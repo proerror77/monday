@@ -34,6 +34,7 @@ Migrate the imported PLOY compatibility code into Monday's canonical market-fami
 - [x] Port the long-lived Polymarket reference collector and raw-tape uploader to Rust, and retire their Python runtime entry points.
 - [x] Coalesce Polymarket price-change batches before publishing quotes so transient crossed intermediate states are never recorded.
 - [x] Reject a first price-change delta older than the latest full-book snapshot before mutating cached depth (#444).
+- [x] Bypass strategy and simulated execution for the pure market-tape recorder, and preserve a contained inactive baseline during failed recorder deployment.
 - [ ] Hand off a versioned, identity-bound incremental market-tape manifest to the uploader and prove the #716 CPU repair in a reviewed non-production fixture before another canary.
 - [ ] Capture the first bounded raw CLOB payload behind #453 and turn it into a deterministic replay before changing book semantics.
 

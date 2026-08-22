@@ -104,6 +104,7 @@ runner_version() {
   runuser -u "$verify_user" -- "$1" --version
 }
 systemctl_value() { systemctl show --property="$2" --value "$1"; }
+unit_file_state() { systemctl is-enabled "$UNIT_NAME" 2>/dev/null || true; }
 effective_exec_argv() {
   local raw argv
   raw=$(systemctl_value "$1" ExecStart) || return 1
@@ -150,6 +151,7 @@ verify_fresh_output() {
 capture_runtime() {
   local configured_exec actual_exe
   systemctl is-active --quiet "$UNIT_NAME" || return 1
+  [[ $(unit_file_state) == enabled ]] || return 1
   configured_exec=$(effective_exec_argv "$UNIT_NAME") || return 1
   runtime_binary=${configured_exec%% *}
   [[ $configured_exec == "$runtime_binary $EXPECTED_ARGS" ]] || return 1
@@ -170,7 +172,8 @@ capture_runtime() {
   [[ $runtime_source =~ ^[0-9a-f]{40}$ ]] || return 1
   [[ $(systemctl_value "$UNIT_NAME" MainPID) == "$runtime_pid" \
     && $(systemctl_value "$UNIT_NAME" InvocationID) == "$runtime_invocation" \
-    && $(systemctl_value "$UNIT_NAME" NRestarts) == "$runtime_restarts" ]] || return 1
+    && $(systemctl_value "$UNIT_NAME" NRestarts) == "$runtime_restarts" \
+    && $(unit_file_state) == enabled ]] || return 1
   [[ $(readlink -f -- "$PROC_ROOT/$runtime_pid/exe") == "$actual_exe" \
     && $(sha256sum "$PROC_ROOT/$runtime_pid/exe" | awk '{print $1}') == "$runtime_sha" ]]
 }
@@ -207,14 +210,13 @@ verify_installed_release() {
       || return 1
   fi
 }
-capture_contained_inactive_runtime() {
-  local configured_exec enabled source_readback
+capture_inactive_runtime() {
+  local expected_unit_state=$1 configured_exec source_readback
   [[ $(systemctl_value "$UNIT_NAME" ActiveState) == inactive ]] || return 1
   [[ $(systemctl_value "$UNIT_NAME" SubState) == dead ]] || return 1
   runtime_pid=$(systemctl_value "$UNIT_NAME" MainPID) || return 1
   [[ $runtime_pid == 0 ]] || return 1
-  enabled=$(systemctl is-enabled "$UNIT_NAME") || return 1
-  [[ $enabled == enabled ]] || return 1
+  [[ $(unit_file_state) == "$expected_unit_state" ]] || return 1
   configured_exec=$(effective_exec_argv "$UNIT_NAME") || return 1
   runtime_binary=${configured_exec%% *}
   [[ $configured_exec == "$runtime_binary $EXPECTED_ARGS" ]] || return 1
@@ -232,11 +234,12 @@ capture_contained_inactive_runtime() {
   [[ $(systemctl_value "$UNIT_NAME" ActiveState) == inactive \
     && $(systemctl_value "$UNIT_NAME" SubState) == dead \
     && $(systemctl_value "$UNIT_NAME" MainPID) == 0 \
-    && $(systemctl is-enabled "$UNIT_NAME") == enabled \
+    && $(unit_file_state) == "$expected_unit_state" \
     && $(effective_exec_argv "$UNIT_NAME") == "$configured_exec" \
     && $(sha256sum "$runtime_binary" | awk '{print $1}') == "$runtime_sha" \
     && $source_readback == "new-ploy-runner $runtime_source" ]]
 }
+capture_contained_inactive_runtime() { capture_inactive_runtime disabled; }
 publish_runtime_snapshot() {
   local sha=$1 source_revision=$2 proc_exe=$3 destination
   destination="$RELEASE_ROOT/$sha"
@@ -277,13 +280,18 @@ publish_candidate() {
   release_staging=
   verify_installed_release "$sha" "$source_revision" "$image_digest"
 }
-verify_running_release() {
-  local sha=$1 source_revision=$2 not_before=$3 expected_binary
+verify_running_identity() {
+  local sha=$1 source_revision=$2 expected_binary
   expected_binary="$RELEASE_ROOT/$sha/new-ploy-runner"
   verify_installed_release "$sha" "$source_revision" || return 1
   capture_runtime || return 1
   [[ $runtime_binary == "$expected_binary" && $runtime_sha == "$sha" \
-    && $runtime_source == "$source_revision" && $runtime_restarts == 0 ]] || return 1
+    && $runtime_source == "$source_revision" ]]
+}
+verify_running_release() {
+  local sha=$1 source_revision=$2 not_before=$3
+  verify_running_identity "$sha" "$source_revision" || return 1
+  [[ $runtime_restarts == 0 ]] || return 1
   verify_fresh_output "$not_before"
 }
 install_release_unit() {
@@ -300,6 +308,8 @@ install_release_unit() {
 activate_release() {
   local sha=$1 source_revision=$2 started attempt
   install_release_unit "$sha" "$source_revision" || return 1
+  systemctl enable "$UNIT_NAME" || return 1
+  [[ $(unit_file_state) == enabled ]] || return 1
   systemctl reset-failed "$UNIT_NAME" || return 1
   [[ $(systemctl_value "$UNIT_NAME" NRestarts) == 0 ]] || return 1
   started=$(date +%s)
@@ -316,6 +326,7 @@ restore_contained_inactive_release() {
   local sha=$1 source_revision=$2
   systemctl stop "$UNIT_NAME" || return 1
   install_release_unit "$sha" "$source_revision" || return 1
+  systemctl disable "$UNIT_NAME" || return 1
   capture_contained_inactive_runtime || return 1
   [[ $runtime_sha == "$sha" && $runtime_source == "$source_revision" ]]
 }
@@ -330,39 +341,65 @@ restore_baseline_after_failure() {
 }
 load_state() {
   secure_regular_file "$STATE_PATH" 600 || return 1
-  jq -e '
-    (keys | sort) == ["current", "previous", "schema"]
-    and .schema == "monday.polymarket_market_recorder_deploy.v1"
-    and all(.current, .previous;
-      (keys | sort) == ["sha256", "source_revision"]
-      and (.sha256 | test("^[0-9a-f]{64}$"))
-      and (.source_revision | test("^[0-9a-f]{40}$")))' "$STATE_PATH" >/dev/null \
-    || return 1
-  IFS=$'\t' read -r state_current_sha state_current_source \
-    state_previous_sha state_previous_source < <(jq -er \
-    '[.current.sha256,.current.source_revision,.previous.sha256,.previous.source_revision] | @tsv' "$STATE_PATH")
+  state_schema=$(jq -er .schema "$STATE_PATH") || return 1
+  case "$state_schema" in
+    monday.polymarket_market_recorder_deploy.v1)
+      jq -e '
+        (keys | sort) == ["current", "previous", "schema"]
+        and all(.current, .previous;
+          (keys | sort) == ["sha256", "source_revision"]
+          and (.sha256 | test("^[0-9a-f]{64}$"))
+          and (.source_revision | test("^[0-9a-f]{40}$")))' "$STATE_PATH" >/dev/null \
+        || return 1
+      IFS=$'\t' read -r state_current_sha state_current_source \
+        state_previous_sha state_previous_source < <(jq -er \
+        '[.current.sha256,.current.source_revision,.previous.sha256,.previous.source_revision] | @tsv' "$STATE_PATH")
+      state_current_activity=active
+      state_previous_activity=active
+      ;;
+    monday.polymarket_market_recorder_deploy.v2)
+      jq -e '
+        (keys | sort) == ["current", "previous", "schema"]
+        and all(.current, .previous;
+          (keys | sort) == ["activity", "sha256", "source_revision"]
+          and (.activity == "active" or .activity == "inactive")
+          and (.sha256 | test("^[0-9a-f]{64}$"))
+          and (.source_revision | test("^[0-9a-f]{40}$")))' "$STATE_PATH" >/dev/null \
+        || return 1
+      IFS=$'\t' read -r state_current_sha state_current_source state_current_activity \
+        state_previous_sha state_previous_source state_previous_activity < <(jq -er \
+        '[.current.sha256,.current.source_revision,.current.activity,
+          .previous.sha256,.previous.source_revision,.previous.activity] | @tsv' "$STATE_PATH")
+      ;;
+    *) return 1 ;;
+  esac
 }
 write_state() {
-  local current_sha=$1 current_source=$2 previous_sha=$3 previous_source=$4 temporary
+  local current_sha=$1 current_source=$2 current_activity=$3
+  local previous_sha=$4 previous_source=$5 previous_activity=$6 temporary
   mkdir -p "$STATE_DIR" || return 1
   chmod 0750 "$STATE_DIR" || return 1
   [[ $(stat_uid "$STATE_DIR") == "$expected_uid" ]] || return 1
   temporary=$(mktemp "${STATE_PATH}.new.XXXXXX") || return 1
   jq -S -n --arg current_sha "$current_sha" --arg current_source "$current_source" \
-    --arg previous_sha "$previous_sha" --arg previous_source "$previous_source" '
-    {schema:"monday.polymarket_market_recorder_deploy.v1",
-      current:{sha256:$current_sha,source_revision:$current_source},
-      previous:{sha256:$previous_sha,source_revision:$previous_source}}' >"$temporary"
-  chmod 0600 "$temporary"
-  mv -f "$temporary" "$STATE_PATH"
+    --arg current_activity "$current_activity" --arg previous_sha "$previous_sha" \
+    --arg previous_source "$previous_source" --arg previous_activity "$previous_activity" '
+    {schema:"monday.polymarket_market_recorder_deploy.v2",
+      current:{sha256:$current_sha,source_revision:$current_source,activity:$current_activity},
+      previous:{sha256:$previous_sha,source_revision:$previous_source,activity:$previous_activity}}' >"$temporary" \
+    || return 1
+  chmod 0600 "$temporary" || return 1
+  mv -f "$temporary" "$STATE_PATH" || return 1
   load_state
 }
 stop_with_recovery_evidence() {
   local failed_sha=$1 recovery_sha=$2 recovery_status=stop_failed active_state main_pid
   if systemctl stop "$UNIT_NAME" >/dev/null 2>&1 \
+    && systemctl disable "$UNIT_NAME" >/dev/null 2>&1 \
     && active_state=$(systemctl_value "$UNIT_NAME" ActiveState) \
     && main_pid=$(systemctl_value "$UNIT_NAME" MainPID) \
-    && [[ $active_state == inactive && $main_pid == 0 ]]; then
+    && [[ $active_state == inactive && $main_pid == 0 \
+      && $(unit_file_state) == disabled ]]; then
     recovery_status=stopped
   fi
   printf 'market-recorder deploy: recovery_status=%s failed_sha256=%s recovery_sha256=%s unit=%s state=%s\n' \
@@ -415,6 +452,9 @@ pre_mutation_feasibility() {
     [[ $state_current_sha == "$runtime_sha" \
       && $state_current_source == "$runtime_source" ]] \
       || die 'current runtime does not match deployment state'
+    [[ $state_schema == monday.polymarket_market_recorder_deploy.v1 \
+      || $state_current_activity == "$runtime_activity" ]] \
+      || die 'current runtime activity does not match deployment state'
   fi
   [[ $candidate_sha != "$runtime_sha" ]] \
     || die 'candidate matches current runtime; no distinct rollback target'
@@ -454,8 +494,8 @@ install_release() {
     fi
     die "candidate failed post-start verification; restored sha256=$baseline_sha source_revision=$baseline_source activity=$baseline_activity"
   fi
-  if ! write_state "$candidate_sha" "$source_revision" \
-    "$baseline_sha" "$baseline_source"; then
+  if ! write_state "$candidate_sha" "$source_revision" active \
+    "$baseline_sha" "$baseline_source" "$baseline_activity"; then
     printf 'market-recorder deploy: state publication failed; restoring sha256=%s\n' \
       "$baseline_sha" >&2
     if ! restore_baseline_after_failure \
@@ -471,39 +511,89 @@ install_release() {
 
 verify_current() {
   load_state || die 'deployment state is missing or invalid'
-  verify_running_release "$state_current_sha" "$state_current_source" \
-    "$(($(date +%s) - MAX_OUTPUT_AGE_SECONDS))" \
-    || die 'configured and running market-recorder release is not exact'
-  printf 'verify passed sha256=%s source_revision=%s pid=%s invocation_id=%s n_restarts=%s\n' \
-    "$state_current_sha" "$state_current_source" \
-    "$runtime_pid" "$runtime_invocation" "$runtime_restarts"
+  if [[ $state_current_activity == active ]]; then
+    verify_running_release "$state_current_sha" "$state_current_source" \
+      "$(($(date +%s) - MAX_OUTPUT_AGE_SECONDS))" \
+      || die 'configured and running market-recorder release is not exact'
+    printf 'verify passed sha256=%s source_revision=%s activity=active pid=%s invocation_id=%s n_restarts=%s\n' \
+      "$state_current_sha" "$state_current_source" \
+      "$runtime_pid" "$runtime_invocation" "$runtime_restarts"
+  else
+    [[ $state_current_activity == inactive ]] \
+      || die 'deployment state has an invalid current activity'
+    capture_contained_inactive_runtime \
+      || die 'configured and stopped market-recorder release is not exact and contained'
+    [[ $runtime_sha == "$state_current_sha" \
+      && $runtime_source == "$state_current_source" ]] \
+      || die 'stopped market-recorder release does not match deployment state'
+    printf 'verify passed sha256=%s source_revision=%s activity=inactive pid=0\n' \
+      "$state_current_sha" "$state_current_source"
+  fi
 }
 
 rollback_release() {
+  local current_sha current_source current_activity
+  local previous_sha previous_source previous_activity
+  local rollback_current_healthy=0
   [[ -n $test_root || $EUID -eq 0 ]] || die 'install and rollback require root'
   load_state || die 'deployment state is missing or invalid'
-  verify_running_release "$state_current_sha" "$state_current_source" \
-    "$(($(date +%s) - MAX_OUTPUT_AGE_SECONDS))" \
-    || die 'current release is not verified; refusing rollback'
-  verify_installed_release "$state_previous_sha" "$state_previous_source" \
+  current_sha=$state_current_sha
+  current_source=$state_current_source
+  current_activity=$state_current_activity
+  previous_sha=$state_previous_sha
+  previous_source=$state_previous_source
+  previous_activity=$state_previous_activity
+  if [[ $current_activity == active ]]; then
+    if [[ $previous_activity == inactive ]]; then
+      if verify_running_release "$current_sha" "$current_source" \
+        "$(($(date +%s) - MAX_OUTPUT_AGE_SECONDS))"; then
+        rollback_current_healthy=1
+      elif verify_running_identity "$current_sha" "$current_source"; then
+        :
+      else
+        capture_inactive_runtime enabled \
+          || die 'current release identity is not exact; refusing contained rollback'
+        [[ $runtime_sha == "$current_sha" && $runtime_source == "$current_source" ]] \
+          || die 'current stopped release does not match deployment state'
+      fi
+    else
+      verify_running_release "$current_sha" "$current_source" \
+        "$(($(date +%s) - MAX_OUTPUT_AGE_SECONDS))" \
+        || die 'current release is not verified; refusing rollback'
+    fi
+  else
+    [[ $current_activity == inactive ]] \
+      || die 'deployment state has an invalid current activity'
+    capture_contained_inactive_runtime \
+      || die 'current stopped release is not verified; refusing rollback'
+    [[ $runtime_sha == "$current_sha" && $runtime_source == "$current_source" ]] \
+      || die 'current stopped release does not match deployment state'
+  fi
+  verify_installed_release "$previous_sha" "$previous_source" \
     || die 'previous release is not immutable and verified'
-  if ! activate_release "$state_previous_sha" "$state_previous_source"; then
-    stop_with_recovery_evidence "$state_previous_sha" "$state_current_sha"
+  if ! restore_baseline_after_failure \
+    "$previous_activity" "$previous_sha" "$previous_source"; then
+    stop_with_recovery_evidence "$previous_sha" "$current_sha"
     die 'rollback target failed verification; see recovery evidence'
   fi
-  if ! write_state "$state_previous_sha" "$state_previous_source" \
-    "$state_current_sha" "$state_current_source"; then
+  if ! write_state "$previous_sha" "$previous_source" "$previous_activity" \
+    "$current_sha" "$current_source" "$current_activity"; then
     printf 'market-recorder deploy: rollback state publication failed; restoring sha256=%s\n' \
-      "$state_current_sha" >&2
-    if ! activate_release "$state_current_sha" "$state_current_source"; then
-      stop_with_recovery_evidence "$state_previous_sha" "$state_current_sha"
+      "$current_sha" >&2
+    if [[ $previous_activity == inactive && $rollback_current_healthy == 0 ]]; then
+      stop_with_recovery_evidence "$current_sha" "$previous_sha" || true
+      die 'rollback state publication failed; contained baseline remains stopped'
+    fi
+    if ! restore_baseline_after_failure \
+      "$current_activity" "$current_sha" "$current_source"; then
+      stop_with_recovery_evidence "$previous_sha" "$current_sha"
       return 1
     fi
     die 'rollback was reversed because deployment state could not be published'
   fi
-  printf 'rollback passed current_sha256=%s current_source_revision=%s previous_sha256=%s previous_source_revision=%s\n' \
-    "$state_current_sha" "$state_current_source" \
-    "$state_previous_sha" "$state_previous_source"
+  printf 'rollback passed current_sha256=%s current_source_revision=%s current_activity=%s previous_sha256=%s previous_source_revision=%s previous_activity=%s\n' \
+    "$state_current_sha" "$state_current_source" "$state_current_activity" \
+    "$state_previous_sha" "$state_previous_source" "$state_previous_activity"
 }
 
 for command in awk chmod chown cmp date find flock grep id install jq mkdir mktemp mv readlink \
