@@ -860,7 +860,15 @@ mod pure_recorder_tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("polymarket-pure-recorder-{unique}.ndjson"));
+        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .expect("current dir")
+                    .join("target/test-artifacts")
+            });
+        fs::create_dir_all(&root).expect("create test artifact dir");
+        let path = root.join(format!("polymarket-pure-recorder-{unique}.ndjson"));
         let feed = RecordingFeed::with_policy(
             HistoricalFeed::new(updates.clone()),
             &path,
