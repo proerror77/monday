@@ -527,8 +527,8 @@ run_spool_symlink_fixture() (
 run_recovery_isolation_fixture() (
   fixture="$tmp_dir/recovery-isolation"
   setup_fixture "$fixture"
-  python_rule='s#^ExecStartPre=\+/opt/monday/bin/monday-rust-lob-recovery-queue isolate %i$##'
-  sed "$python_rule" "$SYSTEMD_ROOT/binance-lob-archiver-production@.service" \
+  grep -Fvx 'ExecStartPre=+/opt/monday/bin/monday-rust-lob-recovery-queue isolate %i' \
+    "$SYSTEMD_ROOT/binance-lob-archiver-production@.service" \
     >"$SYSTEMD_ROOT/binance-lob-archiver-production@.service.tmp"
   mv "$SYSTEMD_ROOT/binance-lob-archiver-production@.service.tmp" \
     "$SYSTEMD_ROOT/binance-lob-archiver-production@.service"
