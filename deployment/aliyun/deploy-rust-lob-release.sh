@@ -82,6 +82,8 @@ assets=(
   binance-lob-archiver-rust@.service
   binance-lob-archiver-upload@.service
   binance-lob-archiver-rust-upload@.service
+  binance-lob-archiver-recovery@.service
+  binance-lob-archiver-recovery@.timer
   binance-lob-archiver-production-spot.env
   binance-lob-archiver-production-usdm.env
   binance-lob-archiver-rust-spot.env
@@ -91,6 +93,7 @@ assets=(
   host-rust-lob-shadow-gate.sh
   host-rust-lob-cutover.sh
   host-rust-lob-restore.sh
+  host-rust-lob-recovery-queue.sh
   rust-lob-control-plane-lib.sh
   rust-lob-runtime-health-policy.jq
   rust-lob-shadow-gate-policy.jq

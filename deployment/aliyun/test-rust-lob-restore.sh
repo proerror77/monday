@@ -25,7 +25,7 @@ for step in \
   validate-shadow-gate \
   validate-production-quiescent \
   validate-canonical-spool \
-  validate-segment-spool \
+  validate-recovery-isolation \
   validate-installed-production-assets; do
   grep -Fq "STEP=$step" "$RESTORE" \
     || { printf 'restore script missing fail-closed step: %s\n' "$step" >&2; exit 1; }
@@ -41,11 +41,12 @@ if grep -Eq 'ln[[:space:]]+-[snf]|rm[[:space:]]+.*\$PRODUCTION_LINK|unlink[[:spa
   printf 'restore script may not rewrite the production symlink\n' >&2
   exit 1
 fi
-# Restore may only start/stop/enable/disable the production units; upload and
-# legacy units are masked fail-closed and must never be started or enabled.
+# Restore may only start/stop/enable/disable the production units and recovery
+# timers; upload and legacy units are masked fail-closed and must never be
+# started or enabled.
 if grep -En 'systemctl[[:space:]]+(start|stop|restart|enable|disable)' "$RESTORE" \
-  | grep -Ev 'PRODUCTION_UNITS' >/dev/null; then
-  printf 'restore may only start, stop, enable, or disable production units\n' >&2
+  | grep -Ev 'PRODUCTION_UNITS|RECOVERY_TIMERS' >/dev/null; then
+  printf 'restore may only start, stop, enable, or disable production units and recovery timers\n' >&2
   exit 1
 fi
 if sed -n '/^assets=(/,/^)/p' "$INSTALL_RELEASE" | grep -Fq 'host-rust-lob-restore.sh'; then
@@ -89,6 +90,17 @@ mv() {
     [[ $arg == -T || $arg == -Tf ]] || args+=("$arg")
   done
   command mv -f "${args[@]}"
+}
+
+install() {
+  local -a args=()
+  while (($#)); do
+    case "$1" in
+      -o|-g) shift 2 ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  command install "${args[@]}"
 }
 
 sha256sum() {
@@ -162,16 +174,25 @@ setup_fixture() {
       deployment_source_revision:$source}' >"$CANDIDATE_RELEASE/release.json"
   for asset in \
     binance-lob-archiver-production@.service \
+    binance-lob-archiver-recovery@.service \
+    binance-lob-archiver-recovery@.timer \
     binance-lob-archiver-production-spot.env \
-    binance-lob-archiver-production-usdm.env; do
+    binance-lob-archiver-production-usdm.env \
+    host-rust-lob-recovery-queue.sh; do
     install -m 0644 "$SCRIPT_DIR/$asset" "$CANDIDATE_DEPLOYMENT/$asset"
   done
   install -m 0644 "$SCRIPT_DIR/binance-lob-archiver-production@.service" \
     "$SYSTEMD_ROOT/binance-lob-archiver-production@.service"
+  install -m 0644 "$SCRIPT_DIR/binance-lob-archiver-recovery@.service" \
+    "$SYSTEMD_ROOT/binance-lob-archiver-recovery@.service"
+  install -m 0644 "$SCRIPT_DIR/binance-lob-archiver-recovery@.timer" \
+    "$SYSTEMD_ROOT/binance-lob-archiver-recovery@.timer"
   install -m 0640 "$SCRIPT_DIR/binance-lob-archiver-production-spot.env" \
     "$CONFIG_ROOT/binance-lob-archiver-production-spot.env"
   install -m 0640 "$SCRIPT_DIR/binance-lob-archiver-production-usdm.env" \
     "$CONFIG_ROOT/binance-lob-archiver-production-usdm.env"
+  install -m 0755 "$SCRIPT_DIR/host-rust-lob-recovery-queue.sh" \
+    "$BIN_DIR/monday-rust-lob-recovery-queue"
   install -m 0644 "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" \
     "$CANDIDATE_DEPLOYMENT/rust-lob-shadow-gate-policy.jq"
   install -m 0644 "$SCRIPT_DIR/rust-lob-runtime-health-policy.jq" \
@@ -354,8 +375,14 @@ systemctl() {
       touch "$MOCK_STATE/active/binance-lob-archiver-production@usdm.service"
       ;;
     enable)
+      local activate=0
       for arg in "${@:2}"; do
+        [[ $arg == --now ]] && activate=1
+      done
+      for arg in "${@:2}"; do
+        [[ $arg == --now ]] && continue
         touch "$MOCK_STATE/enabled/$arg"
+        (( activate )) && touch "$MOCK_STATE/active/$arg"
       done
       ;;
     disable)
@@ -396,6 +423,8 @@ run_success_fixture() (
   setup_fixture "$fixture"
   restore_release "$CANDIDATE_SHA256" >"$fixture/out" 2>&1 \
     || { printf 'restore failed in success fixture\n' >&2; exit 1; }
+  [[ -d $RECOVERY_QUEUE_ROOT && ! -L $RECOVERY_QUEUE_ROOT ]]
+  [[ -d $EVIDENCE_ROOT && ! -L $EVIDENCE_ROOT ]]
   evidence=$(restore_evidence_dir)
   [[ -n $evidence ]] || { printf 'no recovery evidence directory\n' >&2; exit 1; }
   jq -e --arg sha "$CANDIDATE_SHA256" --arg bundle "$DEPLOYMENT_BUNDLE_SHA256" \
@@ -433,6 +462,10 @@ run_success_fixture() (
   [[ -f $MOCK_STATE/enabled/binance-lob-archiver-production@spot.service ]]
   [[ -f $MOCK_STATE/active/binance-lob-archiver-production@usdm.service ]]
   [[ -f $MOCK_STATE/enabled/binance-lob-archiver-production@usdm.service ]]
+  [[ -f $MOCK_STATE/active/binance-lob-archiver-recovery@spot.timer ]]
+  [[ -f $MOCK_STATE/enabled/binance-lob-archiver-recovery@spot.timer ]]
+  [[ -f $MOCK_STATE/active/binance-lob-archiver-recovery@usdm.timer ]]
+  [[ -f $MOCK_STATE/enabled/binance-lob-archiver-recovery@usdm.timer ]]
 )
 
 run_missing_symlink_fixture() (
@@ -504,16 +537,20 @@ run_spool_symlink_fixture() (
     'canonical spool path contains a symlink'
 )
 
-run_segment_spool_fixture() (
-  fixture="$tmp_dir/segment-spool"
+run_recovery_isolation_fixture() (
+  fixture="$tmp_dir/recovery-isolation"
   setup_fixture "$fixture"
-  touch "$CANONICAL_SPOOL/spot/part-0000.jsonl.zst"
+  grep -Fvx 'ExecStartPre=+/opt/monday/bin/monday-rust-lob-recovery-queue isolate %i' \
+    "$SYSTEMD_ROOT/binance-lob-archiver-production@.service" \
+    >"$SYSTEMD_ROOT/binance-lob-archiver-production@.service.tmp"
+  mv "$SYSTEMD_ROOT/binance-lob-archiver-production@.service.tmp" \
+    "$SYSTEMD_ROOT/binance-lob-archiver-production@.service"
   if restore_release "$CANDIDATE_SHA256" >"$fixture/out" 2>&1; then
-    printf 'restore accepted segment artifacts in the canonical spool\n' >&2
+    printf 'restore accepted a production unit without recovery isolation\n' >&2
     exit 1
   fi
-  assert_failed_recovery "$fixture/out" validate-segment-spool \
-    'canonical spool contains segment artifacts'
+  assert_failed_recovery "$fixture/out" validate-recovery-isolation \
+    'installed production unit cannot isolate interrupted spools'
 )
 
 run_drifted_assets_fixture() (
@@ -564,14 +601,36 @@ run_health_failure_fixture() (
   [[ -f $evidence/rollback-spot-health.json && -f $evidence/rollback-usdm-health.json ]]
 )
 
+run_evidence_failure_disables_recovery_timers_fixture() (
+  fixture="$tmp_dir/evidence-failure"
+  setup_fixture "$fixture"
+  # Called indirectly by restore_release from the sourced script.
+  # shellcheck disable=SC2317,SC2329
+  write_recovery_evidence() {
+    return 1
+  }
+  if restore_release "$CANDIDATE_SHA256" >"$fixture/out" 2>&1; then
+    printf 'restore accepted a failed final evidence write\n' >&2
+    exit 1
+  fi
+  grep -Fq 'restore failed and evidence could not be written' "$fixture/out"
+  for timer in \
+    binance-lob-archiver-recovery@spot.timer \
+    binance-lob-archiver-recovery@usdm.timer; do
+    [[ ! -f $MOCK_STATE/active/$timer ]]
+    [[ ! -f $MOCK_STATE/enabled/$timer ]]
+  done
+)
+
 run_success_fixture
 run_missing_symlink_fixture
 run_symlink_mismatch_fixture
 run_missing_gate_fixture
 run_active_production_fixture
 run_spool_symlink_fixture
-run_segment_spool_fixture
+run_recovery_isolation_fixture
 run_drifted_assets_fixture
 run_health_failure_fixture
+run_evidence_failure_disables_recovery_timers_fixture
 
 printf 'Rust LOB governed restore tests passed\n'

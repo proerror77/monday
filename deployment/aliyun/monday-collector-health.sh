@@ -81,6 +81,7 @@ TAG=monday-collector-health
 SPOOL_ROOT=${MONDAY_COLLECTOR_SPOOL_ROOT:-/data/monday/spool}
 STATE_DIR=${MONDAY_COLLECTOR_STATE_DIR:-/var/lib/monday-collector-health}
 STATE_FILE="$STATE_DIR/state.json"
+RECOVERY_QUEUE_ROOT="$SPOOL_ROOT/binance-lob-recovery"
 
 HEALTH_SILENCE_SECONDS=300
 DISK_WARN_PERCENT=25
@@ -116,6 +117,8 @@ BYBIT_SUCCESS_MAX_AGE=5400
 # Gate 2 polymarket addendum: with rotated tapes still pending, an upload
 # stall must alert within 30 minutes rather than after two full rotations.
 POLY_PENDING_STALE_MAX_AGE=1800
+RECOVERY_QUEUE_READY_MAX_AGE=1800
+RECOVERY_QUEUE_RUNNING_MAX_AGE=7200
 
 # Gate 3: pending backlog bounds per lane (count limit, oldest-artifact age).
 LOB_PENDING_MAX=4
@@ -205,6 +208,8 @@ warnings=""
 units_json='{}'
 health_json='{}'
 uploads_json='{}'
+recovery_queue_json='{}'
+recovery_queue_root_ok=1
 delay_gate_json='{}'
 disk_json='{}'
 mount_json='{}'
@@ -557,6 +562,108 @@ check_binance_health() {
     '$base + {($k): $v}')
 }
 
+queue_entry_count() {
+  printf '%s\n' "$1" | awk 'NF { c += 1 } END { print c + 0 }'
+}
+
+queue_oldest_age() {
+  queue_oldest_age_result=null
+  [ -n "$1" ] || return 0
+  oldest=0
+  for entry in $1; do
+    mtime=$(file_mtime "$entry")
+    case "$mtime" in (*[!0-9]*|'') continue ;; esac
+    if [ "$oldest" -eq 0 ] || [ "$mtime" -lt "$oldest" ]; then
+      oldest=$mtime
+    fi
+  done
+  if [ "$oldest" -gt 0 ]; then
+    age=$((NOW_SEC - oldest))
+    [ "$age" -lt 0 ] && age=0
+    queue_oldest_age_result=$age
+  fi
+}
+
+check_recovery_queue_market() {
+  market=$1
+  queue_dir="$RECOVERY_QUEUE_ROOT/$market"
+  label="binance-lob-recovery[$market]"
+  ready_scan_failed=0
+  running_scan_failed=0
+  failed_scan_failed=0
+  ready_entries=""
+  running_entries=""
+  failed_entries=""
+  ready_count=0
+  running_count=0
+  failed_count=0
+  ready_oldest_age=null
+  running_oldest_age=null
+  failed_oldest_age=null
+
+  if [ "$recovery_queue_root_ok" -eq 1 ] && { [ -e "$queue_dir" ] || [ -L "$queue_dir" ]; }; then
+    if [ ! -d "$queue_dir" ] || [ -L "$queue_dir" ] || [ ! -r "$queue_dir" ] || [ ! -x "$queue_dir" ]; then
+      record_breach "$label: recovery queue root is not an inspectable directory ($queue_dir)"
+    else
+      ready_entries=$(find "$queue_dir" -mindepth 1 -maxdepth 1 -type d -name '*.ready' -print 2>/dev/null) \
+        || ready_scan_failed=1
+      running_entries=$(find "$queue_dir" -mindepth 1 -maxdepth 1 -type d -name '*.running' -print 2>/dev/null) \
+        || running_scan_failed=1
+      failed_entries=$(find "$queue_dir" -mindepth 1 -maxdepth 1 -type d -name '*.failed' -print 2>/dev/null) \
+        || failed_scan_failed=1
+      if [ "${ready_scan_failed:-0}" -eq 1 ] \
+        || [ "${running_scan_failed:-0}" -eq 1 ] \
+        || [ "${failed_scan_failed:-0}" -eq 1 ]; then
+        record_breach "$label: recovery queue scan failed ($queue_dir)"
+      else
+        ready_count=$(queue_entry_count "$ready_entries")
+        running_count=$(queue_entry_count "$running_entries")
+        failed_count=$(queue_entry_count "$failed_entries")
+        queue_oldest_age "$ready_entries"
+        ready_oldest_age=$queue_oldest_age_result
+        queue_oldest_age "$running_entries"
+        running_oldest_age=$queue_oldest_age_result
+        queue_oldest_age "$failed_entries"
+        failed_oldest_age=$queue_oldest_age_result
+      fi
+    fi
+  fi
+
+  if [ "$failed_count" -gt 0 ]; then
+    record_breach "$label: failed recovery job(s) present ($failed_count)"
+  fi
+  if [ "$ready_oldest_age" != null ] && [ "$ready_oldest_age" -gt "$RECOVERY_QUEUE_READY_MAX_AGE" ]; then
+    record_breach "$label: oldest ready recovery job age ${ready_oldest_age}s over ${RECOVERY_QUEUE_READY_MAX_AGE}s"
+  fi
+  if [ "$running_oldest_age" != null ] && [ "$running_oldest_age" -gt "$RECOVERY_QUEUE_RUNNING_MAX_AGE" ]; then
+    record_breach "$label: oldest running recovery job age ${running_oldest_age}s over ${RECOVERY_QUEUE_RUNNING_MAX_AGE}s"
+  fi
+
+  qobj=$(jq -n \
+    --argjson rc "$ready_count" \
+    --argjson ra "$ready_oldest_age" \
+    --argjson uc "$running_count" \
+    --argjson ua "$running_oldest_age" \
+    --argjson fc "$failed_count" \
+    --argjson fa "$failed_oldest_age" \
+    '{ready_count: $rc, ready_oldest_age_seconds: $ra,
+      running_count: $uc, running_oldest_age_seconds: $ua,
+      failed_count: $fc, failed_oldest_age_seconds: $fa}')
+  recovery_queue_json=$(jq -n --argjson base "$recovery_queue_json" --arg k "$market" --argjson v "$qobj" \
+    '$base + {($k): $v}')
+}
+
+check_recovery_queue_root() {
+  recovery_queue_root_ok=1
+  if [ -e "$RECOVERY_QUEUE_ROOT" ] || [ -L "$RECOVERY_QUEUE_ROOT" ]; then
+    if [ ! -d "$RECOVERY_QUEUE_ROOT" ] || [ -L "$RECOVERY_QUEUE_ROOT" ] \
+      || [ ! -r "$RECOVERY_QUEUE_ROOT" ] || [ ! -x "$RECOVERY_QUEUE_ROOT" ]; then
+      recovery_queue_root_ok=0
+      record_breach "binance-lob-recovery: recovery queue root is not an inspectable directory ($RECOVERY_QUEUE_ROOT)"
+    fi
+  fi
+}
+
 # Pending-backlog scanners. Each sets pending_count and pending_oldest (epoch
 # mtime of the oldest pending artifact, 0 when none), mirroring the collector's
 # own pending definition for that lane.
@@ -882,6 +989,9 @@ check_raw_ops_gate "$POLY_RAW_OPS_GATE" "polymarket-raw-ops-gate"
 
 check_binance_health "binance-lob-archiver-production@spot" "$SPOOL_ROOT/binance-lob/spot"
 check_binance_health "binance-lob-archiver-production@usdm" "$SPOOL_ROOT/binance-lob/usdm"
+check_recovery_queue_root
+check_recovery_queue_market spot
+check_recovery_queue_market usdm
 
 check_upload_lane "binance-lob-archiver-production@spot" "$SPOOL_ROOT/binance-lob/spot" \
   1 "$LOB_SUCCESS_MAX_AGE" "$LOB_PENDING_MAX" "$LOB_PENDING_MAX_AGE" manifests
@@ -914,8 +1024,9 @@ if [ "$JSON_MODE" -eq 1 ]; then
   warnings_json=$(printf '%s' "$warnings" | jq -Rs 'split("\n") | map(select(length > 0))')
   checks_json=$(jq -n --argjson disk "$disk_json" --argjson mount "$mount_json" \
     --argjson units "$units_json" --argjson health "$health_json" \
-    --argjson uploads "$uploads_json" --argjson delay "$delay_gate_json" \
-    '{disk: $disk, mount: $mount, units: $units, health: $health, uploads: $uploads, delay_gate: $delay}')
+    --argjson uploads "$uploads_json" --argjson queue "$recovery_queue_json" \
+    --argjson delay "$delay_gate_json" \
+    '{disk: $disk, mount: $mount, units: $units, health: $health, uploads: $uploads, recovery_queue: $queue, delay_gate: $delay}')
   jq -n --argjson ok "$ok_str" --arg checked "$CHECKED_AT" \
     --argjson breaches "$breaches_json" --argjson warnings "$warnings_json" \
     --argjson checks "$checks_json" \

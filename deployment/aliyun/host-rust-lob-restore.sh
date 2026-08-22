@@ -21,6 +21,7 @@ configure_paths() {
   EVIDENCE_ROOT="$root/data/monday/evidence/recoveries"
   LOCK_ROOT="$root/run/lock"
   CANONICAL_SPOOL="$root/data/monday/spool/binance-lob"
+  RECOVERY_QUEUE_ROOT="$root/data/monday/spool/binance-lob-recovery"
   HEALTH_TIMEOUT_SECONDS=300
   EXPECTED_ROOT_UID=0
 }
@@ -33,6 +34,10 @@ UPLOAD_UNITS=(
   binance-lob-archiver-upload@spot.service
   binance-lob-archiver-upload@usdm.service
 )
+RECOVERY_TIMERS=(
+  binance-lob-archiver-recovery@spot.timer
+  binance-lob-archiver-recovery@usdm.timer
+)
 LEGACY_UNITS=(
   binance-lob-archiver@spot.service
   binance-lob-archiver@usdm.service
@@ -44,8 +49,11 @@ TRANSITION_MASK_UNITS=(
 )
 RESTORE_ASSETS=(
   binance-lob-archiver-production@.service
+  binance-lob-archiver-recovery@.service
+  binance-lob-archiver-recovery@.timer
   binance-lob-archiver-production-spot.env
   binance-lob-archiver-production-usdm.env
+  host-rust-lob-recovery-queue.sh
 )
 
 fail() {
@@ -284,9 +292,10 @@ write_verification_evidence() {
 rollback_after_failure() {
   local unit
   ROLLBACK_RESULT=disabled
+  systemctl disable --now "${RECOVERY_TIMERS[@]}" >/dev/null 2>&1 || true
   systemctl disable --now "${PRODUCTION_UNITS[@]}" >/dev/null 2>&1 || true
   systemctl mask --runtime "${TRANSITION_MASK_UNITS[@]}" >/dev/null 2>&1 || true
-  for unit in "${PRODUCTION_UNITS[@]}"; do
+  for unit in "${PRODUCTION_UNITS[@]}" "${RECOVERY_TIMERS[@]}"; do
     if systemctl is-active --quiet "$unit" || systemctl is-enabled --quiet "$unit"; then
       ROLLBACK_RESULT=production-stop-or-disable-failed-but-contained
     fi
@@ -353,10 +362,18 @@ restore_release() (
   trap on_exit EXIT
 
   STEP=prepare-recovery-evidence
-  for path in "$DATA_ROOT" "$DATA_ROOT/monday" "$DATA_ROOT/monday/evidence" "$EVIDENCE_ROOT"; do
+  for path in \
+    "$DATA_ROOT" \
+    "$DATA_ROOT/monday" \
+    "$DATA_ROOT/monday/evidence" \
+    "$EVIDENCE_ROOT" \
+    "$DATA_ROOT/monday/spool" \
+    "$RECOVERY_QUEUE_ROOT"; do
     path_is_direct_or_absent "$path" || fail "recovery evidence path contains a symlink: $path"
   done
-  install -d -m 0750 "$DATA_ROOT/monday/evidence" "$EVIDENCE_ROOT"
+  install -d -m 0750 -o root -g root \
+    "$DATA_ROOT/monday/evidence" "$EVIDENCE_ROOT"
+  install -d -m 0750 -o root -g hftcollector "$RECOVERY_QUEUE_ROOT"
   mkdir -m 0750 -- "$EVIDENCE_DIR" \
     || fail "refusing to reuse recovery evidence directory: $EVIDENCE_DIR"
 
@@ -443,17 +460,18 @@ restore_release() (
       "$CANONICAL_SPOOL/spot" "$CANONICAL_SPOOL/usdm"
   fi
 
-  STEP=validate-segment-spool
-  if [[ ${MONDAY_ALLOW_RESTORE_WITH_PENDING:-0} != 1 ]] \
-    && ! require_empty_segment_spool; then
-    fail 'canonical spool contains segment artifacts; set MONDAY_ALLOW_RESTORE_WITH_PENDING=1 to force'
-  fi
+  STEP=validate-recovery-isolation
+  grep -Fxq 'ExecStartPre=+/opt/monday/bin/monday-rust-lob-recovery-queue isolate %i' \
+    "$SYSTEMD_ROOT/binance-lob-archiver-production@.service" \
+    || fail 'installed production unit cannot isolate interrupted spools'
 
   STEP=validate-installed-production-assets
   for asset in "${RESTORE_ASSETS[@]}"; do
     case "$asset" in
-      *.service) installed_asset="$SYSTEMD_ROOT/$asset" ;;
+      *.service|*.timer) installed_asset="$SYSTEMD_ROOT/$asset" ;;
       *.env) installed_asset="$CONFIG_ROOT/$asset" ;;
+      host-rust-lob-recovery-queue.sh)
+        installed_asset="$BIN_DIR/monday-rust-lob-recovery-queue" ;;
     esac
     secure_regular_file "$installed_asset"
     secure_regular_file "$CANDIDATE_DEPLOYMENT/$asset"
@@ -508,12 +526,19 @@ restore_release() (
   health_ready_for_release usdm "$USDM_MINIMUM_SYMBOLS" \
     "$OLD_SESSION_USDM" "$RESTART_STARTED_NS" "$USDM_EXPECTED_DATASET" \
     || fail 'USD-M health changed while enabling production'
+  systemctl enable --now "${RECOVERY_TIMERS[@]}" >/dev/null
+  for timer in "${RECOVERY_TIMERS[@]}"; do
+    systemctl is-enabled --quiet "$timer" \
+      || fail "recovery timer did not enable: $timer"
+    systemctl is-active --quiet "$timer" \
+      || fail "recovery timer did not start: $timer"
+  done
 
   STEP=write-recovery-evidence
   RESULT=passed
   ROLLBACK_RESULT=not-needed
-  write_recovery_evidence
-  write_verification_evidence
+  write_recovery_evidence || fail 'could not write restore evidence'
+  write_verification_evidence || fail 'could not write restore verification'
   SUCCESS=1
   trap - EXIT ERR
   printf 'Rust collector restore passed: %s\nEvidence: %s/recovery.json\n' \

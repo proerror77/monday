@@ -152,6 +152,12 @@ make_spools() {
            "$spool_root/polymarket-reference"
 }
 
+touch_age() {
+  touch -t "$(jq -rn --argjson age "$2" '
+    now - $age | floor | localtime | strftime("%Y%m%d%H%M.%S")
+  ')" "$1"
+}
+
 write_health() {
   # $1 market (spot|usdm), $2 age_seconds, $3 gaps, $4 disk_warning, $5 status
   market=$1
@@ -1025,7 +1031,8 @@ healthy_scenario
 healthy_fixtures
 run_health --dry-run
 expect "dry-run: exit 0" "$(rc_is 0; echo $?)"
-expect "dry-run: state file not created" "$([ ! -e "$state_dir/state.json" ]; echo $?)"
+if [ ! -e "$state_dir/state.json" ]; then state_missing_rc=0; else state_missing_rc=1; fi
+expect "dry-run: state file not created" "$state_missing_rc"
 
 # ---------------------------------------------------------------------------
 # 24. Gate 6: an inactive polymarket upload timer while its collector is
@@ -1115,6 +1122,88 @@ write_upload "$spool_root/polymarket/upload-status.json" null null 0 7300
 run_health
 expect "gate2 poly stale lane bound: exit 1" "$(rc_is 1; echo $?)"
 expect "gate2 poly stale lane bound: breach message" "$(grep_out '^breach: polymarket-market-tape-upload: last upload success stale'; echo $?)"
+
+# ---------------------------------------------------------------------------
+# 15. Recovery queue: empty queue is healthy, stale ready/running and any
+#     failed queue entry breach fail-closed.
+# ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+run_health --json
+expect "recovery queue empty: exit 0" "$(rc_is 0; echo $?)"
+expect "recovery queue empty: json zero counts" "$(json_query '
+  .checks.recovery_queue.spot.ready_count == 0 and
+  .checks.recovery_queue.spot.running_count == 0 and
+  .checks.recovery_queue.spot.failed_count == 0 and
+  .checks.recovery_queue.usdm.ready_count == 0 and
+  .checks.recovery_queue.usdm.running_count == 0 and
+  .checks.recovery_queue.usdm.failed_count == 0
+'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+mkdir -p "$spool_root/binance-lob-recovery/spot/job.ready"
+touch_age "$spool_root/binance-lob-recovery/spot/job.ready" 60
+run_health --json
+expect "recovery queue ready fresh: exit 0" "$(rc_is 0; echo $?)"
+expect "recovery queue ready fresh: json count" "$(json_query '
+  .checks.recovery_queue.spot.ready_count == 1 and
+  (.checks.recovery_queue.spot.ready_oldest_age_seconds >= 0) and
+  .checks.recovery_queue.spot.failed_count == 0
+'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+mkdir -p "$spool_root/binance-lob-recovery/spot/job.ready"
+touch_age "$spool_root/binance-lob-recovery/spot/job.ready" 1900
+run_health
+expect "recovery queue ready stale: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue ready stale: breach" "$(grep_out '^breach: binance-lob-recovery\[spot\]: oldest ready recovery job age '; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+mkdir -p "$spool_root/binance-lob-recovery/usdm/job.running"
+touch_age "$spool_root/binance-lob-recovery/usdm/job.running" 7300
+run_health
+expect "recovery queue running stale: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue running stale: breach" "$(grep_out '^breach: binance-lob-recovery\[usdm\]: oldest running recovery job age '; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+mkdir -p "$spool_root/binance-lob-recovery/usdm/job.failed"
+touch_age "$spool_root/binance-lob-recovery/usdm/job.failed" 30
+run_health
+expect "recovery queue failed present: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue failed present: breach" "$(grep_out '^breach: binance-lob-recovery\[usdm\]: failed recovery job(s) present'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+mkdir -p "$spool_root/binance-lob-recovery"
+ln -s "$spool_root/binance-lob/spot" "$spool_root/binance-lob-recovery/spot"
+run_health
+expect "recovery queue scan failure: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue scan failure: breach" "$(grep_out '^breach: binance-lob-recovery\[spot\]: recovery queue root is not an inspectable directory'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+printf 'not-a-directory\n' >"$spool_root/binance-lob-recovery"
+run_health
+expect "recovery queue malformed parent: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue malformed parent: breach" "$(grep_out '^breach: binance-lob-recovery: recovery queue root is not an inspectable directory'; echo $?)"
 
 # ---------------------------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$pass_count" "$fail_count"

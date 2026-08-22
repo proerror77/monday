@@ -1,0 +1,12 @@
+[Unit]
+Description=Schedule Rust Binance LOB detached spool recovery (%i)
+
+[Timer]
+OnBootSec=10min
+OnUnitInactiveSec=15min
+RandomizedDelaySec=60
+Persistent=true
+Unit=binance-lob-archiver-recovery@%i.service
+
+[Install]
+WantedBy=timers.target

@@ -19,6 +19,7 @@ ACR_WORKFLOW="$SCRIPT_DIR/../../.github/workflows/acr-publish.yml"
 POLICY="$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq"
 RUNTIME_POLICY="$SCRIPT_DIR/rust-lob-runtime-health-policy.jq"
 SHADOW_USDM_ENV="$SCRIPT_DIR/binance-lob-archiver-rust-usdm.env"
+PRODUCTION_SPOT_ENV="$SCRIPT_DIR/binance-lob-archiver-production-spot.env"
 PRODUCTION_USDM_ENV="$SCRIPT_DIR/binance-lob-archiver-production-usdm.env"
 LIB="$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
 # shellcheck disable=SC1090,SC1091
@@ -185,7 +186,36 @@ grep -Fq 'min_symbols[usdm]=100' "$GATE"
 grep -Fq 'and .markets.usdm.symbol_count == 100' "$POLICY"
 grep -Fq '"$CANDIDATE_STARTED_NS" 100' "$CUTOVER"
 grep -Fq '"$OLD_USDM_MINIMUM_SYMBOLS"' "$CUTOVER"
+startup_body=$(sed -n '/^async fn main()/,/^fn recover_parts_only()/p' "$COLLECTOR")
+if grep -Fq 'recover_parts(&config.segment_config())' <<<"$startup_body"; then
+  printf 'normal collector startup may not recover interrupted parts\n' >&2
+  exit 1
+fi
+grep -Fq 'ensure_startup_spool_ready(&spool_dir)?' <<<"$startup_body"
+grep -Fxq 'ExecStartPre=+/opt/monday/bin/monday-rust-lob-recovery-queue isolate %i' \
+  "$SCRIPT_DIR/binance-lob-archiver-production@.service"
+grep -Fxq 'ExecStart=/opt/monday/bin/monday-rust-lob-recovery-queue drain %i' \
+  "$SCRIPT_DIR/binance-lob-archiver-recovery@.service"
+grep -Fxq 'Unit=binance-lob-archiver-recovery@%i.service' \
+  "$SCRIPT_DIR/binance-lob-archiver-recovery@.timer"
+grep -Fq 'host-rust-lob-recovery-queue.sh' "$INSTALL_RELEASE"
+queue_root_line=$(grep -n 'install -d -m 0750 -o root -g hftcollector "$RECOVERY_QUEUE_ROOT"' \
+  "$CUTOVER" | cut -d: -f1)
+candidate_start_line=$(grep -n '^STEP=start-candidate-production$' "$CUTOVER" | cut -d: -f1)
+[[ -n $queue_root_line && -n $candidate_start_line \
+  && $queue_root_line -lt $candidate_start_line ]] || {
+  printf 'cutover does not create the recovery queue root before entering the systemd sandbox\n' >&2
+  exit 1
+}
+grep -Fq '"$RECOVERY_EVIDENCE_ROOT"' "$CUTOVER"
 drain_body=$(sed -n '/^run_candidate_drain()/,/^}/p' "$CUTOVER")
+incomplete_body=$(sed -n '/^has_incomplete_segment_artifacts()/,/^}/p' "$CUTOVER")
+for suffix in '*.jsonl.part' '*.zst.tmp' '*.part.corrupt'; do
+  grep -Fq -- "-name '$suffix'" <<<"$incomplete_body" || {
+    printf 'cutover does not detect interrupted %s artifacts\n' "$suffix" >&2
+    exit 1
+  }
+done
 backup_line=$(grep -n -- 'RECOVERY_BACKUP_DIR=' <<<"$drain_body" | cut -d: -f1)
 recover_line=$(grep -n -- '--recover-parts-only' <<<"$drain_body" | cut -d: -f1)
 upload_line=$(grep -n -- '--upload-only' <<<"$drain_body" | cut -d: -f1)
@@ -1521,7 +1551,8 @@ for asset in "${deployment_assets[@]}"; do
 done
 
 run_stage_fixture() (
-  DEPLOYMENT_ASSETS=("${deployment_assets[@]}")
+  BASE_DEPLOYMENT_ASSETS=("${deployment_assets[@]}")
+  RECOVERY_DEPLOYMENT_ASSETS=()
   OLD_DEPLOYMENT="$release_deployment"
   EVIDENCE_DIR=$1
   ROLLBACK_DEPLOYMENT_MANIFEST_SHA256=
@@ -1566,6 +1597,7 @@ run_contained_upgrade_rollback_fixture() (
   local calls="$tmp_dir/contained-rollback.calls"
   PRODUCTION_UNITS=(production-spot production-usdm)
   UPLOAD_UNITS=(upload-spot upload-usdm)
+  RECOVERY_TIMERS=(recovery-spot recovery-usdm)
   LEGACY_UNITS=(legacy-spot legacy-usdm)
   TRANSITION_MASK_UNITS=("${PRODUCTION_UNITS[@]}" "${UPLOAD_UNITS[@]}" "${LEGACY_UNITS[@]}")
   CANONICAL_SPOOL="$tmp_dir/nonexistent-spool"
@@ -1580,6 +1612,7 @@ run_contained_upgrade_rollback_fixture() (
   DRAIN_REQUIRED=0
   DRAIN_ATTEMPTED=0
   DRAIN_MAY_HAVE_MUTATED=0
+  OLD_RECOVERY_TIMERS_ENABLED=0
   SPOOL_ENV_DEPLOYMENT=
   mkdir -p "$OLD_DEPLOYMENT" "$EVIDENCE_DIR" "$(dirname "$PRODUCTION_LINK")"
   : >"$calls"
@@ -1630,6 +1663,7 @@ run_new_host_rollback_fixture() (
   local active_unit=${1:-} unit
   PRODUCTION_UNITS=(production-spot production-usdm)
   UPLOAD_UNITS=(upload-spot upload-usdm)
+  RECOVERY_TIMERS=(recovery-spot recovery-usdm)
   LEGACY_UNITS=(legacy-spot legacy-usdm)
   TRANSITION_MASK_UNITS=("${PRODUCTION_UNITS[@]}" "${UPLOAD_UNITS[@]}" "${LEGACY_UNITS[@]}")
   CANONICAL_SPOOL="$tmp_dir/nonexistent-spool"
@@ -1641,6 +1675,7 @@ run_new_host_rollback_fixture() (
   DRAIN_REQUIRED=0
   DRAIN_ATTEMPTED=0
   DRAIN_MAY_HAVE_MUTATED=0
+  OLD_RECOVERY_TIMERS_ENABLED=0
   SPOOL_ENV_DEPLOYMENT=
   systemctl() {
     case "$1" in
