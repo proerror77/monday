@@ -133,7 +133,7 @@ verify_unit() {
   rendered_unit=
 }
 verify_config() {
-  secure_regular_file "$CONFIG_PATH" 644 || return 1
+  secure_regular_file "$CONFIG_PATH" 640 || return 1
   cmp -s "$CONFIG_TEMPLATE" "$CONFIG_PATH"
 }
 verify_fresh_output() {

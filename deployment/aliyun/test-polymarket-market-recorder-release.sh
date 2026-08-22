@@ -158,7 +158,7 @@ sed "s|/opt/monday/releases/polymarket-market-recorder/@POLYMARKET_MARKET_RECORD
   "$SERVICE" >"$unit"
 chmod 0644 "$unit"
 cp "$CONFIG" "$config"
-chmod 0644 "$config"
+chmod 0640 "$config"
 ln -s "$baseline_binary" "$fixture/proc/4101/exe"
 printf '{"fixture":"fresh"}\n' >"$output"
 
@@ -420,7 +420,7 @@ printf '# drift\n' >>"$config"
 run_deploy preflight "$archive" "$source_revision" "$image_digest" \
   >"$fixture/inactive-config-drift.out" 2>&1 && exit 1
 cp "$CONFIG" "$config"
-chmod 0644 "$config"
+chmod 0640 "$config"
 
 run_deploy preflight "$archive" "$source_revision" "$image_digest"
 [[ ! -s $mutation_log && ! -s $output ]]
