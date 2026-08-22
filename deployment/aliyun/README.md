@@ -1123,6 +1123,10 @@ of restarting a writer that could bypass the recovery checks. A recovered
 manifest deliberately preserves its fail-closed replay and
 readiness evidence; successful OSS triplet upload is not a data-quality verdict,
 so cutover readback reports the recovered manifest's gaps and readiness as-is.
+A normal collector start never recovers interrupted parts. It refuses a spool
+containing `.jsonl.part`, `.zst.tmp`, or `.part.corrupt` and leaves every input
+untouched for the governed drain. Systemd limits that failure to three starts in
+five minutes, so a residual part cannot create an unbounded restart/recovery loop.
 A new host is accepted
 only when the canonical spool contains no segment artifact. The script then
 atomically changes the production symlink and starts both services without
@@ -1180,8 +1184,9 @@ Before starting anything the host restore requires all of the following:
 4. The production symlink exists (a missing symlink is refused, never recreated).
 5. The canonical spool path is a direct directory tree under `/data` (no symlink
    escapes) and the spot/usdm subdirectories exist.
-6. The canonical spool contains no segment artifacts, unless the operator forces
-   with `MONDAY_ALLOW_RESTORE_WITH_PENDING=1`.
+6. The canonical spool contains no segment artifacts. Interrupted parts must use
+   the governed recovery and upload drain before restore; there is no force-start
+   bypass.
 7. The installed production unit/env files match the gated deployment bundle
    `cmp`-for-`cmp` and the production unit still declares `RuntimeMaxSec=21600`.
 

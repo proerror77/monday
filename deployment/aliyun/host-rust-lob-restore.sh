@@ -444,10 +444,8 @@ restore_release() (
   fi
 
   STEP=validate-segment-spool
-  if [[ ${MONDAY_ALLOW_RESTORE_WITH_PENDING:-0} != 1 ]] \
-    && ! require_empty_segment_spool; then
-    fail 'canonical spool contains segment artifacts; set MONDAY_ALLOW_RESTORE_WITH_PENDING=1 to force'
-  fi
+  require_empty_segment_spool \
+    || fail 'canonical spool contains segment artifacts; recover and drain it before restore'
 
   STEP=validate-installed-production-assets
   for asset in "${RESTORE_ASSETS[@]}"; do

@@ -10,6 +10,7 @@ GATE="$SCRIPT_DIR/host-rust-lob-shadow-gate.sh"
 SOAK="$SCRIPT_DIR/host-rust-lob-shadow-soak.sh"
 INSTALL_RELEASE="$SCRIPT_DIR/deploy-rust-lob-release.sh"
 SHADOW_UNIT="$SCRIPT_DIR/binance-lob-archiver-rust@.service"
+PRODUCTION_UNIT="$SCRIPT_DIR/binance-lob-archiver-production@.service"
 INVOKE="$SCRIPT_DIR/invoke-rust-lob-operation.sh"
 COLLECTOR_DOCKERFILE="$SCRIPT_DIR/../../rust_hft/deployment/docker/Dockerfile.binance-lob-archiver"
 ARTIFACT_VERIFIER="$SCRIPT_DIR/../../rust_hft/data-pipelines/core/src/binance_market_tape_artifact.rs"
@@ -186,6 +187,16 @@ grep -Fq 'and .markets.usdm.symbol_count == 100' "$POLICY"
 grep -Fq '"$CANDIDATE_STARTED_NS" 100' "$CUTOVER"
 grep -Fq '"$OLD_USDM_MINIMUM_SYMBOLS"' "$CUTOVER"
 drain_body=$(sed -n '/^run_candidate_drain()/,/^}/p' "$CUTOVER")
+startup_body=$(sed -n '/^async fn main()/,/^fn recover_parts_only()/p' "$COLLECTOR")
+if grep -Fq 'recover_parts(' <<<"$startup_body"; then
+  printf 'normal collector startup may not recover interrupted parts\n' >&2
+  exit 1
+fi
+grep -Fq 'ensure_startup_spool_ready(&spool_dir)?' <<<"$startup_body"
+for unit in "$PRODUCTION_UNIT" "$SHADOW_UNIT"; do
+  grep -Fxq 'StartLimitIntervalSec=300' "$unit"
+  grep -Fxq 'StartLimitBurst=3' "$unit"
+done
 backup_line=$(grep -n -- 'RECOVERY_BACKUP_DIR=' <<<"$drain_body" | cut -d: -f1)
 recover_line=$(grep -n -- '--recover-parts-only' <<<"$drain_body" | cut -d: -f1)
 upload_line=$(grep -n -- '--upload-only' <<<"$drain_body" | cut -d: -f1)

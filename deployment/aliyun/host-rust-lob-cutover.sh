@@ -260,6 +260,12 @@ validate_deployment() {
     grep -Fxq 'ExecStartPre=/opt/monday/bin/binance-lob-archiver --self-test' \
       "$directory/binance-lob-archiver-production@.service" \
       || fail 'candidate production unit does not run the binary self-test'
+    grep -Fxq 'StartLimitIntervalSec=300' \
+      "$directory/binance-lob-archiver-production@.service" \
+      || fail 'candidate production unit does not bound restart attempts'
+    grep -Fxq 'StartLimitBurst=3' \
+      "$directory/binance-lob-archiver-production@.service" \
+      || fail 'candidate production unit does not bound restart attempts'
     grep -Fxq 'AssertPathIsMountPoint=/data' \
       "$directory/binance-lob-archiver-upload@.service" \
       || fail 'candidate upload unit does not assert the /data mount'

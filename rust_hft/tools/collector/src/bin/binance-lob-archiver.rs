@@ -135,6 +135,7 @@ const UPLOADED_CLEANUP_TMP_SUFFIX: &str = ".uploaded-cleanup.json.tmp";
 const OSS_READBACK_ATTEMPTS: usize = 3;
 const OSS_READBACK_RETRY_DELAY: Duration = Duration::from_secs(1);
 const SPOOL_LOCK_FILE: &str = ".binance-lob-archiver.lock";
+const INCOMPLETE_SEGMENT_SUFFIXES: [&str; 3] = [".jsonl.part", ".zst.tmp", ".part.corrupt"];
 const SUBSCRIPTION_PROOF_ID: u64 = 1;
 const SUBSCRIPTION_PROOF_TIMEOUT: Duration = Duration::from_secs(20);
 // Non-depth Binance streams can be quiet between updates; keep their reconnect
@@ -1216,11 +1217,8 @@ async fn main() -> anyhow::Result<()> {
     let spool_dir = PathBuf::from(env_string("SPOOL_DIR", "/data/monday/spool/binance-lob"));
     std::fs::create_dir_all(&spool_dir)?;
     let _spool_lock = SpoolLock::acquire(&spool_dir)?;
+    ensure_startup_spool_ready(&spool_dir)?;
     let config = Arc::new(Config::from_env().await?);
-    let recovered = recover_parts(&config.segment_config())?;
-    if !recovered.is_empty() {
-        info!(segments = recovered.len(), "recovered interrupted segments");
-    }
     let producer_diagnostics = Arc::new(ProducerDiagnostics::default());
     let watchdog = ProcessWatchdog::start(config.process_watchdog_timeout, producer_diagnostics)?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -1243,6 +1241,24 @@ async fn main() -> anyhow::Result<()> {
     watchdog.stop();
     upload_task.await?;
     shutdown_signal.abort();
+    Ok(())
+}
+
+fn incomplete_segment_artifacts(spool_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut incomplete = Vec::new();
+    for suffix in INCOMPLETE_SEGMENT_SUFFIXES {
+        incomplete.extend(files_with_suffix(spool_dir, suffix)?);
+    }
+    Ok(incomplete)
+}
+
+fn ensure_startup_spool_ready(spool_dir: &Path) -> anyhow::Result<()> {
+    let incomplete = incomplete_segment_artifacts(spool_dir)?;
+    anyhow::ensure!(
+        incomplete.is_empty(),
+        "collector startup blocked by {} incomplete segment artifacts; run governed recovery before restart",
+        incomplete.len()
+    );
     Ok(())
 }
 
@@ -4625,10 +4641,7 @@ async fn upload_only(config: &UploadConfig) -> anyhow::Result<()> {
         );
     }
     let _spool_lock = SpoolLock::acquire(&config.spool_dir)?;
-    let mut incomplete = Vec::new();
-    for suffix in [".jsonl.part", ".zst.tmp", ".part.corrupt"] {
-        incomplete.extend(files_with_suffix(&config.spool_dir, suffix)?);
-    }
+    let incomplete = incomplete_segment_artifacts(&config.spool_dir)?;
     if !incomplete.is_empty() {
         anyhow::bail!(
             "upload-only drain blocked by {} incomplete segment artifacts; recover them with the collector release that created them",
@@ -5940,6 +5953,21 @@ mod tests {
             assert!(error.to_string().contains("incomplete segment artifacts"));
             assert!(artifact.is_file());
             std::fs::remove_dir_all(spool_dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn startup_refuses_incomplete_segments_without_mutating_them() {
+        for suffix in ["jsonl.part", "jsonl.zst.tmp", "jsonl.part.corrupt"] {
+            let spool = tempfile::tempdir().unwrap();
+            let artifact = spool
+                .path()
+                .join(format!("part-1700000000000000000.{suffix}"));
+            std::fs::write(&artifact, b"unfinished").unwrap();
+
+            let error = ensure_startup_spool_ready(spool.path()).unwrap_err();
+            assert!(error.to_string().contains("governed recovery"));
+            assert_eq!(std::fs::read(&artifact).unwrap(), b"unfinished");
         }
     }
 

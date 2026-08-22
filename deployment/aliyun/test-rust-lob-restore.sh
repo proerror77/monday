@@ -35,6 +35,10 @@ grep -Fq 'monday.rust_lob_recovery.v1' "$RESTORE"
 grep -Fq 'monday.rust_lob_recovery_verification.v1' "$RESTORE"
 grep -Fq 'systemctl disable --now' "$RESTORE"
 grep -Fq 'systemctl mask --runtime' "$RESTORE"
+if grep -Fq 'MONDAY_ALLOW_RESTORE_WITH_PENDING' "$RESTORE"; then
+  printf 'restore may not bypass the empty canonical spool requirement\n' >&2
+  exit 1
+fi
 # Restore must never rewrite the production symlink or touch deployment assets.
 # shellcheck disable=SC2016
 if grep -Eq 'ln[[:space:]]+-[snf]|rm[[:space:]]+.*\$PRODUCTION_LINK|unlink[[:space:]]+\$PRODUCTION_LINK' "$RESTORE"; then

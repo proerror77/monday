@@ -4,6 +4,8 @@ After=network-online.target
 Wants=network-online.target
 RequiresMountsFor=/data
 AssertPathIsMountPoint=/data
+StartLimitIntervalSec=300
+StartLimitBurst=3
 
 [Service]
 Type=simple
