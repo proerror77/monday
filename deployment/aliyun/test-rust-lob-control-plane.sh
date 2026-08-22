@@ -237,9 +237,9 @@ grep -Fq 'validated_nonempty_recovery_parts' <<<"$recover_body"
 grep -Fq 'validated_recovery_temporaries' <<<"$recover_body"
 backup_line=$(grep -n 'backup_recovery_inputs' <<<"$recover_body" | head -1 | cut -d: -f1)
 drop_line=$(grep -n 'drop_recovery_privileges' <<<"$recover_body" | head -1 | cut -d: -f1)
-catalog_line=$(grep -n 'discover_recovery_catalog' <<<"$recover_body" | head -1 | cut -d: -f1)
+catalog_line=$(grep -n 'prepare_recovery_batches' <<<"$recover_body" | head -1 | cut -d: -f1)
 remove_temporary_line=$(grep -n 'remove_recovery_temporaries' <<<"$recover_body" | head -1 | cut -d: -f1)
-recover_line=$(grep -n 'recover_parts(&config)' <<<"$recover_body" | head -1 | cut -d: -f1)
+recover_line=$(grep -n 'recover_recovery_batches' <<<"$recover_body" | head -1 | cut -d: -f1)
 [[ -n $backup_line && -n $drop_line && -n $catalog_line \
   && -n $remove_temporary_line && -n $recover_line \
   && $backup_line -lt $drop_line && $drop_line -lt $catalog_line \
@@ -1594,27 +1594,30 @@ grep -Fq 'installed production asset drifted from the active immutable release' 
 
 run_contained_upgrade_rollback_fixture() (
   local expect_contained=${1:-1}
+  local pending_drain=${2:-0}
+  local mode=${3:-contained-upgrade}
   local calls="$tmp_dir/contained-rollback.calls"
   PRODUCTION_UNITS=(production-spot production-usdm)
   UPLOAD_UNITS=(upload-spot upload-usdm)
   RECOVERY_TIMERS=(recovery-spot recovery-usdm)
   LEGACY_UNITS=(legacy-spot legacy-usdm)
   TRANSITION_MASK_UNITS=("${PRODUCTION_UNITS[@]}" "${UPLOAD_UNITS[@]}" "${LEGACY_UNITS[@]}")
-  CANONICAL_SPOOL="$tmp_dir/nonexistent-spool"
+  CANONICAL_SPOOL="$tmp_dir/rollback-spool"
   CANDIDATE_BINARY="$tmp_dir/candidate-binary"
   PRODUCTION_LINK="$tmp_dir/contained-production-link"
-  OLD_MODE=contained-upgrade
+  OLD_MODE=$mode
   OLD_DEPLOYMENT="$tmp_dir/contained-old-deployment"
   OLD_BINARY="$tmp_dir/contained-old-binary"
   ROLLBACK_DEPLOYMENT_MANIFEST_SHA256=fixture
   ROLLBACK_RESULT=
   EVIDENCE_DIR="$tmp_dir/contained-evidence"
-  DRAIN_REQUIRED=0
+  DRAIN_REQUIRED=$pending_drain
   DRAIN_ATTEMPTED=0
   DRAIN_MAY_HAVE_MUTATED=0
   OLD_RECOVERY_TIMERS_ENABLED=0
-  SPOOL_ENV_DEPLOYMENT=
-  mkdir -p "$OLD_DEPLOYMENT" "$EVIDENCE_DIR" "$(dirname "$PRODUCTION_LINK")"
+  SPOOL_ENV_DEPLOYMENT=$OLD_DEPLOYMENT
+  mkdir -p "$CANONICAL_SPOOL" "$OLD_DEPLOYMENT" "$EVIDENCE_DIR" \
+    "$(dirname "$PRODUCTION_LINK")"
   : >"$calls"
   systemctl() {
     printf '%s %s\n' "$1" "${*:2}" >>"$calls"
@@ -1637,7 +1640,7 @@ run_contained_upgrade_rollback_fixture() (
   }
   sha256sum() { return 0; }
   copy_health_evidence() { return 0; }
-  run_candidate_drain() { return 0; }
+  run_candidate_drain() { printf 'drain %s\n' "$1" >>"$calls"; return 1; }
   install_deployment() { printf 'install %s\n' "$1" >>"$calls"; return 0; }
   atomic_symlink() { printf 'symlink %s %s\n' "$1" "$2" >>"$calls"; return 0; }
   restore_allowlisted_production_dropins() { printf 'restore-dropin\n' >>"$calls"; return 0; }
@@ -1646,10 +1649,21 @@ run_contained_upgrade_rollback_fixture() (
   # shellcheck disable=SC1090
   . "$rollback_body"
   rollback_after_failure
+  grep -Fq "install $OLD_DEPLOYMENT" "$calls"
+  grep -Fq "symlink $OLD_BINARY $PRODUCTION_LINK" "$calls"
   grep -Fq 'restore-dropin' "$calls"
   grep -Eq '^daemon-reload( |$)' "$calls"
   if grep -Eq '^(start|enable|unmask) ' "$calls"; then
     printf 'contained rollback tried to restart or unmask the previous release\n' >&2
+    exit 1
+  fi
+  if [[ $mode == contained-upgrade ]] && grep -Fq 'drain ' "$calls"; then
+    printf 'contained rollback retried a failed canonical spool drain\n' >&2
+    exit 1
+  fi
+  if [[ $mode == upgrade && $pending_drain == 1 ]] \
+    && ! grep -Fq "drain $OLD_DEPLOYMENT" "$calls"; then
+    printf 'upgrade rollback did not attempt its required canonical spool drain\n' >&2
     exit 1
   fi
   printf '%s\n' "$ROLLBACK_RESULT"
@@ -1658,6 +1672,9 @@ run_contained_upgrade_rollback_fixture() (
 [[ $(run_contained_upgrade_rollback_fixture) == previous-release-restored-contained ]]
 [[ $(run_contained_upgrade_rollback_fixture 0) \
   == previous-release-restore-containment-failed ]]
+[[ $(run_contained_upgrade_rollback_fixture 1 1) == previous-release-restored-contained ]]
+[[ $(run_contained_upgrade_rollback_fixture 1 1 upgrade) \
+  == previous-release-restored-disabled ]]
 
 run_new_host_rollback_fixture() (
   local active_unit=${1:-} unit

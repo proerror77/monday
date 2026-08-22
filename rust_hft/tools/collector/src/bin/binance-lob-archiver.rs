@@ -14,11 +14,13 @@ use data::binance_market_tape_artifact::{
 use futures::{SinkExt, StreamExt};
 use hft_collector::lob_archiver::{
     checkpoint_event, command_status_with_timeout, files_with_suffix, read_upload_status,
-    recover_parts, segment_partition, send_or_shutdown, sha256_file, write_health,
+    recover_parts_from_paths, segment_partition, send_or_shutdown, sha256_file, write_health,
     write_success_marker, write_upload_status, DepthDiff, Market, OrderBookState, PendingBudget,
     QueueHealth, Segment, SegmentArtifacts, SegmentConfig, SendOutcome, UploadStatus,
     MAX_RECOVERY_ROW_BYTES, RAW_SCHEMA,
 };
+#[cfg(test)]
+use hft_collector::lob_archiver::recover_parts;
 use hft_collector::polymarket_upload::ExclusiveTempDir;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1342,25 +1344,21 @@ fn recover_parts_only() -> anyhow::Result<()> {
     )?;
     let expected_stream_types = stream_types_for_recovery(market, &dataset)?;
     drop_recovery_privileges(recovery_uid, recovery_gid)?;
-    let (symbols, stream_types) = if nonempty_parts.is_empty() {
-        (Vec::new(), expected_stream_types)
-    } else {
-        discover_recovery_catalog(&nonempty_parts, market, &expected_stream_types)?
-    };
-    remove_recovery_temporaries(&temporaries)?;
-    let config = SegmentConfig {
+    let base_config = SegmentConfig {
         spool_dir: spool_dir.clone(),
         market,
         dataset,
         shard_id,
-        symbols,
+        symbols: Vec::new(),
         security_token_symbols: Vec::new(),
         excluded_symbols: Vec::new(),
         snapshot_limit: required_env_parse("SNAPSHOT_LIMIT")?,
         zstd_timeout: Duration::from_secs(required_env_parse("ZSTD_TIMEOUT_SECONDS")?),
-        stream_types,
+        stream_types: expected_stream_types,
     };
-    let recovered = recover_parts(&config)?;
+    let recovery_batches = prepare_recovery_batches(&base_config, &parts, &nonempty_parts)?;
+    remove_recovery_temporaries(&temporaries)?;
+    let recovered = recover_recovery_batches(recovery_batches)?;
     anyhow::ensure!(
         recovered.len() == nonempty_parts.len()
             && files_with_suffix(&spool_dir, ".jsonl.part")?.is_empty()
@@ -1370,6 +1368,75 @@ fn recover_parts_only() -> anyhow::Result<()> {
     );
     println!("recover-parts-only: recovered={}", recovered.len());
     Ok(())
+}
+
+fn prepare_recovery_batches(
+    base_config: &SegmentConfig,
+    parts: &[PathBuf],
+    nonempty_parts: &[PathBuf],
+) -> anyhow::Result<Vec<(SegmentConfig, Vec<PathBuf>)>> {
+    let groups = recovery_session_groups(nonempty_parts)?;
+    let nonempty = nonempty_parts.iter().collect::<BTreeSet<_>>();
+    let mut empty = parts
+        .iter()
+        .filter(|part| !nonempty.contains(part))
+        .cloned()
+        .collect::<Vec<_>>();
+    if groups.is_empty() {
+        return Ok(vec![(base_config.clone(), empty)]);
+    }
+    let mut batches = Vec::with_capacity(groups.len());
+    for mut session_parts in groups {
+        let (symbols, stream_types) = discover_recovery_catalog(
+            &session_parts,
+            base_config.market,
+            &base_config.stream_types,
+        )?;
+        let mut config = base_config.clone();
+        config.symbols = symbols;
+        config.stream_types = stream_types;
+        session_parts.append(&mut empty);
+        batches.push((config, session_parts));
+    }
+    Ok(batches)
+}
+
+fn recover_recovery_batches(
+    batches: Vec<(SegmentConfig, Vec<PathBuf>)>,
+) -> anyhow::Result<Vec<SegmentArtifacts>> {
+    let mut recovered = Vec::new();
+    for (config, parts) in batches {
+        recovered.extend(recover_parts_from_paths(&config, &parts)?);
+    }
+    Ok(recovered)
+}
+
+fn recovery_session_groups(parts: &[PathBuf]) -> anyhow::Result<Vec<Vec<PathBuf>>> {
+    let mut identified = parts
+        .iter()
+        .map(|part| {
+            let (session_id, received_at_ns) = first_recovery_identity(part)?;
+            Ok((received_at_ns, part.clone(), session_id))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    identified.sort();
+    let mut seen = BTreeSet::new();
+    let mut groups: Vec<(String, Vec<PathBuf>)> = Vec::new();
+    for (_, part, session_id) in identified {
+        if groups
+            .last()
+            .is_some_and(|(current, _)| current == &session_id)
+        {
+            groups.last_mut().expect("checked group").1.push(part);
+            continue;
+        }
+        anyhow::ensure!(
+            seen.insert(session_id.clone()),
+            "recovery session reappears after a different session: {session_id}"
+        );
+        groups.push((session_id, vec![part]));
+    }
+    Ok(groups.into_iter().map(|(_, parts)| parts).collect())
 }
 
 fn validated_nonempty_recovery_parts(
@@ -5458,6 +5525,84 @@ mod tests {
             &stream_types_for_market(Market::Spot),
         )
         .is_err());
+    }
+
+    #[test]
+    fn recovery_keeps_consecutive_sessions_in_separate_artifacts() {
+        if Command::new("zstd").arg("--version").output().is_err() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let sessions = ["session-1", "session-2", "session-2", "session-3"];
+        let parts = sessions
+            .iter()
+            .enumerate()
+            .map(|(index, session_id)| {
+                let received_at_ns = u64::try_from(index + 1).unwrap();
+                let part = root
+                    .path()
+                    .join(format!("part-{received_at_ns}.jsonl.part"));
+                std::fs::write(
+                    &part,
+                    format!(
+                        "{}\n",
+                        json!({
+                            "schema": RAW_SCHEMA,
+                            "received_at_ns": received_at_ns,
+                            "type": "stream_coverage",
+                            "session_id": session_id,
+                            "shards": [["btcusdt@depth@100ms"]]
+                        })
+                    ),
+                )
+                .unwrap();
+                part
+            })
+            .collect::<Vec<_>>();
+        let base_config = SegmentConfig {
+            spool_dir: root.path().to_owned(),
+            market: Market::Usdm,
+            dataset: USDM_TOP100_LOB_DATASET.to_owned(),
+            shard_id: "all".to_owned(),
+            symbols: Vec::new(),
+            security_token_symbols: Vec::new(),
+            excluded_symbols: Vec::new(),
+            snapshot_limit: 100,
+            zstd_timeout: Duration::from_secs(30),
+            stream_types: vec!["depth@100ms".to_owned()],
+        };
+        let repeated = root.path().join("part-5.jsonl.part");
+        std::fs::write(
+            &repeated,
+            format!(
+                "{}\n",
+                json!({
+                    "schema": RAW_SCHEMA,
+                    "received_at_ns": 5,
+                    "type": "stream_coverage",
+                    "session_id": "session-1",
+                    "shards": [["btcusdt@depth@100ms"]]
+                })
+            ),
+        )
+        .unwrap();
+        assert!(recovery_session_groups(&[parts[0].clone(), parts[1].clone(), repeated]).is_err());
+        let batches = prepare_recovery_batches(&base_config, &parts, &parts).unwrap();
+        let artifacts = recover_recovery_batches(batches).unwrap();
+        assert_eq!(artifacts.len(), parts.len());
+        let recovered_sessions = artifacts
+            .iter()
+            .map(|artifact| {
+                serde_json::from_reader::<_, Value>(
+                    std::fs::File::open(&artifact.manifest).unwrap(),
+                )
+                .unwrap()["lob_continuity"]["capture_session_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(recovered_sessions, sessions);
     }
 
     #[test]
