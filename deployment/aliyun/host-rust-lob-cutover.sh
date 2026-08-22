@@ -748,6 +748,7 @@ production_is_fail_closed() {
   for unit in "${RECOVERY_UNITS[@]}"; do
     systemctl is-active --quiet "$unit" && return 1
   done
+  return 0
 }
 
 write_evidence() {
