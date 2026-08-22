@@ -209,6 +209,7 @@ units_json='{}'
 health_json='{}'
 uploads_json='{}'
 recovery_queue_json='{}'
+recovery_queue_root_ok=1
 delay_gate_json='{}'
 disk_json='{}'
 mount_json='{}'
@@ -600,7 +601,7 @@ check_recovery_queue_market() {
   running_oldest_age=null
   failed_oldest_age=null
 
-  if [ -e "$queue_dir" ] || [ -L "$queue_dir" ]; then
+  if [ "$recovery_queue_root_ok" -eq 1 ] && { [ -e "$queue_dir" ] || [ -L "$queue_dir" ]; }; then
     if [ ! -d "$queue_dir" ] || [ -L "$queue_dir" ] || [ ! -r "$queue_dir" ] || [ ! -x "$queue_dir" ]; then
       record_breach "$label: recovery queue root is not an inspectable directory ($queue_dir)"
     else
@@ -650,6 +651,17 @@ check_recovery_queue_market() {
       failed_count: $fc, failed_oldest_age_seconds: $fa}')
   recovery_queue_json=$(jq -n --argjson base "$recovery_queue_json" --arg k "$market" --argjson v "$qobj" \
     '$base + {($k): $v}')
+}
+
+check_recovery_queue_root() {
+  recovery_queue_root_ok=1
+  if [ -e "$RECOVERY_QUEUE_ROOT" ] || [ -L "$RECOVERY_QUEUE_ROOT" ]; then
+    if [ ! -d "$RECOVERY_QUEUE_ROOT" ] || [ -L "$RECOVERY_QUEUE_ROOT" ] \
+      || [ ! -r "$RECOVERY_QUEUE_ROOT" ] || [ ! -x "$RECOVERY_QUEUE_ROOT" ]; then
+      recovery_queue_root_ok=0
+      record_breach "binance-lob-recovery: recovery queue root is not an inspectable directory ($RECOVERY_QUEUE_ROOT)"
+    fi
+  fi
 }
 
 # Pending-backlog scanners. Each sets pending_count and pending_oldest (epoch
@@ -977,6 +989,7 @@ check_raw_ops_gate "$POLY_RAW_OPS_GATE" "polymarket-raw-ops-gate"
 
 check_binance_health "binance-lob-archiver-production@spot" "$SPOOL_ROOT/binance-lob/spot"
 check_binance_health "binance-lob-archiver-production@usdm" "$SPOOL_ROOT/binance-lob/usdm"
+check_recovery_queue_root
 check_recovery_queue_market spot
 check_recovery_queue_market usdm
 

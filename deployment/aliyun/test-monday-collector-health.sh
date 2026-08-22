@@ -1031,7 +1031,8 @@ healthy_scenario
 healthy_fixtures
 run_health --dry-run
 expect "dry-run: exit 0" "$(rc_is 0; echo $?)"
-expect "dry-run: state file not created" "$([ ! -e "$state_dir/state.json" ]; echo $?)"
+if [ ! -e "$state_dir/state.json" ]; then state_missing_rc=0; else state_missing_rc=1; fi
+expect "dry-run: state file not created" "$state_missing_rc"
 
 # ---------------------------------------------------------------------------
 # 24. Gate 6: an inactive polymarket upload timer while its collector is
@@ -1194,6 +1195,15 @@ ln -s "$spool_root/binance-lob/spot" "$spool_root/binance-lob-recovery/spot"
 run_health
 expect "recovery queue scan failure: exit 1" "$(rc_is 1; echo $?)"
 expect "recovery queue scan failure: breach" "$(grep_out '^breach: binance-lob-recovery\[spot\]: recovery queue root is not an inspectable directory'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+printf 'not-a-directory\n' >"$spool_root/binance-lob-recovery"
+run_health
+expect "recovery queue malformed parent: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue malformed parent: breach" "$(grep_out '^breach: binance-lob-recovery: recovery queue root is not an inspectable directory'; echo $?)"
 
 # ---------------------------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$pass_count" "$fail_count"

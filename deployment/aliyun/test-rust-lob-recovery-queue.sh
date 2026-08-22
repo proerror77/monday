@@ -23,6 +23,11 @@ grep -Fq 'ExecStartPre=+/opt/monday/bin/monday-rust-lob-recovery-queue isolate %
 grep -Fq 'ExecStart=/opt/monday/bin/monday-rust-lob-recovery-queue drain %i' \
   "$SCRIPT_DIR/binance-lob-archiver-recovery@.service"
 grep -Fq 'host-rust-lob-recovery-queue.sh' "$SCRIPT_DIR/deploy-rust-lob-release.sh"
+grep -Fxq 'MemoryMax=2560M' "$SCRIPT_DIR/binance-lob-archiver-production@.service"
+grep -Fxq 'StartLimitIntervalSec=300' "$SCRIPT_DIR/binance-lob-archiver-production@.service"
+grep -Fxq 'StartLimitBurst=5' "$SCRIPT_DIR/binance-lob-archiver-production@.service"
+grep -Fxq 'CPUQuota=25%' "$SCRIPT_DIR/binance-lob-archiver-recovery@.service"
+grep -Fxq 'MemoryMax=768M' "$SCRIPT_DIR/binance-lob-archiver-recovery@.service"
 
 # shellcheck disable=SC1090
 . "$QUEUE_SCRIPT"
@@ -33,7 +38,25 @@ stat() {
     shift 2
     [[ ${1:-} != -- ]] || shift
     case "$format" in
-      %u|%g) printf '0\n' ;;
+      %u)
+        # Values are populated by configure_paths() from the sourced script.
+        # shellcheck disable=SC2153
+        case "$1" in
+          "$CANONICAL_ROOT/spot"|"$CANONICAL_ROOT/usdm"|*/.binance-lob-archiver.lock)
+            printf '4241\n'
+            ;;
+          *) printf '0\n' ;;
+        esac
+        ;;
+      %g)
+        # shellcheck disable=SC2153
+        case "$1" in
+          "$CANONICAL_ROOT/spot"|"$CANONICAL_ROOT/usdm"|*/.binance-lob-archiver.lock|"$QUEUE_ROOT"|"$QUEUE_ROOT"/*)
+            printf '4242\n'
+            ;;
+          *) printf '0\n' ;;
+        esac
+        ;;
       %a)
         if [[ $(uname -s) == Darwin ]]; then
           /usr/bin/stat -f %Lp "$1"
@@ -108,9 +131,9 @@ install() {
 
 id() {
   if [[ ${1:-} == -u && ${2:-} == hftcollector ]]; then
-    printf '0\n'
+    printf '4241\n'
   elif [[ ${1:-} == -g && ${2:-} == hftcollector ]]; then
-    printf '0\n'
+    printf '4242\n'
   else
     command id "$@"
   fi
@@ -134,20 +157,24 @@ runuser() {
 }
 
 flock() {
+  if [[ ${1:-} == -n && ${2:-} == 7 && ${MOCK_DRAIN_LOCK_BUSY:-0} == 1 ]]; then
+    return 1
+  fi
   return 0
 }
 
 sync() {
+  printf '%s\n' "$*" >>"$MOCK_SYNC_LOG"
   return 0
 }
 
 setup_fixture() {
   local fixture=$1
-  local release_sha source_sha bundle_sha release_dir canonical_root queue_root env_file release_env
-  FIXTURE_ROOT=$fixture
+  local release_sha source_sha bundle_sha release_dir env_file release_env
   MOCK_SYSTEMCTL_LOG="$fixture/systemctl.log"
   MOCK_RUNUSER_LOG="$fixture/runuser.log"
   MOCK_CALLS_LOG="$fixture/binary.log"
+  MOCK_SYNC_LOG="$fixture/sync.log"
   configure_paths "$fixture"
   mkdir -p \
     "$BIN_DIR" "$RELEASE_ROOT" "$CONFIG_ROOT" "$LOCK_ROOT" \
@@ -217,6 +244,8 @@ EOF
 run_action() (
   local fixture=$1 action=$2 market=$3
   configure_paths "$fixture"
+  # MARKET is consumed by functions from the sourced recovery script.
+  # shellcheck disable=SC2034
   MARKET=$market
   canonical_paths_safe
   market_paths
@@ -265,6 +294,8 @@ test_isolate_creates_ready_job() {
   assert canonical-clean test ! -e "$fixture/data/monday/spool/binance-lob/spot/part-001.jsonl.part"
   assert canonical-recreated test -d "$fixture/data/monday/spool/binance-lob/spot"
   assert systemctl-start grep -Fq 'start --no-block binance-lob-archiver-recovery@spot.service' "$fixture/systemctl.log"
+  assert canonical-parent-synced grep -Fq -- '-f '"$fixture/data/monday/spool/binance-lob" "$fixture/sync.log"
+  assert queue-parent-synced grep -Fq -- '-f '"$fixture/data/monday/spool/binance-lob-recovery/spot" "$fixture/sync.log"
 }
 
 test_drain_runs_recover_then_upload() {
@@ -283,6 +314,7 @@ test_drain_runs_recover_then_upload() {
   [[ $(sed -n '1p' "$fixture/binary.log") == usdm\ --recover-parts-only* ]]
   [[ $(sed -n '2p' "$fixture/binary.log") == usdm\ --upload-only* ]]
   assert backup-receipt test -f "$evidence_dir/recovery-input/receipt.json"
+  assert evidence-synced grep -Fq -- '-f '"$evidence_dir" "$fixture/sync.log"
 }
 
 test_drain_does_not_depend_on_current_production_symlink() {
@@ -297,7 +329,7 @@ test_drain_does_not_depend_on_current_production_symlink() {
 }
 
 test_failed_job_is_not_retried() {
-  local fixture=$tmp_dir/drain-fail failed_dir before after
+  local fixture=$tmp_dir/drain-fail failed_dir job_id evidence_dir before after
   setup_fixture "$fixture"
   printf 'part\n' >"$fixture/data/monday/spool/binance-lob/usdm/part-001.jsonl.part"
   run_action "$fixture" isolate usdm
@@ -305,13 +337,43 @@ test_failed_job_is_not_retried() {
   expect_failure "$fixture" drain usdm
   failed_dir=$(find "$fixture/data/monday/spool/binance-lob-recovery/usdm" -mindepth 1 -maxdepth 1 -type d -name '*.failed' | head -n 1)
   [[ -n $failed_dir ]] || exit 1
-  jq -e '.result == "failed"' "$failed_dir/result.json" >/dev/null
+  job_id=$(jq -r '.job_id' "$failed_dir/job.json")
+  evidence_dir="$fixture/data/monday/evidence/recoveries/lob-queue/$job_id"
+  jq -e '.result == "failed"' "$evidence_dir/result.json" >/dev/null
   assert failed-input-preserved test -f "$failed_dir/job.json"
   before=$(wc -l <"$fixture/binary.log")
   rm -f "$fixture/fail-upload"
   run_action "$fixture" drain usdm
   after=$(wc -l <"$fixture/binary.log")
   [[ $before == "$after" ]]
+}
+
+test_other_market_recovery_defers_without_mutating_job() {
+  local fixture=$tmp_dir/drain-deferred ready_dir
+  setup_fixture "$fixture"
+  printf 'part\n' >"$fixture/data/monday/spool/binance-lob/spot/part-001.jsonl.part"
+  run_action "$fixture" isolate spot
+  MOCK_DRAIN_LOCK_BUSY=1 run_action "$fixture" drain spot
+  ready_dir=$(find "$fixture/data/monday/spool/binance-lob-recovery/spot" -mindepth 1 -maxdepth 1 -type d -name '*.ready' | head -n 1)
+  [[ -n $ready_dir ]]
+  assert deferred-no-binary test ! -s "$fixture/binary.log"
+}
+
+test_invalid_release_env_never_executes_recovery_binary() {
+  local fixture=$tmp_dir/invalid-env ready_dir release_env env_sha
+  setup_fixture "$fixture"
+  printf 'part\n' >"$fixture/data/monday/spool/binance-lob/usdm/part-001.jsonl.part"
+  run_action "$fixture" isolate usdm
+  ready_dir=$(find "$fixture/data/monday/spool/binance-lob-recovery/usdm" -mindepth 1 -maxdepth 1 -type d -name '*.ready' | head -n 1)
+  release_env=$(jq -r '.release_env' "$ready_dir/job.json")
+  sed '/^OSS_COPY_TIMEOUT_SECONDS=/d' "$release_env" >"$release_env.tmp"
+  mv "$release_env.tmp" "$release_env"
+  env_sha=$(sha256sum "$release_env" | awk '{print $1}')
+  jq --arg env_sha "$env_sha" '.env_sha256 = $env_sha' "$ready_dir/job.json" \
+    >"$ready_dir/job.json.tmp"
+  mv "$ready_dir/job.json.tmp" "$ready_dir/job.json"
+  expect_failure "$fixture" drain usdm
+  assert invalid-env-no-binary test ! -s "$fixture/binary.log"
 }
 
 test_unsafe_release_identity_fails_closed() {
@@ -374,12 +436,35 @@ test_passed_running_finalizes_without_retry() {
   ready_dir=$(find "$fixture/data/monday/spool/binance-lob-recovery/usdm" -mindepth 1 -maxdepth 1 -type d -name '*.ready' | head -n 1)
   running_dir="${ready_dir%.ready}.running"
   mv "$ready_dir" "$running_dir"
-  job_id=$(jq -r '.job_id' "$running_dir/job.json")
-  jq -n '{result:"passed"}' >"$running_dir/result.json"
-  run_action "$fixture" drain usdm
+  # Globals below are produced/consumed by functions from the sourced script.
+  # shellcheck disable=SC2034
+  MARKET=usdm
+  market_paths
+  load_job "$running_dir"
+  # shellcheck disable=SC2153
+  job_id=$JOB_ID
+  # shellcheck disable=SC2034
+  JOB_STARTED_AT=2026-08-22T00:00:00Z
   evidence_dir="$fixture/data/monday/evidence/recoveries/lob-queue/$job_id"
+  ensure_root_directory "$evidence_dir"
+  write_result "$evidence_dir/result.json" passed upload-readback-ok complete
+  run_action "$fixture" drain usdm
   [[ -d $evidence_dir/spool.done ]] || exit 1
   assert no-binary-call test ! -s "$fixture/binary.log"
+}
+
+test_running_job_ignores_untrusted_in_spool_pass_result() {
+  local fixture=$tmp_dir/forged-result ready_dir running_dir
+  setup_fixture "$fixture"
+  printf 'part\n' >"$fixture/data/monday/spool/binance-lob/usdm/part-001.jsonl.part"
+  run_action "$fixture" isolate usdm
+  ready_dir=$(find "$fixture/data/monday/spool/binance-lob-recovery/usdm" -mindepth 1 -maxdepth 1 -type d -name '*.ready' | head -n 1)
+  running_dir="${ready_dir%.ready}.running"
+  mv "$ready_dir" "$running_dir"
+  jq -n '{result:"passed"}' >"$running_dir/result.json"
+  expect_failure "$fixture" drain usdm
+  [[ -d $running_dir ]]
+  assert forged-result-no-binary test ! -s "$fixture/binary.log"
 }
 
 test_no_part_noop
@@ -387,11 +472,14 @@ test_isolate_creates_ready_job
 test_drain_runs_recover_then_upload
 test_drain_does_not_depend_on_current_production_symlink
 test_failed_job_is_not_retried
+test_other_market_recovery_defers_without_mutating_job
+test_invalid_release_env_never_executes_recovery_binary
 test_unsafe_release_identity_fails_closed
 test_missing_canonical_lock_fails_closed
 test_symlinked_queue_root_fails_closed
 test_missing_canonical_recovers_only_with_valid_queue_job
 test_missing_canonical_without_valid_queue_job_fails_closed
 test_passed_running_finalizes_without_retry
+test_running_job_ignores_untrusted_in_spool_pass_result
 
 printf 'ok\n'

@@ -4,6 +4,8 @@ After=network-online.target
 Wants=network-online.target
 RequiresMountsFor=/data
 AssertPathIsMountPoint=/data
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -31,8 +33,8 @@ RestrictSUIDSGID=true
 StateDirectory=hft-collector
 ReadWritePaths=/data/monday/spool/binance-lob -/data/monday/spool/binance-lob-recovery
 CPUQuota=80%
-MemoryHigh=3072M
-MemoryMax=3584M
+MemoryHigh=2048M
+MemoryMax=2560M
 
 [Install]
 WantedBy=multi-user.target

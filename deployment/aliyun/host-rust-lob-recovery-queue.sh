@@ -74,9 +74,11 @@ require_env_value() {
   [[ $actual == "$expected" ]] || fail "$file has unsafe $key=$actual (expected $expected)"
 }
 
-allowlisted_env_args() {
+ALLOWLISTED_ENV_ARGS=()
+
+load_allowlisted_env_args() {
   local file=$1 spool_dir=$2 key value
-  local -a args=()
+  ALLOWLISTED_ENV_ARGS=()
   require_env_value "$file" MARKET "$MARKET"
   require_env_value "$file" SHARD_ID all
   require_env_value "$file" SPOOL_DIR "$CANONICAL_SPOOL"
@@ -89,10 +91,9 @@ allowlisted_env_args() {
     OSS_BUCKET OSS_ENDPOINT OSS_REGION ALIYUN_PROFILE OSS_COPY_TIMEOUT_SECONDS; do
     value=$(env_value "$file" "$key") \
       || fail "$file must contain exactly one $key setting"
-    args+=("$key=$value")
+    ALLOWLISTED_ENV_ARGS+=("$key=$value")
   done
-  args+=("SPOOL_DIR=$spool_dir")
-  printf '%s\0' "${args[@]}"
+  ALLOWLISTED_ENV_ARGS+=("SPOOL_DIR=$spool_dir")
 }
 
 canonical_paths_safe() {
@@ -120,12 +121,20 @@ canonical_paths_safe() {
 }
 
 ensure_root_directory() {
-  local path=$1
+  local path=$1 expected_gid=${2:-0}
   if [[ -e $path || -L $path ]]; then
-    secure_directory "$path" 0 0
+    secure_directory "$path" 0 "$expected_gid"
   else
-    install -d -m 0750 -o root -g root -- "$path"
+    install -d -m 0750 -o root -g "$expected_gid" -- "$path"
   fi
+}
+
+ensure_queue_directory() {
+  local path=$1 hft_gid=$2 mode
+  ensure_root_directory "$path" "$hft_gid"
+  mode=$(stat -c %a -- "$path")
+  (( (8#$mode & 010) != 0 )) \
+    || fail "collector group cannot traverse recovery queue directory: $path"
 }
 
 market_paths() {
@@ -224,6 +233,11 @@ queue_lock() {
   flock -n 9 || fail "another recovery queue operation holds the $MARKET lock"
 }
 
+drain_lock() {
+  exec 7>"$LOCK_ROOT/monday-rust-lob-recovery-drain.lock"
+  flock -n 7
+}
+
 write_job_receipt() {
   local job_id=$1 queue_unit=$2 tmp
   tmp="$CANONICAL_SPOOL/job.json.tmp.$$"
@@ -283,13 +297,12 @@ job_receipt_valid_for_canonical() {
 }
 
 recover_missing_canonical_after_partial_isolate() {
-  local hft_uid=$1 hft_gid=$2 queue_dir count=0 first_valid=
+  local hft_uid=$1 hft_gid=$2 queue_dir count=0
   [[ -e $CANONICAL_SPOOL || -L $CANONICAL_SPOOL ]] && return 1
   [[ -d $QUEUE_MARKET_ROOT && ! -L $QUEUE_MARKET_ROOT ]] \
     || fail "canonical spool is missing without a recovery queue: $CANONICAL_SPOOL"
   while IFS= read -r queue_dir; do
     if job_receipt_valid_for_canonical "$queue_dir"; then
-      first_valid=${first_valid:-$queue_dir}
       count=$((count + 1))
     fi
   done < <(find "$QUEUE_MARKET_ROOT" -mindepth 1 -maxdepth 1 -type d \
@@ -297,6 +310,7 @@ recover_missing_canonical_after_partial_isolate() {
   (( count == 1 )) \
     || fail "canonical spool is missing without exactly one valid queued recovery job: $CANONICAL_SPOOL"
   install -d -m 0750 -o "$hft_uid" -g "$hft_gid" -- "$CANONICAL_SPOOL"
+  sync -f "$CANONICAL_ROOT"
   systemctl start --no-block "$RECOVERY_SERVICE@$MARKET.service" >/dev/null 2>&1 || true
   return 0
 }
@@ -305,6 +319,8 @@ isolate_market() {
   local hft_uid hft_gid job_id ready_dir queue_unit spool_lock
   hft_uid=$(id -u hftcollector)
   hft_gid=$(id -g hftcollector)
+  ensure_queue_directory "$QUEUE_ROOT" "$hft_gid"
+  ensure_queue_directory "$QUEUE_MARKET_ROOT" "$hft_gid"
   if [[ ! -e $CANONICAL_SPOOL && ! -L $CANONICAL_SPOOL ]]; then
     recover_missing_canonical_after_partial_isolate "$hft_uid" "$hft_gid" && exit 0
   fi
@@ -316,11 +332,6 @@ isolate_market() {
   secure_regular_file "$spool_lock" "$hft_uid"
   exec 8<>"$spool_lock"
   flock -n 8 || fail "collector spool lock is already held: $spool_lock"
-  ensure_root_directory "$QUEUE_ROOT"
-  ensure_root_directory "$QUEUE_MARKET_ROOT"
-  ensure_root_directory "$DATA_ROOT/monday/evidence"
-  ensure_root_directory "$DATA_ROOT/monday/evidence/recoveries"
-  ensure_root_directory "$EVIDENCE_ROOT"
   same_filesystem "$CANONICAL_ROOT" "$QUEUE_MARKET_ROOT" \
     || fail "queue root must share a filesystem with the canonical spool: $QUEUE_MARKET_ROOT"
   job_id="$(date -u +%Y%m%dT%H%M%SZ)-${MARKET}-${RELEASE_SHA256:0:12}-$$"
@@ -329,7 +340,10 @@ isolate_market() {
   queue_unit="$RECOVERY_SERVICE@$MARKET.service"
   write_job_receipt "$job_id" "$queue_unit"
   mv -T -- "$CANONICAL_SPOOL" "$ready_dir"
+  sync -f "$CANONICAL_ROOT"
+  sync -f "$QUEUE_MARKET_ROOT"
   install -d -m 0750 -o "$hft_uid" -g "$hft_gid" -- "$CANONICAL_SPOOL"
+  sync -f "$CANONICAL_ROOT"
   systemctl start --no-block "$queue_unit" >/dev/null 2>&1 || true
 }
 
@@ -342,11 +356,6 @@ oldest_ready_dir() {
 running_dirs() {
   [[ -d $QUEUE_MARKET_ROOT && ! -L $QUEUE_MARKET_ROOT ]] || return 0
   find "$QUEUE_MARKET_ROOT" -mindepth 1 -maxdepth 1 -type d -name '*.running' -print | sort
-}
-
-job_result_path() {
-  local queue_dir=$1
-  printf '%s/result.json\n' "$queue_dir"
 }
 
 job_evidence_root() {
@@ -376,14 +385,16 @@ write_result() {
       step:$step,message:$message}' >"$path.tmp"
   chmod 0640 "$path.tmp"
   mv -Tf "$path.tmp" "$path"
+  sync -f "$path"
+  sync -f "${path%/*}"
 }
 
 load_job() {
-  local queue_dir=$1 job_json queue_id
+  local queue_dir=$1 job_json queue_id job_schema
   job_json="$queue_dir/job.json"
   secure_regular_file "$job_json" 0
   queue_id=$(job_dir_id "$queue_dir") || fail "queued job directory has an invalid name: $queue_dir"
-  JOB_SCHEMA=$(jq -er '.schema' "$job_json")
+  job_schema=$(jq -er '.schema' "$job_json")
   JOB_ID=$(jq -er '.job_id' "$job_json")
   JOB_MARKET=$(jq -er '.market' "$job_json")
   JOB_CANONICAL_SPOOL=$(jq -er '.canonical_spool' "$job_json")
@@ -393,7 +404,7 @@ load_job() {
   JOB_ENV_SHA256=$(jq -er '.env_sha256' "$job_json")
   JOB_RELEASE_ENV=$(jq -er '.release_env' "$job_json")
   JOB_RECOVERY_UNIT=$(jq -er '.recovery_unit' "$job_json")
-  [[ $JOB_SCHEMA == monday.rust_lob_recovery_queue.v1 ]] || fail "queued job has an invalid schema: $queue_dir"
+  [[ $job_schema == monday.rust_lob_recovery_queue.v1 ]] || fail "queued job has an invalid schema: $queue_dir"
   [[ $JOB_ID == "$queue_id" ]] || fail "queued job id does not match its directory: $queue_dir"
   [[ $JOB_MARKET == "$MARKET" ]] || fail "queued job market mismatch: $queue_dir"
   [[ $JOB_CANONICAL_SPOOL == "$CANONICAL_SPOOL" ]] || fail "queued job canonical spool mismatch: $queue_dir"
@@ -409,21 +420,26 @@ load_job() {
 
 finalize_passed_running() {
   local running_dir=$1 result evidence_root
-  result=$(job_result_path "$running_dir")
-  [[ -f $result ]] || return 1
-  jq -e '.result == "passed"' "$result" >/dev/null || return 1
   load_job "$running_dir"
   evidence_root=$(job_evidence_root "$JOB_ID")
-  install -d -m 0750 -o root -g root -- "$evidence_root"
+  [[ -d $evidence_root && ! -L $evidence_root ]] || return 1
+  secure_directory "$evidence_root" 0 0
+  result="$evidence_root/result.json"
+  secure_regular_file "$result" 0
+  jq -e \
+    --arg job_id "$JOB_ID" \
+    --arg market "$MARKET" \
+    --arg release_sha256 "$JOB_RELEASE_SHA256" \
+    '.result == "passed"
+      and .job_id == $job_id
+      and .market == $market
+      and .release_sha256 == $release_sha256' \
+    "$result" >/dev/null || return 1
   [[ ! -e $evidence_root/spool.done && ! -L $evidence_root/spool.done ]] \
     || fail "refusing to reuse evidence spool path: $evidence_root/spool.done"
   mv -T -- "$running_dir" "$evidence_root/spool.done"
-  install -m 0640 "$evidence_root/spool.done/result.json" "$evidence_root/result.json"
-}
-
-recover_args_from_release_env() {
-  local file=$1 spool=$2
-  allowlisted_env_args "$file" "$spool"
+  sync -f "$QUEUE_MARKET_ROOT"
+  sync -f "$evidence_root"
 }
 
 check_upload_readback() {
@@ -466,8 +482,9 @@ run_drain_job() {
   ensure_root_directory "$EVIDENCE_ROOT"
   ensure_root_directory "$evidence_root"
   backup_dir="$evidence_root/recovery-input"
-  result_path=$(job_result_path "$running_dir")
-  mapfile -d '' -t env_args < <(recover_args_from_release_env "$release_env" "$running_dir")
+  result_path="$evidence_root/result.json"
+  load_allowlisted_env_args "$release_env" "$running_dir"
+  env_args=("${ALLOWLISTED_ENV_ARGS[@]}")
   env -i \
     HOME=/root \
     PATH="$SAFE_PATH" \
@@ -491,7 +508,8 @@ run_drain_job() {
   [[ ! -e $evidence_root/spool.done && ! -L $evidence_root/spool.done ]] \
     || fail "refusing to reuse evidence spool path: $evidence_root/spool.done"
   mv -T -- "$running_dir" "$evidence_root/spool.done"
-  install -m 0640 "$evidence_root/spool.done/result.json" "$evidence_root/result.json"
+  sync -f "$QUEUE_MARKET_ROOT"
+  sync -f "$evidence_root"
 }
 
 mark_failed() {
@@ -504,13 +522,12 @@ mark_failed() {
   ensure_root_directory "$DATA_ROOT/monday/evidence/recoveries"
   ensure_root_directory "$EVIDENCE_ROOT"
   ensure_root_directory "$evidence_root"
-  result_path=$(job_result_path "$running_dir")
+  result_path="$evidence_root/result.json"
   write_result "$result_path" failed "$step" "$message"
   if [[ $running_dir != "$failed_dir" ]]; then
     mv -T -- "$running_dir" "$failed_dir"
-    result_path=$(job_result_path "$failed_dir")
+    sync -f "$QUEUE_MARKET_ROOT"
   fi
-  install -m 0640 "$result_path" "$evidence_root/result.json"
 }
 
 CURRENT_RUNNING_DIR=
@@ -526,21 +543,20 @@ on_signal() {
 }
 
 drain_market() {
-  local ready_dir running_dir
+  local ready_dir running_dir hft_gid
   local -a running=()
-  if [[ -e $QUEUE_ROOT || -L $QUEUE_ROOT ]]; then
-    secure_directory "$QUEUE_ROOT" 0 0
+  if ! drain_lock; then
+    printf 'another market recovery is active; deferred %s drain\n' "$MARKET"
+    exit 0
   fi
-  if [[ -e $QUEUE_MARKET_ROOT || -L $QUEUE_MARKET_ROOT ]]; then
-    secure_directory "$QUEUE_MARKET_ROOT" 0 0
-  else
-    install -d -m 0750 -o root -g root -- "$QUEUE_MARKET_ROOT"
-  fi
-  if [[ -e $EVIDENCE_ROOT || -L $EVIDENCE_ROOT ]]; then
-    secure_directory "$EVIDENCE_ROOT" 0 0
-  else
-    install -d -m 0750 -o root -g root -- "$EVIDENCE_ROOT"
-  fi
+  hft_gid=$(id -g hftcollector)
+  ensure_queue_directory "$QUEUE_ROOT" "$hft_gid"
+  ensure_queue_directory "$QUEUE_MARKET_ROOT" "$hft_gid"
+  ensure_root_directory "$DATA_ROOT/monday/evidence"
+  ensure_root_directory "$DATA_ROOT/monday/evidence/recoveries"
+  ensure_root_directory "$EVIDENCE_ROOT"
+  same_filesystem "$QUEUE_MARKET_ROOT" "$EVIDENCE_ROOT" \
+    || fail "recovery queue and evidence root must share a filesystem"
   mapfile -t running < <(running_dirs)
   if (( ${#running[@]} > 1 )); then
     fail "multiple running recovery jobs require manual intervention: $QUEUE_MARKET_ROOT"
@@ -556,6 +572,7 @@ drain_market() {
   [[ -n $ready_dir ]] || exit 0
   running_dir="${ready_dir%.ready}.running"
   mv -T -- "$ready_dir" "$running_dir"
+  sync -f "$QUEUE_MARKET_ROOT"
   CURRENT_RUNNING_DIR=$running_dir
   CURRENT_STEP=recover-upload
   if ( run_drain_job "$running_dir" ); then
@@ -577,7 +594,7 @@ main() {
     usage
     exit 2
   fi
-  for command in awk date env find flock grep id install jq mv readlink runuser sha256sum stat sync systemctl wc; do
+  for command in awk chmod date env find flock grep head id install jq mv readlink runuser sha256sum sort stat sync systemctl; do
     command -v "$command" >/dev/null 2>&1 \
       || fail "missing required command: $command"
   done

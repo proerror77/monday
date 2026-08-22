@@ -283,6 +283,14 @@ validate_deployment() {
     grep -Fxq 'ExecStartPre=+/opt/monday/bin/monday-rust-lob-recovery-queue isolate %i' \
       "$directory/binance-lob-archiver-production@.service" \
       || fail 'candidate production unit does not isolate interrupted spools'
+    grep -Fxq 'CPUQuota=80%' "$directory/binance-lob-archiver-production@.service" \
+      || fail 'candidate production unit has the wrong CPU quota'
+    grep -Fxq 'MemoryMax=2560M' "$directory/binance-lob-archiver-production@.service" \
+      || fail 'candidate production unit has the wrong memory limit'
+    grep -Fxq 'StartLimitIntervalSec=300' "$directory/binance-lob-archiver-production@.service" \
+      || fail 'candidate production unit has the wrong restart interval'
+    grep -Fxq 'StartLimitBurst=5' "$directory/binance-lob-archiver-production@.service" \
+      || fail 'candidate production unit has no bounded restart policy'
     grep -Fxq 'AssertPathIsMountPoint=/data' \
       "$directory/binance-lob-archiver-upload@.service" \
       || fail 'candidate upload unit does not assert the /data mount'
@@ -295,6 +303,10 @@ validate_deployment() {
     grep -Fxq 'ExecStart=/opt/monday/bin/monday-rust-lob-recovery-queue drain %i' \
       "$directory/binance-lob-archiver-recovery@.service" \
       || fail 'candidate recovery unit has the wrong executable'
+    grep -Fxq 'CPUQuota=25%' "$directory/binance-lob-archiver-recovery@.service" \
+      || fail 'candidate recovery unit has the wrong CPU quota'
+    grep -Fxq 'MemoryMax=768M' "$directory/binance-lob-archiver-recovery@.service" \
+      || fail 'candidate recovery unit has the wrong memory limit'
     grep -Fxq 'Unit=binance-lob-archiver-recovery@%i.service' \
       "$directory/binance-lob-archiver-recovery@.timer" \
       || fail 'candidate recovery timer has the wrong service target'
@@ -406,6 +418,15 @@ require_empty_segment_spool() {
   fi
 }
 
+has_incomplete_segment_artifacts() {
+  local spool=$1
+  find "$spool" -type f \( \
+    -name '*.jsonl.part' -o \
+    -name '*.zst.tmp' -o \
+    -name '*.part.corrupt' \
+  \) -print -quit | grep -q .
+}
+
 run_candidate_drain() {
   local deployment=$1 market env_file key value recovery_parent recovery_dir
   local -a env_args
@@ -419,8 +440,7 @@ run_candidate_drain() {
       [[ -n $value ]] || return 1
       env_args+=("$key=$value")
     done
-    if find "$CANONICAL_SPOOL/$market" -type f -name '*.jsonl.part' -print -quit \
-      | grep -q .; then
+    if has_incomplete_segment_artifacts "$CANONICAL_SPOOL/$market"; then
       recovery_parent="$EVIDENCE_DIR/recovery-input/$market"
       install -d -m 0750 -o root -g root -- "$recovery_parent" || return 1
       recovery_dir="$recovery_parent/$(date -u +%Y%m%dT%H%M%S%NZ)-$$"

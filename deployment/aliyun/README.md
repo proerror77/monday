@@ -1102,8 +1102,10 @@ are included in the transition mask so they cannot become a second canonical
 writer.
 
 The drain is bootstrap-safe: it runs the digest-pinned target binary against
-the previous production env. If that spool contains `.jsonl.part` files, the
-candidate takes the per-spool writer lock and preserves root-owned, read-only,
+the previous production env. Any `.jsonl.part`, `.zst.tmp`, or `.part.corrupt`
+enters the recovery path; `.part.corrupt` is deliberately refused and blocks
+cutover for manual inspection. For recoverable inputs, the candidate takes the
+per-spool writer lock and preserves root-owned, read-only,
 hash-verified copies plus a source-metadata receipt under the cutover evidence
 directory before changing any part. The receipt binds the candidate digest,
 deployment source revision, and deployment-bundle digest already verified by
@@ -1123,6 +1125,22 @@ of restarting a writer that could bypass the recovery checks. A recovered
 manifest deliberately preserves its fail-closed replay and
 readiness evidence; successful OSS triplet upload is not a data-quality verdict,
 so cutover readback reports the recovered manifest's gaps and readiness as-is.
+
+Normal production restart does not perform this recovery inline. Its privileged
+pre-start step only locks and atomically moves the affected market spool to a
+root-owned recovery queue, recreates an empty canonical spool, and lets live
+acquisition start. A separate timer drains one market at a time with the exact
+release and env recorded in the queue receipt. Failed or interrupted jobs stay
+`.failed` or `.running` for manual inspection and are never retried in a restart
+loop. Queue age and failure state are separate collector-health breaches; a
+healthy live collector does not claim that a queued historical segment has been
+delivered. The two production instances are each bounded at `CPUQuota=80%` and
+`MemoryMax=2560M`; the globally serialized recovery worker is bounded at
+`CPUQuota=25%` and `MemoryMax=768M`, keeping configured collector work below the
+2-vCPU/8-GiB host boundary without increasing the ECS size. A persistent
+pre-start failure is capped at five attempts per five minutes instead of
+restarting every five seconds forever.
+
 A new host is accepted
 only when the canonical spool contains no segment artifact. The script then
 atomically changes the production symlink and starts both services without
@@ -1196,6 +1214,9 @@ unique recovery evidence directory is created under
 `/data/monday/evidence/recoveries/<ts>-<sha:0:12>-<pid>/` and holds the previous
 and post-restart health snapshots, a copy of the gated `gate.json` +
 `PASSED.sha256`, and immutable `recovery.json` + `verification.json`.
+Restore success proves the live acquisition runtime only. Detached queue
+completion remains a separate delivery state reported by collector health and
+its per-job result evidence.
 
 If the restored units never reach verified health, the host restore performs a
 fail-closed rollback: it disables and stops production, applies the runtime

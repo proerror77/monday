@@ -588,6 +588,25 @@ run_health_failure_fixture() (
   [[ -f $evidence/rollback-spot-health.json && -f $evidence/rollback-usdm-health.json ]]
 )
 
+run_evidence_failure_disables_recovery_timers_fixture() (
+  fixture="$tmp_dir/evidence-failure"
+  setup_fixture "$fixture"
+  # Called indirectly by restore_release from the sourced script.
+  # shellcheck disable=SC2329
+  write_recovery_evidence() { return 1; }
+  if restore_release "$CANDIDATE_SHA256" >"$fixture/out" 2>&1; then
+    printf 'restore accepted a failed final evidence write\n' >&2
+    exit 1
+  fi
+  grep -Fq 'restore failed and evidence could not be written' "$fixture/out"
+  for timer in \
+    binance-lob-archiver-recovery@spot.timer \
+    binance-lob-archiver-recovery@usdm.timer; do
+    [[ ! -f $MOCK_STATE/active/$timer ]]
+    [[ ! -f $MOCK_STATE/enabled/$timer ]]
+  done
+)
+
 run_success_fixture
 run_missing_symlink_fixture
 run_symlink_mismatch_fixture
@@ -597,5 +616,6 @@ run_spool_symlink_fixture
 run_recovery_isolation_fixture
 run_drifted_assets_fixture
 run_health_failure_fixture
+run_evidence_failure_disables_recovery_timers_fixture
 
 printf 'Rust LOB governed restore tests passed\n'

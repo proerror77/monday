@@ -10,4 +10,3 @@ Unit=binance-lob-archiver-recovery@%i.service
 
 [Install]
 WantedBy=timers.target
-

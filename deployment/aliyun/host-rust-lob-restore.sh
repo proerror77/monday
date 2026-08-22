@@ -291,9 +291,10 @@ write_verification_evidence() {
 rollback_after_failure() {
   local unit
   ROLLBACK_RESULT=disabled
+  systemctl disable --now "${RECOVERY_TIMERS[@]}" >/dev/null 2>&1 || true
   systemctl disable --now "${PRODUCTION_UNITS[@]}" >/dev/null 2>&1 || true
   systemctl mask --runtime "${TRANSITION_MASK_UNITS[@]}" >/dev/null 2>&1 || true
-  for unit in "${PRODUCTION_UNITS[@]}"; do
+  for unit in "${PRODUCTION_UNITS[@]}" "${RECOVERY_TIMERS[@]}"; do
     if systemctl is-active --quiet "$unit" || systemctl is-enabled --quiet "$unit"; then
       ROLLBACK_RESULT=production-stop-or-disable-failed-but-contained
     fi
@@ -527,8 +528,8 @@ restore_release() (
   STEP=write-recovery-evidence
   RESULT=passed
   ROLLBACK_RESULT=not-needed
-  write_recovery_evidence
-  write_verification_evidence
+  write_recovery_evidence || fail 'could not write restore evidence'
+  write_verification_evidence || fail 'could not write restore verification'
   SUCCESS=1
   trap - EXIT ERR
   printf 'Rust collector restore passed: %s\nEvidence: %s/recovery.json\n' \

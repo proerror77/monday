@@ -200,6 +200,13 @@ grep -Fxq 'Unit=binance-lob-archiver-recovery@%i.service' \
   "$SCRIPT_DIR/binance-lob-archiver-recovery@.timer"
 grep -Fq 'host-rust-lob-recovery-queue.sh' "$INSTALL_RELEASE"
 drain_body=$(sed -n '/^run_candidate_drain()/,/^}/p' "$CUTOVER")
+incomplete_body=$(sed -n '/^has_incomplete_segment_artifacts()/,/^}/p' "$CUTOVER")
+for suffix in '*.jsonl.part' '*.zst.tmp' '*.part.corrupt'; do
+  grep -Fq -- "-name '$suffix'" <<<"$incomplete_body" || {
+    printf 'cutover does not detect interrupted %s artifacts\n' "$suffix" >&2
+    exit 1
+  }
+done
 backup_line=$(grep -n -- 'RECOVERY_BACKUP_DIR=' <<<"$drain_body" | cut -d: -f1)
 recover_line=$(grep -n -- '--recover-parts-only' <<<"$drain_body" | cut -d: -f1)
 upload_line=$(grep -n -- '--upload-only' <<<"$drain_body" | cut -d: -f1)
