@@ -593,7 +593,9 @@ run_evidence_failure_disables_recovery_timers_fixture() (
   setup_fixture "$fixture"
   # Called indirectly by restore_release from the sourced script.
   # shellcheck disable=SC2317,SC2329
-  write_recovery_evidence() { return 1; }
+  write_recovery_evidence() {
+    return 1
+  }
   if restore_release "$CANDIDATE_SHA256" >"$fixture/out" 2>&1; then
     printf 'restore accepted a failed final evidence write\n' >&2
     exit 1
