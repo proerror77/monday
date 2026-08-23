@@ -201,7 +201,7 @@ impl OrderBookState {
 
     pub fn apply_diff(
         &mut self,
-        diff: DepthDiff,
+        diff: &DepthDiff,
         budget: &mut PendingBudget,
     ) -> anyhow::Result<bool> {
         if diff.symbol != self.symbol {
@@ -209,10 +209,10 @@ impl OrderBookState {
         }
         if !self.snapshot_installed {
             budget.reserve()?;
-            self.pending.push(diff);
+            self.pending.push(diff.clone());
             return Ok(false);
         }
-        self.apply_after_snapshot(&diff)?;
+        self.apply_after_snapshot(diff)?;
         Ok(true)
     }
 
@@ -1295,6 +1295,7 @@ pub fn write_health(
     session_id: &str,
     status: &str,
     sequence_gaps: u64,
+    sequence_gap_total: u64,
     pending_upload_segments: usize,
     queue: QueueHealth,
     states: &HashMap<String, OrderBookState>,
@@ -1356,6 +1357,7 @@ pub fn write_health(
             "full_stream_coverage_verified": readiness.all_stream_coverage_verified,
             "session_id": session_id,
             "sequence_gaps": sequence_gaps,
+            "sequence_gap_total": sequence_gap_total,
             "pending_upload_segments": pending_upload_segments,
             "disk_free_gb": disk_free_gb,
             "disk_warning": disk_free_gb.is_some_and(|free| free < disk_warning_threshold_gb),
@@ -1719,7 +1721,7 @@ mod tests {
             ["99.50000000".to_string(), "5.00000000".to_string()],
             ["100.00000000".to_string(), "0.00000000".to_string()],
         ];
-        state.apply_diff(update, &mut budget).unwrap();
+        state.apply_diff(&update, &mut budget).unwrap();
 
         let checkpoint = state.checkpoint("session-1").unwrap();
         assert_eq!(
@@ -1738,7 +1740,7 @@ mod tests {
         let mut state = OrderBookState::new("BTCUSDT", Market::Spot);
         let mut budget = PendingBudget::new(10);
         state
-            .apply_diff(diff("BTCUSDT", 101, 102, None), &mut budget)
+            .apply_diff(&diff("BTCUSDT", 101, 102, None), &mut budget)
             .unwrap();
         state.install_snapshot(&snapshot(100), &mut budget).unwrap();
         assert_eq!(state.last_update_id(), Some(102));
@@ -1746,7 +1748,7 @@ mod tests {
         assert_eq!(budget.count(), 0);
 
         let gap = state
-            .apply_diff(diff("BTCUSDT", 104, 104, None), &mut budget)
+            .apply_diff(&diff("BTCUSDT", 104, 104, None), &mut budget)
             .unwrap_err();
         assert!(gap.downcast_ref::<SequenceGap>().is_some());
         assert!(!state.synced);
@@ -1776,15 +1778,15 @@ mod tests {
         let mut budget = PendingBudget::new(10);
         state.install_snapshot(&snapshot(100), &mut budget).unwrap();
         state
-            .apply_diff(diff("1000SHIBUSDT", 150, 175, Some(100)), &mut budget)
+            .apply_diff(&diff("1000SHIBUSDT", 150, 175, Some(100)), &mut budget)
             .unwrap();
         state
-            .apply_diff(diff("1000SHIBUSDT", 176, 180, Some(175)), &mut budget)
+            .apply_diff(&diff("1000SHIBUSDT", 176, 180, Some(175)), &mut budget)
             .unwrap();
         assert_eq!(state.last_update_id(), Some(180));
 
         assert!(state
-            .apply_diff(diff("1000SHIBUSDT", 181, 182, Some(174)), &mut budget,)
+            .apply_diff(&diff("1000SHIBUSDT", 181, 182, Some(174)), &mut budget,)
             .is_err());
     }
 
@@ -1797,7 +1799,7 @@ mod tests {
 
         assert!(!state.bridged);
         state
-            .apply_diff(diff("BTCUSDT", 95, 105, Some(90)), &mut budget)
+            .apply_diff(&diff("BTCUSDT", 95, 105, Some(90)), &mut budget)
             .unwrap();
         assert!(state.bridged);
         assert_eq!(state.last_update_id(), Some(105));
@@ -1823,7 +1825,7 @@ mod tests {
         let mut budget = PendingBudget::new(10);
         state.install_snapshot(&snapshot(100), &mut budget).unwrap();
         state
-            .apply_diff(diff("BTCUSDT", 90, 100, Some(42)), &mut budget)
+            .apply_diff(&diff("BTCUSDT", 90, 100, Some(42)), &mut budget)
             .unwrap();
         assert!(state.synced);
         assert!(!state.bridged);
@@ -1838,7 +1840,7 @@ mod tests {
         let mut update = diff("BTCUSDT", 101, 101, None);
         update.bids = vec![["100.00000000".to_string(), "0.00000000".to_string()]];
         update.asks = vec![["102.12345678".to_string(), "1.00000001".to_string()]];
-        state.apply_diff(update, &mut budget).unwrap();
+        state.apply_diff(&update, &mut budget).unwrap();
         let checkpoint = state.checkpoint("session-1").unwrap();
         assert!(checkpoint.bids.is_empty());
         assert_eq!(checkpoint.asks[1], ["102.12345678", "1.00000001"]);
@@ -1916,7 +1918,8 @@ mod tests {
             "spot_all",
             "session-1",
             "synced",
-            0,
+            2,
+            5,
             1,
             QueueHealth {
                 capacity: 1,
@@ -1931,6 +1934,8 @@ mod tests {
         assert_eq!(health["upload_warning"], true);
         assert_eq!(health["upload_failure_count"], 7);
         assert_eq!(health["last_upload_error"], "oss down");
+        assert_eq!(health["sequence_gaps"], 2);
+        assert_eq!(health["sequence_gap_total"], 5);
         assert_eq!(health["snapshot_ready_count"], 0);
         assert_eq!(health["bridged_count"], 0);
         assert_eq!(health["snapshot_only_symbols"], json!([]));
