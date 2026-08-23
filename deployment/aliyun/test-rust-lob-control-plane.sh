@@ -1339,6 +1339,36 @@ sed -n '/^production_is_fail_closed()/,/^}/p' "$CUTOVER" \
 partial_predicate_body="$tmp_dir/partial-spot-is-restored.sh"
 sed -n '/^partial_spot_runtime_is_restored()/,/^}/p' "$CUTOVER" \
   >"$partial_predicate_body"
+release_match_body="$tmp_dir/unit-matches-release.sh"
+sed -n '/^unit_matches_release()/,/^}/p' "$CUTOVER" >"$release_match_body"
+run_release_match_fixture() (
+  local current_restarts=$1 expected_restarts=$2
+  local current_invocation=11111111111111111111111111111111
+  systemctl() {
+    case "$1:$2:${3:-}:${4:-}" in
+      is-active:--quiet:production-spot:) return 0 ;;
+      is-enabled:--quiet:production-spot:) return 0 ;;
+      show:production-spot:--property=NRestarts:--value) printf '%s\n' "$current_restarts" ;;
+      show:production-spot:--property=InvocationID:--value) printf '%s\n' "$current_invocation" ;;
+      show:production-spot:--property=MainPID:--value) printf '123\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  readlink() { [[ $1 == -f && $2 == /proc/123/exe ]] && printf '/old-binary\n'; }
+  # shellcheck disable=SC1090
+  . "$release_match_body"
+  unit_matches_release production-spot /old-binary true \
+    "$expected_restarts" "$current_invocation"
+)
+run_release_match_fixture 1 1
+if run_release_match_fixture 1 0; then
+  printf 'release matcher ignored a nonzero restart baseline\n' >&2
+  exit 1
+fi
+if run_release_match_fixture 2 1; then
+  printf 'release matcher accepted a changed restart baseline\n' >&2
+  exit 1
+fi
 spot_wait_body="$tmp_dir/wait-for-spot-release-health.sh"
 sed -n '/^wait_for_spot_release_health()/,/^}/p' "$CUTOVER" >"$spot_wait_body"
 run_spot_wait_fixture() (
@@ -1444,22 +1474,27 @@ grep -Fq '$usdm_enabled_state == masked || $usdm_enabled_state == masked-runtime
 grep -Fq '$spot_upload_enabled_state == static' <<<"$host_state_dispatch"
 grep -Fq '$spot_upload_enabled_state == masked-runtime' <<<"$host_state_dispatch"
 grep -Fq '$usdm_upload_enabled_state == masked' <<<"$host_state_dispatch"
+grep -Fq '$usdm_upload_enabled_state == static' <<<"$host_state_dispatch"
+grep -Fq 'previous_spot_restarts' "$CUTOVER"
+grep -Fq 'previous_spot_invocation_id' "$CUTOVER"
 host_state_dispatch_file="$tmp_dir/host-state-dispatch.sh"
 printf '%s\n' "$host_state_dispatch" >"$host_state_dispatch_file"
 run_partial_host_state_fixture() (
   local usdm_enabled_state=$1 usdm_main_pid=${2:-0}
   local spot_upload_enabled_state=${3:-masked-runtime}
+  local initial_usdm_upload_enabled_state=${4:-masked-runtime}
   local fixed_now_ns=2000000000000
   PRODUCTION_UNITS=(production-spot production-usdm)
   UPLOAD_UNITS=(upload-spot upload-usdm)
-  PRODUCTION_LINK="$tmp_dir/partial-production-$usdm_enabled_state-$usdm_main_pid-$spot_upload_enabled_state"
+  PRODUCTION_LINK="$tmp_dir/partial-production-$usdm_enabled_state-$usdm_main_pid-$spot_upload_enabled_state-$initial_usdm_upload_enabled_state"
   ln -s "$tmp_dir/old-production-binary" "$PRODUCTION_LINK"
   active_count=1
   enabled_count=1
   spot_active_state=active
   spot_enabled_state=enabled
   usdm_active_state=inactive
-  usdm_upload_enabled_state=masked-runtime
+  usdm_upload_enabled_state=$initial_usdm_upload_enabled_state
+  usdm_upload_masked=0
   HEALTH_TIMEOUT_SECONDS=300
   PRODUCTION_USDM_MEMORY_DROPIN_PRESENT=0
   DRAIN_REQUIRED=0
@@ -1475,9 +1510,23 @@ run_partial_host_state_fixture() (
   capture_existing_production_identity() {
     OLD_MODE=$1
     OLD_BINARY="$tmp_dir/old-production-binary"
+    OLD_SPOT_RESTARTS=1
+    OLD_SPOT_INVOCATION_ID=11111111111111111111111111111111
   }
   unit_matches_release() {
-    [[ $1 == production-spot && $2 == "$OLD_BINARY" && $3 == true ]]
+    [[ $1 == production-spot && $2 == "$OLD_BINARY" && $3 == true \
+      && $4 == 1 && $5 == "$OLD_SPOT_INVOCATION_ID" ]]
+  }
+  systemctl() {
+    if [[ $1 == mask && $2 == --runtime && $3 == upload-usdm ]]; then
+      usdm_upload_masked=1
+      return 0
+    fi
+    if [[ $1 == is-enabled && $2 == upload-usdm && $usdm_upload_masked -eq 1 ]]; then
+      printf 'masked-runtime\n'
+      return 1
+    fi
+    return 1
   }
   date() { [[ $1 == +%s%N ]] && printf '%s\n' "$fixed_now_ns"; }
   health_ready_for_release() {
@@ -1489,10 +1538,12 @@ run_partial_host_state_fixture() (
   if ! . "$host_state_dispatch_file"; then
     return 1
   fi
-  printf '%s %s\n' "$OLD_MODE" "$DRAIN_REQUIRED"
+  printf '%s %s %s\n' "$OLD_MODE" "$DRAIN_REQUIRED" "$usdm_upload_masked"
 )
 [[ $(run_partial_host_state_fixture masked-runtime) \
-  == 'partial-contained-spot-live 1' ]]
+  == 'partial-contained-spot-live 1 0' ]]
+[[ $(run_partial_host_state_fixture masked-runtime 0 masked-runtime static) \
+  == 'partial-contained-spot-live 1 1' ]]
 if run_partial_host_state_fixture disabled >"$tmp_dir/partial-disabled.out" 2>&1; then
   printf 'partial classifier accepted disabled instead of masked USD-M\n' >&2
   exit 1
