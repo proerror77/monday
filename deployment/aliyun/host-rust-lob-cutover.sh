@@ -51,6 +51,9 @@ DRAIN_ATTEMPTED=0
 DRAIN_MAY_HAVE_MUTATED=0
 SPOOL_ENV_DEPLOYMENT=
 OLD_RECOVERY_TIMERS_ENABLED=0
+OLD_SPOT_RESTARTS=
+OLD_SPOT_INVOCATION_ID=
+MASK_USDM_UPLOAD_FOR_TRANSITION=0
 
 PRODUCTION_UNITS=(
   binance-lob-archiver-production@spot.service
@@ -585,6 +588,14 @@ capture_existing_production_identity() {
     || fail 'old production has partially enabled recovery timers'
   [[ $OLD_SHA256 != "$CANDIDATE_SHA256" ]] || fail 'candidate is already the production release'
   printf '%s  %s\n' "$OLD_SHA256" "$OLD_BINARY" | sha256sum --check --strict
+  if [[ $OLD_MODE == partial-contained-spot-live ]]; then
+    OLD_SPOT_RESTARTS=$(systemctl_value "${PRODUCTION_UNITS[0]}" NRestarts)
+    [[ $OLD_SPOT_RESTARTS =~ ^[0-9]+$ ]] \
+      || fail 'running Spot production has an invalid restart baseline'
+    OLD_SPOT_INVOCATION_ID=$(systemctl_value "${PRODUCTION_UNITS[0]}" InvocationID)
+    [[ $OLD_SPOT_INVOCATION_ID =~ ^[A-Fa-f0-9]{32}$ ]] \
+      || fail 'running Spot production has an invalid invocation baseline'
+  fi
   OLD_DEPLOYMENT="$RELEASE_ROOT/$OLD_SHA256/deployment"
   stage_existing_deployment_for_rollback
   SPOOL_ENV_DEPLOYMENT="$OLD_DEPLOYMENT"
@@ -694,10 +705,15 @@ health_ready_for_release() {
 }
 
 unit_matches_release() {
-  local unit=$1 binary=$2 require_enabled=$3 restarts main_pid main_exe
+  local unit=$1 binary=$2 require_enabled=$3 expected_restarts=${4:-0}
+  local expected_invocation_id=${5:-} restarts invocation_id main_pid main_exe
   systemctl is-active --quiet "$unit" || return 1
   restarts=$(systemctl show "$unit" --property=NRestarts --value) || return 1
-  [[ $restarts == 0 ]] || return 1
+  [[ $restarts == "$expected_restarts" ]] || return 1
+  if [[ -n $expected_invocation_id ]]; then
+    invocation_id=$(systemctl show "$unit" --property=InvocationID --value) || return 1
+    [[ $invocation_id == "$expected_invocation_id" ]] || return 1
+  fi
   main_pid=$(systemctl show "$unit" --property=MainPID --value) || return 1
   [[ $main_pid =~ ^[1-9][0-9]*$ ]] || return 1
   main_exe=$(readlink -f "/proc/$main_pid/exe" 2>/dev/null || true)
@@ -812,6 +828,8 @@ write_evidence() {
     --arg deployment_source_revision "$DEPLOYMENT_SOURCE_REVISION" \
     --arg deployment_bundle_sha256 "$DEPLOYMENT_BUNDLE_SHA256" \
     --arg previous_sha256 "$OLD_SHA256" \
+    --arg previous_spot_restarts "$OLD_SPOT_RESTARTS" \
+    --arg previous_spot_invocation_id "$OLD_SPOT_INVOCATION_ID" \
     --arg mode "$OLD_MODE" \
     --arg current_binary "$current_target" \
     --argjson spot_active "$spot_active" \
@@ -831,6 +849,12 @@ write_evidence() {
         (if $deployment_source_revision == "" then null else $deployment_source_revision end),
       deployment_bundle_sha256: (if $deployment_bundle_sha256 == "" then null else $deployment_bundle_sha256 end),
       previous_sha256: (if $previous_sha256 == "" then null else $previous_sha256 end),
+      previous_spot_restarts:
+        (if $previous_spot_restarts == "" then null
+         else ($previous_spot_restarts | tonumber) end),
+      previous_spot_invocation_id:
+        (if $previous_spot_invocation_id == "" then null
+         else $previous_spot_invocation_id end),
       host_mode: $mode,
       current_binary: (if $current_binary == "" then null else $current_binary end),
       production_units_active: {spot: $spot_active, usdm: $usdm_active}
@@ -1150,12 +1174,17 @@ elif (( active_count == 1 && enabled_count == 1 )) \
     && ( $spot_upload_enabled_state == static \
       || $spot_upload_enabled_state == masked-runtime ) \
     && ( $usdm_upload_enabled_state == masked \
-      || $usdm_upload_enabled_state == masked-runtime ) ]]; then
+      || $usdm_upload_enabled_state == masked-runtime \
+      || $usdm_upload_enabled_state == static ) ]]; then
   [[ $(systemctl_value "${PRODUCTION_UNITS[1]}" SubState) == dead \
     && $(systemctl_value "${PRODUCTION_UNITS[1]}" MainPID) == 0 ]] \
     || fail 'contained USD-M production is not inactive/dead with MainPID=0'
+  if [[ $usdm_upload_enabled_state == static ]]; then
+    MASK_USDM_UPLOAD_FOR_TRANSITION=1
+  fi
   capture_existing_production_identity partial-contained-spot-live
   unit_matches_release "${PRODUCTION_UNITS[0]}" "$OLD_BINARY" true \
+    "$OLD_SPOT_RESTARTS" "$OLD_SPOT_INVOCATION_ID" \
     || fail 'running Spot production does not match the previous release identity'
   spot_health_min_updated_ns=$(( \
     $(date +%s%N) - HEALTH_TIMEOUT_SECONDS * 1000000000 \
@@ -1172,8 +1201,17 @@ else
   fail "ambiguous production state: active=$active_count enabled=$enabled_count spot=$spot_active_state/$spot_enabled_state/$spot_upload_enabled_state usdm=$usdm_active_state/$usdm_enabled_state/$usdm_upload_enabled_state symlink=$PRODUCTION_LINK"
 fi
 
-STEP=stop-production
 TRANSITION_STARTED=1
+if (( MASK_USDM_UPLOAD_FOR_TRANSITION )); then
+  STEP=contain-usdm-uploader
+  systemctl mask --runtime "${UPLOAD_UNITS[1]}" >/dev/null \
+    || fail 'could not runtime-mask the contained USD-M uploader'
+  usdm_upload_enabled_state=$(systemctl is-enabled "${UPLOAD_UNITS[1]}" 2>/dev/null || true)
+  [[ $usdm_upload_enabled_state == masked \
+    || $usdm_upload_enabled_state == masked-runtime ]] \
+    || fail 'contained USD-M uploader did not become masked'
+fi
+STEP=stop-production
 systemctl disable --now "${LEGACY_UNITS[@]}" >/dev/null 2>&1 || true
 for unit in "${LEGACY_UNITS[@]}"; do
   systemctl is-active --quiet "$unit" && fail "legacy collector unit did not stop: $unit"
