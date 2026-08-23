@@ -363,14 +363,8 @@ atomic_install() {
   cmp -s -- "$source" "$destination"
 }
 
-install_deployment() {
+install_recovery_deployment() {
   local directory=$1
-  install -d -m 0755 /etc/systemd/system || return 1
-  install -d -m 0755 /etc/monday || return 1
-  atomic_install 0644 "$directory/binance-lob-archiver-production@.service" \
-    /etc/systemd/system/binance-lob-archiver-production@.service || return 1
-  atomic_install 0644 "$directory/binance-lob-archiver-upload@.service" \
-    /etc/systemd/system/binance-lob-archiver-upload@.service || return 1
   if [[ -f $directory/binance-lob-archiver-recovery@.service ]]; then
     atomic_install 0644 "$directory/binance-lob-archiver-recovery@.service" \
       /etc/systemd/system/binance-lob-archiver-recovery@.service || return 1
@@ -379,6 +373,17 @@ install_deployment() {
     atomic_install 0755 "$directory/host-rust-lob-recovery-queue.sh" \
       /opt/monday/bin/monday-rust-lob-recovery-queue || return 1
   fi
+}
+
+install_deployment() {
+  local directory=$1
+  install -d -m 0755 /etc/systemd/system || return 1
+  install -d -m 0755 /etc/monday || return 1
+  atomic_install 0644 "$directory/binance-lob-archiver-production@.service" \
+    /etc/systemd/system/binance-lob-archiver-production@.service || return 1
+  atomic_install 0644 "$directory/binance-lob-archiver-upload@.service" \
+    /etc/systemd/system/binance-lob-archiver-upload@.service || return 1
+  install_recovery_deployment "$directory" || return 1
   atomic_install 0640 "$directory/binance-lob-archiver-production-spot.env" \
     /etc/monday/binance-lob-archiver-production-spot.env || return 1
   atomic_install 0640 "$directory/binance-lob-archiver-production-usdm.env" \
@@ -1083,19 +1088,10 @@ done
 systemctl mask --runtime "${TRANSITION_MASK_UNITS[@]}" >/dev/null
 canonical_spool_paths_safe || fail 'canonical spool path changed during production stop'
 
-STEP=install-candidate-production-assets
+STEP=stage-candidate-recovery-assets
 validate_deployment "$CANDIDATE_DEPLOYMENT" true
-install_deployment "$CANDIDATE_DEPLOYMENT"
-remove_allowlisted_production_dropins_for_candidate
-install -d -m 0750 -o hftcollector -g hftcollector \
-  "$CANONICAL_SPOOL/spot" "$CANONICAL_SPOOL/usdm"
+install_recovery_deployment "$CANDIDATE_DEPLOYMENT"
 systemctl daemon-reload
-for unit in "${PRODUCTION_UNITS[@]}"; do
-  unit_dropins=$(systemctl_value "$unit" DropInPaths) \
-    || fail "could not read production drop-ins for $unit after daemon-reload"
-  [[ -z $unit_dropins ]] \
-    || fail "candidate production service retained an unexpected systemd drop-in: $unit_dropins"
-done
 
 if [[ $OLD_MODE == upgrade || $OLD_MODE == contained-upgrade ]]; then
   STEP=drain-old-production-with-candidate
@@ -1108,6 +1104,19 @@ else
   STEP=verify-new-host-spool
   require_empty_segment_spool || fail 'new host canonical spool contains segment artifacts'
 fi
+
+STEP=install-candidate-production-assets
+install_deployment "$CANDIDATE_DEPLOYMENT"
+remove_allowlisted_production_dropins_for_candidate
+install -d -m 0750 -o hftcollector -g hftcollector \
+  "$CANONICAL_SPOOL/spot" "$CANONICAL_SPOOL/usdm"
+systemctl daemon-reload
+for unit in "${PRODUCTION_UNITS[@]}"; do
+  unit_dropins=$(systemctl_value "$unit" DropInPaths) \
+    || fail "could not read production drop-ins for $unit after daemon-reload"
+  [[ -z $unit_dropins ]] \
+    || fail "candidate production service retained an unexpected systemd drop-in: $unit_dropins"
+done
 
 STEP=switch-production-symlink
 atomic_symlink "$CANDIDATE_BINARY" "$PRODUCTION_LINK"
