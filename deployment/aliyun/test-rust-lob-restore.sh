@@ -201,7 +201,8 @@ setup_fixture() {
   gate_dir="$GATE_ROOT/$CANDIDATE_SHA256/$DEPLOYMENT_BUNDLE_SHA256/runs/gate-1"
   mkdir -p "$gate_dir"
   market=$(jq -cn \
-    '{symbol_count:1200,snapshot_ready_count:1200,bridged_count:1200,
+    '{observation_started_ns:150,
+      symbol_count:1200,snapshot_ready_count:1200,bridged_count:1200,
       stream_coverage_verified_count:1200,all_stream_coverage_verified:true,sequence_gaps:0,
       upload_failure_count:0,health_samples:121,max_health_silence_seconds:30,
       symbols_config:"ALL",
