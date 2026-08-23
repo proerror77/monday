@@ -32,6 +32,15 @@ grep -Fxq 'MemoryMax=768M' "$SCRIPT_DIR/binance-lob-archiver-recovery@.service"
 # shellcheck disable=SC1090
 . "$QUEUE_SCRIPT"
 
+configure_paths /
+[[ $ROOT_PREFIX == '' \
+  && $OPT_ROOT == /opt/monday \
+  && $DATA_ROOT == /data \
+  && $LOCK_ROOT == /run/lock ]] || {
+  printf 'root path configuration introduced a double-slash prefix\n' >&2
+  exit 1
+}
+
 stat() {
   if [[ ${1:-} == -c ]]; then
     local format=$2
