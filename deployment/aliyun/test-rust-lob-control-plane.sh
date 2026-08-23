@@ -528,6 +528,38 @@ run_strict_verifier_failure_fixture() (
 )
 run_strict_verifier_failure_fixture
 
+upload_drain_body="$tmp_dir/upload-drain.sh"
+sed -n '/^stop_upload_drain()/,/^}/p;/^run_candidate_drain()/,/^}/p' \
+  "$GATE" >"$upload_drain_body"
+run_upload_drain_fixture() (
+  local -a invocations=()
+  declare -A spool_dir oss_bucket oss_endpoint oss_region aliyun_profile oss_copy_timeout
+  upload_drain_unit=
+  upload_drain_counter=0
+  SERVICE_USER=hftcollector
+  SERVICE_HOME=/var/lib/hft-collector
+  SAFE_PATH=/usr/bin:/bin
+  candidate_binary=/candidate/binance-lob-archiver
+  spool_dir[spot]=/spool/spot
+  oss_bucket[spot]=bucket
+  oss_endpoint[spot]=endpoint
+  oss_region[spot]=region
+  aliyun_profile[spot]=profile
+  oss_copy_timeout[spot]=60
+  systemd-run() { invocations+=("$*"); }
+  assert_spool_drained() { [[ $1 == spot ]]; }
+  # shellcheck disable=SC1090
+  . "$upload_drain_body"
+  run_candidate_drain spot
+  [[ ${#invocations[@]} -eq 1 ]] || exit 1
+  [[ ${invocations[0]} == *'--property=CPUQuota=80%'* ]] || exit 1
+  [[ ${invocations[0]} == *'--property=MemoryHigh=2500M'* ]] || exit 1
+  [[ ${invocations[0]} == *'--property=MemoryMax=3200M'* ]] || exit 1
+  [[ ${invocations[0]} == *'/candidate/binance-lob-archiver --upload-only'* ]] || exit 1
+  [[ -z $upload_drain_unit ]]
+)
+run_upload_drain_fixture
+
 health_settle_body="$tmp_dir/resolve-health-settle.sh"
 sed -n '/^resolve_health_settle_seconds()/,/^}/p' "$GATE" >"$health_settle_body"
 resolve_health_settle() (
@@ -1417,6 +1449,7 @@ printf '%s\n' "$host_state_dispatch" >"$host_state_dispatch_file"
 run_partial_host_state_fixture() (
   local usdm_enabled_state=$1 usdm_main_pid=${2:-0}
   local spot_upload_enabled_state=${3:-masked-runtime}
+  local fixed_now_ns=2000000000000
   PRODUCTION_UNITS=(production-spot production-usdm)
   UPLOAD_UNITS=(upload-spot upload-usdm)
   PRODUCTION_LINK="$tmp_dir/partial-production-$usdm_enabled_state-$usdm_main_pid-$spot_upload_enabled_state"
@@ -1446,8 +1479,10 @@ run_partial_host_state_fixture() (
   unit_matches_release() {
     [[ $1 == production-spot && $2 == "$OLD_BINARY" && $3 == true ]]
   }
+  date() { [[ $1 == +%s%N ]] && printf '%s\n' "$fixed_now_ns"; }
   health_ready_for_release() {
-    [[ $1 == spot && $2 == 1000 && -z $3 && $4 -gt 0 ]]
+    [[ $1 == spot && $2 == 1000 && -z $3 \
+      && $4 == $((fixed_now_ns - HEALTH_TIMEOUT_SECONDS * 1000000000)) ]]
   }
   require_empty_segment_spool() { return 1; }
   fail() { printf '%s\n' "$*" >&2; exit 1; }

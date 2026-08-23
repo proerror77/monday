@@ -430,15 +430,24 @@ chmod 0750 "$tmp_dir"
 gate_finished=false
 strict_verifier_unit=
 strict_verifier_counter=0
+upload_drain_unit=
+upload_drain_counter=0
 stop_strict_verifier() {
   if [[ -n $strict_verifier_unit ]]; then
     systemctl stop "$strict_verifier_unit" >/dev/null 2>&1 || true
     strict_verifier_unit=
   fi
 }
+stop_upload_drain() {
+  if [[ -n $upload_drain_unit ]]; then
+    systemctl stop "$upload_drain_unit" >/dev/null 2>&1 || true
+    upload_drain_unit=
+  fi
+}
 cleanup() {
   local status=$?
   stop_strict_verifier
+  stop_upload_drain
   if [[ $gate_finished != true ]]; then
     systemctl stop "${unit[spot]}" "${unit[usdm]}" >/dev/null 2>&1 || true
   fi
@@ -476,18 +485,33 @@ assert_spool_drained() {
 }
 
 run_candidate_drain() {
-  local market=$1
-  runuser --user "$SERVICE_USER" -- env -i \
-    HOME="$SERVICE_HOME" \
-    PATH="$SAFE_PATH" \
-    RUST_LOG=info \
-    SPOOL_DIR="${spool_dir[$market]}" \
-    OSS_BUCKET="${oss_bucket[$market]}" \
-    OSS_ENDPOINT="${oss_endpoint[$market]}" \
-    OSS_REGION="${oss_region[$market]}" \
-    ALIYUN_PROFILE="${aliyun_profile[$market]}" \
-    OSS_COPY_TIMEOUT_SECONDS="${oss_copy_timeout[$market]}" \
-    "$candidate_binary" --upload-only
+  local market=$1 status
+  upload_drain_counter=$((upload_drain_counter + 1))
+  upload_drain_unit="monday-rust-upload-drain-$$-${market}-${upload_drain_counter}.service"
+  if systemd-run --quiet --wait --collect \
+    --unit="$upload_drain_unit" \
+    --property=KillMode=control-group \
+    --property=OOMScoreAdjust=500 \
+    --property=CPUQuota=80% \
+    --property=MemoryHigh=2500M \
+    --property=MemoryMax=3200M \
+    -- runuser --user "$SERVICE_USER" -- env -i \
+      HOME="$SERVICE_HOME" \
+      PATH="$SAFE_PATH" \
+      RUST_LOG=info \
+      SPOOL_DIR="${spool_dir[$market]}" \
+      OSS_BUCKET="${oss_bucket[$market]}" \
+      OSS_ENDPOINT="${oss_endpoint[$market]}" \
+      OSS_REGION="${oss_region[$market]}" \
+      ALIYUN_PROFILE="${aliyun_profile[$market]}" \
+      OSS_COPY_TIMEOUT_SECONDS="${oss_copy_timeout[$market]}" \
+      "$candidate_binary" --upload-only; then
+    upload_drain_unit=
+  else
+    status=$?
+    stop_upload_drain
+    return "$status"
+  fi
   assert_spool_drained "$market"
 }
 
