@@ -693,19 +693,24 @@ health_ready_for_release() {
     -f "$RUNTIME_HEALTH_POLICY" "$health" >/dev/null
 }
 
+unit_matches_release() {
+  local unit=$1 binary=$2 require_enabled=$3 restarts main_pid main_exe
+  systemctl is-active --quiet "$unit" || return 1
+  restarts=$(systemctl show "$unit" --property=NRestarts --value) || return 1
+  [[ $restarts == 0 ]] || return 1
+  main_pid=$(systemctl show "$unit" --property=MainPID --value) || return 1
+  [[ $main_pid =~ ^[1-9][0-9]*$ ]] || return 1
+  main_exe=$(readlink -f "/proc/$main_pid/exe" 2>/dev/null || true)
+  [[ $main_exe == "$binary" ]] || return 1
+  if [[ $require_enabled == true ]]; then
+    systemctl is-enabled --quiet "$unit" || return 1
+  fi
+}
+
 runtime_matches_release() {
-  local binary=$1 require_enabled=$2 unit restarts main_pid main_exe
+  local binary=$1 require_enabled=$2 unit
   for unit in "${PRODUCTION_UNITS[@]}"; do
-    systemctl is-active --quiet "$unit" || return 1
-    restarts=$(systemctl show "$unit" --property=NRestarts --value) || return 1
-    [[ $restarts == 0 ]] || return 1
-    main_pid=$(systemctl show "$unit" --property=MainPID --value) || return 1
-    [[ $main_pid =~ ^[1-9][0-9]*$ ]] || return 1
-    main_exe=$(readlink -f "/proc/$main_pid/exe" 2>/dev/null || true)
-    [[ $main_exe == "$binary" ]] || return 1
-    if [[ $require_enabled == true ]]; then
-      systemctl is-enabled --quiet "$unit" || return 1
-    fi
+    unit_matches_release "$unit" "$binary" "$require_enabled" || return 1
   done
 }
 
@@ -750,6 +755,22 @@ production_is_fail_closed() {
     [[ $state == disabled || $state == masked || $state == masked-runtime \
       || $state == not-found ]] || return 1
   done
+  for unit in "${RECOVERY_UNITS[@]}"; do
+    systemctl is-active --quiet "$unit" && return 1
+  done
+  return 0
+}
+
+partial_spot_runtime_is_restored() {
+  local binary=$1 unit state
+  unit_matches_release "${PRODUCTION_UNITS[0]}" "$binary" true || return 1
+  for unit in "${PRODUCTION_UNITS[1]}" "${UPLOAD_UNITS[1]}" "${LEGACY_UNITS[@]}"; do
+    systemctl is-active --quiet "$unit" && return 1
+    state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+    [[ $state == masked || $state == masked-runtime ]] || return 1
+  done
+  [[ $(systemctl show "${PRODUCTION_UNITS[1]}" --property=MainPID --value) == 0 ]] \
+    || return 1
   for unit in "${RECOVERY_UNITS[@]}"; do
     systemctl is-active --quiet "$unit" && return 1
   done
@@ -802,7 +823,7 @@ write_evidence() {
 }
 
 rollback_after_failure() {
-  local safe_to_restart=1 safe_to_restore=1 unit rollback_started_ns=0
+  local safe_to_restart=1 safe_to_restore=1 partial_restored=0 unit rollback_started_ns=0
   ROLLBACK_RESULT=disabled
   systemctl disable --now "${RECOVERY_TIMERS[@]}" >/dev/null 2>&1 || true
   systemctl stop "${RECOVERY_UNITS[@]}" >/dev/null 2>&1 || true
@@ -819,7 +840,8 @@ rollback_after_failure() {
     return
   fi
 
-  if [[ -d $CANONICAL_SPOOL && $DRAIN_REQUIRED -eq 1 && $OLD_MODE == upgrade ]]; then
+  if [[ -d $CANONICAL_SPOOL && $DRAIN_REQUIRED -eq 1 \
+    && ( $OLD_MODE == upgrade || $OLD_MODE == partial-contained-spot-live ) ]]; then
     if [[ -z $SPOOL_ENV_DEPLOYMENT \
       || ( $DRAIN_ATTEMPTED -eq 1 && $DRAIN_MAY_HAVE_MUTATED -eq 0 ) ]]; then
       safe_to_restart=0
@@ -833,7 +855,8 @@ rollback_after_failure() {
     fi
   fi
 
-  if [[ $OLD_MODE == upgrade || $OLD_MODE == contained-upgrade ]]; then
+  if [[ $OLD_MODE == upgrade || $OLD_MODE == contained-upgrade \
+    || $OLD_MODE == partial-contained-spot-live ]]; then
     if [[ -n $ROLLBACK_DEPLOYMENT_MANIFEST_SHA256 ]]; then
       printf '%s  %s\n' "$ROLLBACK_DEPLOYMENT_MANIFEST_SHA256" \
         "$EVIDENCE_DIR/rollback-deployment.sha256" | sha256sum --check --strict \
@@ -867,6 +890,11 @@ rollback_after_failure() {
         safe_to_restart=0
         ROLLBACK_RESULT=previous-release-restore-containment-failed
       fi
+    elif [[ $OLD_MODE == partial-contained-spot-live ]]; then
+      if ! systemctl unmask --runtime "${PRODUCTION_UNITS[0]}" >/dev/null; then
+        safe_to_restart=0
+        ROLLBACK_RESULT=previous-spot-unmask-failed-disabled
+      fi
     elif (( safe_to_restart \
       && OLD_RECOVERY_TIMERS_ENABLED == ${#RECOVERY_TIMERS[@]} )) \
       && ! systemctl enable --now "${RECOVERY_TIMERS[@]}" >/dev/null; then
@@ -877,7 +905,8 @@ rollback_after_failure() {
         || safe_to_restart=0
     fi
 
-    if [[ $OLD_MODE == upgrade ]] && (( safe_to_restart )); then
+    if [[ $OLD_MODE == upgrade || $OLD_MODE == partial-contained-spot-live ]] \
+      && (( safe_to_restart )); then
       copy_health_evidence failed-candidate
       if ! clear_health_before_restart; then
         safe_to_restart=0
@@ -907,6 +936,38 @@ rollback_after_failure() {
           ROLLBACK_RESULT=previous-release-health-unverified-disabled
         else
           ROLLBACK_RESULT=previous-release-health-unverified-containment-failed
+        fi
+      fi
+    elif [[ $OLD_MODE == partial-contained-spot-live ]] && (( safe_to_restart )); then
+      partial_restored=1
+      systemctl reset-failed "${PRODUCTION_UNITS[0]}" >/dev/null 2>&1 || true
+      if ! systemctl start "${PRODUCTION_UNITS[0]}" \
+        || ! health_ready_for_release spot 1000 "$OLD_SESSION_SPOT" "$rollback_started_ns" \
+        || ! systemctl enable "${PRODUCTION_UNITS[0]}" >/dev/null \
+        || ! unit_matches_release "${PRODUCTION_UNITS[0]}" "$OLD_BINARY" true \
+        || ! health_ready_for_release spot 1000 "$OLD_SESSION_SPOT" "$rollback_started_ns"; then
+        partial_restored=0
+      fi
+      if (( partial_restored )) \
+        && ! systemctl unmask --runtime "${UPLOAD_UNITS[0]}" >/dev/null; then
+        partial_restored=0
+      fi
+      if (( partial_restored \
+        && OLD_RECOVERY_TIMERS_ENABLED == ${#RECOVERY_TIMERS[@]} )) \
+        && ! systemctl enable --now "${RECOVERY_TIMERS[@]}" >/dev/null; then
+        partial_restored=0
+      fi
+      if (( partial_restored )) \
+        && partial_spot_runtime_is_restored "$OLD_BINARY"; then
+        ROLLBACK_RESULT=previous-spot-restored-usdm-contained
+      else
+        systemctl disable --now "${RECOVERY_TIMERS[@]}" >/dev/null 2>&1 || true
+        systemctl disable --now "${PRODUCTION_UNITS[@]}" >/dev/null 2>&1 || true
+        systemctl mask --runtime "${TRANSITION_MASK_UNITS[@]}" >/dev/null 2>&1 || true
+        if production_is_fail_closed; then
+          ROLLBACK_RESULT=previous-spot-health-unverified-disabled
+        else
+          ROLLBACK_RESULT=previous-spot-restore-containment-failed
         fi
       fi
     elif (( safe_to_restart == 0 )); then
@@ -1042,6 +1103,10 @@ active_count=0
 enabled_count=0
 OLD_SESSION_SPOT=$(jq -r '.session_id // empty' "$CANONICAL_SPOOL/spot/health.json" 2>/dev/null || true)
 OLD_SESSION_USDM=$(jq -r '.session_id // empty' "$CANONICAL_SPOOL/usdm/health.json" 2>/dev/null || true)
+spot_active_state=$(systemctl_value "${PRODUCTION_UNITS[0]}" ActiveState)
+usdm_active_state=$(systemctl_value "${PRODUCTION_UNITS[1]}" ActiveState)
+spot_enabled_state=$(systemctl is-enabled "${PRODUCTION_UNITS[0]}" 2>/dev/null || true)
+usdm_enabled_state=$(systemctl is-enabled "${PRODUCTION_UNITS[1]}" 2>/dev/null || true)
 for unit in "${PRODUCTION_UNITS[@]}"; do
   if systemctl is-active --quiet "$unit"; then
     ((active_count += 1))
@@ -1057,13 +1122,30 @@ if (( active_count == 2 && enabled_count == 2 )); then
 elif (( active_count == 0 && enabled_count == 2 )) && [[ -L $PRODUCTION_LINK ]]; then
   capture_existing_production_identity contained-upgrade
   DRAIN_REQUIRED=1
+elif (( active_count == 1 && enabled_count == 1 )) \
+  && [[ -L $PRODUCTION_LINK \
+    && $spot_active_state == active && $spot_enabled_state == enabled \
+    && $usdm_active_state == inactive \
+    && ( $usdm_enabled_state == masked || $usdm_enabled_state == masked-runtime ) ]]; then
+  [[ $(systemctl_value "${PRODUCTION_UNITS[1]}" SubState) == dead \
+    && $(systemctl_value "${PRODUCTION_UNITS[1]}" MainPID) == 0 ]] \
+    || fail 'contained USD-M production is not inactive/dead with MainPID=0'
+  capture_existing_production_identity partial-contained-spot-live
+  unit_matches_release "${PRODUCTION_UNITS[0]}" "$OLD_BINARY" true \
+    || fail 'running Spot production does not match the previous release identity'
+  spot_health_min_updated_ns=$(( \
+    $(date +%s%N) - HEALTH_TIMEOUT_SECONDS * 1000000000 \
+  ))
+  health_ready_for_release spot 1000 "" "$spot_health_min_updated_ns" \
+    || fail 'running Spot production health is not ready for partial-contained cutover'
+  DRAIN_REQUIRED=1
 elif (( active_count == 0 && enabled_count == 0 )) && [[ ! -e $PRODUCTION_LINK && ! -L $PRODUCTION_LINK ]]; then
   OLD_MODE=new-host
   (( PRODUCTION_USDM_MEMORY_DROPIN_PRESENT == 0 )) \
     || fail 'new host must not retain a production USD-M drop-in'
   require_empty_segment_spool || fail 'new host canonical spool contains segment artifacts'
 else
-  fail "ambiguous production state: active=$active_count enabled=$enabled_count symlink=$PRODUCTION_LINK"
+  fail "ambiguous production state: active=$active_count enabled=$enabled_count spot=$spot_active_state/$spot_enabled_state usdm=$usdm_active_state/$usdm_enabled_state symlink=$PRODUCTION_LINK"
 fi
 
 STEP=stop-production
@@ -1075,6 +1157,9 @@ for unit in "${LEGACY_UNITS[@]}"; do
 done
 if [[ $OLD_MODE == upgrade ]]; then
   systemctl disable --now "${PRODUCTION_UNITS[@]}"
+elif [[ $OLD_MODE == partial-contained-spot-live ]]; then
+  systemctl disable --now "${PRODUCTION_UNITS[0]}"
+  systemctl disable "${PRODUCTION_UNITS[1]}" >/dev/null 2>&1 || true
 else
   systemctl disable "${PRODUCTION_UNITS[@]}" >/dev/null 2>&1 || true
 fi
@@ -1093,7 +1178,8 @@ validate_deployment "$CANDIDATE_DEPLOYMENT" true
 install_recovery_deployment "$CANDIDATE_DEPLOYMENT"
 systemctl daemon-reload
 
-if [[ $OLD_MODE == upgrade || $OLD_MODE == contained-upgrade ]]; then
+if [[ $OLD_MODE == upgrade || $OLD_MODE == contained-upgrade \
+  || $OLD_MODE == partial-contained-spot-live ]]; then
   STEP=drain-old-production-with-candidate
   DRAIN_ATTEMPTED=1
   run_candidate_drain "$OLD_DEPLOYMENT"
