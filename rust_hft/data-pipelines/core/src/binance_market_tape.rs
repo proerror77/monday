@@ -422,6 +422,25 @@ pub struct DepthSourceClockSequenceValidator {
     last: HashMap<String, (u64, Option<u64>, u64)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepthSequenceGap {
+    pub symbol: String,
+    pub expected: u64,
+    pub received: u64,
+}
+
+impl std::fmt::Display for DepthSequenceGap {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} depth sequence gap expected={} received={}",
+            self.symbol, self.expected, self.received
+        )
+    }
+}
+
+impl std::error::Error for DepthSequenceGap {}
+
 impl DepthSourceClockSequenceValidator {
     pub fn observe(&mut self, clock: &DepthSourceClock) -> Result<()> {
         if let Some((previous_event_time, previous_transaction_time, previous_final_update_id)) =
@@ -432,18 +451,23 @@ impl DepthSourceClockSequenceValidator {
                 .context("depth update id overflow")?;
             if let Some(reported_previous_id) = clock.previous_final_update_id {
                 if reported_previous_id > previous_final_update_id {
-                    anyhow::bail!("{} depth previous-update gap", clock.symbol);
+                    return Err(DepthSequenceGap {
+                        symbol: clock.symbol.clone(),
+                        expected: previous_final_update_id,
+                        received: reported_previous_id,
+                    }
+                    .into());
                 }
                 if reported_previous_id < previous_final_update_id {
                     anyhow::bail!("{} depth previous-update rollback", clock.symbol);
                 }
             } else if clock.first_update_id > expected_update_id {
-                anyhow::bail!(
-                    "{} depth sequence gap expected={} received={}",
-                    clock.symbol,
-                    expected_update_id,
-                    clock.first_update_id
-                );
+                return Err(DepthSequenceGap {
+                    symbol: clock.symbol.clone(),
+                    expected: expected_update_id,
+                    received: clock.first_update_id,
+                }
+                .into());
             }
             if clock.final_update_id < expected_update_id {
                 anyhow::bail!("{} depth sequence rollback", clock.symbol);
@@ -1358,11 +1382,8 @@ mod tests {
 
         let mut sequence = DepthSourceClockSequenceValidator::default();
         sequence.observe(&first).unwrap();
-        assert!(sequence
-            .observe(&gap)
-            .unwrap_err()
-            .to_string()
-            .contains("gap"));
+        let error = sequence.observe(&gap).unwrap_err();
+        assert!(error.downcast_ref::<DepthSequenceGap>().is_some());
         sequence.observe(&recovered).unwrap();
     }
 
@@ -1387,19 +1408,14 @@ mod tests {
 
         let mut gap_sequence = DepthSourceClockSequenceValidator::default();
         gap_sequence.observe(&first).unwrap();
-        assert!(gap_sequence
-            .observe(&previous_id_ahead)
-            .unwrap_err()
-            .to_string()
-            .contains("gap"));
+        let error = gap_sequence.observe(&previous_id_ahead).unwrap_err();
+        assert!(error.downcast_ref::<DepthSequenceGap>().is_some());
 
         let mut rollback_sequence = DepthSourceClockSequenceValidator::default();
         rollback_sequence.observe(&first).unwrap();
-        assert!(rollback_sequence
-            .observe(&previous_id_behind)
-            .unwrap_err()
-            .to_string()
-            .contains("rollback"));
+        let error = rollback_sequence.observe(&previous_id_behind).unwrap_err();
+        assert!(error.downcast_ref::<DepthSequenceGap>().is_none());
+        assert!(error.to_string().contains("rollback"));
     }
 
     #[test]

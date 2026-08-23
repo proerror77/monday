@@ -1295,6 +1295,7 @@ pub fn write_health(
     session_id: &str,
     status: &str,
     sequence_gaps: u64,
+    sequence_gap_total: u64,
     pending_upload_segments: usize,
     queue: QueueHealth,
     states: &HashMap<String, OrderBookState>,
@@ -1356,6 +1357,7 @@ pub fn write_health(
             "full_stream_coverage_verified": readiness.all_stream_coverage_verified,
             "session_id": session_id,
             "sequence_gaps": sequence_gaps,
+            "sequence_gap_total": sequence_gap_total,
             "pending_upload_segments": pending_upload_segments,
             "disk_free_gb": disk_free_gb,
             "disk_warning": disk_free_gb.is_some_and(|free| free < disk_warning_threshold_gb),
@@ -1916,7 +1918,8 @@ mod tests {
             "spot_all",
             "session-1",
             "synced",
-            0,
+            2,
+            5,
             1,
             QueueHealth {
                 capacity: 1,
@@ -1931,6 +1934,8 @@ mod tests {
         assert_eq!(health["upload_warning"], true);
         assert_eq!(health["upload_failure_count"], 7);
         assert_eq!(health["last_upload_error"], "oss down");
+        assert_eq!(health["sequence_gaps"], 2);
+        assert_eq!(health["sequence_gap_total"], 5);
         assert_eq!(health["snapshot_ready_count"], 0);
         assert_eq!(health["bridged_count"], 0);
         assert_eq!(health["snapshot_only_symbols"], json!([]));
