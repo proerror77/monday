@@ -1357,12 +1357,17 @@ run_release_match_fixture() (
   readlink() { [[ $1 == -f && $2 == /proc/123/exe ]] && printf '/old-binary\n'; }
   # shellcheck disable=SC1090
   . "$release_match_body"
-  unit_matches_release production-spot /old-binary true \
-    "$expected_restarts" "$current_invocation"
+  if [[ $expected_restarts == default ]]; then
+    unit_matches_release production-spot /old-binary true
+  else
+    unit_matches_release production-spot /old-binary true \
+      "$expected_restarts" "$current_invocation"
+  fi
 )
+run_release_match_fixture 0 default
 run_release_match_fixture 1 1
-if run_release_match_fixture 1 0; then
-  printf 'release matcher ignored a nonzero restart baseline\n' >&2
+if run_release_match_fixture 1 default; then
+  printf 'release matcher weakened the default zero-restart contract\n' >&2
   exit 1
 fi
 if run_release_match_fixture 2 1; then
@@ -1494,7 +1499,7 @@ run_partial_host_state_fixture() (
   spot_enabled_state=enabled
   usdm_active_state=inactive
   usdm_upload_enabled_state=$initial_usdm_upload_enabled_state
-  usdm_upload_masked=0
+  MASK_USDM_UPLOAD_FOR_TRANSITION=0
   HEALTH_TIMEOUT_SECONDS=300
   PRODUCTION_USDM_MEMORY_DROPIN_PRESENT=0
   DRAIN_REQUIRED=0
@@ -1517,17 +1522,6 @@ run_partial_host_state_fixture() (
     [[ $1 == production-spot && $2 == "$OLD_BINARY" && $3 == true \
       && $4 == 1 && $5 == "$OLD_SPOT_INVOCATION_ID" ]]
   }
-  systemctl() {
-    if [[ $1 == mask && $2 == --runtime && $3 == upload-usdm ]]; then
-      usdm_upload_masked=1
-      return 0
-    fi
-    if [[ $1 == is-enabled && $2 == upload-usdm && $usdm_upload_masked -eq 1 ]]; then
-      printf 'masked-runtime\n'
-      return 1
-    fi
-    return 1
-  }
   date() { [[ $1 == +%s%N ]] && printf '%s\n' "$fixed_now_ns"; }
   health_ready_for_release() {
     [[ $1 == spot && $2 == 1000 && -z $3 \
@@ -1538,12 +1532,49 @@ run_partial_host_state_fixture() (
   if ! . "$host_state_dispatch_file"; then
     return 1
   fi
-  printf '%s %s %s\n' "$OLD_MODE" "$DRAIN_REQUIRED" "$usdm_upload_masked"
+  printf '%s %s %s\n' \
+    "$OLD_MODE" "$DRAIN_REQUIRED" "$MASK_USDM_UPLOAD_FOR_TRANSITION"
 )
 [[ $(run_partial_host_state_fixture masked-runtime) \
   == 'partial-contained-spot-live 1 0' ]]
 [[ $(run_partial_host_state_fixture masked-runtime 0 masked-runtime static) \
   == 'partial-contained-spot-live 1 1' ]]
+
+transition_mask_body="$tmp_dir/transition-mask-usdm-uploader.sh"
+sed -n '/^if (( MASK_USDM_UPLOAD_FOR_TRANSITION )); then$/,/^fi$/p' \
+  "$CUTOVER" >"$transition_mask_body"
+run_transition_mask_fixture() (
+  local readback=$1
+  MASK_USDM_UPLOAD_FOR_TRANSITION=1
+  UPLOAD_UNITS=(upload-spot upload-usdm)
+  STEP=
+  systemctl() {
+    if [[ $1 == mask && $2 == --runtime && $3 == upload-usdm ]]; then
+      return 0
+    fi
+    if [[ $1 == is-enabled && $2 == upload-usdm ]]; then
+      printf '%s\n' "$readback"
+      return 1
+    fi
+    return 1
+  }
+  fail() { exit 1; }
+  # shellcheck disable=SC1090
+  . "$transition_mask_body"
+  [[ $STEP == contain-usdm-uploader ]]
+)
+run_transition_mask_fixture masked-runtime
+if run_transition_mask_fixture static; then
+  printf 'transition accepted an unmasked USD-M uploader readback\n' >&2
+  exit 1
+fi
+transition_started_line=$(grep -n '^TRANSITION_STARTED=1$' "$CUTOVER" | cut -d: -f1)
+transition_mask_line=$(grep -n '^if (( MASK_USDM_UPLOAD_FOR_TRANSITION )); then$' \
+  "$CUTOVER" | cut -d: -f1)
+(( transition_started_line < transition_mask_line )) || {
+  printf 'USD-M uploader mask moved before the governed transition\n' >&2
+  exit 1
+}
 if run_partial_host_state_fixture disabled >"$tmp_dir/partial-disabled.out" 2>&1; then
   printf 'partial classifier accepted disabled instead of masked USD-M\n' >&2
   exit 1

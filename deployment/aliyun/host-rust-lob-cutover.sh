@@ -53,6 +53,7 @@ SPOOL_ENV_DEPLOYMENT=
 OLD_RECOVERY_TIMERS_ENABLED=0
 OLD_SPOT_RESTARTS=
 OLD_SPOT_INVOCATION_ID=
+MASK_USDM_UPLOAD_FOR_TRANSITION=0
 
 PRODUCTION_UNITS=(
   binance-lob-archiver-production@spot.service
@@ -1179,12 +1180,7 @@ elif (( active_count == 1 && enabled_count == 1 )) \
     && $(systemctl_value "${PRODUCTION_UNITS[1]}" MainPID) == 0 ]] \
     || fail 'contained USD-M production is not inactive/dead with MainPID=0'
   if [[ $usdm_upload_enabled_state == static ]]; then
-    systemctl mask --runtime "${UPLOAD_UNITS[1]}" >/dev/null \
-      || fail 'could not runtime-mask the contained USD-M uploader'
-    usdm_upload_enabled_state=$(systemctl is-enabled "${UPLOAD_UNITS[1]}" 2>/dev/null || true)
-    [[ $usdm_upload_enabled_state == masked \
-      || $usdm_upload_enabled_state == masked-runtime ]] \
-      || fail 'contained USD-M uploader did not become masked'
+    MASK_USDM_UPLOAD_FOR_TRANSITION=1
   fi
   capture_existing_production_identity partial-contained-spot-live
   unit_matches_release "${PRODUCTION_UNITS[0]}" "$OLD_BINARY" true \
@@ -1205,8 +1201,17 @@ else
   fail "ambiguous production state: active=$active_count enabled=$enabled_count spot=$spot_active_state/$spot_enabled_state/$spot_upload_enabled_state usdm=$usdm_active_state/$usdm_enabled_state/$usdm_upload_enabled_state symlink=$PRODUCTION_LINK"
 fi
 
-STEP=stop-production
 TRANSITION_STARTED=1
+if (( MASK_USDM_UPLOAD_FOR_TRANSITION )); then
+  STEP=contain-usdm-uploader
+  systemctl mask --runtime "${UPLOAD_UNITS[1]}" >/dev/null \
+    || fail 'could not runtime-mask the contained USD-M uploader'
+  usdm_upload_enabled_state=$(systemctl is-enabled "${UPLOAD_UNITS[1]}" 2>/dev/null || true)
+  [[ $usdm_upload_enabled_state == masked \
+    || $usdm_upload_enabled_state == masked-runtime ]] \
+    || fail 'contained USD-M uploader did not become masked'
+fi
+STEP=stop-production
 systemctl disable --now "${LEGACY_UNITS[@]}" >/dev/null 2>&1 || true
 for unit in "${LEGACY_UNITS[@]}"; do
   systemctl is-active --quiet "$unit" && fail "legacy collector unit did not stop: $unit"
