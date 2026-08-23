@@ -16,7 +16,7 @@ use hft_collector::lob_archiver::{
     checkpoint_event, command_status_with_timeout, files_with_suffix, read_upload_status,
     recover_parts_from_paths, segment_partition, send_or_shutdown, sha256_file, write_health,
     write_success_marker, write_upload_status, DepthDiff, Market, OrderBookState, PendingBudget,
-    QueueHealth, Segment, SegmentArtifacts, SegmentConfig, SendOutcome, UploadStatus,
+    QueueHealth, Segment, SegmentArtifacts, SegmentConfig, SendOutcome, SequenceGap, UploadStatus,
     MAX_RECOVERY_ROW_BYTES, RAW_SCHEMA,
 };
 #[cfg(test)]
@@ -837,6 +837,7 @@ enum ProducerWait<T> {
 #[derive(Debug, Default)]
 struct ProcessState {
     sequence_gaps: u64,
+    active_order_book_gaps: BTreeSet<String>,
     depth_source_clocks: DepthSourceClockSequenceValidator,
     aggregate_trades: AggregateTradeSequenceValidator,
     raw_trades: RawTradeSequenceValidator,
@@ -862,6 +863,11 @@ impl ProcessState {
 
     fn depth_streams_healthy(&self) -> bool {
         self.reconnecting_depth_shards.is_empty()
+    }
+
+    fn health_sequence_gaps(&self) -> u64 {
+        self.sequence_gaps
+            .saturating_add(self.active_order_book_gaps.len() as u64)
     }
 
     fn bump_snapshot_generation(&mut self, symbol: &str) -> u64 {
@@ -2367,7 +2373,7 @@ async fn run_session(
                 &config.dataset,
                 &session_id,
                 status,
-                process_state.sequence_gaps,
+                process_state.health_sequence_gaps(),
                 manifest_count,
                 QueueHealth::from_sender(&sender),
                 &states,
@@ -2418,7 +2424,7 @@ async fn run_session(
         } else {
             "stopped"
         },
-        process_state.sequence_gaps,
+        process_state.health_sequence_gaps(),
         files_with_suffix(&config.spool_dir, ".manifest.json")?.len(),
         final_queue_health,
         &states,
@@ -2471,6 +2477,58 @@ fn invalidate_depth_resync_targets(
         process_state.bump_snapshot_generation(&symbol);
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_order_book_error(
+    segment: &mut Segment,
+    states: &mut HashMap<String, OrderBookState>,
+    budget: &mut PendingBudget,
+    session_id: &str,
+    symbol: &str,
+    received_at_ns: u64,
+    error: anyhow::Error,
+    process_state: &mut ProcessState,
+    pending_diff: Option<DepthDiff>,
+) -> anyhow::Result<ProcessAction> {
+    segment.mark_replay_unsafe();
+    segment.write(
+        "sequence_gap",
+        json!({
+            "session_id":session_id,
+            "kind":"order_book_sequence",
+            "symbol":symbol,
+            "error":error.to_string(),
+        }),
+        received_at_ns,
+    )?;
+    if error
+        .downcast_ref::<SequenceGap>()
+        .is_none_or(|gap| gap.symbol != symbol)
+    {
+        process_state.sequence_gaps += 1;
+        return Err(error);
+    }
+
+    let state = states
+        .get_mut(symbol)
+        .ok_or_else(|| anyhow::anyhow!("unconfigured symbol {symbol}"))?;
+    state.invalidate_for_resync(budget);
+    // The websocket subscription is still proof-verified; only this local
+    // order book lost continuity. Keep the gap in the unsafe segment and
+    // re-bootstrap this symbol without poisoning every later segment.
+    state.verify_stream_coverage();
+    process_state
+        .active_order_book_gaps
+        .insert(symbol.to_owned());
+    if let Some(diff) = pending_diff {
+        state.apply_diff(&diff, budget)?;
+    }
+    let generation = process_state.bump_snapshot_generation(symbol);
+    Ok(ProcessAction::ResyncSnapshots(vec![SnapshotRequest {
+        symbol: symbol.to_owned(),
+        generation,
+    }]))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2610,18 +2668,22 @@ fn process_event(
                 json!({"session_id":session_id,"frame":frame}),
                 received_at_ns,
             )?;
+            let symbol = diff.symbol.clone();
             let state = states
-                .get_mut(&diff.symbol)
-                .ok_or_else(|| anyhow::anyhow!("unconfigured symbol {}", diff.symbol))?;
-            if let Err(error) = state.apply_diff(diff, budget) {
-                segment.mark_replay_unsafe();
-                process_state.sequence_gaps += 1;
-                segment.write(
-                    "sequence_gap",
-                    json!({"session_id":session_id,"error":error.to_string()}),
-                    now_ns()?,
-                )?;
-                return Err(error);
+                .get_mut(&symbol)
+                .ok_or_else(|| anyhow::anyhow!("unconfigured symbol {symbol}"))?;
+            if let Err(error) = state.apply_diff(&diff, budget) {
+                return handle_order_book_error(
+                    segment,
+                    states,
+                    budget,
+                    session_id,
+                    &symbol,
+                    received_at_ns,
+                    error,
+                    process_state,
+                    Some(diff),
+                );
             }
             process_state.mark_stream_observed(&stream_name);
         }
@@ -2858,15 +2920,19 @@ fn process_event(
                 .get_mut(&symbol)
                 .ok_or_else(|| anyhow::anyhow!("unconfigured symbol {symbol}"))?;
             if let Err(error) = state.install_snapshot(&snapshot, budget) {
-                segment.mark_replay_unsafe();
-                process_state.sequence_gaps += 1;
-                segment.write(
-                    "sequence_gap",
-                    json!({"session_id":session_id,"error":error.to_string()}),
-                    now_ns()?,
-                )?;
-                return Err(error);
+                return handle_order_book_error(
+                    segment,
+                    states,
+                    budget,
+                    session_id,
+                    &symbol,
+                    received_at_ns,
+                    error,
+                    process_state,
+                    None,
+                );
             }
+            process_state.active_order_book_gaps.remove(&symbol);
         }
         Event::ExcludeSymbol { symbol, reason } => {
             config.exclude_symbol(&symbol);
@@ -6866,7 +6932,7 @@ mod tests {
         )
         .unwrap();
         btc.apply_diff(
-            DepthDiff {
+            &DepthDiff {
                 symbol: "BTCUSDT".into(),
                 first_update_id: 101,
                 final_update_id: 101,
@@ -7082,7 +7148,7 @@ mod tests {
             .unwrap();
         state
             .apply_diff(
-                DepthDiff {
+                &DepthDiff {
                     symbol: "BTCUSDT".into(),
                     first_update_id: 101,
                     final_update_id: 101,
@@ -9147,7 +9213,7 @@ mod tests {
     }
 
     #[test]
-    fn depth_gap_ends_the_capture_epoch() {
+    fn depth_gap_resyncs_only_the_affected_symbol() {
         let root = tempfile::Builder::new()
             .prefix("monday-depth-gap-epoch-test-")
             .tempdir()
@@ -9156,8 +9222,9 @@ mod tests {
         config.market = Market::Usdm;
         config.spool_dir = root.path().to_path_buf();
         let mut budget = PendingBudget::new(10);
-        let mut state = OrderBookState::new("BTCUSDT", Market::Usdm);
-        state
+        config.symbols = vec!["BTCUSDT".into(), "ETHUSDT".into()];
+        let mut btc = OrderBookState::new("BTCUSDT", Market::Usdm);
+        btc
             .install_snapshot(
                 &json!({
                     "lastUpdateId": 11_075_153_756_947_u64,
@@ -9167,7 +9234,20 @@ mod tests {
                 &mut budget,
             )
             .unwrap();
-        let mut states = HashMap::from([("BTCUSDT".to_owned(), state)]);
+        let mut eth = OrderBookState::new("ETHUSDT", Market::Usdm);
+        eth.install_snapshot(
+            &json!({
+                "lastUpdateId": 42_u64,
+                "bids": [["200", "1"]],
+                "asks": [["201", "1"]]
+            }),
+            &mut budget,
+        )
+        .unwrap();
+        let mut states = HashMap::from([
+            ("BTCUSDT".to_owned(), btc),
+            ("ETHUSDT".to_owned(), eth),
+        ]);
         let mut segment =
             Segment::create(config.segment_config(), 1_784_349_725_319_895_632).unwrap();
         let mut process_state = trusted_process_state(&config.symbols);
@@ -9191,7 +9271,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = process_event(
+        let action = process_event(
             &config,
             &mut segment,
             &mut states,
@@ -9200,13 +9280,185 @@ mod tests {
             event,
             &mut process_state,
         )
+        .unwrap();
+
+        assert_eq!(
+            action,
+            ProcessAction::ResyncSnapshots(vec![SnapshotRequest {
+                symbol: "BTCUSDT".into(),
+                generation: 1,
+            }])
+        );
+        assert!(!action.restarts_capture_session());
+        assert!(!states["BTCUSDT"].synced);
+        assert_eq!(states["BTCUSDT"].last_update_id(), None);
+        assert!(states["ETHUSDT"].synced);
+        assert_eq!(states["ETHUSDT"].last_update_id(), Some(42));
+        assert_eq!(process_state.snapshot_generation("BTCUSDT"), 1);
+        assert_eq!(process_state.snapshot_generation("ETHUSDT"), 0);
+        assert_eq!(process_state.sequence_gaps, 0);
+        assert_eq!(process_state.health_sequence_gaps(), 1);
+        assert_eq!(segment.event_count("sequence_gap"), 1);
+        assert!(!segment.is_replay_safe());
+
+        assert_eq!(
+            process_event(
+                &config,
+                &mut segment,
+                &mut states,
+                &mut budget,
+                "session-1",
+                Event::Snapshot {
+                    received_at_ns: received_at_ns + 1,
+                    symbol: "BTCUSDT".into(),
+                    generation: 1,
+                    request_started_at_ns: received_at_ns,
+                    snapshot: json!({
+                        "lastUpdateId": 11_075_153_767_256_u64,
+                        "bids": [["100", "1"]],
+                        "asks": [["101", "1"]]
+                    }),
+                },
+                &mut process_state,
+            )
+            .unwrap(),
+            ProcessAction::None
+        );
+        assert!(states["BTCUSDT"].synced);
+        assert!(states["BTCUSDT"].continuity_complete());
+        assert_eq!(states["BTCUSDT"].last_update_id(), Some(11_075_153_767_256));
+        assert_eq!(budget.count(), 0);
+        assert_eq!(process_state.health_sequence_gaps(), 0);
+        assert!(!segment.is_replay_safe());
+    }
+
+    #[test]
+    fn pending_depth_gap_requests_a_new_snapshot_without_ending_the_session() {
+        let root = tempfile::Builder::new()
+            .prefix("monday-pending-depth-gap-resync-test-")
+            .tempdir()
+            .unwrap();
+        let mut config = test_config("http://unused".into());
+        config.market = Market::Usdm;
+        config.symbols = vec!["BTCUSDT".into(), "ETHUSDT".into()];
+        config.spool_dir = root.path().to_path_buf();
+        let mut budget = PendingBudget::new(10);
+        let mut btc = OrderBookState::new("BTCUSDT", Market::Usdm);
+        btc.apply_diff(
+            &DepthDiff {
+                symbol: "BTCUSDT".into(),
+                first_update_id: 201,
+                final_update_id: 202,
+                previous_update_id: Some(200),
+                bids: Vec::new(),
+                asks: Vec::new(),
+            },
+            &mut budget,
+        )
+        .unwrap();
+        let mut eth = OrderBookState::new("ETHUSDT", Market::Usdm);
+        eth.install_snapshot(
+            &json!({
+                "lastUpdateId": 42_u64,
+                "bids": [["200", "1"]],
+                "asks": [["201", "1"]]
+            }),
+            &mut budget,
+        )
+        .unwrap();
+        let mut states = HashMap::from([
+            ("BTCUSDT".to_owned(), btc),
+            ("ETHUSDT".to_owned(), eth),
+        ]);
+        let received_at_ns = 1_784_349_725_538_670_685;
+        let mut segment =
+            Segment::create(config.segment_config(), received_at_ns - 1_000_000).unwrap();
+        let mut process_state = trusted_process_state(&config.symbols);
+
+        let action = process_event(
+            &config,
+            &mut segment,
+            &mut states,
+            &mut budget,
+            "session-1",
+            Event::Snapshot {
+                received_at_ns,
+                symbol: "BTCUSDT".into(),
+                generation: 0,
+                request_started_at_ns: received_at_ns - 1_000_000,
+                snapshot: json!({
+                    "lastUpdateId": 100_u64,
+                    "bids": [["100", "1"]],
+                    "asks": [["101", "1"]]
+                }),
+            },
+            &mut process_state,
+        )
+        .unwrap();
+
+        assert_eq!(
+            action,
+            ProcessAction::ResyncSnapshots(vec![SnapshotRequest {
+                symbol: "BTCUSDT".into(),
+                generation: 1,
+            }])
+        );
+        assert!(!action.restarts_capture_session());
+        assert!(!states["BTCUSDT"].synced);
+        assert_eq!(states["BTCUSDT"].last_update_id(), None);
+        assert!(states["ETHUSDT"].synced);
+        assert_eq!(states["ETHUSDT"].last_update_id(), Some(42));
+        assert_eq!(process_state.snapshot_generation("BTCUSDT"), 1);
+        assert_eq!(process_state.snapshot_generation("ETHUSDT"), 0);
+        assert_eq!(process_state.sequence_gaps, 0);
+        assert_eq!(process_state.health_sequence_gaps(), 1);
+        assert_eq!(segment.event_count("sequence_gap"), 1);
+        assert!(!segment.is_replay_safe());
+    }
+
+    #[test]
+    fn non_sequence_order_book_error_remains_session_fatal() {
+        let root = tempfile::Builder::new()
+            .prefix("monday-non-sequence-order-book-error-test-")
+            .tempdir()
+            .unwrap();
+        let mut config = test_config("http://unused".into());
+        config.market = Market::Usdm;
+        config.symbols = vec!["BTCUSDT".into()];
+        config.spool_dir = root.path().to_path_buf();
+        let received_at_ns = 1_784_349_725_538_670_685;
+        let mut segment =
+            Segment::create(config.segment_config(), received_at_ns - 1_000_000).unwrap();
+        let mut states = HashMap::from([(
+            "BTCUSDT".to_owned(),
+            OrderBookState::new("BTCUSDT", Market::Usdm),
+        )]);
+        let mut budget = PendingBudget::new(10);
+        let mut process_state = trusted_process_state(&config.symbols);
+
+        let error = process_event(
+            &config,
+            &mut segment,
+            &mut states,
+            &mut budget,
+            "session-1",
+            Event::Snapshot {
+                received_at_ns,
+                symbol: "BTCUSDT".into(),
+                generation: 0,
+                request_started_at_ns: received_at_ns - 1_000_000,
+                snapshot: json!({"bids":[["100","1"]],"asks":[["101","1"]]}),
+            },
+            &mut process_state,
+        )
         .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("expected=11075153756947 received=11075153761591-11075153767256"));
+        assert!(error.to_string().contains("snapshot missing lastUpdateId"));
         assert_eq!(process_state.sequence_gaps, 1);
+        assert_eq!(process_state.health_sequence_gaps(), 1);
+        assert!(process_state.active_order_book_gaps.is_empty());
         assert_eq!(segment.event_count("sequence_gap"), 1);
+        assert!(!segment.is_replay_safe());
     }
 
     #[test]
@@ -10561,7 +10813,7 @@ mod tests {
             .unwrap();
         bridged
             .apply_diff(
-                DepthDiff {
+                &DepthDiff {
                     symbol: "BTCUSDT".into(),
                     first_update_id: 101,
                     final_update_id: 101,
@@ -10685,7 +10937,7 @@ mod tests {
             .unwrap();
         bridged
             .apply_diff(
-                DepthDiff {
+                &DepthDiff {
                     symbol: "BTCUSDT".into(),
                     first_update_id: 101,
                     final_update_id: 101,
@@ -10754,7 +11006,7 @@ mod tests {
             if symbol == "BTCUSDT" {
                 state
                     .apply_diff(
-                        DepthDiff {
+                        &DepthDiff {
                             symbol: symbol.clone(),
                             first_update_id: 101,
                             final_update_id: 101,
@@ -10849,7 +11101,7 @@ mod tests {
             .unwrap();
         state
             .apply_diff(
-                DepthDiff {
+                &DepthDiff {
                     symbol: "BTCUSDT".into(),
                     first_update_id: 101,
                     final_update_id: 101,
@@ -10927,7 +11179,7 @@ mod tests {
             .unwrap();
         state
             .apply_diff(
-                DepthDiff {
+                &DepthDiff {
                     symbol: "BTCUSDT".into(),
                     first_update_id: 101,
                     final_update_id: 101,
@@ -11008,7 +11260,7 @@ mod tests {
             .unwrap();
         state
             .apply_diff(
-                DepthDiff {
+                &DepthDiff {
                     symbol: "BTCUSDT".into(),
                     first_update_id: 101,
                     final_update_id: 101,
@@ -11202,7 +11454,7 @@ mod tests {
             .unwrap();
         state
             .apply_diff(
-                DepthDiff {
+                &DepthDiff {
                     symbol: "BTCUSDT".into(),
                     first_update_id: 101,
                     final_update_id: 101,
