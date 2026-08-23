@@ -60,10 +60,10 @@ if monday_shadow_memory_admission 1 0 0 >/dev/null 2>&1; then
   printf 'shadow gate memory admission accepted a zero requirement\n' >&2
   exit 1
 fi
-calibrated_gate_bytes=5368709120
+calibrated_gate_bytes=4429185024
 [[ $(monday_shadow_memory_admission \
-  "$calibrated_gate_bytes" 1073741824 4294967296 0) == "$calibrated_gate_bytes" ]] || {
-  printf 'calibrated dual-market gate does not fit its exact 5 GiB budget\n' >&2
+  "$calibrated_gate_bytes" 1073741824 3355443200 0) == "$calibrated_gate_bytes" ]] || {
+  printf 'calibrated sequential gate does not fit its upload-drain budget\n' >&2
   exit 1
 }
 
@@ -300,10 +300,12 @@ grep -Fq 'candidate shadow gate USD-M symbols differ from the deployment bundle'
 grep -Fq 'or (.diff_count == 0' "$GATE"
 grep -Fq 'and .first_update_id == null' "$GATE"
 grep -Fq 'and .last_update_id == null' "$GATE"
-grep -Fq 'observation_started_ns=$(date +%s%N)' "$GATE"
-grep -Fq '((end_ns <= observation_started_ns)) && continue' "$GATE"
+grep -Fq 'market_observation_started_ns[$market]=$(date +%s%N)' "$GATE"
+grep -Fq '((end_ns <= market_observation_started_ns[$market])) && continue' "$GATE"
 grep -Fq 'shadow segments did not rotate after health settled' "$GATE"
-[[ $(grep -Fc 'end_received_at_ns > $gate.observation_started_ns' "$POLICY") -eq 2 ]] || {
+grep -Fq 'end_received_at_ns > $gate.markets.spot.observation_started_ns' "$POLICY"
+grep -Fq 'end_received_at_ns > $gate.markets.usdm.observation_started_ns' "$POLICY"
+[[ $(grep -Fc 'end_received_at_ns > $gate.observation_started_ns' "$POLICY") -eq 0 ]] || {
   printf 'gate policy does not bind both market tapes across observation start\n' >&2
   exit 1
 }
@@ -311,11 +313,11 @@ if grep -Fq '((start_ns < gate_started_ns)) && continue' "$GATE"; then
   printf 'manifest discovery still admits health-settle warmup segments\n' >&2
   exit 1
 fi
-if grep -Fq '((start_ns < observation_started_ns)) && continue' "$GATE"; then
+if grep -Fq '((start_ns < market_observation_started_ns[$market])) && continue' "$GATE"; then
   printf 'manifest discovery still drops the segment overlapping observation start\n' >&2
   exit 1
 fi
-grep -Fq 'gate_started_ns=$(date +%s%N)' "$GATE"
+grep -Fq 'market_gate_started_ns[$market]=$(date +%s%N)' "$GATE"
 grep -Fq 'all(.[].lob_reconnect_boundary; . == false)' "$GATE"
 grep -Fq 'ARG SOURCE_REVISION' "$COLLECTOR_DOCKERFILE"
 grep -Fq 'MONDAY_SOURCE_REVISION="$SOURCE_REVISION" cargo' "$COLLECTOR_DOCKERFILE"
@@ -329,6 +331,7 @@ grep -Fq 'systemctl_value "$market" MemoryHigh' "$GATE"
 grep -Fq 'memory_max_bytes[$market] == 2147483648' "$GATE"
 grep -Fq 'readonly HOST_MEMORY_RESERVE_BYTES=1073741824' "$GATE"
 grep -Fq 'readonly STRICT_VERIFIER_MEMORY_MAX_BYTES=3221225472' "$GATE"
+grep -Fq 'readonly UPLOAD_DRAIN_MEMORY_MAX_BYTES=3355443200' "$GATE"
 grep -Fq 'monday_shadow_memory_admission' "$GATE"
 grep -Fq 'host_memory_available_bytes_at_preflight' "$GATE"
 grep -Fq 'host_swap_total_bytes' "$GATE"
@@ -338,15 +341,23 @@ grep -Fq 'host_memory_required_bytes' "$GATE"
 grep -Fq 'host_memory_shortfall_bytes' "$GATE"
 grep -Fq 'host_memory_headroom_ok' "$GATE"
 grep -Fq 'systemctl_value "$market" OOMScoreAdjust' "$GATE"
-memory_guard_line=$(grep -nF 'insufficient host memory headroom for concurrent shadow gate' \
+memory_guard_line=$(grep -nF 'insufficient host memory headroom for sequential shadow gate' \
   "$GATE" | cut -d: -f1)
-shadow_start_line=$(grep -nF 'systemctl start "${unit[spot]}" "${unit[usdm]}"' \
+shadow_start_line=$(grep -nF 'systemctl start "${unit[$market]}"' \
   "$GATE" | cut -d: -f1)
 [[ -n $memory_guard_line && -n $shadow_start_line \
   && $memory_guard_line -lt $shadow_start_line ]] || {
-  printf 'shadow gate memory guard does not run before both shadow units start\n' >&2
+  printf 'shadow gate memory guard does not run before sequential shadow phases\n' >&2
   exit 1
 }
+if grep -Fq 'systemctl start "${unit[spot]}" "${unit[usdm]}"' "$GATE"; then
+  printf 'shadow gate still starts Spot and USD-M concurrently\n' >&2
+  exit 1
+fi
+grep -Fq 'readonly -a markets=(spot usdm)' "$GATE"
+grep -Fq 'run_market_gate_phase "$market"' "$GATE"
+grep -Fq 'for other in "${markets[@]}"; do' "$GATE"
+grep -Fq 'shadow service is active before the $market phase' "$GATE"
 if grep -Fq 'binance-lob-archiver-rust-usdm-memory.conf' "$INSTALL_RELEASE" "$GATE"; then
   printf 'shadow memory contract still depends on a persistent USD-M drop-in\n' >&2
   exit 1
@@ -517,6 +528,38 @@ run_strict_verifier_failure_fixture() (
 )
 run_strict_verifier_failure_fixture
 
+upload_drain_body="$tmp_dir/upload-drain.sh"
+sed -n '/^stop_upload_drain()/,/^}/p;/^run_candidate_drain()/,/^}/p' \
+  "$GATE" >"$upload_drain_body"
+run_upload_drain_fixture() (
+  local -a invocations=()
+  declare -A spool_dir oss_bucket oss_endpoint oss_region aliyun_profile oss_copy_timeout
+  upload_drain_unit=
+  upload_drain_counter=0
+  SERVICE_USER=hftcollector
+  SERVICE_HOME=/var/lib/hft-collector
+  SAFE_PATH=/usr/bin:/bin
+  candidate_binary=/candidate/binance-lob-archiver
+  spool_dir[spot]=/spool/spot
+  oss_bucket[spot]=bucket
+  oss_endpoint[spot]=endpoint
+  oss_region[spot]=region
+  aliyun_profile[spot]=profile
+  oss_copy_timeout[spot]=60
+  systemd-run() { invocations+=("$*"); }
+  assert_spool_drained() { [[ $1 == spot ]]; }
+  # shellcheck disable=SC1090
+  . "$upload_drain_body"
+  run_candidate_drain spot
+  [[ ${#invocations[@]} -eq 1 ]] || exit 1
+  [[ ${invocations[0]} == *'--property=CPUQuota=80%'* ]] || exit 1
+  [[ ${invocations[0]} == *'--property=MemoryHigh=2500M'* ]] || exit 1
+  [[ ${invocations[0]} == *'--property=MemoryMax=3200M'* ]] || exit 1
+  [[ ${invocations[0]} == *'/candidate/binance-lob-archiver --upload-only'* ]] || exit 1
+  [[ -z $upload_drain_unit ]]
+)
+run_upload_drain_fixture
+
 health_settle_body="$tmp_dir/resolve-health-settle.sh"
 sed -n '/^resolve_health_settle_seconds()/,/^}/p' "$GATE" >"$health_settle_body"
 resolve_health_settle() (
@@ -629,7 +672,8 @@ usdm_catalog=$(jq -cn --arg symbols "$usdm_symbols_config" \
 
 market_json=$(jq -cn \
   --arg catalog "$catalog" \
-  '{symbol_count:1200,snapshot_ready_count:1200,bridged_count:1200,
+  '{observation_started_ns:150,
+    symbol_count:1200,snapshot_ready_count:1200,bridged_count:1200,
     stream_coverage_verified_count:1200,all_stream_coverage_verified:true,sequence_gaps:0,
     upload_failure_count:0,health_samples:121,max_health_silence_seconds:30,
     symbols_config:"ALL",catalog_sha256:$catalog,configured_catalog_sha256:$catalog,
@@ -722,7 +766,27 @@ if jq -e \
   printf 'gate policy accepted evidence without an observation boundary\n' >&2
   exit 1
 fi
-jq '.observation_started_ns = 99' \
+jq 'del(.markets.spot.observation_started_ns)' \
+  "$tmp_dir/gate.json" >"$tmp_dir/missing-market-observation-boundary.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/missing-market-observation-boundary.json" >/dev/null; then
+  printf 'gate policy accepted Spot evidence without its observation boundary\n' >&2
+  exit 1
+fi
+jq 'del(.markets.usdm.observation_started_ns)' \
+  "$tmp_dir/gate.json" >"$tmp_dir/missing-usdm-observation-boundary.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/missing-usdm-observation-boundary.json" >/dev/null; then
+  printf 'gate policy accepted USD-M evidence without its observation boundary\n' >&2
+  exit 1
+fi
+jq '.markets.spot.observation_started_ns = 99' \
   "$tmp_dir/gate.json" >"$tmp_dir/late-evidence-start.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
@@ -732,7 +796,7 @@ if jq -e \
   printf 'gate policy accepted evidence that starts after observation\n' >&2
   exit 1
 fi
-jq '.observation_started_ns = 200' \
+jq '.markets.usdm.observation_started_ns = 200' \
   "$tmp_dir/gate.json" >"$tmp_dir/early-evidence-end.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
@@ -1272,6 +1336,29 @@ sed -n '/^rollback_after_failure()/,/^}/p' "$CUTOVER" >"$rollback_body"
 production_predicate_body="$tmp_dir/production-is-fail-closed.sh"
 sed -n '/^production_is_fail_closed()/,/^}/p' "$CUTOVER" \
   >"$production_predicate_body"
+partial_predicate_body="$tmp_dir/partial-spot-is-restored.sh"
+sed -n '/^partial_spot_runtime_is_restored()/,/^}/p' "$CUTOVER" \
+  >"$partial_predicate_body"
+spot_wait_body="$tmp_dir/wait-for-spot-release-health.sh"
+sed -n '/^wait_for_spot_release_health()/,/^}/p' "$CUTOVER" >"$spot_wait_body"
+run_spot_wait_fixture() (
+  PRODUCTION_UNITS=(production-spot production-usdm)
+  HEALTH_TIMEOUT_SECONDS=20
+  SECONDS=0
+  health_checks=0
+  systemctl() { [[ $1 == is-active && ${!#} == production-spot ]]; }
+  health_ready_for_release() {
+    health_checks=$((health_checks + 1))
+    ((health_checks >= 3))
+  }
+  unit_matches_release() { return 0; }
+  sleep() { SECONDS=$((SECONDS + $1)); }
+  # shellcheck disable=SC1090
+  . "$spot_wait_body"
+  wait_for_spot_release_health old-binary old-session 123
+  printf '%s\n' "$health_checks"
+)
+[[ $(run_spot_wait_fixture) == 3 ]]
 start_line=$(grep -n 'systemctl start "${PRODUCTION_UNITS\[@\]}"' "$rollback_body" | tail -1 | cut -d: -f1)
 clear_line=$(grep -n 'clear_health_before_restart' "$rollback_body" | cut -d: -f1)
 health_line=$(grep -n 'wait_for_release_health' "$rollback_body" | cut -d: -f1)
@@ -1291,7 +1378,11 @@ grep -Fq 'binance-lob-archiver@spot.service' "$CUTOVER"
 grep -Fq 'binance-lob-archiver@usdm.service' "$CUTOVER"
 grep -Fq 'contained-upgrade' "$CUTOVER"
 grep -Fq 'capture_existing_production_identity contained-upgrade' "$CUTOVER"
-grep -Fq 'if [[ $OLD_MODE == upgrade || $OLD_MODE == contained-upgrade ]]; then' "$CUTOVER"
+grep -Fq 'partial-contained-spot-live' "$CUTOVER"
+grep -Fq 'capture_existing_production_identity partial-contained-spot-live' "$CUTOVER"
+grep -Fq 'partial_spot_runtime_is_restored' "$CUTOVER"
+grep -Fq 'wait_for_spot_release_health' "$CUTOVER"
+grep -Fq 'previous-spot-restored-usdm-contained' "$CUTOVER"
 grep -Fq "fail 'new host must not retain a production USD-M drop-in'" "$CUTOVER"
 grep -Fq 'binance-lob-archiver-production@usdm.service.d/10-memory.conf' "$CUTOVER"
 grep -Fq 'legacy collector unit must be disabled before cutover' "$CUTOVER"
@@ -1344,6 +1435,83 @@ grep -Fq 'OLD_MODE=new-host' <<<"$host_state_dispatch"
 grep -Fq '(( PRODUCTION_USDM_MEMORY_DROPIN_PRESENT == 0 ))' <<<"$host_state_dispatch"
 grep -Fq $'capture_existing_production_identity contained-upgrade\n  DRAIN_REQUIRED=1' \
   <<<"$host_state_dispatch"
+grep -Fq 'capture_existing_production_identity partial-contained-spot-live' \
+  <<<"$host_state_dispatch"
+grep -Fq '$spot_active_state == active && $spot_enabled_state == enabled' \
+  <<<"$host_state_dispatch"
+grep -Fq '$usdm_enabled_state == masked || $usdm_enabled_state == masked-runtime' \
+  <<<"$host_state_dispatch"
+grep -Fq '$spot_upload_enabled_state == static' <<<"$host_state_dispatch"
+grep -Fq '$spot_upload_enabled_state == masked-runtime' <<<"$host_state_dispatch"
+grep -Fq '$usdm_upload_enabled_state == masked' <<<"$host_state_dispatch"
+host_state_dispatch_file="$tmp_dir/host-state-dispatch.sh"
+printf '%s\n' "$host_state_dispatch" >"$host_state_dispatch_file"
+run_partial_host_state_fixture() (
+  local usdm_enabled_state=$1 usdm_main_pid=${2:-0}
+  local spot_upload_enabled_state=${3:-masked-runtime}
+  local fixed_now_ns=2000000000000
+  PRODUCTION_UNITS=(production-spot production-usdm)
+  UPLOAD_UNITS=(upload-spot upload-usdm)
+  PRODUCTION_LINK="$tmp_dir/partial-production-$usdm_enabled_state-$usdm_main_pid-$spot_upload_enabled_state"
+  ln -s "$tmp_dir/old-production-binary" "$PRODUCTION_LINK"
+  active_count=1
+  enabled_count=1
+  spot_active_state=active
+  spot_enabled_state=enabled
+  usdm_active_state=inactive
+  usdm_upload_enabled_state=masked-runtime
+  HEALTH_TIMEOUT_SECONDS=300
+  PRODUCTION_USDM_MEMORY_DROPIN_PRESENT=0
+  DRAIN_REQUIRED=0
+  OLD_MODE=
+  OLD_BINARY=
+  systemctl_value() {
+    case "$1:$2" in
+      production-usdm:SubState) printf 'dead\n' ;;
+      production-usdm:MainPID) printf '%s\n' "$usdm_main_pid" ;;
+      *) return 1 ;;
+    esac
+  }
+  capture_existing_production_identity() {
+    OLD_MODE=$1
+    OLD_BINARY="$tmp_dir/old-production-binary"
+  }
+  unit_matches_release() {
+    [[ $1 == production-spot && $2 == "$OLD_BINARY" && $3 == true ]]
+  }
+  date() { [[ $1 == +%s%N ]] && printf '%s\n' "$fixed_now_ns"; }
+  health_ready_for_release() {
+    [[ $1 == spot && $2 == 1000 && -z $3 \
+      && $4 == $((fixed_now_ns - HEALTH_TIMEOUT_SECONDS * 1000000000)) ]]
+  }
+  require_empty_segment_spool() { return 1; }
+  fail() { printf '%s\n' "$*" >&2; exit 1; }
+  if ! . "$host_state_dispatch_file"; then
+    return 1
+  fi
+  printf '%s %s\n' "$OLD_MODE" "$DRAIN_REQUIRED"
+)
+[[ $(run_partial_host_state_fixture masked-runtime) \
+  == 'partial-contained-spot-live 1' ]]
+if run_partial_host_state_fixture disabled >"$tmp_dir/partial-disabled.out" 2>&1; then
+  printf 'partial classifier accepted disabled instead of masked USD-M\n' >&2
+  exit 1
+fi
+grep -Fq 'ambiguous production state' "$tmp_dir/partial-disabled.out"
+if run_partial_host_state_fixture masked-runtime 1 \
+  >"$tmp_dir/partial-main-pid.out" 2>&1; then
+  printf 'partial classifier accepted a live USD-M MainPID\n' >&2
+  exit 1
+fi
+grep -Fq 'contained USD-M production is not inactive/dead with MainPID=0' \
+  "$tmp_dir/partial-main-pid.out"
+if run_partial_host_state_fixture masked-runtime 0 masked \
+  >"$tmp_dir/partial-persistent-spot-upload-mask.out" 2>&1; then
+  printf 'partial classifier accepted a persistently masked Spot uploader\n' >&2
+  exit 1
+fi
+grep -Fq 'ambiguous production state' \
+  "$tmp_dir/partial-persistent-spot-upload-mask.out"
 
 new_host_dropin_guard="$tmp_dir/new-host-dropin-guard.sh"
 sed -n '/^  (( PRODUCTION_USDM_MEMORY_DROPIN_PRESENT == 0 )) \\/,+1p' "$CUTOVER" \
@@ -1364,7 +1532,7 @@ grep -Fq 'new host must not retain a production USD-M drop-in' \
 
 drain_dispatch_body="$tmp_dir/drain-dispatch.sh"
 sed -n \
-  '/^if \[\[ \$OLD_MODE == upgrade || \$OLD_MODE == contained-upgrade \]\]; then$/,/^fi$/p' \
+  '/^if \[\[ \$OLD_MODE == upgrade || \$OLD_MODE == contained-upgrade/,/^fi$/p' \
   "$CUTOVER" >"$drain_dispatch_body"
 run_drain_dispatch_fixture() (
   local calls=$1
@@ -1380,10 +1548,13 @@ run_drain_dispatch_fixture() (
   . "$drain_dispatch_body"
 )
 contained_drain_calls="$tmp_dir/contained-drain.calls"
+partial_drain_calls="$tmp_dir/partial-drain.calls"
 new_host_drain_calls="$tmp_dir/new-host-drain.calls"
 run_drain_dispatch_fixture "$contained_drain_calls" contained-upgrade
+run_drain_dispatch_fixture "$partial_drain_calls" partial-contained-spot-live
 run_drain_dispatch_fixture "$new_host_drain_calls" new-host
 grep -Fxq 'drain old-deployment' "$contained_drain_calls"
+grep -Fxq 'drain old-deployment' "$partial_drain_calls"
 if grep -Fq 'require-empty' "$contained_drain_calls"; then
   printf 'contained upgrade used the new-host spool invariant\n' >&2
   exit 1
@@ -1603,6 +1774,7 @@ run_contained_upgrade_rollback_fixture() (
   local active_recovery_timer=${5:-}
   local enabled_recovery_timer=${6:-}
   local active_recovery_unit=${7:-}
+  local spot_upload_unmasked=0
   local calls="$tmp_dir/contained-rollback.calls"
   PRODUCTION_UNITS=(production-spot production-usdm)
   UPLOAD_UNITS=(upload-spot upload-usdm)
@@ -1623,6 +1795,7 @@ run_contained_upgrade_rollback_fixture() (
   DRAIN_ATTEMPTED=0
   DRAIN_MAY_HAVE_MUTATED=0
   OLD_RECOVERY_TIMERS_ENABLED=$old_recovery_timers_enabled
+  OLD_SESSION_SPOT=old-spot-session
   SPOOL_ENV_DEPLOYMENT=$OLD_DEPLOYMENT
   mkdir -p "$CANONICAL_SPOOL" "$OLD_DEPLOYMENT" "$EVIDENCE_DIR" \
     "$(dirname "$PRODUCTION_LINK")"
@@ -1634,6 +1807,10 @@ run_contained_upgrade_rollback_fixture() (
         [[ ${!#} == "$active_recovery_timer" || ${!#} == "$active_recovery_unit" ]]
         ;;
       is-enabled)
+        if [[ ${!#} == upload-spot && $spot_upload_unmasked -eq 1 ]]; then
+          printf 'static\n'
+          return 1
+        fi
         if [[ ${2:-} == --quiet ]]; then
           [[ ${!#} == "$enabled_recovery_timer" ]]
           return
@@ -1649,18 +1826,34 @@ run_contained_upgrade_rollback_fixture() (
         fi
         return 1
         ;;
+      show)
+        if [[ $* == *'--property=MainPID'* ]]; then
+          printf '0\n'
+        fi
+        ;;
+      unmask)
+        if [[ ${!#} == upload-spot ]]; then
+          spot_upload_unmasked=1
+        fi
+        ;;
       mask) (( expect_contained )) ;;
       *) return 0 ;;
     esac
   }
   sha256sum() { return 0; }
   copy_health_evidence() { return 0; }
+  clear_health_before_restart() { return 0; }
+  health_ready_for_release() { return 0; }
+  wait_for_spot_release_health() { return 0; }
+  unit_matches_release() { return 0; }
   run_candidate_drain() { printf 'drain %s\n' "$1" >>"$calls"; return 1; }
   install_deployment() { printf 'install %s\n' "$1" >>"$calls"; return 0; }
   atomic_symlink() { printf 'symlink %s %s\n' "$1" "$2" >>"$calls"; return 0; }
   restore_allowlisted_production_dropins() { printf 'restore-dropin\n' >>"$calls"; return 0; }
   # shellcheck disable=SC1090
   . "$production_predicate_body"
+  # shellcheck disable=SC1090
+  . "$partial_predicate_body"
   # shellcheck disable=SC1090
   . "$rollback_body"
   rollback_after_failure
@@ -1675,7 +1868,16 @@ run_contained_upgrade_rollback_fixture() (
     printf 'uncontained rollback tried to restore the previous release\n' >&2
     exit 1
   fi
-  if grep -Eq '^(start|enable|unmask) ' "$calls"; then
+  if [[ $mode == partial-contained-spot-live ]]; then
+    grep -Fxq 'start production-spot' "$calls"
+    grep -Fxq 'enable production-spot' "$calls"
+    grep -Fxq 'unmask --runtime production-spot' "$calls"
+    grep -Fxq 'unmask --runtime upload-spot' "$calls"
+    if grep -Eq '^(start|enable|unmask) .*(production-usdm|upload-usdm)' "$calls"; then
+      printf 'partial rollback tried to start, enable, or unmask old USD-M\n' >&2
+      exit 1
+    fi
+  elif grep -Eq '^(start|enable|unmask) ' "$calls"; then
     printf 'contained rollback tried to restart or unmask the previous release\n' >&2
     exit 1
   fi
@@ -1706,6 +1908,10 @@ run_contained_upgrade_rollback_fixture() (
   == production-stop-or-disable-containment-failed ]]
 [[ $(run_contained_upgrade_rollback_fixture 1 1 upgrade) \
   == previous-release-restored-disabled ]]
+[[ $(run_contained_upgrade_rollback_fixture 1 0 partial-contained-spot-live) \
+  == previous-spot-restored-usdm-contained ]]
+[[ $(run_contained_upgrade_rollback_fixture 1 0 partial-contained-spot-live 2) \
+  == previous-spot-restored-usdm-contained ]]
 
 run_new_host_rollback_fixture() (
   local active_unit=${1:-} unit

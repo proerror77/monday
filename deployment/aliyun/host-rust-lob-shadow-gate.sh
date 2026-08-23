@@ -11,6 +11,7 @@ readonly MAX_HEALTH_SILENCE_SECONDS=120
 readonly MAX_SEGMENT_GAP_NS=90000000000
 readonly HOST_MEMORY_RESERVE_BYTES=1073741824
 readonly STRICT_VERIFIER_MEMORY_MAX_BYTES=3221225472
+readonly UPLOAD_DRAIN_MEMORY_MAX_BYTES=3355443200
 readonly SHADOW_BINARY=/opt/monday/bin/binance-lob-archiver-shadow
 readonly RELEASE_ROOT=/opt/monday/releases/binance-lob-archiver
 readonly EVIDENCE_ROOT=/data/monday/evidence/shadow-gates
@@ -215,6 +216,9 @@ for asset in \
   cmp -s "$candidate_deployment/$asset" "$installed_asset" \
     || die "installed shadow asset differs from the gated deployment bundle: $asset"
 done
+grep -Fxq 'MemoryMax=3200M' \
+  "$candidate_deployment/binance-lob-archiver-rust-upload@.service" \
+  || die 'shadow upload service MemoryMax differs from the gated template'
 candidate_production_spot_env="$candidate_deployment/binance-lob-archiver-production-spot.env"
 candidate_production_usdm_env="$candidate_deployment/binance-lob-archiver-production-usdm.env"
 secure_regular_file "$candidate_production_spot_env"
@@ -250,7 +254,7 @@ done
 host_memory_total_bytes=${host_meminfo_bytes[MemTotal]}
 host_memory_available_bytes=${host_meminfo_bytes[MemAvailable]}
 host_swap_total_bytes=${host_meminfo_bytes[SwapTotal]}
-shadow_memory_max_bytes=()
+shadow_phase_memory_bytes=0
 for market in "${markets[@]}"; do
   shadow_unit=${unit[$market]}
   [[ -z $(systemctl show "$shadow_unit" --property=DropInPaths --value) ]] \
@@ -262,11 +266,15 @@ for market in "${markets[@]}"; do
   memory_max=$(systemctl show "$shadow_unit" --property=MemoryMax --value)
   [[ $memory_max == 2147483648 ]] \
     || die "$market shadow service MemoryMax differs from the gated template"
-  shadow_memory_max_bytes+=("$memory_max")
+  if ((memory_max > shadow_phase_memory_bytes)); then
+    shadow_phase_memory_bytes=$memory_max
+  fi
 done
-shadow_phase_memory_bytes=$((shadow_memory_max_bytes[0] + shadow_memory_max_bytes[1]))
 if ((STRICT_VERIFIER_MEMORY_MAX_BYTES > shadow_phase_memory_bytes)); then
   shadow_phase_memory_bytes=$STRICT_VERIFIER_MEMORY_MAX_BYTES
+fi
+if ((UPLOAD_DRAIN_MEMORY_MAX_BYTES > shadow_phase_memory_bytes)); then
+  shadow_phase_memory_bytes=$UPLOAD_DRAIN_MEMORY_MAX_BYTES
 fi
 production_memory_headroom_bytes=0
 for market in "${markets[@]}"; do
@@ -422,15 +430,24 @@ chmod 0750 "$tmp_dir"
 gate_finished=false
 strict_verifier_unit=
 strict_verifier_counter=0
+upload_drain_unit=
+upload_drain_counter=0
 stop_strict_verifier() {
   if [[ -n $strict_verifier_unit ]]; then
     systemctl stop "$strict_verifier_unit" >/dev/null 2>&1 || true
     strict_verifier_unit=
   fi
 }
+stop_upload_drain() {
+  if [[ -n $upload_drain_unit ]]; then
+    systemctl stop "$upload_drain_unit" >/dev/null 2>&1 || true
+    upload_drain_unit=
+  fi
+}
 cleanup() {
   local status=$?
   stop_strict_verifier
+  stop_upload_drain
   if [[ $gate_finished != true ]]; then
     systemctl stop "${unit[spot]}" "${unit[usdm]}" >/dev/null 2>&1 || true
   fi
@@ -445,7 +462,7 @@ trap 'exit 143' HUP INT TERM
 trap cleanup EXIT
 
 [[ $host_memory_headroom_ok == true ]] || die \
-  "insufficient host memory headroom for concurrent shadow gate: total=$host_memory_total_bytes available=$host_memory_available_bytes swap=$host_swap_total_bytes phase=$shadow_phase_memory_bytes production_headroom=$production_memory_headroom_bytes reserve=$HOST_MEMORY_RESERVE_BYTES required=$host_memory_required_bytes shortfall=$host_memory_shortfall_bytes"
+  "insufficient host memory headroom for sequential shadow gate: total=$host_memory_total_bytes available=$host_memory_available_bytes swap=$host_swap_total_bytes phase=$shadow_phase_memory_bytes production_headroom=$production_memory_headroom_bytes reserve=$HOST_MEMORY_RESERVE_BYTES required=$host_memory_required_bytes shortfall=$host_memory_shortfall_bytes"
 
 assert_candidate() {
   [[ -L $SHADOW_BINARY ]] || die 'shadow candidate symlink disappeared'
@@ -468,18 +485,33 @@ assert_spool_drained() {
 }
 
 run_candidate_drain() {
-  local market=$1
-  runuser --user "$SERVICE_USER" -- env -i \
-    HOME="$SERVICE_HOME" \
-    PATH="$SAFE_PATH" \
-    RUST_LOG=info \
-    SPOOL_DIR="${spool_dir[$market]}" \
-    OSS_BUCKET="${oss_bucket[$market]}" \
-    OSS_ENDPOINT="${oss_endpoint[$market]}" \
-    OSS_REGION="${oss_region[$market]}" \
-    ALIYUN_PROFILE="${aliyun_profile[$market]}" \
-    OSS_COPY_TIMEOUT_SECONDS="${oss_copy_timeout[$market]}" \
-    "$candidate_binary" --upload-only
+  local market=$1 status
+  upload_drain_counter=$((upload_drain_counter + 1))
+  upload_drain_unit="monday-rust-upload-drain-$$-${market}-${upload_drain_counter}.service"
+  if systemd-run --quiet --wait --collect \
+    --unit="$upload_drain_unit" \
+    --property=KillMode=control-group \
+    --property=OOMScoreAdjust=500 \
+    --property=CPUQuota=80% \
+    --property=MemoryHigh=2500M \
+    --property=MemoryMax=3200M \
+    -- runuser --user "$SERVICE_USER" -- env -i \
+      HOME="$SERVICE_HOME" \
+      PATH="$SAFE_PATH" \
+      RUST_LOG=info \
+      SPOOL_DIR="${spool_dir[$market]}" \
+      OSS_BUCKET="${oss_bucket[$market]}" \
+      OSS_ENDPOINT="${oss_endpoint[$market]}" \
+      OSS_REGION="${oss_region[$market]}" \
+      ALIYUN_PROFILE="${aliyun_profile[$market]}" \
+      OSS_COPY_TIMEOUT_SECONDS="${oss_copy_timeout[$market]}" \
+      "$candidate_binary" --upload-only; then
+    upload_drain_unit=
+  else
+    status=$?
+    stop_upload_drain
+    return "$status"
+  fi
   assert_spool_drained "$market"
 }
 
@@ -608,8 +640,6 @@ done
 assert_candidate
 
 gate_started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-gate_started_ns=$(date +%s%N)
-systemctl start "${unit[spot]}" "${unit[usdm]}"
 
 systemctl_value() {
   local market=$1
@@ -660,36 +690,14 @@ monotonic_seconds() {
 }
 
 declare -A active_enter_us cpu_start_ns cpu_quota_us memory_max_bytes max_memory_bytes
-for market in "${markets[@]}"; do
-  systemctl is-active --quiet "${unit[$market]}" || die "$market shadow service is not active"
-  [[ $(systemctl_value "$market" ActiveState) == active ]] \
-    || die "$market shadow service did not enter ActiveState=active"
-  [[ $(systemctl_value "$market" SubState) == running ]] \
-    || die "$market shadow service did not enter SubState=running"
-  [[ $(systemctl_value "$market" OOMScoreAdjust) == 500 ]] \
-    || die "$market shadow service OOMScoreAdjust differs from the gated template"
-  [[ $(systemctl_value "$market" NRestarts) == 0 ]] \
-    || die "$market shadow service restarted during startup"
-  active_enter_us[$market]=$(require_uint \
-    "$(systemctl_value "$market" ActiveEnterTimestampMonotonic)" \
-    "$market ActiveEnterTimestampMonotonic")
-  cpu_start_ns[$market]=$(require_uint "$(systemctl_value "$market" CPUUsageNSec)" \
-    "$market CPUUsageNSec")
-  quota_raw=$(systemctl_value "$market" CPUQuotaPerSecUSec)
-  cpu_quota_us[$market]=$(timespan_to_us "$quota_raw") \
-    || die "$market CPU quota is unavailable: $quota_raw"
-  ((cpu_quota_us[$market] > 0)) || die "$market CPU quota must be finite"
-  [[ -z $(systemctl_value "$market" DropInPaths) ]] \
-    || die "$market shadow service has an unexpected systemd drop-in"
-  [[ $(systemctl_value "$market" MemoryHigh) == 1879048192 ]] \
-    || die "$market shadow service MemoryHigh differs from the gated template"
-  memory_max_bytes[$market]=$(require_uint "$(systemctl_value "$market" MemoryMax)" \
-    "$market MemoryMax")
-  ((memory_max_bytes[$market] == 2147483648)) \
-    || die "$market shadow service MemoryMax differs from the gated template"
-  max_memory_bytes[$market]=$(require_uint "$(systemctl_value "$market" MemoryCurrent)" \
-    "$market MemoryCurrent")
-done
+declare -A market_gate_started_ns market_observation_started_ns
+declare -A observed_session frozen_symbol_count frozen_catalog_sha256 configured_catalog_sha256
+declare -A initial_upload_failure_count last_health_updated_ns health_samples
+declare -A last_health_advance_mono max_health_silence_seconds
+declare -A pre_observation_segment current_segment
+declare -A observed_runtime_seconds cpu_usage_ns memory_peak_bytes health_sha256
+declare -A symbol_count snapshot_ready_count stream_coverage_verified_count sequence_gaps
+declare -A full_stream_coverage_verified
 
 health_passes() {
   local market=$1
@@ -700,7 +708,7 @@ health_passes() {
     --arg dataset "${dataset[$market]}" \
     --arg symbols_config "${configured_symbols[$market]}" \
     --argjson minimum_symbols "${min_symbols[$market]}" \
-    --argjson gate_started_ns "$gate_started_ns" \
+    --argjson gate_started_ns "${market_gate_started_ns[$market]}" \
     '.market == $market
       and .dataset == $dataset
       and .updated_at_ns >= $gate_started_ns
@@ -740,40 +748,6 @@ health_catalog_sha256() {
     | sha256sum | awk '{print $1}'
 }
 
-settle_deadline=$(( $(monotonic_seconds) + health_settle_seconds ))
-while ! health_passes spot || ! health_passes usdm; do
-  (( $(monotonic_seconds) < settle_deadline )) \
-    || die 'shadow health did not reach the fail-closed gate before the settle deadline'
-  for market in "${markets[@]}"; do
-    systemctl is-active --quiet "${unit[$market]}" || die "$market shadow service stopped while settling"
-    [[ $(systemctl_value "$market" NRestarts) == 0 ]] \
-      || die "$market shadow service restarted while settling"
-  done
-  sleep 10
-done
-
-declare -A observed_session frozen_symbol_count frozen_catalog_sha256 configured_catalog_sha256
-declare -A initial_upload_failure_count last_health_updated_ns health_samples
-declare -A last_health_advance_mono max_health_silence_seconds
-for market in "${markets[@]}"; do
-  health="${spool_dir[$market]}/health.json"
-  observed_session[$market]=$(jq -er '.session_id' "$health")
-  frozen_symbol_count[$market]=$(jq -er '.symbol_count' "$health")
-  frozen_catalog_sha256[$market]=$(health_catalog_sha256 "$market")
-  if [[ $market == usdm ]]; then
-    configured_catalog_sha256[$market]=$(jq -cn \
-      --arg symbols "${configured_symbols[$market]}" \
-      '$symbols | split(",") | sort' | sha256sum | awk '{print $1}')
-  else
-    configured_catalog_sha256[$market]=${frozen_catalog_sha256[$market]}
-  fi
-  initial_upload_failure_count[$market]=$(jq -er '.upload_failure_count' "$health")
-  last_health_updated_ns[$market]=$(jq -er '.updated_at_ns' "$health")
-  last_health_advance_mono[$market]=$(monotonic_seconds)
-  max_health_silence_seconds[$market]=0
-  health_samples[$market]=1
-done
-
 validate_observation_sample() {
   local market=$1 health session symbols catalog upload_failures updated_ns
   local current_mono next_updated_ns next_advance_mono next_max_gap sample_increment
@@ -809,20 +783,18 @@ validate_observation_sample() {
 }
 
 validate_running_sample() {
-  local market memory_now
+  local market=$1 memory_now
   assert_candidate
-  for market in "${markets[@]}"; do
-    systemctl is-active --quiet "${unit[$market]}" \
-      || die "$market shadow service stopped before observation completed"
-    [[ $(systemctl_value "$market" NRestarts) == 0 ]] \
-      || die "$market shadow service restarted before observation completed"
-    memory_now=$(require_uint "$(systemctl_value "$market" MemoryCurrent)" \
-      "$market MemoryCurrent")
-    ((memory_now > max_memory_bytes[$market])) && max_memory_bytes[$market]=$memory_now
-    ((memory_now <= memory_max_bytes[$market])) \
-      || die "$market memory usage exceeded MemoryMax"
-    validate_observation_sample "$market"
-  done
+  systemctl is-active --quiet "${unit[$market]}" \
+    || die "$market shadow service stopped before observation completed"
+  [[ $(systemctl_value "$market" NRestarts) == 0 ]] \
+    || die "$market shadow service restarted before observation completed"
+  memory_now=$(require_uint "$(systemctl_value "$market" MemoryCurrent)" \
+    "$market MemoryCurrent")
+  ((memory_now > max_memory_bytes[$market])) && max_memory_bytes[$market]=$memory_now
+  ((memory_now <= memory_max_bytes[$market])) \
+    || die "$market memory usage exceeded MemoryMax"
+  validate_observation_sample "$market"
 }
 
 active_segment_start_ns() {
@@ -833,54 +805,111 @@ active_segment_start_ns() {
     | sed -n '$p'
 }
 
-declare -A pre_observation_segment current_segment
-for market in "${markets[@]}"; do
+run_market_gate_phase() {
+  local market=$1 other health quota_raw settle_deadline alignment_deadline
+  local observation_started_mono observation_deadline now_mono remaining interval
+  local minimum_health_samples now_monotonic_us cpu_end_ns allowed_cpu_ns memory_now peak_raw
+
+  for other in "${markets[@]}"; do
+    if [[ $other != "$market" ]]; then
+      systemctl is-active --quiet "${unit[$other]}" \
+        && die "$other shadow service is active before the $market phase"
+    fi
+  done
+  assert_candidate
+  market_gate_started_ns[$market]=$(date +%s%N)
+  systemctl start "${unit[$market]}"
+  systemctl is-active --quiet "${unit[$market]}" || die "$market shadow service is not active"
+  [[ $(systemctl_value "$market" ActiveState) == active ]] \
+    || die "$market shadow service did not enter ActiveState=active"
+  [[ $(systemctl_value "$market" SubState) == running ]] \
+    || die "$market shadow service did not enter SubState=running"
+  [[ $(systemctl_value "$market" OOMScoreAdjust) == 500 ]] \
+    || die "$market shadow service OOMScoreAdjust differs from the gated template"
+  [[ $(systemctl_value "$market" NRestarts) == 0 ]] \
+    || die "$market shadow service restarted during startup"
+  active_enter_us[$market]=$(require_uint \
+    "$(systemctl_value "$market" ActiveEnterTimestampMonotonic)" \
+    "$market ActiveEnterTimestampMonotonic")
+  cpu_start_ns[$market]=$(require_uint "$(systemctl_value "$market" CPUUsageNSec)" \
+    "$market CPUUsageNSec")
+  quota_raw=$(systemctl_value "$market" CPUQuotaPerSecUSec)
+  cpu_quota_us[$market]=$(timespan_to_us "$quota_raw") \
+    || die "$market CPU quota is unavailable: $quota_raw"
+  ((cpu_quota_us[$market] > 0)) || die "$market CPU quota must be finite"
+  [[ -z $(systemctl_value "$market" DropInPaths) ]] \
+    || die "$market shadow service has an unexpected systemd drop-in"
+  [[ $(systemctl_value "$market" MemoryHigh) == 1879048192 ]] \
+    || die "$market shadow service MemoryHigh differs from the gated template"
+  memory_max_bytes[$market]=$(require_uint "$(systemctl_value "$market" MemoryMax)" \
+    "$market MemoryMax")
+  ((memory_max_bytes[$market] == 2147483648)) \
+    || die "$market shadow service MemoryMax differs from the gated template"
+  max_memory_bytes[$market]=$(require_uint "$(systemctl_value "$market" MemoryCurrent)" \
+    "$market MemoryCurrent")
+
+  settle_deadline=$(( $(monotonic_seconds) + health_settle_seconds ))
+  while ! health_passes "$market"; do
+    (( $(monotonic_seconds) < settle_deadline )) \
+      || die "$market shadow health did not reach the fail-closed gate before the settle deadline"
+    systemctl is-active --quiet "${unit[$market]}" \
+      || die "$market shadow service stopped while settling"
+    [[ $(systemctl_value "$market" NRestarts) == 0 ]] \
+      || die "$market shadow service restarted while settling"
+    sleep 10
+  done
+
+  health="${spool_dir[$market]}/health.json"
+  observed_session[$market]=$(jq -er '.session_id' "$health")
+  frozen_symbol_count[$market]=$(jq -er '.symbol_count' "$health")
+  frozen_catalog_sha256[$market]=$(health_catalog_sha256 "$market")
+  if [[ $market == usdm ]]; then
+    configured_catalog_sha256[$market]=$(jq -cn \
+      --arg symbols "${configured_symbols[$market]}" \
+      '$symbols | split(",") | sort' | sha256sum | awk '{print $1}')
+  else
+    configured_catalog_sha256[$market]=${frozen_catalog_sha256[$market]}
+  fi
+  initial_upload_failure_count[$market]=$(jq -er '.upload_failure_count' "$health")
+  last_health_updated_ns[$market]=$(jq -er '.updated_at_ns' "$health")
+  last_health_advance_mono[$market]=$(monotonic_seconds)
+  max_health_silence_seconds[$market]=0
+  health_samples[$market]=1
+
   pre_observation_segment[$market]=$(active_segment_start_ns "${spool_dir[$market]}")
   [[ ${pre_observation_segment[$market]} =~ ^[1-9][0-9]{0,18}$ ]] \
     || die "$market has no valid active segment before observation"
-done
-alignment_deadline=$(( $(monotonic_seconds) + GATE_SEGMENT_SECONDS + MAX_HEALTH_SILENCE_SECONDS ))
-while :; do
-  validate_running_sample
-  segments_rotated=true
-  for market in "${markets[@]}"; do
+  alignment_deadline=$(( $(monotonic_seconds) + GATE_SEGMENT_SECONDS + MAX_HEALTH_SILENCE_SECONDS ))
+  while :; do
+    validate_running_sample "$market"
     current_segment[$market]=$(active_segment_start_ns "${spool_dir[$market]}")
     [[ ${current_segment[$market]} =~ ^[1-9][0-9]{0,18}$ ]] \
       || die "$market lost its active segment before observation"
-    ((current_segment[$market] > pre_observation_segment[$market])) \
-      || segments_rotated=false
+    ((current_segment[$market] > pre_observation_segment[$market])) && break
+    (( $(monotonic_seconds) < alignment_deadline )) \
+      || die "$market shadow segments did not rotate after health settled"
+    sleep 10
   done
-  [[ $segments_rotated == true ]] && break
-  (( $(monotonic_seconds) < alignment_deadline )) \
-    || die 'shadow segments did not rotate after health settled'
-  sleep 10
-done
-observation_started_ns=$(date +%s%N)
+  market_observation_started_ns[$market]=$(date +%s%N)
 
-observation_started_mono=$(monotonic_seconds)
-observation_deadline=$((observation_started_mono + gate_seconds))
-while (( $(monotonic_seconds) < observation_deadline )); do
-  now_mono=$(monotonic_seconds)
-  remaining=$((observation_deadline - now_mono))
-  interval=30
-  ((remaining < interval)) && interval=$remaining
-  ((interval > 0)) && sleep "$interval"
-  validate_running_sample
-done
+  observation_started_mono=$(monotonic_seconds)
+  observation_deadline=$((observation_started_mono + gate_seconds))
+  while (( $(monotonic_seconds) < observation_deadline )); do
+    now_mono=$(monotonic_seconds)
+    remaining=$((observation_deadline - now_mono))
+    interval=30
+    ((remaining < interval)) && interval=$remaining
+    ((interval > 0)) && sleep "$interval"
+    validate_running_sample "$market"
+  done
 
-if [[ $test_only != true ]]; then
-  minimum_health_samples=$((REQUIRED_DURATION_SECONDS / 30))
-  for market in "${markets[@]}"; do
+  if [[ $test_only != true ]]; then
+    minimum_health_samples=$((REQUIRED_DURATION_SECONDS / 30))
     ((health_samples[$market] >= minimum_health_samples)) \
       || die "$market health did not advance often enough during observation"
-  done
-fi
+  fi
 
-declare -A observed_runtime_seconds cpu_usage_ns memory_peak_bytes health_sha256
-declare -A symbol_count snapshot_ready_count stream_coverage_verified_count sequence_gaps
-declare -A full_stream_coverage_verified
-now_monotonic_us=$(awk '{printf "%.0f\n", $1 * 1000000}' /proc/uptime)
-for market in "${markets[@]}"; do
+  now_monotonic_us=$(awk '{printf "%.0f\n", $1 * 1000000}' /proc/uptime)
   assert_candidate
   systemctl is-active --quiet "${unit[$market]}" || die "$market shadow service is not active at gate close"
   [[ $(systemctl_value "$market" NRestarts) == 0 ]] \
@@ -920,14 +949,16 @@ for market in "${markets[@]}"; do
   stream_coverage_verified_count[$market]=$(jq -er '.stream_coverage_verified_count' "$health")
   sequence_gaps[$market]=$(jq -er '.sequence_gaps' "$health")
   full_stream_coverage_verified[$market]=$(jq -c '.full_stream_coverage_verified' "$health")
-done
 
-systemctl stop "${unit[spot]}" "${unit[usdm]}"
-for market in "${markets[@]}"; do
+  systemctl stop "${unit[$market]}"
   systemctl is-active --quiet "${unit[$market]}" \
     && die "$market shadow service remained active after stop"
   assert_candidate
   run_candidate_drain "$market"
+}
+
+for market in "${markets[@]}"; do
+  run_market_gate_phase "$market"
 done
 
 run_oss() {
@@ -1010,7 +1041,7 @@ verify_oss_round_trips() {
     fi
     start_ns=$(jq -er '.start_received_at_ns' "$manifest")
     end_ns=$(jq -er '.end_received_at_ns' "$manifest")
-    ((end_ns <= observation_started_ns)) && continue
+    ((end_ns <= market_observation_started_ns[$market])) && continue
     jq -e --arg session_id "${observed_session[$market]}" \
       --arg market "$market" \
       --argjson expected_stream_types "${expected_stream_types[$market]}" \
@@ -1372,6 +1403,7 @@ duration_seconds=${observed_runtime_seconds[spot]}
 if ((observed_runtime_seconds[usdm] < duration_seconds)); then
   duration_seconds=${observed_runtime_seconds[usdm]}
 fi
+observation_started_ns=${market_observation_started_ns[spot]}
 
 markets_json='{}'
 for market in "${markets[@]}"; do
@@ -1389,6 +1421,7 @@ for market in "${markets[@]}"; do
     --arg catalog_sha256 "${frozen_catalog_sha256[$market]}" \
     --arg configured_catalog_sha256 "${configured_catalog_sha256[$market]}" \
     --arg health_sha256 "${health_sha256[$market]}" \
+    --argjson observation_started_ns "${market_observation_started_ns[$market]}" \
     --argjson symbol_count "${symbol_count[$market]}" \
     --argjson snapshot_ready_count "${snapshot_ready_count[$market]}" \
     --argjson stream_coverage_verified_count "${stream_coverage_verified_count[$market]}" \
@@ -1405,6 +1438,7 @@ for market in "${markets[@]}"; do
     --argjson memory_max_bytes "${memory_max_bytes[$market]}" \
     --argjson oss_round_trips "$round_trips" \
     '{market:$market,unit:$unit,dataset:$dataset,session_id:$session_id,
+      observation_started_ns:$observation_started_ns,
       tape_schema:$tape_schema,
       symbols_config:$symbols_config,catalog_sha256:$catalog_sha256,
       configured_catalog_sha256:$configured_catalog_sha256,

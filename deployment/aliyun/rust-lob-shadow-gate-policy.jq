@@ -10,6 +10,14 @@ and .run_spool == ("/data/monday/spool/binance-lob-rust-shadow/runs/"
 and (.observation_started_ns | type) == "number"
 and .observation_started_ns == (.observation_started_ns | floor)
 and .observation_started_ns > 0
+and (.markets.spot.observation_started_ns | type) == "number"
+and .markets.spot.observation_started_ns == (.markets.spot.observation_started_ns | floor)
+and .markets.spot.observation_started_ns > 0
+and (.markets.usdm.observation_started_ns | type) == "number"
+and .markets.usdm.observation_started_ns == (.markets.usdm.observation_started_ns | floor)
+and .markets.usdm.observation_started_ns > 0
+and .observation_started_ns == .markets.spot.observation_started_ns
+and .markets.spot.observation_started_ns <= .markets.usdm.observation_started_ns
 and .required_duration_seconds == 240
 and .requested_duration_seconds >= .required_duration_seconds
 and .health_settle_seconds == 240
@@ -107,8 +115,8 @@ and all(.markets.spot.oss_roundtrip_evidence[];
   and (.lob_min_ask_levels | type) == "number"
   and .lob_min_ask_levels > 0)
 and (.markets.spot.oss_roundtrip_evidence as $round_trips
-  | $round_trips[0].start_received_at_ns <= $gate.observation_started_ns
-  and $round_trips[0].end_received_at_ns > $gate.observation_started_ns
+  | $round_trips[0].start_received_at_ns <= $gate.markets.spot.observation_started_ns
+  and $round_trips[0].end_received_at_ns > $gate.markets.spot.observation_started_ns
   and $round_trips[0].gap_from_previous_ns == 0
   and all($round_trips[].lob_reconnect_boundary; . == false)
   and .markets.spot.lob_reconnect_boundaries
@@ -210,8 +218,8 @@ and all(.markets.usdm.oss_roundtrip_evidence[];
   and (.lob_min_ask_levels | type) == "number"
   and .lob_min_ask_levels > 0)
 and (.markets.usdm.oss_roundtrip_evidence as $round_trips
-  | $round_trips[0].start_received_at_ns <= $gate.observation_started_ns
-  and $round_trips[0].end_received_at_ns > $gate.observation_started_ns
+  | $round_trips[0].start_received_at_ns <= $gate.markets.usdm.observation_started_ns
+  and $round_trips[0].end_received_at_ns > $gate.markets.usdm.observation_started_ns
   and $round_trips[0].gap_from_previous_ns == 0
   and all($round_trips[].lob_reconnect_boundary; . == false)
   and .markets.usdm.lob_reconnect_boundaries
