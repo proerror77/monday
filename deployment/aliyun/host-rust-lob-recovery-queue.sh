@@ -10,7 +10,6 @@ usage() {
 configure_paths() {
   local root=${1:-/}
   root=${root%/}
-  [[ -n $root ]] || root=/
   ROOT_PREFIX="$root"
   OPT_ROOT="$root/opt/monday"
   BIN_DIR="$OPT_ROOT/bin"
@@ -99,7 +98,7 @@ load_allowlisted_env_args() {
 canonical_paths_safe() {
   local path
   for path in \
-    "$ROOT_PREFIX" \
+    "${ROOT_PREFIX:-/}" \
     "$ROOT_PREFIX/opt" \
     "$OPT_ROOT" \
     "$ROOT_PREFIX/opt/monday/releases" \
