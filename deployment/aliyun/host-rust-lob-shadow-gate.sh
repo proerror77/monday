@@ -11,6 +11,7 @@ readonly MAX_HEALTH_SILENCE_SECONDS=120
 readonly MAX_SEGMENT_GAP_NS=90000000000
 readonly HOST_MEMORY_RESERVE_BYTES=1073741824
 readonly STRICT_VERIFIER_MEMORY_MAX_BYTES=3221225472
+readonly UPLOAD_DRAIN_MEMORY_MAX_BYTES=3355443200
 readonly SHADOW_BINARY=/opt/monday/bin/binance-lob-archiver-shadow
 readonly RELEASE_ROOT=/opt/monday/releases/binance-lob-archiver
 readonly EVIDENCE_ROOT=/data/monday/evidence/shadow-gates
@@ -215,6 +216,9 @@ for asset in \
   cmp -s "$candidate_deployment/$asset" "$installed_asset" \
     || die "installed shadow asset differs from the gated deployment bundle: $asset"
 done
+grep -Fxq 'MemoryMax=3200M' \
+  "$candidate_deployment/binance-lob-archiver-rust-upload@.service" \
+  || die 'shadow upload service MemoryMax differs from the gated template'
 candidate_production_spot_env="$candidate_deployment/binance-lob-archiver-production-spot.env"
 candidate_production_usdm_env="$candidate_deployment/binance-lob-archiver-production-usdm.env"
 secure_regular_file "$candidate_production_spot_env"
@@ -268,6 +272,9 @@ for market in "${markets[@]}"; do
 done
 if ((STRICT_VERIFIER_MEMORY_MAX_BYTES > shadow_phase_memory_bytes)); then
   shadow_phase_memory_bytes=$STRICT_VERIFIER_MEMORY_MAX_BYTES
+fi
+if ((UPLOAD_DRAIN_MEMORY_MAX_BYTES > shadow_phase_memory_bytes)); then
+  shadow_phase_memory_bytes=$UPLOAD_DRAIN_MEMORY_MAX_BYTES
 fi
 production_memory_headroom_bytes=0
 for market in "${markets[@]}"; do

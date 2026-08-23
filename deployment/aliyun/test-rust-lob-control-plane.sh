@@ -60,10 +60,10 @@ if monday_shadow_memory_admission 1 0 0 >/dev/null 2>&1; then
   printf 'shadow gate memory admission accepted a zero requirement\n' >&2
   exit 1
 fi
-calibrated_gate_bytes=4294967296
+calibrated_gate_bytes=4429185024
 [[ $(monday_shadow_memory_admission \
-  "$calibrated_gate_bytes" 1073741824 3221225472 0) == "$calibrated_gate_bytes" ]] || {
-  printf 'calibrated sequential gate does not fit its exact 4 GiB budget\n' >&2
+  "$calibrated_gate_bytes" 1073741824 3355443200 0) == "$calibrated_gate_bytes" ]] || {
+  printf 'calibrated sequential gate does not fit its upload-drain budget\n' >&2
   exit 1
 }
 
@@ -331,6 +331,7 @@ grep -Fq 'systemctl_value "$market" MemoryHigh' "$GATE"
 grep -Fq 'memory_max_bytes[$market] == 2147483648' "$GATE"
 grep -Fq 'readonly HOST_MEMORY_RESERVE_BYTES=1073741824' "$GATE"
 grep -Fq 'readonly STRICT_VERIFIER_MEMORY_MAX_BYTES=3221225472' "$GATE"
+grep -Fq 'readonly UPLOAD_DRAIN_MEMORY_MAX_BYTES=3355443200' "$GATE"
 grep -Fq 'monday_shadow_memory_admission' "$GATE"
 grep -Fq 'host_memory_available_bytes_at_preflight' "$GATE"
 grep -Fq 'host_swap_total_bytes' "$GATE"
@@ -1306,6 +1307,26 @@ sed -n '/^production_is_fail_closed()/,/^}/p' "$CUTOVER" \
 partial_predicate_body="$tmp_dir/partial-spot-is-restored.sh"
 sed -n '/^partial_spot_runtime_is_restored()/,/^}/p' "$CUTOVER" \
   >"$partial_predicate_body"
+spot_wait_body="$tmp_dir/wait-for-spot-release-health.sh"
+sed -n '/^wait_for_spot_release_health()/,/^}/p' "$CUTOVER" >"$spot_wait_body"
+run_spot_wait_fixture() (
+  PRODUCTION_UNITS=(production-spot production-usdm)
+  HEALTH_TIMEOUT_SECONDS=20
+  SECONDS=0
+  health_checks=0
+  systemctl() { [[ $1 == is-active && ${!#} == production-spot ]]; }
+  health_ready_for_release() {
+    health_checks=$((health_checks + 1))
+    ((health_checks >= 3))
+  }
+  unit_matches_release() { return 0; }
+  sleep() { SECONDS=$((SECONDS + $1)); }
+  # shellcheck disable=SC1090
+  . "$spot_wait_body"
+  wait_for_spot_release_health old-binary old-session 123
+  printf '%s\n' "$health_checks"
+)
+[[ $(run_spot_wait_fixture) == 3 ]]
 start_line=$(grep -n 'systemctl start "${PRODUCTION_UNITS\[@\]}"' "$rollback_body" | tail -1 | cut -d: -f1)
 clear_line=$(grep -n 'clear_health_before_restart' "$rollback_body" | cut -d: -f1)
 health_line=$(grep -n 'wait_for_release_health' "$rollback_body" | cut -d: -f1)
@@ -1328,6 +1349,7 @@ grep -Fq 'capture_existing_production_identity contained-upgrade' "$CUTOVER"
 grep -Fq 'partial-contained-spot-live' "$CUTOVER"
 grep -Fq 'capture_existing_production_identity partial-contained-spot-live' "$CUTOVER"
 grep -Fq 'partial_spot_runtime_is_restored' "$CUTOVER"
+grep -Fq 'wait_for_spot_release_health' "$CUTOVER"
 grep -Fq 'previous-spot-restored-usdm-contained' "$CUTOVER"
 grep -Fq "fail 'new host must not retain a production USD-M drop-in'" "$CUTOVER"
 grep -Fq 'binance-lob-archiver-production@usdm.service.d/10-memory.conf' "$CUTOVER"
@@ -1387,18 +1409,24 @@ grep -Fq '$spot_active_state == active && $spot_enabled_state == enabled' \
   <<<"$host_state_dispatch"
 grep -Fq '$usdm_enabled_state == masked || $usdm_enabled_state == masked-runtime' \
   <<<"$host_state_dispatch"
+grep -Fq '$spot_upload_enabled_state == static' <<<"$host_state_dispatch"
+grep -Fq '$spot_upload_enabled_state == masked-runtime' <<<"$host_state_dispatch"
+grep -Fq '$usdm_upload_enabled_state == masked' <<<"$host_state_dispatch"
 host_state_dispatch_file="$tmp_dir/host-state-dispatch.sh"
 printf '%s\n' "$host_state_dispatch" >"$host_state_dispatch_file"
 run_partial_host_state_fixture() (
   local usdm_enabled_state=$1 usdm_main_pid=${2:-0}
+  local spot_upload_enabled_state=${3:-masked-runtime}
   PRODUCTION_UNITS=(production-spot production-usdm)
-  PRODUCTION_LINK="$tmp_dir/partial-production-$usdm_enabled_state-$usdm_main_pid"
+  UPLOAD_UNITS=(upload-spot upload-usdm)
+  PRODUCTION_LINK="$tmp_dir/partial-production-$usdm_enabled_state-$usdm_main_pid-$spot_upload_enabled_state"
   ln -s "$tmp_dir/old-production-binary" "$PRODUCTION_LINK"
   active_count=1
   enabled_count=1
   spot_active_state=active
   spot_enabled_state=enabled
   usdm_active_state=inactive
+  usdm_upload_enabled_state=masked-runtime
   HEALTH_TIMEOUT_SECONDS=300
   PRODUCTION_USDM_MEMORY_DROPIN_PRESENT=0
   DRAIN_REQUIRED=0
@@ -1442,6 +1470,13 @@ if run_partial_host_state_fixture masked-runtime 1 \
 fi
 grep -Fq 'contained USD-M production is not inactive/dead with MainPID=0' \
   "$tmp_dir/partial-main-pid.out"
+if run_partial_host_state_fixture masked-runtime 0 masked \
+  >"$tmp_dir/partial-persistent-spot-upload-mask.out" 2>&1; then
+  printf 'partial classifier accepted a persistently masked Spot uploader\n' >&2
+  exit 1
+fi
+grep -Fq 'ambiguous production state' \
+  "$tmp_dir/partial-persistent-spot-upload-mask.out"
 
 new_host_dropin_guard="$tmp_dir/new-host-dropin-guard.sh"
 sed -n '/^  (( PRODUCTION_USDM_MEMORY_DROPIN_PRESENT == 0 )) \\/,+1p' "$CUTOVER" \
@@ -1704,6 +1739,7 @@ run_contained_upgrade_rollback_fixture() (
   local active_recovery_timer=${5:-}
   local enabled_recovery_timer=${6:-}
   local active_recovery_unit=${7:-}
+  local spot_upload_unmasked=0
   local calls="$tmp_dir/contained-rollback.calls"
   PRODUCTION_UNITS=(production-spot production-usdm)
   UPLOAD_UNITS=(upload-spot upload-usdm)
@@ -1736,6 +1772,10 @@ run_contained_upgrade_rollback_fixture() (
         [[ ${!#} == "$active_recovery_timer" || ${!#} == "$active_recovery_unit" ]]
         ;;
       is-enabled)
+        if [[ ${!#} == upload-spot && $spot_upload_unmasked -eq 1 ]]; then
+          printf 'static\n'
+          return 1
+        fi
         if [[ ${2:-} == --quiet ]]; then
           [[ ${!#} == "$enabled_recovery_timer" ]]
           return
@@ -1756,6 +1796,11 @@ run_contained_upgrade_rollback_fixture() (
           printf '0\n'
         fi
         ;;
+      unmask)
+        if [[ ${!#} == upload-spot ]]; then
+          spot_upload_unmasked=1
+        fi
+        ;;
       mask) (( expect_contained )) ;;
       *) return 0 ;;
     esac
@@ -1764,6 +1809,7 @@ run_contained_upgrade_rollback_fixture() (
   copy_health_evidence() { return 0; }
   clear_health_before_restart() { return 0; }
   health_ready_for_release() { return 0; }
+  wait_for_spot_release_health() { return 0; }
   unit_matches_release() { return 0; }
   run_candidate_drain() { printf 'drain %s\n' "$1" >>"$calls"; return 1; }
   install_deployment() { printf 'install %s\n' "$1" >>"$calls"; return 0; }

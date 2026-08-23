@@ -732,6 +732,20 @@ wait_for_release_health() {
   return 1
 }
 
+wait_for_spot_release_health() {
+  local binary=$1 old_session=$2 minimum_updated_ns=$3 deadline
+  deadline=$((SECONDS + HEALTH_TIMEOUT_SECONDS))
+  while (( SECONDS < deadline )); do
+    systemctl is-active --quiet "${PRODUCTION_UNITS[0]}" || return 1
+    if health_ready_for_release spot 1000 "$old_session" "$minimum_updated_ns" \
+      && unit_matches_release "${PRODUCTION_UNITS[0]}" "$binary" false; then
+      return 0
+    fi
+    sleep 5
+  done
+  return 1
+}
+
 clear_health_before_restart() {
   local market health
   canonical_spool_paths_safe || return 1
@@ -764,6 +778,9 @@ production_is_fail_closed() {
 partial_spot_runtime_is_restored() {
   local binary=$1 unit state
   unit_matches_release "${PRODUCTION_UNITS[0]}" "$binary" true || return 1
+  systemctl is-active --quiet "${UPLOAD_UNITS[0]}" && return 1
+  state=$(systemctl is-enabled "${UPLOAD_UNITS[0]}" 2>/dev/null || true)
+  [[ $state == static ]] || return 1
   for unit in "${PRODUCTION_UNITS[1]}" "${UPLOAD_UNITS[1]}" "${LEGACY_UNITS[@]}"; do
     systemctl is-active --quiet "$unit" && return 1
     state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
@@ -942,7 +959,8 @@ rollback_after_failure() {
       partial_restored=1
       systemctl reset-failed "${PRODUCTION_UNITS[0]}" >/dev/null 2>&1 || true
       if ! systemctl start "${PRODUCTION_UNITS[0]}" \
-        || ! health_ready_for_release spot 1000 "$OLD_SESSION_SPOT" "$rollback_started_ns" \
+        || ! wait_for_spot_release_health \
+          "$OLD_BINARY" "$OLD_SESSION_SPOT" "$rollback_started_ns" \
         || ! systemctl enable "${PRODUCTION_UNITS[0]}" >/dev/null \
         || ! unit_matches_release "${PRODUCTION_UNITS[0]}" "$OLD_BINARY" true \
         || ! health_ready_for_release spot 1000 "$OLD_SESSION_SPOT" "$rollback_started_ns"; then
@@ -1107,6 +1125,8 @@ spot_active_state=$(systemctl_value "${PRODUCTION_UNITS[0]}" ActiveState)
 usdm_active_state=$(systemctl_value "${PRODUCTION_UNITS[1]}" ActiveState)
 spot_enabled_state=$(systemctl is-enabled "${PRODUCTION_UNITS[0]}" 2>/dev/null || true)
 usdm_enabled_state=$(systemctl is-enabled "${PRODUCTION_UNITS[1]}" 2>/dev/null || true)
+spot_upload_enabled_state=$(systemctl is-enabled "${UPLOAD_UNITS[0]}" 2>/dev/null || true)
+usdm_upload_enabled_state=$(systemctl is-enabled "${UPLOAD_UNITS[1]}" 2>/dev/null || true)
 for unit in "${PRODUCTION_UNITS[@]}"; do
   if systemctl is-active --quiet "$unit"; then
     ((active_count += 1))
@@ -1126,7 +1146,11 @@ elif (( active_count == 1 && enabled_count == 1 )) \
   && [[ -L $PRODUCTION_LINK \
     && $spot_active_state == active && $spot_enabled_state == enabled \
     && $usdm_active_state == inactive \
-    && ( $usdm_enabled_state == masked || $usdm_enabled_state == masked-runtime ) ]]; then
+    && ( $usdm_enabled_state == masked || $usdm_enabled_state == masked-runtime ) \
+    && ( $spot_upload_enabled_state == static \
+      || $spot_upload_enabled_state == masked-runtime ) \
+    && ( $usdm_upload_enabled_state == masked \
+      || $usdm_upload_enabled_state == masked-runtime ) ]]; then
   [[ $(systemctl_value "${PRODUCTION_UNITS[1]}" SubState) == dead \
     && $(systemctl_value "${PRODUCTION_UNITS[1]}" MainPID) == 0 ]] \
     || fail 'contained USD-M production is not inactive/dead with MainPID=0'
@@ -1145,7 +1169,7 @@ elif (( active_count == 0 && enabled_count == 0 )) && [[ ! -e $PRODUCTION_LINK &
     || fail 'new host must not retain a production USD-M drop-in'
   require_empty_segment_spool || fail 'new host canonical spool contains segment artifacts'
 else
-  fail "ambiguous production state: active=$active_count enabled=$enabled_count spot=$spot_active_state/$spot_enabled_state usdm=$usdm_active_state/$usdm_enabled_state symlink=$PRODUCTION_LINK"
+  fail "ambiguous production state: active=$active_count enabled=$enabled_count spot=$spot_active_state/$spot_enabled_state/$spot_upload_enabled_state usdm=$usdm_active_state/$usdm_enabled_state/$usdm_upload_enabled_state symlink=$PRODUCTION_LINK"
 fi
 
 STEP=stop-production
