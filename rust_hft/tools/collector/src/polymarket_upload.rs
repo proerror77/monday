@@ -12,7 +12,7 @@ use rust_decimal::Decimal;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt};
@@ -22,7 +22,6 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Semaphore;
 
 pub(crate) const TRADE_COMPLETION_KIND: &str = "polymarket_trade_collection_complete";
 pub(crate) const TRADE_COMPLETION_BASIS: &str =
@@ -2987,6 +2986,33 @@ pub(crate) fn read_status(path: &Path) -> Result<Map<String, Value>> {
     }
 }
 
+fn read_polymarket_status(path: &Path) -> Result<Map<String, Value>> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Map::new()),
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            let value: Value = serde_json::from_slice(&fs::read(path)?)
+                .with_context(|| format!("upload status {} is not valid JSON", path.display()))?;
+            let status = value
+                .as_object()
+                .cloned()
+                .ok_or_else(|| anyhow!("upload status {} must be a JSON object", path.display()))?;
+            upload_status_failure_count(&status)?;
+            Ok(status)
+        }
+        Ok(_) => bail!("upload status must be a regular non-symlink file"),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn upload_status_failure_count(status: &Map<String, Value>) -> Result<u64> {
+    match status.get("failure_count") {
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| anyhow!("upload status failure_count must be a nonnegative integer")),
+        None => Ok(0),
+    }
+}
+
 /// Upload all closed tapes, continuing past bad segments while returning failure.
 pub fn upload_pending(config: &UploadConfig) -> Result<UploadSummary> {
     upload_pending_with(config, archive_source)
@@ -3007,53 +3033,101 @@ where
 {
     config.validate()?;
     ensure_canonical_directory(&config.spool_dir)?;
-    let mut status = read_status(&config.spool_dir.join("upload-status.json"))?;
+    let mut status = read_polymarket_status(&config.spool_dir.join("upload-status.json"))?;
+    let prior_failure_count = upload_status_failure_count(&status)?;
     let archive = Arc::new(archive);
-    let semaphore = Arc::new(Semaphore::new(config.max_concurrent_uploads));
     let mut failures = Vec::new();
     let mut uploaded_segments = 0_usize;
     let mut canonical_uploaded_segments = 0_usize;
     // Fail closed before any zstd/ossutil child or staging temp file exists.
     if !record_low_disk_failures(config, &mut failures)? {
         let sources = discover_rotated_tapes(&config.spool_dir)?;
-        let mut tasks = Vec::with_capacity(sources.len());
+        let mut tasks: VecDeque<(
+            PathBuf,
+            tokio::task::JoinHandle<Result<Vec<UploadedSegment>>>,
+        )> = VecDeque::new();
         for source in sources {
-            let permit = semaphore.clone().acquire_owned().await?;
-            let archive = archive.clone();
-            let config = config.clone();
-            let task_source = source.clone();
-            let task = tokio::task::spawn_blocking(move || {
-                let result = archive(&task_source, &config);
-                drop(permit);
-                result
-            });
-            tasks.push((source, task));
-        }
-
-        for (source, task) in tasks {
-            match task.await {
-                Ok(result) => record_upload_result(
-                    &source,
-                    result,
+            if tasks.len() >= config.max_concurrent_uploads {
+                let (task_source, task) = tasks
+                    .pop_front()
+                    .expect("upload task set must be non-empty at its concurrency limit");
+                record_async_upload_result(
+                    &task_source,
+                    task,
                     &mut status,
                     &mut failures,
                     &mut uploaded_segments,
                     &mut canonical_uploaded_segments,
-                ),
-                Err(error) => failures.push(json!({
-                    "source": source.file_name().and_then(|name| name.to_str()),
-                    "error": format!("async upload task failed: {error}"),
-                })),
+                )
+                .await;
+                write_upload_status(
+                    &config.spool_dir,
+                    &mut status,
+                    prior_failure_count,
+                    &failures,
+                    uploaded_segments,
+                    canonical_uploaded_segments,
+                )?;
             }
+            let archive = archive.clone();
+            let config = config.clone();
+            let task_source = source.clone();
+            let task = tokio::task::spawn_blocking(move || archive(&task_source, &config));
+            tasks.push_back((source, task));
+        }
+
+        while let Some((task_source, task)) = tasks.pop_front() {
+            record_async_upload_result(
+                &task_source,
+                task,
+                &mut status,
+                &mut failures,
+                &mut uploaded_segments,
+                &mut canonical_uploaded_segments,
+            )
+            .await;
+            write_upload_status(
+                &config.spool_dir,
+                &mut status,
+                prior_failure_count,
+                &failures,
+                uploaded_segments,
+                canonical_uploaded_segments,
+            )?;
         }
     }
     finalize_upload_status(
         &config.spool_dir,
         status,
+        prior_failure_count,
         failures,
         uploaded_segments,
         canonical_uploaded_segments,
     )
+}
+
+async fn record_async_upload_result(
+    source: &Path,
+    task: tokio::task::JoinHandle<Result<Vec<UploadedSegment>>>,
+    status: &mut Map<String, Value>,
+    failures: &mut Vec<Value>,
+    uploaded_segments: &mut usize,
+    canonical_uploaded_segments: &mut usize,
+) {
+    match task.await {
+        Ok(result) => record_upload_result(
+            source,
+            result,
+            status,
+            failures,
+            uploaded_segments,
+            canonical_uploaded_segments,
+        ),
+        Err(error) => failures.push(json!({
+            "source": source.file_name().and_then(|name| name.to_str()),
+            "error": format!("async upload task failed: {error}"),
+        })),
+    }
 }
 
 fn record_upload_result(
@@ -3097,26 +3171,90 @@ fn record_upload_result(
 fn finalize_upload_status(
     spool_dir: &Path,
     mut status: Map<String, Value>,
+    prior_failure_count: u64,
     failures: Vec<Value>,
     uploaded_segments: usize,
     canonical_uploaded_segments: usize,
 ) -> Result<UploadSummary> {
+    write_upload_status(
+        spool_dir,
+        &mut status,
+        prior_failure_count,
+        &failures,
+        uploaded_segments,
+        canonical_uploaded_segments,
+    )?;
+    if failures.is_empty() {
+        Ok(UploadSummary {
+            uploaded_segments,
+            canonical_uploaded_segments,
+        })
+    } else {
+        bail!(
+            "{} closed Polymarket tape segment(s) failed",
+            failures.len()
+        )
+    }
+}
+
+fn upload_pending_with<F>(config: &UploadConfig, mut archive: F) -> Result<UploadSummary>
+where
+    F: FnMut(&Path, &UploadConfig) -> Result<Vec<UploadedSegment>>,
+{
+    config.validate()?;
+    ensure_canonical_directory(&config.spool_dir)?;
+    let mut status = read_polymarket_status(&config.spool_dir.join("upload-status.json"))?;
+    let prior_failure_count = upload_status_failure_count(&status)?;
+    let mut failures = Vec::new();
+    let mut uploaded_segments = 0_usize;
+    let mut canonical_uploaded_segments = 0_usize;
+    // Fail closed before any zstd/ossutil child or staging temp file exists:
+    // a disk-full spool would otherwise ENOSPC every upload with 0 segments.
+    if !record_low_disk_failures(config, &mut failures)? {
+        for source in discover_rotated_tapes(&config.spool_dir)? {
+            record_upload_result(
+                &source,
+                archive(&source, config),
+                &mut status,
+                &mut failures,
+                &mut uploaded_segments,
+                &mut canonical_uploaded_segments,
+            );
+        }
+    }
+    finalize_upload_status(
+        &config.spool_dir,
+        status,
+        prior_failure_count,
+        failures,
+        uploaded_segments,
+        canonical_uploaded_segments,
+    )
+}
+
+fn write_upload_status(
+    spool_dir: &Path,
+    status: &mut Map<String, Value>,
+    prior_failure_count: u64,
+    failures: &[Value],
+    uploaded_segments: usize,
+    canonical_uploaded_segments: usize,
+) -> Result<()> {
     let now = utc_now();
-    let pending = discover_rotated_tapes(spool_dir)?.len();
-    let prior_failure_count = match status.get("failure_count") {
-        Some(value) => value
-            .as_u64()
-            .ok_or_else(|| anyhow!("upload status failure_count must be a nonnegative integer"))?,
-        None => 0,
-    };
     status.insert("updated_at".to_owned(), json!(now));
     status.insert("uploaded_segments".to_owned(), json!(uploaded_segments));
     status.insert(
         "canonical_uploaded_segments".to_owned(),
         json!(canonical_uploaded_segments),
     );
-    status.insert("pending_segments".to_owned(), json!(pending));
-    status.insert("failed_segments".to_owned(), Value::Array(failures.clone()));
+    status.insert(
+        "pending_segments".to_owned(),
+        json!(discover_rotated_tapes(spool_dir)?.len()),
+    );
+    status.insert(
+        "failed_segments".to_owned(),
+        Value::Array(failures.to_vec()),
+    );
     status.insert(
         "failure_count".to_owned(),
         json!(prior_failure_count.saturating_add(failures.len() as u64)),
@@ -3139,51 +3277,7 @@ fn finalize_upload_status(
     );
     atomic_json(
         &spool_dir.join("upload-status.json"),
-        &Value::Object(status),
-    )?;
-    if failures.is_empty() {
-        Ok(UploadSummary {
-            uploaded_segments,
-            canonical_uploaded_segments,
-        })
-    } else {
-        bail!(
-            "{} closed Polymarket tape segment(s) failed",
-            failures.len()
-        )
-    }
-}
-
-fn upload_pending_with<F>(config: &UploadConfig, mut archive: F) -> Result<UploadSummary>
-where
-    F: FnMut(&Path, &UploadConfig) -> Result<Vec<UploadedSegment>>,
-{
-    config.validate()?;
-    ensure_canonical_directory(&config.spool_dir)?;
-    let mut status = read_status(&config.spool_dir.join("upload-status.json"))?;
-    let mut failures = Vec::new();
-    let mut uploaded_segments = 0_usize;
-    let mut canonical_uploaded_segments = 0_usize;
-    // Fail closed before any zstd/ossutil child or staging temp file exists:
-    // a disk-full spool would otherwise ENOSPC every upload with 0 segments.
-    if !record_low_disk_failures(config, &mut failures)? {
-        for source in discover_rotated_tapes(&config.spool_dir)? {
-            record_upload_result(
-                &source,
-                archive(&source, config),
-                &mut status,
-                &mut failures,
-                &mut uploaded_segments,
-                &mut canonical_uploaded_segments,
-            );
-        }
-    }
-    finalize_upload_status(
-        &config.spool_dir,
-        status,
-        failures,
-        uploaded_segments,
-        canonical_uploaded_segments,
+        &Value::Object(status.clone()),
     )
 }
 
@@ -6465,6 +6559,113 @@ mod tests {
             serde_json::from_slice(&fs::read(root.path().join("upload-status.json")).unwrap())
                 .unwrap();
         assert_eq!(status["pending_segments"], 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_checkpoint_persists_first_success_before_blocked_second_source() {
+        let root = TestDir::new();
+        let first = root.path().join("market-updates.20260715T010000.ndjson");
+        let second = root.path().join("market-updates.20260715T020000.ndjson");
+        let second_started = root.path().join("second.started");
+        let release_second = root.path().join("second.release");
+        fs::write(&first, b"closed").unwrap();
+        fs::write(&second, b"closed").unwrap();
+        let mut config = config(root.path());
+        config.max_concurrent_uploads = 1;
+        let archive = {
+            let first = first.clone();
+            let second = second.clone();
+            let second_started = second_started.clone();
+            let release_second = release_second.clone();
+            move |source: &Path, _config: &UploadConfig| -> Result<Vec<UploadedSegment>> {
+                if source == first {
+                    fs::remove_file(source)?;
+                    return Ok(vec![UploadedSegment {
+                        object: "oss://bucket/first".to_owned(),
+                        canonical_complete: true,
+                    }]);
+                }
+                assert_eq!(source, second);
+                fs::write(&second_started, b"started")?;
+                while !release_second.exists() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                fs::remove_file(source)?;
+                Ok(vec![UploadedSegment {
+                    object: "oss://bucket/second".to_owned(),
+                    canonical_complete: true,
+                }])
+            }
+        };
+
+        let task = tokio::spawn({
+            let config = config.clone();
+            async move { upload_pending_async_with(&config, archive).await }
+        });
+
+        let checkpoint = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if second_started.exists() {
+                    let status: Value = serde_json::from_slice(
+                        &fs::read(root.path().join("upload-status.json")).unwrap(),
+                    )
+                    .unwrap();
+                    if status["uploaded_segments"] == 1
+                        && status["canonical_uploaded_segments"] == 1
+                        && status["pending_segments"] == 1
+                        && status["last_uploaded_object"] == "oss://bucket/first"
+                    {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        fs::write(&release_second, b"release").unwrap();
+        checkpoint.unwrap();
+
+        let summary = task.await.unwrap().unwrap();
+        assert_eq!(summary.uploaded_segments, 2);
+    }
+
+    #[test]
+    fn upload_status_must_be_valid_object_with_numeric_failure_count_before_archive() {
+        let root = TestDir::new();
+        let source = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &sample_rows(),
+        );
+
+        for (payload, expected) in [
+            (b"{not json}".as_slice(), "not valid JSON"),
+            (b"[]".as_slice(), "must be a JSON object"),
+            (
+                br#"{"failure_count":"bad"}"#.as_slice(),
+                "failure_count must be a nonnegative integer",
+            ),
+        ] {
+            fs::write(root.path().join("upload-status.json"), payload).unwrap();
+            let called = Arc::new(AtomicUsize::new(0));
+            let archive_called = called.clone();
+
+            let error = upload_pending_with(&config(root.path()), move |_source, _config| {
+                archive_called.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![UploadedSegment {
+                    object: "oss://bucket/unreachable".to_owned(),
+                    canonical_complete: true,
+                }])
+            })
+            .unwrap_err();
+
+            assert_eq!(called.load(Ordering::SeqCst), 0);
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected}, got {error:#}"
+            );
+            assert!(source.exists(), "invalid status must fail before archive");
+        }
     }
 
     #[test]
