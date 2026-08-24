@@ -24,10 +24,27 @@ grep -Fq 'ExecStart=/opt/monday/bin/monday-rust-lob-recovery-queue drain %i' \
   "$SCRIPT_DIR/binance-lob-archiver-recovery@.service"
 grep -Fq 'host-rust-lob-recovery-queue.sh' "$SCRIPT_DIR/deploy-rust-lob-release.sh"
 grep -Fxq 'MemoryMax=2560M' "$SCRIPT_DIR/binance-lob-archiver-production@.service"
-grep -Fxq 'StartLimitIntervalSec=300' "$SCRIPT_DIR/binance-lob-archiver-production@.service"
+production_unit="$SCRIPT_DIR/binance-lob-archiver-production@.service"
+grep -Fxq 'StartLimitIntervalSec=7200' "$production_unit"
 grep -Fxq 'StartLimitBurst=5' "$SCRIPT_DIR/binance-lob-archiver-production@.service"
+grep -Fxq 'TimeoutStartSec=120' "$SCRIPT_DIR/binance-lob-archiver-production@.service"
 grep -Fxq 'CPUQuota=25%' "$SCRIPT_DIR/binance-lob-archiver-recovery@.service"
 grep -Fxq 'MemoryMax=768M' "$SCRIPT_DIR/binance-lob-archiver-recovery@.service"
+
+unit_seconds() {
+  local key=$1
+  sed -n "s/^${key}=//p" "$production_unit"
+}
+start_limit_seconds=$(unit_seconds StartLimitIntervalSec)
+start_limit_burst=$(unit_seconds StartLimitBurst)
+start_timeout_seconds=$(unit_seconds TimeoutStartSec)
+stop_timeout_seconds=$(unit_seconds TimeoutStopSec)
+restart_delay_seconds=$(unit_seconds RestartSec)
+(( start_limit_seconds > start_limit_burst \
+  * (start_timeout_seconds + stop_timeout_seconds + restart_delay_seconds) )) || {
+  printf 'production restart limit can roll forward during repeated startup timeouts\n' >&2
+  exit 1
+}
 
 # shellcheck disable=SC1090
 . "$QUEUE_SCRIPT"
@@ -173,6 +190,13 @@ flock() {
 }
 
 sync() {
+  local argument
+  for argument in "$@"; do
+    if [[ $argument == -f ]]; then
+      printf 'recovery queue attempted filesystem-wide sync\n' >&2
+      return 1
+    fi
+  done
   printf '%s\n' "$*" >>"$MOCK_SYNC_LOG"
   return 0
 }
@@ -307,8 +331,12 @@ test_isolate_creates_ready_job() {
   assert canonical-clean test ! -e "$fixture/data/monday/spool/binance-lob/spot/part-001.jsonl.part"
   assert canonical-recreated test -d "$fixture/data/monday/spool/binance-lob/spot"
   assert systemctl-start grep -Fq 'start --no-block binance-lob-archiver-recovery@spot.service' "$fixture/systemctl.log"
-  assert canonical-parent-synced grep -Fq -- '-f '"$fixture/data/monday/spool/binance-lob" "$fixture/sync.log"
-  assert queue-parent-synced grep -Fq -- '-f '"$fixture/data/monday/spool/binance-lob-recovery/spot" "$fixture/sync.log"
+  assert canonical-parent-synced grep -Fxq -- "$fixture/data/monday/spool/binance-lob" "$fixture/sync.log"
+  assert queue-parent-synced grep -Fxq -- "$fixture/data/monday/spool/binance-lob-recovery/spot" "$fixture/sync.log"
+  if grep -Eq '(^|[[:space:]])-f([[:space:]]|$)' "$fixture/sync.log"; then
+    printf 'recovery queue used filesystem-wide sync instead of path-scoped fsync\n' >&2
+    exit 1
+  fi
 }
 
 test_many_incomplete_parts_isolate_without_sigpipe() {
@@ -353,7 +381,11 @@ test_drain_runs_recover_then_upload() {
   [[ $(sed -n '1p' "$fixture/binary.log") == usdm\ --recover-parts-only* ]]
   [[ $(sed -n '2p' "$fixture/binary.log") == usdm\ --upload-only* ]]
   assert backup-receipt test -f "$evidence_dir/recovery-input/receipt.json"
-  assert evidence-synced grep -Fq -- '-f '"$evidence_dir" "$fixture/sync.log"
+  assert evidence-synced grep -Fxq -- "$evidence_dir" "$fixture/sync.log"
+  if grep -Eq '(^|[[:space:]])-f([[:space:]]|$)' "$fixture/sync.log"; then
+    printf 'recovery drain used filesystem-wide sync instead of path-scoped fsync\n' >&2
+    exit 1
+  fi
 }
 
 test_drain_uses_queued_immutable_inputs() {
