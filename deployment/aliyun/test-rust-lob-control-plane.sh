@@ -1375,6 +1375,9 @@ sed -n '/^production_is_fail_closed()/,/^}/p' "$CUTOVER" \
 partial_predicate_body="$tmp_dir/partial-spot-is-restored.sh"
 sed -n '/^partial_spot_runtime_is_restored()/,/^}/p' "$CUTOVER" \
   >"$partial_predicate_body"
+partial_usdm_predicate_body="$tmp_dir/partial-usdm-is-restored.sh"
+sed -n '/^partial_usdm_runtime_is_restored()/,/^}/p' "$CUTOVER" \
+  >"$partial_usdm_predicate_body"
 release_match_body="$tmp_dir/unit-matches-release.sh"
 sed -n '/^unit_matches_release()/,/^}/p' "$CUTOVER" >"$release_match_body"
 run_release_match_fixture() (
@@ -1412,6 +1415,8 @@ if run_release_match_fixture 2 1; then
 fi
 spot_wait_body="$tmp_dir/wait-for-spot-release-health.sh"
 sed -n '/^wait_for_spot_release_health()/,/^}/p' "$CUTOVER" >"$spot_wait_body"
+usdm_wait_body="$tmp_dir/wait-for-usdm-release-health.sh"
+sed -n '/^wait_for_usdm_release_health()/,/^}/p' "$CUTOVER" >"$usdm_wait_body"
 run_spot_wait_fixture() (
   PRODUCTION_UNITS=(production-spot production-usdm)
   HEALTH_TIMEOUT_SECONDS=20
@@ -1430,6 +1435,24 @@ run_spot_wait_fixture() (
   printf '%s\n' "$health_checks"
 )
 [[ $(run_spot_wait_fixture) == 3 ]]
+run_usdm_wait_fixture() (
+  PRODUCTION_UNITS=(production-spot production-usdm)
+  HEALTH_TIMEOUT_SECONDS=20
+  SECONDS=0
+  health_checks=0
+  systemctl() { [[ $1 == is-active && ${!#} == production-usdm ]]; }
+  health_ready_for_release() {
+    health_checks=$((health_checks + 1))
+    ((health_checks >= 3))
+  }
+  unit_matches_release() { return 0; }
+  sleep() { SECONDS=$((SECONDS + $1)); }
+  # shellcheck disable=SC1090
+  . "$usdm_wait_body"
+  wait_for_usdm_release_health old-binary 400 old-session 123
+  printf '%s\n' "$health_checks"
+)
+[[ $(run_usdm_wait_fixture) == 3 ]]
 start_line=$(grep -n 'systemctl start "${PRODUCTION_UNITS\[@\]}"' "$rollback_body" | tail -1 | cut -d: -f1)
 clear_line=$(grep -n 'clear_health_before_restart' "$rollback_body" | cut -d: -f1)
 health_line=$(grep -n 'wait_for_release_health' "$rollback_body" | cut -d: -f1)
@@ -1451,9 +1474,14 @@ grep -Fq 'contained-upgrade' "$CUTOVER"
 grep -Fq 'capture_existing_production_identity contained-upgrade' "$CUTOVER"
 grep -Fq 'partial-contained-spot-live' "$CUTOVER"
 grep -Fq 'capture_existing_production_identity partial-contained-spot-live' "$CUTOVER"
+grep -Fq 'partial-contained-usdm-live' "$CUTOVER"
+grep -Fq 'capture_existing_production_identity partial-contained-usdm-live' "$CUTOVER"
 grep -Fq 'partial_spot_runtime_is_restored' "$CUTOVER"
+grep -Fq 'partial_usdm_runtime_is_restored' "$CUTOVER"
 grep -Fq 'wait_for_spot_release_health' "$CUTOVER"
+grep -Fq 'wait_for_usdm_release_health' "$CUTOVER"
 grep -Fq 'previous-spot-restored-usdm-contained' "$CUTOVER"
+grep -Fq 'previous-usdm-restored-spot-contained' "$CUTOVER"
 grep -Fq "fail 'new host must not retain a production USD-M drop-in'" "$CUTOVER"
 grep -Fq 'binance-lob-archiver-production@usdm.service.d/10-memory.conf' "$CUTOVER"
 grep -Fq 'legacy collector unit must be disabled before cutover' "$CUTOVER"
@@ -1508,16 +1536,21 @@ grep -Fq $'capture_existing_production_identity contained-upgrade\n  DRAIN_REQUI
   <<<"$host_state_dispatch"
 grep -Fq 'capture_existing_production_identity partial-contained-spot-live' \
   <<<"$host_state_dispatch"
+grep -Fq 'capture_existing_production_identity partial-contained-usdm-live' \
+  <<<"$host_state_dispatch"
 grep -Fq '$spot_active_state == active && $spot_enabled_state == enabled' \
   <<<"$host_state_dispatch"
 grep -Fq '$usdm_enabled_state == masked || $usdm_enabled_state == masked-runtime' \
   <<<"$host_state_dispatch"
 grep -Fq '$spot_upload_enabled_state == static' <<<"$host_state_dispatch"
+grep -Fq '$spot_upload_enabled_state == masked' <<<"$host_state_dispatch"
 grep -Fq '$spot_upload_enabled_state == masked-runtime' <<<"$host_state_dispatch"
 grep -Fq '$usdm_upload_enabled_state == masked' <<<"$host_state_dispatch"
 grep -Fq '$usdm_upload_enabled_state == static' <<<"$host_state_dispatch"
 grep -Fq 'previous_spot_restarts' "$CUTOVER"
 grep -Fq 'previous_spot_invocation_id' "$CUTOVER"
+grep -Fq 'previous_usdm_restarts' "$CUTOVER"
+grep -Fq 'previous_usdm_invocation_id' "$CUTOVER"
 host_state_dispatch_file="$tmp_dir/host-state-dispatch.sh"
 printf '%s\n' "$host_state_dispatch" >"$host_state_dispatch_file"
 run_partial_host_state_fixture() (
@@ -1575,6 +1608,62 @@ run_partial_host_state_fixture() (
   == 'partial-contained-spot-live 1 0' ]]
 [[ $(run_partial_host_state_fixture masked-runtime 0 masked-runtime static) \
   == 'partial-contained-spot-live 1 1' ]]
+run_partial_usdm_host_state_fixture() (
+  local spot_enabled_state=$1 spot_main_pid=${2:-0}
+  local usdm_upload_enabled_state=${3:-masked-runtime}
+  local initial_spot_upload_enabled_state=${4:-masked-runtime}
+  local fixed_now_ns=2000000000000
+  PRODUCTION_UNITS=(production-spot production-usdm)
+  UPLOAD_UNITS=(upload-spot upload-usdm)
+  PRODUCTION_LINK="$tmp_dir/partial-usdm-production-$spot_enabled_state-$spot_main_pid-$usdm_upload_enabled_state-$initial_spot_upload_enabled_state"
+  ln -s "$tmp_dir/old-production-binary" "$PRODUCTION_LINK"
+  active_count=1
+  enabled_count=1
+  spot_active_state=inactive
+  usdm_active_state=active
+  usdm_enabled_state=enabled
+  spot_upload_enabled_state=$initial_spot_upload_enabled_state
+  MASK_SPOT_UPLOAD_FOR_TRANSITION=0
+  HEALTH_TIMEOUT_SECONDS=300
+  PRODUCTION_USDM_MEMORY_DROPIN_PRESENT=0
+  DRAIN_REQUIRED=0
+  OLD_MODE=
+  OLD_BINARY=
+  OLD_USDM_MINIMUM_SYMBOLS=400
+  systemctl_value() {
+    case "$1:$2" in
+      production-spot:SubState) printf 'dead\n' ;;
+      production-spot:MainPID) printf '%s\n' "$spot_main_pid" ;;
+      *) return 1 ;;
+    esac
+  }
+  capture_existing_production_identity() {
+    OLD_MODE=$1
+    OLD_BINARY="$tmp_dir/old-production-binary"
+    OLD_USDM_RESTARTS=2
+    OLD_USDM_INVOCATION_ID=22222222222222222222222222222222
+  }
+  unit_matches_release() {
+    [[ $1 == production-usdm && $2 == "$OLD_BINARY" && $3 == true \
+      && $4 == 2 && $5 == "$OLD_USDM_INVOCATION_ID" ]]
+  }
+  date() { [[ $1 == +%s%N ]] && printf '%s\n' "$fixed_now_ns"; }
+  health_ready_for_release() {
+    [[ $1 == usdm && $2 == 400 && -z $3 \
+      && $4 == $((fixed_now_ns - HEALTH_TIMEOUT_SECONDS * 1000000000)) ]]
+  }
+  require_empty_segment_spool() { return 1; }
+  fail() { printf '%s\n' "$*" >&2; exit 1; }
+  if ! . "$host_state_dispatch_file"; then
+    return 1
+  fi
+  printf '%s %s %s\n' \
+    "$OLD_MODE" "$DRAIN_REQUIRED" "$MASK_SPOT_UPLOAD_FOR_TRANSITION"
+)
+[[ $(run_partial_usdm_host_state_fixture masked-runtime) \
+  == 'partial-contained-usdm-live 1 0' ]]
+[[ $(run_partial_usdm_host_state_fixture masked-runtime 0 masked-runtime static) \
+  == 'partial-contained-usdm-live 1 1' ]]
 
 transition_mask_body="$tmp_dir/transition-mask-usdm-uploader.sh"
 sed -n '/^if (( MASK_USDM_UPLOAD_FOR_TRANSITION )); then$/,/^fi$/p' \
@@ -1604,11 +1693,45 @@ if run_transition_mask_fixture static; then
   printf 'transition accepted an unmasked USD-M uploader readback\n' >&2
   exit 1
 fi
+transition_spot_mask_body="$tmp_dir/transition-mask-spot-uploader.sh"
+sed -n '/^if (( MASK_SPOT_UPLOAD_FOR_TRANSITION )); then$/,/^fi$/p' \
+  "$CUTOVER" >"$transition_spot_mask_body"
+run_transition_spot_mask_fixture() (
+  local readback=$1
+  MASK_SPOT_UPLOAD_FOR_TRANSITION=1
+  UPLOAD_UNITS=(upload-spot upload-usdm)
+  STEP=
+  systemctl() {
+    if [[ $1 == mask && $2 == --runtime && $3 == upload-spot ]]; then
+      return 0
+    fi
+    if [[ $1 == is-enabled && $2 == upload-spot ]]; then
+      printf '%s\n' "$readback"
+      return 1
+    fi
+    return 1
+  }
+  fail() { exit 1; }
+  # shellcheck disable=SC1090
+  . "$transition_spot_mask_body"
+  [[ $STEP == contain-spot-uploader ]]
+)
+run_transition_spot_mask_fixture masked-runtime
+if run_transition_spot_mask_fixture static; then
+  printf 'transition accepted an unmasked Spot uploader readback\n' >&2
+  exit 1
+fi
 transition_started_line=$(grep -n '^TRANSITION_STARTED=1$' "$CUTOVER" | cut -d: -f1)
 transition_mask_line=$(grep -n '^if (( MASK_USDM_UPLOAD_FOR_TRANSITION )); then$' \
   "$CUTOVER" | cut -d: -f1)
 (( transition_started_line < transition_mask_line )) || {
   printf 'USD-M uploader mask moved before the governed transition\n' >&2
+  exit 1
+}
+transition_spot_mask_line=$(grep -n '^if (( MASK_SPOT_UPLOAD_FOR_TRANSITION )); then$' \
+  "$CUTOVER" | cut -d: -f1)
+(( transition_started_line < transition_spot_mask_line )) || {
+  printf 'Spot uploader mask moved before the governed transition\n' >&2
   exit 1
 }
 if run_partial_host_state_fixture disabled >"$tmp_dir/partial-disabled.out" 2>&1; then
@@ -1630,6 +1753,26 @@ if run_partial_host_state_fixture masked-runtime 0 masked \
 fi
 grep -Fq 'ambiguous production state' \
   "$tmp_dir/partial-persistent-spot-upload-mask.out"
+if run_partial_usdm_host_state_fixture disabled \
+  >"$tmp_dir/partial-usdm-disabled.out" 2>&1; then
+  printf 'partial classifier accepted disabled instead of masked Spot\n' >&2
+  exit 1
+fi
+grep -Fq 'ambiguous production state' "$tmp_dir/partial-usdm-disabled.out"
+if run_partial_usdm_host_state_fixture masked-runtime 1 \
+  >"$tmp_dir/partial-usdm-main-pid.out" 2>&1; then
+  printf 'partial classifier accepted a live Spot MainPID\n' >&2
+  exit 1
+fi
+grep -Fq 'contained Spot production is not inactive/dead with MainPID=0' \
+  "$tmp_dir/partial-usdm-main-pid.out"
+if run_partial_usdm_host_state_fixture masked-runtime 0 masked \
+  >"$tmp_dir/partial-persistent-usdm-upload-mask.out" 2>&1; then
+  printf 'partial classifier accepted a persistently masked USD-M uploader\n' >&2
+  exit 1
+fi
+grep -Fq 'ambiguous production state' \
+  "$tmp_dir/partial-persistent-usdm-upload-mask.out"
 
 new_host_dropin_guard="$tmp_dir/new-host-dropin-guard.sh"
 sed -n '/^  (( PRODUCTION_USDM_MEMORY_DROPIN_PRESENT == 0 )) \\/,+1p' "$CUTOVER" \
@@ -1670,6 +1813,7 @@ partial_drain_calls="$tmp_dir/partial-drain.calls"
 new_host_drain_calls="$tmp_dir/new-host-drain.calls"
 run_drain_dispatch_fixture "$contained_drain_calls" contained-upgrade
 run_drain_dispatch_fixture "$partial_drain_calls" partial-contained-spot-live
+run_drain_dispatch_fixture "$partial_drain_calls" partial-contained-usdm-live
 run_drain_dispatch_fixture "$new_host_drain_calls" new-host
 grep -Fxq 'drain old-deployment' "$contained_drain_calls"
 grep -Fxq 'drain old-deployment' "$partial_drain_calls"
@@ -1961,6 +2105,7 @@ run_contained_upgrade_rollback_fixture() (
   local enabled_recovery_timer=${6:-}
   local active_recovery_unit=${7:-}
   local spot_upload_unmasked=0
+  local usdm_upload_unmasked=0
   local calls="$tmp_dir/contained-rollback.calls"
   PRODUCTION_UNITS=(production-spot production-usdm)
   UPLOAD_UNITS=(upload-spot upload-usdm)
@@ -1982,6 +2127,10 @@ run_contained_upgrade_rollback_fixture() (
   DRAIN_MAY_HAVE_MUTATED=0
   OLD_RECOVERY_TIMERS_ENABLED=$old_recovery_timers_enabled
   OLD_SESSION_SPOT=old-spot-session
+  OLD_SESSION_USDM=old-usdm-session
+  OLD_USDM_MINIMUM_SYMBOLS=400
+  OLD_USDM_RESTARTS=2
+  OLD_USDM_INVOCATION_ID=22222222222222222222222222222222
   SPOOL_ENV_DEPLOYMENT=$OLD_DEPLOYMENT
   mkdir -p "$CANONICAL_SPOOL" "$OLD_DEPLOYMENT" "$EVIDENCE_DIR" \
     "$(dirname "$PRODUCTION_LINK")"
@@ -1994,6 +2143,10 @@ run_contained_upgrade_rollback_fixture() (
         ;;
       is-enabled)
         if [[ ${!#} == upload-spot && $spot_upload_unmasked -eq 1 ]]; then
+          printf 'static\n'
+          return 1
+        fi
+        if [[ ${!#} == upload-usdm && $usdm_upload_unmasked -eq 1 ]]; then
           printf 'static\n'
           return 1
         fi
@@ -2020,6 +2173,8 @@ run_contained_upgrade_rollback_fixture() (
       unmask)
         if [[ ${!#} == upload-spot ]]; then
           spot_upload_unmasked=1
+        elif [[ ${!#} == upload-usdm ]]; then
+          usdm_upload_unmasked=1
         fi
         ;;
       mask) (( expect_contained )) ;;
@@ -2031,7 +2186,14 @@ run_contained_upgrade_rollback_fixture() (
   clear_health_before_restart() { return 0; }
   health_ready_for_release() { return 0; }
   wait_for_spot_release_health() { return 0; }
-  unit_matches_release() { return 0; }
+  wait_for_usdm_release_health() { return 0; }
+  unit_matches_release() {
+    if [[ $mode == partial-contained-usdm-live && $1 == production-usdm && $# -ne 3 ]]; then
+      printf 'partial USD-M rollback compared stale activation identity\n' >&2
+      return 1
+    fi
+    return 0
+  }
   run_candidate_drain() { printf 'drain %s\n' "$1" >>"$calls"; return 1; }
   install_deployment() { printf 'install %s\n' "$1" >>"$calls"; return 0; }
   atomic_symlink() { printf 'symlink %s %s\n' "$1" "$2" >>"$calls"; return 0; }
@@ -2040,6 +2202,8 @@ run_contained_upgrade_rollback_fixture() (
   . "$production_predicate_body"
   # shellcheck disable=SC1090
   . "$partial_predicate_body"
+  # shellcheck disable=SC1090
+  . "$partial_usdm_predicate_body"
   # shellcheck disable=SC1090
   . "$rollback_body"
   rollback_after_failure
@@ -2061,6 +2225,15 @@ run_contained_upgrade_rollback_fixture() (
     grep -Fxq 'unmask --runtime upload-spot' "$calls"
     if grep -Eq '^(start|enable|unmask) .*(production-usdm|upload-usdm)' "$calls"; then
       printf 'partial rollback tried to start, enable, or unmask old USD-M\n' >&2
+      exit 1
+    fi
+  elif [[ $mode == partial-contained-usdm-live ]]; then
+    grep -Fxq 'start production-usdm' "$calls"
+    grep -Fxq 'enable production-usdm' "$calls"
+    grep -Fxq 'unmask --runtime production-usdm' "$calls"
+    grep -Fxq 'unmask --runtime upload-usdm' "$calls"
+    if grep -Eq '^(start|enable|unmask) .*(production-spot|upload-spot)' "$calls"; then
+      printf 'partial rollback tried to start, enable, or unmask old Spot\n' >&2
       exit 1
     fi
   elif grep -Eq '^(start|enable|unmask) ' "$calls"; then
@@ -2098,6 +2271,10 @@ run_contained_upgrade_rollback_fixture() (
   == previous-spot-restored-usdm-contained ]]
 [[ $(run_contained_upgrade_rollback_fixture 1 0 partial-contained-spot-live 2) \
   == previous-spot-restored-usdm-contained ]]
+[[ $(run_contained_upgrade_rollback_fixture 1 0 partial-contained-usdm-live) \
+  == previous-usdm-restored-spot-contained ]]
+[[ $(run_contained_upgrade_rollback_fixture 1 0 partial-contained-usdm-live 2) \
+  == previous-usdm-restored-spot-contained ]]
 
 run_new_host_rollback_fixture() (
   local active_unit=${1:-} unit
