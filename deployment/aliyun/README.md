@@ -1014,7 +1014,7 @@ not Code, CI, Merge, or immutable Release publication. It verifies the candidate
 Spot `SYMBOLS=ALL`, and the exact frozen 100-symbol USD-M production allowlist,
 then creates a fresh spool under
 `/data/monday/spool/binance-lob-rust-shadow/runs/<artifact>/<run-id>/`, starts
-both units with `SEGMENT_SECONDS=120`, waits at most 240 seconds for initial
+each market sequentially with `SEGMENT_SECONDS=120`, waits at most 240 seconds for initial
 configured-catalog health, freezes both session IDs and catalog digests, and then uses
 monotonic time to observe at least 240 seconds. It never drains or recovers an
 older Shadow run. Any incomplete files left by a failed run remain confined to
@@ -1025,8 +1025,13 @@ Five immutable passed Tokyo gates measured Spot at no more than 664,735,744 byte
 and the former 570-symbol USD-M scope at no more than 1,789,218,816 bytes; the
 current USD-M Gate covers only the frozen Top 100. Strict readback is separately
 capped at 2560MiB/3072MiB and carries the same non-production OOM preference as
-the Shadow collectors. The largest Gate phase is therefore 4GiB, plus the
-existing 1GiB host reserve. An over-limit candidate fails the Gate instead of
+the Shadow collectors. Candidate upload drain is capped at 2500MiB/3200MiB, so
+the largest sequential Gate phase is 3200MiB, plus the existing 1GiB host
+reserve. Active production usage is already reflected in `MemAvailable`; its
+growth to `MemoryHigh` is budgeted explicitly. The 1GiB reserve covers at most
+512MiB of additional production growth from `MemoryHigh` to `MemoryMax` and
+must leave at least 512MiB for the host. All three production-growth values are
+recorded as evidence. An over-limit candidate fails the Gate instead of
 increasing the host size or weakening the reserve.
 The Gate fails unless all of these are true for the entire candidate run:
 

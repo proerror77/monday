@@ -10,6 +10,7 @@ readonly GATE_SEGMENT_SECONDS=120
 readonly MAX_HEALTH_SILENCE_SECONDS=120
 readonly MAX_SEGMENT_GAP_NS=90000000000
 readonly HOST_MEMORY_RESERVE_BYTES=1073741824
+readonly MIN_HOST_MEMORY_RESERVE_BYTES=536870912
 readonly STRICT_VERIFIER_MEMORY_MAX_BYTES=3221225472
 readonly UPLOAD_DRAIN_MEMORY_MAX_BYTES=3355443200
 readonly SHADOW_BINARY=/opt/monday/bin/binance-lob-archiver-shadow
@@ -277,6 +278,8 @@ if ((UPLOAD_DRAIN_MEMORY_MAX_BYTES > shadow_phase_memory_bytes)); then
   shadow_phase_memory_bytes=$UPLOAD_DRAIN_MEMORY_MAX_BYTES
 fi
 production_memory_headroom_bytes=0
+production_memory_soft_headroom_bytes=0
+production_memory_reserve_burst_bytes=0
 for market in "${markets[@]}"; do
   production_unit="binance-lob-archiver-production@${market}.service"
   production_active=$(systemctl show "$production_unit" --property=ActiveState --value)
@@ -285,14 +288,26 @@ for market in "${markets[@]}"; do
       [[ $(systemctl show "$production_unit" --property=SubState --value) == running ]] \
         || die "$market production service is active but not running"
       production_memory_max=$(systemctl show "$production_unit" --property=MemoryMax --value)
+      production_memory_high=$(systemctl show "$production_unit" --property=MemoryHigh --value)
       production_memory_current=$(systemctl show "$production_unit" \
         --property=MemoryCurrent --value)
       [[ $production_memory_max =~ ^[0-9]+$ \
+        && $production_memory_high =~ ^[0-9]+$ \
         && $production_memory_current =~ ^[0-9]+$ \
+        && $production_memory_high -le $production_memory_max \
         && $production_memory_current -le $production_memory_max ]] \
         || die "$market production memory accounting is invalid"
       production_memory_headroom_bytes=$((production_memory_headroom_bytes \
         + production_memory_max - production_memory_current))
+      if ((production_memory_current < production_memory_high)); then
+        production_memory_soft_headroom_bytes=$((production_memory_soft_headroom_bytes \
+          + production_memory_high - production_memory_current))
+        production_memory_reserve_burst_bytes=$((production_memory_reserve_burst_bytes \
+          + production_memory_max - production_memory_high))
+      else
+        production_memory_reserve_burst_bytes=$((production_memory_reserve_burst_bytes \
+          + production_memory_max - production_memory_current))
+      fi
       ;;
     inactive) ;;
     *) die "$market production service has ambiguous ActiveState=$production_active" ;;
@@ -300,9 +315,15 @@ for market in "${markets[@]}"; do
 done
 host_memory_headroom_ok=false
 host_memory_shortfall_bytes=0
+((production_memory_reserve_burst_bytes \
+  <= HOST_MEMORY_RESERVE_BYTES - MIN_HOST_MEMORY_RESERVE_BYTES)) \
+  || die "production memory burst leaves less than the minimum host reserve: burst=$production_memory_reserve_burst_bytes reserve=$HOST_MEMORY_RESERVE_BYTES minimum=$MIN_HOST_MEMORY_RESERVE_BYTES"
+# MemAvailable already reflects active production usage. Budget growth to
+# MemoryHigh explicitly; the fixed reserve covers the remaining growth to
+# MemoryMax while preserving MIN_HOST_MEMORY_RESERVE_BYTES for the host.
 if host_memory_required_bytes=$(monday_shadow_memory_admission \
   "$host_memory_available_bytes" "$HOST_MEMORY_RESERVE_BYTES" \
-  "$shadow_phase_memory_bytes" "$production_memory_headroom_bytes"); then
+  "$shadow_phase_memory_bytes" "$production_memory_soft_headroom_bytes"); then
   host_memory_headroom_ok=true
 else
   admission_status=$?
@@ -400,7 +421,10 @@ jq -n \
   --argjson host_swap_total_bytes "$host_swap_total_bytes" \
   --argjson shadow_phase_memory_bytes "$shadow_phase_memory_bytes" \
   --argjson production_memory_headroom_bytes "$production_memory_headroom_bytes" \
+  --argjson production_memory_soft_headroom_bytes "$production_memory_soft_headroom_bytes" \
+  --argjson production_memory_reserve_burst_bytes "$production_memory_reserve_burst_bytes" \
   --argjson host_memory_reserve_bytes "$HOST_MEMORY_RESERVE_BYTES" \
+  --argjson minimum_host_memory_reserve_bytes "$MIN_HOST_MEMORY_RESERVE_BYTES" \
   --argjson host_memory_required_bytes "$host_memory_required_bytes" \
   --argjson host_memory_shortfall_bytes "$host_memory_shortfall_bytes" \
   --argjson host_memory_headroom_ok "$host_memory_headroom_ok" \
@@ -417,7 +441,10 @@ jq -n \
     host_swap_total_bytes:$host_swap_total_bytes,
     shadow_phase_memory_bytes:$shadow_phase_memory_bytes,
     production_memory_headroom_bytes:$production_memory_headroom_bytes,
+    production_memory_soft_headroom_bytes:$production_memory_soft_headroom_bytes,
+    production_memory_reserve_burst_bytes:$production_memory_reserve_burst_bytes,
     host_memory_reserve_bytes:$host_memory_reserve_bytes,
+    minimum_host_memory_reserve_bytes:$minimum_host_memory_reserve_bytes,
     host_memory_required_bytes:$host_memory_required_bytes,
     host_memory_shortfall_bytes:$host_memory_shortfall_bytes,
     host_memory_headroom_ok:$host_memory_headroom_ok,test_only:$test_only}' \
@@ -462,7 +489,7 @@ trap 'exit 143' HUP INT TERM
 trap cleanup EXIT
 
 [[ $host_memory_headroom_ok == true ]] || die \
-  "insufficient host memory headroom for sequential shadow gate: total=$host_memory_total_bytes available=$host_memory_available_bytes swap=$host_swap_total_bytes phase=$shadow_phase_memory_bytes production_headroom=$production_memory_headroom_bytes reserve=$HOST_MEMORY_RESERVE_BYTES required=$host_memory_required_bytes shortfall=$host_memory_shortfall_bytes"
+  "insufficient host memory headroom for sequential shadow gate: total=$host_memory_total_bytes available=$host_memory_available_bytes swap=$host_swap_total_bytes phase=$shadow_phase_memory_bytes production_headroom=$production_memory_headroom_bytes production_soft_headroom=$production_memory_soft_headroom_bytes production_reserve_burst=$production_memory_reserve_burst_bytes reserve=$HOST_MEMORY_RESERVE_BYTES minimum_host_reserve=$MIN_HOST_MEMORY_RESERVE_BYTES required=$host_memory_required_bytes shortfall=$host_memory_shortfall_bytes"
 
 assert_candidate() {
   [[ -L $SHADOW_BINARY ]] || die 'shadow candidate symlink disappeared'
@@ -1516,7 +1543,10 @@ jq -n \
   --argjson host_swap_total_bytes "$host_swap_total_bytes" \
   --argjson shadow_phase_memory_bytes "$shadow_phase_memory_bytes" \
   --argjson production_memory_headroom_bytes "$production_memory_headroom_bytes" \
+  --argjson production_memory_soft_headroom_bytes "$production_memory_soft_headroom_bytes" \
+  --argjson production_memory_reserve_burst_bytes "$production_memory_reserve_burst_bytes" \
   --argjson host_memory_reserve_bytes "$HOST_MEMORY_RESERVE_BYTES" \
+  --argjson minimum_host_memory_reserve_bytes "$MIN_HOST_MEMORY_RESERVE_BYTES" \
   --argjson host_memory_required_bytes "$host_memory_required_bytes" \
   --argjson host_memory_shortfall_bytes "$host_memory_shortfall_bytes" \
   --argjson segment_seconds "$GATE_SEGMENT_SECONDS" \
@@ -1540,7 +1570,10 @@ jq -n \
     host_swap_total_bytes:$host_swap_total_bytes,
     shadow_phase_memory_bytes:$shadow_phase_memory_bytes,
     production_memory_headroom_bytes:$production_memory_headroom_bytes,
+    production_memory_soft_headroom_bytes:$production_memory_soft_headroom_bytes,
+    production_memory_reserve_burst_bytes:$production_memory_reserve_burst_bytes,
     host_memory_reserve_bytes:$host_memory_reserve_bytes,
+    minimum_host_memory_reserve_bytes:$minimum_host_memory_reserve_bytes,
     host_memory_required_bytes:$host_memory_required_bytes,
     host_memory_shortfall_bytes:$host_memory_shortfall_bytes,
     segment_seconds:$segment_seconds,
