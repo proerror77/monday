@@ -1,16 +1,16 @@
 //! Validation and fail-closed OSS upload for closed Polymarket raw tapes.
 
 use crate::lob_archiver::{command_status_with_timeout, sha256_file, write_success_marker};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, NaiveDateTime, TimeDelta, Utc};
 use polymarket_tape_contract::{
-    complete_market_tape_manifest_shape, tape_seal_path, PolymarketTapeSeal, TapeFileIdentity,
-    POLYMARKET_TAPE_SEAL_SCHEMA,
+    POLYMARKET_TAPE_SEAL_SCHEMA, PolymarketTapeSeal, TapeFileIdentity,
+    complete_market_tape_manifest_shape, tape_seal_path,
 };
 use rand::random;
 use rust_decimal::Decimal;
 use serde::Serialize;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
@@ -19,8 +19,8 @@ use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
@@ -80,6 +80,8 @@ const OSS_VERIFY_DOWNLOAD_ATTEMPTS: usize = 60;
 const OSS_VERIFY_DOWNLOAD_RETRY_DELAY_SECS: u64 = 4;
 pub const DEFAULT_MAX_CONCURRENT_UPLOADS: usize = 2;
 const MAX_CONCURRENT_UPLOADS: usize = 4;
+const MIN_ZSTD_TIMEOUT_BYTES_PER_SEC: u64 = 512 * 1024;
+const MIN_ZSTD_TIMEOUT_HEADROOM_SECS: u64 = 300;
 // Fail-closed low-disk guard: a disk-full spool fails every upload attempt
 // with ENOSPC before any OSS PUT, leaving uploaded_segments at 0 and the
 // dataset prefix NoSuchKey. The uploader therefore refuses to stage or upload
@@ -155,6 +157,18 @@ impl UploadConfig {
         }
         Ok(())
     }
+}
+
+fn effective_zstd_timeout(config: &UploadConfig, source_bytes: u64) -> Duration {
+    if source_bytes == 0 {
+        return config.zstd_timeout;
+    }
+    let minimum_secs = source_bytes.saturating_add(MIN_ZSTD_TIMEOUT_BYTES_PER_SEC - 1)
+        / MIN_ZSTD_TIMEOUT_BYTES_PER_SEC;
+    if minimum_secs <= config.zstd_timeout.as_secs() {
+        return config.zstd_timeout;
+    }
+    Duration::from_secs(minimum_secs.saturating_add(MIN_ZSTD_TIMEOUT_HEADROOM_SECS))
 }
 
 #[derive(Debug)]
@@ -2120,7 +2134,10 @@ fn prepare_artifacts_from_scan(
     command.stdout(Stdio::from(output));
     let zstd_result = {
         let _phase = PhaseAttribution::new("zstd");
-        command_status_with_timeout(&mut command, config.zstd_timeout)
+        command_status_with_timeout(
+            &mut command,
+            effective_zstd_timeout(config, scan.identity.bytes),
+        )
     };
     match zstd_result {
         Ok(status) if status.success() => {}
@@ -3480,9 +3497,7 @@ mod tests {
 
         let root = TestDir::new();
         let root_path = root.path().to_path_buf();
-        let fixture = root
-            .path()
-            .join("market-updates.20260715T020000.ndjson");
+        let fixture = root.path().join("market-updates.20260715T020000.ndjson");
         let validation_time = DateTime::parse_from_rfc3339("2026-07-15T01:59:59Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -3610,17 +3625,21 @@ mod tests {
         let root = TestDir::new();
         let mut config = config(root.path());
         config.max_concurrent_uploads = 0;
-        assert!(config
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("max concurrent uploads must be between 1 and 4"));
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("max concurrent uploads must be between 1 and 4")
+        );
         config.max_concurrent_uploads = MAX_CONCURRENT_UPLOADS + 1;
-        assert!(config
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("max concurrent uploads must be between 1 and 4"));
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("max concurrent uploads must be between 1 and 4")
+        );
     }
 
     #[test]
@@ -3659,6 +3678,30 @@ mod tests {
     }
 
     #[test]
+    fn effective_zstd_timeout_keeps_config_floor_for_small_sources() {
+        let root = TestDir::new();
+        let config = config(root.path());
+
+        assert_eq!(effective_zstd_timeout(&config, 0), Duration::from_secs(30));
+        assert_eq!(
+            effective_zstd_timeout(&config, 1_024),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn effective_zstd_timeout_scales_with_large_sources() {
+        let root = TestDir::new();
+        let mut config = config(root.path());
+        config.zstd_timeout = Duration::from_secs(3_600);
+
+        assert_eq!(
+            effective_zstd_timeout(&config, 3_714_888_561),
+            Duration::from_secs(7_386)
+        );
+    }
+
+    #[test]
     fn oss_copy_command_includes_multipart_tuning() {
         let root = TestDir::new();
         let config = config(root.path());
@@ -3694,18 +3737,22 @@ mod tests {
         let root = TestDir::new();
         let mut config = config(root.path());
         config.oss_parallel = 0;
-        assert!(config
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("oss parallel must be at least 1"));
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("oss parallel must be at least 1")
+        );
         config.oss_parallel = 8;
         config.oss_part_size = " ".to_owned();
-        assert!(config
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("oss part size must be non-empty"));
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("oss part size must be non-empty")
+        );
     }
 
     #[test]
@@ -3838,9 +3885,11 @@ mod tests {
         );
 
         let error = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("collection_result does not match incomplete"));
+        assert!(
+            error
+                .to_string()
+                .contains("collection_result does not match incomplete")
+        );
     }
 
     #[test]
@@ -4064,9 +4113,11 @@ mod tests {
 
         let error = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("quote collection failure requires explicit status"));
+        assert!(
+            error
+                .to_string()
+                .contains("quote collection failure requires explicit status")
+        );
     }
 
     #[test]
@@ -4090,9 +4141,11 @@ mod tests {
 
         let error = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("unsupported quote collection error_kind"));
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported quote collection error_kind")
+        );
     }
 
     #[test]
@@ -4116,9 +4169,11 @@ mod tests {
 
         let error = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("invalid quote collection http_status"));
+        assert!(
+            error
+                .to_string()
+                .contains("invalid quote collection http_status")
+        );
     }
 
     #[test]
@@ -4188,9 +4243,11 @@ mod tests {
 
         let error = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("quote source time moved backwards by 60000ms"));
+        assert!(
+            error
+                .to_string()
+                .contains("quote source time moved backwards by 60000ms")
+        );
     }
 
     #[test]
@@ -4673,33 +4730,41 @@ mod tests {
         let mut rows = sample_rows();
         rows[1]["sequence"] = json!(2);
         let gap = write_tape(root.path(), "market-updates.20260715T010000.ndjson", &rows);
-        assert!(scan_tape(&gap, "crypto_expiry", 1, 1_000)
-            .unwrap_err()
-            .to_string()
-            .contains("sequence gap"));
+        assert!(
+            scan_tape(&gap, "crypto_expiry", 1, 1_000)
+                .unwrap_err()
+                .to_string()
+                .contains("sequence gap")
+        );
 
         let incomplete = root.path().join("market-updates.20260715T020000.ndjson");
         fs::write(&incomplete, b"{\"sequence\":0").unwrap();
-        assert!(scan_tape(&incomplete, "crypto_expiry", 1, 1_000)
-            .unwrap_err()
-            .to_string()
-            .contains("incomplete record"));
+        assert!(
+            scan_tape(&incomplete, "crypto_expiry", 1, 1_000)
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete record")
+        );
 
         let mut rows = sample_rows();
         rows[1]["update"]["bid"] = json!("not-a-number");
         let numeric = write_tape(root.path(), "market-updates.20260715T030000.ndjson", &rows);
-        assert!(scan_tape(&numeric, "crypto_expiry", 1, 1_000)
-            .unwrap_err()
-            .to_string()
-            .contains("bid must be numeric"));
+        assert!(
+            scan_tape(&numeric, "crypto_expiry", 1, 1_000)
+                .unwrap_err()
+                .to_string()
+                .contains("bid must be numeric")
+        );
 
         let mut rows = sample_rows();
         rows[1]["update"]["bid_levels"][0]["size"] = Value::Null;
         let depth = write_tape(root.path(), "market-updates.20260715T040000.ndjson", &rows);
-        assert!(scan_tape(&depth, "crypto_expiry", 1, 1_000)
-            .unwrap_err()
-            .to_string()
-            .contains("requires price and size"));
+        assert!(
+            scan_tape(&depth, "crypto_expiry", 1, 1_000)
+                .unwrap_err()
+                .to_string()
+                .contains("requires price and size")
+        );
     }
 
     fn write_torn_tape(root: &Path, name: &str, rows: &[Value], tail: &[u8]) -> PathBuf {
@@ -4722,19 +4787,18 @@ mod tests {
         let torn_bytes = fs::metadata(&tape).unwrap().len();
         // The pre-repair failure mode from #919: the scan rejects the closed
         // segment and the segment stalls the upload queue on every pass.
-        assert!(scan_tape(&tape, "crypto_expiry", 1, 1_000)
-            .unwrap_err()
-            .to_string()
-            .contains("incomplete record"));
+        assert!(
+            scan_tape(&tape, "crypto_expiry", 1, 1_000)
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete record")
+        );
 
         let truncated = repair_torn_tail(&tape)
             .unwrap()
             .expect("torn tail must be repaired");
 
-        assert_eq!(
-            truncated,
-            torn_bytes - fs::metadata(&tape).unwrap().len()
-        );
+        assert_eq!(truncated, torn_bytes - fs::metadata(&tape).unwrap().len());
         scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap();
         let audit: Value = serde_json::from_str(
             fs::read_to_string(root.path().join("repaired-tape-tails.log"))
@@ -4745,10 +4809,7 @@ mod tests {
         assert_eq!(audit["source"], "market-updates.20260715T010000.ndjson");
         assert_eq!(audit["line_number"], 4);
         assert_eq!(audit["truncated_bytes"], truncated);
-        assert_eq!(
-            audit["kept_bytes"],
-            fs::metadata(&tape).unwrap().len()
-        );
+        assert_eq!(audit["kept_bytes"], fs::metadata(&tape).unwrap().len());
         assert!(audit["repaired_at"].as_str().is_some());
     }
 
@@ -4782,10 +4843,12 @@ mod tests {
 
         repair_torn_tail(&tape).unwrap();
 
-        assert!(scan_tape(&tape, "crypto_expiry", 1, 1_000)
-            .unwrap_err()
-            .to_string()
-            .contains("bid must be numeric"));
+        assert!(
+            scan_tape(&tape, "crypto_expiry", 1, 1_000)
+                .unwrap_err()
+                .to_string()
+                .contains("bid must be numeric")
+        );
     }
 
     #[test]
@@ -4831,10 +4894,12 @@ mod tests {
         assert_eq!(manifest["event_context_complete"], false);
         assert_eq!(manifest["canonical"], false);
         assert_eq!(manifest["segment_complete"], false);
-        assert!(manifest["replay_scope"]
-            .as_str()
-            .unwrap()
-            .contains("requires_prior_event_context"));
+        assert!(
+            manifest["replay_scope"]
+                .as_str()
+                .unwrap()
+                .contains("requires_prior_event_context")
+        );
 
         let reference = vec![
             record(0, "2026-07-15T03:00:00Z", valid_market_metadata_update()),
@@ -4862,10 +4927,12 @@ mod tests {
                 &format!("market-updates.20260715T{stamp}.ndjson"),
                 &invalid,
             );
-            assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-                .unwrap_err()
-                .to_string()
-                .contains("size must be positive"));
+            assert!(
+                scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("size must be positive")
+            );
         }
     }
 
@@ -4880,10 +4947,12 @@ mod tests {
             &[record(0, "2026-07-15T03:00:00Z", update)],
         );
 
-        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-            .unwrap_err()
-            .to_string()
-            .contains("market_metadata market_id does not match raw market"));
+        assert!(
+            scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("market_metadata market_id does not match raw market")
+        );
     }
 
     #[test]
@@ -4897,10 +4966,12 @@ mod tests {
             &[record(0, "2026-07-15T03:00:00Z", update)],
         );
 
-        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-            .unwrap_err()
-            .to_string()
-            .contains("market_metadata symbol is unsupported or contradicts raw market"));
+        assert!(
+            scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("market_metadata symbol is unsupported or contradicts raw market")
+        );
     }
 
     #[test]
@@ -4914,10 +4985,12 @@ mod tests {
             &[record(0, "2026-07-15T03:00:00Z", update)],
         );
 
-        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-            .unwrap_err()
-            .to_string()
-            .contains("market_metadata window is unsupported or contradicts raw market"));
+        assert!(
+            scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("market_metadata window is unsupported or contradicts raw market")
+        );
     }
 
     #[test]
@@ -4931,10 +5004,12 @@ mod tests {
             &[record(0, "2026-07-15T03:00:00Z", update)],
         );
 
-        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-            .unwrap_err()
-            .to_string()
-            .contains("market_metadata raw market requires two unique clobTokenIds"));
+        assert!(
+            scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("market_metadata raw market requires two unique clobTokenIds")
+        );
     }
 
     #[test]
@@ -4948,10 +5023,12 @@ mod tests {
             &[record(0, "2026-07-15T03:00:00Z", update)],
         );
 
-        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-            .unwrap_err()
-            .to_string()
-            .contains("market_metadata raw market requires two unique outcomes"));
+        assert!(
+            scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("market_metadata raw market requires two unique outcomes")
+        );
     }
 
     #[test]
@@ -4965,10 +5042,12 @@ mod tests {
             &[record(0, "2026-07-15T03:00:00Z", update)],
         );
 
-        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-            .unwrap_err()
-            .to_string()
-            .contains("market_metadata.market must be an object"));
+        assert!(
+            scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("market_metadata.market must be an object")
+        );
     }
 
     #[test]
@@ -4982,10 +5061,12 @@ mod tests {
             &[record(0, "2026-07-15T03:06:00Z", update)],
         );
 
-        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-            .unwrap_err()
-            .to_string()
-            .contains("market_settlement raw market must be closed"));
+        assert!(
+            scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("market_settlement raw market must be closed")
+        );
     }
 
     #[test]
@@ -4999,10 +5080,12 @@ mod tests {
             &[record(0, "2026-07-15T03:06:00Z", update)],
         );
 
-        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-            .unwrap_err()
-            .to_string()
-            .contains("market_settlement winning_token_id does not match raw market"));
+        assert!(
+            scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("market_settlement winning_token_id does not match raw market")
+        );
     }
 
     #[test]
@@ -5022,10 +5105,12 @@ mod tests {
                 &format!("market-updates.20260715T03000{index}.ndjson"),
                 &[record(0, "2026-07-15T03:06:00Z", update)],
             );
-            assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-                .unwrap_err()
-                .to_string()
-                .contains(expected));
+            assert!(
+                scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected)
+            );
         }
     }
 
@@ -5043,10 +5128,12 @@ mod tests {
                 &format!("market-updates.20260715T03001{index}.ndjson"),
                 &[record(0, "2026-07-15T03:06:00Z", update)],
             );
-            assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-                .unwrap_err()
-                .to_string()
-                .contains(expected));
+            assert!(
+                scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected)
+            );
         }
     }
 
@@ -5149,10 +5236,12 @@ mod tests {
             &[record(0, "2026-07-15T03:10:00Z", update)],
         );
 
-        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-            .unwrap_err()
-            .to_string()
-            .contains("record_id does not match raw trade"));
+        assert!(
+            scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("record_id does not match raw trade")
+        );
     }
 
     #[test]
@@ -5166,10 +5255,12 @@ mod tests {
             &[record(0, "2026-07-15T03:10:00Z", update)],
         );
 
-        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-            .unwrap_err()
-            .to_string()
-            .contains("record_id_version must be v2"));
+        assert!(
+            scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("record_id_version must be v2")
+        );
     }
 
     #[test]
@@ -5202,10 +5293,12 @@ mod tests {
             &[record(0, "2026-07-15T03:10:00Z", update)],
         );
 
-        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-            .unwrap_err()
-            .to_string()
-            .contains("polymarket_trade.trade must be an object"));
+        assert!(
+            scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("polymarket_trade.trade must be an object")
+        );
     }
 
     #[test]
@@ -5219,10 +5312,12 @@ mod tests {
             &[record(0, "2026-07-15T03:10:00Z", update)],
         );
 
-        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-            .unwrap_err()
-            .to_string()
-            .contains("raw trade requires proxyWallet"));
+        assert!(
+            scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("raw trade requires proxyWallet")
+        );
     }
 
     #[test]
@@ -6102,11 +6197,13 @@ mod tests {
         let root = TestDir::new();
         let mut config = config(root.path());
         config.low_disk_floor_bytes = Some(0);
-        assert!(config
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("low disk floor must be nonzero"));
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("low disk floor must be nonzero")
+        );
     }
 
     #[test]
@@ -6132,9 +6229,11 @@ mod tests {
                 .unwrap();
         assert_eq!(status["failure_count"], 1);
         assert_eq!(status["failed_segments"].as_array().unwrap().len(), 1);
-        assert!(status["failed_segments"][0]["error"]
-            .to_string()
-            .contains("readback failed"));
+        assert!(
+            status["failed_segments"][0]["error"]
+                .to_string()
+                .contains("readback failed")
+        );
         assert!(status["last_error"].to_string().contains("readback failed"));
     }
 
@@ -6152,10 +6251,12 @@ mod tests {
         let root = TestDir::new();
         write_tape(root.path(), "market-updates.ndjson", &sample_rows());
         write_tape(root.path(), "market-updates.backup.ndjson", &sample_rows());
-        assert!(discover_rotated_tapes(root.path())
-            .unwrap_err()
-            .to_string()
-            .contains("invalid rotated tape name"));
+        assert!(
+            discover_rotated_tapes(root.path())
+                .unwrap_err()
+                .to_string()
+                .contains("invalid rotated tape name")
+        );
         fs::remove_file(root.path().join("market-updates.backup.ndjson")).unwrap();
         let valid = write_tape(
             root.path(),
@@ -6200,10 +6301,12 @@ mod tests {
             actual.join("child").join("..").join("child"),
         ] {
             let upload_config = config(&spool_dir);
-            assert!(upload_pending(&upload_config)
-                .unwrap_err()
-                .to_string()
-                .contains("directory"));
+            assert!(
+                upload_pending(&upload_config)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("directory")
+            );
         }
     }
 
