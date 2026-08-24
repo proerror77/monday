@@ -1505,6 +1505,7 @@ health_ready_for_release usdm 100 "$OLD_SESSION_USDM" "$CANDIDATE_STARTED_NS" \
 systemctl unmask --runtime "${UPLOAD_UNITS[@]}" >/dev/null
 
 STEP=enable-recovery-timers
+systemctl unmask --runtime "${RECOVERY_TIMERS[@]}" >/dev/null
 systemctl enable --now "${RECOVERY_TIMERS[@]}" >/dev/null
 for timer in "${RECOVERY_TIMERS[@]}"; do
   systemctl is-enabled --quiet "$timer" \

@@ -2008,6 +2008,10 @@ candidate_start_line=$(grep -n 'systemctl start "${PRODUCTION_UNITS\[@\]}"' \
 candidate_health_line=$(grep -n '^wait_for_release_health' "$candidate_start_body" | cut -d: -f1)
 candidate_enable_line=$(grep -n 'systemctl enable "${PRODUCTION_UNITS\[@\]}"' \
   "$candidate_start_body" | cut -d: -f1)
+candidate_recovery_timer_unmask_line=$(grep -n 'systemctl unmask --runtime "${RECOVERY_TIMERS\[@\]}"' \
+  "$candidate_start_body" | cut -d: -f1)
+candidate_recovery_timer_enable_line=$(grep -n 'systemctl enable --now "${RECOVERY_TIMERS\[@\]}"' \
+  "$candidate_start_body" | cut -d: -f1)
 ((candidate_clear_line < candidate_timestamp_line \
   && candidate_timestamp_line < candidate_start_line \
   && candidate_start_line < candidate_health_line \
@@ -2015,7 +2019,15 @@ candidate_enable_line=$(grep -n 'systemctl enable "${PRODUCTION_UNITS\[@\]}"' \
   printf 'candidate no longer follows clear stale health -> timestamp -> start -> verify -> enable\n' >&2
   exit 1
 }
+((candidate_enable_line < candidate_recovery_timer_unmask_line \
+  && candidate_recovery_timer_unmask_line < candidate_recovery_timer_enable_line)) || {
+  printf 'candidate no longer unmasks recovery timers before enabling them\n' >&2
+  exit 1
+}
 grep -Fq '"$CANDIDATE_STARTED_NS"' "$candidate_start_body"
+grep -Fq 'trap on_exit EXIT' "$CUTOVER"
+grep -Fq 'if (( TRANSITION_STARTED )); then' "$CUTOVER"
+grep -Fq 'rollback_after_failure' "$CUTOVER"
 
 dropin_body="$tmp_dir/production-dropins.sh"
 {
