@@ -882,12 +882,14 @@ test_preexisting_triplet_blocks_uploader() {
   data_dir=${data_dir%/fee.json}
   old_dir="${data_dir%/*}/batch=0000000000000000000"
   mv "$data_dir" "$old_dir"
+  rm "$old_dir/fee.json"
   if run_cutover "$fixture" "$fixture/artifact" fee-test >"$fixture/out" 2>"$fixture/err"; then
-    printf 'cutover uploaded a triplet outside the current attempt\n' >&2
+    printf 'cutover accepted an incomplete preexisting batch\n' >&2
     exit 1
   fi
   assert_failure_receipt "$fixture" 'canonical fee spool contains pending triplets before cutover'
-  [[ -f $old_dir/fee.json ]]
+  [[ -f $old_dir/fee.json.manifest.json ]]
+  [[ ! -e $fixture/root/etc/systemd/system/binance-fee-snapshot-spot.service ]]
   [[ -z $(find "$fixture/oss" -type f -name fee.json -print -quit) ]]
 }
 

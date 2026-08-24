@@ -511,12 +511,15 @@ discover_new_triplets() {
 }
 
 list_fee_triplets() {
-  local output=$1 data_file dir
+  local output=$1 entry name dir
   : >"$output"
   if [[ -d $FEE_SPOOL_ROOT/lake/raw ]]; then
-    find "$FEE_SPOOL_ROOT/lake/raw" -type f -name fee.json -print \
-      | while IFS= read -r data_file; do
-        dir=${data_file%/fee.json}
+    find "$FEE_SPOOL_ROOT/lake/raw" -mindepth 6 -maxdepth 6 -print \
+      | while IFS= read -r entry; do
+        name=${entry##*/}
+        [[ $name == .fee-staging.* ]] && continue
+        [[ -d $entry && ! -L $entry && $name =~ ^batch=[0-9]+$ ]] || exit 1
+        dir=$entry
         [[ $dir == "$FEE_SPOOL_ROOT/"* ]] || exit 1
         printf '%s\n' "${dir#"$FEE_SPOOL_ROOT/"}"
       done \
