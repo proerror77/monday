@@ -2751,6 +2751,7 @@ fn ensure_upload_staging_root(path: &Path) -> Result<()> {
 // Tails longer than this window are indistinguishable from mid-tape
 // corruption and refuse repair instead.
 const TORN_TAIL_REPAIR_WINDOW_BYTES: u64 = 1024 * 1024;
+const EMPTY_TAPE_QUARANTINE_DIR: &str = "quarantined-empty-tapes";
 
 fn complete_line_count(file: &File) -> Result<usize> {
     let mut reader = BufReader::new(file);
@@ -2790,6 +2791,63 @@ fn audit_torn_tail_repair(
     file.write_all(b"\n")?;
     file.sync_all()?;
     Ok(())
+}
+
+fn audit_empty_tape_quarantine(spool_dir: &Path, source: &Path, target: &Path) -> Result<()> {
+    let record = json!({
+        "quarantined_at": utc_now(),
+        "source": source.file_name().and_then(|name| name.to_str()),
+        "target": target.file_name().and_then(|name| name.to_str()),
+        "bytes": 0,
+        "reason": "tape is empty",
+    });
+    eprintln!("Polymarket empty tape quarantined: {record}");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(spool_dir.join("quarantined-empty-tapes.log"))?;
+    serde_json::to_writer(&mut file, &record)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn quarantine_empty_tape(source: &Path) -> Result<bool> {
+    let identity = regular_identity(source)?;
+    if identity.bytes != 0 {
+        return Ok(false);
+    }
+    let spool_dir = source
+        .parent()
+        .ok_or_else(|| anyhow!("source has no parent"))?;
+    let quarantine_dir = spool_dir.join(EMPTY_TAPE_QUARANTINE_DIR);
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o750)
+        .create(&quarantine_dir)?;
+    let name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("source file name is not UTF-8"))?;
+    let mut target = quarantine_dir.join(name);
+    while target.exists() {
+        target = quarantine_dir.join(format!("{name}.{}", random::<u64>()));
+    }
+    fs::rename(source, &target)?;
+    File::open(spool_dir)?.sync_all()?;
+    File::open(&quarantine_dir)?.sync_all()?;
+    audit_empty_tape_quarantine(spool_dir, source, &target)?;
+    Ok(true)
+}
+
+fn quarantine_empty_rotated_tapes(spool_dir: &Path) -> Result<usize> {
+    let mut quarantined = 0_usize;
+    for source in discover_rotated_tapes(spool_dir)? {
+        if quarantine_empty_tape(&source)? {
+            quarantined += 1;
+        }
+    }
+    Ok(quarantined)
 }
 
 /// Truncate the unterminated final record of a closed tape, returning the
@@ -2955,6 +3013,7 @@ where
 {
     config.validate()?;
     ensure_canonical_directory(&config.spool_dir)?;
+    quarantine_empty_rotated_tapes(&config.spool_dir)?;
     let mut status = read_status(&config.spool_dir.join("upload-status.json"))?;
     let archive = Arc::new(archive);
     let semaphore = Arc::new(Semaphore::new(config.max_concurrent_uploads));
@@ -3099,6 +3158,7 @@ where
 {
     config.validate()?;
     ensure_canonical_directory(&config.spool_dir)?;
+    quarantine_empty_rotated_tapes(&config.spool_dir)?;
     let mut status = read_status(&config.spool_dir.join("upload-status.json"))?;
     let mut failures = Vec::new();
     let mut uploaded_segments = 0_usize;
@@ -6243,6 +6303,56 @@ mod tests {
             status["failed_segments"][0]["source"],
             first.file_name().unwrap().to_str().unwrap()
         );
+    }
+
+    #[test]
+    fn quarantines_empty_closed_segments_before_uploading() {
+        let root = TestDir::new();
+        let empty = root.path().join("market-updates.20260715T010000.ndjson");
+        fs::write(&empty, b"").unwrap();
+        let source = write_tape(
+            root.path(),
+            "market-updates.20260715T020000.ndjson",
+            &sample_rows(),
+        );
+        let config = config(root.path());
+
+        let summary = upload_pending_with(&config, |path, _| {
+            assert_eq!(path, source);
+            fs::remove_file(path)?;
+            Ok(vec![UploadedSegment {
+                object: "oss://bucket/good".to_owned(),
+                canonical_complete: true,
+            }])
+        })
+        .unwrap();
+
+        assert_eq!(
+            summary,
+            UploadSummary {
+                uploaded_segments: 1,
+                canonical_uploaded_segments: 1,
+            }
+        );
+        assert!(!empty.exists(), "empty tape must leave the pending root");
+        let quarantined = fs::read_dir(root.path().join(EMPTY_TAPE_QUARANTINE_DIR))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(quarantined, vec!["market-updates.20260715T010000.ndjson"]);
+        let audit: Value = serde_json::from_str(
+            fs::read_to_string(root.path().join("quarantined-empty-tapes.log"))
+                .unwrap()
+                .trim(),
+        )
+        .unwrap();
+        assert_eq!(audit["source"], "market-updates.20260715T010000.ndjson");
+        assert_eq!(audit["reason"], "tape is empty");
+        let status: Value =
+            serde_json::from_slice(&fs::read(root.path().join("upload-status.json")).unwrap())
+                .unwrap();
+        assert_eq!(status["pending_segments"], 0);
+        assert_eq!(status["failure_count"], 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
