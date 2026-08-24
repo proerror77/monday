@@ -39,7 +39,7 @@ sha_file() {
 
 file_uid() {
   local path=$1
-  case $(uname -s) in
+  case $(/usr/bin/uname -s) in
     Darwin) /usr/bin/stat -f %u "$path" ;;
     *) /usr/bin/stat -c %u "$path" ;;
   esac
@@ -117,7 +117,7 @@ exit 1
 
   write_file "$bin_dir/stat" '#!/usr/bin/env bash
 set -euo pipefail
-if [[ ${1:-} == -c ]]; then
+if [[ $(/usr/bin/uname -s) == Darwin && ${1:-} == -c ]]; then
   format=$2
   shift 2
   [[ ${1:-} != -- ]] || shift
