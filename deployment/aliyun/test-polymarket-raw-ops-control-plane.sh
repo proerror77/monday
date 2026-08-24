@@ -1624,6 +1624,12 @@ if real_market_segment_preflight "$bad_mode_case/source" "$bad_mode_case/spool" 
   printf 'real-segment preflight accepted a linked segment with the wrong owner or mode\n' >&2
   exit 1
 fi
+jq -e '.status == "failed"
+  and (.failure_reason | contains("ownership or mode is untrusted"))' \
+  "$bad_mode_case/evidence/real-market-preflight.json" >/dev/null || {
+  printf 'real-segment preflight did not publish failed evidence for a linked segment with the wrong owner or mode\n' >&2
+  exit 1
+}
 unset LINKED_SOURCE_MODE_OWNER
 
 replaced_source_case="$preflight_root/replaced-source-case"
@@ -1640,6 +1646,12 @@ if real_market_segment_preflight "$replaced_source_case/source" "$replaced_sourc
   printf 'real-segment preflight accepted a production path replaced by a different inode after linking\n' >&2
   exit 1
 fi
+jq -e '.status == "failed"
+  and .failure_reason == "production segment path was replaced by a different inode after linking"' \
+  "$replaced_source_case/evidence/real-market-preflight.json" >/dev/null || {
+  printf 'real-segment preflight did not publish failed evidence when the production path was replaced after linking\n' >&2
+  exit 1
+}
 unset REPLACE_SOURCE_AFTER_LINK REPLACE_SOURCE_WITH
 
 # Counterexample (issue #586): a tick-level segment much larger than the scan

@@ -1089,6 +1089,7 @@ real_market_segment_preflight() {
   local terminal_status upload_summary
   local source_quote_records source_recorded_hours source_content_sha256 source_bytes
   local source_identity source_mtime source_path_identity source_mode_owner
+  local source_segment_hint candidate_exit_json
   local uploaded_content_sha256 uploaded_canonical
   local uploaded_uri uploaded_triplet uploaded_name preflight_tmp preflight_json
   local candidate_stdout_tmp candidate_stdout candidate_stderr_tmp candidate_stderr
@@ -1118,17 +1119,66 @@ real_market_segment_preflight() {
     printf 'real market preflight found no eligible closed market segment\n' >&2
     return 1
   fi
+  started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  preflight_json="$evidence/real-market-preflight.json"
+  preflight_tmp="$evidence/.real-market-preflight.json.tmp"
+  candidate_stdout="$evidence/real-market-uploader.json"
+  candidate_stderr="$evidence/real-market-uploader.stderr"
+  source_segment_hint=$(jq -cn --arg path "$source_path" --arg file "$source_name" \
+    '{path:$path,file:$file}')
+  write_preflight_failure() {
+    local reason=$1
+    local candidate_exit_value=${2:-null}
+    local segment_json=${3:-$source_segment_hint}
+    completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    if [[ $candidate_exit_value == null ]]; then
+      candidate_exit_json=null
+    else
+      candidate_exit_json=$candidate_exit_value
+    fi
+    jq -n --arg started_at "$started_at" --arg completed_at "$completed_at" \
+      --arg candidate_sha256 "$candidate_sha" \
+      --arg deployment_source_revision "$source_revision" \
+      --arg deployment_bundle_sha256 "$deployment_bundle_sha" \
+      --arg release_manifest_sha256 "$release_manifest_sha" \
+      --arg control_archive_sha256 "$control_archive_sha" \
+      --arg oss_config_sha256 "$oss_config_sha" \
+      --arg dataset "${preflight_dataset:-}" \
+      --arg failure_reason "$reason" \
+      --argjson source_segment "$segment_json" \
+      --argjson candidate_exit_code "$candidate_exit_json" \
+      '{schema:"monday.polymarket_real_market_preflight.v2",status:"failed",
+        started_at:$started_at,completed_at:$completed_at,
+        candidate_sha256:$candidate_sha256,
+        deployment_source_revision:$deployment_source_revision,
+        deployment_bundle_sha256:$deployment_bundle_sha256,
+        release_manifest_sha256:$release_manifest_sha256,
+        control_archive_sha256:$control_archive_sha256,
+        oss_config_sha256:$oss_config_sha256,
+        dataset:(if $dataset == "" then null else $dataset end),
+        source_segment:$source_segment,
+        failure_reason:$failure_reason,
+        candidate_exit_code:$candidate_exit_code}' >"$preflight_tmp"
+    mv "$preflight_tmp" "$preflight_json"
+    sync "$preflight_json"
+  }
   source_file="$spool/$source_name"
   source_tmp="$spool/.${source_name}.preflight.$$"
   [[ ! -e $source_file && ! -L $source_file \
-    && ! -e $source_tmp && ! -L $source_tmp ]] || return 1
+    && ! -e $source_tmp && ! -L $source_tmp ]] || {
+    write_preflight_failure 'shadow spool already contains the preflight target path'
+    return 1
+  }
   for _ in 1 2 3; do
     rm -f -- "$source_tmp"
     # Bind the production segment onto the shadow spool before hashing it. Once
     # the extra link exists, the production uploader may unlink the original
     # path and the Gate still retains the exact inode for upload/readback.
     run_before_deadline "$preflight_deadline" ln "$source_path" "$source_tmp" \
-      || return 1
+      || {
+        write_preflight_failure 'could not hardlink the production segment into the shadow spool'
+        return 1
+      }
     before=$(run_before_deadline "$preflight_deadline" \
       stat -c '%d:%i:%s:%Y:%Z' "$source_tmp") || return 1
     source_content_sha256=$(run_before_deadline "$preflight_deadline" \
@@ -1140,19 +1190,30 @@ real_market_segment_preflight() {
       break
     fi
   done
-  [[ $stable == true ]] || return 1
+  [[ $stable == true ]] || {
+    write_preflight_failure 'linked production segment did not remain inode-stable while hashing'
+    return 1
+  }
   source_mode_owner=$(run_before_deadline "$preflight_deadline" \
     stat -c '%U:%G:%a' "$source_tmp") || return 1
-  [[ $source_mode_owner == hftcollector:hftcollector:640 ]] || return 1
+  [[ $source_mode_owner == hftcollector:hftcollector:640 ]] || {
+    write_preflight_failure "linked production segment ownership or mode is untrusted ($source_mode_owner)"
+    return 1
+  }
   if [[ -e $source_path || -L $source_path ]]; then
-    [[ -f $source_path && ! -L $source_path ]] || return 1
+    [[ -f $source_path && ! -L $source_path ]] || {
+      write_preflight_failure 'production segment path became indirect or non-regular after linking'
+      return 1
+    }
     source_path_identity=$(run_before_deadline "$preflight_deadline" \
       stat -c '%d:%i:%s:%Y:%Z' "$source_path") || return 1
-    [[ $source_path_identity == "$after" ]] || return 1
+    [[ $source_path_identity == "$after" ]] || {
+      write_preflight_failure 'production segment path was replaced by a different inode after linking'
+      return 1
+    }
   fi
   preflight_dataset="crypto_expiry_preflight_${candidate_sha:0:12}_${run_id,,}"
   [[ $preflight_dataset =~ ^[a-z0-9_-]+$ ]] || return 1
-  started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   # Bounded scan (issue #586): count quotes only in a bounded head window so the
   # preflight cost does not scale with tick volume. The input-side head caps the
   # scanned records at PREFLIGHT_SCAN_WINDOW_RECORDS; jq reads the full window
@@ -1208,8 +1269,6 @@ real_market_segment_preflight() {
   fi
   mv "$candidate_stdout_tmp" "$candidate_stdout"
   mv "$candidate_stderr_tmp" "$candidate_stderr"
-  preflight_json="$evidence/real-market-preflight.json"
-  preflight_tmp="$evidence/.real-market-preflight.json.tmp"
   candidate_summary=
   terminal_status=
   upload_summary=
