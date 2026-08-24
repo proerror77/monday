@@ -32,6 +32,12 @@ readonly WATCHDOG_SERVICE=polymarket-market-tape-upload-watchdog.service
 readonly WATCHDOG_TIMER=polymarket-market-tape-upload-watchdog.timer
 readonly WATCHDOG_SERVICE_PATH=/etc/systemd/system/$WATCHDOG_SERVICE
 readonly WATCHDOG_TIMER_PATH=/etc/systemd/system/$WATCHDOG_TIMER
+
+WATCHDOG_PROBE_INVOCATION_ID=
+WATCHDOG_PROBE_ACTIVE_STATE=
+WATCHDOG_PROBE_RESULT=
+WATCHDOG_PROBE_STATUS=
+WATCHDOG_PROBE_JOURNAL_SHA256=
 readonly HEALTH=/data/monday/spool/polymarket-reference/health.json
 readonly LEGACY_STATE=/data/monday/spool/polymarket-reference/collector-state.json
 readonly LEGACY_COLLECTOR=/opt/monday/bin/polymarket_reference_collector.py
@@ -820,6 +826,50 @@ verify_oneshot_success() {
   result=$(systemctl show --property=Result --value "$unit")
   status=$(systemctl show --property=ExecMainStatus --value "$unit")
   [[ $result == success && $status == 0 ]]
+}
+
+verify_watchdog_probe() {
+  local journal_file=$1 previous_invocation invocation active_state result status
+  local journal_tmp
+  [[ ! -e $WATCHDOG_SUPPRESS_FILE && ! -L $WATCHDOG_SUPPRESS_FILE ]] || return 1
+  previous_invocation=$(systemctl show --property=InvocationID --value "$WATCHDOG_SERVICE") \
+    || return 1
+  reset_failed_unit_if_needed "$WATCHDOG_SERVICE" || return 1
+  systemctl start "$WATCHDOG_SERVICE" || return 1
+  for _ in $(seq 1 10); do
+    systemctl is-failed --quiet "$WATCHDOG_SERVICE" && return 1
+    invocation=$(systemctl show --property=InvocationID --value "$WATCHDOG_SERVICE") \
+      || return 1
+    if [[ $invocation =~ ^[a-f0-9]{32}$ && $invocation != "$previous_invocation" ]]; then
+      active_state=$(systemctl show --property=ActiveState --value "$WATCHDOG_SERVICE") \
+        || return 1
+      result=$(systemctl show --property=Result --value "$WATCHDOG_SERVICE") || return 1
+      status=$(systemctl show --property=ExecMainStatus --value "$WATCHDOG_SERVICE") \
+        || return 1
+      if [[ $active_state == inactive && $result == success && $status == 0 ]]; then
+        journal_tmp="${journal_file}.tmp.$$"
+        journalctl --sync || return 1
+        journalctl --unit "$WATCHDOG_SERVICE" \
+          _SYSTEMD_INVOCATION_ID="$invocation" \
+          --output=json --no-pager >"$journal_tmp" || return 1
+        jq -se --arg invocation "$invocation" '
+          length > 0
+          and all(.[]; ._SYSTEMD_INVOCATION_ID == $invocation)
+          and any(.[]; (.MESSAGE? // "") | contains("market_pending_rotated_tapes="))
+          and all(.[]; ((.MESSAGE? // "") | contains("suppressed:")) | not)
+        ' "$journal_tmp" >/dev/null || return 1
+        mv -Tf "$journal_tmp" "$journal_file"
+        WATCHDOG_PROBE_INVOCATION_ID=$invocation
+        WATCHDOG_PROBE_ACTIVE_STATE=$active_state
+        WATCHDOG_PROBE_RESULT=$result
+        WATCHDOG_PROBE_STATUS=$status
+        WATCHDOG_PROBE_JOURNAL_SHA256=$(sha256sum "$journal_file" | awk '{print $1}')
+        return 0
+      fi
+    fi
+    sleep 1
+  done
+  return 1
 }
 
 verify_deferred_upload() {
@@ -2090,6 +2140,12 @@ on_exit() {
   if [[ $cutover_succeeded == false && $transition_started == true ]]; then
     printf 'cutover failed; restoring snapshotted legacy runtime\n' >&2
     trap - EXIT
+    if [[ ${watchdog_suppressed:-false} == true ]]; then
+      write_watchdog_suppress "${watchdog_suppress_owner:-}" || {
+        printf 'refusing automatic rollback because watchdog suppression could not be restored\n' >&2
+        exit 1
+      }
+    fi
     prepare_rollback_evidence "$evidence_dir" || {
       printf 'refusing automatic rollback because success evidence could not be invalidated\n' >&2
       exit 1
@@ -2296,13 +2352,11 @@ unit_active "$REFERENCE_UPLOAD_TIMER" \
   || die 'Rust reference upload timer is not active'
 unit_active "$MARKET_UPLOAD_TIMER" \
   || die 'Rust market upload timer is not active'
-systemctl restart "$WATCHDOG_TIMER"
-reset_failed_unit_if_needed "$WATCHDOG_SERVICE"
-systemctl start "$WATCHDOG_SERVICE"
-verify_oneshot_success "$WATCHDOG_SERVICE" \
-  || die 'watchdog did not complete its governed post-install probe'
-verify_watchdog_runtime \
-  || die 'watchdog timer is not enabled, active, and finitely scheduled'
+unit_enabled "$WATCHDOG_TIMER" \
+  || die 'watchdog timer is not enabled before the unsuppressed probe'
+if unit_active "$WATCHDOG_TIMER"; then
+  die 'watchdog timer became active before the unsuppressed probe'
+fi
 verify_rust_runtime "$candidate_binary" "$started_epoch" "$rust_pid" "$rust_invocation_id" \
   || die 'Rust collector identity changed while enabling upload timers'
 verify_upload_units "$pinned_upload_env" \
@@ -2327,6 +2381,16 @@ main_pid=$(systemctl show --property=MainPID --value "$COLLECTOR_UNIT")
   || die 'Rust reference uploader failed during deferred backlog startup'
 verify_rust_runtime "$candidate_binary" "$started_epoch" "$rust_pid" "$rust_invocation_id" \
   || die 'Rust collector identity or health changed before evidence publication'
+remove_watchdog_suppress "$watchdog_suppress_owner"
+[[ ! -e $WATCHDOG_SUPPRESS_FILE && ! -L $WATCHDOG_SUPPRESS_FILE ]] \
+  || die 'watchdog suppression persisted after governed cutover handoff'
+watchdog_probe_journal="$evidence_dir/watchdog-probe.journal"
+verify_watchdog_probe "$watchdog_probe_journal" \
+  || die 'watchdog did not complete an unsuppressed governed post-install probe'
+sync "$watchdog_probe_journal"
+systemctl restart "$WATCHDOG_TIMER"
+verify_watchdog_runtime \
+  || die 'watchdog identity or schedule changed after the unsuppressed probe'
 health_file="$evidence_dir/post-start-health.json"
 install -m 0640 "$HEALTH" "$health_file"
 sync "$health_file"
@@ -2355,6 +2419,11 @@ jq -n \
   --arg completed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --arg health_sha256 "$health_sha" \
   --arg journal_sha256 "$journal_sha" \
+  --arg watchdog_probe_invocation_id "$WATCHDOG_PROBE_INVOCATION_ID" \
+  --arg watchdog_probe_active_state "$WATCHDOG_PROBE_ACTIVE_STATE" \
+  --arg watchdog_probe_result "$WATCHDOG_PROBE_RESULT" \
+  --argjson watchdog_probe_exec_main_status "$WATCHDOG_PROBE_STATUS" \
+  --arg watchdog_probe_journal_sha256 "$WATCHDOG_PROBE_JOURNAL_SHA256" \
   --arg rollback_manifest_sha256 "$rollback_sha" \
   --arg rust_invocation_id "$rust_invocation_id" \
   --argjson recovery "$recovery_json" \
@@ -2375,6 +2444,11 @@ jq -n \
     collector:{main_pid:$main_pid,restarts:0,invocation_id:$rust_invocation_id,
       health_sha256:$health_sha256,
       journal_sha256:$journal_sha256},
+    watchdog_probe:{invocation_id:$watchdog_probe_invocation_id,
+      active_state:$watchdog_probe_active_state,
+      result:$watchdog_probe_result,
+      exec_main_status:$watchdog_probe_exec_main_status,
+      journal_sha256:$watchdog_probe_journal_sha256},
     rollback_manifest_sha256:$rollback_manifest_sha256,
     explicit_restart:true,post_start_identity_verified:true,
     upload_services_verified:true,
@@ -2433,8 +2507,6 @@ secure_root_chain "$evidence_dir" \
 mv -Tf "$success_marker_tmp" "$success_marker"
 sync "$success_marker"
 sync -f "$evidence_dir"
-remove_watchdog_suppress "$watchdog_suppress_owner"
-watchdog_suppressed=false
 
 cutover_succeeded=true
 trap - EXIT
