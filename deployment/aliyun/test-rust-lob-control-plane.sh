@@ -202,6 +202,10 @@ fi
 grep -Fq 'ensure_startup_spool_ready(&spool_dir)?' <<<"$startup_body"
 grep -Fxq 'ExecStartPre=+/opt/monday/bin/monday-rust-lob-recovery-queue isolate %i' \
   "$SCRIPT_DIR/binance-lob-archiver-production@.service"
+grep -Fxq 'TimeoutStartSec=120' \
+  "$SCRIPT_DIR/binance-lob-archiver-production@.service"
+grep -Fq "grep -Fxq 'StartLimitIntervalSec=7200'" "$CUTOVER"
+grep -Fq "grep -Fxq 'TimeoutStartSec=120'" "$CUTOVER"
 grep -Fxq 'ExecStart=/opt/monday/bin/monday-rust-lob-recovery-queue drain %i' \
   "$SCRIPT_DIR/binance-lob-archiver-recovery@.service"
 grep -Fxq 'Unit=binance-lob-archiver-recovery@%i.service' \

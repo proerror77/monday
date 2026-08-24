@@ -238,7 +238,8 @@ write_job_receipt() {
   env_tmp="$env_copy.tmp.$$"
   install -m 0640 -o root -g root -- "$RELEASE_ENV_FILE" "$env_tmp"
   mv -Tf "$env_tmp" "$env_copy"
-  sync -f "$env_copy"
+  # A path operand uses fsync(2); -f uses syncfs(2) and can stall on all of /data.
+  sync "$env_copy"
   tmp="$CANONICAL_SPOOL/job.json.tmp.$$"
   jq -n \
     --arg schema monday.rust_lob_recovery_queue.v1 \
@@ -259,8 +260,8 @@ write_job_receipt() {
       release_env:$release_env,recovery_unit:$recovery_unit}' >"$tmp"
   chmod 0640 "$tmp"
   mv -Tf "$tmp" "$CANONICAL_SPOOL/job.json"
-  sync -f "$CANONICAL_SPOOL/job.json"
-  sync -f "$CANONICAL_SPOOL"
+  sync "$CANONICAL_SPOOL/job.json"
+  sync "$CANONICAL_SPOOL"
 }
 
 job_dir_id() {
@@ -309,7 +310,7 @@ recover_missing_canonical_after_partial_isolate() {
   (( count == 1 )) \
     || fail "canonical spool is missing without exactly one valid queued recovery job: $CANONICAL_SPOOL"
   install -d -m 0750 -o "$hft_uid" -g "$hft_gid" -- "$CANONICAL_SPOOL"
-  sync -f "$CANONICAL_ROOT"
+  sync "$CANONICAL_ROOT"
   systemctl start --no-block "$RECOVERY_SERVICE@$MARKET.service" >/dev/null 2>&1 || true
   return 0
 }
@@ -339,17 +340,17 @@ isolate_market() {
   queue_unit="$RECOVERY_SERVICE@$MARKET.service"
   write_job_receipt "$job_id" "$queue_unit"
   mv -T -- "$CANONICAL_SPOOL" "$ready_dir"
-  sync -f "$CANONICAL_ROOT"
-  sync -f "$QUEUE_MARKET_ROOT"
+  sync "$CANONICAL_ROOT"
+  sync "$QUEUE_MARKET_ROOT"
   install -d -m 0750 -o "$hft_uid" -g "$hft_gid" -- "$CANONICAL_SPOOL"
   prior_upload_status="$ready_dir/upload-status.json"
   if [[ -f $prior_upload_status && ! -L $prior_upload_status ]]; then
     install -m 0640 -o "$hft_uid" -g "$hft_gid" -- \
       "$prior_upload_status" "$CANONICAL_SPOOL/upload-status.json"
-    sync -f "$CANONICAL_SPOOL/upload-status.json"
+    sync "$CANONICAL_SPOOL/upload-status.json"
   fi
-  sync -f "$CANONICAL_SPOOL"
-  sync -f "$CANONICAL_ROOT"
+  sync "$CANONICAL_SPOOL"
+  sync "$CANONICAL_ROOT"
   systemctl start --no-block "$queue_unit" >/dev/null 2>&1 || true
 }
 
@@ -391,8 +392,8 @@ write_result() {
       step:$step,message:$message}' >"$path.tmp"
   chmod 0640 "$path.tmp"
   mv -Tf "$path.tmp" "$path"
-  sync -f "$path"
-  sync -f "${path%/*}"
+  sync "$path"
+  sync "${path%/*}"
 }
 
 load_job() {
@@ -445,8 +446,8 @@ finalize_passed_running() {
   [[ ! -e $evidence_root/spool.done && ! -L $evidence_root/spool.done ]] \
     || fail "refusing to reuse evidence spool path: $evidence_root/spool.done"
   mv -T -- "$running_dir" "$evidence_root/spool.done"
-  sync -f "$QUEUE_MARKET_ROOT"
-  sync -f "$evidence_root"
+  sync "$QUEUE_MARKET_ROOT"
+  sync "$evidence_root"
 }
 
 check_upload_readback() {
@@ -504,8 +505,8 @@ run_drain_job() {
   [[ ! -e $evidence_root/spool.done && ! -L $evidence_root/spool.done ]] \
     || fail "refusing to reuse evidence spool path: $evidence_root/spool.done"
   mv -T -- "$running_dir" "$evidence_root/spool.done"
-  sync -f "$QUEUE_MARKET_ROOT"
-  sync -f "$evidence_root"
+  sync "$QUEUE_MARKET_ROOT"
+  sync "$evidence_root"
 }
 
 mark_failed() {
@@ -522,7 +523,7 @@ mark_failed() {
   write_result "$result_path" failed "$step" "$message"
   if [[ $running_dir != "$failed_dir" ]]; then
     mv -T -- "$running_dir" "$failed_dir"
-    sync -f "$QUEUE_MARKET_ROOT"
+    sync "$QUEUE_MARKET_ROOT"
   fi
 }
 
@@ -568,7 +569,7 @@ drain_market() {
   [[ -n $ready_dir ]] || exit 0
   running_dir="${ready_dir%.ready}.running"
   mv -T -- "$ready_dir" "$running_dir"
-  sync -f "$QUEUE_MARKET_ROOT"
+  sync "$QUEUE_MARKET_ROOT"
   CURRENT_RUNNING_DIR=$running_dir
   CURRENT_STEP=recover-upload
   if ( run_drain_job "$running_dir" ); then

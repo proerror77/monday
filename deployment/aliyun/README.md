@@ -201,6 +201,9 @@ The persistent-service check deliberately does not warn on `NRestarts > 0`:
 both Binance archivers restart every six hours by design
 (`RuntimeMaxSec=21600`). Crash loops are detected through `Result != success`
 or an `NRestarts` delta greater than one between consecutive five-minute polls.
+Production startup is bounded at 120 seconds. Five failed starts inside the
+two-hour `StartLimitIntervalSec` stop automatic retries instead of allowing a
+slow `ExecStartPre` to roll out of the rate-limit window and loop indefinitely.
 
 Test/override environment for fixtures and containers:
 `MONDAY_COLLECTOR_SPOOL_ROOT` (default `/data/monday/spool`) and
@@ -1150,8 +1153,8 @@ delivered. The two production instances are each bounded at `CPUQuota=80%` and
 `MemoryMax=2560M`; the globally serialized recovery worker is bounded at
 `CPUQuota=25%` and `MemoryMax=768M`, keeping configured collector work below the
 2-vCPU/8-GiB host boundary without increasing the ECS size. A persistent
-pre-start failure is capped at five attempts per five minutes instead of
-restarting every five seconds forever.
+pre-start failure is bounded to 120 seconds per start and capped at five
+attempts per two hours instead of restarting forever.
 
 A new host is accepted
 only when the canonical spool contains no segment artifact. The script then

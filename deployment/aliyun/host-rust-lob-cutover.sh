@@ -304,10 +304,12 @@ validate_deployment() {
       || fail 'candidate production unit has the wrong CPU quota'
     grep -Fxq 'MemoryMax=2560M' "$directory/binance-lob-archiver-production@.service" \
       || fail 'candidate production unit has the wrong memory limit'
-    grep -Fxq 'StartLimitIntervalSec=300' "$directory/binance-lob-archiver-production@.service" \
+    grep -Fxq 'StartLimitIntervalSec=7200' "$directory/binance-lob-archiver-production@.service" \
       || fail 'candidate production unit has the wrong restart interval'
     grep -Fxq 'StartLimitBurst=5' "$directory/binance-lob-archiver-production@.service" \
       || fail 'candidate production unit has no bounded restart policy'
+    grep -Fxq 'TimeoutStartSec=120' "$directory/binance-lob-archiver-production@.service" \
+      || fail 'candidate production unit has the wrong startup timeout'
     grep -Fxq 'AssertPathIsMountPoint=/data' \
       "$directory/binance-lob-archiver-upload@.service" \
       || fail 'candidate upload unit does not assert the /data mount'

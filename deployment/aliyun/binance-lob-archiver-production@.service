@@ -4,7 +4,7 @@ After=network-online.target
 Wants=network-online.target
 RequiresMountsFor=/data
 AssertPathIsMountPoint=/data
-StartLimitIntervalSec=300
+StartLimitIntervalSec=7200
 StartLimitBurst=5
 
 [Service]
@@ -20,6 +20,7 @@ ExecStart=/opt/monday/bin/binance-lob-archiver
 Restart=always
 RestartSec=5
 RuntimeMaxSec=21600
+TimeoutStartSec=120
 TimeoutStopSec=600
 NoNewPrivileges=true
 PrivateTmp=true
