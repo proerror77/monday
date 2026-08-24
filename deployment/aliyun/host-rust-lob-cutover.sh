@@ -300,6 +300,8 @@ validate_deployment() {
     grep -Fxq 'ExecStartPre=+/opt/monday/bin/monday-rust-lob-recovery-queue isolate %i' \
       "$directory/binance-lob-archiver-production@.service" \
       || fail 'candidate production unit does not isolate interrupted spools'
+    grep -Fxq 'KillMode=mixed' "$directory/binance-lob-archiver-production@.service" \
+      || fail 'candidate production unit must preserve graceful finalization on stop'
     grep -Fxq 'CPUQuota=80%' "$directory/binance-lob-archiver-production@.service" \
       || fail 'candidate production unit has the wrong CPU quota'
     grep -Fxq 'MemoryMax=2560M' "$directory/binance-lob-archiver-production@.service" \
