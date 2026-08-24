@@ -172,7 +172,7 @@ the `monitor-collector-host` workflow issue and blocks `ok:true`.
 | 4. Upload failures | `last_error_at`/`last_error` present, or a `failure_count` increase since the previous poll (prior counts live under `/var/lib/monday-collector-health`) |
 | 5. `/data` disk | free <= 15% (used >= 85%) via `df -Pk /data` — the 2026-08-17/18 incidents reached 100% twice, so the critical watermark pages a human instead of only warning |
 | 6. Polymarket upload timers | `polymarket-market-tape-upload.timer` or `polymarket-reference-upload.timer` not active (waiting) while its collector service (`polymarket-market-tape.service` / `polymarket-reference-collector.service`) is active — a stopped timer with a running collector silently strands rotated tapes until the disk fills |
-| 7. Polymarket upload watchdog | `polymarket-market-tape-upload-watchdog.timer` is not `waiting`, or has no next elapse — systemd can otherwise report an enabled, active but elapsed timer that will never run again |
+| 7. Polymarket upload watchdog | `polymarket-market-tape-upload-watchdog.timer` is neither `waiting` nor briefly `running`, or a waiting timer has no finite monotonic next elapse — systemd can otherwise report an enabled, active but elapsed timer that will never run again |
 
 The raw-ops Gate template has no `[Install]` section, so `static` is the
 healthy installed state only when no Gate instance is active, the control lock

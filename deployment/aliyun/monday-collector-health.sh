@@ -276,7 +276,7 @@ unit_substate() {
   systemctl show -p SubState --value "$1" 2>/dev/null || true
 }
 unit_timer_next() {
-  systemctl show -p NextElapseUSecRealtime --value "$1" 2>/dev/null || true
+  systemctl show -p NextElapseUSecMonotonic --value "$1" 2>/dev/null || true
 }
 
 check_mount() {
@@ -388,13 +388,20 @@ check_watchdog_timer() {
   check_timer "$unit" "$label"
   substate=$(unit_substate "$unit")
   next_elapse=$(unit_timer_next "$unit")
-  [ "$substate" = "waiting" ] \
-    || record_breach "$label: timer not waiting (SubState='$substate')"
-  [ -n "$next_elapse" ] && [ "$next_elapse" != "n/a" ] \
-    || record_breach "$label: timer has no next elapse"
+  case "$substate" in
+    waiting)
+      [ -n "$next_elapse" ] && [ "$next_elapse" != "n/a" ] \
+        && [ "$next_elapse" != "infinity" ] \
+        || record_breach "$label: waiting timer has no finite next elapse"
+      ;;
+    running) ;;
+    *) record_breach "$label: timer not waiting or running (SubState='$substate')" ;;
+  esac
   obj=$(jq -n --argjson base "$units_json" --arg k "$unit" \
     --arg s "$substate" --arg n "$next_elapse" \
-    '$base | .[$k] += {substate: $s, scheduled: ($n != "" and $n != "n/a"), next_elapse: $n}')
+    '$base | .[$k] += {substate: $s,
+      scheduled: ($n != "" and $n != "n/a" and $n != "infinity"),
+      next_elapse_monotonic: $n}')
   units_json=$obj
 }
 
