@@ -37,6 +37,15 @@ sha_file() {
   sha256sum "$1" | awk '{print $1}'
 }
 
+file_uid() {
+  local path=$1 uid
+  if uid=$(/usr/bin/stat -f %u "$path" 2>/dev/null); then
+    printf '%s\n' "$uid"
+  else
+    /usr/bin/stat -c %u "$path"
+  fi
+}
+
 write_file() {
   local path=$1
   shift
@@ -576,7 +585,7 @@ run_cutover() {
   shift
   PATH="$fixture/bin:$PATH" \
   MONDAY_ROOT_PREFIX="$fixture/root" \
-  MONDAY_EXPECTED_ROOT_UID="$(/usr/bin/stat -f %u "$fixture/root/etc/monday/credentials/binance-account.json")" \
+  MONDAY_EXPECTED_ROOT_UID="$(file_uid "$fixture/root/etc/monday/credentials/binance-account.json")" \
   FAKE_OSS_ROOT="$fixture/oss" \
   "$CUTOVER" "$@"
 }
@@ -654,7 +663,7 @@ test_preflight_failure_preserves_reason() {
   create_artifact_bundle "$fixture/artifact" 2929292929292929292929292929292929292929
   if PATH="$fixture/bin:$PATH" \
     MONDAY_ROOT_PREFIX="$fixture/root" \
-    MONDAY_EXPECTED_ROOT_UID="$(/usr/bin/stat -f %u "$fixture/root/etc/monday/credentials/binance-account.json")" \
+    MONDAY_EXPECTED_ROOT_UID="$(file_uid "$fixture/root/etc/monday/credentials/binance-account.json")" \
     FAKE_OSS_ROOT="$fixture/oss" \
     MONDAY_TEST_MOUNTPOINT_FAIL=1 \
     "$CUTOVER" "$fixture/artifact" fee-test >"$fixture/out" 2>"$fixture/err"; then
@@ -689,7 +698,7 @@ test_artifact_swap_after_freeze_does_not_change_release() {
   release_sha=$(awk 'NR == 1 {print $1}' "$fixture/artifact/binance-fee-release.json.sha256")
   if ! PATH="$fixture/bin:$PATH" \
     MONDAY_ROOT_PREFIX="$fixture/root" \
-    MONDAY_EXPECTED_ROOT_UID="$(/usr/bin/stat -f %u "$fixture/root/etc/monday/credentials/binance-account.json")" \
+    MONDAY_EXPECTED_ROOT_UID="$(file_uid "$fixture/root/etc/monday/credentials/binance-account.json")" \
     FAKE_OSS_ROOT="$fixture/oss" \
     MONDAY_TEST_MUTATE_ORIGINAL_ARTIFACT="$fixture/artifact" \
     "$CUTOVER" "$fixture/artifact" fee-test >"$fixture/out" 2>"$fixture/err"; then
@@ -710,7 +719,7 @@ test_market_failure_rolls_back_absent() {
   create_artifact_bundle "$fixture/artifact" 3333333333333333333333333333333333333333
   if PATH="$fixture/bin:$PATH" \
     MONDAY_ROOT_PREFIX="$fixture/root" \
-    MONDAY_EXPECTED_ROOT_UID="$(/usr/bin/stat -f %u "$fixture/root/etc/monday/credentials/binance-account.json")" \
+    MONDAY_EXPECTED_ROOT_UID="$(file_uid "$fixture/root/etc/monday/credentials/binance-account.json")" \
     FAKE_OSS_ROOT="$fixture/oss" \
     MONDAY_TEST_FAIL_UNIT=binance-fee-snapshot-usdm.service \
     "$CUTOVER" "$fixture/artifact" fee-test >"$fixture/out" 2>"$fixture/err"; then
@@ -734,7 +743,7 @@ test_readback_failure_rolls_back_absent() {
   create_artifact_bundle "$fixture/artifact" 4444444444444444444444444444444444444444
   if PATH="$fixture/bin:$PATH" \
     MONDAY_ROOT_PREFIX="$fixture/root" \
-    MONDAY_EXPECTED_ROOT_UID="$(/usr/bin/stat -f %u "$fixture/root/etc/monday/credentials/binance-account.json")" \
+    MONDAY_EXPECTED_ROOT_UID="$(file_uid "$fixture/root/etc/monday/credentials/binance-account.json")" \
     FAKE_OSS_ROOT="$fixture/oss" \
     MONDAY_TEST_CORRUPT_URI_FRAGMENT='fee.json._SUCCESS' \
     "$CUTOVER" "$fixture/artifact" fee-test >"$fixture/out" 2>"$fixture/err"; then
@@ -755,7 +764,7 @@ test_market_failure_restores_partial_contained() {
   old_uploader=$(readlink "$fixture/root/opt/monday/bin/binance-fee-snapshot-upload")
   if PATH="$fixture/bin:$PATH" \
     MONDAY_ROOT_PREFIX="$fixture/root" \
-    MONDAY_EXPECTED_ROOT_UID="$(/usr/bin/stat -f %u "$fixture/root/etc/monday/credentials/binance-account.json")" \
+    MONDAY_EXPECTED_ROOT_UID="$(file_uid "$fixture/root/etc/monday/credentials/binance-account.json")" \
     FAKE_OSS_ROOT="$fixture/oss" \
     MONDAY_TEST_FAIL_UNIT=binance-fee-snapshot-usdm.service \
     "$CUTOVER" "$fixture/artifact" fee-test >"$fixture/out" 2>"$fixture/err"; then
