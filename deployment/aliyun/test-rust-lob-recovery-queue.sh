@@ -166,6 +166,19 @@ id() {
 }
 
 systemctl() {
+  if [[ ${1:-} == start ]]; then
+    if { : >&8; } 2>/dev/null; then
+      printf 'fd8-open\n' >>"$MOCK_SEQUENCE_LOG"
+    else
+      printf 'fd8-closed\n' >>"$MOCK_SEQUENCE_LOG"
+    fi
+    if { : >&9; } 2>/dev/null; then
+      printf 'fd9-open\n' >>"$MOCK_SEQUENCE_LOG"
+    else
+      printf 'fd9-closed\n' >>"$MOCK_SEQUENCE_LOG"
+    fi
+  fi
+  printf 'systemctl %s\n' "$*" >>"$MOCK_SEQUENCE_LOG"
   printf '%s\n' "$*" >>"$MOCK_SYSTEMCTL_LOG"
   if [[ ${1:-} == start ]]; then
     return 0
@@ -183,6 +196,7 @@ runuser() {
 }
 
 flock() {
+  printf 'flock %s\n' "$*" >>"$MOCK_SEQUENCE_LOG"
   if [[ ${1:-} == -n && ${2:-} == 7 && ${MOCK_DRAIN_LOCK_BUSY:-0} == 1 ]]; then
     return 1
   fi
@@ -198,6 +212,7 @@ sync() {
     fi
   done
   printf '%s\n' "$*" >>"$MOCK_SYNC_LOG"
+  printf 'sync %s\n' "$*" >>"$MOCK_SEQUENCE_LOG"
   return 0
 }
 
@@ -208,6 +223,7 @@ setup_fixture() {
   MOCK_RUNUSER_LOG="$fixture/runuser.log"
   MOCK_CALLS_LOG="$fixture/binary.log"
   MOCK_SYNC_LOG="$fixture/sync.log"
+  MOCK_SEQUENCE_LOG="$fixture/sequence.log"
   configure_paths "$fixture"
   mkdir -p \
     "$BIN_DIR" "$RELEASE_ROOT" "$CONFIG_ROOT" "$LOCK_ROOT" \
@@ -493,6 +509,52 @@ test_missing_canonical_recovers_only_with_valid_queue_job() {
   assert worker-restarted grep -Fq 'start --no-block binance-lob-archiver-recovery@spot.service' "$fixture/systemctl.log"
 }
 
+test_recovery_start_follows_durable_lock_handoff() {
+  local fixture=$tmp_dir/lock-handoff sequence
+  setup_fixture "$fixture"
+  sequence="$fixture/sequence.log"
+  printf 'part\n' >"$fixture/data/monday/spool/binance-lob/spot/part-001.jsonl.part"
+  run_action "$fixture" isolate spot
+  awk -v canonical="$fixture/data/monday/spool/binance-lob/spot" \
+    -v canonical_root="$fixture/data/monday/spool/binance-lob" \
+    -v queue_root="$fixture/data/monday/spool/binance-lob-recovery/spot" \
+    -v start='systemctl start --no-block binance-lob-archiver-recovery@spot.service' '
+      $0 == "sync " canonical { canonical_sync = NR }
+      $0 == "sync " canonical_root { canonical_root_sync = NR }
+      $0 == "sync " queue_root { queue_sync = NR }
+      $0 == "flock -u 8" { unlock8 = NR }
+      $0 == "flock -u 9" { unlock9 = NR }
+      $0 == "fd8-closed" { closed8 = NR }
+      $0 == "fd9-closed" { closed9 = NR }
+      $0 == start { started = NR }
+      END {
+        exit !(canonical_sync && canonical_root_sync && queue_sync && unlock8 && unlock9 &&
+          closed8 && closed9 && started && canonical_sync < unlock8 &&
+          canonical_root_sync < unlock8 && queue_sync < unlock8 && unlock9 == unlock8 + 1 &&
+          closed8 == unlock9 + 1 && closed9 == closed8 + 1 && started == closed9 + 1)
+      }
+    ' "$sequence"
+
+  rm -rf "$fixture/data/monday/spool/binance-lob/spot"
+  : >"$sequence"
+  : >"$fixture/sync.log"
+  run_action "$fixture" isolate spot
+  awk -v canonical_root="$fixture/data/monday/spool/binance-lob" \
+    -v start='systemctl start --no-block binance-lob-archiver-recovery@spot.service' '
+      $0 == "sync " canonical_root { durable = NR }
+      $0 == "flock -u 8" { unlock8 = NR }
+      $0 == "flock -u 9" { unlock9 = NR }
+      $0 == "fd8-closed" { closed8 = NR }
+      $0 == "fd9-closed" { closed9 = NR }
+      $0 == start { started = NR }
+      END {
+        exit !(durable && !unlock8 && unlock9 && closed8 && closed9 && started &&
+          durable < unlock9 && closed8 == unlock9 + 1 && closed9 == closed8 + 1 &&
+          started == closed9 + 1)
+      }
+    ' "$sequence"
+}
+
 test_missing_canonical_without_valid_queue_job_fails_closed() {
   local fixture=$tmp_dir/missing-canonical-invalid ready_dir
   setup_fixture "$fixture"
@@ -557,6 +619,7 @@ test_unsafe_release_identity_fails_closed
 test_missing_canonical_lock_fails_closed
 test_symlinked_queue_root_fails_closed
 test_missing_canonical_recovers_only_with_valid_queue_job
+test_recovery_start_follows_durable_lock_handoff
 test_missing_canonical_without_valid_queue_job_fails_closed
 test_passed_running_finalizes_without_retry
 test_running_job_ignores_untrusted_in_spool_pass_result

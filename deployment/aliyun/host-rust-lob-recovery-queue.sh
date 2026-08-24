@@ -311,6 +311,8 @@ recover_missing_canonical_after_partial_isolate() {
     || fail "canonical spool is missing without exactly one valid queued recovery job: $CANONICAL_SPOOL"
   install -d -m 0750 -o "$hft_uid" -g "$hft_gid" -- "$CANONICAL_SPOOL"
   sync "$CANONICAL_ROOT"
+  flock -u 9
+  exec 9>&-
   systemctl start --no-block "$RECOVERY_SERVICE@$MARKET.service" >/dev/null 2>&1 || true
   return 0
 }
@@ -351,6 +353,10 @@ isolate_market() {
   fi
   sync "$CANONICAL_SPOOL"
   sync "$CANONICAL_ROOT"
+  flock -u 8
+  exec 8>&-
+  flock -u 9
+  exec 9>&-
   systemctl start --no-block "$queue_unit" >/dev/null 2>&1 || true
 }
 
