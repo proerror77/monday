@@ -16,7 +16,7 @@ if [[ $# -ne 1 || ! $1 =~ ^[A-Fa-f0-9]{64}$ ]]; then
   exit 2
 fi
 
-for command in awk chmod cmp date env find flock grep id install jq ln mkdir mountpoint mv readlink rm runuser sha256sum sleep sort stat systemctl tr wc; do
+for command in awk chmod cmp date env find flock grep id install jq ln mkdir mountpoint mv readlink rm runuser sed sha256sum sleep sort stat systemctl tr wc; do
   if ! command -v "$command" >/dev/null 2>&1; then
     printf 'missing required command: %s\n' "$command" >&2
     exit 2
@@ -482,7 +482,7 @@ run_candidate_drain() {
 
 stage_existing_deployment_for_rollback() {
   local existing_base=0 existing_recovery=0 installed_recovery=0
-  local asset source installed_source mode source_kind old_usdm_symbols
+  local asset source installed_source snapshot_source mode source_kind old_usdm_symbols
   local -a rollback_assets
   local release_deployment=$OLD_DEPLOYMENT
   local snapshot="$EVIDENCE_DIR/rollback-deployment"
@@ -542,26 +542,25 @@ stage_existing_deployment_for_rollback() {
         ;;
     esac
     secure_regular_file "$installed_source"
+    snapshot_source="$snapshot/$asset"
+    atomic_install "$mode" "$installed_source" "$snapshot_source"
     if [[ $source_kind == release ]]; then
       source="$release_deployment/$asset"
       secure_regular_file "$source"
-      if ! cmp -s -- "$source" "$installed_source"; then
+      if ! cmp -s -- "$source" "$snapshot_source"; then
         if [[ $OLD_MODE == partial-contained-spot-live \
           && $asset == binance-lob-archiver-production@.service \
           && $(grep -Fxc 'ReadWritePaths=/data/monday/spool/binance-lob -/data/monday/spool/binance-lob-recovery' "$source") -eq 1 \
-          && $(grep -Fxc 'ReadWritePaths=/data/monday/spool' "$installed_source") -eq 1 ]] \
+          && $(grep -Fxc 'ReadWritePaths=/data/monday/spool' "$snapshot_source") -eq 1 ]] \
           && cmp -s -- "$source" <(sed \
             's#^ReadWritePaths=/data/monday/spool$#ReadWritePaths=/data/monday/spool/binance-lob -/data/monday/spool/binance-lob-recovery#' \
-            "$installed_source"); then
-          source=$installed_source
+            "$snapshot_source"); then
+          :
         else
           fail "installed production asset drifted from the active immutable release: $installed_source"
         fi
       fi
-    else
-      source=$installed_source
     fi
-    atomic_install "$mode" "$source" "$snapshot/$asset"
   done
   validate_deployment "$snapshot" false
   old_usdm_symbols=$(awk -F= '$1 == "SYMBOLS" { print substr($0, 9) }' \
