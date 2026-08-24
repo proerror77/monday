@@ -1180,11 +1180,11 @@ real_market_segment_preflight() {
         return 1
       }
     before=$(run_before_deadline "$preflight_deadline" \
-      stat -c '%d:%i:%s:%Y:%Z' "$source_tmp") || return 1
+      stat -c '%d:%i:%s:%Y' "$source_tmp") || return 1
     source_content_sha256=$(run_before_deadline "$preflight_deadline" \
       sha256sum "$source_tmp" | awk '{print $1}') || return 1
     after=$(run_before_deadline "$preflight_deadline" \
-      stat -c '%d:%i:%s:%Y:%Z' "$source_tmp") || return 1
+      stat -c '%d:%i:%s:%Y' "$source_tmp") || return 1
     if [[ $before == "$after" ]]; then
       stable=true
       break
@@ -1206,7 +1206,7 @@ real_market_segment_preflight() {
       return 1
     }
     source_path_identity=$(run_before_deadline "$preflight_deadline" \
-      stat -c '%d:%i:%s:%Y:%Z' "$source_path") || return 1
+      stat -c '%d:%i:%s:%Y' "$source_path") || return 1
     [[ $source_path_identity == "$after" ]] || {
       write_preflight_failure 'production segment path was replaced by a different inode after linking'
       return 1

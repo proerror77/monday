@@ -1676,6 +1676,11 @@ if [[ $mode == rollback ]]; then
   restore_legacy "$rollback_evidence" >/dev/null
   finalize_rollback_evidence "$rollback_evidence" rolled-back \
     || die 'could not finalize rolled-back cutover evidence'
+  if [[ -e $WATCHDOG_SUPPRESS_FILE || -L $WATCHDOG_SUPPRESS_FILE ]]; then
+    manual_watchdog_suppress_owner="cutover:$rollback_candidate:${rollback_evidence##*/}"
+    remove_watchdog_suppress "$manual_watchdog_suppress_owner" \
+      || die 'could not clear owned watchdog suppression after manual rollback'
+  fi
   printf '%s\n' "$rollback_evidence"
   exit 0
 fi

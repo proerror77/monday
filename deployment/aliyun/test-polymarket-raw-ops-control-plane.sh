@@ -1165,6 +1165,11 @@ if grep -Fq 'cp -- "$source_path" "$source_tmp"' "$GATE"; then
   printf 'real-segment preflight fell back to byte-copying the production segment\n' >&2
   exit 1
 fi
+if grep -Fq "stat -c '%d:%i:%s:%Y:%Z' \"\$source_tmp\"" "$GATE" \
+  || grep -Fq "stat -c '%d:%i:%s:%Y:%Z' \"\$source_path\"" "$GATE"; then
+  printf 'real-segment preflight still binds hash stability to ctime\n' >&2
+  exit 1
+fi
 secure_collector_directory() {
   [[ ${INSECURE_SOURCE_SPOOL:-} != "$1" ]]
 }
@@ -1268,7 +1273,7 @@ if [[ -n ${LINKED_SOURCE_PATH_FILE:-} && -f $LINKED_SOURCE_PATH_FILE ]]; then
   linked_path=$(<"$LINKED_SOURCE_PATH_FILE")
 fi
 if [[ -n $unstable_path && $last == "$unstable_path" \
-  && ${1:-} == -c && ${2:-} == '%d:%i:%s:%Y:%Z' ]]; then
+  && ${1:-} == -c && ${2:-} == '%d:%i:%s:%Y' ]]; then
   count=0
   [[ ! -f $UNSTABLE_STAT_COUNTER ]] || count=$(<"$UNSTABLE_STAT_COUNTER")
   count=$((count + 1))
@@ -3419,6 +3424,11 @@ exercise_manual_lineage() (
   secure_root_chain() { [[ -d $1 && ! -L $1 ]]; }
   secure_release_directory() { [[ -d $1 && ! -L $1 ]]; }
   secure_regular_file() { [[ -f $1 && ! -L $1 ]]; }
+  WATCHDOG_SUPPRESS_FILE="$evidence/polymarket-upload-watchdog.suppress"
+  remove_watchdog_suppress() {
+    [[ -e $WATCHDOG_SUPPRESS_FILE || -L $WATCHDOG_SUPPRESS_FILE ]] || return 0
+    rm -f -- "$WATCHDOG_SUPPRESS_FILE"
+  }
   prepare_rollback_evidence() { printf 'prepare\n' >>"$mutation_log"; }
   restore_legacy() { printf 'restore\n' >>"$mutation_log"; }
   finalize_rollback_evidence() { printf 'finalize\n' >>"$mutation_log"; }
@@ -3486,6 +3496,11 @@ exercise_manual_bootstrap_lineage() (
   secure_root_chain() { [[ -d $1 && ! -L $1 ]]; }
   secure_release_directory() { [[ -d $1 && ! -L $1 ]]; }
   secure_regular_file() { [[ -f $1 && ! -L $1 ]]; }
+  WATCHDOG_SUPPRESS_FILE="$evidence/polymarket-upload-watchdog.suppress"
+  remove_watchdog_suppress() {
+    [[ -e $WATCHDOG_SUPPRESS_FILE || -L $WATCHDOG_SUPPRESS_FILE ]] || return 0
+    rm -f -- "$WATCHDOG_SUPPRESS_FILE"
+  }
   stat() {
     [[ ${1:-} == -c && ${2:-} == %a && ${3:-} == -- && ${4:-} == "$ACTIVE_BINARY" ]] \
       || return 1
@@ -3832,6 +3847,17 @@ exercise_manual_rollback() (
   secure_root_chain() {
     [[ -d $1 && ! -L $1 ]]
   }
+  WATCHDOG_SUPPRESS_FILE="$rollback_evidence/polymarket-upload-watchdog.suppress"
+  rollback_candidate=$(printf 'a%.0s' {1..64})
+  remove_watchdog_suppress() {
+    local owner expected
+    owner=$1
+    [[ -e $WATCHDOG_SUPPRESS_FILE || -L $WATCHDOG_SUPPRESS_FILE ]] || return 0
+    [[ -f $WATCHDOG_SUPPRESS_FILE && ! -L $WATCHDOG_SUPPRESS_FILE ]] || return 92
+    expected=$(jq -er '.owner' "$WATCHDOG_SUPPRESS_FILE") || return 93
+    [[ $expected == "$owner" ]] || return 94
+    rm -f -- "$WATCHDOG_SUPPRESS_FILE"
+  }
   die() {
     printf 'manual rollback evidence transition failed: %s\n' "$*" >&2
     exit 1
@@ -3852,6 +3878,8 @@ mkdir "$manual_failure_dir"
 printf '%s\n' '{"schema":"monday.polymarket_cutover.v1"}' \
   >"$manual_failure_dir/cutover.json"
 publish_cutover_marker "$manual_failure_dir"
+printf '%s\n' '{"schema":"monday.polymarket_cutover_watchdog_suppress.v1","owner":"cutover:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:manual-rollback-failure","observed_at":"2026-08-24T00:00:00Z"}' \
+  >"$manual_failure_dir/polymarket-upload-watchdog.suppress"
 set +e
 exercise_manual_rollback "$manual_failure_dir" 1 >/dev/null 2>&1
 manual_failure_status=$?
@@ -3861,6 +3889,7 @@ set -e
   && -f $manual_failure_dir/PASSED.rollback-pending.sha256 \
   && -f $manual_failure_dir/cutover.json \
   && -f $manual_failure_dir/restore-observed-pending \
+  && -f $manual_failure_dir/polymarket-upload-watchdog.suppress \
   && ! -e $manual_failure_dir/PASSED.rolled-back.sha256 \
   && ! -e $manual_failure_dir/cutover.rolled-back.json ]] || {
   printf 'failed manual restoration did not leave rollback-pending evidence\n' >&2
@@ -3879,6 +3908,7 @@ set -e
   && ! -e $manual_failure_dir/PASSED.sha256 \
   && ! -e $manual_failure_dir/PASSED.rollback-pending.sha256 \
   && -f $manual_failure_dir/cutover.json \
+  && ! -e $manual_failure_dir/polymarket-upload-watchdog.suppress \
   && -f $manual_failure_dir/PASSED.rolled-back.sha256 \
   && ! -e $manual_failure_dir/cutover.rolled-back.json ]] || {
   printf 'successful manual rollback retained success-looking evidence\n' >&2
@@ -3888,6 +3918,24 @@ set -e
   cd "$manual_failure_dir"
   sha256sum --check --strict PASSED.rolled-back.sha256 >/dev/null
 )
+
+manual_foreign_marker_dir="$tmp_dir/manual-rollback-foreign-marker"
+mkdir "$manual_foreign_marker_dir"
+printf '%s\n' '{"schema":"monday.polymarket_cutover.v1"}' \
+  >"$manual_foreign_marker_dir/cutover.json"
+publish_cutover_marker "$manual_foreign_marker_dir"
+printf '%s\n' '{"schema":"monday.polymarket_cutover_watchdog_suppress.v1","owner":"foreign","observed_at":"2026-08-24T00:00:00Z"}' \
+  >"$manual_foreign_marker_dir/polymarket-upload-watchdog.suppress"
+set +e
+exercise_manual_rollback "$manual_foreign_marker_dir" 0 >/dev/null 2>&1
+manual_foreign_marker_status=$?
+set -e
+[[ $manual_foreign_marker_status -ne 0 \
+  && -f $manual_foreign_marker_dir/polymarket-upload-watchdog.suppress \
+  && -f $manual_foreign_marker_dir/PASSED.rolled-back.sha256 ]] || {
+  printf 'manual rollback did not fail closed on a foreign watchdog suppression marker\n' >&2
+  exit 1
+}
 
 restore_legacy_contract="$tmp_dir/restore-legacy-contract.sh"
 sed -n '/^restore_legacy() (/,/^)/p' "$CUTOVER" >"$restore_legacy_contract"
