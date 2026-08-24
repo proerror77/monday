@@ -11,7 +11,7 @@ User=hftcollector
 Group=hftcollector
 Environment=HOME=/var/lib/hft-collector
 EnvironmentFile=/etc/monday/polymarket-market-tape-upload.env
-ExecStart=/usr/bin/env ZSTD_THREADS=1 /opt/monday/bin/polymarket-raw-ops upload --spool-dir /data/monday/spool/polymarket-reference --dataset crypto_expiry_reference --quote-depth-levels 0 --quote-sample-ms 0 --upload-concurrency 2
+ExecStart=/usr/bin/env ZSTD_THREADS=1 /opt/monday/bin/polymarket-raw-ops upload --spool-dir /data/monday/spool/polymarket-reference --dataset crypto_expiry_reference --quote-depth-levels 0 --quote-sample-ms 0 --upload-concurrency 1
 TimeoutStartSec=0
 NoNewPrivileges=true
 PrivateTmp=true
@@ -26,7 +26,7 @@ StateDirectory=hft-collector
 ReadWritePaths=/data/monday/spool/polymarket-reference
 RestrictAddressFamilies=AF_INET AF_INET6
 UMask=0027
-CPUQuota=200%
+CPUQuota=100%
 Nice=10
-MemoryHigh=2G
-MemoryMax=3G
+MemoryHigh=1G
+MemoryMax=1536M
