@@ -382,9 +382,10 @@ check_timer() {
     '$base + {($k): $v}')
 }
 
-check_watchdog_timer() {
+check_scheduled_timer() {
   unit=$1
   label=$2
+  backing_service=${3:-}
   check_timer "$unit" "$label"
   substate=$(unit_substate "$unit")
   next_elapse=$(unit_timer_next "$unit")
@@ -392,7 +393,12 @@ check_watchdog_timer() {
     waiting)
       if [ -z "$next_elapse" ] || [ "$next_elapse" = "n/a" ] \
           || [ "$next_elapse" = "infinity" ]; then
-        record_breach "$label: waiting timer has no finite next elapse"
+        service_state=
+        [ -z "$backing_service" ] || service_state=$(unit_is_active "$backing_service")
+        case "$service_state" in
+          active | activating | deactivating) ;;
+          *) record_breach "$label: waiting timer has no finite next elapse" ;;
+        esac
       fi
       ;;
     running) ;;
@@ -1010,13 +1016,13 @@ check_timer "$RECOVERY_USDM_TIMER" "binance-lob-archiver-recovery@usdm.timer" "$
 check_service "$REFERENCE_COLLECTOR" "binance-usdm-reference-collector"
 check_service "$BYBIT_ARCHIVER" "bybit-options-archiver"
 
-check_timer "$POLY_MARKET_UPLOAD_TIMER" "polymarket-market-tape-upload.timer"
+check_scheduled_timer "$POLY_MARKET_UPLOAD_TIMER" "polymarket-market-tape-upload.timer" "$POLY_MARKET_UPLOAD_SERVICE"
 check_oneshot_result "$POLY_MARKET_UPLOAD_SERVICE" "polymarket-market-tape-upload.service"
-check_timer "$POLY_REF_UPLOAD_TIMER" "polymarket-reference-upload.timer"
+check_scheduled_timer "$POLY_REF_UPLOAD_TIMER" "polymarket-reference-upload.timer" "$POLY_REF_UPLOAD_SERVICE"
 check_oneshot_result "$POLY_REF_UPLOAD_SERVICE" "polymarket-reference-upload.service"
 check_upload_timer_backed "$POLY_MARKET_COLLECTOR" "$POLY_MARKET_UPLOAD_TIMER" "polymarket-market-tape-upload.timer"
 check_upload_timer_backed "$POLY_REF_COLLECTOR" "$POLY_REF_UPLOAD_TIMER" "polymarket-reference-upload.timer"
-check_watchdog_timer "$WATCHDOG_TIMER" "polymarket-market-tape-upload-watchdog.timer"
+check_scheduled_timer "$WATCHDOG_TIMER" "polymarket-market-tape-upload-watchdog.timer"
 check_oneshot_result "$WATCHDOG_SERVICE" "polymarket-market-tape-upload-watchdog.service"
 check_timer "$BYBIT_UPLOAD_TIMER" "bybit-options-upload.timer"
 check_oneshot_result "$BYBIT_UPLOAD_SERVICE" "bybit-options-upload.service"

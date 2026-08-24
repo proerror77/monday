@@ -768,6 +768,24 @@ reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
+rewrite_scenario 's|^polymarket-market-tape-upload.timer\tactive\tenabled\t-\t-$|polymarket-market-tape-upload.timer\tactive\tenabled\t-\t-\telapsed\tinfinity|'
+run_health
+expect "market upload timer elapsed: exit 1" "$(rc_is 1; echo $?)"
+expect "market upload timer elapsed: breach message" "$(grep_out "^breach: polymarket-market-tape-upload.timer: timer not waiting or running (SubState='elapsed')"; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+rewrite_scenario 's|^polymarket-reference-upload.timer\tactive\tenabled\t-\t-$|polymarket-reference-upload.timer\tactive\tenabled\t-\t-\twaiting\tinfinity|'
+run_health
+expect "reference upload timer infinite next: exit 1" "$(rc_is 1; echo $?)"
+expect "reference upload timer infinite next: breach message" "$(grep_out '^breach: polymarket-reference-upload.timer: waiting timer has no finite next elapse'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
 rewrite_scenario 's|^binance-lob-archiver-recovery@spot.timer	active	enabled|binance-lob-archiver-recovery@spot.timer	inactive	disabled|'
 run_health
 expect "recovery timer down: exit 1" "$(rc_is 1; echo $?)"

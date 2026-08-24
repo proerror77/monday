@@ -34,6 +34,14 @@ unit_state() {
   systemctl is-active "$1" 2>/dev/null || true
 }
 
+unit_substate() {
+  systemctl show -p SubState --value "$1" 2>/dev/null || true
+}
+
+unit_timer_next() {
+  systemctl show -p NextElapseUSecMonotonic --value "$1" 2>/dev/null || true
+}
+
 # Sets pending and oldest_age for the rotated tapes in spool dir $1. Both
 # lanes rotate 'market-updates.<timestamp>.ndjson' next to the active
 # 'market-updates.ndjson', which never matches the rotation glob but is
@@ -66,6 +74,16 @@ start_unit() {
   fi
 }
 
+restart_unit() {
+  lane=$1
+  unit=$2
+  shift 2
+  if ! systemctl restart "$@" "$unit"; then
+    log err "lane $lane: failed to restart $unit"
+    remediation_failed=1
+  fi
+}
+
 # Self-heal one upload lane: $1 lane label, $2 timer unit, $3 service unit,
 # $4 spool dir, $5 pending rotated tapes, $6 oldest rotated tape age in
 # seconds.
@@ -83,12 +101,34 @@ check_lane() {
       return 0
       ;;
   esac
+  service_state=$(unit_state "$3")
   timer_state=$(unit_state "$2")
   if [ "$timer_state" != "active" ]; then
     log warning "$2 was '$timer_state'; starting it (see issue #655)"
     start_unit "$1" "$2"
+  else
+    timer_substate=$(unit_substate "$2")
+    timer_next=$(unit_timer_next "$2")
+    case $timer_substate in
+      running) ;;
+      waiting)
+        if [ -z "$timer_next" ] || [ "$timer_next" = "n/a" ] \
+          || [ "$timer_next" = "infinity" ]; then
+          case $service_state in
+            active | activating | deactivating) ;;
+            *)
+              log warning "$2 waiting but NextElapseUSecMonotonic='$timer_next' while $3 is '$service_state'; restarting it to rearm the schedule"
+              restart_unit "$1" "$2"
+              ;;
+          esac
+        fi
+        ;;
+      *)
+        log warning "$2 active but SubState='$timer_substate'; restarting it to rearm the schedule"
+        restart_unit "$1" "$2"
+        ;;
+    esac
   fi
-  service_state=$(unit_state "$3")
   case $service_state in
     active | activating | deactivating) ;;
     *)
