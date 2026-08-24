@@ -5699,9 +5699,19 @@ if ! jq -e -f "$POLICY" "$tmp_dir/long.json" >/dev/null; then
   printf 'gate policy rejected one second of elapsed-time rounding\n' >&2
   exit 1
 fi
-jq '.duration_seconds = 3602' "$tmp_dir/gate.json" >"$tmp_dir/too-long.json"
+jq '.duration_seconds = 3602' "$tmp_dir/gate.json" >"$tmp_dir/body-overrun.json"
+if ! jq -e -f "$POLICY" "$tmp_dir/body-overrun.json" >/dev/null; then
+  printf 'gate policy rejected bounded final-sample work\n' >&2
+  exit 1
+fi
+jq '.duration_seconds = 3630' "$tmp_dir/gate.json" >"$tmp_dir/sample-tail.json"
+if ! jq -e -f "$POLICY" "$tmp_dir/sample-tail.json" >/dev/null; then
+  printf 'gate policy rejected one bounded sample period of tail work\n' >&2
+  exit 1
+fi
+jq '.duration_seconds = 3631' "$tmp_dir/gate.json" >"$tmp_dir/too-long.json"
 if jq -e -f "$POLICY" "$tmp_dir/too-long.json" >/dev/null; then
-  printf 'gate policy accepted more than one second of elapsed-time rounding\n' >&2
+  printf 'gate policy accepted more than one sample period of tail work\n' >&2
   exit 1
 fi
 jq '.started_at = "1970-01-01T00:01:41Z"' \
@@ -6939,6 +6949,28 @@ grep -Fq 'observation_deadline=$gate_seconds' "$GATE"
 grep -Fq '&& ((observation_deadline < HEALTH_SETTLE_SECONDS)); then' "$GATE"
 grep -Fq 'observation_deadline=$HEALTH_SETTLE_SECONDS' "$GATE"
 grep -Fq '((elapsed < observation_deadline)) || break' "$GATE"
+awk '
+  /^common_cutoff=$/ { observation_armed = 1 }
+  observation_armed && /^while :; do$/ { in_observation = 1; next }
+  in_observation && /^  elapsed=\$\(\(now_uptime - start_uptime\)\)$/ {
+    elapsed_samples++
+    if (elapsed_samples == 2) resample_line = NR
+  }
+  in_observation && /^  if \(\(elapsed >= gate_seconds\)\)/ {
+    completion_line = NR
+  }
+  in_observation && /^  \(\(elapsed < observation_deadline\)\) \|\| break$/ {
+    deadline_line = NR
+  }
+  in_observation && /^done$/ {
+    exit !(elapsed_samples == 2
+      && resample_line < completion_line
+      && completion_line < deadline_line)
+  }
+' "$GATE" || {
+  printf 'Gate observation loop does not re-sample elapsed time before completion and sleep decisions\n' >&2
+  exit 1
+}
 grep -Fq 'if ((elapsed >= HEALTH_SETTLE_SECONDS)); then' "$GATE"
 if grep -Fq 'if ((elapsed >= HEALTH_SETTLE_SECONDS)) || [[ $test_only == true ]]; then' "$GATE"; then
   printf 'short shadow gate bypasses the initial health settle window\n' >&2

@@ -2402,6 +2402,11 @@ while :; do
     fi
   fi
 
+  # Re-sample after the checks above before deciding whether to sleep again.
+  # Using the loop-entry sample here can add a whole extra sample period when
+  # the body crosses the observation deadline.
+  now_uptime=$SECONDS
+  elapsed=$((now_uptime - start_uptime))
   if ((elapsed >= gate_seconds)) \
     && ! baseline_health_requires_continuous_freshness "$baseline_mode" \
     && [[ $LEGACY_HEALTH_COMPLETION_REQUIRED == true ]] \

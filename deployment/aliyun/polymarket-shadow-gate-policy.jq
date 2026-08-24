@@ -173,7 +173,10 @@ and ((.real_market_preflight.started_at | utc_iso8601_unix)
   <= (.real_market_preflight.completed_at | utc_iso8601_unix))
 and ((.real_market_preflight.completed_at | utc_iso8601_unix)
   <= (.started_at | utc_iso8601_unix))
-and (.duration_seconds | positive_integer and . >= 3600 and . <= 3601)
+# The controller samples every 30 seconds. Its final health sample may finish
+# just after the one-hour deadline, so admit at most one honest sample period
+# of tail work while still rejecting an unbounded observation overrun.
+and (.duration_seconds | positive_integer and . >= 3600 and . <= 3630)
 and (.started_at | utc_iso8601_unix | type == "number")
 and (.parity_window_started_at_unix | positive_integer)
 and (.parity_window_ended_at_unix | positive_integer)
