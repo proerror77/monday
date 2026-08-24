@@ -38,12 +38,11 @@ sha_file() {
 }
 
 file_uid() {
-  local path=$1 uid
-  if uid=$(/usr/bin/stat -f %u "$path" 2>/dev/null); then
-    printf '%s\n' "$uid"
-  else
-    /usr/bin/stat -c %u "$path"
-  fi
+  local path=$1
+  case $(uname -s) in
+    Darwin) /usr/bin/stat -f %u "$path" ;;
+    *) /usr/bin/stat -c %u "$path" ;;
+  esac
 }
 
 write_file() {
@@ -636,6 +635,7 @@ test_bad_credential() {
   create_artifact_bundle "$fixture/artifact" 1111111111111111111111111111111111111111
   printf '%s\n' '{"runtime_account_id":"desk/main","api_key":"key"}' \
     >"$fixture/root/etc/monday/credentials/binance-account.json"
+  chmod 0600 "$fixture/root/etc/monday/credentials/binance-account.json"
   if run_cutover "$fixture" "$fixture/artifact" fee-test >"$fixture/out" 2>"$fixture/err"; then
     printf 'cutover accepted an incomplete credential JSON\n' >&2
     exit 1
