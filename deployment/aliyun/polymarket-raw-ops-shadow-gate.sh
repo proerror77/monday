@@ -1179,11 +1179,11 @@ real_market_segment_preflight() {
     }
   for _ in 1 2 3; do
     before=$(run_before_deadline "$preflight_deadline" \
-      stat -c '%d:%i:%s:%Y:%Z' "$source_tmp") || return 1
+      stat -c '%d:%i:%s:%Y' "$source_tmp") || return 1
     source_content_sha256=$(run_before_deadline "$preflight_deadline" \
       sha256sum "$source_tmp" | awk '{print $1}') || return 1
     after=$(run_before_deadline "$preflight_deadline" \
-      stat -c '%d:%i:%s:%Y:%Z' "$source_tmp") || return 1
+      stat -c '%d:%i:%s:%Y' "$source_tmp") || return 1
     if [[ $before == "$after" ]]; then
       stable=true
       break
