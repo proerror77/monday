@@ -25,6 +25,8 @@ readonly REFERENCE_UPLOAD_UNIT=polymarket-reference-upload.service
 readonly REFERENCE_UPLOAD_TIMER=polymarket-reference-upload.timer
 readonly MARKET_UPLOAD_UNIT=polymarket-market-tape-upload.service
 readonly MARKET_UPLOAD_TIMER=polymarket-market-tape-upload.timer
+readonly WATCHDOG_SUPPRESS_FILE=/run/monday/polymarket-upload-watchdog.suppress
+readonly WATCHDOG_SERVICE=polymarket-market-tape-upload-watchdog.service
 readonly HEALTH=/data/monday/spool/polymarket-reference/health.json
 readonly LEGACY_STATE=/data/monday/spool/polymarket-reference/collector-state.json
 readonly LEGACY_COLLECTOR=/opt/monday/bin/polymarket_reference_collector.py
@@ -85,6 +87,52 @@ readonly -a STAGE_ARTIFACT_ASSETS=(
 die() {
   printf 'Polymarket cutover failed: %s\n' "$*" >&2
   exit 1
+}
+
+write_watchdog_suppress() {
+  local owner=$1 temporary
+  install -d -m 0755 "${WATCHDOG_SUPPRESS_FILE%/*}"
+  if [[ -e $WATCHDOG_SUPPRESS_FILE || -L $WATCHDOG_SUPPRESS_FILE ]]; then
+    secure_regular_file "$WATCHDOG_SUPPRESS_FILE" || die 'watchdog suppression is indirect'
+    jq -e --arg owner "$owner" '
+      .schema == "monday.polymarket_cutover_watchdog_suppress.v1"
+      and .owner == $owner
+    ' "$WATCHDOG_SUPPRESS_FILE" >/dev/null \
+      || die 'foreign watchdog suppression already exists'
+    return
+  fi
+  temporary="${WATCHDOG_SUPPRESS_FILE}.tmp.$$"
+  jq -cn --arg owner "$owner" --arg observed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+    {schema:"monday.polymarket_cutover_watchdog_suppress.v1",
+      owner:$owner,observed_at:$observed_at}' >"$temporary"
+  chmod 0600 "$temporary"
+  mv "$temporary" "$WATCHDOG_SUPPRESS_FILE"
+}
+
+remove_watchdog_suppress() {
+  local owner=$1
+  [[ -e $WATCHDOG_SUPPRESS_FILE || -L $WATCHDOG_SUPPRESS_FILE ]] || return 0
+  secure_regular_file "$WATCHDOG_SUPPRESS_FILE" || die 'watchdog suppression is indirect'
+  jq -e --arg owner "$owner" '
+    .schema == "monday.polymarket_cutover_watchdog_suppress.v1"
+    and .owner == $owner
+  ' "$WATCHDOG_SUPPRESS_FILE" >/dev/null \
+    || die 'watchdog suppression ownership drifted during cutover'
+  rm -f -- "$WATCHDOG_SUPPRESS_FILE"
+}
+
+admit_watchdog_suppress() {
+  local owner=$1 active_state
+  write_watchdog_suppress "$owner"
+  active_state=$(systemctl show --property=ActiveState --value "$WATCHDOG_SERVICE") \
+    || {
+      remove_watchdog_suppress "$owner"
+      die 'cannot read watchdog service state before cutover transition'
+    }
+  if [[ $active_state == active || $active_state == activating ]]; then
+    remove_watchdog_suppress "$owner"
+    die "watchdog service is $active_state before cutover transition"
+  fi
 }
 
 usage() {
@@ -1840,6 +1888,8 @@ snapshot_legacy "$rollback_dir" "$baseline_mode" \
 
 transition_started=false
 cutover_succeeded=false
+watchdog_suppressed=false
+watchdog_suppress_owner=
 on_exit() {
   local status=$? restore_status=0
   if [[ $cutover_succeeded == false && $transition_started == true ]]; then
@@ -1857,6 +1907,10 @@ on_exit() {
       printf 'automatic rollback failed; collector and upload timers require operator recovery\n' >&2
       status=1
     else
+      if [[ ${watchdog_suppressed:-false} == true ]]; then
+        remove_watchdog_suppress "${watchdog_suppress_owner:-}" || status=1
+        watchdog_suppressed=false
+      fi
       finalize_rollback_evidence "$evidence_dir" invalid || status=1
     fi
   fi
@@ -1873,6 +1927,9 @@ trap on_exit EXIT
   || die 'Gate evidence changed before cutover transition'
 [[ $(oss_config_sha256) == "$gate_oss_config_sha" ]] \
   || die 'OSS configuration changed before the cutover transition'
+watchdog_suppress_owner="cutover:$candidate_sha:$run_id"
+admit_watchdog_suppress "$watchdog_suppress_owner"
+watchdog_suppressed=true
 transition_started=true
 systemctl stop "$REFERENCE_UPLOAD_TIMER" "$MARKET_UPLOAD_TIMER"
 systemctl stop "$REFERENCE_UPLOAD_UNIT" "$MARKET_UPLOAD_UNIT"
@@ -2156,6 +2213,8 @@ secure_root_chain "$evidence_dir" \
 mv -Tf "$success_marker_tmp" "$success_marker"
 sync "$success_marker"
 sync -f "$evidence_dir"
+remove_watchdog_suppress "$watchdog_suppress_owner"
+watchdog_suppressed=false
 
 cutover_succeeded=true
 trap - EXIT

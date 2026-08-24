@@ -1089,7 +1089,7 @@ real_market_segment_preflight() {
   local terminal_status upload_summary
   local source_quote_records source_recorded_hours source_content_sha256 source_bytes
   local source_identity source_mtime
-  local copied_sha256 uploaded_content_sha256 uploaded_canonical
+  local uploaded_content_sha256 uploaded_canonical
   local uploaded_uri uploaded_triplet uploaded_name preflight_tmp preflight_json
   local candidate_stdout_tmp candidate_stdout candidate_stderr_tmp candidate_stderr
   local preflight_deadline
@@ -1119,20 +1119,23 @@ real_market_segment_preflight() {
     return 1
   fi
   source_file="$spool/$source_name"
-  source_tmp="$source_file.tmp"
+  source_tmp="$spool/.${source_name}.preflight.$$"
+  [[ ! -e $source_file && ! -L $source_file \
+    && ! -e $source_tmp && ! -L $source_tmp ]] || return 1
   for _ in 1 2 3; do
+    rm -f -- "$source_tmp"
+    # Bind the production segment onto the shadow spool before hashing it. Once
+    # the extra link exists, the production uploader may unlink the original
+    # path and the Gate still retains the exact inode for upload/readback.
+    run_before_deadline "$preflight_deadline" ln "$source_path" "$source_tmp" \
+      || return 1
     before=$(run_before_deadline "$preflight_deadline" \
-      stat -c '%d:%i:%s:%Y:%Z' "$source_path") || return 1
-    run_before_deadline "$preflight_deadline" cp -- "$source_path" "$source_tmp" \
-      || return 1
+      stat -c '%d:%i:%s:%Y:%Z' "$source_tmp") || return 1
     source_content_sha256=$(run_before_deadline "$preflight_deadline" \
-      sha256sum "$source_path" | awk '{print $1}') \
-      || return 1
-    copied_sha256=$(run_before_deadline "$preflight_deadline" \
       sha256sum "$source_tmp" | awk '{print $1}') || return 1
     after=$(run_before_deadline "$preflight_deadline" \
-      stat -c '%d:%i:%s:%Y:%Z' "$source_path") || return 1
-    if [[ $before == "$after" && $source_content_sha256 == "$copied_sha256" ]]; then
+      stat -c '%d:%i:%s:%Y:%Z' "$source_tmp") || return 1
+    if [[ $before == "$after" ]]; then
       stable=true
       break
     fi
@@ -1167,17 +1170,15 @@ real_market_segment_preflight() {
   source_bytes=$(run_before_deadline "$preflight_deadline" \
     stat -c %s "$source_tmp") || return 1
   source_identity=$(run_before_deadline "$preflight_deadline" \
-    stat -c '%d:%i' "$source_path") || return 1
+    stat -c '%d:%i' "$source_tmp") || return 1
   source_mtime=$(run_before_deadline "$preflight_deadline" \
-    stat -c %Y "$source_path") || return 1
+    stat -c %Y "$source_tmp") || return 1
   source_segment=$(jq -cn --arg path "$source_path" --arg file "$source_name" \
     --arg sha256 "$source_content_sha256" --arg identity "$source_identity" \
     --argjson bytes "$source_bytes" --argjson modified_at_unix "$source_mtime" \
     '{path:$path,file:$file,bytes:$bytes,sha256:$sha256,
       file_identity:$identity,modified_at_unix:$modified_at_unix}') || return 1
   mv "$source_tmp" "$source_file"
-  chown hftcollector:hftcollector "$source_file"
-  chmod 0640 "$source_file"
   sync "$source_file"
 
   candidate_stdout_tmp="$evidence/.real-market-uploader.json.tmp"
