@@ -1367,6 +1367,9 @@ if runtime_policy_accepts "$tmp_dir/cross-dataset.json" old-session 100; then
   exit 1
 fi
 
+restore_recovery_timers_body="$tmp_dir/restore-recovery-timers.sh"
+sed -n '/^restore_previous_recovery_timers()/,/^}/p' "$CUTOVER" \
+  >"$restore_recovery_timers_body"
 rollback_body="$tmp_dir/rollback.sh"
 sed -n '/^rollback_after_failure()/,/^}/p' "$CUTOVER" >"$rollback_body"
 production_predicate_body="$tmp_dir/production-is-fail-closed.sh"
@@ -1551,8 +1554,141 @@ grep -Fq 'previous_spot_restarts' "$CUTOVER"
 grep -Fq 'previous_spot_invocation_id' "$CUTOVER"
 grep -Fq 'previous_usdm_restarts' "$CUTOVER"
 grep -Fq 'previous_usdm_invocation_id' "$CUTOVER"
+grep -Fq 'previous_recovery_timers_enabled' "$CUTOVER"
+grep -Fq 'OLD_RECOVERY_TIMER_SPOT_ENABLED=0' "$CUTOVER"
+grep -Fq 'OLD_RECOVERY_TIMER_USDM_ENABLED=0' "$CUTOVER"
+grep -Fq 'old production recovery timers do not match partial-contained-spot-live' "$CUTOVER"
+grep -Fq 'old production recovery timers do not match partial-contained-usdm-live' "$CUTOVER"
 host_state_dispatch_file="$tmp_dir/host-state-dispatch.sh"
 printf '%s\n' "$host_state_dispatch" >"$host_state_dispatch_file"
+capture_existing_production_identity_body="$tmp_dir/capture-existing-production-identity.sh"
+sed -n '/^capture_existing_production_identity()/,/^}/p' \
+  "$CUTOVER" >"$capture_existing_production_identity_body"
+run_capture_existing_production_identity_fixture() (
+  local mode=$1
+  local spot_timer_enabled=${2:-0}
+  local usdm_timer_enabled=${3:-0}
+  local old_sha
+  old_sha=$(printf 'a%.0s' {1..64})
+  RELEASE_ROOT=$(mkdir -p "$tmp_dir/capture-release-root" && cd "$tmp_dir/capture-release-root" && pwd -P)
+  PRODUCTION_LINK="$tmp_dir/capture-production-link-$mode-$spot_timer_enabled-$usdm_timer_enabled"
+  PRODUCTION_UNITS=(production-spot production-usdm)
+  RECOVERY_TIMERS=(recovery-spot recovery-usdm)
+  CANDIDATE_SHA256=$(printf 'c%.0s' {1..64})
+  OLD_RECOVERY_TIMERS_ENABLED=0
+  OLD_RECOVERY_TIMER_SPOT_ENABLED=0
+  OLD_RECOVERY_TIMER_USDM_ENABLED=0
+  mkdir -p "$RELEASE_ROOT/$old_sha"
+  : >"$RELEASE_ROOT/$old_sha/binance-lob-archiver"
+  ln -sf "$RELEASE_ROOT/$old_sha/binance-lob-archiver" "$PRODUCTION_LINK"
+  systemctl() {
+    if [[ $1 == is-enabled && ${2:-} == --quiet ]]; then
+      case "${!#}" in
+        recovery-spot) (( spot_timer_enabled )) ;;
+        recovery-usdm) (( usdm_timer_enabled )) ;;
+        *) return 1 ;;
+      esac
+      return
+    fi
+    return 1
+  }
+  systemctl_value() {
+    case "$1:$2" in
+      production-spot:NRestarts) printf '1\n' ;;
+      production-spot:InvocationID) printf '11111111111111111111111111111111\n' ;;
+      production-usdm:NRestarts) printf '2\n' ;;
+      production-usdm:InvocationID) printf '22222222222222222222222222222222\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  stage_existing_deployment_for_rollback() {
+    OLD_DEPLOYMENT="$tmp_dir/capture-old-deployment"
+  }
+  sha256sum() { return 0; }
+  fail() { printf '%s\n' "$*" >&2; exit 1; }
+  # shellcheck disable=SC1090
+  . "$capture_existing_production_identity_body"
+  capture_existing_production_identity "$mode"
+  printf '%s %s %s\n' \
+    "$OLD_RECOVERY_TIMERS_ENABLED" \
+    "$OLD_RECOVERY_TIMER_SPOT_ENABLED" \
+    "$OLD_RECOVERY_TIMER_USDM_ENABLED"
+)
+[[ $(run_capture_existing_production_identity_fixture contained-upgrade 0 0) == '0 0 0' ]]
+[[ $(run_capture_existing_production_identity_fixture contained-upgrade 1 1) == '2 1 1' ]]
+[[ $(run_capture_existing_production_identity_fixture partial-contained-spot-live 0 0) == '0 0 0' ]]
+[[ $(run_capture_existing_production_identity_fixture partial-contained-spot-live 1 0) == '1 1 0' ]]
+[[ $(run_capture_existing_production_identity_fixture partial-contained-spot-live 1 1) == '2 1 1' ]]
+[[ $(run_capture_existing_production_identity_fixture partial-contained-usdm-live 0 0) == '0 0 0' ]]
+[[ $(run_capture_existing_production_identity_fixture partial-contained-usdm-live 0 1) == '1 0 1' ]]
+[[ $(run_capture_existing_production_identity_fixture partial-contained-usdm-live 1 1) == '2 1 1' ]]
+if run_capture_existing_production_identity_fixture contained-upgrade 1 0 \
+  >"$tmp_dir/capture-contained-partial.out" 2>&1; then
+  printf 'contained cutover accepted partially enabled recovery timers\n' >&2
+  exit 1
+fi
+grep -Fq 'old production has partially enabled recovery timers' \
+  "$tmp_dir/capture-contained-partial.out"
+if run_capture_existing_production_identity_fixture partial-contained-spot-live 0 1 \
+  >"$tmp_dir/capture-spot-wrong-timer.out" 2>&1; then
+  printf 'partial-contained spot cutover accepted the wrong recovery timer\n' >&2
+  exit 1
+fi
+grep -Fq 'old production recovery timers do not match partial-contained-spot-live' \
+  "$tmp_dir/capture-spot-wrong-timer.out"
+if run_capture_existing_production_identity_fixture partial-contained-usdm-live 1 0 \
+  >"$tmp_dir/capture-usdm-wrong-timer.out" 2>&1; then
+  printf 'partial-contained USD-M cutover accepted the wrong recovery timer\n' >&2
+  exit 1
+fi
+grep -Fq 'old production recovery timers do not match partial-contained-usdm-live' \
+  "$tmp_dir/capture-usdm-wrong-timer.out"
+write_evidence_body="$tmp_dir/write-evidence.sh"
+sed -n '/^write_evidence()/,/^}/p' "$CUTOVER" >"$write_evidence_body"
+run_write_evidence_fixture() (
+  local target="$tmp_dir/write-evidence-target"
+  local link="$tmp_dir/write-evidence-link"
+  EVIDENCE_DIR="$tmp_dir/write-evidence"
+  STARTED_AT=2026-08-24T00:00:00Z
+  RESULT=passed
+  STEP='done'
+  FAILURE_REASON=
+  ROLLBACK_RESULT=not-needed
+  ROLLBACK_DEPLOYMENT_MANIFEST_SHA256=
+  CANDIDATE_SHA256=$(printf 'c%.0s' {1..64})
+  DEPLOYMENT_SOURCE_REVISION=$(printf 'd%.0s' {1..40})
+  DEPLOYMENT_BUNDLE_SHA256=$(printf 'e%.0s' {1..64})
+  OLD_SHA256=$(printf 'f%.0s' {1..64})
+  OLD_SPOT_RESTARTS=1
+  OLD_SPOT_INVOCATION_ID=11111111111111111111111111111111
+  OLD_USDM_RESTARTS=2
+  OLD_USDM_INVOCATION_ID=22222222222222222222222222222222
+  OLD_RECOVERY_TIMER_SPOT_ENABLED=1
+  OLD_RECOVERY_TIMER_USDM_ENABLED=0
+  OLD_MODE=partial-contained-spot-live
+  PRODUCTION_UNITS=(production-spot production-usdm)
+  PRODUCTION_LINK="$link"
+  mkdir -p "$EVIDENCE_DIR"
+  : >"$target"
+  ln -sf "$target" "$link"
+  unit_active_json() {
+    if [[ $1 == production-spot ]]; then
+      printf '{"active":true}\n'
+    else
+      printf '{"active":false}\n'
+    fi
+  }
+  date() { [[ $1 == -u && $2 == +%Y-%m-%dT%H:%M:%SZ ]] && printf '2026-08-24T00:05:00Z\n'; }
+  mv() { command mv -f "$2" "$3"; }
+  # shellcheck disable=SC1090
+  . "$write_evidence_body"
+  write_evidence
+  jq -e '
+    .previous_recovery_timers_enabled == {spot:true, usdm:false}
+    and .host_mode == "partial-contained-spot-live"
+  ' "$EVIDENCE_DIR/cutover.json" >/dev/null
+)
+run_write_evidence_fixture
 run_partial_host_state_fixture() (
   local usdm_enabled_state=$1 usdm_main_pid=${2:-0}
   local spot_upload_enabled_state=${3:-masked-runtime}
@@ -2104,8 +2240,14 @@ run_contained_upgrade_rollback_fixture() (
   local active_recovery_timer=${5:-}
   local enabled_recovery_timer=${6:-}
   local active_recovery_unit=${7:-}
+  local old_recovery_timer_spot_enabled=${8:-}
+  local old_recovery_timer_usdm_enabled=${9:-}
   local spot_upload_unmasked=0
   local usdm_upload_unmasked=0
+  local recovery_spot_enabled_now=0
+  local recovery_usdm_enabled_now=0
+  local recovery_spot_active_now=0
+  local recovery_usdm_active_now=0
   local calls="$tmp_dir/contained-rollback.calls"
   PRODUCTION_UNITS=(production-spot production-usdm)
   UPLOAD_UNITS=(upload-spot upload-usdm)
@@ -2126,6 +2268,20 @@ run_contained_upgrade_rollback_fixture() (
   DRAIN_ATTEMPTED=0
   DRAIN_MAY_HAVE_MUTATED=0
   OLD_RECOVERY_TIMERS_ENABLED=$old_recovery_timers_enabled
+  if [[ -n $old_recovery_timer_spot_enabled ]]; then
+    OLD_RECOVERY_TIMER_SPOT_ENABLED=$old_recovery_timer_spot_enabled
+  elif (( old_recovery_timers_enabled == 2 || ( old_recovery_timers_enabled == 1 && mode == partial-contained-spot-live ) )); then
+    OLD_RECOVERY_TIMER_SPOT_ENABLED=1
+  else
+    OLD_RECOVERY_TIMER_SPOT_ENABLED=0
+  fi
+  if [[ -n $old_recovery_timer_usdm_enabled ]]; then
+    OLD_RECOVERY_TIMER_USDM_ENABLED=$old_recovery_timer_usdm_enabled
+  elif (( old_recovery_timers_enabled == 2 || ( old_recovery_timers_enabled == 1 && mode == partial-contained-usdm-live ) )); then
+    OLD_RECOVERY_TIMER_USDM_ENABLED=1
+  else
+    OLD_RECOVERY_TIMER_USDM_ENABLED=0
+  fi
   OLD_SESSION_SPOT=old-spot-session
   OLD_SESSION_USDM=old-usdm-session
   OLD_USDM_MINIMUM_SYMBOLS=400
@@ -2139,7 +2295,17 @@ run_contained_upgrade_rollback_fixture() (
     printf '%s %s\n' "$1" "${*:2}" >>"$calls"
     case "$1" in
       is-active)
-        [[ ${!#} == "$active_recovery_timer" || ${!#} == "$active_recovery_unit" ]]
+        case "${!#}" in
+          recovery-spot)
+            [[ ${!#} == "$active_recovery_timer" || $recovery_spot_active_now -eq 1 ]]
+            ;;
+          recovery-usdm)
+            [[ ${!#} == "$active_recovery_timer" || $recovery_usdm_active_now -eq 1 ]]
+            ;;
+          *)
+            [[ ${!#} == "$active_recovery_unit" ]]
+            ;;
+        esac
         ;;
       is-enabled)
         if [[ ${!#} == upload-spot && $spot_upload_unmasked -eq 1 ]]; then
@@ -2151,10 +2317,22 @@ run_contained_upgrade_rollback_fixture() (
           return 1
         fi
         if [[ ${2:-} == --quiet ]]; then
-          [[ ${!#} == "$enabled_recovery_timer" ]]
+          case "${!#}" in
+            recovery-spot)
+              [[ ${!#} == "$enabled_recovery_timer" || $recovery_spot_enabled_now -eq 1 ]]
+              ;;
+            recovery-usdm)
+              [[ ${!#} == "$enabled_recovery_timer" || $recovery_usdm_enabled_now -eq 1 ]]
+              ;;
+            *)
+              [[ ${!#} == "$enabled_recovery_timer" ]]
+              ;;
+          esac
           return
         fi
-        if [[ ${!#} == "$enabled_recovery_timer" ]]; then
+        if [[ ${!#} == "$enabled_recovery_timer" \
+          || ( ${!#} == recovery-spot && $recovery_spot_enabled_now -eq 1 ) \
+          || ( ${!#} == recovery-usdm && $recovery_usdm_enabled_now -eq 1 ) ]]; then
           printf 'enabled\n'
           return 0
         fi
@@ -2177,6 +2355,44 @@ run_contained_upgrade_rollback_fixture() (
           usdm_upload_unmasked=1
         fi
         ;;
+      enable)
+        shift
+        if [[ ${1:-} == --now ]]; then
+          shift
+        fi
+        while (($#)); do
+          case "$1" in
+            recovery-spot)
+              recovery_spot_enabled_now=1
+              recovery_spot_active_now=1
+              ;;
+            recovery-usdm)
+              recovery_usdm_enabled_now=1
+              recovery_usdm_active_now=1
+              ;;
+          esac
+          shift
+        done
+        ;;
+      disable)
+        shift
+        if [[ ${1:-} == --now ]]; then
+          shift
+        fi
+        while (($#)); do
+          case "$1" in
+            recovery-spot)
+              recovery_spot_enabled_now=0
+              recovery_spot_active_now=0
+              ;;
+            recovery-usdm)
+              recovery_usdm_enabled_now=0
+              recovery_usdm_active_now=0
+              ;;
+          esac
+          shift
+        done
+        ;;
       mask) (( expect_contained )) ;;
       *) return 0 ;;
     esac
@@ -2198,6 +2414,8 @@ run_contained_upgrade_rollback_fixture() (
   install_deployment() { printf 'install %s\n' "$1" >>"$calls"; return 0; }
   atomic_symlink() { printf 'symlink %s %s\n' "$1" "$2" >>"$calls"; return 0; }
   restore_allowlisted_production_dropins() { printf 'restore-dropin\n' >>"$calls"; return 0; }
+  # shellcheck disable=SC1090
+  . "$restore_recovery_timers_body"
   # shellcheck disable=SC1090
   . "$production_predicate_body"
   # shellcheck disable=SC1090
@@ -2223,6 +2441,18 @@ run_contained_upgrade_rollback_fixture() (
     grep -Fxq 'enable production-spot' "$calls"
     grep -Fxq 'unmask --runtime production-spot' "$calls"
     grep -Fxq 'unmask --runtime upload-spot' "$calls"
+    if (( OLD_RECOVERY_TIMER_SPOT_ENABLED )); then
+      grep -Fxq 'enable --now recovery-spot' "$calls"
+    elif grep -Eq '^enable --now .*recovery-spot' "$calls"; then
+      printf 'partial spot rollback restored a previously disabled Spot timer\n' >&2
+      exit 1
+    fi
+    if (( OLD_RECOVERY_TIMER_USDM_ENABLED )); then
+      grep -Fxq 'enable --now recovery-usdm' "$calls"
+    elif grep -Eq '^enable --now .*recovery-usdm' "$calls"; then
+      printf 'partial spot rollback tried to restore the contained USD-M timer\n' >&2
+      exit 1
+    fi
     if grep -Eq '^(start|enable|unmask) .*(production-usdm|upload-usdm)' "$calls"; then
       printf 'partial rollback tried to start, enable, or unmask old USD-M\n' >&2
       exit 1
@@ -2232,6 +2462,18 @@ run_contained_upgrade_rollback_fixture() (
     grep -Fxq 'enable production-usdm' "$calls"
     grep -Fxq 'unmask --runtime production-usdm' "$calls"
     grep -Fxq 'unmask --runtime upload-usdm' "$calls"
+    if (( OLD_RECOVERY_TIMER_USDM_ENABLED )); then
+      grep -Fxq 'enable --now recovery-usdm' "$calls"
+    elif grep -Eq '^enable --now .*recovery-usdm' "$calls"; then
+      printf 'partial USD-M rollback restored a previously disabled USD-M timer\n' >&2
+      exit 1
+    fi
+    if (( OLD_RECOVERY_TIMER_SPOT_ENABLED )); then
+      grep -Fxq 'enable --now recovery-spot' "$calls"
+    elif grep -Eq '^enable --now .*recovery-spot' "$calls"; then
+      printf 'partial USD-M rollback tried to restore the contained Spot timer\n' >&2
+      exit 1
+    fi
     if grep -Eq '^(start|enable|unmask) .*(production-spot|upload-spot)' "$calls"; then
       printf 'partial rollback tried to start, enable, or unmask old Spot\n' >&2
       exit 1
@@ -2269,9 +2511,15 @@ run_contained_upgrade_rollback_fixture() (
   == previous-release-restored-disabled ]]
 [[ $(run_contained_upgrade_rollback_fixture 1 0 partial-contained-spot-live) \
   == previous-spot-restored-usdm-contained ]]
+[[ $(run_contained_upgrade_rollback_fixture \
+  1 0 partial-contained-spot-live 1 '' '' '' 1 0) \
+  == previous-spot-restored-usdm-contained ]]
 [[ $(run_contained_upgrade_rollback_fixture 1 0 partial-contained-spot-live 2) \
   == previous-spot-restored-usdm-contained ]]
 [[ $(run_contained_upgrade_rollback_fixture 1 0 partial-contained-usdm-live) \
+  == previous-usdm-restored-spot-contained ]]
+[[ $(run_contained_upgrade_rollback_fixture \
+  1 0 partial-contained-usdm-live 1 '' '' '' 0 1) \
   == previous-usdm-restored-spot-contained ]]
 [[ $(run_contained_upgrade_rollback_fixture 1 0 partial-contained-usdm-live 2) \
   == previous-usdm-restored-spot-contained ]]
