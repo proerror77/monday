@@ -62,8 +62,16 @@ if monday_shadow_memory_admission 1 0 0 >/dev/null 2>&1; then
 fi
 calibrated_gate_bytes=4429185024
 [[ $(monday_shadow_memory_admission \
-  "$calibrated_gate_bytes" 1073741824 3355443200 0) == "$calibrated_gate_bytes" ]] || {
+  "$calibrated_gate_bytes" 1073741824 3355443200) == "$calibrated_gate_bytes" ]] || {
   printf 'calibrated sequential gate does not fit its upload-drain budget\n' >&2
+  exit 1
+}
+calibrated_soft_headroom_bytes=1048576
+[[ $(monday_shadow_memory_admission \
+  "$((calibrated_gate_bytes + calibrated_soft_headroom_bytes))" \
+  1073741824 3355443200 "$calibrated_soft_headroom_bytes") \
+  == "$((calibrated_gate_bytes + calibrated_soft_headroom_bytes))" ]] || {
+  printf 'calibrated sequential gate does not reserve production growth to MemoryHigh\n' >&2
   exit 1
 }
 
@@ -330,6 +338,7 @@ grep -Fq 'systemctl_value "$market" DropInPaths' "$GATE"
 grep -Fq 'systemctl_value "$market" MemoryHigh' "$GATE"
 grep -Fq 'memory_max_bytes[$market] == 2147483648' "$GATE"
 grep -Fq 'readonly HOST_MEMORY_RESERVE_BYTES=1073741824' "$GATE"
+grep -Fq 'readonly MIN_HOST_MEMORY_RESERVE_BYTES=536870912' "$GATE"
 grep -Fq 'readonly STRICT_VERIFIER_MEMORY_MAX_BYTES=3221225472' "$GATE"
 grep -Fq 'readonly UPLOAD_DRAIN_MEMORY_MAX_BYTES=3355443200' "$GATE"
 grep -Fq 'monday_shadow_memory_admission' "$GATE"
@@ -337,10 +346,31 @@ grep -Fq 'host_memory_available_bytes_at_preflight' "$GATE"
 grep -Fq 'host_swap_total_bytes' "$GATE"
 grep -Fq 'shadow_phase_memory_bytes' "$GATE"
 grep -Fq 'production_memory_headroom_bytes' "$GATE"
+grep -Fq 'production_memory_soft_headroom_bytes' "$GATE"
+grep -Fq 'production_memory_reserve_burst_bytes' "$GATE"
+grep -Fq 'minimum_host_memory_reserve_bytes' "$GATE"
 grep -Fq 'host_memory_required_bytes' "$GATE"
 grep -Fq 'host_memory_shortfall_bytes' "$GATE"
 grep -Fq 'host_memory_headroom_ok' "$GATE"
 grep -Fq 'systemctl_value "$market" OOMScoreAdjust' "$GATE"
+memory_admission_call=$(sed -n \
+  '/^if host_memory_required_bytes=$(monday_shadow_memory_admission \\/,/^  "$shadow_phase_memory_bytes" "$production_memory_soft_headroom_bytes"); then$/p' \
+  "$GATE")
+[[ -n $memory_admission_call \
+  && $memory_admission_call == *production_memory_soft_headroom_bytes* \
+  && $memory_admission_call != *'"$production_memory_headroom_bytes"'* \
+  && $memory_admission_call != *production_memory_reserve_burst_bytes* ]] || {
+  printf 'shadow gate double-reserves production cgroup slack\n' >&2
+  exit 1
+}
+production_burst_guard=$(sed -n \
+  '/^((production_memory_reserve_burst_bytes \\/,/^  || die "production memory burst leaves less than the minimum host reserve:/p' \
+  "$GATE")
+[[ -n $production_burst_guard \
+  && $production_burst_guard == *'HOST_MEMORY_RESERVE_BYTES - MIN_HOST_MEMORY_RESERVE_BYTES'* ]] || {
+  printf 'shadow gate does not preserve the minimum host reserve during production bursts\n' >&2
+  exit 1
+}
 memory_guard_line=$(grep -nF 'insufficient host memory headroom for sequential shadow gate' \
   "$GATE" | cut -d: -f1)
 shadow_start_line=$(grep -nF 'systemctl start "${unit[$market]}"' \
