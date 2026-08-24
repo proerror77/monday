@@ -274,7 +274,7 @@ for a in "$@"; do
     unit="$a"
   fi
   case "$a" in
-    Result|NRestarts|ActiveState|SubState) prop="$a" ;;
+    Result|NRestarts|ActiveState|SubState|NextElapseUSecMonotonic) prop="$a" ;;
   esac
   prev="$a"
 done
@@ -287,23 +287,35 @@ if [ -z "$unit" ]; then
 fi
 [ -n "$unit" ] || exit 1
 line=$(awk -F'\t' -v u="$unit" '$1 == u { print; exit }' "$SCENARIO" 2>/dev/null || true)
-active="inactive"; enabled="disabled"; result="success"; nrestarts="0"
+active="inactive"; enabled="disabled"; result="success"; nrestarts="0"; substate=""; next_elapse=""
 if [ -n "$line" ]; then
   active=$(printf '%s\n' "$line" | awk -F'\t' '{print $2}')
   enabled=$(printf '%s\n' "$line" | awk -F'\t' '{print $3}')
   result=$(printf '%s\n' "$line" | awk -F'\t' '{print $4}')
   nrestarts=$(printf '%s\n' "$line" | awk -F'\t' '{print $5}')
+  substate=$(printf '%s\n' "$line" | awk -F'\t' '{print $6}')
+  next_elapse=$(printf '%s\n' "$line" | awk -F'\t' '{print $7}')
 fi
 [ "$active" != "-" ] || active="inactive"
 [ "$enabled" != "-" ] || enabled="disabled"
 [ "$result" != "-" ] || result="success"
 [ "$nrestarts" != "-" ] || nrestarts="0"
+if [ "${unit##*.}" = "timer" ]; then
+  [ -n "$substate" ] || substate="waiting"
+  [ -n "$next_elapse" ] || next_elapse="123456789"
+else
+  [ -n "$substate" ] || substate="dead"
+fi
+[ "$substate" != "-" ] || substate=""
+[ "$next_elapse" != "-" ] || next_elapse=""
 case "$1" in
   is-active) printf '%s\n' "$active" ;;
   is-enabled) printf '%s\n' "$enabled" ;;
   show)
     case "$prop" in
       NRestarts) printf '%s\n' "$nrestarts" ;;
+      SubState) printf '%s\n' "$substate" ;;
+      NextElapseUSecMonotonic) printf '%s\n' "$next_elapse" ;;
       *) printf '%s\n' "$result" ;;
     esac
     ;;
@@ -724,6 +736,33 @@ rewrite_scenario 's|^polymarket-market-tape-upload-watchdog.timer	active	enabled
 run_health
 expect "timer not enabled: exit 0" "$(rc_is 0; echo $?)"
 expect "timer not enabled: warning message" "$(grep_out '^warning: .*timer not enabled'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+rewrite_scenario 's|^polymarket-market-tape-upload-watchdog.timer\tactive\tenabled\t-\t-$|polymarket-market-tape-upload-watchdog.timer\tactive\tenabled\t-\t-\telapsed\t123456789|'
+run_health
+expect "timer elapsed: exit 1" "$(rc_is 1; echo $?)"
+expect "timer elapsed: breach message" "$(grep_out "^breach: polymarket-market-tape-upload-watchdog.timer: timer not waiting or running (SubState='elapsed')"; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+rewrite_scenario 's|^polymarket-market-tape-upload-watchdog.timer\tactive\tenabled\t-\t-$|polymarket-market-tape-upload-watchdog.timer\tactive\tenabled\t-\t-\twaiting\t-|'
+run_health
+expect "timer missing next elapse: exit 1" "$(rc_is 1; echo $?)"
+expect "timer missing next elapse: breach message" "$(grep_out '^breach: polymarket-market-tape-upload-watchdog.timer: waiting timer has no finite next elapse'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+rewrite_scenario 's|^polymarket-market-tape-upload-watchdog.timer\tactive\tenabled\t-\t-$|polymarket-market-tape-upload-watchdog.timer\tactive\tenabled\t-\t-\trunning\tinfinity|'
+run_health
+expect "timer running: exit 0" "$(rc_is 0; echo $?)"
+expect "timer running: no watchdog breach" "$(grep_not_out '^breach: polymarket-market-tape-upload-watchdog.timer:'; echo $?)"
 
 reset_env
 reset_state

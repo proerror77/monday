@@ -272,6 +272,12 @@ unit_result() {
 unit_nrestarts() {
   systemctl show -p NRestarts --value "$1" 2>/dev/null || true
 }
+unit_substate() {
+  systemctl show -p SubState --value "$1" 2>/dev/null || true
+}
+unit_timer_next() {
+  systemctl show -p NextElapseUSecMonotonic --value "$1" 2>/dev/null || true
+}
 
 check_mount() {
   data_mounted=0
@@ -374,6 +380,30 @@ check_timer() {
     '{active: ($a == "active"), enabled: ($e == "enabled")}')
   units_json=$(jq -n --argjson base "$units_json" --arg k "$unit" --argjson v "$obj" \
     '$base + {($k): $v}')
+}
+
+check_watchdog_timer() {
+  unit=$1
+  label=$2
+  check_timer "$unit" "$label"
+  substate=$(unit_substate "$unit")
+  next_elapse=$(unit_timer_next "$unit")
+  case "$substate" in
+    waiting)
+      if [ -z "$next_elapse" ] || [ "$next_elapse" = "n/a" ] \
+          || [ "$next_elapse" = "infinity" ]; then
+        record_breach "$label: waiting timer has no finite next elapse"
+      fi
+      ;;
+    running) ;;
+    *) record_breach "$label: timer not waiting or running (SubState='$substate')" ;;
+  esac
+  obj=$(jq -n --argjson base "$units_json" --arg k "$unit" \
+    --arg s "$substate" --arg n "$next_elapse" \
+    '$base | .[$k] += {substate: $s,
+      scheduled: ($n != "" and $n != "n/a" and $n != "infinity"),
+      next_elapse_monotonic: $n}')
+  units_json=$obj
 }
 
 check_upload_timer_backed() {
@@ -986,7 +1016,7 @@ check_timer "$POLY_REF_UPLOAD_TIMER" "polymarket-reference-upload.timer"
 check_oneshot_result "$POLY_REF_UPLOAD_SERVICE" "polymarket-reference-upload.service"
 check_upload_timer_backed "$POLY_MARKET_COLLECTOR" "$POLY_MARKET_UPLOAD_TIMER" "polymarket-market-tape-upload.timer"
 check_upload_timer_backed "$POLY_REF_COLLECTOR" "$POLY_REF_UPLOAD_TIMER" "polymarket-reference-upload.timer"
-check_timer "$WATCHDOG_TIMER" "polymarket-market-tape-upload-watchdog.timer"
+check_watchdog_timer "$WATCHDOG_TIMER" "polymarket-market-tape-upload-watchdog.timer"
 check_oneshot_result "$WATCHDOG_SERVICE" "polymarket-market-tape-upload-watchdog.service"
 check_timer "$BYBIT_UPLOAD_TIMER" "bybit-options-upload.timer"
 check_oneshot_result "$BYBIT_UPLOAD_SERVICE" "bybit-options-upload.service"
