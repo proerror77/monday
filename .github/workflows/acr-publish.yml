@@ -562,6 +562,9 @@ jobs:
             polymarket-reference-upload.timer
             polymarket-market-tape-upload.service
             polymarket-market-tape-upload.timer
+            polymarket-market-tape-upload-watchdog.sh
+            polymarket-market-tape-upload-watchdog.service
+            polymarket-market-tape-upload-watchdog.timer
           )
           (
             cd deployment/aliyun

@@ -63,6 +63,11 @@ readonly LEGACY_EXEC='/usr/bin/python3 /opt/monday/bin/polymarket_reference_coll
 readonly RUST_PRODUCTION_EXEC='/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200'
 readonly RUST_ACTIVE_BINARY=/opt/monday/bin/polymarket-raw-ops
 readonly CONTROL_DIR=/opt/monday/control/polymarket-raw-ops
+readonly WATCHDOG_BINARY=/opt/monday/bin/polymarket-market-tape-upload-watchdog.sh
+readonly WATCHDOG_SERVICE=polymarket-market-tape-upload-watchdog.service
+readonly WATCHDOG_TIMER=polymarket-market-tape-upload-watchdog.timer
+readonly WATCHDOG_SERVICE_PATH=/etc/systemd/system/$WATCHDOG_SERVICE
+readonly WATCHDOG_TIMER_PATH=/etc/systemd/system/$WATCHDOG_TIMER
 readonly LEGACY_FRAGMENT=/etc/systemd/system/polymarket-reference-collector.service
 readonly SHADOW_FRAGMENT=/etc/systemd/system/polymarket-reference-collector-shadow@.service
 readonly LEGACY_SPOOL=/data/monday/spool/polymarket-reference
@@ -82,6 +87,22 @@ readonly SERVICE_TEMPLATE="$SCRIPT_DIR/polymarket-reference-collector-shadow@.se
 readonly GATE_POLICY="$SCRIPT_DIR/polymarket-shadow-gate-policy.jq"
 readonly LEGACY_HEALTH_POLICY="$SCRIPT_DIR/polymarket-legacy-health-policy.jq"
 readonly RUST_HEALTH_POLICY="$SCRIPT_DIR/polymarket-rust-health-policy.jq"
+readonly -a BASELINE_UNIT_ASSETS=(
+  polymarket-reference-collector.service
+  polymarket-reference-upload.service
+  polymarket-reference-upload.timer
+  polymarket-market-tape-upload.service
+  polymarket-market-tape-upload.timer
+)
+readonly -a UNIT_ASSETS=(
+  polymarket-reference-collector.service
+  polymarket-reference-upload.service
+  polymarket-reference-upload.timer
+  polymarket-market-tape-upload.service
+  polymarket-market-tape-upload.timer
+  polymarket-market-tape-upload-watchdog.service
+  polymarket-market-tape-upload-watchdog.timer
+)
 readonly -a BUNDLE_ASSETS=(
   polymarket-raw-ops-gate-control.sh
   polymarket-raw-ops-gate@.service
@@ -96,6 +117,9 @@ readonly -a BUNDLE_ASSETS=(
   polymarket-reference-upload.timer
   polymarket-market-tape-upload.service
   polymarket-market-tape-upload.timer
+  polymarket-market-tape-upload-watchdog.sh
+  polymarket-market-tape-upload-watchdog.service
+  polymarket-market-tape-upload-watchdog.timer
 )
 
 die() {
@@ -762,14 +786,13 @@ verify_contained_recovery_baseline() {
 verify_cutover_target_preflight() {
   local baseline_mode=$1 active_binary=$2 control_dir=$3 release_manifest_name=$4
   local file_verifier=$5 unit fragment expected_fragment drop_ins asset assets
+  local watchdog_present=0 path
   [[ $baseline_mode == legacy_python || $baseline_mode == rust_release \
     || $baseline_mode == rust_bootstrap ]] || return 1
   [[ $baseline_mode != legacy_python || ( ! -e $active_binary && ! -L $active_binary ) ]] \
     || return 1
   secure_root_chain_or_absent "$control_dir" || return 1
-  for unit in polymarket-reference-collector.service \
-    polymarket-reference-upload.service polymarket-reference-upload.timer \
-    polymarket-market-tape-upload.service polymarket-market-tape-upload.timer; do
+  for unit in "${BASELINE_UNIT_ASSETS[@]}"; do
     expected_fragment="/etc/systemd/system/$unit"
     fragment=$(systemctl show --property=FragmentPath --value "$unit") || return 1
     [[ $fragment == "$expected_fragment" ]] || return 1
@@ -777,6 +800,23 @@ verify_cutover_target_preflight() {
     drop_ins=$(systemctl show --property=DropInPaths --value "$unit") || return 1
     [[ -z $drop_ins ]] || return 1
   done
+  for path in "$WATCHDOG_BINARY" "$WATCHDOG_SERVICE_PATH" "$WATCHDOG_TIMER_PATH"; do
+    [[ ! -e $path && ! -L $path ]] || ((watchdog_present += 1))
+  done
+  if ((watchdog_present != 0)); then
+    ((watchdog_present == 3)) || return 1
+    "$file_verifier" "$WATCHDOG_BINARY" || return 1
+    [[ -x $WATCHDOG_BINARY ]] || return 1
+    for unit in "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER"; do
+      expected_fragment=$WATCHDOG_SERVICE_PATH
+      [[ $unit == "$WATCHDOG_TIMER" ]] && expected_fragment=$WATCHDOG_TIMER_PATH
+      fragment=$(systemctl show --property=FragmentPath --value "$unit") || return 1
+      [[ $fragment == "$expected_fragment" ]] || return 1
+      "$file_verifier" "$expected_fragment" || return 1
+      drop_ins=$(systemctl show --property=DropInPaths --value "$unit") || return 1
+      [[ -z $drop_ins ]] || return 1
+    done
+  fi
   if [[ -e $control_dir || -L $control_dir ]]; then
     direct_directory "$control_dir" && secure_root_chain "$control_dir" || return 1
     assets=$(release_control_assets "$control_dir") || return 1

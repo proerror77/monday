@@ -17,7 +17,7 @@ readonly GATE_CONTROL="$SCRIPT_DIR/polymarket-raw-ops-gate-control.sh"
 readonly GATE_UNIT="$SCRIPT_DIR/polymarket-raw-ops-gate@.service"
 readonly CUTOVER="$SCRIPT_DIR/polymarket-raw-ops-cutover.sh"
 readonly WATCHDOG="$SCRIPT_DIR/polymarket-market-tape-upload-watchdog.sh"
-readonly WATCHDOG_TIMER="$SCRIPT_DIR/polymarket-market-tape-upload-watchdog.timer"
+readonly WATCHDOG_TIMER_FILE="$SCRIPT_DIR/polymarket-market-tape-upload-watchdog.timer"
 readonly WORKFLOW="$SCRIPT_DIR/../../.github/workflows/acr-publish.yml"
 readonly CI_WORKFLOW="$SCRIPT_DIR/../../.github/workflows/ci.yml"
 readonly README="$SCRIPT_DIR/README.md"
@@ -64,8 +64,8 @@ join_shell_continuations() {
 }
 
 shellcheck "$GATE" "$GATE_CONTROL" "$CUTOVER" "$WATCHDOG" "$0"
-grep -Fxq 'OnActiveSec=2min' "$WATCHDOG_TIMER"
-if grep -Fq 'OnBootSec=' "$WATCHDOG_TIMER"; then
+grep -Fxq 'OnActiveSec=2min' "$WATCHDOG_TIMER_FILE"
+if grep -Fq 'OnBootSec=' "$WATCHDOG_TIMER_FILE"; then
   printf 'watchdog timer must schedule from each activation, not only from boot\n' >&2
   exit 1
 fi
@@ -107,12 +107,20 @@ if grep -Fq 'marker="$evidence_dir/PASSED.sha256"' "$GATE"; then
   exit 1
 fi
 grep -Fq 'readonly WATCHDOG_SUPPRESS_FILE=/run/monday/polymarket-upload-watchdog.suppress' "$CUTOVER"
+grep -Fq 'readonly WATCHDOG_SCRIPT_ASSET=polymarket-market-tape-upload-watchdog.sh' "$CUTOVER"
+grep -Fq 'readonly WATCHDOG_BINARY=/opt/monday/bin/polymarket-market-tape-upload-watchdog.sh' "$CUTOVER"
 grep -Fq 'readonly WATCHDOG_SERVICE=polymarket-market-tape-upload-watchdog.service' "$CUTOVER"
+grep -Fq 'readonly WATCHDOG_TIMER=polymarket-market-tape-upload-watchdog.timer' "$CUTOVER"
 grep -Fq 'admit_watchdog_suppress "$watchdog_suppress_owner"' "$CUTOVER"
-if grep -Fq 'watchdog.timer' "$CUTOVER"; then
-  printf 'cutover should not manipulate the watchdog timer\n' >&2
-  exit 1
-fi
+grep -Fq 'atomic_install 0755 "$SCRIPT_DIR/$WATCHDOG_SCRIPT_ASSET" "$WATCHDOG_BINARY"' \
+  "$CUTOVER"
+grep -Fq 'verify_watchdog_runtime' "$CUTOVER"
+grep -Fq 'install -m "$mode" "$WATCHDOG_BINARY" "$rollback_dir/bin/$WATCHDOG_SCRIPT_ASSET"' \
+  "$CUTOVER"
+grep -Fq 'atomic_install "$mode" "$rollback_dir/bin/$WATCHDOG_SCRIPT_ASSET" "$WATCHDOG_BINARY"' \
+  "$CUTOVER"
+grep -Fq 'systemctl stop "$WATCHDOG_TIMER" "$WATCHDOG_SERVICE"' "$CUTOVER"
+grep -Fq 'systemctl restart "$WATCHDOG_TIMER"' "$CUTOVER"
 watchdog_admit_line=$(grep -nF 'admit_watchdog_suppress "$watchdog_suppress_owner"' "$CUTOVER" | cut -d: -f1)
 transition_start_line=$(grep -nF 'transition_started=true' "$CUTOVER" | head -1 | cut -d: -f1)
 watchdog_success_remove_line=$(grep -nF 'remove_watchdog_suppress "$watchdog_suppress_owner"' "$CUTOVER" | tail -1 | cut -d: -f1)
@@ -2814,8 +2822,29 @@ cutover_transition_line=$(grep -n '^transition_started=true$' "$CUTOVER" \
 (
   baseline_mode=legacy_python
   active_binary="$tmp_dir/active-polymarket-raw-ops"
+  WATCHDOG_BINARY="$tmp_dir/polymarket-market-tape-upload-watchdog.sh"
+  WATCHDOG_SERVICE=polymarket-market-tape-upload-watchdog.service
+  WATCHDOG_TIMER=polymarket-market-tape-upload-watchdog.timer
+  WATCHDOG_SERVICE_PATH="$tmp_dir/$WATCHDOG_SERVICE"
+  WATCHDOG_TIMER_PATH="$tmp_dir/$WATCHDOG_TIMER"
   control_dir="$tmp_dir/global-control"
   release_manifest_name=polymarket-raw-ops-release.json
+  readonly -a BASELINE_UNIT_ASSETS=(
+    polymarket-reference-collector.service
+    polymarket-reference-upload.service
+    polymarket-reference-upload.timer
+    polymarket-market-tape-upload.service
+    polymarket-market-tape-upload.timer
+  )
+  readonly -a UNIT_ASSETS=(
+    polymarket-reference-collector.service
+    polymarket-reference-upload.service
+    polymarket-reference-upload.timer
+    polymarket-market-tape-upload.service
+    polymarket-market-tape-upload.timer
+    polymarket-market-tape-upload-watchdog.service
+    polymarket-market-tape-upload-watchdog.timer
+  )
   readonly -a BUNDLE_ASSETS=(
     polymarket-raw-ops-shadow-gate.sh
     polymarket-raw-ops-cutover.sh
@@ -2835,6 +2864,10 @@ cutover_transition_line=$(grep -n '^transition_started=true$' "$CUTOVER" \
       --property=FragmentPath)
         if [[ $4 == "$fragment_drift_unit" ]]; then
           printf '/run/systemd/transient/%s\n' "$4"
+        elif [[ $4 == "$WATCHDOG_SERVICE" ]]; then
+          printf '%s\n' "$WATCHDOG_SERVICE_PATH"
+        elif [[ $4 == "$WATCHDOG_TIMER" ]]; then
+          printf '%s\n' "$WATCHDOG_TIMER_PATH"
         else
           printf '/etc/systemd/system/%s\n' "$4"
         fi
@@ -2861,6 +2894,32 @@ cutover_transition_line=$(grep -n '^transition_started=true$' "$CUTOVER" \
     printf 'cutover target preflight rejected clean legacy state\n' >&2
     exit 1
   }
+
+  : >"$WATCHDOG_BINARY"
+  chmod 0755 "$WATCHDOG_BINARY"
+  if verify_cutover_target_preflight \
+    "$baseline_mode" "$active_binary" "$control_dir" "$release_manifest_name" \
+    secure_test_file; then
+    printf 'cutover target preflight accepted a partial watchdog baseline\n' >&2
+    exit 1
+  fi
+  : >"$WATCHDOG_SERVICE_PATH"
+  : >"$WATCHDOG_TIMER_PATH"
+  verify_cutover_target_preflight \
+    "$baseline_mode" "$active_binary" "$control_dir" "$release_manifest_name" \
+    secure_test_file || {
+    printf 'cutover target preflight rejected a complete watchdog baseline\n' >&2
+    exit 1
+  }
+
+  chmod 0644 "$WATCHDOG_BINARY"
+  if verify_cutover_target_preflight \
+    "$baseline_mode" "$active_binary" "$control_dir" "$release_manifest_name" \
+    secure_test_file; then
+    printf 'cutover target preflight accepted a non-executable watchdog\n' >&2
+    exit 1
+  fi
+  chmod 0755 "$WATCHDOG_BINARY"
 
   unsafe_control_parent=true
   if verify_cutover_target_preflight \
@@ -2916,9 +2975,7 @@ cutover_transition_line=$(grep -n '^transition_started=true$' "$CUTOVER" \
   fi
   insecure_unit_file=
 
-  for drop_in_unit in polymarket-reference-collector.service \
-    polymarket-reference-upload.service polymarket-reference-upload.timer \
-    polymarket-market-tape-upload.service polymarket-market-tape-upload.timer; do
+  for drop_in_unit in "${UNIT_ASSETS[@]}"; do
     if verify_cutover_target_preflight \
       "$baseline_mode" "$active_binary" "$control_dir" "$release_manifest_name" \
       secure_test_file; then
@@ -3713,22 +3770,34 @@ sed -n '/^snapshot_legacy() {$/,/^}$/p' "$CUTOVER" >"$snapshot_legacy_contract"
 }
 exercise_bootstrap_snapshot() (
   set -euo pipefail
-  local case_name=$1 copy_drift=${2:-false} root rollback systemd_fixture candidate_sha baseline_sha
+  local case_name=$1 copy_drift=${2:-false} watchdog_present=${3:-true}
+  local root rollback systemd_fixture candidate_sha baseline_sha
   root="$tmp_dir/bootstrap-snapshot-$case_name"
   rollback="$root/rollback"
   systemd_fixture="$root/systemd"
   mkdir -p "$systemd_fixture" "$root/bin"
-  UNIT_ASSETS=(
+  BASELINE_UNIT_ASSETS=(
     polymarket-reference-collector.service
     polymarket-reference-upload.service
     polymarket-reference-upload.timer
     polymarket-market-tape-upload.service
     polymarket-market-tape-upload.timer
   )
+  UNIT_ASSETS=(
+    "${BASELINE_UNIT_ASSETS[@]}"
+    polymarket-market-tape-upload-watchdog.service
+    polymarket-market-tape-upload-watchdog.timer
+  )
   COLLECTOR_UNIT=polymarket-reference-collector.service
   REFERENCE_UPLOAD_TIMER=polymarket-reference-upload.timer
   MARKET_UPLOAD_TIMER=polymarket-market-tape-upload.timer
-  for asset in "${UNIT_ASSETS[@]}"; do
+  WATCHDOG_SCRIPT_ASSET=polymarket-market-tape-upload-watchdog.sh
+  WATCHDOG_BINARY="$root/bin/$WATCHDOG_SCRIPT_ASSET"
+  WATCHDOG_SERVICE=polymarket-market-tape-upload-watchdog.service
+  WATCHDOG_TIMER=polymarket-market-tape-upload-watchdog.timer
+  WATCHDOG_SERVICE_PATH="$systemd_fixture/$WATCHDOG_SERVICE"
+  WATCHDOG_TIMER_PATH="$systemd_fixture/$WATCHDOG_TIMER"
+  for asset in "${BASELINE_UNIT_ASSETS[@]}"; do
     printf 'unit=%s\n' "$asset" >"$systemd_fixture/$asset"
   done
   UPLOAD_ENV="$root/upload.env"
@@ -3736,6 +3805,12 @@ exercise_bootstrap_snapshot() (
   ACTIVE_BINARY="$root/bin/polymarket-raw-ops"
   printf 'bootstrap-original\n' >"$ACTIVE_BINARY"
   chmod 0755 "$ACTIVE_BINARY"
+  if [[ $watchdog_present == true ]]; then
+    printf 'unit=%s\n' "$WATCHDOG_SERVICE" >"$WATCHDOG_SERVICE_PATH"
+    printf 'unit=%s\n' "$WATCHDOG_TIMER" >"$WATCHDOG_TIMER_PATH"
+    printf 'watchdog\n' >"$WATCHDOG_BINARY"
+    chmod 0755 "$WATCHDOG_BINARY"
+  fi
   CONTROL_DIR="$root/absent-control"
   candidate_sha=$(printf 'c%.0s' {1..64})
   baseline_sha=$(sha256sum "$ACTIVE_BINARY" | awk '{print $1}')
@@ -3778,9 +3853,12 @@ exercise_bootstrap_snapshot() (
     command sync >/dev/null 2>&1 || die 'filesystem sync failed before snapshot digest check'
     (cd "$rollback" && sha256sum --check --strict manifest.sha256 >/dev/null)
     jq -e '.control_dir_present == false' "$rollback/state.json" >/dev/null
+    jq -e --argjson present "$watchdog_present" \
+      '.watchdog_present == $present' "$rollback/state.json" >/dev/null
   )
 )
 exercise_bootstrap_snapshot absent-control
+exercise_bootstrap_snapshot absent-control-and-watchdog false false
 if exercise_bootstrap_snapshot copied-binary-drift true; then
   printf 'bootstrap snapshot accepted a binary changed during copy\n' >&2
   exit 1
@@ -3804,7 +3882,7 @@ sed -n \
 }
 exercise_cutover_watchdog_suppress() (
   set -euo pipefail
-  local root=$1 service_state=$2 owner=$3
+  local root=$1 service_state=$2 owner=$3 present=${4:-true}
   secure_regular_file() { [[ -f $1 && ! -L $1 ]]; }
   install() { command install "$@"; }
   die() {
@@ -3815,6 +3893,8 @@ exercise_cutover_watchdog_suppress() (
   source "$watchdog_suppress_contract"
   WATCHDOG_SUPPRESS_FILE="$root/polymarket-upload-watchdog.suppress"
   WATCHDOG_SERVICE=polymarket-market-tape-upload-watchdog.service
+  WATCHDOG_SERVICE_PATH="$root/$WATCHDOG_SERVICE"
+  [[ $present == false ]] || : >"$WATCHDOG_SERVICE_PATH"
   systemctl() {
     [[ $1 == show && $2 == --property=ActiveState && $3 == --value \
       && $4 == "$WATCHDOG_SERVICE" ]] || return 1
@@ -3850,6 +3930,13 @@ mkdir "$watchdog_inactive_dir"
 exercise_cutover_watchdog_suppress "$watchdog_inactive_dir" inactive ours >/dev/null
 [[ -f $watchdog_inactive_dir/polymarket-upload-watchdog.suppress ]] || {
   printf 'cutover did not persist its owned watchdog suppression marker\n' >&2
+  exit 1
+}
+watchdog_absent_dir="$tmp_dir/cutover-watchdog-absent"
+mkdir "$watchdog_absent_dir"
+exercise_cutover_watchdog_suppress "$watchdog_absent_dir" absent ours false >/dev/null
+[[ -f $watchdog_absent_dir/polymarket-upload-watchdog.suppress ]] || {
+  printf 'cutover did not admit an absent watchdog baseline\n' >&2
   exit 1
 }
 
@@ -4105,8 +4192,15 @@ exercise_absent_control_dir_restore() (
   REFERENCE_UPLOAD_TIMER=reference-upload.timer
   MARKET_UPLOAD_UNIT=market-upload.service
   MARKET_UPLOAD_TIMER=market-upload.timer
-  UNIT_ASSETS=("$COLLECTOR_UNIT" "$REFERENCE_UPLOAD_UNIT" "$REFERENCE_UPLOAD_TIMER"
-    "$MARKET_UPLOAD_UNIT" "$MARKET_UPLOAD_TIMER")
+  WATCHDOG_SCRIPT_ASSET=polymarket-market-tape-upload-watchdog.sh
+  WATCHDOG_BINARY=$evidence_dir/watchdog
+  WATCHDOG_SERVICE=watchdog.service
+  WATCHDOG_TIMER=watchdog.timer
+  WATCHDOG_SERVICE_PATH=$evidence_dir/$WATCHDOG_SERVICE
+  WATCHDOG_TIMER_PATH=$evidence_dir/$WATCHDOG_TIMER
+  BASELINE_UNIT_ASSETS=("$COLLECTOR_UNIT" "$REFERENCE_UPLOAD_UNIT" \
+    "$REFERENCE_UPLOAD_TIMER" "$MARKET_UPLOAD_UNIT" "$MARKET_UPLOAD_TIMER")
+  UNIT_ASSETS=("${BASELINE_UNIT_ASSETS[@]}" "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER")
   BUNDLE_ASSETS=(candidate-control)
   PYTHON_ASSETS=(legacy-collector.py legacy-uploader.py)
   mkdir -p "$rollback_dir/control" "$CONTROL_DIR"
@@ -4115,11 +4209,14 @@ exercise_absent_control_dir_restore() (
   printf 'candidate control\n' >"$CONTROL_DIR/candidate-control"
   printf 'candidate manifest\n' \
     >"$CONTROL_DIR/${RELEASE_MANIFEST##*/}"
+  printf 'candidate watchdog\n' >"$WATCHDOG_BINARY"
+  printf 'candidate watchdog service\n' >"$WATCHDOG_SERVICE_PATH"
+  printf 'candidate watchdog timer\n' >"$WATCHDOG_TIMER_PATH"
   [[ $extra_control == false ]] || printf 'unexpected\n' >"$CONTROL_DIR/unexpected"
   jq -n --argjson units "$(printf '%s\n' "${UNIT_ASSETS[@]}" \
       | jq -Rn '[inputs] | map({key:.,value:"0644"}) | from_entries')" '
       {baseline_mode:"legacy_python",control_dir_present:false,
-       unit_modes:$units,upload_env_mode:"0640"}' \
+       unit_modes:$units,upload_env_mode:"0640",watchdog_present:false}' \
     >"$rollback_dir/state.json"
   (
     cd "$rollback_dir"
@@ -4145,7 +4242,10 @@ exercise_absent_control_dir_restore "$absent_control_restore_dir"
 absent_control_restore_status=$?
 set -e
 [[ $absent_control_restore_status -ne 0 \
-  && ! -e $absent_control_restore_dir/global-control ]] || {
+  && ! -e $absent_control_restore_dir/global-control \
+  && ! -e $absent_control_restore_dir/watchdog \
+  && ! -e $absent_control_restore_dir/watchdog.service \
+  && ! -e $absent_control_restore_dir/watchdog.timer ]] || {
   printf 'legacy rollback retained an absent control-directory snapshot\n' >&2
   exit 1
 }
@@ -4156,7 +4256,10 @@ exercise_absent_control_dir_restore "$unexpected_control_restore_dir" true
 unexpected_control_restore_status=$?
 set -e
 [[ $unexpected_control_restore_status -eq 66 \
-  && -f $unexpected_control_restore_dir/global-control/unexpected ]] || {
+  && -f $unexpected_control_restore_dir/global-control/unexpected \
+  && ! -e $unexpected_control_restore_dir/watchdog \
+  && ! -e $unexpected_control_restore_dir/watchdog.service \
+  && ! -e $unexpected_control_restore_dir/watchdog.timer ]] || {
   printf 'legacy rollback removed or accepted an unexpected control entry\n' >&2
   exit 1
 }
@@ -7137,6 +7240,7 @@ exercise_saved_unit_state() (
   COLLECTOR_UNIT=collector.service
   REFERENCE_UPLOAD_TIMER=reference-upload.timer
   MARKET_UPLOAD_TIMER=market-upload.timer
+  WATCHDOG_TIMER=watchdog.timer
   unit_enabled() { [[ $2 == true ]] && return 0 || return 1; }
   unit_active() { [[ $2 == true ]] && return 0 || return 1; }
   # shellcheck source=/dev/null
@@ -7144,23 +7248,24 @@ exercise_saved_unit_state() (
   unit_enabled() {
     case "$1" in
       collector.service) [[ $enabled_now == true ]] ;;
-      reference-upload.timer|market-upload.timer) [[ $enabled_now == true ]] ;;
+      reference-upload.timer|market-upload.timer|watchdog.timer) [[ $enabled_now == true ]] ;;
       *) return 1 ;;
     esac
   }
   unit_active() {
     case "$1" in
       collector.service) [[ $active_now == true ]] ;;
-      reference-upload.timer|market-upload.timer) [[ $active_now == true ]] ;;
+      reference-upload.timer|market-upload.timer|watchdog.timer) [[ $active_now == true ]] ;;
       *) return 1 ;;
     esac
   }
   state_json="$tmp_dir/saved-unit-state.json"
   jq -n --arg enabled "$enabled_json" --arg active "$active_json" '
-    {units:{
+    {watchdog_present:true,units:{
       "collector.service":{enabled:($enabled|fromjson),active:($active|fromjson)},
       "reference-upload.timer":{enabled:($enabled|fromjson),active:($active|fromjson)},
-      "market-upload.timer":{enabled:($enabled|fromjson),active:($active|fromjson)}
+      "market-upload.timer":{enabled:($enabled|fromjson),active:($active|fromjson)},
+      "watchdog.timer":{enabled:($enabled|fromjson),active:($active|fromjson)}
     }}' >"$state_json"
   verify_saved_unit_state "$state_json"
 )
@@ -7546,6 +7651,46 @@ cutover_assets=$(extract_bundle_assets "$CUTOVER")
   printf 'ACR artifact and release-control bundle asset lists differ\n' >&2
   exit 1
 }
+for watchdog_asset in \
+  polymarket-market-tape-upload-watchdog.sh \
+  polymarket-market-tape-upload-watchdog.service \
+  polymarket-market-tape-upload-watchdog.timer; do
+  grep -Fxq "$watchdog_asset" <<<"$workflow_assets" || {
+    printf 'Polymarket release bundle omits %s\n' "$watchdog_asset" >&2
+    exit 1
+  }
+done
+extract_array_assets() {
+  local array_name=$1 file=$2
+  sed -n \
+    "/^[[:space:]]*readonly -a $array_name=(\$/,/^[[:space:]]*)\$/p" "$file" \
+    | sed '1d;$d;s/^[[:space:]]*//'
+}
+gate_unit_assets=$(extract_array_assets UNIT_ASSETS "$GATE")
+cutover_unit_assets=$(extract_array_assets UNIT_ASSETS "$CUTOVER")
+[[ -n $gate_unit_assets && $gate_unit_assets == "$cutover_unit_assets" ]] || {
+  printf 'Gate and cutover governed unit lists differ\n' >&2
+  exit 1
+}
+for watchdog_unit in polymarket-market-tape-upload-watchdog.service \
+  polymarket-market-tape-upload-watchdog.timer; do
+  grep -Fxq "$watchdog_unit" <<<"$cutover_unit_assets" || {
+    printf 'Polymarket governed unit list omits %s\n' "$watchdog_unit" >&2
+    exit 1
+  }
+done
+gate_baseline_unit_assets=$(extract_array_assets BASELINE_UNIT_ASSETS "$GATE")
+cutover_baseline_unit_assets=$(extract_array_assets BASELINE_UNIT_ASSETS "$CUTOVER")
+[[ -n $gate_baseline_unit_assets \
+  && $gate_baseline_unit_assets == "$cutover_baseline_unit_assets" ]] || {
+  printf 'Gate and cutover baseline unit lists differ\n' >&2
+  exit 1
+}
+if grep -Fq 'polymarket-market-tape-upload-watchdog.' \
+  <<<"$cutover_baseline_unit_assets"; then
+  printf 'First governed rollout incorrectly requires watchdog baseline assets\n' >&2
+  exit 1
+fi
 grep -Fq '@${{ steps.build.outputs.digest }}' "$WORKFLOW"
 if grep -F 'IMAGE:' "$WORKFLOW" | grep -Fq ':${{ github.sha }}'; then
   printf 'workflow still extracts the collector from a mutable SHA tag\n' >&2

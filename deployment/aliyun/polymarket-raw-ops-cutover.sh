@@ -26,7 +26,12 @@ readonly REFERENCE_UPLOAD_TIMER=polymarket-reference-upload.timer
 readonly MARKET_UPLOAD_UNIT=polymarket-market-tape-upload.service
 readonly MARKET_UPLOAD_TIMER=polymarket-market-tape-upload.timer
 readonly WATCHDOG_SUPPRESS_FILE=/run/monday/polymarket-upload-watchdog.suppress
+readonly WATCHDOG_SCRIPT_ASSET=polymarket-market-tape-upload-watchdog.sh
+readonly WATCHDOG_BINARY=/opt/monday/bin/polymarket-market-tape-upload-watchdog.sh
 readonly WATCHDOG_SERVICE=polymarket-market-tape-upload-watchdog.service
+readonly WATCHDOG_TIMER=polymarket-market-tape-upload-watchdog.timer
+readonly WATCHDOG_SERVICE_PATH=/etc/systemd/system/$WATCHDOG_SERVICE
+readonly WATCHDOG_TIMER_PATH=/etc/systemd/system/$WATCHDOG_TIMER
 readonly HEALTH=/data/monday/spool/polymarket-reference/health.json
 readonly LEGACY_STATE=/data/monday/spool/polymarket-reference/collector-state.json
 readonly LEGACY_COLLECTOR=/opt/monday/bin/polymarket_reference_collector.py
@@ -46,12 +51,21 @@ readonly MAX_ACCEPTED_CYCLE_SECONDS=180
 readonly INITIAL_HEALTH_GRACE_SECONDS=60
 readonly CUTOVER_HEALTH_TIMEOUT_SECONDS=$((STARTUP_RECOVERY_SECONDS + 2 * MAX_ACCEPTED_CYCLE_SECONDS + INITIAL_HEALTH_GRACE_SECONDS))
 readonly MAX_HEALTH_SILENCE_SECONDS=240
+readonly -a BASELINE_UNIT_ASSETS=(
+  polymarket-reference-collector.service
+  polymarket-reference-upload.service
+  polymarket-reference-upload.timer
+  polymarket-market-tape-upload.service
+  polymarket-market-tape-upload.timer
+)
 readonly -a UNIT_ASSETS=(
   polymarket-reference-collector.service
   polymarket-reference-upload.service
   polymarket-reference-upload.timer
   polymarket-market-tape-upload.service
   polymarket-market-tape-upload.timer
+  polymarket-market-tape-upload-watchdog.service
+  polymarket-market-tape-upload-watchdog.timer
 )
 readonly -a PYTHON_ASSETS=(
   polymarket_reference_collector.py
@@ -71,6 +85,9 @@ readonly -a BUNDLE_ASSETS=(
   polymarket-reference-upload.timer
   polymarket-market-tape-upload.service
   polymarket-market-tape-upload.timer
+  polymarket-market-tape-upload-watchdog.sh
+  polymarket-market-tape-upload-watchdog.service
+  polymarket-market-tape-upload-watchdog.timer
 )
 readonly -a STAGE_ARTIFACT_ASSETS=(
   polymarket-raw-ops
@@ -124,6 +141,7 @@ remove_watchdog_suppress() {
 admit_watchdog_suppress() {
   local owner=$1 active_state
   write_watchdog_suppress "$owner"
+  [[ -e $WATCHDOG_SERVICE_PATH || -L $WATCHDOG_SERVICE_PATH ]] || return 0
   active_state=$(systemctl show --property=ActiveState --value "$WATCHDOG_SERVICE") \
     || {
       remove_watchdog_suppress "$owner"
@@ -869,6 +887,43 @@ verify_upload_units() {
   done
 }
 
+verify_watchdog_units() {
+  local fragment drop_ins
+  secure_regular_file "$WATCHDOG_BINARY" || return 1
+  [[ -x $WATCHDOG_BINARY ]] || return 1
+  cmp -s "$SCRIPT_DIR/$WATCHDOG_SCRIPT_ASSET" "$WATCHDOG_BINARY" || return 1
+  cmp -s "$SCRIPT_DIR/$WATCHDOG_SERVICE" "/etc/systemd/system/$WATCHDOG_SERVICE" \
+    || return 1
+  cmp -s "$SCRIPT_DIR/$WATCHDOG_TIMER" "/etc/systemd/system/$WATCHDOG_TIMER" \
+    || return 1
+  verify_effective_unit "$WATCHDOG_SERVICE" \
+    "/etc/systemd/system/$WATCHDOG_SERVICE" "$WATCHDOG_BINARY" || return 1
+  fragment=$(systemctl show --property=FragmentPath --value "$WATCHDOG_TIMER") \
+    || return 1
+  [[ $fragment == "/etc/systemd/system/$WATCHDOG_TIMER" ]] || return 1
+  drop_ins=$(systemctl show --property=DropInPaths --value "$WATCHDOG_TIMER") \
+    || return 1
+  [[ -z $drop_ins ]]
+}
+
+verify_watchdog_runtime() {
+  local substate next_elapse
+  verify_watchdog_units || return 1
+  unit_enabled "$WATCHDOG_TIMER" && unit_active "$WATCHDOG_TIMER" || return 1
+  ! systemctl is-failed --quiet "$WATCHDOG_SERVICE" || return 1
+  substate=$(systemctl show --property=SubState --value "$WATCHDOG_TIMER") || return 1
+  case "$substate" in
+    running) ;;
+    waiting)
+      next_elapse=$(systemctl show --property=NextElapseUSecMonotonic \
+        --value "$WATCHDOG_TIMER") || return 1
+      [[ -n $next_elapse && $next_elapse != n/a && $next_elapse != infinity ]] \
+        || return 1
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 render_upload_unit() {
   local source=$1 destination=$2 pinned_upload_env=$3 temporary
   temporary="${destination}.new.$$"
@@ -879,8 +934,12 @@ render_upload_unit() {
 }
 
 verify_saved_unit_state() {
-  local state_json=$1 unit expected_enabled expected_active
-  for unit in "$COLLECTOR_UNIT" "$REFERENCE_UPLOAD_TIMER" "$MARKET_UPLOAD_TIMER"; do
+  local state_json=$1 unit expected_enabled expected_active watchdog_present
+  local -a state_units=("$COLLECTOR_UNIT" "$REFERENCE_UPLOAD_TIMER" "$MARKET_UPLOAD_TIMER")
+  watchdog_present=$(jq -er '.watchdog_present | select(type == "boolean") | tostring' \
+    "$state_json") || return 1
+  [[ $watchdog_present == false ]] || state_units+=("$WATCHDOG_TIMER")
+  for unit in "${state_units[@]}"; do
     expected_enabled=$(jq -r --arg unit "$unit" '.units[$unit].enabled' "$state_json") \
       || return 1
     expected_active=$(jq -r --arg unit "$unit" '.units[$unit].active' "$state_json") \
@@ -935,14 +994,13 @@ verify_legacy_health() {
 verify_cutover_target_preflight() {
   local baseline_mode=$1 active_binary=$2 control_dir=$3 release_manifest_name=$4
   local file_verifier=$5 unit fragment expected_fragment drop_ins asset assets
+  local watchdog_present=0 path
   [[ $baseline_mode == legacy_python || $baseline_mode == rust_release \
     || $baseline_mode == rust_bootstrap ]] || return 1
   [[ $baseline_mode != legacy_python || ( ! -e $active_binary && ! -L $active_binary ) ]] \
     || return 1
   secure_root_chain_or_absent "$control_dir" || return 1
-  for unit in polymarket-reference-collector.service \
-    polymarket-reference-upload.service polymarket-reference-upload.timer \
-    polymarket-market-tape-upload.service polymarket-market-tape-upload.timer; do
+  for unit in "${BASELINE_UNIT_ASSETS[@]}"; do
     expected_fragment="/etc/systemd/system/$unit"
     fragment=$(systemctl show --property=FragmentPath --value "$unit") || return 1
     [[ $fragment == "$expected_fragment" ]] || return 1
@@ -950,6 +1008,23 @@ verify_cutover_target_preflight() {
     drop_ins=$(systemctl show --property=DropInPaths --value "$unit") || return 1
     [[ -z $drop_ins ]] || return 1
   done
+  for path in "$WATCHDOG_BINARY" "$WATCHDOG_SERVICE_PATH" "$WATCHDOG_TIMER_PATH"; do
+    [[ ! -e $path && ! -L $path ]] || ((watchdog_present += 1))
+  done
+  if ((watchdog_present != 0)); then
+    ((watchdog_present == 3)) || return 1
+    "$file_verifier" "$WATCHDOG_BINARY" || return 1
+    [[ -x $WATCHDOG_BINARY ]] || return 1
+    for unit in "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER"; do
+      expected_fragment=$WATCHDOG_SERVICE_PATH
+      [[ $unit == "$WATCHDOG_TIMER" ]] && expected_fragment=$WATCHDOG_TIMER_PATH
+      fragment=$(systemctl show --property=FragmentPath --value "$unit") || return 1
+      [[ $fragment == "$expected_fragment" ]] || return 1
+      "$file_verifier" "$expected_fragment" || return 1
+      drop_ins=$(systemctl show --property=DropInPaths --value "$unit") || return 1
+      [[ -z $drop_ins ]] || return 1
+    done
+  fi
   if [[ -e $control_dir || -L $control_dir ]]; then
     direct_directory "$control_dir" && secure_root_chain "$control_dir" || return 1
     assets=$(release_control_assets "$control_dir") || return 1
@@ -1097,7 +1172,8 @@ snapshot_legacy() {
   local baseline_release_path=${3:-} baseline_release_sha=${4:-} candidate_sha=${5:-}
   local contained_recovery=${6:-false}
   local state_json=$rollback_dir/state.json asset enabled active mode snapshot_asset
-  local control_present=false control_assets control_files
+  local control_present=false control_assets control_files path watchdog_count=0
+  local watchdog_present=false
   install -d -m 0750 "$rollback_dir/systemd" "$rollback_dir/bin" \
     "$rollback_dir/config" "$rollback_dir/control"
   secure_root_chain "$rollback_dir" \
@@ -1108,13 +1184,39 @@ snapshot_legacy() {
     --argjson contained_recovery "$contained_recovery" \
     '{baseline_mode:$baseline_mode,candidate_sha256:$candidate_sha,
       contained_recovery:$contained_recovery}' >"$state_json"
-  for asset in "${UNIT_ASSETS[@]}"; do
+  for asset in "${BASELINE_UNIT_ASSETS[@]}"; do
     secure_regular_file "/etc/systemd/system/$asset"
     mode=$(stat -c %a -- "/etc/systemd/system/$asset")
     install -m "$mode" "/etc/systemd/system/$asset" "$rollback_dir/systemd/$asset"
     jq --arg asset "$asset" --arg mode "$mode" '.unit_modes[$asset]=$mode' \
       "$state_json" >"$state_json.tmp"; mv "$state_json.tmp" "$state_json"
   done
+  for path in "$WATCHDOG_BINARY" "$WATCHDOG_SERVICE_PATH" "$WATCHDOG_TIMER_PATH"; do
+    [[ ! -e $path && ! -L $path ]] || ((watchdog_count += 1))
+  done
+  if ((watchdog_count != 0)); then
+    ((watchdog_count == 3)) || die 'watchdog baseline is only partially installed'
+    watchdog_present=true
+    for asset in "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER"; do
+      path=$WATCHDOG_SERVICE_PATH
+      [[ $asset == "$WATCHDOG_TIMER" ]] && path=$WATCHDOG_TIMER_PATH
+      secure_regular_file "$path"
+      mode=$(stat -c %a -- "$path")
+      install -m "$mode" "$path" "$rollback_dir/systemd/$asset"
+      jq --arg asset "$asset" --arg mode "$mode" '.unit_modes[$asset]=$mode' \
+        "$state_json" >"$state_json.tmp"; mv "$state_json.tmp" "$state_json"
+    done
+    secure_regular_file "$WATCHDOG_BINARY"
+    [[ -x $WATCHDOG_BINARY ]] \
+      || die 'watchdog script is not executable before rollback snapshot'
+    mode=$(stat -c %a -- "$WATCHDOG_BINARY")
+    install -m "$mode" "$WATCHDOG_BINARY" "$rollback_dir/bin/$WATCHDOG_SCRIPT_ASSET"
+    jq --arg mode "$mode" '.watchdog_mode=$mode' "$state_json" >"$state_json.tmp"
+    mv "$state_json.tmp" "$state_json"
+  fi
+  jq --argjson present "$watchdog_present" '.watchdog_present=$present' \
+    "$state_json" >"$state_json.tmp"
+  mv "$state_json.tmp" "$state_json"
   secure_regular_file "$UPLOAD_ENV"
   mode=$(stat -c %a -- "$UPLOAD_ENV")
   install -m "$mode" "$UPLOAD_ENV" "$rollback_dir/config/polymarket-market-tape-upload.env"
@@ -1190,6 +1292,16 @@ snapshot_legacy() {
       >"$state_json.tmp"
     mv "$state_json.tmp" "$state_json"
   done
+  if [[ $watchdog_present == true ]]; then
+    enabled=false
+    active=false
+    unit_enabled "$WATCHDOG_TIMER" && enabled=true
+    unit_active "$WATCHDOG_TIMER" && active=true
+    jq --arg unit "$WATCHDOG_TIMER" --argjson enabled "$enabled" \
+      --argjson active "$active" '.units[$unit] = {enabled:$enabled,active:$active}' \
+      "$state_json" >"$state_json.tmp"
+    mv "$state_json.tmp" "$state_json"
+  fi
   (
     cd "$rollback_dir"
     shopt -s nullglob
@@ -1205,7 +1317,7 @@ restore_legacy() (
   local expected_manifest_sha started_epoch rollback_pid current_pid restarts rollback_mode
   local rollback_sha temporary_link previous_health_sha current_health_sha
   local bootstrap_path bootstrap_sha bootstrap_mode bootstrap_restored bootstrap_active_mode
-  local contained_recovery
+  local contained_recovery watchdog_present path
   local control_dir_present control_files=
   local rollback_health_policy=$rollback_dir/control/polymarket-legacy-health-policy.jq
   secure_root_chain "$evidence_dir" || die 'rollback evidence directory is not trusted'
@@ -1221,6 +1333,9 @@ restore_legacy() (
     '(.contained_recovery // false) | select(type == "boolean") | tostring' \
     "$rollback_dir/state.json") \
     || die 'rollback snapshot has no valid contained recovery state'
+  watchdog_present=$(jq -er \
+    '.watchdog_present | select(type == "boolean") | tostring' \
+    "$rollback_dir/state.json") || die 'rollback snapshot has no watchdog presence state'
   if [[ $contained_recovery == true ]]; then
     jq -e --arg collector "$COLLECTOR_UNIT" --arg reference_timer "$REFERENCE_UPLOAD_TIMER" \
       --arg market_timer "$MARKET_UPLOAD_TIMER" '
@@ -1256,6 +1371,11 @@ restore_legacy() (
     clear_health_before_restart "$evidence_dir" \
       "pre-contained-recovery-rollback-$(date -u +%Y%m%dT%H%M%SZ)-$$"
   fi
+  for asset in "$WATCHDOG_TIMER" "$WATCHDOG_SERVICE"; do
+    path=$WATCHDOG_TIMER_PATH
+    [[ $asset == "$WATCHDOG_SERVICE" ]] && path=$WATCHDOG_SERVICE_PATH
+    [[ ! -e $path && ! -L $path ]] || systemctl stop "$asset"
+  done
   systemctl stop "$REFERENCE_UPLOAD_TIMER" "$MARKET_UPLOAD_TIMER"
   systemctl stop "$REFERENCE_UPLOAD_UNIT" "$MARKET_UPLOAD_UNIT"
   systemctl stop "$COLLECTOR_UNIT"
@@ -1266,11 +1386,34 @@ restore_legacy() (
   if [[ $contained_recovery == false && $rollback_mode != rust_release ]]; then
     clear_health_before_restart "$evidence_dir" "pre-rollback-$(date -u +%Y%m%dT%H%M%SZ)-$$"
   fi
-  for asset in "${UNIT_ASSETS[@]}"; do
+  for asset in "${BASELINE_UNIT_ASSETS[@]}"; do
     mode=$(jq -r --arg asset "$asset" '.unit_modes[$asset] // "0644"' \
       "$rollback_dir/state.json")
     atomic_install "$mode" "$rollback_dir/systemd/$asset" "/etc/systemd/system/$asset"
   done
+  if [[ $watchdog_present == true ]]; then
+    for asset in "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER"; do
+      mode=$(jq -er --arg asset "$asset" '.unit_modes[$asset] | select(test("^[0-7]{3,4}$"))' \
+        "$rollback_dir/state.json") || die 'rollback snapshot has no watchdog unit mode'
+      path=$WATCHDOG_SERVICE_PATH
+      [[ $asset == "$WATCHDOG_TIMER" ]] && path=$WATCHDOG_TIMER_PATH
+      atomic_install "$mode" "$rollback_dir/systemd/$asset" "$path"
+    done
+    mode=$(jq -er '.watchdog_mode | select(test("^[0-7]{3,4}$"))' \
+      "$rollback_dir/state.json") || die 'rollback snapshot has no watchdog mode'
+    (( (8#$mode & 0111) != 0 )) || die 'rollback watchdog mode is not executable'
+    atomic_install "$mode" "$rollback_dir/bin/$WATCHDOG_SCRIPT_ASSET" "$WATCHDOG_BINARY"
+  else
+    if unit_enabled "$WATCHDOG_TIMER"; then
+      systemctl disable "$WATCHDOG_TIMER"
+    fi
+    for path in "$WATCHDOG_BINARY" "$WATCHDOG_SERVICE_PATH" "$WATCHDOG_TIMER_PATH"; do
+      if [[ -e $path || -L $path ]]; then
+        secure_regular_file "$path" || die 'candidate watchdog rollback path is indirect'
+        rm -f -- "$path"
+      fi
+    done
+  fi
   mode=$(jq -r '.upload_env_mode // "0640"' "$rollback_dir/state.json")
   atomic_install "$mode" "$rollback_dir/config/polymarket-market-tape-upload.env" "$UPLOAD_ENV"
   for asset in "${BUNDLE_ASSETS[@]}" "${RELEASE_MANIFEST##*/}"; do
@@ -1372,6 +1515,22 @@ restore_legacy() (
   sync -f /etc/systemd/system
   sync -f /opt/monday
   systemctl daemon-reload
+  if [[ $watchdog_present == true ]]; then
+    cmp -s "$rollback_dir/bin/$WATCHDOG_SCRIPT_ASSET" "$WATCHDOG_BINARY" \
+      || die 'rollback watchdog script readback differs from the snapshot'
+    cmp -s "$rollback_dir/systemd/$WATCHDOG_SERVICE" "$WATCHDOG_SERVICE_PATH" \
+      || die 'rollback watchdog service readback differs from the snapshot'
+    cmp -s "$rollback_dir/systemd/$WATCHDOG_TIMER" "$WATCHDOG_TIMER_PATH" \
+      || die 'rollback watchdog timer readback differs from the snapshot'
+  else
+    for path in "$WATCHDOG_BINARY" "$WATCHDOG_SERVICE_PATH" "$WATCHDOG_TIMER_PATH"; do
+      [[ ! -e $path && ! -L $path ]] \
+        || die 'rollback did not restore the absent watchdog baseline'
+    done
+    if unit_enabled "$WATCHDOG_TIMER" || unit_active "$WATCHDOG_TIMER"; then
+      die 'rollback left an absent-baseline watchdog timer scheduled'
+    fi
+  fi
   if [[ $contained_recovery == true ]]; then
     reset_failed_unit_if_needed "$COLLECTOR_UNIT"
     systemctl stop "$COLLECTOR_UNIT"
@@ -1390,6 +1549,20 @@ restore_legacy() (
     done
     [[ $(systemctl show --property=MainPID --value "$COLLECTOR_UNIT") == 0 ]] \
       || die 'contained recovery rollback left a collector process running'
+    if [[ $watchdog_present == true ]]; then
+      if jq -e --arg unit "$WATCHDOG_TIMER" '.units[$unit].enabled == true' \
+        "$rollback_dir/state.json" >/dev/null; then
+        systemctl enable "$WATCHDOG_TIMER"
+      else
+        systemctl disable "$WATCHDOG_TIMER"
+      fi
+      if jq -e --arg unit "$WATCHDOG_TIMER" '.units[$unit].active == true' \
+        "$rollback_dir/state.json" >/dev/null; then
+        systemctl start "$WATCHDOG_TIMER"
+      else
+        systemctl stop "$WATCHDOG_TIMER"
+      fi
+    fi
     verify_saved_unit_state "$rollback_dir/state.json" \
       || die 'contained recovery rollback did not restore saved unit state'
     printf '%s\n' "$evidence_dir"
@@ -1460,6 +1633,18 @@ restore_legacy() (
       systemctl start "$asset"
     fi
   done
+  if [[ $watchdog_present == true ]]; then
+    if jq -e --arg unit "$WATCHDOG_TIMER" '.units[$unit].enabled == true' \
+      "$rollback_dir/state.json" >/dev/null; then
+      systemctl enable "$WATCHDOG_TIMER"
+    else
+      systemctl disable "$WATCHDOG_TIMER"
+    fi
+    if jq -e --arg unit "$WATCHDOG_TIMER" '.units[$unit].active == true' \
+      "$rollback_dir/state.json" >/dev/null; then
+      systemctl start "$WATCHDOG_TIMER"
+    fi
+  fi
   if [[ $rollback_mode == legacy_python ]]; then
     verify_legacy_runtime "$rollback_pid" 0 "$rollback_invocation_id" \
       || die 'rollback did not preserve legacy runtime identity'
@@ -1767,8 +1952,7 @@ pinned_upload_env="$RELEASE_ROOT/$candidate_sha/polymarket-upload-env-$gate_oss_
 secure_regular_file "$pinned_upload_env"
 [[ $(oss_config_sha256 "$pinned_upload_env") == "$gate_oss_config_sha" ]] \
   || die 'pinned uploader environment differs from the shadow gate'
-for asset in "$COLLECTOR_UNIT" "$REFERENCE_UPLOAD_UNIT" "$REFERENCE_UPLOAD_TIMER" \
-  "$MARKET_UPLOAD_UNIT" "$MARKET_UPLOAD_TIMER"; do
+for asset in "${UNIT_ASSETS[@]}"; do
   secure_regular_file "$SCRIPT_DIR/$asset"
 done
 baseline_mode=$(jq -er '.baseline_mode | select(. == "legacy_python" or . == "rust_release" or . == "rust_bootstrap")' \
@@ -1893,6 +2077,9 @@ rollback_dir="$evidence_dir/rollback"
 snapshot_legacy "$rollback_dir" "$baseline_mode" \
   "${gate_baseline_release_path:-}" "${gate_baseline_release_sha:-}" "$candidate_sha" \
   "$contained_recovery"
+baseline_watchdog_present=$(jq -er \
+  '.watchdog_present | select(type == "boolean") | tostring' \
+  "$rollback_dir/state.json") || die 'rollback snapshot has no watchdog presence state'
 
 transition_started=false
 cutover_succeeded=false
@@ -1940,6 +2127,9 @@ watchdog_suppress_owner="cutover:$candidate_sha:$run_id"
 admit_watchdog_suppress "$watchdog_suppress_owner"
 watchdog_suppressed=true
 transition_started=true
+if [[ $baseline_watchdog_present == true ]]; then
+  systemctl stop "$WATCHDOG_TIMER" "$WATCHDOG_SERVICE"
+fi
 systemctl stop "$REFERENCE_UPLOAD_TIMER" "$MARKET_UPLOAD_TIMER"
 systemctl stop "$REFERENCE_UPLOAD_UNIT" "$MARKET_UPLOAD_UNIT"
 if [[ $baseline_mode == legacy_python ]]; then
@@ -2014,6 +2204,7 @@ mv -Tf "$temporary_link" "$ACTIVE_BINARY"
 remove_snapshotted_control_files "$rollback_dir/state.json" \
   || die 'could not remove snapshotted baseline controls before promotion'
 install_control_release "$SCRIPT_DIR"
+atomic_install 0755 "$SCRIPT_DIR/$WATCHDOG_SCRIPT_ASSET" "$WATCHDOG_BINARY"
 for asset in "${UNIT_ASSETS[@]}"; do
   case "$asset" in
     "$REFERENCE_UPLOAD_UNIT"|"$MARKET_UPLOAD_UNIT")
@@ -2027,6 +2218,8 @@ systemctl daemon-reload
 verify_upload_units "$pinned_upload_env" \
   "$REFERENCE_UPLOAD_EXEC" "$MARKET_UPLOAD_EXEC" \
   || die 'Rust upload unit or timer identity differs from the gated configuration'
+verify_watchdog_units \
+  || die 'watchdog script, service, or timer differs from the gated configuration'
 
 reset_failed_unit_if_needed "$COLLECTOR_UNIT"
 [[ $(systemctl show --property=NRestarts --value "$COLLECTOR_UNIT") == 0 ]] \
@@ -2096,12 +2289,20 @@ verify_deferred_upload "$MARKET_UPLOAD_UNIT" "$candidate_binary" \
   || die 'Rust market uploader did not start cleanly for deferred backlog processing'
 [[ $(oss_config_sha256 "$pinned_upload_env") == "$gate_oss_config_sha" ]] \
   || die 'pinned OSS configuration changed during market upload startup'
-systemctl enable "$COLLECTOR_UNIT" "$REFERENCE_UPLOAD_TIMER" "$MARKET_UPLOAD_TIMER"
+systemctl enable "$COLLECTOR_UNIT" "$REFERENCE_UPLOAD_TIMER" "$MARKET_UPLOAD_TIMER" \
+  "$WATCHDOG_TIMER"
 systemctl start "$REFERENCE_UPLOAD_TIMER" "$MARKET_UPLOAD_TIMER"
 unit_active "$REFERENCE_UPLOAD_TIMER" \
   || die 'Rust reference upload timer is not active'
 unit_active "$MARKET_UPLOAD_TIMER" \
   || die 'Rust market upload timer is not active'
+systemctl restart "$WATCHDOG_TIMER"
+reset_failed_unit_if_needed "$WATCHDOG_SERVICE"
+systemctl start "$WATCHDOG_SERVICE"
+verify_oneshot_success "$WATCHDOG_SERVICE" \
+  || die 'watchdog did not complete its governed post-install probe'
+verify_watchdog_runtime \
+  || die 'watchdog timer is not enabled, active, and finitely scheduled'
 verify_rust_runtime "$candidate_binary" "$started_epoch" "$rust_pid" "$rust_invocation_id" \
   || die 'Rust collector identity changed while enabling upload timers'
 verify_upload_units "$pinned_upload_env" \
@@ -2182,13 +2383,15 @@ jq -n \
     market_upload_gate_verified:true,
     market_upload_terminal_success_required:false,
     market_backlog_deferred_to_timer:true,
-    upload_timers_verified:true,rollback_ready:true}' \
+    upload_timers_verified:true,watchdog_verified:true,rollback_ready:true}' \
   >"$evidence_dir/cutover.json.tmp"
 verify_rust_runtime "$candidate_binary" "$started_epoch" "$rust_pid" "$rust_invocation_id" \
   || die 'Rust collector identity changed while cutover evidence was being prepared'
 verify_upload_units "$pinned_upload_env" \
   "$REFERENCE_UPLOAD_EXEC" "$MARKET_UPLOAD_EXEC" \
   || die 'Rust upload unit identity changed while cutover evidence was being prepared'
+verify_watchdog_runtime \
+  || die 'watchdog identity or schedule changed while cutover evidence was being prepared'
 [[ $(oss_config_sha256 "$pinned_upload_env") == "$gate_oss_config_sha" ]] \
   || die 'pinned OSS configuration changed while cutover evidence was being prepared'
 mv "$evidence_dir/cutover.json.tmp" "$evidence_dir/cutover.json"
@@ -2200,6 +2403,8 @@ verify_rust_runtime "$candidate_binary" "$started_epoch" "$rust_pid" "$rust_invo
 verify_upload_units "$pinned_upload_env" \
   "$REFERENCE_UPLOAD_EXEC" "$MARKET_UPLOAD_EXEC" \
   || die 'Rust upload unit identity changed before cutover completion'
+verify_watchdog_runtime \
+  || die 'watchdog identity or schedule changed before cutover completion'
 ! systemctl is-failed --quiet "$MARKET_UPLOAD_UNIT" \
   || die 'Rust market uploader failed before cutover completion'
 ! systemctl is-failed --quiet "$REFERENCE_UPLOAD_UNIT" \
