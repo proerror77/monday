@@ -453,7 +453,8 @@ verify_local_triplet() {
       and .bytes == $bytes
     ' "$manifest" >/dev/null \
     || die "local fee manifest does not match the data triplet: $manifest"
-  prefix=$(realpath --relative-to="$FEE_SPOOL_ROOT" "$dir")
+  [[ $dir == "$FEE_SPOOL_ROOT/"* ]] || die "fee triplet escapes the spool root: $dir"
+  prefix=${dir#"$FEE_SPOOL_ROOT/"}
   jq -cn \
     --arg dir "$dir" \
     --arg market "$market" \
@@ -598,7 +599,7 @@ if [[ $(id -u) -ne 0 ]]; then
   printf 'must run as root\n' >&2
   exit 2
 fi
-for command in awk chmod cmp cp date dirname find flock id install jq ln mkdir mktemp mountpoint mv readlink realpath rm sha256sum sort stat systemctl systemd-tmpfiles tar tr wc; do
+for command in awk chmod cmp cp date dirname find flock id install jq ln mkdir mktemp mountpoint mv readlink rm sha256sum sort stat systemctl systemd-tmpfiles tar tr wc; do
   command_exists "$command" || die "missing required command: $command"
 done
 configure_paths "${MONDAY_ROOT_PREFIX:-}"

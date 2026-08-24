@@ -14,7 +14,7 @@ else
   TAR_CREATE_OPTS=()
 fi
 
-for command in awk bash cmp date find grep id install jq mktemp python3 readlink rm sed sha256sum stat tar; do
+for command in awk bash cmp date find grep id install jq mktemp readlink rm sed sha256sum stat tar; do
   command -v "$command" >/dev/null 2>&1 \
     || { printf 'missing test dependency: %s\n' "$command" >&2; exit 2; }
 done
@@ -123,21 +123,6 @@ fi
 exec /usr/bin/stat "$@"
 '
   chmod 0755 "$bin_dir/stat"
-
-  write_file "$bin_dir/realpath" '#!/usr/bin/env bash
-set -euo pipefail
-if [[ ${1:-} == --relative-to=* ]]; then
-  base=${1#--relative-to=}
-  path=$2
-  python3 - "$base" "$path" <<'"'"'PY'"'"'
-import os, sys
-print(os.path.relpath(sys.argv[2], sys.argv[1]))
-PY
-  exit 0
-fi
-exec /usr/bin/realpath "$@"
-'
-  chmod 0755 "$bin_dir/realpath"
 
   write_file "$bin_dir/systemd-tmpfiles" '#!/usr/bin/env bash
 set -euo pipefail
