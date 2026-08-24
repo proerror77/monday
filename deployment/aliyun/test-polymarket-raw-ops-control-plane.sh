@@ -1159,6 +1159,13 @@ case $1 in
     esac
     ;;
   is-active) printf '%s\n' inactive; exit 3 ;;
+  show)
+    case $3 in
+      SubState) printf '%s\n' waiting ;;
+      NextElapseUSecMonotonic) printf '%s\n' 123456789 ;;
+      *) exit 2 ;;
+    esac
+    ;;
   start) printf '%s\n' "$*" >>"$WATCHDOG_START_LOG" ;;
   *) exit 2 ;;
 esac
@@ -1178,6 +1185,61 @@ WATCHDOG_START_LOG="$watchdog_start_log" \
 if [[ $(wc -l <"$watchdog_start_log") -ne 1 ]] \
   || ! grep -Fxq 'start polymarket-market-tape-upload.timer' "$watchdog_start_log"; then
   printf 'watchdog did not respect the disabled reference-lane containment\n' >&2
+  exit 1
+fi
+
+: >"$watchdog_start_log"
+cat >"$watchdog_bin/systemctl" <<'EOF'
+#!/bin/sh
+case $1 in
+  is-enabled)
+    printf '%s\n' enabled
+    ;;
+  is-active)
+    printf '%s\n' active
+    ;;
+  show)
+    case $3 in
+      SubState) printf '%s\n' elapsed ;;
+      NextElapseUSecMonotonic) printf '%s\n' infinity ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  restart) printf '%s\n' "$*" >>"$WATCHDOG_START_LOG" ;;
+  *) exit 2 ;;
+esac
+EOF
+chmod +x "$watchdog_bin/systemctl"
+WATCHDOG_START_LOG="$watchdog_start_log" \
+  PATH="$watchdog_bin:$PATH" "$WATCHDOG"
+if [[ $(wc -l <"$watchdog_start_log") -ne 2 ]] \
+  || ! grep -Fxq 'restart polymarket-market-tape-upload.timer' "$watchdog_start_log" \
+  || ! grep -Fxq 'restart polymarket-reference-upload.timer' "$watchdog_start_log"; then
+  printf 'watchdog did not rearm elapsed upload timers with an infinite next elapse\n' >&2
+  exit 1
+fi
+
+: >"$watchdog_start_log"
+cat >"$watchdog_bin/systemctl" <<'EOF'
+#!/bin/sh
+case $1 in
+  is-enabled) printf '%s\n' enabled ;;
+  is-active) printf '%s\n' active ;;
+  show)
+    case $3 in
+      SubState) printf '%s\n' waiting ;;
+      NextElapseUSecMonotonic) printf '%s\n' infinity ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  *) exit 2 ;;
+esac
+EOF
+chmod +x "$watchdog_bin/systemctl"
+WATCHDOG_START_LOG="$watchdog_start_log" \
+  PATH="$watchdog_bin:$PATH" "$WATCHDOG"
+if [[ -s $watchdog_start_log ]]; then
+  printf 'watchdog restarted an OnUnitInactiveSec timer while its oneshot service was running\n' >&2
   exit 1
 fi
 
