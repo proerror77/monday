@@ -133,13 +133,17 @@ sudo install -m 0644 deployment/aliyun/polymarket-market-tape-upload-watchdog.se
   deployment/aliyun/polymarket-market-tape-upload-watchdog.timer \
   /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now polymarket-market-tape-upload-watchdog.timer
+sudo systemctl enable polymarket-market-tape-upload-watchdog.timer
+sudo systemctl restart polymarket-market-tape-upload-watchdog.timer
+sudo systemctl start polymarket-market-tape-upload-watchdog.service
 ```
 
 Post-install readback (required before the change is considered live):
 
 ```bash
-systemctl is-active polymarket-market-tape-upload-watchdog.timer
+systemctl show polymarket-market-tape-upload-watchdog.timer \
+  --property=ActiveState --property=SubState \
+  --property=NextElapseUSecMonotonic
 journalctl -t polymarket-upload-watchdog -n 5
 ```
 

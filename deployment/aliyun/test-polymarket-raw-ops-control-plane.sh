@@ -69,6 +69,8 @@ if grep -Fq 'OnBootSec=' "$WATCHDOG_TIMER"; then
   printf 'watchdog timer must schedule from each activation, not only from boot\n' >&2
   exit 1
 fi
+grep -Fq 'sudo systemctl restart polymarket-market-tape-upload-watchdog.timer' "$README"
+grep -Fq -- '--property=NextElapseUSecMonotonic' "$README"
 if grep -Fq 'release-preflight' "$GATE_CONTROL" \
   || grep -Fq 'preflight-hold' "$GATE_CONTROL" \
   || grep -Fq 'WATCHDOG_SUPPRESS_FILE' "$GATE_CONTROL"; then
