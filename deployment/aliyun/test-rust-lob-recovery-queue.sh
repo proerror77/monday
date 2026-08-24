@@ -167,6 +167,11 @@ id() {
 
 systemctl() {
   if [[ ${1:-} == start ]]; then
+    if { : >&8; } 2>/dev/null; then
+      printf 'fd8-open\n' >>"$MOCK_SEQUENCE_LOG"
+    else
+      printf 'fd8-closed\n' >>"$MOCK_SEQUENCE_LOG"
+    fi
     if { : >&9; } 2>/dev/null; then
       printf 'fd9-open\n' >>"$MOCK_SEQUENCE_LOG"
     else
@@ -517,13 +522,16 @@ test_recovery_start_follows_durable_lock_handoff() {
       $0 == "sync " canonical { canonical_sync = NR }
       $0 == "sync " canonical_root { canonical_root_sync = NR }
       $0 == "sync " queue_root { queue_sync = NR }
-      $0 == "flock -u 9" { unlock = NR }
-      $0 == "fd9-closed" { closed = NR }
+      $0 == "flock -u 8" { unlock8 = NR }
+      $0 == "flock -u 9" { unlock9 = NR }
+      $0 == "fd8-closed" { closed8 = NR }
+      $0 == "fd9-closed" { closed9 = NR }
       $0 == start { started = NR }
       END {
-        exit !(canonical_sync && canonical_root_sync && queue_sync && unlock && closed && started &&
-          canonical_sync < unlock && canonical_root_sync < unlock && queue_sync < unlock &&
-          closed == unlock + 1 && started == closed + 1)
+        exit !(canonical_sync && canonical_root_sync && queue_sync && unlock8 && unlock9 &&
+          closed8 && closed9 && started && canonical_sync < unlock8 &&
+          canonical_root_sync < unlock8 && queue_sync < unlock8 && unlock9 == unlock8 + 1 &&
+          closed8 == unlock9 + 1 && closed9 == closed8 + 1 && started == closed9 + 1)
       }
     ' "$sequence"
 
@@ -534,12 +542,15 @@ test_recovery_start_follows_durable_lock_handoff() {
   awk -v canonical_root="$fixture/data/monday/spool/binance-lob" \
     -v start='systemctl start --no-block binance-lob-archiver-recovery@spot.service' '
       $0 == "sync " canonical_root { durable = NR }
-      $0 == "flock -u 9" { unlock = NR }
-      $0 == "fd9-closed" { closed = NR }
+      $0 == "flock -u 8" { unlock8 = NR }
+      $0 == "flock -u 9" { unlock9 = NR }
+      $0 == "fd8-closed" { closed8 = NR }
+      $0 == "fd9-closed" { closed9 = NR }
       $0 == start { started = NR }
       END {
-        exit !(durable && unlock && closed && started && durable < unlock &&
-          closed == unlock + 1 && started == closed + 1)
+        exit !(durable && !unlock8 && unlock9 && closed8 && closed9 && started &&
+          durable < unlock9 && closed8 == unlock9 + 1 && closed9 == closed8 + 1 &&
+          started == closed9 + 1)
       }
     ' "$sequence"
 }

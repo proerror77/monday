@@ -353,6 +353,8 @@ isolate_market() {
   fi
   sync "$CANONICAL_SPOOL"
   sync "$CANONICAL_ROOT"
+  flock -u 8
+  exec 8>&-
   flock -u 9
   exec 9>&-
   systemctl start --no-block "$queue_unit" >/dev/null 2>&1 || true
