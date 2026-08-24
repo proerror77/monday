@@ -96,9 +96,14 @@ exit 0
   write_file "$bin_dir/mv" '#!/usr/bin/env bash
 set -euo pipefail
 args=()
+destination=
 for arg in "$@"; do
+  destination=$arg
   [[ $arg == -T || $arg == -Tf ]] || args+=("$arg")
 done
+if [[ -n ${MONDAY_TEST_FAIL_MV_DEST:-} && $destination == *"$MONDAY_TEST_FAIL_MV_DEST" ]]; then
+  exit 1
+fi
 exec /bin/mv "${args[@]}"
 '
   chmod 0755 "$bin_dir/mv"
@@ -148,6 +153,10 @@ set -euo pipefail
 [[ ${1:-} == ossutil && ${2:-} == cp ]] || exit 2
 src=$3
 dst=$4
+if [[ -n ${MONDAY_TEST_FAIL_OSS_CP_URI_FRAGMENT:-} \
+  && "$src $dst" == *"$MONDAY_TEST_FAIL_OSS_CP_URI_FRAGMENT"* ]]; then
+  exit 1
+fi
 if [[ $src == oss://* ]]; then
   remote="${FAKE_OSS_ROOT}/${src#oss://}"
   if [[ -n ${MONDAY_TEST_CORRUPT_URI_FRAGMENT:-} && $src == *"$MONDAY_TEST_CORRUPT_URI_FRAGMENT"* && ! -e ${FAKE_OSS_ROOT}/.corrupted ]]; then
@@ -253,9 +262,20 @@ run_service() {
 cmd=$1
 shift
 case "$cmd" in
-  daemon-reload) exit 0 ;;
+  daemon-reload)
+    if [[ ${MONDAY_TEST_FAIL_DAEMON_RELOAD_ONCE:-0} == 1 \
+      && ! -e $state_root/.daemon-reload-failed ]]; then
+      : >"$state_root/.daemon-reload-failed"
+      exit 1
+    fi
+    exit 0
+    ;;
   stop)
     for unit in "$@"; do
+      if [[ ${MONDAY_TEST_FAIL_STOP_UNIT:-} == "$unit" ]]; then
+        set_state "$unit" active active
+        exit 1
+      fi
       set_state "$unit" active inactive
     done
     exit 0
@@ -274,9 +294,17 @@ case "$cmd" in
       shift
     fi
     for unit in "$@"; do
-      set_state "$unit" enabled enabled
+      if [[ ${MONDAY_TEST_DISABLED_TIMER:-} == "$unit" ]]; then
+        set_state "$unit" enabled disabled
+      else
+        set_state "$unit" enabled enabled
+      fi
       if (( start_now )); then
-        set_state "$unit" active active
+        if [[ ${MONDAY_TEST_INACTIVE_TIMER:-} == "$unit" ]]; then
+          set_state "$unit" active inactive
+        else
+          set_state "$unit" active active
+        fi
       fi
     done
     exit 0
@@ -628,6 +656,19 @@ assert_failure_receipt() {
   [[ -f $evidence/FAILED.sha256 ]]
 }
 
+assert_timers_contained() {
+  local fixture=$1 timer enabled active
+  for timer in \
+    binance-fee-snapshot-spot.timer \
+    binance-fee-snapshot-usdm.timer \
+    binance-fee-upload.timer; do
+    enabled="$fixture/root/state/systemd/$timer.enabled"
+    active="$fixture/root/state/systemd/$timer.active"
+    [[ ! -f $enabled || $(<"$enabled") == disabled ]]
+    [[ ! -f $active || $(<"$active") == inactive ]]
+  done
+}
+
 test_bad_credential() {
   local fixture="$tmp_dir/bad-credential"
   create_root_layout "$fixture"
@@ -674,6 +715,27 @@ test_preflight_failure_preserves_reason() {
   ! grep -Fq 'unbound variable' "$fixture/err"
 }
 
+test_install_failure_restores_absent_baseline() {
+  local fixture="$tmp_dir/install-failure" evidence
+  create_root_layout "$fixture"
+  create_stub_commands "$fixture/bin"
+  create_artifact_bundle "$fixture/artifact" 3030303030303030303030303030303030303031
+  if PATH="$fixture/bin:$PATH" \
+    MONDAY_ROOT_PREFIX="$fixture/root" \
+    MONDAY_EXPECTED_ROOT_UID="$(file_uid "$fixture/root/etc/monday/credentials/binance-account.json")" \
+    FAKE_OSS_ROOT="$fixture/oss" \
+    MONDAY_TEST_FAIL_DAEMON_RELOAD_ONCE=1 \
+    "$CUTOVER" "$fixture/artifact" fee-test >"$fixture/out" 2>"$fixture/err"; then
+    printf 'cutover ignored an install-time daemon-reload failure\n' >&2
+    exit 1
+  fi
+  assert_failure_receipt "$fixture" 'unhandled command failed'
+  [[ ! -e $fixture/root/etc/systemd/system/binance-fee-upload.timer ]]
+  [[ ! -L $fixture/root/opt/monday/bin/binance-fee-snapshot ]]
+  evidence=$(latest_evidence_dir "$fixture")
+  jq -e '.rollback_result == "baseline-restored"' "$evidence/cutover.json" >/dev/null
+}
+
 test_absent_success_enables_timers() {
   local fixture="$tmp_dir/absent-success"
   create_root_layout "$fixture"
@@ -687,6 +749,65 @@ test_absent_success_enables_timers() {
   [[ $(cat "$fixture/root/state/systemd/binance-fee-snapshot-usdm.timer.enabled") == enabled ]]
   [[ $(cat "$fixture/root/state/systemd/binance-fee-upload.timer.enabled") == enabled ]]
   assert_success_receipt "$fixture" absent
+}
+
+test_success_requires_enabled_active_timers() {
+  local fixture="$tmp_dir/timer-state-failure"
+  create_root_layout "$fixture"
+  create_stub_commands "$fixture/bin"
+  create_artifact_bundle "$fixture/artifact" 3030303030303030303030303030303030303032
+  if PATH="$fixture/bin:$PATH" \
+    MONDAY_ROOT_PREFIX="$fixture/root" \
+    MONDAY_EXPECTED_ROOT_UID="$(file_uid "$fixture/root/etc/monday/credentials/binance-account.json")" \
+    FAKE_OSS_ROOT="$fixture/oss" \
+    MONDAY_TEST_INACTIVE_TIMER=binance-fee-upload.timer \
+    "$CUTOVER" "$fixture/artifact" fee-test >"$fixture/out" 2>"$fixture/err"; then
+    printf 'cutover accepted an enabled but inactive timer\n' >&2
+    exit 1
+  fi
+  assert_failure_receipt "$fixture" 'upload timer is not enabled and active'
+  assert_timers_contained "$fixture"
+}
+
+test_receipt_failure_rolls_back_enabled_timers() {
+  local fixture="$tmp_dir/receipt-failure" evidence
+  create_root_layout "$fixture"
+  create_stub_commands "$fixture/bin"
+  create_artifact_bundle "$fixture/artifact" 3030303030303030303030303030303030303033
+  if PATH="$fixture/bin:$PATH" \
+    MONDAY_ROOT_PREFIX="$fixture/root" \
+    MONDAY_EXPECTED_ROOT_UID="$(file_uid "$fixture/root/etc/monday/credentials/binance-account.json")" \
+    FAKE_OSS_ROOT="$fixture/oss" \
+    MONDAY_TEST_FAIL_MV_DEST=PASSED.sha256 \
+    "$CUTOVER" "$fixture/artifact" fee-test >"$fixture/out" 2>"$fixture/err"; then
+    printf 'cutover stayed enabled after its success marker failed\n' >&2
+    exit 1
+  fi
+  assert_failure_receipt "$fixture" 'terminal success receipt persistence failed'
+  assert_timers_contained "$fixture"
+  evidence=$(latest_evidence_dir "$fixture")
+  [[ ! -e $evidence/PASSED.sha256 ]]
+}
+
+test_rollback_stop_failure_is_not_reported_as_restored() {
+  local fixture="$tmp_dir/rollback-stop-failure" evidence
+  create_root_layout "$fixture"
+  create_stub_commands "$fixture/bin"
+  create_artifact_bundle "$fixture/artifact" 3030303030303030303030303030303030303034
+  if PATH="$fixture/bin:$PATH" \
+    MONDAY_ROOT_PREFIX="$fixture/root" \
+    MONDAY_EXPECTED_ROOT_UID="$(file_uid "$fixture/root/etc/monday/credentials/binance-account.json")" \
+    FAKE_OSS_ROOT="$fixture/oss" \
+    MONDAY_TEST_FAIL_MV_DEST=PASSED.sha256 \
+    MONDAY_TEST_FAIL_STOP_UNIT=binance-fee-snapshot-spot.timer \
+    "$CUTOVER" "$fixture/artifact" fee-test >"$fixture/out" 2>"$fixture/err"; then
+    printf 'cutover ignored a rollback containment failure\n' >&2
+    exit 1
+  fi
+  evidence=$(latest_evidence_dir "$fixture")
+  jq -e '.success == false and .rollback_result == "restore-failed"' \
+    "$evidence/cutover.json" >/dev/null
+  [[ $(<"$fixture/root/state/systemd/binance-fee-snapshot-spot.timer.active") == active ]]
 }
 
 test_artifact_swap_after_freeze_does_not_change_release() {
@@ -713,7 +834,7 @@ test_artifact_swap_after_freeze_does_not_change_release() {
 }
 
 test_market_failure_rolls_back_absent() {
-  local fixture="$tmp_dir/market-failure"
+  local fixture="$tmp_dir/market-failure" old_data old_dir
   create_root_layout "$fixture"
   create_stub_commands "$fixture/bin"
   create_artifact_bundle "$fixture/artifact" 3333333333333333333333333333333333333333
@@ -729,11 +850,42 @@ test_market_failure_rolls_back_absent() {
   assert_failure_receipt "$fixture" 'usdm fee snapshot start failed'
   [[ ! -e $fixture/root/etc/systemd/system/binance-fee-snapshot-usdm.service ]]
   [[ ! -L $fixture/root/opt/monday/bin/binance-fee-snapshot ]]
-  run_cutover "$fixture" "$fixture/artifact" fee-test >"$fixture/retry.out" 2>"$fixture/retry.err" || {
-    cat "$fixture/retry.err" >&2
+  old_data=$(find "$fixture/root/data/monday/spool/binance-fee/lake/raw" \
+    -type f -name fee.json -print -quit)
+  [[ -n $old_data ]]
+  old_dir=${old_data%/fee.json}
+  mv "$old_dir" "${old_dir%/*}/batch=0000000000000000001"
+  if run_cutover "$fixture" "$fixture/artifact" fee-test \
+    >"$fixture/retry.out" 2>"$fixture/retry.err"; then
+    printf 'retry uploaded a triplet left by the failed attempt\n' >&2
     exit 1
-  }
-  assert_success_receipt "$fixture" absent
+  fi
+  assert_failure_receipt "$fixture" 'canonical fee spool contains triplets outside the current cutover'
+  [[ -z $(find "$fixture/oss" -type f -name fee.json -print -quit) ]]
+}
+
+test_preexisting_triplet_blocks_uploader() {
+  local fixture="$tmp_dir/preexisting-triplet" data_dir old_dir
+  create_root_layout "$fixture"
+  create_stub_commands "$fixture/bin"
+  create_artifact_bundle "$fixture/artifact" 3333333333333333333333333333333333333334
+  "$fixture/artifact/binance-fee-snapshot" \
+    --market spot \
+    --symbol BTCUSDT \
+    --output-root "$fixture/root/data/monday/spool/binance-fee" \
+    --account-secret-file "$fixture/root/etc/monday/credentials/binance-account.json"
+  data_dir=$(find "$fixture/root/data/monday/spool/binance-fee/lake/raw" \
+    -type f -name fee.json -print -quit)
+  data_dir=${data_dir%/fee.json}
+  old_dir="${data_dir%/*}/batch=0000000000000000000"
+  mv "$data_dir" "$old_dir"
+  if run_cutover "$fixture" "$fixture/artifact" fee-test >"$fixture/out" 2>"$fixture/err"; then
+    printf 'cutover uploaded a triplet outside the current attempt\n' >&2
+    exit 1
+  fi
+  assert_failure_receipt "$fixture" 'canonical fee spool contains triplets outside the current cutover'
+  [[ -f $old_dir/fee.json ]]
+  [[ -z $(find "$fixture/oss" -type f -name fee.json -print -quit) ]]
 }
 
 test_readback_failure_rolls_back_absent() {
@@ -752,6 +904,23 @@ test_readback_failure_rolls_back_absent() {
   fi
   assert_failure_receipt "$fixture" 'remote fee success marker drifted'
   [[ ! -e $fixture/root/etc/monday/binance-fee-upload.env ]]
+}
+
+test_unhandled_readback_failure_records_reason() {
+  local fixture="$tmp_dir/unhandled-readback-failure"
+  create_root_layout "$fixture"
+  create_stub_commands "$fixture/bin"
+  create_artifact_bundle "$fixture/artifact" 4444444444444444444444444444444444444445
+  if PATH="$fixture/bin:$PATH" \
+    MONDAY_ROOT_PREFIX="$fixture/root" \
+    MONDAY_EXPECTED_ROOT_UID="$(file_uid "$fixture/root/etc/monday/credentials/binance-account.json")" \
+    FAKE_OSS_ROOT="$fixture/oss" \
+    MONDAY_TEST_FAIL_OSS_CP_URI_FRAGMENT=fee.json.manifest.json \
+    "$CUTOVER" "$fixture/artifact" fee-test >"$fixture/out" 2>"$fixture/err"; then
+    printf 'cutover ignored an unhandled OSS readback failure\n' >&2
+    exit 1
+  fi
+  assert_failure_receipt "$fixture" 'unhandled command failed'
 }
 
 test_market_failure_restores_partial_contained() {
@@ -811,10 +980,16 @@ run_case() {
 run_case bad_credential test_bad_credential
 run_case digest_drift test_digest_drift
 run_case preflight_failure test_preflight_failure_preserves_reason
+run_case install_failure test_install_failure_restores_absent_baseline
 run_case absent_success test_absent_success_enables_timers
+run_case timer_state_failure test_success_requires_enabled_active_timers
+run_case receipt_failure test_receipt_failure_rolls_back_enabled_timers
+run_case rollback_stop_failure test_rollback_stop_failure_is_not_reported_as_restored
 run_case artifact_swap test_artifact_swap_after_freeze_does_not_change_release
 run_case market_failure test_market_failure_rolls_back_absent
+run_case preexisting_triplet test_preexisting_triplet_blocks_uploader
 run_case readback_failure test_readback_failure_rolls_back_absent
+run_case unhandled_readback test_unhandled_readback_failure_records_reason
 run_case partial_failure test_market_failure_restores_partial_contained
 run_case partial_success test_partial_contained_success_enables_timers
 

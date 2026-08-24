@@ -126,6 +126,12 @@ timer_enabled_or_active() {
   [[ $state == enabled ]] || systemctl is-active --quiet "$timer"
 }
 
+timer_enabled_and_active() {
+  local timer=$1 state
+  state=$(systemctl is-enabled "$timer" 2>/dev/null || true)
+  [[ $state == enabled ]] && systemctl is-active --quiet "$timer"
+}
+
 validate_credential() {
   secure_secret_file "$CREDENTIAL_PATH" \
     || die "credential must be a direct root-owned 0600 regular file: $CREDENTIAL_PATH"
@@ -313,18 +319,43 @@ snapshot_baseline() {
 }
 
 restore_baseline() {
-  local path mode
-  systemctl stop \
+  local path mode unit timer state
+  for unit in \
     binance-fee-snapshot-spot.timer \
     binance-fee-snapshot-usdm.timer \
     binance-fee-upload.timer \
     binance-fee-snapshot-spot.service \
     binance-fee-snapshot-usdm.service \
-    binance-fee-upload.service >/dev/null 2>&1 || true
-  systemctl disable \
+    binance-fee-upload.service; do
+    state=$(systemctl is-active "$unit" 2>/dev/null || true)
+    case $state in
+      active|activating|deactivating|reloading)
+        systemctl stop "$unit" >/dev/null 2>&1 || return 1
+        ;;
+      inactive|failed|unknown) ;;
+      *) return 1 ;;
+    esac
+    state=$(systemctl is-active "$unit" 2>/dev/null || true)
+    case $state in
+      inactive|failed|unknown) ;;
+      *) return 1 ;;
+    esac
+  done
+  for timer in \
     binance-fee-snapshot-spot.timer \
     binance-fee-snapshot-usdm.timer \
-    binance-fee-upload.timer >/dev/null 2>&1 || true
+    binance-fee-upload.timer; do
+    state=$(systemctl is-enabled "$timer" 2>/dev/null || true)
+    case $state in
+      disabled|masked|masked-runtime|not-found|static) ;;
+      *) systemctl disable "$timer" >/dev/null 2>&1 || return 1 ;;
+    esac
+    state=$(systemctl is-enabled "$timer" 2>/dev/null || true)
+    case $state in
+      disabled|masked|masked-runtime|not-found|static) ;;
+      *) return 1 ;;
+    esac
+  done
   rm -f \
     "$SNAPSHOT_LINK" \
     "$UPLOAD_LINK" \
@@ -479,6 +510,25 @@ discover_new_triplets() {
     || die 'fee cutover did not produce exactly one spot and one USD-M triplet'
 }
 
+verify_pending_triplet_scope() {
+  local expected actual data_file dir
+  expected="$EVIDENCE_DIR/current-triplets.lst"
+  actual="$EVIDENCE_DIR/pending-triplets.lst"
+  jq -r '.object_prefix' "$LOCAL_TRIPLETS_JSONL" | sort >"$expected"
+  : >"$actual"
+  if [[ -d $FEE_SPOOL_ROOT/lake/raw ]]; then
+    while IFS= read -r data_file; do
+      dir=${data_file%/fee.json}
+      [[ $dir == "$FEE_SPOOL_ROOT/"* ]] \
+        || die "fee triplet escapes the spool root: $dir"
+      printf '%s\n' "${dir#"$FEE_SPOOL_ROOT/"}"
+    done < <(find "$FEE_SPOOL_ROOT/lake/raw" -type f -name fee.json | sort) \
+      | sort >"$actual"
+  fi
+  cmp -s "$expected" "$actual" \
+    || die 'canonical fee spool contains triplets outside the current cutover'
+}
+
 oss_cp() {
   local src=$1 dst=$2
   aliyun ossutil cp "$src" "$dst" \
@@ -531,6 +581,8 @@ verify_remote_triplets() {
 
 write_receipt() {
   local receipt=$1 marker=$2 success=$3 rollback_result=$4 failure_reason=$5
+  local receipt_tmp="${receipt}.new.$$" marker_tmp="${marker}.new.$$" digest
+  rm -f "$receipt_tmp" "$marker_tmp"
   jq -n \
     --arg schema monday.binance_fee_cutover.v1 \
     --arg started_at "$STARTED_AT" \
@@ -565,13 +617,33 @@ write_receipt() {
       failure_reason:(if $failure_reason == "" then null else $failure_reason end),
       local_triplets:$local_triplets,
       remote_triplets:$remote_triplets
-    }' >"$receipt"
-  (cd "$EVIDENCE_DIR" && sha256sum "${receipt##*/}" >"$marker")
+    }' >"$receipt_tmp" || { rm -f "$receipt_tmp" "$marker_tmp"; return 1; }
+  digest=$(sha256sum "$receipt_tmp" | awk '{print $1}') \
+    || { rm -f "$receipt_tmp" "$marker_tmp"; return 1; }
+  printf '%s  %s\n' "$digest" "${receipt##*/}" >"$marker_tmp" \
+    || { rm -f "$receipt_tmp" "$marker_tmp"; return 1; }
+  mv -Tf "$receipt_tmp" "$receipt" \
+    || { rm -f "$receipt_tmp" "$marker_tmp"; return 1; }
+  mv -Tf "$marker_tmp" "$marker" \
+    || { rm -f "$receipt_tmp" "$marker_tmp"; return 1; }
+}
+
+cleanup_temporary() {
+  rm -rf "$CONTROL_STAGE" "$VALIDATED_ARTIFACT_DIR" 2>/dev/null || true
+  rm -f "$LOCAL_TRIPLETS_JSONL" "$REMOTE_TRIPLETS_JSONL" 2>/dev/null || true
+}
+
+on_error() {
+  local status=$1 line=$2 command=$3
+  if [[ -z ${FAILURE_REASON:-} ]]; then
+    FAILURE_REASON="unhandled command failed at line $line with status $status: $command"
+  fi
+  return "$status"
 }
 
 on_exit() {
   local status=$? rollback_result=$ROLLBACK_RESULT failure_reason=${FAILURE_REASON:-}
-  trap - EXIT
+  trap - ERR EXIT
   if (( status != 0 )) && (( TRANSITION_STARTED == 1 )); then
     if restore_baseline; then
       rollback_result=baseline-restored
@@ -580,14 +652,15 @@ on_exit() {
     fi
   fi
   if [[ -n $EVIDENCE_DIR ]]; then
-    write_receipt "$EVIDENCE_DIR/cutover.json" \
+    if ! write_receipt "$EVIDENCE_DIR/cutover.json" \
       "$EVIDENCE_DIR/$([[ $status -eq 0 ]] && printf 'PASSED.sha256' || printf 'FAILED.sha256')" \
       "$([[ $status -eq 0 ]] && printf true || printf false)" \
       "$rollback_result" \
-      "$failure_reason"
+      "$failure_reason"; then
+      printf 'failed to persist terminal fee cutover receipt\n' >&2
+    fi
   fi
-  rm -rf "$CONTROL_STAGE" "$VALIDATED_ARTIFACT_DIR"
-  rm -f "$LOCAL_TRIPLETS_JSONL" "$REMOTE_TRIPLETS_JSONL"
+  cleanup_temporary
   exit "$status"
 }
 
@@ -621,6 +694,8 @@ VALIDATED_ARTIFACT_DIR=
 EVIDENCE_DIR=
 LOCAL_TRIPLETS_JSONL=$(mktemp)
 REMOTE_TRIPLETS_JSONL=$(mktemp)
+MARKER=
+trap 'on_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 trap on_exit EXIT
 
 install -d -m 0755 "$LOCK_ROOT"
@@ -636,8 +711,8 @@ validate_credential
 validate_artifact_bundle "$1"
 snapshot_baseline
 stage_release
-install_candidate
 TRANSITION_STARTED=1
+install_candidate
 
 MARKER="$EVIDENCE_DIR/pre-snapshot.marker"
 : >"$MARKER"
@@ -653,6 +728,7 @@ systemctl start binance-fee-snapshot-usdm.service \
   || { FAILURE_REASON='usdm fee snapshot did not finish successfully'; exit 1; }
 
 discover_new_triplets "$MARKER"
+verify_pending_triplet_scope
 OSS_BUCKET=$(env_value "$UPLOAD_ENV_PATH" OSS_BUCKET) || die 'missing OSS_BUCKET'
 OSS_ENDPOINT=$(env_value "$UPLOAD_ENV_PATH" OSS_ENDPOINT) || die 'missing OSS_ENDPOINT'
 OSS_REGION=$(env_value "$UPLOAD_ENV_PATH" OSS_REGION) || die 'missing OSS_REGION'
@@ -669,9 +745,18 @@ systemctl enable --now \
   binance-fee-snapshot-spot.timer \
   binance-fee-snapshot-usdm.timer \
   binance-fee-upload.timer >/dev/null
-timer_enabled_or_active binance-fee-snapshot-spot.timer \
-  || { FAILURE_REASON='spot timer did not enable'; exit 1; }
-timer_enabled_or_active binance-fee-snapshot-usdm.timer \
-  || { FAILURE_REASON='usdm timer did not enable'; exit 1; }
-timer_enabled_or_active binance-fee-upload.timer \
-  || { FAILURE_REASON='upload timer did not enable'; exit 1; }
+timer_enabled_and_active binance-fee-snapshot-spot.timer \
+  || { FAILURE_REASON='spot timer is not enabled and active'; exit 1; }
+timer_enabled_and_active binance-fee-snapshot-usdm.timer \
+  || { FAILURE_REASON='usdm timer is not enabled and active'; exit 1; }
+timer_enabled_and_active binance-fee-upload.timer \
+  || { FAILURE_REASON='upload timer is not enabled and active'; exit 1; }
+
+if ! write_receipt "$EVIDENCE_DIR/cutover.json" "$EVIDENCE_DIR/PASSED.sha256" \
+  true not-needed ''; then
+  FAILURE_REASON='terminal success receipt persistence failed'
+  exit 1
+fi
+TRANSITION_STARTED=0
+trap - ERR EXIT
+cleanup_temporary
