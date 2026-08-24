@@ -120,14 +120,34 @@ grep -Fq 'install -m "$mode" "$WATCHDOG_BINARY" "$rollback_dir/bin/$WATCHDOG_SCR
 grep -Fq 'atomic_install "$mode" "$rollback_dir/bin/$WATCHDOG_SCRIPT_ASSET" "$WATCHDOG_BINARY"' \
   "$CUTOVER"
 grep -Fq 'systemctl stop "$WATCHDOG_TIMER" "$WATCHDOG_SERVICE"' "$CUTOVER"
+grep -Fq 'unit_enabled "$WATCHDOG_TIMER"' "$CUTOVER"
+grep -Fq 'watchdog timer became active before the unsuppressed probe' "$CUTOVER"
 grep -Fq 'systemctl restart "$WATCHDOG_TIMER"' "$CUTOVER"
+grep -Fq 'verify_watchdog_probe "$watchdog_probe_journal"' "$CUTOVER"
+grep -Fq 'watchdog_probe:{invocation_id:$watchdog_probe_invocation_id,' "$CUTOVER"
 watchdog_admit_line=$(grep -nF 'admit_watchdog_suppress "$watchdog_suppress_owner"' "$CUTOVER" | cut -d: -f1)
 transition_start_line=$(grep -nF 'transition_started=true' "$CUTOVER" | head -1 | cut -d: -f1)
 watchdog_success_remove_line=$(grep -nF 'remove_watchdog_suppress "$watchdog_suppress_owner"' "$CUTOVER" | tail -1 | cut -d: -f1)
+watchdog_timer_inactive_guard_line=$(grep -nF 'watchdog timer became active before the unsuppressed probe' \
+  "$CUTOVER" | cut -d: -f1)
+watchdog_absent_line=$(grep -nF '[[ ! -e $WATCHDOG_SUPPRESS_FILE && ! -L $WATCHDOG_SUPPRESS_FILE ]]' \
+  "$CUTOVER" | tail -1 | cut -d: -f1)
+watchdog_probe_line=$(grep -nF 'verify_watchdog_probe "$watchdog_probe_journal"' "$CUTOVER" \
+  | cut -d: -f1)
+watchdog_timer_restart_line=$(grep -nF 'systemctl restart "$WATCHDOG_TIMER"' "$CUTOVER" \
+  | tail -1 | cut -d: -f1)
+cutover_marker_line=$(grep -nF 'success_marker="$evidence_dir/PASSED.sha256"' "$CUTOVER" \
+  | cut -d: -f1)
 cutover_success_line=$(grep -nF 'cutover_succeeded=true' "$CUTOVER" | cut -d: -f1)
 ((watchdog_admit_line < transition_start_line \
-  && watchdog_success_remove_line < cutover_success_line)) || {
-  printf 'cutover watchdog suppression is not admitted before transition or cleared before success\n' >&2
+  && watchdog_timer_inactive_guard_line < watchdog_success_remove_line \
+  && watchdog_success_remove_line < watchdog_absent_line \
+  && watchdog_absent_line < watchdog_probe_line \
+  && watchdog_probe_line < watchdog_timer_restart_line \
+  && watchdog_timer_restart_line < cutover_marker_line \
+  && watchdog_probe_line < cutover_marker_line \
+  && cutover_marker_line < cutover_success_line)) || {
+  printf 'cutover watchdog suppression/probe ordering is not fail-closed\n' >&2
   exit 1
 }
 
@@ -3948,9 +3968,17 @@ exercise_failed_cutover_cleanup() (
   transition_started=true
   watchdog_suppressed=true
   watchdog_suppress_owner=ours
+  WATCHDOG_SUPPRESS_FILE="$evidence_dir/polymarket-upload-watchdog.suppress"
+  write_watchdog_suppress() {
+    [[ $1 == "$watchdog_suppress_owner" ]] || return 92
+    [[ -e $WATCHDOG_SUPPRESS_FILE ]] || printf '%s\n' \
+      '{"schema":"monday.polymarket_cutover_watchdog_suppress.v1","owner":"ours"}' \
+      >"$WATCHDOG_SUPPRESS_FILE"
+  }
   restore_legacy() {
     [[ ! -e $evidence_dir/PASSED.sha256 \
-      && -f $evidence_dir/PASSED.rollback-pending.sha256 ]] || return 90
+      && -f $evidence_dir/PASSED.rollback-pending.sha256 \
+      && -f $WATCHDOG_SUPPRESS_FILE ]] || return 90
     printf '%s\n' pending >"$evidence_dir/restore-observed-pending"
     return "$restore_result"
   }
@@ -7371,6 +7399,18 @@ cutover_final_upload_line=$(grep -n '^verify_upload_units "$pinned_upload_env"' 
 cutover_final_oss_line=$(grep -n \
   'pinned OSS configuration changed before cutover completion' "$CUTOVER" \
   | cut -d: -f1)
+cutover_watchdog_remove_line=$(grep -n \
+  '^remove_watchdog_suppress "$watchdog_suppress_owner"$' "$CUTOVER" \
+  | tail -1 | cut -d: -f1)
+cutover_watchdog_absent_line=$(grep -nF \
+  "[[ ! -e \$WATCHDOG_SUPPRESS_FILE && ! -L \$WATCHDOG_SUPPRESS_FILE ]] \\" "$CUTOVER" \
+  | tail -1 | cut -d: -f1)
+cutover_watchdog_probe_line=$(grep -n '^verify_watchdog_probe "\$watchdog_probe_journal"' \
+  "$CUTOVER" | cut -d: -f1)
+cutover_watchdog_probe_sync_line=$(grep -n '^sync "\$watchdog_probe_journal"$' "$CUTOVER" \
+  | cut -d: -f1)
+cutover_watchdog_timer_restart_line=$(grep -n '^systemctl restart "\$WATCHDOG_TIMER"$' \
+  "$CUTOVER" | tail -1 | cut -d: -f1)
 cutover_marker_hash_line=$(grep -n '^  sha256sum cutover.json >' "$CUTOVER" | cut -d: -f1)
 cutover_marker_move_line=$(grep -n '^mv -Tf "$success_marker_tmp" "$success_marker"$' \
   "$CUTOVER" | cut -d: -f1)
@@ -7379,7 +7419,12 @@ cutover_marker_dir_sync_line=$(grep -n '^sync -f "$evidence_dir"$' "$CUTOVER" \
   | tail -1 | cut -d: -f1)
 cutover_success_line=$(grep -n '^cutover_succeeded=true$' "$CUTOVER" | cut -d: -f1)
 cutover_trap_off_line=$(grep -n '^trap - EXIT$' "$CUTOVER" | tail -1 | cut -d: -f1)
-((cutover_sync_line < cutover_rollback_sync_line \
+((cutover_watchdog_remove_line < cutover_watchdog_absent_line \
+  && cutover_watchdog_absent_line < cutover_watchdog_probe_line \
+  && cutover_watchdog_probe_line < cutover_watchdog_probe_sync_line \
+  && cutover_watchdog_probe_sync_line < cutover_watchdog_timer_restart_line \
+  && cutover_watchdog_timer_restart_line < cutover_sync_line \
+  && cutover_sync_line < cutover_rollback_sync_line \
   && cutover_rollback_sync_line < cutover_release_sync_line \
   && cutover_release_sync_line < cutover_final_runtime_line \
   && cutover_final_runtime_line < cutover_final_upload_line \
@@ -7529,6 +7574,99 @@ for retry_case in pid-delayed exe-delayed preexec-delayed; do
     exit 1
   fi
 done
+
+watchdog_probe_functions="$tmp_dir/watchdog-probe-functions.sh"
+sed -n '/^verify_watchdog_probe() {$/,/^}$/p' "$CUTOVER" >"$watchdog_probe_functions"
+[[ -s $watchdog_probe_functions ]] || {
+  printf 'cutover watchdog probe helper is missing\n' >&2
+  exit 1
+}
+run_watchdog_probe_case() (
+  local test_case=$1
+  local root="$tmp_dir/watchdog-probe-$test_case"
+  local probe_status=0
+  probe_previous_invocation=11111111111111111111111111111111
+  probe_new_invocation=22222222222222222222222222222222
+  probe_wrong_invocation=33333333333333333333333333333333
+  mkdir -p "$root"
+  WATCHDOG_SUPPRESS_FILE="$root/polymarket-upload-watchdog.suppress"
+  WATCHDOG_SERVICE=polymarket-market-tape-upload-watchdog.service
+  reset_failed_unit_if_needed() { [[ $1 == "$WATCHDOG_SERVICE" ]]; }
+  systemctl() {
+    case "$1" in
+      is-failed) return 1 ;;
+      start) : >"$root/started"; return 0 ;;
+      --sync) return 0 ;;
+      show)
+        case "$2" in
+          --property=InvocationID)
+            [[ -e $root/started ]] \
+              && printf '%s\n' "$probe_new_invocation" \
+              || printf '%s\n' "$probe_previous_invocation"
+            ;;
+          --property=ActiveState) printf '%s\n' inactive ;;
+          --property=Result) printf '%s\n' success ;;
+          --property=ExecMainStatus) printf '%s\n' 0 ;;
+          *) return 1 ;;
+        esac
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  journalctl() {
+    if [[ $1 == --sync ]]; then
+      return 0
+    fi
+    case "$test_case" in
+      empty-journal) ;;
+      mixed-invocation)
+        printf '%s\n' \
+          '{"_SYSTEMD_INVOCATION_ID":"'"$probe_new_invocation"'","MESSAGE":"market_pending_rotated_tapes=1 reference_pending_rotated_tapes=0"}' \
+          '{"_SYSTEMD_INVOCATION_ID":"'"$probe_wrong_invocation"'","MESSAGE":"market_pending_rotated_tapes=2 reference_pending_rotated_tapes=0"}'
+        ;;
+      missing-stats)
+        printf '%s\n' \
+          '{"_SYSTEMD_INVOCATION_ID":"'"$probe_new_invocation"'","MESSAGE":"watchdog probe without stats"}'
+        ;;
+      suppressed-message)
+        printf '%s\n' \
+          '{"_SYSTEMD_INVOCATION_ID":"'"$probe_new_invocation"'","MESSAGE":"suppressed: /run/monday/polymarket-upload-watchdog.suppress present; skipping all remediation"}'
+        ;;
+      *)
+        printf '%s\n' \
+          '{"_SYSTEMD_INVOCATION_ID":"'"$probe_new_invocation"'","MESSAGE":"market_pending_rotated_tapes=1 reference_pending_rotated_tapes=0 data_free_gb=10"}' \
+          '{"_SYSTEMD_INVOCATION_ID":"'"$probe_new_invocation"'","MESSAGE":"watchdog probe complete"}'
+        ;;
+    esac
+  }
+  sleep() { :; }
+  if [[ $test_case == suppressed ]]; then
+    printf '%s\n' '{"schema":"monday.polymarket_cutover_watchdog_suppress.v1"}' \
+      >"$WATCHDOG_SUPPRESS_FILE"
+  fi
+  # shellcheck source=/dev/null
+  source "$watchdog_probe_functions"
+  verify_watchdog_probe "$root/watchdog-probe.journal" || probe_status=$?
+  if [[ $test_case != success ]]; then
+    ((probe_status == 0))
+    return
+  fi
+  ((probe_status == 0))
+  [[ $WATCHDOG_PROBE_INVOCATION_ID == "$probe_new_invocation" \
+    && $WATCHDOG_PROBE_ACTIVE_STATE == inactive \
+    && $WATCHDOG_PROBE_RESULT == success \
+    && $WATCHDOG_PROBE_STATUS == 0 \
+    && -s $root/watchdog-probe.journal \
+    && $WATCHDOG_PROBE_JOURNAL_SHA256 \
+      == $(sha256sum "$root/watchdog-probe.journal" | awk '{print $1}') ]]
+)
+for rejected_case in suppressed empty-journal mixed-invocation missing-stats suppressed-message; do
+  if run_watchdog_probe_case "$rejected_case"; then
+    printf 'watchdog probe helper accepted counterexample: %s\n' "$rejected_case" >&2
+    exit 1
+  fi
+done
+run_watchdog_probe_case success
 
 snapshot_nullglob_line=$(grep -n '^    shopt -s nullglob$' "$CUTOVER" | cut -d: -f1)
 snapshot_manifest_line=$(grep -n \
