@@ -598,6 +598,7 @@ jobs:
               "${reference_production_assets[@]}"
           )
           fee_production_assets=(
+            binance-fee-cutover.sh
             binance-fee-snapshot-spot.service
             binance-fee-snapshot-spot.timer
             binance-fee-snapshot-usdm.service
