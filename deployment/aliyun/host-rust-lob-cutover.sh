@@ -545,8 +545,19 @@ stage_existing_deployment_for_rollback() {
     if [[ $source_kind == release ]]; then
       source="$release_deployment/$asset"
       secure_regular_file "$source"
-      cmp -s -- "$source" "$installed_source" \
-        || fail "installed production asset drifted from the active immutable release: $installed_source"
+      if ! cmp -s -- "$source" "$installed_source"; then
+        if [[ $OLD_MODE == partial-contained-spot-live \
+          && $asset == binance-lob-archiver-production@.service \
+          && $(grep -Fxc 'ReadWritePaths=/data/monday/spool/binance-lob -/data/monday/spool/binance-lob-recovery' "$source") -eq 1 \
+          && $(grep -Fxc 'ReadWritePaths=/data/monday/spool' "$installed_source") -eq 1 ]] \
+          && cmp -s -- "$source" <(sed \
+            's#^ReadWritePaths=/data/monday/spool$#ReadWritePaths=/data/monday/spool/binance-lob -/data/monday/spool/binance-lob-recovery#' \
+            "$installed_source"); then
+          source=$installed_source
+        else
+          fail "installed production asset drifted from the active immutable release: $installed_source"
+        fi
+      fi
     else
       source=$installed_source
     fi
