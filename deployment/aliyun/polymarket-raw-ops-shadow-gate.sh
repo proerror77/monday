@@ -1088,7 +1088,7 @@ real_market_segment_preflight() {
   local preflight_dataset started_at completed_at candidate_exit candidate_summary
   local terminal_status upload_summary
   local source_quote_records source_recorded_hours source_content_sha256 source_bytes
-  local source_identity source_mtime
+  local source_identity source_mtime source_path_identity source_mode_owner
   local uploaded_content_sha256 uploaded_canonical
   local uploaded_uri uploaded_triplet uploaded_name preflight_tmp preflight_json
   local candidate_stdout_tmp candidate_stdout candidate_stderr_tmp candidate_stderr
@@ -1141,6 +1141,15 @@ real_market_segment_preflight() {
     fi
   done
   [[ $stable == true ]] || return 1
+  source_mode_owner=$(run_before_deadline "$preflight_deadline" \
+    stat -c '%U:%G:%a' "$source_tmp") || return 1
+  [[ $source_mode_owner == hftcollector:hftcollector:640 ]] || return 1
+  if [[ -e $source_path || -L $source_path ]]; then
+    [[ -f $source_path && ! -L $source_path ]] || return 1
+    source_path_identity=$(run_before_deadline "$preflight_deadline" \
+      stat -c '%d:%i:%s:%Y:%Z' "$source_path") || return 1
+    [[ $source_path_identity == "$after" ]] || return 1
+  fi
   preflight_dataset="crypto_expiry_preflight_${candidate_sha:0:12}_${run_id,,}"
   [[ $preflight_dataset =~ ^[a-z0-9_-]+$ ]] || return 1
   started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)

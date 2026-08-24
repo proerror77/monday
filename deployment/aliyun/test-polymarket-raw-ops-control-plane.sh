@@ -1241,8 +1241,15 @@ set -euo pipefail
 if [[ -n ${UNSTABLE_STAT_PATH_FILE:-} ]]; then
   printf '%s\n' "${2:-}" >"$UNSTABLE_STAT_PATH_FILE"
 fi
+if [[ -n ${LINKED_SOURCE_PATH_FILE:-} ]]; then
+  printf '%s\n' "${2:-}" >"$LINKED_SOURCE_PATH_FILE"
+fi
 if [[ -n ${UNLINK_SOURCE_AFTER_LINK:-} && ${1:-} == "$UNLINK_SOURCE_AFTER_LINK" ]]; then
   rm -f -- "$1"
+fi
+if [[ -n ${REPLACE_SOURCE_AFTER_LINK:-} && ${1:-} == "$REPLACE_SOURCE_AFTER_LINK" ]]; then
+  rm -f -- "$1"
+  cp "$REPLACE_SOURCE_WITH" "$1"
 fi
 EOF
 chmod +x "$fake_bin/ln"
@@ -1256,6 +1263,10 @@ unstable_path=${UNSTABLE_STAT_PATH:-}
 if [[ -n ${UNSTABLE_STAT_PATH_FILE:-} && -f $UNSTABLE_STAT_PATH_FILE ]]; then
   unstable_path=$(<"$UNSTABLE_STAT_PATH_FILE")
 fi
+linked_path=
+if [[ -n ${LINKED_SOURCE_PATH_FILE:-} && -f $LINKED_SOURCE_PATH_FILE ]]; then
+  linked_path=$(<"$LINKED_SOURCE_PATH_FILE")
+fi
 if [[ -n $unstable_path && $last == "$unstable_path" \
   && ${1:-} == -c && ${2:-} == '%d:%i:%s:%Y:%Z' ]]; then
   count=0
@@ -1263,6 +1274,11 @@ if [[ -n $unstable_path && $last == "$unstable_path" \
   count=$((count + 1))
   printf '%s\n' "$count" >"$UNSTABLE_STAT_COUNTER"
   printf '%s:%s\n' "$("$PREFLIGHT_STAT" "$@")" "$count"
+  exit 0
+fi
+if [[ -n $linked_path && $last == "$linked_path" \
+  && ${1:-} == -c && ${2:-} == '%U:%G:%a' ]]; then
+  printf '%s\n' "${LINKED_SOURCE_MODE_OWNER:-hftcollector:hftcollector:640}"
   exit 0
 fi
 exec "$PREFLIGHT_STAT" "$@"
@@ -1357,6 +1373,7 @@ cp "$remote_root/${template_uri#oss://bucket/}"* "$unrelated_template_dir/"
 
 original_path=$PATH
 export PATH="$fake_bin:$PATH"
+export LINKED_SOURCE_PATH_FILE="$preflight_root/linked-path"
 export FAKE_OSS_ROOT="$remote_root"
 export FAKE_CANDIDATE_TEMPLATE="$matching_template_dir"
 export PREFLIGHT_STAT="$preflight_stat"
@@ -1595,6 +1612,35 @@ jq -e '.status == "passed"
   printf 'real-segment preflight did not preserve content parity after the production path was removed\n' >&2
   exit 1
 }
+
+bad_mode_case="$preflight_root/bad-mode-case"
+mkdir -p "$bad_mode_case/source" "$bad_mode_case/spool" \
+  "$bad_mode_case/download" "$bad_mode_case/evidence"
+cp "$compatible" \
+  "$bad_mode_case/source/market-updates.20260101T021500000000.ndjson"
+export LINKED_SOURCE_MODE_OWNER='root:wheel:600'
+if real_market_segment_preflight "$bad_mode_case/source" "$bad_mode_case/spool" \
+  "$bad_mode_case/download" "$bad_mode_case/evidence"; then
+  printf 'real-segment preflight accepted a linked segment with the wrong owner or mode\n' >&2
+  exit 1
+fi
+unset LINKED_SOURCE_MODE_OWNER
+
+replaced_source_case="$preflight_root/replaced-source-case"
+mkdir -p "$replaced_source_case/source" "$replaced_source_case/spool" \
+  "$replaced_source_case/download" "$replaced_source_case/evidence"
+replaced_source="$replaced_source_case/source/market-updates.20260101T021700000000.ndjson"
+replacement_payload="$replaced_source_case/replacement.ndjson"
+cp "$compatible" "$replaced_source"
+cp "$noncanonical" "$replacement_payload"
+export REPLACE_SOURCE_AFTER_LINK="$replaced_source"
+export REPLACE_SOURCE_WITH="$replacement_payload"
+if real_market_segment_preflight "$replaced_source_case/source" "$replaced_source_case/spool" \
+  "$replaced_source_case/download" "$replaced_source_case/evidence"; then
+  printf 'real-segment preflight accepted a production path replaced by a different inode after linking\n' >&2
+  exit 1
+fi
+unset REPLACE_SOURCE_AFTER_LINK REPLACE_SOURCE_WITH
 
 # Counterexample (issue #586): a tick-level segment much larger than the scan
 # window must not make the bounded SCAN exceed its budget. The upload path
