@@ -17,6 +17,7 @@ readonly GATE_CONTROL="$SCRIPT_DIR/polymarket-raw-ops-gate-control.sh"
 readonly GATE_UNIT="$SCRIPT_DIR/polymarket-raw-ops-gate@.service"
 readonly CUTOVER="$SCRIPT_DIR/polymarket-raw-ops-cutover.sh"
 readonly WATCHDOG="$SCRIPT_DIR/polymarket-market-tape-upload-watchdog.sh"
+readonly WATCHDOG_TIMER="$SCRIPT_DIR/polymarket-market-tape-upload-watchdog.timer"
 readonly WORKFLOW="$SCRIPT_DIR/../../.github/workflows/acr-publish.yml"
 readonly CI_WORKFLOW="$SCRIPT_DIR/../../.github/workflows/ci.yml"
 readonly README="$SCRIPT_DIR/README.md"
@@ -63,6 +64,11 @@ join_shell_continuations() {
 }
 
 shellcheck "$GATE" "$GATE_CONTROL" "$CUTOVER" "$WATCHDOG" "$0"
+grep -Fxq 'OnActiveSec=2min' "$WATCHDOG_TIMER"
+if grep -Fq 'OnBootSec=' "$WATCHDOG_TIMER"; then
+  printf 'watchdog timer must schedule from each activation, not only from boot\n' >&2
+  exit 1
+fi
 if grep -Fq 'release-preflight' "$GATE_CONTROL" \
   || grep -Fq 'preflight-hold' "$GATE_CONTROL" \
   || grep -Fq 'WATCHDOG_SUPPRESS_FILE' "$GATE_CONTROL"; then
