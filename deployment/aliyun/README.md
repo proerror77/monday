@@ -87,9 +87,11 @@ logs one journal INFO line (tag `polymarket-upload-watchdog`) with, for each of
 the market (`/data/monday/spool/polymarket`) and reference
 (`/data/monday/spool/polymarket-reference`) spools, the pending rotated-tape
 count and the oldest rotated-tape age, plus `/data` free gigabytes. For each
-lane independently: if the upload timer (`polymarket-market-tape-upload.timer`
-or `polymarket-reference-upload.timer`) is not active, the watchdog starts it
-and logs a WARNING with the previous state; if the upload service is inactive
+lane independently: if an enabled upload timer
+(`polymarket-market-tape-upload.timer` or `polymarket-reference-upload.timer`)
+is not active, the watchdog starts it and logs a WARNING with the previous
+state. A disabled or masked timer is administrative containment, so the
+watchdog logs it and leaves that lane untouched. If the upload service is inactive
 while a rotated tape is older than 90 minutes, it starts the service with
 `--no-block` and logs why. A failed start is logged as an ERROR naming the
 lane, the remaining lane is still checked, and the run exits nonzero at the
@@ -102,14 +104,10 @@ Governed cutovers stop both upload timers and services on purpose, so the
 watchdog honors the runtime suppression file
 `/run/monday/polymarket-upload-watchdog.suppress`: while it exists, every run
 logs one `suppressed` INFO line and performs no remediation on either lane.
-The file lives under `/run` and never survives a reboot. Any controller that
-stops the upload timers MUST create the file before stopping them and remove
-it immediately after the cutover concludes:
-
-```bash
-sudo install -D /dev/null /run/monday/polymarket-upload-watchdog.suppress
-sudo rm -f /run/monday/polymarket-upload-watchdog.suppress
-```
+The file lives under `/run` and never survives a reboot. The raw-ops cutover
+controller writes an owner-bound JSON marker before stopping either timer and
+removes only its own marker after a successful cutover or rollback. Operators
+must not create or remove this file by hand.
 
 Install and enable it alongside the upload units. This is a governed runtime
 change with one named controller:

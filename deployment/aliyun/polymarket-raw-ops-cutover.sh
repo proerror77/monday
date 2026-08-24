@@ -25,6 +25,8 @@ readonly REFERENCE_UPLOAD_UNIT=polymarket-reference-upload.service
 readonly REFERENCE_UPLOAD_TIMER=polymarket-reference-upload.timer
 readonly MARKET_UPLOAD_UNIT=polymarket-market-tape-upload.service
 readonly MARKET_UPLOAD_TIMER=polymarket-market-tape-upload.timer
+readonly WATCHDOG_SUPPRESS_FILE=/run/monday/polymarket-upload-watchdog.suppress
+readonly WATCHDOG_SERVICE=polymarket-market-tape-upload-watchdog.service
 readonly HEALTH=/data/monday/spool/polymarket-reference/health.json
 readonly LEGACY_STATE=/data/monday/spool/polymarket-reference/collector-state.json
 readonly LEGACY_COLLECTOR=/opt/monday/bin/polymarket_reference_collector.py
@@ -85,6 +87,52 @@ readonly -a STAGE_ARTIFACT_ASSETS=(
 die() {
   printf 'Polymarket cutover failed: %s\n' "$*" >&2
   exit 1
+}
+
+write_watchdog_suppress() {
+  local owner=$1 temporary
+  install -d -m 0755 "${WATCHDOG_SUPPRESS_FILE%/*}"
+  if [[ -e $WATCHDOG_SUPPRESS_FILE || -L $WATCHDOG_SUPPRESS_FILE ]]; then
+    secure_regular_file "$WATCHDOG_SUPPRESS_FILE" || die 'watchdog suppression is indirect'
+    jq -e --arg owner "$owner" '
+      .schema == "monday.polymarket_cutover_watchdog_suppress.v1"
+      and .owner == $owner
+    ' "$WATCHDOG_SUPPRESS_FILE" >/dev/null \
+      || die 'foreign watchdog suppression already exists'
+    return
+  fi
+  temporary="${WATCHDOG_SUPPRESS_FILE}.tmp.$$"
+  jq -cn --arg owner "$owner" --arg observed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+    {schema:"monday.polymarket_cutover_watchdog_suppress.v1",
+      owner:$owner,observed_at:$observed_at}' >"$temporary"
+  chmod 0600 "$temporary"
+  mv "$temporary" "$WATCHDOG_SUPPRESS_FILE"
+}
+
+remove_watchdog_suppress() {
+  local owner=$1
+  [[ -e $WATCHDOG_SUPPRESS_FILE || -L $WATCHDOG_SUPPRESS_FILE ]] || return 0
+  secure_regular_file "$WATCHDOG_SUPPRESS_FILE" || die 'watchdog suppression is indirect'
+  jq -e --arg owner "$owner" '
+    .schema == "monday.polymarket_cutover_watchdog_suppress.v1"
+    and .owner == $owner
+  ' "$WATCHDOG_SUPPRESS_FILE" >/dev/null \
+    || die 'watchdog suppression ownership drifted during cutover'
+  rm -f -- "$WATCHDOG_SUPPRESS_FILE"
+}
+
+admit_watchdog_suppress() {
+  local owner=$1 active_state
+  write_watchdog_suppress "$owner"
+  active_state=$(systemctl show --property=ActiveState --value "$WATCHDOG_SERVICE") \
+    || {
+      remove_watchdog_suppress "$owner"
+      die 'cannot read watchdog service state before cutover transition'
+    }
+  if [[ $active_state == active || $active_state == activating ]]; then
+    remove_watchdog_suppress "$owner"
+    die "watchdog service is $active_state before cutover transition"
+  fi
 }
 
 usage() {
@@ -756,19 +804,20 @@ verify_oneshot_success() {
   [[ $result == success && $status == 0 ]]
 }
 
-verify_deferred_market_upload() {
-  local expected_binary=$1 previous_invocation=$2 state pid proc_exe invocation
+verify_deferred_upload() {
+  local unit=$1 expected_binary=$2 previous_invocation=$3
+  local state pid proc_exe invocation
   for _ in $(seq 1 10); do
-    systemctl is-failed --quiet "$MARKET_UPLOAD_UNIT" && return 1
-    invocation=$(systemctl show --property=InvocationID --value "$MARKET_UPLOAD_UNIT")
+    systemctl is-failed --quiet "$unit" && return 1
+    invocation=$(systemctl show --property=InvocationID --value "$unit")
     if [[ $invocation =~ ^[a-f0-9]{32}$ && $invocation != "$previous_invocation" ]]; then
-      state=$(systemctl show --property=ActiveState --value "$MARKET_UPLOAD_UNIT")
+      state=$(systemctl show --property=ActiveState --value "$unit")
       if [[ $state == inactive ]]; then
-        verify_oneshot_success "$MARKET_UPLOAD_UNIT"
+        verify_oneshot_success "$unit"
         return
       fi
       if [[ $state == active || $state == activating ]]; then
-        pid=$(systemctl show --property=MainPID --value "$MARKET_UPLOAD_UNIT")
+        pid=$(systemctl show --property=MainPID --value "$unit")
         if [[ ! $pid =~ ^[1-9][0-9]*$ ]]; then
           sleep 1
           continue
@@ -832,10 +881,12 @@ render_upload_unit() {
 verify_saved_unit_state() {
   local state_json=$1 unit expected_enabled expected_active
   for unit in "$COLLECTOR_UNIT" "$REFERENCE_UPLOAD_TIMER" "$MARKET_UPLOAD_TIMER"; do
-    expected_enabled=$(jq -er --arg unit "$unit" '.units[$unit].enabled' "$state_json") \
+    expected_enabled=$(jq -r --arg unit "$unit" '.units[$unit].enabled' "$state_json") \
       || return 1
-    expected_active=$(jq -er --arg unit "$unit" '.units[$unit].active' "$state_json") \
+    expected_active=$(jq -r --arg unit "$unit" '.units[$unit].active' "$state_json") \
       || return 1
+    [[ $expected_enabled == true || $expected_enabled == false ]] || return 1
+    [[ $expected_active == true || $expected_active == false ]] || return 1
     if [[ $expected_enabled == true ]]; then
       unit_enabled "$unit" || return 1
     elif unit_enabled "$unit"; then
@@ -1628,6 +1679,11 @@ if [[ $mode == rollback ]]; then
   restore_legacy "$rollback_evidence" >/dev/null
   finalize_rollback_evidence "$rollback_evidence" rolled-back \
     || die 'could not finalize rolled-back cutover evidence'
+  if [[ -e $WATCHDOG_SUPPRESS_FILE || -L $WATCHDOG_SUPPRESS_FILE ]]; then
+    manual_watchdog_suppress_owner="cutover:$rollback_candidate:${rollback_evidence##*/}"
+    remove_watchdog_suppress "$manual_watchdog_suppress_owner" \
+      || die 'could not clear owned watchdog suppression after manual rollback'
+  fi
   printf '%s\n' "$rollback_evidence"
   exit 0
 fi
@@ -1840,6 +1896,8 @@ snapshot_legacy "$rollback_dir" "$baseline_mode" \
 
 transition_started=false
 cutover_succeeded=false
+watchdog_suppressed=false
+watchdog_suppress_owner=
 on_exit() {
   local status=$? restore_status=0
   if [[ $cutover_succeeded == false && $transition_started == true ]]; then
@@ -1857,6 +1915,10 @@ on_exit() {
       printf 'automatic rollback failed; collector and upload timers require operator recovery\n' >&2
       status=1
     else
+      if [[ ${watchdog_suppressed:-false} == true ]]; then
+        remove_watchdog_suppress "${watchdog_suppress_owner:-}" || status=1
+        watchdog_suppressed=false
+      fi
       finalize_rollback_evidence "$evidence_dir" invalid || status=1
     fi
   fi
@@ -1864,8 +1926,9 @@ on_exit() {
 }
 trap on_exit EXIT
 
-# Drain only uploader configurations that the Gate could bind. A degraded
-# bootstrap baseline is deliberately not a release-control source.
+# Only the market backlog needs an explicit kick here. The reference lane is
+# left to the promoted timers so a stalled baseline oneshot cannot block
+# cutover.
 [[ $(sha256sum "$gate_terminal_receipt" | awk '{print $1}') \
   == "$gate_terminal_receipt_sha256" ]] \
   || die 'Gate terminal receipt changed before cutover transition'
@@ -1873,6 +1936,9 @@ trap on_exit EXIT
   || die 'Gate evidence changed before cutover transition'
 [[ $(oss_config_sha256) == "$gate_oss_config_sha" ]] \
   || die 'OSS configuration changed before the cutover transition'
+watchdog_suppress_owner="cutover:$candidate_sha:$run_id"
+admit_watchdog_suppress "$watchdog_suppress_owner"
+watchdog_suppressed=true
 transition_started=true
 systemctl stop "$REFERENCE_UPLOAD_TIMER" "$MARKET_UPLOAD_TIMER"
 systemctl stop "$REFERENCE_UPLOAD_UNIT" "$MARKET_UPLOAD_UNIT"
@@ -1891,12 +1957,7 @@ elif [[ $baseline_mode == rust_release ]]; then
     "$baseline_reference_upload_exec" "$baseline_market_upload_exec" \
     || die 'Rust baseline upload units changed before drain'
 fi
-if [[ $contained_recovery == false && $baseline_mode != rust_bootstrap ]]; then
-  systemctl start "$REFERENCE_UPLOAD_UNIT"
-  verify_oneshot_success "$REFERENCE_UPLOAD_UNIT" \
-    || die 'legacy reference uploader drain did not complete successfully'
-fi
-if [[ $baseline_mode == rust_release ]]; then
+if [[ $contained_recovery == false && $baseline_mode == rust_release ]]; then
   systemctl start "$MARKET_UPLOAD_UNIT"
   verify_oneshot_success "$MARKET_UPLOAD_UNIT" \
     || die 'Rust market uploader drain did not complete successfully'
@@ -2017,16 +2078,21 @@ verify_rust_runtime "$candidate_binary" "$started_epoch" "$rust_pid" "$rust_invo
 verify_upload_units "$pinned_upload_env" \
   "$REFERENCE_UPLOAD_EXEC" "$MARKET_UPLOAD_EXEC" \
   || die 'Rust upload unit or timer identity changed before execution'
-systemctl start "$REFERENCE_UPLOAD_UNIT"
+reset_failed_unit_if_needed "$REFERENCE_UPLOAD_UNIT"
+reference_upload_invocation_before=$(systemctl show \
+  --property=InvocationID --value "$REFERENCE_UPLOAD_UNIT")
+systemctl start --no-block "$REFERENCE_UPLOAD_UNIT"
 [[ $(oss_config_sha256 "$pinned_upload_env") == "$gate_oss_config_sha" ]] \
   || die 'pinned OSS configuration changed during reference upload'
-verify_oneshot_success "$REFERENCE_UPLOAD_UNIT" \
-  || die 'Rust reference uploader did not complete successfully'
+verify_deferred_upload "$REFERENCE_UPLOAD_UNIT" "$candidate_binary" \
+  "$reference_upload_invocation_before" \
+  || die 'Rust reference uploader did not start cleanly for deferred backlog processing'
 reset_failed_unit_if_needed "$MARKET_UPLOAD_UNIT"
 market_upload_invocation_before=$(systemctl show \
   --property=InvocationID --value "$MARKET_UPLOAD_UNIT")
 systemctl start --no-block "$MARKET_UPLOAD_UNIT"
-verify_deferred_market_upload "$candidate_binary" "$market_upload_invocation_before" \
+verify_deferred_upload "$MARKET_UPLOAD_UNIT" "$candidate_binary" \
+  "$market_upload_invocation_before" \
   || die 'Rust market uploader did not start cleanly for deferred backlog processing'
 [[ $(oss_config_sha256 "$pinned_upload_env") == "$gate_oss_config_sha" ]] \
   || die 'pinned OSS configuration changed during market upload startup'
@@ -2056,6 +2122,8 @@ main_pid=$(systemctl show --property=MainPID --value "$COLLECTOR_UNIT")
 [[ $main_pid == "$rust_pid" ]] || die 'Rust collector PID changed before evidence publication'
 ! systemctl is-failed --quiet "$MARKET_UPLOAD_UNIT" \
   || die 'Rust market uploader failed during deferred backlog startup'
+! systemctl is-failed --quiet "$REFERENCE_UPLOAD_UNIT" \
+  || die 'Rust reference uploader failed during deferred backlog startup'
 verify_rust_runtime "$candidate_binary" "$started_epoch" "$rust_pid" "$rust_invocation_id" \
   || die 'Rust collector identity or health changed before evidence publication'
 health_file="$evidence_dir/post-start-health.json"
@@ -2109,6 +2177,8 @@ jq -n \
     rollback_manifest_sha256:$rollback_manifest_sha256,
     explicit_restart:true,post_start_identity_verified:true,
     upload_services_verified:true,
+    reference_upload_terminal_success_required:false,
+    reference_backlog_deferred_to_timer:true,
     market_upload_gate_verified:true,
     market_upload_terminal_success_required:false,
     market_backlog_deferred_to_timer:true,
@@ -2132,6 +2202,8 @@ verify_upload_units "$pinned_upload_env" \
   || die 'Rust upload unit identity changed before cutover completion'
 ! systemctl is-failed --quiet "$MARKET_UPLOAD_UNIT" \
   || die 'Rust market uploader failed before cutover completion'
+! systemctl is-failed --quiet "$REFERENCE_UPLOAD_UNIT" \
+  || die 'Rust reference uploader failed before cutover completion'
 [[ $(oss_config_sha256 "$pinned_upload_env") == "$gate_oss_config_sha" ]] \
   || die 'pinned OSS configuration changed before cutover completion'
 verify_release_binding "$RELEASE_MANIFEST" "$gate_release_manifest_sha" \
@@ -2156,6 +2228,8 @@ secure_root_chain "$evidence_dir" \
 mv -Tf "$success_marker_tmp" "$success_marker"
 sync "$success_marker"
 sync -f "$evidence_dir"
+remove_watchdog_suppress "$watchdog_suppress_owner"
+watchdog_suppressed=false
 
 cutover_succeeded=true
 trap - EXIT

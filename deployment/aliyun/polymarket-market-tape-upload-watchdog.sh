@@ -70,6 +70,19 @@ start_unit() {
 # $4 spool dir, $5 pending rotated tapes, $6 oldest rotated tape age in
 # seconds.
 check_lane() {
+  timer_enablement=$(systemctl is-enabled "$2" 2>/dev/null || true)
+  case $timer_enablement in
+    enabled | enabled-runtime) ;;
+    disabled | masked | masked-runtime)
+      log info "$2 is '$timer_enablement'; respecting administrative containment for lane $1"
+      return 0
+      ;;
+    *)
+      log err "lane $1: cannot verify enablement of $2 ('$timer_enablement')"
+      remediation_failed=1
+      return 0
+      ;;
+  esac
   timer_state=$(unit_state "$2")
   if [ "$timer_state" != "active" ]; then
     log warning "$2 was '$timer_state'; starting it (see issue #655)"
