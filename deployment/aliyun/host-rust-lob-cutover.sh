@@ -51,6 +51,8 @@ DRAIN_ATTEMPTED=0
 DRAIN_MAY_HAVE_MUTATED=0
 SPOOL_ENV_DEPLOYMENT=
 OLD_RECOVERY_TIMERS_ENABLED=0
+OLD_RECOVERY_TIMER_SPOT_ENABLED=0
+OLD_RECOVERY_TIMER_USDM_ENABLED=0
 OLD_SPOT_RESTARTS=
 OLD_SPOT_INVOCATION_ID=
 OLD_USDM_RESTARTS=
@@ -596,14 +598,31 @@ capture_existing_production_identity() {
     || fail "running production symlink is not digest-addressed: $OLD_BINARY"
   OLD_SHA256=${BASH_REMATCH[1]}
   OLD_RECOVERY_TIMERS_ENABLED=0
+  OLD_RECOVERY_TIMER_SPOT_ENABLED=0
+  OLD_RECOVERY_TIMER_USDM_ENABLED=0
   for timer in "${RECOVERY_TIMERS[@]}"; do
     if systemctl is-enabled --quiet "$timer" 2>/dev/null; then
       ((OLD_RECOVERY_TIMERS_ENABLED += 1))
+      if [[ $timer == "${RECOVERY_TIMERS[0]}" ]]; then
+        OLD_RECOVERY_TIMER_SPOT_ENABLED=1
+      elif [[ $timer == "${RECOVERY_TIMERS[1]}" ]]; then
+        OLD_RECOVERY_TIMER_USDM_ENABLED=1
+      fi
     fi
   done
-  (( OLD_RECOVERY_TIMERS_ENABLED == 0 \
-    || OLD_RECOVERY_TIMERS_ENABLED == ${#RECOVERY_TIMERS[@]} )) \
-    || fail 'old production has partially enabled recovery timers'
+  if [[ $OLD_MODE == partial-contained-spot-live ]]; then
+    (( OLD_RECOVERY_TIMER_SPOT_ENABLED == 1 \
+      || OLD_RECOVERY_TIMER_USDM_ENABLED == 0 )) \
+      || fail 'old production recovery timers do not match partial-contained-spot-live'
+  elif [[ $OLD_MODE == partial-contained-usdm-live ]]; then
+    (( OLD_RECOVERY_TIMER_USDM_ENABLED == 1 \
+      || OLD_RECOVERY_TIMER_SPOT_ENABLED == 0 )) \
+      || fail 'old production recovery timers do not match partial-contained-usdm-live'
+  else
+    (( OLD_RECOVERY_TIMERS_ENABLED == 0 \
+      || OLD_RECOVERY_TIMERS_ENABLED == ${#RECOVERY_TIMERS[@]} )) \
+      || fail 'old production has partially enabled recovery timers'
+  fi
   [[ $OLD_SHA256 != "$CANDIDATE_SHA256" ]] || fail 'candidate is already the production release'
   printf '%s  %s\n' "$OLD_SHA256" "$OLD_BINARY" | sha256sum --check --strict
   if [[ $OLD_MODE == partial-contained-spot-live ]]; then
@@ -624,6 +643,32 @@ capture_existing_production_identity() {
   OLD_DEPLOYMENT="$RELEASE_ROOT/$OLD_SHA256/deployment"
   stage_existing_deployment_for_rollback
   SPOOL_ENV_DEPLOYMENT="$OLD_DEPLOYMENT"
+}
+
+restore_previous_recovery_timers() {
+  local -a timers_to_enable=()
+  local timer expected_enabled
+  (( OLD_RECOVERY_TIMER_SPOT_ENABLED )) && timers_to_enable+=("${RECOVERY_TIMERS[0]}")
+  (( OLD_RECOVERY_TIMER_USDM_ENABLED )) && timers_to_enable+=("${RECOVERY_TIMERS[1]}")
+  if (( ${#timers_to_enable[@]} > 0 )); then
+    systemctl enable --now "${timers_to_enable[@]}" >/dev/null || return 1
+  fi
+  for timer in "${RECOVERY_TIMERS[@]}"; do
+    expected_enabled=0
+    if [[ $timer == "${RECOVERY_TIMERS[0]}" ]]; then
+      expected_enabled=$OLD_RECOVERY_TIMER_SPOT_ENABLED
+    elif [[ $timer == "${RECOVERY_TIMERS[1]}" ]]; then
+      expected_enabled=$OLD_RECOVERY_TIMER_USDM_ENABLED
+    fi
+    if (( expected_enabled )); then
+      systemctl is-enabled --quiet "$timer" >/dev/null 2>&1 || return 1
+      systemctl is-active --quiet "$timer" >/dev/null 2>&1 || return 1
+    else
+      systemctl is-enabled --quiet "$timer" >/dev/null 2>&1 && return 1
+      systemctl is-active --quiet "$timer" >/dev/null 2>&1 && return 1
+    fi
+  done
+  return 0
 }
 
 capture_allowlisted_production_usdm_dropin() {
@@ -870,10 +915,21 @@ partial_usdm_runtime_is_restored() {
 
 write_evidence() {
   local temporary current_target spot_active usdm_active
+  local previous_recovery_timer_spot_enabled previous_recovery_timer_usdm_enabled
   temporary="$EVIDENCE_DIR/cutover.json.tmp"
   current_target=$(readlink -f "$PRODUCTION_LINK" 2>/dev/null || true)
   spot_active=$(unit_active_json "${PRODUCTION_UNITS[0]}")
   usdm_active=$(unit_active_json "${PRODUCTION_UNITS[1]}")
+  if (( OLD_RECOVERY_TIMER_SPOT_ENABLED )); then
+    previous_recovery_timer_spot_enabled=true
+  else
+    previous_recovery_timer_spot_enabled=false
+  fi
+  if (( OLD_RECOVERY_TIMER_USDM_ENABLED )); then
+    previous_recovery_timer_usdm_enabled=true
+  else
+    previous_recovery_timer_usdm_enabled=false
+  fi
   jq -n \
     --arg started_at "$STARTED_AT" \
     --arg completed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -890,6 +946,8 @@ write_evidence() {
     --arg previous_spot_invocation_id "$OLD_SPOT_INVOCATION_ID" \
     --arg previous_usdm_restarts "$OLD_USDM_RESTARTS" \
     --arg previous_usdm_invocation_id "$OLD_USDM_INVOCATION_ID" \
+    --argjson previous_recovery_timer_spot_enabled "$previous_recovery_timer_spot_enabled" \
+    --argjson previous_recovery_timer_usdm_enabled "$previous_recovery_timer_usdm_enabled" \
     --arg mode "$OLD_MODE" \
     --arg current_binary "$current_target" \
     --argjson spot_active "$spot_active" \
@@ -921,6 +979,10 @@ write_evidence() {
       previous_usdm_invocation_id:
         (if $previous_usdm_invocation_id == "" then null
          else $previous_usdm_invocation_id end),
+      previous_recovery_timers_enabled: {
+        spot: $previous_recovery_timer_spot_enabled,
+        usdm: $previous_recovery_timer_usdm_enabled
+      },
       host_mode: $mode,
       current_binary: (if $current_binary == "" then null else $current_binary end),
       production_units_active: {spot: $spot_active, usdm: $usdm_active}
@@ -1009,9 +1071,7 @@ rollback_after_failure() {
         safe_to_restart=0
         ROLLBACK_RESULT=previous-usdm-unmask-failed-disabled
       fi
-    elif (( safe_to_restart \
-      && OLD_RECOVERY_TIMERS_ENABLED == ${#RECOVERY_TIMERS[@]} )) \
-      && ! systemctl enable --now "${RECOVERY_TIMERS[@]}" >/dev/null; then
+    elif (( safe_to_restart )) && ! restore_previous_recovery_timers; then
       safe_to_restart=0
       ROLLBACK_RESULT=recovery-timer-restore-failed-disabled
     elif (( safe_to_restart )); then
@@ -1068,9 +1128,7 @@ rollback_after_failure() {
         && ! systemctl unmask --runtime "${UPLOAD_UNITS[0]}" >/dev/null; then
         partial_restored=0
       fi
-      if (( partial_restored \
-        && OLD_RECOVERY_TIMERS_ENABLED == ${#RECOVERY_TIMERS[@]} )) \
-        && ! systemctl enable --now "${RECOVERY_TIMERS[@]}" >/dev/null; then
+      if (( partial_restored )) && ! restore_previous_recovery_timers; then
         partial_restored=0
       fi
       if (( partial_restored )) \
@@ -1102,9 +1160,7 @@ rollback_after_failure() {
         && ! systemctl unmask --runtime "${UPLOAD_UNITS[1]}" >/dev/null; then
         partial_restored=0
       fi
-      if (( partial_restored \
-        && OLD_RECOVERY_TIMERS_ENABLED == ${#RECOVERY_TIMERS[@]} )) \
-        && ! systemctl enable --now "${RECOVERY_TIMERS[@]}" >/dev/null; then
+      if (( partial_restored )) && ! restore_previous_recovery_timers; then
         partial_restored=0
       fi
       if (( partial_restored )) \
