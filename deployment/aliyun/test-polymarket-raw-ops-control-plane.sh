@@ -1276,6 +1276,8 @@ fi
 preflight_verifier="$tmp_dir/real-market-preflight.sh"
 sed -n \
   -e '/^readonly REAL_MARKET_PREFLIGHT_BUDGET_SECONDS=/p' \
+  -e '/^readonly REAL_MARKET_SEGMENT_WAIT_BUDGET_SECONDS=/p' \
+  -e '/^readonly REAL_MARKET_PREFLIGHT_TOTAL_BUDGET_SECONDS=/,/))$/p' \
   -e '/^readonly PREFLIGHT_SCAN_WINDOW_RECORDS=/p' \
   -e '/^remaining_seconds_before_deadline() {$/,/^}$/p' \
   -e '/^run_before_deadline() {$/,/^}$/p' \
@@ -1388,6 +1390,12 @@ if [[ -n ${LN_COUNT_FILE:-} ]]; then
   count=0
   [[ ! -f $LN_COUNT_FILE ]] || count=$(<"$LN_COUNT_FILE")
   printf '%s\n' "$((count + 1))" >"$LN_COUNT_FILE"
+fi
+if [[ -n ${UNLINK_SOURCE_BEFORE_LINK:-} \
+  && ${1:-} == "$UNLINK_SOURCE_BEFORE_LINK" \
+  && ! -e ${UNLINK_SOURCE_BEFORE_LINK_ONCE:-} ]]; then
+  : >"$UNLINK_SOURCE_BEFORE_LINK_ONCE"
+  rm -f -- "$1"
 fi
 /bin/ln "$@"
 if [[ -n ${UNSTABLE_STAT_PATH_FILE:-} ]]; then
@@ -1659,16 +1667,61 @@ fi
 unset FAKE_CANONICAL_COUNT
 release_binary="$VERIFY"
 
+prelink_race_case="$preflight_root/prelink-race-case"
+mkdir -p "$prelink_race_case/source" "$prelink_race_case/spool" \
+  "$prelink_race_case/download" "$prelink_race_case/evidence"
+prelink_race_source="$prelink_race_case/source/market-updates.20260101T041500000000.ndjson"
+prelink_race_replacement="$prelink_race_case/source/market-updates.20260101T041600000000.ndjson"
+cp "$compatible" "$prelink_race_source"
+export UNLINK_SOURCE_BEFORE_LINK="$prelink_race_source"
+export UNLINK_SOURCE_BEFORE_LINK_ONCE="$prelink_race_case/unlinked"
+sleep() {
+  cp "$compatible" "$prelink_race_replacement"
+}
+real_market_segment_preflight "$prelink_race_case/source" \
+  "$prelink_race_case/spool" "$prelink_race_case/download" \
+  "$prelink_race_case/evidence" || {
+  printf 'real-segment preflight did not rescan after a pre-link uploader race\n' >&2
+  exit 1
+}
+unset -f sleep
+unset UNLINK_SOURCE_BEFORE_LINK UNLINK_SOURCE_BEFORE_LINK_ONCE
+jq -e '.status == "passed"
+  and .source_segment.file == "market-updates.20260101T041600000000.ndjson"' \
+  "$prelink_race_case/evidence/real-market-preflight.json" >/dev/null
+
+delayed_case="$preflight_root/delayed-case"
+mkdir -p "$delayed_case/source" "$delayed_case/spool" "$delayed_case/download" \
+  "$delayed_case/evidence"
+delayed_source="$delayed_case/source/market-updates.20260101T042000000000.ndjson"
+sleep() {
+  cp "$compatible" "$delayed_source"
+}
+real_market_segment_preflight "$delayed_case/source" "$delayed_case/spool" \
+  "$delayed_case/download" "$delayed_case/evidence" || {
+  printf 'real-segment preflight did not wait for and pin a newly closed segment\n' >&2
+  exit 1
+}
+unset -f sleep
+jq -e '.status == "passed"
+  and .source_segment.file == "market-updates.20260101T042000000000.ndjson"' \
+  "$delayed_case/evidence/real-market-preflight.json" >/dev/null
+
 empty_case="$preflight_root/empty-case"
 mkdir -p "$empty_case/source" "$empty_case/spool" "$empty_case/download" \
   "$empty_case/evidence"
 empty_stderr="$empty_case/evidence/preflight.stderr"
+sleep() {
+  SECONDS=$segment_wait_deadline
+}
 if real_market_segment_preflight "$empty_case/source" "$empty_case/spool" \
   "$empty_case/download" "$empty_case/evidence" 2>"$empty_stderr"; then
   printf 'real-segment preflight accepted an empty production spool\n' >&2
   exit 1
 fi
-grep -Fxq 'real market preflight found no eligible closed market segment' \
+unset -f sleep
+grep -Fxq \
+  "real market preflight found no eligible closed market segment within ${REAL_MARKET_SEGMENT_WAIT_BUDGET_SECONDS} seconds" \
   "$empty_stderr" || {
   printf 'empty production spool has no exact fail-closed reason\n' >&2
   exit 1
@@ -6245,6 +6298,8 @@ grep -Fq 'upload timeout values remain bound into OSS configuration evidence' "$
   # shellcheck source=/dev/null
   source "$legacy_runtime_budget_contract"
   [[ $REAL_MARKET_PREFLIGHT_BUDGET_SECONDS -eq 1200 \
+    && $REAL_MARKET_SEGMENT_WAIT_BUDGET_SECONDS -eq 3900 \
+    && $REAL_MARKET_PREFLIGHT_TOTAL_BUDGET_SECONDS -eq 5160 \
     && $LEGACY_RUNTIME_STABILITY_REQUIRED == true \
     && $LEGACY_RUNTIME_MAX_SECONDS -eq 21600 \
     && $LEGACY_RUNTIME_RESERVE_SECONDS -eq 60 \
@@ -6262,12 +6317,12 @@ grep -Fq 'upload timeout values remain bound into OSS configuration evidence' "$
   monotonic_uptime_seconds() { printf '20906\n'; }
   zstd_timeout_seconds=3600
   oss_copy_timeout_seconds=1800
-  required=$((REAL_MARKET_PREFLIGHT_BUDGET_SECONDS \
+  required=$((REAL_MARKET_PREFLIGHT_TOTAL_BUDGET_SECONDS \
     + MINIMUM_GATE_SECONDS \
     + PARITY_CUTOFF_LAG_SECONDS \
     + zstd_timeout_seconds + oss_copy_timeout_seconds \
     + LEGACY_RUNTIME_RESERVE_SECONDS))
-  [[ $required -eq 10320 ]] || {
+  [[ $required -eq 14280 ]] || {
     printf 'Gate runtime budget does not cover bounded post-gate uploads\n' >&2
     exit 1
   }
@@ -6344,7 +6399,7 @@ grep -Fq 'upload timeout values remain bound into OSS configuration evidence' "$
     printf 'Gate did not bind legacy identity around real preflight\n' >&2
     exit 1
   }
-  [[ $(<"$timeout_log") == '--signal=KILL 1200 env '* ]] || {
+  [[ $(<"$timeout_log") == '--signal=KILL 5160 env '* ]] || {
     printf 'Gate real preflight does not have an exact hard deadline\n' >&2
     exit 1
   }
@@ -6361,6 +6416,11 @@ grep -Fq 'run_before_deadline() {' "$preflight_deadline_contract" || {
 grep -Fq 'preflight_deadline=$((SECONDS + REAL_MARKET_PREFLIGHT_BUDGET_SECONDS))' \
   "$GATE" || {
   printf 'Gate real preflight has no overall deadline\n' >&2
+  exit 1
+}
+grep -Fq 'segment_wait_deadline=$((SECONDS + REAL_MARKET_SEGMENT_WAIT_BUDGET_SECONDS))' \
+  "$GATE" || {
+  printf 'Gate real-segment wait has no full-rotation deadline\n' >&2
   exit 1
 }
 grep -Fq 'run_before_deadline "$preflight_deadline" runuser' "$GATE" || {

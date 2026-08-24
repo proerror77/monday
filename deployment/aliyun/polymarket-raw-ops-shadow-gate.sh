@@ -32,6 +32,14 @@ readonly LEGACY_RUNTIME_STABILITY_REQUIRED=true
 # budget plus 120 attempts) AND the upload time of the largest observed
 # segment (~150s for a 109MiB multipart object on this endpoint).
 readonly REAL_MARKET_PREFLIGHT_BUDGET_SECONDS=1200
+# A closed market tape is produced hourly and normally removed by the uploader
+# within five minutes. Wait through one full rotation plus one upload cadence,
+# then give the selected tape the independent preflight budget above.
+readonly REAL_MARKET_SEGMENT_WAIT_BUDGET_SECONDS=3900
+# The outer worker includes fixed startup and evidence-flush headroom.
+readonly REAL_MARKET_PREFLIGHT_TOTAL_BUDGET_SECONDS=$((
+  REAL_MARKET_SEGMENT_WAIT_BUDGET_SECONDS \
+  + REAL_MARKET_PREFLIGHT_BUDGET_SECONDS + 60))
 # Tick-level segments (7.7-18GB) make a full-file preflight scan exceed the
 # budget. The scan is therefore bounded: a deterministic head/tail window
 # validates the segment and quote presence (issue #586). The window caps scanned
@@ -1125,7 +1133,7 @@ download_and_verify_oss_triplet() {
 
 real_market_segment_preflight() {
   local source_spool=$1 spool=$2 download_root=$3 evidence=$4 before after path name
-  local stable=false source_path source_name source_file source_tmp source_segment
+  local pinned=false stable=false source_path source_name source_file source_tmp source_segment
   local source_stamp source_uuid candidate_stamp candidate_uuid
   local preflight_dataset started_at completed_at candidate_exit candidate_summary
   local terminal_status upload_summary
@@ -1135,37 +1143,16 @@ real_market_segment_preflight() {
   local uploaded_content_sha256 uploaded_canonical
   local uploaded_uri uploaded_triplet uploaded_name preflight_tmp preflight_json
   local candidate_stdout_tmp candidate_stdout candidate_stderr_tmp candidate_stderr
-  local preflight_deadline
-  preflight_deadline=$((SECONDS + REAL_MARKET_PREFLIGHT_BUDGET_SECONDS))
+  local segment_wait_deadline preflight_deadline
+  segment_wait_deadline=$((SECONDS + REAL_MARKET_SEGMENT_WAIT_BUDGET_SECONDS))
   secure_collector_directory "$source_spool" || return 1
-  source_path=
-  source_name=
-  source_stamp=
-  source_uuid=
-  for path in "$source_spool"/market-updates.*.ndjson; do
-    name=${path##*/}
-    [[ $name =~ ^market-updates\.([0-9]{8}T[0-9]{6}([0-9]{6})?)(\.([[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}))?\.ndjson$ ]] \
-      || continue
-    candidate_stamp=${BASH_REMATCH[1]}
-    candidate_uuid=${BASH_REMATCH[4]:-}
-    if [[ -z $source_name || $candidate_stamp > "$source_stamp" \
-      || ( $candidate_stamp == "$source_stamp" \
-        && -n $candidate_uuid && -z $source_uuid ) ]]; then
-      source_path=$path
-      source_name=$name
-      source_stamp=$candidate_stamp
-      source_uuid=$candidate_uuid
-    fi
-  done
-  if [[ -z $source_path || ! -f $source_path || -L $source_path ]]; then
-    printf 'real market preflight found no eligible closed market segment\n' >&2
-    return 1
-  fi
   started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   preflight_json="$evidence/real-market-preflight.json"
   preflight_tmp="$evidence/.real-market-preflight.json.tmp"
   candidate_stdout="$evidence/real-market-uploader.json"
   candidate_stderr="$evidence/real-market-uploader.stderr"
+  source_path=
+  source_name=
   source_segment_hint=$(jq -cn --arg path "$source_path" --arg file "$source_name" \
     '{path:$path,file:$file}')
   write_preflight_failure() {
@@ -1204,21 +1191,65 @@ real_market_segment_preflight() {
     mv "$preflight_tmp" "$preflight_json"
     sync "$preflight_json"
   }
-  source_file="$spool/$source_name"
-  source_tmp="$spool/.${source_name}.preflight.$$"
-  [[ ! -e $source_file && ! -L $source_file \
-    && ! -e $source_tmp && ! -L $source_tmp ]] || {
-    write_preflight_failure 'shadow spool already contains the preflight target path'
+  while ((SECONDS < segment_wait_deadline)); do
+    source_path=
+    source_name=
+    source_stamp=
+    source_uuid=
+    for path in "$source_spool"/market-updates.*.ndjson; do
+      name=${path##*/}
+      [[ $name =~ ^market-updates\.([0-9]{8}T[0-9]{6}([0-9]{6})?)(\.([[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}))?\.ndjson$ ]] \
+        || continue
+      candidate_stamp=${BASH_REMATCH[1]}
+      candidate_uuid=${BASH_REMATCH[4]:-}
+      if [[ -z $source_name || $candidate_stamp > "$source_stamp" \
+        || ( $candidate_stamp == "$source_stamp" \
+          && -n $candidate_uuid && -z $source_uuid ) ]]; then
+        source_path=$path
+        source_name=$name
+        source_stamp=$candidate_stamp
+        source_uuid=$candidate_uuid
+      fi
+    done
+    if [[ -n $source_path ]]; then
+      if [[ -L $source_path || ( -e $source_path && ! -f $source_path ) ]]; then
+        printf 'real market preflight found no eligible closed market segment\n' >&2
+        return 1
+      fi
+      source_file="$spool/$source_name"
+      source_tmp="$spool/.${source_name}.preflight.$$"
+      [[ ! -e $source_file && ! -L $source_file \
+        && ! -e $source_tmp && ! -L $source_tmp ]] || {
+        source_segment_hint=$(jq -cn --arg path "$source_path" --arg file "$source_name" \
+          '{path:$path,file:$file}')
+        write_preflight_failure 'shadow spool already contains the preflight target path'
+        return 1
+      }
+      # Pin the exact inode before inspecting it. If the production uploader
+      # wins the unlink race, rescan until the same bounded preflight deadline.
+      if run_before_deadline "$segment_wait_deadline" \
+        ln "$source_path" "$source_tmp"; then
+        pinned=true
+        break
+      fi
+      if [[ -e $source_path || -L $source_path \
+        || -e $source_tmp || -L $source_tmp ]]; then
+        source_segment_hint=$(jq -cn --arg path "$source_path" --arg file "$source_name" \
+          '{path:$path,file:$file}')
+        write_preflight_failure 'could not hardlink the production segment into the shadow spool'
+        return 1
+      fi
+    fi
+    run_before_deadline "$segment_wait_deadline" sleep 1 || break
+  done
+  if [[ $pinned != true ]]; then
+    printf 'real market preflight found no eligible closed market segment within %s seconds\n' \
+      "$REAL_MARKET_SEGMENT_WAIT_BUDGET_SECONDS" >&2
     return 1
-  }
-  # Bind the production segment onto the shadow spool before hashing it. Once
-  # the extra link exists, the production uploader may unlink the original
-  # path and the Gate still retains the exact inode for upload/readback.
-  run_before_deadline "$preflight_deadline" ln "$source_path" "$source_tmp" \
-    || {
-      write_preflight_failure 'could not hardlink the production segment into the shadow spool'
-      return 1
-    }
+  fi
+  preflight_deadline=$((SECONDS + REAL_MARKET_PREFLIGHT_BUDGET_SECONDS))
+  source_segment_hint=$(jq -cn --arg path "$source_path" --arg file "$source_name" \
+    '{path:$path,file:$file}')
   for _ in 1 2 3; do
     before=$(run_before_deadline "$preflight_deadline" \
       stat -c '%d:%i:%s:%Y:%Z' "$source_tmp") || return 1
@@ -1437,7 +1468,7 @@ run_budgeted_real_market_preflight() {
       printf 'legacy baseline identity changed before real preflight\n' >&2
       return 1
     }
-    legacy_runtime_budget_required=$((REAL_MARKET_PREFLIGHT_BUDGET_SECONDS \
+    legacy_runtime_budget_required=$((REAL_MARKET_PREFLIGHT_TOTAL_BUDGET_SECONDS \
       + gate_seconds \
       + PARITY_CUTOFF_LAG_SECONDS \
       + zstd_timeout_seconds + oss_copy_timeout_seconds \
@@ -1458,7 +1489,8 @@ run_budgeted_real_market_preflight() {
       return 1
     }
   fi
-  preflight_output=$(timeout --signal=KILL "$REAL_MARKET_PREFLIGHT_BUDGET_SECONDS" env \
+  preflight_output=$(timeout --signal=KILL \
+    "$REAL_MARKET_PREFLIGHT_TOTAL_BUDGET_SECONDS" env \
     "candidate_sha=$candidate_sha" "run_id=$run_id" \
     "release_binary=$release_binary" "oss_bucket=$oss_bucket" \
     "oss_endpoint=$oss_endpoint" "oss_region=$oss_region" \
