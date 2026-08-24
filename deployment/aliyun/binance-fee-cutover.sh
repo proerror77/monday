@@ -510,21 +510,37 @@ discover_new_triplets() {
     || die 'fee cutover did not produce exactly one spot and one USD-M triplet'
 }
 
+list_fee_triplets() {
+  local output=$1 entry name dir
+  : >"$output"
+  if [[ -d $FEE_SPOOL_ROOT/lake/raw ]]; then
+    find "$FEE_SPOOL_ROOT/lake/raw" -mindepth 6 -maxdepth 6 -print \
+      | while IFS= read -r entry; do
+        name=${entry##*/}
+        [[ $name == .fee-staging.* ]] && continue
+        [[ -d $entry && ! -L $entry && $name =~ ^batch=[0-9]+$ ]] || exit 1
+        dir=$entry
+        [[ $dir == "$FEE_SPOOL_ROOT/"* ]] || exit 1
+        printf '%s\n' "${dir#"$FEE_SPOOL_ROOT/"}"
+      done \
+      | sort >"$output"
+  fi
+}
+
+record_fee_spool_baseline() {
+  BASELINE_TRIPLETS_LIST="$EVIDENCE_DIR/baseline-triplets.lst"
+  list_fee_triplets "$BASELINE_TRIPLETS_LIST" \
+    || die 'failed to record the baseline fee spool'
+  [[ ! -s $BASELINE_TRIPLETS_LIST ]] \
+    || die 'canonical fee spool contains pending triplets before cutover'
+}
+
 verify_pending_triplet_scope() {
-  local expected actual data_file dir
+  local expected actual
   expected="$EVIDENCE_DIR/current-triplets.lst"
   actual="$EVIDENCE_DIR/pending-triplets.lst"
   jq -r '.object_prefix' "$LOCAL_TRIPLETS_JSONL" | sort >"$expected"
-  : >"$actual"
-  if [[ -d $FEE_SPOOL_ROOT/lake/raw ]]; then
-    while IFS= read -r data_file; do
-      dir=${data_file%/fee.json}
-      [[ $dir == "$FEE_SPOOL_ROOT/"* ]] \
-        || die "fee triplet escapes the spool root: $dir"
-      printf '%s\n' "${dir#"$FEE_SPOOL_ROOT/"}"
-    done < <(find "$FEE_SPOOL_ROOT/lake/raw" -type f -name fee.json | sort) \
-      | sort >"$actual"
-  fi
+  list_fee_triplets "$actual" || die 'failed to enumerate the canonical fee spool'
   cmp -s "$expected" "$actual" \
     || die 'canonical fee spool contains triplets outside the current cutover'
 }
@@ -646,7 +662,15 @@ on_exit() {
   trap - ERR EXIT
   if (( status != 0 )) && (( TRANSITION_STARTED == 1 )); then
     if restore_baseline; then
-      rollback_result=baseline-restored
+      if list_fee_triplets "$EVIDENCE_DIR/rollback-triplets.lst"; then
+        if cmp -s "$BASELINE_TRIPLETS_LIST" "$EVIDENCE_DIR/rollback-triplets.lst"; then
+          rollback_result=baseline-restored
+        else
+          rollback_result=baseline-restored-with-pending-data
+        fi
+      else
+        rollback_result=restore-failed
+      fi
     else
       rollback_result=restore-failed
     fi
@@ -695,6 +719,7 @@ EVIDENCE_DIR=
 LOCAL_TRIPLETS_JSONL=$(mktemp)
 REMOTE_TRIPLETS_JSONL=$(mktemp)
 MARKER=
+BASELINE_TRIPLETS_LIST=
 trap 'on_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 trap on_exit EXIT
 
@@ -710,6 +735,7 @@ mkdir -m 0750 "$EVIDENCE_DIR"
 validate_credential
 validate_artifact_bundle "$1"
 snapshot_baseline
+record_fee_spool_baseline
 stage_release
 TRANSITION_STARTED=1
 install_candidate
