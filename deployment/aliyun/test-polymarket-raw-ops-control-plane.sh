@@ -16,6 +16,7 @@ readonly GATE="$SCRIPT_DIR/polymarket-raw-ops-shadow-gate.sh"
 readonly GATE_CONTROL="$SCRIPT_DIR/polymarket-raw-ops-gate-control.sh"
 readonly GATE_UNIT="$SCRIPT_DIR/polymarket-raw-ops-gate@.service"
 readonly CUTOVER="$SCRIPT_DIR/polymarket-raw-ops-cutover.sh"
+readonly WATCHDOG="$SCRIPT_DIR/polymarket-market-tape-upload-watchdog.sh"
 readonly WORKFLOW="$SCRIPT_DIR/../../.github/workflows/acr-publish.yml"
 readonly CI_WORKFLOW="$SCRIPT_DIR/../../.github/workflows/ci.yml"
 readonly README="$SCRIPT_DIR/README.md"
@@ -61,7 +62,7 @@ join_shell_continuations() {
   }' "$1"
 }
 
-shellcheck "$GATE" "$GATE_CONTROL" "$CUTOVER" "$0"
+shellcheck "$GATE" "$GATE_CONTROL" "$CUTOVER" "$WATCHDOG" "$0"
 if grep -Fq 'release-preflight' "$GATE_CONTROL" \
   || grep -Fq 'preflight-hold' "$GATE_CONTROL" \
   || grep -Fq 'WATCHDOG_SUPPRESS_FILE' "$GATE_CONTROL"; then
@@ -1135,6 +1136,42 @@ fi
 tmp_dir=$(mktemp -d)
 tmp_dir=$(cd -- "$tmp_dir" && pwd -P)
 trap 'rm -rf "$tmp_dir"' EXIT
+
+watchdog_bin="$tmp_dir/watchdog-bin"
+watchdog_start_log="$tmp_dir/watchdog-start.log"
+mkdir "$watchdog_bin"
+cat >"$watchdog_bin/systemctl" <<'EOF'
+#!/bin/sh
+case $1 in
+  is-enabled)
+    case $2 in
+      polymarket-market-tape-upload.timer) printf '%s\n' enabled ;;
+      polymarket-reference-upload.timer) printf '%s\n' disabled; exit 1 ;;
+      *) printf '%s\n' not-found; exit 1 ;;
+    esac
+    ;;
+  is-active) printf '%s\n' inactive; exit 3 ;;
+  start) printf '%s\n' "$*" >>"$WATCHDOG_START_LOG" ;;
+  *) exit 2 ;;
+esac
+EOF
+cat >"$watchdog_bin/logger" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+cat >"$watchdog_bin/df" <<'EOF'
+#!/bin/sh
+printf '%s\n' 'Filesystem 1024-blocks Used Available Capacity Mounted on'
+printf '%s\n' '/dev/test 10485760 0 10485760 0% /data'
+EOF
+chmod +x "$watchdog_bin/systemctl" "$watchdog_bin/logger" "$watchdog_bin/df"
+WATCHDOG_START_LOG="$watchdog_start_log" \
+  PATH="$watchdog_bin:$PATH" "$WATCHDOG"
+if [[ $(wc -l <"$watchdog_start_log") -ne 1 ]] \
+  || ! grep -Fxq 'start polymarket-market-tape-upload.timer' "$watchdog_start_log"; then
+  printf 'watchdog did not respect the disabled reference-lane containment\n' >&2
+  exit 1
+fi
 
 # A production Gate must exercise the candidate against a real closed segment,
 # not a compatible fixture manufactured by the Gate itself.
@@ -6951,10 +6988,6 @@ if grep -Fq 'verify_oneshot_success "$REFERENCE_UPLOAD_UNIT"' "$cutover_legacy_p
   printf 'cutover still synchronously drains the baseline reference uploader before stop\n' >&2
   exit 1
 fi
-[[ $(grep -Fc 'verify_oneshot_success "$REFERENCE_UPLOAD_UNIT"' "$CUTOVER") -eq 1 ]] || {
-  printf 'cutover no longer verifies the promoted reference uploader exactly once\n' >&2
-  exit 1
-}
 legacy_cursor_line=$(grep -n '^[[:space:]]*legacy_stop_cursor=$(journal_cursor "$COLLECTOR_UNIT")' \
   "$CUTOVER" | cut -d: -f1)
 legacy_final_runtime_line=$(grep -n \
@@ -7194,21 +7227,36 @@ cutover_trap_off_line=$(grep -n '^trap - EXIT$' "$CUTOVER" | tail -1 | cut -d: -
   printf 'cutover still requires terminal success for the complete market backlog\n' >&2
   exit 1
 }
+[[ $(grep -c '^systemctl start "$REFERENCE_UPLOAD_UNIT"$' "$CUTOVER") -eq 0 ]] || {
+  printf 'cutover still synchronously drains the complete reference backlog\n' >&2
+  exit 1
+}
+[[ $(grep -c '^verify_oneshot_success "$REFERENCE_UPLOAD_UNIT"' "$CUTOVER") -eq 0 ]] || {
+  printf 'cutover still requires terminal success for the complete reference backlog\n' >&2
+  exit 1
+}
+grep -Fq 'systemctl start --no-block "$REFERENCE_UPLOAD_UNIT"' "$CUTOVER"
+grep -Fq \
+  'verify_deferred_upload "$REFERENCE_UPLOAD_UNIT" "$candidate_binary"' "$CUTOVER"
 grep -Fq 'systemctl start --no-block "$MARKET_UPLOAD_UNIT"' "$CUTOVER"
 grep -Fq \
-  'verify_deferred_market_upload "$candidate_binary" "$market_upload_invocation_before"' \
+  'verify_deferred_upload "$MARKET_UPLOAD_UNIT" "$candidate_binary"' \
   "$CUTOVER"
+grep -Fq 'reset_failed_unit_if_needed "$REFERENCE_UPLOAD_UNIT"' "$CUTOVER"
 grep -Fq 'reset_failed_unit_if_needed "$MARKET_UPLOAD_UNIT"' "$CUTOVER"
-[[ $(grep -c 'systemctl is-failed --quiet "$MARKET_UPLOAD_UNIT"' "$CUTOVER") -ge 3 ]]
+[[ $(grep -c 'systemctl is-failed --quiet "$MARKET_UPLOAD_UNIT"' "$CUTOVER") -ge 2 ]]
+[[ $(grep -c 'systemctl is-failed --quiet "$REFERENCE_UPLOAD_UNIT"' "$CUTOVER") -ge 2 ]]
 grep -Fq 'unit_active "$REFERENCE_UPLOAD_TIMER"' "$CUTOVER"
 grep -Fq 'unit_active "$MARKET_UPLOAD_TIMER"' "$CUTOVER"
 grep -Fq 'market_upload_gate_verified:true' "$CUTOVER"
+grep -Fq 'reference_upload_terminal_success_required:false' "$CUTOVER"
+grep -Fq 'reference_backlog_deferred_to_timer:true' "$CUTOVER"
 grep -Fq 'market_upload_terminal_success_required:false' "$CUTOVER"
 grep -Fq 'market_backlog_deferred_to_timer:true' "$CUTOVER"
 
 deferred_upload_functions="$tmp_dir/deferred-upload-functions.sh"
 awk '
-  /^verify_oneshot_success\(\) \{$/ || /^verify_deferred_market_upload\(\) \{$/ {
+  /^verify_oneshot_success\(\) \{$/ || /^verify_deferred_upload\(\) \{$/ {
     copy=1
   }
   copy {print}
@@ -7223,7 +7271,7 @@ run_deferred_upload_case() (
   local pid_state="$tmp_dir/deferred-upload-pid-$test_case"
   local exe_state="$tmp_dir/deferred-upload-exe-$test_case"
   local preexec_state="$tmp_dir/deferred-upload-preexec-$test_case"
-  MARKET_UPLOAD_UNIT=polymarket-market-tape-upload.service
+  local unit=polymarket-market-tape-upload.service
   systemctl() {
     if [[ $1 == is-failed ]]; then
       [[ $test_case == failed ]]
@@ -7285,7 +7333,7 @@ run_deferred_upload_case() (
   }
   sleep() { : >"$tmp_dir/deferred-upload-slept-$test_case"; }
   source "$deferred_upload_functions"
-  verify_deferred_market_upload "$expected_binary" "$previous_invocation"
+  verify_deferred_upload "$unit" "$expected_binary" "$previous_invocation"
 )
 
 for rejected_case in stale failed inactive-failed mismatched-exe active-mismatched-exe; do
