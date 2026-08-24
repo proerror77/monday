@@ -834,7 +834,7 @@ test_artifact_swap_after_freeze_does_not_change_release() {
 }
 
 test_market_failure_rolls_back_absent() {
-  local fixture="$tmp_dir/market-failure" old_data old_dir
+  local fixture="$tmp_dir/market-failure" evidence old_data old_dir
   create_root_layout "$fixture"
   create_stub_commands "$fixture/bin"
   create_artifact_bundle "$fixture/artifact" 3333333333333333333333333333333333333333
@@ -848,6 +848,9 @@ test_market_failure_rolls_back_absent() {
     exit 1
   fi
   assert_failure_receipt "$fixture" 'usdm fee snapshot start failed'
+  evidence=$(latest_evidence_dir "$fixture")
+  jq -e '.rollback_result == "baseline-restored-with-pending-data"' \
+    "$evidence/cutover.json" >/dev/null
   [[ ! -e $fixture/root/etc/systemd/system/binance-fee-snapshot-usdm.service ]]
   [[ ! -L $fixture/root/opt/monday/bin/binance-fee-snapshot ]]
   old_data=$(find "$fixture/root/data/monday/spool/binance-fee/lake/raw" \
@@ -860,7 +863,7 @@ test_market_failure_rolls_back_absent() {
     printf 'retry uploaded a triplet left by the failed attempt\n' >&2
     exit 1
   fi
-  assert_failure_receipt "$fixture" 'canonical fee spool contains triplets outside the current cutover'
+  assert_failure_receipt "$fixture" 'canonical fee spool contains pending triplets before cutover'
   [[ -z $(find "$fixture/oss" -type f -name fee.json -print -quit) ]]
 }
 
@@ -883,7 +886,7 @@ test_preexisting_triplet_blocks_uploader() {
     printf 'cutover uploaded a triplet outside the current attempt\n' >&2
     exit 1
   fi
-  assert_failure_receipt "$fixture" 'canonical fee spool contains triplets outside the current cutover'
+  assert_failure_receipt "$fixture" 'canonical fee spool contains pending triplets before cutover'
   [[ -f $old_dir/fee.json ]]
   [[ -z $(find "$fixture/oss" -type f -name fee.json -print -quit) ]]
 }
@@ -945,7 +948,8 @@ test_market_failure_restores_partial_contained() {
   [[ $(readlink "$fixture/root/opt/monday/bin/binance-fee-snapshot-upload") == "$old_uploader" ]]
   local evidence
   evidence=$(latest_evidence_dir "$fixture")
-  jq -e '.baseline_mode == "partial-contained" and .rollback_result == "baseline-restored"' \
+  jq -e '.baseline_mode == "partial-contained"
+    and .rollback_result == "baseline-restored-with-pending-data"' \
     "$evidence/cutover.json" >/dev/null
 }
 
