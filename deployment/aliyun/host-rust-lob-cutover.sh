@@ -53,6 +53,8 @@ SPOOL_ENV_DEPLOYMENT=
 OLD_RECOVERY_TIMERS_ENABLED=0
 OLD_RECOVERY_TIMER_SPOT_ENABLED=0
 OLD_RECOVERY_TIMER_USDM_ENABLED=0
+OLD_RECOVERY_TIMER_SPOT_MASKED_RUNTIME=0
+OLD_RECOVERY_TIMER_USDM_MASKED_RUNTIME=0
 OLD_SPOT_RESTARTS=
 OLD_SPOT_INVOCATION_ID=
 OLD_USDM_RESTARTS=
@@ -590,7 +592,7 @@ stage_existing_deployment_for_rollback() {
 }
 
 capture_existing_production_identity() {
-  local timer
+  local timer state
   OLD_MODE=$1
   [[ -L $PRODUCTION_LINK ]] || fail 'running production binary must be a release symlink'
   OLD_BINARY=$(readlink -f "$PRODUCTION_LINK")
@@ -600,13 +602,23 @@ capture_existing_production_identity() {
   OLD_RECOVERY_TIMERS_ENABLED=0
   OLD_RECOVERY_TIMER_SPOT_ENABLED=0
   OLD_RECOVERY_TIMER_USDM_ENABLED=0
+  OLD_RECOVERY_TIMER_SPOT_MASKED_RUNTIME=0
+  OLD_RECOVERY_TIMER_USDM_MASKED_RUNTIME=0
   for timer in "${RECOVERY_TIMERS[@]}"; do
-    if systemctl is-enabled --quiet "$timer" 2>/dev/null; then
-      ((OLD_RECOVERY_TIMERS_ENABLED += 1))
-      if [[ $timer == "${RECOVERY_TIMERS[0]}" ]]; then
+    state=$(systemctl is-enabled "$timer" 2>/dev/null || true)
+    if [[ $timer == "${RECOVERY_TIMERS[0]}" ]]; then
+      if [[ $state == enabled ]]; then
+        ((OLD_RECOVERY_TIMERS_ENABLED += 1))
         OLD_RECOVERY_TIMER_SPOT_ENABLED=1
-      elif [[ $timer == "${RECOVERY_TIMERS[1]}" ]]; then
+      elif [[ $state == masked-runtime ]]; then
+        OLD_RECOVERY_TIMER_SPOT_MASKED_RUNTIME=1
+      fi
+    elif [[ $timer == "${RECOVERY_TIMERS[1]}" ]]; then
+      if [[ $state == enabled ]]; then
+        ((OLD_RECOVERY_TIMERS_ENABLED += 1))
         OLD_RECOVERY_TIMER_USDM_ENABLED=1
+      elif [[ $state == masked-runtime ]]; then
+        OLD_RECOVERY_TIMER_USDM_MASKED_RUNTIME=1
       fi
     fi
   done
@@ -647,7 +659,7 @@ capture_existing_production_identity() {
 
 restore_previous_recovery_timers() {
   local -a timers_to_enable=()
-  local timer expected_enabled
+  local timer expected_enabled expected_masked_runtime state
   (( OLD_RECOVERY_TIMER_SPOT_ENABLED )) && timers_to_enable+=("${RECOVERY_TIMERS[0]}")
   (( OLD_RECOVERY_TIMER_USDM_ENABLED )) && timers_to_enable+=("${RECOVERY_TIMERS[1]}")
   if (( ${#timers_to_enable[@]} > 0 )); then
@@ -655,14 +667,24 @@ restore_previous_recovery_timers() {
   fi
   for timer in "${RECOVERY_TIMERS[@]}"; do
     expected_enabled=0
+    expected_masked_runtime=0
     if [[ $timer == "${RECOVERY_TIMERS[0]}" ]]; then
       expected_enabled=$OLD_RECOVERY_TIMER_SPOT_ENABLED
+      expected_masked_runtime=$OLD_RECOVERY_TIMER_SPOT_MASKED_RUNTIME
     elif [[ $timer == "${RECOVERY_TIMERS[1]}" ]]; then
       expected_enabled=$OLD_RECOVERY_TIMER_USDM_ENABLED
+      expected_masked_runtime=$OLD_RECOVERY_TIMER_USDM_MASKED_RUNTIME
     fi
+    if (( expected_masked_runtime )); then
+      systemctl mask --runtime "$timer" >/dev/null || return 1
+    fi
+    state=$(systemctl is-enabled "$timer" 2>/dev/null || true)
     if (( expected_enabled )); then
       systemctl is-enabled --quiet "$timer" >/dev/null 2>&1 || return 1
       systemctl is-active --quiet "$timer" >/dev/null 2>&1 || return 1
+    elif (( expected_masked_runtime )); then
+      [[ $state == masked-runtime ]] || return 1
+      systemctl is-active --quiet "$timer" >/dev/null 2>&1 && return 1
     else
       systemctl is-enabled --quiet "$timer" >/dev/null 2>&1 && return 1
       systemctl is-active --quiet "$timer" >/dev/null 2>&1 && return 1
@@ -916,6 +938,7 @@ partial_usdm_runtime_is_restored() {
 write_evidence() {
   local temporary current_target spot_active usdm_active
   local previous_recovery_timer_spot_enabled previous_recovery_timer_usdm_enabled
+  local previous_recovery_timer_spot_masked_runtime previous_recovery_timer_usdm_masked_runtime
   temporary="$EVIDENCE_DIR/cutover.json.tmp"
   current_target=$(readlink -f "$PRODUCTION_LINK" 2>/dev/null || true)
   spot_active=$(unit_active_json "${PRODUCTION_UNITS[0]}")
@@ -929,6 +952,16 @@ write_evidence() {
     previous_recovery_timer_usdm_enabled=true
   else
     previous_recovery_timer_usdm_enabled=false
+  fi
+  if (( OLD_RECOVERY_TIMER_SPOT_MASKED_RUNTIME )); then
+    previous_recovery_timer_spot_masked_runtime=true
+  else
+    previous_recovery_timer_spot_masked_runtime=false
+  fi
+  if (( OLD_RECOVERY_TIMER_USDM_MASKED_RUNTIME )); then
+    previous_recovery_timer_usdm_masked_runtime=true
+  else
+    previous_recovery_timer_usdm_masked_runtime=false
   fi
   jq -n \
     --arg started_at "$STARTED_AT" \
@@ -948,6 +981,8 @@ write_evidence() {
     --arg previous_usdm_invocation_id "$OLD_USDM_INVOCATION_ID" \
     --argjson previous_recovery_timer_spot_enabled "$previous_recovery_timer_spot_enabled" \
     --argjson previous_recovery_timer_usdm_enabled "$previous_recovery_timer_usdm_enabled" \
+    --argjson previous_recovery_timer_spot_masked_runtime "$previous_recovery_timer_spot_masked_runtime" \
+    --argjson previous_recovery_timer_usdm_masked_runtime "$previous_recovery_timer_usdm_masked_runtime" \
     --arg mode "$OLD_MODE" \
     --arg current_binary "$current_target" \
     --argjson spot_active "$spot_active" \
@@ -982,6 +1017,10 @@ write_evidence() {
       previous_recovery_timers_enabled: {
         spot: $previous_recovery_timer_spot_enabled,
         usdm: $previous_recovery_timer_usdm_enabled
+      },
+      previous_recovery_timers_masked_runtime: {
+        spot: $previous_recovery_timer_spot_masked_runtime,
+        usdm: $previous_recovery_timer_usdm_masked_runtime
       },
       host_mode: $mode,
       current_binary: (if $current_binary == "" then null else $current_binary end),
@@ -1055,7 +1094,12 @@ rollback_after_failure() {
       safe_to_restart=0
       ROLLBACK_RESULT=daemon-reload-failed-disabled
     elif [[ $OLD_MODE == contained-upgrade ]]; then
-      if production_is_fail_closed; then
+      if (( OLD_RECOVERY_TIMER_SPOT_MASKED_RUNTIME \
+        || OLD_RECOVERY_TIMER_USDM_MASKED_RUNTIME )) \
+        && ! restore_previous_recovery_timers; then
+        safe_to_restart=0
+        ROLLBACK_RESULT=recovery-timer-restore-failed-disabled
+      elif production_is_fail_closed; then
         ROLLBACK_RESULT=previous-release-restored-contained
       else
         safe_to_restart=0
