@@ -1165,9 +1165,16 @@ if grep -Fq 'cp -- "$source_path" "$source_tmp"' "$GATE"; then
   printf 'real-segment preflight fell back to byte-copying the production segment\n' >&2
   exit 1
 fi
-if grep -Fq "stat -c '%d:%i:%s:%Y:%Z' \"\$source_tmp\"" "$GATE" \
-  || grep -Fq "stat -c '%d:%i:%s:%Y:%Z' \"\$source_path\"" "$GATE"; then
-  printf 'real-segment preflight still binds hash stability to ctime\n' >&2
+grep -Fq "stat -c '%d:%i:%s:%Y:%Z' \"\$source_tmp\"" "$GATE" || {
+  printf 'real-segment preflight no longer records full linked inode identity during hash stability\n' >&2
+  exit 1
+}
+grep -Fq "stat -c '%d:%i:%s:%Y:%Z' \"\$source_path\"" "$GATE" || {
+  printf 'real-segment preflight no longer records full production-path identity after linking\n' >&2
+  exit 1
+}
+if grep -Fq 'rm -f -- "$source_tmp"' "$GATE"; then
+  printf 'real-segment preflight still discards the retained link between hash retries\n' >&2
   exit 1
 fi
 secure_collector_directory() {
@@ -1242,6 +1249,11 @@ chmod +x "$fake_bin/chown"
 cat >"$fake_bin/ln" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ -n ${LN_COUNT_FILE:-} ]]; then
+  count=0
+  [[ ! -f $LN_COUNT_FILE ]] || count=$(<"$LN_COUNT_FILE")
+  printf '%s\n' "$((count + 1))" >"$LN_COUNT_FILE"
+fi
 /bin/ln "$@"
 if [[ -n ${UNSTABLE_STAT_PATH_FILE:-} ]]; then
   printf '%s\n' "${2:-}" >"$UNSTABLE_STAT_PATH_FILE"
@@ -1272,13 +1284,31 @@ linked_path=
 if [[ -n ${LINKED_SOURCE_PATH_FILE:-} && -f $LINKED_SOURCE_PATH_FILE ]]; then
   linked_path=$(<"$LINKED_SOURCE_PATH_FILE")
 fi
+ctime_race_path=
+if [[ -n ${CTIME_RACE_PATH_FILE:-} && -f $CTIME_RACE_PATH_FILE ]]; then
+  ctime_race_path=$(<"$CTIME_RACE_PATH_FILE")
+fi
 if [[ -n $unstable_path && $last == "$unstable_path" \
-  && ${1:-} == -c && ${2:-} == '%d:%i:%s:%Y' ]]; then
+  && ${1:-} == -c && ${2:-} == '%d:%i:%s:%Y:%Z' ]]; then
   count=0
   [[ ! -f $UNSTABLE_STAT_COUNTER ]] || count=$(<"$UNSTABLE_STAT_COUNTER")
   count=$((count + 1))
   printf '%s\n' "$count" >"$UNSTABLE_STAT_COUNTER"
   printf '%s:%s\n' "$("$PREFLIGHT_STAT" "$@")" "$count"
+  exit 0
+fi
+if [[ -n $ctime_race_path && $last == "$ctime_race_path" \
+  && ${1:-} == -c && ${2:-} == '%d:%i:%s:%Y:%Z' ]]; then
+  count=0
+  [[ ! -f $CTIME_RACE_COUNTER ]] || count=$(<"$CTIME_RACE_COUNTER")
+  count=$((count + 1))
+  printf '%s\n' "$count" >"$CTIME_RACE_COUNTER"
+  value=$("$PREFLIGHT_STAT" "$@")
+  if (( count <= 2 )); then
+    printf '%s:%s\n' "$value" "$count"
+  else
+    printf '%s\n' "$value"
+  fi
   exit 0
 fi
 if [[ -n $linked_path && $last == "$linked_path" \
@@ -1597,15 +1627,22 @@ mkdir -p "$unlink_race_case/source" "$unlink_race_case/spool" \
   "$unlink_race_case/download" "$unlink_race_case/evidence"
 unlink_race_source="$unlink_race_case/source/market-updates.20260101T021000000000.ndjson"
 cp "$compatible" "$unlink_race_source"
+export LN_COUNT_FILE="$unlink_race_case/ln-count"
+export CTIME_RACE_PATH_FILE="$unlink_race_case/linked-path"
+export CTIME_RACE_COUNTER="$unlink_race_case/ctime-count"
 export UNLINK_SOURCE_AFTER_LINK="$unlink_race_source"
 real_market_segment_preflight "$unlink_race_case/source" "$unlink_race_case/spool" \
   "$unlink_race_case/download" "$unlink_race_case/evidence" || {
   printf 'real-segment preflight lost the hardlinked segment after the production uploader unlink race\n' >&2
   exit 1
 }
-unset UNLINK_SOURCE_AFTER_LINK
+unset UNLINK_SOURCE_AFTER_LINK LN_COUNT_FILE CTIME_RACE_PATH_FILE CTIME_RACE_COUNTER
 [[ ! -e $unlink_race_source ]] || {
   printf 'real-segment preflight did not delete the production path during the unlink race injection\n' >&2
+  exit 1
+}
+[[ $(<"$unlink_race_case/ln-count") == 1 ]] || {
+  printf 'real-segment preflight recreated the retained link instead of reusing it after unlink-induced ctime drift\n' >&2
   exit 1
 }
 jq -e '.status == "passed"
@@ -6910,8 +6947,14 @@ if grep -Fq 'verify_fresh_legacy_runtime' "$cutover_legacy_rollback"; then
   printf 'legacy rollback still waits for a full-cycle health publication\n' >&2
   exit 1
 fi
-legacy_drain_line=$(grep -n '^[[:space:]]*verify_oneshot_success "$REFERENCE_UPLOAD_UNIT"' "$CUTOVER" \
-  | head -1 | cut -d: -f1)
+if grep -Fq 'verify_oneshot_success "$REFERENCE_UPLOAD_UNIT"' "$cutover_legacy_promotion"; then
+  printf 'cutover still synchronously drains the baseline reference uploader before stop\n' >&2
+  exit 1
+fi
+[[ $(grep -Fc 'verify_oneshot_success "$REFERENCE_UPLOAD_UNIT"' "$CUTOVER") -eq 1 ]] || {
+  printf 'cutover no longer verifies the promoted reference uploader exactly once\n' >&2
+  exit 1
+}
 legacy_cursor_line=$(grep -n '^[[:space:]]*legacy_stop_cursor=$(journal_cursor "$COLLECTOR_UNIT")' \
   "$CUTOVER" | cut -d: -f1)
 legacy_final_runtime_line=$(grep -n \
@@ -6979,12 +7022,59 @@ run_reset_case inactive 2 true success 1
 run_reset_case failed 0 false failure 1
 run_reset_case active 0 true failure 0
 
+saved_unit_state_contract="$tmp_dir/saved-unit-state-contract.sh"
+sed -n '/^verify_saved_unit_state() {$/,/^}$/p' "$CUTOVER" >"$saved_unit_state_contract"
+[[ -s $saved_unit_state_contract ]] || {
+  printf 'saved unit-state verifier is missing\n' >&2
+  exit 1
+}
+exercise_saved_unit_state() (
+  set -euo pipefail
+  local enabled_json=$1 active_json=$2 enabled_now=$3 active_now=$4
+  COLLECTOR_UNIT=collector.service
+  REFERENCE_UPLOAD_TIMER=reference-upload.timer
+  MARKET_UPLOAD_TIMER=market-upload.timer
+  unit_enabled() { [[ $2 == true ]] && return 0 || return 1; }
+  unit_active() { [[ $2 == true ]] && return 0 || return 1; }
+  # shellcheck source=/dev/null
+  source "$saved_unit_state_contract"
+  unit_enabled() {
+    case "$1" in
+      collector.service) [[ $enabled_now == true ]] ;;
+      reference-upload.timer|market-upload.timer) [[ $enabled_now == true ]] ;;
+      *) return 1 ;;
+    esac
+  }
+  unit_active() {
+    case "$1" in
+      collector.service) [[ $active_now == true ]] ;;
+      reference-upload.timer|market-upload.timer) [[ $active_now == true ]] ;;
+      *) return 1 ;;
+    esac
+  }
+  state_json="$tmp_dir/saved-unit-state.json"
+  jq -n --arg enabled "$enabled_json" --arg active "$active_json" '
+    {units:{
+      "collector.service":{enabled:($enabled|fromjson),active:($active|fromjson)},
+      "reference-upload.timer":{enabled:($enabled|fromjson),active:($active|fromjson)},
+      "market-upload.timer":{enabled:($enabled|fromjson),active:($active|fromjson)}
+    }}' >"$state_json"
+  verify_saved_unit_state "$state_json"
+)
+exercise_saved_unit_state false false false false || {
+  printf 'saved unit-state verifier rejected disabled/inactive rollback state\n' >&2
+  exit 1
+}
+if exercise_saved_unit_state null false false false >/dev/null 2>&1; then
+  printf 'saved unit-state verifier accepted a non-boolean enabled value\n' >&2
+  exit 1
+fi
+
 cutover_reset_line=$(grep -n '^reset_failed_unit_if_needed "$COLLECTOR_UNIT"$' "$CUTOVER" \
   | cut -d: -f1)
 cutover_restart_line=$(grep -n '^systemctl restart "$COLLECTOR_UNIT"$' "$CUTOVER" \
   | cut -d: -f1)
-((legacy_drain_line < legacy_cursor_line \
-  && legacy_cursor_line < legacy_final_oss_line \
+((legacy_cursor_line < legacy_final_oss_line \
   && legacy_final_oss_line < legacy_final_runtime_line \
   && legacy_final_runtime_line < cutover_stop_line \
   && cutover_stop_line < legacy_journal_guard_line \

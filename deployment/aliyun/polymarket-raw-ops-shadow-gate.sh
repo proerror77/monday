@@ -1169,22 +1169,21 @@ real_market_segment_preflight() {
     write_preflight_failure 'shadow spool already contains the preflight target path'
     return 1
   }
+  # Bind the production segment onto the shadow spool before hashing it. Once
+  # the extra link exists, the production uploader may unlink the original
+  # path and the Gate still retains the exact inode for upload/readback.
+  run_before_deadline "$preflight_deadline" ln "$source_path" "$source_tmp" \
+    || {
+      write_preflight_failure 'could not hardlink the production segment into the shadow spool'
+      return 1
+    }
   for _ in 1 2 3; do
-    rm -f -- "$source_tmp"
-    # Bind the production segment onto the shadow spool before hashing it. Once
-    # the extra link exists, the production uploader may unlink the original
-    # path and the Gate still retains the exact inode for upload/readback.
-    run_before_deadline "$preflight_deadline" ln "$source_path" "$source_tmp" \
-      || {
-        write_preflight_failure 'could not hardlink the production segment into the shadow spool'
-        return 1
-      }
     before=$(run_before_deadline "$preflight_deadline" \
-      stat -c '%d:%i:%s:%Y' "$source_tmp") || return 1
+      stat -c '%d:%i:%s:%Y:%Z' "$source_tmp") || return 1
     source_content_sha256=$(run_before_deadline "$preflight_deadline" \
       sha256sum "$source_tmp" | awk '{print $1}') || return 1
     after=$(run_before_deadline "$preflight_deadline" \
-      stat -c '%d:%i:%s:%Y' "$source_tmp") || return 1
+      stat -c '%d:%i:%s:%Y:%Z' "$source_tmp") || return 1
     if [[ $before == "$after" ]]; then
       stable=true
       break
@@ -1206,7 +1205,7 @@ real_market_segment_preflight() {
       return 1
     }
     source_path_identity=$(run_before_deadline "$preflight_deadline" \
-      stat -c '%d:%i:%s:%Y' "$source_path") || return 1
+      stat -c '%d:%i:%s:%Y:%Z' "$source_path") || return 1
     [[ $source_path_identity == "$after" ]] || {
       write_preflight_failure 'production segment path was replaced by a different inode after linking'
       return 1

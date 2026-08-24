@@ -880,10 +880,12 @@ render_upload_unit() {
 verify_saved_unit_state() {
   local state_json=$1 unit expected_enabled expected_active
   for unit in "$COLLECTOR_UNIT" "$REFERENCE_UPLOAD_TIMER" "$MARKET_UPLOAD_TIMER"; do
-    expected_enabled=$(jq -er --arg unit "$unit" '.units[$unit].enabled' "$state_json") \
+    expected_enabled=$(jq -r --arg unit "$unit" '.units[$unit].enabled' "$state_json") \
       || return 1
-    expected_active=$(jq -er --arg unit "$unit" '.units[$unit].active' "$state_json") \
+    expected_active=$(jq -r --arg unit "$unit" '.units[$unit].active' "$state_json") \
       || return 1
+    [[ $expected_enabled == true || $expected_enabled == false ]] || return 1
+    [[ $expected_active == true || $expected_active == false ]] || return 1
     if [[ $expected_enabled == true ]]; then
       unit_enabled "$unit" || return 1
     elif unit_enabled "$unit"; then
@@ -1923,8 +1925,9 @@ on_exit() {
 }
 trap on_exit EXIT
 
-# Drain only uploader configurations that the Gate could bind. A degraded
-# bootstrap baseline is deliberately not a release-control source.
+# Only the market backlog needs an explicit kick here. The reference lane is
+# left to the promoted timers so a stalled baseline oneshot cannot block
+# cutover.
 [[ $(sha256sum "$gate_terminal_receipt" | awk '{print $1}') \
   == "$gate_terminal_receipt_sha256" ]] \
   || die 'Gate terminal receipt changed before cutover transition'
@@ -1953,12 +1956,7 @@ elif [[ $baseline_mode == rust_release ]]; then
     "$baseline_reference_upload_exec" "$baseline_market_upload_exec" \
     || die 'Rust baseline upload units changed before drain'
 fi
-if [[ $contained_recovery == false && $baseline_mode != rust_bootstrap ]]; then
-  systemctl start "$REFERENCE_UPLOAD_UNIT"
-  verify_oneshot_success "$REFERENCE_UPLOAD_UNIT" \
-    || die 'legacy reference uploader drain did not complete successfully'
-fi
-if [[ $baseline_mode == rust_release ]]; then
+if [[ $contained_recovery == false && $baseline_mode == rust_release ]]; then
   systemctl start "$MARKET_UPLOAD_UNIT"
   verify_oneshot_success "$MARKET_UPLOAD_UNIT" \
     || die 'Rust market uploader drain did not complete successfully'
