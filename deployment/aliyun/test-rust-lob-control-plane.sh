@@ -1705,7 +1705,7 @@ grep -Fq 'gate_markers=("$GATE_BUNDLE_DIR"/runs/*/PASSED.sha256)' "$CUTOVER"
 grep -Fq 'rollback-deployment.sha256' "$CUTOVER"
 grep -Fq 'ROLLBACK_DEPLOYMENT_MANIFEST_SHA256' "$rollback_body"
 grep -Fq 'installed production asset drifted from the active immutable release' "$CUTOVER"
-grep -Fq 'cmp -s -- "$source" "$installed_source"' "$CUTOVER"
+grep -Fq 'cmp -s -- "$source" "$snapshot_source"' "$CUTOVER"
 grep -Fq 'mkdir -m 0750 -- "$EVIDENCE_DIR"' "$CUTOVER"
 grep -Fq 'mkdir -m 0750 -- "$evidence_dir"' "$GATE"
 grep -Fq '\( -type f -o -type l \)' "$GATE"
@@ -1832,7 +1832,14 @@ for asset in "${deployment_assets[@]}"; do
     *.service) installed="$installed_root/systemd/$asset" ;;
     *.env) installed="$installed_root/monday/$asset" ;;
   esac
-  printf 'fixture:%s\n' "$asset" >"$release_deployment/$asset"
+  if [[ $asset == binance-lob-archiver-production@.service ]]; then
+    printf '%s\n' \
+      '[Service]' \
+      'ReadWritePaths=/data/monday/spool/binance-lob -/data/monday/spool/binance-lob-recovery' \
+      >"$release_deployment/$asset"
+  else
+    printf 'fixture:%s\n' "$asset" >"$release_deployment/$asset"
+  fi
   install -m 0644 "$release_deployment/$asset" "$installed"
 done
 
@@ -1841,11 +1848,18 @@ run_stage_fixture() (
   RECOVERY_DEPLOYMENT_ASSETS=()
   OLD_DEPLOYMENT="$release_deployment"
   EVIDENCE_DIR=$1
+  OLD_MODE=${2:-upgrade}
   ROLLBACK_DEPLOYMENT_MANIFEST_SHA256=
   fail() { printf '%s\n' "$*" >&2; exit 1; }
   validate_deployment() { return 0; }
   secure_regular_file() { [[ -f $1 && ! -L $1 ]]; }
-  atomic_install() { install -m "$1" "$2" "$3"; }
+  atomic_install() {
+    if [[ ${3:-} == */binance-lob-archiver-production@.service \
+      && ${MUTATE_INSTALLED_BEFORE_SNAPSHOT:-0} == 1 ]]; then
+      printf 'ProtectSystem=false\n' >>"$2"
+    fi
+    install -m "$1" "$2" "$3"
+  }
   # shellcheck disable=SC1090
   . "$stage_body"
   stage_existing_deployment_for_rollback
@@ -1867,6 +1881,60 @@ if (
   printf 'rollback manifest accepted a tampered snapshot\n' >&2
   exit 1
 fi
+
+installed_production_unit="$installed_root/systemd/binance-lob-archiver-production@.service"
+sed -i.bak \
+  's#^ReadWritePaths=/data/monday/spool/binance-lob -/data/monday/spool/binance-lob-recovery$#ReadWritePaths=/data/monday/spool#' \
+  "$installed_production_unit"
+rm -f "$installed_production_unit.bak"
+legacy_scope_evidence="$tmp_dir/legacy-scope-evidence"
+mkdir -p "$legacy_scope_evidence"
+run_stage_fixture "$legacy_scope_evidence" partial-contained-spot-live
+grep -Fxq 'ReadWritePaths=/data/monday/spool' \
+  "$legacy_scope_evidence/rollback-deployment/binance-lob-archiver-production@.service"
+(
+  cd "$legacy_scope_evidence/rollback-deployment"
+  sha256sum --check --strict "$legacy_scope_evidence/rollback-deployment.sha256" >/dev/null
+)
+legacy_scope_race_evidence="$tmp_dir/legacy-scope-race-evidence"
+mkdir -p "$legacy_scope_race_evidence"
+if MUTATE_INSTALLED_BEFORE_SNAPSHOT=1 \
+  run_stage_fixture "$legacy_scope_race_evidence" partial-contained-spot-live \
+  >"$tmp_dir/legacy-scope-race.out" 2>&1; then
+  printf 'rollback snapshot accepted bytes changed after the drift precheck\n' >&2
+  exit 1
+fi
+grep -Fq 'installed production asset drifted from the active immutable release' \
+  "$tmp_dir/legacy-scope-race.out"
+install -m 0644 \
+  "$release_deployment/binance-lob-archiver-production@.service" \
+  "$installed_production_unit"
+sed -i.bak \
+  's#^ReadWritePaths=/data/monday/spool/binance-lob -/data/monday/spool/binance-lob-recovery$#ReadWritePaths=/data/monday/spool#' \
+  "$installed_production_unit"
+rm -f "$installed_production_unit.bak"
+legacy_scope_upgrade_evidence="$tmp_dir/legacy-scope-upgrade-evidence"
+mkdir -p "$legacy_scope_upgrade_evidence"
+if run_stage_fixture "$legacy_scope_upgrade_evidence" upgrade \
+  >"$tmp_dir/legacy-scope-upgrade.out" 2>&1; then
+  printf 'rollback snapshot accepted legacy scope drift outside partial-contained mode\n' >&2
+  exit 1
+fi
+grep -Fq 'installed production asset drifted from the active immutable release' \
+  "$tmp_dir/legacy-scope-upgrade.out"
+printf 'ProtectSystem=false\n' >>"$installed_production_unit"
+legacy_scope_extra_evidence="$tmp_dir/legacy-scope-extra-evidence"
+mkdir -p "$legacy_scope_extra_evidence"
+if run_stage_fixture "$legacy_scope_extra_evidence" partial-contained-spot-live \
+  >"$tmp_dir/legacy-scope-extra.out" 2>&1; then
+  printf 'rollback snapshot accepted an extra partial-contained unit drift\n' >&2
+  exit 1
+fi
+grep -Fq 'installed production asset drifted from the active immutable release' \
+  "$tmp_dir/legacy-scope-extra.out"
+install -m 0644 \
+  "$release_deployment/binance-lob-archiver-production@.service" \
+  "$installed_production_unit"
 
 printf 'drifted\n' >>"$installed_root/monday/binance-lob-archiver-production-spot.env"
 drift_evidence="$tmp_dir/drift-evidence"
