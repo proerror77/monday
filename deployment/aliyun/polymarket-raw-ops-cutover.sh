@@ -33,7 +33,7 @@ readonly LEGACY_EXEC="/usr/bin/python3 $LEGACY_COLLECTOR"
 readonly RUST_EXEC="$ACTIVE_BINARY collect-reference --max-trade-polls-per-cycle 200"
 readonly COLLECTOR_FRAGMENT="/etc/systemd/system/$COLLECTOR_UNIT"
 readonly LEGACY_REFERENCE_UPLOAD_EXEC="/usr/bin/python3 $LEGACY_UPLOADER --spool-dir /data/monday/spool/polymarket-reference --dataset crypto_expiry_reference --quote-depth-levels 0 --quote-sample-ms 0"
-readonly REFERENCE_UPLOAD_EXEC="$ACTIVE_BINARY upload --spool-dir /data/monday/spool/polymarket-reference --dataset crypto_expiry_reference --quote-depth-levels 0 --quote-sample-ms 0"
+readonly REFERENCE_UPLOAD_EXEC="/usr/bin/env ZSTD_THREADS=1 $ACTIVE_BINARY upload --spool-dir /data/monday/spool/polymarket-reference --dataset crypto_expiry_reference --quote-depth-levels 0 --quote-sample-ms 0 --upload-concurrency 2"
 readonly MARKET_UPLOAD_EXEC="/usr/bin/env ZSTD_THREADS=1 $ACTIVE_BINARY upload --quote-depth-levels 0 --quote-sample-ms 0 --upload-concurrency 2"
 readonly UPLOAD_ENV=/etc/monday/polymarket-market-tape-upload.env
 # Must match the collector's in-process MAX_STARTUP_DURATION: startup recovery
