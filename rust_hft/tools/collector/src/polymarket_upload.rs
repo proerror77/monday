@@ -2768,6 +2768,8 @@ fn ensure_upload_staging_root(path: &Path) -> Result<()> {
 // Tails longer than this window are indistinguishable from mid-tape
 // corruption and refuse repair instead.
 const TORN_TAIL_REPAIR_WINDOW_BYTES: u64 = 1024 * 1024;
+const EMPTY_TAPE_QUARANTINE_DIR: &str = "quarantined-empty-tapes";
+const EMPTY_TAPE_QUARANTINE_LOG: &str = "quarantined-empty-tapes.log";
 
 fn complete_line_count(file: &File) -> Result<usize> {
     let mut reader = BufReader::new(file);
@@ -2807,6 +2809,43 @@ fn audit_torn_tail_repair(
     file.write_all(b"\n")?;
     file.sync_all()?;
     Ok(())
+}
+
+fn quarantine_empty_tape(source: &Path) -> Result<Option<PathBuf>> {
+    let identity = regular_identity(source)?;
+    if identity.bytes != 0 {
+        return Ok(None);
+    }
+    let spool_dir = source
+        .parent()
+        .ok_or_else(|| anyhow!("source has no parent"))?;
+    let quarantine_root = spool_dir.join(EMPTY_TAPE_QUARANTINE_DIR);
+    ensure_upload_staging_root(&quarantine_root)?;
+    let name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("tape file name is not UTF-8"))?;
+    let quarantine = quarantine_root.join(format!("{name}.empty.{:016x}", random::<u64>()));
+    ensure_identity(source, identity)?;
+    fs::rename(source, &quarantine)?;
+    File::open(&quarantine_root)?.sync_all()?;
+    File::open(spool_dir)?.sync_all()?;
+    let record = json!({
+        "quarantined_at": utc_now(),
+        "source": name,
+        "quarantine": quarantine.file_name().and_then(|value| value.to_str()),
+        "bytes": identity.bytes,
+        "reason": "empty_closed_tape",
+    });
+    eprintln!("Polymarket empty closed tape quarantined: {record}");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(spool_dir.join(EMPTY_TAPE_QUARANTINE_LOG))?;
+    serde_json::to_writer(&mut file, &record)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    Ok(Some(quarantine))
 }
 
 /// Truncate the unterminated final record of a closed tape, returning the
@@ -2855,6 +2894,9 @@ fn repair_torn_tail(source: &Path) -> Result<Option<u64>> {
 
 fn archive_source(source: &Path, config: &UploadConfig) -> Result<Vec<UploadedSegment>> {
     let _archive_activity = ArchiveActivity::enter();
+    if let Some(quarantine) = quarantine_empty_tape(source)? {
+        bail!("empty closed tape quarantined at {}", quarantine.display());
+    }
     // Only rotated (closed) tapes reach this path via discover_rotated_tapes;
     // the active tape keeps its in-progress tail untouched.
     repair_torn_tail(source)?;
@@ -3051,10 +3093,14 @@ fn record_upload_result(
                 "Polymarket tape upload failed for {}: {error}",
                 source.display()
             );
-            failures.push(json!({
+            let mut failure = json!({
                 "source": source.file_name().and_then(|name| name.to_str()),
                 "error": error.to_string(),
-            }));
+            });
+            if error.to_string().contains("empty closed tape quarantined") {
+                failure["reason"] = json!("empty_closed_tape");
+            }
+            failures.push(failure);
         }
     }
 }
@@ -4814,6 +4860,36 @@ mod tests {
     }
 
     #[test]
+    fn empty_closed_segment_is_quarantined_and_audited() {
+        let root = TestDir::new();
+        let tape = root.path().join("market-updates.20260715T010000.ndjson");
+        File::create(&tape).unwrap().sync_all().unwrap();
+
+        let quarantine = quarantine_empty_tape(&tape)
+            .unwrap()
+            .expect("empty tape must be quarantined");
+
+        assert!(!tape.exists());
+        assert!(quarantine.exists());
+        let audit: Value = serde_json::from_str(
+            fs::read_to_string(root.path().join(EMPTY_TAPE_QUARANTINE_LOG))
+                .unwrap()
+                .trim(),
+        )
+        .unwrap();
+        assert_eq!(audit["source"], "market-updates.20260715T010000.ndjson");
+        assert_eq!(audit["reason"], "empty_closed_tape");
+        assert_eq!(audit["bytes"], 0);
+        assert_eq!(
+            audit["quarantine"],
+            quarantine
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn terminated_closed_segment_is_not_repaired() {
         let root = TestDir::new();
         let tape = write_tape(
@@ -6203,6 +6279,36 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("low disk floor must be nonzero")
+        );
+    }
+
+    #[test]
+    fn upload_pending_quarantines_empty_closed_tape_only_once() {
+        let root = TestDir::new();
+        let tape = root.path().join("market-updates.20260715T010000.ndjson");
+        File::create(&tape).unwrap().sync_all().unwrap();
+        let config = config(root.path());
+
+        let error = upload_pending(&config).unwrap_err();
+
+        assert!(error.to_string().contains("failed"));
+        assert!(!tape.exists());
+        let status: Value =
+            serde_json::from_slice(&fs::read(root.path().join("upload-status.json")).unwrap())
+                .unwrap();
+        assert_eq!(status["pending_segments"], 0);
+        assert_eq!(status["failure_count"], 1);
+        assert_eq!(status["failed_segments"][0]["reason"], "empty_closed_tape");
+        assert!(root.path().join(EMPTY_TAPE_QUARANTINE_DIR).exists());
+
+        let retry = upload_pending(&config).unwrap();
+
+        assert_eq!(
+            retry,
+            UploadSummary {
+                uploaded_segments: 0,
+                canonical_uploaded_segments: 0,
+            }
         );
     }
 
