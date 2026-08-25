@@ -2244,6 +2244,11 @@ while :; do
     verify_baseline_identity \
       || die 'baseline collector identity changed during gate and is not an admissible supervised crash restart'
   fi
+  # Crash-restart adjudication may wait for both systemd settlement and
+  # journal visibility. Health and settle-boundary decisions must use the
+  # time after that bounded wait, not the loop-entry sample.
+  now_uptime=$SECONDS
+  elapsed=$((now_uptime - start_uptime))
   if baseline_health_requires_continuous_freshness "$baseline_mode"; then
     legacy_health="$LEGACY_SPOOL/health.json"
     [[ -f $legacy_health && ! -L $legacy_health ]] \
@@ -2402,6 +2407,30 @@ while :; do
     fi
   fi
 
+  # Re-sample after the checks above before deciding whether to sleep again.
+  # Using the loop-entry sample here can add a whole extra sample period when
+  # the body crosses the observation deadline.
+  now_uptime=$SECONDS
+  elapsed=$((now_uptime - start_uptime))
+  if baseline_health_requires_continuous_freshness "$baseline_mode"; then
+    legacy_health_result=$(legacy_health_transition \
+      "$legacy_health_state" "$legacy_api_error_started_at" \
+      "$now_uptime" "$MAX_HEALTH_SILENCE_SECONDS")
+    legacy_health_decision=${legacy_health_result%%:*}
+    legacy_api_error_started_at=${legacy_health_result#*:}
+    case "$legacy_health_decision" in
+      advance|wait)
+        ;;
+      expired)
+        die "$baseline_label API errors did not recover within the health budget"
+        ;;
+      *)
+        die "$baseline_label health is not fail-closed clean during shadow"
+        ;;
+    esac
+    ((now_uptime - last_legacy_health_change <= MAX_HEALTH_SILENCE_SECONDS)) \
+      || die "$baseline_label health stopped advancing during shadow"
+  fi
   if ((elapsed >= gate_seconds)) \
     && ! baseline_health_requires_continuous_freshness "$baseline_mode" \
     && [[ $LEGACY_HEALTH_COMPLETION_REQUIRED == true ]] \
