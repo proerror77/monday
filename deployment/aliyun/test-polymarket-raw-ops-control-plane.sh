@@ -5704,14 +5704,14 @@ if ! jq -e -f "$POLICY" "$tmp_dir/body-overrun.json" >/dev/null; then
   printf 'gate policy rejected bounded final-sample work\n' >&2
   exit 1
 fi
-jq '.duration_seconds = 3630' "$tmp_dir/gate.json" >"$tmp_dir/sample-tail.json"
+jq '.duration_seconds = 3691' "$tmp_dir/gate.json" >"$tmp_dir/sample-tail.json"
 if ! jq -e -f "$POLICY" "$tmp_dir/sample-tail.json" >/dev/null; then
-  printf 'gate policy rejected one bounded sample period of tail work\n' >&2
+  printf 'gate policy rejected bounded sample and restart-adjudication tail work\n' >&2
   exit 1
 fi
-jq '.duration_seconds = 3631' "$tmp_dir/gate.json" >"$tmp_dir/too-long.json"
+jq '.duration_seconds = 3692' "$tmp_dir/gate.json" >"$tmp_dir/too-long.json"
 if jq -e -f "$POLICY" "$tmp_dir/too-long.json" >/dev/null; then
-  printf 'gate policy accepted more than one sample period of tail work\n' >&2
+  printf 'gate policy accepted more than the bounded observation tail\n' >&2
   exit 1
 fi
 jq '.started_at = "1970-01-01T00:01:41Z"' \
@@ -6937,7 +6937,7 @@ grep -Fq '"$now_uptime" "$MAX_HEALTH_SILENCE_SECONDS")' "$GATE"
 grep -Fq 'legacy_health_decision=${legacy_health_result%%:*}' "$GATE"
 grep -Fq 'legacy_api_error_started_at=${legacy_health_result#*:}' "$GATE"
 legacy_transition_line=$(grep -nF \
-  'legacy_health_result=$(legacy_health_transition' "$GATE" | cut -d: -f1)
+  'legacy_health_result=$(legacy_health_transition' "$GATE" | head -n 1 | cut -d: -f1)
 health_settle_line=$(grep -nF \
   '  if ((elapsed >= HEALTH_SETTLE_SECONDS)); then' "$GATE" | cut -d: -f1)
 if ((legacy_transition_line >= health_settle_line)); then
@@ -6955,6 +6955,12 @@ awk '
   in_observation && /^  elapsed=\$\(\(now_uptime - start_uptime\)\)$/ {
     elapsed_samples++
     if (elapsed_samples == 2) resample_line = NR
+    if (elapsed_samples == 3) final_resample_line = NR
+  }
+  in_observation && /^  if baseline_health_requires_continuous_freshness / {
+    health_checks++
+    if (health_checks == 1) health_sample_line = NR
+    if (health_checks == 2) final_health_line = NR
   }
   in_observation && /^  if \(\(elapsed >= gate_seconds\)\)/ {
     completion_line = NR
@@ -6963,8 +6969,10 @@ awk '
     deadline_line = NR
   }
   in_observation && /^done$/ {
-    exit !(elapsed_samples == 2 &&
-      resample_line < completion_line &&
+    exit !(elapsed_samples == 3 && health_checks == 2 &&
+      resample_line < health_sample_line &&
+      final_resample_line < final_health_line &&
+      final_health_line < completion_line &&
       completion_line < deadline_line)
   }
 ' "$GATE" || {
