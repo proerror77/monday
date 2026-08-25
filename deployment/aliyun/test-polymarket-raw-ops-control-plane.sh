@@ -102,7 +102,7 @@ if ! awk '
   exit 1
 fi
 if ! awk '
-  /"\$GATE" --real-market-segment-ready "\$MARKET_SPOOL"/ {ready=NR}
+  /^  \[\[ \$segment_ready == true \]\] \|\| require_real_market_segment_ready$/ {ready=NR}
   /^  write_runtime_request "\$candidate_path"/ {request=NR}
   /^  if ! systemctl start "\$unit"/ {start=NR}
   END {exit !(ready && ready < request && request < start)}
@@ -585,8 +585,34 @@ supervisor_recovery_gate_invocation=$(printf '9%.0s' {1..32})
 set_supervisor_state invocation "$supervisor_recovery_gate_invocation"
 set_supervisor_state active inactive
 set_supervisor_state baseline-active inactive
+supervisor_recovery_request_file="$supervisor_root/run/monday/polymarket-raw-ops-gates/$supervisor_candidate_sha.request.json"
+supervisor_recovery_env_file="$supervisor_root/run/monday/polymarket-raw-ops-gates/$supervisor_candidate_sha.env"
+supervisor_recovery_starts_before=$(grep -Fxc "start $supervisor_unit" \
+  "$supervisor_calls" || true)
+if env "${gate_control_env[@]}" INVOCATION_ID= FAKE_REAL_MARKET_READY_EXIT=1 \
+  "$supervisor_control" recover "$supervisor_candidate" \
+  "$supervisor_candidate_sha" "$supervisor_source" "$supervisor_probe" \
+  >/dev/null 2>&1; then
+  printf 'recovery without a ready market segment unexpectedly passed\n' >&2
+  exit 1
+fi
+[[ $(grep -Fxc "start $supervisor_unit" "$supervisor_calls" || true) \
+    -eq $supervisor_recovery_starts_before \
+  && ! -e $supervisor_recovery_request_file \
+  && ! -e $supervisor_recovery_env_file ]]
+if admission_records_matching '.result == "admitted"' | grep -q .; then
+  printf 'segment refusal published a false recovery admission\n' >&2
+  exit 1
+fi
+[[ $(admission_records_matching \
+  '.result == "refused" and (.refusal_reason | test("no eligible closed market segment"))' \
+  | grep -c .) -eq 1 ]]
+supervisor_recovery_ready_before=$(grep -Fc -- \
+  '--real-market-segment-ready ' "$supervisor_gate_calls" || true)
 gate_control recover "$supervisor_candidate" "$supervisor_candidate_sha" \
   "$supervisor_source" "$supervisor_probe" >"$supervisor_tmp/recover-start.json"
+[[ $(grep -Fc -- '--real-market-segment-ready ' "$supervisor_gate_calls") \
+  -eq $((supervisor_recovery_ready_before + 1)) ]]
 jq -e --arg invocation "$supervisor_recovery_gate_invocation" '
   .phase == "running" and .systemd_invocation_id == $invocation
 ' "$supervisor_tmp/recover-start.json" >/dev/null
@@ -1352,6 +1378,21 @@ preflight_root="$tmp_dir/real-market-preflight"
 remote_root="$preflight_root/remote"
 fake_bin="$preflight_root/bin"
 mkdir -p "$remote_root" "$fake_bin"
+calendar_case="$preflight_root/calendar-case"
+calendar_valid="$calendar_case/market-updates.20260101T000000000000.ndjson"
+calendar_invalid="$calendar_case/market-updates.20990231T000000000000.ndjson"
+mkdir "$calendar_case"
+printf 'valid\n' >"$calendar_valid"
+printf 'invalid\n' >"$calendar_invalid"
+[[ $(latest_real_market_segment "$calendar_case") == "$calendar_valid" ]] || {
+  printf 'real-segment admission preferred an impossible calendar timestamp\n' >&2
+  exit 1
+}
+rm "$calendar_valid"
+if latest_real_market_segment "$calendar_case" >/dev/null; then
+  printf 'real-segment admission accepted an impossible calendar timestamp\n' >&2
+  exit 1
+fi
 
 make_remote_triplet() {
   local source=$1 uri=$2 dataset=$3 remote_data remote_manifest

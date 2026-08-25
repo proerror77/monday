@@ -1150,6 +1150,10 @@ latest_real_market_segment() {
       || continue
     candidate_stamp=${BASH_REMATCH[1]}
     candidate_uuid=${BASH_REMATCH[4]:-}
+    date -u -d \
+      "${candidate_stamp:0:4}-${candidate_stamp:4:2}-${candidate_stamp:6:2}T${candidate_stamp:9:2}:${candidate_stamp:11:2}:${candidate_stamp:13:2}Z" \
+      +%Y%m%dT%H%M%S 2>/dev/null \
+      | grep -Fqx -- "${candidate_stamp:0:15}" || continue
     if [[ -z $source_name || $candidate_stamp > "$source_stamp" \
       || ( $candidate_stamp == "$source_stamp" \
         && -n $candidate_uuid && -z $source_uuid ) ]]; then

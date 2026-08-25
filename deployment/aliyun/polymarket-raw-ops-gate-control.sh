@@ -849,6 +849,11 @@ recover_admission_refused() {
   die "$reason"
 }
 
+require_real_market_segment_ready() {
+  "$GATE" --real-market-segment-ready "$MARKET_SPOOL" >/dev/null \
+    || die 'no eligible closed market segment is ready; retry after the next rotation'
+}
+
 recover_gate() {
   local candidate_path=$1 candidate_sha=$2 source_revision=$3 probe=$4
   local probe_json=null baseline_json=null recovery_json
@@ -880,18 +885,22 @@ recover_gate() {
     recover_admission_refused "$candidate_sha" "$source_revision" \
       "$probe_json" "$baseline_json" "$reset_log" "$admission_stderr"
   fi
+  if ! ( require_real_market_segment_ready ) 2>"$admission_stderr"; then
+    recover_admission_refused "$candidate_sha" "$source_revision" \
+      "$probe_json" "$baseline_json" "$reset_log" "$admission_stderr"
+  fi
   write_recovery_admission "$candidate_sha" "$source_revision" admitted '' \
     "$probe_json" "$baseline_json" "$reset_log" \
     || die 'recovery admission evidence could not be written'
   rm -f -- "$admission_stderr" "$reset_log"
   recovery_json=$(jq -cn --argjson baseline "$baseline_json" --argjson probe "$probe_json" \
     '{mode:"gamma_closed_200",baseline:$baseline,candidate_probe:$probe}')
-  start_gate "$candidate_path" "$candidate_sha" "$source_revision" "$recovery_json"
+  start_gate "$candidate_path" "$candidate_sha" "$source_revision" "$recovery_json" true
 }
 
 start_gate() {
   local candidate_path=$1 candidate_sha source_revision=$3 recovery=${4:-null} unit invocation env_file
-  local active_state main_pid
+  local segment_ready=${5:-false} active_state main_pid
   candidate_sha=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
   source_revision=$(printf '%s' "$source_revision" | tr '[:upper:]' '[:lower:]')
   valid_candidate "$candidate_sha" || die 'candidate SHA-256 is invalid'
@@ -928,8 +937,7 @@ start_gate() {
     || die 'cannot read Gate state before start'
   [[ $active_state == inactive || $active_state == failed ]] \
     || die 'a Gate job already owns this candidate'
-  "$GATE" --real-market-segment-ready "$MARKET_SPOOL" >/dev/null \
-    || die 'no eligible closed market segment is ready; retry after the next rotation'
+  [[ $segment_ready == true ]] || require_real_market_segment_ready
   write_runtime_request "$candidate_path" "$candidate_sha" "$source_revision" "$recovery"
   env_file="$RUN_ROOT/$candidate_sha.env"
   [[ ! -L $env_file ]] || die 'Gate EnvironmentFile is a symlink'
