@@ -443,35 +443,37 @@ done
 select_if_affected() {
   local flag=$1
   shift
-  local package
+  local package selected=false
   for package in "$@"; do
     if is_affected "$package"; then
       mark_checked_direct_package "$package"
-      case "$flag" in
-        loop) loop=true ;;
-        handoff) handoff=true ;;
-        json) json=true ;;
-        ondo) ondo=true ;;
-        collector) collector=true ;;
-        focused) focused=true ;;
-      esac
-      toolchain=true
-      return
+      selected=true
     fi
   done
+  [[ $selected == true ]] || return 0
+  case "$flag" in
+    loop) loop=true ;;
+    handoff) handoff=true ;;
+    json) json=true ;;
+    ondo) ondo=true ;;
+    collector) collector=true ;;
+    focused) focused=true ;;
+  esac
+  toolchain=true
 }
 
 select_job_if_affected() {
   local job=$1
   shift
-  local package
+  local package selected=false
   for package in "$@"; do
     if is_affected "$package"; then
       mark_checked_direct_package "$package"
-      select_job "$job"
-      return
+      selected=true
     fi
   done
+  [[ $selected == true ]] && select_job "$job"
+  return 0
 }
 
 select_if_affected loop alpha-domain alpha-store alpha-engine alpha-onnx-evaluator \

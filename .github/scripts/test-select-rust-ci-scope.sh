@@ -154,6 +154,13 @@ known_and_future=$(run_case known-and-future pull_request known-and-future.txt)
 assert_jobs "$known_and_future" 'ci/rust,ci/polymarket-evidence-compiler-image'
 assert_owning_packages "$known_and_future" 'future-rust-tool'
 
+printf '%s\n' rust_hft/apps/live/src/lib.rs rust_hft/apps/paper/src/main.rs \
+  >"$tmp_dir/same-suite.txt"
+same_suite=$(run_case same-suite pull_request same-suite.txt)
+assert_jobs "$same_suite" 'ci/rust,ci/deployment-artifacts'
+assert_owning_packages "$same_suite" ''
+assert_flag "$same_suite" focused true
+
 all_security_jobs='security/sast-semgrep,security/cargo-audit,security/secret-presence,security/license-check,security/clippy-strict,security/cargo-machete,security/secret-detection'
 assert_security_jobs "$tmp_dir/docs.out" 'security/secret-detection'
 assert_security_jobs "$tmp_dir/security-workflow.out" "$all_security_jobs"
