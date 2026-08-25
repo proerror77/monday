@@ -31,6 +31,7 @@ toolchain=false
 jobs=
 security_jobs=
 research_image_relevant=false
+owning_packages=
 
 select_job() {
   local job=$1
@@ -161,9 +162,11 @@ emit() {
   done
   [[ $jobs =~ ^((ci|ploy)/[a-z0-9/-]+(,(ci|ploy)/[a-z0-9/-]+)*)?$ ]] || { printf 'invalid job selector output: %s\n' "$jobs" >&2; exit 1; }
   [[ $security_jobs =~ ^(security/[a-z0-9/-]+(,security/[a-z0-9/-]+)*)?$ ]] || { printf 'invalid security job selector output: %s\n' "$security_jobs" >&2; exit 1; }
+  [[ $owning_packages =~ ^([A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*)?$ ]] || { printf 'invalid owning package selector output: %s\n' "$owning_packages" >&2; exit 1; }
   printf '%s\n' \
     "jobs=,$jobs," \
     "security_jobs=,$security_jobs," \
+    "owning_packages=,$owning_packages," \
     "loop=$loop" \
     "handoff=$handoff" \
     "json=$json" \
@@ -366,8 +369,17 @@ while IFS=$'\t' read -r name manifest dependencies; do
 done < <(jq -r '.packages[] | [.name, .manifest_path, ([.dependencies[] | select(.path != null) | .name] | join(","))] | @tsv' "$metadata")
 
 affected=$'\n'
+direct_root_packages=$'\n'
+checked_direct_packages=$'\n'
 is_affected() { [[ $affected == *$'\n'"$1"$'\n'* ]]; }
 mark_affected() { is_affected "$1" || affected+="$1"$'\n'; }
+is_direct_root_package() { [[ $direct_root_packages == *$'\n'"$1"$'\n'* ]]; }
+mark_direct_root_package() { is_direct_root_package "$1" || direct_root_packages+="$1"$'\n'; }
+is_checked_direct_package() { [[ $checked_direct_packages == *$'\n'"$1"$'\n'* ]]; }
+mark_checked_direct_package() {
+  is_direct_root_package "$1" || return 0
+  is_checked_direct_package "$1" || checked_direct_packages+="$1"$'\n'
+}
 
 for path in "${paths[@]}"; do
   [[ $path == rust_hft/* ]] || continue
@@ -380,12 +392,14 @@ for path in "${paths[@]}"; do
       ;;
   esac
   owner=
+  owner_directory=
   owner_length=0
   for ((index = 0; index < ${#package_names[@]}; index++)); do
     name=${package_names[$index]}
     directory=${package_dirs[$index]}
     if [[ $path == "$directory"/* && ${#directory} -gt $owner_length ]]; then
       owner=$name
+      owner_directory=$directory
       owner_length=${#directory}
     fi
   done
@@ -402,6 +416,7 @@ for path in "${paths[@]}"; do
     fi
     continue
   fi
+  [[ $owner_directory == rust_hft/prediction-markets* ]] || mark_direct_root_package "$owner"
   mark_affected "$owner"
 done
 
@@ -428,33 +443,37 @@ done
 select_if_affected() {
   local flag=$1
   shift
-  local package
+  local package selected=false
   for package in "$@"; do
     if is_affected "$package"; then
-      case "$flag" in
-        loop) loop=true ;;
-        handoff) handoff=true ;;
-        json) json=true ;;
-        ondo) ondo=true ;;
-        collector) collector=true ;;
-        focused) focused=true ;;
-      esac
-      toolchain=true
-      return
+      mark_checked_direct_package "$package"
+      selected=true
     fi
   done
+  [[ $selected == true ]] || return 0
+  case "$flag" in
+    loop) loop=true ;;
+    handoff) handoff=true ;;
+    json) json=true ;;
+    ondo) ondo=true ;;
+    collector) collector=true ;;
+    focused) focused=true ;;
+  esac
+  toolchain=true
 }
 
 select_job_if_affected() {
   local job=$1
   shift
-  local package
+  local package selected=false
   for package in "$@"; do
     if is_affected "$package"; then
-      select_job "$job"
-      return
+      mark_checked_direct_package "$package"
+      selected=true
     fi
   done
+  [[ $selected == true ]] && select_job "$job"
+  return 0
 }
 
 select_if_affected loop alpha-domain alpha-store alpha-engine alpha-onnx-evaluator \
@@ -505,5 +524,16 @@ if [[ $event == pull_request ]] && is_affected hft-backtest; then
   select_job ploy/research-image-binaries
 fi
 select_main_research_image_jobs
+
+while IFS= read -r package; do
+  [[ -n $package ]] || continue
+  if ! is_checked_direct_package "$package"; then
+    [[ ,$owning_packages, == *,$package,* ]] || owning_packages=${owning_packages:+$owning_packages,}$package
+  fi
+done <<<"$direct_root_packages"
+if [[ -n $owning_packages ]]; then
+  toolchain=true
+  select_job ci/rust
+fi
 
 emit

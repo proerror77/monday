@@ -24,6 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       jobs: ${{ steps.scope.outputs.jobs }}
+      owning_packages: ${{ steps.scope.outputs.owning_packages }}
       loop: ${{ steps.scope.outputs.loop }}
       handoff: ${{ steps.scope.outputs.handoff }}
       json: ${{ steps.scope.outputs.json }}
@@ -58,6 +59,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       jobs: ${{ steps.scope.outputs.jobs }}
+      owning_packages: ${{ steps.scope.outputs.owning_packages }}
       loop: ${{ steps.scope.outputs.loop }}
       handoff: ${{ steps.scope.outputs.handoff }}
       json: ${{ steps.scope.outputs.json }}
@@ -72,6 +74,7 @@ jobs:
         env:
           SELECTOR_RESULT: ${{ needs.selector.result }}
           SELECTED_JOBS: ${{ needs.selector.outputs.jobs }}
+          SELECTED_OWNING_PACKAGES: ${{ needs.selector.outputs.owning_packages }}
           SELECTED_LOOP: ${{ needs.selector.outputs.loop }}
           SELECTED_HANDOFF: ${{ needs.selector.outputs.handoff }}
           SELECTED_JSON: ${{ needs.selector.outputs.json }}
@@ -84,9 +87,11 @@ jobs:
         run: |
           if [[ "$SELECTOR_RESULT" == success && "$SELECTED_COMPLETE" == true ]] &&
              [[ "$SELECTED_JOBS" =~ ^,[a-z0-9/-]*(,[a-z0-9/-]+)*,$ ]] &&
+             [[ "$SELECTED_OWNING_PACKAGES" =~ ^,[A-Za-z0-9_-]*(,[A-Za-z0-9_-]+)*,$ ]] &&
              [[ "$SELECTED_LOOP,$SELECTED_HANDOFF,$SELECTED_JSON,$SELECTED_ONDO,$SELECTED_COLLECTOR,$SELECTED_CONTROL,$SELECTED_FOCUSED,$SELECTED_TOOLCHAIN" =~ ^(true|false)(,(true|false)){7}$ ]]; then
             printf '%s\n' \
               "jobs=$SELECTED_JOBS" \
+              "owning_packages=$SELECTED_OWNING_PACKAGES" \
               "loop=$SELECTED_LOOP" \
               "handoff=$SELECTED_HANDOFF" \
               "json=$SELECTED_JSON" \
@@ -98,6 +103,7 @@ jobs:
           else
             printf '%s\n' \
               'jobs=,ci/rust,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,' \
+              'owning_packages=,,' \
               'loop=true' \
               'handoff=true' \
               'json=true' \
@@ -107,6 +113,14 @@ jobs:
               'focused=true' \
               'toolchain=true'
           fi >> "$GITHUB_OUTPUT"
+
+      - name: Summarize check plan
+        env:
+          SELECTED_JOBS: ${{ steps.scope.outputs.jobs }}
+          SELECTED_OWNING_PACKAGES: ${{ steps.scope.outputs.owning_packages }}
+        run: |
+          printf '### CI check plan\n\n- Jobs: %s\n- Direct Rust package tests: %s\n' \
+            "$SELECTED_JOBS" "$SELECTED_OWNING_PACKAGES" >> "$GITHUB_STEP_SUMMARY"
 
   rust:
     name: Rust Workspace
@@ -173,6 +187,20 @@ jobs:
       - name: Test Loop Engineer packages
         if: needs.scope.outputs.loop == 'true'
         run: cargo test -p alpha-domain -p alpha-store -p alpha-engine -p alpha-onnx-evaluator -p alpha-harness -p hft-harnessctl -p hft-research-ml --locked
+
+      - name: Test directly changed Rust packages
+        if: needs.scope.outputs.owning_packages != ',,'
+        env:
+          OWNING_PACKAGES: ${{ needs.scope.outputs.owning_packages }}
+        run: |
+          package_list=${OWNING_PACKAGES#,}
+          package_list=${package_list%,}
+          IFS=',' read -ra packages <<<"$package_list"
+          args=()
+          for package in "${packages[@]}"; do
+            args+=(-p "$package")
+          done
+          cargo test "${args[@]}" --locked
 
       - name: Verify signed runtime handoff
         if: needs.scope.outputs.handoff == 'true'
