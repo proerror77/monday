@@ -6963,9 +6963,9 @@ awk '
     deadline_line = NR
   }
   in_observation && /^done$/ {
-    exit !(elapsed_samples == 2
-      && resample_line < completion_line
-      && completion_line < deadline_line)
+    exit !(elapsed_samples == 2 &&
+      resample_line < completion_line &&
+      completion_line < deadline_line)
   }
 ' "$GATE" || {
   printf 'Gate observation loop does not re-sample elapsed time before completion and sleep decisions\n' >&2
