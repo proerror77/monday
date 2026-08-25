@@ -119,7 +119,7 @@ jobs:
           SELECTED_JOBS: ${{ steps.scope.outputs.jobs }}
           SELECTED_OWNING_PACKAGES: ${{ steps.scope.outputs.owning_packages }}
         run: |
-          printf '### CI check plan\n\n- Jobs: `%s`\n- Direct Rust package tests: `%s`\n' \
+          printf '### CI check plan\n\n- Jobs: %s\n- Direct Rust package tests: %s\n' \
             "$SELECTED_JOBS" "$SELECTED_OWNING_PACKAGES" >> "$GITHUB_STEP_SUMMARY"
 
   rust:
