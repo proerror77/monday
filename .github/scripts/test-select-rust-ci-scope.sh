@@ -55,6 +55,21 @@ assert_jobs() {
   }
 }
 
+assert_owning_packages() {
+  local output=$1 expected=$2 actual
+  actual=$(sed -n 's/^owning_packages=//p' "$output")
+  [[ $actual == ,*, ]] || {
+    printf '%s: owning_packages output must use exact comma-delimited membership: %s\n' "$output" "$actual" >&2
+    exit 1
+  }
+  actual=${actual#,}
+  actual=${actual%,}
+  [[ $actual == "$expected" ]] || {
+    printf '%s: expected owning_packages=%s, got owning_packages=%s\n' "$output" "$expected" "$actual" >&2
+    exit 1
+  }
+}
+
 assert_security_jobs() {
   local output=$1 expected=$2 actual
   actual=$(sed -n 's/^security_jobs=//p' "$output")
@@ -107,8 +122,37 @@ for job_case in "${job_cases[@]}"; do
   IFS='|' read -r name event fixture expected <<<"$job_case"
   output=$(run_case "$name" "$event" "$fixture")
   assert_jobs "$output" "$expected"
+  assert_owning_packages "$output" ''
   assert_flag "$output" selection_complete true
 done
+
+owning_package_cases=(
+  'hft-data-adapter-replay|rust_hft/data-pipelines/adapters/adapter-replay/src/lib.rs'
+  'hft-testing|rust_hft/infra-services/testing/src/lib.rs'
+  'hft-binance-md|rust_hft/apps/binance-md/src/main.rs'
+  'hft-replay|rust_hft/apps/replay/src/main.rs'
+  'hft-dataset|rust_hft/tools/dataset/src/main.rs'
+  'hyperliquid-demo|rust_hft/tools/hyperliquid-demo/src/main.rs'
+  'ws-connection-test|rust_hft/tools/ws_test/src/main.rs'
+  'listing-monitor|rust_hft/tools/listing-monitor/src/main.rs'
+  'future-rust-tool|rust_hft/tools/future-rust-tool/src/lib.rs'
+)
+for owning_case in "${owning_package_cases[@]}"; do
+  IFS='|' read -r package path <<<"$owning_case"
+  fixture="owning-$package.txt"
+  printf '%s\n' "$path" >"$tmp_dir/$fixture"
+  output=$(run_case "owning-$package" pull_request "$fixture")
+  assert_jobs "$output" 'ci/rust'
+  assert_owning_packages "$output" "$package"
+  assert_flag "$output" toolchain true
+done
+
+printf '%s\n' \
+  rust_hft/tools/collector/src/polymarket/reference.rs \
+  rust_hft/tools/future-rust-tool/src/lib.rs >"$tmp_dir/known-and-future.txt"
+known_and_future=$(run_case known-and-future pull_request known-and-future.txt)
+assert_jobs "$known_and_future" 'ci/rust,ci/polymarket-evidence-compiler-image'
+assert_owning_packages "$known_and_future" 'future-rust-tool'
 
 all_security_jobs='security/sast-semgrep,security/cargo-audit,security/secret-presence,security/license-check,security/clippy-strict,security/cargo-machete,security/secret-detection'
 assert_security_jobs "$tmp_dir/docs.out" 'security/secret-detection'
@@ -170,6 +214,8 @@ grep -Fqx "          if [[ \"\$SELECTOR_RESULT\" == success && \"\$SELECTED_COMP
 grep -Fqx "             [[ \"\$SELECTED_JOBS\" =~ ^,[a-z0-9/-]*(,[a-z0-9/-]+)*,\$ ]] &&" "$ci_workflow"
 grep -Fq "'jobs=,ci/rust,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,'" "$ci_workflow"
 grep -Fq "contains(needs.scope.outputs.jobs, ',ci/rust,')" "$ci_workflow"
+[[ $(grep -Fxc '      owning_packages: ${{ steps.scope.outputs.owning_packages }}' "$ci_workflow") -eq 2 ]]
+grep -Fqx '      - name: Summarize check plan' "$ci_workflow"
 grep -Fqx '      CARGO_PROFILE_DEV_DEBUG: "0"' "$ci_workflow"
 grep -Fqx '      CARGO_PROFILE_TEST_DEBUG: "0"' "$ci_workflow"
 grep -Fqx '  rust_fast_gates:' "$ci_workflow"
@@ -216,6 +262,8 @@ grep -Fq 'test-rust-lob-recovery-queue.sh' <<<"$fast_gates_block"
 grep -Fq 'shellcheck' <<<"$fast_gates_block"
 grep -Fq 'cargo fmt --check' <<<"$fast_gates_block"
 grep -Fq 'test-polymarket-raw-ops-control-plane.sh' <<<"$rust_job_block"
+grep -Fqx '      - name: Test directly changed Rust packages' "$ci_workflow"
+grep -Fq 'cargo test "${args[@]}" --locked' <<<"$rust_job_block"
 
 # The market-recorder release contract runs as its own parallel job (#568).
 ci_gate_block=$(job_block ci-gate)
