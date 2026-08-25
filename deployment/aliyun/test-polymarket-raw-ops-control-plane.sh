@@ -961,7 +961,7 @@ supervisor_env_file="$supervisor_root/run/monday/polymarket-raw-ops-gates/$super
 supervisor_request_file="$supervisor_root/run/monday/polymarket-raw-ops-gates/$supervisor_candidate_sha.request.json"
 supervisor_starts_before_segment_admission=$(grep -Fxc "start $supervisor_unit" \
   "$supervisor_calls" || true)
-if env "${gate_control_env[@]}" FAKE_REAL_MARKET_READY_EXIT=1 \
+if env "${gate_control_env[@]}" INVOCATION_ID= FAKE_REAL_MARKET_READY_EXIT=1 \
   "$supervisor_control" start "$supervisor_candidate" \
   "$supervisor_candidate_sha" "$supervisor_source" >/dev/null 2>&1; then
   printf 'Gate start without a ready market segment unexpectedly passed\n' >&2
