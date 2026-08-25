@@ -285,7 +285,11 @@ ploy_workflow="$script_dir/../workflows/ploy-ci.yml"
 grep -Fqx "  group: prediction-markets-\${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}" "$ploy_workflow"
 grep -Fqx "  cancel-in-progress: \${{ github.ref != 'refs/heads/main' }}" "$ploy_workflow"
 [[ $(grep -Fxc '    branches: [main, develop]' "$ploy_workflow") -eq 2 ]]
-grep -Fqx '      - "deployment/aliyun/**"' "$ploy_workflow"
+if sed -n '/^  push:$/,/^  workflow_dispatch:$/p' "$ploy_workflow" \
+  | grep -Eq '^    paths(-ignore)?:'; then
+  echo 'Prediction Markets CI can skip a main SHA by path' >&2
+  exit 1
+fi
 grep -Fqx '    needs: image-smoke-selector' "$ploy_workflow"
 grep -Fqx "$always_condition" "$ploy_workflow"
 grep -Fqx '        working-directory: .' "$ploy_workflow"

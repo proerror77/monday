@@ -19,11 +19,13 @@ mode_restore_block=$(sed -n \
   '/^      - name: Restore research runner binary modes$/,/^      - name: Verify research runner binary artifact$/p' \
   "$workflow")
 source_command_block=$(sed -n \
-  '/^          \.github\/scripts\/select-acr-publish-source\.sh \\/,/^            --current-run-id /p' \
+  '/^          \.github\/scripts\/select-acr-publish-source\.sh \\/,/^            --security-conclusion /p' \
   "$workflow")
 acr_publish_block=$(sed -n \
   '/^      - name: Build and push$/,/^      - name: Record immutable image$/p' \
   "$workflow")
+ci_push_block=$(sed -n '/^  push:$/,/^  pull_request:$/p' "$ci_workflow")
+ploy_push_block=$(sed -n '/^  push:$/,/^  workflow_dispatch:$/p' "$ploy_workflow")
 
 grep -Fqx '            [{repository:"research-runner",file:"rust_hft/deployment/docker/Dockerfile.research",target:"prebuilt"},' "$workflow"
 grep -Fqx '  workflow_run:' "$workflow"
@@ -33,15 +35,41 @@ grep -Fqx "        description: Image target to publish (polymarket-raw-ops uses
 grep -Fqx '          - polymarket-raw-ops' "$workflow"
 grep -Fqx '          - research-source-test' "$workflow"
 grep -Fqx '  actions: read' "$workflow"
+grep -Fqx '  checks: read' "$workflow"
 grep -Fqx 'concurrency:' "$workflow"
 grep -Fqx '  group: acr-publish-${{ github.ref }}' "$workflow"
 grep -Fqx '  cancel-in-progress: false' "$workflow"
+if grep -Eq '^    paths(-ignore)?:' <<<"$ci_push_block$ploy_push_block"; then
+  printf 'required CI workflow can skip a main SHA by path\n' >&2
+  exit 1
+fi
 grep -Fqx '      rebuild_research_runner:' "$workflow"
 grep -Fqx '      source_test_source_sha:' "$workflow"
 grep -Fqx '          jobs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID/jobs" \' "$workflow"
 grep -Fqx '          BINARIES_CONCLUSION: ${{ steps.source-jobs.outputs.binaries_conclusion }}' "$workflow"
 grep -Fqx '          SMOKE_CONCLUSION: ${{ steps.source-jobs.outputs.smoke_conclusion }}' "$workflow"
+grep -Fqx '      - name: Read authenticated release admission' "$workflow"
+grep -Fqx '            main_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '\''.object.sha'\'')' "$workflow"
+grep -Fqx '            gh api --paginate --slurp \' "$workflow"
+grep -Fqx '              "repos/$GITHUB_REPOSITORY/commits/$admission_sha/check-runs?filter=latest&per_page=100" > "$checks_json"' "$workflow"
+grep -Fqx '            .github/scripts/read-acr-required-checks.sh "$checks_json" "$evidence"' "$workflow"
+grep -Fqx '          deadline=$((SECONDS + 900))' "$workflow"
 grep -Fqx '          .github/scripts/select-acr-publish-source.sh \' "$workflow"
+grep -Fqx '          CURRENT_REF: ${{ github.ref }}' "$workflow"
+grep -Fqx '          MAIN_SHA: ${{ steps.admission.outputs.main_sha }}' "$workflow"
+grep -Fqx '          MONOREPO_CONCLUSION: ${{ steps.admission.outputs.monorepo_conclusion }}' "$workflow"
+grep -Fqx '          PREDICTION_CONCLUSION: ${{ steps.admission.outputs.prediction_conclusion }}' "$workflow"
+grep -Fqx '          SECURITY_CONCLUSION: ${{ steps.admission.outputs.security_conclusion }}' "$workflow"
+grep -Fqx '            --current-ref "$CURRENT_REF" \' "$workflow"
+grep -Fqx '            --main-sha "$MAIN_SHA" \' "$workflow"
+grep -Fqx '            --monorepo-conclusion "$MONOREPO_CONCLUSION" \' "$workflow"
+grep -Fqx '            --prediction-conclusion "$PREDICTION_CONCLUSION" \' "$workflow"
+grep -Fqx '            --security-conclusion "$SECURITY_CONCLUSION"' "$workflow"
+grep -Fqx '      - name: Revalidate current main before publication' "$workflow"
+grep -Fqx '          current_main=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '\''.object.sha'\'')' "$workflow"
+grep -Fqx '          test "$SOURCE_REVISION" = "$current_main"' "$workflow"
+test "$(grep -n '^      - name: Revalidate current main before publication$' "$workflow" | cut -d: -f1)" \
+  -lt "$(grep -n '^      - name: Build and push$' "$workflow" | cut -d: -f1)"
 if grep -Fq '${{' <<<"$source_command_block"; then
   printf 'source selector interpolates workflow context directly into shell\n' >&2
   exit 1

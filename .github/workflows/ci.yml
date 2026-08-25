@@ -4,8 +4,6 @@ on:
   workflow_dispatch:
   push:
     branches: [main, develop]
-    paths-ignore:
-      - "rust_hft/prediction-markets/**"
   pull_request:
     branches: [main, develop]
 
