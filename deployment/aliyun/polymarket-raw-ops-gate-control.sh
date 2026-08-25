@@ -60,6 +60,8 @@ RECEIPT_ROOT=$(prefix_path /data/monday/evidence/polymarket-gate-jobs)
 readonly RECEIPT_ROOT
 GATE_EVIDENCE_ROOT=$(prefix_path /data/monday/evidence/polymarket-shadow-gates)
 readonly GATE_EVIDENCE_ROOT
+MARKET_SPOOL=$(prefix_path /data/monday/spool/polymarket)
+readonly MARKET_SPOOL
 INSTALLED_UNIT=$(prefix_path "/etc/systemd/system/$UNIT_TEMPLATE")
 readonly INSTALLED_UNIT
 SYSTEMD_UNIT_DIR=$(prefix_path /etc/systemd/system)
@@ -926,6 +928,8 @@ start_gate() {
     || die 'cannot read Gate state before start'
   [[ $active_state == inactive || $active_state == failed ]] \
     || die 'a Gate job already owns this candidate'
+  "$GATE" --real-market-segment-ready "$MARKET_SPOOL" >/dev/null \
+    || die 'no eligible closed market segment is ready; retry after the next rotation'
   write_runtime_request "$candidate_path" "$candidate_sha" "$source_revision" "$recovery"
   env_file="$RUN_ROOT/$candidate_sha.env"
   [[ ! -L $env_file ]] || die 'Gate EnvironmentFile is a symlink'
