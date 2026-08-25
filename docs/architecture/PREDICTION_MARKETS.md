@@ -280,9 +280,11 @@ The complete path and SHA-256 record is in
 - The standalone README is preserved under
   `rust_hft/prediction-markets/docs/archive/standalone-source-2026-07-13`; the active README
   documents Monday-only development and execution boundaries.
-- The write-capable standalone `ploy-openclaw` package was relocated byte-for-byte
-  into that archive. The only active OpenClaw example is read-only and rejects
-  unlisted RPC methods and remote-control mutations before SSH.
+- The write-capable standalone `ploy-openclaw` bytes were preserved in that
+  archive; its upstream instruction file was renamed to `AGENTS.upstream.md` and
+  replaced at the active name by an archive-only safety guard. The only active
+  OpenClaw example is read-only and rejects unlisted RPC methods and remote-control
+  mutations before SSH.
 
 The imported nested `.github` workflow tree was retired during the Rust-only
 cutover. The former `deployment` and `infra` trees now live under
