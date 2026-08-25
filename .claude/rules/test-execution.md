@@ -1,60 +1,16 @@
-# Test Execution Rule
+# Test Execution
 
-Standard patterns for running tests across all testing commands.
-
-## Core Principles
-
-1. **Always use test-runner agent** from `.claude/agents/test-runner.md`
-2. **No mocking** - use real services for accurate results
-3. **Verbose output** - capture everything for debugging
-4. **Check test structure first** - before assuming code bugs
-
-## Execution Pattern
-
-```markdown
-Execute tests for: {target}
-
-Requirements:
-- Run with verbose output
-- No mock services
-- Capture full stack traces
-- Analyze test structure if failures occur
-```
-
-## Output Focus
-
-### Success
-Keep it simple:
-```
-✅ All tests passed ({count} tests in {time}s)
-```
-
-### Failure
-Focus on what failed:
-```
-❌ Test failures: {count}
-
-{test_name} - {file}:{line}
-  Error: {message}
-  Fix: {suggestion}
-```
-
-## Common Issues
-
-- Test not found → Check file path
-- Timeout → Kill process, report incomplete
-- Framework missing → Install dependencies
-
-## Cleanup
-
-Always clean up after tests:
-```bash
-pkill -f "jest|mocha" 2>/dev/null || true
-```
-
-## Important Notes
-
-- Don't parallelize tests (avoid conflicts)
-- Let each test complete fully
-- Report failures with actionable fixes
-- Focus output on failures, not successes
+- Run the smallest test that can disprove the change. Expand to the owning crate
+  or workflow only when its risk or blast radius warrants it; do not default to
+  a full repository test.
+- Reuse the existing build cache. Never run `cargo clean` as routine test
+  preparation; use a fresh temporary target directory only for proven cache
+  corruption or an explicit clean-room check.
+- Use mocks for deterministic unit boundaries and real services only when the
+  contract being tested actually crosses that trust boundary.
+- Parallelize independent tests only when they do not share mutable services,
+  ports, databases, or output paths.
+- Capture concise output on success and the complete failing command, error, and
+  relevant stack trace on failure.
+- Stop only the exact process started by the current task. Never use a broad
+  process-name kill as generic cleanup.

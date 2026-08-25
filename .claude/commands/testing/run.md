@@ -1,108 +1,35 @@
 ---
-allowed-tools: Bash, Read, Write, LS, Task
+allowed-tools: Bash, Read, LS, Task
 ---
 
 # Run Tests
 
-Execute tests with the configured test-runner agent.
+Run the smallest validation that can disprove the requested change.
 
 ## Usage
-```
-/testing:run [test_target]
-```
 
-Where `test_target` can be:
-- Empty (run all tests)
-- Test file path
-- Test pattern
-- Test suite name
-
-## Quick Check
-
-```bash
-# Check if testing is configured
-test -f .claude/testing-config.md || echo "❌ Testing not configured. Run /testing:prime first"
+```text
+/testing:run [package, test target, file, or pattern]
 ```
 
-If test target provided, verify it exists:
-```bash
-# For file targets
-test -f "$ARGUMENTS" || echo "⚠️ Test file not found: $ARGUMENTS"
-```
+## Execution
 
-## Instructions
+1. Read the nearest manifest and repository instructions. Never invent a
+   package or test command.
+2. If a target is supplied, run only that target. Otherwise infer the owning
+   package from the current diff; do not default to the full repository suite.
+3. For Rust, use locked dependencies and the repository Cargo configuration so
+   the existing build cache remains active. Never run `cargo clean` first.
+4. Use mocks for deterministic unit boundaries. Require real services only when
+   the behavior under test actually crosses that boundary.
+5. Run an owning-package check only after the focused check passes and only when
+   it can still disprove the change. Delegate to the test-runner agent only when
+   separate failure analysis will materially help.
 
-### 1. Determine Test Command
+## Result
 
-Based on testing-config.md and target:
-- No arguments → Run full test suite from config
-- File path → Run specific test file
-- Pattern → Run tests matching pattern
+Report the exact command, duration, pass/fail result, first causal failure, and
+any boundary not verified. On success, keep the output to one concise summary.
 
-### 2. Execute Tests
-
-Use the test-runner agent from `.claude/agents/test-runner.md`:
-
-```markdown
-Execute tests for: $ARGUMENTS (or "all" if empty)
-
-Requirements:
-- Run with verbose output for debugging
-- No mocks - use real services
-- Capture full output including stack traces
-- If test fails, check test structure before assuming code issue
-```
-
-### 3. Monitor Execution
-
-- Show test progress
-- Capture stdout and stderr
-- Note execution time
-
-### 4. Report Results
-
-**Success:**
-```
-✅ All tests passed ({count} tests in {time}s)
-```
-
-**Failure:**
-```
-❌ Test failures: {failed_count} of {total_count}
-
-{test_name} - {file}:{line}
-  Error: {error_message}
-  Likely: {test issue | code issue}
-  Fix: {suggestion}
-
-Run with more detail: /testing:run {specific_test}
-```
-
-**Mixed:**
-```
-Tests complete: {passed} passed, {failed} failed, {skipped} skipped
-
-Failed:
-- {test_1}: {brief_reason}
-- {test_2}: {brief_reason}
-```
-
-### 5. Cleanup
-
-```bash
-# Kill any hanging test processes
-pkill -f "jest|mocha" 2>/dev/null || true
-```
-
-## Error Handling
-
-- Test command fails → "❌ Test execution failed: {error}. Check test framework is installed."
-- Timeout → Kill process and report: "❌ Tests timed out after {time}s"
-- No tests found → "❌ No tests found matching: $ARGUMENTS"
-
-## Important Notes
-
-- Always use test-runner agent for analysis
-- No mocking - real services only
-- Check test structure if failures occur
-- Keep output focused on failures
+Stop only processes started by this invocation, using captured process IDs or
+the test tool's own cleanup. Never use a broad process-name kill.

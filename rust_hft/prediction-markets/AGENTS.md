@@ -16,7 +16,7 @@ product or execution authority.
 - Run Rust commands from `rust_hft/prediction-markets`; the nested Cargo workspace is a transitional build seam pinned by `rust-toolchain.toml`.
 - Run frontend commands with `npm --prefix ploy-frontend`; run sidecar checks with `cargo test -p ploy-agent-sidecar`.
 - Do not create new `ploy-*` crates, a `products/ploy` tree, or another venue execution path. Put new capabilities in the canonical Monday module named in `docs/architecture/PREDICTION_MARKETS.md`.
-- Use `tasks/todo.md` for non-trivial work and keep changes atomic.
+- Use current GitHub issue and PR metadata for durable non-trivial work; `tasks/todo.md` is a historical migration checklist, not an authority.
 - Use `apply_patch` for manual edits, preserve unrelated changes, and verify with focused checks before the full PLOY CI lane.
 - Do not run a local PostgreSQL instance. Database-backed validation belongs in GitHub Actions.
 
