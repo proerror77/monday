@@ -521,7 +521,6 @@ if is_affected hft-collector || is_affected alpha-harness || is_affected hft-bac
   research_image_relevant=true
 fi
 if [[ $event == pull_request ]] && is_affected hft-backtest; then
-  mark_checked_direct_package hft-backtest
   select_job ploy/research-image-binaries
 fi
 select_main_research_image_jobs

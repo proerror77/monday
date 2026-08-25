@@ -111,7 +111,7 @@ job_cases=(
   'unknown-prediction|pull_request|unknown-prediction.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
   'mixed-prediction|pull_request|mixed-prediction.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans,ploy/rust-format,ploy/rust-research-heavy'
   'frontend|pull_request|frontend.txt|ploy/commit-hygiene,ploy/safety-scans,ploy/frontend'
-  'backtest|pull_request|backtest.txt|ploy/research-image-binaries'
+  'backtest|pull_request|backtest.txt|ploy/research-image-binaries,ci/rust|hft-backtest'
   'live-push|push|live.txt|ci/rust,ci/deployment-artifacts'
   'trading-dockerfile-push|push|trading-dockerfile.txt|ci/deployment-artifacts'
   'research-deployment-push|push|research-deployment.txt|ci/deployment-artifacts,ploy/research-image-binaries,ploy/research-image-smoke'
@@ -119,10 +119,10 @@ job_cases=(
   'full|push|collector.txt|ci/rust,ci/polymarket-evidence-compiler-image,ploy/research-image-binaries,ploy/research-image-smoke'
 )
 for job_case in "${job_cases[@]}"; do
-  IFS='|' read -r name event fixture expected <<<"$job_case"
+  IFS='|' read -r name event fixture expected expected_owning <<<"$job_case"
   output=$(run_case "$name" "$event" "$fixture")
   assert_jobs "$output" "$expected"
-  assert_owning_packages "$output" ''
+  assert_owning_packages "$output" "${expected_owning:-}"
   assert_flag "$output" selection_complete true
 done
 
