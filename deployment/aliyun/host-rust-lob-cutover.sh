@@ -30,13 +30,15 @@ CANDIDATE_BINARY="$CANDIDATE_RELEASE/binance-lob-archiver"
 CANDIDATE_DEPLOYMENT="$CANDIDATE_RELEASE/deployment"
 GATE_POLICY="$CANDIDATE_DEPLOYMENT/rust-lob-shadow-gate-policy.jq"
 RUNTIME_HEALTH_POLICY="$CANDIDATE_DEPLOYMENT/rust-lob-runtime-health-policy.jq"
+CONTROL_PLANE_LIB="$CANDIDATE_DEPLOYMENT/rust-lob-control-plane-lib.sh"
 GATE_ROOT=/data/monday/evidence/shadow-gates
-GATE_BUNDLE_DIR=
+GATE_RUNTIME_DIR=
 GATE_DIR=
 GATE_JSON=
 GATE_MARKER=
 DEPLOYMENT_BUNDLE_SHA256=
 DEPLOYMENT_SOURCE_REVISION=
+RUNTIME_CONTRACT_SHA256=
 PRODUCTION_LINK=/opt/monday/bin/binance-lob-archiver
 SHADOW_LINK=/opt/monday/bin/binance-lob-archiver-shadow
 INSTALLED_HEALTH_SCRIPT=/opt/monday/bin/monday-collector-health.sh
@@ -845,8 +847,8 @@ restore_previous_recovery_scheduler() {
   systemctl stop "${RECOVERY_UNITS[@]}" >/dev/null || return 1
   systemctl unmask --runtime "${RECOVERY_UNITS[@]}" "${RECOVERY_TIMERS[@]}" \
     >/dev/null || return 1
-  systemctl reset-failed "${RECOVERY_UNITS[@]}" "${RECOVERY_TIMERS[@]}" \
-    >/dev/null || return 1
+  reset_failed_recovery_units "${RECOVERY_UNITS[@]}" "${RECOVERY_TIMERS[@]}" \
+    || return 1
   for index in 0 1; do
     unit=${RECOVERY_UNITS[$index]}
     if (( index == 0 )); then
@@ -907,16 +909,25 @@ restore_previous_recovery_scheduler() {
   return 0
 }
 
+reset_failed_recovery_units() {
+  local unit
+  for unit in "$@"; do
+    if systemctl is-failed --quiet "$unit"; then
+      systemctl reset-failed "$unit" >/dev/null || return 1
+    fi
+  done
+}
+
 enable_candidate_recovery_scheduler() {
   local unit state
   systemctl unmask --runtime "${RECOVERY_UNITS[@]}" >/dev/null || return 1
-  systemctl reset-failed "${RECOVERY_UNITS[@]}" >/dev/null || return 1
+  reset_failed_recovery_units "${RECOVERY_UNITS[@]}" || return 1
   for unit in "${RECOVERY_UNITS[@]}"; do
     state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
     [[ $state != masked && $state != masked-runtime ]] || return 1
   done
   systemctl unmask --runtime "${RECOVERY_TIMERS[@]}" >/dev/null || return 1
-  systemctl reset-failed "${RECOVERY_TIMERS[@]}" >/dev/null || return 1
+  reset_failed_recovery_units "${RECOVERY_TIMERS[@]}" || return 1
   systemctl enable --now "${RECOVERY_TIMERS[@]}" >/dev/null || return 1
   for unit in "${RECOVERY_TIMERS[@]}"; do
     systemctl is-enabled --quiet "$unit" >/dev/null 2>&1 || return 1
@@ -1210,6 +1221,7 @@ write_evidence() {
     --arg previous_health_rollback_source "$OLD_HEALTH_ROLLBACK_SOURCE" \
     --argjson previous_health_script_present "$previous_health_script_present" \
     --arg candidate_sha256 "$CANDIDATE_SHA256" \
+    --arg runtime_contract_sha256 "$RUNTIME_CONTRACT_SHA256" \
     --arg deployment_source_revision "$DEPLOYMENT_SOURCE_REVISION" \
     --arg deployment_bundle_sha256 "$DEPLOYMENT_BUNDLE_SHA256" \
     --arg previous_sha256 "$OLD_SHA256" \
@@ -1245,6 +1257,8 @@ write_evidence() {
         snapshot: (if $previous_health_script_snapshot == "" then null else $previous_health_script_snapshot end)
       },
       candidate_sha256: $candidate_sha256,
+      runtime_contract_sha256:
+        (if $runtime_contract_sha256 == "" then null else $runtime_contract_sha256 end),
       deployment_source_revision:
         (if $deployment_source_revision == "" then null else $deployment_source_revision end),
       deployment_bundle_sha256: (if $deployment_bundle_sha256 == "" then null else $deployment_bundle_sha256 end),
@@ -1548,20 +1562,32 @@ printf '%s  %s\n' "$CANDIDATE_SHA256" "$CANDIDATE_BINARY" | sha256sum --check --
 secure_regular_file "$CANDIDATE_RELEASE/release.json"
 secure_regular_file "$GATE_POLICY"
 secure_regular_file "$RUNTIME_HEALTH_POLICY"
+secure_regular_file "$CONTROL_PLANE_LIB"
 DEPLOYMENT_BUNDLE_SHA256=$(jq -er '.deployment_bundle_sha256' \
   "$CANDIDATE_RELEASE/release.json")
 DEPLOYMENT_SOURCE_REVISION=$(jq -er '.deployment_source_revision' \
+  "$CANDIDATE_RELEASE/release.json")
+RUNTIME_CONTRACT_SHA256=$(jq -er '.runtime_contract_sha256' \
   "$CANDIDATE_RELEASE/release.json")
 [[ $DEPLOYMENT_BUNDLE_SHA256 =~ ^[a-f0-9]{64}$ ]] \
   || fail 'candidate release has an invalid deployment bundle SHA-256'
 [[ $DEPLOYMENT_SOURCE_REVISION =~ ^[a-f0-9]{40,64}$ ]] \
   || fail 'candidate release has an invalid deployment source revision'
+[[ $RUNTIME_CONTRACT_SHA256 =~ ^[a-f0-9]{64}$ ]] \
+  || fail 'candidate release has an invalid runtime contract SHA-256'
 jq -e --arg sha "$CANDIDATE_SHA256" --arg bundle "$DEPLOYMENT_BUNDLE_SHA256" \
-  '.artifact_sha256 == $sha and .deployment_bundle_sha256 == $bundle' \
+  --arg runtime_contract "$RUNTIME_CONTRACT_SHA256" \
+  '.artifact_sha256 == $sha and .deployment_bundle_sha256 == $bundle
+    and .runtime_contract_sha256 == $runtime_contract' \
   "$CANDIDATE_RELEASE/release.json" >/dev/null \
   || fail 'candidate release metadata does not match the requested identity'
-GATE_BUNDLE_DIR="$GATE_ROOT/$CANDIDATE_SHA256/$DEPLOYMENT_BUNDLE_SHA256"
 validate_deployment "$CANDIDATE_DEPLOYMENT" true
+# shellcheck disable=SC1090,SC1091
+. "$CONTROL_PLANE_LIB"
+[[ $(monday_rust_lob_runtime_contract_sha256 "$CANDIDATE_DEPLOYMENT") \
+  == "$RUNTIME_CONTRACT_SHA256" ]] \
+  || fail 'installed runtime contract does not match release metadata'
+GATE_RUNTIME_DIR="$GATE_ROOT/$CANDIDATE_SHA256/$RUNTIME_CONTRACT_SHA256"
 id hftcollector >/dev/null 2>&1 || fail 'service account hftcollector is missing'
 runuser -u hftcollector -- "$CANDIDATE_BINARY" --self-test
 "$CANDIDATE_BINARY" --help | grep -Fq -- '--upload-only'
@@ -1570,12 +1596,12 @@ runuser -u hftcollector -- "$CANDIDATE_BINARY" --self-test
   || fail 'shadow symlink does not point to the gated candidate binary'
 
 STEP=validate-shadow-gate
-for path in "$GATE_ROOT" "$GATE_ROOT/$CANDIDATE_SHA256" "$GATE_BUNDLE_DIR" \
-  "$GATE_BUNDLE_DIR/runs"; do
+for path in "$GATE_ROOT" "$GATE_ROOT/$CANDIDATE_SHA256" "$GATE_RUNTIME_DIR" \
+  "$GATE_RUNTIME_DIR/runs"; do
   path_is_direct_or_absent "$path" || fail "shadow gate path contains a symlink: $path"
 done
 shopt -s nullglob
-gate_markers=("$GATE_BUNDLE_DIR"/runs/*/PASSED.sha256)
+gate_markers=("$GATE_RUNTIME_DIR"/runs/*/PASSED.sha256)
 shopt -u nullglob
 (( ${#gate_markers[@]} == 1 )) \
   || fail "expected exactly one immutable passed shadow gate, found ${#gate_markers[@]}"
@@ -1593,8 +1619,7 @@ marker_entry=$(<"$GATE_MARKER")
 (cd "$GATE_DIR" && sha256sum --check --strict PASSED.sha256)
 jq -e \
   --arg candidate_sha256 "$CANDIDATE_SHA256" \
-  --arg deployment_bundle_sha256 "$DEPLOYMENT_BUNDLE_SHA256" \
-  --arg deployment_source_revision "$DEPLOYMENT_SOURCE_REVISION" \
+  --arg runtime_contract_sha256 "$RUNTIME_CONTRACT_SHA256" \
   -f "$GATE_POLICY" "$GATE_JSON" >/dev/null \
   || fail 'candidate shadow gate does not meet production thresholds'
 GATE_USDM_SYMBOLS=$(jq -er '.markets.usdm.symbols_config' "$GATE_JSON")

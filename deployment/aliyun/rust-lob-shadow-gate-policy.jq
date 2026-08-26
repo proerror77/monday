@@ -1,8 +1,11 @@
 . as $gate
-| .schema == "monday.rust_lob_shadow_gate.v3"
+| .schema == "monday.rust_lob_shadow_gate.v4"
 and .candidate_sha256 == $candidate_sha256
-and .deployment_bundle_sha256 == $deployment_bundle_sha256
-and .deployment_source_revision == $deployment_source_revision
+and .runtime_contract_sha256 == $runtime_contract_sha256
+and (.deployment_bundle_sha256 | type) == "string"
+and (.deployment_bundle_sha256 | test("^[a-f0-9]{64}$"))
+and (.deployment_source_revision | type) == "string"
+and (.deployment_source_revision | test("^[a-f0-9]{40,64}$"))
 and (.run_id | type) == "string"
 and (.run_id | test("^[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*$"))
 and .run_spool == ("/data/monday/spool/binance-lob-rust-shadow/runs/"

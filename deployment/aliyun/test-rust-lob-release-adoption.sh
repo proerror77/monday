@@ -135,13 +135,16 @@ setup_fixture() {
   chmod 0640 "$USDM_ENV"
   DEPLOYMENT_BUNDLE_SHA256=$(printf 'b%.0s' {1..64})
   DEPLOYMENT_SOURCE_REVISION=$(printf 'c%.0s' {1..40})
+  RUNTIME_CONTRACT_SHA256=$(printf 'd%.0s' {1..64})
   jq -n \
     --arg artifact "$CANDIDATE_SHA256" \
     --arg bundle "$DEPLOYMENT_BUNDLE_SHA256" \
     --arg source "$DEPLOYMENT_SOURCE_REVISION" \
-    '{artifact_sha256:$artifact,deployment_bundle_sha256:$bundle,
+    --arg runtime_contract "$RUNTIME_CONTRACT_SHA256" \
+    '{artifact_sha256:$artifact,runtime_contract_sha256:$runtime_contract,
+      deployment_bundle_sha256:$bundle,
       deployment_source_revision:$source}' >"$CANDIDATE_RELEASE/release.json"
-  gate_dir="$GATE_ROOT/$CANDIDATE_SHA256/$DEPLOYMENT_BUNDLE_SHA256/runs/gate-1"
+  gate_dir="$GATE_ROOT/$CANDIDATE_SHA256/$RUNTIME_CONTRACT_SHA256/runs/gate-1"
   mkdir -p "$gate_dir"
   market=$(jq -cn \
     '{observation_started_ns:150,
@@ -217,13 +220,15 @@ setup_fixture() {
     <<<"$market")
   jq -n \
     --arg artifact "$CANDIDATE_SHA256" \
+    --arg runtime_contract "$RUNTIME_CONTRACT_SHA256" \
     --arg bundle "$DEPLOYMENT_BUNDLE_SHA256" \
     --arg source "$DEPLOYMENT_SOURCE_REVISION" \
     --arg run_id 20260820T000000Z-1 \
     --arg run_spool "/data/monday/spool/binance-lob-rust-shadow/runs/$CANDIDATE_SHA256/20260820T000000Z-1" \
     --argjson market "$market" \
     --argjson usdm_market "$usdm_market" \
-    '{schema:"monday.rust_lob_shadow_gate.v3",candidate_sha256:$artifact,
+    '{schema:"monday.rust_lob_shadow_gate.v4",candidate_sha256:$artifact,
+      runtime_contract_sha256:$runtime_contract,
       deployment_bundle_sha256:$bundle,deployment_source_revision:$source,
       run_id:$run_id,run_spool:$run_spool,
       required_duration_seconds:240,requested_duration_seconds:240,

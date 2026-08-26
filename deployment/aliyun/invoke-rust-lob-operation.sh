@@ -139,6 +139,8 @@ for _ in $(seq 1 "$polls"); do
         jq -e --arg artifact "$ARTIFACT_SHA256" \
           '.schema == "monday.rust_lob_gate_resource_preflight.v1"
             and .candidate_sha256 == $artifact
+            and (.runtime_contract_sha256 | type) == "string"
+            and (.runtime_contract_sha256 | test("^[a-f0-9]{64}$"))
             and (.deployment_bundle_sha256 | type) == "string"
             and (.deployment_bundle_sha256 | test("^[a-f0-9]{64}$"))
             and (.deployment_source_revision | type) == "string"

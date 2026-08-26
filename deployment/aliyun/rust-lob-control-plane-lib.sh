@@ -1,5 +1,41 @@
 #!/usr/bin/env bash
 
+# Hash only the bytes exercised by the Shadow Gate and later installed as the
+# production collector runtime. Transition, recovery, and readback controllers
+# remain covered by the full deployment bundle identity.
+monday_rust_lob_runtime_contract_sha256() {
+  [[ $# -eq 1 ]] || return 2
+  local directory=$1 asset digest
+  local -a assets=(
+    binance-lob-archiver-production@.service
+    binance-lob-archiver-rust@.service
+    binance-lob-archiver-upload@.service
+    binance-lob-archiver-rust-upload@.service
+    binance-lob-archiver-production-spot.env
+    binance-lob-archiver-production-usdm.env
+    binance-lob-archiver-rust-spot.env
+    binance-lob-archiver-rust-usdm.env
+  )
+
+  for asset in "${assets[@]}"; do
+    [[ -f $directory/$asset && ! -L $directory/$asset ]] || return 1
+  done
+  {
+    for asset in "${assets[@]}"; do
+      if command -v sha256sum >/dev/null 2>&1; then
+        digest=$(sha256sum "$directory/$asset" | awk '{print $1}')
+      else
+        digest=$(shasum -a 256 "$directory/$asset" | awk '{print $1}')
+      fi
+      printf '%s  %s\n' "$digest" "$asset"
+    done
+  } | if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  else
+    shasum -a 256 | awk '{print $1}'
+  fi
+}
+
 # Pure monotonic freshness transition used by the host gate and its tests.
 # Output: last_updated_ns last_advance_mono max_gap_seconds sample_increment
 monday_observe_health_freshness() {

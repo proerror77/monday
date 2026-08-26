@@ -511,6 +511,34 @@ grep -Fq 'Spot shadow and production SNAPSHOT_PRODUCERS differ' "$GATE"
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
 
+runtime_contract_dir="$tmp_dir/runtime-contract"
+mkdir -p "$runtime_contract_dir"
+for asset in \
+  binance-lob-archiver-production@.service \
+  binance-lob-archiver-rust@.service \
+  binance-lob-archiver-upload@.service \
+  binance-lob-archiver-rust-upload@.service \
+  binance-lob-archiver-production-spot.env \
+  binance-lob-archiver-production-usdm.env \
+  binance-lob-archiver-rust-spot.env \
+  binance-lob-archiver-rust-usdm.env; do
+  cp "$SCRIPT_DIR/$asset" "$runtime_contract_dir/$asset"
+done
+cp "$CUTOVER" "$runtime_contract_dir/host-rust-lob-cutover.sh"
+runtime_contract_before=$(monday_rust_lob_runtime_contract_sha256 "$runtime_contract_dir")
+printf '\n# controller-only fixture\n' >>"$runtime_contract_dir/host-rust-lob-cutover.sh"
+[[ $(monday_rust_lob_runtime_contract_sha256 "$runtime_contract_dir") \
+  == "$runtime_contract_before" ]] || {
+  printf 'controller-only bytes changed the runtime contract\n' >&2
+  exit 1
+}
+printf '\n# runtime fixture\n' >>"$runtime_contract_dir/binance-lob-archiver-production-spot.env"
+[[ $(monday_rust_lob_runtime_contract_sha256 "$runtime_contract_dir") \
+  != "$runtime_contract_before" ]] || {
+  printf 'runtime bytes did not change the runtime contract\n' >&2
+  exit 1
+}
+
 resource_admission_body="$tmp_dir/resource-admission.sh"
 sed -n '/^admit_resource_phase()/,/^}/p' "$GATE" >"$resource_admission_body"
 resource_admission_fixture() (
@@ -870,6 +898,7 @@ artifact=$(printf 'a%.0s' {1..64})
 bundle=$(printf 'b%.0s' {1..64})
 source_revision=$(printf 'c%.0s' {1..40})
 catalog=$(printf 'd%.0s' {1..64})
+runtime_contract=$(printf 'e%.0s' {1..64})
 gate_run_id=20260820T000000Z-1
 run_spool="/data/monday/spool/binance-lob-rust-shadow/runs/$artifact/$gate_run_id"
 usdm_symbols_config=$(sed -n 's/^SYMBOLS=//p' "$SHADOW_USDM_ENV")
@@ -940,13 +969,15 @@ usdm_market=$(jq -c --arg symbols_config "$usdm_symbols_config" \
   <<<"$market_json")
 jq -n \
   --arg artifact "$artifact" \
+  --arg runtime_contract "$runtime_contract" \
   --arg bundle "$bundle" \
   --arg source "$source_revision" \
   --arg run_id "$gate_run_id" \
   --arg run_spool "$run_spool" \
   --argjson market "$market_json" \
   --argjson usdm_market "$usdm_market" \
-  '{schema:"monday.rust_lob_shadow_gate.v3",candidate_sha256:$artifact,
+  '{schema:"monday.rust_lob_shadow_gate.v4",candidate_sha256:$artifact,
+    runtime_contract_sha256:$runtime_contract,
     deployment_bundle_sha256:$bundle,deployment_source_revision:$source,
     run_id:$run_id,run_spool:$run_spool,
     required_duration_seconds:240,requested_duration_seconds:240,
@@ -958,6 +989,7 @@ jq -n \
 
 jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/gate.json" >/dev/null
@@ -966,6 +998,7 @@ jq 'del(.observation_started_ns)' \
   "$tmp_dir/gate.json" >"$tmp_dir/missing-observation-boundary.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/missing-observation-boundary.json" >/dev/null; then
@@ -976,6 +1009,7 @@ jq 'del(.markets.spot.observation_started_ns)' \
   "$tmp_dir/gate.json" >"$tmp_dir/missing-market-observation-boundary.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/missing-market-observation-boundary.json" >/dev/null; then
@@ -986,6 +1020,7 @@ jq 'del(.markets.usdm.observation_started_ns)' \
   "$tmp_dir/gate.json" >"$tmp_dir/missing-usdm-observation-boundary.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/missing-usdm-observation-boundary.json" >/dev/null; then
@@ -996,6 +1031,7 @@ jq '.markets.spot.observation_started_ns = 99' \
   "$tmp_dir/gate.json" >"$tmp_dir/late-evidence-start.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/late-evidence-start.json" >/dev/null; then
@@ -1006,6 +1042,7 @@ jq '.markets.usdm.observation_started_ns = 200' \
   "$tmp_dir/gate.json" >"$tmp_dir/early-evidence-end.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/early-evidence-end.json" >/dev/null; then
@@ -1017,6 +1054,7 @@ jq '.markets.usdm.stream_types = ["aggTrade","bookTicker","depth@100ms","forceOr
   "$tmp_dir/gate.json" >"$tmp_dir/usdm-legacy-stream-contract.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/usdm-legacy-stream-contract.json" >/dev/null; then
@@ -1028,6 +1066,7 @@ jq '.markets.usdm.book_ticker_count = 1
   "$tmp_dir/gate.json" >"$tmp_dir/usdm-book-ticker-rows.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/usdm-book-ticker-rows.json" >/dev/null; then
@@ -1042,6 +1081,7 @@ jq '.markets.usdm.symbol_count = 101
   "$tmp_dir/gate.json" >"$tmp_dir/usdm-101-symbols.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/usdm-101-symbols.json" >/dev/null; then
@@ -1053,6 +1093,7 @@ jq '.markets.usdm.symbols_config = "ALL"' \
   "$tmp_dir/gate.json" >"$tmp_dir/usdm-all-symbols.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/usdm-all-symbols.json" >/dev/null; then
@@ -1065,6 +1106,7 @@ jq '.markets.usdm.configured_catalog_sha256 =
   "$tmp_dir/gate.json" >"$tmp_dir/usdm-catalog-mismatch.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/usdm-catalog-mismatch.json" >/dev/null; then
@@ -1076,6 +1118,7 @@ jq '.run_spool = "/data/monday/spool/binance-lob-rust-shadow/spot"' \
   "$tmp_dir/gate.json" >"$tmp_dir/fixed-spool-gate.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/fixed-spool-gate.json" >/dev/null; then
@@ -1114,13 +1157,15 @@ v1_usdm_market=$(jq -c --arg symbols_config "$usdm_symbols_config" '
   <<<"$v1_market")
 jq -n \
   --arg artifact "$artifact" \
+  --arg runtime_contract "$runtime_contract" \
   --arg bundle "$bundle" \
   --arg source "$source_revision" \
   --arg run_id "$gate_run_id" \
   --arg run_spool "$run_spool" \
   --argjson market "$v1_market" \
   --argjson usdm_market "$v1_usdm_market" \
-  '{schema:"monday.rust_lob_shadow_gate.v3",candidate_sha256:$artifact,
+  '{schema:"monday.rust_lob_shadow_gate.v4",candidate_sha256:$artifact,
+    runtime_contract_sha256:$runtime_contract,
     deployment_bundle_sha256:$bundle,deployment_source_revision:$source,
     run_id:$run_id,run_spool:$run_spool,
     required_duration_seconds:240,requested_duration_seconds:240,
@@ -1131,6 +1176,7 @@ jq -n \
   >"$tmp_dir/gate-v1.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/gate-v1.json" >/dev/null; then
@@ -1142,6 +1188,7 @@ jq '.markets.spot.raw_trade_count = 1' \
   "$tmp_dir/gate-v1.json" >"$tmp_dir/v1-with-raw-trades.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/v1-with-raw-trades.json" >/dev/null; then
@@ -1153,6 +1200,7 @@ jq 'del(.markets.spot.tape_schema)' \
   "$tmp_dir/gate.json" >"$tmp_dir/missing-tape-schema.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/missing-tape-schema.json" >/dev/null; then
@@ -1164,6 +1212,7 @@ jq '.markets.spot.stream_types = ["aggTrade","depth@100ms"]' \
   "$tmp_dir/gate.json" >"$tmp_dir/legacy-stream-types.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/legacy-stream-types.json" >/dev/null; then
@@ -1175,6 +1224,7 @@ jq '.markets.spot.raw_trade_segments = 1' \
   "$tmp_dir/gate.json" >"$tmp_dir/non-continuous-raw-trades.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/non-continuous-raw-trades.json" >/dev/null; then
@@ -1186,6 +1236,7 @@ jq '.markets.spot.raw_trade_count = 0' \
   "$tmp_dir/gate.json" >"$tmp_dir/zero-raw-trades.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/zero-raw-trades.json" >/dev/null; then
@@ -1197,6 +1248,7 @@ jq '.markets.spot.book_ticker_count = 0' \
   "$tmp_dir/gate.json" >"$tmp_dir/zero-book-tickers.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/zero-book-tickers.json" >/dev/null; then
@@ -1208,6 +1260,7 @@ jq 'del(.markets.spot.strict_raw_trade_continuity_readback)' \
   "$tmp_dir/gate.json" >"$tmp_dir/missing-strict-raw-trade-readback.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/missing-strict-raw-trade-readback.json" >/dev/null; then
@@ -1219,6 +1272,7 @@ jq 'del(.markets.usdm.force_order_count)' \
   "$tmp_dir/gate.json" >"$tmp_dir/missing-force-order-count.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/missing-force-order-count.json" >/dev/null; then
@@ -1230,6 +1284,7 @@ jq '.markets.spot.force_order_count = 1' \
   "$tmp_dir/gate.json" >"$tmp_dir/spot-force-orders.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/spot-force-orders.json" >/dev/null; then
@@ -1241,6 +1296,7 @@ jq '.markets.spot.full_stream_coverage_verified = false' \
   "$tmp_dir/gate.json" >"$tmp_dir/unverified-full-stream-coverage.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/unverified-full-stream-coverage.json" >/dev/null; then
@@ -1252,6 +1308,7 @@ jq '.markets.spot.all_stream_coverage_verified = false' \
   "$tmp_dir/gate.json" >"$tmp_dir/unverified-stream-coverage.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/unverified-stream-coverage.json" >/dev/null; then
@@ -1263,6 +1320,7 @@ jq '.markets.spot.oss_roundtrip_evidence[0].stream_coverage_verified_count = 119
   "$tmp_dir/gate.json" >"$tmp_dir/incomplete-segment-stream-coverage.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/incomplete-segment-stream-coverage.json" >/dev/null; then
@@ -1275,6 +1333,7 @@ jq '.markets.spot.lob_reconnect_boundaries = 1
   "$tmp_dir/gate.json" >"$tmp_dir/pre-observation-reconnect.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/pre-observation-reconnect.json" >/dev/null; then
@@ -1282,13 +1341,23 @@ if jq -e \
   exit 1
 fi
 
-wrong_bundle=$(printf 'e%.0s' {1..64})
-if jq -e \
+wrong_bundle=$(printf '8%.0s' {1..64})
+jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$wrong_bundle" \
   --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/gate.json" >/dev/null || {
+  printf 'gate policy coupled evidence to the transition controller bundle\n' >&2
+  exit 1
+}
+
+wrong_runtime_contract=$(printf '7%.0s' {1..64})
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$wrong_runtime_contract" \
   -f "$POLICY" "$tmp_dir/gate.json" >/dev/null; then
-  printf 'gate policy accepted evidence from a different deployment bundle\n' >&2
+  printf 'gate policy accepted evidence from a different runtime contract\n' >&2
   exit 1
 fi
 
@@ -1296,6 +1365,7 @@ jq '.markets.spot.oss_roundtrip_evidence[1].lob_capture_session_id = "session-2"
   "$tmp_dir/gate.json" >"$tmp_dir/mixed-lob-session.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/mixed-lob-session.json" >/dev/null; then
@@ -1311,6 +1381,7 @@ jq '.markets.spot.oss_roundtrip_evidence[1] |=
   "$tmp_dir/gate.json" >"$tmp_dir/excessive-segment-gap.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/excessive-segment-gap.json" >/dev/null; then
@@ -1322,6 +1393,7 @@ jq 'del(.markets.spot.oss_roundtrip_evidence[0].manifest_sha256)' \
   "$tmp_dir/gate.json" >"$tmp_dir/missing-manifest-anchor.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/missing-manifest-anchor.json" >/dev/null; then
@@ -1333,6 +1405,7 @@ jq '.markets.usdm.oss_roundtrip_evidence[1].start_received_at_ns = 199' \
   "$tmp_dir/gate.json" >"$tmp_dir/overlapping-agg-trades.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/overlapping-agg-trades.json" >/dev/null; then
@@ -1343,6 +1416,7 @@ fi
 wrong_artifact=$(printf 'f%.0s' {1..64})
 if jq -e \
   --arg candidate_sha256 "$wrong_artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/gate.json" >/dev/null; then
@@ -1351,18 +1425,20 @@ if jq -e \
 fi
 
 wrong_source=$(printf '9%.0s' {1..40})
-if jq -e \
+jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$wrong_source" \
-  -f "$POLICY" "$tmp_dir/gate.json" >/dev/null; then
-  printf 'gate policy accepted evidence from a different source revision\n' >&2
+  -f "$POLICY" "$tmp_dir/gate.json" >/dev/null || {
+  printf 'gate policy coupled evidence to the transition controller source\n' >&2
   exit 1
-fi
+}
 
 jq '.markets.spot.health_samples = 1' "$tmp_dir/gate.json" >"$tmp_dir/short-sampling.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/short-sampling.json" >/dev/null; then
@@ -1376,6 +1452,7 @@ for market in spot usdm; do
     "$tmp_dir/gate.json" >"$tmp_dir/rotation-jitter-health-$market.json"
   jq -e \
     --arg candidate_sha256 "$artifact" \
+    --arg runtime_contract_sha256 "$runtime_contract" \
     --arg deployment_bundle_sha256 "$bundle" \
     --arg deployment_source_revision "$source_revision" \
     -f "$POLICY" "$tmp_dir/rotation-jitter-health-$market.json" >/dev/null || {
@@ -1388,6 +1465,7 @@ for market in spot usdm; do
     "$tmp_dir/gate.json" >"$tmp_dir/stale-health-$market.json"
   if jq -e \
     --arg candidate_sha256 "$artifact" \
+    --arg runtime_contract_sha256 "$runtime_contract" \
     --arg deployment_bundle_sha256 "$bundle" \
     --arg deployment_source_revision "$source_revision" \
     -f "$POLICY" "$tmp_dir/stale-health-$market.json" >/dev/null; then
@@ -1400,6 +1478,7 @@ jq '.markets.spot.agg_trade_count = 0' \
   "$tmp_dir/gate.json" >"$tmp_dir/zero-agg-trades.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/zero-agg-trades.json" >/dev/null; then
@@ -1411,6 +1490,7 @@ jq 'del(.markets.spot.strict_trade_summary_readback)' \
   "$tmp_dir/gate.json" >"$tmp_dir/missing-strict-trade-summary-readback.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/missing-strict-trade-summary-readback.json" >/dev/null; then
@@ -1422,6 +1502,7 @@ jq 'del(.markets.spot.oss_roundtrip_evidence[0].success_uri)' \
   "$tmp_dir/gate.json" >"$tmp_dir/missing-success-marker.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/missing-success-marker.json" >/dev/null; then
@@ -1433,6 +1514,7 @@ jq '.markets.usdm.agg_trade_segments = 1' \
   "$tmp_dir/gate.json" >"$tmp_dir/non-continuous-agg-trades.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/non-continuous-agg-trades.json" >/dev/null; then
@@ -1538,11 +1620,15 @@ if runtime_policy_accepts "$tmp_dir/cross-dataset.json" old-session 100; then
 fi
 
 restore_recovery_scheduler_body="$tmp_dir/restore-recovery-scheduler.sh"
-sed -n '/^restore_previous_recovery_scheduler()/,/^}/p' "$CUTOVER" \
-  >"$restore_recovery_scheduler_body"
+{
+  sed -n '/^reset_failed_recovery_units()/,/^}/p' "$CUTOVER"
+  sed -n '/^restore_previous_recovery_scheduler()/,/^}/p' "$CUTOVER"
+} >"$restore_recovery_scheduler_body"
 enable_recovery_scheduler_body="$tmp_dir/enable-recovery-scheduler.sh"
-sed -n '/^enable_candidate_recovery_scheduler()/,/^}/p' "$CUTOVER" \
-  >"$enable_recovery_scheduler_body"
+{
+  sed -n '/^reset_failed_recovery_units()/,/^}/p' "$CUTOVER"
+  sed -n '/^enable_candidate_recovery_scheduler()/,/^}/p' "$CUTOVER"
+} >"$enable_recovery_scheduler_body"
 quiesce_recovery_scheduler_body="$tmp_dir/quiesce-recovery-scheduler.sh"
 sed -n '/^quiesce_recovery_scheduler()/,/^}/p' "$CUTOVER" \
   >"$quiesce_recovery_scheduler_body"
@@ -1886,6 +1972,7 @@ run_write_evidence_fixture() (
   CANDIDATE_SHA256=$(printf 'c%.0s' {1..64})
   DEPLOYMENT_SOURCE_REVISION=$(printf 'd%.0s' {1..40})
   DEPLOYMENT_BUNDLE_SHA256=$(printf 'e%.0s' {1..64})
+  RUNTIME_CONTRACT_SHA256=$(printf 'b%.0s' {1..64})
   OLD_SHA256=$(printf 'f%.0s' {1..64})
   OLD_SPOT_RESTARTS=1
   OLD_SPOT_INVOCATION_ID=11111111111111111111111111111111
@@ -1923,6 +2010,7 @@ run_write_evidence_fixture() (
     and .previous_health_script.rollback_source == "rollback-deployment"
     and .previous_health_script.sha256 == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     and .health_script_rollback_result == "not-needed"
+    and .runtime_contract_sha256 == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     and .host_mode == "partial-contained-spot-live"
   ' "$EVIDENCE_DIR/cutover.json" >/dev/null
 )
@@ -1970,7 +2058,8 @@ run_restore_recovery_scheduler_fixture() (
         shift 2
         for unit in "$@"; do masked_runtime_now[$unit]=0; done
         ;;
-      reset-failed) ;;
+      is-failed) return 1 ;;
+      reset-failed) return 1 ;;
       enable)
         shift
         [[ ${1:-} == --now ]] && shift
@@ -2045,7 +2134,8 @@ run_enable_candidate_recovery_scheduler_fixture() (
         shift 2
         for unit in "$@"; do masked_runtime_now[$unit]=0; done
         ;;
-      reset-failed) ;;
+      is-failed) return 1 ;;
+      reset-failed) return 1 ;;
       enable)
         shift 2
         for unit in "$@"; do
@@ -2413,7 +2503,7 @@ grep -Fq 'runuser -u hftcollector -- "$release_binary" --self-test' "$INSTALL_RE
 grep -Fq 'existing release identity does not match requested artifact, bundle, and source' \
   "$INSTALL_RELEASE"
 grep -Fq 'existing release deployment differs from the requested bundle' "$INSTALL_RELEASE"
-grep -Fq 'bundle_evidence_dir="$binary_evidence_dir/$deployment_bundle_sha256"' "$GATE"
+grep -Fq 'runtime_evidence_dir="$binary_evidence_dir/$runtime_contract_sha256"' "$GATE"
 grep -Fq 'evidence_dir="$runs_dir/$gate_run_id"' "$GATE"
 grep -Fq 'an immutable production-eligible gate already exists' "$GATE"
 grep -Fq 'for candidate_unit in "${candidate_units[@]}"; do' "$GATE"
@@ -2422,7 +2512,7 @@ if grep -Fq 'rm -f "$gate_json"' "$GATE"; then
   printf 'shadow gate still deletes immutable gate evidence\n' >&2
   exit 1
 fi
-grep -Fq 'gate_markers=("$GATE_BUNDLE_DIR"/runs/*/PASSED.sha256)' "$CUTOVER"
+grep -Fq 'gate_markers=("$GATE_RUNTIME_DIR"/runs/*/PASSED.sha256)' "$CUTOVER"
 grep -Fq 'rollback-deployment.sha256' "$CUTOVER"
 grep -Fq 'ROLLBACK_DEPLOYMENT_MANIFEST_SHA256' "$rollback_body"
 grep -Fq 'installed production asset drifted from the active immutable release' "$CUTOVER"
@@ -2458,11 +2548,11 @@ candidate_recovery_enable_line=$(grep -n '^enable_candidate_recovery_scheduler' 
 }
 candidate_recovery_service_unmask_line=$(grep -n 'systemctl unmask --runtime "${RECOVERY_UNITS\[@\]}"' \
   "$enable_recovery_scheduler_body" | cut -d: -f1)
-candidate_recovery_service_reset_line=$(grep -n 'systemctl reset-failed "${RECOVERY_UNITS\[@\]}"' \
+candidate_recovery_service_reset_line=$(grep -n 'reset_failed_recovery_units "${RECOVERY_UNITS\[@\]}"' \
   "$enable_recovery_scheduler_body" | cut -d: -f1)
 candidate_recovery_timer_unmask_line=$(grep -n 'systemctl unmask --runtime "${RECOVERY_TIMERS\[@\]}"' \
   "$enable_recovery_scheduler_body" | cut -d: -f1)
-candidate_recovery_timer_reset_line=$(grep -n 'systemctl reset-failed "${RECOVERY_TIMERS\[@\]}"' \
+candidate_recovery_timer_reset_line=$(grep -n 'reset_failed_recovery_units "${RECOVERY_TIMERS\[@\]}"' \
   "$enable_recovery_scheduler_body" | cut -d: -f1)
 candidate_recovery_timer_enable_line=$(grep -n 'systemctl enable --now "${RECOVERY_TIMERS\[@\]}"' \
   "$enable_recovery_scheduler_body" | cut -d: -f1)
@@ -3334,12 +3424,15 @@ run_commands_after=$(grep -c 'ecs RunCommand' "$mock_state/calls.log" 2>/dev/nul
 
 preflight_bundle=$(printf 'b%.0s' {1..64})
 preflight_source=$(printf 'c%.0s' {1..40})
+preflight_runtime_contract=$(printf 'd%.0s' {1..64})
 preflight_payload=$(jq -cn \
   --arg artifact "$artifact" \
   --arg bundle "$preflight_bundle" \
   --arg source "$preflight_source" \
+  --arg runtime_contract "$preflight_runtime_contract" \
   '{schema:"monday.rust_lob_gate_resource_preflight.v1",
     candidate_sha256:$artifact,
+    runtime_contract_sha256:$runtime_contract,
     deployment_bundle_sha256:$bundle,
     deployment_source_revision:$source,
     host_memory_total_bytes:8589934592,

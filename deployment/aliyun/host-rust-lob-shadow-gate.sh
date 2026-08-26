@@ -134,13 +134,21 @@ secure_regular_file "$control_plane_lib"
 . "$control_plane_lib"
 deployment_bundle_sha256=$(jq -er '.deployment_bundle_sha256' "$release_json")
 deployment_source_revision=$(jq -er '.deployment_source_revision' "$release_json")
+runtime_contract_sha256=$(jq -er '.runtime_contract_sha256' "$release_json")
 [[ $deployment_bundle_sha256 =~ ^[a-f0-9]{64}$ ]] \
   || die 'release metadata has an invalid deployment bundle SHA-256'
 [[ $deployment_source_revision =~ ^[a-f0-9]{40,64}$ ]] \
   || die 'release metadata has an invalid deployment source revision'
+[[ $runtime_contract_sha256 =~ ^[a-f0-9]{64}$ ]] \
+  || die 'release metadata has an invalid runtime contract SHA-256'
 jq -e --arg artifact "$candidate_sha" --arg bundle "$deployment_bundle_sha256" \
-  '.artifact_sha256 == $artifact and .deployment_bundle_sha256 == $bundle' \
+  --arg runtime_contract "$runtime_contract_sha256" \
+  '.artifact_sha256 == $artifact and .deployment_bundle_sha256 == $bundle
+    and .runtime_contract_sha256 == $runtime_contract' \
   "$release_json" >/dev/null || die 'release metadata does not match the candidate identity'
+[[ $(monday_rust_lob_runtime_contract_sha256 "$candidate_deployment") \
+  == "$runtime_contract_sha256" ]] \
+  || die 'installed runtime contract does not match release metadata'
 
 [[ -f $candidate_binary && -x $candidate_binary ]] || die "candidate is not executable: $candidate_binary"
 secure_regular_file "$candidate_binary"
@@ -441,6 +449,7 @@ if [[ $resource_preflight_only == true ]]; then
   jq -cn \
     --arg schema monday.rust_lob_gate_resource_preflight.v1 \
     --arg candidate_sha256 "$candidate_sha" \
+    --arg runtime_contract_sha256 "$runtime_contract_sha256" \
     --arg deployment_bundle_sha256 "$deployment_bundle_sha256" \
     --arg deployment_source_revision "$deployment_source_revision" \
     --argjson host_memory_total_bytes "$host_memory_total_bytes" \
@@ -450,6 +459,7 @@ if [[ $resource_preflight_only == true ]]; then
       "$maximum_sequential_phase_memory_bytes" \
     --argjson resource_preflight "$resource_preflight_json" \
     '{schema:$schema,candidate_sha256:$candidate_sha256,
+      runtime_contract_sha256:$runtime_contract_sha256,
       deployment_bundle_sha256:$deployment_bundle_sha256,
       deployment_source_revision:$deployment_source_revision,
       host_memory_total_bytes:$host_memory_total_bytes,
@@ -461,8 +471,8 @@ if [[ $resource_preflight_only == true ]]; then
 fi
 
 binary_evidence_dir="$EVIDENCE_ROOT/$candidate_sha"
-bundle_evidence_dir="$binary_evidence_dir/$deployment_bundle_sha256"
-runs_dir="$bundle_evidence_dir/runs"
+runtime_evidence_dir="$binary_evidence_dir/$runtime_contract_sha256"
+runs_dir="$runtime_evidence_dir/runs"
 gate_run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 run_spool_path="$RUN_SPOOL_ROOT/$candidate_sha/$gate_run_id"
 for market in "${markets[@]}"; do
@@ -485,9 +495,9 @@ done
 install -d -m 0750 "$binary_evidence_dir"
 direct_directory "$binary_evidence_dir" \
   || die 'binary evidence directory is indirect or a symlink'
-install -d -m 0750 "$bundle_evidence_dir" "$runs_dir"
-direct_directory "$bundle_evidence_dir" \
-  || die 'bundle evidence directory is indirect or a symlink'
+install -d -m 0750 "$runtime_evidence_dir" "$runs_dir"
+direct_directory "$runtime_evidence_dir" \
+  || die 'runtime contract evidence directory is indirect or a symlink'
 direct_directory "$runs_dir" || die 'gate runs directory is indirect or a symlink'
 if [[ $test_only != true ]]; then
   shopt -s nullglob
@@ -524,6 +534,7 @@ write_run_json() {
     --arg run_id "$gate_run_id" \
     --arg created_at "$run_created_at" \
     --arg candidate_sha256 "$candidate_sha" \
+    --arg runtime_contract_sha256 "$runtime_contract_sha256" \
     --arg deployment_bundle_sha256 "$deployment_bundle_sha256" \
     --arg deployment_source_revision "$deployment_source_revision" \
     --arg run_spool "$run_spool_path" \
@@ -540,6 +551,7 @@ write_run_json() {
     --argjson test_only "$test_only" \
     '{schema:$schema,run_id:$run_id,created_at:$created_at,
       candidate_sha256:$candidate_sha256,
+      runtime_contract_sha256:$runtime_contract_sha256,
       deployment_bundle_sha256:$deployment_bundle_sha256,
       deployment_source_revision:$deployment_source_revision,
       run_spool:$run_spool,segment_seconds:$segment_seconds,
@@ -1636,9 +1648,10 @@ fi
 write_run_json
 
 jq -n \
-  --arg schema monday.rust_lob_shadow_gate.v3 \
+  --arg schema monday.rust_lob_shadow_gate.v4 \
   --arg candidate_sha256 "$candidate_sha" \
   --arg candidate_binary "$candidate_binary" \
+  --arg runtime_contract_sha256 "$runtime_contract_sha256" \
   --arg deployment_bundle_sha256 "$deployment_bundle_sha256" \
   --arg deployment_source_revision "$deployment_source_revision" \
   --arg run_id "$gate_run_id" \
@@ -1664,6 +1677,7 @@ jq -n \
   --argjson passed "$passed" \
   --argjson markets "$markets_json" \
   '{schema:$schema,candidate_sha256:$candidate_sha256,candidate_binary:$candidate_binary,
+    runtime_contract_sha256:$runtime_contract_sha256,
     deployment_bundle_sha256:$deployment_bundle_sha256,
     deployment_source_revision:$deployment_source_revision,
     run_id:$run_id,run_spool:$run_spool,
