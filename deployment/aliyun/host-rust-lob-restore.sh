@@ -12,6 +12,8 @@ configure_paths() {
   OPT_ROOT="$root/opt/monday"
   BIN_DIR="$root/opt/monday/bin"
   RELEASE_ROOT="$OPT_ROOT/releases/binance-lob-archiver"
+  CONTROLLER_RELEASE_ROOT="$OPT_ROOT/releases/binance-lob-controller"
+  ACTIVE_CONTROLLER_LINK="$CONTROLLER_RELEASE_ROOT/active"
   PRODUCTION_LINK="$BIN_DIR/binance-lob-archiver"
   SYSTEMD_ROOT="$root/etc/systemd/system"
   CONFIG_ROOT="$root/etc/monday"
@@ -225,8 +227,10 @@ write_recovery_evidence() {
     --arg failure_reason "$FAILURE_REASON" \
     --arg rollback_result "$ROLLBACK_RESULT" \
     --arg candidate_sha256 "$CANDIDATE_SHA256" \
+    --arg controller_release_manifest_sha256 "$CONTROLLER_RELEASE_SHA256" \
     --arg runtime_contract_sha256 "$RUNTIME_CONTRACT_SHA256" \
     --arg deployment_bundle_sha256 "$DEPLOYMENT_BUNDLE_SHA256" \
+    --arg deployment_source_revision "$DEPLOYMENT_SOURCE_REVISION" \
     --arg health_script_status "$HEALTH_SCRIPT_STATUS" \
     --arg previous_session_spot "$OLD_SESSION_SPOT" \
     --arg previous_session_usdm "$OLD_SESSION_USDM" \
@@ -242,9 +246,14 @@ write_recovery_evidence() {
       failure_reason: (if $failure_reason == "" then null else $failure_reason end),
       rollback_result: $rollback_result,
       candidate_sha256: $candidate_sha256,
+      controller_release_manifest_sha256:
+        (if $controller_release_manifest_sha256 == "" then null
+         else $controller_release_manifest_sha256 end),
       runtime_contract_sha256:
         (if $runtime_contract_sha256 == "" then null else $runtime_contract_sha256 end),
       deployment_bundle_sha256: (if $deployment_bundle_sha256 == "" then null else $deployment_bundle_sha256 end),
+      deployment_source_revision:
+        (if $deployment_source_revision == "" then null else $deployment_source_revision end),
       health_script_status: $health_script_status,
       previous_session_spot: (if $previous_session_spot == "" then null else $previous_session_spot end),
       previous_session_usdm: (if $previous_session_usdm == "" then null else $previous_session_usdm end),
@@ -271,8 +280,10 @@ write_verification_evidence() {
   jq -n \
     --arg schema monday.rust_lob_recovery_verification.v1 \
     --arg candidate_sha256 "$CANDIDATE_SHA256" \
+    --arg controller_release_manifest_sha256 "$CONTROLLER_RELEASE_SHA256" \
     --arg runtime_contract_sha256 "$RUNTIME_CONTRACT_SHA256" \
     --arg deployment_bundle_sha256 "$DEPLOYMENT_BUNDLE_SHA256" \
+    --arg deployment_source_revision "$DEPLOYMENT_SOURCE_REVISION" \
     --arg health_script_status "$HEALTH_SCRIPT_STATUS" \
     --arg gate_marker "$GATE_MARKER" \
     --arg current_binary "$(readlink -f "$PRODUCTION_LINK" 2>/dev/null || true)" \
@@ -284,8 +295,12 @@ write_verification_evidence() {
     --argjson usdm_active "$usdm_active" \
     --argjson usdm_enabled "$usdm_enabled" \
     '{schema:$schema,candidate_sha256:$candidate_sha256,
+      controller_release_manifest_sha256:
+        (if $controller_release_manifest_sha256 == "" then null
+         else $controller_release_manifest_sha256 end),
       runtime_contract_sha256:$runtime_contract_sha256,
       deployment_bundle_sha256:$deployment_bundle_sha256,
+      deployment_source_revision:$deployment_source_revision,
       health_script_status:$health_script_status,
       gate_marker:$gate_marker,current_binary:$current_binary,
       production_units:{
@@ -349,9 +364,12 @@ restore_release() (
   CANDIDATE_RELEASE="$RELEASE_ROOT/$CANDIDATE_SHA256"
   CANDIDATE_BINARY="$CANDIDATE_RELEASE/binance-lob-archiver"
   CANDIDATE_DEPLOYMENT="$CANDIDATE_RELEASE/deployment"
-  GATE_POLICY="$CANDIDATE_DEPLOYMENT/rust-lob-shadow-gate-policy.jq"
-  RUNTIME_HEALTH_POLICY="$CANDIDATE_DEPLOYMENT/rust-lob-runtime-health-policy.jq"
-  CONTROL_PLANE_LIB="$CANDIDATE_DEPLOYMENT/rust-lob-control-plane-lib.sh"
+  CANDIDATE_METADATA="$CANDIDATE_RELEASE/release.json"
+  CONTROLLER_RELEASE_SHA256=
+  CONTROLLER_RELEASE=
+  GATE_POLICY=
+  RUNTIME_HEALTH_POLICY=
+  CONTROL_PLANE_LIB=
   GATE_RUNTIME_DIR=
   GATE_DIR=
   GATE_JSON=
@@ -393,22 +411,58 @@ restore_release() (
     || fail "refusing to reuse recovery evidence directory: $EVIDENCE_DIR"
 
   STEP=validate-candidate-release
-  for path in "$OPT_ROOT" "$BIN_DIR" "$RELEASE_ROOT" "$CANDIDATE_RELEASE" "$CANDIDATE_DEPLOYMENT"; do
+  if [[ -e $ACTIVE_CONTROLLER_LINK || -L $ACTIVE_CONTROLLER_LINK ]]; then
+    [[ -L $ACTIVE_CONTROLLER_LINK ]] \
+      || fail 'active controller identity is not a symlink'
+    CONTROLLER_RELEASE=$(readlink -f "$ACTIVE_CONTROLLER_LINK") \
+      || fail 'active controller identity is dangling'
+    CONTROLLER_RELEASE_SHA256=${CONTROLLER_RELEASE##*/}
+    [[ $CONTROLLER_RELEASE_SHA256 =~ ^[a-f0-9]{64}$ \
+      && $CONTROLLER_RELEASE == "$CONTROLLER_RELEASE_ROOT/$CONTROLLER_RELEASE_SHA256" ]] \
+      || fail 'active controller identity is not digest-addressed'
+    CANDIDATE_DEPLOYMENT="$CONTROLLER_RELEASE/deployment"
+    CANDIDATE_METADATA="$CONTROLLER_RELEASE/release.json"
+  fi
+  GATE_POLICY="$CANDIDATE_DEPLOYMENT/rust-lob-shadow-gate-policy.jq"
+  RUNTIME_HEALTH_POLICY="$CANDIDATE_DEPLOYMENT/rust-lob-runtime-health-policy.jq"
+  CONTROL_PLANE_LIB="$CANDIDATE_DEPLOYMENT/rust-lob-control-plane-lib.sh"
+  for path in "$OPT_ROOT" "$BIN_DIR" "$RELEASE_ROOT" "$CANDIDATE_RELEASE" \
+    "$CANDIDATE_DEPLOYMENT"; do
     path_is_direct_or_absent "$path" || fail "release path contains a symlink: $path"
   done
+  if [[ -n $CONTROLLER_RELEASE ]]; then
+    for path in "$CONTROLLER_RELEASE_ROOT" "$CONTROLLER_RELEASE"; do
+      path_is_direct_or_absent "$path" || fail "controller release path is indirect: $path"
+    done
+    [[ -L $ACTIVE_CONTROLLER_LINK \
+      && $(readlink -f "$ACTIVE_CONTROLLER_LINK") == "$CONTROLLER_RELEASE" ]] \
+      || fail 'restore controller release is not the active controller identity'
+  fi
   secure_regular_file "$CANDIDATE_BINARY"
   [[ -x $CANDIDATE_BINARY ]] || fail "candidate binary is not executable: $CANDIDATE_BINARY"
   printf '%s  %s\n' "$CANDIDATE_SHA256" "$CANDIDATE_BINARY" | sha256sum --check --strict
   secure_regular_file "$CANDIDATE_RELEASE/release.json"
+  secure_regular_file "$CANDIDATE_METADATA"
   secure_regular_file "$GATE_POLICY"
   secure_regular_file "$RUNTIME_HEALTH_POLICY"
   secure_regular_file "$CONTROL_PLANE_LIB"
-  DEPLOYMENT_BUNDLE_SHA256=$(jq -er '.deployment_bundle_sha256' \
-    "$CANDIDATE_RELEASE/release.json")
-  DEPLOYMENT_SOURCE_REVISION=$(jq -er '.deployment_source_revision' \
-    "$CANDIDATE_RELEASE/release.json")
-  RUNTIME_CONTRACT_SHA256=$(jq -er '.runtime_contract_sha256' \
-    "$CANDIDATE_RELEASE/release.json")
+  if [[ -n $CONTROLLER_RELEASE ]]; then
+    secure_regular_file "$CONTROLLER_RELEASE/release.json.sha256"
+    secure_regular_file "$CONTROLLER_RELEASE/deployment.sha256"
+    [[ $(sha256sum "$CANDIDATE_METADATA" | awk '{print $1}') \
+      == "$CONTROLLER_RELEASE_SHA256" ]] \
+      || fail 'controller release manifest digest mismatch'
+    (cd "$CONTROLLER_RELEASE" \
+      && sha256sum --check --strict release.json.sha256 >/dev/null \
+      && sha256sum --check --strict deployment.sha256 >/dev/null) \
+      || fail 'controller release checksum verification failed'
+    jq -e '.schema == "monday.rust_lob_controller_release.v1"' \
+      "$CANDIDATE_METADATA" >/dev/null \
+      || fail 'controller release manifest schema is invalid'
+  fi
+  DEPLOYMENT_BUNDLE_SHA256=$(jq -er '.deployment_bundle_sha256' "$CANDIDATE_METADATA")
+  DEPLOYMENT_SOURCE_REVISION=$(jq -er '.deployment_source_revision' "$CANDIDATE_METADATA")
+  RUNTIME_CONTRACT_SHA256=$(jq -er '.runtime_contract_sha256' "$CANDIDATE_METADATA")
   [[ $DEPLOYMENT_BUNDLE_SHA256 =~ ^[a-f0-9]{64}$ ]] \
     || fail 'candidate release has an invalid deployment bundle SHA-256'
   [[ $DEPLOYMENT_SOURCE_REVISION =~ ^[a-f0-9]{40,64}$ ]] \
@@ -419,8 +473,12 @@ restore_release() (
     --arg runtime_contract "$RUNTIME_CONTRACT_SHA256" \
     '.artifact_sha256 == $sha and .deployment_bundle_sha256 == $bundle
       and .runtime_contract_sha256 == $runtime_contract' \
-    "$CANDIDATE_RELEASE/release.json" >/dev/null \
+    "$CANDIDATE_METADATA" >/dev/null \
     || fail 'candidate release metadata does not match the requested identity'
+  jq -e --arg sha "$CANDIDATE_SHA256" --arg runtime "$RUNTIME_CONTRACT_SHA256" \
+    '.artifact_sha256 == $sha and .runtime_contract_sha256 == $runtime' \
+    "$CANDIDATE_RELEASE/release.json" >/dev/null \
+    || fail 'artifact release metadata differs from the controller release'
   # shellcheck disable=SC1090,SC1091
   . "$CONTROL_PLANE_LIB"
   [[ $(monday_rust_lob_runtime_contract_sha256 "$CANDIDATE_DEPLOYMENT") \

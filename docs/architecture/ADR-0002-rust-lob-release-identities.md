@@ -40,6 +40,17 @@ destinations, preserve production PIDs and restart counters, provide rollback,
 and emit direct byte and runtime readback. Publication alone is only **Release**;
 it is not **Runtime** or **Readback**.
 
+The first application contract is intentionally narrow: only the recovery queue
+controller may change. Production unit/env files, recovery units/timers, and the
+health script must already be byte-identical to the controller release. The
+apply operation briefly quiesces the recovery timers, never restarts either
+collector, records the active controller manifest under a digest-addressed
+symlink, and rolls back the script, symlink, and timer state on failure.
+Recovery and restore evidence then attributes the controller bundle/source
+rather than the older artifact bundle. A later binary cutover uses its own
+artifact deployment and clears this artifact-specific controller override;
+rollback restores it when the cutover fails.
+
 ## Consequences
 
 - Controller fixes can pass Code, CI, Merge, and Release without fabricating a

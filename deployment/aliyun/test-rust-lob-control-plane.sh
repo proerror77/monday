@@ -10,6 +10,7 @@ GATE="$SCRIPT_DIR/host-rust-lob-shadow-gate.sh"
 SOAK="$SCRIPT_DIR/host-rust-lob-shadow-soak.sh"
 INSTALL_RELEASE="$SCRIPT_DIR/deploy-rust-lob-release.sh"
 CONTROLLER_RELEASE="$SCRIPT_DIR/host-rust-lob-controller-release.sh"
+CONTROLLER_APPLY="$SCRIPT_DIR/host-rust-lob-controller-apply.sh"
 SHADOW_UNIT="$SCRIPT_DIR/binance-lob-archiver-rust@.service"
 INVOKE="$SCRIPT_DIR/invoke-rust-lob-operation.sh"
 COLLECTOR_DOCKERFILE="$SCRIPT_DIR/../../rust_hft/deployment/docker/Dockerfile.binance-lob-archiver"
@@ -27,6 +28,7 @@ LIB="$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
 . "$LIB"
 "$SCRIPT_DIR/test-rust-lob-shadow-soak.sh"
 "$SCRIPT_DIR/test-rust-lob-controller-release.sh"
+"$SCRIPT_DIR/test-rust-lob-controller-apply.sh"
 
 required_memory=11559501824
 [[ $(monday_shadow_memory_admission \
@@ -1865,9 +1867,11 @@ run_capture_existing_production_identity_fixture() (
   local usdm_timer_state=${3:-disabled}
   local spot_service_state=${4:-static}
   local usdm_service_state=${5:-static}
-  local old_sha state
+  local old_sha runtime_contract state
   old_sha=$(printf 'a%.0s' {1..64})
   RELEASE_ROOT=$(mkdir -p "$tmp_dir/capture-release-root" && cd "$tmp_dir/capture-release-root" && pwd -P)
+  CONTROLLER_RELEASE_ROOT="$tmp_dir/capture-controller-root"
+  ACTIVE_CONTROLLER_LINK="$CONTROLLER_RELEASE_ROOT/active"
   PRODUCTION_LINK="$tmp_dir/capture-production-link-$mode-$spot_timer_state-$usdm_timer_state"
   PRODUCTION_UNITS=(production-spot production-usdm)
   RECOVERY_TIMERS=(recovery-spot recovery-usdm)
@@ -1880,8 +1884,11 @@ run_capture_existing_production_identity_fixture() (
   OLD_RECOVERY_TIMER_USDM_MASKED_RUNTIME=0
   OLD_RECOVERY_UNIT_SPOT_MASKED_RUNTIME=0
   OLD_RECOVERY_UNIT_USDM_MASKED_RUNTIME=0
-  mkdir -p "$RELEASE_ROOT/$old_sha"
+  runtime_contract=$(printf 'd%.0s' {1..64})
+  mkdir -p "$RELEASE_ROOT/$old_sha/deployment"
   : >"$RELEASE_ROOT/$old_sha/binance-lob-archiver"
+  jq -n --arg runtime "$runtime_contract" \
+    '{runtime_contract_sha256:$runtime}' >"$RELEASE_ROOT/$old_sha/release.json"
   ln -sf "$RELEASE_ROOT/$old_sha/binance-lob-archiver" \
     "$PRODUCTION_LINK"
   systemctl() {
@@ -2510,9 +2517,12 @@ grep -Fq 'COPYFILE_DISABLE=1 tar -C "$SCRIPT_DIR" -cf "$BUNDLE_PATH" "${assets[@
   "$INSTALL_RELEASE"
 grep -Fq 'host-rust-lob-controller-release.sh' \
   < <(sed -n '/^assets=(/,/^)/p' "$INSTALL_RELEASE")
+grep -Fq 'host-rust-lob-controller-apply.sh' \
+  < <(sed -n '/^assets=(/,/^)/p' "$INSTALL_RELEASE")
 grep -Fq 'BUNDLE_ONLY and CONTROLLER_ONLY are mutually exclusive' "$INSTALL_RELEASE"
 grep -Fq 'monday.rust_lob_controller_release.v1' "$INSTALL_RELEASE"
 grep -Fq 'production unchanged' "$CONTROLLER_RELEASE"
+grep -Fq 'controller release applied without collector restart' "$CONTROLLER_APPLY"
 if grep -Eq 'systemctl[[:space:]]+(start|stop|restart|enable|disable|kill)' \
   "$CONTROLLER_RELEASE"; then
   printf 'controller release publisher may not mutate service state\n' >&2
@@ -2543,6 +2553,9 @@ grep -Fq 'rollback-deployment.sha256' "$CUTOVER"
 grep -Fq 'ROLLBACK_DEPLOYMENT_MANIFEST_SHA256' "$rollback_body"
 grep -Fq 'installed production asset drifted from the active immutable release' "$CUTOVER"
 grep -Fq 'cmp -s -- "$source" "$snapshot_source"' "$CUTOVER"
+grep -Fq 'monday_rust_lob_active_controller_deployment' "$CUTOVER"
+grep -Fq 'STEP=clear-previous-controller-override' "$CUTOVER"
+grep -Fq 'restore_previous_controller_link' "$CUTOVER"
 grep -Fq 'mkdir -m 0750 -- "$EVIDENCE_DIR"' "$CUTOVER"
 grep -Fq 'mkdir -m 0750 -- "$evidence_dir"' "$GATE"
 grep -Fq '\( -type f -o -type l \)' "$GATE"
@@ -3102,6 +3115,7 @@ run_contained_upgrade_rollback_fixture() (
   run_candidate_drain() { printf 'drain %s\n' "$1" >>"$calls"; return 1; }
   install_deployment() { printf 'install %s\n' "$1" >>"$calls"; return 0; }
   atomic_symlink() { printf 'symlink %s %s\n' "$1" "$2" >>"$calls"; return 0; }
+  restore_previous_controller_link() { return 0; }
   restore_allowlisted_production_dropins() { printf 'restore-dropin\n' >>"$calls"; return 0; }
   # shellcheck disable=SC1090
   . "$remove_health_body"
@@ -3335,6 +3349,7 @@ run_new_host_rollback_fixture() (
   }
   copy_health_evidence() { return 0; }
   run_candidate_drain() { return 0; }
+  restore_previous_controller_link() { return 0; }
   # shellcheck disable=SC1090
   . "$remove_health_body"
   # shellcheck disable=SC1090
@@ -3506,6 +3521,31 @@ if env "${common_env[@]}" \
 fi
 grep -Fq 'gate-preflight returned invalid JSON evidence' \
   "$tmp_dir/invalid-gate-preflight.out"
+
+controller_release_sha=$(printf 'e%.0s' {1..64})
+controller_output_b64=$(printf 'controller applied\n' | base64 | tr -d '\n')
+env "${common_env[@]}" \
+  ACTION=controller-apply \
+  CONTROLLER_RELEASE_SHA256="$controller_release_sha" \
+  MOCK_STATUS=Success \
+  MOCK_EXIT_CODE=0 \
+  MOCK_OUTPUT_B64="$controller_output_b64" \
+  "$INVOKE" >"$tmp_dir/controller-apply.out"
+base64 --decode <"$mock_state/last-command-content" \
+  >"$tmp_dir/controller-apply-command.sh"
+grep -Fq "/opt/monday/releases/binance-lob-controller/$controller_release_sha/deployment/host-rust-lob-controller-apply.sh" \
+  "$tmp_dir/controller-apply-command.sh"
+grep -Fq "$controller_release_sha $artifact" \
+  "$tmp_dir/controller-apply-command.sh"
+
+run_commands_before=$(grep -c 'ecs RunCommand' "$mock_state/calls.log")
+if env "${common_env[@]}" ACTION=controller-apply "$INVOKE" \
+  >"$tmp_dir/controller-missing.out" 2>&1; then
+  printf 'controller apply accepted a missing controller release identity\n' >&2
+  exit 1
+fi
+run_commands_after=$(grep -c 'ecs RunCommand' "$mock_state/calls.log")
+[[ $run_commands_after == "$run_commands_before" ]]
 
 env "${common_env[@]}" MOCK_STATUS=Success MOCK_EXIT_CODE=0 "$INVOKE" \
   >"$tmp_dir/success.out"

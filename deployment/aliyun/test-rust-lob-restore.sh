@@ -7,7 +7,7 @@ RESTORE="$SCRIPT_DIR/host-rust-lob-restore.sh"
 INVOKE="$SCRIPT_DIR/invoke-rust-lob-operation.sh"
 INSTALL_RELEASE="$SCRIPT_DIR/deploy-rust-lob-release.sh"
 
-for command in awk cmp find grep head install jq mktemp sed sha256sum; do
+for command in awk cmp find grep head install jq mktemp sed sha256sum sort; do
   command -v "$command" >/dev/null 2>&1 \
     || { printf 'missing test dependency: %s\n' "$command" >&2; exit 2; }
 done
@@ -328,6 +328,38 @@ setup_fixture() {
   ln -s "$CANDIDATE_BINARY" "$PROC_ROOT/222/exe"
 }
 
+activate_controller_fixture() {
+  local staging controller_release
+  CONTROLLER_BUNDLE_SHA256=$(printf 'e%.0s' {1..64})
+  CONTROLLER_SOURCE_REVISION=$(printf 'f%.0s' {1..40})
+  staging="$CONTROLLER_RELEASE_ROOT/staging"
+  mkdir -p "$staging"
+  cp -R "$CANDIDATE_DEPLOYMENT" "$staging/deployment"
+  printf '\n# controller update\n' \
+    >>"$staging/deployment/host-rust-lob-recovery-queue.sh"
+  install -m 0755 "$staging/deployment/host-rust-lob-recovery-queue.sh" \
+    "$BIN_DIR/monday-rust-lob-recovery-queue"
+  jq -n \
+    --arg artifact "$CANDIDATE_SHA256" \
+    --arg runtime "$RUNTIME_CONTRACT_SHA256" \
+    --arg bundle "$CONTROLLER_BUNDLE_SHA256" \
+    --arg source "$CONTROLLER_SOURCE_REVISION" '
+      {schema:"monday.rust_lob_controller_release.v1",
+       artifact_sha256:$artifact,runtime_contract_sha256:$runtime,
+       deployment_bundle_sha256:$bundle,deployment_source_revision:$source}' \
+    >"$staging/release.json"
+  CONTROLLER_RELEASE_SHA256=$(sha256sum "$staging/release.json" | awk '{print $1}')
+  (
+    cd "$staging"
+    sha256sum release.json >release.json.sha256
+    for asset in deployment/*; do sha256sum "$asset"; done \
+      | sort -k2 >deployment.sha256
+  )
+  controller_release="$CONTROLLER_RELEASE_ROOT/$CONTROLLER_RELEASE_SHA256"
+  mv "$staging" "$controller_release"
+  ln -s "$controller_release" "$ACTIVE_CONTROLLER_LINK"
+}
+
 mock_write_health() {
   local market=$1 session symbol_count
   if [[ $market == spot ]]; then
@@ -491,6 +523,27 @@ run_success_fixture() (
   [[ -f $MOCK_STATE/enabled/binance-lob-archiver-recovery@usdm.timer ]]
   cmp -s "$CANDIDATE_DEPLOYMENT/monday-collector-health.sh" \
     "$BIN_DIR/monday-collector-health.sh"
+)
+
+run_controller_override_fixture() (
+  fixture="$tmp_dir/controller-override"
+  setup_fixture "$fixture"
+  activate_controller_fixture
+  restore_release "$CANDIDATE_SHA256" >"$fixture/out" 2>&1 \
+    || { printf 'restore failed with an active controller override\n' >&2; exit 1; }
+  evidence=$(restore_evidence_dir)
+  jq -e \
+    --arg controller "$CONTROLLER_RELEASE_SHA256" \
+    --arg bundle "$CONTROLLER_BUNDLE_SHA256" \
+    --arg source "$CONTROLLER_SOURCE_REVISION" '
+      .result == "passed"
+      and .controller_release_manifest_sha256 == $controller
+      and .deployment_bundle_sha256 == $bundle
+      and .deployment_source_revision == $source' \
+    "$evidence/recovery.json" >/dev/null
+  cmp -s \
+    "$CONTROLLER_RELEASE_ROOT/$CONTROLLER_RELEASE_SHA256/deployment/host-rust-lob-recovery-queue.sh" \
+    "$BIN_DIR/monday-rust-lob-recovery-queue"
 )
 
 run_missing_symlink_fixture() (
@@ -672,6 +725,7 @@ run_evidence_failure_disables_recovery_timers_fixture() (
 )
 
 run_success_fixture
+run_controller_override_fixture
 run_missing_symlink_fixture
 run_symlink_mismatch_fixture
 run_missing_gate_fixture

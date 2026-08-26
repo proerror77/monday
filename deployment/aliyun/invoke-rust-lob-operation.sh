@@ -3,8 +3,9 @@ set -euo pipefail
 
 usage() {
   printf '%s\n' \
-    'Usage: ACTION=gate-preflight|gate|cutover|restore INSTANCE_ID=i-... ARTIFACT_SHA256=<64 hex> invoke-rust-lob-operation.sh' \
+    'Usage: ACTION=gate-preflight|gate|controller-apply|cutover|restore INSTANCE_ID=i-... ARTIFACT_SHA256=<64 hex> invoke-rust-lob-operation.sh' \
     '' \
+    'controller-apply also requires CONTROLLER_RELEASE_SHA256=<64 hex>.' \
     'The command always targets ap-northeast-1 and uses Alibaba Cloud Assistant.'
 }
 
@@ -34,6 +35,13 @@ if [[ ! "$ARTIFACT_SHA256" =~ ^[A-Fa-f0-9]{64}$ ]]; then
   exit 2
 fi
 ARTIFACT_SHA256=$(printf '%s' "$ARTIFACT_SHA256" | tr '[:upper:]' '[:lower:]')
+CONTROLLER_RELEASE_SHA256=${CONTROLLER_RELEASE_SHA256:-}
+if [[ -n $CONTROLLER_RELEASE_SHA256 ]]; then
+  [[ $CONTROLLER_RELEASE_SHA256 =~ ^[A-Fa-f0-9]{64}$ ]] \
+    || { printf 'CONTROLLER_RELEASE_SHA256 must contain exactly 64 hexadecimal characters\n' >&2; exit 2; }
+  CONTROLLER_RELEASE_SHA256=$(printf '%s' "$CONTROLLER_RELEASE_SHA256" \
+    | tr '[:upper:]' '[:lower:]')
+fi
 
 case "$ACTION" in
   gate-preflight)
@@ -45,6 +53,11 @@ case "$ACTION" in
     host_script=host-rust-lob-shadow-gate.sh
     timeout_seconds=7200
     command_name=monday-rust-lob-shadow-gate
+    ;;
+  controller-apply)
+    host_script=host-rust-lob-controller-apply.sh
+    timeout_seconds=600
+    command_name=monday-rust-lob-controller-apply
     ;;
   cutover)
     host_script=host-rust-lob-cutover.sh
@@ -59,6 +72,13 @@ case "$ACTION" in
   *)
     usage >&2
     exit 2
+    ;;
+esac
+
+case "$ACTION" in
+  controller-apply)
+    [[ -n $CONTROLLER_RELEASE_SHA256 ]] \
+      || { printf '%s requires CONTROLLER_RELEASE_SHA256\n' "$ACTION" >&2; exit 2; }
     ;;
 esac
 
@@ -82,10 +102,17 @@ if [[ -n "$ALIYUN_LOCAL_PROFILE" ]]; then
   aliyun_profile_args=(--profile "$ALIYUN_LOCAL_PROFILE")
 fi
 
-host_path="/opt/monday/releases/binance-lob-archiver/$ARTIFACT_SHA256/deployment/$host_script"
+if [[ $ACTION == controller-apply ]]; then
+  host_path="/opt/monday/releases/binance-lob-controller/$CONTROLLER_RELEASE_SHA256/deployment/$host_script"
+else
+  host_path="/opt/monday/releases/binance-lob-archiver/$ARTIFACT_SHA256/deployment/$host_script"
+fi
 if [[ $ACTION == gate-preflight ]]; then
   printf -v remote_script '#!/usr/bin/env bash\nset -euo pipefail\nexec %q --resource-preflight %q\n' \
     "$host_path" "$ARTIFACT_SHA256"
+elif [[ $ACTION == controller-apply ]]; then
+  printf -v remote_script '#!/usr/bin/env bash\nset -euo pipefail\nexec %q %q %q\n' \
+    "$host_path" "$CONTROLLER_RELEASE_SHA256" "$ARTIFACT_SHA256"
 else
   printf -v remote_script '#!/usr/bin/env bash\nset -euo pipefail\nexec %q %q\n' \
     "$host_path" "$ARTIFACT_SHA256"

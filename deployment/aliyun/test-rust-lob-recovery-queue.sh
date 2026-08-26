@@ -5,7 +5,7 @@ export LC_ALL=C
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 QUEUE_SCRIPT="$SCRIPT_DIR/host-rust-lob-recovery-queue.sh"
 
-for command in awk cmp grep install jq mktemp sed sha256sum; do
+for command in awk cmp grep install jq mktemp sed sha256sum sort; do
   command -v "$command" >/dev/null 2>&1 \
     || { printf 'missing test dependency: %s\n' "$command" >&2; exit 2; }
 done
@@ -218,7 +218,7 @@ sync() {
 
 setup_fixture() {
   local fixture=$1
-  local release_sha source_sha bundle_sha release_dir env_file release_env
+  local release_sha source_sha bundle_sha runtime_sha release_dir env_file release_env
   MOCK_SYSTEMCTL_LOG="$fixture/systemctl.log"
   MOCK_RUNUSER_LOG="$fixture/runuser.log"
   MOCK_CALLS_LOG="$fixture/binary.log"
@@ -272,6 +272,7 @@ EOF
   release_sha=$(sha256sum "$fixture/fake-binary.sh" | awk '{print $1}')
   source_sha=$(printf 'c%.0s' {1..40})
   bundle_sha=$(printf 'b%.0s' {1..64})
+  runtime_sha=$(printf 'd%.0s' {1..64})
   release_dir="$RELEASE_ROOT/$release_sha"
   mkdir -p "$release_dir/deployment"
   install -m 0755 "$fixture/fake-binary.sh" "$release_dir/binance-lob-archiver"
@@ -279,8 +280,10 @@ EOF
     --arg artifact "$release_sha" \
     --arg bundle "$bundle_sha" \
     --arg source "$source_sha" \
+    --arg runtime "$runtime_sha" \
     '{artifact_sha256:$artifact,deployment_bundle_sha256:$bundle,
-      deployment_source_revision:$source}' >"$release_dir/release.json"
+      deployment_source_revision:$source,
+      runtime_contract_sha256:$runtime}' >"$release_dir/release.json"
   ln -s "$release_dir/binance-lob-archiver" "$PRODUCTION_LINK"
   for market in spot usdm; do
     env_file="$CONFIG_ROOT/binance-lob-archiver-production-$market.env"
@@ -291,6 +294,45 @@ EOF
     install -m 0640 "$env_file" "$release_env"
     : >"$CANONICAL_ROOT/$market/.binance-lob-archiver.lock"
   done
+}
+
+activate_controller_fixture() {
+  local fixture=$1 artifact_sha artifact_release staging controller_sha
+  local controller_source controller_bundle runtime_contract market
+  configure_paths "$fixture"
+  artifact_release=$(dirname "$(readlink -f "$PRODUCTION_LINK")")
+  artifact_sha=${artifact_release##*/}
+  runtime_contract=$(jq -er '.runtime_contract_sha256' "$artifact_release/release.json")
+  controller_source=$(printf 'e%.0s' {1..40})
+  controller_bundle=$(printf 'f%.0s' {1..64})
+  staging="$CONTROLLER_RELEASE_ROOT/staging"
+  mkdir -p "$staging/deployment"
+  install -m 0755 "$QUEUE_SCRIPT" \
+    "$staging/deployment/host-rust-lob-recovery-queue.sh"
+  install -m 0755 "$QUEUE_SCRIPT" "$INSTALLED_RECOVERY"
+  for market in spot usdm; do
+    install -m 0640 \
+      "$artifact_release/deployment/binance-lob-archiver-production-$market.env" \
+      "$staging/deployment/binance-lob-archiver-production-$market.env"
+  done
+  jq -n \
+    --arg artifact "$artifact_sha" \
+    --arg bundle "$controller_bundle" \
+    --arg source "$controller_source" \
+    --arg runtime "$runtime_contract" '
+      {schema:"monday.rust_lob_controller_release.v1",
+       artifact_sha256:$artifact,deployment_bundle_sha256:$bundle,
+       deployment_source_revision:$source,runtime_contract_sha256:$runtime}' \
+    >"$staging/release.json"
+  controller_sha=$(sha256sum "$staging/release.json" | awk '{print $1}')
+  (
+    cd "$staging"
+    sha256sum release.json >release.json.sha256
+    for asset in deployment/*; do sha256sum "$asset"; done \
+      | sort -k2 >deployment.sha256
+  )
+  mv "$staging" "$CONTROLLER_RELEASE_ROOT/$controller_sha"
+  ln -s "$CONTROLLER_RELEASE_ROOT/$controller_sha" "$ACTIVE_CONTROLLER"
 }
 
 run_action() (
@@ -524,6 +566,25 @@ test_unsafe_release_identity_fails_closed() {
     "$release_json" >"$release_json.tmp"
   mv "$release_json.tmp" "$release_json"
   expect_failure "$fixture" isolate spot
+}
+
+test_active_controller_attributes_recovery_and_rejects_drift() {
+  local fixture=$tmp_dir/controller-attribution ready_dir
+  setup_fixture "$fixture"
+  activate_controller_fixture "$fixture"
+  printf 'part\n' >"$fixture/data/monday/spool/binance-lob/spot/part-001.jsonl.part"
+  run_action "$fixture" isolate spot
+  ready_dir=$(find "$fixture/data/monday/spool/binance-lob-recovery/spot" \
+    -mindepth 1 -maxdepth 1 -type d -name '*.ready' -print -quit)
+  jq -e \
+    --arg bundle "$(printf 'f%.0s' {1..64})" \
+    --arg source "$(printf 'e%.0s' {1..40})" '
+      .deployment_bundle_sha256 == $bundle
+      and .deployment_source_revision == $source' \
+    "$ready_dir/job.json" >/dev/null
+  printf '\n# drift\n' >>"$fixture/opt/monday/bin/monday-rust-lob-recovery-queue"
+  printf 'part\n' >"$fixture/data/monday/spool/binance-lob/usdm/part-001.jsonl.part"
+  expect_failure "$fixture" isolate usdm
 }
 
 test_missing_canonical_lock_fails_closed() {
@@ -786,6 +847,7 @@ test_failed_job_is_not_retried
 test_other_market_recovery_defers_without_mutating_job
 test_invalid_release_env_never_executes_recovery_binary
 test_unsafe_release_identity_fails_closed
+test_active_controller_attributes_recovery_and_rejects_drift
 test_missing_canonical_lock_fails_closed
 test_symlinked_queue_root_fails_closed
 test_isolation_marker_recovers_all_crash_boundaries
