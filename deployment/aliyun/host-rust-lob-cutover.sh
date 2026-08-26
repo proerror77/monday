@@ -39,6 +39,7 @@ DEPLOYMENT_BUNDLE_SHA256=
 DEPLOYMENT_SOURCE_REVISION=
 PRODUCTION_LINK=/opt/monday/bin/binance-lob-archiver
 SHADOW_LINK=/opt/monday/bin/binance-lob-archiver-shadow
+INSTALLED_HEALTH_SCRIPT=/opt/monday/bin/monday-collector-health.sh
 CANONICAL_SPOOL=/data/monday/spool/binance-lob
 RECOVERY_QUEUE_ROOT=/data/monday/spool/binance-lob-recovery
 RECOVERY_EVIDENCE_ROOT=/data/monday/evidence/recoveries
@@ -61,6 +62,7 @@ OLD_USDM_RESTARTS=
 OLD_USDM_INVOCATION_ID=
 MASK_USDM_UPLOAD_FOR_TRANSITION=0
 MASK_SPOT_UPLOAD_FOR_TRANSITION=0
+OLD_HEALTH_ASSET_PRESENT=0
 
 PRODUCTION_UNITS=(
   binance-lob-archiver-production@spot.service
@@ -107,6 +109,7 @@ RECOVERY_DEPLOYMENT_ASSETS=(
   binance-lob-archiver-recovery@.timer
   host-rust-lob-recovery-queue.sh
 )
+HEALTH_DEPLOYMENT_ASSET=monday-collector-health.sh
 DRAIN_ENV_KEYS=(
   MARKET
   DATASET
@@ -274,6 +277,10 @@ validate_deployment() {
       secure_regular_file "$directory/$asset"
     done
   fi
+  if [[ $strict == true || -e $directory/$HEALTH_DEPLOYMENT_ASSET \
+    || -L $directory/$HEALTH_DEPLOYMENT_ASSET ]]; then
+    secure_regular_file "$directory/$HEALTH_DEPLOYMENT_ASSET"
+  fi
 
   validate_production_env \
     "$directory/binance-lob-archiver-production-spot.env" \
@@ -402,6 +409,15 @@ install_deployment() {
     /etc/monday/binance-lob-archiver-production-spot.env || return 1
   atomic_install 0640 "$directory/binance-lob-archiver-production-usdm.env" \
     /etc/monday/binance-lob-archiver-production-usdm.env || return 1
+  if [[ -f $directory/$HEALTH_DEPLOYMENT_ASSET ]]; then
+    atomic_install 0755 "$directory/$HEALTH_DEPLOYMENT_ASSET" \
+      "$INSTALLED_HEALTH_SCRIPT" || return 1
+  fi
+}
+
+remove_installed_health_script() {
+  rm -f -- "$INSTALLED_HEALTH_SCRIPT" || return 1
+  [[ ! -e $INSTALLED_HEALTH_SCRIPT && ! -L $INSTALLED_HEALTH_SCRIPT ]]
 }
 
 atomic_symlink() {
@@ -498,6 +514,7 @@ stage_existing_deployment_for_rollback() {
   local release_deployment=$OLD_DEPLOYMENT
   local snapshot="$EVIDENCE_DIR/rollback-deployment"
   local manifest="$EVIDENCE_DIR/rollback-deployment.sha256"
+  OLD_HEALTH_ASSET_PRESENT=0
   [[ ! -L $OLD_DEPLOYMENT ]] || fail "old staged deployment is a symlink: $OLD_DEPLOYMENT"
   for asset in "${BASE_DEPLOYMENT_ASSETS[@]}"; do
     if [[ -e $release_deployment/$asset ]]; then
@@ -539,6 +556,13 @@ stage_existing_deployment_for_rollback() {
   else
     fail "old release has a partial staged deployment: $release_deployment"
   fi
+  if [[ -e $INSTALLED_HEALTH_SCRIPT || -L $INSTALLED_HEALTH_SCRIPT ]]; then
+    OLD_HEALTH_ASSET_PRESENT=1
+    rollback_assets+=("$HEALTH_DEPLOYMENT_ASSET")
+  elif [[ -e $release_deployment/$HEALTH_DEPLOYMENT_ASSET \
+    || -L $release_deployment/$HEALTH_DEPLOYMENT_ASSET ]]; then
+    fail "installed production is missing the health script from the active immutable release: $INSTALLED_HEALTH_SCRIPT"
+  fi
 
   [[ ! -e $snapshot && ! -L $snapshot ]] \
     || fail "rollback evidence snapshot already exists: $snapshot"
@@ -551,11 +575,16 @@ stage_existing_deployment_for_rollback() {
         installed_source=/opt/monday/bin/monday-rust-lob-recovery-queue
         mode=0755
         ;;
+      monday-collector-health.sh)
+        installed_source=$INSTALLED_HEALTH_SCRIPT
+        mode=0755
+        ;;
     esac
     secure_regular_file "$installed_source"
     snapshot_source="$snapshot/$asset"
     atomic_install "$mode" "$installed_source" "$snapshot_source"
-    if [[ $source_kind == release ]]; then
+    if [[ $source_kind == release \
+      && ( -e $release_deployment/$asset || -L $release_deployment/$asset ) ]]; then
       source="$release_deployment/$asset"
       secure_regular_file "$source"
       if ! cmp -s -- "$source" "$snapshot_source"; then
@@ -1084,6 +1113,10 @@ rollback_after_failure() {
     elif ! install_deployment "$OLD_DEPLOYMENT"; then
       safe_to_restart=0
       ROLLBACK_RESULT=restore-assets-failed-disabled
+    elif (( OLD_HEALTH_ASSET_PRESENT == 0 )) \
+      && ! remove_installed_health_script; then
+      safe_to_restart=0
+      ROLLBACK_RESULT=restore-health-script-failed-disabled
     elif ! atomic_symlink "$OLD_BINARY" "$PRODUCTION_LINK"; then
       safe_to_restart=0
       ROLLBACK_RESULT=restore-symlink-failed-disabled

@@ -213,6 +213,10 @@ grep -Fxq 'ExecStart=/opt/monday/bin/monday-rust-lob-recovery-queue drain %i' \
 grep -Fxq 'Unit=binance-lob-archiver-recovery@%i.service' \
   "$SCRIPT_DIR/binance-lob-archiver-recovery@.timer"
 grep -Fq 'host-rust-lob-recovery-queue.sh' "$INSTALL_RELEASE"
+sed -n '/^assets=(/,/^)/p' "$INSTALL_RELEASE" \
+  | grep -Fq 'monday-collector-health.sh'
+grep -Fq 'HEALTH_DEPLOYMENT_ASSET=monday-collector-health.sh' "$CUTOVER"
+grep -Fq 'atomic_install 0755 "$directory/$HEALTH_DEPLOYMENT_ASSET"' "$CUTOVER"
 queue_root_line=$(grep -n 'install -d -m 0750 -o root -g hftcollector "$RECOVERY_QUEUE_ROOT"' \
   "$CUTOVER" | cut -d: -f1)
 candidate_start_line=$(grep -n '^STEP=start-candidate-production$' "$CUTOVER" | cut -d: -f1)
@@ -1372,6 +1376,9 @@ sed -n '/^restore_previous_recovery_timers()/,/^}/p' "$CUTOVER" \
   >"$restore_recovery_timers_body"
 rollback_body="$tmp_dir/rollback.sh"
 sed -n '/^rollback_after_failure()/,/^}/p' "$CUTOVER" >"$rollback_body"
+remove_health_body="$tmp_dir/remove-installed-health.sh"
+sed -n '/^remove_installed_health_script()/,/^}/p' "$CUTOVER" \
+  >"$remove_health_body"
 production_predicate_body="$tmp_dir/production-is-fail-closed.sh"
 sed -n '/^production_is_fail_closed()/,/^}/p' "$CUTOVER" \
   >"$production_predicate_body"
@@ -2242,7 +2249,8 @@ grep -Fq 'spot production service has an unexpected systemd drop-in' \
 installed_root="$tmp_dir/installed"
 release_deployment="$tmp_dir/old-release/deployment"
 stage_body="$tmp_dir/stage-existing-deployment.sh"
-mkdir -p "$installed_root/systemd" "$installed_root/monday" "$release_deployment"
+mkdir -p "$installed_root/systemd" "$installed_root/monday" "$installed_root/bin" \
+  "$release_deployment"
 sed -n '/^stage_existing_deployment_for_rollback()/,/^}/p' "$CUTOVER" \
   | sed \
       -e "s#/etc/systemd/system#$installed_root/systemd#g" \
@@ -2269,10 +2277,15 @@ for asset in "${deployment_assets[@]}"; do
   fi
   install -m 0644 "$release_deployment/$asset" "$installed"
 done
+installed_health_script="$installed_root/bin/monday-collector-health.sh"
+printf '#!/bin/sh\nprintf "legacy installed health\\n"\n' >"$installed_health_script"
+chmod 0755 "$installed_health_script"
 
 run_stage_fixture() (
   BASE_DEPLOYMENT_ASSETS=("${deployment_assets[@]}")
   RECOVERY_DEPLOYMENT_ASSETS=()
+  HEALTH_DEPLOYMENT_ASSET=monday-collector-health.sh
+  INSTALLED_HEALTH_SCRIPT="$installed_health_script"
   OLD_DEPLOYMENT="$release_deployment"
   EVIDENCE_DIR=$1
   OLD_MODE=${2:-upgrade}
@@ -2295,10 +2308,26 @@ run_stage_fixture() (
 snapshot_evidence="$tmp_dir/snapshot-evidence"
 mkdir -p "$snapshot_evidence"
 run_stage_fixture "$snapshot_evidence"
+cmp -s "$installed_health_script" \
+  "$snapshot_evidence/rollback-deployment/monday-collector-health.sh"
 (
   cd "$snapshot_evidence/rollback-deployment"
   sha256sum --check --strict "$snapshot_evidence/rollback-deployment.sha256" >/dev/null
 )
+install -m 0755 "$installed_health_script" \
+  "$release_deployment/monday-collector-health.sh"
+rm -f "$installed_health_script"
+missing_installed_health_evidence="$tmp_dir/missing-installed-health-evidence"
+mkdir -p "$missing_installed_health_evidence"
+if run_stage_fixture "$missing_installed_health_evidence" \
+  >"$tmp_dir/missing-installed-health.out" 2>&1; then
+  printf 'rollback snapshot accepted an immutable health script missing from the host\n' >&2
+  exit 1
+fi
+grep -Fq \
+  "installed production is missing the health script from the active immutable release: $installed_health_script" \
+  "$tmp_dir/missing-installed-health.out"
+mv "$release_deployment/monday-collector-health.sh" "$installed_health_script"
 printf 'tampered\n' >> \
   "$snapshot_evidence/rollback-deployment/binance-lob-archiver-production@.service"
 if (
@@ -2385,6 +2414,7 @@ run_contained_upgrade_rollback_fixture() (
   local old_recovery_timer_usdm_enabled=${9:-}
   local old_recovery_timer_spot_masked_runtime=${10:-}
   local old_recovery_timer_usdm_masked_runtime=${11:-}
+  local old_health_asset_present=${12:-1}
   local spot_upload_unmasked=0
   local usdm_upload_unmasked=0
   local recovery_spot_enabled_now=0
@@ -2434,10 +2464,16 @@ run_contained_upgrade_rollback_fixture() (
   OLD_USDM_MINIMUM_SYMBOLS=400
   OLD_USDM_RESTARTS=2
   OLD_USDM_INVOCATION_ID=22222222222222222222222222222222
+  OLD_HEALTH_ASSET_PRESENT=$old_health_asset_present
+  INSTALLED_HEALTH_SCRIPT="$tmp_dir/contained-installed-health"
   SPOOL_ENV_DEPLOYMENT=$OLD_DEPLOYMENT
   mkdir -p "$CANONICAL_SPOOL" "$OLD_DEPLOYMENT" "$EVIDENCE_DIR" \
     "$(dirname "$PRODUCTION_LINK")"
   : >"$calls"
+  rm -f "$INSTALLED_HEALTH_SCRIPT"
+  if (( OLD_HEALTH_ASSET_PRESENT == 0 )); then
+    printf 'candidate installed health\n' >"$INSTALLED_HEALTH_SCRIPT"
+  fi
   systemctl() {
     printf '%s %s\n' "$1" "${*:2}" >>"$calls"
     case "$1" in
@@ -2588,6 +2624,8 @@ run_contained_upgrade_rollback_fixture() (
   atomic_symlink() { printf 'symlink %s %s\n' "$1" "$2" >>"$calls"; return 0; }
   restore_allowlisted_production_dropins() { printf 'restore-dropin\n' >>"$calls"; return 0; }
   # shellcheck disable=SC1090
+  . "$remove_health_body"
+  # shellcheck disable=SC1090
   . "$restore_recovery_timers_body"
   # shellcheck disable=SC1090
   . "$production_predicate_body"
@@ -2678,6 +2716,11 @@ run_contained_upgrade_rollback_fixture() (
     printf 'upgrade rollback did not attempt its required canonical spool drain\n' >&2
     exit 1
   fi
+  if (( OLD_HEALTH_ASSET_PRESENT == 0 )) \
+    && [[ -e $INSTALLED_HEALTH_SCRIPT || -L $INSTALLED_HEALTH_SCRIPT ]]; then
+    printf 'rollback retained a candidate health script absent from the previous deployment\n' >&2
+    exit 1
+  fi
   printf '%s\n' "$ROLLBACK_RESULT"
 )
 
@@ -2686,6 +2729,9 @@ run_contained_upgrade_rollback_fixture() (
   == production-stop-or-disable-containment-failed ]]
 [[ $(run_contained_upgrade_rollback_fixture 1 1) == previous-release-restored-contained ]]
 [[ $(run_contained_upgrade_rollback_fixture 1 0 contained-upgrade 2) \
+  == previous-release-restored-contained ]]
+[[ $(run_contained_upgrade_rollback_fixture \
+  1 0 contained-upgrade 0 '' '' '' '' '' '' '' 0) \
   == previous-release-restored-contained ]]
 [[ $(run_contained_upgrade_rollback_fixture \
   1 0 contained-upgrade 0 '' '' '' 0 0 1 1) \

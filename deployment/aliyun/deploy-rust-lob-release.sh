@@ -94,6 +94,7 @@ assets=(
   host-rust-lob-cutover.sh
   host-rust-lob-restore.sh
   host-rust-lob-recovery-queue.sh
+  monday-collector-health.sh
   rust-lob-control-plane-lib.sh
   rust-lob-runtime-health-policy.jq
   rust-lob-shadow-gate-policy.jq
