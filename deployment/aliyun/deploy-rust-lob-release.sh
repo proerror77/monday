@@ -5,7 +5,7 @@ usage() {
   printf '%s\n' \
     'Usage: INSTANCE_ID=i-... ARTIFACT_OSS_URI=oss://... ARTIFACT_SHA256=<64 hex> SOURCE_REVISION=<git sha> deploy-rust-lob-release.sh' \
     '' \
-    'Optional: REGION_ID=ap-northeast-1 ALIYUN_LOCAL_PROFILE=default'
+    'Optional: REGION_ID=ap-northeast-1 ALIYUN_LOCAL_PROFILE=default BUNDLE_ONLY=0 CONTROLLER_ONLY=0'
 }
 
 for command in aliyun base64 git jq tar; do
@@ -58,6 +58,15 @@ if [[ "$BUNDLE_ONLY" != '0' && "$BUNDLE_ONLY" != '1' ]]; then
   printf 'BUNDLE_ONLY must be 0 or 1\n' >&2
   exit 2
 fi
+CONTROLLER_ONLY=${CONTROLLER_ONLY:-0}
+if [[ "$CONTROLLER_ONLY" != '0' && "$CONTROLLER_ONLY" != '1' ]]; then
+  printf 'CONTROLLER_ONLY must be 0 or 1\n' >&2
+  exit 2
+fi
+if [[ $BUNDLE_ONLY == 1 && $CONTROLLER_ONLY == 1 ]]; then
+  printf 'BUNDLE_ONLY and CONTROLLER_ONLY are mutually exclusive\n' >&2
+  exit 2
+fi
 
 ARTIFACT_SHA256=$(printf '%s' "$ARTIFACT_SHA256" | tr '[:upper:]' '[:lower:]')
 SOURCE_REVISION=$(printf '%s' "$SOURCE_REVISION" | tr '[:upper:]' '[:lower:]')
@@ -94,6 +103,7 @@ assets=(
   host-rust-lob-cutover.sh
   host-rust-lob-restore.sh
   host-rust-lob-recovery-queue.sh
+  host-rust-lob-controller-release.sh
   monday-collector-health.sh
   rust-lob-control-plane-lib.sh
   rust-lob-runtime-health-policy.jq
@@ -120,6 +130,33 @@ else
   BUNDLE_SHA256=$(shasum -a 256 "$BUNDLE_PATH" | awk '{print $1}')
 fi
 BUNDLE_OSS_URI="${BUNDLE_OSS_PREFIX%/}/${SOURCE_REVISION}/deployment-${BUNDLE_SHA256}.tar"
+CONTROLLER_MANIFEST_PATH=
+CONTROLLER_MANIFEST_SHA256=
+CONTROLLER_MANIFEST_OSS_URI=
+if [[ $CONTROLLER_ONLY == 1 ]]; then
+  CONTROLLER_MANIFEST_PATH="$TMP_DIR/controller-release.json"
+  jq -n \
+    --arg artifact_uri "$ARTIFACT_OSS_URI" \
+    --arg artifact_sha256 "$ARTIFACT_SHA256" \
+    --arg runtime_contract_sha256 "$RUNTIME_CONTRACT_SHA256" \
+    --arg deployment_source_revision "$SOURCE_REVISION" \
+    --arg deployment_bundle_uri "$BUNDLE_OSS_URI" \
+    --arg deployment_bundle_sha256 "$BUNDLE_SHA256" '
+      {schema:"monday.rust_lob_controller_release.v1",
+       artifact_uri:$artifact_uri,
+       artifact_sha256:$artifact_sha256,
+       runtime_contract_sha256:$runtime_contract_sha256,
+       deployment_source_revision:$deployment_source_revision,
+       deployment_bundle_uri:$deployment_bundle_uri,
+       deployment_bundle_sha256:$deployment_bundle_sha256}' \
+    >"$CONTROLLER_MANIFEST_PATH"
+  if command -v sha256sum >/dev/null 2>&1; then
+    CONTROLLER_MANIFEST_SHA256=$(sha256sum "$CONTROLLER_MANIFEST_PATH" | awk '{print $1}')
+  else
+    CONTROLLER_MANIFEST_SHA256=$(shasum -a 256 "$CONTROLLER_MANIFEST_PATH" | awk '{print $1}')
+  fi
+  CONTROLLER_MANIFEST_OSS_URI="${BUNDLE_OSS_PREFIX%/}/${SOURCE_REVISION}/controller-release-${CONTROLLER_MANIFEST_SHA256}.json"
+fi
 
 aliyun_profile_args=()
 if [[ -n "$ALIYUN_LOCAL_PROFILE" ]]; then
@@ -134,46 +171,61 @@ aliyun ossutil cp \
   --force \
   "${aliyun_profile_args[@]}"
 
+if [[ $CONTROLLER_ONLY == 1 ]]; then
+  aliyun ossutil cp \
+    "$CONTROLLER_MANIFEST_PATH" \
+    "$CONTROLLER_MANIFEST_OSS_URI" \
+    --endpoint oss-ap-northeast-1.aliyuncs.com \
+    --region "$REGION_ID" \
+    --force \
+    "${aliyun_profile_args[@]}"
+fi
+
 printf -v remote_variables \
-  'artifact_uri=%q\nartifact_sha256=%q\nsource_revision=%q\nbundle_uri=%q\nbundle_sha256=%q\nruntime_contract_sha256=%q\nbundle_only=%q\n' \
+  'artifact_uri=%q\nartifact_sha256=%q\nsource_revision=%q\nbundle_uri=%q\nbundle_sha256=%q\nruntime_contract_sha256=%q\nbundle_only=%q\ncontroller_only=%q\ncontroller_manifest_uri=%q\ncontroller_manifest_sha256=%q\n' \
   "$ARTIFACT_OSS_URI" \
   "$ARTIFACT_SHA256" \
   "$SOURCE_REVISION" \
   "$BUNDLE_OSS_URI" \
   "$BUNDLE_SHA256" \
   "$RUNTIME_CONTRACT_SHA256" \
-  "$BUNDLE_ONLY"
+  "$BUNDLE_ONLY" \
+  "$CONTROLLER_ONLY" \
+  "$CONTROLLER_MANIFEST_OSS_URI" \
+  "$CONTROLLER_MANIFEST_SHA256"
 
 read -r -d '' remote_body <<'REMOTE_SCRIPT' || true
 set -euo pipefail
 umask 027
 
-install -d -m 0755 /run/lock
-exec 9>/run/lock/monday-rust-lob-release.lock
-if ! flock -w 30 9; then
-  printf 'another Rust collector release operation holds the host lock\n' >&2
-  exit 1
-fi
-if ! mountpoint -q /data; then
-  printf '/data must be a mounted filesystem before collector installation\n' >&2
-  exit 1
-fi
-for path in \
-  /data/monday \
-  /data/monday/spool \
-  /data/monday/spool/binance-lob-rust-shadow \
-  /data/monday/spool/binance-lob-rust-shadow/spot \
-  /data/monday/spool/binance-lob-rust-shadow/usdm; do
-  if [[ -L $path ]]; then
-    printf 'refusing symlink in shadow spool path: %s\n' "$path" >&2
+if [[ $controller_only == 0 ]]; then
+  install -d -m 0755 /run/lock
+  exec 9>/run/lock/monday-rust-lob-release.lock
+  if ! flock -w 30 9; then
+    printf 'another Rust collector release operation holds the host lock\n' >&2
     exit 1
   fi
-done
+  if ! mountpoint -q /data; then
+    printf '/data must be a mounted filesystem before collector installation\n' >&2
+    exit 1
+  fi
+  for path in \
+    /data/monday \
+    /data/monday/spool \
+    /data/monday/spool/binance-lob-rust-shadow \
+    /data/monday/spool/binance-lob-rust-shadow/spot \
+    /data/monday/spool/binance-lob-rust-shadow/usdm; do
+    if [[ -L $path ]]; then
+      printf 'refusing symlink in shadow spool path: %s\n' "$path" >&2
+      exit 1
+    fi
+  done
 
-if systemctl is-active --quiet binance-lob-archiver-rust@spot.service \
-  || systemctl is-active --quiet binance-lob-archiver-rust@usdm.service; then
-  printf 'refusing to replace the shadow candidate while a shadow unit is active\n' >&2
-  exit 1
+  if systemctl is-active --quiet binance-lob-archiver-rust@spot.service \
+    || systemctl is-active --quiet binance-lob-archiver-rust@usdm.service; then
+    printf 'refusing to replace the shadow candidate while a shadow unit is active\n' >&2
+    exit 1
+  fi
 fi
 
 work_dir=$(mktemp -d)
@@ -196,6 +248,7 @@ trap cleanup EXIT
 artifact_tmp="$work_dir/binance-lob-archiver"
 bundle_tmp="$work_dir/deployment.tar"
 bundle_dir="$work_dir/deployment"
+controller_manifest_tmp="$work_dir/controller-release.json"
 mkdir -p "$bundle_dir"
 
 aliyun ossutil cp "$artifact_uri" "$artifact_tmp" \
@@ -216,6 +269,19 @@ tar --no-same-owner --no-same-permissions -xf "$bundle_tmp" -C "$bundle_dir"
 . "$bundle_dir/rust-lob-control-plane-lib.sh"
 [[ $(monday_rust_lob_runtime_contract_sha256 "$bundle_dir") == "$runtime_contract_sha256" ]] \
   || { printf 'deployment runtime contract does not match release metadata\n' >&2; exit 1; }
+
+if [[ $controller_only == 1 ]]; then
+  aliyun ossutil cp "$controller_manifest_uri" "$controller_manifest_tmp" \
+    --profile ecs-role \
+    --endpoint oss-ap-northeast-1-internal.aliyuncs.com \
+    --region ap-northeast-1 \
+    --force
+  printf '%s  %s\n' "$controller_manifest_sha256" "$controller_manifest_tmp" \
+    | sha256sum --check --strict
+  bash "$bundle_dir/host-rust-lob-controller-release.sh" \
+    "$artifact_tmp" "$bundle_tmp" "$controller_manifest_tmp"
+  exit 0
+fi
 
 if ! id hftcollector >/dev/null 2>&1; then
   useradd --system --create-home --home-dir /var/lib/hft-collector \
@@ -402,6 +468,9 @@ run_json=$(aliyun ecs RunCommand \
 invoke_id=$(printf '%s' "$run_json" | jq -er '.InvokeId')
 printf 'Cloud Assistant invocation: %s\nDeployment bundle: %s\n' \
   "$invoke_id" "$BUNDLE_OSS_URI"
+if [[ $CONTROLLER_ONLY == 1 ]]; then
+  printf 'Controller release manifest: %s\n' "$CONTROLLER_MANIFEST_OSS_URI"
+fi
 
 for _ in $(seq 1 240); do
   if ! result_json=$(aliyun ecs DescribeInvocationResults \
@@ -419,7 +488,11 @@ for _ in $(seq 1 240); do
   case "$status" in
     Success|Finished)
       if [[ "$exit_code" == '0' ]]; then
-        printf 'candidate install completed successfully: %s\n' "$invoke_id"
+        if [[ $CONTROLLER_ONLY == 1 ]]; then
+          printf 'controller release publication completed successfully: %s\n' "$invoke_id"
+        else
+          printf 'candidate install completed successfully: %s\n' "$invoke_id"
+        fi
         exit 0
       fi
       printf '%s\n' "$result_json" >&2

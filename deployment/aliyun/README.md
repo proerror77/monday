@@ -959,12 +959,25 @@ exactly; otherwise installation fails instead of rewriting historical release
 evidence. First installation is assembled in a sibling directory and renamed
 into place only after all identity checks pass.
 
-For a script/policy-only change that does not rebuild the binary, run the
-installer with `BUNDLE_ONLY=1`. It keeps the artifact identity and verifies the
-installed binary SHA, archives the prior `release.json` as
-`release.json.prev.<sha256>`, and atomically replaces `deployment/` plus the
-`deployment_bundle_*` fields and `deployment_source_revision` of `release.json`.
-The binary is never replaced in this mode.
+`BUNDLE_ONLY=1` is retained only for an inactive candidate release. It keeps the
+artifact identity, verifies the installed binary SHA, archives the prior
+`release.json`, and replaces that inactive candidate's deployment bundle. It
+deliberately refuses the active production digest so historical rollback
+identity cannot be rewritten.
+
+For a controller-only change on the active binary, use the same command with
+`CONTROLLER_ONLY=1`. This uploads a digest-addressed bundle and release manifest,
+then publishes an immutable host release under:
+
+```text
+/opt/monday/releases/binance-lob-controller/<deployment-bundle-sha256>/
+```
+
+Publication requires the active artifact URI/SHA and the candidate and active
+runtime-contract digests to match. It does not install controller files, change
+systemd state, touch `/data`, start a Gate, change either production symlink, or
+restart a collector. Applying that exact controller release is a separate
+Runtime transition with its own rollback and readback evidence.
 
 The committed shadow environments use `SYMBOLS=ALL` for Spot and the same
 frozen 100-symbol USD-M production allowlist for Futures. Both keep five-minute

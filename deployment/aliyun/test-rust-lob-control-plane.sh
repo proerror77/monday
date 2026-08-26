@@ -9,6 +9,7 @@ RESTORE="$SCRIPT_DIR/host-rust-lob-restore.sh"
 GATE="$SCRIPT_DIR/host-rust-lob-shadow-gate.sh"
 SOAK="$SCRIPT_DIR/host-rust-lob-shadow-soak.sh"
 INSTALL_RELEASE="$SCRIPT_DIR/deploy-rust-lob-release.sh"
+CONTROLLER_RELEASE="$SCRIPT_DIR/host-rust-lob-controller-release.sh"
 SHADOW_UNIT="$SCRIPT_DIR/binance-lob-archiver-rust@.service"
 INVOKE="$SCRIPT_DIR/invoke-rust-lob-operation.sh"
 COLLECTOR_DOCKERFILE="$SCRIPT_DIR/../../rust_hft/deployment/docker/Dockerfile.binance-lob-archiver"
@@ -25,6 +26,7 @@ LIB="$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
 # shellcheck disable=SC1090,SC1091
 . "$LIB"
 "$SCRIPT_DIR/test-rust-lob-shadow-soak.sh"
+"$SCRIPT_DIR/test-rust-lob-controller-release.sh"
 
 required_memory=11559501824
 [[ $(monday_shadow_memory_admission \
@@ -2506,6 +2508,16 @@ grep -Fq 'release_staging=$(mktemp -d "$release_root/.${artifact_sha256}.new.XXX
   "$INSTALL_RELEASE"
 grep -Fq 'COPYFILE_DISABLE=1 tar -C "$SCRIPT_DIR" -cf "$BUNDLE_PATH" "${assets[@]}"' \
   "$INSTALL_RELEASE"
+grep -Fq 'host-rust-lob-controller-release.sh' \
+  < <(sed -n '/^assets=(/,/^)/p' "$INSTALL_RELEASE")
+grep -Fq 'BUNDLE_ONLY and CONTROLLER_ONLY are mutually exclusive' "$INSTALL_RELEASE"
+grep -Fq 'monday.rust_lob_controller_release.v1' "$INSTALL_RELEASE"
+grep -Fq 'production unchanged' "$CONTROLLER_RELEASE"
+if grep -Eq 'systemctl[[:space:]]+(start|stop|restart|enable|disable|kill)' \
+  "$CONTROLLER_RELEASE"; then
+  printf 'controller release publisher may not mutate service state\n' >&2
+  exit 1
+fi
 shadow_spool_install=$(sed -n \
   '/^install -d -m 0750 -o hftcollector -g hftcollector \\/,/^  \/data\/monday\/spool\/binance-lob-rust-shadow\/usdm$/p' \
   "$INSTALL_RELEASE")
