@@ -579,8 +579,10 @@ cutover may install them globally. Readback uses the installed controller, requi
 the exact cutover PID and invocation to remain active with zero restarts, and
 downloads both production `data`/`manifest`/`_SUCCESS` triplets into bounded
 `/run` scratch space. It fails until both upload queues are empty and each
-manifest starts after cutover completion; archive its JSON output separately from
-the immutable cutover directory.
+manifest starts after the success marker publication second. The slow OSS downloads
+do not hold the release lock, so rollback remains available; the final runtime and
+upload-status snapshots are revalidated under the lock. Archive the JSON output
+separately from the immutable cutover directory.
 
 The Rust shadow unit must complete its configured observation window and publish
 fresh fail-closed health before the reference collector is promoted. Evidence binds

@@ -19,6 +19,7 @@ readonly EVIDENCE_ROOT=/data/monday/evidence/polymarket-cutovers
 readonly GATE_RECEIPT_ROOT=/data/monday/evidence/polymarket-gate-jobs
 readonly GATE_EVIDENCE_ROOT=/data/monday/evidence/polymarket-shadow-gates
 readonly MAX_GATE_AGE_SECONDS=86400
+readonly POLY_SUCCESS_MAX_AGE_SECONDS=7200
 readonly LOCK_FILE=/run/monday/polymarket-raw-ops.lock
 readonly COLLECTOR_UNIT=polymarket-reference-collector.service
 readonly REFERENCE_UPLOAD_UNIT=polymarket-reference-upload.service
@@ -1745,7 +1746,8 @@ production_upload_status() {
   updated_epoch=$(date -u -d "$updated_at" +%s) || return 1
   now=$(date -u +%s) || return 1
   ((success_epoch >= cutover_epoch && success_epoch <= updated_epoch \
-    && updated_epoch <= now)) || return 1
+    && updated_epoch <= now \
+    && now - success_epoch <= POLY_SUCCESS_MAX_AGE_SECONDS)) || return 1
   canonical_sha=$(printf '%s' "$status" | sha256sum | awk '{print $1}') || return 1
   jq -cn --argjson status "$status" --arg sha256 "$canonical_sha" '
     {updated_at:$status.updated_at,last_success_at:$status.last_success_at,
@@ -1806,6 +1808,7 @@ verify_post_cutover_runtime() {
 readback_cutover() {
   local requested=$1 evidence_dir cutover cutover_sha candidate_sha source_revision
   local bundle_sha manifest_sha archive_sha oss_sha completed_at completed_epoch now
+  local marker_epoch not_before_epoch
   local candidate_binary release_manifest pinned_upload_env worker pid invocation
   local reference_status market_status reference_triplet market_triplet readback_at
   mountpoint -q /data || die '/data must be a mount point'
@@ -1815,6 +1818,8 @@ readback_cutover() {
   [[ $evidence_dir == "$requested" && $evidence_dir == "$EVIDENCE_ROOT"/* ]] \
     || die 'readback evidence is outside the canonical cutover evidence root'
   secure_root_chain "$evidence_dir" || die 'readback evidence directory is not trusted'
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || die 'another Polymarket release operation is running'
   secure_regular_file "$evidence_dir/cutover.json"
   secure_regular_file "$evidence_dir/PASSED.sha256"
   verify_named_marker "$evidence_dir" cutover.json PASSED.sha256 \
@@ -1859,6 +1864,10 @@ readback_cutover() {
     || die 'cutover completion timestamp is invalid'
   now=$(date -u +%s)
   ((completed_epoch <= now)) || die 'cutover completion timestamp is in the future'
+  marker_epoch=$(stat -c %Y -- "$evidence_dir/PASSED.sha256") \
+    || die 'cutover success publication timestamp is unavailable'
+  ((marker_epoch <= now)) || die 'cutover success publication timestamp is in the future'
+  not_before_epoch=$((marker_epoch + 1))
   pid=$(jq -er '.collector.main_pid | tostring' "$cutover")
   invocation=$(jq -er '.collector.invocation_id' "$cutover")
   candidate_binary="$RELEASE_ROOT/$candidate_sha/polymarket-raw-ops"
@@ -1886,29 +1895,33 @@ readback_cutover() {
     || die 'production runtime or delivery controls differ from the exact cutover'
 
   reference_status=$(production_upload_status "$REFERENCE_SPOOL" \
-    crypto_expiry_reference "$completed_epoch") \
+    crypto_expiry_reference "$not_before_epoch") \
     || die 'reference uploader has no clean post-cutover success'
   market_status=$(production_upload_status "$MARKET_SPOOL" \
-    crypto_expiry "$completed_epoch") \
+    crypto_expiry "$not_before_epoch") \
     || die 'market uploader has no clean post-cutover success'
   READBACK_DOWNLOAD_ROOT=$(mktemp -d /run/monday/polymarket-readback.XXXXXX)
   chmod 0700 "$READBACK_DOWNLOAD_ROOT"
   secure_root_chain "$READBACK_DOWNLOAD_ROOT" \
     || die 'readback download directory is not trusted'
   trap cleanup_readback_download_root EXIT
+  flock -u 9
   reference_triplet=$(post_cutover_oss_triplet "$worker" "$pinned_upload_env" \
     "$oss_sha" "$reference_status" crypto_expiry_reference \
-    "$READBACK_DOWNLOAD_ROOT/reference" "$completed_epoch") \
+    "$READBACK_DOWNLOAD_ROOT/reference" "$not_before_epoch") \
     || die 'reference production OSS triplet is not post-cutover complete'
   market_triplet=$(post_cutover_oss_triplet "$worker" "$pinned_upload_env" \
     "$oss_sha" "$market_status" crypto_expiry \
-    "$READBACK_DOWNLOAD_ROOT/market" "$completed_epoch") \
+    "$READBACK_DOWNLOAD_ROOT/market" "$not_before_epoch") \
     || die 'market production OSS triplet is not post-cutover complete'
   cleanup_readback_download_root || die 'could not remove readback downloads'
   trap - EXIT
 
+  flock -n 9 || die 'another Polymarket release operation is running'
   verify_named_marker "$evidence_dir" cutover.json PASSED.sha256 \
     || die 'cutover evidence changed during readback'
+  [[ $(stat -c %Y -- "$evidence_dir/PASSED.sha256") == "$marker_epoch" ]] \
+    || die 'cutover success publication timestamp changed during readback'
   for marker in PASSED.rollback-pending.sha256 PASSED.invalid.sha256 \
     PASSED.rolled-back.sha256; do
     [[ ! -e $evidence_dir/$marker && ! -L $evidence_dir/$marker ]] \
@@ -1922,6 +1935,18 @@ readback_cutover() {
     "$CONTROL_DIR" || die 'release identity changed during readback'
   [[ $(oss_config_sha256 "$pinned_upload_env") == "$oss_sha" ]] \
     || die 'pinned OSS configuration changed during readback'
+  reference_status=$(production_upload_status "$REFERENCE_SPOOL" \
+    crypto_expiry_reference "$not_before_epoch") \
+    || die 'reference uploader changed during readback'
+  market_status=$(production_upload_status "$MARKET_SPOOL" \
+    crypto_expiry "$not_before_epoch") \
+    || die 'market uploader changed during readback'
+  [[ $(jq -er '.last_uploaded_object' <<<"$reference_status") \
+    == "$(jq -er '.uri' <<<"$reference_triplet")" ]] \
+    || die 'reference uploader advanced during readback; retry the readback'
+  [[ $(jq -er '.last_uploaded_object' <<<"$market_status") \
+    == "$(jq -er '.uri' <<<"$market_triplet")" ]] \
+    || die 'market uploader advanced during readback; retry the readback'
   cutover_sha=$(sha256sum "$cutover" | awk '{print $1}')
   readback_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   jq -S -n --arg cutover_sha256 "$cutover_sha" \
@@ -1929,6 +1954,7 @@ readback_cutover() {
     --arg release_manifest_sha256 "$manifest_sha" \
     --arg deployment_bundle_sha256 "$bundle_sha" \
     --arg oss_config_sha256 "$oss_sha" --arg completed_at "$completed_at" \
+    --argjson not_before_epoch "$not_before_epoch" \
     --arg readback_at "$readback_at" --argjson main_pid "$pid" \
     --arg invocation_id "$invocation" --argjson reference "$reference_status" \
     --argjson reference_triplet "$reference_triplet" \
@@ -1939,6 +1965,7 @@ readback_cutover() {
       release_manifest_sha256:$release_manifest_sha256,
       deployment_bundle_sha256:$deployment_bundle_sha256,
       oss_config_sha256:$oss_config_sha256,cutover_completed_at:$completed_at,
+      post_cutover_not_before_epoch:$not_before_epoch,
       collector:{main_pid:$main_pid,restarts:0,invocation_id:$invocation_id},
       reference:{upload_status:$reference,oss_triplet:$reference_triplet},
       market:{upload_status:$market,oss_triplet:$market_triplet},
@@ -1948,7 +1975,7 @@ readback_cutover() {
 
 [[ ${EUID} -eq 0 ]] || die 'must run as root'
 for command in awk chmod chown cmp date dirname flock grep install journalctl jq ln mkdir mktemp mountpoint \
-  mv readlink rm sed seq sha256sum sleep sort stat sync systemctl tar tr wc; do
+  mv readlink rm sed seq sha256sum sleep sort stat sync systemctl tar touch tr wc; do
   command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
 done
 mode=${1:-}
@@ -2016,13 +2043,13 @@ secure_collector_directory /data/monday/spool/polymarket-reference \
   || die 'production spool is not an exact hftcollector-owned 0750 directory'
 install -d -m 0755 /run/monday
 secure_root_chain /run/monday || die 'runtime control directory is not trusted'
-exec 9>"$LOCK_FILE"
-flock -n 9 || die 'another Polymarket release operation is running'
-
 if [[ $mode == readback ]]; then
   readback_cutover "$2"
   exit
 fi
+
+exec 9>"$LOCK_FILE"
+flock -n 9 || die 'another Polymarket release operation is running'
 
 if [[ $mode == rollback ]]; then
   [[ -d $2 && ! -L $2 ]] || die 'rollback evidence must be a direct directory'
@@ -2744,6 +2771,8 @@ secure_root_chain "$evidence_dir" \
 mv -Tf "$success_marker_tmp" "$success_marker"
 sync "$success_marker"
 sync -f "$evidence_dir"
+touch -m -- "$success_marker"
+sync "$success_marker"
 
 cutover_succeeded=true
 trap - EXIT
