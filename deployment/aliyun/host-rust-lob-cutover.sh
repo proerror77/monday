@@ -910,9 +910,12 @@ restore_previous_recovery_scheduler() {
 }
 
 reset_failed_recovery_units() {
-  local unit
+  local unit loaded_units
   for unit in "$@"; do
-    if systemctl is-failed --quiet "$unit"; then
+    loaded_units=$(systemctl list-units --all --full --plain --no-legend "$unit") \
+      || return 1
+    if awk -v unit="$unit" '$1 == unit { found=1 } END { exit(found ? 0 : 1) }' \
+      <<<"$loaded_units"; then
       systemctl reset-failed "$unit" >/dev/null || return 1
     fi
   done

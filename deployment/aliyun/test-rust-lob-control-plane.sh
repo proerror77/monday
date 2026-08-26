@@ -2120,22 +2120,34 @@ fi
 
 run_enable_candidate_recovery_scheduler_fixture() (
   local unit
-  declare -A enabled_now=() active_now=() masked_runtime_now=()
+  declare -A enabled_now=() active_now=() masked_runtime_now=() loaded_now=() reset_now=()
   RECOVERY_TIMERS=(recovery-spot recovery-usdm)
   RECOVERY_UNITS=(recovery-spot-service recovery-usdm-service)
   for unit in "${RECOVERY_TIMERS[@]}" "${RECOVERY_UNITS[@]}"; do
     enabled_now[$unit]=0
     active_now[$unit]=0
     masked_runtime_now[$unit]=1
+    loaded_now[$unit]=0
+    reset_now[$unit]=0
   done
+  loaded_now[recovery-spot-service]=1
   systemctl() {
     case "$1" in
       unmask)
         shift 2
         for unit in "$@"; do masked_runtime_now[$unit]=0; done
         ;;
-      is-failed) return 1 ;;
-      reset-failed) return 1 ;;
+      list-units)
+        unit=${!#}
+        (( loaded_now[$unit] )) \
+          && printf '%s loaded inactive dead fixture\n' "$unit"
+        return 0
+        ;;
+      reset-failed)
+        unit=$2
+        (( loaded_now[$unit] )) || return 1
+        reset_now[$unit]=1
+        ;;
       enable)
         shift 2
         for unit in "$@"; do
@@ -2165,6 +2177,8 @@ run_enable_candidate_recovery_scheduler_fixture() (
   enable_candidate_recovery_scheduler
   (( masked_runtime_now[recovery-spot-service] == 0 ))
   (( masked_runtime_now[recovery-usdm-service] == 0 ))
+  (( reset_now[recovery-spot-service] == 1 ))
+  (( reset_now[recovery-usdm-service] == 0 ))
   (( enabled_now[recovery-spot] == 1 && active_now[recovery-spot] == 1 ))
   (( enabled_now[recovery-usdm] == 1 && active_now[recovery-usdm] == 1 ))
 )
