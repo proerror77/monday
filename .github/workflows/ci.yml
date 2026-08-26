@@ -114,7 +114,7 @@ jobs:
 
       - name: Checkout collector controls
         if: steps.scope.outputs.control == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Install shellcheck
         if: steps.scope.outputs.control == 'true'
@@ -128,7 +128,6 @@ jobs:
             bash -n "$script"
           done
           shellcheck ../deployment/aliyun/*.sh
-          ../deployment/aliyun/test-polymarket-raw-ops-control-plane.sh
           ../deployment/aliyun/test-polymarket-market-tape-upload-contract.sh
           ../deployment/aliyun/test-polymarket-reference-upload-contract.sh
           ../deployment/aliyun/test-monday-collector-health.sh
@@ -265,7 +264,9 @@ jobs:
 
       - name: Verify collector release control plane
         if: needs.scope.outputs.control == 'true'
-        run: cargo test -p hft-collector --lib systemd_reference_resource_envelope_is_pinned --locked
+        run: |
+          ../deployment/aliyun/test-polymarket-raw-ops-control-plane.sh
+          cargo test -p hft-collector --lib systemd_reference_resource_envelope_is_pinned --locked
 
       - name: Build focused packages
         if: needs.scope.outputs.focused == 'true'

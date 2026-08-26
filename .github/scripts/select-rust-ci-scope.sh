@@ -330,11 +330,29 @@ for path in "${paths[@]}"; do
       select_job ci/market-recorder-contract
       ;;
     deployment/aliyun/polymarket-market-tape.toml|\
-    deployment/aliyun/polymarket-market-tape.service|\
+    deployment/aliyun/polymarket-market-tape.service)
+      control=true
+      toolchain=true
+      select_job ci/market-recorder-contract
+      select_job ploy/integration-regressions
+      select_job ci/rust
+      ;;
     deployment/aliyun/polymarket-reference-collector.service|\
     deployment/aliyun/polymarket-reference-collector-shadow@.service|\
     deployment/aliyun/polymarket-market-tape-upload.service|\
     deployment/aliyun/polymarket-reference-upload.service)
+      control=true
+      toolchain=true
+      select_job ploy/integration-regressions
+      select_job ci/rust
+      ;;
+    deployment/aliyun/polymarket-raw-ops-*|\
+    deployment/aliyun/test-polymarket-raw-ops-*|\
+    deployment/aliyun/polymarket-shadow-gate-policy.jq|\
+    deployment/aliyun/polymarket-legacy-health-policy.jq|\
+    deployment/aliyun/polymarket-rust-health-policy.jq|\
+    deployment/aliyun/polymarket-market-tape-upload-watchdog.sh|\
+    deployment/aliyun/polymarket-market-tape-upload-watchdog.timer)
       control=true
       toolchain=true
       select_job ploy/integration-regressions
@@ -365,6 +383,8 @@ for path in "${paths[@]}"; do
       ;;
   esac
 done
+
+[[ $control == true ]] && select_job ploy/safety-scans
 
 if [[ $needs_metadata == false ]]; then
   [[ $toolchain == true ]] && select_job ci/rust

@@ -30,6 +30,8 @@ printf '%s\n' Makefile >"$tmp_dir/unknown-root.txt"
 printf '%s\n' config/risk.toml >"$tmp_dir/unknown-nested.txt"
 printf '%s\n' deployment/aliyun/host-rust-lob-cutover.sh >"$tmp_dir/lob-control.txt"
 printf '%s\n' deployment/aliyun/polymarket-market-recorder-deploy.sh >"$tmp_dir/market-recorder-control.txt"
+printf '%s\n' deployment/aliyun/polymarket-market-tape.service >"$tmp_dir/market-recorder-unit.txt"
+printf '%s\n' deployment/aliyun/bybit-options-archiver.service >"$tmp_dir/unowned-unit.txt"
 printf '%s\n' rust_hft/deployment/docker/Dockerfile.trading >"$tmp_dir/trading-dockerfile.txt"
 printf '%s\n' rust_hft/docs/README.md >"$tmp_dir/rust-docs.txt"
 printf '%s\n' rust_hft/research-core/README.md >"$tmp_dir/package-readme.txt"
@@ -94,12 +96,14 @@ assert_security_jobs() {
 
 job_cases=(
   'collector|pull_request|collector.txt|ci/rust,ci/polymarket-evidence-compiler-image'
-  'pinned-aliyun|pull_request|pinned-aliyun.txt|ploy/integration-regressions,ci/rust'
-  'pinned-aliyun-push|push|pinned-aliyun.txt|ploy/integration-regressions,ci/rust'
-  'future-aliyun-pin|pull_request|future-aliyun-pin.txt|'
+  'pinned-aliyun|pull_request|pinned-aliyun.txt|ci/market-recorder-contract,ploy/integration-regressions,ci/rust,ploy/safety-scans'
+  'pinned-aliyun-push|push|pinned-aliyun.txt|ci/market-recorder-contract,ploy/integration-regressions,ci/rust,ploy/safety-scans'
+  'future-aliyun-pin|pull_request|future-aliyun-pin.txt|ploy/safety-scans'
   'future-aliyun-markdown-pin|pull_request|future-aliyun-markdown-pin.txt|'
-  'lob-control|pull_request|lob-control.txt|'
-  'market-recorder-control|pull_request|market-recorder-control.txt|ci/market-recorder-contract'
+  'lob-control|pull_request|lob-control.txt|ploy/safety-scans'
+  'market-recorder-control|pull_request|market-recorder-control.txt|ci/market-recorder-contract,ploy/safety-scans'
+  'market-recorder-unit|pull_request|market-recorder-unit.txt|ci/market-recorder-contract,ploy/integration-regressions,ci/rust,ploy/safety-scans'
+  'unowned-unit|pull_request|unowned-unit.txt|ploy/safety-scans'
   'evaluator|pull_request|evaluator.txt|ploy/commit-hygiene,ploy/rust-format,ploy/safety-scans,ploy/rust-research-heavy'
   'shared-prediction|pull_request|shared-prediction.txt|ploy/commit-hygiene,ploy/rust-format,ploy/safety-scans,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
   'prediction-lock|pull_request|prediction-lock.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
@@ -218,9 +222,9 @@ for flag in handoff json ondo focused toolchain; do assert_flag "$live" "$flag" 
 for flag in loop collector control; do assert_flag "$live" "$flag" false; done
 
 control=$(run_case control pull_request control.txt)
-assert_jobs "$control" ''
-assert_flag "$control" control true
-for flag in loop handoff json ondo collector focused toolchain; do assert_flag "$control" "$flag" false; done
+assert_jobs "$control" 'ploy/integration-regressions,ci/rust,ploy/safety-scans'
+for flag in control toolchain; do assert_flag "$control" "$flag" true; done
+for flag in loop handoff json ondo collector focused; do assert_flag "$control" "$flag" false; done
 
 docs="$tmp_dir/docs.out"
 for flag in loop handoff json ondo collector control focused toolchain; do
@@ -291,11 +295,11 @@ grep -Fq 'uses: mozilla-actions/sccache-action@v0.0.10' <<<"$fast_lane_block"
 ! grep -Fq 'shellcheck' <<<"$fast_gates_block"
 grep -Fq 'test-rust-lob-control-plane.sh' <<<"$scope_job_block"
 grep -Fq 'test-rust-lob-recovery-queue.sh' <<<"$scope_job_block"
-grep -Fq 'test-polymarket-raw-ops-control-plane.sh' <<<"$scope_job_block"
+[[ $scope_job_block != *test-polymarket-raw-ops-control-plane.sh* ]]
 grep -Fq 'test-monday-collector-health.sh' <<<"$scope_job_block"
 grep -Fq 'shellcheck' <<<"$scope_job_block"
 grep -Fq 'cargo fmt --check' <<<"$fast_gates_block"
-! grep -Fq 'test-polymarket-raw-ops-control-plane.sh' <<<"$rust_job_block"
+grep -Fq 'test-polymarket-raw-ops-control-plane.sh' <<<"$rust_job_block"
 grep -Fqx '      - name: Test directly changed Rust packages' "$ci_workflow"
 grep -Fq 'cargo test "${args[@]}" --locked' <<<"$rust_job_block"
 
