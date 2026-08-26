@@ -372,6 +372,15 @@ for path in "${paths[@]}"; do
     rust_hft/docs/*|rust_hft/README*|rust_hft/*/README*)
       continue
       ;;
+    rust_hft/scripts/deploy-ecs-tools-collector.sh)
+      collector=true
+      control=true
+      toolchain=true
+      select_job ci/rust-shell-scripts
+      select_job ci/rust
+      select_job ci/polymarket-evidence-compiler-image
+      continue
+      ;;
     rust_hft/scripts/*.sh)
       select_job ci/rust-shell-scripts
       continue

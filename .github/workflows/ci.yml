@@ -157,13 +157,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Check shell syntax
-        run: |
-          for script in rust_hft/scripts/*.sh; do
-            bash -n "$script"
-          done
+        run: find rust_hft/scripts -type f -name '*.sh' -exec bash -n {} \;
 
   rust:
     name: Rust Workspace
@@ -313,7 +310,7 @@ jobs:
   rust_fast_gates:
     name: Rust Fast Gates
     needs: scope
-    if: ${{ contains(needs.scope.outputs.jobs, ',ci/rust,') }}
+    if: ${{ contains(needs.scope.outputs.jobs, ',ci/rust,') || contains(needs.scope.outputs.jobs, ',ci/rust-shell-scripts,') }}
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always

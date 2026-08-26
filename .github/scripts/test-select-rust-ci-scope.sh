@@ -35,7 +35,8 @@ printf '%s\n' deployment/aliyun/bybit-options-archiver.service >"$tmp_dir/unowne
 printf '%s\n' rust_hft/deployment/docker/Dockerfile.trading >"$tmp_dir/trading-dockerfile.txt"
 printf '%s\n' rust_hft/docs/README.md >"$tmp_dir/rust-docs.txt"
 printf '%s\n' rust_hft/research-core/README.md >"$tmp_dir/package-readme.txt"
-printf '%s\n' rust_hft/scripts/local_bitget_futures_test.sh >"$tmp_dir/rust-shell-script.txt"
+printf '%s\n' rust_hft/scripts/clickhouse/run_bitget_dedup.sh >"$tmp_dir/rust-shell-script.txt"
+printf '%s\n' rust_hft/scripts/deploy-ecs-tools-collector.sh >"$tmp_dir/rust-deploy-collector.txt"
 printf '%s\n' \
   .github/scripts/agent-worktree-preflight.sh \
   .github/scripts/test-agent-worktree-preflight.sh >"$tmp_dir/preflight-only.txt"
@@ -123,6 +124,7 @@ job_cases=(
   'rust-docs|pull_request|rust-docs.txt|'
   'package-readme|pull_request|package-readme.txt|'
   'rust-shell-script|pull_request|rust-shell-script.txt|ci/rust-shell-scripts'
+  'rust-deploy-collector|pull_request|rust-deploy-collector.txt|ci/rust-shell-scripts,ci/rust,ci/polymarket-evidence-compiler-image,ploy/safety-scans'
   'docs|pull_request|docs.txt|'
   'unknown-prediction|pull_request|unknown-prediction.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
   'mixed-prediction|pull_request|mixed-prediction.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans,ploy/rust-format,ploy/rust-research-heavy'
@@ -193,6 +195,7 @@ assert_security_jobs "$tmp_dir/root-node.out" 'security/sast-semgrep,security/se
 assert_security_jobs "$tmp_dir/unknown-nested.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
 assert_security_jobs "$tmp_dir/lob-control.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
 assert_security_jobs "$tmp_dir/rust-shell-script.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
+assert_security_jobs "$tmp_dir/rust-deploy-collector.out" "$all_security_jobs"
 assert_security_jobs "$tmp_dir/trading-dockerfile-push.out" 'security/sast-semgrep,security/secret-presence,security/container-scan,security/secret-detection'
 trading_develop="$tmp_dir/trading-dockerfile-develop.out"
 GITHUB_REF=refs/heads/develop "$selector" --event push \
@@ -219,6 +222,10 @@ assert_security_jobs "$security_manual" "$all_security_jobs"
 collector="$tmp_dir/collector.out"
 for flag in loop collector control toolchain; do assert_flag "$collector" "$flag" true; done
 for flag in handoff json ondo focused; do assert_flag "$collector" "$flag" false; done
+
+rust_deploy_collector="$tmp_dir/rust-deploy-collector.out"
+for flag in collector control toolchain; do assert_flag "$rust_deploy_collector" "$flag" true; done
+for flag in loop handoff json ondo focused; do assert_flag "$rust_deploy_collector" "$flag" false; done
 
 live=$(run_case live pull_request live.txt)
 for flag in handoff json ondo focused toolchain; do assert_flag "$live" "$flag" true; done
@@ -272,15 +279,15 @@ scope_job_block=$(job_block scope)
 [ -n "$fast_gates_block" ]
 [ -n "$scope_job_block" ]
 
-# rust_fast_gates must carry the same scope condition as the heavy rust job,
-# checked inside its own block (a file-wide substring match would pass even
-# if the condition were deleted from the fast job and gate enforcement
-# silently bypassed).
-grep -Fq "if: \${{ contains(needs.scope.outputs.jobs, ',ci/rust,') }}" <<<"$fast_gates_block"
+# rust_fast_gates must preserve repository policy checks for both compiled
+# Rust changes and lightweight Rust shell changes.
+grep -Fq "if: \${{ contains(needs.scope.outputs.jobs, ',ci/rust,') || contains(needs.scope.outputs.jobs, ',ci/rust-shell-scripts,') }}" <<<"$fast_gates_block"
 grep -Fq "if: \${{ contains(needs.scope.outputs.jobs, ',ci/rust,') }}" <<<"$rust_job_block"
 grep -Fq "if: \${{ contains(needs.scope.outputs.jobs, ',ci/rust-shell-scripts,') }}" <<<"$rust_shell_scripts_block"
-grep -Fq 'for script in rust_hft/scripts/*.sh; do' <<<"$rust_shell_scripts_block"
-grep -Fq 'bash -n "$script"' <<<"$rust_shell_scripts_block"
+grep -Fq "uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1" <<<"$rust_shell_scripts_block"
+grep -Fq "find rust_hft/scripts -type f -name '*.sh' -exec bash -n {} \\;" <<<"$rust_shell_scripts_block"
+grep -Fq 'Enforce Rust-only research and runtime source' <<<"$fast_gates_block"
+grep -Fq 'Python runtime or package-manager command' <<<"$fast_gates_block"
 
 # sccache must be wired into EACH of the two heavy jobs (per-job presence,
 # not a file-wide count).
