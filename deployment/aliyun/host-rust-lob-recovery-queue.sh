@@ -640,7 +640,7 @@ on_signal() {
 }
 
 drain_market() {
-  local ready_dir running_dir hft_gid
+  local ready_dir running_dir hft_gid drain_status
   local -a running=()
   if ! drain_lock; then
     printf 'another market recovery is active; deferred %s drain\n' "$MARKET"
@@ -673,7 +673,14 @@ drain_market() {
   sync "$QUEUE_MARKET_ROOT"
   CURRENT_RUNNING_DIR=$running_dir
   CURRENT_STEP=recover-upload
-  if ( run_drain_job "$running_dir" ); then
+  set +e
+  (
+    set -Eeuo pipefail
+    run_drain_job "$running_dir"
+  )
+  drain_status=$?
+  set -e
+  if (( drain_status == 0 )); then
     CURRENT_RUNNING_DIR=
     exit 0
   fi

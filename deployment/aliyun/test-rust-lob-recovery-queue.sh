@@ -240,6 +240,9 @@ case "\${1:-}" in
     printf '%s\n' '--upload-only'
     ;;
   --recover-parts-only)
+    if [[ -f $fixture/fail-recover ]]; then
+      exit 1
+    fi
     install -d -m 0750 "\$RECOVERY_BACKUP_DIR"
     jq -n \
       --arg artifact "\$RECOVERY_ARTIFACT_SHA256" \
@@ -334,8 +337,15 @@ assert() {
 }
 
 expect_failure() {
-  local fixture=$1 action=$2 market=$3
-  if run_action "$fixture" "$action" "$market"; then
+  local fixture=$1 action=$2 market=$3 status
+  set +e
+  (
+    set -Eeuo pipefail
+    run_action "$fixture" "$action" "$market"
+  )
+  status=$?
+  set -e
+  if (( status == 0 )); then
     printf 'expected failure: %s %s\n' "$action" "$market" >&2
     exit 1
   fi
@@ -457,6 +467,23 @@ test_failed_job_is_not_retried() {
   run_action "$fixture" drain usdm
   after=$(wc -l <"$fixture/binary.log")
   [[ $before == "$after" ]]
+}
+
+test_recovery_failure_never_starts_upload() {
+  local fixture=$tmp_dir/recover-fail failed_dir job_id evidence_dir
+  setup_fixture "$fixture"
+  printf 'part\n' >"$fixture/data/monday/spool/binance-lob/usdm/part-001.jsonl.part"
+  run_action "$fixture" isolate usdm
+  : >"$fixture/fail-recover"
+  expect_failure "$fixture" drain usdm
+  failed_dir=$(find "$fixture/data/monday/spool/binance-lob-recovery/usdm" -mindepth 1 -maxdepth 1 -type d -name '*.failed' | head -n 1)
+  [[ -n $failed_dir ]] || exit 1
+  job_id=$(jq -r '.job_id' "$failed_dir/job.json")
+  evidence_dir="$fixture/data/monday/evidence/recoveries/lob-queue/$job_id"
+  jq -e '.result == "failed"' "$evidence_dir/result.json" >/dev/null
+  [[ $(grep -c '^usdm --recover-parts-only ' "$fixture/binary.log") == 1 ]]
+  assert failed-recovery-no-upload test \
+    "$(grep -c '^usdm --upload-only ' "$fixture/binary.log" || true)" -eq 0
 }
 
 test_other_market_recovery_defers_without_mutating_job() {
@@ -754,6 +781,7 @@ test_many_incomplete_parts_isolate_without_sigpipe
 test_isolate_preserves_upload_readback
 test_drain_runs_recover_then_upload
 test_drain_uses_queued_immutable_inputs
+test_recovery_failure_never_starts_upload
 test_failed_job_is_not_retried
 test_other_market_recovery_defers_without_mutating_job
 test_invalid_release_env_never_executes_recovery_binary
