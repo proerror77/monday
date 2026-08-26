@@ -38,8 +38,10 @@ WATCHDOG_PROBE_ACTIVE_STATE=
 WATCHDOG_PROBE_RESULT=
 WATCHDOG_PROBE_STATUS=
 WATCHDOG_PROBE_JOURNAL_SHA256=
-readonly HEALTH=/data/monday/spool/polymarket-reference/health.json
-readonly LEGACY_STATE=/data/monday/spool/polymarket-reference/collector-state.json
+readonly REFERENCE_SPOOL=/data/monday/spool/polymarket-reference
+readonly MARKET_SPOOL=/data/monday/spool/polymarket
+readonly HEALTH=$REFERENCE_SPOOL/health.json
+readonly LEGACY_STATE=$REFERENCE_SPOOL/collector-state.json
 readonly LEGACY_COLLECTOR=/opt/monday/bin/polymarket_reference_collector.py
 readonly LEGACY_UPLOADER=/opt/monday/bin/polymarket_market_tape_upload.py
 readonly LEGACY_EXEC="/usr/bin/python3 $LEGACY_COLLECTOR"
@@ -164,6 +166,7 @@ usage() {
     'Usage:' \
     '  polymarket-raw-ops-cutover.sh stage <artifact-directory> <expected-source-revision>' \
     '  polymarket-raw-ops-cutover.sh cutover <candidate-sha256> <receipt.json>' \
+    '  polymarket-raw-ops-cutover.sh readback <cutover-evidence-directory>' \
     '  polymarket-raw-ops-cutover.sh rollback <cutover-evidence-directory>'
 }
 
@@ -1720,6 +1723,229 @@ restore_legacy() (
   printf '%s\n' "$evidence_dir"
 )
 
+production_upload_status() {
+  local spool=$1 dataset=$2 cutover_epoch=$3 status_path status
+  local last_success_at updated_at success_epoch updated_epoch now canonical_sha
+  secure_collector_directory "$spool" || return 1
+  status_path="$spool/upload-status.json"
+  [[ -f $status_path && ! -L $status_path ]] || return 1
+  status=$(jq -ceS --arg dataset "$dataset" '
+    select(type == "object"
+      and (.updated_at | type == "string" and length > 0)
+      and (.last_success_at | type == "string" and length > 0)
+      and (.last_uploaded_object | type == "string"
+        and startswith("oss://")
+        and contains("/venue=polymarket/dataset=" + $dataset + "/"))
+      and .pending_segments == 0
+      and .failed_segments == [] and .last_error == null)
+  ' "$status_path") || return 1
+  last_success_at=$(jq -er '.last_success_at' <<<"$status") || return 1
+  updated_at=$(jq -er '.updated_at' <<<"$status") || return 1
+  success_epoch=$(date -u -d "$last_success_at" +%s) || return 1
+  updated_epoch=$(date -u -d "$updated_at" +%s) || return 1
+  now=$(date -u +%s) || return 1
+  ((success_epoch >= cutover_epoch && success_epoch <= updated_epoch \
+    && updated_epoch <= now)) || return 1
+  canonical_sha=$(printf '%s' "$status" | sha256sum | awk '{print $1}') || return 1
+  jq -cn --argjson status "$status" --arg sha256 "$canonical_sha" '
+    {updated_at:$status.updated_at,last_success_at:$status.last_success_at,
+      last_uploaded_object:$status.last_uploaded_object,
+      pending_segments:$status.pending_segments,
+      canonical_sha256:$sha256}'
+}
+
+post_cutover_oss_triplet() {
+  local worker=$1 upload_env=$2 expected_oss_sha=$3 status=$4 dataset=$5
+  local target=$6 cutover_epoch=$7 uri triplet start_at end_at start_epoch end_epoch
+  uri=$(jq -er '.last_uploaded_object' <<<"$status") || return 1
+  triplet=$("$worker" --oss-triplet-readback-worker "$upload_env" \
+    "$expected_oss_sha" "$uri" "$dataset" "$target") || return 1
+  jq -e --arg uri "$uri" --arg dataset "$dataset" '
+    .uri == $uri and .dataset == $dataset
+    and .canonical == true and .segment_complete == true
+    and (.start_recorded_at | type == "string" and length > 0)
+    and (.end_recorded_at | type == "string" and length > 0)
+  ' <<<"$triplet" >/dev/null || return 1
+  start_at=$(jq -er '.start_recorded_at' <<<"$triplet") || return 1
+  end_at=$(jq -er '.end_recorded_at' <<<"$triplet") || return 1
+  start_epoch=$(date -u -d "$start_at" +%s) || return 1
+  end_epoch=$(date -u -d "$end_at" +%s) || return 1
+  ((start_epoch >= cutover_epoch && end_epoch >= start_epoch)) || return 1
+  printf '%s\n' "$triplet"
+}
+
+READBACK_DOWNLOAD_ROOT=
+cleanup_readback_download_root() {
+  local root=${READBACK_DOWNLOAD_ROOT:-}
+  [[ -n $root ]] || return 0
+  [[ $root == /run/monday/polymarket-readback.* \
+    && -d $root && ! -L $root && $(readlink -f -- "$root") == "$root" ]] \
+    || return 1
+  rm -rf -- "$root"
+  READBACK_DOWNLOAD_ROOT=
+}
+
+verify_post_cutover_runtime() {
+  local candidate_binary=$1 completed_epoch=$2 pid=$3 invocation=$4
+  local pinned_upload_env=$5 timer
+  verify_rust_runtime "$candidate_binary" "$completed_epoch" "$pid" "$invocation" 0 \
+    || return 1
+  unit_enabled "$COLLECTOR_UNIT" || return 1
+  verify_upload_units "$pinned_upload_env" \
+    "$REFERENCE_UPLOAD_EXEC" "$MARKET_UPLOAD_EXEC" || return 1
+  for timer in "$REFERENCE_UPLOAD_TIMER" "$MARKET_UPLOAD_TIMER"; do
+    unit_enabled "$timer" || return 1
+    unit_active "$timer" || return 1
+  done
+  ! systemctl is-failed --quiet "$REFERENCE_UPLOAD_UNIT" || return 1
+  ! systemctl is-failed --quiet "$MARKET_UPLOAD_UNIT" || return 1
+  verify_watchdog_runtime || return 1
+  [[ ! -e $WATCHDOG_SUPPRESS_FILE && ! -L $WATCHDOG_SUPPRESS_FILE ]]
+}
+
+readback_cutover() {
+  local requested=$1 evidence_dir cutover cutover_sha candidate_sha source_revision
+  local bundle_sha manifest_sha archive_sha oss_sha completed_at completed_epoch now
+  local candidate_binary release_manifest pinned_upload_env worker pid invocation
+  local reference_status market_status reference_triplet market_triplet readback_at
+  mountpoint -q /data || die '/data must be a mount point'
+  [[ $requested == /* && -d $requested && ! -L $requested ]] \
+    || die 'readback evidence must be a direct absolute directory'
+  evidence_dir=$(readlink -f -- "$requested")
+  [[ $evidence_dir == "$requested" && $evidence_dir == "$EVIDENCE_ROOT"/* ]] \
+    || die 'readback evidence is outside the canonical cutover evidence root'
+  secure_root_chain "$evidence_dir" || die 'readback evidence directory is not trusted'
+  secure_regular_file "$evidence_dir/cutover.json"
+  secure_regular_file "$evidence_dir/PASSED.sha256"
+  verify_named_marker "$evidence_dir" cutover.json PASSED.sha256 \
+    || die 'cutover success marker does not verify the requested evidence'
+  for marker in PASSED.rollback-pending.sha256 PASSED.invalid.sha256 \
+    PASSED.rolled-back.sha256; do
+    [[ ! -e $evidence_dir/$marker && ! -L $evidence_dir/$marker ]] \
+      || die 'cutover success has been revoked by rollback'
+  done
+  cutover="$evidence_dir/cutover.json"
+  jq -e -s '
+    length == 1 and (.[0] |
+      .schema == "monday.polymarket_cutover.v1"
+      and (.candidate_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+      and (.deployment_source_revision | type == "string"
+        and test("^[a-f0-9]{40,64}$"))
+      and (.deployment_bundle_sha256 | type == "string"
+        and test("^[a-f0-9]{64}$"))
+      and (.release_manifest_sha256 | type == "string"
+        and test("^[a-f0-9]{64}$"))
+      and (.control_archive_sha256 | type == "string"
+        and test("^[a-f0-9]{64}$"))
+      and (.oss_config_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+      and (.completed_at | type == "string" and length > 0)
+      and (.collector.main_pid | type == "number" and floor == . and . > 0)
+      and .collector.restarts == 0
+      and (.collector.invocation_id | type == "string"
+        and test("^[a-f0-9]{32}$"))
+      and .post_start_identity_verified == true
+      and .upload_services_verified == true
+      and .upload_timers_verified == true
+      and .watchdog_verified == true)
+  ' "$cutover" >/dev/null || die 'cutover evidence has no complete runtime identity'
+  candidate_sha=$(jq -er '.candidate_sha256' "$cutover")
+  source_revision=$(jq -er '.deployment_source_revision' "$cutover")
+  bundle_sha=$(jq -er '.deployment_bundle_sha256' "$cutover")
+  manifest_sha=$(jq -er '.release_manifest_sha256' "$cutover")
+  archive_sha=$(jq -er '.control_archive_sha256' "$cutover")
+  oss_sha=$(jq -er '.oss_config_sha256' "$cutover")
+  completed_at=$(jq -er '.completed_at' "$cutover")
+  completed_epoch=$(date -u -d "$completed_at" +%s) \
+    || die 'cutover completion timestamp is invalid'
+  now=$(date -u +%s)
+  ((completed_epoch <= now)) || die 'cutover completion timestamp is in the future'
+  pid=$(jq -er '.collector.main_pid | tostring' "$cutover")
+  invocation=$(jq -er '.collector.invocation_id' "$cutover")
+  candidate_binary="$RELEASE_ROOT/$candidate_sha/polymarket-raw-ops"
+  release_manifest="$CONTROL_DIR/${RELEASE_MANIFEST##*/}"
+  pinned_upload_env="$RELEASE_ROOT/$candidate_sha/polymarket-upload-env-$oss_sha.env"
+  worker="$CONTROL_DIR/polymarket-raw-ops-shadow-gate.sh"
+  [[ $(readlink -f -- "$0") == "$CONTROL_DIR/polymarket-raw-ops-cutover.sh" ]] \
+    || die 'readback must use the installed cutover controller'
+  secure_release_directory "${candidate_binary%/*}" \
+    || die 'active candidate release directory is not trusted'
+  secure_regular_file "$candidate_binary"; [[ -x $candidate_binary ]] \
+    || die 'active candidate release is not executable'
+  secure_regular_file "$pinned_upload_env"
+  secure_regular_file "$worker"; [[ -x $worker ]] \
+    || die 'installed OSS readback worker is not executable'
+  [[ $(oss_config_sha256 "$pinned_upload_env") == "$oss_sha" ]] \
+    || die 'pinned OSS configuration differs from cutover evidence'
+  verify_release_binding "$release_manifest" "$manifest_sha" "$candidate_sha" \
+    "$source_revision" "$bundle_sha" "$archive_sha" "$candidate_binary" \
+    "$CONTROL_DIR" || die 'installed release identity differs from cutover evidence'
+  verify_control_release "$CONTROL_DIR" "$candidate_sha" "$candidate_binary" \
+    || die 'installed control identity differs from cutover evidence'
+  verify_post_cutover_runtime "$candidate_binary" "$completed_epoch" "$pid" \
+    "$invocation" "$pinned_upload_env" \
+    || die 'production runtime or delivery controls differ from the exact cutover'
+
+  reference_status=$(production_upload_status "$REFERENCE_SPOOL" \
+    crypto_expiry_reference "$completed_epoch") \
+    || die 'reference uploader has no clean post-cutover success'
+  market_status=$(production_upload_status "$MARKET_SPOOL" \
+    crypto_expiry "$completed_epoch") \
+    || die 'market uploader has no clean post-cutover success'
+  READBACK_DOWNLOAD_ROOT=$(mktemp -d /run/monday/polymarket-readback.XXXXXX)
+  chmod 0700 "$READBACK_DOWNLOAD_ROOT"
+  secure_root_chain "$READBACK_DOWNLOAD_ROOT" \
+    || die 'readback download directory is not trusted'
+  trap cleanup_readback_download_root EXIT
+  reference_triplet=$(post_cutover_oss_triplet "$worker" "$pinned_upload_env" \
+    "$oss_sha" "$reference_status" crypto_expiry_reference \
+    "$READBACK_DOWNLOAD_ROOT/reference" "$completed_epoch") \
+    || die 'reference production OSS triplet is not post-cutover complete'
+  market_triplet=$(post_cutover_oss_triplet "$worker" "$pinned_upload_env" \
+    "$oss_sha" "$market_status" crypto_expiry \
+    "$READBACK_DOWNLOAD_ROOT/market" "$completed_epoch") \
+    || die 'market production OSS triplet is not post-cutover complete'
+  cleanup_readback_download_root || die 'could not remove readback downloads'
+  trap - EXIT
+
+  verify_named_marker "$evidence_dir" cutover.json PASSED.sha256 \
+    || die 'cutover evidence changed during readback'
+  for marker in PASSED.rollback-pending.sha256 PASSED.invalid.sha256 \
+    PASSED.rolled-back.sha256; do
+    [[ ! -e $evidence_dir/$marker && ! -L $evidence_dir/$marker ]] \
+      || die 'cutover success was revoked during readback'
+  done
+  verify_post_cutover_runtime "$candidate_binary" "$completed_epoch" "$pid" \
+    "$invocation" "$pinned_upload_env" \
+    || die 'production runtime or delivery controls changed during readback'
+  verify_release_binding "$release_manifest" "$manifest_sha" "$candidate_sha" \
+    "$source_revision" "$bundle_sha" "$archive_sha" "$candidate_binary" \
+    "$CONTROL_DIR" || die 'release identity changed during readback'
+  [[ $(oss_config_sha256 "$pinned_upload_env") == "$oss_sha" ]] \
+    || die 'pinned OSS configuration changed during readback'
+  cutover_sha=$(sha256sum "$cutover" | awk '{print $1}')
+  readback_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  jq -S -n --arg cutover_sha256 "$cutover_sha" \
+    --arg candidate_sha256 "$candidate_sha" --arg source_revision "$source_revision" \
+    --arg release_manifest_sha256 "$manifest_sha" \
+    --arg deployment_bundle_sha256 "$bundle_sha" \
+    --arg oss_config_sha256 "$oss_sha" --arg completed_at "$completed_at" \
+    --arg readback_at "$readback_at" --argjson main_pid "$pid" \
+    --arg invocation_id "$invocation" --argjson reference "$reference_status" \
+    --argjson reference_triplet "$reference_triplet" \
+    --argjson market "$market_status" --argjson market_triplet "$market_triplet" '
+    {schema:"monday.polymarket_post_cutover_readback.v1",result:"active_complete",
+      cutover_sha256:$cutover_sha256,candidate_sha256:$candidate_sha256,
+      source_revision:$source_revision,
+      release_manifest_sha256:$release_manifest_sha256,
+      deployment_bundle_sha256:$deployment_bundle_sha256,
+      oss_config_sha256:$oss_config_sha256,cutover_completed_at:$completed_at,
+      collector:{main_pid:$main_pid,restarts:0,invocation_id:$invocation_id},
+      reference:{upload_status:$reference,oss_triplet:$reference_triplet},
+      market:{upload_status:$market,oss_triplet:$market_triplet},
+      runtime_identity_verified:true,upload_units_verified:true,
+      watchdog_verified:true,oss_triplets_verified:true,readback_at:$readback_at}'
+}
+
 [[ ${EUID} -eq 0 ]] || die 'must run as root'
 for command in awk chmod chown cmp date dirname flock grep install journalctl jq ln mkdir mktemp mountpoint \
   mv readlink rm sed seq sha256sum sleep sort stat sync systemctl tar tr wc; do
@@ -1734,6 +1960,12 @@ case "$mode" in
     }
     ;;
   rollback)
+    [[ $# -eq 2 ]] || {
+      usage >&2
+      exit 2
+    }
+    ;;
+  readback)
     [[ $# -eq 2 ]] || {
       usage >&2
       exit 2
@@ -1786,6 +2018,11 @@ install -d -m 0755 /run/monday
 secure_root_chain /run/monday || die 'runtime control directory is not trusted'
 exec 9>"$LOCK_FILE"
 flock -n 9 || die 'another Polymarket release operation is running'
+
+if [[ $mode == readback ]]; then
+  readback_cutover "$2"
+  exit
+fi
 
 if [[ $mode == rollback ]]; then
   [[ -d $2 && ! -L $2 ]] || die 'rollback evidence must be a direct directory'
