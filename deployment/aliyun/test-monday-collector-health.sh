@@ -91,6 +91,7 @@ run_health() {
     MONDAY_COLLECTOR_STATE_DIR="${MONDAY_COLLECTOR_STATE_DIR:-$state_dir}" \
     MONDAY_COLLECTOR_HEALTH_TEST_MODE=1 \
     MONDAY_COLLECTOR_HEALTH_TEST_ROOT="$test_root" \
+    MONDAY_COLLECTOR_HEALTH_TEST_HFT_GID="${STUB_HFT_GID:-$(id -g)}" \
     PATH="$stub_dir:$PATH" \
     "$health_script" "$@" >"$out_file" 2>"$err_file"
   rc=$?
@@ -110,6 +111,7 @@ reset_env() {
   STUB_FLOCK_HELD=0
   STUB_FLOCK_ERROR=0
   STUB_LOCK_APPEAR=0
+  STUB_HFT_GID=$(id -g)
   unset MONDAY_COLLECTOR_STATE_DIR
 }
 
@@ -204,6 +206,19 @@ write_upload_ms() {
 EOF
 }
 
+make_recovery_queue_root() {
+  mkdir -p "$spool_root/binance-lob-recovery"
+  chgrp "$(id -g)" "$spool_root/binance-lob-recovery"
+  chmod 0750 "$spool_root/binance-lob-recovery"
+}
+
+make_recovery_queue() {
+  make_recovery_queue_root
+  mkdir -p "$spool_root/binance-lob-recovery/$1"
+  chgrp "$(id -g)" "$spool_root/binance-lob-recovery/$1"
+  chmod 0750 "$spool_root/binance-lob-recovery/$1"
+}
+
 write_recovery_job() {
   # $1 market, $2 job id, $3 state (ready|running|failed)
   market=$1
@@ -212,6 +227,7 @@ write_recovery_job() {
   job_dir="$spool_root/binance-lob-recovery/$market/$job_id.$state"
   hash64=$(printf '%064d' 0)
   source_revision=$(printf '%040d' 0)
+  make_recovery_queue "$market"
   mkdir -p "$job_dir"
   jq -n \
     --arg schema monday.rust_lob_recovery_queue.v1 \
@@ -231,6 +247,25 @@ write_recovery_job() {
       deployment_source_revision:$deployment_source_revision,
       env_sha256:$env_sha256,release_env:"recovery.env"}' \
     >"$job_dir/job.json"
+}
+
+write_isolation_marker() {
+  # $1 market, $2 job id; the matching ready receipt must already exist.
+  market=$1
+  job_id=$2
+  queue_dir="$spool_root/binance-lob-recovery/$market"
+  ready_dir="$queue_dir/$job_id.ready"
+  receipt_sha256=$(sha256sum "$ready_dir/job.json" | awk '{print $1}')
+  jq -n \
+    --arg schema monday.rust_lob_recovery_isolation.v1 \
+    --arg job_id "$job_id" \
+    --arg market "$market" \
+    --arg canonical_spool "$spool_root/binance-lob/$market" \
+    --arg ready_dir "$ready_dir" \
+    --arg receipt_sha256 "$receipt_sha256" \
+    '{schema:$schema,job_id:$job_id,market:$market,
+      canonical_spool:$canonical_spool,ready_dir:$ready_dir,
+      receipt_sha256:$receipt_sha256}' >"$queue_dir/isolation.json"
 }
 
 healthy_fixtures() {
@@ -1303,6 +1338,7 @@ reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
+make_recovery_queue spot
 mkdir -p "$spool_root/binance-lob-recovery/spot/missing.ready"
 run_health --json
 expect "recovery queue missing receipt: exit 1" "$(rc_is 1; echo $?)"
@@ -1349,6 +1385,41 @@ reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
+isolation_job=20260826T000001Z-spot-000000000000-1
+write_recovery_job spot "$isolation_job" ready
+write_isolation_marker spot "$isolation_job"
+run_health --json
+expect "recovery queue active isolation: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue active isolation: bound marker" "$(json_query '
+  .checks.recovery_queue.spot.isolation_active == true and
+  .checks.recovery_queue.spot.isolation_valid == true and
+  (.checks.recovery_queue.spot.isolation_age_seconds | type) == "number"
+'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+isolation_job=20260826T000001Z-usdm-000000000000-2
+write_recovery_job usdm "$isolation_job" ready
+write_isolation_marker usdm "$isolation_job"
+jq '.receipt_sha256 = ("f" * 64)' \
+  "$spool_root/binance-lob-recovery/usdm/isolation.json" \
+  >"$spool_root/binance-lob-recovery/usdm/isolation.json.tmp"
+mv "$spool_root/binance-lob-recovery/usdm/isolation.json.tmp" \
+  "$spool_root/binance-lob-recovery/usdm/isolation.json"
+run_health --json
+expect "recovery queue drifted isolation: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue drifted isolation: malformed marker" "$(json_query '
+  .checks.recovery_queue.usdm.isolation_active == true and
+  .checks.recovery_queue.usdm.isolation_valid == false
+'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+make_recovery_queue spot
 mkdir -p "$spool_root/binance-lob-recovery/spot/legacy-unreceipted/legacy-job"
 run_health --json
 expect "recovery queue legacy containment: exit 1" "$(rc_is 1; echo $?)"
@@ -1360,6 +1431,7 @@ reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
+make_recovery_queue spot
 mkdir -p "$spool_root/binance-lob-recovery/spot/legacy-unreceipted"
 chmod 0770 "$spool_root/binance-lob-recovery/spot/legacy-unreceipted"
 run_health
@@ -1370,7 +1442,7 @@ reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
-mkdir -p "$spool_root/binance-lob-recovery"
+make_recovery_queue_root
 chmod 0770 "$spool_root/binance-lob-recovery"
 run_health
 expect "recovery queue writable root: exit 1" "$(rc_is 1; echo $?)"
@@ -1380,11 +1452,31 @@ reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
-mkdir -p "$spool_root/binance-lob-recovery/spot"
+make_recovery_queue spot
 chmod 0770 "$spool_root/binance-lob-recovery/spot"
 run_health
 expect "recovery queue writable market: exit 1" "$(rc_is 1; echo $?)"
 expect "recovery queue writable market: breach" "$(grep_out '^breach: binance-lob-recovery\[spot\]: recovery queue root is not an inspectable directory'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+make_recovery_queue spot
+chmod 0740 "$spool_root/binance-lob-recovery/spot"
+run_health
+expect "recovery queue untraversable market: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue untraversable market: breach" "$(grep_out '^breach: binance-lob-recovery\[spot\]: recovery queue root is not an inspectable directory'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+STUB_HFT_GID=99999
+make_recovery_queue_root
+run_health
+expect "recovery queue wrong collector group: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue wrong collector group: breach" "$(grep_out '^breach: binance-lob-recovery: recovery queue root is not an inspectable directory'; echo $?)"
 
 reset_env
 reset_state
@@ -1414,7 +1506,7 @@ reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
-mkdir -p "$spool_root/binance-lob-recovery"
+make_recovery_queue_root
 ln -s "$spool_root/binance-lob/spot" "$spool_root/binance-lob-recovery/spot"
 run_health
 expect "recovery queue scan failure: exit 1" "$(rc_is 1; echo $?)"
