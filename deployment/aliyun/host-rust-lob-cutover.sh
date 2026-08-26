@@ -1822,6 +1822,14 @@ done
 systemctl mask --runtime "${TRANSITION_MASK_UNITS[@]}" >/dev/null
 canonical_spool_paths_safe || fail 'canonical spool path changed during production stop'
 
+STEP=clear-previous-controller-override
+if [[ -n $OLD_CONTROLLER_RELEASE ]]; then
+  CONTROLLER_SWITCHED=1
+  rm -f -- "$ACTIVE_CONTROLLER_LINK"
+  [[ ! -e $ACTIVE_CONTROLLER_LINK && ! -L $ACTIVE_CONTROLLER_LINK ]] \
+    || fail 'could not clear the previous controller override'
+fi
+
 STEP=stage-candidate-recovery-assets
 validate_deployment "$CANDIDATE_DEPLOYMENT" true
 install_recovery_deployment "$CANDIDATE_DEPLOYMENT"
@@ -1888,14 +1896,6 @@ health_ready_for_release spot 1000 "$OLD_SESSION_SPOT" "$CANDIDATE_STARTED_NS" \
 health_ready_for_release usdm 100 "$OLD_SESSION_USDM" "$CANDIDATE_STARTED_NS" \
   || fail 'USD-M health changed while enabling production'
 systemctl unmask --runtime "${UPLOAD_UNITS[@]}" >/dev/null
-
-STEP=clear-previous-controller-override
-if [[ -n $OLD_CONTROLLER_RELEASE ]]; then
-  CONTROLLER_SWITCHED=1
-  rm -f -- "$ACTIVE_CONTROLLER_LINK"
-  [[ ! -e $ACTIVE_CONTROLLER_LINK && ! -L $ACTIVE_CONTROLLER_LINK ]] \
-    || fail 'could not clear the previous controller override'
-fi
 
 STEP=enable-recovery-scheduler
 enable_candidate_recovery_scheduler \
