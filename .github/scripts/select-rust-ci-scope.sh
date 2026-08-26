@@ -75,7 +75,7 @@ select_security_scope() {
   done
 
   case ",$jobs," in
-    *",ci/rust,"*|*",ci/polymarket-evidence-compiler-image,"*|*",ci/rust-hft-engine-fast-lane,"*|\
+    *",ci/rust,"*|*",ci/market-recorder-contract,"*|*",ci/polymarket-evidence-compiler-image,"*|*",ci/rust-hft-engine-fast-lane,"*|\
     *",ploy/research-image-"*|*",ploy/rust-"*|*",ploy/audit,"*|*",ploy/integration-regressions,"*)
       rust_relevant=true
       ;;
@@ -98,6 +98,7 @@ select_security_scope() {
 
 select_all_ci_jobs() {
   select_job ci/rust
+  select_job ci/market-recorder-contract
   select_job ci/deployment-artifacts
   select_job ci/polymarket-evidence-compiler-image
   select_job ci/rust-hft-engine-fast-lane
@@ -106,6 +107,7 @@ select_all_ci_jobs() {
 
 select_all_rust_ci_jobs() {
   select_job ci/rust
+  select_job ci/market-recorder-contract
   select_job ci/deployment-artifacts
   select_job ci/polymarket-evidence-compiler-image
   select_job ci/rust-hft-engine-fast-lane
@@ -322,10 +324,45 @@ for path in "${paths[@]}"; do
       [[ $path == deployment/aliyun/research/* ]] && research_image_relevant=true
       continue
       ;;
-    deployment/aliyun/*)
+    deployment/aliyun/polymarket-market-recorder-deploy.sh|\
+    deployment/aliyun/test-polymarket-market-recorder-release.sh)
+      control=true
+      select_job ci/market-recorder-contract
+      ;;
+    deployment/aliyun/polymarket-market-tape.toml|\
+    deployment/aliyun/polymarket-market-tape.service)
+      control=true
+      toolchain=true
+      select_job ci/market-recorder-contract
+      select_job ploy/integration-regressions
+      select_job ci/rust
+      ;;
+    deployment/aliyun/polymarket-reference-collector.service|\
+    deployment/aliyun/polymarket-reference-collector-shadow@.service|\
+    deployment/aliyun/polymarket-market-tape-upload.service|\
+    deployment/aliyun/polymarket-reference-upload.service)
       control=true
       toolchain=true
       select_job ploy/integration-regressions
+      select_job ci/rust
+      ;;
+    deployment/aliyun/polymarket-raw-ops-*|\
+    deployment/aliyun/test-polymarket-raw-ops-*|\
+    deployment/aliyun/polymarket-shadow-gate-policy.jq|\
+    deployment/aliyun/polymarket-legacy-health-policy.jq|\
+    deployment/aliyun/polymarket-rust-health-policy.jq|\
+    deployment/aliyun/polymarket-market-tape-upload-watchdog.sh|\
+    deployment/aliyun/polymarket-market-tape-upload-watchdog.timer)
+      control=true
+      toolchain=true
+      select_job ploy/integration-regressions
+      select_job ci/rust
+      ;;
+    deployment/aliyun/*.md)
+      continue
+      ;;
+    deployment/aliyun/*)
+      control=true
       [[ $path == deployment/aliyun/research/* ]] && research_image_relevant=true
       ;;
     docs/*|*.md|LICENSE*)
@@ -346,6 +383,8 @@ for path in "${paths[@]}"; do
       ;;
   esac
 done
+
+[[ $control == true ]] && select_job ploy/safety-scans
 
 if [[ $needs_metadata == false ]]; then
   [[ $toolchain == true ]] && select_job ci/rust
