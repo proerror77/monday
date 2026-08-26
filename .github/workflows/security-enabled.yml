@@ -1,6 +1,7 @@
 name: Security & Quality (ENABLED)
 
 on:
+  workflow_dispatch:
   schedule:
     # Weekly security audit
     - cron: '0 2 * * 1'
