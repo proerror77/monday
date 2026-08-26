@@ -12,10 +12,11 @@
 #   4. failure_count not growing, last_error empty (all lanes)
 #   5. /data disk: free <= 25% warns, free <= 15% (used >= 85%) breaches
 #   6. polymarket upload timers must be active while their collector is active
+#   7. /data must be mounted
 # plus the raw-ops Gate containment contract (static template with no active
 # instance, running lock, or residual environment) and state-persistence
 # failures. Everything else (units, timers, restarts,
-# health.json, delay-gate journal, disk warning band, mount, fee snapshot
+# health.json, delay-gate journal, disk warning band, fee snapshot
 # journal) is a warning: reported, never blocking ok:true.
 #
 # Usage: ./test-monday-collector-health.sh
@@ -201,6 +202,35 @@ write_upload_ms() {
   cat > "$1" <<EOF
 {"last_success_at": $success_ms, "last_error_at": $2, "last_error": $3, "failure_count": $4}
 EOF
+}
+
+write_recovery_job() {
+  # $1 market, $2 job id, $3 state (ready|running|failed)
+  market=$1
+  job_id=$2
+  state=$3
+  job_dir="$spool_root/binance-lob-recovery/$market/$job_id.$state"
+  hash64=$(printf '%064d' 0)
+  source_revision=$(printf '%040d' 0)
+  mkdir -p "$job_dir"
+  jq -n \
+    --arg schema monday.rust_lob_recovery_queue.v1 \
+    --arg market "$market" \
+    --arg job_id "$job_id" \
+    --arg queued_at 2026-08-26T00:00:00Z \
+    --arg canonical_spool "$spool_root/binance-lob/$market" \
+    --arg recovery_unit "binance-lob-archiver-recovery@$market.service" \
+    --arg release_sha256 "$hash64" \
+    --arg deployment_bundle_sha256 "$hash64" \
+    --arg deployment_source_revision "$source_revision" \
+    --arg env_sha256 "$hash64" \
+    '{schema:$schema,market:$market,job_id:$job_id,queued_at:$queued_at,
+      canonical_spool:$canonical_spool,recovery_unit:$recovery_unit,
+      release_sha256:$release_sha256,
+      deployment_bundle_sha256:$deployment_bundle_sha256,
+      deployment_source_revision:$deployment_source_revision,
+      env_sha256:$env_sha256,release_env:"recovery.env"}' \
+    >"$job_dir/job.json"
 }
 
 healthy_fixtures() {
@@ -896,7 +926,7 @@ expect "fee snapshot failure: exit 0" "$(rc_is 0; echo $?)"
 expect "fee snapshot failure: warning message" "$(grep_out '^warning: .*recent snapshot failure'; echo $?)"
 
 # ---------------------------------------------------------------------------
-# 17. Demoted: /data unmounted is a warning
+# 17. /data unmounted is a breach
 # ---------------------------------------------------------------------------
 reset_env
 reset_state
@@ -904,8 +934,8 @@ healthy_scenario
 healthy_fixtures
 STUB_MOUNTED=0
 run_health
-expect "mount: exit 0" "$(rc_is 0; echo $?)"
-expect "mount: warning message" "$(grep_out '^warning: mount: /data is not mounted'; echo $?)"
+expect "mount: exit 1" "$(rc_is 1; echo $?)"
+expect "mount: breach message" "$(grep_out '^breach: mount: /data is not mounted'; echo $?)"
 
 # ---------------------------------------------------------------------------
 # 18. State persistence failure stays a breach (gate 4 delta evidence)
@@ -1215,30 +1245,35 @@ expect "recovery queue empty: json zero counts" "$(json_query '
   .checks.recovery_queue.spot.ready_count == 0 and
   .checks.recovery_queue.spot.running_count == 0 and
   .checks.recovery_queue.spot.failed_count == 0 and
+  .checks.recovery_queue.spot.malformed_count == 0 and
+  .checks.recovery_queue.spot.legacy_unreceipted_count == 0 and
   .checks.recovery_queue.usdm.ready_count == 0 and
   .checks.recovery_queue.usdm.running_count == 0 and
-  .checks.recovery_queue.usdm.failed_count == 0
+  .checks.recovery_queue.usdm.failed_count == 0 and
+  .checks.recovery_queue.usdm.malformed_count == 0 and
+  .checks.recovery_queue.usdm.legacy_unreceipted_count == 0
 '; echo $?)"
 
 reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
-mkdir -p "$spool_root/binance-lob-recovery/spot/job.ready"
+write_recovery_job spot job ready
 touch_age "$spool_root/binance-lob-recovery/spot/job.ready" 60
 run_health --json
 expect "recovery queue ready fresh: exit 0" "$(rc_is 0; echo $?)"
 expect "recovery queue ready fresh: json count" "$(json_query '
   .checks.recovery_queue.spot.ready_count == 1 and
   (.checks.recovery_queue.spot.ready_oldest_age_seconds >= 0) and
-  .checks.recovery_queue.spot.failed_count == 0
+  .checks.recovery_queue.spot.failed_count == 0 and
+  .checks.recovery_queue.spot.malformed_count == 0
 '; echo $?)"
 
 reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
-mkdir -p "$spool_root/binance-lob-recovery/spot/job.ready"
+write_recovery_job spot job ready
 touch_age "$spool_root/binance-lob-recovery/spot/job.ready" 1900
 run_health
 expect "recovery queue ready stale: exit 1" "$(rc_is 1; echo $?)"
@@ -1248,7 +1283,7 @@ reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
-mkdir -p "$spool_root/binance-lob-recovery/usdm/job.running"
+write_recovery_job usdm job running
 touch_age "$spool_root/binance-lob-recovery/usdm/job.running" 7300
 run_health
 expect "recovery queue running stale: exit 1" "$(rc_is 1; echo $?)"
@@ -1258,11 +1293,122 @@ reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
-mkdir -p "$spool_root/binance-lob-recovery/usdm/job.failed"
+write_recovery_job usdm job failed
 touch_age "$spool_root/binance-lob-recovery/usdm/job.failed" 30
 run_health
 expect "recovery queue failed present: exit 1" "$(rc_is 1; echo $?)"
 expect "recovery queue failed present: breach" "$(grep_out '^breach: binance-lob-recovery\[usdm\]: failed recovery job(s) present'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+mkdir -p "$spool_root/binance-lob-recovery/spot/missing.ready"
+run_health --json
+expect "recovery queue missing receipt: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue missing receipt: malformed count" "$(json_query '
+  .checks.recovery_queue.spot.ready_count == 1 and
+  .checks.recovery_queue.spot.malformed_count == 1
+'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+write_recovery_job usdm mismatch ready
+jq '.canonical_spool = "/wrong"' \
+  "$spool_root/binance-lob-recovery/usdm/mismatch.ready/job.json" \
+  >"$spool_root/binance-lob-recovery/usdm/mismatch.ready/job.json.tmp"
+mv "$spool_root/binance-lob-recovery/usdm/mismatch.ready/job.json.tmp" \
+  "$spool_root/binance-lob-recovery/usdm/mismatch.ready/job.json"
+run_health --json
+expect "recovery queue mismatched receipt: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue mismatched receipt: malformed count" "$(json_query '
+  .checks.recovery_queue.usdm.ready_count == 1 and
+  .checks.recovery_queue.usdm.malformed_count == 1
+'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+write_recovery_job spot missing-hash ready
+jq 'del(.release_sha256)' \
+  "$spool_root/binance-lob-recovery/spot/missing-hash.ready/job.json" \
+  >"$spool_root/binance-lob-recovery/spot/missing-hash.ready/job.json.tmp"
+mv "$spool_root/binance-lob-recovery/spot/missing-hash.ready/job.json.tmp" \
+  "$spool_root/binance-lob-recovery/spot/missing-hash.ready/job.json"
+run_health --json
+expect "recovery queue missing hash receipt: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue missing hash receipt: malformed count" "$(json_query '
+  .checks.recovery_queue.spot.ready_count == 1 and
+  .checks.recovery_queue.spot.malformed_count == 1
+'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+mkdir -p "$spool_root/binance-lob-recovery/spot/legacy-unreceipted/legacy-job"
+run_health --json
+expect "recovery queue legacy containment: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue legacy containment: count" "$(json_query '
+  .checks.recovery_queue.spot.legacy_unreceipted_count == 1
+'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+mkdir -p "$spool_root/binance-lob-recovery/spot/legacy-unreceipted"
+chmod 0770 "$spool_root/binance-lob-recovery/spot/legacy-unreceipted"
+run_health
+expect "recovery queue writable legacy containment: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue writable legacy containment: breach" "$(grep_out '^breach: binance-lob-recovery\[spot\]: legacy-unreceipted is not an inspectable root-owned directory'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+mkdir -p "$spool_root/binance-lob-recovery"
+chmod 0770 "$spool_root/binance-lob-recovery"
+run_health
+expect "recovery queue writable root: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue writable root: breach" "$(grep_out '^breach: binance-lob-recovery: recovery queue root is not an inspectable directory'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+mkdir -p "$spool_root/binance-lob-recovery/spot"
+chmod 0770 "$spool_root/binance-lob-recovery/spot"
+run_health
+expect "recovery queue writable market: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue writable market: breach" "$(grep_out '^breach: binance-lob-recovery\[spot\]: recovery queue root is not an inspectable directory'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+write_recovery_job spot writable-dir ready
+chmod 0770 "$spool_root/binance-lob-recovery/spot/writable-dir.ready"
+run_health --json
+expect "recovery queue writable job dir: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue writable job dir: malformed" "$(json_query '
+  .checks.recovery_queue.spot.malformed_count == 1
+'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+write_recovery_job spot writable-receipt ready
+chmod 0660 "$spool_root/binance-lob-recovery/spot/writable-receipt.ready/job.json"
+run_health --json
+expect "recovery queue writable receipt: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue writable receipt: malformed" "$(json_query '
+  .checks.recovery_queue.spot.malformed_count == 1
+'; echo $?)"
 
 reset_env
 reset_state

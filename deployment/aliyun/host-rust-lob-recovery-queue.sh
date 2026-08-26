@@ -139,6 +139,7 @@ ensure_queue_directory() {
 market_paths() {
   CANONICAL_SPOOL="$CANONICAL_ROOT/$MARKET"
   QUEUE_MARKET_ROOT="$QUEUE_ROOT/$MARKET"
+  ISOLATION_MARKER="$QUEUE_MARKET_ROOT/isolation.json"
   ENV_FILE="$CONFIG_ROOT/binance-lob-archiver-production-$MARKET.env"
 }
 
@@ -272,59 +273,158 @@ job_dir_id() {
   esac
 }
 
-job_receipt_valid_for_canonical() {
-  local queue_dir=$1 expected_id
-  expected_id=$(job_dir_id "$queue_dir") || return 1
-  [[ -f $queue_dir/job.json && ! -L $queue_dir/job.json ]] || return 1
-  jq -e \
-    --arg schema monday.rust_lob_recovery_queue.v1 \
+write_isolation_marker() {
+  local job_id=$1 receipt_sha256=$2 ready_dir tmp
+  ready_dir="$QUEUE_MARKET_ROOT/$job_id.ready"
+  tmp="$QUEUE_MARKET_ROOT/.isolation.json.tmp.$$"
+  [[ ! -e $ISOLATION_MARKER && ! -L $ISOLATION_MARKER ]] \
+    || fail "an isolation transaction is already active: $ISOLATION_MARKER"
+  [[ ! -e $tmp && ! -L $tmp ]] || fail "refusing to reuse isolation marker temp path: $tmp"
+  jq -n \
+    --arg schema monday.rust_lob_recovery_isolation.v1 \
+    --arg job_id "$job_id" \
     --arg market "$MARKET" \
-    --arg canonical "$CANONICAL_SPOOL" \
-    --arg expected_id "$expected_id" \
-    --arg release_env recovery.env \
-    --arg recovery_unit "$RECOVERY_SERVICE@$MARKET.service" \
-    '.schema == $schema
-      and .market == $market
-      and .canonical_spool == $canonical
-      and .job_id == $expected_id
-      and .release_env == $release_env
-      and .recovery_unit == $recovery_unit
-      and (.release_sha256 | test("^[a-f0-9]{64}$"))
-      and (.deployment_bundle_sha256 | test("^[a-f0-9]{64}$"))
-      and (.deployment_source_revision | test("^[a-f0-9]{40,64}$"))
-      and (.env_sha256 | test("^[a-f0-9]{64}$"))' \
-    "$queue_dir/job.json" >/dev/null
+    --arg canonical_spool "$CANONICAL_SPOOL" \
+    --arg ready_dir "$ready_dir" \
+    --arg receipt_sha256 "$receipt_sha256" \
+    '{schema:$schema,job_id:$job_id,market:$market,
+      canonical_spool:$canonical_spool,ready_dir:$ready_dir,
+      receipt_sha256:$receipt_sha256}' >"$tmp"
+  chmod 0640 "$tmp"
+  mv -Tf "$tmp" "$ISOLATION_MARKER"
+  secure_regular_file "$ISOLATION_MARKER" 0
+  sync "$ISOLATION_MARKER"
+  sync "$QUEUE_MARKET_ROOT"
 }
 
-recover_missing_canonical_after_partial_isolate() {
-  local hft_uid=$1 hft_gid=$2 queue_dir count=0
-  [[ -e $CANONICAL_SPOOL || -L $CANONICAL_SPOOL ]] && return 1
-  [[ -d $QUEUE_MARKET_ROOT && ! -L $QUEUE_MARKET_ROOT ]] \
-    || fail "canonical spool is missing without a recovery queue: $CANONICAL_SPOOL"
+load_isolation_marker() {
+  secure_regular_file "$ISOLATION_MARKER" 0
+  ISOLATION_JOB_ID=$(jq -er '.job_id' "$ISOLATION_MARKER")
+  ISOLATION_MARKET=$(jq -er '.market' "$ISOLATION_MARKER")
+  ISOLATION_CANONICAL_SPOOL=$(jq -er '.canonical_spool' "$ISOLATION_MARKER")
+  ISOLATION_READY_DIR=$(jq -er '.ready_dir' "$ISOLATION_MARKER")
+  ISOLATION_RECEIPT_SHA256=$(jq -er '.receipt_sha256' "$ISOLATION_MARKER")
+  jq -e '.schema == "monday.rust_lob_recovery_isolation.v1"' \
+    "$ISOLATION_MARKER" >/dev/null \
+    || fail "isolation marker has an invalid schema: $ISOLATION_MARKER"
+  [[ $ISOLATION_JOB_ID =~ ^[0-9]{8}T[0-9]{6}Z-${MARKET}-[a-f0-9]{12}-[0-9]+$ ]] \
+    || fail "isolation marker has an invalid job id: $ISOLATION_MARKER"
+  [[ $ISOLATION_MARKET == "$MARKET" ]] \
+    || fail "isolation marker market mismatch: $ISOLATION_MARKER"
+  [[ $ISOLATION_CANONICAL_SPOOL == "$CANONICAL_SPOOL" ]] \
+    || fail "isolation marker canonical spool mismatch: $ISOLATION_MARKER"
+  [[ $ISOLATION_READY_DIR == "$QUEUE_MARKET_ROOT/$ISOLATION_JOB_ID.ready" ]] \
+    || fail "isolation marker ready path mismatch: $ISOLATION_MARKER"
+  [[ $ISOLATION_RECEIPT_SHA256 =~ ^[a-f0-9]{64}$ ]] \
+    || fail "isolation marker has an invalid receipt digest: $ISOLATION_MARKER"
+}
+
+validate_isolation_receipt() {
+  local spool=$1 actual_sha256
+  load_job "$spool" "$ISOLATION_JOB_ID"
+  [[ $ISOLATION_JOB_ID == *-"${JOB_RELEASE_SHA256:0:12}"-* ]] \
+    || fail "isolation transaction job id does not match its release: $spool/job.json"
+  actual_sha256=$(sha256sum "$spool/job.json" | awk '{print $1}')
+  [[ $actual_sha256 == "$ISOLATION_RECEIPT_SHA256" ]] \
+    || fail "isolation transaction receipt drifted: $spool/job.json"
+}
+
+require_recreated_canonical_spool() {
+  local spool=$1 expected_uid=$2 remaining status
+  status="$spool/upload-status.json"
+  if [[ -e $status || -L $status ]]; then
+    secure_regular_file "$status" "$expected_uid"
+  fi
+  remaining=$(find "$spool" -mindepth 1 -maxdepth 1 \
+    ! -name upload-status.json -print)
+  [[ -z $remaining ]] || {
+    printf '%s\n' "$remaining" >&2
+    return 1
+  }
+}
+
+complete_isolation_transaction() {
+  local hft_uid=$1 hft_gid=$2 spool_lock_held=${3:-0}
+  local prior_upload_status spool_lock queue_unit
+  load_isolation_marker
+  queue_unit="$RECOVERY_SERVICE@$MARKET.service"
+  if [[ -e $ISOLATION_READY_DIR || -L $ISOLATION_READY_DIR ]]; then
+    secure_directory "$ISOLATION_READY_DIR" "$hft_uid" "$hft_gid"
+    validate_isolation_receipt "$ISOLATION_READY_DIR"
+    if [[ -e $CANONICAL_SPOOL || -L $CANONICAL_SPOOL ]]; then
+      secure_directory "$CANONICAL_SPOOL" "$hft_uid" "$hft_gid"
+      require_recreated_canonical_spool "$CANONICAL_SPOOL" "$hft_uid" \
+        || fail "recreated canonical spool drifted: $CANONICAL_SPOOL"
+    else
+      install -d -m 0750 -o "$hft_uid" -g "$hft_gid" -- "$CANONICAL_SPOOL"
+    fi
+  else
+    [[ -e $CANONICAL_SPOOL || -L $CANONICAL_SPOOL ]] \
+      || fail "isolation marker has neither canonical nor ready spool: $ISOLATION_MARKER"
+    secure_directory "$CANONICAL_SPOOL" "$hft_uid" "$hft_gid"
+    validate_isolation_receipt "$CANONICAL_SPOOL"
+    if (( ! spool_lock_held )); then
+      spool_lock="$CANONICAL_SPOOL/.binance-lob-archiver.lock"
+      secure_regular_file "$spool_lock" "$hft_uid"
+      exec 8<>"$spool_lock"
+      flock -n 8 || fail "collector spool lock is already held: $spool_lock"
+      spool_lock_held=1
+    fi
+    mv -T -- "$CANONICAL_SPOOL" "$ISOLATION_READY_DIR"
+    sync "$CANONICAL_ROOT"
+    sync "$QUEUE_MARKET_ROOT"
+    install -d -m 0750 -o "$hft_uid" -g "$hft_gid" -- "$CANONICAL_SPOOL"
+  fi
+  prior_upload_status="$ISOLATION_READY_DIR/upload-status.json"
+  if [[ -f $prior_upload_status && ! -L $prior_upload_status ]]; then
+    install -m 0640 -o "$hft_uid" -g "$hft_gid" -- \
+      "$prior_upload_status" "$CANONICAL_SPOOL/upload-status.json"
+    sync "$CANONICAL_SPOOL/upload-status.json"
+  fi
+  sync "$CANONICAL_SPOOL"
+  sync "$CANONICAL_ROOT"
+  rm -f -- "$ISOLATION_MARKER"
+  sync "$QUEUE_MARKET_ROOT"
+  if (( spool_lock_held )); then
+    flock -u 8
+    exec 8>&-
+  fi
+  flock -u 9
+  exec 9>&-
+  systemctl start --no-block "$queue_unit" >/dev/null 2>&1 || true
+}
+
+recover_single_legacy_isolation() {
+  local hft_uid=$1 hft_gid=$2 queue_dir candidate_count=0 valid_count=0
   while IFS= read -r queue_dir; do
-    if job_receipt_valid_for_canonical "$queue_dir"; then
-      count=$((count + 1))
+    candidate_count=$((candidate_count + 1))
+    if ( load_job "$queue_dir" ) >/dev/null 2>&1; then
+      valid_count=$((valid_count + 1))
     fi
   done < <(find "$QUEUE_MARKET_ROOT" -mindepth 1 -maxdepth 1 -type d \
     \( -name '*.ready' -o -name '*.running' \) -print | sort)
-  (( count == 1 )) \
-    || fail "canonical spool is missing without exactly one valid queued recovery job: $CANONICAL_SPOOL"
+  (( candidate_count == 1 && valid_count == 1 )) \
+    || fail "canonical spool is missing without one exclusive valid legacy recovery job: $CANONICAL_SPOOL"
   install -d -m 0750 -o "$hft_uid" -g "$hft_gid" -- "$CANONICAL_SPOOL"
   sync "$CANONICAL_ROOT"
   flock -u 9
   exec 9>&-
   systemctl start --no-block "$RECOVERY_SERVICE@$MARKET.service" >/dev/null 2>&1 || true
-  return 0
 }
 
 isolate_market() {
-  local hft_uid hft_gid job_id ready_dir queue_unit spool_lock prior_upload_status
+  local hft_uid hft_gid job_id queue_unit spool_lock receipt_sha256
   hft_uid=$(id -u hftcollector)
   hft_gid=$(id -g hftcollector)
   ensure_queue_directory "$QUEUE_ROOT" "$hft_gid"
   ensure_queue_directory "$QUEUE_MARKET_ROOT" "$hft_gid"
+  if [[ -e $ISOLATION_MARKER || -L $ISOLATION_MARKER ]]; then
+    complete_isolation_transaction "$hft_uid" "$hft_gid"
+    exit 0
+  fi
   if [[ ! -e $CANONICAL_SPOOL && ! -L $CANONICAL_SPOOL ]]; then
-    recover_missing_canonical_after_partial_isolate "$hft_uid" "$hft_gid" && exit 0
+    recover_single_legacy_isolation "$hft_uid" "$hft_gid"
+    exit 0
   fi
   secure_directory "$CANONICAL_SPOOL" "$hft_uid" "$hft_gid"
   if ! has_incomplete_parts "$CANONICAL_SPOOL"; then
@@ -337,27 +437,13 @@ isolate_market() {
   same_filesystem "$CANONICAL_ROOT" "$QUEUE_MARKET_ROOT" \
     || fail "queue root must share a filesystem with the canonical spool: $QUEUE_MARKET_ROOT"
   job_id="$(date -u +%Y%m%dT%H%M%SZ)-${MARKET}-${RELEASE_SHA256:0:12}-$$"
-  ready_dir="$QUEUE_MARKET_ROOT/$job_id.ready"
-  [[ ! -e $ready_dir && ! -L $ready_dir ]] || fail "refusing to reuse queued recovery path: $ready_dir"
+  [[ ! -e $QUEUE_MARKET_ROOT/$job_id.ready && ! -L $QUEUE_MARKET_ROOT/$job_id.ready ]] \
+    || fail "refusing to reuse queued recovery path: $QUEUE_MARKET_ROOT/$job_id.ready"
   queue_unit="$RECOVERY_SERVICE@$MARKET.service"
   write_job_receipt "$job_id" "$queue_unit"
-  mv -T -- "$CANONICAL_SPOOL" "$ready_dir"
-  sync "$CANONICAL_ROOT"
-  sync "$QUEUE_MARKET_ROOT"
-  install -d -m 0750 -o "$hft_uid" -g "$hft_gid" -- "$CANONICAL_SPOOL"
-  prior_upload_status="$ready_dir/upload-status.json"
-  if [[ -f $prior_upload_status && ! -L $prior_upload_status ]]; then
-    install -m 0640 -o "$hft_uid" -g "$hft_gid" -- \
-      "$prior_upload_status" "$CANONICAL_SPOOL/upload-status.json"
-    sync "$CANONICAL_SPOOL/upload-status.json"
-  fi
-  sync "$CANONICAL_SPOOL"
-  sync "$CANONICAL_ROOT"
-  flock -u 8
-  exec 8>&-
-  flock -u 9
-  exec 9>&-
-  systemctl start --no-block "$queue_unit" >/dev/null 2>&1 || true
+  receipt_sha256=$(sha256sum "$CANONICAL_SPOOL/job.json" | awk '{print $1}')
+  write_isolation_marker "$job_id" "$receipt_sha256"
+  complete_isolation_transaction "$hft_uid" "$hft_gid" 1
 }
 
 oldest_ready_dir() {
@@ -403,12 +489,18 @@ write_result() {
 }
 
 load_job() {
-  local queue_dir=$1 job_json queue_id job_schema job_env
+  local queue_dir=$1 expected_id=${2:-} job_json queue_id job_schema job_env
   job_json="$queue_dir/job.json"
   secure_regular_file "$job_json" 0
-  queue_id=$(job_dir_id "$queue_dir") || fail "queued job directory has an invalid name: $queue_dir"
+  if [[ -n $expected_id ]]; then
+    queue_id=$expected_id
+  else
+    queue_id=$(job_dir_id "$queue_dir") \
+      || fail "queued job directory has an invalid name: $queue_dir"
+  fi
   job_schema=$(jq -er '.schema' "$job_json")
   JOB_ID=$(jq -er '.job_id' "$job_json")
+  JOB_QUEUED_AT=$(jq -er '.queued_at' "$job_json")
   JOB_MARKET=$(jq -er '.market' "$job_json")
   JOB_CANONICAL_SPOOL=$(jq -er '.canonical_spool' "$job_json")
   JOB_RELEASE_SHA256=$(jq -er '.release_sha256' "$job_json")
@@ -419,6 +511,8 @@ load_job() {
   JOB_RECOVERY_UNIT=$(jq -er '.recovery_unit' "$job_json")
   [[ $job_schema == monday.rust_lob_recovery_queue.v1 ]] || fail "queued job has an invalid schema: $queue_dir"
   [[ $JOB_ID == "$queue_id" ]] || fail "queued job id does not match its directory: $queue_dir"
+  [[ $JOB_QUEUED_AT =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
+    || fail "queued job has an invalid queued timestamp: $queue_dir"
   [[ $JOB_MARKET == "$MARKET" ]] || fail "queued job market mismatch: $queue_dir"
   [[ $JOB_CANONICAL_SPOOL == "$CANONICAL_SPOOL" ]] || fail "queued job canonical spool mismatch: $queue_dir"
   [[ $JOB_RELEASE_SHA256 =~ ^[a-f0-9]{64}$ ]] || fail "queued job has an invalid release sha: $queue_dir"
@@ -573,6 +667,7 @@ drain_market() {
   fi
   ready_dir=$(oldest_ready_dir)
   [[ -n $ready_dir ]] || exit 0
+  load_job "$ready_dir"
   running_dir="${ready_dir%.ready}.running"
   mv -T -- "$ready_dir" "$running_dir"
   sync "$QUEUE_MARKET_ROOT"
@@ -597,7 +692,7 @@ main() {
     usage
     exit 2
   fi
-  for command in awk chmod date env find flock grep id install jq mv readlink runuser sed sha256sum sort stat sync systemctl; do
+  for command in awk chmod date env find flock grep id install jq mv readlink rm runuser sed sha256sum sort stat sync systemctl; do
     command -v "$command" >/dev/null 2>&1 \
       || fail "missing required command: $command"
   done

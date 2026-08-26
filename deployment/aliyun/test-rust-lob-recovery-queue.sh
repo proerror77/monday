@@ -68,7 +68,7 @@ stat() {
         # Values are populated by configure_paths() from the sourced script.
         # shellcheck disable=SC2153
         case "$1" in
-          "$CANONICAL_ROOT/spot"|"$CANONICAL_ROOT/usdm"|*/.binance-lob-archiver.lock)
+          "$CANONICAL_ROOT/spot"|"$CANONICAL_ROOT/usdm"|"$QUEUE_ROOT"/*/*.ready|"$QUEUE_ROOT"/*/*.running|"$QUEUE_ROOT"/*/*.failed|*/.binance-lob-archiver.lock)
             printf '4241\n'
             ;;
           *) printf '0\n' ;;
@@ -309,6 +309,24 @@ run_action() (
   esac
 )
 
+stage_isolation_marker() {
+  local fixture=$1 market=$2 ordinal=$3 timestamp=${4:-20260826T000001Z}
+  local receipt_sha256
+  configure_paths "$fixture"
+  # MARKET and the release globals are consumed by the sourced queue script.
+  # shellcheck disable=SC2034
+  MARKET=$market
+  market_paths
+  secure_release_identity
+  ensure_queue_directory "$QUEUE_ROOT" "$(id -g hftcollector)"
+  ensure_queue_directory "$QUEUE_MARKET_ROOT" "$(id -g hftcollector)"
+  STAGED_JOB_ID="$timestamp-$market-${RELEASE_SHA256:0:12}-$ordinal"
+  STAGED_READY_DIR="$QUEUE_MARKET_ROOT/$STAGED_JOB_ID.ready"
+  write_job_receipt "$STAGED_JOB_ID" "$RECOVERY_SERVICE@$market.service"
+  receipt_sha256=$(sha256sum "$CANONICAL_SPOOL/job.json" | awk '{print $1}')
+  write_isolation_marker "$STAGED_JOB_ID" "$receipt_sha256"
+}
+
 assert() {
   local label=$1
   shift
@@ -498,15 +516,61 @@ test_symlinked_queue_root_fails_closed() {
   expect_failure "$fixture" isolate spot
 }
 
-test_missing_canonical_recovers_only_with_valid_queue_job() {
-  local fixture=$tmp_dir/missing-canonical-valid
+test_isolation_marker_recovers_all_crash_boundaries() {
+  local state fixture canonical marker ready
+  for state in before-mv after-mv after-mkdir; do
+    fixture="$tmp_dir/isolation-$state"
+    setup_fixture "$fixture"
+    canonical="$fixture/data/monday/spool/binance-lob/spot"
+    printf 'part\n' >"$canonical/part-001.jsonl.part"
+    stage_isolation_marker "$fixture" spot 7001
+    marker=$ISOLATION_MARKER
+    ready=$STAGED_READY_DIR
+    case "$state" in
+      before-mv) ;;
+      after-mv)
+        mv "$canonical" "$ready"
+        ;;
+      after-mkdir)
+        mv "$canonical" "$ready"
+        install -d -m 0750 -o 4241 -g 4242 "$canonical"
+        ;;
+    esac
+    run_action "$fixture" isolate spot
+    assert "$state-canonical" test -d "$canonical"
+    assert "$state-ready" test -d "$ready"
+    assert "$state-marker-committed" test ! -e "$marker"
+    assert "$state-worker-restarted" \
+      grep -Fq 'start --no-block binance-lob-archiver-recovery@spot.service' \
+      "$fixture/systemctl.log"
+  done
+}
+
+test_missing_canonical_with_multiple_backlog_uses_marker() {
+  local fixture=$tmp_dir/missing-canonical-multiple canonical first_ready second_ready
   setup_fixture "$fixture"
-  printf 'part\n' >"$fixture/data/monday/spool/binance-lob/spot/part-001.jsonl.part"
+  canonical="$fixture/data/monday/spool/binance-lob/spot"
+  printf 'first\n' >"$canonical/part-001.jsonl.part"
+  stage_isolation_marker "$fixture" spot 7101 20260826T000001Z
+  first_ready=$STAGED_READY_DIR
   run_action "$fixture" isolate spot
-  rm -rf "$fixture/data/monday/spool/binance-lob/spot"
+  printf 'second\n' >"$canonical/part-002.jsonl.part"
+  stage_isolation_marker "$fixture" spot 7102 20260826T000002Z
+  second_ready=$STAGED_READY_DIR
+  mv "$canonical" "$second_ready"
   run_action "$fixture" isolate spot
-  [[ -d $fixture/data/monday/spool/binance-lob/spot ]]
-  assert worker-restarted grep -Fq 'start --no-block binance-lob-archiver-recovery@spot.service' "$fixture/systemctl.log"
+  assert canonical-recovered test -d "$canonical"
+  assert first-backlog-preserved test -d "$first_ready"
+  assert marked-transaction-preserved test -d "$second_ready"
+  assert two-valid-ready-jobs test "$(find "$QUEUE_MARKET_ROOT" -mindepth 1 -maxdepth 1 -type d -name '*.ready' | wc -l | tr -d ' ')" -eq 2
+  ( load_job "$first_ready" )
+  ( load_job "$second_ready" )
+  assert marker-committed test ! -e "$ISOLATION_MARKER"
+  rm -rf "$canonical"
+  : >"$fixture/systemctl.log"
+  expect_failure "$fixture" isolate spot
+  assert multiple-legacy-jobs-not-adopted test ! -e "$canonical"
+  assert multiple-legacy-jobs-not-started test ! -s "$fixture/systemctl.log"
 }
 
 test_recovery_start_follows_durable_lock_handoff() {
@@ -535,7 +599,9 @@ test_recovery_start_follows_durable_lock_handoff() {
       }
     ' "$sequence"
 
-  rm -rf "$fixture/data/monday/spool/binance-lob/spot"
+  printf 'second\n' >"$fixture/data/monday/spool/binance-lob/spot/part-002.jsonl.part"
+  stage_isolation_marker "$fixture" spot 7202 20260826T000002Z
+  mv "$fixture/data/monday/spool/binance-lob/spot" "$STAGED_READY_DIR"
   : >"$sequence"
   : >"$fixture/sync.log"
   run_action "$fixture" isolate spot
@@ -555,16 +621,92 @@ test_recovery_start_follows_durable_lock_handoff() {
     ' "$sequence"
 }
 
-test_missing_canonical_without_valid_queue_job_fails_closed() {
-  local fixture=$tmp_dir/missing-canonical-invalid ready_dir
+test_missing_canonical_single_valid_legacy_job_recovers() {
+  local fixture=$tmp_dir/missing-canonical-single-legacy ready_dir
   setup_fixture "$fixture"
   printf 'part\n' >"$fixture/data/monday/spool/binance-lob/spot/part-001.jsonl.part"
   run_action "$fixture" isolate spot
   ready_dir=$(find "$fixture/data/monday/spool/binance-lob-recovery/spot" -mindepth 1 -maxdepth 1 -type d -name '*.ready' | head -n 1)
-  jq '.canonical_spool = "/wrong"' "$ready_dir/job.json" >"$ready_dir/job.json.tmp"
-  mv "$ready_dir/job.json.tmp" "$ready_dir/job.json"
+  rm -rf "$fixture/data/monday/spool/binance-lob/spot"
+  : >"$fixture/systemctl.log"
+  run_action "$fixture" isolate spot
+  assert legacy-canonical-recreated test -d "$fixture/data/monday/spool/binance-lob/spot"
+  assert legacy-job-preserved test -d "$ready_dir"
+  assert legacy-recovery-started \
+    grep -Fq 'start --no-block binance-lob-archiver-recovery@spot.service' \
+    "$fixture/systemctl.log"
+}
+
+test_missing_canonical_without_valid_legacy_job_fails_closed() {
+  local fixture=$tmp_dir/missing-canonical-no-valid-legacy
+  setup_fixture "$fixture"
   rm -rf "$fixture/data/monday/spool/binance-lob/spot"
   expect_failure "$fixture" isolate spot
+  assert no-valid-legacy-canonical-not-invented test ! -e "$fixture/data/monday/spool/binance-lob/spot"
+}
+
+test_missing_canonical_mixed_legacy_queue_fails_closed() {
+  local fixture=$tmp_dir/missing-canonical-mixed-legacy malformed
+  setup_fixture "$fixture"
+  printf 'part\n' >"$fixture/data/monday/spool/binance-lob/spot/part-001.jsonl.part"
+  run_action "$fixture" isolate spot
+  malformed="$fixture/data/monday/spool/binance-lob-recovery/spot/00000000T000000Z-spot-aaaaaaaaaaaa-1.ready"
+  mkdir "$malformed"
+  printf '{}\n' >"$malformed/job.json"
+  chmod 0640 "$malformed/job.json"
+  rm -rf "$fixture/data/monday/spool/binance-lob/spot"
+  : >"$fixture/systemctl.log"
+  expect_failure "$fixture" isolate spot
+  assert mixed-legacy-canonical-not-invented test ! -e "$fixture/data/monday/spool/binance-lob/spot"
+  assert mixed-legacy-recovery-not-started test ! -s "$fixture/systemctl.log"
+}
+
+test_isolation_transaction_drift_fails_closed() {
+  local fixture=$tmp_dir/isolation-marker-drift canonical ready
+  setup_fixture "$fixture"
+  canonical="$fixture/data/monday/spool/binance-lob/spot"
+  printf 'part\n' >"$canonical/part-001.jsonl.part"
+  stage_isolation_marker "$fixture" spot 7301
+  ready=$STAGED_READY_DIR
+  mv "$canonical" "$ready"
+  jq '.receipt_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+    "$ISOLATION_MARKER" >"$ISOLATION_MARKER.tmp"
+  mv "$ISOLATION_MARKER.tmp" "$ISOLATION_MARKER"
+  expect_failure "$fixture" isolate spot
+  assert drift-ready-preserved test -d "$ready"
+  assert drift-canonical-not-invented test ! -e "$canonical"
+  assert drift-marker-preserved test -f "$ISOLATION_MARKER"
+
+  fixture=$tmp_dir/isolation-canonical-drift
+  setup_fixture "$fixture"
+  canonical="$fixture/data/monday/spool/binance-lob/spot"
+  printf 'old\n' >"$canonical/part-001.jsonl.part"
+  stage_isolation_marker "$fixture" spot 7302
+  ready=$STAGED_READY_DIR
+  mv "$canonical" "$ready"
+  install -d -m 0750 -o 4241 -g 4242 "$canonical"
+  printf 'new\n' >"$canonical/part-unexpected.jsonl.part"
+  expect_failure "$fixture" isolate spot
+  assert canonical-drift-preserved test -f "$canonical/part-unexpected.jsonl.part"
+  assert canonical-drift-marker-preserved test -f "$ISOLATION_MARKER"
+}
+
+test_malformed_oldest_ready_is_not_renamed() {
+  local fixture=$tmp_dir/malformed-oldest malformed valid
+  setup_fixture "$fixture"
+  printf 'part\n' >"$fixture/data/monday/spool/binance-lob/spot/part-001.jsonl.part"
+  run_action "$fixture" isolate spot
+  valid=$(find "$fixture/data/monday/spool/binance-lob-recovery/spot" \
+    -mindepth 1 -maxdepth 1 -type d -name '*.ready' -print -quit)
+  malformed="$fixture/data/monday/spool/binance-lob-recovery/spot/00000000T000000Z-spot-aaaaaaaaaaaa-1.ready"
+  mkdir "$malformed"
+  printf '{}\n' >"$malformed/job.json"
+  chmod 0640 "$malformed/job.json"
+  expect_failure "$fixture" drain spot
+  assert malformed-remains-ready test -d "$malformed"
+  assert valid-remains-ready test -d "$valid"
+  assert no-running-created test -z "$(find "$fixture/data/monday/spool/binance-lob-recovery/spot" \
+    -mindepth 1 -maxdepth 1 -type d -name '*.running' -print -quit)"
 }
 
 test_passed_running_finalizes_without_retry() {
@@ -618,9 +760,14 @@ test_invalid_release_env_never_executes_recovery_binary
 test_unsafe_release_identity_fails_closed
 test_missing_canonical_lock_fails_closed
 test_symlinked_queue_root_fails_closed
-test_missing_canonical_recovers_only_with_valid_queue_job
+test_isolation_marker_recovers_all_crash_boundaries
+test_missing_canonical_with_multiple_backlog_uses_marker
 test_recovery_start_follows_durable_lock_handoff
-test_missing_canonical_without_valid_queue_job_fails_closed
+test_missing_canonical_single_valid_legacy_job_recovers
+test_missing_canonical_without_valid_legacy_job_fails_closed
+test_missing_canonical_mixed_legacy_queue_fails_closed
+test_isolation_transaction_drift_fails_closed
+test_malformed_oldest_ready_is_not_renamed
 test_passed_running_finalizes_without_retry
 test_running_job_ignores_untrusted_in_spool_pass_result
 
