@@ -8,6 +8,8 @@ fixtures="$script_dir/fixtures/rust-ci-scope"
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
 
+bash "$script_dir/test-agent-worktree-preflight.sh"
+
 run_case() {
   local name=$1 event=$2 changed=$3 ref=
   local output="$tmp_dir/$name.out"
@@ -29,6 +31,9 @@ printf '%s\n' config/risk.toml >"$tmp_dir/unknown-nested.txt"
 printf '%s\n' rust_hft/deployment/docker/Dockerfile.trading >"$tmp_dir/trading-dockerfile.txt"
 printf '%s\n' rust_hft/docs/README.md >"$tmp_dir/rust-docs.txt"
 printf '%s\n' rust_hft/research-core/README.md >"$tmp_dir/package-readme.txt"
+printf '%s\n' \
+  .github/scripts/agent-worktree-preflight.sh \
+  .github/scripts/test-agent-worktree-preflight.sh >"$tmp_dir/preflight-only.txt"
 
 assert_flag() {
   local output=$1 flag=$2 expected=$3
@@ -102,6 +107,7 @@ job_cases=(
   'security-workflow-push|push|security-workflow.txt|ploy/workflow-lint'
   'governance-template|pull_request|governance-template.txt|ploy/commit-hygiene,ploy/workflow-lint'
   'governance-doc|pull_request|governance-doc.txt|ploy/commit-hygiene,ploy/workflow-lint'
+  'preflight-only|pull_request|preflight-only.txt|ploy/commit-hygiene'
   'unknown-workflow|pull_request|unknown-workflow.txt|ci/rust,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/workflow-lint,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
   'unknown-root|pull_request|unknown-root.txt|ci/rust,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
   'unknown-nested|pull_request|unknown-nested.txt|'
@@ -125,6 +131,14 @@ for job_case in "${job_cases[@]}"; do
   assert_owning_packages "$output" "${expected_owning:-}"
   assert_flag "$output" selection_complete true
 done
+
+printf '%s\n' \
+  .github/scripts/agent-worktree-preflight.sh \
+  rust_hft/tools/future-rust-tool/src/lib.rs >"$tmp_dir/preflight-and-rust.txt"
+preflight_and_rust=$(run_case preflight-and-rust pull_request preflight-and-rust.txt)
+assert_jobs "$preflight_and_rust" 'ploy/commit-hygiene,ci/rust'
+assert_owning_packages "$preflight_and_rust" 'future-rust-tool'
+assert_flag "$preflight_and_rust" toolchain true
 
 owning_package_cases=(
   'hft-data-adapter-replay|rust_hft/data-pipelines/adapters/adapter-replay/src/lib.rs'

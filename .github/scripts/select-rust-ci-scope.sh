@@ -295,6 +295,10 @@ for path in "${paths[@]}"; do
       select_job ploy/workflow-lint
       continue
       ;;
+    .github/scripts/agent-worktree-preflight.sh|.github/scripts/test-agent-worktree-preflight.sh)
+      [[ $event == pull_request ]] && select_job ploy/commit-hygiene
+      continue
+      ;;
     .github/scripts/select-rust-ci-scope.sh|.github/scripts/test-select-rust-ci-scope.sh|.github/scripts/fixtures/rust-ci-scope/*)
       select_all
       select_all_ci_jobs
