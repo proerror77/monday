@@ -97,6 +97,7 @@ select_security_scope() {
 }
 
 select_all_ci_jobs() {
+  select_job ci/rust-shell-scripts
   select_job ci/rust
   select_job ci/market-recorder-contract
   select_job ci/deployment-artifacts
@@ -369,6 +370,10 @@ for path in "${paths[@]}"; do
       continue
       ;;
     rust_hft/docs/*|rust_hft/README*|rust_hft/*/README*)
+      continue
+      ;;
+    rust_hft/scripts/*.sh)
+      select_job ci/rust-shell-scripts
       continue
       ;;
     rust_hft/*)

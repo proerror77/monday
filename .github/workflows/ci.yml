@@ -100,7 +100,7 @@ jobs:
               "toolchain=$SELECTED_TOOLCHAIN"
           else
             printf '%s\n' \
-              'jobs=,ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,' \
+              'jobs=,ci/rust-shell-scripts,ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,' \
               'owning_packages=,,' \
               'loop=true' \
               'handoff=true' \
@@ -149,6 +149,21 @@ jobs:
           printf '### CI check plan\n\n- Jobs: %s\n- Direct Rust package tests: %s\n- Collector control contract: %s\n' \
             "$SELECTED_JOBS" "$SELECTED_OWNING_PACKAGES" "$SELECTED_CONTROL" \
             >> "$GITHUB_STEP_SUMMARY"
+
+  rust_shell_scripts:
+    name: Rust shell scripts
+    needs: scope
+    if: ${{ contains(needs.scope.outputs.jobs, ',ci/rust-shell-scripts,') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check shell syntax
+        run: |
+          for script in rust_hft/scripts/*.sh; do
+            bash -n "$script"
+          done
 
   rust:
     name: Rust Workspace
@@ -689,6 +704,7 @@ jobs:
     needs:
       - selector
       - scope
+      - rust_shell_scripts
       - rust
       - rust_fast_gates
       - market_recorder_contract
