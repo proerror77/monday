@@ -25,6 +25,8 @@ done
 
 CANDIDATE_SHA256=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
 RELEASE_ROOT=/opt/monday/releases/binance-lob-archiver
+CONTROLLER_RELEASE_ROOT=/opt/monday/releases/binance-lob-controller
+ACTIVE_CONTROLLER_LINK="$CONTROLLER_RELEASE_ROOT/active"
 CANDIDATE_RELEASE="$RELEASE_ROOT/$CANDIDATE_SHA256"
 CANDIDATE_BINARY="$CANDIDATE_RELEASE/binance-lob-archiver"
 CANDIDATE_DEPLOYMENT="$CANDIDATE_RELEASE/deployment"
@@ -76,6 +78,8 @@ OLD_HEALTH_ROLLBACK_SOURCE=absent
 HEALTH_SCRIPT_ROLLBACK_RESULT=not-needed
 CANDIDATE_DRAIN_UNIT=
 CANDIDATE_DRAIN_COUNTER=0
+OLD_CONTROLLER_RELEASE=
+CONTROLLER_SWITCHED=0
 
 PRODUCTION_UNITS=(
   binance-lob-archiver-production@spot.service
@@ -522,6 +526,16 @@ atomic_symlink() {
   [[ -L $link && $(readlink -f -- "$link" 2>/dev/null || true) == "$resolved_target" ]]
 }
 
+restore_previous_controller_link() {
+  (( CONTROLLER_SWITCHED )) || return 0
+  if [[ -n $OLD_CONTROLLER_RELEASE ]]; then
+    atomic_symlink "$OLD_CONTROLLER_RELEASE" "$ACTIVE_CONTROLLER_LINK"
+  else
+    rm -f -- "$ACTIVE_CONTROLLER_LINK"
+    [[ ! -e $ACTIVE_CONTROLLER_LINK && ! -L $ACTIVE_CONTROLLER_LINK ]]
+  fi
+}
+
 canonical_spool_paths_safe() {
   local path
   for path in \
@@ -743,7 +757,7 @@ stage_existing_deployment_for_rollback() {
 }
 
 capture_existing_production_identity() {
-  local timer unit state
+  local timer unit state old_runtime_contract
   OLD_MODE=$1
   [[ -L $PRODUCTION_LINK ]] || fail 'running production binary must be a release symlink'
   OLD_BINARY=$(readlink -f "$PRODUCTION_LINK")
@@ -813,7 +827,17 @@ capture_existing_production_identity() {
     [[ $OLD_USDM_INVOCATION_ID =~ ^[A-Fa-f0-9]{32}$ ]] \
       || fail 'running USD-M production has an invalid invocation baseline'
   fi
-  OLD_DEPLOYMENT="$RELEASE_ROOT/$OLD_SHA256/deployment"
+  old_runtime_contract=$(jq -er '.runtime_contract_sha256' \
+    "$RELEASE_ROOT/$OLD_SHA256/release.json") \
+    || fail 'old release is missing its runtime contract identity'
+  if [[ -e $ACTIVE_CONTROLLER_LINK || -L $ACTIVE_CONTROLLER_LINK ]]; then
+    OLD_DEPLOYMENT=$(monday_rust_lob_active_controller_deployment \
+      "$CONTROLLER_RELEASE_ROOT" "$OLD_SHA256" "$old_runtime_contract") \
+      || fail 'active controller release does not bind the old production runtime'
+    OLD_CONTROLLER_RELEASE=${OLD_DEPLOYMENT%/deployment}
+  else
+    OLD_DEPLOYMENT="$RELEASE_ROOT/$OLD_SHA256/deployment"
+  fi
   stage_existing_deployment_for_rollback
   SPOOL_ENV_DEPLOYMENT="$OLD_DEPLOYMENT"
 }
@@ -1224,6 +1248,8 @@ write_evidence() {
     --arg previous_health_rollback_source "$OLD_HEALTH_ROLLBACK_SOURCE" \
     --argjson previous_health_script_present "$previous_health_script_present" \
     --arg candidate_sha256 "$CANDIDATE_SHA256" \
+    --arg previous_controller_release_manifest_sha256 \
+      "${OLD_CONTROLLER_RELEASE:+${OLD_CONTROLLER_RELEASE##*/}}" \
     --arg runtime_contract_sha256 "$RUNTIME_CONTRACT_SHA256" \
     --arg deployment_source_revision "$DEPLOYMENT_SOURCE_REVISION" \
     --arg deployment_bundle_sha256 "$DEPLOYMENT_BUNDLE_SHA256" \
@@ -1260,6 +1286,9 @@ write_evidence() {
         snapshot: (if $previous_health_script_snapshot == "" then null else $previous_health_script_snapshot end)
       },
       candidate_sha256: $candidate_sha256,
+      previous_controller_release_manifest_sha256:
+        (if $previous_controller_release_manifest_sha256 == "" then null
+         else $previous_controller_release_manifest_sha256 end),
       runtime_contract_sha256:
         (if $runtime_contract_sha256 == "" then null else $runtime_contract_sha256 end),
       deployment_source_revision:
@@ -1366,6 +1395,9 @@ rollback_after_failure() {
     elif ! atomic_symlink "$OLD_BINARY" "$PRODUCTION_LINK"; then
       safe_to_restart=0
       ROLLBACK_RESULT=restore-symlink-failed-disabled
+    elif ! restore_previous_controller_link; then
+      safe_to_restart=0
+      ROLLBACK_RESULT=restore-controller-identity-failed-disabled
     elif ! restore_allowlisted_production_dropins; then
       safe_to_restart=0
       ROLLBACK_RESULT=restore-dropin-failed-disabled
@@ -1512,7 +1544,9 @@ rollback_after_failure() {
     if [[ $(readlink -f "$PRODUCTION_LINK" 2>/dev/null || true) == "$CANDIDATE_BINARY" ]]; then
       rm -f "$PRODUCTION_LINK"
     fi
-    if [[ $HEALTH_SCRIPT_ROLLBACK_RESULT == failed ]] \
+    if ! restore_previous_controller_link; then
+      ROLLBACK_RESULT=new-host-controller-identity-restore-failed-disabled
+    elif [[ $HEALTH_SCRIPT_ROLLBACK_RESULT == failed ]] \
       && production_is_fail_closed; then
       ROLLBACK_RESULT=new-host-health-restore-failed-disabled
     elif production_is_fail_closed; then
@@ -1723,6 +1757,8 @@ elif (( active_count == 1 && enabled_count == 1 )) \
     || fail 'running USD-M production health is not ready for partial-contained cutover'
   DRAIN_REQUIRED=1
 elif (( active_count == 0 && enabled_count == 0 )) && [[ ! -e $PRODUCTION_LINK && ! -L $PRODUCTION_LINK ]]; then
+  [[ ! -e $ACTIVE_CONTROLLER_LINK && ! -L $ACTIVE_CONTROLLER_LINK ]] \
+    || fail 'new host must not retain an active controller override'
   OLD_MODE=new-host
   (( PRODUCTION_USDM_MEMORY_DROPIN_PRESENT == 0 )) \
     || fail 'new host must not retain a production USD-M drop-in'
@@ -1852,6 +1888,14 @@ health_ready_for_release spot 1000 "$OLD_SESSION_SPOT" "$CANDIDATE_STARTED_NS" \
 health_ready_for_release usdm 100 "$OLD_SESSION_USDM" "$CANDIDATE_STARTED_NS" \
   || fail 'USD-M health changed while enabling production'
 systemctl unmask --runtime "${UPLOAD_UNITS[@]}" >/dev/null
+
+STEP=clear-previous-controller-override
+if [[ -n $OLD_CONTROLLER_RELEASE ]]; then
+  CONTROLLER_SWITCHED=1
+  rm -f -- "$ACTIVE_CONTROLLER_LINK"
+  [[ ! -e $ACTIVE_CONTROLLER_LINK && ! -L $ACTIVE_CONTROLLER_LINK ]] \
+    || fail 'could not clear the previous controller override'
+fi
 
 STEP=enable-recovery-scheduler
 enable_candidate_recovery_scheduler \

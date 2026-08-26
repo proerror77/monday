@@ -41,6 +41,7 @@ assets=(
   host-rust-lob-restore.sh
   host-rust-lob-recovery-queue.sh
   host-rust-lob-controller-release.sh
+  host-rust-lob-controller-apply.sh
   monday-collector-health.sh
   rust-lob-control-plane-lib.sh
   rust-lob-runtime-health-policy.jq

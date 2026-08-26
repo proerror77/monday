@@ -979,6 +979,28 @@ systemd state, touch `/data`, start a Gate, change either production symlink, or
 restart a collector. Applying that exact controller release is a separate
 Runtime transition with its own rollback and readback evidence.
 
+Apply a published controller release through the named operation wrapper:
+
+```bash
+ACTION=controller-apply \
+INSTANCE_ID=i-REPLACE \
+ARTIFACT_SHA256=REPLACE_WITH_ACTIVE_BINARY_SHA256 \
+CONTROLLER_RELEASE_SHA256=REPLACE_WITH_CONTROLLER_MANIFEST_SHA256 \
+./deployment/aliyun/invoke-rust-lob-operation.sh
+```
+
+The current allowlist permits only
+`/opt/monday/bin/monday-rust-lob-recovery-queue` to change. Both production
+collectors must remain on the named artifact with unchanged PIDs and restart
+counters; recovery services must be inactive. The operation briefly stops the
+recovery timers, applies the exact script and active-controller symlink, restores
+the prior timer state, and writes an immutable apply receipt under
+`/data/monday/evidence/controller-applies/`. Any failed mutation restores the
+prior script, controller identity, and timer state. Restore and recovery queue
+receipts use the active controller bundle/source identity. The next successful
+binary cutover clears this artifact-specific override; its rollback restores the
+override when necessary.
+
 The committed shadow environments use `SYMBOLS=ALL` for Spot and the same
 frozen 100-symbol USD-M production allowlist for Futures. Both keep five-minute
 segments, isolated spools, and isolated OSS datasets:

@@ -14,7 +14,10 @@ configure_paths() {
   OPT_ROOT="$root/opt/monday"
   BIN_DIR="$OPT_ROOT/bin"
   RELEASE_ROOT="$OPT_ROOT/releases/binance-lob-archiver"
+  CONTROLLER_RELEASE_ROOT="$OPT_ROOT/releases/binance-lob-controller"
+  ACTIVE_CONTROLLER="$CONTROLLER_RELEASE_ROOT/active"
   PRODUCTION_LINK="$BIN_DIR/binance-lob-archiver"
+  INSTALLED_RECOVERY="$BIN_DIR/monday-rust-lob-recovery-queue"
   CONFIG_ROOT="$root/etc/monday"
   DATA_ROOT="$root/data"
   LOCK_ROOT="$root/run/lock"
@@ -102,6 +105,7 @@ canonical_paths_safe() {
     "$ROOT_PREFIX/opt" \
     "$OPT_ROOT" \
     "$ROOT_PREFIX/opt/monday/releases" \
+    "$CONTROLLER_RELEASE_ROOT" \
     "$ROOT_PREFIX/etc" \
     "$CONFIG_ROOT" \
     "$DATA_ROOT" \
@@ -186,7 +190,8 @@ require_empty_segment_spool() {
 }
 
 secure_release_identity() {
-  local release_json env_sha release_env_sha
+  local release_json artifact_json runtime_contract env_sha release_env_sha
+  local controller_release controller_sha controller_manifest controller_deployment
   path_is_direct_or_absent "$OPT_ROOT" || fail "release path contains a symlink: $OPT_ROOT"
   path_is_direct_or_absent "$BIN_DIR" || fail "release path contains a symlink: $BIN_DIR"
   path_is_direct_or_absent "$RELEASE_ROOT" || fail "release path contains a symlink: $RELEASE_ROOT"
@@ -200,8 +205,52 @@ secure_release_identity() {
   secure_regular_file "$RELEASE_BINARY" 0
   [[ -x $RELEASE_BINARY ]] || fail "release binary is not executable: $RELEASE_BINARY"
   printf '%s  %s\n' "$RELEASE_SHA256" "$RELEASE_BINARY" | sha256sum --check --strict >/dev/null
-  release_json="$RELEASE_DIR/release.json"
-  secure_regular_file "$release_json" 0
+  artifact_json="$RELEASE_DIR/release.json"
+  release_json=$artifact_json
+  secure_regular_file "$artifact_json" 0
+  runtime_contract=$(jq -er '.runtime_contract_sha256' "$artifact_json")
+  [[ $runtime_contract =~ ^[a-f0-9]{64}$ ]] \
+    || fail "release has an invalid runtime contract SHA-256: $artifact_json"
+  if [[ -e $ACTIVE_CONTROLLER || -L $ACTIVE_CONTROLLER ]]; then
+    [[ -L $ACTIVE_CONTROLLER ]] \
+      || fail "active controller identity is not a symlink: $ACTIVE_CONTROLLER"
+    controller_release=$(readlink -f -- "$ACTIVE_CONTROLLER") \
+      || fail 'active controller identity is dangling'
+    controller_sha=${controller_release##*/}
+    [[ $controller_sha =~ ^[a-f0-9]{64}$ \
+      && $controller_release == "$CONTROLLER_RELEASE_ROOT/$controller_sha" ]] \
+      || fail 'active controller identity is not digest-addressed'
+    path_is_direct_or_absent "$controller_release" \
+      || fail "controller release path is indirect: $controller_release"
+    controller_manifest="$controller_release/release.json"
+    controller_deployment="$controller_release/deployment"
+    path_is_direct_or_absent "$controller_deployment" \
+      || fail "controller deployment path is indirect: $controller_deployment"
+    secure_regular_file "$controller_manifest" 0
+    secure_regular_file "$controller_release/release.json.sha256" 0
+    secure_regular_file "$controller_release/deployment.sha256" 0
+    [[ $(sha256sum "$controller_manifest" | awk '{print $1}') == "$controller_sha" ]] \
+      || fail 'active controller manifest digest mismatch'
+    (cd "$controller_release" \
+      && sha256sum --check --strict release.json.sha256 >/dev/null \
+      && sha256sum --check --strict deployment.sha256 >/dev/null) \
+      || fail 'active controller checksum verification failed'
+    jq -e --arg artifact "$RELEASE_SHA256" --arg runtime "$runtime_contract" '
+        .schema == "monday.rust_lob_controller_release.v1"
+        and .artifact_sha256 == $artifact
+        and .runtime_contract_sha256 == $runtime' \
+      "$controller_manifest" >/dev/null \
+      || fail 'active controller does not bind the production artifact and runtime contract'
+    secure_regular_file "$INSTALLED_RECOVERY" 0
+    secure_regular_file "$controller_deployment/host-rust-lob-recovery-queue.sh" 0
+    cmp -s -- "$INSTALLED_RECOVERY" \
+      "$controller_deployment/host-rust-lob-recovery-queue.sh" \
+      || fail 'installed recovery controller differs from the active controller release'
+    release_json=$controller_manifest
+    RELEASE_ENV_FILE="$controller_deployment/binance-lob-archiver-production-$MARKET.env"
+  else
+    RELEASE_ENV_FILE="$RELEASE_DIR/deployment/binance-lob-archiver-production-$MARKET.env"
+  fi
   RELEASE_BUNDLE_SHA256=$(jq -er '.deployment_bundle_sha256' "$release_json")
   RELEASE_SOURCE_REVISION=$(jq -er '.deployment_source_revision' "$release_json")
   [[ $RELEASE_BUNDLE_SHA256 =~ ^[a-f0-9]{64}$ ]] \
@@ -209,10 +258,11 @@ secure_release_identity() {
   [[ $RELEASE_SOURCE_REVISION =~ ^[a-f0-9]{40,64}$ ]] \
     || fail "release has an invalid deployment source revision: $release_json"
   jq -e --arg sha "$RELEASE_SHA256" --arg bundle "$RELEASE_BUNDLE_SHA256" \
-    '.artifact_sha256 == $sha and .deployment_bundle_sha256 == $bundle' \
+    --arg runtime "$runtime_contract" \
+    '.artifact_sha256 == $sha and .deployment_bundle_sha256 == $bundle
+      and .runtime_contract_sha256 == $runtime' \
     "$release_json" >/dev/null \
     || fail "release metadata does not match the production binary: $release_json"
-  RELEASE_ENV_FILE="$RELEASE_DIR/deployment/binance-lob-archiver-production-$MARKET.env"
   secure_regular_file "$ENV_FILE" 0
   secure_regular_file "$RELEASE_ENV_FILE" 0
   env_sha=$(sha256sum "$ENV_FILE" | awk '{print $1}')

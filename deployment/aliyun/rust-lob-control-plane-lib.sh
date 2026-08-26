@@ -36,6 +36,40 @@ monday_rust_lob_runtime_contract_sha256() {
   fi
 }
 
+# Resolve the immutable controller deployment currently applied to one artifact.
+monday_rust_lob_active_controller_deployment() {
+  [[ $# -eq 3 ]] || return 2
+  local controller_root=$1 artifact_sha=$2 runtime_contract=$3
+  local active="$controller_root/active" release manifest manifest_sha deployment
+
+  [[ $artifact_sha =~ ^[a-f0-9]{64}$ \
+    && $runtime_contract =~ ^[a-f0-9]{64}$ \
+    && -L $active ]] || return 1
+  release=$(readlink -f -- "$active") || return 1
+  [[ $release =~ ^${controller_root}/([a-f0-9]{64})$ \
+    && -d $release && ! -L $release ]] || return 1
+  manifest_sha=${BASH_REMATCH[1]}
+  manifest="$release/release.json"
+  deployment="$release/deployment"
+  [[ -f $manifest && ! -L $manifest \
+    && -d $deployment && ! -L $deployment \
+    && -f $release/release.json.sha256 && ! -L $release/release.json.sha256 \
+    && -f $release/deployment.sha256 && ! -L $release/deployment.sha256 ]] \
+    || return 1
+  [[ $(sha256sum "$manifest" | awk '{print $1}') == "$manifest_sha" ]] || return 1
+  (cd "$release" \
+    && sha256sum --check --strict release.json.sha256 >/dev/null \
+    && sha256sum --check --strict deployment.sha256 >/dev/null) || return 1
+  jq -e \
+    --arg artifact "$artifact_sha" \
+    --arg runtime "$runtime_contract" '
+      .schema == "monday.rust_lob_controller_release.v1"
+      and .artifact_sha256 == $artifact
+      and .runtime_contract_sha256 == $runtime' \
+    "$manifest" >/dev/null || return 1
+  printf '%s\n' "$deployment"
+}
+
 # Pure monotonic freshness transition used by the host gate and its tests.
 # Output: last_updated_ns last_advance_mono max_gap_seconds sample_increment
 monday_observe_health_freshness() {
