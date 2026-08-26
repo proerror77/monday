@@ -306,7 +306,10 @@ owned_collector_traversable_directory() {
     && [ "$(file_gid "$1")" = "$3" ] \
     && file_group_world_not_writable "$1" \
     && mode=$(stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null) \
-    && (( (8#$mode & 010) != 0 ))
+    && case "$mode" in
+      [0-7][1357][0-7] | [0-7][0-7][1357][0-7]) true ;;
+      *) false ;;
+    esac
 }
 
 unit_is_active() {
