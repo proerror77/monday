@@ -561,13 +561,28 @@ gate_terminal=$(sudo "$gate_control" status "$candidate_sha" "$gate_invocation")
 jq -e '.terminal_state == "passed"' <<<"$gate_terminal" >/dev/null
 gate_receipt="/data/monday/evidence/polymarket-gate-jobs/$candidate_sha/$gate_invocation/receipt.json"
 pinned_control_dir="/opt/monday/releases/polymarket-raw-ops/$candidate_sha/control"
-sudo "$pinned_control_dir/polymarket-raw-ops-cutover.sh" \
-  cutover "$candidate_sha" "$gate_receipt"
+cutover_json=$(sudo "$pinned_control_dir/polymarket-raw-ops-cutover.sh" \
+  cutover "$candidate_sha" "$gate_receipt")
+
+# Run once both production lanes have published a fully post-cutover segment.
+# This is a one-shot readback; it never waits for the next hourly rotation.
+cutover_dir=${cutover_json%/*}
+readback=$(sudo /opt/monday/control/polymarket-raw-ops/polymarket-raw-ops-cutover.sh \
+  readback "$cutover_dir")
+jq -e '.result == "active_complete" and .runtime_identity_verified == true
+  and .oss_triplets_verified == true' <<<"$readback" >/dev/null
 ```
 
 Staging does not replace active global controls or production units. The Gate pins
 the verified controls under the immutable candidate release; only a successful
-cutover may install them globally.
+cutover may install them globally. Readback uses the installed controller, requires
+the exact cutover PID and invocation to remain active with zero restarts, and
+downloads both production `data`/`manifest`/`_SUCCESS` triplets into bounded
+`/run` scratch space. It fails until both upload queues are empty and each
+manifest starts after the success marker publication second. The slow OSS downloads
+do not hold the release lock, so rollback remains available; the final runtime and
+upload-status snapshots are revalidated under the lock. Archive the JSON output
+separately from the immutable cutover directory.
 
 The Rust shadow unit must complete its configured observation window and publish
 fresh fail-closed health before the reference collector is promoted. Evidence binds

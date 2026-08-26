@@ -999,12 +999,13 @@ oss_config_sha256() {
 }
 
 load_oss_config_snapshot() {
-  oss_bucket=$(env_value OSS_BUCKET)
-  oss_endpoint=$(env_value OSS_ENDPOINT)
-  oss_region=$(env_value OSS_REGION)
-  aliyun_profile=$(env_value ALIYUN_PROFILE)
-  zstd_timeout_seconds=$(env_value ZSTD_TIMEOUT_SECONDS)
-  oss_copy_timeout_seconds=$(env_value OSS_COPY_TIMEOUT_SECONDS)
+  local upload_env=${1:-$UPLOAD_ENV}
+  oss_bucket=$(env_value OSS_BUCKET "$upload_env")
+  oss_endpoint=$(env_value OSS_ENDPOINT "$upload_env")
+  oss_region=$(env_value OSS_REGION "$upload_env")
+  aliyun_profile=$(env_value ALIYUN_PROFILE "$upload_env")
+  zstd_timeout_seconds=$(env_value ZSTD_TIMEOUT_SECONDS "$upload_env")
+  oss_copy_timeout_seconds=$(env_value OSS_COPY_TIMEOUT_SECONDS "$upload_env")
   # Development policy: upload timeout values remain bound into OSS configuration evidence.
   [[ $zstd_timeout_seconds =~ ^[1-9][0-9]*$ \
     && $oss_copy_timeout_seconds =~ ^[1-9][0-9]*$ ]] \
@@ -1017,12 +1018,13 @@ load_oss_config_snapshot() {
     "ZSTD_TIMEOUT_SECONDS=$zstd_timeout_seconds" \
     "OSS_COPY_TIMEOUT_SECONDS=$oss_copy_timeout_seconds" \
     | sha256sum | awk '{print $1}')
-  [[ $(oss_config_sha256) == "$oss_config_sha" ]] \
+  oss_config_file=$upload_env
+  [[ $(oss_config_sha256 "$oss_config_file") == "$oss_config_sha" ]] \
     || die 'OSS configuration changed while it was being snapshotted'
 }
 
 verify_current_oss_config() {
-  [[ $(oss_config_sha256) == "$oss_config_sha" ]] \
+  [[ $(oss_config_sha256 "${oss_config_file:-$UPLOAD_ENV}") == "$oss_config_sha" ]] \
     || die 'OSS configuration changed during the shadow gate'
 }
 
@@ -1071,6 +1073,7 @@ download_and_verify_oss_triplet() {
   local prefix relative path_sha data_name
   local data manifest success superseded_uri superseded_listing manifest_json
   local expected_bytes expected_sha source_bytes canonical segment_complete
+  local start_recorded_at end_recorded_at
   prefix="oss://$oss_bucket/lake/raw/venue=polymarket/dataset=$expected_dataset/"
   [[ $uri == "$prefix"* ]] || return 1
   relative=${uri#"$prefix"}
@@ -1104,6 +1107,8 @@ download_and_verify_oss_triplet() {
       and (.bytes | type == "number" and floor == . and . > 0)
       and (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))
       and (.source_bytes | type == "number" and floor == . and . > 0)
+      and (.start_recorded_at | type == "string" and length > 0)
+      and (.end_recorded_at | type == "string" and length > 0)
       and (.canonical | type == "boolean")
       and (.segment_complete | type == "boolean")
       and .source_session_closed == true and .sequence_gaps == 0)' \
@@ -1111,6 +1116,8 @@ download_and_verify_oss_triplet() {
   expected_bytes=$(jq -er '.bytes' <<<"$manifest_json") || return 1
   expected_sha=$(jq -er '.sha256' <<<"$manifest_json") || return 1
   source_bytes=$(jq -er '.source_bytes' <<<"$manifest_json") || return 1
+  start_recorded_at=$(jq -er '.start_recorded_at' <<<"$manifest_json") || return 1
+  end_recorded_at=$(jq -er '.end_recorded_at' <<<"$manifest_json") || return 1
   canonical=$(jq -r '.canonical' <<<"$manifest_json") || return 1
   segment_complete=$(jq -r '.segment_complete' <<<"$manifest_json") || return 1
   [[ $canonical == "$segment_complete" ]] || return 1
@@ -1123,12 +1130,15 @@ download_and_verify_oss_triplet() {
     --arg file "$data_name" --arg sha256 "$expected_sha" \
     --arg manifest_sha256 "$(sha256sum "$manifest" | awk '{print $1}')" \
     --arg success_sha256 "$expected_sha" \
+    --arg start_recorded_at "$start_recorded_at" \
+    --arg end_recorded_at "$end_recorded_at" \
     --argjson bytes "$expected_bytes" --argjson source_bytes "$source_bytes" \
     --argjson canonical "$canonical" --argjson segment_complete "$segment_complete" \
     '{uri:$uri,dataset:$dataset,file:$file,bytes:$bytes,sha256:$sha256,
       source_bytes:$source_bytes,manifest_sha256:$manifest_sha256,
       success_sha256:$success_sha256,canonical:$canonical,
-      segment_complete:$segment_complete}'
+      segment_complete:$segment_complete,start_recorded_at:$start_recorded_at,
+      end_recorded_at:$end_recorded_at}'
 }
 
 real_market_segment_preflight() {
@@ -1819,6 +1829,40 @@ adjudicate_trade_parity() {
         then true else .passed end) and ([.checks[]] | all))
   '
 }
+
+if [[ ${1:-} == --oss-triplet-readback-worker ]]; then
+  [[ ${EUID} -eq 0 && $# -eq 6 ]] || exit 2
+  for command in aliyun awk date grep jq mkdir readlink sed seq sha256sum sleep stat \
+    timeout tr wc; do
+    command -v "$command" >/dev/null 2>&1 || die "missing readback command: $command"
+  done
+  readback_upload_env=$2
+  readback_oss_config_sha=$3
+  readback_uri=$4
+  readback_dataset=$5
+  readback_target=$6
+  readback_parent=${readback_target%/*}
+  readback_leaf=${readback_target##*/}
+  [[ $readback_upload_env == /* \
+    && $readback_oss_config_sha =~ ^[a-f0-9]{64}$ \
+    && $readback_dataset =~ ^[a-z0-9_-]+$ \
+    && $readback_parent =~ ^/run/monday/polymarket-readback\.[A-Za-z0-9]{6}$ \
+    && ( $readback_leaf == reference || $readback_leaf == market ) \
+    && ! -e $readback_target && ! -L $readback_target ]] \
+    || die 'OSS triplet readback arguments are invalid'
+  secure_root_chain "${readback_upload_env%/*}" \
+    || die 'readback OSS configuration parent is not trusted'
+  secure_control_file "$readback_upload_env"
+  secure_root_chain "$readback_parent" \
+    || die 'readback target parent is not trusted'
+  load_oss_config_snapshot "$readback_upload_env"
+  [[ $oss_config_sha == "$readback_oss_config_sha" ]] \
+    || die 'readback OSS configuration differs from the cutover evidence'
+  download_and_verify_oss_triplet "$readback_uri" "$readback_dataset" \
+    "$readback_target" "$((SECONDS + 600))" \
+    || die 'production OSS triplet readback failed'
+  exit
+fi
 
 if [[ ${1:-} == --real-market-preflight-worker ]]; then
   [[ ${EUID} -eq 0 && $# -eq 5 ]] || exit 2

@@ -1338,7 +1338,9 @@ make_remote_triplet() {
     --argjson source_bytes "$source_bytes" \
     '{venue:"polymarket",dataset:$dataset,file:$file,bytes:$bytes,
       sha256:$sha,source_bytes:$source_bytes,canonical:true,
-      segment_complete:true,source_session_closed:true,sequence_gaps:0}' \
+      segment_complete:true,source_session_closed:true,sequence_gaps:0,
+      start_recorded_at:"2026-01-01T00:00:00Z",
+      end_recorded_at:"2026-01-01T00:59:59Z"}' \
     >"$remote_manifest"
   printf '%s\n' "$data_sha" >"${remote_data}._SUCCESS"
 }
@@ -3572,7 +3574,7 @@ fi
 # The marker must be a unique, exact checksum of cutover.json and a rerun must
 # fail closed rather than replacing existing evidence.
 cutover_marker_publisher="$tmp_dir/publish-cutover-marker.sh"
-sed -n '/^success_marker="\$evidence_dir\/PASSED.sha256"$/,/^sync -f "\$evidence_dir"$/p' \
+sed -n '/^success_marker="\$evidence_dir\/PASSED.sha256"$/,/^cutover_succeeded=true$/p' \
   "$CUTOVER" >"$cutover_marker_publisher"
 [[ -s $cutover_marker_publisher ]] || {
   printf 'cutover success-marker publisher is missing\n' >&2
@@ -7514,8 +7516,13 @@ cutover_watchdog_timer_restart_line=$(grep -n '^systemctl restart "\$WATCHDOG_TI
 cutover_marker_hash_line=$(grep -n '^  sha256sum cutover.json >' "$CUTOVER" | cut -d: -f1)
 cutover_marker_move_line=$(grep -n '^mv -Tf "$success_marker_tmp" "$success_marker"$' \
   "$CUTOVER" | cut -d: -f1)
-cutover_marker_sync_line=$(grep -n '^sync "$success_marker"$' "$CUTOVER" | cut -d: -f1)
+cutover_marker_sync_line=$(grep -n '^sync "$success_marker"$' "$CUTOVER" \
+  | head -1 | cut -d: -f1)
 cutover_marker_dir_sync_line=$(grep -n '^sync -f "$evidence_dir"$' "$CUTOVER" \
+  | tail -1 | cut -d: -f1)
+cutover_marker_touch_line=$(grep -n '^touch -m -- "$success_marker"$' "$CUTOVER" \
+  | cut -d: -f1)
+cutover_marker_final_sync_line=$(grep -n '^sync "$success_marker"$' "$CUTOVER" \
   | tail -1 | cut -d: -f1)
 cutover_success_line=$(grep -n '^cutover_succeeded=true$' "$CUTOVER" | cut -d: -f1)
 cutover_trap_off_line=$(grep -n '^trap - EXIT$' "$CUTOVER" | tail -1 | cut -d: -f1)
@@ -7533,7 +7540,9 @@ cutover_trap_off_line=$(grep -n '^trap - EXIT$' "$CUTOVER" | tail -1 | cut -d: -
   && cutover_marker_hash_line < cutover_marker_move_line \
   && cutover_marker_move_line < cutover_marker_sync_line \
   && cutover_marker_sync_line < cutover_marker_dir_sync_line \
-  && cutover_marker_dir_sync_line < cutover_success_line \
+  && cutover_marker_dir_sync_line < cutover_marker_touch_line \
+  && cutover_marker_touch_line < cutover_marker_final_sync_line \
+  && cutover_marker_final_sync_line < cutover_success_line \
   && cutover_success_line < cutover_trap_off_line)) || {
   printf 'cutover publishes success before final verification or durable marker sync\n' >&2
   exit 1
@@ -7992,11 +8001,11 @@ join_shell_continuations "$CUTOVER" >"$cutover_joined"
 }
 [[ $(grep -c \
   '^[[:space:]]*verify_upload_units "\$pinned_upload_env" "\$REFERENCE_UPLOAD_EXEC" "\$MARKET_UPLOAD_EXEC" ' \
-  "$cutover_joined") -eq 5 ]] || {
+  "$cutover_joined") -eq 6 ]] || {
   printf 'cutover no longer verifies promoted upload units against candidate identity\n' >&2
   exit 1
 }
-[[ $(grep -c '^[[:space:]]*verify_upload_units "' "$cutover_joined") -eq 7 ]] || {
+[[ $(grep -c '^[[:space:]]*verify_upload_units "' "$cutover_joined") -eq 8 ]] || {
   printf 'unexpected verify_upload_units call count in cutover\n' >&2
   exit 1
 }
@@ -8165,6 +8174,280 @@ run_upload_units_case promoted "$candidate_reference_exec" "$candidate_market_ex
   printf 'promoted upload units rejected against candidate identity\n' >&2
   exit 1
 }
+
+# Post-cutover readback must bind the exact runtime before it downloads both
+# production OSS triplets, and it must never mutate systemd or the cutover evidence.
+readback_contract="$tmp_dir/readback-contract.sh"
+sed -n \
+  -e '/^verify_named_marker() {$/,/^}$/p' \
+  -e '/^production_upload_status() {$/,/^}$/p' \
+  -e '/^post_cutover_oss_triplet() {$/,/^}$/p' \
+  -e '/^cleanup_readback_download_root() {$/,/^}$/p' \
+  -e '/^verify_post_cutover_runtime() {$/,/^}$/p' \
+  -e '/^readback_cutover() {$/,/^}$/p' \
+  "$CUTOVER" >"$readback_contract"
+for helper in verify_named_marker production_upload_status post_cutover_oss_triplet \
+  cleanup_readback_download_root verify_post_cutover_runtime readback_cutover; do
+  grep -Fq "$helper() {" "$readback_contract" || {
+    printf 'post-cutover readback helper is missing: %s\n' "$helper" >&2
+    exit 1
+  }
+done
+grep -Fq \
+  '"$worker" --oss-triplet-readback-worker "$upload_env"' "$readback_contract"
+if grep -Eq 'systemctl (start|stop|restart|enable|disable|mask|unmask|reset-failed)' \
+  "$readback_contract"; then
+  printf 'post-cutover readback can mutate systemd state\n' >&2
+  exit 1
+fi
+grep -Fq 'polymarket-raw-ops-cutover.sh readback <cutover-evidence-directory>' \
+  "$CUTOVER"
+readback_dispatch_line=$(grep -n '^if \[\[ \$mode == readback \]\]; then$' "$CUTOVER" \
+  | cut -d: -f1)
+common_release_lock_line=$(grep -n '^exec 9>"\$LOCK_FILE"$' "$CUTOVER" \
+  | tail -1 | cut -d: -f1)
+((readback_dispatch_line < common_release_lock_line)) || {
+  printf 'post-cutover readback holds the mutation lock during OSS downloads\n' >&2
+  exit 1
+}
+health_poly_success_max_age=$(sed -n \
+  's/^POLY_SUCCESS_MAX_AGE=\([0-9][0-9]*\)$/\1/p' \
+  "$SCRIPT_DIR/monday-collector-health.sh")
+cutover_poly_success_max_age=$(sed -n \
+  's/^readonly POLY_SUCCESS_MAX_AGE_SECONDS=\([0-9][0-9]*\)$/\1/p' "$CUTOVER")
+[[ -n $health_poly_success_max_age \
+  && $cutover_poly_success_max_age == "$health_poly_success_max_age" ]] || {
+  printf 'post-cutover upload freshness differs from collector health\n' >&2
+  exit 1
+}
+
+run_readback_case() (
+  set -euo pipefail
+  local test_case=$1 root="$tmp_dir/readback-$1"
+  local candidate_sha source_revision bundle_sha manifest_sha archive_sha oss_sha
+  local evidence candidate_binary pinned_upload_env worker output status
+  local spool_dataset spool dataset runtime_checks=0
+  mkdir -p "$root"
+  candidate_sha=$(printf 'a%.0s' {1..64})
+  source_revision=$(printf 'b%.0s' {1..40})
+  bundle_sha=$(printf 'c%.0s' {1..64})
+  manifest_sha=$(printf 'd%.0s' {1..64})
+  archive_sha=$(printf 'e%.0s' {1..64})
+  oss_sha=$(printf 'f%.0s' {1..64})
+  EVIDENCE_ROOT="$root/evidence"
+  RELEASE_ROOT="$root/releases"
+  CONTROL_DIR="$root/control"
+  LOCK_FILE="$root/release.lock"
+  POLY_SUCCESS_MAX_AGE_SECONDS=$cutover_poly_success_max_age
+  RELEASE_MANIFEST="$CONTROL_DIR/polymarket-raw-ops-release.json"
+  REFERENCE_SPOOL="$root/reference"
+  MARKET_SPOOL="$root/market"
+  COLLECTOR_UNIT=polymarket-reference-collector.service
+  REFERENCE_UPLOAD_UNIT=polymarket-reference-upload.service
+  REFERENCE_UPLOAD_TIMER=polymarket-reference-upload.timer
+  MARKET_UPLOAD_UNIT=polymarket-market-tape-upload.service
+  MARKET_UPLOAD_TIMER=polymarket-market-tape-upload.timer
+  WATCHDOG_SUPPRESS_FILE="$root/watchdog.suppress"
+  REFERENCE_UPLOAD_EXEC=reference-upload
+  MARKET_UPLOAD_EXEC=market-upload
+  mkdir -p "$EVIDENCE_ROOT/run" "$RELEASE_ROOT/$candidate_sha" \
+    "$CONTROL_DIR" "$REFERENCE_SPOOL" "$MARKET_SPOOL"
+  evidence="$EVIDENCE_ROOT/run"
+  candidate_binary="$RELEASE_ROOT/$candidate_sha/polymarket-raw-ops"
+  pinned_upload_env="$RELEASE_ROOT/$candidate_sha/polymarket-upload-env-$oss_sha.env"
+  worker="$CONTROL_DIR/polymarket-raw-ops-shadow-gate.sh"
+  printf '#!/bin/sh\nexit 0\n' >"$candidate_binary"
+  chmod +x "$candidate_binary"
+  printf 'pinned\n' >"$pinned_upload_env"
+  printf 'release\n' >"$RELEASE_MANIFEST"
+  cat >"$worker" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$READBACK_WORKER_LOG"
+printf 'worker:%s\n' "$5" >>"$READBACK_EVENT_LOG"
+[[ ${READBACK_WORKER_FAIL:-false} != true ]] || exit 1
+mkdir "$6"
+jq -cn --arg uri "$4" --arg dataset "$5" \
+  --arg start_recorded_at "${READBACK_START_AT:-2026-08-26T00:01:00Z}" \
+  '{uri:$uri,dataset:$dataset,file:"market-updates.test.ndjson.zst",bytes:10,
+    sha256:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    source_bytes:20,
+    manifest_sha256:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    success_sha256:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    canonical:true,segment_complete:true,
+    start_recorded_at:$start_recorded_at,
+    end_recorded_at:"2026-08-26T00:02:00Z"}'
+if [[ ${READBACK_STATUS_DRIFT:-false} == true && $5 == crypto_expiry ]]; then
+  jq '.pending_segments = 1' "$READBACK_STATUS_DRIFT_PATH" \
+    >"$READBACK_STATUS_DRIFT_PATH.tmp"
+  mv "$READBACK_STATUS_DRIFT_PATH.tmp" "$READBACK_STATUS_DRIFT_PATH"
+elif [[ ${READBACK_STATUS_ADVANCE:-false} == true && $5 == crypto_expiry ]]; then
+  jq '.last_uploaded_object |= sub("market-updates.test"; "market-updates.next")' \
+    "$READBACK_STATUS_DRIFT_PATH" >"$READBACK_STATUS_DRIFT_PATH.tmp"
+  mv "$READBACK_STATUS_DRIFT_PATH.tmp" "$READBACK_STATUS_DRIFT_PATH"
+fi
+SH
+  chmod +x "$worker"
+  jq -n --arg candidate "$candidate_sha" --arg source "$source_revision" \
+    --arg bundle "$bundle_sha" --arg manifest "$manifest_sha" \
+    --arg archive "$archive_sha" --arg oss "$oss_sha" \
+    --arg invocation "$(printf '1%.0s' {1..32})" '
+    {schema:"monday.polymarket_cutover.v1",candidate_sha256:$candidate,
+      deployment_source_revision:$source,deployment_bundle_sha256:$bundle,
+      release_manifest_sha256:$manifest,control_archive_sha256:$archive,
+      oss_config_sha256:$oss,completed_at:"2026-08-26T00:00:00Z",
+      collector:{main_pid:42,restarts:0,invocation_id:$invocation},
+      post_start_identity_verified:true,upload_services_verified:true,
+      upload_timers_verified:true,watchdog_verified:true}' >"$evidence/cutover.json"
+  (cd "$evidence" && sha256sum cutover.json >PASSED.sha256)
+  for spool_dataset in \
+    "$REFERENCE_SPOOL|crypto_expiry_reference" "$MARKET_SPOOL|crypto_expiry"; do
+    spool=${spool_dataset%%|*}
+    dataset=${spool_dataset#*|}
+    jq -n --arg dataset "$dataset" '
+      {updated_at:"2026-08-26T00:03:00Z",
+        last_success_at:"2026-08-26T00:02:00Z",
+        last_uploaded_object:("oss://bucket/lake/raw/venue=polymarket/dataset="
+          + $dataset + "/date=2026-08-26/hour=00/market-updates.test.ndjson.zst"),
+        pending_segments:0,failed_segments:[],last_error:null}' \
+      >"$spool/upload-status.json"
+  done
+  : >"$root/systemctl.log"
+  : >"$root/worker.log"
+  : >"$root/event.log"
+  export READBACK_WORKER_LOG="$root/worker.log"
+  export READBACK_EVENT_LOG="$root/event.log"
+  [[ $test_case != oss-triplet-failure ]] || export READBACK_WORKER_FAIL=true
+  [[ $test_case != same-second-segment ]] \
+    || export READBACK_START_AT=2026-08-26T00:00:50Z
+  if [[ $test_case == upload-status-drift ]]; then
+    export READBACK_STATUS_DRIFT=true
+    export READBACK_STATUS_DRIFT_PATH="$MARKET_SPOOL/upload-status.json"
+  elif [[ $test_case == upload-status-advanced ]]; then
+    export READBACK_STATUS_ADVANCE=true
+    export READBACK_STATUS_DRIFT_PATH="$MARKET_SPOOL/upload-status.json"
+  fi
+  # shellcheck source=/dev/null
+  source "$readback_contract"
+  die() { printf 'readback rejected: %s\n' "$*" >&2; exit 1; }
+  mountpoint() { [[ $test_case != data-unmounted ]]; }
+  secure_root_chain() { return 0; }
+  secure_collector_directory() { return 0; }
+  secure_regular_file() { [[ -f $1 && ! -L $1 ]]; }
+  secure_release_directory() { [[ -d $1 && ! -L $1 ]]; }
+  verify_release_binding() { return 0; }
+  verify_control_release() { return 0; }
+  verify_rust_runtime() {
+    runtime_checks=$((runtime_checks + 1))
+    [[ $test_case != runtime-mismatch \
+      && ! ( $test_case == post-download-drift && $runtime_checks -ge 2 ) ]]
+  }
+  verify_upload_units() { return 0; }
+  verify_watchdog_runtime() { return 0; }
+  unit_enabled() { return 0; }
+  unit_active() { return 0; }
+  oss_config_sha256() { printf '%s\n' "$oss_sha"; }
+  flock() {
+    printf 'flock:%s\n' "$*" >>"$root/event.log"
+    return 0
+  }
+  stat() {
+    [[ $1 == -c && $2 == %Y && $3 == -- \
+      && $4 == "$evidence/PASSED.sha256" ]] || return 2
+    printf '1050\n'
+  }
+  systemctl() {
+    printf '%s\n' "$*" >>"$root/systemctl.log"
+    [[ $1 == is-failed && $2 == --quiet ]] || return 99
+    return 1
+  }
+  date() {
+    if [[ ${1:-} == -u && ${2:-} == -d ]]; then
+      case "$3" in
+        2026-08-26T00:00:00Z) printf '1000\n' ;;
+        2026-08-26T00:00:50Z) printf '1050\n' ;;
+        2026-08-26T00:01:00Z) printf '1100\n' ;;
+        2026-08-26T00:02:00Z) printf '1200\n' ;;
+        2026-08-26T00:03:00Z) printf '1300\n' ;;
+        *) return 1 ;;
+      esac
+    elif [[ ${1:-} == -u && ${2:-} == +%s ]]; then
+      [[ $test_case != stale-upload-success ]] \
+        && printf '2000\n' || printf '9001\n'
+    elif [[ ${1:-} == -u && ${2:-} == +%Y-%m-%dT%H:%M:%SZ ]]; then
+      printf '2026-08-26T00:10:00Z\n'
+    else
+      return 1
+    fi
+  }
+  readlink() {
+    local path=${!#}
+    [[ $path != "$0" ]] \
+      && printf '%s\n' "$path" \
+      || printf '%s\n' "$CONTROL_DIR/polymarket-raw-ops-cutover.sh"
+  }
+  mktemp() {
+    [[ $1 == -d ]]
+    mkdir "$root/downloads"
+    printf '%s\n' "$root/downloads"
+  }
+  cleanup_readback_download_root() {
+    [[ -z ${READBACK_DOWNLOAD_ROOT:-} ]] || rm -rf -- "$READBACK_DOWNLOAD_ROOT"
+    READBACK_DOWNLOAD_ROOT=
+  }
+  set +e
+  output=$(readback_cutover "$evidence" 2>"$root/stderr")
+  status=$?
+  set -e
+  case "$test_case" in
+    success)
+      ((status == 0))
+      jq -e --arg candidate "$candidate_sha" '
+        .schema == "monday.polymarket_post_cutover_readback.v1"
+        and .result == "active_complete" and .candidate_sha256 == $candidate
+        and .collector.main_pid == 42 and .collector.restarts == 0
+        and .reference.oss_triplet.canonical == true
+        and .market.oss_triplet.segment_complete == true
+        and .runtime_identity_verified == true
+        and .oss_triplets_verified == true
+      ' <<<"$output" >/dev/null
+      [[ $(wc -l <"$root/worker.log") -eq 2 ]]
+      [[ $(<"$root/event.log") == $'flock:-n 9\nflock:-u 9\nworker:crypto_expiry_reference\nworker:crypto_expiry\nflock:-n 9' ]]
+      [[ $(wc -l <"$root/systemctl.log") -eq 4 ]]
+      if grep -Ev '^is-failed --quiet (polymarket-reference-upload|polymarket-market-tape-upload)\.service$' \
+        "$root/systemctl.log" | grep -q .; then
+        return 1
+      fi
+      ;;
+    data-unmounted|runtime-mismatch)
+      ((status != 0))
+      [[ ! -s $root/worker.log && ! -s $root/systemctl.log ]]
+      ;;
+    stale-upload-success)
+      ((status != 0))
+      [[ ! -s $root/worker.log ]]
+      [[ $(wc -l <"$root/systemctl.log") -eq 2 ]]
+      ;;
+    post-download-drift|upload-status-drift|upload-status-advanced)
+      ((status != 0))
+      [[ $(wc -l <"$root/worker.log") -eq 2 ]]
+      ;;
+    oss-triplet-failure|same-second-segment)
+      ((status != 0))
+      [[ $(wc -l <"$root/worker.log") -eq 1 ]]
+      ;;
+    *) return 2 ;;
+  esac
+)
+
+for readback_case in success data-unmounted runtime-mismatch stale-upload-success \
+  oss-triplet-failure same-second-segment post-download-drift upload-status-drift \
+  upload-status-advanced; do
+  run_readback_case "$readback_case" || {
+    printf 'post-cutover readback case failed: %s\n' "$readback_case" >&2
+    exit 1
+  }
+done
 
 legacy_test_reference_allowlist=$(sed -n \
   "s/^[[:space:]]*legacy_runtime_reference_allowlist='\(.*\)'$/\1/p" "$CI_WORKFLOW")
