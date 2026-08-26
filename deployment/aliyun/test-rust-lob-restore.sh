@@ -62,6 +62,8 @@ grep -Fq 'monday-rust-lob-restore' "$INVOKE"
 
 # shellcheck disable=SC1090
 . "$RESTORE"
+# shellcheck disable=SC1090,SC1091
+. "$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
 
 # Translate the Ubuntu host calls used by the helper only on the macOS test
 # host. GitHub Actions already provides GNU stat, so preserve its arguments
@@ -168,22 +170,32 @@ setup_fixture() {
   CANDIDATE_BINARY="$CANDIDATE_RELEASE/binance-lob-archiver"
   DEPLOYMENT_BUNDLE_SHA256=$(printf 'b%.0s' {1..64})
   DEPLOYMENT_SOURCE_REVISION=$(printf 'c%.0s' {1..40})
-  jq -n \
-    --arg artifact "$CANDIDATE_SHA256" \
-    --arg bundle "$DEPLOYMENT_BUNDLE_SHA256" \
-    --arg source "$DEPLOYMENT_SOURCE_REVISION" \
-    '{artifact_sha256:$artifact,deployment_bundle_sha256:$bundle,
-      deployment_source_revision:$source}' >"$CANDIDATE_RELEASE/release.json"
   for asset in \
     binance-lob-archiver-production@.service \
+    binance-lob-archiver-rust@.service \
+    binance-lob-archiver-upload@.service \
+    binance-lob-archiver-rust-upload@.service \
     binance-lob-archiver-recovery@.service \
     binance-lob-archiver-recovery@.timer \
     binance-lob-archiver-production-spot.env \
     binance-lob-archiver-production-usdm.env \
+    binance-lob-archiver-rust-spot.env \
+    binance-lob-archiver-rust-usdm.env \
     host-rust-lob-recovery-queue.sh \
-    monday-collector-health.sh; do
+    monday-collector-health.sh \
+    rust-lob-control-plane-lib.sh; do
     install -m 0644 "$SCRIPT_DIR/$asset" "$CANDIDATE_DEPLOYMENT/$asset"
   done
+  RUNTIME_CONTRACT_SHA256=$(monday_rust_lob_runtime_contract_sha256 \
+    "$CANDIDATE_DEPLOYMENT")
+  jq -n \
+    --arg artifact "$CANDIDATE_SHA256" \
+    --arg runtime_contract "$RUNTIME_CONTRACT_SHA256" \
+    --arg bundle "$DEPLOYMENT_BUNDLE_SHA256" \
+    --arg source "$DEPLOYMENT_SOURCE_REVISION" \
+    '{artifact_sha256:$artifact,runtime_contract_sha256:$runtime_contract,
+      deployment_bundle_sha256:$bundle,
+      deployment_source_revision:$source}' >"$CANDIDATE_RELEASE/release.json"
   install -m 0644 "$SCRIPT_DIR/binance-lob-archiver-production@.service" \
     "$SYSTEMD_ROOT/binance-lob-archiver-production@.service"
   install -m 0644 "$SCRIPT_DIR/binance-lob-archiver-recovery@.service" \
@@ -203,7 +215,7 @@ setup_fixture() {
   install -m 0644 "$SCRIPT_DIR/rust-lob-runtime-health-policy.jq" \
     "$CANDIDATE_DEPLOYMENT/rust-lob-runtime-health-policy.jq"
   ln -s "$CANDIDATE_BINARY" "$PRODUCTION_LINK"
-  gate_dir="$GATE_ROOT/$CANDIDATE_SHA256/$DEPLOYMENT_BUNDLE_SHA256/runs/gate-1"
+  gate_dir="$GATE_ROOT/$CANDIDATE_SHA256/$RUNTIME_CONTRACT_SHA256/runs/gate-1"
   mkdir -p "$gate_dir"
   market=$(jq -cn \
     '{observation_started_ns:150,
@@ -279,13 +291,15 @@ setup_fixture() {
     <<<"$market")
   jq -n \
     --arg artifact "$CANDIDATE_SHA256" \
+    --arg runtime_contract "$RUNTIME_CONTRACT_SHA256" \
     --arg bundle "$DEPLOYMENT_BUNDLE_SHA256" \
     --arg source "$DEPLOYMENT_SOURCE_REVISION" \
     --arg run_id 20260820T000000Z-1 \
     --arg run_spool "/data/monday/spool/binance-lob-rust-shadow/runs/$CANDIDATE_SHA256/20260820T000000Z-1" \
     --argjson market "$market" \
     --argjson usdm_market "$usdm_market" \
-    '{schema:"monday.rust_lob_shadow_gate.v3",candidate_sha256:$artifact,
+    '{schema:"monday.rust_lob_shadow_gate.v4",candidate_sha256:$artifact,
+      runtime_contract_sha256:$runtime_contract,
       deployment_bundle_sha256:$bundle,deployment_source_revision:$source,
       run_id:$run_id,run_spool:$run_spool,
       required_duration_seconds:240,requested_duration_seconds:240,

@@ -225,6 +225,7 @@ write_recovery_evidence() {
     --arg failure_reason "$FAILURE_REASON" \
     --arg rollback_result "$ROLLBACK_RESULT" \
     --arg candidate_sha256 "$CANDIDATE_SHA256" \
+    --arg runtime_contract_sha256 "$RUNTIME_CONTRACT_SHA256" \
     --arg deployment_bundle_sha256 "$DEPLOYMENT_BUNDLE_SHA256" \
     --arg health_script_status "$HEALTH_SCRIPT_STATUS" \
     --arg previous_session_spot "$OLD_SESSION_SPOT" \
@@ -241,6 +242,8 @@ write_recovery_evidence() {
       failure_reason: (if $failure_reason == "" then null else $failure_reason end),
       rollback_result: $rollback_result,
       candidate_sha256: $candidate_sha256,
+      runtime_contract_sha256:
+        (if $runtime_contract_sha256 == "" then null else $runtime_contract_sha256 end),
       deployment_bundle_sha256: (if $deployment_bundle_sha256 == "" then null else $deployment_bundle_sha256 end),
       health_script_status: $health_script_status,
       previous_session_spot: (if $previous_session_spot == "" then null else $previous_session_spot end),
@@ -268,6 +271,7 @@ write_verification_evidence() {
   jq -n \
     --arg schema monday.rust_lob_recovery_verification.v1 \
     --arg candidate_sha256 "$CANDIDATE_SHA256" \
+    --arg runtime_contract_sha256 "$RUNTIME_CONTRACT_SHA256" \
     --arg deployment_bundle_sha256 "$DEPLOYMENT_BUNDLE_SHA256" \
     --arg health_script_status "$HEALTH_SCRIPT_STATUS" \
     --arg gate_marker "$GATE_MARKER" \
@@ -280,6 +284,7 @@ write_verification_evidence() {
     --argjson usdm_active "$usdm_active" \
     --argjson usdm_enabled "$usdm_enabled" \
     '{schema:$schema,candidate_sha256:$candidate_sha256,
+      runtime_contract_sha256:$runtime_contract_sha256,
       deployment_bundle_sha256:$deployment_bundle_sha256,
       health_script_status:$health_script_status,
       gate_marker:$gate_marker,current_binary:$current_binary,
@@ -346,12 +351,14 @@ restore_release() (
   CANDIDATE_DEPLOYMENT="$CANDIDATE_RELEASE/deployment"
   GATE_POLICY="$CANDIDATE_DEPLOYMENT/rust-lob-shadow-gate-policy.jq"
   RUNTIME_HEALTH_POLICY="$CANDIDATE_DEPLOYMENT/rust-lob-runtime-health-policy.jq"
-  GATE_BUNDLE_DIR=
+  CONTROL_PLANE_LIB="$CANDIDATE_DEPLOYMENT/rust-lob-control-plane-lib.sh"
+  GATE_RUNTIME_DIR=
   GATE_DIR=
   GATE_JSON=
   GATE_MARKER=
   DEPLOYMENT_BUNDLE_SHA256=
   DEPLOYMENT_SOURCE_REVISION=
+  RUNTIME_CONTRACT_SHA256=
   STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   EVIDENCE_DIR="$EVIDENCE_ROOT/$(date -u +%Y%m%dT%H%M%SZ)-${CANDIDATE_SHA256:0:12}-$$"
   STEP=preflight
@@ -395,19 +402,31 @@ restore_release() (
   secure_regular_file "$CANDIDATE_RELEASE/release.json"
   secure_regular_file "$GATE_POLICY"
   secure_regular_file "$RUNTIME_HEALTH_POLICY"
+  secure_regular_file "$CONTROL_PLANE_LIB"
   DEPLOYMENT_BUNDLE_SHA256=$(jq -er '.deployment_bundle_sha256' \
     "$CANDIDATE_RELEASE/release.json")
   DEPLOYMENT_SOURCE_REVISION=$(jq -er '.deployment_source_revision' \
+    "$CANDIDATE_RELEASE/release.json")
+  RUNTIME_CONTRACT_SHA256=$(jq -er '.runtime_contract_sha256' \
     "$CANDIDATE_RELEASE/release.json")
   [[ $DEPLOYMENT_BUNDLE_SHA256 =~ ^[a-f0-9]{64}$ ]] \
     || fail 'candidate release has an invalid deployment bundle SHA-256'
   [[ $DEPLOYMENT_SOURCE_REVISION =~ ^[a-f0-9]{40,64}$ ]] \
     || fail 'candidate release has an invalid deployment source revision'
+  [[ $RUNTIME_CONTRACT_SHA256 =~ ^[a-f0-9]{64}$ ]] \
+    || fail 'candidate release has an invalid runtime contract SHA-256'
   jq -e --arg sha "$CANDIDATE_SHA256" --arg bundle "$DEPLOYMENT_BUNDLE_SHA256" \
-    '.artifact_sha256 == $sha and .deployment_bundle_sha256 == $bundle' \
+    --arg runtime_contract "$RUNTIME_CONTRACT_SHA256" \
+    '.artifact_sha256 == $sha and .deployment_bundle_sha256 == $bundle
+      and .runtime_contract_sha256 == $runtime_contract' \
     "$CANDIDATE_RELEASE/release.json" >/dev/null \
     || fail 'candidate release metadata does not match the requested identity'
-  GATE_BUNDLE_DIR="$GATE_ROOT/$CANDIDATE_SHA256/$DEPLOYMENT_BUNDLE_SHA256"
+  # shellcheck disable=SC1090,SC1091
+  . "$CONTROL_PLANE_LIB"
+  [[ $(monday_rust_lob_runtime_contract_sha256 "$CANDIDATE_DEPLOYMENT") \
+    == "$RUNTIME_CONTRACT_SHA256" ]] \
+    || fail 'installed runtime contract does not match release metadata'
+  GATE_RUNTIME_DIR="$GATE_ROOT/$CANDIDATE_SHA256/$RUNTIME_CONTRACT_SHA256"
 
   STEP=validate-production-symlink
   [[ -L $PRODUCTION_LINK ]] || fail 'production symlink is missing'
@@ -418,12 +437,12 @@ restore_release() (
   printf '%s  %s\n' "$CANDIDATE_SHA256" "$current_target" | sha256sum --check --strict
 
   STEP=validate-shadow-gate
-  for path in "$GATE_ROOT" "$GATE_ROOT/$CANDIDATE_SHA256" "$GATE_BUNDLE_DIR" \
-    "$GATE_BUNDLE_DIR/runs"; do
+  for path in "$GATE_ROOT" "$GATE_ROOT/$CANDIDATE_SHA256" "$GATE_RUNTIME_DIR" \
+    "$GATE_RUNTIME_DIR/runs"; do
     path_is_direct_or_absent "$path" || fail "shadow gate path contains a symlink: $path"
   done
   shopt -s nullglob
-  gate_markers=("$GATE_BUNDLE_DIR"/runs/*/PASSED.sha256)
+  gate_markers=("$GATE_RUNTIME_DIR"/runs/*/PASSED.sha256)
   shopt -u nullglob
   (( ${#gate_markers[@]} == 1 )) \
     || fail "expected exactly one immutable passed shadow gate, found ${#gate_markers[@]}"
@@ -441,8 +460,7 @@ restore_release() (
   (cd "$GATE_DIR" && sha256sum --check --strict PASSED.sha256)
   jq -e \
     --arg candidate_sha256 "$CANDIDATE_SHA256" \
-    --arg deployment_bundle_sha256 "$DEPLOYMENT_BUNDLE_SHA256" \
-    --arg deployment_source_revision "$DEPLOYMENT_SOURCE_REVISION" \
+    --arg runtime_contract_sha256 "$RUNTIME_CONTRACT_SHA256" \
     -f "$GATE_POLICY" "$GATE_JSON" >/dev/null \
     || fail 'candidate shadow gate does not meet production thresholds'
   GATE_USDM_SYMBOLS=$(jq -er '.markets.usdm.symbols_config' "$GATE_JSON")

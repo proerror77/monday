@@ -106,6 +106,12 @@ for asset in "${assets[@]}"; do
   fi
 done
 
+# shellcheck disable=SC1090,SC1091
+. "$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
+RUNTIME_CONTRACT_SHA256=$(monday_rust_lob_runtime_contract_sha256 "$SCRIPT_DIR")
+[[ $RUNTIME_CONTRACT_SHA256 =~ ^[a-f0-9]{64}$ ]] \
+  || { printf 'failed to derive the Rust LOB runtime contract SHA-256\n' >&2; exit 2; }
+
 BUNDLE_PATH="$TMP_DIR/deployment.tar"
 COPYFILE_DISABLE=1 tar -C "$SCRIPT_DIR" -cf "$BUNDLE_PATH" "${assets[@]}"
 if command -v sha256sum >/dev/null 2>&1; then
@@ -129,12 +135,13 @@ aliyun ossutil cp \
   "${aliyun_profile_args[@]}"
 
 printf -v remote_variables \
-  'artifact_uri=%q\nartifact_sha256=%q\nsource_revision=%q\nbundle_uri=%q\nbundle_sha256=%q\nbundle_only=%q\n' \
+  'artifact_uri=%q\nartifact_sha256=%q\nsource_revision=%q\nbundle_uri=%q\nbundle_sha256=%q\nruntime_contract_sha256=%q\nbundle_only=%q\n' \
   "$ARTIFACT_OSS_URI" \
   "$ARTIFACT_SHA256" \
   "$SOURCE_REVISION" \
   "$BUNDLE_OSS_URI" \
   "$BUNDLE_SHA256" \
+  "$RUNTIME_CONTRACT_SHA256" \
   "$BUNDLE_ONLY"
 
 read -r -d '' remote_body <<'REMOTE_SCRIPT' || true
@@ -205,6 +212,10 @@ aliyun ossutil cp "$bundle_uri" "$bundle_tmp" \
   --force
 printf '%s  %s\n' "$bundle_sha256" "$bundle_tmp" | sha256sum --check --strict
 tar --no-same-owner --no-same-permissions -xf "$bundle_tmp" -C "$bundle_dir"
+# shellcheck disable=SC1090,SC1091
+. "$bundle_dir/rust-lob-control-plane-lib.sh"
+[[ $(monday_rust_lob_runtime_contract_sha256 "$bundle_dir") == "$runtime_contract_sha256" ]] \
+  || { printf 'deployment runtime contract does not match release metadata\n' >&2; exit 1; }
 
 if ! id hftcollector >/dev/null 2>&1; then
   useradd --system --create-home --home-dir /var/lib/hft-collector \
@@ -258,8 +269,8 @@ if [[ $bundle_only == 1 ]]; then
   deploy_staging=$(mktemp -d "$release_dir/.deployment.new.XXXXXX")
   cp -a "$bundle_dir/." "$deploy_staging/"
   meta_staging=$(mktemp "$release_dir/.release.json.new.XXXXXX")
-  printf '{"artifact_uri":"%s","artifact_sha256":"%s","deployment_source_revision":"%s","deployment_bundle_uri":"%s","deployment_bundle_sha256":"%s"}\n' \
-    "$artifact_uri" "$artifact_sha256" "$source_revision" "$bundle_uri" "$bundle_sha256" \
+  printf '{"artifact_uri":"%s","artifact_sha256":"%s","runtime_contract_sha256":"%s","deployment_source_revision":"%s","deployment_bundle_uri":"%s","deployment_bundle_sha256":"%s"}\n' \
+    "$artifact_uri" "$artifact_sha256" "$runtime_contract_sha256" "$source_revision" "$bundle_uri" "$bundle_sha256" \
     > "$meta_staging"
   chmod 0644 "$meta_staging"
   # Replace the deployment and metadata transactionally: rename the prior
@@ -301,8 +312,10 @@ elif [[ -e $release_dir || -L $release_dir ]]; then
     --arg source_revision "$source_revision" \
     --arg bundle_uri "$bundle_uri" \
     --arg bundle_sha256 "$bundle_sha256" \
+    --arg runtime_contract_sha256 "$runtime_contract_sha256" \
     '.artifact_uri == $artifact_uri
       and .artifact_sha256 == $artifact_sha256
+      and .runtime_contract_sha256 == $runtime_contract_sha256
       and .deployment_source_revision == $source_revision
       and .deployment_bundle_uri == $bundle_uri
       and .deployment_bundle_sha256 == $bundle_sha256' \
@@ -333,8 +346,8 @@ else
   install -d -m 0755 "$release_staging/deployment"
   install -m 0755 "$artifact_tmp" "$release_staging/binance-lob-archiver"
   cp -a "$bundle_dir/." "$release_staging/deployment/"
-  printf '{"artifact_uri":"%s","artifact_sha256":"%s","deployment_source_revision":"%s","deployment_bundle_uri":"%s","deployment_bundle_sha256":"%s"}\n' \
-    "$artifact_uri" "$artifact_sha256" "$source_revision" "$bundle_uri" "$bundle_sha256" \
+  printf '{"artifact_uri":"%s","artifact_sha256":"%s","runtime_contract_sha256":"%s","deployment_source_revision":"%s","deployment_bundle_uri":"%s","deployment_bundle_sha256":"%s"}\n' \
+    "$artifact_uri" "$artifact_sha256" "$runtime_contract_sha256" "$source_revision" "$bundle_uri" "$bundle_sha256" \
     > "$release_staging/release.json"
   chmod 0644 "$release_staging/release.json"
   printf '%s  %s\n' "$artifact_sha256" "$release_staging/binance-lob-archiver" \

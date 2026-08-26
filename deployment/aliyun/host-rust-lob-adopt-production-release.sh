@@ -297,23 +297,29 @@ verify_candidate_release() {
     || die 'candidate release is missing its deployment bundle digest'
   DEPLOYMENT_SOURCE_REVISION=$(jq -er '.deployment_source_revision' "$CANDIDATE_METADATA") \
     || die 'candidate release is missing its deployment source revision'
+  RUNTIME_CONTRACT_SHA256=$(jq -er '.runtime_contract_sha256' "$CANDIDATE_METADATA") \
+    || die 'candidate release is missing its runtime contract digest'
   [[ $DEPLOYMENT_BUNDLE_SHA256 =~ ^[a-f0-9]{64}$ ]] \
     || die 'candidate deployment bundle digest is invalid'
   [[ $DEPLOYMENT_SOURCE_REVISION =~ ^[a-f0-9]{40,64}$ ]] \
     || die 'candidate deployment source revision is invalid'
+  [[ $RUNTIME_CONTRACT_SHA256 =~ ^[a-f0-9]{64}$ ]] \
+    || die 'candidate runtime contract digest is invalid'
   jq -e --arg sha "$CANDIDATE_SHA256" --arg bundle "$DEPLOYMENT_BUNDLE_SHA256" \
-    '.artifact_sha256 == $sha and .deployment_bundle_sha256 == $bundle' \
+    --arg runtime_contract "$RUNTIME_CONTRACT_SHA256" \
+    '.artifact_sha256 == $sha and .deployment_bundle_sha256 == $bundle
+      and .runtime_contract_sha256 == $runtime_contract' \
     "$CANDIDATE_METADATA" >/dev/null \
     || die 'candidate release identity does not match its metadata'
 
-  GATE_BUNDLE_DIR="$GATE_ROOT/$CANDIDATE_SHA256/$DEPLOYMENT_BUNDLE_SHA256"
-  for path in "$GATE_ROOT" "$GATE_ROOT/$CANDIDATE_SHA256" "$GATE_BUNDLE_DIR" \
-    "$GATE_BUNDLE_DIR/runs"; do
+  GATE_RUNTIME_DIR="$GATE_ROOT/$CANDIDATE_SHA256/$RUNTIME_CONTRACT_SHA256"
+  for path in "$GATE_ROOT" "$GATE_ROOT/$CANDIDATE_SHA256" "$GATE_RUNTIME_DIR" \
+    "$GATE_RUNTIME_DIR/runs"; do
     secure_direct_directory "$path" \
       || die "candidate gate path is indirect, writable, or not root-owned: $path"
   done
   shopt -s nullglob
-  markers=("$GATE_BUNDLE_DIR"/runs/*/PASSED.sha256)
+  markers=("$GATE_RUNTIME_DIR"/runs/*/PASSED.sha256)
   shopt -u nullglob
   (( ${#markers[@]} == 1 )) \
     || die "expected exactly one verified candidate gate, found ${#markers[@]}"
@@ -333,8 +339,7 @@ verify_candidate_release() {
     || die 'candidate gate marker does not verify'
   jq -e \
     --arg candidate_sha256 "$CANDIDATE_SHA256" \
-    --arg deployment_bundle_sha256 "$DEPLOYMENT_BUNDLE_SHA256" \
-    --arg deployment_source_revision "$DEPLOYMENT_SOURCE_REVISION" \
+    --arg runtime_contract_sha256 "$RUNTIME_CONTRACT_SHA256" \
     -f "$gate_policy" "$gate_json" >/dev/null \
     || die 'candidate gate is not production eligible'
   [[ $(jq -er '.markets.usdm.symbols_config' "$gate_json") \
@@ -432,6 +437,7 @@ write_adoption_evidence() {
     --arg release_binary "$RELEASE_BINARY" \
     --arg upload_source "$CANDIDATE_UPLOAD" \
     --arg upload_sha "$upload_sha" \
+    --arg runtime_contract_sha "$RUNTIME_CONTRACT_SHA256" \
     --arg bundle_sha "$DEPLOYMENT_BUNDLE_SHA256" \
     --arg source_revision "$DEPLOYMENT_SOURCE_REVISION" \
     --argjson before_units "$BEFORE_UNITS" \
@@ -442,6 +448,7 @@ write_adoption_evidence() {
       started_at:$started_at,completed_at:$completed_at,
       current_binary_sha256:$current_sha,candidate_binary_sha256:$candidate_sha,
       adopted_release_binary:$release_binary,
+      candidate_runtime_contract_sha256:$runtime_contract_sha,
       candidate_deployment_bundle_sha256:$bundle_sha,
       candidate_deployment_source_revision:$source_revision,
       legacy_binary_supports_upload_only:false,

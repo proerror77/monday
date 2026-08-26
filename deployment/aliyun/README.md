@@ -1094,17 +1094,19 @@ The Gate fails unless all of these are true for the entire candidate run:
 A successful production gate writes:
 
 ```text
-/data/monday/evidence/shadow-gates/<artifact-sha256>/<deployment-bundle-sha256>/runs/<run-id>/run.json
-/data/monday/evidence/shadow-gates/<artifact-sha256>/<deployment-bundle-sha256>/runs/<run-id>/gate.json
-/data/monday/evidence/shadow-gates/<artifact-sha256>/<deployment-bundle-sha256>/runs/<run-id>/PASSED.sha256
+/data/monday/evidence/shadow-gates/<artifact-sha256>/<runtime-contract-sha256>/runs/<run-id>/run.json
+/data/monday/evidence/shadow-gates/<artifact-sha256>/<runtime-contract-sha256>/runs/<run-id>/gate.json
+/data/monday/evidence/shadow-gates/<artifact-sha256>/<runtime-contract-sha256>/runs/<run-id>/PASSED.sha256
 ```
 
 Every invocation gets a new append-only run directory; prior gate evidence is
 never deleted or replaced. The marker hashes exactly that run's `gate.json`.
-Evidence also binds the clean source revision and deployment-bundle SHA-256, so
-unit or env changes cannot consume an older gate for the same binary. A second
-production gate for an identity that already has a passing run is refused, and
-cutover requires exactly one immutable passing run. A short test override is
+Evidence binds the binary and the content hash of the eight production/Shadow
+unit and environment files. It records the clean source revision and full
+deployment-bundle SHA-256 separately, so a controller-only fix can reuse the
+same runtime Gate while unit or environment changes cannot. A second production
+gate for an identity that already has a passing run is refused, and cutover
+requires exactly one immutable passing run. A short test override is
 available only for script testing; it writes `passed=false` and never creates
 `PASSED.sha256`, so it cannot authorize cutover.
 
