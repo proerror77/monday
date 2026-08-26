@@ -28,6 +28,8 @@ printf '%s\n' .github/ISSUE_TEMPLATE/engineering-change.yml >"$tmp_dir/governanc
 printf '%s\n' docs/agents/issue-tracker.md >"$tmp_dir/governance-doc.txt"
 printf '%s\n' Makefile >"$tmp_dir/unknown-root.txt"
 printf '%s\n' config/risk.toml >"$tmp_dir/unknown-nested.txt"
+printf '%s\n' deployment/aliyun/host-rust-lob-cutover.sh >"$tmp_dir/lob-control.txt"
+printf '%s\n' deployment/aliyun/polymarket-market-recorder-deploy.sh >"$tmp_dir/market-recorder-control.txt"
 printf '%s\n' rust_hft/deployment/docker/Dockerfile.trading >"$tmp_dir/trading-dockerfile.txt"
 printf '%s\n' rust_hft/docs/README.md >"$tmp_dir/rust-docs.txt"
 printf '%s\n' rust_hft/research-core/README.md >"$tmp_dir/package-readme.txt"
@@ -94,13 +96,15 @@ job_cases=(
   'collector|pull_request|collector.txt|ci/rust,ci/polymarket-evidence-compiler-image'
   'pinned-aliyun|pull_request|pinned-aliyun.txt|ploy/integration-regressions,ci/rust'
   'pinned-aliyun-push|push|pinned-aliyun.txt|ploy/integration-regressions,ci/rust'
-  'future-aliyun-pin|pull_request|future-aliyun-pin.txt|ploy/integration-regressions,ci/rust'
-  'future-aliyun-markdown-pin|pull_request|future-aliyun-markdown-pin.txt|ploy/integration-regressions,ci/rust'
+  'future-aliyun-pin|pull_request|future-aliyun-pin.txt|'
+  'future-aliyun-markdown-pin|pull_request|future-aliyun-markdown-pin.txt|'
+  'lob-control|pull_request|lob-control.txt|'
+  'market-recorder-control|pull_request|market-recorder-control.txt|ci/market-recorder-contract'
   'evaluator|pull_request|evaluator.txt|ploy/commit-hygiene,ploy/rust-format,ploy/safety-scans,ploy/rust-research-heavy'
   'shared-prediction|pull_request|shared-prediction.txt|ploy/commit-hygiene,ploy/rust-format,ploy/safety-scans,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
   'prediction-lock|pull_request|prediction-lock.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
   'research-dockerfile|pull_request|research-dockerfile.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans'
-  'unknown-docker|pull_request|unknown-docker.txt|ci/rust,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
+  'unknown-docker|pull_request|unknown-docker.txt|ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
   'prediction-workflow|pull_request|prediction-workflow.txt|ploy/commit-hygiene,ploy/workflow-lint,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
   'root-node|pull_request|root-node.txt|ci/node-install'
   'security-workflow|pull_request|security-workflow.txt|ploy/commit-hygiene,ploy/workflow-lint'
@@ -108,8 +112,8 @@ job_cases=(
   'governance-template|pull_request|governance-template.txt|ploy/commit-hygiene,ploy/workflow-lint'
   'governance-doc|pull_request|governance-doc.txt|ploy/commit-hygiene,ploy/workflow-lint'
   'preflight-only|pull_request|preflight-only.txt|ploy/commit-hygiene'
-  'unknown-workflow|pull_request|unknown-workflow.txt|ci/rust,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/workflow-lint,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
-  'unknown-root|pull_request|unknown-root.txt|ci/rust,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
+  'unknown-workflow|pull_request|unknown-workflow.txt|ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/workflow-lint,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
+  'unknown-root|pull_request|unknown-root.txt|ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
   'unknown-nested|pull_request|unknown-nested.txt|'
   'rust-docs|pull_request|rust-docs.txt|'
   'package-readme|pull_request|package-readme.txt|'
@@ -181,6 +185,7 @@ assert_security_jobs "$tmp_dir/security-workflow.out" "$all_security_jobs"
 assert_security_jobs "$tmp_dir/security-workflow-push.out" "$all_security_jobs,security/container-scan"
 assert_security_jobs "$tmp_dir/root-node.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
 assert_security_jobs "$tmp_dir/unknown-nested.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
+assert_security_jobs "$tmp_dir/lob-control.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
 assert_security_jobs "$tmp_dir/trading-dockerfile-push.out" 'security/sast-semgrep,security/secret-presence,security/container-scan,security/secret-detection'
 trading_develop="$tmp_dir/trading-dockerfile-develop.out"
 GITHUB_REF=refs/heads/develop "$selector" --event push \
@@ -213,9 +218,9 @@ for flag in handoff json ondo focused toolchain; do assert_flag "$live" "$flag" 
 for flag in loop collector control; do assert_flag "$live" "$flag" false; done
 
 control=$(run_case control pull_request control.txt)
-assert_jobs "$control" 'ploy/integration-regressions,ci/rust'
-for flag in control toolchain; do assert_flag "$control" "$flag" true; done
-for flag in loop handoff json ondo collector focused; do assert_flag "$control" "$flag" false; done
+assert_jobs "$control" ''
+assert_flag "$control" control true
+for flag in loop handoff json ondo collector focused toolchain; do assert_flag "$control" "$flag" false; done
 
 docs="$tmp_dir/docs.out"
 for flag in loop handoff json ondo collector control focused toolchain; do
@@ -233,10 +238,11 @@ grep -Fqx '    needs: selector' "$ci_workflow"
 grep -Fqx "$always_condition" "$ci_workflow"
 grep -Fqx "          if [[ \"\$SELECTOR_RESULT\" == success && \"\$SELECTED_COMPLETE\" == true ]] &&" "$ci_workflow"
 grep -Fqx "             [[ \"\$SELECTED_JOBS\" =~ ^,[a-z0-9/-]*(,[a-z0-9/-]+)*,\$ ]] &&" "$ci_workflow"
-grep -Fq "'jobs=,ci/rust,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,'" "$ci_workflow"
+grep -Fq "'jobs=,ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,'" "$ci_workflow"
 grep -Fq "contains(needs.scope.outputs.jobs, ',ci/rust,')" "$ci_workflow"
 [[ $(grep -Fxc '      owning_packages: ${{ steps.scope.outputs.owning_packages }}' "$ci_workflow") -eq 2 ]]
 grep -Fqx '      - name: Summarize check plan' "$ci_workflow"
+grep -Fq -- '- Collector control contract: %s' "$ci_workflow"
 grep -Fqx '      CARGO_PROFILE_DEV_DEBUG: "0"' "$ci_workflow"
 grep -Fqx '      CARGO_PROFILE_TEST_DEBUG: "0"' "$ci_workflow"
 grep -Fqx '  rust_fast_gates:' "$ci_workflow"
@@ -252,8 +258,10 @@ job_block() {
 }
 rust_job_block=$(job_block rust)
 fast_gates_block=$(job_block rust_fast_gates)
+scope_job_block=$(job_block scope)
 [ -n "$rust_job_block" ]
 [ -n "$fast_gates_block" ]
+[ -n "$scope_job_block" ]
 
 # rust_fast_gates must carry the same scope condition as the heavy rust job,
 # checked inside its own block (a file-wide substring match would pass even
@@ -278,11 +286,16 @@ grep -Fq 'uses: mozilla-actions/sccache-action@v0.0.10' <<<"$fast_lane_block"
 ! grep -Fq 'shellcheck' <<<"$rust_job_block"
 ! grep -Fq 'test-rust-lob-control-plane.sh' <<<"$rust_job_block"
 ! grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$fast_gates_block"
-grep -Fq 'test-rust-lob-control-plane.sh' <<<"$fast_gates_block"
-grep -Fq 'test-rust-lob-recovery-queue.sh' <<<"$fast_gates_block"
-grep -Fq 'shellcheck' <<<"$fast_gates_block"
+! grep -Fq 'test-rust-lob-control-plane.sh' <<<"$fast_gates_block"
+! grep -Fq 'test-rust-lob-recovery-queue.sh' <<<"$fast_gates_block"
+! grep -Fq 'shellcheck' <<<"$fast_gates_block"
+grep -Fq 'test-rust-lob-control-plane.sh' <<<"$scope_job_block"
+grep -Fq 'test-rust-lob-recovery-queue.sh' <<<"$scope_job_block"
+grep -Fq 'test-polymarket-raw-ops-control-plane.sh' <<<"$scope_job_block"
+grep -Fq 'test-monday-collector-health.sh' <<<"$scope_job_block"
+grep -Fq 'shellcheck' <<<"$scope_job_block"
 grep -Fq 'cargo fmt --check' <<<"$fast_gates_block"
-grep -Fq 'test-polymarket-raw-ops-control-plane.sh' <<<"$rust_job_block"
+! grep -Fq 'test-polymarket-raw-ops-control-plane.sh' <<<"$rust_job_block"
 grep -Fqx '      - name: Test directly changed Rust packages' "$ci_workflow"
 grep -Fq 'cargo test "${args[@]}" --locked' <<<"$rust_job_block"
 
@@ -292,6 +305,7 @@ grep -Fqx '      - market_recorder_contract' <<<"$ci_gate_block"
 recorder_block=$(job_block market_recorder_contract)
 [ -n "$recorder_block" ]
 grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$recorder_block"
+grep -Fq "contains(needs.scope.outputs.jobs, ',ci/market-recorder-contract,')" <<<"$recorder_block"
 ! grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$rust_job_block"
 grep -Fqx "        if: always() && needs.scope.outputs.toolchain == 'true'" "$ci_workflow"
 
