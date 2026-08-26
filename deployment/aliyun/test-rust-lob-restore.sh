@@ -588,25 +588,16 @@ run_drifted_health_script_fixture() (
     'installed production asset drifted from the gated deployment bundle'
 )
 
-run_legacy_health_script_fixture() (
-  fixture="$tmp_dir/legacy-health-script"
+run_missing_candidate_health_script_fixture() (
+  fixture="$tmp_dir/missing-candidate-health-script"
   setup_fixture "$fixture"
   rm -f "$CANDIDATE_DEPLOYMENT/monday-collector-health.sh"
-  legacy_health_sha=$(sha256sum "$BIN_DIR/monday-collector-health.sh" | awk '{print $1}')
-  restore_release "$CANDIDATE_SHA256" >"$fixture/out" 2>&1 \
-    || { printf 'restore rejected a legacy release without a bundled health script\n' >&2; exit 1; }
-  [[ $(sha256sum "$BIN_DIR/monday-collector-health.sh" | awk '{print $1}') \
-    == "$legacy_health_sha" ]]
-  evidence=$(restore_evidence_dir)
-  jq -e '
-    .result == "passed"
-    and .health_script_status == "legacy-installed-unbound"' \
-    "$evidence/recovery.json" >/dev/null
-  jq -e '
-    .health_script_status == "legacy-installed-unbound"
-    and .verification.installed_assets_match_bundle == false
-    and .verification.health_script_matches_bundle == false' \
-    "$evidence/verification.json" >/dev/null
+  if restore_release "$CANDIDATE_SHA256" >"$fixture/out" 2>&1; then
+    printf 'restore accepted a candidate without a bundled health script\n' >&2
+    exit 1
+  fi
+  assert_failed_recovery "$fixture/out" validate-installed-production-assets \
+    "required regular file is missing or a symlink: $CANDIDATE_DEPLOYMENT/monday-collector-health.sh"
 )
 
 run_health_failure_fixture() (
@@ -675,7 +666,7 @@ run_spool_symlink_fixture
 run_recovery_isolation_fixture
 run_drifted_assets_fixture
 run_drifted_health_script_fixture
-run_legacy_health_script_fixture
+run_missing_candidate_health_script_fixture
 run_health_failure_fixture
 run_evidence_failure_disables_recovery_timers_fixture
 

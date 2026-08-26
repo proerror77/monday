@@ -63,6 +63,10 @@ OLD_USDM_INVOCATION_ID=
 MASK_USDM_UPLOAD_FOR_TRANSITION=0
 MASK_SPOT_UPLOAD_FOR_TRANSITION=0
 OLD_HEALTH_ASSET_PRESENT=0
+OLD_HEALTH_SCRIPT_SHA256=
+OLD_HEALTH_SCRIPT_SNAPSHOT=
+OLD_HEALTH_ROLLBACK_SOURCE=absent
+HEALTH_SCRIPT_ROLLBACK_RESULT=not-needed
 
 PRODUCTION_UNITS=(
   binance-lob-archiver-production@spot.service
@@ -420,6 +424,51 @@ remove_installed_health_script() {
   [[ ! -e $INSTALLED_HEALTH_SCRIPT && ! -L $INSTALLED_HEALTH_SCRIPT ]]
 }
 
+stage_new_host_health_for_rollback() {
+  local snapshot="$EVIDENCE_DIR/new-host-previous-monday-collector-health.sh"
+  local manifest="$EVIDENCE_DIR/new-host-previous-monday-collector-health.sh.sha256"
+  OLD_HEALTH_ASSET_PRESENT=0
+  OLD_HEALTH_SCRIPT_SHA256=
+  OLD_HEALTH_SCRIPT_SNAPSHOT=
+  OLD_HEALTH_ROLLBACK_SOURCE=new-host-absent
+  [[ -e $INSTALLED_HEALTH_SCRIPT || -L $INSTALLED_HEALTH_SCRIPT ]] || return 0
+  secure_regular_file "$INSTALLED_HEALTH_SCRIPT"
+  [[ ! -e $snapshot && ! -L $snapshot && ! -e $manifest && ! -L $manifest ]] \
+    || fail "new-host health rollback evidence already exists: $snapshot"
+  atomic_install 0755 "$INSTALLED_HEALTH_SCRIPT" "$snapshot" \
+    || fail 'could not snapshot the preexisting new-host health script'
+  OLD_HEALTH_SCRIPT_SHA256=$(sha256sum "$snapshot" | awk '{print $1}')
+  printf '%s  %s\n' "$OLD_HEALTH_SCRIPT_SHA256" "${snapshot##*/}" >"$manifest"
+  chmod 0640 "$manifest"
+  (cd "$EVIDENCE_DIR" && sha256sum --check --strict "${manifest##*/}") >/dev/null \
+    || fail 'new-host health rollback snapshot failed SHA-256 verification'
+  OLD_HEALTH_ASSET_PRESENT=1
+  OLD_HEALTH_SCRIPT_SNAPSHOT=$snapshot
+  OLD_HEALTH_ROLLBACK_SOURCE=new-host-installed
+}
+
+restore_new_host_health_after_failure() {
+  local expected_snapshot="$EVIDENCE_DIR/new-host-previous-monday-collector-health.sh"
+  if (( OLD_HEALTH_ASSET_PRESENT )); then
+    [[ $OLD_HEALTH_ROLLBACK_SOURCE == new-host-installed \
+      && $OLD_HEALTH_SCRIPT_SNAPSHOT == "$expected_snapshot" \
+      && $OLD_HEALTH_SCRIPT_SHA256 =~ ^[a-f0-9]{64}$ \
+      && -f $OLD_HEALTH_SCRIPT_SNAPSHOT && ! -L $OLD_HEALTH_SCRIPT_SNAPSHOT ]] \
+      || return 1
+    printf '%s  %s\n' "$OLD_HEALTH_SCRIPT_SHA256" "$OLD_HEALTH_SCRIPT_SNAPSHOT" \
+      | sha256sum --check --strict >/dev/null || return 1
+    atomic_install 0755 "$OLD_HEALTH_SCRIPT_SNAPSHOT" "$INSTALLED_HEALTH_SCRIPT" \
+      || return 1
+    printf '%s  %s\n' "$OLD_HEALTH_SCRIPT_SHA256" "$INSTALLED_HEALTH_SCRIPT" \
+      | sha256sum --check --strict >/dev/null || return 1
+    HEALTH_SCRIPT_ROLLBACK_RESULT=previous-bytes-restored
+  else
+    [[ $OLD_HEALTH_ROLLBACK_SOURCE == new-host-absent ]] || return 1
+    remove_installed_health_script || return 1
+    HEALTH_SCRIPT_ROLLBACK_RESULT=candidate-removed
+  fi
+}
+
 atomic_symlink() {
   local target=$1 link=$2 temporary resolved_target
   resolved_target=$(readlink -f -- "$target" 2>/dev/null) || return 1
@@ -515,6 +564,9 @@ stage_existing_deployment_for_rollback() {
   local snapshot="$EVIDENCE_DIR/rollback-deployment"
   local manifest="$EVIDENCE_DIR/rollback-deployment.sha256"
   OLD_HEALTH_ASSET_PRESENT=0
+  OLD_HEALTH_SCRIPT_SHA256=
+  OLD_HEALTH_SCRIPT_SNAPSHOT=
+  OLD_HEALTH_ROLLBACK_SOURCE=absent
   [[ ! -L $OLD_DEPLOYMENT ]] || fail "old staged deployment is a symlink: $OLD_DEPLOYMENT"
   for asset in "${BASE_DEPLOYMENT_ASSETS[@]}"; do
     if [[ -e $release_deployment/$asset ]]; then
@@ -583,6 +635,11 @@ stage_existing_deployment_for_rollback() {
     secure_regular_file "$installed_source"
     snapshot_source="$snapshot/$asset"
     atomic_install "$mode" "$installed_source" "$snapshot_source"
+    if [[ $asset == "$HEALTH_DEPLOYMENT_ASSET" ]]; then
+      OLD_HEALTH_SCRIPT_SHA256=$(sha256sum "$snapshot_source" | awk '{print $1}')
+      OLD_HEALTH_SCRIPT_SNAPSHOT=$snapshot_source
+      OLD_HEALTH_ROLLBACK_SOURCE=rollback-deployment
+    fi
     if [[ $source_kind == release \
       && ( -e $release_deployment/$asset || -L $release_deployment/$asset ) ]]; then
       source="$release_deployment/$asset"
@@ -968,6 +1025,7 @@ write_evidence() {
   local temporary current_target spot_active usdm_active
   local previous_recovery_timer_spot_enabled previous_recovery_timer_usdm_enabled
   local previous_recovery_timer_spot_masked_runtime previous_recovery_timer_usdm_masked_runtime
+  local previous_health_script_present
   temporary="$EVIDENCE_DIR/cutover.json.tmp"
   current_target=$(readlink -f "$PRODUCTION_LINK" 2>/dev/null || true)
   spot_active=$(unit_active_json "${PRODUCTION_UNITS[0]}")
@@ -992,6 +1050,11 @@ write_evidence() {
   else
     previous_recovery_timer_usdm_masked_runtime=false
   fi
+  if (( OLD_HEALTH_ASSET_PRESENT )); then
+    previous_health_script_present=true
+  else
+    previous_health_script_present=false
+  fi
   jq -n \
     --arg started_at "$STARTED_AT" \
     --arg completed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -1000,6 +1063,11 @@ write_evidence() {
     --arg failure_reason "$FAILURE_REASON" \
     --arg rollback_result "$ROLLBACK_RESULT" \
     --arg rollback_deployment_manifest_sha256 "$ROLLBACK_DEPLOYMENT_MANIFEST_SHA256" \
+    --arg health_script_rollback_result "$HEALTH_SCRIPT_ROLLBACK_RESULT" \
+    --arg previous_health_script_sha256 "$OLD_HEALTH_SCRIPT_SHA256" \
+    --arg previous_health_script_snapshot "$OLD_HEALTH_SCRIPT_SNAPSHOT" \
+    --arg previous_health_rollback_source "$OLD_HEALTH_ROLLBACK_SOURCE" \
+    --argjson previous_health_script_present "$previous_health_script_present" \
     --arg candidate_sha256 "$CANDIDATE_SHA256" \
     --arg deployment_source_revision "$DEPLOYMENT_SOURCE_REVISION" \
     --arg deployment_bundle_sha256 "$DEPLOYMENT_BUNDLE_SHA256" \
@@ -1026,6 +1094,13 @@ write_evidence() {
       rollback_deployment_manifest_sha256:
         (if $rollback_deployment_manifest_sha256 == "" then null
          else $rollback_deployment_manifest_sha256 end),
+      health_script_rollback_result: $health_script_rollback_result,
+      previous_health_script: {
+        present: $previous_health_script_present,
+        rollback_source: $previous_health_rollback_source,
+        sha256: (if $previous_health_script_sha256 == "" then null else $previous_health_script_sha256 end),
+        snapshot: (if $previous_health_script_snapshot == "" then null else $previous_health_script_snapshot end)
+      },
       candidate_sha256: $candidate_sha256,
       deployment_source_revision:
         (if $deployment_source_revision == "" then null else $deployment_source_revision end),
@@ -1066,6 +1141,10 @@ rollback_after_failure() {
   systemctl stop "${RECOVERY_UNITS[@]}" >/dev/null 2>&1 || true
   systemctl disable --now "${PRODUCTION_UNITS[@]}" >/dev/null 2>&1 || true
   systemctl mask --runtime "${TRANSITION_MASK_UNITS[@]}" >/dev/null 2>&1 || true
+  if [[ $OLD_MODE == new-host ]] \
+    && ! restore_new_host_health_after_failure; then
+    HEALTH_SCRIPT_ROLLBACK_RESULT=failed
+  fi
   production_is_fail_closed || safe_to_restart=0
   if (( safe_to_restart == 0 )); then
     if production_is_fail_closed; then
@@ -1266,7 +1345,10 @@ rollback_after_failure() {
     if [[ $(readlink -f "$PRODUCTION_LINK" 2>/dev/null || true) == "$CANDIDATE_BINARY" ]]; then
       rm -f "$PRODUCTION_LINK"
     fi
-    if production_is_fail_closed; then
+    if [[ $HEALTH_SCRIPT_ROLLBACK_RESULT == failed ]] \
+      && production_is_fail_closed; then
+      ROLLBACK_RESULT=new-host-health-restore-failed-disabled
+    elif production_is_fail_closed; then
       ROLLBACK_RESULT=new-host-disabled
     else
       ROLLBACK_RESULT=new-host-containment-failed
@@ -1464,6 +1546,7 @@ elif (( active_count == 0 && enabled_count == 0 )) && [[ ! -e $PRODUCTION_LINK &
   (( PRODUCTION_USDM_MEMORY_DROPIN_PRESENT == 0 )) \
     || fail 'new host must not retain a production USD-M drop-in'
   require_empty_segment_spool || fail 'new host canonical spool contains segment artifacts'
+  stage_new_host_health_for_rollback
 else
   fail "ambiguous production state: active=$active_count enabled=$enabled_count spot=$spot_active_state/$spot_enabled_state/$spot_upload_enabled_state usdm=$usdm_active_state/$usdm_enabled_state/$usdm_upload_enabled_state symlink=$PRODUCTION_LINK"
 fi

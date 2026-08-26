@@ -54,8 +54,8 @@ RESTORE_ASSETS=(
   binance-lob-archiver-production-spot.env
   binance-lob-archiver-production-usdm.env
   host-rust-lob-recovery-queue.sh
+  monday-collector-health.sh
 )
-HEALTH_DEPLOYMENT_ASSET=monday-collector-health.sh
 
 fail() {
   FAILURE_REASON=$*
@@ -480,26 +480,15 @@ restore_release() (
       *.env) installed_asset="$CONFIG_ROOT/$asset" ;;
       host-rust-lob-recovery-queue.sh)
         installed_asset="$BIN_DIR/monday-rust-lob-recovery-queue" ;;
+      monday-collector-health.sh)
+        installed_asset="$BIN_DIR/monday-collector-health.sh" ;;
     esac
     secure_regular_file "$installed_asset"
     secure_regular_file "$CANDIDATE_DEPLOYMENT/$asset"
     cmp -s -- "$CANDIDATE_DEPLOYMENT/$asset" "$installed_asset" \
       || fail "installed production asset drifted from the gated deployment bundle: $installed_asset"
   done
-  candidate_health_script="$CANDIDATE_DEPLOYMENT/$HEALTH_DEPLOYMENT_ASSET"
-  installed_health_script="$BIN_DIR/monday-collector-health.sh"
-  if [[ -e $candidate_health_script || -L $candidate_health_script ]]; then
-    secure_regular_file "$candidate_health_script"
-    secure_regular_file "$installed_health_script"
-    cmp -s -- "$candidate_health_script" "$installed_health_script" \
-      || fail "installed production asset drifted from the gated deployment bundle: $installed_health_script"
-    HEALTH_SCRIPT_STATUS=bundled-verified
-  elif [[ -e $installed_health_script || -L $installed_health_script ]]; then
-    secure_regular_file "$installed_health_script"
-    HEALTH_SCRIPT_STATUS=legacy-installed-unbound
-  else
-    HEALTH_SCRIPT_STATUS=legacy-not-installed
-  fi
+  HEALTH_SCRIPT_STATUS=bundled-verified
   if [[ $(sed -n 's/^SYMBOLS=//p' \
     "$CANDIDATE_DEPLOYMENT/binance-lob-archiver-production-usdm.env") != ALL ]]; then
     USDM_MINIMUM_SYMBOLS=100

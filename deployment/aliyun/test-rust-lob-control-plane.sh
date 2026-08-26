@@ -1379,6 +1379,12 @@ sed -n '/^rollback_after_failure()/,/^}/p' "$CUTOVER" >"$rollback_body"
 remove_health_body="$tmp_dir/remove-installed-health.sh"
 sed -n '/^remove_installed_health_script()/,/^}/p' "$CUTOVER" \
   >"$remove_health_body"
+stage_new_host_health_body="$tmp_dir/stage-new-host-health.sh"
+sed -n '/^stage_new_host_health_for_rollback()/,/^}/p' "$CUTOVER" \
+  >"$stage_new_host_health_body"
+restore_new_host_health_body="$tmp_dir/restore-new-host-health.sh"
+sed -n '/^restore_new_host_health_after_failure()/,/^}/p' "$CUTOVER" \
+  >"$restore_new_host_health_body"
 production_predicate_body="$tmp_dir/production-is-fail-closed.sh"
 sed -n '/^production_is_fail_closed()/,/^}/p' "$CUTOVER" \
   >"$production_predicate_body"
@@ -1482,6 +1488,13 @@ grep -Fq 'binance-lob-archiver@spot.service' "$CUTOVER"
 grep -Fq 'binance-lob-archiver@usdm.service' "$CUTOVER"
 grep -Fq 'contained-upgrade' "$CUTOVER"
 grep -Fq 'capture_existing_production_identity contained-upgrade' "$CUTOVER"
+new_host_health_stage_line=$(grep -nF '  stage_new_host_health_for_rollback' "$CUTOVER" | cut -d: -f1)
+transition_started_line=$(grep -nF 'TRANSITION_STARTED=1' "$CUTOVER" | cut -d: -f1)
+[[ -n $new_host_health_stage_line && -n $transition_started_line \
+  && $new_host_health_stage_line -lt $transition_started_line ]] || {
+  printf 'new-host health snapshot no longer completes before transition mutation\n' >&2
+  exit 1
+}
 grep -Fq 'partial-contained-spot-live' "$CUTOVER"
 grep -Fq 'capture_existing_production_identity partial-contained-spot-live' "$CUTOVER"
 grep -Fq 'partial-contained-usdm-live' "$CUTOVER"
@@ -1678,6 +1691,11 @@ run_write_evidence_fixture() (
   FAILURE_REASON=
   ROLLBACK_RESULT=not-needed
   ROLLBACK_DEPLOYMENT_MANIFEST_SHA256=
+  HEALTH_SCRIPT_ROLLBACK_RESULT=not-needed
+  OLD_HEALTH_ASSET_PRESENT=1
+  OLD_HEALTH_SCRIPT_SHA256=$(printf 'a%.0s' {1..64})
+  OLD_HEALTH_SCRIPT_SNAPSHOT=/evidence/rollback-health.sh
+  OLD_HEALTH_ROLLBACK_SOURCE=rollback-deployment
   CANDIDATE_SHA256=$(printf 'c%.0s' {1..64})
   DEPLOYMENT_SOURCE_REVISION=$(printf 'd%.0s' {1..40})
   DEPLOYMENT_BUNDLE_SHA256=$(printf 'e%.0s' {1..64})
@@ -1711,6 +1729,10 @@ run_write_evidence_fixture() (
   jq -e '
     .previous_recovery_timers_enabled == {spot:true, usdm:false}
     and .previous_recovery_timers_masked_runtime == {spot:false, usdm:true}
+    and .previous_health_script.present == true
+    and .previous_health_script.rollback_source == "rollback-deployment"
+    and .previous_health_script.sha256 == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    and .health_script_rollback_result == "not-needed"
     and .host_mode == "partial-contained-spot-live"
   ' "$EVIDENCE_DIR/cutover.json" >/dev/null
 )
@@ -2764,7 +2786,7 @@ run_contained_upgrade_rollback_fixture() (
   == previous-usdm-restored-spot-contained ]]
 
 run_new_host_rollback_fixture() (
-  local active_unit=${1:-} unit
+  local active_unit=${1:-} prior_health=${2:-absent} unit previous_health_sha=
   PRODUCTION_UNITS=(production-spot production-usdm)
   UPLOAD_UNITS=(upload-spot upload-usdm)
   RECOVERY_TIMERS=(recovery-spot recovery-usdm)
@@ -2775,13 +2797,56 @@ run_new_host_rollback_fixture() (
   CANDIDATE_DEPLOYMENT="$tmp_dir/candidate-deployment"
   CANDIDATE_BINARY="$tmp_dir/candidate-binary"
   PRODUCTION_LINK="$tmp_dir/nonexistent-production-link"
+  INSTALLED_HEALTH_SCRIPT="$tmp_dir/new-host-installed-health.sh"
+  EVIDENCE_DIR="$tmp_dir/new-host-health-evidence"
   OLD_MODE=new-host
   ROLLBACK_RESULT=
+  HEALTH_SCRIPT_ROLLBACK_RESULT=not-needed
+  OLD_HEALTH_ASSET_PRESENT=0
+  OLD_HEALTH_SCRIPT_SHA256=
+  OLD_HEALTH_SCRIPT_SNAPSHOT=
+  OLD_HEALTH_ROLLBACK_SOURCE=absent
   DRAIN_REQUIRED=0
   DRAIN_ATTEMPTED=0
   DRAIN_MAY_HAVE_MUTATED=0
   OLD_RECOVERY_TIMERS_ENABLED=0
   SPOOL_ENV_DEPLOYMENT=
+  rm -rf "$EVIDENCE_DIR"
+  rm -f "$INSTALLED_HEALTH_SCRIPT"
+  mkdir -p "$EVIDENCE_DIR"
+  sha256sum() {
+    local -a args=()
+    local arg check=0 checksum_file
+    for arg in "$@"; do
+      case "$arg" in
+        --strict) ;;
+        --check) check=1 ;;
+        *) args+=("$arg") ;;
+      esac
+    done
+    if (( check )); then
+      if (( ${#args[@]} )); then
+        command sha256sum -c "${args[@]}"
+      else
+        checksum_file=$(mktemp)
+        command cat >"$checksum_file"
+        command sha256sum -c "$checksum_file"
+        command rm -f "$checksum_file"
+      fi
+    else
+      command sha256sum "${args[@]}"
+    fi
+  }
+  if [[ $prior_health == present ]]; then
+    printf 'preexisting new-host health\n' >"$INSTALLED_HEALTH_SCRIPT"
+    previous_health_sha=$(sha256sum "$INSTALLED_HEALTH_SCRIPT" | awk '{print $1}')
+  fi
+  fail() { printf '%s\n' "$*" >&2; exit 1; }
+  secure_regular_file() { [[ -f $1 && ! -L $1 ]]; }
+  atomic_install() {
+    install -m "$1" "$2" "$3"
+    cmp -s -- "$2" "$3"
+  }
   systemctl() {
     case "$1" in
       is-active)
@@ -2802,14 +2867,31 @@ run_new_host_rollback_fixture() (
   copy_health_evidence() { return 0; }
   run_candidate_drain() { return 0; }
   # shellcheck disable=SC1090
+  . "$remove_health_body"
+  # shellcheck disable=SC1090
+  . "$stage_new_host_health_body"
+  # shellcheck disable=SC1090
+  . "$restore_new_host_health_body"
+  stage_new_host_health_for_rollback
+  printf 'candidate installed health\n' >"$INSTALLED_HEALTH_SCRIPT"
+  # shellcheck disable=SC1090
   . "$production_predicate_body"
   # shellcheck disable=SC1090
   . "$rollback_body"
   rollback_after_failure
+  if [[ $prior_health == present ]]; then
+    [[ $HEALTH_SCRIPT_ROLLBACK_RESULT == previous-bytes-restored ]]
+    [[ $(sha256sum "$INSTALLED_HEALTH_SCRIPT" | awk '{print $1}') \
+      == "$previous_health_sha" ]]
+  else
+    [[ $HEALTH_SCRIPT_ROLLBACK_RESULT == candidate-removed ]]
+    [[ ! -e $INSTALLED_HEALTH_SCRIPT && ! -L $INSTALLED_HEALTH_SCRIPT ]]
+  fi
   printf '%s\n' "$ROLLBACK_RESULT"
 )
 
 [[ $(run_new_host_rollback_fixture) == new-host-disabled ]]
+[[ $(run_new_host_rollback_fixture '' present) == new-host-disabled ]]
 [[ $(run_new_host_rollback_fixture legacy-spot) \
   == production-stop-or-disable-containment-failed ]]
 [[ $(run_new_host_rollback_fixture upload-usdm) \
