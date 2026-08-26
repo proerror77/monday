@@ -302,10 +302,10 @@ grep -Fq 'SPOOL_ENV_DEPLOYMENT="$OLD_DEPLOYMENT"' "$CUTOVER"
 grep -Fq 'SPOOL_ENV_DEPLOYMENT="$CANDIDATE_DEPLOYMENT"' "$CUTOVER"
 grep -Fq 'run_candidate_drain "$SPOOL_ENV_DEPLOYMENT"' "$CUTOVER"
 grep -Fq '$DRAIN_ATTEMPTED -eq 1 && $DRAIN_MAY_HAVE_MUTATED -eq 0' "$CUTOVER"
-recovery_stage_line=$(grep -n '^STEP=stage-candidate-recovery-assets$' "$CUTOVER" | cut -d: -f1)
-controller_clear_line=$(grep -n '^STEP=clear-previous-controller-override$' "$CUTOVER" | cut -d: -f1)
-old_drain_line=$(grep -n '^  STEP=drain-old-production-with-candidate$' "$CUTOVER" | cut -d: -f1)
-candidate_env_install_line=$(grep -n '^STEP=install-candidate-production-assets$' "$CUTOVER" | cut -d: -f1)
+recovery_stage_line=$(grep -n '^STEP=stage-candidate-recovery-assets$' "$CUTOVER" | head -n1 | cut -d: -f1)
+controller_clear_line=$(grep -n '^STEP=clear-previous-controller-override$' "$CUTOVER" | head -n1 | cut -d: -f1)
+old_drain_line=$(grep -n '^  STEP=drain-old-production-with-candidate$' "$CUTOVER" | head -n1 | cut -d: -f1)
+candidate_env_install_line=$(grep -n '^STEP=install-candidate-production-assets$' "$CUTOVER" | head -n1 | cut -d: -f1)
 [[ -n $controller_clear_line && -n $recovery_stage_line && -n $old_drain_line \
   && -n $candidate_env_install_line \
   && $controller_clear_line -lt $recovery_stage_line \
