@@ -1020,7 +1020,21 @@ trade for a static symbol. Every segment must still contain at least one real
 
 ### 2. Run the short production-catalog gate
 
-Start the gate through the same CLI wrapper:
+Run the non-mutating host and resource preflight first. It verifies the exact
+candidate, deployment bundle, installed Shadow assets, production service state,
+and fresh `MemAvailable`, then prints one JSON result without creating Gate
+evidence, spool directories, overrides, or changing services:
+
+```bash
+set -euo pipefail
+ACTION=gate-preflight \
+INSTANCE_ID=i-REPLACE \
+ARTIFACT_SHA256=REPLACE_WITH_64_HEX_DIGEST \
+./deployment/aliyun/invoke-rust-lob-operation.sh
+```
+
+After that passes, start the formal Gate through the same CLI wrapper. The Gate
+repeats the preflight and does not rely on the earlier sample:
 
 ```bash
 set -euo pipefail
@@ -1045,15 +1059,15 @@ The Shadow unit uses a 1792MiB high watermark and 2048MiB hard limit per market.
 Five immutable passed Tokyo gates measured Spot at no more than 664,735,744 bytes
 and the former 570-symbol USD-M scope at no more than 1,789,218,816 bytes; the
 current USD-M Gate covers only the frozen Top 100. Strict readback is separately
-capped at 2560MiB/3072MiB and carries the same non-production OOM preference as
-the Shadow collectors. Candidate upload drain is capped at 2500MiB/3200MiB, so
-the largest sequential Gate phase is 3200MiB, plus the existing 1GiB host
-reserve. Active production usage is already reflected in `MemAvailable`; its
-growth to `MemoryHigh` is budgeted explicitly. The 1GiB reserve covers at most
-512MiB of additional production growth from `MemoryHigh` to `MemoryMax` and
-must leave at least 512MiB for the host. All three production-growth values are
-recorded as evidence. An over-limit candidate fails the Gate instead of
-increasing the host size or weakening the reserve.
+capped at 1280MiB/1536MiB and carries the same non-production OOM preference as
+the Shadow collectors. Candidate upload drain is capped at 384MiB/512MiB, so
+the largest sequential Gate phase remains the 2048MiB Shadow collector. The
+controller rereads `MemAvailable` immediately before each Shadow start, upload
+drain, and strict verifier, and requires that phase's hard limit plus a fixed
+1GiB host reserve. Active production usage is already reflected in that fresh
+kernel value; the Gate records the actual production `MemoryCurrent` values,
+initial preflight, and every successful phase-admission sample. An over-limit
+phase fails closed instead of increasing the host size or weakening the reserve.
 The Gate fails unless all of these are true for the entire candidate run:
 
 - both units stay active with `NRestarts=0`;
@@ -1143,7 +1157,10 @@ removed after the backup is durable. The candidate drops to the collector owner
 recorded on the spool lock before removing that temporary or changing and
 finalizing any segment. It then
 performs streaming `--recover-parts-only` and runs
-`--upload-only` with bounded OSS readback. Recovery never performs live symbol
+`--upload-only` with bounded OSS readback. The direct cutover drain runs in a
+named transient systemd unit with `CPUQuota=80%`, `MemoryHigh=384M`,
+`MemoryMax=512M`, `OOMScoreAdjust=500`, and control-group cleanup; cancellation
+or failure stops that exact unit before rollback. Recovery never performs live symbol
 discovery and does not depend on the old production binary supporting either
 command. Rollback resumes a partial drain with the deployment environment that
 owns the interrupted spool; an unproven recovery keeps production masked instead

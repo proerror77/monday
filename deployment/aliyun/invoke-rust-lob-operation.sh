@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   printf '%s\n' \
-    'Usage: ACTION=gate|cutover|restore INSTANCE_ID=i-... ARTIFACT_SHA256=<64 hex> invoke-rust-lob-operation.sh' \
+    'Usage: ACTION=gate-preflight|gate|cutover|restore INSTANCE_ID=i-... ARTIFACT_SHA256=<64 hex> invoke-rust-lob-operation.sh' \
     '' \
     'The command always targets ap-northeast-1 and uses Alibaba Cloud Assistant.'
 }
@@ -15,7 +15,7 @@ for command in aliyun base64 jq seq sleep tr; do
   fi
 done
 
-: "${ACTION:?set ACTION to gate, cutover, or restore}"
+: "${ACTION:?set ACTION to gate-preflight, gate, cutover, or restore}"
 : "${INSTANCE_ID:?set INSTANCE_ID}"
 : "${ARTIFACT_SHA256:?set ARTIFACT_SHA256}"
 
@@ -36,6 +36,11 @@ fi
 ARTIFACT_SHA256=$(printf '%s' "$ARTIFACT_SHA256" | tr '[:upper:]' '[:lower:]')
 
 case "$ACTION" in
+  gate-preflight)
+    host_script=host-rust-lob-shadow-gate.sh
+    timeout_seconds=300
+    command_name=monday-rust-lob-gate-preflight
+    ;;
   gate)
     host_script=host-rust-lob-shadow-gate.sh
     timeout_seconds=7200
@@ -78,8 +83,13 @@ if [[ -n "$ALIYUN_LOCAL_PROFILE" ]]; then
 fi
 
 host_path="/opt/monday/releases/binance-lob-archiver/$ARTIFACT_SHA256/deployment/$host_script"
-printf -v remote_script '#!/usr/bin/env bash\nset -euo pipefail\nexec %q %q\n' \
-  "$host_path" "$ARTIFACT_SHA256"
+if [[ $ACTION == gate-preflight ]]; then
+  printf -v remote_script '#!/usr/bin/env bash\nset -euo pipefail\nexec %q --resource-preflight %q\n' \
+    "$host_path" "$ARTIFACT_SHA256"
+else
+  printf -v remote_script '#!/usr/bin/env bash\nset -euo pipefail\nexec %q %q\n' \
+    "$host_path" "$ARTIFACT_SHA256"
+fi
 command_content=$(printf '%s' "$remote_script" | base64 | tr -d '\n')
 
 run_json=$(aliyun ecs RunCommand \
@@ -93,7 +103,11 @@ run_json=$(aliyun ecs RunCommand \
   --Timeout "$timeout_seconds" \
   "${aliyun_profile_args[@]}")
 invoke_id=$(printf '%s' "$run_json" | jq -er '.InvokeId')
-printf 'Cloud Assistant invocation: %s (%s)\n' "$invoke_id" "$ACTION"
+if [[ $ACTION == gate-preflight ]]; then
+  printf 'Cloud Assistant invocation: %s (%s)\n' "$invoke_id" "$ACTION" >&2
+else
+  printf 'Cloud Assistant invocation: %s (%s)\n' "$invoke_id" "$ACTION"
+fi
 
 result_json=''
 for _ in $(seq 1 "$polls"); do
@@ -113,12 +127,74 @@ for _ in $(seq 1 "$polls"); do
     Success|Finished)
       output=$(printf '%s' "$result_json" \
         | jq -r '[.. | objects | .Output? // empty][0] // empty')
-      if [[ -n "$output" ]]; then
+      if [[ $ACTION == gate-preflight && $exit_code == 0 ]]; then
+        [[ -n $output ]] || {
+          printf 'gate-preflight returned no JSON output\n' >&2
+          exit 1
+        }
+        decoded_output=$(printf '%s' "$output" | base64 --decode) || {
+          printf 'gate-preflight returned invalid base64 output\n' >&2
+          exit 1
+        }
+        jq -e --arg artifact "$ARTIFACT_SHA256" \
+          '.schema == "monday.rust_lob_gate_resource_preflight.v1"
+            and .candidate_sha256 == $artifact
+            and (.deployment_bundle_sha256 | type) == "string"
+            and (.deployment_bundle_sha256 | test("^[a-f0-9]{64}$"))
+            and (.deployment_source_revision | type) == "string"
+            and (.deployment_source_revision | test("^[a-f0-9]{40,64}$"))
+            and (.host_memory_total_bytes | type) == "number"
+            and .host_memory_total_bytes == (.host_memory_total_bytes | floor)
+            and .host_memory_total_bytes > 0
+            and (.host_swap_total_bytes | type) == "number"
+            and .host_swap_total_bytes == (.host_swap_total_bytes | floor)
+            and .host_swap_total_bytes >= 0
+            and (.maximum_sequential_phase_memory_bytes | type) == "number"
+            and .maximum_sequential_phase_memory_bytes
+              == (.maximum_sequential_phase_memory_bytes | floor)
+            and .maximum_sequential_phase_memory_bytes > 0
+            and (.production_memory_current_bytes | type) == "object"
+            and (.production_memory_current_bytes | keys | sort) == ["spot","usdm"]
+            and all(.production_memory_current_bytes[];
+              (.active_state == "active" or .active_state == "inactive")
+              and (if .active_state == "active" then
+                (.current_bytes | type) == "number"
+              else .current_bytes == null or (.current_bytes | type) == "number"
+              end)
+              and (.current_bytes == null
+                or ((.current_bytes | type) == "number"
+                  and .current_bytes == (.current_bytes | floor)
+                  and .current_bytes >= 0)))
+            and .resource_preflight.phase == "resource-preflight"
+            and (.resource_preflight.sampled_at | type) == "string"
+            and (.resource_preflight.sampled_at
+              | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+            and (.resource_preflight.host_memory_available_bytes | type) == "number"
+            and .resource_preflight.host_memory_available_bytes
+              == (.resource_preflight.host_memory_available_bytes | floor)
+            and .resource_preflight.host_memory_reserve_bytes == 1073741824
+            and .resource_preflight.phase_memory_max_bytes
+              == .maximum_sequential_phase_memory_bytes
+            and .resource_preflight.required_bytes
+              == (.resource_preflight.host_memory_reserve_bytes
+                + .resource_preflight.phase_memory_max_bytes)
+            and .resource_preflight.host_memory_available_bytes
+              >= .resource_preflight.required_bytes
+            and .passed == true' <<<"$decoded_output" >/dev/null || {
+          printf 'gate-preflight returned invalid JSON evidence\n' >&2
+          exit 1
+        }
+        printf '%s\n' "$decoded_output"
+      elif [[ -n "$output" ]]; then
         printf '%s' "$output" | base64 --decode || true
         printf '\n'
       fi
       if [[ "$exit_code" == '0' ]]; then
-        printf '%s completed successfully: %s\n' "$ACTION" "$invoke_id"
+        if [[ $ACTION == gate-preflight ]]; then
+          printf '%s completed successfully: %s\n' "$ACTION" "$invoke_id" >&2
+        else
+          printf '%s completed successfully: %s\n' "$ACTION" "$invoke_id"
+        fi
         exit 0
       fi
       printf '%s\n' "$result_json" >&2
