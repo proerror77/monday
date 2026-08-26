@@ -45,6 +45,8 @@
 #      must be active (waiting) whenever their collector service is active; a
 #      stopped timer with a running collector silently strands rotated tapes
 #      until the disk fills.
+#   7. /data must be mounted; otherwise healthy-looking spool paths may be
+#      writing to the root filesystem instead of the governed data volume.
 # The raw-ops Gate template has no [Install] section, so systemd reports it as
 # static. Static is healthy only when no Gate instance, running lock, or
 # residual EnvironmentFile remains on the host. State-persistence failures
@@ -53,7 +55,7 @@
 #
 # Everything else is a WARNING: unit/timer active+enabled state, systemd
 # Result, restart-rate deltas, health.json freshness/gaps, journald delay-gate
-# trips, fee snapshot journal failures, and the /data mount.
+# trips, and fee snapshot journal failures.
 # Warnings are reported in the JSON warnings array (and as warning: lines in
 # text mode) but never block ok:true.
 #
@@ -74,7 +76,8 @@
 #                                /var/lib/monday-collector-health)
 #   MONDAY_COLLECTOR_HEALTH_TEST_MODE=1 and
 #   MONDAY_COLLECTOR_HEALTH_TEST_ROOT  are reserved for the contract test
-#                                      fixture under /tmp.
+#                                      fixture under /tmp. Test mode may also
+#   MONDAY_COLLECTOR_HEALTH_TEST_HFT_GID override the expected collector gid.
 set -u
 
 TAG=monday-collector-health
@@ -212,6 +215,9 @@ health_json='{}'
 uploads_json='{}'
 recovery_queue_json='{}'
 recovery_queue_root_ok=1
+recovery_root_owner_uid=0
+recovery_hft_owner_uid=''
+recovery_hft_group_gid=''
 delay_gate_json='{}'
 disk_json='{}'
 mount_json='{}'
@@ -260,6 +266,52 @@ file_mtime() {
   stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
 }
 
+file_uid() {
+  # Portable owner uid: GNU stat on the host, BSD stat under the macOS tests.
+  stat -c %u "$1" 2>/dev/null || stat -f %u "$1" 2>/dev/null
+}
+
+file_gid() {
+  # Portable owner gid: GNU stat on the host, BSD stat under the macOS tests.
+  stat -c %g "$1" 2>/dev/null || stat -f %g "$1" 2>/dev/null
+}
+
+file_group_world_not_writable() {
+  mode=$(stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null) || return 1
+  case "$mode" in
+    [0-7][0-7][0-7] | [0-7][0-7][0-7][0-7]) ;;
+    *) return 1 ;;
+  esac
+  case "$mode" in
+    *[2367]? | *[2367]) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+owned_directory_not_writable() {
+  [ -d "$1" ] && [ ! -L "$1" ] \
+    && [ "$(file_uid "$1")" = "$2" ] \
+    && file_group_world_not_writable "$1"
+}
+
+owned_regular_file_not_writable() {
+  [ -f "$1" ] && [ ! -L "$1" ] \
+    && [ "$(file_uid "$1")" = "$2" ] \
+    && file_group_world_not_writable "$1"
+}
+
+owned_collector_traversable_directory() {
+  [ -d "$1" ] && [ ! -L "$1" ] \
+    && [ "$(file_uid "$1")" = "$2" ] \
+    && [ "$(file_gid "$1")" = "$3" ] \
+    && file_group_world_not_writable "$1" \
+    && mode=$(stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null) \
+    && case "$mode" in
+      [0-7][1357][0-7] | [0-7][0-7][1357][0-7]) true ;;
+      *) false ;;
+    esac
+}
+
 unit_is_active() {
   systemctl is-active "$1" 2>/dev/null || true
 }
@@ -289,7 +341,7 @@ check_mount() {
     data_mounted=1
   fi
   if [ "$data_mounted" -eq 0 ]; then
-    record_warning "mount: /data is not mounted"
+    record_breach "mount: /data is not mounted"
   fi
   mount_json=$(jq -n --argjson m "$(bool_json "$data_mounted")" '{data_mounted: $m}')
 }
@@ -634,6 +686,71 @@ queue_oldest_age() {
   fi
 }
 
+recovery_job_receipt_valid() {
+  entry=$1
+  market=$2
+  name=${entry##*/}
+  job_id=${3:-${name%.*}}
+  receipt="$entry/job.json"
+  owned_directory_not_writable "$entry" "$recovery_hft_owner_uid" \
+    && owned_regular_file_not_writable "$receipt" "$recovery_root_owner_uid" \
+    && jq -e \
+      --arg schema monday.rust_lob_recovery_queue.v1 \
+      --arg market "$market" \
+      --arg job_id "$job_id" \
+      --arg canonical_spool "$SPOOL_ROOT/binance-lob/$market" \
+      --arg recovery_unit "binance-lob-archiver-recovery@$market.service" \
+      '.schema == $schema
+        and .market == $market
+        and .job_id == $job_id
+        and .canonical_spool == $canonical_spool
+        and .recovery_unit == $recovery_unit
+        and (.queued_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+        and (.release_sha256 | test("^[a-f0-9]{64}$"))
+        and (.deployment_bundle_sha256 | test("^[a-f0-9]{64}$"))
+        and (.deployment_source_revision | test("^[a-f0-9]{40,64}$"))
+        and (.env_sha256 | test("^[a-f0-9]{64}$"))
+        and .release_env == "recovery.env"' \
+      "$receipt" >/dev/null 2>&1
+}
+
+recovery_isolation_marker_valid() {
+  marker=$1
+  market=$2
+  queue_dir=$3
+  owned_regular_file_not_writable "$marker" "$recovery_root_owner_uid" || return 1
+  job_id=$(jq -er '.job_id | select(type == "string")' "$marker" 2>/dev/null) || return 1
+  receipt_sha256=$(jq -er '.receipt_sha256 | select(type == "string")' "$marker" 2>/dev/null) || return 1
+  printf '%s\n' "$job_id" \
+    | grep -Eq "^[0-9]{8}T[0-9]{6}Z-${market}-[a-f0-9]{12}-[0-9]+$" \
+    || return 1
+  printf '%s\n' "$receipt_sha256" | grep -Eq '^[a-f0-9]{64}$' || return 1
+  canonical_spool="$SPOOL_ROOT/binance-lob/$market"
+  ready_dir="$queue_dir/$job_id.ready"
+  jq -e \
+    --arg schema monday.rust_lob_recovery_isolation.v1 \
+    --arg job_id "$job_id" \
+    --arg market "$market" \
+    --arg canonical_spool "$canonical_spool" \
+    --arg ready_dir "$ready_dir" \
+    --arg receipt_sha256 "$receipt_sha256" \
+    '.schema == $schema
+      and .job_id == $job_id
+      and .market == $market
+      and .canonical_spool == $canonical_spool
+      and .ready_dir == $ready_dir
+      and .receipt_sha256 == $receipt_sha256' \
+    "$marker" >/dev/null 2>&1 || return 1
+  if [ -e "$ready_dir" ] || [ -L "$ready_dir" ]; then
+    receipt_dir=$ready_dir
+  else
+    receipt_dir=$canonical_spool
+  fi
+  recovery_job_receipt_valid "$receipt_dir" "$market" "$job_id" || return 1
+  actual_receipt_sha256=$(sha256sum "$receipt_dir/job.json" 2>/dev/null | awk '{print $1}')
+  [ "$actual_receipt_sha256" = "$receipt_sha256" ]
+}
+
 check_recovery_queue_market() {
   market=$1
   queue_dir="$RECOVERY_QUEUE_ROOT/$market"
@@ -641,29 +758,61 @@ check_recovery_queue_market() {
   ready_scan_failed=0
   running_scan_failed=0
   failed_scan_failed=0
+  malformed_scan_failed=0
+  legacy_scan_failed=0
   ready_entries=""
   running_entries=""
   failed_entries=""
+  status_entries=""
+  legacy_entries=""
   ready_count=0
   running_count=0
   failed_count=0
+  malformed_count=0
+  legacy_unreceipted_count=0
+  isolation_active=0
+  isolation_valid=0
+  isolation_age=null
   ready_oldest_age=null
   running_oldest_age=null
   failed_oldest_age=null
 
   if [ "$recovery_queue_root_ok" -eq 1 ] && { [ -e "$queue_dir" ] || [ -L "$queue_dir" ]; }; then
-    if [ ! -d "$queue_dir" ] || [ -L "$queue_dir" ] || [ ! -r "$queue_dir" ] || [ ! -x "$queue_dir" ]; then
+    if ! owned_collector_traversable_directory "$queue_dir" "$recovery_root_owner_uid" "$recovery_hft_group_gid" \
+      || [ ! -r "$queue_dir" ] || [ ! -x "$queue_dir" ]; then
       record_breach "$label: recovery queue root is not an inspectable directory ($queue_dir)"
     else
+      isolation_marker="$queue_dir/isolation.json"
+      if [ -e "$isolation_marker" ] || [ -L "$isolation_marker" ]; then
+        isolation_active=1
+        marker_mtime=$(file_mtime "$isolation_marker")
+        case "$marker_mtime" in
+          *[!0-9]* | '') ;;
+          *)
+            isolation_age=$((NOW_SEC - marker_mtime))
+            [ "$isolation_age" -lt 0 ] && isolation_age=0
+            ;;
+        esac
+        if recovery_isolation_marker_valid "$isolation_marker" "$market" "$queue_dir"; then
+          isolation_valid=1
+          record_breach "$label: unfinished isolation transaction present (age ${isolation_age}s)"
+        else
+          record_breach "$label: malformed isolation transaction present (age ${isolation_age}s)"
+        fi
+      fi
       ready_entries=$(find "$queue_dir" -mindepth 1 -maxdepth 1 -type d -name '*.ready' -print 2>/dev/null) \
         || ready_scan_failed=1
       running_entries=$(find "$queue_dir" -mindepth 1 -maxdepth 1 -type d -name '*.running' -print 2>/dev/null) \
         || running_scan_failed=1
       failed_entries=$(find "$queue_dir" -mindepth 1 -maxdepth 1 -type d -name '*.failed' -print 2>/dev/null) \
         || failed_scan_failed=1
+      status_entries=$(find "$queue_dir" -mindepth 1 -maxdepth 1 \
+        \( -name '*.ready' -o -name '*.running' -o -name '*.failed' \) -print 2>/dev/null) \
+        || malformed_scan_failed=1
       if [ "${ready_scan_failed:-0}" -eq 1 ] \
         || [ "${running_scan_failed:-0}" -eq 1 ] \
-        || [ "${failed_scan_failed:-0}" -eq 1 ]; then
+        || [ "${failed_scan_failed:-0}" -eq 1 ] \
+        || [ "${malformed_scan_failed:-0}" -eq 1 ]; then
         record_breach "$label: recovery queue scan failed ($queue_dir)"
       else
         ready_count=$(queue_entry_count "$ready_entries")
@@ -675,10 +824,37 @@ check_recovery_queue_market() {
         running_oldest_age=$queue_oldest_age_result
         queue_oldest_age "$failed_entries"
         failed_oldest_age=$queue_oldest_age_result
+        for entry in $status_entries; do
+          if ! recovery_job_receipt_valid "$entry" "$market"; then
+            malformed_count=$((malformed_count + 1))
+          fi
+        done
+      fi
+
+      legacy_dir="$queue_dir/legacy-unreceipted"
+      if [ -e "$legacy_dir" ] || [ -L "$legacy_dir" ]; then
+        if ! owned_directory_not_writable "$legacy_dir" "$recovery_root_owner_uid" \
+          || [ ! -r "$legacy_dir" ] || [ ! -x "$legacy_dir" ]; then
+          record_breach "$label: legacy-unreceipted is not an inspectable root-owned directory ($legacy_dir)"
+        else
+          legacy_entries=$(find "$legacy_dir" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null) \
+            || legacy_scan_failed=1
+          if [ "${legacy_scan_failed:-0}" -eq 1 ]; then
+            record_breach "$label: legacy-unreceipted scan failed ($legacy_dir)"
+          else
+            legacy_unreceipted_count=$(queue_entry_count "$legacy_entries")
+          fi
+        fi
       fi
     fi
   fi
 
+  if [ "$malformed_count" -gt 0 ]; then
+    record_breach "$label: malformed recovery job receipt(s) present ($malformed_count)"
+  fi
+  if [ "$legacy_unreceipted_count" -gt 0 ]; then
+    record_breach "$label: legacy unreceipted recovery job(s) present ($legacy_unreceipted_count)"
+  fi
   if [ "$failed_count" -gt 0 ]; then
     record_breach "$label: failed recovery job(s) present ($failed_count)"
   fi
@@ -696,9 +872,17 @@ check_recovery_queue_market() {
     --argjson ua "$running_oldest_age" \
     --argjson fc "$failed_count" \
     --argjson fa "$failed_oldest_age" \
+    --argjson mc "$malformed_count" \
+    --argjson lc "$legacy_unreceipted_count" \
+    --argjson ia "$isolation_active" \
+    --argjson iv "$isolation_valid" \
+    --argjson ig "$isolation_age" \
     '{ready_count: $rc, ready_oldest_age_seconds: $ra,
       running_count: $uc, running_oldest_age_seconds: $ua,
-      failed_count: $fc, failed_oldest_age_seconds: $fa}')
+      failed_count: $fc, failed_oldest_age_seconds: $fa,
+      malformed_count: $mc, legacy_unreceipted_count: $lc,
+      isolation_active: ($ia == 1), isolation_valid: ($iv == 1),
+      isolation_age_seconds: $ig}')
   recovery_queue_json=$(jq -n --argjson base "$recovery_queue_json" --arg k "$market" --argjson v "$qobj" \
     '$base + {($k): $v}')
 }
@@ -706,7 +890,17 @@ check_recovery_queue_market() {
 check_recovery_queue_root() {
   recovery_queue_root_ok=1
   if [ -e "$RECOVERY_QUEUE_ROOT" ] || [ -L "$RECOVERY_QUEUE_ROOT" ]; then
-    if [ ! -d "$RECOVERY_QUEUE_ROOT" ] || [ -L "$RECOVERY_QUEUE_ROOT" ] \
+    if [ "${MONDAY_COLLECTOR_HEALTH_TEST_MODE:-0}" = 1 ]; then
+      recovery_root_owner_uid=$(id -u)
+      recovery_hft_owner_uid=$recovery_root_owner_uid
+      recovery_hft_group_gid=${MONDAY_COLLECTOR_HEALTH_TEST_HFT_GID:-$(id -g)}
+    elif ! recovery_hft_owner_uid=$(id -u hftcollector 2>/dev/null) \
+      || ! recovery_hft_group_gid=$(id -g hftcollector 2>/dev/null); then
+      recovery_queue_root_ok=0
+      record_breach "binance-lob-recovery: hftcollector owner identity is unavailable"
+      return
+    fi
+    if ! owned_collector_traversable_directory "$RECOVERY_QUEUE_ROOT" "$recovery_root_owner_uid" "$recovery_hft_group_gid" \
       || [ ! -r "$RECOVERY_QUEUE_ROOT" ] || [ ! -x "$RECOVERY_QUEUE_ROOT" ]; then
       recovery_queue_root_ok=0
       record_breach "binance-lob-recovery: recovery queue root is not an inspectable directory ($RECOVERY_QUEUE_ROOT)"
