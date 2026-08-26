@@ -3,12 +3,19 @@ set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 selector="$script_dir/select-acr-publish-source.sh"
+check_reader="$script_dir/read-acr-required-checks.sh"
 artifact="$script_dir/research-image-release-artifact.sh"
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
 
 main_sha=1111111111111111111111111111111111111111
 other_sha=2222222222222222222222222222222222222222
+green_admission=(
+  --main-sha "$main_sha"
+  --monorepo-conclusion success
+  --prediction-conclusion success
+  --security-conclusion success
+)
 
 assert_source() {
   local name=$1 expected=$2
@@ -21,24 +28,28 @@ assert_source() {
 assert_source automated $'publish_target=research-runner\nresearch_mode=artifact\nsource_sha=1111111111111111111111111111111111111111\nartifact_run_id=1234' \
   --event workflow_run --conclusion success --source-event push --head-branch main \
   --head-sha "$main_sha" --run-id 1234 \
-  --binaries-conclusion success --smoke-conclusion success
+  --binaries-conclusion success --smoke-conclusion success \
+  "${green_admission[@]}"
 assert_source irrelevant $'publish_target=none\nresearch_mode=none\nsource_sha=1111111111111111111111111111111111111111\nartifact_run_id=1234' \
   --event workflow_run --conclusion success --source-event push --head-branch main \
   --head-sha "$main_sha" --run-id 1234 \
   --binaries-conclusion skipped --smoke-conclusion skipped
-assert_source manual-rebuild $'publish_target=research-runner\nresearch_mode=rebuild\nsource_sha=2222222222222222222222222222222222222222\nartifact_run_id=5678' \
+assert_source manual-rebuild $'publish_target=research-runner\nresearch_mode=rebuild\nsource_sha=1111111111111111111111111111111111111111\nartifact_run_id=5678' \
   --event workflow_dispatch --target research-runner --rebuild true \
-  --current-sha "$other_sha" --current-run-id 5678
-assert_source manual-nonresearch $'publish_target=hft-trading\nresearch_mode=none\nsource_sha=2222222222222222222222222222222222222222\nartifact_run_id=5678' \
+  --current-ref refs/heads/main --current-sha "$main_sha" --current-run-id 5678 \
+  "${green_admission[@]}"
+assert_source manual-nonresearch $'publish_target=hft-trading\nresearch_mode=none\nsource_sha=1111111111111111111111111111111111111111\nartifact_run_id=5678' \
   --event workflow_dispatch --target hft-trading --rebuild false \
-  --current-sha "$other_sha" --current-run-id 5678
-assert_source manual-raw-ops-alias $'publish_target=binance-lob-archiver\nresearch_mode=none\nsource_sha=2222222222222222222222222222222222222222\nartifact_run_id=5678' \
+  --current-ref refs/heads/main --current-sha "$main_sha" --current-run-id 5678 \
+  "${green_admission[@]}"
+assert_source manual-raw-ops-alias $'publish_target=binance-lob-archiver\nresearch_mode=none\nsource_sha=1111111111111111111111111111111111111111\nartifact_run_id=5678' \
   --event workflow_dispatch --target polymarket-raw-ops --rebuild false \
-  --current-sha "$other_sha" --current-run-id 5678
+  --current-ref refs/heads/main --current-sha "$main_sha" --current-run-id 5678 \
+  "${green_admission[@]}"
 assert_source source-test $'publish_target=research-source-test\nresearch_mode=none\nsource_sha=1111111111111111111111111111111111111111\nartifact_run_id=5678\nsource_test_profile=binance-bstocks-attestation\nsource_test_tag=source-test-1111111111111111111111111111111111111111-binance-bstocks-attestation' \
   --event workflow_dispatch --target research-source-test --rebuild false \
   --source-test-sha "$main_sha" --source-test-profile binance-bstocks-attestation --current-ref refs/heads/main \
-  --current-sha "$main_sha" --current-run-id 5678
+  --current-sha "$main_sha" --current-run-id 5678 --main-sha "$main_sha"
 
 assert_source_test_identity() {
   local name=$1 profile=$2
@@ -46,6 +57,7 @@ assert_source_test_identity() {
   "$selector" --event workflow_dispatch --target research-source-test --rebuild false \
     --source-test-sha "$main_sha" --source-test-profile "$profile" \
     --current-ref refs/heads/main --current-sha "$main_sha" --current-run-id 5678 \
+    --main-sha "$main_sha" \
     --output "$output"
   selected_profile=$(sed -n 's/^source_test_profile=//p' "$output")
   tag=$(sed -n 's/^source_test_tag=//p' "$output")
@@ -62,15 +74,23 @@ binance_repeat_source_test_tag=$(sed -n 's/^source_test_tag=//p' "$tmp_dir/sourc
 test "$binance_source_test_tag" != "$bybit_source_test_tag"
 test "$binance_source_test_tag" = "$binance_repeat_source_test_tag"
 
-for rejected in failed-run pull-request-run branch-run implicit-rebuild source-test-missing-sha source-test-nonmain source-test-untrusted-sha source-test-rebuild source-test-invalid-profile source-test-on-runtime automated-source-test; do
+for rejected in failed-run pull-request-run branch-run automated-stale-main manual-nonmain manual-stale-main required-missing required-pending required-skipped required-failed implicit-rebuild source-test-missing-sha source-test-nonmain source-test-untrusted-sha source-test-stale-main source-test-rebuild source-test-invalid-profile source-test-on-runtime automated-source-test; do
   case "$rejected" in
     failed-run) args=(--event workflow_run --conclusion failure --source-event push --head-branch main --head-sha "$main_sha" --run-id 1234) ;;
     pull-request-run) args=(--event workflow_run --conclusion success --source-event pull_request --head-branch main --head-sha "$main_sha" --run-id 1234) ;;
     branch-run) args=(--event workflow_run --conclusion success --source-event push --head-branch develop --head-sha "$main_sha" --run-id 1234) ;;
-    implicit-rebuild) args=(--event workflow_dispatch --target research-runner --rebuild false --current-sha "$other_sha" --current-run-id 5678) ;;
+    automated-stale-main) args=(--event workflow_run --conclusion success --source-event push --head-branch main --head-sha "$other_sha" --run-id 1234 --binaries-conclusion success --smoke-conclusion success "${green_admission[@]}") ;;
+    manual-nonmain) args=(--event workflow_dispatch --target hft-trading --rebuild false --current-ref refs/heads/codex/example --current-sha "$other_sha" --current-run-id 5678) ;;
+    manual-stale-main) args=(--event workflow_dispatch --target hft-trading --rebuild false --current-ref refs/heads/main --current-sha "$other_sha" --current-run-id 5678 "${green_admission[@]}") ;;
+    required-missing) args=(--event workflow_dispatch --target hft-trading --rebuild false --current-ref refs/heads/main --current-sha "$main_sha" --current-run-id 5678 --main-sha "$main_sha" --monorepo-conclusion missing --prediction-conclusion success --security-conclusion success) ;;
+    required-pending) args=(--event workflow_dispatch --target hft-trading --rebuild false --current-ref refs/heads/main --current-sha "$main_sha" --current-run-id 5678 --main-sha "$main_sha" --monorepo-conclusion success --prediction-conclusion in_progress --security-conclusion success) ;;
+    required-skipped) args=(--event workflow_dispatch --target hft-trading --rebuild false --current-ref refs/heads/main --current-sha "$main_sha" --current-run-id 5678 --main-sha "$main_sha" --monorepo-conclusion success --prediction-conclusion success --security-conclusion skipped) ;;
+    required-failed) args=(--event workflow_dispatch --target hft-trading --rebuild false --current-ref refs/heads/main --current-sha "$main_sha" --current-run-id 5678 --main-sha "$main_sha" --monorepo-conclusion failure --prediction-conclusion success --security-conclusion success) ;;
+    implicit-rebuild) args=(--event workflow_dispatch --target research-runner --rebuild false --current-ref refs/heads/main --current-sha "$other_sha" --current-run-id 5678) ;;
     source-test-missing-sha) args=(--event workflow_dispatch --target research-source-test --rebuild false --current-ref refs/heads/main --current-sha "$other_sha" --current-run-id 5678) ;;
     source-test-nonmain) args=(--event workflow_dispatch --target research-source-test --rebuild false --source-test-sha "$main_sha" --current-ref refs/heads/codex/example --current-sha "$other_sha" --current-run-id 5678) ;;
     source-test-untrusted-sha) args=(--event workflow_dispatch --target research-source-test --rebuild false --source-test-sha "$main_sha" --current-ref refs/heads/main --current-sha "$other_sha" --current-run-id 5678) ;;
+    source-test-stale-main) args=(--event workflow_dispatch --target research-source-test --rebuild false --source-test-sha "$other_sha" --source-test-profile binance-bstocks-attestation --current-ref refs/heads/main --current-sha "$other_sha" --current-run-id 5678 --main-sha "$main_sha") ;;
     source-test-rebuild) args=(--event workflow_dispatch --target research-source-test --rebuild true --source-test-sha "$main_sha" --current-ref refs/heads/main --current-sha "$other_sha" --current-run-id 5678) ;;
     source-test-invalid-profile) args=(--event workflow_dispatch --target research-source-test --rebuild false --source-test-sha "$main_sha" --source-test-profile invalid-profile --current-ref refs/heads/main --current-sha "$main_sha" --current-run-id 5678) ;;
     source-test-on-runtime) args=(--event workflow_dispatch --target hft-trading --rebuild false --source-test-sha "$main_sha" --current-ref refs/heads/main --current-sha "$other_sha" --current-run-id 5678) ;;
@@ -86,6 +106,42 @@ if "$selector" --event workflow_run --conclusion success --source-event push \
   --binaries-conclusion success --smoke-conclusion skipped \
   --output "$tmp_dir/partial.out" >/dev/null 2>&1; then
   printf 'partial research validation unexpectedly selected a publish source\n' >&2
+  exit 1
+fi
+
+checks_json="$tmp_dir/checks.json"
+checks_output="$tmp_dir/checks.out"
+jq -n '{check_runs:[
+  {id:1,name:"Monorepo CI gate",status:"completed",conclusion:"success",app:{id:15368,slug:"github-actions"}},
+  {id:2,name:"Prediction Markets CI gate",status:"completed",conclusion:"success",app:{id:15368,slug:"github-actions"}},
+  {id:3,name:"Security Summary Report",status:"completed",conclusion:"success",app:{id:15368,slug:"github-actions"}}
+]}' >"$checks_json"
+"$check_reader" "$checks_json" "$checks_output"
+diff -u <(printf '%s\n' \
+  'monorepo_conclusion=success' \
+  'prediction_conclusion=success' \
+  'security_conclusion=success') "$checks_output"
+"$check_reader" /dev/stdin "$checks_output" <"$checks_json"
+jq -s '.' "$checks_json" >"$tmp_dir/check-pages.json"
+"$check_reader" "$tmp_dir/check-pages.json" "$checks_output"
+
+jq -n '{check_runs:[
+  {id:1,name:"Monorepo CI gate",status:"completed",conclusion:"success",app:{id:15368,slug:"github-actions"}},
+  {id:4,name:"Monorepo CI gate",status:"in_progress",conclusion:null,app:{id:15368,slug:"github-actions"}},
+  {id:5,name:"Monorepo CI gate",status:"completed",conclusion:"success",app:{id:1,slug:"untrusted"}},
+  {id:2,name:"Prediction Markets CI gate",status:"completed",conclusion:"success",app:{id:15368,slug:"github-actions"}}
+]}' >"$checks_json"
+"$check_reader" "$checks_json" "$checks_output"
+diff -u <(printf '%s\n' \
+  'monorepo_conclusion=in_progress' \
+  'prediction_conclusion=success' \
+  'security_conclusion=missing') "$checks_output"
+
+jq -n '{check_runs:[
+  {id:1,name:"Monorepo CI gate",status:"completed",conclusion:"unexpected",app:{id:15368,slug:"github-actions"}}
+]}' >"$checks_json"
+if "$check_reader" "$checks_json" "$checks_output" >/dev/null 2>&1; then
+  printf 'invalid required check state unexpectedly passed\n' >&2
   exit 1
 fi
 

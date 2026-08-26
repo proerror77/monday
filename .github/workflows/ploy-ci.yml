@@ -5,14 +5,6 @@ on:
     branches: [main, develop]
   push:
     branches: [main, develop]
-    paths:
-      - "rust_hft/**"
-      - ".cargo/**"
-      - "deployment/aliyun/**"
-      - ".github/workflows/**"
-      - ".github/actions/**"
-      - ".github/scripts/**"
-      - "*"
   workflow_dispatch:
 
 concurrency:
