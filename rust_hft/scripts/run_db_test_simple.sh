@@ -141,9 +141,7 @@ step2_build_project() {
     log_step "步骤 2/6: 编译高性能 Release 版本..."
     echo "$(date): 开始编译项目" >> "$RESULTS_DIR/test_timeline.log"
     
-    log_info "清理之前的构建..."
-    cargo clean > "$RESULTS_DIR/build.log" 2>&1
-    
+    : > "$RESULTS_DIR/build.log"
     log_info "编译优化版本 (启用 LTO, target-cpu=native, AVX2)..."
     
     RUSTFLAGS="-C target-cpu=native -C target-feature=+avx2,+fma" \
