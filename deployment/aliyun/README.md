@@ -970,7 +970,7 @@ For a controller-only change on the active binary, use the same command with
 then publishes an immutable host release under:
 
 ```text
-/opt/monday/releases/binance-lob-controller/<deployment-bundle-sha256>/
+/opt/monday/releases/binance-lob-controller/<controller-release-manifest-sha256>/
 ```
 
 Publication requires the active artifact URI/SHA and the candidate and active

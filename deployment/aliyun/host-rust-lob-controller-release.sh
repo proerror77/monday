@@ -123,7 +123,7 @@ verify_published_release() {
 publish_controller_release() (
   [[ $# -eq 4 ]] || return 2
   local root=$1 artifact_file=$2 bundle=$3 manifest=$4
-  local artifact_sha artifact_uri bundle_sha runtime_contract source_revision
+  local artifact_sha artifact_uri bundle_sha manifest_sha runtime_contract source_revision
   local active_release active_binary active_metadata active_deployment
   local work_dir extracted listing release_dir staging asset mode
 
@@ -136,6 +136,7 @@ publish_controller_release() (
   artifact_sha=$(jq -er '.artifact_sha256' "$manifest")
   artifact_uri=$(jq -er '.artifact_uri' "$manifest")
   bundle_sha=$(jq -er '.deployment_bundle_sha256' "$manifest")
+  manifest_sha=$(sha256_file "$manifest")
   runtime_contract=$(jq -er '.runtime_contract_sha256' "$manifest")
   source_revision=$(jq -er '.deployment_source_revision' "$manifest")
   [[ $(sha256_file "$artifact_file") == "$artifact_sha" ]] \
@@ -175,8 +176,10 @@ publish_controller_release() (
   extract_bundle "$bundle" "$extracted" "$listing"
   regular_file "$extracted/rust-lob-control-plane-lib.sh" \
     || die 'deployment bundle is missing the runtime contract helper'
+  regular_file "$active_deployment/rust-lob-control-plane-lib.sh" \
+    || die 'active deployment is missing the runtime contract helper'
   # shellcheck disable=SC1090,SC1091
-  . "$extracted/rust-lob-control-plane-lib.sh"
+  . "$active_deployment/rust-lob-control-plane-lib.sh"
   [[ $(monday_rust_lob_runtime_contract_sha256 "$active_deployment") \
       == "$runtime_contract" ]] \
     || die 'active deployment runtime contract drifted from release metadata'
@@ -192,14 +195,14 @@ publish_controller_release() (
       || die 'release root is indirect'
     install -d -m 0755 "$CONTROLLER_RELEASE_ROOT"
   fi
-  release_dir="$CONTROLLER_RELEASE_ROOT/$bundle_sha"
+  release_dir="$CONTROLLER_RELEASE_ROOT/$manifest_sha"
   if [[ -e $release_dir || -L $release_dir ]]; then
     verify_published_release "$release_dir" "$extracted" "$manifest" "$listing"
-    printf 'controller release already published: %s\n' "$bundle_sha"
+    printf 'controller release already published: %s\n' "$manifest_sha"
     return 0
   fi
 
-  staging=$(mktemp -d "$CONTROLLER_RELEASE_ROOT/.${bundle_sha}.new.XXXXXX")
+  staging=$(mktemp -d "$CONTROLLER_RELEASE_ROOT/.${manifest_sha}.new.XXXXXX")
   mkdir -m 0755 "$staging/deployment"
   while IFS= read -r asset; do
     mode=0444
@@ -218,8 +221,8 @@ publish_controller_release() (
   mv "$staging" "$release_dir"
   staging=
   verify_published_release "$release_dir" "$extracted" "$manifest" "$listing"
-  printf 'published controller release %s from %s; production unchanged\n' \
-    "$bundle_sha" "$source_revision"
+  printf 'published controller release %s (bundle %s) from %s; production unchanged\n' \
+    "$manifest_sha" "$bundle_sha" "$source_revision"
 )
 
 main() {

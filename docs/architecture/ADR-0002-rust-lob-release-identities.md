@@ -25,9 +25,8 @@ The LOB delivery chain has three immutable identities:
    and the binary SHA-256 are unchanged.
 3. **Controller release:** full deployment bundle SHA-256 plus a manifest that
    binds its source revision, OSS URI, artifact identity, and runtime-contract
-   identity. It is published under
-   `/opt/monday/releases/binance-lob-controller/<bundle-sha256>/` without changing
-   the active artifact release.
+   identity. It is published under a directory keyed by the complete manifest
+   SHA-256, not the bundle alone, without changing the active artifact release.
 
 `BUNDLE_ONLY=1` continues to reject the active production digest. The new
 `CONTROLLER_ONLY=1` path is publish-only: it verifies the active binary and

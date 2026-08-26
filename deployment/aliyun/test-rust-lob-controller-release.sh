@@ -102,12 +102,13 @@ manifest="$tmp_dir/controller-release.json"
 make_bundle "$bundle_source" "$bundle"
 bundle_sha=$(sha256sum "$bundle" | awk '{print $1}')
 write_manifest "$manifest" "$artifact_sha" "$bundle_sha" "$runtime_contract"
+manifest_sha=$(sha256sum "$manifest" | awk '{print $1}')
 active_metadata_before=$(sha256sum "$artifact_release/release.json" | awk '{print $1}')
 active_target_before=$(readlink "$fixture/opt/monday/bin/binance-lob-archiver")
 
 publish_controller_release "$fixture" "$artifact" "$bundle" "$manifest" \
   >"$tmp_dir/first.out"
-controller_release="$fixture/opt/monday/releases/binance-lob-controller/$bundle_sha"
+controller_release="$fixture/opt/monday/releases/binance-lob-controller/$manifest_sha"
 [[ -d $controller_release && ! -L $controller_release ]]
 cmp -s "$manifest" "$controller_release/release.json"
 (cd "$controller_release" \
@@ -138,6 +139,26 @@ if (publish_controller_release "$fixture" "$artifact" "$runtime_bundle" \
 fi
 grep -Fq 'active release metadata differs from controller release identity' \
   "$tmp_dir/runtime.out"
+
+tampered_source="$tmp_dir/tampered-source"
+cp -R "$bundle_source" "$tampered_source"
+printf '\nTAMPERED_RUNTIME_FIXTURE=changed\n' \
+  >>"$tampered_source/binance-lob-archiver-production-spot.env"
+printf '\nmonday_rust_lob_runtime_contract_sha256() { printf "%%s\\n" "%s"; }\n' \
+  "$runtime_contract" >>"$tampered_source/rust-lob-control-plane-lib.sh"
+tampered_bundle="$tmp_dir/tampered.tar"
+tampered_manifest="$tmp_dir/tampered.json"
+make_bundle "$tampered_source" "$tampered_bundle"
+tampered_bundle_sha=$(sha256sum "$tampered_bundle" | awk '{print $1}')
+write_manifest "$tampered_manifest" "$artifact_sha" "$tampered_bundle_sha" \
+  "$runtime_contract"
+if (publish_controller_release "$fixture" "$artifact" "$tampered_bundle" \
+  "$tampered_manifest") >"$tmp_dir/tampered.out" 2>&1; then
+  printf 'controller release trusted a tampered candidate runtime helper\n' >&2
+  exit 1
+fi
+grep -Fq 'controller bundle changes the gated runtime contract' \
+  "$tmp_dir/tampered.out"
 
 bad_artifact="$tmp_dir/bad-artifact"
 printf 'different artifact\n' >"$bad_artifact"
