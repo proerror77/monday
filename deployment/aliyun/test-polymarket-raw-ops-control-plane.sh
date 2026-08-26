@@ -101,6 +101,15 @@ if ! awk '
   printf 'unmanaged Gate can reach preflight or shadow startup\n' >&2
   exit 1
 fi
+if ! awk '
+  /^  \[\[ \$segment_ready == true \]\] \|\| require_real_market_segment_ready$/ {ready=NR}
+  /^  write_runtime_request "\$candidate_path"/ {request=NR}
+  /^  if ! systemctl start "\$unit"/ {start=NR}
+  END {exit !(ready && ready < request && request < start)}
+' "$GATE_CONTROL"; then
+  printf 'Gate does not require a ready closed market segment before invocation creation\n' >&2
+  exit 1
+fi
 grep -Fq 'pass_ready_marker="$evidence_dir/.PASSED.sha256.ready"' "$GATE"
 if grep -Fq 'marker="$evidence_dir/PASSED.sha256"' "$GATE"; then
   printf 'running Gate publishes the official pass marker before finalization\n' >&2
@@ -189,6 +198,9 @@ cat >"$supervisor_control_dir/${GATE##*/}" <<'EOF'
 set -euo pipefail
 printf '%s|%s|%s\n' "$*" "${INVOCATION_ID:-}" \
   "${MONDAY_POLYMARKET_GATE_INVOCATION_ID:-}" >>"$FAKE_GATE_CALLS"
+if [[ ${1:-} == --real-market-segment-ready ]]; then
+  exit "${FAKE_REAL_MARKET_READY_EXIT:-0}"
+fi
 exit "${FAKE_GATE_EXIT:-0}"
 EOF
 chmod 0755 "$supervisor_control" \
@@ -573,8 +585,34 @@ supervisor_recovery_gate_invocation=$(printf '9%.0s' {1..32})
 set_supervisor_state invocation "$supervisor_recovery_gate_invocation"
 set_supervisor_state active inactive
 set_supervisor_state baseline-active inactive
+supervisor_recovery_request_file="$supervisor_root/run/monday/polymarket-raw-ops-gates/$supervisor_candidate_sha.request.json"
+supervisor_recovery_env_file="$supervisor_root/run/monday/polymarket-raw-ops-gates/$supervisor_candidate_sha.env"
+supervisor_recovery_starts_before=$(grep -Fxc "start $supervisor_unit" \
+  "$supervisor_calls" || true)
+if env "${gate_control_env[@]}" INVOCATION_ID= FAKE_REAL_MARKET_READY_EXIT=1 \
+  "$supervisor_control" recover "$supervisor_candidate" \
+  "$supervisor_candidate_sha" "$supervisor_source" "$supervisor_probe" \
+  >/dev/null 2>&1; then
+  printf 'recovery without a ready market segment unexpectedly passed\n' >&2
+  exit 1
+fi
+[[ $(grep -Fxc "start $supervisor_unit" "$supervisor_calls" || true) \
+    -eq $supervisor_recovery_starts_before \
+  && ! -e $supervisor_recovery_request_file \
+  && ! -e $supervisor_recovery_env_file ]]
+if admission_records_matching '.result == "admitted"' | grep -q .; then
+  printf 'segment refusal published a false recovery admission\n' >&2
+  exit 1
+fi
+[[ $(admission_records_matching \
+  '.result == "refused" and (.refusal_reason | test("no eligible closed market segment"))' \
+  | grep -c .) -eq 1 ]]
+supervisor_recovery_ready_before=$(grep -Fc -- \
+  '--real-market-segment-ready ' "$supervisor_gate_calls" || true)
 gate_control recover "$supervisor_candidate" "$supervisor_candidate_sha" \
   "$supervisor_source" "$supervisor_probe" >"$supervisor_tmp/recover-start.json"
+[[ $(grep -Fc -- '--real-market-segment-ready ' "$supervisor_gate_calls") \
+  -eq $((supervisor_recovery_ready_before + 1)) ]]
 jq -e --arg invocation "$supervisor_recovery_gate_invocation" '
   .phase == "running" and .systemd_invocation_id == $invocation
 ' "$supervisor_tmp/recover-start.json" >/dev/null
@@ -946,6 +984,23 @@ if ! (
 fi
 
 supervisor_env_file="$supervisor_root/run/monday/polymarket-raw-ops-gates/$supervisor_candidate_sha.env"
+supervisor_request_file="$supervisor_root/run/monday/polymarket-raw-ops-gates/$supervisor_candidate_sha.request.json"
+supervisor_starts_before_segment_admission=$(grep -Fxc "start $supervisor_unit" \
+  "$supervisor_calls" || true)
+if env "${gate_control_env[@]}" INVOCATION_ID= FAKE_REAL_MARKET_READY_EXIT=1 \
+  "$supervisor_control" start "$supervisor_candidate" \
+  "$supervisor_candidate_sha" "$supervisor_source" >/dev/null 2>&1; then
+  printf 'Gate start without a ready market segment unexpectedly passed\n' >&2
+  exit 1
+fi
+[[ $(grep -Fxc "start $supervisor_unit" "$supervisor_calls" || true) \
+    -eq $supervisor_starts_before_segment_admission \
+  && ! -e $supervisor_request_file \
+  && ! -e $supervisor_env_file ]]
+supervisor_market_spool="$(cd -- "$supervisor_root" && pwd -P)/data/monday/spool/polymarket"
+grep -Fqx -- \
+  "--real-market-segment-ready $supervisor_market_spool||" \
+  "$supervisor_gate_calls"
 set_supervisor_state active inactive
 if env "${gate_control_env[@]}" FAKE_START_REJECT=1 \
   "$supervisor_control" start "$supervisor_candidate" \
@@ -1274,22 +1329,23 @@ fi
 # A production Gate must exercise the candidate against a real closed segment,
 # not a compatible fixture manufactured by the Gate itself.
 preflight_verifier="$tmp_dir/real-market-preflight.sh"
-sed -n \
-  -e '/^readonly REAL_MARKET_PREFLIGHT_BUDGET_SECONDS=/p' \
-  -e '/^readonly REAL_MARKET_SEGMENT_WAIT_BUDGET_SECONDS=/p' \
-  -e '/^readonly REAL_MARKET_PREFLIGHT_TOTAL_BUDGET_SECONDS=/,/))$/p' \
-  -e '/^readonly PREFLIGHT_SCAN_WINDOW_RECORDS=/p' \
-  -e '/^remaining_seconds_before_deadline() {$/,/^}$/p' \
-  -e '/^run_before_deadline() {$/,/^}$/p' \
-  -e '/^oss_download_with_retry() {$/,/^}$/p' "$GATE" \
-  >"$preflight_verifier"
-sed -n '/^download_and_verify_oss_triplet() {$/,/^}$/p' "$GATE" \
-  >>"$preflight_verifier"
-sed -n '/^real_market_segment_preflight() {$/,/^}$/p' "$GATE" \
-  >>"$preflight_verifier"
+{
+  sed -n \
+    -e '/^readonly REAL_MARKET_PREFLIGHT_BUDGET_SECONDS=/p' \
+    -e '/^readonly REAL_MARKET_SEGMENT_WAIT_BUDGET_SECONDS=/p' \
+    -e '/^readonly REAL_MARKET_PREFLIGHT_TOTAL_BUDGET_SECONDS=/,/))$/p' \
+    -e '/^readonly PREFLIGHT_SCAN_WINDOW_RECORDS=/p' \
+    -e '/^remaining_seconds_before_deadline() {$/,/^}$/p' \
+    -e '/^run_before_deadline() {$/,/^}$/p' \
+    -e '/^oss_download_with_retry() {$/,/^}$/p' "$GATE"
+  sed -n '/^latest_real_market_segment() {$/,/^}$/p' "$GATE"
+  sed -n '/^download_and_verify_oss_triplet() {$/,/^}$/p' "$GATE"
+  sed -n '/^real_market_segment_preflight() {$/,/^}$/p' "$GATE"
+} >"$preflight_verifier"
 # shellcheck source=/dev/null
 source "$preflight_verifier"
-if ! declare -F download_and_verify_oss_triplet >/dev/null \
+if ! declare -F latest_real_market_segment >/dev/null \
+  || ! declare -F download_and_verify_oss_triplet >/dev/null \
   || ! declare -F real_market_segment_preflight >/dev/null; then
   printf 'Gate does not expose the real market-segment preflight helpers\n' >&2
   exit 1
@@ -1322,6 +1378,21 @@ preflight_root="$tmp_dir/real-market-preflight"
 remote_root="$preflight_root/remote"
 fake_bin="$preflight_root/bin"
 mkdir -p "$remote_root" "$fake_bin"
+calendar_case="$preflight_root/calendar-case"
+calendar_valid="$calendar_case/market-updates.20260101T000000000000.ndjson"
+calendar_invalid="$calendar_case/market-updates.20990231T000000000000.ndjson"
+mkdir "$calendar_case"
+printf 'valid\n' >"$calendar_valid"
+printf 'invalid\n' >"$calendar_invalid"
+[[ $(latest_real_market_segment "$calendar_case") == "$calendar_valid" ]] || {
+  printf 'real-segment admission preferred an impossible calendar timestamp\n' >&2
+  exit 1
+}
+rm "$calendar_valid"
+if latest_real_market_segment "$calendar_case" >/dev/null; then
+  printf 'real-segment admission accepted an impossible calendar timestamp\n' >&2
+  exit 1
+fi
 
 make_remote_triplet() {
   local source=$1 uri=$2 dataset=$3 remote_data remote_manifest
@@ -6310,8 +6381,8 @@ grep -Fq 'upload timeout values remain bound into OSS configuration evidence' "$
   # shellcheck source=/dev/null
   source "$legacy_runtime_budget_contract"
   [[ $REAL_MARKET_PREFLIGHT_BUDGET_SECONDS -eq 1200 \
-    && $REAL_MARKET_SEGMENT_WAIT_BUDGET_SECONDS -eq 3900 \
-    && $REAL_MARKET_PREFLIGHT_TOTAL_BUDGET_SECONDS -eq 5160 \
+    && $REAL_MARKET_SEGMENT_WAIT_BUDGET_SECONDS -eq 5 \
+    && $REAL_MARKET_PREFLIGHT_TOTAL_BUDGET_SECONDS -eq 1265 \
     && $LEGACY_RUNTIME_STABILITY_REQUIRED == true \
     && $LEGACY_RUNTIME_MAX_SECONDS -eq 21600 \
     && $LEGACY_RUNTIME_RESERVE_SECONDS -eq 60 \
@@ -6334,7 +6405,7 @@ grep -Fq 'upload timeout values remain bound into OSS configuration evidence' "$
     + PARITY_CUTOFF_LAG_SECONDS \
     + zstd_timeout_seconds + oss_copy_timeout_seconds \
     + LEGACY_RUNTIME_RESERVE_SECONDS))
-  [[ $required -eq 14280 ]] || {
+  [[ $required -eq 10385 ]] || {
     printf 'Gate runtime budget does not cover bounded post-gate uploads\n' >&2
     exit 1
   }
@@ -6411,7 +6482,7 @@ grep -Fq 'upload timeout values remain bound into OSS configuration evidence' "$
     printf 'Gate did not bind legacy identity around real preflight\n' >&2
     exit 1
   }
-  [[ $(<"$timeout_log") == '--signal=KILL 5160 env '* ]] || {
+  [[ $(<"$timeout_log") == '--signal=KILL 1265 env '* ]] || {
     printf 'Gate real preflight does not have an exact hard deadline\n' >&2
     exit 1
   }
@@ -6432,7 +6503,7 @@ grep -Fq 'preflight_deadline=$((SECONDS + REAL_MARKET_PREFLIGHT_BUDGET_SECONDS))
 }
 grep -Fq 'segment_wait_deadline=$((SECONDS + REAL_MARKET_SEGMENT_WAIT_BUDGET_SECONDS))' \
   "$GATE" || {
-  printf 'Gate real-segment wait has no full-rotation deadline\n' >&2
+  printf 'Gate real-segment race window has no deadline\n' >&2
   exit 1
 }
 grep -Fq 'run_before_deadline "$preflight_deadline" runuser' "$GATE" || {

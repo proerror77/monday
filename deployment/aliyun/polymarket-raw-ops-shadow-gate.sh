@@ -32,10 +32,10 @@ readonly LEGACY_RUNTIME_STABILITY_REQUIRED=true
 # budget plus 120 attempts) AND the upload time of the largest observed
 # segment (~150s for a 109MiB multipart object on this endpoint).
 readonly REAL_MARKET_PREFLIGHT_BUDGET_SECONDS=1200
-# A closed market tape is produced hourly and normally removed by the uploader
-# within five minutes. Wait through one full rotation plus one upload cadence,
-# then give the selected tape the independent preflight budget above.
-readonly REAL_MARKET_SEGMENT_WAIT_BUDGET_SECONDS=3900
+# Gate admission requires a closed market tape before creating the supervised
+# invocation. Keep only a short race window here in case the production
+# uploader removes that tape between admission and the inode-pinning step.
+readonly REAL_MARKET_SEGMENT_WAIT_BUDGET_SECONDS=5
 # The outer worker includes fixed startup and evidence-flush headroom.
 readonly REAL_MARKET_PREFLIGHT_TOTAL_BUDGET_SECONDS=$((
   REAL_MARKET_SEGMENT_WAIT_BUDGET_SECONDS \
@@ -1141,10 +1141,35 @@ download_and_verify_oss_triplet() {
       end_recorded_at:$end_recorded_at}'
 }
 
+latest_real_market_segment() {
+  local source_spool=$1 path name source_path='' source_name=''
+  local source_stamp='' source_uuid='' candidate_stamp candidate_uuid
+  for path in "$source_spool"/market-updates.*.ndjson; do
+    name=${path##*/}
+    [[ $name =~ ^market-updates\.([0-9]{8}T[0-9]{6}([0-9]{6})?)(\.([[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}))?\.ndjson$ ]] \
+      || continue
+    candidate_stamp=${BASH_REMATCH[1]}
+    candidate_uuid=${BASH_REMATCH[4]:-}
+    date -u -d \
+      "${candidate_stamp:0:4}-${candidate_stamp:4:2}-${candidate_stamp:6:2}T${candidate_stamp:9:2}:${candidate_stamp:11:2}:${candidate_stamp:13:2}Z" \
+      +%Y%m%dT%H%M%S 2>/dev/null \
+      | grep -Fqx -- "${candidate_stamp:0:15}" || continue
+    if [[ -z $source_name || $candidate_stamp > "$source_stamp" \
+      || ( $candidate_stamp == "$source_stamp" \
+        && -n $candidate_uuid && -z $source_uuid ) ]]; then
+      source_path=$path
+      source_name=$name
+      source_stamp=$candidate_stamp
+      source_uuid=$candidate_uuid
+    fi
+  done
+  [[ -n $source_path && -f $source_path && ! -L $source_path ]] || return 1
+  printf '%s\n' "$source_path"
+}
+
 real_market_segment_preflight() {
-  local source_spool=$1 spool=$2 download_root=$3 evidence=$4 before after path name
+  local source_spool=$1 spool=$2 download_root=$3 evidence=$4 before after
   local pinned=false stable=false source_path source_name source_file source_tmp source_segment
-  local source_stamp source_uuid candidate_stamp candidate_uuid
   local preflight_dataset started_at completed_at candidate_exit candidate_summary
   local terminal_status upload_summary
   local source_quote_records source_recorded_hours source_content_sha256 source_bytes
@@ -1202,30 +1227,8 @@ real_market_segment_preflight() {
     sync "$preflight_json"
   }
   while ((SECONDS < segment_wait_deadline)); do
-    source_path=
-    source_name=
-    source_stamp=
-    source_uuid=
-    for path in "$source_spool"/market-updates.*.ndjson; do
-      name=${path##*/}
-      [[ $name =~ ^market-updates\.([0-9]{8}T[0-9]{6}([0-9]{6})?)(\.([[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}))?\.ndjson$ ]] \
-        || continue
-      candidate_stamp=${BASH_REMATCH[1]}
-      candidate_uuid=${BASH_REMATCH[4]:-}
-      if [[ -z $source_name || $candidate_stamp > "$source_stamp" \
-        || ( $candidate_stamp == "$source_stamp" \
-          && -n $candidate_uuid && -z $source_uuid ) ]]; then
-        source_path=$path
-        source_name=$name
-        source_stamp=$candidate_stamp
-        source_uuid=$candidate_uuid
-      fi
-    done
-    if [[ -n $source_path ]]; then
-      if [[ -L $source_path || ( -e $source_path && ! -f $source_path ) ]]; then
-        printf 'real market preflight found no eligible closed market segment\n' >&2
-        return 1
-      fi
+    if source_path=$(latest_real_market_segment "$source_spool"); then
+      source_name=${source_path##*/}
       source_file="$spool/$source_name"
       source_tmp="$spool/.${source_name}.preflight.$$"
       [[ ! -e $source_file && ! -L $source_file \
@@ -1869,6 +1872,16 @@ if [[ ${1:-} == --real-market-preflight-worker ]]; then
   real_market_segment_preflight "$2" "$3" "$4" "$5" || exit
   printf '%s\n' "$real_market_preflight_json"
   exit
+fi
+
+if [[ ${1:-} == --real-market-segment-ready ]]; then
+  [[ ${EUID} -eq 0 && $# -eq 2 ]] || exit 2
+  if ! secure_collector_directory "$2" \
+    || ! latest_real_market_segment "$2" >/dev/null; then
+    printf 'no eligible closed market segment is ready for Gate admission\n' >&2
+    exit 1
+  fi
+  exit 0
 fi
 
 [[ ${EUID} -eq 0 ]] || die 'must run as root'
