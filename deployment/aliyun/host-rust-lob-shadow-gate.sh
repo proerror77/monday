@@ -10,9 +10,9 @@ readonly GATE_SEGMENT_SECONDS=120
 readonly MAX_HEALTH_SILENCE_SECONDS=120
 readonly MAX_SEGMENT_GAP_NS=90000000000
 readonly HOST_MEMORY_RESERVE_BYTES=1073741824
-readonly MIN_HOST_MEMORY_RESERVE_BYTES=536870912
-readonly STRICT_VERIFIER_MEMORY_MAX_BYTES=3221225472
-readonly UPLOAD_DRAIN_MEMORY_MAX_BYTES=3355443200
+readonly PRODUCTION_MEMORY_GROWTH_MARGIN_BYTES=268435456
+readonly STRICT_VERIFIER_MEMORY_MAX_BYTES=1610612736
+readonly UPLOAD_DRAIN_MEMORY_MAX_BYTES=536870912
 readonly SHADOW_BINARY=/opt/monday/bin/binance-lob-archiver-shadow
 readonly RELEASE_ROOT=/opt/monday/releases/binance-lob-archiver
 readonly EVIDENCE_ROOT=/data/monday/evidence/shadow-gates
@@ -30,7 +30,7 @@ die() {
 
 usage() {
   printf '%s\n' \
-    'Usage: host-rust-lob-shadow-gate.sh <candidate-sha256>' \
+    'Usage: host-rust-lob-shadow-gate.sh [--resource-preflight] <candidate-sha256>' \
     '' \
     'Production gates wait up to 240 seconds for health, then observe at least 240 seconds.' \
     'Tests may set MONDAY_GATE_TEST_SECONDS only with' \
@@ -65,10 +65,22 @@ resolve_health_settle_seconds() {
 }
 
 [[ ${EUID} -eq 0 ]] || die 'must run as root'
-[[ $# -eq 1 ]] || {
-  usage >&2
-  exit 2
-}
+resource_preflight_only=false
+case $# in
+  1) candidate_arg=$1 ;;
+  2)
+    [[ $1 == --resource-preflight ]] || {
+      usage >&2
+      exit 2
+    }
+    resource_preflight_only=true
+    candidate_arg=$2
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
 
 for command in aliyun awk chmod chown cmp date dirname find flock grep id install jq mkdir mktemp \
   mountpoint mv readlink rm runuser sed sha256sum sleep sort stat systemctl systemd-run tr wc zstd; do
@@ -78,11 +90,13 @@ done
 mountpoint -q /data || die '/data must be a mount point'
 [[ -r /proc/uptime ]] || die '/proc/uptime is required for monotonic timing'
 id "$SERVICE_USER" >/dev/null 2>&1 || die "missing service user: $SERVICE_USER"
-install -d -m 0755 "$(dirname "$LOCK_FILE")"
-exec 9>"$LOCK_FILE"
-flock -n 9 || die 'another Rust collector release operation is running'
+if [[ $resource_preflight_only != true ]]; then
+  install -d -m 0755 "$(dirname "$LOCK_FILE")"
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || die 'another Rust collector release operation is running'
+fi
 
-candidate_sha=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+candidate_sha=$(printf '%s' "$candidate_arg" | tr '[:upper:]' '[:lower:]')
 [[ $candidate_sha =~ ^[a-f0-9]{64}$ ]] || die 'candidate SHA-256 must be 64 hexadecimal characters'
 candidate_release="$RELEASE_ROOT/$candidate_sha"
 candidate_binary="$candidate_release/binance-lob-archiver"
@@ -217,7 +231,10 @@ for asset in \
   cmp -s "$candidate_deployment/$asset" "$installed_asset" \
     || die "installed shadow asset differs from the gated deployment bundle: $asset"
 done
-grep -Fxq 'MemoryMax=3200M' \
+grep -Fxq 'MemoryHigh=384M' \
+  "$candidate_deployment/binance-lob-archiver-rust-upload@.service" \
+  || die 'shadow upload service MemoryHigh differs from the gated template'
+grep -Fxq 'MemoryMax=512M' \
   "$candidate_deployment/binance-lob-archiver-rust-upload@.service" \
   || die 'shadow upload service MemoryMax differs from the gated template'
 candidate_production_spot_env="$candidate_deployment/binance-lob-archiver-production-spot.env"
@@ -243,19 +260,21 @@ configured_usdm_ws_shard_size=$(env_value "${env_file[usdm]}" WS_SHARD_SIZE)
   == "$configured_usdm_ws_shard_size" ]] \
   || die 'USD-M shadow and production WS_SHARD_SIZE differ'
 
-declare -A host_meminfo_bytes
-for field in MemTotal MemAvailable SwapTotal; do
+meminfo_bytes() {
+  local field=$1 value
   value=$(awk -v key="$field:" '
       $1 == key { count += 1; value = $2 }
       END { if (count != 1 || value !~ /^[0-9]+$/) exit 1; print value }
-    ' /proc/meminfo) || die "$field is unavailable in /proc/meminfo"
-  ((value <= 9007199254740991)) || die "$field is too large to convert safely"
-  host_meminfo_bytes[$field]=$((value * 1024))
-done
-host_memory_total_bytes=${host_meminfo_bytes[MemTotal]}
-host_memory_available_bytes=${host_meminfo_bytes[MemAvailable]}
-host_swap_total_bytes=${host_meminfo_bytes[SwapTotal]}
-shadow_phase_memory_bytes=0
+    ' /proc/meminfo) || return 1
+  ((value <= 9007199254740991)) || return 1
+  printf '%s\n' "$((value * 1024))"
+}
+
+host_memory_total_bytes=$(meminfo_bytes MemTotal) \
+  || die 'MemTotal is unavailable in /proc/meminfo'
+host_swap_total_bytes=$(meminfo_bytes SwapTotal) \
+  || die 'SwapTotal is unavailable in /proc/meminfo'
+maximum_sequential_phase_memory_bytes=0
 for market in "${markets[@]}"; do
   shadow_unit=${unit[$market]}
   [[ -z $(systemctl show "$shadow_unit" --property=DropInPaths --value) ]] \
@@ -267,70 +286,139 @@ for market in "${markets[@]}"; do
   memory_max=$(systemctl show "$shadow_unit" --property=MemoryMax --value)
   [[ $memory_max == 2147483648 ]] \
     || die "$market shadow service MemoryMax differs from the gated template"
-  if ((memory_max > shadow_phase_memory_bytes)); then
-    shadow_phase_memory_bytes=$memory_max
+  if ((memory_max > maximum_sequential_phase_memory_bytes)); then
+    maximum_sequential_phase_memory_bytes=$memory_max
   fi
 done
-if ((STRICT_VERIFIER_MEMORY_MAX_BYTES > shadow_phase_memory_bytes)); then
-  shadow_phase_memory_bytes=$STRICT_VERIFIER_MEMORY_MAX_BYTES
+if ((STRICT_VERIFIER_MEMORY_MAX_BYTES > maximum_sequential_phase_memory_bytes)); then
+  maximum_sequential_phase_memory_bytes=$STRICT_VERIFIER_MEMORY_MAX_BYTES
 fi
-if ((UPLOAD_DRAIN_MEMORY_MAX_BYTES > shadow_phase_memory_bytes)); then
-  shadow_phase_memory_bytes=$UPLOAD_DRAIN_MEMORY_MAX_BYTES
+if ((UPLOAD_DRAIN_MEMORY_MAX_BYTES > maximum_sequential_phase_memory_bytes)); then
+  maximum_sequential_phase_memory_bytes=$UPLOAD_DRAIN_MEMORY_MAX_BYTES
 fi
-production_memory_headroom_bytes=0
-production_memory_soft_headroom_bytes=0
-production_memory_reserve_burst_bytes=0
+declare -A production_active_state production_memory_current_bytes
+declare -A production_memory_peak_bytes production_memory_max_bytes
+declare -A production_memory_growth_target_bytes
+production_memory_growth_headroom_bytes=0
 for market in "${markets[@]}"; do
   production_unit="binance-lob-archiver-production@${market}.service"
-  production_active=$(systemctl show "$production_unit" --property=ActiveState --value)
-  case "$production_active" in
+  production_active_state[$market]=$(systemctl show "$production_unit" \
+    --property=ActiveState --value)
+  production_memory_current=$(systemctl show "$production_unit" \
+    --property=MemoryCurrent --value)
+  case "${production_active_state[$market]}" in
     active)
       [[ $(systemctl show "$production_unit" --property=SubState --value) == running ]] \
         || die "$market production service is active but not running"
       production_memory_max=$(systemctl show "$production_unit" --property=MemoryMax --value)
       production_memory_high=$(systemctl show "$production_unit" --property=MemoryHigh --value)
-      production_memory_current=$(systemctl show "$production_unit" \
-        --property=MemoryCurrent --value)
+      production_memory_peak=$(systemctl show "$production_unit" --property=MemoryPeak --value)
       [[ $production_memory_max =~ ^[0-9]+$ \
         && $production_memory_high =~ ^[0-9]+$ \
+        && $production_memory_peak =~ ^[0-9]+$ \
         && $production_memory_current =~ ^[0-9]+$ \
         && $production_memory_high -le $production_memory_max \
+        && $production_memory_current -le $production_memory_peak \
+        && $production_memory_peak -le $production_memory_max \
         && $production_memory_current -le $production_memory_max ]] \
         || die "$market production memory accounting is invalid"
-      production_memory_headroom_bytes=$((production_memory_headroom_bytes \
-        + production_memory_max - production_memory_current))
-      if ((production_memory_current < production_memory_high)); then
-        production_memory_soft_headroom_bytes=$((production_memory_soft_headroom_bytes \
-          + production_memory_high - production_memory_current))
-        production_memory_reserve_burst_bytes=$((production_memory_reserve_burst_bytes \
-          + production_memory_max - production_memory_high))
-      else
-        production_memory_reserve_burst_bytes=$((production_memory_reserve_burst_bytes \
-          + production_memory_max - production_memory_current))
-      fi
+      production_memory_current_bytes[$market]=$production_memory_current
+      production_memory_peak_bytes[$market]=$production_memory_peak
+      production_memory_max_bytes[$market]=$production_memory_max
+      production_growth=$(monday_production_memory_growth_headroom \
+        "$production_memory_current" "$production_memory_peak" \
+        "$production_memory_max" "$PRODUCTION_MEMORY_GROWTH_MARGIN_BYTES") \
+        || die "$market production memory growth headroom is invalid"
+      production_memory_growth_target_bytes[$market]=$(( \
+        production_memory_current + production_growth))
+      ((production_growth \
+        <= 9223372036854775807 - production_memory_growth_headroom_bytes)) \
+        || die 'production memory growth headroom overflowed'
+      production_memory_growth_headroom_bytes=$(( \
+        production_memory_growth_headroom_bytes + production_growth))
       ;;
-    inactive) ;;
-    *) die "$market production service has ambiguous ActiveState=$production_active" ;;
+    inactive)
+      if [[ $production_memory_current =~ ^[0-9]+$ ]]; then
+        production_memory_current_bytes[$market]=$production_memory_current
+      else
+        production_memory_current_bytes[$market]=
+      fi
+      production_memory_peak_bytes[$market]=
+      production_memory_max_bytes[$market]=
+      production_memory_growth_target_bytes[$market]=
+      ;;
+    *) die "$market production service has ambiguous ActiveState=${production_active_state[$market]}" ;;
   esac
 done
-host_memory_headroom_ok=false
-host_memory_shortfall_bytes=0
-((production_memory_reserve_burst_bytes \
-  <= HOST_MEMORY_RESERVE_BYTES - MIN_HOST_MEMORY_RESERVE_BYTES)) \
-  || die "production memory burst leaves less than the minimum host reserve: burst=$production_memory_reserve_burst_bytes reserve=$HOST_MEMORY_RESERVE_BYTES minimum=$MIN_HOST_MEMORY_RESERVE_BYTES"
-# MemAvailable already reflects active production usage. Budget growth to
-# MemoryHigh explicitly; the fixed reserve covers the remaining growth to
-# MemoryMax while preserving MIN_HOST_MEMORY_RESERVE_BYTES for the host.
-if host_memory_required_bytes=$(monday_shadow_memory_admission \
-  "$host_memory_available_bytes" "$HOST_MEMORY_RESERVE_BYTES" \
-  "$shadow_phase_memory_bytes" "$production_memory_soft_headroom_bytes"); then
-  host_memory_headroom_ok=true
-else
-  admission_status=$?
-  [[ $admission_status -eq 1 ]] \
-    || die 'shadow memory admission inputs are invalid or overflowed'
-  host_memory_shortfall_bytes=$((host_memory_required_bytes - host_memory_available_bytes))
-fi
+production_memory_current_json=$(jq -cn \
+  --arg spot_state "${production_active_state[spot]}" \
+  --arg usdm_state "${production_active_state[usdm]}" \
+  --arg spot "${production_memory_current_bytes[spot]}" \
+  --arg usdm "${production_memory_current_bytes[usdm]}" \
+  --arg spot_peak "${production_memory_peak_bytes[spot]}" \
+  --arg usdm_peak "${production_memory_peak_bytes[usdm]}" \
+  --arg spot_max "${production_memory_max_bytes[spot]}" \
+  --arg usdm_max "${production_memory_max_bytes[usdm]}" \
+  --arg spot_target "${production_memory_growth_target_bytes[spot]}" \
+  --arg usdm_target "${production_memory_growth_target_bytes[usdm]}" \
+  'def bytes($value): if $value == "" then null else ($value | tonumber) end;
+    {spot:{active_state:$spot_state,current_bytes:bytes($spot),peak_bytes:bytes($spot_peak),
+      memory_max_bytes:bytes($spot_max),growth_target_bytes:bytes($spot_target)},
+    usdm:{active_state:$usdm_state,current_bytes:bytes($usdm),peak_bytes:bytes($usdm_peak),
+      memory_max_bytes:bytes($usdm_max),growth_target_bytes:bytes($usdm_target)}}')
+
+resource_admission_samples_json='[]'
+latest_resource_admission_sample_json=null
+admit_resource_phase() {
+  local phase=$1 phase_memory_max_bytes=$2 sampled_at available required status shortfall sample
+  sampled_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  available=$(meminfo_bytes MemAvailable) \
+    || die 'MemAvailable is unavailable in /proc/meminfo'
+  if required=$(monday_shadow_memory_admission \
+    "$available" "$HOST_MEMORY_RESERVE_BYTES" "$phase_memory_max_bytes" \
+    "$production_memory_growth_headroom_bytes"); then
+    :
+  else
+    status=$?
+    [[ $status -eq 1 ]] \
+      || die "resource admission inputs are invalid or overflowed for phase $phase"
+    shortfall=$((required - available))
+    die "insufficient host memory for phase $phase: available=$available reserve=$HOST_MEMORY_RESERVE_BYTES phase_max=$phase_memory_max_bytes required=$required shortfall=$shortfall"
+  fi
+  sample=$(jq -cn \
+    --arg phase "$phase" \
+    --arg sampled_at "$sampled_at" \
+    --argjson host_memory_available_bytes "$available" \
+    --argjson host_memory_reserve_bytes "$HOST_MEMORY_RESERVE_BYTES" \
+    --argjson phase_memory_max_bytes "$phase_memory_max_bytes" \
+    --argjson production_memory_growth_margin_bytes \
+      "$PRODUCTION_MEMORY_GROWTH_MARGIN_BYTES" \
+    --argjson production_memory_growth_headroom_bytes \
+      "$production_memory_growth_headroom_bytes" \
+    --argjson required_bytes "$required" \
+    '{phase:$phase,sampled_at:$sampled_at,
+      host_memory_available_bytes:$host_memory_available_bytes,
+      host_memory_reserve_bytes:$host_memory_reserve_bytes,
+      phase_memory_max_bytes:$phase_memory_max_bytes,
+      production_memory_growth_margin_bytes:$production_memory_growth_margin_bytes,
+      production_memory_growth_headroom_bytes:$production_memory_growth_headroom_bytes,
+      required_bytes:$required_bytes}')
+  resource_admission_samples_json=$(jq -cn \
+    --argjson samples "$resource_admission_samples_json" \
+    --argjson sample "$sample" '$samples + [$sample]')
+  latest_resource_admission_sample_json=$sample
+}
+
+assert_host_memory_reserve() {
+  local available
+  available=$(meminfo_bytes MemAvailable) \
+    || die 'MemAvailable is unavailable in /proc/meminfo'
+  ((available >= HOST_MEMORY_RESERVE_BYTES)) \
+    || die "host memory reserve was consumed during the active Shadow phase: available=$available reserve=$HOST_MEMORY_RESERVE_BYTES"
+}
+
+admit_resource_phase resource-preflight "$maximum_sequential_phase_memory_bytes"
+resource_preflight_json=$latest_resource_admission_sample_json
 
 [[ ${base_spool_dir[spot]} == /data/monday/spool/binance-lob-rust-shadow/spot ]] \
   || die 'Spot shadow spool path is not isolated'
@@ -348,6 +436,29 @@ min_symbols[usdm]=100
 # transition.
 expected_stream_types[spot]='["aggTrade","bookTicker","depth@100ms","trade"]'
 expected_stream_types[usdm]='["depth@100ms"]'
+
+if [[ $resource_preflight_only == true ]]; then
+  jq -cn \
+    --arg schema monday.rust_lob_gate_resource_preflight.v1 \
+    --arg candidate_sha256 "$candidate_sha" \
+    --arg deployment_bundle_sha256 "$deployment_bundle_sha256" \
+    --arg deployment_source_revision "$deployment_source_revision" \
+    --argjson host_memory_total_bytes "$host_memory_total_bytes" \
+    --argjson host_swap_total_bytes "$host_swap_total_bytes" \
+    --argjson production_memory_current_bytes "$production_memory_current_json" \
+    --argjson maximum_sequential_phase_memory_bytes \
+      "$maximum_sequential_phase_memory_bytes" \
+    --argjson resource_preflight "$resource_preflight_json" \
+    '{schema:$schema,candidate_sha256:$candidate_sha256,
+      deployment_bundle_sha256:$deployment_bundle_sha256,
+      deployment_source_revision:$deployment_source_revision,
+      host_memory_total_bytes:$host_memory_total_bytes,
+      host_swap_total_bytes:$host_swap_total_bytes,
+      production_memory_current_bytes:$production_memory_current_bytes,
+      maximum_sequential_phase_memory_bytes:$maximum_sequential_phase_memory_bytes,
+      resource_preflight:$resource_preflight,passed:true}'
+  exit 0
+fi
 
 binary_evidence_dir="$EVIDENCE_ROOT/$candidate_sha"
 bundle_evidence_dir="$binary_evidence_dir/$deployment_bundle_sha256"
@@ -405,51 +516,46 @@ for path in "$RUN_SPOOL_ROOT" "$RUN_SPOOL_ROOT/$candidate_sha" "$run_spool_path"
   direct_directory "$path" || die "run-scoped spool path is indirect: $path"
 done
 run_created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-jq -n \
-  --arg schema monday.rust_lob_shadow_gate_run.v1 \
-  --arg run_id "$gate_run_id" \
-  --arg created_at "$run_created_at" \
-  --arg candidate_sha256 "$candidate_sha" \
-  --arg deployment_bundle_sha256 "$deployment_bundle_sha256" \
-  --arg deployment_source_revision "$deployment_source_revision" \
-  --arg run_spool "$run_spool_path" \
-  --argjson segment_seconds "$GATE_SEGMENT_SECONDS" \
-  --argjson requested_duration_seconds "$gate_seconds" \
-  --argjson health_settle_seconds "$health_settle_seconds" \
-  --argjson host_memory_total_bytes "$host_memory_total_bytes" \
-  --argjson host_memory_available_bytes_at_preflight "$host_memory_available_bytes" \
-  --argjson host_swap_total_bytes "$host_swap_total_bytes" \
-  --argjson shadow_phase_memory_bytes "$shadow_phase_memory_bytes" \
-  --argjson production_memory_headroom_bytes "$production_memory_headroom_bytes" \
-  --argjson production_memory_soft_headroom_bytes "$production_memory_soft_headroom_bytes" \
-  --argjson production_memory_reserve_burst_bytes "$production_memory_reserve_burst_bytes" \
-  --argjson host_memory_reserve_bytes "$HOST_MEMORY_RESERVE_BYTES" \
-  --argjson minimum_host_memory_reserve_bytes "$MIN_HOST_MEMORY_RESERVE_BYTES" \
-  --argjson host_memory_required_bytes "$host_memory_required_bytes" \
-  --argjson host_memory_shortfall_bytes "$host_memory_shortfall_bytes" \
-  --argjson host_memory_headroom_ok "$host_memory_headroom_ok" \
-  --argjson test_only "$test_only" \
-  '{schema:$schema,run_id:$run_id,created_at:$created_at,
-    candidate_sha256:$candidate_sha256,
-    deployment_bundle_sha256:$deployment_bundle_sha256,
-    deployment_source_revision:$deployment_source_revision,
-    run_spool:$run_spool,segment_seconds:$segment_seconds,
-    requested_duration_seconds:$requested_duration_seconds,
-    health_settle_seconds:$health_settle_seconds,
-    host_memory_total_bytes:$host_memory_total_bytes,
-    host_memory_available_bytes_at_preflight:$host_memory_available_bytes_at_preflight,
-    host_swap_total_bytes:$host_swap_total_bytes,
-    shadow_phase_memory_bytes:$shadow_phase_memory_bytes,
-    production_memory_headroom_bytes:$production_memory_headroom_bytes,
-    production_memory_soft_headroom_bytes:$production_memory_soft_headroom_bytes,
-    production_memory_reserve_burst_bytes:$production_memory_reserve_burst_bytes,
-    host_memory_reserve_bytes:$host_memory_reserve_bytes,
-    minimum_host_memory_reserve_bytes:$minimum_host_memory_reserve_bytes,
-    host_memory_required_bytes:$host_memory_required_bytes,
-    host_memory_shortfall_bytes:$host_memory_shortfall_bytes,
-    host_memory_headroom_ok:$host_memory_headroom_ok,test_only:$test_only}' \
-  >"$evidence_dir/run.json"
-chmod 0640 "$evidence_dir/run.json"
+run_json="$evidence_dir/run.json"
+run_json_tmp="$evidence_dir/.run.json.tmp"
+write_run_json() {
+  jq -n \
+    --arg schema monday.rust_lob_shadow_gate_run.v1 \
+    --arg run_id "$gate_run_id" \
+    --arg created_at "$run_created_at" \
+    --arg candidate_sha256 "$candidate_sha" \
+    --arg deployment_bundle_sha256 "$deployment_bundle_sha256" \
+    --arg deployment_source_revision "$deployment_source_revision" \
+    --arg run_spool "$run_spool_path" \
+    --argjson segment_seconds "$GATE_SEGMENT_SECONDS" \
+    --argjson requested_duration_seconds "$gate_seconds" \
+    --argjson health_settle_seconds "$health_settle_seconds" \
+    --argjson host_memory_total_bytes "$host_memory_total_bytes" \
+    --argjson host_swap_total_bytes "$host_swap_total_bytes" \
+    --argjson production_memory_current_bytes "$production_memory_current_json" \
+    --argjson maximum_sequential_phase_memory_bytes \
+      "$maximum_sequential_phase_memory_bytes" \
+    --argjson resource_preflight "$resource_preflight_json" \
+    --argjson resource_admission_samples "$resource_admission_samples_json" \
+    --argjson test_only "$test_only" \
+    '{schema:$schema,run_id:$run_id,created_at:$created_at,
+      candidate_sha256:$candidate_sha256,
+      deployment_bundle_sha256:$deployment_bundle_sha256,
+      deployment_source_revision:$deployment_source_revision,
+      run_spool:$run_spool,segment_seconds:$segment_seconds,
+      requested_duration_seconds:$requested_duration_seconds,
+      health_settle_seconds:$health_settle_seconds,
+      host_memory_total_bytes:$host_memory_total_bytes,
+      host_swap_total_bytes:$host_swap_total_bytes,
+      production_memory_current_bytes:$production_memory_current_bytes,
+      maximum_sequential_phase_memory_bytes:$maximum_sequential_phase_memory_bytes,
+      resource_preflight:$resource_preflight,
+      resource_admission_samples:$resource_admission_samples,
+      test_only:$test_only}' >"$run_json_tmp"
+  chmod 0640 "$run_json_tmp"
+  mv -Tf "$run_json_tmp" "$run_json"
+}
+write_run_json
 
 tmp_dir=$(mktemp -d)
 chown "$SERVICE_USER:$SERVICE_USER" "$tmp_dir"
@@ -475,6 +581,7 @@ cleanup() {
   local status=$?
   stop_strict_verifier
   stop_upload_drain
+  write_run_json >/dev/null 2>&1 || true
   if [[ $gate_finished != true ]]; then
     systemctl stop "${unit[spot]}" "${unit[usdm]}" >/dev/null 2>&1 || true
   fi
@@ -482,14 +589,11 @@ cleanup() {
     rm -f -- "${override_file[$market]}"
   done
   rm -rf "$tmp_dir"
-  rm -f "$gate_tmp" "$marker_tmp"
+  rm -f "$run_json_tmp" "$gate_tmp" "$marker_tmp"
   exit "$status"
 }
 trap 'exit 143' HUP INT TERM
 trap cleanup EXIT
-
-[[ $host_memory_headroom_ok == true ]] || die \
-  "insufficient host memory headroom for sequential shadow gate: total=$host_memory_total_bytes available=$host_memory_available_bytes swap=$host_swap_total_bytes phase=$shadow_phase_memory_bytes production_headroom=$production_memory_headroom_bytes production_soft_headroom=$production_memory_soft_headroom_bytes production_reserve_burst=$production_memory_reserve_burst_bytes reserve=$HOST_MEMORY_RESERVE_BYTES minimum_host_reserve=$MIN_HOST_MEMORY_RESERVE_BYTES required=$host_memory_required_bytes shortfall=$host_memory_shortfall_bytes"
 
 assert_candidate() {
   [[ -L $SHADOW_BINARY ]] || die 'shadow candidate symlink disappeared'
@@ -515,13 +619,14 @@ run_candidate_drain() {
   local market=$1 status
   upload_drain_counter=$((upload_drain_counter + 1))
   upload_drain_unit="monday-rust-upload-drain-$$-${market}-${upload_drain_counter}.service"
+  admit_resource_phase "upload-drain-$market" "$UPLOAD_DRAIN_MEMORY_MAX_BYTES"
   if systemd-run --quiet --wait --collect \
     --unit="$upload_drain_unit" \
     --property=KillMode=control-group \
     --property=OOMScoreAdjust=500 \
     --property=CPUQuota=80% \
-    --property=MemoryHigh=2500M \
-    --property=MemoryMax=3200M \
+    --property=MemoryHigh=384M \
+    --property=MemoryMax=512M \
     -- runuser --user "$SERVICE_USER" -- env -i \
       HOME="$SERVICE_HOME" \
       PATH="$SAFE_PATH" \
@@ -546,12 +651,14 @@ run_strict_verifier() {
   local verifier_status=0
   strict_verifier_counter=$((strict_verifier_counter + 1))
   strict_verifier_unit="monday-rust-strict-verifier-$$-${strict_verifier_counter}.service"
+  admit_resource_phase "strict-verifier-$strict_verifier_counter" \
+    "$STRICT_VERIFIER_MEMORY_MAX_BYTES"
   if systemd-run --quiet --wait --collect \
     --unit="$strict_verifier_unit" \
     --property=KillMode=control-group \
     --property=OOMScoreAdjust=500 \
-    --property=MemoryHigh=2560M \
-    --property=MemoryMax=3072M \
+    --property=MemoryHigh=1280M \
+    --property=MemoryMax=1536M \
     -- "$candidate_binary" "$@" >/dev/null; then
     verifier_status=0
   else
@@ -812,6 +919,7 @@ validate_observation_sample() {
 validate_running_sample() {
   local market=$1 memory_now
   assert_candidate
+  assert_host_memory_reserve
   systemctl is-active --quiet "${unit[$market]}" \
     || die "$market shadow service stopped before observation completed"
   [[ $(systemctl_value "$market" NRestarts) == 0 ]] \
@@ -844,6 +952,7 @@ run_market_gate_phase() {
     fi
   done
   assert_candidate
+  admit_resource_phase "shadow-$market" 2147483648
   market_gate_started_ns[$market]=$(date +%s%N)
   systemctl start "${unit[$market]}"
   systemctl is-active --quiet "${unit[$market]}" || die "$market shadow service is not active"
@@ -883,6 +992,7 @@ run_market_gate_phase() {
       || die "$market shadow service stopped while settling"
     [[ $(systemctl_value "$market" NRestarts) == 0 ]] \
       || die "$market shadow service restarted while settling"
+    assert_host_memory_reserve
     sleep 10
   done
 
@@ -1523,6 +1633,7 @@ if [[ $test_only == true ]] || ((duration_seconds < REQUIRED_DURATION_SECONDS));
   passed=false
   production_eligible=false
 fi
+write_run_json
 
 jq -n \
   --arg schema monday.rust_lob_shadow_gate.v3 \
@@ -1539,16 +1650,12 @@ jq -n \
   --argjson requested_duration_seconds "$gate_seconds" \
   --argjson health_settle_seconds "$health_settle_seconds" \
   --argjson host_memory_total_bytes "$host_memory_total_bytes" \
-  --argjson host_memory_available_bytes_at_preflight "$host_memory_available_bytes" \
   --argjson host_swap_total_bytes "$host_swap_total_bytes" \
-  --argjson shadow_phase_memory_bytes "$shadow_phase_memory_bytes" \
-  --argjson production_memory_headroom_bytes "$production_memory_headroom_bytes" \
-  --argjson production_memory_soft_headroom_bytes "$production_memory_soft_headroom_bytes" \
-  --argjson production_memory_reserve_burst_bytes "$production_memory_reserve_burst_bytes" \
-  --argjson host_memory_reserve_bytes "$HOST_MEMORY_RESERVE_BYTES" \
-  --argjson minimum_host_memory_reserve_bytes "$MIN_HOST_MEMORY_RESERVE_BYTES" \
-  --argjson host_memory_required_bytes "$host_memory_required_bytes" \
-  --argjson host_memory_shortfall_bytes "$host_memory_shortfall_bytes" \
+  --argjson production_memory_current_bytes "$production_memory_current_json" \
+  --argjson maximum_sequential_phase_memory_bytes \
+    "$maximum_sequential_phase_memory_bytes" \
+  --argjson resource_preflight "$resource_preflight_json" \
+  --argjson resource_admission_samples "$resource_admission_samples_json" \
   --argjson segment_seconds "$GATE_SEGMENT_SECONDS" \
   --argjson duration_seconds "$duration_seconds" \
   --argjson test_only "$test_only" \
@@ -1566,16 +1673,11 @@ jq -n \
     requested_duration_seconds:$requested_duration_seconds,
     health_settle_seconds:$health_settle_seconds,
     host_memory_total_bytes:$host_memory_total_bytes,
-    host_memory_available_bytes_at_preflight:$host_memory_available_bytes_at_preflight,
     host_swap_total_bytes:$host_swap_total_bytes,
-    shadow_phase_memory_bytes:$shadow_phase_memory_bytes,
-    production_memory_headroom_bytes:$production_memory_headroom_bytes,
-    production_memory_soft_headroom_bytes:$production_memory_soft_headroom_bytes,
-    production_memory_reserve_burst_bytes:$production_memory_reserve_burst_bytes,
-    host_memory_reserve_bytes:$host_memory_reserve_bytes,
-    minimum_host_memory_reserve_bytes:$minimum_host_memory_reserve_bytes,
-    host_memory_required_bytes:$host_memory_required_bytes,
-    host_memory_shortfall_bytes:$host_memory_shortfall_bytes,
+    production_memory_current_bytes:$production_memory_current_bytes,
+    maximum_sequential_phase_memory_bytes:$maximum_sequential_phase_memory_bytes,
+    resource_preflight:$resource_preflight,
+    resource_admission_samples:$resource_admission_samples,
     segment_seconds:$segment_seconds,
     duration_seconds:$duration_seconds,
     test_only:$test_only,checks_passed:$checks_passed,

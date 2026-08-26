@@ -37,6 +37,27 @@ if monday_shadow_memory_admission \
   printf 'shadow gate memory admission accepted one byte below the requirement\n' >&2
   exit 1
 fi
+if rejected_required=$(monday_shadow_memory_admission \
+  "$((required_memory - 1))" 1073741824 10485760000 0); then
+  printf 'shadow gate memory admission accepted a rejected fixture\n' >&2
+  exit 1
+else
+  rejected_status=$?
+fi
+[[ $rejected_status == 1 && $rejected_required == "$required_memory" ]] || {
+  printf 'shadow gate memory admission lost the rejected requirement or status\n' >&2
+  exit 1
+}
+[[ $(monday_production_memory_growth_headroom 5 9 25 3) == 7 ]]
+[[ $(monday_production_memory_growth_headroom 5 24 25 3) == 20 ]]
+if monday_production_memory_growth_headroom 10 9 25 3 >/dev/null 2>&1; then
+  printf 'production memory growth accepted a peak below current usage\n' >&2
+  exit 1
+fi
+if monday_production_memory_growth_headroom 5 26 25 3 >/dev/null 2>&1; then
+  printf 'production memory growth accepted a peak above MemoryMax\n' >&2
+  exit 1
+fi
 if monday_shadow_memory_admission 1 1 invalid 0 >/dev/null 2>&1; then
   printf 'shadow gate memory admission accepted an invalid phase limit\n' >&2
   exit 1
@@ -60,20 +81,17 @@ if monday_shadow_memory_admission 1 0 0 >/dev/null 2>&1; then
   printf 'shadow gate memory admission accepted a zero requirement\n' >&2
   exit 1
 fi
-calibrated_gate_bytes=4429185024
+calibrated_gate_bytes=3221225472
 [[ $(monday_shadow_memory_admission \
-  "$calibrated_gate_bytes" 1073741824 3355443200) == "$calibrated_gate_bytes" ]] || {
-  printf 'calibrated sequential gate does not fit its upload-drain budget\n' >&2
+  "$calibrated_gate_bytes" 1073741824 2147483648) == "$calibrated_gate_bytes" ]] || {
+  printf 'calibrated sequential gate does not fit its largest Shadow phase\n' >&2
   exit 1
 }
-calibrated_soft_headroom_bytes=1048576
-[[ $(monday_shadow_memory_admission \
-  "$((calibrated_gate_bytes + calibrated_soft_headroom_bytes))" \
-  1073741824 3355443200 "$calibrated_soft_headroom_bytes") \
-  == "$((calibrated_gate_bytes + calibrated_soft_headroom_bytes))" ]] || {
-  printf 'calibrated sequential gate does not reserve production growth to MemoryHigh\n' >&2
+if monday_shadow_memory_admission "$((calibrated_gate_bytes - 1))" \
+  1073741824 2147483648 >/dev/null; then
+  printf 'calibrated sequential gate accepted one byte below its phase reserve\n' >&2
   exit 1
-}
+fi
 
 for command in awk base64 cmp cut grep install jq mktemp sed seq sha256sum sort tail; do
   command -v "$command" >/dev/null 2>&1 || {
@@ -129,8 +147,8 @@ grep -Fq -- '--unit="$strict_verifier_unit"' "$GATE"
 grep -Fxq 'KillMode=mixed' "$SHADOW_UNIT"
 grep -Fxq 'KillMode=mixed' "$SCRIPT_DIR/binance-lob-archiver-production@.service"
 grep -Fq -- '--property=KillMode=control-group' "$GATE"
-grep -Fq 'MemoryHigh=2560M' "$GATE"
-grep -Fq 'MemoryMax=3072M' "$GATE"
+grep -Fq 'MemoryHigh=1280M' "$GATE"
+grep -Fq 'MemoryMax=1536M' "$GATE"
 grep -Fq 'OOMScoreAdjust=500' "$GATE"
 grep -Fq 'verify_oss_round_trips "$market" >"$round_trips_path"' "$GATE"
 if grep -Fq 'round_trips=$(verify_oss_round_trips "$market")' "$GATE"; then
@@ -242,6 +260,21 @@ upload_line=$(grep -n -- '--upload-only' <<<"$drain_body" | cut -d: -f1 || true)
   printf 'cutover does not detach interrupted spools before upload-only drain\n' >&2
   exit 1
 }
+for property in \
+  '--property=KillMode=control-group' \
+  '--property=OOMScoreAdjust=500' \
+  '--property=CPUQuota=80%' \
+  '--property=MemoryHigh=384M' \
+  '--property=MemoryMax=512M'; do
+  grep -Fq -- "$property" <<<"$drain_body" || {
+    printf 'cutover candidate drain is missing %s\n' "$property" >&2
+    exit 1
+  }
+done
+grep -Fq 'CANDIDATE_DRAIN_UNIT="monday-rust-cutover-upload-drain-' <<<"$drain_body"
+grep -Fq 'stop_candidate_drain' \
+  <<<"$(sed -n '/^on_exit()/,/^}/p' "$CUTOVER")"
+grep -Fq "trap 'exit 143' HUP INT TERM" "$CUTOVER"
 recover_body=$(sed -n '/^fn recover_parts_only()/,/^fn stream_types_for_market/p' "$COLLECTOR")
 grep -Fq '/opt/monday/bin/monday-rust-lob-recovery-queue isolate "$market"' "$CUTOVER"
 grep -Fq 'spool_lock.owner()' <<<"$recover_body"
@@ -348,46 +381,77 @@ grep -Fq 'systemctl_value "$market" DropInPaths' "$GATE"
 grep -Fq 'systemctl_value "$market" MemoryHigh' "$GATE"
 grep -Fq 'memory_max_bytes[$market] == 2147483648' "$GATE"
 grep -Fq 'readonly HOST_MEMORY_RESERVE_BYTES=1073741824' "$GATE"
-grep -Fq 'readonly MIN_HOST_MEMORY_RESERVE_BYTES=536870912' "$GATE"
-grep -Fq 'readonly STRICT_VERIFIER_MEMORY_MAX_BYTES=3221225472' "$GATE"
-grep -Fq 'readonly UPLOAD_DRAIN_MEMORY_MAX_BYTES=3355443200' "$GATE"
+grep -Fq 'readonly PRODUCTION_MEMORY_GROWTH_MARGIN_BYTES=268435456' "$GATE"
+grep -Fq 'readonly STRICT_VERIFIER_MEMORY_MAX_BYTES=1610612736' "$GATE"
+grep -Fq 'readonly UPLOAD_DRAIN_MEMORY_MAX_BYTES=536870912' "$GATE"
+grep -Fxq 'MemoryHigh=384M' "$SCRIPT_DIR/binance-lob-archiver-rust-upload@.service"
+grep -Fxq 'MemoryMax=512M' "$SCRIPT_DIR/binance-lob-archiver-rust-upload@.service"
+grep -Fxq 'MemoryHigh=384M' "$SCRIPT_DIR/binance-lob-archiver-upload@.service"
+grep -Fxq 'MemoryMax=512M' "$SCRIPT_DIR/binance-lob-archiver-upload@.service"
 grep -Fq 'monday_shadow_memory_admission' "$GATE"
-grep -Fq 'host_memory_available_bytes_at_preflight' "$GATE"
 grep -Fq 'host_swap_total_bytes' "$GATE"
-grep -Fq 'shadow_phase_memory_bytes' "$GATE"
-grep -Fq 'production_memory_headroom_bytes' "$GATE"
-grep -Fq 'production_memory_soft_headroom_bytes' "$GATE"
-grep -Fq 'production_memory_reserve_burst_bytes' "$GATE"
-grep -Fq 'minimum_host_memory_reserve_bytes' "$GATE"
-grep -Fq 'host_memory_required_bytes' "$GATE"
-grep -Fq 'host_memory_shortfall_bytes' "$GATE"
-grep -Fq 'host_memory_headroom_ok' "$GATE"
+grep -Fq 'production_memory_current_bytes' "$GATE"
+grep -Fq 'maximum_sequential_phase_memory_bytes' "$GATE"
+grep -Fq 'resource_preflight' "$GATE"
+grep -Fq 'resource_admission_samples' "$GATE"
 grep -Fq 'systemctl_value "$market" OOMScoreAdjust' "$GATE"
-memory_admission_call=$(sed -n \
-  '/^if host_memory_required_bytes=$(monday_shadow_memory_admission \\/,/^  "$shadow_phase_memory_bytes" "$production_memory_soft_headroom_bytes"); then$/p' \
-  "$GATE")
-[[ -n $memory_admission_call \
-  && $memory_admission_call == *production_memory_soft_headroom_bytes* \
-  && $memory_admission_call != *'"$production_memory_headroom_bytes"'* \
-  && $memory_admission_call != *production_memory_reserve_burst_bytes* ]] || {
-  printf 'shadow gate double-reserves production cgroup slack\n' >&2
+for obsolete in \
+  production_memory_headroom_bytes \
+  production_memory_soft_headroom_bytes \
+  production_memory_reserve_burst_bytes \
+  minimum_host_memory_reserve_bytes \
+  host_memory_headroom_ok \
+  host_memory_shortfall_bytes; do
+  if grep -Fq "$obsolete" "$GATE"; then
+    printf 'shadow gate still records obsolete resource field %s\n' "$obsolete" >&2
+    exit 1
+  fi
+done
+admission_body=$(sed -n '/^admit_resource_phase()/,/^}/p' "$GATE")
+grep -Fq '"$available" "$HOST_MEMORY_RESERVE_BYTES" "$phase_memory_max_bytes"' \
+  <<<"$admission_body"
+grep -Fq '"$production_memory_growth_headroom_bytes"' <<<"$admission_body"
+if grep -Fq 'if ! required=$(monday_shadow_memory_admission' <<<"$admission_body"; then
+  printf 'phase admission still destroys the rejected helper status with !\n' >&2
+  exit 1
+fi
+grep -Fq 'assert_host_memory_reserve' "$GATE"
+grep -Fq 'admit_resource_phase "shadow-$market" 2147483648' "$GATE"
+grep -Fq 'admit_resource_phase "upload-drain-$market" "$UPLOAD_DRAIN_MEMORY_MAX_BYTES"' \
+  "$GATE"
+grep -Fq 'admit_resource_phase "strict-verifier-$strict_verifier_counter"' "$GATE"
+preflight_admission_line=$(grep -n '^admit_resource_phase resource-preflight ' "$GATE" \
+  | cut -d: -f1)
+preflight_exit_line=$(grep -n '^  exit 0$' "$GATE" | cut -d: -f1)
+evidence_mutation_line=$(grep -n '^install -d -m 0755 /data/monday$' "$GATE" \
+  | cut -d: -f1)
+[[ -n $preflight_admission_line && -n $preflight_exit_line \
+  && -n $evidence_mutation_line \
+  && $preflight_admission_line -lt $preflight_exit_line \
+  && $preflight_exit_line -lt $evidence_mutation_line ]] || {
+  printf 'resource preflight is not complete before Gate evidence mutation\n' >&2
   exit 1
 }
-production_burst_guard=$(sed -n \
-  '/^((production_memory_reserve_burst_bytes \\/,/^  || die "production memory burst leaves less than the minimum host reserve:/p' \
-  "$GATE")
-[[ -n $production_burst_guard \
-  && $production_burst_guard == *'HOST_MEMORY_RESERVE_BYTES - MIN_HOST_MEMORY_RESERVE_BYTES'* ]] || {
-  printf 'shadow gate does not preserve the minimum host reserve during production bursts\n' >&2
+preflight_lock_guard=$(sed -n \
+  '/^if \[\[ \$resource_preflight_only != true \]\]; then$/,/^fi$/p' "$GATE")
+[[ $preflight_lock_guard == *'install -d -m 0755'* \
+  && $preflight_lock_guard == *'flock -n 9'* ]] || {
+  printf 'formal Gate lock is not isolated from the non-mutating preflight\n' >&2
   exit 1
 }
-memory_guard_line=$(grep -nF 'insufficient host memory headroom for sequential shadow gate' \
-  "$GATE" | cut -d: -f1)
+if grep -Fq 'release lock must already exist for a non-mutating resource preflight' \
+  "$GATE"; then
+  printf 'resource preflight still depends on a volatile pre-existing lock file\n' >&2
+  exit 1
+fi
+shadow_phase_body=$(sed -n '/^run_market_gate_phase()/,/^}/p' "$GATE")
+shadow_admission_line=$(grep -nF 'admit_resource_phase "shadow-$market"' \
+  <<<"$shadow_phase_body" | cut -d: -f1)
 shadow_start_line=$(grep -nF 'systemctl start "${unit[$market]}"' \
-  "$GATE" | cut -d: -f1)
-[[ -n $memory_guard_line && -n $shadow_start_line \
-  && $memory_guard_line -lt $shadow_start_line ]] || {
-  printf 'shadow gate memory guard does not run before sequential shadow phases\n' >&2
+  <<<"$shadow_phase_body" | cut -d: -f1)
+[[ -n $shadow_admission_line && -n $shadow_start_line \
+  && $shadow_admission_line -lt $shadow_start_line ]] || {
+  printf 'shadow phase does not refresh resource admission before start\n' >&2
   exit 1
 }
 if grep -Fq 'systemctl start "${unit[spot]}" "${unit[usdm]}"' "$GATE"; then
@@ -447,6 +511,98 @@ grep -Fq 'Spot shadow and production SNAPSHOT_PRODUCERS differ' "$GATE"
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
 
+resource_admission_body="$tmp_dir/resource-admission.sh"
+sed -n '/^admit_resource_phase()/,/^}/p' "$GATE" >"$resource_admission_body"
+resource_admission_fixture() (
+  fixture_available=$1
+  HOST_MEMORY_RESERVE_BYTES=1073741824
+  PRODUCTION_MEMORY_GROWTH_MARGIN_BYTES=268435456
+  production_memory_growth_headroom_bytes=268435456
+  resource_admission_samples_json='[]'
+  latest_resource_admission_sample_json=null
+  meminfo_bytes() { [[ $1 == MemAvailable ]] && printf '%s\n' "$fixture_available"; }
+  die() { printf '%s\n' "$*" >&2; exit 1; }
+  # shellcheck disable=SC1090
+  . "$resource_admission_body"
+  admit_resource_phase shadow-spot 2147483648
+  printf '%s\n' "$latest_resource_admission_sample_json"
+)
+resource_sample=$(resource_admission_fixture 3489660928)
+jq -e '.phase == "shadow-spot"
+  and .host_memory_available_bytes == 3489660928
+  and .host_memory_reserve_bytes == 1073741824
+  and .phase_memory_max_bytes == 2147483648
+  and .production_memory_growth_margin_bytes == 268435456
+  and .production_memory_growth_headroom_bytes == 268435456
+  and .required_bytes == 3489660928' <<<"$resource_sample" >/dev/null
+if resource_admission_fixture 3489660927 >/dev/null 2>&1; then
+  printf 'phase admission accepted one byte below reserve, phase max, and production growth\n' >&2
+  exit 1
+fi
+
+cutover_drain_fixture_body="$tmp_dir/cutover-drain.sh"
+sed -n '/^stop_candidate_drain()/,/^}/p;/^run_candidate_drain()/,/^}/p' \
+  "$CUTOVER" >"$cutover_drain_fixture_body"
+run_cutover_drain_fixture() (
+  local -a invocations=() stopped_units=()
+  CANDIDATE_DRAIN_UNIT=
+  CANDIDATE_DRAIN_COUNTER=0
+  CANDIDATE_SHA256=$(printf 'a%.0s' {1..64})
+  CANDIDATE_BINARY=/candidate/binance-lob-archiver
+  CANONICAL_SPOOL=/spool
+  SAFE_PATH=/usr/bin:/bin
+  DRAIN_MAY_HAVE_MUTATED=0
+  DRAIN_ENV_KEYS=(MARKET)
+  canonical_spool_paths_safe() { return 0; }
+  env_value() { printf 'value\n'; }
+  has_incomplete_segment_artifacts() { return 1; }
+  require_empty_segment_spool() { return 0; }
+  jq() { return 0; }
+  systemctl() { [[ $1 == stop ]] && stopped_units+=("$2"); }
+  systemd-run() { invocations+=("$*"); }
+  # shellcheck disable=SC1090
+  . "$cutover_drain_fixture_body"
+  run_candidate_drain /deployment
+  [[ ${#invocations[@]} -eq 2 && ${#stopped_units[@]} -eq 0 ]]
+  for invocation in "${invocations[@]}"; do
+    [[ $invocation == *'--property=KillMode=control-group'* ]]
+    [[ $invocation == *'--property=OOMScoreAdjust=500'* ]]
+    [[ $invocation == *'--property=CPUQuota=80%'* ]]
+    [[ $invocation == *'--property=MemoryHigh=384M'* ]]
+    [[ $invocation == *'--property=MemoryMax=512M'* ]]
+  done
+  [[ -z $CANDIDATE_DRAIN_UNIT ]]
+)
+run_cutover_drain_fixture
+run_cutover_drain_failure_fixture() (
+  local -a stopped_units=()
+  CANDIDATE_DRAIN_UNIT=
+  CANDIDATE_DRAIN_COUNTER=0
+  CANDIDATE_SHA256=$(printf 'a%.0s' {1..64})
+  CANDIDATE_BINARY=/candidate/binance-lob-archiver
+  CANONICAL_SPOOL=/spool
+  SAFE_PATH=/usr/bin:/bin
+  DRAIN_MAY_HAVE_MUTATED=0
+  DRAIN_ENV_KEYS=(MARKET)
+  canonical_spool_paths_safe() { return 0; }
+  env_value() { printf 'value\n'; }
+  has_incomplete_segment_artifacts() { return 1; }
+  require_empty_segment_spool() { return 0; }
+  jq() { return 0; }
+  systemctl() { [[ $1 == stop ]] && stopped_units+=("$2"); }
+  systemd-run() { return 17; }
+  # shellcheck disable=SC1090
+  . "$cutover_drain_fixture_body"
+  if run_candidate_drain /deployment; then
+    printf 'failed cutover drain fixture unexpectedly passed\n' >&2
+    exit 1
+  fi
+  [[ ${#stopped_units[@]} -eq 1 ]]
+  [[ ${stopped_units[0]} == monday-rust-cutover-upload-drain-*.service ]]
+  [[ -z $CANDIDATE_DRAIN_UNIT ]]
+)
+run_cutover_drain_failure_fixture
+
 active_segment_body=$(sed -n '/^active_segment_start_ns()/,/^}/p' "$GATE")
 eval "$active_segment_body"
 active_segment_fixture="$tmp_dir/active-segment"
@@ -467,8 +623,12 @@ run_strict_verifier_fixture() (
   local -a verifier_invocations=()
   strict_verifier_unit=
   strict_verifier_counter=0
+  STRICT_VERIFIER_MEMORY_MAX_BYTES=1610612736
   candidate_binary=candidate_binary
   die() { printf '%s\n' "$*" >&2; exit 1; }
+  admit_resource_phase() {
+    [[ $1 == strict-verifier-* && $2 == "$STRICT_VERIFIER_MEMORY_MAX_BYTES" ]]
+  }
   systemd-run() {
     verifier_units+=("$*")
     while (($#)); do
@@ -521,8 +681,8 @@ run_strict_verifier_fixture() (
   }
   for verifier_unit in "${verifier_units[@]}"; do
     [[ $verifier_unit == *'--property=OOMScoreAdjust=500'* ]] || exit 1
-    [[ $verifier_unit == *'--property=MemoryHigh=2560M'* ]] || exit 1
-    [[ $verifier_unit == *'--property=MemoryMax=3072M'* ]] || exit 1
+    [[ $verifier_unit == *'--property=MemoryHigh=1280M'* ]] || exit 1
+    [[ $verifier_unit == *'--property=MemoryMax=1536M'* ]] || exit 1
   done
 )
 run_strict_verifier_fixture
@@ -531,7 +691,9 @@ run_strict_verifier_failure_fixture() (
   local -a stopped_units=()
   strict_verifier_unit=
   strict_verifier_counter=0
+  STRICT_VERIFIER_MEMORY_MAX_BYTES=1610612736
   candidate_binary=candidate_binary
+  admit_resource_phase() { :; }
   systemd-run() {
     while (($#)); do
       if [[ $1 == -- ]]; then
@@ -576,6 +738,7 @@ run_upload_drain_fixture() (
   declare -A spool_dir oss_bucket oss_endpoint oss_region aliyun_profile oss_copy_timeout
   upload_drain_unit=
   upload_drain_counter=0
+  UPLOAD_DRAIN_MEMORY_MAX_BYTES=536870912
   SERVICE_USER=hftcollector
   SERVICE_HOME=/var/lib/hft-collector
   SAFE_PATH=/usr/bin:/bin
@@ -586,6 +749,9 @@ run_upload_drain_fixture() (
   oss_region[spot]=region
   aliyun_profile[spot]=profile
   oss_copy_timeout[spot]=60
+  admit_resource_phase() {
+    [[ $1 == upload-drain-spot && $2 == "$UPLOAD_DRAIN_MEMORY_MAX_BYTES" ]]
+  }
   systemd-run() { invocations+=("$*"); }
   assert_spool_drained() { [[ $1 == spot ]]; }
   # shellcheck disable=SC1090
@@ -593,8 +759,8 @@ run_upload_drain_fixture() (
   run_candidate_drain spot
   [[ ${#invocations[@]} -eq 1 ]] || exit 1
   [[ ${invocations[0]} == *'--property=CPUQuota=80%'* ]] || exit 1
-  [[ ${invocations[0]} == *'--property=MemoryHigh=2500M'* ]] || exit 1
-  [[ ${invocations[0]} == *'--property=MemoryMax=3200M'* ]] || exit 1
+  [[ ${invocations[0]} == *'--property=MemoryHigh=384M'* ]] || exit 1
+  [[ ${invocations[0]} == *'--property=MemoryMax=512M'* ]] || exit 1
   [[ ${invocations[0]} == *'/candidate/binance-lob-archiver --upload-only'* ]] || exit 1
   [[ -z $upload_drain_unit ]]
 )
@@ -3097,6 +3263,14 @@ set -euo pipefail
 printf '%s\n' "$*" >>"$MOCK_STATE_DIR/calls.log"
 case "${1:-} ${2:-}" in
   'ecs RunCommand')
+    capture_next=0
+    for argument in "$@"; do
+      if ((capture_next)); then
+        printf '%s\n' "$argument" >"$MOCK_STATE_DIR/last-command-content"
+        break
+      fi
+      [[ $argument == --CommandContent ]] && capture_next=1
+    done
     printf '{"InvokeId":"mock-invoke"}\n'
     ;;
   'ecs DescribeInvocationResults')
@@ -3110,8 +3284,8 @@ case "${1:-} ${2:-}" in
       status=${MOCK_STATUS:-Success}
       exit_code=${MOCK_EXIT_CODE:-0}
     fi
-    printf '{"Invocation":{"InvocationStatus":"%s","ExitCode":"%s"}}\n' \
-      "$status" "$exit_code"
+    printf '{"Invocation":{"InvocationStatus":"%s","ExitCode":"%s","Output":"%s"}}\n' \
+      "$status" "$exit_code" "${MOCK_OUTPUT_B64:-}"
     ;;
   'ecs StopInvocation')
     : >"$MOCK_STATE_DIR/stopped"
@@ -3157,6 +3331,62 @@ run_commands_after=$(grep -c 'ecs RunCommand' "$mock_state/calls.log" 2>/dev/nul
   printf 'operation wrapper launched a remote command before validating test parameters\n' >&2
   exit 1
 }
+
+preflight_bundle=$(printf 'b%.0s' {1..64})
+preflight_source=$(printf 'c%.0s' {1..40})
+preflight_payload=$(jq -cn \
+  --arg artifact "$artifact" \
+  --arg bundle "$preflight_bundle" \
+  --arg source "$preflight_source" \
+  '{schema:"monday.rust_lob_gate_resource_preflight.v1",
+    candidate_sha256:$artifact,
+    deployment_bundle_sha256:$bundle,
+    deployment_source_revision:$source,
+    host_memory_total_bytes:8589934592,
+    host_swap_total_bytes:0,
+    production_memory_current_bytes:{
+      spot:{active_state:"active",current_bytes:2147483648,
+        peak_bytes:2147483648,memory_max_bytes:2684354560,
+        growth_target_bytes:2415919104},
+      usdm:{active_state:"active",current_bytes:536870912,
+        peak_bytes:805306368,memory_max_bytes:2684354560,
+        growth_target_bytes:1073741824}},
+    maximum_sequential_phase_memory_bytes:2147483648,
+    resource_preflight:{
+      phase:"resource-preflight",
+      sampled_at:"2026-08-26T00:00:00Z",
+      host_memory_available_bytes:4294967296,
+      host_memory_reserve_bytes:1073741824,
+      phase_memory_max_bytes:2147483648,
+      production_memory_growth_margin_bytes:268435456,
+      production_memory_growth_headroom_bytes:805306368,
+      required_bytes:4026531840},
+    passed:true}')
+preflight_output_b64=$(printf '%s\n' "$preflight_payload" | base64 | tr -d '\n')
+env "${common_env[@]}" \
+  ACTION=gate-preflight \
+  MOCK_STATUS=Success \
+  MOCK_EXIT_CODE=0 \
+  MOCK_OUTPUT_B64="$preflight_output_b64" \
+  "$INVOKE" >"$tmp_dir/gate-preflight.json" 2>"$tmp_dir/gate-preflight.err"
+jq -e '.schema == "monday.rust_lob_gate_resource_preflight.v1" and .passed == true' \
+  "$tmp_dir/gate-preflight.json" >/dev/null
+base64 --decode <"$mock_state/last-command-content" >"$tmp_dir/gate-preflight-command.sh"
+grep -Fq -- '--resource-preflight' "$tmp_dir/gate-preflight-command.sh"
+grep -Fq 'gate-preflight completed successfully: mock-invoke' \
+  "$tmp_dir/gate-preflight.err"
+invalid_preflight_output_b64=$(printf '{}\n' | base64 | tr -d '\n')
+if env "${common_env[@]}" \
+  ACTION=gate-preflight \
+  MOCK_STATUS=Success \
+  MOCK_EXIT_CODE=0 \
+  MOCK_OUTPUT_B64="$invalid_preflight_output_b64" \
+  "$INVOKE" >"$tmp_dir/invalid-gate-preflight.out" 2>&1; then
+  printf 'operation wrapper accepted invalid gate-preflight JSON\n' >&2
+  exit 1
+fi
+grep -Fq 'gate-preflight returned invalid JSON evidence' \
+  "$tmp_dir/invalid-gate-preflight.out"
 
 env "${common_env[@]}" MOCK_STATUS=Success MOCK_EXIT_CODE=0 "$INVOKE" \
   >"$tmp_dir/success.out"

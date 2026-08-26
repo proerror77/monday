@@ -16,7 +16,7 @@ if [[ $# -ne 1 || ! $1 =~ ^[A-Fa-f0-9]{64}$ ]]; then
   exit 2
 fi
 
-for command in awk chmod cmp date env find flock grep id install jq ln mkdir mountpoint mv readlink rm runuser sed sha256sum sleep sort stat systemctl tr wc; do
+for command in awk chmod cmp date env find flock grep id install jq ln mkdir mountpoint mv readlink rm runuser sed sha256sum sleep sort stat systemctl systemd-run tr wc; do
   if ! command -v "$command" >/dev/null 2>&1; then
     printf 'missing required command: %s\n' "$command" >&2
     exit 2
@@ -72,6 +72,8 @@ OLD_HEALTH_SCRIPT_SHA256=
 OLD_HEALTH_SCRIPT_SNAPSHOT=
 OLD_HEALTH_ROLLBACK_SOURCE=absent
 HEALTH_SCRIPT_ROLLBACK_RESULT=not-needed
+CANDIDATE_DRAIN_UNIT=
+CANDIDATE_DRAIN_COUNTER=0
 
 PRODUCTION_UNITS=(
   binance-lob-archiver-production@spot.service
@@ -372,6 +374,12 @@ validate_deployment() {
     grep -Fxq 'EnvironmentFile=/etc/monday/binance-lob-archiver-production-%i.env' \
       "$directory/binance-lob-archiver-upload@.service" \
       || fail 'candidate upload unit has the wrong environment file'
+    grep -Fxq 'MemoryHigh=384M' \
+      "$directory/binance-lob-archiver-upload@.service" \
+      || fail 'candidate upload unit has the wrong memory high watermark'
+    grep -Fxq 'MemoryMax=512M' \
+      "$directory/binance-lob-archiver-upload@.service" \
+      || fail 'candidate upload unit has the wrong memory limit'
     grep -Fxq 'ExecStart=/opt/monday/bin/monday-rust-lob-recovery-queue drain %i' \
       "$directory/binance-lob-archiver-recovery@.service" \
       || fail 'candidate recovery unit has the wrong executable'
@@ -558,8 +566,15 @@ has_incomplete_segment_artifacts() {
   \) -print -quit | grep -q .
 }
 
+stop_candidate_drain() {
+  if [[ -n $CANDIDATE_DRAIN_UNIT ]]; then
+    systemctl stop "$CANDIDATE_DRAIN_UNIT" >/dev/null 2>&1 || true
+    CANDIDATE_DRAIN_UNIT=
+  fi
+}
+
 run_candidate_drain() {
-  local deployment=$1 market env_file key value
+  local deployment=$1 market env_file key value status
   local -a env_args
   canonical_spool_paths_safe || return 1
   for market in spot usdm; do
@@ -577,12 +592,27 @@ run_candidate_drain() {
       continue
     fi
     DRAIN_MAY_HAVE_MUTATED=1
-    runuser --user hftcollector -- env -i \
-      HOME=/var/lib/hft-collector \
-      PATH="$SAFE_PATH" \
-      RUST_LOG=info \
-      "${env_args[@]}" \
-      "$CANDIDATE_BINARY" --upload-only || return 1
+    CANDIDATE_DRAIN_COUNTER=$((CANDIDATE_DRAIN_COUNTER + 1))
+    CANDIDATE_DRAIN_UNIT="monday-rust-cutover-upload-drain-${CANDIDATE_SHA256:0:12}-$$-${market}-${CANDIDATE_DRAIN_COUNTER}.service"
+    if systemd-run --quiet --wait --collect \
+      --unit="$CANDIDATE_DRAIN_UNIT" \
+      --property=KillMode=control-group \
+      --property=OOMScoreAdjust=500 \
+      --property=CPUQuota=80% \
+      --property=MemoryHigh=384M \
+      --property=MemoryMax=512M \
+      -- runuser --user hftcollector -- env -i \
+        HOME=/var/lib/hft-collector \
+        PATH="$SAFE_PATH" \
+        RUST_LOG=info \
+        "${env_args[@]}" \
+        "$CANDIDATE_BINARY" --upload-only; then
+      CANDIDATE_DRAIN_UNIT=
+    else
+      status=$?
+      stop_candidate_drain
+      return "$status"
+    fi
     jq -e '.last_error == null' "$CANONICAL_SPOOL/$market/upload-status.json" >/dev/null \
       || return 1
   done
@@ -1488,6 +1518,7 @@ on_exit() {
   local rc=$?
   trap - EXIT ERR
   set +e
+  stop_candidate_drain
   if (( SUCCESS == 0 )); then
     RESULT=failed
     if (( TRANSITION_STARTED )); then
@@ -1505,6 +1536,7 @@ on_exit() {
 
 trap on_error ERR
 trap on_exit EXIT
+trap 'exit 143' HUP INT TERM
 
 STEP=validate-candidate-release
 for path in /opt/monday /opt/monday/bin "$RELEASE_ROOT" "$CANDIDATE_RELEASE" "$CANDIDATE_DEPLOYMENT"; do

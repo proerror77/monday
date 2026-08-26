@@ -56,6 +56,26 @@ monday_shadow_memory_admission() {
   ((available >= total))
 }
 
+# Reserve a measured production peak plus a bounded growth margin, capped by
+# the unit's hard limit. The live host-reserve check covers growth beyond it.
+monday_production_memory_growth_headroom() {
+  [[ $# -eq 4 ]] || return 2
+  local current=$1 peak=$2 maximum=$3 margin=$4 target
+
+  for value in "$current" "$peak" "$maximum" "$margin"; do
+    [[ $value =~ ^(0|[1-9][0-9]{0,18})$ ]] || return 2
+    # shellcheck disable=SC2071
+    (( ${#value} < 19 )) || [[ $value < 9223372036854775808 ]] || return 2
+  done
+  ((current <= peak && peak <= maximum)) || return 2
+  if ((margin >= maximum - peak)); then
+    target=$maximum
+  else
+    target=$((peak + margin))
+  fi
+  printf '%s\n' "$((target - current))"
+}
+
 # Validate that replay-unsafe manifests are limited to the trailing incomplete
 # portion of a gate observation. Safe segments remain the only input to strict
 # readback; an unsafe segment followed by safe data is a fail-closed boundary.
