@@ -43,6 +43,7 @@ INSTALLED_HEALTH_SCRIPT=/opt/monday/bin/monday-collector-health.sh
 CANONICAL_SPOOL=/data/monday/spool/binance-lob
 RECOVERY_QUEUE_ROOT=/data/monday/spool/binance-lob-recovery
 RECOVERY_EVIDENCE_ROOT=/data/monday/evidence/recoveries
+LOCK_ROOT=/run/lock
 HEALTH_TIMEOUT_SECONDS=300
 SAFE_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -56,6 +57,10 @@ OLD_RECOVERY_TIMER_SPOT_ENABLED=0
 OLD_RECOVERY_TIMER_USDM_ENABLED=0
 OLD_RECOVERY_TIMER_SPOT_MASKED_RUNTIME=0
 OLD_RECOVERY_TIMER_USDM_MASKED_RUNTIME=0
+OLD_RECOVERY_UNIT_SPOT_MASKED_RUNTIME=0
+OLD_RECOVERY_UNIT_USDM_MASKED_RUNTIME=0
+RECOVERY_DRAIN_LOCK_HELD=0
+RECOVERY_QUEUE_LOCKS_HELD=0
 OLD_SPOT_RESTARTS=
 OLD_SPOT_INVOCATION_ID=
 OLD_USDM_RESTARTS=
@@ -128,12 +133,40 @@ DRAIN_ENV_KEYS=(
   OSS_COPY_TIMEOUT_SECONDS
 )
 
-install -d -m 0755 /run/lock
-exec 9>/run/lock/monday-rust-lob-release.lock
+install -d -m 0755 "$LOCK_ROOT"
+exec 9>"$LOCK_ROOT/monday-rust-lob-release.lock"
 if ! flock -n 9; then
   printf 'another Rust collector release operation holds the host lock\n' >&2
   exit 1
 fi
+
+acquire_recovery_transition_locks() {
+  exec 7>"$LOCK_ROOT/monday-rust-lob-recovery-drain.lock"
+  flock -n 7 || return 1
+  RECOVERY_DRAIN_LOCK_HELD=1
+  exec 6>"$LOCK_ROOT/monday-rust-lob-recovery-queue-spot.lock"
+  flock -n 6 || return 1
+  exec 5>"$LOCK_ROOT/monday-rust-lob-recovery-queue-usdm.lock"
+  flock -n 5 || return 1
+  RECOVERY_QUEUE_LOCKS_HELD=1
+}
+
+release_recovery_queue_locks() {
+  (( RECOVERY_QUEUE_LOCKS_HELD )) || return 0
+  flock -u 5 || return 1
+  flock -u 6 || return 1
+  exec 5>&-
+  exec 6>&-
+  RECOVERY_QUEUE_LOCKS_HELD=0
+}
+
+release_recovery_transition_locks() {
+  release_recovery_queue_locks || return 1
+  (( RECOVERY_DRAIN_LOCK_HELD )) || return 0
+  flock -u 7 || return 1
+  exec 7>&-
+  RECOVERY_DRAIN_LOCK_HELD=0
+}
 if [[ ! -d /data || -L /data ]] || ! mountpoint -q /data; then
   printf '/data must be a mounted filesystem\n' >&2
   exit 1
@@ -678,7 +711,7 @@ stage_existing_deployment_for_rollback() {
 }
 
 capture_existing_production_identity() {
-  local timer state
+  local timer unit state
   OLD_MODE=$1
   [[ -L $PRODUCTION_LINK ]] || fail 'running production binary must be a release symlink'
   OLD_BINARY=$(readlink -f "$PRODUCTION_LINK")
@@ -690,8 +723,12 @@ capture_existing_production_identity() {
   OLD_RECOVERY_TIMER_USDM_ENABLED=0
   OLD_RECOVERY_TIMER_SPOT_MASKED_RUNTIME=0
   OLD_RECOVERY_TIMER_USDM_MASKED_RUNTIME=0
+  OLD_RECOVERY_UNIT_SPOT_MASKED_RUNTIME=0
+  OLD_RECOVERY_UNIT_USDM_MASKED_RUNTIME=0
   for timer in "${RECOVERY_TIMERS[@]}"; do
     state=$(systemctl is-enabled "$timer" 2>/dev/null || true)
+    [[ $state != masked ]] \
+      || fail "old production recovery timer is persistently masked: $timer"
     if [[ $timer == "${RECOVERY_TIMERS[0]}" ]]; then
       if [[ $state == enabled ]]; then
         ((OLD_RECOVERY_TIMERS_ENABLED += 1))
@@ -708,6 +745,16 @@ capture_existing_production_identity() {
       fi
     fi
   done
+  for unit in "${RECOVERY_UNITS[@]}"; do
+    state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+    [[ $state != masked ]] \
+      || fail "old production recovery service is persistently masked: $unit"
+    if [[ $unit == "${RECOVERY_UNITS[0]}" && $state == masked-runtime ]]; then
+      OLD_RECOVERY_UNIT_SPOT_MASKED_RUNTIME=1
+    elif [[ $unit == "${RECOVERY_UNITS[1]}" && $state == masked-runtime ]]; then
+      OLD_RECOVERY_UNIT_USDM_MASKED_RUNTIME=1
+    fi
+  done
   if [[ $OLD_MODE == partial-contained-spot-live ]]; then
     (( OLD_RECOVERY_TIMER_SPOT_ENABLED == 1 \
       || OLD_RECOVERY_TIMER_USDM_ENABLED == 0 )) \
@@ -716,10 +763,6 @@ capture_existing_production_identity() {
     (( OLD_RECOVERY_TIMER_USDM_ENABLED == 1 \
       || OLD_RECOVERY_TIMER_SPOT_ENABLED == 0 )) \
       || fail 'old production recovery timers do not match partial-contained-usdm-live'
-  else
-    (( OLD_RECOVERY_TIMERS_ENABLED == 0 \
-      || OLD_RECOVERY_TIMERS_ENABLED == ${#RECOVERY_TIMERS[@]} )) \
-      || fail 'old production has partially enabled recovery timers'
   fi
   [[ $OLD_SHA256 != "$CANDIDATE_SHA256" ]] || fail 'candidate is already the production release'
   printf '%s  %s\n' "$OLD_SHA256" "$OLD_BINARY" | sha256sum --check --strict
@@ -743,26 +786,81 @@ capture_existing_production_identity() {
   SPOOL_ENV_DEPLOYMENT="$OLD_DEPLOYMENT"
 }
 
-restore_previous_recovery_timers() {
+quiesce_recovery_scheduler() {
+  local unit state
+  systemctl mask --runtime "${RECOVERY_UNITS[@]}" >/dev/null || return 1
+  systemctl stop "${RECOVERY_UNITS[@]}" >/dev/null || return 1
+  systemctl stop "${RECOVERY_TIMERS[@]}" >/dev/null || return 1
+  systemctl mask --runtime "${RECOVERY_TIMERS[@]}" >/dev/null || return 1
+  for unit in "${RECOVERY_UNITS[@]}" "${RECOVERY_TIMERS[@]}"; do
+    systemctl is-active --quiet "$unit" >/dev/null 2>&1 && return 1
+    state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+    [[ $state == masked-runtime ]] || return 1
+  done
+}
+
+recovery_is_fail_closed() {
+  local unit state
+  for unit in "${RECOVERY_UNITS[@]}" "${RECOVERY_TIMERS[@]}"; do
+    systemctl is-active --quiet "$unit" >/dev/null 2>&1 && return 1
+    state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+    [[ $state == masked || $state == masked-runtime ]] || return 1
+  done
+}
+
+restore_previous_recovery_scheduler() {
   local -a timers_to_enable=()
-  local timer expected_enabled expected_masked_runtime state
+  local index timer unit expected_enabled expected_masked_runtime state
+  systemctl disable --now "${RECOVERY_TIMERS[@]}" >/dev/null || return 1
+  systemctl stop "${RECOVERY_UNITS[@]}" >/dev/null || return 1
+  systemctl unmask --runtime "${RECOVERY_UNITS[@]}" "${RECOVERY_TIMERS[@]}" \
+    >/dev/null || return 1
+  systemctl reset-failed "${RECOVERY_UNITS[@]}" "${RECOVERY_TIMERS[@]}" \
+    >/dev/null || return 1
+  for index in 0 1; do
+    unit=${RECOVERY_UNITS[$index]}
+    if (( index == 0 )); then
+      expected_masked_runtime=$OLD_RECOVERY_UNIT_SPOT_MASKED_RUNTIME
+    else
+      expected_masked_runtime=$OLD_RECOVERY_UNIT_USDM_MASKED_RUNTIME
+    fi
+    if (( expected_masked_runtime )); then
+      systemctl mask --runtime "$unit" >/dev/null || return 1
+    fi
+    systemctl is-active --quiet "$unit" >/dev/null 2>&1 && return 1
+    state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+    if (( expected_masked_runtime )); then
+      [[ $state == masked-runtime ]] || return 1
+    else
+      [[ $state != masked && $state != masked-runtime ]] || return 1
+    fi
+  done
   (( OLD_RECOVERY_TIMER_SPOT_ENABLED )) && timers_to_enable+=("${RECOVERY_TIMERS[0]}")
   (( OLD_RECOVERY_TIMER_USDM_ENABLED )) && timers_to_enable+=("${RECOVERY_TIMERS[1]}")
-  if (( ${#timers_to_enable[@]} > 0 )); then
-    systemctl enable --now "${timers_to_enable[@]}" >/dev/null || return 1
-  fi
-  for timer in "${RECOVERY_TIMERS[@]}"; do
-    expected_enabled=0
-    expected_masked_runtime=0
-    if [[ $timer == "${RECOVERY_TIMERS[0]}" ]]; then
+  for index in 0 1; do
+    timer=${RECOVERY_TIMERS[$index]}
+    if (( index == 0 )); then
       expected_enabled=$OLD_RECOVERY_TIMER_SPOT_ENABLED
       expected_masked_runtime=$OLD_RECOVERY_TIMER_SPOT_MASKED_RUNTIME
-    elif [[ $timer == "${RECOVERY_TIMERS[1]}" ]]; then
+    else
       expected_enabled=$OLD_RECOVERY_TIMER_USDM_ENABLED
       expected_masked_runtime=$OLD_RECOVERY_TIMER_USDM_MASKED_RUNTIME
     fi
     if (( expected_masked_runtime )); then
       systemctl mask --runtime "$timer" >/dev/null || return 1
+    fi
+  done
+  if (( ${#timers_to_enable[@]} > 0 )); then
+    systemctl enable --now "${timers_to_enable[@]}" >/dev/null || return 1
+  fi
+  for index in 0 1; do
+    timer=${RECOVERY_TIMERS[$index]}
+    if (( index == 0 )); then
+      expected_enabled=$OLD_RECOVERY_TIMER_SPOT_ENABLED
+      expected_masked_runtime=$OLD_RECOVERY_TIMER_SPOT_MASKED_RUNTIME
+    else
+      expected_enabled=$OLD_RECOVERY_TIMER_USDM_ENABLED
+      expected_masked_runtime=$OLD_RECOVERY_TIMER_USDM_MASKED_RUNTIME
     fi
     state=$(systemctl is-enabled "$timer" 2>/dev/null || true)
     if (( expected_enabled )); then
@@ -777,6 +875,23 @@ restore_previous_recovery_timers() {
     fi
   done
   return 0
+}
+
+enable_candidate_recovery_scheduler() {
+  local unit state
+  systemctl unmask --runtime "${RECOVERY_UNITS[@]}" >/dev/null || return 1
+  systemctl reset-failed "${RECOVERY_UNITS[@]}" >/dev/null || return 1
+  for unit in "${RECOVERY_UNITS[@]}"; do
+    state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+    [[ $state != masked && $state != masked-runtime ]] || return 1
+  done
+  systemctl unmask --runtime "${RECOVERY_TIMERS[@]}" >/dev/null || return 1
+  systemctl reset-failed "${RECOVERY_TIMERS[@]}" >/dev/null || return 1
+  systemctl enable --now "${RECOVERY_TIMERS[@]}" >/dev/null || return 1
+  for unit in "${RECOVERY_TIMERS[@]}"; do
+    systemctl is-enabled --quiet "$unit" >/dev/null 2>&1 || return 1
+    systemctl is-active --quiet "$unit" >/dev/null 2>&1 || return 1
+  done
 }
 
 capture_allowlisted_production_usdm_dropin() {
@@ -971,16 +1086,7 @@ production_is_fail_closed() {
     state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
     [[ $state == masked || $state == masked-runtime ]] || return 1
   done
-  for unit in "${RECOVERY_TIMERS[@]}"; do
-    systemctl is-active --quiet "$unit" && return 1
-    state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
-    [[ $state == disabled || $state == masked || $state == masked-runtime \
-      || $state == not-found ]] || return 1
-  done
-  for unit in "${RECOVERY_UNITS[@]}"; do
-    systemctl is-active --quiet "$unit" && return 1
-  done
-  return 0
+  recovery_is_fail_closed
 }
 
 partial_spot_runtime_is_restored() {
@@ -996,10 +1102,7 @@ partial_spot_runtime_is_restored() {
   done
   [[ $(systemctl show "${PRODUCTION_UNITS[1]}" --property=MainPID --value) == 0 ]] \
     || return 1
-  for unit in "${RECOVERY_UNITS[@]}"; do
-    systemctl is-active --quiet "$unit" && return 1
-  done
-  return 0
+  recovery_is_fail_closed
 }
 
 partial_usdm_runtime_is_restored() {
@@ -1015,16 +1118,14 @@ partial_usdm_runtime_is_restored() {
   done
   [[ $(systemctl show "${PRODUCTION_UNITS[0]}" --property=MainPID --value) == 0 ]] \
     || return 1
-  for unit in "${RECOVERY_UNITS[@]}"; do
-    systemctl is-active --quiet "$unit" && return 1
-  done
-  return 0
+  recovery_is_fail_closed
 }
 
 write_evidence() {
   local temporary current_target spot_active usdm_active
   local previous_recovery_timer_spot_enabled previous_recovery_timer_usdm_enabled
   local previous_recovery_timer_spot_masked_runtime previous_recovery_timer_usdm_masked_runtime
+  local previous_recovery_unit_spot_masked_runtime previous_recovery_unit_usdm_masked_runtime
   local previous_health_script_present
   temporary="$EVIDENCE_DIR/cutover.json.tmp"
   current_target=$(readlink -f "$PRODUCTION_LINK" 2>/dev/null || true)
@@ -1049,6 +1150,16 @@ write_evidence() {
     previous_recovery_timer_usdm_masked_runtime=true
   else
     previous_recovery_timer_usdm_masked_runtime=false
+  fi
+  if (( OLD_RECOVERY_UNIT_SPOT_MASKED_RUNTIME )); then
+    previous_recovery_unit_spot_masked_runtime=true
+  else
+    previous_recovery_unit_spot_masked_runtime=false
+  fi
+  if (( OLD_RECOVERY_UNIT_USDM_MASKED_RUNTIME )); then
+    previous_recovery_unit_usdm_masked_runtime=true
+  else
+    previous_recovery_unit_usdm_masked_runtime=false
   fi
   if (( OLD_HEALTH_ASSET_PRESENT )); then
     previous_health_script_present=true
@@ -1080,6 +1191,8 @@ write_evidence() {
     --argjson previous_recovery_timer_usdm_enabled "$previous_recovery_timer_usdm_enabled" \
     --argjson previous_recovery_timer_spot_masked_runtime "$previous_recovery_timer_spot_masked_runtime" \
     --argjson previous_recovery_timer_usdm_masked_runtime "$previous_recovery_timer_usdm_masked_runtime" \
+    --argjson previous_recovery_unit_spot_masked_runtime "$previous_recovery_unit_spot_masked_runtime" \
+    --argjson previous_recovery_unit_usdm_masked_runtime "$previous_recovery_unit_usdm_masked_runtime" \
     --arg mode "$OLD_MODE" \
     --arg current_binary "$current_target" \
     --argjson spot_active "$spot_active" \
@@ -1126,6 +1239,10 @@ write_evidence() {
         spot: $previous_recovery_timer_spot_masked_runtime,
         usdm: $previous_recovery_timer_usdm_masked_runtime
       },
+      previous_recovery_services_masked_runtime: {
+        spot: $previous_recovery_unit_spot_masked_runtime,
+        usdm: $previous_recovery_unit_usdm_masked_runtime
+      },
       host_mode: $mode,
       current_binary: (if $current_binary == "" then null else $current_binary end),
       production_units_active: {spot: $spot_active, usdm: $usdm_active}
@@ -1137,8 +1254,11 @@ write_evidence() {
 rollback_after_failure() {
   local safe_to_restart=1 safe_to_restore=1 partial_restored=0 unit rollback_started_ns=0
   ROLLBACK_RESULT=disabled
+  release_recovery_queue_locks >/dev/null 2>&1 || true
   systemctl disable --now "${RECOVERY_TIMERS[@]}" >/dev/null 2>&1 || true
   systemctl stop "${RECOVERY_UNITS[@]}" >/dev/null 2>&1 || true
+  systemctl mask --runtime "${RECOVERY_UNITS[@]}" "${RECOVERY_TIMERS[@]}" \
+    >/dev/null 2>&1 || true
   systemctl disable --now "${PRODUCTION_UNITS[@]}" >/dev/null 2>&1 || true
   systemctl mask --runtime "${TRANSITION_MASK_UNITS[@]}" >/dev/null 2>&1 || true
   if [[ $OLD_MODE == new-host ]] \
@@ -1206,12 +1326,7 @@ rollback_after_failure() {
       safe_to_restart=0
       ROLLBACK_RESULT=daemon-reload-failed-disabled
     elif [[ $OLD_MODE == contained-upgrade ]]; then
-      if (( OLD_RECOVERY_TIMER_SPOT_MASKED_RUNTIME \
-        || OLD_RECOVERY_TIMER_USDM_MASKED_RUNTIME )) \
-        && ! restore_previous_recovery_timers; then
-        safe_to_restart=0
-        ROLLBACK_RESULT=recovery-timer-restore-failed-disabled
-      elif production_is_fail_closed; then
+      if production_is_fail_closed; then
         ROLLBACK_RESULT=previous-release-restored-contained
       else
         safe_to_restart=0
@@ -1227,9 +1342,6 @@ rollback_after_failure() {
         safe_to_restart=0
         ROLLBACK_RESULT=previous-usdm-unmask-failed-disabled
       fi
-    elif (( safe_to_restart )) && ! restore_previous_recovery_timers; then
-      safe_to_restart=0
-      ROLLBACK_RESULT=recovery-timer-restore-failed-disabled
     elif (( safe_to_restart )); then
       systemctl unmask --runtime "${PRODUCTION_UNITS[@]}" >/dev/null \
         || safe_to_restart=0
@@ -1258,8 +1370,22 @@ rollback_after_failure() {
         && health_ready_for_release spot 1000 "$OLD_SESSION_SPOT" "$rollback_started_ns" \
         && health_ready_for_release usdm "$OLD_USDM_MINIMUM_SYMBOLS" \
           "$OLD_SESSION_USDM" "$rollback_started_ns"; then
-        ROLLBACK_RESULT=previous-release-health-verified
-        systemctl unmask --runtime "${UPLOAD_UNITS[@]}" >/dev/null 2>&1 || true
+        if restore_previous_recovery_scheduler; then
+          ROLLBACK_RESULT=previous-release-health-verified
+          systemctl unmask --runtime "${UPLOAD_UNITS[@]}" >/dev/null 2>&1 || true
+        else
+          systemctl disable --now "${RECOVERY_TIMERS[@]}" >/dev/null 2>&1 || true
+          systemctl stop "${RECOVERY_UNITS[@]}" >/dev/null 2>&1 || true
+          systemctl mask --runtime "${RECOVERY_UNITS[@]}" "${RECOVERY_TIMERS[@]}" \
+            >/dev/null 2>&1 || true
+          systemctl disable --now "${PRODUCTION_UNITS[@]}" >/dev/null 2>&1 || true
+          systemctl mask --runtime "${TRANSITION_MASK_UNITS[@]}" >/dev/null 2>&1 || true
+          if production_is_fail_closed; then
+            ROLLBACK_RESULT=recovery-scheduler-restore-failed-disabled
+          else
+            ROLLBACK_RESULT=recovery-scheduler-restore-containment-failed
+          fi
+        fi
       else
         systemctl disable --now "${PRODUCTION_UNITS[@]}" >/dev/null 2>&1 || true
         systemctl mask --runtime "${TRANSITION_MASK_UNITS[@]}" >/dev/null 2>&1 || true
@@ -1282,9 +1408,6 @@ rollback_after_failure() {
       fi
       if (( partial_restored )) \
         && ! systemctl unmask --runtime "${UPLOAD_UNITS[0]}" >/dev/null; then
-        partial_restored=0
-      fi
-      if (( partial_restored )) && ! restore_previous_recovery_timers; then
         partial_restored=0
       fi
       if (( partial_restored )) \
@@ -1314,9 +1437,6 @@ rollback_after_failure() {
       fi
       if (( partial_restored )) \
         && ! systemctl unmask --runtime "${UPLOAD_UNITS[1]}" >/dev/null; then
-        partial_restored=0
-      fi
-      if (( partial_restored )) && ! restore_previous_recovery_timers; then
         partial_restored=0
       fi
       if (( partial_restored )) \
@@ -1372,6 +1492,7 @@ on_exit() {
     RESULT=failed
     if (( TRANSITION_STARTED )); then
       rollback_after_failure
+      release_recovery_transition_locks >/dev/null 2>&1 || true
     fi
     if write_evidence; then
       printf 'cutover failed; evidence: %s/cutover.json\n' "$EVIDENCE_DIR" >&2
@@ -1551,7 +1672,15 @@ else
   fail "ambiguous production state: active=$active_count enabled=$enabled_count spot=$spot_active_state/$spot_enabled_state/$spot_upload_enabled_state usdm=$usdm_active_state/$usdm_enabled_state/$usdm_upload_enabled_state symlink=$PRODUCTION_LINK"
 fi
 
+STEP=lock-recovery-scheduler
+acquire_recovery_transition_locks \
+  || fail 'a recovery queue or drain operation is active before cutover'
 TRANSITION_STARTED=1
+STEP=quiesce-recovery-scheduler
+quiesce_recovery_scheduler \
+  || fail 'recovery services and timers did not become inactive and runtime-masked'
+release_recovery_queue_locks \
+  || fail 'recovery queue locks could not be released after scheduler quiescence'
 if (( MASK_USDM_UPLOAD_FOR_TRANSITION )); then
   STEP=contain-usdm-uploader
   systemctl mask --runtime "${UPLOAD_UNITS[1]}" >/dev/null \
@@ -1664,20 +1793,16 @@ health_ready_for_release usdm 100 "$OLD_SESSION_USDM" "$CANDIDATE_STARTED_NS" \
   || fail 'USD-M health changed while enabling production'
 systemctl unmask --runtime "${UPLOAD_UNITS[@]}" >/dev/null
 
-STEP=enable-recovery-timers
-systemctl unmask --runtime "${RECOVERY_TIMERS[@]}" >/dev/null
-systemctl enable --now "${RECOVERY_TIMERS[@]}" >/dev/null
-for timer in "${RECOVERY_TIMERS[@]}"; do
-  systemctl is-enabled --quiet "$timer" \
-    || fail "recovery timer did not enable: $timer"
-  systemctl is-active --quiet "$timer" \
-    || fail "recovery timer did not start: $timer"
-done
+STEP=enable-recovery-scheduler
+enable_candidate_recovery_scheduler \
+  || fail 'candidate recovery services and timers did not become ready'
 
 STEP=write-cutover-evidence
 RESULT=passed
 ROLLBACK_RESULT=not-needed
 write_evidence
+release_recovery_transition_locks \
+  || fail 'recovery drain lock could not be released after cutover'
 SUCCESS=1
 trap - EXIT ERR
 printf 'Rust collector cutover passed: %s\nEvidence: %s/cutover.json\n' \
