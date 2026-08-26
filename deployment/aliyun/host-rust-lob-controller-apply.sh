@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2317
 set -Eeuo pipefail
 umask 027
 export LC_ALL=C
