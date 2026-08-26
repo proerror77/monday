@@ -37,6 +37,27 @@ if monday_shadow_memory_admission \
   printf 'shadow gate memory admission accepted one byte below the requirement\n' >&2
   exit 1
 fi
+if rejected_required=$(monday_shadow_memory_admission \
+  "$((required_memory - 1))" 1073741824 10485760000 0); then
+  printf 'shadow gate memory admission accepted a rejected fixture\n' >&2
+  exit 1
+else
+  rejected_status=$?
+fi
+[[ $rejected_status == 1 && $rejected_required == "$required_memory" ]] || {
+  printf 'shadow gate memory admission lost the rejected requirement or status\n' >&2
+  exit 1
+}
+[[ $(monday_production_memory_growth_headroom 5 9 25 3) == 7 ]]
+[[ $(monday_production_memory_growth_headroom 5 24 25 3) == 20 ]]
+if monday_production_memory_growth_headroom 10 9 25 3 >/dev/null 2>&1; then
+  printf 'production memory growth accepted a peak below current usage\n' >&2
+  exit 1
+fi
+if monday_production_memory_growth_headroom 5 26 25 3 >/dev/null 2>&1; then
+  printf 'production memory growth accepted a peak above MemoryMax\n' >&2
+  exit 1
+fi
 if monday_shadow_memory_admission 1 1 invalid 0 >/dev/null 2>&1; then
   printf 'shadow gate memory admission accepted an invalid phase limit\n' >&2
   exit 1
@@ -360,6 +381,7 @@ grep -Fq 'systemctl_value "$market" DropInPaths' "$GATE"
 grep -Fq 'systemctl_value "$market" MemoryHigh' "$GATE"
 grep -Fq 'memory_max_bytes[$market] == 2147483648' "$GATE"
 grep -Fq 'readonly HOST_MEMORY_RESERVE_BYTES=1073741824' "$GATE"
+grep -Fq 'readonly PRODUCTION_MEMORY_GROWTH_MARGIN_BYTES=268435456' "$GATE"
 grep -Fq 'readonly STRICT_VERIFIER_MEMORY_MAX_BYTES=1610612736' "$GATE"
 grep -Fq 'readonly UPLOAD_DRAIN_MEMORY_MAX_BYTES=536870912' "$GATE"
 grep -Fxq 'MemoryHigh=384M' "$SCRIPT_DIR/binance-lob-archiver-rust-upload@.service"
@@ -388,6 +410,12 @@ done
 admission_body=$(sed -n '/^admit_resource_phase()/,/^}/p' "$GATE")
 grep -Fq '"$available" "$HOST_MEMORY_RESERVE_BYTES" "$phase_memory_max_bytes"' \
   <<<"$admission_body"
+grep -Fq '"$production_memory_growth_headroom_bytes"' <<<"$admission_body"
+if grep -Fq 'if ! required=$(monday_shadow_memory_admission' <<<"$admission_body"; then
+  printf 'phase admission still destroys the rejected helper status with !\n' >&2
+  exit 1
+fi
+grep -Fq 'assert_host_memory_reserve' "$GATE"
 grep -Fq 'admit_resource_phase "shadow-$market" 2147483648' "$GATE"
 grep -Fq 'admit_resource_phase "upload-drain-$market" "$UPLOAD_DRAIN_MEMORY_MAX_BYTES"' \
   "$GATE"
@@ -488,6 +516,8 @@ sed -n '/^admit_resource_phase()/,/^}/p' "$GATE" >"$resource_admission_body"
 resource_admission_fixture() (
   fixture_available=$1
   HOST_MEMORY_RESERVE_BYTES=1073741824
+  PRODUCTION_MEMORY_GROWTH_MARGIN_BYTES=268435456
+  production_memory_growth_headroom_bytes=268435456
   resource_admission_samples_json='[]'
   latest_resource_admission_sample_json=null
   meminfo_bytes() { [[ $1 == MemAvailable ]] && printf '%s\n' "$fixture_available"; }
@@ -497,14 +527,16 @@ resource_admission_fixture() (
   admit_resource_phase shadow-spot 2147483648
   printf '%s\n' "$latest_resource_admission_sample_json"
 )
-resource_sample=$(resource_admission_fixture 3221225472)
+resource_sample=$(resource_admission_fixture 3489660928)
 jq -e '.phase == "shadow-spot"
-  and .host_memory_available_bytes == 3221225472
+  and .host_memory_available_bytes == 3489660928
   and .host_memory_reserve_bytes == 1073741824
   and .phase_memory_max_bytes == 2147483648
-  and .required_bytes == 3221225472' <<<"$resource_sample" >/dev/null
-if resource_admission_fixture 3221225471 >/dev/null 2>&1; then
-  printf 'phase admission accepted one byte below the fixed reserve and phase max\n' >&2
+  and .production_memory_growth_margin_bytes == 268435456
+  and .production_memory_growth_headroom_bytes == 268435456
+  and .required_bytes == 3489660928' <<<"$resource_sample" >/dev/null
+if resource_admission_fixture 3489660927 >/dev/null 2>&1; then
+  printf 'phase admission accepted one byte below reserve, phase max, and production growth\n' >&2
   exit 1
 fi
 
@@ -3313,8 +3345,12 @@ preflight_payload=$(jq -cn \
     host_memory_total_bytes:8589934592,
     host_swap_total_bytes:0,
     production_memory_current_bytes:{
-      spot:{active_state:"active",current_bytes:2147483648},
-      usdm:{active_state:"active",current_bytes:536870912}},
+      spot:{active_state:"active",current_bytes:2147483648,
+        peak_bytes:2147483648,memory_max_bytes:2684354560,
+        growth_target_bytes:2415919104},
+      usdm:{active_state:"active",current_bytes:536870912,
+        peak_bytes:805306368,memory_max_bytes:2684354560,
+        growth_target_bytes:1073741824}},
     maximum_sequential_phase_memory_bytes:2147483648,
     resource_preflight:{
       phase:"resource-preflight",
@@ -3322,7 +3358,9 @@ preflight_payload=$(jq -cn \
       host_memory_available_bytes:4294967296,
       host_memory_reserve_bytes:1073741824,
       phase_memory_max_bytes:2147483648,
-      required_bytes:3221225472},
+      production_memory_growth_margin_bytes:268435456,
+      production_memory_growth_headroom_bytes:805306368,
+      required_bytes:4026531840},
     passed:true}')
 preflight_output_b64=$(printf '%s\n' "$preflight_payload" | base64 | tr -d '\n')
 env "${common_env[@]}" \

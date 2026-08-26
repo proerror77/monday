@@ -1065,8 +1065,12 @@ the largest sequential Gate phase remains the 2048MiB Shadow collector. The
 controller rereads `MemAvailable` immediately before each Shadow start, upload
 drain, and strict verifier, and requires that phase's hard limit plus a fixed
 1GiB host reserve. Active production usage is already reflected in that fresh
-kernel value; the Gate records the actual production `MemoryCurrent` values,
-initial preflight, and every successful phase-admission sample. An over-limit
+kernel value; growth from the sampled usage to each active unit's `MemoryHigh`
+is not treated as a static reservation. Instead, each active production unit
+reserves its observed `MemoryPeak` plus a 256MiB growth margin, capped by its
+hard limit, and the active Shadow phase stops if the live host reserve is
+consumed. The Gate records production current, peak, hard limit, growth target,
+the initial preflight, and every successful phase-admission sample. An over-limit
 phase fails closed instead of increasing the host size or weakening the reserve.
 The Gate fails unless all of these are true for the entire candidate run:
 

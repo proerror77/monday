@@ -10,6 +10,7 @@ readonly GATE_SEGMENT_SECONDS=120
 readonly MAX_HEALTH_SILENCE_SECONDS=120
 readonly MAX_SEGMENT_GAP_NS=90000000000
 readonly HOST_MEMORY_RESERVE_BYTES=1073741824
+readonly PRODUCTION_MEMORY_GROWTH_MARGIN_BYTES=268435456
 readonly STRICT_VERIFIER_MEMORY_MAX_BYTES=1610612736
 readonly UPLOAD_DRAIN_MEMORY_MAX_BYTES=536870912
 readonly SHADOW_BINARY=/opt/monday/bin/binance-lob-archiver-shadow
@@ -296,6 +297,9 @@ if ((UPLOAD_DRAIN_MEMORY_MAX_BYTES > maximum_sequential_phase_memory_bytes)); th
   maximum_sequential_phase_memory_bytes=$UPLOAD_DRAIN_MEMORY_MAX_BYTES
 fi
 declare -A production_active_state production_memory_current_bytes
+declare -A production_memory_peak_bytes production_memory_max_bytes
+declare -A production_memory_growth_target_bytes
+production_memory_growth_headroom_bytes=0
 for market in "${markets[@]}"; do
   production_unit="binance-lob-archiver-production@${market}.service"
   production_active_state[$market]=$(systemctl show "$production_unit" \
@@ -308,13 +312,30 @@ for market in "${markets[@]}"; do
         || die "$market production service is active but not running"
       production_memory_max=$(systemctl show "$production_unit" --property=MemoryMax --value)
       production_memory_high=$(systemctl show "$production_unit" --property=MemoryHigh --value)
+      production_memory_peak=$(systemctl show "$production_unit" --property=MemoryPeak --value)
       [[ $production_memory_max =~ ^[0-9]+$ \
         && $production_memory_high =~ ^[0-9]+$ \
+        && $production_memory_peak =~ ^[0-9]+$ \
         && $production_memory_current =~ ^[0-9]+$ \
         && $production_memory_high -le $production_memory_max \
+        && $production_memory_current -le $production_memory_peak \
+        && $production_memory_peak -le $production_memory_max \
         && $production_memory_current -le $production_memory_max ]] \
         || die "$market production memory accounting is invalid"
       production_memory_current_bytes[$market]=$production_memory_current
+      production_memory_peak_bytes[$market]=$production_memory_peak
+      production_memory_max_bytes[$market]=$production_memory_max
+      production_growth=$(monday_production_memory_growth_headroom \
+        "$production_memory_current" "$production_memory_peak" \
+        "$production_memory_max" "$PRODUCTION_MEMORY_GROWTH_MARGIN_BYTES") \
+        || die "$market production memory growth headroom is invalid"
+      production_memory_growth_target_bytes[$market]=$(( \
+        production_memory_current + production_growth))
+      ((production_growth \
+        <= 9223372036854775807 - production_memory_growth_headroom_bytes)) \
+        || die 'production memory growth headroom overflowed'
+      production_memory_growth_headroom_bytes=$(( \
+        production_memory_growth_headroom_bytes + production_growth))
       ;;
     inactive)
       if [[ $production_memory_current =~ ^[0-9]+$ ]]; then
@@ -322,6 +343,9 @@ for market in "${markets[@]}"; do
       else
         production_memory_current_bytes[$market]=
       fi
+      production_memory_peak_bytes[$market]=
+      production_memory_max_bytes[$market]=
+      production_memory_growth_target_bytes[$market]=
       ;;
     *) die "$market production service has ambiguous ActiveState=${production_active_state[$market]}" ;;
   esac
@@ -331,8 +355,17 @@ production_memory_current_json=$(jq -cn \
   --arg usdm_state "${production_active_state[usdm]}" \
   --arg spot "${production_memory_current_bytes[spot]}" \
   --arg usdm "${production_memory_current_bytes[usdm]}" \
-  '{spot:{active_state:$spot_state,current_bytes:(if $spot == "" then null else ($spot | tonumber) end)},
-    usdm:{active_state:$usdm_state,current_bytes:(if $usdm == "" then null else ($usdm | tonumber) end)}}')
+  --arg spot_peak "${production_memory_peak_bytes[spot]}" \
+  --arg usdm_peak "${production_memory_peak_bytes[usdm]}" \
+  --arg spot_max "${production_memory_max_bytes[spot]}" \
+  --arg usdm_max "${production_memory_max_bytes[usdm]}" \
+  --arg spot_target "${production_memory_growth_target_bytes[spot]}" \
+  --arg usdm_target "${production_memory_growth_target_bytes[usdm]}" \
+  'def bytes($value): if $value == "" then null else ($value | tonumber) end;
+    {spot:{active_state:$spot_state,current_bytes:bytes($spot),peak_bytes:bytes($spot_peak),
+      memory_max_bytes:bytes($spot_max),growth_target_bytes:bytes($spot_target)},
+    usdm:{active_state:$usdm_state,current_bytes:bytes($usdm),peak_bytes:bytes($usdm_peak),
+      memory_max_bytes:bytes($usdm_max),growth_target_bytes:bytes($usdm_target)}}')
 
 resource_admission_samples_json='[]'
 latest_resource_admission_sample_json=null
@@ -341,8 +374,11 @@ admit_resource_phase() {
   sampled_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   available=$(meminfo_bytes MemAvailable) \
     || die 'MemAvailable is unavailable in /proc/meminfo'
-  if ! required=$(monday_shadow_memory_admission \
-    "$available" "$HOST_MEMORY_RESERVE_BYTES" "$phase_memory_max_bytes"); then
+  if required=$(monday_shadow_memory_admission \
+    "$available" "$HOST_MEMORY_RESERVE_BYTES" "$phase_memory_max_bytes" \
+    "$production_memory_growth_headroom_bytes"); then
+    :
+  else
     status=$?
     [[ $status -eq 1 ]] \
       || die "resource admission inputs are invalid or overflowed for phase $phase"
@@ -355,15 +391,30 @@ admit_resource_phase() {
     --argjson host_memory_available_bytes "$available" \
     --argjson host_memory_reserve_bytes "$HOST_MEMORY_RESERVE_BYTES" \
     --argjson phase_memory_max_bytes "$phase_memory_max_bytes" \
+    --argjson production_memory_growth_margin_bytes \
+      "$PRODUCTION_MEMORY_GROWTH_MARGIN_BYTES" \
+    --argjson production_memory_growth_headroom_bytes \
+      "$production_memory_growth_headroom_bytes" \
     --argjson required_bytes "$required" \
     '{phase:$phase,sampled_at:$sampled_at,
       host_memory_available_bytes:$host_memory_available_bytes,
       host_memory_reserve_bytes:$host_memory_reserve_bytes,
-      phase_memory_max_bytes:$phase_memory_max_bytes,required_bytes:$required_bytes}')
+      phase_memory_max_bytes:$phase_memory_max_bytes,
+      production_memory_growth_margin_bytes:$production_memory_growth_margin_bytes,
+      production_memory_growth_headroom_bytes:$production_memory_growth_headroom_bytes,
+      required_bytes:$required_bytes}')
   resource_admission_samples_json=$(jq -cn \
     --argjson samples "$resource_admission_samples_json" \
     --argjson sample "$sample" '$samples + [$sample]')
   latest_resource_admission_sample_json=$sample
+}
+
+assert_host_memory_reserve() {
+  local available
+  available=$(meminfo_bytes MemAvailable) \
+    || die 'MemAvailable is unavailable in /proc/meminfo'
+  ((available >= HOST_MEMORY_RESERVE_BYTES)) \
+    || die "host memory reserve was consumed during the active Shadow phase: available=$available reserve=$HOST_MEMORY_RESERVE_BYTES"
 }
 
 admit_resource_phase resource-preflight "$maximum_sequential_phase_memory_bytes"
@@ -868,6 +919,7 @@ validate_observation_sample() {
 validate_running_sample() {
   local market=$1 memory_now
   assert_candidate
+  assert_host_memory_reserve
   systemctl is-active --quiet "${unit[$market]}" \
     || die "$market shadow service stopped before observation completed"
   [[ $(systemctl_value "$market" NRestarts) == 0 ]] \
@@ -940,6 +992,7 @@ run_market_gate_phase() {
       || die "$market shadow service stopped while settling"
     [[ $(systemctl_value "$market" NRestarts) == 0 ]] \
       || die "$market shadow service restarted while settling"
+    assert_host_memory_reserve
     sleep 10
   done
 

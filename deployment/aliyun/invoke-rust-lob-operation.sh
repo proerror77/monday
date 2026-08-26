@@ -158,13 +158,20 @@ for _ in $(seq 1 "$polls"); do
             and all(.production_memory_current_bytes[];
               (.active_state == "active" or .active_state == "inactive")
               and (if .active_state == "active" then
-                (.current_bytes | type) == "number"
-              else .current_bytes == null or (.current_bytes | type) == "number"
-              end)
-              and (.current_bytes == null
-                or ((.current_bytes | type) == "number"
-                  and .current_bytes == (.current_bytes | floor)
-                  and .current_bytes >= 0)))
+                all([.current_bytes,.peak_bytes,.memory_max_bytes,.growth_target_bytes][];
+                  type == "number" and . == floor and . >= 0)
+                and .current_bytes <= .peak_bytes
+                and .peak_bytes <= .growth_target_bytes
+                and .growth_target_bytes <= .memory_max_bytes
+              else
+                (.current_bytes == null or
+                  ((.current_bytes | type) == "number"
+                    and .current_bytes == (.current_bytes | floor)
+                    and .current_bytes >= 0))
+                and .peak_bytes == null
+                and .memory_max_bytes == null
+                and .growth_target_bytes == null
+              end))
             and .resource_preflight.phase == "resource-preflight"
             and (.resource_preflight.sampled_at | type) == "string"
             and (.resource_preflight.sampled_at
@@ -175,9 +182,20 @@ for _ in $(seq 1 "$polls"); do
             and .resource_preflight.host_memory_reserve_bytes == 1073741824
             and .resource_preflight.phase_memory_max_bytes
               == .maximum_sequential_phase_memory_bytes
+            and .resource_preflight.production_memory_growth_margin_bytes == 268435456
+            and (.resource_preflight.production_memory_growth_headroom_bytes
+              | type) == "number"
+            and .resource_preflight.production_memory_growth_headroom_bytes
+              == (.resource_preflight.production_memory_growth_headroom_bytes | floor)
+            and .resource_preflight.production_memory_growth_headroom_bytes >= 0
+            and .resource_preflight.production_memory_growth_headroom_bytes
+              == ([.production_memory_current_bytes[]
+                | select(.active_state == "active")
+                | .growth_target_bytes - .current_bytes] | add // 0)
             and .resource_preflight.required_bytes
               == (.resource_preflight.host_memory_reserve_bytes
-                + .resource_preflight.phase_memory_max_bytes)
+                + .resource_preflight.phase_memory_max_bytes
+                + .resource_preflight.production_memory_growth_headroom_bytes)
             and .resource_preflight.host_memory_available_bytes
               >= .resource_preflight.required_bytes
             and .passed == true' <<<"$decoded_output" >/dev/null || {
