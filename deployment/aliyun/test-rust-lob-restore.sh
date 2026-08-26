@@ -55,6 +55,8 @@ else
   printf 'deployment bundle does not include host-rust-lob-restore.sh\n' >&2
   exit 1
 fi
+sed -n '/^assets=(/,/^)/p' "$INSTALL_RELEASE" \
+  | grep -Fq 'monday-collector-health.sh'
 grep -Fq 'restore)' "$INVOKE"
 grep -Fq 'monday-rust-lob-restore' "$INVOKE"
 
@@ -178,7 +180,8 @@ setup_fixture() {
     binance-lob-archiver-recovery@.timer \
     binance-lob-archiver-production-spot.env \
     binance-lob-archiver-production-usdm.env \
-    host-rust-lob-recovery-queue.sh; do
+    host-rust-lob-recovery-queue.sh \
+    monday-collector-health.sh; do
     install -m 0644 "$SCRIPT_DIR/$asset" "$CANDIDATE_DEPLOYMENT/$asset"
   done
   install -m 0644 "$SCRIPT_DIR/binance-lob-archiver-production@.service" \
@@ -193,6 +196,8 @@ setup_fixture() {
     "$CONFIG_ROOT/binance-lob-archiver-production-usdm.env"
   install -m 0755 "$SCRIPT_DIR/host-rust-lob-recovery-queue.sh" \
     "$BIN_DIR/monday-rust-lob-recovery-queue"
+  install -m 0755 "$SCRIPT_DIR/monday-collector-health.sh" \
+    "$BIN_DIR/monday-collector-health.sh"
   install -m 0644 "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" \
     "$CANDIDATE_DEPLOYMENT/rust-lob-shadow-gate-policy.jq"
   install -m 0644 "$SCRIPT_DIR/rust-lob-runtime-health-policy.jq" \
@@ -432,6 +437,7 @@ run_success_fixture() (
     '.result == "passed"
      and .candidate_sha256 == $sha
      and .deployment_bundle_sha256 == $bundle
+     and .health_script_status == "bundled-verified"
      and .previous_session_spot == "pre-spot"
      and .previous_session_usdm == "pre-usdm"
      and .production_units_active.spot == true
@@ -444,7 +450,9 @@ run_success_fixture() (
     and .production_units["binance-lob-archiver-production@usdm.service"].enabled == true
     and .production_units["binance-lob-archiver-production@spot.service"].runtime_max_sec == 21600
     and .verification.symlink_sha256 == true
-    and .verification.gate_marker_verified == true' \
+    and .verification.gate_marker_verified == true
+    and .verification.installed_assets_match_bundle == true
+    and .verification.health_script_matches_bundle == true' \
     "$evidence/verification.json" >/dev/null
   # Symlink must be untouched and still resolve to the candidate.
   [[ -L $PRODUCTION_LINK ]]
@@ -467,6 +475,8 @@ run_success_fixture() (
   [[ -f $MOCK_STATE/enabled/binance-lob-archiver-recovery@spot.timer ]]
   [[ -f $MOCK_STATE/active/binance-lob-archiver-recovery@usdm.timer ]]
   [[ -f $MOCK_STATE/enabled/binance-lob-archiver-recovery@usdm.timer ]]
+  cmp -s "$CANDIDATE_DEPLOYMENT/monday-collector-health.sh" \
+    "$BIN_DIR/monday-collector-health.sh"
 )
 
 run_missing_symlink_fixture() (
@@ -566,6 +576,30 @@ run_drifted_assets_fixture() (
     'installed production asset drifted from the gated deployment bundle'
 )
 
+run_drifted_health_script_fixture() (
+  fixture="$tmp_dir/drifted-health-script"
+  setup_fixture "$fixture"
+  printf '\n# tampered\n' >>"$BIN_DIR/monday-collector-health.sh"
+  if restore_release "$CANDIDATE_SHA256" >"$fixture/out" 2>&1; then
+    printf 'restore accepted a drifted installed health script\n' >&2
+    exit 1
+  fi
+  assert_failed_recovery "$fixture/out" validate-installed-production-assets \
+    'installed production asset drifted from the gated deployment bundle'
+)
+
+run_missing_candidate_health_script_fixture() (
+  fixture="$tmp_dir/missing-candidate-health-script"
+  setup_fixture "$fixture"
+  rm -f "$CANDIDATE_DEPLOYMENT/monday-collector-health.sh"
+  if restore_release "$CANDIDATE_SHA256" >"$fixture/out" 2>&1; then
+    printf 'restore accepted a candidate without a bundled health script\n' >&2
+    exit 1
+  fi
+  assert_failed_recovery "$fixture/out" validate-installed-production-assets \
+    "required regular file is missing or a symlink: $CANDIDATE_DEPLOYMENT/monday-collector-health.sh"
+)
+
 run_health_failure_fixture() (
   fixture="$tmp_dir/health-failure"
   setup_fixture "$fixture"
@@ -631,6 +665,8 @@ run_active_production_fixture
 run_spool_symlink_fixture
 run_recovery_isolation_fixture
 run_drifted_assets_fixture
+run_drifted_health_script_fixture
+run_missing_candidate_health_script_fixture
 run_health_failure_fixture
 run_evidence_failure_disables_recovery_timers_fixture
 

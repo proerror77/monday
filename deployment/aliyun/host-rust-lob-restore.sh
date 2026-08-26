@@ -54,6 +54,7 @@ RESTORE_ASSETS=(
   binance-lob-archiver-production-spot.env
   binance-lob-archiver-production-usdm.env
   host-rust-lob-recovery-queue.sh
+  monday-collector-health.sh
 )
 
 fail() {
@@ -225,6 +226,7 @@ write_recovery_evidence() {
     --arg rollback_result "$ROLLBACK_RESULT" \
     --arg candidate_sha256 "$CANDIDATE_SHA256" \
     --arg deployment_bundle_sha256 "$DEPLOYMENT_BUNDLE_SHA256" \
+    --arg health_script_status "$HEALTH_SCRIPT_STATUS" \
     --arg previous_session_spot "$OLD_SESSION_SPOT" \
     --arg previous_session_usdm "$OLD_SESSION_USDM" \
     --arg current_binary "$current_target" \
@@ -240,6 +242,7 @@ write_recovery_evidence() {
       rollback_result: $rollback_result,
       candidate_sha256: $candidate_sha256,
       deployment_bundle_sha256: (if $deployment_bundle_sha256 == "" then null else $deployment_bundle_sha256 end),
+      health_script_status: $health_script_status,
       previous_session_spot: (if $previous_session_spot == "" then null else $previous_session_spot end),
       previous_session_usdm: (if $previous_session_usdm == "" then null else $previous_session_usdm end),
       current_binary: (if $current_binary == "" then null else $current_binary end),
@@ -266,6 +269,7 @@ write_verification_evidence() {
     --arg schema monday.rust_lob_recovery_verification.v1 \
     --arg candidate_sha256 "$CANDIDATE_SHA256" \
     --arg deployment_bundle_sha256 "$DEPLOYMENT_BUNDLE_SHA256" \
+    --arg health_script_status "$HEALTH_SCRIPT_STATUS" \
     --arg gate_marker "$GATE_MARKER" \
     --arg current_binary "$(readlink -f "$PRODUCTION_LINK" 2>/dev/null || true)" \
     --arg spot_unit "$spot_unit" \
@@ -277,13 +281,16 @@ write_verification_evidence() {
     --argjson usdm_enabled "$usdm_enabled" \
     '{schema:$schema,candidate_sha256:$candidate_sha256,
       deployment_bundle_sha256:$deployment_bundle_sha256,
+      health_script_status:$health_script_status,
       gate_marker:$gate_marker,current_binary:$current_binary,
       production_units:{
         ($spot_unit):{active:$spot_active,enabled:$spot_enabled,runtime_max_sec:$runtime_max_sec},
         ($usdm_unit):{active:$usdm_active,enabled:$usdm_enabled,runtime_max_sec:$runtime_max_sec}
       },
       verification:{symlink_sha256:true,gate_marker_verified:true,
-        installed_assets_match_bundle:true,runtime_max_sec_declared:true}}' \
+        installed_assets_match_bundle:($health_script_status == "bundled-verified"),
+        health_script_matches_bundle:($health_script_status == "bundled-verified"),
+        runtime_max_sec_declared:true}}' \
     > "$temporary" || return 1
   chmod 0640 "$temporary" || return 1
   mv -Tf "$temporary" "$EVIDENCE_DIR/verification.json" || return 1
@@ -358,6 +365,7 @@ restore_release() (
   OLD_SESSION_USDM=
   USDM_MINIMUM_SYMBOLS=400
   USDM_EXPECTED_DATASET=
+  HEALTH_SCRIPT_STATUS=unchecked
   trap on_error ERR
   trap on_exit EXIT
 
@@ -472,12 +480,15 @@ restore_release() (
       *.env) installed_asset="$CONFIG_ROOT/$asset" ;;
       host-rust-lob-recovery-queue.sh)
         installed_asset="$BIN_DIR/monday-rust-lob-recovery-queue" ;;
+      monday-collector-health.sh)
+        installed_asset="$BIN_DIR/monday-collector-health.sh" ;;
     esac
     secure_regular_file "$installed_asset"
     secure_regular_file "$CANDIDATE_DEPLOYMENT/$asset"
     cmp -s -- "$CANDIDATE_DEPLOYMENT/$asset" "$installed_asset" \
       || fail "installed production asset drifted from the gated deployment bundle: $installed_asset"
   done
+  HEALTH_SCRIPT_STATUS=bundled-verified
   if [[ $(sed -n 's/^SYMBOLS=//p' \
     "$CANDIDATE_DEPLOYMENT/binance-lob-archiver-production-usdm.env") != ALL ]]; then
     USDM_MINIMUM_SYMBOLS=100
