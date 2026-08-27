@@ -146,6 +146,52 @@ monday_production_memory_growth_headroom() {
   printf '%s\n' "$((target - current))"
 }
 
+# Read the cumulative memory-full stall time from a Linux PSI source.
+monday_memory_full_psi_total_us() {
+  [[ $# -eq 1 && -f $1 && ! -L $1 ]] || return 2
+  awk '
+    $1 == "full" {
+      rows += 1
+      for (i = 2; i <= NF; i++) {
+        if ($i ~ /^total=[0-9]+$/) {
+          totals += 1
+          value = substr($i, 7)
+        }
+      }
+    }
+    END {
+      if (rows != 1 || totals != 1 || value !~ /^(0|[1-9][0-9]*)$/) exit 1
+      print value
+    }
+  ' "$1"
+}
+
+# Output: delta_us ratio hit consecutive_hits. A full-stall delta at the
+# threshold is a hit; any non-hit resets the consecutive counter.
+monday_memory_full_psi_window() {
+  [[ $# -eq 5 ]] || return 2
+  local previous=$1 current=$2 window_us=$3 threshold_us=$4 consecutive=$5
+  local value delta hit next ratio
+
+  for value in "$previous" "$current" "$window_us" "$threshold_us" "$consecutive"; do
+    [[ $value =~ ^(0|[1-9][0-9]{0,18})$ ]] || return 2
+    # shellcheck disable=SC2071
+    (( ${#value} < 19 )) || [[ $value < 9223372036854775808 ]] || return 2
+  done
+  ((current >= previous && window_us > 0 && threshold_us > 0)) || return 2
+  delta=$((current - previous))
+  if ((delta >= threshold_us)); then
+    hit=true
+    next=$((consecutive + 1))
+  else
+    hit=false
+    next=0
+  fi
+  ratio=$(awk -v delta="$delta" -v window="$window_us" \
+    'BEGIN { printf "%.9f", delta / window }')
+  printf '%s %s %s %s\n' "$delta" "$ratio" "$hit" "$next"
+}
+
 # Validate that replay-unsafe manifests are limited to the trailing incomplete
 # portion of a gate observation. Safe segments remain the only input to strict
 # readback; an unsafe segment followed by safe data is a fail-closed boundary.

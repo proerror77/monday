@@ -30,6 +30,113 @@ LIB="$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
 "$SCRIPT_DIR/test-rust-lob-controller-release.sh"
 "$SCRIPT_DIR/test-rust-lob-controller-apply.sh"
 
+psi_tmp_dir=$(mktemp -d)
+trap 'rm -rf "$psi_tmp_dir"' EXIT
+psi_fixture="$psi_tmp_dir/pressure"
+printf 'some avg10=0.00 avg60=0.00 avg300=0.00 total=7\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=100\n' \
+  >"$psi_fixture"
+[[ $(monday_memory_full_psi_total_us "$psi_fixture") == 100 ]]
+read -r delta ratio hit consecutive < <(
+  monday_memory_full_psi_window 100 150099 15000000 150000 0)
+[[ $delta == 149999 && $ratio == 0.009999933 && $hit == false && $consecutive == 0 ]]
+read -r delta ratio hit consecutive < <(
+  monday_memory_full_psi_window 100 150100 15000000 150000 0)
+[[ $delta == 150000 && $ratio == 0.010000000 && $hit == true && $consecutive == 1 ]]
+read -r _ _ hit consecutive < <(
+  monday_memory_full_psi_window 150100 300100 15000000 150000 "$consecutive")
+read -r _ _ hit consecutive < <(
+  monday_memory_full_psi_window 300100 450100 15000000 150000 "$consecutive")
+[[ $hit == true && $consecutive == 3 ]]
+read -r _ _ _ reset_hits < <(
+  monday_memory_full_psi_window 300100 300101 15000000 150000 2)
+[[ $reset_hits == 0 ]]
+read -r _ _ _ consecutive < <(
+  monday_memory_full_psi_window 450100 450101 15000000 150000 "$consecutive")
+[[ $consecutive == 0 ]]
+printf 'some avg10=0.00 avg60=0.00 avg300=0.00 total=7\n' >"$psi_fixture"
+if monday_memory_full_psi_total_us "$psi_fixture" >/dev/null 2>&1; then
+  printf 'memory PSI parser accepted a missing full row\n' >&2
+  exit 1
+fi
+printf 'full avg10=0.00 avg60=0.00 avg300=0.00 total=bad\n' >"$psi_fixture"
+if monday_memory_full_psi_total_us "$psi_fixture" >/dev/null 2>&1; then
+  printf 'memory PSI parser accepted a non-integer total\n' >&2
+  exit 1
+fi
+if monday_memory_full_psi_window 2 1 15000000 150000 0 >/dev/null 2>&1; then
+  printf 'memory PSI window accepted a regressed total\n' >&2
+  exit 1
+else
+  regression_status=$?
+fi
+[[ $regression_status == 2 ]]
+rm -f "$psi_fixture"
+
+monitor_body="$psi_tmp_dir/monitor"
+sed -n '/^run_active_memory_psi_command()/,/^}/p' "$GATE" >"$monitor_body"
+run_psi_kill_fixture() (
+  # shellcheck disable=SC1090
+  . "$monitor_body"
+  marker="$psi_tmp_dir/cleanup"
+  child_marker="$psi_tmp_dir/child-stopped"
+  MEMORY_PSI_WINDOW_SECONDS=15
+  MEMORY_PSI_SOURCE=/fixture
+  MEMORY_PSI_FULL_DELTA_LIMIT_US=150000
+  MEMORY_PSI_CONSECUTIVE_HIT_LIMIT=3
+  memory_psi_phase=fixture
+  sleep() { :; }
+  monday_memory_full_psi_total_us() { printf '0\n'; }
+  read_memory_psi_window() { return 1; }
+  stop_fixture() { : >"$marker"; }
+  blocking_child() {
+    trap ': >"$child_marker"; exit 143' TERM
+    while :; do sleep 1; done
+  }
+  if run_active_memory_psi_command stop_fixture blocking_child; then
+    exit 1
+  else
+    status=$?
+  fi
+  [[ $status == 75 && -f $marker && -f $child_marker ]]
+  rm -f "$marker" "$child_marker"
+)
+run_psi_kill_fixture 2>"$psi_tmp_dir/threshold"
+grep -Fq 'memory full PSI exceeded' "$psi_tmp_dir/threshold"
+run_psi_invalid_fixture() (
+  # shellcheck disable=SC1090
+  . "$monitor_body"
+  MEMORY_PSI_WINDOW_SECONDS=15
+  MEMORY_PSI_SOURCE=/fixture
+  MEMORY_PSI_FULL_DELTA_LIMIT_US=150000
+  MEMORY_PSI_CONSECUTIVE_HIT_LIMIT=3
+  memory_psi_phase=fixture
+  sleep() { :; }
+  monday_memory_full_psi_total_us() { printf '0\n'; }
+  read_memory_psi_window() { return 2; }
+  stop_fixture() { :; }
+  blocking_child() { while :; do sleep 1; done; }
+  if run_active_memory_psi_command stop_fixture blocking_child; then
+    exit 1
+  else
+    status=$?
+  fi
+  [[ $status == 76 ]]
+)
+run_psi_invalid_fixture 2>"$psi_tmp_dir/invalid"
+grep -Fq 'missing, invalid, or regressed' "$psi_tmp_dir/invalid"
+rm -rf "$psi_tmp_dir"
+trap - EXIT
+grep -Fq 'begin_memory_psi_phase "shadow-$market"' "$GATE"
+grep -Fq 'run_memory_psi_phase_command "upload-drain-$market"' "$GATE"
+grep -Fq 'run_memory_psi_phase_command "strict-verifier-$strict_verifier_counter"' "$GATE"
+grep -Fq 'begin_memory_psi_phase "oss-roundtrip-$market"' "$GATE"
+[[ $(monday_rust_lob_runtime_contract_sha256 "$SCRIPT_DIR") \
+  == 1a9618e19552f482d83789580bd82b0ae4a59adb875f477133230a3fd3031dcd ]]
+if grep -Eq 'polymarket|upload.*timer|timer.*upload' "$GATE"; then
+  printf 'LOB Gate unexpectedly references Polymarket or external upload timers\n' >&2
+  exit 1
+fi
+
 required_memory=11559501824
 [[ $(monday_shadow_memory_admission \
   "$required_memory" 1073741824 10485760000 0) == "$required_memory" ]] || {
@@ -664,6 +771,7 @@ run_strict_verifier_fixture() (
   admit_resource_phase() {
     [[ $1 == strict-verifier-* && $2 == "$STRICT_VERIFIER_MEMORY_MAX_BYTES" ]]
   }
+  run_memory_psi_phase_command() { shift 2; "$@"; }
   systemd-run() {
     verifier_units+=("$*")
     while (($#)); do
@@ -729,6 +837,7 @@ run_strict_verifier_failure_fixture() (
   STRICT_VERIFIER_MEMORY_MAX_BYTES=1610612736
   candidate_binary=candidate_binary
   admit_resource_phase() { :; }
+  run_memory_psi_phase_command() { shift 2; "$@"; }
   systemd-run() {
     while (($#)); do
       if [[ $1 == -- ]]; then
@@ -787,6 +896,7 @@ run_upload_drain_fixture() (
   admit_resource_phase() {
     [[ $1 == upload-drain-spot && $2 == "$UPLOAD_DRAIN_MEMORY_MAX_BYTES" ]]
   }
+  run_memory_psi_phase_command() { shift 2; "$@"; }
   systemd-run() { invocations+=("$*"); }
   assert_spool_drained() { [[ $1 == spot ]]; }
   # shellcheck disable=SC1090
@@ -974,6 +1084,15 @@ usdm_market=$(jq -c --arg symbols_config "$usdm_symbols_config" \
       | .agg_trade_count = 0 | .raw_trade_count = 0
       | .book_ticker_count = 0 | .force_order_count = 0)' \
   <<<"$market_json")
+psi_windows=$(jq -cn '
+  ["resource-preflight","shadow-spot","upload-drain-spot","shadow-usdm",
+    "upload-drain-usdm","oss-roundtrip-spot","strict-verifier-1",
+    "oss-roundtrip-usdm"] as $phases
+  | [$phases[] as $phase | range(0;3) as $index
+    | {phase:$phase,started_at:"2026-08-28T00:00:00Z",
+       finished_at:"2026-08-28T00:00:15Z",
+       previous_total_us:0,current_total_us:0,
+       delta_us:0,window_us:15000000,ratio:0,hit:false,consecutive_hits:0}]')
 jq -n \
   --arg artifact "$artifact" \
   --arg runtime_contract "$runtime_contract" \
@@ -983,12 +1102,14 @@ jq -n \
   --arg run_spool "$run_spool" \
   --argjson market "$market_json" \
   --argjson usdm_market "$usdm_market" \
+  --argjson psi_windows "$psi_windows" \
   '{schema:"monday.rust_lob_shadow_gate.v4",candidate_sha256:$artifact,
     runtime_contract_sha256:$runtime_contract,
     deployment_bundle_sha256:$bundle,deployment_source_revision:$source,
     run_id:$run_id,run_spool:$run_spool,
     required_duration_seconds:240,requested_duration_seconds:240,
     health_settle_seconds:240,segment_seconds:120,test_only:false,
+    memory_full_psi_windows:$psi_windows,
     observation_started_ns:150,
     passed:true,production_eligible:true,checks_passed:true,duration_seconds:240,
     markets:{spot:$market,usdm:$usdm_market}}' \
@@ -1000,6 +1121,28 @@ jq -e \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/gate.json" >/dev/null
+
+jq 'del(.memory_full_psi_windows)' "$tmp_dir/gate.json" \
+  >"$tmp_dir/missing-psi.json"
+if jq -e --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
+  -f "$POLICY" "$tmp_dir/missing-psi.json" >/dev/null; then
+  printf 'gate policy accepted missing memory PSI evidence\n' >&2
+  exit 1
+fi
+jq '.memory_full_psi_windows[0:3] |=
+  (.[0] += {current_total_us:150000,delta_us:150000,ratio:0.01,hit:true,consecutive_hits:1}
+  | .[1] += {previous_total_us:150000,current_total_us:300000,delta_us:150000,
+      ratio:0.01,hit:true,consecutive_hits:2}
+  | .[2] += {previous_total_us:300000,current_total_us:450000,delta_us:150000,
+      ratio:0.01,hit:true,consecutive_hits:3})' "$tmp_dir/gate.json" \
+  >"$tmp_dir/three-psi-hits.json"
+if jq -e --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
+  -f "$POLICY" "$tmp_dir/three-psi-hits.json" >/dev/null; then
+  printf 'gate policy accepted three consecutive memory PSI hits\n' >&2
+  exit 1
+fi
 
 jq 'del(.observation_started_ns)' \
   "$tmp_dir/gate.json" >"$tmp_dir/missing-observation-boundary.json"
@@ -3498,6 +3641,16 @@ preflight_payload=$(jq -cn \
       production_memory_growth_margin_bytes:268435456,
       production_memory_growth_headroom_bytes:805306368,
       required_bytes:4026531840},
+    memory_full_psi_windows:[
+      {phase:"resource-preflight",started_at:"2026-08-28T00:00:00Z",
+       finished_at:"2026-08-28T00:00:15Z",previous_total_us:0,current_total_us:0,
+       delta_us:0,window_us:15000000,ratio:0,hit:false,consecutive_hits:0},
+      {phase:"resource-preflight",started_at:"2026-08-28T00:00:15Z",
+       finished_at:"2026-08-28T00:00:30Z",previous_total_us:0,current_total_us:0,
+       delta_us:0,window_us:15000000,ratio:0,hit:false,consecutive_hits:0},
+      {phase:"resource-preflight",started_at:"2026-08-28T00:00:30Z",
+       finished_at:"2026-08-28T00:00:45Z",previous_total_us:0,current_total_us:0,
+       delta_us:0,window_us:15000000,ratio:0,hit:false,consecutive_hits:0}],
     passed:true}')
 preflight_output_b64=$(printf '%s\n' "$preflight_payload" | base64 | tr -d '\n')
 env "${common_env[@]}" \

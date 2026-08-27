@@ -227,6 +227,33 @@ for _ in $(seq 1 "$polls"); do
                 + .resource_preflight.production_memory_growth_headroom_bytes)
             and .resource_preflight.host_memory_available_bytes
               >= .resource_preflight.required_bytes
+            and (.memory_full_psi_windows | type) == "array"
+            and (.memory_full_psi_windows | length) == 3
+            and all(.memory_full_psi_windows[];
+              .phase == "resource-preflight"
+              and (.started_at | type) == "string"
+              and (.started_at
+                | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+              and (.finished_at | type) == "string"
+              and (.finished_at
+                | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+              and .finished_at >= .started_at
+              and (.previous_total_us | type) == "number"
+              and .previous_total_us == (.previous_total_us | floor)
+              and .previous_total_us >= 0
+              and (.current_total_us | type) == "number"
+              and .current_total_us == (.current_total_us | floor)
+              and .current_total_us >= .previous_total_us
+              and .delta_us == (.current_total_us - .previous_total_us)
+              and .window_us == 15000000
+              and (.ratio | type) == "number" and .ratio >= 0
+              and .hit == (.delta_us >= 150000)
+              and (.consecutive_hits | type) == "number"
+              and .consecutive_hits == (.consecutive_hits | floor)
+              and .consecutive_hits >= 0 and .consecutive_hits < 3)
+            and (.memory_full_psi_windows as $psi
+              | all(range(1; 3);
+                $psi[.].previous_total_us == $psi[. - 1].current_total_us))
             and .passed == true' <<<"$decoded_output" >/dev/null || {
           printf 'gate-preflight returned invalid JSON evidence\n' >&2
           exit 1

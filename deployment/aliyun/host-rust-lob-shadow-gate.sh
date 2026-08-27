@@ -13,6 +13,11 @@ readonly HOST_MEMORY_RESERVE_BYTES=1073741824
 readonly PRODUCTION_MEMORY_GROWTH_MARGIN_BYTES=268435456
 readonly STRICT_VERIFIER_MEMORY_MAX_BYTES=1610612736
 readonly UPLOAD_DRAIN_MEMORY_MAX_BYTES=536870912
+readonly MEMORY_PSI_WINDOW_SECONDS=15
+readonly MEMORY_PSI_WINDOW_US=15000000
+readonly MEMORY_PSI_FULL_DELTA_LIMIT_US=150000
+readonly MEMORY_PSI_CONSECUTIVE_HIT_LIMIT=3
+readonly MEMORY_PSI_SOURCE=/proc/pressure/memory
 readonly SHADOW_BINARY=/opt/monday/bin/binance-lob-archiver-shadow
 readonly RELEASE_ROOT=/opt/monday/releases/binance-lob-archiver
 readonly EVIDENCE_ROOT=/data/monday/evidence/shadow-gates
@@ -89,6 +94,7 @@ done
 
 mountpoint -q /data || die '/data must be a mount point'
 [[ -r /proc/uptime ]] || die '/proc/uptime is required for monotonic timing'
+[[ -r $MEMORY_PSI_SOURCE ]] || die 'memory PSI is unavailable'
 id "$SERVICE_USER" >/dev/null 2>&1 || die "missing service user: $SERVICE_USER"
 if [[ $resource_preflight_only != true ]]; then
   install -d -m 0755 "$(dirname "$LOCK_FILE")"
@@ -377,6 +383,78 @@ production_memory_current_json=$(jq -cn \
 
 resource_admission_samples_json='[]'
 latest_resource_admission_sample_json=null
+memory_psi_windows_json='[]'
+memory_psi_previous_total=
+memory_psi_previous_at=
+memory_psi_consecutive_hits=0
+memory_psi_phase=
+
+record_memory_psi_window() {
+  local current_total=$1 current_at=$2 transition delta ratio hit consecutive
+  transition=$(monday_memory_full_psi_window \
+    "$memory_psi_previous_total" "$current_total" "$MEMORY_PSI_WINDOW_US" \
+    "$MEMORY_PSI_FULL_DELTA_LIMIT_US" "$memory_psi_consecutive_hits") || return $?
+  read -r delta ratio hit consecutive <<<"$transition"
+  memory_psi_windows_json=$(jq -cn \
+    --argjson windows "$memory_psi_windows_json" \
+    --arg phase "$memory_psi_phase" \
+    --arg started_at "$memory_psi_previous_at" \
+    --arg finished_at "$current_at" \
+    --argjson previous_total_us "$memory_psi_previous_total" \
+    --argjson current_total_us "$current_total" \
+    --argjson delta_us "$delta" \
+    --argjson window_us "$MEMORY_PSI_WINDOW_US" \
+    --argjson ratio "$ratio" \
+    --argjson hit "$hit" \
+    --argjson consecutive_hits "$consecutive" \
+    '$windows + [{phase:$phase,started_at:$started_at,finished_at:$finished_at,
+      previous_total_us:$previous_total_us,current_total_us:$current_total_us,
+      delta_us:$delta_us,window_us:$window_us,ratio:$ratio,hit:$hit,
+      consecutive_hits:$consecutive_hits}]')
+  memory_psi_previous_total=$current_total
+  memory_psi_previous_at=$current_at
+  memory_psi_consecutive_hits=$consecutive
+  ((consecutive < MEMORY_PSI_CONSECUTIVE_HIT_LIMIT))
+}
+
+read_memory_psi_window() {
+  local current_total current_at
+  current_total=$(monday_memory_full_psi_total_us "$MEMORY_PSI_SOURCE") \
+    || return 2
+  current_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  record_memory_psi_window "$current_total" "$current_at"
+}
+
+sample_memory_psi_after_window() {
+  sleep "$MEMORY_PSI_WINDOW_SECONDS"
+  read_memory_psi_window
+}
+
+require_memory_psi_window() {
+  local status
+  if sample_memory_psi_after_window; then
+    return 0
+  else
+    status=$?
+  fi
+  if [[ $status -eq 1 ]]; then
+    die "memory full PSI exceeded ${MEMORY_PSI_FULL_DELTA_LIMIT_US}us for ${MEMORY_PSI_CONSECUTIVE_HIT_LIMIT} consecutive windows during phase $memory_psi_phase"
+  fi
+  die "memory PSI full total is missing, invalid, or regressed during phase $memory_psi_phase"
+}
+
+begin_memory_psi_phase() {
+  local phase=$1 index
+  memory_psi_phase=$phase
+  memory_psi_consecutive_hits=0
+  memory_psi_previous_total=$(monday_memory_full_psi_total_us "$MEMORY_PSI_SOURCE") \
+    || die "memory PSI full total is missing or invalid before phase $phase"
+  memory_psi_previous_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  for index in 1 2 3; do
+    require_memory_psi_window
+  done
+}
+
 admit_resource_phase() {
   local phase=$1 phase_memory_max_bytes=$2 sampled_at available required status shortfall sample
   sampled_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -427,6 +505,8 @@ assert_host_memory_reserve() {
 
 admit_resource_phase resource-preflight "$maximum_sequential_phase_memory_bytes"
 resource_preflight_json=$latest_resource_admission_sample_json
+begin_memory_psi_phase resource-preflight
+resource_preflight_psi_windows_json=$memory_psi_windows_json
 
 [[ ${base_spool_dir[spot]} == /data/monday/spool/binance-lob-rust-shadow/spot ]] \
   || die 'Spot shadow spool path is not isolated'
@@ -458,6 +538,7 @@ if [[ $resource_preflight_only == true ]]; then
     --argjson maximum_sequential_phase_memory_bytes \
       "$maximum_sequential_phase_memory_bytes" \
     --argjson resource_preflight "$resource_preflight_json" \
+    --argjson memory_full_psi_windows "$resource_preflight_psi_windows_json" \
     '{schema:$schema,candidate_sha256:$candidate_sha256,
       runtime_contract_sha256:$runtime_contract_sha256,
       deployment_bundle_sha256:$deployment_bundle_sha256,
@@ -466,7 +547,8 @@ if [[ $resource_preflight_only == true ]]; then
       host_swap_total_bytes:$host_swap_total_bytes,
       production_memory_current_bytes:$production_memory_current_bytes,
       maximum_sequential_phase_memory_bytes:$maximum_sequential_phase_memory_bytes,
-      resource_preflight:$resource_preflight,passed:true}'
+      resource_preflight:$resource_preflight,
+      memory_full_psi_windows:$memory_full_psi_windows,passed:true}'
   exit 0
 fi
 
@@ -548,6 +630,7 @@ write_run_json() {
       "$maximum_sequential_phase_memory_bytes" \
     --argjson resource_preflight "$resource_preflight_json" \
     --argjson resource_admission_samples "$resource_admission_samples_json" \
+    --argjson memory_full_psi_windows "$memory_psi_windows_json" \
     --argjson test_only "$test_only" \
     '{schema:$schema,run_id:$run_id,created_at:$created_at,
       candidate_sha256:$candidate_sha256,
@@ -563,6 +646,7 @@ write_run_json() {
       maximum_sequential_phase_memory_bytes:$maximum_sequential_phase_memory_bytes,
       resource_preflight:$resource_preflight,
       resource_admission_samples:$resource_admission_samples,
+      memory_full_psi_windows:$memory_full_psi_windows,
       test_only:$test_only}' >"$run_json_tmp"
   chmod 0640 "$run_json_tmp"
   mv -Tf "$run_json_tmp" "$run_json"
@@ -588,6 +672,66 @@ stop_upload_drain() {
     systemctl stop "$upload_drain_unit" >/dev/null 2>&1 || true
     upload_drain_unit=
   fi
+}
+
+run_active_memory_psi_command() {
+  local stop_callback=$1 child status second child_active
+  shift
+  set -m
+  "$@" &
+  child=$!
+  set +m
+  if ! memory_psi_previous_total=$(monday_memory_full_psi_total_us \
+    "$MEMORY_PSI_SOURCE"); then
+    kill -TERM -- "-$child" >/dev/null 2>&1 || true
+    "$stop_callback"
+    wait "$child" >/dev/null 2>&1 || true
+    printf 'shadow gate failed: memory PSI full total is missing or invalid before active phase %s\n' \
+      "$memory_psi_phase" >&2
+    return 76
+  fi
+  memory_psi_previous_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  while jobs -pr | grep -Fxq "$child"; do
+    child_active=true
+    for ((second = 0; second < MEMORY_PSI_WINDOW_SECONDS; second++)); do
+      sleep 1
+      if ! jobs -pr | grep -Fxq "$child"; then
+        child_active=false
+        break
+      fi
+    done
+    [[ $child_active == true ]] || break
+    if read_memory_psi_window; then
+      :
+    else
+      status=$?
+      kill -TERM -- "-$child" >/dev/null 2>&1 || true
+      "$stop_callback"
+      wait "$child" >/dev/null 2>&1 || true
+      if [[ $status -eq 1 ]]; then
+        printf 'shadow gate failed: memory full PSI exceeded %sus for %s consecutive windows during phase %s\n' \
+          "$MEMORY_PSI_FULL_DELTA_LIMIT_US" "$MEMORY_PSI_CONSECUTIVE_HIT_LIMIT" \
+          "$memory_psi_phase" >&2
+        return 75
+      fi
+      printf 'shadow gate failed: memory PSI full total is missing, invalid, or regressed during phase %s\n' \
+        "$memory_psi_phase" >&2
+      return 76
+    fi
+  done
+  if wait "$child"; then
+    status=0
+  else
+    status=$?
+  fi
+  return "$status"
+}
+
+run_memory_psi_phase_command() {
+  local phase=$1 stop_callback=$2
+  shift 2
+  begin_memory_psi_phase "$phase"
+  run_active_memory_psi_command "$stop_callback" "$@"
 }
 cleanup() {
   local status=$?
@@ -632,7 +776,8 @@ run_candidate_drain() {
   upload_drain_counter=$((upload_drain_counter + 1))
   upload_drain_unit="monday-rust-upload-drain-$$-${market}-${upload_drain_counter}.service"
   admit_resource_phase "upload-drain-$market" "$UPLOAD_DRAIN_MEMORY_MAX_BYTES"
-  if systemd-run --quiet --wait --collect \
+  if run_memory_psi_phase_command "upload-drain-$market" stop_upload_drain \
+    systemd-run --quiet --wait --collect \
     --unit="$upload_drain_unit" \
     --property=KillMode=control-group \
     --property=OOMScoreAdjust=500 \
@@ -665,7 +810,8 @@ run_strict_verifier() {
   strict_verifier_unit="monday-rust-strict-verifier-$$-${strict_verifier_counter}.service"
   admit_resource_phase "strict-verifier-$strict_verifier_counter" \
     "$STRICT_VERIFIER_MEMORY_MAX_BYTES"
-  if systemd-run --quiet --wait --collect \
+  if run_memory_psi_phase_command "strict-verifier-$strict_verifier_counter" \
+    stop_strict_verifier systemd-run --quiet --wait --collect \
     --unit="$strict_verifier_unit" \
     --property=KillMode=control-group \
     --property=OOMScoreAdjust=500 \
@@ -965,6 +1111,7 @@ run_market_gate_phase() {
   done
   assert_candidate
   admit_resource_phase "shadow-$market" 2147483648
+  begin_memory_psi_phase "shadow-$market"
   market_gate_started_ns[$market]=$(date +%s%N)
   systemctl start "${unit[$market]}"
   systemctl is-active --quiet "${unit[$market]}" || die "$market shadow service is not active"
@@ -1005,7 +1152,7 @@ run_market_gate_phase() {
     [[ $(systemctl_value "$market" NRestarts) == 0 ]] \
       || die "$market shadow service restarted while settling"
     assert_host_memory_reserve
-    sleep 10
+    require_memory_psi_window
   done
 
   health="${spool_dir[$market]}/health.json"
@@ -1037,7 +1184,7 @@ run_market_gate_phase() {
     ((current_segment[$market] > pre_observation_segment[$market])) && break
     (( $(monotonic_seconds) < alignment_deadline )) \
       || die "$market shadow segments did not rotate after health settled"
-    sleep 10
+    require_memory_psi_window
   done
   market_observation_started_ns[$market]=$(date +%s%N)
 
@@ -1046,9 +1193,13 @@ run_market_gate_phase() {
   while (( $(monotonic_seconds) < observation_deadline )); do
     now_mono=$(monotonic_seconds)
     remaining=$((observation_deadline - now_mono))
-    interval=30
+    interval=$MEMORY_PSI_WINDOW_SECONDS
     ((remaining < interval)) && interval=$remaining
-    ((interval > 0)) && sleep "$interval"
+    if ((interval == MEMORY_PSI_WINDOW_SECONDS)); then
+      require_memory_psi_window
+    elif ((interval > 0)); then
+      sleep "$interval"
+    fi
     validate_running_sample "$market"
   done
 
@@ -1154,7 +1305,7 @@ verify_oss_round_trips() {
   local uri manifest start_ns end_ns file digest zst_uri zst_path success_uri success_path
   local manifest_replay_safe
   local segment_dir manifest_path manifest_digest actual_manifest_digest
-  local actual_digest bytes agg_trade_count manifest_agg_trade_count gap_ns
+  local actual_digest bytes agg_trade_count manifest_agg_trade_count gap_ns digest_output
   local tape_schema='' candidate_schema stream_type_count
   local family_counts raw_trade_count book_ticker_count force_order_count
   local manifest_symbol_count manifest_raw_trade_count manifest_book_ticker_count
@@ -1163,14 +1314,17 @@ verify_oss_round_trips() {
   local round_trips='[]'
   local -a strict_verifier_segments=()
 
-  manifest_uris "$market" "$listing" >"$uris"
+  begin_memory_psi_phase "oss-roundtrip-$market"
+
+  run_active_memory_psi_command : manifest_uris "$market" "$listing" >"$uris"
   : >"$candidates"
   : >"$unsafe_candidates"
   while IFS= read -r uri; do
     [[ -n $uri ]] || continue
     manifest="$tmp_dir/${market}-scan-$index.json"
     index=$((index + 1))
-    run_oss "$market" cp "$uri" "$manifest" --force --no-progress >/dev/null
+    run_active_memory_psi_command : run_oss "$market" cp "$uri" "$manifest" \
+      --force --no-progress >/dev/null
     if ! jq -e \
       --arg market "$market" \
       --arg dataset "${dataset[$market]}" \
@@ -1340,16 +1494,21 @@ verify_oss_round_trips() {
     zst_uri="${uri%/*}/$file"
     zst_path="$segment_dir/$file"
     manifest_path="$segment_dir/${file}.manifest.json"
-    run_oss "$market" cp "$uri" "$manifest_path" --force --no-progress >/dev/null
+    run_active_memory_psi_command : run_oss "$market" cp "$uri" "$manifest_path" \
+      --force --no-progress >/dev/null
     actual_manifest_digest=$(sha256sum "$manifest_path" | awk '{print $1}')
     [[ $actual_manifest_digest == "$manifest_digest" ]] \
       || die "$market manifest changed between discovery and readback: $uri"
-    run_oss "$market" cp "$zst_uri" "$zst_path" --force --no-progress >/dev/null
-    actual_digest=$(sha256sum "$zst_path" | awk '{print $1}')
+    run_active_memory_psi_command : run_oss "$market" cp "$zst_uri" "$zst_path" \
+      --force --no-progress >/dev/null
+    digest_output="$segment_dir/data.sha256"
+    run_active_memory_psi_command : sha256sum "$zst_path" >"$digest_output"
+    actual_digest=$(awk '{print $1}' "$digest_output")
     [[ $actual_digest == "$digest" ]] || die "$market OSS round-trip digest mismatch: $zst_uri"
     success_uri="${uri%/*}/${file}._SUCCESS"
     success_path="$segment_dir/${file}._SUCCESS"
-    run_oss "$market" cp "$success_uri" "$success_path" --force --no-progress >/dev/null
+    run_active_memory_psi_command : run_oss "$market" cp "$success_uri" "$success_path" \
+      --force --no-progress >/dev/null
     printf '%s\n' "$digest" | cmp -s - "$success_path" \
       || die "$market OSS success marker does not match segment SHA-256: $success_uri"
     manifest_symbol_count=$(jq -er '.symbols | length' "$manifest")
@@ -1669,6 +1828,7 @@ jq -n \
     "$maximum_sequential_phase_memory_bytes" \
   --argjson resource_preflight "$resource_preflight_json" \
   --argjson resource_admission_samples "$resource_admission_samples_json" \
+  --argjson memory_full_psi_windows "$memory_psi_windows_json" \
   --argjson segment_seconds "$GATE_SEGMENT_SECONDS" \
   --argjson duration_seconds "$duration_seconds" \
   --argjson test_only "$test_only" \
@@ -1692,6 +1852,7 @@ jq -n \
     maximum_sequential_phase_memory_bytes:$maximum_sequential_phase_memory_bytes,
     resource_preflight:$resource_preflight,
     resource_admission_samples:$resource_admission_samples,
+    memory_full_psi_windows:$memory_full_psi_windows,
     segment_seconds:$segment_seconds,
     duration_seconds:$duration_seconds,
     test_only:$test_only,checks_passed:$checks_passed,
