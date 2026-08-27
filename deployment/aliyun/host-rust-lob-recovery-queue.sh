@@ -61,8 +61,18 @@ isolation_phase_begin() {
   log_isolation_phase begin 0
 }
 
+isolation_phase_finish() {
+  log_isolation_phase "$1" "$((SECONDS - CURRENT_ISOLATION_PHASE_STARTED))"
+  CURRENT_ISOLATION_PHASE=idle
+  CURRENT_ISOLATION_PHASE_STARTED=0
+}
+
 isolation_phase_done() {
-  log_isolation_phase 'done' "$((SECONDS - CURRENT_ISOLATION_PHASE_STARTED))"
+  isolation_phase_finish 'done'
+}
+
+isolation_phase_deferred() {
+  isolation_phase_finish deferred
 }
 
 log_isolation_exit() {
@@ -454,12 +464,14 @@ require_recreated_canonical_spool() {
 
 complete_isolation_transaction() {
   local hft_uid=$1 hft_gid=$2 spool_lock_held=${3:-0}
-  local prior_upload_status spool_lock queue_unit
+  local prior_upload_status spool_lock queue_unit start_status
+  isolation_phase_begin validation
   load_isolation_marker
   queue_unit="$RECOVERY_SERVICE@$MARKET.service"
   if [[ -e $ISOLATION_READY_DIR || -L $ISOLATION_READY_DIR ]]; then
     secure_directory "$ISOLATION_READY_DIR" "$hft_uid" "$hft_gid"
     validate_isolation_receipt "$ISOLATION_READY_DIR"
+    isolation_phase_done
     isolation_phase_begin canonical-recreate
     if [[ -e $CANONICAL_SPOOL || -L $CANONICAL_SPOOL ]]; then
       secure_directory "$CANONICAL_SPOOL" "$hft_uid" "$hft_gid"
@@ -480,6 +492,7 @@ complete_isolation_transaction() {
       flock -n 8 || fail "collector spool lock is already held: $spool_lock"
       spool_lock_held=1
     fi
+    isolation_phase_done
     isolation_phase_begin rename
     mv -T -- "$CANONICAL_SPOOL" "$ISOLATION_READY_DIR"
     isolation_phase_done
@@ -516,12 +529,18 @@ complete_isolation_transaction() {
   fi
   flock -u 9
   exec 9>&-
-  systemctl start --no-block "$queue_unit" >/dev/null 2>&1 || true
-  isolation_phase_done
+  start_status=0
+  systemctl start --no-block "$queue_unit" >/dev/null 2>&1 || start_status=$?
+  if (( start_status == 0 )); then
+    isolation_phase_done
+  else
+    isolation_phase_deferred
+  fi
 }
 
 recover_single_legacy_isolation() {
-  local hft_uid=$1 hft_gid=$2 queue_dir candidate_count=0 valid_count=0
+  local hft_uid=$1 hft_gid=$2 queue_dir candidate_count=0 valid_count=0 start_status
+  isolation_phase_begin validation
   while IFS= read -r queue_dir; do
     candidate_count=$((candidate_count + 1))
     if ( load_job "$queue_dir" ) >/dev/null 2>&1; then
@@ -531,6 +550,7 @@ recover_single_legacy_isolation() {
     \( -name '*.ready' -o -name '*.running' \) -print | sort)
   (( candidate_count == 1 && valid_count == 1 )) \
     || fail "canonical spool is missing without one exclusive valid legacy recovery job: $CANONICAL_SPOOL"
+  isolation_phase_done
   isolation_phase_begin canonical-recreate
   install -d -m 0750 -o "$hft_uid" -g "$hft_gid" -- "$CANONICAL_SPOOL"
   isolation_phase_done
@@ -540,8 +560,14 @@ recover_single_legacy_isolation() {
   isolation_phase_begin handoff
   flock -u 9
   exec 9>&-
-  systemctl start --no-block "$RECOVERY_SERVICE@$MARKET.service" >/dev/null 2>&1 || true
-  isolation_phase_done
+  start_status=0
+  systemctl start --no-block "$RECOVERY_SERVICE@$MARKET.service" >/dev/null 2>&1 \
+    || start_status=$?
+  if (( start_status == 0 )); then
+    isolation_phase_done
+  else
+    isolation_phase_deferred
+  fi
 }
 
 run_isolate() {

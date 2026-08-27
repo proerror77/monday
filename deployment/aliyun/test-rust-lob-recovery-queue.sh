@@ -228,7 +228,8 @@ systemctl() {
   printf 'systemctl %s\n' "$*" >>"$MOCK_SEQUENCE_LOG"
   printf '%s\n' "$*" >>"$MOCK_SYSTEMCTL_LOG"
   if [[ ${1:-} == start ]]; then
-    return 0
+    [[ ${MOCK_SYSTEMCTL_START_FAIL:-0} == 0 ]]
+    return
   fi
   return 1
 }
@@ -390,8 +391,11 @@ activate_controller_fixture() {
 }
 
 run_action() (
-  local fixture=$1 action=$2 market=$3 failed_job_id=${4:-} sync_fail_ordinal=${5:-${MOCK_SYNC_FAIL_ORDINAL:-0}}
+  local fixture=$1 action=$2 market=$3 failed_job_id=${4:-}
+  local sync_fail_ordinal=${5:-${MOCK_SYNC_FAIL_ORDINAL:-0}}
+  local systemctl_start_fail=${6:-${MOCK_SYSTEMCTL_START_FAIL:-0}}
   MOCK_SYNC_FAIL_ORDINAL=$sync_fail_ordinal
+  MOCK_SYSTEMCTL_START_FAIL=$systemctl_start_fail
   configure_paths "$fixture"
   # MARKET is consumed by functions from the sourced recovery script.
   # shellcheck disable=SC2034
@@ -998,6 +1002,50 @@ test_signal_has_one_terminal_isolation_record() {
   assert signal-phase test "$(structured_field "$line" current_isolation_phase)" = marker-file
 }
 
+test_handoff_start_failure_is_deferred() {
+  local fixture=$tmp_dir/handoff-start-failure log line ready_dir
+  setup_fixture "$fixture"
+  configure_paths "$fixture"
+  MARKET=spot
+  market_paths
+  printf 'part\n' >"$CANONICAL_ROOT/spot/part-001.jsonl.part"
+
+  log="$fixture/transaction-handoff.log"
+  run_action "$fixture" isolate spot '' 0 1 2>"$log"
+  assert transaction-handoff-deferred \
+    grep -q 'event=deferred phase=handoff ' "$log"
+  assert transaction-handoff-not-done \
+    test "$(grep -c 'event=done phase=handoff ' "$log" || true)" -eq 0
+  line=$(grep 'event=exit ' "$log")
+  assert transaction-handoff-exit-idle \
+    test "$(structured_field "$line" current_isolation_phase)" = idle
+  ready_dir=$(find "$QUEUE_MARKET_ROOT" -mindepth 1 -maxdepth 1 \
+    -type d -name '*.ready' -print -quit)
+  assert transaction-handoff-ready-preserved test -n "$ready_dir"
+  assert transaction-handoff-canonical-present test -d "$CANONICAL_SPOOL"
+  assert transaction-handoff-marker-cleared test ! -e "$ISOLATION_MARKER"
+  assert transaction-handoff-start-requested \
+    grep -Fxq 'start --no-block binance-lob-archiver-recovery@spot.service' \
+    "$fixture/systemctl.log"
+
+  rm -rf "$CANONICAL_SPOOL"
+  : >"$fixture/systemctl.log"
+  log="$fixture/legacy-handoff.log"
+  run_action "$fixture" isolate spot '' 0 1 2>"$log"
+  assert legacy-handoff-deferred \
+    grep -q 'event=deferred phase=handoff ' "$log"
+  assert legacy-handoff-not-done \
+    test "$(grep -c 'event=done phase=handoff ' "$log" || true)" -eq 0
+  line=$(grep 'event=exit ' "$log")
+  assert legacy-handoff-exit-idle \
+    test "$(structured_field "$line" current_isolation_phase)" = idle
+  assert legacy-handoff-canonical-present test -d "$CANONICAL_SPOOL"
+  assert legacy-handoff-ready-preserved test -d "$ready_dir"
+  assert legacy-handoff-start-requested \
+    test "$(grep -c '^start --no-block binance-lob-archiver-recovery@spot.service$' \
+      "$fixture/systemctl.log")" -eq 1
+}
+
 test_missing_canonical_single_valid_legacy_job_recovers() {
   local fixture=$tmp_dir/missing-canonical-single-legacy ready_dir
   setup_fixture "$fixture"
@@ -1039,7 +1087,7 @@ test_missing_canonical_mixed_legacy_queue_fails_closed() {
 }
 
 test_isolation_transaction_drift_fails_closed() {
-  local fixture=$tmp_dir/isolation-marker-drift canonical ready
+  local fixture=$tmp_dir/isolation-marker-drift canonical ready log line status
   setup_fixture "$fixture"
   canonical="$fixture/data/monday/spool/binance-lob/spot"
   printf 'part\n' >"$canonical/part-001.jsonl.part"
@@ -1049,7 +1097,16 @@ test_isolation_transaction_drift_fails_closed() {
   jq '.receipt_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
     "$ISOLATION_MARKER" >"$ISOLATION_MARKER.tmp"
   mv "$ISOLATION_MARKER.tmp" "$ISOLATION_MARKER"
-  expect_failure "$fixture" isolate spot
+  log="$fixture/isolation.log"
+  set +e
+  run_action "$fixture" isolate spot 2>"$log"
+  status=$?
+  set -e
+  assert drift-failed test "$status" -ne 0
+  assert drift-single-exit test "$(grep -c 'event=exit ' "$log")" -eq 1
+  line=$(grep 'event=exit ' "$log")
+  assert drift-validation-phase \
+    test "$(structured_field "$line" current_isolation_phase)" = validation
   assert drift-ready-preserved test -d "$ready"
   assert drift-canonical-not-invented test ! -e "$canonical"
   assert drift-marker-preserved test -f "$ISOLATION_MARKER"
@@ -1144,6 +1201,7 @@ test_missing_canonical_with_multiple_backlog_uses_marker
 test_recovery_start_follows_durable_lock_handoff
 test_isolation_phase_logs_locate_sync_failures_and_retry_converges
 test_signal_has_one_terminal_isolation_record
+test_handoff_start_failure_is_deferred
 test_missing_canonical_single_valid_legacy_job_recovers
 test_missing_canonical_without_valid_legacy_job_fails_closed
 test_missing_canonical_mixed_legacy_queue_fails_closed
