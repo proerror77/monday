@@ -329,7 +329,7 @@ run_transient_cleanup_fixture() (
   stop_fails=true
   kill_clears=true
   mock_sub_state=exited
-  mock_exec_code=exited
+  mock_exec_code=1
   mock_exec_status=0
   mock_result=success
   sleep() { :; }
@@ -393,8 +393,29 @@ run_transient_cleanup_fixture() (
 
   mock_active_state=active
   mock_sub_state=exited
+  mock_exec_code=1
   mock_exec_status=0
   run_transient_unit_command fixture.service true
+  for invalid_code in 0 2; do
+    mock_exec_code=$invalid_code
+    if run_transient_unit_command fixture.service true; then
+      printf 'transient command accepted invalid ExecMainCode=%s\n' "$invalid_code" >&2
+      exit 1
+    fi
+  done
+  mock_exec_code=1
+  mock_exec_status=17
+  if run_transient_unit_command fixture.service true; then
+    printf 'transient command accepted non-zero ExecMainStatus\n' >&2
+    exit 1
+  fi
+  mock_exec_status=0
+  mock_result=exit-code
+  if run_transient_unit_command fixture.service true; then
+    printf 'transient command accepted a non-success Result\n' >&2
+    exit 1
+  fi
+  mock_result=success
   mock_active_state=failed
   if run_transient_unit_command fixture.service true; then
     printf 'transient command accepted a failed unit state\n' >&2

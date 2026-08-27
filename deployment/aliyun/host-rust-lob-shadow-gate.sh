@@ -751,7 +751,7 @@ run_transient_unit_command() {
         2>/dev/null) || return 1
       result=$(systemctl show --property=Result --value "$transient_unit" \
         2>/dev/null) || return 1
-      [[ $exec_code == exited && $exec_status == 0 && $result == success ]]
+      [[ $exec_code == 1 && $exec_status == 0 && $result == success ]]
       return
     fi
     [[ $active_state == active || $active_state == activating ]] || return 1
