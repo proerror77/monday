@@ -39,6 +39,7 @@ CURRENT_ACTION=
 CURRENT_ISOLATION_PHASE=idle
 CURRENT_ISOLATION_PHASE_STARTED=0
 CURRENT_ISOLATION_JOB_ID=unknown
+CURRENT_ISOLATION_SIGNAL=none
 ISOLATION_READY_DIR=
 
 isolation_path_state() {
@@ -76,7 +77,7 @@ log_isolation_exit() {
 
 on_exit() {
   local status=$1
-  log_isolation_exit "$status"
+  log_isolation_exit "$status" "$CURRENT_ISOLATION_SIGNAL"
 }
 
 path_is_direct_or_absent() {
@@ -547,6 +548,7 @@ run_isolate() {
   CURRENT_ISOLATION_PHASE=idle
   CURRENT_ISOLATION_PHASE_STARTED=$SECONDS
   CURRENT_ISOLATION_JOB_ID=unknown
+  CURRENT_ISOLATION_SIGNAL=none
   ISOLATION_READY_DIR=
   isolation_phase_begin release-identity
   secure_release_identity
@@ -1096,7 +1098,7 @@ JOB_STARTED_AT=
 
 on_signal() {
   local signal=$1
-  log_isolation_exit 1 "$signal"
+  CURRENT_ISOLATION_SIGNAL=$signal
   if [[ -n ${CURRENT_RUNNING_DIR:-} && -d ${CURRENT_RUNNING_DIR:-} ]]; then
     mark_failed "$CURRENT_RUNNING_DIR" "$CURRENT_STEP" "interrupted by $signal"
   fi
