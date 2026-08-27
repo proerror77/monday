@@ -5,6 +5,7 @@ export LC_ALL=C
 
 usage() {
   printf 'Usage: %s <isolate|drain> <spot|usdm>\n' "${0##*/}" >&2
+  printf '       %s reconcile-legacy <spot|usdm> <failed-job-id>\n' "${0##*/}" >&2
 }
 
 configure_paths() {
@@ -24,6 +25,7 @@ configure_paths() {
   CANONICAL_ROOT="$DATA_ROOT/monday/spool/binance-lob"
   QUEUE_ROOT="$DATA_ROOT/monday/spool/binance-lob-recovery"
   EVIDENCE_ROOT="$DATA_ROOT/monday/evidence/recoveries/lob-queue"
+  LEGACY_RECONCILIATION_ROOT="$DATA_ROOT/monday/evidence/recoveries/lob-legacy-reconciliations"
   SAFE_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
   RECOVERY_SERVICE=binance-lob-archiver-recovery
 }
@@ -116,6 +118,7 @@ canonical_paths_safe() {
     "$CANONICAL_ROOT" \
     "$QUEUE_ROOT" \
     "$EVIDENCE_ROOT" \
+    "$LEGACY_RECONCILIATION_ROOT" \
     "$ROOT_PREFIX/run" \
     "$LOCK_ROOT"; do
     path_is_direct_or_absent "$path" \
@@ -512,6 +515,320 @@ job_evidence_root() {
   printf '%s/%s\n' "$EVIDENCE_ROOT" "$job_id"
 }
 
+validate_legacy_reconciliation_receipt() {
+  local reconciliation_dir=$1 failed_job_id=$2 receipt marker marker_entry
+  receipt="$reconciliation_dir/reconciliation.json"
+  marker="$reconciliation_dir/RECONCILED.sha256"
+  secure_directory "$reconciliation_dir" 0 0
+  secure_regular_file "$receipt" 0
+  secure_regular_file "$marker" 0
+  [[ $(wc -l <"$marker") -eq 1 ]] \
+    || fail "legacy reconciliation marker must contain one entry: $marker"
+  marker_entry=$(<"$marker")
+  [[ $marker_entry =~ ^[a-f0-9]{64}[[:space:]]+reconciliation\.json$ ]] \
+    || fail "legacy reconciliation marker is malformed: $marker"
+  (cd "$reconciliation_dir" && sha256sum --check --strict RECONCILED.sha256 >/dev/null) \
+    || fail "legacy reconciliation receipt digest drifted: $receipt"
+  jq -e \
+    --arg market "$MARKET" \
+    --arg failed_job_id "$failed_job_id" \
+    --arg release "$JOB_RELEASE_SHA256" \
+    --arg bundle "$JOB_BUNDLE_SHA256" \
+    --arg source "$JOB_SOURCE_REVISION" '
+      .schema == "monday.rust_lob_legacy_reconciliation.v1"
+      and .result == "passed"
+      and .market == $market
+      and .failed_job_id == $failed_job_id
+      and .release_sha256 == $release
+      and .deployment_bundle_sha256 == $bundle
+      and .deployment_source_revision == $source
+      and (.recovery_input_receipt_sha256 | test("^[a-f0-9]{64}$"))
+      and (.entries | type == "array" and length > 0)
+      and all(.entries[];
+        .prefix_equal == true
+        and (.bytes | type == "number" and . > 0)
+        and (.legacy_sha256 | test("^[a-f0-9]{64}$"))
+        and (.backup_sha256 | test("^[a-f0-9]{64}$")))' \
+    "$receipt" >/dev/null \
+    || fail "legacy reconciliation receipt identity drifted: $receipt"
+}
+
+validate_legacy_reconciliation_archive() {
+  local reconciliation_dir=$1 archived_spool=$2 hft_gid=$3 row legacy_name relative
+  local bytes legacy_sha part actual_count receipt_count unexpected archive_gid seen=''
+  local -a entries=()
+
+  archive_gid=$(stat -c %g -- "$archived_spool")
+  [[ $archive_gid == 0 || $archive_gid == "$hft_gid" ]] \
+    || fail "legacy reconciliation archive has an unsafe group: $archived_spool"
+  secure_directory "$archived_spool" 0 "$archive_gid"
+  unexpected=$(find "$archived_spool" -mindepth 1 ! -type d ! -type f -print -quit)
+  [[ -z $unexpected ]] || fail "legacy reconciliation archive contains a non-regular entry: $unexpected"
+  unexpected=$(find "$archived_spool" -type f ! -name '*.jsonl.part' -print -quit)
+  [[ -z $unexpected ]] || fail "legacy reconciliation archive contains an unexpected file: $unexpected"
+  mapfile -t entries < <(jq -cer '.entries[]' "$reconciliation_dir/reconciliation.json")
+  (( ${#entries[@]} > 0 )) || fail "legacy reconciliation archive has no receipt entries"
+  receipt_count=$(jq -er '.entries | length' "$reconciliation_dir/reconciliation.json")
+  [[ ${#entries[@]} == "$receipt_count" ]] \
+    || fail "legacy reconciliation archive receipt could not be fully decoded"
+  actual_count=$(find "$archived_spool" -type f -name '*.jsonl.part' -print | wc -l | tr -d '[:space:]')
+  [[ $actual_count == "${#entries[@]}" ]] \
+    || fail "legacy reconciliation archive file count drifted: $archived_spool"
+  for row in "${entries[@]}"; do
+    legacy_name=$(jq -er '.legacy_directory' <<<"$row")
+    relative=$(jq -er '.path' <<<"$row")
+    bytes=$(jq -er '.bytes' <<<"$row")
+    legacy_sha=$(jq -er '.legacy_sha256' <<<"$row")
+    [[ $legacy_name =~ ^[0-9]{8}T[0-9]{6}Z-${MARKET}-${JOB_RELEASE_SHA256:0:12}-[0-9]+\.(ready|running)$ \
+      && $relative =~ ^date=[0-9]{4}-[0-9]{2}-[0-9]{2}/hour=[0-9]{2}/part-[0-9]+\.jsonl\.part$ ]] \
+      || fail "legacy reconciliation archive receipt has an invalid path"
+    ! grep -Fxq -- "$legacy_name/$relative" <<<"$seen" \
+      || fail "legacy reconciliation archive receipt has a duplicate path: $legacy_name/$relative"
+    seen+="$legacy_name/$relative"$'\n'
+    secure_directory "$archived_spool/$legacy_name" 0 0
+    part="$archived_spool/$legacy_name/$relative"
+    secure_regular_file "$part" 0
+    [[ $(stat -c %h -- "$part") == 1 && $(stat -c %a -- "$part") == 440 \
+      && $(stat -c %s -- "$part") == "$bytes" \
+      && $(sha256sum "$part" | awk '{print $1}') == "$legacy_sha" ]] \
+      || fail "legacy reconciliation archived part drifted: $part"
+  done
+}
+
+collect_legacy_prefix_evidence() {
+  local legacy_root=$1 backup_root=$2 backup_receipt=$3 entries_file=$4
+  local hft_uid=$5 hft_gid=$6 legacy_dir legacy_name part relative backup
+  local legacy_bytes legacy_sha backup_bytes backup_sha backup_prefix_sha before after receipt_row
+  local part_uid part_gid part_mode
+  local verified_backups='' entry_count=0 unexpected
+  local -a legacy_dirs=() parts=()
+
+  secure_directory "$legacy_root" 0 "$hft_gid"
+  mapfile -t legacy_dirs < <(find "$legacy_root" -mindepth 1 -maxdepth 1 -type d -print | sort)
+  (( ${#legacy_dirs[@]} > 0 )) || fail "legacy recovery containment is empty: $legacy_root"
+  : >"$entries_file"
+  for legacy_dir in "${legacy_dirs[@]}"; do
+    legacy_name=${legacy_dir##*/}
+    [[ $legacy_name =~ ^[0-9]{8}T[0-9]{6}Z-${MARKET}-${JOB_RELEASE_SHA256:0:12}-[0-9]+\.(ready|running)$ ]] \
+      || fail "legacy recovery directory does not bind the failed release: $legacy_dir"
+    secure_directory "$legacy_dir" 0 0
+    unexpected=$(find "$legacy_dir" -mindepth 1 ! -type d ! -type f -print -quit)
+    [[ -z $unexpected ]] || fail "legacy recovery contains a non-regular entry: $unexpected"
+    unexpected=$(find "$legacy_dir" -type f ! -name '*.jsonl.part' -print -quit)
+    [[ -z $unexpected ]] || fail "legacy recovery contains an unexpected file: $unexpected"
+    mapfile -t parts < <(find "$legacy_dir" -type f -name '*.jsonl.part' -print | sort)
+    (( ${#parts[@]} > 0 )) || fail "legacy recovery directory has no part: $legacy_dir"
+    for part in "${parts[@]}"; do
+      relative=${part#"$legacy_dir/"}
+      [[ $relative =~ ^date=[0-9]{4}-[0-9]{2}-[0-9]{2}/hour=[0-9]{2}/part-[0-9]+\.jsonl\.part$ ]] \
+        || fail "legacy recovery part has an invalid relative path: $part"
+      part_uid=$(stat -c %u -- "$part")
+      part_gid=$(stat -c %g -- "$part")
+      part_mode=$(stat -c %a -- "$part")
+      [[ $(stat -c %h -- "$part") == 1 ]] \
+        || fail "legacy recovery part has unsafe links: $part"
+      if [[ $part_uid == "$hft_uid" && $part_gid == "$hft_gid" ]]; then
+        (( (8#$part_mode & 022) == 0 )) \
+          || fail "legacy recovery part is group/world writable: $part"
+      elif [[ $part_uid == 0 && $part_gid == 0 && $part_mode == 440 ]]; then
+        :
+      else
+        fail "legacy recovery part has unsafe ownership or mode: $part"
+      fi
+      receipt_row=$(jq -cer --arg path "$relative" '
+        [.files[] | select(.path == $path)]
+        | if length == 1 then .[0] else error("expected one recovery input") end
+        | select((.bytes | type) == "number" and .bytes > 0)
+        | select((.sha256 | type) == "string" and (.sha256 | test("^[a-f0-9]{64}$")))' \
+        "$backup_receipt") \
+        || fail "failed recovery receipt does not bind legacy part: $relative"
+      backup="$backup_root/$relative"
+      secure_regular_file "$backup" 0
+      [[ $(stat -c %h -- "$backup") == 1 && $(stat -c %a -- "$backup") == 440 ]] \
+        || fail "recovery input backup is not a single-link read-only file: $backup"
+      backup_bytes=$(jq -er '.bytes' <<<"$receipt_row")
+      backup_sha=$(jq -er '.sha256' <<<"$receipt_row")
+      [[ $(stat -c %s -- "$backup") == "$backup_bytes" ]] \
+        || fail "recovery input backup size drifted: $backup"
+      if ! grep -Fxq -- "$relative" <<<"$verified_backups"; then
+        [[ $(sha256sum "$backup" | awk '{print $1}') == "$backup_sha" ]] \
+          || fail "recovery input backup digest drifted: $backup"
+        verified_backups+="$relative"$'\n'
+      fi
+      legacy_bytes=$(stat -c %s -- "$part")
+      (( legacy_bytes > 0 && legacy_bytes <= backup_bytes )) \
+        || fail "legacy recovery part is not a bounded prefix candidate: $part"
+      if [[ $part_uid == "$hft_uid" ]]; then
+        RECONCILIATION_SEALED_TEMP="$part.sealed.$$"
+        [[ ! -e $RECONCILIATION_SEALED_TEMP && ! -L $RECONCILIATION_SEALED_TEMP ]] \
+          || fail "legacy sealed path already exists: $RECONCILIATION_SEALED_TEMP"
+        install -m 0440 -o root -g root -- "$part" "$RECONCILIATION_SEALED_TEMP"
+        secure_regular_file "$RECONCILIATION_SEALED_TEMP" 0
+        [[ $(stat -c %h -- "$RECONCILIATION_SEALED_TEMP") == 1 \
+          && $(stat -c %s -- "$RECONCILIATION_SEALED_TEMP") == "$legacy_bytes" ]] \
+          || fail "legacy sealed copy metadata drifted: $RECONCILIATION_SEALED_TEMP"
+        legacy_sha=$(sha256sum "$RECONCILIATION_SEALED_TEMP" | awk '{print $1}')
+      else
+        before=$(stat -c '%d:%i:%h:%u:%g:%a:%s:%Y' -- "$part")
+        legacy_sha=$(sha256sum "$part" | awk '{print $1}')
+      fi
+      backup_prefix_sha=$(head -c "$legacy_bytes" "$backup" | sha256sum | awk '{print $1}')
+      [[ $legacy_sha == "$backup_prefix_sha" ]] \
+        || fail "legacy recovery part is not a byte prefix of the failed-job backup: $part"
+      if [[ $part_uid == "$hft_uid" ]]; then
+        mv -Tf -- "$RECONCILIATION_SEALED_TEMP" "$part"
+        RECONCILIATION_SEALED_TEMP=
+        sync "$part"
+        sync "${part%/*}"
+      else
+        after=$(stat -c '%d:%i:%h:%u:%g:%a:%s:%Y' -- "$part")
+        [[ $before == "$after" ]] \
+          || fail "sealed legacy recovery part changed during reconciliation: $part"
+      fi
+      jq -cn \
+        --arg legacy_directory "$legacy_name" \
+        --arg path "$relative" \
+        --arg backup_path "$relative" \
+        --arg legacy_sha256 "$legacy_sha" \
+        --arg backup_sha256 "$backup_sha" \
+        --argjson bytes "$legacy_bytes" \
+        '{legacy_directory:$legacy_directory,path:$path,bytes:$bytes,
+          legacy_sha256:$legacy_sha256,backup_path:$backup_path,
+          backup_sha256:$backup_sha256,prefix_equal:true}' \
+        >>"$entries_file"
+      entry_count=$((entry_count + 1))
+    done
+  done
+  (( entry_count > 0 )) || fail "legacy reconciliation produced no prefix evidence"
+}
+
+reconcile_legacy_prefixes() (
+  local failed_job_id=$1 hft_uid hft_gid failed_dir failed_evidence
+  local backup_root backup_receipt result release_dir release_binary release_json
+  local reconciliation_dir archived_spool entries_file receipt_tmp marker_tmp
+  local backup_receipt_sha receipt_sha
+
+  drain_lock || fail "another market recovery is active"
+  hft_uid=$(id -u hftcollector)
+  hft_gid=$(id -g hftcollector)
+  ensure_queue_directory "$QUEUE_ROOT" "$hft_gid"
+  ensure_queue_directory "$QUEUE_MARKET_ROOT" "$hft_gid"
+  failed_dir="$QUEUE_MARKET_ROOT/$failed_job_id.failed"
+  secure_directory "$failed_dir" "$hft_uid" "$hft_gid"
+  load_job "$failed_dir" "$failed_job_id"
+  [[ $failed_job_id == *-"${JOB_RELEASE_SHA256:0:12}"-* ]] \
+    || fail "failed recovery job id does not bind its release: $failed_dir"
+  secure_regular_file "$JOB_RELEASE_ENV" 0
+  [[ $(sha256sum "$JOB_RELEASE_ENV" | awk '{print $1}') == "$JOB_ENV_SHA256" ]] \
+    || fail "failed recovery job env digest drifted: $JOB_RELEASE_ENV"
+  release_dir="$RELEASE_ROOT/$JOB_RELEASE_SHA256"
+  secure_directory "$release_dir" 0 0
+  release_binary="$release_dir/binance-lob-archiver"
+  release_json="$release_dir/release.json"
+  secure_regular_file "$release_binary" 0
+  secure_regular_file "$release_json" 0
+  [[ -x $release_binary ]] || fail "failed recovery release binary is not executable: $release_binary"
+  [[ $(sha256sum "$release_binary" | awk '{print $1}') == "$JOB_RELEASE_SHA256" ]] \
+    || fail "failed recovery release binary digest drifted: $release_binary"
+  jq -e \
+    --arg release "$JOB_RELEASE_SHA256" --arg bundle "$JOB_BUNDLE_SHA256" \
+    --arg source "$JOB_SOURCE_REVISION" '
+      .artifact_sha256 == $release
+      and .deployment_bundle_sha256 == $bundle
+      and .deployment_source_revision == $source' "$release_json" >/dev/null \
+    || fail "failed recovery release metadata drifted: $release_json"
+
+  failed_evidence=$(job_evidence_root "$failed_job_id")
+  secure_directory "$failed_evidence" 0 0
+  result="$failed_evidence/result.json"
+  backup_root="$failed_evidence/recovery-input"
+  backup_receipt="$backup_root/receipt.json"
+  secure_regular_file "$result" 0
+  secure_directory "$backup_root" 0 0
+  secure_regular_file "$backup_receipt" 0
+  jq -e \
+    --arg job_id "$failed_job_id" --arg market "$MARKET" \
+    --arg release "$JOB_RELEASE_SHA256" --arg bundle "$JOB_BUNDLE_SHA256" \
+    --arg source "$JOB_SOURCE_REVISION" '
+      .schema == "monday.rust_lob_recovery_queue_result.v1"
+      and .result == "failed" and .job_id == $job_id and .market == $market
+      and .release_sha256 == $release
+      and .deployment_bundle_sha256 == $bundle
+      and .deployment_source_revision == $source' "$result" >/dev/null \
+    || fail "failed recovery result identity drifted: $result"
+  jq -e \
+    --arg market "$MARKET" --arg release "$JOB_RELEASE_SHA256" \
+    --arg bundle "$JOB_BUNDLE_SHA256" --arg source "$JOB_SOURCE_REVISION" '
+      .schema == "monday.binance-lob-recovery-input.v2"
+      and .market == $market and .artifact_sha256 == $release
+      and .deployment_bundle_sha256 == $bundle
+      and .deployment_source_revision == $source
+      and (.files | type == "array" and length > 0)' "$backup_receipt" >/dev/null \
+    || fail "failed recovery input receipt identity drifted: $backup_receipt"
+  backup_receipt_sha=$(sha256sum "$backup_receipt" | awk '{print $1}')
+
+  ensure_root_directory "$DATA_ROOT/monday/evidence"
+  ensure_root_directory "$DATA_ROOT/monday/evidence/recoveries"
+  ensure_root_directory "$LEGACY_RECONCILIATION_ROOT"
+  same_filesystem "$QUEUE_MARKET_ROOT" "$LEGACY_RECONCILIATION_ROOT" \
+    || fail "legacy queue and reconciliation evidence must share a filesystem"
+  reconciliation_dir="$LEGACY_RECONCILIATION_ROOT/$failed_job_id"
+  archived_spool="$reconciliation_dir/spool"
+  entries_file=$(mktemp "$LOCK_ROOT/monday-lob-legacy-reconciliation.XXXXXX")
+  RECONCILIATION_SEALED_TEMP=
+  trap 'rm -f -- "$entries_file"; [[ -z ${RECONCILIATION_SEALED_TEMP:-} ]] || rm -f -- "$RECONCILIATION_SEALED_TEMP"' EXIT
+
+  if [[ -e $reconciliation_dir || -L $reconciliation_dir ]]; then
+    validate_legacy_reconciliation_receipt "$reconciliation_dir" "$failed_job_id"
+    [[ -d $archived_spool && ! -L $archived_spool ]] \
+      || fail "partial legacy reconciliation requires manual intervention: $reconciliation_dir"
+    [[ ! -e $QUEUE_MARKET_ROOT/legacy-unreceipted \
+      && ! -L $QUEUE_MARKET_ROOT/legacy-unreceipted ]] \
+      || fail "completed legacy reconciliation still has a queue source"
+    validate_legacy_reconciliation_archive "$reconciliation_dir" "$archived_spool" "$hft_gid"
+    printf 'legacy recovery prefixes already reconciled: %s\n' "$reconciliation_dir"
+    exit 0
+  fi
+
+  collect_legacy_prefix_evidence \
+    "$QUEUE_MARKET_ROOT/legacy-unreceipted" "$backup_root" "$backup_receipt" \
+    "$entries_file" "$hft_uid" "$hft_gid"
+  install -d -m 0750 -o root -g root -- "$reconciliation_dir"
+  receipt_tmp="$reconciliation_dir/reconciliation.json.tmp.$$"
+  marker_tmp="$reconciliation_dir/RECONCILED.sha256.tmp.$$"
+  jq -s \
+    --arg schema monday.rust_lob_legacy_reconciliation.v1 \
+    --arg result passed \
+    --arg completed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg market "$MARKET" \
+    --arg failed_job_id "$failed_job_id" \
+    --arg release_sha256 "$JOB_RELEASE_SHA256" \
+    --arg deployment_bundle_sha256 "$JOB_BUNDLE_SHA256" \
+    --arg deployment_source_revision "$JOB_SOURCE_REVISION" \
+    --arg recovery_input_receipt_sha256 "$backup_receipt_sha" \
+    '{schema:$schema,result:$result,completed_at:$completed_at,market:$market,
+      failed_job_id:$failed_job_id,release_sha256:$release_sha256,
+      deployment_bundle_sha256:$deployment_bundle_sha256,
+      deployment_source_revision:$deployment_source_revision,
+      recovery_input_receipt_sha256:$recovery_input_receipt_sha256,
+      entries:.}' "$entries_file" >"$receipt_tmp"
+  chmod 0640 "$receipt_tmp"
+  receipt_sha=$(sha256sum "$receipt_tmp" | awk '{print $1}')
+  printf '%s  reconciliation.json\n' "$receipt_sha" >"$marker_tmp"
+  chmod 0640 "$marker_tmp"
+  mv -Tf -- "$receipt_tmp" "$reconciliation_dir/reconciliation.json"
+  mv -Tf -- "$marker_tmp" "$reconciliation_dir/RECONCILED.sha256"
+  sync "$reconciliation_dir/reconciliation.json"
+  sync "$reconciliation_dir/RECONCILED.sha256"
+  validate_legacy_reconciliation_receipt "$reconciliation_dir" "$failed_job_id"
+  [[ ! -e $archived_spool && ! -L $archived_spool ]] \
+    || fail "legacy reconciliation archive path already exists: $archived_spool"
+  mv -T -- "$QUEUE_MARKET_ROOT/legacy-unreceipted" "$archived_spool"
+  sync "$QUEUE_MARKET_ROOT"
+  sync "$reconciliation_dir"
+  printf 'reconciled legacy recovery prefixes into %s\n' "$archived_spool"
+)
+
 write_result() {
   local path=$1 result=$2 step=$3 message=$4
   jq -n \
@@ -740,16 +1057,24 @@ drain_market() {
 }
 
 main() {
-  local action=${1:-} market=${2:-} command
+  local action=${1:-} market=${2:-} failed_job_id=${3:-} command
   if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
     printf 'must run as root\n' >&2
     exit 2
   fi
-  if [[ $# -ne 2 || ! $action =~ ^(isolate|drain)$ || ! $market =~ ^(spot|usdm)$ ]]; then
+  if [[ ! $market =~ ^(spot|usdm)$ ]] \
+    || { [[ $action =~ ^(isolate|drain)$ ]] && [[ $# -ne 2 ]]; } \
+    || { [[ $action == reconcile-legacy ]] && [[ $# -ne 3 ]]; } \
+    || [[ ! $action =~ ^(isolate|drain|reconcile-legacy)$ ]]; then
     usage
     exit 2
   fi
-  for command in awk chmod date env find flock grep id install jq mv readlink rm runuser sed sha256sum sort stat sync systemctl; do
+  if [[ $action == reconcile-legacy \
+    && ! $failed_job_id =~ ^[0-9]{8}T[0-9]{6}Z-${market}-[a-f0-9]{12}-[0-9]+$ ]]; then
+    usage
+    exit 2
+  fi
+  for command in awk chmod date env find flock grep head id install jq mktemp mv readlink rm runuser sed sha256sum sort stat sync systemctl wc; do
     command -v "$command" >/dev/null 2>&1 \
       || fail "missing required command: $command"
   done
@@ -766,6 +1091,7 @@ main() {
       isolate_market
       ;;
     drain) drain_market ;;
+    reconcile-legacy) reconcile_legacy_prefixes "$failed_job_id" ;;
   esac
 }
 
