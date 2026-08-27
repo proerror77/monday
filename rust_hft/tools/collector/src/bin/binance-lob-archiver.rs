@@ -4034,6 +4034,7 @@ async fn receive_url(
         let mut reconnect_frame_deadline = (!reconnect_confirmed)
             .then(|| tokio::time::Instant::now() + reconnect_frame_timeout);
         let reason = loop {
+            let pause_epoch = last_pause_epoch;
             if let Some(exit) = acknowledge_rotation_pause(
                 producer_id,
                 &sender,
@@ -4045,6 +4046,10 @@ async fn receive_url(
             .await?
             {
                 return Ok(exit);
+            }
+            if last_pause_epoch > pause_epoch && reconnect_frame_deadline.is_some() {
+                reconnect_frame_deadline =
+                    Some(tokio::time::Instant::now() + reconnect_frame_timeout);
             }
             let message = tokio::select! {
                 biased;
@@ -7841,6 +7846,145 @@ mod tests {
             fourth_connected_at.duration_since(third_connected_at) < Duration::from_millis(1800),
             "first market frame did not reset reconnect backoff"
         );
+
+        shutdown_tx.send(true).unwrap();
+        assert!(matches!(
+            task.await.unwrap().unwrap(),
+            TaskExit::Stopped(None)
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconnect_market_frame_deadline_restarts_after_rotation_pause() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let event_time_ms = now_ns().unwrap() / 1_000_000;
+        let (proof_processed_tx, proof_processed_rx) = tokio::sync::oneshot::channel();
+        let (send_market_tx, send_market_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut proof_processed_tx = Some(proof_processed_tx);
+            let mut send_market_rx = Some(send_market_rx);
+            for connection in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let request = websocket.next().await.unwrap().unwrap();
+                assert!(request.to_text().unwrap().contains("LIST_SUBSCRIPTIONS"));
+                websocket
+                    .send(Message::Text(
+                        json!({
+                            "id": SUBSCRIPTION_PROOF_ID,
+                            "result": ["btcusdt@aggTrade"]
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                if connection == 1 {
+                    websocket
+                        .send(Message::Ping(Vec::new().into()))
+                        .await
+                        .unwrap();
+                    loop {
+                        if matches!(websocket.next().await.unwrap().unwrap(), Message::Pong(_)) {
+                            break;
+                        }
+                    }
+                    proof_processed_tx.take().unwrap().send(()).unwrap();
+                    send_market_rx.take().unwrap().await.unwrap();
+                }
+                websocket
+                    .send(Message::Text(
+                        json!({
+                            "stream": "btcusdt@aggTrade",
+                            "data": {
+                                "e": "aggTrade",
+                                "E": event_time_ms,
+                                "s": "BTCUSDT",
+                                "a": connection + 1,
+                                "f": connection + 1,
+                                "l": connection + 1,
+                                "p": "100",
+                                "q": "1",
+                                "T": event_time_ms,
+                                "m": false
+                            }
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                if connection == 0 {
+                    websocket.close(None).await.unwrap();
+                } else {
+                    let _ = websocket.next().await;
+                }
+            }
+        });
+        let (sender, mut receiver) = mpsc::channel(8);
+        let (stream_connected, _) = broadcast::channel(1);
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let (pause_tx, pause_rx) = watch::channel(0_u64);
+        let (resume_tx, resume_rx) = watch::channel(0_u64);
+        let task = tokio::spawn(receive_url(
+            StreamShard {
+                url: format!("ws://{address}"),
+                streams: BTreeSet::from(["btcusdt@aggTrade".to_owned()]),
+            },
+            sender,
+            stream_connected,
+            shutdown,
+            SPARSE_STREAM_STALL_TIMEOUT,
+            Duration::from_millis(200),
+            Duration::from_secs(1),
+            ProcessWatchdog::new_state(),
+            0,
+            pause_rx,
+            resume_rx,
+        ));
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::AggregateTrade { .. })
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::StreamDisconnected { .. })
+        ));
+        proof_processed_rx.await.unwrap();
+        pause_tx.send(1).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::RotationBarrier {
+                producer_id: 0,
+                epoch: 1
+            })
+        ));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(receiver.try_recv().is_err());
+        resume_tx.send(1).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        send_market_tx.send(()).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::StreamReconnected { .. })
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::AggregateTrade { .. })
+        ));
 
         shutdown_tx.send(true).unwrap();
         assert!(matches!(
