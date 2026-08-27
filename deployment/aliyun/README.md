@@ -1107,6 +1107,19 @@ hard limit, and the active Shadow phase stops if the live host reserve is
 consumed. The Gate records production current, peak, hard limit, growth target,
 the initial preflight, and every successful phase-admission sample. An over-limit
 phase fails closed instead of increasing the host size or weakening the reserve.
+The Gate also samples Linux I/O `full` PSI from `/proc/pressure/io` on a
+15-second cadence.
+Preflight records four cumulative samples as three windows; every Shadow,
+upload-drain, strict-verifier, and OSS round-trip/readback phase recalibrates
+the same way and continues sampling for the complete phase, including
+compression, validation, and OSS readback. Evidence records the actual
+monotonic elapsed time for each window. A window is a hit when its `full` stall
+ratio is at least 1%, equivalent to 150,000 microseconds over 15 seconds. Three consecutive
+hits terminate the current candidate or transient process, run normal cleanup,
+and cannot write `PASSED.sha256`; a lower window resets the count. Missing,
+non-integer, interrupted, or regressing PSI counters fail closed. Existing
+background services are judged only by their measured PSI effect; this control
+does not stop or reconfigure external upload timers.
 The Gate fails unless all of these are true for the entire candidate run:
 
 - both units stay active with `NRestarts=0`;

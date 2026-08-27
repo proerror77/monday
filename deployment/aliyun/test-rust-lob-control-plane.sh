@@ -30,6 +30,412 @@ LIB="$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
 "$SCRIPT_DIR/test-rust-lob-controller-release.sh"
 "$SCRIPT_DIR/test-rust-lob-controller-apply.sh"
 
+psi_tmp_dir=$(mktemp -d)
+trap 'rm -rf "$psi_tmp_dir"' EXIT
+psi_fixture="$psi_tmp_dir/pressure"
+printf 'some avg10=0.00 avg60=0.00 avg300=0.00 total=7\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=100\n' \
+  >"$psi_fixture"
+[[ $(monday_io_full_psi_total_us "$psi_fixture") == 100 ]]
+read -r delta ratio hit consecutive < <(
+  monday_io_full_psi_window 100 150099 15000000 15000000 150000 0)
+[[ $delta == 149999 && $ratio == 0.009999933 && $hit == false && $consecutive == 0 ]]
+read -r delta ratio hit consecutive < <(
+  monday_io_full_psi_window 100 150100 15000000 15000000 150000 0)
+[[ $delta == 150000 && $ratio == 0.010000000 && $hit == true && $consecutive == 1 ]]
+read -r delta ratio hit consecutive < <(
+  monday_io_full_psi_window 100 300099 30000000 15000000 150000 0)
+[[ $delta == 299999 && $ratio == 0.009999967 && $hit == false && $consecutive == 0 ]]
+read -r delta ratio hit consecutive < <(
+  monday_io_full_psi_window 100 300100 30000000 15000000 150000 0)
+[[ $delta == 300000 && $ratio == 0.010000000 && $hit == true && $consecutive == 1 ]]
+read -r _ _ hit consecutive < <(
+  monday_io_full_psi_window 150100 300100 15000000 15000000 150000 "$consecutive")
+read -r _ _ hit consecutive < <(
+  monday_io_full_psi_window 300100 450100 15000000 15000000 150000 "$consecutive")
+[[ $hit == true && $consecutive == 3 ]]
+read -r _ _ _ reset_hits < <(
+  monday_io_full_psi_window 300100 300101 15000000 15000000 150000 2)
+[[ $reset_hits == 0 ]]
+read -r _ _ _ consecutive < <(
+  monday_io_full_psi_window 450100 450101 15000000 15000000 150000 "$consecutive")
+[[ $consecutive == 0 ]]
+printf 'some avg10=0.00 avg60=0.00 avg300=0.00 total=7\n' >"$psi_fixture"
+if monday_io_full_psi_total_us "$psi_fixture" >/dev/null 2>&1; then
+  printf 'I/O PSI parser accepted a missing full row\n' >&2
+  exit 1
+fi
+printf 'full avg10=0.00 avg60=0.00 avg300=0.00 total=bad\n' >"$psi_fixture"
+if monday_io_full_psi_total_us "$psi_fixture" >/dev/null 2>&1; then
+  printf 'I/O PSI parser accepted a non-integer total\n' >&2
+  exit 1
+fi
+if monday_io_full_psi_window 2 1 15000000 15000000 150000 0 >/dev/null 2>&1; then
+  printf 'I/O PSI window accepted a regressed total\n' >&2
+  exit 1
+else
+  regression_status=$?
+fi
+[[ $regression_status == 2 ]]
+rm -f "$psi_fixture"
+
+monitor_body="$psi_tmp_dir/monitor"
+sed -n '/^terminate_active_process_file()/,/^}/p' "$GATE" >"$monitor_body"
+sed -n '/^io_psi_runtime_monitor()/,/^}/p' "$GATE" >>"$monitor_body"
+sed -n '/^run_active_io_psi_command()/,/^}/p' "$GATE" >>"$monitor_body"
+run_psi_kill_fixture() (
+  # shellcheck disable=SC1090
+  . "$monitor_body"
+  IO_PSI_WINDOW_SECONDS=0
+  IO_PSI_WINDOW_US=15000000
+  IO_PSI_SOURCE=/fixture
+  IO_PSI_FULL_DELTA_LIMIT_US=150000
+  IO_PSI_CONSECUTIVE_HIT_LIMIT=3
+  ACTIVE_PROCESS_TERM_GRACE_SECONDS=0
+  ACTIVE_PROCESS_KILL_GRACE_SECONDS=0
+  total_index="$psi_tmp_dir/total-index"
+  mono_index="$psi_tmp_dir/mono-index"
+  output="$psi_tmp_dir/runtime.ndjson"
+  active="$psi_tmp_dir/active"
+  ready="$psi_tmp_dir/runtime.ready"
+  printf '0\n' >"$total_index"
+  printf '0\n' >"$mono_index"
+  : >"$output"
+  sleep() { :; }
+  monday_io_full_psi_total_us() {
+    local index
+    index=$(<"$total_index")
+    printf '%s\n' "$((index * 150000))"
+    printf '%s\n' "$((index + 1))" >"$total_index"
+  }
+  io_psi_monotonic_us() {
+    local index
+    index=$(<"$mono_index")
+    printf '%s\n' "$((1000000 + index * 15000000))"
+    printf '%s\n' "$((index + 1))" >"$mono_index"
+  }
+  set -m
+  bash -c 'trap "" TERM; while :; do sleep 1; done' &
+  ignored_child=$!
+  set +m
+  printf '%s %s\n' "$ignored_child" "$ignored_child" >"$active"
+  bash -c 'trap "exit 0" TERM; while :; do sleep 1; done' &
+  gate_fixture=$!
+  if io_psi_runtime_monitor fixture 1 "$output" "$active" "$gate_fixture" "$ready"; then
+    exit 1
+  else
+    status=$?
+  fi
+  [[ $status == 75 ]]
+  [[ -f $ready ]]
+  wait "$ignored_child" >/dev/null 2>&1 || true
+  wait "$gate_fixture" >/dev/null 2>&1 || true
+  if kill -0 "$ignored_child" >/dev/null 2>&1; then
+    exit 1
+  fi
+  [[ $(wc -l <"$output" | tr -d ' ') == 3 ]]
+  jq -se 'length == 3 and .[2].consecutive_hits == 3
+    and all(.[]; .stage == "runtime" and .window_us == 15000000)' "$output" >/dev/null
+
+  printf '0\n' >"$total_index"
+  printf '0\n' >"$mono_index"
+  low_output="$psi_tmp_dir/low-runtime.ndjson"
+  low_ready="$psi_tmp_dir/low-runtime.ready"
+  : >"$low_output"
+  monday_io_full_psi_total_us() {
+    local index
+    index=$(<"$total_index")
+    printf '%s\n' "$index"
+    printf '%s\n' "$((index + 1))" >"$total_index"
+  }
+  set -m
+  bash -c 'while :; do sleep 1; done' &
+  background_child=$!
+  set +m
+  printf '%s %s\n' "$background_child" "$background_child" >"$active"
+  io_psi_runtime_monitor low-background 2 "$low_output" "$active" $$ "$low_ready" &
+  low_monitor=$!
+  for _ in {1..100}; do
+    [[ $(wc -l <"$low_output" | tr -d ' ') -ge 3 ]] && break
+  done
+  kill -TERM "$low_monitor"
+  wait "$low_monitor"
+  kill -0 "$background_child"
+  jq -se 'length >= 3 and all(.[]; .hit == false and .consecutive_hits == 0)' \
+    "$low_output" >/dev/null
+  kill -KILL -- "-$background_child" >/dev/null 2>&1 || true
+  wait "$background_child" >/dev/null 2>&1 || true
+)
+run_psi_kill_fixture
+
+run_pipeline_group_fixture() (
+  # shellcheck disable=SC1090
+  . "$monitor_body"
+  ACTIVE_PROCESS_TERM_GRACE_SECONDS=1
+  ACTIVE_PROCESS_KILL_GRACE_SECONDS=1
+  active_process_file="$psi_tmp_dir/pipeline-active"
+  normal_output="$psi_tmp_dir/pipeline-output"
+  zstd_pid_file="$psi_tmp_dir/zstd-pid"
+  jq_pid_file="$psi_tmp_dir/jq-pid"
+  pipeline_bin="$psi_tmp_dir/pipeline-bin"
+  pipeline_filter="$psi_tmp_dir/pipeline-filter.jq"
+  real_jq=$(command -v jq)
+  mkdir "$pipeline_bin"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'trap "exit 143" TERM' \
+    'printf "%s\n" "$$" >"$ZSTD_PID_FILE"' \
+    'sleep "$PIPELINE_SLEEP_SECONDS"' \
+    'printf "payload\n"' >"$pipeline_bin/zstd"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'if [[ " $* " != *" -f "* ]]; then exec "$REAL_JQ" "$@"; fi' \
+    'trap "exit 143" TERM' \
+    'printf "%s\n" "$$" >"$JQ_PID_FILE"' \
+    'cat' >"$pipeline_bin/jq"
+  chmod +x "$pipeline_bin/zstd" "$pipeline_bin/jq"
+  printf '.\n' >"$pipeline_filter"
+  export ZSTD_PID_FILE="$zstd_pid_file" JQ_PID_FILE="$jq_pid_file" REAL_JQ="$real_jq"
+  export PIPELINE_SLEEP_SECONDS=2
+  mv() {
+    if [[ ${1:-} == -Tf ]]; then
+      command mv -f "$2" "$3"
+    else
+      command mv "$@"
+    fi
+  }
+  stop_fixture() { :; }
+  sleep 10 &
+  io_psi_monitor_pid=$!
+  started=$SECONDS
+  run_active_io_psi_command stop_fixture env PATH="$pipeline_bin:$PATH" \
+    bash -o pipefail -c '
+    zstd -q -d -c "$1" | jq -ec -n -f "$2"
+  ' _ segment.zst "$pipeline_filter" >"$normal_output"
+  ((SECONDS - started >= 1))
+  [[ $(<"$normal_output") == payload ]]
+  kill -TERM "$io_psi_monitor_pid" >/dev/null 2>&1 || true
+  wait "$io_psi_monitor_pid" >/dev/null 2>&1 || true
+  for pid_file in "$zstd_pid_file" "$jq_pid_file"; do
+    child_pid=$(<"$pid_file")
+    if kill -0 "$child_pid" >/dev/null 2>&1; then
+      printf 'controlled family-count pipeline left a child after normal completion\n' >&2
+      exit 1
+    fi
+  done
+
+  total_index="$psi_tmp_dir/pipeline-total-index"
+  mono_index="$psi_tmp_dir/pipeline-mono-index"
+  breach_output="$psi_tmp_dir/pipeline-breach.ndjson"
+  breach_ready="$psi_tmp_dir/pipeline-breach.ready"
+  printf '0\n' >"$total_index"
+  printf '0\n' >"$mono_index"
+  : >"$breach_output"
+  IO_PSI_WINDOW_SECONDS=1
+  IO_PSI_WINDOW_US=15000000
+  IO_PSI_SOURCE=/fixture
+  IO_PSI_FULL_DELTA_LIMIT_US=150000
+  IO_PSI_CONSECUTIVE_HIT_LIMIT=3
+  monday_io_full_psi_total_us() {
+    local index
+    index=$(<"$total_index")
+    printf '%s\n' "$((index * 150000))"
+    printf '%s\n' "$((index + 1))" >"$total_index"
+  }
+  io_psi_monotonic_us() {
+    local index
+    index=$(<"$mono_index")
+    printf '%s\n' "$((1000000 + index * 15000000))"
+    printf '%s\n' "$((index + 1))" >"$mono_index"
+  }
+  export PIPELINE_SLEEP_SECONDS=10
+  bash -c 'trap "exit 0" TERM; while :; do sleep 1; done' &
+  gate_fixture=$!
+  io_psi_runtime_monitor pipeline-breach 3 "$breach_output" \
+    "$active_process_file" "$gate_fixture" "$breach_ready" &
+  io_psi_monitor_pid=$!
+  while [[ ! -f $breach_ready ]]; do sleep 0.1; done
+  if run_active_io_psi_command stop_fixture env PATH="$pipeline_bin:$PATH" \
+    bash -o pipefail -c '
+    zstd -q -d -c "$1" | jq -ec -n -f "$2"
+  ' _ segment.zst "$pipeline_filter" >/dev/null; then
+    printf 'family-count pipeline survived a three-window PSI breach\n' >&2
+    exit 1
+  fi
+  wait "$io_psi_monitor_pid" >/dev/null 2>&1 || true
+  wait "$gate_fixture" >/dev/null 2>&1 || true
+  "$real_jq" -se 'length == 3 and .[2].consecutive_hits == 3' \
+    "$breach_output" >/dev/null
+  for pid_file in "$zstd_pid_file" "$jq_pid_file"; do
+    child_pid=$(<"$pid_file")
+    if kill -0 "$child_pid" >/dev/null 2>&1; then
+      printf 'PSI breach left a family-count pipeline child orphaned\n' >&2
+      exit 1
+    fi
+  done
+
+  rm -f "$zstd_pid_file" "$jq_pid_file"
+  external_active="$psi_tmp_dir/external-term-active"
+  (
+    active_process_file="$external_active"
+    sleep 20 &
+    io_psi_monitor_pid=$!
+    external_term_cleanup() {
+      local cleanup_status=143
+      terminate_active_process_file "$active_process_file" || cleanup_status=1
+      kill -TERM "$io_psi_monitor_pid" >/dev/null 2>&1 || true
+      wait "$io_psi_monitor_pid" >/dev/null 2>&1 || true
+      exit "$cleanup_status"
+    }
+    trap external_term_cleanup HUP INT TERM
+    run_active_io_psi_command stop_fixture env PATH="$pipeline_bin:$PATH" \
+      bash -o pipefail -c '
+      zstd -q -d -c "$1" | jq -ec -n -f "$2"
+    ' _ segment.zst "$pipeline_filter" >/dev/null
+  ) &
+  external_harness=$!
+  for _ in {1..50}; do
+    [[ -s $zstd_pid_file && -s $jq_pid_file && -s $external_active ]] && break
+    sleep 0.1
+  done
+  [[ -s $zstd_pid_file && -s $jq_pid_file && -s $external_active ]]
+  kill -TERM "$external_harness"
+  if wait "$external_harness"; then
+    printf 'external TERM fixture unexpectedly completed successfully\n' >&2
+    exit 1
+  else
+    external_status=$?
+  fi
+  [[ $external_status == 143 ]]
+  for pid_file in "$zstd_pid_file" "$jq_pid_file"; do
+    child_pid=$(<"$pid_file")
+    if kill -0 "$child_pid" >/dev/null 2>&1; then
+      printf 'external TERM left a family-count pipeline child orphaned\n' >&2
+      exit 1
+    fi
+  done
+)
+run_pipeline_group_fixture
+
+transient_body="$psi_tmp_dir/transient-cleanup"
+sed -n \
+  '/^transient_unit_is_drained()/,/^}/p;
+   /^stop_transient_unit()/,/^}/p;
+   /^run_transient_unit_command()/,/^}/p;
+   /^stop_upload_drain()/,/^}/p' "$GATE" >"$transient_body"
+run_transient_cleanup_fixture() (
+  # shellcheck disable=SC1090
+  . "$transient_body"
+  local -a transient_calls=()
+  mock_active_state=active
+  mock_tasks=true
+  stop_fails=true
+  kill_clears=true
+  mock_sub_state=exited
+  mock_exec_code=1
+  mock_exec_status=0
+  mock_result=success
+  sleep() { :; }
+  transient_control_group_has_tasks() { [[ $mock_tasks == true ]]; }
+  systemctl() {
+    transient_calls+=("$*")
+    case $1 in
+      stop)
+        [[ $stop_fails == false ]] || return 1
+        mock_active_state=inactive
+        ;;
+      show)
+        case $2 in
+          --property=ActiveState) printf '%s\n' "$mock_active_state" ;;
+          --property=ControlGroup) printf '/fixture\n' ;;
+          --property=SubState) printf '%s\n' "$mock_sub_state" ;;
+          --property=ExecMainCode) printf '%s\n' "$mock_exec_code" ;;
+          --property=ExecMainStatus) printf '%s\n' "$mock_exec_status" ;;
+          --property=Result) printf '%s\n' "$mock_result" ;;
+          *) return 1 ;;
+        esac
+        ;;
+      kill)
+        mock_active_state=inactive
+        [[ $kill_clears == false ]] || mock_tasks=false
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  stop_transient_unit fixture.service
+  [[ ${transient_calls[*]} == *'stop --no-block fixture.service'* ]]
+  [[ ${transient_calls[*]} == *'kill --kill-who=all --signal=KILL fixture.service'* ]]
+  [[ $mock_active_state == inactive && $mock_tasks == false ]]
+
+  transient_calls=()
+  mock_active_state=active
+  mock_tasks=true
+  stop_fails=false
+  kill_clears=true
+  stop_transient_unit fixture.service
+  [[ ${transient_calls[*]} == *'kill --kill-who=all --signal=KILL fixture.service'* ]]
+
+  transient_calls=()
+  mock_active_state=active
+  mock_tasks=true
+  stop_fails=true
+  kill_clears=false
+  if stop_transient_unit fixture.service 2>"$psi_tmp_dir/transient-failed"; then
+    printf 'transient cleanup accepted a non-empty cgroup after KILL\n' >&2
+    exit 1
+  fi
+  grep -Fq 'did not drain after bounded KILL' "$psi_tmp_dir/transient-failed"
+
+  upload_drain_unit=fixture.service
+  stop_transient_unit() { return 1; }
+  if stop_upload_drain; then
+    printf 'upload cleanup accepted an undrained transient unit\n' >&2
+    exit 1
+  fi
+  [[ $upload_drain_unit == fixture.service ]]
+
+  mock_active_state=active
+  mock_sub_state=exited
+  mock_exec_code=1
+  mock_exec_status=0
+  run_transient_unit_command fixture.service true
+  for invalid_code in 0 2; do
+    mock_exec_code=$invalid_code
+    if run_transient_unit_command fixture.service true; then
+      printf 'transient command accepted invalid ExecMainCode=%s\n' "$invalid_code" >&2
+      exit 1
+    fi
+  done
+  mock_exec_code=1
+  mock_exec_status=17
+  if run_transient_unit_command fixture.service true; then
+    printf 'transient command accepted non-zero ExecMainStatus\n' >&2
+    exit 1
+  fi
+  mock_exec_status=0
+  mock_result=exit-code
+  if run_transient_unit_command fixture.service true; then
+    printf 'transient command accepted a non-success Result\n' >&2
+    exit 1
+  fi
+  mock_result=success
+  mock_active_state=failed
+  if run_transient_unit_command fixture.service true; then
+    printf 'transient command accepted a failed unit state\n' >&2
+    exit 1
+  fi
+)
+run_transient_cleanup_fixture
+rm -rf "$psi_tmp_dir"
+trap - EXIT
+grep -Fq 'begin_io_psi_phase "shadow-$market"' "$GATE"
+grep -Fq 'run_io_psi_phase_command "upload-drain-$market"' "$GATE"
+grep -Fq 'run_io_psi_phase_command "strict-verifier-$strict_verifier_counter"' "$GATE"
+grep -Fq 'begin_io_psi_phase "oss-roundtrip-$market"' "$GATE"
+[[ $(monday_rust_lob_runtime_contract_sha256 "$SCRIPT_DIR") \
+  == 1a9618e19552f482d83789580bd82b0ae4a59adb875f477133230a3fd3031dcd ]]
+if grep -Eq 'polymarket|upload.*timer|timer.*upload' "$GATE"; then
+  printf 'LOB Gate unexpectedly references Polymarket or external upload timers\n' >&2
+  exit 1
+fi
+
 required_memory=11559501824
 [[ $(monday_shadow_memory_admission \
   "$required_memory" 1073741824 10485760000 0) == "$required_memory" ]] || {
@@ -424,16 +830,18 @@ if grep -Fq 'if ! required=$(monday_shadow_memory_admission' <<<"$admission_body
 fi
 grep -Fq 'assert_host_memory_reserve' "$GATE"
 grep -Fq 'admit_resource_phase "shadow-$market" 2147483648' "$GATE"
-grep -Fq 'admit_resource_phase "upload-drain-$market" "$UPLOAD_DRAIN_MEMORY_MAX_BYTES"' \
-  "$GATE"
-grep -Fq 'admit_resource_phase "strict-verifier-$strict_verifier_counter"' "$GATE"
+grep -Fq '"$UPLOAD_DRAIN_MEMORY_MAX_BYTES" stop_upload_drain' "$GATE"
+grep -Fq '"$STRICT_VERIFIER_MEMORY_MAX_BYTES" stop_strict_verifier' "$GATE"
 preflight_admission_line=$(grep -n '^admit_resource_phase resource-preflight ' "$GATE" \
+  | cut -d: -f1)
+preflight_calibration_line=$(grep -n '^begin_io_psi_phase resource-preflight$' "$GATE" \
   | cut -d: -f1)
 preflight_exit_line=$(grep -n '^  exit 0$' "$GATE" | cut -d: -f1)
 evidence_mutation_line=$(grep -n '^install -d -m 0755 /data/monday$' "$GATE" \
   | cut -d: -f1)
-[[ -n $preflight_admission_line && -n $preflight_exit_line \
+[[ -n $preflight_calibration_line && -n $preflight_admission_line && -n $preflight_exit_line \
   && -n $evidence_mutation_line \
+  && $preflight_calibration_line -lt $preflight_admission_line \
   && $preflight_admission_line -lt $preflight_exit_line \
   && $preflight_exit_line -lt $evidence_mutation_line ]] || {
   printf 'resource preflight is not complete before Gate evidence mutation\n' >&2
@@ -454,9 +862,12 @@ fi
 shadow_phase_body=$(sed -n '/^run_market_gate_phase()/,/^}/p' "$GATE")
 shadow_admission_line=$(grep -nF 'admit_resource_phase "shadow-$market"' \
   <<<"$shadow_phase_body" | cut -d: -f1)
+shadow_calibration_line=$(grep -nF 'begin_io_psi_phase "shadow-$market"' \
+  <<<"$shadow_phase_body" | cut -d: -f1)
 shadow_start_line=$(grep -nF 'systemctl start "${unit[$market]}"' \
   <<<"$shadow_phase_body" | cut -d: -f1)
-[[ -n $shadow_admission_line && -n $shadow_start_line \
+[[ -n $shadow_calibration_line && -n $shadow_admission_line && -n $shadow_start_line \
+  && $shadow_calibration_line -lt $shadow_admission_line \
   && $shadow_admission_line -lt $shadow_start_line ]] || {
   printf 'shadow phase does not refresh resource admission before start\n' >&2
   exit 1
@@ -664,6 +1075,8 @@ run_strict_verifier_fixture() (
   admit_resource_phase() {
     [[ $1 == strict-verifier-* && $2 == "$STRICT_VERIFIER_MEMORY_MAX_BYTES" ]]
   }
+  run_io_psi_phase_command() { shift 3; "$@"; }
+  run_transient_unit_command() { shift; "$@"; }
   systemd-run() {
     verifier_units+=("$*")
     while (($#)); do
@@ -678,6 +1091,7 @@ run_strict_verifier_fixture() (
   candidate_binary() {
     verifier_invocations+=("$*")
   }
+  stop_transient_unit() { :; }
   # shellcheck disable=SC1090
   . "$strict_verifier_body"
   verify_adjacent_segments \
@@ -715,6 +1129,8 @@ run_strict_verifier_fixture() (
     exit 1
   }
   for verifier_unit in "${verifier_units[@]}"; do
+    [[ $verifier_unit == *'--property=RemainAfterExit=yes'* ]] || exit 1
+    [[ $verifier_unit != *'--collect'* ]] || exit 1
     [[ $verifier_unit == *'--property=OOMScoreAdjust=500'* ]] || exit 1
     [[ $verifier_unit == *'--property=MemoryHigh=1280M'* ]] || exit 1
     [[ $verifier_unit == *'--property=MemoryMax=1536M'* ]] || exit 1
@@ -729,6 +1145,8 @@ run_strict_verifier_failure_fixture() (
   STRICT_VERIFIER_MEMORY_MAX_BYTES=1610612736
   candidate_binary=candidate_binary
   admit_resource_phase() { :; }
+  run_io_psi_phase_command() { shift 3; "$@"; }
+  run_transient_unit_command() { shift; "$@"; }
   systemd-run() {
     while (($#)); do
       if [[ $1 == -- ]]; then
@@ -745,6 +1163,7 @@ run_strict_verifier_failure_fixture() (
     stopped_units+=("$2")
   }
   candidate_binary() { :; }
+  stop_transient_unit() { stopped_units+=("$1"); }
   # shellcheck disable=SC1090
   . "$strict_verifier_body"
   if run_strict_verifier_pair \
@@ -787,13 +1206,18 @@ run_upload_drain_fixture() (
   admit_resource_phase() {
     [[ $1 == upload-drain-spot && $2 == "$UPLOAD_DRAIN_MEMORY_MAX_BYTES" ]]
   }
+  run_io_psi_phase_command() { shift 3; "$@"; }
+  run_transient_unit_command() { shift; "$@"; }
   systemd-run() { invocations+=("$*"); }
+  stop_transient_unit() { :; }
   assert_spool_drained() { [[ $1 == spot ]]; }
   # shellcheck disable=SC1090
   . "$upload_drain_body"
   run_candidate_drain spot
   [[ ${#invocations[@]} -eq 1 ]] || exit 1
   [[ ${invocations[0]} == *'--property=CPUQuota=80%'* ]] || exit 1
+  [[ ${invocations[0]} == *'--property=RemainAfterExit=yes'* ]] || exit 1
+  [[ ${invocations[0]} != *'--collect'* ]] || exit 1
   [[ ${invocations[0]} == *'--property=MemoryHigh=384M'* ]] || exit 1
   [[ ${invocations[0]} == *'--property=MemoryMax=512M'* ]] || exit 1
   [[ ${invocations[0]} == *'/candidate/binance-lob-archiver --upload-only'* ]] || exit 1
@@ -974,6 +1398,18 @@ usdm_market=$(jq -c --arg symbols_config "$usdm_symbols_config" \
       | .agg_trade_count = 0 | .raw_trade_count = 0
       | .book_ticker_count = 0 | .force_order_count = 0)' \
   <<<"$market_json")
+psi_windows=$(jq -cn '
+  ["resource-preflight","shadow-spot","upload-drain-spot","shadow-usdm",
+    "upload-drain-usdm","oss-roundtrip-spot","strict-verifier-1",
+    "oss-roundtrip-usdm"] as $phases
+  | [$phases | to_entries[] as $entry
+    | range(0; (if $entry.value == "resource-preflight" then 3 else 4 end)) as $index
+    | {phase:$entry.value,phase_run:($entry.key + 1),
+       stage:(if $index < 3 then "calibration" else "runtime" end),
+       started_at:"2026-08-28T00:00:00Z",
+       finished_at:"2026-08-28T00:00:15Z",
+       previous_total_us:0,current_total_us:0,
+       delta_us:0,window_us:15000000,ratio:0,hit:false,consecutive_hits:0}]')
 jq -n \
   --arg artifact "$artifact" \
   --arg runtime_contract "$runtime_contract" \
@@ -983,12 +1419,14 @@ jq -n \
   --arg run_spool "$run_spool" \
   --argjson market "$market_json" \
   --argjson usdm_market "$usdm_market" \
+  --argjson psi_windows "$psi_windows" \
   '{schema:"monday.rust_lob_shadow_gate.v4",candidate_sha256:$artifact,
     runtime_contract_sha256:$runtime_contract,
     deployment_bundle_sha256:$bundle,deployment_source_revision:$source,
     run_id:$run_id,run_spool:$run_spool,
     required_duration_seconds:240,requested_duration_seconds:240,
     health_settle_seconds:240,segment_seconds:120,test_only:false,
+    io_full_psi_windows:$psi_windows,
     observation_started_ns:150,
     passed:true,production_eligible:true,checks_passed:true,duration_seconds:240,
     markets:{spot:$market,usdm:$usdm_market}}' \
@@ -1000,6 +1438,39 @@ jq -e \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/gate.json" >/dev/null
+
+jq 'del(.io_full_psi_windows)' "$tmp_dir/gate.json" \
+  >"$tmp_dir/missing-psi.json"
+if jq -e --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
+  -f "$POLICY" "$tmp_dir/missing-psi.json" >/dev/null; then
+  printf 'gate policy accepted missing I/O PSI evidence\n' >&2
+  exit 1
+fi
+jq '.io_full_psi_windows[0:3] |=
+  (.[0] += {current_total_us:150000,delta_us:150000,ratio:0.01,hit:true,consecutive_hits:1}
+  | .[1] += {previous_total_us:150000,current_total_us:300000,delta_us:150000,
+      ratio:0.01,hit:true,consecutive_hits:2}
+  | .[2] += {previous_total_us:300000,current_total_us:450000,delta_us:150000,
+      ratio:0.01,hit:true,consecutive_hits:3})' "$tmp_dir/gate.json" \
+  >"$tmp_dir/three-psi-hits.json"
+if jq -e --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
+  -f "$POLICY" "$tmp_dir/three-psi-hits.json" >/dev/null; then
+  printf 'gate policy accepted three consecutive I/O PSI hits\n' >&2
+  exit 1
+fi
+
+jq '.io_full_psi_windows[0:3] |= map(
+  .current_total_us = 150000 | .delta_us = 150000 | .ratio = 0.01
+  | .hit = true | .consecutive_hits = 0)' "$tmp_dir/gate.json" \
+  >"$tmp_dir/tampered-psi-transition.json"
+if jq -e --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
+  -f "$POLICY" "$tmp_dir/tampered-psi-transition.json" >/dev/null; then
+  printf 'gate policy accepted tampered I/O PSI consecutive-hit state\n' >&2
+  exit 1
+fi
 
 jq 'del(.observation_started_ns)' \
   "$tmp_dir/gate.json" >"$tmp_dir/missing-observation-boundary.json"
@@ -3498,6 +3969,19 @@ preflight_payload=$(jq -cn \
       production_memory_growth_margin_bytes:268435456,
       production_memory_growth_headroom_bytes:805306368,
       required_bytes:4026531840},
+    io_full_psi_windows:[
+      {phase:"resource-preflight",phase_run:1,stage:"calibration",
+       started_at:"2026-08-28T00:00:00Z",
+       finished_at:"2026-08-28T00:00:15Z",previous_total_us:0,current_total_us:0,
+       delta_us:0,window_us:15000000,ratio:0,hit:false,consecutive_hits:0},
+      {phase:"resource-preflight",phase_run:1,stage:"calibration",
+       started_at:"2026-08-28T00:00:15Z",
+       finished_at:"2026-08-28T00:00:30Z",previous_total_us:0,current_total_us:0,
+       delta_us:0,window_us:15000000,ratio:0,hit:false,consecutive_hits:0},
+      {phase:"resource-preflight",phase_run:1,stage:"calibration",
+       started_at:"2026-08-28T00:00:30Z",
+       finished_at:"2026-08-28T00:00:45Z",previous_total_us:0,current_total_us:0,
+       delta_us:0,window_us:15000000,ratio:0,hit:false,consecutive_hits:0}],
     passed:true}')
 preflight_output_b64=$(printf '%s\n' "$preflight_payload" | base64 | tr -d '\n')
 env "${common_env[@]}" \
@@ -3512,6 +3996,23 @@ base64 --decode <"$mock_state/last-command-content" >"$tmp_dir/gate-preflight-co
 grep -Fq -- '--resource-preflight' "$tmp_dir/gate-preflight-command.sh"
 grep -Fq 'gate-preflight completed successfully: mock-invoke' \
   "$tmp_dir/gate-preflight.err"
+tampered_preflight_payload=$(jq '
+  .io_full_psi_windows[0] += {current_total_us:150000,delta_us:150000,
+    ratio:0.01,hit:true,consecutive_hits:0}
+  | .io_full_psi_windows[1] += {previous_total_us:150000,current_total_us:300000,
+    delta_us:150000,ratio:0.01,hit:true,consecutive_hits:0}
+  | .io_full_psi_windows[2] += {previous_total_us:300000,current_total_us:450000,
+    delta_us:150000,ratio:0.01,hit:true,consecutive_hits:0}' <<<"$preflight_payload")
+tampered_preflight_output_b64=$(printf '%s\n' "$tampered_preflight_payload" \
+  | base64 | tr -d '\n')
+if env "${common_env[@]}" ACTION=gate-preflight MOCK_STATUS=Success MOCK_EXIT_CODE=0 \
+  MOCK_OUTPUT_B64="$tampered_preflight_output_b64" \
+  "$INVOKE" >"$tmp_dir/tampered-gate-preflight.out" 2>&1; then
+  printf 'operation wrapper accepted tampered I/O PSI hit counters\n' >&2
+  exit 1
+fi
+grep -Fq 'gate-preflight returned invalid JSON evidence' \
+  "$tmp_dir/tampered-gate-preflight.out"
 invalid_preflight_output_b64=$(printf '{}\n' | base64 | tr -d '\n')
 if env "${common_env[@]}" \
   ACTION=gate-preflight \

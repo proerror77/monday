@@ -227,6 +227,49 @@ for _ in $(seq 1 "$polls"); do
                 + .resource_preflight.production_memory_growth_headroom_bytes)
             and .resource_preflight.host_memory_available_bytes
               >= .resource_preflight.required_bytes
+            and (.io_full_psi_windows | type) == "array"
+            and (.io_full_psi_windows | length) == 3
+            and all(.io_full_psi_windows[];
+              .phase == "resource-preflight"
+              and .phase_run == 1
+              and .stage == "calibration"
+              and (.started_at | type) == "string"
+              and (.started_at
+                | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+              and (.finished_at | type) == "string"
+              and (.finished_at
+                | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+              and .finished_at >= .started_at
+              and (.previous_total_us | type) == "number"
+              and .previous_total_us == (.previous_total_us | floor)
+              and .previous_total_us >= 0
+              and (.current_total_us | type) == "number"
+              and .current_total_us == (.current_total_us | floor)
+              and .current_total_us >= .previous_total_us
+              and .delta_us == (.current_total_us - .previous_total_us)
+              and (.window_us | type) == "number"
+              and .window_us == (.window_us | floor) and .window_us > 0
+              and (.ratio | type) == "number" and .ratio >= 0
+              and (((.ratio - (.delta_us / .window_us)) as $difference
+                | (if $difference < 0 then -$difference else $difference end))
+                  <= 0.000000001)
+              and .hit == ((.delta_us / .window_us) >= (150000 / 15000000))
+              and (.consecutive_hits | type) == "number"
+              and .consecutive_hits == (.consecutive_hits | floor)
+              and .consecutive_hits >= 0 and .consecutive_hits < 3)
+            and (.io_full_psi_windows as $psi
+              | reduce range(0; 3) as $index
+                ({hits:0,current:null,valid:true};
+                  ($psi[$index]) as $window
+                  | (if $window.hit then (.hits + 1) else 0 end) as $expected_hits
+                  | .valid = (.valid
+                      and $window.consecutive_hits == $expected_hits
+                      and (if $index > 0 then
+                        $window.previous_total_us == .current
+                      else true end))
+                  | .hits = $expected_hits
+                  | .current = $window.current_total_us)
+              | .valid)
             and .passed == true' <<<"$decoded_output" >/dev/null || {
           printf 'gate-preflight returned invalid JSON evidence\n' >&2
           exit 1
