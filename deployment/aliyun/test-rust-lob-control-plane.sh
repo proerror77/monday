@@ -81,6 +81,7 @@ rm -f "$psi_fixture"
 monitor_body="$psi_tmp_dir/monitor"
 sed -n '/^terminate_active_process_file()/,/^}/p' "$GATE" >"$monitor_body"
 sed -n '/^io_psi_runtime_monitor()/,/^}/p' "$GATE" >>"$monitor_body"
+sed -n '/^run_active_io_psi_command()/,/^}/p' "$GATE" >>"$monitor_body"
 run_psi_kill_fixture() (
   # shellcheck disable=SC1090
   . "$monitor_body"
@@ -165,6 +166,242 @@ run_psi_kill_fixture() (
   wait "$background_child" >/dev/null 2>&1 || true
 )
 run_psi_kill_fixture
+
+run_pipeline_group_fixture() (
+  # shellcheck disable=SC1090
+  . "$monitor_body"
+  ACTIVE_PROCESS_TERM_GRACE_SECONDS=1
+  ACTIVE_PROCESS_KILL_GRACE_SECONDS=1
+  active_process_file="$psi_tmp_dir/pipeline-active"
+  normal_output="$psi_tmp_dir/pipeline-output"
+  zstd_pid_file="$psi_tmp_dir/zstd-pid"
+  jq_pid_file="$psi_tmp_dir/jq-pid"
+  pipeline_bin="$psi_tmp_dir/pipeline-bin"
+  pipeline_filter="$psi_tmp_dir/pipeline-filter.jq"
+  real_jq=$(command -v jq)
+  mkdir "$pipeline_bin"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'trap "exit 143" TERM' \
+    'printf "%s\n" "$$" >"$ZSTD_PID_FILE"' \
+    'sleep "$PIPELINE_SLEEP_SECONDS"' \
+    'printf "payload\n"' >"$pipeline_bin/zstd"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'if [[ " $* " != *" -f "* ]]; then exec "$REAL_JQ" "$@"; fi' \
+    'trap "exit 143" TERM' \
+    'printf "%s\n" "$$" >"$JQ_PID_FILE"' \
+    'cat' >"$pipeline_bin/jq"
+  chmod +x "$pipeline_bin/zstd" "$pipeline_bin/jq"
+  printf '.\n' >"$pipeline_filter"
+  export ZSTD_PID_FILE="$zstd_pid_file" JQ_PID_FILE="$jq_pid_file" REAL_JQ="$real_jq"
+  export PIPELINE_SLEEP_SECONDS=2
+  mv() {
+    if [[ ${1:-} == -Tf ]]; then
+      command mv -f "$2" "$3"
+    else
+      command mv "$@"
+    fi
+  }
+  stop_fixture() { :; }
+  sleep 10 &
+  io_psi_monitor_pid=$!
+  started=$SECONDS
+  run_active_io_psi_command stop_fixture env PATH="$pipeline_bin:$PATH" \
+    bash -o pipefail -c '
+    zstd -q -d -c "$1" | jq -ec -n -f "$2"
+  ' _ segment.zst "$pipeline_filter" >"$normal_output"
+  ((SECONDS - started >= 1))
+  [[ $(<"$normal_output") == payload ]]
+  kill -TERM "$io_psi_monitor_pid" >/dev/null 2>&1 || true
+  wait "$io_psi_monitor_pid" >/dev/null 2>&1 || true
+  for pid_file in "$zstd_pid_file" "$jq_pid_file"; do
+    child_pid=$(<"$pid_file")
+    if kill -0 "$child_pid" >/dev/null 2>&1; then
+      printf 'controlled family-count pipeline left a child after normal completion\n' >&2
+      exit 1
+    fi
+  done
+
+  total_index="$psi_tmp_dir/pipeline-total-index"
+  mono_index="$psi_tmp_dir/pipeline-mono-index"
+  breach_output="$psi_tmp_dir/pipeline-breach.ndjson"
+  breach_ready="$psi_tmp_dir/pipeline-breach.ready"
+  printf '0\n' >"$total_index"
+  printf '0\n' >"$mono_index"
+  : >"$breach_output"
+  IO_PSI_WINDOW_SECONDS=1
+  IO_PSI_WINDOW_US=15000000
+  IO_PSI_SOURCE=/fixture
+  IO_PSI_FULL_DELTA_LIMIT_US=150000
+  IO_PSI_CONSECUTIVE_HIT_LIMIT=3
+  monday_io_full_psi_total_us() {
+    local index
+    index=$(<"$total_index")
+    printf '%s\n' "$((index * 150000))"
+    printf '%s\n' "$((index + 1))" >"$total_index"
+  }
+  io_psi_monotonic_us() {
+    local index
+    index=$(<"$mono_index")
+    printf '%s\n' "$((1000000 + index * 15000000))"
+    printf '%s\n' "$((index + 1))" >"$mono_index"
+  }
+  export PIPELINE_SLEEP_SECONDS=10
+  bash -c 'trap "exit 0" TERM; while :; do sleep 1; done' &
+  gate_fixture=$!
+  io_psi_runtime_monitor pipeline-breach 3 "$breach_output" \
+    "$active_process_file" "$gate_fixture" "$breach_ready" &
+  io_psi_monitor_pid=$!
+  while [[ ! -f $breach_ready ]]; do sleep 0.1; done
+  if run_active_io_psi_command stop_fixture env PATH="$pipeline_bin:$PATH" \
+    bash -o pipefail -c '
+    zstd -q -d -c "$1" | jq -ec -n -f "$2"
+  ' _ segment.zst "$pipeline_filter" >/dev/null; then
+    printf 'family-count pipeline survived a three-window PSI breach\n' >&2
+    exit 1
+  fi
+  wait "$io_psi_monitor_pid" >/dev/null 2>&1 || true
+  wait "$gate_fixture" >/dev/null 2>&1 || true
+  "$real_jq" -se 'length == 3 and .[2].consecutive_hits == 3' \
+    "$breach_output" >/dev/null
+  for pid_file in "$zstd_pid_file" "$jq_pid_file"; do
+    child_pid=$(<"$pid_file")
+    if kill -0 "$child_pid" >/dev/null 2>&1; then
+      printf 'PSI breach left a family-count pipeline child orphaned\n' >&2
+      exit 1
+    fi
+  done
+
+  rm -f "$zstd_pid_file" "$jq_pid_file"
+  external_active="$psi_tmp_dir/external-term-active"
+  (
+    active_process_file="$external_active"
+    sleep 20 &
+    io_psi_monitor_pid=$!
+    external_term_cleanup() {
+      local cleanup_status=143
+      terminate_active_process_file "$active_process_file" || cleanup_status=1
+      kill -TERM "$io_psi_monitor_pid" >/dev/null 2>&1 || true
+      wait "$io_psi_monitor_pid" >/dev/null 2>&1 || true
+      exit "$cleanup_status"
+    }
+    trap external_term_cleanup HUP INT TERM
+    run_active_io_psi_command stop_fixture env PATH="$pipeline_bin:$PATH" \
+      bash -o pipefail -c '
+      zstd -q -d -c "$1" | jq -ec -n -f "$2"
+    ' _ segment.zst "$pipeline_filter" >/dev/null
+  ) &
+  external_harness=$!
+  for _ in {1..50}; do
+    [[ -s $zstd_pid_file && -s $jq_pid_file && -s $external_active ]] && break
+    sleep 0.1
+  done
+  [[ -s $zstd_pid_file && -s $jq_pid_file && -s $external_active ]]
+  kill -TERM "$external_harness"
+  if wait "$external_harness"; then
+    printf 'external TERM fixture unexpectedly completed successfully\n' >&2
+    exit 1
+  else
+    external_status=$?
+  fi
+  [[ $external_status == 143 ]]
+  for pid_file in "$zstd_pid_file" "$jq_pid_file"; do
+    child_pid=$(<"$pid_file")
+    if kill -0 "$child_pid" >/dev/null 2>&1; then
+      printf 'external TERM left a family-count pipeline child orphaned\n' >&2
+      exit 1
+    fi
+  done
+)
+run_pipeline_group_fixture
+
+transient_body="$psi_tmp_dir/transient-cleanup"
+sed -n \
+  '/^transient_unit_is_drained()/,/^}/p;
+   /^stop_transient_unit()/,/^}/p;
+   /^run_transient_unit_command()/,/^}/p;
+   /^stop_upload_drain()/,/^}/p' "$GATE" >"$transient_body"
+run_transient_cleanup_fixture() (
+  # shellcheck disable=SC1090
+  . "$transient_body"
+  local -a transient_calls=()
+  mock_active_state=active
+  mock_tasks=true
+  stop_fails=true
+  kill_clears=true
+  mock_sub_state=exited
+  mock_exec_code=exited
+  mock_exec_status=0
+  mock_result=success
+  sleep() { :; }
+  transient_control_group_has_tasks() { [[ $mock_tasks == true ]]; }
+  systemctl() {
+    transient_calls+=("$*")
+    case $1 in
+      stop)
+        [[ $stop_fails == false ]] || return 1
+        mock_active_state=inactive
+        ;;
+      show)
+        case $2 in
+          --property=ActiveState) printf '%s\n' "$mock_active_state" ;;
+          --property=ControlGroup) printf '/fixture\n' ;;
+          --property=SubState) printf '%s\n' "$mock_sub_state" ;;
+          --property=ExecMainCode) printf '%s\n' "$mock_exec_code" ;;
+          --property=ExecMainStatus) printf '%s\n' "$mock_exec_status" ;;
+          --property=Result) printf '%s\n' "$mock_result" ;;
+          *) return 1 ;;
+        esac
+        ;;
+      kill)
+        mock_active_state=inactive
+        [[ $kill_clears == false ]] || mock_tasks=false
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  stop_transient_unit fixture.service
+  [[ ${transient_calls[*]} == *'stop --no-block fixture.service'* ]]
+  [[ ${transient_calls[*]} == *'kill --kill-who=all --signal=KILL fixture.service'* ]]
+  [[ $mock_active_state == inactive && $mock_tasks == false ]]
+
+  transient_calls=()
+  mock_active_state=active
+  mock_tasks=true
+  stop_fails=false
+  kill_clears=true
+  stop_transient_unit fixture.service
+  [[ ${transient_calls[*]} == *'kill --kill-who=all --signal=KILL fixture.service'* ]]
+
+  transient_calls=()
+  mock_active_state=active
+  mock_tasks=true
+  stop_fails=true
+  kill_clears=false
+  if stop_transient_unit fixture.service 2>"$psi_tmp_dir/transient-failed"; then
+    printf 'transient cleanup accepted a non-empty cgroup after KILL\n' >&2
+    exit 1
+  fi
+  grep -Fq 'did not drain after bounded KILL' "$psi_tmp_dir/transient-failed"
+
+  upload_drain_unit=fixture.service
+  stop_transient_unit() { return 1; }
+  if stop_upload_drain; then
+    printf 'upload cleanup accepted an undrained transient unit\n' >&2
+    exit 1
+  fi
+  [[ $upload_drain_unit == fixture.service ]]
+
+  mock_active_state=active
+  mock_sub_state=exited
+  mock_exec_status=0
+  run_transient_unit_command fixture.service true
+  mock_active_state=failed
+  if run_transient_unit_command fixture.service true; then
+    printf 'transient command accepted a failed unit state\n' >&2
+    exit 1
+  fi
+)
+run_transient_cleanup_fixture
 rm -rf "$psi_tmp_dir"
 trap - EXIT
 grep -Fq 'begin_io_psi_phase "shadow-$market"' "$GATE"
@@ -818,6 +1055,7 @@ run_strict_verifier_fixture() (
     [[ $1 == strict-verifier-* && $2 == "$STRICT_VERIFIER_MEMORY_MAX_BYTES" ]]
   }
   run_io_psi_phase_command() { shift 3; "$@"; }
+  run_transient_unit_command() { shift; "$@"; }
   systemd-run() {
     verifier_units+=("$*")
     while (($#)); do
@@ -832,6 +1070,7 @@ run_strict_verifier_fixture() (
   candidate_binary() {
     verifier_invocations+=("$*")
   }
+  stop_transient_unit() { :; }
   # shellcheck disable=SC1090
   . "$strict_verifier_body"
   verify_adjacent_segments \
@@ -869,6 +1108,8 @@ run_strict_verifier_fixture() (
     exit 1
   }
   for verifier_unit in "${verifier_units[@]}"; do
+    [[ $verifier_unit == *'--property=RemainAfterExit=yes'* ]] || exit 1
+    [[ $verifier_unit != *'--collect'* ]] || exit 1
     [[ $verifier_unit == *'--property=OOMScoreAdjust=500'* ]] || exit 1
     [[ $verifier_unit == *'--property=MemoryHigh=1280M'* ]] || exit 1
     [[ $verifier_unit == *'--property=MemoryMax=1536M'* ]] || exit 1
@@ -884,6 +1125,7 @@ run_strict_verifier_failure_fixture() (
   candidate_binary=candidate_binary
   admit_resource_phase() { :; }
   run_io_psi_phase_command() { shift 3; "$@"; }
+  run_transient_unit_command() { shift; "$@"; }
   systemd-run() {
     while (($#)); do
       if [[ $1 == -- ]]; then
@@ -900,6 +1142,7 @@ run_strict_verifier_failure_fixture() (
     stopped_units+=("$2")
   }
   candidate_binary() { :; }
+  stop_transient_unit() { stopped_units+=("$1"); }
   # shellcheck disable=SC1090
   . "$strict_verifier_body"
   if run_strict_verifier_pair \
@@ -943,13 +1186,17 @@ run_upload_drain_fixture() (
     [[ $1 == upload-drain-spot && $2 == "$UPLOAD_DRAIN_MEMORY_MAX_BYTES" ]]
   }
   run_io_psi_phase_command() { shift 3; "$@"; }
+  run_transient_unit_command() { shift; "$@"; }
   systemd-run() { invocations+=("$*"); }
+  stop_transient_unit() { :; }
   assert_spool_drained() { [[ $1 == spot ]]; }
   # shellcheck disable=SC1090
   . "$upload_drain_body"
   run_candidate_drain spot
   [[ ${#invocations[@]} -eq 1 ]] || exit 1
   [[ ${invocations[0]} == *'--property=CPUQuota=80%'* ]] || exit 1
+  [[ ${invocations[0]} == *'--property=RemainAfterExit=yes'* ]] || exit 1
+  [[ ${invocations[0]} != *'--collect'* ]] || exit 1
   [[ ${invocations[0]} == *'--property=MemoryHigh=384M'* ]] || exit 1
   [[ ${invocations[0]} == *'--property=MemoryMax=512M'* ]] || exit 1
   [[ ${invocations[0]} == *'/candidate/binance-lob-archiver --upload-only'* ]] || exit 1

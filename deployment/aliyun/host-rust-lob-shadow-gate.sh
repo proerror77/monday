@@ -89,7 +89,7 @@ case $# in
     ;;
 esac
 
-for command in aliyun awk chmod chown cmp date dirname find flock grep id install jq mkdir mktemp \
+for command in aliyun awk bash chmod chown cmp date dirname find flock grep id install jq mkdir mktemp \
   mountpoint mv readlink rm runuser sed sha256sum sleep sort stat systemctl systemd-run tr wc zstd; do
   command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
 done
@@ -688,15 +688,85 @@ io_psi_monitor_file=
 active_process_pid=
 active_process_pgid=
 active_process_file="$tmp_dir/active-process"
+transient_control_group_has_tasks() {
+  local control_group=$1 tasks_file task
+  [[ -z $control_group ]] && return 1
+  [[ $control_group == /* && $control_group != */../* ]] || return 2
+  tasks_file="/sys/fs/cgroup${control_group}/cgroup.procs"
+  [[ -f $tasks_file && ! -L $tasks_file ]] || return 2
+  if IFS= read -r task <"$tasks_file"; then
+    [[ $task =~ ^[1-9][0-9]*$ ]] || return 2
+    return 0
+  fi
+  return 1
+}
+transient_unit_is_drained() {
+  local transient_unit=$1 active_state control_group task_status
+  active_state=$(systemctl show --property=ActiveState --value "$transient_unit" \
+    2>/dev/null) || return 1
+  control_group=$(systemctl show --property=ControlGroup --value "$transient_unit" \
+    2>/dev/null) || return 1
+  [[ $active_state == inactive ]] || return 1
+  if transient_control_group_has_tasks "$control_group"; then
+    return 1
+  else
+    task_status=$?
+  fi
+  [[ $task_status == 1 ]]
+}
+stop_transient_unit() {
+  local transient_unit=$1 stop_failed=false second
+  if ! systemctl stop --no-block "$transient_unit" >/dev/null 2>&1; then
+    stop_failed=true
+  fi
+  if [[ $stop_failed == false ]]; then
+    for second in {1..5}; do
+      transient_unit_is_drained "$transient_unit" && return 0
+      sleep 1
+    done
+  fi
+  systemctl kill --kill-who=all --signal=KILL "$transient_unit" \
+    >/dev/null 2>&1 || true
+  for second in {1..5}; do
+    transient_unit_is_drained "$transient_unit" && return 0
+    sleep 1
+  done
+  printf 'shadow gate failed: transient unit did not drain after bounded KILL: %s\n' \
+    "$transient_unit" >&2
+  return 1
+}
+run_transient_unit_command() {
+  local transient_unit=$1 active_state sub_state exec_code exec_status result
+  shift
+  "$@" || return $?
+  while :; do
+    active_state=$(systemctl show --property=ActiveState --value "$transient_unit" \
+      2>/dev/null) || return 1
+    sub_state=$(systemctl show --property=SubState --value "$transient_unit" \
+      2>/dev/null) || return 1
+    if [[ $active_state == active && $sub_state == exited ]]; then
+      exec_code=$(systemctl show --property=ExecMainCode --value "$transient_unit" \
+        2>/dev/null) || return 1
+      exec_status=$(systemctl show --property=ExecMainStatus --value "$transient_unit" \
+        2>/dev/null) || return 1
+      result=$(systemctl show --property=Result --value "$transient_unit" \
+        2>/dev/null) || return 1
+      [[ $exec_code == exited && $exec_status == 0 && $result == success ]]
+      return
+    fi
+    [[ $active_state == active || $active_state == activating ]] || return 1
+    sleep 1
+  done
+}
 stop_strict_verifier() {
   if [[ -n $strict_verifier_unit ]]; then
-    systemctl stop "$strict_verifier_unit" >/dev/null 2>&1 || true
+    stop_transient_unit "$strict_verifier_unit" || return 1
     strict_verifier_unit=
   fi
 }
 stop_upload_drain() {
   if [[ -n $upload_drain_unit ]]; then
-    systemctl stop "$upload_drain_unit" >/dev/null 2>&1 || true
+    stop_transient_unit "$upload_drain_unit" || return 1
     upload_drain_unit=
   fi
 }
@@ -842,7 +912,7 @@ assert_io_psi_runtime_monitor() {
 }
 
 run_active_io_psi_command() {
-  local stop_callback=$1 child status monitor_interrupted=false
+  local stop_callback=$1 child status monitor_interrupted=false callback_failed=false
   shift
   set -m
   "$@" &
@@ -858,7 +928,7 @@ run_active_io_psi_command() {
       && ! jobs -pr | grep -Fxq "$io_psi_monitor_pid"; then
       monitor_interrupted=true
       terminate_active_process_file "$active_process_file" || true
-      "$stop_callback"
+      "$stop_callback" || callback_failed=true
       break
     fi
     sleep 1
@@ -867,11 +937,14 @@ run_active_io_psi_command() {
     status=0
   else
     status=$?
-    [[ $monitor_interrupted == true ]] || "$stop_callback"
+    if [[ $monitor_interrupted != true ]]; then
+      "$stop_callback" || callback_failed=true
+    fi
   fi
   rm -f -- "$active_process_file"
   active_process_pid=
   active_process_pgid=
+  [[ $callback_failed == false ]] || return 77
   [[ $monitor_interrupted == false ]] || return 76
   return "$status"
 }
@@ -887,11 +960,12 @@ run_io_psi_phase_command() {
   return "$status"
 }
 cleanup() {
-  local status=$?
-  terminate_active_process_file "$active_process_file" >/dev/null 2>&1 || true
-  finish_io_psi_runtime_monitor >/dev/null 2>&1 || true
-  stop_strict_verifier
-  stop_upload_drain
+  local status=$? cleanup_failed=false
+  terminate_active_process_file "$active_process_file" >/dev/null 2>&1 \
+    || cleanup_failed=true
+  finish_io_psi_runtime_monitor >/dev/null 2>&1 || cleanup_failed=true
+  stop_strict_verifier || cleanup_failed=true
+  stop_upload_drain || cleanup_failed=true
   write_run_json >/dev/null 2>&1 || true
   if [[ $gate_finished != true ]]; then
     systemctl stop "${unit[spot]}" "${unit[usdm]}" >/dev/null 2>&1 || true
@@ -901,6 +975,10 @@ cleanup() {
   done
   rm -rf "$tmp_dir"
   rm -f "$run_json_tmp" "$gate_tmp" "$marker_tmp"
+  if [[ $cleanup_failed == true ]]; then
+    printf 'shadow gate failed: bounded process or transient-unit cleanup was incomplete\n' >&2
+    ((status != 0)) || status=1
+  fi
   exit "$status"
 }
 trap 'exit 143' HUP INT TERM
@@ -932,8 +1010,9 @@ run_candidate_drain() {
   upload_drain_unit="monday-rust-upload-drain-$$-${market}-${upload_drain_counter}.service"
   if run_io_psi_phase_command "upload-drain-$market" \
     "$UPLOAD_DRAIN_MEMORY_MAX_BYTES" stop_upload_drain \
-    systemd-run --quiet --wait --collect \
+    run_transient_unit_command "$upload_drain_unit" systemd-run --quiet \
     --unit="$upload_drain_unit" \
+    --property=RemainAfterExit=yes \
     --property=KillMode=control-group \
     --property=OOMScoreAdjust=500 \
     --property=CPUQuota=80% \
@@ -950,10 +1029,10 @@ run_candidate_drain() {
       ALIYUN_PROFILE="${aliyun_profile[$market]}" \
       OSS_COPY_TIMEOUT_SECONDS="${oss_copy_timeout[$market]}" \
       "$candidate_binary" --upload-only; then
-    upload_drain_unit=
+    stop_upload_drain || return 1
   else
     status=$?
-    stop_upload_drain
+    stop_upload_drain || return 1
     return "$status"
   fi
   assert_spool_drained "$market"
@@ -970,19 +1049,19 @@ run_strict_verifier() {
   strict_verifier_unit="monday-rust-strict-verifier-$$-${strict_verifier_counter}.service"
   if run_io_psi_phase_command "strict-verifier-$strict_verifier_counter" \
     "$STRICT_VERIFIER_MEMORY_MAX_BYTES" stop_strict_verifier \
-    systemd-run --quiet --wait --collect \
+    run_transient_unit_command "$strict_verifier_unit" systemd-run --quiet \
     --unit="$strict_verifier_unit" \
+    --property=RemainAfterExit=yes \
     --property=KillMode=control-group \
     --property=OOMScoreAdjust=500 \
     --property=MemoryHigh=1280M \
     --property=MemoryMax=1536M \
     -- "$candidate_binary" "$@" >/dev/null; then
-    verifier_status=0
+    stop_strict_verifier || verifier_status=1
   else
     verifier_status=$?
-    stop_strict_verifier
+    stop_strict_verifier || verifier_status=1
   fi
-  strict_verifier_unit=
   if [[ $outer_monitor == true ]]; then
     begin_io_psi_phase "$outer_phase"
     start_io_psi_runtime_monitor
@@ -1473,7 +1552,8 @@ verify_oss_round_trips() {
   local segment_dir manifest_path manifest_digest actual_manifest_digest
   local actual_digest bytes agg_trade_count manifest_agg_trade_count gap_ns digest_output
   local tape_schema='' candidate_schema stream_type_count
-  local family_counts raw_trade_count book_ticker_count force_order_count
+  local family_counts family_counts_path family_counts_filter_path
+  local raw_trade_count book_ticker_count force_order_count
   local manifest_symbol_count manifest_raw_trade_count manifest_book_ticker_count
   local manifest_force_order_count
   local previous_end_ns=0
@@ -1679,13 +1759,10 @@ verify_oss_round_trips() {
     printf '%s\n' "$digest" | cmp -s - "$success_path" \
       || die "$market OSS success marker does not match segment SHA-256: $success_uri"
     manifest_symbol_count=$(jq -er '.symbols | length' "$manifest")
-    family_counts=$(run_active_io_psi_command : zstd -q -d -c "$zst_path" | jq -ec -n \
-      --arg schema "$tape_schema" \
-      --arg market "$market" \
-      --argjson symbol_count "$manifest_symbol_count" \
-      --argjson stream_type_count "$stream_type_count" \
-      --argjson expected_stream_types "${expected_stream_types[$market]}" \
-      '
+    family_counts_path="$segment_dir/family-counts.json"
+    family_counts_filter_path="$segment_dir/family-counts.jq"
+    # shellcheck disable=SC2016
+    printf '%s\n' '
       def valid_agg_trade:
         (.received_at_ns | type) == "number"
         and .received_at_ns >= 0
@@ -1793,8 +1870,22 @@ verify_oss_round_trips() {
         elif $market == "spot" and $schema == "binance.market_tape.v1"
           and (.raw_trade > 0 or .book_ticker > 0 or .force_order > 0)
           then error("v1 tape carries v2 stream families")
-        else {agg_trade,raw_trade,book_ticker,force_order} end') \
-      || die "$market segment has missing or malformed stream-family events: $zst_uri"
+        else {agg_trade,raw_trade,book_ticker,force_order} end' \
+      >"$family_counts_filter_path"
+    # The external bash is the registered process-group leader; with job control
+    # disabled inside it, both zstd and jq inherit that same group.
+    # shellcheck disable=SC2016
+    if ! run_active_io_psi_command : bash -o pipefail -c '
+      zstd -q -d -c "$1" | jq -ec -n \
+        --arg schema "$2" --arg market "$3" \
+        --argjson symbol_count "$4" --argjson stream_type_count "$5" \
+        --argjson expected_stream_types "$6" -f "$7"
+    ' _ "$zst_path" "$tape_schema" "$market" "$manifest_symbol_count" \
+      "$stream_type_count" "${expected_stream_types[$market]}" \
+      "$family_counts_filter_path" >"$family_counts_path"; then
+      die "$market segment has missing or malformed stream-family events: $zst_uri"
+    fi
+    family_counts=$(<"$family_counts_path")
     agg_trade_count=$(jq -er '.agg_trade' <<<"$family_counts")
     raw_trade_count=$(jq -er '.raw_trade' <<<"$family_counts")
     book_ticker_count=$(jq -er '.book_ticker' <<<"$family_counts")
