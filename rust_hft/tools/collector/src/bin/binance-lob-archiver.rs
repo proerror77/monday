@@ -2093,6 +2093,7 @@ async fn run_session(
             stream_connected_tx.clone(),
             session_stop_rx.clone(),
             stall_timeout,
+            config.stall_timeout,
             SUBSCRIPTION_PROOF_TIMEOUT,
             watchdog.clone(),
             producer_id,
@@ -3727,6 +3728,7 @@ async fn receive_url(
     stream_connected: broadcast::Sender<Vec<String>>,
     mut shutdown: watch::Receiver<bool>,
     stall_timeout: Duration,
+    reconnect_frame_timeout: Duration,
     subscription_proof_timeout: Duration,
     watchdog: ProcessWatchdog,
     producer_id: usize,
@@ -3858,6 +3860,8 @@ async fn receive_url(
             continue;
         }
 
+        let reconnecting = coverage_announced;
+        let mut reconnect_confirmed = !reconnecting;
         let mut subscription_proof_deadline =
             tokio::time::Instant::now() + subscription_proof_timeout;
         let mut proof_failure = None;
@@ -3925,11 +3929,10 @@ async fn receive_url(
             // Complete-message delivery from Tungstenite in userspace; not kernel or NIC RX.
             let received_at_ns = now_ns()?;
             if let Message::Text(text) = message {
-                watchdog.mark_data_for(producer_id);
                 let frame: Value = serde_json::from_str(&text)?;
                 if frame.get("id").and_then(Value::as_u64) == Some(SUBSCRIPTION_PROOF_ID) {
                     let listed = validate_subscription_listing(&frame, &shard.streams)?;
-                    if coverage_announced {
+                    if reconnecting && !proof_events.is_empty() {
                         if let Some(exit) = send_stream_event(
                             &sender,
                             Event::StreamReconnected {
@@ -3941,7 +3944,8 @@ async fn receive_url(
                         {
                             return Ok(exit);
                         }
-                    } else {
+                        reconnect_confirmed = true;
+                    } else if !coverage_announced {
                         // Fan the connection notification out to every snapshot
                         // producer; a dropped receiver is not a producer failure.
                         let _ = stream_connected.send(listed);
@@ -3959,10 +3963,13 @@ async fn receive_url(
                             }
                         }
                     }
-                    reconnect_backoff = 1;
+                    if reconnect_confirmed {
+                        reconnect_backoff = 1;
+                    }
                     break;
                 }
                 let event = event_from_frame_for_shard(frame, received_at_ns, producer_id)?;
+                watchdog.mark_data_for(producer_id);
                 if coverage_announced {
                     if proof_events.len() >= proof_buffer_budget {
                         anyhow::bail!(
@@ -4024,7 +4031,10 @@ async fn receive_url(
 
         // Only verified exact stream coverage unlocks snapshot requests. Market
         // events received while waiting for the proof were already buffered above.
+        let mut reconnect_frame_deadline = (!reconnect_confirmed)
+            .then(|| tokio::time::Instant::now() + reconnect_frame_timeout);
         let reason = loop {
+            let pause_epoch = last_pause_epoch;
             if let Some(exit) = acknowledge_rotation_pause(
                 producer_id,
                 &sender,
@@ -4037,6 +4047,10 @@ async fn receive_url(
             {
                 return Ok(exit);
             }
+            if last_pause_epoch > pause_epoch && reconnect_frame_deadline.is_some() {
+                reconnect_frame_deadline =
+                    Some(tokio::time::Instant::now() + reconnect_frame_timeout);
+            }
             let message = tokio::select! {
                 biased;
                 changed = shutdown.changed() => {
@@ -4048,27 +4062,55 @@ async fn receive_url(
                     changed.context("segment rotation controller stopped before producer pause")?;
                     continue;
                 }
-                message = tokio::time::timeout(stall_timeout, websocket.next()) => match message {
+                message = async {
+                    match reconnect_frame_deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline, websocket.next()).await,
+                        None => tokio::time::timeout(stall_timeout, websocket.next()).await,
+                    }
+                } => match message {
                     Ok(Some(Ok(message))) => message,
                     Ok(Some(Err(error))) => break format!("websocket receive failed: {error}"),
                     Ok(None) => break "websocket closed".into(),
+                    Err(_) if reconnect_frame_deadline.is_some() => break format!(
+                        "websocket shard produced no market frame for {}s after subscription proof",
+                        reconnect_frame_timeout.as_secs()
+                    ),
                     Err(_) => break format!("websocket shard stalled for {}s", stall_timeout.as_secs()),
                 }
             };
             // Complete-message delivery from Tungstenite in userspace; not kernel or NIC RX.
             let received_at_ns = now_ns()?;
             if let Message::Text(text) = message {
-                watchdog.mark_data_for(producer_id);
                 let event = event_from_frame_for_shard(
                     serde_json::from_str(&text)?,
                     received_at_ns,
                     producer_id,
                 )?;
+                watchdog.mark_data_for(producer_id);
+                let confirmed_reconnect = !reconnect_confirmed;
+                if confirmed_reconnect {
+                    if let Some(exit) = send_stream_event(
+                        &sender,
+                        Event::StreamReconnected {
+                            streams: streams.clone(),
+                        },
+                        &mut shutdown,
+                    )
+                    .await?
+                    {
+                        return Ok(exit);
+                    }
+                    reconnect_confirmed = true;
+                    reconnect_frame_deadline = None;
+                }
                 watchdog.record_queue_health(QueueHealth::from_sender(&sender));
                 match send_or_shutdown(&sender, event, &mut shutdown).await? {
                     SendOutcome::Sent => {
                         watchdog.mark_enqueued_for(producer_id);
                         watchdog.record_queue_health(QueueHealth::from_sender(&sender));
+                        if confirmed_reconnect {
+                            reconnect_backoff = 1;
+                        }
                     }
                     SendOutcome::Shutdown(event) => return Ok(TaskExit::Stopped(Some(event))),
                 }
@@ -7387,6 +7429,7 @@ mod tests {
                 stream_connected,
                 shutdown,
                 Duration::from_secs(1),
+                Duration::from_secs(1),
                 Duration::from_millis(50),
                 ProcessWatchdog::new_state(),
                 0,
@@ -7455,6 +7498,7 @@ mod tests {
             sender,
             stream_connected,
             shutdown,
+            Duration::from_secs(1),
             Duration::from_secs(1),
             Duration::from_secs(1),
             ProcessWatchdog::new_state(),
@@ -7590,6 +7634,7 @@ mod tests {
             stream_connected,
             shutdown,
             Duration::from_secs(1),
+            Duration::from_secs(1),
             Duration::from_millis(50),
             ProcessWatchdog::new_state(),
             0,
@@ -7632,6 +7677,324 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconnect_proof_without_market_data_keeps_shard_recovering() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let event_time_ms = now_ns().unwrap() / 1_000_000;
+        let (accepted_tx, mut accepted_rx) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            for connection in 0..4 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let request = websocket.next().await.unwrap().unwrap();
+                assert!(request.to_text().unwrap().contains("LIST_SUBSCRIPTIONS"));
+                accepted_tx
+                    .send((connection, Instant::now()))
+                    .unwrap();
+                websocket
+                    .send(Message::Text(
+                        json!({
+                            "id": SUBSCRIPTION_PROOF_ID,
+                            "result": ["btcusdt@aggTrade"]
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                if connection == 0 || connection == 2 {
+                    websocket
+                        .send(Message::Text(
+                            json!({
+                                "stream": "btcusdt@aggTrade",
+                                "data": {
+                                    "e": "aggTrade",
+                                    "E": event_time_ms,
+                                    "s": "BTCUSDT",
+                                    "a": connection + 1,
+                                    "f": connection + 1,
+                                    "l": connection + 1,
+                                    "p": "100",
+                                    "q": "1",
+                                    "T": event_time_ms,
+                                    "m": false
+                                }
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    websocket.close(None).await.unwrap();
+                } else {
+                    let _ = websocket.next().await;
+                }
+            }
+        });
+        let (sender, mut receiver) = mpsc::channel(16);
+        let (stream_connected, _) = broadcast::channel(1);
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let (_pause_tx, pause_rx) = watch::channel(0_u64);
+        let (_resume_tx, resume_rx) = watch::channel(0_u64);
+        let shard = StreamShard {
+            url: format!("ws://{address}"),
+            streams: BTreeSet::from(["btcusdt@aggTrade".to_owned()]),
+        };
+        let diagnostics = Arc::new(ProducerDiagnostics::new(std::slice::from_ref(&shard)));
+        let watchdog = ProcessWatchdog::new_with_diagnostics(diagnostics.clone());
+        let task = tokio::spawn(receive_url(
+            shard,
+            sender,
+            stream_connected,
+            shutdown,
+            SPARSE_STREAM_STALL_TIMEOUT,
+            Duration::from_millis(50),
+            Duration::from_secs(1),
+            watchdog,
+            0,
+            pause_rx,
+            resume_rx,
+        ));
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::AggregateTrade { .. })
+        ));
+        let received_after_first_frame = diagnostics.producers.read().unwrap()[0]
+            .last_received_ms
+            .load(Ordering::Relaxed);
+        let enqueued_after_first_frame = diagnostics.producers.read().unwrap()[0]
+            .last_enqueued_ms
+            .load(Ordering::Relaxed);
+        assert_ne!(received_after_first_frame, UNKNOWN_ELAPSED_MS);
+        assert_ne!(enqueued_after_first_frame, UNKNOWN_ELAPSED_MS);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::StreamDisconnected { .. })
+        ));
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .unwrap()
+            {
+                Some(Event::StreamDisconnected { .. }) => break,
+                Some(Event::StreamReconnected { .. }) => {
+                    panic!("subscription proof alone declared the shard reconnected")
+                }
+                Some(_) => {}
+                None => panic!("stream task exited while reconnecting the quiet shard"),
+            }
+        }
+        assert_eq!(
+            diagnostics.producers.read().unwrap()[0]
+                .last_received_ms
+                .load(Ordering::Relaxed),
+            received_after_first_frame,
+            "subscription proof refreshed the market-data watchdog"
+        );
+        assert_eq!(
+            diagnostics.producers.read().unwrap()[0]
+                .last_enqueued_ms
+                .load(Ordering::Relaxed),
+            enqueued_after_first_frame,
+            "subscription proof entered the archive queue"
+        );
+
+        let (first_connection, _) = accepted_rx.recv().await.unwrap();
+        let (second_connection, second_connected_at) = accepted_rx.recv().await.unwrap();
+        let (third_connection, third_connected_at) = accepted_rx.recv().await.unwrap();
+        assert_eq!((first_connection, second_connection, third_connection), (0, 1, 2));
+        assert!(
+            third_connected_at.duration_since(second_connected_at) >= Duration::from_millis(1800),
+            "quiet subscription proof reset reconnect backoff"
+        );
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::StreamReconnected { .. })
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::AggregateTrade { .. })
+        ));
+        {
+            let producers = diagnostics.producers.read().unwrap();
+            let producer = &producers[0];
+            assert!(
+                producer.last_received_ms.load(Ordering::Relaxed) > received_after_first_frame
+            );
+            assert!(
+                producer.last_enqueued_ms.load(Ordering::Relaxed) > enqueued_after_first_frame
+            );
+        }
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::StreamDisconnected { .. })
+        ));
+        let (fourth_connection, fourth_connected_at) = accepted_rx.recv().await.unwrap();
+        assert_eq!(fourth_connection, 3);
+        assert!(
+            fourth_connected_at.duration_since(third_connected_at) < Duration::from_millis(1800),
+            "first market frame did not reset reconnect backoff"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        assert!(matches!(
+            task.await.unwrap().unwrap(),
+            TaskExit::Stopped(None)
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconnect_market_frame_deadline_restarts_after_rotation_pause() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let event_time_ms = now_ns().unwrap() / 1_000_000;
+        let (proof_processed_tx, proof_processed_rx) = tokio::sync::oneshot::channel();
+        let (send_market_tx, send_market_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut proof_processed_tx = Some(proof_processed_tx);
+            let mut send_market_rx = Some(send_market_rx);
+            for connection in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let request = websocket.next().await.unwrap().unwrap();
+                assert!(request.to_text().unwrap().contains("LIST_SUBSCRIPTIONS"));
+                websocket
+                    .send(Message::Text(
+                        json!({
+                            "id": SUBSCRIPTION_PROOF_ID,
+                            "result": ["btcusdt@aggTrade"]
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                if connection == 1 {
+                    websocket
+                        .send(Message::Ping(Vec::new().into()))
+                        .await
+                        .unwrap();
+                    loop {
+                        if matches!(websocket.next().await.unwrap().unwrap(), Message::Pong(_)) {
+                            break;
+                        }
+                    }
+                    proof_processed_tx.take().unwrap().send(()).unwrap();
+                    send_market_rx.take().unwrap().await.unwrap();
+                }
+                websocket
+                    .send(Message::Text(
+                        json!({
+                            "stream": "btcusdt@aggTrade",
+                            "data": {
+                                "e": "aggTrade",
+                                "E": event_time_ms,
+                                "s": "BTCUSDT",
+                                "a": connection + 1,
+                                "f": connection + 1,
+                                "l": connection + 1,
+                                "p": "100",
+                                "q": "1",
+                                "T": event_time_ms,
+                                "m": false
+                            }
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                if connection == 0 {
+                    websocket.close(None).await.unwrap();
+                } else {
+                    let _ = websocket.next().await;
+                }
+            }
+        });
+        let (sender, mut receiver) = mpsc::channel(8);
+        let (stream_connected, _) = broadcast::channel(1);
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let (pause_tx, pause_rx) = watch::channel(0_u64);
+        let (resume_tx, resume_rx) = watch::channel(0_u64);
+        let task = tokio::spawn(receive_url(
+            StreamShard {
+                url: format!("ws://{address}"),
+                streams: BTreeSet::from(["btcusdt@aggTrade".to_owned()]),
+            },
+            sender,
+            stream_connected,
+            shutdown,
+            SPARSE_STREAM_STALL_TIMEOUT,
+            Duration::from_millis(200),
+            Duration::from_secs(1),
+            ProcessWatchdog::new_state(),
+            0,
+            pause_rx,
+            resume_rx,
+        ));
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::AggregateTrade { .. })
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::StreamDisconnected { .. })
+        ));
+        proof_processed_rx.await.unwrap();
+        pause_tx.send(1).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::RotationBarrier {
+                producer_id: 0,
+                epoch: 1
+            })
+        ));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(receiver.try_recv().is_err());
+        resume_tx.send(1).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        send_market_tx.send(()).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::StreamReconnected { .. })
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::AggregateTrade { .. })
+        ));
+
+        shutdown_tx.send(true).unwrap();
+        assert!(matches!(
+            task.await.unwrap().unwrap(),
+            TaskExit::Stopped(None)
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn pause_during_websocket_connect_acknowledges_rotation() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -7654,6 +8017,7 @@ mod tests {
             sender,
             stream_connected,
             shutdown,
+            Duration::from_secs(1),
             Duration::from_secs(1),
             Duration::from_secs(1),
             ProcessWatchdog::new_state(),
@@ -7707,6 +8071,7 @@ mod tests {
             sender,
             stream_connected,
             shutdown,
+            Duration::from_secs(1),
             Duration::from_secs(1),
             Duration::from_secs(20),
             ProcessWatchdog::new_state(),
@@ -7819,6 +8184,7 @@ mod tests {
             sender,
             stream_connected,
             shutdown,
+            Duration::from_secs(1),
             Duration::from_secs(1),
             Duration::from_secs(20),
             ProcessWatchdog::new_state(),
@@ -7933,6 +8299,7 @@ mod tests {
             sender,
             stream_connected,
             shutdown,
+            Duration::from_secs(1),
             Duration::from_secs(1),
             Duration::from_millis(400),
             ProcessWatchdog::new_state(),
