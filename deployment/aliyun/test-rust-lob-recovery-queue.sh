@@ -251,7 +251,7 @@ flock() {
 }
 
 sync() {
-  local argument
+  local argument ordinal
   for argument in "$@"; do
     if [[ $argument == -f ]]; then
       printf 'recovery queue attempted filesystem-wide sync\n' >&2
@@ -260,6 +260,11 @@ sync() {
   done
   printf '%s\n' "$*" >>"$MOCK_SYNC_LOG"
   printf 'sync %s\n' "$*" >>"$MOCK_SEQUENCE_LOG"
+  ordinal=$(( $(<"$MOCK_SYNC_COUNT_FILE") + 1 ))
+  printf '%s\n' "$ordinal" >"$MOCK_SYNC_COUNT_FILE"
+  if [[ ${MOCK_SYNC_FAIL_ORDINAL:-0} -eq $ordinal ]]; then
+    exit 97
+  fi
   return 0
 }
 
@@ -270,6 +275,7 @@ setup_fixture() {
   MOCK_RUNUSER_LOG="$fixture/runuser.log"
   MOCK_CALLS_LOG="$fixture/binary.log"
   MOCK_SYNC_LOG="$fixture/sync.log"
+  MOCK_SYNC_COUNT_FILE="$fixture/sync-count"
   MOCK_SEQUENCE_LOG="$fixture/sequence.log"
   configure_paths "$fixture"
   mkdir -p \
@@ -277,6 +283,7 @@ setup_fixture() {
     "$CANONICAL_ROOT/spot" "$CANONICAL_ROOT/usdm" \
     "$QUEUE_ROOT/spot" "$QUEUE_ROOT/usdm" \
     "$EVIDENCE_ROOT"
+  printf '0\n' >"$MOCK_SYNC_COUNT_FILE"
   cat >"$fixture/fake-binary.sh" <<EOF
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -383,7 +390,8 @@ activate_controller_fixture() {
 }
 
 run_action() (
-  local fixture=$1 action=$2 market=$3 failed_job_id=${4:-}
+  local fixture=$1 action=$2 market=$3 failed_job_id=${4:-} sync_fail_ordinal=${5:-${MOCK_SYNC_FAIL_ORDINAL:-0}}
+  MOCK_SYNC_FAIL_ORDINAL=$sync_fail_ordinal
   configure_paths "$fixture"
   # MARKET is consumed by functions from the sourced recovery script.
   # shellcheck disable=SC2034
@@ -391,11 +399,14 @@ run_action() (
   canonical_paths_safe
   market_paths
   queue_lock
+  # Consumed by on_exit() from the sourced queue controller.
+  # shellcheck disable=SC2034
+  CURRENT_ACTION=$action
+  trap 'on_exit $?' EXIT
+  trap 'on_signal INT' INT
+  trap 'on_signal TERM' TERM
   case "$action" in
-    isolate)
-      secure_release_identity
-      isolate_market
-      ;;
+    isolate) run_isolate ;;
     drain) drain_market ;;
     reconcile-legacy) reconcile_legacy_prefixes "$failed_job_id" ;;
     *) exit 2 ;;
@@ -819,7 +830,7 @@ test_recovery_start_follows_durable_lock_handoff() {
   setup_fixture "$fixture"
   sequence="$fixture/sequence.log"
   printf 'part\n' >"$fixture/data/monday/spool/binance-lob/spot/part-001.jsonl.part"
-  run_action "$fixture" isolate spot
+  run_action "$fixture" isolate spot 2>>"$sequence"
   awk -v canonical="$fixture/data/monday/spool/binance-lob/spot" \
     -v canonical_root="$fixture/data/monday/spool/binance-lob" \
     -v queue_root="$fixture/data/monday/spool/binance-lob-recovery/spot" \
@@ -829,14 +840,18 @@ test_recovery_start_follows_durable_lock_handoff() {
       $0 == "sync " queue_root { queue_sync = NR }
       $0 == "flock -u 8" { unlock8 = NR }
       $0 == "flock -u 9" { unlock9 = NR }
+      $0 ~ /event=done phase=queue-parent/ { durable_done = NR }
       $0 == "fd8-closed" { closed8 = NR }
       $0 == "fd9-closed" { closed9 = NR }
       $0 == start { started = NR }
       END {
-        exit !(canonical_sync && canonical_root_sync && queue_sync && unlock8 && unlock9 &&
+        ok = canonical_sync && canonical_root_sync && queue_sync && durable_done && unlock8 && unlock9 &&
           closed8 && closed9 && started && canonical_sync < unlock8 &&
-          canonical_root_sync < unlock8 && queue_sync < unlock8 && unlock9 == unlock8 + 1 &&
-          closed8 == unlock9 + 1 && closed9 == closed8 + 1 && started == closed9 + 1)
+          canonical_root_sync < unlock8 && queue_sync < durable_done && durable_done < unlock8 &&
+          unlock8 < unlock9 && unlock9 < closed8 && closed8 < closed9 && closed9 < started
+        if (!ok) print "handoff-order", canonical_sync, canonical_root_sync, queue_sync,
+          durable_done, unlock8, unlock9, closed8, closed9, started > "/dev/stderr"
+        exit !ok
       }
     ' "$sequence"
 
@@ -845,21 +860,72 @@ test_recovery_start_follows_durable_lock_handoff() {
   mv "$fixture/data/monday/spool/binance-lob/spot" "$STAGED_READY_DIR"
   : >"$sequence"
   : >"$fixture/sync.log"
-  run_action "$fixture" isolate spot
+  run_action "$fixture" isolate spot 2>>"$sequence"
   awk -v canonical_root="$fixture/data/monday/spool/binance-lob" \
     -v start='systemctl start --no-block binance-lob-archiver-recovery@spot.service' '
       $0 == "sync " canonical_root { durable = NR }
       $0 == "flock -u 8" { unlock8 = NR }
       $0 == "flock -u 9" { unlock9 = NR }
+      $0 ~ /event=done phase=queue-parent/ { durable_done = NR }
       $0 == "fd8-closed" { closed8 = NR }
       $0 == "fd9-closed" { closed9 = NR }
       $0 == start { started = NR }
       END {
-        exit !(durable && !unlock8 && unlock9 && closed8 && closed9 && started &&
-          durable < unlock9 && closed8 == unlock9 + 1 && closed9 == closed8 + 1 &&
-          started == closed9 + 1)
+        ok = durable && durable_done && !unlock8 && unlock9 && closed8 && closed9 && started &&
+          durable < durable_done && durable_done < unlock9 && unlock9 < closed8 &&
+          closed8 < closed9 && closed9 < started
+        if (!ok) print "resume-handoff-order", durable, durable_done, unlock8,
+          unlock9, closed8, closed9, started > "/dev/stderr"
+        exit !ok
       }
     ' "$sequence"
+}
+
+test_isolation_phase_logs_locate_sync_failures_and_retry_converges() {
+  local ordinal fixture log last_phase ready_count status handoff_count=0
+  local -a expected_phases=(
+    receipt-file receipt-file receipt-dir marker-file marker-dir
+    canonical-parent queue-parent canonical-recreate canonical-parent queue-parent
+  )
+  for ordinal in "${!expected_phases[@]}"; do
+    fixture="$tmp_dir/isolation-sync-failure-$((ordinal + 1))"
+    log="$fixture/isolation.log"
+    setup_fixture "$fixture"
+    printf 'part\n' >"$CANONICAL_ROOT/spot/part-001.jsonl.part"
+    set +e
+    printf '0\n' >"$MOCK_SYNC_COUNT_FILE"
+    run_action "$fixture" isolate spot '' "$((ordinal + 1))" 2>"$log"
+    status=$?
+    set -e
+    configure_paths "$fixture"
+    MARKET=spot
+    market_paths
+    assert "sync-$((ordinal + 1))-failed" test "$status" -ne 0
+    last_phase=$(sed -n 's/.*event=begin phase=\([^ ]*\).*/\1/p' "$log" | tail -n 1)
+    assert "sync-$((ordinal + 1))-phase" test "$last_phase" = "${expected_phases[$ordinal]}"
+    grep -Eq 'event=exit .*current_isolation_phase=[^ ]+ .*marker=(present|absent) .*ready=(present|absent) .*canonical=(present|absent)' "$log"
+    [[ -d $CANONICAL_SPOOL || -d $ISOLATION_READY_DIR ]] || {
+      printf 'sync failure left no complete isolation source at ordinal %s\n' "$((ordinal + 1))" >&2
+      exit 1
+    }
+    printf '0\n' >"$MOCK_SYNC_COUNT_FILE"
+    run_action "$fixture" isolate spot '' 0 2>>"$log"
+    configure_paths "$fixture"
+    MARKET=spot
+    market_paths
+    assert "sync-$((ordinal + 1))-marker-cleared" test ! -e "$ISOLATION_MARKER"
+    assert "sync-$((ordinal + 1))-canonical-present" test -d "$CANONICAL_SPOOL"
+    ready_count=$(find "$QUEUE_MARKET_ROOT" -mindepth 1 -maxdepth 1 -type d -name '*.ready' | wc -l | tr -d ' ')
+    assert "sync-$((ordinal + 1))-ready-present" test "$ready_count" -ge 1
+    if grep -q 'event=done phase=handoff .*elapsed_seconds=' "$log"; then
+      handoff_count=$((handoff_count + 1))
+    fi
+  done
+
+  grep -q 'event=begin phase=release-identity' "$log"
+  grep -q 'event=done phase=release-identity .*elapsed_seconds=' "$log"
+  grep -q 'event=begin phase=incomplete-scan' "$log"
+  assert handoff-observed test "$handoff_count" -ge 1
 }
 
 test_missing_canonical_single_valid_legacy_job_recovers() {
@@ -1006,6 +1072,7 @@ test_symlinked_queue_root_fails_closed
 test_isolation_marker_recovers_all_crash_boundaries
 test_missing_canonical_with_multiple_backlog_uses_marker
 test_recovery_start_follows_durable_lock_handoff
+test_isolation_phase_logs_locate_sync_failures_and_retry_converges
 test_missing_canonical_single_valid_legacy_job_recovers
 test_missing_canonical_without_valid_legacy_job_fails_closed
 test_missing_canonical_mixed_legacy_queue_fails_closed

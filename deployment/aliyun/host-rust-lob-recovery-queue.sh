@@ -35,6 +35,50 @@ fail() {
   exit 1
 }
 
+CURRENT_ACTION=
+CURRENT_ISOLATION_PHASE=idle
+CURRENT_ISOLATION_PHASE_STARTED=0
+CURRENT_ISOLATION_JOB_ID=unknown
+ISOLATION_READY_DIR=
+
+isolation_path_state() {
+  [[ -e $1 || -L $1 ]] && printf 'present\n' || printf 'absent\n'
+}
+
+log_isolation_phase() {
+  local event=$1 elapsed_seconds=$2 ready_path=${ISOLATION_READY_DIR:-}
+  [[ -n $ready_path ]] || ready_path="$QUEUE_MARKET_ROOT/${CURRENT_ISOLATION_JOB_ID}.ready"
+  printf 'monday_lob_isolation event=%s phase=%s elapsed_seconds=%s market=%s job_id=%s marker=%s ready=%s canonical=%s\n' \
+    "$event" "$CURRENT_ISOLATION_PHASE" "$elapsed_seconds" "${MARKET:-unknown}" \
+    "$CURRENT_ISOLATION_JOB_ID" "$(isolation_path_state "$ISOLATION_MARKER")" \
+    "$(isolation_path_state "$ready_path")" "$(isolation_path_state "$CANONICAL_SPOOL")" >&2
+}
+
+isolation_phase_begin() {
+  CURRENT_ISOLATION_PHASE=$1
+  CURRENT_ISOLATION_PHASE_STARTED=$SECONDS
+  log_isolation_phase begin 0
+}
+
+isolation_phase_done() {
+  log_isolation_phase 'done' "$((SECONDS - CURRENT_ISOLATION_PHASE_STARTED))"
+}
+
+log_isolation_exit() {
+  local status=$1 signal=${2:-none} ready_path=${ISOLATION_READY_DIR:-}
+  [[ ${CURRENT_ACTION:-} == isolate ]] || return 0
+  [[ -n $ready_path ]] || ready_path="$QUEUE_MARKET_ROOT/${CURRENT_ISOLATION_JOB_ID}.ready"
+  printf 'monday_lob_isolation event=exit status=%s signal=%s current_isolation_phase=%s market=%s job_id=%s marker=%s ready=%s canonical=%s\n' \
+    "$status" "$signal" "$CURRENT_ISOLATION_PHASE" "${MARKET:-unknown}" \
+    "$CURRENT_ISOLATION_JOB_ID" "$(isolation_path_state "$ISOLATION_MARKER")" \
+    "$(isolation_path_state "$ready_path")" "$(isolation_path_state "$CANONICAL_SPOOL")" >&2
+}
+
+on_exit() {
+  local status=$1
+  log_isolation_exit "$status"
+}
+
 path_is_direct_or_absent() {
   local path=$1 resolved
   [[ -e $path || -L $path ]] || return 0
@@ -288,6 +332,8 @@ drain_lock() {
 
 write_job_receipt() {
   local job_id=$1 queue_unit=$2 tmp env_copy env_tmp
+  CURRENT_ISOLATION_JOB_ID=$job_id
+  isolation_phase_begin receipt-file
   env_copy="$CANONICAL_SPOOL/recovery.env"
   env_tmp="$env_copy.tmp.$$"
   install -m 0640 -o root -g root -- "$RELEASE_ENV_FILE" "$env_tmp"
@@ -315,7 +361,10 @@ write_job_receipt() {
   chmod 0640 "$tmp"
   mv -Tf "$tmp" "$CANONICAL_SPOOL/job.json"
   sync "$CANONICAL_SPOOL/job.json"
+  isolation_phase_done
+  isolation_phase_begin receipt-dir
   sync "$CANONICAL_SPOOL"
+  isolation_phase_done
 }
 
 job_dir_id() {
@@ -329,6 +378,8 @@ job_dir_id() {
 write_isolation_marker() {
   local job_id=$1 receipt_sha256=$2 ready_dir tmp
   ready_dir="$QUEUE_MARKET_ROOT/$job_id.ready"
+  ISOLATION_READY_DIR=$ready_dir
+  isolation_phase_begin marker-file
   tmp="$QUEUE_MARKET_ROOT/.isolation.json.tmp.$$"
   [[ ! -e $ISOLATION_MARKER && ! -L $ISOLATION_MARKER ]] \
     || fail "an isolation transaction is already active: $ISOLATION_MARKER"
@@ -347,7 +398,10 @@ write_isolation_marker() {
   mv -Tf "$tmp" "$ISOLATION_MARKER"
   secure_regular_file "$ISOLATION_MARKER" 0
   sync "$ISOLATION_MARKER"
+  isolation_phase_done
+  isolation_phase_begin marker-dir
   sync "$QUEUE_MARKET_ROOT"
+  isolation_phase_done
 }
 
 load_isolation_marker() {
@@ -357,6 +411,7 @@ load_isolation_marker() {
   ISOLATION_CANONICAL_SPOOL=$(jq -er '.canonical_spool' "$ISOLATION_MARKER")
   ISOLATION_READY_DIR=$(jq -er '.ready_dir' "$ISOLATION_MARKER")
   ISOLATION_RECEIPT_SHA256=$(jq -er '.receipt_sha256' "$ISOLATION_MARKER")
+  CURRENT_ISOLATION_JOB_ID=$ISOLATION_JOB_ID
   jq -e '.schema == "monday.rust_lob_recovery_isolation.v1"' \
     "$ISOLATION_MARKER" >/dev/null \
     || fail "isolation marker has an invalid schema: $ISOLATION_MARKER"
@@ -404,6 +459,7 @@ complete_isolation_transaction() {
   if [[ -e $ISOLATION_READY_DIR || -L $ISOLATION_READY_DIR ]]; then
     secure_directory "$ISOLATION_READY_DIR" "$hft_uid" "$hft_gid"
     validate_isolation_receipt "$ISOLATION_READY_DIR"
+    isolation_phase_begin canonical-recreate
     if [[ -e $CANONICAL_SPOOL || -L $CANONICAL_SPOOL ]]; then
       secure_directory "$CANONICAL_SPOOL" "$hft_uid" "$hft_gid"
       require_recreated_canonical_spool "$CANONICAL_SPOOL" "$hft_uid" \
@@ -423,9 +479,16 @@ complete_isolation_transaction() {
       flock -n 8 || fail "collector spool lock is already held: $spool_lock"
       spool_lock_held=1
     fi
+    isolation_phase_begin rename
     mv -T -- "$CANONICAL_SPOOL" "$ISOLATION_READY_DIR"
+    isolation_phase_done
+    isolation_phase_begin canonical-parent
     sync "$CANONICAL_ROOT"
+    isolation_phase_done
+    isolation_phase_begin queue-parent
     sync "$QUEUE_MARKET_ROOT"
+    isolation_phase_done
+    isolation_phase_begin canonical-recreate
     install -d -m 0750 -o "$hft_uid" -g "$hft_gid" -- "$CANONICAL_SPOOL"
   fi
   prior_upload_status="$ISOLATION_READY_DIR/upload-status.json"
@@ -435,9 +498,17 @@ complete_isolation_transaction() {
     sync "$CANONICAL_SPOOL/upload-status.json"
   fi
   sync "$CANONICAL_SPOOL"
+  isolation_phase_done
+  isolation_phase_begin canonical-parent
   sync "$CANONICAL_ROOT"
+  isolation_phase_done
+  isolation_phase_begin marker-remove
   rm -f -- "$ISOLATION_MARKER"
+  isolation_phase_done
+  isolation_phase_begin queue-parent
   sync "$QUEUE_MARKET_ROOT"
+  isolation_phase_done
+  isolation_phase_begin handoff
   if (( spool_lock_held )); then
     flock -u 8
     exec 8>&-
@@ -445,6 +516,7 @@ complete_isolation_transaction() {
   flock -u 9
   exec 9>&-
   systemctl start --no-block "$queue_unit" >/dev/null 2>&1 || true
+  isolation_phase_done
 }
 
 recover_single_legacy_isolation() {
@@ -458,11 +530,28 @@ recover_single_legacy_isolation() {
     \( -name '*.ready' -o -name '*.running' \) -print | sort)
   (( candidate_count == 1 && valid_count == 1 )) \
     || fail "canonical spool is missing without one exclusive valid legacy recovery job: $CANONICAL_SPOOL"
+  isolation_phase_begin canonical-recreate
   install -d -m 0750 -o "$hft_uid" -g "$hft_gid" -- "$CANONICAL_SPOOL"
+  isolation_phase_done
+  isolation_phase_begin canonical-parent
   sync "$CANONICAL_ROOT"
+  isolation_phase_done
+  isolation_phase_begin handoff
   flock -u 9
   exec 9>&-
   systemctl start --no-block "$RECOVERY_SERVICE@$MARKET.service" >/dev/null 2>&1 || true
+  isolation_phase_done
+}
+
+run_isolate() {
+  CURRENT_ISOLATION_PHASE=idle
+  CURRENT_ISOLATION_PHASE_STARTED=$SECONDS
+  CURRENT_ISOLATION_JOB_ID=unknown
+  ISOLATION_READY_DIR=
+  isolation_phase_begin release-identity
+  secure_release_identity
+  isolation_phase_done
+  isolate_market
 }
 
 isolate_market() {
@@ -480,9 +569,12 @@ isolate_market() {
     exit 0
   fi
   secure_directory "$CANONICAL_SPOOL" "$hft_uid" "$hft_gid"
+  isolation_phase_begin incomplete-scan
   if ! has_incomplete_parts "$CANONICAL_SPOOL"; then
+    isolation_phase_done
     exit 0
   fi
+  isolation_phase_done
   spool_lock="$CANONICAL_SPOOL/.binance-lob-archiver.lock"
   secure_regular_file "$spool_lock" "$hft_uid"
   exec 8<>"$spool_lock"
@@ -1004,6 +1096,7 @@ JOB_STARTED_AT=
 
 on_signal() {
   local signal=$1
+  log_isolation_exit 1 "$signal"
   if [[ -n ${CURRENT_RUNNING_DIR:-} && -d ${CURRENT_RUNNING_DIR:-} ]]; then
     mark_failed "$CURRENT_RUNNING_DIR" "$CURRENT_STEP" "interrupted by $signal"
   fi
@@ -1087,13 +1180,12 @@ main() {
   canonical_paths_safe
   market_paths
   queue_lock
+  CURRENT_ACTION=$action
+  trap 'on_exit $?' EXIT
   trap 'on_signal INT' INT
   trap 'on_signal TERM' TERM
   case "$action" in
-    isolate)
-      secure_release_identity
-      isolate_market
-      ;;
+    isolate) run_isolate ;;
     drain) drain_market ;;
     reconcile-legacy) reconcile_legacy_prefixes "$failed_job_id" ;;
   esac
