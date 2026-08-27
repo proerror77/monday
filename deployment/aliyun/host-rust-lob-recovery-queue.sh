@@ -599,7 +599,7 @@ collect_legacy_prefix_evidence() {
   local legacy_root=$1 backup_root=$2 backup_receipt=$3 entries_file=$4
   local hft_uid=$5 hft_gid=$6 legacy_dir legacy_name part relative backup
   local legacy_bytes legacy_sha backup_bytes backup_sha backup_prefix_sha before after receipt_row
-  local part_uid part_gid part_mode
+  local part_uid part_gid part_mode needs_seal
   local verified_backups='' entry_count=0 unexpected
   local -a legacy_dirs=() parts=()
 
@@ -627,9 +627,13 @@ collect_legacy_prefix_evidence() {
       part_mode=$(stat -c %a -- "$part")
       [[ $(stat -c %h -- "$part") == 1 ]] \
         || fail "legacy recovery part has unsafe links: $part"
+      needs_seal=0
       if [[ $part_uid == "$hft_uid" && $part_gid == "$hft_gid" ]]; then
         (( (8#$part_mode & 022) == 0 )) \
           || fail "legacy recovery part is group/world writable: $part"
+        needs_seal=1
+      elif [[ $part_uid == 0 && $part_gid == 0 && $part_mode == 600 ]]; then
+        needs_seal=1
       elif [[ $part_uid == 0 && $part_gid == 0 && $part_mode == 440 ]]; then
         :
       else
@@ -658,7 +662,7 @@ collect_legacy_prefix_evidence() {
       legacy_bytes=$(stat -c %s -- "$part")
       (( legacy_bytes > 0 && legacy_bytes <= backup_bytes )) \
         || fail "legacy recovery part is not a bounded prefix candidate: $part"
-      if [[ $part_uid == "$hft_uid" ]]; then
+      if (( needs_seal )); then
         RECONCILIATION_SEALED_TEMP="$part.sealed.$$"
         [[ ! -e $RECONCILIATION_SEALED_TEMP && ! -L $RECONCILIATION_SEALED_TEMP ]] \
           || fail "legacy sealed path already exists: $RECONCILIATION_SEALED_TEMP"
@@ -675,7 +679,7 @@ collect_legacy_prefix_evidence() {
       backup_prefix_sha=$(head -c "$legacy_bytes" "$backup" | sha256sum | awk '{print $1}')
       [[ $legacy_sha == "$backup_prefix_sha" ]] \
         || fail "legacy recovery part is not a byte prefix of the failed-job backup: $part"
-      if [[ $part_uid == "$hft_uid" ]]; then
+      if (( needs_seal )); then
         mv -Tf -- "$RECONCILIATION_SEALED_TEMP" "$part"
         RECONCILIATION_SEALED_TEMP=
         sync "$part"

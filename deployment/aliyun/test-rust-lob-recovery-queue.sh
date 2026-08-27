@@ -77,7 +77,7 @@ stat() {
         # shellcheck disable=SC2153
         case "$1" in
           "$QUEUE_ROOT"/*/legacy-unreceipted/*/date=*/hour=*/*.jsonl.part)
-            [[ $(native_mode "$1") == 440 ]] && printf '0\n' || printf '4241\n'
+            [[ $(native_mode "$1") =~ ^(440|600)$ ]] && printf '0\n' || printf '4241\n'
             ;;
           "$QUEUE_ROOT"/*/legacy-unreceipted|"$QUEUE_ROOT"/*/legacy-unreceipted/*)
             printf '0\n'
@@ -92,7 +92,7 @@ stat() {
         # shellcheck disable=SC2153
         case "$1" in
           "$QUEUE_ROOT"/*/legacy-unreceipted/*/date=*/hour=*/*.jsonl.part)
-            [[ $(native_mode "$1") == 440 ]] && printf '0\n' || printf '4242\n'
+            [[ $(native_mode "$1") =~ ^(440|600)$ ]] && printf '0\n' || printf '4242\n'
             ;;
           "$QUEUE_ROOT"/*/legacy-unreceipted)
             printf '4242\n'
@@ -534,6 +534,16 @@ test_legacy_non_prefix_fails_without_moving_data() {
   assert non-prefix-no-sealed test -z "$(find "$STAGED_LEGACY_ROOT" -name '*.sealed.*' -print -quit)"
   assert non-prefix-no-receipt test ! -e "$LEGACY_RECONCILIATION_ROOT/$STAGED_FAILED_JOB_ID"
   assert non-prefix-no-binary test ! -s "$MOCK_CALLS_LOG"
+}
+
+test_root_owned_legacy_prefix_is_sealed() {
+  local fixture=$tmp_dir/legacy-root-owned legacy_part archived_part
+  stage_legacy_reconciliation_fixture "$fixture"
+  legacy_part="$STAGED_LEGACY_ROOT/$STAGED_LEGACY_NAME/date=2026-08-24/hour=12/part-1787572800000177730.jsonl.part"
+  chmod 0600 "$legacy_part"
+  run_action "$fixture" reconcile-legacy spot "$STAGED_FAILED_JOB_ID"
+  archived_part="$LEGACY_RECONCILIATION_ROOT/$STAGED_FAILED_JOB_ID/spool/$STAGED_LEGACY_NAME/date=2026-08-24/hour=12/part-1787572800000177730.jsonl.part"
+  assert root-owned-legacy-sealed test "$(native_mode "$archived_part")" = 440
 }
 
 test_no_part_noop() {
@@ -1005,5 +1015,6 @@ test_passed_running_finalizes_without_retry
 test_running_job_ignores_untrusted_in_spool_pass_result
 test_legacy_prefix_reconciliation_archives_without_upload
 test_legacy_non_prefix_fails_without_moving_data
+test_root_owned_legacy_prefix_is_sealed
 
 printf 'ok\n'
