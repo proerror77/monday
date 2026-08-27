@@ -13,11 +13,13 @@ readonly HOST_MEMORY_RESERVE_BYTES=1073741824
 readonly PRODUCTION_MEMORY_GROWTH_MARGIN_BYTES=268435456
 readonly STRICT_VERIFIER_MEMORY_MAX_BYTES=1610612736
 readonly UPLOAD_DRAIN_MEMORY_MAX_BYTES=536870912
-readonly MEMORY_PSI_WINDOW_SECONDS=15
-readonly MEMORY_PSI_WINDOW_US=15000000
-readonly MEMORY_PSI_FULL_DELTA_LIMIT_US=150000
-readonly MEMORY_PSI_CONSECUTIVE_HIT_LIMIT=3
-readonly MEMORY_PSI_SOURCE=/proc/pressure/memory
+readonly IO_PSI_WINDOW_SECONDS=15
+readonly IO_PSI_WINDOW_US=15000000
+readonly IO_PSI_FULL_DELTA_LIMIT_US=150000
+readonly IO_PSI_CONSECUTIVE_HIT_LIMIT=3
+readonly IO_PSI_SOURCE=/proc/pressure/io
+readonly ACTIVE_PROCESS_TERM_GRACE_SECONDS=5
+readonly ACTIVE_PROCESS_KILL_GRACE_SECONDS=5
 readonly SHADOW_BINARY=/opt/monday/bin/binance-lob-archiver-shadow
 readonly RELEASE_ROOT=/opt/monday/releases/binance-lob-archiver
 readonly EVIDENCE_ROOT=/data/monday/evidence/shadow-gates
@@ -94,7 +96,7 @@ done
 
 mountpoint -q /data || die '/data must be a mount point'
 [[ -r /proc/uptime ]] || die '/proc/uptime is required for monotonic timing'
-[[ -r $MEMORY_PSI_SOURCE ]] || die 'memory PSI is unavailable'
+[[ -r $IO_PSI_SOURCE ]] || die 'I/O PSI is unavailable'
 id "$SERVICE_USER" >/dev/null 2>&1 || die "missing service user: $SERVICE_USER"
 if [[ $resource_preflight_only != true ]]; then
   install -d -m 0755 "$(dirname "$LOCK_FILE")"
@@ -383,75 +385,95 @@ production_memory_current_json=$(jq -cn \
 
 resource_admission_samples_json='[]'
 latest_resource_admission_sample_json=null
-memory_psi_windows_json='[]'
-memory_psi_previous_total=
-memory_psi_previous_at=
-memory_psi_consecutive_hits=0
-memory_psi_phase=
+io_psi_windows_json='[]'
+io_psi_previous_total=
+io_psi_previous_at=
+io_psi_previous_monotonic_us=
+io_psi_consecutive_hits=0
+io_psi_phase=
+io_psi_phase_run=0
 
-record_memory_psi_window() {
-  local current_total=$1 current_at=$2 transition delta ratio hit consecutive
-  transition=$(monday_memory_full_psi_window \
-    "$memory_psi_previous_total" "$current_total" "$MEMORY_PSI_WINDOW_US" \
-    "$MEMORY_PSI_FULL_DELTA_LIMIT_US" "$memory_psi_consecutive_hits") || return $?
+io_psi_monotonic_us() {
+  awk '{printf "%.0f\n", $1 * 1000000}' /proc/uptime
+}
+
+record_io_psi_window() {
+  local stage=$1 current_total=$2 current_at=$3 current_monotonic_us=$4
+  local transition delta ratio hit consecutive window_us
+  [[ $current_monotonic_us =~ ^[1-9][0-9]*$ \
+    && $io_psi_previous_monotonic_us =~ ^[1-9][0-9]*$ \
+    && $current_monotonic_us -gt $io_psi_previous_monotonic_us ]] || return 2
+  window_us=$((current_monotonic_us - io_psi_previous_monotonic_us))
+  transition=$(monday_io_full_psi_window \
+    "$io_psi_previous_total" "$current_total" "$window_us" "$IO_PSI_WINDOW_US" \
+    "$IO_PSI_FULL_DELTA_LIMIT_US" "$io_psi_consecutive_hits") || return $?
   read -r delta ratio hit consecutive <<<"$transition"
-  memory_psi_windows_json=$(jq -cn \
-    --argjson windows "$memory_psi_windows_json" \
-    --arg phase "$memory_psi_phase" \
-    --arg started_at "$memory_psi_previous_at" \
+  io_psi_windows_json=$(jq -cn \
+    --argjson windows "$io_psi_windows_json" \
+    --arg phase "$io_psi_phase" \
+    --arg stage "$stage" \
+    --argjson phase_run "$io_psi_phase_run" \
+    --arg started_at "$io_psi_previous_at" \
     --arg finished_at "$current_at" \
-    --argjson previous_total_us "$memory_psi_previous_total" \
+    --argjson previous_total_us "$io_psi_previous_total" \
     --argjson current_total_us "$current_total" \
     --argjson delta_us "$delta" \
-    --argjson window_us "$MEMORY_PSI_WINDOW_US" \
+    --argjson window_us "$window_us" \
     --argjson ratio "$ratio" \
     --argjson hit "$hit" \
     --argjson consecutive_hits "$consecutive" \
-    '$windows + [{phase:$phase,started_at:$started_at,finished_at:$finished_at,
+    '$windows + [{phase:$phase,phase_run:$phase_run,stage:$stage,
+      started_at:$started_at,finished_at:$finished_at,
       previous_total_us:$previous_total_us,current_total_us:$current_total_us,
       delta_us:$delta_us,window_us:$window_us,ratio:$ratio,hit:$hit,
       consecutive_hits:$consecutive_hits}]')
-  memory_psi_previous_total=$current_total
-  memory_psi_previous_at=$current_at
-  memory_psi_consecutive_hits=$consecutive
-  ((consecutive < MEMORY_PSI_CONSECUTIVE_HIT_LIMIT))
+  io_psi_previous_total=$current_total
+  io_psi_previous_at=$current_at
+  io_psi_previous_monotonic_us=$current_monotonic_us
+  io_psi_consecutive_hits=$consecutive
+  ((consecutive < IO_PSI_CONSECUTIVE_HIT_LIMIT))
 }
 
-read_memory_psi_window() {
-  local current_total current_at
-  current_total=$(monday_memory_full_psi_total_us "$MEMORY_PSI_SOURCE") \
+read_io_psi_window() {
+  local stage=$1 current_total current_at current_monotonic_us
+  current_total=$(monday_io_full_psi_total_us "$IO_PSI_SOURCE") \
     || return 2
   current_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  record_memory_psi_window "$current_total" "$current_at"
+  current_monotonic_us=$(io_psi_monotonic_us) || return 2
+  record_io_psi_window "$stage" "$current_total" "$current_at" "$current_monotonic_us"
 }
 
-sample_memory_psi_after_window() {
-  sleep "$MEMORY_PSI_WINDOW_SECONDS"
-  read_memory_psi_window
+sample_io_psi_after_window() {
+  local stage=$1
+  sleep "$IO_PSI_WINDOW_SECONDS"
+  read_io_psi_window "$stage"
 }
 
-require_memory_psi_window() {
-  local status
-  if sample_memory_psi_after_window; then
+require_io_psi_window() {
+  local stage=$1 status
+  if sample_io_psi_after_window "$stage"; then
     return 0
   else
     status=$?
   fi
   if [[ $status -eq 1 ]]; then
-    die "memory full PSI exceeded ${MEMORY_PSI_FULL_DELTA_LIMIT_US}us for ${MEMORY_PSI_CONSECUTIVE_HIT_LIMIT} consecutive windows during phase $memory_psi_phase"
+    die "I/O full PSI exceeded ${IO_PSI_FULL_DELTA_LIMIT_US}us for ${IO_PSI_CONSECUTIVE_HIT_LIMIT} consecutive windows during phase $io_psi_phase"
   fi
-  die "memory PSI full total is missing, invalid, or regressed during phase $memory_psi_phase"
+  die "I/O PSI full total is missing, invalid, or regressed during phase $io_psi_phase"
 }
 
-begin_memory_psi_phase() {
+begin_io_psi_phase() {
   local phase=$1 index
-  memory_psi_phase=$phase
-  memory_psi_consecutive_hits=0
-  memory_psi_previous_total=$(monday_memory_full_psi_total_us "$MEMORY_PSI_SOURCE") \
-    || die "memory PSI full total is missing or invalid before phase $phase"
-  memory_psi_previous_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  io_psi_phase=$phase
+  io_psi_phase_run=$((io_psi_phase_run + 1))
+  io_psi_consecutive_hits=0
+  io_psi_previous_total=$(monday_io_full_psi_total_us "$IO_PSI_SOURCE") \
+    || die "I/O PSI full total is missing or invalid before phase $phase"
+  io_psi_previous_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  io_psi_previous_monotonic_us=$(io_psi_monotonic_us) \
+    || die "monotonic clock is unavailable before phase $phase"
   for index in 1 2 3; do
-    require_memory_psi_window
+    require_io_psi_window calibration
   done
 }
 
@@ -503,10 +525,10 @@ assert_host_memory_reserve() {
     || die "host memory reserve was consumed during the active Shadow phase: available=$available reserve=$HOST_MEMORY_RESERVE_BYTES"
 }
 
+begin_io_psi_phase resource-preflight
 admit_resource_phase resource-preflight "$maximum_sequential_phase_memory_bytes"
 resource_preflight_json=$latest_resource_admission_sample_json
-begin_memory_psi_phase resource-preflight
-resource_preflight_psi_windows_json=$memory_psi_windows_json
+resource_preflight_psi_windows_json=$io_psi_windows_json
 
 [[ ${base_spool_dir[spot]} == /data/monday/spool/binance-lob-rust-shadow/spot ]] \
   || die 'Spot shadow spool path is not isolated'
@@ -538,7 +560,7 @@ if [[ $resource_preflight_only == true ]]; then
     --argjson maximum_sequential_phase_memory_bytes \
       "$maximum_sequential_phase_memory_bytes" \
     --argjson resource_preflight "$resource_preflight_json" \
-    --argjson memory_full_psi_windows "$resource_preflight_psi_windows_json" \
+    --argjson io_full_psi_windows "$resource_preflight_psi_windows_json" \
     '{schema:$schema,candidate_sha256:$candidate_sha256,
       runtime_contract_sha256:$runtime_contract_sha256,
       deployment_bundle_sha256:$deployment_bundle_sha256,
@@ -548,7 +570,7 @@ if [[ $resource_preflight_only == true ]]; then
       production_memory_current_bytes:$production_memory_current_bytes,
       maximum_sequential_phase_memory_bytes:$maximum_sequential_phase_memory_bytes,
       resource_preflight:$resource_preflight,
-      memory_full_psi_windows:$memory_full_psi_windows,passed:true}'
+      io_full_psi_windows:$io_full_psi_windows,passed:true}'
   exit 0
 fi
 
@@ -630,7 +652,7 @@ write_run_json() {
       "$maximum_sequential_phase_memory_bytes" \
     --argjson resource_preflight "$resource_preflight_json" \
     --argjson resource_admission_samples "$resource_admission_samples_json" \
-    --argjson memory_full_psi_windows "$memory_psi_windows_json" \
+    --argjson io_full_psi_windows "$io_psi_windows_json" \
     --argjson test_only "$test_only" \
     '{schema:$schema,run_id:$run_id,created_at:$created_at,
       candidate_sha256:$candidate_sha256,
@@ -646,7 +668,7 @@ write_run_json() {
       maximum_sequential_phase_memory_bytes:$maximum_sequential_phase_memory_bytes,
       resource_preflight:$resource_preflight,
       resource_admission_samples:$resource_admission_samples,
-      memory_full_psi_windows:$memory_full_psi_windows,
+      io_full_psi_windows:$io_full_psi_windows,
       test_only:$test_only}' >"$run_json_tmp"
   chmod 0640 "$run_json_tmp"
   mv -Tf "$run_json_tmp" "$run_json"
@@ -661,6 +683,11 @@ strict_verifier_unit=
 strict_verifier_counter=0
 upload_drain_unit=
 upload_drain_counter=0
+io_psi_monitor_pid=
+io_psi_monitor_file=
+active_process_pid=
+active_process_pgid=
+active_process_file="$tmp_dir/active-process"
 stop_strict_verifier() {
   if [[ -n $strict_verifier_unit ]]; then
     systemctl stop "$strict_verifier_unit" >/dev/null 2>&1 || true
@@ -674,67 +701,195 @@ stop_upload_drain() {
   fi
 }
 
-run_active_memory_psi_command() {
-  local stop_callback=$1 child status second child_active
+terminate_active_process_file() {
+  local file=$1 pid pgid signal second
+  [[ -s $file ]] || return 0
+  read -r pid pgid <"$file" || return 0
+  [[ $pid =~ ^[1-9][0-9]*$ && $pgid =~ ^[1-9][0-9]*$ ]] || return 0
+  kill -0 "$pid" >/dev/null 2>&1 || return 0
+  for signal in TERM KILL; do
+    kill -"$signal" -- "-$pgid" >/dev/null 2>&1 \
+      || kill -"$signal" "$pid" >/dev/null 2>&1 || true
+    if [[ $signal == TERM ]]; then
+      second=$ACTIVE_PROCESS_TERM_GRACE_SECONDS
+    else
+      second=$ACTIVE_PROCESS_KILL_GRACE_SECONDS
+    fi
+    while ((second > 0)) && kill -0 "$pid" >/dev/null 2>&1; do
+      sleep 1
+      second=$((second - 1))
+    done
+    kill -0 "$pid" >/dev/null 2>&1 || return 0
+  done
+  return 1
+}
+
+io_psi_runtime_monitor() {
+  local phase=$1 phase_run=$2 output=$3 active_file=$4 gate_pid=$5 ready_file=$6
+  local previous_total previous_at previous_mono current_total current_at current_mono
+  local window_us transition delta ratio hit consecutive=0 stop_requested=false
+  trap 'stop_requested=true' TERM
+  previous_total=$(monday_io_full_psi_total_us "$IO_PSI_SOURCE") || {
+    kill -TERM "$gate_pid" >/dev/null 2>&1 || true
+    return 76
+  }
+  previous_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  previous_mono=$(io_psi_monotonic_us) || {
+    kill -TERM "$gate_pid" >/dev/null 2>&1 || true
+    return 76
+  }
+  : >"$ready_file"
+  while :; do
+    sleep "$IO_PSI_WINDOW_SECONDS" &
+    wait $! >/dev/null 2>&1 || true
+    current_total=$(monday_io_full_psi_total_us "$IO_PSI_SOURCE") || {
+      terminate_active_process_file "$active_file" || true
+      kill -TERM "$gate_pid" >/dev/null 2>&1 || true
+      return 76
+    }
+    current_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    current_mono=$(io_psi_monotonic_us) || {
+      terminate_active_process_file "$active_file" || true
+      kill -TERM "$gate_pid" >/dev/null 2>&1 || true
+      return 76
+    }
+    ((current_mono > previous_mono)) || {
+      terminate_active_process_file "$active_file" || true
+      kill -TERM "$gate_pid" >/dev/null 2>&1 || true
+      return 76
+    }
+    window_us=$((current_mono - previous_mono))
+    transition=$(monday_io_full_psi_window "$previous_total" "$current_total" \
+      "$window_us" "$IO_PSI_WINDOW_US" "$IO_PSI_FULL_DELTA_LIMIT_US" \
+      "$consecutive") || {
+      terminate_active_process_file "$active_file" || true
+      kill -TERM "$gate_pid" >/dev/null 2>&1 || true
+      return 76
+    }
+    read -r delta ratio hit consecutive <<<"$transition"
+    jq -cn --arg phase "$phase" --argjson phase_run "$phase_run" \
+      --arg stage runtime --arg started_at "$previous_at" --arg finished_at "$current_at" \
+      --argjson previous_total_us "$previous_total" --argjson current_total_us "$current_total" \
+      --argjson delta_us "$delta" --argjson window_us "$window_us" \
+      --argjson ratio "$ratio" --argjson hit "$hit" \
+      --argjson consecutive_hits "$consecutive" \
+      '{phase:$phase,phase_run:$phase_run,stage:$stage,started_at:$started_at,
+        finished_at:$finished_at,previous_total_us:$previous_total_us,
+        current_total_us:$current_total_us,delta_us:$delta_us,window_us:$window_us,
+        ratio:$ratio,hit:$hit,consecutive_hits:$consecutive_hits}' >>"$output"
+    if ((consecutive >= IO_PSI_CONSECUTIVE_HIT_LIMIT)); then
+      terminate_active_process_file "$active_file" || true
+      kill -TERM "$gate_pid" >/dev/null 2>&1 || true
+      return 75
+    fi
+    previous_total=$current_total
+    previous_at=$current_at
+    previous_mono=$current_mono
+    [[ $stop_requested == true ]] && return 0
+  done
+}
+
+start_io_psi_runtime_monitor() {
+  local ready_file index
+  [[ -z $io_psi_monitor_pid ]] || die 'I/O PSI runtime monitor is already active'
+  io_psi_monitor_file="$tmp_dir/io-psi-${io_psi_phase_run}.ndjson"
+  ready_file="$tmp_dir/io-psi-${io_psi_phase_run}.ready"
+  : >"$io_psi_monitor_file"
+  rm -f -- "$ready_file"
+  io_psi_runtime_monitor "$io_psi_phase" "$io_psi_phase_run" \
+    "$io_psi_monitor_file" "$active_process_file" "$$" "$ready_file" &
+  io_psi_monitor_pid=$!
+  for index in {1..50}; do
+    [[ -f $ready_file ]] && return 0
+    kill -0 "$io_psi_monitor_pid" >/dev/null 2>&1 \
+      || die "I/O PSI runtime monitor failed to start for phase $io_psi_phase"
+    sleep 0.1
+  done
+  die "I/O PSI runtime monitor start timed out for phase $io_psi_phase"
+}
+
+finish_io_psi_runtime_monitor() {
+  local status=0 runtime_windows='[]' second=$((IO_PSI_WINDOW_SECONDS + 2))
+  [[ -n $io_psi_monitor_pid ]] || return 0
+  kill -TERM "$io_psi_monitor_pid" >/dev/null 2>&1 || true
+  while ((second > 0)) && jobs -pr | grep -Fxq "$io_psi_monitor_pid"; do
+    sleep 1
+    second=$((second - 1))
+  done
+  if jobs -pr | grep -Fxq "$io_psi_monitor_pid"; then
+    kill -KILL "$io_psi_monitor_pid" >/dev/null 2>&1 || true
+    status=76
+  elif wait "$io_psi_monitor_pid"; then
+    :
+  else
+    status=$?
+  fi
+  if [[ -s $io_psi_monitor_file ]]; then
+    runtime_windows=$(jq -sc '.' "$io_psi_monitor_file") || status=76
+    io_psi_windows_json=$(jq -cn --argjson existing "$io_psi_windows_json" \
+      --argjson runtime "$runtime_windows" '$existing + $runtime')
+  fi
+  io_psi_monitor_pid=
+  io_psi_monitor_file=
+  ((status == 0)) || return "$status"
+}
+
+assert_io_psi_runtime_monitor() {
+  if [[ -z $io_psi_monitor_pid ]] \
+    || ! jobs -pr | grep -Fxq "$io_psi_monitor_pid"; then
+    die "I/O PSI runtime monitor stopped during phase $io_psi_phase"
+  fi
+}
+
+run_active_io_psi_command() {
+  local stop_callback=$1 child status monitor_interrupted=false
   shift
   set -m
   "$@" &
   child=$!
+  active_process_pid=$child
+  active_process_pgid=$child
+  printf '%s %s\n' "$active_process_pid" "$active_process_pgid" \
+    >"$active_process_file.tmp"
+  mv -Tf "$active_process_file.tmp" "$active_process_file"
   set +m
-  if ! memory_psi_previous_total=$(monday_memory_full_psi_total_us \
-    "$MEMORY_PSI_SOURCE"); then
-    kill -TERM -- "-$child" >/dev/null 2>&1 || true
-    "$stop_callback"
-    wait "$child" >/dev/null 2>&1 || true
-    printf 'shadow gate failed: memory PSI full total is missing or invalid before active phase %s\n' \
-      "$memory_psi_phase" >&2
-    return 76
-  fi
-  memory_psi_previous_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   while jobs -pr | grep -Fxq "$child"; do
-    child_active=true
-    for ((second = 0; second < MEMORY_PSI_WINDOW_SECONDS; second++)); do
-      sleep 1
-      if ! jobs -pr | grep -Fxq "$child"; then
-        child_active=false
-        break
-      fi
-    done
-    [[ $child_active == true ]] || break
-    if read_memory_psi_window; then
-      :
-    else
-      status=$?
-      kill -TERM -- "-$child" >/dev/null 2>&1 || true
+    if [[ -n ${io_psi_monitor_pid:-} ]] \
+      && ! jobs -pr | grep -Fxq "$io_psi_monitor_pid"; then
+      monitor_interrupted=true
+      terminate_active_process_file "$active_process_file" || true
       "$stop_callback"
-      wait "$child" >/dev/null 2>&1 || true
-      if [[ $status -eq 1 ]]; then
-        printf 'shadow gate failed: memory full PSI exceeded %sus for %s consecutive windows during phase %s\n' \
-          "$MEMORY_PSI_FULL_DELTA_LIMIT_US" "$MEMORY_PSI_CONSECUTIVE_HIT_LIMIT" \
-          "$memory_psi_phase" >&2
-        return 75
-      fi
-      printf 'shadow gate failed: memory PSI full total is missing, invalid, or regressed during phase %s\n' \
-        "$memory_psi_phase" >&2
-      return 76
+      break
     fi
+    sleep 1
   done
   if wait "$child"; then
     status=0
   else
     status=$?
+    [[ $monitor_interrupted == true ]] || "$stop_callback"
   fi
+  rm -f -- "$active_process_file"
+  active_process_pid=
+  active_process_pgid=
+  [[ $monitor_interrupted == false ]] || return 76
   return "$status"
 }
 
-run_memory_psi_phase_command() {
-  local phase=$1 stop_callback=$2
-  shift 2
-  begin_memory_psi_phase "$phase"
-  run_active_memory_psi_command "$stop_callback" "$@"
+run_io_psi_phase_command() {
+  local phase=$1 phase_memory_max_bytes=$2 stop_callback=$3 status=0
+  shift 3
+  begin_io_psi_phase "$phase"
+  admit_resource_phase "$phase" "$phase_memory_max_bytes"
+  start_io_psi_runtime_monitor
+  run_active_io_psi_command "$stop_callback" "$@" || status=$?
+  finish_io_psi_runtime_monitor || status=$?
+  return "$status"
 }
 cleanup() {
   local status=$?
+  terminate_active_process_file "$active_process_file" >/dev/null 2>&1 || true
+  finish_io_psi_runtime_monitor >/dev/null 2>&1 || true
   stop_strict_verifier
   stop_upload_drain
   write_run_json >/dev/null 2>&1 || true
@@ -775,8 +930,8 @@ run_candidate_drain() {
   local market=$1 status
   upload_drain_counter=$((upload_drain_counter + 1))
   upload_drain_unit="monday-rust-upload-drain-$$-${market}-${upload_drain_counter}.service"
-  admit_resource_phase "upload-drain-$market" "$UPLOAD_DRAIN_MEMORY_MAX_BYTES"
-  if run_memory_psi_phase_command "upload-drain-$market" stop_upload_drain \
+  if run_io_psi_phase_command "upload-drain-$market" \
+    "$UPLOAD_DRAIN_MEMORY_MAX_BYTES" stop_upload_drain \
     systemd-run --quiet --wait --collect \
     --unit="$upload_drain_unit" \
     --property=KillMode=control-group \
@@ -805,13 +960,17 @@ run_candidate_drain() {
 }
 
 run_strict_verifier() {
-  local verifier_status=0
+  local verifier_status=0 outer_phase='' outer_monitor=false
+  if [[ -n ${io_psi_monitor_pid:-} ]]; then
+    outer_phase=$io_psi_phase
+    outer_monitor=true
+    finish_io_psi_runtime_monitor
+  fi
   strict_verifier_counter=$((strict_verifier_counter + 1))
   strict_verifier_unit="monday-rust-strict-verifier-$$-${strict_verifier_counter}.service"
-  admit_resource_phase "strict-verifier-$strict_verifier_counter" \
-    "$STRICT_VERIFIER_MEMORY_MAX_BYTES"
-  if run_memory_psi_phase_command "strict-verifier-$strict_verifier_counter" \
-    stop_strict_verifier systemd-run --quiet --wait --collect \
+  if run_io_psi_phase_command "strict-verifier-$strict_verifier_counter" \
+    "$STRICT_VERIFIER_MEMORY_MAX_BYTES" stop_strict_verifier \
+    systemd-run --quiet --wait --collect \
     --unit="$strict_verifier_unit" \
     --property=KillMode=control-group \
     --property=OOMScoreAdjust=500 \
@@ -824,6 +983,10 @@ run_strict_verifier() {
     stop_strict_verifier
   fi
   strict_verifier_unit=
+  if [[ $outer_monitor == true ]]; then
+    begin_io_psi_phase "$outer_phase"
+    start_io_psi_runtime_monitor
+  fi
   return "$verifier_status"
 }
 
@@ -1076,6 +1239,7 @@ validate_observation_sample() {
 
 validate_running_sample() {
   local market=$1 memory_now
+  assert_io_psi_runtime_monitor
   assert_candidate
   assert_host_memory_reserve
   systemctl is-active --quiet "${unit[$market]}" \
@@ -1110,8 +1274,9 @@ run_market_gate_phase() {
     fi
   done
   assert_candidate
+  begin_io_psi_phase "shadow-$market"
   admit_resource_phase "shadow-$market" 2147483648
-  begin_memory_psi_phase "shadow-$market"
+  start_io_psi_runtime_monitor
   market_gate_started_ns[$market]=$(date +%s%N)
   systemctl start "${unit[$market]}"
   systemctl is-active --quiet "${unit[$market]}" || die "$market shadow service is not active"
@@ -1145,6 +1310,7 @@ run_market_gate_phase() {
 
   settle_deadline=$(( $(monotonic_seconds) + health_settle_seconds ))
   while ! health_passes "$market"; do
+    assert_io_psi_runtime_monitor
     (( $(monotonic_seconds) < settle_deadline )) \
       || die "$market shadow health did not reach the fail-closed gate before the settle deadline"
     systemctl is-active --quiet "${unit[$market]}" \
@@ -1152,7 +1318,7 @@ run_market_gate_phase() {
     [[ $(systemctl_value "$market" NRestarts) == 0 ]] \
       || die "$market shadow service restarted while settling"
     assert_host_memory_reserve
-    require_memory_psi_window
+    sleep "$IO_PSI_WINDOW_SECONDS"
   done
 
   health="${spool_dir[$market]}/health.json"
@@ -1177,6 +1343,7 @@ run_market_gate_phase() {
     || die "$market has no valid active segment before observation"
   alignment_deadline=$(( $(monotonic_seconds) + GATE_SEGMENT_SECONDS + MAX_HEALTH_SILENCE_SECONDS ))
   while :; do
+    assert_io_psi_runtime_monitor
     validate_running_sample "$market"
     current_segment[$market]=$(active_segment_start_ns "${spool_dir[$market]}")
     [[ ${current_segment[$market]} =~ ^[1-9][0-9]{0,18}$ ]] \
@@ -1184,7 +1351,7 @@ run_market_gate_phase() {
     ((current_segment[$market] > pre_observation_segment[$market])) && break
     (( $(monotonic_seconds) < alignment_deadline )) \
       || die "$market shadow segments did not rotate after health settled"
-    require_memory_psi_window
+    sleep "$IO_PSI_WINDOW_SECONDS"
   done
   market_observation_started_ns[$market]=$(date +%s%N)
 
@@ -1193,11 +1360,9 @@ run_market_gate_phase() {
   while (( $(monotonic_seconds) < observation_deadline )); do
     now_mono=$(monotonic_seconds)
     remaining=$((observation_deadline - now_mono))
-    interval=$MEMORY_PSI_WINDOW_SECONDS
+    interval=$IO_PSI_WINDOW_SECONDS
     ((remaining < interval)) && interval=$remaining
-    if ((interval == MEMORY_PSI_WINDOW_SECONDS)); then
-      require_memory_psi_window
-    elif ((interval > 0)); then
+    if ((interval > 0)); then
       sleep "$interval"
     fi
     validate_running_sample "$market"
@@ -1251,6 +1416,7 @@ run_market_gate_phase() {
   full_stream_coverage_verified[$market]=$(jq -c '.full_stream_coverage_verified' "$health")
 
   systemctl stop "${unit[$market]}"
+  finish_io_psi_runtime_monitor
   systemctl is-active --quiet "${unit[$market]}" \
     && die "$market shadow service remained active after stop"
   assert_candidate
@@ -1314,16 +1480,17 @@ verify_oss_round_trips() {
   local round_trips='[]'
   local -a strict_verifier_segments=()
 
-  begin_memory_psi_phase "oss-roundtrip-$market"
+  begin_io_psi_phase "oss-roundtrip-$market"
+  start_io_psi_runtime_monitor
 
-  run_active_memory_psi_command : manifest_uris "$market" "$listing" >"$uris"
+  run_active_io_psi_command : manifest_uris "$market" "$listing" >"$uris"
   : >"$candidates"
   : >"$unsafe_candidates"
   while IFS= read -r uri; do
     [[ -n $uri ]] || continue
     manifest="$tmp_dir/${market}-scan-$index.json"
     index=$((index + 1))
-    run_active_memory_psi_command : run_oss "$market" cp "$uri" "$manifest" \
+    run_active_io_psi_command : run_oss "$market" cp "$uri" "$manifest" \
       --force --no-progress >/dev/null
     if ! jq -e \
       --arg market "$market" \
@@ -1494,25 +1661,25 @@ verify_oss_round_trips() {
     zst_uri="${uri%/*}/$file"
     zst_path="$segment_dir/$file"
     manifest_path="$segment_dir/${file}.manifest.json"
-    run_active_memory_psi_command : run_oss "$market" cp "$uri" "$manifest_path" \
+    run_active_io_psi_command : run_oss "$market" cp "$uri" "$manifest_path" \
       --force --no-progress >/dev/null
     actual_manifest_digest=$(sha256sum "$manifest_path" | awk '{print $1}')
     [[ $actual_manifest_digest == "$manifest_digest" ]] \
       || die "$market manifest changed between discovery and readback: $uri"
-    run_active_memory_psi_command : run_oss "$market" cp "$zst_uri" "$zst_path" \
+    run_active_io_psi_command : run_oss "$market" cp "$zst_uri" "$zst_path" \
       --force --no-progress >/dev/null
     digest_output="$segment_dir/data.sha256"
-    run_active_memory_psi_command : sha256sum "$zst_path" >"$digest_output"
+    run_active_io_psi_command : sha256sum "$zst_path" >"$digest_output"
     actual_digest=$(awk '{print $1}' "$digest_output")
     [[ $actual_digest == "$digest" ]] || die "$market OSS round-trip digest mismatch: $zst_uri"
     success_uri="${uri%/*}/${file}._SUCCESS"
     success_path="$segment_dir/${file}._SUCCESS"
-    run_active_memory_psi_command : run_oss "$market" cp "$success_uri" "$success_path" \
+    run_active_io_psi_command : run_oss "$market" cp "$success_uri" "$success_path" \
       --force --no-progress >/dev/null
     printf '%s\n' "$digest" | cmp -s - "$success_path" \
       || die "$market OSS success marker does not match segment SHA-256: $success_uri"
     manifest_symbol_count=$(jq -er '.symbols | length' "$manifest")
-    family_counts=$(zstd -q -d -c "$zst_path" | jq -ec -n \
+    family_counts=$(run_active_io_psi_command : zstd -q -d -c "$zst_path" | jq -ec -n \
       --arg schema "$tape_schema" \
       --arg market "$market" \
       --argjson symbol_count "$manifest_symbol_count" \
@@ -1703,6 +1870,7 @@ verify_oss_round_trips() {
     <<<"$round_trips" >/dev/null \
     || die "$market LOB evidence crosses a capture-session or observation boundary"
 
+  finish_io_psi_runtime_monitor
   jq -cn --arg tape_schema "$tape_schema" --argjson round_trips "$round_trips" \
     '{tape_schema:$tape_schema,round_trips:$round_trips}'
 }
@@ -1828,7 +1996,7 @@ jq -n \
     "$maximum_sequential_phase_memory_bytes" \
   --argjson resource_preflight "$resource_preflight_json" \
   --argjson resource_admission_samples "$resource_admission_samples_json" \
-  --argjson memory_full_psi_windows "$memory_psi_windows_json" \
+  --argjson io_full_psi_windows "$io_psi_windows_json" \
   --argjson segment_seconds "$GATE_SEGMENT_SECONDS" \
   --argjson duration_seconds "$duration_seconds" \
   --argjson test_only "$test_only" \
@@ -1852,7 +2020,7 @@ jq -n \
     maximum_sequential_phase_memory_bytes:$maximum_sequential_phase_memory_bytes,
     resource_preflight:$resource_preflight,
     resource_admission_samples:$resource_admission_samples,
-    memory_full_psi_windows:$memory_full_psi_windows,
+    io_full_psi_windows:$io_full_psi_windows,
     segment_seconds:$segment_seconds,
     duration_seconds:$duration_seconds,
     test_only:$test_only,checks_passed:$checks_passed,

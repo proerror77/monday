@@ -146,8 +146,8 @@ monday_production_memory_growth_headroom() {
   printf '%s\n' "$((target - current))"
 }
 
-# Read the cumulative memory-full stall time from a Linux PSI source.
-monday_memory_full_psi_total_us() {
+# Read the cumulative I/O-full stall time from a Linux PSI source.
+monday_io_full_psi_total_us() {
   [[ $# -eq 1 && -f $1 && ! -L $1 ]] || return 2
   awk '
     $1 == "full" {
@@ -166,21 +166,27 @@ monday_memory_full_psi_total_us() {
   ' "$1"
 }
 
-# Output: delta_us ratio hit consecutive_hits. A full-stall delta at the
-# threshold is a hit; any non-hit resets the consecutive counter.
-monday_memory_full_psi_window() {
-  [[ $# -eq 5 ]] || return 2
-  local previous=$1 current=$2 window_us=$3 threshold_us=$4 consecutive=$5
+# Output: delta_us ratio hit consecutive_hits. The threshold is normalized to
+# its reference window so scheduler and validation time cannot inflate a hit.
+# Any non-hit resets the consecutive counter.
+monday_io_full_psi_window() {
+  [[ $# -eq 6 ]] || return 2
+  local previous=$1 current=$2 window_us=$3 reference_window_us=$4
+  local threshold_us=$5 consecutive=$6
   local value delta hit next ratio
 
-  for value in "$previous" "$current" "$window_us" "$threshold_us" "$consecutive"; do
+  for value in "$previous" "$current" "$window_us" "$reference_window_us" \
+    "$threshold_us" "$consecutive"; do
     [[ $value =~ ^(0|[1-9][0-9]{0,18})$ ]] || return 2
     # shellcheck disable=SC2071
     (( ${#value} < 19 )) || [[ $value < 9223372036854775808 ]] || return 2
   done
-  ((current >= previous && window_us > 0 && threshold_us > 0)) || return 2
+  ((current >= previous && window_us > 0 && reference_window_us > 0 \
+    && threshold_us > 0)) || return 2
   delta=$((current - previous))
-  if ((delta >= threshold_us)); then
+  if awk -v delta="$delta" -v window="$window_us" \
+    -v threshold="$threshold_us" -v reference="$reference_window_us" \
+    'BEGIN { exit !((delta / window) >= (threshold / reference)) }'; then
     hit=true
     next=$((consecutive + 1))
   else

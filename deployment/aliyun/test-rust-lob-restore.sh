@@ -188,6 +188,17 @@ setup_fixture() {
   done
   RUNTIME_CONTRACT_SHA256=$(monday_rust_lob_runtime_contract_sha256 \
     "$CANDIDATE_DEPLOYMENT")
+  psi_windows=$(jq -cn '
+    ["resource-preflight","shadow-spot","upload-drain-spot","shadow-usdm",
+      "upload-drain-usdm","oss-roundtrip-spot","strict-verifier-1",
+      "oss-roundtrip-usdm"] as $phases
+    | [$phases | to_entries[] as $entry
+      | range(0; (if $entry.value == "resource-preflight" then 3 else 4 end)) as $index
+      | {phase:$entry.value,phase_run:($entry.key + 1),
+         stage:(if $index < 3 then "calibration" else "runtime" end),
+         started_at:"2026-08-28T00:00:00Z",finished_at:"2026-08-28T00:00:15Z",
+         previous_total_us:0,current_total_us:0,delta_us:0,window_us:15000000,
+         ratio:0,hit:false,consecutive_hits:0}]')
   jq -n \
     --arg artifact "$CANDIDATE_SHA256" \
     --arg runtime_contract "$RUNTIME_CONTRACT_SHA256" \
@@ -298,12 +309,14 @@ setup_fixture() {
     --arg run_spool "/data/monday/spool/binance-lob-rust-shadow/runs/$CANDIDATE_SHA256/20260820T000000Z-1" \
     --argjson market "$market" \
     --argjson usdm_market "$usdm_market" \
+    --argjson psi_windows "$psi_windows" \
     '{schema:"monday.rust_lob_shadow_gate.v4",candidate_sha256:$artifact,
       runtime_contract_sha256:$runtime_contract,
       deployment_bundle_sha256:$bundle,deployment_source_revision:$source,
       run_id:$run_id,run_spool:$run_spool,
       required_duration_seconds:240,requested_duration_seconds:240,
       health_settle_seconds:240,segment_seconds:120,test_only:false,
+      io_full_psi_windows:$psi_windows,
       observation_started_ns:150,
       passed:true,production_eligible:true,checks_passed:true,duration_seconds:240,
       markets:{spot:$market,usdm:$usdm_market}}' \

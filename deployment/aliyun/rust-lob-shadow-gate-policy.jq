@@ -1,8 +1,11 @@
-def valid_memory_full_psi_windows:
+def valid_io_full_psi_windows:
   type == "array"
   and length >= 3
   and all(.[];
     (.phase | type) == "string" and (.phase | length) > 0
+    and (.phase_run | type) == "number"
+    and .phase_run == (.phase_run | floor) and .phase_run > 0
+    and (.stage == "calibration" or .stage == "runtime")
     and (.started_at | type) == "string"
     and (.started_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
     and (.finished_at | type) == "string"
@@ -15,22 +18,26 @@ def valid_memory_full_psi_windows:
     and .current_total_us == (.current_total_us | floor)
     and .current_total_us >= .previous_total_us
     and .delta_us == (.current_total_us - .previous_total_us)
-    and .window_us == 15000000
+    and (.window_us | type) == "number"
+    and .window_us == (.window_us | floor) and .window_us > 0
     and (.ratio | type) == "number" and .ratio >= 0
-    and .hit == (.delta_us >= 150000)
+    and (((.ratio - (.delta_us / .window_us)) as $difference
+      | (if $difference < 0 then -$difference else $difference end)) <= 0.000000001)
+    and .hit == ((.delta_us / .window_us) >= (150000 / 15000000))
     and (.consecutive_hits | type) == "number"
     and .consecutive_hits == (.consecutive_hits | floor)
     and .consecutive_hits >= 0 and .consecutive_hits < 3)
   and (reduce .[] as $window
-    ({phase:null,hits:0,current:null,valid:true};
-      (if .phase == $window.phase then .hits else 0 end) as $previous_hits
+    ({key:null,hits:0,current:null,valid:true};
+      ([$window.phase,$window.phase_run,$window.stage]) as $key
+      | (if .key == $key then .hits else 0 end) as $previous_hits
       | (if $window.hit then ($previous_hits + 1) else 0 end) as $expected_hits
       | .valid = (.valid
           and $window.consecutive_hits == $expected_hits
-          and (if .phase == $window.phase then
+          and (if .key == $key then
             $window.previous_total_us == .current
           else true end))
-      | .phase = $window.phase
+      | .key = $key
       | .hits = $expected_hits
       | .current = $window.current_total_us)
     | .valid);
@@ -66,15 +73,23 @@ and .test_only == false
 and .passed == true
 and .production_eligible == true
 and .checks_passed == true
-and (.memory_full_psi_windows | valid_memory_full_psi_windows)
-and ([.memory_full_psi_windows[].phase] as $phases
-  | all(["resource-preflight","shadow-spot","upload-drain-spot","shadow-usdm",
-      "upload-drain-usdm","oss-roundtrip-spot","oss-roundtrip-usdm"][];
-      . as $required | ([$phases[] | select(. == $required)] | length) >= 3)
-  and ([$phases[] | select(startswith("strict-verifier-"))] | length) >= 3)
-and (([.memory_full_psi_windows[].phase] | unique) as $psi_phases
-  | all($psi_phases[]; . as $phase
-    | ([$gate.memory_full_psi_windows[] | select(.phase == $phase)] | length) >= 3))
+and (.io_full_psi_windows | valid_io_full_psi_windows)
+and (["resource-preflight","shadow-spot","upload-drain-spot","shadow-usdm",
+    "upload-drain-usdm","oss-roundtrip-spot","oss-roundtrip-usdm"] as $required
+  | all($required[]; . as $phase
+      | ([$gate.io_full_psi_windows[]
+          | select(.phase == $phase and .stage == "calibration")] | length) >= 3)
+  and all($required[1:][]; . as $phase
+      | ([$gate.io_full_psi_windows[]
+          | select(.phase == $phase and .stage == "runtime")] | length) >= 1))
+and ([.io_full_psi_windows[] | select(.phase | startswith("strict-verifier-"))]
+  | length >= 4
+  and ([.[].phase] | unique) as $strict_phases
+  | all($strict_phases[]; . as $phase
+      | ([$gate.io_full_psi_windows[]
+          | select(.phase == $phase and .stage == "calibration")] | length) >= 3
+      and ([$gate.io_full_psi_windows[]
+          | select(.phase == $phase and .stage == "runtime")] | length) >= 1))
 and (.duration_seconds | type) == "number"
 and .duration_seconds == (.duration_seconds | floor)
 and .duration_seconds >= 240
