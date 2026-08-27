@@ -58,6 +58,14 @@ configure_paths /
   exit 1
 }
 
+native_mode() {
+  if [[ $(uname -s) == Darwin ]]; then
+    /usr/bin/stat -f %Lp "$1"
+  else
+    /usr/bin/stat -c %a "$1"
+  fi
+}
+
 stat() {
   if [[ ${1:-} == -c ]]; then
     local format=$2
@@ -68,6 +76,12 @@ stat() {
         # Values are populated by configure_paths() from the sourced script.
         # shellcheck disable=SC2153
         case "$1" in
+          "$QUEUE_ROOT"/*/legacy-unreceipted/*/date=*/hour=*/*.jsonl.part)
+            [[ $(native_mode "$1") == 440 ]] && printf '0\n' || printf '4241\n'
+            ;;
+          "$QUEUE_ROOT"/*/legacy-unreceipted|"$QUEUE_ROOT"/*/legacy-unreceipted/*)
+            printf '0\n'
+            ;;
           "$CANONICAL_ROOT/spot"|"$CANONICAL_ROOT/usdm"|"$QUEUE_ROOT"/*/*.ready|"$QUEUE_ROOT"/*/*.running|"$QUEUE_ROOT"/*/*.failed|*/.binance-lob-archiver.lock)
             printf '4241\n'
             ;;
@@ -77,6 +91,15 @@ stat() {
       %g)
         # shellcheck disable=SC2153
         case "$1" in
+          "$QUEUE_ROOT"/*/legacy-unreceipted/*/date=*/hour=*/*.jsonl.part)
+            [[ $(native_mode "$1") == 440 ]] && printf '0\n' || printf '4242\n'
+            ;;
+          "$QUEUE_ROOT"/*/legacy-unreceipted)
+            printf '4242\n'
+            ;;
+          "$QUEUE_ROOT"/*/legacy-unreceipted/*)
+            printf '0\n'
+            ;;
           "$CANONICAL_ROOT/spot"|"$CANONICAL_ROOT/usdm"|*/.binance-lob-archiver.lock|"$QUEUE_ROOT"|"$QUEUE_ROOT"/*)
             printf '4242\n'
             ;;
@@ -84,17 +107,31 @@ stat() {
         esac
         ;;
       %a)
-        if [[ $(uname -s) == Darwin ]]; then
-          /usr/bin/stat -f %Lp "$1"
-        else
-          /usr/bin/stat -c %a "$1"
-        fi
+        native_mode "$1"
         ;;
       %d)
         if [[ $(uname -s) == Darwin ]]; then
           /usr/bin/stat -f %d "$1"
         else
           /usr/bin/stat -c %d "$1"
+        fi
+        ;;
+      %h|%s)
+        if [[ $(uname -s) == Darwin ]]; then
+          if [[ $format == %h ]]; then
+            /usr/bin/stat -f %l "$1"
+          else
+            /usr/bin/stat -f %z "$1"
+          fi
+        else
+          /usr/bin/stat -c "$format" "$1"
+        fi
+        ;;
+      '%d:%i:%h:%u:%g:%a:%s:%Y')
+        if [[ $(uname -s) == Darwin ]]; then
+          /usr/bin/stat -f '%d:%i:%l:%u:%g:%Lp:%z:%m' "$1"
+        else
+          /usr/bin/stat -c "$format" "$1"
         fi
         ;;
       *) return 2 ;;
@@ -141,9 +178,15 @@ sha256sum() {
 
 install() {
   local -a args=()
+  local owner='' group='' destination
   while (($#)); do
     case "$1" in
-      -o|-g)
+      -o)
+        owner=$2
+        shift 2
+        ;;
+      -g)
+        group=$2
         shift 2
         ;;
       *)
@@ -152,6 +195,10 @@ install() {
         ;;
     esac
   done
+  destination=${args[${#args[@]}-1]}
+  if [[ $destination == *.jsonl.part.sealed.* ]]; then
+    [[ $owner == root && $group == root ]] || return 1
+  fi
   command install "${args[@]}"
 }
 
@@ -336,7 +383,7 @@ activate_controller_fixture() {
 }
 
 run_action() (
-  local fixture=$1 action=$2 market=$3
+  local fixture=$1 action=$2 market=$3 failed_job_id=${4:-}
   configure_paths "$fixture"
   # MARKET is consumed by functions from the sourced recovery script.
   # shellcheck disable=SC2034
@@ -350,6 +397,7 @@ run_action() (
       isolate_market
       ;;
     drain) drain_market ;;
+    reconcile-legacy) reconcile_legacy_prefixes "$failed_job_id" ;;
     *) exit 2 ;;
   esac
 )
@@ -379,11 +427,11 @@ assert() {
 }
 
 expect_failure() {
-  local fixture=$1 action=$2 market=$3 status
+  local fixture=$1 action=$2 market=$3 extra=${4:-} status
   set +e
   (
     set -Eeuo pipefail
-    run_action "$fixture" "$action" "$market"
+    run_action "$fixture" "$action" "$market" "$extra"
   )
   status=$?
   set -e
@@ -391,6 +439,101 @@ expect_failure() {
     printf 'expected failure: %s %s\n' "$action" "$market" >&2
     exit 1
   fi
+}
+
+stage_legacy_reconciliation_fixture() {
+  local fixture=$1 legacy_payload=${2:-$'row-one\n'}
+  local ready_dir failed_dir evidence_dir backup receipt result relative release bundle source
+  setup_fixture "$fixture"
+  relative=date=2026-08-24/hour=12/part-1787572800000177730.jsonl.part
+  mkdir -p "$CANONICAL_ROOT/spot/${relative%/*}"
+  printf 'row-one\nrow-two\n' >"$CANONICAL_ROOT/spot/$relative"
+  run_action "$fixture" isolate spot
+  ready_dir=$(find "$QUEUE_ROOT/spot" -mindepth 1 -maxdepth 1 -type d -name '*.ready' -print -quit)
+  [[ -n $ready_dir ]] || exit 1
+  STAGED_FAILED_JOB_ID=$(jq -er '.job_id' "$ready_dir/job.json")
+  failed_dir="$QUEUE_ROOT/spot/$STAGED_FAILED_JOB_ID.failed"
+  mv "$ready_dir" "$failed_dir"
+  release=$(jq -er '.release_sha256' "$failed_dir/job.json")
+  bundle=$(jq -er '.deployment_bundle_sha256' "$failed_dir/job.json")
+  source=$(jq -er '.deployment_source_revision' "$failed_dir/job.json")
+  evidence_dir="$EVIDENCE_ROOT/$STAGED_FAILED_JOB_ID"
+  backup="$evidence_dir/recovery-input/$relative"
+  receipt="$evidence_dir/recovery-input/receipt.json"
+  result="$evidence_dir/result.json"
+  mkdir -p "${backup%/*}"
+  install -m 0440 "$failed_dir/$relative" "$backup"
+  jq -n \
+    --arg artifact "$release" --arg bundle "$bundle" --arg source "$source" \
+    --arg path "$relative" \
+    --arg sha256 "$(sha256sum "$backup" | awk '{print $1}')" \
+    --argjson bytes "$(wc -c <"$backup" | tr -d '[:space:]')" '
+      {schema:"monday.binance-lob-recovery-input.v2",artifact_sha256:$artifact,
+       deployment_source_revision:$source,deployment_bundle_sha256:$bundle,
+       market:"spot",dataset:"spot_all",shard_id:"all",
+       files:[{path:$path,sha256:$sha256,bytes:$bytes}]}' >"$receipt"
+  chmod 0640 "$receipt"
+  jq -n \
+    --arg job_id "$STAGED_FAILED_JOB_ID" --arg release "$release" \
+    --arg bundle "$bundle" --arg source "$source" '
+      {schema:"monday.rust_lob_recovery_queue_result.v1",job_id:$job_id,
+       market:"spot",release_sha256:$release,deployment_bundle_sha256:$bundle,
+       deployment_source_revision:$source,result:"failed"}' >"$result"
+  chmod 0640 "$result"
+  STAGED_LEGACY_NAME="20260824T130608Z-spot-${release:0:12}-3055322.running"
+  STAGED_LEGACY_ROOT="$QUEUE_ROOT/spot/legacy-unreceipted"
+  mkdir -p "$STAGED_LEGACY_ROOT/$STAGED_LEGACY_NAME/${relative%/*}"
+  chmod 0750 "$STAGED_LEGACY_ROOT"
+  chmod 0700 "$STAGED_LEGACY_ROOT/$STAGED_LEGACY_NAME"
+  printf '%s' "$legacy_payload" >"$STAGED_LEGACY_ROOT/$STAGED_LEGACY_NAME/$relative"
+  chmod 0644 "$STAGED_LEGACY_ROOT/$STAGED_LEGACY_NAME/$relative"
+  : >"$MOCK_SYSTEMCTL_LOG"
+  : >"$MOCK_CALLS_LOG"
+}
+
+test_legacy_prefix_reconciliation_archives_without_upload() {
+  local fixture=$tmp_dir/legacy-reconciliation reconciliation archived_part
+  stage_legacy_reconciliation_fixture "$fixture"
+  run_action "$fixture" reconcile-legacy spot "$STAGED_FAILED_JOB_ID"
+  reconciliation="$LEGACY_RECONCILIATION_ROOT/$STAGED_FAILED_JOB_ID"
+  archived_part="$reconciliation/spool/$STAGED_LEGACY_NAME/date=2026-08-24/hour=12/part-1787572800000177730.jsonl.part"
+  assert legacy-archived test -d "$reconciliation/spool/$STAGED_LEGACY_NAME"
+  assert legacy-sealed test "$(native_mode "$archived_part")" = 440
+  assert legacy-left-queue test ! -e "$STAGED_LEGACY_ROOT"
+  assert failed-job-preserved test -d "$QUEUE_ROOT/spot/$STAGED_FAILED_JOB_ID.failed"
+  jq -e \
+    --arg legacy "$STAGED_LEGACY_NAME" '
+      .schema == "monday.rust_lob_legacy_reconciliation.v1"
+      and .result == "passed"
+      and (.entries | length == 1)
+      and .entries[0].legacy_directory == $legacy
+      and .entries[0].path == "date=2026-08-24/hour=12/part-1787572800000177730.jsonl.part"
+      and .entries[0].bytes == 8
+      and .entries[0].backup_path == .entries[0].path
+      and (.entries[0].legacy_sha256 | test("^[a-f0-9]{64}$"))
+      and (.entries[0].backup_sha256 | test("^[a-f0-9]{64}$"))
+      and .entries[0].prefix_equal == true' \
+    "$reconciliation/reconciliation.json" >/dev/null
+  (cd "$reconciliation" && sha256sum --check --strict RECONCILED.sha256 >/dev/null)
+  assert reconciliation-no-binary test ! -s "$MOCK_CALLS_LOG"
+  assert reconciliation-no-systemctl test ! -s "$MOCK_SYSTEMCTL_LOG"
+  run_action "$fixture" reconcile-legacy spot "$STAGED_FAILED_JOB_ID"
+  chmod 0640 "$archived_part"
+  printf 'drift\n' >>"$archived_part"
+  chmod 0440 "$archived_part"
+  expect_failure "$fixture" reconcile-legacy spot "$STAGED_FAILED_JOB_ID"
+}
+
+test_legacy_non_prefix_fails_without_moving_data() {
+  local fixture=$tmp_dir/legacy-non-prefix legacy_part
+  stage_legacy_reconciliation_fixture "$fixture" $'different\n'
+  legacy_part="$STAGED_LEGACY_ROOT/$STAGED_LEGACY_NAME/date=2026-08-24/hour=12/part-1787572800000177730.jsonl.part"
+  expect_failure "$fixture" reconcile-legacy spot "$STAGED_FAILED_JOB_ID"
+  assert non-prefix-preserved test -d "$STAGED_LEGACY_ROOT/$STAGED_LEGACY_NAME"
+  assert non-prefix-original-still-writable test "$(native_mode "$legacy_part")" = 644
+  assert non-prefix-no-sealed test -z "$(find "$STAGED_LEGACY_ROOT" -name '*.sealed.*' -print -quit)"
+  assert non-prefix-no-receipt test ! -e "$LEGACY_RECONCILIATION_ROOT/$STAGED_FAILED_JOB_ID"
+  assert non-prefix-no-binary test ! -s "$MOCK_CALLS_LOG"
 }
 
 test_no_part_noop() {
@@ -860,5 +1003,7 @@ test_isolation_transaction_drift_fails_closed
 test_malformed_oldest_ready_is_not_renamed
 test_passed_running_finalizes_without_retry
 test_running_job_ignores_untrusted_in_spool_pass_result
+test_legacy_prefix_reconciliation_archives_without_upload
+test_legacy_non_prefix_fails_without_moving_data
 
 printf 'ok\n'
