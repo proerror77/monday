@@ -92,6 +92,36 @@ monday_validate_oss_prefix() {
   [[ $prefix == "lake/raw/venue=binance/market=$market/dataset=$dataset/shard=all" ]]
 }
 
+monday_validate_calendar_date() {
+  [[ $# -eq 1 ]] || return 2
+  local value=$1 year month day max_day
+  [[ $value =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})$ ]] || return 1
+  year=$((10#${BASH_REMATCH[1]})); month=$((10#${BASH_REMATCH[2]})); day=$((10#${BASH_REMATCH[3]}))
+  (( year >= 1 && month >= 1 && month <= 12 && day >= 1 )) || return 1
+  max_day=31
+  case "$month" in
+    2)
+      max_day=28
+      (( year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) )) && max_day=29
+      ;;
+    4|6|9|11) max_day=30 ;;
+  esac
+  (( day <= max_day ))
+}
+
+monday_validate_lob_object_prefix() {
+  [[ $# -eq 3 ]] || return 2
+  local market=$1 dataset=$2 prefix=$3 base suffix date_part hour_part
+  base="lake/raw/venue=binance/market=$market/dataset=$dataset/shard=all"
+  monday_validate_oss_prefix "$market" "$dataset" "$base" || return 1
+  [[ $prefix == "$base"/* ]] || return 1
+  suffix=${prefix#"$base"/}
+  [[ $suffix =~ ^date=([0-9]{4}-[0-9]{2}-[0-9]{2})/hour=([0-9]{2})$ ]] || return 1
+  date_part=${BASH_REMATCH[1]}; hour_part=${BASH_REMATCH[2]}
+  monday_validate_calendar_date "$date_part" || return 1
+  (( 10#$hour_part <= 23 ))
+}
+
 monday_path_direct_or_absent() {
   [[ $# -eq 1 ]] || return 2
   [[ ! -e $1 && ! -L $1 ]] || monday_path_direct "$1"
@@ -1582,16 +1612,19 @@ monday_validate_v2_transition() {
 }
 
 # Verify one production upload-status triplet using an injected copy function.
-# The caller owns the OSS credentials; this helper owns URI identity, triplet
-# bytes, marker content, and manifest re-download consistency.
+# Arguments 7 and 10 are independent upload-commit and capture cutoffs; a
+# zero/empty capture cutoff permits historical recovery data.  The caller owns
+# the OSS credentials; this helper owns URI identity, triplet bytes, marker
+# content, and manifest re-download consistency.
 monday_verify_upload_triplet_readback() {
-  [[ $# -eq 8 || $# -eq 9 ]] || return 2
+  [[ $# -ge 8 && $# -le 10 ]] || return 2
   local status=$1 market=$2 dataset=$3 expected_bucket=$4 expected_prefix=$5
   local tmp_root=$6 minimum_success_at=$7 copy_fn=$8 expected_session=${9:-}
+  local minimum_capture_ns_arg=${10:-}
   local triplet data_uri manifest_uri success_uri status_session triplet_session
   local data_sha manifest_sha success_sha object_prefix first_manifest second_manifest uploaded_at uploaded_ns
   local data_file manifest_file success_file expected_success_file expected_prefix_norm data_file_name
-  local success_at success_ns start_ns end_ns minimum_ns now_ns manifest_session
+  local success_at success_ns start_ns end_ns minimum_success_ns minimum_capture_ns now_ns manifest_session
   monday_file_direct "$status" || return 1
   jq -e '
     type == "object"
@@ -1614,13 +1647,23 @@ monday_verify_upload_triplet_readback() {
   [[ $market == spot || $market == usdm ]] || return 1
   monday_validate_component "$dataset" || return 1
   monday_validate_component "$expected_bucket" || return 1
-  expected_prefix_norm=${expected_prefix%/}
+  expected_prefix_norm=$expected_prefix
+  [[ $expected_prefix_norm == "${expected_prefix_norm%/}" ]] || return 1
   monday_validate_oss_prefix "$market" "$dataset" "$expected_prefix_norm" || return 1
+  if [[ -n $minimum_capture_ns_arg ]]; then
+    [[ $minimum_capture_ns_arg =~ ^[0-9]+$ ]] || return 1
+    minimum_capture_ns=$minimum_capture_ns_arg
+  else
+    minimum_capture_ns=0
+  fi
   declare -F "$copy_fn" >/dev/null 2>&1 || return 2
   triplet=$(jq -cer '.last_uploaded_triplet | objects' "$status") || return 1
   triplet_session=$(jq -er '.session_id // empty' <<<"$triplet") || true
   if [[ -n $expected_session && -n $triplet_session ]]; then
     [[ $triplet_session == "$expected_session" ]] || return 1
+  fi
+  if [[ -n $status_session && -n $triplet_session ]]; then
+    [[ $triplet_session == "$status_session" ]] || return 1
   fi
   data_sha=$(jq -er '.data_sha256' <<<"$triplet") || return 1
   manifest_sha=$(jq -er '.manifest_sha256' <<<"$triplet") || return 1
@@ -1628,20 +1671,20 @@ monday_verify_upload_triplet_readback() {
   monday_sha256_ok "$data_sha" && monday_sha256_ok "$manifest_sha" \
     && monday_sha256_ok "$success_sha" || return 1
   object_prefix=$(jq -er '.object_prefix' <<<"$triplet") || return 1
-  [[ $object_prefix == "$expected_prefix_norm" ]] || return 1
+  monday_validate_lob_object_prefix "$market" "$dataset" "$object_prefix" || return 1
   data_uri=$(jq -er '.data_uri // .object // empty' <<<"$triplet") || true
   if [[ -z $data_uri ]]; then data_uri=$(jq -er '.last_uploaded_object' "$status") || return 1; fi
   data_file_name=${data_uri##*/}
-  [[ $data_file_name =~ ^[A-Za-z0-9._-]+\.jsonl\.zst$ \
-    && $data_uri == "oss://$expected_bucket/$expected_prefix_norm/$data_file_name" \
-    && $data_uri != *'%'* && $data_uri != *'\\'* ]] || return 1
+  [[ $data_file_name =~ ^part-[0-9]+\.jsonl\.zst$ \
+    && $data_uri == "oss://$expected_bucket/$object_prefix/$data_file_name" \
+    && $data_uri != *%* && $data_uri != *\\* ]] || return 1
   manifest_uri=$(jq -er '.manifest_uri // empty' <<<"$triplet") || true
   [[ -n $manifest_uri ]] || manifest_uri="$data_uri.manifest.json"
   success_uri=$(jq -er '.success_uri // empty' <<<"$triplet") || true
   [[ -n $success_uri ]] || success_uri="$data_uri._SUCCESS"
   [[ $manifest_uri == "$data_uri.manifest.json" && $success_uri == "$data_uri._SUCCESS" \
-    && $manifest_uri != *'%'* && $manifest_uri != *'\\'* \
-    && $success_uri != *'%'* && $success_uri != *'\\'* ]] || return 1
+    && $manifest_uri != *%* && $manifest_uri != *\\* \
+    && $success_uri != *%* && $success_uri != *\\* ]] || return 1
   mkdir -p "$tmp_root" || return 1
   first_manifest="$tmp_root/$market.manifest.first"; second_manifest="$tmp_root/$market.manifest.second"
   data_file="$tmp_root/$market.data"; manifest_file="$tmp_root/$market.manifest"; success_file="$tmp_root/$market.success"
@@ -1677,23 +1720,29 @@ monday_verify_upload_triplet_readback() {
   success_ns=$(monday_iso_epoch_ns "$success_at") || return 1
   now_ns=$(date +%s%N) || return 1
   [[ $now_ns =~ ^[0-9]+$ && $success_ns -le $now_ns ]] || return 1
-  minimum_ns=0
+  minimum_success_ns=0
   if [[ -n $minimum_success_at ]]; then
-    minimum_ns=$(monday_iso_epoch_ns "$minimum_success_at") || return 1
-    [[ $success_ns -ge $minimum_ns ]] || return 1
+    minimum_success_ns=$(monday_iso_epoch_ns "$minimum_success_at") || return 1
+    [[ $success_ns -ge $minimum_success_ns ]] || return 1
   fi
   start_ns=$(jq -er '.start_received_at_ns' "$manifest_file") || return 1
   end_ns=$(jq -er '.end_received_at_ns' "$manifest_file") || return 1
   [[ $start_ns =~ ^[0-9]+$ && $end_ns =~ ^[0-9]+$ \
-    && $start_ns -ge $minimum_ns && $end_ns -ge $start_ns && $end_ns -le $now_ns ]] || return 1
+    && $start_ns -ge $minimum_capture_ns && $end_ns -ge $start_ns && $end_ns -le $now_ns ]] || return 1
   uploaded_at=$(jq -er '.uploaded_at // empty' <<<"$triplet") || true
   if [[ -n $uploaded_at ]]; then
     uploaded_ns=$(monday_iso_epoch_ns "$uploaded_at") || return 1
-    [[ $uploaded_ns -le $now_ns && $uploaded_ns -ge $minimum_ns ]] || return 1
+    [[ $uploaded_ns -le $now_ns && $uploaded_ns -ge $minimum_success_ns ]] || return 1
   fi
   manifest_session=$(jq -er '.session_id // .lob_continuity.capture_session_id' "$manifest_file") || return 1
   if [[ -n $expected_session ]]; then
     [[ $manifest_session == "$expected_session" ]] || return 1
+  fi
+  if [[ -n $status_session ]]; then
+    [[ $manifest_session == "$status_session" ]] || return 1
+  fi
+  if [[ -n $triplet_session ]]; then
+    [[ $manifest_session == "$triplet_session" ]] || return 1
   fi
   jq -cn --arg market "$market" --arg data_uri "$data_uri" --arg manifest_uri "$manifest_uri" \
     --arg success_uri "$success_uri" --arg data_sha "$data_sha" --arg manifest_sha "$manifest_sha" \

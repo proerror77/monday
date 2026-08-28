@@ -1126,24 +1126,25 @@ printf 'fixture-data\n' >"$triplet_data"
 triplet_data_sha=$(monday_sha256_file "$triplet_data")
 triplet_manifest="$triplet_root/part-1.jsonl.zst.manifest.json"
 jq -cn --arg sha "$triplet_data_sha" \
-  '{market:"spot",dataset:"spot_all",shard_id:"all",file:"part-1.jsonl.zst",sha256:$sha,session_id:"fixture-session",catalog_sha256:"fixture-catalog"}' \
+  '{schema:"binance.market_tape.v2",market:"spot",dataset:"spot_all",shard_id:"all",file:"part-1.jsonl.zst",sha256:$sha,session_id:"fixture-session",catalog_sha256:"fixture-catalog",received_at:"2026-08-27T00:00:00Z"}' \
   >"$triplet_manifest"
 triplet_success="$triplet_root/part-1.jsonl.zst._SUCCESS"
 printf '%s\n' "$triplet_data_sha" >"$triplet_success"
 triplet_success_sha=$(monday_sha256_file "$triplet_success")
 triplet_status="$triplet_root/upload-status.json"
-triplet_uri='oss://bucket/lake/raw/venue=binance/market=spot/dataset=spot_all/shard=all/part-1.jsonl.zst'
 triplet_prefix='lake/raw/venue=binance/market=spot/dataset=spot_all/shard=all'
+triplet_object_prefix="$triplet_prefix/date=2026-08-28/hour=05"
+triplet_uri="oss://bucket/$triplet_object_prefix/part-1.jsonl.zst"
 triplet_now_ns=$(( $(date +%s%N) - 120000000000 ))
 triplet_now=$(monday_epoch_ns_rfc3339 "$triplet_now_ns")
-triplet_start_ns=$((triplet_now_ns + 1000000000))
-triplet_end_ns=$((triplet_now_ns + 2000000000))
+triplet_start_ns=$((triplet_now_ns - 3600000000000))
+triplet_end_ns=$((triplet_now_ns - 3599000000000))
 jq --argjson start "$triplet_start_ns" --argjson end "$triplet_end_ns" \
   '.start_received_at_ns=$start | .end_received_at_ns=$end' \
   "$triplet_manifest" >"$triplet_manifest.tmp"
 mv -f -- "$triplet_manifest.tmp" "$triplet_manifest"
 triplet_manifest_sha=$(monday_sha256_file "$triplet_manifest")
-jq -cn --arg now "$triplet_now" --arg uri "$triplet_uri" --arg prefix "$triplet_prefix" \
+jq -cn --arg now "$triplet_now" --arg uri "$triplet_uri" --arg prefix "$triplet_object_prefix" \
   --arg data "$triplet_data_sha" --arg manifest "$triplet_manifest_sha" --arg success "$triplet_success_sha" \
   --argjson start "$triplet_start_ns" --argjson end "$triplet_end_ns" \
   '{last_success_at:$now,last_error:null,last_error_at:null,failure_count:0,discovery_failed:false,pending_batches:0,failed_batches:[],last_uploaded_triplet:{data_uri:$uri,object_prefix:$prefix,data_sha256:$data,manifest_sha256:$manifest,success_sha256:$success,uploaded_at:$now,start_received_at_ns:$start,end_received_at_ns:$end}}' \
@@ -1156,8 +1157,46 @@ copy_triplet_fixture() {
 }
 triplet_tmp="$ROOT/triplet-readback-tmp"
 triplet_readback=$(monday_verify_upload_triplet_readback "$triplet_status" spot spot_all bucket "$triplet_prefix" \
-  "$triplet_tmp" "$triplet_now" copy_triplet_fixture fixture-session)
+  "$triplet_tmp" "$triplet_now" copy_triplet_fixture fixture-session 0)
 [[ $(jq -r '.data_sha256' <<<"$triplet_readback") == "$triplet_data_sha" ]]
+# A historical capture may predate the recovery job; only the upload commit
+# must be newer than its cutoff.
+historical_readback=$(monday_verify_upload_triplet_readback "$triplet_status" spot spot_all bucket "$triplet_prefix" \
+  "$triplet_tmp" "$triplet_now" copy_triplet_fixture fixture-session 0)
+[[ $(jq -r '.session_id' <<<"$historical_readback") == fixture-session ]]
+if monday_verify_upload_triplet_readback "$triplet_status" spot spot_all bucket "$triplet_prefix" \
+    "$triplet_tmp" "$triplet_now" copy_triplet_fixture fixture-session "$triplet_now_ns" >/dev/null 2>&1; then
+  printf 'triplet readback ignored the minimum capture cutoff\n' >&2
+  exit 1
+fi
+
+bad_prefixes=(
+  "$triplet_prefix/date=2026-02-29/hour=05"
+  "$triplet_prefix/date=2026-08-28/hour=24"
+  "$triplet_prefix/date=2026-08-28/hour=05/extra"
+  "$triplet_prefix/date=2026-08-28//hour=05"
+  "$triplet_prefix/date=2026-08-28/hour=05%2Fforeign"
+  "$triplet_prefix/date=2026-08-28/hour=05/../foreign"
+  "$triplet_prefix/date=2026-08-28/hour=05/./foreign"
+)
+bad_prefixes+=("$(printf '%s\\evil' "$triplet_object_prefix")")
+for bad_prefix in "${bad_prefixes[@]}"; do
+  if jq --arg prefix "$bad_prefix" '.last_uploaded_triplet.object_prefix=$prefix' "$triplet_status" \
+      >"$triplet_status.bad-prefix" \
+    && monday_verify_upload_triplet_readback "$triplet_status.bad-prefix" spot spot_all bucket "$triplet_prefix" \
+      "$triplet_tmp" "$triplet_now" copy_triplet_fixture "" 0 >/dev/null 2>&1; then
+    printf 'triplet readback accepted malformed object prefix: %s\n' "$bad_prefix" >&2
+    exit 1
+  fi
+done
+bad_data_uri="oss://bucket/$triplet_object_prefix/../part-1.jsonl.zst"
+if jq --arg uri "$bad_data_uri" '.last_uploaded_triplet.data_uri=$uri' "$triplet_status" \
+    >"$triplet_status.bad-uri" \
+  && monday_verify_upload_triplet_readback "$triplet_status.bad-uri" spot spot_all bucket "$triplet_prefix" \
+    "$triplet_tmp" "$triplet_now" copy_triplet_fixture "" 0 >/dev/null 2>&1; then
+  printf 'triplet readback accepted a traversing data URI\n' >&2
+  exit 1
+fi
 if monday_verify_upload_triplet_readback "$triplet_status" spot spot_all bucket "$triplet_prefix" \
     "$triplet_tmp" "$triplet_now" copy_triplet_fixture changed-session >/dev/null 2>&1; then
   printf 'triplet readback accepted a mismatched current health session\n' >&2

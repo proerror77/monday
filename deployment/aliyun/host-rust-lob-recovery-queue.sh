@@ -375,7 +375,7 @@ copy_active_oss() {
 }
 
 verify_upload_triplet_readback() {
-  local spool=$1 minimum_success_at=$2 dataset bucket shard prefix tmp triplet status
+  local spool=$1 minimum_success_at=$2 minimum_capture_ns=${3:-0} dataset bucket shard prefix tmp triplet status
   status="$spool/upload-status.json"
   dataset=$(env_value "$RELEASE_ENV_FILE" DATASET) \
     || fail 'active recovery environment has no dataset'
@@ -387,7 +387,7 @@ verify_upload_triplet_readback() {
   tmp=$(mktemp -d "$(root_join "$ROOT_PREFIX" tmp)/monday-recovery-readback.XXXXXX") \
     || fail 'could not create recovery readback temp directory'
   if ! triplet=$(monday_verify_upload_triplet_readback "$status" "$MARKET" "$dataset" \
-      "$bucket" "$prefix" "$tmp" "$minimum_success_at" copy_active_oss); then
+      "$bucket" "$prefix" "$tmp" "$minimum_success_at" copy_active_oss "" "$minimum_capture_ns"); then
     rm -rf -- "$tmp"
     fail 'independent OSS triplet readback failed after recovery upload'
   fi
@@ -774,7 +774,7 @@ mark_stale() {
 }
 
 finalize_passed_running() {
-  local running_dir=$1 result evidence_root completed_at
+  local running_dir=$1 result evidence_root minimum_upload_at
   load_job "$running_dir"
   secure_release_identity
   if ! job_identity_matches_active; then
@@ -795,8 +795,11 @@ finalize_passed_running() {
       and .market == $market
       and .release_sha256 == $release_sha256' \
     "$result" >/dev/null || return 1
-  completed_at=$(jq -er '.completed_at' "$result") || return 1
-  verify_upload_triplet_readback "$running_dir" "$completed_at" || return 1
+  minimum_upload_at=$(jq -er '.started_at' "$result") || return 1
+  # The result completion time is an archival bookkeeping timestamp.  Upload
+  # freshness is anchored to the recovery start; capture timestamps remain
+  # unconstrained so historical segments can be finalized.
+  verify_upload_triplet_readback "$running_dir" "$minimum_upload_at" 0 || return 1
   [[ ! -e $evidence_root/spool.done && ! -L $evidence_root/spool.done ]] \
     || fail "refusing to reuse evidence spool path: $evidence_root/spool.done"
   mv -T -- "$running_dir" "$evidence_root/spool.done"
@@ -862,7 +865,7 @@ run_drain_job() {
     "${env_args[@]}" \
     "$release_binary" --upload-only
   check_upload_readback "$running_dir"
-  verify_upload_triplet_readback "$running_dir" "$JOB_STARTED_AT"
+  verify_upload_triplet_readback "$running_dir" "$JOB_STARTED_AT" 0
   write_result "$result_path" passed upload-readback-ok "detached spool recovered, uploaded, and archived"
   [[ ! -e $evidence_root/spool.done && ! -L $evidence_root/spool.done ]] \
     || fail "refusing to reuse evidence spool path: $evidence_root/spool.done"

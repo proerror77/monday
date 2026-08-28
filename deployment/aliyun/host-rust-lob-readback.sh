@@ -432,7 +432,7 @@ for market in spot usdm; do
       || die "${market} current health session is unavailable"
     triplet_json=$(monday_verify_upload_triplet_readback "${status_snapshot_path[$market]}" "$market" \
       "${status_dataset[$market]}" "${status_bucket[$market]}" "${status_prefix[$market]}" \
-      "$tmp" "$minimum_success_at" copy_oss "$expected_session") \
+      "$tmp" "$minimum_success_at" copy_oss "$expected_session" "$minimum_commit_ns") \
       || die "${market} independent OSS triplet readback failed"
     assert_runtime_stable
     markets=$(jq -cn --argjson prior "$markets" --argjson triplet "$triplet_json" \
