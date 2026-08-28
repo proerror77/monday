@@ -1118,7 +1118,7 @@ verify_oss_roundtrips() {
     monday_validate_lob_object_uri "$market" "${dataset[$market]}" "$expected_bucket" "$uri" manifest \
       || die "$market OSS manifest URI failed strict validation: $uri"
     object_prefix=${uri#"oss://$expected_bucket/"}
-    object_prefix=${object_prefix%/$manifest_name}
+    object_prefix=${object_prefix%/"$manifest_name"}
     [[ $object_prefix == "${expected_oss_prefix[$market]}"/* ]] \
       || die "$market OSS manifest URI is outside the configured base prefix: $uri"
     manifest="$readback/discovered-$count.json"; run_oss "$market" cp "$uri" "$manifest" --force --no-progress >/dev/null

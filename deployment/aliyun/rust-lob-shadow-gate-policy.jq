@@ -1,3 +1,19 @@
+def valid_lob_partition:
+  if test("^date=[0-9]{4}-[0-9]{2}-[0-9]{2}/hour=[0-9]{2}$") then
+    capture("^date=(?<year>[0-9]{4})-(?<month>[0-9]{2})-(?<day>[0-9]{2})/hour=(?<hour>[0-9]{2})$") as $p
+    | ($p.year | tonumber) as $year
+    | ($p.month | tonumber) as $month
+    | ($p.day | tonumber) as $day
+    | ($p.hour | tonumber) as $hour
+    | ($year >= 1 and $month >= 1 and $month <= 12 and $day >= 1 and $hour <= 23)
+    and ($day <= (if $month == 2 then
+        if ($year % 400 == 0 or ($year % 4 == 0 and $year % 100 != 0)) then 29 else 28 end
+      elif ($month == 4 or $month == 6 or $month == 9 or $month == 11) then 30
+      else 31 end))
+  else
+    false
+  end;
+
 . as $root
 | ([
     "binance-lob-archiver-recovery@.service",
@@ -252,14 +268,15 @@ and (.markets | type == "object" and ((keys | sort) == ["spot", "usdm"])
         and (.manifest_uri | type == "string")
         and (.success_uri | type == "string")
         and (
-          .data_uri as $data_uri
+          . as $triplet
+          | .data_uri as $data_uri
           | .manifest_uri as $manifest_uri
           | .success_uri as $success_uri
           | ($data_uri | capture("^oss://(?<bucket>[^/]+)/(?<prefix>.+)/(?<file>part-[0-9]+\\.jsonl\\.zst)$")) as $data
           | ($manifest_uri | capture("^oss://(?<bucket>[^/]+)/(?<prefix>.+)/(?<file>part-[0-9]+\\.jsonl\\.zst\\.manifest\\.json)$")) as $manifest
           | ($success_uri | capture("^oss://(?<bucket>[^/]+)/(?<prefix>.+)/(?<file>part-[0-9]+\\.jsonl\\.zst\\._SUCCESS)$")) as $success
           | ($data.prefix | ltrimstr($m.expected_oss_prefix + "/")) as $partition
-          | ($partition | test("^date=[0-9]{4}-[0-9]{2}-[0-9]{2}/hour=(0[0-9]|1[0-9]|2[0-3])$"))
+          | ($partition | valid_lob_partition)
           and ($data.bucket == $m.expected_oss_bucket)
           and ($manifest.bucket == $m.expected_oss_bucket)
           and ($success.bucket == $m.expected_oss_bucket)
@@ -268,7 +285,7 @@ and (.markets | type == "object" and ((keys | sort) == ["spot", "usdm"])
           and ($success.prefix == $data.prefix)
           and ($manifest.file == ($data.file + ".manifest.json"))
           and ($success.file == ($data.file + "._SUCCESS"))
-          and (.object_prefix == $data.prefix)
+          and ($triplet.object_prefix == $data.prefix)
           and ($manifest_uri == ($data_uri + ".manifest.json"))
           and ($success_uri == ($data_uri + "._SUCCESS"))
         )

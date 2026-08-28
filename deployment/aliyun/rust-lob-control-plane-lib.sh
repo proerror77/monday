@@ -135,7 +135,7 @@ monday_validate_lob_object_uri() {
   relative=${uri#"oss://$expected_bucket/"}
   [[ -n $relative && $relative != "$uri" && $relative != */ ]] || return 1
   name=${relative##*/}
-  object_prefix=${relative%/$name}
+  object_prefix=${relative%/"$name"}
   [[ -n $object_prefix && $object_prefix != "$relative" ]] || return 1
   monday_validate_lob_object_prefix "$market" "$dataset" "$object_prefix" || return 1
   case "$kind" in
@@ -1482,7 +1482,8 @@ monday_validate_v2_gate() {
               and (.manifest_uri | type == "string")
               and (.success_uri | type == "string")
               and (
-                .data_uri as $data_uri
+                . as $triplet
+                | .data_uri as $data_uri
                 | .manifest_uri as $manifest_uri
                 | .success_uri as $success_uri
                 | ($data_uri | capture("^oss://(?<bucket>[^/]+)/(?<prefix>.+)/(?<file>part-[0-9]+\\.jsonl\\.zst)$")) as $data
@@ -1498,7 +1499,7 @@ monday_validate_v2_gate() {
                 and ($success.prefix == $data.prefix)
                 and ($manifest.file == ($data.file + ".manifest.json"))
                 and ($success.file == ($data.file + "._SUCCESS"))
-                and (.object_prefix == $data.prefix)
+                and ($triplet.object_prefix == $data.prefix)
                 and ($manifest_uri == ($data_uri + ".manifest.json"))
                 and ($success_uri == ($data_uri + "._SUCCESS"))
               )

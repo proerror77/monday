@@ -517,6 +517,35 @@ if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$fake" >/dev/null 2>&1
   printf 'Gate policy accepted an extra nested triplet path\n' >&2
   exit 1
 fi
+# The standalone v5 policy and the shell validator must agree on Gregorian
+# calendar validity, including leap years, rather than accepting date-shaped
+# but impossible partitions.
+rewrite_triplet_partition_date() {
+  local source=$1 target=$2 date_value=$3
+  jq --arg date "$date_value" '
+    .markets.spot.triplets[0]
+    |= (.object_prefix |= sub("/date=[0-9]{4}-[0-9]{2}-[0-9]{2}/hour="; ("/date=" + $date + "/hour="))
+      | .data_uri |= sub("/date=[0-9]{4}-[0-9]{2}-[0-9]{2}/hour="; ("/date=" + $date + "/hour="))
+      | .manifest_uri |= sub("/date=[0-9]{4}-[0-9]{2}-[0-9]{2}/hour="; ("/date=" + $date + "/hour="))
+      | .success_uri |= sub("/date=[0-9]{4}-[0-9]{2}-[0-9]{2}/hour="; ("/date=" + $date + "/hour=")))
+  ' "$source" >"$target"
+}
+fake="$ROOT/fake-impossible-date.json"
+rewrite_triplet_partition_date "$gate" "$fake" 2026-02-29
+fake_sha=$(monday_sha256_file "$fake")
+if monday_validate_v2_gate "$fake" "$c0" "$c1" "$fake_sha"; then
+  printf 'Gate validator accepted an impossible Gregorian date\n' >&2
+  exit 1
+fi
+if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$fake" >/dev/null 2>&1; then
+  printf 'Gate policy accepted an impossible Gregorian date\n' >&2
+  exit 1
+fi
+fake="$ROOT/fake-leap-date.json"
+rewrite_triplet_partition_date "$gate" "$fake" 2024-02-29
+fake_sha=$(monday_sha256_file "$fake")
+monday_validate_v2_gate "$fake" "$c0" "$c1" "$fake_sha"
+jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$fake" >/dev/null
 for asset in "${!shadow_before_sha[@]}"; do
   if [[ $asset == *.service ]]; then target="$ROOT/etc/systemd/system/$asset"; else target="$ROOT/etc/monday/$asset"; fi
   [[ $(monday_sha256_file "$(readlink -f -- "$target")") == "${shadow_before_sha[$asset]}" ]] || {
