@@ -387,7 +387,7 @@ webhook.
 `.github/workflows/monitor-collector-host.yml` runs every 15 minutes. It
 refreshes `origin/main`, invokes `/opt/monday/bin/monday-collector-health.sh
 --json` on the host through Cloud Assistant (the same RunShellScript/Base64
-invoke pattern as `invoke-rust-lob-operation.sh`), decodes the JSON, and when
+invoke pattern as `rust-lob-control-plane.sh`), decodes the JSON, and when
 `ok:false` opens or appends a single `needs-triage` GitHub issue (deduped by
 open-issue search) following the `docs/agents/issue-tracker.md` lifecycle. It
 also opens an issue when the invocation itself cannot return a snapshot.
@@ -925,88 +925,43 @@ macOS `target/release` binary. The ACR collector image is a durable container
 publication, but the current bare ECS collector consumes the separately pinned
 OSS binary.
 
-Run the committed installer from a clean checkout at `SOURCE_REVISION`:
+Run the single operator from a clean checkout at `SOURCE_REVISION`:
 
 ```bash
 set -euo pipefail
-INSTANCE_ID=i-REPLACE \
-ARTIFACT_OSS_URI=oss://monday-lob-apne1-1045353359/releases/binance-lob-archiver/REPLACE/binance-lob-archiver \
-ARTIFACT_SHA256=REPLACE_WITH_64_HEX_DIGEST \
-SOURCE_REVISION=REPLACE_WITH_GIT_SHA \
-./deployment/aliyun/deploy-rust-lob-release.sh
+./deployment/aliyun/rust-lob-control-plane.sh release \
+  --instance i-REPLACE \
+  --uri oss://monday-lob-apne1-1045353359/releases/binance-lob-archiver/REPLACE/binance-lob-archiver \
+  --payload REPLACE_WITH_64_HEX_DIGEST \
+  --source REPLACE_WITH_GIT_SHA
 ```
 
-The installer verifies that `SOURCE_REVISION` is the clean current `HEAD`,
-uploads a digest-addressed deployment bundle, waits for Cloud Assistant, verifies
-both OSS objects on the host, runs the binary self-test, and requires the
-`--upload-only` capability. It installs only the isolated shadow unit/env files
-and the shadow symlink. Production unit/env files remain staged under:
+The operator verifies that `SOURCE_REVISION` is the clean current `HEAD`,
+publishes a digest-addressed ControllerRelease, and leaves production unchanged.
+The release binds the payload (`P`), runtime contract (`R`), deployment bundle
+(`B`), and source revision (`S`) into `C = sha256(canonical release.json)`. The
+host installs the immutable payload and controller directories; only a later
+pair cutover may change production. Payload binaries remain staged under:
 
 ```text
 /opt/monday/releases/binance-lob-archiver/<artifact-sha256>/deployment/
 ```
 
-Candidate installation refuses an unmounted `/data`, an active shadow, a digest
-mismatch, or a concurrent release operation. It does not start any service and
-does not overwrite production configuration or the production symlink. A
-pre-existing artifact directory is reusable only when its binary, deployment
-assets, artifact URI, bundle digest, bundle URI, and source revision all match
-exactly; otherwise installation fails instead of rewriting historical release
-evidence. First installation is assembled in a sibling directory and renamed
-into place only after all identity checks pass.
-
-`BUNDLE_ONLY=1` is retained only for an inactive candidate release. It keeps the
-artifact identity, verifies the installed binary SHA, archives the prior
-`release.json`, and replaces that inactive candidate's deployment bundle. It
-deliberately refuses the active production digest so historical rollback
-identity cannot be rewritten.
-
-For a controller-only change on a digest-addressed staged artifact, use the same
-command with `CONTROLLER_ONLY=1`. The staged artifact may be inactive; publication
-verifies its binary SHA, `release.json`, and runtime-contract digest before it
-uploads a digest-addressed bundle and release manifest, then publishes an
-immutable host release under:
+Publication refuses dirty source, mismatched bytes, and rewrites of an existing
+identity. It does not start, stop, or restart any service, alter `controller/active`,
+touch the data spool, or run a Gate. The controller release is stored under:
 
 ```text
 /opt/monday/releases/binance-lob-controller/<controller-release-manifest-sha256>/
 ```
 
-The release root also contains a deterministic `binance-lob-archiver` symlink
-to the exact digest-addressed artifact binary under
-`/opt/monday/releases/binance-lob-archiver/<artifact-sha256>/`. It is a derived
-payload projection, not another release identity or mutable state source; repeat
-publication verifies it and fails closed on any missing, replaced, or redirected
-projection.
+The release root also contains a deterministic payload projection to the exact
+digest-addressed binary. `controller/active` is the sole runtime identity link;
+installed files are derived cache and must match the active controller bytes.
 
-Publication requires the staged artifact URI/SHA and its runtime-contract digest
-to match the controller manifest and bundle. It does not require the production
-symlink to point at that artifact, and it does not change the production or
-controller `active` symlinks, install controller files, change systemd state,
-touch `/data`, start a Gate, or restart a collector. Applying that exact
-controller release is a separate Runtime transition with its own rollback and
-readback evidence.
-
-Apply a published controller release through the named operation wrapper:
-
-```bash
-ACTION=controller-apply \
-INSTANCE_ID=i-REPLACE \
-ARTIFACT_SHA256=REPLACE_WITH_ACTIVE_BINARY_SHA256 \
-CONTROLLER_RELEASE_SHA256=REPLACE_WITH_CONTROLLER_MANIFEST_SHA256 \
-./deployment/aliyun/invoke-rust-lob-operation.sh
-```
-
-The current allowlist permits only
-`/opt/monday/bin/monday-rust-lob-recovery-queue` to change. Both production
-collectors must remain on the named artifact with unchanged PIDs and restart
-counters; recovery services must be inactive. The operation briefly stops the
-recovery timers, applies the exact script and active-controller symlink, restores
-the prior timer state, and writes an immutable apply receipt under
-`/data/monday/evidence/controller-applies/`. Any failed mutation restores the
-prior script, controller identity, and timer state. Restore and recovery queue
-receipts use the active controller bundle/source identity. The next successful
-binary cutover clears this artifact-specific override; its rollback restores the
-override when necessary.
+The same operator invokes all later transitions. It validates exact controller
+digests and delegates business checks to the host script shipped by that
+controller; it never stores a second state machine or chooses a fallback path.
 
 The committed shadow environments use `SYMBOLS=ALL` for Spot and the same
 frozen 100-symbol USD-M production allowlist for Futures. Both keep five-minute
@@ -1025,22 +980,20 @@ The formal Gate below is the only candidate correctness and stability lane. The
 merged exact-frame parser E2E remains the parser evidence.
 
 Each session proves the exact expected subscription set on every WebSocket
-shard with `LIST_SUBSCRIPTIONS` before it requests snapshots. A
-`binance.market_tape.v2` candidate declares its per-symbol stream-type list
+shard with `LIST_SUBSCRIPTIONS` before it requests snapshots. Only a
+`binance.market_tape.v2` candidate is eligible for the V2 Gate; it declares its per-symbol stream-type list
 (`depth@100ms`, `aggTrade`, `trade`, `bookTicker`, plus USD-M-only
 `forceOrder`) in the manifest and every `session_start` row, and coverage is
-verified against that declared list. A `binance.market_tape.v1` candidate
-keeps the legacy depth-plus-`aggTrade` pair and never carries the new
-families, so the same gate can still gate a v1 binary during the transition.
+verified against that declared list. Historical `binance.market_tape.v1`
+evidence remains readable for audit only; it cannot authorize a new V2 release,
+Gate, or cutover.
 Every segment also retains the sorted stream list returned for each shard in a
 SHA-bound `stream_coverage` row, so canonical readback can recompute the exact
 catalog (symbols x declared stream types for v2, symbols x 2 for v1) instead
 of trusting a boolean alone. The resulting checkpoints, health, and manifests
 carry the derived coverage summary; health also publishes an explicit
 `full_stream_coverage_verified` decision so deploy policies can pin
-full-family coverage without weakening the depth-only readiness fields (a v1
-collector never publishes the field, and its absence stays acceptable so a
-rollback to a v1 binary remains possible during the transition). A
+full-family coverage without weakening the depth-only readiness fields. A
 symbol that receives no depth or trade event during
 a segment is complete only when it has an unchanged two-sided snapshot-backed
 checkpoint and verified stream coverage; the collector never invents a diff or
@@ -1050,53 +1003,37 @@ trade for a static symbol. Every segment must still contain at least one real
 
 ### 2. Run the short production-catalog gate
 
-Run the non-mutating host and resource preflight first. Pass the exact published
-controller release as well as the candidate artifact. The controller release is
-the only source of the Gate script, helper, and policy; the candidate supplies
-only the binary and runtime assets. It verifies both identities, deployment
-checksums, installed Shadow assets, production service state, and fresh
-`MemAvailable`, then prints one JSON result without creating Gate evidence, spool
-directories, overrides, or changing services:
+Run the formal Gate once for the exact pair. The controller release is the only
+source of the Gate script, helper, and policy; the candidate supplies only the
+payload and runtime assets. A bootstrap uses `direct` only when no controller is
+active and the running payload is byte-identical to `P0`:
 
 ```bash
 set -euo pipefail
-ACTION=gate-preflight \
-INSTANCE_ID=i-REPLACE \
-ARTIFACT_SHA256=REPLACE_WITH_64_HEX_DIGEST \
-CONTROLLER_RELEASE_SHA256=REPLACE_WITH_CONTROLLER_MANIFEST_SHA256 \
-./deployment/aliyun/invoke-rust-lob-operation.sh
+./deployment/aliyun/rust-lob-control-plane.sh gate \
+  --instance i-REPLACE \
+  --from-controller REPLACE_WITH_ACTIVE_CONTROLLER_SHA_OR_direct \
+  --candidate-controller REPLACE_WITH_CANDIDATE_CONTROLLER_SHA
 ```
 
-After that passes, start the formal Gate through the same CLI wrapper. The Gate
-repeats the preflight and does not rely on the earlier sample:
+The command executes the Gate bytes from the candidate controller directory and
+binds the receipt to `C1`, `P1`, `R1`, `B1`, and `S1`. It proves the current pair,
+candidate process, market health, and Spot/USD-M OSS evidence before writing one
+immutable schema-v5 receipt. A receipt from another controller or payload is
+not reusable. No public preflight operation exists; checks that do not create
+evidence are internal to the Gate.
 
 ```bash
 set -euo pipefail
-ACTION=gate \
-INSTANCE_ID=i-REPLACE \
-ARTIFACT_SHA256=REPLACE_WITH_64_HEX_DIGEST \
-CONTROLLER_RELEASE_SHA256=REPLACE_WITH_CONTROLLER_MANIFEST_SHA256 \
-./deployment/aliyun/invoke-rust-lob-operation.sh
+./deployment/aliyun/rust-lob-control-plane.sh gate \
+  --instance i-REPLACE \
+  --from-controller REPLACE_WITH_ACTIVE_CONTROLLER_SHA \
+  --candidate-controller REPLACE_WITH_CANDIDATE_CONTROLLER_SHA
 ```
 
-The no-controller form remains a deprecated artifact-routed compatibility
-fallback and may still produce a legacy v4 `PASSED.sha256` during the
-transition. That legacy receipt cannot authorize the future pair-bound
-cutover/readback path. Keep the controller digest paired with the current and
-rollback candidate. A controller-only change may keep the same runtime payload,
-but it does not make a v5 receipt reusable: the final controller digest must
-still be named by the Gate, cutover, and independent readback.
-A pair-bound Gate never executes control scripts, helpers, or policy files from
-the candidate artifact; those bytes must come from the controller release
-digest. The legacy no-controller fallback continues to use the candidate
-control-plane bytes and may produce v4 evidence until the removal trigger above
-is satisfied.
-
-Fallback removal trigger: once every repository caller, runbook, and test
-passes `CONTROLLER_RELEASE_SHA256`, both the current and rollback candidates
-have a named controller release, pair-bound cutover/readback consume only v5
-evidence, and one final controller digest has completed Gate -> cutover ->
-independent readback, remove the no-controller fallback in the next change.
+The Gate has no compatibility routing. Historical receipts remain readable for
+audit but cannot authorize a new transition. Failed Gate attempts block only the
+candidate cutover; they never rewrite a release or production state.
 
 The host gate owns only the runtime transition. A failed Gate blocks cutover,
 not Code, CI, Merge, or immutable Release publication. It verifies the candidate,
@@ -1161,9 +1098,9 @@ The Gate fails unless all of these are true for the entire candidate run:
 A successful production gate writes:
 
 ```text
-/data/monday/evidence/shadow-gates/<artifact-sha256>/<runtime-contract-sha256>/<controller-release-sha256>/runs/<run-id>/run.json
-/data/monday/evidence/shadow-gates/<artifact-sha256>/<runtime-contract-sha256>/<controller-release-sha256>/runs/<run-id>/gate.json
-/data/monday/evidence/shadow-gates/<artifact-sha256>/<runtime-contract-sha256>/<controller-release-sha256>/runs/<run-id>/PASSED.sha256
+/data/monday/evidence/shadow-gates/<controller-release-sha256>/<runtime-contract-sha256>/runs/<run-id>/run.json
+/data/monday/evidence/shadow-gates/<controller-release-sha256>/<runtime-contract-sha256>/runs/<run-id>/gate.json
+/data/monday/evidence/shadow-gates/<controller-release-sha256>/<runtime-contract-sha256>/runs/<run-id>/PASSED.sha256
 ```
 
 Every invocation gets a new append-only run directory; prior gate evidence is
@@ -1179,33 +1116,19 @@ requires exactly one immutable passing run. A short test override is
 available only for script testing; it writes `passed=false` and never creates
 `PASSED.sha256`, so it cannot authorize cutover.
 
-For a one-time upgrade from the pre-release layout, where the running Rust
-binary is still a regular file instead of a digest-addressed symlink, use
-`host-rust-lob-adopt-production-release.sh` through Cloud Assistant before the
-cutover. Pin both the running binary digest and the already gated candidate
-digest. The helper never starts, stops, restarts, enables, or disables a unit.
-It verifies fresh configured-catalog production health and stable PIDs/restart counts,
-copies the byte-identical running binary and current rollback assets into an
-adopted release, installs an inactive/non-installable rollback-compatibility
-upload unit, atomically replaces the regular path with the identical release
-symlink, and writes immutable adoption evidence. Any failure restores the
-original regular binary and the upload unit's original absent state. This helper
-is intentionally not part of the candidate deployment bundle, so using it does
-not mutate or invalidate an already completed shadow gate. It is not a general
-manual-symlink escape hatch and refuses partial, drifted, unhealthy, or already
-modern release layouts.
-
 ### 3. Cut over or roll back
 
-After the production gate succeeds, invoke the cutover with the same immutable
-artifact digest:
+After the production Gate succeeds, consume its exact receipt with the same
+controller pair:
 
 ```bash
 set -euo pipefail
-ACTION=cutover \
-INSTANCE_ID=i-REPLACE \
-ARTIFACT_SHA256=REPLACE_WITH_64_HEX_DIGEST \
-./deployment/aliyun/invoke-rust-lob-operation.sh
+./deployment/aliyun/rust-lob-control-plane.sh cutover \
+  --instance i-REPLACE \
+  --from REPLACE_WITH_ACTIVE_CONTROLLER_SHA_OR_direct \
+  --to REPLACE_WITH_CANDIDATE_CONTROLLER_SHA \
+  --gate-receipt /data/monday/evidence/shadow-gates/REPLACE/gate.json \
+  --gate-sha256 REPLACE_WITH_GATE_SHA
 ```
 
 The host cutover revalidates the binary, release metadata, staged deployment
@@ -1284,38 +1207,32 @@ runtime disabled and masked. If a safe restore cannot be proved, both production
 units remain disabled and masked. Cutover evidence is written under
 `/data/monday/evidence/cutovers/`.
 
-Rollback uses the same `ACTION=cutover` operation with a previously installed,
-previously gated artifact digest. There is no Python fallback and no manual
-symlink shortcut.
+Rollback uses the same pair cutover operation with an explicitly named previous
+controller and its own immutable Gate receipt. There is no alternate dispatcher
+or manual symlink shortcut.
 
 ### 4. Restore a stopped, already-gated production release
 
-If an already-gated, already-cutover release was later stopped and disabled (for
-example, during a disk-full incident), `ACTION=cutover` still cannot bring it
-back: the cutover path accepts a contained `active=0 enabled=2` emergency-stop
-state so it can transition to a new candidate, but it does not resume an already
-disabled production runtime. `host-rust-lob-restore.sh` closes that gap. It is
-fail-closed: it never rewrites the production symlink and never touches the
-digest-addressed release or its deployment assets, so the restored runtime is
-byte-identical to the cutover artifact.
+If an already-cutover release is stopped and disabled, use `restore` for the
+exact active controller. Restore never guesses a previous release and never
+accepts a candidate digest that is not the active controller. It converges the
+installed assets and runtime to the active pair, or leaves production stopped
+and masked when identity verification fails.
 
-Invoke it with the immutable artifact digest that is already on disk and already
-gated:
+Invoke it with the exact active controller digest:
 
 ```bash
 set -euo pipefail
-ACTION=restore \
-INSTANCE_ID=i-REPLACE \
-ARTIFACT_SHA256=REPLACE_WITH_64_HEX_DIGEST \
-./deployment/aliyun/invoke-rust-lob-operation.sh
+./deployment/aliyun/rust-lob-control-plane.sh restore \
+  --instance i-REPLACE \
+  --controller REPLACE_WITH_ACTIVE_CONTROLLER_SHA
 ```
 
 Before starting anything the host restore requires all of the following:
 
-1. `sha256($PRODUCTION_LINK)` matches `ARTIFACT_SHA256` and the link resolves to
-   `$RELEASE_ROOT/<sha256>/binance-lob-archiver`.
-2. Exactly one immutable passed shadow gate exists for that
-   `<sha256>/<deployment_bundle_sha256>` and it still satisfies the gate policy.
+1. The active controller link resolves to the requested digest and its manifest
+   binds the exact payload and runtime contract.
+2. The stable production link resolves to that manifest's payload.
 3. No production unit is active (a running restore is refused, never preempted).
 4. The production symlink exists (a missing symlink is refused, never recreated).
 5. The canonical spool path is a direct directory tree under `/data` (no symlink
