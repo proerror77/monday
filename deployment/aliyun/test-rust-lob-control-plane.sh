@@ -120,14 +120,21 @@ fi
 [[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == \
   "$ROOT/opt/monday/releases/binance-lob-archiver/$p1_sha/binance-lob-archiver" ]]
 
-MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+cutover_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from "$c1" --to "$c2" \
-  --gate-receipt "$gate2" --gate-sha256 "$gate2_sha" --root "$ROOT" >/dev/null
+  --gate-receipt "$gate2" --gate-sha256 "$gate2_sha" --root "$ROOT")
+transition2=$(printf '%s\n' "$cutover_output" | sed -n 's/^Transition receipt: //p')
+transition2_sha=$(printf '%s\n' "$cutover_output" | sed -n 's/^SHA-256: //p')
 rm "$ROOT/opt/monday/bin/binance-lob-archiver"
 MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c2" --root "$ROOT" >/dev/null
 [[ $(monday_active_controller_sha "$ROOT") == "$c2" ]]
 [[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == \
   "$ROOT/opt/monday/releases/binance-lob-archiver/$p2_sha/binance-lob-archiver" ]]
+[[ $(monday_sha256_file "$transition2") == "$transition2_sha" ]]
+MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-readback.sh" --controller "$c2" \
+  --transition-receipt "$transition2" --receipt-sha256 "$transition2_sha" \
+  --root "$ROOT" >/dev/null
 
 printf 'V2 Gate contract passed\n'
