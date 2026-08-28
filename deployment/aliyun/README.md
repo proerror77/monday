@@ -1019,7 +1019,7 @@ set -euo pipefail
 The command executes the Gate bytes from the candidate controller directory and
 binds the receipt to `C1`, `P1`, `R1`, `B1`, and `S1`. It proves the current pair,
 candidate process, market health, and Spot/USD-M OSS evidence before writing one
-immutable schema-v5 receipt. A receipt from another controller or payload is
+immutable schema-v6 receipt. A receipt from another controller or payload is
 not reusable. No public preflight operation exists; checks that do not create
 evidence are internal to the Gate.
 
@@ -1046,26 +1046,32 @@ monotonic time to observe at least 240 seconds. It never drains or recovers an
 older Shadow run. Any incomplete files left by a failed run remain confined to
 that run's spool and cannot block the next Gate; files already uploaded and
 cleaned retain their OSS triplet evidence instead of a duplicate local copy.
-The Shadow unit uses a 1792MiB high watermark and 2048MiB hard limit per market.
+The production lanes share the signed aggregate slice
+`system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice` with a 3072MiB
+high watermark and 3584MiB hard limit; each production child remains bounded
+at 2048MiB/2560MiB. Gate Shadow workers use a run-scoped aggregate slice and
+per-market 1280MiB high watermark/1536MiB hard limit; the source Shadow unit
+template remains at 1792MiB/2048MiB and is narrowed by that run-scoped parent
+slice when rendered.
 Five immutable passed Tokyo gates measured Spot at no more than 664,735,744 bytes
 and the former 570-symbol USD-M scope at no more than 1,789,218,816 bytes; the
-current USD-M Gate covers only the frozen Top 100. Strict readback uses a separate
-1280MiB/1536MiB reservation and carries the same non-production OOM preference as
-the Shadow collectors. Candidate upload drain uses a 384MiB/512MiB reservation, so
-the largest sequential Gate phase remains the 2048MiB Shadow collector. Before
-the Gate and before every actual phase, it reads `MemAvailable` together with
+current USD-M Gate covers only the frozen Top 100. Strict readback uses the
+same 1280MiB/1536MiB worker envelope and candidate upload drain uses a
+384MiB/512MiB envelope. Before the Gate and before every actual phase, it reads `MemAvailable` together with
 the production template's automatically assigned `Slice` and cgroup. Spot and
 USD-M must share one slice; the parent control group is `/system.slice/<Slice>`
 and their two cgroups must be direct children of it. The parent `cgroup.procs`
 must be empty, the active child set must be exactly those two services, and both
 systemd `MemoryMax` and child `memory.max` must be exactly 2,560MiB. The snapshot records parent
-`memory.current`, `memory.peak`, and `memory.events`, plus PID/executable hash
-and `NRestarts`; a five-second monitor fails closed on any membership, limit, or
-identity drift. Paired reads use the lower parent current and higher child-limit
-sum for admission. The required bytes are exactly:
+`memory.current`, `memory.peak`, `memory.stat` (`anon` and `file`), and
+`memory.events`, plus PID/executable hash and `NRestarts`; a five-second monitor
+fails closed on any membership, limit, or identity drift. Paired reads use the
+conservative `MemAvailable`/`anon` values for admission; current, file, peak,
+and events remain audit evidence. The required bytes are exactly:
 
 ```text
-host reserve (1GiB) + phase memory budget + (child memory.max sum - parent memory.current)
+host reserve (1GiB) + phase memory budget +
+(production slice MemoryMax - parent memory.stat anon)
 ```
 
 Active production usage is already reflected in `MemAvailable`; no static
@@ -1078,6 +1084,11 @@ stores the exact per-phase current/sum/growth/reserve/limit/required values and
 the production cgroup snapshot; `MemoryPeak` and `memory.events` are audit-only,
 never inputs to the formula. An over-limit or malformed phase fails closed
 instead of increasing the host size or weakening the reserve.
+The first direct bootstrap may take a narrowly scoped runtime lease when the
+legacy slice is still unlimited; the prior limits are recorded in the Gate
+receipt and restored (including on abnormal exit) before the receipt can pass.
+Cutover, restore, and readback each re-check the permanent slice and both child
+unit memberships before claiming a successful pair.
 The Gate also samples Linux I/O `full` PSI from `/proc/pressure/io` on a
 15-second cadence.
 Preflight records four cumulative samples as three windows; every resource phase
@@ -1122,9 +1133,9 @@ A successful production gate writes:
 Every invocation gets a new append-only run directory; prior gate evidence is
 never deleted or replaced. The marker hashes exactly that run's `gate.json`.
 Evidence binds the binary, the controller release digest, and the content hash
-of the eight production/Shadow unit and environment files. It records the clean
+of the nine production/Shadow unit, slice, and environment files. It records the clean
 source revision and full deployment-bundle SHA-256 separately, so a
-controller-only fix cannot reuse a prior v5 receipt; it must name the new
+controller-only fix cannot reuse a prior v6 receipt; it must name the new
 controller digest in a fresh Gate. Unit or environment changes likewise require
 a fresh Gate. A second production
 gate for an identity that already has a passing run is refused, and cutover
@@ -1253,7 +1264,8 @@ set -euo pipefail
 
 Before any unit or projection mutation, the host restore verifies the active
 controller manifest and payload digest, the active production runtime contract,
-all eight runtime assets, both controller helper projections, and the canonical
+all nine runtime assets (including the aggregate production slice), both controller
+helper projections, and the canonical
 production environment/spool paths. Every installed projection must either be
 an exact active-C symlink or contain byte-for-byte active-C content; a missing
 projection may be repaired from active `C`, but foreign, indirect, or drifted

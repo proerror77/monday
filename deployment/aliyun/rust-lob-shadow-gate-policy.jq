@@ -22,7 +22,7 @@ def expected_phase_memory_max:
     or . == "oss-readback-usdm" then
     1610612736
   elif . == "shadow-spot" or . == "shadow-usdm" then
-    2147483648
+    1610612736
   elif . == "upload-drain-spot" or . == "upload-drain-usdm" then
     536870912
   else
@@ -43,6 +43,15 @@ def valid_lob_cgroup_path:
     | ($parts[0] == "" and ($parts[1:] | length) >= 1
       and all($parts[1:][]; test("^[A-Za-z0-9_.@-]+(?:\\\\x2d[A-Za-z0-9_.@-]+)*$"))));
 
+def valid_production_asset_map($keys; $source_mode):
+  type == "object"
+  and (keys | sort) == $keys
+  and all(to_entries[];
+    ((.value | type == "string" and test("^[a-f0-9]{64}$")))
+    or ($source_mode == "direct"
+      and .key == "system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice"
+      and .value == null));
+
 . as $root
 | ([
     "binance-lob-archiver-recovery@.service",
@@ -59,6 +68,7 @@ def valid_lob_cgroup_path:
     "rust-lob-shadow-gate-policy.jq"
   ] | sort) as $controller_asset_keys
 | ([
+    "system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice",
     "binance-lob-archiver-production@.service",
     "binance-lob-archiver-upload@.service",
     "binance-lob-archiver-production-spot.env",
@@ -70,7 +80,7 @@ def valid_lob_cgroup_path:
     "binance-lob-archiver-rust-spot.env",
     "binance-lob-archiver-rust-usdm.env"
   ] | sort) as $shadow_asset_keys
-| $root.schema == "monday.rust_lob_shadow_gate.v5"
+| $root.schema == "monday.rust_lob_shadow_gate.v6"
 and .control_plane_version == 2
 and .passed == true
 and (.production_eligible | type == "boolean")
@@ -103,12 +113,15 @@ and (.before | type == "object"
   and (.payload_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
   and (.runtime_contract_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
   and (.production_projection | type == "string" and length > 0)
-  and (.production_assets | type == "object" and (keys | sort) == $production_asset_keys
-    and all(.[]; type == "string" and test("^[a-f0-9]{64}$"))))
-and (.production_assets | type == "object" and (keys | sort) == $production_asset_keys
-  and all(.[]; type == "string" and test("^[a-f0-9]{64}$")))
+  and (.production_assets | valid_production_asset_map($production_asset_keys; $root.source_mode)))
+and (.production_assets | valid_production_asset_map($production_asset_keys; $root.source_mode))
 and (.production_runtime | type == "object"
-  and .schema == "monday.rust_lob_production_runtime.v1"
+  and .schema == "monday.rust_lob_production_runtime.v2"
+  and (.slice | valid_lob_slice)
+  and .slice_memory_high == "3072M"
+  and .slice_memory_max == "3584M"
+  and (.slice_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+  and (.slice_semantics_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
   and .type == "simple"
   and .exec_start == "/opt/monday/bin/binance-lob-archiver"
   and .environment_file == "/etc/monday/binance-lob-archiver-production-%i.env"
@@ -145,10 +158,12 @@ and (.production_runtime | type == "object"
     and .timeout_start_sec == 0)
   and (.unit_sha256 | type == "object"
     and (.collector | type == "string" and test("^[a-f0-9]{64}$"))
-    and (.upload | type == "string" and test("^[a-f0-9]{64}$")))
+    and (.upload | type == "string" and test("^[a-f0-9]{64}$"))
+    and (.slice | type == "string" and test("^[a-f0-9]{64}$")))
   and (.unit_semantics_sha256 | type == "object"
     and (.collector | type == "string" and test("^[a-f0-9]{64}$"))
-    and (.upload | type == "string" and test("^[a-f0-9]{64}$")))
+    and (.upload | type == "string" and test("^[a-f0-9]{64}$"))
+    and (.slice | type == "string" and test("^[a-f0-9]{64}$")))
   and (.env_sha256 | type == "object"
     and (.spot | type == "string" and test("^[a-f0-9]{64}$"))
     and (.usdm | type == "string" and test("^[a-f0-9]{64}$")))
@@ -178,6 +193,12 @@ and (.production_process | type == "object"
 and (.production_memory | . as $pm
   | (type == "object"
   and (.slice | valid_lob_slice)
+  and (.production_slice_memory_high_bytes | type == "number" and floor == . and . == 3221225472)
+  and (.production_slice_memory_max_bytes | type == "number" and floor == . and . == 3758096384)
+  and (.systemd_production_slice_memory_high_bytes | type == "number" and floor == . and . == 3221225472)
+  and (.systemd_production_slice_memory_max_bytes | type == "number" and floor == . and . == 3758096384)
+  and (.production_slice_memory_high_bytes == .systemd_production_slice_memory_high_bytes)
+  and (.production_slice_memory_max_bytes == .systemd_production_slice_memory_max_bytes)
   and (.parent_control_group | valid_lob_cgroup_path
     and test("^/system[.]slice/system-binance\\\\x2dlob\\\\x2darchiver\\\\x2dproduction[.]slice$")
     and . == ("/system.slice/" + $pm.slice)
@@ -205,10 +226,25 @@ and (.production_memory | . as $pm
     == ($pm.active_child_control_groups | sort))
   and (.parent_memory_current_bytes | type == "number" and floor == . and . >= 0)
   and (.parent_memory_peak_bytes | type == "number" and floor == . and . >= 0)
+  and (.parent_memory_anon_bytes | type == "number" and floor == . and . >= 0)
+  and (.parent_memory_file_bytes | type == "number" and floor == . and . >= 0)
+  and (.parent_memory_stat | type == "object"
+    and (.anon | type == "number" and floor == . and . == $pm.parent_memory_anon_bytes)
+    and (.file | type == "number" and floor == . and . == $pm.parent_memory_file_bytes))
   and (.child_memory_max_sum_bytes | type == "number" and floor == . and . == 5368709120)
+  and (.parent_memory_anon_bytes <= .production_slice_memory_max_bytes)
   and (.parent_memory_current_bytes <= .child_memory_max_sum_bytes)
   and (.parent_memory_events | type == "object"
-    and all(.[]; type == "number" and floor == . and . >= 0))))
+    and all(.[]; type == "number" and floor == . and . >= 0))
+  and (.slice_lease | type == "object"
+    and (.mode == "permanent" or .mode == "temporary-bootstrap")
+    and (.before_memory_high | type == "string" and length > 0)
+    and (.before_memory_max | type == "string" and length > 0)
+    and .requested_memory_high == "3072M"
+    and .requested_memory_max == "3584M"
+    and (.applied | type == "boolean")
+    and (.restored | type == "boolean" and . == true)
+    and (if .mode == "permanent" then .applied == false else .applied == true end))))
 and (.production_process.spot.main_pid == .production_memory.children.spot.main_pid
   and .production_process.usdm.main_pid == .production_memory.children.usdm.main_pid
   and .production_process.spot.process_exe_sha256 == .production_memory.children.spot.process_exe_sha256
@@ -226,15 +262,24 @@ and (.resource_admission | type == "array" and length == 9
       and (.ended_at | type == "string" and length > 0)
       and (.samples | type == "number" and . >= 1)
       and (.host_memory_available_bytes | type == "number" and . >= 0)
+      and (.host_memory_available_before_bytes | type == "number" and floor == . and . >= 0)
+      and (.host_memory_available_after_bytes | type == "number" and floor == . and . >= 0)
+      and (.host_memory_available_bytes == ([.host_memory_available_before_bytes,.host_memory_available_after_bytes] | min))
       and (.max_memory_available_bytes | type == "number" and . >= 0)
       and (.current_memory_available_bytes | type == "number" and . >= 0)
       and (.breach | type == "boolean" and . == false)
       and (.host_memory_reserve_bytes | type == "number" and . == 1073741824)
       and (.production_parent_memory_current_bytes | type == "number" and floor == . and . >= 0)
+      and (.production_parent_memory_anon_bytes | type == "number" and floor == . and . >= 0)
+      and (.production_parent_memory_file_bytes | type == "number" and floor == . and . >= 0)
+      and (.production_slice_memory_max_bytes | type == "number" and floor == . and . == 3758096384)
       and (.production_child_memory_max_sum_bytes | type == "number" and floor == . and . == 5368709120)
+      and (.production_parent_memory_anon_bytes <= .production_slice_memory_max_bytes)
       and (.production_parent_memory_current_bytes <= .production_child_memory_max_sum_bytes)
       and (.production_memory_growth_bytes | type == "number" and floor == .
-        and . == ($r.production_child_memory_max_sum_bytes - $r.production_parent_memory_current_bytes))
+        and . == ($r.production_slice_memory_max_bytes - $r.production_parent_memory_anon_bytes))
+      and (.production_unallocated_bytes | type == "number" and floor == .
+        and . == $r.production_memory_growth_bytes)
       and ($r.required_bytes | type == "number"
         and . == ($expected_phase_max + $r.host_memory_reserve_bytes + $r.production_memory_growth_bytes)
         and . <= $r.host_memory_available_bytes)
@@ -253,6 +298,12 @@ and (.shadow_staging | type == "object"
   and .mode == "run-scoped"
   and (.run_unit_root | type == "string" and test("/run/monday/rust-lob-gate/[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*$"))
   and (.spool_root | type == "string" and test("/data/monday/spool/binance-lob-rust-shadow/gate/[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*$"))
+  and (.aggregate_slice | type == "object"
+    and (.name | type == "string" and test("^mondayrustlobgate[0-9]{15,}\\.slice$"))
+    and (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+    and (. as $slice | ($slice.cgroup | type == "string" and . == ("/" + $slice.name)))
+    and (.memory_high_bytes | type == "number" and floor == . and . == 1342177280)
+    and (.memory_max_bytes | type == "number" and floor == . and . == 1610612736))
   and (.units | type == "object" and (keys | sort) == ["spot", "usdm"]
     and (.spot | type == "string" and test("^monday-rust-lob-gate-[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*-spot\\.service$"))
     and (.usdm | type == "string" and test("^monday-rust-lob-gate-[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*-usdm\\.service$")))

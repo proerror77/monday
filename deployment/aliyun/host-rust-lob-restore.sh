@@ -590,6 +590,10 @@ restore_started_ns=0
 if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
   restore_started_ns=$(date +%s%N)
   systemctl daemon-reload || die 'daemon-reload failed'
+  if [[ $TEST_ONLY == false ]]; then
+    monday_rust_lob_verify_systemd_production_slice "$ROOT" \
+      || die 'permanent production slice verification failed before restore'
+  fi
   systemctl unmask binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service \
     || die 'could not unmask V2 production lanes'
   systemctl start binance-lob-archiver-production@spot.service \

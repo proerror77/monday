@@ -200,6 +200,22 @@ monday_file_mode() {
 
 monday_runtime_assets() {
   printf '%s\n' \
+    'system-binance\x2dlob\x2darchiver\x2dproduction.slice' \
+    binance-lob-archiver-production@.service \
+    binance-lob-archiver-rust@.service \
+    binance-lob-archiver-upload@.service \
+    binance-lob-archiver-rust-upload@.service \
+    binance-lob-archiver-production-spot.env \
+    binance-lob-archiver-production-usdm.env \
+    binance-lob-archiver-rust-spot.env \
+    binance-lob-archiver-rust-usdm.env
+}
+
+# The direct bootstrap is the one typed migration boundary from the historical
+# eight-asset runtime to V2's nine-asset runtime.  This list is read-only
+# evidence for C0; every stable V2 operation uses monday_runtime_assets above.
+monday_runtime_assets_v1() {
+  printf '%s\n' \
     binance-lob-archiver-production@.service \
     binance-lob-archiver-rust@.service \
     binance-lob-archiver-upload@.service \
@@ -532,6 +548,7 @@ monday_runtime_asset_target() {
   [[ $# -eq 2 ]] || return 2
   local root=$1 asset=$2
   case "$asset" in
+    'system-binance\x2dlob\x2darchiver\x2dproduction.slice'|\
     binance-lob-archiver-production@.service|binance-lob-archiver-rust@.service|\
     binance-lob-archiver-upload@.service|binance-lob-archiver-rust-upload@.service)
       monday_root_join "$root" "etc/systemd/system/$asset" ;;
@@ -547,6 +564,26 @@ monday_rust_lob_runtime_contract_sha256() {
   local directory=${1%/} asset digest
   local -a assets=()
   mapfile -t assets < <(monday_runtime_assets)
+  for asset in "${assets[@]}"; do
+    monday_file_direct "$directory/$asset" || return 1
+  done
+  {
+    for asset in "${assets[@]}"; do
+      digest=$(monday_sha256_file "$directory/$asset") || return 1
+      printf '%s  %s\n' "$digest" "$asset"
+    done
+  } | if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  else
+    shasum -a 256 | awk '{print $1}'
+  fi
+}
+
+monday_rust_lob_runtime_contract_sha256_v1() {
+  [[ $# -eq 1 ]] || return 2
+  local directory=${1%/} asset digest
+  local -a assets=()
+  mapfile -t assets < <(monday_runtime_assets_v1)
   for asset in "${assets[@]}"; do
     monday_file_direct "$directory/$asset" || return 1
   done
@@ -589,6 +626,40 @@ monday_rust_lob_live_runtime_contract_sha256() {
     }
   done < <(monday_runtime_assets)
   digest=$(monday_rust_lob_runtime_contract_sha256 "$scratch") || {
+    rm -rf -- "$scratch"
+    return 1
+  }
+  rm -rf -- "$scratch"
+  printf '%s\n' "$digest"
+}
+
+monday_rust_lob_live_runtime_contract_sha256_v1() {
+  [[ $# -eq 1 ]] || return 2
+  local root=$1 scratch asset target resolved digest
+  scratch=$(mktemp -d) || return 1
+  while IFS= read -r asset; do
+    target=$(monday_runtime_asset_target "$root" "$asset") || {
+      rm -rf -- "$scratch"
+      return 1
+    }
+    [[ -f $target ]] || {
+      rm -rf -- "$scratch"
+      return 1
+    }
+    resolved=$(readlink -f -- "$target") || {
+      rm -rf -- "$scratch"
+      return 1
+    }
+    [[ -f $resolved && ! -L $resolved ]] || {
+      rm -rf -- "$scratch"
+      return 1
+    }
+    cp -p -- "$resolved" "$scratch/$asset" || {
+      rm -rf -- "$scratch"
+      return 1
+    }
+  done < <(monday_runtime_assets_v1)
+  digest=$(monday_rust_lob_runtime_contract_sha256_v1 "$scratch") || {
     rm -rf -- "$scratch"
     return 1
   }
@@ -825,6 +896,45 @@ monday_unit_semantics_sha256() {
   monday_sha256_text "$normalized"
 }
 
+# The aggregate production slice is a signed runtime asset, not an ambient
+# host default.  Parse its tiny allowlist instead of checking two matching
+# lines so an extra directive cannot silently widen the envelope.
+monday_slice_normalized() {
+  [[ $# -eq 1 ]] || return 2
+  local file=$1 raw line section='' key value normalized=''
+  local -A seen=()
+  monday_file_direct "$file" || return 1
+  while IFS= read -r raw || [[ -n $raw ]]; do
+    line=${raw%%#*}
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -n $line ]] || continue
+    if [[ $line == '[Slice]' ]]; then
+      [[ -z $section ]] || return 1
+      section=Slice
+      continue
+    fi
+    [[ $section == Slice && $line =~ ^(MemoryHigh|MemoryMax)=(.*)$ ]] || return 1
+    key=${BASH_REMATCH[1]}; value=${BASH_REMATCH[2]}
+    [[ -n $value && -z ${seen[$key]+x} ]] || return 1
+    case "$key" in
+      MemoryHigh) [[ $value == 3072M ]] || return 1 ;;
+      MemoryMax) [[ $value == 3584M ]] || return 1 ;;
+    esac
+    seen[$key]=1
+    normalized+="Slice|$key|$value"$'\n'
+  done <"$file"
+  [[ $section == Slice && ${seen[MemoryHigh]:-0} == 1 && ${seen[MemoryMax]:-0} == 1 ]] || return 1
+  printf '%s' "$normalized"
+}
+
+monday_slice_semantics_sha256() {
+  [[ $# -eq 1 ]] || return 2
+  local normalized
+  normalized=$(monday_slice_normalized "$1") || return 1
+  monday_sha256_text "$normalized"
+}
+
 monday_env_value() {
   [[ $# -eq 2 ]] || return 2
   local file=$1 key=$2 count value
@@ -905,15 +1015,16 @@ monday_validate_production_env() {
 
 monday_verify_production_runtime_assets() {
   [[ $# -eq 3 ]] || return 2
-  local root=$1 deployment=$2 payload=$3 service upload spot_env usdm_env target
-  local service_sha upload_sha spot_sha usdm_sha service_semantics_sha upload_semantics_sha production_json markets_json
+  local root=$1 deployment=$2 payload=$3 service upload slice spot_env usdm_env target
+  local service_sha upload_sha slice_sha spot_sha usdm_sha service_semantics_sha upload_semantics_sha slice_semantics_sha production_json markets_json
   monday_sha256_ok "$payload" || return 1
   monday_path_direct "$deployment" || return 1
   service="$deployment/binance-lob-archiver-production@.service"
   upload="$deployment/binance-lob-archiver-upload@.service"
+  slice="$deployment/system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice"
   spot_env="$deployment/binance-lob-archiver-production-spot.env"
   usdm_env="$deployment/binance-lob-archiver-production-usdm.env"
-  for file in "$service" "$upload" "$spot_env" "$usdm_env"; do
+  for file in "$service" "$upload" "$slice" "$spot_env" "$usdm_env"; do
     monday_file_direct "$file" || return 1
   done
 
@@ -923,6 +1034,7 @@ monday_verify_production_runtime_assets() {
   # formatting the only harmless source changes.
   service_semantics_sha=$(monday_unit_semantics_sha256 "$service" production) || return 1
   upload_semantics_sha=$(monday_unit_semantics_sha256 "$upload" upload) || return 1
+  slice_semantics_sha=$(monday_slice_semantics_sha256 "$slice") || return 1
 
   # Candidate ExecStart is the only stable production projection.  The
   # candidate payload itself is checked at its immutable digest path below.
@@ -994,6 +1106,7 @@ monday_verify_production_runtime_assets() {
 
   service_sha=$(monday_sha256_file "$service") || return 1
   upload_sha=$(monday_sha256_file "$upload") || return 1
+  slice_sha=$(monday_sha256_file "$slice") || return 1
   spot_sha=$(monday_sha256_file "$spot_env") || return 1
   usdm_sha=$(monday_sha256_file "$usdm_env") || return 1
   markets_json=$(jq -cn \
@@ -1006,10 +1119,11 @@ monday_verify_production_runtime_assets() {
     '{spot:{market:$spot_market,dataset:$spot_dataset,symbols:$spot_symbols,shard_id:"all",spool_dir:$spot_spool,oss_bucket:"monday-lob-apne1-1045353359",oss_endpoint:"oss-ap-northeast-1-internal.aliyuncs.com",oss_region:"ap-northeast-1",aliyun_profile:"ecs-role"},usdm:{market:$usdm_market,dataset:$usdm_dataset,symbols:$usdm_symbols,shard_id:"all",spool_dir:$usdm_spool,oss_bucket:"monday-lob-apne1-1045353359",oss_endpoint:"oss-ap-northeast-1-internal.aliyuncs.com",oss_region:"ap-northeast-1",aliyun_profile:"ecs-role",ws_shard_size:25}}') || return 1
   production_json=$(jq -cnS \
     --arg service_sha "$service_sha" --arg upload_sha "$upload_sha" \
+    --arg slice_sha "$slice_sha" --arg slice_semantics_sha "$slice_semantics_sha" \
     --arg spot_sha "$spot_sha" --arg usdm_sha "$usdm_sha" \
     --argjson markets "$markets_json" \
     --arg service_semantics_sha "$service_semantics_sha" --arg upload_semantics_sha "$upload_semantics_sha" \
-    '{schema:"monday.rust_lob_production_runtime.v1",exec_start:"/opt/monday/bin/binance-lob-archiver",environment_file:"/etc/monday/binance-lob-archiver-production-%i.env",user:"hftcollector",group:"hftcollector",restart:"always",restart_sec:5,runtime_max_sec:21600,kill_mode:"mixed",timeout_start_sec:120,timeout_stop_sec:600,type:"simple",cpu_quota:"80%",memory_high:"2048M",memory_max:"2560M",sandbox:{no_new_privileges:true,private_tmp:true,protect_system:"strict",protect_home:true,protect_kernel_tunables:true,protect_kernel_modules:true,protect_control_groups:true,lock_personality:true,restrict_suidsgid:true,state_directory:"hft-collector",read_write_paths:["/data/monday/spool/binance-lob","/data/monday/spool/binance-lob-recovery"]},upload:{type:"oneshot",exec_start:"/opt/monday/bin/binance-lob-archiver --upload-only",environment_file:"/etc/monday/binance-lob-archiver-production-%i.env",cpu_quota:"80%",memory_high:"384M",memory_max:"512M",timeout_start_sec:0},unit_sha256:{collector:$service_sha,upload:$upload_sha},unit_semantics_sha256:{collector:$service_semantics_sha,upload:$upload_semantics_sha},env_sha256:{spot:$spot_sha,usdm:$usdm_sha},markets:$markets}') || return 1
+    '{schema:"monday.rust_lob_production_runtime.v2",slice:"system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice",slice_memory_high:"3072M",slice_memory_max:"3584M",slice_sha256:$slice_sha,slice_semantics_sha256:$slice_semantics_sha,exec_start:"/opt/monday/bin/binance-lob-archiver",environment_file:"/etc/monday/binance-lob-archiver-production-%i.env",user:"hftcollector",group:"hftcollector",restart:"always",restart_sec:5,runtime_max_sec:21600,kill_mode:"mixed",timeout_start_sec:120,timeout_stop_sec:600,type:"simple",cpu_quota:"80%",memory_high:"2048M",memory_max:"2560M",sandbox:{no_new_privileges:true,private_tmp:true,protect_system:"strict",protect_home:true,protect_kernel_tunables:true,protect_kernel_modules:true,protect_control_groups:true,lock_personality:true,restrict_suidsgid:true,state_directory:"hft-collector",read_write_paths:["/data/monday/spool/binance-lob","/data/monday/spool/binance-lob-recovery"]},upload:{type:"oneshot",exec_start:"/opt/monday/bin/binance-lob-archiver --upload-only",environment_file:"/etc/monday/binance-lob-archiver-production-%i.env",cpu_quota:"80%",memory_high:"384M",memory_max:"512M",timeout_start_sec:0},unit_sha256:{collector:$service_sha,upload:$upload_sha,slice:$slice_sha},unit_semantics_sha256:{collector:$service_semantics_sha,upload:$upload_semantics_sha,slice:$slice_semantics_sha},env_sha256:{spot:$spot_sha,usdm:$usdm_sha},markets:$markets}') || return 1
   printf '%s\n' "$production_json"
 }
 
@@ -1085,24 +1199,25 @@ monday_observe_health_freshness() {
 
 # Return the required bytes for one sequential phase and accept only when the
 # host has that headroom.  MemAvailable already includes active production
-# usage; only the measured cgroup growth (child limit sum minus parent current)
-# is added to the phase and host reserve.  The five arguments are deliberately
-# exact so callers cannot silently fall back to the old static two-lane model.
+# usage; the governed aggregate slice cap minus resident anonymous memory is
+# the only production budget added to the phase and host reserve.  File cache
+# and memory.current remain audit values and must not be credited twice.  The
+# five arguments are deliberately exact so callers cannot silently fall back
+# to the old static two-lane model.
 monday_shadow_memory_admission() {
   [[ $# -eq 5 ]] || return 2
-  local available=$1 host_reserve=$2 phase_max=$3 parent_current=$4 child_max_sum=$5
-  local growth required value
-  for value in "$available" "$host_reserve" "$phase_max" "$parent_current" "$child_max_sum"; do
+  local available=$1 host_reserve=$2 phase_max=$3 parent_anon=$4 slice_max=$5
+  local unallocated required value max_int=9223372036854775807
+  for value in "$available" "$host_reserve" "$phase_max" "$parent_anon" "$slice_max"; do
     [[ $value =~ ^(0|[1-9][0-9]{0,18})$ ]] || return 2
-    # shellcheck disable=SC2071
-    (( ${#value} < 19 )) || [[ $value < 9223372036854775808 ]] || return 2
+    (( value <= max_int )) || return 2
   done
-  ((parent_current <= child_max_sum)) || return 2
-  growth=$((child_max_sum - parent_current))
-  ((host_reserve <= 9223372036854775807 - phase_max)) || return 2
+  (( parent_anon <= slice_max )) || return 2
+  unallocated=$((slice_max - parent_anon))
+  (( host_reserve <= max_int - phase_max )) || return 2
   required=$((host_reserve + phase_max))
-  ((growth <= 9223372036854775807 - required)) || return 2
-  required=$((required + growth))
+  (( unallocated <= max_int - required )) || return 2
+  required=$((required + unallocated))
   ((required > 0)) || return 2
   printf '%s\n' "$required"
   ((available >= required))
@@ -1148,10 +1263,22 @@ monday_validate_lob_production_snapshot() {
     ))
     and (([.children.spot.control_group, .children.usdm.control_group] | sort)
       == (.active_child_control_groups | sort))
+    and (.production_slice_memory_high_bytes | type == "number" and floor == . and . == 3221225472)
+    and (.production_slice_memory_max_bytes | type == "number" and floor == . and . == 3758096384)
+    and (.systemd_production_slice_memory_high_bytes | type == "number" and floor == . and . == 3221225472)
+    and (.systemd_production_slice_memory_max_bytes | type == "number" and floor == . and . == 3758096384)
+    and (.production_slice_memory_high_bytes == .systemd_production_slice_memory_high_bytes)
+    and (.production_slice_memory_max_bytes == .systemd_production_slice_memory_max_bytes)
     and (.parent_memory_current_bytes | type == "number" and floor == . and . >= 0)
     and (.parent_memory_peak_bytes | type == "number" and floor == . and . >= 0)
+    and (.parent_memory_anon_bytes | type == "number" and floor == . and . >= 0)
+    and (.parent_memory_file_bytes | type == "number" and floor == . and . >= 0)
+    and (.parent_memory_stat | type == "object"
+      and (.anon | type == "number" and floor == . and . == $root.parent_memory_anon_bytes)
+      and (.file | type == "number" and floor == . and . == $root.parent_memory_file_bytes))
     and (.child_memory_max_sum_bytes | type == "number" and floor == .
       and . == 5368709120)
+    and (.parent_memory_anon_bytes <= .production_slice_memory_max_bytes)
     and (.parent_memory_current_bytes <= .child_memory_max_sum_bytes)
     and (.parent_memory_events | type == "object"
       and all(.[]; type == "number" and floor == . and . >= 0))
@@ -1172,6 +1299,8 @@ monday_lob_production_snapshot_identity() {
   local source=$1
   local filter='.
     | {slice,parent_control_group,parent_cgroup_procs,active_child_control_groups,
+      production_slice_memory_high_bytes,production_slice_memory_max_bytes,
+      systemd_production_slice_memory_high_bytes,systemd_production_slice_memory_max_bytes,
       children: (.children | with_entries(.value |= {
         market,slice,control_group,main_pid,process_exe_sha256,n_restarts,active,
         systemd_memory_max_bytes,memory_max_bytes
@@ -1181,6 +1310,45 @@ monday_lob_production_snapshot_identity() {
   else
     printf '%s\n' "$source" | jq -ceS "$filter"
   fi
+}
+
+# Verify the permanent production slice at a runtime boundary.  Gate performs
+# the deeper cgroup snapshot; Cutover/Restore/Readback call this lightweight
+# systemd check after any projection change so a missing or widened slice can
+# never be reported as a successful pair.
+monday_rust_lob_verify_systemd_production_slice() {
+  [[ $# -eq 1 ]] || return 2
+  local slice='system-binance\x2dlob\x2darchiver\x2dproduction.slice'
+  local output item key value
+  local -A fields=()
+  output=$(systemctl show "$slice" --property=MemoryHigh,MemoryMax,ControlGroup 2>/dev/null) || return 1
+  while IFS= read -r item; do
+    [[ $item == *=* ]] || return 1
+    key=${item%%=*}; value=${item#*=}
+    case $key in MemoryHigh|MemoryMax|ControlGroup) ;; *) return 1 ;; esac
+    [[ -z ${fields[$key]+x} ]] || return 1
+    fields[$key]=$value
+  done <<<"${output%$'\n'}"
+  [[ ${fields[MemoryHigh]:-} == 3221225472 \
+    && ${fields[MemoryMax]:-} == 3758096384 \
+    && ${fields[ControlGroup]:-} == "/system.slice/$slice" ]] || return 1
+  local market child_output child_slice child_group
+  for market in spot usdm; do
+    child_output=$(systemctl show "binance-lob-archiver-production@${market}.service" \
+      --property=Slice,ControlGroup,MemoryMax 2>/dev/null) || return 1
+    child_slice=; child_group=; value=; fields=()
+    while IFS= read -r item; do
+      [[ $item == *=* ]] || return 1
+      key=${item%%=*}; value=${item#*=}
+      case $key in Slice|ControlGroup|MemoryMax) ;; *) return 1 ;; esac
+      [[ -z ${fields[$key]+x} ]] || return 1
+      fields[$key]=$value
+    done <<<"${child_output%$'\n'}"
+    child_slice=${fields[Slice]:-}; child_group=${fields[ControlGroup]:-}
+    [[ $child_slice == "$slice" && ${fields[MemoryMax]:-} == 2684354560 \
+      && $child_group == "/system.slice/$slice/binance-lob-archiver-production@${market}.service" ]] \
+      || return 1
+  done
 }
 
 # Read cumulative I/O-full stall time from a Linux PSI source.
@@ -1313,6 +1481,7 @@ monday_validate_v2_gate() {
   local dataset expected_bucket expected_prefix object_prefix data_uri manifest_uri success_uri data_prefix manifest_prefix success_prefix
   controller_asset_keys=$(monday_controller_assets | jq -Rsc 'split("\n") | map(select(length > 0)) | sort') || return 1
   production_asset_keys=$(printf '%s\n' \
+    'system-binance\x2dlob\x2darchiver\x2dproduction.slice' \
     binance-lob-archiver-production@.service \
     binance-lob-archiver-upload@.service \
     binance-lob-archiver-production-spot.env \
@@ -1339,7 +1508,7 @@ monday_validate_v2_gate() {
           or . == "oss-readback-usdm" then
           1610612736
         elif . == "shadow-spot" or . == "shadow-usdm" then
-          2147483648
+          1610612736
         elif . == "upload-drain-spot" or . == "upload-drain-usdm" then
           536870912
         else
@@ -1356,7 +1525,16 @@ monday_validate_v2_gate() {
         and (split("/") as $parts
           | ($parts[0] == "" and ($parts[1:] | length) >= 1
             and all($parts[1:][]; test("^[A-Za-z0-9_.@-]+(?:\\\\x2d[A-Za-z0-9_.@-]+)*$"))));
-      .schema == "monday.rust_lob_shadow_gate.v5"
+      def valid_production_asset_map($keys; $source_mode):
+        type == "object"
+        and (keys | sort) == $keys
+        and all(to_entries[];
+          ((.value | type == "string" and test("^[a-f0-9]{64}$")))
+          or ($source_mode == "direct"
+            and .key == "system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice"
+            and .value == null));
+      . as $root |
+      .schema == "monday.rust_lob_shadow_gate.v6"
       and .control_plane_version == 2
       and .passed == true
       and (.production_eligible | type == "boolean")
@@ -1388,12 +1566,15 @@ monday_validate_v2_gate() {
       and (.before.payload_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
       and (.before.runtime_contract_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
       and (.before.production_projection | type == "string" and length > 0)
-      and (.before.production_assets | type == "object" and (keys | sort) == $production_asset_keys
-        and all(.[]; type == "string" and test("^[a-f0-9]{64}$")))
-      and (.production_assets | type == "object" and (keys | sort) == $production_asset_keys
-        and all(.[]; type == "string" and test("^[a-f0-9]{64}$")))
+      and (.before.production_assets | valid_production_asset_map($production_asset_keys; $root.source_mode))
+      and (.production_assets | valid_production_asset_map($production_asset_keys; $root.source_mode))
       and (.production_runtime | type == "object"
-        and .schema == "monday.rust_lob_production_runtime.v1"
+        and .schema == "monday.rust_lob_production_runtime.v2"
+        and (.slice | valid_lob_slice)
+        and .slice_memory_high == "3072M"
+        and .slice_memory_max == "3584M"
+        and (.slice_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+        and (.slice_semantics_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
         and .type == "simple"
         and .exec_start == "/opt/monday/bin/binance-lob-archiver"
         and .environment_file == "/etc/monday/binance-lob-archiver-production-%i.env"
@@ -1430,10 +1611,12 @@ monday_validate_v2_gate() {
           and .timeout_start_sec == 0)
         and (.unit_sha256 | type == "object"
           and (.collector | type == "string" and test("^[a-f0-9]{64}$"))
-          and (.upload | type == "string" and test("^[a-f0-9]{64}$")))
+          and (.upload | type == "string" and test("^[a-f0-9]{64}$"))
+          and (.slice | type == "string" and test("^[a-f0-9]{64}$")))
         and (.unit_semantics_sha256 | type == "object"
           and (.collector | type == "string" and test("^[a-f0-9]{64}$"))
-          and (.upload | type == "string" and test("^[a-f0-9]{64}$")))
+          and (.upload | type == "string" and test("^[a-f0-9]{64}$"))
+          and (.slice | type == "string" and test("^[a-f0-9]{64}$")))
         and (.env_sha256 | type == "object"
           and (.spot | type == "string" and test("^[a-f0-9]{64}$"))
           and (.usdm | type == "string" and test("^[a-f0-9]{64}$")))
@@ -1463,6 +1646,12 @@ monday_validate_v2_gate() {
       and (.production_memory | . as $pm
         | (type == "object"
         and (.slice | valid_lob_slice)
+        and (.production_slice_memory_high_bytes | type == "number" and floor == . and . == 3221225472)
+        and (.production_slice_memory_max_bytes | type == "number" and floor == . and . == 3758096384)
+        and (.systemd_production_slice_memory_high_bytes | type == "number" and floor == . and . == 3221225472)
+        and (.systemd_production_slice_memory_max_bytes | type == "number" and floor == . and . == 3758096384)
+        and (.production_slice_memory_high_bytes == .systemd_production_slice_memory_high_bytes)
+        and (.production_slice_memory_max_bytes == .systemd_production_slice_memory_max_bytes)
         and (.parent_control_group | valid_lob_cgroup_path
           and test("^/system[.]slice/system-binance\\\\x2dlob\\\\x2darchiver\\\\x2dproduction[.]slice$")
           and . == ("/system.slice/" + $pm.slice)
@@ -1489,10 +1678,25 @@ monday_validate_v2_gate() {
           == ($pm.active_child_control_groups | sort))
         and (.parent_memory_current_bytes | type == "number" and floor == . and . >= 0)
         and (.parent_memory_peak_bytes | type == "number" and floor == . and . >= 0)
+        and (.parent_memory_anon_bytes | type == "number" and floor == . and . >= 0)
+        and (.parent_memory_file_bytes | type == "number" and floor == . and . >= 0)
+        and (.parent_memory_stat | type == "object"
+          and (.anon | type == "number" and floor == . and . == $pm.parent_memory_anon_bytes)
+          and (.file | type == "number" and floor == . and . == $pm.parent_memory_file_bytes))
         and (.child_memory_max_sum_bytes | type == "number" and floor == . and . == 5368709120)
+        and (.parent_memory_anon_bytes <= .production_slice_memory_max_bytes)
         and (.parent_memory_current_bytes <= .child_memory_max_sum_bytes)
         and (.parent_memory_events | type == "object"
-          and all(.[]; type == "number" and floor == . and . >= 0))))
+          and all(.[]; type == "number" and floor == . and . >= 0))
+        and (.slice_lease | type == "object"
+          and (.mode == "permanent" or .mode == "temporary-bootstrap")
+          and (.before_memory_high | type == "string" and length > 0)
+          and (.before_memory_max | type == "string" and length > 0)
+          and .requested_memory_high == "3072M"
+          and .requested_memory_max == "3584M"
+          and (.applied | type == "boolean")
+          and (.restored | type == "boolean" and . == true)
+          and (if .mode == "permanent" then .applied == false else .applied == true end))))
       and (.production_process.spot.main_pid == .production_memory.children.spot.main_pid
         and .production_process.usdm.main_pid == .production_memory.children.usdm.main_pid
         and .production_process.spot.process_exe_sha256 == .production_memory.children.spot.process_exe_sha256
@@ -1510,15 +1714,24 @@ monday_validate_v2_gate() {
             and (.ended_at | type == "string" and length > 0)
             and (.samples | type == "number" and . >= 1)
             and (.host_memory_available_bytes | type == "number" and . >= 0)
+            and (.host_memory_available_before_bytes | type == "number" and floor == . and . >= 0)
+            and (.host_memory_available_after_bytes | type == "number" and floor == . and . >= 0)
+            and (.host_memory_available_bytes == ([.host_memory_available_before_bytes,.host_memory_available_after_bytes] | min))
             and (.max_memory_available_bytes | type == "number" and . >= 0)
             and (.current_memory_available_bytes | type == "number" and . >= 0)
             and (.breach | type == "boolean" and . == false)
             and (.host_memory_reserve_bytes | type == "number" and . == 1073741824)
             and (.production_parent_memory_current_bytes | type == "number" and floor == . and . >= 0)
+            and (.production_parent_memory_anon_bytes | type == "number" and floor == . and . >= 0)
+            and (.production_parent_memory_file_bytes | type == "number" and floor == . and . >= 0)
+            and (.production_slice_memory_max_bytes | type == "number" and floor == . and . == 3758096384)
             and (.production_child_memory_max_sum_bytes | type == "number" and floor == . and . == 5368709120)
+            and (.production_parent_memory_anon_bytes <= .production_slice_memory_max_bytes)
             and (.production_parent_memory_current_bytes <= .production_child_memory_max_sum_bytes)
             and (.production_memory_growth_bytes | type == "number" and floor == .
-              and . == ($r.production_child_memory_max_sum_bytes - $r.production_parent_memory_current_bytes))
+              and . == ($r.production_slice_memory_max_bytes - $r.production_parent_memory_anon_bytes))
+            and (.production_unallocated_bytes | type == "number" and floor == .
+              and . == $r.production_memory_growth_bytes)
             and ($r.required_bytes | type == "number"
               and . == ($expected_phase_max + $r.host_memory_reserve_bytes + $r.production_memory_growth_bytes)
               and . <= $r.host_memory_available_bytes)
@@ -1534,10 +1747,16 @@ monday_validate_v2_gate() {
                  and ($p.ratio | type == "number" and . >= 0)
                else true end)))
       and (.shadow_staging | type == "object"
-        and .mode == "run-scoped"
-        and (.run_unit_root | type == "string" and test("/run/monday/rust-lob-gate/[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*$"))
-        and (.spool_root | type == "string" and test("/data/monday/spool/binance-lob-rust-shadow/gate/[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*$"))
-        and (.units | type == "object" and (keys | sort) == ["spot", "usdm"]
+      and .mode == "run-scoped"
+      and (.run_unit_root | type == "string" and test("/run/monday/rust-lob-gate/[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*$"))
+      and (.spool_root | type == "string" and test("/data/monday/spool/binance-lob-rust-shadow/gate/[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*$"))
+      and (.aggregate_slice | type == "object"
+        and (.name | type == "string" and test("^mondayrustlobgate[0-9]{15,}\\.slice$"))
+        and (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+        and (. as $slice | ($slice.cgroup | type == "string" and . == ("/" + $slice.name)))
+        and (.memory_high_bytes | type == "number" and floor == . and . == 1342177280)
+        and (.memory_max_bytes | type == "number" and floor == . and . == 1610612736))
+      and (.units | type == "object" and (keys | sort) == ["spot", "usdm"]
           and (.spot | type == "string" and test("^monday-rust-lob-gate-[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*-spot\\.service$"))
           and (.usdm | type == "string" and test("^monday-rust-lob-gate-[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*-usdm\\.service$")))
         and (.upload_units | type == "object" and (keys | sort) == ["spot", "usdm"]
@@ -1708,7 +1927,7 @@ monday_validate_v2_transition() {
   [[ $# -eq 5 ]] || return 2
   local receipt=$1 from=$2 to=$3 gate=$4 gate_sha=$5
   local gate_evidence gate_payload gate_runtime gate_from gate_production_runtime pair_asset_keys controller_projection_keys
-  # The stable pair contains exactly the eight runtime unit/env assets
+  # The stable pair contains exactly the nine runtime unit/env/slice assets
   # (production + shadow).  Recovery/health helpers remain controller assets
   # and are addressed through the immutable active controller, never copied
   # into a second live state projection.

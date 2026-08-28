@@ -13,54 +13,89 @@ trap 'chmod -R u+w "$ROOT" 2>/dev/null || true; rm -rf "$ROOT"' EXIT
 . "$SCRIPT_DIR/host-rust-lob-controller-release.sh"
 ROOT=$fixture_root
 
-# MemAvailable already includes active production usage.  A 6.0 GiB reading
-# therefore needs only the sequential 2 GiB phase plus the fixed 1 GiB reserve;
-# the old two-lane growth headroom would incorrectly reject this host.
+# Resource Envelope V2 is a single immutable runtime contract: the production
+# template and its aggregate slice carry the pair cap, while each sequential
+# shadow phase has its own smaller envelope.  Keep these assertions before any
+# fixture publication so an old eight-asset/v1 contract fails immediately.
+production_slice_asset='system-binance\x2dlob\x2darchiver\x2dproduction.slice'
+[[ -f "$SCRIPT_DIR/$production_slice_asset" ]] || {
+  printf 'Resource Envelope V2 slice asset is missing\n' >&2
+  exit 1
+}
+[[ $(monday_runtime_assets | wc -l | tr -d '[:space:]') == 9 ]] || {
+  printf 'Resource Envelope V2 must publish exactly nine runtime assets\n' >&2
+  exit 1
+}
+if grep -Fqx 'Slice=system-binance\x2dlob\x2darchiver\x2dproduction.slice' \
+  "$SCRIPT_DIR/binance-lob-archiver-production@.service"; then
+  printf 'production template must rely on the automatic aggregate slice\n' >&2
+  exit 1
+fi
+grep -Fqx 'MemoryHigh=3072M' "$SCRIPT_DIR/$production_slice_asset" || {
+  printf 'production slice MemoryHigh is not 3072M\n' >&2
+  exit 1
+}
+grep -Fqx 'MemoryMax=3584M' "$SCRIPT_DIR/$production_slice_asset" || {
+  printf 'production slice MemoryMax is not 3584M\n' >&2
+  exit 1
+}
+grep -Fqx 'MemoryHigh=1792M' "$SCRIPT_DIR/binance-lob-archiver-rust@.service" || {
+  printf 'shadow MemoryHigh is not 1792M\n' >&2
+  exit 1
+}
+grep -Fqx 'MemoryMax=2048M' "$SCRIPT_DIR/binance-lob-archiver-rust@.service" || {
+  printf 'shadow MemoryMax is not 2048M\n' >&2
+  exit 1
+}
+
+# Resource Envelope V2 reserves the production slice's unallocated aggregate
+# cap from parent memory.stat anon.  File cache and memory.current remain audit
+# fields and must not reduce the required budget a second time.
 admission_available_bytes=6442450944
 admission_reserve_bytes=1073741824
-admission_phase_max_bytes=2147483648
-admission_parent_current_bytes=5368709120
-admission_child_max_sum_bytes=5368709120
-admission_required_bytes=$((admission_reserve_bytes + admission_phase_max_bytes + admission_child_max_sum_bytes - admission_parent_current_bytes))
+admission_phase_max_bytes=1610612736
+admission_parent_anon_bytes=317067264
+admission_slice_max_bytes=3758096384
+admission_required_bytes=$((admission_reserve_bytes + admission_phase_max_bytes + admission_slice_max_bytes - admission_parent_anon_bytes))
 [[ $(monday_shadow_memory_admission \
   "$admission_available_bytes" "$admission_reserve_bytes" "$admission_phase_max_bytes" \
-  "$admission_parent_current_bytes" "$admission_child_max_sum_bytes") \
+  "$admission_parent_anon_bytes" "$admission_slice_max_bytes") \
   == "$admission_required_bytes" ]] || {
   printf 'sequential memory admission rejected the available host headroom\n' >&2
   exit 1
 }
 [[ $(monday_shadow_memory_admission \
   "$admission_required_bytes" "$admission_reserve_bytes" "$admission_phase_max_bytes" \
-  "$admission_parent_current_bytes" "$admission_child_max_sum_bytes") \
+  "$admission_parent_anon_bytes" "$admission_slice_max_bytes") \
   == "$admission_required_bytes" ]] || {
   printf 'sequential memory admission rejected exact phase plus reserve\n' >&2
   exit 1
 }
 if monday_shadow_memory_admission "$((admission_required_bytes - 1))" \
   "$admission_reserve_bytes" "$admission_phase_max_bytes" \
-  "$admission_parent_current_bytes" "$admission_child_max_sum_bytes" >/dev/null 2>&1; then
+  "$admission_parent_anon_bytes" "$admission_slice_max_bytes" >/dev/null 2>&1; then
   printf 'sequential memory admission accepted one byte below phase plus reserve\n' >&2
   exit 1
 fi
 if monday_shadow_memory_admission "$admission_available_bytes" \
   "$admission_reserve_bytes" "$admission_phase_max_bytes" \
-  "$admission_child_max_sum_bytes" "$((admission_parent_current_bytes - 1))" >/dev/null 2>&1; then
-  printf 'sequential memory admission accepted current greater than child limit sum\n' >&2
+  "$((admission_slice_max_bytes + 1))" "$admission_slice_max_bytes" >/dev/null 2>&1; then
+  printf 'sequential memory admission accepted anon greater than slice limit\n' >&2
   exit 1
 fi
 if monday_shadow_memory_admission "$admission_available_bytes" \
   "$admission_reserve_bytes" "$admission_phase_max_bytes" \
-  268435456 >/dev/null 2>&1; then
+  "$admission_parent_anon_bytes" >/dev/null 2>&1; then
   printf 'sequential memory admission accepted legacy three-argument shape\n' >&2
   exit 1
 fi
 if monday_shadow_memory_admission "$admission_available_bytes" \
   "$admission_reserve_bytes" "$admission_phase_max_bytes" \
-  "$admission_parent_current_bytes" "$admission_child_max_sum_bytes" 1 >/dev/null 2>&1; then
+  "$admission_parent_anon_bytes" "$admission_slice_max_bytes" 1 >/dev/null 2>&1; then
   printf 'sequential memory admission accepted legacy six-argument shape\n' >&2
   exit 1
 fi
-if monday_shadow_memory_admission 0 1 9223372036854775807 0 0 >/dev/null 2>&1; then
+if monday_shadow_memory_admission 0 1 9223372036854775807 0 9223372036854775807 >/dev/null 2>&1; then
   printf 'sequential memory admission accepted an overflowing reserve plus phase\n' >&2
   exit 1
 fi
@@ -83,11 +118,43 @@ jq -n --arg exe "$production_exe_sha" '
        control_group:"/system.slice/system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice/binance-lob-archiver-production@usdm.service",
        main_pid:102,process_exe_sha256:$exe,n_restarts:8,active:true,
        systemd_memory_max_bytes:2684354560,memory_max_bytes:2684354560}},
-   parent_memory_current_bytes:5000000000,parent_memory_peak_bytes:5100000000,
+   production_slice_memory_high_bytes:3221225472,production_slice_memory_max_bytes:3758096384,
+   systemd_production_slice_memory_high_bytes:3221225472,systemd_production_slice_memory_max_bytes:3758096384,
+   parent_memory_current_bytes:1101067264,parent_memory_peak_bytes:5100000000,
+   parent_memory_anon_bytes:317067264,parent_memory_file_bytes:784000000,
+   parent_memory_stat:{anon:317067264,file:784000000},
    child_memory_max_sum_bytes:5368709120,parent_memory_events:{high:0,oom:0,oom_kill:0}}
 ' >"$production_snapshot"
 monday_validate_lob_production_snapshot "$production_snapshot"
 production_identity=$(monday_lob_production_snapshot_identity "$production_snapshot")
+
+# Runtime-boundary verification reads unordered KEY=VALUE output from
+# systemctl and requires the permanent aggregate slice plus both direct child
+# units.  This small stub keeps the helper covered without mutating a host.
+# shellcheck disable=SC2329
+systemctl() {
+  local action=${1:-} unit=${2:-}
+  [[ $action == show ]] || return 1
+  if [[ $unit == 'system-binance\x2dlob\x2darchiver\x2dproduction.slice' ]]; then
+    printf '%s\n' \
+      'ControlGroup=/system.slice/system-binance\x2dlob\x2darchiver\x2dproduction.slice' \
+      'MemoryMax=3758096384' 'MemoryHigh=3221225472'
+  elif [[ $unit == 'binance-lob-archiver-production@spot.service' ]]; then
+    printf '%s\n' \
+      'MemoryMax=2684354560' \
+      'ControlGroup=/system.slice/system-binance\x2dlob\x2darchiver\x2dproduction.slice/binance-lob-archiver-production@spot.service' \
+      'Slice=system-binance\x2dlob\x2darchiver\x2dproduction.slice'
+  elif [[ $unit == 'binance-lob-archiver-production@usdm.service' ]]; then
+    printf '%s\n' \
+      'Slice=system-binance\x2dlob\x2darchiver\x2dproduction.slice' \
+      'ControlGroup=/system.slice/system-binance\x2dlob\x2darchiver\x2dproduction.slice/binance-lob-archiver-production@usdm.service' \
+      'MemoryMax=2684354560'
+  else
+    return 1
+  fi
+}
+monday_rust_lob_verify_systemd_production_slice "$ROOT"
+unset -f systemctl
 mutated_snapshot="$ROOT/production-snapshot-mutated.json"
 for mutation in extra-child non-direct wrong-limit identity; do
   case "$mutation" in
@@ -155,7 +222,7 @@ mkdir -p "$ROOT/opt/monday/bin"
 p0="$ROOT/p0"; m0="$ROOT/m0.json"
 p0_sha=$(publish_fixture "$p0" "$m0")
 mkdir -p "$ROOT/etc/systemd/system" "$ROOT/etc/monday"
-for asset in binance-lob-archiver-production@.service binance-lob-archiver-upload@.service; do
+for asset in "$production_slice_asset" binance-lob-archiver-production@.service binance-lob-archiver-upload@.service; do
   cp "$ROOT/opt/monday/releases/binance-lob-controller/$(monday_sha256_file "$m0")/deployment/$asset" \
     "$ROOT/etc/systemd/system/$asset"
 done
@@ -163,7 +230,7 @@ for asset in binance-lob-archiver-production-spot.env binance-lob-archiver-produ
   cp "$ROOT/opt/monday/releases/binance-lob-controller/$(monday_sha256_file "$m0")/deployment/$asset" \
     "$ROOT/etc/monday/$asset"
 done
-# Bootstrap independently verifies all eight runtime unit/env bytes (the
+# Bootstrap independently verifies all nine runtime unit/env bytes (the
 # production and shadow lanes) before establishing stable projections.
 for asset in binance-lob-archiver-rust@.service binance-lob-archiver-rust-upload@.service; do
   cp "$ROOT/opt/monday/releases/binance-lob-controller/$(monday_sha256_file "$m0")/deployment/$asset" \
@@ -173,6 +240,10 @@ for asset in binance-lob-archiver-rust-spot.env binance-lob-archiver-rust-usdm.e
   cp "$ROOT/opt/monday/releases/binance-lob-controller/$(monday_sha256_file "$m0")/deployment/$asset" \
     "$ROOT/etc/monday/$asset"
 done
+# The fixture starts from the historical eight-asset runtime.  The candidate
+# release carries the ninth signed aggregate-slice asset, but the legacy live
+# topology deliberately does not; this is the only direct R0 -> R2 delta.
+rm -f -- "$ROOT/etc/systemd/system/$production_slice_asset"
 # Production upload-status is a sentinel: every shadow Gate/drain must leave
 # the governed production spool untouched.
 production_spool_root="$ROOT/data/monday/spool/binance-lob"
@@ -197,8 +268,14 @@ legacy_artifact_uri=oss://bucket/payload
 legacy_bundle_uri=oss://bucket/legacy-controller
 legacy_source=$(printf '9%.0s' {1..40})
 legacy_bundle_sha=$(monday_sha256_file "$p0")
+legacy_runtime_sha=$(monday_rust_lob_runtime_contract_sha256_v1 "$source_dir")
+candidate_runtime_sha=$(monday_manifest_field "$m0" runtime_contract_sha256)
+[[ $legacy_runtime_sha != "$candidate_runtime_sha" ]] || {
+  printf 'typed runtime migration fixture did not produce distinct R0/R2 identities\n' >&2
+  exit 1
+}
 jq -cS -n --arg artifact_uri "$legacy_artifact_uri" --arg artifact_sha "$p0_sha" \
-  --arg runtime "$(monday_manifest_field "$m0" runtime_contract_sha256)" \
+  --arg runtime "$legacy_runtime_sha" \
   --arg source "$legacy_source" --arg bundle "$legacy_bundle_uri" --arg bundle_sha "$legacy_bundle_sha" \
   '{schema:("monday.rust_lob_controller_release." + "v1"),artifact_uri:$artifact_uri,
     artifact_sha256:$artifact_sha,runtime_contract_sha256:$runtime,
@@ -223,9 +300,99 @@ cp -p -- "$legacy_work/deployment/host-rust-lob-recovery-queue.sh" \
 cp -p -- "$legacy_work/deployment/monday-collector-health.sh" \
   "$ROOT/opt/monday/bin/monday-collector-health.sh"
 
-# Bootstrap uses an explicit direct before topology and requires P1 == P0.
+# Bootstrap uses an explicit direct before topology and requires P1 == P0;
+# the candidate runtime is R2, while the live legacy topology is R0.
 ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p0_sha/binance-lob-archiver" \
   "$ROOT/opt/monday/bin/binance-lob-archiver"
+# A persisted temporary lease is recoverable without an EXIT trap.  The
+# fixture invokes the signed Gate's internal recovery mode as a stand-in for
+# a timer firing after SIGKILL: run-scoped workers are stopped first, the
+# limits are read back, and the transient timer/service are removed.
+recovery_run=20260828T010101Z-77
+recovery_state_root="$ROOT/run/monday/rust-lob-gate"
+recovery_state="$recovery_state_root/bootstrap-slice-lease-$recovery_run.json"
+recovery_service="monday-rust-lob-gate-${recovery_run}-lease-recovery.service"
+recovery_timer="monday-rust-lob-gate-${recovery_run}-lease-recovery.timer"
+recovery_gate_script="$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/host-rust-lob-shadow-gate.sh"
+recovery_gate_script_sha=$(monday_sha256_file "$recovery_gate_script")
+mkdir -p "$recovery_state_root" "$ROOT/run/systemd/system"
+jq -cS -n --arg run "$recovery_run" --arg slice "$production_slice_asset" \
+  --arg service "$recovery_service" --arg timer "$recovery_timer" \
+  --arg controller "$c0" --arg gate_script "$recovery_gate_script" \
+  --arg gate_script_sha "$recovery_gate_script_sha" \
+  --argjson gate_pid 999999 --argjson gate_starttime 1 \
+  '{schema:"monday.rust_lob_bootstrap_slice_lease.v1",run_id:$run,slice:$slice,
+    mode:"temporary-bootstrap",before_memory_high:"3221225472",
+    before_memory_max:"3758096384",requested_memory_high:"3072M",
+    requested_memory_max:"3584M",candidate_controller_sha256:$controller,
+    gate_script:$gate_script,gate_script_sha256:$gate_script_sha,
+    gate_pid:$gate_pid,gate_starttime:$gate_starttime,
+    recovery_service:$service,recovery_timer:$timer,
+    applied:true,restored:false}' >"$recovery_state"
+printf '[Unit]\n' >"$ROOT/run/systemd/system/$recovery_service"
+printf '[Timer]\n' >"$ROOT/run/systemd/system/$recovery_timer"
+rm -f -- "$ROOT/run/gate-fixture.calls"
+MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_RECOVERY_RUN="$recovery_run" \
+MONDAY_GATE_FIXTURE_RECORD_CALLS=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --recover-bootstrap-lease \
+  "$recovery_state" --root "$ROOT" >"$ROOT/recovery.out" 2>&1 || {
+  cat "$ROOT/recovery.out" >&2
+  exit 1
+}
+[[ $(jq -er '.restored' "$recovery_state") == true ]]
+[[ ! -e "$ROOT/run/systemd/system/$recovery_service" && ! -e "$ROOT/run/systemd/system/$recovery_timer" ]]
+[[ $(grep -n '^stop monday-rust-lob-gate-' "$ROOT/run/gate-fixture.calls" | head -n1 | cut -d: -f1) -lt \
+   $(grep -n '^set-property$' "$ROOT/run/gate-fixture.calls" | head -n1 | cut -d: -f1) ]]
+if grep -Fq "stop $recovery_service" "$ROOT/run/gate-fixture.calls"; then
+  printf 'lease recovery oneshot attempted to stop itself\n' >&2
+  exit 1
+fi
+grep -Fq 'OnActiveSec=30s' "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh"
+grep -Fq 'OnUnitInactiveSec=30s' "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh"
+if grep -Fq 'OnActiveSec=5s' "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh"; then
+  printf 'lease recovery timer still has the unsafe five-second trigger\n' >&2
+  exit 1
+fi
+# A watchdog firing while its recorded Gate owner is still alive must leave
+# the lease and workers untouched; only owner disappearance permits restore.
+recovery_alive_run=20260828T010102Z-78
+recovery_alive_state="$recovery_state_root/bootstrap-slice-lease-$recovery_alive_run.json"
+recovery_alive_service="monday-rust-lob-gate-${recovery_alive_run}-lease-recovery.service"
+recovery_alive_timer="monday-rust-lob-gate-${recovery_alive_run}-lease-recovery.timer"
+mkdir -p "$ROOT/proc/$$"
+printf '1 fixture S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 4242\n' >"$ROOT/proc/$$/stat"
+jq -cS -n --arg run "$recovery_alive_run" --arg slice "$production_slice_asset" \
+  --arg service "$recovery_alive_service" --arg timer "$recovery_alive_timer" \
+  --arg controller "$c0" --arg gate_script "$recovery_gate_script" \
+  --arg gate_script_sha "$recovery_gate_script_sha" --argjson gate_pid "$$" \
+  --argjson gate_starttime 4242 \
+  '{schema:"monday.rust_lob_bootstrap_slice_lease.v1",run_id:$run,slice:$slice,
+    mode:"temporary-bootstrap",before_memory_high:"3221225472",
+    before_memory_max:"3758096384",requested_memory_high:"3072M",
+    requested_memory_max:"3584M",candidate_controller_sha256:$controller,
+    gate_script:$gate_script,gate_script_sha256:$gate_script_sha,
+    gate_pid:$gate_pid,gate_starttime:$gate_starttime,
+    recovery_service:$service,recovery_timer:$timer,
+    applied:true,restored:false}' >"$recovery_alive_state"
+rm -f -- "$ROOT/run/gate-fixture.calls"
+MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_RECOVERY_RUN="$recovery_alive_run" \
+MONDAY_GATE_FIXTURE_RECORD_CALLS=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --recover-bootstrap-lease \
+  "$recovery_alive_state" --root "$ROOT" >/dev/null
+[[ $(jq -er '.restored' "$recovery_alive_state") == false ]]
+[[ ! -s "$ROOT/run/gate-fixture.calls" ]]
+rm -rf -- "$ROOT/proc/$$"
+legacy_production_service="$ROOT/etc/systemd/system/binance-lob-archiver-production@.service"
+cp -p -- "$legacy_production_service" "$legacy_production_service.before-delta"
+chmod u+w "$legacy_production_service"
+printf '\n# illegal legacy runtime delta fixture\n' >>"$legacy_production_service"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
+  --from-controller direct --candidate-controller "$c0" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'Gate accepted an illegal legacy runtime delta\n' >&2
+  exit 1
+fi
+mv -f -- "$legacy_production_service.before-delta" "$legacy_production_service"
 gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
   --from-controller direct --candidate-controller "$c0" --root "$ROOT")
@@ -233,9 +400,16 @@ gate=$(printf '%s\n' "$gate_output" | sed -n 's/^V2 Gate receipt: //p')
 gate_sha=$(printf '%s\n' "$gate_output" | sed -n 's/^SHA-256: //p')
 [[ -f $gate && $gate_sha == "$(monday_sha256_file "$gate")" ]]
 monday_validate_v2_gate "$gate" direct "$c0" "$gate_sha"
+jq -e '.shadow_staging.aggregate_slice.cgroup
+  == ("/" + .shadow_staging.aggregate_slice.name)' "$gate" >/dev/null
+oss_source=$(sed -n '/^run_oss()/,/^verify_oss_roundtrips()/p' \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh")
+grep -Fq 'systemd-run --quiet --pipe --wait --collect' <<<"$oss_source"
+grep -Fq -- "--slice=\"\$GATE_WORKER_SLICE\"" <<<"$oss_source"
+grep -Fq -- '--property=MemoryMax=1536M' <<<"$oss_source"
 jq -e 'all(.resource_admission[];
   .required_bytes == (.phase_memory_max_bytes + .host_memory_reserve_bytes + .production_memory_growth_bytes)
-  and .production_memory_growth_bytes == (.production_child_memory_max_sum_bytes - .production_parent_memory_current_bytes)
+  and .production_memory_growth_bytes == (.production_slice_memory_max_bytes - .production_parent_memory_anon_bytes)
   and .host_memory_reserve_bytes == 1073741824
   and .host_memory_available_bytes >= .required_bytes
   and (has("production_memory_growth_headroom_bytes") | not))' "$gate" >/dev/null
@@ -371,7 +545,9 @@ ln -s "$legacy_root/$legacy_c0" "$ROOT/opt/monday/releases/binance-lob-controlle
 rm -f -- "$ROOT/opt/monday/bin/binance-lob-archiver"
 ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p0_sha/binance-lob-archiver" \
   "$ROOT/opt/monday/bin/binance-lob-archiver"
+rm -f -- "$(monday_runtime_asset_target "$ROOT" "$production_slice_asset")"
 while IFS= read -r asset; do
+  [[ $asset == "$production_slice_asset" ]] && continue
   target=$(monday_runtime_asset_target "$ROOT" "$asset")
   rm -f -- "$target"
   cp -p -- "$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/$asset" "$target"
@@ -508,7 +684,7 @@ if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_FRESH_ADMISSION_FAIL=1 \
   exit 1
 fi
 if [[ -f $ROOT/run/gate-fixture.calls ]] && grep -Eq \
-  '^start monday-rust-lob-gate-' "$ROOT/run/gate-fixture.calls"; then
+  '^start monday-rust-lob-gate-.*-(spot|usdm)\\.service$' "$ROOT/run/gate-fixture.calls"; then
   printf 'Shadow writer started after fresh memory admission failed\n' >&2
   exit 1
 fi
@@ -524,7 +700,7 @@ if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_PID_MISMATCH=1 \
   exit 1
 fi
 if [[ -f $ROOT/run/gate-fixture.calls ]] && grep -Eq \
-  '^start monday-rust-lob-gate-' "$ROOT/run/gate-fixture.calls"; then
+  '^start monday-rust-lob-gate-.*-(spot|usdm)\\.service$' "$ROOT/run/gate-fixture.calls"; then
   printf 'Shadow writer started after production MainPID membership failed\n' >&2
   exit 1
 fi
@@ -541,7 +717,7 @@ if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_IDENTITY_DRIFT=1 \
   exit 1
 fi
 if [[ -f $ROOT/run/gate-fixture.calls ]] && grep -Eq \
-  '^start monday-rust-lob-gate-' "$ROOT/run/gate-fixture.calls"; then
+  '^start monday-rust-lob-gate-.*-(spot|usdm)\\.service$' "$ROOT/run/gate-fixture.calls"; then
   printf 'Shadow writer started after production identity drift\n' >&2
   exit 1
 fi
