@@ -22,15 +22,20 @@ configure() {
 }
 
 validate_archive() {
-  local archive=$1 list entry
+  local archive=$1 list entry invalid=false
   list=$(mktemp)
   tar -tf "$archive" >"$list" || { rm -f "$list"; return 1; }
   [[ -s $list ]] || { rm -f "$list"; return 1; }
   while IFS= read -r entry; do
     [[ $entry =~ ^[A-Za-z0-9][A-Za-z0-9._@+-]*$ ]] || {
-      rm -f "$list"; return 1;
+      invalid=true
+      break
     }
   done <"$list"
+  if [[ $invalid == true ]]; then
+    rm -f "$list"
+    return 1
+  fi
   printf '%s\n' "$list"
 }
 
@@ -90,6 +95,7 @@ publish_controller_release() (
   local artifact=$1 bundle=$2 manifest=$3 root=${4:-${MONDAY_ROOT:-/}}
   local artifact_sha artifact_uri bundle_sha bundle_uri source runtime manifest_sha release work extracted list asset mode
   configure "$root"
+  # shellcheck disable=SC1091
   . "$(dirname -- "$0")/rust-lob-control-plane-lib.sh"
   regular_file "$artifact" || die 'artifact input is missing'
   regular_file "$bundle" || die 'deployment bundle input is missing'
