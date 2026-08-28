@@ -961,19 +961,23 @@ artifact identity, verifies the installed binary SHA, archives the prior
 deliberately refuses the active production digest so historical rollback
 identity cannot be rewritten.
 
-For a controller-only change on the active binary, use the same command with
-`CONTROLLER_ONLY=1`. This uploads a digest-addressed bundle and release manifest,
-then publishes an immutable host release under:
+For a controller-only change on a digest-addressed staged artifact, use the same
+command with `CONTROLLER_ONLY=1`. The staged artifact may be inactive; publication
+verifies its binary SHA, `release.json`, and runtime-contract digest before it
+uploads a digest-addressed bundle and release manifest, then publishes an
+immutable host release under:
 
 ```text
 /opt/monday/releases/binance-lob-controller/<controller-release-manifest-sha256>/
 ```
 
-Publication requires the active artifact URI/SHA and the candidate and active
-runtime-contract digests to match. It does not install controller files, change
-systemd state, touch `/data`, start a Gate, change either production symlink, or
-restart a collector. Applying that exact controller release is a separate
-Runtime transition with its own rollback and readback evidence.
+Publication requires the staged artifact URI/SHA and its runtime-contract digest
+to match the controller manifest and bundle. It does not require the production
+symlink to point at that artifact, and it does not change the production or
+controller `active` symlinks, install controller files, change systemd state,
+touch `/data`, start a Gate, or restart a collector. Applying that exact
+controller release is a separate Runtime transition with its own rollback and
+readback evidence.
 
 Apply a published controller release through the named operation wrapper:
 

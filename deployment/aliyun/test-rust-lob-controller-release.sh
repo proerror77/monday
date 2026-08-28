@@ -66,6 +66,24 @@ write_manifest() {
       deployment_bundle_sha256:$bundle_sha}' >"$output"
 }
 
+make_artifact_release() {
+  local artifact_file=$1 artifact_sha=$2 artifact_uri=$3 deployment_source=$4
+  local release="$fixture/opt/monday/releases/binance-lob-archiver/$artifact_sha"
+  local runtime_contract
+  mkdir -p "$release/deployment"
+  for asset in "${assets[@]}"; do
+    cp "$deployment_source/$asset" "$release/deployment/$asset"
+  done
+  cp "$artifact_file" "$release/binance-lob-archiver"
+  runtime_contract=$(monday_rust_lob_runtime_contract_sha256 "$release/deployment")
+  jq -n \
+    --arg artifact_uri "$artifact_uri" \
+    --arg artifact_sha "$artifact_sha" \
+    --arg runtime_contract "$runtime_contract" \
+    '{artifact_uri:$artifact_uri,artifact_sha256:$artifact_sha,
+      runtime_contract_sha256:$runtime_contract}' >"$release/release.json"
+}
+
 fixture="$tmp_dir/fixture"
 bundle_source="$tmp_dir/bundle-source"
 mkdir -p "$fixture/opt/monday/bin" "$bundle_source"
@@ -80,20 +98,19 @@ printf '#!/usr/bin/env bash\nexit 0\n' >"$artifact"
 chmod 0755 "$artifact"
 artifact_sha=$(sha256sum "$artifact" | awk '{print $1}')
 artifact_release="$fixture/opt/monday/releases/binance-lob-archiver/$artifact_sha"
-mkdir -p "$artifact_release/deployment"
-for asset in "${assets[@]}"; do
-  cp "$SCRIPT_DIR/$asset" "$artifact_release/deployment/$asset"
-done
-cp "$artifact" "$artifact_release/binance-lob-archiver"
 artifact_uri="oss://bucket/releases/$artifact_sha/binance-lob-archiver"
-runtime_contract=$(monday_rust_lob_runtime_contract_sha256 "$artifact_release/deployment")
-jq -n \
-  --arg artifact_uri "$artifact_uri" \
-  --arg artifact_sha "$artifact_sha" \
-  --arg runtime_contract "$runtime_contract" \
-  '{artifact_uri:$artifact_uri,artifact_sha256:$artifact_sha,
-    runtime_contract_sha256:$runtime_contract}' >"$artifact_release/release.json"
-ln -s "$artifact_release/binance-lob-archiver" \
+make_artifact_release "$artifact" "$artifact_sha" "$artifact_uri" "$SCRIPT_DIR"
+runtime_contract=$(jq -er '.runtime_contract_sha256' "$artifact_release/release.json")
+
+production_artifact="$tmp_dir/binance-lob-archiver-production"
+printf '#!/usr/bin/env bash\nprintf production\\nexit 0\n' >"$production_artifact"
+chmod 0755 "$production_artifact"
+production_artifact_sha=$(sha256sum "$production_artifact" | awk '{print $1}')
+production_artifact_release="$fixture/opt/monday/releases/binance-lob-archiver/$production_artifact_sha"
+production_artifact_uri="oss://bucket/releases/$production_artifact_sha/binance-lob-archiver"
+make_artifact_release \
+  "$production_artifact" "$production_artifact_sha" "$production_artifact_uri" "$SCRIPT_DIR"
+ln -s "$production_artifact_release/binance-lob-archiver" \
   "$fixture/opt/monday/bin/binance-lob-archiver"
 
 bundle="$tmp_dir/deployment.tar"
@@ -112,8 +129,10 @@ done
 bundle_sha=$(sha256sum "$bundle" | awk '{print $1}')
 write_manifest "$manifest" "$artifact_sha" "$bundle_sha" "$runtime_contract"
 manifest_sha=$(sha256sum "$manifest" | awk '{print $1}')
-active_metadata_before=$(sha256sum "$artifact_release/release.json" | awk '{print $1}')
-active_target_before=$(readlink "$fixture/opt/monday/bin/binance-lob-archiver")
+staged_metadata_before=$(sha256sum "$artifact_release/release.json" | awk '{print $1}')
+production_target_before=$(readlink "$fixture/opt/monday/bin/binance-lob-archiver")
+controller_root="$fixture/opt/monday/releases/binance-lob-controller"
+[[ ! -e "$controller_root/active" && ! -L "$controller_root/active" ]]
 
 publish_controller_release "$fixture" "$artifact" "$bundle" "$manifest" \
   >"$tmp_dir/first.out"
@@ -124,12 +143,25 @@ cmp -s "$manifest" "$controller_release/release.json"
   && sha256sum --check --strict release.json.sha256 >/dev/null \
   && sha256sum --check --strict deployment.sha256 >/dev/null)
 [[ $(sha256sum "$artifact_release/release.json" | awk '{print $1}') \
-  == "$active_metadata_before" ]]
+  == "$staged_metadata_before" ]]
 [[ $(readlink "$fixture/opt/monday/bin/binance-lob-archiver") \
-  == "$active_target_before" ]]
+  == "$production_target_before" ]]
 publish_controller_release "$fixture" "$artifact" "$bundle" "$manifest" \
   >"$tmp_dir/second.out"
 grep -Fq 'already published' "$tmp_dir/second.out"
+
+ln -s "$controller_release" "$controller_root/active"
+active_controller_before=$(readlink "$controller_root/active")
+p0_manifest="$tmp_dir/production-controller-release.json"
+write_manifest "$p0_manifest" "$production_artifact_sha" "$bundle_sha" "$runtime_contract"
+p0_manifest_sha=$(sha256sum "$p0_manifest" | awk '{print $1}')
+publish_controller_release "$fixture" "$production_artifact" "$bundle" \
+  "$p0_manifest" >"$tmp_dir/production.out"
+production_controller_release="$controller_root/$p0_manifest_sha"
+[[ -d $production_controller_release && ! -L $production_controller_release ]]
+[[ $p0_manifest_sha != "$manifest_sha" ]]
+[[ $(readlink "$controller_root/active") == "$active_controller_before" ]]
+[[ $(readlink "$fixture/opt/monday/bin/binance-lob-archiver") == "$production_target_before" ]]
 
 runtime_source="$tmp_dir/runtime-source"
 cp -R "$bundle_source" "$runtime_source"
@@ -146,8 +178,117 @@ if (publish_controller_release "$fixture" "$artifact" "$runtime_bundle" \
   printf 'controller release accepted a changed runtime contract\n' >&2
   exit 1
 fi
-grep -Fq 'active release metadata differs from controller release identity' \
+grep -Fq 'staged artifact metadata differs from controller release identity' \
   "$tmp_dir/runtime.out"
+
+runtime_artifact="$tmp_dir/binance-lob-archiver-runtime"
+printf '#!/usr/bin/env bash\nprintf runtime\\nexit 0\n' >"$runtime_artifact"
+chmod 0755 "$runtime_artifact"
+runtime_artifact_sha=$(sha256sum "$runtime_artifact" | awk '{print $1}')
+runtime_artifact_uri="oss://bucket/releases/$runtime_artifact_sha/binance-lob-archiver"
+make_artifact_release \
+  "$runtime_artifact" "$runtime_artifact_sha" "$runtime_artifact_uri" "$runtime_source"
+runtime_candidate_manifest="$tmp_dir/runtime-candidate.json"
+write_manifest "$runtime_candidate_manifest" "$runtime_artifact_sha" \
+  "$runtime_bundle_sha" "$runtime_changed"
+runtime_candidate_sha=$(sha256sum "$runtime_candidate_manifest" | awk '{print $1}')
+publish_controller_release "$fixture" "$runtime_artifact" "$runtime_bundle" \
+  "$runtime_candidate_manifest" >"$tmp_dir/runtime-candidate.out"
+[[ -d "$controller_root/$runtime_candidate_sha" \
+  && ! -L "$controller_root/$runtime_candidate_sha" ]]
+[[ $(readlink "$fixture/opt/monday/bin/binance-lob-archiver") \
+  == "$production_target_before" ]]
+[[ $(readlink "$controller_root/active") == "$active_controller_before" ]]
+
+controller_manifest_tampered="$tmp_dir/controller-manifest-tampered.json"
+jq '.deployment_source_revision = ("d" * 40)' "$manifest" \
+  >"$controller_manifest_tampered"
+controller_manifest_tampered_sha=$(sha256sum "$controller_manifest_tampered" | awk '{print $1}')
+controller_manifest_tampered_real="$tmp_dir/controller-release-real"
+cp -R "$controller_release" "$controller_manifest_tampered_real"
+ln -s "$controller_manifest_tampered_real" \
+  "$controller_root/$controller_manifest_tampered_sha"
+if (publish_controller_release "$fixture" "$artifact" "$bundle" \
+  "$controller_manifest_tampered") >"$tmp_dir/controller-path.out" 2>&1; then
+  printf 'controller release accepted an indirect existing release path\n' >&2
+  exit 1
+fi
+grep -Fq 'controller release path is indirect' "$tmp_dir/controller-path.out"
+
+controller_root_real="$tmp_dir/controller-root-real"
+mv "$controller_root" "$controller_root_real"
+ln -s "$controller_root_real" "$controller_root"
+if (publish_controller_release "$fixture" "$artifact" "$bundle" "$manifest") \
+  >"$tmp_dir/controller-root.out" 2>&1; then
+  printf 'controller release accepted an indirect controller release root\n' >&2
+  exit 1
+fi
+grep -Fq 'controller release root is indirect' "$tmp_dir/controller-root.out"
+rm "$controller_root"
+mv "$controller_root_real" "$controller_root"
+
+release_manifest_backup="$tmp_dir/release.json.backup"
+release_checksum_backup="$tmp_dir/release.json.sha256.backup"
+cp "$controller_release/release.json" "$release_manifest_backup"
+cp "$controller_release/release.json.sha256" "$release_checksum_backup"
+chmod u+w "$controller_release"
+chmod u+w "$controller_release/release.json" "$controller_release/release.json.sha256"
+printf '{"tampered":true}\n' >"$controller_release/release.json"
+sha256sum "$controller_release/release.json" >"$controller_release/release.json.sha256"
+chmod 0444 "$controller_release/release.json" "$controller_release/release.json.sha256"
+if (publish_controller_release "$fixture" "$artifact" "$bundle" "$manifest") \
+  >"$tmp_dir/controller-manifest.out" 2>&1; then
+  printf 'controller release accepted a manifest digest mismatch\n' >&2
+  exit 1
+fi
+grep -Fq 'existing controller release manifest differs' "$tmp_dir/controller-manifest.out"
+chmod u+w "$controller_release"
+chmod u+w "$controller_release/release.json" "$controller_release/release.json.sha256"
+cp "$release_manifest_backup" "$controller_release/release.json"
+cp "$release_checksum_backup" "$controller_release/release.json.sha256"
+chmod 0444 "$controller_release/release.json" "$controller_release/release.json.sha256"
+chmod 0555 "$controller_release"
+
+release_checksum_backup="$tmp_dir/deployment.sha256.backup"
+cp "$controller_release/deployment.sha256" "$release_checksum_backup"
+chmod u+w "$controller_release"
+chmod u+w "$controller_release/deployment.sha256"
+printf 'tampered\n' >"$controller_release/deployment.sha256"
+chmod 0444 "$controller_release/deployment.sha256"
+if (publish_controller_release "$fixture" "$artifact" "$bundle" "$manifest") \
+  >"$tmp_dir/controller-checksum.out" 2>&1; then
+  printf 'controller release accepted a checksum mismatch\n' >&2
+  exit 1
+fi
+grep -Fq 'existing controller release checksum verification failed' \
+  "$tmp_dir/controller-checksum.out"
+chmod u+w "$controller_release"
+chmod u+w "$controller_release/deployment.sha256"
+cp "$release_checksum_backup" "$controller_release/deployment.sha256"
+chmod 0444 "$controller_release/deployment.sha256"
+chmod 0555 "$controller_release"
+
+indirect_artifact="$tmp_dir/binance-lob-archiver-indirect"
+printf '#!/usr/bin/env bash\nprintf indirect\\nexit 0\n' >"$indirect_artifact"
+chmod 0755 "$indirect_artifact"
+indirect_artifact_sha=$(sha256sum "$indirect_artifact" | awk '{print $1}')
+indirect_artifact_uri="oss://bucket/releases/$indirect_artifact_sha/binance-lob-archiver"
+indirect_artifact_release="$fixture/opt/monday/releases/binance-lob-archiver/$indirect_artifact_sha"
+make_artifact_release \
+  "$indirect_artifact" "$indirect_artifact_sha" "$indirect_artifact_uri" "$SCRIPT_DIR"
+indirect_artifact_real="$tmp_dir/indirect-artifact-real"
+mv "$indirect_artifact_release" "$indirect_artifact_real"
+ln -s "$indirect_artifact_real" "$indirect_artifact_release"
+indirect_manifest="$tmp_dir/indirect-artifact.json"
+write_manifest "$indirect_manifest" "$indirect_artifact_sha" "$bundle_sha" \
+  "$runtime_contract"
+if (publish_controller_release "$fixture" "$indirect_artifact" "$bundle" \
+  "$indirect_manifest") >"$tmp_dir/indirect-artifact.out" 2>&1; then
+  printf 'controller release accepted an indirect staged artifact release\n' >&2
+  exit 1
+fi
+grep -Fq 'staged artifact release is missing or indirect' \
+  "$tmp_dir/indirect-artifact.out"
 
 tampered_source="$tmp_dir/tampered-source"
 cp -R "$bundle_source" "$tampered_source"
