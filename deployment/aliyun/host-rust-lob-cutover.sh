@@ -142,6 +142,14 @@ readonly -a PAIR_ASSETS=(
   host-rust-lob-recovery-queue.sh
   monday-collector-health.sh
 )
+is_production_pair_asset() {
+  case "$1" in
+    binance-lob-archiver-production@.service|binance-lob-archiver-upload@.service|\
+    binance-lob-archiver-production-spot.env|binance-lob-archiver-production-usdm.env)
+      return 0 ;;
+    *) return 1 ;;
+  esac
+}
 declare -A asset_target asset_mode asset_state asset_sha
 for asset in "${PAIR_ASSETS[@]}"; do
   if [[ $asset == *.service || $asset == *.timer ]]; then
@@ -159,6 +167,24 @@ for asset in "${PAIR_ASSETS[@]}"; do
     asset_state[$asset]=absent; asset_sha[$asset]=
   else
     die "installed pair asset is indirect: ${asset_target[$asset]}"
+  fi
+done
+for asset in "${PAIR_ASSETS[@]}"; do
+  source="$target_release/deployment/$asset"
+  [[ -f $source && ! -L $source ]] || die "target pair asset is missing: $asset"
+  if [[ $FROM == direct ]]; then
+    if is_production_pair_asset "$asset"; then
+      [[ ${asset_state[$asset]} == present ]] || die "direct bootstrap production asset is absent: $asset"
+      cmp -s "$source" "${asset_target[$asset]}" \
+        || die "direct bootstrap production asset changed since Gate: $asset"
+    elif [[ ${asset_state[$asset]} == present ]]; then
+      cmp -s "$source" "${asset_target[$asset]}" \
+        || die "direct bootstrap existing pair asset changed since Gate: $asset"
+    fi
+  else
+    [[ ${asset_state[$asset]} == present ]] || die "before pair asset is absent: $asset"
+    cmp -s "$before_release/deployment/$asset" "${asset_target[$asset]}" \
+      || die "before pair asset changed since Gate: $asset"
   fi
 done
 

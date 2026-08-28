@@ -71,6 +71,19 @@ gate_sha=$(printf '%s\n' "$gate_output" | sed -n 's/^SHA-256: //p')
 [[ -f $gate && $gate_sha == "$(monday_sha256_file "$gate")" ]]
 monday_validate_v2_gate "$gate" direct "$c0" "$gate_sha"
 
+bootstrap_cutover_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from direct --to "$c0" \
+  --gate-receipt "$gate" --gate-sha256 "$gate_sha" --root "$ROOT")
+bootstrap_transition=$(printf '%s\n' "$bootstrap_cutover_output" | sed -n 's/^Transition receipt: //p')
+bootstrap_transition_sha=$(printf '%s\n' "$bootstrap_cutover_output" | sed -n 's/^SHA-256: //p')
+[[ $(monday_active_controller_sha "$ROOT") == "$c0" ]]
+[[ $(readlink -- "$ROOT/opt/monday/bin/binance-lob-archiver") == \
+  "$ROOT/opt/monday/releases/binance-lob-controller/active/binance-lob-archiver" ]]
+[[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == \
+  "$ROOT/opt/monday/releases/binance-lob-archiver/$p0_sha/binance-lob-archiver" ]]
+[[ $(monday_sha256_file "$bootstrap_transition") == "$bootstrap_transition_sha" ]]
+monday_validate_v2_transition "$bootstrap_transition" direct "$c0" "$gate" "$gate_sha"
+
 if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
   --from-controller direct --candidate-controller "$c0" --root "$ROOT" \
@@ -123,15 +136,8 @@ if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$fake" >/dev/null 2>&1
   exit 1
 fi
 
-# A V2 before pair must be active and its payload may change.
-ln -s "$ROOT/opt/monday/releases/binance-lob-controller/$c0" \
-  "$ROOT/opt/monday/releases/binance-lob-controller/active"
-# V2 operations require the permanent production projection to resolve through
-# the active controller.  Bootstrap above intentionally exercises the direct
-# topology; switch the fixture to the stable projection before the V2 Gate.
-rm "$ROOT/opt/monday/bin/binance-lob-archiver"
-ln -s "$ROOT/opt/monday/releases/binance-lob-controller/active/binance-lob-archiver" \
-  "$ROOT/opt/monday/bin/binance-lob-archiver"
+# A V2 before pair must be active and its payload may change.  The bootstrap
+# cutover above established the permanent stable production projection.
 mkdir -p "$ROOT/etc/systemd/system" "$ROOT/etc/monday"
 for asset in \
   binance-lob-archiver-rust@.service binance-lob-archiver-rust-upload@.service; do
