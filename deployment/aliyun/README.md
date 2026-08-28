@@ -1079,8 +1079,11 @@ cutover/readback path. Keep the controller digest paired with the current and
 rollback candidate. A controller-only change may keep the same runtime payload,
 but it does not make a v5 receipt reusable: the final controller digest must
 still be named by the Gate, cutover, and independent readback.
-The Gate never executes control scripts, helpers, or policy files from the
-candidate artifact; those bytes must come from the controller release digest.
+A pair-bound Gate never executes control scripts, helpers, or policy files from
+the candidate artifact; those bytes must come from the controller release
+digest. The legacy no-controller fallback continues to use the candidate
+control-plane bytes and may produce v4 evidence until the removal trigger above
+is satisfied.
 
 Fallback removal trigger: once every repository caller, runbook, and test
 passes `CONTROLLER_RELEASE_SHA256`, both the current and rollback candidates
