@@ -1043,16 +1043,20 @@ trade for a static symbol. Every segment must still contain at least one real
 
 ### 2. Run the short production-catalog gate
 
-Run the non-mutating host and resource preflight first. It verifies the exact
-candidate, deployment bundle, installed Shadow assets, production service state,
-and fresh `MemAvailable`, then prints one JSON result without creating Gate
-evidence, spool directories, overrides, or changing services:
+Run the non-mutating host and resource preflight first. Pass the exact published
+controller release as well as the candidate artifact. The controller release is
+the only source of the Gate script, helper, and policy; the candidate supplies
+only the binary and runtime assets. It verifies both identities, deployment
+checksums, installed Shadow assets, production service state, and fresh
+`MemAvailable`, then prints one JSON result without creating Gate evidence, spool
+directories, overrides, or changing services:
 
 ```bash
 set -euo pipefail
 ACTION=gate-preflight \
 INSTANCE_ID=i-REPLACE \
 ARTIFACT_SHA256=REPLACE_WITH_64_HEX_DIGEST \
+CONTROLLER_RELEASE_SHA256=REPLACE_WITH_CONTROLLER_MANIFEST_SHA256 \
 ./deployment/aliyun/invoke-rust-lob-operation.sh
 ```
 
@@ -1064,8 +1068,28 @@ set -euo pipefail
 ACTION=gate \
 INSTANCE_ID=i-REPLACE \
 ARTIFACT_SHA256=REPLACE_WITH_64_HEX_DIGEST \
+CONTROLLER_RELEASE_SHA256=REPLACE_WITH_CONTROLLER_MANIFEST_SHA256 \
 ./deployment/aliyun/invoke-rust-lob-operation.sh
 ```
+
+The no-controller form remains a deprecated artifact-routed compatibility
+fallback and may still produce a legacy v4 `PASSED.sha256` during the
+transition. That legacy receipt cannot authorize the future pair-bound
+cutover/readback path. Keep the controller digest paired with the current and
+rollback candidate. A controller-only change may keep the same runtime payload,
+but it does not make a v5 receipt reusable: the final controller digest must
+still be named by the Gate, cutover, and independent readback.
+A pair-bound Gate never executes control scripts, helpers, or policy files from
+the candidate artifact; those bytes must come from the controller release
+digest. The legacy no-controller fallback continues to use the candidate
+control-plane bytes and may produce v4 evidence until the removal trigger above
+is satisfied.
+
+Fallback removal trigger: once every repository caller, runbook, and test
+passes `CONTROLLER_RELEASE_SHA256`, both the current and rollback candidates
+have a named controller release, pair-bound cutover/readback consume only v5
+evidence, and one final controller digest has completed Gate -> cutover ->
+independent readback, remove the no-controller fallback in the next change.
 
 The host gate owns only the runtime transition. A failed Gate blocks cutover,
 not Code, CI, Merge, or immutable Release publication. It verifies the candidate,
@@ -1130,17 +1154,19 @@ The Gate fails unless all of these are true for the entire candidate run:
 A successful production gate writes:
 
 ```text
-/data/monday/evidence/shadow-gates/<artifact-sha256>/<runtime-contract-sha256>/runs/<run-id>/run.json
-/data/monday/evidence/shadow-gates/<artifact-sha256>/<runtime-contract-sha256>/runs/<run-id>/gate.json
-/data/monday/evidence/shadow-gates/<artifact-sha256>/<runtime-contract-sha256>/runs/<run-id>/PASSED.sha256
+/data/monday/evidence/shadow-gates/<artifact-sha256>/<runtime-contract-sha256>/<controller-release-sha256>/runs/<run-id>/run.json
+/data/monday/evidence/shadow-gates/<artifact-sha256>/<runtime-contract-sha256>/<controller-release-sha256>/runs/<run-id>/gate.json
+/data/monday/evidence/shadow-gates/<artifact-sha256>/<runtime-contract-sha256>/<controller-release-sha256>/runs/<run-id>/PASSED.sha256
 ```
 
 Every invocation gets a new append-only run directory; prior gate evidence is
 never deleted or replaced. The marker hashes exactly that run's `gate.json`.
-Evidence binds the binary and the content hash of the eight production/Shadow
-unit and environment files. It records the clean source revision and full
-deployment-bundle SHA-256 separately, so a controller-only fix can reuse the
-same runtime Gate while unit or environment changes cannot. A second production
+Evidence binds the binary, the controller release digest, and the content hash
+of the eight production/Shadow unit and environment files. It records the clean
+source revision and full deployment-bundle SHA-256 separately, so a
+controller-only fix cannot reuse a prior v5 receipt; it must name the new
+controller digest in a fresh Gate. Unit or environment changes likewise require
+a fresh Gate. A second production
 gate for an identity that already has a passing run is refused, and cutover
 requires exactly one immutable passing run. A short test override is
 available only for script testing; it writes `passed=false` and never creates

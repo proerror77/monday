@@ -53,6 +53,14 @@ grep -Fxq '  gate)' "$INVOKE"
   printf 'formal Gate actions do not share the single host Gate entry\n' >&2
   exit 1
 }
+grep -Fq 'host-rust-lob-shadow-gate.sh' "$GATE"
+grep -Fq 'monday.rust_lob_gate_resource_preflight.v2' "$GATE"
+grep -Fq 'monday.rust_lob_shadow_gate_run.v2' "$GATE"
+grep -Fq 'monday.rust_lob_shadow_gate.v5' "$GATE"
+if grep -Fq '. "$candidate_deployment' "$GATE"; then
+  printf 'pair-bound Gate sources a candidate control-plane helper\n' >&2
+  exit 1
+fi
 
 psi_tmp_dir=$(mktemp -d)
 trap 'rm -rf "$psi_tmp_dir"' EXIT
@@ -871,10 +879,29 @@ evidence_mutation_line=$(grep -n '^install -d -m 0755 /data/monday$' "$GATE" \
   exit 1
 }
 preflight_lock_guard=$(sed -n \
-  '/^if \[\[ \$resource_preflight_only != true \]\]; then$/,/^fi$/p' "$GATE")
+  '/^if \[\[ \$resource_preflight_only != true || \$pair_mode == true \]\]; then$/,/^fi$/p' "$GATE")
 [[ $preflight_lock_guard == *'install -d -m 0755'* \
+  && $preflight_lock_guard == *'flock -s -n 9'* \
   && $preflight_lock_guard == *'flock -n 9'* ]] || {
   printf 'formal Gate lock is not isolated from the non-mutating preflight\n' >&2
+  exit 1
+}
+preflight_shared_lock_branch_line=$(grep -n -m1 \
+  '^  if \[\[ \$resource_preflight_only == true \]\]; then$' "$GATE" \
+  | cut -d: -f1)
+preflight_shared_lock_line=$(grep -n -m1 'flock -s -n 9' "$GATE" | cut -d: -f1)
+preflight_lock_else_line=$(awk -v start="$preflight_shared_lock_branch_line" \
+  'NR > start && /^  else$/ {print NR; exit}' "$GATE")
+preflight_exclusive_lock_line=$(awk -v start="$preflight_lock_else_line" \
+  'NR > start && /flock -n 9/ {print NR; exit}' "$GATE")
+[[ $preflight_shared_lock_branch_line =~ ^[1-9][0-9]*$ \
+  && $preflight_shared_lock_line =~ ^[1-9][0-9]*$ \
+  && $preflight_lock_else_line =~ ^[1-9][0-9]*$ \
+  && $preflight_exclusive_lock_line =~ ^[1-9][0-9]*$ \
+  && $preflight_shared_lock_branch_line -lt $preflight_shared_lock_line \
+  && $preflight_shared_lock_line -lt $preflight_lock_else_line \
+  && $preflight_lock_else_line -lt $preflight_exclusive_lock_line ]] || {
+  printf 'pair preflight does not use a shared lock and formal Gate an exclusive lock\n' >&2
   exit 1
 }
 if grep -Fq 'release lock must already exist for a non-mutating resource preflight' \
@@ -951,6 +978,464 @@ grep -Fq 'Spot shadow and production SNAPSHOT_PRODUCERS differ' "$GATE"
 
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
+
+# Execute the production pair verifier in a synthetic release tree.  The host
+# entrypoint itself is intentionally not started here (it requires root,
+# /data, systemd, and a live collector); extract the exact verifier functions
+# and identity block so these tests still exercise the code that runs before
+# any Gate evidence or process mutation.
+extract_gate_function() {
+  local function_name=$1
+  awk -v function_name="$function_name" '
+    BEGIN { started = 0; depth = 0 }
+    !started && $0 ~ ("^" function_name "\\(\\) \\\{") { started = 1 }
+    started {
+      line = $0
+      depth += gsub(/\{/, "", line)
+      depth -= gsub(/\}/, "", line)
+      print
+      if (depth == 0) exit
+    }
+  ' "$GATE"
+}
+
+mkdir -p "$tmp_dir/pair-fixture"
+pair_fixture=$(readlink -f "$tmp_dir/pair-fixture")
+pair_verifier_functions="$tmp_dir/pair-verifier-functions.sh"
+pair_verifier_start=$(grep -n -m1 '^if \[\[ \$pair_mode == true \]\]; then$' "$GATE" \
+  | cut -d: -f1)
+pair_verifier_end=$(grep -n -m1 '^gate_seconds=' "$GATE" | cut -d: -f1)
+[[ $pair_verifier_start =~ ^[1-9][0-9]*$ && $pair_verifier_end =~ ^[1-9][0-9]*$ \
+  && $pair_verifier_start -lt $pair_verifier_end ]] || {
+  printf 'could not locate the production pair identity block\n' >&2
+  exit 1
+}
+{
+  extract_gate_function direct_directory
+  extract_gate_function secure_regular_file
+  extract_gate_function runtime_contract_sha256_independent
+  printf 'readonly -f runtime_contract_sha256_independent\n'
+  extract_gate_function validate_controller_manifest
+  extract_gate_function verify_controller_release \
+    | sed "s|/opt/monday/releases|__PAIR_RELEASE_ROOT__|g; s|/opt/monday|$pair_fixture/opt/monday|g; s|__PAIR_RELEASE_ROOT__|$pair_fixture/opt/monday/releases|g"
+} >"$pair_verifier_functions"
+pair_identity_body="$tmp_dir/pair-identity.sh"
+sed -n "${pair_verifier_start},$((pair_verifier_end - 1))p" "$GATE" \
+  | sed "s|/opt/monday/releases|__PAIR_RELEASE_ROOT__|g; s|/opt/monday|$pair_fixture/opt/monday|g; s|__PAIR_RELEASE_ROOT__|$pair_fixture/opt/monday/releases|g" \
+  >"$pair_identity_body"
+
+pair_monday_root="$pair_fixture/opt/monday"
+pair_controller_root="$pair_monday_root/releases/binance-lob-controller"
+pair_artifact_root="$pair_monday_root/releases/binance-lob-archiver"
+pair_data_root="$pair_fixture/data"
+mkdir -p "$pair_monday_root/bin" "$pair_controller_root" "$pair_artifact_root" \
+  "$pair_data_root"
+pair_controller_source=$(printf 'd%.0s' {1..40})
+pair_bundle_sha=$(printf 'b%.0s' {1..64})
+pair_artifact_bundle_sha=$(printf 'a%.0s' {1..64})
+pair_artifact_source=$(printf 'c%.0s' {1..40})
+# The bundle digest is publisher-bound metadata; the host verifies it together
+# with the extracted deployment.sha256 byte receipt rather than rebuilding the
+# original tar stream.
+pair_runtime_assets=(
+  binance-lob-archiver-production@.service
+  binance-lob-archiver-rust@.service
+  binance-lob-archiver-upload@.service
+  binance-lob-archiver-rust-upload@.service
+  binance-lob-archiver-production-spot.env
+  binance-lob-archiver-production-usdm.env
+  binance-lob-archiver-rust-spot.env
+  binance-lob-archiver-rust-usdm.env
+)
+
+pair_artifact_staging="$pair_artifact_root/.artifact-staging"
+pair_artifact_release="$pair_artifact_staging"
+pair_artifact_deployment="$pair_artifact_release/deployment"
+mkdir -p "$pair_artifact_deployment"
+printf '#!/usr/bin/env bash\nexit 0\n' \
+  >"$pair_artifact_release/binance-lob-archiver"
+chmod 0555 "$pair_artifact_release/binance-lob-archiver"
+for pair_asset in "${pair_runtime_assets[@]}"; do
+  cp "$SCRIPT_DIR/$pair_asset" "$pair_artifact_deployment/$pair_asset"
+  chmod 0444 "$pair_artifact_deployment/$pair_asset"
+done
+pair_artifact_sha=$(sha256sum "$pair_artifact_release/binance-lob-archiver" \
+  | awk '{print $1}')
+pair_artifact_release="$pair_artifact_root/$pair_artifact_sha"
+mv "$pair_artifact_staging" "$pair_artifact_release"
+pair_artifact_deployment="$pair_artifact_release/deployment"
+jq -n \
+  --arg artifact "$pair_artifact_sha" \
+  --arg bundle "$pair_artifact_bundle_sha" \
+  --arg source "$pair_artifact_source" \
+  --arg runtime "$(monday_rust_lob_runtime_contract_sha256 \
+    "$pair_artifact_deployment")" \
+  '{artifact_sha256:$artifact,runtime_contract_sha256:$runtime,
+    deployment_bundle_sha256:$bundle,deployment_source_revision:$source}' \
+  >"$pair_artifact_release/release.json"
+chmod 0444 "$pair_artifact_release/release.json"
+ln -s "$pair_artifact_release/binance-lob-archiver" \
+  "$pair_monday_root/bin/binance-lob-archiver-shadow"
+
+pair_controller_staging="$pair_controller_root/.controller-staging"
+pair_controller_release="$pair_controller_staging"
+pair_controller_deployment="$pair_controller_release/deployment"
+pair_controller_manifest="$pair_controller_release/release.json"
+mkdir -p "$pair_controller_deployment"
+for pair_asset in "${pair_runtime_assets[@]}"; do
+  cp "$SCRIPT_DIR/$pair_asset" "$pair_controller_deployment/$pair_asset"
+  chmod 0444 "$pair_controller_deployment/$pair_asset"
+done
+cp "$LIB" "$pair_controller_deployment/rust-lob-control-plane-lib.sh"
+cp "$POLICY" "$pair_controller_deployment/rust-lob-shadow-gate-policy.jq"
+chmod 0444 "$pair_controller_deployment/rust-lob-control-plane-lib.sh" \
+  "$pair_controller_deployment/rust-lob-shadow-gate-policy.jq"
+cp "$pair_verifier_functions" \
+  "$pair_controller_deployment/host-rust-lob-shadow-gate.sh"
+chmod 0555 "$pair_controller_deployment/host-rust-lob-shadow-gate.sh"
+
+pair_runtime_contract=$(monday_rust_lob_runtime_contract_sha256 \
+  "$pair_controller_deployment")
+jq -n \
+  --arg artifact "$pair_artifact_sha" \
+  --arg bundle "$pair_bundle_sha" \
+  --arg source "$pair_controller_source" \
+  --arg runtime "$pair_runtime_contract" \
+  '{schema:"monday.rust_lob_controller_release.v1",
+    artifact_uri:("oss://fixture/releases/" + $artifact),
+    artifact_sha256:$artifact,
+    deployment_bundle_sha256:$bundle,
+    deployment_bundle_uri:("oss://fixture/controllers/" + $bundle),
+    deployment_source_revision:$source,
+    runtime_contract_sha256:$runtime}' \
+  >"$pair_controller_manifest"
+printf '%s  release.json\n' \
+  "$(sha256sum "$pair_controller_manifest" | awk '{print $1}')" \
+  >"$pair_controller_release/release.json.sha256"
+(
+  cd "$pair_controller_release"
+  for pair_asset in deployment/*; do sha256sum "$pair_asset"; done \
+    | sort -k2 >deployment.sha256
+)
+pair_controller_sha=$(sha256sum "$pair_controller_manifest" | awk '{print $1}')
+pair_controller_release="$pair_controller_root/$pair_controller_sha"
+mv "$pair_controller_staging" "$pair_controller_release"
+pair_controller_deployment="$pair_controller_release/deployment"
+pair_controller_manifest="$pair_controller_release/release.json"
+pair_controller_gate="$pair_controller_deployment/host-rust-lob-shadow-gate.sh"
+pair_assert_identity_function="$tmp_dir/pair-assert-identity.sh"
+extract_gate_function assert_pair_identity \
+  | sed "s|/opt/monday/releases|__PAIR_RELEASE_ROOT__|g; s|/opt/monday|$pair_fixture/opt/monday|g; s|__PAIR_RELEASE_ROOT__|$pair_fixture/opt/monday/releases|g" \
+  >"$pair_assert_identity_function"
+
+run_pair_identity_fixture() (
+  local requested_controller=$1
+  local source_gate=$2
+  pair_mode=true
+  controller_release_sha256=$requested_controller
+  CONTROLLER_RELEASE_ROOT=$pair_controller_root
+  RELEASE_ROOT=$pair_artifact_root
+  SHADOW_BINARY=$pair_monday_root/bin/binance-lob-archiver-shadow
+  RUNTIME_CONTRACT_ASSETS=("${pair_runtime_assets[@]}")
+  candidate_sha=$pair_artifact_sha
+  candidate_release=$pair_artifact_release
+  candidate_binary=$pair_artifact_release/binance-lob-archiver
+  candidate_deployment=$pair_artifact_deployment
+  release_json=$pair_artifact_release/release.json
+  die() { printf 'pair verifier fixture failed: %s\n' "$*" >&2; exit 1; }
+  stat() {
+    case "${1:-}:${2:-}" in
+      -c:%u) printf '0\n' ;;
+      -c:%a) printf '444\n' ;;
+      *) command stat "$@" ;;
+    esac
+  }
+  sha256sum() {
+    local -a args=()
+    local argument check=false
+    for argument in "$@"; do
+      case "$argument" in
+        --check) args+=(-c); check=true ;;
+        --strict) : ;;
+        *) args+=("$argument") ;;
+      esac
+    done
+    [[ $check == true && ${#args[@]} -eq 1 ]] && args+=(-)
+    command sha256sum "${args[@]}"
+  }
+  # shellcheck disable=SC1090
+  . "$source_gate"
+  # shellcheck disable=SC1090
+  . "$pair_identity_body"
+  printf '%s %s\n' "$deployment_bundle_sha256" "$deployment_source_revision"
+)
+
+run_pair_evidence_root_fixture() (
+  local controller=$1
+  local binary_evidence_dir runtime_evidence_dir runs_dir
+  local candidate_sha=$pair_artifact_sha
+  local runtime_contract_sha256=$pair_runtime_contract
+  local controller_release_sha256=$controller
+  local pair_mode=true
+  local EVIDENCE_ROOT="$pair_data_root/evidence/shadow-gates"
+  # shellcheck disable=SC1090,SC1091
+  . "$tmp_dir/pair-evidence-path.sh"
+  printf '%s\n' "$runs_dir"
+)
+sed -n '/^binary_evidence_dir=/,/^runs_dir=/p' "$GATE" \
+  >"$tmp_dir/pair-evidence-path.sh"
+
+[[ $(run_pair_identity_fixture "$pair_controller_sha" "$pair_controller_gate") \
+  == "$pair_bundle_sha $pair_controller_source" ]]
+pair_candidate_control_sentinel="$tmp_dir/pair-candidate-control-executed"
+printf ': > %q\n' "$pair_candidate_control_sentinel" \
+  >"$pair_artifact_deployment/rust-lob-control-plane-lib.sh"
+printf ': > %q\n' "$pair_candidate_control_sentinel" \
+  >"$pair_artifact_deployment/host-rust-lob-shadow-gate.sh"
+printf ': > %q\n' "$pair_candidate_control_sentinel" \
+  >"$pair_artifact_deployment/rust-lob-shadow-gate-policy.jq"
+chmod 0555 "$pair_artifact_deployment/rust-lob-control-plane-lib.sh" \
+  "$pair_artifact_deployment/host-rust-lob-shadow-gate.sh"
+chmod 0444 "$pair_artifact_deployment/rust-lob-shadow-gate-policy.jq"
+run_pair_identity_fixture "$pair_controller_sha" "$pair_controller_gate" >/dev/null
+[[ ! -e $pair_candidate_control_sentinel ]] || {
+  printf 'pair verifier executed candidate control-plane bytes\n' >&2
+  exit 1
+}
+[[ $(jq -r '.deployment_bundle_sha256' "$pair_artifact_release/release.json") \
+  == "$pair_artifact_bundle_sha" ]]
+[[ $(jq -r '.deployment_source_revision' "$pair_artifact_release/release.json") \
+  == "$pair_artifact_source" ]]
+[[ "$pair_artifact_bundle_sha" != "$pair_bundle_sha" \
+  && "$pair_artifact_source" != "$pair_controller_source" ]]
+[[ -e $pair_controller_deployment/host-rust-lob-shadow-gate.sh \
+  && -e $pair_controller_deployment/rust-lob-control-plane-lib.sh \
+  && -e $pair_controller_deployment/rust-lob-shadow-gate-policy.jq ]]
+
+pair_controller_zero=$(printf '0%.0s' {1..64})
+mkdir -p "$pair_controller_root/$pair_controller_zero"
+ln -s "$pair_controller_root/$pair_controller_zero" "$pair_controller_root/active"
+run_pair_identity_fixture "$pair_controller_sha" "$pair_controller_gate" >/dev/null
+[[ $(run_pair_evidence_root_fixture "$pair_controller_sha") \
+  != "$(run_pair_evidence_root_fixture "$pair_controller_zero")" ]]
+
+pair_side_effect_sentinel="$tmp_dir/pair-first-side-effect"
+printf '%s\n' untouched >"$pair_side_effect_sentinel"
+pair_expect_failure() {
+  local name=$1
+  shift
+  if "$@" >"$tmp_dir/pair-$name.out" 2>&1; then
+    printf 'pair verifier accepted invalid fixture: %s\n' "$name" >&2
+    exit 1
+  fi
+  cmp -s <(printf '%s\n' untouched) "$pair_side_effect_sentinel" || {
+    printf 'pair verifier crossed the first-side-effect boundary: %s\n' "$name" >&2
+    exit 1
+  }
+  [[ ! -e $pair_candidate_control_sentinel ]] || {
+    printf 'candidate control sentinel ran on failed fixture: %s\n' "$name" >&2
+    exit 1
+  }
+}
+
+run_pair_final_identity_fixture() (
+  local marker=$1
+  pair_mode=true
+  controller_release_sha256=$pair_controller_sha
+  CONTROLLER_RELEASE_ROOT=$pair_controller_root
+  RELEASE_ROOT=$pair_artifact_root
+  candidate_sha=$pair_artifact_sha
+  candidate_release=$pair_artifact_release
+  candidate_binary=$pair_artifact_release/binance-lob-archiver
+  candidate_deployment=$pair_artifact_deployment
+  release_json=$pair_artifact_release/release.json
+  runtime_contract_sha256=$(jq -er '.runtime_contract_sha256' "$release_json")
+  controller_release="$pair_controller_release"
+  controller_deployment="$pair_controller_deployment"
+  controller_manifest="$pair_controller_manifest"
+  controller_gate_script="$pair_controller_gate"
+  controller_lib="$pair_controller_deployment/rust-lob-control-plane-lib.sh"
+  controller_policy="$pair_controller_deployment/rust-lob-shadow-gate-policy.jq"
+  RUNTIME_CONTRACT_ASSETS=("${pair_runtime_assets[@]}")
+  die() { printf 'pair final verifier fixture failed: %s\n' "$*" >&2; exit 1; }
+  stat() {
+    case "${1:-}:${2:-}" in
+      -c:%u) printf '0\n' ;;
+      -c:%a) printf '444\n' ;;
+      *) command stat "$@" ;;
+    esac
+  }
+  sha256sum() {
+    local -a args=()
+    local argument check=false
+    for argument in "$@"; do
+      case "$argument" in
+        --check) args+=(-c); check=true ;;
+        --strict) : ;;
+        *) args+=("$argument") ;;
+      esac
+    done
+    [[ $check == true && ${#args[@]} -eq 1 ]] && args+=(-)
+    command sha256sum "${args[@]}"
+  }
+  # Source the controller path itself so BASH_SOURCE validation observes the
+  # same immutable Gate location as production.
+  # shellcheck disable=SC1090,SC1091
+  . "$pair_controller_gate"
+  # shellcheck disable=SC1090,SC1091
+  . "$pair_assert_identity_function"
+  assert_pair_identity
+  printf 'passed\n' >"$marker"
+)
+
+pair_final_marker="$tmp_dir/pair-final-PASSED"
+run_pair_final_identity_fixture "$pair_final_marker"
+[[ -f $pair_final_marker ]] || {
+  printf 'pair final verifier fixture did not emit its success marker\n' >&2
+  exit 1
+}
+rm -f "$pair_final_marker"
+pair_final_asset=binance-lob-archiver-rust-usdm.env
+pair_final_asset_backup="$tmp_dir/pair-final-asset.backup"
+cp "$pair_artifact_deployment/$pair_final_asset" "$pair_final_asset_backup"
+chmod u+w "$pair_artifact_deployment/$pair_final_asset"
+printf '\nPAIR_FINAL_ASSET_DRIFT=1\n' \
+  >>"$pair_artifact_deployment/$pair_final_asset"
+chmod 0444 "$pair_artifact_deployment/$pair_final_asset"
+pair_expect_failure gate-tail-runtime-asset-drift \
+  run_pair_final_identity_fixture "$pair_final_marker"
+[[ ! -e $pair_final_marker ]] || {
+  printf 'pair final verifier emitted PASSED after runtime asset drift\n' >&2
+  exit 1
+}
+chmod u+w "$pair_artifact_deployment/$pair_final_asset"
+cp "$pair_final_asset_backup" "$pair_artifact_deployment/$pair_final_asset"
+chmod 0444 "$pair_artifact_deployment/$pair_final_asset"
+
+pair_missing_controller=$(printf 'd%.0s' {1..64})
+pair_expect_failure controller-path run_pair_identity_fixture \
+  "$pair_missing_controller" "$pair_controller_gate"
+
+pair_manifest_backup="$tmp_dir/pair-controller-release.json.backup"
+cp "$pair_controller_manifest" "$pair_manifest_backup"
+printf '{}\n' >"$pair_controller_manifest"
+pair_expect_failure controller-manifest run_pair_identity_fixture \
+  "$pair_controller_sha" "$pair_controller_gate"
+cp "$pair_manifest_backup" "$pair_controller_manifest"
+
+pair_checksum_backup="$tmp_dir/pair-controller-deployment.sha256.backup"
+cp "$pair_controller_release/deployment.sha256" "$pair_checksum_backup"
+printf 'tampered\n' >"$pair_controller_release/deployment.sha256"
+pair_expect_failure controller-deployment-checksum run_pair_identity_fixture \
+  "$pair_controller_sha" "$pair_controller_gate"
+cp "$pair_checksum_backup" "$pair_controller_release/deployment.sha256"
+
+pair_gate_backup="$tmp_dir/pair-controller-gate.backup"
+mv "$pair_controller_deployment/host-rust-lob-shadow-gate.sh" "$pair_gate_backup"
+ln -s "$pair_controller_deployment/rust-lob-control-plane-lib.sh" \
+  "$pair_controller_deployment/host-rust-lob-shadow-gate.sh"
+pair_expect_failure controller-gate-symlink run_pair_identity_fixture \
+  "$pair_controller_sha" "$pair_controller_gate"
+rm -f "$pair_controller_deployment/host-rust-lob-shadow-gate.sh"
+mv "$pair_gate_backup" "$pair_controller_deployment/host-rust-lob-shadow-gate.sh"
+
+for pair_control_file in rust-lob-control-plane-lib.sh rust-lob-shadow-gate-policy.jq; do
+  pair_control_backup="$tmp_dir/pair-controller-$pair_control_file.backup"
+  cp "$pair_controller_deployment/$pair_control_file" "$pair_control_backup"
+  rm -f "$pair_controller_deployment/$pair_control_file"
+  ln -s "$pair_controller_deployment/host-rust-lob-shadow-gate.sh" \
+    "$pair_controller_deployment/$pair_control_file"
+  pair_expect_failure "controller-$pair_control_file-symlink" \
+    run_pair_identity_fixture "$pair_controller_sha" "$pair_controller_gate"
+  rm -f "$pair_controller_deployment/$pair_control_file"
+  mv "$pair_control_backup" "$pair_controller_deployment/$pair_control_file"
+done
+
+pair_wrong_source="$tmp_dir/pair-wrong-source.sh"
+cp "$pair_controller_gate" "$pair_wrong_source"
+pair_expect_failure controller-bash-source run_pair_identity_fixture \
+  "$pair_controller_sha" "$pair_wrong_source"
+
+pair_artifact_manifest_backup="$tmp_dir/pair-artifact-release.json.backup"
+cp "$pair_artifact_release/release.json" "$pair_artifact_manifest_backup"
+jq '.runtime_contract_sha256 = ("9" * 64)' \
+  "$pair_artifact_release/release.json" \
+  >"$pair_artifact_release/release.json.tampered"
+mv "$pair_artifact_release/release.json.tampered" \
+  "$pair_artifact_release/release.json"
+pair_expect_failure candidate-runtime-mismatch run_pair_identity_fixture \
+  "$pair_controller_sha" "$pair_controller_gate"
+cp "$pair_artifact_manifest_backup" "$pair_artifact_release/release.json"
+
+pair_artifact_manifest_backup="$tmp_dir/pair-artifact-release-bundle.backup"
+cp "$pair_artifact_release/release.json" "$pair_artifact_manifest_backup"
+jq '.deployment_bundle_sha256 = "not-a-digest"' \
+  "$pair_artifact_release/release.json" \
+  >"$pair_artifact_release/release.json.tampered"
+mv "$pair_artifact_release/release.json.tampered" \
+  "$pair_artifact_release/release.json"
+pair_expect_failure candidate-bundle-format run_pair_identity_fixture \
+  "$pair_controller_sha" "$pair_controller_gate"
+cp "$pair_artifact_manifest_backup" "$pair_artifact_release/release.json"
+
+pair_binary_backup="$tmp_dir/pair-artifact.binary.backup"
+cp "$pair_artifact_release/binance-lob-archiver" "$pair_binary_backup"
+chmod u+w "$pair_artifact_release/binance-lob-archiver"
+printf 'drift\n' >>"$pair_artifact_release/binance-lob-archiver"
+chmod 0555 "$pair_artifact_release/binance-lob-archiver"
+pair_expect_failure candidate-binary-drift run_pair_identity_fixture \
+  "$pair_controller_sha" "$pair_controller_gate"
+chmod u+w "$pair_artifact_release/binance-lob-archiver"
+cp "$pair_binary_backup" "$pair_artifact_release/binance-lob-archiver"
+chmod 0555 "$pair_artifact_release/binance-lob-archiver"
+
+pair_asset_index=0
+for pair_asset in "${pair_runtime_assets[@]}"; do
+  pair_asset_backup="$tmp_dir/pair-artifact-asset-$pair_asset_index.backup"
+  cp "$pair_artifact_deployment/$pair_asset" "$pair_asset_backup"
+  chmod u+w "$pair_artifact_deployment/$pair_asset"
+  printf '\nPAIR_ASSET_DRIFT=%s\n' "$pair_asset_index" \
+    >>"$pair_artifact_deployment/$pair_asset"
+  chmod 0444 "$pair_artifact_deployment/$pair_asset"
+  pair_expect_failure "candidate-runtime-asset-drift-$pair_asset_index" \
+    run_pair_identity_fixture "$pair_controller_sha" "$pair_controller_gate"
+  chmod u+w "$pair_artifact_deployment/$pair_asset"
+  cp "$pair_asset_backup" "$pair_artifact_deployment/$pair_asset"
+  chmod 0444 "$pair_artifact_deployment/$pair_asset"
+
+  pair_asset_backup="$tmp_dir/pair-artifact-asset-symlink-$pair_asset_index.backup"
+  mv "$pair_artifact_deployment/$pair_asset" "$pair_asset_backup"
+  ln -s "$pair_artifact_deployment/binance-lob-archiver-rust-spot.env" \
+    "$pair_artifact_deployment/$pair_asset"
+  pair_expect_failure "candidate-runtime-asset-symlink-$pair_asset_index" \
+    run_pair_identity_fixture "$pair_controller_sha" "$pair_controller_gate"
+  rm -f "$pair_artifact_deployment/$pair_asset"
+  mv "$pair_asset_backup" "$pair_artifact_deployment/$pair_asset"
+  chmod 0444 "$pair_artifact_deployment/$pair_asset"
+  pair_asset_index=$((pair_asset_index + 1))
+done
+
+pair_helper_backup="$tmp_dir/pair-controller-helper.backup"
+cp "$pair_controller_deployment/rust-lob-control-plane-lib.sh" "$pair_helper_backup"
+chmod u+w "$pair_controller_deployment/rust-lob-control-plane-lib.sh"
+printf '\nmonday_rust_lob_runtime_contract_sha256() { printf "%%s\\n" "wrong"; }\n' \
+  >>"$pair_controller_deployment/rust-lob-control-plane-lib.sh"
+chmod 0444 "$pair_controller_deployment/rust-lob-control-plane-lib.sh"
+(
+  cd "$pair_controller_release"
+  for pair_asset in deployment/*; do sha256sum "$pair_asset"; done \
+    | sort -k2 >deployment.sha256
+)
+pair_expect_failure controller-helper-lies run_pair_identity_fixture \
+  "$pair_controller_sha" "$pair_controller_gate"
+chmod u+w "$pair_controller_deployment/rust-lob-control-plane-lib.sh"
+cp "$pair_helper_backup" "$pair_controller_deployment/rust-lob-control-plane-lib.sh"
+chmod 0444 "$pair_controller_deployment/rust-lob-control-plane-lib.sh"
+(
+  cd "$pair_controller_release"
+  for pair_asset in deployment/*; do sha256sum "$pair_asset"; done \
+    | sort -k2 >deployment.sha256
+)
 
 runtime_contract_dir="$tmp_dir/runtime-contract"
 mkdir -p "$runtime_contract_dir"
@@ -1461,6 +1946,47 @@ jq -e \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/gate.json" >/dev/null
+
+controller_release=$(printf '1%.0s' {1..64})
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  --arg controller_release_sha256 "$controller_release" \
+  -f "$POLICY" "$tmp_dir/gate.json" >/dev/null; then
+  printf 'gate policy accepted legacy v4 evidence with a named controller\n' >&2
+  exit 1
+fi
+jq --arg controller_release "$controller_release" \
+  --arg bundle "$bundle" --arg source "$source_revision" \
+  '.schema = "monday.rust_lob_shadow_gate.v5"
+   | .controller_release_sha256 = $controller_release
+   | .controller_deployment_bundle_sha256 = $bundle
+   | .controller_deployment_source_revision = $source' \
+  "$tmp_dir/gate.json" >"$tmp_dir/pair-gate.json"
+jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg runtime_contract_sha256 "$runtime_contract" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  --arg controller_release_sha256 "$controller_release" \
+  -f "$POLICY" "$tmp_dir/pair-gate.json" >/dev/null
+for pair_field in controller_release_sha256 controller_deployment_bundle_sha256 \
+  controller_deployment_source_revision; do
+  jq --arg field "$pair_field" '.[$field] = "9" * (if $field == "controller_deployment_source_revision" then 40 else 64 end)' \
+    "$tmp_dir/pair-gate.json" >"$tmp_dir/pair-tampered-$pair_field.json"
+  if jq -e \
+    --arg candidate_sha256 "$artifact" \
+    --arg runtime_contract_sha256 "$runtime_contract" \
+    --arg deployment_bundle_sha256 "$bundle" \
+    --arg deployment_source_revision "$source_revision" \
+    --arg controller_release_sha256 "$controller_release" \
+    -f "$POLICY" "$tmp_dir/pair-tampered-$pair_field.json" >/dev/null; then
+    printf 'gate policy accepted tampered pair field: %s\n' "$pair_field" >&2
+    exit 1
+  fi
+done
 
 jq 'del(.io_full_psi_windows)' "$tmp_dir/gate.json" \
   >"$tmp_dir/missing-psi.json"
@@ -4019,6 +4545,40 @@ base64 --decode <"$mock_state/last-command-content" >"$tmp_dir/gate-preflight-co
 grep -Fq -- '--resource-preflight' "$tmp_dir/gate-preflight-command.sh"
 grep -Fq 'gate-preflight completed successfully: mock-invoke' \
   "$tmp_dir/gate-preflight.err"
+
+pair_controller_release=$(printf 'e%.0s' {1..64})
+pair_preflight_payload=$(jq \
+  --arg controller "$pair_controller_release" \
+  --arg bundle "$preflight_bundle" \
+  --arg source "$preflight_source" \
+  '.schema = "monday.rust_lob_gate_resource_preflight.v2"
+   | .controller_release_sha256 = $controller
+   | .controller_deployment_bundle_sha256 = $bundle
+   | .controller_deployment_source_revision = $source' \
+  <<<"$preflight_payload")
+pair_preflight_output_b64=$(printf '%s\n' "$pair_preflight_payload" | base64 | tr -d '\n')
+env "${common_env[@]}" \
+  ACTION=gate-preflight \
+  CONTROLLER_RELEASE_SHA256="$pair_controller_release" \
+  MOCK_STATUS=Success \
+  MOCK_EXIT_CODE=0 \
+  MOCK_OUTPUT_B64="$pair_preflight_output_b64" \
+  "$INVOKE" >"$tmp_dir/pair-gate-preflight.json" 2>"$tmp_dir/pair-gate-preflight.err"
+jq -e \
+  --arg controller "$pair_controller_release" \
+  '.schema == "monday.rust_lob_gate_resource_preflight.v2"
+   and .controller_release_sha256 == $controller' \
+  "$tmp_dir/pair-gate-preflight.json" >/dev/null
+base64 --decode <"$mock_state/last-command-content" >"$tmp_dir/pair-gate-preflight-command.sh"
+grep -Fq -- \
+  "/opt/monday/releases/binance-lob-controller/$pair_controller_release/deployment/host-rust-lob-shadow-gate.sh" \
+  "$tmp_dir/pair-gate-preflight-command.sh"
+grep -Fq -- "--controller-release-sha256 $pair_controller_release --resource-preflight $artifact" \
+  "$tmp_dir/pair-gate-preflight-command.sh"
+if grep -Fq 'deprecated artifact-routed Gate fallback' "$tmp_dir/pair-gate-preflight.err"; then
+  printf 'pair-bound Gate preflight emitted the artifact fallback deprecation\n' >&2
+  exit 1
+fi
 tampered_preflight_payload=$(jq '
   .io_full_psi_windows[0] += {current_total_us:150000,delta_us:150000,
     ratio:0.01,hit:true,consecutive_hits:0}

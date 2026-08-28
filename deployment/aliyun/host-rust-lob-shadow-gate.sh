@@ -22,6 +22,7 @@ readonly ACTIVE_PROCESS_TERM_GRACE_SECONDS=5
 readonly ACTIVE_PROCESS_KILL_GRACE_SECONDS=5
 readonly SHADOW_BINARY=/opt/monday/bin/binance-lob-archiver-shadow
 readonly RELEASE_ROOT=/opt/monday/releases/binance-lob-archiver
+readonly CONTROLLER_RELEASE_ROOT=/opt/monday/releases/binance-lob-controller
 readonly EVIDENCE_ROOT=/data/monday/evidence/shadow-gates
 readonly RUN_SPOOL_ROOT=/data/monday/spool/binance-lob-rust-shadow/runs
 readonly OVERRIDE_ROOT=/run/monday
@@ -29,6 +30,16 @@ readonly LOCK_FILE=/run/lock/monday-rust-lob-release.lock
 readonly SERVICE_USER=hftcollector
 readonly SERVICE_HOME=/var/lib/hft-collector
 readonly SAFE_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+readonly -a RUNTIME_CONTRACT_ASSETS=(
+  binance-lob-archiver-production@.service
+  binance-lob-archiver-rust@.service
+  binance-lob-archiver-upload@.service
+  binance-lob-archiver-rust-upload@.service
+  binance-lob-archiver-production-spot.env
+  binance-lob-archiver-production-usdm.env
+  binance-lob-archiver-rust-spot.env
+  binance-lob-archiver-rust-usdm.env
+)
 
 die() {
   printf 'shadow gate failed: %s\n' "$*" >&2
@@ -37,7 +48,7 @@ die() {
 
 usage() {
   printf '%s\n' \
-    'Usage: host-rust-lob-shadow-gate.sh [--resource-preflight] <candidate-sha256>' \
+    'Usage: host-rust-lob-shadow-gate.sh [--controller-release-sha256 <controller-sha256>] [--resource-preflight] <candidate-sha256>' \
     '' \
     'Production gates wait up to 240 seconds for health, then observe at least 240 seconds.' \
     'Tests may set MONDAY_GATE_TEST_SECONDS only with' \
@@ -73,20 +84,27 @@ resolve_health_settle_seconds() {
 
 [[ ${EUID} -eq 0 ]] || die 'must run as root'
 resource_preflight_only=false
+controller_release_arg=
 case $# in
   1) candidate_arg=$1 ;;
   2)
-    [[ $1 == --resource-preflight ]] || {
-      usage >&2
-      exit 2
-    }
+    [[ $1 == --resource-preflight ]] || { usage >&2; exit 2; }
     resource_preflight_only=true
     candidate_arg=$2
     ;;
-  *)
-    usage >&2
-    exit 2
+  3)
+    [[ $1 == --controller-release-sha256 ]] || { usage >&2; exit 2; }
+    controller_release_arg=$2
+    candidate_arg=$3
     ;;
+  4)
+    [[ $1 == --controller-release-sha256 && $3 == --resource-preflight ]] \
+      || { usage >&2; exit 2; }
+    controller_release_arg=$2
+    resource_preflight_only=true
+    candidate_arg=$4
+    ;;
+  *) usage >&2; exit 2 ;;
 esac
 
 for command in aliyun awk bash chmod chown cmp date dirname find flock grep id install jq mkdir mktemp \
@@ -98,19 +116,42 @@ mountpoint -q /data || die '/data must be a mount point'
 [[ -r /proc/uptime ]] || die '/proc/uptime is required for monotonic timing'
 [[ -r $IO_PSI_SOURCE ]] || die 'I/O PSI is unavailable'
 id "$SERVICE_USER" >/dev/null 2>&1 || die "missing service user: $SERVICE_USER"
-if [[ $resource_preflight_only != true ]]; then
+controller_release_sha256=
+if [[ -n $controller_release_arg ]]; then
+  controller_release_sha256=$(printf '%s' "$controller_release_arg" | tr '[:upper:]' '[:lower:]')
+  [[ $controller_release_sha256 =~ ^[a-f0-9]{64}$ ]] \
+    || die 'controller release SHA-256 must be 64 hexadecimal characters'
+fi
+pair_mode=false
+[[ -n $controller_release_sha256 ]] && pair_mode=true
+if [[ $resource_preflight_only != true || $pair_mode == true ]]; then
   install -d -m 0755 "$(dirname "$LOCK_FILE")"
   exec 9>"$LOCK_FILE"
-  flock -n 9 || die 'another Rust collector release operation is running'
+  if [[ $resource_preflight_only == true ]]; then
+    flock -s -n 9 || die 'another Rust collector release operation is running'
+  else
+    flock -n 9 || die 'another Rust collector release operation is running'
+  fi
 fi
 
 candidate_sha=$(printf '%s' "$candidate_arg" | tr '[:upper:]' '[:lower:]')
 [[ $candidate_sha =~ ^[a-f0-9]{64}$ ]] || die 'candidate SHA-256 must be 64 hexadecimal characters'
+
+controller_release=
+controller_deployment=
+controller_manifest=
+controller_gate_script=
+controller_lib=
+controller_policy=
+controller_deployment_bundle_sha256=
+controller_deployment_source_revision=
+controller_artifact_sha256=
+controller_runtime_contract_sha256=
+
 candidate_release="$RELEASE_ROOT/$candidate_sha"
 candidate_binary="$candidate_release/binance-lob-archiver"
 candidate_deployment="$candidate_release/deployment"
 release_json="$candidate_release/release.json"
-control_plane_lib="$candidate_deployment/rust-lob-control-plane-lib.sh"
 
 direct_directory() {
   local path=$1
@@ -132,39 +173,175 @@ secure_regular_file() {
   (( (8#$mode & 022) == 0 )) || die "required file is group/world writable: $path"
 }
 
+runtime_contract_sha256_independent() {
+  local directory=$1 asset digest
+  for asset in "${RUNTIME_CONTRACT_ASSETS[@]}"; do
+    [[ -f $directory/$asset && ! -L $directory/$asset ]] || return 1
+  done
+  {
+    for asset in "${RUNTIME_CONTRACT_ASSETS[@]}"; do
+      digest=$(command sha256sum "$directory/$asset" | command awk '{print $1}') \
+        || return 1
+      printf '%s  %s\n' "$digest" "$asset"
+    done
+  } | command sha256sum | command awk '{print $1}'
+}
+readonly -f runtime_contract_sha256_independent
+
+validate_controller_manifest() {
+  local manifest=$1
+  jq -e '
+    type == "object"
+    and keys == [
+      "artifact_sha256",
+      "artifact_uri",
+      "deployment_bundle_sha256",
+      "deployment_bundle_uri",
+      "deployment_source_revision",
+      "runtime_contract_sha256",
+      "schema"
+    ]
+    and .schema == "monday.rust_lob_controller_release.v1"
+    and (.artifact_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+    and (.artifact_uri | type == "string" and test("^oss://[A-Za-z0-9][A-Za-z0-9.-]*/[A-Za-z0-9._/@+=:-]+$"))
+    and (.deployment_bundle_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+    and (.deployment_bundle_uri | type == "string" and test("^oss://[A-Za-z0-9][A-Za-z0-9.-]*/[A-Za-z0-9._/@+=:-]+$"))
+    and (.deployment_source_revision | type == "string" and test("^[a-f0-9]{40,64}$"))
+    and (.runtime_contract_sha256 | type == "string" and test("^[a-f0-9]{64}$"))' \
+    "$manifest" >/dev/null || die 'controller release manifest is invalid'
+}
+
+verify_controller_release() {
+  local expected_manifest_sha=$1
+  local actual_manifest_sha expected_manifest_checksum expected_deployment_checksum asset
+  for path in /opt/monday /opt/monday/releases "$CONTROLLER_RELEASE_ROOT" \
+    "$controller_release" "$controller_deployment"; do
+    direct_directory "$path" || die "controller release path is missing, indirect, or a symlink: $path"
+  done
+  for path in "$controller_manifest" "$controller_release/release.json.sha256" \
+    "$controller_release/deployment.sha256" "$controller_gate_script" \
+    "$controller_lib" "$controller_policy"; do
+    secure_regular_file "$path"
+  done
+  [[ -x $controller_gate_script ]] \
+    || die 'controller Gate script is not executable'
+  actual_manifest_sha=$(sha256sum "$controller_manifest" | awk '{print $1}')
+  [[ $actual_manifest_sha == "$expected_manifest_sha" ]] \
+    || die 'controller release manifest SHA-256 does not match its digest path'
+  expected_manifest_checksum=$(printf '%s  release.json\n' "$actual_manifest_sha")
+  printf '%s\n' "$expected_manifest_checksum" \
+    | cmp -s - "$controller_release/release.json.sha256" \
+    || die 'controller release manifest checksum does not match its digest path'
+  validate_controller_manifest "$controller_manifest"
+  for asset in "$controller_deployment"/*; do
+    secure_regular_file "$asset"
+  done
+  (cd "$controller_release" && sha256sum --check --strict deployment.sha256 >/dev/null) \
+    || die 'controller deployment checksum verification failed'
+  expected_deployment_checksum=$(cd "$controller_release" \
+    && for asset in deployment/*; do sha256sum "$asset"; done | sort -k2)
+  printf '%s\n' "$expected_deployment_checksum" \
+    | cmp -s - "$controller_release/deployment.sha256" \
+    || die 'controller deployment checksum contents drifted'
+  [[ $(readlink -f -- "${BASH_SOURCE[0]}") == "$controller_gate_script" ]] \
+    || die 'Gate script was not executed from the controller release digest path'
+  controller_artifact_sha256=$(jq -er '.artifact_sha256' "$controller_manifest")
+  controller_deployment_bundle_sha256=$(jq -er '.deployment_bundle_sha256' "$controller_manifest")
+  controller_deployment_source_revision=$(jq -er '.deployment_source_revision' "$controller_manifest")
+  controller_runtime_contract_sha256=$(jq -er '.runtime_contract_sha256' "$controller_manifest")
+  [[ $(runtime_contract_sha256_independent "$controller_deployment") \
+    == "$controller_runtime_contract_sha256" ]] \
+    || die 'controller deployment runtime contract checksum drifted'
+}
+
+if [[ $pair_mode == true ]]; then
+  controller_release="$CONTROLLER_RELEASE_ROOT/$controller_release_sha256"
+  controller_deployment="$controller_release/deployment"
+  controller_manifest="$controller_release/release.json"
+  controller_gate_script="$controller_deployment/host-rust-lob-shadow-gate.sh"
+  controller_lib="$controller_deployment/rust-lob-control-plane-lib.sh"
+  controller_policy="$controller_deployment/rust-lob-shadow-gate-policy.jq"
+  verify_controller_release "$controller_release_sha256"
+else
+  printf 'deprecated artifact-routed Gate fallback: pass --controller-release-sha256 for a pair-bound operation\n' >&2
+  controller_gate_script="$candidate_deployment/host-rust-lob-shadow-gate.sh"
+  controller_lib="$candidate_deployment/rust-lob-control-plane-lib.sh"
+  controller_policy="$candidate_deployment/rust-lob-shadow-gate-policy.jq"
+fi
+
 for path in /opt/monday /opt/monday/releases "$RELEASE_ROOT" "$candidate_release" \
   "$candidate_deployment"; do
   direct_directory "$path" || die "release path is missing, indirect, or a symlink: $path"
 done
 secure_regular_file "$release_json"
-secure_regular_file "$control_plane_lib"
-# shellcheck disable=SC1090,SC1091
-. "$control_plane_lib"
-deployment_bundle_sha256=$(jq -er '.deployment_bundle_sha256' "$release_json")
-deployment_source_revision=$(jq -er '.deployment_source_revision' "$release_json")
 runtime_contract_sha256=$(jq -er '.runtime_contract_sha256' "$release_json")
-[[ $deployment_bundle_sha256 =~ ^[a-f0-9]{64}$ ]] \
-  || die 'release metadata has an invalid deployment bundle SHA-256'
-[[ $deployment_source_revision =~ ^[a-f0-9]{40,64}$ ]] \
-  || die 'release metadata has an invalid deployment source revision'
 [[ $runtime_contract_sha256 =~ ^[a-f0-9]{64}$ ]] \
   || die 'release metadata has an invalid runtime contract SHA-256'
-jq -e --arg artifact "$candidate_sha" --arg bundle "$deployment_bundle_sha256" \
-  --arg runtime_contract "$runtime_contract_sha256" \
-  '.artifact_sha256 == $artifact and .deployment_bundle_sha256 == $bundle
-    and .runtime_contract_sha256 == $runtime_contract' \
-  "$release_json" >/dev/null || die 'release metadata does not match the candidate identity'
-[[ $(monday_rust_lob_runtime_contract_sha256 "$candidate_deployment") \
-  == "$runtime_contract_sha256" ]] \
-  || die 'installed runtime contract does not match release metadata'
+if [[ $pair_mode == true ]]; then
+  candidate_manifest_bundle_sha256=$(jq -r '.deployment_bundle_sha256 // empty' \
+    "$release_json")
+  candidate_manifest_source_revision=$(jq -r '.deployment_source_revision // empty' \
+    "$release_json")
+  [[ -z $candidate_manifest_bundle_sha256 \
+    || $candidate_manifest_bundle_sha256 =~ ^[a-f0-9]{64}$ ]] \
+    || die 'candidate metadata has an invalid deployment bundle SHA-256'
+  [[ -z $candidate_manifest_source_revision \
+    || $candidate_manifest_source_revision =~ ^[a-f0-9]{40,64}$ ]] \
+    || die 'candidate metadata has an invalid deployment source revision'
+  deployment_bundle_sha256=$controller_deployment_bundle_sha256
+  deployment_source_revision=$controller_deployment_source_revision
+  jq -e --arg artifact "$candidate_sha" \
+    --arg runtime_contract "$runtime_contract_sha256" \
+    '.artifact_sha256 == $artifact
+      and .runtime_contract_sha256 == $runtime_contract' \
+    "$release_json" >/dev/null || die 'release metadata does not match the candidate identity'
+else
+  deployment_bundle_sha256=$(jq -er '.deployment_bundle_sha256' "$release_json")
+  deployment_source_revision=$(jq -er '.deployment_source_revision' "$release_json")
+  [[ $deployment_bundle_sha256 =~ ^[a-f0-9]{64}$ ]] \
+    || die 'release metadata has an invalid deployment bundle SHA-256'
+  [[ $deployment_source_revision =~ ^[a-f0-9]{40,64}$ ]] \
+    || die 'release metadata has an invalid deployment source revision'
+  jq -e --arg artifact "$candidate_sha" --arg bundle "$deployment_bundle_sha256" \
+    --arg runtime_contract "$runtime_contract_sha256" \
+    '.artifact_sha256 == $artifact and .deployment_bundle_sha256 == $bundle
+      and .runtime_contract_sha256 == $runtime_contract' \
+    "$release_json" >/dev/null || die 'release metadata does not match the candidate identity'
+fi
+if [[ $pair_mode == true ]]; then
+  [[ $controller_artifact_sha256 == "$candidate_sha" ]] \
+    || die 'controller release does not bind the requested candidate artifact'
+  [[ $controller_deployment_bundle_sha256 == "$deployment_bundle_sha256" ]] \
+    || die 'controller and candidate deployment bundle digests differ'
+  [[ $controller_deployment_source_revision == "$deployment_source_revision" ]] \
+    || die 'controller and candidate deployment source revisions differ'
+  [[ $controller_runtime_contract_sha256 == "$runtime_contract_sha256" ]] \
+    || die 'controller and candidate runtime contracts differ'
+fi
 
 [[ -f $candidate_binary && -x $candidate_binary ]] || die "candidate is not executable: $candidate_binary"
 secure_regular_file "$candidate_binary"
-printf '%s  %s\n' "$candidate_sha" "$candidate_binary" | sha256sum --check --strict >/dev/null
+printf '%s  %s\n' "$candidate_sha" "$candidate_binary" \
+  | sha256sum --check --strict >/dev/null \
+  || die 'candidate binary checksum does not match the requested artifact'
 [[ -L $SHADOW_BINARY ]] || die "$SHADOW_BINARY must be a symlink"
 [[ $(readlink -f "$SHADOW_BINARY") == "$candidate_binary" ]] \
   || die 'shadow symlink does not point to the requested candidate'
-printf '%s  %s\n' "$candidate_sha" "$SHADOW_BINARY" | sha256sum --check --strict >/dev/null
+printf '%s  %s\n' "$candidate_sha" "$SHADOW_BINARY" | sha256sum --check --strict >/dev/null \
+  || die 'shadow binary checksum does not match the requested artifact'
+
+# shellcheck disable=SC1090,SC1091
+. "$controller_lib" >/dev/null
+candidate_runtime_contract_from_helper=$(monday_rust_lob_runtime_contract_sha256 \
+  "$candidate_deployment") \
+  || die 'installed runtime contract helper failed'
+candidate_runtime_contract_independent=$(runtime_contract_sha256_independent \
+  "$candidate_deployment") \
+  || die 'installed runtime contract assets are invalid'
+[[ $candidate_runtime_contract_from_helper == "$candidate_runtime_contract_independent" ]] \
+  || die 'controller runtime contract helper returned an inconsistent digest'
+[[ $candidate_runtime_contract_independent == "$runtime_contract_sha256" ]] \
+  || die 'installed runtime contract does not match release metadata'
 
 gate_seconds=${MONDAY_GATE_TEST_SECONDS:-$REQUIRED_DURATION_SECONDS}
 [[ $gate_seconds =~ ^[1-9][0-9]*$ ]] || die 'gate duration must be a positive integer'
@@ -233,19 +410,24 @@ done
 is_usdm_top100 "${configured_symbols[usdm]}" \
   || die "${env_file[usdm]} must set 100 unique explicit symbols"
 
-for asset in \
-  binance-lob-archiver-rust@.service \
-  binance-lob-archiver-rust-upload@.service \
-  binance-lob-archiver-rust-spot.env \
-  binance-lob-archiver-rust-usdm.env; do
+runtime_assets=("${RUNTIME_CONTRACT_ASSETS[@]}")
+for asset in "${runtime_assets[@]}"; do
   secure_regular_file "$candidate_deployment/$asset"
+done
+shadow_assets=(
+  binance-lob-archiver-rust@.service
+  binance-lob-archiver-rust-upload@.service
+  binance-lob-archiver-rust-spot.env
+  binance-lob-archiver-rust-usdm.env
+)
+for asset in "${shadow_assets[@]}"; do
   case "$asset" in
     *.service) installed_asset="/etc/systemd/system/$asset" ;;
     *.env) installed_asset="/etc/monday/$asset" ;;
   esac
   secure_regular_file "$installed_asset"
   cmp -s "$candidate_deployment/$asset" "$installed_asset" \
-    || die "installed shadow asset differs from the gated deployment bundle: $asset"
+    || die "installed runtime asset differs from the gated deployment bundle: $asset"
 done
 grep -Fxq 'MemoryHigh=384M' \
   "$candidate_deployment/binance-lob-archiver-rust-upload@.service" \
@@ -255,8 +437,6 @@ grep -Fxq 'MemoryMax=512M' \
   || die 'shadow upload service MemoryMax differs from the gated template'
 candidate_production_spot_env="$candidate_deployment/binance-lob-archiver-production-spot.env"
 candidate_production_usdm_env="$candidate_deployment/binance-lob-archiver-production-usdm.env"
-secure_regular_file "$candidate_production_spot_env"
-secure_regular_file "$candidate_production_usdm_env"
 configured_spot_snapshot_producers=$(env_value "${env_file[spot]}" SNAPSHOT_PRODUCERS)
 [[ $configured_spot_snapshot_producers == 16 ]] \
   || die 'Spot shadow SNAPSHOT_PRODUCERS must be 16'
@@ -548,12 +728,17 @@ expected_stream_types[spot]='["aggTrade","bookTicker","depth@100ms","trade"]'
 expected_stream_types[usdm]='["depth@100ms"]'
 
 if [[ $resource_preflight_only == true ]]; then
+  preflight_schema=monday.rust_lob_gate_resource_preflight.v1
+  [[ $pair_mode == true ]] && preflight_schema=monday.rust_lob_gate_resource_preflight.v2
   jq -cn \
-    --arg schema monday.rust_lob_gate_resource_preflight.v1 \
+    --arg schema "$preflight_schema" \
     --arg candidate_sha256 "$candidate_sha" \
     --arg runtime_contract_sha256 "$runtime_contract_sha256" \
     --arg deployment_bundle_sha256 "$deployment_bundle_sha256" \
     --arg deployment_source_revision "$deployment_source_revision" \
+    --arg controller_release_sha256 "$controller_release_sha256" \
+    --arg controller_deployment_bundle_sha256 "$controller_deployment_bundle_sha256" \
+    --arg controller_deployment_source_revision "$controller_deployment_source_revision" \
     --argjson host_memory_total_bytes "$host_memory_total_bytes" \
     --argjson host_swap_total_bytes "$host_swap_total_bytes" \
     --argjson production_memory_current_bytes "$production_memory_current_json" \
@@ -570,12 +755,20 @@ if [[ $resource_preflight_only == true ]]; then
       production_memory_current_bytes:$production_memory_current_bytes,
       maximum_sequential_phase_memory_bytes:$maximum_sequential_phase_memory_bytes,
       resource_preflight:$resource_preflight,
-      io_full_psi_windows:$io_full_psi_windows,passed:true}'
+      io_full_psi_windows:$io_full_psi_windows,passed:true}
+      + (if $controller_release_sha256 == "" then {} else {
+        controller_release_sha256:$controller_release_sha256,
+        controller_deployment_bundle_sha256:$controller_deployment_bundle_sha256,
+        controller_deployment_source_revision:$controller_deployment_source_revision
+      } end)'
   exit 0
 fi
 
 binary_evidence_dir="$EVIDENCE_ROOT/$candidate_sha"
 runtime_evidence_dir="$binary_evidence_dir/$runtime_contract_sha256"
+if [[ $pair_mode == true ]]; then
+  runtime_evidence_dir="$binary_evidence_dir/$runtime_contract_sha256/$controller_release_sha256"
+fi
 runs_dir="$runtime_evidence_dir/runs"
 gate_run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 run_spool_path="$RUN_SPOOL_ROOT/$candidate_sha/$gate_run_id"
@@ -632,15 +825,20 @@ done
 run_created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 run_json="$evidence_dir/run.json"
 run_json_tmp="$evidence_dir/.run.json.tmp"
+run_schema=monday.rust_lob_shadow_gate_run.v1
+[[ $pair_mode == true ]] && run_schema=monday.rust_lob_shadow_gate_run.v2
 write_run_json() {
   jq -n \
-    --arg schema monday.rust_lob_shadow_gate_run.v1 \
+    --arg schema "$run_schema" \
     --arg run_id "$gate_run_id" \
     --arg created_at "$run_created_at" \
     --arg candidate_sha256 "$candidate_sha" \
     --arg runtime_contract_sha256 "$runtime_contract_sha256" \
     --arg deployment_bundle_sha256 "$deployment_bundle_sha256" \
     --arg deployment_source_revision "$deployment_source_revision" \
+    --arg controller_release_sha256 "$controller_release_sha256" \
+    --arg controller_deployment_bundle_sha256 "$controller_deployment_bundle_sha256" \
+    --arg controller_deployment_source_revision "$controller_deployment_source_revision" \
     --arg run_spool "$run_spool_path" \
     --argjson segment_seconds "$GATE_SEGMENT_SECONDS" \
     --argjson requested_duration_seconds "$gate_seconds" \
@@ -669,7 +867,12 @@ write_run_json() {
       resource_preflight:$resource_preflight,
       resource_admission_samples:$resource_admission_samples,
       io_full_psi_windows:$io_full_psi_windows,
-      test_only:$test_only}' >"$run_json_tmp"
+      test_only:$test_only}
+      + (if $controller_release_sha256 == "" then {} else {
+        controller_release_sha256:$controller_release_sha256,
+        controller_deployment_bundle_sha256:$controller_deployment_bundle_sha256,
+        controller_deployment_source_revision:$controller_deployment_source_revision
+      } end)' >"$run_json_tmp"
   chmod 0640 "$run_json_tmp"
   mv -Tf "$run_json_tmp" "$run_json"
 }
@@ -990,6 +1193,29 @@ assert_candidate() {
     || die 'shadow candidate symlink changed during the gate'
   printf '%s  %s\n' "$candidate_sha" "$SHADOW_BINARY" \
     | sha256sum --check --strict >/dev/null
+}
+
+assert_pair_identity() {
+  [[ $pair_mode == true ]] || return 0
+  verify_controller_release "$controller_release_sha256"
+  printf '%s  %s\n' "$candidate_sha" "$candidate_binary" \
+    | sha256sum --check --strict >/dev/null \
+    || die 'candidate binary changed before Gate finalization'
+  # Re-source only the already verified controller helper so the final
+  # assertion binds the candidate's eight runtime assets to its release R.
+  # shellcheck disable=SC1090,SC1091
+  . "$controller_lib" >/dev/null
+  candidate_runtime_contract_from_helper=$(monday_rust_lob_runtime_contract_sha256 \
+    "$candidate_deployment") \
+    || die 'candidate runtime contract helper failed before Gate finalization'
+  candidate_runtime_contract_independent=$(runtime_contract_sha256_independent \
+    "$candidate_deployment") \
+    || die 'candidate runtime assets failed before Gate finalization'
+  [[ $candidate_runtime_contract_from_helper == \
+    "$candidate_runtime_contract_independent" ]] \
+    || die 'controller helper returned an inconsistent final runtime contract'
+  [[ $candidate_runtime_contract_independent == "$runtime_contract_sha256" ]] \
+    || die 'candidate runtime contract changed before Gate finalization'
 }
 
 assert_spool_drained() {
@@ -2065,13 +2291,19 @@ if [[ $test_only == true ]] || ((duration_seconds < REQUIRED_DURATION_SECONDS));
 fi
 write_run_json
 
+assert_pair_identity
+gate_schema=monday.rust_lob_shadow_gate.v4
+[[ $pair_mode == true ]] && gate_schema=monday.rust_lob_shadow_gate.v5
 jq -n \
-  --arg schema monday.rust_lob_shadow_gate.v4 \
+  --arg schema "$gate_schema" \
   --arg candidate_sha256 "$candidate_sha" \
   --arg candidate_binary "$candidate_binary" \
   --arg runtime_contract_sha256 "$runtime_contract_sha256" \
   --arg deployment_bundle_sha256 "$deployment_bundle_sha256" \
   --arg deployment_source_revision "$deployment_source_revision" \
+  --arg controller_release_sha256 "$controller_release_sha256" \
+  --arg controller_deployment_bundle_sha256 "$controller_deployment_bundle_sha256" \
+  --arg controller_deployment_source_revision "$controller_deployment_source_revision" \
   --arg run_id "$gate_run_id" \
   --arg run_spool "$run_spool_path" \
   --arg started_at "$gate_started_at" \
@@ -2115,13 +2347,27 @@ jq -n \
     segment_seconds:$segment_seconds,
     duration_seconds:$duration_seconds,
     test_only:$test_only,checks_passed:$checks_passed,
-    production_eligible:$production_eligible,passed:$passed,markets:$markets}' \
+    production_eligible:$production_eligible,passed:$passed,markets:$markets}
+    + (if $controller_release_sha256 == "" then {} else {
+      controller_release_sha256:$controller_release_sha256,
+      controller_deployment_bundle_sha256:$controller_deployment_bundle_sha256,
+      controller_deployment_source_revision:$controller_deployment_source_revision
+    } end)' \
   >"$gate_tmp"
 [[ ! -e $gate_json && ! -L $gate_json ]] || die 'gate evidence path already exists'
 install -m 0640 "$gate_tmp" "$gate_json"
 rm -f "$gate_tmp"
 
 if [[ $production_eligible == true ]]; then
+  jq -e \
+    --arg candidate_sha256 "$candidate_sha" \
+    --arg runtime_contract_sha256 "$runtime_contract_sha256" \
+    --arg deployment_bundle_sha256 "$deployment_bundle_sha256" \
+    --arg deployment_source_revision "$deployment_source_revision" \
+    --arg controller_release_sha256 "$controller_release_sha256" \
+    -f "$controller_policy" "$gate_json" >/dev/null \
+    || die 'Gate evidence failed the controller-bound policy'
+  assert_pair_identity
   gate_sha=$(sha256sum "$gate_json" | awk '{print $1}')
   printf '%s  gate.json\n' "$gate_sha" >"$marker_tmp"
   chmod 0640 "$marker_tmp"

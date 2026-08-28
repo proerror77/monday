@@ -42,8 +42,10 @@ def valid_io_full_psi_windows:
       | .current = $window.current_total_us)
     | .valid);
 
-. as $gate
-| .schema == "monday.rust_lob_shadow_gate.v4"
+($ARGS.named.controller_release_sha256 // "") as $expected_controller_release_sha256
+| . as $gate
+| (.schema == "monday.rust_lob_shadow_gate.v4"
+  or .schema == "monday.rust_lob_shadow_gate.v5")
 and .candidate_sha256 == $candidate_sha256
 and .runtime_contract_sha256 == $runtime_contract_sha256
 and (.deployment_bundle_sha256 | type) == "string"
@@ -73,6 +75,20 @@ and .test_only == false
 and .passed == true
 and .production_eligible == true
 and .checks_passed == true
+and (if $expected_controller_release_sha256 != "" then
+  .schema == "monday.rust_lob_shadow_gate.v5"
+  and (.controller_release_sha256 | type) == "string"
+  and (.controller_release_sha256 | test("^[a-f0-9]{64}$"))
+  and .controller_release_sha256 == $expected_controller_release_sha256
+  and (.controller_deployment_bundle_sha256 | type) == "string"
+  and (.controller_deployment_bundle_sha256 | test("^[a-f0-9]{64}$"))
+  and .controller_deployment_bundle_sha256 == .deployment_bundle_sha256
+  and (.controller_deployment_source_revision | type) == "string"
+  and (.controller_deployment_source_revision | test("^[a-f0-9]{40,64}$"))
+  and .controller_deployment_source_revision == .deployment_source_revision
+else
+  .schema == "monday.rust_lob_shadow_gate.v4"
+end)
 and (.io_full_psi_windows | valid_io_full_psi_windows)
 and (["resource-preflight","shadow-spot","upload-drain-spot","shadow-usdm",
     "upload-drain-usdm","oss-roundtrip-spot","oss-roundtrip-usdm"] as $required
