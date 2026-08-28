@@ -87,9 +87,11 @@ binary=$(monday_root_join "$ROOT" "opt/monday/releases/binance-lob-archiver/$pay
 
 mapfile -t PAIR_ASSETS < <(monday_runtime_assets)
 readonly PAIR_ASSETS
+mapfile -t CONTROLLER_PROJECTION_ASSETS < <(monday_controller_projection_assets)
+readonly CONTROLLER_PROJECTION_ASSETS
 projection="$controller_root/active"
 stable_binary="$projection/binance-lob-archiver"
-declare -A installed_projections installed_sha
+declare -A installed_projections installed_sha installed_controller_projections installed_controller_sha
 success=false
 contain() {
   [[ $TEST_ONLY == true && $FIXTURE_SYSTEMD == false ]] && return 0
@@ -134,6 +136,22 @@ for asset in "${PAIR_ASSETS[@]}"; do
   [[ $(monday_sha256_file "$resolved") == "$(monday_sha256_file "$release/deployment/$asset")" ]] \
     || die "stable pair projection differs from active controller: $asset"
   installed_projections[$asset]=$expected; installed_sha[$asset]=$(monday_sha256_file "$resolved")
+done
+for asset in "${CONTROLLER_PROJECTION_ASSETS[@]}"; do
+  target=$(monday_controller_projection_target "$ROOT" "$asset") \
+    || die "unknown controller projection: $asset"
+  expected="$projection/deployment/$asset"
+  ensure_projection "$target" "$expected" \
+    || die "could not converge controller projection: $asset"
+  resolved=$(readlink -f -- "$target") \
+    || die "controller projection is dangling: $asset"
+  monday_file_direct "$resolved" \
+    || die "controller projection is not a file: $asset"
+  [[ $(monday_sha256_file "$resolved") == \
+    "$(monday_sha256_file "$release/deployment/$asset")" ]] \
+    || die "controller projection differs from active controller: $asset"
+  installed_controller_projections[$asset]=$expected
+  installed_controller_sha[$asset]=$(monday_sha256_file "$resolved")
 done
 
 restore_started_ns=0
@@ -199,14 +217,23 @@ mkdir -p "$receipt_root/$CONTROLLER"; receipt="$receipt_root/$CONTROLLER/restore
 [[ ! -e $receipt && ! -L $receipt ]] || die 'restore receipt already exists for this controller'
 projections='{}'
 for asset in "${PAIR_ASSETS[@]}"; do projections=$(jq -cn --argjson values "$projections" --arg asset "$asset" --arg target "${installed_projections[$asset]}" --arg sha "${installed_sha[$asset]}" '$values + {($asset):{target:$target,sha256:$sha}}'); done
+controller_projections='{}'
+for asset in "${CONTROLLER_PROJECTION_ASSETS[@]}"; do
+  controller_projections=$(jq -cn --argjson values "$controller_projections" \
+    --arg asset "$asset" --arg target "${installed_controller_projections[$asset]}" \
+    --arg sha "${installed_controller_sha[$asset]}" \
+    '$values + {($asset):{target:$target,sha256:$sha}}')
+done
 tmp="$receipt.tmp.$$"; completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 jq -cS -n --arg controller "$CONTROLLER" --arg payload "$payload" --arg completed "$completed_at" \
   --arg projection "/opt/monday/releases/binance-lob-controller/active/binance-lob-archiver" \
   --argjson test_only "$TEST_ONLY" --argjson eligible "$( [[ $TEST_ONLY == true ]] && printf false || printf true )" \
-  --argjson processes "$process_json" --argjson health "$health_json" --argjson projections "$projections" \
+  --argjson processes "$process_json" --argjson health "$health_json" \
+  --argjson projections "$projections" --argjson controller_projections "$controller_projections" \
   '{schema:"monday.rust_lob_pair_restore.v2",control_plane_version:2,operation:"restore",test_only:$test_only,production_eligible:$eligible,
     controller_sha256:$controller,payload_sha256:$payload,stable_production_projection:$projection,
-    active_pair_converged:true,installed_projections:$projections,process_identity:$processes,health:$health,
+    active_pair_converged:true,installed_projections:$projections,controller_projections:$controller_projections,
+    process_identity:$processes,health:$health,
     completed_at:$completed,result:"success"}' >"$tmp"
 chmod 0640 "$tmp"; mv -f -- "$tmp" "$receipt"; success=true
 receipt_sha=$(monday_sha256_file "$receipt"); printf '%s  restore.json\n' "$receipt_sha" >"$receipt.sha256"; chmod 0440 "$receipt" "$receipt.sha256"

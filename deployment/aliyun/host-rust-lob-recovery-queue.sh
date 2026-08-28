@@ -254,7 +254,7 @@ require_empty_segment_spool() {
 
 secure_release_identity() {
   local release_json artifact_json runtime_contract env_sha release_env_sha
-  local controller_release controller_sha controller_manifest controller_deployment
+  local controller_release controller_sha controller_manifest controller_deployment installed_recovery
   path_is_direct_or_absent "$OPT_ROOT" || fail "release path contains a symlink: $OPT_ROOT"
   path_is_direct_or_absent "$BIN_DIR" || fail "release path contains a symlink: $BIN_DIR"
   path_is_direct_or_absent "$RELEASE_ROOT" || fail "release path contains a symlink: $RELEASE_ROOT"
@@ -307,9 +307,15 @@ secure_release_identity() {
         and .runtime_contract_sha256 == $runtime' \
       "$controller_manifest" >/dev/null \
       || fail 'active controller does not bind the production artifact and runtime contract'
-    secure_regular_file "$INSTALLED_RECOVERY" 0
-    secure_regular_file "$controller_deployment/host-rust-lob-recovery-queue.sh" 0
-    cmp -s -- "$INSTALLED_RECOVERY" \
+    [[ -L $INSTALLED_RECOVERY ]] \
+      || fail "installed recovery controller is not the active projection: $INSTALLED_RECOVERY"
+    [[ $(readlink -- "$INSTALLED_RECOVERY") == \
+      "$ACTIVE_CONTROLLER/deployment/host-rust-lob-recovery-queue.sh" ]] \
+      || fail 'installed recovery controller does not resolve through active controller'
+    installed_recovery=$(readlink -f -- "$INSTALLED_RECOVERY") \
+      || fail 'installed recovery controller projection is dangling'
+    secure_regular_file "$installed_recovery" 0
+    cmp -s -- "$installed_recovery" \
       "$controller_deployment/host-rust-lob-recovery-queue.sh" \
       || fail 'installed recovery controller differs from the active controller release'
     release_json=$controller_manifest

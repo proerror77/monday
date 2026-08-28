@@ -102,6 +102,8 @@ stable_projection=$(monday_root_join "$ROOT" opt/monday/releases/binance-lob-con
 deployment=$(monday_root_join "$ROOT" "opt/monday/releases/binance-lob-controller/$CONTROLLER/deployment")
 mapfile -t PAIR_ASSETS < <(monday_runtime_assets)
 readonly PAIR_ASSETS
+mapfile -t CONTROLLER_PROJECTION_ASSETS < <(monday_controller_projection_assets)
+readonly CONTROLLER_PROJECTION_ASSETS
 production_projection=$(monday_root_join "$ROOT" opt/monday/releases/binance-lob-controller/active/binance-lob-archiver)
 [[ -L $production && $(readlink -- "$production") == "$production_projection" \
   && $(readlink -f -- "$production") == "$target" ]] \
@@ -115,6 +117,24 @@ for asset in "${PAIR_ASSETS[@]}"; do
   monday_file_direct "$resolved" || die "installed pair projection is not a file: $asset"
   [[ $(monday_sha256_file "$resolved") == "$(monday_sha256_file "$deployment/$asset")" ]] \
     || die "installed pair asset differs from active C: $asset"
+done
+controller_projections='{}'
+for asset in "${CONTROLLER_PROJECTION_ASSETS[@]}"; do
+  installed=$(monday_controller_projection_target "$ROOT" "$asset") \
+    || die "unknown controller projection: $asset"
+  expected=$(monday_root_join "$ROOT" "opt/monday/releases/binance-lob-controller/active/deployment/$asset")
+  [[ -L $installed && $(readlink -- "$installed") == "$expected" ]] \
+    || die "installed controller projection is not the active projection: $asset"
+  resolved=$(readlink -f -- "$installed") \
+    || die "installed controller projection is dangling: $asset"
+  monday_file_direct "$resolved" \
+    || die "installed controller projection is not a file: $asset"
+  [[ $(monday_sha256_file "$resolved") == "$(monday_sha256_file "$deployment/$asset")" ]] \
+    || die "installed controller projection differs from active C: $asset"
+  controller_projections=$(jq -cn --argjson values "$controller_projections" \
+    --arg asset "$asset" --arg target "/opt/monday/releases/binance-lob-controller/active/deployment/$asset" \
+    --arg sha "$(monday_sha256_file "$resolved")" \
+    '$values + {($asset):{target:$target,sha256:$sha}}')
 done
 
 runtime_identity='{}'; health_identity='{}'
@@ -158,6 +178,16 @@ assert_runtime_stable() {
   [[ -L $production && $(readlink -- "$production") == "$production_projection" \
     && $(readlink -f -- "$production") == "$target" ]] \
     || die 'stable production projection changed during OSS readback'
+  for asset in "${CONTROLLER_PROJECTION_ASSETS[@]}"; do
+    installed=$(monday_controller_projection_target "$ROOT" "$asset") || die "unknown controller projection: $asset"
+    expected=$(monday_root_join "$ROOT" "opt/monday/releases/binance-lob-controller/active/deployment/$asset")
+    [[ -L $installed && $(readlink -- "$installed") == "$expected" ]] \
+      || die "controller projection changed during OSS readback: $asset"
+    resolved=$(readlink -f -- "$installed") || die "controller projection is dangling: $asset"
+    monday_file_direct "$resolved" || die "controller projection is not a file: $asset"
+    [[ $(monday_sha256_file "$resolved") == "$(monday_sha256_file "$deployment/$asset")" ]] \
+      || die "controller projection differs during OSS readback: $asset"
+  done
   capture_runtime_identity
   [[ $runtime_identity == "$runtime_before" && $health_identity == "$health_before" ]] \
     || die 'process or health identity changed during OSS readback'
@@ -230,13 +260,15 @@ jq -cn --arg schema monday.rust_lob_operation_readback.v2 \
   --arg receipt "$RECEIPT_SHA" --arg transition "$TRANSITION_RECEIPT" \
   --arg gate "$transition_gate" --arg gate_sha "$transition_gate_sha" \
   --argjson markets "$markets" --argjson processes "$runtime_after" --argjson health "$health_after" \
+  --argjson controller_projections "$controller_projections" \
   --argjson statuses "$status_observations" \
   '{schema:$schema,control_plane_version:2,controller_sha256:$controller,
     payload_sha256:$payload,transition_receipt:$transition,
     transition_receipt_sha256:$receipt,gate_receipt:$gate,gate_sha256:$gate_sha,
     production_link_verified:true,process_identity_verified:true,
     process_restarts_verified:true,installed_assets_verified:true,
-    process_identity:$processes,health:$health,upload_status:$statuses,
+    process_identity:$processes,health:$health,controller_projections:$controller_projections,
+    upload_status:$statuses,
     oss_triplets:$markets,result:"success"}' >"$tmp_out"
 mv -f "$tmp_out" "$out"
 out_sha=$(monday_sha256_file "$out")

@@ -93,6 +93,81 @@ monday_controller_assets() {
     rust-lob-shadow-gate-policy.jq
 }
 
+# These are the controller-owned programs that systemd invokes through a
+# fixed /opt/monday/bin path.  They are stable projections of the active
+# controller, not a second mutable controller state.
+monday_controller_projection_assets() {
+  printf '%s\n' \
+    host-rust-lob-recovery-queue.sh \
+    monday-collector-health.sh
+}
+
+monday_controller_projection_target() {
+  [[ $# -eq 2 ]] || return 2
+  local root=$1 asset=$2
+  case "$asset" in
+    host-rust-lob-recovery-queue.sh)
+      monday_root_join "$root" opt/monday/bin/monday-rust-lob-recovery-queue ;;
+    monday-collector-health.sh)
+      monday_root_join "$root" opt/monday/bin/monday-collector-health.sh ;;
+    *) return 1 ;;
+  esac
+}
+
+# Verify the fixed entrypoints used by systemd resolve to one exact active
+# ControllerRelease.  This is read-only and deliberately accepts no regular
+# file fallback once V2 has been bootstrapped.
+monday_verify_controller_projections() {
+  [[ $# -eq 2 ]] || return 2
+  local root=$1 sha=$2 controller_root active release asset target expected resolved
+  monday_sha256_ok "$sha" || return 1
+  controller_root=$(monday_root_join "$root" opt/monday/releases/binance-lob-controller) || return 1
+  active="$controller_root/active"; release="$controller_root/$sha"
+  [[ -L $active && $(readlink -f -- "$active") == "$release" ]] || return 1
+  while IFS= read -r asset; do
+    target=$(monday_controller_projection_target "$root" "$asset") || return 1
+    expected="$active/deployment/$asset"
+    [[ -L $target && $(readlink -- "$target") == "$expected" ]] || return 1
+    resolved=$(readlink -f -- "$target") || return 1
+    monday_file_direct "$resolved" || return 1
+    cmp -s "$release/deployment/$asset" "$resolved" || return 1
+  done < <(monday_controller_projection_assets)
+}
+
+# Read-only verifier for the controller identity left by the pre-V2 apply
+# path.  No v1 control bytes are executed; only the manifest, payload and
+# runtime identity are used to establish an exact bootstrap rollback anchor.
+monday_verify_legacy_controller_release() {
+  [[ $# -eq 3 ]] || return 2
+  local root=$1 sha=$2 production=$3 controller_root release manifest artifact runtime
+  monday_sha256_ok "$sha" || return 1
+  controller_root=$(monday_root_join "$root" opt/monday/releases/binance-lob-controller) || return 1
+  release="$controller_root/$sha"; manifest="$release/release.json"
+  monday_path_direct "$controller_root" || return 1
+  monday_path_direct "$release" || return 1
+  monday_path_direct "$release/deployment" || return 1
+  monday_file_direct "$manifest" || return 1
+  [[ $(monday_sha256_file "$manifest") == "$sha" ]] || return 1
+  [[ -f "$release/release.json.sha256" && ! -L "$release/release.json.sha256" ]] || return 1
+  (cd "$release" && sha256sum --check --strict release.json.sha256 >/dev/null) || return 1
+  local legacy_schema
+  legacy_schema=$(printf '%s%s' 'monday.rust_lob_controller_release.' 'v1')
+  jq -e --arg schema "$legacy_schema" \
+    '.schema == $schema
+     and (.artifact_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+     and (.runtime_contract_sha256 | type == "string" and test("^[a-f0-9]{64}$"))' \
+    "$manifest" >/dev/null 2>&1 || return 1
+  artifact=$(jq -er '.artifact_sha256' "$manifest") || return 1
+  runtime=$(jq -er '.runtime_contract_sha256' "$manifest") || return 1
+  monday_sha256_ok "$runtime" || return 1
+  local binary
+  binary=$(monday_root_join "$root" "opt/monday/releases/binance-lob-archiver/$artifact/binance-lob-archiver") || return 1
+  monday_file_direct "$binary" || return 1
+  [[ $(monday_sha256_file "$binary") == "$artifact" ]] || return 1
+  [[ -L $production && $(readlink -f -- "$production") == "$binary" ]] || return 1
+  printf '%s %s %s\n' "$artifact" "$runtime" "$release"
+}
+
 monday_runtime_asset_target() {
   [[ $# -eq 2 ]] || return 2
   local root=$1 asset=$2
@@ -398,7 +473,16 @@ monday_validate_v2_gate() {
       and (.production_eligible | type == "boolean")
       and (.test_only | type == "boolean")
       and (if .test_only then .production_eligible == false else .production_eligible == true end)
-      and .transition.before == $from
+      and (.source_mode == "stable" or .source_mode == "direct")
+      and (.from_controller_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+      and (if $from == "direct" then
+        .source_mode == "direct"
+        and .transition.before == .from_controller_sha256
+      else
+        .source_mode == "stable"
+        and .from_controller_sha256 == $from
+        and .transition.before == $from
+      end)
       and .transition.after == $candidate
       and (.transition.topology == "stable" or .transition.topology == "direct-bootstrap")
       and (.candidate_controller_sha256 == $candidate)
@@ -410,13 +494,13 @@ monday_validate_v2_gate() {
         and (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))
         and (.assets | type == "object" and (keys | sort) == $controller_asset_keys
           and all(.[]; type == "string" and test("^[a-f0-9]{64}$"))))
-      and (.before | type == "object"
-        and .controller == $from
-        and (.payload_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
-        and (.runtime_contract_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
-        and (.production_projection | type == "string" and length > 0)
-        and (.production_assets | type == "object" and (keys | sort) == $production_asset_keys
-          and all(.[]; type == "string" and test("^[a-f0-9]{64}$"))))
+      and (.before | type == "object")
+      and (.before.controller == (if $from == "direct" then .from_controller_sha256 else $from end))
+      and (.before.payload_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+      and (.before.runtime_contract_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+      and (.before.production_projection | type == "string" and length > 0)
+      and (.before.production_assets | type == "object" and (keys | sort) == $production_asset_keys
+        and all(.[]; type == "string" and test("^[a-f0-9]{64}$")))
       and (.production_assets | type == "object" and (keys | sort) == $production_asset_keys
         and all(.[]; type == "string" and test("^[a-f0-9]{64}$")))
       and (.production_process | type == "object")
@@ -545,7 +629,7 @@ monday_validate_v2_gate() {
 monday_validate_v2_transition() {
   [[ $# -eq 5 ]] || return 2
   local receipt=$1 from=$2 to=$3 gate=$4 gate_sha=$5
-  local gate_evidence gate_payload gate_runtime pair_asset_keys
+  local gate_evidence gate_payload gate_runtime gate_from pair_asset_keys controller_projection_keys
   # The stable pair contains exactly the eight runtime unit/env assets
   # (production + shadow).  Recovery/health helpers remain controller assets
   # and are addressed through the immutable active controller, never copied
@@ -561,13 +645,20 @@ monday_validate_v2_transition() {
     "$gate") || return 1
   gate_payload=$(jq -er '.candidate_payload_sha256' "$gate") || return 1
   gate_runtime=$(jq -er '.candidate_runtime_contract_sha256' "$gate") || return 1
+  gate_from=$(jq -er '.from_controller_sha256' "$gate") || return 1
+  controller_projection_keys=$(monday_controller_projection_assets | jq -Rsc 'split("\n") | map(select(length > 0)) | sort') || return 1
   jq -e --arg from "$from" --arg to "$to" --arg gate "$gate" --arg gate_sha "$gate_sha" \
-    --arg payload "$gate_payload" --arg runtime "$gate_runtime" \
+    --arg gate_from "$gate_from" --arg payload "$gate_payload" --arg runtime "$gate_runtime" \
+    --argjson controller_projection_keys "$controller_projection_keys" \
     --argjson pair_asset_keys "$pair_asset_keys" '
     .schema == "monday.rust_lob_pair_transition.v2"
     and .control_plane_version == 2
     and .operation == "cutover"
-    and .from_controller_sha256 == $from
+    and ((if $from == "direct" then
+      .source_mode == "direct" and .from_controller_sha256 == $gate_from
+    else
+      .source_mode == "stable" and .from_controller_sha256 == $from
+    end))
     and .controller_sha256 == $to
     and .payload_sha256 == $payload
     and .runtime_contract_sha256 == $runtime
@@ -584,8 +675,8 @@ monday_validate_v2_transition() {
       and (.candidate_control_bytes | type == "object")
       and (.resource_admission | type == "array" and length >= 3)
       and (.io_full_psi_windows | type == "array" and length >= 3))
-    and (.before | type == "object"
-      and (.controller == $from)
+      and (.before | type == "object"
+      and (.controller == (if $from == "direct" then $gate_from else $from end))
       and (.payload_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
       and (.runtime_contract_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
       and (.production_projection | type == "string"
@@ -600,7 +691,12 @@ monday_validate_v2_transition() {
     and (.installed_assets | type == "object" and (keys | sort) == $pair_asset_keys
       and all(.[]; type == "string" and test("^[a-f0-9]{64}$")))
     and (.installed_projections | type == "object" and (keys | sort) == $pair_asset_keys
-      and all(.[]; type == "string" and length > 0))' \
+      and all(.[]; type == "string" and length > 0))
+    and (.installed_controller_projections | type == "object"
+      and (keys | sort) == $controller_projection_keys
+      and all(.[];
+        (.target | type == "string" and test("^/opt/monday/releases/binance-lob-controller/active/deployment/[A-Za-z0-9._-]+$"))
+        and (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))))' \
     "$receipt" >/dev/null
   jq -e --argjson expected "$gate_evidence" \
     '.gate_evidence == $expected' "$receipt" >/dev/null

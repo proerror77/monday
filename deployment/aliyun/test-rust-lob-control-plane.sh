@@ -70,6 +70,37 @@ p1_sha=$(publish_fixture "$p1" "$m1")
 c0=$(monday_sha256_file "$m0")
 c1=$(monday_sha256_file "$m1")
 
+# The real bootstrap starts from the immutable controller identity created by
+# the pre-V2 apply path.  It is read-only evidence: no v1 control byte is
+# sourced or executed during the V2 Gate/cutover.
+legacy_root="$ROOT/opt/monday/releases/binance-lob-controller"
+legacy_work="$ROOT/legacy-controller"
+mkdir -p "$legacy_work/deployment"
+legacy_artifact_uri=oss://bucket/payload
+legacy_bundle_uri=oss://bucket/legacy-controller
+legacy_source=$(printf '9%.0s' {1..40})
+legacy_bundle_sha=$(monday_sha256_file "$p0")
+jq -cS -n --arg artifact_uri "$legacy_artifact_uri" --arg artifact_sha "$p0_sha" \
+  --arg runtime "$(monday_manifest_field "$m0" runtime_contract_sha256)" \
+  --arg source "$legacy_source" --arg bundle "$legacy_bundle_uri" --arg bundle_sha "$legacy_bundle_sha" \
+  '{schema:("monday.rust_lob_controller_release." + "v1"),artifact_uri:$artifact_uri,
+    artifact_sha256:$artifact_sha,runtime_contract_sha256:$runtime,
+    deployment_source_revision:$source,deployment_bundle_uri:$bundle,
+    deployment_bundle_sha256:$bundle_sha}' >"$legacy_work/release.json"
+legacy_c0=$(monday_sha256_file "$legacy_work/release.json")
+for asset in host-rust-lob-recovery-queue.sh monday-collector-health.sh; do
+  cp -p -- "$source_dir/$asset" "$legacy_work/deployment/$asset"
+done
+mkdir -p "$legacy_root/$legacy_c0/deployment"
+cp -p -- "$legacy_work/release.json" "$legacy_root/$legacy_c0/release.json"
+cp -p -- "$legacy_work/deployment/"* "$legacy_root/$legacy_c0/deployment/"
+(cd "$legacy_root/$legacy_c0" && sha256sum release.json >release.json.sha256 && sha256sum deployment/* >deployment.sha256)
+ln -s "$legacy_root/$legacy_c0" "$legacy_root/active"
+cp -p -- "$legacy_work/deployment/host-rust-lob-recovery-queue.sh" \
+  "$ROOT/opt/monday/bin/monday-rust-lob-recovery-queue"
+cp -p -- "$legacy_work/deployment/monday-collector-health.sh" \
+  "$ROOT/opt/monday/bin/monday-collector-health.sh"
+
 # Bootstrap uses an explicit direct before topology and requires P1 == P0.
 ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p0_sha/binance-lob-archiver" \
   "$ROOT/opt/monday/bin/binance-lob-archiver"
@@ -80,6 +111,42 @@ gate=$(printf '%s\n' "$gate_output" | sed -n 's/^V2 Gate receipt: //p')
 gate_sha=$(printf '%s\n' "$gate_output" | sed -n 's/^SHA-256: //p')
 [[ -f $gate && $gate_sha == "$(monday_sha256_file "$gate")" ]]
 monday_validate_v2_gate "$gate" direct "$c0" "$gate_sha"
+jq -e --arg from "$legacy_c0" \
+  '.source_mode == "direct" and .from_controller_sha256 == $from
+   and .transition.before == $from and .transition.topology == "direct-bootstrap"' \
+  "$gate" >/dev/null
+
+# A hard stop immediately after active=C1 must leave that one commit as the
+# recovery source.  Restore then establishes every stable projection from C1;
+# no receipt or guessed previous state is needed.  Rebuild the direct legacy
+# topology afterwards so the normal bootstrap path remains covered below.
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_HARD_CRASH_AFTER_ACTIVE=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from direct --to "$c0" \
+  --gate-receipt "$gate" --gate-sha256 "$gate_sha" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'hard-crash cutover unexpectedly survived SIGKILL\n' >&2
+  exit 1
+fi
+[[ $(monday_active_controller_sha "$ROOT") == "$c0" ]]
+for asset in binance-lob-archiver-rust-spot.env binance-lob-archiver-rust-usdm.env; do
+  [[ -f "$(monday_runtime_asset_target "$ROOT" "$asset")" && ! -L "$(monday_runtime_asset_target "$ROOT" "$asset")" ]]
+done
+MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c0" --root "$ROOT" >/dev/null
+rm -f -- "$ROOT/opt/monday/releases/binance-lob-controller/active"
+ln -s "$legacy_root/$legacy_c0" "$ROOT/opt/monday/releases/binance-lob-controller/active"
+rm -f -- "$ROOT/opt/monday/bin/binance-lob-archiver"
+ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p0_sha/binance-lob-archiver" \
+  "$ROOT/opt/monday/bin/binance-lob-archiver"
+while IFS= read -r asset; do
+  target=$(monday_runtime_asset_target "$ROOT" "$asset")
+  rm -f -- "$target"
+  cp -p -- "$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/$asset" "$target"
+done < <(monday_runtime_assets)
+while IFS= read -r asset; do
+  target=$(monday_controller_projection_target "$ROOT" "$asset")
+  rm -f -- "$target"
+  cp -p -- "$legacy_root/$legacy_c0/deployment/$asset" "$target"
+done < <(monday_controller_projection_assets)
 
 # Bootstrap must independently bind the live R0 bytes.  A missing or drifted
 # shadow runtime asset is rejected before any active/controller projection is
@@ -94,6 +161,7 @@ if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   exit 1
 fi
 mv -f -- "$bootstrap_shadow.saved" "$bootstrap_shadow"
+chmod u+w "$bootstrap_shadow"
 printf 'bootstrap-r0-drift\n' >"$bootstrap_shadow"
 if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from direct --to "$c0" \
@@ -121,6 +189,56 @@ while IFS= read -r asset; do
   [[ -L $target && $(readlink -- "$target") == \
     "$ROOT/opt/monday/releases/binance-lob-controller/active/deployment/$asset" ]]
 done < <(monday_runtime_assets)
+
+# A V2 active controller paired with a direct production binary is a mixed
+# topology, not a second bootstrap mode.  Gate must reject it before reading
+# any candidate control bytes, then the stable projection is restored.
+mixed_production_target=$(readlink -- "$ROOT/opt/monday/bin/binance-lob-archiver")
+rm -f -- "$ROOT/opt/monday/bin/binance-lob-archiver"
+ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p0_sha/binance-lob-archiver" \
+  "$ROOT/opt/monday/bin/binance-lob-archiver"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c1" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'Gate accepted a mixed V2-active/direct-production topology\n' >&2
+  exit 1
+fi
+rm -f -- "$ROOT/opt/monday/bin/binance-lob-archiver"
+ln -s "$mixed_production_target" "$ROOT/opt/monday/bin/binance-lob-archiver"
+
+# Simulate the production unit's ExecStartPre identity boundary.  The real
+# helper is not invoked in an isolated fixture, but the exact stable
+# projection, executable bit, resolved bytes, and active-controller target
+# are checked through the same fixed path systemd calls.
+simulate_recovery_execstartpre() {
+  local asset target expected
+  while IFS= read -r asset; do
+    target=$(monday_controller_projection_target "$ROOT" "$asset")
+    expected="$ROOT/opt/monday/releases/binance-lob-controller/active/deployment/$asset"
+    bash -c 'set -eu
+      entry=$1
+      expected=$2
+      test -L "$entry"
+      test -x "$entry"
+      test "$(readlink -- "$entry")" = "$expected"
+      resolved=$(readlink -f -- "$entry")
+      test -f "$resolved" && test ! -L "$resolved"
+      cmp -s "$resolved" "$expected"' _ "$target" "$expected" \
+      || return 1
+  done < <(monday_controller_projection_assets)
+}
+simulate_recovery_execstartpre
+recovery_projection=$(monday_controller_projection_target "$ROOT" host-rust-lob-recovery-queue.sh)
+recovery_projection_target=$(readlink -- "$recovery_projection")
+rm -f -- "$recovery_projection"
+printf 'tampered-recovery-helper\n' >"$recovery_projection"
+if simulate_recovery_execstartpre; then
+  printf 'ExecStartPre simulation accepted a non-projected recovery helper\n' >&2
+  exit 1
+fi
+rm -f -- "$recovery_projection"
+ln -s "$recovery_projection_target" "$recovery_projection"
+simulate_recovery_execstartpre
 
 if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
@@ -285,6 +403,57 @@ gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   --candidate-controller "$c2" --root "$ROOT")
 gate2=$(printf '%s\n' "$gate_output" | sed -n 's/^V2 Gate receipt: //p')
 gate2_sha=$(printf '%s\n' "$gate_output" | sed -n 's/^SHA-256: //p')
+
+# A candidate Spot lane may start before the USD-M lane fails.  The rollback
+# must restore the complete before pair (including both stable projections),
+# then restart both old lanes; no candidate process or transition receipt may
+# remain.  The once-only fixture lets the old USD-M lane recover successfully.
+partial_receipt="$ROOT/data/monday/evidence/cutovers/$c2/transition.json"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
+  MONDAY_CUTOVER_FIXTURE_FAIL_USDM_ONCE=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from "$c1" --to "$c2" \
+  --gate-receipt "$gate2" --gate-sha256 "$gate2_sha" --root "$ROOT" \
+  >/dev/null 2>&1; then
+  printf 'partial-start cutover unexpectedly succeeded\n' >&2
+  exit 1
+fi
+[[ $(monday_active_controller_sha "$ROOT") == "$c1" ]]
+[[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == \
+  "$ROOT/opt/monday/releases/binance-lob-archiver/$p1_sha/binance-lob-archiver" ]]
+[[ ! -e $partial_receipt && ! -L $partial_receipt ]]
+partial_calls="$ROOT/run/cutover-fixture.calls"
+for unit in binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service; do
+  grep -Fq "mask $unit" "$partial_calls"
+done
+partial_process_root="$ROOT/run/cutover-fixture.processes"
+for process in "$partial_process_root"/*; do
+  [[ -e $process ]] || continue
+  [[ $(cat "$process") == "$c1" ]] || {
+    printf 'partial-start rollback left a candidate process: %s\n' "$process" >&2
+    exit 1
+  }
+done
+
+# If the old USD-M lane also fails during rollback, both lanes must remain
+# stopped/masked rather than being reported as recovered with a partial pair.
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
+  MONDAY_CUTOVER_FIXTURE_FAIL_USDM=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from "$c1" --to "$c2" \
+  --gate-receipt "$gate2" --gate-sha256 "$gate2_sha" --root "$ROOT" \
+  >/dev/null 2>&1; then
+  printf 'partial-start rollback-failure fixture unexpectedly succeeded\n' >&2
+  exit 1
+fi
+[[ $(monday_active_controller_sha "$ROOT") == "$c1" ]]
+for unit in binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service; do
+  grep -Fq "mask $unit" "$partial_calls"
+done
+if compgen -G "$partial_process_root/*" >/dev/null; then
+  printf 'contained partial-start rollback left a process marker\n' >&2
+  exit 1
+fi
+[[ ! -e $partial_receipt && ! -L $partial_receipt ]]
+
 active_before_stage=$(monday_active_controller_sha "$ROOT")
 production_before_stage=$(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver")
 if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" MONDAY_CUTOVER_FAIL_AFTER_ASSET_STAGE=1 \

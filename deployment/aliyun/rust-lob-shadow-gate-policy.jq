@@ -31,6 +31,8 @@ and .passed == true
 and (.production_eligible | type == "boolean")
 and (.test_only | type == "boolean")
 and (if .test_only then .production_eligible == false else .production_eligible == true end)
+and (.source_mode == "stable" or .source_mode == "direct")
+and (.from_controller_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
 and (.candidate_controller_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
 and (.candidate_payload_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
 and (.candidate_runtime_contract_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
@@ -41,9 +43,16 @@ and (.candidate_control_bytes | type == "object"
   and (.assets | type == "object" and (keys | sort) == $controller_asset_keys
     and all(.[]; type == "string" and test("^[a-f0-9]{64}$"))))
 and (.transition | type == "object"
-  and (.before == "direct" or (.before | test("^[a-f0-9]{64}$")))
+  and (.before | test("^[a-f0-9]{64}$"))
   and (.after == $root.candidate_controller_sha256)
   and (.topology == "stable" or .topology == "direct-bootstrap"))
+and (if .source_mode == "direct" then
+  .transition.topology == "direct-bootstrap"
+  and .from_controller_sha256 == .transition.before
+ else
+  .source_mode == "stable"
+  and .from_controller_sha256 == .transition.before
+end)
 and (.before | type == "object"
   and .controller == $root.transition.before
   and (.payload_sha256 | type == "string" and test("^[a-f0-9]{64}$"))

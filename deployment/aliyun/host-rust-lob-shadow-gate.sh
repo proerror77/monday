@@ -245,12 +245,14 @@ while IFS= read -r control_asset; do
     --arg asset "$control_asset" --arg sha "$control_sha" '$values + {($asset):$sha}')
 done < <(monday_controller_assets)
 
-active_before=direct; before_payload=; before_runtime=; before_bundle=; before_source=; before_deployment=; before_production_projection=
+active_before=direct; before_controller=; source_mode=stable; legacy_controller=; legacy_target=; legacy_payload=; legacy_runtime=; before_payload=; before_runtime=; before_bundle=; before_source=; before_deployment=; before_production_projection=
 if [[ $FROM_CONTROLLER != direct ]]; then
   active_before=$(monday_active_controller_sha "$ROOT") || die 'requested before controller is not active'
   [[ $active_before == "$FROM_CONTROLLER" ]] || die 'active pair differs from requested before controller'
+  before_controller=$FROM_CONTROLLER
   before_release="$CONTROLLER_ROOT/$FROM_CONTROLLER"; before_deployment="$before_release/deployment"
   monday_verify_controller_release "$ROOT" "$FROM_CONTROLLER" || die 'before controller release is invalid'
+  monday_verify_controller_projections "$ROOT" "$FROM_CONTROLLER" || die 'before controller projections are not stable'
   before_payload=$(monday_manifest_field "$before_release/release.json" artifact_sha256)
   before_runtime=$(monday_manifest_field "$before_release/release.json" runtime_contract_sha256)
   before_bundle=$(monday_manifest_field "$before_release/release.json" deployment_bundle_sha256)
@@ -259,15 +261,42 @@ if [[ $FROM_CONTROLLER != direct ]]; then
     || die 'production binary is not the stable active projection'
   before_production_projection="$CONTROLLER_ROOT/active/binance-lob-archiver"
 else
-  [[ ! -L $CONTROLLER_ROOT/active ]] || die 'direct bootstrap requires no active V2 controller'
+  source_mode=direct
+  [[ -L $CONTROLLER_ROOT/active ]] || die 'direct bootstrap requires an existing legacy active controller'
+  legacy_target=$(readlink -f -- "$CONTROLLER_ROOT/active") || die 'legacy active controller is dangling'
+  legacy_controller=${legacy_target##*/}
+  [[ $legacy_target == "$CONTROLLER_ROOT/$legacy_controller" ]] \
+    || die 'legacy active controller is not digest-addressed'
+  monday_verify_legacy_controller_release "$ROOT" "$legacy_controller" "$PRODUCTION_BINARY" \
+    || die 'direct bootstrap requires an immutable v1 active controller'
+  before_controller=$legacy_controller
+  before_release="$legacy_target"
+  # Never source or execute the legacy deployment.  C0 contributes only its
+  # immutable manifest identity; all candidate control bytes come from C1.
   before_deployment=$candidate_deployment
   production_target=$(readlink -f -- "$PRODUCTION_BINARY") || die 'direct bootstrap requires a production binary'
   before_payload=$(sha256_file "$production_target") || die 'direct bootstrap requires a production binary'
+  legacy_payload=$(jq -er '.artifact_sha256' "$legacy_target/release.json") || die 'legacy controller payload is invalid'
+  legacy_runtime=$(jq -er '.runtime_contract_sha256' "$legacy_target/release.json") || die 'legacy controller runtime is invalid'
+  [[ $before_payload == "$legacy_payload" ]] || die 'direct production does not match the legacy controller payload'
   [[ $before_payload == "$candidate_payload" ]] || die 'direct bootstrap requires P0 equal to P1'
-  before_runtime=$candidate_runtime; before_bundle=$candidate_bundle; before_source=$candidate_source
-  if [[ $TEST_ONLY != true ]]; then [[ -L $PRODUCTION_BINARY && $(readlink -f -- "$PRODUCTION_BINARY") == "$candidate_binary" ]] || die 'direct production identity differs'; fi
+  before_runtime=$legacy_runtime
+  before_bundle=$(jq -er '.deployment_bundle_sha256' "$legacy_target/release.json") || die 'legacy controller bundle is invalid'
+  before_source=$(jq -er '.deployment_source_revision' "$legacy_target/release.json") || die 'legacy controller source is invalid'
+  [[ $candidate_runtime == "$before_runtime" ]] || die 'direct bootstrap requires R0 equal to R1'
+  [[ -L $PRODUCTION_BINARY && $(readlink -f -- "$PRODUCTION_BINARY") == "$production_target" ]] \
+    || die 'direct production identity differs'
   before_production_projection=$(readlink -- "$PRODUCTION_BINARY")
 fi
+
+# The before runtime contract is established from every live unit/env byte,
+# never from the candidate manifest.  This is especially important for direct
+# bootstrap: C0's R0 must be true of the installed P0 topology before any
+# shadow staging occurs.
+live_runtime=$(monday_rust_lob_live_runtime_contract_sha256 "$ROOT") \
+  || die 'before runtime contract is missing or indirect'
+[[ $live_runtime == "$before_runtime" ]] \
+  || die 'before runtime bytes differ from the immutable before controller'
 
 production_asset_json='{}'
 for asset in "${PRODUCTION_ASSETS[@]}"; do
@@ -856,8 +885,16 @@ for market in "${markets[@]}"; do run_market_gate_phase "$market"; run_candidate
 for market in "${markets[@]}"; do verify_oss_roundtrips "$market"; done
 for market in "${markets[@]}"; do systemctl stop "${unit[$market]}" >/dev/null 2>&1 || true; done
 restore_shadow_assets || die 'before shadow assets could not be restored'; restore_shadow_link || die 'before shadow link could not be restored'
-if [[ $FROM_CONTROLLER != direct ]]; then [[ $(monday_active_controller_sha "$ROOT") == "$FROM_CONTROLLER" ]] || die 'active controller changed during Gate'; [[ -L $PRODUCTION_BINARY && $(readlink -- "$PRODUCTION_BINARY") == "$CONTROLLER_ROOT/active/binance-lob-archiver" ]] || die 'production identity changed during Gate'
-else [[ $TEST_ONLY == true || $(readlink -f -- "$PRODUCTION_BINARY") == "$candidate_binary" ]] || die 'direct production identity changed during Gate'; fi
+if [[ $FROM_CONTROLLER != direct ]]; then
+  [[ $(monday_active_controller_sha "$ROOT") == "$FROM_CONTROLLER" ]] || die 'active controller changed during Gate'
+  monday_verify_controller_projections "$ROOT" "$FROM_CONTROLLER" || die 'before controller projections changed during Gate'
+  [[ -L $PRODUCTION_BINARY && $(readlink -- "$PRODUCTION_BINARY") == "$CONTROLLER_ROOT/active/binance-lob-archiver" ]] || die 'production identity changed during Gate'
+else
+  [[ $(monday_active_controller_sha "$ROOT") == "$legacy_controller" ]] || die 'legacy active controller changed during Gate'
+  monday_verify_legacy_controller_release "$ROOT" "$legacy_controller" "$PRODUCTION_BINARY" \
+    || die 'legacy controller identity changed during Gate'
+  [[ $TEST_ONLY == true || $(readlink -f -- "$PRODUCTION_BINARY") == "$candidate_binary" ]] || die 'direct production identity changed during Gate'
+fi
 if [[ $old_shadow_present == true ]]; then [[ $(readlink -- "$SHADOW_BINARY") == "$old_shadow_target" ]] || die 'shadow link was not restored'; else [[ ! -e $SHADOW_BINARY && ! -L $SHADOW_BINARY ]] || die 'shadow link was not removed'; fi
 final_payload=$(monday_manifest_field "$candidate_manifest" artifact_sha256) || die 'candidate payload identity disappeared during Gate'
 final_runtime=$(monday_manifest_field "$candidate_manifest" runtime_contract_sha256) || die 'candidate runtime identity disappeared during Gate'
@@ -923,8 +960,8 @@ for market in "${markets[@]}"; do
   markets_json=$(jq -cn --argjson values "$markets_json" --arg market "$market" --argjson value "$market_json" '$values + {($market):$value}')
 done
 gate_finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ); production_eligible=true; [[ $TEST_ONLY == true ]] && production_eligible=false
-jq -cn --arg schema monday.rust_lob_shadow_gate.v5 --arg from "$FROM_CONTROLLER" --arg after "$CANDIDATE_CONTROLLER" --arg candidate "$CANDIDATE_CONTROLLER" --arg payload "$candidate_payload" --arg runtime "$candidate_runtime" --arg bundle "$candidate_bundle" --arg source "$candidate_source" --arg before_payload "$before_payload" --arg before_runtime "$before_runtime" --arg before_bundle "$before_bundle" --arg before_source "$before_source" --arg before_projection "$before_production_projection" --arg control_sha "$candidate_control_bytes_sha" --argjson control_assets "$candidate_control_assets" --arg run "$run_id" --arg spool "$run_spool" --arg started "$gate_started_at" --arg finished "$gate_finished_at" --argjson host_total "$host_memory_total" --argjson host_swap "$host_swap_total" --argjson production_memory "$production_memory_json" --argjson production_process "$production_process_json" --argjson production_assets "$production_asset_json" --argjson resources "$resource_samples" --argjson psi "$psi_windows" --argjson checks "$checks" --argjson markets "$markets_json" --argjson eligible "$production_eligible" --argjson test_only "$TEST_ONLY" --argjson before_assets "$before_assets_json" --argjson staged_assets "$staged_assets_json" --argjson restored_assets "$restored_assets_json" --arg shadow_binary "$SHADOW_BINARY" --arg candidate_binary "$candidate_binary" --arg old_shadow_target "$old_shadow_target" --arg old_shadow_target_sha "$old_shadow_target_sha256" --argjson old_shadow_present "$old_shadow_present" \
-  '{schema:$schema,control_plane_version:2,passed:true,production_eligible:$eligible,test_only:$test_only,transition:{before:$from,after:$after,topology:(if $from == "direct" then "direct-bootstrap" else "stable" end)},candidate_controller_sha256:$candidate,candidate_payload_sha256:$payload,candidate_runtime_contract_sha256:$runtime,candidate_deployment_bundle_sha256:$bundle,candidate_deployment_source_revision:$source,candidate_control_bytes:{sha256:$control_sha,assets:$control_assets},before:{controller:$from,payload_sha256:$before_payload,runtime_contract_sha256:$before_runtime,deployment_bundle_sha256:$before_bundle,deployment_source_revision:$before_source,production_projection:$before_projection,production_assets:$production_assets},run_id:$run,run_spool:$spool,started_at:$started,finished_at:$finished,required_duration_seconds:240,health_settle_seconds:240,segment_seconds:120,host_memory_total_bytes:$host_total,host_swap_total_bytes:$host_swap,production_memory:$production_memory,production_process:$production_process,production_assets:$production_assets,resource_admission:$resources,io_full_psi_windows:$psi,shadow_staging:{candidate_assets:$staged_assets,restored_assets:$restored_assets,before_assets:$before_assets,binary:{path:$shadow_binary,candidate_target:$candidate_binary,restored_target:(if $old_shadow_present then $old_shadow_target else null end),restored_target_sha256:(if $old_shadow_present then $old_shadow_target_sha else null end),restored_present:$old_shadow_present}},checks:$checks,markets:$markets}' >"$gate_json.tmp"
+jq -cn --arg schema monday.rust_lob_shadow_gate.v5 --arg from "$before_controller" --arg source_mode "$source_mode" --arg after "$CANDIDATE_CONTROLLER" --arg candidate "$CANDIDATE_CONTROLLER" --arg payload "$candidate_payload" --arg runtime "$candidate_runtime" --arg bundle "$candidate_bundle" --arg source "$candidate_source" --arg before_payload "$before_payload" --arg before_runtime "$before_runtime" --arg before_bundle "$before_bundle" --arg before_source "$before_source" --arg before_projection "$before_production_projection" --arg control_sha "$candidate_control_bytes_sha" --argjson control_assets "$candidate_control_assets" --arg run "$run_id" --arg spool "$run_spool" --arg started "$gate_started_at" --arg finished "$gate_finished_at" --argjson host_total "$host_memory_total" --argjson host_swap "$host_swap_total" --argjson production_memory "$production_memory_json" --argjson production_process "$production_process_json" --argjson production_assets "$production_asset_json" --argjson resources "$resource_samples" --argjson psi "$psi_windows" --argjson checks "$checks" --argjson markets "$markets_json" --argjson eligible "$production_eligible" --argjson test_only "$TEST_ONLY" --argjson before_assets "$before_assets_json" --argjson staged_assets "$staged_assets_json" --argjson restored_assets "$restored_assets_json" --arg shadow_binary "$SHADOW_BINARY" --arg candidate_binary "$candidate_binary" --arg old_shadow_target "$old_shadow_target" --arg old_shadow_target_sha "$old_shadow_target_sha256" --argjson old_shadow_present "$old_shadow_present" \
+  '{schema:$schema,control_plane_version:2,passed:true,production_eligible:$eligible,test_only:$test_only,source_mode:$source_mode,from_controller_sha256:$from,transition:{before:$from,after:$after,topology:(if $source_mode == "direct" then "direct-bootstrap" else "stable" end)},candidate_controller_sha256:$candidate,candidate_payload_sha256:$payload,candidate_runtime_contract_sha256:$runtime,candidate_deployment_bundle_sha256:$bundle,candidate_deployment_source_revision:$source,candidate_control_bytes:{sha256:$control_sha,assets:$control_assets},before:{controller:$from,payload_sha256:$before_payload,runtime_contract_sha256:$before_runtime,deployment_bundle_sha256:$before_bundle,deployment_source_revision:$before_source,production_projection:$before_projection,production_assets:$production_assets},run_id:$run,run_spool:$spool,started_at:$started,finished_at:$finished,required_duration_seconds:240,health_settle_seconds:240,segment_seconds:120,host_memory_total_bytes:$host_total,host_swap_total_bytes:$host_swap,production_memory:$production_memory,production_process:$production_process,production_assets:$production_assets,resource_admission:$resources,io_full_psi_windows:$psi,shadow_staging:{candidate_assets:$staged_assets,restored_assets:$restored_assets,before_assets:$before_assets,binary:{path:$shadow_binary,candidate_target:$candidate_binary,restored_target:(if $old_shadow_present then $old_shadow_target else null end),restored_target_sha256:(if $old_shadow_present then $old_shadow_target_sha else null end),restored_present:$old_shadow_present}},checks:$checks,markets:$markets}' >"$gate_json.tmp"
 chmod 0640 "$gate_json.tmp"; [[ ! -e $gate_json ]] || die 'gate receipt already exists'; mv -f -- "$gate_json.tmp" "$gate_json"
 if ! jq -e -f "$POLICY_SOURCE" "$gate_json" >/dev/null; then die 'V2 Gate policy rejected the receipt'; fi
 if [[ $production_eligible == true ]]; then gate_sha=$(sha256_file "$gate_json"); printf '%s  gate.json\n' "$gate_sha" >"$passed_marker.tmp"; chmod 0640 "$passed_marker.tmp"; mv -f -- "$passed_marker.tmp" "$passed_marker"; fi
