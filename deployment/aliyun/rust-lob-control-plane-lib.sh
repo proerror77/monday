@@ -1242,7 +1242,7 @@ monday_validate_v2_gate() {
   [[ $# -eq 4 ]] || return 2
   local gate=$1 from=$2 candidate=$3 gate_sha=$4
   local controller_asset_keys production_asset_keys shadow_asset_keys observed_now_ns market observed_at observed_at_ns parsed_observed
-  local dataset expected_bucket expected_prefix data_uri manifest_uri success_uri data_prefix manifest_prefix success_prefix
+  local dataset expected_bucket expected_prefix object_prefix data_uri manifest_uri success_uri data_prefix manifest_prefix success_prefix
   controller_asset_keys=$(monday_controller_assets | jq -Rsc 'split("\n") | map(select(length > 0)) | sort') || return 1
   production_asset_keys=$(printf '%s\n' \
     binance-lob-archiver-production@.service \
@@ -1477,6 +1477,7 @@ monday_validate_v2_gate() {
             and all(.[];
               (.market | type == "string" and . == $m.market)
               and (.dataset | type == "string" and . == $m.dataset)
+              and (.object_prefix | type == "string")
               and (.data_uri | type == "string")
               and (.manifest_uri | type == "string")
               and (.success_uri | type == "string")
@@ -1497,6 +1498,7 @@ monday_validate_v2_gate() {
                 and ($success.prefix == $data.prefix)
                 and ($manifest.file == ($data.file + ".manifest.json"))
                 and ($success.file == ($data.file + "._SUCCESS"))
+                and (.object_prefix == $data.prefix)
                 and ($manifest_uri == ($data_uri + ".manifest.json"))
                 and ($success_uri == ($data_uri + "._SUCCESS"))
               )
@@ -1521,7 +1523,7 @@ monday_validate_v2_gate() {
             and (.samples | type == "number" and . >= 1)
             and .session_id == $m.session_id)))' \
     "$gate" >/dev/null || return 1
-  while IFS=$'\t' read -r market dataset expected_bucket expected_prefix data_uri manifest_uri success_uri; do
+  while IFS=$'\t' read -r market dataset expected_bucket expected_prefix object_prefix data_uri manifest_uri success_uri; do
     [[ $market == spot || $market == usdm ]] || return 1
     monday_validate_oss_prefix "$market" "$dataset" "$expected_prefix" || return 1
     monday_validate_lob_object_uri "$market" "$dataset" "$expected_bucket" "$data_uri" data || return 1
@@ -1534,6 +1536,7 @@ monday_validate_v2_gate() {
     success_prefix=${success_uri#"oss://$expected_bucket/"}
     success_prefix=${success_prefix%/*}
     [[ $data_prefix == "$expected_prefix"/* \
+      && $object_prefix == "$data_prefix" \
       && $manifest_prefix == "$data_prefix" \
       && $success_prefix == "$data_prefix" \
       && $manifest_uri == "$data_uri.manifest.json" \
@@ -1541,7 +1544,7 @@ monday_validate_v2_gate() {
   done < <(jq -r '.markets | to_entries[] | .value as $value
     | $value.triplets[]
     | [$value.market, $value.dataset, $value.expected_oss_bucket, $value.expected_oss_prefix,
-       .data_uri, .manifest_uri, .success_uri] | @tsv' "$gate")
+       .object_prefix, .data_uri, .manifest_uri, .success_uri] | @tsv' "$gate")
   observed_now_ns=$(date +%s%N) || return 1
   [[ $observed_now_ns =~ ^[0-9]+$ ]] || return 1
   while IFS=$'\t' read -r market observed_at observed_at_ns market_observed_at_ns; do
