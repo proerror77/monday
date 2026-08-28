@@ -26,6 +26,7 @@ validate_archive() {
   list=$(mktemp)
   tar -tf "$archive" >"$list" || { rm -f "$list"; return 1; }
   [[ -s $list ]] || { rm -f "$list"; return 1; }
+  [[ -z $(sort "$list" | uniq -d) ]] || { rm -f "$list"; return 1; }
   while IFS= read -r entry; do
     [[ $entry =~ ^[A-Za-z0-9][A-Za-z0-9._@+-]*$ ]] || {
       invalid=true
@@ -93,7 +94,7 @@ install_payload_release() {
 publish_controller_release() (
   [[ $# -ge 3 && $# -le 4 ]] || { usage; return 2; }
   local artifact=$1 bundle=$2 manifest=$3 root=${4:-${MONDAY_ROOT:-/}}
-  local artifact_sha artifact_uri bundle_sha bundle_uri source runtime manifest_sha release work extracted list asset mode
+  local artifact_sha artifact_uri bundle_sha bundle_uri source runtime manifest_sha release work extracted list asset mode expected_assets
   configure "$root"
   # shellcheck disable=SC1091
   . "$(dirname -- "$0")/rust-lob-control-plane-lib.sh"
@@ -108,14 +109,23 @@ publish_controller_release() (
   source=$(monday_manifest_field "$manifest" deployment_source_revision)
   runtime=$(monday_manifest_field "$manifest" runtime_contract_sha256)
   [[ $(sha256_file "$bundle") == "$bundle_sha" ]] || die 'deployment bundle digest mismatch'
-  direct_directory "$ARTIFACT_ROOT" || { mkdir -p "$ARTIFACT_ROOT"; direct_directory "$ARTIFACT_ROOT"; }
-  direct_directory "$CONTROLLER_ROOT" || mkdir -p "$CONTROLLER_ROOT"
+  if ! direct_directory "$ARTIFACT_ROOT"; then
+    mkdir -p "$ARTIFACT_ROOT"
+    direct_directory "$ARTIFACT_ROOT" || die 'payload release root is not a direct directory'
+  fi
+  if ! direct_directory "$CONTROLLER_ROOT"; then
+    mkdir -p "$CONTROLLER_ROOT"
+    direct_directory "$CONTROLLER_ROOT" || die 'controller release root is not a direct directory'
+  fi
   manifest_sha=$(sha256_file "$manifest")
   release="$CONTROLLER_ROOT/$manifest_sha"
   work=$(mktemp -d); extracted="$work/deployment"
   list=$(validate_archive "$bundle") || die 'deployment bundle contains an unsafe member'
   trap 'rm -rf "${work:-}"' EXIT
   extract_archive "$bundle" "$extracted" "$list" || die 'deployment bundle contains a non-regular member'
+  expected_assets=$(printf '%s\n' "$(monday_runtime_assets)" "$(monday_controller_assets)" | sort -u)
+  cmp -s <(sort "$list") <(printf '%s\n' "$expected_assets") \
+    || die 'deployment bundle contains an unexpected or missing asset'
   for asset in $(monday_runtime_assets) $(monday_controller_assets); do
     regular_file "$extracted/$asset" || die "deployment bundle is missing $asset"
   done

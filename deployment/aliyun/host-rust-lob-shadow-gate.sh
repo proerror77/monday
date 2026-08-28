@@ -59,6 +59,7 @@ CANDIDATE_CONTROLLER=$(printf '%s' "$CANDIDATE_CONTROLLER" | tr '[:upper:]' '[:l
 [[ $CANDIDATE_CONTROLLER =~ ^[a-f0-9]{64}$ ]] ||
   die 'candidate controller must be a 64-character SHA-256'
 TEST_ONLY=false; [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 ]] && TEST_ONLY=true
+[[ $TEST_ONLY == false || $ROOT != / ]] || die 'test mode requires an isolated fixture root'
 
 GATE_DURATION_SECONDS=$REQUIRED_DURATION_SECONDS
 HEALTH_SETTLE_DURATION_SECONDS=$HEALTH_SETTLE_SECONDS
@@ -93,6 +94,16 @@ LIB_SOURCE="$SCRIPT_DIR/rust-lob-control-plane-lib.sh"; POLICY_SOURCE="$SCRIPT_D
 [[ -f $LIB_SOURCE && -f $POLICY_SOURCE ]] || die 'V2 control-plane assets are missing'
 # shellcheck disable=SC1090
 . "$LIB_SOURCE"
+
+# Hold the release lock before reading candidate, active, or production
+# identities.  The fixture skips flock but still exercises the same ordering.
+mkdir -p "$(dirname -- "$LOCK_FILE")"
+if [[ $TEST_ONLY == true ]]; then
+  true
+else
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || die 'another collector control-plane action is running'
+fi
 
 for command in awk bash chmod cmp cp date dirname find grep install jq mkdir mktemp mv readlink rm sed sha256sum sleep sort stat tr wc zstd; do
   command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
@@ -151,7 +162,8 @@ if [[ $TEST_ONLY == true ]]; then
       ls)
         for object in "${spool_dir[$OSS_FIXTURE_MARKET]}"/*.manifest.json; do
           [[ -f $object ]] || continue
-          printf 'oss://fixture/%s/%s\n' "$OSS_FIXTURE_MARKET" "${object##*/}"
+          printf 'oss://fixture/lake/raw/venue=binance/market=%s/dataset=%s/shard=all/%s\n' \
+            "$OSS_FIXTURE_MARKET" "${dataset[$OSS_FIXTURE_MARKET]}" "${object##*/}"
         done
         ;;
       cp)
@@ -223,8 +235,16 @@ candidate_bundle=$(monday_manifest_field "$candidate_manifest" deployment_bundle
 candidate_source=$(monday_manifest_field "$candidate_manifest" deployment_source_revision)
 candidate_payload_dir="$RELEASE_ROOT/$candidate_payload"; candidate_binary="$candidate_payload_dir/binance-lob-archiver"
 secure_file "$candidate_binary"; [[ -x $candidate_binary && $(sha256_file "$candidate_binary") == "$candidate_payload" ]] || die 'candidate payload identity failed'
+candidate_control_bytes_sha=$(sha256_file "$candidate_release/deployment.sha256")
+candidate_control_assets='{}'
+while IFS= read -r control_asset; do
+  [[ -n $control_asset ]] || continue
+  control_sha=$(sha256_file "$candidate_deployment/$control_asset")
+  candidate_control_assets=$(jq -cn --argjson values "$candidate_control_assets" \
+    --arg asset "$control_asset" --arg sha "$control_sha" '$values + {($asset):$sha}')
+done < <(monday_controller_assets)
 
-active_before=direct; before_payload=; before_runtime=; before_bundle=; before_source=; before_deployment=
+active_before=direct; before_payload=; before_runtime=; before_bundle=; before_source=; before_deployment=; before_production_projection=
 if [[ $FROM_CONTROLLER != direct ]]; then
   active_before=$(monday_active_controller_sha "$ROOT") || die 'requested before controller is not active'
   [[ $active_before == "$FROM_CONTROLLER" ]] || die 'active pair differs from requested before controller'
@@ -234,7 +254,9 @@ if [[ $FROM_CONTROLLER != direct ]]; then
   before_runtime=$(monday_manifest_field "$before_release/release.json" runtime_contract_sha256)
   before_bundle=$(monday_manifest_field "$before_release/release.json" deployment_bundle_sha256)
   before_source=$(monday_manifest_field "$before_release/release.json" deployment_source_revision)
-  [[ $(readlink -f -- "$PRODUCTION_BINARY") == "$RELEASE_ROOT/$before_payload/binance-lob-archiver" ]] || die 'production binary is not bound to before pair'
+  [[ -L $PRODUCTION_BINARY && $(readlink -- "$PRODUCTION_BINARY") == "$CONTROLLER_ROOT/active/binance-lob-archiver" ]] \
+    || die 'production binary is not the stable active projection'
+  before_production_projection="$CONTROLLER_ROOT/active/binance-lob-archiver"
 else
   [[ ! -L $CONTROLLER_ROOT/active ]] || die 'direct bootstrap requires no active V2 controller'
   before_deployment=$candidate_deployment
@@ -243,6 +265,7 @@ else
   [[ $before_payload == "$candidate_payload" ]] || die 'direct bootstrap requires P0 equal to P1'
   before_runtime=$candidate_runtime; before_bundle=$candidate_bundle; before_source=$candidate_source
   if [[ $TEST_ONLY != true ]]; then [[ -L $PRODUCTION_BINARY && $(readlink -f -- "$PRODUCTION_BINARY") == "$candidate_binary" ]] || die 'direct production identity differs'; fi
+  before_production_projection=$(readlink -- "$PRODUCTION_BINARY")
 fi
 
 production_asset_json='{}'
@@ -265,9 +288,14 @@ for asset in "${SHADOW_ASSETS[@]}"; do
     die "shadow asset path is a symlink: ${installed_asset[$asset]}"
   else saved_state[$asset]=absent; saved_sha[$asset]=; fi
 done
-old_shadow_target=; old_shadow_present=false
+old_shadow_target=; old_shadow_target_sha256=; old_shadow_present=false
 if [[ -L $SHADOW_BINARY ]]; then old_shadow_target=$(readlink -- "$SHADOW_BINARY"); old_shadow_present=true
 elif [[ -e $SHADOW_BINARY ]]; then die 'shadow binary path is not a symlink'; fi
+if [[ $old_shadow_present == true ]]; then
+  old_shadow_target_resolved=$(readlink -f -- "$SHADOW_BINARY") || die 'existing shadow binary link is dangling'
+  secure_file "$old_shadow_target_resolved"
+  old_shadow_target_sha256=$(sha256_file "$old_shadow_target_resolved")
+fi
 
 install_shadow_assets() {
   local deployment=$1 asset target
@@ -289,14 +317,9 @@ restore_shadow_assets() {
 }
 restore_shadow_link() { if [[ $old_shadow_present == true ]]; then monday_atomic_symlink "$old_shadow_target" "$SHADOW_BINARY"; else rm -f -- "$SHADOW_BINARY"; fi; }
 
-mkdir -p "$(dirname -- "$LOCK_FILE")"
-if [[ $TEST_ONLY == true ]]; then
-  true
-else
-  exec 9>"$LOCK_FILE"; flock -n 9 || die 'another collector control-plane action is running'
-fi
-declare -A market_env spool_dir dataset symbols unit override_file
+declare -A market_env spool_dir dataset symbols unit override_file expected_oss_prefix
 declare -A oss_bucket oss_endpoint oss_region aliyun_profile
+declare -A phase_segments_json phase_triplets_json phase_health_json
 markets=(spot usdm)
 for market in "${markets[@]}"; do
   market_env[$market]="$candidate_deployment/binance-lob-archiver-rust-${market}.env"
@@ -319,6 +342,11 @@ if [[ $TEST_ONLY != true ]]; then
     [[ -n ${oss_bucket[$market]} && -n ${oss_endpoint[$market]} && -n ${aliyun_profile[$market]} ]] || die "$market OSS identity is incomplete"
   done
 fi
+for market in "${markets[@]}"; do
+  phase_segments_json[$market]='[]'
+  phase_triplets_json[$market]='[]'
+  phase_health_json[$market]='{}'
+done
 
 host_memory_total=$(meminfo_bytes MemTotal) || die 'MemTotal is unavailable'; host_memory_available=$(meminfo_bytes MemAvailable) || die 'MemAvailable is unavailable'; host_swap_total=$(meminfo_bytes SwapTotal) || die 'SwapTotal is unavailable'
 declare -A production_growth; production_memory_json='{}'
@@ -348,6 +376,7 @@ else production_growth[spot]=0; production_growth[usdm]=0; production_process_js
 resource_samples='[]'; psi_windows='[]'
 record_resource() {
   local phase=$1 phase_max=$2 required sample
+  host_memory_available=$(meminfo_bytes MemAvailable) || die 'MemAvailable became unavailable during Gate'
   required=$(monday_shadow_memory_admission "$host_memory_available" "$HOST_MEMORY_RESERVE_BYTES" "$phase_max" "${production_growth[spot]}" "${production_growth[usdm]}") || die "insufficient memory for $phase"
   sample=$(jq -cn --arg phase "$phase" --argjson available "$host_memory_available" --argjson required "$required" --argjson phase_max "$phase_max" '{phase:$phase,host_memory_available_bytes:$available,required_bytes:$required,phase_memory_max_bytes:$phase_max}')
   resource_samples=$(jq -cn --argjson values "$resource_samples" --argjson value "$sample" '$values + [$value]')
@@ -534,10 +563,12 @@ validate_observation_sample() {
   health_samples[$market]=$((health_samples[$market] + increment))
 }
 verify_segments() {
-  local market=$1 dir="${spool_dir[$1]}" path file digest manifest_digest count=0 previous_end=0 start end
+  local market=$1 dir="${spool_dir[$1]}" path file digest manifest_digest success_digest expected_success count=0 previous_end=0 start end segment_json
   local -a segment_records=()
+  phase_segments_json[$market]='[]'
   while IFS= read -r path; do
-    file=${path##*/}; digest=$(sha256_file "$path"); [[ $(sed -n '1p' "$path._SUCCESS") == "$digest" ]] || die "$market _SUCCESS digest mismatch"
+    file=${path##*/}; digest=$(sha256_file "$path"); expected_success="$tmp_dir/$market-$file.expected-success"; printf '%s\n' "$digest" >"$expected_success"; cmp -s "$path._SUCCESS" "$expected_success" || die "$market _SUCCESS digest mismatch"
+    success_digest=$(sha256_file "$path._SUCCESS")
     manifest_digest=$(sha256_file "$path.manifest.json")
     jq -e --arg market "$market" --arg digest "$digest" --arg session "${phase_session[$market]}" \
       '.schema == "binance.market_tape.v2" and .market == $market and .sha256 == $digest
@@ -546,6 +577,14 @@ verify_segments() {
        and .lob_continuity.capture_session_id == $session' \
       "$path.manifest.json" >/dev/null || die "$market manifest failed strict checks"
     start=$(jq -er '.start_received_at_ns' "$path.manifest.json"); end=$(jq -er '.end_received_at_ns' "$path.manifest.json"); ((previous_end == 0 || start >= previous_end)) || die "$market segments overlap"; ((previous_end == 0 || start-previous_end <= MAX_SEGMENT_GAP_NS)) || die "$market segment gap is too large"; previous_end=$end; count=$((count+1))
+    segment_json=$(jq -cn --arg file "$file" --arg path "$path" --arg data_sha "$digest" \
+      --arg manifest_sha "$manifest_digest" --arg success_sha "$success_digest" \
+      --argjson start "$start" --argjson end "$end" --arg session "${phase_session[$market]}" \
+      '{file:$file,path:$path,data_sha256:$data_sha,manifest_sha256:$manifest_sha,
+        success_sha256:$success_sha,start_received_at_ns:$start,end_received_at_ns:$end,
+        session_id:$session}')
+    phase_segments_json[$market]=$(jq -cn --argjson values "${phase_segments_json[$market]}" \
+      --argjson value "$segment_json" '$values + [$value]')
     segment_records+=("$path" "$digest" "$manifest_digest")
   done < <(find "$dir" -maxdepth 1 -type f -name '*.jsonl.zst' | sort)
   ((count >= 2)) || die "$market has fewer than two complete segments"
@@ -573,8 +612,14 @@ run_market_gate_phase() {
   fi
   settle=$(( $(monotonic_seconds) + HEALTH_SETTLE_DURATION_SECONDS )); while ! health_ok "$market"; do (( $(monotonic_seconds) < settle )) || die "$market health did not settle"; [[ $(systemctl_value "$market" NRestarts) == 0 ]] || die "$market restarted while settling"; [[ $(systemctl_value "$market" MainPID) == "$pid" ]] || die "$market MainPID changed while settling"; assert_host_memory_reserve; sleep 1; done
   phase_session["$market"]=$(jq -er '.session_id' "${spool_dir[$market]}/health.json"); frozen_symbol_count[$market]=$(jq -er '.symbol_count' "${spool_dir[$market]}/health.json"); frozen_catalog_sha256[$market]=$(health_catalog_sha256 "$market"); initial_upload_failure_count[$market]=$(jq -er '.upload_failure_count' "${spool_dir[$market]}/health.json"); last_health_updated_ns[$market]=$(jq -er '.updated_at_ns' "${spool_dir[$market]}/health.json"); last_health_advance_mono[$market]=$(monotonic_seconds); max_health_silence_seconds[$market]=0; health_samples[$market]=1; market_observation_started_ns[$market]=$(date +%s%N)
+  phase_health_json[$market]=$(jq -cn --arg sha "$(sha256_file "${spool_dir[$market]}/health.json")" \
+    --arg session "${phase_session[$market]}" --argjson symbols "${frozen_symbol_count[$market]}" \
+    --arg catalog "${frozen_catalog_sha256[$market]}" --argjson silence "${max_health_silence_seconds[$market]}" \
+    --argjson samples "${health_samples[$market]}" \
+    '{sha256:$sha,session_id:$session,frozen_symbol_count:$symbols,
+      frozen_catalog_sha256:$catalog,max_health_silence_seconds:$silence,samples:$samples}')
   observation=$(( $(monotonic_seconds) + GATE_DURATION_SECONDS )); while (( $(monotonic_seconds) < observation )); do validate_observation_sample "$market"; assert_host_memory_reserve; [[ $(systemctl_value "$market" NRestarts) == 0 ]] || die "$market restarted"; [[ $(systemctl_value "$market" MainPID) == "$pid" ]] || die "$market MainPID changed"; [[ $TEST_ONLY == true ]] && break; sleep 15; done
-  phase_runtime["$market"]=$GATE_DURATION_SECONDS; systemctl stop "${unit[$market]}"; systemctl_active "${unit[$market]}" && die "$market shadow remained active"; verify_segments "$market"
+  phase_runtime["$market"]=$GATE_DURATION_SECONDS; systemctl stop "${unit[$market]}"; systemctl_active "${unit[$market]}" && die "$market shadow remained active"; verify_segments "$market"; calibrate_psi "shadow-$market-tail"
 }
 run_candidate_drain() { local market=$1; [[ $TEST_ONLY == true ]] && return 0; systemd-run --quiet --wait --collect --unit="monday-rust-upload-drain-$$-$market.service" --property=MemoryMax="$((UPLOAD_DRAIN_MEMORY_MAX_BYTES / 1048576))M" --property=MemoryHigh=384M --uid="$SERVICE_USER" -- "$candidate_binary" --upload-only; }
 assert_spool_drained() {
@@ -597,9 +642,10 @@ run_oss() {
   fi
 }
 verify_oss_roundtrips() {
-  local market=$1 readback="$tmp_dir/oss-$1" listing="$tmp_dir/oss-$1.list" uri manifest final_manifest data success file digest manifest_digest line token replay_safe
+  local market=$1 readback="$tmp_dir/oss-$1" listing="$tmp_dir/oss-$1.list" uri manifest final_manifest data success expected_success file digest manifest_digest success_digest line token replay_safe triplet_json observed_at
   local candidates_file unsafe_file
   local start end previous_end=0 count=0; local -a roundtrip_records=(); mkdir -p "$readback"
+  phase_triplets_json[$market]='[]'
   candidates_file="$readback/replay-safe.tsv"; unsafe_file="$readback/replay-unsafe.tsv"
   : >"$candidates_file"; : >"$unsafe_file"
   local prefix
@@ -608,6 +654,12 @@ verify_oss_roundtrips() {
   else
     prefix="oss://${oss_bucket[$market]}/lake/raw/venue=binance/market=$market/dataset=${dataset[$market]}/shard=$(env_value "${market_env[$market]}" SHARD_ID)/"
   fi
+  if [[ $TEST_ONLY == true ]]; then
+    expected_oss_prefix[$market]=${prefix#oss://fixture/}
+  else
+    expected_oss_prefix[$market]=${prefix#oss://"${oss_bucket[$market]}"/}
+  fi
+  expected_oss_prefix[$market]=${expected_oss_prefix[$market]%/}
   run_oss "$market" ls "$prefix" --recursive --short-format >"$listing"
   : >"$readback/manifest-uris"
   while IFS= read -r line; do
@@ -653,7 +705,23 @@ verify_oss_roundtrips() {
     run_oss "$market" cp "$uri" "$final_manifest" --force --no-progress >/dev/null
     [[ $(sha256_file "$final_manifest") == "$manifest_digest" ]] || die "$market OSS manifest changed between reads"
     run_oss "$market" cp "${uri%/*}/$file" "$data" --force --no-progress >/dev/null; run_oss "$market" cp "${uri%/*}/$file._SUCCESS" "$success" --force --no-progress >/dev/null
-    [[ $(sha256_file "$data") == "$digest" ]] || die "$market OSS data digest mismatch"; [[ $(sed -n '1p' "$success") == "$digest" ]] || die "$market OSS success marker mismatch"
+    expected_success="$readback/$file.expected-success"; printf '%s\n' "$digest" >"$expected_success"; [[ $(sha256_file "$data") == "$digest" ]] || die "$market OSS data digest mismatch"; cmp -s "$success" "$expected_success" || die "$market OSS success marker mismatch"
+    success_digest=$(sha256_file "$success")
+    observed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    triplet_json=$(jq -cn --arg market "$market" --arg dataset "${dataset[$market]}" \
+      --arg data_uri "${uri%/*}/$file" --arg manifest_uri "$uri" \
+      --arg success_uri "${uri%/*}/$file._SUCCESS" --arg data_sha "$digest" \
+      --arg manifest_sha "$manifest_digest" --arg success_sha "$success_digest" \
+      --arg prefix "${uri%/*}" --arg observed "$observed_at" \
+      --arg session "${phase_session[$market]}" --arg catalog "${frozen_catalog_sha256[$market]}" \
+      --argjson start "$start" --argjson end "$end" \
+      '{market:$market,dataset:$dataset,data_uri:$data_uri,manifest_uri:$manifest_uri,success_uri:$success_uri,
+        data_sha256:$data_sha,manifest_sha256:$manifest_sha,success_sha256:$success_sha,
+        success_content:($data_sha + "\n"),object_prefix:$prefix,observed_at:$observed,
+        start_received_at_ns:$start,end_received_at_ns:$end,session_id:$session,
+        catalog_sha256:$catalog}')
+    phase_triplets_json[$market]=$(jq -cn --argjson values "${phase_triplets_json[$market]}" \
+      --argjson value "$triplet_json" '$values + [$value]')
     roundtrip_records+=("$data" "$digest" "$manifest_digest")
     count=$((count + 1))
   done <"$readback/manifest-uris"
@@ -672,11 +740,26 @@ for market in "${markets[@]}"; do run_market_gate_phase "$market"; run_candidate
 for market in "${markets[@]}"; do verify_oss_roundtrips "$market"; done
 for market in "${markets[@]}"; do systemctl stop "${unit[$market]}" >/dev/null 2>&1 || true; done
 restore_shadow_assets || die 'before shadow assets could not be restored'; restore_shadow_link || die 'before shadow link could not be restored'
-if [[ $FROM_CONTROLLER != direct ]]; then [[ $(monday_active_controller_sha "$ROOT") == "$FROM_CONTROLLER" ]] || die 'active controller changed during Gate'; [[ $(readlink -f -- "$PRODUCTION_BINARY") == "$RELEASE_ROOT/$before_payload/binance-lob-archiver" ]] || die 'production identity changed during Gate'
+if [[ $FROM_CONTROLLER != direct ]]; then [[ $(monday_active_controller_sha "$ROOT") == "$FROM_CONTROLLER" ]] || die 'active controller changed during Gate'; [[ -L $PRODUCTION_BINARY && $(readlink -- "$PRODUCTION_BINARY") == "$CONTROLLER_ROOT/active/binance-lob-archiver" ]] || die 'production identity changed during Gate'
 else [[ $TEST_ONLY == true || $(readlink -f -- "$PRODUCTION_BINARY") == "$candidate_binary" ]] || die 'direct production identity changed during Gate'; fi
 if [[ $old_shadow_present == true ]]; then [[ $(readlink -- "$SHADOW_BINARY") == "$old_shadow_target" ]] || die 'shadow link was not restored'; else [[ ! -e $SHADOW_BINARY && ! -L $SHADOW_BINARY ]] || die 'shadow link was not removed'; fi
+final_payload=$(monday_manifest_field "$candidate_manifest" artifact_sha256) || die 'candidate payload identity disappeared during Gate'
+final_runtime=$(monday_manifest_field "$candidate_manifest" runtime_contract_sha256) || die 'candidate runtime identity disappeared during Gate'
+[[ $final_payload == "$candidate_payload" && $final_runtime == "$candidate_runtime" ]] \
+  || die 'candidate C/P/R changed during Gate'
+monday_verify_controller_release "$ROOT" "$CANDIDATE_CONTROLLER" \
+  || die 'candidate controller failed final identity verification'
+[[ $(sha256_file "$candidate_binary") == "$candidate_payload" ]] \
+  || die 'candidate payload changed during Gate'
+[[ $(sha256_file "$candidate_release/deployment.sha256") == "$candidate_control_bytes_sha" ]] \
+  || die 'candidate control bytes changed during Gate'
+if [[ $old_shadow_present == true ]]; then
+  restored_target=$(readlink -f -- "$SHADOW_BINARY") || die 'restored shadow link is unresolved'
+  [[ $(sha256_file "$restored_target") == "$old_shadow_target_sha256" ]] \
+    || die 'restored shadow binary bytes changed during Gate'
+fi
 
-checks=$(jq -cn '{before_pair_unchanged:true,shadow_staging_verified:true,shadow_assets_restored:true,resource_preflight:true,oss_triplets:true,strict_segment_verifier:true,final_identity:true}')
+checks=$(jq -cn '{before_pair_unchanged:true,shadow_staging_verified:true,shadow_assets_restored:true,resource_preflight:true,oss_triplets:true,strict_segment_verifier:true,final_identity:true,controller_control_bytes:true,shadow_link_restored:true,health_freshness:true}')
 before_assets_json='{}'; staged_assets_json='{}'; restored_assets_json='{}'
 for asset in "${SHADOW_ASSETS[@]}"; do
   before_assets_json=$(jq -cn --argjson values "$before_assets_json" --arg asset "$asset" \
@@ -692,12 +775,39 @@ done
 markets_json='{}'
 for market in "${markets[@]}"; do
   health_sha=$(sha256_file "${spool_dir[$market]}/health.json")
-  market_json=$(jq -cn --arg market "$market" --arg unit "${unit[$market]}" --arg dataset "${dataset[$market]}" --arg session "${phase_session[$market]}" --argjson pid "${phase_pid[$market]}" --arg exe "${phase_exe_sha[$market]}" --argjson runtime "${phase_runtime[$market]}" --argjson segments "${phase_segments[$market]}" --argjson oss "${phase_oss[$market]}" --arg health "$health_sha" --argjson strict_lob "${phase_strict_lob[$market]:-false}" --argjson strict_aggregate "${phase_strict_aggregate[$market]:-false}" --argjson strict_raw "${phase_strict_raw[$market]:-false}" '{market:$market,unit:$unit,dataset:$dataset,session_id:$session,main_pid:$pid,process_exe_sha256:$exe,n_restarts:0,observed_runtime_seconds:$runtime,segment_count:$segments,oss_triplet_count:$oss,health_sha256:$health,process_identity_verified:true,installed_shadow_assets_verified:true,strict_lob_continuity_readback:$strict_lob,strict_aggregate_trade_continuity_readback:$strict_aggregate,strict_raw_trade_continuity_readback:$strict_raw}')
+  receipt_bucket=${oss_bucket[$market]}
+  [[ $TEST_ONLY == true ]] && receipt_bucket=fixture
+  phase_health_json[$market]=$(jq -cn --argjson value "${phase_health_json[$market]}" \
+    --argjson silence "${max_health_silence_seconds[$market]}" \
+    --argjson samples "${health_samples[$market]}" \
+    '$value | .max_health_silence_seconds=$silence | .samples=$samples')
+  market_json=$(jq -cn --arg market "$market" --arg unit "${unit[$market]}" \
+    --arg dataset "${dataset[$market]}" --arg session "${phase_session[$market]}" \
+    --arg bucket "$receipt_bucket" --arg prefix "${expected_oss_prefix[$market]}" \
+    --argjson pid "${phase_pid[$market]}" --arg exe "${phase_exe_sha[$market]}" \
+    --argjson runtime "${phase_runtime[$market]}" --argjson segments "${phase_segments[$market]}" \
+    --argjson oss "${phase_oss[$market]}" --arg health "$health_sha" \
+    --argjson segment_evidence "${phase_segments_json[$market]}" \
+    --argjson triplet_evidence "${phase_triplets_json[$market]}" \
+    --argjson health_evidence "${phase_health_json[$market]}" \
+    --argjson strict_lob "${phase_strict_lob[$market]:-false}" \
+    --argjson strict_aggregate "${phase_strict_aggregate[$market]:-false}" \
+    --argjson strict_raw "${phase_strict_raw[$market]:-false}" \
+    '{market:$market,unit:$unit,dataset:$dataset,session_id:$session,main_pid:$pid,
+      process_exe_sha256:$exe,n_restarts:0,observed_runtime_seconds:$runtime,
+      segment_count:$segments,oss_triplet_count:$oss,health_sha256:$health,
+      expected_oss_bucket:$bucket,expected_oss_prefix:$prefix,segments:$segment_evidence,
+      triplets:$triplet_evidence,health:$health_evidence,
+      process_identity_verified:true,installed_shadow_assets_verified:true,
+      strict_lob_continuity_readback:$strict_lob,
+      strict_aggregate_trade_continuity_readback:$strict_aggregate,
+      strict_raw_trade_continuity_readback:$strict_raw}')
   markets_json=$(jq -cn --argjson values "$markets_json" --arg market "$market" --argjson value "$market_json" '$values + {($market):$value}')
 done
 gate_finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ); production_eligible=true; [[ $TEST_ONLY == true ]] && production_eligible=false
-jq -cn --arg schema monday.rust_lob_shadow_gate.v5 --arg from "$FROM_CONTROLLER" --arg after "$CANDIDATE_CONTROLLER" --arg candidate "$CANDIDATE_CONTROLLER" --arg payload "$candidate_payload" --arg runtime "$candidate_runtime" --arg bundle "$candidate_bundle" --arg source "$candidate_source" --arg before_payload "$before_payload" --arg before_runtime "$before_runtime" --arg before_bundle "$before_bundle" --arg before_source "$before_source" --arg run "$run_id" --arg spool "$run_spool" --arg started "$gate_started_at" --arg finished "$gate_finished_at" --argjson host_total "$host_memory_total" --argjson host_swap "$host_swap_total" --argjson production_memory "$production_memory_json" --argjson production_process "$production_process_json" --argjson production_assets "$production_asset_json" --argjson resources "$resource_samples" --argjson psi "$psi_windows" --argjson checks "$checks" --argjson markets "$markets_json" --argjson eligible "$production_eligible" --argjson test_only "$TEST_ONLY" --argjson before_assets "$before_assets_json" --argjson staged_assets "$staged_assets_json" --argjson restored_assets "$restored_assets_json" --arg shadow_binary "$SHADOW_BINARY" --arg candidate_binary "$candidate_binary" --arg old_shadow_target "$old_shadow_target" --argjson old_shadow_present "$old_shadow_present" \
-  '{schema:$schema,control_plane_version:2,passed:true,production_eligible:$eligible,test_only:$test_only,transition:{before:$from,after:$after,topology:(if $from == "direct" then "direct-bootstrap" else "stable" end)},candidate_controller_sha256:$candidate,candidate_payload_sha256:$payload,candidate_runtime_contract_sha256:$runtime,candidate_deployment_bundle_sha256:$bundle,candidate_deployment_source_revision:$source,before:{controller:$from,payload_sha256:$before_payload,runtime_contract_sha256:$before_runtime,deployment_bundle_sha256:$before_bundle,deployment_source_revision:$before_source},run_id:$run,run_spool:$spool,started_at:$started,finished_at:$finished,required_duration_seconds:240,health_settle_seconds:240,segment_seconds:120,host_memory_total_bytes:$host_total,host_swap_total_bytes:$host_swap,production_memory:$production_memory,production_process:$production_process,production_assets:$production_assets,resource_admission:$resources,io_full_psi_windows:$psi,shadow_staging:{candidate_assets:$staged_assets,restored_assets:$restored_assets,before_assets:$before_assets,binary:{path:$shadow_binary,candidate_target:$candidate_binary,restored_target:(if $old_shadow_present then $old_shadow_target else null end),restored_present:$old_shadow_present}},checks:$checks,markets:$markets}' >"$gate_json.tmp"
-chmod 0640 "$gate_json.tmp"; [[ ! -e $gate_json ]] || die 'gate receipt already exists'; mv -f -- "$gate_json.tmp" "$gate_json"; jq -e -f "$POLICY_SOURCE" "$gate_json" >/dev/null || die 'V2 Gate policy rejected the receipt'
+jq -cn --arg schema monday.rust_lob_shadow_gate.v5 --arg from "$FROM_CONTROLLER" --arg after "$CANDIDATE_CONTROLLER" --arg candidate "$CANDIDATE_CONTROLLER" --arg payload "$candidate_payload" --arg runtime "$candidate_runtime" --arg bundle "$candidate_bundle" --arg source "$candidate_source" --arg before_payload "$before_payload" --arg before_runtime "$before_runtime" --arg before_bundle "$before_bundle" --arg before_source "$before_source" --arg before_projection "$before_production_projection" --arg control_sha "$candidate_control_bytes_sha" --argjson control_assets "$candidate_control_assets" --arg run "$run_id" --arg spool "$run_spool" --arg started "$gate_started_at" --arg finished "$gate_finished_at" --argjson host_total "$host_memory_total" --argjson host_swap "$host_swap_total" --argjson production_memory "$production_memory_json" --argjson production_process "$production_process_json" --argjson production_assets "$production_asset_json" --argjson resources "$resource_samples" --argjson psi "$psi_windows" --argjson checks "$checks" --argjson markets "$markets_json" --argjson eligible "$production_eligible" --argjson test_only "$TEST_ONLY" --argjson before_assets "$before_assets_json" --argjson staged_assets "$staged_assets_json" --argjson restored_assets "$restored_assets_json" --arg shadow_binary "$SHADOW_BINARY" --arg candidate_binary "$candidate_binary" --arg old_shadow_target "$old_shadow_target" --arg old_shadow_target_sha "$old_shadow_target_sha256" --argjson old_shadow_present "$old_shadow_present" \
+  '{schema:$schema,control_plane_version:2,passed:true,production_eligible:$eligible,test_only:$test_only,transition:{before:$from,after:$after,topology:(if $from == "direct" then "direct-bootstrap" else "stable" end)},candidate_controller_sha256:$candidate,candidate_payload_sha256:$payload,candidate_runtime_contract_sha256:$runtime,candidate_deployment_bundle_sha256:$bundle,candidate_deployment_source_revision:$source,candidate_control_bytes:{sha256:$control_sha,assets:$control_assets},before:{controller:$from,payload_sha256:$before_payload,runtime_contract_sha256:$before_runtime,deployment_bundle_sha256:$before_bundle,deployment_source_revision:$before_source,production_projection:$before_projection,production_assets:$production_assets},run_id:$run,run_spool:$spool,started_at:$started,finished_at:$finished,required_duration_seconds:240,health_settle_seconds:240,segment_seconds:120,host_memory_total_bytes:$host_total,host_swap_total_bytes:$host_swap,production_memory:$production_memory,production_process:$production_process,production_assets:$production_assets,resource_admission:$resources,io_full_psi_windows:$psi,shadow_staging:{candidate_assets:$staged_assets,restored_assets:$restored_assets,before_assets:$before_assets,binary:{path:$shadow_binary,candidate_target:$candidate_binary,restored_target:(if $old_shadow_present then $old_shadow_target else null end),restored_target_sha256:(if $old_shadow_present then $old_shadow_target_sha else null end),restored_present:$old_shadow_present}},checks:$checks,markets:$markets}' >"$gate_json.tmp"
+chmod 0640 "$gate_json.tmp"; [[ ! -e $gate_json ]] || die 'gate receipt already exists'; mv -f -- "$gate_json.tmp" "$gate_json"
+if ! jq -e -f "$POLICY_SOURCE" "$gate_json" >/dev/null; then die 'V2 Gate policy rejected the receipt'; fi
 if [[ $production_eligible == true ]]; then gate_sha=$(sha256_file "$gate_json"); printf '%s  gate.json\n' "$gate_sha" >"$passed_marker.tmp"; chmod 0640 "$passed_marker.tmp"; mv -f -- "$passed_marker.tmp" "$passed_marker"; fi
 gate_finished=true; printf 'V2 Gate receipt: %s\nSHA-256: %s\n' "$gate_json" "$(sha256_file "$gate_json")"; [[ $production_eligible == true ]] && printf 'production shadow gate passed\n' || printf 'fixture Gate completed; not eligible for cutover\n'

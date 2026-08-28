@@ -55,4 +55,27 @@ if jq '.control_plane_version = 1' "$manifest" >"$ROOT/v1.json"; then
   fi
 fi
 
+duplicate_bundle="$ROOT/duplicate.tar"
+cp "$bundle" "$duplicate_bundle"
+COPYFILE_DISABLE=1 tar -C "$source_dir" -rf "$duplicate_bundle" "${assets[0]}"
+duplicate_sha=$(monday_sha256_file "$duplicate_bundle")
+jq --arg sha "$duplicate_sha" '.deployment_bundle_sha256 = $sha' "$manifest" >"$ROOT/duplicate.json"
+if publish_controller_release "$payload" "$duplicate_bundle" "$ROOT/duplicate.json" "$ROOT" \
+  >/dev/null 2>&1; then
+  printf 'accepted a duplicate-member deployment archive\n' >&2
+  exit 1
+fi
+
+printf 'unexpected controller payload\n' >"$source_dir/unexpected.txt"
+extra_bundle="$ROOT/extra.tar"
+cp "$bundle" "$extra_bundle"
+COPYFILE_DISABLE=1 tar -C "$source_dir" -rf "$extra_bundle" unexpected.txt
+extra_sha=$(monday_sha256_file "$extra_bundle")
+jq --arg sha "$extra_sha" '.deployment_bundle_sha256 = $sha' "$manifest" >"$ROOT/extra.json"
+if publish_controller_release "$payload" "$extra_bundle" "$ROOT/extra.json" "$ROOT" \
+  >/dev/null 2>&1; then
+  printf 'accepted an unexpected deployment archive member\n' >&2
+  exit 1
+fi
+
 printf 'controller V2 release contract passed\n'

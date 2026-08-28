@@ -94,9 +94,44 @@ if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$tampered" >/dev/null 
   exit 1
 fi
 
+# A hand-written v5-shaped summary is not authoritative: the validator and
+# policy must require the per-market triplet evidence rather than trusting the
+# advertised counts.
+fake="$ROOT/fake-v5.json"
+jq '.markets.spot.triplets = [] | .markets.usdm.triplets = []' "$gate" >"$fake"
+fake_sha=$(monday_sha256_file "$fake")
+if monday_validate_v2_gate "$fake" direct "$c0" "$fake_sha"; then
+  printf 'Gate validator accepted a summary-only v5 receipt\n' >&2
+  exit 1
+fi
+if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$fake" >/dev/null 2>&1; then
+  printf 'Gate policy accepted a summary-only v5 receipt\n' >&2
+  exit 1
+fi
+
+# Control-byte evidence is keyed to the exact controller asset set; a
+# same-sized map with an unexpected asset must not authorize a transition.
+fake="$ROOT/fake-control-assets.json"
+jq '.candidate_control_bytes.assets = {unexpected: ("0" * 64)}' "$gate" >"$fake"
+fake_sha=$(monday_sha256_file "$fake")
+if monday_validate_v2_gate "$fake" direct "$c0" "$fake_sha"; then
+  printf 'Gate validator accepted an unexpected control asset map\n' >&2
+  exit 1
+fi
+if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$fake" >/dev/null 2>&1; then
+  printf 'Gate policy accepted an unexpected control asset map\n' >&2
+  exit 1
+fi
+
 # A V2 before pair must be active and its payload may change.
 ln -s "$ROOT/opt/monday/releases/binance-lob-controller/$c0" \
   "$ROOT/opt/monday/releases/binance-lob-controller/active"
+# V2 operations require the permanent production projection to resolve through
+# the active controller.  Bootstrap above intentionally exercises the direct
+# topology; switch the fixture to the stable projection before the V2 Gate.
+rm "$ROOT/opt/monday/bin/binance-lob-archiver"
+ln -s "$ROOT/opt/monday/releases/binance-lob-controller/active/binance-lob-archiver" \
+  "$ROOT/opt/monday/bin/binance-lob-archiver"
 mkdir -p "$ROOT/etc/systemd/system" "$ROOT/etc/monday"
 for asset in \
   binance-lob-archiver-rust@.service binance-lob-archiver-rust-upload@.service; do
@@ -138,9 +173,12 @@ cutover_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
 transition=$(printf '%s\n' "$cutover_output" | sed -n 's/^Transition receipt: //p')
 transition_sha=$(printf '%s\n' "$cutover_output" | sed -n 's/^SHA-256: //p')
 [[ $(monday_active_controller_sha "$ROOT") == "$c1" ]]
+[[ $(readlink -- "$ROOT/opt/monday/bin/binance-lob-archiver") == \
+  "$ROOT/opt/monday/releases/binance-lob-controller/active/binance-lob-archiver" ]]
 [[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == \
   "$ROOT/opt/monday/releases/binance-lob-archiver/$p1_sha/binance-lob-archiver" ]]
 [[ $(monday_sha256_file "$transition") == "$transition_sha" ]]
+monday_validate_v2_transition "$transition" "$c0" "$c1" "$gate" "$gate_sha"
 
 # A fault after the active-pair rename restores both identities under the lock.
 printf '\n# controller revision three fixture\n' >>"$source_dir/host-rust-lob-readback.sh"
@@ -186,6 +224,17 @@ gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   --candidate-controller "$c2" --root "$ROOT")
 gate2=$(printf '%s\n' "$gate_output" | sed -n 's/^V2 Gate receipt: //p')
 gate2_sha=$(printf '%s\n' "$gate_output" | sed -n 's/^SHA-256: //p')
+active_before_stage=$(monday_active_controller_sha "$ROOT")
+production_before_stage=$(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver")
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" MONDAY_CUTOVER_FAIL_AFTER_ASSET_STAGE=1 \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from "$c1" --to "$c2" \
+  --gate-receipt "$gate2" --gate-sha256 "$gate2_sha" --root "$ROOT" \
+  >/dev/null 2>&1; then
+  printf 'fault-injected asset-stage cutover unexpectedly succeeded\n' >&2
+  exit 1
+fi
+[[ $(monday_active_controller_sha "$ROOT") == "$active_before_stage" ]]
+[[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == "$production_before_stage" ]]
 if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" MONDAY_CUTOVER_FAIL_AFTER_ACTIVE=1 \
   "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from "$c1" --to "$c2" \
   --gate-receipt "$gate2" --gate-sha256 "$gate2_sha" --root "$ROOT" \
@@ -194,6 +243,8 @@ if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" MONDAY_CUTOVER_FAIL_AFTER_ACT
   exit 1
 fi
 [[ $(monday_active_controller_sha "$ROOT") == "$c1" ]]
+[[ $(readlink -- "$ROOT/opt/monday/bin/binance-lob-archiver") == \
+  "$ROOT/opt/monday/releases/binance-lob-controller/active/binance-lob-archiver" ]]
 [[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == \
   "$ROOT/opt/monday/releases/binance-lob-archiver/$p1_sha/binance-lob-archiver" ]]
 
@@ -206,6 +257,8 @@ rm "$ROOT/opt/monday/bin/binance-lob-archiver"
 MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c2" --root "$ROOT" >/dev/null
 [[ $(monday_active_controller_sha "$ROOT") == "$c2" ]]
+[[ $(readlink -- "$ROOT/opt/monday/bin/binance-lob-archiver") == \
+  "$ROOT/opt/monday/releases/binance-lob-controller/active/binance-lob-archiver" ]]
 [[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == \
   "$ROOT/opt/monday/releases/binance-lob-archiver/$p2_sha/binance-lob-archiver" ]]
 [[ $(monday_sha256_file "$transition2") == "$transition2_sha" ]]
@@ -213,6 +266,76 @@ MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-readback.sh" --controller "$c2" \
   --transition-receipt "$transition2" --receipt-sha256 "$transition2_sha" \
   --root "$ROOT" >/dev/null
+
+# Shared OSS triplet readback rejects stale status, foreign prefixes, missing
+# objects, and a marker whose digest is internally consistent but whose bytes
+# are not the canonical data SHA plus one newline.
+triplet_root="$ROOT/triplet-fixture"; mkdir -p "$triplet_root"
+triplet_data="$triplet_root/part-1.jsonl.zst"
+printf 'fixture-data\n' >"$triplet_data"
+triplet_data_sha=$(monday_sha256_file "$triplet_data")
+triplet_manifest="$triplet_root/part-1.jsonl.zst.manifest.json"
+jq -cn --arg sha "$triplet_data_sha" \
+  '{market:"spot",dataset:"spot_all",shard_id:"all",file:"part-1.jsonl.zst",sha256:$sha,session_id:"fixture-session",catalog_sha256:"fixture-catalog"}' \
+  >"$triplet_manifest"
+triplet_manifest_sha=$(monday_sha256_file "$triplet_manifest")
+triplet_success="$triplet_root/part-1.jsonl.zst._SUCCESS"
+printf '%s\n' "$triplet_data_sha" >"$triplet_success"
+triplet_success_sha=$(monday_sha256_file "$triplet_success")
+triplet_status="$triplet_root/upload-status.json"
+triplet_uri='oss://bucket/lake/raw/venue=binance/market=spot/dataset=spot_all/shard=all/part-1.jsonl.zst'
+triplet_prefix='lake/raw/venue=binance/market=spot/dataset=spot_all/shard=all'
+triplet_now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+jq -cn --arg now "$triplet_now" --arg uri "$triplet_uri" --arg prefix "$triplet_prefix" \
+  --arg data "$triplet_data_sha" --arg manifest "$triplet_manifest_sha" --arg success "$triplet_success_sha" \
+  '{last_success_at:$now,last_uploaded_triplet:{data_uri:$uri,object_prefix:$prefix,data_sha256:$data,manifest_sha256:$manifest,success_sha256:$success}}' \
+  >"$triplet_status"
+copy_triplet_fixture() {
+  local uri=$1 target=$2 object
+  object=${uri##*/}
+  [[ ${TRIPLET_FIXTURE_MISSING:-0} != 1 ]] || return 1
+  cp -p -- "$triplet_root/$object" "$target"
+}
+triplet_tmp="$ROOT/triplet-readback-tmp"
+triplet_readback=$(monday_verify_upload_triplet_readback "$triplet_status" spot spot_all bucket "$triplet_prefix" \
+  "$triplet_tmp" "$triplet_now" copy_triplet_fixture)
+[[ $(jq -r '.data_sha256' <<<"$triplet_readback") == "$triplet_data_sha" ]]
+if jq '.last_success_at = "2000-01-01T00:00:00Z"' "$triplet_status" >"$triplet_status.stale" \
+  && monday_verify_upload_triplet_readback "$triplet_status.stale" spot spot_all bucket "$triplet_prefix" \
+    "$triplet_tmp" "$triplet_now" copy_triplet_fixture >/dev/null 2>&1; then
+  printf 'triplet readback accepted stale last_success_at\n' >&2
+  exit 1
+fi
+if jq '.last_uploaded_triplet.data_uri |= sub("oss://bucket"; "oss://foreign")' "$triplet_status" \
+  >"$triplet_status.foreign" \
+  && monday_verify_upload_triplet_readback "$triplet_status.foreign" spot spot_all bucket "$triplet_prefix" \
+    "$triplet_tmp" "$triplet_now" copy_triplet_fixture >/dev/null 2>&1; then
+  printf 'triplet readback accepted a foreign bucket\n' >&2
+  exit 1
+fi
+if jq '.last_uploaded_triplet.object_prefix = "foreign/prefix"' "$triplet_status" \
+  >"$triplet_status.foreign-prefix" \
+  && monday_verify_upload_triplet_readback "$triplet_status.foreign-prefix" spot spot_all bucket "$triplet_prefix" \
+    "$triplet_tmp" "$triplet_now" copy_triplet_fixture >/dev/null 2>&1; then
+  printf 'triplet readback accepted a foreign object prefix\n' >&2
+  exit 1
+fi
+printf 'not-the-data-sha\n' >"$triplet_success"
+wrong_success_sha=$(monday_sha256_file "$triplet_success")
+jq --arg sha "$wrong_success_sha" \
+  '.last_uploaded_triplet.success_sha256 = $sha' "$triplet_status" >"$triplet_status.bad-success"
+if monday_verify_upload_triplet_readback "$triplet_status.bad-success" spot spot_all bucket "$triplet_prefix" \
+  "$triplet_tmp" "$triplet_now" copy_triplet_fixture >/dev/null 2>&1; then
+  printf 'triplet readback accepted non-canonical success bytes\n' >&2
+  exit 1
+fi
+printf '%s\n' "$triplet_data_sha" >"$triplet_success"
+TRIPLET_FIXTURE_MISSING=1
+if monday_verify_upload_triplet_readback "$triplet_status" spot spot_all bucket "$triplet_prefix" \
+    "$triplet_tmp" "$triplet_now" copy_triplet_fixture >/dev/null 2>&1; then
+  printf 'triplet readback accepted a missing OSS object\n' >&2
+  exit 1
+fi
 
 # The local operator is the only Cloud Assistant entry point. Its dry run must
 # carry an exact controller path and never expose a second routing mode.

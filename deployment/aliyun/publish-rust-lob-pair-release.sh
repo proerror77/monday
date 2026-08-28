@@ -73,6 +73,13 @@ jq -cS -n \
     deployment_bundle_uri:$bundle,deployment_bundle_sha256:$bundle_sha}' >"$manifest"
 manifest_sha=$(monday_sha256_file "$manifest")
 manifest_uri="${prefix%/}/${source_revision}/controller-${manifest_sha}.json"
+fixed_publisher="$SCRIPT_DIR/host-rust-lob-controller-release.sh"
+fixed_lib="$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
+fixed_publisher_sha=$(monday_sha256_file "$fixed_publisher")
+fixed_lib_sha=$(monday_sha256_file "$fixed_lib")
+command -v gzip >/dev/null 2>&1 || die 'gzip is required to transfer the fixed publisher'
+fixed_publisher_b64=$(gzip -c "$fixed_publisher" | base64 | tr -d '\n')
+fixed_lib_b64=$(gzip -c "$fixed_lib" | base64 | tr -d '\n')
 
 if [[ ${MONDAY_CONTROL_PLANE_DRY_RUN:-0} == 1 ]]; then
   jq -cn --arg controller "$manifest_sha" --arg payload "$artifact_sha" \
@@ -95,6 +102,11 @@ remote=$(cat <<EOF
 set -Eeuo pipefail
 tmp=\$(mktemp -d)
 trap 'rm -rf "\$tmp"' EXIT
+printf '%s' '$fixed_publisher_b64' | base64 --decode | gzip -d >"\$tmp/fixed-publisher.sh"
+printf '%s' '$fixed_lib_b64' | base64 --decode | gzip -d >"\$tmp/rust-lob-control-plane-lib.sh"
+printf '%s  %s\\n' '$fixed_publisher_sha' "\$tmp/fixed-publisher.sh" | sha256sum --check --strict
+printf '%s  %s\\n' '$fixed_lib_sha' "\$tmp/rust-lob-control-plane-lib.sh" | sha256sum --check --strict
+chmod 0555 "\$tmp/fixed-publisher.sh" "\$tmp/rust-lob-control-plane-lib.sh"
 aliyun ossutil cp '$artifact_uri' "\$tmp/payload" --profile ecs-role --endpoint oss-ap-northeast-1-internal.aliyuncs.com --region ap-northeast-1 --force
 printf '%s  %s\\n' '$artifact_sha' "\$tmp/payload" | sha256sum --check --strict
 aliyun ossutil cp '$bundle_uri' "\$tmp/deployment.tar" --profile ecs-role --endpoint oss-ap-northeast-1-internal.aliyuncs.com --region ap-northeast-1 --force
@@ -102,8 +114,9 @@ printf '%s  %s\\n' '$bundle_sha' "\$tmp/deployment.tar" | sha256sum --check --st
 aliyun ossutil cp '$manifest_uri' "\$tmp/release.json" --profile ecs-role --endpoint oss-ap-northeast-1-internal.aliyuncs.com --region ap-northeast-1 --force
 printf '%s  %s\\n' '$manifest_sha' "\$tmp/release.json" | sha256sum --check --strict
 mkdir "\$tmp/deployment"
-tar --no-same-owner --no-same-permissions -xf "\$tmp/deployment.tar" -C "\$tmp/deployment"
-bash "\$tmp/deployment/host-rust-lob-controller-release.sh" "\$tmp/payload" "\$tmp/deployment.tar" "\$tmp/release.json"
+# The candidate archive is data only.  The publisher/verifier is the fixed
+# byte-checked copy sent above; candidate helper/lib files are never run.
+bash "\$tmp/fixed-publisher.sh" "\$tmp/payload" "\$tmp/deployment.tar" "\$tmp/release.json"
 EOF
 )
 command_content=$(printf '%s' "$remote" | base64 | tr -d '\n')

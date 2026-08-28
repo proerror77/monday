@@ -25,6 +25,22 @@ monday_sha256_ok() {
   [[ $# -eq 1 && $1 =~ ^[a-f0-9]{64}$ ]]
 }
 
+monday_iso_epoch() {
+  [[ $# -eq 1 ]] || return 2
+  local value=$1 normalized tz
+  [[ $value =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$ ]] || return 1
+  if date -u -d "$value" +%s >/dev/null 2>&1; then
+    date -u -d "$value" +%s
+    return
+  fi
+  [[ $value =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$ ]] || return 1
+  normalized=${BASH_REMATCH[1]}
+  tz=${BASH_REMATCH[3]}
+  [[ $tz == Z ]] && tz=+0000 || tz=${tz/:/}
+  normalized+="$tz"
+  date -u -j -f '%Y-%m-%dT%H:%M:%S%z' "$normalized" +%s
+}
+
 monday_path_direct() {
   [[ $# -eq 1 ]] || return 2
   local path=$1 resolved
@@ -92,7 +108,7 @@ monday_controller_release_sha256() {
 
 # Resolve the immutable V2 deployment currently installed as the active pair.
 # This helper is intentionally strict: it never guesses another release and
-# never accepts a legacy manifest.
+# never accepts an unsupported manifest.
 monday_rust_lob_active_controller_deployment() {
   [[ $# -eq 3 ]] || return 2
   local controller_root=$1 artifact_sha=$2 runtime_contract=$3
@@ -105,7 +121,9 @@ monday_rust_lob_active_controller_deployment() {
   manifest="$release/release.json"
   deployment="$release/deployment"
   [[ -d $release && ! -L $release && -d $deployment && ! -L $deployment ]] || return 1
-  monday_verify_controller_release "${controller_root%/}/../../.." "$sha" 2>/dev/null || return 1
+  local root
+  root=$(cd -- "${controller_root%/}/../../../.." 2>/dev/null && pwd -P) || return 1
+  monday_verify_controller_release "$root" "$sha" 2>/dev/null || return 1
   jq -e --arg artifact "$artifact_sha" --arg runtime "$runtime_contract" \
     '.artifact_sha256 == $artifact and .runtime_contract_sha256 == $runtime' \
     "$manifest" >/dev/null || return 1
@@ -291,10 +309,27 @@ monday_verify_controller_release() {
 monday_validate_v2_gate() {
   [[ $# -eq 4 ]] || return 2
   local gate=$1 from=$2 candidate=$3 gate_sha=$4
+  local controller_asset_keys production_asset_keys shadow_asset_keys
+  controller_asset_keys=$(monday_controller_assets | jq -Rsc 'split("\n") | map(select(length > 0)) | sort') || return 1
+  production_asset_keys=$(printf '%s\n' \
+    binance-lob-archiver-production@.service \
+    binance-lob-archiver-upload@.service \
+    binance-lob-archiver-production-spot.env \
+    binance-lob-archiver-production-usdm.env \
+    | jq -Rsc 'split("\n") | map(select(length > 0)) | sort') || return 1
+  shadow_asset_keys=$(printf '%s\n' \
+    binance-lob-archiver-rust@.service \
+    binance-lob-archiver-rust-upload@.service \
+    binance-lob-archiver-rust-spot.env \
+    binance-lob-archiver-rust-usdm.env \
+    | jq -Rsc 'split("\n") | map(select(length > 0)) | sort') || return 1
   monday_file_direct "$gate" || return 1
   [[ $(monday_sha256_file "$gate") == "$gate_sha" ]] || return 1
   jq -e \
-    --arg from "$from" --arg candidate "$candidate" --arg gate_sha "$gate_sha" '
+    --arg from "$from" --arg candidate "$candidate" --arg gate_sha "$gate_sha" \
+    --argjson controller_asset_keys "$controller_asset_keys" \
+    --argjson production_asset_keys "$production_asset_keys" \
+    --argjson shadow_asset_keys "$shadow_asset_keys" '
       .schema == "monday.rust_lob_shadow_gate.v5"
       and .control_plane_version == 2
       and .passed == true
@@ -309,15 +344,50 @@ monday_validate_v2_gate() {
       and (.candidate_runtime_contract_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
       and (.candidate_deployment_bundle_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
       and (.candidate_deployment_source_revision | type == "string" and test("^[a-f0-9]{40,64}$"))
-      and (.before | type == "object")
-      and (.production_assets | type == "object" and length == 4)
+      and (.candidate_control_bytes | type == "object"
+        and (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+        and (.assets | type == "object" and (keys | sort) == $controller_asset_keys
+          and all(.[]; type == "string" and test("^[a-f0-9]{64}$"))))
+      and (.before | type == "object"
+        and .controller == $from
+        and (.payload_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+        and (.runtime_contract_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+        and (.production_projection | type == "string" and length > 0)
+        and (.production_assets | type == "object" and (keys | sort) == $production_asset_keys
+          and all(.[]; type == "string" and test("^[a-f0-9]{64}$"))))
+      and (.production_assets | type == "object" and (keys | sort) == $production_asset_keys
+        and all(.[]; type == "string" and test("^[a-f0-9]{64}$")))
       and (.production_process | type == "object")
+      and (if .test_only then true else
+        (.production_process | ((keys | sort) == ["spot", "usdm"]
+          and all(.[]; .active == true
+            and (.main_pid | type == "number" and . >= 1)
+            and (.process_exe_sha256 | type == "string" and test("^[a-f0-9]{64}$"))))) end)
+      and (.resource_admission | type == "array" and length >= 3
+        and all(.[]; . as $r
+          | (.phase | type == "string" and length > 0)
+          and (.host_memory_available_bytes | type == "number" and . >= 0)
+          and ($r.required_bytes | type == "number" and . > 0 and . <= $r.host_memory_available_bytes)
+          and (.phase_memory_max_bytes | type == "number" and . > 0)))
+      and (.io_full_psi_windows | type == "array" and length >= 3
+        and all(.[]; . as $p
+          | (.phase | type == "string" and length > 0)
+          and (.stage | type == "string" and length > 0)
+          and (.hit | type == "boolean")
+          and ($p.consecutive_hits | type == "number" and . >= 0)
+          and (if $p.stage == "calibration"
+               then ($p.delta_us | type == "number" and . >= 0)
+                 and ($p.ratio | type == "number" and . >= 0)
+               else true end)))
       and (.shadow_staging | type == "object"
-        and (.candidate_assets | type == "object" and length == 4)
-        and (.restored_assets | type == "object" and length == 4)
-        and (.before_assets | type == "object" and length == 4)
+        and (.candidate_assets | type == "object" and (keys | sort) == $shadow_asset_keys)
+        and (.restored_assets | type == "object" and (keys | sort) == $shadow_asset_keys)
+        and (.before_assets | type == "object" and (keys | sort) == $shadow_asset_keys)
+        and (.restored_assets == .before_assets)
         and (.binary | type == "object" and (.candidate_target | type == "string")
-          and (.restored_present | type == "boolean")))
+          and (.restored_present | type == "boolean")
+          and ((.restored_target_sha256 == null)
+            or (.restored_target_sha256 | type == "string" and test("^[a-f0-9]{64}$")))))
       and (.checks | type == "object"
         and .before_pair_unchanged == true
         and .shadow_staging_verified == true
@@ -325,15 +395,216 @@ monday_validate_v2_gate() {
         and .resource_preflight == true
         and .oss_triplets == true
         and .strict_segment_verifier == true
-        and .final_identity == true)
+        and .final_identity == true
+        and .controller_control_bytes == true
+        and .shadow_link_restored == true
+        and .health_freshness == true)
       and (.markets | type == "object" and ((keys | sort) == ["spot", "usdm"])
-        and all(.[].segment_count; . >= 2)
-        and all(.[].oss_triplet_count; . >= 2)
-        and all(.[].n_restarts; . == 0)
-        and all(.[].process_identity_verified; . == true)
-        and all(.[].installed_shadow_assets_verified; . == true)
-        and all(.[].strict_lob_continuity_readback; . == true))' \
+        and (to_entries | all(.[]; .value.market == .key))
+        and all(.[]; . as $m
+          | (.market | type == "string")
+          and (.dataset | type == "string" and length > 0)
+          and (.session_id | type == "string" and length > 0)
+          and (.expected_oss_bucket | type == "string" and length > 0)
+          and (.expected_oss_prefix | type == "string" and length > 0)
+          and ($m.segment_count | type == "number" and . >= 2 and . == ($m.segments | length))
+          and ($m.oss_triplet_count | type == "number" and . >= 2 and . == ($m.triplets | length))
+          and (.n_restarts | type == "number" and . == 0)
+          and (.process_identity_verified == true)
+          and (.installed_shadow_assets_verified == true)
+          and (.strict_lob_continuity_readback == true)
+          and (.strict_aggregate_trade_continuity_readback | type == "boolean")
+          and (.strict_raw_trade_continuity_readback | type == "boolean")
+          and (if .market == "spot" then
+            .strict_aggregate_trade_continuity_readback == true
+            and .strict_raw_trade_continuity_readback == true
+          else true end)
+          and (.segments | type == "array" and length >= 2
+            and all(.[];
+              (.file | type == "string" and test("^[A-Za-z0-9._-]+\\.jsonl\\.zst$"))
+              and (.path | type == "string" and length > 0)
+              and (.data_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+              and (.manifest_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+              and (.success_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+              and (.start_received_at_ns | type == "number" and . >= 0)
+              and (.end_received_at_ns | type == "number")
+              and (.end_received_at_ns >= .start_received_at_ns)
+              and (.session_id | type == "string" and . == $m.session_id)))
+          and (.triplets | type == "array" and length >= 2
+            and all(.[];
+              (.market | type == "string" and . == $m.market)
+              and (.dataset | type == "string" and . == $m.dataset)
+              and (.data_uri | type == "string"
+                and startswith(("oss://" + $m.expected_oss_bucket + "/" + $m.expected_oss_prefix + "/"))
+                and test("^oss://[^/]+/.+\\.jsonl\\.zst$"))
+              and (.manifest_uri | type == "string")
+              and (.manifest_uri == (.data_uri + ".manifest.json"))
+              and (.success_uri | type == "string")
+              and (.success_uri == (.data_uri + "._SUCCESS"))
+              and (.data_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+              and (.manifest_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+              and (.success_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+              and (.success_content == (.data_sha256 + "\n"))
+              and (.start_received_at_ns | type == "number" and . >= 0)
+              and (.end_received_at_ns | type == "number")
+              and (.end_received_at_ns >= .start_received_at_ns)
+              and (.observed_at | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+              and (.session_id | type == "string" and . == $m.session_id)
+              and (.catalog_sha256 | type == "string" and . == $m.health.frozen_catalog_sha256)))
+          and (.health | type == "object"
+            and (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+            and (.session_id | type == "string" and length > 0)
+            and (.frozen_catalog_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+            and (.frozen_symbol_count | type == "number" and . >= 1)
+            and (.max_health_silence_seconds | type == "number" and . >= 0 and . <= 120)
+            and (.samples | type == "number" and . >= 1)
+            and .session_id == $m.session_id)))' \
     "$gate" >/dev/null
+}
+
+# Validate the transition receipt and its exact V2 Gate evidence.  A cutover
+# receipt is not authoritative by itself: the immutable Gate receipt must be
+# present, hash-identical, and pass the full evidence validator above.
+monday_validate_v2_transition() {
+  [[ $# -eq 5 ]] || return 2
+  local receipt=$1 from=$2 to=$3 gate=$4 gate_sha=$5
+  local gate_evidence gate_payload gate_runtime pair_asset_keys
+  pair_asset_keys=$(printf '%s\n' \
+    binance-lob-archiver-production@.service \
+    binance-lob-archiver-upload@.service \
+    binance-lob-archiver-production-spot.env \
+    binance-lob-archiver-production-usdm.env \
+    binance-lob-archiver-recovery@.service \
+    binance-lob-archiver-recovery@.timer \
+    host-rust-lob-recovery-queue.sh \
+    monday-collector-health.sh \
+    | jq -Rsc 'split("\n") | map(select(length > 0)) | sort') || return 1
+  monday_file_direct "$receipt" || return 1
+  [[ $from == direct || $from =~ ^[a-f0-9]{64}$ ]] || return 1
+  [[ $to =~ ^[a-f0-9]{64}$ && $gate_sha =~ ^[a-f0-9]{64}$ ]] || return 1
+  monday_file_direct "$gate" || return 1
+  monday_validate_v2_gate "$gate" "$from" "$to" "$gate_sha" || return 1
+  gate_evidence=$(jq -ceS \
+    '{candidate_control_bytes,resource_admission,io_full_psi_windows,shadow_staging,checks,markets}' \
+    "$gate") || return 1
+  gate_payload=$(jq -er '.candidate_payload_sha256' "$gate") || return 1
+  gate_runtime=$(jq -er '.candidate_runtime_contract_sha256' "$gate") || return 1
+  jq -e --arg from "$from" --arg to "$to" --arg gate "$gate" --arg gate_sha "$gate_sha" \
+    --arg payload "$gate_payload" --arg runtime "$gate_runtime" \
+    --argjson pair_asset_keys "$pair_asset_keys" '
+    .schema == "monday.rust_lob_pair_transition.v2"
+    and .control_plane_version == 2
+    and .operation == "cutover"
+    and .from_controller_sha256 == $from
+    and .controller_sha256 == $to
+    and .payload_sha256 == $payload
+    and .runtime_contract_sha256 == $runtime
+    and .gate_receipt == $gate
+    and .gate_sha256 == $gate_sha
+    and (.test_only | type == "boolean")
+    and (if .test_only then .production_eligible == false else .production_eligible == true end)
+    and .active_pair_committed == true
+    and (.completed_at | type == "string" and length > 0)
+    and (.stable_production_projection | type == "string"
+      and . == "/opt/monday/releases/binance-lob-controller/active/binance-lob-archiver")
+    and (.gate_evidence | type == "object"
+      and (.markets | type == "object" and ((keys | sort) == ["spot", "usdm"]))
+      and (.candidate_control_bytes | type == "object")
+      and (.resource_admission | type == "array" and length >= 3)
+      and (.io_full_psi_windows | type == "array" and length >= 3))
+    and (.before | type == "object"
+      and (.controller == $from)
+      and (.payload_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+      and (.runtime_contract_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+      and (.production_projection | type == "string"
+        and . == "/opt/monday/releases/binance-lob-controller/active/binance-lob-archiver")
+      and (.assets | type == "object" and (keys | sort) == $pair_asset_keys
+        and all(.[]; ((.state == "present"
+          and (.sha256 | type == "string" and test("^[a-f0-9]{64}$")))
+          or (.state == "absent" and .sha256 == null)))))
+    and (.installed_assets | type == "object" and (keys | sort) == $pair_asset_keys
+      and all(.[]; type == "string" and test("^[a-f0-9]{64}$")))' \
+    "$receipt" >/dev/null
+  jq -e --argjson expected "$gate_evidence" \
+    '.gate_evidence == $expected' "$receipt" >/dev/null
+}
+
+# Verify one production upload-status triplet using an injected copy function.
+# The caller owns the OSS credentials; this helper owns URI identity, triplet
+# bytes, marker content, and manifest re-download consistency.
+monday_verify_upload_triplet_readback() {
+  [[ $# -eq 8 ]] || return 2
+  local status=$1 market=$2 dataset=$3 expected_bucket=$4 expected_prefix=$5
+  local tmp_root=$6 minimum_success_at=$7 copy_fn=$8 triplet data_uri manifest_uri success_uri
+  local data_sha manifest_sha success_sha object_prefix first_manifest second_manifest
+  local data_file manifest_file success_file expected_success_file expected_prefix_norm
+  monday_file_direct "$status" || return 1
+  [[ $market == spot || $market == usdm ]] || return 1
+  [[ $dataset =~ ^[A-Za-z0-9_.-]+$ && $expected_bucket =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || return 1
+  expected_prefix_norm=${expected_prefix%/}
+  [[ -n $expected_prefix_norm && $expected_prefix_norm != /* ]] || return 1
+  declare -F "$copy_fn" >/dev/null 2>&1 || return 2
+  triplet=$(jq -cer '.last_uploaded_triplet | objects' "$status") || return 1
+  data_sha=$(jq -er '.data_sha256' <<<"$triplet") || return 1
+  manifest_sha=$(jq -er '.manifest_sha256' <<<"$triplet") || return 1
+  success_sha=$(jq -er '.success_sha256' <<<"$triplet") || return 1
+  monday_sha256_ok "$data_sha" && monday_sha256_ok "$manifest_sha" \
+    && monday_sha256_ok "$success_sha" || return 1
+  object_prefix=$(jq -er '.object_prefix' <<<"$triplet") || return 1
+  # Producers record the directory prefix itself for a triplet, while some
+  # upload-status writers append a shard/object component.  Both are valid as
+  # long as the value cannot escape the exact expected prefix.
+  [[ $object_prefix == "$expected_prefix_norm" || $object_prefix == "$expected_prefix_norm"/* ]] || return 1
+  data_uri=$(jq -er '.data_uri // .object // empty' <<<"$triplet") || true
+  if [[ -z $data_uri ]]; then data_uri=$(jq -er '.last_uploaded_object' "$status") || return 1; fi
+  [[ $data_uri == "oss://$expected_bucket/$expected_prefix_norm/"*.jsonl.zst ]] || return 1
+  manifest_uri=$(jq -er '.manifest_uri // empty' <<<"$triplet") || true
+  [[ -n $manifest_uri ]] || manifest_uri="$data_uri.manifest.json"
+  success_uri=$(jq -er '.success_uri // empty' <<<"$triplet") || true
+  [[ -n $success_uri ]] || success_uri="$data_uri._SUCCESS"
+  [[ $manifest_uri == "$data_uri.manifest.json" && $success_uri == "$data_uri._SUCCESS" ]] || return 1
+  mkdir -p "$tmp_root" || return 1
+  first_manifest="$tmp_root/$market.manifest.first"; second_manifest="$tmp_root/$market.manifest.second"
+  data_file="$tmp_root/$market.data"; manifest_file="$tmp_root/$market.manifest"; success_file="$tmp_root/$market.success"
+  expected_success_file="$tmp_root/$market.success.expected"
+  "$copy_fn" "$manifest_uri" "$first_manifest" || return 1
+  "$copy_fn" "$data_uri" "$data_file" || return 1
+  "$copy_fn" "$success_uri" "$success_file" || return 1
+  "$copy_fn" "$manifest_uri" "$second_manifest" || return 1
+  monday_file_direct "$first_manifest" && monday_file_direct "$second_manifest" \
+    && cmp -s "$first_manifest" "$second_manifest" || return 1
+  cp -p -- "$first_manifest" "$manifest_file" || return 1
+  [[ $(monday_sha256_file "$data_file") == "$data_sha" \
+    && $(monday_sha256_file "$manifest_file") == "$manifest_sha" ]] || return 1
+  printf '%s\n' "$data_sha" >"$expected_success_file"
+  cmp -s "$success_file" "$expected_success_file" || return 1
+  if [[ $success_sha != "$data_sha" ]]; then
+    [[ $(monday_sha256_file "$success_file") == "$success_sha" ]] || return 1
+  fi
+  jq -e --arg market "$market" --arg dataset "$dataset" --arg data_sha "$data_sha" \
+    --arg data_file "${data_uri##*/}" '
+      type == "object" and .market == $market and .dataset == $dataset
+      and .file == $data_file and .sha256 == $data_sha
+      and (.shard_id | type == "string" and length > 0)
+      and ((.session_id // .lob_continuity.capture_session_id)
+        | type == "string" and length > 0)
+      and (.catalog_sha256? // "" | type == "string")' \
+    "$manifest_file" >/dev/null || return 1
+  if [[ -n $minimum_success_at ]]; then
+    success_at=$(jq -er '.last_success_at' "$status") || return 1
+    minimum_epoch=$(monday_iso_epoch "$minimum_success_at") || return 1
+    success_epoch=$(monday_iso_epoch "$success_at") || return 1
+    ((success_epoch >= minimum_epoch)) || return 1
+  fi
+  jq -cn --arg market "$market" --arg data_uri "$data_uri" --arg manifest_uri "$manifest_uri" \
+    --arg success_uri "$success_uri" --arg data_sha "$data_sha" --arg manifest_sha "$manifest_sha" \
+    --arg success_sha "$success_sha" --arg object_prefix "$object_prefix" \
+    --arg session "$(jq -er '.session_id // .lob_continuity.capture_session_id' "$manifest_file")" \
+    --arg catalog "$(jq -er '.catalog_sha256 // ""' "$manifest_file")" \
+    '{market:$market,data_uri:$data_uri,manifest_uri:$manifest_uri,success_uri:$success_uri,
+      data_sha256:$data_sha,manifest_sha256:$manifest_sha,success_sha256:$success_sha,
+      success_content:($data_sha + "\n"),object_prefix:$object_prefix,
+      session_id:$session,catalog_sha256:$catalog}'
 }
 
 monday_atomic_symlink() {
