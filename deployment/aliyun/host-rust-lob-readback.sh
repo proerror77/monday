@@ -171,7 +171,9 @@ capture_runtime_identity() {
     [[ -f $health && ! -L $health ]] || die "production health is missing: $market"
     session=$(jq -er '.session_id // empty' "$health") || die "production health session is missing: $market"
     updated=$(jq -er '.updated_at_ns // 0' "$health")
-    [[ $updated =~ ^[0-9]+$ && $updated -ge $minimum_ns ]] || die "production health is stale: $market"
+    now_ns=$(date +%s%N)
+    [[ $updated =~ ^[0-9]+$ && $updated -ge $minimum_ns && $updated -le $now_ns ]] \
+      || die "production health is stale or in the future: $market"
     health_identity=$(jq -cn --argjson values "$health_identity" --arg market "$market" --arg session "$session" \
       --argjson observed "$updated" '$values + {($market):{session_id:$session,observed_at_ns:$observed}}')
   done
@@ -196,8 +198,24 @@ assert_runtime_stable() {
       || die "controller projection differs during OSS readback: $asset"
   done
   capture_runtime_identity
-  [[ $runtime_identity == "$runtime_before" && $health_identity == "$health_before" ]] \
-    || die 'process or health identity changed during OSS readback'
+  [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 ]] && return 0
+  [[ $runtime_identity == "$runtime_before" ]] \
+    || die 'process identity changed during OSS readback'
+  for market in spot usdm; do
+    before_session=$(jq -er --arg market "$market" '.[$market].session_id' <<<"$health_before") \
+      || die "initial health session is missing: $market"
+    current_session=$(jq -er --arg market "$market" '.[$market].session_id' <<<"$health_identity") \
+      || die "current health session is missing: $market"
+    [[ $current_session == "$before_session" ]] || die "health session changed during OSS readback: $market"
+    before_updated=$(jq -er --arg market "$market" '.[$market].observed_at_ns' <<<"$health_before") \
+      || die "initial health timestamp is missing: $market"
+    current_updated=$(jq -er --arg market "$market" '.[$market].observed_at_ns' <<<"$health_identity") \
+      || die "current health timestamp is missing: $market"
+    now_ns=$(date +%s%N)
+    [[ $before_updated =~ ^[0-9]+$ && $current_updated =~ ^[0-9]+$ \
+      && $current_updated -ge $before_updated && $current_updated -le $now_ns ]] \
+      || die "health timestamp moved backwards or into the future: $market"
+  done
 }
 
 status_root=${MONDAY_UPLOAD_STATUS_ROOT:-$(monday_root_join "$ROOT" data/monday/spool/binance-lob)}
@@ -229,23 +247,32 @@ minimum_success_at=$(jq -er '.completed_at' "$TRANSITION_RECEIPT") \
 for market in spot usdm; do
   status="$status_root/$market/upload-status.json"
   if [[ -f $status && ! -L $status ]]; then
-    jq -e '.last_error == null' "$status" >/dev/null \
-      || die "${market} upload status has a last_error"
+    status_snapshot="$tmp/$market.upload-status.snapshot.json"
+    cp -p -- "$status" "$status_snapshot" || die "${market} upload status snapshot failed"
+    status_snapshot_sha=$(monday_sha256_file "$status_snapshot") \
+      || die "${market} upload status snapshot hash failed"
+    [[ $(monday_sha256_file "$status") == "$status_snapshot_sha" ]] \
+      || die "${market} upload status changed during snapshot"
     env_file=$(monday_root_join "$ROOT" "etc/monday/binance-lob-archiver-production-$market.env")
     dataset=$(env_value "$env_file" DATASET) || die "${market} production dataset is invalid"
     bucket=$(env_value "$env_file" OSS_BUCKET) || die "${market} production bucket is invalid"
     shard=$(env_value "$env_file" SHARD_ID) || die "${market} production shard is invalid"
     prefix="lake/raw/venue=binance/market=$market/dataset=$dataset/shard=$shard"
     assert_runtime_stable
-    triplet_json=$(monday_verify_upload_triplet_readback "$status" "$market" "$dataset" \
-      "$bucket" "$prefix" "$tmp" "$minimum_success_at" copy_oss) \
+    expected_session=$(jq -er --arg market "$market" '.[$market].session_id' <<<"$health_before") \
+      || die "${market} current health session is unavailable"
+    triplet_json=$(monday_verify_upload_triplet_readback "$status_snapshot" "$market" "$dataset" \
+      "$bucket" "$prefix" "$tmp" "$minimum_success_at" copy_oss "$expected_session") \
       || die "${market} independent OSS triplet readback failed"
     assert_runtime_stable
+    [[ $(monday_sha256_file "$status") == "$status_snapshot_sha" ]] \
+      || die "${market} upload status changed during OSS readback"
     markets=$(jq -cn --argjson prior "$markets" --argjson triplet "$triplet_json" \
       '$prior + [$triplet]')
     status_observations=$(jq -cn --argjson values "$status_observations" --arg market "$market" \
-      --arg success "$(jq -er '.last_success_at' "$status")" \
-      '$values + {($market):{last_success_at:$success,last_error:null}}')
+      --arg success "$(jq -er '.last_success_at' "$status_snapshot")" \
+      --arg session "$expected_session" --arg snapshot_sha "$status_snapshot_sha" \
+      '$values + {($market):{last_success_at:$success,last_error:null,session_id:$session,snapshot_sha256:$snapshot_sha}}')
   else
     [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 ]] || die "${market} upload status is missing"
   fi

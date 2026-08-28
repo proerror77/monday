@@ -116,6 +116,37 @@ jq -e --arg from "$legacy_c0" \
    and .transition.before == $from and .transition.topology == "direct-bootstrap"' \
   "$gate" >/dev/null
 
+# Gate's production lane is static evidence, not a process start.  The shared
+# verifier must reject a candidate unit or market environment that would alter
+# the governed production identity even though the Gate itself runs shadow.
+production_verify_dir="$ROOT/production-runtime-verify"
+mkdir -p "$production_verify_dir"
+for asset in \
+  binance-lob-archiver-production@.service binance-lob-archiver-upload@.service \
+  binance-lob-archiver-production-spot.env binance-lob-archiver-production-usdm.env; do
+  cp -p -- "$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/$asset" \
+    "$production_verify_dir/$asset"
+done
+sed -i.bak 's/^User=hftcollector$/User=untrusted/' \
+  "$production_verify_dir/binance-lob-archiver-production@.service"
+rm -f -- "$production_verify_dir/binance-lob-archiver-production@.service.bak"
+if monday_verify_production_runtime_assets "$ROOT" "$production_verify_dir" "$p0_sha"; then
+  printf 'production runtime verifier accepted an untrusted unit user\n' >&2
+  exit 1
+fi
+chmod u+w "$production_verify_dir/binance-lob-archiver-production@.service"
+rm -f -- "$production_verify_dir/binance-lob-archiver-production@.service"
+cp -p -- "$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/binance-lob-archiver-production@.service" \
+  "$production_verify_dir/binance-lob-archiver-production@.service"
+chmod u+w "$production_verify_dir/binance-lob-archiver-production-spot.env"
+sed -i.bak 's/^OSS_ENDPOINT=.*/OSS_ENDPOINT=foreign.endpoint.example/' \
+  "$production_verify_dir/binance-lob-archiver-production-spot.env"
+rm -f -- "$production_verify_dir/binance-lob-archiver-production-spot.env.bak"
+if monday_verify_production_runtime_assets "$ROOT" "$production_verify_dir" "$p0_sha"; then
+  printf 'production runtime verifier accepted a foreign market endpoint\n' >&2
+  exit 1
+fi
+
 # A hard stop immediately after active=C1 must leave that one commit as the
 # recovery source.  Restore then establishes every stable projection from C1;
 # no receipt or guessed previous state is needed.  Rebuild the direct legacy
@@ -535,6 +566,72 @@ MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   --transition-receipt "$transition2" --receipt-sha256 "$transition2_sha" \
   --root "$ROOT" >/dev/null
 
+# A SIGKILL after a run-scoped Gate start cannot run the EXIT trap.  The
+# bounded unit/spool must remain isolated, with all governed /etc and global
+# shadow projections byte-for-byte unchanged; the next serialized Gate owns
+# stale-run cleanup and can recover without touching production.
+printf '\n# controller revision four fixture\n' >>"$source_dir/host-rust-lob-readback.sh"
+p3="$ROOT/p3"; m3="$ROOT/m3.json"
+publish_fixture "$p3" "$m3" >/dev/null
+c3=$(monday_sha256_file "$m3")
+shadow_link_before_sigkill=$(readlink -- "$ROOT/opt/monday/bin/binance-lob-archiver-shadow")
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_SIGKILL=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c2" \
+  --candidate-controller "$c3" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'SIGKILL Gate fixture unexpectedly survived\n' >&2
+  exit 1
+fi
+for asset in "${!shadow_before_sha[@]}"; do
+  if [[ $asset == *.service ]]; then target="$ROOT/etc/systemd/system/$asset"; else target="$ROOT/etc/monday/$asset"; fi
+  [[ $(monday_sha256_file "$(readlink -f -- "$target")") == "${shadow_before_sha[$asset]}" ]] || {
+    printf 'SIGKILL Gate changed governed shadow asset %s\n' "$asset" >&2
+    exit 1
+  }
+done
+[[ $(readlink -- "$ROOT/opt/monday/bin/binance-lob-archiver-shadow") == "$shadow_link_before_sigkill" ]]
+stale_gate_dir=$(find "$ROOT/run/monday/rust-lob-gate" -mindepth 1 -maxdepth 1 -type d -print -quit)
+[[ -n $stale_gate_dir && -f "$stale_gate_dir/monday-rust-lob-gate-$(basename -- "$stale_gate_dir")-spot.service" ]]
+grep -Fqx 'Restart=no' "$stale_gate_dir/monday-rust-lob-gate-$(basename -- "$stale_gate_dir")-spot.service"
+grep -Fqx 'RuntimeMaxSec=1800' "$stale_gate_dir/monday-rust-lob-gate-$(basename -- "$stale_gate_dir")-spot.service"
+stale_run=$(basename -- "$stale_gate_dir")
+[[ -d "$ROOT/data/monday/spool/binance-lob-rust-shadow/gate/$stale_run" ]]
+gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c2" \
+  --candidate-controller "$c3" --root "$ROOT")
+gate3=$(printf '%s\n' "$gate_output" | sed -n 's/^V2 Gate receipt: //p')
+gate3_sha=$(printf '%s\n' "$gate_output" | sed -n 's/^SHA-256: //p')
+monday_validate_v2_gate "$gate3" "$c2" "$c3" "$gate3_sha"
+[[ ! -e "$stale_gate_dir" && ! -e "$ROOT/data/monday/spool/binance-lob-rust-shadow/gate/$stale_run" ]]
+
+# Candidate shadow identity is fixed by the Gate contract.  Each foreign
+# spool/endpoint/profile/shard mutation must be rejected before any writer is
+# started or any global shadow projection is touched.
+shadow_env_source="$source_dir/binance-lob-archiver-rust-spot.env"
+shadow_env_saved="$ROOT/binance-lob-archiver-rust-spot.env.saved"
+cp -p -- "$shadow_env_source" "$shadow_env_saved"
+for mutation in spool endpoint profile shard; do
+  rm -f -- "$shadow_env_source"
+  cp -p -- "$shadow_env_saved" "$shadow_env_source"
+  case "$mutation" in
+    spool) sed -i.bak 's|^SPOOL_DIR=.*$|SPOOL_DIR=/data/monday/spool/binance-lob/spot|' "$shadow_env_source" ;;
+    endpoint) sed -i.bak 's|^OSS_ENDPOINT=.*$|OSS_ENDPOINT=foreign.endpoint.example|' "$shadow_env_source" ;;
+    profile) sed -i.bak 's|^ALIYUN_PROFILE=.*$|ALIYUN_PROFILE=foreign-profile|' "$shadow_env_source" ;;
+    shard) sed -i.bak 's|^SHARD_ID=.*$|SHARD_ID=foreign-shard|' "$shadow_env_source" ;;
+  esac
+  rm -f -- "$shadow_env_source.bak"
+  bad_payload="$ROOT/p-bad-$mutation"; bad_manifest="$ROOT/m-bad-$mutation.json"
+  publish_fixture "$bad_payload" "$bad_manifest" >/dev/null
+  bad_controller=$(monday_sha256_file "$bad_manifest")
+  if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+    "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c2" \
+    --candidate-controller "$bad_controller" --root "$ROOT" >/dev/null 2>&1; then
+    printf 'Gate accepted foreign shadow %s identity\n' "$mutation" >&2
+    exit 1
+  fi
+done
+rm -f -- "$shadow_env_source"
+cp -p -- "$shadow_env_saved" "$shadow_env_source"
+
 # If the second production lane fails during restore, both lanes must be
 # contained and the failed attempt must not emit a success receipt.
 restore_evidence="$ROOT/data/monday/evidence/restores/$c2"
@@ -585,12 +682,23 @@ copy_triplet_fixture() {
 }
 triplet_tmp="$ROOT/triplet-readback-tmp"
 triplet_readback=$(monday_verify_upload_triplet_readback "$triplet_status" spot spot_all bucket "$triplet_prefix" \
-  "$triplet_tmp" "$triplet_now" copy_triplet_fixture)
+  "$triplet_tmp" "$triplet_now" copy_triplet_fixture fixture-session)
 [[ $(jq -r '.data_sha256' <<<"$triplet_readback") == "$triplet_data_sha" ]]
+if monday_verify_upload_triplet_readback "$triplet_status" spot spot_all bucket "$triplet_prefix" \
+    "$triplet_tmp" "$triplet_now" copy_triplet_fixture changed-session >/dev/null 2>&1; then
+  printf 'triplet readback accepted a mismatched current health session\n' >&2
+  exit 1
+fi
 if jq '.last_success_at = "2000-01-01T00:00:00Z"' "$triplet_status" >"$triplet_status.stale" \
   && monday_verify_upload_triplet_readback "$triplet_status.stale" spot spot_all bucket "$triplet_prefix" \
     "$triplet_tmp" "$triplet_now" copy_triplet_fixture >/dev/null 2>&1; then
   printf 'triplet readback accepted stale last_success_at\n' >&2
+  exit 1
+fi
+if jq '.last_success_at = "2999-01-01T00:00:00Z"' "$triplet_status" >"$triplet_status.future" \
+  && monday_verify_upload_triplet_readback "$triplet_status.future" spot spot_all bucket "$triplet_prefix" \
+    "$triplet_tmp" "$triplet_now" copy_triplet_fixture >/dev/null 2>&1; then
+  printf 'triplet readback accepted future last_success_at\n' >&2
   exit 1
 fi
 if jq '.last_uploaded_triplet.data_uri |= sub("oss://bucket"; "oss://foreign")' "$triplet_status" \

@@ -62,6 +62,65 @@ and (.before | type == "object"
     and all(.[]; type == "string" and test("^[a-f0-9]{64}$"))))
 and (.production_assets | type == "object" and (keys | sort) == $production_asset_keys
   and all(.[]; type == "string" and test("^[a-f0-9]{64}$")))
+and (.production_runtime | type == "object"
+  and .schema == "monday.rust_lob_production_runtime.v1"
+  and .type == "simple"
+  and .exec_start == "/opt/monday/bin/binance-lob-archiver"
+  and .environment_file == "/etc/monday/binance-lob-archiver-production-%i.env"
+  and .user == "hftcollector"
+  and .group == "hftcollector"
+  and .restart == "always"
+  and .restart_sec == 5
+  and .runtime_max_sec == 21600
+  and .kill_mode == "mixed"
+  and .timeout_start_sec == 120
+  and .timeout_stop_sec == 600
+  and .cpu_quota == "80%"
+  and .memory_high == "2048M"
+  and .memory_max == "2560M"
+  and (.sandbox | type == "object"
+    and .no_new_privileges == true
+    and .private_tmp == true
+    and .protect_system == "strict"
+    and .protect_home == true
+    and .protect_kernel_tunables == true
+    and .protect_kernel_modules == true
+    and .protect_control_groups == true
+    and .lock_personality == true
+    and .restrict_suidsgid == true
+    and .state_directory == "hft-collector"
+    and .read_write_paths == ["/data/monday/spool/binance-lob", "/data/monday/spool/binance-lob-recovery"])
+  and (.upload | type == "object"
+    and .type == "oneshot"
+    and .exec_start == "/opt/monday/bin/binance-lob-archiver --upload-only"
+    and .environment_file == "/etc/monday/binance-lob-archiver-production-%i.env"
+    and .cpu_quota == "80%"
+    and .memory_high == "384M"
+    and .memory_max == "512M"
+    and .timeout_start_sec == 0)
+  and (.unit_sha256 | type == "object"
+    and (.collector | type == "string" and test("^[a-f0-9]{64}$"))
+    and (.upload | type == "string" and test("^[a-f0-9]{64}$")))
+  and (.env_sha256 | type == "object"
+    and (.spot | type == "string" and test("^[a-f0-9]{64}$"))
+    and (.usdm | type == "string" and test("^[a-f0-9]{64}$")))
+  and (.markets | type == "object" and (keys | sort) == ["spot", "usdm"]
+    and (.spot | type == "object"
+      and .market == "spot" and .dataset == "spot_all" and .symbols == "ALL"
+      and .shard_id == "all" and .spool_dir == "/data/monday/spool/binance-lob/spot"
+      and .oss_bucket == "monday-lob-apne1-1045353359"
+      and .oss_endpoint == "oss-ap-northeast-1-internal.aliyuncs.com"
+      and .oss_region == "ap-northeast-1" and .aliyun_profile == "ecs-role")
+    and (.usdm | type == "object"
+      and .market == "usdm" and .dataset == "usdm_perpetual_top100_lob"
+      and .shard_id == "all" and .ws_shard_size == 25
+      and .spool_dir == "/data/monday/spool/binance-lob/usdm"
+      and .oss_bucket == "monday-lob-apne1-1045353359"
+      and .oss_endpoint == "oss-ap-northeast-1-internal.aliyuncs.com"
+      and .oss_region == "ap-northeast-1" and .aliyun_profile == "ecs-role")
+    and (.usdm.symbols | type == "string")
+    and ((.usdm.symbols | split(",")) | length == 100)
+    and ((.usdm.symbols | split(",") | unique) | length == 100)))
 and (.production_process | type == "object")
 and (if .test_only then true else
   (.production_process | ((keys | sort) == ["spot", "usdm"]
@@ -93,6 +152,12 @@ and (.io_full_psi_windows | type == "array" and length >= 3
            and ($p.ratio | type == "number" and . >= 0)
          else true end)))
 and (.shadow_staging | type == "object"
+  and .mode == "run-scoped"
+  and (.run_unit_root | type == "string" and test("/run/monday/rust-lob-gate/[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*$"))
+  and (.spool_root | type == "string" and test("/data/monday/spool/binance-lob-rust-shadow/gate/[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*$"))
+  and (.units | type == "object" and (keys | sort) == ["spot", "usdm"]
+    and (.spot | type == "string" and test("^monday-rust-lob-gate-[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*-spot\\.service$"))
+    and (.usdm | type == "string" and test("^monday-rust-lob-gate-[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*-usdm\\.service$")))
   and (.candidate_assets | type == "object" and (keys | sort) == $shadow_asset_keys
     and all(.[]; type == "string" and test("^[a-f0-9]{64}$")))
   and (.restored_assets | type == "object" and (keys | sort) == $shadow_asset_keys
@@ -112,13 +177,16 @@ and (.shadow_staging | type == "object"
   and .restored_assets == .before_assets
   and (.binary | type == "object"
     and (.path | type == "string" and length > 0)
+    and (.candidate_target | type == "string" and (contains("/opt/monday/bin/") | not))
     and (.candidate_target | type == "string" and length > 0)
     and (.restored_present | type == "boolean")
     and ((.restored_target_sha256 == null)
       or (.restored_target_sha256 | type == "string" and test("^[a-f0-9]{64}$")))))
+  and (.binary.path == .run_unit_root)
 and (.checks | type == "object"
   and .before_pair_unchanged == true
   and .shadow_staging_verified == true
+  and .production_runtime_verified == true
   and .shadow_assets_restored == true
   and .resource_preflight == true
   and .oss_triplets == true
@@ -133,6 +201,12 @@ and (.markets | type == "object" and ((keys | sort) == ["spot", "usdm"])
     | (.market | type == "string")
     and (.dataset | type == "string" and length > 0)
     and (.session_id | type == "string" and length > 0)
+    and (.spool_dir | type == "string" and test("/data/monday/spool/binance-lob-rust-shadow/gate/[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*/(spot|usdm)$"))
+    and (.shard_id == "all")
+    and (.oss_bucket == "monday-lob-apne1-1045353359")
+    and (.oss_endpoint == "oss-ap-northeast-1-internal.aliyuncs.com")
+    and (.oss_region == "ap-northeast-1")
+    and (.aliyun_profile == "ecs-role")
     and (.expected_oss_bucket | type == "string" and length > 0)
     and (.expected_oss_prefix | type == "string" and length > 0)
     and ($m.segment_count | type == "number" and . >= 2 and . == ($m.segments | length))

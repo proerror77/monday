@@ -120,6 +120,9 @@ target_runtime=$(monday_manifest_field "$target_manifest" runtime_contract_sha25
 target_binary=$(monday_root_join "$ROOT" "opt/monday/releases/binance-lob-archiver/$target_payload/binance-lob-archiver")
 monday_file_direct "$target_binary" || die 'target payload binary is missing'
 [[ $(monday_sha256_file "$target_binary") == "$target_payload" ]] || die 'target payload digest mismatch'
+target_production_runtime=$(monday_verify_production_runtime_assets \
+  "$ROOT" "$target_release/deployment" "$target_payload") \
+  || die 'target production runtime contract failed static verification'
 
 # Only the immutable V2 receipt emitted by the candidate controller can
 # authorize a transition.  Test receipts remain explicitly ineligible.
@@ -149,6 +152,11 @@ else
 fi
 monday_validate_v2_gate "$GATE" "$FROM" "$TO" "$GATE_SHA" \
   || die 'Gate receipt does not authorize this exact pair transition'
+gate_production_runtime=$(jq -ce '.production_runtime' "$GATE") \
+  || die 'Gate receipt has no production runtime contract'
+jq -e --argjson expected "$target_production_runtime" \
+  '$expected == .production_runtime' "$GATE" >/dev/null \
+  || die 'Gate production runtime contract differs from target controller'
 jq -e --arg payload "$target_payload" --arg runtime "$target_runtime" \
   '.candidate_payload_sha256 == $payload and .candidate_runtime_contract_sha256 == $runtime' \
   "$GATE" >/dev/null || die 'Gate receipt payload/runtime differs from target controller'
@@ -491,15 +499,79 @@ else
   [[ -L $production && $(readlink -- "$production") == "$stable_projection" ]] \
     || die 'stable production projection is not active'
 fi
+# Re-read the exact static production contract after the active pair and all
+# projections are prepared, but before any production process is started.
+# This closes the identity window between Gate authorization and systemd.
+post_commit_production_runtime=$(monday_verify_production_runtime_assets \
+  "$ROOT" "$target_release/deployment" "$target_payload") \
+  || die 'target production runtime contract disappeared after pair commit'
+jq -e --argjson expected "$target_production_runtime" \
+  '$expected == .' <<<"$post_commit_production_runtime" >/dev/null \
+  || die 'target production runtime contract changed after pair commit'
 if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
   systemctl daemon-reload
+  cutover_started_ns=$(date +%s%N)
   systemctl start binance-lob-archiver-production@spot.service \
     || die 'Spot did not start after pair commit'
   systemctl start binance-lob-archiver-production@usdm.service \
     || die 'USD-M did not start after pair commit'
   systemctl is-active --quiet binance-lob-archiver-production@spot.service || die 'Spot did not start after pair commit'
   systemctl is-active --quiet binance-lob-archiver-production@usdm.service || die 'USD-M did not start after pair commit'
+else
+  cutover_started_ns=0
 fi
+production_process='{}'
+verify_production_process() {
+  local market unit active sub pid restarts exe exe_sha env_file env_file_resolved spool health session updated now_ns minimum_symbols
+  [[ $TEST_ONLY == true ]] && return 0
+  now_ns=$(date +%s%N)
+  for market in spot usdm; do
+    unit="binance-lob-archiver-production@${market}.service"
+    active=$(systemctl show "$unit" --property=ActiveState --value)
+    sub=$(systemctl show "$unit" --property=SubState --value)
+    [[ $active == active && $sub == running ]] || die "$market production unit is not running after cutover"
+    pid=$(systemctl show "$unit" --property=MainPID --value)
+    [[ $pid =~ ^[1-9][0-9]*$ ]] || die "$market production unit has no MainPID after cutover"
+    restarts=$(systemctl show "$unit" --property=NRestarts --value)
+    [[ $restarts == 0 ]] || die "$market production unit restarted during cutover"
+    exe=$(readlink -f -- "$(monday_root_join "$ROOT" "proc/$pid/exe")") \
+      || die "$market production executable is unavailable after cutover"
+    exe_sha=$(monday_sha256_file "$exe") || die "$market production executable cannot be hashed"
+    [[ $exe == "$target_binary" && $exe_sha == "$target_payload" ]] \
+      || die "$market production executable identity differs from target"
+    env_file=$(monday_runtime_asset_target "$ROOT" "binance-lob-archiver-production-$market.env") \
+      || die "$market production environment path is invalid"
+    env_file_resolved=$(readlink -f -- "$env_file") \
+      || die "$market production environment projection is dangling"
+    monday_file_direct "$env_file_resolved" \
+      || die "$market production environment projection is not a file"
+    spool=$(sed -n 's/^SPOOL_DIR=//p' "$env_file_resolved")
+    [[ $spool == "/data/monday/spool/binance-lob/$market" ]] \
+      || die "$market production spool is not the governed path"
+    [[ $ROOT == / ]] || spool="$ROOT$spool"
+    health="$spool/health.json"
+    [[ -f $health && ! -L $health ]] || die "$market production health is missing after cutover"
+    session=$(jq -er '.session_id // empty' "$health") \
+      || die "$market production health session is missing after cutover"
+    updated=$(jq -er '.updated_at_ns // 0' "$health") \
+      || die "$market production health timestamp is missing after cutover"
+    [[ $updated =~ ^[0-9]+$ ]] || die "$market production health timestamp is invalid after cutover"
+    (( updated >= cutover_started_ns && updated <= now_ns )) \
+      || die "$market production health timestamp is stale or in the future after cutover"
+    minimum_symbols=1000; [[ $market == usdm ]] && minimum_symbols=100
+    jq -e --arg market "$market" --arg dataset "$(sed -n 's/^DATASET=//p' "$env_file_resolved")" \
+      --argjson minimum "$minimum_symbols" \
+      '.market == $market and .dataset == $dataset and .status == "synced"
+       and .sequence_gaps == 0 and (.symbol_count | type == "number" and . >= $minimum)' \
+      "$health" >/dev/null \
+      || die "$market production health is not fresh and synchronized after cutover"
+    production_process=$(jq -cn --argjson values "$production_process" --arg market "$market" \
+      --argjson pid "$pid" --arg exe "$exe_sha" --argjson restarts "$restarts" \
+      --arg session "$session" --argjson observed "$updated" \
+      '$values + {($market):{active:true,main_pid:$pid,process_exe_sha256:$exe,n_restarts:$restarts,session_id:$session,observed_at_ns:$observed}}')
+  done
+}
+verify_production_process
 [[ -L $production && $(readlink -- "$production") == "$stable_projection" ]] \
   || die 'stable production projection is not active'
 [[ $(readlink -f -- "$production") == "$target_binary" ]] || die 'production payload does not resolve to target'
@@ -551,7 +623,9 @@ source_mode=stable
 jq -cS -n --arg from "$before_controller" --arg source_mode "$source_mode" --arg to "$TO" --arg payload "$target_payload" --arg runtime "$target_runtime" \
   --arg before_payload "$before_payload" --arg before_runtime "$before_runtime" --arg gate "$GATE" --arg gate_sha "$GATE_SHA" \
   --arg completed "$completed_at" --arg stable "/opt/monday/releases/binance-lob-controller/active/binance-lob-archiver" \
-  --arg projection "$stable_projection" --argjson evidence "$gate_evidence" --argjson before_assets "$before_assets" \
+  --arg projection "$stable_projection" --argjson evidence "$gate_evidence" \
+  --argjson production_runtime "$gate_production_runtime" --argjson production_process "$production_process" \
+  --argjson before_assets "$before_assets" \
   --argjson installed_assets "$installed_assets" --argjson installed_projections "$installed_projections" \
   --argjson installed_controller_projections "$installed_controller_projections" \
   --argjson test_only "$TEST_ONLY" --argjson eligible "$( [[ $TEST_ONLY == true ]] && printf false || printf true )" \
@@ -559,6 +633,7 @@ jq -cS -n --arg from "$before_controller" --arg source_mode "$source_mode" --arg
     test_only:$test_only,production_eligible:$eligible,source_mode:$source_mode,from_source_mode:$source_mode,
     from_controller_sha256:$from,controller_sha256:$to,
     payload_sha256:$payload,runtime_contract_sha256:$runtime,gate_receipt:$gate,gate_sha256:$gate_sha,
+    production_runtime:$production_runtime,production_process:$production_process,
     gate_evidence:$evidence,active_pair_committed:true,completed_at:$completed,
     stable_production_projection:$stable,production_projection:$projection,
     before:{controller:$from,payload_sha256:$before_payload,runtime_contract_sha256:$before_runtime,

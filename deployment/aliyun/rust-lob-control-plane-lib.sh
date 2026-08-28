@@ -236,6 +236,164 @@ monday_rust_lob_live_runtime_contract_sha256() {
   printf '%s\n' "$digest"
 }
 
+# Strict, read-only verifier for the production runtime that a controller
+# release would install.  Gate and Cutover both call this function so the
+# bytes checked before authorization are the same bytes checked at commit.
+# The unit templates intentionally keep one fixed production topology; adding
+# another runtime mode would require a new reviewed contract, not a fallback.
+monday_unit_exact_line() {
+  [[ $# -eq 3 ]] || return 2
+  local file=$1 key=$2 value=$3
+  [[ $(grep -Fxc "$key=$value" "$file" || true) -eq 1 ]]
+}
+
+monday_env_value() {
+  [[ $# -eq 2 ]] || return 2
+  local file=$1 key=$2 count value
+  count=$(grep -c "^${key}=" "$file" || true)
+  [[ $count -eq 1 ]] || return 1
+  value=$(sed -n "s/^${key}=//p" "$file")
+  [[ -n $value ]] || return 1
+  printf '%s\n' "$value"
+}
+
+monday_validate_usdm_symbols() {
+  [[ $# -eq 1 ]] || return 2
+  local value=$1 unique
+  [[ $value =~ ^[A-Z0-9]+(,[A-Z0-9]+)*$ ]] || return 1
+  local -a symbols
+  IFS=, read -r -a symbols <<<"$value"
+  (( ${#symbols[@]} == 100 )) || return 1
+  unique=$(printf '%s\n' "${symbols[@]}" | sort -u | wc -l)
+  (( unique == 100 ))
+}
+
+monday_validate_production_env() {
+  [[ $# -eq 3 ]] || return 2
+  local file=$1 market=$2 dataset=$3 symbols spool
+  monday_file_direct "$file" || return 1
+  [[ $(monday_env_value "$file" MARKET) == "$market" ]] || return 1
+  [[ $(monday_env_value "$file" DATASET) == "$dataset" ]] || return 1
+  [[ $(monday_env_value "$file" SHARD_ID) == all ]] || return 1
+  symbols=$(monday_env_value "$file" SYMBOLS) || return 1
+  if [[ $market == spot ]]; then
+    [[ $symbols == ALL ]] || return 1
+  else
+    monday_validate_usdm_symbols "$symbols" || return 1
+    [[ $(monday_env_value "$file" WS_SHARD_SIZE) == 25 ]] || return 1
+  fi
+  [[ $(monday_env_value "$file" DEPTH_MODE) == diff ]] || return 1
+  [[ $(monday_env_value "$file" SEGMENT_SECONDS) == 3600 ]] || return 1
+  spool="/data/monday/spool/binance-lob/$market"
+  [[ $(monday_env_value "$file" SPOOL_DIR) == "$spool" ]] || return 1
+  [[ $(monday_env_value "$file" OSS_BUCKET) == monday-lob-apne1-1045353359 ]] || return 1
+  [[ $(monday_env_value "$file" OSS_ENDPOINT) == oss-ap-northeast-1-internal.aliyuncs.com ]] || return 1
+  [[ $(monday_env_value "$file" OSS_REGION) == ap-northeast-1 ]] || return 1
+  [[ $(monday_env_value "$file" ALIYUN_PROFILE) == ecs-role ]] || return 1
+}
+
+monday_verify_production_runtime_assets() {
+  [[ $# -eq 3 ]] || return 2
+  local root=$1 deployment=$2 payload=$3 service upload spot_env usdm_env target
+  local service_sha upload_sha spot_sha usdm_sha production_json markets_json
+  monday_sha256_ok "$payload" || return 1
+  monday_path_direct "$deployment" || return 1
+  service="$deployment/binance-lob-archiver-production@.service"
+  upload="$deployment/binance-lob-archiver-upload@.service"
+  spot_env="$deployment/binance-lob-archiver-production-spot.env"
+  usdm_env="$deployment/binance-lob-archiver-production-usdm.env"
+  for file in "$service" "$upload" "$spot_env" "$usdm_env"; do
+    monday_file_direct "$file" || return 1
+  done
+
+  # Candidate ExecStart is the only stable production projection.  The
+  # candidate payload itself is checked at its immutable digest path below.
+  monday_unit_exact_line "$service" Type simple || return 1
+  monday_unit_exact_line "$service" User hftcollector || return 1
+  monday_unit_exact_line "$service" Group hftcollector || return 1
+  monday_unit_exact_line "$service" EnvironmentFile /etc/monday/binance-lob-archiver-production-%i.env || return 1
+  monday_unit_exact_line "$service" ExecStart /opt/monday/bin/binance-lob-archiver || return 1
+  monday_unit_exact_line "$service" Restart always || return 1
+  monday_unit_exact_line "$service" RestartSec 5 || return 1
+  monday_unit_exact_line "$service" RuntimeMaxSec 21600 || return 1
+  monday_unit_exact_line "$service" KillMode mixed || return 1
+  monday_unit_exact_line "$service" TimeoutStartSec 120 || return 1
+  monday_unit_exact_line "$service" TimeoutStopSec 600 || return 1
+  monday_unit_exact_line "$service" NoNewPrivileges true || return 1
+  monday_unit_exact_line "$service" PrivateTmp true || return 1
+  monday_unit_exact_line "$service" ProtectSystem strict || return 1
+  monday_unit_exact_line "$service" ProtectHome true || return 1
+  monday_unit_exact_line "$service" ProtectKernelTunables true || return 1
+  monday_unit_exact_line "$service" ProtectKernelModules true || return 1
+  monday_unit_exact_line "$service" ProtectControlGroups true || return 1
+  monday_unit_exact_line "$service" LockPersonality true || return 1
+  monday_unit_exact_line "$service" RestrictSUIDSGID true || return 1
+  monday_unit_exact_line "$service" StateDirectory hft-collector || return 1
+  monday_unit_exact_line "$service" ReadWritePaths '/data/monday/spool/binance-lob -/data/monday/spool/binance-lob-recovery' || return 1
+  monday_unit_exact_line "$service" CPUQuota '80%' || return 1
+  monday_unit_exact_line "$service" MemoryHigh '2048M' || return 1
+  monday_unit_exact_line "$service" MemoryMax '2560M' || return 1
+  monday_unit_exact_line "$service" AssertPathIsMountPoint /data || return 1
+  monday_unit_exact_line "$service" StartLimitIntervalSec 7200 || return 1
+  monday_unit_exact_line "$service" StartLimitBurst 5 || return 1
+  [[ $(grep -Fxc 'ExecStartPre=/opt/monday/bin/binance-lob-archiver --self-test' "$service" || true) -eq 1 ]] || return 1
+  [[ $(grep -Fxc 'ExecStartPre=+/opt/monday/bin/monday-rust-lob-recovery-queue isolate %i' "$service" || true) -eq 1 ]] || return 1
+  [[ $(grep -c '^EnvironmentFile=' "$service" || true) -eq 1 ]] || return 1
+  [[ $(grep -c '^ExecStartPre=' "$service" || true) -eq 2 ]] || return 1
+  [[ $(grep -c '^ExecStart=' "$service" || true) -eq 1 ]] || return 1
+
+  monday_unit_exact_line "$upload" Type oneshot || return 1
+  monday_unit_exact_line "$upload" User hftcollector || return 1
+  monday_unit_exact_line "$upload" Group hftcollector || return 1
+  monday_unit_exact_line "$upload" EnvironmentFile /etc/monday/binance-lob-archiver-production-%i.env || return 1
+  monday_unit_exact_line "$upload" ExecStart '/opt/monday/bin/binance-lob-archiver --upload-only' || return 1
+  monday_unit_exact_line "$upload" TimeoutStartSec 0 || return 1
+  monday_unit_exact_line "$upload" NoNewPrivileges true || return 1
+  monday_unit_exact_line "$upload" PrivateTmp true || return 1
+  monday_unit_exact_line "$upload" ProtectSystem strict || return 1
+  monday_unit_exact_line "$upload" ProtectHome true || return 1
+  monday_unit_exact_line "$upload" ProtectKernelTunables true || return 1
+  monday_unit_exact_line "$upload" ProtectKernelModules true || return 1
+  monday_unit_exact_line "$upload" ProtectControlGroups true || return 1
+  monday_unit_exact_line "$upload" LockPersonality true || return 1
+  monday_unit_exact_line "$upload" RestrictSUIDSGID true || return 1
+  monday_unit_exact_line "$upload" StateDirectory hft-collector || return 1
+  monday_unit_exact_line "$upload" ReadWritePaths /data/monday/spool/binance-lob || return 1
+  monday_unit_exact_line "$upload" CPUQuota '80%' || return 1
+  monday_unit_exact_line "$upload" MemoryHigh '384M' || return 1
+  monday_unit_exact_line "$upload" MemoryMax '512M' || return 1
+  monday_unit_exact_line "$upload" AssertPathIsMountPoint /data || return 1
+  [[ $(grep -c '^ExecStart=' "$upload" || true) -eq 1 ]] || return 1
+  [[ $(grep -c '^EnvironmentFile=' "$upload" || true) -eq 1 ]] || return 1
+  [[ $(grep -c '^ExecStartPre=' "$upload" || true) -eq 0 ]] || return 1
+  [[ $(grep -c '^Restart=' "$upload" || true) -eq 0 ]] || return 1
+
+  monday_validate_production_env "$spot_env" spot spot_all || return 1
+  monday_validate_production_env "$usdm_env" usdm usdm_perpetual_top100_lob || return 1
+  target=$(monday_root_join "$root" "opt/monday/releases/binance-lob-archiver/$payload/binance-lob-archiver") || return 1
+  monday_file_direct "$target" || return 1
+  [[ -x $target && $(monday_sha256_file "$target") == "$payload" ]] || return 1
+
+  service_sha=$(monday_sha256_file "$service") || return 1
+  upload_sha=$(monday_sha256_file "$upload") || return 1
+  spot_sha=$(monday_sha256_file "$spot_env") || return 1
+  usdm_sha=$(monday_sha256_file "$usdm_env") || return 1
+  markets_json=$(jq -cn \
+    --arg spot_market spot --arg spot_dataset spot_all \
+    --arg spot_symbols "$(monday_env_value "$spot_env" SYMBOLS)" \
+    --arg spot_spool /data/monday/spool/binance-lob/spot \
+    --arg usdm_market usdm --arg usdm_dataset usdm_perpetual_top100_lob \
+    --arg usdm_symbols "$(monday_env_value "$usdm_env" SYMBOLS)" \
+    --arg usdm_spool /data/monday/spool/binance-lob/usdm \
+    '{spot:{market:$spot_market,dataset:$spot_dataset,symbols:$spot_symbols,shard_id:"all",spool_dir:$spot_spool,oss_bucket:"monday-lob-apne1-1045353359",oss_endpoint:"oss-ap-northeast-1-internal.aliyuncs.com",oss_region:"ap-northeast-1",aliyun_profile:"ecs-role"},usdm:{market:$usdm_market,dataset:$usdm_dataset,symbols:$usdm_symbols,shard_id:"all",spool_dir:$usdm_spool,oss_bucket:"monday-lob-apne1-1045353359",oss_endpoint:"oss-ap-northeast-1-internal.aliyuncs.com",oss_region:"ap-northeast-1",aliyun_profile:"ecs-role",ws_shard_size:25}}') || return 1
+  production_json=$(jq -cnS \
+    --arg service_sha "$service_sha" --arg upload_sha "$upload_sha" \
+    --arg spot_sha "$spot_sha" --arg usdm_sha "$usdm_sha" \
+    --argjson markets "$markets_json" \
+    '{schema:"monday.rust_lob_production_runtime.v1",exec_start:"/opt/monday/bin/binance-lob-archiver",environment_file:"/etc/monday/binance-lob-archiver-production-%i.env",user:"hftcollector",group:"hftcollector",restart:"always",restart_sec:5,runtime_max_sec:21600,kill_mode:"mixed",timeout_start_sec:120,timeout_stop_sec:600,type:"simple",cpu_quota:"80%",memory_high:"2048M",memory_max:"2560M",sandbox:{no_new_privileges:true,private_tmp:true,protect_system:"strict",protect_home:true,protect_kernel_tunables:true,protect_kernel_modules:true,protect_control_groups:true,lock_personality:true,restrict_suidsgid:true,state_directory:"hft-collector",read_write_paths:["/data/monday/spool/binance-lob","/data/monday/spool/binance-lob-recovery"]},upload:{type:"oneshot",exec_start:"/opt/monday/bin/binance-lob-archiver --upload-only",environment_file:"/etc/monday/binance-lob-archiver-production-%i.env",cpu_quota:"80%",memory_high:"384M",memory_max:"512M",timeout_start_sec:0},unit_sha256:{collector:$service_sha,upload:$upload_sha},env_sha256:{spot:$spot_sha,usdm:$usdm_sha},markets:$markets}') || return 1
+  printf '%s\n' "$production_json"
+}
+
 monday_controller_release_sha256() {
   [[ $# -eq 1 ]] || return 2
   monday_sha256_file "$1/release.json"
@@ -503,6 +661,65 @@ monday_validate_v2_gate() {
         and all(.[]; type == "string" and test("^[a-f0-9]{64}$")))
       and (.production_assets | type == "object" and (keys | sort) == $production_asset_keys
         and all(.[]; type == "string" and test("^[a-f0-9]{64}$")))
+      and (.production_runtime | type == "object"
+        and .schema == "monday.rust_lob_production_runtime.v1"
+        and .type == "simple"
+        and .exec_start == "/opt/monday/bin/binance-lob-archiver"
+        and .environment_file == "/etc/monday/binance-lob-archiver-production-%i.env"
+        and .user == "hftcollector"
+        and .group == "hftcollector"
+        and .restart == "always"
+        and .restart_sec == 5
+        and .runtime_max_sec == 21600
+        and .kill_mode == "mixed"
+        and .timeout_start_sec == 120
+        and .timeout_stop_sec == 600
+        and .cpu_quota == "80%"
+        and .memory_high == "2048M"
+        and .memory_max == "2560M"
+        and (.sandbox | type == "object"
+          and .no_new_privileges == true
+          and .private_tmp == true
+          and .protect_system == "strict"
+          and .protect_home == true
+          and .protect_kernel_tunables == true
+          and .protect_kernel_modules == true
+          and .protect_control_groups == true
+          and .lock_personality == true
+          and .restrict_suidsgid == true
+          and .state_directory == "hft-collector"
+          and .read_write_paths == ["/data/monday/spool/binance-lob", "/data/monday/spool/binance-lob-recovery"])
+        and (.upload | type == "object"
+          and .type == "oneshot"
+          and .exec_start == "/opt/monday/bin/binance-lob-archiver --upload-only"
+          and .environment_file == "/etc/monday/binance-lob-archiver-production-%i.env"
+          and .cpu_quota == "80%"
+          and .memory_high == "384M"
+          and .memory_max == "512M"
+          and .timeout_start_sec == 0)
+        and (.unit_sha256 | type == "object"
+          and (.collector | type == "string" and test("^[a-f0-9]{64}$"))
+          and (.upload | type == "string" and test("^[a-f0-9]{64}$")))
+        and (.env_sha256 | type == "object"
+          and (.spot | type == "string" and test("^[a-f0-9]{64}$"))
+          and (.usdm | type == "string" and test("^[a-f0-9]{64}$")))
+        and (.markets | type == "object" and (keys | sort) == ["spot", "usdm"]
+          and (.spot | type == "object"
+            and .market == "spot" and .dataset == "spot_all" and .symbols == "ALL"
+            and .shard_id == "all" and .spool_dir == "/data/monday/spool/binance-lob/spot"
+            and .oss_bucket == "monday-lob-apne1-1045353359"
+            and .oss_endpoint == "oss-ap-northeast-1-internal.aliyuncs.com"
+            and .oss_region == "ap-northeast-1" and .aliyun_profile == "ecs-role")
+          and (.usdm | type == "object"
+            and .market == "usdm" and .dataset == "usdm_perpetual_top100_lob"
+            and .shard_id == "all" and .ws_shard_size == 25
+            and .spool_dir == "/data/monday/spool/binance-lob/usdm"
+            and .oss_bucket == "monday-lob-apne1-1045353359"
+            and .oss_endpoint == "oss-ap-northeast-1-internal.aliyuncs.com"
+            and .oss_region == "ap-northeast-1" and .aliyun_profile == "ecs-role")
+          and (.usdm.symbols | type == "string")
+          and ((.usdm.symbols | split(",")) | length == 100)
+          and ((.usdm.symbols | split(",") | unique) | length == 100)))
       and (.production_process | type == "object")
       and (if .test_only then true else
         (.production_process | ((keys | sort) == ["spot", "usdm"]
@@ -534,7 +751,14 @@ monday_validate_v2_gate() {
                  and ($p.ratio | type == "number" and . >= 0)
                else true end)))
       and (.shadow_staging | type == "object"
-        and (.candidate_assets | type == "object" and (keys | sort) == $shadow_asset_keys)
+        and .mode == "run-scoped"
+        and (.run_unit_root | type == "string" and test("/run/monday/rust-lob-gate/[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*$"))
+        and (.spool_root | type == "string" and test("/data/monday/spool/binance-lob-rust-shadow/gate/[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*$"))
+        and (.units | type == "object" and (keys | sort) == ["spot", "usdm"]
+          and (.spot | type == "string" and test("^monday-rust-lob-gate-[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*-spot\\.service$"))
+          and (.usdm | type == "string" and test("^monday-rust-lob-gate-[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*-usdm\\.service$")))
+        and (.candidate_assets | type == "object" and (keys | sort) == $shadow_asset_keys
+          and all(.[]; type == "string" and test("^[a-f0-9]{64}$")))
         and (.restored_assets | type == "object" and (keys | sort) == $shadow_asset_keys)
         and (.before_assets | type == "object" and (keys | sort) == $shadow_asset_keys)
         and (.restored_assets == .before_assets)
@@ -545,12 +769,15 @@ monday_validate_v2_gate() {
            or (.state == "projection"
              and (.target | type == "string" and length > 0)
              and (.sha256 | type == "string" and test("^[a-f0-9]{64}$")))))
-        and (.binary | type == "object" and (.candidate_target | type == "string")
+        and (.binary | type == "object" and (.path | type == "string")
+          and (.candidate_target | type == "string" and (contains("/opt/monday/bin/") | not))
           and (.restored_present | type == "boolean")
           and ((.restored_target_sha256 == null)
             or (.restored_target_sha256 | type == "string" and test("^[a-f0-9]{64}$")))))
+        and (.binary.path == .run_unit_root)
       and (.checks | type == "object"
         and .before_pair_unchanged == true
+        and .production_runtime_verified == true
         and .shadow_staging_verified == true
         and .shadow_assets_restored == true
         and .resource_preflight == true
@@ -566,6 +793,12 @@ monday_validate_v2_gate() {
           | (.market | type == "string")
           and (.dataset | type == "string" and length > 0)
           and (.session_id | type == "string" and length > 0)
+          and (.spool_dir | type == "string" and test("/data/monday/spool/binance-lob-rust-shadow/gate/[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*/(spot|usdm)$"))
+          and (.shard_id == "all")
+          and (.oss_bucket == "monday-lob-apne1-1045353359")
+          and (.oss_endpoint == "oss-ap-northeast-1-internal.aliyuncs.com")
+          and (.oss_region == "ap-northeast-1")
+          and (.aliyun_profile == "ecs-role")
           and (.expected_oss_bucket | type == "string" and length > 0)
           and (.expected_oss_prefix | type == "string" and length > 0)
           and ($m.segment_count | type == "number" and . >= 2 and . == ($m.segments | length))
@@ -629,7 +862,7 @@ monday_validate_v2_gate() {
 monday_validate_v2_transition() {
   [[ $# -eq 5 ]] || return 2
   local receipt=$1 from=$2 to=$3 gate=$4 gate_sha=$5
-  local gate_evidence gate_payload gate_runtime gate_from pair_asset_keys controller_projection_keys
+  local gate_evidence gate_payload gate_runtime gate_from gate_production_runtime pair_asset_keys controller_projection_keys
   # The stable pair contains exactly the eight runtime unit/env assets
   # (production + shadow).  Recovery/health helpers remain controller assets
   # and are addressed through the immutable active controller, never copied
@@ -646,6 +879,7 @@ monday_validate_v2_transition() {
   gate_payload=$(jq -er '.candidate_payload_sha256' "$gate") || return 1
   gate_runtime=$(jq -er '.candidate_runtime_contract_sha256' "$gate") || return 1
   gate_from=$(jq -er '.from_controller_sha256' "$gate") || return 1
+  gate_production_runtime=$(jq -ce '.production_runtime' "$gate") || return 1
   controller_projection_keys=$(monday_controller_projection_assets | jq -Rsc 'split("\n") | map(select(length > 0)) | sort') || return 1
   jq -e --arg from "$from" --arg to "$to" --arg gate "$gate" --arg gate_sha "$gate_sha" \
     --arg gate_from "$gate_from" --arg payload "$gate_payload" --arg runtime "$gate_runtime" \
@@ -668,6 +902,18 @@ monday_validate_v2_transition() {
     and .gate_sha256 == $gate_sha
     and (.test_only | type == "boolean")
     and (if .test_only then .production_eligible == false else .production_eligible == true end)
+    and (.production_runtime | type == "object")
+    and (.production_process | type == "object")
+    and (if .test_only then .production_process == {} else
+      ((.production_process | keys | sort) == ["spot", "usdm"]
+       and all(.production_process[];
+         .active == true
+         and (.main_pid | type == "number" and . >= 1)
+         and (.process_exe_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+         and (.n_restarts | type == "number" and . == 0)
+         and (.session_id | type == "string" and length > 0)
+         and (.observed_at_ns | type == "number" and . >= 0)))
+    end)
     and .active_pair_committed == true
     and (.completed_at | type == "string" and length > 0)
     and (.stable_production_projection | type == "string"
@@ -702,25 +948,36 @@ monday_validate_v2_transition() {
     "$receipt" >/dev/null
   jq -e --argjson expected "$gate_evidence" \
     '.gate_evidence == $expected' "$receipt" >/dev/null
+  jq -e --argjson expected "$gate_production_runtime" \
+    '.production_runtime == $expected' "$receipt" >/dev/null
 }
 
 # Verify one production upload-status triplet using an injected copy function.
 # The caller owns the OSS credentials; this helper owns URI identity, triplet
 # bytes, marker content, and manifest re-download consistency.
 monday_verify_upload_triplet_readback() {
-  [[ $# -eq 8 ]] || return 2
+  [[ $# -eq 8 || $# -eq 9 ]] || return 2
   local status=$1 market=$2 dataset=$3 expected_bucket=$4 expected_prefix=$5
-  local tmp_root=$6 minimum_success_at=$7 copy_fn=$8 triplet data_uri manifest_uri success_uri
+  local tmp_root=$6 minimum_success_at=$7 copy_fn=$8 expected_session=${9:-}
+  local triplet data_uri manifest_uri success_uri status_session triplet_session
   local data_sha manifest_sha success_sha object_prefix first_manifest second_manifest
   local data_file manifest_file success_file expected_success_file expected_prefix_norm
   monday_file_direct "$status" || return 1
   jq -e '.last_error == null' "$status" >/dev/null || return 1
+  status_session=$(jq -er '.session_id // empty' "$status") || true
+  if [[ -n $expected_session && -n $status_session ]]; then
+    [[ $status_session == "$expected_session" ]] || return 1
+  fi
   [[ $market == spot || $market == usdm ]] || return 1
   [[ $dataset =~ ^[A-Za-z0-9_.-]+$ && $expected_bucket =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || return 1
   expected_prefix_norm=${expected_prefix%/}
   [[ -n $expected_prefix_norm && $expected_prefix_norm != /* ]] || return 1
   declare -F "$copy_fn" >/dev/null 2>&1 || return 2
   triplet=$(jq -cer '.last_uploaded_triplet | objects' "$status") || return 1
+  triplet_session=$(jq -er '.session_id // empty' <<<"$triplet") || true
+  if [[ -n $expected_session && -n $triplet_session ]]; then
+    [[ $triplet_session == "$expected_session" ]] || return 1
+  fi
   data_sha=$(jq -er '.data_sha256' <<<"$triplet") || return 1
   manifest_sha=$(jq -er '.manifest_sha256' <<<"$triplet") || return 1
   success_sha=$(jq -er '.success_sha256' <<<"$triplet") || return 1
@@ -766,17 +1023,23 @@ monday_verify_upload_triplet_readback() {
         | type == "string" and length > 0)
       and (.catalog_sha256? // "" | type == "string")' \
     "$manifest_file" >/dev/null || return 1
+  success_at=$(jq -er '.last_success_at' "$status") || return 1
+  success_epoch=$(monday_iso_epoch "$success_at") || return 1
+  now_epoch=$(date -u +%s) || return 1
+  ((success_epoch <= now_epoch)) || return 1
   if [[ -n $minimum_success_at ]]; then
-    success_at=$(jq -er '.last_success_at' "$status") || return 1
     minimum_epoch=$(monday_iso_epoch "$minimum_success_at") || return 1
-    success_epoch=$(monday_iso_epoch "$success_at") || return 1
     ((success_epoch >= minimum_epoch)) || return 1
+  fi
+  manifest_session=$(jq -er '.session_id // .lob_continuity.capture_session_id' "$manifest_file") || return 1
+  if [[ -n $expected_session ]]; then
+    [[ $manifest_session == "$expected_session" ]] || return 1
   fi
   jq -cn --arg market "$market" --arg data_uri "$data_uri" --arg manifest_uri "$manifest_uri" \
     --arg success_uri "$success_uri" --arg data_sha "$data_sha" --arg manifest_sha "$manifest_sha" \
     --arg success_sha "$success_sha" --arg object_prefix "$object_prefix" \
     --arg last_success_at "$(jq -er '.last_success_at' "$status")" \
-    --arg session "$(jq -er '.session_id // .lob_continuity.capture_session_id' "$manifest_file")" \
+    --arg session "$manifest_session" \
     --arg catalog "$(jq -er '.catalog_sha256 // ""' "$manifest_file")" \
     '{market:$market,data_uri:$data_uri,manifest_uri:$manifest_uri,success_uri:$success_uri,
       data_sha256:$data_sha,manifest_sha256:$manifest_sha,success_sha256:$success_sha,
