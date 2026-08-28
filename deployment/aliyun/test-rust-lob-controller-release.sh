@@ -34,8 +34,6 @@ assets=(
   binance-lob-archiver-production-usdm.env
   binance-lob-archiver-rust-spot.env
   binance-lob-archiver-rust-usdm.env
-  host-rust-lob-shadow-preflight.sh
-  host-rust-lob-shadow-soak.sh
   host-rust-lob-shadow-gate.sh
   host-rust-lob-cutover.sh
   host-rust-lob-restore.sh
@@ -101,6 +99,16 @@ ln -s "$artifact_release/binance-lob-archiver" \
 bundle="$tmp_dir/deployment.tar"
 manifest="$tmp_dir/controller-release.json"
 make_bundle "$bundle_source" "$bundle"
+bundle_members=$(tar -tf "$bundle")
+grep -Fxq 'host-rust-lob-shadow-gate.sh' <<<"$bundle_members"
+for removed_asset in \
+  host-rust-lob-shadow-preflight.sh \
+  host-rust-lob-shadow-soak.sh; do
+  if grep -Fxq "$removed_asset" <<<"$bundle_members"; then
+    printf 'controller release bundle retained removed asset: %s\n' "$removed_asset" >&2
+    exit 1
+  fi
+done
 bundle_sha=$(sha256sum "$bundle" | awk '{print $1}')
 write_manifest "$manifest" "$artifact_sha" "$bundle_sha" "$runtime_contract"
 manifest_sha=$(sha256sum "$manifest" | awk '{print $1}')
