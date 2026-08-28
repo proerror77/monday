@@ -78,4 +78,57 @@ if publish_controller_release "$payload" "$extra_bundle" "$ROOT/extra.json" "$RO
   exit 1
 fi
 
+# Release transfers the fixed publisher through the digest-checked OSS bundle,
+# not inline in Cloud Assistant. Keep the Base64 command below the 16 KiB
+# RunCommand limit so a future change cannot reintroduce oversized content.
+release_script="$SCRIPT_DIR/publish-rust-lob-pair-release.sh"
+for forbidden in fixed_publisher_b64 fixed_lib_b64; do
+  if grep -Fq "$forbidden" "$release_script"; then
+    printf 'release command still inlines %s\n' "$forbidden" >&2
+    exit 1
+  fi
+done
+release_line() {
+  awk -v first="$1" -v second="$2" -v third="${3:-}" \
+    'index($0, first) && index($0, second) && (third == "" || index($0, third)) { print NR; exit }' \
+    "$release_script"
+}
+bundle_check_line=$(release_line "\$bundle_sha" 'deployment.tar' 'sha256sum --check --strict')
+extract_publisher_line=$(release_line 'tar -xOf' 'host-rust-lob-controller-release.sh')
+extract_lib_line=$(release_line 'tar -xOf' 'rust-lob-control-plane-lib.sh')
+publisher_check_line=$(release_line 'fixed-publisher.sh' 'sha256sum --check --strict')
+lib_check_line=$(release_line 'rust-lob-control-plane-lib.sh' 'sha256sum --check --strict')
+execute_line=$(release_line 'bash' 'fixed-publisher.sh' 'payload')
+[[ $bundle_check_line =~ ^[0-9]+$ && $extract_publisher_line =~ ^[0-9]+$ \
+  && $extract_lib_line =~ ^[0-9]+$ && $publisher_check_line =~ ^[0-9]+$ \
+  && $lib_check_line =~ ^[0-9]+$ && $execute_line =~ ^[0-9]+$ ]] \
+  || { printf 'release command transport/check sequence is incomplete\n' >&2; exit 1; }
+(( bundle_check_line < extract_publisher_line \
+  && extract_publisher_line < extract_lib_line \
+  && extract_lib_line < publisher_check_line \
+  && extract_lib_line < lib_check_line \
+  && publisher_check_line < execute_line \
+  && lib_check_line < execute_line ))
+
+# The release script deliberately refuses a dirty checkout. Build a minimal
+# clean fixture repository so this test exercises its real identity guard.
+command_repo="$ROOT/release-command-repo"
+mkdir -p "$command_repo/deployment/aliyun"
+while IFS= read -r asset; do
+  cp -p "$SCRIPT_DIR/$asset" "$command_repo/deployment/aliyun/$asset"
+done < <({ monday_runtime_assets; monday_controller_assets; } | sort -u)
+cp -p "$release_script" "$command_repo/deployment/aliyun/publish-rust-lob-pair-release.sh"
+git -C "$command_repo" init -q
+git -C "$command_repo" config user.name monday-test
+git -C "$command_repo" config user.email monday-test@example.invalid
+git -C "$command_repo" add deployment/aliyun
+git -C "$command_repo" commit -qm 'release command fixture'
+source_revision=$(git -C "$command_repo" rev-parse HEAD)
+dry_run=$(MONDAY_CONTROL_PLANE_DRY_RUN=1 MONDAY_CONTROL_PLANE_TEST=1 \
+  "$command_repo/deployment/aliyun/publish-rust-lob-pair-release.sh" \
+  --instance i-fixture --artifact-uri oss://bucket/payload \
+  --artifact-sha256 "$(printf 'd%.0s' {1..64})" --source-revision "$source_revision")
+jq -e '.operation == "release" and (.command_bytes | type == "number" and . <= 16384)' \
+  <<<"$dry_run" >/dev/null
+
 printf 'controller V2 release contract passed\n'
