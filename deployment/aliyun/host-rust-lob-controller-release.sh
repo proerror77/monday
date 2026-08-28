@@ -12,7 +12,6 @@ configure_paths() {
   local root=${1%/}
   ARTIFACT_RELEASE_ROOT="$root/opt/monday/releases/binance-lob-archiver"
   CONTROLLER_RELEASE_ROOT="$root/opt/monday/releases/binance-lob-controller"
-  PRODUCTION_BINARY="$root/opt/monday/bin/binance-lob-archiver"
   LOCK_ROOT="$root/run/lock"
 }
 
@@ -34,6 +33,64 @@ direct_directory() {
 
 regular_file() {
   [[ -f $1 && ! -L $1 ]]
+}
+
+runtime_contract_sha256_v1() {
+  [[ $# -eq 1 ]] || return 2
+  local directory=$1 asset digest
+  local -a assets=(
+    binance-lob-archiver-production@.service
+    binance-lob-archiver-rust@.service
+    binance-lob-archiver-upload@.service
+    binance-lob-archiver-rust-upload@.service
+    binance-lob-archiver-production-spot.env
+    binance-lob-archiver-production-usdm.env
+    binance-lob-archiver-rust-spot.env
+    binance-lob-archiver-rust-usdm.env
+  )
+
+  for asset in "${assets[@]}"; do
+    regular_file "$directory/$asset" || return 1
+  done
+  {
+    for asset in "${assets[@]}"; do
+      digest=$(sha256_file "$directory/$asset")
+      printf '%s  %s\n' "$digest" "$asset"
+    done
+  } | sha256sum | awk '{print $1}'
+}
+
+verify_staged_artifact_release() {
+  local release_dir=$1 artifact_sha=$2 artifact_uri=$3 runtime_contract=$4
+  local artifact_binary="$release_dir/binance-lob-archiver"
+  local artifact_metadata="$release_dir/release.json"
+  local artifact_deployment="$release_dir/deployment"
+
+  direct_directory "$ARTIFACT_RELEASE_ROOT" \
+    || die 'artifact release root is missing or indirect'
+  direct_directory "$release_dir" \
+    || die "staged artifact release is missing or indirect: $release_dir"
+  direct_directory "$artifact_deployment" \
+    || die 'staged artifact deployment is missing or indirect'
+  regular_file "$artifact_binary" \
+    || die 'staged artifact binary is not a regular file'
+  regular_file "$artifact_metadata" \
+    || die 'staged artifact metadata is not a regular file'
+  regular_file "$artifact_deployment/rust-lob-control-plane-lib.sh" \
+    || die 'staged artifact runtime contract helper is not a regular file'
+  [[ $(sha256_file "$artifact_binary") == "$artifact_sha" ]] \
+    || die 'staged artifact binary digest mismatch'
+  jq -e \
+    --arg artifact_sha "$artifact_sha" \
+    --arg artifact_uri "$artifact_uri" \
+    --arg runtime_contract "$runtime_contract" '
+      .artifact_sha256 == $artifact_sha
+      and .artifact_uri == $artifact_uri
+      and .runtime_contract_sha256 == $runtime_contract' \
+    "$artifact_metadata" >/dev/null \
+    || die 'staged artifact metadata differs from controller release identity'
+  [[ $(runtime_contract_sha256_v1 "$artifact_deployment") == "$runtime_contract" ]] \
+    || die 'staged artifact runtime contract drifted from release metadata'
 }
 
 validate_manifest() {
@@ -124,7 +181,7 @@ publish_controller_release() (
   [[ $# -eq 4 ]] || return 2
   local root=$1 artifact_file=$2 bundle=$3 manifest=$4
   local artifact_sha artifact_uri bundle_sha manifest_sha runtime_contract source_revision
-  local active_release active_binary active_metadata active_deployment
+  local staged_release
   local work_dir extracted listing release_dir staging asset mode
 
   configure_paths "$root"
@@ -144,29 +201,9 @@ publish_controller_release() (
   [[ $(sha256_file "$bundle") == "$bundle_sha" ]] \
     || die 'downloaded deployment bundle digest differs from controller release manifest'
 
-  active_release="$ARTIFACT_RELEASE_ROOT/$artifact_sha"
-  active_binary="$active_release/binance-lob-archiver"
-  active_metadata="$active_release/release.json"
-  active_deployment="$active_release/deployment"
-  [[ -L $PRODUCTION_BINARY ]] \
-    || die 'production binary is not a digest-addressed symlink'
-  direct_directory "$active_release" || die 'active artifact release is indirect'
-  direct_directory "$active_deployment" || die 'active artifact deployment is indirect'
-  regular_file "$active_binary" || die 'active release binary is not a regular file'
-  regular_file "$active_metadata" || die 'active release metadata is not a regular file'
-  [[ $(readlink -f -- "$PRODUCTION_BINARY") == "$active_binary" ]] \
-    || die 'production binary does not resolve to the requested artifact release'
-  [[ $(sha256_file "$active_binary") == "$artifact_sha" ]] \
-    || die 'active release binary digest mismatch'
-  jq -e \
-    --arg artifact_sha "$artifact_sha" \
-    --arg artifact_uri "$artifact_uri" \
-    --arg runtime_contract "$runtime_contract" '
-      .artifact_sha256 == $artifact_sha
-      and .artifact_uri == $artifact_uri
-      and .runtime_contract_sha256 == $runtime_contract' \
-    "$active_metadata" >/dev/null \
-    || die 'active release metadata differs from controller release identity'
+  staged_release="$ARTIFACT_RELEASE_ROOT/$artifact_sha"
+  verify_staged_artifact_release \
+    "$staged_release" "$artifact_sha" "$artifact_uri" "$runtime_contract"
 
   work_dir=$(mktemp -d)
   extracted="$work_dir/deployment"
@@ -176,14 +213,7 @@ publish_controller_release() (
   extract_bundle "$bundle" "$extracted" "$listing"
   regular_file "$extracted/rust-lob-control-plane-lib.sh" \
     || die 'deployment bundle is missing the runtime contract helper'
-  regular_file "$active_deployment/rust-lob-control-plane-lib.sh" \
-    || die 'active deployment is missing the runtime contract helper'
-  # shellcheck disable=SC1090,SC1091
-  . "$active_deployment/rust-lob-control-plane-lib.sh"
-  [[ $(monday_rust_lob_runtime_contract_sha256 "$active_deployment") \
-      == "$runtime_contract" ]] \
-    || die 'active deployment runtime contract drifted from release metadata'
-  [[ $(monday_rust_lob_runtime_contract_sha256 "$extracted") \
+  [[ $(runtime_contract_sha256_v1 "$extracted") \
       == "$runtime_contract" ]] \
     || die 'controller bundle changes the gated runtime contract'
 
