@@ -64,6 +64,14 @@ for asset in binance-lob-archiver-rust-spot.env binance-lob-archiver-rust-usdm.e
   cp "$ROOT/opt/monday/releases/binance-lob-controller/$(monday_sha256_file "$m0")/deployment/$asset" \
     "$ROOT/etc/monday/$asset"
 done
+# Production upload-status is a sentinel: every shadow Gate/drain must leave
+# the governed production spool untouched.
+production_spool_root="$ROOT/data/monday/spool/binance-lob"
+mkdir -p "$production_spool_root/spot" "$production_spool_root/usdm"
+printf 'production-sentinel-spot\n' >"$production_spool_root/spot/upload-status.json"
+printf 'production-sentinel-usdm\n' >"$production_spool_root/usdm/upload-status.json"
+production_spot_status_sha=$(monday_sha256_file "$production_spool_root/spot/upload-status.json")
+production_usdm_status_sha=$(monday_sha256_file "$production_spool_root/usdm/upload-status.json")
 printf '\n# controller revision two fixture\n' >>"$source_dir/host-rust-lob-readback.sh"
 p1="$ROOT/p1"; m1="$ROOT/m1.json"
 p1_sha=$(publish_fixture "$p1" "$m1")
@@ -111,6 +119,14 @@ gate=$(printf '%s\n' "$gate_output" | sed -n 's/^V2 Gate receipt: //p')
 gate_sha=$(printf '%s\n' "$gate_output" | sed -n 's/^SHA-256: //p')
 [[ -f $gate && $gate_sha == "$(monday_sha256_file "$gate")" ]]
 monday_validate_v2_gate "$gate" direct "$c0" "$gate_sha"
+# Production-shaped path construction reaches spool preparation without
+# opening a market socket.  The fixture still uses an isolated root, while
+# exercising the unconditional run-scoped path branch.
+path_only_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_PATH_ONLY=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --root "$ROOT")
+grep -Fq "V2 Gate spool preparation: $ROOT/data/monday/spool/binance-lob-rust-shadow/gate/" \
+  <<<"$path_only_output"
 jq -e --arg from "$legacy_c0" \
   '.source_mode == "direct" and .from_controller_sha256 == $from
    and .transition.before == $from and .transition.topology == "direct-bootstrap"' \
@@ -144,6 +160,31 @@ sed -i.bak 's/^OSS_ENDPOINT=.*/OSS_ENDPOINT=foreign.endpoint.example/' \
 rm -f -- "$production_verify_dir/binance-lob-archiver-production-spot.env.bak"
 if monday_verify_production_runtime_assets "$ROOT" "$production_verify_dir" "$p0_sha"; then
   printf 'production runtime verifier accepted a foreign market endpoint\n' >&2
+  exit 1
+fi
+chmod u+w "$production_verify_dir/binance-lob-archiver-production-spot.env"
+cp -p -- "$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/binance-lob-archiver-production-spot.env" \
+  "$production_verify_dir/binance-lob-archiver-production-spot.env"
+chmod u+w "$production_verify_dir/binance-lob-archiver-production@.service"
+printf '\nExecStartPost=/bin/true\n' >>"$production_verify_dir/binance-lob-archiver-production@.service"
+if monday_verify_production_runtime_assets "$ROOT" "$production_verify_dir" "$p0_sha"; then
+  printf 'production runtime verifier accepted an unallowlisted ExecStartPost\n' >&2
+  exit 1
+fi
+cp -p -- "$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/binance-lob-archiver-production@.service" \
+  "$production_verify_dir/binance-lob-archiver-production@.service"
+chmod u+w "$production_verify_dir/binance-lob-archiver-production@.service"
+printf 'ExecStart=/opt/monday/bin/binance-lob-archiver\n' >>"$production_verify_dir/binance-lob-archiver-production@.service"
+if monday_verify_production_runtime_assets "$ROOT" "$production_verify_dir" "$p0_sha"; then
+  printf 'production runtime verifier accepted a duplicate ExecStart\n' >&2
+  exit 1
+fi
+cp -p -- "$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/binance-lob-archiver-production@.service" \
+  "$production_verify_dir/binance-lob-archiver-production@.service"
+chmod u+w "$production_verify_dir/binance-lob-archiver-production-spot.env"
+printf 'UNTRUSTED_RUNTIME_FLAG=1\n' >>"$production_verify_dir/binance-lob-archiver-production-spot.env"
+if monday_verify_production_runtime_assets "$ROOT" "$production_verify_dir" "$p0_sha"; then
+  printf 'production runtime verifier accepted an unknown environment key\n' >&2
   exit 1
 fi
 
@@ -249,7 +290,9 @@ bootstrap_transition_sha=$(printf '%s\n' "$bootstrap_cutover_output" | sed -n 's
   "$ROOT/opt/monday/releases/binance-lob-archiver/$p0_sha/binance-lob-archiver" ]]
 [[ $(monday_sha256_file "$bootstrap_transition") == "$bootstrap_transition_sha" ]]
 monday_validate_v2_transition "$bootstrap_transition" direct "$c0" "$gate" "$gate_sha"
+mkdir -p "$ROOT/fixture-upload-status-empty"
 MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  MONDAY_UPLOAD_STATUS_ROOT="$ROOT/fixture-upload-status-empty" \
   "$SCRIPT_DIR/host-rust-lob-readback.sh" --controller "$c0" \
   --transition-receipt "$bootstrap_transition" --receipt-sha256 "$bootstrap_transition_sha" \
   --root "$ROOT" >/dev/null
@@ -415,9 +458,32 @@ for asset in "${!shadow_before_sha[@]}"; do
 done
 [[ $(readlink -- "$ROOT/opt/monday/bin/binance-lob-archiver-shadow") == "$shadow_before_target" ]]
 
-cutover_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+fixture_process_pid=4242
+mkdir -p "$ROOT/proc/$fixture_process_pid"
+ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p1_sha/binance-lob-archiver" \
+  "$ROOT/proc/$fixture_process_pid/exe"
+write_cutover_fixture_health() {
+  local observed_at_ns
+  observed_at_ns=$(date +%s%N)
+  mkdir -p "$production_spool_root/spot" "$production_spool_root/usdm"
+  jq -cn --argjson observed "$observed_at_ns" \
+    '{market:"spot",dataset:"spot_all",status:"synced",sequence_gaps:0,symbol_count:1000,session_id:"cutover-fixture-spot",updated_at_ns:$observed}' \
+    >"$production_spool_root/spot/health.json"
+  jq -cn --argjson observed "$observed_at_ns" \
+    '{market:"usdm",dataset:"usdm_perpetual_top100_lob",status:"synced",sequence_gaps:0,symbol_count:100,session_id:"cutover-fixture-usdm",updated_at_ns:$observed}' \
+    >"$production_spool_root/usdm/health.json"
+}
+(
+  sleep 1
+  write_cutover_fixture_health
+) &
+fixture_health_writer=$!
+cutover_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
+  MONDAY_CUTOVER_FIXTURE_VERIFY_PROCESS=1 MONDAY_CUTOVER_FIXTURE_PID="$fixture_process_pid" \
+  MONDAY_CUTOVER_HEALTH_TIMEOUT_SECONDS=5 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from "$c0" --to "$c1" \
   --gate-receipt "$gate" --gate-sha256 "$gate_sha" --root "$ROOT")
+wait "$fixture_health_writer"
 transition=$(printf '%s\n' "$cutover_output" | sed -n 's/^Transition receipt: //p')
 transition_sha=$(printf '%s\n' "$cutover_output" | sed -n 's/^SHA-256: //p')
 [[ $(monday_active_controller_sha "$ROOT") == "$c1" ]]
@@ -427,6 +493,12 @@ transition_sha=$(printf '%s\n' "$cutover_output" | sed -n 's/^SHA-256: //p')
   "$ROOT/opt/monday/releases/binance-lob-archiver/$p1_sha/binance-lob-archiver" ]]
 [[ $(monday_sha256_file "$transition") == "$transition_sha" ]]
 monday_validate_v2_transition "$transition" "$c0" "$c1" "$gate" "$gate_sha"
+jq -e --argjson pid "$fixture_process_pid" \
+  '.production_process | .spot.main_pid == $pid and .usdm.main_pid == $pid
+   and .spot.process_exe_sha256 == .usdm.process_exe_sha256
+   and .spot.n_restarts == 0 and .usdm.n_restarts == 0
+   and (.spot.session_id | length) > 0 and (.usdm.session_id | length) > 0' \
+  "$transition" >/dev/null
 
 # A fault after the active-pair rename restores both identities under the lock.
 printf '\n# controller revision three fixture\n' >>"$source_dir/host-rust-lob-readback.sh"
@@ -472,6 +544,25 @@ gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   --candidate-controller "$c2" --root "$ROOT")
 gate2=$(printf '%s\n' "$gate_output" | sed -n 's/^V2 Gate receipt: //p')
 gate2_sha=$(printf '%s\n' "$gate_output" | sed -n 's/^SHA-256: //p')
+
+# Cutover must reject a candidate whose process restart counter changes while
+# waiting for the first fresh health publication.  This exercises the same
+# post-start identity check as production, but remains a bounded fixture.
+restart_fixture_pid=4243
+mkdir -p "$ROOT/proc/$restart_fixture_pid"
+ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p2_sha/binance-lob-archiver" \
+  "$ROOT/proc/$restart_fixture_pid/exe"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
+  MONDAY_CUTOVER_FIXTURE_VERIFY_PROCESS=1 MONDAY_CUTOVER_FIXTURE_PID="$restart_fixture_pid" \
+  MONDAY_CUTOVER_FIXTURE_RESTARTS=1 MONDAY_CUTOVER_HEALTH_TIMEOUT_SECONDS=2 \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from "$c1" --to "$c2" \
+  --gate-receipt "$gate2" --gate-sha256 "$gate2_sha" --root "$ROOT" \
+  >/dev/null 2>&1; then
+  printf 'cutover accepted a changed process restart counter\n' >&2
+  exit 1
+fi
+[[ $(monday_active_controller_sha "$ROOT") == "$c1" ]]
+[[ ! -e "$ROOT/data/monday/evidence/cutovers/$c2/transition.json" ]]
 
 # A candidate Spot lane may start before the USD-M lane fails.  The rollback
 # must restore the complete before pair (including both stable projections),
@@ -562,9 +653,20 @@ MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   "$ROOT/opt/monday/releases/binance-lob-archiver/$p2_sha/binance-lob-archiver" ]]
 [[ $(monday_sha256_file "$transition2") == "$transition2_sha" ]]
 MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  MONDAY_UPLOAD_STATUS_ROOT="$ROOT/fixture-upload-status-empty" \
   "$SCRIPT_DIR/host-rust-lob-readback.sh" --controller "$c2" \
   --transition-receipt "$transition2" --receipt-sha256 "$transition2_sha" \
   --root "$ROOT" >/dev/null
+
+# Health liveness is independent from stable process identity: a newer
+# observed_at is accepted while a backwards/stalled sample is rejected.
+health_freshness=$(monday_observe_health_freshness 100 10 0 200 11 120)
+read -r health_updated health_mono health_gap health_increment <<<"$health_freshness"
+[[ $health_updated == 200 && $health_mono == 11 && $health_gap == 1 && $health_increment == 1 ]]
+if monday_observe_health_freshness 200 11 0 199 12 120 >/dev/null 2>&1; then
+  printf 'health readback accepted a regressed observed_at\n' >&2
+  exit 1
+fi
 
 # A SIGKILL after a run-scoped Gate start cannot run the EXIT trap.  The
 # bounded unit/spool must remain isolated, with all governed /etc and global
@@ -595,6 +697,8 @@ grep -Fqx 'Restart=no' "$stale_gate_dir/monday-rust-lob-gate-$(basename -- "$sta
 grep -Fqx 'RuntimeMaxSec=1800' "$stale_gate_dir/monday-rust-lob-gate-$(basename -- "$stale_gate_dir")-spot.service"
 stale_run=$(basename -- "$stale_gate_dir")
 [[ -d "$ROOT/data/monday/spool/binance-lob-rust-shadow/gate/$stale_run" ]]
+stale_search_unit="$ROOT/run/systemd/system/monday-rust-lob-gate-${stale_run}-spot.service"
+[[ -f "$stale_search_unit" && ! -L "$stale_search_unit" ]]
 gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c2" \
   --candidate-controller "$c3" --root "$ROOT")
@@ -602,6 +706,31 @@ gate3=$(printf '%s\n' "$gate_output" | sed -n 's/^V2 Gate receipt: //p')
 gate3_sha=$(printf '%s\n' "$gate_output" | sed -n 's/^SHA-256: //p')
 monday_validate_v2_gate "$gate3" "$c2" "$c3" "$gate3_sha"
 [[ ! -e "$stale_gate_dir" && ! -e "$ROOT/data/monday/spool/binance-lob-rust-shadow/gate/$stale_run" ]]
+
+# The governed shadow source unit has one optional soak EnvironmentFile and no
+# other extension points.  Unknown commands or additional EnvironmentFiles
+# must be rejected before the candidate can render a run-scoped unit.
+shadow_unit_source="$source_dir/binance-lob-archiver-rust@.service"
+shadow_unit_saved="$ROOT/binance-lob-archiver-rust@.service.saved"
+cp -p -- "$shadow_unit_source" "$shadow_unit_saved"
+for mutation in execstartpost environmentfile; do
+  cp -p -- "$shadow_unit_saved" "$shadow_unit_source"
+  chmod u+w "$shadow_unit_source"
+  case "$mutation" in
+    execstartpost) printf 'ExecStartPost=/bin/true\n' >>"$shadow_unit_source" ;;
+    environmentfile) printf 'EnvironmentFile=/run/monday/foreign.env\n' >>"$shadow_unit_source" ;;
+  esac
+  bad_payload="$ROOT/p-bad-shadow-$mutation"; bad_manifest="$ROOT/m-bad-shadow-$mutation.json"
+  publish_fixture "$bad_payload" "$bad_manifest" >/dev/null
+  bad_controller=$(monday_sha256_file "$bad_manifest")
+  if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+    "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c3" \
+    --candidate-controller "$bad_controller" --root "$ROOT" >/dev/null 2>&1; then
+    printf 'Gate accepted an unallowlisted shadow %s directive\n' "$mutation" >&2
+    exit 1
+  fi
+done
+cp -p -- "$shadow_unit_saved" "$shadow_unit_source"
 
 # Candidate shadow identity is fixed by the Gate contract.  Each foreign
 # spool/endpoint/profile/shard mutation must be rejected before any writer is
@@ -672,7 +801,7 @@ triplet_prefix='lake/raw/venue=binance/market=spot/dataset=spot_all/shard=all'
 triplet_now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 jq -cn --arg now "$triplet_now" --arg uri "$triplet_uri" --arg prefix "$triplet_prefix" \
   --arg data "$triplet_data_sha" --arg manifest "$triplet_manifest_sha" --arg success "$triplet_success_sha" \
-  '{last_success_at:$now,last_error:null,last_uploaded_triplet:{data_uri:$uri,object_prefix:$prefix,data_sha256:$data,manifest_sha256:$manifest,success_sha256:$success}}' \
+  '{last_success_at:$now,last_error:null,last_uploaded_triplet:{data_uri:$uri,object_prefix:$prefix,data_sha256:$data,manifest_sha256:$manifest,success_sha256:$success,uploaded_at:$now}}' \
   >"$triplet_status"
 copy_triplet_fixture() {
   local uri=$1 target=$2 object
@@ -701,6 +830,12 @@ if jq '.last_success_at = "2999-01-01T00:00:00Z"' "$triplet_status" >"$triplet_s
   printf 'triplet readback accepted future last_success_at\n' >&2
   exit 1
 fi
+if jq '.last_uploaded_triplet.uploaded_at = "2999-01-01T00:00:00Z"' "$triplet_status" >"$triplet_status.future-triplet" \
+  && monday_verify_upload_triplet_readback "$triplet_status.future-triplet" spot spot_all bucket "$triplet_prefix" \
+    "$triplet_tmp" "$triplet_now" copy_triplet_fixture >/dev/null 2>&1; then
+  printf 'triplet readback accepted future triplet timestamp\n' >&2
+  exit 1
+fi
 if jq '.last_uploaded_triplet.data_uri |= sub("oss://bucket"; "oss://foreign")' "$triplet_status" \
   >"$triplet_status.foreign" \
   && monday_verify_upload_triplet_readback "$triplet_status.foreign" spot spot_all bucket "$triplet_prefix" \
@@ -713,6 +848,12 @@ if jq '.last_uploaded_triplet.object_prefix = "foreign/prefix"' "$triplet_status
   && monday_verify_upload_triplet_readback "$triplet_status.foreign-prefix" spot spot_all bucket "$triplet_prefix" \
     "$triplet_tmp" "$triplet_now" copy_triplet_fixture >/dev/null 2>&1; then
   printf 'triplet readback accepted a foreign object prefix\n' >&2
+  exit 1
+fi
+if jq '.last_error = "status drift"' "$triplet_status" >"$triplet_status.drift" \
+  && monday_verify_upload_triplet_readback "$triplet_status.drift" spot spot_all bucket "$triplet_prefix" \
+    "$triplet_tmp" "$triplet_now" copy_triplet_fixture >/dev/null 2>&1; then
+  printf 'triplet readback accepted upload-status drift\n' >&2
   exit 1
 fi
 printf 'not-the-data-sha\n' >"$triplet_success"
@@ -772,6 +913,8 @@ done
 # against /.  This exercises each direct path before any filesystem read.
 [[ $(monday_root_join / opt/monday) == /opt/monday ]]
 [[ $(monday_root_join / data/monday) == /data/monday ]]
+[[ $(monday_sha256_file "$production_spool_root/spot/upload-status.json") == "$production_spot_status_sha" ]]
+[[ $(monday_sha256_file "$production_spool_root/usdm/upload-status.json") == "$production_usdm_status_sha" ]]
 if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT=/ \
   "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
   --candidate-controller "$c1" --root / >/dev/null 2>&1; then

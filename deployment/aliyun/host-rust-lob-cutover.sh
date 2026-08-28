@@ -30,6 +30,12 @@ ROOT=${ROOT%/}; [[ -n $ROOT ]] || ROOT=/
 TEST_ONLY=false; [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 ]] && TEST_ONLY=true
 [[ $TEST_ONLY == true && $ROOT != / ]] || [[ $TEST_ONLY == false ]] \
   || die 'test mode requires an isolated fixture root'
+PRODUCTION_HEALTH_WAIT_SECONDS=${MONDAY_CUTOVER_HEALTH_TIMEOUT_SECONDS:-240}
+PRODUCTION_HEALTH_POLL_SECONDS=${MONDAY_CUTOVER_HEALTH_POLL_SECONDS:-1}
+[[ $PRODUCTION_HEALTH_WAIT_SECONDS =~ ^[1-9][0-9]*$ && $PRODUCTION_HEALTH_WAIT_SECONDS -le 900 ]] \
+  || die 'MONDAY_CUTOVER_HEALTH_TIMEOUT_SECONDS must be 1..900 seconds'
+[[ $PRODUCTION_HEALTH_POLL_SECONDS =~ ^[1-9][0-9]*$ && $PRODUCTION_HEALTH_POLL_SECONDS -le 10 ]] \
+  || die 'MONDAY_CUTOVER_HEALTH_POLL_SECONDS must be 1..10 seconds'
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 # shellcheck disable=SC1091
@@ -102,8 +108,10 @@ if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
       show)
         unit=$2
         case "${3#--property=}" in
-          MainPID) printf '%s\n' "$$" ;;
-          NRestarts) printf '0\n' ;;
+          ActiveState) [[ ${fixture_unit_state[$unit]:-inactive} == active ]] && printf 'active\n' || printf 'inactive\n' ;;
+          SubState) [[ ${fixture_unit_state[$unit]:-inactive} == active ]] && printf 'running\n' || printf 'dead\n' ;;
+          MainPID) printf '%s\n' "${MONDAY_CUTOVER_FIXTURE_PID:-$$}" ;;
+          NRestarts) printf '%s\n' "${MONDAY_CUTOVER_FIXTURE_RESTARTS:-0}" ;;
           *) printf '\n' ;;
         esac
         return 0 ;;
@@ -521,24 +529,16 @@ else
   cutover_started_ns=0
 fi
 production_process='{}'
+declare -A expected_pid expected_restarts expected_exe_sha
 verify_production_process() {
   local market unit active sub pid restarts exe exe_sha env_file env_file_resolved spool health session updated now_ns minimum_symbols
-  [[ $TEST_ONLY == true ]] && return 0
-  now_ns=$(date +%s%N)
+  local deadline health_session ready
+  # Ordinary fixture cutovers never start a process.  The opt-in fixture
+  # systemd path below exercises the same identity/freshness loop without
+  # weakening production (and keeps its timeout bounded by the caller).
+  [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_VERIFY_PROCESS:-0} != 1 ]] && return 0
   for market in spot usdm; do
     unit="binance-lob-archiver-production@${market}.service"
-    active=$(systemctl show "$unit" --property=ActiveState --value)
-    sub=$(systemctl show "$unit" --property=SubState --value)
-    [[ $active == active && $sub == running ]] || die "$market production unit is not running after cutover"
-    pid=$(systemctl show "$unit" --property=MainPID --value)
-    [[ $pid =~ ^[1-9][0-9]*$ ]] || die "$market production unit has no MainPID after cutover"
-    restarts=$(systemctl show "$unit" --property=NRestarts --value)
-    [[ $restarts == 0 ]] || die "$market production unit restarted during cutover"
-    exe=$(readlink -f -- "$(monday_root_join "$ROOT" "proc/$pid/exe")") \
-      || die "$market production executable is unavailable after cutover"
-    exe_sha=$(monday_sha256_file "$exe") || die "$market production executable cannot be hashed"
-    [[ $exe == "$target_binary" && $exe_sha == "$target_payload" ]] \
-      || die "$market production executable identity differs from target"
     env_file=$(monday_runtime_asset_target "$ROOT" "binance-lob-archiver-production-$market.env") \
       || die "$market production environment path is invalid"
     env_file_resolved=$(readlink -f -- "$env_file") \
@@ -550,24 +550,61 @@ verify_production_process() {
       || die "$market production spool is not the governed path"
     [[ $ROOT == / ]] || spool="$ROOT$spool"
     health="$spool/health.json"
-    [[ -f $health && ! -L $health ]] || die "$market production health is missing after cutover"
-    session=$(jq -er '.session_id // empty' "$health") \
-      || die "$market production health session is missing after cutover"
-    updated=$(jq -er '.updated_at_ns // 0' "$health") \
-      || die "$market production health timestamp is missing after cutover"
-    [[ $updated =~ ^[0-9]+$ ]] || die "$market production health timestamp is invalid after cutover"
-    (( updated >= cutover_started_ns && updated <= now_ns )) \
-      || die "$market production health timestamp is stale or in the future after cutover"
     minimum_symbols=1000; [[ $market == usdm ]] && minimum_symbols=100
-    jq -e --arg market "$market" --arg dataset "$(sed -n 's/^DATASET=//p' "$env_file_resolved")" \
-      --argjson minimum "$minimum_symbols" \
-      '.market == $market and .dataset == $dataset and .status == "synced"
-       and .sequence_gaps == 0 and (.symbol_count | type == "number" and . >= $minimum)' \
-      "$health" >/dev/null \
-      || die "$market production health is not fresh and synchronized after cutover"
+    deadline=$(( $(date +%s) + PRODUCTION_HEALTH_WAIT_SECONDS )); health_session=; ready=false
+    while :; do
+      # Process identity is sampled on every poll.  A restart or PID/exe
+      # change while waiting for the first health publication is a contained
+      # cutover failure, never a reason to accept a later healthy file.
+      active=$(systemctl show "$unit" --property=ActiveState --value)
+      sub=$(systemctl show "$unit" --property=SubState --value)
+      [[ $active == active && $sub == running ]] || die "$market production unit is not running after cutover"
+      pid=$(systemctl show "$unit" --property=MainPID --value)
+      [[ $pid =~ ^[1-9][0-9]*$ ]] || die "$market production unit has no MainPID after cutover"
+      restarts=$(systemctl show "$unit" --property=NRestarts --value)
+      [[ $restarts == 0 ]] || die "$market production unit restarted during cutover"
+      if [[ -z ${expected_pid[$market]:-} ]]; then
+        expected_pid[$market]=$pid; expected_restarts[$market]=$restarts
+      else
+        [[ $pid == "${expected_pid[$market]}" ]] || die "$market production MainPID changed while awaiting health"
+        [[ $restarts == "${expected_restarts[$market]}" ]] || die "$market production restart count changed while awaiting health"
+      fi
+      exe=$(readlink -f -- "$(monday_root_join "$ROOT" "proc/$pid/exe")") \
+        || die "$market production executable is unavailable after cutover"
+      exe_sha=$(monday_sha256_file "$exe") || die "$market production executable cannot be hashed"
+      [[ $exe == "$target_binary" && $exe_sha == "$target_payload" ]] \
+        || die "$market production executable identity differs from target"
+      if [[ -z ${expected_exe_sha[$market]:-} ]]; then expected_exe_sha[$market]=$exe_sha
+      else [[ $exe_sha == "${expected_exe_sha[$market]}" ]] || die "$market production executable changed while awaiting health"; fi
+
+      now_ns=$(date +%s%N); ready=false
+      if [[ -f $health && ! -L $health ]]; then
+        session=$(jq -er '.session_id // empty' "$health" 2>/dev/null || true)
+        updated=$(jq -er '.updated_at_ns // 0' "$health" 2>/dev/null || true)
+        if [[ $updated =~ ^[0-9]+$ ]] && (( updated > now_ns )); then
+          die "$market production health timestamp is in the future"
+        fi
+        if [[ -n $session && $updated =~ ^[0-9]+$ ]] && (( updated >= cutover_started_ns && updated <= now_ns )); then
+          if [[ -n $health_session && $session != "$health_session" ]]; then
+            die "$market production health session changed while awaiting health"
+          fi
+          health_session=$session
+          if jq -e --arg market "$market" --arg dataset "$(sed -n 's/^DATASET=//p' "$env_file_resolved")" \
+            --argjson minimum "$minimum_symbols" \
+            '.market == $market and .dataset == $dataset and .status == "synced"
+             and .sequence_gaps == 0 and (.symbol_count | type == "number" and . >= $minimum)' \
+            "$health" >/dev/null 2>&1; then
+            ready=true
+          fi
+        fi
+      fi
+      [[ $ready == true ]] && break
+      (( $(date +%s) < deadline )) || die "$market production health did not become fresh and synchronized within ${PRODUCTION_HEALTH_WAIT_SECONDS}s"
+      sleep "$PRODUCTION_HEALTH_POLL_SECONDS"
+    done
     production_process=$(jq -cn --argjson values "$production_process" --arg market "$market" \
       --argjson pid "$pid" --arg exe "$exe_sha" --argjson restarts "$restarts" \
-      --arg session "$session" --argjson observed "$updated" \
+      --arg session "$health_session" --argjson observed "$updated" \
       '$values + {($market):{active:true,main_pid:$pid,process_exe_sha256:$exe,n_restarts:$restarts,session_id:$session,observed_at_ns:$observed}}')
   done
 }

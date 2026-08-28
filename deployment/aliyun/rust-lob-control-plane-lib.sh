@@ -247,6 +247,218 @@ monday_unit_exact_line() {
   [[ $(grep -Fxc "$key=$value" "$file" || true) -eq 1 ]]
 }
 
+# Parse a systemd unit into a small, deterministic semantic form.  The
+# production verifier below uses this allowlist before checking individual
+# trust-critical values.  This matters because checking only expected lines
+# would still accept an attacker-supplied ExecStartPost, extra EnvironmentFile,
+# or a duplicate directive that changes systemd's effective configuration.
+# Comments and blank lines are not semantics; section/directive order is kept
+# because systemd treats repeated command directives as ordered operations.
+monday_unit_normalized() {
+  [[ $# -eq 2 ]] || return 2
+  local file=$1 kind=$2 raw line section='' key value identity normalized=''
+  local -A seen=() sections=()
+  local -a expected=() required_sections=()
+  case "$kind" in
+    production)
+      required_sections=(Unit Service Install)
+      expected=(
+        'Unit|Description|Rust Binance LOB archiver production (%i)'
+        'Unit|After|network-online.target'
+        'Unit|Wants|network-online.target'
+        'Unit|RequiresMountsFor|/data'
+        'Unit|AssertPathIsMountPoint|/data'
+        'Unit|StartLimitIntervalSec|7200'
+        'Unit|StartLimitBurst|5'
+        'Service|Type|simple'
+        'Service|User|hftcollector'
+        'Service|Group|hftcollector'
+        'Service|Environment|RUST_LOG=info'
+        'Service|Environment|HOME=/var/lib/hft-collector'
+        'Service|EnvironmentFile|/etc/monday/binance-lob-archiver-production-%i.env'
+        'Service|ExecStartPre|/opt/monday/bin/binance-lob-archiver --self-test'
+        'Service|ExecStartPre|+/opt/monday/bin/monday-rust-lob-recovery-queue isolate %i'
+        'Service|ExecStart|/opt/monday/bin/binance-lob-archiver'
+        'Service|Restart|always'
+        'Service|RestartSec|5'
+        'Service|RuntimeMaxSec|21600'
+        'Service|KillMode|mixed'
+        'Service|TimeoutStartSec|120'
+        'Service|TimeoutStopSec|600'
+        'Service|NoNewPrivileges|true'
+        'Service|PrivateTmp|true'
+        'Service|ProtectSystem|strict'
+        'Service|ProtectHome|true'
+        'Service|ProtectKernelTunables|true'
+        'Service|ProtectKernelModules|true'
+        'Service|ProtectControlGroups|true'
+        'Service|LockPersonality|true'
+        'Service|RestrictSUIDSGID|true'
+        'Service|StateDirectory|hft-collector'
+        'Service|ReadWritePaths|/data/monday/spool/binance-lob -/data/monday/spool/binance-lob-recovery'
+        'Service|CPUQuota|80%'
+        'Service|MemoryHigh|2048M'
+        'Service|MemoryMax|2560M'
+        'Install|WantedBy|multi-user.target'
+      ) ;;
+    upload)
+      required_sections=(Unit Service)
+      expected=(
+        'Unit|Description|Rust Binance LOB archiver production pending-upload drain (%i)'
+        'Unit|After|network-online.target'
+        'Unit|Wants|network-online.target'
+        'Unit|RequiresMountsFor|/data'
+        'Unit|AssertPathIsMountPoint|/data'
+        'Service|Type|oneshot'
+        'Service|User|hftcollector'
+        'Service|Group|hftcollector'
+        'Service|Environment|RUST_LOG=info'
+        'Service|Environment|HOME=/var/lib/hft-collector'
+        'Service|EnvironmentFile|/etc/monday/binance-lob-archiver-production-%i.env'
+        'Service|ExecStart|/opt/monday/bin/binance-lob-archiver --upload-only'
+        'Service|TimeoutStartSec|0'
+        'Service|NoNewPrivileges|true'
+        'Service|PrivateTmp|true'
+        'Service|ProtectSystem|strict'
+        'Service|ProtectHome|true'
+        'Service|ProtectKernelTunables|true'
+        'Service|ProtectKernelModules|true'
+        'Service|ProtectControlGroups|true'
+        'Service|LockPersonality|true'
+        'Service|RestrictSUIDSGID|true'
+        'Service|StateDirectory|hft-collector'
+        'Service|ReadWritePaths|/data/monday/spool/binance-lob'
+        'Service|CPUQuota|80%'
+        'Service|MemoryHigh|384M'
+        'Service|MemoryMax|512M'
+      ) ;;
+    shadow)
+      required_sections=(Unit Service Install)
+      expected=(
+        'Unit|Description|Rust Binance LOB archiver shadow (%i)'
+        'Unit|After|network-online.target'
+        'Unit|Wants|network-online.target'
+        'Unit|RequiresMountsFor|/data'
+        'Unit|AssertPathIsMountPoint|/data'
+        'Service|Type|simple'
+        'Service|User|hftcollector'
+        'Service|Group|hftcollector'
+        'Service|Environment|RUST_LOG=info'
+        'Service|Environment|HOME=/var/lib/hft-collector'
+        'Service|EnvironmentFile|/etc/monday/binance-lob-archiver-rust-%i.env'
+        'Service|EnvironmentFile|-/run/monday/binance-lob-archiver-rust-%i-soak.env'
+        'Service|ExecStartPre|/opt/monday/bin/binance-lob-archiver-shadow --self-test'
+        'Service|ExecStart|/opt/monday/bin/binance-lob-archiver-shadow'
+        'Service|Restart|always'
+        'Service|RestartSec|5'
+        'Service|RuntimeMaxSec|21600'
+        'Service|KillMode|mixed'
+        'Service|TimeoutStopSec|600'
+        'Service|NoNewPrivileges|true'
+        'Service|PrivateTmp|true'
+        'Service|ProtectSystem|strict'
+        'Service|ProtectHome|true'
+        'Service|ProtectKernelTunables|true'
+        'Service|ProtectKernelModules|true'
+        'Service|ProtectControlGroups|true'
+        'Service|LockPersonality|true'
+        'Service|RestrictSUIDSGID|true'
+        'Service|StateDirectory|hft-collector'
+        'Service|ReadWritePaths|/data/monday/spool/binance-lob-rust-shadow'
+        'Service|CPUQuota|80%'
+        'Service|OOMScoreAdjust|500'
+        'Service|MemoryHigh|1792M'
+        'Service|MemoryMax|2048M'
+        'Install|WantedBy|multi-user.target'
+      ) ;;
+    shadow_upload)
+      required_sections=(Unit Service)
+      expected=(
+        'Unit|Description|Rust Binance LOB archiver shadow pending-upload drain (%i)'
+        'Unit|After|network-online.target'
+        'Unit|Wants|network-online.target'
+        'Unit|RequiresMountsFor|/data'
+        'Unit|AssertPathIsMountPoint|/data'
+        'Service|Type|oneshot'
+        'Service|User|hftcollector'
+        'Service|Group|hftcollector'
+        'Service|Environment|RUST_LOG=info'
+        'Service|Environment|HOME=/var/lib/hft-collector'
+        'Service|EnvironmentFile|/etc/monday/binance-lob-archiver-rust-%i.env'
+        'Service|ExecStart|/opt/monday/bin/binance-lob-archiver-shadow --upload-only'
+        'Service|TimeoutStartSec|0'
+        'Service|NoNewPrivileges|true'
+        'Service|PrivateTmp|true'
+        'Service|ProtectSystem|strict'
+        'Service|ProtectHome|true'
+        'Service|ProtectKernelTunables|true'
+        'Service|ProtectKernelModules|true'
+        'Service|ProtectControlGroups|true'
+        'Service|LockPersonality|true'
+        'Service|RestrictSUIDSGID|true'
+        'Service|StateDirectory|hft-collector'
+        'Service|ReadWritePaths|/data/monday/spool/binance-lob-rust-shadow'
+        'Service|CPUQuota|80%'
+        'Service|MemoryHigh|384M'
+        'Service|MemoryMax|512M'
+      ) ;;
+    *) return 2 ;;
+  esac
+  monday_file_direct "$file" || return 1
+  while IFS= read -r raw || [[ -n $raw ]]; do
+    line=${raw%%#*}
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -n $line ]] || continue
+    if [[ $line =~ ^\[([A-Za-z]+)\]$ ]]; then
+      section=${BASH_REMATCH[1]}
+      [[ ${sections[$section]:-0} == 0 ]] || return 1
+      case " ${required_sections[*]} " in *" $section "*) ;; *) return 1 ;; esac
+      sections[$section]=1; continue
+    fi
+    [[ -n $section && $line =~ ^([A-Za-z][A-Za-z0-9]*)=(.*)$ ]] || return 1
+    key=${BASH_REMATCH[1]}; value=${BASH_REMATCH[2]}
+    identity="$section|$key"
+    # Environment carries its own key; command directives are distinct only
+    # when their full command differs.  All other directives are singleton.
+    [[ $key == Environment ]] && identity+="|${value%%=*}"
+    [[ $key == EnvironmentFile ]] && identity+="|$value"
+    [[ $key == ExecStartPre ]] && identity+="|$value"
+    [[ ${seen[$identity]:-0} == 0 ]] || return 1
+    seen[$identity]=1
+    local semantic="$section|$key|$value" expected_line found=false
+    for expected_line in "${expected[@]}"; do
+      [[ $semantic == "$expected_line" ]] && found=true
+    done
+    [[ $found == true ]] || return 1
+    normalized+="$semantic"$'\n'
+  done <"$file"
+  for section in "${required_sections[@]}"; do
+    [[ ${sections[$section]:-0} == 1 ]] || return 1
+  done
+  # Every allowlisted semantic must be present exactly once (apart from the
+  # two intentionally distinct ExecStartPre commands and Environment keys,
+  # which are already keyed by their value/name above).
+  for expected_line in "${expected[@]}"; do
+    local count=0
+    while IFS= read -r line; do [[ $line == "$expected_line" ]] && count=$((count + 1)); done <<<"$normalized"
+    (( count == 1 )) || return 1
+  done
+  printf '%s' "$normalized"
+}
+
+monday_validate_unit_allowlist() {
+  [[ $# -eq 2 ]] || return 2
+  monday_unit_normalized "$1" "$2" >/dev/null
+}
+
+monday_unit_semantics_sha256() {
+  [[ $# -eq 2 ]] || return 2
+  local normalized
+  normalized=$(monday_unit_normalized "$1" "$2") || return 1
+  monday_sha256_text "$normalized"
+}
+
 monday_env_value() {
   [[ $# -eq 2 ]] || return 2
   local file=$1 key=$2 count value
@@ -272,6 +484,39 @@ monday_validate_production_env() {
   [[ $# -eq 3 ]] || return 2
   local file=$1 market=$2 dataset=$3 symbols spool
   monday_file_direct "$file" || return 1
+  # EnvironmentFile is part of the signed runtime pair.  Accept comments and
+  # blank lines, but reject unknown keys, duplicates, and missing projections;
+  # otherwise an extra variable could silently alter collector behaviour while
+  # the unit and the handful of checked identity fields still look valid.
+  local raw line key value allowed_key found
+  local -A seen=()
+  local -a allowed_keys=(
+    MARKET DATASET SHARD_ID SYMBOLS DEPTH_MODE WS_SHARD_SIZE SNAPSHOT_LIMIT
+    SNAPSHOT_REQUESTS_PER_SECOND SNAPSHOT_RETRY_ATTEMPTS SYNC_TIMEOUT_SECONDS
+    STALL_TIMEOUT_SECONDS PROCESS_WATCHDOG_SECONDS MAX_BUFFERED_DIFFS
+    MAX_PENDING_DIFFS_TOTAL MIN_FREE_GB ZSTD_TIMEOUT_SECONDS
+    OSS_COPY_TIMEOUT_SECONDS SEGMENT_SECONDS SPOOL_DIR OSS_BUCKET OSS_ENDPOINT
+    OSS_REGION ALIYUN_PROFILE BINANCE_REST_BASE LOG_LEVEL
+  )
+  [[ $market == spot ]] && allowed_keys+=(SNAPSHOT_PRODUCERS)
+  while IFS= read -r raw || [[ -n $raw ]]; do
+    line="$raw"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z $line || $line == \#* ]] && continue
+    [[ $line =~ ^([A-Za-z][A-Za-z0-9_]*)=(.+)$ ]] || return 1
+    key=${BASH_REMATCH[1]}; value=${BASH_REMATCH[2]}
+    found=false
+    for allowed_key in "${allowed_keys[@]}"; do
+      [[ $key == "$allowed_key" ]] && found=true
+    done
+    [[ $found == true && ${seen[$key]:-0} == 0 ]] || return 1
+    [[ -n $value ]] || return 1
+    seen[$key]=1
+  done <"$file"
+  for key in "${allowed_keys[@]}"; do
+    [[ ${seen[$key]:-0} == 1 ]] || return 1
+  done
   [[ $(monday_env_value "$file" MARKET) == "$market" ]] || return 1
   [[ $(monday_env_value "$file" DATASET) == "$dataset" ]] || return 1
   [[ $(monday_env_value "$file" SHARD_ID) == all ]] || return 1
@@ -295,7 +540,7 @@ monday_validate_production_env() {
 monday_verify_production_runtime_assets() {
   [[ $# -eq 3 ]] || return 2
   local root=$1 deployment=$2 payload=$3 service upload spot_env usdm_env target
-  local service_sha upload_sha spot_sha usdm_sha production_json markets_json
+  local service_sha upload_sha spot_sha usdm_sha service_semantics_sha upload_semantics_sha production_json markets_json
   monday_sha256_ok "$payload" || return 1
   monday_path_direct "$deployment" || return 1
   service="$deployment/binance-lob-archiver-production@.service"
@@ -305,6 +550,13 @@ monday_verify_production_runtime_assets() {
   for file in "$service" "$upload" "$spot_env" "$usdm_env"; do
     monday_file_direct "$file" || return 1
   done
+
+  # Reject every unit directive outside the reviewed production topology before
+  # checking individual values.  The raw SHA below binds bytes; these semantic
+  # hashes bind the normalized directive/section contract and make comments or
+  # formatting the only harmless source changes.
+  service_semantics_sha=$(monday_unit_semantics_sha256 "$service" production) || return 1
+  upload_semantics_sha=$(monday_unit_semantics_sha256 "$upload" upload) || return 1
 
   # Candidate ExecStart is the only stable production projection.  The
   # candidate payload itself is checked at its immutable digest path below.
@@ -390,7 +642,8 @@ monday_verify_production_runtime_assets() {
     --arg service_sha "$service_sha" --arg upload_sha "$upload_sha" \
     --arg spot_sha "$spot_sha" --arg usdm_sha "$usdm_sha" \
     --argjson markets "$markets_json" \
-    '{schema:"monday.rust_lob_production_runtime.v1",exec_start:"/opt/monday/bin/binance-lob-archiver",environment_file:"/etc/monday/binance-lob-archiver-production-%i.env",user:"hftcollector",group:"hftcollector",restart:"always",restart_sec:5,runtime_max_sec:21600,kill_mode:"mixed",timeout_start_sec:120,timeout_stop_sec:600,type:"simple",cpu_quota:"80%",memory_high:"2048M",memory_max:"2560M",sandbox:{no_new_privileges:true,private_tmp:true,protect_system:"strict",protect_home:true,protect_kernel_tunables:true,protect_kernel_modules:true,protect_control_groups:true,lock_personality:true,restrict_suidsgid:true,state_directory:"hft-collector",read_write_paths:["/data/monday/spool/binance-lob","/data/monday/spool/binance-lob-recovery"]},upload:{type:"oneshot",exec_start:"/opt/monday/bin/binance-lob-archiver --upload-only",environment_file:"/etc/monday/binance-lob-archiver-production-%i.env",cpu_quota:"80%",memory_high:"384M",memory_max:"512M",timeout_start_sec:0},unit_sha256:{collector:$service_sha,upload:$upload_sha},env_sha256:{spot:$spot_sha,usdm:$usdm_sha},markets:$markets}') || return 1
+    --arg service_semantics_sha "$service_semantics_sha" --arg upload_semantics_sha "$upload_semantics_sha" \
+    '{schema:"monday.rust_lob_production_runtime.v1",exec_start:"/opt/monday/bin/binance-lob-archiver",environment_file:"/etc/monday/binance-lob-archiver-production-%i.env",user:"hftcollector",group:"hftcollector",restart:"always",restart_sec:5,runtime_max_sec:21600,kill_mode:"mixed",timeout_start_sec:120,timeout_stop_sec:600,type:"simple",cpu_quota:"80%",memory_high:"2048M",memory_max:"2560M",sandbox:{no_new_privileges:true,private_tmp:true,protect_system:"strict",protect_home:true,protect_kernel_tunables:true,protect_kernel_modules:true,protect_control_groups:true,lock_personality:true,restrict_suidsgid:true,state_directory:"hft-collector",read_write_paths:["/data/monday/spool/binance-lob","/data/monday/spool/binance-lob-recovery"]},upload:{type:"oneshot",exec_start:"/opt/monday/bin/binance-lob-archiver --upload-only",environment_file:"/etc/monday/binance-lob-archiver-production-%i.env",cpu_quota:"80%",memory_high:"384M",memory_max:"512M",timeout_start_sec:0},unit_sha256:{collector:$service_sha,upload:$upload_sha},unit_semantics_sha256:{collector:$service_semantics_sha,upload:$upload_semantics_sha},env_sha256:{spot:$spot_sha,usdm:$usdm_sha},markets:$markets}') || return 1
   printf '%s\n' "$production_json"
 }
 
@@ -700,6 +953,9 @@ monday_validate_v2_gate() {
         and (.unit_sha256 | type == "object"
           and (.collector | type == "string" and test("^[a-f0-9]{64}$"))
           and (.upload | type == "string" and test("^[a-f0-9]{64}$")))
+        and (.unit_semantics_sha256 | type == "object"
+          and (.collector | type == "string" and test("^[a-f0-9]{64}$"))
+          and (.upload | type == "string" and test("^[a-f0-9]{64}$")))
         and (.env_sha256 | type == "object"
           and (.spot | type == "string" and test("^[a-f0-9]{64}$"))
           and (.usdm | type == "string" and test("^[a-f0-9]{64}$")))
@@ -904,7 +1160,17 @@ monday_validate_v2_transition() {
     and (if .test_only then .production_eligible == false else .production_eligible == true end)
     and (.production_runtime | type == "object")
     and (.production_process | type == "object")
-    and (if .test_only then .production_process == {} else
+    and (if .test_only then
+      (.production_process == {} or
+       ((.production_process | keys | sort) == ["spot", "usdm"]
+        and all(.production_process[];
+          .active == true
+          and (.main_pid | type == "number" and . >= 1)
+          and (.process_exe_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+          and (.n_restarts | type == "number" and . == 0)
+          and (.session_id | type == "string" and length > 0)
+          and (.observed_at_ns | type == "number" and . >= 0))))
+    else
       ((.production_process | keys | sort) == ["spot", "usdm"]
        and all(.production_process[];
          .active == true
@@ -960,7 +1226,7 @@ monday_verify_upload_triplet_readback() {
   local status=$1 market=$2 dataset=$3 expected_bucket=$4 expected_prefix=$5
   local tmp_root=$6 minimum_success_at=$7 copy_fn=$8 expected_session=${9:-}
   local triplet data_uri manifest_uri success_uri status_session triplet_session
-  local data_sha manifest_sha success_sha object_prefix first_manifest second_manifest
+  local data_sha manifest_sha success_sha object_prefix first_manifest second_manifest uploaded_at uploaded_epoch
   local data_file manifest_file success_file expected_success_file expected_prefix_norm
   monday_file_direct "$status" || return 1
   jq -e '.last_error == null' "$status" >/dev/null || return 1
@@ -1030,6 +1296,14 @@ monday_verify_upload_triplet_readback() {
   if [[ -n $minimum_success_at ]]; then
     minimum_epoch=$(monday_iso_epoch "$minimum_success_at") || return 1
     ((success_epoch >= minimum_epoch)) || return 1
+  fi
+  uploaded_at=$(jq -er '.uploaded_at // empty' <<<"$triplet") || true
+  if [[ -n $uploaded_at ]]; then
+    uploaded_epoch=$(monday_iso_epoch "$uploaded_at") || return 1
+    ((uploaded_epoch <= now_epoch)) || return 1
+    if [[ -n $minimum_success_at ]]; then
+      ((uploaded_epoch >= minimum_epoch)) || return 1
+    fi
   fi
   manifest_session=$(jq -er '.session_id // .lob_continuity.capture_session_id' "$manifest_file") || return 1
   if [[ -n $expected_session ]]; then

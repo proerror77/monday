@@ -101,6 +101,9 @@ and (.production_runtime | type == "object"
   and (.unit_sha256 | type == "object"
     and (.collector | type == "string" and test("^[a-f0-9]{64}$"))
     and (.upload | type == "string" and test("^[a-f0-9]{64}$")))
+  and (.unit_semantics_sha256 | type == "object"
+    and (.collector | type == "string" and test("^[a-f0-9]{64}$"))
+    and (.upload | type == "string" and test("^[a-f0-9]{64}$")))
   and (.env_sha256 | type == "object"
     and (.spot | type == "string" and test("^[a-f0-9]{64}$"))
     and (.usdm | type == "string" and test("^[a-f0-9]{64}$")))

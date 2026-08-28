@@ -83,6 +83,8 @@ done
 monday_validate_v2_transition "$TRANSITION_RECEIPT" "$transition_validator_from" "$CONTROLLER" \
   "$transition_gate" "$transition_gate_sha" \
   || die 'transition receipt failed the exact V2 Gate-chain validator'
+transition_process=$(jq -ce '.production_process' "$TRANSITION_RECEIPT") \
+  || die 'transition receipt has no production process identity'
 if [[ $TEST_ONLY == false ]]; then
   jq -e '.test_only == false and .production_eligible == true' "$TRANSITION_RECEIPT" >/dev/null \
     || die 'production readback requires an eligible transition'
@@ -146,13 +148,14 @@ done
 
 runtime_identity='{}'; health_identity='{}'
 capture_runtime_identity() {
-  local market unit pid restarts exe env_file spool health session updated minimum_ns
+  local market unit pid restarts exe env_file spool health session updated minimum_ns expected_observed
   runtime_identity='{}'; health_identity='{}'
   [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 ]] && return 0
-  minimum_ns=$(( $(monday_iso_epoch "$(jq -er '.completed_at' "$TRANSITION_RECEIPT")") * 1000000000 ))
   for market in spot usdm; do
     unit="binance-lob-archiver-production@${market}.service"
     systemctl is-active --quiet "$unit" || die "production unit is inactive: $unit"
+    [[ $(systemctl show "$unit" --property=SubState --value) == running ]] \
+      || die "production unit is not running: $unit"
     restarts=$(systemctl show "$unit" --property=NRestarts --value)
     [[ $restarts == 0 ]] || die "production unit restarted during readback: $unit"
     pid=$(systemctl show "$unit" --property=MainPID --value)
@@ -171,6 +174,10 @@ capture_runtime_identity() {
     [[ -f $health && ! -L $health ]] || die "production health is missing: $market"
     session=$(jq -er '.session_id // empty' "$health") || die "production health session is missing: $market"
     updated=$(jq -er '.updated_at_ns // 0' "$health")
+    expected_observed=$(jq -er --arg market "$market" '.[$market].observed_at_ns' <<<"$transition_process") \
+      || die "transition health observation is missing: $market"
+    [[ $expected_observed =~ ^[0-9]+$ ]] || die "transition health observation is invalid: $market"
+    minimum_ns=$expected_observed
     now_ns=$(date +%s%N)
     [[ $updated =~ ^[0-9]+$ && $updated -ge $minimum_ns && $updated -le $now_ns ]] \
       || die "production health is stale or in the future: $market"
@@ -180,6 +187,36 @@ capture_runtime_identity() {
 }
 capture_runtime_identity
 runtime_before=$runtime_identity; health_before=$health_identity
+assert_transition_process_identity() {
+  local market expected_pid expected_exe expected_restarts expected_session expected_observed
+  local current_pid current_exe current_restarts current_session current_observed now_ns
+  [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 ]] && return 0
+  for market in spot usdm; do
+    expected_pid=$(jq -er --arg market "$market" '.[$market].main_pid' <<<"$transition_process") \
+      || die "transition process PID is missing: $market"
+    expected_exe=$(jq -er --arg market "$market" '.[$market].process_exe_sha256' <<<"$transition_process") \
+      || die "transition process executable identity is missing: $market"
+    expected_restarts=$(jq -er --arg market "$market" '.[$market].n_restarts' <<<"$transition_process") \
+      || die "transition process restart count is missing: $market"
+    expected_session=$(jq -er --arg market "$market" '.[$market].session_id' <<<"$transition_process") \
+      || die "transition process session is missing: $market"
+    expected_observed=$(jq -er --arg market "$market" '.[$market].observed_at_ns' <<<"$transition_process") \
+      || die "transition process timestamp is missing: $market"
+    current_pid=$(jq -er --arg market "$market" '.[$market].main_pid' <<<"$runtime_identity")
+    current_exe=$(jq -er --arg market "$market" '.[$market].exe' <<<"$runtime_identity")
+    current_restarts=$(jq -er --arg market "$market" '.[$market].n_restarts' <<<"$runtime_identity")
+    current_session=$(jq -er --arg market "$market" '.[$market].session_id' <<<"$health_identity")
+    current_observed=$(jq -er --arg market "$market" '.[$market].observed_at_ns' <<<"$health_identity")
+    [[ $current_pid == "$expected_pid" && $current_exe == "$expected_exe" \
+      && $current_restarts == "$expected_restarts" && $current_session == "$expected_session" ]] \
+      || die "production process identity differs from the cutover receipt: $market"
+    now_ns=$(date +%s%N)
+    [[ $current_observed =~ ^[0-9]+$ && $expected_observed =~ ^[0-9]+$ \
+      && $current_observed -ge $expected_observed && $current_observed -le $now_ns ]] \
+      || die "production health timestamp is older than cutover or in the future: $market"
+  done
+}
+assert_transition_process_identity
 assert_runtime_stable() {
   local observed_active
   observed_active=$(monday_active_controller_sha "$ROOT") || die 'active controller disappeared during OSS readback'
@@ -199,6 +236,7 @@ assert_runtime_stable() {
   done
   capture_runtime_identity
   [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 ]] && return 0
+  assert_transition_process_identity
   [[ $runtime_identity == "$runtime_before" ]] \
     || die 'process identity changed during OSS readback'
   for market in spot usdm; do
@@ -294,6 +332,7 @@ jq -cn --arg schema monday.rust_lob_operation_readback.v2 \
   --arg receipt "$RECEIPT_SHA" --arg transition "$TRANSITION_RECEIPT" \
   --arg gate "$transition_gate" --arg gate_sha "$transition_gate_sha" \
   --argjson markets "$markets" --argjson processes "$runtime_after" --argjson health "$health_after" \
+  --argjson transition_process "$transition_process" \
   --argjson controller_projections "$controller_projections" \
   --argjson statuses "$status_observations" \
   '{schema:$schema,control_plane_version:2,controller_sha256:$controller,
@@ -301,6 +340,7 @@ jq -cn --arg schema monday.rust_lob_operation_readback.v2 \
     transition_receipt_sha256:$receipt,gate_receipt:$gate,gate_sha256:$gate_sha,
     production_link_verified:true,process_identity_verified:true,
     process_restarts_verified:true,installed_assets_verified:true,
+    cutover_process_identity:$transition_process,
     process_identity:$processes,health:$health,controller_projections:$controller_projections,
     upload_status:$statuses,
     oss_triplets:$markets,result:"success"}' >"$tmp_out"

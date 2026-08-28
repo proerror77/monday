@@ -6,7 +6,6 @@ export LC_ALL=C
 # V2 shadow Gate. Candidate controller C1 owns this script and its policy.
 readonly REQUIRED_DURATION_SECONDS=240
 readonly HEALTH_SETTLE_SECONDS=240
-readonly GATE_SEGMENT_SECONDS=120
 readonly MAX_HEALTH_SILENCE_SECONDS=120
 readonly MAX_SEGMENT_GAP_NS=90000000000
 readonly HOST_MEMORY_RESERVE_BYTES=1073741824
@@ -93,7 +92,7 @@ DATA_ROOT=$(monday_root_join "$ROOT" data/monday); EVIDENCE_ROOT=${MONDAY_GATE_E
 # Gate writers are always run-scoped.  Nothing under /etc or the stable
 # /opt/monday/bin projection is mutated by this operation.
 RUN_SPOOL_ROOT="$DATA_ROOT/spool/binance-lob-rust-shadow/gate"; PROC_ROOT=$(monday_root_join "$ROOT" proc)
-GATE_UNIT_ROOT="$OVERRIDE_ROOT/rust-lob-gate"; SHADOW_BINARY="$BIN_ROOT/binance-lob-archiver-shadow"
+GATE_UNIT_ROOT="$OVERRIDE_ROOT/rust-lob-gate"; GATE_SYSTEMD_ROOT=$(monday_root_join "$ROOT" run/systemd/system); SHADOW_BINARY="$BIN_ROOT/binance-lob-archiver-shadow"
 PSI_SOURCE="$PROC_ROOT/pressure/io"
 PRODUCTION_BINARY="$BIN_ROOT/binance-lob-archiver"
 LIB_SOURCE="$SCRIPT_DIR/rust-lob-control-plane-lib.sh"; POLICY_SOURCE="$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq"
@@ -202,6 +201,8 @@ for path in "$OPT_ROOT" "$RELEASE_ROOT" "$CONTROLLER_ROOT" "$BIN_ROOT" \
 done
 direct_directory_or_absent "$(dirname -- "$LOCK_FILE")" || die 'control-plane lock path is indirect'
 direct_directory_or_absent "$OVERRIDE_ROOT" || die 'shadow override path is indirect'
+direct_directory_or_absent "$(monday_root_join "$ROOT" run/systemd)" || die 'systemd runtime path is indirect'
+direct_directory_or_absent "$GATE_SYSTEMD_ROOT" || die 'systemd runtime unit path is indirect'
 
 meminfo_bytes() {
   local field=$1 source="$PROC_ROOT/meminfo" value
@@ -220,8 +221,10 @@ env_value() {
   value=$(sed -n "s/^${key}=//p" "$file"); [[ -n $value ]] || die "$file has an empty $key"; printf '%s\n' "$value"
 }
 run_spool_dir() {
-  local candidate=$1 run_id=$2 market=$3; [[ $candidate =~ ^[a-f0-9]{64}$ && $run_id =~ ^[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*$ ]]
-  [[ $market == spot || $market == usdm ]]; printf '%s/%s/%s/%s\n' "$RUN_SPOOL_ROOT" "$candidate" "$run_id" "$market"
+  local run_id=$1 market=$2
+  [[ $run_id =~ ^[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*$ ]] || return 1
+  [[ $market == spot || $market == usdm ]] || return 1
+  printf '%s/%s/%s\n' "$RUN_SPOOL_ROOT" "$run_id" "$market"
 }
 is_usdm_top100() {
   local value=$1 unique; [[ $value =~ ^[A-Z0-9]+(,[A-Z0-9]+)*$ ]] || return 1
@@ -355,6 +358,7 @@ fi
 verify_shadow_unit_template() {
   local file=$1
   monday_file_direct "$file" || return 1
+  monday_validate_unit_allowlist "$file" shadow || return 1
   monday_unit_exact_line "$file" Type simple || return 1
   monday_unit_exact_line "$file" User hftcollector || return 1
   monday_unit_exact_line "$file" Group hftcollector || return 1
@@ -559,7 +563,7 @@ gate_unit_dir="$GATE_UNIT_ROOT/$run_id"
 # our own run-scoped names are stopped and removed; production units, links,
 # and /etc bytes are never addressed by this cleanup.
 cleanup_stale_gate_runs() {
-  local dir old unit_file unit
+  local dir old unit_file unit market
   [[ -n $RUN_SPOOL_ROOT ]] || return 1
   [[ -d $GATE_UNIT_ROOT ]] || return 0
   while IFS= read -r dir; do
@@ -571,20 +575,51 @@ cleanup_stale_gate_runs() {
       systemctl stop "$unit.service" >/dev/null 2>&1 || true
       systemctl reset-failed "$unit.service" >/dev/null 2>&1 || true
     done < <(find "$dir" -maxdepth 1 -type f -name 'monday-rust-lob-gate-*.service' -print)
+    for market in spot usdm; do
+      rm -f -- "$GATE_SYSTEMD_ROOT/monday-rust-lob-gate-${old}-${market}.service" \
+        "$GATE_SYSTEMD_ROOT/monday-rust-lob-gate-${old}-${market}-upload.service"
+    done
     rm -rf -- "$dir" "${RUN_SPOOL_ROOT:?}/$old"
   done < <(find "$GATE_UNIT_ROOT" -mindepth 1 -maxdepth 1 -type d -print)
+  [[ $TEST_ONLY == true ]] || systemctl daemon-reload >/dev/null 2>&1 || return 1
 }
 cleanup_stale_gate_runs
+# Every Gate, including production, writes only to this run-scoped spool.  A
+# prior test-only conditional left production's spool_dir empty and made the
+# first install attempt fail before any market work; keep construction before
+# the common install path so both modes exercise the same topology.
+for market in "${markets[@]}"; do
+  spool_dir[$market]=$(run_spool_dir "$run_id" "$market")
+done
+install -d -m 0750 "$EVIDENCE_ROOT" "$RUN_SPOOL_ROOT" "$evidence_dir"
+install -d -m 0755 "$GATE_SYSTEMD_ROOT"
 if [[ $TEST_ONLY == true ]]; then
-  for market in "${markets[@]}"; do spool_dir[$market]="$run_spool/$market"; done
+  install -d -m 0750 "$run_spool" "$gate_unit_dir"
+else
+  install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$run_spool" "$gate_unit_dir"
 fi
-install -d -m 0750 "$EVIDENCE_ROOT" "$RUN_SPOOL_ROOT" "$evidence_dir" "$run_spool" "$gate_unit_dir"
-for market in "${markets[@]}"; do install -d -m 0750 "${spool_dir[$market]}"; done
-while IFS= read -r prior_receipt; do
-  if jq -e '.schema == "monday.rust_lob_shadow_gate.v5" and .passed == true' "$prior_receipt" >/dev/null 2>&1; then
-    die 'a passed Gate receipt already exists for this controller identity'
+for market in "${markets[@]}"; do
+  if [[ $TEST_ONLY == true ]]; then
+    install -d -m 0750 "${spool_dir[$market]}"
+  else
+    install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "${spool_dir[$market]}"
+    [[ $(stat -c '%U:%G' -- "${spool_dir[$market]}") == "$SERVICE_USER:$SERVICE_USER" ]] \
+      || die "$market run-scoped Gate spool ownership is not ${SERVICE_USER}:${SERVICE_USER}"
   fi
-done < <(find "$EVIDENCE_ROOT/$CANDIDATE_CONTROLLER/$candidate_runtime" -type f -name gate.json -print)
+done
+if [[ $TEST_ONLY == false ]]; then
+  [[ $(stat -c '%U:%G' -- "$run_spool") == "$SERVICE_USER:$SERVICE_USER" ]] \
+    || die "run-scoped Gate spool ownership is not ${SERVICE_USER}:${SERVICE_USER}"
+  [[ $(stat -c '%U:%G' -- "$gate_unit_dir") == "$SERVICE_USER:$SERVICE_USER" ]] \
+    || die "run-scoped Gate override ownership is not ${SERVICE_USER}:${SERVICE_USER}"
+fi
+if [[ ${MONDAY_GATE_FIXTURE_PATH_ONLY:-0} != 1 ]]; then
+  while IFS= read -r prior_receipt; do
+    if jq -e '.schema == "monday.rust_lob_shadow_gate.v5" and .passed == true' "$prior_receipt" >/dev/null 2>&1; then
+      die 'a passed Gate receipt already exists for this controller identity'
+    fi
+  done < <(find "$EVIDENCE_ROOT/$CANDIDATE_CONTROLLER/$candidate_runtime" -type f -name gate.json -print)
+fi
 gate_started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ); gate_finished=false
 declare -A phase_pid phase_exe_sha phase_session phase_segments phase_oss phase_runtime
 declare -A phase_strict_lob phase_strict_aggregate phase_strict_raw
@@ -599,13 +634,29 @@ write_run_json() {
 cleanup() {
   local status=$? cleanup_failed=false; set +e
   resource_monitor_stop >/dev/null 2>&1 || cleanup_failed=true
-  for market in "${markets[@]}"; do systemctl stop "${unit[$market]}" >/dev/null 2>&1 || true; done
+  for market in "${markets[@]}"; do
+    [[ -n ${unit[$market]:-} ]] || continue
+    systemctl stop "${unit[$market]}" >/dev/null 2>&1 || true
+    rm -f -- "$GATE_SYSTEMD_ROOT/${unit[$market]}" \
+      "$GATE_SYSTEMD_ROOT/monday-rust-lob-gate-${run_id}-${market}-upload.service"
+  done
   [[ $TEST_ONLY == true ]] || systemctl daemon-reload >/dev/null 2>&1 || cleanup_failed=true
   rm -rf -- "$gate_unit_dir" "$run_spool" "$tmp_dir"
   [[ $gate_finished == true ]] || rm -f -- "$passed_marker" "$evidence_dir/.PASSED.sha256.tmp"
   [[ $cleanup_failed == false ]] || { printf 'run-scoped Gate cleanup was incomplete\n' >&2; status=1; }; exit "$status"
 }
 trap cleanup EXIT; trap 'exit 143' HUP INT TERM
+
+# Fixture-only path coverage reaches the same run-scoped preparation without
+# opening sockets, invoking OSS, or starting an external market process.
+if [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_PATH_ONLY:-0} == 1 ]]; then
+  for market in "${markets[@]}"; do
+    [[ ${spool_dir[$market]} == "$run_spool/$market" ]] \
+      || die "$market fixture Gate spool path is not run-scoped"
+  done
+  printf 'V2 Gate spool preparation: %s\n' "$run_spool"
+  exit 0
+fi
 
 resource_monitor_start preflight "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; calibrate_psi preflight; resource_monitor_stop; write_run_json
 if [[ $FROM_CONTROLLER != direct ]]; then
@@ -643,6 +694,8 @@ render_shadow_unit() {
   rendered_upload="$gate_unit_dir/monday-rust-lob-gate-${run_id}-${market}-upload.service"
   rendered_env="$gate_unit_dir/monday-rust-lob-gate-${run_id}-${market}.env"
   spool="${spool_dir[$market]}"
+  monday_validate_unit_allowlist "$source_upload" shadow_upload \
+    || die 'candidate shadow upload template failed security/resource verification'
   [[ -n $spool && $spool == "$run_spool/$market" ]] || die "$market Gate spool is not run-scoped"
   sed -e '/^EnvironmentFile=-\/run\/monday\/binance-lob-archiver-rust-%i-soak.env$/d' \
       -e "s|^EnvironmentFile=/etc/monday/binance-lob-archiver-rust-%i.env$|EnvironmentFile=$rendered_env|" \
@@ -668,6 +721,17 @@ render_shadow_unit() {
   [[ $(grep -Fxc "SPOOL_DIR=$spool" "$rendered_env" || true) -eq 1 ]] || die "$market Gate env spool is not exact"
   [[ $TEST_ONLY == true ]] || systemd-analyze verify "$rendered_unit" "$rendered_upload" || die "$market Gate unit failed systemd-analyze verify"
   unit[$market]="monday-rust-lob-gate-${run_id}-${market}.service"
+  # systemd does not search the private evidence directory.  Install a
+  # run-scoped copy under its runtime search path, then remove it in the EXIT
+  # trap; the rendered bytes remain bound by candidate_asset_sha above.
+  local search_unit="$GATE_SYSTEMD_ROOT/${unit[$market]}"
+  local search_upload="$GATE_SYSTEMD_ROOT/monday-rust-lob-gate-${run_id}-${market}-upload.service"
+  [[ ! -e $search_unit && ! -L $search_unit ]] \
+    || die "$market run-scoped Gate unit already exists"
+  [[ ! -e $search_upload && ! -L $search_upload ]] \
+    || die "$market run-scoped upload unit already exists"
+  install -m 0644 "$rendered_unit" "$search_unit"
+  install -m 0644 "$rendered_upload" "$search_upload"
   candidate_asset_sha["binance-lob-archiver-rust@.service"]=$(sha256_file "$rendered_unit")
   candidate_asset_sha["binance-lob-archiver-rust-upload@.service"]=$(sha256_file "$rendered_upload")
   candidate_asset_sha["binance-lob-archiver-rust-${market}.env"]=$(sha256_file "$rendered_env")
@@ -845,7 +909,56 @@ run_market_gate_phase() {
   observation=$(( $(monotonic_seconds) + GATE_DURATION_SECONDS )); while (( $(monotonic_seconds) < observation )); do validate_observation_sample "$market"; assert_host_memory_reserve; [[ $(systemctl_value "$market" NRestarts) == 0 ]] || die "$market restarted"; [[ $(systemctl_value "$market" MainPID) == "$pid" ]] || die "$market MainPID changed"; [[ $TEST_ONLY == true ]] && break; sleep 15; done
   phase_runtime["$market"]=$GATE_DURATION_SECONDS; systemctl stop "${unit[$market]}"; systemctl_active "${unit[$market]}" && die "$market shadow remained active"; resource_monitor_stop; resource_monitor_start "strict-verifier-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; verify_segments "$market"; resource_monitor_stop; calibrate_psi "shadow-$market-tail"
 }
-run_candidate_drain() { local market=$1; resource_monitor_start "upload-drain-$market" "$UPLOAD_DRAIN_MEMORY_MAX_BYTES"; if [[ $TEST_ONLY == true ]]; then resource_monitor_stop; return 0; fi; systemd-run --quiet --wait --collect --unit="monday-rust-upload-drain-$$-$market.service" --property=MemoryMax="$((UPLOAD_DRAIN_MEMORY_MAX_BYTES / 1048576))M" --property=MemoryHigh=384M --uid="$SERVICE_USER" -- "$candidate_binary" --upload-only; resource_monitor_stop; }
+DRAIN_ENV_KEYS=(
+  MARKET DATASET SHARD_ID SYMBOLS DEPTH_MODE WS_SHARD_SIZE SNAPSHOT_LIMIT
+  SNAPSHOT_REQUESTS_PER_SECOND SNAPSHOT_RETRY_ATTEMPTS
+  SYNC_TIMEOUT_SECONDS STALL_TIMEOUT_SECONDS PROCESS_WATCHDOG_SECONDS
+  TASK_CANCEL_TIMEOUT_SECONDS
+  MAX_BUFFERED_DIFFS MAX_PENDING_DIFFS_TOTAL MIN_FREE_GB ZSTD_TIMEOUT_SECONDS
+  OSS_COPY_TIMEOUT_SECONDS SEGMENT_SECONDS OSS_BUCKET OSS_ENDPOINT OSS_REGION
+  ALIYUN_PROFILE BINANCE_REST_BASE LOG_LEVEL
+)
+declare -a candidate_drain_env_args=()
+load_candidate_drain_env() {
+  local market=$1 file=${market_env[$1]} spool=${spool_dir[$1]} key value
+  candidate_drain_env_args=()
+  [[ -n $spool && $spool == "$run_spool/$market" ]] || die "$market drain spool is not run-scoped"
+  for key in "${DRAIN_ENV_KEYS[@]}"; do
+    value=$(env_value "$file" "$key") || die "$market candidate env has no unique $key"
+    candidate_drain_env_args+=("$key=$value")
+  done
+  if grep -q '^SNAPSHOT_PRODUCERS=' "$file"; then
+    value=$(env_value "$file" SNAPSHOT_PRODUCERS) || die "$market candidate env has no unique SNAPSHOT_PRODUCERS"
+    candidate_drain_env_args+=("SNAPSHOT_PRODUCERS=$value")
+  fi
+  # SPOOL_DIR is the one deliberate projection: the candidate env is used as
+  # the source of every identity/timeout value, while the drain is forced into
+  # this Gate's isolated spool instead of inheriting production's default.
+  candidate_drain_env_args+=("SPOOL_DIR=$spool")
+}
+run_candidate_drain() {
+  local market=$1
+  resource_monitor_start "upload-drain-$market" "$UPLOAD_DRAIN_MEMORY_MAX_BYTES"
+  # Build and validate the exact environment even in fixtures.  Returning
+  # before this step previously masked a production-only default-spool bug.
+  load_candidate_drain_env "$market"
+  if [[ $TEST_ONLY == true ]]; then
+    printf '%s\n' "${candidate_drain_env_args[@]}" >"$tmp_dir/$market-drain-env"
+    jq -cn --arg market "$market" --arg dataset "${dataset[$market]}" \
+      --arg session "${phase_session[$market]}" \
+      '{market:$market,dataset:$dataset,last_error:null,session_id:$session,uploaded_triplets:1}' \
+      >"${spool_dir[$market]}/upload-status.json"
+    resource_monitor_stop
+    return 0
+  fi
+  systemd-run --quiet --wait --collect \
+    --unit="monday-rust-upload-drain-$$-$market.service" \
+    --property=MemoryMax="$((UPLOAD_DRAIN_MEMORY_MAX_BYTES / 1048576))M" \
+    --property=MemoryHigh=384M --uid="$SERVICE_USER" -- \
+    env -i HOME="$SERVICE_HOME" PATH="$SAFE_PATH" RUST_LOG=info \
+    "${candidate_drain_env_args[@]}" "$candidate_binary" --upload-only
+  resource_monitor_stop
+}
 assert_spool_drained() {
   local market=$1 remaining
   remaining=$(find "${spool_dir[$market]}" \( -type f -o -type l \) \( \
