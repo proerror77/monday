@@ -95,6 +95,17 @@ jq -e --arg payload "$target_payload" --arg runtime "$target_runtime" \
 [[ $(monday_sha256_file "$target_release/deployment.sha256") == \
   "$(jq -er '.candidate_control_bytes.sha256' "$GATE")" ]] \
   || die 'Gate control bytes do not match the target controller'
+expected_control_assets='{}'
+while IFS= read -r control_asset; do
+  control_sha=$(monday_sha256_file "$target_release/deployment/$control_asset") \
+    || die "target control asset is missing: $control_asset"
+  expected_control_assets=$(jq -cn --argjson values "$expected_control_assets" \
+    --arg asset "$control_asset" --arg sha "$control_sha" \
+    '$values + {($asset):$sha}')
+done < <(monday_controller_assets)
+jq -e --argjson expected "$expected_control_assets" \
+  '.candidate_control_bytes.assets == $expected' "$GATE" >/dev/null \
+  || die 'Gate control asset digests do not match the target controller'
 
 active=none; old_active_target=; before_payload=; before_runtime=; before_release=
 if [[ -L $active_link ]]; then active=$(monday_active_controller_sha "$ROOT") || die 'active controller is invalid'; fi
