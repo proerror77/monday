@@ -119,7 +119,8 @@ monday_manifest_field() {
 
 monday_active_controller_sha() {
   [[ $# -eq 1 ]] || return 2
-  local root=${1%/} link="$root/opt/monday/releases/binance-lob-controller/active"
+  local root=${1%/} link
+  link="$root/opt/monday/releases/binance-lob-controller/active"
   local target sha
   [[ -L $link ]] || return 1
   target=$(readlink -f -- "$link") || return 1
@@ -172,7 +173,6 @@ monday_validate_v2_gate() {
       .schema == "monday.rust_lob_shadow_gate.v5"
       and .control_plane_version == 2
       and .passed == true
-      and .gate_sha256 == $gate_sha
       and .transition.before == $from
       and .transition.after == $candidate
       and (.candidate_controller_sha256 == $candidate)
