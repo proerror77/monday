@@ -5,7 +5,8 @@ usage() {
   printf '%s\n' \
     'Usage: ACTION=gate-preflight|gate|controller-apply|cutover|restore INSTANCE_ID=i-... ARTIFACT_SHA256=<64 hex> invoke-rust-lob-operation.sh' \
     '' \
-    'controller-apply also requires CONTROLLER_RELEASE_SHA256=<64 hex>.' \
+    'gate-preflight, gate, cutover, and restore optionally accept CONTROLLER_RELEASE_SHA256=<64 hex>.' \
+    'controller-apply requires CONTROLLER_RELEASE_SHA256=<64 hex>.' \
     'The command always targets ap-northeast-1 and uses Alibaba Cloud Assistant.'
 }
 
@@ -82,6 +83,18 @@ case "$ACTION" in
     ;;
 esac
 
+controller_dispatch=false
+case "$ACTION" in
+  gate-preflight|gate|cutover|restore)
+    if [[ -n $CONTROLLER_RELEASE_SHA256 ]]; then
+      controller_dispatch=true
+    else
+      printf 'deprecated: ACTION=%s without CONTROLLER_RELEASE_SHA256 uses artifact-release controller bytes; pin an applied controller release\n' \
+        "$ACTION" >&2
+    fi
+    ;;
+esac
+
 polls=$((timeout_seconds / 5))
 cancel_polls=12
 if [[ -n ${MONDAY_OPERATION_TEST_POLLS:-} || -n ${MONDAY_OPERATION_TEST_CANCEL_POLLS:-} ]]; then
@@ -104,18 +117,36 @@ fi
 
 if [[ $ACTION == controller-apply ]]; then
   host_path="/opt/monday/releases/binance-lob-controller/$CONTROLLER_RELEASE_SHA256/deployment/$host_script"
-else
-  host_path="/opt/monday/releases/binance-lob-archiver/$ARTIFACT_SHA256/deployment/$host_script"
-fi
-if [[ $ACTION == gate-preflight ]]; then
-  printf -v remote_script '#!/usr/bin/env bash\nset -euo pipefail\nexec %q --resource-preflight %q\n' \
-    "$host_path" "$ARTIFACT_SHA256"
-elif [[ $ACTION == controller-apply ]]; then
   printf -v remote_script '#!/usr/bin/env bash\nset -euo pipefail\nexec %q %q %q\n' \
     "$host_path" "$CONTROLLER_RELEASE_SHA256" "$ARTIFACT_SHA256"
+elif [[ $controller_dispatch == true ]]; then
+  artifact_release="/opt/monday/releases/binance-lob-archiver/$ARTIFACT_SHA256"
+  controller_root=/opt/monday/releases/binance-lob-controller
+  controller_release="$controller_root/$CONTROLLER_RELEASE_SHA256"
+  controller_deployment="$controller_release/deployment"
+  printf -v remote_variables \
+    'artifact_sha=%q\nartifact_release=%q\ncontroller_sha=%q\ncontroller_root=%q\ncontroller_release=%q\ncontroller_deployment=%q\nhost_script=%q\n' \
+    "$ARTIFACT_SHA256" "$artifact_release" "$CONTROLLER_RELEASE_SHA256" \
+    "$controller_root" "$controller_release" "$controller_deployment" "$host_script"
+  remote_script=$'#!/usr/bin/env bash\nset -euo pipefail\nexport LC_ALL=C\n'
+  remote_script+="$remote_variables"
+  remote_script+=$'\nregular_file() {\n  [[ -f $1 && ! -L $1 ]]\n}\n\ndirect_directory() {\n  local path=$1 resolved\n  [[ -d $path && ! -L $path ]] || return 1\n  resolved=$(readlink -f -- "$path") || return 1\n  [[ $resolved == "$path" ]]\n}\n\ndie() {\n  printf \'controller dispatcher failed: %s\\n\' "$*" >&2\n  exit 1\n}\n\ndirect_directory "$artifact_release" || die "artifact release path is missing or indirect"\ndirect_directory "$artifact_release/deployment" || die "artifact deployment path is missing or indirect"\nartifact_manifest="$artifact_release/release.json"\nregular_file "$artifact_manifest" || die "artifact release manifest is missing or indirect"\njq -e --arg artifact "$artifact_sha" \'\n  .artifact_sha256 == $artifact\n  and (.runtime_contract_sha256 | type == "string")\n  and (.runtime_contract_sha256 | test("^[a-f0-9]{64}$"))\' \\\n  "$artifact_manifest" >/dev/null || die "artifact release identity is invalid"\nruntime_contract=$(jq -er \'.runtime_contract_sha256\' "$artifact_manifest") \\\n  || die "artifact release runtime identity is missing"\n\ndirect_directory "$controller_root" || die "controller release root is missing or indirect"\ndirect_directory "$controller_release" || die "controller release path is missing or indirect"\ndirect_directory "$controller_deployment" || die "controller deployment path is missing or indirect"\ncontroller_manifest="$controller_release/release.json"\nregular_file "$controller_manifest" || die "controller release manifest is missing or indirect"\nregular_file "$controller_release/release.json.sha256" || die "controller manifest checksum is missing or indirect"\nregular_file "$controller_release/deployment.sha256" || die "controller deployment checksum is missing or indirect"\n[[ $(sha256sum "$controller_manifest" | awk \'{print $1}\') == "$controller_sha" ]] \\\n  || die "controller release manifest digest mismatch"\n(cd "$controller_release" \\\n  && sha256sum --check --strict release.json.sha256 >/dev/null \\\n  && sha256sum --check --strict deployment.sha256 >/dev/null) \\\n  || die "controller release checksum verification failed"\njq -e --arg artifact "$artifact_sha" --arg runtime "$runtime_contract" \'\n  .schema == "monday.rust_lob_controller_release.v1"\n  and .artifact_sha256 == $artifact\n  and .runtime_contract_sha256 == $runtime\n  and (.deployment_bundle_sha256 | type == "string" and test("^[a-f0-9]{64}$"))\n  and (.deployment_source_revision | type == "string" and test("^[a-f0-9]{40,64}$"))\' \\\n  "$controller_manifest" >/dev/null || die "controller release identity is invalid"\n\nregular_file "$controller_deployment/rust-lob-control-plane-lib.sh" \\\n  || die "controller deployment helper is missing or indirect"\n# shellcheck disable=SC1090,SC1091\n. "$controller_deployment/rust-lob-control-plane-lib.sh"\nactive_deployment=$(monday_rust_lob_active_controller_deployment \\\n  "$controller_root" "$artifact_sha" "$runtime_contract") \\\n  || die "active controller deployment is invalid"\n[[ $active_deployment == "$controller_deployment" ]] \\\n  || die "active controller deployment differs from requested controller release"\ntarget_host_script="$controller_deployment/$host_script"\nregular_file "$target_host_script" && [[ -x $target_host_script ]] \\\n  || die "controller host script is missing, indirect, or not executable"\n'
+  if [[ $ACTION == gate-preflight ]]; then
+    remote_script+=$(printf 'exec %q --resource-preflight %q\n' \
+      "$controller_deployment/$host_script" "$ARTIFACT_SHA256")
+  else
+    remote_script+=$(printf 'exec %q %q\n' \
+      "$controller_deployment/$host_script" "$ARTIFACT_SHA256")
+  fi
 else
-  printf -v remote_script '#!/usr/bin/env bash\nset -euo pipefail\nexec %q %q\n' \
-    "$host_path" "$ARTIFACT_SHA256"
+  host_path="/opt/monday/releases/binance-lob-archiver/$ARTIFACT_SHA256/deployment/$host_script"
+  if [[ $ACTION == gate-preflight ]]; then
+    printf -v remote_script '#!/usr/bin/env bash\nset -euo pipefail\nexec %q --resource-preflight %q\n' \
+      "$host_path" "$ARTIFACT_SHA256"
+  else
+    printf -v remote_script '#!/usr/bin/env bash\nset -euo pipefail\nexec %q %q\n' \
+      "$host_path" "$ARTIFACT_SHA256"
+  fi
 fi
 command_content=$(printf '%s' "$remote_script" | base64 | tr -d '\n')
 

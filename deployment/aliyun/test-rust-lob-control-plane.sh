@@ -53,6 +53,9 @@ grep -Fxq '  gate)' "$INVOKE"
   printf 'formal Gate actions do not share the single host Gate entry\n' >&2
   exit 1
 }
+grep -Fq 'monday_rust_lob_active_controller_deployment' "$INVOKE"
+grep -Fq 'controller dispatcher failed' "$INVOKE"
+grep -Fq 'artifact-release controller bytes' "$INVOKE"
 
 psi_tmp_dir=$(mktemp -d)
 trap 'rm -rf "$psi_tmp_dir"' EXIT
@@ -4051,6 +4054,71 @@ grep -Fq 'gate-preflight returned invalid JSON evidence' \
 
 controller_release_sha=$(printf 'e%.0s' {1..64})
 controller_output_b64=$(printf 'controller applied\n' | base64 | tr -d '\n')
+for action in gate-preflight gate cutover restore; do
+  explicit_out="$tmp_dir/$action-explicit.out"
+  explicit_err="$tmp_dir/$action-explicit.err"
+  if [[ $action == gate-preflight ]]; then
+    explicit_output_b64=$preflight_output_b64
+  else
+    explicit_output_b64=''
+  fi
+  env "${common_env[@]}" \
+    ACTION="$action" \
+    CONTROLLER_RELEASE_SHA256="$controller_release_sha" \
+    MOCK_STATUS=Success \
+    MOCK_EXIT_CODE=0 \
+    MOCK_OUTPUT_B64="$explicit_output_b64" \
+    "$INVOKE" >"$explicit_out" 2>"$explicit_err"
+  if grep -Fq 'deprecated:' "$explicit_err"; then
+    printf '%s explicit controller dispatch emitted a deprecation warning\n' "$action" >&2
+    exit 1
+  fi
+  base64 --decode <"$mock_state/last-command-content" \
+    >"$tmp_dir/$action-explicit-command.sh"
+  bash -n "$tmp_dir/$action-explicit-command.sh"
+  grep -Fq 'monday_rust_lob_active_controller_deployment' \
+    "$tmp_dir/$action-explicit-command.sh"
+  grep -Fq "/opt/monday/releases/binance-lob-controller/$controller_release_sha/deployment" \
+    "$tmp_dir/$action-explicit-command.sh"
+  grep -Fq 'sha256sum --check --strict release.json.sha256' \
+    "$tmp_dir/$action-explicit-command.sh"
+  grep -Fq 'sha256sum --check --strict deployment.sha256' \
+    "$tmp_dir/$action-explicit-command.sh"
+  grep -Fq 'regular_file "$target_host_script" && [[ -x $target_host_script ]]' \
+    "$tmp_dir/$action-explicit-command.sh"
+  if [[ $action == gate-preflight ]]; then
+    grep -Fq \
+      "exec /opt/monday/releases/binance-lob-controller/$controller_release_sha/deployment/host-rust-lob-shadow-gate.sh --resource-preflight $artifact" \
+      "$tmp_dir/$action-explicit-command.sh"
+    jq -e '.schema == "monday.rust_lob_gate_resource_preflight.v1"' \
+      "$explicit_out" >/dev/null
+  elif [[ $action == gate ]]; then
+    grep -Fq \
+      "exec /opt/monday/releases/binance-lob-controller/$controller_release_sha/deployment/host-rust-lob-shadow-gate.sh $artifact" \
+      "$tmp_dir/$action-explicit-command.sh"
+  elif [[ $action == cutover ]]; then
+    grep -Fq \
+      "exec /opt/monday/releases/binance-lob-controller/$controller_release_sha/deployment/host-rust-lob-cutover.sh $artifact" \
+      "$tmp_dir/$action-explicit-command.sh"
+  else
+    grep -Fq \
+      "exec /opt/monday/releases/binance-lob-controller/$controller_release_sha/deployment/host-rust-lob-restore.sh $artifact" \
+      "$tmp_dir/$action-explicit-command.sh"
+  fi
+done
+
+run_commands_before=$(grep -c 'ecs RunCommand' "$mock_state/calls.log")
+if env "${common_env[@]}" ACTION=gate \
+  CONTROLLER_RELEASE_SHA256=invalid \
+  "$INVOKE" >"$tmp_dir/invalid-controller-release.out" 2>&1; then
+  printf 'operation wrapper accepted an invalid controller release identity\n' >&2
+  exit 1
+fi
+run_commands_after=$(grep -c 'ecs RunCommand' "$mock_state/calls.log")
+[[ $run_commands_after == "$run_commands_before" ]]
+grep -Fq 'CONTROLLER_RELEASE_SHA256 must contain exactly 64 hexadecimal characters' \
+  "$tmp_dir/invalid-controller-release.out"
+
 env "${common_env[@]}" \
   ACTION=controller-apply \
   CONTROLLER_RELEASE_SHA256="$controller_release_sha" \
@@ -4075,8 +4143,14 @@ run_commands_after=$(grep -c 'ecs RunCommand' "$mock_state/calls.log")
 [[ $run_commands_after == "$run_commands_before" ]]
 
 env "${common_env[@]}" MOCK_STATUS=Success MOCK_EXIT_CODE=0 "$INVOKE" \
-  >"$tmp_dir/success.out"
+  >"$tmp_dir/success.out" 2>"$tmp_dir/success.err"
 grep -Fq 'gate completed successfully: mock-invoke' "$tmp_dir/success.out"
+grep -Fq 'deprecated: ACTION=gate without CONTROLLER_RELEASE_SHA256 uses artifact-release controller bytes' \
+  "$tmp_dir/success.err"
+if grep -Fq 'deprecated:' "$tmp_dir/success.out"; then
+  printf 'artifact-release fallback deprecation leaked to stdout\n' >&2
+  exit 1
+fi
 
 rm -f "$mock_state/stopped" "$mock_state/transient-seen"
 env "${common_env[@]}" MOCK_TRANSIENT_ONCE=1 MOCK_STATUS=Success MOCK_EXIT_CODE=0 \

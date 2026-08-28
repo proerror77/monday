@@ -975,6 +975,14 @@ systemd state, touch `/data`, start a Gate, change either production symlink, or
 restart a collector. Applying that exact controller release is a separate
 Runtime transition with its own rollback and readback evidence.
 
+The same controller manifest identity must be supplied to the Gate, cutover,
+and restore operations. The dispatcher reads the artifact runtime identity,
+verifies the named controller manifest and deployment checksums, confirms that
+the active controller symlink resolves to that exact release, and only then
+executes the selected controller script. Omitting `CONTROLLER_RELEASE_SHA256`
+keeps the artifact-release path as a temporary compatibility fallback and emits
+a deprecation warning on stderr; it is not the release path for new operations.
+
 Apply a published controller release through the named operation wrapper:
 
 ```bash
@@ -1049,6 +1057,7 @@ set -euo pipefail
 ACTION=gate-preflight \
 INSTANCE_ID=i-REPLACE \
 ARTIFACT_SHA256=REPLACE_WITH_64_HEX_DIGEST \
+CONTROLLER_RELEASE_SHA256=REPLACE_WITH_CONTROLLER_MANIFEST_SHA256 \
 ./deployment/aliyun/invoke-rust-lob-operation.sh
 ```
 
@@ -1060,6 +1069,7 @@ set -euo pipefail
 ACTION=gate \
 INSTANCE_ID=i-REPLACE \
 ARTIFACT_SHA256=REPLACE_WITH_64_HEX_DIGEST \
+CONTROLLER_RELEASE_SHA256=REPLACE_WITH_CONTROLLER_MANIFEST_SHA256 \
 ./deployment/aliyun/invoke-rust-lob-operation.sh
 ```
 
@@ -1168,6 +1178,7 @@ set -euo pipefail
 ACTION=cutover \
 INSTANCE_ID=i-REPLACE \
 ARTIFACT_SHA256=REPLACE_WITH_64_HEX_DIGEST \
+CONTROLLER_RELEASE_SHA256=REPLACE_WITH_CONTROLLER_MANIFEST_SHA256 \
 ./deployment/aliyun/invoke-rust-lob-operation.sh
 ```
 
@@ -1270,6 +1281,7 @@ set -euo pipefail
 ACTION=restore \
 INSTANCE_ID=i-REPLACE \
 ARTIFACT_SHA256=REPLACE_WITH_64_HEX_DIGEST \
+CONTROLLER_RELEASE_SHA256=REPLACE_WITH_CONTROLLER_MANIFEST_SHA256 \
 ./deployment/aliyun/invoke-rust-lob-operation.sh
 ```
 
