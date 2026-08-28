@@ -189,6 +189,13 @@ monday_atomic_symlink() {
   temporary="$link.new.$$"
   rm -f -- "$temporary"
   ln -s "$target" "$temporary"
-  mv -f -- "$temporary" "$link"
+  if [[ $(uname -s) == Darwin ]]; then
+    # macOS mv follows a directory symlink; remove the link while the
+    # operation lock is held, then rename the staged link into place.
+    rm -f -- "$link"
+    mv -f -- "$temporary" "$link"
+  else
+    mv -Tf -- "$temporary" "$link"
+  fi
   [[ -L $link && $(readlink -f -- "$link") == "$resolved" ]]
 }

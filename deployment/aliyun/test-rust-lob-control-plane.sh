@@ -23,7 +23,7 @@ done < <({ monday_runtime_assets; monday_controller_assets; } | sort -u)
 publish_fixture() {
   local payload=$1 manifest=$2
   local payload_sha runtime_sha bundle bundle_sha
-  printf '#!/usr/bin/env bash\nexit 0\n' >"$payload"
+  printf '#!/usr/bin/env bash\n# %s\nexit 0\n' "$payload" >"$payload"
   chmod 0755 "$payload"
   payload_sha=$(monday_sha256_file "$payload")
   runtime_sha=$(monday_rust_lob_runtime_contract_sha256 "$source_dir")
@@ -88,5 +88,46 @@ gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
 gate=$(printf '%s\n' "$gate_output" | sed -n 's/^V2 Gate receipt: //p')
 gate_sha=$(printf '%s\n' "$gate_output" | sed -n 's/^SHA-256: //p')
 monday_validate_v2_gate "$gate" "$c0" "$c1" "$gate_sha"
+
+cutover_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from "$c0" --to "$c1" \
+  --gate-receipt "$gate" --gate-sha256 "$gate_sha" --root "$ROOT")
+transition=$(printf '%s\n' "$cutover_output" | sed -n 's/^Transition receipt: //p')
+transition_sha=$(printf '%s\n' "$cutover_output" | sed -n 's/^SHA-256: //p')
+[[ $(monday_active_controller_sha "$ROOT") == "$c1" ]]
+[[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == \
+  "$ROOT/opt/monday/releases/binance-lob-archiver/$p1_sha/binance-lob-archiver" ]]
+[[ $(monday_sha256_file "$transition") == "$transition_sha" ]]
+
+# A fault after the active-pair rename restores both identities under the lock.
+printf '\n# controller revision three fixture\n' >>"$source_dir/host-rust-lob-readback.sh"
+p2="$ROOT/p2"; m2="$ROOT/m2.json"
+p2_sha=$(publish_fixture "$p2" "$m2")
+c2=$(monday_sha256_file "$m2")
+gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c1" \
+  --candidate-controller "$c2" --root "$ROOT")
+gate2=$(printf '%s\n' "$gate_output" | sed -n 's/^V2 Gate receipt: //p')
+gate2_sha=$(printf '%s\n' "$gate_output" | sed -n 's/^SHA-256: //p')
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" MONDAY_CUTOVER_FAIL_AFTER_ACTIVE=1 \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from "$c1" --to "$c2" \
+  --gate-receipt "$gate2" --gate-sha256 "$gate2_sha" --root "$ROOT" \
+  >/dev/null 2>&1; then
+  printf 'fault-injected cutover unexpectedly succeeded\n' >&2
+  exit 1
+fi
+[[ $(monday_active_controller_sha "$ROOT") == "$c1" ]]
+[[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == \
+  "$ROOT/opt/monday/releases/binance-lob-archiver/$p1_sha/binance-lob-archiver" ]]
+
+MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from "$c1" --to "$c2" \
+  --gate-receipt "$gate2" --gate-sha256 "$gate2_sha" --root "$ROOT" >/dev/null
+rm "$ROOT/opt/monday/bin/binance-lob-archiver"
+MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c2" --root "$ROOT" >/dev/null
+[[ $(monday_active_controller_sha "$ROOT") == "$c2" ]]
+[[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == \
+  "$ROOT/opt/monday/releases/binance-lob-archiver/$p2_sha/binance-lob-archiver" ]]
 
 printf 'V2 Gate contract passed\n'
