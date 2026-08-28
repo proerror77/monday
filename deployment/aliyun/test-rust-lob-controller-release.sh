@@ -138,6 +138,13 @@ publish_controller_release "$fixture" "$artifact" "$bundle" "$manifest" \
   >"$tmp_dir/first.out"
 controller_release="$fixture/opt/monday/releases/binance-lob-controller/$manifest_sha"
 [[ -d $controller_release && ! -L $controller_release ]]
+projection="$controller_release/binance-lob-archiver"
+expected_projection_target="$artifact_release/binance-lob-archiver"
+[[ -L $projection ]]
+[[ $(readlink "$projection") == "$expected_projection_target" ]]
+[[ $(readlink -f -- "$projection") == "$expected_projection_target" ]]
+[[ -f $expected_projection_target && ! -L $expected_projection_target ]]
+[[ $(sha256sum "$expected_projection_target" | awk '{print $1}') == "$artifact_sha" ]]
 cmp -s "$manifest" "$controller_release/release.json"
 (cd "$controller_release" \
   && sha256sum --check --strict release.json.sha256 >/dev/null \
@@ -149,6 +156,87 @@ cmp -s "$manifest" "$controller_release/release.json"
 publish_controller_release "$fixture" "$artifact" "$bundle" "$manifest" \
   >"$tmp_dir/second.out"
 grep -Fq 'already published' "$tmp_dir/second.out"
+
+no_production_manifest="$tmp_dir/no-production.json"
+jq '.deployment_source_revision = ("e" * 40)' "$manifest" \
+  >"$no_production_manifest"
+no_production_manifest_sha=$(sha256sum "$no_production_manifest" \
+  | awk '{print $1}')
+rm "$fixture/opt/monday/bin/binance-lob-archiver"
+publish_controller_release "$fixture" "$artifact" "$bundle" \
+  "$no_production_manifest" >"$tmp_dir/no-production.out"
+[[ -L "$controller_root/$no_production_manifest_sha/binance-lob-archiver" ]]
+[[ ! -e "$controller_root/active" && ! -L "$controller_root/active" ]]
+ln -s "$production_target_before" "$fixture/opt/monday/bin/binance-lob-archiver"
+
+chmod u+w "$controller_release"
+rm "$projection"
+ln -s "$production_target_before" "$projection"
+chmod 0555 "$controller_release"
+if (publish_controller_release "$fixture" "$artifact" "$bundle" "$manifest") \
+  >"$tmp_dir/wrong-projection.out" 2>&1; then
+  printf 'controller release accepted a projection for the wrong artifact\n' >&2
+  exit 1
+fi
+grep -Fq 'controller payload projection target differs from artifact release' \
+  "$tmp_dir/wrong-projection.out"
+
+chmod u+w "$controller_release"
+rm "$projection"
+ln -s "$tmp_dir/missing/binance-lob-archiver" "$projection"
+chmod 0555 "$controller_release"
+if (publish_controller_release "$fixture" "$artifact" "$bundle" "$manifest") \
+  >"$tmp_dir/dangling-projection.out" 2>&1; then
+  printf 'controller release accepted a dangling projection\n' >&2
+  exit 1
+fi
+grep -Fq 'controller payload projection is dangling' \
+  "$tmp_dir/dangling-projection.out"
+
+printf 'projection escape\n' >"$tmp_dir/escape"
+chmod u+w "$controller_release"
+rm "$projection"
+ln -s ../../../../../../escape "$projection"
+chmod 0555 "$controller_release"
+if (publish_controller_release "$fixture" "$artifact" "$bundle" "$manifest") \
+  >"$tmp_dir/escape-projection.out" 2>&1; then
+  printf 'controller release accepted a projection escape\n' >&2
+  exit 1
+fi
+grep -Fq 'controller payload projection target differs from artifact release' \
+  "$tmp_dir/escape-projection.out"
+
+chmod u+w "$controller_release"
+rm "$projection"
+printf 'replaced projection\n' >"$projection"
+chmod 0444 "$projection"
+chmod 0555 "$controller_release"
+if (publish_controller_release "$fixture" "$artifact" "$bundle" "$manifest") \
+  >"$tmp_dir/regular-projection.out" 2>&1; then
+  printf 'controller release accepted a regular projection replacement\n' >&2
+  exit 1
+fi
+grep -Fq 'controller payload projection is not a symlink' \
+  "$tmp_dir/regular-projection.out"
+
+chmod u+w "$controller_release"
+rm "$projection"
+ln -s "$expected_projection_target" "$projection"
+chmod 0555 "$controller_release"
+
+artifact_backup="$tmp_dir/artifact.backup"
+cp "$expected_projection_target" "$artifact_backup"
+printf '\ntampered payload\n' >>"$expected_projection_target"
+if (publish_controller_release "$fixture" "$artifact" "$bundle" "$manifest") \
+  >"$tmp_dir/tampered-projection-target.out" 2>&1; then
+  printf 'controller release accepted a tampered payload target\n' >&2
+  exit 1
+fi
+grep -Fq 'staged artifact binary digest mismatch' \
+  "$tmp_dir/tampered-projection-target.out"
+chmod u+w "$expected_projection_target"
+cp "$artifact_backup" "$expected_projection_target"
+chmod 0755 "$expected_projection_target"
 
 ln -s "$controller_release" "$controller_root/active"
 active_controller_before=$(readlink "$controller_root/active")
