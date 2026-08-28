@@ -4,292 +4,154 @@ umask 027
 export LC_ALL=C
 
 usage() {
-  printf 'Usage: %s <artifact-file> <deployment-bundle.tar> <controller-release.json>\n' \
-    "${0##*/}" >&2
+  printf 'Usage: %s <artifact> <bundle.tar> <controller-release.json> [root]\n' "${0##*/}" >&2
 }
 
-configure_paths() {
-  local root=${1%/}
-  ARTIFACT_RELEASE_ROOT="$root/opt/monday/releases/binance-lob-archiver"
-  CONTROLLER_RELEASE_ROOT="$root/opt/monday/releases/binance-lob-controller"
-  LOCK_ROOT="$root/run/lock"
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+ROOT=${MONDAY_ROOT:-/}
+sha256_file() { monday_sha256_file "$1"; }
+regular_file() { monday_file_direct "$1"; }
+direct_directory() { monday_path_direct "$1"; }
+
+configure() {
+  ROOT=${1:-$ROOT}; ROOT=${ROOT%/}
+  [[ -n $ROOT ]] || ROOT=/
+  ARTIFACT_ROOT="$ROOT/opt/monday/releases/binance-lob-archiver"
+  CONTROLLER_ROOT="$ROOT/opt/monday/releases/binance-lob-controller"
 }
 
-die() {
-  printf '%s\n' "$*" >&2
-  exit 1
-}
-
-sha256_file() {
-  sha256sum "$1" | awk '{print $1}'
-}
-
-direct_directory() {
-  local path=$1 resolved
-  [[ -d $path && ! -L $path ]] || return 1
-  resolved=$(readlink -f -- "$path") || return 1
-  [[ $resolved == "$path" ]]
-}
-
-regular_file() {
-  [[ -f $1 && ! -L $1 ]]
-}
-
-verify_payload_projection() {
-  local release_dir=$1 artifact_sha=$2
-  local projection="$release_dir/binance-lob-archiver"
-  local expected_target="$ARTIFACT_RELEASE_ROOT/$artifact_sha/binance-lob-archiver"
-  local resolved_target
-
-  [[ -L $projection ]] \
-    || die 'controller payload projection is not a symlink'
-  resolved_target=$(readlink -f -- "$projection") \
-    || die 'controller payload projection is dangling'
-  [[ $(readlink -- "$projection") == "$expected_target" \
-      && $resolved_target == "$expected_target" ]] \
-    || die 'controller payload projection target differs from artifact release'
-  regular_file "$resolved_target" \
-    || die 'controller payload projection target is not a regular file'
-  [[ $(sha256_file "$resolved_target") == "$artifact_sha" ]] \
-    || die 'controller payload projection target digest mismatch'
-}
-
-runtime_contract_sha256_v1() {
-  [[ $# -eq 1 ]] || return 2
-  local directory=$1 asset digest
-  local -a assets=(
-    binance-lob-archiver-production@.service
-    binance-lob-archiver-rust@.service
-    binance-lob-archiver-upload@.service
-    binance-lob-archiver-rust-upload@.service
-    binance-lob-archiver-production-spot.env
-    binance-lob-archiver-production-usdm.env
-    binance-lob-archiver-rust-spot.env
-    binance-lob-archiver-rust-usdm.env
-  )
-
-  for asset in "${assets[@]}"; do
-    regular_file "$directory/$asset" || return 1
-  done
-  {
-    for asset in "${assets[@]}"; do
-      digest=$(sha256_file "$directory/$asset")
-      printf '%s  %s\n' "$digest" "$asset"
-    done
-  } | sha256sum | awk '{print $1}'
-}
-
-verify_staged_artifact_release() {
-  local release_dir=$1 artifact_sha=$2 artifact_uri=$3 runtime_contract=$4
-  local artifact_binary="$release_dir/binance-lob-archiver"
-  local artifact_metadata="$release_dir/release.json"
-  local artifact_deployment="$release_dir/deployment"
-
-  direct_directory "$ARTIFACT_RELEASE_ROOT" \
-    || die 'artifact release root is missing or indirect'
-  direct_directory "$release_dir" \
-    || die "staged artifact release is missing or indirect: $release_dir"
-  direct_directory "$artifact_deployment" \
-    || die 'staged artifact deployment is missing or indirect'
-  regular_file "$artifact_binary" \
-    || die 'staged artifact binary is not a regular file'
-  [[ $(readlink -f -- "$artifact_binary") == "$artifact_binary" ]] \
-    || die 'staged artifact binary path is indirect'
-  regular_file "$artifact_metadata" \
-    || die 'staged artifact metadata is not a regular file'
-  regular_file "$artifact_deployment/rust-lob-control-plane-lib.sh" \
-    || die 'staged artifact runtime contract helper is not a regular file'
-  [[ $(sha256_file "$artifact_binary") == "$artifact_sha" ]] \
-    || die 'staged artifact binary digest mismatch'
-  jq -e \
-    --arg artifact_sha "$artifact_sha" \
-    --arg artifact_uri "$artifact_uri" \
-    --arg runtime_contract "$runtime_contract" '
-      .artifact_sha256 == $artifact_sha
-      and .artifact_uri == $artifact_uri
-      and .runtime_contract_sha256 == $runtime_contract' \
-    "$artifact_metadata" >/dev/null \
-    || die 'staged artifact metadata differs from controller release identity'
-  [[ $(runtime_contract_sha256_v1 "$artifact_deployment") == "$runtime_contract" ]] \
-    || die 'staged artifact runtime contract drifted from release metadata'
-}
-
-validate_manifest() {
-  jq -e '
-    type == "object"
-    and keys == [
-      "artifact_sha256",
-      "artifact_uri",
-      "deployment_bundle_sha256",
-      "deployment_bundle_uri",
-      "deployment_source_revision",
-      "runtime_contract_sha256",
-      "schema"
-    ]
-    and .schema == "monday.rust_lob_controller_release.v1"
-    and (.artifact_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
-    and (.artifact_uri
-      | type == "string"
-      and test("^oss://[A-Za-z0-9][A-Za-z0-9.-]*/[A-Za-z0-9._/@+=:-]+$"))
-    and (.deployment_bundle_sha256
-      | type == "string" and test("^[a-f0-9]{64}$"))
-    and (.deployment_bundle_uri
-      | type == "string"
-      and test("^oss://[A-Za-z0-9][A-Za-z0-9.-]*/[A-Za-z0-9._/@+=:-]+$"))
-    and (.deployment_source_revision
-      | type == "string" and test("^[a-f0-9]{40,64}$"))
-    and (.runtime_contract_sha256
-      | type == "string" and test("^[a-f0-9]{64}$"))' \
-    "$1" >/dev/null
-}
-
-extract_bundle() {
-  local bundle=$1 destination=$2 listing=$3 entry duplicate
-  tar -tf "$bundle" >"$listing" || die 'deployment bundle cannot be listed'
-  [[ -s $listing ]] || die 'deployment bundle is empty'
+validate_archive() {
+  local archive=$1 list entry
+  list=$(mktemp)
+  tar -tf "$archive" >"$list" || { rm -f "$list"; return 1; }
+  [[ -s $list ]] || { rm -f "$list"; return 1; }
   while IFS= read -r entry; do
-    [[ $entry =~ ^[A-Za-z0-9][A-Za-z0-9._@+-]*$ ]] \
-      || die "deployment bundle contains an unsafe asset name: $entry"
-  done <"$listing"
-  duplicate=$(sort "$listing" | uniq -d | head -n 1)
-  [[ -z $duplicate ]] || die "deployment bundle repeats an asset: $duplicate"
-  tar --no-same-owner --no-same-permissions -xf "$bundle" -C "$destination"
-  while IFS= read -r entry; do
-    regular_file "$destination/$entry" \
-      || die "deployment bundle contains a non-regular asset: $entry"
-  done <"$listing"
+    [[ $entry =~ ^[A-Za-z0-9][A-Za-z0-9._@+-]*$ ]] || {
+      rm -f "$list"; return 1;
+    }
+  done <"$list"
+  printf '%s\n' "$list"
 }
 
-verify_published_release() {
-  local release_dir=$1 extracted=$2 manifest=$3 listing=$4 source asset
-  local expected_assets actual_assets top_level artifact_sha
-  direct_directory "$release_dir" \
-    || die "controller release path is indirect: $release_dir"
-  direct_directory "$release_dir/deployment" \
-    || die 'controller release deployment is indirect'
-  regular_file "$release_dir/release.json" \
-    || die 'controller release manifest is not a regular file'
-  regular_file "$release_dir/release.json.sha256" \
-    || die 'controller release manifest checksum is not a regular file'
-  regular_file "$release_dir/deployment.sha256" \
-    || die 'controller deployment checksum is not a regular file'
-  cmp -s "$manifest" "$release_dir/release.json" \
-    || die 'existing controller release manifest differs'
-  (cd "$release_dir" \
-    && sha256sum --check --strict release.json.sha256 >/dev/null \
-    && sha256sum --check --strict deployment.sha256 >/dev/null) \
-    || die 'existing controller release checksum verification failed'
+extract_archive() {
+  local archive=$1 destination=$2 list=$3 entry
+  mkdir "$destination"
+  tar --no-same-owner --no-same-permissions -xf "$archive" -C "$destination"
+  while IFS= read -r entry; do
+    regular_file "$destination/$entry" || return 1
+  done <"$list"
+}
 
-  expected_assets=$(wc -l <"$listing" | tr -d ' ')
-  actual_assets=$(find "$release_dir/deployment" -mindepth 1 -maxdepth 1 -print \
-    | wc -l | tr -d ' ')
-  [[ $actual_assets == "$expected_assets" ]] \
-    || die 'existing controller release contains unexpected deployment assets'
+validate_payload() {
+  local artifact=$1 artifact_sha=$2 release=$3 metadata
+  regular_file "$artifact" || die 'payload artifact is not a regular file'
+  [[ $(sha256_file "$artifact") == "$artifact_sha" ]] \
+    || die 'payload artifact digest mismatch'
+  metadata="$release/release.json"
+  if [[ -e $metadata || -L $metadata ]]; then
+    regular_file "$metadata" || die 'payload metadata is not a regular file'
+    jq -e --arg sha "$artifact_sha" '.artifact_sha256 == $sha' "$metadata" >/dev/null \
+      || die 'existing payload metadata binds a different artifact'
+  fi
+}
+
+install_payload_release() {
+  local artifact=$1 artifact_sha=$2 artifact_uri=$3 source_revision=$4 bundle_sha=$5 bundle_uri=$6 runtime=$7 extracted=$8 release staging asset
+  release="$ARTIFACT_ROOT/$artifact_sha"
+  if [[ -e $release || -L $release ]]; then
+    direct_directory "$release" || die 'payload release path is indirect'
+    validate_payload "$release/binance-lob-archiver" "$artifact_sha" "$release"
+    return 0
+  fi
+  staging=$(mktemp -d "$ARTIFACT_ROOT/.${artifact_sha}.new.XXXXXX")
+  trap 'rm -rf "${staging:-}"' RETURN
+  install -m 0755 "$artifact" "$staging/binance-lob-archiver"
+  mkdir -m 0755 "$staging/deployment"
   while IFS= read -r asset; do
-    source="$extracted/$asset"
-    if ! regular_file "$release_dir/deployment/$asset" \
-      || ! cmp -s "$source" "$release_dir/deployment/$asset"; then
-      die "existing controller release differs from bundle: $asset"
-    fi
-  done <"$listing"
-  artifact_sha=$(jq -er '.artifact_sha256' "$manifest") \
-    || die 'controller release manifest is missing the artifact digest'
-  verify_payload_projection "$release_dir" "$artifact_sha"
-  top_level=$(find "$release_dir" -mindepth 1 -maxdepth 1 -print \
-    | wc -l | tr -d ' ')
-  [[ $top_level == 5 ]] \
-    || die 'existing controller release contains unexpected top-level assets'
+    [[ -n $asset ]] || continue
+    install -m 0444 "$extracted/$asset" "$staging/deployment/$asset"
+  done < <(monday_runtime_assets)
+  jq -cn --arg uri "$artifact_uri" --arg sha "$artifact_sha" \
+    --arg runtime "$runtime" --arg source "$source_revision" \
+    --arg bundle "$bundle_uri" --arg bundle_sha "$bundle_sha" \
+    '{schema:"monday.rust_lob_payload_release.v1",artifact_uri:$uri,
+      artifact_sha256:$sha,runtime_contract_sha256:$runtime,
+      deployment_source_revision:$source,deployment_bundle_uri:$bundle,
+      deployment_bundle_sha256:$bundle_sha}' >"$staging/release.json"
+  chmod 0444 "$staging/release.json"
+  chmod 0555 "$staging" "$staging/deployment"
+  mv -f "$staging" "$release"
+  staging=
 }
 
 publish_controller_release() (
-  [[ $# -eq 4 ]] || return 2
-  local root=$1 artifact_file=$2 bundle=$3 manifest=$4
-  local artifact_sha artifact_uri bundle_sha manifest_sha runtime_contract source_revision
-  local staged_release
-  local work_dir extracted listing release_dir staging asset mode
-
-  configure_paths "$root"
-  regular_file "$artifact_file" || die 'artifact input is not a regular file'
-  regular_file "$bundle" || die 'deployment bundle input is not a regular file'
-  regular_file "$manifest" || die 'controller release manifest is not a regular file'
-  validate_manifest "$manifest" || die 'controller release manifest is invalid'
-
-  artifact_sha=$(jq -er '.artifact_sha256' "$manifest")
-  artifact_uri=$(jq -er '.artifact_uri' "$manifest")
-  bundle_sha=$(jq -er '.deployment_bundle_sha256' "$manifest")
+  [[ $# -ge 3 && $# -le 4 ]] || { usage; return 2; }
+  local artifact=$1 bundle=$2 manifest=$3 root=${4:-${MONDAY_ROOT:-/}}
+  local artifact_sha artifact_uri bundle_sha bundle_uri source runtime manifest_sha release work extracted list asset mode
+  configure "$root"
+  . "$(dirname -- "$0")/rust-lob-control-plane-lib.sh"
+  regular_file "$artifact" || die 'artifact input is missing'
+  regular_file "$bundle" || die 'deployment bundle input is missing'
+  regular_file "$manifest" || die 'controller manifest input is missing'
+  monday_validate_v2_manifest "$manifest" || die 'controller manifest is not V2'
+  artifact_sha=$(monday_manifest_field "$manifest" artifact_sha256)
+  artifact_uri=$(monday_manifest_field "$manifest" artifact_uri)
+  bundle_sha=$(monday_manifest_field "$manifest" deployment_bundle_sha256)
+  bundle_uri=$(monday_manifest_field "$manifest" deployment_bundle_uri)
+  source=$(monday_manifest_field "$manifest" deployment_source_revision)
+  runtime=$(monday_manifest_field "$manifest" runtime_contract_sha256)
+  [[ $(sha256_file "$bundle") == "$bundle_sha" ]] || die 'deployment bundle digest mismatch'
+  direct_directory "$ARTIFACT_ROOT" || { mkdir -p "$ARTIFACT_ROOT"; direct_directory "$ARTIFACT_ROOT"; }
+  direct_directory "$CONTROLLER_ROOT" || mkdir -p "$CONTROLLER_ROOT"
   manifest_sha=$(sha256_file "$manifest")
-  runtime_contract=$(jq -er '.runtime_contract_sha256' "$manifest")
-  source_revision=$(jq -er '.deployment_source_revision' "$manifest")
-  [[ $(sha256_file "$artifact_file") == "$artifact_sha" ]] \
-    || die 'downloaded artifact digest differs from controller release manifest'
-  [[ $(sha256_file "$bundle") == "$bundle_sha" ]] \
-    || die 'downloaded deployment bundle digest differs from controller release manifest'
-
-  staged_release="$ARTIFACT_RELEASE_ROOT/$artifact_sha"
-  verify_staged_artifact_release \
-    "$staged_release" "$artifact_sha" "$artifact_uri" "$runtime_contract"
-
-  work_dir=$(mktemp -d)
-  extracted="$work_dir/deployment"
-  listing="$work_dir/assets"
-  mkdir "$extracted"
-  trap 'rm -rf "$work_dir" "${staging:-}"' EXIT
-  extract_bundle "$bundle" "$extracted" "$listing"
-  regular_file "$extracted/rust-lob-control-plane-lib.sh" \
-    || die 'deployment bundle is missing the runtime contract helper'
-  [[ $(runtime_contract_sha256_v1 "$extracted") \
-      == "$runtime_contract" ]] \
-    || die 'controller bundle changes the gated runtime contract'
-
-  if [[ -e $CONTROLLER_RELEASE_ROOT || -L $CONTROLLER_RELEASE_ROOT ]]; then
-    direct_directory "$CONTROLLER_RELEASE_ROOT" \
-      || die 'controller release root is indirect'
-  else
-    direct_directory "${CONTROLLER_RELEASE_ROOT%/*}" \
-      || die 'release root is indirect'
-    install -d -m 0755 "$CONTROLLER_RELEASE_ROOT"
-  fi
-  release_dir="$CONTROLLER_RELEASE_ROOT/$manifest_sha"
-  if [[ -e $release_dir || -L $release_dir ]]; then
-    verify_published_release "$release_dir" "$extracted" "$manifest" "$listing"
+  release="$CONTROLLER_ROOT/$manifest_sha"
+  work=$(mktemp -d); extracted="$work/deployment"
+  list=$(validate_archive "$bundle") || die 'deployment bundle contains an unsafe member'
+  trap 'rm -rf "${work:-}"' EXIT
+  extract_archive "$bundle" "$extracted" "$list" || die 'deployment bundle contains a non-regular member'
+  for asset in $(monday_runtime_assets) $(monday_controller_assets); do
+    regular_file "$extracted/$asset" || die "deployment bundle is missing $asset"
+  done
+  [[ $(monday_rust_lob_runtime_contract_sha256 "$extracted") == "$runtime" ]] \
+    || die 'runtime contract differs from the manifest'
+  validate_payload "$artifact" "$artifact_sha" "$ARTIFACT_ROOT/$artifact_sha"
+  install_payload_release "$artifact" "$artifact_sha" "$artifact_uri" "$source" \
+    "$bundle_sha" "$bundle_uri" "$runtime" "$extracted"
+  if [[ -e $release || -L $release ]]; then
+    monday_verify_controller_release "$ROOT" "$manifest_sha" \
+      || die 'existing controller release does not match the immutable manifest'
     printf 'controller release already published: %s\n' "$manifest_sha"
     return 0
   fi
-
-  staging=$(mktemp -d "$CONTROLLER_RELEASE_ROOT/.${manifest_sha}.new.XXXXXX")
+  local staging
+  staging=$(mktemp -d "$CONTROLLER_ROOT/.${manifest_sha}.new.XXXXXX")
+  trap 'rm -rf "${staging:-}" "${work:-}"' EXIT
   mkdir -m 0755 "$staging/deployment"
   while IFS= read -r asset; do
+    [[ -n $asset ]] || continue
     mode=0444
     [[ $asset == *.sh ]] && mode=0555
     install -m "$mode" "$extracted/$asset" "$staging/deployment/$asset"
-  done <"$listing"
-  ln -s "$ARTIFACT_RELEASE_ROOT/$artifact_sha/binance-lob-archiver" \
-    "$staging/binance-lob-archiver"
-  verify_payload_projection "$staging" "$artifact_sha"
+  done < <(printf '%s\n' "$(monday_runtime_assets)" "$(monday_controller_assets)" | sort -u)
+  ln -s "$ARTIFACT_ROOT/$artifact_sha/binance-lob-archiver" "$staging/binance-lob-archiver"
   install -m 0444 "$manifest" "$staging/release.json"
-  (
-    cd "$staging"
-    sha256sum release.json >release.json.sha256
-    for asset in deployment/*; do sha256sum "$asset"; done \
-      | sort -k2 >deployment.sha256
-    chmod 0444 release.json.sha256 deployment.sha256
-  )
-  chmod 0555 "$staging/deployment" "$staging"
-  mv "$staging" "$release_dir"
+  (cd "$staging" && sha256sum release.json >release.json.sha256 \
+    && sha256sum deployment/* | sort -k2 >deployment.sha256)
+  chmod 0444 "$staging/release.json.sha256" "$staging/deployment.sha256"
+  chmod 0555 "$staging" "$staging/deployment"
+  mv -f "$staging" "$release"
   staging=
-  verify_published_release "$release_dir" "$extracted" "$manifest" "$listing"
-  printf 'published controller release %s (bundle %s) from %s; production unchanged\n' \
-    "$manifest_sha" "$bundle_sha" "$source_revision"
+  monday_verify_controller_release "$ROOT" "$manifest_sha" \
+    || die 'published controller release failed verification'
+  printf 'published controller V2 %s (payload %s); production unchanged\n' \
+    "$manifest_sha" "$artifact_sha"
 )
 
 main() {
-  [[ $# -eq 3 ]] || { usage; exit 2; }
-  (( EUID == 0 )) || die 'controller release publication must run as root'
-  configure_paths ''
-  install -d -m 0755 "$LOCK_ROOT"
-  exec 9>"$LOCK_ROOT/monday-rust-lob-release.lock"
-  flock -w 30 9 || die 'another Rust collector release operation holds the host lock'
-  publish_controller_release '' "$1" "$2" "$3"
+  [[ ${EUID:-$(id -u)} -eq 0 || ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 ]] \
+    || die 'controller publication must run as root'
+  publish_controller_release "$@"
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
