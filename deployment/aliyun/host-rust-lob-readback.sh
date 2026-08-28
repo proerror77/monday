@@ -44,6 +44,42 @@ if [[ $TEST_ONLY == false ]]; then
   flock -n 6 || die 'USD-M operation is active'
 fi
 
+FIXTURE_SYSTEMD=false
+if [[ $TEST_ONLY == true && ${MONDAY_READBACK_FIXTURE_SYSTEMD:-0} == 1 ]]; then
+  FIXTURE_SYSTEMD=true
+  declare -A fixture_unit_state=() fixture_unit_file_state=() fixture_unit_load_state=()
+  fixture_pid=${MONDAY_READBACK_FIXTURE_PID:-$$}
+  fixture_enabled=${MONDAY_READBACK_FIXTURE_UNIT_FILE_STATE:-enabled}
+  for fixture_market in spot usdm; do
+    fixture_unit="binance-lob-archiver-production@${fixture_market}.service"
+    fixture_unit_state[$fixture_unit]=active
+    fixture_unit_file_state[$fixture_unit]=$fixture_enabled
+    fixture_unit_load_state[$fixture_unit]=loaded
+  done
+  systemctl() {
+    local action=${1:-} unit=${2:-}
+    case "$action" in
+      is-active)
+        [[ $2 == --quiet ]] && unit=$3
+        [[ ${fixture_unit_state[$unit]:-inactive} == active ]] && return 0
+        return 3 ;;
+      show)
+        unit=$2
+        case "${3#--property=}" in
+          LoadState) printf '%s\n' "${fixture_unit_load_state[$unit]:-loaded}" ;;
+          ActiveState) [[ ${fixture_unit_state[$unit]:-inactive} == active ]] && printf 'active\n' || printf 'inactive\n' ;;
+          SubState) [[ ${fixture_unit_state[$unit]:-inactive} == active ]] && printf 'running\n' || printf 'dead\n' ;;
+          UnitFileState) printf '%s\n' "${fixture_unit_file_state[$unit]:-disabled}" ;;
+          MainPID) printf '%s\n' "$fixture_pid" ;;
+          NRestarts) printf '%s\n' "${MONDAY_READBACK_FIXTURE_RESTARTS:-0}" ;;
+          *) printf '\n' ;;
+        esac
+        return 0 ;;
+      *) return 0 ;;
+    esac
+  }
+fi
+
 monday_file_direct "$TRANSITION_RECEIPT" || die 'transition receipt is missing'
 [[ $(monday_sha256_file "$TRANSITION_RECEIPT") == "$RECEIPT_SHA" ]] \
   || die 'transition receipt digest mismatch'
@@ -148,14 +184,16 @@ done
 
 runtime_identity='{}'; health_identity='{}'
 capture_runtime_identity() {
-  local market unit pid restarts exe env_file spool health session updated minimum_ns expected_observed
+  local market unit pid restarts enabled exe env_file spool health session updated minimum_ns expected_observed dataset minimum_symbols policy
   runtime_identity='{}'; health_identity='{}'
-  [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 ]] && return 0
+  [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 && $FIXTURE_SYSTEMD == false ]] && return 0
   for market in spot usdm; do
     unit="binance-lob-archiver-production@${market}.service"
     systemctl is-active --quiet "$unit" || die "production unit is inactive: $unit"
     [[ $(systemctl show "$unit" --property=SubState --value) == running ]] \
       || die "production unit is not running: $unit"
+    enabled=$(systemctl show "$unit" --property=UnitFileState --value)
+    [[ $enabled == enabled ]] || die "production unit is not enabled: $unit"
     restarts=$(systemctl show "$unit" --property=NRestarts --value)
     [[ $restarts == 0 ]] || die "production unit restarted during readback: $unit"
     pid=$(systemctl show "$unit" --property=MainPID --value)
@@ -165,7 +203,8 @@ capture_runtime_identity() {
       || die "production process identity differs: $unit"
     runtime_identity=$(jq -cn --argjson values "$runtime_identity" --arg market "$market" \
       --argjson pid "$pid" --arg sha "$(monday_sha256_file "$exe")" --argjson restarts "$restarts" \
-      '$values + {($market):{main_pid:$pid,exe:$sha,n_restarts:$restarts}}')
+      --arg unit_file_state "$enabled" \
+      '$values + {($market):{main_pid:$pid,exe:$sha,n_restarts:$restarts,unit_file_state:$unit_file_state}}')
     env_file=$(monday_runtime_asset_target "$ROOT" "binance-lob-archiver-production-$market.env") || die "production env is invalid: $market"
     spool=$(sed -n 's/^SPOOL_DIR=//p' "$env_file" | head -n1)
     [[ -n $spool && $spool == /* ]] || die "production spool is invalid: $market"
@@ -173,31 +212,49 @@ capture_runtime_identity() {
     health="$spool/health.json"
     [[ -f $health && ! -L $health ]] || die "production health is missing: $market"
     session=$(jq -er '.session_id // empty' "$health") || die "production health session is missing: $market"
+    dataset=$(sed -n 's/^DATASET=//p' "$env_file" | head -n1)
+    minimum_symbols=1000; [[ $market == usdm ]] && minimum_symbols=100
+    policy="$deployment/rust-lob-runtime-health-policy.jq"
     updated=$(jq -er '.updated_at_ns // 0' "$health")
-    expected_observed=$(jq -er --arg market "$market" '.[$market].observed_at_ns' <<<"$transition_process") \
-      || die "transition health observation is missing: $market"
+    if ! expected_observed=$(jq -er --arg market "$market" '.[$market].observed_at_ns' <<<"$transition_process"); then
+      [[ $FIXTURE_SYSTEMD == true ]] || die "transition health observation is missing: $market"
+      expected_observed=0
+    fi
     [[ $expected_observed =~ ^[0-9]+$ ]] || die "transition health observation is invalid: $market"
     minimum_ns=$expected_observed
     now_ns=$(date +%s%N)
     [[ $updated =~ ^[0-9]+$ && $updated -ge $minimum_ns && $updated -le $now_ns ]] \
       || die "production health is stale or in the future: $market"
+    monday_verify_rust_lob_runtime_health "$policy" "$health" "$market" "$dataset" \
+      "$minimum_symbols" "$minimum_ns" \
+      || die "production health policy failed during readback: $market"
     health_identity=$(jq -cn --argjson values "$health_identity" --arg market "$market" --arg session "$session" \
-      --argjson observed "$updated" '$values + {($market):{session_id:$session,observed_at_ns:$observed}}')
+      --arg status "$(jq -er '.status' "$health")" --argjson observed "$updated" \
+      --argjson gaps "$(jq -er '.sequence_gaps' "$health")" \
+      --argjson symbols "$(jq -er '.symbol_count' "$health")" \
+      --argjson ready "$(jq -er '.snapshot_ready_count' "$health")" \
+      '$values + {($market):{session_id:$session,observed_at_ns:$observed,status:$status,sequence_gaps:$gaps,symbol_count:$symbols,snapshot_ready_count:$ready}}')
   done
 }
 capture_runtime_identity
 runtime_before=$runtime_identity; health_before=$health_identity
 assert_transition_process_identity() {
-  local market expected_pid expected_exe expected_restarts expected_session expected_observed
-  local current_pid current_exe current_restarts current_session current_observed now_ns
-  [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 ]] && return 0
+  local market expected_pid expected_exe expected_restarts expected_enabled expected_session expected_observed
+  local current_pid current_exe current_restarts current_enabled current_session current_observed now_ns
+  [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 && $FIXTURE_SYSTEMD == false ]] && return 0
   for market in spot usdm; do
+    if ! jq -e --arg market "$market" '.[$market] | type == "object"' <<<"$transition_process" >/dev/null 2>&1; then
+      [[ $FIXTURE_SYSTEMD == true ]] && continue
+      die "transition process identity is missing: $market"
+    fi
     expected_pid=$(jq -er --arg market "$market" '.[$market].main_pid' <<<"$transition_process") \
       || die "transition process PID is missing: $market"
     expected_exe=$(jq -er --arg market "$market" '.[$market].process_exe_sha256' <<<"$transition_process") \
       || die "transition process executable identity is missing: $market"
     expected_restarts=$(jq -er --arg market "$market" '.[$market].n_restarts' <<<"$transition_process") \
       || die "transition process restart count is missing: $market"
+    expected_enabled=$(jq -er --arg market "$market" '.[$market].unit_file_state // "enabled"' <<<"$transition_process") \
+      || die "transition process unit-file state is missing: $market"
     expected_session=$(jq -er --arg market "$market" '.[$market].session_id' <<<"$transition_process") \
       || die "transition process session is missing: $market"
     expected_observed=$(jq -er --arg market "$market" '.[$market].observed_at_ns' <<<"$transition_process") \
@@ -205,10 +262,12 @@ assert_transition_process_identity() {
     current_pid=$(jq -er --arg market "$market" '.[$market].main_pid' <<<"$runtime_identity")
     current_exe=$(jq -er --arg market "$market" '.[$market].exe' <<<"$runtime_identity")
     current_restarts=$(jq -er --arg market "$market" '.[$market].n_restarts' <<<"$runtime_identity")
+    current_enabled=$(jq -er --arg market "$market" '.[$market].unit_file_state' <<<"$runtime_identity")
     current_session=$(jq -er --arg market "$market" '.[$market].session_id' <<<"$health_identity")
     current_observed=$(jq -er --arg market "$market" '.[$market].observed_at_ns' <<<"$health_identity")
     [[ $current_pid == "$expected_pid" && $current_exe == "$expected_exe" \
-      && $current_restarts == "$expected_restarts" && $current_session == "$expected_session" ]] \
+      && $current_restarts == "$expected_restarts" && $current_enabled == "$expected_enabled" \
+      && $current_session == "$expected_session" ]] \
       || die "production process identity differs from the cutover receipt: $market"
     now_ns=$(date +%s%N)
     [[ $current_observed =~ ^[0-9]+$ && $expected_observed =~ ^[0-9]+$ \
@@ -235,7 +294,7 @@ assert_runtime_stable() {
       || die "controller projection differs during OSS readback: $asset"
   done
   capture_runtime_identity
-  [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 ]] && return 0
+  [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 && $FIXTURE_SYSTEMD == false ]] && return 0
   assert_transition_process_identity
   [[ $runtime_identity == "$runtime_before" ]] \
     || die 'process identity changed during OSS readback'
@@ -339,7 +398,8 @@ jq -cn --arg schema monday.rust_lob_operation_readback.v2 \
     payload_sha256:$payload,transition_receipt:$transition,
     transition_receipt_sha256:$receipt,gate_receipt:$gate,gate_sha256:$gate_sha,
     production_link_verified:true,process_identity_verified:true,
-    process_restarts_verified:true,installed_assets_verified:true,
+    process_restarts_verified:true,unit_file_state_verified:true,
+    health_policy_verified:true,installed_assets_verified:true,
     cutover_process_identity:$transition_process,
     process_identity:$processes,health:$health,controller_projections:$controller_projections,
     upload_status:$statuses,

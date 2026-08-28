@@ -852,6 +852,84 @@ run_restore_health_fixture success
 grep -Fq 'enable binance-lob-archiver-production@spot.service' "$restore_calls"
 grep -Fq 'enable binance-lob-archiver-production@usdm.service' "$restore_calls"
 
+# Readback reuses the active-C health policy before and after the independent
+# OSS phase.  A fixture systemd view supplies process/unit identity while the
+# restored health files exercise the positive path and three fail-closed
+# policy negatives, including a disabled production unit.
+readback_fixture_pid=5353
+mkdir -p "$ROOT/proc/$readback_fixture_pid"
+rm -f -- "$ROOT/proc/$readback_fixture_pid/exe"
+ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p2_sha/binance-lob-archiver" \
+  "$ROOT/proc/$readback_fixture_pid/exe"
+readback_out="$ROOT/data/monday/evidence/readbacks/$c2"
+run_readback_fixture() {
+  local mode=$1
+  rm -rf -- "$readback_out" "$readback_out.sha256"
+  case $mode in
+    success) : ;;
+    unsynced)
+      jq '.status = "starting"' "$production_spool_root/spot/health.json" \
+        >"$production_spool_root/spot/health.json.tmp"
+      mv -f -- "$production_spool_root/spot/health.json.tmp" "$production_spool_root/spot/health.json"
+      jq '.status = "starting"' "$production_spool_root/usdm/health.json" \
+        >"$production_spool_root/usdm/health.json.tmp"
+      mv -f -- "$production_spool_root/usdm/health.json.tmp" "$production_spool_root/usdm/health.json" ;;
+    gaps)
+      jq '.sequence_gaps = 1' "$production_spool_root/spot/health.json" \
+        >"$production_spool_root/spot/health.json.tmp"
+      mv -f -- "$production_spool_root/spot/health.json.tmp" "$production_spool_root/spot/health.json"
+      jq '.sequence_gaps = 1' "$production_spool_root/usdm/health.json" \
+        >"$production_spool_root/usdm/health.json.tmp"
+      mv -f -- "$production_spool_root/usdm/health.json.tmp" "$production_spool_root/usdm/health.json" ;;
+    nonready)
+      jq '.snapshot_ready_count = 0' "$production_spool_root/spot/health.json" \
+        >"$production_spool_root/spot/health.json.tmp"
+      mv -f -- "$production_spool_root/spot/health.json.tmp" "$production_spool_root/spot/health.json"
+      jq '.snapshot_ready_count = 0' "$production_spool_root/usdm/health.json" \
+        >"$production_spool_root/usdm/health.json.tmp"
+      mv -f -- "$production_spool_root/usdm/health.json.tmp" "$production_spool_root/usdm/health.json" ;;
+    disabled) : ;;
+    *) return 2 ;;
+  esac
+  if [[ $mode == disabled ]]; then
+    if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_READBACK_FIXTURE_SYSTEMD=1 \
+      MONDAY_READBACK_FIXTURE_UNIT_FILE_STATE=disabled MONDAY_READBACK_FIXTURE_PID="$readback_fixture_pid" \
+      MONDAY_UPLOAD_STATUS_ROOT="$ROOT/fixture-upload-status-empty" MONDAY_ROOT="$ROOT" \
+      "$SCRIPT_DIR/host-rust-lob-readback.sh" --controller "$c2" \
+      --transition-receipt "$transition2" --receipt-sha256 "$transition2_sha" --root "$ROOT" \
+      >/dev/null 2>&1; then
+      printf 'readback accepted a disabled production unit\n' >&2
+      exit 1
+    fi
+  elif [[ $mode == success ]]; then
+    MONDAY_CONTROL_PLANE_TEST=1 MONDAY_READBACK_FIXTURE_SYSTEMD=1 \
+      MONDAY_READBACK_FIXTURE_PID="$readback_fixture_pid" \
+      MONDAY_UPLOAD_STATUS_ROOT="$ROOT/fixture-upload-status-empty" MONDAY_ROOT="$ROOT" \
+      "$SCRIPT_DIR/host-rust-lob-readback.sh" --controller "$c2" \
+      --transition-receipt "$transition2" --receipt-sha256 "$transition2_sha" --root "$ROOT" \
+      >/dev/null
+    jq -e '.result == "success" and .unit_file_state_verified == true
+      and .health_policy_verified == true
+      and .process_identity.spot.unit_file_state == "enabled"
+      and .process_identity.usdm.unit_file_state == "enabled"' "$readback_out" >/dev/null
+  else
+    if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_READBACK_FIXTURE_SYSTEMD=1 \
+      MONDAY_READBACK_FIXTURE_PID="$readback_fixture_pid" \
+      MONDAY_UPLOAD_STATUS_ROOT="$ROOT/fixture-upload-status-empty" MONDAY_ROOT="$ROOT" \
+      "$SCRIPT_DIR/host-rust-lob-readback.sh" --controller "$c2" \
+      --transition-receipt "$transition2" --receipt-sha256 "$transition2_sha" --root "$ROOT" \
+      >/dev/null 2>&1; then
+      printf 'readback accepted invalid health state: %s\n' "$mode" >&2
+      exit 1
+    fi
+  fi
+}
+run_readback_fixture success
+run_readback_fixture unsynced
+run_readback_fixture gaps
+run_readback_fixture nonready
+run_readback_fixture disabled
+
 # Health liveness is independent from stable process identity: a newer
 # observed_at is accepted while a backwards/stalled sample is rejected.
 health_freshness=$(monday_observe_health_freshness 100 10 0 200 11 120)

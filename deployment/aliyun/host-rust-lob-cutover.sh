@@ -571,6 +571,8 @@ if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
   cutover_started_ns=$(date +%s%N)
   systemctl unmask binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service \
     || die 'could not unmask V2 production lanes'
+  systemctl enable binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service \
+    || die 'could not enable V2 production lanes before start'
   systemctl start binance-lob-archiver-production@spot.service \
     || die 'Spot did not start after pair commit'
   systemctl start binance-lob-archiver-production@usdm.service \
@@ -583,7 +585,7 @@ fi
 production_process='{}'
 declare -A expected_pid expected_restarts expected_exe_sha
 verify_production_process() {
-  local market unit active sub pid restarts exe exe_sha env_file env_file_resolved spool health session updated now_ns minimum_symbols
+  local market unit active sub pid restarts enabled exe exe_sha env_file env_file_resolved spool health session updated now_ns minimum_symbols
   local deadline health_session ready recorded_pid recorded_restarts recorded_exe recorded_session recorded_observed
   # Ordinary fixture cutovers never start a process.  The opt-in fixture
   # systemd path below exercises the same identity/freshness loop without
@@ -611,6 +613,8 @@ verify_production_process() {
       active=$(systemctl show "$unit" --property=ActiveState --value)
       sub=$(systemctl show "$unit" --property=SubState --value)
       [[ $active == active && $sub == running ]] || die "$market production unit is not running after cutover"
+      enabled=$(systemctl show "$unit" --property=UnitFileState --value)
+      [[ $enabled == enabled ]] || die "$market production unit is not enabled after cutover"
       pid=$(systemctl show "$unit" --property=MainPID --value)
       [[ $pid =~ ^[1-9][0-9]*$ ]] || die "$market production unit has no MainPID after cutover"
       restarts=$(systemctl show "$unit" --property=NRestarts --value)
@@ -656,8 +660,8 @@ verify_production_process() {
     done
     production_process=$(jq -cn --argjson values "$production_process" --arg market "$market" \
       --argjson pid "$pid" --arg exe "$exe_sha" --argjson restarts "$restarts" \
-      --arg session "$health_session" --argjson observed "$updated" \
-      '$values + {($market):{active:true,main_pid:$pid,process_exe_sha256:$exe,n_restarts:$restarts,session_id:$session,observed_at_ns:$observed}}')
+      --arg session "$health_session" --arg unit_file_state "$enabled" --argjson observed "$updated" \
+      '$values + {($market):{active:true,unit_file_state:$unit_file_state,main_pid:$pid,process_exe_sha256:$exe,n_restarts:$restarts,session_id:$session,observed_at_ns:$observed}}')
   done
   # Both lanes are ready now; take one final paired sample before emitting the
   # transition receipt.  Spot may change while USD-M is catching up, so a
@@ -667,6 +671,8 @@ verify_production_process() {
     active=$(systemctl show "$unit" --property=ActiveState --value)
     sub=$(systemctl show "$unit" --property=SubState --value)
     [[ $active == active && $sub == running ]] || die "$market production unit changed after both lanes became ready"
+    enabled=$(systemctl show "$unit" --property=UnitFileState --value)
+    [[ $enabled == enabled ]] || die "$market production unit was disabled after both lanes became ready"
     pid=$(systemctl show "$unit" --property=MainPID --value)
     restarts=$(systemctl show "$unit" --property=NRestarts --value)
     [[ $pid =~ ^[1-9][0-9]*$ && $restarts == 0 ]] || die "$market production process identity changed after readiness"
