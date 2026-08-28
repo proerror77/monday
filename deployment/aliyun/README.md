@@ -1049,26 +1049,42 @@ cleaned retain their OSS triplet evidence instead of a duplicate local copy.
 The Shadow unit uses a 1792MiB high watermark and 2048MiB hard limit per market.
 Five immutable passed Tokyo gates measured Spot at no more than 664,735,744 bytes
 and the former 570-symbol USD-M scope at no more than 1,789,218,816 bytes; the
-current USD-M Gate covers only the frozen Top 100. Strict readback is separately
-capped at 1280MiB/1536MiB and carries the same non-production OOM preference as
-the Shadow collectors. Candidate upload drain is capped at 384MiB/512MiB, so
-the largest sequential Gate phase remains the 2048MiB Shadow collector. The
-controller rereads `MemAvailable` immediately before each Shadow start, upload
-drain, and strict verifier, and requires that phase's hard limit plus a fixed
-1GiB host reserve. Active production usage is already reflected in that fresh
-kernel value; growth from the sampled usage to each active unit's `MemoryHigh`
-is not treated as a static reservation. Instead, each active production unit
-reserves its observed `MemoryPeak` plus a 256MiB growth margin, capped by its
-hard limit, and the active Shadow phase stops if the live host reserve is
-consumed. The Gate records production current, peak, hard limit, growth target,
-the initial preflight, and every successful phase-admission sample. An over-limit
-phase fails closed instead of increasing the host size or weakening the reserve.
+current USD-M Gate covers only the frozen Top 100. Strict readback uses a separate
+1280MiB/1536MiB reservation and carries the same non-production OOM preference as
+the Shadow collectors. Candidate upload drain uses a 384MiB/512MiB reservation, so
+the largest sequential Gate phase remains the 2048MiB Shadow collector. Before
+the Gate and before every actual phase, it reads `MemAvailable` together with
+the production template's automatically assigned `Slice` and cgroup. Spot and
+USD-M must share one slice; the parent control group is `/system.slice/<Slice>`
+and their two cgroups must be direct children of it. The parent `cgroup.procs`
+must be empty, the active child set must be exactly those two services, and both
+systemd `MemoryMax` and child `memory.max` must be exactly 2,560MiB. The snapshot records parent
+`memory.current`, `memory.peak`, and `memory.events`, plus PID/executable hash
+and `NRestarts`; a five-second monitor fails closed on any membership, limit, or
+identity drift. Paired reads use the lower parent current and higher child-limit
+sum for admission. The required bytes are exactly:
+
+```text
+host reserve (1GiB) + phase memory budget + (child memory.max sum - parent memory.current)
+```
+
+Active production usage is already reflected in `MemAvailable`; no static
+two-lane growth reservation is added a second time. Where a PSI calibration is
+required (preflight and the Shadow/tail transitions), it completes before the
+fresh admission; upload-drain and OSS readback use their resource monitor's
+admission immediately before their first start/external call. The active phase
+still stops if the live reserve or PSI stop rule is breached. The Gate receipt
+stores the exact per-phase current/sum/growth/reserve/limit/required values and
+the production cgroup snapshot; `MemoryPeak` and `memory.events` are audit-only,
+never inputs to the formula. An over-limit or malformed phase fails closed
+instead of increasing the host size or weakening the reserve.
 The Gate also samples Linux I/O `full` PSI from `/proc/pressure/io` on a
 15-second cadence.
-Preflight records four cumulative samples as three windows; every Shadow,
-upload-drain, strict-verifier, and OSS round-trip/readback phase recalibrates
-the same way and continues sampling for the complete phase, including
-compression, validation, and OSS readback. Evidence records the actual
+Preflight records four cumulative samples as three windows; every resource phase
+continues sampling for its complete phase, including compression, validation,
+and OSS readback. Shadow/tail transitions perform the same PSI calibration
+before admission; upload-drain and OSS phases do not add a second calibration
+wait. Evidence records the actual
 monotonic elapsed time for each window. A window is a hit when its `full` stall
 ratio is at least 1%, equivalent to 150,000 microseconds over 15 seconds. Three consecutive
 hits terminate the current candidate or transient process, run normal cleanup,

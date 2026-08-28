@@ -14,6 +14,35 @@ def valid_lob_partition:
     false
   end;
 
+def expected_phase_memory_max:
+  if . == "preflight"
+    or . == "strict-verifier-spot"
+    or . == "strict-verifier-usdm"
+    or . == "oss-readback-spot"
+    or . == "oss-readback-usdm" then
+    1610612736
+  elif . == "shadow-spot" or . == "shadow-usdm" then
+    2147483648
+  elif . == "upload-drain-spot" or . == "upload-drain-usdm" then
+    536870912
+  else
+    null
+  end;
+
+def expected_lob_slice:
+  "system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice";
+
+def valid_lob_slice:
+  type == "string"
+  and . == expected_lob_slice;
+
+def valid_lob_cgroup_path:
+  type == "string"
+  and (contains("..") | not)
+  and (split("/") as $parts
+    | ($parts[0] == "" and ($parts[1:] | length) >= 1
+      and all($parts[1:][]; test("^[A-Za-z0-9_.@-]+(?:\\\\x2d[A-Za-z0-9_.@-]+)*$"))));
+
 . as $root
 | ([
     "binance-lob-archiver-recovery@.service",
@@ -140,26 +169,76 @@ and (.production_runtime | type == "object"
     and (.usdm.symbols | type == "string")
     and ((.usdm.symbols | split(",")) | length == 100)
     and ((.usdm.symbols | split(",") | unique) | length == 100)))
-and (.production_process | type == "object")
-and (if .test_only then true else
-  (.production_process | ((keys | sort) == ["spot", "usdm"]
-    and all(.[]; .active == true
-      and (.main_pid | type == "number" and . >= 1)
-      and (.process_exe_sha256 | type == "string" and test("^[a-f0-9]{64}$"))))) end)
-and (.resource_admission | type == "array" and length >= 3
-  and ((["preflight","shadow-spot","strict-verifier-spot","upload-drain-spot","shadow-usdm","strict-verifier-usdm","upload-drain-usdm","oss-readback-spot","oss-readback-usdm"]
-    - (map(.phase) | unique)) | length == 0)
+and (.production_process | type == "object"
+  and (keys | sort) == ["spot", "usdm"]
+  and all(.[]; .active == true
+    and (.main_pid | type == "number" and floor == . and . >= 1)
+    and (.process_exe_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+    and (.n_restarts | type == "number" and floor == . and . >= 0)))
+and (.production_memory | . as $pm
+  | (type == "object"
+  and (.slice | valid_lob_slice)
+  and (.parent_control_group | valid_lob_cgroup_path
+    and test("^/system[.]slice/system-binance\\\\x2dlob\\\\x2darchiver\\\\x2dproduction[.]slice$")
+    and . == ("/system.slice/" + $pm.slice)
+    and (split("/") | .[-1] == $pm.slice))
+  and (.parent_cgroup_procs | type == "array" and length == 0)
+  and (.children | type == "object" and (keys | sort) == ["spot", "usdm"])
+  and (.children.spot.market == "spot" and .children.usdm.market == "usdm")
+  and all(.children[]; . as $child
+    | (.market | type == "string" and (. == "spot" or . == "usdm"))
+    and (.slice | type == "string" and . == $pm.slice)
+    and (.control_group | valid_lob_cgroup_path
+      and test("^/system[.]slice/system-binance\\\\x2dlob\\\\x2darchiver\\\\x2dproduction[.]slice/binance-lob-archiver-production@(spot|usdm)[.]service$"))
+    and ((.control_group | split("/")[:-1] | join("/")) == $pm.parent_control_group)
+    and ((.control_group | split("/")[-1]) == ("binance-lob-archiver-production@" + .market + ".service"))
+    and (.main_pid | type == "number" and floor == . and . >= 1)
+    and (.process_exe_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+    and (.n_restarts | type == "number" and floor == . and . >= 0)
+    and (.active == true)
+    and (.systemd_memory_max_bytes | type == "number" and floor == . and . == 2684354560)
+    and (.memory_max_bytes | type == "number" and floor == . and . == 2684354560)
+    and (.systemd_memory_max_bytes == .memory_max_bytes))
+  and (.active_child_control_groups | type == "array" and length == 2
+    and (unique | length == 2))
+  and (([$pm.children.spot.control_group, $pm.children.usdm.control_group] | sort)
+    == ($pm.active_child_control_groups | sort))
+  and (.parent_memory_current_bytes | type == "number" and floor == . and . >= 0)
+  and (.parent_memory_peak_bytes | type == "number" and floor == . and . >= 0)
+  and (.child_memory_max_sum_bytes | type == "number" and floor == . and . == 5368709120)
+  and (.parent_memory_current_bytes <= .child_memory_max_sum_bytes)
+  and (.parent_memory_events | type == "object"
+    and all(.[]; type == "number" and floor == . and . >= 0))))
+and (.production_process.spot.main_pid == .production_memory.children.spot.main_pid
+  and .production_process.usdm.main_pid == .production_memory.children.usdm.main_pid
+  and .production_process.spot.process_exe_sha256 == .production_memory.children.spot.process_exe_sha256
+  and .production_process.usdm.process_exe_sha256 == .production_memory.children.usdm.process_exe_sha256
+  and .production_process.spot.n_restarts == .production_memory.children.spot.n_restarts
+  and .production_process.usdm.n_restarts == .production_memory.children.usdm.n_restarts)
+and (.resource_admission | type == "array" and length == 9
+  and ((map(.phase) | sort)
+    == ["oss-readback-spot","oss-readback-usdm","preflight","shadow-spot","shadow-usdm","strict-verifier-spot","strict-verifier-usdm","upload-drain-spot","upload-drain-usdm"])
   and all(.[]; . as $r
-    | (.phase | type == "string" and length > 0)
-    and (.started_at | type == "string" and length > 0)
-    and (.ended_at | type == "string" and length > 0)
-    and (.samples | type == "number" and . >= 1)
-    and (.host_memory_available_bytes | type == "number" and . >= 0)
-    and (.max_memory_available_bytes | type == "number" and . >= 0)
-    and (.current_memory_available_bytes | type == "number" and . >= 0)
-    and (.breach | type == "boolean" and . == false)
-    and ($r.required_bytes | type == "number" and . > 0 and . <= $r.host_memory_available_bytes)
-    and (.phase_memory_max_bytes | type == "number" and . > 0)))
+    | ($r.phase | expected_phase_memory_max) as $expected_phase_max
+    | ($expected_phase_max != null
+      and ($r.phase | type == "string" and length > 0)
+      and (.started_at | type == "string" and length > 0)
+      and (.ended_at | type == "string" and length > 0)
+      and (.samples | type == "number" and . >= 1)
+      and (.host_memory_available_bytes | type == "number" and . >= 0)
+      and (.max_memory_available_bytes | type == "number" and . >= 0)
+      and (.current_memory_available_bytes | type == "number" and . >= 0)
+      and (.breach | type == "boolean" and . == false)
+      and (.host_memory_reserve_bytes | type == "number" and . == 1073741824)
+      and (.production_parent_memory_current_bytes | type == "number" and floor == . and . >= 0)
+      and (.production_child_memory_max_sum_bytes | type == "number" and floor == . and . == 5368709120)
+      and (.production_parent_memory_current_bytes <= .production_child_memory_max_sum_bytes)
+      and (.production_memory_growth_bytes | type == "number" and floor == .
+        and . == ($r.production_child_memory_max_sum_bytes - $r.production_parent_memory_current_bytes))
+      and ($r.required_bytes | type == "number"
+        and . == ($expected_phase_max + $r.host_memory_reserve_bytes + $r.production_memory_growth_bytes)
+        and . <= $r.host_memory_available_bytes)
+      and (.phase_memory_max_bytes | type == "number" and . == $expected_phase_max))))
 and (.io_full_psi_windows | type == "array" and length >= 3
   and all(.[]; . as $p
     | (.phase | type == "string" and length > 0)

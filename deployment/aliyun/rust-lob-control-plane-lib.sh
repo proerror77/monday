@@ -1083,36 +1083,104 @@ monday_observe_health_freshness() {
     "$max_gap_seconds" "$sample_increment"
 }
 
-# Return the required bytes and accept only when the host has that headroom.
+# Return the required bytes for one sequential phase and accept only when the
+# host has that headroom.  MemAvailable already includes active production
+# usage; only the measured cgroup growth (child limit sum minus parent current)
+# is added to the phase and host reserve.  The five arguments are deliberately
+# exact so callers cannot silently fall back to the old static two-lane model.
 monday_shadow_memory_admission() {
-  (($# >= 3)) || return 2
-  local available=$1 total=0 value
-  for value in "$@"; do
+  [[ $# -eq 5 ]] || return 2
+  local available=$1 host_reserve=$2 phase_max=$3 parent_current=$4 child_max_sum=$5
+  local growth required value
+  for value in "$available" "$host_reserve" "$phase_max" "$parent_current" "$child_max_sum"; do
     [[ $value =~ ^(0|[1-9][0-9]{0,18})$ ]] || return 2
-    (( value <= 9223372036854775807 )) || return 2
+    # shellcheck disable=SC2071
+    (( ${#value} < 19 )) || [[ $value < 9223372036854775808 ]] || return 2
   done
-  shift
-  for value in "$@"; do
-    ((value <= 9223372036854775807 - total)) || return 2
-    total=$((total + value))
-  done
-  ((total > 0)) || return 2
-  printf '%s\n' "$total"
-  ((available >= total))
+  ((parent_current <= child_max_sum)) || return 2
+  growth=$((child_max_sum - parent_current))
+  ((host_reserve <= 9223372036854775807 - phase_max)) || return 2
+  required=$((host_reserve + phase_max))
+  ((growth <= 9223372036854775807 - required)) || return 2
+  required=$((required + growth))
+  ((required > 0)) || return 2
+  printf '%s\n' "$required"
+  ((available >= required))
 }
 
-# Reserve measured production peak plus bounded growth, capped by unit limit.
-monday_production_memory_growth_headroom() {
-  [[ $# -eq 4 ]] || return 2
-  local current=$1 peak=$2 maximum=$3 margin=$4 target
-  local value
-  for value in "$current" "$peak" "$maximum" "$margin"; do
-    [[ $value =~ ^(0|[1-9][0-9]{0,18})$ ]] || return 2
-    (( value <= 9223372036854775807 )) || return 2
-  done
-  ((current <= peak && peak <= maximum)) || return 2
-  if ((margin >= maximum - peak)); then target=$maximum; else target=$((peak + margin)); fi
-  printf '%s\n' "$((target - current))"
+# Validate the production cgroup snapshot captured by the Gate.  The caller
+# may pass either a regular JSON file or the JSON document itself.  This is a
+# pure check: it never reads systemd or mutates host state.  The host script
+# supplies the active-child set from the parent cgroup, so an extra direct
+# child, a non-direct child path, or a changed limit/identity is rejected
+# before a phase can start.
+monday_validate_lob_production_snapshot() {
+  [[ $# -eq 1 ]] || return 2
+  local source=$1
+  # shellcheck disable=SC2016 # jq filter is intentionally passed literally.
+  local filter='.
+    as $root
+    | type == "object"
+    and (.slice | type == "string" and . == "system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice")
+    and (.parent_control_group | type == "string"
+      and test("^/system[.]slice/system-binance\\\\x2dlob\\\\x2darchiver\\\\x2dproduction[.]slice$")
+      and . == ("/system.slice/" + $root.slice)
+      and (split("/") | .[-1] == $root.slice))
+    and (.parent_cgroup_procs | type == "array" and length == 0)
+    and (.active_child_control_groups | type == "array" and length == 2
+      and (unique | length == 2))
+    and (.children | type == "object" and (keys | sort) == ["spot", "usdm"])
+    and (all(.children[];
+      type == "object"
+      and (.market | type == "string" and (. == "spot" or . == "usdm"))
+      and (.slice | type == "string" and . == $root.slice)
+      and (.control_group | type == "string"
+      and test("^/system[.]slice/system-binance\\\\x2dlob\\\\x2darchiver\\\\x2dproduction[.]slice/binance-lob-archiver-production@(spot|usdm)[.]service$"))
+      and ((.control_group | split("/")[:-1] | join("/")) == $root.parent_control_group)
+      and ((.control_group | split("/")[-1]) == ("binance-lob-archiver-production@" + .market + ".service"))
+      and (.main_pid | type == "number" and floor == . and . >= 1)
+      and (.process_exe_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+      and (.n_restarts | type == "number" and floor == . and . >= 0)
+      and (.active == true)
+      and (.systemd_memory_max_bytes | type == "number" and floor == . and . == 2684354560)
+      and (.memory_max_bytes | type == "number" and floor == . and . == 2684354560)
+      and (.systemd_memory_max_bytes == .memory_max_bytes)
+    ))
+    and (([.children.spot.control_group, .children.usdm.control_group] | sort)
+      == (.active_child_control_groups | sort))
+    and (.parent_memory_current_bytes | type == "number" and floor == . and . >= 0)
+    and (.parent_memory_peak_bytes | type == "number" and floor == . and . >= 0)
+    and (.child_memory_max_sum_bytes | type == "number" and floor == .
+      and . == 5368709120)
+    and (.parent_memory_current_bytes <= .child_memory_max_sum_bytes)
+    and (.parent_memory_events | type == "object"
+      and all(.[]; type == "number" and floor == . and . >= 0))
+  '
+  if [[ -f $source && ! -L $source ]]; then
+    jq -e "$filter" "$source" >/dev/null
+  else
+    printf '%s\n' "$source" | jq -e "$filter" >/dev/null
+  fi
+}
+
+# Emit only identity-bearing fields for comparison between the Gate start and
+# every later resource-monitor sample.  Memory current/peak/events are audit
+# values and intentionally excluded so normal usage changes do not look like
+# process or cgroup identity drift.
+monday_lob_production_snapshot_identity() {
+  [[ $# -eq 1 ]] || return 2
+  local source=$1
+  local filter='.
+    | {slice,parent_control_group,parent_cgroup_procs,active_child_control_groups,
+      children: (.children | with_entries(.value |= {
+        market,slice,control_group,main_pid,process_exe_sha256,n_restarts,active,
+        systemd_memory_max_bytes,memory_max_bytes
+      }))}'
+  if [[ -f $source && ! -L $source ]]; then
+    jq -ceS "$filter" "$source"
+  else
+    printf '%s\n' "$source" | jq -ceS "$filter"
+  fi
 }
 
 # Read cumulative I/O-full stall time from a Linux PSI source.
@@ -1263,6 +1331,31 @@ monday_validate_v2_gate() {
     --argjson controller_asset_keys "$controller_asset_keys" \
     --argjson production_asset_keys "$production_asset_keys" \
     --argjson shadow_asset_keys "$shadow_asset_keys" '
+      def expected_phase_memory_max:
+        if . == "preflight"
+          or . == "strict-verifier-spot"
+          or . == "strict-verifier-usdm"
+          or . == "oss-readback-spot"
+          or . == "oss-readback-usdm" then
+          1610612736
+        elif . == "shadow-spot" or . == "shadow-usdm" then
+          2147483648
+        elif . == "upload-drain-spot" or . == "upload-drain-usdm" then
+          536870912
+        else
+          null
+        end;
+      def expected_lob_slice:
+        "system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice";
+      def valid_lob_slice:
+        type == "string"
+        and . == expected_lob_slice;
+      def valid_lob_cgroup_path:
+        type == "string"
+        and (contains("..") | not)
+        and (split("/") as $parts
+          | ($parts[0] == "" and ($parts[1:] | length) >= 1
+            and all($parts[1:][]; test("^[A-Za-z0-9_.@-]+(?:\\\\x2d[A-Za-z0-9_.@-]+)*$"))));
       .schema == "monday.rust_lob_shadow_gate.v5"
       and .control_plane_version == 2
       and .passed == true
@@ -1361,26 +1454,75 @@ monday_validate_v2_gate() {
           and (.usdm.symbols | type == "string")
           and ((.usdm.symbols | split(",")) | length == 100)
           and ((.usdm.symbols | split(",") | unique) | length == 100)))
-      and (.production_process | type == "object")
-      and (if .test_only then true else
-        (.production_process | ((keys | sort) == ["spot", "usdm"]
-          and all(.[]; .active == true
-            and (.main_pid | type == "number" and . >= 1)
-            and (.process_exe_sha256 | type == "string" and test("^[a-f0-9]{64}$"))))) end)
-      and (.resource_admission | type == "array" and length >= 3
-        and ((["preflight","shadow-spot","strict-verifier-spot","upload-drain-spot","shadow-usdm","strict-verifier-usdm","upload-drain-usdm","oss-readback-spot","oss-readback-usdm"]
-          - (map(.phase) | unique)) | length == 0)
+      and (.production_process | type == "object"
+        and (keys | sort) == ["spot", "usdm"]
+        and all(.[]; .active == true
+          and (.main_pid | type == "number" and floor == . and . >= 1)
+          and (.process_exe_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+          and (.n_restarts | type == "number" and floor == . and . >= 0)))
+      and (.production_memory | . as $pm
+        | (type == "object"
+        and (.slice | valid_lob_slice)
+        and (.parent_control_group | valid_lob_cgroup_path
+          and test("^/system[.]slice/system-binance\\\\x2dlob\\\\x2darchiver\\\\x2dproduction[.]slice$")
+          and . == ("/system.slice/" + $pm.slice)
+          and (split("/") | .[-1] == $pm.slice))
+        and (.parent_cgroup_procs | type == "array" and length == 0)
+        and (.children | type == "object" and (keys | sort) == ["spot", "usdm"])
+        and (.children.spot.market == "spot" and .children.usdm.market == "usdm")
+        and all(.children[]; . as $child
+          | (.market | type == "string" and (. == "spot" or . == "usdm"))
+          and (.slice | type == "string" and . == $pm.slice)
+          and (.control_group | valid_lob_cgroup_path
+            and test("^/system[.]slice/system-binance\\\\x2dlob\\\\x2darchiver\\\\x2dproduction[.]slice/binance-lob-archiver-production@(spot|usdm)[.]service$"))
+          and ((.control_group | split("/")[:-1] | join("/")) == $pm.parent_control_group)
+          and ((.control_group | split("/")[-1]) == ("binance-lob-archiver-production@" + .market + ".service"))
+          and (.main_pid | type == "number" and floor == . and . >= 1)
+          and (.process_exe_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+          and (.n_restarts | type == "number" and floor == . and . >= 0)
+          and (.active == true)
+          and (.systemd_memory_max_bytes | type == "number" and floor == . and . == 2684354560)
+          and (.memory_max_bytes | type == "number" and floor == . and . == 2684354560)
+          and (.systemd_memory_max_bytes == .memory_max_bytes))
+        and (.active_child_control_groups | type == "array" and length == 2 and (unique | length == 2))
+        and (([$pm.children.spot.control_group, $pm.children.usdm.control_group] | sort)
+          == ($pm.active_child_control_groups | sort))
+        and (.parent_memory_current_bytes | type == "number" and floor == . and . >= 0)
+        and (.parent_memory_peak_bytes | type == "number" and floor == . and . >= 0)
+        and (.child_memory_max_sum_bytes | type == "number" and floor == . and . == 5368709120)
+        and (.parent_memory_current_bytes <= .child_memory_max_sum_bytes)
+        and (.parent_memory_events | type == "object"
+          and all(.[]; type == "number" and floor == . and . >= 0))))
+      and (.production_process.spot.main_pid == .production_memory.children.spot.main_pid
+        and .production_process.usdm.main_pid == .production_memory.children.usdm.main_pid
+        and .production_process.spot.process_exe_sha256 == .production_memory.children.spot.process_exe_sha256
+        and .production_process.usdm.process_exe_sha256 == .production_memory.children.usdm.process_exe_sha256
+        and .production_process.spot.n_restarts == .production_memory.children.spot.n_restarts
+        and .production_process.usdm.n_restarts == .production_memory.children.usdm.n_restarts)
+      and (.resource_admission | type == "array" and length == 9
+        and ((map(.phase) | sort)
+          == ["oss-readback-spot","oss-readback-usdm","preflight","shadow-spot","shadow-usdm","strict-verifier-spot","strict-verifier-usdm","upload-drain-spot","upload-drain-usdm"])
         and all(.[]; . as $r
-          | (.phase | type == "string" and length > 0)
-          and (.started_at | type == "string" and length > 0)
-          and (.ended_at | type == "string" and length > 0)
-          and (.samples | type == "number" and . >= 1)
-          and (.host_memory_available_bytes | type == "number" and . >= 0)
-          and (.max_memory_available_bytes | type == "number" and . >= 0)
-          and (.current_memory_available_bytes | type == "number" and . >= 0)
-          and (.breach | type == "boolean" and . == false)
-          and ($r.required_bytes | type == "number" and . > 0 and . <= $r.host_memory_available_bytes)
-          and (.phase_memory_max_bytes | type == "number" and . > 0)))
+          | ($r.phase | expected_phase_memory_max) as $expected_phase_max
+          | ($expected_phase_max != null
+            and ($r.phase | type == "string" and length > 0)
+            and (.started_at | type == "string" and length > 0)
+            and (.ended_at | type == "string" and length > 0)
+            and (.samples | type == "number" and . >= 1)
+            and (.host_memory_available_bytes | type == "number" and . >= 0)
+            and (.max_memory_available_bytes | type == "number" and . >= 0)
+            and (.current_memory_available_bytes | type == "number" and . >= 0)
+            and (.breach | type == "boolean" and . == false)
+            and (.host_memory_reserve_bytes | type == "number" and . == 1073741824)
+            and (.production_parent_memory_current_bytes | type == "number" and floor == . and . >= 0)
+            and (.production_child_memory_max_sum_bytes | type == "number" and floor == . and . == 5368709120)
+            and (.production_parent_memory_current_bytes <= .production_child_memory_max_sum_bytes)
+            and (.production_memory_growth_bytes | type == "number" and floor == .
+              and . == ($r.production_child_memory_max_sum_bytes - $r.production_parent_memory_current_bytes))
+            and ($r.required_bytes | type == "number"
+              and . == ($expected_phase_max + $r.host_memory_reserve_bytes + $r.production_memory_growth_bytes)
+              and . <= $r.host_memory_available_bytes)
+            and (.phase_memory_max_bytes | type == "number" and . == $expected_phase_max))))
       and (.io_full_psi_windows | type == "array" and length >= 3
         and all(.[]; . as $p
           | (.phase | type == "string" and length > 0)
@@ -1640,7 +1782,9 @@ monday_validate_v2_transition() {
     and (.gate_evidence | type == "object"
       and (.markets | type == "object" and ((keys | sort) == ["spot", "usdm"]))
       and (.candidate_control_bytes | type == "object")
-      and (.resource_admission | type == "array" and length >= 3)
+      and (.resource_admission | type == "array" and length == 9
+        and ((map(.phase) | sort)
+          == ["oss-readback-spot","oss-readback-usdm","preflight","shadow-spot","shadow-usdm","strict-verifier-spot","strict-verifier-usdm","upload-drain-spot","upload-drain-usdm"]))
       and (.io_full_psi_windows | type == "array" and length >= 3))
       and (.before | type == "object"
       and (.controller == (if $from == "direct" then $gate_from else $from end))

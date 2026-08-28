@@ -9,7 +9,6 @@ readonly HEALTH_SETTLE_SECONDS=240
 readonly MAX_HEALTH_SILENCE_SECONDS=120
 readonly MAX_SEGMENT_GAP_NS=90000000000
 readonly HOST_MEMORY_RESERVE_BYTES=1073741824
-readonly PRODUCTION_MEMORY_GROWTH_MARGIN_BYTES=268435456
 readonly STRICT_VERIFIER_MEMORY_MAX_BYTES=1610612736
 readonly IO_PSI_WINDOW_SECONDS=15
 readonly IO_PSI_WINDOW_US=15000000
@@ -32,6 +31,11 @@ readonly -a PRODUCTION_ASSETS=(
   binance-lob-archiver-production-spot.env
   binance-lob-archiver-production-usdm.env
 )
+# systemd's escaped unit-template slice is part of the production contract.
+# Keep the literal backslash-x2d spelling returned by systemctl on the live host.
+readonly PRODUCTION_SLICE='system-binance\x2dlob\x2darchiver\x2dproduction.slice'
+readonly FIXTURE_PRODUCTION_SPOT_PID=51001
+readonly FIXTURE_PRODUCTION_USDM_PID=51002
 
 die() { printf 'shadow gate failed: %s\n' "$*"; exit 1; }
 usage() {
@@ -95,6 +99,7 @@ DATA_ROOT=$(monday_root_join "$ROOT" data/monday); EVIDENCE_ROOT="$DATA_ROOT/evi
 # Gate writers are always run-scoped.  Nothing under /etc or the stable
 # /opt/monday/bin projection is mutated by this operation.
 RUN_SPOOL_ROOT="$DATA_ROOT/spool/binance-lob-rust-shadow/gate"; PROC_ROOT=$(monday_root_join "$ROOT" proc)
+CGROUP_ROOT=$(monday_root_join "$ROOT" sys/fs/cgroup)
 GATE_UNIT_ROOT="$OVERRIDE_ROOT/rust-lob-gate"; GATE_SYSTEMD_ROOT=$(monday_root_join "$ROOT" run/systemd/system); SHADOW_BINARY="$BIN_ROOT/binance-lob-archiver-shadow"
 PSI_SOURCE="$PROC_ROOT/pressure/io"
 PRODUCTION_BINARY="$BIN_ROOT/binance-lob-archiver"
@@ -129,10 +134,15 @@ fi
 if [[ $TEST_ONLY == true ]]; then
   declare -A fixture_unit_state=()
   systemctl() {
-    local action=${1:-} unit_name=${2:-} property value
+    local action=${1:-} unit_name=${2:-} property value item output_values=false
+    local -a properties=()
     case "$action" in
-      start) fixture_unit_state[$unit_name]=active; return 0 ;;
-      stop) fixture_unit_state[$unit_name]=inactive; return 0 ;;
+      start)
+        [[ ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] && printf 'start %s\n' "$unit_name" >>"$ROOT/run/gate-fixture.calls"
+        fixture_unit_state[$unit_name]=active; return 0 ;;
+      stop)
+        [[ ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] && printf 'stop %s\n' "$unit_name" >>"$ROOT/run/gate-fixture.calls"
+        fixture_unit_state[$unit_name]=inactive; return 0 ;;
       reset-failed|daemon-reload) return 0 ;;
       is-active)
         if [[ $2 == --quiet ]]; then unit_name=$3; else unit_name=$2; fi
@@ -141,22 +151,56 @@ if [[ $TEST_ONLY == true ]]; then
       show)
         unit_name=$2; property=${3#--property=}; property=${property#--property};
         if [[ $property == *=* ]]; then property=${property#*=}; fi
-        case "$property" in
-          ActiveState) value=${fixture_unit_state[$unit_name]:-inactive} ;;
-          SubState) [[ ${fixture_unit_state[$unit_name]:-inactive} == active ]] && value=running || value=dead ;;
-          NRestarts) [[ ${MONDAY_GATE_FIXTURE_FAIL_RESTART:-0} == 1 ]] && value=1 || value=0 ;;
-          MainPID) value=$$ ;;
-          MemoryCurrent) value=1048576 ;;
-          MemoryPeak) value=1048576 ;;
-          MemoryMax) value=2147483648 ;;
-          MemoryHigh) value=1879048192 ;;
-          CPUUsageNSec) value=1000000 ;;
-          CPUQuotaPerSecUSec) value=800ms ;;
-          DropInPaths) value= ;;
-          OOMScoreAdjust) value=500 ;;
-          *) value= ;;
-        esac
-        printf '%s\n' "$value"; return 0 ;;
+        if [[ ${4:-} == --value ]]; then
+          output_values=true
+          IFS=, read -r -a properties <<<"$property"
+        elif [[ $unit_name == binance-lob-archiver-production@* ]]; then
+          # Real systemd does not guarantee request order; keep the fixture
+          # deliberately in the observed live order to exercise key parsing.
+          properties=(ActiveState SubState MainPID NRestarts Slice ControlGroup MemoryMax)
+        else
+          output_values=false
+          IFS=, read -r -a properties <<<"$property"
+        fi
+        for item in "${properties[@]}"; do
+          case "$item" in
+            ActiveState)
+              if [[ $unit_name == binance-lob-archiver-production@* ]]; then value=active
+              else value=${fixture_unit_state[$unit_name]:-inactive}; fi ;;
+            SubState)
+              if [[ $unit_name == binance-lob-archiver-production@* ]]; then value=running
+              elif [[ ${fixture_unit_state[$unit_name]:-inactive} == active ]]; then value=running
+              else value=dead; fi ;;
+            NRestarts)
+              if [[ $unit_name == binance-lob-archiver-production@* ]]; then value=${MONDAY_GATE_FIXTURE_PRODUCTION_RESTARTS:-8}
+              elif [[ ${MONDAY_GATE_FIXTURE_FAIL_RESTART:-0} == 1 ]]; then value=1
+              else value=0; fi ;;
+            MainPID)
+              if [[ $unit_name == binance-lob-archiver-production@spot.service ]]; then value=$FIXTURE_PRODUCTION_SPOT_PID
+              elif [[ $unit_name == binance-lob-archiver-production@usdm.service ]]; then value=$FIXTURE_PRODUCTION_USDM_PID
+              else value=$$; fi ;;
+            MemoryCurrent) value=1048576 ;;
+            MemoryPeak) value=1048576 ;;
+            MemoryMax) [[ $unit_name == binance-lob-archiver-production@* ]] && value=2684354560 || value=2147483648 ;;
+            MemoryHigh) value=1879048192 ;;
+            Slice) [[ $unit_name == binance-lob-archiver-production@* ]] && value=$PRODUCTION_SLICE || value=system.slice ;;
+            ControlGroup)
+              if [[ $unit_name == binance-lob-archiver-production@spot.service ]]; then value="/system.slice/$PRODUCTION_SLICE/binance-lob-archiver-production@spot.service"
+              elif [[ $unit_name == binance-lob-archiver-production@usdm.service ]]; then value="/system.slice/$PRODUCTION_SLICE/binance-lob-archiver-production@usdm.service"
+              else value=; fi ;;
+            CPUUsageNSec) value=1000000 ;;
+            CPUQuotaPerSecUSec) value=800ms ;;
+            DropInPaths) value= ;;
+            OOMScoreAdjust) value=500 ;;
+            *) value= ;;
+          esac
+          if [[ ${output_values:-false} == true ]]; then
+            printf '%s\n' "$value"
+          else
+            printf '%s=%s\n' "$item" "$value"
+          fi
+        done
+        return 0 ;;
       *) return 0 ;;
     esac
   }
@@ -229,7 +273,7 @@ sha256_file() { monday_sha256_file "$1"; }
 
 for path in "$OPT_ROOT" "$RELEASE_ROOT" "$CONTROLLER_ROOT" "$BIN_ROOT" \
   "$SYSTEMD_ROOT" "$CONFIG_ROOT" "$DATA_ROOT" "$DATA_ROOT/spool" \
-  "$DATA_ROOT/spool/binance-lob-rust-shadow"; do
+  "$DATA_ROOT/spool/binance-lob-rust-shadow" "$CGROUP_ROOT"; do
   direct_directory_or_absent "$path" || die "control-plane path is indirect: $path"
 done
 direct_directory_or_absent "$(dirname -- "$LOCK_FILE")" || die 'control-plane lock path is indirect'
@@ -240,7 +284,16 @@ direct_directory_or_absent "$GATE_SYSTEMD_ROOT" || die 'systemd runtime unit pat
 meminfo_bytes() {
   local field=$1 source="$PROC_ROOT/meminfo" value
   if [[ ! -f $source && $TEST_ONLY == true ]]; then case "$field" in
-    MemTotal) printf '8589934592\n';; MemAvailable) printf '6442450944\n';; SwapTotal) printf '0\n';; esac; return; fi
+    MemTotal) printf '8589934592\n';;
+    MemAvailable)
+      if [[ ${MONDAY_GATE_FIXTURE_FRESH_ADMISSION_FAIL:-0} == 1 \
+        && ${fixture_last_calibrated_phase:-} == shadow-spot ]]; then
+        printf '3000000000\n'
+      else
+        printf '6442450944\n'
+      fi ;;
+    SwapTotal) printf '0\n';;
+    esac; return; fi
   value=$(awk -v key="$field:" '$1 == key { count++; value=$2 } END { if (count != 1 || value !~ /^[0-9]+$/) exit 1; print value }' "$source") || return 1
   printf '%s\n' "$((value * 1024))"
 }
@@ -254,7 +307,201 @@ proc_starttime() {
 }
 io_total_us() { if [[ $TEST_ONLY == true && ! -f $PSI_SOURCE ]]; then printf '0\n'; else monday_io_full_psi_total_us "$PSI_SOURCE"; fi; }
 systemctl_show() { systemctl show "$1" --property="$2" --value 2>/dev/null; }
+systemctl_show_many() { systemctl show "$1" --property="$2" 2>/dev/null; }
 systemctl_active() { systemctl is-active --quiet "$1"; }
+
+# A production snapshot is one immutable view of the systemd template pair
+# and its automatically assigned slice.  The snapshot carries cgroup limits
+# and audit counters separately from process identity so resource admission can
+# use conservative current/limit values while the monitor compares only the
+# identity-bearing fields.
+cgroup_file_value() {
+  local path=$1
+  [[ -f $path && ! -L $path ]] || return 1
+  tr -d '\n' <"$path"
+}
+cgroup_numeric_value() {
+  local path=$1 value
+  value=$(cgroup_file_value "$path") || return 1
+  [[ $value =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  printf '%s\n' "$value"
+}
+cgroup_events_json() {
+  local path=$1
+  [[ -f $path && ! -L $path ]] || return 1
+  jq -Rsc '
+    split("\n")
+    | map(select(length > 0) | capture("^(?<key>[A-Za-z0-9_]+)[[:space:]]+(?<value>[0-9]+)$")
+      | {key:.key,value:(.value|tonumber)})
+    | from_entries
+  ' "$path"
+}
+cgroup_child_path() {
+  local control_group=$1 normalized
+  [[ $control_group == /* && $control_group != */ && $control_group != *..* ]] || return 1
+  normalized=${control_group#/}
+  [[ -n $normalized && $normalized != *'//'* ]] || return 1
+  printf '%s/%s\n' "$CGROUP_ROOT" "$normalized"
+}
+
+fixture_prepare_production_cgroup() {
+  [[ $TEST_ONLY == true ]] || return 0
+  local parent="$CGROUP_ROOT/system.slice/$PRODUCTION_SLICE" child unit market fixture_pid fixture_cgroup_pid
+  mkdir -p "$parent"
+  : >"$parent/cgroup.procs"
+  printf '5368709120\n' >"$parent/memory.current"
+  printf '5368709120\n' >"$parent/memory.peak"
+  printf 'high 0\noom 0\noom_kill 0\n' >"$parent/memory.events"
+  for market in spot usdm; do
+    child="$parent/binance-lob-archiver-production@${market}.service"
+    mkdir -p "$child"
+    if [[ $market == spot ]]; then fixture_pid=$FIXTURE_PRODUCTION_SPOT_PID
+    else fixture_pid=$FIXTURE_PRODUCTION_USDM_PID; fi
+    if [[ ${MONDAY_GATE_FIXTURE_PID_MISMATCH:-0} == 1 && $market == spot ]]; then
+      fixture_cgroup_pid=$FIXTURE_PRODUCTION_USDM_PID
+    else
+      fixture_cgroup_pid=$fixture_pid
+    fi
+    printf '%s\n' "$fixture_cgroup_pid" >"$child/cgroup.procs"
+    printf '2684354560\n' >"$child/memory.max"
+    mkdir -p "$PROC_ROOT/$fixture_pid"
+    rm -f -- "$PROC_ROOT/$fixture_pid/exe"
+    ln -s "$RELEASE_ROOT/$before_payload/binance-lob-archiver" \
+      "$PROC_ROOT/$fixture_pid/exe"
+  done
+  if [[ ${MONDAY_GATE_FIXTURE_EXTRA_CHILD:-0} != 1 ]]; then
+    rm -rf -- "$parent/foreign.service"
+  fi
+  if [[ ${MONDAY_GATE_FIXTURE_EXTRA_CHILD:-0} == 1 ]]; then
+    child="$parent/foreign.service"
+    mkdir -p "$child"
+    printf '%s\n' "$$" >"$child/cgroup.procs"
+    printf '1\n' >"$child/memory.max"
+  fi
+  if [[ ${MONDAY_GATE_FIXTURE_PARENT_PROCS:-0} == 1 ]]; then
+    printf '%s\n' "$$" >"$parent/cgroup.procs"
+  fi
+}
+
+capture_production_snapshot() {
+  local market unit state substate slice control_group parent_group memory_max pid exe_sha n_restarts
+  local child_path parent_path parent_procs_json active_children_json child_max_sum=0
+  local parent_current parent_peak parent_events children_json='{}' expected_parent='' expected_slice=''
+  local show_output item key value
+  declare -A show_fields=()
+  local -a active_children=()
+  if [[ $TEST_ONLY == true ]]; then
+    fixture_prepare_production_cgroup
+  fi
+
+  for market in spot usdm; do
+    unit="binance-lob-archiver-production@${market}.service"
+    show_output=$(systemctl_show_many "$unit" 'ActiveState,SubState,Slice,ControlGroup,MemoryMax,MainPID,NRestarts') || return 1
+    show_output=${show_output%$'\n'}
+    show_fields=()
+    while IFS= read -r item; do
+      [[ $item == *=* ]] || return 1
+      key=${item%%=*}; value=${item#*=}
+      case $key in
+        ActiveState|SubState|Slice|ControlGroup|MemoryMax|MainPID|NRestarts) ;;
+        *) return 1 ;;
+      esac
+      [[ -z ${show_fields[$key]+x} ]] || return 1
+      show_fields[$key]=$value
+    done <<<"$show_output"
+    (( ${#show_fields[@]} == 7 )) || return 1
+    state=${show_fields[ActiveState]:-}; substate=${show_fields[SubState]:-}; slice=${show_fields[Slice]:-}
+    control_group=${show_fields[ControlGroup]:-}; memory_max=${show_fields[MemoryMax]:-}
+    pid=${show_fields[MainPID]:-}; n_restarts=${show_fields[NRestarts]:-}
+    [[ $state == active && $substate == running ]] || return 1
+    [[ $slice == "$PRODUCTION_SLICE" ]] || return 1
+    slice=${slice#/}
+    [[ $memory_max =~ ^2684354560$ ]] || return 1
+    [[ $pid =~ ^[1-9][0-9]*$ && $n_restarts =~ ^[0-9]+$ ]] || return 1
+    [[ -r "$PROC_ROOT/$pid/exe" ]] || return 1
+    exe_sha=$(sha256_file "$(readlink -f -- "$PROC_ROOT/$pid/exe")") || return 1
+    [[ $exe_sha == "$before_payload" ]] || return 1
+    if [[ -z $expected_slice ]]; then
+      expected_slice=$slice
+      expected_parent="/system.slice/$slice"
+    else
+      [[ $slice == "$expected_slice" ]] || return 1
+    fi
+    parent_group=${control_group%/*}
+    [[ $parent_group == "$expected_parent" ]] || return 1
+    [[ $control_group == "$expected_parent/binance-lob-archiver-production@${market}.service" ]] || return 1
+    child_path=$(cgroup_child_path "$control_group") || return 1
+    parent_path=$(cgroup_child_path "$parent_group") || return 1
+    monday_path_direct "$child_path" || return 1
+    monday_path_direct "$parent_path" || return 1
+    awk -v expected_pid="$pid" '$1 == expected_pid { found=1 } END { exit(found ? 0 : 1) }' \
+      "$child_path/cgroup.procs" || return 1
+    [[ $(cgroup_numeric_value "$child_path/memory.max") == 2684354560 ]] || return 1
+    child_max_sum=$((child_max_sum + 2684354560))
+    children_json=$(jq -cn --argjson values "$children_json" --arg market "$market" --arg slice "$slice" \
+      --arg control_group "$control_group" --argjson pid "$pid" --arg exe "$exe_sha" \
+      --argjson restarts "$n_restarts" --argjson systemd_max "$memory_max" \
+      '$values + {($market):{market:$market,slice:$slice,control_group:$control_group,main_pid:$pid,
+        process_exe_sha256:$exe,n_restarts:$restarts,active:true,
+        systemd_memory_max_bytes:$systemd_max,memory_max_bytes:2684354560}}')
+  done
+  parent_path=$(cgroup_child_path "$expected_parent") || return 1
+  parent_procs_json=$(awk 'NF {bad=1; values[++n]=$1} END {if (bad) {printf "["; for (i=1;i<=n;i++) printf "%s%s", (i>1?",":""), values[i]; printf "]"} else print "[]"}' \
+    "$parent_path/cgroup.procs") || return 1
+  [[ $parent_procs_json == '[]' ]] || return 1
+  while IFS= read -r child_path; do
+    [[ -d $child_path && ! -L $child_path ]] || continue
+    [[ -f $child_path/cgroup.procs && ! -L $child_path/cgroup.procs ]] || return 1
+    if awk 'NF {found=1} END {exit(found ? 0 : 1)}' "$child_path/cgroup.procs"; then
+      active_children+=("$expected_parent/${child_path##*/}")
+    fi
+  done < <(find "$parent_path" -mindepth 1 -maxdepth 1 -type d -print)
+  active_children_json=$(printf '%s\n' "${active_children[@]}" | jq -Rsc 'split("\n") | map(select(length > 0)) | sort') || return 1
+  parent_current=$(cgroup_numeric_value "$parent_path/memory.current") || return 1
+  parent_peak=$(cgroup_numeric_value "$parent_path/memory.peak") || return 1
+  parent_events=$(cgroup_events_json "$parent_path/memory.events") || return 1
+  jq -cn --arg slice "$expected_slice" --arg parent "$expected_parent" \
+    --argjson procs "$parent_procs_json" --argjson active "$active_children_json" \
+    --argjson children "$children_json" --argjson current "$parent_current" \
+    --argjson peak "$parent_peak" --argjson sum "$child_max_sum" --argjson events "$parent_events" \
+    '{slice:$slice,parent_control_group:$parent,parent_cgroup_procs:$procs,
+      active_child_control_groups:$active,children:$children,
+      parent_memory_current_bytes:$current,parent_memory_peak_bytes:$peak,
+      child_memory_max_sum_bytes:$sum,parent_memory_events:$events}'
+}
+
+production_snapshot_json=''; production_snapshot_identity_json=''
+production_parent_current=''; production_child_max_sum=''; production_growth=''
+production_memory_json='{}' production_process_json='{}'
+refresh_production_snapshot() {
+  local first second first_identity second_identity current_a current_b sum_a sum_b conservative_current conservative_sum
+  first=$(capture_production_snapshot) || return 1
+  monday_validate_lob_production_snapshot "$first" || return 1
+  first_identity=$(monday_lob_production_snapshot_identity "$first") || return 1
+  if [[ -n ${production_snapshot_identity_json:-} && $first_identity != "$production_snapshot_identity_json" ]]; then
+    return 1
+  fi
+  second=$(capture_production_snapshot) || return 1
+  monday_validate_lob_production_snapshot "$second" || return 1
+  second_identity=$(monday_lob_production_snapshot_identity "$second") || return 1
+  [[ $second_identity == "$first_identity" ]] || return 1
+  current_a=$(jq -er '.parent_memory_current_bytes' <<<"$first") || return 1
+  current_b=$(jq -er '.parent_memory_current_bytes' <<<"$second") || return 1
+  sum_a=$(jq -er '.child_memory_max_sum_bytes' <<<"$first") || return 1
+  sum_b=$(jq -er '.child_memory_max_sum_bytes' <<<"$second") || return 1
+  conservative_current=$current_a; (( current_b < conservative_current )) && conservative_current=$current_b
+  conservative_sum=$sum_a; (( sum_b > conservative_sum )) && conservative_sum=$sum_b
+  production_snapshot_json=$(jq -cn --argjson value "$second" --argjson current "$conservative_current" --argjson sum "$conservative_sum" \
+    '$value | .parent_memory_current_bytes=$current | .child_memory_max_sum_bytes=$sum')
+  production_parent_current=$conservative_current
+  production_child_max_sum=$conservative_sum
+  production_growth=$((conservative_sum - conservative_current))
+  production_memory_json=$(jq -c '{slice,parent_control_group,parent_cgroup_procs,active_child_control_groups,children,parent_memory_current_bytes,parent_memory_peak_bytes,child_memory_max_sum_bytes,parent_memory_events}' <<<"$production_snapshot_json")
+  production_process_json=$(jq -c '(.children | with_entries(.value |= {main_pid,process_exe_sha256,n_restarts,active}))' <<<"$production_snapshot_json")
+  if [[ -z ${production_snapshot_identity_json:-} ]]; then
+    production_snapshot_identity_json=$first_identity
+  fi
+}
 env_value() {
   local file=$1 key=$2 count value; count=$(grep -c "^${key}=" "$file" || true)
   [[ $count -eq 1 ]] || die "$file must contain exactly one ${key}= entry"
@@ -472,49 +719,67 @@ for market in "${markets[@]}"; do
 done
 
 host_memory_total=$(meminfo_bytes MemTotal) || die 'MemTotal is unavailable'; host_memory_available=$(meminfo_bytes MemAvailable) || die 'MemAvailable is unavailable'; host_swap_total=$(meminfo_bytes SwapTotal) || die 'SwapTotal is unavailable'
-declare -A production_growth; production_memory_json='{}'
-declare -A production_pid production_exe_sha
-production_process_json='{}'
-if [[ $TEST_ONLY != true ]]; then
-  declare -A production_state production_current production_peak production_max
-  for market in "${markets[@]}"; do
-    production_unit="binance-lob-archiver-production@${market}.service"; production_state[$market]=$(systemctl_show "$production_unit" ActiveState)
-    case "${production_state[$market]}" in
-      active) [[ $(systemctl_show "$production_unit" SubState) == running ]] || die "$market production is not running"
-        production_current[$market]=$(systemctl_show "$production_unit" MemoryCurrent); production_peak[$market]=$(systemctl_show "$production_unit" MemoryPeak); production_max[$market]=$(systemctl_show "$production_unit" MemoryMax)
-        production_growth[$market]=$(monday_production_memory_growth_headroom "${production_current[$market]}" "${production_peak[$market]}" "${production_max[$market]}" "$PRODUCTION_MEMORY_GROWTH_MARGIN_BYTES") || die "$market production memory accounting is invalid" ;;
-      inactive) production_growth[$market]=0 ;;
-      *) die "$market production state is ambiguous" ;;
-    esac
-    [[ ${production_state[$market]} == active ]] || die "$market production is not active for pair Gate"
-    production_pid[$market]=$(systemctl_show "$production_unit" MainPID)
-    [[ ${production_pid[$market]} =~ ^[1-9][0-9]*$ ]] || die "$market production MainPID is unavailable"
-    production_exe_sha[$market]=$(sha256_file "$(readlink -f -- "$PROC_ROOT/${production_pid[$market]}/exe")") || die "$market production executable is unavailable"
-    [[ ${production_exe_sha[$market]} == "$before_payload" ]] || die "$market production executable differs from before pair"
-    production_process_json=$(jq -cn --argjson values "$production_process_json" --arg market "$market" --argjson pid "${production_pid[$market]}" --arg exe "${production_exe_sha[$market]}" '$values + {($market):{main_pid:$pid,process_exe_sha256:$exe,active:true}}')
-  done
-  production_memory_json=$(jq -cn --arg spot "${production_state[spot]}" --arg usdm "${production_state[usdm]}" '{spot:{active_state:$spot},usdm:{active_state:$usdm}}')
-else production_growth[spot]=0; production_growth[usdm]=0; production_process_json='{}'; fi
+if [[ $TEST_ONLY == true ]]; then
+  refresh_production_snapshot || die 'fixture production cgroup snapshot is invalid'
+else
+  refresh_production_snapshot || die 'production cgroup snapshot is invalid'
+fi
 
 resource_samples='[]'; psi_windows='[]'; resource_monitor_pid=; resource_monitor_control=; resource_monitor_log=; resource_monitor_phase=
 strict_unit_seq=0
-declare -A resource_phase_required resource_phase_limit
+declare -A resource_phase_required resource_phase_limit resource_phase_parent_current resource_phase_child_sum resource_phase_growth
 record_resource() {
-  local phase=$1 phase_max=$2 required sample now
-  host_memory_available=$(meminfo_bytes MemAvailable) || die 'MemAvailable became unavailable during Gate'
-  required=$(monday_shadow_memory_admission "$host_memory_available" "$HOST_MEMORY_RESERVE_BYTES" "$phase_max" "${production_growth[spot]}" "${production_growth[usdm]}") || die "insufficient memory for $phase"
+  local phase=$1 phase_max=$2 required sample now available_before available_after
+  available_before=$(meminfo_bytes MemAvailable) || die 'MemAvailable became unavailable during Gate'
+  refresh_production_snapshot || die "production cgroup identity drifted before $phase admission"
+  available_after=$(meminfo_bytes MemAvailable) || die 'MemAvailable became unavailable during Gate'
+  host_memory_available=$available_before
+  (( available_after < host_memory_available )) && host_memory_available=$available_after
+  required=$(monday_shadow_memory_admission "$host_memory_available" "$HOST_MEMORY_RESERVE_BYTES" "$phase_max" \
+    "$production_parent_current" "$production_child_max_sum") || die "insufficient memory for $phase"
   resource_phase_required[$phase]=$required
   resource_phase_limit[$phase]=$phase_max
+  resource_phase_parent_current[$phase]=$production_parent_current
+  resource_phase_child_sum[$phase]=$production_child_max_sum
+  resource_phase_growth[$phase]=$production_growth
   now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  sample=$(jq -cn --arg phase "$phase" --argjson available "$host_memory_available" --argjson required "$required" --argjson phase_max "$phase_max" --arg now "$now" \
-    '{phase:$phase,started_at:$now,ended_at:$now,samples:1,host_memory_available_bytes:$available,max_memory_available_bytes:$available,current_memory_available_bytes:$available,breach:false,required_bytes:$required,phase_memory_max_bytes:$phase_max}')
+  sample=$(jq -cn --arg phase "$phase" --argjson available "$host_memory_available" --argjson required "$required" --argjson phase_max "$phase_max" \
+    --argjson reserve "$HOST_MEMORY_RESERVE_BYTES" --argjson current "$production_parent_current" \
+    --argjson child_sum "$production_child_max_sum" --argjson growth "$production_growth" --arg now "$now" \
+    '{phase:$phase,started_at:$now,ended_at:$now,samples:1,host_memory_available_bytes:$available,
+      max_memory_available_bytes:$available,current_memory_available_bytes:$available,breach:false,
+      host_memory_reserve_bytes:$reserve,production_parent_memory_current_bytes:$current,
+      production_child_memory_max_sum_bytes:$child_sum,production_memory_growth_bytes:$growth,
+      required_bytes:$required,phase_memory_max_bytes:$phase_max}')
   resource_samples=$(jq -cn --argjson values "$resource_samples" --argjson value "$sample" '$values + [$value]')
+}
+resource_monitor_identity_guard() {
+  local snapshot=$1 snapshot_identity
+  if [[ -z $snapshot ]] || ! monday_validate_lob_production_snapshot "$snapshot" 2>/dev/null; then
+    printf 'production-snapshot-invalid\n' >"$tmp_dir/resource-monitor-breach"
+    return 1
+  fi
+  snapshot_identity=$(monday_lob_production_snapshot_identity "$snapshot" 2>/dev/null || true)
+  if [[ -z $snapshot_identity || $snapshot_identity != "$production_snapshot_identity_json" ]]; then
+    printf 'production-identity-drift\n' >"$tmp_dir/resource-monitor-breach"
+    return 1
+  fi
 }
 resource_monitor_start() {
   local phase=$1 phase_max=$2 initial_available initial_psi parent_pid parent_starttime
   resource_monitor_phase=$phase
   record_resource "$phase" "$phase_max"
-  [[ $TEST_ONLY == true ]] && return 0
+  if [[ $TEST_ONLY == true ]]; then
+    # The fixture normally skips the asynchronous monitor, but this hook
+    # exercises the same identity guard synchronously before a writer starts.
+    if [[ ${MONDAY_GATE_FIXTURE_IDENTITY_DRIFT:-0} == 1 ]]; then
+      MONDAY_GATE_FIXTURE_PRODUCTION_RESTARTS=9
+      local snapshot
+      snapshot=$(capture_production_snapshot 2>/dev/null || true)
+      resource_monitor_identity_guard "$snapshot" || die "production identity drifted before $phase"
+    fi
+    return 0
+  fi
   resource_monitor_control="$tmp_dir/resource-monitor-$phase.running"
   resource_monitor_log="$tmp_dir/resource-monitor-$phase.tsv"
   : >"$resource_monitor_control"; : >"$resource_monitor_log"
@@ -526,6 +791,7 @@ resource_monitor_start() {
   printf '%s %s\n' "$parent_pid" "$parent_starttime" >"$tmp_dir/resource-monitor-$phase.parent"
   (
     local previous_psi=$initial_psi available current_psi consecutive_hits=0 delta current_parent_starttime
+    local snapshot
     while [[ -e $resource_monitor_control ]]; do
       current_parent_starttime=$(proc_starttime "$parent_pid" 2>/dev/null || true)
       if ! kill -0 "$parent_pid" 2>/dev/null || [[ -z $current_parent_starttime || $current_parent_starttime != "$parent_starttime" ]]; then
@@ -535,6 +801,11 @@ resource_monitor_start() {
       available=$(meminfo_bytes MemAvailable 2>/dev/null || printf 0)
       current_psi=$(io_total_us 2>/dev/null || printf 0)
       printf '%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$available" "$current_psi" >>"$resource_monitor_log"
+      snapshot=$(capture_production_snapshot 2>/dev/null || true)
+      if ! resource_monitor_identity_guard "$snapshot"; then
+        kill -TERM "$parent_pid" 2>/dev/null || true
+        break
+      fi
       if (( available < HOST_MEMORY_RESERVE_BYTES )); then
         printf 'memory-breach\n' >"$tmp_dir/resource-monitor-breach"
         kill -TERM "$parent_pid" 2>/dev/null || true
@@ -563,14 +834,14 @@ resource_monitor_start() {
   resource_monitor_pid=$!
 }
 resource_monitor_stop() {
-  local phase=$resource_monitor_phase started ended samples max_available current_available breach required phase_max parent_pid parent_starttime
+  local phase=$resource_monitor_phase ended samples max_available current_available breach required phase_max parent_pid parent_starttime
+  local parent_current child_sum growth
   [[ -n ${resource_monitor_pid:-} ]] || return 0
   if [[ $TEST_ONLY == true ]]; then
     resource_monitor_pid=; resource_monitor_phase=; return 0
   fi
   rm -f -- "$resource_monitor_control"
   wait "$resource_monitor_pid" 2>/dev/null || true
-  started=$(head -n1 "$resource_monitor_log" | cut -f1)
   ended=$(tail -n1 "$resource_monitor_log" | cut -f1)
   samples=$(wc -l <"$resource_monitor_log" | tr -d ' ')
   read -r parent_pid parent_starttime <"$tmp_dir/resource-monitor-$phase.parent" || true
@@ -578,20 +849,38 @@ resource_monitor_stop() {
   current_available=$(tail -n1 "$resource_monitor_log" | cut -f2)
   required=${resource_phase_required[$phase]:-1}
   phase_max=${resource_phase_limit[$phase]:-1}
+  parent_current=${resource_phase_parent_current[$phase]:-0}
+  child_sum=${resource_phase_child_sum[$phase]:-0}
+  growth=${resource_phase_growth[$phase]:-0}
   breach=false; [[ -f $tmp_dir/resource-monitor-breach ]] && breach=true
   [[ $breach == false ]] || die "resource monitor breached during $phase"
-  resource_samples=$(jq -cn --argjson values "$resource_samples" --arg phase "$phase" --arg started "$started" --arg ended "$ended" \
+  resource_samples=$(jq -cn --argjson prior "$resource_samples" --arg phase "$phase" --arg ended "$ended" \
     --argjson samples "${samples:-0}" --argjson max "${max_available:-0}" --argjson current "${current_available:-0}" \
     --argjson required "${required:-1}" --argjson phase_max "${phase_max:-1}" \
+    --argjson reserve "$HOST_MEMORY_RESERVE_BYTES" --argjson parent_current "$parent_current" \
+    --argjson child_sum "$child_sum" --argjson growth "$growth" \
     --arg parent_pid "${parent_pid:-}" --arg parent_starttime "${parent_starttime:-}" \
-    '{phase:$phase,started_at:$started,ended_at:$ended,samples:$samples,host_memory_available_bytes:$current,max_memory_available_bytes:$max,current_memory_available_bytes:$current,breach:false,required_bytes:$required,phase_memory_max_bytes:$phase_max,parent_pid:($parent_pid|if length == 0 then null else tonumber end),parent_proc_starttime:($parent_starttime|if length == 0 then null else tonumber end)}' \
-    | jq -s --argjson prior "$resource_samples" '($prior + .)')
-  unset "resource_phase_required[$phase]" "resource_phase_limit[$phase]"
+    '$prior | map(if .phase == $phase then . + {
+      ended_at:$ended,samples:$samples,
+      max_memory_available_bytes:$max,current_memory_available_bytes:$current,
+      breach:false,host_memory_reserve_bytes:$reserve,
+      production_parent_memory_current_bytes:$parent_current,
+      production_child_memory_max_sum_bytes:$child_sum,
+      production_memory_growth_bytes:$growth,required_bytes:$required,
+      phase_memory_max_bytes:$phase_max,
+      parent_pid:($parent_pid|if length == 0 then null else tonumber end),
+      parent_proc_starttime:($parent_starttime|if length == 0 then null else tonumber end)
+    } else . end)')
+  unset "resource_phase_required[$phase]" "resource_phase_limit[$phase]" \
+    "resource_phase_parent_current[$phase]" "resource_phase_child_sum[$phase]" "resource_phase_growth[$phase]"
   resource_monitor_pid=; resource_monitor_phase=
 }
 calibrate_psi() {
   local phase=$1 previous current transition delta ratio hit consecutive=0 i
-  if [[ $TEST_ONLY == true ]]; then psi_windows=$(jq -cn --argjson values "$psi_windows" --arg phase "$phase" '$values + [{phase:$phase,stage:"fixture",hit:false,consecutive_hits:0}]'); return; fi
+  if [[ $TEST_ONLY == true ]]; then
+    fixture_last_calibrated_phase=$phase
+    psi_windows=$(jq -cn --argjson values "$psi_windows" --arg phase "$phase" '$values + [{phase:$phase,stage:"fixture",hit:false,consecutive_hits:0}]'); return
+  fi
   previous=$(io_total_us) || die "I/O PSI unavailable before $phase"
   for i in 1 2 3; do sleep "$IO_PSI_WINDOW_SECONDS"; current=$(io_total_us) || die "I/O PSI unavailable during $phase"
     transition=$(monday_io_full_psi_window "$previous" "$current" "$IO_PSI_WINDOW_US" "$IO_PSI_WINDOW_US" "$IO_PSI_FULL_DELTA_LIMIT_US" "$consecutive") || die 'I/O PSI moved backwards'
@@ -736,7 +1025,7 @@ if [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_PATH_ONLY:-0} == 1 ]]; then
   exit 0
 fi
 
-resource_monitor_start preflight "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; calibrate_psi preflight; resource_monitor_stop; write_run_json
+calibrate_psi preflight; resource_monitor_start preflight "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; resource_monitor_stop; write_run_json
 if [[ $FROM_CONTROLLER != direct ]]; then
   for asset in "${SHADOW_ASSETS[@]}"; do
     [[ ${saved_state[$asset]} == present || ${saved_state[$asset]} == projection ]] || die "before shadow asset is absent: $asset"
@@ -983,7 +1272,7 @@ verify_segments() {
 }
 run_market_gate_phase() {
   local market=$1 settle observation pid started_ns
-  resource_monitor_start "shadow-$market" 2147483648; calibrate_psi "shadow-$market"; fixture_seed_market "$market"; systemctl reset-failed "${unit[$market]}" >/dev/null 2>&1 || true
+  calibrate_psi "shadow-$market"; resource_monitor_start "shadow-$market" 2147483648; fixture_seed_market "$market"; systemctl reset-failed "${unit[$market]}" >/dev/null 2>&1 || true
   started_ns=$(date +%s%N); market_gate_started_ns[$market]=$started_ns
   systemctl start "${unit[$market]}"; systemctl_active "${unit[$market]}" || die "$market shadow did not start"; [[ $(systemctl_value "$market" NRestarts) == 0 ]] || die "$market shadow restarted"; pid=$(systemctl_value "$market" MainPID); [[ $pid =~ ^[1-9][0-9]*$ ]] || die "$market MainPID unavailable"; phase_pid["$market"]=$pid; phase_exe_sha["$market"]=$candidate_payload
   if [[ $TEST_ONLY == true && ( ${MONDAY_GATE_FIXTURE_SIGKILL:-0} == 1 || ${MONDAY_GATE_HARD_CRASH_AFTER_SHADOW_START:-0} == 1 ) && $market == spot ]]; then
@@ -1002,7 +1291,7 @@ run_market_gate_phase() {
     '{sha256:$sha,session_id:$session,frozen_symbol_count:$symbols,
       frozen_catalog_sha256:$catalog,max_health_silence_seconds:$silence,samples:$samples}')
   observation=$(( $(monotonic_seconds) + GATE_DURATION_SECONDS )); while (( $(monotonic_seconds) < observation )); do validate_observation_sample "$market"; assert_host_memory_reserve; [[ $(systemctl_value "$market" NRestarts) == 0 ]] || die "$market restarted"; [[ $(systemctl_value "$market" MainPID) == "$pid" ]] || die "$market MainPID changed"; [[ $TEST_ONLY == true ]] && break; sleep 15; done
-  phase_runtime["$market"]=$GATE_DURATION_SECONDS; systemctl stop "${unit[$market]}"; systemctl_active "${unit[$market]}" && die "$market shadow remained active"; resource_monitor_stop; resource_monitor_start "strict-verifier-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; verify_segments "$market"; resource_monitor_stop; calibrate_psi "shadow-$market-tail"
+  phase_runtime["$market"]=$GATE_DURATION_SECONDS; systemctl stop "${unit[$market]}"; systemctl_active "${unit[$market]}" && die "$market shadow remained active"; resource_monitor_stop; calibrate_psi "shadow-$market-tail"; resource_monitor_start "strict-verifier-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; verify_segments "$market"; resource_monitor_stop
 }
 DRAIN_ENV_KEYS=(
   MARKET DATASET SHARD_ID SYMBOLS DEPTH_MODE WS_SHARD_SIZE SNAPSHOT_LIMIT
@@ -1243,6 +1532,7 @@ if [[ $old_shadow_present == true ]]; then
   [[ $(sha256_file "$restored_target") == "$old_shadow_target_sha256" ]] \
     || die 'restored shadow binary bytes changed during Gate'
 fi
+refresh_production_snapshot || die 'production cgroup identity changed during Gate'
 
 checks=$(jq -cn '{before_pair_unchanged:true,production_runtime_verified:true,shadow_staging_verified:true,shadow_assets_restored:true,resource_preflight:true,oss_triplets:true,strict_segment_verifier:true,final_identity:true,controller_control_bytes:true,shadow_link_restored:true,health_freshness:true}')
 before_assets_json='{}'; staged_assets_json='{}'; restored_assets_json='{}'

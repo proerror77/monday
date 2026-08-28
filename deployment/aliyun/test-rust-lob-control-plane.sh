@@ -13,6 +13,114 @@ trap 'chmod -R u+w "$ROOT" 2>/dev/null || true; rm -rf "$ROOT"' EXIT
 . "$SCRIPT_DIR/host-rust-lob-controller-release.sh"
 ROOT=$fixture_root
 
+# MemAvailable already includes active production usage.  A 6.0 GiB reading
+# therefore needs only the sequential 2 GiB phase plus the fixed 1 GiB reserve;
+# the old two-lane growth headroom would incorrectly reject this host.
+admission_available_bytes=6442450944
+admission_reserve_bytes=1073741824
+admission_phase_max_bytes=2147483648
+admission_parent_current_bytes=5368709120
+admission_child_max_sum_bytes=5368709120
+admission_required_bytes=$((admission_reserve_bytes + admission_phase_max_bytes + admission_child_max_sum_bytes - admission_parent_current_bytes))
+[[ $(monday_shadow_memory_admission \
+  "$admission_available_bytes" "$admission_reserve_bytes" "$admission_phase_max_bytes" \
+  "$admission_parent_current_bytes" "$admission_child_max_sum_bytes") \
+  == "$admission_required_bytes" ]] || {
+  printf 'sequential memory admission rejected the available host headroom\n' >&2
+  exit 1
+}
+[[ $(monday_shadow_memory_admission \
+  "$admission_required_bytes" "$admission_reserve_bytes" "$admission_phase_max_bytes" \
+  "$admission_parent_current_bytes" "$admission_child_max_sum_bytes") \
+  == "$admission_required_bytes" ]] || {
+  printf 'sequential memory admission rejected exact phase plus reserve\n' >&2
+  exit 1
+}
+if monday_shadow_memory_admission "$((admission_required_bytes - 1))" \
+  "$admission_reserve_bytes" "$admission_phase_max_bytes" \
+  "$admission_parent_current_bytes" "$admission_child_max_sum_bytes" >/dev/null 2>&1; then
+  printf 'sequential memory admission accepted one byte below phase plus reserve\n' >&2
+  exit 1
+fi
+if monday_shadow_memory_admission "$admission_available_bytes" \
+  "$admission_reserve_bytes" "$admission_phase_max_bytes" \
+  "$admission_child_max_sum_bytes" "$((admission_parent_current_bytes - 1))" >/dev/null 2>&1; then
+  printf 'sequential memory admission accepted current greater than child limit sum\n' >&2
+  exit 1
+fi
+if monday_shadow_memory_admission "$admission_available_bytes" \
+  "$admission_reserve_bytes" "$admission_phase_max_bytes" \
+  268435456 >/dev/null 2>&1; then
+  printf 'sequential memory admission accepted legacy three-argument shape\n' >&2
+  exit 1
+fi
+if monday_shadow_memory_admission "$admission_available_bytes" \
+  "$admission_reserve_bytes" "$admission_phase_max_bytes" \
+  "$admission_parent_current_bytes" "$admission_child_max_sum_bytes" 1 >/dev/null 2>&1; then
+  printf 'sequential memory admission accepted legacy six-argument shape\n' >&2
+  exit 1
+fi
+if monday_shadow_memory_admission 0 1 9223372036854775807 0 0 >/dev/null 2>&1; then
+  printf 'sequential memory admission accepted an overflowing reserve plus phase\n' >&2
+  exit 1
+fi
+
+# Production cgroup snapshots are validated independently of a host systemd
+# daemon.  The same fixture exercises the exact slice/parent/child topology,
+# active-child set, limits, and process identities used by the Gate.
+production_snapshot="$ROOT/production-snapshot.json"
+production_exe_sha=$(printf 'a%.0s' {1..64})
+jq -n --arg exe "$production_exe_sha" '
+  {slice:"system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice",
+   parent_control_group:"/system.slice/system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice",parent_cgroup_procs:[],
+   active_child_control_groups:["/system.slice/system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice/binance-lob-archiver-production@spot.service",
+     "/system.slice/system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice/binance-lob-archiver-production@usdm.service"],
+   children:{spot:{market:"spot",slice:"system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice",
+       control_group:"/system.slice/system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice/binance-lob-archiver-production@spot.service",
+       main_pid:101,process_exe_sha256:$exe,n_restarts:8,active:true,
+       systemd_memory_max_bytes:2684354560,memory_max_bytes:2684354560},
+     usdm:{market:"usdm",slice:"system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice",
+       control_group:"/system.slice/system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice/binance-lob-archiver-production@usdm.service",
+       main_pid:102,process_exe_sha256:$exe,n_restarts:8,active:true,
+       systemd_memory_max_bytes:2684354560,memory_max_bytes:2684354560}},
+   parent_memory_current_bytes:5000000000,parent_memory_peak_bytes:5100000000,
+   child_memory_max_sum_bytes:5368709120,parent_memory_events:{high:0,oom:0,oom_kill:0}}
+' >"$production_snapshot"
+monday_validate_lob_production_snapshot "$production_snapshot"
+production_identity=$(monday_lob_production_snapshot_identity "$production_snapshot")
+mutated_snapshot="$ROOT/production-snapshot-mutated.json"
+for mutation in extra-child non-direct wrong-limit identity; do
+  case "$mutation" in
+    extra-child)
+      jq '.active_child_control_groups += ["/system.slice/foreign.service"]' "$production_snapshot" >"$mutated_snapshot" ;;
+    non-direct)
+      jq '.children.spot.control_group = "/other.slice/binance-lob-archiver-production@spot.service"' \
+        "$production_snapshot" >"$mutated_snapshot" ;;
+    wrong-limit)
+      jq '.children.usdm.memory_max_bytes = 2147483648 | .child_memory_max_sum_bytes = 4831838208' \
+        "$production_snapshot" >"$mutated_snapshot" ;;
+    identity)
+      jq '.children.spot.n_restarts = 9' "$production_snapshot" >"$mutated_snapshot" ;;
+  esac
+  if [[ $mutation == identity ]]; then
+    monday_validate_lob_production_snapshot "$mutated_snapshot"
+    mutated_identity=$(monday_lob_production_snapshot_identity "$mutated_snapshot")
+    [[ $mutated_identity != "$production_identity" ]] || {
+      printf 'production snapshot identity did not change after restart drift\n' >&2
+      exit 1
+    }
+  elif monday_validate_lob_production_snapshot "$mutated_snapshot"; then
+    printf 'production snapshot validator accepted %s mutation\n' "$mutation" >&2
+    exit 1
+  fi
+done
+
+jq '.parent_cgroup_procs=[4242]' "$production_snapshot" >"$mutated_snapshot"
+if monday_validate_lob_production_snapshot "$mutated_snapshot"; then
+  printf 'production snapshot validator accepted a non-empty parent cgroup\n' >&2
+  exit 1
+fi
+
 assets=()
 source_dir="$ROOT/source"
 mkdir -p "$source_dir"
@@ -125,6 +233,42 @@ gate=$(printf '%s\n' "$gate_output" | sed -n 's/^V2 Gate receipt: //p')
 gate_sha=$(printf '%s\n' "$gate_output" | sed -n 's/^SHA-256: //p')
 [[ -f $gate && $gate_sha == "$(monday_sha256_file "$gate")" ]]
 monday_validate_v2_gate "$gate" direct "$c0" "$gate_sha"
+jq -e 'all(.resource_admission[];
+  .required_bytes == (.phase_memory_max_bytes + .host_memory_reserve_bytes + .production_memory_growth_bytes)
+  and .production_memory_growth_bytes == (.production_child_memory_max_sum_bytes - .production_parent_memory_current_bytes)
+  and .host_memory_reserve_bytes == 1073741824
+  and .host_memory_available_bytes >= .required_bytes
+  and (has("production_memory_growth_headroom_bytes") | not))' "$gate" >/dev/null
+low_end_available="$ROOT/low-end-available.json"
+jq '(.resource_admission[0].current_memory_available_bytes = (.resource_admission[0].required_bytes - 1))' \
+  "$gate" >"$low_end_available"
+low_end_available_sha=$(monday_sha256_file "$low_end_available")
+monday_validate_v2_gate "$low_end_available" direct "$c0" "$low_end_available_sha"
+jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$low_end_available" >/dev/null
+tampered="$ROOT/tampered-memory-admission.json"
+jq '(.resource_admission[0].required_bytes) -= 1' "$gate" >"$tampered"
+tampered_sha=$(monday_sha256_file "$tampered")
+if monday_validate_v2_gate "$tampered" direct "$c0" "$tampered_sha"; then
+  printf 'Gate validator accepted a phase requirement below phase max plus reserve\n' >&2
+  exit 1
+fi
+if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$tampered" >/dev/null 2>&1; then
+  printf 'Gate policy accepted a phase requirement below phase max plus reserve\n' >&2
+  exit 1
+fi
+tampered="$ROOT/tampered-production-memory.json"
+jq '.production_memory.children.spot.memory_max_bytes = 2147483648
+    | .production_memory.children.spot.systemd_memory_max_bytes = 2147483648
+    | .production_memory.child_memory_max_sum_bytes = 4831838208' "$gate" >"$tampered"
+tampered_sha=$(monday_sha256_file "$tampered")
+if monday_validate_v2_gate "$tampered" direct "$c0" "$tampered_sha"; then
+  printf 'Gate validator accepted tampered production cgroup memory limits\n' >&2
+  exit 1
+fi
+if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$tampered" >/dev/null 2>&1; then
+  printf 'Gate policy accepted tampered production cgroup memory limits\n' >&2
+  exit 1
+fi
 # Production-shaped path construction reaches spool preparation without
 # opening a market socket.  The fixture still uses an isolated root, while
 # exercising the unconditional run-scoped path branch.
@@ -351,6 +495,56 @@ while IFS= read -r asset; do
   [[ -L $target && $(readlink -- "$target") == \
     "$ROOT/opt/monday/releases/binance-lob-controller/active/deployment/$asset" ]]
 done < <(monday_runtime_assets)
+
+# PSI calibration alone does not authorize a phase.  If MemAvailable falls
+# between calibration and the fresh Shadow admission, the Gate must reject
+# before systemctl start and leave no candidate writer running.
+rm -f -- "$ROOT/run/gate-fixture.calls"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_FRESH_ADMISSION_FAIL=1 \
+  MONDAY_GATE_FIXTURE_RECORD_CALLS=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c0" \
+  --candidate-controller "$c1" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'Gate accepted a phase after fresh memory admission failed\n' >&2
+  exit 1
+fi
+if [[ -f $ROOT/run/gate-fixture.calls ]] && grep -Eq \
+  '^start monday-rust-lob-gate-' "$ROOT/run/gate-fixture.calls"; then
+  printf 'Shadow writer started after fresh memory admission failed\n' >&2
+  exit 1
+fi
+
+# A production MainPID that is not present in its reported child cgroup is a
+# mixed identity and must fail before any candidate writer starts.
+rm -f -- "$ROOT/run/gate-fixture.calls"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_PID_MISMATCH=1 \
+  MONDAY_GATE_FIXTURE_RECORD_CALLS=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c0" \
+  --candidate-controller "$c1" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'Gate accepted a MainPID outside its production child cgroup\n' >&2
+  exit 1
+fi
+if [[ -f $ROOT/run/gate-fixture.calls ]] && grep -Eq \
+  '^start monday-rust-lob-gate-' "$ROOT/run/gate-fixture.calls"; then
+  printf 'Shadow writer started after production MainPID membership failed\n' >&2
+  exit 1
+fi
+
+# The asynchronous monitor is a synchronous guard in TEST_ONLY.  A changed
+# production restart identity writes the breach marker and blocks the first
+# phase, so no candidate writer or receipt can be produced.
+rm -f -- "$ROOT/run/gate-fixture.calls"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_IDENTITY_DRIFT=1 \
+  MONDAY_GATE_FIXTURE_RECORD_CALLS=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c0" \
+  --candidate-controller "$c1" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'Gate accepted production identity drift in its monitor guard\n' >&2
+  exit 1
+fi
+if [[ -f $ROOT/run/gate-fixture.calls ]] && grep -Eq \
+  '^start monday-rust-lob-gate-' "$ROOT/run/gate-fixture.calls"; then
+  printf 'Shadow writer started after production identity drift\n' >&2
+  exit 1
+fi
 
 # A V2 active controller paired with a direct production binary is a mixed
 # topology, not a second bootstrap mode.  Gate must reject it before reading
