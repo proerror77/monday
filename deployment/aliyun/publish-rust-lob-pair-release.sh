@@ -15,7 +15,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
 
-instance= artifact_uri= artifact_sha= source_revision=
+instance='' artifact_uri='' artifact_sha='' source_revision=''
 region=${REGION_ID:-ap-northeast-1}
 profile=${ALIYUN_LOCAL_PROFILE:-default}
 prefix=${BUNDLE_OSS_PREFIX:-oss://monday-lob-apne1-1045353359/releases/binance-lob-controller}
@@ -113,4 +113,39 @@ run_json=$(aliyun ecs RunCommand --RegionId "$region" --InstanceId.1 "$instance"
   "${profile_args[@]}")
 invoke_id=$(printf '%s' "$run_json" | jq -er '.InvokeId')
 printf 'Cloud Assistant invocation: %s\ncontroller release: %s\n' "$invoke_id" "$manifest_sha"
-exit 0
+polls=${MONDAY_OPERATION_TEST_POLLS:-240}
+if [[ -n ${MONDAY_OPERATION_TEST_POLLS:-} ]]; then
+  [[ ${MONDAY_ALLOW_SHORT_OPERATION_TEST:-0} == 1 ]] \
+    || die 'short polling requires MONDAY_ALLOW_SHORT_OPERATION_TEST=1'
+fi
+[[ $polls =~ ^[1-9][0-9]*$ ]] || die 'poll count must be a positive integer'
+for ((poll = 1; poll <= polls; poll++)); do
+  result_json=$(aliyun ecs DescribeInvocationResults --RegionId "$region" \
+    --InvokeId "$invoke_id" --InstanceId "$instance" "${profile_args[@]}" 2>/dev/null || true)
+  status=$(printf '%s' "$result_json" \
+    | jq -r '[.. | objects | .InvocationStatus? // empty][0] // empty' 2>/dev/null || true)
+  exit_code=$(printf '%s' "$result_json" \
+    | jq -r '[.. | objects | .ExitCode? // empty][0] // empty' 2>/dev/null || true)
+  case "$status" in
+    Success|Finished)
+      output=$(printf '%s' "$result_json" \
+        | jq -r '[.. | objects | .Output? // empty][0] // empty')
+      if [[ -n $output ]]; then
+        printf '%s' "$output" | base64 --decode || true
+        printf '\n'
+      fi
+      [[ $exit_code == 0 ]] || die "controller publication failed: $invoke_id"
+      printf 'controller publication completed: %s\n' "$invoke_id"
+      exit 0
+      ;;
+    Failed|Stopped|PartialFailed|Timeout)
+      printf '%s\n' "$result_json" >&2
+      die "controller publication reached terminal state: $status"
+      ;;
+  esac
+  sleep 5
+done
+printf 'timed out locally; stopping publication %s\n' "$invoke_id" >&2
+aliyun ecs StopInvocation --RegionId "$region" --InvokeId "$invoke_id" \
+  --InstanceId.1 "$instance" "${profile_args[@]}" >/dev/null 2>&1 || true
+die "controller publication did not reach a terminal state: $invoke_id"
