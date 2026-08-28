@@ -178,6 +178,15 @@ secure_file() {
     (( (8#$mode & 022) == 0 )) || die "required file is writable by group/world: $path"; fi
 }
 sha256_file() { monday_sha256_file "$1"; }
+
+for path in "$OPT_ROOT" "$RELEASE_ROOT" "$CONTROLLER_ROOT" "$BIN_ROOT" \
+  "$SYSTEMD_ROOT" "$CONFIG_ROOT" "$DATA_ROOT" "$DATA_ROOT/spool" \
+  "$DATA_ROOT/spool/binance-lob-rust-shadow"; do
+  direct_directory_or_absent "$path" || die "control-plane path is indirect: $path"
+done
+direct_directory_or_absent "$(dirname -- "$LOCK_FILE")" || die 'control-plane lock path is indirect'
+direct_directory_or_absent "$OVERRIDE_ROOT" || die 'shadow override path is indirect'
+
 meminfo_bytes() {
   local field=$1 source="$PROC_ROOT/meminfo" value
   if [[ ! -f $source && $TEST_ONLY == true ]]; then case "$field" in
