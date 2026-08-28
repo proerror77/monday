@@ -161,6 +161,10 @@ and (.shadow_staging | type == "object"
   and (.units | type == "object" and (keys | sort) == ["spot", "usdm"]
     and (.spot | type == "string" and test("^monday-rust-lob-gate-[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*-spot\\.service$"))
     and (.usdm | type == "string" and test("^monday-rust-lob-gate-[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*-usdm\\.service$")))
+  and (.upload_units | type == "object" and (keys | sort) == ["spot", "usdm"]
+    and all(.[]; type == "object"
+      and (.unit | type == "string" and test("^monday-rust-lob-gate-[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*-(spot|usdm)-upload\\.service$"))
+      and (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))))
   and (.candidate_assets | type == "object" and (keys | sort) == $shadow_asset_keys
     and all(.[]; type == "string" and test("^[a-f0-9]{64}$")))
   and (.restored_assets | type == "object" and (keys | sort) == $shadow_asset_keys

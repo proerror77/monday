@@ -68,7 +68,7 @@ if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
   mkdir -p "$fixture_process_root"
   fixture_usdm_starts=0
   systemctl() {
-    local action=${1:-} unit=${2:-} argument
+    local action=${1:-} unit=${2:-} argument fixture_pid
     case "$action" in
       start)
         for argument in "$@"; do
@@ -110,7 +110,12 @@ if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
         case "${3#--property=}" in
           ActiveState) [[ ${fixture_unit_state[$unit]:-inactive} == active ]] && printf 'active\n' || printf 'inactive\n' ;;
           SubState) [[ ${fixture_unit_state[$unit]:-inactive} == active ]] && printf 'running\n' || printf 'dead\n' ;;
-          MainPID) printf '%s\n' "${MONDAY_CUTOVER_FIXTURE_PID:-$$}" ;;
+          MainPID)
+            fixture_pid=${MONDAY_CUTOVER_FIXTURE_PID:-$$}
+            if [[ $unit == *'@spot.service' && -f "$(monday_root_join "$ROOT" run/cutover-fixture-spot-flip)" ]]; then
+              fixture_pid=${MONDAY_CUTOVER_FIXTURE_SPOT_FLIP_PID:-$fixture_pid}
+            fi
+            printf '%s\n' "$fixture_pid" ;;
           NRestarts) printf '%s\n' "${MONDAY_CUTOVER_FIXTURE_RESTARTS:-0}" ;;
           *) printf '\n' ;;
         esac
@@ -532,7 +537,7 @@ production_process='{}'
 declare -A expected_pid expected_restarts expected_exe_sha
 verify_production_process() {
   local market unit active sub pid restarts exe exe_sha env_file env_file_resolved spool health session updated now_ns minimum_symbols
-  local deadline health_session ready
+  local deadline health_session ready recorded_pid recorded_restarts recorded_exe recorded_session recorded_observed
   # Ordinary fixture cutovers never start a process.  The opt-in fixture
   # systemd path below exercises the same identity/freshness loop without
   # weakening production (and keeps its timeout bounded by the caller).
@@ -606,6 +611,51 @@ verify_production_process() {
       --argjson pid "$pid" --arg exe "$exe_sha" --argjson restarts "$restarts" \
       --arg session "$health_session" --argjson observed "$updated" \
       '$values + {($market):{active:true,main_pid:$pid,process_exe_sha256:$exe,n_restarts:$restarts,session_id:$session,observed_at_ns:$observed}}')
+  done
+  # Both lanes are ready now; take one final paired sample before emitting the
+  # transition receipt.  Spot may change while USD-M is catching up, so a
+  # per-lane ready result alone is not sufficient authorization.
+  for market in spot usdm; do
+    unit="binance-lob-archiver-production@${market}.service"
+    active=$(systemctl show "$unit" --property=ActiveState --value)
+    sub=$(systemctl show "$unit" --property=SubState --value)
+    [[ $active == active && $sub == running ]] || die "$market production unit changed after both lanes became ready"
+    pid=$(systemctl show "$unit" --property=MainPID --value)
+    restarts=$(systemctl show "$unit" --property=NRestarts --value)
+    [[ $pid =~ ^[1-9][0-9]*$ && $restarts == 0 ]] || die "$market production process identity changed after readiness"
+    recorded_pid=$(jq -er --arg market "$market" '.[$market].main_pid' <<<"$production_process")
+    recorded_restarts=$(jq -er --arg market "$market" '.[$market].n_restarts' <<<"$production_process")
+    [[ $pid == "$recorded_pid" && $restarts == "$recorded_restarts" ]] \
+      || die "$market production PID/restart changed after both lanes became ready"
+    exe=$(readlink -f -- "$(monday_root_join "$ROOT" "proc/$pid/exe")") \
+      || die "$market production executable disappeared after readiness"
+    exe_sha=$(monday_sha256_file "$exe") || die "$market production executable cannot be hashed after readiness"
+    recorded_exe=$(jq -er --arg market "$market" '.[$market].process_exe_sha256' <<<"$production_process")
+    [[ $exe == "$target_binary" && $exe_sha == "$recorded_exe" ]] \
+      || die "$market production executable changed after both lanes became ready"
+    env_file=$(monday_runtime_asset_target "$ROOT" "binance-lob-archiver-production-$market.env") \
+      || die "$market production environment path is invalid after readiness"
+    env_file_resolved=$(readlink -f -- "$env_file") || die "$market production environment projection is dangling after readiness"
+    spool=$(sed -n 's/^SPOOL_DIR=//p' "$env_file_resolved")
+    [[ $ROOT == / ]] || spool="$ROOT$spool"
+    health="$spool/health.json"
+    session=$(jq -er '.session_id // empty' "$health") || die "$market production health session disappeared after readiness"
+    recorded_session=$(jq -er --arg market "$market" '.[$market].session_id' <<<"$production_process")
+    [[ $session == "$recorded_session" ]] || die "$market production health session changed after both lanes became ready"
+    updated=$(jq -er '.updated_at_ns // 0' "$health")
+    now_ns=$(date +%s%N)
+    recorded_observed=$(jq -er --arg market "$market" '.[$market].observed_at_ns' <<<"$production_process")
+    [[ $updated =~ ^[0-9]+$ && $updated -ge "$recorded_observed" \
+      && $updated -ge "$cutover_started_ns" && $updated -le "$now_ns" ]] \
+      || die "$market production health is stale or in the future after readiness"
+    minimum_symbols=1000; [[ $market == usdm ]] && minimum_symbols=100
+    jq -e --arg market "$market" --arg dataset "$(sed -n 's/^DATASET=//p' "$env_file_resolved")" \
+      --argjson minimum "$minimum_symbols" \
+      '.market == $market and .dataset == $dataset and .status == "synced"
+       and .sequence_gaps == 0 and (.symbol_count | type == "number" and . >= $minimum)' \
+      "$health" >/dev/null || die "$market production health is not synchronized after readiness"
+    production_process=$(jq -cn --argjson values "$production_process" --arg market "$market" \
+      --argjson observed "$updated" '$values + {($market):($values[$market] + {observed_at_ns:$observed})}')
   done
 }
 verify_production_process

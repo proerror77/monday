@@ -463,18 +463,33 @@ mkdir -p "$ROOT/proc/$fixture_process_pid"
 ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p1_sha/binance-lob-archiver" \
   "$ROOT/proc/$fixture_process_pid/exe"
 write_cutover_fixture_health() {
-  local observed_at_ns
-  observed_at_ns=$(date +%s%N)
+  local started elapsed observed_at_ns
+  started=$(date +%s)
   mkdir -p "$production_spool_root/spot" "$production_spool_root/usdm"
-  jq -cn --argjson observed "$observed_at_ns" \
-    '{market:"spot",dataset:"spot_all",status:"synced",sequence_gaps:0,symbol_count:1000,session_id:"cutover-fixture-spot",updated_at_ns:$observed}' \
-    >"$production_spool_root/spot/health.json"
-  jq -cn --argjson observed "$observed_at_ns" \
-    '{market:"usdm",dataset:"usdm_perpetual_top100_lob",status:"synced",sequence_gaps:0,symbol_count:100,session_id:"cutover-fixture-usdm",updated_at_ns:$observed}' \
-    >"$production_spool_root/usdm/health.json"
+  while [[ ! -e "$ROOT/run/cutover-fixture-health.stop" ]]; do
+    elapsed=$(( $(date +%s) - started ))
+    (( elapsed >= 1 )) || { sleep 0.1; continue; }
+    observed_at_ns=$(date +%s%N)
+    jq -cn --argjson observed "$observed_at_ns" \
+      '{market:"spot",dataset:"spot_all",status:"synced",sequence_gaps:0,symbol_count:1000,session_id:"cutover-fixture-spot",updated_at_ns:$observed}' \
+      >"$production_spool_root/spot/health.json.tmp"
+    mv -f -- "$production_spool_root/spot/health.json.tmp" "$production_spool_root/spot/health.json"
+    if (( elapsed >= 3 )); then
+      if [[ ${FIXTURE_SPOT_FLIP:-0} == 1 ]]; then
+        : >"$ROOT/run/cutover-fixture-spot-flip"
+      fi
+      jq -cn --argjson observed "$observed_at_ns" \
+        '{market:"usdm",dataset:"usdm_perpetual_top100_lob",status:"synced",sequence_gaps:0,symbol_count:100,session_id:"cutover-fixture-usdm",updated_at_ns:$observed}' \
+        >"$production_spool_root/usdm/health.json.tmp"
+      mv -f -- "$production_spool_root/usdm/health.json.tmp" "$production_spool_root/usdm/health.json"
+    fi
+    (( elapsed < 15 )) || break
+    sleep 0.1
+  done
 }
+rm -f -- "$ROOT/run/cutover-fixture-health.stop" "$ROOT/run/cutover-fixture-spot-flip" \
+  "$production_spool_root/spot/health.json" "$production_spool_root/usdm/health.json"
 (
-  sleep 1
   write_cutover_fixture_health
 ) &
 fixture_health_writer=$!
@@ -483,6 +498,7 @@ cutover_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
   MONDAY_CUTOVER_HEALTH_TIMEOUT_SECONDS=5 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from "$c0" --to "$c1" \
   --gate-receipt "$gate" --gate-sha256 "$gate_sha" --root "$ROOT")
+ : >"$ROOT/run/cutover-fixture-health.stop"
 wait "$fixture_health_writer"
 transition=$(printf '%s\n' "$cutover_output" | sed -n 's/^Transition receipt: //p')
 transition_sha=$(printf '%s\n' "$cutover_output" | sed -n 's/^SHA-256: //p')
@@ -544,6 +560,35 @@ gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   --candidate-controller "$c2" --root "$ROOT")
 gate2=$(printf '%s\n' "$gate_output" | sed -n 's/^V2 Gate receipt: //p')
 gate2_sha=$(printf '%s\n' "$gate_output" | sed -n 's/^SHA-256: //p')
+
+# Spot is ready before USD-M, but its process identity changes while the
+# second lane is catching up.  The final paired re-read must reject this
+# partial-ready transition and leave the previous pair active.
+flip_fixture_pid=4244; flip_fixture_pid_after=4245
+mkdir -p "$ROOT/proc/$flip_fixture_pid" "$ROOT/proc/$flip_fixture_pid_after"
+ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p2_sha/binance-lob-archiver" \
+  "$ROOT/proc/$flip_fixture_pid/exe"
+ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p2_sha/binance-lob-archiver" \
+  "$ROOT/proc/$flip_fixture_pid_after/exe"
+rm -f -- "$ROOT/run/cutover-fixture-health.stop" "$ROOT/run/cutover-fixture-spot-flip" \
+  "$production_spool_root/spot/health.json" "$production_spool_root/usdm/health.json"
+(
+  FIXTURE_SPOT_FLIP=1 write_cutover_fixture_health
+) &
+flip_health_writer=$!
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
+  MONDAY_CUTOVER_FIXTURE_VERIFY_PROCESS=1 MONDAY_CUTOVER_FIXTURE_PID="$flip_fixture_pid" \
+  MONDAY_CUTOVER_FIXTURE_SPOT_FLIP_PID="$flip_fixture_pid_after" \
+  MONDAY_CUTOVER_HEALTH_TIMEOUT_SECONDS=5 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from "$c1" --to "$c2" \
+  --gate-receipt "$gate2" --gate-sha256 "$gate2_sha" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'cutover accepted a Spot identity change while USD-M was becoming ready\n' >&2
+  exit 1
+fi
+: >"$ROOT/run/cutover-fixture-health.stop"
+wait "$flip_health_writer"
+[[ $(monday_active_controller_sha "$ROOT") == "$c1" ]]
+[[ ! -e "$ROOT/data/monday/evidence/cutovers/$c2/transition.json" ]]
 
 # Cutover must reject a candidate whose process restart counter changes while
 # waiting for the first fresh health publication.  This exercises the same
@@ -731,6 +776,23 @@ for mutation in execstartpost environmentfile; do
   fi
 done
 cp -p -- "$shadow_unit_saved" "$shadow_unit_source"
+
+# The upload drain is a separately rendered transient unit, so it must reject
+# the same unallowlisted control directives before any candidate writer starts.
+shadow_upload_source="$source_dir/binance-lob-archiver-rust-upload@.service"
+shadow_upload_saved="$ROOT/binance-lob-archiver-rust-upload@.service.saved"
+cp -p -- "$shadow_upload_source" "$shadow_upload_saved"
+printf 'ExecStartPost=/bin/true\n' >>"$shadow_upload_source"
+bad_payload="$ROOT/p-bad-shadow-upload"; bad_manifest="$ROOT/m-bad-shadow-upload.json"
+publish_fixture "$bad_payload" "$bad_manifest" >/dev/null
+bad_controller=$(monday_sha256_file "$bad_manifest")
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c2" \
+  --candidate-controller "$bad_controller" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'Gate accepted an unallowlisted shadow upload directive\n' >&2
+  exit 1
+fi
+cp -p -- "$shadow_upload_saved" "$shadow_upload_source"
 
 # Candidate shadow identity is fixed by the Gate contract.  Each foreign
 # spool/endpoint/profile/shard mutation must be rejected before any writer is

@@ -371,7 +371,7 @@ monday_unit_normalized() {
         'Service|MemoryMax|2048M'
         'Install|WantedBy|multi-user.target'
       ) ;;
-    shadow_upload)
+    shadow_upload|shadow_upload_run)
       required_sections=(Unit Service)
       expected=(
         'Unit|Description|Rust Binance LOB archiver shadow pending-upload drain (%i)'
@@ -401,7 +401,13 @@ monday_unit_normalized() {
         'Service|CPUQuota|80%'
         'Service|MemoryHigh|384M'
         'Service|MemoryMax|512M'
-      ) ;;
+      )
+      if [[ $kind == shadow_upload_run ]]; then
+        expected+=(
+          'Service|Restart|no'
+          'Service|RuntimeMaxSec|1800'
+        )
+      fi ;;
     *) return 2 ;;
   esac
   monday_file_direct "$file" || return 1
@@ -1013,6 +1019,10 @@ monday_validate_v2_gate() {
         and (.units | type == "object" and (keys | sort) == ["spot", "usdm"]
           and (.spot | type == "string" and test("^monday-rust-lob-gate-[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*-spot\\.service$"))
           and (.usdm | type == "string" and test("^monday-rust-lob-gate-[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*-usdm\\.service$")))
+        and (.upload_units | type == "object" and (keys | sort) == ["spot", "usdm"]
+          and all(.[]; type == "object"
+            and (.unit | type == "string" and test("^monday-rust-lob-gate-[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*-(spot|usdm)-upload\\.service$"))
+            and (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))))
         and (.candidate_assets | type == "object" and (keys | sort) == $shadow_asset_keys
           and all(.[]; type == "string" and test("^[a-f0-9]{64}$")))
         and (.restored_assets | type == "object" and (keys | sort) == $shadow_asset_keys)

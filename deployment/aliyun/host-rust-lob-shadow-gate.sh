@@ -19,6 +19,7 @@ readonly UPLOAD_DRAIN_MEMORY_MAX_BYTES=536870912
 readonly SERVICE_USER=hftcollector
 readonly SERVICE_HOME=/var/lib/hft-collector
 readonly SAFE_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+readonly GATE_UNIT_PREFIX=monday-rust-lob-gate-
 readonly -a SHADOW_ASSETS=(
   binance-lob-archiver-rust@.service
   binance-lob-archiver-rust-upload@.service
@@ -186,6 +187,30 @@ fi
 direct_directory() { local path=$1; [[ -d $path && ! -L $path && $(readlink -f -- "$path") == "$path" ]]; }
 direct_directory_or_absent() { local path=$1; [[ ! -e $path && ! -L $path ]] || direct_directory "$path"; }
 regular_file() { [[ -f $1 && ! -L $1 ]]; }
+directory_mode() {
+  local path=$1 value
+  if value=$(stat -c '%a' -- "$path" 2>/dev/null); then printf '%s\n' "$value"; else stat -f '%Lp' -- "$path"; fi
+}
+directory_owner_group() {
+  local path=$1 value
+  if value=$(stat -c '%U:%G' -- "$path" 2>/dev/null); then printf '%s\n' "$value"; else stat -f '%Su:%Sg' -- "$path"; fi
+}
+ensure_run_spool_dir() {
+  local path=$1 owner_group
+  direct_directory_or_absent "$path" || die "run spool parent is indirect: $path"
+  if [[ $TEST_ONLY == true ]]; then
+    install -d -m 0750 "$path"
+  else
+    install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$path"
+  fi
+  direct_directory "$path" || die "run spool parent is not a direct directory: $path"
+  [[ $(directory_mode "$path") == 750 ]] || die "run spool parent mode is not 0750: $path"
+  if [[ $TEST_ONLY != true ]]; then
+    owner_group=$(directory_owner_group "$path")
+    [[ $owner_group == "$SERVICE_USER:$SERVICE_USER" || $owner_group == "root:$SERVICE_USER" ]] \
+      || die "run spool parent ownership is not safe: $path ($owner_group)"
+  fi
+}
 secure_file() {
   local path=$1 mode owner; regular_file "$path" || die "required regular file is missing: $path"
   if [[ $TEST_ONLY != true ]]; then owner=$(stat -c %u -- "$path"); mode=$(stat -c %a -- "$path")
@@ -212,6 +237,13 @@ meminfo_bytes() {
   printf '%s\n' "$((value * 1024))"
 }
 monotonic_seconds() { if [[ $TEST_ONLY == true && ! -r "$PROC_ROOT/uptime" ]]; then printf '%s\n' "$(date +%s)"; else awk '{print int($1)}' "$PROC_ROOT/uptime"; fi; }
+proc_starttime() {
+  local pid=$1 stat_file
+  [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
+  stat_file="$PROC_ROOT/$pid/stat"
+  [[ -r $stat_file ]] || return 1
+  awk '{ if ($22 !~ /^[0-9]+$/) exit 1; print $22 }' "$stat_file"
+}
 io_total_us() { if [[ $TEST_ONLY == true && ! -f $PSI_SOURCE ]]; then printf '0\n'; else monday_io_full_psi_total_us "$PSI_SOURCE"; fi; }
 systemctl_show() { systemctl show "$1" --property="$2" --value 2>/dev/null; }
 systemctl_active() { systemctl is-active --quiet "$1"; }
@@ -390,7 +422,8 @@ verify_shadow_unit_template() {
   [[ $(grep -c '^EnvironmentFile=' "$file" || true) -eq 2 ]] || return 1
 }
 
-declare -A market_env spool_dir candidate_shadow_spool dataset symbols unit expected_oss_prefix
+declare -A market_env spool_dir candidate_shadow_spool dataset symbols unit upload_unit expected_oss_prefix
+declare -A candidate_upload_unit_sha
 declare -A oss_bucket oss_endpoint oss_region aliyun_profile
 declare -A phase_segments_json phase_triplets_json phase_health_json
 markets=(spot usdm)
@@ -456,6 +489,7 @@ if [[ $TEST_ONLY != true ]]; then
 else production_growth[spot]=0; production_growth[usdm]=0; production_process_json='{}'; fi
 
 resource_samples='[]'; psi_windows='[]'; resource_monitor_pid=; resource_monitor_control=; resource_monitor_log=; resource_monitor_phase=
+strict_unit_seq=0
 declare -A resource_phase_required resource_phase_limit
 record_resource() {
   local phase=$1 phase_max=$2 required sample now
@@ -469,7 +503,7 @@ record_resource() {
   resource_samples=$(jq -cn --argjson values "$resource_samples" --argjson value "$sample" '$values + [$value]')
 }
 resource_monitor_start() {
-  local phase=$1 phase_max=$2 initial_available initial_psi
+  local phase=$1 phase_max=$2 initial_available initial_psi parent_pid parent_starttime
   resource_monitor_phase=$phase
   record_resource "$phase" "$phase_max"
   [[ $TEST_ONLY == true ]] && return 0
@@ -479,10 +513,17 @@ resource_monitor_start() {
   initial_available=$(meminfo_bytes MemAvailable) || die 'MemAvailable became unavailable during Gate'
   initial_psi=$(io_total_us 2>/dev/null || printf 0)
   printf '%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$initial_available" "$initial_psi" >"$resource_monitor_log"
-  local parent_pid=$$
+  parent_pid=$$
+  parent_starttime=$(proc_starttime "$parent_pid") || die 'resource monitor parent starttime is unavailable'
+  printf '%s %s\n' "$parent_pid" "$parent_starttime" >"$tmp_dir/resource-monitor-$phase.parent"
   (
-    local previous_psi=$initial_psi available current_psi consecutive_hits=0 delta
+    local previous_psi=$initial_psi available current_psi consecutive_hits=0 delta current_parent_starttime
     while [[ -e $resource_monitor_control ]]; do
+      current_parent_starttime=$(proc_starttime "$parent_pid" 2>/dev/null || true)
+      if ! kill -0 "$parent_pid" 2>/dev/null || [[ -z $current_parent_starttime || $current_parent_starttime != "$parent_starttime" ]]; then
+        printf 'parent-disappeared\n' >"$tmp_dir/resource-monitor-parent-exit"
+        break
+      fi
       available=$(meminfo_bytes MemAvailable 2>/dev/null || printf 0)
       current_psi=$(io_total_us 2>/dev/null || printf 0)
       printf '%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$available" "$current_psi" >>"$resource_monitor_log"
@@ -514,7 +555,7 @@ resource_monitor_start() {
   resource_monitor_pid=$!
 }
 resource_monitor_stop() {
-  local phase=$resource_monitor_phase started ended samples max_available current_available breach required phase_max
+  local phase=$resource_monitor_phase started ended samples max_available current_available breach required phase_max parent_pid parent_starttime
   [[ -n ${resource_monitor_pid:-} ]] || return 0
   if [[ $TEST_ONLY == true ]]; then
     resource_monitor_pid=; resource_monitor_phase=; return 0
@@ -524,6 +565,7 @@ resource_monitor_stop() {
   started=$(head -n1 "$resource_monitor_log" | cut -f1)
   ended=$(tail -n1 "$resource_monitor_log" | cut -f1)
   samples=$(wc -l <"$resource_monitor_log" | tr -d ' ')
+  read -r parent_pid parent_starttime <"$tmp_dir/resource-monitor-$phase.parent" || true
   max_available=$(awk -F '\t' 'BEGIN{m=0} $2>m{m=$2} END{print m+0}' "$resource_monitor_log")
   current_available=$(tail -n1 "$resource_monitor_log" | cut -f2)
   required=${resource_phase_required[$phase]:-1}
@@ -533,7 +575,8 @@ resource_monitor_stop() {
   resource_samples=$(jq -cn --argjson values "$resource_samples" --arg phase "$phase" --arg started "$started" --arg ended "$ended" \
     --argjson samples "${samples:-0}" --argjson max "${max_available:-0}" --argjson current "${current_available:-0}" \
     --argjson required "${required:-1}" --argjson phase_max "${phase_max:-1}" \
-    '{phase:$phase,started_at:$started,ended_at:$ended,samples:$samples,host_memory_available_bytes:$current,max_memory_available_bytes:$max,current_memory_available_bytes:$current,breach:false,required_bytes:$required,phase_memory_max_bytes:$phase_max}' \
+    --arg parent_pid "${parent_pid:-}" --arg parent_starttime "${parent_starttime:-}" \
+    '{phase:$phase,started_at:$started,ended_at:$ended,samples:$samples,host_memory_available_bytes:$current,max_memory_available_bytes:$max,current_memory_available_bytes:$current,breach:false,required_bytes:$required,phase_memory_max_bytes:$phase_max,parent_pid:($parent_pid|if length == 0 then null else tonumber end),parent_proc_starttime:($parent_starttime|if length == 0 then null else tonumber end)}' \
     | jq -s --argjson prior "$resource_samples" '($prior + .)')
   unset "resource_phase_required[$phase]" "resource_phase_limit[$phase]"
   resource_monitor_pid=; resource_monitor_phase=
@@ -559,19 +602,56 @@ run_id=$(date -u +%Y%m%dT%H%M%SZ)-$$
 evidence_dir="$EVIDENCE_ROOT/$CANDIDATE_CONTROLLER/$candidate_runtime/runs/$run_id"; gate_json="$evidence_dir/gate.json"; passed_marker="$evidence_dir/PASSED.sha256"; run_spool="$RUN_SPOOL_ROOT/$run_id"; run_json="$evidence_dir/run.json"
 gate_unit_dir="$GATE_UNIT_ROOT/$run_id"
 
+# BSD/GNU install only applies -m to the leaf when creating a nested path.
+# Create each shadow spool component explicitly so the collector user can
+# traverse a fresh tree without widening the parent permissions.
+ensure_run_spool_dir "$DATA_ROOT/spool/binance-lob-rust-shadow"
+ensure_run_spool_dir "$RUN_SPOOL_ROOT"
+ensure_run_spool_dir "$run_spool"
+ensure_run_spool_dir "$GATE_UNIT_ROOT"
+
 # A killed Gate cannot run its EXIT trap.  On the next serialized Gate, only
 # our own run-scoped names are stopped and removed; production units, links,
 # and /etc bytes are never addressed by this cleanup.
+valid_gate_transient_unit() {
+  local candidate_unit_name=$1
+  [[ $candidate_unit_name =~ ^${GATE_UNIT_PREFIX}[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*-(spot|usdm|spot-upload|usdm-upload|strict-[1-9][0-9]*)\.service$ ]]
+}
+cleanup_stale_gate_units() {
+  local listed unit unit_file
+  [[ $TEST_ONLY == true ]] && return 0
+  listed=$(systemctl list-units --all --type=service --no-legend --plain \
+    "${GATE_UNIT_PREFIX}*.service") || return 1
+  while read -r unit _; do
+    [[ -n ${unit:-} ]] || continue
+    valid_gate_transient_unit "$unit" || continue
+    systemctl stop "$unit" >/dev/null 2>&1 || true
+    systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+  done <<<"$listed"
+  direct_directory "$GATE_SYSTEMD_ROOT" || return 1
+  while IFS= read -r unit_file; do
+    unit=${unit_file##*/}
+    valid_gate_transient_unit "$unit" || continue
+    rm -f -- "$unit_file"
+  done < <(find "$GATE_SYSTEMD_ROOT" -maxdepth 1 -type f -name 'monday-rust-lob-gate-*.service' -print)
+  systemctl daemon-reload >/dev/null 2>&1 || return 1
+}
 cleanup_stale_gate_runs() {
-  local dir old unit_file unit market
+  local dir old old_spool unit_file unit market
   [[ -n $RUN_SPOOL_ROOT ]] || return 1
   [[ -d $GATE_UNIT_ROOT ]] || return 0
   while IFS= read -r dir; do
     [[ -n $dir && $dir != "$gate_unit_dir" ]] || continue
     old=${dir##*/}
     [[ $old =~ ^[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*$ ]] || continue
+    direct_directory "$dir" || return 1
+    old_spool="$RUN_SPOOL_ROOT/$old"
+    if [[ -e $old_spool || -L $old_spool ]]; then
+      direct_directory "$old_spool" || return 1
+    fi
     while IFS= read -r unit_file; do
       unit=${unit_file##*/}; unit=${unit%.service}
+      valid_gate_transient_unit "$unit.service" || continue
       systemctl stop "$unit.service" >/dev/null 2>&1 || true
       systemctl reset-failed "$unit.service" >/dev/null 2>&1 || true
     done < <(find "$dir" -maxdepth 1 -type f -name 'monday-rust-lob-gate-*.service' -print)
@@ -579,10 +659,11 @@ cleanup_stale_gate_runs() {
       rm -f -- "$GATE_SYSTEMD_ROOT/monday-rust-lob-gate-${old}-${market}.service" \
         "$GATE_SYSTEMD_ROOT/monday-rust-lob-gate-${old}-${market}-upload.service"
     done
-    rm -rf -- "$dir" "${RUN_SPOOL_ROOT:?}/$old"
+    rm -rf -- "$dir" "$old_spool"
   done < <(find "$GATE_UNIT_ROOT" -mindepth 1 -maxdepth 1 -type d -print)
   [[ $TEST_ONLY == true ]] || systemctl daemon-reload >/dev/null 2>&1 || return 1
 }
+cleanup_stale_gate_units
 cleanup_stale_gate_runs
 # Every Gate, including production, writes only to this run-scoped spool.  A
 # prior test-only conditional left production's spool_dir empty and made the
@@ -591,28 +672,12 @@ cleanup_stale_gate_runs
 for market in "${markets[@]}"; do
   spool_dir[$market]=$(run_spool_dir "$run_id" "$market")
 done
-install -d -m 0750 "$EVIDENCE_ROOT" "$RUN_SPOOL_ROOT" "$evidence_dir"
+install -d -m 0750 "$EVIDENCE_ROOT" "$evidence_dir"
 install -d -m 0755 "$GATE_SYSTEMD_ROOT"
-if [[ $TEST_ONLY == true ]]; then
-  install -d -m 0750 "$run_spool" "$gate_unit_dir"
-else
-  install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$run_spool" "$gate_unit_dir"
-fi
+ensure_run_spool_dir "$gate_unit_dir"
 for market in "${markets[@]}"; do
-  if [[ $TEST_ONLY == true ]]; then
-    install -d -m 0750 "${spool_dir[$market]}"
-  else
-    install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "${spool_dir[$market]}"
-    [[ $(stat -c '%U:%G' -- "${spool_dir[$market]}") == "$SERVICE_USER:$SERVICE_USER" ]] \
-      || die "$market run-scoped Gate spool ownership is not ${SERVICE_USER}:${SERVICE_USER}"
-  fi
+  ensure_run_spool_dir "${spool_dir[$market]}"
 done
-if [[ $TEST_ONLY == false ]]; then
-  [[ $(stat -c '%U:%G' -- "$run_spool") == "$SERVICE_USER:$SERVICE_USER" ]] \
-    || die "run-scoped Gate spool ownership is not ${SERVICE_USER}:${SERVICE_USER}"
-  [[ $(stat -c '%U:%G' -- "$gate_unit_dir") == "$SERVICE_USER:$SERVICE_USER" ]] \
-    || die "run-scoped Gate override ownership is not ${SERVICE_USER}:${SERVICE_USER}"
-fi
 if [[ ${MONDAY_GATE_FIXTURE_PATH_ONLY:-0} != 1 ]]; then
   while IFS= read -r prior_receipt; do
     if jq -e '.schema == "monday.rust_lob_shadow_gate.v5" and .passed == true' "$prior_receipt" >/dev/null 2>&1; then
@@ -650,11 +715,15 @@ trap cleanup EXIT; trap 'exit 143' HUP INT TERM
 # Fixture-only path coverage reaches the same run-scoped preparation without
 # opening sockets, invoking OSS, or starting an external market process.
 if [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_PATH_ONLY:-0} == 1 ]]; then
+  for path in "$DATA_ROOT/spool/binance-lob-rust-shadow" "$RUN_SPOOL_ROOT" \
+    "$run_spool" "$gate_unit_dir" "${spool_dir[spot]}" "${spool_dir[usdm]}"; do
+    [[ $(directory_mode "$path") == 750 ]] || die "fixture run directory mode is not 0750: $path"
+  done
   for market in "${markets[@]}"; do
     [[ ${spool_dir[$market]} == "$run_spool/$market" ]] \
       || die "$market fixture Gate spool path is not run-scoped"
   done
-  printf 'V2 Gate spool preparation: %s\n' "$run_spool"
+  printf 'V2 Gate spool preparation: %s permissions=750\n' "$run_spool"
   exit 0
 fi
 
@@ -686,7 +755,7 @@ fixture_seed_market() {
   done
 }
 render_shadow_unit() {
-  local market=$1 source_unit source_upload source_env rendered_unit rendered_upload rendered_env spool
+  local market=$1 source_unit source_upload source_env rendered_unit rendered_upload rendered_env spool canonical_upload
   source_unit="$candidate_deployment/binance-lob-archiver-rust@.service"
   source_upload="$candidate_deployment/binance-lob-archiver-rust-upload@.service"
   source_env="$candidate_deployment/binance-lob-archiver-rust-${market}.env"
@@ -705,7 +774,10 @@ render_shadow_unit() {
       -e 's|^RuntimeMaxSec=.*$|RuntimeMaxSec=1800|' \
       -e "s|^ReadWritePaths=.*$|ReadWritePaths=$spool|" \
       "$source_unit" >"$rendered_unit"
-  sed -e "s|^EnvironmentFile=.*$|EnvironmentFile=$rendered_env|" \
+  sed -e '/^\[Service\]$/a\
+Restart=no\
+RuntimeMaxSec=1800' \
+      -e "s|^EnvironmentFile=.*$|EnvironmentFile=$rendered_env|" \
       -e "s|^ExecStart=.*$|ExecStart=$candidate_binary --upload-only|" \
       -e "s|^ReadWritePaths=.*$|ReadWritePaths=$spool|" \
       "$source_upload" >"$rendered_upload"
@@ -718,6 +790,15 @@ render_shadow_unit() {
   [[ $(grep -Fxc "EnvironmentFile=$rendered_env" "$rendered_upload" || true) -eq 1 ]] || die "$market Gate upload env path is not exact"
   [[ $(grep -Fxc "ExecStart=$candidate_binary --upload-only" "$rendered_upload" || true) -eq 1 ]] || die "$market Gate upload identity is not exact"
   [[ $(grep -Fxc "ReadWritePaths=$spool" "$rendered_upload" || true) -eq 1 ]] || die "$market Gate upload spool is not exact"
+  [[ $(grep -Fxc 'Restart=no' "$rendered_upload" || true) -eq 1 ]] || die "$market Gate upload restart policy is not bounded"
+  [[ $(grep -Fxc 'RuntimeMaxSec=1800' "$rendered_upload" || true) -eq 1 ]] || die "$market Gate upload runtime is not bounded"
+  canonical_upload="$tmp_dir/$market-shadow-upload-source.service"
+  sed -e "s|^EnvironmentFile=$rendered_env$|EnvironmentFile=/etc/monday/binance-lob-archiver-rust-%i.env|" \
+      -e "s|^ExecStart=$candidate_binary --upload-only$|ExecStart=/opt/monday/bin/binance-lob-archiver-shadow --upload-only|" \
+      -e "s|^ReadWritePaths=$spool$|ReadWritePaths=/data/monday/spool/binance-lob-rust-shadow|" \
+      "$rendered_upload" >"$canonical_upload"
+  monday_validate_unit_allowlist "$canonical_upload" shadow_upload_run \
+    || die "$market rendered shadow upload unit failed security/resource verification"
   [[ $(grep -Fxc "SPOOL_DIR=$spool" "$rendered_env" || true) -eq 1 ]] || die "$market Gate env spool is not exact"
   [[ $TEST_ONLY == true ]] || systemd-analyze verify "$rendered_unit" "$rendered_upload" || die "$market Gate unit failed systemd-analyze verify"
   unit[$market]="monday-rust-lob-gate-${run_id}-${market}.service"
@@ -732,6 +813,8 @@ render_shadow_unit() {
     || die "$market run-scoped upload unit already exists"
   install -m 0644 "$rendered_unit" "$search_unit"
   install -m 0644 "$rendered_upload" "$search_upload"
+  upload_unit[$market]="monday-rust-lob-gate-${run_id}-${market}-upload.service"
+  candidate_upload_unit_sha[$market]=$(sha256_file "$rendered_upload")
   candidate_asset_sha["binance-lob-archiver-rust@.service"]=$(sha256_file "$rendered_unit")
   candidate_asset_sha["binance-lob-archiver-rust-upload@.service"]=$(sha256_file "$rendered_upload")
   candidate_asset_sha["binance-lob-archiver-rust-${market}.env"]=$(sha256_file "$rendered_env")
@@ -750,9 +833,12 @@ run_strict_verifier() {
     [[ $expect_path == false ]]
     return
   fi
-  systemd-run --quiet --wait --collect --unit="monday-rust-strict-verifier-$$.service" \
+  strict_unit_seq=$((strict_unit_seq + 1))
+  systemd-run --quiet --wait --collect \
+    --unit="${GATE_UNIT_PREFIX}${run_id}-strict-${strict_unit_seq}.service" \
     --property=MemoryMax=1536M --property=MemoryHigh=1280M \
-    --property=OOMScoreAdjust=500 --uid="$SERVICE_USER" -- "$candidate_binary" "$@"
+    --property=OOMScoreAdjust=500 --property=Restart=no --property=RuntimeMaxSec=1800 \
+    --uid="$SERVICE_USER" -- "$candidate_binary" "$@"
 }
 run_strict_verifier_pair() { run_strict_verifier --require-lob-continuity "$@"; }
 verify_adjacent_segments() {
@@ -951,12 +1037,11 @@ run_candidate_drain() {
     resource_monitor_stop
     return 0
   fi
-  systemd-run --quiet --wait --collect \
-    --unit="monday-rust-upload-drain-$$-$market.service" \
-    --property=MemoryMax="$((UPLOAD_DRAIN_MEMORY_MAX_BYTES / 1048576))M" \
-    --property=MemoryHigh=384M --uid="$SERVICE_USER" -- \
-    env -i HOME="$SERVICE_HOME" PATH="$SAFE_PATH" RUST_LOG=info \
-    "${candidate_drain_env_args[@]}" "$candidate_binary" --upload-only
+  systemctl reset-failed "${upload_unit[$market]}" >/dev/null 2>&1 || true
+  systemctl start "${upload_unit[$market]}" \
+    || { resource_monitor_stop; die "$market run-scoped upload drain failed"; }
+  [[ $(systemctl show "${upload_unit[$market]}" --property=Result --value) == success ]] \
+    || { resource_monitor_stop; die "$market run-scoped upload drain did not complete successfully"; }
   resource_monitor_stop
 }
 assert_spool_drained() {
@@ -1175,9 +1260,14 @@ for market in "${markets[@]}"; do
 done
 run_units_json=$(jq -cn --arg spot "${unit[spot]}" --arg usdm "${unit[usdm]}" \
   '{spot:$spot,usdm:$usdm}')
+run_upload_units_json=$(jq -cn \
+  --arg spot "${upload_unit[spot]}" --arg usdm "${upload_unit[usdm]}" \
+  --arg spot_sha "${candidate_upload_unit_sha[spot]}" \
+  --arg usdm_sha "${candidate_upload_unit_sha[usdm]}" \
+  '{spot:{unit:$spot,sha256:$spot_sha},usdm:{unit:$usdm,sha256:$usdm_sha}}')
 gate_finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ); production_eligible=true; [[ $TEST_ONLY == true ]] && production_eligible=false
-jq -cn --arg schema monday.rust_lob_shadow_gate.v5 --arg from "$before_controller" --arg source_mode "$source_mode" --arg after "$CANDIDATE_CONTROLLER" --arg candidate "$CANDIDATE_CONTROLLER" --arg payload "$candidate_payload" --arg runtime "$candidate_runtime" --arg bundle "$candidate_bundle" --arg source "$candidate_source" --arg before_payload "$before_payload" --arg before_runtime "$before_runtime" --arg before_bundle "$before_bundle" --arg before_source "$before_source" --arg before_projection "$before_production_projection" --arg control_sha "$candidate_control_bytes_sha" --argjson control_assets "$candidate_control_assets" --argjson production_runtime "$candidate_production_runtime" --arg run "$run_id" --arg spool "$run_spool" --arg run_unit_root "$gate_unit_dir" --argjson units "$run_units_json" --arg started "$gate_started_at" --arg finished "$gate_finished_at" --argjson host_total "$host_memory_total" --argjson host_swap "$host_swap_total" --argjson production_memory "$production_memory_json" --argjson production_process "$production_process_json" --argjson production_assets "$production_asset_json" --argjson resources "$resource_samples" --argjson psi "$psi_windows" --argjson checks "$checks" --argjson markets "$markets_json" --argjson eligible "$production_eligible" --argjson test_only "$TEST_ONLY" --argjson before_assets "$before_assets_json" --argjson staged_assets "$staged_assets_json" --argjson restored_assets "$restored_assets_json" --arg shadow_binary "$SHADOW_BINARY" --arg candidate_binary "$candidate_binary" --arg old_shadow_target "$old_shadow_target" --arg old_shadow_target_sha "$old_shadow_target_sha256" --argjson old_shadow_present "$old_shadow_present" \
-  '{schema:$schema,control_plane_version:2,passed:true,production_eligible:$eligible,test_only:$test_only,source_mode:$source_mode,from_controller_sha256:$from,transition:{before:$from,after:$after,topology:(if $source_mode == "direct" then "direct-bootstrap" else "stable" end)},candidate_controller_sha256:$candidate,candidate_payload_sha256:$payload,candidate_runtime_contract_sha256:$runtime,candidate_deployment_bundle_sha256:$bundle,candidate_deployment_source_revision:$source,candidate_control_bytes:{sha256:$control_sha,assets:$control_assets},production_runtime:$production_runtime,before:{controller:$from,payload_sha256:$before_payload,runtime_contract_sha256:$before_runtime,deployment_bundle_sha256:$before_bundle,deployment_source_revision:$before_source,production_projection:$before_projection,production_assets:$production_assets},run_id:$run,run_spool:$spool,started_at:$started,finished_at:$finished,required_duration_seconds:240,health_settle_seconds:240,segment_seconds:120,host_memory_total_bytes:$host_total,host_swap_total_bytes:$host_swap,production_memory:$production_memory,production_process:$production_process,production_assets:$production_assets,resource_admission:$resources,io_full_psi_windows:$psi,shadow_staging:{mode:"run-scoped",run_unit_root:$run_unit_root,spool_root:$spool,units:$units,candidate_assets:$staged_assets,restored_assets:$restored_assets,before_assets:$before_assets,binary:{path:$run_unit_root,candidate_target:$candidate_binary,restored_target:(if $old_shadow_present then $old_shadow_target else null end),restored_target_sha256:(if $old_shadow_present then $old_shadow_target_sha else null end),restored_present:$old_shadow_present}},checks:$checks,markets:$markets}' >"$gate_json.tmp"
+jq -cn --arg schema monday.rust_lob_shadow_gate.v5 --arg from "$before_controller" --arg source_mode "$source_mode" --arg after "$CANDIDATE_CONTROLLER" --arg candidate "$CANDIDATE_CONTROLLER" --arg payload "$candidate_payload" --arg runtime "$candidate_runtime" --arg bundle "$candidate_bundle" --arg source "$candidate_source" --arg before_payload "$before_payload" --arg before_runtime "$before_runtime" --arg before_bundle "$before_bundle" --arg before_source "$before_source" --arg before_projection "$before_production_projection" --arg control_sha "$candidate_control_bytes_sha" --argjson control_assets "$candidate_control_assets" --argjson production_runtime "$candidate_production_runtime" --arg run "$run_id" --arg spool "$run_spool" --arg run_unit_root "$gate_unit_dir" --argjson units "$run_units_json" --argjson upload_units "$run_upload_units_json" --arg started "$gate_started_at" --arg finished "$gate_finished_at" --argjson host_total "$host_memory_total" --argjson host_swap "$host_swap_total" --argjson production_memory "$production_memory_json" --argjson production_process "$production_process_json" --argjson production_assets "$production_asset_json" --argjson resources "$resource_samples" --argjson psi "$psi_windows" --argjson checks "$checks" --argjson markets "$markets_json" --argjson eligible "$production_eligible" --argjson test_only "$TEST_ONLY" --argjson before_assets "$before_assets_json" --argjson staged_assets "$staged_assets_json" --argjson restored_assets "$restored_assets_json" --arg shadow_binary "$SHADOW_BINARY" --arg candidate_binary "$candidate_binary" --arg old_shadow_target "$old_shadow_target" --arg old_shadow_target_sha "$old_shadow_target_sha256" --argjson old_shadow_present "$old_shadow_present" \
+  '{schema:$schema,control_plane_version:2,passed:true,production_eligible:$eligible,test_only:$test_only,source_mode:$source_mode,from_controller_sha256:$from,transition:{before:$from,after:$after,topology:(if $source_mode == "direct" then "direct-bootstrap" else "stable" end)},candidate_controller_sha256:$candidate,candidate_payload_sha256:$payload,candidate_runtime_contract_sha256:$runtime,candidate_deployment_bundle_sha256:$bundle,candidate_deployment_source_revision:$source,candidate_control_bytes:{sha256:$control_sha,assets:$control_assets},production_runtime:$production_runtime,before:{controller:$from,payload_sha256:$before_payload,runtime_contract_sha256:$before_runtime,deployment_bundle_sha256:$before_bundle,deployment_source_revision:$before_source,production_projection:$before_projection,production_assets:$production_assets},run_id:$run,run_spool:$spool,started_at:$started,finished_at:$finished,required_duration_seconds:240,health_settle_seconds:240,segment_seconds:120,host_memory_total_bytes:$host_total,host_swap_total_bytes:$host_swap,production_memory:$production_memory,production_process:$production_process,production_assets:$production_assets,resource_admission:$resources,io_full_psi_windows:$psi,shadow_staging:{mode:"run-scoped",run_unit_root:$run_unit_root,spool_root:$spool,units:$units,upload_units:$upload_units,candidate_assets:$staged_assets,restored_assets:$restored_assets,before_assets:$before_assets,binary:{path:$run_unit_root,candidate_target:$candidate_binary,restored_target:(if $old_shadow_present then $old_shadow_target else null end),restored_target_sha256:(if $old_shadow_present then $old_shadow_target_sha else null end),restored_present:$old_shadow_present}},checks:$checks,markets:$markets}' >"$gate_json.tmp"
 chmod 0640 "$gate_json.tmp"; [[ ! -e $gate_json ]] || die 'gate receipt already exists'; mv -f -- "$gate_json.tmp" "$gate_json"
 if ! jq -e -f "$POLICY_SOURCE" "$gate_json" >/dev/null; then die 'V2 Gate policy rejected the receipt'; fi
 if [[ $production_eligible == true ]]; then gate_sha=$(sha256_file "$gate_json"); printf '%s  gate.json\n' "$gate_sha" >"$passed_marker.tmp"; chmod 0640 "$passed_marker.tmp"; mv -f -- "$passed_marker.tmp" "$passed_marker"; fi
