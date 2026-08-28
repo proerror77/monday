@@ -25,6 +25,18 @@ monday_sha256_ok() {
   [[ $# -eq 1 && $1 =~ ^[a-f0-9]{64}$ ]]
 }
 
+monday_root_join() {
+  [[ $# -eq 2 ]] || return 2
+  local root=${1:-/} suffix=${2#/}
+  root=${root%/}
+  [[ -n $root ]] || root=/
+  if [[ $root == / ]]; then
+    printf '/%s\n' "$suffix"
+  else
+    printf '%s/%s\n' "$root" "$suffix"
+  fi
+}
+
 monday_iso_epoch() {
   [[ $# -eq 1 ]] || return 2
   local value=$1 normalized tz
@@ -81,6 +93,20 @@ monday_controller_assets() {
     rust-lob-shadow-gate-policy.jq
 }
 
+monday_runtime_asset_target() {
+  [[ $# -eq 2 ]] || return 2
+  local root=$1 asset=$2
+  case "$asset" in
+    binance-lob-archiver-production@.service|binance-lob-archiver-rust@.service|\
+    binance-lob-archiver-upload@.service|binance-lob-archiver-rust-upload@.service)
+      monday_root_join "$root" "etc/systemd/system/$asset" ;;
+    binance-lob-archiver-production-spot.env|binance-lob-archiver-production-usdm.env|\
+    binance-lob-archiver-rust-spot.env|binance-lob-archiver-rust-usdm.env)
+      monday_root_join "$root" "etc/monday/$asset" ;;
+    *) return 1 ;;
+  esac
+}
+
 monday_rust_lob_runtime_contract_sha256() {
   [[ $# -eq 1 ]] || return 2
   local directory=${1%/} asset digest
@@ -99,6 +125,40 @@ monday_rust_lob_runtime_contract_sha256() {
   else
     shasum -a 256 | awk '{print $1}'
   fi
+}
+
+monday_rust_lob_live_runtime_contract_sha256() {
+  [[ $# -eq 1 ]] || return 2
+  local root=$1 scratch asset target resolved digest
+  scratch=$(mktemp -d) || return 1
+  while IFS= read -r asset; do
+    target=$(monday_runtime_asset_target "$root" "$asset") || {
+      rm -rf -- "$scratch"
+      return 1
+    }
+    [[ -f $target ]] || {
+      rm -rf -- "$scratch"
+      return 1
+    }
+    resolved=$(readlink -f -- "$target") || {
+      rm -rf -- "$scratch"
+      return 1
+    }
+    [[ -f $resolved && ! -L $resolved ]] || {
+      rm -rf -- "$scratch"
+      return 1
+    }
+    cp -p -- "$resolved" "$scratch/$asset" || {
+      rm -rf -- "$scratch"
+      return 1
+    }
+  done < <(monday_runtime_assets)
+  digest=$(monday_rust_lob_runtime_contract_sha256 "$scratch") || {
+    rm -rf -- "$scratch"
+    return 1
+  }
+  rm -rf -- "$scratch"
+  printf '%s\n' "$digest"
 }
 
 monday_controller_release_sha256() {
@@ -262,24 +322,26 @@ monday_manifest_field() {
 
 monday_active_controller_sha() {
   [[ $# -eq 1 ]] || return 2
-  local root=${1%/} link
-  link="$root/opt/monday/releases/binance-lob-controller/active"
+  local root=${1:-/} link controller_root
+  controller_root=$(monday_root_join "$root" opt/monday/releases/binance-lob-controller) || return 1
+  link="$controller_root/active"
   local target sha
   [[ -L $link ]] || return 1
   target=$(readlink -f -- "$link") || return 1
   sha=${target##*/}
-  [[ $target == "$root/opt/monday/releases/binance-lob-controller/$sha" \
+  [[ $target == "$controller_root/$sha" \
     && $sha =~ ^[a-f0-9]{64}$ ]] || return 1
   printf '%s\n' "$sha"
 }
 
 monday_verify_controller_release() {
   [[ $# -eq 2 ]] || return 2
-  local root=${1%/} sha=$2
-  local release="$root/opt/monday/releases/binance-lob-controller/$sha"
+  local root=${1:-/} sha=$2 controller_root release
+  controller_root=$(monday_root_join "$root" opt/monday/releases/binance-lob-controller) || return 1
+  release="$controller_root/$sha"
   local manifest="$release/release.json" asset expected projection target payload
   monday_sha256_ok "$sha" || return 1
-  monday_path_direct "$root/opt/monday/releases/binance-lob-controller" || return 1
+  monday_path_direct "$controller_root" || return 1
   monday_path_direct "$release" || return 1
   monday_path_direct "$release/deployment" || return 1
   monday_file_direct "$manifest" || return 1
@@ -297,7 +359,7 @@ monday_verify_controller_release() {
   done < <(monday_controller_assets)
   payload=$(monday_manifest_field "$manifest" artifact_sha256) || return 1
   projection="$release/binance-lob-archiver"
-  target="$root/opt/monday/releases/binance-lob-archiver/$payload/binance-lob-archiver"
+  target=$(monday_root_join "$root" "opt/monday/releases/binance-lob-archiver/$payload/binance-lob-archiver")
   [[ -L $projection && $(readlink -- "$projection") == "$target" ]] || return 1
   [[ $(readlink -f -- "$projection") == "$target" ]] || return 1
   monday_file_direct "$target" || return 1
@@ -364,9 +426,17 @@ monday_validate_v2_gate() {
             and (.main_pid | type == "number" and . >= 1)
             and (.process_exe_sha256 | type == "string" and test("^[a-f0-9]{64}$"))))) end)
       and (.resource_admission | type == "array" and length >= 3
+        and ((["preflight","shadow-spot","strict-verifier-spot","upload-drain-spot","shadow-usdm","strict-verifier-usdm","upload-drain-usdm","oss-readback-spot","oss-readback-usdm"]
+          - (map(.phase) | unique)) | length == 0)
         and all(.[]; . as $r
           | (.phase | type == "string" and length > 0)
+          and (.started_at | type == "string" and length > 0)
+          and (.ended_at | type == "string" and length > 0)
+          and (.samples | type == "number" and . >= 1)
           and (.host_memory_available_bytes | type == "number" and . >= 0)
+          and (.max_memory_available_bytes | type == "number" and . >= 0)
+          and (.current_memory_available_bytes | type == "number" and . >= 0)
+          and (.breach | type == "boolean" and . == false)
           and ($r.required_bytes | type == "number" and . > 0 and . <= $r.host_memory_available_bytes)
           and (.phase_memory_max_bytes | type == "number" and . > 0)))
       and (.io_full_psi_windows | type == "array" and length >= 3
@@ -384,6 +454,13 @@ monday_validate_v2_gate() {
         and (.restored_assets | type == "object" and (keys | sort) == $shadow_asset_keys)
         and (.before_assets | type == "object" and (keys | sort) == $shadow_asset_keys)
         and (.restored_assets == .before_assets)
+        and all([.restored_assets, .before_assets][] | .[];
+          ((.state == "present"
+            and (.sha256 | type == "string" and test("^[a-f0-9]{64}$")))
+           or (.state == "absent" and .sha256 == null)
+           or (.state == "projection"
+             and (.target | type == "string" and length > 0)
+             and (.sha256 | type == "string" and test("^[a-f0-9]{64}$")))))
         and (.binary | type == "object" and (.candidate_target | type == "string")
           and (.restored_present | type == "boolean")
           and ((.restored_target_sha256 == null)
@@ -469,16 +546,11 @@ monday_validate_v2_transition() {
   [[ $# -eq 5 ]] || return 2
   local receipt=$1 from=$2 to=$3 gate=$4 gate_sha=$5
   local gate_evidence gate_payload gate_runtime pair_asset_keys
-  pair_asset_keys=$(printf '%s\n' \
-    binance-lob-archiver-production@.service \
-    binance-lob-archiver-upload@.service \
-    binance-lob-archiver-production-spot.env \
-    binance-lob-archiver-production-usdm.env \
-    binance-lob-archiver-recovery@.service \
-    binance-lob-archiver-recovery@.timer \
-    host-rust-lob-recovery-queue.sh \
-    monday-collector-health.sh \
-    | jq -Rsc 'split("\n") | map(select(length > 0)) | sort') || return 1
+  # The stable pair contains exactly the eight runtime unit/env assets
+  # (production + shadow).  Recovery/health helpers remain controller assets
+  # and are addressed through the immutable active controller, never copied
+  # into a second live state projection.
+  pair_asset_keys=$(monday_runtime_assets | jq -Rsc 'split("\n") | map(select(length > 0)) | sort') || return 1
   monday_file_direct "$receipt" || return 1
   [[ $from == direct || $from =~ ^[a-f0-9]{64}$ ]] || return 1
   [[ $to =~ ^[a-f0-9]{64}$ && $gate_sha =~ ^[a-f0-9]{64}$ ]] || return 1
@@ -521,9 +593,14 @@ monday_validate_v2_transition() {
       and (.assets | type == "object" and (keys | sort) == $pair_asset_keys
         and all(.[]; ((.state == "present"
           and (.sha256 | type == "string" and test("^[a-f0-9]{64}$")))
-          or (.state == "absent" and .sha256 == null)))))
+          or (.state == "absent" and .sha256 == null)
+          or (.state == "projection"
+            and (.target | type == "string" and length > 0)
+            and (.sha256 | type == "string" and test("^[a-f0-9]{64}$")))))))
     and (.installed_assets | type == "object" and (keys | sort) == $pair_asset_keys
-      and all(.[]; type == "string" and test("^[a-f0-9]{64}$")))' \
+      and all(.[]; type == "string" and test("^[a-f0-9]{64}$")))
+    and (.installed_projections | type == "object" and (keys | sort) == $pair_asset_keys
+      and all(.[]; type == "string" and length > 0))' \
     "$receipt" >/dev/null
   jq -e --argjson expected "$gate_evidence" \
     '.gate_evidence == $expected' "$receipt" >/dev/null
@@ -539,6 +616,7 @@ monday_verify_upload_triplet_readback() {
   local data_sha manifest_sha success_sha object_prefix first_manifest second_manifest
   local data_file manifest_file success_file expected_success_file expected_prefix_norm
   monday_file_direct "$status" || return 1
+  jq -e '.last_error == null' "$status" >/dev/null || return 1
   [[ $market == spot || $market == usdm ]] || return 1
   [[ $dataset =~ ^[A-Za-z0-9_.-]+$ && $expected_bucket =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || return 1
   expected_prefix_norm=${expected_prefix%/}
@@ -599,11 +677,12 @@ monday_verify_upload_triplet_readback() {
   jq -cn --arg market "$market" --arg data_uri "$data_uri" --arg manifest_uri "$manifest_uri" \
     --arg success_uri "$success_uri" --arg data_sha "$data_sha" --arg manifest_sha "$manifest_sha" \
     --arg success_sha "$success_sha" --arg object_prefix "$object_prefix" \
+    --arg last_success_at "$(jq -er '.last_success_at' "$status")" \
     --arg session "$(jq -er '.session_id // .lob_continuity.capture_session_id' "$manifest_file")" \
     --arg catalog "$(jq -er '.catalog_sha256 // ""' "$manifest_file")" \
     '{market:$market,data_uri:$data_uri,manifest_uri:$manifest_uri,success_uri:$success_uri,
       data_sha256:$data_sha,manifest_sha256:$manifest_sha,success_sha256:$success_sha,
-      success_content:($data_sha + "\n"),object_prefix:$object_prefix,
+      success_content:($data_sha + "\n"),object_prefix:$object_prefix,last_success_at:$last_success_at,
       session_id:$session,catalog_sha256:$catalog}'
 }
 

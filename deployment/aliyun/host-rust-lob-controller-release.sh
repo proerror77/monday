@@ -9,6 +9,13 @@ usage() {
 
 die() { printf '%s\n' "$*" >&2; exit 1; }
 
+root_join() {
+  local root=${1:-/} suffix=${2#/}
+  root=${root%/}
+  [[ -n $root ]] || root=/
+  if [[ $root == / ]]; then printf '/%s\n' "$suffix"; else printf '%s/%s\n' "$root" "$suffix"; fi
+}
+
 ROOT=${MONDAY_ROOT:-/}
 sha256_file() { monday_sha256_file "$1"; }
 regular_file() { monday_file_direct "$1"; }
@@ -17,8 +24,8 @@ direct_directory() { monday_path_direct "$1"; }
 configure() {
   ROOT=${1:-$ROOT}; ROOT=${ROOT%/}
   [[ -n $ROOT ]] || ROOT=/
-  ARTIFACT_ROOT="$ROOT/opt/monday/releases/binance-lob-archiver"
-  CONTROLLER_ROOT="$ROOT/opt/monday/releases/binance-lob-controller"
+  ARTIFACT_ROOT=$(root_join "$ROOT" opt/monday/releases/binance-lob-archiver)
+  CONTROLLER_ROOT=$(root_join "$ROOT" opt/monday/releases/binance-lob-controller)
 }
 
 validate_archive() {

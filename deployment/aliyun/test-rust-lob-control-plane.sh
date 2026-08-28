@@ -54,6 +54,16 @@ for asset in binance-lob-archiver-production-spot.env binance-lob-archiver-produ
   cp "$ROOT/opt/monday/releases/binance-lob-controller/$(monday_sha256_file "$m0")/deployment/$asset" \
     "$ROOT/etc/monday/$asset"
 done
+# Bootstrap independently verifies all eight runtime unit/env bytes (the
+# production and shadow lanes) before establishing stable projections.
+for asset in binance-lob-archiver-rust@.service binance-lob-archiver-rust-upload@.service; do
+  cp "$ROOT/opt/monday/releases/binance-lob-controller/$(monday_sha256_file "$m0")/deployment/$asset" \
+    "$ROOT/etc/systemd/system/$asset"
+done
+for asset in binance-lob-archiver-rust-spot.env binance-lob-archiver-rust-usdm.env; do
+  cp "$ROOT/opt/monday/releases/binance-lob-controller/$(monday_sha256_file "$m0")/deployment/$asset" \
+    "$ROOT/etc/monday/$asset"
+done
 printf '\n# controller revision two fixture\n' >>"$source_dir/host-rust-lob-readback.sh"
 p1="$ROOT/p1"; m1="$ROOT/m1.json"
 p1_sha=$(publish_fixture "$p1" "$m1")
@@ -71,6 +81,29 @@ gate_sha=$(printf '%s\n' "$gate_output" | sed -n 's/^SHA-256: //p')
 [[ -f $gate && $gate_sha == "$(monday_sha256_file "$gate")" ]]
 monday_validate_v2_gate "$gate" direct "$c0" "$gate_sha"
 
+# Bootstrap must independently bind the live R0 bytes.  A missing or drifted
+# shadow runtime asset is rejected before any active/controller projection is
+# changed, even when the Gate receipt itself was produced earlier.
+bootstrap_shadow="$ROOT/etc/monday/binance-lob-archiver-rust-spot.env"
+cp -p -- "$bootstrap_shadow" "$bootstrap_shadow.saved"
+rm -f -- "$bootstrap_shadow"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from direct --to "$c0" \
+  --gate-receipt "$gate" --gate-sha256 "$gate_sha" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'bootstrap accepted a missing shadow runtime asset\n' >&2
+  exit 1
+fi
+mv -f -- "$bootstrap_shadow.saved" "$bootstrap_shadow"
+printf 'bootstrap-r0-drift\n' >"$bootstrap_shadow"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from direct --to "$c0" \
+  --gate-receipt "$gate" --gate-sha256 "$gate_sha" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'bootstrap accepted drifted runtime bytes\n' >&2
+  exit 1
+fi
+cp -p -- "$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/binance-lob-archiver-rust-spot.env" \
+  "$bootstrap_shadow"
+
 bootstrap_cutover_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from direct --to "$c0" \
   --gate-receipt "$gate" --gate-sha256 "$gate_sha" --root "$ROOT")
@@ -83,6 +116,11 @@ bootstrap_transition_sha=$(printf '%s\n' "$bootstrap_cutover_output" | sed -n 's
   "$ROOT/opt/monday/releases/binance-lob-archiver/$p0_sha/binance-lob-archiver" ]]
 [[ $(monday_sha256_file "$bootstrap_transition") == "$bootstrap_transition_sha" ]]
 monday_validate_v2_transition "$bootstrap_transition" direct "$c0" "$gate" "$gate_sha"
+while IFS= read -r asset; do
+  target=$(monday_runtime_asset_target "$ROOT" "$asset")
+  [[ -L $target && $(readlink -- "$target") == \
+    "$ROOT/opt/monday/releases/binance-lob-controller/active/deployment/$asset" ]]
+done < <(monday_runtime_assets)
 
 if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
@@ -136,25 +174,42 @@ if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$fake" >/dev/null 2>&1
   exit 1
 fi
 
-# A V2 before pair must be active and its payload may change.  The bootstrap
-# cutover above established the permanent stable production projection.
-mkdir -p "$ROOT/etc/systemd/system" "$ROOT/etc/monday"
-for asset in \
-  binance-lob-archiver-rust@.service binance-lob-archiver-rust-upload@.service; do
-  cp "$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/$asset" \
-    "$ROOT/etc/systemd/system/$asset"
-done
-for asset in binance-lob-archiver-rust-spot.env binance-lob-archiver-rust-usdm.env; do
-  cp "$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/$asset" \
-    "$ROOT/etc/monday/$asset"
-done
+# A V2 before pair must be active and its payload may change.  Bootstrap has
+# already established the permanent stable projections for every runtime
+# asset; the test must not write through those links into immutable C0.
 declare -A shadow_before_sha
 for asset in \
   binance-lob-archiver-rust@.service binance-lob-archiver-rust-upload@.service \
   binance-lob-archiver-rust-spot.env binance-lob-archiver-rust-usdm.env; do
   if [[ $asset == *.service ]]; then target="$ROOT/etc/systemd/system/$asset"; else target="$ROOT/etc/monday/$asset"; fi
-  shadow_before_sha[$asset]=$(monday_sha256_file "$target")
+  [[ -L $target && $(readlink -- "$target") == "$ROOT/opt/monday/releases/binance-lob-controller/active/deployment/$asset" ]]
+  shadow_before_sha[$asset]=$(monday_sha256_file "$(readlink -f -- "$target")")
 done
+# The before runtime must contain all four shadow assets and each one must
+# resolve to the active controller projection.  Missing or drifted bytes are
+# rejected before a Gate can stage a candidate.
+missing_shadow="$ROOT/etc/monday/binance-lob-archiver-rust-spot.env"
+rm -f -- "$missing_shadow"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c0" \
+  --candidate-controller "$c1" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'Gate accepted a missing shadow runtime asset\n' >&2
+  exit 1
+fi
+ln -s "$ROOT/opt/monday/releases/binance-lob-controller/active/deployment/binance-lob-archiver-rust-spot.env" \
+  "$missing_shadow"
+drift_shadow="$ROOT/etc/monday/binance-lob-archiver-rust-usdm.env"
+rm -f -- "$drift_shadow"
+printf 'drifted-runtime-byte\n' >"$drift_shadow"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c0" \
+  --candidate-controller "$c1" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'Gate accepted drifted shadow runtime bytes\n' >&2
+  exit 1
+fi
+rm -f -- "$drift_shadow"
+ln -s "$ROOT/opt/monday/releases/binance-lob-controller/active/deployment/binance-lob-archiver-rust-usdm.env" \
+  "$drift_shadow"
 ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p0_sha/binance-lob-archiver" \
   "$ROOT/opt/monday/bin/binance-lob-archiver-shadow"
 shadow_before_target=$(readlink -- "$ROOT/opt/monday/bin/binance-lob-archiver-shadow")
@@ -166,7 +221,7 @@ gate_sha=$(printf '%s\n' "$gate_output" | sed -n 's/^SHA-256: //p')
 monday_validate_v2_gate "$gate" "$c0" "$c1" "$gate_sha"
 for asset in "${!shadow_before_sha[@]}"; do
   if [[ $asset == *.service ]]; then target="$ROOT/etc/systemd/system/$asset"; else target="$ROOT/etc/monday/$asset"; fi
-  [[ $(monday_sha256_file "$target") == "${shadow_before_sha[$asset]}" ]] || {
+  [[ $(monday_sha256_file "$(readlink -f -- "$target")") == "${shadow_before_sha[$asset]}" ]] || {
     printf 'Gate did not restore shadow asset %s\n' "$asset" >&2
     exit 1
   }
@@ -203,7 +258,7 @@ fi
 [[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == "$production_before_failure" ]]
 for asset in "${!shadow_before_sha[@]}"; do
   if [[ $asset == *.service ]]; then target="$ROOT/etc/systemd/system/$asset"; else target="$ROOT/etc/monday/$asset"; fi
-  [[ $(monday_sha256_file "$target") == "${shadow_before_sha[$asset]}" ]] || {
+  [[ $(monday_sha256_file "$(readlink -f -- "$target")") == "${shadow_before_sha[$asset]}" ]] || {
     printf 'failed Gate did not restore shadow asset %s\n' "$asset" >&2
     exit 1
   }
@@ -273,6 +328,25 @@ MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   --transition-receipt "$transition2" --receipt-sha256 "$transition2_sha" \
   --root "$ROOT" >/dev/null
 
+# If the second production lane fails during restore, both lanes must be
+# contained and the failed attempt must not emit a success receipt.
+restore_evidence="$ROOT/data/monday/evidence/restores/$c2"
+rm -f -- "$restore_evidence/restore.json" "$restore_evidence/restore.json.sha256"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_RESTORE_FIXTURE_SYSTEMD=1 \
+  MONDAY_RESTORE_FIXTURE_FAIL_USDM=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c2" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'restore second-lane fault unexpectedly succeeded\n' >&2
+  exit 1
+fi
+restore_calls="$ROOT/run/restore-fixture.calls"
+for unit in binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service; do
+  grep -Fq "stop $unit" "$restore_calls"
+  grep -Fq "disable $unit" "$restore_calls"
+  grep -Fq "mask $unit" "$restore_calls"
+done
+[[ ! -e $restore_evidence/restore.json && ! -e $restore_evidence/restore.json.sha256 ]]
+[[ $(monday_active_controller_sha "$ROOT") == "$c2" ]]
+
 # Shared OSS triplet readback rejects stale status, foreign prefixes, missing
 # objects, and a marker whose digest is internally consistent but whose bytes
 # are not the canonical data SHA plus one newline.
@@ -294,7 +368,7 @@ triplet_prefix='lake/raw/venue=binance/market=spot/dataset=spot_all/shard=all'
 triplet_now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 jq -cn --arg now "$triplet_now" --arg uri "$triplet_uri" --arg prefix "$triplet_prefix" \
   --arg data "$triplet_data_sha" --arg manifest "$triplet_manifest_sha" --arg success "$triplet_success_sha" \
-  '{last_success_at:$now,last_uploaded_triplet:{data_uri:$uri,object_prefix:$prefix,data_sha256:$data,manifest_sha256:$manifest,success_sha256:$success}}' \
+  '{last_success_at:$now,last_error:null,last_uploaded_triplet:{data_uri:$uri,object_prefix:$prefix,data_sha256:$data,manifest_sha256:$manifest,success_sha256:$success}}' \
   >"$triplet_status"
 copy_triplet_fixture() {
   local uri=$1 target=$2 object
@@ -377,5 +451,34 @@ for path in \
     fi
   done
 done
+
+# Production-root dry coverage: the real root must join to /opt and /data
+# exactly (never //opt or //data), while every host action rejects test mode
+# against /.  This exercises each direct path before any filesystem read.
+[[ $(monday_root_join / opt/monday) == /opt/monday ]]
+[[ $(monday_root_join / data/monday) == /data/monday ]]
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT=/ \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c1" --root / >/dev/null 2>&1; then
+  printf 'Gate accepted an unsafe production root in test mode\n' >&2
+  exit 1
+fi
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT=/ \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from direct --to "$c1" \
+  --gate-receipt /data/gate.json --gate-sha256 "$(printf '%064d' 0)" --root / >/dev/null 2>&1; then
+  printf 'Cutover accepted an unsafe production root in test mode\n' >&2
+  exit 1
+fi
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT=/ \
+  "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c1" --root / >/dev/null 2>&1; then
+  printf 'Restore accepted an unsafe production root in test mode\n' >&2
+  exit 1
+fi
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT=/ \
+  "$SCRIPT_DIR/host-rust-lob-readback.sh" --controller "$c1" \
+  --transition-receipt /data/transition.json --receipt-sha256 "$(printf '%064d' 0)" --root / >/dev/null 2>&1; then
+  printf 'Readback accepted an unsafe production root in test mode\n' >&2
+  exit 1
+fi
 
 printf 'V2 Gate contract passed\n'

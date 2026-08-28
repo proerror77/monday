@@ -31,7 +31,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 
 # Readback is serialized with cutover/restore and takes the locks before any
 # active, Gate, or process identity is read.
-lock_root="$ROOT/run/lock"
+lock_root=$(monday_root_join "$ROOT" run/lock)
 mkdir -p "$lock_root"
 exec 9>"$lock_root/monday-rust-lob-control-plane.lock"
 exec 8>"$lock_root/monday-rust-lob-recovery-drain.lock"
@@ -59,17 +59,17 @@ transition_gate=$(jq -er '.gate_receipt' "$TRANSITION_RECEIPT") \
 transition_gate_sha=$(jq -er '.gate_sha256' "$TRANSITION_RECEIPT") \
   || die 'transition receipt has no exact Gate digest'
 runtime=$(monday_manifest_field \
-  "$ROOT/opt/monday/releases/binance-lob-controller/$CONTROLLER/release.json" \
+  "$(monday_root_join "$ROOT" "opt/monday/releases/binance-lob-controller/$CONTROLLER/release.json")" \
   runtime_contract_sha256) || die 'active controller runtime contract is invalid'
-canonical_gate_root="$ROOT/data/monday/evidence/shadow-gates/$CONTROLLER/$runtime"
+canonical_gate_root=$(monday_root_join "$ROOT" "data/monday/evidence/shadow-gates/$CONTROLLER/$runtime")
 gate_relative=${transition_gate#"$canonical_gate_root"/}
 [[ $gate_relative =~ ^runs/[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*/gate\.json$ ]] \
   || die 'transition Gate path is outside the canonical V2 run path'
 gate_dir=$(dirname -- "$transition_gate")
 for gate_parent in \
-  "$ROOT/data" "$ROOT/data/monday" "$ROOT/data/monday/evidence" \
-  "$ROOT/data/monday/evidence/shadow-gates" \
-  "$ROOT/data/monday/evidence/shadow-gates/$CONTROLLER" \
+  "$(monday_root_join "$ROOT" data)" "$(monday_root_join "$ROOT" data/monday)" "$(monday_root_join "$ROOT" data/monday/evidence)" \
+  "$(monday_root_join "$ROOT" data/monday/evidence/shadow-gates)" \
+  "$(monday_root_join "$ROOT" "data/monday/evidence/shadow-gates/$CONTROLLER")" \
   "$canonical_gate_root" "$canonical_gate_root/runs" "$gate_dir"; do
   monday_path_direct "$gate_parent" || die "transition Gate parent is indirect: $gate_parent"
 done
@@ -90,55 +90,87 @@ else
 fi
 
 payload=$(jq -er '.artifact_sha256' \
-  "$ROOT/opt/monday/releases/binance-lob-controller/$CONTROLLER/release.json")
-production="$ROOT/opt/monday/bin/binance-lob-archiver"
-target="$ROOT/opt/monday/releases/binance-lob-archiver/$payload/binance-lob-archiver"
-stable_projection="$ROOT/opt/monday/releases/binance-lob-controller/active/binance-lob-archiver"
+  "$(monday_root_join "$ROOT" "opt/monday/releases/binance-lob-controller/$CONTROLLER/release.json")")
+production=$(monday_root_join "$ROOT" opt/monday/bin/binance-lob-archiver)
+target=$(monday_root_join "$ROOT" "opt/monday/releases/binance-lob-archiver/$payload/binance-lob-archiver")
+stable_projection=$(monday_root_join "$ROOT" opt/monday/releases/binance-lob-controller/active/binance-lob-archiver)
 [[ -L $production && $(readlink -- "$production") == "$stable_projection" \
   && $(readlink -f -- "$production") == "$target" ]] \
   || die 'stable production projection does not match the active controller payload'
 [[ $(monday_sha256_file "$target") == "$payload" ]] || die 'production binary digest mismatch'
 
-deployment="$ROOT/opt/monday/releases/binance-lob-controller/$CONTROLLER/deployment"
-for asset in \
-  binance-lob-archiver-production@.service \
-  binance-lob-archiver-upload@.service \
-  binance-lob-archiver-recovery@.service \
-  binance-lob-archiver-recovery@.timer; do
-  installed="$ROOT/etc/systemd/system/$asset"
-  cmp -s "$deployment/$asset" "$installed" \
-    || die "installed systemd asset differs: $asset"
+deployment=$(monday_root_join "$ROOT" "opt/monday/releases/binance-lob-controller/$CONTROLLER/deployment")
+mapfile -t PAIR_ASSETS < <(monday_runtime_assets)
+readonly PAIR_ASSETS
+production_projection=$(monday_root_join "$ROOT" opt/monday/releases/binance-lob-controller/active/binance-lob-archiver)
+[[ -L $production && $(readlink -- "$production") == "$production_projection" \
+  && $(readlink -f -- "$production") == "$target" ]] \
+  || die 'stable production projection does not match active C'
+for asset in "${PAIR_ASSETS[@]}"; do
+  installed=$(monday_runtime_asset_target "$ROOT" "$asset") || die "unknown runtime asset: $asset"
+  expected=$(monday_root_join "$ROOT" "opt/monday/releases/binance-lob-controller/active/deployment/$asset")
+  [[ -L $installed && $(readlink -- "$installed") == "$expected" ]] \
+    || die "installed pair asset is not the active projection: $asset"
+  resolved=$(readlink -f -- "$installed") || die "installed pair projection is dangling: $asset"
+  monday_file_direct "$resolved" || die "installed pair projection is not a file: $asset"
+  [[ $(monday_sha256_file "$resolved") == "$(monday_sha256_file "$deployment/$asset")" ]] \
+    || die "installed pair asset differs from active C: $asset"
 done
-  for asset in binance-lob-archiver-production-spot.env binance-lob-archiver-production-usdm.env; do
-  cmp -s "$deployment/$asset" "$ROOT/etc/monday/$asset" \
-    || die "installed environment differs: $asset"
-done
-cmp -s "$deployment/host-rust-lob-recovery-queue.sh" \
-  "$ROOT/opt/monday/bin/monday-rust-lob-recovery-queue" \
-  || die 'installed recovery controller differs from active C'
-cmp -s "$deployment/monday-collector-health.sh" \
-  "$ROOT/opt/monday/bin/monday-collector-health.sh" \
-  || die 'installed health controller differs from active C'
 
-if [[ ${MONDAY_CONTROL_PLANE_TEST:-0} != 1 ]]; then
-  for unit in binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service; do
+runtime_identity='{}'; health_identity='{}'
+capture_runtime_identity() {
+  local market unit pid restarts exe env_file spool health session updated minimum_ns
+  runtime_identity='{}'; health_identity='{}'
+  [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 ]] && return 0
+  minimum_ns=$(( $(monday_iso_epoch "$(jq -er '.completed_at' "$TRANSITION_RECEIPT")") * 1000000000 ))
+  for market in spot usdm; do
+    unit="binance-lob-archiver-production@${market}.service"
     systemctl is-active --quiet "$unit" || die "production unit is inactive: $unit"
     restarts=$(systemctl show "$unit" --property=NRestarts --value)
     [[ $restarts == 0 ]] || die "production unit restarted during readback: $unit"
     pid=$(systemctl show "$unit" --property=MainPID --value)
     [[ $pid =~ ^[1-9][0-9]*$ ]] || die "production unit has no main PID: $unit"
-    exe=$(readlink -f -- "$ROOT/proc/$pid/exe" 2>/dev/null || true)
-    [[ $exe == "$target" ]] || die "production process identity differs: $unit"
+    exe=$(readlink -f -- "$(monday_root_join "$ROOT" "proc/$pid/exe")") || die "production process executable is unavailable: $unit"
+    [[ $exe == "$target" && $(monday_sha256_file "$exe") == "$payload" ]] \
+      || die "production process identity differs: $unit"
+    runtime_identity=$(jq -cn --argjson values "$runtime_identity" --arg market "$market" \
+      --argjson pid "$pid" --arg sha "$(monday_sha256_file "$exe")" --argjson restarts "$restarts" \
+      '$values + {($market):{main_pid:$pid,exe:$sha,n_restarts:$restarts}}')
+    env_file=$(monday_runtime_asset_target "$ROOT" "binance-lob-archiver-production-$market.env") || die "production env is invalid: $market"
+    spool=$(sed -n 's/^SPOOL_DIR=//p' "$env_file" | head -n1)
+    [[ -n $spool && $spool == /* ]] || die "production spool is invalid: $market"
+    [[ $ROOT == / ]] || spool="$ROOT$spool"
+    health="$spool/health.json"
+    [[ -f $health && ! -L $health ]] || die "production health is missing: $market"
+    session=$(jq -er '.session_id // empty' "$health") || die "production health session is missing: $market"
+    updated=$(jq -er '.updated_at_ns // 0' "$health")
+    [[ $updated =~ ^[0-9]+$ && $updated -ge $minimum_ns ]] || die "production health is stale: $market"
+    health_identity=$(jq -cn --argjson values "$health_identity" --arg market "$market" --arg session "$session" \
+      --argjson observed "$updated" '$values + {($market):{session_id:$session,observed_at_ns:$observed}}')
   done
-fi
+}
+capture_runtime_identity
+runtime_before=$runtime_identity; health_before=$health_identity
+assert_runtime_stable() {
+  local observed_active
+  observed_active=$(monday_active_controller_sha "$ROOT") || die 'active controller disappeared during OSS readback'
+  [[ $observed_active == "$CONTROLLER" ]] || die 'active controller changed during OSS readback'
+  [[ -L $production && $(readlink -- "$production") == "$production_projection" \
+    && $(readlink -f -- "$production") == "$target" ]] \
+    || die 'stable production projection changed during OSS readback'
+  capture_runtime_identity
+  [[ $runtime_identity == "$runtime_before" && $health_identity == "$health_before" ]] \
+    || die 'process or health identity changed during OSS readback'
+}
 
-status_root=${MONDAY_UPLOAD_STATUS_ROOT:-$ROOT/data/monday/spool/binance-lob}
+status_root=${MONDAY_UPLOAD_STATUS_ROOT:-$(monday_root_join "$ROOT" data/monday/spool/binance-lob)}
 if [[ -e $status_root || -L $status_root ]]; then
   monday_path_direct "$status_root" || die 'upload status root is indirect'
 fi
-tmp=$(mktemp -d "${ROOT%/}/tmp/monday-readback.XXXXXX" 2>/dev/null || mktemp -d)
+tmp=$(mktemp -d "$(monday_root_join "$ROOT" tmp)/monday-readback.XXXXXX" 2>/dev/null || mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 markets='[]'
+status_observations='{}'
 env_value() {
   local file=$1 key=$2 count value
   count=$(grep -c "^${key}=" "$file" || true)
@@ -160,22 +192,34 @@ minimum_success_at=$(jq -er '.completed_at' "$TRANSITION_RECEIPT") \
 for market in spot usdm; do
   status="$status_root/$market/upload-status.json"
   if [[ -f $status && ! -L $status ]]; then
-    env_file="$ROOT/etc/monday/binance-lob-archiver-production-$market.env"
+    jq -e '.last_error == null' "$status" >/dev/null \
+      || die "${market} upload status has a last_error"
+    env_file=$(monday_root_join "$ROOT" "etc/monday/binance-lob-archiver-production-$market.env")
     dataset=$(env_value "$env_file" DATASET) || die "${market} production dataset is invalid"
     bucket=$(env_value "$env_file" OSS_BUCKET) || die "${market} production bucket is invalid"
     shard=$(env_value "$env_file" SHARD_ID) || die "${market} production shard is invalid"
     prefix="lake/raw/venue=binance/market=$market/dataset=$dataset/shard=$shard"
+    assert_runtime_stable
     triplet_json=$(monday_verify_upload_triplet_readback "$status" "$market" "$dataset" \
       "$bucket" "$prefix" "$tmp" "$minimum_success_at" copy_oss) \
       || die "${market} independent OSS triplet readback failed"
+    assert_runtime_stable
     markets=$(jq -cn --argjson prior "$markets" --argjson triplet "$triplet_json" \
       '$prior + [$triplet]')
+    status_observations=$(jq -cn --argjson values "$status_observations" --arg market "$market" \
+      --arg success "$(jq -er '.last_success_at' "$status")" \
+      '$values + {($market):{last_success_at:$success,last_error:null}}')
   else
     [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 ]] || die "${market} upload status is missing"
   fi
 done
 
-out_root=${MONDAY_READBACK_ROOT:-$ROOT/data/monday/evidence/readbacks}
+# OSS reads are independent, and each triplet was bracketed by this same
+# active-pair/process check.  Keep one final sample in the receipt as well.
+assert_runtime_stable
+runtime_after=$runtime_identity; health_after=$health_identity
+
+out_root=${MONDAY_READBACK_ROOT:-$(monday_root_join "$ROOT" data/monday/evidence/readbacks)}
 if [[ ! -e $out_root && ! -L $out_root ]]; then mkdir -p "$out_root"; fi
 monday_path_direct "$out_root" || die 'readback evidence root is indirect'
 out="$out_root/$CONTROLLER"
@@ -185,12 +229,14 @@ jq -cn --arg schema monday.rust_lob_operation_readback.v2 \
   --arg controller "$CONTROLLER" --arg payload "$payload" \
   --arg receipt "$RECEIPT_SHA" --arg transition "$TRANSITION_RECEIPT" \
   --arg gate "$transition_gate" --arg gate_sha "$transition_gate_sha" \
-  --argjson markets "$markets" \
+  --argjson markets "$markets" --argjson processes "$runtime_after" --argjson health "$health_after" \
+  --argjson statuses "$status_observations" \
   '{schema:$schema,control_plane_version:2,controller_sha256:$controller,
     payload_sha256:$payload,transition_receipt:$transition,
     transition_receipt_sha256:$receipt,gate_receipt:$gate,gate_sha256:$gate_sha,
     production_link_verified:true,process_identity_verified:true,
     process_restarts_verified:true,installed_assets_verified:true,
+    process_identity:$processes,health:$health,upload_status:$statuses,
     oss_triplets:$markets,result:"success"}' >"$tmp_out"
 mv -f "$tmp_out" "$out"
 out_sha=$(monday_sha256_file "$out")

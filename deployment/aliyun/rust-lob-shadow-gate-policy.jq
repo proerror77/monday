@@ -60,9 +60,17 @@ and (if .test_only then true else
       and (.main_pid | type == "number" and . >= 1)
       and (.process_exe_sha256 | type == "string" and test("^[a-f0-9]{64}$"))))) end)
 and (.resource_admission | type == "array" and length >= 3
+  and ((["preflight","shadow-spot","strict-verifier-spot","upload-drain-spot","shadow-usdm","strict-verifier-usdm","upload-drain-usdm","oss-readback-spot","oss-readback-usdm"]
+    - (map(.phase) | unique)) | length == 0)
   and all(.[]; . as $r
     | (.phase | type == "string" and length > 0)
+    and (.started_at | type == "string" and length > 0)
+    and (.ended_at | type == "string" and length > 0)
+    and (.samples | type == "number" and . >= 1)
     and (.host_memory_available_bytes | type == "number" and . >= 0)
+    and (.max_memory_available_bytes | type == "number" and . >= 0)
+    and (.current_memory_available_bytes | type == "number" and . >= 0)
+    and (.breach | type == "boolean" and . == false)
     and ($r.required_bytes | type == "number" and . > 0 and . <= $r.host_memory_available_bytes)
     and (.phase_memory_max_bytes | type == "number" and . > 0)))
 and (.io_full_psi_windows | type == "array" and length >= 3
@@ -81,11 +89,17 @@ and (.shadow_staging | type == "object"
   and (.restored_assets | type == "object" and (keys | sort) == $shadow_asset_keys
     and all(.[]; ((.state == "present"
       and (.sha256 | type == "string" and test("^[a-f0-9]{64}$")))
-      or (.state == "absent" and .sha256 == null))))
+      or (.state == "absent" and .sha256 == null)
+      or (.state == "projection"
+        and (.target | type == "string" and length > 0)
+        and (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))))))
   and (.before_assets | type == "object" and (keys | sort) == $shadow_asset_keys
     and all(.[]; ((.state == "present"
       and (.sha256 | type == "string" and test("^[a-f0-9]{64}$")))
-      or (.state == "absent" and .sha256 == null))))
+      or (.state == "absent" and .sha256 == null)
+      or (.state == "projection"
+        and (.target | type == "string" and length > 0)
+        and (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))))))
   and .restored_assets == .before_assets
   and (.binary | type == "object"
     and (.path | type == "string" and length > 0)

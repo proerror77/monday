@@ -61,6 +61,10 @@ CANDIDATE_CONTROLLER=$(printf '%s' "$CANDIDATE_CONTROLLER" | tr '[:upper:]' '[:l
 TEST_ONLY=false; [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 ]] && TEST_ONLY=true
 [[ $TEST_ONLY == false || $ROOT != / ]] || die 'test mode requires an isolated fixture root'
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck disable=SC1090,SC1091
+. "$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
+
 GATE_DURATION_SECONDS=$REQUIRED_DURATION_SECONDS
 HEALTH_SETTLE_DURATION_SECONDS=$HEALTH_SETTLE_SECONDS
 resolve_test_duration() {
@@ -80,20 +84,17 @@ resolve_test_duration() {
 }
 resolve_test_duration
 
-OPT_ROOT="$ROOT/opt/monday"; RELEASE_ROOT="$OPT_ROOT/releases/binance-lob-archiver"
+OPT_ROOT=$(monday_root_join "$ROOT" opt/monday); RELEASE_ROOT="$OPT_ROOT/releases/binance-lob-archiver"
 CONTROLLER_ROOT="$OPT_ROOT/releases/binance-lob-controller"; BIN_ROOT="$OPT_ROOT/bin"
-SYSTEMD_ROOT="$ROOT/etc/systemd/system"; CONFIG_ROOT="$ROOT/etc/monday"
-LOCK_FILE="$ROOT/run/lock/monday-rust-lob-control-plane.lock"
-OVERRIDE_ROOT="$ROOT/run/monday"
-DATA_ROOT="$ROOT/data/monday"; EVIDENCE_ROOT=${MONDAY_GATE_EVIDENCE_ROOT:-$DATA_ROOT/evidence/shadow-gates}
-RUN_SPOOL_ROOT="$DATA_ROOT/spool/binance-lob-rust-shadow/runs"; PROC_ROOT="$ROOT/proc"
+SYSTEMD_ROOT=$(monday_root_join "$ROOT" etc/systemd/system); CONFIG_ROOT=$(monday_root_join "$ROOT" etc/monday)
+LOCK_FILE=$(monday_root_join "$ROOT" run/lock/monday-rust-lob-control-plane.lock)
+OVERRIDE_ROOT=$(monday_root_join "$ROOT" run/monday)
+DATA_ROOT=$(monday_root_join "$ROOT" data/monday); EVIDENCE_ROOT=${MONDAY_GATE_EVIDENCE_ROOT:-$DATA_ROOT/evidence/shadow-gates}
+RUN_SPOOL_ROOT="$DATA_ROOT/spool/binance-lob-rust-shadow/runs"; PROC_ROOT=$(monday_root_join "$ROOT" proc)
 PSI_SOURCE="$PROC_ROOT/pressure/io"; SHADOW_BINARY="$BIN_ROOT/binance-lob-archiver-shadow"
 PRODUCTION_BINARY="$BIN_ROOT/binance-lob-archiver"
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 LIB_SOURCE="$SCRIPT_DIR/rust-lob-control-plane-lib.sh"; POLICY_SOURCE="$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq"
 [[ -f $LIB_SOURCE && -f $POLICY_SOURCE ]] || die 'V2 control-plane assets are missing'
-# shellcheck disable=SC1090
-. "$LIB_SOURCE"
 
 # Hold the release lock before reading candidate, active, or production
 # identities.  The fixture skips flock but still exercises the same ordering.
@@ -112,7 +113,7 @@ if [[ $TEST_ONLY != true ]]; then
   for command in aliyun flock id mountpoint runuser systemctl systemd-run; do
     command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
   done
-  mountpoint -q "$ROOT/data" || die 'data filesystem must be a mount point'
+  mountpoint -q "$(monday_root_join "$ROOT" data)" || die 'data filesystem must be a mount point'
   [[ -r "$PROC_ROOT/uptime" && -r $PSI_SOURCE ]] || die 'proc timing/PSI sources are unavailable'
   id "$SERVICE_USER" >/dev/null 2>&1 || die "missing service user: $SERVICE_USER"
 fi
@@ -271,12 +272,21 @@ fi
 production_asset_json='{}'
 for asset in "${PRODUCTION_ASSETS[@]}"; do
   if [[ $asset == *.service ]]; then production_target="$SYSTEMD_ROOT/$asset"; else production_target="$CONFIG_ROOT/$asset"; fi
-  regular_file "$production_target" || die "installed production asset is missing: $production_target"
-  cmp -s "$before_deployment/$asset" "$production_target" || die "installed production asset differs from before controller: $asset"
-  production_asset_json=$(jq -cn --argjson values "$production_asset_json" --arg asset "$asset" --arg sha "$(sha256_file "$production_target")" '$values + {($asset):$sha}')
+  if [[ -L $production_target ]]; then
+    [[ $(readlink -- "$production_target") == "$CONTROLLER_ROOT/active/deployment/$asset" ]] \
+      || die "installed production asset is not the stable projection: $asset"
+    production_resolved=$(readlink -f -- "$production_target") \
+      || die "installed production asset projection is dangling: $asset"
+  else
+    production_resolved=$production_target
+  fi
+  regular_file "$production_resolved" || die "installed production asset is missing: $production_target"
+  cmp -s "$before_deployment/$asset" "$production_resolved" \
+    || die "installed production asset differs from before controller: $asset"
+  production_asset_json=$(jq -cn --argjson values "$production_asset_json" --arg asset "$asset" --arg sha "$(sha256_file "$production_resolved")" '$values + {($asset):$sha}')
 done
 
-declare -A installed_asset asset_kind saved_state saved_sha
+declare -A installed_asset asset_kind saved_state saved_sha saved_target
 declare -A candidate_asset_sha restored_asset_sha
 tmp_dir=$(mktemp -d); restore_dir="$tmp_dir/restore"; mkdir -p "$restore_dir/systemd" "$restore_dir/monday"
 for asset in "${SHADOW_ASSETS[@]}"; do
@@ -285,7 +295,12 @@ for asset in "${SHADOW_ASSETS[@]}"; do
   if regular_file "${installed_asset[$asset]}"; then
     saved_state[$asset]=present; cp -p -- "${installed_asset[$asset]}" "$restore_dir/${asset_kind[$asset]}/$asset"; saved_sha[$asset]=$(sha256_file "${installed_asset[$asset]}")
   elif [[ -L ${installed_asset[$asset]} ]]; then
-    die "shadow asset path is a symlink: ${installed_asset[$asset]}"
+    saved_target[$asset]=$(readlink -- "${installed_asset[$asset]}") || die "shadow projection is unreadable: $asset"
+    [[ ${saved_target[$asset]} == "$CONTROLLER_ROOT/active/deployment/$asset" ]] \
+      || die "shadow asset path is not the stable projection: $asset"
+    saved_resolved=$(readlink -f -- "${installed_asset[$asset]}") || die "shadow projection is dangling: $asset"
+    regular_file "$saved_resolved" || die "shadow projection target is not a file: $asset"
+    saved_state[$asset]=projection; saved_sha[$asset]=$(sha256_file "$saved_resolved")
   else saved_state[$asset]=absent; saved_sha[$asset]=; fi
 done
 old_shadow_target=; old_shadow_target_sha256=; old_shadow_present=false
@@ -299,7 +314,14 @@ fi
 
 install_shadow_assets() {
   local deployment=$1 asset target
-  for asset in "${SHADOW_ASSETS[@]}"; do target="${installed_asset[$asset]}"; [[ ! -L $target ]] || die "shadow asset path became a symlink: $target"; install -d -m 0755 "$(dirname -- "$target")"
+  for asset in "${SHADOW_ASSETS[@]}"; do
+    target="${installed_asset[$asset]}"
+    if [[ -L $target ]]; then
+      [[ $(readlink -- "$target") == "$CONTROLLER_ROOT/active/deployment/$asset" ]] \
+        || die "shadow asset path is not the stable projection: $target"
+    fi
+    install -d -m 0755 "$(dirname -- "$target")"
+    rm -f -- "$target"
     install -m 0640 "$deployment/$asset" "$target"; cmp -s "$deployment/$asset" "$target" || die "staged shadow asset differs: $asset"
     candidate_asset_sha[$asset]=$(sha256_file "$target")
   done
@@ -308,10 +330,16 @@ install_shadow_assets() {
 restore_shadow_assets() {
   local asset target
   for asset in "${SHADOW_ASSETS[@]}"; do target="${installed_asset[$asset]}"
-    [[ ! -L $target ]] || return 1
+    rm -f -- "$target"
     if [[ ${saved_state[$asset]} == present ]]; then install -m 0640 "$restore_dir/${asset_kind[$asset]}/$asset" "$target"; [[ $(sha256_file "$target") == "${saved_sha[$asset]}" ]] || return 1
       restored_asset_sha[$asset]=$(sha256_file "$target")
-    else rm -f -- "$target"; [[ ! -e $target && ! -L $target ]] || return 1; fi
+    elif [[ ${saved_state[$asset]} == projection ]]; then
+      ln -s "${saved_target[$asset]}" "$target"
+      restored_resolved=$(readlink -f -- "$target") || return 1
+      regular_file "$restored_resolved" || return 1
+      [[ $(sha256_file "$restored_resolved") == "${saved_sha[$asset]}" ]] || return 1
+      restored_asset_sha[$asset]="${saved_sha[$asset]}"
+    else [[ ! -e $target && ! -L $target ]] || return 1; fi
   done
   [[ $TEST_ONLY == true ]] || systemctl daemon-reload
 }
@@ -373,13 +401,88 @@ if [[ $TEST_ONLY != true ]]; then
   production_memory_json=$(jq -cn --arg spot "${production_state[spot]}" --arg usdm "${production_state[usdm]}" '{spot:{active_state:$spot},usdm:{active_state:$usdm}}')
 else production_growth[spot]=0; production_growth[usdm]=0; production_process_json='{}'; fi
 
-resource_samples='[]'; psi_windows='[]'
+resource_samples='[]'; psi_windows='[]'; resource_monitor_pid=; resource_monitor_control=; resource_monitor_log=; resource_monitor_phase=
+declare -A resource_phase_required resource_phase_limit
 record_resource() {
-  local phase=$1 phase_max=$2 required sample
+  local phase=$1 phase_max=$2 required sample now
   host_memory_available=$(meminfo_bytes MemAvailable) || die 'MemAvailable became unavailable during Gate'
   required=$(monday_shadow_memory_admission "$host_memory_available" "$HOST_MEMORY_RESERVE_BYTES" "$phase_max" "${production_growth[spot]}" "${production_growth[usdm]}") || die "insufficient memory for $phase"
-  sample=$(jq -cn --arg phase "$phase" --argjson available "$host_memory_available" --argjson required "$required" --argjson phase_max "$phase_max" '{phase:$phase,host_memory_available_bytes:$available,required_bytes:$required,phase_memory_max_bytes:$phase_max}')
+  resource_phase_required[$phase]=$required
+  resource_phase_limit[$phase]=$phase_max
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  sample=$(jq -cn --arg phase "$phase" --argjson available "$host_memory_available" --argjson required "$required" --argjson phase_max "$phase_max" --arg now "$now" \
+    '{phase:$phase,started_at:$now,ended_at:$now,samples:1,host_memory_available_bytes:$available,max_memory_available_bytes:$available,current_memory_available_bytes:$available,breach:false,required_bytes:$required,phase_memory_max_bytes:$phase_max}')
   resource_samples=$(jq -cn --argjson values "$resource_samples" --argjson value "$sample" '$values + [$value]')
+}
+resource_monitor_start() {
+  local phase=$1 phase_max=$2 initial_available initial_psi
+  resource_monitor_phase=$phase
+  record_resource "$phase" "$phase_max"
+  [[ $TEST_ONLY == true ]] && return 0
+  resource_monitor_control="$tmp_dir/resource-monitor-$phase.running"
+  resource_monitor_log="$tmp_dir/resource-monitor-$phase.tsv"
+  : >"$resource_monitor_control"; : >"$resource_monitor_log"
+  initial_available=$(meminfo_bytes MemAvailable) || die 'MemAvailable became unavailable during Gate'
+  initial_psi=$(io_total_us 2>/dev/null || printf 0)
+  printf '%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$initial_available" "$initial_psi" >"$resource_monitor_log"
+  local parent_pid=$$
+  (
+    local previous_psi=$initial_psi available current_psi consecutive_hits=0 delta
+    while [[ -e $resource_monitor_control ]]; do
+      available=$(meminfo_bytes MemAvailable 2>/dev/null || printf 0)
+      current_psi=$(io_total_us 2>/dev/null || printf 0)
+      printf '%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$available" "$current_psi" >>"$resource_monitor_log"
+      if (( available < HOST_MEMORY_RESERVE_BYTES )); then
+        printf 'memory-breach\n' >"$tmp_dir/resource-monitor-breach"
+        kill -TERM "$parent_pid" 2>/dev/null || true
+        break
+      fi
+      if (( current_psi < previous_psi )); then
+        printf 'psi-regressed\n' >"$tmp_dir/resource-monitor-breach"
+        kill -TERM "$parent_pid" 2>/dev/null || true
+        break
+      fi
+      delta=$((current_psi - previous_psi))
+      if (( delta * 3 >= IO_PSI_FULL_DELTA_LIMIT_US )); then
+        consecutive_hits=$((consecutive_hits + 1))
+      else
+        consecutive_hits=0
+      fi
+      if (( consecutive_hits >= IO_PSI_CONSECUTIVE_HIT_LIMIT )); then
+        printf 'psi-stop-rule\n' >"$tmp_dir/resource-monitor-breach"
+        kill -TERM "$parent_pid" 2>/dev/null || true
+        break
+      fi
+      previous_psi=$current_psi
+      sleep 5
+    done
+  ) &
+  resource_monitor_pid=$!
+}
+resource_monitor_stop() {
+  local phase=$resource_monitor_phase started ended samples max_available current_available breach required phase_max
+  [[ -n ${resource_monitor_pid:-} ]] || return 0
+  if [[ $TEST_ONLY == true ]]; then
+    resource_monitor_pid=; resource_monitor_phase=; return 0
+  fi
+  rm -f -- "$resource_monitor_control"
+  wait "$resource_monitor_pid" 2>/dev/null || true
+  started=$(head -n1 "$resource_monitor_log" | cut -f1)
+  ended=$(tail -n1 "$resource_monitor_log" | cut -f1)
+  samples=$(wc -l <"$resource_monitor_log" | tr -d ' ')
+  max_available=$(awk -F '\t' 'BEGIN{m=0} $2>m{m=$2} END{print m+0}' "$resource_monitor_log")
+  current_available=$(tail -n1 "$resource_monitor_log" | cut -f2)
+  required=${resource_phase_required[$phase]:-1}
+  phase_max=${resource_phase_limit[$phase]:-1}
+  breach=false; [[ -f $tmp_dir/resource-monitor-breach ]] && breach=true
+  [[ $breach == false ]] || die "resource monitor breached during $phase"
+  resource_samples=$(jq -cn --argjson values "$resource_samples" --arg phase "$phase" --arg started "$started" --arg ended "$ended" \
+    --argjson samples "${samples:-0}" --argjson max "${max_available:-0}" --argjson current "${current_available:-0}" \
+    --argjson required "${required:-1}" --argjson phase_max "${phase_max:-1}" \
+    '{phase:$phase,started_at:$started,ended_at:$ended,samples:$samples,host_memory_available_bytes:$current,max_memory_available_bytes:$max,current_memory_available_bytes:$current,breach:false,required_bytes:$required,phase_memory_max_bytes:$phase_max}' \
+    | jq -s --argjson prior "$resource_samples" '($prior + .)')
+  unset "resource_phase_required[$phase]" "resource_phase_limit[$phase]"
+  resource_monitor_pid=; resource_monitor_phase=
 }
 calibrate_psi() {
   local phase=$1 previous current transition delta ratio hit consecutive=0 i
@@ -422,6 +525,7 @@ write_run_json() {
 }
 cleanup() {
   local status=$? restore_failed=false; set +e
+  resource_monitor_stop >/dev/null 2>&1 || restore_failed=true
   for market in "${markets[@]}"; do systemctl stop "${unit[$market]}" >/dev/null 2>&1 || true; done
   for market in "${markets[@]}"; do rm -f -- "${override_file[$market]}"; done
   if [[ $staging_started == true ]]; then restore_shadow_assets || restore_failed=true; fi
@@ -431,11 +535,21 @@ cleanup() {
 }
 trap cleanup EXIT; trap 'exit 143' HUP INT TERM
 
-record_resource preflight "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; calibrate_psi preflight; write_run_json
+resource_monitor_start preflight "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; calibrate_psi preflight; resource_monitor_stop; write_run_json
 if [[ $FROM_CONTROLLER != direct ]]; then
-  for asset in "${SHADOW_ASSETS[@]}"; do [[ ${saved_state[$asset]} == present ]] || die "before shadow asset is absent: $asset"; cmp -s "$before_deployment/$asset" "${installed_asset[$asset]}" || die "installed shadow asset differs from before controller: $asset"; done
+  for asset in "${SHADOW_ASSETS[@]}"; do
+    [[ ${saved_state[$asset]} == present || ${saved_state[$asset]} == projection ]] || die "before shadow asset is absent: $asset"
+    shadow_resolved=${installed_asset[$asset]}
+    [[ ${saved_state[$asset]} == projection ]] && shadow_resolved=$(readlink -f -- "$shadow_resolved")
+    cmp -s "$before_deployment/$asset" "$shadow_resolved" || die "installed shadow asset differs from before controller: $asset"
+  done
 else
-  for asset in "${SHADOW_ASSETS[@]}"; do if [[ ${saved_state[$asset]} == present ]]; then cmp -s "$candidate_deployment/$asset" "${installed_asset[$asset]}" || die "direct bootstrap installed shadow asset differs: $asset"; fi; done
+  for asset in "${SHADOW_ASSETS[@]}"; do
+    [[ ${saved_state[$asset]} == present || ${saved_state[$asset]} == projection ]] || die "direct bootstrap shadow asset is absent: $asset"
+    shadow_resolved=${installed_asset[$asset]}
+    [[ ${saved_state[$asset]} == projection ]] && shadow_resolved=$(readlink -f -- "$shadow_resolved")
+    cmp -s "$candidate_deployment/$asset" "$shadow_resolved" || die "direct bootstrap installed shadow asset differs: $asset"
+  done
 fi
 for market in "${markets[@]}"; do systemctl stop "${unit[$market]}" >/dev/null 2>&1 || true; done
 staging_started=true
@@ -603,7 +717,7 @@ verify_segments() {
 }
 run_market_gate_phase() {
   local market=$1 settle observation pid started_ns
-  record_resource "shadow-$market" 2147483648; calibrate_psi "shadow-$market"; fixture_seed_market "$market"; mkdir -p "$OVERRIDE_ROOT"; printf 'SPOOL_DIR=%s\nSEGMENT_SECONDS=%s\n' "${spool_dir[$market]}" "$GATE_SEGMENT_SECONDS" >"${override_file[$market]}"; chmod 0640 "${override_file[$market]}"; systemctl reset-failed "${unit[$market]}" >/dev/null 2>&1 || true
+  resource_monitor_start "shadow-$market" 2147483648; calibrate_psi "shadow-$market"; fixture_seed_market "$market"; mkdir -p "$OVERRIDE_ROOT"; printf 'SPOOL_DIR=%s\nSEGMENT_SECONDS=%s\n' "${spool_dir[$market]}" "$GATE_SEGMENT_SECONDS" >"${override_file[$market]}"; chmod 0640 "${override_file[$market]}"; systemctl reset-failed "${unit[$market]}" >/dev/null 2>&1 || true
   started_ns=$(date +%s%N); market_gate_started_ns[$market]=$started_ns
   systemctl start "${unit[$market]}"; systemctl_active "${unit[$market]}" || die "$market shadow did not start"; [[ $(systemctl_value "$market" NRestarts) == 0 ]] || die "$market shadow restarted"; pid=$(systemctl_value "$market" MainPID); [[ $pid =~ ^[1-9][0-9]*$ ]] || die "$market MainPID unavailable"; phase_pid["$market"]=$pid; phase_exe_sha["$market"]=$candidate_payload
   if [[ $TEST_ONLY != true ]]; then
@@ -619,9 +733,9 @@ run_market_gate_phase() {
     '{sha256:$sha,session_id:$session,frozen_symbol_count:$symbols,
       frozen_catalog_sha256:$catalog,max_health_silence_seconds:$silence,samples:$samples}')
   observation=$(( $(monotonic_seconds) + GATE_DURATION_SECONDS )); while (( $(monotonic_seconds) < observation )); do validate_observation_sample "$market"; assert_host_memory_reserve; [[ $(systemctl_value "$market" NRestarts) == 0 ]] || die "$market restarted"; [[ $(systemctl_value "$market" MainPID) == "$pid" ]] || die "$market MainPID changed"; [[ $TEST_ONLY == true ]] && break; sleep 15; done
-  phase_runtime["$market"]=$GATE_DURATION_SECONDS; systemctl stop "${unit[$market]}"; systemctl_active "${unit[$market]}" && die "$market shadow remained active"; verify_segments "$market"; calibrate_psi "shadow-$market-tail"
+  phase_runtime["$market"]=$GATE_DURATION_SECONDS; systemctl stop "${unit[$market]}"; systemctl_active "${unit[$market]}" && die "$market shadow remained active"; resource_monitor_stop; resource_monitor_start "strict-verifier-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; verify_segments "$market"; resource_monitor_stop; calibrate_psi "shadow-$market-tail"
 }
-run_candidate_drain() { local market=$1; [[ $TEST_ONLY == true ]] && return 0; systemd-run --quiet --wait --collect --unit="monday-rust-upload-drain-$$-$market.service" --property=MemoryMax="$((UPLOAD_DRAIN_MEMORY_MAX_BYTES / 1048576))M" --property=MemoryHigh=384M --uid="$SERVICE_USER" -- "$candidate_binary" --upload-only; }
+run_candidate_drain() { local market=$1; resource_monitor_start "upload-drain-$market" "$UPLOAD_DRAIN_MEMORY_MAX_BYTES"; if [[ $TEST_ONLY == true ]]; then resource_monitor_stop; return 0; fi; systemd-run --quiet --wait --collect --unit="monday-rust-upload-drain-$$-$market.service" --property=MemoryMax="$((UPLOAD_DRAIN_MEMORY_MAX_BYTES / 1048576))M" --property=MemoryHigh=384M --uid="$SERVICE_USER" -- "$candidate_binary" --upload-only; resource_monitor_stop; }
 assert_spool_drained() {
   local market=$1 remaining
   remaining=$(find "${spool_dir[$market]}" \( -type f -o -type l \) \( \
@@ -644,6 +758,7 @@ run_oss() {
 verify_oss_roundtrips() {
   local market=$1 readback="$tmp_dir/oss-$1" listing="$tmp_dir/oss-$1.list" uri manifest final_manifest data success expected_success file digest manifest_digest success_digest line token replay_safe triplet_json observed_at
   local candidates_file unsafe_file
+  resource_monitor_start "oss-readback-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"
   local start end previous_end=0 count=0; local -a roundtrip_records=(); mkdir -p "$readback"
   phase_triplets_json[$market]='[]'
   candidates_file="$readback/replay-safe.tsv"; unsafe_file="$readback/replay-unsafe.tsv"
@@ -734,6 +849,7 @@ verify_oss_roundtrips() {
     verify_raw_trade_continuity "${roundtrip_records[@]}" || die "$market OSS strict raw-trade continuity verifier failed"
   fi
   phase_oss[$market]=$count
+  resource_monitor_stop
 }
 
 for market in "${markets[@]}"; do run_market_gate_phase "$market"; run_candidate_drain "$market"; assert_spool_drained "$market"; done
@@ -764,13 +880,15 @@ before_assets_json='{}'; staged_assets_json='{}'; restored_assets_json='{}'
 for asset in "${SHADOW_ASSETS[@]}"; do
   before_assets_json=$(jq -cn --argjson values "$before_assets_json" --arg asset "$asset" \
     --arg state "${saved_state[$asset]}" --arg sha "${saved_sha[$asset]:-}" \
-    '$values + {($asset):{state:$state,sha256:(if $sha == "" then null else $sha end)}}')
+    --arg target "${saved_target[$asset]:-}" \
+    '$values + {($asset):{state:$state,sha256:(if $sha == "" then null else $sha end),target:(if $state == "projection" then $target else null end)}}')
   staged_assets_json=$(jq -cn --argjson values "$staged_assets_json" --arg asset "$asset" \
     --arg sha "${candidate_asset_sha[$asset]:-}" \
     '$values + {($asset):$sha}')
   restored_assets_json=$(jq -cn --argjson values "$restored_assets_json" --arg asset "$asset" \
     --arg state "${saved_state[$asset]}" --arg sha "${restored_asset_sha[$asset]:-}" \
-    '$values + {($asset):{state:$state,sha256:(if $sha == "" then null else $sha end)}}')
+    --arg target "${saved_target[$asset]:-}" \
+    '$values + {($asset):{state:$state,sha256:(if $sha == "" then null else $sha end),target:(if $state == "projection" then $target else null end)}}')
 done
 markets_json='{}'
 for market in "${markets[@]}"; do

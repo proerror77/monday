@@ -7,20 +7,28 @@ usage() {
   printf 'Usage: %s <isolate|drain> <spot|usdm>\n' "${0##*/}" >&2
 }
 
+root_join() {
+  local root=${1:-/} suffix=${2#/}
+  root=${root%/}
+  [[ -n $root ]] || root=/
+  if [[ $root == / ]]; then printf '/%s\n' "$suffix"; else printf '%s/%s\n' "$root" "$suffix"; fi
+}
+
 configure_paths() {
   local root=${1:-/}
   root=${root%/}
+  [[ -n $root ]] || root=/
   ROOT_PREFIX="$root"
-  OPT_ROOT="$root/opt/monday"
+  OPT_ROOT=$(root_join "$root" opt/monday)
   BIN_DIR="$OPT_ROOT/bin"
   RELEASE_ROOT="$OPT_ROOT/releases/binance-lob-archiver"
   CONTROLLER_RELEASE_ROOT="$OPT_ROOT/releases/binance-lob-controller"
   ACTIVE_CONTROLLER="$CONTROLLER_RELEASE_ROOT/active"
   PRODUCTION_LINK="$BIN_DIR/binance-lob-archiver"
   INSTALLED_RECOVERY="$BIN_DIR/monday-rust-lob-recovery-queue"
-  CONFIG_ROOT="$root/etc/monday"
-  DATA_ROOT="$root/data"
-  LOCK_ROOT="$root/run/lock"
+  CONFIG_ROOT=$(root_join "$root" etc/monday)
+  DATA_ROOT=$(root_join "$root" data)
+  LOCK_ROOT=$(root_join "$root" run/lock)
   CANONICAL_ROOT="$DATA_ROOT/monday/spool/binance-lob"
   QUEUE_ROOT="$DATA_ROOT/monday/spool/binance-lob-recovery"
   EVIDENCE_ROOT="$DATA_ROOT/monday/evidence/recoveries/lob-queue"
@@ -156,12 +164,12 @@ load_allowlisted_env_args() {
 canonical_paths_safe() {
   local path
   for path in \
-    "${ROOT_PREFIX:-/}" \
-    "$ROOT_PREFIX/opt" \
+    "$ROOT_PREFIX" \
+    "$(root_join "$ROOT_PREFIX" opt)" \
     "$OPT_ROOT" \
-    "$ROOT_PREFIX/opt/monday/releases" \
+    "$(root_join "$ROOT_PREFIX" opt/monday/releases)" \
     "$CONTROLLER_RELEASE_ROOT" \
-    "$ROOT_PREFIX/etc" \
+    "$(root_join "$ROOT_PREFIX" etc)" \
     "$CONFIG_ROOT" \
     "$DATA_ROOT" \
     "$DATA_ROOT/monday" \
@@ -171,7 +179,7 @@ canonical_paths_safe() {
     "$CANONICAL_ROOT" \
     "$QUEUE_ROOT" \
     "$EVIDENCE_ROOT" \
-    "$ROOT_PREFIX/run" \
+    "$(root_join "$ROOT_PREFIX" run)" \
     "$LOCK_ROOT"; do
     path_is_direct_or_absent "$path" \
       || fail "path contains a symlink: $path"
@@ -367,7 +375,7 @@ verify_upload_triplet_readback() {
   shard=$(env_value "$RELEASE_ENV_FILE" SHARD_ID) \
     || fail 'active recovery environment has no shard'
   prefix="lake/raw/venue=binance/market=$MARKET/dataset=$dataset/shard=$shard"
-  tmp=$(mktemp -d "${ROOT_PREFIX:-/}/tmp/monday-recovery-readback.XXXXXX") \
+  tmp=$(mktemp -d "$(root_join "$ROOT_PREFIX" tmp)/monday-recovery-readback.XXXXXX") \
     || fail 'could not create recovery readback temp directory'
   if ! triplet=$(monday_verify_upload_triplet_readback "$status" "$MARKET" "$dataset" \
       "$bucket" "$prefix" "$tmp" "$minimum_success_at" copy_active_oss); then
