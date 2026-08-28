@@ -15,8 +15,11 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
 readonly SAFE_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ALIYUN_BIN=$(command -v aliyun) || die 'aliyun CLI is unavailable'
-[[ $ALIYUN_BIN == /*/aliyun ]] || die 'aliyun CLI path is not trusted'
+ALIYUN_BIN=
+if [[ ${MONDAY_CONTROL_PLANE_DRY_RUN:-0} != 1 ]]; then
+  ALIYUN_BIN=$(command -v aliyun) || die 'aliyun CLI is unavailable'
+  [[ $ALIYUN_BIN == /*/aliyun ]] || die 'aliyun CLI path is not trusted'
+fi
 readonly REMOTE_ALIYUN_BIN=/usr/local/bin/aliyun
 
 instance='' artifact_uri='' artifact_sha='' source_revision=''
@@ -81,18 +84,44 @@ fixed_publisher="$SCRIPT_DIR/host-rust-lob-controller-release.sh"
 fixed_lib="$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
 fixed_publisher_sha=$(monday_sha256_file "$fixed_publisher")
 fixed_lib_sha=$(monday_sha256_file "$fixed_lib")
-command -v gzip >/dev/null 2>&1 || die 'gzip is required to transfer the fixed publisher'
-fixed_publisher_b64=$(gzip -c "$fixed_publisher" | base64 | tr -d '\n')
-fixed_lib_b64=$(gzip -c "$fixed_lib" | base64 | tr -d '\n')
 
+remote=$(cat <<EOF
+set -Eeuo pipefail
+tmp=\$(mktemp -d)
+trap 'rm -rf "\$tmp"' EXIT
+env -i HOME=/var/lib/hft-collector LC_ALL=C PATH='$SAFE_PATH' '$REMOTE_ALIYUN_BIN' ossutil cp '$bundle_uri' "\$tmp/deployment.tar" --profile ecs-role --endpoint oss-ap-northeast-1-internal.aliyuncs.com --region ap-northeast-1 --force
+printf '%s  %s\\n' '$bundle_sha' "\$tmp/deployment.tar" | sha256sum --check --strict
+# The fixed publisher and its library are immutable members of the
+# digest-checked deployment bundle. Fetching them from OSS keeps the Cloud
+# Assistant command small while preserving exact controller bytes.
+tar -xOf "\$tmp/deployment.tar" host-rust-lob-controller-release.sh >"\$tmp/fixed-publisher.sh"
+tar -xOf "\$tmp/deployment.tar" rust-lob-control-plane-lib.sh >"\$tmp/rust-lob-control-plane-lib.sh"
+printf '%s  %s\\n' '$fixed_publisher_sha' "\$tmp/fixed-publisher.sh" | sha256sum --check --strict
+printf '%s  %s\\n' '$fixed_lib_sha' "\$tmp/rust-lob-control-plane-lib.sh" | sha256sum --check --strict
+chmod 0555 "\$tmp/fixed-publisher.sh" "\$tmp/rust-lob-control-plane-lib.sh"
+env -i HOME=/var/lib/hft-collector LC_ALL=C PATH='$SAFE_PATH' '$REMOTE_ALIYUN_BIN' ossutil cp '$artifact_uri' "\$tmp/payload" --profile ecs-role --endpoint oss-ap-northeast-1-internal.aliyuncs.com --region ap-northeast-1 --force
+printf '%s  %s\\n' '$artifact_sha' "\$tmp/payload" | sha256sum --check --strict
+env -i HOME=/var/lib/hft-collector LC_ALL=C PATH='$SAFE_PATH' '$REMOTE_ALIYUN_BIN' ossutil cp '$manifest_uri' "\$tmp/release.json" --profile ecs-role --endpoint oss-ap-northeast-1-internal.aliyuncs.com --region ap-northeast-1 --force
+printf '%s  %s\\n' '$manifest_sha' "\$tmp/release.json" | sha256sum --check --strict
+mkdir "\$tmp/deployment"
+# The candidate archive is data only.  The publisher/verifier is the fixed
+# byte-checked copy extracted above; unverified candidate bytes are never run.
+env -i HOME=/root LC_ALL=C PATH='$SAFE_PATH' bash "\$tmp/fixed-publisher.sh" "\$tmp/payload" "\$tmp/deployment.tar" "\$tmp/release.json"
+EOF
+)
+command_content=$(printf '%s' "$remote" | base64 | tr -d '\n')
+command_bytes=$(LC_ALL=C printf '%s' "$command_content" | wc -c | tr -d '[:space:]')
+[[ $command_bytes =~ ^[0-9]+$ && $command_bytes -le 16384 ]] \
+  || die "Base64 Cloud Assistant command content exceeds 16 KiB: ${command_bytes:-unknown} bytes"
 if [[ ${MONDAY_CONTROL_PLANE_DRY_RUN:-0} == 1 ]]; then
   jq -cn --arg controller "$manifest_sha" --arg payload "$artifact_sha" \
     --arg bundle "$bundle_uri" --arg manifest "$manifest_uri" \
+    --argjson command_bytes "$command_bytes" \
     '{operation:"release",controller:$controller,payload:$payload,
-      bundle_uri:$bundle,manifest_uri:$manifest,production_changed:false}'
+      bundle_uri:$bundle,manifest_uri:$manifest,command_bytes:$command_bytes,
+      production_changed:false}'
   exit 0
 fi
-
 profile_args=()
 [[ -n $profile ]] && profile_args=(--profile "$profile")
 "$ALIYUN_BIN" ossutil cp "$bundle" "$bundle_uri" \
@@ -101,29 +130,6 @@ profile_args=()
 "$ALIYUN_BIN" ossutil cp "$manifest" "$manifest_uri" \
   --endpoint oss-ap-northeast-1.aliyuncs.com --region "$region" --force \
   "${profile_args[@]}"
-
-remote=$(cat <<EOF
-set -Eeuo pipefail
-tmp=\$(mktemp -d)
-trap 'rm -rf "\$tmp"' EXIT
-printf '%s' '$fixed_publisher_b64' | base64 --decode | gzip -d >"\$tmp/fixed-publisher.sh"
-printf '%s' '$fixed_lib_b64' | base64 --decode | gzip -d >"\$tmp/rust-lob-control-plane-lib.sh"
-printf '%s  %s\\n' '$fixed_publisher_sha' "\$tmp/fixed-publisher.sh" | sha256sum --check --strict
-printf '%s  %s\\n' '$fixed_lib_sha' "\$tmp/rust-lob-control-plane-lib.sh" | sha256sum --check --strict
-chmod 0555 "\$tmp/fixed-publisher.sh" "\$tmp/rust-lob-control-plane-lib.sh"
-env -i HOME=/var/lib/hft-collector LC_ALL=C PATH='$SAFE_PATH' '$REMOTE_ALIYUN_BIN' ossutil cp '$artifact_uri' "\$tmp/payload" --profile ecs-role --endpoint oss-ap-northeast-1-internal.aliyuncs.com --region ap-northeast-1 --force
-printf '%s  %s\\n' '$artifact_sha' "\$tmp/payload" | sha256sum --check --strict
-env -i HOME=/var/lib/hft-collector LC_ALL=C PATH='$SAFE_PATH' '$REMOTE_ALIYUN_BIN' ossutil cp '$bundle_uri' "\$tmp/deployment.tar" --profile ecs-role --endpoint oss-ap-northeast-1-internal.aliyuncs.com --region ap-northeast-1 --force
-printf '%s  %s\\n' '$bundle_sha' "\$tmp/deployment.tar" | sha256sum --check --strict
-env -i HOME=/var/lib/hft-collector LC_ALL=C PATH='$SAFE_PATH' '$REMOTE_ALIYUN_BIN' ossutil cp '$manifest_uri' "\$tmp/release.json" --profile ecs-role --endpoint oss-ap-northeast-1-internal.aliyuncs.com --region ap-northeast-1 --force
-printf '%s  %s\\n' '$manifest_sha' "\$tmp/release.json" | sha256sum --check --strict
-mkdir "\$tmp/deployment"
-# The candidate archive is data only.  The publisher/verifier is the fixed
-# byte-checked copy sent above; candidate helper/lib files are never run.
-env -i HOME=/root LC_ALL=C PATH='$SAFE_PATH' bash "\$tmp/fixed-publisher.sh" "\$tmp/payload" "\$tmp/deployment.tar" "\$tmp/release.json"
-EOF
-)
-command_content=$(printf '%s' "$remote" | base64 | tr -d '\n')
 run_json=$(aliyun ecs RunCommand --RegionId "$region" --InstanceId.1 "$instance" \
   --Type RunShellScript --ContentEncoding Base64 --CommandContent "$command_content" \
   --KeepCommand false --Name monday-rust-lob-controller-release --Timeout 1200 \
