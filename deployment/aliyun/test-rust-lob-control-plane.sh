@@ -7,7 +7,6 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 CUTOVER="$SCRIPT_DIR/host-rust-lob-cutover.sh"
 RESTORE="$SCRIPT_DIR/host-rust-lob-restore.sh"
 GATE="$SCRIPT_DIR/host-rust-lob-shadow-gate.sh"
-SOAK="$SCRIPT_DIR/host-rust-lob-shadow-soak.sh"
 INSTALL_RELEASE="$SCRIPT_DIR/deploy-rust-lob-release.sh"
 CONTROLLER_RELEASE="$SCRIPT_DIR/host-rust-lob-controller-release.sh"
 CONTROLLER_APPLY="$SCRIPT_DIR/host-rust-lob-controller-apply.sh"
@@ -26,9 +25,34 @@ PRODUCTION_USDM_ENV="$SCRIPT_DIR/binance-lob-archiver-production-usdm.env"
 LIB="$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
 # shellcheck disable=SC1090,SC1091
 . "$LIB"
-"$SCRIPT_DIR/test-rust-lob-shadow-soak.sh"
 "$SCRIPT_DIR/test-rust-lob-controller-release.sh"
 "$SCRIPT_DIR/test-rust-lob-controller-apply.sh"
+
+for removed_asset in \
+  host-rust-lob-shadow-preflight.sh \
+  host-rust-lob-shadow-soak.sh \
+  test-rust-lob-shadow-soak.sh; do
+  [[ ! -e $SCRIPT_DIR/$removed_asset ]] || {
+    printf 'removed standalone Shadow entry still exists: %s\n' "$removed_asset" >&2
+    exit 1
+  }
+done
+for removed_entry in \
+  host-rust-lob-shadow-preflight.sh \
+  host-rust-lob-shadow-soak.sh \
+  monday-rust-lob-shadow-preflight \
+  monday-rust-lob-shadow-soak; do
+  if grep -Fq "$removed_entry" "$INSTALL_RELEASE" "$SCRIPT_DIR/README.md"; then
+    printf 'removed standalone Shadow entry is still published: %s\n' "$removed_entry" >&2
+    exit 1
+  fi
+done
+grep -Fxq '  gate-preflight)' "$INVOKE"
+grep -Fxq '  gate)' "$INVOKE"
+[[ $(grep -Fc 'host_script=host-rust-lob-shadow-gate.sh' "$INVOKE") -eq 2 ]] || {
+  printf 'formal Gate actions do not share the single host Gate entry\n' >&2
+  exit 1
+}
 
 psi_tmp_dir=$(mktemp -d)
 trap 'rm -rf "$psi_tmp_dir"' EXIT
@@ -757,7 +781,6 @@ grep -Fq 'and .snapshot_only_symbols == []' "$GATE"
 grep -Fq 'and .stream_coverage_verified_count == .symbol_count' "$GATE"
 grep -Fq 'and .all_stream_coverage_verified == true' "$GATE"
 grep -Fq 'then (.symbols | keys | sort) == ($symbols_config | split(",") | sort)' "$GATE"
-grep -Fq 'then (.symbols | keys | sort) == ($symbols_config | split(",") | sort)' "$SOAK"
 grep -Fq 'configured_catalog_sha256:$configured_catalog_sha256' "$GATE"
 grep -Fq 'candidate shadow gate USD-M symbols differ from the deployment bundle' "$CUTOVER"
 grep -Fq 'candidate shadow gate USD-M symbols differ from the deployment bundle' "$RESTORE"
