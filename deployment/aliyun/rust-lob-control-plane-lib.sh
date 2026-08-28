@@ -122,6 +122,30 @@ monday_validate_lob_object_prefix() {
   (( 10#$hour_part <= 23 ))
 }
 
+# Validate one of the three objects in a LOB upload triplet.  The object must
+# be a direct child of the canonical date/hour partition; accepting a merely
+# prefixed URI would allow an extra nested object to be mistaken for the
+# producer's triplet.
+monday_validate_lob_object_uri() {
+  [[ $# -eq 5 ]] || return 2
+  local market=$1 dataset=$2 expected_bucket=$3 uri=$4 kind=$5
+  local relative name object_prefix
+  monday_validate_component "$expected_bucket" || return 1
+  [[ $uri == "oss://$expected_bucket/"* && $uri != *%* && $uri != *\\* ]] || return 1
+  relative=${uri#"oss://$expected_bucket/"}
+  [[ -n $relative && $relative != "$uri" && $relative != */ ]] || return 1
+  name=${relative##*/}
+  object_prefix=${relative%/$name}
+  [[ -n $object_prefix && $object_prefix != "$relative" ]] || return 1
+  monday_validate_lob_object_prefix "$market" "$dataset" "$object_prefix" || return 1
+  case "$kind" in
+    data) [[ $name =~ ^part-[0-9]+\.jsonl\.zst$ ]] ;;
+    manifest) [[ $name =~ ^part-[0-9]+\.jsonl\.zst\.manifest\.json$ ]] ;;
+    success) [[ $name =~ ^part-[0-9]+\.jsonl\.zst\._SUCCESS$ ]] ;;
+    *) return 2 ;;
+  esac
+}
+
 monday_path_direct_or_absent() {
   [[ $# -eq 1 ]] || return 2
   [[ ! -e $1 && ! -L $1 ]] || monday_path_direct "$1"
@@ -1218,6 +1242,7 @@ monday_validate_v2_gate() {
   [[ $# -eq 4 ]] || return 2
   local gate=$1 from=$2 candidate=$3 gate_sha=$4
   local controller_asset_keys production_asset_keys shadow_asset_keys observed_now_ns market observed_at observed_at_ns parsed_observed
+  local dataset expected_bucket expected_prefix data_uri manifest_uri success_uri data_prefix manifest_prefix success_prefix
   controller_asset_keys=$(monday_controller_assets | jq -Rsc 'split("\n") | map(select(length > 0)) | sort') || return 1
   production_asset_keys=$(printf '%s\n' \
     binance-lob-archiver-production@.service \
@@ -1420,7 +1445,9 @@ monday_validate_v2_gate() {
           and (.oss_region == "ap-northeast-1")
           and (.aliyun_profile == "ecs-role")
           and (.expected_oss_bucket | type == "string" and length > 0)
-          and (.expected_oss_prefix | type == "string" and length > 0)
+          and (.expected_oss_prefix | type == "string"
+            and . == ("lake/raw/venue=binance/market=" + $m.market
+              + "/dataset=" + $m.dataset + "/shard=all"))
           and (.observed_at_ns | type == "number" and floor == . and . >= 0)
           and ($m.segment_count | type == "number" and . >= 2 and . == ($m.segments | length))
           and ($m.oss_triplet_count | type == "number" and . >= 2 and . == ($m.triplets | length))
@@ -1436,7 +1463,7 @@ monday_validate_v2_gate() {
           else true end)
           and (.segments | type == "array" and length >= 2
             and all(.[];
-              (.file | type == "string" and test("^[A-Za-z0-9._-]+\\.jsonl\\.zst$"))
+              (.file | type == "string" and test("^part-[0-9]+\\.jsonl\\.zst$"))
               and (.path | type == "string" and length > 0)
               and (.data_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
               and (.manifest_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
@@ -1450,13 +1477,29 @@ monday_validate_v2_gate() {
             and all(.[];
               (.market | type == "string" and . == $m.market)
               and (.dataset | type == "string" and . == $m.dataset)
-              and (.data_uri | type == "string"
-                and startswith(("oss://" + $m.expected_oss_bucket + "/" + $m.expected_oss_prefix + "/"))
-                and test("^oss://[^/]+/.+\\.jsonl\\.zst$"))
+              and (.data_uri | type == "string")
               and (.manifest_uri | type == "string")
-              and (.manifest_uri == (.data_uri + ".manifest.json"))
               and (.success_uri | type == "string")
-              and (.success_uri == (.data_uri + "._SUCCESS"))
+              and (
+                .data_uri as $data_uri
+                | .manifest_uri as $manifest_uri
+                | .success_uri as $success_uri
+                | ($data_uri | capture("^oss://(?<bucket>[^/]+)/(?<prefix>.+)/(?<file>part-[0-9]+\\.jsonl\\.zst)$")) as $data
+                | ($manifest_uri | capture("^oss://(?<bucket>[^/]+)/(?<prefix>.+)/(?<file>part-[0-9]+\\.jsonl\\.zst\\.manifest\\.json)$")) as $manifest
+                | ($success_uri | capture("^oss://(?<bucket>[^/]+)/(?<prefix>.+)/(?<file>part-[0-9]+\\.jsonl\\.zst\\._SUCCESS)$")) as $success
+                | ($data.prefix | ltrimstr($m.expected_oss_prefix + "/")) as $partition
+                | ($partition | test("^date=[0-9]{4}-[0-9]{2}-[0-9]{2}/hour=(0[0-9]|1[0-9]|2[0-3])$"))
+                and ($data.bucket == $m.expected_oss_bucket)
+                and ($manifest.bucket == $m.expected_oss_bucket)
+                and ($success.bucket == $m.expected_oss_bucket)
+                and ($data.prefix | startswith($m.expected_oss_prefix + "/"))
+                and ($manifest.prefix == $data.prefix)
+                and ($success.prefix == $data.prefix)
+                and ($manifest.file == ($data.file + ".manifest.json"))
+                and ($success.file == ($data.file + "._SUCCESS"))
+                and ($manifest_uri == ($data_uri + ".manifest.json"))
+                and ($success_uri == ($data_uri + "._SUCCESS"))
+              )
               and (.data_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
               and (.manifest_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
               and (.success_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
@@ -1478,6 +1521,27 @@ monday_validate_v2_gate() {
             and (.samples | type == "number" and . >= 1)
             and .session_id == $m.session_id)))' \
     "$gate" >/dev/null || return 1
+  while IFS=$'\t' read -r market dataset expected_bucket expected_prefix data_uri manifest_uri success_uri; do
+    [[ $market == spot || $market == usdm ]] || return 1
+    monday_validate_oss_prefix "$market" "$dataset" "$expected_prefix" || return 1
+    monday_validate_lob_object_uri "$market" "$dataset" "$expected_bucket" "$data_uri" data || return 1
+    monday_validate_lob_object_uri "$market" "$dataset" "$expected_bucket" "$manifest_uri" manifest || return 1
+    monday_validate_lob_object_uri "$market" "$dataset" "$expected_bucket" "$success_uri" success || return 1
+    data_prefix=${data_uri#"oss://$expected_bucket/"}
+    data_prefix=${data_prefix%/*}
+    manifest_prefix=${manifest_uri#"oss://$expected_bucket/"}
+    manifest_prefix=${manifest_prefix%/*}
+    success_prefix=${success_uri#"oss://$expected_bucket/"}
+    success_prefix=${success_prefix%/*}
+    [[ $data_prefix == "$expected_prefix"/* \
+      && $manifest_prefix == "$data_prefix" \
+      && $success_prefix == "$data_prefix" \
+      && $manifest_uri == "$data_uri.manifest.json" \
+      && $success_uri == "$data_uri._SUCCESS" ]] || return 1
+  done < <(jq -r '.markets | to_entries[] | .value as $value
+    | $value.triplets[]
+    | [$value.market, $value.dataset, $value.expected_oss_bucket, $value.expected_oss_prefix,
+       .data_uri, .manifest_uri, .success_uri] | @tsv' "$gate")
   observed_now_ns=$(date +%s%N) || return 1
   [[ $observed_now_ns =~ ^[0-9]+$ ]] || return 1
   while IFS=$'\t' read -r market observed_at observed_at_ns market_observed_at_ns; do
@@ -1622,7 +1686,7 @@ monday_verify_upload_triplet_readback() {
   local tmp_root=$6 minimum_success_at=$7 copy_fn=$8 expected_session=${9:-}
   local minimum_capture_ns_arg=${10:-}
   local triplet data_uri manifest_uri success_uri status_session triplet_session
-  local data_sha manifest_sha success_sha object_prefix first_manifest second_manifest uploaded_at uploaded_ns
+  local data_sha manifest_sha success_sha failure_count object_prefix first_manifest second_manifest uploaded_at uploaded_ns
   local data_file manifest_file success_file expected_success_file expected_prefix_norm data_file_name
   local success_at success_ns start_ns end_ns minimum_success_ns minimum_capture_ns now_ns manifest_session
   monday_file_direct "$status" || return 1
@@ -1630,7 +1694,9 @@ monday_verify_upload_triplet_readback() {
     type == "object"
     and ((.last_error? // null) == null)
     and ((.last_error_at? // null) == null)
-    and (((.failure_count? // 0) | type == "number" and floor == . and . == 0))
+    and (if has("failure_count")
+         then (.failure_count | type == "number" and floor == . and . >= 0)
+         else true end)
     and (((.discovery_failed? // false) == false))
     and (((.pending? // false) as $pending
       | ($pending == false
@@ -1640,6 +1706,7 @@ monday_verify_upload_triplet_readback() {
     and (((.failed_batches? // []) | type == "array" and length == 0))
     and (((.failed_segments? // []) | type == "array" and length == 0))
   ' "$status" >/dev/null || return 1
+  failure_count=$(jq -er 'if has("failure_count") then .failure_count else 0 end' "$status") || return 1
   status_session=$(jq -er '.session_id // empty' "$status") || true
   if [[ -n $expected_session && -n $status_session ]]; then
     [[ $status_session == "$expected_session" ]] || return 1
@@ -1747,6 +1814,7 @@ monday_verify_upload_triplet_readback() {
   jq -cn --arg market "$market" --arg data_uri "$data_uri" --arg manifest_uri "$manifest_uri" \
     --arg success_uri "$success_uri" --arg data_sha "$data_sha" --arg manifest_sha "$manifest_sha" \
     --arg success_sha "$success_sha" --arg object_prefix "$object_prefix" \
+    --argjson failure_count "$failure_count" \
     --arg last_success_at "$(jq -er '.last_success_at' "$status")" \
     --arg session "$manifest_session" \
     --arg catalog "$(jq -er '.catalog_sha256 // ""' "$manifest_file")" \
@@ -1754,6 +1822,7 @@ monday_verify_upload_triplet_readback() {
     '{market:$market,data_uri:$data_uri,manifest_uri:$manifest_uri,success_uri:$success_uri,
       data_sha256:$data_sha,manifest_sha256:$manifest_sha,success_sha256:$success_sha,
       success_content:($data_sha + "\n"),object_prefix:$object_prefix,last_success_at:$last_success_at,
+      failure_count:$failure_count,
       start_received_at_ns:$start,end_received_at_ns:$end,
       session_id:$session,catalog_sha256:$catalog}'
 }

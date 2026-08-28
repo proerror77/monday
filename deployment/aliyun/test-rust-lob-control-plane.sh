@@ -600,6 +600,14 @@ if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_TAMPER_OSS=1 MONDAY_ROOT="$RO
 fi
 [[ $(monday_active_controller_sha "$ROOT") == "$active_before_failure" ]]
 [[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == "$production_before_failure" ]]
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_EXTRA_NESTED=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c1" \
+  --candidate-controller "$c2" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'Gate accepted a nested extra-date OSS object\n' >&2
+  exit 1
+fi
+[[ $(monday_active_controller_sha "$ROOT") == "$active_before_failure" ]]
+[[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == "$production_before_failure" ]]
 if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --resource-preflight "$c2" >/dev/null 2>&1; then
   printf 'Gate exposed a public preflight action\n' >&2
@@ -1164,6 +1172,24 @@ triplet_readback=$(monday_verify_upload_triplet_readback "$triplet_status" spot 
 historical_readback=$(monday_verify_upload_triplet_readback "$triplet_status" spot spot_all bucket "$triplet_prefix" \
   "$triplet_tmp" "$triplet_now" copy_triplet_fixture fixture-session 0)
 [[ $(jq -r '.session_id' <<<"$historical_readback") == fixture-session ]]
+# failure_count is a cumulative audit counter.  A healthy retry can carry a
+# non-zero historical count, while current error or pending fields still fail.
+retry_status="$triplet_root/upload-status.retry.json"
+jq '.failure_count = 7' "$triplet_status" >"$retry_status"
+retry_readback=$(monday_verify_upload_triplet_readback "$retry_status" spot spot_all bucket "$triplet_prefix" \
+  "$triplet_tmp" "$triplet_now" copy_triplet_fixture fixture-session 0)
+[[ $(jq -r '.failure_count' <<<"$retry_readback") == 7 ]]
+for retry_mutation in last_error pending_batches; do
+  case "$retry_mutation" in
+    last_error) jq '.last_error = "retry failed"' "$retry_status" >"$retry_status.$retry_mutation" ;;
+    pending_batches) jq '.pending_batches = 1' "$retry_status" >"$retry_status.$retry_mutation" ;;
+  esac
+  if monday_verify_upload_triplet_readback "$retry_status.$retry_mutation" spot spot_all bucket "$triplet_prefix" \
+      "$triplet_tmp" "$triplet_now" copy_triplet_fixture fixture-session 0 >/dev/null 2>&1; then
+    printf 'triplet readback accepted retry status with current %s\n' "$retry_mutation" >&2
+    exit 1
+  fi
+done
 if monday_verify_upload_triplet_readback "$triplet_status" spot spot_all bucket "$triplet_prefix" \
     "$triplet_tmp" "$triplet_now" copy_triplet_fixture fixture-session "$triplet_now_ns" >/dev/null 2>&1; then
   printf 'triplet readback ignored the minimum capture cutoff\n' >&2

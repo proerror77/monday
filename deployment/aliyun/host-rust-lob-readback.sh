@@ -388,7 +388,7 @@ minimum_commit_ns=$(jq -er '.completed_at_ns' "$TRANSITION_RECEIPT") \
 [[ $minimum_commit_ns =~ ^[0-9]+$ ]] || die 'transition completion nanosecond timestamp is invalid'
 [[ $(monday_iso_epoch_ns "$minimum_success_at") == "$minimum_commit_ns" ]] \
   || die 'transition completion timestamp does not match its nanosecond value'
-declare -A status_snapshot_path status_snapshot_sha status_dataset status_bucket status_prefix
+declare -A status_snapshot_path status_snapshot_sha status_dataset status_bucket status_prefix status_failure_count
 # Snapshot both upload-status files before any OSS verification.  The final
 # paired hash below is the only success point; a lane changing while the other
 # lane is read back therefore cannot be silently accepted.
@@ -404,6 +404,9 @@ for market in spot usdm; do
       || die "${market} upload status snapshot is indirect"
     status_snapshot_sha[$market]=$(monday_sha256_file "${status_snapshot_path[$market]}") \
       || die "${market} upload status snapshot hash failed"
+    status_failure_count[$market]=$(jq -er 'if has("failure_count") then .failure_count else 0 end' \
+      "${status_snapshot_path[$market]}") \
+      || die "${market} upload status failure_count is invalid"
     [[ $(monday_sha256_file "$status") == "${status_snapshot_sha[$market]}" ]] \
       || die "${market} upload status changed during snapshot"
     env_file=$(monday_root_join "$ROOT" "etc/monday/binance-lob-archiver-production-$market.env")
@@ -439,8 +442,9 @@ for market in spot usdm; do
       '$prior + [$triplet]')
     status_observations=$(jq -cn --argjson values "$status_observations" --arg market "$market" \
       --arg success "$(jq -er '.last_success_at' "${status_snapshot_path[$market]}")" \
+      --argjson failure_count "${status_failure_count[$market]}" \
       --arg session "$expected_session" --arg snapshot_sha "${status_snapshot_sha[$market]}" \
-      '$values + {($market):{last_success_at:$success,last_error:null,session_id:$session,snapshot_sha256:$snapshot_sha}}')
+      '$values + {($market):{last_success_at:$success,last_error:null,failure_count:$failure_count,session_id:$session,snapshot_sha256:$snapshot_sha}}')
   else
     [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 ]] || die "${market} upload status is missing"
   fi
@@ -459,6 +463,10 @@ for market in spot usdm; do
     monday_file_direct "$final_status" || die "${market} final upload status is indirect"
     [[ $(monday_sha256_file "$final_status") == "${status_snapshot_sha[$market]}" ]] \
       || die "${market} upload status changed during paired OSS readback"
+    final_failure_count=$(jq -er 'if has("failure_count") then .failure_count else 0 end' \
+      "$final_status") || die "${market} final upload status failure_count is invalid"
+    [[ $final_failure_count == "${status_failure_count[$market]}" ]] \
+      || die "${market} upload failure_count changed during paired OSS readback"
   fi
 done
 assert_runtime_stable

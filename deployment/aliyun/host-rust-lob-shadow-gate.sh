@@ -166,10 +166,16 @@ if [[ $TEST_ONLY == true ]]; then
     shift 2
     case "$action" in
       ls)
+        fixture_date=2026-08-28
+        fixture_hour=05
         for object in "${spool_dir[$OSS_FIXTURE_MARKET]}"/*.manifest.json; do
           [[ -f $object ]] || continue
-          printf 'oss://fixture/lake/raw/venue=binance/market=%s/dataset=%s/shard=all/%s\n' \
-            "$OSS_FIXTURE_MARKET" "${dataset[$OSS_FIXTURE_MARKET]}" "${object##*/}"
+          printf 'oss://fixture/lake/raw/venue=binance/market=%s/dataset=%s/shard=all/date=%s/hour=%s/%s\n' \
+            "$OSS_FIXTURE_MARKET" "${dataset[$OSS_FIXTURE_MARKET]}" "$fixture_date" "$fixture_hour" "${object##*/}"
+          if [[ ${MONDAY_GATE_FIXTURE_EXTRA_NESTED:-0} == 1 ]]; then
+            printf 'oss://fixture/lake/raw/venue=binance/market=%s/dataset=%s/shard=all/extra/date=%s/hour=%s/%s\n' \
+              "$OSS_FIXTURE_MARKET" "${dataset[$OSS_FIXTURE_MARKET]}" "$fixture_date" "$fixture_hour" "${object##*/}"
+          fi
         done
         ;;
       cp)
@@ -1069,6 +1075,7 @@ run_oss() {
 }
 verify_oss_roundtrips() {
   local market=$1 readback="$tmp_dir/oss-$1" listing="$tmp_dir/oss-$1.list" uri manifest final_manifest data success expected_success file digest manifest_digest success_digest line token replay_safe triplet_json observed_at observed_cutoff_ns
+  local expected_bucket manifest_name object_prefix data_uri success_uri expected_file
   local candidates_file unsafe_file
   resource_monitor_start "oss-readback-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"
   observed_cutoff_ns=$(date +%s%N)
@@ -1089,6 +1096,10 @@ verify_oss_roundtrips() {
     expected_oss_prefix[$market]=${prefix#oss://"${oss_bucket[$market]}"/}
   fi
   expected_oss_prefix[$market]=${expected_oss_prefix[$market]%/}
+  monday_validate_oss_prefix "$market" "${dataset[$market]}" "${expected_oss_prefix[$market]}" \
+    || die "$market OSS base prefix is invalid"
+  expected_bucket=${oss_bucket[$market]}
+  [[ $TEST_ONLY == true ]] && expected_bucket=fixture
   run_oss "$market" ls "$prefix" --recursive --short-format >"$listing"
   : >"$readback/manifest-uris"
   while IFS= read -r line; do
@@ -1103,6 +1114,13 @@ verify_oss_roundtrips() {
   sort -u -o "$readback/manifest-uris" "$readback/manifest-uris"
   while IFS= read -r uri; do
     [[ -n $uri ]] || continue
+    manifest_name=${uri##*/}
+    monday_validate_lob_object_uri "$market" "${dataset[$market]}" "$expected_bucket" "$uri" manifest \
+      || die "$market OSS manifest URI failed strict validation: $uri"
+    object_prefix=${uri#"oss://$expected_bucket/"}
+    object_prefix=${object_prefix%/$manifest_name}
+    [[ $object_prefix == "${expected_oss_prefix[$market]}"/* ]] \
+      || die "$market OSS manifest URI is outside the configured base prefix: $uri"
     manifest="$readback/discovered-$count.json"; run_oss "$market" cp "$uri" "$manifest" --force --no-progress >/dev/null
     jq -e --arg market "$market" \
       '.market == $market
@@ -1122,7 +1140,7 @@ verify_oss_roundtrips() {
        and (.has_replay_safe_checkpoint | type == "boolean") and .lob_continuity.sequence_gaps == 0
        and .lob_continuity.reconnect_boundary == false
        and .lob_continuity.capture_session_id == $session
-       and (.file | type == "string" and test("^[A-Za-z0-9._-]+\\.jsonl\\.zst$"))' \
+       and (.file | type == "string" and test("^part-[0-9]+\\.jsonl\\.zst$"))' \
       "$manifest" >/dev/null || die "$market OSS manifest failed strict verification"
     replay_safe=$(jq -er '.has_replay_safe_checkpoint' "$manifest")
     if [[ $replay_safe != true ]]; then
@@ -1131,19 +1149,28 @@ verify_oss_roundtrips() {
     fi
     printf '%s\t%s\t%s\n' "$start" "$end" "$uri" >>"$candidates_file"
     ((previous_end == 0 || start >= previous_end)) || die "$market OSS segments overlap"; ((previous_end == 0 || start - previous_end <= MAX_SEGMENT_GAP_NS)) || die "$market OSS continuity gap exceeded"; previous_end=$end
-    file=$(jq -er '.file' "$manifest"); digest=$(jq -er '.sha256' "$manifest"); manifest_digest=$(sha256_file "$manifest")
+    expected_file=${manifest_name%.manifest.json}
+    file=$(jq -er '.file' "$manifest"); [[ $file == "$expected_file" ]] \
+      || die "$market OSS manifest filename does not match its object URI"
+    data_uri="oss://$expected_bucket/$object_prefix/$file"
+    success_uri="oss://$expected_bucket/$object_prefix/$file._SUCCESS"
+    monday_validate_lob_object_uri "$market" "${dataset[$market]}" "$expected_bucket" "$data_uri" data \
+      || die "$market OSS data URI failed strict validation: $data_uri"
+    monday_validate_lob_object_uri "$market" "${dataset[$market]}" "$expected_bucket" "$success_uri" success \
+      || die "$market OSS success URI failed strict validation: $success_uri"
+    digest=$(jq -er '.sha256' "$manifest"); manifest_digest=$(sha256_file "$manifest")
     data="$readback/$file"; success="$data._SUCCESS"; final_manifest="$data.manifest.json"
     run_oss "$market" cp "$uri" "$final_manifest" --force --no-progress >/dev/null
     [[ $(sha256_file "$final_manifest") == "$manifest_digest" ]] || die "$market OSS manifest changed between reads"
-    run_oss "$market" cp "${uri%/*}/$file" "$data" --force --no-progress >/dev/null; run_oss "$market" cp "${uri%/*}/$file._SUCCESS" "$success" --force --no-progress >/dev/null
+    run_oss "$market" cp "$data_uri" "$data" --force --no-progress >/dev/null; run_oss "$market" cp "$success_uri" "$success" --force --no-progress >/dev/null
     expected_success="$readback/$file.expected-success"; printf '%s\n' "$digest" >"$expected_success"; [[ $(sha256_file "$data") == "$digest" ]] || die "$market OSS data digest mismatch"; cmp -s "$success" "$expected_success" || die "$market OSS success marker mismatch"
     success_digest=$(sha256_file "$success")
     observed_at=$(monday_epoch_ns_rfc3339 "$observed_cutoff_ns")
     triplet_json=$(jq -cn --arg market "$market" --arg dataset "${dataset[$market]}" \
-      --arg data_uri "${uri%/*}/$file" --arg manifest_uri "$uri" \
-      --arg success_uri "${uri%/*}/$file._SUCCESS" --arg data_sha "$digest" \
+      --arg data_uri "$data_uri" --arg manifest_uri "$uri" \
+      --arg success_uri "$success_uri" --arg data_sha "$digest" \
       --arg manifest_sha "$manifest_digest" --arg success_sha "$success_digest" \
-      --arg prefix "${uri%/*}" --arg observed "$observed_at" \
+      --arg prefix "$object_prefix" --arg observed "$observed_at" \
       --arg session "${phase_session[$market]}" --arg catalog "${frozen_catalog_sha256[$market]}" \
       --argjson start "$start" --argjson end "$end" \
       --argjson observed_ns "$observed_cutoff_ns" \

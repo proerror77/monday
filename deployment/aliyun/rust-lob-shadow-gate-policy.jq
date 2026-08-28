@@ -215,7 +215,9 @@ and (.markets | type == "object" and ((keys | sort) == ["spot", "usdm"])
     and (.oss_region == "ap-northeast-1")
     and (.aliyun_profile == "ecs-role")
     and (.expected_oss_bucket | type == "string" and length > 0)
-    and (.expected_oss_prefix | type == "string" and length > 0)
+    and (.expected_oss_prefix | type == "string"
+      and . == ("lake/raw/venue=binance/market=" + $m.market
+        + "/dataset=" + $m.dataset + "/shard=all"))
     and (.observed_at_ns | type == "number" and floor == . and . >= 0)
     and ($m.segment_count | type == "number" and . >= 2 and . == ($m.segments | length))
     and ($m.oss_triplet_count | type == "number" and . >= 2 and . == ($m.triplets | length))
@@ -231,7 +233,7 @@ and (.markets | type == "object" and ((keys | sort) == ["spot", "usdm"])
     else true end)
     and (.segments | type == "array" and length >= 2
       and all(.[];
-        (.file | type == "string" and test("^[A-Za-z0-9._-]+\\.jsonl\\.zst$"))
+        (.file | type == "string" and test("^part-[0-9]+\\.jsonl\\.zst$"))
         and (.path | type == "string" and length > 0)
         and (.data_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
         and (.manifest_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
@@ -245,13 +247,29 @@ and (.markets | type == "object" and ((keys | sort) == ["spot", "usdm"])
       and all(.[];
         (.market | type == "string" and . == $m.market)
         and (.dataset | type == "string" and . == $m.dataset)
-        and (.data_uri | type == "string"
-          and startswith(("oss://" + $m.expected_oss_bucket + "/" + $m.expected_oss_prefix + "/"))
-          and test("^oss://[^/]+/.+\\.jsonl\\.zst$"))
-        and (.manifest_uri | type == "string" and test("^oss://[^/]+/.+\\.manifest\\.json$"))
-        and (.manifest_uri == (.data_uri + ".manifest.json"))
-        and (.success_uri | type == "string" and test("^oss://[^/]+/.+\\._SUCCESS$"))
-        and (.success_uri == (.data_uri + "._SUCCESS"))
+        and (.data_uri | type == "string")
+        and (.manifest_uri | type == "string")
+        and (.success_uri | type == "string")
+        and (
+          .data_uri as $data_uri
+          | .manifest_uri as $manifest_uri
+          | .success_uri as $success_uri
+          | ($data_uri | capture("^oss://(?<bucket>[^/]+)/(?<prefix>.+)/(?<file>part-[0-9]+\\.jsonl\\.zst)$")) as $data
+          | ($manifest_uri | capture("^oss://(?<bucket>[^/]+)/(?<prefix>.+)/(?<file>part-[0-9]+\\.jsonl\\.zst\\.manifest\\.json)$")) as $manifest
+          | ($success_uri | capture("^oss://(?<bucket>[^/]+)/(?<prefix>.+)/(?<file>part-[0-9]+\\.jsonl\\.zst\\._SUCCESS)$")) as $success
+          | ($data.prefix | ltrimstr($m.expected_oss_prefix + "/")) as $partition
+          | ($partition | test("^date=[0-9]{4}-[0-9]{2}-[0-9]{2}/hour=(0[0-9]|1[0-9]|2[0-3])$"))
+          and ($data.bucket == $m.expected_oss_bucket)
+          and ($manifest.bucket == $m.expected_oss_bucket)
+          and ($success.bucket == $m.expected_oss_bucket)
+          and ($data.prefix | startswith($m.expected_oss_prefix + "/"))
+          and ($manifest.prefix == $data.prefix)
+          and ($success.prefix == $data.prefix)
+          and ($manifest.file == ($data.file + ".manifest.json"))
+          and ($success.file == ($data.file + "._SUCCESS"))
+          and ($manifest_uri == ($data_uri + ".manifest.json"))
+          and ($success_uri == ($data_uri + "._SUCCESS"))
+        )
         and (.data_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
         and (.manifest_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
         and (.success_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
