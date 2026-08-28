@@ -1073,11 +1073,12 @@ CONTROLLER_RELEASE_SHA256=REPLACE_WITH_CONTROLLER_MANIFEST_SHA256 \
 ```
 
 The no-controller form remains a deprecated artifact-routed compatibility
-fallback and is not eligible for new production evidence. Keep the controller
-digest paired with the current and rollback candidate. A controller-only change
-may keep the same runtime payload, but it does not make a v5 receipt reusable:
-the final controller digest must still be named by the Gate, cutover, and
-independent readback.
+fallback and may still produce a legacy v4 `PASSED.sha256` during the
+transition. That legacy receipt cannot authorize the future pair-bound
+cutover/readback path. Keep the controller digest paired with the current and
+rollback candidate. A controller-only change may keep the same runtime payload,
+but it does not make a v5 receipt reusable: the final controller digest must
+still be named by the Gate, cutover, and independent readback.
 The Gate never executes control scripts, helpers, or policy files from the
 candidate artifact; those bytes must come from the controller release digest.
 

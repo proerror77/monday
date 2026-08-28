@@ -127,7 +127,11 @@ pair_mode=false
 if [[ $resource_preflight_only != true || $pair_mode == true ]]; then
   install -d -m 0755 "$(dirname "$LOCK_FILE")"
   exec 9>"$LOCK_FILE"
-  flock -n 9 || die 'another Rust collector release operation is running'
+  if [[ $resource_preflight_only == true ]]; then
+    flock -s -n 9 || die 'another Rust collector release operation is running'
+  else
+    flock -n 9 || die 'another Rust collector release operation is running'
+  fi
 fi
 
 candidate_sha=$(printf '%s' "$candidate_arg" | tr '[:upper:]' '[:lower:]')
@@ -274,14 +278,16 @@ runtime_contract_sha256=$(jq -er '.runtime_contract_sha256' "$release_json")
 [[ $runtime_contract_sha256 =~ ^[a-f0-9]{64}$ ]] \
   || die 'release metadata has an invalid runtime contract SHA-256'
 if [[ $pair_mode == true ]]; then
-  deployment_bundle_sha256=$(jq -r '.deployment_bundle_sha256 // empty' "$release_json")
-  deployment_source_revision=$(jq -r '.deployment_source_revision // empty' "$release_json")
-  [[ -z $deployment_bundle_sha256 || $deployment_bundle_sha256 == \
-    "$controller_deployment_bundle_sha256" ]] \
-    || die 'candidate deployment bundle differs from controller release'
-  [[ -z $deployment_source_revision || $deployment_source_revision == \
-    "$controller_deployment_source_revision" ]] \
-    || die 'candidate deployment source differs from controller release'
+  candidate_manifest_bundle_sha256=$(jq -r '.deployment_bundle_sha256 // empty' \
+    "$release_json")
+  candidate_manifest_source_revision=$(jq -r '.deployment_source_revision // empty' \
+    "$release_json")
+  [[ -z $candidate_manifest_bundle_sha256 \
+    || $candidate_manifest_bundle_sha256 =~ ^[a-f0-9]{64}$ ]] \
+    || die 'candidate metadata has an invalid deployment bundle SHA-256'
+  [[ -z $candidate_manifest_source_revision \
+    || $candidate_manifest_source_revision =~ ^[a-f0-9]{40,64}$ ]] \
+    || die 'candidate metadata has an invalid deployment source revision'
   deployment_bundle_sha256=$controller_deployment_bundle_sha256
   deployment_source_revision=$controller_deployment_source_revision
   jq -e --arg artifact "$candidate_sha" \
@@ -1195,6 +1201,21 @@ assert_pair_identity() {
   printf '%s  %s\n' "$candidate_sha" "$candidate_binary" \
     | sha256sum --check --strict >/dev/null \
     || die 'candidate binary changed before Gate finalization'
+  # Re-source only the already verified controller helper so the final
+  # assertion binds the candidate's eight runtime assets to its release R.
+  # shellcheck disable=SC1090,SC1091
+  . "$controller_lib" >/dev/null
+  candidate_runtime_contract_from_helper=$(monday_rust_lob_runtime_contract_sha256 \
+    "$candidate_deployment") \
+    || die 'candidate runtime contract helper failed before Gate finalization'
+  candidate_runtime_contract_independent=$(runtime_contract_sha256_independent \
+    "$candidate_deployment") \
+    || die 'candidate runtime assets failed before Gate finalization'
+  [[ $candidate_runtime_contract_from_helper == \
+    "$candidate_runtime_contract_independent" ]] \
+    || die 'controller helper returned an inconsistent final runtime contract'
+  [[ $candidate_runtime_contract_independent == "$runtime_contract_sha256" ]] \
+    || die 'candidate runtime contract changed before Gate finalization'
 }
 
 assert_spool_drained() {
