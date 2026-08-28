@@ -5,7 +5,8 @@ usage() {
   printf '%s\n' \
     'Usage: ACTION=gate-preflight|gate|controller-apply|cutover|restore INSTANCE_ID=i-... ARTIFACT_SHA256=<64 hex> invoke-rust-lob-operation.sh' \
     '' \
-    'controller-apply also requires CONTROLLER_RELEASE_SHA256=<64 hex>.' \
+    'gate-preflight and gate accept CONTROLLER_RELEASE_SHA256=<64 hex> for pair-bound routing.' \
+    'controller-apply requires CONTROLLER_RELEASE_SHA256=<64 hex>.' \
     'The command always targets ap-northeast-1 and uses Alibaba Cloud Assistant.'
 }
 
@@ -104,12 +105,30 @@ fi
 
 if [[ $ACTION == controller-apply ]]; then
   host_path="/opt/monday/releases/binance-lob-controller/$CONTROLLER_RELEASE_SHA256/deployment/$host_script"
+elif [[ ($ACTION == gate-preflight || $ACTION == gate) && -n $CONTROLLER_RELEASE_SHA256 ]]; then
+  host_path="/opt/monday/releases/binance-lob-controller/$CONTROLLER_RELEASE_SHA256/deployment/$host_script"
 else
   host_path="/opt/monday/releases/binance-lob-archiver/$ARTIFACT_SHA256/deployment/$host_script"
 fi
-if [[ $ACTION == gate-preflight ]]; then
-  printf -v remote_script '#!/usr/bin/env bash\nset -euo pipefail\nexec %q --resource-preflight %q\n' \
-    "$host_path" "$ARTIFACT_SHA256"
+if [[ ($ACTION == gate-preflight || $ACTION == gate) && -n $CONTROLLER_RELEASE_SHA256 ]]; then
+  printf 'using pair-bound controller release %s for %s\n' \
+    "$CONTROLLER_RELEASE_SHA256" "$ACTION" >&2
+  if [[ $ACTION == gate-preflight ]]; then
+    printf -v remote_script '#!/usr/bin/env bash\nset -euo pipefail\nexec %q --controller-release-sha256 %q --resource-preflight %q\n' \
+      "$host_path" "$CONTROLLER_RELEASE_SHA256" "$ARTIFACT_SHA256"
+  else
+    printf -v remote_script '#!/usr/bin/env bash\nset -euo pipefail\nexec %q --controller-release-sha256 %q %q\n' \
+      "$host_path" "$CONTROLLER_RELEASE_SHA256" "$ARTIFACT_SHA256"
+  fi
+elif [[ $ACTION == gate-preflight || $ACTION == gate ]]; then
+  printf 'deprecated artifact-routed Gate fallback; pass CONTROLLER_RELEASE_SHA256 for pair-bound routing\n' >&2
+  if [[ $ACTION == gate-preflight ]]; then
+    printf -v remote_script '#!/usr/bin/env bash\nset -euo pipefail\nexec %q --resource-preflight %q\n' \
+      "$host_path" "$ARTIFACT_SHA256"
+  else
+    printf -v remote_script '#!/usr/bin/env bash\nset -euo pipefail\nexec %q %q\n' \
+      "$host_path" "$ARTIFACT_SHA256"
+  fi
 elif [[ $ACTION == controller-apply ]]; then
   printf -v remote_script '#!/usr/bin/env bash\nset -euo pipefail\nexec %q %q %q\n' \
     "$host_path" "$CONTROLLER_RELEASE_SHA256" "$ARTIFACT_SHA256"
@@ -164,7 +183,10 @@ for _ in $(seq 1 "$polls"); do
           exit 1
         }
         jq -e --arg artifact "$ARTIFACT_SHA256" \
-          '.schema == "monday.rust_lob_gate_resource_preflight.v1"
+          --arg controller "$CONTROLLER_RELEASE_SHA256" \
+          '.schema == (if $controller == ""
+            then "monday.rust_lob_gate_resource_preflight.v1"
+            else "monday.rust_lob_gate_resource_preflight.v2" end)
             and .candidate_sha256 == $artifact
             and (.runtime_contract_sha256 | type) == "string"
             and (.runtime_contract_sha256 | test("^[a-f0-9]{64}$"))
@@ -270,6 +292,15 @@ for _ in $(seq 1 "$polls"); do
                   | .hits = $expected_hits
                   | .current = $window.current_total_us)
               | .valid)
+            and (if $controller == "" then true else
+              .controller_release_sha256 == $controller
+              and (.controller_deployment_bundle_sha256 | type) == "string"
+              and (.controller_deployment_bundle_sha256 | test("^[a-f0-9]{64}$"))
+              and .controller_deployment_bundle_sha256 == .deployment_bundle_sha256
+              and (.controller_deployment_source_revision | type) == "string"
+              and (.controller_deployment_source_revision | test("^[a-f0-9]{40,64}$"))
+              and .controller_deployment_source_revision == .deployment_source_revision
+            end)
             and .passed == true' <<<"$decoded_output" >/dev/null || {
           printf 'gate-preflight returned invalid JSON evidence\n' >&2
           exit 1
