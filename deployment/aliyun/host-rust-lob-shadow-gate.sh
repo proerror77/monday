@@ -64,6 +64,8 @@ TEST_ONLY=false; [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 ]] && TEST_ONLY=true
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck disable=SC1090,SC1091
 . "$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
+monday_control_plane_validate_mode "$ROOT" "$TEST_ONLY" \
+  || die 'production uses canonical root or fixture mode lacks an explicit sentinel'
 
 GATE_DURATION_SECONDS=$REQUIRED_DURATION_SECONDS
 HEALTH_SETTLE_DURATION_SECONDS=$HEALTH_SETTLE_SECONDS
@@ -89,7 +91,7 @@ CONTROLLER_ROOT="$OPT_ROOT/releases/binance-lob-controller"; BIN_ROOT="$OPT_ROOT
 SYSTEMD_ROOT=$(monday_root_join "$ROOT" etc/systemd/system); CONFIG_ROOT=$(monday_root_join "$ROOT" etc/monday)
 LOCK_FILE=$(monday_root_join "$ROOT" run/lock/monday-rust-lob-control-plane.lock)
 OVERRIDE_ROOT=$(monday_root_join "$ROOT" run/monday)
-DATA_ROOT=$(monday_root_join "$ROOT" data/monday); EVIDENCE_ROOT=${MONDAY_GATE_EVIDENCE_ROOT:-$DATA_ROOT/evidence/shadow-gates}
+DATA_ROOT=$(monday_root_join "$ROOT" data/monday); EVIDENCE_ROOT="$DATA_ROOT/evidence/shadow-gates"
 # Gate writers are always run-scoped.  Nothing under /etc or the stable
 # /opt/monday/bin projection is mutated by this operation.
 RUN_SPOOL_ROOT="$DATA_ROOT/spool/binance-lob-rust-shadow/gate"; PROC_ROOT=$(monday_root_join "$ROOT" proc)
@@ -689,6 +691,7 @@ gate_started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ); gate_finished=false
 declare -A phase_pid phase_exe_sha phase_session phase_segments phase_oss phase_runtime
 declare -A phase_strict_lob phase_strict_aggregate phase_strict_raw
 declare -A market_gate_started_ns market_observation_started_ns frozen_symbol_count frozen_catalog_sha256
+declare -A market_observed_at_ns
 declare -A initial_upload_failure_count last_health_updated_ns last_health_advance_mono
 declare -A max_health_silence_seconds health_samples
 write_run_json() {
@@ -1057,16 +1060,19 @@ run_oss() {
   if [[ $TEST_ONLY == true ]]; then
     OSS_FIXTURE_MARKET=$market aliyun ossutil "$@" --profile "${aliyun_profile[$market]}" --endpoint fixture --region ap-northeast-1
   else
+    [[ -x /usr/local/bin/aliyun ]] || die 'trusted OSS CLI is missing: /usr/local/bin/aliyun'
     runuser --user "$SERVICE_USER" -- env -i HOME="$SERVICE_HOME" PATH="$SAFE_PATH" \
-      ALIYUN_PROFILE="${aliyun_profile[$market]}" aliyun ossutil "$@" \
+      ALIYUN_PROFILE="${aliyun_profile[$market]}" /usr/local/bin/aliyun ossutil "$@" \
       --profile "${aliyun_profile[$market]}" --endpoint "${oss_endpoint[$market]}" \
       --region "${oss_region[$market]}"
   fi
 }
 verify_oss_roundtrips() {
-  local market=$1 readback="$tmp_dir/oss-$1" listing="$tmp_dir/oss-$1.list" uri manifest final_manifest data success expected_success file digest manifest_digest success_digest line token replay_safe triplet_json observed_at
+  local market=$1 readback="$tmp_dir/oss-$1" listing="$tmp_dir/oss-$1.list" uri manifest final_manifest data success expected_success file digest manifest_digest success_digest line token replay_safe triplet_json observed_at observed_cutoff_ns
   local candidates_file unsafe_file
   resource_monitor_start "oss-readback-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"
+  observed_cutoff_ns=$(date +%s%N)
+  [[ $observed_cutoff_ns =~ ^[0-9]+$ ]] || die "$market OSS observation clock is unavailable"
   local start end previous_end=0 count=0; local -a roundtrip_records=(); mkdir -p "$readback"
   phase_triplets_json[$market]='[]'
   candidates_file="$readback/replay-safe.tsv"; unsafe_file="$readback/replay-unsafe.tsv"
@@ -1100,12 +1106,14 @@ verify_oss_roundtrips() {
     manifest="$readback/discovered-$count.json"; run_oss "$market" cp "$uri" "$manifest" --force --no-progress >/dev/null
     jq -e --arg market "$market" \
       '.market == $market
-       and (.start_received_at_ns | type == "number")
-       and (.end_received_at_ns | type == "number")
+       and (.start_received_at_ns | type == "number" and floor == . and . >= 0)
+       and (.end_received_at_ns | type == "number" and floor == . and . >= 0)
        and .end_received_at_ns >= .start_received_at_ns
        and (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))' \
       "$manifest" >/dev/null || die "$market OSS manifest failed strict verification"
     start=$(jq -er '.start_received_at_ns' "$manifest"); end=$(jq -er '.end_received_at_ns' "$manifest")
+    [[ $start =~ ^[0-9]+$ && $end =~ ^[0-9]+$ && $end -le $observed_cutoff_ns ]] \
+      || die "$market OSS manifest is future-dated"
     if [[ $TEST_ONLY != true ]] && ((end <= market_observation_started_ns[$market])); then
       continue
     fi
@@ -1130,7 +1138,7 @@ verify_oss_roundtrips() {
     run_oss "$market" cp "${uri%/*}/$file" "$data" --force --no-progress >/dev/null; run_oss "$market" cp "${uri%/*}/$file._SUCCESS" "$success" --force --no-progress >/dev/null
     expected_success="$readback/$file.expected-success"; printf '%s\n' "$digest" >"$expected_success"; [[ $(sha256_file "$data") == "$digest" ]] || die "$market OSS data digest mismatch"; cmp -s "$success" "$expected_success" || die "$market OSS success marker mismatch"
     success_digest=$(sha256_file "$success")
-    observed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    observed_at=$(monday_epoch_ns_rfc3339 "$observed_cutoff_ns")
     triplet_json=$(jq -cn --arg market "$market" --arg dataset "${dataset[$market]}" \
       --arg data_uri "${uri%/*}/$file" --arg manifest_uri "$uri" \
       --arg success_uri "${uri%/*}/$file._SUCCESS" --arg data_sha "$digest" \
@@ -1138,9 +1146,11 @@ verify_oss_roundtrips() {
       --arg prefix "${uri%/*}" --arg observed "$observed_at" \
       --arg session "${phase_session[$market]}" --arg catalog "${frozen_catalog_sha256[$market]}" \
       --argjson start "$start" --argjson end "$end" \
+      --argjson observed_ns "$observed_cutoff_ns" \
       '{market:$market,dataset:$dataset,data_uri:$data_uri,manifest_uri:$manifest_uri,success_uri:$success_uri,
         data_sha256:$data_sha,manifest_sha256:$manifest_sha,success_sha256:$success_sha,
         success_content:($data_sha + "\n"),object_prefix:$prefix,observed_at:$observed,
+        observed_at_ns:$observed_ns,
         start_received_at_ns:$start,end_received_at_ns:$end,session_id:$session,
         catalog_sha256:$catalog}')
     phase_triplets_json[$market]=$(jq -cn --argjson values "${phase_triplets_json[$market]}" \
@@ -1156,6 +1166,7 @@ verify_oss_roundtrips() {
     verify_aggregate_trade_continuity "${roundtrip_records[@]}" || die "$market OSS strict aggregate-trade continuity verifier failed"
     verify_raw_trade_continuity "${roundtrip_records[@]}" || die "$market OSS strict raw-trade continuity verifier failed"
   fi
+  market_observed_at_ns[$market]=$observed_cutoff_ns
   phase_oss[$market]=$count
   resource_monitor_stop
 }
@@ -1246,11 +1257,12 @@ for market in "${markets[@]}"; do
     --argjson strict_lob "${phase_strict_lob[$market]:-false}" \
     --argjson strict_aggregate "${phase_strict_aggregate[$market]:-false}" \
     --argjson strict_raw "${phase_strict_raw[$market]:-false}" \
+    --argjson observed_at_ns "${market_observed_at_ns[$market]}" \
     '{market:$market,unit:$unit,dataset:$dataset,session_id:$session,main_pid:$pid,
       process_exe_sha256:$exe,n_restarts:0,observed_runtime_seconds:$runtime,
       spool_dir:$spool,shard_id:$shard,oss_bucket:$configured_bucket,oss_endpoint:$endpoint,
       oss_region:$region,aliyun_profile:$profile,segment_count:$segments,oss_triplet_count:$oss,health_sha256:$health,
-      expected_oss_bucket:$bucket,expected_oss_prefix:$prefix,segments:$segment_evidence,
+      expected_oss_bucket:$bucket,expected_oss_prefix:$prefix,observed_at_ns:$observed_at_ns,segments:$segment_evidence,
       triplets:$triplet_evidence,health:$health_evidence,
       process_identity_verified:true,installed_shadow_assets_verified:true,
       strict_lob_continuity_readback:$strict_lob,

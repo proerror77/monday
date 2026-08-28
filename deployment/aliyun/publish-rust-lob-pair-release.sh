@@ -14,6 +14,10 @@ die() { printf '%s\n' "$*" >&2; exit 1; }
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
+readonly SAFE_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ALIYUN_BIN=$(command -v aliyun) || die 'aliyun CLI is unavailable'
+[[ $ALIYUN_BIN == /*/aliyun ]] || die 'aliyun CLI path is not trusted'
+readonly REMOTE_ALIYUN_BIN=/usr/local/bin/aliyun
 
 instance='' artifact_uri='' artifact_sha='' source_revision=''
 region=${REGION_ID:-ap-northeast-1}
@@ -91,10 +95,10 @@ fi
 
 profile_args=()
 [[ -n $profile ]] && profile_args=(--profile "$profile")
-aliyun ossutil cp "$bundle" "$bundle_uri" \
+"$ALIYUN_BIN" ossutil cp "$bundle" "$bundle_uri" \
   --endpoint oss-ap-northeast-1.aliyuncs.com --region "$region" --force \
   "${profile_args[@]}"
-aliyun ossutil cp "$manifest" "$manifest_uri" \
+"$ALIYUN_BIN" ossutil cp "$manifest" "$manifest_uri" \
   --endpoint oss-ap-northeast-1.aliyuncs.com --region "$region" --force \
   "${profile_args[@]}"
 
@@ -107,16 +111,16 @@ printf '%s' '$fixed_lib_b64' | base64 --decode | gzip -d >"\$tmp/rust-lob-contro
 printf '%s  %s\\n' '$fixed_publisher_sha' "\$tmp/fixed-publisher.sh" | sha256sum --check --strict
 printf '%s  %s\\n' '$fixed_lib_sha' "\$tmp/rust-lob-control-plane-lib.sh" | sha256sum --check --strict
 chmod 0555 "\$tmp/fixed-publisher.sh" "\$tmp/rust-lob-control-plane-lib.sh"
-aliyun ossutil cp '$artifact_uri' "\$tmp/payload" --profile ecs-role --endpoint oss-ap-northeast-1-internal.aliyuncs.com --region ap-northeast-1 --force
+env -i HOME=/var/lib/hft-collector LC_ALL=C PATH='$SAFE_PATH' '$REMOTE_ALIYUN_BIN' ossutil cp '$artifact_uri' "\$tmp/payload" --profile ecs-role --endpoint oss-ap-northeast-1-internal.aliyuncs.com --region ap-northeast-1 --force
 printf '%s  %s\\n' '$artifact_sha' "\$tmp/payload" | sha256sum --check --strict
-aliyun ossutil cp '$bundle_uri' "\$tmp/deployment.tar" --profile ecs-role --endpoint oss-ap-northeast-1-internal.aliyuncs.com --region ap-northeast-1 --force
+env -i HOME=/var/lib/hft-collector LC_ALL=C PATH='$SAFE_PATH' '$REMOTE_ALIYUN_BIN' ossutil cp '$bundle_uri' "\$tmp/deployment.tar" --profile ecs-role --endpoint oss-ap-northeast-1-internal.aliyuncs.com --region ap-northeast-1 --force
 printf '%s  %s\\n' '$bundle_sha' "\$tmp/deployment.tar" | sha256sum --check --strict
-aliyun ossutil cp '$manifest_uri' "\$tmp/release.json" --profile ecs-role --endpoint oss-ap-northeast-1-internal.aliyuncs.com --region ap-northeast-1 --force
+env -i HOME=/var/lib/hft-collector LC_ALL=C PATH='$SAFE_PATH' '$REMOTE_ALIYUN_BIN' ossutil cp '$manifest_uri' "\$tmp/release.json" --profile ecs-role --endpoint oss-ap-northeast-1-internal.aliyuncs.com --region ap-northeast-1 --force
 printf '%s  %s\\n' '$manifest_sha' "\$tmp/release.json" | sha256sum --check --strict
 mkdir "\$tmp/deployment"
 # The candidate archive is data only.  The publisher/verifier is the fixed
 # byte-checked copy sent above; candidate helper/lib files are never run.
-bash "\$tmp/fixed-publisher.sh" "\$tmp/payload" "\$tmp/deployment.tar" "\$tmp/release.json"
+env -i HOME=/root LC_ALL=C PATH='$SAFE_PATH' bash "\$tmp/fixed-publisher.sh" "\$tmp/payload" "\$tmp/deployment.tar" "\$tmp/release.json"
 EOF
 )
 command_content=$(printf '%s' "$remote" | base64 | tr -d '\n')

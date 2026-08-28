@@ -17,7 +17,6 @@ done
 ROOT=${ROOT%/}; [[ -n $ROOT ]] || ROOT=/
 [[ $CONTROLLER =~ ^[a-f0-9]{64}$ ]] || die 'controller digest is invalid'
 TEST_ONLY=false; [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 ]] && TEST_ONLY=true
-[[ $TEST_ONLY == false || $ROOT != / ]] || die 'test mode requires an isolated fixture root'
 RESTORE_HEALTH_WAIT_SECONDS=60
 if [[ $TEST_ONLY == true && -n ${MONDAY_RESTORE_HEALTH_TIMEOUT_SECONDS:-} ]]; then
   RESTORE_HEALTH_WAIT_SECONDS=$MONDAY_RESTORE_HEALTH_TIMEOUT_SECONDS
@@ -27,6 +26,8 @@ fi
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
+monday_control_plane_validate_mode "$ROOT" "$TEST_ONLY" \
+  || die 'production uses canonical root or fixture mode lacks an explicit sentinel'
 
 controller_root=$(monday_root_join "$ROOT" opt/monday/releases/binance-lob-controller)
 lock_root=$(monday_root_join "$ROOT" run/lock); mkdir -p "$lock_root"
@@ -47,6 +48,31 @@ if [[ $TEST_ONLY == true && ${MONDAY_RESTORE_FIXTURE_SYSTEMD:-0} == 1 ]]; then
   declare -A fixture_unit_state=() fixture_unit_file_state=() fixture_unit_load_state=()
   fixture_calls=$(monday_root_join "$ROOT" run/restore-fixture.calls)
   mkdir -p "$(dirname -- "$fixture_calls")"
+  # A second idempotent invocation is a new shell process, so model the
+  # already-successful pair from its immutable receipt instead of treating
+  # an empty fixture systemd map as live state.  This is fixture plumbing
+  # only; production always queries the real units below.
+  fixture_restore_receipt=$(monday_root_join "$ROOT" "data/monday/evidence/restores/$CONTROLLER/restore.json")
+  fixture_pid_from_receipt=
+  if [[ -f $fixture_restore_receipt && ! -L $fixture_restore_receipt ]]; then
+    fixture_pid_from_receipt=$(jq -r '.process_identity.spot.main_pid // empty' "$fixture_restore_receipt" 2>/dev/null || true)
+    for fixture_market in spot usdm; do
+      fixture_unit="binance-lob-archiver-production@${fixture_market}.service"
+      fixture_unit_state[$fixture_unit]=active
+      fixture_unit_file_state[$fixture_unit]=enabled
+      fixture_unit_load_state[$fixture_unit]=loaded
+    done
+    while IFS= read -r fixture_unit; do
+      fixture_unit_state[$fixture_unit]=inactive
+      fixture_unit_file_state[$fixture_unit]=masked-runtime
+      fixture_unit_load_state[$fixture_unit]=masked
+    done < <(monday_rust_lob_legacy_writer_units)
+    while IFS= read -r fixture_unit; do
+      fixture_unit_state[$fixture_unit]=active
+      fixture_unit_file_state[$fixture_unit]=enabled
+      fixture_unit_load_state[$fixture_unit]=loaded
+    done < <(monday_rust_lob_recovery_timer_units)
+  fi
   systemctl() {
     local action=${1:-} unit=${2:-} argument
     case "$action" in
@@ -90,30 +116,34 @@ if [[ $TEST_ONLY == true && ${MONDAY_RESTORE_FIXTURE_SYSTEMD:-0} == 1 ]]; then
           ActiveState) [[ ${fixture_unit_state[$unit]:-inactive} == active ]] && printf 'active\n' || printf 'inactive\n' ;;
           SubState) [[ ${fixture_unit_state[$unit]:-inactive} == active ]] && printf 'running\n' || printf 'dead\n' ;;
           UnitFileState) printf '%s\n' "${fixture_unit_file_state[$unit]:-disabled}" ;;
-          MainPID) printf '%s\n' "${MONDAY_RESTORE_FIXTURE_PID:-$$}" ;;
+          MainPID) printf '%s\n' "${MONDAY_RESTORE_FIXTURE_PID:-${fixture_pid_from_receipt:-$$}}" ;;
           NRestarts) printf '0\n' ;;
           *) printf '\n' ;;
         esac
         return 0 ;;
       is-enabled)
-        printf '%s\n' "${fixture_unit_file_state[$2]:-disabled}"
-        [[ ${fixture_unit_file_state[$2]:-disabled} == enabled ]] && return 0
+        [[ $2 == --quiet ]] && unit=$3
+        printf '%s\n' "${fixture_unit_file_state[$unit]:-disabled}"
+        [[ ${fixture_unit_file_state[$unit]:-disabled} == enabled ]] && return 0
         return 1 ;;
       *) return 0 ;;
     esac
   }
 fi
 
-success=false
+success=false; readonly_idempotency_check=false
 cleanup() {
   local status=$?; set +e
   if [[ $success != true && $status != 0 \
+    && $readonly_idempotency_check != true \
     && ($TEST_ONLY == false || $FIXTURE_SYSTEMD == true) ]]; then
     # Restore is fail-closed even when a preflight fails before the normal
     # containment boundary: no legacy, shadow, upload, or production writer
     # may continue against a pair whose identity was not proven.
     monday_rust_lob_contain_writers >/dev/null 2>&1 || true
     monday_rust_lob_verify_contained >/dev/null 2>&1 || true
+    monday_rust_lob_contain_recovery_schedulers >/dev/null 2>&1 || true
+    monday_rust_lob_verify_recovery_schedulers_contained >/dev/null 2>&1 || true
   fi
   exit "$status"
 }
@@ -138,12 +168,220 @@ production_runtime=$(monday_verify_production_runtime_assets \
   "$ROOT" "$release/deployment" "$payload") \
   || die 'active production runtime contract failed verification'
 
+production=$(monday_root_join "$ROOT" opt/monday/bin/binance-lob-archiver)
+
+verify_existing_restore_state() {
+  local receipt=$1 expected_runtime=$2 stable_binary expected resolved asset target
+  local named_transition named_gate named_gate_sha receipt_gate receipt_gate_sha transition_from transition_mode transition_validator_from
+  local receipt_process receipt_health market unit pid restarts exe env_file spool health dataset minimum_symbols
+  local expected_pid expected_exe expected_restarts expected_session expected_observed current_session updated now_ns
+
+  # The receipt is only an idempotency key after its complete read-only state
+  # has been proven.  In particular, a stale success file never authorizes a
+  # new containment, projection, or systemd mutation.
+  jq -e --argjson require_runtime "$expected_runtime" '
+    (.recovery_schedulers | type == "object")
+    and (if $require_runtime then
+      (.recovery_schedulers
+       | ((keys | sort) == ["spot", "usdm"]
+          and all(.[]; .active == true and .enabled == true
+            and (.unit | type == "string" and test("^binance-lob-archiver-recovery@(spot|usdm)\\.timer$")))))
+    else true end)
+  ' "$receipt" >/dev/null || die 'existing restore receipt has invalid recovery scheduler evidence'
+
+  # If the restore receipt names a transition, validate that exact immutable
+  # transition and its Gate before looking at runtime state.  Do not scan or
+  # guess an unrelated historical receipt.
+  named_transition=$(jq -r '.transition_receipt // empty' "$receipt") || die 'existing restore receipt transition field is malformed'
+  if [[ -n $named_transition ]]; then
+    [[ $named_transition == "$(monday_root_join "$ROOT" "data/monday/evidence/cutovers/$CONTROLLER/transition.json")" ]] \
+      || die 'existing restore transition path is not the active pair receipt'
+    monday_file_direct "$named_transition" || die 'existing restore transition receipt is indirect'
+    transition_from=$(jq -er '.from_controller_sha256' "$named_transition") \
+      || die 'existing restore transition has no before controller'
+    transition_mode=$(jq -er '.from_source_mode' "$named_transition") \
+      || die 'existing restore transition has no source mode'
+    case "$transition_mode" in
+      direct) transition_validator_from=direct ;;
+      stable) transition_validator_from=$transition_from ;;
+      *) die 'existing restore transition has an invalid source mode' ;;
+    esac
+    named_gate=$(jq -er '.gate_receipt' "$named_transition") \
+      || die 'existing restore transition has no Gate path'
+    named_gate_sha=$(jq -er '.gate_sha256' "$named_transition") \
+      || die 'existing restore transition has no Gate digest'
+    receipt_gate=$(jq -r '.gate_receipt // empty' "$receipt") \
+      || die 'existing restore Gate field is malformed'
+    receipt_gate_sha=$(jq -r '.gate_sha256 // empty' "$receipt") \
+      || die 'existing restore Gate digest field is malformed'
+    [[ $receipt_gate == "$named_gate" && $receipt_gate_sha == "$named_gate_sha" ]] \
+      || die 'existing restore Gate identity differs from its transition'
+    monday_validate_v2_transition "$named_transition" "$transition_validator_from" "$CONTROLLER" \
+      "$named_gate" "$named_gate_sha" \
+      || die 'existing restore transition failed exact Gate-chain validation'
+  else
+    receipt_gate=$(jq -r '.gate_receipt // empty' "$receipt") \
+      || die 'existing restore Gate field is malformed'
+    receipt_gate_sha=$(jq -r '.gate_sha256 // empty' "$receipt") \
+      || die 'existing restore Gate digest field is malformed'
+    [[ -z $receipt_gate && -z $receipt_gate_sha ]] \
+      || die 'existing restore names a Gate without its transition receipt'
+  fi
+
+  stable_binary="$controller_root/active/binance-lob-archiver"
+  [[ -L $production && $(readlink -- "$production") == "$stable_binary" \
+    && $(readlink -f -- "$production") == "$binary" ]] \
+    || die 'existing restore stable production projection drifted'
+  [[ $(monday_sha256_file "$binary") == "$payload" ]] || die 'existing restore active payload digest drifted'
+
+  # Every runtime and controller projection must still be a direct symlink to
+  # the active C.  A regular file, indirect link, or byte drift is a hard
+  # failure, never repaired by an idempotent invocation.
+  while IFS= read -r asset; do
+    target=$(monday_runtime_asset_target "$ROOT" "$asset") \
+      || die "existing restore runtime asset path is invalid: $asset"
+    expected="$controller_root/active/deployment/$asset"
+    [[ -L $target && $(readlink -- "$target") == "$expected" ]] \
+      || die "existing restore runtime projection drifted: $asset"
+    resolved=$(readlink -f -- "$target") || die "existing restore runtime projection is dangling: $asset"
+    monday_file_direct "$resolved" || die "existing restore runtime projection is indirect: $asset"
+    cmp -s "$resolved" "$release/deployment/$asset" \
+      || die "existing restore runtime projection bytes drifted: $asset"
+  done < <(monday_runtime_assets)
+  while IFS= read -r asset; do
+    target=$(monday_controller_projection_target "$ROOT" "$asset") \
+      || die "existing restore controller projection path is invalid: $asset"
+    expected="$controller_root/active/deployment/$asset"
+    [[ -L $target && $(readlink -- "$target") == "$expected" ]] \
+      || die "existing restore controller projection drifted: $asset"
+    resolved=$(readlink -f -- "$target") || die "existing restore controller projection is dangling: $asset"
+    monday_file_direct "$resolved" || die "existing restore controller projection is indirect: $asset"
+    cmp -s "$resolved" "$release/deployment/$asset" \
+      || die "existing restore controller projection bytes drifted: $asset"
+  done < <(monday_controller_projection_assets)
+
+  # A test-only restore without a fixture systemd view deliberately does not
+  # claim live production.  Its receipt is still checked above for immutable
+  # identity/projection evidence; a production or systemd fixture receipt
+  # must pass the complete unit, timer, process, and health contract below.
+  if [[ $expected_runtime == false ]]; then
+    jq -e '.production_enabled == false and (.process_identity | type == "object" and length == 0)' \
+      "$receipt" >/dev/null || die 'non-runtime restore receipt claims live production'
+    return 0
+  fi
+
+  monday_rust_lob_verify_legacy_contained \
+    || die 'existing restore legacy writers are not contained'
+  monday_rust_lob_verify_recovery_schedulers_active \
+    || die 'existing restore recovery timers are not active and enabled'
+  receipt_process=$(jq -ce '.process_identity' "$receipt") \
+    || die 'existing restore process identity evidence is malformed'
+  receipt_health=$(jq -ce '.health' "$receipt") \
+    || die 'existing restore health evidence is malformed'
+  jq -e '.process_identity | type == "object" and (keys | sort) == ["spot", "usdm"]' \
+    "$receipt" >/dev/null || die 'existing restore process identity is incomplete'
+  jq -e '.health | type == "object" and (keys | sort) == ["spot", "usdm"]' \
+    "$receipt" >/dev/null || die 'existing restore health identity is incomplete'
+  for market in spot usdm; do
+    unit="binance-lob-archiver-production@${market}.service"
+    systemctl is-active --quiet "$unit" || die "existing restore production unit is inactive: $market"
+    [[ $(systemctl show "$unit" --property=SubState --value) == running ]] \
+      || die "existing restore production unit is not running: $market"
+    [[ $(systemctl show "$unit" --property=UnitFileState --value) == enabled ]] \
+      || die "existing restore production unit is not enabled: $market"
+    pid=$(systemctl show "$unit" --property=MainPID --value)
+    restarts=$(systemctl show "$unit" --property=NRestarts --value)
+    expected_pid=$(jq -er --arg market "$market" '.[$market].main_pid' <<<"$receipt_process") \
+      || die "existing restore process PID evidence is missing: $market"
+    expected_exe=$(jq -er --arg market "$market" '.[$market].process_exe_sha256' <<<"$receipt_process") \
+      || die "existing restore process executable evidence is missing: $market"
+    expected_restarts=$(jq -er --arg market "$market" '.[$market].n_restarts' <<<"$receipt_process") \
+      || die "existing restore restart evidence is missing: $market"
+    [[ $pid == "$expected_pid" && $restarts == "$expected_restarts" && $restarts == 0 ]] \
+      || die "existing restore process identity changed: $market"
+    exe=$(readlink -f -- "$(monday_root_join "$ROOT" "proc/$pid/exe")") \
+      || die "existing restore process executable is unavailable: $market"
+    [[ $exe == "$binary" && $(monday_sha256_file "$exe") == "$expected_exe" \
+      && $expected_exe == "$payload" ]] \
+      || die "existing restore process executable changed: $market"
+
+    env_file=$(monday_runtime_asset_target "$ROOT" "binance-lob-archiver-production-$market.env") \
+      || die "existing restore environment path is invalid: $market"
+    spool=$(sed -n 's/^SPOOL_DIR=//p' "$env_file" | head -n1)
+    [[ $spool == "/data/monday/spool/binance-lob/$market" ]] \
+      || die "existing restore spool is non-canonical: $market"
+    [[ $ROOT == / ]] || spool="$ROOT$spool"
+    health="$spool/health.json"
+    [[ -f $health && ! -L $health ]] || die "existing restore health is missing: $market"
+    expected_session=$(jq -er --arg market "$market" '.[$market].session_id' <<<"$receipt_process") \
+      || die "existing restore process session evidence is missing: $market"
+    expected_observed=$(jq -er --arg market "$market" '.[$market].observed_at_ns' <<<"$receipt_process") \
+      || die "existing restore process timestamp evidence is missing: $market"
+    expected_health_session=$(jq -er --arg market "$market" '.[$market].session_id' <<<"$receipt_health") \
+      || die "existing restore health session evidence is missing: $market"
+    expected_health_observed=$(jq -er --arg market "$market" '.[$market].observed_at_ns' <<<"$receipt_health") \
+      || die "existing restore health timestamp evidence is missing: $market"
+    [[ $expected_session == "$expected_health_session" && $expected_observed == "$expected_health_observed" ]] \
+      || die "existing restore process/health evidence does not agree: $market"
+    current_session=$(jq -er '.session_id // empty' "$health") \
+      || die "existing restore health session is missing: $market"
+    updated=$(jq -er '.updated_at_ns // 0' "$health") \
+      || die "existing restore health timestamp is missing: $market"
+    now_ns=$(date +%s%N)
+    [[ $current_session == "$expected_session" && $updated =~ ^[0-9]+$ \
+      && $expected_observed =~ ^[0-9]+$ && $updated -ge $expected_observed \
+      && $updated -le $now_ns ]] \
+      || die "existing restore health is stale or in the future: $market"
+    dataset=$(sed -n 's/^DATASET=//p' "$env_file" | head -n1)
+    minimum_symbols=1000; [[ $market == usdm ]] && minimum_symbols=100
+    monday_verify_rust_lob_runtime_health \
+      "$release/deployment/rust-lob-runtime-health-policy.jq" "$health" "$market" \
+      "$dataset" "$minimum_symbols" "$((expected_observed - 1))" \
+      || die "existing restore health policy failed: $market"
+  done
+}
+
+# Idempotency is decided before containment or any projection/systemd write.
+# A completed restore is immutable evidence; repeating it only verifies the
+# exact receipt and returns without touching the running pair.
+receipt_root=$(monday_root_join "$ROOT" data/monday/evidence/restores)
+restore_receipt="$receipt_root/$CONTROLLER/restore.json"
+restore_receipt_sha="$restore_receipt.sha256"
+if [[ -e $restore_receipt || -L $restore_receipt || -e $restore_receipt_sha || -L $restore_receipt_sha ]]; then
+  readonly_idempotency_check=true
+  monday_file_direct "$restore_receipt" || die 'existing restore receipt is indirect'
+  monday_file_direct "$restore_receipt_sha" || die 'existing restore receipt digest is indirect'
+  receipt_digest=$(awk '$2 == "restore.json" { count++; value=$1 } END { if (count != 1) exit 1; print value }' "$restore_receipt_sha") \
+    || die 'existing restore receipt digest is malformed'
+  [[ $receipt_digest == "$(monday_sha256_file "$restore_receipt")" ]] \
+    || die 'existing restore receipt digest does not match'
+  expected_runtime=true
+  [[ $TEST_ONLY == true && $FIXTURE_SYSTEMD == false ]] && expected_runtime=false
+  jq -e --arg controller "$CONTROLLER" --arg payload "$payload" --arg runtime "$runtime" \
+    --argjson test_only "$TEST_ONLY" --argjson expected_runtime "$expected_runtime" \
+    '.schema == "monday.rust_lob_pair_restore.v2"
+     and .operation == "restore" and .result == "success"
+     and .active_pair_converged == true and .production_enabled == $expected_runtime
+     and .test_only == $test_only
+     and .controller_sha256 == $controller
+     and .payload_sha256 == $payload
+     and .runtime_contract_sha256 == $runtime
+     and (.completed_at | type == "string" and length > 0)' \
+    "$restore_receipt" >/dev/null \
+    || die 'existing restore receipt is not an exact successful active pair'
+  verify_existing_restore_state "$restore_receipt" "$expected_runtime"
+  printf 'Pair restore already complete (read-only): %s\n' "$restore_receipt"
+  exit 0
+fi
+
 # If this active pair already has a transition receipt, validate only the Gate
 # path and digest named by that receipt.  A crash before the receipt exists is
 # intentionally recoverable from active C alone; no Gate/previous-state scan is
 # performed.
 active_transition_receipt=$(monday_root_join "$ROOT" "data/monday/evidence/cutovers/$CONTROLLER/transition.json")
+transition_receipt_ref=; transition_gate=; transition_gate_sha=
 if [[ -e $active_transition_receipt || -L $active_transition_receipt ]]; then
+  transition_receipt_ref=$active_transition_receipt
   monday_file_direct "$active_transition_receipt" || die 'active transition receipt is indirect'
   transition_from=$(jq -er '.from_controller_sha256' "$active_transition_receipt") \
     || die 'active transition receipt has no before controller'
@@ -205,7 +443,10 @@ for asset in $(monday_controller_projection_assets); do
     monday_file_direct "$resolved" || die "controller projection is indirect: $asset"
     cmp -s "$resolved" "$release/deployment/$asset" || die "controller projection bytes drifted: $asset"
   elif [[ -f $target && ! -L $target ]]; then
-    cmp -s "$target" "$release/deployment/$asset" || die "controller projection bytes drifted: $asset"
+    owner=$(monday_file_uid "$target") || die "controller projection owner is unavailable: $asset"
+    mode=$(monday_file_mode "$target") || die "controller projection mode is unavailable: $asset"
+    [[ $((8#$mode & 022)) == 0 && ($owner == 0 || $TEST_ONLY == true) ]] \
+      || die "controller projection regular file is not a safe legacy projection: $asset"
   elif [[ ! -e $target ]]; then
     : # The active C is the only source allowed to repair this missing link.
   else
@@ -263,6 +504,10 @@ if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
     || die 'could not contain all canonical writers before restore'
   monday_rust_lob_verify_contained \
     || die 'canonical writers are not stopped, disabled, and runtime-masked'
+  monday_rust_lob_contain_recovery_schedulers \
+    || die 'could not contain recovery schedulers before restore'
+  monday_rust_lob_verify_recovery_schedulers_contained \
+    || die 'recovery schedulers are not stopped, disabled, and runtime-masked'
 fi
 ensure_projection() {
   local target=$1 expected=$2 source=${3:-} temporary="$1.restore.$$" resolved
@@ -284,6 +529,26 @@ ensure_projection() {
   ln -s "$expected" "$temporary"; mv -f -- "$temporary" "$target"
   [[ -L $target && $(readlink -- "$target") == "$expected" ]]
 }
+ensure_controller_projection() {
+  local target=$1 expected=$2 temporary="$1.restore.$$" resolved owner mode
+  mkdir -p "$(dirname -- "$target")"
+  if [[ -L $target ]]; then
+    [[ $(readlink -- "$target") == "$expected" ]] || return 1
+    resolved=$(readlink -f -- "$target") || return 1
+    [[ -f $resolved && ! -L $resolved ]] || return 1
+    return 0
+  fi
+  if [[ -e $target ]]; then
+    [[ -f $target && ! -L $target ]] || return 1
+    owner=$(monday_file_uid "$target") || return 1
+    mode=$(monday_file_mode "$target") || return 1
+    [[ $((8#$mode & 022)) == 0 && ($owner == 0 || $TEST_ONLY == true) ]] || return 1
+    rm -f -- "$target" || return 1
+  fi
+  rm -f -- "$temporary"
+  ln -s "$expected" "$temporary" && mv -f -- "$temporary" "$target"
+  [[ -L $target && $(readlink -- "$target") == "$expected" ]]
+}
 ensure_projection "$production" "$stable_binary" "$binary" || die 'could not converge stable production projection'
 [[ $(readlink -f -- "$production") == "$binary" ]] || die 'stable production projection differs from active payload'
 for asset in "${PAIR_ASSETS[@]}"; do
@@ -301,7 +566,7 @@ for asset in "${CONTROLLER_PROJECTION_ASSETS[@]}"; do
   target=$(monday_controller_projection_target "$ROOT" "$asset") \
     || die "unknown controller projection: $asset"
   expected="$projection/deployment/$asset"
-  ensure_projection "$target" "$expected" "$release/deployment/$asset" \
+  ensure_controller_projection "$target" "$expected" \
     || die "could not converge controller projection: $asset"
   resolved=$(readlink -f -- "$target") \
     || die "controller projection is dangling: $asset"
@@ -333,7 +598,7 @@ if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
     || die 'USD-M failed to start during restore'
 fi
 
-process_json='{}'; health_json='{}'
+process_json='{}'; health_json='{}'; runtime_observed=false
 verify_runtime_lane() {
   local market=$1 unit="binance-lob-archiver-production@${1}.service" pid restarts exe env_file spool health updated session now
   local dataset minimum_symbols old_session policy
@@ -400,6 +665,8 @@ if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
   done
   monday_rust_lob_verify_legacy_contained \
     || die 'legacy canonical writers escaped the restore containment'
+  monday_rust_lob_enable_recovery_schedulers \
+    || die 'recovery schedulers did not become active and enabled after restore'
   # Take one final paired sample.  The receipt must bind the same fresh
   # session/timestamp that passed the active-C health policy for both lanes.
   for market in spot usdm; do
@@ -429,9 +696,9 @@ if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
       "$health" "$market" "$dataset" "$minimum_symbols" "$((expected_observed - 1))" \
       || die "production health policy failed after paired restore sample: $market"
   done
+  runtime_observed=true
 fi
 
-receipt_root=${MONDAY_RESTORE_RECEIPT_ROOT:-$(monday_root_join "$ROOT" data/monday/evidence/restores)}
 mkdir -p "$receipt_root/$CONTROLLER"; receipt="$receipt_root/$CONTROLLER/restore.json"
 [[ ! -e $receipt && ! -L $receipt ]] || die 'restore receipt already exists for this controller'
 projections='{}'
@@ -451,20 +718,42 @@ while IFS= read -r unit; do
     --arg load "$load" --arg active "$active_state" --arg enabled "$enabled_state" \
     '$values + {($unit):{load_state:$load,active_state:$active,unit_file_state:$enabled,contained:($active != "active" and ($enabled == "masked" or ($enabled | startswith("masked-"))))}}')
 done < <(monday_rust_lob_legacy_writer_units)
+recovery_scheduler_state='{}'
+if [[ $runtime_observed == true ]]; then
+  monday_rust_lob_verify_recovery_schedulers_active \
+    || die 'could not read active recovery scheduler state for restore receipt'
+  while IFS= read -r unit; do
+    market=${unit#binance-lob-archiver-recovery@}; market=${market%.timer}
+    active_state=$(systemctl show "$unit" --property=ActiveState --value)
+    enabled_state=$(systemctl show "$unit" --property=UnitFileState --value)
+    [[ $active_state == active && $enabled_state == enabled ]] \
+      || die "recovery scheduler state changed before restore receipt: $market"
+    recovery_scheduler_state=$(jq -cn --argjson values "$recovery_scheduler_state" \
+      --arg market "$market" --arg unit "$unit" \
+      '$values + {($market):{unit:$unit,active:true,enabled:true}}')
+  done < <(monday_rust_lob_recovery_timer_units)
+fi
 tmp="$receipt.tmp.$$"; completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 jq -cS -n --arg controller "$CONTROLLER" --arg payload "$payload" --arg runtime "$runtime" \
   --arg policy_sha "$(monday_sha256_file "$release/deployment/rust-lob-runtime-health-policy.jq")" --arg completed "$completed_at" \
+  --arg transition_receipt "$transition_receipt_ref" --arg gate_receipt "$transition_gate" --arg gate_sha "$transition_gate_sha" \
   --arg projection "/opt/monday/releases/binance-lob-controller/active/binance-lob-archiver" \
   --argjson test_only "$TEST_ONLY" --argjson eligible "$( [[ $TEST_ONLY == true ]] && printf false || printf true )" \
   --argjson processes "$process_json" --argjson health "$health_json" \
   --argjson projections "$projections" --argjson controller_projections "$controller_projections" \
   --argjson production_runtime "$production_runtime" --argjson legacy_containment "$legacy_containment" \
+  --argjson recovery_schedulers "$recovery_scheduler_state" \
+  --argjson production_enabled "$runtime_observed" \
   '{schema:"monday.rust_lob_pair_restore.v2",control_plane_version:2,operation:"restore",test_only:$test_only,production_eligible:$eligible,
     controller_sha256:$controller,payload_sha256:$payload,runtime_contract_sha256:$runtime,
+    transition_receipt:(if $transition_receipt == "" then null else $transition_receipt end),
+    gate_receipt:(if $gate_receipt == "" then null else $gate_receipt end),
+    gate_sha256:(if $gate_sha == "" then null else $gate_sha end),
     runtime_health_policy_sha256:$policy_sha,stable_production_projection:$projection,
     active_pair_converged:true,installed_projections:$projections,controller_projections:$controller_projections,
     production_runtime:$production_runtime,legacy_writer_containment:$legacy_containment,
-    production_enabled:true,process_identity:$processes,health:$health,
+    recovery_schedulers:$recovery_schedulers,
+    production_enabled:$production_enabled,process_identity:$processes,health:$health,
     completed_at:$completed,result:"success"}' >"$tmp"
 chmod 0640 "$tmp"; mv -f -- "$tmp" "$receipt"; success=true
 receipt_sha=$(monday_sha256_file "$receipt"); printf '%s  restore.json\n' "$receipt_sha" >"$receipt.sha256"; chmod 0440 "$receipt" "$receipt.sha256"

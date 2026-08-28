@@ -307,6 +307,8 @@ secure_release_identity() {
         and .runtime_contract_sha256 == $runtime' \
       "$controller_manifest" >/dev/null \
       || fail 'active controller does not bind the production artifact and runtime contract'
+    ACTIVE_CONTROLLER_SHA256=$controller_sha
+    ACTIVE_RUNTIME_CONTRACT_SHA256=$runtime_contract
     [[ -L $INSTALLED_RECOVERY ]] \
       || fail "installed recovery controller is not the active projection: $INSTALLED_RECOVERY"
     [[ $(readlink -- "$INSTALLED_RECOVERY") == \
@@ -357,7 +359,7 @@ queue_lock() {
 }
 
 copy_active_oss() {
-  local uri=$1 target=$2 profile endpoint region
+  local uri=$1 target=$2 profile endpoint region cli=/usr/local/bin/aliyun
   profile=$(env_value "$RELEASE_ENV_FILE" ALIYUN_PROFILE) \
     || fail 'active recovery environment has no OSS profile'
   endpoint=$(env_value "$RELEASE_ENV_FILE" OSS_ENDPOINT) \
@@ -365,9 +367,10 @@ copy_active_oss() {
   region=$(env_value "$RELEASE_ENV_FILE" OSS_REGION) \
     || fail 'active recovery environment has no OSS region'
   [[ $uri == oss://* && -n $target ]] || return 1
+  [[ -x $cli ]] || fail "trusted OSS CLI is missing: $cli"
   runuser --user hftcollector -- env -i \
     HOME=/var/lib/hft-collector PATH="$SAFE_PATH" ALIYUN_PROFILE="$profile" \
-    aliyun ossutil cp "$uri" "$target" --profile "$profile" \
+    "$cli" ossutil cp "$uri" "$target" --profile "$profile" \
     --endpoint "$endpoint" --region "$region" --force --no-progress >/dev/null
 }
 
@@ -416,13 +419,18 @@ write_job_receipt() {
     --arg canonical_spool "$CANONICAL_SPOOL" \
     --arg env_sha256 "$ENV_SHA256" \
     --arg release_sha256 "$RELEASE_SHA256" \
+    --arg payload_sha256 "$RELEASE_SHA256" \
+    --arg controller_sha256 "${ACTIVE_CONTROLLER_SHA256:-}" \
+    --arg runtime_contract_sha256 "${ACTIVE_RUNTIME_CONTRACT_SHA256:-}" \
     --arg deployment_bundle_sha256 "$RELEASE_BUNDLE_SHA256" \
     --arg deployment_source_revision "$RELEASE_SOURCE_REVISION" \
     --arg release_env recovery.env \
     --arg recovery_unit "$queue_unit" \
     '{schema:$schema,job_id:$job_id,queued_at:$queued_at,market:$market,
       canonical_spool:$canonical_spool,env_sha256:$env_sha256,
-      release_sha256:$release_sha256,deployment_bundle_sha256:$deployment_bundle_sha256,
+      release_sha256:$release_sha256,payload_sha256:$payload_sha256,
+      controller_sha256:$controller_sha256,runtime_contract_sha256:$runtime_contract_sha256,
+      deployment_bundle_sha256:$deployment_bundle_sha256,
       deployment_source_revision:$deployment_source_revision,
       release_env:$release_env,recovery_unit:$recovery_unit}' >"$tmp"
   chmod 0640 "$tmp"
@@ -437,7 +445,7 @@ write_job_receipt() {
 job_dir_id() {
   local name=${1##*/}
   case "$name" in
-    *.ready|*.running|*.failed) printf '%s\n' "${name%.*}" ;;
+    *.ready|*.running|*.failed|*.stale) printf '%s\n' "${name%.*}" ;;
     *) return 1 ;;
   esac
 }
@@ -665,6 +673,9 @@ write_result() {
     --arg job_id "$JOB_ID" \
     --arg market "$MARKET" \
     --arg release_sha256 "$JOB_RELEASE_SHA256" \
+    --arg payload_sha256 "${JOB_PAYLOAD_SHA256:-$JOB_RELEASE_SHA256}" \
+    --arg controller_sha256 "${JOB_CONTROLLER_SHA256:-}" \
+    --arg runtime_contract_sha256 "${JOB_RUNTIME_CONTRACT_SHA256:-}" \
     --arg deployment_bundle_sha256 "$JOB_BUNDLE_SHA256" \
     --arg deployment_source_revision "$JOB_SOURCE_REVISION" \
     --arg env_sha256 "$JOB_ENV_SHA256" \
@@ -676,6 +687,8 @@ write_result() {
     --argjson upload_triplet_readback "${UPLOAD_TRIPLET_READBACK:-{}}" \
     '{schema:$schema,job_id:$job_id,market:$market,
       release_sha256:$release_sha256,deployment_bundle_sha256:$deployment_bundle_sha256,
+      payload_sha256:$payload_sha256,controller_sha256:$controller_sha256,
+      runtime_contract_sha256:$runtime_contract_sha256,
       deployment_source_revision:$deployment_source_revision,env_sha256:$env_sha256,
       started_at:$started_at,completed_at:$completed_at,result:$result,
       step:$step,message:$message,upload_triplet_readback:$upload_triplet_readback}' >"$path.tmp"
@@ -701,9 +714,12 @@ load_job() {
   JOB_MARKET=$(jq -er '.market' "$job_json")
   JOB_CANONICAL_SPOOL=$(jq -er '.canonical_spool' "$job_json")
   JOB_RELEASE_SHA256=$(jq -er '.release_sha256' "$job_json")
+  JOB_PAYLOAD_SHA256=$(jq -er '.payload_sha256 // .release_sha256' "$job_json")
   JOB_BUNDLE_SHA256=$(jq -er '.deployment_bundle_sha256' "$job_json")
   JOB_SOURCE_REVISION=$(jq -er '.deployment_source_revision' "$job_json")
   JOB_ENV_SHA256=$(jq -er '.env_sha256' "$job_json")
+  JOB_CONTROLLER_SHA256=$(jq -er '.controller_sha256 // empty' "$job_json") || true
+  JOB_RUNTIME_CONTRACT_SHA256=$(jq -er '.runtime_contract_sha256 // empty' "$job_json") || true
   job_env=$(jq -er '.release_env' "$job_json")
   JOB_RECOVERY_UNIT=$(jq -er '.recovery_unit' "$job_json")
   [[ $job_schema == monday.rust_lob_recovery_queue.v1 ]] || fail "queued job has an invalid schema: $queue_dir"
@@ -713,6 +729,7 @@ load_job() {
   [[ $JOB_MARKET == "$MARKET" ]] || fail "queued job market mismatch: $queue_dir"
   [[ $JOB_CANONICAL_SPOOL == "$CANONICAL_SPOOL" ]] || fail "queued job canonical spool mismatch: $queue_dir"
   [[ $JOB_RELEASE_SHA256 =~ ^[a-f0-9]{64}$ ]] || fail "queued job has an invalid release sha: $queue_dir"
+  [[ $JOB_PAYLOAD_SHA256 =~ ^[a-f0-9]{64}$ ]] || fail "queued job has an invalid payload sha: $queue_dir"
   [[ $JOB_BUNDLE_SHA256 =~ ^[a-f0-9]{64}$ ]] || fail "queued job has an invalid bundle sha: $queue_dir"
   [[ $JOB_SOURCE_REVISION =~ ^[a-f0-9]{40,64}$ ]] || fail "queued job has an invalid source revision: $queue_dir"
   [[ $JOB_ENV_SHA256 =~ ^[a-f0-9]{64}$ ]] || fail "queued job has an invalid env sha: $queue_dir"
@@ -720,11 +737,50 @@ load_job() {
     || fail "queued job release env mismatch: $queue_dir"
   [[ $JOB_RECOVERY_UNIT == "$RECOVERY_SERVICE@$MARKET.service" ]] \
     || fail "queued job recovery unit mismatch: $queue_dir"
+  [[ -z $JOB_CONTROLLER_SHA256 || $JOB_CONTROLLER_SHA256 =~ ^[a-f0-9]{64}$ ]] \
+    || fail "queued job has an invalid controller sha: $queue_dir"
+  [[ -z $JOB_RUNTIME_CONTRACT_SHA256 || $JOB_RUNTIME_CONTRACT_SHA256 =~ ^[a-f0-9]{64}$ ]] \
+    || fail "queued job has an invalid runtime contract sha: $queue_dir"
+}
+
+job_identity_matches_active() {
+  [[ -n ${JOB_CONTROLLER_SHA256:-} && -n ${JOB_RUNTIME_CONTRACT_SHA256:-} ]] || return 1
+  [[ ${JOB_RELEASE_SHA256:-} == "${RELEASE_SHA256:-}" \
+    && ${JOB_PAYLOAD_SHA256:-} == "${RELEASE_SHA256:-}" \
+    && ${JOB_BUNDLE_SHA256:-} == "${RELEASE_BUNDLE_SHA256:-}" \
+    && ${JOB_SOURCE_REVISION:-} == "${RELEASE_SOURCE_REVISION:-}" \
+    && ${JOB_ENV_SHA256:-} == "${ENV_SHA256:-}" \
+    && $JOB_CONTROLLER_SHA256 == "${ACTIVE_CONTROLLER_SHA256:-}" \
+    && $JOB_RUNTIME_CONTRACT_SHA256 == "${ACTIVE_RUNTIME_CONTRACT_SHA256:-}" ]]
+}
+
+mark_stale() {
+  local running_dir=$1 step=$2 message=$3 stale_dir evidence_root result_path
+  load_job "$running_dir"
+  JOB_STARTED_AT=${JOB_STARTED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}
+  stale_dir="${running_dir%.running}.stale"
+  evidence_root=$(job_evidence_root "$JOB_ID")
+  ensure_root_directory "$DATA_ROOT/monday/evidence"
+  ensure_root_directory "$DATA_ROOT/monday/evidence/recoveries"
+  ensure_root_directory "$EVIDENCE_ROOT"
+  ensure_root_directory "$evidence_root"
+  result_path="$evidence_root/result.json"
+  [[ ! -e $result_path && ! -L $result_path ]] || fail "refusing to overwrite stale recovery result: $result_path"
+  write_result "$result_path" stale "$step" "$message"
+  [[ ! -e $stale_dir && ! -L $stale_dir ]] || fail "refusing to reuse stale recovery path: $stale_dir"
+  mv -T -- "$running_dir" "$stale_dir"
+  sync "$QUEUE_MARKET_ROOT"
+  sync "$evidence_root"
 }
 
 finalize_passed_running() {
   local running_dir=$1 result evidence_root completed_at
   load_job "$running_dir"
+  secure_release_identity
+  if ! job_identity_matches_active; then
+    mark_stale "$running_dir" stale-identity 'queued recovery identity is not the active ControllerRelease'
+    return 0
+  fi
   evidence_root=$(job_evidence_root "$JOB_ID")
   [[ -d $evidence_root && ! -L $evidence_root ]] || return 1
   secure_directory "$evidence_root" 0 0
@@ -765,6 +821,10 @@ run_drain_job() {
   # The failed job identity is evidence only.  Executable and runtime bytes
   # always come from the currently active ControllerRelease.
   secure_release_identity
+  if ! job_identity_matches_active; then
+    mark_stale "$running_dir" stale-identity 'queued recovery identity is not the active ControllerRelease'
+    return 0
+  fi
   release_dir="$RELEASE_ROOT/$RELEASE_SHA256"
   path_is_direct_or_absent "$release_dir" || fail "release path contains a symlink: $release_dir"
   release_binary="$release_dir/binance-lob-archiver"
@@ -895,6 +955,12 @@ drain_market() {
 
 main() {
   local action=${1:-} market=${2:-} command
+  export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  local inherited_name
+  while IFS= read -r inherited_name; do
+    [[ -n $inherited_name ]] || continue
+    fail "production recovery refuses inherited control-plane override: $inherited_name"
+  done < <(compgen -v MONDAY_)
   if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
     printf 'must run as root\n' >&2
     exit 2

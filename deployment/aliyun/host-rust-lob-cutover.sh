@@ -28,8 +28,6 @@ ROOT=${ROOT%/}; [[ -n $ROOT ]] || ROOT=/
 [[ -n $GATE ]] || die 'Gate receipt is required'
 [[ $FROM != "$TO" ]] || die 'cutover requires distinct before and target controllers'
 TEST_ONLY=false; [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 ]] && TEST_ONLY=true
-[[ $TEST_ONLY == true && $ROOT != / ]] || [[ $TEST_ONLY == false ]] \
-  || die 'test mode requires an isolated fixture root'
 PRODUCTION_HEALTH_WAIT_SECONDS=${MONDAY_CUTOVER_HEALTH_TIMEOUT_SECONDS:-240}
 PRODUCTION_HEALTH_POLL_SECONDS=${MONDAY_CUTOVER_HEALTH_POLL_SECONDS:-1}
 [[ $PRODUCTION_HEALTH_WAIT_SECONDS =~ ^[1-9][0-9]*$ && $PRODUCTION_HEALTH_WAIT_SECONDS -le 900 ]] \
@@ -40,6 +38,8 @@ PRODUCTION_HEALTH_POLL_SECONDS=${MONDAY_CUTOVER_HEALTH_POLL_SECONDS:-1}
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
+monday_control_plane_validate_mode "$ROOT" "$TEST_ONLY" \
+  || die 'production uses canonical root or fixture mode lacks an explicit sentinel'
 
 controller_root=$(monday_root_join "$ROOT" opt/monday/releases/binance-lob-controller)
 production=$(monday_root_join "$ROOT" opt/monday/bin/binance-lob-archiver)
@@ -94,7 +94,9 @@ if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
           fixture_unit_state[$argument]=active
           [[ -n ${fixture_unit_file_state[$argument]:-} ]] || fixture_unit_file_state[$argument]=enabled
           fixture_unit_load_state[$argument]=loaded
-          printf '%s\n' "$(monday_active_controller_sha "$ROOT")" >"$fixture_process_root/${argument//@/_}"
+          if [[ $argument == *.service ]]; then
+            printf '%s\n' "$(monday_active_controller_sha "$ROOT")" >"$fixture_process_root/${argument//@/_}"
+          fi
           printf 'start %s\n' "$argument" >>"$fixture_calls"
         done
         return 0 ;;
@@ -138,8 +140,9 @@ if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
         esac
         return 0 ;;
       is-enabled)
-        printf '%s\n' "${fixture_unit_file_state[$2]:-disabled}"
-        [[ ${fixture_unit_file_state[$2]:-disabled} == enabled ]] && return 0
+        [[ $2 == --quiet ]] && unit=$3
+        printf '%s\n' "${fixture_unit_file_state[$unit]:-disabled}"
+        [[ ${fixture_unit_file_state[$unit]:-disabled} == enabled ]] && return 0
         return 1 ;;
       *) return 0 ;;
     esac
@@ -436,6 +439,10 @@ cleanup() {
             monday_rust_lob_contain_legacy_writers || rollback_failed=true
             monday_rust_lob_verify_legacy_contained || rollback_failed=true
           fi
+          # Recovery timers are part of the V2 runtime contract.  Re-enable
+          # them only after the previous writer state has been restored; a
+          # failed rollback keeps the complete scheduler set contained below.
+          monday_rust_lob_enable_recovery_schedulers || rollback_failed=true
         fi
         if [[ $rollback_failed == false ]]; then
           monday_rust_lob_verify_writer_state_snapshot() {
@@ -454,6 +461,8 @@ cleanup() {
       if [[ $rollback_failed == true ]]; then
         monday_rust_lob_contain_writers >/dev/null 2>&1 || true
         monday_rust_lob_verify_contained >/dev/null 2>&1 || true
+        monday_rust_lob_contain_recovery_schedulers >/dev/null 2>&1 || true
+        monday_rust_lob_verify_recovery_schedulers_contained >/dev/null 2>&1 || true
         printf 'pair rollback failed; all canonical writers remain contained\n' >&2
       fi
     fi
@@ -492,6 +501,12 @@ if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
   fi
   monday_rust_lob_verify_contained \
     || die 'canonical writers are not stopped, disabled, and runtime-masked'
+  if ! monday_rust_lob_contain_recovery_schedulers; then
+    writer_containment_failed=1
+    die 'could not contain recovery schedulers before pair transition'
+  fi
+  monday_rust_lob_verify_recovery_schedulers_contained \
+    || die 'recovery schedulers are not stopped, disabled, and runtime-masked'
 fi
 if [[ $FROM == direct ]]; then
   # The containment boundary must not widen the bootstrap identity window. Re-read
@@ -585,7 +600,7 @@ fi
 production_process='{}'
 declare -A expected_pid expected_restarts expected_exe_sha
 verify_production_process() {
-  local market unit active sub pid restarts enabled exe exe_sha env_file env_file_resolved spool health session updated now_ns minimum_symbols
+  local market unit active sub pid restarts enabled exe exe_sha env_file env_file_resolved spool health session updated now_ns minimum_symbols policy
   local deadline health_session ready recorded_pid recorded_restarts recorded_exe recorded_session recorded_observed
   # Ordinary fixture cutovers never start a process.  The opt-in fixture
   # systemd path below exercises the same identity/freshness loop without
@@ -605,6 +620,7 @@ verify_production_process() {
     [[ $ROOT == / ]] || spool="$ROOT$spool"
     health="$spool/health.json"
     minimum_symbols=1000; [[ $market == usdm ]] && minimum_symbols=100
+    policy="$target_release/deployment/rust-lob-runtime-health-policy.jq"
     deadline=$(( $(date +%s) + PRODUCTION_HEALTH_WAIT_SECONDS )); health_session=; ready=false
     while :; do
       # Process identity is sampled on every poll.  A restart or PID/exe
@@ -645,11 +661,9 @@ verify_production_process() {
             die "$market production health session changed while awaiting health"
           fi
           health_session=$session
-          if jq -e --arg market "$market" --arg dataset "$(sed -n 's/^DATASET=//p' "$env_file_resolved")" \
-            --argjson minimum "$minimum_symbols" \
-            '.market == $market and .dataset == $dataset and .status == "synced"
-             and .sequence_gaps == 0 and (.symbol_count | type == "number" and . >= $minimum)' \
-            "$health" >/dev/null 2>&1; then
+          if monday_verify_rust_lob_runtime_health "$policy" "$health" "$market" \
+            "$(sed -n 's/^DATASET=//p' "$env_file_resolved")" "$minimum_symbols" \
+            "$((cutover_started_ns - 1))" >/dev/null 2>&1; then
             ready=true
           fi
         fi
@@ -702,16 +716,20 @@ verify_production_process() {
       && $updated -ge "$cutover_started_ns" && $updated -le "$now_ns" ]] \
       || die "$market production health is stale or in the future after readiness"
     minimum_symbols=1000; [[ $market == usdm ]] && minimum_symbols=100
-    jq -e --arg market "$market" --arg dataset "$(sed -n 's/^DATASET=//p' "$env_file_resolved")" \
-      --argjson minimum "$minimum_symbols" \
-      '.market == $market and .dataset == $dataset and .status == "synced"
-       and .sequence_gaps == 0 and (.symbol_count | type == "number" and . >= $minimum)' \
-      "$health" >/dev/null || die "$market production health is not synchronized after readiness"
+    policy="$target_release/deployment/rust-lob-runtime-health-policy.jq"
+    monday_verify_rust_lob_runtime_health "$policy" "$health" "$market" \
+      "$(sed -n 's/^DATASET=//p' "$env_file_resolved")" "$minimum_symbols" \
+      "$((cutover_started_ns - 1))" \
+      || die "$market production health policy failed after readiness"
     production_process=$(jq -cn --argjson values "$production_process" --arg market "$market" \
       --argjson observed "$updated" '$values + {($market):($values[$market] + {observed_at_ns:$observed})}')
   done
 }
 verify_production_process
+if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
+  monday_rust_lob_enable_recovery_schedulers \
+    || die 'recovery schedulers did not become active and enabled after cutover'
+fi
 if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
   monday_rust_lob_verify_legacy_contained \
     || die 'legacy canonical writers escaped the successful V2 transition'
@@ -738,10 +756,23 @@ for asset in "${CONTROLLER_PROJECTION_ASSETS[@]}"; do
     || die "active controller projection differs from target: $asset"
 done
 
-receipt_root=${MONDAY_CUTOVER_RECEIPT_ROOT:-$(monday_root_join "$ROOT" data/monday/evidence/cutovers)}
+recovery_scheduler_state='{}'
+if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
+  for recovery_timer in $(monday_rust_lob_recovery_timer_units); do
+    recovery_market=${recovery_timer#binance-lob-archiver-recovery@}
+    recovery_market=${recovery_market%.timer}
+    recovery_scheduler_state=$(jq -cn --argjson values "$recovery_scheduler_state" \
+      --arg market "$recovery_market" --arg timer "$recovery_timer" \
+      '$values + {($market):{unit:$timer,active:true,enabled:true}}')
+  done
+fi
+
+receipt_root=$(monday_root_join "$ROOT" data/monday/evidence/cutovers)
 mkdir -p "$receipt_root/$TO"; receipt="$receipt_root/$TO/transition.json"
 [[ ! -e $receipt && ! -L $receipt ]] || die 'transition receipt already exists for target controller'
-completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+completed_at_ns=$(date +%s%N)
+[[ $completed_at_ns =~ ^[0-9]+$ ]] || die 'cutover completion timestamp is unavailable'
+completed_at=$(monday_epoch_ns_rfc3339 "$completed_at_ns") || die 'cutover completion timestamp is invalid'
 before_assets='{}'; installed_assets='{}'; installed_projections='{}'; installed_controller_projections='{}'
 for asset in "${PAIR_ASSETS[@]}"; do
   before_assets=$(jq -cn --argjson values "$before_assets" --arg asset "$asset" \
@@ -764,11 +795,12 @@ gate_evidence=$(jq -cS '{candidate_control_bytes,resource_admission,io_full_psi_
 transition_tmp="$receipt.tmp.$$"
 source_mode=stable
 [[ $FROM == direct ]] && source_mode=direct
-jq -cS -n --arg from "$before_controller" --arg source_mode "$source_mode" --arg to "$TO" --arg payload "$target_payload" --arg runtime "$target_runtime" \
+  jq -cS -n --arg from "$before_controller" --arg source_mode "$source_mode" --arg to "$TO" --arg payload "$target_payload" --arg runtime "$target_runtime" \
   --arg before_payload "$before_payload" --arg before_runtime "$before_runtime" --arg gate "$GATE" --arg gate_sha "$GATE_SHA" \
-  --arg completed "$completed_at" --arg stable "/opt/monday/releases/binance-lob-controller/active/binance-lob-archiver" \
+  --arg completed "$completed_at" --argjson completed_ns "$completed_at_ns" --arg stable "/opt/monday/releases/binance-lob-controller/active/binance-lob-archiver" \
   --arg projection "$stable_projection" --argjson evidence "$gate_evidence" \
   --argjson production_runtime "$gate_production_runtime" --argjson production_process "$production_process" \
+  --argjson recovery_schedulers "$recovery_scheduler_state" \
   --argjson before_assets "$before_assets" \
   --argjson installed_assets "$installed_assets" --argjson installed_projections "$installed_projections" \
   --argjson installed_controller_projections "$installed_controller_projections" \
@@ -778,7 +810,8 @@ jq -cS -n --arg from "$before_controller" --arg source_mode "$source_mode" --arg
     from_controller_sha256:$from,controller_sha256:$to,
     payload_sha256:$payload,runtime_contract_sha256:$runtime,gate_receipt:$gate,gate_sha256:$gate_sha,
     production_runtime:$production_runtime,production_process:$production_process,
-    gate_evidence:$evidence,active_pair_committed:true,completed_at:$completed,
+    recovery_schedulers:$recovery_schedulers,
+    gate_evidence:$evidence,active_pair_committed:true,completed_at:$completed,completed_at_ns:$completed_ns,
     stable_production_projection:$stable,production_projection:$projection,
     before:{controller:$from,payload_sha256:$before_payload,runtime_contract_sha256:$before_runtime,
       production_projection:$stable,assets:$before_assets},

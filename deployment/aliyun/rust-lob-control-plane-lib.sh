@@ -53,6 +53,75 @@ monday_iso_epoch() {
   date -u -j -f '%Y-%m-%dT%H:%M:%S%z' "$normalized" +%s
 }
 
+# Parse an RFC3339 timestamp without discarding its fractional component.  All
+# control-plane receipts compare nanoseconds so a pre-cutover value in the
+# same wall-clock second cannot pass a gate by rounding to epoch seconds.
+monday_iso_epoch_ns() {
+  [[ $# -eq 1 ]] || return 2
+  local value=$1 seconds fraction normalized
+  [[ $value =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(\.([0-9]{1,9}))?(Z|[+-][0-9]{2}:[0-9]{2})$ ]] || return 1
+  seconds=$(monday_iso_epoch "$value") || return 1
+  fraction=${BASH_REMATCH[3]:-}
+  while ((${#fraction} < 9)); do fraction="${fraction}0"; done
+  (( ${#fraction} == 9 )) || return 1
+  [[ $seconds =~ ^-?[0-9]+$ && $fraction =~ ^[0-9]{9}$ ]] || return 1
+  printf '%s\n' "$((seconds * 1000000000 + 10#$fraction))"
+}
+
+monday_epoch_ns_rfc3339() {
+  [[ $# -eq 1 && $1 =~ ^[0-9]+$ ]] || return 2
+  local value=$1 seconds fraction date_value
+  seconds=$((value / 1000000000)); fraction=$((value % 1000000000))
+  if date_value=$(date -u -d "@$seconds" +%Y-%m-%dT%H:%M:%S 2>/dev/null); then
+    :
+  else
+    date_value=$(date -u -r "$seconds" +%Y-%m-%dT%H:%M:%S) || return 1
+  fi
+  printf '%s.%09dZ\n' "$date_value" "$fraction"
+}
+
+monday_validate_component() {
+  [[ $# -eq 1 && $1 =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ && $1 != . && $1 != .. && $1 != *%* && $1 != *\\* ]]
+}
+
+monday_validate_oss_prefix() {
+  [[ $# -eq 3 ]] || return 2
+  local market=$1 dataset=$2 prefix=$3
+  monday_validate_component "$dataset" || return 1
+  [[ $market == spot || $market == usdm ]] || return 1
+  [[ $prefix == "lake/raw/venue=binance/market=$market/dataset=$dataset/shard=all" ]]
+}
+
+monday_path_direct_or_absent() {
+  [[ $# -eq 1 ]] || return 2
+  [[ ! -e $1 && ! -L $1 ]] || monday_path_direct "$1"
+}
+
+# Host operations have exactly two modes.  Production is rooted at / and may
+# not inherit a test root, timeout, fixture fault, or evidence redirect from a
+# caller's shell.  Offline fixtures must opt in with a non-root root and an
+# explicit sentinel; this prevents a copied test command from ever reaching
+# the real host paths.
+monday_control_plane_validate_mode() {
+  [[ $# -eq 2 ]] || return 2
+  local root=${1%/} test_only=$2 name
+  [[ -n $root ]] || root=/
+  if [[ $test_only == true ]]; then
+    [[ $root != / ]] || return 1
+    [[ ${MONDAY_CONTROL_PLANE_FIXTURE_SENTINEL:-} == monday-v2-fixture \
+      || -f "$root/.monday-control-plane-fixture" ]] || return 1
+    return 0
+  fi
+  [[ $root == / ]] || return 1
+  # MONDAY_* is intentionally absent from the production environment.  The
+  # local operator sends an env -i command, and a direct invocation with any
+  # redirect/test knob is refused instead of silently changing the state root.
+  while IFS= read -r name; do
+    [[ -n $name ]] || continue
+    return 1
+  done < <(compgen -v MONDAY_)
+}
+
 monday_path_direct() {
   [[ $# -eq 1 ]] || return 2
   local path=$1 resolved
@@ -63,6 +132,16 @@ monday_path_direct() {
 
 monday_file_direct() {
   [[ $# -eq 1 && -f $1 && ! -L $1 ]]
+}
+
+monday_file_uid() {
+  [[ $# -eq 1 ]] || return 2
+  stat -c %u -- "$1" 2>/dev/null || stat -f %u -- "$1"
+}
+
+monday_file_mode() {
+  [[ $# -eq 1 ]] || return 2
+  stat -c %a -- "$1" 2>/dev/null || stat -f %Lp -- "$1"
 }
 
 monday_runtime_assets() {
@@ -139,6 +218,66 @@ monday_rust_lob_shadow_writer_units() {
     binance-lob-archiver-rust@usdm.service \
     binance-lob-archiver-rust-upload@spot.service \
     binance-lob-archiver-rust-upload@usdm.service
+}
+
+monday_rust_lob_recovery_service_units() {
+  printf '%s\n' \
+    binance-lob-archiver-recovery@spot.service \
+    binance-lob-archiver-recovery@usdm.service
+}
+
+monday_rust_lob_recovery_timer_units() {
+  printf '%s\n' \
+    binance-lob-archiver-recovery@spot.timer \
+    binance-lob-archiver-recovery@usdm.timer
+}
+
+monday_rust_lob_recovery_scheduler_units() {
+  monday_rust_lob_recovery_service_units
+  monday_rust_lob_recovery_timer_units
+}
+
+monday_rust_lob_contain_recovery_schedulers() {
+  local unit failed=0
+  while IFS= read -r unit; do
+    systemctl stop "$unit" >/dev/null 2>&1 || failed=1
+    systemctl disable "$unit" >/dev/null 2>&1 || failed=1
+    systemctl mask --runtime "$unit" >/dev/null 2>&1 || failed=1
+  done < <(monday_rust_lob_recovery_scheduler_units)
+  return "$failed"
+}
+
+monday_rust_lob_verify_recovery_schedulers_contained() {
+  local unit load active enabled
+  while IFS= read -r unit; do
+    IFS=$'\t' read -r load active enabled \
+      < <(monday_rust_lob_writer_state "$unit") || return 1
+    [[ $active != active && $active != activating && $active != deactivating ]] || return 1
+    [[ $enabled == masked || $enabled == masked-runtime || $enabled == masked-runtime* ]] || return 1
+  done < <(monday_rust_lob_recovery_scheduler_units)
+}
+
+monday_rust_lob_enable_recovery_schedulers() {
+  local unit failed=0
+  while IFS= read -r unit; do
+    systemctl unmask "$unit" >/dev/null 2>&1 || failed=1
+  done < <(monday_rust_lob_recovery_scheduler_units)
+  while IFS= read -r unit; do
+    systemctl enable "$unit" >/dev/null 2>&1 || failed=1
+  done < <(monday_rust_lob_recovery_timer_units)
+  while IFS= read -r unit; do
+    systemctl start "$unit" >/dev/null 2>&1 || failed=1
+  done < <(monday_rust_lob_recovery_timer_units)
+  monday_rust_lob_verify_recovery_schedulers_active || failed=1
+  return "$failed"
+}
+
+monday_rust_lob_verify_recovery_schedulers_active() {
+  local unit
+  while IFS= read -r unit; do
+    systemctl is-enabled --quiet "$unit" >/dev/null 2>&1 || return 1
+    systemctl is-active --quiet "$unit" >/dev/null 2>&1 || return 1
+  done < <(monday_rust_lob_recovery_timer_units)
 }
 
 monday_rust_lob_all_writer_units() {
@@ -1048,7 +1187,7 @@ monday_verify_controller_release() {
 monday_validate_v2_gate() {
   [[ $# -eq 4 ]] || return 2
   local gate=$1 from=$2 candidate=$3 gate_sha=$4
-  local controller_asset_keys production_asset_keys shadow_asset_keys
+  local controller_asset_keys production_asset_keys shadow_asset_keys observed_now_ns market observed_at observed_at_ns parsed_observed
   controller_asset_keys=$(monday_controller_assets | jq -Rsc 'split("\n") | map(select(length > 0)) | sort') || return 1
   production_asset_keys=$(printf '%s\n' \
     binance-lob-archiver-production@.service \
@@ -1252,6 +1391,7 @@ monday_validate_v2_gate() {
           and (.aliyun_profile == "ecs-role")
           and (.expected_oss_bucket | type == "string" and length > 0)
           and (.expected_oss_prefix | type == "string" and length > 0)
+          and (.observed_at_ns | type == "number" and floor == . and . >= 0)
           and ($m.segment_count | type == "number" and . >= 2 and . == ($m.segments | length))
           and ($m.oss_triplet_count | type == "number" and . >= 2 and . == ($m.triplets | length))
           and (.n_restarts | type == "number" and . == 0)
@@ -1274,6 +1414,7 @@ monday_validate_v2_gate() {
               and (.start_received_at_ns | type == "number" and . >= 0)
               and (.end_received_at_ns | type == "number")
               and (.end_received_at_ns >= .start_received_at_ns)
+              and (.end_received_at_ns <= $m.observed_at_ns)
               and (.session_id | type == "string" and . == $m.session_id)))
           and (.triplets | type == "array" and length >= 2
             and all(.[];
@@ -1293,7 +1434,9 @@ monday_validate_v2_gate() {
               and (.start_received_at_ns | type == "number" and . >= 0)
               and (.end_received_at_ns | type == "number")
               and (.end_received_at_ns >= .start_received_at_ns)
-              and (.observed_at | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+              and (.end_received_at_ns <= $m.observed_at_ns)
+              and (.observed_at | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$"))
+              and (.observed_at_ns | type == "number" and floor == . and . >= 0)
               and (.session_id | type == "string" and . == $m.session_id)
               and (.catalog_sha256 | type == "string" and . == $m.health.frozen_catalog_sha256)))
           and (.health | type == "object"
@@ -1304,7 +1447,18 @@ monday_validate_v2_gate() {
             and (.max_health_silence_seconds | type == "number" and . >= 0 and . <= 120)
             and (.samples | type == "number" and . >= 1)
             and .session_id == $m.session_id)))' \
-    "$gate" >/dev/null
+    "$gate" >/dev/null || return 1
+  observed_now_ns=$(date +%s%N) || return 1
+  [[ $observed_now_ns =~ ^[0-9]+$ ]] || return 1
+  while IFS=$'\t' read -r market observed_at observed_at_ns market_observed_at_ns; do
+    [[ $market == spot || $market == usdm ]] || return 1
+    [[ $observed_at_ns =~ ^[0-9]+$ && $market_observed_at_ns =~ ^[0-9]+$ \
+      && $observed_at_ns -le $market_observed_at_ns \
+      && $market_observed_at_ns -le $observed_now_ns ]] || return 1
+    parsed_observed=$(monday_iso_epoch_ns "$observed_at") || return 1
+    [[ $parsed_observed == "$observed_at_ns" ]] || return 1
+  done < <(jq -r '.markets | to_entries[] | .key as $market | .value as $value
+    | $value.triplets[] | [$market, .observed_at, .observed_at_ns, $value.observed_at_ns] | @tsv' "$gate")
 }
 
 # Validate the transition receipt and its exact V2 Gate evidence.  A cutover
@@ -1355,6 +1509,11 @@ monday_validate_v2_transition() {
     and (if .test_only then .production_eligible == false else .production_eligible == true end)
     and (.production_runtime | type == "object")
     and (.production_process | type == "object")
+    and (.recovery_schedulers | type == "object"
+      and (if .test_only then true else (keys | sort) == ["spot", "usdm"] end)
+      and (if .test_only then true else all(.[];
+        .active == true and .enabled == true
+        and (.unit | type == "string" and test("^binance-lob-archiver-recovery@(spot|usdm)\\.timer$"))) end))
     and (if .test_only then
       (.production_process == {} or
        ((.production_process | keys | sort) == ["spot", "usdm"]
@@ -1376,7 +1535,8 @@ monday_validate_v2_transition() {
          and (.observed_at_ns | type == "number" and . >= 0)))
     end)
     and .active_pair_committed == true
-    and (.completed_at | type == "string" and length > 0)
+    and (.completed_at | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$"))
+    and (.completed_at_ns | type == "number" and floor == . and . >= 0)
     and (.stable_production_projection | type == "string"
       and . == "/opt/monday/releases/binance-lob-controller/active/binance-lob-archiver")
     and (.gate_evidence | type == "object"
@@ -1411,6 +1571,14 @@ monday_validate_v2_transition() {
     '.gate_evidence == $expected' "$receipt" >/dev/null
   jq -e --argjson expected "$gate_production_runtime" \
     '.production_runtime == $expected' "$receipt" >/dev/null
+  local completed_at completed_at_ns parsed_completed_at now_ns
+  completed_at=$(jq -er '.completed_at' "$receipt") || return 1
+  completed_at_ns=$(jq -er '.completed_at_ns' "$receipt") || return 1
+  [[ $completed_at_ns =~ ^[0-9]+$ ]] || return 1
+  parsed_completed_at=$(monday_iso_epoch_ns "$completed_at") || return 1
+  [[ $parsed_completed_at == "$completed_at_ns" ]] || return 1
+  now_ns=$(date +%s%N) || return 1
+  [[ $now_ns =~ ^[0-9]+$ && completed_at_ns -le now_ns ]] || return 1
 }
 
 # Verify one production upload-status triplet using an injected copy function.
@@ -1421,18 +1589,33 @@ monday_verify_upload_triplet_readback() {
   local status=$1 market=$2 dataset=$3 expected_bucket=$4 expected_prefix=$5
   local tmp_root=$6 minimum_success_at=$7 copy_fn=$8 expected_session=${9:-}
   local triplet data_uri manifest_uri success_uri status_session triplet_session
-  local data_sha manifest_sha success_sha object_prefix first_manifest second_manifest uploaded_at uploaded_epoch
-  local data_file manifest_file success_file expected_success_file expected_prefix_norm
+  local data_sha manifest_sha success_sha object_prefix first_manifest second_manifest uploaded_at uploaded_ns
+  local data_file manifest_file success_file expected_success_file expected_prefix_norm data_file_name
+  local success_at success_ns start_ns end_ns minimum_ns now_ns manifest_session
   monday_file_direct "$status" || return 1
-  jq -e '.last_error == null' "$status" >/dev/null || return 1
+  jq -e '
+    type == "object"
+    and ((.last_error? // null) == null)
+    and ((.last_error_at? // null) == null)
+    and (((.failure_count? // 0) | type == "number" and floor == . and . == 0))
+    and (((.discovery_failed? // false) == false))
+    and (((.pending? // false) as $pending
+      | ($pending == false
+        or ($pending | type == "number" and floor == . and . == 0))))
+    and (((.pending_batches? // 0) | type == "number" and floor == . and . == 0))
+    and (((.pending_segments? // 0) | type == "number" and floor == . and . == 0))
+    and (((.failed_batches? // []) | type == "array" and length == 0))
+    and (((.failed_segments? // []) | type == "array" and length == 0))
+  ' "$status" >/dev/null || return 1
   status_session=$(jq -er '.session_id // empty' "$status") || true
   if [[ -n $expected_session && -n $status_session ]]; then
     [[ $status_session == "$expected_session" ]] || return 1
   fi
   [[ $market == spot || $market == usdm ]] || return 1
-  [[ $dataset =~ ^[A-Za-z0-9_.-]+$ && $expected_bucket =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || return 1
+  monday_validate_component "$dataset" || return 1
+  monday_validate_component "$expected_bucket" || return 1
   expected_prefix_norm=${expected_prefix%/}
-  [[ -n $expected_prefix_norm && $expected_prefix_norm != /* ]] || return 1
+  monday_validate_oss_prefix "$market" "$dataset" "$expected_prefix_norm" || return 1
   declare -F "$copy_fn" >/dev/null 2>&1 || return 2
   triplet=$(jq -cer '.last_uploaded_triplet | objects' "$status") || return 1
   triplet_session=$(jq -er '.session_id // empty' <<<"$triplet") || true
@@ -1445,18 +1628,20 @@ monday_verify_upload_triplet_readback() {
   monday_sha256_ok "$data_sha" && monday_sha256_ok "$manifest_sha" \
     && monday_sha256_ok "$success_sha" || return 1
   object_prefix=$(jq -er '.object_prefix' <<<"$triplet") || return 1
-  # Producers record the directory prefix itself for a triplet, while some
-  # upload-status writers append a shard/object component.  Both are valid as
-  # long as the value cannot escape the exact expected prefix.
-  [[ $object_prefix == "$expected_prefix_norm" || $object_prefix == "$expected_prefix_norm"/* ]] || return 1
+  [[ $object_prefix == "$expected_prefix_norm" ]] || return 1
   data_uri=$(jq -er '.data_uri // .object // empty' <<<"$triplet") || true
   if [[ -z $data_uri ]]; then data_uri=$(jq -er '.last_uploaded_object' "$status") || return 1; fi
-  [[ $data_uri == "oss://$expected_bucket/$expected_prefix_norm/"*.jsonl.zst ]] || return 1
+  data_file_name=${data_uri##*/}
+  [[ $data_file_name =~ ^[A-Za-z0-9._-]+\.jsonl\.zst$ \
+    && $data_uri == "oss://$expected_bucket/$expected_prefix_norm/$data_file_name" \
+    && $data_uri != *'%'* && $data_uri != *'\\'* ]] || return 1
   manifest_uri=$(jq -er '.manifest_uri // empty' <<<"$triplet") || true
   [[ -n $manifest_uri ]] || manifest_uri="$data_uri.manifest.json"
   success_uri=$(jq -er '.success_uri // empty' <<<"$triplet") || true
   [[ -n $success_uri ]] || success_uri="$data_uri._SUCCESS"
-  [[ $manifest_uri == "$data_uri.manifest.json" && $success_uri == "$data_uri._SUCCESS" ]] || return 1
+  [[ $manifest_uri == "$data_uri.manifest.json" && $success_uri == "$data_uri._SUCCESS" \
+    && $manifest_uri != *'%'* && $manifest_uri != *'\\'* \
+    && $success_uri != *'%'* && $success_uri != *'\\'* ]] || return 1
   mkdir -p "$tmp_root" || return 1
   first_manifest="$tmp_root/$market.manifest.first"; second_manifest="$tmp_root/$market.manifest.second"
   data_file="$tmp_root/$market.data"; manifest_file="$tmp_root/$market.manifest"; success_file="$tmp_root/$market.success"
@@ -1465,7 +1650,8 @@ monday_verify_upload_triplet_readback() {
   "$copy_fn" "$data_uri" "$data_file" || return 1
   "$copy_fn" "$success_uri" "$success_file" || return 1
   "$copy_fn" "$manifest_uri" "$second_manifest" || return 1
-  monday_file_direct "$first_manifest" && monday_file_direct "$second_manifest" \
+  monday_file_direct "$first_manifest" && monday_file_direct "$data_file" \
+    && monday_file_direct "$success_file" && monday_file_direct "$second_manifest" \
     && cmp -s "$first_manifest" "$second_manifest" || return 1
   cp -p -- "$first_manifest" "$manifest_file" || return 1
   [[ $(monday_sha256_file "$data_file") == "$data_sha" \
@@ -1479,26 +1665,31 @@ monday_verify_upload_triplet_readback() {
     --arg data_file "${data_uri##*/}" '
       type == "object" and .market == $market and .dataset == $dataset
       and .file == $data_file and .sha256 == $data_sha
-      and (.shard_id | type == "string" and length > 0)
+      and .shard_id == "all"
+      and (.start_received_at_ns | type == "number" and floor == . and . >= 0)
+      and (.end_received_at_ns | type == "number" and floor == . and . >= 0)
+      and .end_received_at_ns >= .start_received_at_ns
       and ((.session_id // .lob_continuity.capture_session_id)
         | type == "string" and length > 0)
       and (.catalog_sha256? // "" | type == "string")' \
     "$manifest_file" >/dev/null || return 1
   success_at=$(jq -er '.last_success_at' "$status") || return 1
-  success_epoch=$(monday_iso_epoch "$success_at") || return 1
-  now_epoch=$(date -u +%s) || return 1
-  ((success_epoch <= now_epoch)) || return 1
+  success_ns=$(monday_iso_epoch_ns "$success_at") || return 1
+  now_ns=$(date +%s%N) || return 1
+  [[ $now_ns =~ ^[0-9]+$ && $success_ns -le $now_ns ]] || return 1
+  minimum_ns=0
   if [[ -n $minimum_success_at ]]; then
-    minimum_epoch=$(monday_iso_epoch "$minimum_success_at") || return 1
-    ((success_epoch >= minimum_epoch)) || return 1
+    minimum_ns=$(monday_iso_epoch_ns "$minimum_success_at") || return 1
+    [[ $success_ns -ge $minimum_ns ]] || return 1
   fi
+  start_ns=$(jq -er '.start_received_at_ns' "$manifest_file") || return 1
+  end_ns=$(jq -er '.end_received_at_ns' "$manifest_file") || return 1
+  [[ $start_ns =~ ^[0-9]+$ && $end_ns =~ ^[0-9]+$ \
+    && $start_ns -ge $minimum_ns && $end_ns -ge $start_ns && $end_ns -le $now_ns ]] || return 1
   uploaded_at=$(jq -er '.uploaded_at // empty' <<<"$triplet") || true
   if [[ -n $uploaded_at ]]; then
-    uploaded_epoch=$(monday_iso_epoch "$uploaded_at") || return 1
-    ((uploaded_epoch <= now_epoch)) || return 1
-    if [[ -n $minimum_success_at ]]; then
-      ((uploaded_epoch >= minimum_epoch)) || return 1
-    fi
+    uploaded_ns=$(monday_iso_epoch_ns "$uploaded_at") || return 1
+    [[ $uploaded_ns -le $now_ns && $uploaded_ns -ge $minimum_ns ]] || return 1
   fi
   manifest_session=$(jq -er '.session_id // .lob_continuity.capture_session_id' "$manifest_file") || return 1
   if [[ -n $expected_session ]]; then
@@ -1510,9 +1701,11 @@ monday_verify_upload_triplet_readback() {
     --arg last_success_at "$(jq -er '.last_success_at' "$status")" \
     --arg session "$manifest_session" \
     --arg catalog "$(jq -er '.catalog_sha256 // ""' "$manifest_file")" \
+    --argjson start "$start_ns" --argjson end "$end_ns" \
     '{market:$market,data_uri:$data_uri,manifest_uri:$manifest_uri,success_uri:$success_uri,
       data_sha256:$data_sha,manifest_sha256:$manifest_sha,success_sha256:$success_sha,
       success_content:($data_sha + "\n"),object_prefix:$object_prefix,last_success_at:$last_success_at,
+      start_received_at_ns:$start,end_received_at_ns:$end,
       session_id:$session,catalog_sha256:$catalog}'
 }
 

@@ -3,6 +3,7 @@ set -Eeuo pipefail
 export LC_ALL=C
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
+export MONDAY_CONTROL_PLANE_FIXTURE_SENTINEL=monday-v2-fixture
 ROOT=$(readlink -f "$(mktemp -d)")
 fixture_root=$ROOT
 trap 'chmod -R u+w "$ROOT" 2>/dev/null || true; rm -rf "$ROOT"' EXIT
@@ -98,6 +99,11 @@ jq -cS -n --arg artifact_uri "$legacy_artifact_uri" --arg artifact_sha "$p0_sha"
 legacy_c0=$(monday_sha256_file "$legacy_work/release.json")
 for asset in host-rust-lob-recovery-queue.sh monday-collector-health.sh; do
   cp -p -- "$source_dir/$asset" "$legacy_work/deployment/$asset"
+  # Deliberately make the legacy C0 helper bytes differ from the V2 C1
+  # projection.  A crash after active=C1 must therefore replace these regular
+  # legacy files from the verified active controller, rather than silently
+  # accepting whichever bytes happened to be left on disk.
+  printf '\n# legacy C0 helper projection fixture\n' >>"$legacy_work/deployment/$asset"
 done
 mkdir -p "$legacy_root/$legacy_c0/deployment"
 cp -p -- "$legacy_work/release.json" "$legacy_root/$legacy_c0/release.json"
@@ -202,8 +208,20 @@ fi
 for asset in binance-lob-archiver-rust-spot.env binance-lob-archiver-rust-usdm.env; do
   [[ -f "$(monday_runtime_asset_target "$ROOT" "$asset")" && ! -L "$(monday_runtime_asset_target "$ROOT" "$asset")" ]]
 done
+for asset in host-rust-lob-recovery-queue.sh monday-collector-health.sh; do
+  target=$(monday_controller_projection_target "$ROOT" "$asset")
+  active_asset="$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/$asset"
+  [[ -f $target && ! -L $target ]]
+  [[ $(monday_sha256_file "$target") != "$(monday_sha256_file "$active_asset")" ]]
+done
 MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c0" --root "$ROOT" >/dev/null
+for asset in host-rust-lob-recovery-queue.sh monday-collector-health.sh; do
+  target=$(monday_controller_projection_target "$ROOT" "$asset")
+  expected="$ROOT/opt/monday/releases/binance-lob-controller/active/deployment/$asset"
+  [[ -L $target && $(readlink -- "$target") == "$expected" ]]
+  cmp -s "$(readlink -f -- "$target")" "$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/$asset"
+done
 rm -f -- "$ROOT/opt/monday/releases/binance-lob-controller/active"
 ln -s "$legacy_root/$legacy_c0" "$ROOT/opt/monday/releases/binance-lob-controller/active"
 rm -f -- "$ROOT/opt/monday/bin/binance-lob-archiver"
@@ -503,7 +521,7 @@ write_cutover_fixture_health() {
     (( elapsed >= 1 )) || { sleep 0.1; continue; }
     observed_at_ns=$(date +%s%N)
     jq -cn --argjson observed "$observed_at_ns" \
-      '{market:"spot",dataset:"spot_all",status:"synced",sequence_gaps:0,symbol_count:1000,session_id:"cutover-fixture-spot",updated_at_ns:$observed}' \
+      '{market:"spot",dataset:"spot_all",status:"synced",sequence_gaps:0,symbol_count:1000,snapshot_ready_count:1000,bridged_count:1000,stream_coverage_verified_count:1000,snapshot_only_symbols:[],all_symbols_bridged:true,all_stream_coverage_verified:true,full_stream_coverage_verified:true,pending_upload_segments:0,queue_saturated:false,disk_warning:false,upload_warning:false,session_id:"cutover-fixture-spot",updated_at_ns:$observed}' \
       >"$production_spool_root/spot/health.json.tmp"
     mv -f -- "$production_spool_root/spot/health.json.tmp" "$production_spool_root/spot/health.json"
     if (( elapsed >= 3 )); then
@@ -511,7 +529,7 @@ write_cutover_fixture_health() {
         : >"$ROOT/run/cutover-fixture-spot-flip"
       fi
       jq -cn --argjson observed "$observed_at_ns" \
-        '{market:"usdm",dataset:"usdm_perpetual_top100_lob",status:"synced",sequence_gaps:0,symbol_count:100,session_id:"cutover-fixture-usdm",updated_at_ns:$observed}' \
+        '{market:"usdm",dataset:"usdm_perpetual_top100_lob",status:"synced",sequence_gaps:0,symbol_count:100,snapshot_ready_count:100,bridged_count:100,stream_coverage_verified_count:100,snapshot_only_symbols:[],all_symbols_bridged:true,all_stream_coverage_verified:true,full_stream_coverage_verified:true,pending_upload_segments:0,queue_saturated:false,disk_warning:false,upload_warning:false,session_id:"cutover-fixture-usdm",updated_at_ns:$observed}' \
         >"$production_spool_root/usdm/health.json.tmp"
       mv -f -- "$production_spool_root/usdm/health.json.tmp" "$production_spool_root/usdm/health.json"
     fi
@@ -852,6 +870,29 @@ run_restore_health_fixture success
 grep -Fq 'enable binance-lob-archiver-production@spot.service' "$restore_calls"
 grep -Fq 'enable binance-lob-archiver-production@usdm.service' "$restore_calls"
 
+# A repeated successful restore is a read-only idempotency check.  It must
+# verify the live pair/timers/health contract without issuing any systemd
+# containment or projection mutation; a drifted projection fails closed and
+# likewise leaves the call log untouched.
+restore_calls_sha=$(monday_sha256_file "$restore_calls")
+MONDAY_CONTROL_PLANE_TEST=1 MONDAY_RESTORE_FIXTURE_SYSTEMD=1 \
+  MONDAY_RESTORE_FIXTURE_PID="$restore_fixture_pid" MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c2" --root "$ROOT" >/dev/null
+[[ $(monday_sha256_file "$restore_calls") == "$restore_calls_sha" ]]
+restore_projection_target=$(readlink -- "$ROOT/opt/monday/bin/monday-rust-lob-recovery-queue")
+rm -f -- "$ROOT/opt/monday/bin/monday-rust-lob-recovery-queue"
+printf 'idempotency-drift\n' >"$ROOT/opt/monday/bin/monday-rust-lob-recovery-queue"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_RESTORE_FIXTURE_SYSTEMD=1 \
+  MONDAY_RESTORE_FIXTURE_PID="$restore_fixture_pid" MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c2" --root "$ROOT" \
+  >/dev/null 2>&1; then
+  printf 'restore idempotency accepted a drifted controller projection\n' >&2
+  exit 1
+fi
+[[ $(monday_sha256_file "$restore_calls") == "$restore_calls_sha" ]]
+rm -f -- "$ROOT/opt/monday/bin/monday-rust-lob-recovery-queue"
+ln -s "$restore_projection_target" "$ROOT/opt/monday/bin/monday-rust-lob-recovery-queue"
+
 # Readback reuses the active-C health policy before and after the independent
 # OSS phase.  A fixture systemd view supplies process/unit identity while the
 # restored health files exercise the positive path and three fail-closed
@@ -1087,17 +1128,25 @@ triplet_manifest="$triplet_root/part-1.jsonl.zst.manifest.json"
 jq -cn --arg sha "$triplet_data_sha" \
   '{market:"spot",dataset:"spot_all",shard_id:"all",file:"part-1.jsonl.zst",sha256:$sha,session_id:"fixture-session",catalog_sha256:"fixture-catalog"}' \
   >"$triplet_manifest"
-triplet_manifest_sha=$(monday_sha256_file "$triplet_manifest")
 triplet_success="$triplet_root/part-1.jsonl.zst._SUCCESS"
 printf '%s\n' "$triplet_data_sha" >"$triplet_success"
 triplet_success_sha=$(monday_sha256_file "$triplet_success")
 triplet_status="$triplet_root/upload-status.json"
 triplet_uri='oss://bucket/lake/raw/venue=binance/market=spot/dataset=spot_all/shard=all/part-1.jsonl.zst'
 triplet_prefix='lake/raw/venue=binance/market=spot/dataset=spot_all/shard=all'
-triplet_now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+triplet_now_ns=$(( $(date +%s%N) - 120000000000 ))
+triplet_now=$(monday_epoch_ns_rfc3339 "$triplet_now_ns")
+triplet_start_ns=$((triplet_now_ns + 1000000000))
+triplet_end_ns=$((triplet_now_ns + 2000000000))
+jq --argjson start "$triplet_start_ns" --argjson end "$triplet_end_ns" \
+  '.start_received_at_ns=$start | .end_received_at_ns=$end' \
+  "$triplet_manifest" >"$triplet_manifest.tmp"
+mv -f -- "$triplet_manifest.tmp" "$triplet_manifest"
+triplet_manifest_sha=$(monday_sha256_file "$triplet_manifest")
 jq -cn --arg now "$triplet_now" --arg uri "$triplet_uri" --arg prefix "$triplet_prefix" \
   --arg data "$triplet_data_sha" --arg manifest "$triplet_manifest_sha" --arg success "$triplet_success_sha" \
-  '{last_success_at:$now,last_error:null,last_uploaded_triplet:{data_uri:$uri,object_prefix:$prefix,data_sha256:$data,manifest_sha256:$manifest,success_sha256:$success,uploaded_at:$now}}' \
+  --argjson start "$triplet_start_ns" --argjson end "$triplet_end_ns" \
+  '{last_success_at:$now,last_error:null,last_error_at:null,failure_count:0,discovery_failed:false,pending_batches:0,failed_batches:[],last_uploaded_triplet:{data_uri:$uri,object_prefix:$prefix,data_sha256:$data,manifest_sha256:$manifest,success_sha256:$success,uploaded_at:$now,start_received_at_ns:$start,end_received_at_ns:$end}}' \
   >"$triplet_status"
 copy_triplet_fixture() {
   local uri=$1 target=$2 object
@@ -1132,6 +1181,22 @@ if jq '.last_uploaded_triplet.uploaded_at = "2999-01-01T00:00:00Z"' "$triplet_st
   printf 'triplet readback accepted future triplet timestamp\n' >&2
   exit 1
 fi
+cp -p -- "$triplet_manifest" "$triplet_manifest.valid"
+cp -p -- "$triplet_status" "$triplet_status.valid"
+future_manifest_end_ns=$(( $(date +%s%N) + 3600000000000 ))
+jq --argjson end "$future_manifest_end_ns" \
+  '.end_received_at_ns=$end' "$triplet_manifest.valid" >"$triplet_manifest"
+future_manifest_sha=$(monday_sha256_file "$triplet_manifest")
+jq --arg sha "$future_manifest_sha" --argjson end "$future_manifest_end_ns" \
+  '.last_uploaded_triplet.manifest_sha256=$sha | .last_uploaded_triplet.end_received_at_ns=$end' \
+  "$triplet_status.valid" >"$triplet_status.future-manifest"
+if monday_verify_upload_triplet_readback "$triplet_status.future-manifest" spot spot_all bucket "$triplet_prefix" \
+    "$triplet_tmp" "$triplet_now" copy_triplet_fixture >/dev/null 2>&1; then
+  printf 'triplet readback accepted a future manifest boundary\n' >&2
+  exit 1
+fi
+cp -p -- "$triplet_manifest.valid" "$triplet_manifest"
+cp -p -- "$triplet_status.valid" "$triplet_status"
 if jq '.last_uploaded_triplet.data_uri |= sub("oss://bucket"; "oss://foreign")' "$triplet_status" \
   >"$triplet_status.foreign" \
   && monday_verify_upload_triplet_readback "$triplet_status.foreign" spot spot_all bucket "$triplet_prefix" \

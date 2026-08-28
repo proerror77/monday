@@ -24,10 +24,11 @@ ROOT=${ROOT%/}; [[ -n $ROOT ]] || ROOT=/
 [[ $RECEIPT_SHA =~ ^[a-f0-9]{64}$ ]] || die 'transition receipt digest is invalid'
 [[ -n $TRANSITION_RECEIPT ]] || die 'transition receipt is required'
 TEST_ONLY=false; [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 ]] && TEST_ONLY=true
-[[ $TEST_ONLY == false || $ROOT != / ]] || die 'test mode requires an isolated fixture root'
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
+monday_control_plane_validate_mode "$ROOT" "$TEST_ONLY" \
+  || die 'production uses canonical root or fixture mode lacks an explicit sentinel'
 
 # Readback is serialized with cutover/restore and takes the locks before any
 # active, Gate, or process identity is read.
@@ -50,10 +51,18 @@ if [[ $TEST_ONLY == true && ${MONDAY_READBACK_FIXTURE_SYSTEMD:-0} == 1 ]]; then
   declare -A fixture_unit_state=() fixture_unit_file_state=() fixture_unit_load_state=()
   fixture_pid=${MONDAY_READBACK_FIXTURE_PID:-$$}
   fixture_enabled=${MONDAY_READBACK_FIXTURE_UNIT_FILE_STATE:-enabled}
+  fixture_timer_active=${MONDAY_READBACK_FIXTURE_TIMER_ACTIVE:-active}
+  fixture_timer_enabled=${MONDAY_READBACK_FIXTURE_TIMER_FILE_STATE:-enabled}
   for fixture_market in spot usdm; do
     fixture_unit="binance-lob-archiver-production@${fixture_market}.service"
     fixture_unit_state[$fixture_unit]=active
     fixture_unit_file_state[$fixture_unit]=$fixture_enabled
+    fixture_unit_load_state[$fixture_unit]=loaded
+  done
+  for fixture_market in spot usdm; do
+    fixture_unit="binance-lob-archiver-recovery@${fixture_market}.timer"
+    fixture_unit_state[$fixture_unit]=$fixture_timer_active
+    fixture_unit_file_state[$fixture_unit]=$fixture_timer_enabled
     fixture_unit_load_state[$fixture_unit]=loaded
   done
   systemctl() {
@@ -182,10 +191,11 @@ for asset in "${CONTROLLER_PROJECTION_ASSETS[@]}"; do
     '$values + {($asset):{target:$target,sha256:$sha}}')
 done
 
-runtime_identity='{}'; health_identity='{}'
+runtime_identity='{}'; health_identity='{}'; recovery_scheduler_identity='{}'
 capture_runtime_identity() {
-  local market unit pid restarts enabled exe env_file spool health session updated minimum_ns expected_observed dataset minimum_symbols policy
-  runtime_identity='{}'; health_identity='{}'
+  local market unit timer_unit pid restarts enabled exe env_file spool health session updated minimum_ns expected_observed dataset minimum_symbols policy
+  local timer_active timer_enabled
+  runtime_identity='{}'; health_identity='{}'; recovery_scheduler_identity='{}'
   [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 && $FIXTURE_SYSTEMD == false ]] && return 0
   for market in spot usdm; do
     unit="binance-lob-archiver-production@${market}.service"
@@ -234,10 +244,19 @@ capture_runtime_identity() {
       --argjson symbols "$(jq -er '.symbol_count' "$health")" \
       --argjson ready "$(jq -er '.snapshot_ready_count' "$health")" \
       '$values + {($market):{session_id:$session,observed_at_ns:$observed,status:$status,sequence_gaps:$gaps,symbol_count:$symbols,snapshot_ready_count:$ready}}')
+    timer_unit="binance-lob-archiver-recovery@${market}.timer"
+    systemctl is-active --quiet "$timer_unit" || die "recovery timer is inactive: $timer_unit"
+    timer_active=$(systemctl show "$timer_unit" --property=ActiveState --value)
+    timer_enabled=$(systemctl show "$timer_unit" --property=UnitFileState --value)
+    [[ $timer_active == active && $timer_enabled == enabled ]] \
+      || die "recovery timer is not active and enabled: $timer_unit"
+    recovery_scheduler_identity=$(jq -cn --argjson values "$recovery_scheduler_identity" \
+      --arg market "$market" --arg unit "$timer_unit" \
+      '$values + {($market):{unit:$unit,active:true,enabled:true}}')
   done
 }
 capture_runtime_identity
-runtime_before=$runtime_identity; health_before=$health_identity
+runtime_before=$runtime_identity; health_before=$health_identity; recovery_scheduler_before=$recovery_scheduler_identity
 assert_transition_process_identity() {
   local market expected_pid expected_exe expected_restarts expected_enabled expected_session expected_observed
   local current_pid current_exe current_restarts current_enabled current_session current_observed now_ns
@@ -298,6 +317,8 @@ assert_runtime_stable() {
   assert_transition_process_identity
   [[ $runtime_identity == "$runtime_before" ]] \
     || die 'process identity changed during OSS readback'
+  [[ $recovery_scheduler_identity == "$recovery_scheduler_before" ]] \
+    || die 'recovery scheduler identity changed during OSS readback'
   for market in spot usdm; do
     before_session=$(jq -er --arg market "$market" '.[$market].session_id' <<<"$health_before") \
       || die "initial health session is missing: $market"
@@ -315,10 +336,28 @@ assert_runtime_stable() {
   done
 }
 
-status_root=${MONDAY_UPLOAD_STATUS_ROOT:-$(monday_root_join "$ROOT" data/monday/spool/binance-lob)}
-if [[ -e $status_root || -L $status_root ]]; then
-  monday_path_direct "$status_root" || die 'upload status root is indirect'
+assert_direct_directory_chain() {
+  local path=$1 current
+  [[ $path == /* ]] || return 1
+  current=${path%/}; [[ -n $current ]] || current=/
+  while :; do
+    if [[ -L $current ]]; then
+      return 1
+    elif [[ -e $current && ! -d $current ]]; then
+      return 1
+    elif [[ -d $current ]]; then
+      [[ $(readlink -f -- "$current") == "$current" ]] || return 1
+    fi
+    [[ $current == / ]] && break
+    current=${current%/*}; [[ -n $current ]] || current=/
+  done
+}
+
+status_root=$(monday_root_join "$ROOT" data/monday/spool/binance-lob)
+if [[ $TEST_ONLY == true && -n ${MONDAY_UPLOAD_STATUS_ROOT:-} ]]; then
+  status_root=$MONDAY_UPLOAD_STATUS_ROOT
 fi
+assert_direct_directory_chain "$status_root" || die 'upload status root or ancestor is indirect'
 tmp=$(mktemp -d "$(monday_root_join "$ROOT" tmp)/monday-readback.XXXXXX" 2>/dev/null || mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 markets='[]'
@@ -335,40 +374,72 @@ copy_oss() {
   local uri=$1 target=$2
   [[ $uri == oss://* && -n $target ]] || return 1
   [[ $TEST_ONLY == true ]] && return 1
-  aliyun ossutil cp "$uri" "$target" --profile ecs-role \
+  [[ -x /usr/local/bin/aliyun ]] || die 'trusted OSS CLI is missing: /usr/local/bin/aliyun'
+  env -i HOME=/var/lib/hft-collector LC_ALL=C \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    /usr/local/bin/aliyun ossutil cp "$uri" "$target" --profile ecs-role \
     --endpoint oss-ap-northeast-1-internal.aliyuncs.com --region ap-northeast-1 --force \
     --no-progress >/dev/null
 }
 minimum_success_at=$(jq -er '.completed_at' "$TRANSITION_RECEIPT") \
   || die 'transition receipt has no completion timestamp'
+minimum_commit_ns=$(jq -er '.completed_at_ns' "$TRANSITION_RECEIPT") \
+  || die 'transition receipt has no nanosecond completion timestamp'
+[[ $minimum_commit_ns =~ ^[0-9]+$ ]] || die 'transition completion nanosecond timestamp is invalid'
+[[ $(monday_iso_epoch_ns "$minimum_success_at") == "$minimum_commit_ns" ]] \
+  || die 'transition completion timestamp does not match its nanosecond value'
+declare -A status_snapshot_path status_snapshot_sha status_dataset status_bucket status_prefix
+# Snapshot both upload-status files before any OSS verification.  The final
+# paired hash below is the only success point; a lane changing while the other
+# lane is read back therefore cannot be silently accepted.
 for market in spot usdm; do
-  status="$status_root/$market/upload-status.json"
-  if [[ -f $status && ! -L $status ]]; then
-    status_snapshot="$tmp/$market.upload-status.snapshot.json"
-    cp -p -- "$status" "$status_snapshot" || die "${market} upload status snapshot failed"
-    status_snapshot_sha=$(monday_sha256_file "$status_snapshot") \
+  market_status_root="$status_root/$market"
+  status="$market_status_root/upload-status.json"
+  if [[ -e $status || -L $status ]]; then
+    monday_file_direct "$status" || die "${market} upload status is indirect"
+    status_snapshot_path[$market]="$tmp/$market.upload-status.snapshot.json"
+    cp -p -- "$status" "${status_snapshot_path[$market]}" \
+      || die "${market} upload status snapshot failed"
+    monday_file_direct "${status_snapshot_path[$market]}" \
+      || die "${market} upload status snapshot is indirect"
+    status_snapshot_sha[$market]=$(monday_sha256_file "${status_snapshot_path[$market]}") \
       || die "${market} upload status snapshot hash failed"
-    [[ $(monday_sha256_file "$status") == "$status_snapshot_sha" ]] \
+    [[ $(monday_sha256_file "$status") == "${status_snapshot_sha[$market]}" ]] \
       || die "${market} upload status changed during snapshot"
     env_file=$(monday_root_join "$ROOT" "etc/monday/binance-lob-archiver-production-$market.env")
-    dataset=$(env_value "$env_file" DATASET) || die "${market} production dataset is invalid"
-    bucket=$(env_value "$env_file" OSS_BUCKET) || die "${market} production bucket is invalid"
-    shard=$(env_value "$env_file" SHARD_ID) || die "${market} production shard is invalid"
-    prefix="lake/raw/venue=binance/market=$market/dataset=$dataset/shard=$shard"
+    status_dataset[$market]=$(env_value "$env_file" DATASET) \
+      || die "${market} production dataset is invalid"
+    status_bucket[$market]=$(env_value "$env_file" OSS_BUCKET) \
+      || die "${market} production bucket is invalid"
+    shard=$(env_value "$env_file" SHARD_ID) \
+      || die "${market} production shard is invalid"
+    status_prefix[$market]="lake/raw/venue=binance/market=$market/dataset=${status_dataset[$market]}/shard=$shard"
+  else
+    [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 ]] || die "${market} upload status is missing"
+  fi
+done
+for market in spot usdm; do
+  market_status_root="$status_root/$market"
+  assert_direct_directory_chain "$market_status_root" \
+    || die "${market} upload status market root or ancestor is indirect"
+  status="$market_status_root/upload-status.json"
+  if [[ -e $status || -L $status ]]; then
+    monday_file_direct "$status" || die "${market} upload status is indirect"
+  fi
+  if [[ -f $status && ! -L $status ]]; then
     assert_runtime_stable
     expected_session=$(jq -er --arg market "$market" '.[$market].session_id' <<<"$health_before") \
       || die "${market} current health session is unavailable"
-    triplet_json=$(monday_verify_upload_triplet_readback "$status_snapshot" "$market" "$dataset" \
-      "$bucket" "$prefix" "$tmp" "$minimum_success_at" copy_oss "$expected_session") \
+    triplet_json=$(monday_verify_upload_triplet_readback "${status_snapshot_path[$market]}" "$market" \
+      "${status_dataset[$market]}" "${status_bucket[$market]}" "${status_prefix[$market]}" \
+      "$tmp" "$minimum_success_at" copy_oss "$expected_session") \
       || die "${market} independent OSS triplet readback failed"
     assert_runtime_stable
-    [[ $(monday_sha256_file "$status") == "$status_snapshot_sha" ]] \
-      || die "${market} upload status changed during OSS readback"
     markets=$(jq -cn --argjson prior "$markets" --argjson triplet "$triplet_json" \
       '$prior + [$triplet]')
     status_observations=$(jq -cn --argjson values "$status_observations" --arg market "$market" \
-      --arg success "$(jq -er '.last_success_at' "$status_snapshot")" \
-      --arg session "$expected_session" --arg snapshot_sha "$status_snapshot_sha" \
+      --arg success "$(jq -er '.last_success_at' "${status_snapshot_path[$market]}")" \
+      --arg session "$expected_session" --arg snapshot_sha "${status_snapshot_sha[$market]}" \
       '$values + {($market):{last_success_at:$success,last_error:null,session_id:$session,snapshot_sha256:$snapshot_sha}}')
   else
     [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 ]] || die "${market} upload status is missing"
@@ -376,32 +447,51 @@ for market in spot usdm; do
 done
 
 # OSS reads are independent, and each triplet was bracketed by this same
-# active-pair/process check.  Keep one final sample in the receipt as well.
+# active-pair/process check.  Re-read and hash both status files together
+# before writing a success receipt so a late lane failure cannot be hidden by
+# the other market's successful readback.
+for market in spot usdm; do
+  status="$status_root/$market/upload-status.json"
+  if [[ -n ${status_snapshot_path[$market]:-} ]]; then
+    final_status="$tmp/$market.upload-status.final.json"
+    monday_file_direct "$status" || die "${market} upload status changed to an indirect file"
+    cp -p -- "$status" "$final_status" || die "${market} final upload status read failed"
+    monday_file_direct "$final_status" || die "${market} final upload status is indirect"
+    [[ $(monday_sha256_file "$final_status") == "${status_snapshot_sha[$market]}" ]] \
+      || die "${market} upload status changed during paired OSS readback"
+  fi
+done
 assert_runtime_stable
-runtime_after=$runtime_identity; health_after=$health_identity
+runtime_after=$runtime_identity; health_after=$health_identity; recovery_scheduler_after=$recovery_scheduler_identity
 
-out_root=${MONDAY_READBACK_ROOT:-$(monday_root_join "$ROOT" data/monday/evidence/readbacks)}
+out_root=$(monday_root_join "$ROOT" data/monday/evidence/readbacks)
+if [[ $TEST_ONLY == true && -n ${MONDAY_READBACK_ROOT:-} ]]; then
+  out_root=$MONDAY_READBACK_ROOT
+fi
+assert_direct_directory_chain "$out_root" || die 'readback evidence root or ancestor is indirect'
 if [[ ! -e $out_root && ! -L $out_root ]]; then mkdir -p "$out_root"; fi
 monday_path_direct "$out_root" || die 'readback evidence root is indirect'
 out="$out_root/$CONTROLLER"
 [[ ! -e $out && ! -L $out ]] || die 'readback receipt already exists for this controller'
 tmp_out="$out.tmp.$$"
-jq -cn --arg schema monday.rust_lob_operation_readback.v2 \
+  jq -cn --arg schema monday.rust_lob_operation_readback.v2 \
   --arg controller "$CONTROLLER" --arg payload "$payload" \
   --arg receipt "$RECEIPT_SHA" --arg transition "$TRANSITION_RECEIPT" \
   --arg gate "$transition_gate" --arg gate_sha "$transition_gate_sha" \
   --argjson markets "$markets" --argjson processes "$runtime_after" --argjson health "$health_after" \
   --argjson transition_process "$transition_process" \
   --argjson controller_projections "$controller_projections" \
+  --argjson recovery_schedulers "$recovery_scheduler_after" \
   --argjson statuses "$status_observations" \
   '{schema:$schema,control_plane_version:2,controller_sha256:$controller,
     payload_sha256:$payload,transition_receipt:$transition,
     transition_receipt_sha256:$receipt,gate_receipt:$gate,gate_sha256:$gate_sha,
     production_link_verified:true,process_identity_verified:true,
     process_restarts_verified:true,unit_file_state_verified:true,
-    health_policy_verified:true,installed_assets_verified:true,
+    health_policy_verified:true,recovery_schedulers_verified:true,installed_assets_verified:true,
     cutover_process_identity:$transition_process,
-    process_identity:$processes,health:$health,controller_projections:$controller_projections,
+    process_identity:$processes,health:$health,recovery_schedulers:$recovery_schedulers,
+    controller_projections:$controller_projections,
     upload_status:$statuses,
     oss_triplets:$markets,result:"success"}' >"$tmp_out"
 mv -f "$tmp_out" "$out"

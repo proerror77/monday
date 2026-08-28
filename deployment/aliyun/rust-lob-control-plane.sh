@@ -130,7 +130,7 @@ case "$operation" in
 esac
 
 controller_path="/opt/monday/releases/binance-lob-controller/$controller/deployment/$host_script"
-printf -v remote_script 'set -Eeuo pipefail\nexec %q' "$controller_path"
+printf -v remote_script 'set -Eeuo pipefail\nexec env -i HOME=/root LC_ALL=C PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin %q' "$controller_path"
 for arg in "${remote_args[@]}"; do
   printf -v escaped ' %q' "$arg"
   remote_script+=$escaped
