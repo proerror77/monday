@@ -132,8 +132,8 @@ jobs:
           ../deployment/aliyun/test-polymarket-reference-upload-contract.sh
           ../deployment/aliyun/test-monday-collector-health.sh
           ../deployment/aliyun/test-rust-lob-control-plane.sh
+          ../deployment/aliyun/test-rust-lob-controller-release.sh
           ../deployment/aliyun/test-rust-lob-recovery-queue.sh
-          ../deployment/aliyun/test-rust-lob-release-adoption.sh
           ../deployment/aliyun/test-rust-lob-restore.sh
           ../deployment/aliyun/test-polymarket-raw-ops-stage.sh
           ../deployment/aliyun/test-trading-ecs-host-contract.sh

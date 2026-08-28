@@ -1,376 +1,311 @@
-def valid_io_full_psi_windows:
-  type == "array"
-  and length >= 3
-  and all(.[];
-    (.phase | type) == "string" and (.phase | length) > 0
-    and (.phase_run | type) == "number"
-    and .phase_run == (.phase_run | floor) and .phase_run > 0
-    and (.stage == "calibration" or .stage == "runtime")
-    and (.started_at | type) == "string"
-    and (.started_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
-    and (.finished_at | type) == "string"
-    and (.finished_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
-    and .finished_at >= .started_at
-    and (.previous_total_us | type) == "number"
-    and .previous_total_us == (.previous_total_us | floor)
-    and .previous_total_us >= 0
-    and (.current_total_us | type) == "number"
-    and .current_total_us == (.current_total_us | floor)
-    and .current_total_us >= .previous_total_us
-    and .delta_us == (.current_total_us - .previous_total_us)
-    and (.window_us | type) == "number"
-    and .window_us == (.window_us | floor) and .window_us > 0
-    and (.ratio | type) == "number" and .ratio >= 0
-    and (((.ratio - (.delta_us / .window_us)) as $difference
-      | (if $difference < 0 then -$difference else $difference end)) <= 0.000000001)
-    and .hit == ((.delta_us / .window_us) >= (150000 / 15000000))
-    and (.consecutive_hits | type) == "number"
-    and .consecutive_hits == (.consecutive_hits | floor)
-    and .consecutive_hits >= 0 and .consecutive_hits < 3)
-  and (reduce .[] as $window
-    ({key:null,hits:0,current:null,valid:true};
-      ([$window.phase,$window.phase_run,$window.stage]) as $key
-      | (if .key == $key then .hits else 0 end) as $previous_hits
-      | (if $window.hit then ($previous_hits + 1) else 0 end) as $expected_hits
-      | .valid = (.valid
-          and $window.consecutive_hits == $expected_hits
-          and (if .key == $key then
-            $window.previous_total_us == .current
-          else true end))
-      | .key = $key
-      | .hits = $expected_hits
-      | .current = $window.current_total_us)
-    | .valid);
+def valid_lob_partition:
+  if test("^date=[0-9]{4}-[0-9]{2}-[0-9]{2}/hour=[0-9]{2}$") then
+    capture("^date=(?<year>[0-9]{4})-(?<month>[0-9]{2})-(?<day>[0-9]{2})/hour=(?<hour>[0-9]{2})$") as $p
+    | ($p.year | tonumber) as $year
+    | ($p.month | tonumber) as $month
+    | ($p.day | tonumber) as $day
+    | ($p.hour | tonumber) as $hour
+    | ($year >= 1 and $month >= 1 and $month <= 12 and $day >= 1 and $hour <= 23)
+    and ($day <= (if $month == 2 then
+        if ($year % 400 == 0 or ($year % 4 == 0 and $year % 100 != 0)) then 29 else 28 end
+      elif ($month == 4 or $month == 6 or $month == 9 or $month == 11) then 30
+      else 31 end))
+  else
+    false
+  end;
 
-($ARGS.named.controller_release_sha256 // "") as $expected_controller_release_sha256
-| . as $gate
-| (.schema == "monday.rust_lob_shadow_gate.v4"
-  or .schema == "monday.rust_lob_shadow_gate.v5")
-and .candidate_sha256 == $candidate_sha256
-and .runtime_contract_sha256 == $runtime_contract_sha256
-and (.deployment_bundle_sha256 | type) == "string"
-and (.deployment_bundle_sha256 | test("^[a-f0-9]{64}$"))
-and (.deployment_source_revision | type) == "string"
-and (.deployment_source_revision | test("^[a-f0-9]{40,64}$"))
-and (.run_id | type) == "string"
-and (.run_id | test("^[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*$"))
-and .run_spool == ("/data/monday/spool/binance-lob-rust-shadow/runs/"
-  + $candidate_sha256 + "/" + .run_id)
-and (.observation_started_ns | type) == "number"
-and .observation_started_ns == (.observation_started_ns | floor)
-and .observation_started_ns > 0
-and (.markets.spot.observation_started_ns | type) == "number"
-and .markets.spot.observation_started_ns == (.markets.spot.observation_started_ns | floor)
-and .markets.spot.observation_started_ns > 0
-and (.markets.usdm.observation_started_ns | type) == "number"
-and .markets.usdm.observation_started_ns == (.markets.usdm.observation_started_ns | floor)
-and .markets.usdm.observation_started_ns > 0
-and .observation_started_ns == .markets.spot.observation_started_ns
-and .markets.spot.observation_started_ns <= .markets.usdm.observation_started_ns
-and .required_duration_seconds == 240
-and .requested_duration_seconds >= .required_duration_seconds
-and .health_settle_seconds == 240
-and .segment_seconds == 120
-and .test_only == false
+. as $root
+| ([
+    "binance-lob-archiver-recovery@.service",
+    "binance-lob-archiver-recovery@.timer",
+    "host-rust-lob-recovery-queue.sh",
+    "host-rust-lob-readback.sh",
+    "host-rust-lob-shadow-gate.sh",
+    "host-rust-lob-cutover.sh",
+    "host-rust-lob-restore.sh",
+    "host-rust-lob-controller-release.sh",
+    "monday-collector-health.sh",
+    "rust-lob-control-plane-lib.sh",
+    "rust-lob-runtime-health-policy.jq",
+    "rust-lob-shadow-gate-policy.jq"
+  ] | sort) as $controller_asset_keys
+| ([
+    "binance-lob-archiver-production@.service",
+    "binance-lob-archiver-upload@.service",
+    "binance-lob-archiver-production-spot.env",
+    "binance-lob-archiver-production-usdm.env"
+  ] | sort) as $production_asset_keys
+| ([
+    "binance-lob-archiver-rust@.service",
+    "binance-lob-archiver-rust-upload@.service",
+    "binance-lob-archiver-rust-spot.env",
+    "binance-lob-archiver-rust-usdm.env"
+  ] | sort) as $shadow_asset_keys
+| $root.schema == "monday.rust_lob_shadow_gate.v5"
+and .control_plane_version == 2
 and .passed == true
-and .production_eligible == true
-and .checks_passed == true
-and (if $expected_controller_release_sha256 != "" then
-  .schema == "monday.rust_lob_shadow_gate.v5"
-  and (.controller_release_sha256 | type) == "string"
-  and (.controller_release_sha256 | test("^[a-f0-9]{64}$"))
-  and .controller_release_sha256 == $expected_controller_release_sha256
-  and (.controller_deployment_bundle_sha256 | type) == "string"
-  and (.controller_deployment_bundle_sha256 | test("^[a-f0-9]{64}$"))
-  and .controller_deployment_bundle_sha256 == .deployment_bundle_sha256
-  and (.controller_deployment_source_revision | type) == "string"
-  and (.controller_deployment_source_revision | test("^[a-f0-9]{40,64}$"))
-  and .controller_deployment_source_revision == .deployment_source_revision
-else
-  .schema == "monday.rust_lob_shadow_gate.v4"
+and (.production_eligible | type == "boolean")
+and (.test_only | type == "boolean")
+and (if .test_only then .production_eligible == false else .production_eligible == true end)
+and (.source_mode == "stable" or .source_mode == "direct")
+and (.from_controller_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+and (.candidate_controller_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+and (.candidate_payload_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+and (.candidate_runtime_contract_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+and (.candidate_deployment_bundle_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+and (.candidate_deployment_source_revision | type == "string" and test("^[a-f0-9]{40,64}$"))
+and (.candidate_control_bytes | type == "object"
+  and (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+  and (.assets | type == "object" and (keys | sort) == $controller_asset_keys
+    and all(.[]; type == "string" and test("^[a-f0-9]{64}$"))))
+and (.transition | type == "object"
+  and (.before | test("^[a-f0-9]{64}$"))
+  and (.after == $root.candidate_controller_sha256)
+  and (.topology == "stable" or .topology == "direct-bootstrap"))
+and (if .source_mode == "direct" then
+  .transition.topology == "direct-bootstrap"
+  and .from_controller_sha256 == .transition.before
+ else
+  .source_mode == "stable"
+  and .from_controller_sha256 == .transition.before
 end)
-and (.io_full_psi_windows | valid_io_full_psi_windows)
-and (["resource-preflight","shadow-spot","upload-drain-spot","shadow-usdm",
-    "upload-drain-usdm","oss-roundtrip-spot","oss-roundtrip-usdm"] as $required
-  | all($required[]; . as $phase
-      | ([$gate.io_full_psi_windows[]
-          | select(.phase == $phase and .stage == "calibration")] | length) >= 3)
-  and all($required[1:][]; . as $phase
-      | ([$gate.io_full_psi_windows[]
-          | select(.phase == $phase and .stage == "runtime")] | length) >= 1))
-and ([.io_full_psi_windows[] | select(.phase | startswith("strict-verifier-"))]
-  | length >= 4
-  and ([.[].phase] | unique) as $strict_phases
-  | all($strict_phases[]; . as $phase
-      | ([$gate.io_full_psi_windows[]
-          | select(.phase == $phase and .stage == "calibration")] | length) >= 3
-      and ([$gate.io_full_psi_windows[]
-          | select(.phase == $phase and .stage == "runtime")] | length) >= 1))
-and (.duration_seconds | type) == "number"
-and .duration_seconds == (.duration_seconds | floor)
-and .duration_seconds >= 240
-and (.markets.spot.symbol_count | type) == "number"
-and .markets.spot.symbol_count == (.markets.spot.symbol_count | floor)
-and .markets.spot.symbol_count >= 1000
-and .markets.spot.symbols_config == "ALL"
-and .markets.spot.snapshot_ready_count == .markets.spot.symbol_count
-and .markets.spot.stream_coverage_verified_count == .markets.spot.symbol_count
-and .markets.spot.all_stream_coverage_verified == true
-and .markets.spot.sequence_gaps == 0
-and (.markets.spot.upload_failure_count | type) == "number"
-and .markets.spot.upload_failure_count == (.markets.spot.upload_failure_count | floor)
-and .markets.spot.upload_failure_count >= 0
-and (.markets.spot.health_samples | type) == "number"
-and .markets.spot.health_samples == (.markets.spot.health_samples | floor)
-and .markets.spot.health_samples >= 8
-and (.markets.spot.max_health_silence_seconds | type) == "number"
-and .markets.spot.max_health_silence_seconds >= 0
-and .markets.spot.max_health_silence_seconds <= 120
-and (.markets.spot.catalog_sha256 | type) == "string"
-and (.markets.spot.catalog_sha256 | test("^[a-f0-9]{64}$"))
-and .markets.spot.configured_catalog_sha256 == .markets.spot.catalog_sha256
-and (.markets.spot.session_id | type) == "string"
-and (.markets.spot.session_id | length) > 0
-and (.markets.spot.oss_roundtrips | type) == "number"
-and .markets.spot.oss_roundtrips == (.markets.spot.oss_roundtrips | floor)
-and .markets.spot.oss_roundtrips >= 2
-and (.markets.spot.agg_trade_segments | type) == "number"
-and .markets.spot.agg_trade_segments == (.markets.spot.agg_trade_segments | floor)
-and .markets.spot.agg_trade_segments >= 2
-and .markets.spot.agg_trade_segments == .markets.spot.oss_roundtrips
-and (.markets.spot.agg_trade_count | type) == "number"
-and .markets.spot.agg_trade_count == (.markets.spot.agg_trade_count | floor)
-and .markets.spot.agg_trade_count > 0
-and .markets.spot.strict_trade_summary_readback == true
-and .markets.spot.strict_lob_continuity_readback == true
-and (.markets.spot.lob_reconnect_boundaries | type) == "number"
-and .markets.spot.lob_reconnect_boundaries == 0
-and (.markets.spot.min_lob_source_latency_ms | type) == "number"
-and .markets.spot.min_lob_source_latency_ms >= -1000
-and (.markets.spot.max_lob_source_latency_ms | type) == "number"
-and .markets.spot.max_lob_source_latency_ms <= 30000
-and .markets.spot.max_lob_source_latency_ms >= .markets.spot.min_lob_source_latency_ms
-and (.markets.spot.min_lob_bid_levels | type) == "number"
-and .markets.spot.min_lob_bid_levels > 0
-and (.markets.spot.min_lob_ask_levels | type) == "number"
-and .markets.spot.min_lob_ask_levels > 0
-and (.markets.spot.max_segment_gap_ns | type) == "number"
-and .markets.spot.max_segment_gap_ns == (.markets.spot.max_segment_gap_ns | floor)
-and .markets.spot.max_segment_gap_ns >= 0
-and .markets.spot.max_segment_gap_ns <= 90000000000
-and (.markets.spot.oss_roundtrip_evidence | type) == "array"
-and (.markets.spot.oss_roundtrip_evidence | length) == .markets.spot.oss_roundtrips
-and all(.markets.spot.oss_roundtrip_evidence[];
-  (.success_uri | type) == "string" and (.success_uri | length) > 0
-  and (.sha256 | type) == "string"
-  and (.sha256 | test("^[a-f0-9]{64}$"))
-  and (.manifest_sha256 | type) == "string"
-  and (.manifest_sha256 | test("^[a-f0-9]{64}$"))
-  and (.gap_from_previous_ns | type) == "number"
-  and .gap_from_previous_ns == (.gap_from_previous_ns | floor)
-  and .gap_from_previous_ns >= 0
-  and (.start_received_at_ns | type) == "number"
-  and .start_received_at_ns == (.start_received_at_ns | floor)
-  and (.end_received_at_ns | type) == "number"
-  and .end_received_at_ns == (.end_received_at_ns | floor)
-  and .end_received_at_ns >= .start_received_at_ns
-  and (.agg_trade_count | type) == "number"
-  and .agg_trade_count == (.agg_trade_count | floor)
-  and .agg_trade_count > 0
-  and .lob_capture_session_id == $gate.markets.spot.session_id
-  and (.lob_reconnect_boundary | type) == "boolean"
-  and .lob_sequence_gaps == 0
-  and .lob_source_time_rollbacks == 0
-  and .lob_declared_symbol_count == $gate.markets.spot.symbol_count
-  and .lob_covered_symbol_count == $gate.markets.spot.symbol_count
-  and .stream_coverage_verified_count == $gate.markets.spot.symbol_count
-  and .all_stream_coverage_verified == true
-  and (.lob_min_source_latency_ms | type) == "number"
-  and .lob_min_source_latency_ms >= -1000
-  and (.lob_max_source_latency_ms | type) == "number"
-  and .lob_max_source_latency_ms <= 30000
-  and .lob_max_source_latency_ms >= .lob_min_source_latency_ms
-  and (.lob_min_bid_levels | type) == "number"
-  and .lob_min_bid_levels > 0
-  and (.lob_min_ask_levels | type) == "number"
-  and .lob_min_ask_levels > 0)
-and (.markets.spot.oss_roundtrip_evidence as $round_trips
-  | $round_trips[0].start_received_at_ns <= $gate.markets.spot.observation_started_ns
-  and $round_trips[0].end_received_at_ns > $gate.markets.spot.observation_started_ns
-  and $round_trips[0].gap_from_previous_ns == 0
-  and all($round_trips[].lob_reconnect_boundary; . == false)
-  and .markets.spot.lob_reconnect_boundaries
-    == ([$round_trips[].lob_reconnect_boundary] | map(select(.)) | length)
-  and .markets.spot.min_lob_source_latency_ms == ([$round_trips[].lob_min_source_latency_ms] | min)
-  and .markets.spot.max_lob_source_latency_ms == ([$round_trips[].lob_max_source_latency_ms] | max)
-  and .markets.spot.min_lob_bid_levels == ([$round_trips[].lob_min_bid_levels] | min)
-  and .markets.spot.min_lob_ask_levels == ([$round_trips[].lob_min_ask_levels] | min)
-  and .markets.spot.max_segment_gap_ns == ([$round_trips[].gap_from_previous_ns] | max)
-  and all(range(1; ($round_trips | length));
-      $round_trips[.].start_received_at_ns >= $round_trips[. - 1].end_received_at_ns
-      and $round_trips[.].gap_from_previous_ns
-        == ($round_trips[.].start_received_at_ns - $round_trips[. - 1].end_received_at_ns)))
-and (.markets.usdm.symbol_count | type) == "number"
-and .markets.usdm.symbol_count == (.markets.usdm.symbol_count | floor)
-and .markets.usdm.symbol_count == 100
-and (.markets.usdm.symbols_config | type) == "string"
-and (.markets.usdm.symbols_config | test("^[A-Z0-9]+(,[A-Z0-9]+)*$"))
-and (.markets.usdm.symbols_config | split(",") | length) == 100
-and (.markets.usdm.symbols_config | split(",") | unique | length) == 100
-and .markets.usdm.snapshot_ready_count == .markets.usdm.symbol_count
-and .markets.usdm.stream_coverage_verified_count == .markets.usdm.symbol_count
-and .markets.usdm.all_stream_coverage_verified == true
-and .markets.usdm.sequence_gaps == 0
-and (.markets.usdm.upload_failure_count | type) == "number"
-and .markets.usdm.upload_failure_count == (.markets.usdm.upload_failure_count | floor)
-and .markets.usdm.upload_failure_count >= 0
-and (.markets.usdm.health_samples | type) == "number"
-and .markets.usdm.health_samples == (.markets.usdm.health_samples | floor)
-and .markets.usdm.health_samples >= 8
-and (.markets.usdm.max_health_silence_seconds | type) == "number"
-and .markets.usdm.max_health_silence_seconds >= 0
-and .markets.usdm.max_health_silence_seconds <= 120
-and (.markets.usdm.catalog_sha256 | type) == "string"
-and (.markets.usdm.catalog_sha256 | test("^[a-f0-9]{64}$"))
-and .markets.usdm.configured_catalog_sha256 == .markets.usdm.catalog_sha256
-and (.markets.usdm.session_id | type) == "string"
-and (.markets.usdm.session_id | length) > 0
-and (.markets.usdm.oss_roundtrips | type) == "number"
-and .markets.usdm.oss_roundtrips == (.markets.usdm.oss_roundtrips | floor)
-and .markets.usdm.oss_roundtrips >= 2
-and (.markets.usdm.agg_trade_segments | type) == "number"
-and .markets.usdm.agg_trade_segments == (.markets.usdm.agg_trade_segments | floor)
-and .markets.usdm.agg_trade_segments == 0
-and (.markets.usdm.agg_trade_count | type) == "number"
-and .markets.usdm.agg_trade_count == (.markets.usdm.agg_trade_count | floor)
-and .markets.usdm.agg_trade_count == 0
-and .markets.usdm.strict_trade_summary_readback == false
-and .markets.usdm.strict_lob_continuity_readback == true
-and (.markets.usdm.lob_reconnect_boundaries | type) == "number"
-and .markets.usdm.lob_reconnect_boundaries == 0
-and (.markets.usdm.min_lob_source_latency_ms | type) == "number"
-and .markets.usdm.min_lob_source_latency_ms >= -1000
-and (.markets.usdm.max_lob_source_latency_ms | type) == "number"
-and .markets.usdm.max_lob_source_latency_ms <= 30000
-and .markets.usdm.max_lob_source_latency_ms >= .markets.usdm.min_lob_source_latency_ms
-and (.markets.usdm.min_lob_bid_levels | type) == "number"
-and .markets.usdm.min_lob_bid_levels > 0
-and (.markets.usdm.min_lob_ask_levels | type) == "number"
-and .markets.usdm.min_lob_ask_levels > 0
-and (.markets.usdm.max_segment_gap_ns | type) == "number"
-and .markets.usdm.max_segment_gap_ns == (.markets.usdm.max_segment_gap_ns | floor)
-and .markets.usdm.max_segment_gap_ns >= 0
-and .markets.usdm.max_segment_gap_ns <= 90000000000
-and (.markets.usdm.oss_roundtrip_evidence | type) == "array"
-and (.markets.usdm.oss_roundtrip_evidence | length) == .markets.usdm.oss_roundtrips
-and all(.markets.usdm.oss_roundtrip_evidence[];
-  (.success_uri | type) == "string" and (.success_uri | length) > 0
-  and (.sha256 | type) == "string"
-  and (.sha256 | test("^[a-f0-9]{64}$"))
-  and (.manifest_sha256 | type) == "string"
-  and (.manifest_sha256 | test("^[a-f0-9]{64}$"))
-  and (.gap_from_previous_ns | type) == "number"
-  and .gap_from_previous_ns == (.gap_from_previous_ns | floor)
-  and .gap_from_previous_ns >= 0
-  and (.start_received_at_ns | type) == "number"
-  and .start_received_at_ns == (.start_received_at_ns | floor)
-  and (.end_received_at_ns | type) == "number"
-  and .end_received_at_ns == (.end_received_at_ns | floor)
-  and .end_received_at_ns >= .start_received_at_ns
-  and (.agg_trade_count | type) == "number"
-  and .agg_trade_count == (.agg_trade_count | floor)
-  and .agg_trade_count == 0
-  and .lob_capture_session_id == $gate.markets.usdm.session_id
-  and (.lob_reconnect_boundary | type) == "boolean"
-  and .lob_sequence_gaps == 0
-  and .lob_source_time_rollbacks == 0
-  and .lob_declared_symbol_count == $gate.markets.usdm.symbol_count
-  and .lob_covered_symbol_count == $gate.markets.usdm.symbol_count
-  and .stream_coverage_verified_count == $gate.markets.usdm.symbol_count
-  and .all_stream_coverage_verified == true
-  and (.lob_min_source_latency_ms | type) == "number"
-  and .lob_min_source_latency_ms >= -1000
-  and (.lob_max_source_latency_ms | type) == "number"
-  and .lob_max_source_latency_ms <= 30000
-  and .lob_max_source_latency_ms >= .lob_min_source_latency_ms
-  and (.lob_min_bid_levels | type) == "number"
-  and .lob_min_bid_levels > 0
-  and (.lob_min_ask_levels | type) == "number"
-  and .lob_min_ask_levels > 0)
-and (.markets.usdm.oss_roundtrip_evidence as $round_trips
-  | $round_trips[0].start_received_at_ns <= $gate.markets.usdm.observation_started_ns
-  and $round_trips[0].end_received_at_ns > $gate.markets.usdm.observation_started_ns
-  and $round_trips[0].gap_from_previous_ns == 0
-  and all($round_trips[].lob_reconnect_boundary; . == false)
-  and .markets.usdm.lob_reconnect_boundaries
-    == ([$round_trips[].lob_reconnect_boundary] | map(select(.)) | length)
-  and .markets.usdm.min_lob_source_latency_ms == ([$round_trips[].lob_min_source_latency_ms] | min)
-  and .markets.usdm.max_lob_source_latency_ms == ([$round_trips[].lob_max_source_latency_ms] | max)
-  and .markets.usdm.min_lob_bid_levels == ([$round_trips[].lob_min_bid_levels] | min)
-  and .markets.usdm.min_lob_ask_levels == ([$round_trips[].lob_min_ask_levels] | min)
-  and .markets.usdm.max_segment_gap_ns == ([$round_trips[].gap_from_previous_ns] | max)
-  and all(range(1; ($round_trips | length));
-      $round_trips[.].start_received_at_ns >= $round_trips[. - 1].end_received_at_ns
-      and $round_trips[.].gap_from_previous_ns
-        == ($round_trips[.].start_received_at_ns - $round_trips[. - 1].end_received_at_ns)))
-and .markets.spot.tape_schema == .markets.usdm.tape_schema
-and (.markets.spot.tape_schema == "binance.market_tape.v1"
-  or .markets.spot.tape_schema == "binance.market_tape.v2")
-and (if .markets.spot.tape_schema == "binance.market_tape.v1" then
-  (.markets.spot | has("stream_types") | not)
-  and (.markets.spot | has("raw_trade_segments") | not)
-  and (.markets.spot | has("raw_trade_count") | not)
-  and (.markets.spot | has("book_ticker_count") | not)
-  and (.markets.spot | has("force_order_count") | not)
-  and (.markets.spot | has("strict_raw_trade_continuity_readback") | not)
-  and (.markets.spot.full_stream_coverage_verified == null
-    or .markets.spot.full_stream_coverage_verified == true)
-  and all(.markets.spot.oss_roundtrip_evidence[];
-    (has("raw_trade_count") | not)
-    and (has("book_ticker_count") | not)
-    and (has("force_order_count") | not))
-else
-  .markets.spot.stream_types == ["aggTrade","bookTicker","depth@100ms","trade"]
-  and (.markets.spot.raw_trade_segments | type) == "number"
-  and .markets.spot.raw_trade_segments == (.markets.spot.raw_trade_segments | floor)
-  and .markets.spot.raw_trade_segments >= 2
-  and .markets.spot.raw_trade_segments == .markets.spot.oss_roundtrips
-  and (.markets.spot.raw_trade_count | type) == "number"
-  and .markets.spot.raw_trade_count == (.markets.spot.raw_trade_count | floor)
-  and .markets.spot.raw_trade_count > 0
-  and .markets.spot.raw_trade_count
-    == ([.markets.spot.oss_roundtrip_evidence[].raw_trade_count] | add)
-  and (.markets.spot.book_ticker_count | type) == "number"
-  and .markets.spot.book_ticker_count == (.markets.spot.book_ticker_count | floor)
-  and .markets.spot.book_ticker_count > 0
-  and .markets.spot.book_ticker_count
-    == ([.markets.spot.oss_roundtrip_evidence[].book_ticker_count] | add)
-  and (.markets.spot | has("force_order_count") | not)
-  and .markets.spot.strict_raw_trade_continuity_readback == true
-  and .markets.spot.full_stream_coverage_verified == true
-  and all(.markets.spot.oss_roundtrip_evidence[];
-    (.raw_trade_count | type) == "number"
-    and .raw_trade_count == (.raw_trade_count | floor)
-    and .raw_trade_count > 0
-    and (.book_ticker_count | type) == "number"
-    and .book_ticker_count == (.book_ticker_count | floor)
-    and .book_ticker_count > 0
-    and (has("force_order_count") | not))
-end)
-and .markets.usdm.tape_schema == "binance.market_tape.v2"
-and .markets.usdm.stream_types == ["depth@100ms"]
-and (.markets.usdm.raw_trade_segments | type) == "number"
-and .markets.usdm.raw_trade_segments == 0
-and (.markets.usdm.raw_trade_count | type) == "number"
-and .markets.usdm.raw_trade_count == 0
-and (.markets.usdm.book_ticker_count | type) == "number"
-and .markets.usdm.book_ticker_count == ([.markets.usdm.oss_roundtrip_evidence[].book_ticker_count] | add)
-and .markets.usdm.book_ticker_count == 0
-and (.markets.usdm.force_order_count | type) == "number"
-and .markets.usdm.force_order_count == 0
-and .markets.usdm.strict_raw_trade_continuity_readback == false
-and .markets.usdm.full_stream_coverage_verified == true
-and all(.markets.usdm.oss_roundtrip_evidence[];
-  .raw_trade_count == 0
-  and .book_ticker_count == 0
-  and .force_order_count == 0)
+and (.before | type == "object"
+  and .controller == $root.transition.before
+  and (.payload_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+  and (.runtime_contract_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+  and (.production_projection | type == "string" and length > 0)
+  and (.production_assets | type == "object" and (keys | sort) == $production_asset_keys
+    and all(.[]; type == "string" and test("^[a-f0-9]{64}$"))))
+and (.production_assets | type == "object" and (keys | sort) == $production_asset_keys
+  and all(.[]; type == "string" and test("^[a-f0-9]{64}$")))
+and (.production_runtime | type == "object"
+  and .schema == "monday.rust_lob_production_runtime.v1"
+  and .type == "simple"
+  and .exec_start == "/opt/monday/bin/binance-lob-archiver"
+  and .environment_file == "/etc/monday/binance-lob-archiver-production-%i.env"
+  and .user == "hftcollector"
+  and .group == "hftcollector"
+  and .restart == "always"
+  and .restart_sec == 5
+  and .runtime_max_sec == 21600
+  and .kill_mode == "mixed"
+  and .timeout_start_sec == 120
+  and .timeout_stop_sec == 600
+  and .cpu_quota == "80%"
+  and .memory_high == "2048M"
+  and .memory_max == "2560M"
+  and (.sandbox | type == "object"
+    and .no_new_privileges == true
+    and .private_tmp == true
+    and .protect_system == "strict"
+    and .protect_home == true
+    and .protect_kernel_tunables == true
+    and .protect_kernel_modules == true
+    and .protect_control_groups == true
+    and .lock_personality == true
+    and .restrict_suidsgid == true
+    and .state_directory == "hft-collector"
+    and .read_write_paths == ["/data/monday/spool/binance-lob", "/data/monday/spool/binance-lob-recovery"])
+  and (.upload | type == "object"
+    and .type == "oneshot"
+    and .exec_start == "/opt/monday/bin/binance-lob-archiver --upload-only"
+    and .environment_file == "/etc/monday/binance-lob-archiver-production-%i.env"
+    and .cpu_quota == "80%"
+    and .memory_high == "384M"
+    and .memory_max == "512M"
+    and .timeout_start_sec == 0)
+  and (.unit_sha256 | type == "object"
+    and (.collector | type == "string" and test("^[a-f0-9]{64}$"))
+    and (.upload | type == "string" and test("^[a-f0-9]{64}$")))
+  and (.unit_semantics_sha256 | type == "object"
+    and (.collector | type == "string" and test("^[a-f0-9]{64}$"))
+    and (.upload | type == "string" and test("^[a-f0-9]{64}$")))
+  and (.env_sha256 | type == "object"
+    and (.spot | type == "string" and test("^[a-f0-9]{64}$"))
+    and (.usdm | type == "string" and test("^[a-f0-9]{64}$")))
+  and (.markets | type == "object" and (keys | sort) == ["spot", "usdm"]
+    and (.spot | type == "object"
+      and .market == "spot" and .dataset == "spot_all" and .symbols == "ALL"
+      and .shard_id == "all" and .spool_dir == "/data/monday/spool/binance-lob/spot"
+      and .oss_bucket == "monday-lob-apne1-1045353359"
+      and .oss_endpoint == "oss-ap-northeast-1-internal.aliyuncs.com"
+      and .oss_region == "ap-northeast-1" and .aliyun_profile == "ecs-role")
+    and (.usdm | type == "object"
+      and .market == "usdm" and .dataset == "usdm_perpetual_top100_lob"
+      and .shard_id == "all" and .ws_shard_size == 25
+      and .spool_dir == "/data/monday/spool/binance-lob/usdm"
+      and .oss_bucket == "monday-lob-apne1-1045353359"
+      and .oss_endpoint == "oss-ap-northeast-1-internal.aliyuncs.com"
+      and .oss_region == "ap-northeast-1" and .aliyun_profile == "ecs-role")
+    and (.usdm.symbols | type == "string")
+    and ((.usdm.symbols | split(",")) | length == 100)
+    and ((.usdm.symbols | split(",") | unique) | length == 100)))
+and (.production_process | type == "object")
+and (if .test_only then true else
+  (.production_process | ((keys | sort) == ["spot", "usdm"]
+    and all(.[]; .active == true
+      and (.main_pid | type == "number" and . >= 1)
+      and (.process_exe_sha256 | type == "string" and test("^[a-f0-9]{64}$"))))) end)
+and (.resource_admission | type == "array" and length >= 3
+  and ((["preflight","shadow-spot","strict-verifier-spot","upload-drain-spot","shadow-usdm","strict-verifier-usdm","upload-drain-usdm","oss-readback-spot","oss-readback-usdm"]
+    - (map(.phase) | unique)) | length == 0)
+  and all(.[]; . as $r
+    | (.phase | type == "string" and length > 0)
+    and (.started_at | type == "string" and length > 0)
+    and (.ended_at | type == "string" and length > 0)
+    and (.samples | type == "number" and . >= 1)
+    and (.host_memory_available_bytes | type == "number" and . >= 0)
+    and (.max_memory_available_bytes | type == "number" and . >= 0)
+    and (.current_memory_available_bytes | type == "number" and . >= 0)
+    and (.breach | type == "boolean" and . == false)
+    and ($r.required_bytes | type == "number" and . > 0 and . <= $r.host_memory_available_bytes)
+    and (.phase_memory_max_bytes | type == "number" and . > 0)))
+and (.io_full_psi_windows | type == "array" and length >= 3
+  and all(.[]; . as $p
+    | (.phase | type == "string" and length > 0)
+    and (.stage | type == "string" and length > 0)
+    and (.hit | type == "boolean")
+    and ($p.consecutive_hits | type == "number" and . >= 0)
+    and (if $p.stage == "calibration"
+         then ($p.delta_us | type == "number" and . >= 0)
+           and ($p.ratio | type == "number" and . >= 0)
+         else true end)))
+and (.shadow_staging | type == "object"
+  and .mode == "run-scoped"
+  and (.run_unit_root | type == "string" and test("/run/monday/rust-lob-gate/[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*$"))
+  and (.spool_root | type == "string" and test("/data/monday/spool/binance-lob-rust-shadow/gate/[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*$"))
+  and (.units | type == "object" and (keys | sort) == ["spot", "usdm"]
+    and (.spot | type == "string" and test("^monday-rust-lob-gate-[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*-spot\\.service$"))
+    and (.usdm | type == "string" and test("^monday-rust-lob-gate-[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*-usdm\\.service$")))
+  and (.upload_units | type == "object" and (keys | sort) == ["spot", "usdm"]
+    and all(.[]; type == "object"
+      and (.unit | type == "string" and test("^monday-rust-lob-gate-[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*-(spot|usdm)-upload\\.service$"))
+      and (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))))
+  and (.candidate_assets | type == "object" and (keys | sort) == $shadow_asset_keys
+    and all(.[]; type == "string" and test("^[a-f0-9]{64}$")))
+  and (.restored_assets | type == "object" and (keys | sort) == $shadow_asset_keys
+    and all(.[]; ((.state == "present"
+      and (.sha256 | type == "string" and test("^[a-f0-9]{64}$")))
+      or (.state == "absent" and .sha256 == null)
+      or (.state == "projection"
+        and (.target | type == "string" and length > 0)
+        and (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))))))
+  and (.before_assets | type == "object" and (keys | sort) == $shadow_asset_keys
+    and all(.[]; ((.state == "present"
+      and (.sha256 | type == "string" and test("^[a-f0-9]{64}$")))
+      or (.state == "absent" and .sha256 == null)
+      or (.state == "projection"
+        and (.target | type == "string" and length > 0)
+        and (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))))))
+  and .restored_assets == .before_assets
+  and (.binary | type == "object"
+    and (.path | type == "string" and length > 0)
+    and (.candidate_target | type == "string" and (contains("/opt/monday/bin/") | not))
+    and (.candidate_target | type == "string" and length > 0)
+    and (.restored_present | type == "boolean")
+    and ((.restored_target_sha256 == null)
+      or (.restored_target_sha256 | type == "string" and test("^[a-f0-9]{64}$")))))
+  and (.binary.path == .run_unit_root)
+and (.checks | type == "object"
+  and .before_pair_unchanged == true
+  and .shadow_staging_verified == true
+  and .production_runtime_verified == true
+  and .shadow_assets_restored == true
+  and .resource_preflight == true
+  and .oss_triplets == true
+  and .strict_segment_verifier == true
+  and .final_identity == true
+  and .controller_control_bytes == true
+  and .shadow_link_restored == true
+  and .health_freshness == true)
+and (.markets | type == "object" and ((keys | sort) == ["spot", "usdm"])
+  and (to_entries | all(.[]; .value.market == .key))
+  and all(.[]; . as $m
+    | (.market | type == "string")
+    and (.dataset | type == "string" and length > 0)
+    and (.session_id | type == "string" and length > 0)
+    and (.spool_dir | type == "string" and test("/data/monday/spool/binance-lob-rust-shadow/gate/[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*/(spot|usdm)$"))
+    and (.shard_id == "all")
+    and (.oss_bucket == "monday-lob-apne1-1045353359")
+    and (.oss_endpoint == "oss-ap-northeast-1-internal.aliyuncs.com")
+    and (.oss_region == "ap-northeast-1")
+    and (.aliyun_profile == "ecs-role")
+    and (.expected_oss_bucket | type == "string" and length > 0)
+    and (.expected_oss_prefix | type == "string"
+      and . == ("lake/raw/venue=binance/market=" + $m.market
+        + "/dataset=" + $m.dataset + "/shard=all"))
+    and (.observed_at_ns | type == "number" and floor == . and . >= 0)
+    and ($m.segment_count | type == "number" and . >= 2 and . == ($m.segments | length))
+    and ($m.oss_triplet_count | type == "number" and . >= 2 and . == ($m.triplets | length))
+    and (.n_restarts | type == "number" and . == 0)
+    and .process_identity_verified == true
+    and .installed_shadow_assets_verified == true
+    and .strict_lob_continuity_readback == true
+    and (.strict_aggregate_trade_continuity_readback | type == "boolean")
+    and (.strict_raw_trade_continuity_readback | type == "boolean")
+    and (if .market == "spot" then
+      .strict_aggregate_trade_continuity_readback == true
+      and .strict_raw_trade_continuity_readback == true
+    else true end)
+    and (.segments | type == "array" and length >= 2
+      and all(.[];
+        (.file | type == "string" and test("^part-[0-9]+\\.jsonl\\.zst$"))
+        and (.path | type == "string" and length > 0)
+        and (.data_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+        and (.manifest_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+        and (.success_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+        and (.start_received_at_ns | type == "number" and . >= 0)
+        and (.end_received_at_ns | type == "number")
+        and (.end_received_at_ns >= .start_received_at_ns)
+        and (.end_received_at_ns <= $m.observed_at_ns)
+        and (.session_id | type == "string" and . == $m.session_id)))
+    and (.triplets | type == "array" and length >= 2
+      and all(.[];
+        (.market | type == "string" and . == $m.market)
+        and (.dataset | type == "string" and . == $m.dataset)
+        and (.object_prefix | type == "string")
+        and (.data_uri | type == "string")
+        and (.manifest_uri | type == "string")
+        and (.success_uri | type == "string")
+        and (
+          . as $triplet
+          | .data_uri as $data_uri
+          | .manifest_uri as $manifest_uri
+          | .success_uri as $success_uri
+          | ($data_uri | capture("^oss://(?<bucket>[^/]+)/(?<prefix>.+)/(?<file>part-[0-9]+\\.jsonl\\.zst)$")) as $data
+          | ($manifest_uri | capture("^oss://(?<bucket>[^/]+)/(?<prefix>.+)/(?<file>part-[0-9]+\\.jsonl\\.zst\\.manifest\\.json)$")) as $manifest
+          | ($success_uri | capture("^oss://(?<bucket>[^/]+)/(?<prefix>.+)/(?<file>part-[0-9]+\\.jsonl\\.zst\\._SUCCESS)$")) as $success
+          | ($data.prefix | ltrimstr($m.expected_oss_prefix + "/")) as $partition
+          | ($partition | valid_lob_partition)
+          and ($data.bucket == $m.expected_oss_bucket)
+          and ($manifest.bucket == $m.expected_oss_bucket)
+          and ($success.bucket == $m.expected_oss_bucket)
+          and ($data.prefix | startswith($m.expected_oss_prefix + "/"))
+          and ($manifest.prefix == $data.prefix)
+          and ($success.prefix == $data.prefix)
+          and ($manifest.file == ($data.file + ".manifest.json"))
+          and ($success.file == ($data.file + "._SUCCESS"))
+          and ($triplet.object_prefix == $data.prefix)
+          and ($manifest_uri == ($data_uri + ".manifest.json"))
+          and ($success_uri == ($data_uri + "._SUCCESS"))
+        )
+        and (.data_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+        and (.manifest_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+        and (.success_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+        and (.success_content == (.data_sha256 + "\n"))
+        and (.start_received_at_ns | type == "number" and . >= 0)
+        and (.end_received_at_ns | type == "number")
+        and (.end_received_at_ns >= .start_received_at_ns)
+        and (.end_received_at_ns <= $m.observed_at_ns)
+        and (.observed_at | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$"))
+        and (.observed_at_ns | type == "number" and floor == . and . >= 0)
+        and (.session_id | type == "string" and . == $m.session_id)
+        and (.catalog_sha256 | type == "string" and . == $m.health.frozen_catalog_sha256)))
+    and (.health | type == "object"
+      and (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+      and (.session_id | type == "string" and length > 0)
+      and (.frozen_catalog_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+      and (.frozen_symbol_count | type == "number" and . >= 1)
+      and (.max_health_silence_seconds | type == "number" and . >= 0 and . <= 120)
+      and (.samples | type == "number" and . >= 1)
+      and .session_id == $m.session_id)))
