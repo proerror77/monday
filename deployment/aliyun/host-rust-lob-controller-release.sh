@@ -72,6 +72,10 @@ verify_staged_artifact_release() {
     || die "staged artifact release is missing or indirect: $release_dir"
   direct_directory "$artifact_deployment" \
     || die 'staged artifact deployment is missing or indirect'
+  for asset in "$artifact_deployment"/*; do
+    regular_file "$asset" \
+      || die "staged artifact deployment contains a non-regular asset: ${asset##*/}"
+  done
   regular_file "$artifact_binary" \
     || die 'staged artifact binary is not a regular file'
   regular_file "$artifact_metadata" \
