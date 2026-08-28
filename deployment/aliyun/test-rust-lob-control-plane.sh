@@ -278,7 +278,27 @@ fi
 cp -p -- "$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/binance-lob-archiver-rust-spot.env" \
   "$bootstrap_shadow"
 
-bootstrap_cutover_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+# A normal direct-bootstrap failure must restore the exact pre-bootstrap writer
+# states from the snapshot, including active legacy units; it must not leave
+# the migration partially contained.
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
+  MONDAY_CUTOVER_FIXTURE_LEGACY_ACTIVE=1 MONDAY_CUTOVER_FAIL_AFTER_ACTIVE=1 \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from direct --to "$c0" \
+  --gate-receipt "$gate" --gate-sha256 "$gate_sha" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'fault-injected direct bootstrap unexpectedly succeeded\n' >&2
+  exit 1
+fi
+direct_failure_calls="$ROOT/run/cutover-fixture.calls"
+for unit in \
+  binance-lob-archiver@spot.service binance-lob-archiver@usdm.service \
+  binance-lob-archiver-upload@spot.service binance-lob-archiver-upload@usdm.service; do
+  grep -Fq "mask $unit" "$direct_failure_calls"
+  grep -Fq "start $unit" "$direct_failure_calls"
+done
+rm -f -- "$ROOT/run/cutover-fixture.calls"
+
+bootstrap_cutover_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
+  MONDAY_CUTOVER_FIXTURE_LEGACY_ACTIVE=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from direct --to "$c0" \
   --gate-receipt "$gate" --gate-sha256 "$gate_sha" --root "$ROOT")
 bootstrap_transition=$(printf '%s\n' "$bootstrap_cutover_output" | sed -n 's/^Transition receipt: //p')
@@ -290,6 +310,18 @@ bootstrap_transition_sha=$(printf '%s\n' "$bootstrap_cutover_output" | sed -n 's
   "$ROOT/opt/monday/releases/binance-lob-archiver/$p0_sha/binance-lob-archiver" ]]
 [[ $(monday_sha256_file "$bootstrap_transition") == "$bootstrap_transition_sha" ]]
 monday_validate_v2_transition "$bootstrap_transition" direct "$c0" "$gate" "$gate_sha"
+bootstrap_calls="$ROOT/run/cutover-fixture.calls"
+for unit in \
+  binance-lob-archiver@spot.service binance-lob-archiver@usdm.service \
+  binance-lob-archiver-upload@spot.service binance-lob-archiver-upload@usdm.service; do
+  grep -Fqx "stop $unit" "$bootstrap_calls"
+  grep -Fqx "disable $unit" "$bootstrap_calls"
+  grep -Fqx "mask $unit" "$bootstrap_calls"
+  if grep -Fq "start $unit" "$bootstrap_calls"; then
+    printf 'direct bootstrap resumed a legacy writer: %s\n' "$unit" >&2
+    exit 1
+  fi
+done
 mkdir -p "$ROOT/fixture-upload-status-empty"
 MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   MONDAY_UPLOAD_STATUS_ROOT="$ROOT/fixture-upload-status-empty" \
@@ -653,6 +685,13 @@ fi
 for unit in binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service; do
   grep -Fq "mask $unit" "$partial_calls"
 done
+for unit in \
+  binance-lob-archiver@spot.service binance-lob-archiver@usdm.service \
+  binance-lob-archiver-upload@spot.service binance-lob-archiver-upload@usdm.service \
+  binance-lob-archiver-rust@spot.service binance-lob-archiver-rust@usdm.service \
+  binance-lob-archiver-rust-upload@spot.service binance-lob-archiver-rust-upload@usdm.service; do
+  grep -Fq "mask $unit" "$partial_calls"
+done
 if compgen -G "$partial_process_root/*" >/dev/null; then
   printf 'contained partial-start rollback left a process marker\n' >&2
   exit 1
@@ -702,6 +741,116 @@ MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-readback.sh" --controller "$c2" \
   --transition-receipt "$transition2" --receipt-sha256 "$transition2_sha" \
   --root "$ROOT" >/dev/null
+
+# Restore's health and process checks are exercised with one bounded fixture
+# writer.  The writer waits for the fixture systemd start marker, so every
+# accepted sample is fresh relative to restore_started_ns; invalid policy
+# states are rejected without waiting for the production timeout.
+restore_fixture_pid=5252
+mkdir -p "$ROOT/proc/$restore_fixture_pid"
+rm -f -- "$ROOT/proc/$restore_fixture_pid/exe"
+ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p2_sha/binance-lob-archiver" \
+  "$ROOT/proc/$restore_fixture_pid/exe"
+write_restore_fixture_health() {
+  local mode=$1 observed status gaps ready symbols market dataset
+  while [[ ! -e "$ROOT/run/restore-fixture-start-spot" ]]; do
+    [[ -e "$ROOT/run/restore-fixture-health.stop" ]] && return 0
+    sleep 0.05
+  done
+  while [[ ! -e "$ROOT/run/restore-fixture-health.stop" ]]; do
+    observed=$(date +%s%N)
+    for market in spot usdm; do
+      symbols=1000; dataset=spot_all
+      [[ $market == usdm ]] && symbols=100 && dataset=usdm_perpetual_top100_lob
+      status=synced; gaps=0; ready=$symbols
+      case $mode in
+        unsynced) status=starting ;;
+        gaps) gaps=1 ;;
+        nonready) ready=0 ;;
+        success) : ;;
+        *) return 2 ;;
+      esac
+      jq -cn --arg market "$market" --arg dataset "$dataset" --arg status "$status" \
+        --arg session "restore-fixture-${mode}-${market}" --argjson symbols "$symbols" \
+        --argjson ready "$ready" --argjson gaps "$gaps" --argjson observed "$observed" \
+        '{market:$market,dataset:$dataset,status:$status,sequence_gaps:$gaps,symbol_count:$symbols,
+          snapshot_ready_count:$ready,bridged_count:$symbols,stream_coverage_verified_count:$symbols,
+          snapshot_only_symbols:[],all_symbols_bridged:true,all_stream_coverage_verified:true,
+          full_stream_coverage_verified:true,pending_upload_segments:0,queue_saturated:false,
+          disk_warning:false,upload_warning:false,session_id:$session,updated_at_ns:$observed}' \
+        >"$production_spool_root/$market/health.json.tmp"
+      mv -f -- "$production_spool_root/$market/health.json.tmp" \
+        "$production_spool_root/$market/health.json"
+    done
+    sleep 0.05
+  done
+}
+run_restore_health_fixture() {
+  local mode=$1 receipt="$ROOT/data/monday/evidence/restores/$c2/restore.json"
+  rm -f -- "$receipt" "$receipt.sha256" \
+    "$production_spool_root/spot/health.json" "$production_spool_root/usdm/health.json" \
+    "$ROOT/run/restore-fixture-health.stop" "$ROOT/run/restore-fixture-start-spot" \
+    "$ROOT/run/restore-fixture-start-usdm"
+  (write_restore_fixture_health "$mode") &
+  local writer=$!
+  if [[ $mode == success ]]; then
+    MONDAY_CONTROL_PLANE_TEST=1 MONDAY_RESTORE_FIXTURE_SYSTEMD=1 \
+      MONDAY_RESTORE_FIXTURE_PID="$restore_fixture_pid" \
+      MONDAY_RESTORE_HEALTH_TIMEOUT_SECONDS=2 MONDAY_ROOT="$ROOT" \
+      "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c2" --root "$ROOT" >/dev/null
+  else
+    if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_RESTORE_FIXTURE_SYSTEMD=1 \
+      MONDAY_RESTORE_FIXTURE_PID="$restore_fixture_pid" \
+      MONDAY_RESTORE_HEALTH_TIMEOUT_SECONDS=2 MONDAY_ROOT="$ROOT" \
+      "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c2" --root "$ROOT" \
+      >/dev/null 2>&1; then
+      printf 'restore accepted invalid health state: %s\n' "$mode" >&2
+      exit 1
+    fi
+  fi
+  : >"$ROOT/run/restore-fixture-health.stop"
+  wait "$writer"
+  [[ $mode != success || -f $receipt ]] || {
+    printf 'restore success fixture did not emit a receipt\n' >&2
+    exit 1
+  }
+}
+run_restore_health_fixture unsynced
+run_restore_health_fixture gaps
+run_restore_health_fixture nonready
+
+# A production ExecStartPre drift is a preflight failure.  It must not be
+# overwritten from an unrelated source, and the failure cleanup still masks
+# every writer.  Restore the exact active-C projection afterwards.
+restore_service_projection="$ROOT/etc/systemd/system/binance-lob-archiver-production@.service"
+restore_service_source=$(readlink -f -- "$restore_service_projection")
+rm -f -- "$restore_service_projection"
+cp -p -- "$restore_service_source" "$restore_service_projection"
+chmod u+w "$restore_service_projection"
+printf 'ExecStartPre=/opt/monday/bin/untrusted-helper\n' >>"$restore_service_projection"
+rm -f -- "$ROOT/data/monday/evidence/restores/$c2/restore.json" \
+  "$ROOT/data/monday/evidence/restores/$c2/restore.json.sha256" \
+  "$ROOT/run/restore-fixture.calls"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_RESTORE_FIXTURE_SYSTEMD=1 \
+  MONDAY_RESTORE_FIXTURE_PID="$restore_fixture_pid" MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c2" --root "$ROOT" \
+  >/dev/null 2>&1; then
+  printf 'restore accepted drifted ExecStartPre projection\n' >&2
+  exit 1
+fi
+restore_calls="$ROOT/run/restore-fixture.calls"
+for unit in \
+  binance-lob-archiver@spot.service binance-lob-archiver@usdm.service \
+  binance-lob-archiver-upload@spot.service binance-lob-archiver-upload@usdm.service \
+  binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service; do
+  grep -Fq "mask $unit" "$restore_calls"
+done
+rm -f -- "$restore_service_projection"
+ln -s "$ROOT/opt/monday/releases/binance-lob-controller/active/deployment/binance-lob-archiver-production@.service" \
+  "$restore_service_projection"
+run_restore_health_fixture success
+grep -Fq 'enable binance-lob-archiver-production@spot.service' "$restore_calls"
+grep -Fq 'enable binance-lob-archiver-production@usdm.service' "$restore_calls"
 
 # Health liveness is independent from stable process identity: a newer
 # observed_at is accepted while a backwards/stalled sample is rejected.
@@ -835,6 +984,13 @@ if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_RESTORE_FIXTURE_SYSTEMD=1 \
 fi
 restore_calls="$ROOT/run/restore-fixture.calls"
 for unit in binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service; do
+  grep -Fq "stop $unit" "$restore_calls"
+  grep -Fq "disable $unit" "$restore_calls"
+  grep -Fq "mask $unit" "$restore_calls"
+done
+for unit in \
+  binance-lob-archiver@spot.service binance-lob-archiver@usdm.service \
+  binance-lob-archiver-upload@spot.service binance-lob-archiver-upload@usdm.service; do
   grep -Fq "stop $unit" "$restore_calls"
   grep -Fq "disable $unit" "$restore_calls"
   grep -Fq "mask $unit" "$restore_calls"

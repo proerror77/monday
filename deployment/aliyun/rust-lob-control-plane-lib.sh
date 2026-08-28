@@ -114,6 +114,173 @@ monday_controller_projection_target() {
   esac
 }
 
+# The only canonical writer names that may touch the Binance LOB spools.  The
+# first four are pre-V2 units kept solely as rollback evidence; V2 never
+# resumes them.  The production pair is the only long-running writer that a
+# successful transition may start.  Upload units are oneshot writers and are
+# still included so a stale/manual invocation cannot race a transition.
+monday_rust_lob_legacy_writer_units() {
+  printf '%s\n' \
+    binance-lob-archiver@spot.service \
+    binance-lob-archiver@usdm.service \
+    binance-lob-archiver-upload@spot.service \
+    binance-lob-archiver-upload@usdm.service
+}
+
+monday_rust_lob_production_writer_units() {
+  printf '%s\n' \
+    binance-lob-archiver-production@spot.service \
+    binance-lob-archiver-production@usdm.service
+}
+
+monday_rust_lob_shadow_writer_units() {
+  printf '%s\n' \
+    binance-lob-archiver-rust@spot.service \
+    binance-lob-archiver-rust@usdm.service \
+    binance-lob-archiver-rust-upload@spot.service \
+    binance-lob-archiver-rust-upload@usdm.service
+}
+
+monday_rust_lob_all_writer_units() {
+  monday_rust_lob_legacy_writer_units
+  monday_rust_lob_production_writer_units
+  monday_rust_lob_shadow_writer_units
+}
+
+# Snapshot the exact systemd state needed for a direct bootstrap rollback.
+# The output is tab-separated and intentionally in-memory at each caller; no
+# mutable host state is used as a rollback source after the active rename.
+# Fields: unit, load-state, active-state, unit-file-state.
+monday_rust_lob_writer_state_snapshot() {
+  local unit load active enabled
+  while IFS= read -r unit; do
+    load=$(systemctl show "$unit" --property=LoadState --value 2>/dev/null || true)
+    [[ -n $load ]] || load=not-found
+    active=$(systemctl show "$unit" --property=ActiveState --value 2>/dev/null || true)
+    [[ -n $active ]] || active=inactive
+    enabled=$(systemctl show "$unit" --property=UnitFileState --value 2>/dev/null || true)
+    if [[ -z $enabled ]]; then
+      enabled=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+    fi
+    [[ -n $enabled ]] || enabled=disabled
+    printf '%s\t%s\t%s\t%s\n' "$unit" "$load" "$active" "$enabled"
+  done < <(monday_rust_lob_all_writer_units)
+}
+
+# Stop, disable, and runtime-mask an allowlisted writer stream.  Missing
+# legacy units are harmless (the runtime mask still prevents a late manual
+# start), while failures for known units are returned to the caller.
+monday_rust_lob_contain_writer_list() {
+  [[ $# -eq 1 ]] || return 2
+  local list_command=$1 unit failed=0 known
+  while IFS= read -r unit; do
+    known=false
+    if systemctl show "$unit" --property=LoadState --value >/dev/null 2>&1; then
+      known=true
+    fi
+    if [[ $known == true ]]; then
+      systemctl stop "$unit" >/dev/null 2>&1 || failed=1
+      systemctl disable "$unit" >/dev/null 2>&1 || failed=1
+    fi
+    systemctl mask --runtime "$unit" >/dev/null 2>&1 || failed=1
+  done < <("$list_command")
+  return "$failed"
+}
+
+monday_rust_lob_contain_writers() {
+  monday_rust_lob_contain_writer_list monday_rust_lob_all_writer_units
+}
+
+monday_rust_lob_contain_legacy_writers() {
+  monday_rust_lob_contain_writer_list monday_rust_lob_legacy_writer_units
+}
+
+monday_rust_lob_verify_contained() {
+  local unit load active enabled
+  while IFS= read -r unit; do
+    IFS=$'\t' read -r load active enabled \
+      < <(monday_rust_lob_writer_state "$unit") || return 1
+    [[ $active != active && $active != activating && $active != deactivating ]] || return 1
+    [[ $enabled == masked || $enabled == masked-runtime || $enabled == masked-runtime* ]] || return 1
+  done < <(monday_rust_lob_all_writer_units)
+}
+
+monday_rust_lob_verify_legacy_contained() {
+  local unit load active enabled
+  while IFS= read -r unit; do
+    IFS=$'\t' read -r load active enabled \
+      < <(monday_rust_lob_writer_state "$unit") || return 1
+    [[ $active != active && $active != activating && $active != deactivating ]] || return 1
+    [[ $enabled == masked || $enabled == masked-runtime || $enabled == masked-runtime* ]] || return 1
+  done < <(monday_rust_lob_legacy_writer_units)
+}
+
+monday_rust_lob_writer_state() {
+  [[ $# -eq 1 ]] || return 2
+  local unit=$1 load active enabled
+  load=$(systemctl show "$unit" --property=LoadState --value 2>/dev/null || true)
+  [[ -n $load ]] || load=not-found
+  active=$(systemctl show "$unit" --property=ActiveState --value 2>/dev/null || true)
+  [[ -n $active ]] || active=inactive
+  enabled=$(systemctl show "$unit" --property=UnitFileState --value 2>/dev/null || true)
+  if [[ -z $enabled ]]; then enabled=$(systemctl is-enabled "$unit" 2>/dev/null || true); fi
+  [[ -n $enabled ]] || enabled=disabled
+  printf '%s\t%s\t%s\n' "$load" "$active" "$enabled"
+}
+
+monday_rust_lob_verify_writer_state() {
+  [[ $# -eq 4 ]] || return 2
+  local unit=$1 expected_load=$2 expected_active=$3 expected_enabled=$4
+  local observed_load observed_active observed_enabled
+  IFS=$'\t' read -r observed_load observed_active observed_enabled \
+    < <(monday_rust_lob_writer_state "$unit") || return 1
+  [[ $observed_load == "$expected_load" \
+    && $observed_active == "$expected_active" \
+    && $observed_enabled == "$expected_enabled" ]]
+}
+
+# Restore a snapshot captured before direct bootstrap.  Passing `legacy` is
+# allowed only for the direct migration; stable V2 rollback/restore must keep
+# all legacy writers masked.  A failed restoration is deliberately reported so
+# the caller can contain the complete allowlist instead of guessing a state.
+monday_rust_lob_restore_writer_snapshot() {
+  [[ $# -eq 2 ]] || return 2
+  local snapshot=$1 restore_legacy=$2
+  local unit load active enabled
+  local failed=0
+  while IFS=$'\t' read -r unit load active enabled; do
+    [[ -n $unit ]] || continue
+    if [[ $restore_legacy != legacy ]] &&
+      monday_rust_lob_legacy_writer_units | grep -Fqx "$unit"; then
+      continue
+    fi
+    # A not-found unit has no enable state to restore; remove the temporary
+    # mask and leave it absent.  This also handles hosts without old units.
+    if [[ $load == not-found ]]; then
+      systemctl unmask "$unit" >/dev/null 2>&1 || failed=1
+      continue
+    fi
+    systemctl stop "$unit" >/dev/null 2>&1 || failed=1
+    case "$enabled" in
+      masked|masked-runtime|masked-runtime*)
+        systemctl mask --runtime "$unit" >/dev/null 2>&1 || failed=1 ;;
+      enabled|enabled-runtime|enabled-presets|indirect|generated|linked|linked-runtime)
+        systemctl unmask "$unit" >/dev/null 2>&1 || failed=1
+        systemctl enable "$unit" >/dev/null 2>&1 || failed=1 ;;
+      *)
+        systemctl unmask "$unit" >/dev/null 2>&1 || failed=1
+        systemctl disable "$unit" >/dev/null 2>&1 || failed=1 ;;
+    esac
+    if [[ $active == active || $active == activating ]]; then
+      systemctl start "$unit" >/dev/null 2>&1 || failed=1
+    else
+      systemctl stop "$unit" >/dev/null 2>&1 || failed=1
+    fi
+    monday_rust_lob_verify_writer_state "$unit" "$load" "$active" "$enabled" || failed=1
+  done <"$snapshot"
+  return "$failed"
+}
+
 # Verify the fixed entrypoints used by systemd resolve to one exact active
 # ControllerRelease.  This is read-only and deliberately accepts no regular
 # file fallback once V2 has been bootstrapped.
@@ -680,6 +847,24 @@ monday_rust_lob_active_controller_deployment() {
     '.artifact_sha256 == $artifact and .runtime_contract_sha256 == $runtime' \
     "$manifest" >/dev/null || return 1
   printf '%s\n' "$deployment"
+}
+
+# Apply the exact health policy shipped by the active controller.  Restore and
+# readback pass the active policy path, so a newer controller cannot silently
+# widen the fields checked by an older host script.
+monday_verify_rust_lob_runtime_health() {
+  [[ $# -eq 6 ]] || return 2
+  local policy=$1 health=$2 market=$3 dataset=$4 minimum_symbols=$5 minimum_updated_ns=$6
+  monday_file_direct "$policy" && monday_file_direct "$health" || return 1
+  [[ $market == spot || $market == usdm ]] || return 1
+  [[ $dataset =~ ^[A-Za-z0-9_.-]+$ && $minimum_symbols =~ ^[1-9][0-9]*$ \
+    && $minimum_updated_ns =~ ^[0-9]+$ ]] || return 1
+  jq -e -f "$policy" \
+    --arg expected_market "$market" \
+    --arg expected_dataset "$dataset" \
+    --argjson minimum_symbols "$minimum_symbols" \
+    --argjson minimum_updated_ns "$minimum_updated_ns" \
+    --arg old_session '' "$health" >/dev/null
 }
 
 # Pure monotonic health freshness transition used by the host gate and tests.

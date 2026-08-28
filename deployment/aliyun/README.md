@@ -1211,13 +1211,20 @@ Rollback uses the same pair cutover operation with an explicitly named previous
 controller and its own immutable Gate receipt. There is no alternate dispatcher
 or manual symlink shortcut.
 
-### 4. Restore a stopped, already-gated production release
+### 4. Restore the exact active pair after an interrupted transition
 
-If an already-cutover release is stopped and disabled, use `restore` for the
-exact active controller. Restore never guesses a previous release and never
-accepts a candidate digest that is not the active controller. It converges the
-installed assets and runtime to the active pair, or leaves production stopped
-and masked when identity verification fails.
+Use `restore` with the exact active controller digest when a host may have
+stopped during bootstrap or cutover. Restore is anchored only in the immutable
+`ControllerRelease C(P,R)` selected by the active link: it never discovers a
+candidate, guesses a previous release, or scans unrelated Gate directories.
+This distinction matters after a power loss: if the active link was committed
+before a transition receipt was written, active `C` alone is sufficient for
+recovery and no Gate receipt is required. If the deterministic receipt exists at
+`/data/monday/evidence/cutovers/<controller>/transition.json`, restore validates
+only the Gate path and digest named there; a production receipt must also carry
+the eligible `PASSED.sha256` marker. A missing receipt is therefore not an
+implicit Gate/PASSED failure, while a present but mismatched receipt is a hard
+failure.
 
 Invoke it with the exact active controller digest:
 
@@ -1228,41 +1235,33 @@ set -euo pipefail
   --controller REPLACE_WITH_ACTIVE_CONTROLLER_SHA
 ```
 
-Before starting anything the host restore requires all of the following:
+Before any unit or projection mutation, the host restore verifies the active
+controller manifest and payload digest, the active production runtime contract,
+all eight runtime assets, both controller helper projections, and the canonical
+production environment/spool paths. Every installed projection must either be
+an exact active-C symlink or contain byte-for-byte active-C content; a missing
+projection may be repaired from active `C`, but foreign, indirect, or drifted
+content is refused. The production unit's recovery `ExecStartPre`, sandbox and
+resource policy, and the exact active health-policy file are part of this
+verification. The stable production link must resolve to the active payload (or
+be absent/identical and safely repairable); it is never overwritten with an
+unrelated target.
 
-1. The active controller link resolves to the requested digest and its manifest
-   binds the exact payload and runtime contract.
-2. The stable production link resolves to that manifest's payload.
-3. No production unit is active (a running restore is refused, never preempted).
-4. The production symlink exists (a missing symlink is refused, never recreated).
-5. The canonical spool path is a direct directory tree under `/data` (no symlink
-   escapes) and the spot/usdm subdirectories exist.
-6. The installed production unit already declares
-   `ExecStartPre=+/opt/monday/bin/monday-rust-lob-recovery-queue isolate %i`, so
-   any residual `.jsonl.part`/`.zst.tmp`/`.part.corrupt` is detached into
-   `/data/monday/spool/binance-lob-recovery/<market>/<job>.ready` before the
-   collector starts.
-7. The installed production unit/env files match the gated deployment bundle
-   `cmp`-for-`cmp` and the production unit still declares `RuntimeMaxSec=21600`.
+Restore then snapshots writer state and stops, disables, and runtime-masks the
+complete allowlist of legacy, shadow, upload, and V2 production writers under
+the control-plane lock. It daemon-reloads, repairs only exact active-C
+projections, starts and enables both V2 production lanes, and waits for fresh
+per-lane health from a new session bound to each sample. Success requires the active health policy,
+zero sequence gaps, expected non-zero catalog/readiness, canonical spool,
+stable `MainPID`/executable digest, zero `NRestarts`, and a final paired
+Spot/USD-M re-read. The immutable restore receipt records the controller,
+payload/runtime/policy digests, process and health evidence, production runtime
+projection hashes, and proof that every legacy writer remains contained.
 
-The restore then clears stale health, starts the production units while disabled,
-waits for fresh configured-catalog health written after the restart with a new session
-and zero restarts, verifies each `/proc/<pid>/exe` still resolves to the
-candidate release, enables production for reboot, and re-verifies health. A
-unique recovery evidence directory is created under
-`/data/monday/evidence/recoveries/<ts>-<sha:0:12>-<pid>/` and holds the previous
-and post-restart health snapshots, a copy of the gated `gate.json` +
-`PASSED.sha256`, and immutable `recovery.json` + `verification.json`.
-Restore success proves the live acquisition runtime only. Detached queue
-completion remains a separate delivery state reported by collector health and
-its per-job result evidence.
-
-If the restored units never reach verified health, the host restore performs a
-fail-closed rollback: it disables and stops production, applies the runtime
-transition mask to the production, upload, and legacy units, verifies the host
-is fail-closed, preserves rollback health evidence, and records
-`recovery.json` with `result: failed` and `rollback_result`. A failed restore
-never leaves production active, enabled, or unmasked.
+Any preflight, start, health, identity, policy, or paired re-read failure is
+fail-closed: the restore stops, disables, and runtime-masks **all** allowlisted
+writers and writes no success receipt. Restore never resumes a legacy writer;
+only the exact V2 production pair may be enabled after the complete verification.
 
 ### Upload cleanup and failure rules
 

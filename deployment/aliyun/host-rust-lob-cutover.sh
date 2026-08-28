@@ -61,12 +61,19 @@ fi
 FIXTURE_SYSTEMD=false
 if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
   FIXTURE_SYSTEMD=true
-  declare -A fixture_unit_state=()
+  declare -A fixture_unit_state=() fixture_unit_file_state=() fixture_unit_load_state=()
   fixture_calls=$(monday_root_join "$ROOT" run/cutover-fixture.calls)
   fixture_process_root=$(monday_root_join "$ROOT" run/cutover-fixture.processes)
   mkdir -p "$(dirname -- "$fixture_calls")"
   mkdir -p "$fixture_process_root"
   fixture_usdm_starts=0
+  if [[ ${MONDAY_CUTOVER_FIXTURE_LEGACY_ACTIVE:-0} == 1 ]]; then
+    while IFS= read -r fixture_legacy_unit; do
+      fixture_unit_state[$fixture_legacy_unit]=active
+      fixture_unit_file_state[$fixture_legacy_unit]=enabled
+      fixture_unit_load_state[$fixture_legacy_unit]=loaded
+    done < <(monday_rust_lob_legacy_writer_units)
+  fi
   systemctl() {
     local action=${1:-} unit=${2:-} argument fixture_pid
     case "$action" in
@@ -85,18 +92,26 @@ if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
             fi
           fi
           fixture_unit_state[$argument]=active
+          [[ -n ${fixture_unit_file_state[$argument]:-} ]] || fixture_unit_file_state[$argument]=enabled
+          fixture_unit_load_state[$argument]=loaded
           printf '%s\n' "$(monday_active_controller_sha "$ROOT")" >"$fixture_process_root/${argument//@/_}"
           printf 'start %s\n' "$argument" >>"$fixture_calls"
         done
         return 0 ;;
-      stop|disable|mask|unmask)
+      stop|disable|mask|unmask|enable)
         shift
         for argument in "$@"; do
           [[ $argument == -* ]] && continue
-          if [[ $action == stop || $action == mask ]]; then
+          if [[ $action == stop || $action == mask || $action == disable ]]; then
             fixture_unit_state[$argument]=inactive
             rm -f -- "$fixture_process_root/${argument//@/_}"
           fi
+          case "$action" in
+            mask) fixture_unit_file_state[$argument]=masked; fixture_unit_load_state[$argument]=masked ;;
+            unmask) fixture_unit_file_state[$argument]=disabled; fixture_unit_load_state[$argument]=loaded ;;
+            disable) fixture_unit_file_state[$argument]=disabled ;;
+            enable) fixture_unit_file_state[$argument]=enabled ;;
+          esac
           printf '%s %s\n' "$action" "$argument" >>"$fixture_calls"
         done
         return 0 ;;
@@ -108,8 +123,10 @@ if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
       show)
         unit=$2
         case "${3#--property=}" in
+          LoadState) printf '%s\n' "${fixture_unit_load_state[$unit]:-loaded}" ;;
           ActiveState) [[ ${fixture_unit_state[$unit]:-inactive} == active ]] && printf 'active\n' || printf 'inactive\n' ;;
           SubState) [[ ${fixture_unit_state[$unit]:-inactive} == active ]] && printf 'running\n' || printf 'dead\n' ;;
+          UnitFileState) printf '%s\n' "${fixture_unit_file_state[$unit]:-disabled}" ;;
           MainPID)
             fixture_pid=${MONDAY_CUTOVER_FIXTURE_PID:-$$}
             if [[ $unit == *'@spot.service' && -f "$(monday_root_join "$ROOT" run/cutover-fixture-spot-flip)" ]]; then
@@ -120,6 +137,10 @@ if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
           *) printf '\n' ;;
         esac
         return 0 ;;
+      is-enabled)
+        printf '%s\n' "${fixture_unit_file_state[$2]:-disabled}"
+        [[ ${fixture_unit_file_state[$2]:-disabled} == enabled ]] && return 0
+        return 1 ;;
       *) return 0 ;;
     esac
   }
@@ -332,7 +353,10 @@ done
 
 tmp_root=$(mktemp -d "$(monday_root_join "$ROOT" tmp/monday-cutover.XXXXXX)" 2>/dev/null || mktemp -d)
 backup_root="$tmp_root/backup"; controller_backup_root="$backup_root/controller"; mkdir -p "$backup_root" "$controller_backup_root"
-committed=0; projection_prepared=0; production_prepared=0
+writer_snapshot="$tmp_root/writer-state.tsv"
+monday_rust_lob_writer_state_snapshot >"$writer_snapshot" \
+  || die 'could not snapshot canonical writer states'
+committed=0; projection_prepared=0; production_prepared=0; writer_containment_started=0; writer_containment_failed=0
 restore_direct_topology() {
   local asset target state
   for asset in "${PAIR_ASSETS[@]}"; do
@@ -395,27 +419,42 @@ cleanup() {
     if (( projection_prepared == 1 )) && [[ $FROM == direct ]]; then
       restore_direct_topology || rollback_failed=true
     fi
-    if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
-      systemctl stop binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service >/dev/null 2>&1 || rollback_failed=true
-      systemctl mask --runtime binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service >/dev/null 2>&1 || rollback_failed=true
-      systemctl daemon-reload >/dev/null 2>&1 || rollback_failed=true
-      if [[ $rollback_failed == false ]]; then
-        systemctl unmask binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service >/dev/null 2>&1 || rollback_failed=true
-      fi
-      if [[ $rollback_failed == false ]]; then
-        systemctl start binance-lob-archiver-production@spot.service >/dev/null 2>&1 || rollback_failed=true
-      fi
-      if [[ $rollback_failed == false ]]; then
-        systemctl start binance-lob-archiver-production@usdm.service >/dev/null 2>&1 || rollback_failed=true
-      fi
-      if [[ $rollback_failed == false ]]; then
-        systemctl is-active --quiet binance-lob-archiver-production@spot.service || rollback_failed=true
-        systemctl is-active --quiet binance-lob-archiver-production@usdm.service || rollback_failed=true
+    if (( writer_containment_started == 1 )) && [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
+      if (( writer_containment_failed == 1 )); then
+        rollback_failed=true
+      else
+        systemctl daemon-reload >/dev/null 2>&1 || rollback_failed=true
+        if [[ $rollback_failed == false ]]; then
+          if [[ $FROM == direct ]]; then
+            monday_rust_lob_restore_writer_snapshot "$writer_snapshot" legacy \
+              || rollback_failed=true
+          else
+            # A V2 transition may restore only the pre-existing V2 units; old
+            # canonical writers must remain permanently contained.
+            monday_rust_lob_restore_writer_snapshot "$writer_snapshot" v2 \
+              || rollback_failed=true
+            monday_rust_lob_contain_legacy_writers || rollback_failed=true
+            monday_rust_lob_verify_legacy_contained || rollback_failed=true
+          fi
+        fi
+        if [[ $rollback_failed == false ]]; then
+          monday_rust_lob_verify_writer_state_snapshot() {
+            local unit load active enabled
+            while IFS=$'\t' read -r unit load active enabled; do
+              [[ -n $unit ]] || continue
+              [[ $FROM == direct ]] || {
+                monday_rust_lob_legacy_writer_units | grep -Fqx "$unit" && continue
+              }
+              monday_rust_lob_verify_writer_state "$unit" "$load" "$active" "$enabled" || return 1
+            done <"$writer_snapshot"
+          }
+          monday_rust_lob_verify_writer_state_snapshot || rollback_failed=true
+        fi
       fi
       if [[ $rollback_failed == true ]]; then
-        systemctl stop binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service >/dev/null 2>&1 || true
-        systemctl mask --runtime binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service >/dev/null 2>&1 || true
-        printf 'pair rollback failed; both production lanes remain contained\n' >&2
+        monday_rust_lob_contain_writers >/dev/null 2>&1 || true
+        monday_rust_lob_verify_contained >/dev/null 2>&1 || true
+        printf 'pair rollback failed; all canonical writers remain contained\n' >&2
       fi
     fi
   fi
@@ -446,10 +485,16 @@ if [[ $FROM == direct ]]; then
   projection_prepared=1
 fi
 if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
-  systemctl stop binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service
+  writer_containment_started=1
+  if ! monday_rust_lob_contain_writers; then
+    writer_containment_failed=1
+    die 'could not contain all canonical writers before pair transition'
+  fi
+  monday_rust_lob_verify_contained \
+    || die 'canonical writers are not stopped, disabled, and runtime-masked'
 fi
 if [[ $FROM == direct ]]; then
-  # The stop boundary must not widen the bootstrap identity window.  Re-read
+  # The containment boundary must not widen the bootstrap identity window. Re-read
   # the unchanged direct payload and all live runtime bytes immediately before
   # active=C1 is committed; the target manifest is never used as R0 evidence.
   direct_payload_after_stop=$(readlink -f -- "$production" 2>/dev/null || true)
@@ -524,6 +569,8 @@ jq -e --argjson expected "$target_production_runtime" \
 if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
   systemctl daemon-reload
   cutover_started_ns=$(date +%s%N)
+  systemctl unmask binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service \
+    || die 'could not unmask V2 production lanes'
   systemctl start binance-lob-archiver-production@spot.service \
     || die 'Spot did not start after pair commit'
   systemctl start binance-lob-archiver-production@usdm.service \
@@ -659,6 +706,10 @@ verify_production_process() {
   done
 }
 verify_production_process
+if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
+  monday_rust_lob_verify_legacy_contained \
+    || die 'legacy canonical writers escaped the successful V2 transition'
+fi
 [[ -L $production && $(readlink -- "$production") == "$stable_projection" ]] \
   || die 'stable production projection is not active'
 [[ $(readlink -f -- "$production") == "$target_binary" ]] || die 'production payload does not resolve to target'
