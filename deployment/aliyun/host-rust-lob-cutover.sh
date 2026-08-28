@@ -3,6 +3,14 @@ set -Eeuo pipefail
 umask 027
 export LC_ALL=C
 
+controller_expected_sha256=${MONDAY_RUST_LOB_EXPECTED_CONTROLLER_SHA256:-}
+unset MONDAY_RUST_LOB_EXPECTED_CONTROLLER_SHA256
+if [[ -n $controller_expected_sha256 \
+  && ! $controller_expected_sha256 =~ ^[a-f0-9]{64}$ ]]; then
+  printf 'MONDAY_RUST_LOB_EXPECTED_CONTROLLER_SHA256 must be lowercase 64 hexadecimal characters\n' >&2
+  exit 2
+fi
+
 usage() {
   printf 'Usage: %s <candidate-binary-sha256>\n' "${0##*/}" >&2
 }
@@ -81,6 +89,28 @@ CANDIDATE_DRAIN_COUNTER=0
 OLD_CONTROLLER_RELEASE=
 CONTROLLER_SWITCHED=0
 
+controller_identity_failure() {
+  printf 'controller identity validation failed: %s\n' "$*" >&2
+  exit 1
+}
+
+revalidate_controller_identity() {
+  [[ -n $controller_expected_sha256 ]] || return 0
+  local expected_release="$CONTROLLER_RELEASE_ROOT/$controller_expected_sha256"
+  local active_release script_path expected_script
+  expected_script="$expected_release/deployment/host-rust-lob-cutover.sh"
+  [[ -L $ACTIVE_CONTROLLER_LINK ]] \
+    || controller_identity_failure 'expected controller identity is not a symlink'
+  active_release=$(readlink -f -- "$ACTIVE_CONTROLLER_LINK") \
+    || controller_identity_failure 'expected controller identity is dangling'
+  [[ $active_release == "$expected_release" ]] \
+    || controller_identity_failure 'active controller identity differs from expected release'
+  script_path=$(readlink -f -- "${BASH_SOURCE[0]}") \
+    || controller_identity_failure 'controller host script identity is dangling'
+  [[ $script_path == "$expected_script" ]] \
+    || controller_identity_failure 'controller host script is not from expected release'
+}
+
 PRODUCTION_UNITS=(
   binance-lob-archiver-production@spot.service
   binance-lob-archiver-production@usdm.service
@@ -147,6 +177,8 @@ if ! flock -n 9; then
   printf 'another Rust collector release operation holds the host lock\n' >&2
   exit 1
 fi
+
+revalidate_controller_identity
 
 acquire_recovery_transition_locks() {
   exec 7>"$LOCK_ROOT/monday-rust-lob-recovery-drain.lock"

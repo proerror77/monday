@@ -982,6 +982,11 @@ the active controller symlink resolves to that exact release, and only then
 executes the selected controller script. Omitting `CONTROLLER_RELEASE_SHA256`
 keeps the artifact-release path as a temporary compatibility fallback and emits
 a deprecation warning on stderr; it is not the release path for new operations.
+Explicit dispatch passes the expected controller identity to the host script;
+the Gate, cutover, and restore scripts capture and clear it, then revalidate the
+active symlink and their own release path after taking the release lock. The
+fallback command explicitly clears that identity and preserves the historical
+lock behavior for resource preflight.
 
 Apply a published controller release through the named operation wrapper:
 

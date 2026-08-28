@@ -56,6 +56,57 @@ grep -Fxq '  gate)' "$INVOKE"
 grep -Fq 'monday_rust_lob_active_controller_deployment' "$INVOKE"
 grep -Fq 'controller dispatcher failed' "$INVOKE"
 grep -Fq 'artifact-release controller bytes' "$INVOKE"
+grep -Fq 'if [[ $resource_preflight_only != true || -n $controller_expected_sha256 ]]; then' "$GATE"
+
+line_after() {
+  local file=$1 start=$2 needle=$3
+  awk -v start="$start" -v needle="$needle" \
+    'NR > start && index($0, needle) { print NR; exit }' "$file"
+}
+
+call_after() {
+  local file=$1 start=$2
+  awk -v start="$start" \
+    'NR > start && $0 ~ /^[[:space:]]*revalidate_controller_identity[[:space:]]*$/ {
+       print NR; exit
+     }' "$file"
+}
+
+gate_lock_line=$(grep -nF 'flock -n 9 || die' "$GATE" | head -1 | cut -d: -f1)
+gate_revalidate_line=$(call_after "$GATE" "$gate_lock_line")
+gate_mutation_line=$(line_after "$GATE" "$gate_revalidate_line" \
+  'install -d -m 0755 /data/monday')
+if ! [[ $gate_lock_line =~ ^[0-9]+$ && $gate_revalidate_line =~ ^[0-9]+$ \
+  && $gate_mutation_line =~ ^[0-9]+$ ]] \
+  || ! ((gate_lock_line < gate_revalidate_line \
+    && gate_revalidate_line < gate_mutation_line)); then
+  printf 'Gate lock/revalidation/mutation order is not fail-closed\n' >&2
+  exit 1
+fi
+
+cutover_lock_line=$(awk '/if ! flock -n 9; then/ { print NR; exit }' "$CUTOVER")
+cutover_revalidate_line=$(call_after "$CUTOVER" "$cutover_lock_line")
+cutover_mutation_line=$(line_after "$CUTOVER" "$cutover_revalidate_line" \
+  'install -d -m 0750 -o root -g root')
+if ! [[ $cutover_lock_line =~ ^[0-9]+$ && $cutover_revalidate_line =~ ^[0-9]+$ \
+  && $cutover_mutation_line =~ ^[0-9]+$ ]] \
+  || ! ((cutover_lock_line < cutover_revalidate_line \
+    && cutover_revalidate_line < cutover_mutation_line)); then
+  printf 'Cutover lock/revalidation/mutation order is not fail-closed\n' >&2
+  exit 1
+fi
+
+restore_lock_line=$(awk '/if ! flock -n 9; then/ { print NR; exit }' "$RESTORE")
+restore_revalidate_line=$(call_after "$RESTORE" "$restore_lock_line")
+restore_mutation_line=$(line_after "$RESTORE" "$restore_revalidate_line" \
+  'restore_release "$(printf')
+if ! [[ $restore_lock_line =~ ^[0-9]+$ && $restore_revalidate_line =~ ^[0-9]+$ \
+  && $restore_mutation_line =~ ^[0-9]+$ ]] \
+  || ! ((restore_lock_line < restore_revalidate_line \
+    && restore_revalidate_line < restore_mutation_line)); then
+  printf 'Restore lock/revalidation/mutation order is not fail-closed\n' >&2
+  exit 1
+fi
 
 psi_tmp_dir=$(mktemp -d)
 trap 'rm -rf "$psi_tmp_dir"' EXIT
@@ -874,7 +925,7 @@ evidence_mutation_line=$(grep -n '^install -d -m 0755 /data/monday$' "$GATE" \
   exit 1
 }
 preflight_lock_guard=$(sed -n \
-  '/^if \[\[ \$resource_preflight_only != true \]\]; then$/,/^fi$/p' "$GATE")
+  '/^if \[\[ \$resource_preflight_only != true || -n \$controller_expected_sha256 \]\]; then$/,/^fi$/p' "$GATE")
 [[ $preflight_lock_guard == *'install -d -m 0755'* \
   && $preflight_lock_guard == *'flock -n 9'* ]] || {
   printf 'formal Gate lock is not isolated from the non-mutating preflight\n' >&2
@@ -954,6 +1005,21 @@ grep -Fq 'Spot shadow and production SNAPSHOT_PRODUCERS differ' "$GATE"
 
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
+
+for host_script in "$GATE" "$CUTOVER" "$RESTORE"; do
+  grep -Fq 'unset MONDAY_RUST_LOB_EXPECTED_CONTROLLER_SHA256' "$host_script"
+  if MONDAY_RUST_LOB_EXPECTED_CONTROLLER_SHA256=ABC \
+    "$host_script" invalid >/dev/null 2>"$tmp_dir/invalid-controller-env.err"; then
+    printf 'host accepted an uppercase controller identity\n' >&2
+    exit 1
+  else
+    host_env_status=$?
+  fi
+  [[ $host_env_status == 2 ]] || {
+    printf 'host rejected an invalid controller identity with the wrong status\n' >&2
+    exit 1
+  }
+done
 
 runtime_contract_dir="$tmp_dir/runtime-contract"
 mkdir -p "$runtime_contract_dir"
@@ -4151,6 +4217,10 @@ if grep -Fq 'deprecated:' "$tmp_dir/success.out"; then
   printf 'artifact-release fallback deprecation leaked to stdout\n' >&2
   exit 1
 fi
+base64 --decode <"$mock_state/last-command-content" \
+  >"$tmp_dir/fallback-command.sh"
+grep -Fq 'unset MONDAY_RUST_LOB_EXPECTED_CONTROLLER_SHA256' \
+  "$tmp_dir/fallback-command.sh"
 
 rm -f "$mock_state/stopped" "$mock_state/transient-seen"
 env "${common_env[@]}" MOCK_TRANSIENT_ONCE=1 MOCK_STATUS=Success MOCK_EXIT_CODE=0 \
@@ -4180,5 +4250,221 @@ if env "${common_env[@]}" MOCK_STATUS=Running MOCK_IGNORE_STOP=1 "$INVOKE" \
   exit 1
 fi
 grep -Fq 'invocation did not confirm cancellation' "$tmp_dir/unconfirmed.out"
+
+write_dispatch_deployment_checksums() {
+  (
+    cd "$dispatch_controller_release"
+    find deployment -type f -print | LC_ALL=C sort |
+      while IFS= read -r path; do
+        sha256sum "$path"
+      done
+  ) >"$dispatch_controller_release/deployment.sha256"
+}
+
+create_dispatch_fixture() {
+  local staging manifest_sha host_script dispatch_runtime_contract
+  dispatch_runtime_contract=$(printf 'e%.0s' {1..64})
+  dispatch_fixture_root=$(mktemp -d "$tmp_dir/dispatch.XXXXXX")
+  dispatch_fixture_root=$(cd "$dispatch_fixture_root" && pwd -P)
+  dispatch_artifact_release="$dispatch_fixture_root/opt/monday/releases/binance-lob-archiver/$artifact"
+  dispatch_controller_root="$dispatch_fixture_root/opt/monday/releases/binance-lob-controller"
+  staging="$dispatch_fixture_root/controller-staging"
+  mkdir -p "$dispatch_artifact_release/deployment" "$staging/deployment" \
+    "$dispatch_controller_root"
+  jq -cn --arg artifact "$artifact" --arg runtime "$dispatch_runtime_contract" \
+    '{artifact_sha256:$artifact,runtime_contract_sha256:$runtime}' \
+    >"$dispatch_artifact_release/release.json"
+  cp "$LIB" "$staging/deployment/rust-lob-control-plane-lib.sh"
+  jq -cn \
+    --arg artifact "$artifact" \
+    --arg runtime "$dispatch_runtime_contract" \
+    --arg bundle "$bundle" \
+    --arg source "$source_revision" \
+    '{schema:"monday.rust_lob_controller_release.v1",
+      artifact_sha256:$artifact,runtime_contract_sha256:$runtime,
+      deployment_bundle_sha256:$bundle,deployment_source_revision:$source}' \
+    >"$staging/release.json"
+  dispatch_controller_sha=$(sha256sum "$staging/release.json" | awk '{print $1}')
+  dispatch_controller_release="$dispatch_controller_root/$dispatch_controller_sha"
+  mv "$staging" "$dispatch_controller_release"
+  dispatch_target_sentinel="$dispatch_fixture_root/target-sentinel"
+  dispatch_target_env="$dispatch_fixture_root/target-controller-sha"
+  for host_script in \
+    host-rust-lob-shadow-gate.sh \
+    host-rust-lob-cutover.sh \
+    host-rust-lob-restore.sh; do
+    printf '%s\n' \
+      '#!/usr/bin/env bash' \
+      'set -euo pipefail' \
+      "[[ \${MONDAY_RUST_LOB_EXPECTED_CONTROLLER_SHA256:-} == $dispatch_controller_sha ]] || {" \
+      "  printf 'target received wrong controller identity\\n' >&2" \
+      '  exit 70' \
+      '}' \
+      "printf '%s\\n' \"\${MONDAY_RUST_LOB_EXPECTED_CONTROLLER_SHA256}\" > \"$dispatch_target_env\"" \
+      "printf 'ok\\n' >> \"$dispatch_target_sentinel\"" \
+      >"$dispatch_controller_release/deployment/$host_script"
+    chmod +x "$dispatch_controller_release/deployment/$host_script"
+  done
+  manifest_sha=$(sha256sum "$dispatch_controller_release/release.json" | awk '{print $1}')
+  printf '%s  release.json\n' "$manifest_sha" \
+    >"$dispatch_controller_release/release.json.sha256"
+  write_dispatch_deployment_checksums
+  ln -s "$dispatch_controller_release" "$dispatch_controller_root/active"
+}
+
+run_relocated_dispatch_command() {
+  local command_file=$1 replacement relocated old_count new_count
+  replacement=$(printf '%s' "$dispatch_fixture_root/opt/monday/releases" \
+    | sed 's/[&|]/\\&/g')
+  relocated="$dispatch_fixture_root/remote-command.sh"
+  old_count=$(grep -oF '/opt/monday/releases' "$command_file" \
+    | wc -l | tr -d ' ')
+  sed "s|/opt/monday/releases|$replacement|g" "$command_file" >"$relocated"
+  new_count=$(grep -oF "$dispatch_fixture_root/opt/monday/releases" "$relocated" \
+    | wc -l | tr -d ' ')
+  [[ $old_count =~ ^[1-9][0-9]*$ && $old_count == "$new_count" ]] || {
+    printf 'remote command path relocation was incomplete\n' >&2
+    return 1
+  }
+  if grep -Eq '(^|[=[:space:]])/opt/monday/releases' "$relocated"; then
+    printf 'remote command retained an unreplaced release path\n' >&2
+    return 1
+  fi
+  bash -n "$relocated"
+  PATH="$mock_bin:$PATH" bash "$relocated"
+}
+
+run_dispatch_success_case() {
+  local action=$1 command_file output_b64='' explicit_out explicit_err
+  create_dispatch_fixture
+  rm -f "$mock_state/stopped" "$mock_state/transient-seen"
+  if [[ $action == gate-preflight ]]; then
+    output_b64=$preflight_output_b64
+  fi
+  explicit_out="$tmp_dir/dispatch-$action.out"
+  explicit_err="$tmp_dir/dispatch-$action.err"
+  env "${common_env[@]}" \
+    ACTION="$action" \
+    CONTROLLER_RELEASE_SHA256="$dispatch_controller_sha" \
+    MOCK_STATUS=Success MOCK_EXIT_CODE=0 MOCK_OUTPUT_B64="$output_b64" \
+    "$INVOKE" >"$explicit_out" 2>"$explicit_err"
+  command_file="$tmp_dir/dispatch-$action-command.sh"
+  base64 --decode <"$mock_state/last-command-content" >"$command_file"
+  grep -Fq 'export MONDAY_RUST_LOB_EXPECTED_CONTROLLER_SHA256=' "$command_file"
+  if ! run_relocated_dispatch_command "$command_file" \
+    >"$tmp_dir/dispatch-$action-exec.out" \
+    2>"$tmp_dir/dispatch-$action-exec.err"; then
+    printf '%s dispatch execution failed unexpectedly:\n' "$action" >&2
+    cat "$tmp_dir/dispatch-$action-exec.err" >&2
+    return 1
+  fi
+  [[ -f $dispatch_target_sentinel ]] || {
+    printf '%s dispatch target did not create a success sentinel\n' "$action" >&2
+    return 1
+  }
+  [[ $(wc -l <"$dispatch_target_sentinel" | tr -d ' ') == 1 ]] || {
+    printf '%s dispatch target ran more than once\n' "$action" >&2
+    return 1
+  }
+  [[ $(<"$dispatch_target_env") == "$dispatch_controller_sha" ]] || {
+    printf '%s dispatch target did not receive the expected controller identity\n' \
+      "$action" >&2
+    return 1
+  }
+}
+
+run_dispatch_failure_case() {
+  local mutation=$1 expected=$2 command_file exec_err
+  create_dispatch_fixture
+  case "$mutation" in
+    active-mismatch)
+      rm -f "$dispatch_controller_root/active"
+      ln -s "$dispatch_controller_root/$(printf 'f%.0s' {1..64})" \
+        "$dispatch_controller_root/active"
+      ;;
+    deployment-tamper)
+      printf '\n# deployment tamper\n' \
+        >>"$dispatch_controller_release/deployment/host-rust-lob-shadow-gate.sh"
+      ;;
+    manifest-mismatch)
+      local wrong_artifact dispatch_runtime_contract
+      wrong_artifact=$(printf 'f%.0s' {1..64})
+      dispatch_runtime_contract=$(printf 'e%.0s' {1..64})
+      jq -cn --arg artifact "$wrong_artifact" \
+        --arg runtime "$dispatch_runtime_contract" \
+        '{artifact_sha256:$artifact,runtime_contract_sha256:$runtime}' \
+        >"$dispatch_artifact_release/release.json"
+      ;;
+    controller-manifest-mismatch)
+      local wrong_artifact controller_manifest_tmp new_controller_release
+      wrong_artifact=$(printf 'f%.0s' {1..64})
+      controller_manifest_tmp="$dispatch_controller_release/release.json.tmp"
+      jq --arg artifact "$wrong_artifact" \
+        '.artifact_sha256 = $artifact' \
+        "$dispatch_controller_release/release.json" >"$controller_manifest_tmp"
+      mv "$controller_manifest_tmp" "$dispatch_controller_release/release.json"
+      dispatch_controller_sha=$(sha256sum \
+        "$dispatch_controller_release/release.json" | awk '{print $1}')
+      new_controller_release="$dispatch_controller_root/$dispatch_controller_sha"
+      mv "$dispatch_controller_release" "$new_controller_release"
+      dispatch_controller_release="$new_controller_release"
+      printf '%s  release.json\n' "$dispatch_controller_sha" \
+        >"$dispatch_controller_release/release.json.sha256"
+      write_dispatch_deployment_checksums
+      rm -f "$dispatch_controller_root/active"
+      ln -s "$dispatch_controller_release" "$dispatch_controller_root/active"
+      ;;
+    target-symlink)
+      rm -f "$dispatch_controller_release/deployment/host-rust-lob-shadow-gate.sh"
+      ln -s host-rust-lob-cutover.sh \
+        "$dispatch_controller_release/deployment/host-rust-lob-shadow-gate.sh"
+      write_dispatch_deployment_checksums
+      ;;
+    target-non-executable)
+      chmod a-x "$dispatch_controller_release/deployment/host-rust-lob-shadow-gate.sh"
+      write_dispatch_deployment_checksums
+      ;;
+    *)
+      printf 'unknown dispatch fixture mutation: %s\n' "$mutation" >&2
+      return 1
+      ;;
+  esac
+  rm -f "$mock_state/stopped" "$mock_state/transient-seen"
+  env "${common_env[@]}" \
+    ACTION=gate \
+    CONTROLLER_RELEASE_SHA256="$dispatch_controller_sha" \
+    MOCK_STATUS=Success MOCK_EXIT_CODE=0 MOCK_OUTPUT_B64= \
+    "$INVOKE" >"$tmp_dir/dispatch-$mutation.out" \
+    2>"$tmp_dir/dispatch-$mutation.err"
+  command_file="$tmp_dir/dispatch-$mutation-command.sh"
+  base64 --decode <"$mock_state/last-command-content" >"$command_file"
+  exec_err="$tmp_dir/dispatch-$mutation-exec.err"
+  if run_relocated_dispatch_command "$command_file" \
+    >"$tmp_dir/dispatch-$mutation-exec.out" 2>"$exec_err"; then
+    printf '%s dispatch fixture unexpectedly passed\n' "$mutation" >&2
+    return 1
+  fi
+  grep -Fq "$expected" "$exec_err" || {
+    printf '%s dispatch fixture emitted the wrong failure\n' "$mutation" >&2
+    cat "$exec_err" >&2
+    return 1
+  }
+  [[ ! -e $dispatch_target_sentinel && ! -L $dispatch_target_sentinel ]] || {
+    printf '%s dispatch fixture ran the target after failure\n' "$mutation" >&2
+    return 1
+  }
+}
+
+for action in gate-preflight gate cutover restore; do
+  run_dispatch_success_case "$action"
+done
+run_dispatch_failure_case active-mismatch 'active controller deployment is invalid'
+run_dispatch_failure_case deployment-tamper 'controller release checksum verification failed'
+run_dispatch_failure_case manifest-mismatch 'artifact release identity is invalid'
+run_dispatch_failure_case controller-manifest-mismatch 'controller release identity is invalid'
+run_dispatch_failure_case target-symlink \
+  'controller host script is missing, indirect, or not executable'
+run_dispatch_failure_case target-non-executable \
+  'controller host script is missing, indirect, or not executable'
 
 printf 'Rust collector control-plane contracts passed\n'

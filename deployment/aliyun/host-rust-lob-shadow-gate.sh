@@ -4,6 +4,14 @@ set -euo pipefail
 umask 027
 export LC_ALL=C
 
+controller_expected_sha256=${MONDAY_RUST_LOB_EXPECTED_CONTROLLER_SHA256:-}
+unset MONDAY_RUST_LOB_EXPECTED_CONTROLLER_SHA256
+if [[ -n $controller_expected_sha256 \
+  && ! $controller_expected_sha256 =~ ^[a-f0-9]{64}$ ]]; then
+  printf 'MONDAY_RUST_LOB_EXPECTED_CONTROLLER_SHA256 must be lowercase 64 hexadecimal characters\n' >&2
+  exit 2
+fi
+
 readonly REQUIRED_DURATION_SECONDS=240
 readonly HEALTH_SETTLE_SECONDS=240
 readonly GATE_SEGMENT_SECONDS=120
@@ -26,6 +34,9 @@ readonly EVIDENCE_ROOT=/data/monday/evidence/shadow-gates
 readonly RUN_SPOOL_ROOT=/data/monday/spool/binance-lob-rust-shadow/runs
 readonly OVERRIDE_ROOT=/run/monday
 readonly LOCK_FILE=/run/lock/monday-rust-lob-release.lock
+readonly CONTROLLER_RELEASE_ROOT=/opt/monday/releases/binance-lob-controller
+readonly ACTIVE_CONTROLLER_LINK="$CONTROLLER_RELEASE_ROOT/active"
+readonly CONTROLLER_HOST_SCRIPT=host-rust-lob-shadow-gate.sh
 readonly SERVICE_USER=hftcollector
 readonly SERVICE_HOME=/var/lib/hft-collector
 readonly SAFE_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -33,6 +44,23 @@ readonly SAFE_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 die() {
   printf 'shadow gate failed: %s\n' "$*" >&2
   exit 1
+}
+
+revalidate_controller_identity() {
+  [[ -n $controller_expected_sha256 ]] || return 0
+  local expected_release="$CONTROLLER_RELEASE_ROOT/$controller_expected_sha256"
+  local active_release script_path expected_script
+  expected_script="$expected_release/deployment/$CONTROLLER_HOST_SCRIPT"
+  [[ -L $ACTIVE_CONTROLLER_LINK ]] \
+    || die 'expected controller identity is not a symlink'
+  active_release=$(readlink -f -- "$ACTIVE_CONTROLLER_LINK") \
+    || die 'expected controller identity is dangling'
+  [[ $active_release == "$expected_release" ]] \
+    || die 'active controller identity differs from expected release'
+  script_path=$(readlink -f -- "${BASH_SOURCE[0]}") \
+    || die 'controller host script identity is dangling'
+  [[ $script_path == "$expected_script" ]] \
+    || die 'controller host script is not from expected release'
 }
 
 usage() {
@@ -98,10 +126,11 @@ mountpoint -q /data || die '/data must be a mount point'
 [[ -r /proc/uptime ]] || die '/proc/uptime is required for monotonic timing'
 [[ -r $IO_PSI_SOURCE ]] || die 'I/O PSI is unavailable'
 id "$SERVICE_USER" >/dev/null 2>&1 || die "missing service user: $SERVICE_USER"
-if [[ $resource_preflight_only != true ]]; then
+if [[ $resource_preflight_only != true || -n $controller_expected_sha256 ]]; then
   install -d -m 0755 "$(dirname "$LOCK_FILE")"
   exec 9>"$LOCK_FILE"
   flock -n 9 || die 'another Rust collector release operation is running'
+  revalidate_controller_identity
 fi
 
 candidate_sha=$(printf '%s' "$candidate_arg" | tr '[:upper:]' '[:lower:]')

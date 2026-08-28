@@ -3,6 +3,14 @@ set -Eeuo pipefail
 umask 027
 export LC_ALL=C
 
+controller_expected_sha256=${MONDAY_RUST_LOB_EXPECTED_CONTROLLER_SHA256:-}
+unset MONDAY_RUST_LOB_EXPECTED_CONTROLLER_SHA256
+if [[ -n $controller_expected_sha256 \
+  && ! $controller_expected_sha256 =~ ^[a-f0-9]{64}$ ]]; then
+  printf 'MONDAY_RUST_LOB_EXPECTED_CONTROLLER_SHA256 must be lowercase 64 hexadecimal characters\n' >&2
+  exit 2
+fi
+
 usage() {
   printf 'Usage: %s <candidate-binary-sha256>\n' "${0##*/}" >&2
 }
@@ -63,6 +71,23 @@ fail() {
   FAILURE_REASON=$*
   printf '%s\n' "$FAILURE_REASON" >&2
   exit 1
+}
+
+revalidate_controller_identity() {
+  [[ -n $controller_expected_sha256 ]] || return 0
+  local expected_release="$CONTROLLER_RELEASE_ROOT/$controller_expected_sha256"
+  local active_release script_path expected_script
+  expected_script="$expected_release/deployment/host-rust-lob-restore.sh"
+  [[ -L $ACTIVE_CONTROLLER_LINK ]] \
+    || fail 'expected controller identity is not a symlink'
+  active_release=$(readlink -f -- "$ACTIVE_CONTROLLER_LINK") \
+    || fail 'expected controller identity is dangling'
+  [[ $active_release == "$expected_release" ]] \
+    || fail 'active controller identity differs from expected release'
+  script_path=$(readlink -f -- "${BASH_SOURCE[0]}") \
+    || fail 'controller host script is not from expected release'
+  [[ $script_path == "$expected_script" ]] \
+    || fail 'controller host script is not from expected release'
 }
 
 path_is_direct_or_absent() {
@@ -652,6 +677,7 @@ main() {
     printf 'another Rust collector release operation holds the host lock\n' >&2
     exit 1
   fi
+  revalidate_controller_identity
   if [[ ! -d $DATA_ROOT || -L $DATA_ROOT ]] || ! mountpoint -q "$DATA_ROOT"; then
     printf '/data must be a mounted filesystem\n' >&2
     exit 1
