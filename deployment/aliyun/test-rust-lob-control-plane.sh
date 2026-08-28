@@ -148,6 +148,40 @@ while IFS= read -r asset; do
   cp -p -- "$legacy_root/$legacy_c0/deployment/$asset" "$target"
 done < <(monday_controller_projection_assets)
 
+# A distinct legacy controller carrying the same P/R is still not the Gate's
+# authorized before identity.  Cutover must resolve the active legacy C0 and
+# reject the receipt, then the original direct topology is restored.
+legacy_alt_work="$ROOT/legacy-controller-alt"
+mkdir -p "$legacy_alt_work/deployment"
+jq --arg source "$(printf '8%.0s' {1..40})" --arg uri oss://bucket/legacy-controller-alt \
+  '.deployment_source_revision = $source | .deployment_bundle_uri = $uri' \
+  "$legacy_work/release.json" >"$legacy_alt_work/release.json"
+legacy_alt_c0=$(monday_sha256_file "$legacy_alt_work/release.json")
+for asset in host-rust-lob-recovery-queue.sh monday-collector-health.sh; do
+  cp -p -- "$legacy_work/deployment/$asset" "$legacy_alt_work/deployment/$asset"
+done
+mkdir -p "$legacy_root/$legacy_alt_c0/deployment"
+cp -p -- "$legacy_alt_work/release.json" "$legacy_root/$legacy_alt_c0/release.json"
+cp -p -- "$legacy_alt_work/deployment/"* "$legacy_root/$legacy_alt_c0/deployment/"
+(cd "$legacy_root/$legacy_alt_c0" && sha256sum release.json >release.json.sha256 && sha256sum deployment/* >deployment.sha256)
+rm -f -- "$legacy_root/active"
+ln -s "$legacy_root/$legacy_alt_c0" "$legacy_root/active"
+rm -f -- "$ROOT/opt/monday/bin/binance-lob-archiver"
+ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p0_sha/binance-lob-archiver" \
+  "$ROOT/opt/monday/bin/binance-lob-archiver"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from direct --to "$c0" \
+  --gate-receipt "$gate" --gate-sha256 "$gate_sha" --root "$ROOT" \
+  >/dev/null 2>&1; then
+  printf 'cutover accepted a different legacy C0 with the same P/R\n' >&2
+  exit 1
+fi
+rm -f -- "$legacy_root/active"
+ln -s "$legacy_root/$legacy_c0" "$legacy_root/active"
+rm -f -- "$ROOT/opt/monday/bin/binance-lob-archiver"
+ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p0_sha/binance-lob-archiver" \
+  "$ROOT/opt/monday/bin/binance-lob-archiver"
+
 # Bootstrap must independently bind the live R0 bytes.  A missing or drifted
 # shadow runtime asset is rejected before any active/controller projection is
 # changed, even when the Gate receipt itself was produced earlier.
@@ -184,6 +218,10 @@ bootstrap_transition_sha=$(printf '%s\n' "$bootstrap_cutover_output" | sed -n 's
   "$ROOT/opt/monday/releases/binance-lob-archiver/$p0_sha/binance-lob-archiver" ]]
 [[ $(monday_sha256_file "$bootstrap_transition") == "$bootstrap_transition_sha" ]]
 monday_validate_v2_transition "$bootstrap_transition" direct "$c0" "$gate" "$gate_sha"
+MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-readback.sh" --controller "$c0" \
+  --transition-receipt "$bootstrap_transition" --receipt-sha256 "$bootstrap_transition_sha" \
+  --root "$ROOT" >/dev/null
 while IFS= read -r asset; do
   target=$(monday_runtime_asset_target "$ROOT" "$asset")
   [[ -L $target && $(readlink -- "$target") == \

@@ -654,6 +654,8 @@ monday_validate_v2_transition() {
     .schema == "monday.rust_lob_pair_transition.v2"
     and .control_plane_version == 2
     and .operation == "cutover"
+    and (.from_source_mode == (if $from == "direct" then "direct" else "stable" end))
+    and (.source_mode == .from_source_mode)
     and ((if $from == "direct" then
       .source_mode == "direct" and .from_controller_sha256 == $gate_from
     else

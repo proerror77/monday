@@ -201,6 +201,20 @@ else
     || die 'production payload does not match the before controller'
 fi
 
+# The exact Gate receipt must name the controller that is actually installed
+# before this operation.  For direct bootstrap that identity is resolved only
+# from the immutable legacy active link; a different legacy C0 with the same
+# P/R is still a different transition authority.
+gate_from_controller=$(jq -er '.from_controller_sha256' "$GATE") \
+  || die 'Gate receipt has no exact before controller'
+if [[ $FROM == direct ]]; then
+  [[ $gate_from_controller == "$legacy_controller" ]] \
+    || die 'Gate receipt before controller differs from the resolved legacy active controller'
+else
+  [[ $gate_from_controller == "$FROM" ]] \
+    || die 'Gate receipt before controller differs from the active controller'
+fi
+
 # Independently compute R0 from every live unit/env byte.  The target
 # manifest is never used as a substitute for a missing or drifted before set.
 live_runtime=$(monday_rust_lob_live_runtime_contract_sha256 "$ROOT") \
@@ -532,7 +546,9 @@ for asset in "${CONTROLLER_PROJECTION_ASSETS[@]}"; do
 done
 gate_evidence=$(jq -cS '{candidate_control_bytes,resource_admission,io_full_psi_windows,shadow_staging,checks,markets}' "$GATE")
 transition_tmp="$receipt.tmp.$$"
-jq -cS -n --arg from "$before_controller" --arg source_mode "$( [[ $FROM == direct ]] && printf direct || printf stable )" --arg to "$TO" --arg payload "$target_payload" --arg runtime "$target_runtime" \
+source_mode=stable
+[[ $FROM == direct ]] && source_mode=direct
+jq -cS -n --arg from "$before_controller" --arg source_mode "$source_mode" --arg to "$TO" --arg payload "$target_payload" --arg runtime "$target_runtime" \
   --arg before_payload "$before_payload" --arg before_runtime "$before_runtime" --arg gate "$GATE" --arg gate_sha "$GATE_SHA" \
   --arg completed "$completed_at" --arg stable "/opt/monday/releases/binance-lob-controller/active/binance-lob-archiver" \
   --arg projection "$stable_projection" --argjson evidence "$gate_evidence" --argjson before_assets "$before_assets" \
@@ -540,7 +556,8 @@ jq -cS -n --arg from "$before_controller" --arg source_mode "$( [[ $FROM == dire
   --argjson installed_controller_projections "$installed_controller_projections" \
   --argjson test_only "$TEST_ONLY" --argjson eligible "$( [[ $TEST_ONLY == true ]] && printf false || printf true )" \
   '{schema:"monday.rust_lob_pair_transition.v2",control_plane_version:2,operation:"cutover",
-    test_only:$test_only,production_eligible:$eligible,source_mode:$source_mode,from_controller_sha256:$from,controller_sha256:$to,
+    test_only:$test_only,production_eligible:$eligible,source_mode:$source_mode,from_source_mode:$source_mode,
+    from_controller_sha256:$from,controller_sha256:$to,
     payload_sha256:$payload,runtime_contract_sha256:$runtime,gate_receipt:$gate,gate_sha256:$gate_sha,
     gate_evidence:$evidence,active_pair_committed:true,completed_at:$completed,
     stable_production_projection:$stable,production_projection:$projection,
