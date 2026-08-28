@@ -499,6 +499,24 @@ gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
 gate=$(printf '%s\n' "$gate_output" | sed -n 's/^V2 Gate receipt: //p')
 gate_sha=$(printf '%s\n' "$gate_output" | sed -n 's/^SHA-256: //p')
 monday_validate_v2_gate "$gate" "$c0" "$c1" "$gate_sha"
+# URI identity is part of the v5 policy, not just the downloader.  Moving a
+# complete same-session triplet below an extra path component must fail both
+# validators before it can become transition evidence.
+fake="$ROOT/fake-extra-triplet.json"
+jq '.markets.spot.triplets[0]
+    |= (.data_uri |= sub("/shard=all/"; "/shard=all/extra/")
+      | .manifest_uri |= sub("/shard=all/"; "/shard=all/extra/")
+      | .success_uri |= sub("/shard=all/"; "/shard=all/extra/"))' \
+  "$gate" >"$fake"
+fake_sha=$(monday_sha256_file "$fake")
+if monday_validate_v2_gate "$fake" "$c0" "$c1" "$fake_sha"; then
+  printf 'Gate validator accepted an extra nested triplet path\n' >&2
+  exit 1
+fi
+if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$fake" >/dev/null 2>&1; then
+  printf 'Gate policy accepted an extra nested triplet path\n' >&2
+  exit 1
+fi
 for asset in "${!shadow_before_sha[@]}"; do
   if [[ $asset == *.service ]]; then target="$ROOT/etc/systemd/system/$asset"; else target="$ROOT/etc/monday/$asset"; fi
   [[ $(monday_sha256_file "$(readlink -f -- "$target")") == "${shadow_before_sha[$asset]}" ]] || {
@@ -1179,6 +1197,12 @@ jq '.failure_count = 7' "$triplet_status" >"$retry_status"
 retry_readback=$(monday_verify_upload_triplet_readback "$retry_status" spot spot_all bucket "$triplet_prefix" \
   "$triplet_tmp" "$triplet_now" copy_triplet_fixture fixture-session 0)
 [[ $(jq -r '.failure_count' <<<"$retry_readback") == 7 ]]
+if jq '.failure_count = -1' "$retry_status" >"$retry_status.negative" \
+  && monday_verify_upload_triplet_readback "$retry_status.negative" spot spot_all bucket "$triplet_prefix" \
+      "$triplet_tmp" "$triplet_now" copy_triplet_fixture fixture-session 0 >/dev/null 2>&1; then
+  printf 'triplet readback accepted a negative cumulative failure_count\n' >&2
+  exit 1
+fi
 for retry_mutation in last_error pending_batches; do
   case "$retry_mutation" in
     last_error) jq '.last_error = "retry failed"' "$retry_status" >"$retry_status.$retry_mutation" ;;
