@@ -35,6 +35,25 @@ regular_file() {
   [[ -f $1 && ! -L $1 ]]
 }
 
+verify_payload_projection() {
+  local release_dir=$1 artifact_sha=$2
+  local projection="$release_dir/binance-lob-archiver"
+  local expected_target="$ARTIFACT_RELEASE_ROOT/$artifact_sha/binance-lob-archiver"
+  local resolved_target
+
+  [[ -L $projection ]] \
+    || die 'controller payload projection is not a symlink'
+  resolved_target=$(readlink -f -- "$projection") \
+    || die 'controller payload projection is dangling'
+  [[ $(readlink -- "$projection") == "$expected_target" \
+      && $resolved_target == "$expected_target" ]] \
+    || die 'controller payload projection target differs from artifact release'
+  regular_file "$resolved_target" \
+    || die 'controller payload projection target is not a regular file'
+  [[ $(sha256_file "$resolved_target") == "$artifact_sha" ]] \
+    || die 'controller payload projection target digest mismatch'
+}
+
 runtime_contract_sha256_v1() {
   [[ $# -eq 1 ]] || return 2
   local directory=$1 asset digest
@@ -74,6 +93,8 @@ verify_staged_artifact_release() {
     || die 'staged artifact deployment is missing or indirect'
   regular_file "$artifact_binary" \
     || die 'staged artifact binary is not a regular file'
+  [[ $(readlink -f -- "$artifact_binary") == "$artifact_binary" ]] \
+    || die 'staged artifact binary path is indirect'
   regular_file "$artifact_metadata" \
     || die 'staged artifact metadata is not a regular file'
   regular_file "$artifact_deployment/rust-lob-control-plane-lib.sh" \
@@ -141,7 +162,7 @@ extract_bundle() {
 
 verify_published_release() {
   local release_dir=$1 extracted=$2 manifest=$3 listing=$4 source asset
-  local expected_assets actual_assets top_level
+  local expected_assets actual_assets top_level artifact_sha
   direct_directory "$release_dir" \
     || die "controller release path is indirect: $release_dir"
   direct_directory "$release_dir/deployment" \
@@ -171,9 +192,12 @@ verify_published_release() {
       die "existing controller release differs from bundle: $asset"
     fi
   done <"$listing"
+  artifact_sha=$(jq -er '.artifact_sha256' "$manifest") \
+    || die 'controller release manifest is missing the artifact digest'
+  verify_payload_projection "$release_dir" "$artifact_sha"
   top_level=$(find "$release_dir" -mindepth 1 -maxdepth 1 -print \
     | wc -l | tr -d ' ')
-  [[ $top_level == 4 ]] \
+  [[ $top_level == 5 ]] \
     || die 'existing controller release contains unexpected top-level assets'
 }
 
@@ -239,6 +263,9 @@ publish_controller_release() (
     [[ $asset == *.sh ]] && mode=0555
     install -m "$mode" "$extracted/$asset" "$staging/deployment/$asset"
   done <"$listing"
+  ln -s "$ARTIFACT_RELEASE_ROOT/$artifact_sha/binance-lob-archiver" \
+    "$staging/binance-lob-archiver"
+  verify_payload_projection "$staging" "$artifact_sha"
   install -m 0444 "$manifest" "$staging/release.json"
   (
     cd "$staging"

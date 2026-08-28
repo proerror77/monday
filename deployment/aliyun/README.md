@@ -971,6 +971,13 @@ immutable host release under:
 /opt/monday/releases/binance-lob-controller/<controller-release-manifest-sha256>/
 ```
 
+The release root also contains a deterministic `binance-lob-archiver` symlink
+to the exact digest-addressed artifact binary under
+`/opt/monday/releases/binance-lob-archiver/<artifact-sha256>/`. It is a derived
+payload projection, not another release identity or mutable state source; repeat
+publication verifies it and fails closed on any missing, replaced, or redirected
+projection.
+
 Publication requires the staged artifact URI/SHA and its runtime-contract digest
 to match the controller manifest and bundle. It does not require the production
 symlink to point at that artifact, and it does not change the production or
