@@ -200,6 +200,76 @@ publish_controller_release "$fixture" "$runtime_artifact" "$runtime_bundle" \
   == "$production_target_before" ]]
 [[ $(readlink "$controller_root/active") == "$active_controller_before" ]]
 
+staged_tampered_source="$tmp_dir/staged-tampered-source"
+cp -R "$SCRIPT_DIR" "$staged_tampered_source"
+printf '\nSTAGED_RUNTIME_CONTRACT_FIXTURE=changed\n' \
+  >>"$staged_tampered_source/binance-lob-archiver-production-spot.env"
+staged_tampered_sentinel="$tmp_dir/staged-helper-executed"
+printf '\nmonday_rust_lob_runtime_contract_sha256() { printf "%%s\\n" "%s"; : > "%s"; }\n' \
+  "$runtime_contract" "$staged_tampered_sentinel" \
+  >>"$staged_tampered_source/rust-lob-control-plane-lib.sh"
+staged_tampered_artifact="$tmp_dir/binance-lob-archiver-tampered"
+printf '#!/usr/bin/env bash\nprintf tampered\\nexit 0\n' >"$staged_tampered_artifact"
+chmod 0755 "$staged_tampered_artifact"
+staged_tampered_sha=$(sha256sum "$staged_tampered_artifact" | awk '{print $1}')
+staged_tampered_uri="oss://bucket/releases/$staged_tampered_sha/binance-lob-archiver"
+make_artifact_release \
+  "$staged_tampered_artifact" "$staged_tampered_sha" \
+  "$staged_tampered_uri" "$staged_tampered_source"
+staged_tampered_release="$fixture/opt/monday/releases/binance-lob-archiver/$staged_tampered_sha"
+jq --arg runtime_contract "$runtime_contract" \
+  '.runtime_contract_sha256 = $runtime_contract' \
+  "$staged_tampered_release/release.json" \
+  >"$tmp_dir/staged-tampered-release.json"
+mv "$tmp_dir/staged-tampered-release.json" "$staged_tampered_release/release.json"
+staged_tampered_manifest="$tmp_dir/staged-tampered-controller.json"
+write_manifest "$staged_tampered_manifest" "$staged_tampered_sha" \
+  "$bundle_sha" "$runtime_contract"
+staged_tampered_manifest_sha=$(sha256sum "$staged_tampered_manifest" | awk '{print $1}')
+if (publish_controller_release "$fixture" "$staged_tampered_artifact" "$bundle" \
+  "$staged_tampered_manifest") >"$tmp_dir/staged-tampered.out" 2>&1; then
+  printf 'controller release trusted a tampered staged runtime helper\n' >&2
+  exit 1
+fi
+grep -Fq 'staged artifact runtime contract drifted from release metadata' \
+  "$tmp_dir/staged-tampered.out"
+[[ ! -e "$controller_root/$staged_tampered_manifest_sha" \
+  && ! -L "$controller_root/$staged_tampered_manifest_sha" ]]
+[[ ! -e "$staged_tampered_sentinel" && ! -L "$staged_tampered_sentinel" ]]
+[[ $(readlink "$fixture/opt/monday/bin/binance-lob-archiver") \
+  == "$production_target_before" ]]
+[[ $(readlink "$controller_root/active") == "$active_controller_before" ]]
+
+tampered_candidate_helper_source="$tmp_dir/tampered-candidate-helper-source"
+cp -R "$bundle_source" "$tampered_candidate_helper_source"
+printf '\nCANDIDATE_HELPER_TAMPER=changed\n' \
+  >>"$tampered_candidate_helper_source/rust-lob-control-plane-lib.sh"
+tampered_candidate_helper_bundle="$tmp_dir/tampered-candidate-helper.tar"
+make_bundle "$tampered_candidate_helper_source" "$tampered_candidate_helper_bundle"
+if (publish_controller_release "$fixture" "$artifact" \
+  "$tampered_candidate_helper_bundle" "$manifest") \
+  >"$tmp_dir/tampered-candidate-helper.out" 2>&1; then
+  printf 'controller release accepted a tampered candidate helper\n' >&2
+  exit 1
+fi
+grep -Fq 'downloaded deployment bundle digest differs' \
+  "$tmp_dir/tampered-candidate-helper.out"
+
+tampered_candidate_runtime_source="$tmp_dir/tampered-candidate-runtime-source"
+cp -R "$bundle_source" "$tampered_candidate_runtime_source"
+printf '\nCANDIDATE_RUNTIME_TAMPER=changed\n' \
+  >>"$tampered_candidate_runtime_source/binance-lob-archiver-production-spot.env"
+tampered_candidate_runtime_bundle="$tmp_dir/tampered-candidate-runtime.tar"
+make_bundle "$tampered_candidate_runtime_source" "$tampered_candidate_runtime_bundle"
+if (publish_controller_release "$fixture" "$artifact" \
+  "$tampered_candidate_runtime_bundle" "$manifest") \
+  >"$tmp_dir/tampered-candidate-runtime.out" 2>&1; then
+  printf 'controller release accepted a tampered candidate runtime asset\n' >&2
+  exit 1
+fi
+grep -Fq 'downloaded deployment bundle digest differs' \
+  "$tmp_dir/tampered-candidate-runtime.out"
+
 controller_manifest_tampered="$tmp_dir/controller-manifest-tampered.json"
 jq '.deployment_source_revision = ("d" * 40)' "$manifest" \
   >"$controller_manifest_tampered"
