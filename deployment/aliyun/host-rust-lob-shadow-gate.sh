@@ -42,17 +42,18 @@ die() { printf 'shadow gate failed: %s\n' "$*"; exit 1; }
 usage() {
   cat >&2 <<'EOF'
 Usage: host-rust-lob-shadow-gate.sh --from-controller <direct|sha256> \
-  --candidate-controller <sha256> [--root <fixture-root>]
+  --candidate-controller <sha256> [--preflight-only] [--root <fixture-root>]
        host-rust-lob-shadow-gate.sh --recover-bootstrap-lease <state> [--root <fixture-root>]
 EOF
 }
 
 ROOT=${MONDAY_ROOT:-/}; FROM_CONTROLLER=; CANDIDATE_CONTROLLER=
-RECOVER_STATE=
+RECOVER_STATE=; PREFLIGHT_ONLY=false
 while (($#)); do
   case "$1" in
     --from-controller) (($# >= 2)) || { usage; exit 2; }; FROM_CONTROLLER=$2; shift 2 ;;
     --candidate-controller) (($# >= 2)) || { usage; exit 2; }; CANDIDATE_CONTROLLER=$2; shift 2 ;;
+    --preflight-only) PREFLIGHT_ONLY=true; shift ;;
     --recover-bootstrap-lease) (($# >= 2)) || { usage; exit 2; }; RECOVER_STATE=$2; shift 2 ;;
     --root) (($# >= 2)) || { usage; exit 2; }; ROOT=$2; shift 2 ;;
     --help|-h) usage >&1; exit 0 ;;
@@ -60,6 +61,7 @@ while (($#)); do
   esac
 done
 ROOT=${ROOT%/}; [[ -n $ROOT ]] || ROOT=/
+[[ $PREFLIGHT_ONLY == false || -z $RECOVER_STATE ]] || die '--preflight-only is only valid for a Gate'
 if [[ -z $RECOVER_STATE ]]; then
   FROM_CONTROLLER=$(printf '%s' "$FROM_CONTROLLER" | tr '[:upper:]' '[:lower:]')
   CANDIDATE_CONTROLLER=$(printf '%s' "$CANDIDATE_CONTROLLER" | tr '[:upper:]' '[:lower:]')
@@ -116,13 +118,26 @@ LIB_SOURCE="$SCRIPT_DIR/rust-lob-control-plane-lib.sh"; POLICY_SOURCE="$SCRIPT_D
 [[ -f $LIB_SOURCE && -f $POLICY_SOURCE ]] || die 'V2 control-plane assets are missing'
 
 # Hold the release lock before reading candidate, active, or production
-# identities.  The fixture skips flock but still exercises the same ordering.
-mkdir -p "$(dirname -- "$LOCK_FILE")"
-if [[ $TEST_ONLY == true ]]; then
-  true
-else
-  exec 9>"$LOCK_FILE"
+# identities.  A read-only preflight opens an existing lock without creating or
+# truncating it; formal Gate keeps the current write-open behavior.
+if [[ $PREFLIGHT_ONLY == true ]]; then
+  [[ -f $LOCK_FILE && ! -L $LOCK_FILE ]] || die 'read-only preflight lock file is missing or indirect'
+  if [[ $TEST_ONLY == true ]]; then
+    # macOS fixtures do not ship flock.  Keep the lock contract observable and
+    # allow tests to inject a deterministic contention result; production
+    # always invokes the real flock command below.
+    flock() { [[ ${MONDAY_GATE_FIXTURE_LOCK_BUSY:-0} == 1 ]] && return 1; return 0; }
+  fi
+  exec 9<"$LOCK_FILE"
   flock -n 9 || die 'another collector control-plane action is running'
+else
+  mkdir -p "$(dirname -- "$LOCK_FILE")"
+  if [[ $TEST_ONLY == true ]]; then
+    true
+  else
+    exec 9>"$LOCK_FILE"
+    flock -n 9 || die 'another collector control-plane action is running'
+  fi
 fi
 
 if [[ -z $RECOVER_STATE ]]; then
@@ -345,10 +360,54 @@ proc_starttime() {
   [[ -r $stat_file ]] || return 1
   awk '{ if ($22 !~ /^[0-9]+$/) exit 1; print $22 }' "$stat_file"
 }
-io_total_us() { if [[ $TEST_ONLY == true && ! -f $PSI_SOURCE ]]; then printf '0\n'; else monday_io_full_psi_total_us "$PSI_SOURCE"; fi; }
+preflight_psi_sample_number=0
+io_total_us() {
+  if [[ $TEST_ONLY == true && $PREFLIGHT_ONLY == true \
+    && -n ${MONDAY_GATE_FIXTURE_PREFLIGHT_PSI_VALUES:-} ]]; then
+    local -a values=() value
+    IFS=, read -r -a values <<<"$MONDAY_GATE_FIXTURE_PREFLIGHT_PSI_VALUES"
+    value=${values[${preflight_psi_sample_number:-0}]:-}
+    [[ $value =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+    printf '%s\n' "$value"
+  elif [[ $TEST_ONLY == true && ! -f $PSI_SOURCE ]]; then
+    printf '0\n'
+  else
+    monday_io_full_psi_total_us "$PSI_SOURCE"
+  fi
+}
 systemctl_show() { systemctl show "$1" --property="$2" --value 2>/dev/null; }
 systemctl_show_many() { systemctl show "$1" --property="$2" 2>/dev/null; }
 systemctl_active() { systemctl is-active --quiet "$1"; }
+
+# A preflight is deliberately read-only, but it uses the exact same three
+# 15-second, 1% I/O-full PSI windows as the formal Gate calibration.  Fixture
+# mode keeps the loop deterministic by reading its zero-valued PSI source
+# without sleeping; production always sleeps for each full reference window.
+preflight_psi_windows='[]'
+sample_preflight_psi() {
+  local previous current transition delta ratio hit consecutive=0 i
+  preflight_psi_sample_number=0
+  previous=$(io_total_us) || return 1
+  for i in 1 2 3; do
+    preflight_psi_sample_number=$i
+    [[ $TEST_ONLY == true ]] || sleep "$IO_PSI_WINDOW_SECONDS"
+    current=$(io_total_us) || return 1
+    transition=$(monday_io_full_psi_window "$previous" "$current" \
+      "$IO_PSI_WINDOW_US" "$IO_PSI_WINDOW_US" "$IO_PSI_FULL_DELTA_LIMIT_US" \
+      "$consecutive") || return 1
+    read -r delta ratio hit consecutive <<<"$transition"
+    preflight_psi_windows=$(jq -cn --argjson values "$preflight_psi_windows" \
+      --arg phase preflight --argjson delta "$delta" --argjson ratio "$ratio" \
+      --argjson hit "$hit" --argjson consecutive "$consecutive" \
+      '$values + [{phase:$phase,stage:"calibration",delta_us:$delta,ratio:$ratio,hit:$hit,consecutive_hits:$consecutive}]') || return 1
+    if [[ $hit == true && $consecutive -ge $IO_PSI_CONSECUTIVE_HIT_LIMIT ]]; then
+      printf 'read-only preflight PSI threshold exceeded: delta_us=%s ratio=%s consecutive_hits=%s\n' \
+        "$delta" "$ratio" "$consecutive" >&2
+      return 1
+    fi
+    previous=$current
+  done
+}
 
 # Recover a temporary production-slice lease from its persisted state.  This
 # is intentionally an internal mode of the signed Gate script, rather than a
@@ -825,7 +884,7 @@ else
   legacy_controller=${legacy_target##*/}
   [[ $legacy_target == "$CONTROLLER_ROOT/$legacy_controller" ]] \
     || die 'legacy active controller is not digest-addressed'
-  monday_verify_legacy_controller_release "$ROOT" "$legacy_controller" "$PRODUCTION_BINARY" \
+  monday_verify_legacy_controller_release "$ROOT" "$legacy_controller" "$PRODUCTION_BINARY" >/dev/null \
     || die 'direct bootstrap requires an immutable v1 active controller'
   before_controller=$legacy_controller
   before_release="$legacy_target"
@@ -890,6 +949,37 @@ for asset in "${PRODUCTION_ASSETS[@]}"; do
     || die "installed production asset differs from before controller: $asset"
   production_asset_json=$(jq -cn --argjson values "$production_asset_json" --arg asset "$asset" --arg sha "$(sha256_file "$production_resolved")" '$values + {($asset):$sha}')
 done
+
+if [[ $PREFLIGHT_ONLY == true ]]; then
+  # No temporary directory, cleanup trap, spool/evidence path, systemd unit,
+  # lease, or shadow is created before this branch.  The existing lock was
+  # opened read-only above; the checks here establish C/from/P/R and every
+  # installed production byte from immutable files.  This final sampler is the
+  # same three-window PSI boundary used by a formal Gate.  The result is
+  # advisory only: the formal Gate repeats every check while holding its lock.
+  sample_preflight_psi || die 'I/O PSI preflight failed'
+  jq -cn \
+    --arg from "$before_controller" --arg source_mode "$source_mode" \
+    --arg candidate "$CANDIDATE_CONTROLLER" --arg payload "$candidate_payload" \
+    --arg runtime "$candidate_runtime" --arg bundle "$candidate_bundle" \
+    --arg source "$candidate_source" --arg control_sha "$candidate_control_bytes_sha" \
+    --argjson control_assets "$candidate_control_assets" \
+    --argjson installed_assets "$production_asset_json" \
+    --argjson psi_windows "$preflight_psi_windows" \
+    '{schema:"monday.rust_lob_shadow_gate_preflight.v1",operation:"gate",
+      preflight_only:true,authoritative:false,production_changed:false,
+      authorizes_gate:false,authorizes_cutover:false,source_mode:$source_mode,
+      from_controller_sha256:$from,candidate_controller_sha256:$candidate,
+      candidate_payload_sha256:$payload,candidate_runtime_contract_sha256:$runtime,
+      candidate_deployment_bundle_sha256:$bundle,
+      candidate_deployment_source_revision:$source,
+      candidate_control_bytes:{sha256:$control_sha,assets:$control_assets},
+      installed_production_assets:$installed_assets,
+      io_full_psi_windows:$psi_windows,
+      checks:{controller:true,from_controller:true,payload:true,
+        runtime_contract:true,installed_bytes:true,psi_sampler:true}}'
+  exit 0
+fi
 
 declare -A installed_asset saved_state saved_sha saved_target
 declare -A candidate_asset_sha restored_asset_sha
