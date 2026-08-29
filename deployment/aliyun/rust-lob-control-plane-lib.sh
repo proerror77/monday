@@ -12,6 +12,16 @@ monday_sha256_file() {
   fi
 }
 
+# Emit the portable checksum format without letting sha256sum escape a
+# backslash in the filename.  The checksum tools can read this raw path.
+monday_sha256_checksum_line() {
+  [[ $# -eq 1 ]] || return 2
+  local path=$1 digest
+  [[ -f $path && ! -L $path ]] || return 1
+  digest=$(monday_sha256_file "$path") || return 1
+  printf '%s  %s\n' "$digest" "$path"
+}
+
 monday_sha256_text() {
   [[ $# -eq 1 ]] || return 2
   if command -v sha256sum >/dev/null 2>&1; then
@@ -1476,7 +1486,9 @@ monday_verify_controller_release() {
   (cd "$release" && sha256sum --check --strict release.json.sha256 >/dev/null \
     && sha256sum --check --strict deployment.sha256 >/dev/null) || return 1
   monday_validate_v2_manifest "$manifest" || return 1
-  expected=$(cd "$release" && sha256sum deployment/* | sort -k2)
+  expected=$(cd "$release" && for asset in deployment/*; do
+    monday_sha256_checksum_line "$asset"
+  done | sort -k2)
   cmp -s <(printf '%s\n' "$expected") "$release/deployment.sha256" || return 1
   while IFS= read -r asset; do
     [[ -n $asset ]] || continue

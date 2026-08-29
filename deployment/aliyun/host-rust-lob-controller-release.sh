@@ -172,8 +172,15 @@ publish_controller_release() (
   done < <(printf '%s\n' "$(monday_runtime_assets)" "$(monday_controller_assets)" | sort -u)
   ln -s "$ARTIFACT_ROOT/$artifact_sha/binance-lob-archiver" "$staging/binance-lob-archiver"
   install -m 0444 "$manifest" "$staging/release.json"
-  (cd "$staging" && sha256sum release.json >release.json.sha256 \
-    && sha256sum deployment/* | sort -k2 >deployment.sha256)
+  (
+    cd "$staging"
+    monday_sha256_checksum_line release.json >release.json.sha256
+    : >deployment.sha256
+    for asset in deployment/*; do
+      monday_sha256_checksum_line "$asset" >>deployment.sha256
+    done
+    sort -k2 -o deployment.sha256 deployment.sha256
+  )
   chmod 0444 "$staging/release.json.sha256" "$staging/deployment.sha256"
   chmod 0555 "$staging" "$staging/deployment"
   mv -f "$staging" "$release"

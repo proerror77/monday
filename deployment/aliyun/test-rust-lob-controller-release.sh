@@ -43,9 +43,38 @@ controller_sha=$(monday_sha256_file "$manifest")
 controller="$ROOT/opt/monday/releases/binance-lob-controller/$controller_sha"
 [[ -d $controller && -L $controller/binance-lob-archiver ]]
 monday_verify_controller_release "$ROOT" "$controller_sha"
+# The aggregate slice filename contains literal backslashes.  Its sidecar row
+# must stay raw (no GNU leading escape marker) and remain checkable by the
+# host checksum utility.
+slice_asset='system-binance\x2dlob\x2darchiver\x2dproduction.slice'
+slice_record=$(grep -F "deployment/$slice_asset" "$controller/deployment.sha256")
+slice_digest=$(monday_sha256_file "$controller/deployment/$slice_asset")
+[[ -n $slice_record && ${slice_record:0:1} != "\\" ]]
+[[ $slice_record == "$slice_digest  deployment/$slice_asset" ]]
+(cd "$controller" && sha256sum --check --strict deployment.sha256 >/dev/null)
 publish_controller_release "$payload" "$bundle" "$manifest" "$ROOT" \
   | grep -Fq 'already published'
 [[ ! -e "$ROOT/opt/monday/releases/binance-lob-controller/active" ]]
+
+# A tampered aggregate row must fail closed, then the original sidecar must
+# continue to verify after restoration.
+checksum_backup="$ROOT/deployment.sha256.valid"
+checksum_file="$controller/deployment.sha256"
+cp -p "$checksum_file" "$checksum_backup"
+chmod u+w "$checksum_file"
+slice_line_number=$(grep -nF "deployment/$slice_asset" "$checksum_file" | cut -d: -f1)
+awk -v target_line="$slice_line_number" \
+  'NR == target_line { print $0 "tampered"; next } { print }' \
+  "$checksum_file" >"$ROOT/deployment.sha256.tampered"
+cat "$ROOT/deployment.sha256.tampered" >"$checksum_file"
+rm -f "$ROOT/deployment.sha256.tampered"
+if monday_verify_controller_release "$ROOT" "$controller_sha" >/dev/null 2>&1; then
+  printf 'controller verification accepted a tampered aggregate checksum\n' >&2
+  exit 1
+fi
+cp -p "$checksum_backup" "$checksum_file"
+chmod 0444 "$checksum_file"
+monday_verify_controller_release "$ROOT" "$controller_sha"
 
 if jq '.control_plane_version = 1' "$manifest" >"$ROOT/v1.json"; then
   if publish_controller_release "$payload" "$bundle" "$ROOT/v1.json" "$ROOT" \
