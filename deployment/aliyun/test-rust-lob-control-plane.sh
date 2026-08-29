@@ -131,7 +131,8 @@ production_identity=$(monday_lob_production_snapshot_identity "$production_snaps
 # Runtime-boundary verification reads unordered KEY=VALUE output from
 # systemctl and requires the permanent aggregate slice plus both direct child
 # units.  This small stub keeps the helper covered without mutating a host.
-# shellcheck disable=SC2329
+# Invoked indirectly by the sourced helper.
+# shellcheck disable=SC2317,SC2329
 systemctl() {
   local action=${1:-} unit=${2:-}
   [[ $action == show ]] || return 1
