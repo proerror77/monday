@@ -609,72 +609,37 @@ monday_rust_lob_runtime_contract_sha256_v1() {
   fi
 }
 
+monday_rust_lob_live_runtime_contract_sha256_for_assets() {
+  [[ $# -eq 2 ]] || return 2
+  local root=$1 asset_source=$2 asset target resolved digest checksum_lines
+  checksum_lines=$(
+    while IFS= read -r asset; do
+      target=$(monday_runtime_asset_target "$root" "$asset") || exit 1
+      [[ -e $target || -L $target ]] || exit 1
+      resolved=$(readlink -f -- "$target") || exit 1
+      [[ -f $resolved && ! -L $resolved ]] || exit 1
+      digest=$(monday_sha256_file "$resolved") || exit 1
+      printf '%s  %s\n' "$digest" "$asset"
+    done < <("$asset_source")
+  ) || return 1
+  [[ -n $checksum_lines ]] || return 1
+  digest=$(printf '%s\n' "$checksum_lines" | if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  else
+    shasum -a 256 | awk '{print $1}'
+  fi) || return 1
+  monday_sha256_ok "$digest" || return 1
+  printf '%s\n' "$digest"
+}
+
 monday_rust_lob_live_runtime_contract_sha256() {
   [[ $# -eq 1 ]] || return 2
-  local root=$1 scratch asset target resolved digest
-  scratch=$(mktemp -d) || return 1
-  while IFS= read -r asset; do
-    target=$(monday_runtime_asset_target "$root" "$asset") || {
-      rm -rf -- "$scratch"
-      return 1
-    }
-    [[ -f $target ]] || {
-      rm -rf -- "$scratch"
-      return 1
-    }
-    resolved=$(readlink -f -- "$target") || {
-      rm -rf -- "$scratch"
-      return 1
-    }
-    [[ -f $resolved && ! -L $resolved ]] || {
-      rm -rf -- "$scratch"
-      return 1
-    }
-    cp -p -- "$resolved" "$scratch/$asset" || {
-      rm -rf -- "$scratch"
-      return 1
-    }
-  done < <(monday_runtime_assets)
-  digest=$(monday_rust_lob_runtime_contract_sha256 "$scratch") || {
-    rm -rf -- "$scratch"
-    return 1
-  }
-  rm -rf -- "$scratch"
-  printf '%s\n' "$digest"
+  monday_rust_lob_live_runtime_contract_sha256_for_assets "$1" monday_runtime_assets
 }
 
 monday_rust_lob_live_runtime_contract_sha256_v1() {
   [[ $# -eq 1 ]] || return 2
-  local root=$1 scratch asset target resolved digest
-  scratch=$(mktemp -d) || return 1
-  while IFS= read -r asset; do
-    target=$(monday_runtime_asset_target "$root" "$asset") || {
-      rm -rf -- "$scratch"
-      return 1
-    }
-    [[ -f $target ]] || {
-      rm -rf -- "$scratch"
-      return 1
-    }
-    resolved=$(readlink -f -- "$target") || {
-      rm -rf -- "$scratch"
-      return 1
-    }
-    [[ -f $resolved && ! -L $resolved ]] || {
-      rm -rf -- "$scratch"
-      return 1
-    }
-    cp -p -- "$resolved" "$scratch/$asset" || {
-      rm -rf -- "$scratch"
-      return 1
-    }
-  done < <(monday_runtime_assets_v1)
-  digest=$(monday_rust_lob_runtime_contract_sha256_v1 "$scratch") || {
-    rm -rf -- "$scratch"
-    return 1
-  }
-  rm -rf -- "$scratch"
-  printf '%s\n' "$digest"
+  monday_rust_lob_live_runtime_contract_sha256_for_assets "$1" monday_runtime_assets_v1
 }
 
 # Strict, read-only verifier for the production runtime that a controller

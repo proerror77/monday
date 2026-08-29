@@ -319,6 +319,15 @@ cp -p -- "$legacy_work/deployment/monday-collector-health.sh" \
 # the candidate runtime is R2, while the live legacy topology is R0.
 ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p0_sha/binance-lob-archiver" \
   "$ROOT/opt/monday/bin/binance-lob-archiver"
+# Live runtime digesting is read-only: even with a nonexistent TMPDIR, the
+# canonical v1 asset order and digest must match the fixture's recorded R0.
+runtime_tmpdir_guard="$ROOT/nonexistent-runtime-tmp"
+live_runtime_without_tmp=$(TMPDIR="$runtime_tmpdir_guard" \
+  monday_rust_lob_live_runtime_contract_sha256_v1 "$ROOT")
+[[ $live_runtime_without_tmp == "$legacy_runtime_sha" && ! -e $runtime_tmpdir_guard ]] || {
+  printf 'live runtime digest helper changed identity or created TMPDIR\n' >&2
+  exit 1
+}
 # A persisted temporary lease is recoverable without an EXIT trap.  The
 # fixture invokes the signed Gate's internal recovery mode as a stand-in for
 # a timer firing after SIGKILL: run-scoped workers are stopped first, the
@@ -509,19 +518,26 @@ preflight_residue_before=$(find "$ROOT/data/monday/spool/binance-lob-rust-shadow
   "$ROOT/run/systemd/system" -mindepth 1 -print 2>/dev/null | LC_ALL=C sort || true)
 preflight_lock_path="$ROOT/run/lock/monday-rust-lob-control-plane.lock"
 preflight_lock_sha=$(monday_sha256_file "$preflight_lock_path")
+preflight_tmpdir_guard="$ROOT/nonexistent-preflight-tmp"
+rm -rf -- "$preflight_tmpdir_guard"
 rm -f -- "$ROOT/run/gate-fixture.calls"
-preflight_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+preflight_output=$(TMPDIR="$preflight_tmpdir_guard" MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
   --candidate-controller "$c0" --preflight-only --root "$ROOT")
-jq -e \
+jq -e --arg runtime "$candidate_runtime_sha" \
   '.schema == "monday.rust_lob_shadow_gate_preflight.v1"
    and .operation == "gate" and .preflight_only == true
    and .authoritative == false and .production_changed == false
    and .authorizes_gate == false and .authorizes_cutover == false
+   and .candidate_runtime_contract_sha256 == $runtime
    and (.io_full_psi_windows | length == 3)
    and (.checks.controller and .checks.from_controller and .checks.payload
      and .checks.runtime_contract and .checks.installed_bytes and .checks.psi_sampler)' \
   <<<"$preflight_output" >/dev/null
+[[ ! -e "$preflight_tmpdir_guard" ]] || {
+  printf 'read-only preflight created a temporary directory\n' >&2
+  exit 1
+}
 preflight_residue_after=$(find "$ROOT/data/monday/spool/binance-lob-rust-shadow" \
   "$ROOT/data/monday/evidence/shadow-gates" "$ROOT/run/monday/rust-lob-gate" \
   "$ROOT/run/systemd/system" -mindepth 1 -print 2>/dev/null | LC_ALL=C sort || true)
