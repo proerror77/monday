@@ -261,8 +261,13 @@ and (.production_memory | . as $pm
           and (.timer_restored | type == "boolean")
           and (.service_was_noninactive | type == "boolean")
           and (.service_quiesced | type == "boolean")
+          and (.preexisting_global_health_failed | type == "boolean")
+          and (.global_health_reset_applied | type == "boolean")
+          and (.global_health_reset_applied == false)
           and (.service_was_noninactive
             == ((.before_service.active_state // "inactive") != "inactive"))
+          and (.preexisting_global_health_failed
+            == ((.before_service.active_state // "inactive") == "failed"))
           and (if $pm.slice_lease.mode == "temporary-bootstrap" then
             .required == true
             and .pause_applied == true
@@ -271,14 +276,15 @@ and (.production_memory | . as $pm
             and (.before_timer | valid_health_unit_state("monday-collector-health.timer")
               and .load_state == "loaded"
               and .active_state == "active")
-            and (.before_service | valid_health_unit_state("monday-collector-health.service")
-              and .active_state != "failed")
+            and (.before_service | valid_health_unit_state("monday-collector-health.service"))
           else
             .required == false
             and .pause_applied == false
             and .timer_restored == true
             and .service_was_noninactive == false
             and .service_quiesced == true
+            and .preexisting_global_health_failed == false
+            and .global_health_reset_applied == false
             and .before_timer == null
             and .before_service == null
           end))))
