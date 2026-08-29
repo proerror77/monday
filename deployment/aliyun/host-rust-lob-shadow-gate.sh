@@ -37,6 +37,8 @@ readonly -a PRODUCTION_ASSETS=(
 readonly PRODUCTION_SLICE='system-binance\x2dlob\x2darchiver\x2dproduction.slice'
 readonly FIXTURE_PRODUCTION_SPOT_PID=51001
 readonly FIXTURE_PRODUCTION_USDM_PID=51002
+readonly COLLECTOR_HEALTH_TIMER='monday-collector-health.timer'
+readonly COLLECTOR_HEALTH_SERVICE='monday-collector-health.service'
 
 die() { printf 'shadow gate failed: %s\n' "$*"; exit 1; }
 usage() {
@@ -165,6 +167,12 @@ fi
 # by this action and cannot mutate a host unit.
 if [[ $TEST_ONLY == true ]]; then
   declare -A fixture_unit_state=()
+  fixture_health_timer_state=${MONDAY_GATE_FIXTURE_HEALTH_TIMER_STATE:-active}
+  fixture_health_timer_substate=${MONDAY_GATE_FIXTURE_HEALTH_TIMER_SUBSTATE:-waiting}
+  fixture_health_timer_enabled=${MONDAY_GATE_FIXTURE_HEALTH_TIMER_ENABLED:-enabled}
+  fixture_health_service_state=${MONDAY_GATE_FIXTURE_HEALTH_SERVICE_STATE:-inactive}
+  fixture_health_service_substate=${MONDAY_GATE_FIXTURE_HEALTH_SERVICE_SUBSTATE:-dead}
+  fixture_health_service_enabled=${MONDAY_GATE_FIXTURE_HEALTH_SERVICE_ENABLED:-static}
   fixture_production_memory_high=3221225472
   fixture_production_memory_max=3758096384
   if [[ ${MONDAY_GATE_FIXTURE_BOOTSTRAP_UNLIMITED:-0} == 1 ]]; then
@@ -183,10 +191,24 @@ if [[ $TEST_ONLY == true ]]; then
         return 0 ;;
       start)
         [[ ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] && printf 'start %s\n' "$unit_name" >>"$ROOT/run/gate-fixture.calls"
-        fixture_unit_state[$unit_name]=active; return 0 ;;
+        case "$unit_name" in
+          "$COLLECTOR_HEALTH_TIMER")
+            fixture_health_timer_state=active; fixture_health_timer_substate=waiting ;;
+          "$COLLECTOR_HEALTH_SERVICE")
+            fixture_health_service_state=active; fixture_health_service_substate=running ;;
+          *) fixture_unit_state[$unit_name]=active ;;
+        esac
+        return 0 ;;
       stop)
         [[ ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] && printf 'stop %s\n' "$unit_name" >>"$ROOT/run/gate-fixture.calls"
-        fixture_unit_state[$unit_name]=inactive; return 0 ;;
+        case "$unit_name" in
+          "$COLLECTOR_HEALTH_TIMER")
+            fixture_health_timer_state=inactive; fixture_health_timer_substate=dead ;;
+          "$COLLECTOR_HEALTH_SERVICE")
+            fixture_health_service_state=inactive; fixture_health_service_substate=dead ;;
+          *) fixture_unit_state[$unit_name]=inactive ;;
+        esac
+        return 0 ;;
       set-property)
         [[ ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] && printf 'set-property\n' >>"$ROOT/run/gate-fixture.calls"
         target=$unit_name
@@ -230,11 +252,24 @@ if [[ $TEST_ONLY == true ]]; then
           case "$item" in
             ActiveState)
               if [[ $unit_name == binance-lob-archiver-production@* || $unit_name == "$PRODUCTION_SLICE" ]]; then value=active
+              elif [[ $unit_name == "$COLLECTOR_HEALTH_TIMER" ]]; then value=$fixture_health_timer_state
+              elif [[ $unit_name == "$COLLECTOR_HEALTH_SERVICE" ]]; then value=$fixture_health_service_state
               else value=${fixture_unit_state[$unit_name]:-inactive}; fi ;;
             SubState)
               if [[ $unit_name == binance-lob-archiver-production@* || $unit_name == "$PRODUCTION_SLICE" ]]; then value=running
+              elif [[ $unit_name == "$COLLECTOR_HEALTH_TIMER" ]]; then value=$fixture_health_timer_substate
+              elif [[ $unit_name == "$COLLECTOR_HEALTH_SERVICE" ]]; then value=$fixture_health_service_substate
               elif [[ ${fixture_unit_state[$unit_name]:-inactive} == active ]]; then value=running
               else value=dead; fi ;;
+            LoadState) value=loaded ;;
+            UnitFileState)
+              if [[ $unit_name == "$COLLECTOR_HEALTH_TIMER" ]]; then value=$fixture_health_timer_enabled
+              elif [[ $unit_name == "$COLLECTOR_HEALTH_SERVICE" ]]; then value=$fixture_health_service_enabled
+              else value=static; fi ;;
+            Result)
+              value=success ;;
+            ExecMainStatus)
+              value=0 ;;
             NRestarts)
               if [[ $unit_name == binance-lob-archiver-production@* ]]; then value=${MONDAY_GATE_FIXTURE_PRODUCTION_RESTARTS:-8}
               elif [[ ${MONDAY_GATE_FIXTURE_FAIL_RESTART:-0} == 1 ]]; then value=1
@@ -395,6 +430,80 @@ systemctl_show() { systemctl show "$1" --property="$2" --value 2>/dev/null; }
 systemctl_show_many() { systemctl show "$1" --property="$2" 2>/dev/null; }
 systemctl_active() { systemctl is-active --quiet "$1"; }
 
+# Capture the fixed collector-health timer/service state needed to audit and
+# undo a direct bootstrap pause.  The snapshot is deliberately string-valued
+# so recovery can compare identity-bearing fields without relying on
+# positional output or coercing an implementation-specific empty value.
+health_unit_snapshot_json() {
+  local unit=$1 output item key value
+  local -A fields=()
+  output=$(systemctl_show_many "$unit" \
+    'LoadState,ActiveState,SubState,UnitFileState') \
+    || return 1
+  output=${output%$'\n'}
+  while IFS= read -r item; do
+    [[ $item == *=* ]] || return 1
+    key=${item%%=*}; value=${item#*=}
+    case $key in
+      LoadState|ActiveState|SubState|UnitFileState) ;;
+      *) return 1 ;;
+    esac
+    [[ -z ${fields[$key]+x} ]] || return 1
+    fields[$key]=$value
+  done <<<"$output"
+  [[ ${#fields[@]} == 4 ]] || return 1
+  [[ $unit == "$COLLECTOR_HEALTH_TIMER" || $unit == "$COLLECTOR_HEALTH_SERVICE" ]] || return 1
+  [[ -n ${fields[LoadState]} && -n ${fields[ActiveState]} && -n ${fields[SubState]} \
+    && -n ${fields[UnitFileState]} ]] || return 1
+  jq -cn \
+    --arg unit "$unit" --arg load "${fields[LoadState]}" \
+    --arg active "${fields[ActiveState]}" --arg sub "${fields[SubState]}" \
+    --arg enabled "${fields[UnitFileState]}" \
+    '{unit:$unit,load_state:$load,active_state:$active,sub_state:$sub,
+      unit_file_state:$enabled}'
+}
+
+health_timer_state_matches() {
+  local expected=$1 current
+  current=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_TIMER") || return 1
+  jq -e -n --argjson expected "$expected" --argjson current "$current" '
+    $current.unit == "monday-collector-health.timer"
+    and $current.load_state == $expected.load_state
+    and $current.active_state == $expected.active_state
+    and $current.unit_file_state == $expected.unit_file_state
+  ' >/dev/null
+}
+
+# Restore the fixed health timer and quiesce the service from a persisted lease.
+# This helper is also called by the run-scoped recovery oneshot, before that
+# oneshot removes its own timer/service.  It is idempotent, never starts the
+# service, and never changes enablement.
+restore_bootstrap_monitor_from_state() {
+  local state=$1 required before_timer current
+  required=$(jq -er '.bootstrap_monitor_containment.required' "$state") || return 1
+  [[ $required == true ]] || return 0
+  before_timer=$(jq -c '.bootstrap_monitor_containment.before_timer' "$state") || return 1
+  [[ $(jq -er '.load_state' <<<"$before_timer") == loaded \
+    && $(jq -er '.active_state' <<<"$before_timer") == active ]] || return 1
+  # The health worker is quiesced for the bootstrap interval.  It is never
+  # restarted by Gate/recovery: only the original active timer is restored.
+  current=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
+  if [[ $(jq -er '.active_state' <<<"$current") != inactive ]]; then
+    systemctl stop "$COLLECTOR_HEALTH_SERVICE" >/dev/null 2>&1 || return 1
+  fi
+  current=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
+  [[ $(jq -er '.active_state' <<<"$current") == inactive ]] || return 1
+  if [[ $(jq -er '.active_state' <<<"$before_timer") == active ]]; then
+    systemctl start "$COLLECTOR_HEALTH_TIMER" >/dev/null 2>&1 || return 1
+  else
+    current=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_TIMER") || return 1
+    if [[ $(jq -er '.active_state' <<<"$current") != inactive ]]; then
+      systemctl stop "$COLLECTOR_HEALTH_TIMER" >/dev/null 2>&1 || return 1
+    fi
+  fi
+  health_timer_state_matches "$before_timer"
+}
+
 # A preflight is deliberately read-only, but it uses the exact same three
 # 15-second, 1% I/O-full PSI windows as the formal Gate calibration.  Fixture
 # mode keeps the loop deterministic by reading its zero-valued PSI source
@@ -433,7 +542,7 @@ sample_preflight_psi() {
 # timer/service and marks the state recovered.
 recover_bootstrap_lease() {
   [[ $# -eq 1 ]] || die 'lease recovery requires one state file'
-  local state=$1 state_name run mode applied restored before_high before_max
+  local state=$1 state_name state_schema run mode applied restored before_high before_max
   local expected_service expected_timer service_name timer_name slice_name
   local candidate_controller gate_script gate_script_sha gate_pid gate_starttime owner_starttime expected_gate_script
   local listed unit unit_file output item key value restored_high restored_max temporary
@@ -444,9 +553,26 @@ recover_bootstrap_lease() {
   [[ $state_name =~ ^bootstrap-slice-lease-([0-9]{8}T[0-9]{6}Z-[1-9][0-9]*)\.json$ ]] \
     || die 'lease state filename is not run-scoped'
   secure_file "$state"
-  jq -e --arg slice "$PRODUCTION_SLICE" '
+  state_schema=$(jq -er '.schema' "$state") || die 'lease state schema is unavailable'
+  case "$state_schema" in
+    monday.rust_lob_bootstrap_slice_lease.v1)
+      [[ $(jq -r '.restored // false' "$state") == true ]] \
+        && return 0
+      die 'unrestored v1 bootstrap lease is not recoverable by V2' ;;
+    monday.rust_lob_bootstrap_slice_lease.v2) ;;
+    *) die 'lease state schema is unsupported' ;;
+  esac
+  jq -e --arg slice "$PRODUCTION_SLICE" --arg timer "$COLLECTOR_HEALTH_TIMER" \
+    --arg service "$COLLECTOR_HEALTH_SERVICE" '
+    def valid_health_snapshot($unit):
+      type == "object"
+      and .unit == $unit
+      and (.load_state | type == "string" and length > 0)
+      and (.active_state | type == "string" and length > 0)
+      and (.sub_state | type == "string" and length > 0)
+      and (.unit_file_state | type == "string" and length > 0);
     type == "object"
-    and .schema == "monday.rust_lob_bootstrap_slice_lease.v1"
+    and .schema == "monday.rust_lob_bootstrap_slice_lease.v2"
     and (.run_id | type == "string" and test("^[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*$"))
     and .slice == $slice
     and .mode == "temporary-bootstrap"
@@ -465,7 +591,20 @@ recover_bootstrap_lease() {
     and (.applied | type == "boolean")
     and (.restored | type == "boolean")
     and (.recovery_service | type == "string")
-    and (.recovery_timer | type == "string")' "$state" >/dev/null \
+      and (.recovery_timer | type == "string")
+    and (.bootstrap_monitor_containment | type == "object"
+      and .required == true
+      and .timer == $timer
+      and .service == $service
+      and (.before_timer | valid_health_snapshot($timer)
+        and .load_state == "loaded"
+        and .active_state == "active")
+      and (.before_service | valid_health_snapshot($service))
+      and (.pause_applied | type == "boolean")
+      and (.timer_restored | type == "boolean")
+      and (.service_was_noninactive | type == "boolean")
+      and (.service_was_noninactive == (.before_service.active_state != "inactive"))
+      and (.service_quiesced | type == "boolean"))' "$state" >/dev/null \
     || die 'lease state schema is invalid'
   run=$(jq -er '.run_id' "$state") || die 'lease state run id is unavailable'
   expected_service="${GATE_UNIT_PREFIX}${run}-lease-recovery.service"
@@ -477,6 +616,7 @@ recover_bootstrap_lease() {
   mode=$(jq -er '.mode' "$state") || die 'lease state mode is unavailable'
   applied=$(jq -r '.applied' "$state") || die 'lease state applied flag is unavailable'
   restored=$(jq -r '.restored' "$state") || die 'lease state restored flag is unavailable'
+  [[ $restored == true ]] && return 0
   before_high=$(jq -er '.before_memory_high' "$state") || die 'lease state high limit is unavailable'
   before_max=$(jq -er '.before_memory_max' "$state") || die 'lease state max limit is unavailable'
   [[ $mode == temporary-bootstrap ]] || die 'lease state mode is not temporary bootstrap'
@@ -546,18 +686,23 @@ recover_bootstrap_lease() {
     [[ $restored_high == "$before_high" && $restored_max == "$before_max" ]] \
       || die 'restored production slice limits differ from lease state'
   fi
+  restore_bootstrap_monitor_from_state "$state" \
+    || die 'could not restore the collector health timer/service state'
 
   # This function runs as the recovery oneshot itself.  Stop/reset only the
-  # timer and run workers; stopping the current service would self-interrupt
-  # before its state/readback and unit removal complete.  Normal EXIT cleanup
-  # uses cancel_bootstrap_lease_recovery, which may stop both units.
+  # timer and run workers; stopping the current recovery service would
+  # self-interrupt before its state/readback and unit removal complete.  The
+  # collector health service was already quiesced above and is never started.
   systemctl stop "$timer_name" >/dev/null 2>&1 || true
   systemctl reset-failed "$timer_name" >/dev/null 2>&1 || true
   rm -f -- "$GATE_SYSTEMD_ROOT/$timer_name" "$GATE_SYSTEMD_ROOT/$service_name"
   systemctl daemon-reload >/dev/null 2>&1 || die 'could not reload systemd after lease recovery'
   temporary="${state}.tmp.$$"
   jq -cS --arg recovered_by "$run" \
-    '.restored = true | .recovered_by_run_id = $recovered_by' "$state" >"$temporary" \
+    '.bootstrap_monitor_containment.pause_applied = true
+     | .bootstrap_monitor_containment.timer_restored = true
+     | .bootstrap_monitor_containment.service_quiesced = true
+     | .restored = true | .recovered_by_run_id = $recovered_by' "$state" >"$temporary" \
     || die 'could not mark bootstrap lease recovered'
   chmod 0640 "$temporary" || die 'could not protect recovered lease state'
   mv -f -- "$temporary" "$state" || die 'could not publish recovered lease state'
@@ -1041,6 +1186,104 @@ bootstrap_slice_lease_gate_script_sha256=
 bootstrap_slice_lease_parent_control_group=
 bootstrap_slice_lease_parent_current=0
 bootstrap_slice_lease_parent_anon=0
+bootstrap_monitor_required=false
+bootstrap_monitor_pause_applied=false
+bootstrap_monitor_timer_restored=true
+# Audit whether the captured service state was anything other than inactive;
+# this is not a claim that the service remains stopped after the timer fires.
+bootstrap_monitor_service_was_noninactive=false
+bootstrap_monitor_service_quiesced=true
+bootstrap_monitor_timer_before_json=null
+bootstrap_monitor_service_before_json=null
+bootstrap_monitor_containment_json='{}'
+build_bootstrap_monitor_containment() {
+  bootstrap_monitor_containment_json=$(jq -cn \
+    --argjson required "$bootstrap_monitor_required" \
+    --arg timer "$COLLECTOR_HEALTH_TIMER" --arg service "$COLLECTOR_HEALTH_SERVICE" \
+    --argjson before_timer "$bootstrap_monitor_timer_before_json" \
+    --argjson before_service "$bootstrap_monitor_service_before_json" \
+    --argjson pause_applied "$bootstrap_monitor_pause_applied" \
+    --argjson timer_restored "$bootstrap_monitor_timer_restored" \
+    --argjson service_was_noninactive "$bootstrap_monitor_service_was_noninactive" \
+    --argjson service_quiesced "$bootstrap_monitor_service_quiesced" \
+    '{required:$required,timer:$timer,service:$service,
+      before_timer:$before_timer,before_service:$before_service,
+      pause_applied:$pause_applied,timer_restored:$timer_restored,
+      service_was_noninactive:$service_was_noninactive,service_quiesced:$service_quiesced}') || return 1
+}
+capture_bootstrap_monitor_state() {
+  local timer_state service_state
+  timer_state=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_TIMER") || return 1
+  service_state=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
+  [[ $(jq -er '.load_state' <<<"$timer_state") == loaded \
+    && $(jq -er '.active_state' <<<"$timer_state") == active ]] || return 1
+  bootstrap_monitor_required=true
+  bootstrap_monitor_pause_applied=false
+  bootstrap_monitor_timer_restored=false
+  bootstrap_monitor_service_was_noninactive=false
+  [[ $(jq -er '.active_state' <<<"$service_state") != inactive ]] \
+    && bootstrap_monitor_service_was_noninactive=true
+  bootstrap_monitor_service_quiesced=false
+  bootstrap_monitor_timer_before_json=$timer_state
+  bootstrap_monitor_service_before_json=$service_state
+  build_bootstrap_monitor_containment
+}
+pause_bootstrap_monitor() {
+  [[ $bootstrap_monitor_required == true ]] || return 0
+  systemctl stop "$COLLECTOR_HEALTH_TIMER" >/dev/null 2>&1 || return 1
+  local timer_state service_state
+  timer_state=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_TIMER") || return 1
+  [[ $(jq -er '.active_state' <<<"$timer_state") == inactive ]] || return 1
+  build_bootstrap_monitor_containment || return 1
+  write_bootstrap_slice_lease_state || return 1
+  # Re-read after the timer stop: an in-flight timer callback may have left the
+  # service in any non-inactive state, not only the state captured at entry.
+  service_state=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
+  if [[ $(jq -er '.active_state' <<<"$service_state") != inactive ]]; then
+    systemctl stop "$COLLECTOR_HEALTH_SERVICE" >/dev/null 2>&1 || return 1
+  fi
+  service_state=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
+  [[ $(jq -er '.active_state' <<<"$service_state") == inactive ]] || return 1
+  bootstrap_monitor_service_quiesced=true
+  bootstrap_monitor_pause_applied=true
+  build_bootstrap_monitor_containment || return 1
+  write_bootstrap_slice_lease_state
+}
+restore_bootstrap_monitor() {
+  [[ $bootstrap_monitor_required == true ]] || {
+    bootstrap_monitor_timer_restored=true
+    bootstrap_monitor_service_was_noninactive=false
+    bootstrap_monitor_service_quiesced=true
+    return 0
+  }
+  local before_timer_active current
+  before_timer_active=$(jq -er '.active_state' <<<"$bootstrap_monitor_timer_before_json") || return 1
+  [[ $(jq -er '.load_state' <<<"$bootstrap_monitor_timer_before_json") == loaded \
+    && $before_timer_active == active ]] || return 1
+  # The health worker remains quiesced after the bootstrap window.  Never
+  # restart it here; only a timer that was active before the pause is restored.
+  # service_quiesced records this pause/restore transaction's inactive readback;
+  # it does not claim a timer-triggered service remains inactive forever.
+  current=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
+  if [[ $(jq -er '.active_state' <<<"$current") != inactive ]]; then
+    systemctl stop "$COLLECTOR_HEALTH_SERVICE" >/dev/null 2>&1 || return 1
+  fi
+  current=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
+  [[ $(jq -er '.active_state' <<<"$current") == inactive ]] || return 1
+  bootstrap_monitor_service_quiesced=true
+  if [[ $before_timer_active == active ]]; then
+    systemctl start "$COLLECTOR_HEALTH_TIMER" >/dev/null 2>&1 || return 1
+  else
+    current=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_TIMER") || return 1
+    if [[ $(jq -er '.active_state' <<<"$current") == active ]]; then
+      systemctl stop "$COLLECTOR_HEALTH_TIMER" >/dev/null 2>&1 || return 1
+    fi
+  fi
+  health_timer_state_matches "$bootstrap_monitor_timer_before_json" || return 1
+  bootstrap_monitor_timer_restored=true
+  build_bootstrap_monitor_containment || return 1
+  write_bootstrap_slice_lease_state
+}
 write_bootstrap_slice_lease_state() {
   [[ -n ${bootstrap_slice_lease_state_file:-} ]] || return 1
   local temporary="${bootstrap_slice_lease_state_file}.tmp.$$"
@@ -1061,7 +1304,8 @@ write_bootstrap_slice_lease_state() {
     --argjson parent_anon "$bootstrap_slice_lease_parent_anon" \
     --argjson applied "$bootstrap_slice_lease_applied" \
     --argjson restored "$bootstrap_slice_lease_restored" \
-    '{schema:"monday.rust_lob_bootstrap_slice_lease.v1",run_id:$run,slice:$slice,
+    --argjson monitor "$bootstrap_monitor_containment_json" \
+    '{schema:"monday.rust_lob_bootstrap_slice_lease.v2",run_id:$run,slice:$slice,
       mode:$mode,before_memory_high:$before_high,before_memory_max:$before_max,
       before_parent_control_group:$parent_control_group,
       before_parent_memory_current_bytes:$parent_current,
@@ -1070,7 +1314,8 @@ write_bootstrap_slice_lease_state() {
       candidate_controller_sha256:$controller,gate_script:$gate_script,
       gate_script_sha256:$gate_script_sha,gate_pid:$gate_pid,gate_starttime:$gate_starttime,
       recovery_service:$recovery_service,recovery_timer:$recovery_timer,
-      applied:$applied,restored:$restored}' >"$temporary" || return 1
+      applied:$applied,restored:$restored,
+      bootstrap_monitor_containment:$monitor}' >"$temporary" || return 1
   chmod 0640 "$temporary" || return 1
   mv -f -- "$temporary" "$bootstrap_slice_lease_state_file"
 }
@@ -1196,6 +1441,8 @@ apply_bootstrap_slice_lease() {
   bootstrap_slice_lease_parent_control_group=$parent_control
   bootstrap_slice_lease_parent_current=$parent_current
   bootstrap_slice_lease_parent_anon=$parent_anon
+  capture_bootstrap_monitor_state \
+    || die 'direct bootstrap requires an active collector health timer'
   # Mark the lease as pending before the mutating call so an abnormal exit
   # between set-property and the bookkeeping assignments still enters the
   # EXIT cleanup path with the original limits available for restoration.
@@ -1221,6 +1468,8 @@ apply_bootstrap_slice_lease() {
     && printf 'install-lease-recovery\n' >>"$ROOT/run/gate-fixture.calls"
   install_bootstrap_lease_recovery \
     || die 'could not arm automatic bootstrap lease recovery'
+  pause_bootstrap_monitor \
+    || die 'could not pause the collector health timer/service'
   systemctl set-property --runtime "$PRODUCTION_SLICE" \
     MemoryHigh=3072M MemoryMax=3584M >/dev/null \
     || die 'could not apply the temporary production slice lease'
@@ -1230,6 +1479,10 @@ apply_bootstrap_slice_lease() {
     || die 'temporary production MemoryHigh lease is not exact'
   [[ $before_max == 3758096384 || $before_max == 3584M ]] \
     || die 'temporary production MemoryMax lease is not exact'
+  build_bootstrap_monitor_containment \
+    || die 'bootstrap monitor state is malformed after apply'
+  write_bootstrap_slice_lease_state \
+    || die 'could not persist the applied bootstrap monitor containment'
 }
 restore_bootstrap_slice_lease() {
   [[ ${bootstrap_slice_lease_mode:-permanent} == temporary-bootstrap ]] || return 0
@@ -1242,8 +1495,13 @@ restore_bootstrap_slice_lease() {
   IFS=$'\t' read -r restored_high restored_max <<<"$limits"
   [[ $restored_high == "$bootstrap_slice_lease_before_high" \
     && $restored_max == "$bootstrap_slice_lease_before_max" ]] || return 1
+  bootstrap_slice_lease_restored=false
+  build_bootstrap_monitor_containment || return 1
+  write_bootstrap_slice_lease_state || return 1
+  restore_bootstrap_monitor || return 1
   cancel_bootstrap_lease_recovery || return 1
   bootstrap_slice_lease_restored=true
+  build_bootstrap_monitor_containment || return 1
   write_bootstrap_slice_lease_state || return 1
 }
 
@@ -2283,17 +2541,21 @@ refresh_production_snapshot || die 'production cgroup identity changed during Ga
 # runtime limit before publishing the receipt; Cutover will install the
 # permanent signed slice as part of the atomic 8 -> 9 migration.
 restore_bootstrap_slice_lease || die 'temporary production slice lease could not be restored'
+build_bootstrap_monitor_containment \
+  || die 'bootstrap monitor containment state is unavailable for the receipt'
 production_memory_json=$(jq -c \
   --arg mode "$bootstrap_slice_lease_mode" \
   --arg before_high "${bootstrap_slice_lease_before_high:-}" \
   --arg before_max "${bootstrap_slice_lease_before_max:-}" \
   --argjson applied "${bootstrap_slice_lease_applied:-false}" \
   --argjson restored "${bootstrap_slice_lease_restored:-false}" \
+  --argjson monitor "$bootstrap_monitor_containment_json" \
   '.slice_lease={mode:$mode,before_memory_high:$before_high,before_memory_max:$before_max,
-    requested_memory_high:"3072M",requested_memory_max:"3584M",applied:$applied,restored:$restored}' \
+    requested_memory_high:"3072M",requested_memory_max:"3584M",applied:$applied,restored:$restored}
+   | .bootstrap_monitor_containment=$monitor' \
   <<<"$production_memory_json")
 
-checks=$(jq -cn '{before_pair_unchanged:true,production_runtime_verified:true,shadow_staging_verified:true,shadow_assets_restored:true,resource_preflight:true,oss_triplets:true,strict_segment_verifier:true,final_identity:true,controller_control_bytes:true,shadow_link_restored:true,health_freshness:true}')
+checks=$(jq -cn '{before_pair_unchanged:true,production_runtime_verified:true,shadow_staging_verified:true,shadow_assets_restored:true,resource_preflight:true,oss_triplets:true,strict_segment_verifier:true,final_identity:true,controller_control_bytes:true,shadow_link_restored:true,health_freshness:true,bootstrap_monitor_containment:true}')
 before_assets_json='{}'; staged_assets_json='{}'; restored_assets_json='{}'
 for asset in "${SHADOW_ASSETS[@]}"; do
   restored_asset_sha[$asset]="${saved_sha[$asset]:-}"
