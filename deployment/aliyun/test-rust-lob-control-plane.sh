@@ -263,6 +263,8 @@ production_spool_root="$ROOT/data/monday/spool/binance-lob"
 mkdir -p "$production_spool_root/spot" "$production_spool_root/usdm"
 printf 'production-sentinel-spot\n' >"$production_spool_root/spot/upload-status.json"
 printf 'production-sentinel-usdm\n' >"$production_spool_root/usdm/upload-status.json"
+mkdir -p "$ROOT/run/lock"
+: >"$ROOT/run/lock/monday-rust-lob-control-plane.lock"
 production_spot_status_sha=$(monday_sha256_file "$production_spool_root/spot/upload-status.json")
 production_usdm_status_sha=$(monday_sha256_file "$production_spool_root/usdm/upload-status.json")
 printf '\n# controller revision two fixture\n' >>"$source_dir/host-rust-lob-readback.sh"
@@ -456,6 +458,173 @@ for over_cap_field in current anon; do
     exit 1
   fi
 done
+# A read-only host preflight must validate the same C/from/P/R and installed
+# production bytes as the formal Gate, then emit advisory JSON without creating
+# or truncating the existing lock, run spool, evidence, worker slice, lease,
+# shadow, or systemd unit.
+psi_window_us=15000000
+psi_threshold_us=150000
+read -r psi_delta psi_ratio psi_hit psi_count < <(monday_io_full_psi_window \
+  0 "$psi_threshold_us" "$psi_window_us" "$psi_window_us" "$psi_threshold_us" 0)
+[[ $psi_delta == "$psi_threshold_us" && $psi_ratio == 0.010000000 \
+  && $psi_hit == true && $psi_count == 1 ]] || {
+  printf 'PSI threshold boundary did not record the first continuous hit\n' >&2
+  exit 1
+}
+read -r psi_delta psi_ratio psi_hit psi_count < <(monday_io_full_psi_window \
+  "$psi_threshold_us" "$((psi_threshold_us * 2))" "$psi_window_us" "$psi_window_us" "$psi_threshold_us" "$psi_count")
+[[ $psi_hit == true && $psi_count == 2 ]] || {
+  printf 'PSI continuous-hit count did not advance to two\n' >&2
+  exit 1
+}
+read -r psi_delta psi_ratio psi_hit psi_count < <(monday_io_full_psi_window \
+  "$((psi_threshold_us * 2))" "$((psi_threshold_us * 3))" "$psi_window_us" "$psi_window_us" "$psi_threshold_us" "$psi_count")
+[[ $psi_hit == true && $psi_count == 3 ]] || {
+  printf 'PSI continuous-hit count did not advance to three\n' >&2
+  exit 1
+}
+read -r psi_delta psi_ratio psi_hit psi_count < <(monday_io_full_psi_window \
+  "$((psi_threshold_us * 3))" "$((psi_threshold_us * 3))" "$psi_window_us" "$psi_window_us" "$psi_threshold_us" "$psi_count")
+[[ $psi_hit == false && $psi_count == 0 ]] || {
+  printf 'PSI sub-threshold sample did not reset the continuous-hit count\n' >&2
+  exit 1
+}
+# The runtime monitor samples every five seconds but applies the same 1%
+# reference ratio as the 15-second calibration: 49,999us is below the scaled
+# 50,000us boundary, while 50,000us is exactly a hit.
+read -r psi_delta psi_ratio psi_hit psi_count < <(monday_io_full_psi_window \
+  0 49999 5000000 "$psi_window_us" "$psi_threshold_us" 0)
+[[ $psi_delta == 49999 && $psi_hit == false && $psi_count == 0 ]] || {
+  printf 'five-second PSI sample accepted a below-boundary delta\n' >&2
+  exit 1
+}
+read -r psi_delta psi_ratio psi_hit psi_count < <(monday_io_full_psi_window \
+  0 50000 5000000 "$psi_window_us" "$psi_threshold_us" 0)
+[[ $psi_delta == 50000 && $psi_hit == true && $psi_count == 1 ]] || {
+  printf 'five-second PSI sample rejected the exact scaled boundary\n' >&2
+  exit 1
+}
+preflight_residue_before=$(find "$ROOT/data/monday/spool/binance-lob-rust-shadow" \
+  "$ROOT/data/monday/evidence/shadow-gates" "$ROOT/run/monday/rust-lob-gate" \
+  "$ROOT/run/systemd/system" -mindepth 1 -print 2>/dev/null | LC_ALL=C sort || true)
+preflight_lock_path="$ROOT/run/lock/monday-rust-lob-control-plane.lock"
+preflight_lock_sha=$(monday_sha256_file "$preflight_lock_path")
+rm -f -- "$ROOT/run/gate-fixture.calls"
+preflight_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --preflight-only --root "$ROOT")
+jq -e \
+  '.schema == "monday.rust_lob_shadow_gate_preflight.v1"
+   and .operation == "gate" and .preflight_only == true
+   and .authoritative == false and .production_changed == false
+   and .authorizes_gate == false and .authorizes_cutover == false
+   and (.io_full_psi_windows | length == 3)
+   and (.checks.controller and .checks.from_controller and .checks.payload
+     and .checks.runtime_contract and .checks.installed_bytes and .checks.psi_sampler)' \
+  <<<"$preflight_output" >/dev/null
+preflight_residue_after=$(find "$ROOT/data/monday/spool/binance-lob-rust-shadow" \
+  "$ROOT/data/monday/evidence/shadow-gates" "$ROOT/run/monday/rust-lob-gate" \
+  "$ROOT/run/systemd/system" -mindepth 1 -print 2>/dev/null | LC_ALL=C sort || true)
+[[ $preflight_residue_after == "$preflight_residue_before" ]] || {
+  printf 'read-only preflight left run-scoped residue\n' >&2
+  exit 1
+}
+[[ $(monday_sha256_file "$preflight_lock_path") == "$preflight_lock_sha" ]] || {
+  printf 'read-only preflight changed the existing lock file\n' >&2
+  exit 1
+}
+[[ ! -s "$ROOT/run/gate-fixture.calls" ]] || {
+  printf 'read-only preflight invoked a mutating systemd action\n' >&2
+  exit 1
+}
+# An absent lock is a fail-closed preflight error and must not be recreated.
+mv -f -- "$preflight_lock_path" "$preflight_lock_path.missing"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --preflight-only --root "$ROOT" \
+  >/dev/null 2>"$ROOT/run/preflight-lock-missing.err"; then
+  printf 'read-only preflight recreated a missing lock file\n' >&2
+  exit 1
+fi
+[[ ! -e "$preflight_lock_path" && -e "$preflight_lock_path.missing" ]] || {
+  printf 'missing-lock preflight changed lock path state\n' >&2
+  exit 1
+}
+mv -f -- "$preflight_lock_path.missing" "$preflight_lock_path"
+preflight_residue_after=$(find "$ROOT/data/monday/spool/binance-lob-rust-shadow" \
+  "$ROOT/data/monday/evidence/shadow-gates" "$ROOT/run/monday/rust-lob-gate" \
+  "$ROOT/run/systemd/system" -mindepth 1 -print 2>/dev/null | LC_ALL=C sort || true)
+[[ $preflight_residue_after == "$preflight_residue_before" ]] || {
+  printf 'missing-lock preflight left run-scoped residue\n' >&2
+  exit 1
+}
+# Fixture lock contention is deterministic because macOS has no flock binary;
+# production uses the real flock command on the same read-only descriptor.
+rm -f -- "$ROOT/run/gate-fixture.calls"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_LOCK_BUSY=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --preflight-only --root "$ROOT" \
+  >/dev/null 2>"$ROOT/run/preflight-lock-busy.err"; then
+  printf 'read-only preflight ignored lock contention\n' >&2
+  exit 1
+fi
+[[ $(monday_sha256_file "$preflight_lock_path") == "$preflight_lock_sha" ]] || {
+  printf 'lock-contention preflight changed the existing lock file\n' >&2
+  exit 1
+}
+[[ ! -s "$ROOT/run/gate-fixture.calls" ]] || {
+  printf 'lock-contention preflight invoked a mutating systemd action\n' >&2
+  exit 1
+}
+# PSI failure must retain the third (continuous-hit) window in its diagnostic
+# before returning non-zero, while still leaving every production/run path
+# untouched and emitting no receipt.
+preflight_residue_before=$preflight_residue_after
+rm -f -- "$ROOT/run/gate-fixture.calls"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_PREFLIGHT_PSI_VALUES=0,150000,300000,450000 \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --preflight-only --root "$ROOT" \
+  >/dev/null 2>"$ROOT/run/preflight-psi-failure.err"; then
+  printf 'read-only preflight accepted three continuous PSI threshold hits\n' >&2
+  exit 1
+fi
+grep -Fq 'delta_us=150000' "$ROOT/run/preflight-psi-failure.err"
+grep -Fq 'ratio=0.010000000' "$ROOT/run/preflight-psi-failure.err"
+grep -Fq 'consecutive_hits=3' "$ROOT/run/preflight-psi-failure.err"
+preflight_residue_after=$(find "$ROOT/data/monday/spool/binance-lob-rust-shadow" \
+  "$ROOT/data/monday/evidence/shadow-gates" "$ROOT/run/monday/rust-lob-gate" \
+  "$ROOT/run/systemd/system" -mindepth 1 -print 2>/dev/null | LC_ALL=C sort || true)
+[[ $preflight_residue_after == "$preflight_residue_before" ]] || {
+  printf 'failed PSI preflight left run-scoped residue\n' >&2
+  exit 1
+}
+[[ $(monday_sha256_file "$preflight_lock_path") == "$preflight_lock_sha" ]] || {
+  printf 'failed PSI preflight changed the existing lock file\n' >&2
+  exit 1
+}
+[[ ! -s "$ROOT/run/gate-fixture.calls" ]] || {
+  printf 'failed PSI preflight invoked a mutating systemd action\n' >&2
+  exit 1
+}
+# A failed identity check must fail before any write as well.  c1 carries a
+# different payload than the direct legacy production P0 and is rejected
+# before preflight sampling or any run-scoped setup.
+preflight_residue_before=$preflight_residue_after
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c1" --preflight-only --root "$ROOT" \
+  >/dev/null 2>"$ROOT/run/preflight-failure.err"; then
+  printf 'read-only preflight accepted a mismatched direct payload\n' >&2
+  exit 1
+fi
+preflight_residue_after=$(find "$ROOT/data/monday/spool/binance-lob-rust-shadow" \
+  "$ROOT/data/monday/evidence/shadow-gates" "$ROOT/run/monday/rust-lob-gate" \
+  "$ROOT/run/systemd/system" -mindepth 1 -print 2>/dev/null | LC_ALL=C sort || true)
+[[ $preflight_residue_after == "$preflight_residue_before" ]] || {
+  printf 'failed read-only preflight left run-scoped residue\n' >&2
+  exit 1
+}
+
 gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
   --from-controller direct --candidate-controller "$c0" --root "$ROOT")
@@ -1860,6 +2029,10 @@ grep -Fq 'timeout_seconds=3600' "$operator" || {
   printf 'LOB Gate operator timeout is not capped at 3600 seconds\n' >&2
   exit 1
 }
+grep -Fq 'timeout_seconds=300' "$operator" || {
+  printf 'LOB Gate preflight operator timeout is not capped at 300 seconds\n' >&2
+  exit 1
+}
 candidate=$(printf 'b%.0s' {1..64})
 operator_json=$(MONDAY_CONTROL_PLANE_DRY_RUN=1 "$operator" gate \
   --instance i-fixture --from-controller "$c1" \
@@ -1867,7 +2040,24 @@ operator_json=$(MONDAY_CONTROL_PLANE_DRY_RUN=1 "$operator" gate \
 jq -e --arg controller "$candidate" \
   '.operation == "gate" and .controller == $controller
    and (.command | contains(("/opt/monday/releases/binance-lob-controller/" + $controller)))
-   and .production_changed == false' <<<"$operator_json" >/dev/null
+   and (.command | contains("--preflight-only") | not)
+   and .preflight_only == false and .production_changed == false' <<<"$operator_json" >/dev/null
+operator_preflight_json=$(MONDAY_CONTROL_PLANE_DRY_RUN=1 "$operator" gate \
+  --instance i-fixture --from-controller "$c1" \
+  --candidate-controller "$candidate" --preflight-only)
+jq -e --arg controller "$candidate" \
+  '.operation == "gate" and .controller == $controller
+   and .preflight_only == true and .production_changed == false
+   and (.command | contains(("/opt/monday/releases/binance-lob-controller/" + $controller)))
+   and (.command | contains("--preflight-only"))' \
+  <<<"$operator_preflight_json" >/dev/null
+if MONDAY_CONTROL_PLANE_DRY_RUN=1 "$operator" cutover \
+  --instance i-fixture --from direct --to "$candidate" \
+  --gate-receipt /data/gate.json --gate-sha256 "$candidate" --preflight-only \
+  >/dev/null 2>&1; then
+  printf 'operator accepted --preflight-only for a non-Gate operation\n' >&2
+  exit 1
+fi
 if MONDAY_CONTROL_PLANE_DRY_RUN=1 "$operator" unknown >/dev/null 2>&1; then
   printf 'operator accepted an unknown operation\n' >&2
   exit 1

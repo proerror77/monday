@@ -6,7 +6,7 @@ export LC_ALL=C
 usage() {
   printf '%s\n' \
     "Usage: ${0##*/} release --instance i-... --uri oss://... --payload <64 hex> --source <git sha>" \
-    "       ${0##*/} gate --instance i-... --from-controller <sha|direct> --candidate-controller <64 hex>" \
+    "       ${0##*/} gate --instance i-... --from-controller <sha|direct> --candidate-controller <64 hex> [--preflight-only]" \
     "       ${0##*/} cutover --instance i-... --from <sha|direct> --to <64 hex> --gate-receipt /path --gate-sha256 <64 hex>" \
     "       ${0##*/} restore --instance i-... --controller <64 hex>" \
     "       ${0##*/} readback --instance i-... --controller <64 hex> --transition-receipt /path --receipt-sha256 <64 hex>" \
@@ -39,6 +39,7 @@ gate_sha=
 controller=
 transition_receipt=
 receipt_sha=
+preflight_only=false
 region=${REGION_ID:-ap-northeast-1}
 profile=${ALIYUN_LOCAL_PROFILE:-default}
 
@@ -57,6 +58,9 @@ while (($#)); do
     --controller) controller=${2:-}; shift 2 ;;
     --transition-receipt) transition_receipt=${2:-}; shift 2 ;;
     --receipt-sha256) receipt_sha=${2:-}; shift 2 ;;
+    --preflight-only)
+      [[ $operation == gate ]] || die '--preflight-only is only valid for gate'
+      preflight_only=true; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage; exit 2 ;;
   esac
@@ -92,9 +96,15 @@ case "$operation" in
     hex64 "$to" || die 'gate requires --candidate-controller <64 hex>'
     controller=${to,,}; from_controller=${from_controller,,}
     host_script=host-rust-lob-shadow-gate.sh
-    command_name=monday-rust-lob-shadow-gate
-    timeout_seconds=3600
+    if [[ $preflight_only == true ]]; then
+      command_name=monday-rust-lob-shadow-preflight
+      timeout_seconds=300
+    else
+      command_name=monday-rust-lob-shadow-gate
+      timeout_seconds=3600
+    fi
     remote_args=(--from-controller "$from_controller" --candidate-controller "$controller")
+    [[ $preflight_only == true ]] && remote_args+=(--preflight-only)
     ;;
   cutover)
     if [[ $from != direct ]] && ! hex64 "$from"; then
@@ -140,8 +150,10 @@ command_content=$(printf '%s\n' "$remote_script" | base64 | tr -d '\n')
 if [[ ${MONDAY_CONTROL_PLANE_DRY_RUN:-0} == 1 ]]; then
   jq -cn --arg operation "$operation" --arg instance "$instance" \
     --arg controller "$controller" --arg command "$remote_script" \
+    --argjson preflight_only "$preflight_only" \
     '{operation:$operation,instance:$instance,controller:$controller,
-      command:$command,production_changed:($operation == "cutover" or $operation == "restore")}'
+      command:$command,preflight_only:$preflight_only,
+      production_changed:($operation == "cutover" or $operation == "restore")}'
   exit 0
 fi
 
