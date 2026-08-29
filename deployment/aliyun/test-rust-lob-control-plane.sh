@@ -453,8 +453,7 @@ preflight_residue_after=$(find "$ROOT/data/monday/spool/binance-lob-rust-shadow"
   printf 'read-only preflight invoked a mutating systemd action\n' >&2
   exit 1
 }
-# A lease left by the retired controller must be recovered by that controller
-# before this Gate can trust the operator-owned production envelope.
+# An unresolved lease left by the retired controller still blocks this Gate.
 legacy_lease="$ROOT/run/monday/rust-lob-gate/bootstrap-slice-lease-20260829T000000Z-1.json"
 mkdir -p "${legacy_lease%/*}"
 printf '{}\n' >"$legacy_lease"
@@ -470,6 +469,64 @@ grep -Fq 'unresolved legacy production-envelope lease blocks Gate' \
   cat "$ROOT/run/preflight-legacy-lease.err" >&2
   exit 1
 }
+# A terminal marker alone is not audit evidence.  The complete run-scoped
+# record must validate before it can stop blocking a new Gate.
+jq -cn '{schema:"monday.rust_lob_bootstrap_slice_lease.v1",applied:true,restored:true}' \
+  >"$legacy_lease"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --preflight-only --root "$ROOT" \
+  >"$ROOT/run/preflight-incomplete-terminal-lease.err" 2>&1; then
+  printf 'read-only preflight accepted an incomplete terminal legacy lease\n' >&2
+  exit 1
+fi
+grep -Fq 'unresolved legacy production-envelope lease blocks Gate' \
+  "$ROOT/run/preflight-incomplete-terminal-lease.err" || {
+  cat "$ROOT/run/preflight-incomplete-terminal-lease.err" >&2
+  exit 1
+}
+legacy_run=20260829T000000Z-1
+legacy_gate_script="$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/host-rust-lob-shadow-gate.sh"
+legacy_recovery_service="monday-rust-lob-gate-${legacy_run}-lease-recovery.service"
+legacy_recovery_timer="monday-rust-lob-gate-${legacy_run}-lease-recovery.timer"
+jq -cn --arg run "$legacy_run" --arg slice "$production_slice_asset" \
+  --arg controller "$c0" --arg gate_script "$legacy_gate_script" \
+  --arg gate_script_sha "$(monday_sha256_file "$legacy_gate_script")" \
+  --arg recovery_service "$legacy_recovery_service" \
+  --arg recovery_timer "$legacy_recovery_timer" \
+  '{schema:"monday.rust_lob_bootstrap_slice_lease.v1",run_id:$run,slice:$slice,
+    mode:"temporary-bootstrap",before_memory_high:"infinity",before_memory_max:"infinity",
+    before_parent_control_group:("/system.slice/" + $slice),
+    before_parent_memory_current_bytes:0,before_parent_memory_anon_bytes:0,
+    requested_memory_high:"3072M",requested_memory_max:"3584M",
+    candidate_controller_sha256:$controller,gate_script:$gate_script,
+    gate_script_sha256:$gate_script_sha,gate_pid:1,gate_starttime:1,
+    recovery_service:$recovery_service,recovery_timer:$recovery_timer,
+    applied:true,restored:true}' >"$legacy_lease"
+if ! MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --preflight-only --root "$ROOT" \
+  >"$ROOT/run/preflight-terminal-v1-lease.json" 2>&1; then
+  cat "$ROOT/run/preflight-terminal-v1-lease.json" >&2
+  exit 1
+fi
+jq -c --arg timer monday-collector-health.timer --arg service monday-collector-health.service '
+  .schema = "monday.rust_lob_bootstrap_slice_lease.v2"
+  | .bootstrap_monitor_containment = {
+      required:true,timer:$timer,service:$service,
+      before_timer:{unit:$timer,load_state:"loaded",active_state:"active",sub_state:"waiting",unit_file_state:"enabled"},
+      before_service:{unit:$service,load_state:"loaded",active_state:"inactive",sub_state:"dead",unit_file_state:"static"},
+      pause_applied:true,timer_restored:true,service_was_noninactive:false,service_quiesced:true
+    }
+' "$legacy_lease" >"${legacy_lease}.tmp"
+mv -f -- "${legacy_lease}.tmp" "$legacy_lease"
+if ! MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --preflight-only --root "$ROOT" \
+  >"$ROOT/run/preflight-terminal-v2-lease.json" 2>&1; then
+  cat "$ROOT/run/preflight-terminal-v2-lease.json" >&2
+  exit 1
+fi
 rm -f -- "$legacy_lease"
 # An absent lock is a fail-closed preflight error and must not be recreated.
 mv -f -- "$preflight_lock_path" "$preflight_lock_path.missing"
