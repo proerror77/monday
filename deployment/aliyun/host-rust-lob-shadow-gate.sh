@@ -1467,12 +1467,27 @@ resource_monitor_start() {
   ) &
   resource_monitor_pid=$!
 }
+resource_monitor_breach_cause() {
+  local cause=unknown
+  if [[ -r $tmp_dir/resource-monitor-breach ]]; then
+    IFS= read -r cause <"$tmp_dir/resource-monitor-breach" || cause=unknown
+  fi
+  case "$cause" in
+    fixture-resource-breach|memory-breach|production-identity-drift|production-snapshot-invalid|psi-regressed|psi-stop-rule) ;;
+    *) cause=unknown ;;
+  esac
+  printf '%s\n' "$cause"
+}
 resource_monitor_stop() {
-  local phase=$resource_monitor_phase ended samples max_available current_available breach required phase_max parent_pid parent_starttime
+  local phase=$resource_monitor_phase ended samples max_available current_available breach required phase_max parent_pid parent_starttime cause
   local parent_current child_sum growth
   [[ -n ${resource_monitor_pid:-} ]] || return 0
   if [[ $TEST_ONLY == true ]]; then
     breach=false; [[ -f $tmp_dir/resource-monitor-breach ]] && breach=true
+    if [[ $breach == true ]]; then
+      cause=$(resource_monitor_breach_cause)
+      printf 'resource monitor breached during %s: %s\n' "${phase:-unknown}" "$cause" >&2
+    fi
     resource_monitor_pid=; resource_monitor_phase=; resource_monitor_control=
     [[ $breach == false ]] || return 1
     return 0
@@ -1490,6 +1505,10 @@ resource_monitor_stop() {
   child_sum=${resource_phase_child_sum[$phase]:-0}
   growth=${resource_phase_growth[$phase]:-0}
   breach=false; [[ -f $tmp_dir/resource-monitor-breach ]] && breach=true
+  if [[ $breach == true ]]; then
+    cause=$(resource_monitor_breach_cause)
+    printf 'resource monitor breached during %s: %s\n' "${phase:-unknown}" "$cause" >&2
+  fi
   resource_monitor_pid=; resource_monitor_phase=; resource_monitor_control=
   [[ $breach == false ]] || return 1
   resource_samples=$(jq -cn --argjson prior "$resource_samples" --arg phase "$phase" --arg ended "$ended" \
@@ -1672,7 +1691,7 @@ write_run_json() {
 }
 cleanup() {
   local status=$? cleanup_failed=false; set +e
-  resource_monitor_stop >/dev/null 2>&1 || cleanup_failed=true
+  resource_monitor_stop >/dev/null || cleanup_failed=true
   for market in "${markets[@]}"; do
     [[ -n ${unit[$market]:-} ]] || continue
     systemctl stop "${unit[$market]}" >/dev/null 2>&1 || true

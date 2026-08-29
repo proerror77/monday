@@ -667,7 +667,7 @@ if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_RESOURCE_BREACH=1 \
 fi
 resource_breach_gate_pid=$(cat "$ROOT/run/resource-breach-gate.pid")
 rm -rf -- "$ROOT/proc/$resource_breach_gate_pid" "$ROOT/run/resource-breach-gate.pid"
-grep -Fq 'resource monitor breached during preflight' "$ROOT/run/resource-breach.err"
+grep -Fqx 'resource monitor breached during preflight: fixture-resource-breach' "$ROOT/run/resource-breach.err"
 resource_breach_lease_after=$(find "$ROOT/run/monday/rust-lob-gate" \
   -maxdepth 1 -type f -name 'bootstrap-slice-lease-*.json' -print 2>/dev/null | LC_ALL=C sort || true)
 resource_breach_new_lease=$(comm -13 <(printf '%s\n' "$resource_breach_lease_before") \
