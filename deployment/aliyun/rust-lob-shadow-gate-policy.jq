@@ -271,7 +271,8 @@ and (.production_memory | . as $pm
             and (.before_timer | valid_health_unit_state("monday-collector-health.timer")
               and .load_state == "loaded"
               and .active_state == "active")
-            and (.before_service | valid_health_unit_state("monday-collector-health.service"))
+            and (.before_service | valid_health_unit_state("monday-collector-health.service")
+              and .active_state != "failed")
           else
             .required == false
             and .pause_applied == false
