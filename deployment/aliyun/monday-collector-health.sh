@@ -168,6 +168,7 @@ FEE_UPLOAD_SERVICE=binance-fee-upload.service
 POLY_RAW_OPS_GATE='polymarket-raw-ops-gate@.service'
 POLY_RAW_OPS_GATE_RUN_ROOT=/run/monday/polymarket-raw-ops-gates
 POLY_RAW_OPS_GATE_CONTROL_LOCK="$POLY_RAW_OPS_GATE_RUN_ROOT/control.lock"
+CONTROL_PLANE_LOCK=/run/lock/monday-rust-lob-control-plane.lock
 if [ "${MONDAY_COLLECTOR_HEALTH_TEST_MODE:-0}" = 1 ]; then
   test_root=${MONDAY_COLLECTOR_HEALTH_TEST_ROOT:-}
   case "$test_root" in
@@ -183,6 +184,7 @@ if [ "${MONDAY_COLLECTOR_HEALTH_TEST_MODE:-0}" = 1 ]; then
   esac
   POLY_RAW_OPS_GATE_RUN_ROOT="$test_root/run/monday/polymarket-raw-ops-gates"
   POLY_RAW_OPS_GATE_CONTROL_LOCK="$POLY_RAW_OPS_GATE_RUN_ROOT/control.lock"
+  CONTROL_PLANE_LOCK="$test_root/run/lock/monday-rust-lob-control-plane.lock"
 elif [ -n "${MONDAY_COLLECTOR_HEALTH_TEST_ROOT:-}" ]; then
   printf 'collector-health test root requires explicit test mode\n' >&2
   exit 2
@@ -219,6 +221,10 @@ recovery_root_owner_uid=0
 recovery_hft_owner_uid=''
 recovery_hft_group_gid=''
 delay_gate_json='{}'
+journald_coordination_json='{}'
+journald_coordination_status=error
+journald_coordination_reason=''
+journalctl_calls=0
 disk_json='{}'
 mount_json='{}'
 state_lines=""
@@ -1145,6 +1151,7 @@ check_delay_gate() {
   # delay-gate evidence could not be inspected.
   unit=$1
   label=$2
+  journalctl_calls=$((journalctl_calls + 1))
   journal_out=$(journalctl -u "$unit" --since "$DELAY_GATE_WINDOW" --no-pager 2>/dev/null)
   journal_rc=$?
   trips=$(printf '%s\n' "$journal_out" \
@@ -1155,7 +1162,11 @@ check_delay_gate() {
   elif [ "$trips" -gt 0 ]; then
     record_warning "$label: $trips delay-gate trip(s) in last 15 minutes"
   fi
-  dobj=$(jq -n --argjson t "$trips" '{trips_15m: $t}')
+  if [ "$journal_rc" -eq 0 ]; then
+    dobj=$(jq -n --argjson t "$trips" '{trips_15m: $t, observed: true}')
+  else
+    dobj=$(jq -n '{trips_15m: null, observed: false, skipped_reason: "journal_query_failed"}')
+  fi
   delay_gate_json=$(jq -n --argjson base "$delay_gate_json" --arg k "$unit" --argjson v "$dobj" \
     '$base + {($k): $v}')
 }
@@ -1163,6 +1174,7 @@ check_delay_gate() {
 check_recent_snapshot_failures() {
   unit=$1
   label=$2
+  journalctl_calls=$((journalctl_calls + 1))
   journal_out=$(journalctl -u "$unit" --since "$FEE_FAILURE_WINDOW" --no-pager 2>/dev/null)
   journal_rc=$?
   failures=$(printf '%s\n' "$journal_out" | grep -c 'Failed with result' || true)
@@ -1172,6 +1184,81 @@ check_recent_snapshot_failures() {
   elif [ "$failures" -gt 0 ]; then
     record_warning "$label: $failures recent snapshot failure(s)"
   fi
+}
+
+mark_delay_gate_skipped() {
+  unit=$1
+  reason=$2
+  dobj=$(jq -n --arg skipped_reason "$reason" \
+    '{trips_15m: null, observed: false, skipped_reason: $skipped_reason}')
+  delay_gate_json=$(jq -n --argjson base "$delay_gate_json" --arg k "$unit" \
+    --argjson v "$dobj" '$base + {($k): $v}')
+}
+
+run_journald_checks() {
+  # All four journal reads share one non-blocking shared lock. The lock is
+  # opened read-only and must already exist; this monitor never creates or
+  # truncates the control-plane lock.
+  journald_coordination_status=error
+  journald_coordination_reason=''
+  journalctl_calls=0
+
+  if [ -L "$CONTROL_PLANE_LOCK" ]; then
+    journald_coordination_reason=control_plane_lock_symlink
+  elif [ ! -e "$CONTROL_PLANE_LOCK" ]; then
+    journald_coordination_reason=control_plane_lock_missing
+  elif [ ! -f "$CONTROL_PLANE_LOCK" ]; then
+    journald_coordination_reason=control_plane_lock_not_regular
+  elif [ ! -r "$CONTROL_PLANE_LOCK" ]; then
+    journald_coordination_reason=control_plane_lock_unreadable
+  elif ! command -v flock >/dev/null 2>&1; then
+    journald_coordination_reason=flock_unavailable
+  else
+    journald_lock_group_ran=0
+    journald_flock_rc=3
+    {
+      journald_lock_group_ran=1
+      flock -s -n 9 2>/dev/null
+      journald_flock_rc=$?
+      if [ "$journald_flock_rc" -eq 0 ]; then
+        journald_coordination_status=shared
+        check_recent_snapshot_failures "$FEE_SPOT_SERVICE" "binance-fee-snapshot-spot.service"
+        check_recent_snapshot_failures "$FEE_USDM_SERVICE" "binance-fee-snapshot-usdm.service"
+        check_delay_gate "$ARCHIVER_SPOT" "binance-lob-archiver-production@spot"
+        check_delay_gate "$ARCHIVER_USDM" "binance-lob-archiver-production@usdm"
+      elif [ "$journald_flock_rc" -eq 1 ]; then
+        journald_coordination_status=busy
+        journald_coordination_reason=control_plane_busy
+      else
+        journald_coordination_reason=flock_error
+      fi
+    } 9<"$CONTROL_PLANE_LOCK" 2>/dev/null
+    if [ "$journald_lock_group_ran" -eq 0 ]; then
+      journald_coordination_status=error
+      journald_coordination_reason=control_plane_lock_open_failed
+    fi
+  fi
+
+  case "$journald_coordination_status" in
+    shared) ;;
+    busy)
+      record_warning 'journald coordination: shared control-plane lock is busy; skipped four journald checks'
+      mark_delay_gate_skipped "$ARCHIVER_SPOT" control_plane_busy
+      mark_delay_gate_skipped "$ARCHIVER_USDM" control_plane_busy
+      ;;
+    *)
+      record_breach "journald coordination: $journald_coordination_reason; skipped four journald checks"
+      mark_delay_gate_skipped "$ARCHIVER_SPOT" "$journald_coordination_reason"
+      mark_delay_gate_skipped "$ARCHIVER_USDM" "$journald_coordination_reason"
+      ;;
+  esac
+
+  journald_coordination_json=$(jq -n \
+    --arg status "$journald_coordination_status" \
+    --arg reason "$journald_coordination_reason" \
+    --argjson calls "$journalctl_calls" \
+    '{status: $status, shared_lock: ($status == "shared"), journalctl_calls: $calls,
+      reason: (if $reason == "" then null else $reason end)}')
 }
 
 write_state() {
@@ -1228,8 +1315,7 @@ check_timer "$FEE_USDM_TIMER" "binance-fee-snapshot-usdm.timer"
 check_oneshot_result "$FEE_USDM_SERVICE" "binance-fee-snapshot-usdm.service"
 check_timer "$FEE_UPLOAD_TIMER" "binance-fee-upload.timer"
 check_oneshot_result "$FEE_UPLOAD_SERVICE" "binance-fee-upload.service"
-check_recent_snapshot_failures "$FEE_SPOT_SERVICE" "binance-fee-snapshot-spot.service"
-check_recent_snapshot_failures "$FEE_USDM_SERVICE" "binance-fee-snapshot-usdm.service"
+run_journald_checks
 
 check_raw_ops_gate "$POLY_RAW_OPS_GATE" "polymarket-raw-ops-gate"
 
@@ -1254,9 +1340,6 @@ check_upload_lane "polymarket-reference-upload" "$SPOOL_ROOT/polymarket-referenc
 check_upload_lane "binance-fee-upload" "$SPOOL_ROOT/binance-fee" \
   1 "$FEE_SUCCESS_MAX_AGE" "$FEE_PENDING_MAX" "$FEE_PENDING_MAX_AGE" lake
 
-check_delay_gate "$ARCHIVER_SPOT" "binance-lob-archiver-production@spot"
-check_delay_gate "$ARCHIVER_USDM" "binance-lob-archiver-production@usdm"
-
 write_state
 
 if [ "$breach_count" -gt 0 ]; then
@@ -1271,8 +1354,8 @@ if [ "$JSON_MODE" -eq 1 ]; then
   checks_json=$(jq -n --argjson disk "$disk_json" --argjson mount "$mount_json" \
     --argjson units "$units_json" --argjson health "$health_json" \
     --argjson uploads "$uploads_json" --argjson queue "$recovery_queue_json" \
-    --argjson delay "$delay_gate_json" \
-    '{disk: $disk, mount: $mount, units: $units, health: $health, uploads: $uploads, recovery_queue: $queue, delay_gate: $delay}')
+    --argjson delay "$delay_gate_json" --argjson journald "$journald_coordination_json" \
+    '{disk: $disk, mount: $mount, units: $units, health: $health, uploads: $uploads, recovery_queue: $queue, delay_gate: $delay, journald_coordination: $journald}')
   jq -n --argjson ok "$ok_str" --arg checked "$CHECKED_AT" \
     --argjson breaches "$breaches_json" --argjson warnings "$warnings_json" \
     --argjson checks "$checks_json" \

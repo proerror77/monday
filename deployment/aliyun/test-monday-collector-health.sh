@@ -34,6 +34,9 @@ mkdir -p "$stub_dir" "$spool_root" "$state_dir"
 scenario="$test_root/scenario.tsv"
 out_file="$test_root/out"
 err_file="$test_root/err"
+control_plane_lock="$test_root/run/lock/monday-rust-lob-control-plane.lock"
+journal_calls_file="$test_root/journal.calls"
+flock_calls_file="$test_root/flock.calls"
 
 DF_TOTAL=196000000   # KiB, ~187 GiB (matches the ~196G host disk)
 DF_AVAIL_HEALTHY=117600000   # 60% free
@@ -74,6 +77,8 @@ json_query() {
 }
 
 run_health() {
+  : > "$journal_calls_file"
+  : > "$flock_calls_file"
   set +e
   env \
     STUB_SCENARIO="$scenario" \
@@ -83,6 +88,8 @@ run_health() {
     STUB_JOURNAL_TRIPS="${STUB_JOURNAL_TRIPS:-0}" \
     STUB_JOURNAL_FEE_FAILURES="${STUB_JOURNAL_FEE_FAILURES:-0}" \
     STUB_JOURNAL_FAIL="${STUB_JOURNAL_FAIL:-0}" \
+    STUB_JOURNAL_CALLS_FILE="$journal_calls_file" \
+    STUB_FLOCK_CALLS_FILE="$flock_calls_file" \
     STUB_FLOCK_HELD="${STUB_FLOCK_HELD:-0}" \
     STUB_FLOCK_ERROR="${STUB_FLOCK_ERROR:-0}" \
     STUB_LOCK_APPEAR="${STUB_LOCK_APPEAR:-0}" \
@@ -270,6 +277,8 @@ write_isolation_marker() {
 
 healthy_fixtures() {
   reset_spool
+  mkdir -p "$(dirname -- "$control_plane_lock")"
+  printf '%s\n' 'collector-health-control-lock-sentinel' > "$control_plane_lock"
   write_health spot 45 0 false synced
   write_health usdm 45 0 false synced
   write_upload "$spool_root/binance-lob/spot/upload-status.json" null null 0
@@ -400,6 +409,9 @@ EOF
 
 cat > "$stub_dir/journalctl" <<'EOF'
 #!/bin/sh
+if [ -n "${STUB_JOURNAL_CALLS_FILE:-}" ]; then
+  printf '%s\n' "$*" >> "$STUB_JOURNAL_CALLS_FILE"
+fi
 if [ "${STUB_JOURNAL_FAIL:-0}" = "1" ]; then
   printf 'journalctl: cannot access the journal\n' >&2
   exit 1
@@ -425,6 +437,13 @@ EOF
 
 cat > "$stub_dir/flock" <<'EOF'
 #!/bin/sh
+if [ -n "${STUB_FLOCK_CALLS_FILE:-}" ]; then
+  printf '%s\n' "$*" >> "$STUB_FLOCK_CALLS_FILE"
+fi
+case "$*" in
+  '-s -n 9' | '-n 9') ;;
+  *) exit 2 ;;
+esac
 if [ "${STUB_FLOCK_ERROR:-0}" = "1" ]; then
   exit 2
 fi
@@ -1132,7 +1151,15 @@ expect "json healthy: parses and shape valid" "$(json_query '
   and .checks.uploads["binance-fee-upload"].last_error == "null"
   and (.checks.uploads["bybit-options-upload"].last_success_age_seconds | type) == "number"
   and (.checks.delay_gate["binance-lob-archiver-production@spot.service"].trips_15m | type) == "number"
+  and .checks.delay_gate["binance-lob-archiver-production@spot.service"].observed == true
+  and .checks.journald_coordination.status == "shared"
+  and .checks.journald_coordination.shared_lock == true
+  and .checks.journald_coordination.journalctl_calls == 4
 '; echo $?)"
+journal_call_count=$(wc -l < "$journal_calls_file" | tr -d ' ')
+expect "json healthy: shared lock makes four journal calls" "$(if [ "$journal_call_count" = 4 ]; then echo 0; else echo 1; fi)"
+shared_flock_call_count=$(grep -Fxc -- '-s -n 9' "$flock_calls_file" || true)
+expect "json healthy: exact shared nonblocking flock" "$(if [ "$shared_flock_call_count" = 1 ]; then echo 0; else echo 1; fi)"
 
 # ---------------------------------------------------------------------------
 # 21. JSON output shape (warnings do not block ok:true)
@@ -1152,6 +1179,79 @@ expect "json warnings: ok:true with warnings" "$(json_query '
   and (.warnings | any(contains("at or below warning")))
   and (.warnings | any(contains("delay-gate trip")))
 '; echo $?)"
+
+# ---------------------------------------------------------------------------
+# 21b. Journald coordination: a busy/missing/indirect/error lock skips all
+#      four journal reads without creating or changing the lock.
+# ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+lock_sha_before=$(sha256sum "$control_plane_lock" | awk '{print $1}')
+lock_mtime_before=$(stat -c %Y "$control_plane_lock" 2>/dev/null || stat -f %m "$control_plane_lock")
+lock_contents_before=$(cat "$control_plane_lock")
+STUB_FLOCK_HELD=1
+run_health --json
+lock_sha_after=$(sha256sum "$control_plane_lock" | awk '{print $1}')
+lock_mtime_after=$(stat -c %Y "$control_plane_lock" 2>/dev/null || stat -f %m "$control_plane_lock")
+lock_contents_after=$(cat "$control_plane_lock")
+journal_call_count=$(wc -l < "$journal_calls_file" | tr -d ' ')
+shared_flock_call_count=$(grep -Fxc -- '-s -n 9' "$flock_calls_file" || true)
+expect "journald busy: exit 0" "$(rc_is 0; echo $?)"
+expect "journald busy: one warning and no breach" "$(json_query '.ok == true and (.warnings | map(select(contains("journald coordination: shared control-plane lock is busy"))) | length) == 1 and (.breaches | map(select(contains("journald coordination:"))) | length) == 0'; echo $?)"
+expect "journald busy: zero journal calls" "$(if [ "$journal_call_count" = 0 ]; then echo 0; else echo 1; fi)"
+expect "journald busy: skipped JSON and delay evidence" "$(json_query '
+  .ok == true
+  and .checks.journald_coordination.status == "busy"
+  and .checks.journald_coordination.reason == "control_plane_busy"
+  and .checks.journald_coordination.shared_lock == false
+  and .checks.journald_coordination.journalctl_calls == 0
+  and .checks.delay_gate["binance-lob-archiver-production@spot.service"].trips_15m == null
+  and .checks.delay_gate["binance-lob-archiver-production@spot.service"].observed == false
+  and .checks.delay_gate["binance-lob-archiver-production@spot.service"].skipped_reason == "control_plane_busy"
+  and .checks.delay_gate["binance-lob-archiver-production@usdm.service"].trips_15m == null
+  and .checks.delay_gate["binance-lob-archiver-production@usdm.service"].observed == false
+  and .checks.delay_gate["binance-lob-archiver-production@usdm.service"].skipped_reason == "control_plane_busy"
+'; echo $?)"
+expect "journald busy: lock hash unchanged" "$(if [ "$lock_sha_before" = "$lock_sha_after" ]; then echo 0; else echo 1; fi)"
+expect "journald busy: lock mtime unchanged" "$(if [ "$lock_mtime_before" = "$lock_mtime_after" ]; then echo 0; else echo 1; fi)"
+expect "journald busy: exact shared nonblocking flock" "$(if [ "$shared_flock_call_count" = 1 ]; then echo 0; else echo 1; fi)"
+expect "journald busy: lock sentinel unchanged" "$(if [ "$lock_contents_before" = "$lock_contents_after" ]; then echo 0; else echo 1; fi)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+rm -f "$control_plane_lock"
+run_health --json
+journal_call_count=$(wc -l < "$journal_calls_file" | tr -d ' ')
+expect "journald missing lock: exit 1" "$(rc_is 1; echo $?)"
+expect "journald missing lock: one coordination breach" "$(json_query '.ok == false and (.breaches | map(select(contains("journald coordination"))) | length) == 1 and .checks.journald_coordination.status == "error" and .checks.journald_coordination.reason == "control_plane_lock_missing" and .checks.journald_coordination.journalctl_calls == 0'; echo $?)"
+expect "journald missing lock: zero journal calls" "$(if [ "$journal_call_count" = 0 ]; then echo 0; else echo 1; fi)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+rm -f "$control_plane_lock"
+ln -s /dev/null "$control_plane_lock"
+run_health --json
+journal_call_count=$(wc -l < "$journal_calls_file" | tr -d ' ')
+expect "journald symlink lock: exit 1" "$(rc_is 1; echo $?)"
+expect "journald symlink lock: fail closed without reads" "$(json_query '.ok == false and .checks.journald_coordination.reason == "control_plane_lock_symlink" and .checks.journald_coordination.journalctl_calls == 0'; echo $?)"
+expect "journald symlink lock: zero journal calls" "$(if [ "$journal_call_count" = 0 ]; then echo 0; else echo 1; fi)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+STUB_FLOCK_ERROR=1
+run_health --json
+journal_call_count=$(wc -l < "$journal_calls_file" | tr -d ' ')
+expect "journald flock error: exit 1" "$(rc_is 1; echo $?)"
+expect "journald flock error: fail closed without reads" "$(json_query '.ok == false and .checks.journald_coordination.reason == "flock_error" and .checks.journald_coordination.journalctl_calls == 0'; echo $?)"
+expect "journald flock error: zero journal calls" "$(if [ "$journal_call_count" = 0 ]; then echo 0; else echo 1; fi)"
 
 # ---------------------------------------------------------------------------
 # 22. JSON output shape (breaching)
