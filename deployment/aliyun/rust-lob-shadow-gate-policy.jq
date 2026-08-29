@@ -49,11 +49,7 @@ def valid_health_unit_state($unit):
   and (.load_state | type == "string" and length > 0)
   and (.active_state | type == "string" and length > 0)
   and (.sub_state | type == "string" and length > 0)
-  and (.unit_file_state | type == "string" and length > 0)
-  and (.result | type == "string" and length > 0)
-  and (.exec_main_status | type == "string" and test("^[0-9]*$"))
-  and (.main_pid | type == "string" and test("^[0-9]+$"))
-  and (.n_restarts | type == "string" and test("^[0-9]+$"));
+  and (.unit_file_state | type == "string" and length > 0);
 
 def valid_production_asset_map($keys; $source_mode):
   type == "object"
@@ -263,9 +259,10 @@ and (.production_memory | . as $pm
           and .service == "monday-collector-health.service"
           and (.pause_applied | type == "boolean")
           and (.timer_restored | type == "boolean")
-          and (.service_was_active | type == "boolean")
+          and (.service_was_noninactive | type == "boolean")
           and (.service_quiesced | type == "boolean")
-          and (.service_was_active == (.before_service.active_state == "active"))
+          and (.service_was_noninactive
+            == ((.before_service.active_state // "inactive") != "inactive"))
           and (if $pm.slice_lease.mode == "temporary-bootstrap" then
             .required == true
             and .pause_applied == true
@@ -279,7 +276,7 @@ and (.production_memory | . as $pm
             .required == false
             and .pause_applied == false
             and .timer_restored == true
-            and .service_was_active == false
+            and .service_was_noninactive == false
             and .service_quiesced == true
             and .before_timer == null
             and .before_service == null

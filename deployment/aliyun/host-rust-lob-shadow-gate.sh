@@ -170,13 +170,9 @@ if [[ $TEST_ONLY == true ]]; then
   fixture_health_timer_state=${MONDAY_GATE_FIXTURE_HEALTH_TIMER_STATE:-active}
   fixture_health_timer_substate=${MONDAY_GATE_FIXTURE_HEALTH_TIMER_SUBSTATE:-waiting}
   fixture_health_timer_enabled=${MONDAY_GATE_FIXTURE_HEALTH_TIMER_ENABLED:-enabled}
-  fixture_health_timer_result=${MONDAY_GATE_FIXTURE_HEALTH_TIMER_RESULT:-success}
-  fixture_health_timer_status=${MONDAY_GATE_FIXTURE_HEALTH_TIMER_STATUS:-0}
   fixture_health_service_state=${MONDAY_GATE_FIXTURE_HEALTH_SERVICE_STATE:-inactive}
   fixture_health_service_substate=${MONDAY_GATE_FIXTURE_HEALTH_SERVICE_SUBSTATE:-dead}
   fixture_health_service_enabled=${MONDAY_GATE_FIXTURE_HEALTH_SERVICE_ENABLED:-static}
-  fixture_health_service_result=${MONDAY_GATE_FIXTURE_HEALTH_SERVICE_RESULT:-success}
-  fixture_health_service_status=${MONDAY_GATE_FIXTURE_HEALTH_SERVICE_STATUS:-0}
   fixture_production_memory_high=3221225472
   fixture_production_memory_max=3758096384
   if [[ ${MONDAY_GATE_FIXTURE_BOOTSTRAP_UNLIMITED:-0} == 1 ]]; then
@@ -199,7 +195,7 @@ if [[ $TEST_ONLY == true ]]; then
           "$COLLECTOR_HEALTH_TIMER")
             fixture_health_timer_state=active; fixture_health_timer_substate=waiting ;;
           "$COLLECTOR_HEALTH_SERVICE")
-            fixture_health_service_state=active; fixture_health_service_substate=running; fixture_health_service_result=success; fixture_health_service_status=0 ;;
+            fixture_health_service_state=active; fixture_health_service_substate=running ;;
           *) fixture_unit_state[$unit_name]=active ;;
         esac
         return 0 ;;
@@ -271,13 +267,9 @@ if [[ $TEST_ONLY == true ]]; then
               elif [[ $unit_name == "$COLLECTOR_HEALTH_SERVICE" ]]; then value=$fixture_health_service_enabled
               else value=static; fi ;;
             Result)
-              if [[ $unit_name == "$COLLECTOR_HEALTH_TIMER" ]]; then value=$fixture_health_timer_result
-              elif [[ $unit_name == "$COLLECTOR_HEALTH_SERVICE" ]]; then value=$fixture_health_service_result
-              else value=success; fi ;;
+              value=success ;;
             ExecMainStatus)
-              if [[ $unit_name == "$COLLECTOR_HEALTH_TIMER" ]]; then value=$fixture_health_timer_status
-              elif [[ $unit_name == "$COLLECTOR_HEALTH_SERVICE" ]]; then value=$fixture_health_service_status
-              else value=0; fi ;;
+              value=0 ;;
             NRestarts)
               if [[ $unit_name == binance-lob-archiver-production@* ]]; then value=${MONDAY_GATE_FIXTURE_PRODUCTION_RESTARTS:-8}
               elif [[ ${MONDAY_GATE_FIXTURE_FAIL_RESTART:-0} == 1 ]]; then value=1
@@ -446,34 +438,29 @@ health_unit_snapshot_json() {
   local unit=$1 output item key value
   local -A fields=()
   output=$(systemctl_show_many "$unit" \
-    'LoadState,ActiveState,SubState,UnitFileState,Result,ExecMainStatus,MainPID,NRestarts') \
+    'LoadState,ActiveState,SubState,UnitFileState') \
     || return 1
   output=${output%$'\n'}
   while IFS= read -r item; do
     [[ $item == *=* ]] || return 1
     key=${item%%=*}; value=${item#*=}
     case $key in
-      LoadState|ActiveState|SubState|UnitFileState|Result|ExecMainStatus|MainPID|NRestarts) ;;
+      LoadState|ActiveState|SubState|UnitFileState) ;;
       *) return 1 ;;
     esac
     [[ -z ${fields[$key]+x} ]] || return 1
     fields[$key]=$value
   done <<<"$output"
-  [[ ${#fields[@]} == 8 ]] || return 1
+  [[ ${#fields[@]} == 4 ]] || return 1
   [[ $unit == "$COLLECTOR_HEALTH_TIMER" || $unit == "$COLLECTOR_HEALTH_SERVICE" ]] || return 1
   [[ -n ${fields[LoadState]} && -n ${fields[ActiveState]} && -n ${fields[SubState]} \
-    && -n ${fields[UnitFileState]} && -n ${fields[Result]} \
-    && ${fields[ExecMainStatus]} =~ ^[0-9]*$ \
-    && ${fields[MainPID]} =~ ^[0-9]+$ && ${fields[NRestarts]} =~ ^[0-9]+$ ]] || return 1
+    && -n ${fields[UnitFileState]} ]] || return 1
   jq -cn \
     --arg unit "$unit" --arg load "${fields[LoadState]}" \
     --arg active "${fields[ActiveState]}" --arg sub "${fields[SubState]}" \
-    --arg enabled "${fields[UnitFileState]}" --arg result "${fields[Result]}" \
-    --arg status "${fields[ExecMainStatus]}" --arg pid "${fields[MainPID]}" \
-    --arg restarts "${fields[NRestarts]}" \
+    --arg enabled "${fields[UnitFileState]}" \
     '{unit:$unit,load_state:$load,active_state:$active,sub_state:$sub,
-      unit_file_state:$enabled,result:$result,exec_main_status:$status,
-      main_pid:$pid,n_restarts:$restarts}'
+      unit_file_state:$enabled}'
 }
 
 health_timer_state_matches() {
@@ -490,7 +477,7 @@ health_timer_state_matches() {
 # Restore the fixed health timer and quiesce the service from a persisted lease.
 # This helper is also called by the run-scoped recovery oneshot, before that
 # oneshot removes its own timer/service.  It is idempotent, never starts the
-# service, and never changes enablement or the recorded systemd Result.
+# service, and never changes enablement.
 restore_bootstrap_monitor_from_state() {
   local state=$1 required before_timer current
   required=$(jq -er '.bootstrap_monitor_containment.required' "$state") || return 1
@@ -501,7 +488,7 @@ restore_bootstrap_monitor_from_state() {
   # The health worker is quiesced for the bootstrap interval.  It is never
   # restarted by Gate/recovery: only the original active timer is restored.
   current=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
-  if [[ $(jq -er '.active_state' <<<"$current") == active ]]; then
+  if [[ $(jq -er '.active_state' <<<"$current") != inactive ]]; then
     systemctl stop "$COLLECTOR_HEALTH_SERVICE" >/dev/null 2>&1 || return 1
   fi
   current=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
@@ -510,7 +497,7 @@ restore_bootstrap_monitor_from_state() {
     systemctl start "$COLLECTOR_HEALTH_TIMER" >/dev/null 2>&1 || return 1
   else
     current=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_TIMER") || return 1
-    if [[ $(jq -er '.active_state' <<<"$current") == active ]]; then
+    if [[ $(jq -er '.active_state' <<<"$current") != inactive ]]; then
       systemctl stop "$COLLECTOR_HEALTH_TIMER" >/dev/null 2>&1 || return 1
     fi
   fi
@@ -583,11 +570,7 @@ recover_bootstrap_lease() {
       and (.load_state | type == "string" and length > 0)
       and (.active_state | type == "string" and length > 0)
       and (.sub_state | type == "string" and length > 0)
-      and (.unit_file_state | type == "string" and length > 0)
-      and (.result | type == "string" and length > 0)
-      and (.exec_main_status | type == "string" and test("^[0-9]*$"))
-      and (.main_pid | type == "string" and test("^[0-9]+$"))
-      and (.n_restarts | type == "string" and test("^[0-9]+$"));
+      and (.unit_file_state | type == "string" and length > 0);
     type == "object"
     and .schema == "monday.rust_lob_bootstrap_slice_lease.v2"
     and (.run_id | type == "string" and test("^[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*$"))
@@ -619,8 +602,8 @@ recover_bootstrap_lease() {
       and (.before_service | valid_health_snapshot($service))
       and (.pause_applied | type == "boolean")
       and (.timer_restored | type == "boolean")
-      and (.service_was_active | type == "boolean")
-      and (.service_was_active == (.before_service.active_state == "active"))
+      and (.service_was_noninactive | type == "boolean")
+      and (.service_was_noninactive == (.before_service.active_state != "inactive"))
       and (.service_quiesced | type == "boolean"))' "$state" >/dev/null \
     || die 'lease state schema is invalid'
   run=$(jq -er '.run_id' "$state") || die 'lease state run id is unavailable'
@@ -1206,7 +1189,9 @@ bootstrap_slice_lease_parent_anon=0
 bootstrap_monitor_required=false
 bootstrap_monitor_pause_applied=false
 bootstrap_monitor_timer_restored=true
-bootstrap_monitor_service_was_active=false
+# Audit whether the captured service state was anything other than inactive;
+# this is not a claim that the service remains stopped after the timer fires.
+bootstrap_monitor_service_was_noninactive=false
 bootstrap_monitor_service_quiesced=true
 bootstrap_monitor_timer_before_json=null
 bootstrap_monitor_service_before_json=null
@@ -1219,12 +1204,12 @@ build_bootstrap_monitor_containment() {
     --argjson before_service "$bootstrap_monitor_service_before_json" \
     --argjson pause_applied "$bootstrap_monitor_pause_applied" \
     --argjson timer_restored "$bootstrap_monitor_timer_restored" \
-    --argjson service_was_active "$bootstrap_monitor_service_was_active" \
+    --argjson service_was_noninactive "$bootstrap_monitor_service_was_noninactive" \
     --argjson service_quiesced "$bootstrap_monitor_service_quiesced" \
     '{required:$required,timer:$timer,service:$service,
       before_timer:$before_timer,before_service:$before_service,
       pause_applied:$pause_applied,timer_restored:$timer_restored,
-      service_was_active:$service_was_active,service_quiesced:$service_quiesced}') || return 1
+      service_was_noninactive:$service_was_noninactive,service_quiesced:$service_quiesced}') || return 1
 }
 capture_bootstrap_monitor_state() {
   local timer_state service_state
@@ -1235,9 +1220,9 @@ capture_bootstrap_monitor_state() {
   bootstrap_monitor_required=true
   bootstrap_monitor_pause_applied=false
   bootstrap_monitor_timer_restored=false
-  bootstrap_monitor_service_was_active=false
-  [[ $(jq -er '.active_state' <<<"$service_state") == active ]] \
-    && bootstrap_monitor_service_was_active=true
+  bootstrap_monitor_service_was_noninactive=false
+  [[ $(jq -er '.active_state' <<<"$service_state") != inactive ]] \
+    && bootstrap_monitor_service_was_noninactive=true
   bootstrap_monitor_service_quiesced=false
   bootstrap_monitor_timer_before_json=$timer_state
   bootstrap_monitor_service_before_json=$service_state
@@ -1246,20 +1231,19 @@ capture_bootstrap_monitor_state() {
 pause_bootstrap_monitor() {
   [[ $bootstrap_monitor_required == true ]] || return 0
   systemctl stop "$COLLECTOR_HEALTH_TIMER" >/dev/null 2>&1 || return 1
-  local timer_state service_state before_service_active
+  local timer_state service_state
   timer_state=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_TIMER") || return 1
   [[ $(jq -er '.active_state' <<<"$timer_state") == inactive ]] || return 1
-  before_service_active=$(jq -er '.active_state' <<<"$bootstrap_monitor_service_before_json") || return 1
   build_bootstrap_monitor_containment || return 1
   write_bootstrap_slice_lease_state || return 1
-  if [[ $before_service_active == active ]]; then
+  # Re-read after the timer stop: an in-flight timer callback may have left the
+  # service in any non-inactive state, not only the state captured at entry.
+  service_state=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
+  if [[ $(jq -er '.active_state' <<<"$service_state") != inactive ]]; then
     systemctl stop "$COLLECTOR_HEALTH_SERVICE" >/dev/null 2>&1 || return 1
-    service_state=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
-    [[ $(jq -er '.active_state' <<<"$service_state") == inactive ]] || return 1
-  else
-    service_state=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
-    [[ $(jq -er '.active_state' <<<"$service_state") == inactive ]] || return 1
   fi
+  service_state=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
+  [[ $(jq -er '.active_state' <<<"$service_state") == inactive ]] || return 1
   bootstrap_monitor_service_quiesced=true
   bootstrap_monitor_pause_applied=true
   build_bootstrap_monitor_containment || return 1
@@ -1268,7 +1252,7 @@ pause_bootstrap_monitor() {
 restore_bootstrap_monitor() {
   [[ $bootstrap_monitor_required == true ]] || {
     bootstrap_monitor_timer_restored=true
-    bootstrap_monitor_service_was_active=false
+    bootstrap_monitor_service_was_noninactive=false
     bootstrap_monitor_service_quiesced=true
     return 0
   }
@@ -1281,7 +1265,7 @@ restore_bootstrap_monitor() {
   # service_quiesced records this pause/restore transaction's inactive readback;
   # it does not claim a timer-triggered service remains inactive forever.
   current=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
-  if [[ $(jq -er '.active_state' <<<"$current") == active ]]; then
+  if [[ $(jq -er '.active_state' <<<"$current") != inactive ]]; then
     systemctl stop "$COLLECTOR_HEALTH_SERVICE" >/dev/null 2>&1 || return 1
   fi
   current=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1

@@ -364,18 +364,16 @@ jq -cS -n --arg run "$recovery_run" --arg slice "$production_slice_asset" \
     bootstrap_monitor_containment:{required:true,
       timer:"monday-collector-health.timer",service:"monday-collector-health.service",
       before_timer:{unit:"monday-collector-health.timer",load_state:"loaded",active_state:"active",
-        sub_state:"waiting",unit_file_state:"enabled",result:"success",exec_main_status:"0",
-        main_pid:"0",n_restarts:"0"},
-      before_service:{unit:"monday-collector-health.service",load_state:"loaded",active_state:"active",
-        sub_state:"running",unit_file_state:"static",result:"success",exec_main_status:"0",
-        main_pid:"0",n_restarts:"0"},
-      pause_applied:true,service_was_active:true,service_quiesced:false,
+        sub_state:"waiting",unit_file_state:"enabled"},
+      before_service:{unit:"monday-collector-health.service",load_state:"loaded",active_state:"activating",
+        sub_state:"start",unit_file_state:"static"},
+      pause_applied:true,service_was_noninactive:true,service_quiesced:false,
       timer_restored:false}}' >"$recovery_state"
 printf '[Unit]\n' >"$ROOT/run/systemd/system/$recovery_service"
 printf '[Timer]\n' >"$ROOT/run/systemd/system/$recovery_timer"
 rm -f -- "$ROOT/run/gate-fixture.calls"
 MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_RECOVERY_RUN="$recovery_run" \
-MONDAY_GATE_FIXTURE_HEALTH_SERVICE_STATE=active MONDAY_GATE_FIXTURE_HEALTH_SERVICE_SUBSTATE=running \
+MONDAY_GATE_FIXTURE_HEALTH_SERVICE_STATE=activating MONDAY_GATE_FIXTURE_HEALTH_SERVICE_SUBSTATE=start \
 MONDAY_GATE_FIXTURE_RECORD_CALLS=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --recover-bootstrap-lease \
   "$recovery_state" --root "$ROOT" >"$ROOT/recovery.out" 2>&1 || {
@@ -383,7 +381,7 @@ MONDAY_GATE_FIXTURE_RECORD_CALLS=1 MONDAY_ROOT="$ROOT" \
   exit 1
 }
 [[ $(jq -er '.restored' "$recovery_state") == true ]]
-jq -e '.bootstrap_monitor_containment.service_was_active == true
+jq -e '.bootstrap_monitor_containment.service_was_noninactive == true
   and .bootstrap_monitor_containment.service_quiesced == true
   and .bootstrap_monitor_containment.timer_restored == true' "$recovery_state" >/dev/null
 [[ ! -e "$ROOT/run/systemd/system/$recovery_service" && ! -e "$ROOT/run/systemd/system/$recovery_timer" ]]
@@ -444,12 +442,10 @@ jq -cS -n --arg run "$recovery_alive_run" --arg slice "$production_slice_asset" 
     bootstrap_monitor_containment:{required:true,
       timer:"monday-collector-health.timer",service:"monday-collector-health.service",
       before_timer:{unit:"monday-collector-health.timer",load_state:"loaded",active_state:"active",
-        sub_state:"waiting",unit_file_state:"enabled",result:"success",exec_main_status:"0",
-        main_pid:"0",n_restarts:"0"},
+        sub_state:"waiting",unit_file_state:"enabled"},
       before_service:{unit:"monday-collector-health.service",load_state:"loaded",active_state:"inactive",
-        sub_state:"dead",unit_file_state:"static",result:"success",exec_main_status:"0",
-        main_pid:"0",n_restarts:"0"},
-      pause_applied:true,service_was_active:false,service_quiesced:false,
+        sub_state:"dead",unit_file_state:"static"},
+      pause_applied:true,service_was_noninactive:false,service_quiesced:false,
       timer_restored:false}}' >"$recovery_alive_state"
 rm -f -- "$ROOT/run/gate-fixture.calls"
 MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_RECOVERY_RUN="$recovery_alive_run" \
@@ -755,7 +751,7 @@ jq -e '.mode == "temporary-bootstrap" and .restored == true
   and .bootstrap_monitor_containment.required == true
   and .bootstrap_monitor_containment.pause_applied == true
   and .bootstrap_monitor_containment.timer_restored == true
-  and .bootstrap_monitor_containment.service_was_active == false
+  and .bootstrap_monitor_containment.service_was_noninactive == false
   and .bootstrap_monitor_containment.service_quiesced == true
   and .bootstrap_monitor_containment.timer == "monday-collector-health.timer"
   and .bootstrap_monitor_containment.service == "monday-collector-health.service"' \
@@ -810,7 +806,7 @@ jq -e '.production_memory.slice_lease.mode == "temporary-bootstrap"
   and .production_memory.bootstrap_monitor_containment.required == true
   and .production_memory.bootstrap_monitor_containment.pause_applied == true
   and .production_memory.bootstrap_monitor_containment.timer_restored == true
-  and .production_memory.bootstrap_monitor_containment.service_was_active == false
+  and .production_memory.bootstrap_monitor_containment.service_was_noninactive == false
   and .production_memory.bootstrap_monitor_containment.service_quiesced == true
   and .checks.bootstrap_monitor_containment == true' "$gate" >/dev/null
 jq -e '.shadow_staging.aggregate_slice.cgroup
@@ -879,8 +875,8 @@ grep -Fq "V2 Gate spool preparation: $ROOT/data/monday/spool/binance-lob-rust-sh
 rm -f -- "$ROOT/run/gate-fixture.calls"
 MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_PATH_ONLY=1 \
 MONDAY_GATE_FIXTURE_BOOTSTRAP_UNLIMITED=1 MONDAY_GATE_FIXTURE_BOOTSTRAP_LEASE_USAGE=1 \
-MONDAY_GATE_FIXTURE_HEALTH_SERVICE_STATE=active \
-MONDAY_GATE_FIXTURE_HEALTH_SERVICE_SUBSTATE=running \
+MONDAY_GATE_FIXTURE_HEALTH_SERVICE_STATE=activating \
+MONDAY_GATE_FIXTURE_HEALTH_SERVICE_SUBSTATE=start \
 MONDAY_GATE_FIXTURE_RECORD_CALLS=1 MONDAY_ROOT="$ROOT" \
   bash -c '
     root=$1; shift
@@ -1330,7 +1326,7 @@ jq -e '.source_mode == "stable"
   and .production_memory.bootstrap_monitor_containment.required == false
   and .production_memory.bootstrap_monitor_containment.pause_applied == false
   and .production_memory.bootstrap_monitor_containment.timer_restored == true
-  and .production_memory.bootstrap_monitor_containment.service_was_active == false
+  and .production_memory.bootstrap_monitor_containment.service_was_noninactive == false
   and .production_memory.bootstrap_monitor_containment.service_quiesced == true
   and .production_memory.bootstrap_monitor_containment.before_timer == null
   and .production_memory.bootstrap_monitor_containment.before_service == null' \
