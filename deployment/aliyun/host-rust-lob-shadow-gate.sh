@@ -447,6 +447,24 @@ meminfo_bytes() {
   printf '%s\n' "$((value * 1024))"
 }
 monotonic_seconds() { if [[ $TEST_ONLY == true && ! -r "$PROC_ROOT/uptime" ]]; then printf '%s\n' "$(date +%s)"; else awk '{print int($1)}' "$PROC_ROOT/uptime"; fi; }
+preflight_psi_monotonic_sample_number=0
+io_psi_monotonic_us() {
+  local -a values=() value
+  if [[ $TEST_ONLY == true && $PREFLIGHT_ONLY == true \
+    && -n ${MONDAY_GATE_FIXTURE_PREFLIGHT_PSI_MONOTONIC_VALUES:-} ]]; then
+    IFS=, read -r -a values <<<"$MONDAY_GATE_FIXTURE_PREFLIGHT_PSI_MONOTONIC_VALUES"
+    value=${values[${preflight_psi_monotonic_sample_number:-0}]:-}
+    [[ $value =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+    printf '%s\n' "$value"
+  elif [[ $TEST_ONLY == true && ! -r "$PROC_ROOT/uptime" ]]; then
+    # Fixture roots intentionally omit /proc/uptime.  Advance one exact
+    # reference window per observed sample so the offline contract exercises
+    # the same elapsed-time gate without sleeping.
+    printf '%s\n' "$(( ${preflight_psi_monotonic_sample_number:-0} * IO_PSI_WINDOW_US ))"
+  else
+    awk '{printf "%.0f\n", $1 * 1000000}' "$PROC_ROOT/uptime"
+  fi
+}
 proc_starttime() {
   local pid=$1 stat_file
   [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
@@ -468,6 +486,13 @@ io_total_us() {
   else
     monday_io_full_psi_total_us "$PSI_SOURCE"
   fi
+}
+
+io_psi_window_transition() {
+  local previous=$1 current=$2 elapsed_us=$3 consecutive=$4
+  [[ $elapsed_us =~ ^[1-9][0-9]*$ && $elapsed_us -ge $IO_PSI_WINDOW_US ]] || return 3
+  monday_io_full_psi_window "$previous" "$current" "$elapsed_us" \
+    "$IO_PSI_WINDOW_US" "$IO_PSI_FULL_DELTA_LIMIT_US" "$consecutive"
 }
 systemctl_show() { systemctl show "$1" --property="$2" --value 2>/dev/null; }
 systemctl_show_many() { systemctl show "$1" --property="$2" 2>/dev/null; }
@@ -560,27 +585,39 @@ restore_bootstrap_monitor_from_state() {
 # without sleeping; production always sleeps for each full reference window.
 preflight_psi_windows='[]'
 sample_preflight_psi() {
-  local previous current transition delta ratio hit consecutive=0 i
+  local previous current previous_mono current_mono transition delta ratio hit consecutive=0 i elapsed_us
   preflight_psi_sample_number=0
+  preflight_psi_monotonic_sample_number=0
   previous=$(io_total_us) || return 1
+  previous_mono=$(io_psi_monotonic_us) || return 1
   for i in 1 2 3; do
-    preflight_psi_sample_number=$i
-    [[ $TEST_ONLY == true ]] || sleep "$IO_PSI_WINDOW_SECONDS"
-    current=$(io_total_us) || return 1
-    transition=$(monday_io_full_psi_window "$previous" "$current" \
-      "$IO_PSI_WINDOW_US" "$IO_PSI_WINDOW_US" "$IO_PSI_FULL_DELTA_LIMIT_US" \
-      "$consecutive") || return 1
+    while :; do
+      preflight_psi_sample_number=$((preflight_psi_sample_number + 1))
+      preflight_psi_monotonic_sample_number=$preflight_psi_sample_number
+      [[ $TEST_ONLY == true ]] || sleep "$IO_PSI_WINDOW_SECONDS"
+      current=$(io_total_us) || return 1
+      current_mono=$(io_psi_monotonic_us) || return 1
+      [[ $current_mono =~ ^(0|[1-9][0-9]*)$ && $previous_mono =~ ^(0|[1-9][0-9]*)$ \
+        && $current_mono -gt $previous_mono ]] || return 1
+      elapsed_us=$((current_mono - previous_mono))
+      (( elapsed_us >= IO_PSI_WINDOW_US )) || continue
+      transition=$(io_psi_window_transition "$previous" "$current" \
+        "$elapsed_us" "$consecutive") || return 1
+      break
+    done
     read -r delta ratio hit consecutive <<<"$transition"
     preflight_psi_windows=$(jq -cn --argjson values "$preflight_psi_windows" \
       --arg phase preflight --argjson delta "$delta" --argjson ratio "$ratio" \
       --argjson hit "$hit" --argjson consecutive "$consecutive" \
-      '$values + [{phase:$phase,stage:"calibration",delta_us:$delta,ratio:$ratio,hit:$hit,consecutive_hits:$consecutive}]') || return 1
+      --argjson elapsed "$elapsed_us" \
+      '$values + [{phase:$phase,stage:"calibration",delta_us:$delta,ratio:$ratio,
+        elapsed_us:$elapsed,window_us:$elapsed,hit:$hit,consecutive_hits:$consecutive}]') || return 1
     if [[ $hit == true && $consecutive -ge $IO_PSI_CONSECUTIVE_HIT_LIMIT ]]; then
-      printf 'read-only preflight PSI threshold exceeded: delta_us=%s ratio=%s consecutive_hits=%s\n' \
-        "$delta" "$ratio" "$consecutive" >&2
+      printf 'read-only preflight PSI threshold exceeded: elapsed_us=%s delta_us=%s ratio=%s consecutive_hits=%s\n' \
+        "$elapsed_us" "$delta" "$ratio" "$consecutive" >&2
       return 1
     fi
-    previous=$current
+    previous=$current; previous_mono=$current_mono
   done
 }
 
@@ -1655,6 +1692,8 @@ done
 host_memory_total=$(meminfo_bytes MemTotal) || die 'MemTotal is unavailable'; host_memory_available=$(meminfo_bytes MemAvailable) || die 'MemAvailable is unavailable'; host_swap_total=$(meminfo_bytes SwapTotal) || die 'SwapTotal is unavailable'
 
 resource_samples='[]'; psi_windows='[]'; resource_monitor_pid=; resource_monitor_control=; resource_monitor_log=; resource_monitor_phase=
+resource_monitor_psi_log=; resource_monitor_breach_seen=false; resource_monitor_breach_phase=
+resource_monitor_breach_diagnostic_json='null'; resource_monitor_teardown_failed=false
 strict_unit_seq=0
 oss_unit_seq=0
 declare -A resource_phase_required resource_phase_limit resource_phase_parent_current resource_phase_child_sum resource_phase_growth
@@ -1708,20 +1747,37 @@ verify_gate_worker_slice() {
     && ${fields[ControlGroup]:-} == "/$GATE_WORKER_SLICE" ]] || return 1
   gate_worker_slice_control_group=${fields[ControlGroup]}
 }
+resource_monitor_record_breach() {
+  local phase=$1 cause=$2 elapsed_us=${3:-0} delta_us=${4:-0} ratio=${5:-0} consecutive_hits=${6:-0}
+  local temporary
+  [[ -n ${tmp_dir:-} && -d $tmp_dir ]] || return 1
+  printf '%s\n' "$cause" >"$tmp_dir/resource-monitor-breach" || return 1
+  temporary="$tmp_dir/resource-monitor-breach.json.tmp"
+  jq -cn --arg phase "$phase" --arg cause "$cause" \
+    --argjson elapsed_us "$elapsed_us" --argjson delta_us "$delta_us" \
+    --argjson ratio "$ratio" --argjson consecutive_hits "$consecutive_hits" \
+    '{schema:"monday.rust_lob_shadow_gate_resource_breach.v1",authoritative:false,
+      phase:$phase,cause:$cause,elapsed_us:$elapsed_us,delta_us:$delta_us,
+      ratio:$ratio,consecutive_hits:$consecutive_hits}' >"$temporary" || return 1
+  chmod 0640 "$temporary" || return 1
+  mv -f -- "$temporary" "$tmp_dir/resource-monitor-breach.json"
+}
 resource_monitor_identity_guard() {
   local snapshot=$1 snapshot_identity
   if [[ -z $snapshot ]] || ! monday_validate_lob_production_snapshot "$snapshot" 2>/dev/null; then
-    printf 'production-snapshot-invalid\n' >"$tmp_dir/resource-monitor-breach"
+    resource_monitor_record_breach "${resource_monitor_phase:-unknown}" \
+      production-snapshot-invalid 0 0 0 0 || true
     return 1
   fi
   snapshot_identity=$(monday_lob_production_snapshot_identity "$snapshot" 2>/dev/null || true)
   if [[ -z $snapshot_identity || $snapshot_identity != "$production_snapshot_identity_json" ]]; then
-    printf 'production-identity-drift\n' >"$tmp_dir/resource-monitor-breach"
+    resource_monitor_record_breach "${resource_monitor_phase:-unknown}" \
+      production-identity-drift 0 0 0 0 || true
     return 1
   fi
 }
 resource_monitor_start() {
-  local phase=$1 phase_max=$2 initial_available initial_psi parent_pid parent_starttime
+  local phase=$1 phase_max=$2 initial_available initial_psi initial_psi_mono parent_pid parent_starttime
   resource_monitor_phase=$phase
   record_resource "$phase" "$phase_max"
   verify_gate_worker_slice || die "run-scoped Gate worker slice is not an exact live envelope before $phase"
@@ -1735,23 +1791,31 @@ resource_monitor_start() {
       resource_monitor_identity_guard "$snapshot" || die "production identity drifted before $phase"
     fi
     if [[ ${MONDAY_GATE_FIXTURE_RESOURCE_BREACH:-0} == 1 && $phase == preflight ]]; then
-      printf 'fixture-resource-breach\n' >"$tmp_dir/resource-monitor-breach"
+      resource_monitor_record_breach "$phase" fixture-resource-breach 0 0 0 0 || die 'could not record fixture resource breach'
+      resource_monitor_pid=fixture-resource-monitor
+    elif [[ ${MONDAY_GATE_FIXTURE_RESOURCE_STOP_FAILURE:-0} == 1 && $phase == preflight ]]; then
       resource_monitor_pid=fixture-resource-monitor
     fi
     return 0
   fi
   resource_monitor_control="$tmp_dir/resource-monitor-$phase.running"
   resource_monitor_log="$tmp_dir/resource-monitor-$phase.tsv"
+  resource_monitor_psi_log="$tmp_dir/resource-monitor-$phase.psi.ndjson"
   : >"$resource_monitor_control"; : >"$resource_monitor_log"
+  : >"$resource_monitor_psi_log"
   initial_available=$(meminfo_bytes MemAvailable) || die 'MemAvailable became unavailable during Gate'
   initial_psi=$(io_total_us 2>/dev/null || printf 0)
+  initial_psi_mono=$(io_psi_monotonic_us) || die 'I/O PSI monotonic clock is unavailable during Gate'
   printf '%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$initial_available" "$initial_psi" >"$resource_monitor_log"
   parent_pid=$$
   parent_starttime=$(proc_starttime "$parent_pid") || die 'resource monitor parent starttime is unavailable'
   printf '%s %s\n' "$parent_pid" "$parent_starttime" >"$tmp_dir/resource-monitor-$phase.parent"
   (
-    local previous_psi=$initial_psi available current_psi consecutive_hits=0 delta current_parent_starttime
-    local snapshot
+    local last_psi=$initial_psi window_start_psi=$initial_psi
+    local window_start_mono=$initial_psi_mono current_mono elapsed_us
+    local available current_psi current_parent_starttime transition delta ratio hit consecutive_hits=0
+    local snapshot window_start_at current_at
+    window_start_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     while [[ -e $resource_monitor_control ]]; do
       current_parent_starttime=$(proc_starttime "$parent_pid" 2>/dev/null || true)
       if ! kill -0 "$parent_pid" 2>/dev/null || [[ -z $current_parent_starttime || $current_parent_starttime != "$parent_starttime" ]]; then
@@ -1760,6 +1824,7 @@ resource_monitor_start() {
       fi
       available=$(meminfo_bytes MemAvailable 2>/dev/null || printf 0)
       current_psi=$(io_total_us 2>/dev/null || printf 0)
+      current_mono=$(io_psi_monotonic_us 2>/dev/null || true)
       printf '%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$available" "$current_psi" >>"$resource_monitor_log"
       snapshot=$(capture_production_snapshot 2>/dev/null || true)
       if ! resource_monitor_identity_guard "$snapshot"; then
@@ -1767,27 +1832,53 @@ resource_monitor_start() {
         break
       fi
       if (( available < HOST_MEMORY_RESERVE_BYTES )); then
-        printf 'memory-breach\n' >"$tmp_dir/resource-monitor-breach"
+        resource_monitor_record_breach "$phase" memory-breach 0 0 0 "$consecutive_hits" || true
         kill -TERM "$parent_pid" 2>/dev/null || true
         break
       fi
-      if (( current_psi < previous_psi )); then
-        printf 'psi-regressed\n' >"$tmp_dir/resource-monitor-breach"
+      if [[ ! $current_mono =~ ^(0|[1-9][0-9]*)$ ]] || (( current_mono <= window_start_mono )); then
+        resource_monitor_record_breach "$phase" psi-regressed 0 0 0 "$consecutive_hits" || true
         kill -TERM "$parent_pid" 2>/dev/null || true
         break
       fi
-      delta=$((current_psi - previous_psi))
-      if (( delta * 3 >= IO_PSI_FULL_DELTA_LIMIT_US )); then
-        consecutive_hits=$((consecutive_hits + 1))
-      else
-        consecutive_hits=0
-      fi
-      if (( consecutive_hits >= IO_PSI_CONSECUTIVE_HIT_LIMIT )); then
-        printf 'psi-stop-rule\n' >"$tmp_dir/resource-monitor-breach"
+      elapsed_us=$((current_mono - window_start_mono))
+      if (( current_psi < last_psi )); then
+        resource_monitor_record_breach "$phase" psi-regressed "$elapsed_us" 0 0 "$consecutive_hits" || true
         kill -TERM "$parent_pid" 2>/dev/null || true
         break
       fi
-      previous_psi=$current_psi
+      if (( elapsed_us >= IO_PSI_WINDOW_US )); then
+        current_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        transition=$(io_psi_window_transition "$window_start_psi" "$current_psi" \
+          "$elapsed_us" "$consecutive_hits") || {
+          resource_monitor_record_breach "$phase" psi-regressed "$elapsed_us" 0 0 "$consecutive_hits" || true
+          kill -TERM "$parent_pid" 2>/dev/null || true
+          break
+        }
+        read -r delta ratio hit consecutive_hits <<<"$transition"
+        jq -cn --arg phase "$phase" --arg stage runtime \
+          --arg started_at "$window_start_at" --arg finished_at "$current_at" \
+          --argjson previous_total_us "$window_start_psi" \
+          --argjson current_total_us "$current_psi" --argjson delta_us "$delta" \
+          --argjson elapsed_us "$elapsed_us" --argjson window_us "$elapsed_us" \
+          --argjson ratio "$ratio" --argjson hit "$hit" \
+          --argjson consecutive_hits "$consecutive_hits" \
+          '{phase:$phase,stage:$stage,started_at:$started_at,finished_at:$finished_at,
+            previous_total_us:$previous_total_us,current_total_us:$current_total_us,
+            delta_us:$delta_us,elapsed_us:$elapsed_us,window_us:$window_us,
+            ratio:$ratio,hit:$hit,consecutive_hits:$consecutive_hits}' \
+          >>"$resource_monitor_psi_log" || true
+        if [[ $hit == true && $consecutive_hits -ge $IO_PSI_CONSECUTIVE_HIT_LIMIT ]]; then
+          resource_monitor_record_breach "$phase" psi-stop-rule "$elapsed_us" \
+            "$delta" "$ratio" "$consecutive_hits" || true
+          kill -TERM "$parent_pid" 2>/dev/null || true
+          break
+        fi
+        window_start_psi=$current_psi
+        window_start_mono=$current_mono
+        window_start_at=$current_at
+      fi
+      last_psi=$current_psi
       sleep 5
     done
   ) &
@@ -1804,15 +1895,41 @@ resource_monitor_breach_cause() {
   esac
   printf '%s\n' "$cause"
 }
+resource_monitor_breach_diagnostic() {
+  local diagnostic="$tmp_dir/resource-monitor-breach.json"
+  if [[ -s $diagnostic ]] && jq -e 'type == "object" and .authoritative == false' \
+    "$diagnostic" >/dev/null 2>&1; then
+    jq -c . "$diagnostic"
+  else
+    printf '%s\n' '{"authoritative":false,"elapsed_us":0,"delta_us":0,"ratio":0,"consecutive_hits":0}'
+  fi
+}
+resource_monitor_capture_breach() {
+  local phase=$1 cause diagnostic
+  diagnostic=$(resource_monitor_breach_diagnostic) || return 1
+  resource_monitor_breach_seen=true
+  resource_monitor_breach_phase=$phase
+  resource_monitor_breach_diagnostic_json=$diagnostic
+  cause=$(resource_monitor_breach_cause)
+  printf 'resource monitor breached during %s: %s\n' "$phase" "$cause" >&2
+  printf 'resource monitor diagnostic: elapsed_us=%s delta_us=%s ratio=%s consecutive_hits=%s\n' \
+    "$(jq -r '.elapsed_us // 0' <<<"$diagnostic")" \
+    "$(jq -r '.delta_us // 0' <<<"$diagnostic")" \
+    "$(jq -r '.ratio // 0' <<<"$diagnostic")" \
+    "$(jq -r '.consecutive_hits // 0' <<<"$diagnostic")" >&2
+}
 resource_monitor_stop() {
-  local phase=$resource_monitor_phase ended samples max_available current_available breach required phase_max parent_pid parent_starttime cause
+  local phase=$resource_monitor_phase ended samples max_available current_available breach required phase_max parent_pid parent_starttime
   local parent_current child_sum growth
   [[ -n ${resource_monitor_pid:-} ]] || return 0
   if [[ $TEST_ONLY == true ]]; then
     breach=false; [[ -f $tmp_dir/resource-monitor-breach ]] && breach=true
     if [[ $breach == true ]]; then
-      cause=$(resource_monitor_breach_cause)
-      printf 'resource monitor breached during %s: %s\n' "${phase:-unknown}" "$cause" >&2
+      resource_monitor_capture_breach "${phase:-unknown}" || true
+    elif [[ ${MONDAY_GATE_FIXTURE_RESOURCE_STOP_FAILURE:-0} == 1 ]]; then
+      resource_monitor_teardown_failed=true
+      resource_monitor_pid=; resource_monitor_phase=; resource_monitor_control=
+      return 2
     fi
     resource_monitor_pid=; resource_monitor_phase=; resource_monitor_control=
     [[ $breach == false ]] || return 1
@@ -1832,10 +1949,14 @@ resource_monitor_stop() {
   growth=${resource_phase_growth[$phase]:-0}
   breach=false; [[ -f $tmp_dir/resource-monitor-breach ]] && breach=true
   if [[ $breach == true ]]; then
-    cause=$(resource_monitor_breach_cause)
-    printf 'resource monitor breached during %s: %s\n' "${phase:-unknown}" "$cause" >&2
+    resource_monitor_capture_breach "${phase:-unknown}" || true
   fi
   resource_monitor_pid=; resource_monitor_phase=; resource_monitor_control=
+  if [[ -s ${resource_monitor_psi_log:-} ]]; then
+    local runtime_psi_windows
+    runtime_psi_windows=$(jq -sc '.' "$resource_monitor_psi_log" 2>/dev/null || printf '[]')
+    psi_windows=$(jq -cn --argjson prior "$psi_windows" --argjson runtime "$runtime_psi_windows" '$prior + $runtime')
+  fi
   [[ $breach == false ]] || return 1
   resource_samples=$(jq -cn --argjson prior "$resource_samples" --arg phase "$phase" --arg ended "$ended" \
     --argjson samples "${samples:-0}" --argjson max "${max_available:-0}" --argjson current "${current_available:-0}" \
@@ -1857,17 +1978,48 @@ resource_monitor_stop() {
   unset "resource_phase_required[$phase]" "resource_phase_limit[$phase]" \
     "resource_phase_parent_current[$phase]" "resource_phase_child_sum[$phase]" "resource_phase_growth[$phase]"
 }
+resource_monitor_stop_or_die() {
+  local phase=$1
+  if resource_monitor_stop; then
+    return 0
+  fi
+  if [[ ${resource_monitor_breach_seen:-false} == true ]]; then
+    die "resource monitor breached during $phase"
+  fi
+  die "resource monitor teardown failed during $phase"
+}
 calibrate_psi() {
-  local phase=$1 previous current transition delta ratio hit consecutive=0 i
+  local phase=$1 previous current previous_mono current_mono transition delta ratio hit consecutive=0 i elapsed_us
   if [[ $TEST_ONLY == true ]]; then
     fixture_last_calibrated_phase=$phase
     psi_windows=$(jq -cn --argjson values "$psi_windows" --arg phase "$phase" '$values + [{phase:$phase,stage:"fixture",hit:false,consecutive_hits:0}]'); return
   fi
   previous=$(io_total_us) || die "I/O PSI unavailable before $phase"
-  for i in 1 2 3; do sleep "$IO_PSI_WINDOW_SECONDS"; current=$(io_total_us) || die "I/O PSI unavailable during $phase"
-    transition=$(monday_io_full_psi_window "$previous" "$current" "$IO_PSI_WINDOW_US" "$IO_PSI_WINDOW_US" "$IO_PSI_FULL_DELTA_LIMIT_US" "$consecutive") || die 'I/O PSI moved backwards'
-    read -r delta ratio hit consecutive <<<"$transition"; [[ $hit == false || $consecutive -lt $IO_PSI_CONSECUTIVE_HIT_LIMIT ]] || die 'I/O PSI threshold exceeded'
-    psi_windows=$(jq -cn --argjson values "$psi_windows" --arg phase "$phase" --argjson delta "$delta" --argjson ratio "$ratio" --argjson hit "$hit" --argjson consecutive "$consecutive" '$values + [{phase:$phase,stage:"calibration",delta_us:$delta,ratio:$ratio,hit:$hit,consecutive_hits:$consecutive}]'); previous=$current
+  previous_mono=$(io_psi_monotonic_us) || die "monotonic clock is unavailable before $phase"
+  for i in 1 2 3; do
+    while :; do
+      sleep "$IO_PSI_WINDOW_SECONDS"
+      current=$(io_total_us) || die "I/O PSI unavailable during $phase"
+      current_mono=$(io_psi_monotonic_us) || die "monotonic clock is unavailable during $phase"
+      [[ $current_mono =~ ^(0|[1-9][0-9]*)$ && $previous_mono =~ ^(0|[1-9][0-9]*)$ \
+        && $current_mono -gt $previous_mono ]] || die 'I/O PSI monotonic clock moved backwards'
+      elapsed_us=$((current_mono - previous_mono))
+      (( elapsed_us >= IO_PSI_WINDOW_US )) || continue
+      transition=$(io_psi_window_transition "$previous" "$current" \
+        "$elapsed_us" "$consecutive") || die 'I/O PSI moved backwards'
+      break
+    done
+    read -r delta ratio hit consecutive <<<"$transition"
+    psi_windows=$(jq -cn --argjson values "$psi_windows" --arg phase "$phase" \
+      --argjson delta "$delta" --argjson ratio "$ratio" --argjson hit "$hit" \
+      --argjson consecutive "$consecutive" --argjson elapsed "$elapsed_us" \
+      '$values + [{phase:$phase,stage:"calibration",delta_us:$delta,ratio:$ratio,
+        elapsed_us:$elapsed,window_us:$elapsed,hit:$hit,consecutive_hits:$consecutive}]') \
+      || die 'could not record I/O PSI calibration window'
+    if [[ $hit == true && $consecutive -ge $IO_PSI_CONSECUTIVE_HIT_LIMIT ]]; then
+      die "I/O PSI threshold exceeded: elapsed_us=$elapsed_us delta_us=$delta ratio=$ratio consecutive_hits=$consecutive"
+    fi
+    previous=$current; previous_mono=$current_mono
   done
 }
 assert_host_memory_reserve() {
@@ -2015,9 +2167,29 @@ write_run_json() {
     '{schema:"monday.rust_lob_shadow_gate_run.v3",control_plane_version:2,run_id:$run,candidate_controller_sha256:$controller,candidate_payload_sha256:$payload,candidate_runtime_contract_sha256:$runtime,run_spool:$spool,worker_slice:{name:$worker_slice,sha256:$worker_slice_sha,cgroup:$worker_slice_cgroup,memory_high_bytes:$worker_high,memory_max_bytes:$worker_max},segment_seconds:120,requested_duration_seconds:$requested,health_settle_seconds:$settle,resource_admission:$resources,io_full_psi_windows:$psi}' >"$run_json.tmp"
   chmod 0640 "$run_json.tmp"; mv -f -- "$run_json.tmp" "$run_json"
 }
+write_resource_monitor_failure() {
+  local cleanup_failed=$1 temporary diagnostic
+  [[ ${resource_monitor_breach_seen:-false} == true && -d ${evidence_dir:-} ]] || return 0
+  diagnostic=${resource_monitor_breach_diagnostic_json:-null}
+  temporary="$evidence_dir/resource-monitor-failure.json.tmp.$$"
+  jq -cn --arg phase "${resource_monitor_breach_phase:-unknown}" \
+    --argjson diagnostic "$diagnostic" --argjson cleanup_failed "$cleanup_failed" \
+    '{schema:"monday.rust_lob_shadow_gate_resource_breach.v1",authoritative:false,
+      phase:$phase,cause:($diagnostic.cause // "unknown"),
+      elapsed_us:($diagnostic.elapsed_us // 0),delta_us:($diagnostic.delta_us // 0),
+      ratio:($diagnostic.ratio // 0),consecutive_hits:($diagnostic.consecutive_hits // 0),
+      cleanup_failed:$cleanup_failed,diagnostic:$diagnostic}' >"$temporary" || return 1
+  chmod 0640 "$temporary" || return 1
+  mv -f -- "$temporary" "$evidence_dir/resource-monitor-failure.json"
+}
 cleanup() {
-  local status=$? cleanup_failed=false; set +e
-  resource_monitor_stop >/dev/null || cleanup_failed=true
+  local status=$? cleanup_failed=false monitor_status=0; set +e
+  resource_monitor_stop >/dev/null || monitor_status=$?
+  if (( monitor_status != 0 )) && \
+    [[ ${resource_monitor_breach_seen:-false} != true || $monitor_status != 1 ]]; then
+    cleanup_failed=true
+  fi
+  [[ ${resource_monitor_teardown_failed:-false} == true ]] && cleanup_failed=true
   for market in "${markets[@]}"; do
     [[ -n ${unit[$market]:-} ]] || continue
     systemctl stop "${unit[$market]}" >/dev/null 2>&1 || true
@@ -2028,6 +2200,7 @@ cleanup() {
   systemctl stop "$GATE_WORKER_SLICE" >/dev/null 2>&1 || true
   rm -f -- "$gate_worker_slice_file"
   [[ $TEST_ONLY == true ]] || systemctl daemon-reload >/dev/null 2>&1 || cleanup_failed=true
+  write_resource_monitor_failure "$cleanup_failed" || cleanup_failed=true
   rm -rf -- "$gate_unit_dir" "$run_spool" "$tmp_dir"
   [[ $gate_finished == true ]] || rm -f -- "$passed_marker" "$evidence_dir/.PASSED.sha256.tmp"
   [[ $cleanup_failed == false ]] || { printf 'run-scoped Gate cleanup was incomplete\n' >&2; status=1; }; exit "$status"
@@ -2078,7 +2251,7 @@ if [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_PATH_ONLY:-0} == 1 ]]; then
 fi
 
 calibrate_psi preflight; resource_monitor_start preflight "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; \
-  resource_monitor_stop || die 'resource monitor breached during preflight'; write_run_json
+  resource_monitor_stop_or_die preflight; write_run_json
 if [[ $FROM_CONTROLLER != direct ]]; then
   for asset in "${SHADOW_ASSETS[@]}"; do
     [[ ${saved_state[$asset]} == present || ${saved_state[$asset]} == projection ]] || die "before shadow asset is absent: $asset"
@@ -2405,9 +2578,9 @@ run_market_gate_phase() {
       frozen_catalog_sha256:$catalog,max_health_silence_seconds:$silence,samples:$samples}')
   observation=$(( $(monotonic_seconds) + GATE_DURATION_SECONDS )); while (( $(monotonic_seconds) < observation )); do validate_observation_sample "$market"; assert_host_memory_reserve; [[ $(systemctl_value "$market" NRestarts) == 0 ]] || die "$market restarted"; [[ $(systemctl_value "$market" MainPID) == "$pid" ]] || die "$market MainPID changed"; [[ $TEST_ONLY == true ]] && break; sleep 15; done
   phase_runtime["$market"]=$GATE_DURATION_SECONDS; systemctl stop "${unit[$market]}"; systemctl_active "${unit[$market]}" && die "$market shadow remained active"; \
-    resource_monitor_stop || die "resource monitor breached during shadow-$market"; \
+    resource_monitor_stop_or_die "shadow-$market"; \
     calibrate_psi "shadow-$market-tail"; resource_monitor_start "strict-verifier-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; \
-    verify_segments "$market"; resource_monitor_stop || die "resource monitor breached during strict-verifier-$market"
+    verify_segments "$market"; resource_monitor_stop_or_die "strict-verifier-$market"
 }
 DRAIN_ENV_KEYS=(
   MARKET DATASET SHARD_ID SYMBOLS DEPTH_MODE WS_SHARD_SIZE SNAPSHOT_LIMIT
@@ -2448,7 +2621,7 @@ run_candidate_drain() {
       --arg session "${phase_session[$market]}" \
       '{market:$market,dataset:$dataset,last_error:null,session_id:$session,uploaded_triplets:1}' \
       >"${spool_dir[$market]}/upload-status.json"
-    resource_monitor_stop || die "$market upload-drain resource monitor breached"
+    resource_monitor_stop_or_die "$market upload-drain"
     return 0
   fi
   systemctl reset-failed "${upload_unit[$market]}" >/dev/null 2>&1 || true
@@ -2456,7 +2629,7 @@ run_candidate_drain() {
     || { resource_monitor_stop || true; die "$market run-scoped upload drain failed"; }
   [[ $(systemctl show "${upload_unit[$market]}" --property=Result --value) == success ]] \
     || { resource_monitor_stop || true; die "$market run-scoped upload drain did not complete successfully"; }
-  resource_monitor_stop || die "$market upload-drain resource monitor breached"
+  resource_monitor_stop_or_die "$market upload-drain"
 }
 assert_spool_drained() {
   local market=$1 remaining
@@ -2608,7 +2781,7 @@ verify_oss_roundtrips() {
   fi
   market_observed_at_ns[$market]=$observed_cutoff_ns
   phase_oss[$market]=$count
-  resource_monitor_stop || die "$market OSS resource monitor breached"
+  resource_monitor_stop_or_die "$market OSS"
 }
 
 for market in "${markets[@]}"; do render_shadow_unit "$market"; done

@@ -703,9 +703,9 @@ read -r psi_delta psi_ratio psi_hit psi_count < <(monday_io_full_psi_window \
   printf 'PSI sub-threshold sample did not reset the continuous-hit count\n' >&2
   exit 1
 }
-# The runtime monitor samples every five seconds but applies the same 1%
-# reference ratio as the 15-second calibration: 49,999us is below the scaled
-# 50,000us boundary, while 50,000us is exactly a hit.
+# The shared ratio helper still supports arbitrary elapsed intervals for
+# callers that need the math.  The Gate adapter below refuses to adjudicate
+# any interval shorter than the 15-second reference window.
 read -r psi_delta psi_ratio psi_hit psi_count < <(monday_io_full_psi_window \
   0 49999 5000000 "$psi_window_us" "$psi_threshold_us" 0)
 [[ $psi_delta == 49999 && $psi_hit == false && $psi_count == 0 ]] || {
@@ -715,9 +715,16 @@ read -r psi_delta psi_ratio psi_hit psi_count < <(monday_io_full_psi_window \
 read -r psi_delta psi_ratio psi_hit psi_count < <(monday_io_full_psi_window \
   0 50000 5000000 "$psi_window_us" "$psi_threshold_us" 0)
 [[ $psi_delta == 50000 && $psi_hit == true && $psi_count == 1 ]] || {
-  printf 'five-second PSI sample rejected the exact scaled boundary\n' >&2
+  printf 'shared PSI ratio helper rejected the exact scaled boundary\n' >&2
   exit 1
 }
+gate_monitor_source=$(sed -n '/^resource_monitor_start()/,/^resource_monitor_breach_cause()/p' \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh")
+grep -Fq 'elapsed_us >= IO_PSI_WINDOW_US' <<<"$gate_monitor_source"
+if grep -Fq 'delta * 3' <<<"$gate_monitor_source"; then
+  printf 'resource monitor still adjudicates PSI on a five-second scaled delta\n' >&2
+  exit 1
+fi
 preflight_residue_before=$(find "$ROOT/data/monday/spool/binance-lob-rust-shadow" \
   "$ROOT/data/monday/evidence/shadow-gates" "$ROOT/run/monday/rust-lob-gate" \
   "$ROOT/run/systemd/system" -mindepth 1 -print 2>/dev/null | LC_ALL=C sort || true)
@@ -739,6 +746,27 @@ jq -e --arg runtime "$candidate_runtime_sha" \
    and (.checks.controller and .checks.from_controller and .checks.payload
      and .checks.runtime_contract and .checks.installed_bytes and .checks.psi_sampler)' \
   <<<"$preflight_output" >/dev/null
+# (a) Five-second observations are accumulated but never adjudicated.  Three
+# complete 15-second windows are formed from 5-second samples; the first
+# window is a hit, but later sub-threshold windows prevent a stop.
+preflight_subwindow_output=$(MONDAY_CONTROL_PLANE_TEST=1 \
+  MONDAY_GATE_FIXTURE_PREFLIGHT_PSI_VALUES=0,50000,100000,150000,160000,170000,180000,190000,200000,210000 \
+  MONDAY_GATE_FIXTURE_PREFLIGHT_PSI_MONOTONIC_VALUES=0,5000000,10000000,15000000,20000000,25000000,30000000,35000000,40000000,45000000 \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --preflight-only --root "$ROOT")
+jq -e '.io_full_psi_windows | length == 3
+  and all(.[]; .elapsed_us == 15000000 and .window_us == 15000000)
+  and (map(.consecutive_hits) | max) == 1' <<<"$preflight_subwindow_output" >/dev/null
+# (b) The threshold ratio uses the actual monotonic elapsed time, not a fixed
+# 15-second denominator (160,000us over 16 seconds is exactly 1%).
+preflight_elapsed_output=$(MONDAY_CONTROL_PLANE_TEST=1 \
+  MONDAY_GATE_FIXTURE_PREFLIGHT_PSI_VALUES=0,160000,170000,180000 \
+  MONDAY_GATE_FIXTURE_PREFLIGHT_PSI_MONOTONIC_VALUES=0,16000000,32000000,48000000 \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --preflight-only --root "$ROOT")
+jq -e '.io_full_psi_windows | length == 3
+  and all(.[]; .elapsed_us == 16000000)
+  and .[0].ratio == 0.01 and .[0].delta_us == 160000' <<<"$preflight_elapsed_output" >/dev/null
 [[ ! -e "$preflight_tmpdir_guard" ]] || {
   printf 'read-only preflight created a temporary directory\n' >&2
   exit 1
@@ -797,7 +825,7 @@ fi
   printf 'lock-contention preflight invoked a mutating systemd action\n' >&2
   exit 1
 }
-# PSI failure must retain the third (continuous-hit) window in its diagnostic
+# (c) PSI failure must retain the third (continuous-hit) window in its diagnostic
 # before returning non-zero, while still leaving every production/run path
 # untouched and emitting no receipt.
 preflight_residue_before=$preflight_residue_after
@@ -812,6 +840,7 @@ fi
 grep -Fq 'delta_us=150000' "$ROOT/run/preflight-psi-failure.err"
 grep -Fq 'ratio=0.010000000' "$ROOT/run/preflight-psi-failure.err"
 grep -Fq 'consecutive_hits=3' "$ROOT/run/preflight-psi-failure.err"
+grep -Fq 'elapsed_us=15000000' "$ROOT/run/preflight-psi-failure.err"
 preflight_residue_after=$(find "$ROOT/data/monday/spool/binance-lob-rust-shadow" \
   "$ROOT/data/monday/evidence/shadow-gates" "$ROOT/run/monday/rust-lob-gate" \
   "$ROOT/run/systemd/system" -mindepth 1 -print 2>/dev/null | LC_ALL=C sort || true)
@@ -846,7 +875,7 @@ preflight_residue_after=$(find "$ROOT/data/monday/spool/binance-lob-rust-shadow"
   exit 1
 }
 
-# A resource monitor breach during direct bootstrap must return to its caller
+# (d) A resource monitor breach during direct bootstrap must return to its caller
 # so EXIT cleanup can restore the temporary production lease and remove every
 # run-scoped writer path.  Keep the restored lease JSON as audit evidence, but
 # do not create a receipt or change the production pair/spool.
@@ -873,6 +902,10 @@ fi
 resource_breach_gate_pid=$(cat "$ROOT/run/resource-breach-gate.pid")
 rm -rf -- "$ROOT/proc/$resource_breach_gate_pid" "$ROOT/run/resource-breach-gate.pid"
 grep -Fqx 'resource monitor breached during preflight: fixture-resource-breach' "$ROOT/run/resource-breach.err"
+if grep -Fq 'run-scoped Gate cleanup was incomplete' "$ROOT/run/resource-breach.err"; then
+  printf 'primary resource breach was misreported as cleanup incomplete\n' >&2
+  exit 1
+fi
 resource_breach_lease_after=$(find "$ROOT/run/monday/rust-lob-gate" \
   -maxdepth 1 -type f -name 'bootstrap-slice-lease-*.json' -print 2>/dev/null | LC_ALL=C sort || true)
 resource_breach_new_lease=$(comm -13 <(printf '%s\n' "$resource_breach_lease_before") \
@@ -892,6 +925,13 @@ jq -e '.mode == "temporary-bootstrap" and .restored == true
   "$resource_breach_lease" >/dev/null
 resource_breach_run=$(jq -er '.run_id' "$resource_breach_lease")
 resource_breach_slice="mondayrustlobgate${resource_breach_run//[^0-9]/}.slice"
+resource_breach_diagnostic="$ROOT/data/monday/evidence/shadow-gates/$c0/$candidate_runtime_sha/runs/$resource_breach_run/resource-monitor-failure.json"
+jq -e '.schema == "monday.rust_lob_shadow_gate_resource_breach.v1"
+  and .authoritative == false and .phase == "preflight"
+  and .cause == "fixture-resource-breach"
+  and (.elapsed_us | type == "number") and (.delta_us | type == "number")
+  and (.ratio | type == "number") and (.consecutive_hits | type == "number")
+  and .cleanup_failed == false' "$resource_breach_diagnostic" >/dev/null
 [[ ! -e "$ROOT/run/monday/rust-lob-gate/$resource_breach_run" ]]
 [[ ! -e "$ROOT/data/monday/spool/binance-lob-rust-shadow/gate/$resource_breach_run" ]]
 [[ ! -e "$ROOT/run/systemd/system/$resource_breach_slice" ]]
@@ -922,6 +962,29 @@ fi
 [[ $(readlink -- "$ROOT/opt/monday/bin/binance-lob-archiver") == "$resource_breach_payload_before" ]]
 [[ $(monday_sha256_file "$production_spool_root/spot/upload-status.json") == "$production_spot_status_sha" ]]
 [[ $(monday_sha256_file "$production_spool_root/usdm/upload-status.json") == "$production_usdm_status_sha" ]]
+
+# (e) A teardown error remains distinct from a primary resource breach and is
+# reported as cleanup incomplete.  This fixture only fails the monitor stop
+# operation; the temporary bootstrap lease still has to be restored.
+rm -f -- "$ROOT/run/gate-fixture.calls"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_RESOURCE_STOP_FAILURE=1 \
+  MONDAY_GATE_FIXTURE_BOOTSTRAP_UNLIMITED=1 MONDAY_GATE_FIXTURE_BOOTSTRAP_LEASE_USAGE=1 \
+  MONDAY_GATE_FIXTURE_RECORD_CALLS=1 MONDAY_ROOT="$ROOT" \
+  bash -c '
+    root=$1; shift
+    mkdir -p "$root/proc/$$"
+    printf "1 fixture S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 4242\\n" >"$root/proc/$$/stat"
+    exec "$@"
+  ' _ "$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --root "$ROOT" >"$ROOT/run/resource-stop-failure.err" 2>&1; then
+  printf 'Gate accepted an injected resource monitor teardown failure\n' >&2
+  exit 1
+fi
+grep -Fq 'run-scoped Gate cleanup was incomplete' "$ROOT/run/resource-stop-failure.err"
+if grep -Fq 'resource monitor breached during' "$ROOT/run/resource-stop-failure.err"; then
+  printf 'teardown failure was misreported as a primary resource breach\n' >&2
+  exit 1
+fi
 
 gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_BOOTSTRAP_UNLIMITED=1 \
   MONDAY_GATE_FIXTURE_BOOTSTRAP_LEASE_USAGE=1 MONDAY_ROOT="$ROOT" \
