@@ -27,6 +27,7 @@ ROOT=${ROOT%/}; [[ -n $ROOT ]] || ROOT=/
 [[ $GATE_SHA =~ ^[a-f0-9]{64}$ ]] || die 'Gate receipt digest is invalid'
 [[ -n $GATE ]] || die 'Gate receipt is required'
 [[ $FROM != "$TO" ]] || die 'cutover requires distinct before and target controllers'
+readonly PRODUCTION_SLICE='system-binance\x2dlob\x2darchiver\x2dproduction.slice'
 TEST_ONLY=false; [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 ]] && TEST_ONLY=true
 PRODUCTION_HEALTH_WAIT_SECONDS=${MONDAY_CUTOVER_HEALTH_TIMEOUT_SECONDS:-240}
 PRODUCTION_HEALTH_POLL_SECONDS=${MONDAY_CUTOVER_HEALTH_POLL_SECONDS:-1}
@@ -124,7 +125,27 @@ if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
         return 3 ;;
       show)
         unit=$2
-        case "${3#--property=}" in
+        property=${3#--property=}; property=${property#--property=}
+        if [[ $property == 'MemoryHigh,MemoryMax,ControlGroup' && $unit == "$PRODUCTION_SLICE" ]]; then
+          printf 'verify-config %s\n' "$unit" >>"$fixture_calls"
+          if [[ ${MONDAY_CUTOVER_FIXTURE_BAD_CONFIG:-0} == 1 ]]; then
+            printf 'ControlGroup=/system.slice/wrong-production.slice\nMemoryMax=3758096385\nMemoryHigh=3221225472\n'
+          else
+            printf 'ControlGroup=/system.slice/system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice\nMemoryMax=3758096384\nMemoryHigh=3221225472\n'
+          fi
+          return 0
+        fi
+        if [[ $property == 'Slice,ControlGroup,MemoryMax' && $unit == binance-lob-archiver-production@* ]]; then
+          printf 'verify-membership %s\n' "$unit" >>"$fixture_calls"
+          market=${unit#*@}; market=${market%.service}
+          if [[ ${MONDAY_CUTOVER_FIXTURE_BAD_MEMBERSHIP:-0} == 1 && $market == spot ]]; then
+            printf 'MemoryMax=2684354561\nControlGroup=/system.slice/wrong.slice/%s\nSlice=wrong.slice\n' "$unit"
+          else
+            printf 'MemoryMax=2684354560\nControlGroup=/system.slice/system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice/%s\nSlice=system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice\n' "$unit"
+          fi
+          return 0
+        fi
+        case "$property" in
           LoadState) printf '%s\n' "${fixture_unit_load_state[$unit]:-loaded}" ;;
           ActiveState) [[ ${fixture_unit_state[$unit]:-inactive} == active ]] && printf 'active\n' || printf 'inactive\n' ;;
           SubState) [[ ${fixture_unit_state[$unit]:-inactive} == active ]] && printf 'running\n' || printf 'dead\n' ;;
@@ -606,10 +627,8 @@ if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
       || die 'could not clear the bootstrap production slice lease'
   fi
   systemctl daemon-reload || die 'daemon-reload failed after pair commit'
-  if [[ $TEST_ONLY == false ]]; then
-    monday_rust_lob_verify_systemd_production_slice "$ROOT" \
-      || die 'permanent production slice verification failed before start'
-  fi
+  monday_rust_lob_verify_systemd_production_slice_configured "$ROOT" \
+    || die 'permanent production slice verification failed before start'
   cutover_started_ns=$(date +%s%N)
   systemctl unmask binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service \
     || die 'could not unmask V2 production lanes'
@@ -621,6 +640,8 @@ if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
     || die 'USD-M did not start after pair commit'
   systemctl is-active --quiet binance-lob-archiver-production@spot.service || die 'Spot did not start after pair commit'
   systemctl is-active --quiet binance-lob-archiver-production@usdm.service || die 'USD-M did not start after pair commit'
+  monday_rust_lob_verify_systemd_production_membership "$ROOT" \
+    || die 'production child membership is not exact after start'
 else
   cutover_started_ns=0
 fi

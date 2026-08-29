@@ -213,11 +213,13 @@ if [[ $TEST_ONLY == true ]]; then
             MemoryCurrent) value=1048576 ;;
             MemoryPeak) value=1048576 ;;
             MemoryMax)
-              if [[ $unit_name == binance-lob-archiver-production@* ]]; then value=2684354560
+              if [[ $unit_name == "$PRODUCTION_SLICE" && ${MONDAY_GATE_FIXTURE_BOOTSTRAP_UNLIMITED:-0} == 1 ]]; then value=infinity
+              elif [[ $unit_name == binance-lob-archiver-production@* ]]; then value=2684354560
               elif [[ $unit_name == "$PRODUCTION_SLICE" ]]; then value=3758096384
               else value=1610612736; fi ;;
             MemoryHigh)
-              if [[ $unit_name == "$PRODUCTION_SLICE" ]]; then value=3221225472
+              if [[ $unit_name == "$PRODUCTION_SLICE" && ${MONDAY_GATE_FIXTURE_BOOTSTRAP_UNLIMITED:-0} == 1 ]]; then value=infinity
+              elif [[ $unit_name == "$PRODUCTION_SLICE" ]]; then value=3221225472
               else value=1342177280; fi ;;
             Slice) [[ $unit_name == binance-lob-archiver-production@* ]] && value=$PRODUCTION_SLICE || value=system.slice ;;
             ControlGroup)
@@ -375,6 +377,9 @@ recover_bootstrap_lease() {
     and .mode == "temporary-bootstrap"
     and (.before_memory_high | type == "string" and test("^(infinity|[0-9]+)$"))
     and (.before_memory_max | type == "string" and test("^(infinity|[0-9]+)$"))
+    and (.before_parent_control_group | type == "string" and . == ("/system.slice/" + $slice))
+    and (.before_parent_memory_current_bytes | type == "number" and floor == . and . >= 0 and . <= 3758096384)
+    and (.before_parent_memory_anon_bytes | type == "number" and floor == . and . >= 0 and . <= 3758096384)
     and .requested_memory_high == "3072M"
     and .requested_memory_max == "3584M"
     and (.candidate_controller_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
@@ -536,13 +541,15 @@ cgroup_child_path() {
 fixture_prepare_production_cgroup() {
   [[ $TEST_ONLY == true ]] || return 0
   local parent="$CGROUP_ROOT/system.slice/$PRODUCTION_SLICE" child unit market fixture_pid fixture_cgroup_pid
+  local fixture_parent_current=${MONDAY_GATE_FIXTURE_BOOTSTRAP_PARENT_CURRENT:-1101067264}
+  local fixture_parent_anon=${MONDAY_GATE_FIXTURE_BOOTSTRAP_PARENT_ANON:-317067264}
   mkdir -p "$parent"
   : >"$parent/cgroup.procs"
-  printf '1101067264\n' >"$parent/memory.current"
+  printf '%s\n' "$fixture_parent_current" >"$parent/memory.current"
   printf '5100000000\n' >"$parent/memory.peak"
   printf '3221225472\n' >"$parent/memory.high"
   printf '3758096384\n' >"$parent/memory.max"
-  printf 'anon 317067264\nfile 784000000\n' >"$parent/memory.stat"
+  printf 'anon %s\nfile 784000000\n' "$fixture_parent_anon" >"$parent/memory.stat"
   printf 'high 0\noom 0\noom_kill 0\n' >"$parent/memory.events"
   for market in spot usdm; do
     child="$parent/binance-lob-archiver-production@${market}.service"
@@ -925,6 +932,9 @@ bootstrap_slice_lease_gate_starttime=
 bootstrap_slice_lease_candidate_controller=
 bootstrap_slice_lease_gate_script=
 bootstrap_slice_lease_gate_script_sha256=
+bootstrap_slice_lease_parent_control_group=
+bootstrap_slice_lease_parent_current=0
+bootstrap_slice_lease_parent_anon=0
 write_bootstrap_slice_lease_state() {
   [[ -n ${bootstrap_slice_lease_state_file:-} ]] || return 1
   local temporary="${bootstrap_slice_lease_state_file}.tmp.$$"
@@ -933,6 +943,7 @@ write_bootstrap_slice_lease_state() {
     --arg mode "$bootstrap_slice_lease_mode" \
     --arg before_high "$bootstrap_slice_lease_before_high" \
     --arg before_max "$bootstrap_slice_lease_before_max" \
+    --arg parent_control_group "$bootstrap_slice_lease_parent_control_group" \
     --arg controller "$bootstrap_slice_lease_candidate_controller" \
     --arg gate_script "$bootstrap_slice_lease_gate_script" \
     --arg gate_script_sha "$bootstrap_slice_lease_gate_script_sha256" \
@@ -940,10 +951,15 @@ write_bootstrap_slice_lease_state() {
     --arg recovery_timer "${bootstrap_slice_lease_recovery_timer##*/}" \
     --argjson gate_pid "$bootstrap_slice_lease_gate_pid" \
     --argjson gate_starttime "$bootstrap_slice_lease_gate_starttime" \
+    --argjson parent_current "$bootstrap_slice_lease_parent_current" \
+    --argjson parent_anon "$bootstrap_slice_lease_parent_anon" \
     --argjson applied "$bootstrap_slice_lease_applied" \
     --argjson restored "$bootstrap_slice_lease_restored" \
     '{schema:"monday.rust_lob_bootstrap_slice_lease.v1",run_id:$run,slice:$slice,
       mode:$mode,before_memory_high:$before_high,before_memory_max:$before_max,
+      before_parent_control_group:$parent_control_group,
+      before_parent_memory_current_bytes:$parent_current,
+      before_parent_memory_anon_bytes:$parent_anon,
       requested_memory_high:"3072M",requested_memory_max:"3584M",
       candidate_controller_sha256:$controller,gate_script:$gate_script,
       gate_script_sha256:$gate_script_sha,gate_pid:$gate_pid,gate_starttime:$gate_starttime,
@@ -966,6 +982,44 @@ read_bootstrap_slice_limits() {
   done <<<"$output"
   [[ ${fields[MemoryHigh]+x} && ${fields[MemoryMax]+x} ]] || return 1
   printf '%s\t%s\n' "${fields[MemoryHigh]}" "${fields[MemoryMax]}"
+}
+read_bootstrap_slice_usage() {
+  local output item key value control_group parent_path current parent_stat anon
+  local -A fields=()
+  [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] \
+    && printf 'read-bootstrap-slice-usage\n' >>"$ROOT/run/gate-fixture.calls"
+  # The fixture must create the same direct cgroup files before this
+  # pre-mutation read; production uses the already-mounted cgroup tree.
+  [[ $TEST_ONLY == true ]] && fixture_prepare_production_cgroup
+  output=$(systemctl_show_many "$PRODUCTION_SLICE" 'ControlGroup') || return 1
+  output=${output%$'\n'}
+  while IFS= read -r item; do
+    [[ $item == *=* ]] || return 1
+    key=${item%%=*}; value=${item#*=}
+    [[ $key == ControlGroup ]] || return 1
+    [[ -z ${fields[$key]+x} ]] || return 1
+    fields[$key]=$value
+  done <<<"$output"
+  [[ ${#fields[@]} == 1 ]] || return 1
+  control_group=${fields[ControlGroup]:-}
+  [[ $control_group == "/system.slice/$PRODUCTION_SLICE" ]] || return 1
+  parent_path=$(cgroup_child_path "$control_group") || return 1
+  monday_path_direct "$parent_path" || return 1
+  current=$(cgroup_numeric_value "$parent_path/memory.current") || return 1
+  parent_stat=$(cgroup_memory_stat_json "$parent_path/memory.stat") || return 1
+  anon=$(jq -er '.anon' <<<"$parent_stat") || return 1
+  [[ $current =~ ^(0|[1-9][0-9]*)$ && $anon =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  if (( current > 3758096384 )); then
+    [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] \
+      && printf 'usage-over-cap-current\n' >>"$ROOT/run/gate-fixture.calls"
+    return 1
+  fi
+  if (( anon > 3758096384 )); then
+    [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] \
+      && printf 'usage-over-cap-anon\n' >>"$ROOT/run/gate-fixture.calls"
+    return 1
+  fi
+  printf '%s\t%s\t%s\n' "$control_group" "$current" "$anon"
 }
 install_bootstrap_lease_recovery() {
   [[ $TEST_ONLY == true ]] && return 0
@@ -1006,7 +1060,7 @@ cancel_bootstrap_lease_recovery() {
 }
 apply_bootstrap_slice_lease() {
   [[ $FROM_CONTROLLER == direct ]] || return 0
-  local limits before_high before_max
+  local limits before_high before_max usage parent_control parent_current parent_anon
   limits=$(read_bootstrap_slice_limits) || die 'production slice limits are unavailable before Gate'
   IFS=$'\t' read -r before_high before_max <<<"$limits"
   [[ $before_high =~ ^(infinity|[0-9]+)$ && $before_max =~ ^(infinity|[0-9]+)$ ]] \
@@ -1020,11 +1074,22 @@ apply_bootstrap_slice_lease() {
     bootstrap_slice_lease_restored=true
     return 0
   fi
-  [[ $TEST_ONLY != true ]] || die 'fixture production slice must expose the governed V2 limits'
+  if [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_BOOTSTRAP_LEASE_USAGE:-0} != 1 ]]; then
+    die 'fixture production slice must expose the governed V2 limits'
+  fi
   [[ $before_high == infinity || $before_high == 0 || $before_high == max ]] \
     || die 'direct bootstrap refuses an unexpected production MemoryHigh'
   [[ $before_max == infinity || $before_max == max ]] \
     || die 'direct bootstrap refuses an unexpected production MemoryMax'
+  # Read the exact production parent usage before arming recovery or changing
+  # either limit.  Current and anon are both bounded independently so a
+  # high-current legacy slice cannot be hidden behind a smaller anon value.
+  usage=$(read_bootstrap_slice_usage) \
+    || die 'direct bootstrap could not read the production slice usage before Gate'
+  IFS=$'\t' read -r parent_control parent_current parent_anon <<<"$usage"
+  bootstrap_slice_lease_parent_control_group=$parent_control
+  bootstrap_slice_lease_parent_current=$parent_current
+  bootstrap_slice_lease_parent_anon=$parent_anon
   # Mark the lease as pending before the mutating call so an abnormal exit
   # between set-property and the bookkeeping assignments still enters the
   # EXIT cleanup path with the original limits available for restoration.
@@ -1042,8 +1107,12 @@ apply_bootstrap_slice_lease() {
     || die 'candidate Gate script is not a direct file for lease recovery'
   bootstrap_slice_lease_gate_script_sha256=$(sha256_file "$bootstrap_slice_lease_gate_script") \
     || die 'could not record candidate Gate script identity for lease recovery'
+  [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] \
+    && printf 'write-lease-state\n' >>"$ROOT/run/gate-fixture.calls"
   write_bootstrap_slice_lease_state \
     || die 'could not persist the temporary production slice lease'
+  [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] \
+    && printf 'install-lease-recovery\n' >>"$ROOT/run/gate-fixture.calls"
   install_bootstrap_lease_recovery \
     || die 'could not arm automatic bootstrap lease recovery'
   systemctl set-property --runtime "$PRODUCTION_SLICE" \
@@ -1467,23 +1536,6 @@ done
 install -d -m 0750 "$EVIDENCE_ROOT" "$evidence_dir"
 install -d -m 0755 "$GATE_SYSTEMD_ROOT"
 ensure_run_spool_dir "$gate_unit_dir"
-# Install a run-scoped aggregate slice before any worker unit is loaded.  The
-# per-unit MemoryMax settings remain defense in depth, while this parent cap
-# prevents accidental overlap from exceeding the phase envelope.
-[[ ! -e $gate_worker_slice_file && ! -L $gate_worker_slice_file ]] \
-  || die 'run-scoped Gate worker slice already exists'
-printf '[Slice]\nMemoryHigh=1280M\nMemoryMax=1536M\n' >"$gate_worker_slice_file"
-chmod 0644 "$gate_worker_slice_file"
-[[ $(grep -Fxc 'MemoryHigh=1280M' "$gate_worker_slice_file" || true) -eq 1 \
-  && $(grep -Fxc 'MemoryMax=1536M' "$gate_worker_slice_file" || true) -eq 1 \
-  && $(grep -c '^' "$gate_worker_slice_file" || true) -eq 3 ]] \
-  || die 'run-scoped Gate worker slice envelope is invalid'
-gate_worker_slice_sha256=$(sha256_file "$gate_worker_slice_file")
-[[ $gate_worker_slice_sha256 =~ ^[a-f0-9]{64}$ ]] || die 'run-scoped Gate worker slice digest is invalid'
-[[ $TEST_ONLY == true ]] || systemctl daemon-reload >/dev/null 2>&1 || die 'could not load run-scoped Gate worker slice'
-systemctl start "$GATE_WORKER_SLICE" >/dev/null 2>&1 \
-  || die 'could not activate run-scoped Gate worker slice'
-verify_gate_worker_slice || die 'run-scoped Gate worker slice did not read back exactly'
 for market in "${markets[@]}"; do
   ensure_run_spool_dir "${spool_dir[$market]}"
 done
@@ -1524,6 +1576,24 @@ cleanup() {
   [[ $cleanup_failed == false ]] || { printf 'run-scoped Gate cleanup was incomplete\n' >&2; status=1; }; exit "$status"
 }
 trap cleanup EXIT; trap 'exit 143' HUP INT TERM
+
+# Install a run-scoped aggregate slice only after the EXIT cleanup trap is
+# armed.  If a write, daemon-reload, or start fails, the same cleanup path
+# removes this slice and any workers without requiring a second handler.
+[[ ! -e $gate_worker_slice_file && ! -L $gate_worker_slice_file ]] \
+  || die 'run-scoped Gate worker slice already exists'
+printf '[Slice]\nMemoryHigh=1280M\nMemoryMax=1536M\n' >"$gate_worker_slice_file"
+chmod 0644 "$gate_worker_slice_file"
+[[ $(grep -Fxc 'MemoryHigh=1280M' "$gate_worker_slice_file" || true) -eq 1 \
+  && $(grep -Fxc 'MemoryMax=1536M' "$gate_worker_slice_file" || true) -eq 1 \
+  && $(grep -c '^' "$gate_worker_slice_file" || true) -eq 3 ]] \
+  || die 'run-scoped Gate worker slice envelope is invalid'
+gate_worker_slice_sha256=$(sha256_file "$gate_worker_slice_file")
+[[ $gate_worker_slice_sha256 =~ ^[a-f0-9]{64}$ ]] || die 'run-scoped Gate worker slice digest is invalid'
+[[ $TEST_ONLY == true ]] || systemctl daemon-reload >/dev/null 2>&1 || die 'could not load run-scoped Gate worker slice'
+systemctl start "$GATE_WORKER_SLICE" >/dev/null 2>&1 \
+  || die 'could not activate run-scoped Gate worker slice'
+verify_gate_worker_slice || die 'run-scoped Gate worker slice did not read back exactly'
 
 # Apply the bootstrap lease only after stale Gate workers and any interrupted
 # lease have been cleaned, and after the EXIT trap is armed.  A failure or

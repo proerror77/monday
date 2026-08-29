@@ -1312,11 +1312,10 @@ monday_lob_production_snapshot_identity() {
   fi
 }
 
-# Verify the permanent production slice at a runtime boundary.  Gate performs
-# the deeper cgroup snapshot; Cutover/Restore/Readback call this lightweight
-# systemd check after any projection change so a missing or widened slice can
-# never be reported as a successful pair.
-monday_rust_lob_verify_systemd_production_slice() {
+# Verify only the signed production slice configuration.  Cutover/Restore
+# call this after daemon-reload and before starting either lane; child
+# membership is checked separately once both lanes are active.
+monday_rust_lob_verify_systemd_production_slice_configured() {
   [[ $# -eq 1 ]] || return 2
   local slice='system-binance\x2dlob\x2darchiver\x2dproduction.slice'
   local output item key value
@@ -1329,10 +1328,21 @@ monday_rust_lob_verify_systemd_production_slice() {
     [[ -z ${fields[$key]+x} ]] || return 1
     fields[$key]=$value
   done <<<"${output%$'\n'}"
-  [[ ${fields[MemoryHigh]:-} == 3221225472 \
+  [[ ${#fields[@]} == 3 \
+    && ${fields[MemoryHigh]:-} == 3221225472 \
     && ${fields[MemoryMax]:-} == 3758096384 \
     && ${fields[ControlGroup]:-} == "/system.slice/$slice" ]] || return 1
-  local market child_output child_slice child_group
+}
+
+# Verify live membership after the production pair is unmasked, enabled, and
+# started.  The configured slice check above deliberately does not claim that
+# either child has joined it; this function proves both direct child paths and
+# their exact per-lane limits.
+monday_rust_lob_verify_systemd_production_membership() {
+  [[ $# -eq 1 ]] || return 2
+  local slice='system-binance\x2dlob\x2darchiver\x2dproduction.slice'
+  local market child_output child_slice child_group item key value
+  local -A fields=()
   for market in spot usdm; do
     child_output=$(systemctl show "binance-lob-archiver-production@${market}.service" \
       --property=Slice,ControlGroup,MemoryMax 2>/dev/null) || return 1
@@ -1344,11 +1354,20 @@ monday_rust_lob_verify_systemd_production_slice() {
       [[ -z ${fields[$key]+x} ]] || return 1
       fields[$key]=$value
     done <<<"${child_output%$'\n'}"
+    [[ ${#fields[@]} == 3 ]] || return 1
     child_slice=${fields[Slice]:-}; child_group=${fields[ControlGroup]:-}
     [[ $child_slice == "$slice" && ${fields[MemoryMax]:-} == 2684354560 \
       && $child_group == "/system.slice/$slice/binance-lob-archiver-production@${market}.service" ]] \
       || return 1
   done
+}
+
+# Readback retains the complete check for callers that need one combined
+# assertion after an already-running pair.
+monday_rust_lob_verify_systemd_production_slice() {
+  [[ $# -eq 1 ]] || return 2
+  monday_rust_lob_verify_systemd_production_slice_configured "$1" \
+    && monday_rust_lob_verify_systemd_production_membership "$1"
 }
 
 # Read cumulative I/O-full stall time from a Linux PSI source.

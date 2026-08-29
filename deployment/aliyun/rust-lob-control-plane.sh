@@ -93,7 +93,7 @@ case "$operation" in
     controller=${to,,}; from_controller=${from_controller,,}
     host_script=host-rust-lob-shadow-gate.sh
     command_name=monday-rust-lob-shadow-gate
-    timeout_seconds=7200
+    timeout_seconds=3600
     remote_args=(--from-controller "$from_controller" --candidate-controller "$controller")
     ;;
   cutover)

@@ -43,6 +43,14 @@ grep -Fqx 'MemoryMax=3584M' "$SCRIPT_DIR/$production_slice_asset" || {
   printf 'production slice MemoryMax is not 3584M\n' >&2
   exit 1
 }
+gate_cleanup_trap_line=$(grep -nF 'trap cleanup EXIT;' "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" | head -n1 | cut -d: -f1)
+gate_slice_create_line=$(grep -nF "printf '[Slice]\\nMemoryHigh=1280M" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" | head -n1 | cut -d: -f1)
+[[ $gate_cleanup_trap_line =~ ^[0-9]+$ && $gate_slice_create_line =~ ^[0-9]+$ \
+  && $gate_cleanup_trap_line -lt $gate_slice_create_line ]] || {
+  printf 'Gate cleanup trap must precede run-scoped slice creation\n' >&2
+  exit 1
+}
 grep -Fqx 'MemoryHigh=1792M' "$SCRIPT_DIR/binance-lob-archiver-rust@.service" || {
   printf 'shadow MemoryHigh is not 1792M\n' >&2
   exit 1
@@ -330,6 +338,9 @@ jq -cS -n --arg run "$recovery_run" --arg slice "$production_slice_asset" \
     mode:"temporary-bootstrap",before_memory_high:"3221225472",
     before_memory_max:"3758096384",requested_memory_high:"3072M",
     requested_memory_max:"3584M",candidate_controller_sha256:$controller,
+    before_parent_control_group:("/system.slice/" + $slice),
+    before_parent_memory_current_bytes:1101067264,
+    before_parent_memory_anon_bytes:317067264,
     gate_script:$gate_script,gate_script_sha256:$gate_script_sha,
     gate_pid:$gate_pid,gate_starttime:$gate_starttime,
     recovery_service:$service,recovery_timer:$timer,
@@ -375,6 +386,9 @@ jq -cS -n --arg run "$recovery_alive_run" --arg slice "$production_slice_asset" 
     mode:"temporary-bootstrap",before_memory_high:"3221225472",
     before_memory_max:"3758096384",requested_memory_high:"3072M",
     requested_memory_max:"3584M",candidate_controller_sha256:$controller,
+    before_parent_control_group:("/system.slice/" + $slice),
+    before_parent_memory_current_bytes:1101067264,
+    before_parent_memory_anon_bytes:317067264,
     gate_script:$gate_script,gate_script_sha256:$gate_script_sha,
     gate_pid:$gate_pid,gate_starttime:$gate_starttime,
     recovery_service:$service,recovery_timer:$timer,
@@ -398,6 +412,50 @@ if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   exit 1
 fi
 mv -f -- "$legacy_production_service.before-delta" "$legacy_production_service"
+# Direct bootstrap must reject a legacy production slice whose current or anon
+# usage already exceeds the temporary 3584 MiB cap, before writing lease state,
+# arming recovery, or issuing any set-property mutation.
+for over_cap_field in current anon; do
+  rm -f -- "$ROOT/run/gate-fixture.calls" "$ROOT/run/gate-fixture-error"
+  usage_env=(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_BOOTSTRAP_UNLIMITED=1 \
+    MONDAY_GATE_FIXTURE_BOOTSTRAP_LEASE_USAGE=1 MONDAY_GATE_FIXTURE_RECORD_CALLS=1 \
+    MONDAY_GATE_FIXTURE_BOOTSTRAP_PARENT_CURRENT=317067264 \
+    MONDAY_GATE_FIXTURE_BOOTSTRAP_PARENT_ANON=317067264 MONDAY_ROOT="$ROOT")
+  if [[ $over_cap_field == current ]]; then
+    usage_env+=(MONDAY_GATE_FIXTURE_BOOTSTRAP_PARENT_CURRENT=3758096385)
+  else
+    usage_env+=(MONDAY_GATE_FIXTURE_BOOTSTRAP_PARENT_ANON=3758096385)
+  fi
+  lease_residue_before=$(find "$ROOT/run/monday/rust-lob-gate" "$ROOT/run/systemd/system" \
+    -maxdepth 1 \( -name 'bootstrap-slice-lease-*.json' \
+      -o -name 'monday-rust-lob-gate-*-lease-recovery.*' \
+      -o -name 'mondayrustlobgate*.slice' \) -print 2>/dev/null | LC_ALL=C sort || true)
+  if env "${usage_env[@]}" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
+    --from-controller direct --candidate-controller "$c0" --root "$ROOT" \
+    >/dev/null 2>"$ROOT/run/gate-fixture-error"; then
+    printf 'Gate accepted an over-cap direct bootstrap production %s value\n' "$over_cap_field" >&2
+    exit 1
+  fi
+  grep -Fq "usage-over-cap-$over_cap_field" "$ROOT/run/gate-fixture.calls" || {
+      printf 'Gate did not reject over-cap %s at the live usage guard\n' \
+        "$over_cap_field" >&2
+      exit 1
+    }
+  if [[ -f $ROOT/run/gate-fixture.calls ]] && \
+    grep -Eq '^(write-lease-state|install-lease-recovery|set-property)$' \
+      "$ROOT/run/gate-fixture.calls"; then
+    printf 'Gate mutated production lease state before %s usage admission\n' "$over_cap_field" >&2
+    exit 1
+  fi
+  lease_residue_after=$(find "$ROOT/run/monday/rust-lob-gate" "$ROOT/run/systemd/system" \
+    -maxdepth 1 \( -name 'bootstrap-slice-lease-*.json' \
+      -o -name 'monday-rust-lob-gate-*-lease-recovery.*' \
+      -o -name 'mondayrustlobgate*.slice' \) -print 2>/dev/null | LC_ALL=C sort || true)
+  if [[ $lease_residue_after != "$lease_residue_before" ]]; then
+    printf 'Gate left bootstrap lease residue after %s usage rejection\n' "$over_cap_field" >&2
+    exit 1
+  fi
+done
 gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
   --from-controller direct --candidate-controller "$c0" --root "$ROOT")
@@ -930,6 +988,41 @@ for asset in "${!shadow_before_sha[@]}"; do
 done
 [[ $(readlink -- "$ROOT/opt/monday/bin/binance-lob-archiver-shadow") == "$shadow_before_target" ]]
 
+# Cutover validates only the signed aggregate-slice configuration before any
+# lane is unmasked.  A configured-limit failure must therefore leave the
+# production start boundary untouched.
+rm -f -- "$ROOT/run/cutover-fixture.calls"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
+  MONDAY_CUTOVER_FIXTURE_BAD_CONFIG=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from "$c0" --to "$c1" \
+  --gate-receipt "$gate" --gate-sha256 "$gate_sha" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'cutover accepted an invalid signed production slice configuration\n' >&2
+  exit 1
+fi
+config_line=$(grep -n -m1 '^verify-config ' "$ROOT/run/cutover-fixture.calls" | cut -d: -f1 || true)
+unmask_line=$(grep -n -m1 '^unmask ' "$ROOT/run/cutover-fixture.calls" | cut -d: -f1 || true)
+if [[ -z $config_line || ( -n $unmask_line && $unmask_line -lt $config_line ) ]]; then
+  printf 'cutover unmasked production lanes before configured slice validation\n' >&2
+  exit 1
+fi
+
+# Once configured limits pass, the full two-child verifier runs after starts;
+# a child membership mismatch must be observed only at that post-start point.
+rm -f -- "$ROOT/run/cutover-fixture.calls"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
+  MONDAY_CUTOVER_FIXTURE_BAD_MEMBERSHIP=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from "$c0" --to "$c1" \
+  --gate-receipt "$gate" --gate-sha256 "$gate_sha" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'cutover accepted a live production child membership mismatch\n' >&2
+  exit 1
+fi
+if [[ ! -f $ROOT/run/cutover-fixture.calls ]] || \
+  [[ $(grep -Ec '^start binance-lob-archiver-production@(spot|usdm)\.service$' \
+    "$ROOT/run/cutover-fixture.calls") -ne 2 ]]; then
+  printf 'cutover did not reach the post-start membership verifier\n' >&2
+  exit 1
+fi
+
 fixture_process_pid=4242
 mkdir -p "$ROOT/proc/$fixture_process_pid"
 ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p1_sha/binance-lob-archiver" \
@@ -1296,6 +1389,39 @@ done
 rm -f -- "$restore_service_projection"
 ln -s "$ROOT/opt/monday/releases/binance-lob-controller/active/deployment/binance-lob-archiver-production@.service" \
   "$restore_service_projection"
+
+# Restore uses the same two-stage systemd proof as Cutover: signed aggregate
+# configuration before unmask, then exact child membership after both starts.
+for restore_failure in config membership; do
+  rm -f -- "$ROOT/data/monday/evidence/restores/$c2/restore.json" \
+    "$ROOT/data/monday/evidence/restores/$c2/restore.json.sha256" \
+    "$ROOT/run/restore-fixture.calls"
+  restore_env=(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_RESTORE_FIXTURE_SYSTEMD=1 \
+    MONDAY_RESTORE_FIXTURE_PID="$restore_fixture_pid" MONDAY_ROOT="$ROOT")
+  if [[ $restore_failure == config ]]; then
+    restore_env+=(MONDAY_RESTORE_FIXTURE_BAD_CONFIG=1)
+  else
+    restore_env+=(MONDAY_RESTORE_FIXTURE_BAD_MEMBERSHIP=1)
+  fi
+  if env "${restore_env[@]}" "$SCRIPT_DIR/host-rust-lob-restore.sh" \
+    --controller "$c2" --root "$ROOT" >/dev/null 2>&1; then
+    printf 'restore accepted an invalid production slice %s state\n' "$restore_failure" >&2
+    exit 1
+  fi
+  restore_config_line=$(grep -n -m1 '^verify-config ' "$ROOT/run/restore-fixture.calls" | cut -d: -f1 || true)
+  restore_unmask_line=$(grep -n -m1 '^unmask ' "$ROOT/run/restore-fixture.calls" | cut -d: -f1 || true)
+  [[ -n $restore_config_line && ( -z $restore_unmask_line || $restore_unmask_line -gt $restore_config_line ) ]] || {
+    printf 'restore crossed the production start boundary before slice configuration validation\n' >&2
+    exit 1
+  }
+  if [[ $restore_failure == membership ]]; then
+    [[ $(grep -Ec '^start binance-lob-archiver-production@(spot|usdm)\.service$' \
+      "$ROOT/run/restore-fixture.calls") -eq 2 ]] || {
+      printf 'restore did not reach post-start membership validation\n' >&2
+      exit 1
+    }
+  fi
+done
 run_restore_health_fixture success
 grep -Fq 'enable binance-lob-archiver-production@spot.service' "$restore_calls"
 grep -Fq 'enable binance-lob-archiver-production@usdm.service' "$restore_calls"
@@ -1730,6 +1856,10 @@ fi
 # The local operator is the only Cloud Assistant entry point. Its dry run must
 # carry an exact controller path and never expose a second routing mode.
 operator="$SCRIPT_DIR/rust-lob-control-plane.sh"
+grep -Fq 'timeout_seconds=3600' "$operator" || {
+  printf 'LOB Gate operator timeout is not capped at 3600 seconds\n' >&2
+  exit 1
+}
 candidate=$(printf 'b%.0s' {1..64})
 operator_json=$(MONDAY_CONTROL_PLANE_DRY_RUN=1 "$operator" gate \
   --instance i-fixture --from-controller "$c1" \
