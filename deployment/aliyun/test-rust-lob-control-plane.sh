@@ -51,6 +51,11 @@ gate_slice_create_line=$(grep -nF "printf '[Slice]\\nMemoryHigh=1280M" \
   printf 'Gate cleanup trap must precede run-scoped slice creation\n' >&2
   exit 1
 }
+if grep -Fq "systemctl start \"\$COLLECTOR_HEALTH_SERVICE\"" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh"; then
+  printf 'Gate/recovery must never start the collector health service\n' >&2
+  exit 1
+fi
 grep -Fqx 'MemoryHigh=1792M' "$SCRIPT_DIR/binance-lob-archiver-rust@.service" || {
   printf 'shadow MemoryHigh is not 1792M\n' >&2
   exit 1
@@ -345,7 +350,7 @@ jq -cS -n --arg run "$recovery_run" --arg slice "$production_slice_asset" \
   --arg controller "$c0" --arg gate_script "$recovery_gate_script" \
   --arg gate_script_sha "$recovery_gate_script_sha" \
   --argjson gate_pid 999999 --argjson gate_starttime 1 \
-  '{schema:"monday.rust_lob_bootstrap_slice_lease.v1",run_id:$run,slice:$slice,
+  '{schema:"monday.rust_lob_bootstrap_slice_lease.v2",run_id:$run,slice:$slice,
     mode:"temporary-bootstrap",before_memory_high:"3221225472",
     before_memory_max:"3758096384",requested_memory_high:"3072M",
     requested_memory_max:"3584M",candidate_controller_sha256:$controller,
@@ -355,11 +360,22 @@ jq -cS -n --arg run "$recovery_run" --arg slice "$production_slice_asset" \
     gate_script:$gate_script,gate_script_sha256:$gate_script_sha,
     gate_pid:$gate_pid,gate_starttime:$gate_starttime,
     recovery_service:$service,recovery_timer:$timer,
-    applied:true,restored:false}' >"$recovery_state"
+    applied:true,restored:false,
+    bootstrap_monitor_containment:{required:true,
+      timer:"monday-collector-health.timer",service:"monday-collector-health.service",
+      before_timer:{unit:"monday-collector-health.timer",load_state:"loaded",active_state:"active",
+        sub_state:"waiting",unit_file_state:"enabled",result:"success",exec_main_status:"0",
+        main_pid:"0",n_restarts:"0"},
+      before_service:{unit:"monday-collector-health.service",load_state:"loaded",active_state:"active",
+        sub_state:"running",unit_file_state:"static",result:"success",exec_main_status:"0",
+        main_pid:"0",n_restarts:"0"},
+      pause_applied:true,service_was_active:true,service_quiesced:false,
+      timer_restored:false}}' >"$recovery_state"
 printf '[Unit]\n' >"$ROOT/run/systemd/system/$recovery_service"
 printf '[Timer]\n' >"$ROOT/run/systemd/system/$recovery_timer"
 rm -f -- "$ROOT/run/gate-fixture.calls"
 MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_RECOVERY_RUN="$recovery_run" \
+MONDAY_GATE_FIXTURE_HEALTH_SERVICE_STATE=active MONDAY_GATE_FIXTURE_HEALTH_SERVICE_SUBSTATE=running \
 MONDAY_GATE_FIXTURE_RECORD_CALLS=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --recover-bootstrap-lease \
   "$recovery_state" --root "$ROOT" >"$ROOT/recovery.out" 2>&1 || {
@@ -367,6 +383,9 @@ MONDAY_GATE_FIXTURE_RECORD_CALLS=1 MONDAY_ROOT="$ROOT" \
   exit 1
 }
 [[ $(jq -er '.restored' "$recovery_state") == true ]]
+jq -e '.bootstrap_monitor_containment.service_was_active == true
+  and .bootstrap_monitor_containment.service_quiesced == true
+  and .bootstrap_monitor_containment.timer_restored == true' "$recovery_state" >/dev/null
 [[ ! -e "$ROOT/run/systemd/system/$recovery_service" && ! -e "$ROOT/run/systemd/system/$recovery_timer" ]]
 [[ $(grep -n '^stop monday-rust-lob-gate-' "$ROOT/run/gate-fixture.calls" | head -n1 | cut -d: -f1) -lt \
    $(grep -n '^set-property$' "$ROOT/run/gate-fixture.calls" | head -n1 | cut -d: -f1) ]]
@@ -374,6 +393,24 @@ if grep -Fq "stop $recovery_service" "$ROOT/run/gate-fixture.calls"; then
   printf 'lease recovery oneshot attempted to stop itself\n' >&2
   exit 1
 fi
+if grep -Fq 'start monday-collector-health.service' "$ROOT/run/gate-fixture.calls"; then
+  printf 'lease recovery attempted to start the collector health service\n' >&2
+  exit 1
+fi
+grep -Fqx 'stop monday-collector-health.service' "$ROOT/run/gate-fixture.calls"
+grep -Fqx 'start monday-collector-health.timer' "$ROOT/run/gate-fixture.calls"
+invalid_recovery_timer_state="$recovery_state_root/bootstrap-slice-lease-20260828T010105Z-81.json"
+jq '.bootstrap_monitor_containment.before_timer.load_state = "not-found"' \
+  "$recovery_state" >"$invalid_recovery_timer_state"
+rm -f -- "$ROOT/run/gate-fixture.calls"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_RECOVERY_RUN=20260828T010105Z-81 \
+  MONDAY_GATE_FIXTURE_RECORD_CALLS=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --recover-bootstrap-lease \
+  "$invalid_recovery_timer_state" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'lease recovery accepted a bootstrap timer that was not loaded\n' >&2
+  exit 1
+fi
+[[ ! -s "$ROOT/run/gate-fixture.calls" ]]
 grep -Fq 'OnActiveSec=30s' "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh"
 grep -Fq 'OnUnitInactiveSec=30s' "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh"
 if grep -Fq 'OnActiveSec=5s' "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh"; then
@@ -393,7 +430,7 @@ jq -cS -n --arg run "$recovery_alive_run" --arg slice "$production_slice_asset" 
   --arg controller "$c0" --arg gate_script "$recovery_gate_script" \
   --arg gate_script_sha "$recovery_gate_script_sha" --argjson gate_pid "$$" \
   --argjson gate_starttime 4242 \
-  '{schema:"monday.rust_lob_bootstrap_slice_lease.v1",run_id:$run,slice:$slice,
+  '{schema:"monday.rust_lob_bootstrap_slice_lease.v2",run_id:$run,slice:$slice,
     mode:"temporary-bootstrap",before_memory_high:"3221225472",
     before_memory_max:"3758096384",requested_memory_high:"3072M",
     requested_memory_max:"3584M",candidate_controller_sha256:$controller,
@@ -403,7 +440,17 @@ jq -cS -n --arg run "$recovery_alive_run" --arg slice "$production_slice_asset" 
     gate_script:$gate_script,gate_script_sha256:$gate_script_sha,
     gate_pid:$gate_pid,gate_starttime:$gate_starttime,
     recovery_service:$service,recovery_timer:$timer,
-    applied:true,restored:false}' >"$recovery_alive_state"
+    applied:true,restored:false,
+    bootstrap_monitor_containment:{required:true,
+      timer:"monday-collector-health.timer",service:"monday-collector-health.service",
+      before_timer:{unit:"monday-collector-health.timer",load_state:"loaded",active_state:"active",
+        sub_state:"waiting",unit_file_state:"enabled",result:"success",exec_main_status:"0",
+        main_pid:"0",n_restarts:"0"},
+      before_service:{unit:"monday-collector-health.service",load_state:"loaded",active_state:"inactive",
+        sub_state:"dead",unit_file_state:"static",result:"success",exec_main_status:"0",
+        main_pid:"0",n_restarts:"0"},
+      pause_applied:true,service_was_active:false,service_quiesced:false,
+      timer_restored:false}}' >"$recovery_alive_state"
 rm -f -- "$ROOT/run/gate-fixture.calls"
 MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_RECOVERY_RUN="$recovery_alive_run" \
 MONDAY_GATE_FIXTURE_RECORD_CALLS=1 MONDAY_ROOT="$ROOT" \
@@ -412,6 +459,34 @@ MONDAY_GATE_FIXTURE_RECORD_CALLS=1 MONDAY_ROOT="$ROOT" \
 [[ $(jq -er '.restored' "$recovery_alive_state") == false ]]
 [[ ! -s "$ROOT/run/gate-fixture.calls" ]]
 rm -rf -- "$ROOT/proc/$$"
+# Historical v1 leases are not rewritten by the V2 recovery path.  A restored
+# v1 record is a read-only terminal audit record; an unrestored v1 record is
+# rejected before systemd or any lease state can be touched.
+v1_restored_state="$recovery_state_root/bootstrap-slice-lease-20260828T010103Z-79.json"
+v1_unrestored_state="$recovery_state_root/bootstrap-slice-lease-20260828T010104Z-80.json"
+jq '.schema = "monday.rust_lob_bootstrap_slice_lease.v1" | .restored = true' \
+  "$recovery_state" >"$v1_restored_state"
+jq '.schema = "monday.rust_lob_bootstrap_slice_lease.v1" | .restored = false' \
+  "$recovery_state" >"$v1_unrestored_state"
+v1_restored_sha=$(monday_sha256_file "$v1_restored_state")
+rm -f -- "$ROOT/run/gate-fixture.calls"
+MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_RECOVERY_RUN=20260828T010103Z-79 \
+MONDAY_GATE_FIXTURE_RECORD_CALLS=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --recover-bootstrap-lease \
+  "$v1_restored_state" --root "$ROOT" >/dev/null
+[[ $(monday_sha256_file "$v1_restored_state") == "$v1_restored_sha" ]]
+[[ ! -s "$ROOT/run/gate-fixture.calls" ]]
+v1_unrestored_sha=$(monday_sha256_file "$v1_unrestored_state")
+rm -f -- "$ROOT/run/gate-fixture.calls"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_RECOVERY_RUN=20260828T010104Z-80 \
+  MONDAY_GATE_FIXTURE_RECORD_CALLS=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --recover-bootstrap-lease \
+  "$v1_unrestored_state" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'unrestored historical v1 lease was accepted by V2 recovery\n' >&2
+  exit 1
+fi
+[[ $(monday_sha256_file "$v1_unrestored_state") == "$v1_unrestored_sha" ]]
+[[ ! -s "$ROOT/run/gate-fixture.calls" ]]
 legacy_production_service="$ROOT/etc/systemd/system/binance-lob-archiver-production@.service"
 cp -p -- "$legacy_production_service" "$legacy_production_service.before-delta"
 chmod u+w "$legacy_production_service"
@@ -676,7 +751,14 @@ resource_breach_new_lease=$(comm -13 <(printf '%s\n' "$resource_breach_lease_bef
 resource_breach_lease=$(printf '%s\n' "$resource_breach_new_lease" | sed '/^$/d')
 jq -e '.mode == "temporary-bootstrap" and .restored == true
   and .before_memory_high == "infinity" and .before_memory_max == "infinity"
-  and .requested_memory_high == "3072M" and .requested_memory_max == "3584M"' \
+  and .requested_memory_high == "3072M" and .requested_memory_max == "3584M"
+  and .bootstrap_monitor_containment.required == true
+  and .bootstrap_monitor_containment.pause_applied == true
+  and .bootstrap_monitor_containment.timer_restored == true
+  and .bootstrap_monitor_containment.service_was_active == false
+  and .bootstrap_monitor_containment.service_quiesced == true
+  and .bootstrap_monitor_containment.timer == "monday-collector-health.timer"
+  and .bootstrap_monitor_containment.service == "monday-collector-health.service"' \
   "$resource_breach_lease" >/dev/null
 resource_breach_run=$(jq -er '.run_id' "$resource_breach_lease")
 resource_breach_slice="mondayrustlobgate${resource_breach_run//[^0-9]/}.slice"
@@ -687,6 +769,16 @@ resource_breach_slice="mondayrustlobgate${resource_breach_run//[^0-9]/}.slice"
 [[ ! -e "$ROOT/run/systemd/system/monday-rust-lob-gate-${resource_breach_run}-lease-recovery.timer" ]]
 grep -Fqx 'set-property' "$ROOT/run/gate-fixture.calls"
 [[ $(grep -Fc 'set-property' "$ROOT/run/gate-fixture.calls") == 2 ]]
+grep -Fqx 'stop monday-collector-health.timer' "$ROOT/run/gate-fixture.calls"
+grep -Fqx 'start monday-collector-health.timer' "$ROOT/run/gate-fixture.calls"
+if grep -Fq 'start monday-collector-health.service' "$ROOT/run/gate-fixture.calls"; then
+  printf 'lease recovery attempted to start the collector health service\n' >&2
+  exit 1
+fi
+if grep -Fq 'stop monday-collector-health.service' "$ROOT/run/gate-fixture.calls"; then
+  printf 'inactive health service was unnecessarily stopped during bootstrap pause\n' >&2
+  exit 1
+fi
 if find "$ROOT/data/monday/evidence/shadow-gates/$c0" -type f \
   \( -name gate.json -o -name PASSED.sha256 \) -print -quit 2>/dev/null | grep -q .; then
   printf 'resource monitor breach left an authoritative Gate receipt\n' >&2
@@ -697,15 +789,40 @@ fi
 [[ $(monday_sha256_file "$production_spool_root/spot/upload-status.json") == "$production_spot_status_sha" ]]
 [[ $(monday_sha256_file "$production_spool_root/usdm/upload-status.json") == "$production_usdm_status_sha" ]]
 
-gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
-  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
+gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_BOOTSTRAP_UNLIMITED=1 \
+  MONDAY_GATE_FIXTURE_BOOTSTRAP_LEASE_USAGE=1 MONDAY_ROOT="$ROOT" \
+  bash -c '
+    root=$1; shift
+    mkdir -p "$root/proc/$$"
+    printf "1 fixture S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 4242\\n" >"$root/proc/$$/stat"
+    printf "%s\\n" "$$" >"$root/run/direct-gate.pid"
+    exec "$@"
+  ' _ "$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
   --from-controller direct --candidate-controller "$c0" --root "$ROOT")
+direct_gate_pid=$(cat "$ROOT/run/direct-gate.pid")
+rm -rf -- "$ROOT/proc/$direct_gate_pid" "$ROOT/run/direct-gate.pid"
 gate=$(printf '%s\n' "$gate_output" | sed -n 's/^V2 Gate receipt: //p')
 gate_sha=$(printf '%s\n' "$gate_output" | sed -n 's/^SHA-256: //p')
 [[ -f $gate && $gate_sha == "$(monday_sha256_file "$gate")" ]]
 monday_validate_v2_gate "$gate" direct "$c0" "$gate_sha"
+jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$gate" >/dev/null
+jq -e '.production_memory.slice_lease.mode == "temporary-bootstrap"
+  and .production_memory.bootstrap_monitor_containment.required == true
+  and .production_memory.bootstrap_monitor_containment.pause_applied == true
+  and .production_memory.bootstrap_monitor_containment.timer_restored == true
+  and .production_memory.bootstrap_monitor_containment.service_was_active == false
+  and .production_memory.bootstrap_monitor_containment.service_quiesced == true
+  and .checks.bootstrap_monitor_containment == true' "$gate" >/dev/null
 jq -e '.shadow_staging.aggregate_slice.cgroup
   == ("/" + .shadow_staging.aggregate_slice.name)' "$gate" >/dev/null
+tampered_health_timer="$ROOT/tampered-health-timer.json"
+jq '.production_memory.bootstrap_monitor_containment.before_timer.load_state = "not-found"' \
+  "$gate" >"$tampered_health_timer"
+if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" \
+  "$tampered_health_timer" >/dev/null 2>&1; then
+  printf 'Gate policy accepted a bootstrap timer that was not loaded\n' >&2
+  exit 1
+fi
 oss_source=$(sed -n '/^run_oss()/,/^verify_oss_roundtrips()/p' \
   "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh")
 grep -Fq 'systemd-run --quiet --pipe --wait --collect' <<<"$oss_source"
@@ -755,6 +872,41 @@ path_only_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_PATH_ONLY=1 M
   --candidate-controller "$c0" --root "$ROOT")
 grep -Fq "V2 Gate spool preparation: $ROOT/data/monday/spool/binance-lob-rust-shadow/gate/" \
   <<<"$path_only_output"
+# When the health oneshot is active, direct bootstrap pauses it only after the
+# timer has been stopped and read back, then restores only the timer.  The
+# service remains quiesced and is never started by Gate/recovery.
+# This path-only fixture keeps the check bounded and emits no receipt.
+rm -f -- "$ROOT/run/gate-fixture.calls"
+MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_PATH_ONLY=1 \
+MONDAY_GATE_FIXTURE_BOOTSTRAP_UNLIMITED=1 MONDAY_GATE_FIXTURE_BOOTSTRAP_LEASE_USAGE=1 \
+MONDAY_GATE_FIXTURE_HEALTH_SERVICE_STATE=active \
+MONDAY_GATE_FIXTURE_HEALTH_SERVICE_SUBSTATE=running \
+MONDAY_GATE_FIXTURE_RECORD_CALLS=1 MONDAY_ROOT="$ROOT" \
+  bash -c '
+    root=$1; shift
+    mkdir -p "$root/proc/$$"
+    printf "1 fixture S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 4242\\n" >"$root/proc/$$/stat"
+    printf "%s\\n" "$$" >"$root/run/path-only-active-gate.pid"
+    exec "$@"
+  ' _ "$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
+  --from-controller direct --candidate-controller "$c0" --root "$ROOT" >/dev/null
+path_only_active_gate_pid=$(cat "$ROOT/run/path-only-active-gate.pid")
+rm -rf -- "$ROOT/proc/$path_only_active_gate_pid" "$ROOT/run/path-only-active-gate.pid"
+timer_stop_line=$(grep -nF 'stop monday-collector-health.timer' "$ROOT/run/gate-fixture.calls" | head -n1 | cut -d: -f1)
+service_stop_line=$(grep -nF 'stop monday-collector-health.service' "$ROOT/run/gate-fixture.calls" | head -n1 | cut -d: -f1)
+cap_set_line=$(grep -nFx 'set-property' "$ROOT/run/gate-fixture.calls" | head -n1 | cut -d: -f1)
+timer_start_line=$(grep -nF 'start monday-collector-health.timer' "$ROOT/run/gate-fixture.calls" | tail -n1 | cut -d: -f1)
+if grep -Fq 'start monday-collector-health.service' "$ROOT/run/gate-fixture.calls"; then
+  printf 'direct bootstrap attempted to start the collector health service\n' >&2
+  exit 1
+fi
+[[ $timer_stop_line =~ ^[0-9]+$ && $service_stop_line =~ ^[0-9]+$ && $cap_set_line =~ ^[0-9]+$ \
+  && $timer_start_line =~ ^[0-9]+$ \
+  && $timer_stop_line -lt $service_stop_line && $service_stop_line -lt $cap_set_line \
+  && $cap_set_line -lt $timer_start_line ]] || {
+  printf 'direct bootstrap did not order health monitor pause/restore around cap\n' >&2
+  exit 1
+}
 jq -e --arg from "$legacy_c0" \
   '.source_mode == "direct" and .from_controller_sha256 == $from
    and .transition.before == $from and .transition.topology == "direct-bootstrap"' \
@@ -1173,6 +1325,16 @@ gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
 gate=$(printf '%s\n' "$gate_output" | sed -n 's/^V2 Gate receipt: //p')
 gate_sha=$(printf '%s\n' "$gate_output" | sed -n 's/^SHA-256: //p')
 monday_validate_v2_gate "$gate" "$c0" "$c1" "$gate_sha"
+jq -e '.source_mode == "stable"
+  and .production_memory.slice_lease.mode == "permanent"
+  and .production_memory.bootstrap_monitor_containment.required == false
+  and .production_memory.bootstrap_monitor_containment.pause_applied == false
+  and .production_memory.bootstrap_monitor_containment.timer_restored == true
+  and .production_memory.bootstrap_monitor_containment.service_was_active == false
+  and .production_memory.bootstrap_monitor_containment.service_quiesced == true
+  and .production_memory.bootstrap_monitor_containment.before_timer == null
+  and .production_memory.bootstrap_monitor_containment.before_service == null' \
+  "$gate" >/dev/null
 # URI identity is part of the v5 policy, not just the downloader.  Moving a
 # complete same-session triplet below an extra path component must fail both
 # validators before it can become transition evidence.
