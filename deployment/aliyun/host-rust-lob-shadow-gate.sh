@@ -15,6 +15,8 @@ readonly IO_PSI_WINDOW_US=15000000
 readonly IO_PSI_FULL_DELTA_LIMIT_US=150000
 readonly IO_PSI_CONSECUTIVE_HIT_LIMIT=3
 readonly UPLOAD_DRAIN_MEMORY_MAX_BYTES=536870912
+readonly SHADOW_IDENTITY_WAIT_SECONDS=15
+readonly SHADOW_IDENTITY_TEST_ATTEMPTS=8
 readonly SERVICE_USER=hftcollector
 readonly SERVICE_HOME=/var/lib/hft-collector
 readonly SAFE_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -196,7 +198,12 @@ if [[ $TEST_ONLY == true ]]; then
             fixture_health_timer_state=active; fixture_health_timer_substate=waiting ;;
           "$COLLECTOR_HEALTH_SERVICE")
             fixture_health_service_state=active; fixture_health_service_substate=running ;;
-          *) fixture_unit_state[$unit_name]=active ;;
+          *)
+            fixture_unit_state[$unit_name]=active
+            if [[ $unit_name == monday-rust-lob-gate-*.service ]]; then
+              printf '0\n' >"$ROOT/run/gate-fixture.identity.${unit_name//[^A-Za-z0-9_.-]/_}"
+            fi
+            ;;
         esac
         return 0 ;;
       stop)
@@ -290,6 +297,29 @@ if [[ $TEST_ONLY == true ]]; then
             MainPID)
               if [[ $unit_name == binance-lob-archiver-production@spot.service ]]; then value=$FIXTURE_PRODUCTION_SPOT_PID
               elif [[ $unit_name == binance-lob-archiver-production@usdm.service ]]; then value=$FIXTURE_PRODUCTION_USDM_PID
+              elif [[ $unit_name == monday-rust-lob-gate-*.service ]]; then
+                local identity_counter_file="$ROOT/run/gate-fixture.identity.${unit_name//[^A-Za-z0-9_.-]/_}"
+                local identity_index=0
+                local identity_step=correct identity_pid=61001 identity_target=$candidate_binary
+                local -a identity_sequence=()
+                if [[ -f $identity_counter_file ]]; then
+                  IFS= read -r identity_index <"$identity_counter_file" || identity_index=0
+                  [[ $identity_index =~ ^[0-9]+$ ]] || identity_index=0
+                fi
+                if [[ -n ${MONDAY_GATE_FIXTURE_SHADOW_IDENTITY_SEQUENCE:-} ]]; then
+                  IFS=, read -r -a identity_sequence <<<"$MONDAY_GATE_FIXTURE_SHADOW_IDENTITY_SEQUENCE"
+                  identity_step=${identity_sequence[$identity_index]:-${identity_sequence[${#identity_sequence[@]}-1]:-wrong}}
+                fi
+                case "$identity_step" in
+                  wrong) identity_target=$LIB_SOURCE ;;
+                  correct) : ;;
+                  *) return 1 ;;
+                esac
+                printf '%s\n' "$((identity_index + 1))" >"$identity_counter_file"
+                mkdir -p "$PROC_ROOT/$identity_pid"
+                rm -f -- "$PROC_ROOT/$identity_pid/exe"
+                ln -s "$identity_target" "$PROC_ROOT/$identity_pid/exe"
+                value=$identity_pid
               else value=$$; fi ;;
             MemoryCurrent) value=1048576 ;;
             MemoryPeak) value=1048576 ;;
@@ -488,22 +518,15 @@ health_timer_state_matches() {
 }
 
 quiesce_collector_health_service() {
-  local allow_reset_failed=$1 service_state active_state
-  [[ $allow_reset_failed == true || $allow_reset_failed == false ]] || return 1
+  local service_state active_state
   service_state=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
   active_state=$(jq -er '.active_state' <<<"$service_state") || return 1
-  if [[ $active_state != inactive ]]; then
+  if [[ $active_state != inactive && $active_state != failed ]]; then
     systemctl stop "$COLLECTOR_HEALTH_SERVICE" >/dev/null 2>&1 || return 1
     service_state=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
     active_state=$(jq -er '.active_state' <<<"$service_state") || return 1
-    if [[ $active_state == failed ]]; then
-      [[ $allow_reset_failed == true ]] || return 1
-      systemctl reset-failed "$COLLECTOR_HEALTH_SERVICE" >/dev/null 2>&1 || return 1
-      service_state=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
-      active_state=$(jq -er '.active_state' <<<"$service_state") || return 1
-    fi
   fi
-  [[ $active_state == inactive ]]
+  [[ $active_state == inactive || $active_state == failed ]]
 }
 
 # Restore the fixed health timer and quiesce the service from a persisted lease.
@@ -519,7 +542,7 @@ restore_bootstrap_monitor_from_state() {
     && $(jq -er '.active_state' <<<"$before_timer") == active ]] || return 1
   # The health worker is quiesced for the bootstrap interval.  It is never
   # restarted by Gate/recovery: only the original active timer is restored.
-  quiesce_collector_health_service true || return 1
+  quiesce_collector_health_service || return 1
   if [[ $(jq -er '.active_state' <<<"$before_timer") == active ]]; then
     systemctl start "$COLLECTOR_HEALTH_TIMER" >/dev/null 2>&1 || return 1
   else
@@ -631,6 +654,14 @@ recover_bootstrap_lease() {
       and (.timer_restored | type == "boolean")
       and (.service_was_noninactive | type == "boolean")
       and (.service_was_noninactive == (.before_service.active_state != "inactive"))
+      and (if has("preexisting_global_health_failed")
+           then (.preexisting_global_health_failed | type == "boolean")
+             and (.preexisting_global_health_failed == (.before_service.active_state == "failed"))
+           else true end)
+      and (if has("global_health_reset_applied")
+           then (.global_health_reset_applied | type == "boolean")
+             and (.global_health_reset_applied == false)
+           else true end)
       and (.service_quiesced | type == "boolean"))' "$state" >/dev/null \
     || die 'lease state schema is invalid'
   run=$(jq -er '.run_id' "$state") || die 'lease state run id is unavailable'
@@ -726,9 +757,16 @@ recover_bootstrap_lease() {
   systemctl daemon-reload >/dev/null 2>&1 || die 'could not reload systemd after lease recovery'
   temporary="${state}.tmp.$$"
   jq -cS --arg recovered_by "$run" \
-    '.bootstrap_monitor_containment.pause_applied = true
-     | .bootstrap_monitor_containment.timer_restored = true
-     | .bootstrap_monitor_containment.service_quiesced = true
+    '.bootstrap_monitor_containment |=
+       (if has("preexisting_global_health_failed") then .
+        else . + {preexisting_global_health_failed:(.before_service.active_state == "failed")}
+        end
+        | if has("global_health_reset_applied") then .
+          else . + {global_health_reset_applied:false}
+          end
+        | .pause_applied = true
+        | .timer_restored = true
+        | .service_quiesced = true)
      | .restored = true | .recovered_by_run_id = $recovered_by' "$state" >"$temporary" \
     || die 'could not mark bootstrap lease recovered'
   chmod 0640 "$temporary" || die 'could not protect recovered lease state'
@@ -1219,6 +1257,8 @@ bootstrap_monitor_timer_restored=true
 # Audit whether the captured service state was anything other than inactive;
 # this is not a claim that the service remains stopped after the timer fires.
 bootstrap_monitor_service_was_noninactive=false
+bootstrap_monitor_preexisting_global_health_failed=false
+bootstrap_monitor_global_health_reset_applied=false
 bootstrap_monitor_service_quiesced=true
 bootstrap_monitor_timer_before_json=null
 bootstrap_monitor_service_before_json=null
@@ -1232,11 +1272,16 @@ build_bootstrap_monitor_containment() {
     --argjson pause_applied "$bootstrap_monitor_pause_applied" \
     --argjson timer_restored "$bootstrap_monitor_timer_restored" \
     --argjson service_was_noninactive "$bootstrap_monitor_service_was_noninactive" \
+    --argjson preexisting_global_health_failed "$bootstrap_monitor_preexisting_global_health_failed" \
+    --argjson global_health_reset_applied "$bootstrap_monitor_global_health_reset_applied" \
     --argjson service_quiesced "$bootstrap_monitor_service_quiesced" \
     '{required:$required,timer:$timer,service:$service,
       before_timer:$before_timer,before_service:$before_service,
       pause_applied:$pause_applied,timer_restored:$timer_restored,
-      service_was_noninactive:$service_was_noninactive,service_quiesced:$service_quiesced}') || return 1
+      service_was_noninactive:$service_was_noninactive,
+      preexisting_global_health_failed:$preexisting_global_health_failed,
+      global_health_reset_applied:$global_health_reset_applied,
+      service_quiesced:$service_quiesced}') || return 1
 }
 capture_bootstrap_monitor_state() {
   local timer_state service_state
@@ -1244,16 +1289,16 @@ capture_bootstrap_monitor_state() {
   service_state=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
   [[ $(jq -er '.load_state' <<<"$timer_state") == loaded \
     && $(jq -er '.active_state' <<<"$timer_state") == active ]] || return 1
-  # A fresh Gate must not normalize a pre-existing failed health oneshot.  The
-  # bootstrap lease/watchdog/timer are still untouched at this point; only a
-  # recovery of an already persisted lease may reset a failed service.
-  [[ $(jq -er '.active_state' <<<"$service_state") != failed ]] || return 1
   bootstrap_monitor_required=true
   bootstrap_monitor_pause_applied=false
   bootstrap_monitor_timer_restored=false
   bootstrap_monitor_service_was_noninactive=false
   [[ $(jq -er '.active_state' <<<"$service_state") != inactive ]] \
     && bootstrap_monitor_service_was_noninactive=true
+  bootstrap_monitor_preexisting_global_health_failed=false
+  [[ $(jq -er '.active_state' <<<"$service_state") == failed ]] \
+    && bootstrap_monitor_preexisting_global_health_failed=true
+  bootstrap_monitor_global_health_reset_applied=false
   bootstrap_monitor_service_quiesced=false
   bootstrap_monitor_timer_before_json=$timer_state
   bootstrap_monitor_service_before_json=$service_state
@@ -1269,7 +1314,7 @@ pause_bootstrap_monitor() {
   write_bootstrap_slice_lease_state || return 1
   # Re-read after the timer stop: an in-flight timer callback may have left the
   # service in any non-inactive state, not only the state captured at entry.
-  quiesce_collector_health_service false || return 1
+  quiesce_collector_health_service || return 1
   bootstrap_monitor_service_quiesced=true
   bootstrap_monitor_pause_applied=true
   build_bootstrap_monitor_containment || return 1
@@ -1279,6 +1324,8 @@ restore_bootstrap_monitor() {
   [[ $bootstrap_monitor_required == true ]] || {
     bootstrap_monitor_timer_restored=true
     bootstrap_monitor_service_was_noninactive=false
+    bootstrap_monitor_preexisting_global_health_failed=false
+    bootstrap_monitor_global_health_reset_applied=false
     bootstrap_monitor_service_quiesced=true
     return 0
   }
@@ -1290,7 +1337,7 @@ restore_bootstrap_monitor() {
   # restart it here; only a timer that was active before the pause is restored.
   # service_quiesced records this pause/restore transaction's inactive readback;
   # it does not claim a timer-triggered service remains inactive forever.
-  quiesce_collector_health_service true || return 1
+  quiesce_collector_health_service || return 1
   bootstrap_monitor_service_quiesced=true
   if [[ $before_timer_active == active ]]; then
     systemctl start "$COLLECTOR_HEALTH_TIMER" >/dev/null 2>&1 || return 1
@@ -2175,6 +2222,62 @@ verify_raw_trade_continuity() {
   run_strict_verifier "${args[@]}"
 }
 systemctl_value() { systemctl_show "${unit[$1]}" "$2"; }
+shadow_identity_die() { printf 'shadow gate failed: %s\n' "$*" >&2; exit 1; }
+shadow_identity_wait() {
+  local market=$1 shadow_unit=${unit[$1]} deadline attempts=0 active_state n_restarts current_pid
+  local expected_pid='' candidate_seen=false exe_path exe_sha now
+  deadline=$(( $(monotonic_seconds) + SHADOW_IDENTITY_WAIT_SECONDS ))
+  while :; do
+    active_state=inactive
+    if systemctl_active "$shadow_unit"; then active_state=active; fi
+    n_restarts=$(systemctl_value "$market" NRestarts) \
+      || shadow_identity_die "$market shadow restart count is unavailable during startup identity verification"
+    [[ $n_restarts =~ ^[0-9]+$ ]] \
+      || shadow_identity_die "$market shadow restart count is malformed during startup identity verification"
+    (( n_restarts == 0 )) \
+      || shadow_identity_die "$market shadow restarted during startup identity verification"
+    current_pid=$(systemctl_value "$market" MainPID) \
+      || shadow_identity_die "$market MainPID is unavailable during startup identity verification"
+    if [[ $active_state == active && $current_pid =~ ^[1-9][0-9]*$ ]]; then
+      if [[ -n $expected_pid && $current_pid != "$expected_pid" ]]; then
+        shadow_identity_die "$market MainPID changed during startup identity verification"
+      fi
+      expected_pid=${expected_pid:-$current_pid}
+      if [[ -r "$PROC_ROOT/$current_pid/exe" ]]; then
+        if exe_path=$(readlink -f -- "$PROC_ROOT/$current_pid/exe" 2>/dev/null) \
+          && exe_sha=$(sha256_file "$exe_path" 2>/dev/null); then
+          if [[ $exe_sha == "$candidate_payload" ]]; then
+            if [[ $candidate_seen == true ]]; then
+              printf '%s\n' "$current_pid"
+              return 0
+            fi
+            candidate_seen=true
+          else
+            candidate_seen=false
+          fi
+        else
+          candidate_seen=false
+        fi
+      else
+        candidate_seen=false
+      fi
+    else
+      candidate_seen=false
+    fi
+    if [[ $TEST_ONLY == true ]]; then
+      attempts=$((attempts + 1))
+      if (( attempts >= SHADOW_IDENTITY_TEST_ATTEMPTS )); then
+        shadow_identity_die "$market shadow startup identity timed out (active_state=$active_state n_restarts=$n_restarts pid=$current_pid)"
+      fi
+    else
+      now=$(monotonic_seconds)
+      if (( now >= deadline )); then
+        shadow_identity_die "$market shadow startup identity timed out (active_state=$active_state n_restarts=$n_restarts pid=$current_pid)"
+      fi
+      sleep 1
+    fi
+  done
+}
 health_ok() {
   local market=$1 health="${spool_dir[$1]}/health.json"; [[ -f $health ]] || return 1
   if [[ $TEST_ONLY == true ]]; then jq -e --arg market "$market" '.market == $market and .status == "synced" and .sequence_gaps == 0' "$health" >/dev/null; return; fi
@@ -2288,13 +2391,9 @@ run_market_gate_phase() {
   local market=$1 settle observation pid started_ns
   calibrate_psi "shadow-$market"; resource_monitor_start "shadow-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; fixture_seed_market "$market"; systemctl reset-failed "${unit[$market]}" >/dev/null 2>&1 || true
   started_ns=$(date +%s%N); market_gate_started_ns[$market]=$started_ns
-  systemctl start "${unit[$market]}"; systemctl_active "${unit[$market]}" || die "$market shadow did not start"; [[ $(systemctl_value "$market" NRestarts) == 0 ]] || die "$market shadow restarted"; pid=$(systemctl_value "$market" MainPID); [[ $pid =~ ^[1-9][0-9]*$ ]] || die "$market MainPID unavailable"; phase_pid["$market"]=$pid; phase_exe_sha["$market"]=$candidate_payload
+  systemctl start "${unit[$market]}"; pid=$(shadow_identity_wait "$market"); phase_pid["$market"]=$pid; phase_exe_sha["$market"]=$candidate_payload
   if [[ $TEST_ONLY == true && ( ${MONDAY_GATE_FIXTURE_SIGKILL:-0} == 1 || ${MONDAY_GATE_HARD_CRASH_AFTER_SHADOW_START:-0} == 1 ) && $market == spot ]]; then
     kill -KILL "$$"
-  fi
-  if [[ $TEST_ONLY != true ]]; then
-    exe_path=$(readlink -f -- "$PROC_ROOT/$pid/exe") || die "$market process executable is unavailable"
-    [[ $(sha256_file "$exe_path") == "$candidate_payload" ]] || die "$market process executable identity differs from P1"
   fi
   settle=$(( $(monotonic_seconds) + HEALTH_SETTLE_DURATION_SECONDS )); while ! health_ok "$market"; do (( $(monotonic_seconds) < settle )) || die "$market health did not settle"; [[ $(systemctl_value "$market" NRestarts) == 0 ]] || die "$market restarted while settling"; [[ $(systemctl_value "$market" MainPID) == "$pid" ]] || die "$market MainPID changed while settling"; assert_host_memory_reserve; sleep 1; done
   phase_session["$market"]=$(jq -er '.session_id' "${spool_dir[$market]}/health.json"); frozen_symbol_count[$market]=$(jq -er '.symbol_count' "${spool_dir[$market]}/health.json"); frozen_catalog_sha256[$market]=$(health_catalog_sha256 "$market"); initial_upload_failure_count[$market]=$(jq -er '.upload_failure_count' "${spool_dir[$market]}/health.json"); last_health_updated_ns[$market]=$(jq -er '.updated_at_ns' "${spool_dir[$market]}/health.json"); last_health_advance_mono[$market]=$(monotonic_seconds); max_health_silence_seconds[$market]=0; health_samples[$market]=1; market_observation_started_ns[$market]=$(date +%s%N)
