@@ -456,11 +456,29 @@ io_psi_monotonic_us() {
     value=${values[${preflight_psi_monotonic_sample_number:-0}]:-}
     [[ $value =~ ^(0|[1-9][0-9]*)$ ]] || return 1
     printf '%s\n' "$value"
+  elif [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RESOURCE_MONITOR_ASYNC:-0} == 1 \
+    && -n ${MONDAY_GATE_FIXTURE_RESOURCE_PSI_MONOTONIC_VALUES:-} ]]; then
+    IFS=, read -r -a values <<<"$MONDAY_GATE_FIXTURE_RESOURCE_PSI_MONOTONIC_VALUES"
+    value=${values[${resource_psi_monotonic_sample_number:-0}]:-}
+    if [[ ${MONDAY_GATE_FIXTURE_RESOURCE_PSI_MONOTONIC_INITIAL_FAILURE:-0} == 1 \
+      && ${resource_psi_monotonic_sample_number:-0} == 0 ]]; then
+      return 1
+    fi
+    if [[ -n ${MONDAY_GATE_FIXTURE_RESOURCE_PSI_MONOTONIC_FAIL_AT:-} \
+      && ${resource_psi_monotonic_sample_number:-0} == "$MONDAY_GATE_FIXTURE_RESOURCE_PSI_MONOTONIC_FAIL_AT" ]]; then
+      return 1
+    fi
+    [[ $value =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+    printf '%s\n' "$value"
   elif [[ $TEST_ONLY == true && ! -r "$PROC_ROOT/uptime" ]]; then
     # Fixture roots intentionally omit /proc/uptime.  Advance one exact
     # reference window per observed sample so the offline contract exercises
     # the same elapsed-time gate without sleeping.
-    printf '%s\n' "$(( ${preflight_psi_monotonic_sample_number:-0} * IO_PSI_WINDOW_US ))"
+    if [[ ${MONDAY_GATE_FIXTURE_RESOURCE_MONITOR_ASYNC:-0} == 1 ]]; then
+      printf '%s\n' "$(( ${resource_psi_monotonic_sample_number:-0} * 5000000 ))"
+    else
+      printf '%s\n' "$(( ${preflight_psi_monotonic_sample_number:-0} * IO_PSI_WINDOW_US ))"
+    fi
   else
     awk '{printf "%.0f\n", $1 * 1000000}' "$PROC_ROOT/uptime"
   fi
@@ -473,12 +491,29 @@ proc_starttime() {
   awk '{ if ($22 !~ /^[0-9]+$/) exit 1; print $22 }' "$stat_file"
 }
 preflight_psi_sample_number=0
+resource_psi_sample_number=0
+resource_psi_monotonic_sample_number=0
 io_total_us() {
   if [[ $TEST_ONLY == true && $PREFLIGHT_ONLY == true \
     && -n ${MONDAY_GATE_FIXTURE_PREFLIGHT_PSI_VALUES:-} ]]; then
     local -a values=() value
     IFS=, read -r -a values <<<"$MONDAY_GATE_FIXTURE_PREFLIGHT_PSI_VALUES"
     value=${values[${preflight_psi_sample_number:-0}]:-}
+    [[ $value =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+    printf '%s\n' "$value"
+  elif [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RESOURCE_MONITOR_ASYNC:-0} == 1 \
+    && -n ${MONDAY_GATE_FIXTURE_RESOURCE_PSI_VALUES:-} ]]; then
+    local -a values=() value
+    IFS=, read -r -a values <<<"$MONDAY_GATE_FIXTURE_RESOURCE_PSI_VALUES"
+    value=${values[${resource_psi_sample_number:-0}]:-}
+    if [[ ${MONDAY_GATE_FIXTURE_RESOURCE_PSI_INITIAL_FAILURE:-0} == 1 \
+      && ${resource_psi_sample_number:-0} == 0 ]]; then
+      return 1
+    fi
+    if [[ -n ${MONDAY_GATE_FIXTURE_RESOURCE_PSI_FAIL_AT:-} \
+      && ${resource_psi_sample_number:-0} == "$MONDAY_GATE_FIXTURE_RESOURCE_PSI_FAIL_AT" ]]; then
+      return 1
+    fi
     [[ $value =~ ^(0|[1-9][0-9]*)$ ]] || return 1
     printf '%s\n' "$value"
   elif [[ $TEST_ONLY == true && ! -f $PSI_SOURCE ]]; then
@@ -1781,7 +1816,7 @@ resource_monitor_start() {
   resource_monitor_phase=$phase
   record_resource "$phase" "$phase_max"
   verify_gate_worker_slice || die "run-scoped Gate worker slice is not an exact live envelope before $phase"
-  if [[ $TEST_ONLY == true ]]; then
+  if [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RESOURCE_MONITOR_ASYNC:-0} != 1 ]]; then
     # The fixture normally skips the asynchronous monitor, but this hook
     # exercises the same identity guard synchronously before a writer starts.
     if [[ ${MONDAY_GATE_FIXTURE_IDENTITY_DRIFT:-0} == 1 ]]; then
@@ -1798,14 +1833,43 @@ resource_monitor_start() {
     fi
     return 0
   fi
+  if [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RESOURCE_MONITOR_ASYNC:-0} == 1 ]]; then
+    [[ ${MONDAY_GATE_FIXTURE_RESOURCE_PSI_SAMPLE_LIMIT:-} =~ ^[1-9][0-9]*$ ]] \
+      || die 'async resource monitor fixture requires a positive sample limit'
+  fi
   resource_monitor_control="$tmp_dir/resource-monitor-$phase.running"
   resource_monitor_log="$tmp_dir/resource-monitor-$phase.tsv"
   resource_monitor_psi_log="$tmp_dir/resource-monitor-$phase.psi.ndjson"
   : >"$resource_monitor_control"; : >"$resource_monitor_log"
   : >"$resource_monitor_psi_log"
+  resource_psi_sample_number=0
+  resource_psi_monotonic_sample_number=0
   initial_available=$(meminfo_bytes MemAvailable) || die 'MemAvailable became unavailable during Gate'
-  initial_psi=$(io_total_us 2>/dev/null || printf 0)
-  initial_psi_mono=$(io_psi_monotonic_us) || die 'I/O PSI monotonic clock is unavailable during Gate'
+  if [[ ! $initial_available =~ ^(0|[1-9][0-9]*)$ ]]; then
+    resource_monitor_record_breach "$phase" memory-breach 0 0 0 0 || true
+    resource_monitor_capture_breach "$phase" || true
+    die "MemAvailable became invalid before $phase"
+  fi
+  if ! initial_psi=$(io_total_us 2>/dev/null); then
+    resource_monitor_record_breach "$phase" psi-unavailable 0 0 0 0 || true
+    resource_monitor_capture_breach "$phase" || true
+    die "I/O PSI unavailable before $phase"
+  fi
+  if [[ ! $initial_psi =~ ^(0|[1-9][0-9]*)$ ]]; then
+    resource_monitor_record_breach "$phase" psi-unavailable 0 0 0 0 || true
+    resource_monitor_capture_breach "$phase" || true
+    die "I/O PSI value is invalid before $phase"
+  fi
+  if ! initial_psi_mono=$(io_psi_monotonic_us 2>/dev/null); then
+    resource_monitor_record_breach "$phase" psi-unavailable 0 0 0 0 || true
+    resource_monitor_capture_breach "$phase" || true
+    die "I/O PSI monotonic clock unavailable before $phase"
+  fi
+  if [[ ! $initial_psi_mono =~ ^(0|[1-9][0-9]*)$ ]]; then
+    resource_monitor_record_breach "$phase" psi-unavailable 0 0 0 0 || true
+    resource_monitor_capture_breach "$phase" || true
+    die "I/O PSI monotonic value is invalid before $phase"
+  fi
   printf '%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$initial_available" "$initial_psi" >"$resource_monitor_log"
   parent_pid=$$
   parent_starttime=$(proc_starttime "$parent_pid") || die 'resource monitor parent starttime is unavailable'
@@ -1814,7 +1878,7 @@ resource_monitor_start() {
     local last_psi=$initial_psi window_start_psi=$initial_psi
     local window_start_mono=$initial_psi_mono current_mono elapsed_us
     local available current_psi current_parent_starttime transition delta ratio hit consecutive_hits=0
-    local snapshot window_start_at current_at
+    local snapshot window_start_at current_at fixture_sample_limit=${MONDAY_GATE_FIXTURE_RESOURCE_PSI_SAMPLE_LIMIT:-}
     window_start_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     while [[ -e $resource_monitor_control ]]; do
       current_parent_starttime=$(proc_starttime "$parent_pid" 2>/dev/null || true)
@@ -1823,8 +1887,22 @@ resource_monitor_start() {
         break
       fi
       available=$(meminfo_bytes MemAvailable 2>/dev/null || printf 0)
-      current_psi=$(io_total_us 2>/dev/null || printf 0)
-      current_mono=$(io_psi_monotonic_us 2>/dev/null || true)
+      if [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RESOURCE_MONITOR_ASYNC:-0} == 1 ]]; then
+        resource_psi_sample_number=$((resource_psi_sample_number + 1))
+        resource_psi_monotonic_sample_number=$resource_psi_sample_number
+      fi
+      if ! current_psi=$(io_total_us 2>/dev/null) \
+        || [[ ! $current_psi =~ ^(0|[1-9][0-9]*)$ ]]; then
+        resource_monitor_record_breach "$phase" psi-unavailable 0 0 0 "$consecutive_hits" || true
+        kill -TERM "$parent_pid" 2>/dev/null || true
+        break
+      fi
+      if ! current_mono=$(io_psi_monotonic_us 2>/dev/null) \
+        || [[ ! $current_mono =~ ^(0|[1-9][0-9]*)$ ]]; then
+        resource_monitor_record_breach "$phase" psi-unavailable 0 0 0 "$consecutive_hits" || true
+        kill -TERM "$parent_pid" 2>/dev/null || true
+        break
+      fi
       printf '%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$available" "$current_psi" >>"$resource_monitor_log"
       snapshot=$(capture_production_snapshot 2>/dev/null || true)
       if ! resource_monitor_identity_guard "$snapshot"; then
@@ -1879,10 +1957,20 @@ resource_monitor_start() {
         window_start_at=$current_at
       fi
       last_psi=$current_psi
-      sleep 5
+      if [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RESOURCE_MONITOR_ASYNC:-0} == 1 ]]; then
+        if (( resource_psi_sample_number >= fixture_sample_limit )); then
+          rm -f -- "$resource_monitor_control"
+          break
+        fi
+      else
+        sleep 5
+      fi
     done
   ) &
   resource_monitor_pid=$!
+  if [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RESOURCE_MONITOR_ASYNC:-0} == 1 ]]; then
+    wait "$resource_monitor_pid" 2>/dev/null || true
+  fi
 }
 resource_monitor_breach_cause() {
   local cause=unknown
@@ -1890,7 +1978,7 @@ resource_monitor_breach_cause() {
     IFS= read -r cause <"$tmp_dir/resource-monitor-breach" || cause=unknown
   fi
   case "$cause" in
-    fixture-resource-breach|memory-breach|production-identity-drift|production-snapshot-invalid|psi-regressed|psi-stop-rule) ;;
+    fixture-resource-breach|memory-breach|production-identity-drift|production-snapshot-invalid|psi-regressed|psi-stop-rule|psi-unavailable) ;;
     *) cause=unknown ;;
   esac
   printf '%s\n' "$cause"
@@ -1922,7 +2010,7 @@ resource_monitor_stop() {
   local phase=$resource_monitor_phase ended samples max_available current_available breach required phase_max parent_pid parent_starttime
   local parent_current child_sum growth
   [[ -n ${resource_monitor_pid:-} ]] || return 0
-  if [[ $TEST_ONLY == true ]]; then
+  if [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RESOURCE_MONITOR_ASYNC:-0} != 1 ]]; then
     breach=false; [[ -f $tmp_dir/resource-monitor-breach ]] && breach=true
     if [[ $breach == true ]]; then
       resource_monitor_capture_breach "${phase:-unknown}" || true
@@ -2252,6 +2340,9 @@ fi
 
 calibrate_psi preflight; resource_monitor_start preflight "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; \
   resource_monitor_stop_or_die preflight; write_run_json
+if [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RESOURCE_MONITOR_ONLY:-0} == 1 ]]; then
+  exit 0
+fi
 if [[ $FROM_CONTROLLER != direct ]]; then
   for asset in "${SHADOW_ASSETS[@]}"; do
     [[ ${saved_state[$asset]} == present || ${saved_state[$asset]} == projection ]] || die "before shadow asset is absent: $asset"

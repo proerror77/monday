@@ -986,6 +986,142 @@ if grep -Fq 'resource monitor breached during' "$ROOT/run/resource-stop-failure.
   exit 1
 fi
 
+# Exercise the asynchronous resource monitor through its real start/stop
+# state machine without sleeping.  The fixture supplies cumulative PSI totals
+# and monotonic timestamps; production still uses /proc and five-second polls.
+run_async_resource_monitor() {
+  local label=$1 values=$2 monotonic_values=$3 sample_limit=$4 initial_failure=${5:-0} fail_at=${6:-}
+  local output="$ROOT/run/async-resource-$label.err" before_runs after_runs
+  async_monitor_rc=0; async_monitor_run=; async_monitor_output=$output
+  before_runs=$(find "$ROOT/data/monday/evidence/shadow-gates/$c0/$candidate_runtime_sha/runs" \
+    -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | LC_ALL=C sort || true)
+  if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_RESOURCE_MONITOR_ASYNC=1 \
+    MONDAY_GATE_FIXTURE_RESOURCE_MONITOR_ONLY=1 \
+    MONDAY_GATE_FIXTURE_RESOURCE_PSI_VALUES="$values" \
+    MONDAY_GATE_FIXTURE_RESOURCE_PSI_MONOTONIC_VALUES="$monotonic_values" \
+    MONDAY_GATE_FIXTURE_RESOURCE_PSI_SAMPLE_LIMIT="$sample_limit" \
+    MONDAY_GATE_FIXTURE_RESOURCE_PSI_INITIAL_FAILURE="$initial_failure" \
+    MONDAY_GATE_FIXTURE_RESOURCE_PSI_FAIL_AT="$fail_at" \
+    MONDAY_GATE_FIXTURE_BOOTSTRAP_UNLIMITED=1 MONDAY_GATE_FIXTURE_BOOTSTRAP_LEASE_USAGE=1 \
+    MONDAY_GATE_FIXTURE_RECORD_CALLS=1 MONDAY_ROOT="$ROOT" \
+    bash -c '
+      root=$1; shift
+      mkdir -p "$root/proc/$$"
+      printf "1 fixture S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 4242\\n" >"$root/proc/$$/stat"
+      exec "$@"
+    ' _ "$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+    --candidate-controller "$c0" --root "$ROOT" >"$output" 2>&1; then
+    async_monitor_rc=0
+  else
+    async_monitor_rc=$?
+  fi
+  after_runs=$(find "$ROOT/data/monday/evidence/shadow-gates/$c0/$candidate_runtime_sha/runs" \
+    -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | LC_ALL=C sort || true)
+  async_monitor_run=$(comm -13 <(printf '%s\n' "$before_runs") \
+    <(printf '%s\n' "$after_runs") | sed '/^$/d' | tail -n1)
+  [[ -n $async_monitor_run ]] || {
+    printf 'async resource fixture %s did not leave an evidence run\n' "$label" >&2
+    cat "$output" >&2
+    exit 1
+  }
+}
+assert_async_monitor_cleanup() {
+  local label=$1 expected_rc=$2 expected_cause=${3:-}
+  [[ $async_monitor_rc == "$expected_rc" ]] || {
+    printf 'async resource fixture %s returned %s (expected %s)\n' \
+      "$label" "$async_monitor_rc" "$expected_rc" >&2
+    cat "$async_monitor_output" >&2
+    exit 1
+  }
+  [[ ! -e "$ROOT/run/monday/rust-lob-gate/${async_monitor_run##*/}" \
+    && ! -e "$ROOT/data/monday/spool/binance-lob-rust-shadow/gate/${async_monitor_run##*/}" ]] || {
+    printf 'async resource fixture %s left run-scoped residue\n' "$label" >&2
+    exit 1
+  }
+  async_monitor_lease=$(find "$ROOT/run/monday/rust-lob-gate" -maxdepth 1 \
+    -type f -name "bootstrap-slice-lease-${async_monitor_run##*/}.json" -print -quit 2>/dev/null || true)
+  [[ -f $async_monitor_lease ]] || {
+    printf 'async resource fixture %s did not leave its restored lease audit\n' "$label" >&2
+    exit 1
+  }
+  jq -e '.restored == true' "$async_monitor_lease" >/dev/null || {
+    printf 'async resource fixture %s did not restore its lease\n' "$label" >&2
+    exit 1
+  }
+  if find "$async_monitor_run" -type f \( -name gate.json -o -name PASSED.sha256 \) \
+    -print -quit 2>/dev/null | grep -q .; then
+    printf 'async resource fixture %s left an authoritative receipt\n' "$label" >&2
+    exit 1
+  fi
+  [[ $(monday_active_controller_sha "$ROOT") == "$resource_breach_active_before" \
+    && $(readlink -- "$ROOT/opt/monday/bin/binance-lob-archiver") == "$resource_breach_payload_before" \
+    && $(monday_sha256_file "$production_spool_root/spot/upload-status.json") == "$production_spot_status_sha" \
+    && $(monday_sha256_file "$production_spool_root/usdm/upload-status.json") == "$production_usdm_status_sha" ]] || {
+    printf 'async resource fixture %s changed the production pair or spool\n' "$label" >&2
+    exit 1
+  }
+  if [[ -n $expected_cause ]]; then
+    async_monitor_failure="$async_monitor_run/resource-monitor-failure.json"
+    jq -e --arg cause "$expected_cause" \
+      '.authoritative == false and .cause == $cause and (.diagnostic.authoritative == false)' \
+      "$async_monitor_failure" >/dev/null || {
+      printf 'async resource fixture %s missing %s failure diagnostic\n' "$label" "$expected_cause" >&2
+      exit 1
+    }
+    grep -Fq "resource monitor breached during preflight: $expected_cause" "$async_monitor_output" || {
+      printf 'async resource fixture %s did not report %s\n' "$label" "$expected_cause" >&2
+      exit 1
+    }
+  fi
+}
+
+# (f) Five/ten-second observations do not adjudicate a hit; the first hit is
+# recorded only when a full 15-second window closes.
+run_async_resource_monitor first-hit 0,50000,100000,150000 0,5000000,10000000,15000000 3
+assert_async_monitor_cleanup first-hit 0
+first_hit_run_json="$async_monitor_run/run.json"
+jq -e '([.io_full_psi_windows[] | select(.stage == "runtime")] | length == 1)
+  and ([.io_full_psi_windows[] | select(.stage == "runtime")][0]
+    | .elapsed_us == 15000000 and .window_us == 15000000
+      and .delta_us == 150000 and .ratio == 0.01 and .hit == true
+      and .consecutive_hits == 1)' "$first_hit_run_json" >/dev/null
+# (g) A 10s/80ms high partial interval is ignored; the complete 15s window is
+# below the 1% threshold.
+run_async_resource_monitor partial-no-hit 0,40000,80000,90000,100000 \
+  0,5000000,10000000,10080000,15000000 4
+assert_async_monitor_cleanup partial-no-hit 0
+jq -e '([.io_full_psi_windows[] | select(.stage == "runtime")][0]
+  | .elapsed_us == 15000000 and .delta_us == 100000 and .hit == false
+    and .consecutive_hits == 0)' "$async_monitor_run/run.json" >/dev/null
+# (h) Three complete threshold windows stop the parent with a PSI diagnostic.
+run_async_resource_monitor three-window-stop \
+  0,150000,300000,450000 0,15000000,30000000,45000000 3
+assert_async_monitor_cleanup three-window-stop 143 psi-stop-rule
+jq -e '.elapsed_us == 15000000 and .delta_us == 150000
+  and .ratio == 0.01 and .consecutive_hits == 3' \
+  "$async_monitor_run/resource-monitor-failure.json" >/dev/null
+if grep -Fq 'run-scoped Gate cleanup was incomplete' "$async_monitor_output"; then
+  printf 'three-window PSI breach was misreported as cleanup incomplete\n' >&2
+  exit 1
+fi
+# (i) A low complete window resets the consecutive counter before a later hit.
+run_async_resource_monitor low-window-reset \
+  0,150000,160000,310000 0,15000000,30000000,45000000 3
+assert_async_monitor_cleanup low-window-reset 0
+jq -e '([.io_full_psi_windows[] | select(.stage == "runtime")] | map(.consecutive_hits))
+  == [1,0,1]' "$async_monitor_run/run.json" >/dev/null
+# (j) Cumulative PSI counters may not regress.
+run_async_resource_monitor counter-regression 0,150000,100000 \
+  0,15000000,30000000 2
+assert_async_monitor_cleanup counter-regression 143 psi-regressed
+# (k) Initial and running PSI failures are explicit fail-closed breaches; no
+# fallback zero is accepted.  The second case uses a non-integer counter.
+run_async_resource_monitor initial-unavailable 0,0 0,15000000 1 1
+assert_async_monitor_cleanup initial-unavailable 1 psi-unavailable
+run_async_resource_monitor current-noninteger 0,50000,not-an-integer \
+  0,5000000,10000000 2
+assert_async_monitor_cleanup current-noninteger 143 psi-unavailable
+
 gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_BOOTSTRAP_UNLIMITED=1 \
   MONDAY_GATE_FIXTURE_BOOTSTRAP_LEASE_USAGE=1 MONDAY_ROOT="$ROOT" \
   bash -c '
