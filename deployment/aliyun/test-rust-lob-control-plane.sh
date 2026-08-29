@@ -641,6 +641,62 @@ preflight_residue_after=$(find "$ROOT/data/monday/spool/binance-lob-rust-shadow"
   exit 1
 }
 
+# A resource monitor breach during direct bootstrap must return to its caller
+# so EXIT cleanup can restore the temporary production lease and remove every
+# run-scoped writer path.  Keep the restored lease JSON as audit evidence, but
+# do not create a receipt or change the production pair/spool.
+resource_breach_lease_before=$(find "$ROOT/run/monday/rust-lob-gate" \
+  -maxdepth 1 -type f -name 'bootstrap-slice-lease-*.json' -print 2>/dev/null | LC_ALL=C sort || true)
+resource_breach_active_before=$(monday_active_controller_sha "$ROOT")
+resource_breach_payload_before=$(readlink -- "$ROOT/opt/monday/bin/binance-lob-archiver")
+rm -f -- "$ROOT/run/gate-fixture.calls"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_RESOURCE_BREACH=1 \
+  MONDAY_GATE_FIXTURE_BOOTSTRAP_UNLIMITED=1 MONDAY_GATE_FIXTURE_BOOTSTRAP_LEASE_USAGE=1 \
+  MONDAY_GATE_FIXTURE_RECORD_CALLS=1 MONDAY_ROOT="$ROOT" \
+  bash -c '
+    root=$1; shift
+    mkdir -p "$root/proc/$$"
+    printf "1 fixture S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 4242\\n" >"$root/proc/$$/stat"
+    printf "%s\\n" "$$" >"$root/run/resource-breach-gate.pid"
+    exec "$@"
+  ' _ "$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --root "$ROOT" \
+  >"$ROOT/run/resource-breach.err" 2>&1; then
+  printf 'Gate accepted an injected direct-bootstrap resource monitor breach\n' >&2
+  exit 1
+fi
+resource_breach_gate_pid=$(cat "$ROOT/run/resource-breach-gate.pid")
+rm -rf -- "$ROOT/proc/$resource_breach_gate_pid" "$ROOT/run/resource-breach-gate.pid"
+grep -Fq 'resource monitor breached during preflight' "$ROOT/run/resource-breach.err"
+resource_breach_lease_after=$(find "$ROOT/run/monday/rust-lob-gate" \
+  -maxdepth 1 -type f -name 'bootstrap-slice-lease-*.json' -print 2>/dev/null | LC_ALL=C sort || true)
+resource_breach_new_lease=$(comm -13 <(printf '%s\n' "$resource_breach_lease_before") \
+  <(printf '%s\n' "$resource_breach_lease_after"))
+[[ $(printf '%s\n' "$resource_breach_new_lease" | sed '/^$/d' | wc -l | tr -d ' ') == 1 ]]
+resource_breach_lease=$(printf '%s\n' "$resource_breach_new_lease" | sed '/^$/d')
+jq -e '.mode == "temporary-bootstrap" and .restored == true
+  and .before_memory_high == "infinity" and .before_memory_max == "infinity"
+  and .requested_memory_high == "3072M" and .requested_memory_max == "3584M"' \
+  "$resource_breach_lease" >/dev/null
+resource_breach_run=$(jq -er '.run_id' "$resource_breach_lease")
+resource_breach_slice="mondayrustlobgate${resource_breach_run//[^0-9]/}.slice"
+[[ ! -e "$ROOT/run/monday/rust-lob-gate/$resource_breach_run" ]]
+[[ ! -e "$ROOT/data/monday/spool/binance-lob-rust-shadow/gate/$resource_breach_run" ]]
+[[ ! -e "$ROOT/run/systemd/system/$resource_breach_slice" ]]
+[[ ! -e "$ROOT/run/systemd/system/monday-rust-lob-gate-${resource_breach_run}-lease-recovery.service" ]]
+[[ ! -e "$ROOT/run/systemd/system/monday-rust-lob-gate-${resource_breach_run}-lease-recovery.timer" ]]
+grep -Fqx 'set-property' "$ROOT/run/gate-fixture.calls"
+[[ $(grep -Fc 'set-property' "$ROOT/run/gate-fixture.calls") == 2 ]]
+if find "$ROOT/data/monday/evidence/shadow-gates/$c0" -type f \
+  \( -name gate.json -o -name PASSED.sha256 \) -print -quit 2>/dev/null | grep -q .; then
+  printf 'resource monitor breach left an authoritative Gate receipt\n' >&2
+  exit 1
+fi
+[[ $(monday_active_controller_sha "$ROOT") == "$resource_breach_active_before" ]]
+[[ $(readlink -- "$ROOT/opt/monday/bin/binance-lob-archiver") == "$resource_breach_payload_before" ]]
+[[ $(monday_sha256_file "$production_spool_root/spot/upload-status.json") == "$production_spot_status_sha" ]]
+[[ $(monday_sha256_file "$production_spool_root/usdm/upload-status.json") == "$production_usdm_status_sha" ]]
+
 gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
   --from-controller direct --candidate-controller "$c0" --root "$ROOT")
