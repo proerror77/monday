@@ -22,6 +22,10 @@ production_slice_asset='system-binance\x2dlob\x2darchiver\x2dproduction.slice'
   printf 'Resource Envelope V2 slice asset is missing\n' >&2
   exit 1
 }
+[[ $(monday_sha256_file "$SCRIPT_DIR/$production_slice_asset") =~ ^[a-f0-9]{64}$ ]] || {
+  printf 'Resource Envelope V2 slice digest is not a canonical SHA-256\n' >&2
+  exit 1
+}
 [[ $(monday_runtime_assets | wc -l | tr -d '[:space:]') == 9 ]] || {
   printf 'Resource Envelope V2 must publish exactly nine runtime assets\n' >&2
   exit 1
