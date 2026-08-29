@@ -4,9 +4,10 @@
 # public-data collector host (monday-trade-data-26, Aliyun Tokyo ap-northeast-1).
 #
 # Guards against a silent recurrence of the 2026-08-05/06 disk-full incident in
-# which every governed collector stopped, uploads failed, and delay-gate trips
-# accumulated while the only on-host monitor (polymarket-market-tape-upload-
-# watchdog.sh) self-healed without ever alerting a human.
+# which every governed collector stopped and uploads failed while the only
+# on-host monitor (polymarket-market-tape-upload-watchdog.sh) self-healed
+# without ever alerting a human. Reconnect evidence comes from the collector's
+# typed health counters; this monitor does not scan the journal.
 #
 # Health contract: hard gates, each a breach that fails closed into the
 # monitor-collector-host workflow issue, plus the raw-ops Gate containment
@@ -54,8 +55,7 @@
 # state.
 #
 # Everything else is a WARNING: unit/timer active+enabled state, systemd
-# Result, restart-rate deltas, health.json freshness/gaps, journald delay-gate
-# trips, and fee snapshot journal failures.
+# Result, restart-rate deltas, and health.json freshness/sequence counters.
 # Warnings are reported in the JSON warnings array (and as warning: lines in
 # text mode) but never block ok:true.
 #
@@ -90,19 +90,14 @@ HEALTH_SILENCE_SECONDS=300
 DISK_WARN_PERCENT=25
 DISK_CRIT_PERCENT=15
 RESTART_MAX_DELTA=1
-# journalctl --since value; must be a timestamp journalctl can parse
-# ("15min" is rejected with "Failed to parse timestamp" and would read as a
-# permanent journald-query warning).
-DELAY_GATE_WINDOW='15 min ago'
-FEE_FAILURE_WINDOW='10 min ago'
-
 # Gate 2: last_success_at freshness per lane, set just above the lane's upload
 # cadence:
 # - LOB segments rotate every SEGMENT_SECONDS (default 3600s) and the
 #   in-process upload loop runs every 300s, so a healthy lane uploads at least
 #   once per rotation; allow two full rotations.
 # - fee snapshots publish every 60s and binance-fee-upload.timer retries every
-#   60s (mirrors the FEE_FAILURE_WINDOW='10 min ago' journal window).
+#   60s; fee delivery is hard-gated by upload-status.json and the oneshot
+#   Result observed below.
 # - usdm-reference runs on a 5-minute upload timer over hourly reference
 #   batches.
 # - both polymarket lanes rotate tapes hourly
@@ -258,6 +253,16 @@ read_prior() {
   # $1 = state key (e.g. "nrestarts|<unit>"); prints prior value or empty
   if [ -f "$STATE_FILE" ]; then
     grep "^$1=" "$STATE_FILE" 2>/dev/null | head -n1 | cut -d= -f2-
+  fi
+}
+
+preserve_sequence_prior() {
+  # Invalid or missing health observations must never erase the last valid
+  # session/counter baseline when write_state atomically replaces the file.
+  if [ "$DRY_RUN" -eq 0 ] && [ -n "${prior_session:-}" ] \
+    && [ -n "${prior_total:-}" ]; then
+    sequence_gap_previous_total_json=$prior_total
+    state_lines="$state_lines sequence_gap_session|$label=$prior_session sequence_gap_total|$label=$prior_total"
   fi
 }
 
@@ -626,40 +631,148 @@ check_raw_ops_gate() {
 }
 
 check_binance_health() {
-  # health.json at /data/monday/spool/binance-lob/<market>/: freshness and
-  # sequence gaps are soft signals (warnings); the hard LOB gates run on
-  # upload-status.json and the pending segment backlog.
+  # health.json at /data/monday/spool/binance-lob/<market>/: freshness and the
+  # collector's typed, session-scoped sequence-gap counter are soft signals
+  # (warnings). The hard LOB gates run on upload-status.json and the pending
+  # segment backlog. sequence_gap_total is cumulative only within session_id;
+  # a new session or a counter regression establishes a new baseline instead
+  # of fabricating a delta. Malformed counters retain the last valid baseline.
   label=$1
   spool_dir=$2
   health_file="$spool_dir/health.json"
   age=0
   gaps=0
+  sequence_gap_total_json=null
+  sequence_gap_delta_json=null
+  sequence_gap_previous_total_json=null
+  sequence_gap_session_json=null
+  sequence_gap_observed=0
+  sequence_gap_baseline=missing
   hwarn=false
   hstatus=unknown
+  prior_session=''
+  prior_total=''
+  if [ "$DRY_RUN" -eq 0 ]; then
+    prior_session=$(read_prior "sequence_gap_session|$label")
+    prior_total=$(read_prior "sequence_gap_total|$label")
+    case "$prior_total" in
+      '' | *[!0-9]*) prior_total='' ;;
+    esac
+  fi
   if [ ! -f "$health_file" ] || [ -L "$health_file" ]; then
     record_warning "$label: health.json missing or a symbolic link ($health_file)"
+    sequence_gap_baseline=missing
+    preserve_sequence_prior
     age=999999
   elif ! updated_ns=$(jq -r '.updated_at_ns // 0' "$health_file" 2>/dev/null); then
     record_warning "$label: health.json unparseable ($health_file)"
+    sequence_gap_baseline=malformed
+    preserve_sequence_prior
     age=999999
   else
     gaps=$(jq -r '.sequence_gaps // 0' "$health_file" 2>/dev/null || printf '0')
     hwarn=$(jq -r '.disk_warning // false' "$health_file" 2>/dev/null || printf 'false')
     hstatus=$(jq -r '.status // "unknown"' "$health_file" 2>/dev/null || printf 'unknown')
     case "$gaps" in (*[!0-9]*|'') gaps=0 ;; esac
-    case "$updated_ns" in (*[!0-9]*|'') updated_ns=0 ;; esac
+    if [ "$gaps" -gt 0 ]; then
+      record_warning "$label: sequence_gaps=$gaps"
+    fi
+    updated_ns_valid=1
+    case "$updated_ns" in
+      (*[!0-9]*|'') updated_ns=0; updated_ns_valid=0 ;;
+    esac
     updated_sec=$((updated_ns / 1000000000))
     age=$((NOW_SEC - updated_sec))
     [ "$age" -lt 0 ] && age=0
     if [ "$age" -gt "$HEALTH_SILENCE_SECONDS" ]; then
       record_warning "$label: health.json stale (age ${age}s > ${HEALTH_SILENCE_SECONDS}s)"
     fi
-    if [ "$gaps" -gt 0 ]; then
-      record_warning "$label: sequence_gaps=$gaps"
+
+    # A session id is deliberately constrained to the collector's opaque,
+    # single-token identity format before it can enter the line-oriented state
+    # file. The counter must be a non-negative integer JSON number; strings,
+    # fractions, negatives, and missing fields are malformed rather than zero.
+    session_id=$(jq -r '
+      if (.session_id? | type) == "string" and (.session_id | length) > 0
+        then .session_id else empty end' "$health_file" 2>/dev/null || true)
+    sequence_gap_total=$(jq -r '
+      if (.sequence_gap_total? | type) == "number"
+        and (.sequence_gap_total | floor) == .sequence_gap_total
+        and .sequence_gap_total >= 0
+        then (.sequence_gap_total | tostring) else empty end' \
+      "$health_file" 2>/dev/null || true)
+    session_valid=0
+    case "$session_id" in
+      '' | *[!A-Za-z0-9._:-]*) ;;
+      *) session_valid=1 ;;
+    esac
+    total_valid=0
+    case "$sequence_gap_total" in
+      '' | *[!0-9]*) ;;
+      *) total_valid=1 ;;
+    esac
+
+    if [ "$session_valid" -eq 1 ]; then
+      sequence_gap_session_json=$(jq -Rn --arg s "$session_id" '$s')
+    fi
+    if [ "$total_valid" -eq 1 ]; then
+      sequence_gap_total_json=$sequence_gap_total
+    fi
+
+    if [ "$updated_ns_valid" -eq 0 ]; then
+      record_warning "$label: health.json updated_at_ns malformed"
+      sequence_gap_baseline=malformed
+      preserve_sequence_prior
+    elif [ "$session_valid" -eq 1 ] && [ "$total_valid" -eq 1 ]; then
+      sequence_gap_observed=1
+      if [ "$DRY_RUN" -eq 1 ]; then
+        sequence_gap_baseline=dry_run
+      elif [ -z "$prior_session" ] || [ -z "$prior_total" ]; then
+        sequence_gap_baseline=baseline
+        sequence_gap_previous_total_json=null
+      else
+        sequence_gap_previous_total_json=$prior_total
+        if [ "$session_id" != "$prior_session" ]; then
+          sequence_gap_baseline=session_changed
+          record_warning "$label: sequence_gap session changed ($prior_session -> $session_id); baseline reset at total=$sequence_gap_total"
+        elif [ "$sequence_gap_total" -gt "$prior_total" ]; then
+          sequence_gap_delta=$((sequence_gap_total - prior_total))
+          sequence_gap_delta_json=$sequence_gap_delta
+          sequence_gap_baseline=increased
+          record_warning "$label: sequence_gap_total increased $prior_total -> $sequence_gap_total (delta=$sequence_gap_delta)"
+        elif [ "$sequence_gap_total" -lt "$prior_total" ]; then
+          sequence_gap_baseline=regressed
+          record_warning "$label: sequence_gap_total regressed $prior_total -> $sequence_gap_total; baseline reset"
+        else
+          sequence_gap_baseline=stable
+          sequence_gap_delta_json=0
+        fi
+      fi
+      if [ "$DRY_RUN" -eq 0 ]; then
+        state_lines="$state_lines sequence_gap_session|$label=$session_id sequence_gap_total|$label=$sequence_gap_total"
+      fi
+    else
+      record_warning "$label: health.json sequence counter malformed (session_id/sequence_gap_total)"
+      sequence_gap_baseline=malformed
+      # Preserve the prior valid baseline instead of replacing it with a
+      # fabricated zero. This lets the next valid poll still detect a delta.
+      preserve_sequence_prior
     fi
   fi
-  hobj=$(jq -n --argjson age "$age" --argjson gaps "$gaps" --arg hw "$hwarn" --arg s "$hstatus" \
-    '{age_seconds: $age, sequence_gaps: $gaps, disk_warning: ($hw == "true"), status: $s}')
+  hobj=$(jq -n --argjson age "$age" --argjson gaps "$gaps" \
+    --argjson total "$sequence_gap_total_json" \
+    --argjson delta "$sequence_gap_delta_json" \
+    --argjson previous "$sequence_gap_previous_total_json" \
+    --argjson session "$sequence_gap_session_json" \
+    --arg baseline "$sequence_gap_baseline" \
+    --argjson observed "$sequence_gap_observed" \
+    --arg hw "$hwarn" --arg s "$hstatus" \
+    '{age_seconds: $age, sequence_gaps: $gaps,
+      sequence_gap_total: $total, sequence_gap_delta: $delta,
+      sequence_gap_previous_total: $previous, session_id: $session,
+      sequence_gap_observed: ($observed == 1),
+      sequence_gap_baseline: $baseline,
+      disk_warning: ($hw == "true"), status: $s}')
   health_json=$(jq -n --argjson base "$health_json" --arg k "$label" --argjson v "$hobj" \
     '$base + {($k): $v}')
 }
@@ -1138,40 +1251,18 @@ check_upload_lane() {
   emit_lane_json "$uobj"
 }
 
-check_delay_gate() {
-  # Journald delay-gate trips (the fail-closed reconnect path) in the last 15m,
-  # observed as warnings. Capture journalctl's own exit status separately: a
-  # successful no-match query is trips=0, while a failed query means the
-  # delay-gate evidence could not be inspected.
-  unit=$1
-  label=$2
-  journal_out=$(journalctl -u "$unit" --since "$DELAY_GATE_WINDOW" --no-pager 2>/dev/null)
-  journal_rc=$?
-  trips=$(printf '%s\n' "$journal_out" \
-    | grep -c 'source-to-receive delay exceeds the governed limit' || true)
-  case "$trips" in (*[!0-9]*|'') trips=0 ;; esac
-  if [ "$journal_rc" -ne 0 ]; then
-    record_warning "$label: journald query failed (exit $journal_rc)"
-  elif [ "$trips" -gt 0 ]; then
-    record_warning "$label: $trips delay-gate trip(s) in last 15 minutes"
-  fi
-  dobj=$(jq -n --argjson t "$trips" '{trips_15m: $t}')
-  delay_gate_json=$(jq -n --argjson base "$delay_gate_json" --arg k "$unit" --argjson v "$dobj" \
-    '$base + {($k): $v}')
-}
-
-check_recent_snapshot_failures() {
-  unit=$1
-  label=$2
-  journal_out=$(journalctl -u "$unit" --since "$FEE_FAILURE_WINDOW" --no-pager 2>/dev/null)
-  journal_rc=$?
-  failures=$(printf '%s\n' "$journal_out" | grep -c 'Failed with result' || true)
-  case "$failures" in (*[!0-9]*|'') failures=0 ;; esac
-  if [ "$journal_rc" -ne 0 ]; then
-    record_warning "$label: snapshot failure journal query failed (exit $journal_rc)"
-  elif [ "$failures" -gt 0 ]; then
-    record_warning "$label: $failures recent snapshot failure(s)"
-  fi
+mark_delay_gate_replaced() {
+  # Keep the historical delay_gate projection for consumers that still parse
+  # it, but make the replacement explicit. The typed health counters are the
+  # sole source for sequence-gap/reconnect evidence; no journal scan occurs.
+  for unit in "$ARCHIVER_SPOT" "$ARCHIVER_USDM"; do
+    dobj=$(jq -n \
+      '{trips_15m: null, observed: false,
+        skipped_reason: "replaced_by_health_sequence_counters",
+        replacement: "checks.health"}')
+    delay_gate_json=$(jq -n --argjson base "$delay_gate_json" --arg k "$unit" \
+      --argjson v "$dobj" '$base + {($k): $v}')
+  done
 }
 
 write_state() {
@@ -1228,13 +1319,12 @@ check_timer "$FEE_USDM_TIMER" "binance-fee-snapshot-usdm.timer"
 check_oneshot_result "$FEE_USDM_SERVICE" "binance-fee-snapshot-usdm.service"
 check_timer "$FEE_UPLOAD_TIMER" "binance-fee-upload.timer"
 check_oneshot_result "$FEE_UPLOAD_SERVICE" "binance-fee-upload.service"
-check_recent_snapshot_failures "$FEE_SPOT_SERVICE" "binance-fee-snapshot-spot.service"
-check_recent_snapshot_failures "$FEE_USDM_SERVICE" "binance-fee-snapshot-usdm.service"
 
 check_raw_ops_gate "$POLY_RAW_OPS_GATE" "polymarket-raw-ops-gate"
 
 check_binance_health "binance-lob-archiver-production@spot" "$SPOOL_ROOT/binance-lob/spot"
 check_binance_health "binance-lob-archiver-production@usdm" "$SPOOL_ROOT/binance-lob/usdm"
+mark_delay_gate_replaced
 check_recovery_queue_root
 check_recovery_queue_market spot
 check_recovery_queue_market usdm
@@ -1253,9 +1343,6 @@ check_upload_lane "polymarket-reference-upload" "$SPOOL_ROOT/polymarket-referenc
   0 "$POLY_SUCCESS_MAX_AGE" "$POLY_PENDING_MAX" "$POLY_PENDING_MAX_AGE" tapes "$POLY_PENDING_STALE_MAX_AGE"
 check_upload_lane "binance-fee-upload" "$SPOOL_ROOT/binance-fee" \
   1 "$FEE_SUCCESS_MAX_AGE" "$FEE_PENDING_MAX" "$FEE_PENDING_MAX_AGE" lake
-
-check_delay_gate "$ARCHIVER_SPOT" "binance-lob-archiver-production@spot"
-check_delay_gate "$ARCHIVER_USDM" "binance-lob-archiver-production@usdm"
 
 write_state
 
