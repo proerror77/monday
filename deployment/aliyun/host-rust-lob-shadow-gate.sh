@@ -165,8 +165,14 @@ fi
 # by this action and cannot mutate a host unit.
 if [[ $TEST_ONLY == true ]]; then
   declare -A fixture_unit_state=()
+  fixture_production_memory_high=3221225472
+  fixture_production_memory_max=3758096384
+  if [[ ${MONDAY_GATE_FIXTURE_BOOTSTRAP_UNLIMITED:-0} == 1 ]]; then
+    fixture_production_memory_high=infinity
+    fixture_production_memory_max=infinity
+  fi
   systemctl() {
-    local action=${1:-} unit_name=${2:-} property value item output_values=false
+    local action=${1:-} unit_name=${2:-} property value item setting target output_values=false
     local -a properties=()
     case "$action" in
       list-units)
@@ -183,6 +189,18 @@ if [[ $TEST_ONLY == true ]]; then
         fixture_unit_state[$unit_name]=inactive; return 0 ;;
       set-property)
         [[ ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] && printf 'set-property\n' >>"$ROOT/run/gate-fixture.calls"
+        target=$unit_name
+        [[ $target == --runtime ]] && target=${3:-}
+        if [[ $target == "$PRODUCTION_SLICE" ]]; then
+          for setting in "$@"; do
+            case "$setting" in
+              MemoryHigh=3072M) fixture_production_memory_high=3221225472 ;;
+              MemoryHigh=*) fixture_production_memory_high=${setting#MemoryHigh=} ;;
+              MemoryMax=3584M) fixture_production_memory_max=3758096384 ;;
+              MemoryMax=*) fixture_production_memory_max=${setting#MemoryMax=} ;;
+            esac
+          done
+        fi
         return 0 ;;
       reset-failed|daemon-reload) return 0 ;;
       is-active)
@@ -228,13 +246,11 @@ if [[ $TEST_ONLY == true ]]; then
             MemoryCurrent) value=1048576 ;;
             MemoryPeak) value=1048576 ;;
             MemoryMax)
-              if [[ $unit_name == "$PRODUCTION_SLICE" && ${MONDAY_GATE_FIXTURE_BOOTSTRAP_UNLIMITED:-0} == 1 ]]; then value=infinity
+              if [[ $unit_name == "$PRODUCTION_SLICE" ]]; then value=$fixture_production_memory_max
               elif [[ $unit_name == binance-lob-archiver-production@* ]]; then value=2684354560
-              elif [[ $unit_name == "$PRODUCTION_SLICE" ]]; then value=3758096384
               else value=1610612736; fi ;;
             MemoryHigh)
-              if [[ $unit_name == "$PRODUCTION_SLICE" && ${MONDAY_GATE_FIXTURE_BOOTSTRAP_UNLIMITED:-0} == 1 ]]; then value=infinity
-              elif [[ $unit_name == "$PRODUCTION_SLICE" ]]; then value=3221225472
+              if [[ $unit_name == "$PRODUCTION_SLICE" ]]; then value=$fixture_production_memory_high
               else value=1342177280; fi ;;
             Slice) [[ $unit_name == binance-lob-archiver-production@* ]] && value=$PRODUCTION_SLICE || value=system.slice ;;
             ControlGroup)
@@ -1218,7 +1234,6 @@ apply_bootstrap_slice_lease() {
 restore_bootstrap_slice_lease() {
   [[ ${bootstrap_slice_lease_mode:-permanent} == temporary-bootstrap ]] || return 0
   [[ ${bootstrap_slice_lease_restored:-false} == true ]] && return 0
-  [[ $TEST_ONLY != true ]] || return 1
   systemctl set-property --runtime "$PRODUCTION_SLICE" \
     "MemoryHigh=$bootstrap_slice_lease_before_high" \
     "MemoryMax=$bootstrap_slice_lease_before_max" >/dev/null 2>&1 || return 1
@@ -1393,6 +1408,10 @@ resource_monitor_start() {
       snapshot=$(capture_production_snapshot 2>/dev/null || true)
       resource_monitor_identity_guard "$snapshot" || die "production identity drifted before $phase"
     fi
+    if [[ ${MONDAY_GATE_FIXTURE_RESOURCE_BREACH:-0} == 1 && $phase == preflight ]]; then
+      printf 'fixture-resource-breach\n' >"$tmp_dir/resource-monitor-breach"
+      resource_monitor_pid=fixture-resource-monitor
+    fi
     return 0
   fi
   resource_monitor_control="$tmp_dir/resource-monitor-$phase.running"
@@ -1448,12 +1467,30 @@ resource_monitor_start() {
   ) &
   resource_monitor_pid=$!
 }
+resource_monitor_breach_cause() {
+  local cause=unknown
+  if [[ -r $tmp_dir/resource-monitor-breach ]]; then
+    IFS= read -r cause <"$tmp_dir/resource-monitor-breach" || cause=unknown
+  fi
+  case "$cause" in
+    fixture-resource-breach|memory-breach|production-identity-drift|production-snapshot-invalid|psi-regressed|psi-stop-rule) ;;
+    *) cause=unknown ;;
+  esac
+  printf '%s\n' "$cause"
+}
 resource_monitor_stop() {
-  local phase=$resource_monitor_phase ended samples max_available current_available breach required phase_max parent_pid parent_starttime
+  local phase=$resource_monitor_phase ended samples max_available current_available breach required phase_max parent_pid parent_starttime cause
   local parent_current child_sum growth
   [[ -n ${resource_monitor_pid:-} ]] || return 0
   if [[ $TEST_ONLY == true ]]; then
-    resource_monitor_pid=; resource_monitor_phase=; return 0
+    breach=false; [[ -f $tmp_dir/resource-monitor-breach ]] && breach=true
+    if [[ $breach == true ]]; then
+      cause=$(resource_monitor_breach_cause)
+      printf 'resource monitor breached during %s: %s\n' "${phase:-unknown}" "$cause" >&2
+    fi
+    resource_monitor_pid=; resource_monitor_phase=; resource_monitor_control=
+    [[ $breach == false ]] || return 1
+    return 0
   fi
   rm -f -- "$resource_monitor_control"
   wait "$resource_monitor_pid" 2>/dev/null || true
@@ -1468,7 +1505,12 @@ resource_monitor_stop() {
   child_sum=${resource_phase_child_sum[$phase]:-0}
   growth=${resource_phase_growth[$phase]:-0}
   breach=false; [[ -f $tmp_dir/resource-monitor-breach ]] && breach=true
-  [[ $breach == false ]] || die "resource monitor breached during $phase"
+  if [[ $breach == true ]]; then
+    cause=$(resource_monitor_breach_cause)
+    printf 'resource monitor breached during %s: %s\n' "${phase:-unknown}" "$cause" >&2
+  fi
+  resource_monitor_pid=; resource_monitor_phase=; resource_monitor_control=
+  [[ $breach == false ]] || return 1
   resource_samples=$(jq -cn --argjson prior "$resource_samples" --arg phase "$phase" --arg ended "$ended" \
     --argjson samples "${samples:-0}" --argjson max "${max_available:-0}" --argjson current "${current_available:-0}" \
     --argjson required "${required:-1}" --argjson phase_max "${phase_max:-1}" \
@@ -1488,7 +1530,6 @@ resource_monitor_stop() {
     } else . end)')
   unset "resource_phase_required[$phase]" "resource_phase_limit[$phase]" \
     "resource_phase_parent_current[$phase]" "resource_phase_child_sum[$phase]" "resource_phase_growth[$phase]"
-  resource_monitor_pid=; resource_monitor_phase=
 }
 calibrate_psi() {
   local phase=$1 previous current transition delta ratio hit consecutive=0 i
@@ -1650,7 +1691,7 @@ write_run_json() {
 }
 cleanup() {
   local status=$? cleanup_failed=false; set +e
-  resource_monitor_stop >/dev/null 2>&1 || cleanup_failed=true
+  resource_monitor_stop >/dev/null || cleanup_failed=true
   for market in "${markets[@]}"; do
     [[ -n ${unit[$market]:-} ]] || continue
     systemctl stop "${unit[$market]}" >/dev/null 2>&1 || true
@@ -1710,7 +1751,8 @@ if [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_PATH_ONLY:-0} == 1 ]]; then
   exit 0
 fi
 
-calibrate_psi preflight; resource_monitor_start preflight "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; resource_monitor_stop; write_run_json
+calibrate_psi preflight; resource_monitor_start preflight "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; \
+  resource_monitor_stop || die 'resource monitor breached during preflight'; write_run_json
 if [[ $FROM_CONTROLLER != direct ]]; then
   for asset in "${SHADOW_ASSETS[@]}"; do
     [[ ${saved_state[$asset]} == present || ${saved_state[$asset]} == projection ]] || die "before shadow asset is absent: $asset"
@@ -1984,7 +2026,10 @@ run_market_gate_phase() {
     '{sha256:$sha,session_id:$session,frozen_symbol_count:$symbols,
       frozen_catalog_sha256:$catalog,max_health_silence_seconds:$silence,samples:$samples}')
   observation=$(( $(monotonic_seconds) + GATE_DURATION_SECONDS )); while (( $(monotonic_seconds) < observation )); do validate_observation_sample "$market"; assert_host_memory_reserve; [[ $(systemctl_value "$market" NRestarts) == 0 ]] || die "$market restarted"; [[ $(systemctl_value "$market" MainPID) == "$pid" ]] || die "$market MainPID changed"; [[ $TEST_ONLY == true ]] && break; sleep 15; done
-  phase_runtime["$market"]=$GATE_DURATION_SECONDS; systemctl stop "${unit[$market]}"; systemctl_active "${unit[$market]}" && die "$market shadow remained active"; resource_monitor_stop; calibrate_psi "shadow-$market-tail"; resource_monitor_start "strict-verifier-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; verify_segments "$market"; resource_monitor_stop
+  phase_runtime["$market"]=$GATE_DURATION_SECONDS; systemctl stop "${unit[$market]}"; systemctl_active "${unit[$market]}" && die "$market shadow remained active"; \
+    resource_monitor_stop || die "resource monitor breached during shadow-$market"; \
+    calibrate_psi "shadow-$market-tail"; resource_monitor_start "strict-verifier-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; \
+    verify_segments "$market"; resource_monitor_stop || die "resource monitor breached during strict-verifier-$market"
 }
 DRAIN_ENV_KEYS=(
   MARKET DATASET SHARD_ID SYMBOLS DEPTH_MODE WS_SHARD_SIZE SNAPSHOT_LIMIT
@@ -2025,15 +2070,15 @@ run_candidate_drain() {
       --arg session "${phase_session[$market]}" \
       '{market:$market,dataset:$dataset,last_error:null,session_id:$session,uploaded_triplets:1}' \
       >"${spool_dir[$market]}/upload-status.json"
-    resource_monitor_stop
+    resource_monitor_stop || die "$market upload-drain resource monitor breached"
     return 0
   fi
   systemctl reset-failed "${upload_unit[$market]}" >/dev/null 2>&1 || true
   systemctl start "${upload_unit[$market]}" \
-    || { resource_monitor_stop; die "$market run-scoped upload drain failed"; }
+    || { resource_monitor_stop || true; die "$market run-scoped upload drain failed"; }
   [[ $(systemctl show "${upload_unit[$market]}" --property=Result --value) == success ]] \
-    || { resource_monitor_stop; die "$market run-scoped upload drain did not complete successfully"; }
-  resource_monitor_stop
+    || { resource_monitor_stop || true; die "$market run-scoped upload drain did not complete successfully"; }
+  resource_monitor_stop || die "$market upload-drain resource monitor breached"
 }
 assert_spool_drained() {
   local market=$1 remaining
@@ -2185,7 +2230,7 @@ verify_oss_roundtrips() {
   fi
   market_observed_at_ns[$market]=$observed_cutoff_ns
   phase_oss[$market]=$count
-  resource_monitor_stop
+  resource_monitor_stop || die "$market OSS resource monitor breached"
 }
 
 for market in "${markets[@]}"; do render_shadow_unit "$market"; done
