@@ -203,9 +203,14 @@ if [[ $TEST_ONLY == true ]]; then
         [[ ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] && printf 'stop %s\n' "$unit_name" >>"$ROOT/run/gate-fixture.calls"
         case "$unit_name" in
           "$COLLECTOR_HEALTH_TIMER")
-            fixture_health_timer_state=inactive; fixture_health_timer_substate=dead ;;
+            fixture_health_timer_state=inactive; fixture_health_timer_substate=dead
+            if [[ ${MONDAY_GATE_FIXTURE_HEALTH_SERVICE_FAIL_AFTER_TIMER_STOP:-0} == 1 ]]; then
+              fixture_health_service_state=failed; fixture_health_service_substate=failed
+            fi ;;
           "$COLLECTOR_HEALTH_SERVICE")
-            fixture_health_service_state=inactive; fixture_health_service_substate=dead ;;
+            if [[ $fixture_health_service_state != failed ]]; then
+              fixture_health_service_state=inactive; fixture_health_service_substate=dead
+            fi ;;
           *) fixture_unit_state[$unit_name]=inactive ;;
         esac
         return 0 ;;
@@ -224,7 +229,15 @@ if [[ $TEST_ONLY == true ]]; then
           done
         fi
         return 0 ;;
-      reset-failed|daemon-reload) return 0 ;;
+      reset-failed)
+        [[ ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] \
+          && printf 'reset-failed %s\n' "$unit_name" >>"$ROOT/run/gate-fixture.calls"
+        if [[ $unit_name == "$COLLECTOR_HEALTH_SERVICE" ]]; then
+          [[ ${MONDAY_GATE_FIXTURE_HEALTH_RESET_FAILED_FAIL:-0} == 1 ]] && return 1
+          fixture_health_service_state=inactive; fixture_health_service_substate=dead
+        fi
+        return 0 ;;
+      daemon-reload) return 0 ;;
       is-active)
         if [[ $2 == --quiet ]]; then unit_name=$3; else unit_name=$2; fi
         [[ ${fixture_unit_state[$unit_name]:-inactive} == active ]] && { [[ $2 == --quiet ]] || printf 'active\n'; return 0; }
@@ -474,6 +487,25 @@ health_timer_state_matches() {
   ' >/dev/null
 }
 
+quiesce_collector_health_service() {
+  local allow_reset_failed=$1 service_state active_state
+  [[ $allow_reset_failed == true || $allow_reset_failed == false ]] || return 1
+  service_state=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
+  active_state=$(jq -er '.active_state' <<<"$service_state") || return 1
+  if [[ $active_state != inactive ]]; then
+    systemctl stop "$COLLECTOR_HEALTH_SERVICE" >/dev/null 2>&1 || return 1
+    service_state=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
+    active_state=$(jq -er '.active_state' <<<"$service_state") || return 1
+    if [[ $active_state == failed ]]; then
+      [[ $allow_reset_failed == true ]] || return 1
+      systemctl reset-failed "$COLLECTOR_HEALTH_SERVICE" >/dev/null 2>&1 || return 1
+      service_state=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
+      active_state=$(jq -er '.active_state' <<<"$service_state") || return 1
+    fi
+  fi
+  [[ $active_state == inactive ]]
+}
+
 # Restore the fixed health timer and quiesce the service from a persisted lease.
 # This helper is also called by the run-scoped recovery oneshot, before that
 # oneshot removes its own timer/service.  It is idempotent, never starts the
@@ -487,12 +519,7 @@ restore_bootstrap_monitor_from_state() {
     && $(jq -er '.active_state' <<<"$before_timer") == active ]] || return 1
   # The health worker is quiesced for the bootstrap interval.  It is never
   # restarted by Gate/recovery: only the original active timer is restored.
-  current=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
-  if [[ $(jq -er '.active_state' <<<"$current") != inactive ]]; then
-    systemctl stop "$COLLECTOR_HEALTH_SERVICE" >/dev/null 2>&1 || return 1
-  fi
-  current=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
-  [[ $(jq -er '.active_state' <<<"$current") == inactive ]] || return 1
+  quiesce_collector_health_service true || return 1
   if [[ $(jq -er '.active_state' <<<"$before_timer") == active ]]; then
     systemctl start "$COLLECTOR_HEALTH_TIMER" >/dev/null 2>&1 || return 1
   else
@@ -1217,6 +1244,10 @@ capture_bootstrap_monitor_state() {
   service_state=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
   [[ $(jq -er '.load_state' <<<"$timer_state") == loaded \
     && $(jq -er '.active_state' <<<"$timer_state") == active ]] || return 1
+  # A fresh Gate must not normalize a pre-existing failed health oneshot.  The
+  # bootstrap lease/watchdog/timer are still untouched at this point; only a
+  # recovery of an already persisted lease may reset a failed service.
+  [[ $(jq -er '.active_state' <<<"$service_state") != failed ]] || return 1
   bootstrap_monitor_required=true
   bootstrap_monitor_pause_applied=false
   bootstrap_monitor_timer_restored=false
@@ -1231,19 +1262,14 @@ capture_bootstrap_monitor_state() {
 pause_bootstrap_monitor() {
   [[ $bootstrap_monitor_required == true ]] || return 0
   systemctl stop "$COLLECTOR_HEALTH_TIMER" >/dev/null 2>&1 || return 1
-  local timer_state service_state
+  local timer_state
   timer_state=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_TIMER") || return 1
   [[ $(jq -er '.active_state' <<<"$timer_state") == inactive ]] || return 1
   build_bootstrap_monitor_containment || return 1
   write_bootstrap_slice_lease_state || return 1
   # Re-read after the timer stop: an in-flight timer callback may have left the
   # service in any non-inactive state, not only the state captured at entry.
-  service_state=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
-  if [[ $(jq -er '.active_state' <<<"$service_state") != inactive ]]; then
-    systemctl stop "$COLLECTOR_HEALTH_SERVICE" >/dev/null 2>&1 || return 1
-  fi
-  service_state=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
-  [[ $(jq -er '.active_state' <<<"$service_state") == inactive ]] || return 1
+  quiesce_collector_health_service false || return 1
   bootstrap_monitor_service_quiesced=true
   bootstrap_monitor_pause_applied=true
   build_bootstrap_monitor_containment || return 1
@@ -1264,12 +1290,7 @@ restore_bootstrap_monitor() {
   # restart it here; only a timer that was active before the pause is restored.
   # service_quiesced records this pause/restore transaction's inactive readback;
   # it does not claim a timer-triggered service remains inactive forever.
-  current=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
-  if [[ $(jq -er '.active_state' <<<"$current") != inactive ]]; then
-    systemctl stop "$COLLECTOR_HEALTH_SERVICE" >/dev/null 2>&1 || return 1
-  fi
-  current=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
-  [[ $(jq -er '.active_state' <<<"$current") == inactive ]] || return 1
+  quiesce_collector_health_service true || return 1
   bootstrap_monitor_service_quiesced=true
   if [[ $before_timer_active == active ]]; then
     systemctl start "$COLLECTOR_HEALTH_TIMER" >/dev/null 2>&1 || return 1
