@@ -27,6 +27,7 @@ ROOT=${ROOT%/}; [[ -n $ROOT ]] || ROOT=/
 [[ $GATE_SHA =~ ^[a-f0-9]{64}$ ]] || die 'Gate receipt digest is invalid'
 [[ -n $GATE ]] || die 'Gate receipt is required'
 [[ $FROM != "$TO" ]] || die 'cutover requires distinct before and target controllers'
+readonly PRODUCTION_SLICE='system-binance\x2dlob\x2darchiver\x2dproduction.slice'
 TEST_ONLY=false; [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 ]] && TEST_ONLY=true
 PRODUCTION_HEALTH_WAIT_SECONDS=${MONDAY_CUTOVER_HEALTH_TIMEOUT_SECONDS:-240}
 PRODUCTION_HEALTH_POLL_SECONDS=${MONDAY_CUTOVER_HEALTH_POLL_SECONDS:-1}
@@ -124,7 +125,27 @@ if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
         return 3 ;;
       show)
         unit=$2
-        case "${3#--property=}" in
+        property=${3#--property=}; property=${property#--property=}
+        if [[ $property == 'MemoryHigh,MemoryMax,ControlGroup' && $unit == "$PRODUCTION_SLICE" ]]; then
+          printf 'verify-config %s\n' "$unit" >>"$fixture_calls"
+          if [[ ${MONDAY_CUTOVER_FIXTURE_BAD_CONFIG:-0} == 1 ]]; then
+            printf 'ControlGroup=/system.slice/wrong-production.slice\nMemoryMax=3758096385\nMemoryHigh=3221225472\n'
+          else
+            printf 'ControlGroup=/system.slice/system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice\nMemoryMax=3758096384\nMemoryHigh=3221225472\n'
+          fi
+          return 0
+        fi
+        if [[ $property == 'Slice,ControlGroup,MemoryMax' && $unit == binance-lob-archiver-production@* ]]; then
+          printf 'verify-membership %s\n' "$unit" >>"$fixture_calls"
+          market=${unit#*@}; market=${market%.service}
+          if [[ ${MONDAY_CUTOVER_FIXTURE_BAD_MEMBERSHIP:-0} == 1 && $market == spot ]]; then
+            printf 'MemoryMax=2684354561\nControlGroup=/system.slice/wrong.slice/%s\nSlice=wrong.slice\n' "$unit"
+          else
+            printf 'MemoryMax=2684354560\nControlGroup=/system.slice/system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice/%s\nSlice=system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice\n' "$unit"
+          fi
+          return 0
+        fi
+        case "$property" in
           LoadState) printf '%s\n' "${fixture_unit_load_state[$unit]:-loaded}" ;;
           ActiveState) [[ ${fixture_unit_state[$unit]:-inactive} == active ]] && printf 'active\n' || printf 'inactive\n' ;;
           SubState) [[ ${fixture_unit_state[$unit]:-inactive} == active ]] && printf 'running\n' || printf 'dead\n' ;;
@@ -230,7 +251,6 @@ if [[ $FROM == direct ]]; then
   [[ $before_payload == "$target_payload" ]] || die 'bootstrap requires an unchanged payload'
   before_runtime=$(jq -er '.runtime_contract_sha256' "$legacy_target/release.json") \
     || die 'legacy controller runtime is invalid'
-  [[ $target_runtime == "$before_runtime" ]] || die 'bootstrap requires an unchanged runtime contract'
 else
   [[ $active == "$FROM" ]] || die 'active controller is not the requested before controller'
   before_controller=$FROM
@@ -262,10 +282,18 @@ fi
 
 # Independently compute R0 from every live unit/env byte.  The target
 # manifest is never used as a substitute for a missing or drifted before set.
-live_runtime=$(monday_rust_lob_live_runtime_contract_sha256 "$ROOT") \
-  || die 'live runtime contract is missing or indirect'
 if [[ $FROM == direct ]]; then
-  [[ $live_runtime == "$target_runtime" ]] || die 'bootstrap runtime assets differ from target R1'
+  # Direct bootstrap is the typed R0(v1, eight assets) -> R2(v2, nine assets)
+  # migration; always hash the legacy eight-asset view for the before check.
+  live_runtime=$(monday_rust_lob_live_runtime_contract_sha256_v1 "$ROOT") \
+    || die 'legacy live runtime contract is missing or indirect'
+elif live_runtime=$(monday_rust_lob_live_runtime_contract_sha256 "$ROOT" 2>/dev/null); then
+  :
+else
+  die 'live runtime contract is missing or indirect'
+fi
+if [[ $FROM == direct ]]; then
+  [[ $live_runtime == "$before_runtime" ]] || die 'bootstrap runtime assets differ from legacy R0'
 else
   [[ $live_runtime == "$before_runtime" ]] || die 'live runtime assets differ from before R0'
 fi
@@ -345,8 +373,13 @@ for asset in "${PAIR_ASSETS[@]}"; do
   source="$target_release/deployment/$asset"
   monday_file_direct "$source" || die "target pair asset is missing: $asset"
   if [[ $FROM == direct ]]; then
-    [[ ${asset_state[$asset]} == present ]] || die "bootstrap runtime asset is absent: $asset"
-    cmp -s "$source" "${asset_target[$asset]}" || die "bootstrap runtime asset changed: $asset"
+    if [[ $asset == 'system-binance\x2dlob\x2darchiver\x2dproduction.slice' \
+      && ${asset_state[$asset]} == absent ]]; then
+      : # typed 8 -> 9 migration: the signed target installs this new asset
+    else
+      [[ ${asset_state[$asset]} == present ]] || die "bootstrap runtime asset is absent: $asset"
+      cmp -s "$source" "${asset_target[$asset]}" || die "bootstrap runtime asset changed: $asset"
+    fi
   else
     [[ ${asset_state[$asset]} == projection ]] || die "before pair asset is not a stable projection: $asset"
     cmp -s "$before_release/deployment/$asset" "$(readlink -f -- "${asset_target[$asset]}")" \
@@ -481,6 +514,10 @@ old_production_target=$(readlink -f -- "$production" 2>/dev/null || true)
 if [[ $FROM == direct ]]; then
   [[ -n $old_production_target ]] || die 'bootstrap production projection is unresolved'
   for asset in "${PAIR_ASSETS[@]}"; do
+    if [[ ${asset_state[$asset]} == absent && $asset == 'system-binance\x2dlob\x2darchiver\x2dproduction.slice' ]]; then
+      # The sole typed R0 -> R2 delta is the newly signed aggregate slice.
+      continue
+    fi
     [[ ${asset_state[$asset]} == present ]] || die "bootstrap runtime asset is not a direct file: $asset"
     mkdir -p "$backup_root/$(dirname -- "$asset")"
     cp -p -- "${asset_target[$asset]}" "$backup_root/$asset"
@@ -517,8 +554,8 @@ if [[ $FROM == direct ]]; then
     || die 'bootstrap direct payload disappeared after stopping lanes'
   [[ $(monday_sha256_file "$direct_payload_after_stop") == "$before_payload" ]] \
     || die 'bootstrap direct payload changed after stopping lanes'
-  live_runtime_after_stop=$(monday_rust_lob_live_runtime_contract_sha256 "$ROOT") \
-    || die 'bootstrap runtime contract disappeared after stopping lanes'
+  live_runtime_after_stop=$(monday_rust_lob_live_runtime_contract_sha256_v1 "$ROOT") \
+    || die 'bootstrap legacy runtime contract disappeared after stopping lanes'
   [[ $live_runtime_after_stop == "$before_runtime" ]] \
     || die 'bootstrap runtime contract changed after stopping lanes'
 fi
@@ -582,7 +619,16 @@ jq -e --argjson expected "$target_production_runtime" \
   '$expected == .' <<<"$post_commit_production_runtime" >/dev/null \
   || die 'target production runtime contract changed after pair commit'
 if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
-  systemctl daemon-reload
+  if [[ $TEST_ONLY == false ]]; then
+    # A direct bootstrap Gate may have restored a legacy runtime-only lease.
+    # Drop that transient override so the newly committed signed slice asset
+    # is the permanent source of the production envelope.
+    systemctl revert --runtime "$PRODUCTION_SLICE" \
+      || die 'could not clear the bootstrap production slice lease'
+  fi
+  systemctl daemon-reload || die 'daemon-reload failed after pair commit'
+  monday_rust_lob_verify_systemd_production_slice_configured "$ROOT" \
+    || die 'permanent production slice verification failed before start'
   cutover_started_ns=$(date +%s%N)
   systemctl unmask binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service \
     || die 'could not unmask V2 production lanes'
@@ -594,6 +640,8 @@ if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
     || die 'USD-M did not start after pair commit'
   systemctl is-active --quiet binance-lob-archiver-production@spot.service || die 'Spot did not start after pair commit'
   systemctl is-active --quiet binance-lob-archiver-production@usdm.service || die 'USD-M did not start after pair commit'
+  monday_rust_lob_verify_systemd_production_membership "$ROOT" \
+    || die 'production child membership is not exact after start'
 else
   cutover_started_ns=0
 fi

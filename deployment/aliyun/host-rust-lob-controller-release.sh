@@ -29,21 +29,34 @@ configure() {
 }
 
 validate_archive() {
-  local archive=$1 list entry invalid=false
+  local archive=$1 list normalized entry invalid=false
   list=$(mktemp)
   tar -tf "$archive" >"$list" || { rm -f "$list"; return 1; }
   [[ -s $list ]] || { rm -f "$list"; return 1; }
-  [[ -z $(sort "$list" | uniq -d) ]] || { rm -f "$list"; return 1; }
+  # bsdtar escapes a literal backslash in member names as `\\` while GNU tar
+  # emits the byte unchanged.  Normalize only the one reviewed systemd slice
+  # asset; every other member remains byte-for-byte subject to the allowlist.
+  normalized=$(mktemp)
   while IFS= read -r entry; do
-    [[ $entry =~ ^[A-Za-z0-9][A-Za-z0-9._@+-]*$ ]] || {
+    if [[ $entry == 'system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice' ]]; then
+      entry='system-binance\x2dlob\x2darchiver\x2dproduction.slice'
+    fi
+    [[ $entry == 'system-binance\x2dlob\x2darchiver\x2dproduction.slice' \
+      || $entry =~ ^[A-Za-z0-9][A-Za-z0-9._@+-]*$ ]] || {
       invalid=true
       break
     }
+    printf '%s\n' "$entry" >>"$normalized"
   done <"$list"
   if [[ $invalid == true ]]; then
-    rm -f "$list"
+    rm -f "$list" "$normalized"
     return 1
   fi
+  if [[ -n $(sort "$normalized" | uniq -d) ]]; then
+    rm -f "$list" "$normalized"
+    return 1
+  fi
+  mv -f "$normalized" "$list"
   printf '%s\n' "$list"
 }
 

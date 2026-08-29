@@ -172,6 +172,10 @@ for asset in "${PAIR_ASSETS[@]}"; do
   [[ $(monday_sha256_file "$resolved") == "$(monday_sha256_file "$deployment/$asset")" ]] \
     || die "installed pair asset differs from active C: $asset"
 done
+if [[ $TEST_ONLY == false ]]; then
+  monday_rust_lob_verify_systemd_production_slice "$ROOT" \
+    || die 'permanent production slice verification failed during readback'
+fi
 controller_projections='{}'
 for asset in "${CONTROLLER_PROJECTION_ASSETS[@]}"; do
   installed=$(monday_controller_projection_target "$ROOT" "$asset") \

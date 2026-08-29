@@ -26,6 +26,7 @@ readonly -a SHADOW_ASSETS=(
   binance-lob-archiver-rust-usdm.env
 )
 readonly -a PRODUCTION_ASSETS=(
+  'system-binance\x2dlob\x2darchiver\x2dproduction.slice'
   binance-lob-archiver-production@.service
   binance-lob-archiver-upload@.service
   binance-lob-archiver-production-spot.env
@@ -42,26 +43,34 @@ usage() {
   cat >&2 <<'EOF'
 Usage: host-rust-lob-shadow-gate.sh --from-controller <direct|sha256> \
   --candidate-controller <sha256> [--root <fixture-root>]
+       host-rust-lob-shadow-gate.sh --recover-bootstrap-lease <state> [--root <fixture-root>]
 EOF
 }
 
 ROOT=${MONDAY_ROOT:-/}; FROM_CONTROLLER=; CANDIDATE_CONTROLLER=
+RECOVER_STATE=
 while (($#)); do
   case "$1" in
     --from-controller) (($# >= 2)) || { usage; exit 2; }; FROM_CONTROLLER=$2; shift 2 ;;
     --candidate-controller) (($# >= 2)) || { usage; exit 2; }; CANDIDATE_CONTROLLER=$2; shift 2 ;;
+    --recover-bootstrap-lease) (($# >= 2)) || { usage; exit 2; }; RECOVER_STATE=$2; shift 2 ;;
     --root) (($# >= 2)) || { usage; exit 2; }; ROOT=$2; shift 2 ;;
     --help|-h) usage >&1; exit 0 ;;
     *) usage; exit 2 ;;
   esac
 done
 ROOT=${ROOT%/}; [[ -n $ROOT ]] || ROOT=/
-FROM_CONTROLLER=$(printf '%s' "$FROM_CONTROLLER" | tr '[:upper:]' '[:lower:]')
-CANDIDATE_CONTROLLER=$(printf '%s' "$CANDIDATE_CONTROLLER" | tr '[:upper:]' '[:lower:]')
-[[ $FROM_CONTROLLER == direct || $FROM_CONTROLLER =~ ^[a-f0-9]{64}$ ]] ||
-  die 'before controller must be direct or a 64-character SHA-256'
-[[ $CANDIDATE_CONTROLLER =~ ^[a-f0-9]{64}$ ]] ||
-  die 'candidate controller must be a 64-character SHA-256'
+if [[ -z $RECOVER_STATE ]]; then
+  FROM_CONTROLLER=$(printf '%s' "$FROM_CONTROLLER" | tr '[:upper:]' '[:lower:]')
+  CANDIDATE_CONTROLLER=$(printf '%s' "$CANDIDATE_CONTROLLER" | tr '[:upper:]' '[:lower:]')
+  [[ $FROM_CONTROLLER == direct || $FROM_CONTROLLER =~ ^[a-f0-9]{64}$ ]] ||
+    die 'before controller must be direct or a 64-character SHA-256'
+  [[ $CANDIDATE_CONTROLLER =~ ^[a-f0-9]{64}$ ]] ||
+    die 'candidate controller must be a 64-character SHA-256'
+else
+  [[ -z $FROM_CONTROLLER && -z $CANDIDATE_CONTROLLER ]] ||
+    die 'lease recovery does not accept a controller transition'
+fi
 TEST_ONLY=false; [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 ]] && TEST_ONLY=true
 [[ $TEST_ONLY == false || $ROOT != / ]] || die 'test mode requires an isolated fixture root'
 
@@ -116,16 +125,24 @@ else
   flock -n 9 || die 'another collector control-plane action is running'
 fi
 
-for command in awk bash chmod cmp cp date dirname find grep install jq mkdir mktemp mv readlink rm sed sha256sum sleep sort stat tr wc zstd; do
-  command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
-done
-if [[ $TEST_ONLY != true ]]; then
-  for command in aliyun flock id mountpoint runuser systemctl systemd-analyze systemd-run; do
+if [[ -z $RECOVER_STATE ]]; then
+  for command in awk bash chmod cmp cp date dirname find grep install jq mkdir mktemp mv readlink rm sed sha256sum sleep sort stat tr wc zstd; do
     command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
   done
-  mountpoint -q "$(monday_root_join "$ROOT" data)" || die 'data filesystem must be a mount point'
-  [[ -r "$PROC_ROOT/uptime" && -r $PSI_SOURCE ]] || die 'proc timing/PSI sources are unavailable'
-  id "$SERVICE_USER" >/dev/null 2>&1 || die "missing service user: $SERVICE_USER"
+  if [[ $TEST_ONLY != true ]]; then
+    for command in aliyun flock id mountpoint runuser systemctl systemd-analyze systemd-run; do
+      command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
+    done
+    mountpoint -q "$(monday_root_join "$ROOT" data)" || die 'data filesystem must be a mount point'
+    [[ -r "$PROC_ROOT/uptime" && -r $PSI_SOURCE ]] || die 'proc timing/PSI sources are unavailable'
+    id "$SERVICE_USER" >/dev/null 2>&1 || die "missing service user: $SERVICE_USER"
+  fi
+else
+  for command in bash chmod date find grep install jq mkdir mv readlink rm sha256sum sort; do
+    command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
+  done
+  [[ $TEST_ONLY == true ]] || command -v systemctl >/dev/null 2>&1 \
+    || die 'missing required command: systemctl'
 fi
 
 # The offline fixture supplies a tiny systemd double.  Production always uses
@@ -137,12 +154,21 @@ if [[ $TEST_ONLY == true ]]; then
     local action=${1:-} unit_name=${2:-} property value item output_values=false
     local -a properties=()
     case "$action" in
+      list-units)
+        if [[ -n ${MONDAY_GATE_FIXTURE_RECOVERY_RUN:-} ]]; then
+          printf '%s loaded active running\n' \
+            "${GATE_UNIT_PREFIX}${MONDAY_GATE_FIXTURE_RECOVERY_RUN}-spot.service"
+        fi
+        return 0 ;;
       start)
         [[ ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] && printf 'start %s\n' "$unit_name" >>"$ROOT/run/gate-fixture.calls"
         fixture_unit_state[$unit_name]=active; return 0 ;;
       stop)
         [[ ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] && printf 'stop %s\n' "$unit_name" >>"$ROOT/run/gate-fixture.calls"
         fixture_unit_state[$unit_name]=inactive; return 0 ;;
+      set-property)
+        [[ ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] && printf 'set-property\n' >>"$ROOT/run/gate-fixture.calls"
+        return 0 ;;
       reset-failed|daemon-reload) return 0 ;;
       is-active)
         if [[ $2 == --quiet ]]; then unit_name=$3; else unit_name=$2; fi
@@ -158,6 +184,11 @@ if [[ $TEST_ONLY == true ]]; then
           # Real systemd does not guarantee request order; keep the fixture
           # deliberately in the observed live order to exercise key parsing.
           properties=(ActiveState SubState MainPID NRestarts Slice ControlGroup MemoryMax)
+        elif [[ $unit_name == "${GATE_WORKER_SLICE:-}" ]]; then
+          # The aggregate slice readback is likewise order-independent.  Keep
+          # the fixture in a different order from the request to prove that
+          # callers parse KEY=VALUE rather than positional output.
+          properties=(ControlGroup MemoryMax MemoryHigh)
         else
           output_values=false
           IFS=, read -r -a properties <<<"$property"
@@ -165,10 +196,10 @@ if [[ $TEST_ONLY == true ]]; then
         for item in "${properties[@]}"; do
           case "$item" in
             ActiveState)
-              if [[ $unit_name == binance-lob-archiver-production@* ]]; then value=active
+              if [[ $unit_name == binance-lob-archiver-production@* || $unit_name == "$PRODUCTION_SLICE" ]]; then value=active
               else value=${fixture_unit_state[$unit_name]:-inactive}; fi ;;
             SubState)
-              if [[ $unit_name == binance-lob-archiver-production@* ]]; then value=running
+              if [[ $unit_name == binance-lob-archiver-production@* || $unit_name == "$PRODUCTION_SLICE" ]]; then value=running
               elif [[ ${fixture_unit_state[$unit_name]:-inactive} == active ]]; then value=running
               else value=dead; fi ;;
             NRestarts)
@@ -181,13 +212,22 @@ if [[ $TEST_ONLY == true ]]; then
               else value=$$; fi ;;
             MemoryCurrent) value=1048576 ;;
             MemoryPeak) value=1048576 ;;
-            MemoryMax) [[ $unit_name == binance-lob-archiver-production@* ]] && value=2684354560 || value=2147483648 ;;
-            MemoryHigh) value=1879048192 ;;
+            MemoryMax)
+              if [[ $unit_name == "$PRODUCTION_SLICE" && ${MONDAY_GATE_FIXTURE_BOOTSTRAP_UNLIMITED:-0} == 1 ]]; then value=infinity
+              elif [[ $unit_name == binance-lob-archiver-production@* ]]; then value=2684354560
+              elif [[ $unit_name == "$PRODUCTION_SLICE" ]]; then value=3758096384
+              else value=1610612736; fi ;;
+            MemoryHigh)
+              if [[ $unit_name == "$PRODUCTION_SLICE" && ${MONDAY_GATE_FIXTURE_BOOTSTRAP_UNLIMITED:-0} == 1 ]]; then value=infinity
+              elif [[ $unit_name == "$PRODUCTION_SLICE" ]]; then value=3221225472
+              else value=1342177280; fi ;;
             Slice) [[ $unit_name == binance-lob-archiver-production@* ]] && value=$PRODUCTION_SLICE || value=system.slice ;;
             ControlGroup)
               if [[ $unit_name == binance-lob-archiver-production@spot.service ]]; then value="/system.slice/$PRODUCTION_SLICE/binance-lob-archiver-production@spot.service"
               elif [[ $unit_name == binance-lob-archiver-production@usdm.service ]]; then value="/system.slice/$PRODUCTION_SLICE/binance-lob-archiver-production@usdm.service"
-              else value=; fi ;;
+            elif [[ $unit_name == "$PRODUCTION_SLICE" ]]; then value="/system.slice/$PRODUCTION_SLICE"
+            elif [[ $unit_name == "${GATE_WORKER_SLICE:-}" ]]; then value="/${GATE_WORKER_SLICE}"
+            else value=; fi ;;
             CPUUsageNSec) value=1000000 ;;
             CPUQuotaPerSecUSec) value=800ms ;;
             DropInPaths) value= ;;
@@ -310,6 +350,149 @@ systemctl_show() { systemctl show "$1" --property="$2" --value 2>/dev/null; }
 systemctl_show_many() { systemctl show "$1" --property="$2" 2>/dev/null; }
 systemctl_active() { systemctl is-active --quiet "$1"; }
 
+# Recover a temporary production-slice lease from its persisted state.  This
+# is intentionally an internal mode of the signed Gate script, rather than a
+# second cleanup script: the transient systemd service invokes this exact
+# candidate byte path after a SIGKILL.  It stops only the matching run's
+# workers, restores the recorded limits, reads them back, then removes its own
+# timer/service and marks the state recovered.
+recover_bootstrap_lease() {
+  [[ $# -eq 1 ]] || die 'lease recovery requires one state file'
+  local state=$1 state_name run mode applied restored before_high before_max
+  local expected_service expected_timer service_name timer_name slice_name
+  local candidate_controller gate_script gate_script_sha gate_pid gate_starttime owner_starttime expected_gate_script
+  local listed unit unit_file output item key value restored_high restored_max temporary
+  local -A fields=()
+  direct_directory "$GATE_UNIT_ROOT" || die 'lease state root is not a direct directory'
+  [[ $state == "$GATE_UNIT_ROOT"/bootstrap-slice-lease-*.json ]] || die 'lease state is outside the canonical root'
+  state_name=${state##*/}
+  [[ $state_name =~ ^bootstrap-slice-lease-([0-9]{8}T[0-9]{6}Z-[1-9][0-9]*)\.json$ ]] \
+    || die 'lease state filename is not run-scoped'
+  secure_file "$state"
+  jq -e --arg slice "$PRODUCTION_SLICE" '
+    type == "object"
+    and .schema == "monday.rust_lob_bootstrap_slice_lease.v1"
+    and (.run_id | type == "string" and test("^[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*$"))
+    and .slice == $slice
+    and .mode == "temporary-bootstrap"
+    and (.before_memory_high | type == "string" and test("^(infinity|[0-9]+)$"))
+    and (.before_memory_max | type == "string" and test("^(infinity|[0-9]+)$"))
+    and (.before_parent_control_group | type == "string" and . == ("/system.slice/" + $slice))
+    and (.before_parent_memory_current_bytes | type == "number" and floor == . and . >= 0 and . <= 3758096384)
+    and (.before_parent_memory_anon_bytes | type == "number" and floor == . and . >= 0 and . <= 3758096384)
+    and .requested_memory_high == "3072M"
+    and .requested_memory_max == "3584M"
+    and (.candidate_controller_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+    and (.gate_script | type == "string" and length > 0)
+    and (.gate_script_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+    and (.gate_pid | type == "number" and floor == . and . >= 1)
+    and (.gate_starttime | type == "number" and floor == . and . >= 1)
+    and (.applied | type == "boolean")
+    and (.restored | type == "boolean")
+    and (.recovery_service | type == "string")
+    and (.recovery_timer | type == "string")' "$state" >/dev/null \
+    || die 'lease state schema is invalid'
+  run=$(jq -er '.run_id' "$state") || die 'lease state run id is unavailable'
+  expected_service="${GATE_UNIT_PREFIX}${run}-lease-recovery.service"
+  expected_timer="${GATE_UNIT_PREFIX}${run}-lease-recovery.timer"
+  service_name=$(jq -er '.recovery_service' "$state") || die 'lease recovery service is unavailable'
+  timer_name=$(jq -er '.recovery_timer' "$state") || die 'lease recovery timer is unavailable'
+  [[ $service_name == "$expected_service" && $timer_name == "$expected_timer" ]] \
+    || die 'lease recovery unit identity is not run-scoped'
+  mode=$(jq -er '.mode' "$state") || die 'lease state mode is unavailable'
+  applied=$(jq -r '.applied' "$state") || die 'lease state applied flag is unavailable'
+  restored=$(jq -r '.restored' "$state") || die 'lease state restored flag is unavailable'
+  before_high=$(jq -er '.before_memory_high' "$state") || die 'lease state high limit is unavailable'
+  before_max=$(jq -er '.before_memory_max' "$state") || die 'lease state max limit is unavailable'
+  [[ $mode == temporary-bootstrap ]] || die 'lease state mode is not temporary bootstrap'
+  candidate_controller=$(jq -er '.candidate_controller_sha256' "$state") || die 'lease candidate controller is unavailable'
+  gate_script=$(jq -er '.gate_script' "$state") || die 'lease Gate script is unavailable'
+  gate_script_sha=$(jq -er '.gate_script_sha256' "$state") || die 'lease Gate script digest is unavailable'
+  gate_pid=$(jq -er '.gate_pid' "$state") || die 'lease Gate owner PID is unavailable'
+  gate_starttime=$(jq -er '.gate_starttime' "$state") || die 'lease Gate owner starttime is unavailable'
+  expected_gate_script="$CONTROLLER_ROOT/$candidate_controller/deployment/host-rust-lob-shadow-gate.sh"
+  [[ $gate_script == "$expected_gate_script" ]] || die 'lease Gate script is not the candidate deployment path'
+  monday_file_direct "$gate_script" || die 'lease Gate script is not a direct file'
+  [[ $(sha256_file "$gate_script") == "$gate_script_sha" ]] || die 'lease Gate script digest changed'
+
+  # The recovery timer is a watchdog, not a delayed normal cleanup.  While
+  # the Gate owner still has the recorded PID/starttime pair, leave its lease
+  # and workers untouched; the repeating timer will check again later.  A
+  # missing owner or PID reuse is the only condition that permits recovery.
+  if [[ $applied == true && $restored == false ]] && kill -0 "$gate_pid" 2>/dev/null; then
+    owner_starttime=$(proc_starttime "$gate_pid" 2>/dev/null || true)
+    [[ -n $owner_starttime ]] || die 'lease Gate owner starttime is unverifiable'
+    [[ $owner_starttime == "$gate_starttime" ]] && return 0
+  fi
+
+  # The recovery service is run-scoped.  Do not use a broad unit wildcard or
+  # pkill: any non-matching name is ignored and no unrelated collector unit is
+  # touched.
+  listed=$(systemctl list-units --all --type=service --no-legend --plain \
+    "${GATE_UNIT_PREFIX}${run}-*.service") || die 'could not list run-scoped Gate workers'
+  while read -r unit _; do
+    [[ -n ${unit:-} ]] || continue
+    [[ $unit =~ ^${GATE_UNIT_PREFIX}${run}-(spot|usdm|spot-upload|usdm-upload|strict-[1-9][0-9]*|oss-(spot|usdm)-[1-9][0-9]*)\.service$ ]] \
+      || continue
+    systemctl stop "$unit" >/dev/null 2>&1 || true
+    systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+  done <<<"$listed"
+  direct_directory "$GATE_SYSTEMD_ROOT" || die 'systemd runtime unit path is not direct'
+  while IFS= read -r unit_file; do
+    unit=${unit_file##*/}
+    [[ $unit =~ ^${GATE_UNIT_PREFIX}${run}-(spot|usdm|spot-upload|usdm-upload|strict-[1-9][0-9]*|oss-(spot|usdm)-[1-9][0-9]*)\.service$ ]] \
+      || continue
+    rm -f -- "$unit_file"
+  done < <(find "$GATE_SYSTEMD_ROOT" -maxdepth 1 -type f -name "${GATE_UNIT_PREFIX}${run}-*.service" -print)
+  # Keep the aggregate slice top-level in systemd.  Dashes in a slice name
+  # encode hierarchy, so the run timestamp/PID is rendered as digits only.
+  slice_name="mondayrustlobgate${run//[^0-9]/}.slice"
+  if [[ -f "$GATE_SYSTEMD_ROOT/$slice_name" && ! -L "$GATE_SYSTEMD_ROOT/$slice_name" ]]; then
+    systemctl stop "$slice_name" >/dev/null 2>&1 || true
+    rm -f -- "$GATE_SYSTEMD_ROOT/$slice_name"
+  fi
+
+  if [[ $applied == true && $restored == false ]]; then
+    systemctl set-property --runtime "$PRODUCTION_SLICE" \
+      "MemoryHigh=$before_high" "MemoryMax=$before_max" >/dev/null 2>&1 \
+      || die 'could not restore the bootstrap production slice lease'
+    output=$(systemctl_show_many "$PRODUCTION_SLICE" 'MemoryHigh,MemoryMax') \
+      || die 'restored production slice limits are unavailable'
+    output=${output%$'\n'}; fields=()
+    while IFS= read -r item; do
+      [[ $item == *=* ]] || die 'restored production slice limits are malformed'
+      key=${item%%=*}; value=${item#*=}
+      case $key in MemoryHigh|MemoryMax) ;; *) die 'restored production slice has an unexpected field' ;; esac
+      [[ -z ${fields[$key]+x} ]] || die 'restored production slice has duplicate fields'
+      fields[$key]=$value
+    done <<<"$output"
+    [[ ${#fields[@]} == 2 ]] || die 'restored production slice limits are incomplete'
+    restored_high=${fields[MemoryHigh]:-}; restored_max=${fields[MemoryMax]:-}
+    [[ $restored_high == "$before_high" && $restored_max == "$before_max" ]] \
+      || die 'restored production slice limits differ from lease state'
+  fi
+
+  # This function runs as the recovery oneshot itself.  Stop/reset only the
+  # timer and run workers; stopping the current service would self-interrupt
+  # before its state/readback and unit removal complete.  Normal EXIT cleanup
+  # uses cancel_bootstrap_lease_recovery, which may stop both units.
+  systemctl stop "$timer_name" >/dev/null 2>&1 || true
+  systemctl reset-failed "$timer_name" >/dev/null 2>&1 || true
+  rm -f -- "$GATE_SYSTEMD_ROOT/$timer_name" "$GATE_SYSTEMD_ROOT/$service_name"
+  systemctl daemon-reload >/dev/null 2>&1 || die 'could not reload systemd after lease recovery'
+  temporary="${state}.tmp.$$"
+  jq -cS --arg recovered_by "$run" \
+    '.restored = true | .recovered_by_run_id = $recovered_by' "$state" >"$temporary" \
+    || die 'could not mark bootstrap lease recovered'
+  chmod 0640 "$temporary" || die 'could not protect recovered lease state'
+  mv -f -- "$temporary" "$state" || die 'could not publish recovered lease state'
+}
+
+if [[ -n $RECOVER_STATE ]]; then
+  recover_bootstrap_lease "$RECOVER_STATE"
+  exit 0
+fi
+
 # A production snapshot is one immutable view of the systemd template pair
 # and its automatically assigned slice.  The snapshot carries cgroup limits
 # and audit counters separately from process identity so resource admission can
@@ -336,6 +519,17 @@ cgroup_events_json() {
     | from_entries
   ' "$path"
 }
+cgroup_memory_stat_json() {
+  local path=$1
+  [[ -f $path && ! -L $path ]] || return 1
+  jq -Rsc '
+    split("\n")
+    | map(select(length > 0) | capture("^(?<key>[A-Za-z0-9_]+)[[:space:]]+(?<value>[0-9]+)$")
+      | {key:.key,value:(.value|tonumber)}) as $rows
+    | (($rows | map(.key) | unique | length) == ($rows | length))
+    | if . then ($rows | from_entries) else error("duplicate memory.stat key") end
+  ' "$path"
+}
 cgroup_child_path() {
   local control_group=$1 normalized
   [[ $control_group == /* && $control_group != */ && $control_group != *..* ]] || return 1
@@ -347,10 +541,15 @@ cgroup_child_path() {
 fixture_prepare_production_cgroup() {
   [[ $TEST_ONLY == true ]] || return 0
   local parent="$CGROUP_ROOT/system.slice/$PRODUCTION_SLICE" child unit market fixture_pid fixture_cgroup_pid
+  local fixture_parent_current=${MONDAY_GATE_FIXTURE_BOOTSTRAP_PARENT_CURRENT:-1101067264}
+  local fixture_parent_anon=${MONDAY_GATE_FIXTURE_BOOTSTRAP_PARENT_ANON:-317067264}
   mkdir -p "$parent"
   : >"$parent/cgroup.procs"
-  printf '5368709120\n' >"$parent/memory.current"
-  printf '5368709120\n' >"$parent/memory.peak"
+  printf '%s\n' "$fixture_parent_current" >"$parent/memory.current"
+  printf '5100000000\n' >"$parent/memory.peak"
+  printf '3221225472\n' >"$parent/memory.high"
+  printf '3758096384\n' >"$parent/memory.max"
+  printf 'anon %s\nfile 784000000\n' "$fixture_parent_anon" >"$parent/memory.stat"
   printf 'high 0\noom 0\noom_kill 0\n' >"$parent/memory.events"
   for market in spot usdm; do
     child="$parent/binance-lob-archiver-production@${market}.service"
@@ -386,9 +585,13 @@ fixture_prepare_production_cgroup() {
 capture_production_snapshot() {
   local market unit state substate slice control_group parent_group memory_max pid exe_sha n_restarts
   local child_path parent_path parent_procs_json active_children_json child_max_sum=0
-  local parent_current parent_peak parent_events children_json='{}' expected_parent='' expected_slice=''
+  local parent_current parent_peak parent_events parent_high parent_max parent_anon parent_file parent_stat
+  local slice_systemd_high slice_systemd_max slice_control_group
+  local children_json='{}' expected_parent='' expected_slice=''
   local show_output item key value
+  local slice_show_output slice_show_item slice_show_key slice_show_value
   declare -A show_fields=()
+  declare -A slice_show_fields=()
   local -a active_children=()
   if [[ $TEST_ONLY == true ]]; then
     fixture_prepare_production_cgroup
@@ -445,7 +648,28 @@ capture_production_snapshot() {
         process_exe_sha256:$exe,n_restarts:$restarts,active:true,
         systemd_memory_max_bytes:$systemd_max,memory_max_bytes:2684354560}}')
   done
+  # The aggregate slice is governed by one explicit signed unit.  Keep the
+  # parser order-independent because systemctl does not promise request order.
+  slice_show_output=$(systemctl_show_many "$PRODUCTION_SLICE" 'MemoryHigh,MemoryMax,ControlGroup') || return 1
+  slice_show_output=${slice_show_output%$'\n'}
+  slice_show_fields=()
+  while IFS= read -r slice_show_item; do
+    [[ $slice_show_item == *=* ]] || return 1
+    slice_show_key=${slice_show_item%%=*}; slice_show_value=${slice_show_item#*=}
+    case $slice_show_key in MemoryHigh|MemoryMax|ControlGroup) ;; *) return 1 ;; esac
+    [[ -z ${slice_show_fields[$slice_show_key]+x} ]] || return 1
+    slice_show_fields[$slice_show_key]=$slice_show_value
+  done <<<"$slice_show_output"
+  (( ${#slice_show_fields[@]} == 3 )) || return 1
+  slice_systemd_high=${slice_show_fields[MemoryHigh]:-}
+  slice_systemd_max=${slice_show_fields[MemoryMax]:-}
+  slice_control_group=${slice_show_fields[ControlGroup]:-}
+  [[ $slice_systemd_high == 3221225472 && $slice_systemd_max == 3758096384 ]] || return 1
+  [[ $slice_control_group == "/system.slice/$PRODUCTION_SLICE" ]] || return 1
   parent_path=$(cgroup_child_path "$expected_parent") || return 1
+  parent_high=$(cgroup_numeric_value "$parent_path/memory.high") || return 1
+  parent_max=$(cgroup_numeric_value "$parent_path/memory.max") || return 1
+  [[ $parent_high == 3221225472 && $parent_max == 3758096384 ]] || return 1
   parent_procs_json=$(awk 'NF {bad=1; values[++n]=$1} END {if (bad) {printf "["; for (i=1;i<=n;i++) printf "%s%s", (i>1?",":""), values[i]; printf "]"} else print "[]"}' \
     "$parent_path/cgroup.procs") || return 1
   [[ $parent_procs_json == '[]' ]] || return 1
@@ -459,22 +683,36 @@ capture_production_snapshot() {
   active_children_json=$(printf '%s\n' "${active_children[@]}" | jq -Rsc 'split("\n") | map(select(length > 0)) | sort') || return 1
   parent_current=$(cgroup_numeric_value "$parent_path/memory.current") || return 1
   parent_peak=$(cgroup_numeric_value "$parent_path/memory.peak") || return 1
+  parent_stat=$(cgroup_memory_stat_json "$parent_path/memory.stat") || return 1
+  parent_anon=$(jq -er '.anon' <<<"$parent_stat") || return 1
+  parent_file=$(jq -er '.file' <<<"$parent_stat") || return 1
+  [[ $parent_anon =~ ^[0-9]+$ && $parent_file =~ ^[0-9]+$ ]] || return 1
+  (( parent_anon <= parent_current )) || return 1
   parent_events=$(cgroup_events_json "$parent_path/memory.events") || return 1
   jq -cn --arg slice "$expected_slice" --arg parent "$expected_parent" \
     --argjson procs "$parent_procs_json" --argjson active "$active_children_json" \
     --argjson children "$children_json" --argjson current "$parent_current" \
-    --argjson peak "$parent_peak" --argjson sum "$child_max_sum" --argjson events "$parent_events" \
+    --argjson peak "$parent_peak" --argjson high "$parent_high" --argjson max "$parent_max" \
+    --argjson systemd_high "$slice_systemd_high" --argjson systemd_max "$slice_systemd_max" \
+    --argjson anon "$parent_anon" --argjson file "$parent_file" --argjson stat "$parent_stat" \
+    --argjson sum "$child_max_sum" --argjson events "$parent_events" \
     '{slice:$slice,parent_control_group:$parent,parent_cgroup_procs:$procs,
       active_child_control_groups:$active,children:$children,
+      production_slice_memory_high_bytes:$high,production_slice_memory_max_bytes:$max,
+      systemd_production_slice_memory_high_bytes:$systemd_high,
+      systemd_production_slice_memory_max_bytes:$systemd_max,
       parent_memory_current_bytes:$current,parent_memory_peak_bytes:$peak,
+      parent_memory_anon_bytes:$anon,parent_memory_file_bytes:$file,parent_memory_stat:$stat,
       child_memory_max_sum_bytes:$sum,parent_memory_events:$events}'
 }
 
 production_snapshot_json=''; production_snapshot_identity_json=''
-production_parent_current=''; production_child_max_sum=''; production_growth=''
+production_parent_current=''; production_parent_anon=''; production_parent_file=''
+production_child_max_sum=''; production_slice_memory_max=''; production_growth=''
 production_memory_json='{}' production_process_json='{}'
 refresh_production_snapshot() {
-  local first second first_identity second_identity current_a current_b sum_a sum_b conservative_current conservative_sum
+  local first second first_identity second_identity current_a current_b anon_a anon_b file_a file_b
+  local sum_a sum_b slice_max_a slice_max_b slice_high_a slice_high_b conservative_current conservative_anon conservative_file conservative_sum
   first=$(capture_production_snapshot) || return 1
   monday_validate_lob_production_snapshot "$first" || return 1
   first_identity=$(monday_lob_production_snapshot_identity "$first") || return 1
@@ -487,16 +725,38 @@ refresh_production_snapshot() {
   [[ $second_identity == "$first_identity" ]] || return 1
   current_a=$(jq -er '.parent_memory_current_bytes' <<<"$first") || return 1
   current_b=$(jq -er '.parent_memory_current_bytes' <<<"$second") || return 1
+  anon_a=$(jq -er '.parent_memory_anon_bytes' <<<"$first") || return 1
+  anon_b=$(jq -er '.parent_memory_anon_bytes' <<<"$second") || return 1
+  file_a=$(jq -er '.parent_memory_file_bytes' <<<"$first") || return 1
+  file_b=$(jq -er '.parent_memory_file_bytes' <<<"$second") || return 1
   sum_a=$(jq -er '.child_memory_max_sum_bytes' <<<"$first") || return 1
   sum_b=$(jq -er '.child_memory_max_sum_bytes' <<<"$second") || return 1
+  slice_max_a=$(jq -er '.production_slice_memory_max_bytes' <<<"$first") || return 1
+  slice_max_b=$(jq -er '.production_slice_memory_max_bytes' <<<"$second") || return 1
+  slice_high_a=$(jq -er '.production_slice_memory_high_bytes' <<<"$first") || return 1
+  slice_high_b=$(jq -er '.production_slice_memory_high_bytes' <<<"$second") || return 1
   conservative_current=$current_a; (( current_b < conservative_current )) && conservative_current=$current_b
+  conservative_anon=$anon_a; (( anon_b < conservative_anon )) && conservative_anon=$anon_b
+  conservative_file=$file_a; (( file_b > conservative_file )) && conservative_file=$file_b
   conservative_sum=$sum_a; (( sum_b > conservative_sum )) && conservative_sum=$sum_b
-  production_snapshot_json=$(jq -cn --argjson value "$second" --argjson current "$conservative_current" --argjson sum "$conservative_sum" \
-    '$value | .parent_memory_current_bytes=$current | .child_memory_max_sum_bytes=$sum')
+  [[ $slice_max_a == "$slice_max_b" && $slice_high_a == "$slice_high_b" ]] || return 1
+  production_snapshot_json=$(jq -cn --argjson value "$second" --argjson current "$conservative_current" \
+    --argjson anon "$conservative_anon" --argjson file "$conservative_file" --argjson sum "$conservative_sum" \
+    '$value | .parent_memory_current_bytes=$current | .parent_memory_anon_bytes=$anon
+      | .parent_memory_file_bytes=$file | .child_memory_max_sum_bytes=$sum')
   production_parent_current=$conservative_current
+  production_parent_anon=$conservative_anon
+  production_parent_file=$conservative_file
   production_child_max_sum=$conservative_sum
-  production_growth=$((conservative_sum - conservative_current))
-  production_memory_json=$(jq -c '{slice,parent_control_group,parent_cgroup_procs,active_child_control_groups,children,parent_memory_current_bytes,parent_memory_peak_bytes,child_memory_max_sum_bytes,parent_memory_events}' <<<"$production_snapshot_json")
+  production_slice_memory_max=$slice_max_a
+  production_growth=$((production_slice_memory_max - production_parent_anon))
+  production_memory_json=$(jq -c --argjson anon "$conservative_anon" --argjson file "$conservative_file" \
+    '{slice,parent_control_group,parent_cgroup_procs,active_child_control_groups,children,
+    production_slice_memory_high_bytes,production_slice_memory_max_bytes,
+    systemd_production_slice_memory_high_bytes,systemd_production_slice_memory_max_bytes,
+    parent_memory_current_bytes,parent_memory_peak_bytes,parent_memory_anon_bytes,parent_memory_file_bytes,parent_memory_stat,
+    child_memory_max_sum_bytes,parent_memory_events}
+    | .parent_memory_stat.anon=$anon | .parent_memory_stat.file=$file' <<<"$production_snapshot_json")
   production_process_json=$(jq -c '(.children | with_entries(.value |= {main_pid,process_exe_sha256,n_restarts,active}))' <<<"$production_snapshot_json")
   if [[ -z ${production_snapshot_identity_json:-} ]]; then
     production_snapshot_identity_json=$first_identity
@@ -581,7 +841,6 @@ else
   before_runtime=$legacy_runtime
   before_bundle=$(jq -er '.deployment_bundle_sha256' "$legacy_target/release.json") || die 'legacy controller bundle is invalid'
   before_source=$(jq -er '.deployment_source_revision' "$legacy_target/release.json") || die 'legacy controller source is invalid'
-  [[ $candidate_runtime == "$before_runtime" ]] || die 'direct bootstrap requires R0 equal to R1'
   [[ -L $PRODUCTION_BINARY && $(readlink -f -- "$PRODUCTION_BINARY") == "$production_target" ]] \
     || die 'direct production identity differs'
   before_production_projection=$(readlink -- "$PRODUCTION_BINARY")
@@ -591,14 +850,24 @@ fi
 # never from the candidate manifest.  This is especially important for direct
 # bootstrap: C0's R0 must be true of the installed P0 topology before any
 # shadow staging occurs.
-live_runtime=$(monday_rust_lob_live_runtime_contract_sha256 "$ROOT") \
-  || die 'before runtime contract is missing or indirect'
+if [[ $FROM_CONTROLLER == direct ]]; then
+  # Direct bootstrap is the typed R0(v1, eight assets) -> R2(v2, nine assets)
+  # migration. Always hash the legacy eight-asset view, even if a stale slice
+  # happens to be present, so the candidate's V2 identity is not mistaken for
+  # the immutable pre-bootstrap identity.
+  live_runtime=$(monday_rust_lob_live_runtime_contract_sha256_v1 "$ROOT") \
+    || die 'before legacy runtime contract is missing or indirect'
+elif live_runtime=$(monday_rust_lob_live_runtime_contract_sha256 "$ROOT" 2>/dev/null); then
+  :
+else
+  die 'before runtime contract is missing or indirect'
+fi
 [[ $live_runtime == "$before_runtime" ]] \
   || die 'before runtime bytes differ from the immutable before controller'
 
 production_asset_json='{}'
 for asset in "${PRODUCTION_ASSETS[@]}"; do
-  if [[ $asset == *.service ]]; then production_target="$SYSTEMD_ROOT/$asset"; else production_target="$CONFIG_ROOT/$asset"; fi
+  if [[ $asset == *.service || $asset == "$PRODUCTION_SLICE" ]]; then production_target="$SYSTEMD_ROOT/$asset"; else production_target="$CONFIG_ROOT/$asset"; fi
   if [[ -L $production_target ]]; then
     [[ $(readlink -- "$production_target") == "$CONTROLLER_ROOT/active/deployment/$asset" ]] \
       || die "installed production asset is not the stable projection: $asset"
@@ -606,6 +875,15 @@ for asset in "${PRODUCTION_ASSETS[@]}"; do
       || die "installed production asset projection is dangling: $asset"
   else
     production_resolved=$production_target
+  fi
+  if [[ $FROM_CONTROLLER == direct && $asset == "$PRODUCTION_SLICE" \
+    && ! -e $production_target && ! -L $production_target ]]; then
+    # The direct bootstrap is the sole typed 8 -> 9 migration.  Record the
+    # missing aggregate slice explicitly; Cutover installs it atomically from
+    # the verified candidate release.  No other runtime asset may be absent.
+    production_asset_json=$(jq -cn --argjson values "$production_asset_json" \
+      --arg asset "$asset" '$values + {($asset):null}')
+    continue
   fi
   regular_file "$production_resolved" || die "installed production asset is missing: $production_target"
   cmp -s "$before_deployment/$asset" "$production_resolved" \
@@ -617,7 +895,7 @@ declare -A installed_asset saved_state saved_sha saved_target
 declare -A candidate_asset_sha restored_asset_sha
 tmp_dir=$(mktemp -d)
 for asset in "${SHADOW_ASSETS[@]}"; do
-  if [[ $asset == *.service ]]; then installed_asset[$asset]="$SYSTEMD_ROOT/$asset"
+  if [[ $asset == *.service || $asset == "$PRODUCTION_SLICE" ]]; then installed_asset[$asset]="$SYSTEMD_ROOT/$asset"
   else installed_asset[$asset]="$CONFIG_ROOT/$asset"; fi
   if regular_file "${installed_asset[$asset]}"; then
     saved_state[$asset]=present; saved_sha[$asset]=$(sha256_file "${installed_asset[$asset]}")
@@ -638,6 +916,231 @@ if [[ $old_shadow_present == true ]]; then
   secure_file "$old_shadow_target_resolved"
   old_shadow_target_sha256=$(sha256_file "$old_shadow_target_resolved")
 fi
+
+# Direct bootstrap may run once on a host whose production slice predates V2
+# and is still unlimited.  In that one migration mode, install a runtime-only
+# lease for the duration of this Gate.  The exact previous values are retained
+# in a run-scoped state file before mutation and restored on normal EXIT paths;
+# the next serialized Gate also recovers an un-restored lease left by SIGKILL.
+# Stable V2 Gates only verify the permanent slice and never mutate it.
+bootstrap_slice_lease_mode=permanent
+bootstrap_slice_lease_before_high=3072M; bootstrap_slice_lease_before_max=3584M
+bootstrap_slice_lease_applied=false; bootstrap_slice_lease_restored=true
+bootstrap_slice_lease_state_file=
+bootstrap_slice_lease_gate_pid=
+bootstrap_slice_lease_gate_starttime=
+bootstrap_slice_lease_candidate_controller=
+bootstrap_slice_lease_gate_script=
+bootstrap_slice_lease_gate_script_sha256=
+bootstrap_slice_lease_parent_control_group=
+bootstrap_slice_lease_parent_current=0
+bootstrap_slice_lease_parent_anon=0
+write_bootstrap_slice_lease_state() {
+  [[ -n ${bootstrap_slice_lease_state_file:-} ]] || return 1
+  local temporary="${bootstrap_slice_lease_state_file}.tmp.$$"
+  jq -cS -n \
+    --arg run "$run_id" --arg slice "$PRODUCTION_SLICE" \
+    --arg mode "$bootstrap_slice_lease_mode" \
+    --arg before_high "$bootstrap_slice_lease_before_high" \
+    --arg before_max "$bootstrap_slice_lease_before_max" \
+    --arg parent_control_group "$bootstrap_slice_lease_parent_control_group" \
+    --arg controller "$bootstrap_slice_lease_candidate_controller" \
+    --arg gate_script "$bootstrap_slice_lease_gate_script" \
+    --arg gate_script_sha "$bootstrap_slice_lease_gate_script_sha256" \
+    --arg recovery_service "${bootstrap_slice_lease_recovery_service##*/}" \
+    --arg recovery_timer "${bootstrap_slice_lease_recovery_timer##*/}" \
+    --argjson gate_pid "$bootstrap_slice_lease_gate_pid" \
+    --argjson gate_starttime "$bootstrap_slice_lease_gate_starttime" \
+    --argjson parent_current "$bootstrap_slice_lease_parent_current" \
+    --argjson parent_anon "$bootstrap_slice_lease_parent_anon" \
+    --argjson applied "$bootstrap_slice_lease_applied" \
+    --argjson restored "$bootstrap_slice_lease_restored" \
+    '{schema:"monday.rust_lob_bootstrap_slice_lease.v1",run_id:$run,slice:$slice,
+      mode:$mode,before_memory_high:$before_high,before_memory_max:$before_max,
+      before_parent_control_group:$parent_control_group,
+      before_parent_memory_current_bytes:$parent_current,
+      before_parent_memory_anon_bytes:$parent_anon,
+      requested_memory_high:"3072M",requested_memory_max:"3584M",
+      candidate_controller_sha256:$controller,gate_script:$gate_script,
+      gate_script_sha256:$gate_script_sha,gate_pid:$gate_pid,gate_starttime:$gate_starttime,
+      recovery_service:$recovery_service,recovery_timer:$recovery_timer,
+      applied:$applied,restored:$restored}' >"$temporary" || return 1
+  chmod 0640 "$temporary" || return 1
+  mv -f -- "$temporary" "$bootstrap_slice_lease_state_file"
+}
+read_bootstrap_slice_limits() {
+  local output item key value
+  local -A fields=()
+  output=$(systemctl_show_many "$PRODUCTION_SLICE" 'MemoryHigh,MemoryMax') || return 1
+  output=${output%$'\n'}
+  while IFS= read -r item; do
+    [[ $item == *=* ]] || return 1
+    key=${item%%=*}; value=${item#*=}
+    case $key in MemoryHigh|MemoryMax) ;; *) return 1 ;; esac
+    [[ -z ${fields[$key]+x} ]] || return 1
+    fields[$key]=$value
+  done <<<"$output"
+  [[ ${fields[MemoryHigh]+x} && ${fields[MemoryMax]+x} ]] || return 1
+  printf '%s\t%s\n' "${fields[MemoryHigh]}" "${fields[MemoryMax]}"
+}
+read_bootstrap_slice_usage() {
+  local output item key value control_group parent_path current parent_stat anon
+  local -A fields=()
+  [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] \
+    && printf 'read-bootstrap-slice-usage\n' >>"$ROOT/run/gate-fixture.calls"
+  # The fixture must create the same direct cgroup files before this
+  # pre-mutation read; production uses the already-mounted cgroup tree.
+  [[ $TEST_ONLY == true ]] && fixture_prepare_production_cgroup
+  output=$(systemctl_show_many "$PRODUCTION_SLICE" 'ControlGroup') || return 1
+  output=${output%$'\n'}
+  while IFS= read -r item; do
+    [[ $item == *=* ]] || return 1
+    key=${item%%=*}; value=${item#*=}
+    [[ $key == ControlGroup ]] || return 1
+    [[ -z ${fields[$key]+x} ]] || return 1
+    fields[$key]=$value
+  done <<<"$output"
+  [[ ${#fields[@]} == 1 ]] || return 1
+  control_group=${fields[ControlGroup]:-}
+  [[ $control_group == "/system.slice/$PRODUCTION_SLICE" ]] || return 1
+  parent_path=$(cgroup_child_path "$control_group") || return 1
+  monday_path_direct "$parent_path" || return 1
+  current=$(cgroup_numeric_value "$parent_path/memory.current") || return 1
+  parent_stat=$(cgroup_memory_stat_json "$parent_path/memory.stat") || return 1
+  anon=$(jq -er '.anon' <<<"$parent_stat") || return 1
+  [[ $current =~ ^(0|[1-9][0-9]*)$ && $anon =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  if (( current > 3758096384 )); then
+    [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] \
+      && printf 'usage-over-cap-current\n' >>"$ROOT/run/gate-fixture.calls"
+    return 1
+  fi
+  if (( anon > 3758096384 )); then
+    [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] \
+      && printf 'usage-over-cap-anon\n' >>"$ROOT/run/gate-fixture.calls"
+    return 1
+  fi
+  printf '%s\t%s\t%s\n' "$control_group" "$current" "$anon"
+}
+install_bootstrap_lease_recovery() {
+  [[ $TEST_ONLY == true ]] && return 0
+  local service_name=${bootstrap_slice_lease_recovery_service##*/}
+  local timer_name=${bootstrap_slice_lease_recovery_timer##*/}
+  local candidate_gate_script="$candidate_deployment/host-rust-lob-shadow-gate.sh"
+  local temporary_service="${bootstrap_slice_lease_recovery_service}.tmp.$$"
+  local temporary_timer="${bootstrap_slice_lease_recovery_timer}.tmp.$$"
+  monday_file_direct "$candidate_gate_script" || return 1
+  [[ ! -e $bootstrap_slice_lease_recovery_service && ! -L $bootstrap_slice_lease_recovery_service \
+    && ! -e $bootstrap_slice_lease_recovery_timer && ! -L $bootstrap_slice_lease_recovery_timer ]] || return 1
+  printf '[Unit]\nDescription=Recover Monday Rust LOB bootstrap slice lease (%s)\n\n[Service]\nType=oneshot\nExecStart=%s --recover-bootstrap-lease %s\nTimeoutStartSec=120\n' \
+    "$run_id" "$candidate_gate_script" "$bootstrap_slice_lease_state_file" >"$temporary_service" || return 1
+  # Run once after a short grace period and again after each completed
+  # watchdog service invocation.  The recovery service itself returns while
+  # the recorded Gate owner is alive, so a healthy Gate never loses its lease.
+  printf '[Unit]\nDescription=Recover Monday Rust LOB bootstrap slice lease (%s)\n\n[Timer]\nOnActiveSec=30s\nOnUnitInactiveSec=30s\nAccuracySec=1s\nUnit=%s\n' \
+    "$run_id" "$service_name" >"$temporary_timer" || return 1
+  chmod 0644 "$temporary_service" "$temporary_timer" || return 1
+  mv -f -- "$temporary_service" "$bootstrap_slice_lease_recovery_service" || return 1
+  mv -f -- "$temporary_timer" "$bootstrap_slice_lease_recovery_timer" || return 1
+  systemctl daemon-reload >/dev/null 2>&1 || return 1
+  systemctl start "$timer_name" >/dev/null 2>&1 || return 1
+}
+cancel_bootstrap_lease_recovery() {
+  [[ $TEST_ONLY == true ]] && return 0
+  local service_name=${bootstrap_slice_lease_recovery_service##*/}
+  local timer_name=${bootstrap_slice_lease_recovery_timer##*/}
+  if [[ -e $bootstrap_slice_lease_recovery_service || -L $bootstrap_slice_lease_recovery_service \
+    || -e $bootstrap_slice_lease_recovery_timer || -L $bootstrap_slice_lease_recovery_timer ]]; then
+    systemctl stop "$timer_name" >/dev/null 2>&1 || true
+    systemctl stop "$service_name" >/dev/null 2>&1 || true
+    systemctl reset-failed "$timer_name" >/dev/null 2>&1 || true
+    systemctl reset-failed "$service_name" >/dev/null 2>&1 || true
+    rm -f -- "$bootstrap_slice_lease_recovery_timer" "$bootstrap_slice_lease_recovery_service"
+    systemctl daemon-reload >/dev/null 2>&1 || return 1
+  fi
+}
+apply_bootstrap_slice_lease() {
+  [[ $FROM_CONTROLLER == direct ]] || return 0
+  local limits before_high before_max usage parent_control parent_current parent_anon
+  limits=$(read_bootstrap_slice_limits) || die 'production slice limits are unavailable before Gate'
+  IFS=$'\t' read -r before_high before_max <<<"$limits"
+  [[ $before_high =~ ^(infinity|[0-9]+)$ && $before_max =~ ^(infinity|[0-9]+)$ ]] \
+    || die 'production slice limits are malformed before Gate'
+  if [[ $before_high == 3221225472 || $before_high == 3072M ]] &&
+     [[ $before_max == 3758096384 || $before_max == 3584M ]]; then
+    bootstrap_slice_lease_mode=permanent
+    bootstrap_slice_lease_before_high=$before_high
+    bootstrap_slice_lease_before_max=$before_max
+    bootstrap_slice_lease_applied=false
+    bootstrap_slice_lease_restored=true
+    return 0
+  fi
+  if [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_BOOTSTRAP_LEASE_USAGE:-0} != 1 ]]; then
+    die 'fixture production slice must expose the governed V2 limits'
+  fi
+  [[ $before_high == infinity || $before_high == 0 || $before_high == max ]] \
+    || die 'direct bootstrap refuses an unexpected production MemoryHigh'
+  [[ $before_max == infinity || $before_max == max ]] \
+    || die 'direct bootstrap refuses an unexpected production MemoryMax'
+  # Read the exact production parent usage before arming recovery or changing
+  # either limit.  Current and anon are both bounded independently so a
+  # high-current legacy slice cannot be hidden behind a smaller anon value.
+  usage=$(read_bootstrap_slice_usage) \
+    || die 'direct bootstrap could not read the production slice usage before Gate'
+  IFS=$'\t' read -r parent_control parent_current parent_anon <<<"$usage"
+  bootstrap_slice_lease_parent_control_group=$parent_control
+  bootstrap_slice_lease_parent_current=$parent_current
+  bootstrap_slice_lease_parent_anon=$parent_anon
+  # Mark the lease as pending before the mutating call so an abnormal exit
+  # between set-property and the bookkeeping assignments still enters the
+  # EXIT cleanup path with the original limits available for restoration.
+  bootstrap_slice_lease_mode='temporary-bootstrap'
+  bootstrap_slice_lease_before_high=$before_high
+  bootstrap_slice_lease_before_max=$before_max
+  bootstrap_slice_lease_applied=true
+  bootstrap_slice_lease_restored=false
+  bootstrap_slice_lease_gate_pid=$$
+  bootstrap_slice_lease_gate_starttime=$(proc_starttime "$$") \
+    || die 'could not record the Gate owner starttime for lease recovery'
+  bootstrap_slice_lease_candidate_controller=$CANDIDATE_CONTROLLER
+  bootstrap_slice_lease_gate_script="$candidate_deployment/host-rust-lob-shadow-gate.sh"
+  monday_file_direct "$bootstrap_slice_lease_gate_script" \
+    || die 'candidate Gate script is not a direct file for lease recovery'
+  bootstrap_slice_lease_gate_script_sha256=$(sha256_file "$bootstrap_slice_lease_gate_script") \
+    || die 'could not record candidate Gate script identity for lease recovery'
+  [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] \
+    && printf 'write-lease-state\n' >>"$ROOT/run/gate-fixture.calls"
+  write_bootstrap_slice_lease_state \
+    || die 'could not persist the temporary production slice lease'
+  [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] \
+    && printf 'install-lease-recovery\n' >>"$ROOT/run/gate-fixture.calls"
+  install_bootstrap_lease_recovery \
+    || die 'could not arm automatic bootstrap lease recovery'
+  systemctl set-property --runtime "$PRODUCTION_SLICE" \
+    MemoryHigh=3072M MemoryMax=3584M >/dev/null \
+    || die 'could not apply the temporary production slice lease'
+  limits=$(read_bootstrap_slice_limits) || die 'temporary production slice lease could not be read back'
+  IFS=$'\t' read -r before_high before_max <<<"$limits"
+  [[ $before_high == 3221225472 || $before_high == 3072M ]] \
+    || die 'temporary production MemoryHigh lease is not exact'
+  [[ $before_max == 3758096384 || $before_max == 3584M ]] \
+    || die 'temporary production MemoryMax lease is not exact'
+}
+restore_bootstrap_slice_lease() {
+  [[ ${bootstrap_slice_lease_mode:-permanent} == temporary-bootstrap ]] || return 0
+  [[ ${bootstrap_slice_lease_restored:-false} == true ]] && return 0
+  [[ $TEST_ONLY != true ]] || return 1
+  systemctl set-property --runtime "$PRODUCTION_SLICE" \
+    "MemoryHigh=$bootstrap_slice_lease_before_high" \
+    "MemoryMax=$bootstrap_slice_lease_before_max" >/dev/null 2>&1 || return 1
+  local limits restored_high restored_max
+  limits=$(read_bootstrap_slice_limits) || return 1
+  IFS=$'\t' read -r restored_high restored_max <<<"$limits"
+  [[ $restored_high == "$bootstrap_slice_lease_before_high" \
+    && $restored_max == "$bootstrap_slice_lease_before_max" ]] || return 1
+  cancel_bootstrap_lease_recovery || return 1
+  bootstrap_slice_lease_restored=true
+  write_bootstrap_slice_lease_state || return 1
+}
 
 # Candidate shadow units are rendered into a run-scoped /run directory.  The
 # source template may only contribute the reviewed security/resource fields;
@@ -719,14 +1222,10 @@ for market in "${markets[@]}"; do
 done
 
 host_memory_total=$(meminfo_bytes MemTotal) || die 'MemTotal is unavailable'; host_memory_available=$(meminfo_bytes MemAvailable) || die 'MemAvailable is unavailable'; host_swap_total=$(meminfo_bytes SwapTotal) || die 'SwapTotal is unavailable'
-if [[ $TEST_ONLY == true ]]; then
-  refresh_production_snapshot || die 'fixture production cgroup snapshot is invalid'
-else
-  refresh_production_snapshot || die 'production cgroup snapshot is invalid'
-fi
 
 resource_samples='[]'; psi_windows='[]'; resource_monitor_pid=; resource_monitor_control=; resource_monitor_log=; resource_monitor_phase=
 strict_unit_seq=0
+oss_unit_seq=0
 declare -A resource_phase_required resource_phase_limit resource_phase_parent_current resource_phase_child_sum resource_phase_growth
 record_resource() {
   local phase=$1 phase_max=$2 required sample now available_before available_after
@@ -736,7 +1235,7 @@ record_resource() {
   host_memory_available=$available_before
   (( available_after < host_memory_available )) && host_memory_available=$available_after
   required=$(monday_shadow_memory_admission "$host_memory_available" "$HOST_MEMORY_RESERVE_BYTES" "$phase_max" \
-    "$production_parent_current" "$production_child_max_sum") || die "insufficient memory for $phase"
+    "$production_parent_anon" "$production_slice_memory_max") || die "insufficient memory for $phase"
   resource_phase_required[$phase]=$required
   resource_phase_limit[$phase]=$phase_max
   resource_phase_parent_current[$phase]=$production_parent_current
@@ -744,14 +1243,39 @@ record_resource() {
   resource_phase_growth[$phase]=$production_growth
   now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   sample=$(jq -cn --arg phase "$phase" --argjson available "$host_memory_available" --argjson required "$required" --argjson phase_max "$phase_max" \
+    --argjson available_before "$available_before" --argjson available_after "$available_after" \
     --argjson reserve "$HOST_MEMORY_RESERVE_BYTES" --argjson current "$production_parent_current" \
-    --argjson child_sum "$production_child_max_sum" --argjson growth "$production_growth" --arg now "$now" \
+    --argjson anon "$production_parent_anon" --argjson file "$production_parent_file" \
+    --argjson slice_max "$production_slice_memory_max" --argjson child_sum "$production_child_max_sum" \
+    --argjson growth "$production_growth" --arg now "$now" \
     '{phase:$phase,started_at:$now,ended_at:$now,samples:1,host_memory_available_bytes:$available,
+      host_memory_available_before_bytes:$available_before,host_memory_available_after_bytes:$available_after,
       max_memory_available_bytes:$available,current_memory_available_bytes:$available,breach:false,
       host_memory_reserve_bytes:$reserve,production_parent_memory_current_bytes:$current,
+      production_parent_memory_anon_bytes:$anon,production_parent_memory_file_bytes:$file,
+      production_slice_memory_max_bytes:$slice_max,
       production_child_memory_max_sum_bytes:$child_sum,production_memory_growth_bytes:$growth,
+      production_unallocated_bytes:$growth,
       required_bytes:$required,phase_memory_max_bytes:$phase_max}')
   resource_samples=$(jq -cn --argjson values "$resource_samples" --argjson value "$sample" '$values + [$value]')
+}
+verify_gate_worker_slice() {
+  local output item key value
+  local -A fields=()
+  output=$(systemctl_show_many "$GATE_WORKER_SLICE" 'MemoryHigh,MemoryMax,ControlGroup') || return 1
+  output=${output%$'\n'}
+  while IFS= read -r item; do
+    [[ $item == *=* ]] || return 1
+    key=${item%%=*}; value=${item#*=}
+    case $key in MemoryHigh|MemoryMax|ControlGroup) ;; *) return 1 ;; esac
+    [[ -z ${fields[$key]+x} ]] || return 1
+    fields[$key]=$value
+  done <<<"$output"
+  [[ ${#fields[@]} == 3 ]] || return 1
+  [[ ${fields[MemoryHigh]:-} == "$GATE_WORKER_MEMORY_HIGH_BYTES" \
+    && ${fields[MemoryMax]:-} == "$GATE_WORKER_MEMORY_MAX_BYTES" \
+    && ${fields[ControlGroup]:-} == "/$GATE_WORKER_SLICE" ]] || return 1
+  gate_worker_slice_control_group=${fields[ControlGroup]}
 }
 resource_monitor_identity_guard() {
   local snapshot=$1 snapshot_identity
@@ -769,6 +1293,7 @@ resource_monitor_start() {
   local phase=$1 phase_max=$2 initial_available initial_psi parent_pid parent_starttime
   resource_monitor_phase=$phase
   record_resource "$phase" "$phase_max"
+  verify_gate_worker_slice || die "run-scoped Gate worker slice is not an exact live envelope before $phase"
   if [[ $TEST_ONLY == true ]]; then
     # The fixture normally skips the asynchronous monitor, but this hook
     # exercises the same identity guard synchronously before a writer starts.
@@ -898,6 +1423,19 @@ assert_host_memory_reserve() {
 run_id=$(date -u +%Y%m%dT%H%M%SZ)-$$
 evidence_dir="$EVIDENCE_ROOT/$CANDIDATE_CONTROLLER/$candidate_runtime/runs/$run_id"; gate_json="$evidence_dir/gate.json"; passed_marker="$evidence_dir/PASSED.sha256"; run_spool="$RUN_SPOOL_ROOT/$run_id"; run_json="$evidence_dir/run.json"
 gate_unit_dir="$GATE_UNIT_ROOT/$run_id"
+bootstrap_slice_lease_state_file="$GATE_UNIT_ROOT/bootstrap-slice-lease-$run_id.json"
+bootstrap_slice_lease_recovery_service="$GATE_SYSTEMD_ROOT/${GATE_UNIT_PREFIX}${run_id}-lease-recovery.service"
+bootstrap_slice_lease_recovery_timer="$GATE_SYSTEMD_ROOT/${GATE_UNIT_PREFIX}${run_id}-lease-recovery.timer"
+# All Gate workers share one run-scoped hard envelope.  The production pair
+# remains in its separately governed permanent slice; this transient slice is
+# removed by the EXIT cleanup and is never treated as a production asset.
+# A dash in a systemd slice name denotes a hierarchy component.  Use a
+# digits-only run suffix so this aggregate remains one top-level cgroup.
+GATE_WORKER_SLICE="mondayrustlobgate${run_id//[^0-9]/}.slice"
+gate_worker_slice_file="$GATE_SYSTEMD_ROOT/$GATE_WORKER_SLICE"
+GATE_WORKER_MEMORY_HIGH_BYTES=1342177280
+GATE_WORKER_MEMORY_MAX_BYTES=1610612736
+gate_worker_slice_control_group=
 
 # BSD/GNU install only applies -m to the leaf when creating a nested path.
 # Create each shadow spool component explicitly so the collector user can
@@ -912,7 +1450,11 @@ ensure_run_spool_dir "$GATE_UNIT_ROOT"
 # and /etc bytes are never addressed by this cleanup.
 valid_gate_transient_unit() {
   local candidate_unit_name=$1
-  [[ $candidate_unit_name =~ ^${GATE_UNIT_PREFIX}[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*-(spot|usdm|spot-upload|usdm-upload|strict-[1-9][0-9]*)\.service$ ]]
+  [[ $candidate_unit_name =~ ^${GATE_UNIT_PREFIX}[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*-(spot|usdm|spot-upload|usdm-upload|strict-[1-9][0-9]*|oss-(spot|usdm)-[1-9][0-9]*)\.service$ ]]
+}
+valid_gate_transient_slice() {
+  local candidate_slice_name=$1
+  [[ $candidate_slice_name =~ ^mondayrustlobgate[0-9]{15,}\.slice$ ]]
 }
 cleanup_stale_gate_units() {
   local listed unit unit_file
@@ -931,6 +1473,12 @@ cleanup_stale_gate_units() {
     valid_gate_transient_unit "$unit" || continue
     rm -f -- "$unit_file"
   done < <(find "$GATE_SYSTEMD_ROOT" -maxdepth 1 -type f -name 'monday-rust-lob-gate-*.service' -print)
+  while IFS= read -r unit_file; do
+    unit=${unit_file##*/}
+    valid_gate_transient_slice "$unit" || continue
+    systemctl stop "$unit" >/dev/null 2>&1 || true
+    rm -f -- "$unit_file"
+  done < <(find "$GATE_SYSTEMD_ROOT" -maxdepth 1 -type f -name 'mondayrustlobgate*.slice' -print)
   systemctl daemon-reload >/dev/null 2>&1 || return 1
 }
 cleanup_stale_gate_runs() {
@@ -956,12 +1504,28 @@ cleanup_stale_gate_runs() {
       rm -f -- "$GATE_SYSTEMD_ROOT/monday-rust-lob-gate-${old}-${market}.service" \
         "$GATE_SYSTEMD_ROOT/monday-rust-lob-gate-${old}-${market}-upload.service"
     done
+    while IFS= read -r unit_file; do
+      unit=${unit_file##*/}
+      valid_gate_transient_slice "$unit" || continue
+      systemctl stop "$unit" >/dev/null 2>&1 || true
+      rm -f -- "$unit_file"
+    done < <(find "$GATE_SYSTEMD_ROOT" -maxdepth 1 -type f -name 'mondayrustlobgate*.slice' -print)
     rm -rf -- "$dir" "$old_spool"
   done < <(find "$GATE_UNIT_ROOT" -mindepth 1 -maxdepth 1 -type d -print)
   [[ $TEST_ONLY == true ]] || systemctl daemon-reload >/dev/null 2>&1 || return 1
 }
+cleanup_stale_bootstrap_leases() {
+  [[ $TEST_ONLY == true ]] && return 0
+  local state
+  direct_directory "$GATE_UNIT_ROOT" || return 1
+  while IFS= read -r state; do
+    [[ -n $state ]] || continue
+    recover_bootstrap_lease "$state" || return 1
+  done < <(find "$GATE_UNIT_ROOT" -maxdepth 1 -type f -name 'bootstrap-slice-lease-*.json' -print | sort)
+}
 cleanup_stale_gate_units
 cleanup_stale_gate_runs
+cleanup_stale_bootstrap_leases
 # Every Gate, including production, writes only to this run-scoped spool.  A
 # prior test-only conditional left production's spool_dir empty and made the
 # first install attempt fail before any market work; keep construction before
@@ -977,7 +1541,7 @@ for market in "${markets[@]}"; do
 done
 if [[ ${MONDAY_GATE_FIXTURE_PATH_ONLY:-0} != 1 ]]; then
   while IFS= read -r prior_receipt; do
-    if jq -e '.schema == "monday.rust_lob_shadow_gate.v5" and .passed == true' "$prior_receipt" >/dev/null 2>&1; then
+    if jq -e '(.schema | test("^monday[.]rust_lob_shadow_gate[.]v[0-9]+$")) and .passed == true' "$prior_receipt" >/dev/null 2>&1; then
       die 'a passed Gate receipt already exists for this controller identity'
     fi
   done < <(find "$EVIDENCE_ROOT/$CANDIDATE_CONTROLLER/$candidate_runtime" -type f -name gate.json -print)
@@ -990,8 +1554,8 @@ declare -A market_observed_at_ns
 declare -A initial_upload_failure_count last_health_updated_ns last_health_advance_mono
 declare -A max_health_silence_seconds health_samples
 write_run_json() {
-  jq -cn --arg run "$run_id" --arg controller "$CANDIDATE_CONTROLLER" --arg payload "$candidate_payload" --arg runtime "$candidate_runtime" --arg spool "$run_spool" --argjson requested "$GATE_DURATION_SECONDS" --argjson settle "$HEALTH_SETTLE_DURATION_SECONDS" --argjson resources "$resource_samples" --argjson psi "$psi_windows" \
-    '{schema:"monday.rust_lob_shadow_gate_run.v3",control_plane_version:2,run_id:$run,candidate_controller_sha256:$controller,candidate_payload_sha256:$payload,candidate_runtime_contract_sha256:$runtime,run_spool:$spool,segment_seconds:120,requested_duration_seconds:$requested,health_settle_seconds:$settle,resource_admission:$resources,io_full_psi_windows:$psi}' >"$run_json.tmp"
+  jq -cn --arg run "$run_id" --arg controller "$CANDIDATE_CONTROLLER" --arg payload "$candidate_payload" --arg runtime "$candidate_runtime" --arg spool "$run_spool" --arg worker_slice "$GATE_WORKER_SLICE" --arg worker_slice_sha "$gate_worker_slice_sha256" --arg worker_slice_cgroup "$gate_worker_slice_control_group" --argjson worker_high "$GATE_WORKER_MEMORY_HIGH_BYTES" --argjson worker_max "$GATE_WORKER_MEMORY_MAX_BYTES" --argjson requested "$GATE_DURATION_SECONDS" --argjson settle "$HEALTH_SETTLE_DURATION_SECONDS" --argjson resources "$resource_samples" --argjson psi "$psi_windows" \
+    '{schema:"monday.rust_lob_shadow_gate_run.v3",control_plane_version:2,run_id:$run,candidate_controller_sha256:$controller,candidate_payload_sha256:$payload,candidate_runtime_contract_sha256:$runtime,run_spool:$spool,worker_slice:{name:$worker_slice,sha256:$worker_slice_sha,cgroup:$worker_slice_cgroup,memory_high_bytes:$worker_high,memory_max_bytes:$worker_max},segment_seconds:120,requested_duration_seconds:$requested,health_settle_seconds:$settle,resource_admission:$resources,io_full_psi_windows:$psi}' >"$run_json.tmp"
   chmod 0640 "$run_json.tmp"; mv -f -- "$run_json.tmp" "$run_json"
 }
 cleanup() {
@@ -1003,12 +1567,43 @@ cleanup() {
     rm -f -- "$GATE_SYSTEMD_ROOT/${unit[$market]}" \
       "$GATE_SYSTEMD_ROOT/monday-rust-lob-gate-${run_id}-${market}-upload.service"
   done
+  restore_bootstrap_slice_lease || cleanup_failed=true
+  systemctl stop "$GATE_WORKER_SLICE" >/dev/null 2>&1 || true
+  rm -f -- "$gate_worker_slice_file"
   [[ $TEST_ONLY == true ]] || systemctl daemon-reload >/dev/null 2>&1 || cleanup_failed=true
   rm -rf -- "$gate_unit_dir" "$run_spool" "$tmp_dir"
   [[ $gate_finished == true ]] || rm -f -- "$passed_marker" "$evidence_dir/.PASSED.sha256.tmp"
   [[ $cleanup_failed == false ]] || { printf 'run-scoped Gate cleanup was incomplete\n' >&2; status=1; }; exit "$status"
 }
 trap cleanup EXIT; trap 'exit 143' HUP INT TERM
+
+# Install a run-scoped aggregate slice only after the EXIT cleanup trap is
+# armed.  If a write, daemon-reload, or start fails, the same cleanup path
+# removes this slice and any workers without requiring a second handler.
+[[ ! -e $gate_worker_slice_file && ! -L $gate_worker_slice_file ]] \
+  || die 'run-scoped Gate worker slice already exists'
+printf '[Slice]\nMemoryHigh=1280M\nMemoryMax=1536M\n' >"$gate_worker_slice_file"
+chmod 0644 "$gate_worker_slice_file"
+[[ $(grep -Fxc 'MemoryHigh=1280M' "$gate_worker_slice_file" || true) -eq 1 \
+  && $(grep -Fxc 'MemoryMax=1536M' "$gate_worker_slice_file" || true) -eq 1 \
+  && $(grep -c '^' "$gate_worker_slice_file" || true) -eq 3 ]] \
+  || die 'run-scoped Gate worker slice envelope is invalid'
+gate_worker_slice_sha256=$(sha256_file "$gate_worker_slice_file")
+[[ $gate_worker_slice_sha256 =~ ^[a-f0-9]{64}$ ]] || die 'run-scoped Gate worker slice digest is invalid'
+[[ $TEST_ONLY == true ]] || systemctl daemon-reload >/dev/null 2>&1 || die 'could not load run-scoped Gate worker slice'
+systemctl start "$GATE_WORKER_SLICE" >/dev/null 2>&1 \
+  || die 'could not activate run-scoped Gate worker slice'
+verify_gate_worker_slice || die 'run-scoped Gate worker slice did not read back exactly'
+
+# Apply the bootstrap lease only after stale Gate workers and any interrupted
+# lease have been cleaned, and after the EXIT trap is armed.  A failure or
+# signal after this point therefore restores the exact pre-Gate limits.
+apply_bootstrap_slice_lease
+if [[ $TEST_ONLY == true ]]; then
+  refresh_production_snapshot || die 'fixture production cgroup snapshot is invalid'
+else
+  refresh_production_snapshot || die 'production cgroup snapshot is invalid'
+fi
 
 # Fixture-only path coverage reaches the same run-scoped preparation without
 # opening sockets, invoking OSS, or starting an external market process.
@@ -1065,6 +1660,8 @@ render_shadow_unit() {
     || die 'candidate shadow upload template failed security/resource verification'
   [[ -n $spool && $spool == "$run_spool/$market" ]] || die "$market Gate spool is not run-scoped"
   sed -e '/^EnvironmentFile=-\/run\/monday\/binance-lob-archiver-rust-%i-soak.env$/d' \
+      -e "/^\[Service\]$/a\\
+Slice=$GATE_WORKER_SLICE" \
       -e "s|^EnvironmentFile=/etc/monday/binance-lob-archiver-rust-%i.env$|EnvironmentFile=$rendered_env|" \
       -e "s|^ExecStartPre=.*$|ExecStartPre=$candidate_binary --self-test|" \
       -e "s|^ExecStart=.*$|ExecStart=$candidate_binary|" \
@@ -1072,7 +1669,9 @@ render_shadow_unit() {
       -e 's|^RuntimeMaxSec=.*$|RuntimeMaxSec=1800|' \
       -e "s|^ReadWritePaths=.*$|ReadWritePaths=$spool|" \
       "$source_unit" >"$rendered_unit"
+  # shellcheck disable=SC2086
   sed -e '/^\[Service\]$/a\
+Slice='$GATE_WORKER_SLICE'\
 Restart=no\
 RuntimeMaxSec=1800' \
       -e "s|^EnvironmentFile=.*$|EnvironmentFile=$rendered_env|" \
@@ -1088,10 +1687,13 @@ RuntimeMaxSec=1800' \
   [[ $(grep -Fxc "EnvironmentFile=$rendered_env" "$rendered_upload" || true) -eq 1 ]] || die "$market Gate upload env path is not exact"
   [[ $(grep -Fxc "ExecStart=$candidate_binary --upload-only" "$rendered_upload" || true) -eq 1 ]] || die "$market Gate upload identity is not exact"
   [[ $(grep -Fxc "ReadWritePaths=$spool" "$rendered_upload" || true) -eq 1 ]] || die "$market Gate upload spool is not exact"
+  [[ $(grep -Fxc "Slice=$GATE_WORKER_SLICE" "$rendered_unit" || true) -eq 1 ]] || die "$market Gate worker slice is not exact"
+  [[ $(grep -Fxc "Slice=$GATE_WORKER_SLICE" "$rendered_upload" || true) -eq 1 ]] || die "$market Gate upload worker slice is not exact"
   [[ $(grep -Fxc 'Restart=no' "$rendered_upload" || true) -eq 1 ]] || die "$market Gate upload restart policy is not bounded"
   [[ $(grep -Fxc 'RuntimeMaxSec=1800' "$rendered_upload" || true) -eq 1 ]] || die "$market Gate upload runtime is not bounded"
   canonical_upload="$tmp_dir/$market-shadow-upload-source.service"
-  sed -e "s|^EnvironmentFile=$rendered_env$|EnvironmentFile=/etc/monday/binance-lob-archiver-rust-%i.env|" \
+  sed -e "/^Slice=$GATE_WORKER_SLICE$/d" \
+      -e "s|^EnvironmentFile=$rendered_env$|EnvironmentFile=/etc/monday/binance-lob-archiver-rust-%i.env|" \
       -e "s|^ExecStart=$candidate_binary --upload-only$|ExecStart=/opt/monday/bin/binance-lob-archiver-shadow --upload-only|" \
       -e "s|^ReadWritePaths=$spool$|ReadWritePaths=/data/monday/spool/binance-lob-rust-shadow|" \
       "$rendered_upload" >"$canonical_upload"
@@ -1134,6 +1736,7 @@ run_strict_verifier() {
   strict_unit_seq=$((strict_unit_seq + 1))
   systemd-run --quiet --wait --collect \
     --unit="${GATE_UNIT_PREFIX}${run_id}-strict-${strict_unit_seq}.service" \
+    --slice="$GATE_WORKER_SLICE" \
     --property=MemoryMax=1536M --property=MemoryHigh=1280M \
     --property=OOMScoreAdjust=500 --property=Restart=no --property=RuntimeMaxSec=1800 \
     --uid="$SERVICE_USER" -- "$candidate_binary" "$@"
@@ -1272,7 +1875,7 @@ verify_segments() {
 }
 run_market_gate_phase() {
   local market=$1 settle observation pid started_ns
-  calibrate_psi "shadow-$market"; resource_monitor_start "shadow-$market" 2147483648; fixture_seed_market "$market"; systemctl reset-failed "${unit[$market]}" >/dev/null 2>&1 || true
+  calibrate_psi "shadow-$market"; resource_monitor_start "shadow-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; fixture_seed_market "$market"; systemctl reset-failed "${unit[$market]}" >/dev/null 2>&1 || true
   started_ns=$(date +%s%N); market_gate_started_ns[$market]=$started_ns
   systemctl start "${unit[$market]}"; systemctl_active "${unit[$market]}" || die "$market shadow did not start"; [[ $(systemctl_value "$market" NRestarts) == 0 ]] || die "$market shadow restarted"; pid=$(systemctl_value "$market" MainPID); [[ $pid =~ ^[1-9][0-9]*$ ]] || die "$market MainPID unavailable"; phase_pid["$market"]=$pid; phase_exe_sha["$market"]=$candidate_payload
   if [[ $TEST_ONLY == true && ( ${MONDAY_GATE_FIXTURE_SIGKILL:-0} == 1 || ${MONDAY_GATE_HARD_CRASH_AFTER_SHADOW_START:-0} == 1 ) && $market == spot ]]; then
@@ -1356,7 +1959,15 @@ run_oss() {
     OSS_FIXTURE_MARKET=$market aliyun ossutil "$@" --profile "${aliyun_profile[$market]}" --endpoint fixture --region ap-northeast-1
   else
     [[ -x /usr/local/bin/aliyun ]] || die 'trusted OSS CLI is missing: /usr/local/bin/aliyun'
-    runuser --user "$SERVICE_USER" -- env -i HOME="$SERVICE_HOME" PATH="$SAFE_PATH" \
+    oss_unit_seq=$((oss_unit_seq + 1))
+    # --pipe is required: OSS listing/readback is streamed through this
+    # helper and its exit status must remain the systemd-run status.
+    systemd-run --quiet --pipe --wait --collect \
+      --unit="${GATE_UNIT_PREFIX}${run_id}-oss-${market}-${oss_unit_seq}.service" \
+      --slice="$GATE_WORKER_SLICE" \
+      --property=MemoryMax=1536M --property=MemoryHigh=1280M \
+      --property=OOMScoreAdjust=500 --property=Restart=no --property=RuntimeMaxSec=1800 \
+      -- runuser --user "$SERVICE_USER" -- env -i HOME="$SERVICE_HOME" PATH="$SAFE_PATH" \
       ALIYUN_PROFILE="${aliyun_profile[$market]}" /usr/local/bin/aliyun ossutil "$@" \
       --profile "${aliyun_profile[$market]}" --endpoint "${oss_endpoint[$market]}" \
       --region "${oss_region[$market]}"
@@ -1533,6 +2144,19 @@ if [[ $old_shadow_present == true ]]; then
     || die 'restored shadow binary bytes changed during Gate'
 fi
 refresh_production_snapshot || die 'production cgroup identity changed during Gate'
+# A direct bootstrap lease is only a Gate-time guard.  Restore the original
+# runtime limit before publishing the receipt; Cutover will install the
+# permanent signed slice as part of the atomic 8 -> 9 migration.
+restore_bootstrap_slice_lease || die 'temporary production slice lease could not be restored'
+production_memory_json=$(jq -c \
+  --arg mode "$bootstrap_slice_lease_mode" \
+  --arg before_high "${bootstrap_slice_lease_before_high:-}" \
+  --arg before_max "${bootstrap_slice_lease_before_max:-}" \
+  --argjson applied "${bootstrap_slice_lease_applied:-false}" \
+  --argjson restored "${bootstrap_slice_lease_restored:-false}" \
+  '.slice_lease={mode:$mode,before_memory_high:$before_high,before_memory_max:$before_max,
+    requested_memory_high:"3072M",requested_memory_max:"3584M",applied:$applied,restored:$restored}' \
+  <<<"$production_memory_json")
 
 checks=$(jq -cn '{before_pair_unchanged:true,production_runtime_verified:true,shadow_staging_verified:true,shadow_assets_restored:true,resource_preflight:true,oss_triplets:true,strict_segment_verifier:true,final_identity:true,controller_control_bytes:true,shadow_link_restored:true,health_freshness:true}')
 before_assets_json='{}'; staged_assets_json='{}'; restored_assets_json='{}'
@@ -1595,9 +2219,11 @@ run_upload_units_json=$(jq -cn \
   --arg usdm_sha "${candidate_upload_unit_sha[usdm]}" \
   '{spot:{unit:$spot,sha256:$spot_sha},usdm:{unit:$usdm,sha256:$usdm_sha}}')
 gate_finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ); production_eligible=true; [[ $TEST_ONLY == true ]] && production_eligible=false
-jq -cn --arg schema monday.rust_lob_shadow_gate.v5 --arg from "$before_controller" --arg source_mode "$source_mode" --arg after "$CANDIDATE_CONTROLLER" --arg candidate "$CANDIDATE_CONTROLLER" --arg payload "$candidate_payload" --arg runtime "$candidate_runtime" --arg bundle "$candidate_bundle" --arg source "$candidate_source" --arg before_payload "$before_payload" --arg before_runtime "$before_runtime" --arg before_bundle "$before_bundle" --arg before_source "$before_source" --arg before_projection "$before_production_projection" --arg control_sha "$candidate_control_bytes_sha" --argjson control_assets "$candidate_control_assets" --argjson production_runtime "$candidate_production_runtime" --arg run "$run_id" --arg spool "$run_spool" --arg run_unit_root "$gate_unit_dir" --argjson units "$run_units_json" --argjson upload_units "$run_upload_units_json" --arg started "$gate_started_at" --arg finished "$gate_finished_at" --argjson host_total "$host_memory_total" --argjson host_swap "$host_swap_total" --argjson production_memory "$production_memory_json" --argjson production_process "$production_process_json" --argjson production_assets "$production_asset_json" --argjson resources "$resource_samples" --argjson psi "$psi_windows" --argjson checks "$checks" --argjson markets "$markets_json" --argjson eligible "$production_eligible" --argjson test_only "$TEST_ONLY" --argjson before_assets "$before_assets_json" --argjson staged_assets "$staged_assets_json" --argjson restored_assets "$restored_assets_json" --arg shadow_binary "$SHADOW_BINARY" --arg candidate_binary "$candidate_binary" --arg old_shadow_target "$old_shadow_target" --arg old_shadow_target_sha "$old_shadow_target_sha256" --argjson old_shadow_present "$old_shadow_present" \
-  '{schema:$schema,control_plane_version:2,passed:true,production_eligible:$eligible,test_only:$test_only,source_mode:$source_mode,from_controller_sha256:$from,transition:{before:$from,after:$after,topology:(if $source_mode == "direct" then "direct-bootstrap" else "stable" end)},candidate_controller_sha256:$candidate,candidate_payload_sha256:$payload,candidate_runtime_contract_sha256:$runtime,candidate_deployment_bundle_sha256:$bundle,candidate_deployment_source_revision:$source,candidate_control_bytes:{sha256:$control_sha,assets:$control_assets},production_runtime:$production_runtime,before:{controller:$from,payload_sha256:$before_payload,runtime_contract_sha256:$before_runtime,deployment_bundle_sha256:$before_bundle,deployment_source_revision:$before_source,production_projection:$before_projection,production_assets:$production_assets},run_id:$run,run_spool:$spool,started_at:$started,finished_at:$finished,required_duration_seconds:240,health_settle_seconds:240,segment_seconds:120,host_memory_total_bytes:$host_total,host_swap_total_bytes:$host_swap,production_memory:$production_memory,production_process:$production_process,production_assets:$production_assets,resource_admission:$resources,io_full_psi_windows:$psi,shadow_staging:{mode:"run-scoped",run_unit_root:$run_unit_root,spool_root:$spool,units:$units,upload_units:$upload_units,candidate_assets:$staged_assets,restored_assets:$restored_assets,before_assets:$before_assets,binary:{path:$run_unit_root,candidate_target:$candidate_binary,restored_target:(if $old_shadow_present then $old_shadow_target else null end),restored_target_sha256:(if $old_shadow_present then $old_shadow_target_sha else null end),restored_present:$old_shadow_present}},checks:$checks,markets:$markets}' >"$gate_json.tmp"
+jq -cn --arg schema monday.rust_lob_shadow_gate.v6 --arg from "$before_controller" --arg source_mode "$source_mode" --arg after "$CANDIDATE_CONTROLLER" --arg candidate "$CANDIDATE_CONTROLLER" --arg payload "$candidate_payload" --arg runtime "$candidate_runtime" --arg bundle "$candidate_bundle" --arg source "$candidate_source" --arg before_payload "$before_payload" --arg before_runtime "$before_runtime" --arg before_bundle "$before_bundle" --arg before_source "$before_source" --arg before_projection "$before_production_projection" --arg control_sha "$candidate_control_bytes_sha" --argjson control_assets "$candidate_control_assets" --argjson production_runtime "$candidate_production_runtime" --arg run "$run_id" --arg spool "$run_spool" --arg run_unit_root "$gate_unit_dir" --arg worker_slice "$GATE_WORKER_SLICE" --arg worker_slice_sha "$gate_worker_slice_sha256" --arg worker_slice_cgroup "$gate_worker_slice_control_group" --argjson worker_high "$GATE_WORKER_MEMORY_HIGH_BYTES" --argjson worker_max "$GATE_WORKER_MEMORY_MAX_BYTES" --argjson units "$run_units_json" --argjson upload_units "$run_upload_units_json" --arg started "$gate_started_at" --arg finished "$gate_finished_at" --argjson host_total "$host_memory_total" --argjson host_swap "$host_swap_total" --argjson production_memory "$production_memory_json" --argjson production_process "$production_process_json" --argjson production_assets "$production_asset_json" --argjson resources "$resource_samples" --argjson psi "$psi_windows" --argjson checks "$checks" --argjson markets "$markets_json" --argjson eligible "$production_eligible" --argjson test_only "$TEST_ONLY" --argjson before_assets "$before_assets_json" --argjson staged_assets "$staged_assets_json" --argjson restored_assets "$restored_assets_json" --arg shadow_binary "$SHADOW_BINARY" --arg candidate_binary "$candidate_binary" --arg old_shadow_target "$old_shadow_target" --arg old_shadow_target_sha "$old_shadow_target_sha256" --argjson old_shadow_present "$old_shadow_present" \
+  '{schema:$schema,control_plane_version:2,passed:true,production_eligible:$eligible,test_only:$test_only,source_mode:$source_mode,from_controller_sha256:$from,transition:{before:$from,after:$after,topology:(if $source_mode == "direct" then "direct-bootstrap" else "stable" end)},candidate_controller_sha256:$candidate,candidate_payload_sha256:$payload,candidate_runtime_contract_sha256:$runtime,candidate_deployment_bundle_sha256:$bundle,candidate_deployment_source_revision:$source,candidate_control_bytes:{sha256:$control_sha,assets:$control_assets},production_runtime:$production_runtime,before:{controller:$from,payload_sha256:$before_payload,runtime_contract_sha256:$before_runtime,deployment_bundle_sha256:$before_bundle,deployment_source_revision:$before_source,production_projection:$before_projection,production_assets:$production_assets},run_id:$run,run_spool:$spool,started_at:$started,finished_at:$finished,required_duration_seconds:240,health_settle_seconds:240,segment_seconds:120,host_memory_total_bytes:$host_total,host_swap_total_bytes:$host_swap,production_memory:$production_memory,production_process:$production_process,production_assets:$production_assets,resource_admission:$resources,io_full_psi_windows:$psi,shadow_staging:{mode:"run-scoped",run_unit_root:$run_unit_root,spool_root:$spool,aggregate_slice:{name:$worker_slice,sha256:$worker_slice_sha,cgroup:$worker_slice_cgroup,memory_high_bytes:$worker_high,memory_max_bytes:$worker_max},units:$units,upload_units:$upload_units,candidate_assets:$staged_assets,restored_assets:$restored_assets,before_assets:$before_assets,binary:{path:$run_unit_root,candidate_target:$candidate_binary,restored_target:(if $old_shadow_present then $old_shadow_target else null end),restored_target_sha256:(if $old_shadow_present then $old_shadow_target_sha else null end),restored_present:$old_shadow_present}},checks:$checks,markets:$markets}' >"$gate_json.tmp"
 chmod 0640 "$gate_json.tmp"; [[ ! -e $gate_json ]] || die 'gate receipt already exists'; mv -f -- "$gate_json.tmp" "$gate_json"
-if ! jq -e -f "$POLICY_SOURCE" "$gate_json" >/dev/null; then die 'V2 Gate policy rejected the receipt'; fi
+if ! jq -e -f "$POLICY_SOURCE" "$gate_json" >/dev/null; then
+  die 'V2 Gate policy rejected the receipt'
+fi
 if [[ $production_eligible == true ]]; then gate_sha=$(sha256_file "$gate_json"); printf '%s  gate.json\n' "$gate_sha" >"$passed_marker.tmp"; chmod 0640 "$passed_marker.tmp"; mv -f -- "$passed_marker.tmp" "$passed_marker"; fi
 gate_finished=true; printf 'V2 Gate receipt: %s\nSHA-256: %s\n' "$gate_json" "$(sha256_file "$gate_json")"; [[ $production_eligible == true ]] && printf 'production shadow gate passed\n' || printf 'fixture Gate completed; not eligible for cutover\n'
