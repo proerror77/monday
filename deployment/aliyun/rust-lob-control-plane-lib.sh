@@ -1683,16 +1683,7 @@ monday_validate_v2_gate() {
         and (.parent_memory_anon_bytes <= .production_slice_memory_max_bytes)
         and (.parent_memory_current_bytes <= .child_memory_max_sum_bytes)
         and (.parent_memory_events | type == "object"
-          and all(.[]; type == "number" and floor == . and . >= 0))
-        and (.slice_lease | type == "object"
-          and (.mode == "permanent" or .mode == "temporary-bootstrap")
-          and (.before_memory_high | type == "string" and length > 0)
-          and (.before_memory_max | type == "string" and length > 0)
-          and .requested_memory_high == "3072M"
-          and .requested_memory_max == "3584M"
-          and (.applied | type == "boolean")
-          and (.restored | type == "boolean" and . == true)
-          and (if .mode == "permanent" then .applied == false else .applied == true end))))
+          and all(.[]; type == "number" and floor == . and . >= 0))))
       and (.production_process.spot.main_pid == .production_memory.children.spot.main_pid
         and .production_process.usdm.main_pid == .production_memory.children.usdm.main_pid
         and .production_process.spot.process_exe_sha256 == .production_memory.children.spot.process_exe_sha256

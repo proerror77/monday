@@ -13,7 +13,6 @@ readonly STRICT_VERIFIER_MEMORY_MAX_BYTES=1610612736
 readonly IO_PSI_WINDOW_SECONDS=15
 readonly IO_PSI_WINDOW_US=15000000
 readonly IO_PSI_FULL_DELTA_LIMIT_US=150000
-readonly IO_PSI_CONSECUTIVE_HIT_LIMIT=3
 readonly UPLOAD_DRAIN_MEMORY_MAX_BYTES=536870912
 readonly SHADOW_IDENTITY_WAIT_SECONDS=15
 readonly SHADOW_IDENTITY_TEST_ATTEMPTS=8
@@ -39,44 +38,34 @@ readonly -a PRODUCTION_ASSETS=(
 readonly PRODUCTION_SLICE='system-binance\x2dlob\x2darchiver\x2dproduction.slice'
 readonly FIXTURE_PRODUCTION_SPOT_PID=51001
 readonly FIXTURE_PRODUCTION_USDM_PID=51002
-readonly COLLECTOR_HEALTH_TIMER='monday-collector-health.timer'
-readonly COLLECTOR_HEALTH_SERVICE='monday-collector-health.service'
 
 die() { printf 'shadow gate failed: %s\n' "$*"; exit 1; }
 usage() {
   cat >&2 <<'EOF'
 Usage: host-rust-lob-shadow-gate.sh --from-controller <direct|sha256> \
   --candidate-controller <sha256> [--preflight-only] [--root <fixture-root>]
-       host-rust-lob-shadow-gate.sh --recover-bootstrap-lease <state> [--root <fixture-root>]
 EOF
 }
 
 ROOT=${MONDAY_ROOT:-/}; FROM_CONTROLLER=; CANDIDATE_CONTROLLER=
-RECOVER_STATE=; PREFLIGHT_ONLY=false
+PREFLIGHT_ONLY=false
 while (($#)); do
   case "$1" in
     --from-controller) (($# >= 2)) || { usage; exit 2; }; FROM_CONTROLLER=$2; shift 2 ;;
     --candidate-controller) (($# >= 2)) || { usage; exit 2; }; CANDIDATE_CONTROLLER=$2; shift 2 ;;
     --preflight-only) PREFLIGHT_ONLY=true; shift ;;
-    --recover-bootstrap-lease) (($# >= 2)) || { usage; exit 2; }; RECOVER_STATE=$2; shift 2 ;;
     --root) (($# >= 2)) || { usage; exit 2; }; ROOT=$2; shift 2 ;;
     --help|-h) usage >&1; exit 0 ;;
     *) usage; exit 2 ;;
   esac
 done
 ROOT=${ROOT%/}; [[ -n $ROOT ]] || ROOT=/
-[[ $PREFLIGHT_ONLY == false || -z $RECOVER_STATE ]] || die '--preflight-only is only valid for a Gate'
-if [[ -z $RECOVER_STATE ]]; then
-  FROM_CONTROLLER=$(printf '%s' "$FROM_CONTROLLER" | tr '[:upper:]' '[:lower:]')
-  CANDIDATE_CONTROLLER=$(printf '%s' "$CANDIDATE_CONTROLLER" | tr '[:upper:]' '[:lower:]')
-  [[ $FROM_CONTROLLER == direct || $FROM_CONTROLLER =~ ^[a-f0-9]{64}$ ]] ||
-    die 'before controller must be direct or a 64-character SHA-256'
-  [[ $CANDIDATE_CONTROLLER =~ ^[a-f0-9]{64}$ ]] ||
-    die 'candidate controller must be a 64-character SHA-256'
-else
-  [[ -z $FROM_CONTROLLER && -z $CANDIDATE_CONTROLLER ]] ||
-    die 'lease recovery does not accept a controller transition'
-fi
+FROM_CONTROLLER=$(printf '%s' "$FROM_CONTROLLER" | tr '[:upper:]' '[:lower:]')
+CANDIDATE_CONTROLLER=$(printf '%s' "$CANDIDATE_CONTROLLER" | tr '[:upper:]' '[:lower:]')
+[[ $FROM_CONTROLLER == direct || $FROM_CONTROLLER =~ ^[a-f0-9]{64}$ ]] ||
+  die 'before controller must be direct or a 64-character SHA-256'
+[[ $CANDIDATE_CONTROLLER =~ ^[a-f0-9]{64}$ ]] ||
+  die 'candidate controller must be a 64-character SHA-256'
 TEST_ONLY=false; [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 ]] && TEST_ONLY=true
 [[ $TEST_ONLY == false || $ROOT != / ]] || die 'test mode requires an isolated fixture root'
 
@@ -144,24 +133,27 @@ else
   fi
 fi
 
-if [[ -z $RECOVER_STATE ]]; then
-  for command in awk bash chmod cmp cp date dirname find grep install jq mkdir mktemp mv readlink rm sed sha256sum sleep sort stat tr wc zstd; do
+for command in awk bash chmod cmp cp date dirname find grep head install jq mkdir mktemp mv readlink rm sed sha256sum sleep sort stat tr wc zstd; do
+  command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
+done
+if [[ $TEST_ONLY != true ]]; then
+  for command in aliyun flock id mountpoint runuser systemctl systemd-analyze systemd-run; do
     command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
   done
-  if [[ $TEST_ONLY != true ]]; then
-    for command in aliyun flock id mountpoint runuser systemctl systemd-analyze systemd-run; do
-      command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
-    done
-    mountpoint -q "$(monday_root_join "$ROOT" data)" || die 'data filesystem must be a mount point'
-    [[ -r "$PROC_ROOT/uptime" && -r $PSI_SOURCE ]] || die 'proc timing/PSI sources are unavailable'
-    id "$SERVICE_USER" >/dev/null 2>&1 || die "missing service user: $SERVICE_USER"
-  fi
-else
-  for command in bash chmod date find grep install jq mkdir mv readlink rm sha256sum sort; do
-    command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
-  done
-  [[ $TEST_ONLY == true ]] || command -v systemctl >/dev/null 2>&1 \
-    || die 'missing required command: systemctl'
+  mountpoint -q "$(monday_root_join "$ROOT" data)" || die 'data filesystem must be a mount point'
+  [[ -r "$PROC_ROOT/uptime" && -r $PSI_SOURCE ]] || die 'proc timing/PSI sources are unavailable'
+  id "$SERVICE_USER" >/dev/null 2>&1 || die "missing service user: $SERVICE_USER"
+fi
+
+# An older controller may have left a temporary production-envelope lease and
+# recovery timer behind. This controller never adopts or repairs that state:
+# the operator must finish the old recovery before starting a new Gate.
+if [[ -e $GATE_UNIT_ROOT || -L $GATE_UNIT_ROOT ]]; then
+  [[ -d $GATE_UNIT_ROOT && ! -L $GATE_UNIT_ROOT ]] \
+    || die 'Gate state root is not a direct directory'
+  legacy_lease=$(find "$GATE_UNIT_ROOT" -mindepth 1 -maxdepth 1 \
+    \( -type f -o -type l \) -name 'bootstrap-slice-lease-*.json' -print | head -n 1)
+  [[ -z $legacy_lease ]] || die 'unresolved legacy production-envelope lease blocks Gate'
 fi
 
 # The offline fixture supplies a tiny systemd double.  Production always uses
@@ -169,20 +161,10 @@ fi
 # by this action and cannot mutate a host unit.
 if [[ $TEST_ONLY == true ]]; then
   declare -A fixture_unit_state=()
-  fixture_health_timer_state=${MONDAY_GATE_FIXTURE_HEALTH_TIMER_STATE:-active}
-  fixture_health_timer_substate=${MONDAY_GATE_FIXTURE_HEALTH_TIMER_SUBSTATE:-waiting}
-  fixture_health_timer_enabled=${MONDAY_GATE_FIXTURE_HEALTH_TIMER_ENABLED:-enabled}
-  fixture_health_service_state=${MONDAY_GATE_FIXTURE_HEALTH_SERVICE_STATE:-inactive}
-  fixture_health_service_substate=${MONDAY_GATE_FIXTURE_HEALTH_SERVICE_SUBSTATE:-dead}
-  fixture_health_service_enabled=${MONDAY_GATE_FIXTURE_HEALTH_SERVICE_ENABLED:-static}
   fixture_production_memory_high=3221225472
   fixture_production_memory_max=3758096384
-  if [[ ${MONDAY_GATE_FIXTURE_BOOTSTRAP_UNLIMITED:-0} == 1 ]]; then
-    fixture_production_memory_high=infinity
-    fixture_production_memory_max=infinity
-  fi
   systemctl() {
-    local action=${1:-} unit_name=${2:-} property value item setting target output_values=false
+    local action=${1:-} unit_name=${2:-} property value item output_values=false
     local -a properties=()
     case "$action" in
       list-units)
@@ -193,56 +175,14 @@ if [[ $TEST_ONLY == true ]]; then
         return 0 ;;
       start)
         [[ ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] && printf 'start %s\n' "$unit_name" >>"$ROOT/run/gate-fixture.calls"
-        case "$unit_name" in
-          "$COLLECTOR_HEALTH_TIMER")
-            fixture_health_timer_state=active; fixture_health_timer_substate=waiting ;;
-          "$COLLECTOR_HEALTH_SERVICE")
-            fixture_health_service_state=active; fixture_health_service_substate=running ;;
-          *)
-            fixture_unit_state[$unit_name]=active
-            if [[ $unit_name == monday-rust-lob-gate-*.service ]]; then
-              printf '0\n' >"$ROOT/run/gate-fixture.identity.${unit_name//[^A-Za-z0-9_.-]/_}"
-            fi
-            ;;
-        esac
+        fixture_unit_state[$unit_name]=active
+        if [[ $unit_name == monday-rust-lob-gate-*.service ]]; then
+          printf '0\n' >"$ROOT/run/gate-fixture.identity.${unit_name//[^A-Za-z0-9_.-]/_}"
+        fi
         return 0 ;;
       stop)
         [[ ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] && printf 'stop %s\n' "$unit_name" >>"$ROOT/run/gate-fixture.calls"
-        case "$unit_name" in
-          "$COLLECTOR_HEALTH_TIMER")
-            fixture_health_timer_state=inactive; fixture_health_timer_substate=dead
-            if [[ ${MONDAY_GATE_FIXTURE_HEALTH_SERVICE_FAIL_AFTER_TIMER_STOP:-0} == 1 ]]; then
-              fixture_health_service_state=failed; fixture_health_service_substate=failed
-            fi ;;
-          "$COLLECTOR_HEALTH_SERVICE")
-            if [[ $fixture_health_service_state != failed ]]; then
-              fixture_health_service_state=inactive; fixture_health_service_substate=dead
-            fi ;;
-          *) fixture_unit_state[$unit_name]=inactive ;;
-        esac
-        return 0 ;;
-      set-property)
-        [[ ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] && printf 'set-property\n' >>"$ROOT/run/gate-fixture.calls"
-        target=$unit_name
-        [[ $target == --runtime ]] && target=${3:-}
-        if [[ $target == "$PRODUCTION_SLICE" ]]; then
-          for setting in "$@"; do
-            case "$setting" in
-              MemoryHigh=3072M) fixture_production_memory_high=3221225472 ;;
-              MemoryHigh=*) fixture_production_memory_high=${setting#MemoryHigh=} ;;
-              MemoryMax=3584M) fixture_production_memory_max=3758096384 ;;
-              MemoryMax=*) fixture_production_memory_max=${setting#MemoryMax=} ;;
-            esac
-          done
-        fi
-        return 0 ;;
-      reset-failed)
-        [[ ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] \
-          && printf 'reset-failed %s\n' "$unit_name" >>"$ROOT/run/gate-fixture.calls"
-        if [[ $unit_name == "$COLLECTOR_HEALTH_SERVICE" ]]; then
-          [[ ${MONDAY_GATE_FIXTURE_HEALTH_RESET_FAILED_FAIL:-0} == 1 ]] && return 1
-          fixture_health_service_state=inactive; fixture_health_service_substate=dead
-        fi
+        fixture_unit_state[$unit_name]=inactive
         return 0 ;;
       daemon-reload) return 0 ;;
       is-active)
@@ -272,20 +212,13 @@ if [[ $TEST_ONLY == true ]]; then
           case "$item" in
             ActiveState)
               if [[ $unit_name == binance-lob-archiver-production@* || $unit_name == "$PRODUCTION_SLICE" ]]; then value=active
-              elif [[ $unit_name == "$COLLECTOR_HEALTH_TIMER" ]]; then value=$fixture_health_timer_state
-              elif [[ $unit_name == "$COLLECTOR_HEALTH_SERVICE" ]]; then value=$fixture_health_service_state
               else value=${fixture_unit_state[$unit_name]:-inactive}; fi ;;
             SubState)
               if [[ $unit_name == binance-lob-archiver-production@* || $unit_name == "$PRODUCTION_SLICE" ]]; then value=running
-              elif [[ $unit_name == "$COLLECTOR_HEALTH_TIMER" ]]; then value=$fixture_health_timer_substate
-              elif [[ $unit_name == "$COLLECTOR_HEALTH_SERVICE" ]]; then value=$fixture_health_service_substate
               elif [[ ${fixture_unit_state[$unit_name]:-inactive} == active ]]; then value=running
               else value=dead; fi ;;
             LoadState) value=loaded ;;
-            UnitFileState)
-              if [[ $unit_name == "$COLLECTOR_HEALTH_TIMER" ]]; then value=$fixture_health_timer_enabled
-              elif [[ $unit_name == "$COLLECTOR_HEALTH_SERVICE" ]]; then value=$fixture_health_service_enabled
-              else value=static; fi ;;
+            UnitFileState) value=static ;;
             Result)
               value=success ;;
             ExecMainStatus)
@@ -533,87 +466,6 @@ systemctl_show() { systemctl show "$1" --property="$2" --value 2>/dev/null; }
 systemctl_show_many() { systemctl show "$1" --property="$2" 2>/dev/null; }
 systemctl_active() { systemctl is-active --quiet "$1"; }
 
-# Capture the fixed collector-health timer/service state needed to audit and
-# undo a direct bootstrap pause.  The snapshot is deliberately string-valued
-# so recovery can compare identity-bearing fields without relying on
-# positional output or coercing an implementation-specific empty value.
-health_unit_snapshot_json() {
-  local unit=$1 output item key value
-  local -A fields=()
-  output=$(systemctl_show_many "$unit" \
-    'LoadState,ActiveState,SubState,UnitFileState') \
-    || return 1
-  output=${output%$'\n'}
-  while IFS= read -r item; do
-    [[ $item == *=* ]] || return 1
-    key=${item%%=*}; value=${item#*=}
-    case $key in
-      LoadState|ActiveState|SubState|UnitFileState) ;;
-      *) return 1 ;;
-    esac
-    [[ -z ${fields[$key]+x} ]] || return 1
-    fields[$key]=$value
-  done <<<"$output"
-  [[ ${#fields[@]} == 4 ]] || return 1
-  [[ $unit == "$COLLECTOR_HEALTH_TIMER" || $unit == "$COLLECTOR_HEALTH_SERVICE" ]] || return 1
-  [[ -n ${fields[LoadState]} && -n ${fields[ActiveState]} && -n ${fields[SubState]} \
-    && -n ${fields[UnitFileState]} ]] || return 1
-  jq -cn \
-    --arg unit "$unit" --arg load "${fields[LoadState]}" \
-    --arg active "${fields[ActiveState]}" --arg sub "${fields[SubState]}" \
-    --arg enabled "${fields[UnitFileState]}" \
-    '{unit:$unit,load_state:$load,active_state:$active,sub_state:$sub,
-      unit_file_state:$enabled}'
-}
-
-health_timer_state_matches() {
-  local expected=$1 current
-  current=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_TIMER") || return 1
-  jq -e -n --argjson expected "$expected" --argjson current "$current" '
-    $current.unit == "monday-collector-health.timer"
-    and $current.load_state == $expected.load_state
-    and $current.active_state == $expected.active_state
-    and $current.unit_file_state == $expected.unit_file_state
-  ' >/dev/null
-}
-
-quiesce_collector_health_service() {
-  local service_state active_state
-  service_state=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
-  active_state=$(jq -er '.active_state' <<<"$service_state") || return 1
-  if [[ $active_state != inactive && $active_state != failed ]]; then
-    systemctl stop "$COLLECTOR_HEALTH_SERVICE" >/dev/null 2>&1 || return 1
-    service_state=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
-    active_state=$(jq -er '.active_state' <<<"$service_state") || return 1
-  fi
-  [[ $active_state == inactive || $active_state == failed ]]
-}
-
-# Restore the fixed health timer and quiesce the service from a persisted lease.
-# This helper is also called by the run-scoped recovery oneshot, before that
-# oneshot removes its own timer/service.  It is idempotent, never starts the
-# service, and never changes enablement.
-restore_bootstrap_monitor_from_state() {
-  local state=$1 required before_timer current
-  required=$(jq -er '.bootstrap_monitor_containment.required' "$state") || return 1
-  [[ $required == true ]] || return 0
-  before_timer=$(jq -c '.bootstrap_monitor_containment.before_timer' "$state") || return 1
-  [[ $(jq -er '.load_state' <<<"$before_timer") == loaded \
-    && $(jq -er '.active_state' <<<"$before_timer") == active ]] || return 1
-  # The health worker is quiesced for the bootstrap interval.  It is never
-  # restarted by Gate/recovery: only the original active timer is restored.
-  quiesce_collector_health_service || return 1
-  if [[ $(jq -er '.active_state' <<<"$before_timer") == active ]]; then
-    systemctl start "$COLLECTOR_HEALTH_TIMER" >/dev/null 2>&1 || return 1
-  else
-    current=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_TIMER") || return 1
-    if [[ $(jq -er '.active_state' <<<"$current") != inactive ]]; then
-      systemctl stop "$COLLECTOR_HEALTH_TIMER" >/dev/null 2>&1 || return 1
-    fi
-  fi
-  health_timer_state_matches "$before_timer"
-}
-
 # A preflight is deliberately read-only, but it uses the exact same three
 # 15-second, 1% I/O-full PSI windows as the formal Gate calibration.  Fixture
 # mode keeps the loop deterministic by reading its zero-valued PSI source
@@ -647,214 +499,10 @@ sample_preflight_psi() {
       --argjson elapsed "$elapsed_us" \
       '$values + [{phase:$phase,stage:"calibration",delta_us:$delta,ratio:$ratio,
         elapsed_us:$elapsed,window_us:$elapsed,hit:$hit,consecutive_hits:$consecutive}]') || return 1
-    if [[ $hit == true && $consecutive -ge $IO_PSI_CONSECUTIVE_HIT_LIMIT ]]; then
-      printf 'read-only preflight PSI threshold exceeded: elapsed_us=%s delta_us=%s ratio=%s consecutive_hits=%s\n' \
-        "$elapsed_us" "$delta" "$ratio" "$consecutive" >&2
-      return 1
-    fi
     previous=$current; previous_mono=$current_mono
   done
 }
 
-# Recover a temporary production-slice lease from its persisted state.  This
-# is intentionally an internal mode of the signed Gate script, rather than a
-# second cleanup script: the transient systemd service invokes this exact
-# candidate byte path after a SIGKILL.  It stops only the matching run's
-# workers, restores the recorded limits, reads them back, then removes its own
-# timer/service and marks the state recovered.
-recover_bootstrap_lease() {
-  [[ $# -eq 1 ]] || die 'lease recovery requires one state file'
-  local state=$1 state_name state_schema run mode applied restored before_high before_max
-  local expected_service expected_timer service_name timer_name slice_name
-  local candidate_controller gate_script gate_script_sha gate_pid gate_starttime owner_starttime expected_gate_script
-  local listed unit unit_file output item key value restored_high restored_max temporary
-  local -A fields=()
-  direct_directory "$GATE_UNIT_ROOT" || die 'lease state root is not a direct directory'
-  [[ $state == "$GATE_UNIT_ROOT"/bootstrap-slice-lease-*.json ]] || die 'lease state is outside the canonical root'
-  state_name=${state##*/}
-  [[ $state_name =~ ^bootstrap-slice-lease-([0-9]{8}T[0-9]{6}Z-[1-9][0-9]*)\.json$ ]] \
-    || die 'lease state filename is not run-scoped'
-  secure_file "$state"
-  state_schema=$(jq -er '.schema' "$state") || die 'lease state schema is unavailable'
-  case "$state_schema" in
-    monday.rust_lob_bootstrap_slice_lease.v1)
-      [[ $(jq -r '.restored // false' "$state") == true ]] \
-        && return 0
-      die 'unrestored v1 bootstrap lease is not recoverable by V2' ;;
-    monday.rust_lob_bootstrap_slice_lease.v2) ;;
-    *) die 'lease state schema is unsupported' ;;
-  esac
-  jq -e --arg slice "$PRODUCTION_SLICE" --arg timer "$COLLECTOR_HEALTH_TIMER" \
-    --arg service "$COLLECTOR_HEALTH_SERVICE" '
-    def valid_health_snapshot($unit):
-      type == "object"
-      and .unit == $unit
-      and (.load_state | type == "string" and length > 0)
-      and (.active_state | type == "string" and length > 0)
-      and (.sub_state | type == "string" and length > 0)
-      and (.unit_file_state | type == "string" and length > 0);
-    type == "object"
-    and .schema == "monday.rust_lob_bootstrap_slice_lease.v2"
-    and (.run_id | type == "string" and test("^[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*$"))
-    and .slice == $slice
-    and .mode == "temporary-bootstrap"
-    and (.before_memory_high | type == "string" and test("^(infinity|[0-9]+)$"))
-    and (.before_memory_max | type == "string" and test("^(infinity|[0-9]+)$"))
-    and (.before_parent_control_group | type == "string" and . == ("/system.slice/" + $slice))
-    and (.before_parent_memory_current_bytes | type == "number" and floor == . and . >= 0 and . <= 3758096384)
-    and (.before_parent_memory_anon_bytes | type == "number" and floor == . and . >= 0 and . <= 3758096384)
-    and .requested_memory_high == "3072M"
-    and .requested_memory_max == "3584M"
-    and (.candidate_controller_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
-    and (.gate_script | type == "string" and length > 0)
-    and (.gate_script_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
-    and (.gate_pid | type == "number" and floor == . and . >= 1)
-    and (.gate_starttime | type == "number" and floor == . and . >= 1)
-    and (.applied | type == "boolean")
-    and (.restored | type == "boolean")
-    and (.recovery_service | type == "string")
-      and (.recovery_timer | type == "string")
-    and (.bootstrap_monitor_containment | type == "object"
-      and .required == true
-      and .timer == $timer
-      and .service == $service
-      and (.before_timer | valid_health_snapshot($timer)
-        and .load_state == "loaded"
-        and .active_state == "active")
-      and (.before_service | valid_health_snapshot($service))
-      and (.pause_applied | type == "boolean")
-      and (.timer_restored | type == "boolean")
-      and (.service_was_noninactive | type == "boolean")
-      and (.service_was_noninactive == (.before_service.active_state != "inactive"))
-      and (if has("preexisting_global_health_failed")
-           then (.preexisting_global_health_failed | type == "boolean")
-             and (.preexisting_global_health_failed == (.before_service.active_state == "failed"))
-           else true end)
-      and (if has("global_health_reset_applied")
-           then (.global_health_reset_applied | type == "boolean")
-             and (.global_health_reset_applied == false)
-           else true end)
-      and (.service_quiesced | type == "boolean"))' "$state" >/dev/null \
-    || die 'lease state schema is invalid'
-  run=$(jq -er '.run_id' "$state") || die 'lease state run id is unavailable'
-  expected_service="${GATE_UNIT_PREFIX}${run}-lease-recovery.service"
-  expected_timer="${GATE_UNIT_PREFIX}${run}-lease-recovery.timer"
-  service_name=$(jq -er '.recovery_service' "$state") || die 'lease recovery service is unavailable'
-  timer_name=$(jq -er '.recovery_timer' "$state") || die 'lease recovery timer is unavailable'
-  [[ $service_name == "$expected_service" && $timer_name == "$expected_timer" ]] \
-    || die 'lease recovery unit identity is not run-scoped'
-  mode=$(jq -er '.mode' "$state") || die 'lease state mode is unavailable'
-  applied=$(jq -r '.applied' "$state") || die 'lease state applied flag is unavailable'
-  restored=$(jq -r '.restored' "$state") || die 'lease state restored flag is unavailable'
-  [[ $restored == true ]] && return 0
-  before_high=$(jq -er '.before_memory_high' "$state") || die 'lease state high limit is unavailable'
-  before_max=$(jq -er '.before_memory_max' "$state") || die 'lease state max limit is unavailable'
-  [[ $mode == temporary-bootstrap ]] || die 'lease state mode is not temporary bootstrap'
-  candidate_controller=$(jq -er '.candidate_controller_sha256' "$state") || die 'lease candidate controller is unavailable'
-  gate_script=$(jq -er '.gate_script' "$state") || die 'lease Gate script is unavailable'
-  gate_script_sha=$(jq -er '.gate_script_sha256' "$state") || die 'lease Gate script digest is unavailable'
-  gate_pid=$(jq -er '.gate_pid' "$state") || die 'lease Gate owner PID is unavailable'
-  gate_starttime=$(jq -er '.gate_starttime' "$state") || die 'lease Gate owner starttime is unavailable'
-  expected_gate_script="$CONTROLLER_ROOT/$candidate_controller/deployment/host-rust-lob-shadow-gate.sh"
-  [[ $gate_script == "$expected_gate_script" ]] || die 'lease Gate script is not the candidate deployment path'
-  monday_file_direct "$gate_script" || die 'lease Gate script is not a direct file'
-  [[ $(sha256_file "$gate_script") == "$gate_script_sha" ]] || die 'lease Gate script digest changed'
-
-  # The recovery timer is a watchdog, not a delayed normal cleanup.  While
-  # the Gate owner still has the recorded PID/starttime pair, leave its lease
-  # and workers untouched; the repeating timer will check again later.  A
-  # missing owner or PID reuse is the only condition that permits recovery.
-  if [[ $applied == true && $restored == false ]] && kill -0 "$gate_pid" 2>/dev/null; then
-    owner_starttime=$(proc_starttime "$gate_pid" 2>/dev/null || true)
-    [[ -n $owner_starttime ]] || die 'lease Gate owner starttime is unverifiable'
-    [[ $owner_starttime == "$gate_starttime" ]] && return 0
-  fi
-
-  # The recovery service is run-scoped.  Do not use a broad unit wildcard or
-  # pkill: any non-matching name is ignored and no unrelated collector unit is
-  # touched.
-  listed=$(systemctl list-units --all --type=service --no-legend --plain \
-    "${GATE_UNIT_PREFIX}${run}-*.service") || die 'could not list run-scoped Gate workers'
-  while read -r unit _; do
-    [[ -n ${unit:-} ]] || continue
-    [[ $unit =~ ^${GATE_UNIT_PREFIX}${run}-(spot|usdm|spot-upload|usdm-upload|strict-[1-9][0-9]*|oss-(spot|usdm)-[1-9][0-9]*)\.service$ ]] \
-      || continue
-    systemctl stop "$unit" >/dev/null 2>&1 || true
-    systemctl reset-failed "$unit" >/dev/null 2>&1 || true
-  done <<<"$listed"
-  direct_directory "$GATE_SYSTEMD_ROOT" || die 'systemd runtime unit path is not direct'
-  while IFS= read -r unit_file; do
-    unit=${unit_file##*/}
-    [[ $unit =~ ^${GATE_UNIT_PREFIX}${run}-(spot|usdm|spot-upload|usdm-upload|strict-[1-9][0-9]*|oss-(spot|usdm)-[1-9][0-9]*)\.service$ ]] \
-      || continue
-    rm -f -- "$unit_file"
-  done < <(find "$GATE_SYSTEMD_ROOT" -maxdepth 1 -type f -name "${GATE_UNIT_PREFIX}${run}-*.service" -print)
-  # Keep the aggregate slice top-level in systemd.  Dashes in a slice name
-  # encode hierarchy, so the run timestamp/PID is rendered as digits only.
-  slice_name="mondayrustlobgate${run//[^0-9]/}.slice"
-  if [[ -f "$GATE_SYSTEMD_ROOT/$slice_name" && ! -L "$GATE_SYSTEMD_ROOT/$slice_name" ]]; then
-    systemctl stop "$slice_name" >/dev/null 2>&1 || true
-    rm -f -- "$GATE_SYSTEMD_ROOT/$slice_name"
-  fi
-
-  if [[ $applied == true && $restored == false ]]; then
-    systemctl set-property --runtime "$PRODUCTION_SLICE" \
-      "MemoryHigh=$before_high" "MemoryMax=$before_max" >/dev/null 2>&1 \
-      || die 'could not restore the bootstrap production slice lease'
-    output=$(systemctl_show_many "$PRODUCTION_SLICE" 'MemoryHigh,MemoryMax') \
-      || die 'restored production slice limits are unavailable'
-    output=${output%$'\n'}; fields=()
-    while IFS= read -r item; do
-      [[ $item == *=* ]] || die 'restored production slice limits are malformed'
-      key=${item%%=*}; value=${item#*=}
-      case $key in MemoryHigh|MemoryMax) ;; *) die 'restored production slice has an unexpected field' ;; esac
-      [[ -z ${fields[$key]+x} ]] || die 'restored production slice has duplicate fields'
-      fields[$key]=$value
-    done <<<"$output"
-    [[ ${#fields[@]} == 2 ]] || die 'restored production slice limits are incomplete'
-    restored_high=${fields[MemoryHigh]:-}; restored_max=${fields[MemoryMax]:-}
-    [[ $restored_high == "$before_high" && $restored_max == "$before_max" ]] \
-      || die 'restored production slice limits differ from lease state'
-  fi
-  restore_bootstrap_monitor_from_state "$state" \
-    || die 'could not restore the collector health timer/service state'
-
-  # This function runs as the recovery oneshot itself.  Stop/reset only the
-  # timer and run workers; stopping the current recovery service would
-  # self-interrupt before its state/readback and unit removal complete.  The
-  # collector health service was already quiesced above and is never started.
-  systemctl stop "$timer_name" >/dev/null 2>&1 || true
-  systemctl reset-failed "$timer_name" >/dev/null 2>&1 || true
-  rm -f -- "$GATE_SYSTEMD_ROOT/$timer_name" "$GATE_SYSTEMD_ROOT/$service_name"
-  systemctl daemon-reload >/dev/null 2>&1 || die 'could not reload systemd after lease recovery'
-  temporary="${state}.tmp.$$"
-  jq -cS --arg recovered_by "$run" \
-    '.bootstrap_monitor_containment |=
-       (if has("preexisting_global_health_failed") then .
-        else . + {preexisting_global_health_failed:(.before_service.active_state == "failed")}
-        end
-        | if has("global_health_reset_applied") then .
-          else . + {global_health_reset_applied:false}
-          end
-        | .pause_applied = true
-        | .timer_restored = true
-        | .service_quiesced = true)
-     | .restored = true | .recovered_by_run_id = $recovered_by' "$state" >"$temporary" \
-    || die 'could not mark bootstrap lease recovered'
-  chmod 0640 "$temporary" || die 'could not protect recovered lease state'
-  mv -f -- "$temporary" "$state" || die 'could not publish recovered lease state'
-}
-
-if [[ -n $RECOVER_STATE ]]; then
-  recover_bootstrap_lease "$RECOVER_STATE"
-  exit 0
-fi
-
-# A production snapshot is one immutable view of the systemd template pair
-# and its automatically assigned slice.  The snapshot carries cgroup limits
-# and audit counters separately from process identity so resource admission can
-# use conservative current/limit values while the monitor compares only the
-# identity-bearing fields.
 cgroup_file_value() {
   local path=$1
   [[ -f $path && ! -L $path ]] || return 1
@@ -898,8 +546,8 @@ cgroup_child_path() {
 fixture_prepare_production_cgroup() {
   [[ $TEST_ONLY == true ]] || return 0
   local parent="$CGROUP_ROOT/system.slice/$PRODUCTION_SLICE" child unit market fixture_pid fixture_cgroup_pid
-  local fixture_parent_current=${MONDAY_GATE_FIXTURE_BOOTSTRAP_PARENT_CURRENT:-1101067264}
-  local fixture_parent_anon=${MONDAY_GATE_FIXTURE_BOOTSTRAP_PARENT_ANON:-317067264}
+  local fixture_parent_current=${MONDAY_GATE_FIXTURE_PRODUCTION_PARENT_CURRENT:-1101067264}
+  local fixture_parent_anon=${MONDAY_GATE_FIXTURE_PRODUCTION_PARENT_ANON:-317067264}
   mkdir -p "$parent"
   : >"$parent/cgroup.procs"
   printf '%s\n' "$fixture_parent_current" >"$parent/memory.current"
@@ -1311,340 +959,6 @@ fi
 # in a run-scoped state file before mutation and restored on normal EXIT paths;
 # the next serialized Gate also recovers an un-restored lease left by SIGKILL.
 # Stable V2 Gates only verify the permanent slice and never mutate it.
-bootstrap_slice_lease_mode=permanent
-bootstrap_slice_lease_before_high=3072M; bootstrap_slice_lease_before_max=3584M
-bootstrap_slice_lease_applied=false; bootstrap_slice_lease_restored=true
-bootstrap_slice_lease_state_file=
-bootstrap_slice_lease_gate_pid=
-bootstrap_slice_lease_gate_starttime=
-bootstrap_slice_lease_candidate_controller=
-bootstrap_slice_lease_gate_script=
-bootstrap_slice_lease_gate_script_sha256=
-bootstrap_slice_lease_parent_control_group=
-bootstrap_slice_lease_parent_current=0
-bootstrap_slice_lease_parent_anon=0
-bootstrap_monitor_required=false
-bootstrap_monitor_pause_applied=false
-bootstrap_monitor_timer_restored=true
-# Audit whether the captured service state was anything other than inactive;
-# this is not a claim that the service remains stopped after the timer fires.
-bootstrap_monitor_service_was_noninactive=false
-bootstrap_monitor_preexisting_global_health_failed=false
-bootstrap_monitor_global_health_reset_applied=false
-bootstrap_monitor_service_quiesced=true
-bootstrap_monitor_timer_before_json=null
-bootstrap_monitor_service_before_json=null
-bootstrap_monitor_containment_json='{}'
-build_bootstrap_monitor_containment() {
-  bootstrap_monitor_containment_json=$(jq -cn \
-    --argjson required "$bootstrap_monitor_required" \
-    --arg timer "$COLLECTOR_HEALTH_TIMER" --arg service "$COLLECTOR_HEALTH_SERVICE" \
-    --argjson before_timer "$bootstrap_monitor_timer_before_json" \
-    --argjson before_service "$bootstrap_monitor_service_before_json" \
-    --argjson pause_applied "$bootstrap_monitor_pause_applied" \
-    --argjson timer_restored "$bootstrap_monitor_timer_restored" \
-    --argjson service_was_noninactive "$bootstrap_monitor_service_was_noninactive" \
-    --argjson preexisting_global_health_failed "$bootstrap_monitor_preexisting_global_health_failed" \
-    --argjson global_health_reset_applied "$bootstrap_monitor_global_health_reset_applied" \
-    --argjson service_quiesced "$bootstrap_monitor_service_quiesced" \
-    '{required:$required,timer:$timer,service:$service,
-      before_timer:$before_timer,before_service:$before_service,
-      pause_applied:$pause_applied,timer_restored:$timer_restored,
-      service_was_noninactive:$service_was_noninactive,
-      preexisting_global_health_failed:$preexisting_global_health_failed,
-      global_health_reset_applied:$global_health_reset_applied,
-      service_quiesced:$service_quiesced}') || return 1
-}
-capture_bootstrap_monitor_state() {
-  local timer_state service_state
-  timer_state=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_TIMER") || return 1
-  service_state=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_SERVICE") || return 1
-  [[ $(jq -er '.load_state' <<<"$timer_state") == loaded \
-    && $(jq -er '.active_state' <<<"$timer_state") == active ]] || return 1
-  bootstrap_monitor_required=true
-  bootstrap_monitor_pause_applied=false
-  bootstrap_monitor_timer_restored=false
-  bootstrap_monitor_service_was_noninactive=false
-  [[ $(jq -er '.active_state' <<<"$service_state") != inactive ]] \
-    && bootstrap_monitor_service_was_noninactive=true
-  bootstrap_monitor_preexisting_global_health_failed=false
-  [[ $(jq -er '.active_state' <<<"$service_state") == failed ]] \
-    && bootstrap_monitor_preexisting_global_health_failed=true
-  bootstrap_monitor_global_health_reset_applied=false
-  bootstrap_monitor_service_quiesced=false
-  bootstrap_monitor_timer_before_json=$timer_state
-  bootstrap_monitor_service_before_json=$service_state
-  build_bootstrap_monitor_containment
-}
-pause_bootstrap_monitor() {
-  [[ $bootstrap_monitor_required == true ]] || return 0
-  systemctl stop "$COLLECTOR_HEALTH_TIMER" >/dev/null 2>&1 || return 1
-  local timer_state
-  timer_state=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_TIMER") || return 1
-  [[ $(jq -er '.active_state' <<<"$timer_state") == inactive ]] || return 1
-  build_bootstrap_monitor_containment || return 1
-  write_bootstrap_slice_lease_state || return 1
-  # Re-read after the timer stop: an in-flight timer callback may have left the
-  # service in any non-inactive state, not only the state captured at entry.
-  quiesce_collector_health_service || return 1
-  bootstrap_monitor_service_quiesced=true
-  bootstrap_monitor_pause_applied=true
-  build_bootstrap_monitor_containment || return 1
-  write_bootstrap_slice_lease_state
-}
-restore_bootstrap_monitor() {
-  [[ $bootstrap_monitor_required == true ]] || {
-    bootstrap_monitor_timer_restored=true
-    bootstrap_monitor_service_was_noninactive=false
-    bootstrap_monitor_preexisting_global_health_failed=false
-    bootstrap_monitor_global_health_reset_applied=false
-    bootstrap_monitor_service_quiesced=true
-    return 0
-  }
-  local before_timer_active current
-  before_timer_active=$(jq -er '.active_state' <<<"$bootstrap_monitor_timer_before_json") || return 1
-  [[ $(jq -er '.load_state' <<<"$bootstrap_monitor_timer_before_json") == loaded \
-    && $before_timer_active == active ]] || return 1
-  # The health worker remains quiesced after the bootstrap window.  Never
-  # restart it here; only a timer that was active before the pause is restored.
-  # service_quiesced records this pause/restore transaction's inactive readback;
-  # it does not claim a timer-triggered service remains inactive forever.
-  quiesce_collector_health_service || return 1
-  bootstrap_monitor_service_quiesced=true
-  if [[ $before_timer_active == active ]]; then
-    systemctl start "$COLLECTOR_HEALTH_TIMER" >/dev/null 2>&1 || return 1
-  else
-    current=$(health_unit_snapshot_json "$COLLECTOR_HEALTH_TIMER") || return 1
-    if [[ $(jq -er '.active_state' <<<"$current") == active ]]; then
-      systemctl stop "$COLLECTOR_HEALTH_TIMER" >/dev/null 2>&1 || return 1
-    fi
-  fi
-  health_timer_state_matches "$bootstrap_monitor_timer_before_json" || return 1
-  bootstrap_monitor_timer_restored=true
-  build_bootstrap_monitor_containment || return 1
-  write_bootstrap_slice_lease_state
-}
-write_bootstrap_slice_lease_state() {
-  [[ -n ${bootstrap_slice_lease_state_file:-} ]] || return 1
-  local temporary="${bootstrap_slice_lease_state_file}.tmp.$$"
-  jq -cS -n \
-    --arg run "$run_id" --arg slice "$PRODUCTION_SLICE" \
-    --arg mode "$bootstrap_slice_lease_mode" \
-    --arg before_high "$bootstrap_slice_lease_before_high" \
-    --arg before_max "$bootstrap_slice_lease_before_max" \
-    --arg parent_control_group "$bootstrap_slice_lease_parent_control_group" \
-    --arg controller "$bootstrap_slice_lease_candidate_controller" \
-    --arg gate_script "$bootstrap_slice_lease_gate_script" \
-    --arg gate_script_sha "$bootstrap_slice_lease_gate_script_sha256" \
-    --arg recovery_service "${bootstrap_slice_lease_recovery_service##*/}" \
-    --arg recovery_timer "${bootstrap_slice_lease_recovery_timer##*/}" \
-    --argjson gate_pid "$bootstrap_slice_lease_gate_pid" \
-    --argjson gate_starttime "$bootstrap_slice_lease_gate_starttime" \
-    --argjson parent_current "$bootstrap_slice_lease_parent_current" \
-    --argjson parent_anon "$bootstrap_slice_lease_parent_anon" \
-    --argjson applied "$bootstrap_slice_lease_applied" \
-    --argjson restored "$bootstrap_slice_lease_restored" \
-    --argjson monitor "$bootstrap_monitor_containment_json" \
-    '{schema:"monday.rust_lob_bootstrap_slice_lease.v2",run_id:$run,slice:$slice,
-      mode:$mode,before_memory_high:$before_high,before_memory_max:$before_max,
-      before_parent_control_group:$parent_control_group,
-      before_parent_memory_current_bytes:$parent_current,
-      before_parent_memory_anon_bytes:$parent_anon,
-      requested_memory_high:"3072M",requested_memory_max:"3584M",
-      candidate_controller_sha256:$controller,gate_script:$gate_script,
-      gate_script_sha256:$gate_script_sha,gate_pid:$gate_pid,gate_starttime:$gate_starttime,
-      recovery_service:$recovery_service,recovery_timer:$recovery_timer,
-      applied:$applied,restored:$restored,
-      bootstrap_monitor_containment:$monitor}' >"$temporary" || return 1
-  chmod 0640 "$temporary" || return 1
-  mv -f -- "$temporary" "$bootstrap_slice_lease_state_file"
-}
-read_bootstrap_slice_limits() {
-  local output item key value
-  local -A fields=()
-  output=$(systemctl_show_many "$PRODUCTION_SLICE" 'MemoryHigh,MemoryMax') || return 1
-  output=${output%$'\n'}
-  while IFS= read -r item; do
-    [[ $item == *=* ]] || return 1
-    key=${item%%=*}; value=${item#*=}
-    case $key in MemoryHigh|MemoryMax) ;; *) return 1 ;; esac
-    [[ -z ${fields[$key]+x} ]] || return 1
-    fields[$key]=$value
-  done <<<"$output"
-  [[ ${fields[MemoryHigh]+x} && ${fields[MemoryMax]+x} ]] || return 1
-  printf '%s\t%s\n' "${fields[MemoryHigh]}" "${fields[MemoryMax]}"
-}
-read_bootstrap_slice_usage() {
-  local output item key value control_group parent_path current parent_stat anon
-  local -A fields=()
-  [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] \
-    && printf 'read-bootstrap-slice-usage\n' >>"$ROOT/run/gate-fixture.calls"
-  # The fixture must create the same direct cgroup files before this
-  # pre-mutation read; production uses the already-mounted cgroup tree.
-  [[ $TEST_ONLY == true ]] && fixture_prepare_production_cgroup
-  output=$(systemctl_show_many "$PRODUCTION_SLICE" 'ControlGroup') || return 1
-  output=${output%$'\n'}
-  while IFS= read -r item; do
-    [[ $item == *=* ]] || return 1
-    key=${item%%=*}; value=${item#*=}
-    [[ $key == ControlGroup ]] || return 1
-    [[ -z ${fields[$key]+x} ]] || return 1
-    fields[$key]=$value
-  done <<<"$output"
-  [[ ${#fields[@]} == 1 ]] || return 1
-  control_group=${fields[ControlGroup]:-}
-  [[ $control_group == "/system.slice/$PRODUCTION_SLICE" ]] || return 1
-  parent_path=$(cgroup_child_path "$control_group") || return 1
-  monday_path_direct "$parent_path" || return 1
-  current=$(cgroup_numeric_value "$parent_path/memory.current") || return 1
-  parent_stat=$(cgroup_memory_stat_json "$parent_path/memory.stat") || return 1
-  anon=$(jq -er '.anon' <<<"$parent_stat") || return 1
-  [[ $current =~ ^(0|[1-9][0-9]*)$ && $anon =~ ^(0|[1-9][0-9]*)$ ]] || return 1
-  if (( current > 3758096384 )); then
-    [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] \
-      && printf 'usage-over-cap-current\n' >>"$ROOT/run/gate-fixture.calls"
-    return 1
-  fi
-  if (( anon > 3758096384 )); then
-    [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] \
-      && printf 'usage-over-cap-anon\n' >>"$ROOT/run/gate-fixture.calls"
-    return 1
-  fi
-  printf '%s\t%s\t%s\n' "$control_group" "$current" "$anon"
-}
-install_bootstrap_lease_recovery() {
-  [[ $TEST_ONLY == true ]] && return 0
-  local service_name=${bootstrap_slice_lease_recovery_service##*/}
-  local timer_name=${bootstrap_slice_lease_recovery_timer##*/}
-  local candidate_gate_script="$candidate_deployment/host-rust-lob-shadow-gate.sh"
-  local temporary_service="${bootstrap_slice_lease_recovery_service}.tmp.$$"
-  local temporary_timer="${bootstrap_slice_lease_recovery_timer}.tmp.$$"
-  monday_file_direct "$candidate_gate_script" || return 1
-  [[ ! -e $bootstrap_slice_lease_recovery_service && ! -L $bootstrap_slice_lease_recovery_service \
-    && ! -e $bootstrap_slice_lease_recovery_timer && ! -L $bootstrap_slice_lease_recovery_timer ]] || return 1
-  printf '[Unit]\nDescription=Recover Monday Rust LOB bootstrap slice lease (%s)\n\n[Service]\nType=oneshot\nExecStart=%s --recover-bootstrap-lease %s\nTimeoutStartSec=120\n' \
-    "$run_id" "$candidate_gate_script" "$bootstrap_slice_lease_state_file" >"$temporary_service" || return 1
-  # Run once after a short grace period and again after each completed
-  # watchdog service invocation.  The recovery service itself returns while
-  # the recorded Gate owner is alive, so a healthy Gate never loses its lease.
-  printf '[Unit]\nDescription=Recover Monday Rust LOB bootstrap slice lease (%s)\n\n[Timer]\nOnActiveSec=30s\nOnUnitInactiveSec=30s\nAccuracySec=1s\nUnit=%s\n' \
-    "$run_id" "$service_name" >"$temporary_timer" || return 1
-  chmod 0644 "$temporary_service" "$temporary_timer" || return 1
-  mv -f -- "$temporary_service" "$bootstrap_slice_lease_recovery_service" || return 1
-  mv -f -- "$temporary_timer" "$bootstrap_slice_lease_recovery_timer" || return 1
-  systemctl daemon-reload >/dev/null 2>&1 || return 1
-  systemctl start "$timer_name" >/dev/null 2>&1 || return 1
-}
-cancel_bootstrap_lease_recovery() {
-  [[ $TEST_ONLY == true ]] && return 0
-  local service_name=${bootstrap_slice_lease_recovery_service##*/}
-  local timer_name=${bootstrap_slice_lease_recovery_timer##*/}
-  if [[ -e $bootstrap_slice_lease_recovery_service || -L $bootstrap_slice_lease_recovery_service \
-    || -e $bootstrap_slice_lease_recovery_timer || -L $bootstrap_slice_lease_recovery_timer ]]; then
-    systemctl stop "$timer_name" >/dev/null 2>&1 || true
-    systemctl stop "$service_name" >/dev/null 2>&1 || true
-    systemctl reset-failed "$timer_name" >/dev/null 2>&1 || true
-    systemctl reset-failed "$service_name" >/dev/null 2>&1 || true
-    rm -f -- "$bootstrap_slice_lease_recovery_timer" "$bootstrap_slice_lease_recovery_service"
-    systemctl daemon-reload >/dev/null 2>&1 || return 1
-  fi
-}
-apply_bootstrap_slice_lease() {
-  [[ $FROM_CONTROLLER == direct ]] || return 0
-  local limits before_high before_max usage parent_control parent_current parent_anon
-  limits=$(read_bootstrap_slice_limits) || die 'production slice limits are unavailable before Gate'
-  IFS=$'\t' read -r before_high before_max <<<"$limits"
-  [[ $before_high =~ ^(infinity|[0-9]+)$ && $before_max =~ ^(infinity|[0-9]+)$ ]] \
-    || die 'production slice limits are malformed before Gate'
-  if [[ $before_high == 3221225472 || $before_high == 3072M ]] &&
-     [[ $before_max == 3758096384 || $before_max == 3584M ]]; then
-    bootstrap_slice_lease_mode=permanent
-    bootstrap_slice_lease_before_high=$before_high
-    bootstrap_slice_lease_before_max=$before_max
-    bootstrap_slice_lease_applied=false
-    bootstrap_slice_lease_restored=true
-    return 0
-  fi
-  if [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_BOOTSTRAP_LEASE_USAGE:-0} != 1 ]]; then
-    die 'fixture production slice must expose the governed V2 limits'
-  fi
-  [[ $before_high == infinity || $before_high == 0 || $before_high == max ]] \
-    || die 'direct bootstrap refuses an unexpected production MemoryHigh'
-  [[ $before_max == infinity || $before_max == max ]] \
-    || die 'direct bootstrap refuses an unexpected production MemoryMax'
-  # Read the exact production parent usage before arming recovery or changing
-  # either limit.  Current and anon are both bounded independently so a
-  # high-current legacy slice cannot be hidden behind a smaller anon value.
-  usage=$(read_bootstrap_slice_usage) \
-    || die 'direct bootstrap could not read the production slice usage before Gate'
-  IFS=$'\t' read -r parent_control parent_current parent_anon <<<"$usage"
-  bootstrap_slice_lease_parent_control_group=$parent_control
-  bootstrap_slice_lease_parent_current=$parent_current
-  bootstrap_slice_lease_parent_anon=$parent_anon
-  capture_bootstrap_monitor_state \
-    || die 'direct bootstrap requires an active collector health timer'
-  # Mark the lease as pending before the mutating call so an abnormal exit
-  # between set-property and the bookkeeping assignments still enters the
-  # EXIT cleanup path with the original limits available for restoration.
-  bootstrap_slice_lease_mode='temporary-bootstrap'
-  bootstrap_slice_lease_before_high=$before_high
-  bootstrap_slice_lease_before_max=$before_max
-  bootstrap_slice_lease_applied=true
-  bootstrap_slice_lease_restored=false
-  bootstrap_slice_lease_gate_pid=$$
-  bootstrap_slice_lease_gate_starttime=$(proc_starttime "$$") \
-    || die 'could not record the Gate owner starttime for lease recovery'
-  bootstrap_slice_lease_candidate_controller=$CANDIDATE_CONTROLLER
-  bootstrap_slice_lease_gate_script="$candidate_deployment/host-rust-lob-shadow-gate.sh"
-  monday_file_direct "$bootstrap_slice_lease_gate_script" \
-    || die 'candidate Gate script is not a direct file for lease recovery'
-  bootstrap_slice_lease_gate_script_sha256=$(sha256_file "$bootstrap_slice_lease_gate_script") \
-    || die 'could not record candidate Gate script identity for lease recovery'
-  [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] \
-    && printf 'write-lease-state\n' >>"$ROOT/run/gate-fixture.calls"
-  write_bootstrap_slice_lease_state \
-    || die 'could not persist the temporary production slice lease'
-  [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] \
-    && printf 'install-lease-recovery\n' >>"$ROOT/run/gate-fixture.calls"
-  install_bootstrap_lease_recovery \
-    || die 'could not arm automatic bootstrap lease recovery'
-  pause_bootstrap_monitor \
-    || die 'could not pause the collector health timer/service'
-  systemctl set-property --runtime "$PRODUCTION_SLICE" \
-    MemoryHigh=3072M MemoryMax=3584M >/dev/null \
-    || die 'could not apply the temporary production slice lease'
-  limits=$(read_bootstrap_slice_limits) || die 'temporary production slice lease could not be read back'
-  IFS=$'\t' read -r before_high before_max <<<"$limits"
-  [[ $before_high == 3221225472 || $before_high == 3072M ]] \
-    || die 'temporary production MemoryHigh lease is not exact'
-  [[ $before_max == 3758096384 || $before_max == 3584M ]] \
-    || die 'temporary production MemoryMax lease is not exact'
-  build_bootstrap_monitor_containment \
-    || die 'bootstrap monitor state is malformed after apply'
-  write_bootstrap_slice_lease_state \
-    || die 'could not persist the applied bootstrap monitor containment'
-}
-restore_bootstrap_slice_lease() {
-  [[ ${bootstrap_slice_lease_mode:-permanent} == temporary-bootstrap ]] || return 0
-  [[ ${bootstrap_slice_lease_restored:-false} == true ]] && return 0
-  systemctl set-property --runtime "$PRODUCTION_SLICE" \
-    "MemoryHigh=$bootstrap_slice_lease_before_high" \
-    "MemoryMax=$bootstrap_slice_lease_before_max" >/dev/null 2>&1 || return 1
-  local limits restored_high restored_max
-  limits=$(read_bootstrap_slice_limits) || return 1
-  IFS=$'\t' read -r restored_high restored_max <<<"$limits"
-  [[ $restored_high == "$bootstrap_slice_lease_before_high" \
-    && $restored_max == "$bootstrap_slice_lease_before_max" ]] || return 1
-  bootstrap_slice_lease_restored=false
-  build_bootstrap_monitor_containment || return 1
-  write_bootstrap_slice_lease_state || return 1
-  restore_bootstrap_monitor || return 1
-  cancel_bootstrap_lease_recovery || return 1
-  bootstrap_slice_lease_restored=true
-  build_bootstrap_monitor_containment || return 1
-  write_bootstrap_slice_lease_state || return 1
-}
-
 # Candidate shadow units are rendered into a run-scoped /run directory.  The
 # source template may only contribute the reviewed security/resource fields;
 # all identity, spool, restart, and lifetime fields are rewritten below.
@@ -1946,12 +1260,6 @@ resource_monitor_start() {
             delta_us:$delta_us,elapsed_us:$elapsed_us,window_us:$window_us,
             ratio:$ratio,hit:$hit,consecutive_hits:$consecutive_hits}' \
           >>"$resource_monitor_psi_log" || true
-        if [[ $hit == true && $consecutive_hits -ge $IO_PSI_CONSECUTIVE_HIT_LIMIT ]]; then
-          resource_monitor_record_breach "$phase" psi-stop-rule "$elapsed_us" \
-            "$delta" "$ratio" "$consecutive_hits" || true
-          kill -TERM "$parent_pid" 2>/dev/null || true
-          break
-        fi
         window_start_psi=$current_psi
         window_start_mono=$current_mono
         window_start_at=$current_at
@@ -1978,7 +1286,7 @@ resource_monitor_breach_cause() {
     IFS= read -r cause <"$tmp_dir/resource-monitor-breach" || cause=unknown
   fi
   case "$cause" in
-    fixture-resource-breach|memory-breach|production-identity-drift|production-snapshot-invalid|psi-regressed|psi-stop-rule|psi-unavailable) ;;
+    fixture-resource-breach|memory-breach|production-identity-drift|production-snapshot-invalid|psi-regressed|psi-unavailable) ;;
     *) cause=unknown ;;
   esac
   printf '%s\n' "$cause"
@@ -2104,9 +1412,6 @@ calibrate_psi() {
       '$values + [{phase:$phase,stage:"calibration",delta_us:$delta,ratio:$ratio,
         elapsed_us:$elapsed,window_us:$elapsed,hit:$hit,consecutive_hits:$consecutive}]') \
       || die 'could not record I/O PSI calibration window'
-    if [[ $hit == true && $consecutive -ge $IO_PSI_CONSECUTIVE_HIT_LIMIT ]]; then
-      die "I/O PSI threshold exceeded: elapsed_us=$elapsed_us delta_us=$delta ratio=$ratio consecutive_hits=$consecutive"
-    fi
     previous=$current; previous_mono=$current_mono
   done
 }
@@ -2120,9 +1425,6 @@ assert_host_memory_reserve() {
 run_id=$(date -u +%Y%m%dT%H%M%SZ)-$$
 evidence_dir="$EVIDENCE_ROOT/$CANDIDATE_CONTROLLER/$candidate_runtime/runs/$run_id"; gate_json="$evidence_dir/gate.json"; passed_marker="$evidence_dir/PASSED.sha256"; run_spool="$RUN_SPOOL_ROOT/$run_id"; run_json="$evidence_dir/run.json"
 gate_unit_dir="$GATE_UNIT_ROOT/$run_id"
-bootstrap_slice_lease_state_file="$GATE_UNIT_ROOT/bootstrap-slice-lease-$run_id.json"
-bootstrap_slice_lease_recovery_service="$GATE_SYSTEMD_ROOT/${GATE_UNIT_PREFIX}${run_id}-lease-recovery.service"
-bootstrap_slice_lease_recovery_timer="$GATE_SYSTEMD_ROOT/${GATE_UNIT_PREFIX}${run_id}-lease-recovery.timer"
 # All Gate workers share one run-scoped hard envelope.  The production pair
 # remains in its separately governed permanent slice; this transient slice is
 # removed by the EXIT cleanup and is never treated as a production asset.
@@ -2211,18 +1513,8 @@ cleanup_stale_gate_runs() {
   done < <(find "$GATE_UNIT_ROOT" -mindepth 1 -maxdepth 1 -type d -print)
   [[ $TEST_ONLY == true ]] || systemctl daemon-reload >/dev/null 2>&1 || return 1
 }
-cleanup_stale_bootstrap_leases() {
-  [[ $TEST_ONLY == true ]] && return 0
-  local state
-  direct_directory "$GATE_UNIT_ROOT" || return 1
-  while IFS= read -r state; do
-    [[ -n $state ]] || continue
-    recover_bootstrap_lease "$state" || return 1
-  done < <(find "$GATE_UNIT_ROOT" -maxdepth 1 -type f -name 'bootstrap-slice-lease-*.json' -print | sort)
-}
 cleanup_stale_gate_units
 cleanup_stale_gate_runs
-cleanup_stale_bootstrap_leases
 # Every Gate, including production, writes only to this run-scoped spool.  A
 # prior test-only conditional left production's spool_dir empty and made the
 # first install attempt fail before any market work; keep construction before
@@ -2284,7 +1576,6 @@ cleanup() {
     rm -f -- "$GATE_SYSTEMD_ROOT/${unit[$market]}" \
       "$GATE_SYSTEMD_ROOT/monday-rust-lob-gate-${run_id}-${market}-upload.service"
   done
-  restore_bootstrap_slice_lease || cleanup_failed=true
   systemctl stop "$GATE_WORKER_SLICE" >/dev/null 2>&1 || true
   rm -f -- "$gate_worker_slice_file"
   [[ $TEST_ONLY == true ]] || systemctl daemon-reload >/dev/null 2>&1 || cleanup_failed=true
@@ -2313,10 +1604,8 @@ systemctl start "$GATE_WORKER_SLICE" >/dev/null 2>&1 \
   || die 'could not activate run-scoped Gate worker slice'
 verify_gate_worker_slice || die 'run-scoped Gate worker slice did not read back exactly'
 
-# Apply the bootstrap lease only after stale Gate workers and any interrupted
-# lease have been cleaned, and after the EXIT trap is armed.  A failure or
-# signal after this point therefore restores the exact pre-Gate limits.
-apply_bootstrap_slice_lease
+# The operator applies the signed production envelope before invoking Gate.
+# This readback fails closed without mutating production limits.
 if [[ $TEST_ONLY == true ]]; then
   refresh_production_snapshot || die 'fixture production cgroup snapshot is invalid'
 else
@@ -2921,25 +2210,8 @@ if [[ $old_shadow_present == true ]]; then
     || die 'restored shadow binary bytes changed during Gate'
 fi
 refresh_production_snapshot || die 'production cgroup identity changed during Gate'
-# A direct bootstrap lease is only a Gate-time guard.  Restore the original
-# runtime limit before publishing the receipt; Cutover will install the
-# permanent signed slice as part of the atomic 8 -> 9 migration.
-restore_bootstrap_slice_lease || die 'temporary production slice lease could not be restored'
-build_bootstrap_monitor_containment \
-  || die 'bootstrap monitor containment state is unavailable for the receipt'
-production_memory_json=$(jq -c \
-  --arg mode "$bootstrap_slice_lease_mode" \
-  --arg before_high "${bootstrap_slice_lease_before_high:-}" \
-  --arg before_max "${bootstrap_slice_lease_before_max:-}" \
-  --argjson applied "${bootstrap_slice_lease_applied:-false}" \
-  --argjson restored "${bootstrap_slice_lease_restored:-false}" \
-  --argjson monitor "$bootstrap_monitor_containment_json" \
-  '.slice_lease={mode:$mode,before_memory_high:$before_high,before_memory_max:$before_max,
-    requested_memory_high:"3072M",requested_memory_max:"3584M",applied:$applied,restored:$restored}
-   | .bootstrap_monitor_containment=$monitor' \
-  <<<"$production_memory_json")
 
-checks=$(jq -cn '{before_pair_unchanged:true,production_runtime_verified:true,shadow_staging_verified:true,shadow_assets_restored:true,resource_preflight:true,oss_triplets:true,strict_segment_verifier:true,final_identity:true,controller_control_bytes:true,shadow_link_restored:true,health_freshness:true,bootstrap_monitor_containment:true}')
+checks=$(jq -cn '{before_pair_unchanged:true,production_runtime_verified:true,shadow_staging_verified:true,shadow_assets_restored:true,resource_preflight:true,oss_triplets:true,strict_segment_verifier:true,final_identity:true,controller_control_bytes:true,shadow_link_restored:true,health_freshness:true}')
 before_assets_json='{}'; staged_assets_json='{}'; restored_assets_json='{}'
 for asset in "${SHADOW_ASSETS[@]}"; do
   restored_asset_sha[$asset]="${saved_sha[$asset]:-}"

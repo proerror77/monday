@@ -43,14 +43,6 @@ def valid_lob_cgroup_path:
     | ($parts[0] == "" and ($parts[1:] | length) >= 1
       and all($parts[1:][]; test("^[A-Za-z0-9_.@-]+(?:\\\\x2d[A-Za-z0-9_.@-]+)*$"))));
 
-def valid_health_unit_state($unit):
-  type == "object"
-  and .unit == $unit
-  and (.load_state | type == "string" and length > 0)
-  and (.active_state | type == "string" and length > 0)
-  and (.sub_state | type == "string" and length > 0)
-  and (.unit_file_state | type == "string" and length > 0);
-
 def valid_production_asset_map($keys; $source_mode):
   type == "object"
   and (keys | sort) == $keys
@@ -243,51 +235,7 @@ and (.production_memory | . as $pm
   and (.parent_memory_anon_bytes <= .production_slice_memory_max_bytes)
   and (.parent_memory_current_bytes <= .child_memory_max_sum_bytes)
   and (.parent_memory_events | type == "object"
-    and all(.[]; type == "number" and floor == . and . >= 0))
-  and (.slice_lease | type == "object"
-    and (.mode == "permanent" or .mode == "temporary-bootstrap")
-    and (.before_memory_high | type == "string" and length > 0)
-    and (.before_memory_max | type == "string" and length > 0)
-    and .requested_memory_high == "3072M"
-    and .requested_memory_max == "3584M"
-    and (.applied | type == "boolean")
-    and (.restored | type == "boolean" and . == true)
-    and (if .mode == "permanent" then .applied == false else .applied == true end))
-  and (.bootstrap_monitor_containment | type == "object"
-          and (.required | type == "boolean")
-          and .timer == "monday-collector-health.timer"
-          and .service == "monday-collector-health.service"
-          and (.pause_applied | type == "boolean")
-          and (.timer_restored | type == "boolean")
-          and (.service_was_noninactive | type == "boolean")
-          and (.service_quiesced | type == "boolean")
-          and (.preexisting_global_health_failed | type == "boolean")
-          and (.global_health_reset_applied | type == "boolean")
-          and (.global_health_reset_applied == false)
-          and (.service_was_noninactive
-            == ((.before_service.active_state // "inactive") != "inactive"))
-          and (.preexisting_global_health_failed
-            == ((.before_service.active_state // "inactive") == "failed"))
-          and (if $pm.slice_lease.mode == "temporary-bootstrap" then
-            .required == true
-            and .pause_applied == true
-            and .timer_restored == true
-            and .service_quiesced == true
-            and (.before_timer | valid_health_unit_state("monday-collector-health.timer")
-              and .load_state == "loaded"
-              and .active_state == "active")
-            and (.before_service | valid_health_unit_state("monday-collector-health.service"))
-          else
-            .required == false
-            and .pause_applied == false
-            and .timer_restored == true
-            and .service_was_noninactive == false
-            and .service_quiesced == true
-            and .preexisting_global_health_failed == false
-            and .global_health_reset_applied == false
-            and .before_timer == null
-            and .before_service == null
-          end))))
+    and all(.[]; type == "number" and floor == . and . >= 0))))
 and (.production_process.spot.main_pid == .production_memory.children.spot.main_pid
   and .production_process.usdm.main_pid == .production_memory.children.usdm.main_pid
   and .production_process.spot.process_exe_sha256 == .production_memory.children.spot.process_exe_sha256
