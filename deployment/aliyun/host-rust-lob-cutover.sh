@@ -457,8 +457,12 @@ restore_direct_topology() {
 rollback_active() {
   rm -f -- "$active_link.rollback.$$" || return 1
   ln -s "$old_active_target" "$active_link.rollback.$$" || return 1
-  rm -f -- "$active_link" || return 1
-  mv -f -- "$active_link.rollback.$$" "$active_link" || return 1
+  if [[ $(uname -s) == Darwin ]]; then
+    rm -f -- "$active_link" || return 1
+    mv -f -- "$active_link.rollback.$$" "$active_link" || return 1
+  else
+    mv -Tf -- "$active_link.rollback.$$" "$active_link" || return 1
+  fi
   [[ -L $active_link && $(readlink -- "$active_link") == "$old_active_target" ]] || return 1
   sync -f "$controller_root"
 }
