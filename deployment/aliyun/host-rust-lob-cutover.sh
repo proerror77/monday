@@ -624,6 +624,8 @@ if [[ $FROM == direct ]]; then
       runtime_contract_sha256:$runtime,gate_receipt:$gate,gate_sha256:$gate_sha}' \
     >"$recovery_intent_tmp"
   chmod 0440 "$recovery_intent_tmp"
+  sync -f "$recovery_intent_tmp" \
+    || die 'could not durably flush cutover recovery intent'
   if [[ -e $recovery_intent || -L $recovery_intent ]]; then
     monday_file_direct "$recovery_intent" \
       || die 'existing cutover recovery intent is indirect'
@@ -635,6 +637,8 @@ if [[ $FROM == direct ]]; then
   else
     mv -f -- "$recovery_intent_tmp" "$recovery_intent"
   fi
+  sync -f "$receipt_root/$TO" \
+    || die 'could not durably commit cutover recovery intent'
   monday_file_direct "$recovery_intent" || die 'cutover recovery intent is not a direct file'
   recovery_intent_written=1
   if [[ ${MONDAY_CUTOVER_HARD_CRASH_AFTER_RECOVERY_INTENT:-0} == 1 ]]; then
@@ -664,6 +668,7 @@ fi
 if [[ $FROM != direct ]]; then old_active_target=$(readlink -- "$active_link"); fi
 monday_atomic_symlink "$target_release" "$active_link" || die 'controller active switch failed'
 committed=1
+sync -f "$controller_root" || die 'could not durably commit active controller switch'
 if [[ ${MONDAY_CUTOVER_HARD_CRASH_AFTER_ACTIVE:-0} == 1 ]]; then
   kill -KILL "$$"
 fi
@@ -896,6 +901,17 @@ if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
   done
 fi
 
+# Commit the active pair and every persistent projection before publishing
+# evidence that can outlive the recovery intent.  These paths may be on a
+# different filesystem from /data, so the evidence-directory sync is not a
+# substitute for this barrier.
+sync -f "$(monday_root_join "$ROOT" opt/monday)" \
+  || die 'could not durably commit /opt pair projections'
+sync -f "$(monday_root_join "$ROOT" etc/monday)" \
+  || die 'could not durably commit runtime projections'
+sync -f "$(monday_root_join "$ROOT" etc/systemd/system)" \
+  || die 'could not durably commit systemd projections'
+
 mkdir -p "$receipt_root/$TO"; receipt=$transition_receipt
 [[ ! -e $receipt && ! -L $receipt \
   && ! -e $transition_marker && ! -L $transition_marker \
@@ -955,10 +971,14 @@ monday_validate_v2_transition "$ROOT" "$transition_tmp" "$FROM" "$TO" "$GATE" "$
 receipt_sha=$(monday_sha256_file "$transition_tmp")
 printf '%s  transition.json\n' "$receipt_sha" >"$transition_marker_tmp"
 chmod 0440 "$transition_marker_tmp"
+sync -f "$transition_tmp" || die 'could not durably flush transition receipt'
+sync -f "$transition_marker_tmp" || die 'could not durably flush transition digest'
 mv -f -- "$transition_tmp" "$receipt"
 transition_receipt_written=1
+sync -f "$receipt_root/$TO" || die 'could not durably commit transition receipt'
 mv -f -- "$transition_marker_tmp" "$transition_marker"
 transition_marker_written=1
+sync -f "$receipt_root/$TO" || die 'could not durably commit transition digest'
 monday_file_direct "$receipt" || die 'committed transition receipt is not a direct file'
 monday_file_direct "$transition_marker" || die 'committed transition digest is not a direct file'
 [[ $(monday_file_mode "$receipt") == 640 && $(monday_file_mode "$transition_marker") == 440 ]] \

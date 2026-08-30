@@ -67,6 +67,43 @@ gate_publish_dir_line=$(grep -nF "mv -- \"\$evidence_dir\" \"\$final_evidence_di
   printf 'Gate evidence is not fully protected before atomic directory publication\n' >&2
   exit 1
 }
+
+# Recovery authority must cross a durability barrier before active=C1, and
+# Gate-bearing success evidence must be durable before that authority is
+# removed.  Readback alone proves bytes, not power-loss ordering.
+cutover_script="$SCRIPT_DIR/host-rust-lob-cutover.sh"
+restore_script="$SCRIPT_DIR/host-rust-lob-restore.sh"
+cutover_intent_flush_line=$(grep -nF "could not durably flush cutover recovery intent" "$cutover_script" | cut -d: -f1)
+cutover_intent_commit_line=$(grep -nF "could not durably commit cutover recovery intent" "$cutover_script" | cut -d: -f1)
+cutover_active_line=$(grep -nF "monday_atomic_symlink \"\$target_release\" \"\$active_link\"" "$cutover_script" | cut -d: -f1)
+cutover_active_sync_line=$(grep -nF "could not durably commit active controller switch" "$cutover_script" | cut -d: -f1)
+cutover_active_crash_line=$(grep -nF 'MONDAY_CUTOVER_HARD_CRASH_AFTER_ACTIVE' "$cutover_script" | cut -d: -f1)
+cutover_transition_flush_line=$(grep -nF "could not durably flush transition receipt" "$cutover_script" | cut -d: -f1)
+cutover_transition_commit_line=$(grep -nF "could not durably commit transition digest" "$cutover_script" | cut -d: -f1)
+cutover_transition_crash_line=$(grep -nF 'MONDAY_CUTOVER_HARD_CRASH_AFTER_TRANSITION_RECEIPT' "$cutover_script" | cut -d: -f1)
+cutover_intent_clear_line=$(grep -nF "could not clear committed cutover recovery intent" "$cutover_script" | tail -n1 | cut -d: -f1)
+restore_receipt_flush_line=$(grep -nF "could not durably flush restore receipt'" "$restore_script" | cut -d: -f1)
+restore_receipt_commit_line=$(grep -nF "could not durably commit restore receipt digest" "$restore_script" | cut -d: -f1)
+restore_receipt_crash_line=$(grep -nF 'MONDAY_RESTORE_HARD_CRASH_AFTER_RECEIPT' "$restore_script" | cut -d: -f1)
+restore_intent_clear_line=$(grep -nF "could not clear committed restore recovery intent" "$restore_script" | tail -n1 | cut -d: -f1)
+[[ $cutover_intent_flush_line =~ ^[0-9]+$ && $cutover_intent_commit_line =~ ^[0-9]+$ \
+  && $cutover_active_line =~ ^[0-9]+$ && $cutover_active_sync_line =~ ^[0-9]+$ && $cutover_active_crash_line =~ ^[0-9]+$ \
+  && $cutover_transition_flush_line =~ ^[0-9]+$ && $cutover_transition_commit_line =~ ^[0-9]+$ && $cutover_transition_crash_line =~ ^[0-9]+$ \
+  && $cutover_intent_clear_line =~ ^[0-9]+$ && $restore_receipt_flush_line =~ ^[0-9]+$ \
+  && $restore_receipt_commit_line =~ ^[0-9]+$ && $restore_receipt_crash_line =~ ^[0-9]+$ && $restore_intent_clear_line =~ ^[0-9]+$ \
+  && $cutover_intent_flush_line -lt $cutover_intent_commit_line \
+  && $cutover_intent_commit_line -lt $cutover_active_line \
+  && $cutover_active_line -lt $cutover_active_sync_line \
+  && $cutover_active_sync_line -lt $cutover_active_crash_line \
+  && $cutover_transition_flush_line -lt $cutover_transition_commit_line \
+  && $cutover_transition_commit_line -lt $cutover_transition_crash_line \
+  && $cutover_transition_crash_line -lt $cutover_intent_clear_line \
+  && $restore_receipt_flush_line -lt $restore_receipt_commit_line \
+  && $restore_receipt_commit_line -lt $restore_receipt_crash_line \
+  && $restore_receipt_crash_line -lt $restore_intent_clear_line ]] || {
+  printf 'cutover/restore evidence can cross a power-loss boundary before its authority is durable\n' >&2
+  exit 1
+}
 grep -Fqx 'MemoryHigh=1792M' "$SCRIPT_DIR/binance-lob-archiver-rust@.service" || {
   printf 'shadow MemoryHigh is not 1792M\n' >&2
   exit 1
@@ -2022,6 +2059,15 @@ cutover_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   --gate-receipt "$gate2" --gate-sha256 "$gate2_sha" --root "$ROOT")
 transition2=$(printf '%s\n' "$cutover_output" | sed -n 's/^Transition receipt: //p')
 transition2_sha=$(printf '%s\n' "$cutover_output" | sed -n 's/^SHA-256: //p')
+transition2_marker="$transition2.sha256"
+mv -- "$transition2_marker" "$transition2_marker.held"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c2" --root "$ROOT" \
+  >/dev/null 2>&1; then
+  printf 'restore accepted transition evidence without its durable digest\n' >&2
+  exit 1
+fi
+mv -- "$transition2_marker.held" "$transition2_marker"
 rm "$ROOT/opt/monday/bin/binance-lob-archiver"
 MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c2" --root "$ROOT" >/dev/null

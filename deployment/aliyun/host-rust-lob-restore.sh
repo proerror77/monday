@@ -501,18 +501,6 @@ if [[ -e $recovery_intent || -L $recovery_intent ]]; then
   if [[ -n $transition_receipt_ref ]]; then
     [[ $recovery_gate == "$transition_gate" && $recovery_gate_sha == "$transition_gate_sha" ]] \
       || die 'cutover recovery intent differs from the active transition'
-    if [[ -e $active_transition_marker || -L $active_transition_marker ]]; then
-      monday_file_direct "$active_transition_marker" \
-        || die 'active transition digest is indirect'
-      [[ $(monday_file_mode "$active_transition_marker") == 440 ]] \
-        || die 'active transition digest mode is invalid'
-      transition_marker_sha=$(awk '$2 == "transition.json" { count++; value=$1 } END { if (count != 1) exit 1; print value }' \
-        "$active_transition_marker") || die 'active transition digest is malformed'
-      [[ $transition_marker_sha == "$(monday_sha256_file "$active_transition_receipt")" ]] \
-        || die 'active transition digest differs from its receipt'
-    else
-      recovery_transition_marker_repair=true
-    fi
   fi
   recovery_before_binary=$(monday_root_join "$ROOT" \
     "opt/monday/releases/binance-lob-archiver/$recovery_before_payload/binance-lob-archiver")
@@ -527,6 +515,25 @@ if [[ -e $recovery_intent || -L $recovery_intent ]]; then
   recovery_intent_valid=true
 fi
 
+if [[ -n $transition_receipt_ref ]]; then
+  if [[ -e $active_transition_marker || -L $active_transition_marker ]]; then
+    monday_file_direct "$active_transition_marker" \
+      || die 'active transition digest is indirect'
+    [[ $(monday_file_mode "$active_transition_marker") == 440 ]] \
+      || die 'active transition digest mode is invalid'
+    transition_marker_sha=$(awk '$2 == "transition.json" { count++; value=$1 } END { if (count != 1) exit 1; print value }' \
+      "$active_transition_marker") || die 'active transition digest is malformed'
+    [[ $transition_marker_sha == "$(monday_sha256_file "$active_transition_receipt")" ]] \
+      || die 'active transition digest differs from its receipt'
+  elif [[ $recovery_intent_valid == true ]]; then
+    recovery_transition_marker_repair=true
+  else
+    die 'active transition digest is missing without a recovery intent'
+  fi
+elif [[ -e $active_transition_marker || -L $active_transition_marker ]]; then
+  die 'active transition digest exists without its receipt'
+fi
+
 repair_recovery_transition_marker() {
   [[ $recovery_transition_marker_repair == true ]] || return 0
   local marker_tmp="$active_transition_marker.restore.$$" marker_sha
@@ -536,7 +543,9 @@ repair_recovery_transition_marker() {
   marker_sha=$(monday_sha256_file "$active_transition_receipt") || return 1
   printf '%s  transition.json\n' "$marker_sha" >"$marker_tmp" || return 1
   chmod 0440 "$marker_tmp" || return 1
+  sync -f "$marker_tmp" || return 1
   mv -f -- "$marker_tmp" "$active_transition_marker" || return 1
+  sync -f "$(dirname -- "$active_transition_marker")" || return 1
   monday_file_direct "$active_transition_marker" || return 1
   [[ $(monday_file_mode "$active_transition_marker") == 440 ]] || return 1
   [[ $(awk '$2 == "transition.json" { count++; value=$1 } END { if (count != 1) exit 1; print value }' \
@@ -583,8 +592,12 @@ if [[ -e $restore_receipt || -L $restore_receipt || -e $restore_receipt_sha || -
       || die 'restore receipt digest repair path already exists'
     printf '%s  restore.json\n' "$receipt_digest" >"$restore_receipt_sha_tmp"
     chmod 0440 "$restore_receipt_sha_tmp"
+    sync -f "$restore_receipt_sha_tmp" \
+      || die 'could not durably flush repaired restore receipt digest'
     mv -f -- "$restore_receipt_sha_tmp" "$restore_receipt_sha"
     restore_receipt_sha_written=1
+    sync -f "$receipt_root/$CONTROLLER" \
+      || die 'could not durably commit repaired restore receipt digest'
     monday_file_direct "$restore_receipt_sha" \
       || die 'repaired restore receipt digest is not a direct file'
     [[ $(monday_file_mode "$restore_receipt_sha") == 440 \
@@ -926,6 +939,15 @@ if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
   runtime_observed=true
 fi
 
+# Make the repaired pair durable on every persistent filesystem before its
+# success receipt can become the replacement for the recovery intent.
+sync -f "$(monday_root_join "$ROOT" opt/monday)" \
+  || die 'could not durably commit restored /opt projections'
+sync -f "$(monday_root_join "$ROOT" etc/monday)" \
+  || die 'could not durably commit restored runtime projections'
+sync -f "$(monday_root_join "$ROOT" etc/systemd/system)" \
+  || die 'could not durably commit restored systemd projections'
+
 mkdir -p "$receipt_root/$CONTROLLER"; receipt=$restore_receipt
 [[ ! -e $receipt && ! -L $receipt \
   && ! -e $restore_receipt_sha && ! -L $restore_receipt_sha \
@@ -991,10 +1013,14 @@ verify_existing_restore_state "$tmp" "$runtime_observed"
 receipt_sha=$(monday_sha256_file "$tmp")
 printf '%s  restore.json\n' "$receipt_sha" >"$restore_receipt_sha_tmp"
 chmod 0440 "$restore_receipt_sha_tmp"
+sync -f "$tmp" || die 'could not durably flush restore receipt'
+sync -f "$restore_receipt_sha_tmp" || die 'could not durably flush restore receipt digest'
 mv -f -- "$tmp" "$receipt"
 restore_receipt_written=1
+sync -f "$receipt_root/$CONTROLLER" || die 'could not durably commit restore receipt'
 mv -f -- "$restore_receipt_sha_tmp" "$restore_receipt_sha"
 restore_receipt_sha_written=1
+sync -f "$receipt_root/$CONTROLLER" || die 'could not durably commit restore receipt digest'
 monday_file_direct "$receipt" || die 'committed restore receipt is not a direct file'
 monday_file_direct "$restore_receipt_sha" || die 'committed restore receipt digest is not a direct file'
 [[ $(monday_file_mode "$receipt") == 440 && $(monday_file_mode "$restore_receipt_sha") == 440 ]] \
