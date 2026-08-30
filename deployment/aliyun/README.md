@@ -1051,7 +1051,7 @@ that run's spool and cannot block the next Gate; files already uploaded and
 cleaned retain their OSS triplet evidence instead of a duplicate local copy.
 The Gate's 120-second run-scoped cadence does not alter the signed production
 environment; production cadence is verified independently after cutover.
-The production lanes share the signed aggregate slice
+After Cutover, the production lanes share the signed aggregate slice
 `system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice` with a 3072MiB
 high watermark and 3584MiB hard limit; each production child remains bounded
 at 2048MiB/2560MiB. Gate Shadow workers use a run-scoped aggregate slice and
@@ -1062,12 +1062,15 @@ Five immutable passed Tokyo gates measured Spot at no more than 664,735,744 byte
 and the former 570-symbol USD-M scope at no more than 1,789,218,816 bytes; the
 current USD-M Gate covers only the frozen Top 100. Strict readback uses the
 same 1280MiB/1536MiB worker envelope and candidate upload drain uses a
-384MiB/512MiB envelope. Before the Gate and before every actual phase, it reads `MemAvailable` together with
-the production template's automatically assigned `Slice` and cgroup. Spot and
-USD-M must share one slice; the parent control group is `/system.slice/<Slice>`
-and their two cgroups must be direct children of it. The parent `cgroup.procs`
-must be empty, the active child set must be exactly those two services, and both
-systemd `MemoryMax` and child `memory.max` must be exactly 2,560MiB. The snapshot records parent
+384MiB/512MiB envelope. Before the Gate and before every actual phase, it reads
+`MemAvailable` together with the production template's automatically assigned
+`Slice` and cgroup. Spot and USD-M must share one slice; the parent control
+group is `/system.slice/<Slice>` and their two cgroups must be direct children
+of it. The parent `cgroup.procs` must be empty, the active child set must be
+exactly those two services, and both systemd `MemoryMax` and child `memory.max`
+must be exactly 2,560MiB. A stable V2 Gate also requires the active signed
+aggregate limits. The one direct v1-to-V2 bootstrap instead records the legacy
+aggregate as `legacy-unlimited`; it never changes that live slice. The snapshot records parent
 `memory.current`, `memory.peak`, `memory.stat` (`anon` and `file`), and
 `memory.events`, plus PID/executable hash and `NRestarts`; PID and restart
 changes alone are audit-only, while a five-second monitor fails closed on any
@@ -1079,7 +1082,7 @@ and events remain audit evidence. The required bytes are exactly:
 
 ```text
 host reserve (1GiB) + phase memory budget +
-(production slice MemoryMax - parent memory.stat anon)
+(candidate production slice MemoryMax - parent memory.stat anon)
 ```
 
 Active production usage is already reflected in `MemAvailable`; no static
@@ -1090,11 +1093,11 @@ values and the production cgroup snapshot; `MemoryPeak` is audit-only, while
 `memory.events` must show no new `oom` or `oom_kill` counter. An over-limit or
 malformed phase fails closed instead of increasing the host size or weakening
 the reserve.
-The first direct bootstrap may take a narrowly scoped runtime lease when the
-legacy slice is still unlimited; the prior limits are recorded in the Gate
-receipt and restored (including on abnormal exit) before the receipt can pass.
-Cutover, restore, and readback each re-check the permanent slice and both child
-unit memberships before claiming a successful pair.
+The direct bootstrap Gate records the unlimited legacy slice and the signed
+candidate limit separately. Cutover installs the signed slice, clears any
+legacy runtime override, and verifies it before either candidate lane starts;
+restore and readback re-check the permanent slice and both child memberships
+before claiming a successful pair.
 `io_full_psi_windows` records one advisory PSI snapshot for each of the nine
 resource phases. PSI never authorizes or denies a Gate and cannot terminate a
 candidate; memory reserve, OOM counters, and exact identity remain the

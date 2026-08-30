@@ -1206,11 +1206,14 @@ monday_shadow_memory_admission() {
 # may pass either a regular JSON file or the JSON document itself.  This is a
 # pure check: it never reads systemd or mutates host state.  The host script
 # supplies the active-child set from the parent cgroup, so an extra direct
-# child, a non-direct child path, or a changed limit/identity is rejected
-# before a phase can start.
+# child, a non-direct child path, or a changed identity is rejected before a
+# phase can start. Stable mode requires the signed aggregate envelope; direct
+# bootstrap instead records the legacy unlimited slice until Cutover installs
+# the signed candidate asset.
 monday_validate_lob_production_snapshot() {
-  [[ $# -eq 1 ]] || return 2
-  local source=$1
+  [[ $# -ge 1 && $# -le 2 ]] || return 2
+  local source=$1 expected_mode=${2:-stable}
+  [[ $expected_mode == stable || $expected_mode == direct ]] || return 2
   # shellcheck disable=SC2016 # jq filter is intentionally passed literally.
   local filter='.
     as $root
@@ -1242,12 +1245,23 @@ monday_validate_lob_production_snapshot() {
     ))
     and (([.children.spot.control_group, .children.usdm.control_group] | sort)
       == (.active_child_control_groups | sort))
-    and (.production_slice_memory_high_bytes | type == "number" and floor == . and . == 3221225472)
-    and (.production_slice_memory_max_bytes | type == "number" and floor == . and . == 3758096384)
-    and (.systemd_production_slice_memory_high_bytes | type == "number" and floor == . and . == 3221225472)
-    and (.systemd_production_slice_memory_max_bytes | type == "number" and floor == . and . == 3758096384)
-    and (.production_slice_memory_high_bytes == .systemd_production_slice_memory_high_bytes)
-    and (.production_slice_memory_max_bytes == .systemd_production_slice_memory_max_bytes)
+    and (.production_envelope_state
+      == (if $expected_mode == "direct" then "legacy-unlimited" else "signed" end))
+    and (.target_production_slice_memory_high_bytes | type == "number" and floor == . and . == 3221225472)
+    and (.target_production_slice_memory_max_bytes | type == "number" and floor == . and . == 3758096384)
+    and (if $expected_mode == "direct" then
+      .production_slice_memory_high_bytes == null
+      and .production_slice_memory_max_bytes == null
+      and .systemd_production_slice_memory_high_bytes == null
+      and .systemd_production_slice_memory_max_bytes == null
+    else
+      (.production_slice_memory_high_bytes | type == "number" and floor == . and . == 3221225472)
+      and (.production_slice_memory_max_bytes | type == "number" and floor == . and . == 3758096384)
+      and (.systemd_production_slice_memory_high_bytes | type == "number" and floor == . and . == 3221225472)
+      and (.systemd_production_slice_memory_max_bytes | type == "number" and floor == . and . == 3758096384)
+      and (.production_slice_memory_high_bytes == .systemd_production_slice_memory_high_bytes)
+      and (.production_slice_memory_max_bytes == .systemd_production_slice_memory_max_bytes)
+    end)
     and (.parent_memory_current_bytes | type == "number" and floor == . and . >= 0)
     and (.parent_memory_peak_bytes | type == "number" and floor == . and . >= 0)
     and (.parent_memory_anon_bytes | type == "number" and floor == . and . >= 0)
@@ -1257,15 +1271,15 @@ monday_validate_lob_production_snapshot() {
       and (.file | type == "number" and floor == . and . == $root.parent_memory_file_bytes))
     and (.child_memory_max_sum_bytes | type == "number" and floor == .
       and . == 5368709120)
-    and (.parent_memory_anon_bytes <= .production_slice_memory_max_bytes)
+    and (.parent_memory_anon_bytes <= .target_production_slice_memory_max_bytes)
     and (.parent_memory_current_bytes <= .child_memory_max_sum_bytes)
     and (.parent_memory_events | type == "object"
       and all(.[]; type == "number" and floor == . and . >= 0))
   '
   if [[ -f $source && ! -L $source ]]; then
-    jq -e "$filter" "$source" >/dev/null
+    jq -e --arg expected_mode "$expected_mode" "$filter" "$source" >/dev/null
   else
-    printf '%s\n' "$source" | jq -e "$filter" >/dev/null
+    printf '%s\n' "$source" | jq -e --arg expected_mode "$expected_mode" "$filter" >/dev/null
   fi
 }
 
@@ -1278,8 +1292,10 @@ monday_lob_production_snapshot_identity() {
   local source=$1
   local filter='.
     | {slice,parent_control_group,parent_cgroup_procs,active_child_control_groups,
+      production_envelope_state,
       production_slice_memory_high_bytes,production_slice_memory_max_bytes,
       systemd_production_slice_memory_high_bytes,systemd_production_slice_memory_max_bytes,
+      target_production_slice_memory_high_bytes,target_production_slice_memory_max_bytes,
       children: (.children | with_entries(.value |= {
         market,slice,control_group,process_exe_sha256,active,
         systemd_memory_max_bytes,memory_max_bytes
@@ -1536,7 +1552,7 @@ monday_validate_v2_gate() {
             and .key == "system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice"
             and .value == null));
       . as $root |
-      .schema == "monday.rust_lob_shadow_gate.v6"
+      .schema == "monday.rust_lob_shadow_gate.v7"
       and .control_plane_version == 2
       and .passed == true
       and (.production_eligible | type == "boolean")
@@ -1651,12 +1667,23 @@ monday_validate_v2_gate() {
       and (.production_memory | . as $pm
         | (type == "object"
         and (.slice | valid_lob_slice)
-        and (.production_slice_memory_high_bytes | type == "number" and floor == . and . == 3221225472)
-        and (.production_slice_memory_max_bytes | type == "number" and floor == . and . == 3758096384)
-        and (.systemd_production_slice_memory_high_bytes | type == "number" and floor == . and . == 3221225472)
-        and (.systemd_production_slice_memory_max_bytes | type == "number" and floor == . and . == 3758096384)
-        and (.production_slice_memory_high_bytes == .systemd_production_slice_memory_high_bytes)
-        and (.production_slice_memory_max_bytes == .systemd_production_slice_memory_max_bytes)
+        and (.production_envelope_state
+          == (if $root.source_mode == "direct" then "legacy-unlimited" else "signed" end))
+        and (.target_production_slice_memory_high_bytes | type == "number" and floor == . and . == 3221225472)
+        and (.target_production_slice_memory_max_bytes | type == "number" and floor == . and . == 3758096384)
+        and (if $root.source_mode == "direct" then
+          .production_slice_memory_high_bytes == null
+          and .production_slice_memory_max_bytes == null
+          and .systemd_production_slice_memory_high_bytes == null
+          and .systemd_production_slice_memory_max_bytes == null
+        else
+          (.production_slice_memory_high_bytes | type == "number" and floor == . and . == 3221225472)
+          and (.production_slice_memory_max_bytes | type == "number" and floor == . and . == 3758096384)
+          and (.systemd_production_slice_memory_high_bytes | type == "number" and floor == . and . == 3221225472)
+          and (.systemd_production_slice_memory_max_bytes | type == "number" and floor == . and . == 3758096384)
+          and (.production_slice_memory_high_bytes == .systemd_production_slice_memory_high_bytes)
+          and (.production_slice_memory_max_bytes == .systemd_production_slice_memory_max_bytes)
+        end)
         and (.parent_control_group | valid_lob_cgroup_path
           and test("^/system[.]slice/system-binance\\\\x2dlob\\\\x2darchiver\\\\x2dproduction[.]slice$")
           and . == ("/system.slice/" + $pm.slice)
@@ -1689,7 +1716,7 @@ monday_validate_v2_gate() {
           and (.anon | type == "number" and floor == . and . == $pm.parent_memory_anon_bytes)
           and (.file | type == "number" and floor == . and . == $pm.parent_memory_file_bytes))
         and (.child_memory_max_sum_bytes | type == "number" and floor == . and . == 5368709120)
-        and (.parent_memory_anon_bytes <= .production_slice_memory_max_bytes)
+        and (.parent_memory_anon_bytes <= .target_production_slice_memory_max_bytes)
         and (.parent_memory_current_bytes <= .child_memory_max_sum_bytes)
         and (.parent_memory_events | type == "object"
           and all(.[]; type == "number" and floor == . and . >= 0))))
@@ -1714,12 +1741,14 @@ monday_validate_v2_gate() {
             and (.production_parent_memory_current_bytes | type == "number" and floor == . and . >= 0)
             and (.production_parent_memory_anon_bytes | type == "number" and floor == . and . >= 0)
             and (.production_parent_memory_file_bytes | type == "number" and floor == . and . >= 0)
-            and (.production_slice_memory_max_bytes | type == "number" and floor == . and . == 3758096384)
+            and (.production_slice_memory_max_bytes
+              == (if $root.source_mode == "direct" then null else 3758096384 end))
+            and (.target_production_slice_memory_max_bytes | type == "number" and floor == . and . == 3758096384)
             and (.production_child_memory_max_sum_bytes | type == "number" and floor == . and . == 5368709120)
-            and (.production_parent_memory_anon_bytes <= .production_slice_memory_max_bytes)
+            and (.production_parent_memory_anon_bytes <= .target_production_slice_memory_max_bytes)
             and (.production_parent_memory_current_bytes <= .production_child_memory_max_sum_bytes)
             and (.production_memory_growth_bytes | type == "number" and floor == .
-              and . == ($r.production_slice_memory_max_bytes - $r.production_parent_memory_anon_bytes))
+              and . == ($r.target_production_slice_memory_max_bytes - $r.production_parent_memory_anon_bytes))
             and (.production_unallocated_bytes | type == "number" and floor == .
               and . == $r.production_memory_growth_bytes)
             and ($r.required_bytes | type == "number"

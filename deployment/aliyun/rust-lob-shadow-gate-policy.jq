@@ -113,7 +113,7 @@ def valid_production_asset_map($keys; $source_mode):
     "binance-lob-archiver-rust-spot.env",
     "binance-lob-archiver-rust-usdm.env"
   ] | sort) as $shadow_asset_keys
-| $root.schema == "monday.rust_lob_shadow_gate.v6"
+| $root.schema == "monday.rust_lob_shadow_gate.v7"
 and .control_plane_version == 2
 and .passed == true
 and (.production_eligible | type == "boolean")
@@ -229,12 +229,23 @@ and (.production_process | type == "object"
 and (.production_memory | . as $pm
   | (type == "object"
   and (.slice | valid_lob_slice)
-  and (.production_slice_memory_high_bytes | type == "number" and floor == . and . == 3221225472)
-  and (.production_slice_memory_max_bytes | type == "number" and floor == . and . == 3758096384)
-  and (.systemd_production_slice_memory_high_bytes | type == "number" and floor == . and . == 3221225472)
-  and (.systemd_production_slice_memory_max_bytes | type == "number" and floor == . and . == 3758096384)
-  and (.production_slice_memory_high_bytes == .systemd_production_slice_memory_high_bytes)
-  and (.production_slice_memory_max_bytes == .systemd_production_slice_memory_max_bytes)
+  and (.production_envelope_state
+    == (if $root.source_mode == "direct" then "legacy-unlimited" else "signed" end))
+  and (.target_production_slice_memory_high_bytes | type == "number" and floor == . and . == 3221225472)
+  and (.target_production_slice_memory_max_bytes | type == "number" and floor == . and . == 3758096384)
+  and (if $root.source_mode == "direct" then
+    .production_slice_memory_high_bytes == null
+    and .production_slice_memory_max_bytes == null
+    and .systemd_production_slice_memory_high_bytes == null
+    and .systemd_production_slice_memory_max_bytes == null
+  else
+    (.production_slice_memory_high_bytes | type == "number" and floor == . and . == 3221225472)
+    and (.production_slice_memory_max_bytes | type == "number" and floor == . and . == 3758096384)
+    and (.systemd_production_slice_memory_high_bytes | type == "number" and floor == . and . == 3221225472)
+    and (.systemd_production_slice_memory_max_bytes | type == "number" and floor == . and . == 3758096384)
+    and (.production_slice_memory_high_bytes == .systemd_production_slice_memory_high_bytes)
+    and (.production_slice_memory_max_bytes == .systemd_production_slice_memory_max_bytes)
+  end)
   and (.parent_control_group | valid_lob_cgroup_path
     and test("^/system[.]slice/system-binance\\\\x2dlob\\\\x2darchiver\\\\x2dproduction[.]slice$")
     and . == ("/system.slice/" + $pm.slice)
@@ -268,7 +279,7 @@ and (.production_memory | . as $pm
     and (.anon | type == "number" and floor == . and . == $pm.parent_memory_anon_bytes)
     and (.file | type == "number" and floor == . and . == $pm.parent_memory_file_bytes))
   and (.child_memory_max_sum_bytes | type == "number" and floor == . and . == 5368709120)
-  and (.parent_memory_anon_bytes <= .production_slice_memory_max_bytes)
+  and (.parent_memory_anon_bytes <= .target_production_slice_memory_max_bytes)
   and (.parent_memory_current_bytes <= .child_memory_max_sum_bytes)
   and (.parent_memory_events | type == "object"
     and all(.[]; type == "number" and floor == . and . >= 0))))
@@ -293,12 +304,14 @@ and (.resource_admission | type == "array" and length == 9
       and (.production_parent_memory_current_bytes | type == "number" and floor == . and . >= 0)
       and (.production_parent_memory_anon_bytes | type == "number" and floor == . and . >= 0)
       and (.production_parent_memory_file_bytes | type == "number" and floor == . and . >= 0)
-      and (.production_slice_memory_max_bytes | type == "number" and floor == . and . == 3758096384)
+      and (.production_slice_memory_max_bytes
+        == (if $root.source_mode == "direct" then null else 3758096384 end))
+      and (.target_production_slice_memory_max_bytes | type == "number" and floor == . and . == 3758096384)
       and (.production_child_memory_max_sum_bytes | type == "number" and floor == . and . == 5368709120)
-      and (.production_parent_memory_anon_bytes <= .production_slice_memory_max_bytes)
+      and (.production_parent_memory_anon_bytes <= .target_production_slice_memory_max_bytes)
       and (.production_parent_memory_current_bytes <= .production_child_memory_max_sum_bytes)
       and (.production_memory_growth_bytes | type == "number" and floor == .
-        and . == ($r.production_slice_memory_max_bytes - $r.production_parent_memory_anon_bytes))
+        and . == ($r.target_production_slice_memory_max_bytes - $r.production_parent_memory_anon_bytes))
       and (.production_unallocated_bytes | type == "number" and floor == .
         and . == $r.production_memory_growth_bytes)
       and ($r.required_bytes | type == "number"
