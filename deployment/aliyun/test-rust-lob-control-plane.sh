@@ -153,7 +153,20 @@ production_usdm_segment_seconds=$(sed -n 's/^SEGMENT_SECONDS=//p' \
 gate_observation_source=$(sed -n '/^run_market_gate_phase()/,/^}/p' \
   "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh")
 grep -Fq "observation_started_ns=\$(monotonic_nanoseconds)" <<<"$gate_observation_source"
-grep -Fq "observation_finished_ns=\$(monotonic_nanoseconds)" <<<"$gate_observation_source"
+iteration_started_line=$(grep -Fn "observation_iteration_started_ns=\$(monotonic_nanoseconds)" \
+  <<<"$gate_observation_source" | cut -d: -f1)
+deadline_line=$(grep -Fn 'if (( observation_iteration_started_ns >= observation_deadline_ns )); then' \
+  <<<"$gate_observation_source" | cut -d: -f1)
+validation_line=$(grep -Fn "validate_observation_sample \"\$market\"" \
+  <<<"$gate_observation_source" | cut -d: -f1)
+evidence_line=$(grep -Fn "if clean_segment_pair_ready \"\$market\"; then" \
+  <<<"$gate_observation_source" | cut -d: -f1)
+(( iteration_started_line < deadline_line && deadline_line < evidence_line \
+  && evidence_line < validation_line ))
+grep -Fq "observation_finished_ns=\$observation_iteration_started_ns" \
+  <<<"$gate_observation_source"
+grep -Fq "write_run_json || die 'could not commit deadline failure run evidence'" \
+  <<<"$gate_observation_source"
 
 # Resource Envelope V2 reserves the production slice's unallocated aggregate
 # cap from parent memory.stat anon.  File cache and memory.current remain audit
@@ -1253,6 +1266,56 @@ jq -e 'all(.markets[]; . as $market
   | all(.segments[]; .end_received_at_ns > $market.observation_started_at_ns)
   and all(.triplets[]; .end_received_at_ns > $market.observation_started_at_ns))' \
   "$preobservation_gate" >/dev/null
+
+# A sample that starts inside the evidence window may finish validation after
+# the deadline.  The sample start remains the receipt cutoff; no later sample
+# is authorised.
+cross_deadline_gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 \
+  MONDAY_GATE_FIXTURE_CROSS_EVIDENCE_DEADLINE=1 \
+  MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=1 MONDAY_GATE_TEST_SECONDS=1 \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
+  --from-controller direct --candidate-controller "$c0" --root "$ROOT")
+cross_deadline_gate=$(printf '%s\n' "$cross_deadline_gate_output" \
+  | sed -n 's/^V2 Gate receipt: //p')
+cross_deadline_gate_sha=$(printf '%s\n' "$cross_deadline_gate_output" \
+  | sed -n 's/^SHA-256: //p')
+cross_deadline_run="$(dirname -- "$cross_deadline_gate")/run.json"
+monday_validate_v2_gate "$cross_deadline_gate" direct "$c0" "$cross_deadline_gate_sha"
+jq -e '
+  .evidence_timeout_seconds == 1
+  and all(.markets[];
+    .observed_runtime_seconds >= 0 and .observed_runtime_seconds <= 1
+    and .observation_finished_monotonic_ns >= .observation_started_monotonic_ns)' \
+  "$cross_deadline_run" >/dev/null
+
+# A new iteration may not start at or after the deadline.  Persist the partial
+# observation window before failing so the non-authoritative run evidence is
+# still truthful.
+deadline_failure_output="$ROOT/run/evidence-deadline-failure.err"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_SINGLE_CLEAN_SEGMENT=1 \
+  MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=1 MONDAY_GATE_TEST_SECONDS=1 \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
+  --from-controller direct --candidate-controller "$c0" --root "$ROOT" \
+  >"$deadline_failure_output" 2>&1; then
+  printf 'Gate started a new observation sample after the evidence deadline\n' >&2
+  exit 1
+fi
+grep -Fq 'did not produce two adjacent clean segments before the evidence deadline' \
+  "$deadline_failure_output"
+deadline_run_json=$(find "$ROOT/data/monday/evidence/shadow-gates/$c0" \
+  -type f -name run.json -print | while IFS= read -r candidate; do
+    if jq -e '.evidence_timeout_seconds == 1
+      and .markets.spot != null and .markets.usdm == null' \
+      "$candidate" >/dev/null; then
+      printf '%s\n' "$candidate"
+    fi
+  done)
+[[ $(printf '%s\n' "$deadline_run_json" | awk 'NF { count++ } END { print count + 0 }') == 1 ]]
+jq -e '
+  .markets.spot.observed_runtime_seconds >= .evidence_timeout_seconds
+  and .markets.spot.observation_finished_monotonic_ns
+    >= .markets.spot.observation_started_monotonic_ns
+  and .markets.usdm == null' "$deadline_run_json" >/dev/null
 
 # Time alone never passes the Gate: one clean segment is insufficient.
 if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_SINGLE_CLEAN_SEGMENT=1 \

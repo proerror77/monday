@@ -2083,6 +2083,7 @@ validate_observation_sample() {
   if [[ $TEST_ONLY == true ]]; then
     last_health_updated_ns[$market]=$updated_ns
     last_health_advance_mono[$market]=$current_mono
+    [[ ${MONDAY_GATE_FIXTURE_CROSS_EVIDENCE_DEADLINE:-0} != 1 ]] || sleep 2
     return 0
   fi
   local next_updated next_mono next_gap increment
@@ -2211,7 +2212,7 @@ verify_segments() {
   phase_segments["$market"]=$count
 }
 run_market_gate_phase() {
-  local market=$1 settle observation_deadline_ns observation_finished_ns observation_started_ns pid started_ns readiness
+  local market=$1 settle observation_deadline_ns observation_finished_ns observation_iteration_started_ns observation_started_ns pid started_ns readiness
   resource_monitor_start "shadow-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; fixture_seed_market "$market"; systemctl reset-failed "${unit[$market]}" >/dev/null 2>&1 || true
   started_ns=$(date +%s%N); market_gate_started_ns[$market]=$started_ns
   systemctl start "${unit[$market]}"; pid=$(shadow_identity_wait "$market"); phase_pid["$market"]=$pid; phase_exe_sha["$market"]=$candidate_payload
@@ -2221,28 +2222,38 @@ run_market_gate_phase() {
   settle=$(( $(monotonic_seconds) + HEALTH_SETTLE_DURATION_SECONDS )); while ! health_ok "$market"; do (( $(monotonic_seconds) < settle )) || die "$market health did not settle"; [[ $(systemctl_value "$market" NRestarts) == 0 ]] || die "$market restarted while settling"; [[ $(systemctl_value "$market" MainPID) == "$pid" ]] || die "$market MainPID changed while settling"; assert_host_memory_reserve; sleep 1; done
   phase_session["$market"]=$(jq -er '.session_id' "${spool_dir[$market]}/health.json"); frozen_symbol_count[$market]=$(jq -er '.symbol_count' "${spool_dir[$market]}/health.json"); frozen_catalog_sha256[$market]=$(health_catalog_sha256 "$market"); initial_upload_failure_count[$market]=$(jq -er '.upload_failure_count' "${spool_dir[$market]}/health.json"); last_health_updated_ns[$market]=$(jq -er '.updated_at_ns' "${spool_dir[$market]}/health.json"); last_health_advance_mono[$market]=$(monotonic_seconds); max_health_silence_seconds[$market]=0; health_samples[$market]=1; market_observation_started_ns[$market]=$(date +%s%N); fixture_seed_market_segments "$market"
   observation_started_ns=$(monotonic_nanoseconds)
+  market_observation_started_mono_ns[$market]=$observation_started_ns
   observation_deadline_ns=$(( observation_started_ns + GATE_EVIDENCE_TIMEOUT_SECONDS * 1000000000 ))
   while :; do
+    observation_iteration_started_ns=$(monotonic_nanoseconds)
+    if (( observation_iteration_started_ns >= observation_deadline_ns )); then
+      market_observation_finished_mono_ns[$market]=$observation_iteration_started_ns
+      phase_runtime[$market]=$(( (observation_iteration_started_ns - observation_started_ns) / 1000000000 ))
+      write_run_json || die 'could not commit deadline failure run evidence'
+      die "$market did not produce two adjacent clean segments before the evidence deadline"
+    fi
+    if clean_segment_pair_ready "$market"; then
+      readiness=0
+    else
+      readiness=$?
+      (( readiness == 1 )) || die "$market segment evidence is malformed"
+    fi
     validate_observation_sample "$market"
     assert_host_memory_reserve
     [[ $(systemctl_value "$market" NRestarts) == 0 ]] || die "$market restarted"
     [[ $(systemctl_value "$market" MainPID) == "$pid" ]] || die "$market MainPID changed"
-    (( $(monotonic_nanoseconds) < observation_deadline_ns )) \
-      || die "$market did not produce two adjacent clean segments before the evidence deadline"
-    if health_ok "$market"; then
-      if clean_segment_pair_ready "$market"; then
-        break
-      else
-        readiness=$?
-        (( readiness == 1 )) || die "$market segment evidence is malformed"
-      fi
+    if health_ok "$market" && (( readiness == 0 )); then break; fi
+    if [[ $TEST_ONLY == true ]]; then
+      [[ ${MONDAY_ALLOW_SHORT_GATE_FOR_TESTS:-0} == 1 ]] \
+        || die "$market fixture did not produce two adjacent clean segments"
+      sleep 1
+    else
+      sleep 15
     fi
-    [[ $TEST_ONLY == false ]] \
-      || die "$market fixture did not produce two adjacent clean segments"
-    sleep 15
   done
-  observation_finished_ns=$(monotonic_nanoseconds)
-  market_observation_started_mono_ns[$market]=$observation_started_ns
+  # The final sample starts inside the evidence window.  Its validation may
+  # finish later, but cannot extend the observed window or authorize another sample.
+  observation_finished_ns=$observation_iteration_started_ns
   market_observation_finished_mono_ns[$market]=$observation_finished_ns
   phase_runtime["$market"]=$(( (observation_finished_ns - observation_started_ns) / 1000000000 ))
   phase_health_json[$market]=$(jq -cn --arg sha "$(sha256_file "${spool_dir[$market]}/health.json")" \
