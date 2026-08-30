@@ -1521,6 +1521,15 @@ if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_TAMPER_OSS=1 MONDAY_ROOT="$RO
 fi
 [[ $(monday_active_controller_sha "$ROOT") == "$active_before_failure" ]]
 [[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == "$production_before_failure" ]]
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_TRAILING_UNSAFE=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c1" \
+  --candidate-controller "$c2" --root "$ROOT" >"$ROOT/run/trailing-unsafe.err" 2>&1; then
+  printf 'Gate accepted a trailing replay-unsafe OSS manifest\n' >&2
+  exit 1
+fi
+grep -Fq 'replay-safe manifest ordering failed' "$ROOT/run/trailing-unsafe.err"
+[[ $(monday_active_controller_sha "$ROOT") == "$active_before_failure" ]]
+[[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == "$production_before_failure" ]]
 if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_EXTRA_NESTED=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c1" \
   --candidate-controller "$c2" --root "$ROOT" >/dev/null 2>&1; then

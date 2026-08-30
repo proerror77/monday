@@ -1747,7 +1747,9 @@ fixture_seed_market() {
   jq -cn --arg market "$market" --arg dataset "${dataset[$market]}" --arg session "fixture-$run_id-$market" --argjson updated "$((now * 1000000000))" '{market:$market,dataset:$dataset,updated_at_ns:$updated,status:"synced",sequence_gaps:0,symbol_count:1,symbols:{FIXTURE:{}},snapshot_ready_count:1,bridged_count:1,stream_coverage_verified_count:1,snapshot_only_symbols:[],all_symbols_bridged:true,all_stream_coverage_verified:true,full_stream_coverage_verified:true,queue_saturated:false,disk_warning:false,upload_warning:false,upload_failure_count:0,session_id:$session}' >"$dir/health.json"
 }
 fixture_seed_segment() {
-  local market=$1 start=$2 end=$3 boundary=$4 dir="${spool_dir[$1]}" file data_sha
+  local market=$1 start=$2 end=$3 boundary=$4 replay_safe=${5:-true} gaps=0
+  local dir="${spool_dir[$1]}" file data_sha
+  [[ $replay_safe == true ]] || gaps=1
   file="part-$start.jsonl"
   printf '{"schema":"binance.market_tape.v2","type":"session_start"}\n' >"$dir/$file"
   zstd -q -f "$dir/$file" -o "$dir/$file.zst"
@@ -1755,12 +1757,13 @@ fixture_seed_segment() {
   jq -cn --arg market "$market" --arg dataset "${dataset[$market]}" --arg file "$file" \
     --arg sha "$data_sha" --arg session "fixture-$run_id-$market" \
     --argjson start "$start" --argjson end "$end" --argjson boundary "$boundary" \
+    --argjson replay_safe "$replay_safe" --argjson gaps "$gaps" \
     '{schema:"binance.market_tape.v2",market:$market,dataset:$dataset,shard_id:"all",
       start_received_at_ns:$start,end_received_at_ns:$end,file:$file,sha256:$sha,
       symbols:["FIXTURE"],stream_types:["depth@100ms"],
       event_types:{agg_trade:0,raw_trade:0,book_ticker:0,force_order:0},
-      has_replay_safe_checkpoint:true,
-      lob_continuity:{sequence_gaps:0,reconnect_boundary:$boundary,capture_session_id:$session}}' \
+      has_replay_safe_checkpoint:$replay_safe,
+      lob_continuity:{sequence_gaps:$gaps,reconnect_boundary:$boundary,capture_session_id:$session}}' \
     >"$dir/$file.manifest.json"
   printf '%s\n' "$data_sha" >"$dir/$file._SUCCESS"
 }
@@ -1779,6 +1782,9 @@ fixture_seed_market_segments() {
     start=$((cutoff + i * 1000)); end=$((start + 900))
     fixture_seed_segment "$market" "$start" "$end" "$boundary"
   done
+  if [[ ${MONDAY_GATE_FIXTURE_TRAILING_UNSAFE:-0} == 1 ]]; then
+    fixture_seed_segment "$market" "$((cutoff + 2500))" "$((cutoff + 3500))" false false
+  fi
 }
 render_shadow_unit() {
   local market=$1 source_unit source_upload source_env rendered_unit rendered_upload rendered_env spool canonical_upload
@@ -2273,7 +2279,7 @@ run_oss() {
 verify_oss_roundtrips() {
   local market=$1 readback="$tmp_dir/oss-$1" listing="$tmp_dir/oss-$1.list" uri manifest final_manifest data success expected_success file digest manifest_digest success_digest line token triplet_json observed_at observed_cutoff_ns
   local expected_bucket manifest_name object_prefix data_uri success_uri expected_file
-  local candidates_file unsafe_file interval state manifest_index=0
+  local candidates_file unsafe_file interval state manifest_index=0 pair_selected=false
   resource_monitor_start "oss-readback-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"
   observed_cutoff_ns=$(date +%s%N)
   [[ $observed_cutoff_ns =~ ^[0-9]+$ ]] || die "$market OSS observation clock is unavailable"
@@ -2348,11 +2354,13 @@ verify_oss_roundtrips() {
       "$manifest" >/dev/null || die "$market OSS manifest filename is invalid"
     case $state in
       boundary)
+        [[ $pair_selected == false ]] || continue
         previous_end=0; count=0; roundtrip_records=(); phase_triplets_json[$market]='[]'
         continue
         ;;
       unsafe)
         printf '%s\t%s\t%s\n' "$start" "$end" "$uri" >>"$unsafe_file"
+        [[ $pair_selected == false ]] || continue
         previous_end=0; count=0; roundtrip_records=(); phase_triplets_json[$market]='[]'
         continue
         ;;
@@ -2360,6 +2368,7 @@ verify_oss_roundtrips() {
       *) die "$market OSS manifest classification is invalid" ;;
     esac
     printf '%s\t%s\t%s\n' "$start" "$end" "$uri" >>"$candidates_file"
+    [[ $pair_selected == false ]] || continue
     if (( previous_end > 0 )); then
       (( start >= previous_end )) || die "$market OSS segments overlap"
       if (( start - previous_end > MAX_SEGMENT_GAP_NS )); then
@@ -2402,9 +2411,10 @@ verify_oss_roundtrips() {
       --argjson value "$triplet_json" '$values + [$value]')
     roundtrip_records+=("$data" "$digest" "$manifest_digest")
     count=$((count + 1))
-    (( count >= 2 )) && break
+    (( count < 2 )) || pair_selected=true
   done <"$readback/manifest-uris"
-  ((count == 2)) || die "$market OSS readback has fewer than two adjacent clean triplets"
+  [[ $pair_selected == true && $count -eq 2 ]] \
+    || die "$market OSS readback has fewer than two adjacent clean triplets"
   monday_validate_replay_safe_manifest_order "$market" "$candidates_file" "$unsafe_file" \
     || die "$market replay-safe manifest ordering failed"
   jq -e -n --argjson segments "${phase_segments_json[$market]}" \
