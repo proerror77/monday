@@ -729,8 +729,7 @@ if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
     || die 'could not snapshot canonical writer states'
 fi
 for market in spot usdm; do
-  env_file=$(monday_runtime_asset_target "$ROOT" "binance-lob-archiver-production-$market.env") \
-    || die "production environment path is invalid: $market"
+  env_file="$release/deployment/binance-lob-archiver-production-$market.env"
   spool=$(sed -n 's/^SPOOL_DIR=//p' "$env_file" | head -n1)
   [[ $spool == "/data/monday/spool/binance-lob/$market" ]] \
     || die "production spool is not canonical: $market"

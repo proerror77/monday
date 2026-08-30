@@ -581,11 +581,22 @@ runtime_delta_envs=(
   "$ROOT/etc/monday/binance-lob-archiver-rust-spot.env"
   "$ROOT/etc/monday/binance-lob-archiver-rust-usdm.env"
 )
+write_legacy_runtime_delta() {
+  local source=$1 target=$2
+  case ${target##*/} in
+    binance-lob-archiver-production-spot.env)
+      sed -e 's/^SEGMENT_SECONDS=.*/SEGMENT_SECONDS=3600/' \
+        -e 's|^SPOOL_DIR=.*|SPOOL_DIR=/data/monday/spool/binance-lob-v1/spot|' "$source" >"$target" ;;
+    binance-lob-archiver-production-usdm.env)
+      sed -e 's/^SEGMENT_SECONDS=.*/SEGMENT_SECONDS=3600/' \
+        -e 's|^SPOOL_DIR=.*|SPOOL_DIR=/data/monday/spool/binance-lob-v1/usdm|' "$source" >"$target" ;;
+    *) sed 's/^SEGMENT_SECONDS=.*/SEGMENT_SECONDS=3600/' "$source" >"$target" ;;
+  esac
+}
 for runtime_env in "${runtime_delta_envs[@]}"; do
   cp -p -- "$runtime_env" "$runtime_env.before-direct-delta"
   chmod u+w "$runtime_env"
-  sed 's/^SEGMENT_SECONDS=.*/SEGMENT_SECONDS=3600/' \
-    "$runtime_env.before-direct-delta" >"$runtime_env"
+  write_legacy_runtime_delta "$runtime_env.before-direct-delta" "$runtime_env"
 done
 legacy_delta_runtime=$(monday_rust_lob_live_runtime_contract_sha256_v1 "$ROOT")
 [[ $legacy_delta_runtime != "$candidate_runtime_sha" ]]
@@ -766,8 +777,7 @@ preflight_residue_after=$(find "$ROOT/data/monday/spool/binance-lob-rust-shadow"
 for runtime_env in "${runtime_delta_envs[@]}"; do
   cp -p -- "$runtime_env" "$runtime_env.before-payload-delta"
   chmod u+w "$runtime_env"
-  sed 's/^SEGMENT_SECONDS=.*/SEGMENT_SECONDS=3600/' \
-    "$runtime_env.before-payload-delta" >"$runtime_env"
+  write_legacy_runtime_delta "$runtime_env.before-payload-delta" "$runtime_env"
 done
 rm -f -- "$legacy_root/active"
 ln -s "$legacy_root/$legacy_delta_c0" "$legacy_root/active"
@@ -954,8 +964,7 @@ while IFS= read -r asset; do
 done < <(monday_runtime_assets)
 for runtime_env in "${runtime_delta_envs[@]}"; do
   chmod u+w "$runtime_env"
-  sed 's/^SEGMENT_SECONDS=.*/SEGMENT_SECONDS=3600/' \
-    "$runtime_env.before-payload-delta" >"$runtime_env"
+  write_legacy_runtime_delta "$runtime_env.before-payload-delta" "$runtime_env"
 done
 while IFS= read -r asset; do
   target=$(monday_controller_projection_target "$ROOT" "$asset")
