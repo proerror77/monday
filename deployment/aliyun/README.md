@@ -256,7 +256,8 @@ the mount check is to detect and alert when `/data` is missing.
 `deployment/aliyun/data-completeness-check.sh` (#882) is a POSIX `sh`,
 read-only OSS reconciliation: it compares EXPECTED vs ACTUAL hour partitions
 in the `lake/raw/` lake for every production dataset and fails closed (exit 1)
-on any missing partition, triplet violation, or OSS listing failure. It guards
+on any missing expected partition, triplet violation in an expected hour, or
+OSS listing failure. It guards
 against silent hour-level holes like the 2026-08-14 audit findings (a ~36-hour
 USD-M gap, scattered Bybit single-hour losses, Polymarket data stopping ~12
 hours before the reported outage).
