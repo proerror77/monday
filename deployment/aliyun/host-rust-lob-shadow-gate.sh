@@ -14,6 +14,8 @@ readonly TRANSIENT_WORK_TIMEOUT_SECONDS=300
 readonly MAX_HEALTH_SILENCE_SECONDS=120
 readonly MAX_SEGMENT_GAP_NS=90000000000
 readonly HOST_MEMORY_RESERVE_BYTES=1073741824
+readonly TARGET_PRODUCTION_SLICE_MEMORY_HIGH_BYTES=3221225472
+readonly TARGET_PRODUCTION_SLICE_MEMORY_MAX_BYTES=3758096384
 readonly STRICT_VERIFIER_MEMORY_MAX_BYTES=1610612736
 readonly UPLOAD_DRAIN_MEMORY_MAX_BYTES=536870912
 readonly SHADOW_IDENTITY_WAIT_SECONDS=15
@@ -152,8 +154,8 @@ fi
 # by this action and cannot mutate a host unit.
 if [[ $TEST_ONLY == true ]]; then
   declare -A fixture_unit_state=()
-  fixture_production_memory_high=3221225472
-  fixture_production_memory_max=3758096384
+  fixture_production_memory_high=$TARGET_PRODUCTION_SLICE_MEMORY_HIGH_BYTES
+  fixture_production_memory_max=$TARGET_PRODUCTION_SLICE_MEMORY_MAX_BYTES
   systemctl() {
     local action=${1:-} unit_name=${2:-} property value item output_values=false
     local -a properties=()
@@ -586,8 +588,13 @@ fixture_prepare_production_cgroup() {
   : >"$parent/cgroup.procs"
   printf '%s\n' "$fixture_parent_current" >"$parent/memory.current"
   printf '5100000000\n' >"$parent/memory.peak"
-  printf '3221225472\n' >"$parent/memory.high"
-  printf '3758096384\n' >"$parent/memory.max"
+  if [[ $fixture_production_memory_high == infinity ]]; then
+    printf 'max\n' >"$parent/memory.high"
+    printf 'max\n' >"$parent/memory.max"
+  else
+    printf '%s\n' "$fixture_production_memory_high" >"$parent/memory.high"
+    printf '%s\n' "$fixture_production_memory_max" >"$parent/memory.max"
+  fi
   printf 'anon %s\nfile 784000000\n' "$fixture_parent_anon" >"$parent/memory.stat"
   printf 'high 0\noom 0\noom_kill 0\n' >"$parent/memory.events"
   for market in spot usdm; do
@@ -628,7 +635,8 @@ capture_production_snapshot() {
   local market unit state substate slice control_group parent_group memory_max pid exe_sha n_restarts
   local child_path parent_path parent_procs_json active_children_json child_max_sum=0
   local parent_current parent_peak parent_events parent_high parent_max parent_anon parent_file parent_stat
-  local slice_systemd_high slice_systemd_max slice_control_group
+  local slice_systemd_high slice_systemd_max slice_control_group envelope_state
+  local parent_high_json parent_max_json systemd_high_json systemd_max_json
   local children_json='{}' expected_parent='' expected_slice=''
   local show_output item key value
   local slice_show_output slice_show_item slice_show_key slice_show_value
@@ -706,12 +714,25 @@ capture_production_snapshot() {
   slice_systemd_high=${slice_show_fields[MemoryHigh]:-}
   slice_systemd_max=${slice_show_fields[MemoryMax]:-}
   slice_control_group=${slice_show_fields[ControlGroup]:-}
-  [[ $slice_systemd_high == 3221225472 && $slice_systemd_max == 3758096384 ]] || return 1
   [[ $slice_control_group == "/system.slice/$PRODUCTION_SLICE" ]] || return 1
   parent_path=$(cgroup_child_path "$expected_parent") || return 1
-  parent_high=$(cgroup_numeric_value "$parent_path/memory.high") || return 1
-  parent_max=$(cgroup_numeric_value "$parent_path/memory.max") || return 1
-  [[ $parent_high == 3221225472 && $parent_max == 3758096384 ]] || return 1
+  parent_high=$(cgroup_file_value "$parent_path/memory.high") || return 1
+  parent_max=$(cgroup_file_value "$parent_path/memory.max") || return 1
+  if [[ $source_mode == direct ]]; then
+    [[ $slice_systemd_high == infinity && $slice_systemd_max == infinity \
+      && $parent_high == max && $parent_max == max ]] || return 1
+    envelope_state=legacy-unlimited
+    parent_high_json=null; parent_max_json=null
+    systemd_high_json=null; systemd_max_json=null
+  else
+    [[ $slice_systemd_high == "$TARGET_PRODUCTION_SLICE_MEMORY_HIGH_BYTES" \
+      && $slice_systemd_max == "$TARGET_PRODUCTION_SLICE_MEMORY_MAX_BYTES" \
+      && $parent_high == "$TARGET_PRODUCTION_SLICE_MEMORY_HIGH_BYTES" \
+      && $parent_max == "$TARGET_PRODUCTION_SLICE_MEMORY_MAX_BYTES" ]] || return 1
+    envelope_state=signed
+    parent_high_json=$parent_high; parent_max_json=$parent_max
+    systemd_high_json=$slice_systemd_high; systemd_max_json=$slice_systemd_max
+  fi
   parent_procs_json=$(awk 'NF {bad=1; values[++n]=$1} END {if (bad) {printf "["; for (i=1;i<=n;i++) printf "%s%s", (i>1?",":""), values[i]; printf "]"} else print "[]"}' \
     "$parent_path/cgroup.procs") || return 1
   [[ $parent_procs_json == '[]' ]] || return 1
@@ -732,17 +753,23 @@ capture_production_snapshot() {
   (( parent_anon <= parent_current )) || return 1
   parent_events=$(cgroup_events_json "$parent_path/memory.events") || return 1
   jq -cn --arg slice "$expected_slice" --arg parent "$expected_parent" \
+    --arg envelope_state "$envelope_state" \
     --argjson procs "$parent_procs_json" --argjson active "$active_children_json" \
     --argjson children "$children_json" --argjson current "$parent_current" \
-    --argjson peak "$parent_peak" --argjson high "$parent_high" --argjson max "$parent_max" \
-    --argjson systemd_high "$slice_systemd_high" --argjson systemd_max "$slice_systemd_max" \
+    --argjson peak "$parent_peak" --argjson high "$parent_high_json" --argjson max "$parent_max_json" \
+    --argjson systemd_high "$systemd_high_json" --argjson systemd_max "$systemd_max_json" \
+    --argjson target_high "$TARGET_PRODUCTION_SLICE_MEMORY_HIGH_BYTES" \
+    --argjson target_max "$TARGET_PRODUCTION_SLICE_MEMORY_MAX_BYTES" \
     --argjson anon "$parent_anon" --argjson file "$parent_file" --argjson stat "$parent_stat" \
     --argjson sum "$child_max_sum" --argjson events "$parent_events" \
     '{slice:$slice,parent_control_group:$parent,parent_cgroup_procs:$procs,
       active_child_control_groups:$active,children:$children,
+      production_envelope_state:$envelope_state,
       production_slice_memory_high_bytes:$high,production_slice_memory_max_bytes:$max,
       systemd_production_slice_memory_high_bytes:$systemd_high,
       systemd_production_slice_memory_max_bytes:$systemd_max,
+      target_production_slice_memory_high_bytes:$target_high,
+      target_production_slice_memory_max_bytes:$target_max,
       parent_memory_current_bytes:$current,parent_memory_peak_bytes:$peak,
       parent_memory_anon_bytes:$anon,parent_memory_file_bytes:$file,parent_memory_stat:$stat,
       child_memory_max_sum_bytes:$sum,parent_memory_events:$events}'
@@ -751,14 +778,14 @@ capture_production_snapshot_bounded() {
   local snapshot deadline now
   if [[ $TEST_ONLY == true ]]; then
     snapshot=$(capture_production_snapshot) || return 1
-    monday_validate_lob_production_snapshot "$snapshot" >/dev/null || return 1
+    monday_validate_lob_production_snapshot "$snapshot" "$source_mode" >/dev/null || return 1
     printf '%s\n' "$snapshot"
     return 0
   fi
   deadline=$(( $(monotonic_seconds) + MAX_HEALTH_SILENCE_SECONDS ))
   while :; do
     snapshot=$(capture_production_snapshot 2>/dev/null || true)
-    if [[ -n $snapshot ]] && monday_validate_lob_production_snapshot "$snapshot" >/dev/null 2>&1; then
+    if [[ -n $snapshot ]] && monday_validate_lob_production_snapshot "$snapshot" "$source_mode" >/dev/null 2>&1; then
       printf '%s\n' "$snapshot"
       return 0
     fi
@@ -770,11 +797,12 @@ capture_production_snapshot_bounded() {
 
 production_snapshot_json=''; production_snapshot_identity_json=''
 production_parent_current=''; production_parent_anon=''; production_parent_file=''
-production_child_max_sum=''; production_slice_memory_max=''; production_growth=''
+production_child_max_sum=''; production_actual_slice_memory_max=''; production_target_slice_memory_max=''; production_growth=''
 production_memory_json='{}' production_process_json='{}'
 refresh_production_snapshot() {
   local first second first_identity second_identity current_a current_b anon_a anon_b file_a file_b
-  local sum_a sum_b slice_max_a slice_max_b slice_high_a slice_high_b conservative_current conservative_anon conservative_file conservative_sum
+  local sum_a sum_b slice_max_a slice_max_b slice_high_a slice_high_b target_max_a target_max_b target_high_a target_high_b
+  local conservative_current conservative_anon conservative_file conservative_sum
   first=$(capture_production_snapshot_bounded) || return 1
   jq -e --arg payload "$before_payload" \
     'all(.children[]; .process_exe_sha256 == $payload)' <<<"$first" >/dev/null || return 1
@@ -795,15 +823,20 @@ refresh_production_snapshot() {
   file_b=$(jq -er '.parent_memory_file_bytes' <<<"$second") || return 1
   sum_a=$(jq -er '.child_memory_max_sum_bytes' <<<"$first") || return 1
   sum_b=$(jq -er '.child_memory_max_sum_bytes' <<<"$second") || return 1
-  slice_max_a=$(jq -er '.production_slice_memory_max_bytes' <<<"$first") || return 1
-  slice_max_b=$(jq -er '.production_slice_memory_max_bytes' <<<"$second") || return 1
-  slice_high_a=$(jq -er '.production_slice_memory_high_bytes' <<<"$first") || return 1
-  slice_high_b=$(jq -er '.production_slice_memory_high_bytes' <<<"$second") || return 1
+  slice_max_a=$(jq -c '.production_slice_memory_max_bytes' <<<"$first") || return 1
+  slice_max_b=$(jq -c '.production_slice_memory_max_bytes' <<<"$second") || return 1
+  slice_high_a=$(jq -c '.production_slice_memory_high_bytes' <<<"$first") || return 1
+  slice_high_b=$(jq -c '.production_slice_memory_high_bytes' <<<"$second") || return 1
+  target_max_a=$(jq -er '.target_production_slice_memory_max_bytes' <<<"$first") || return 1
+  target_max_b=$(jq -er '.target_production_slice_memory_max_bytes' <<<"$second") || return 1
+  target_high_a=$(jq -er '.target_production_slice_memory_high_bytes' <<<"$first") || return 1
+  target_high_b=$(jq -er '.target_production_slice_memory_high_bytes' <<<"$second") || return 1
   conservative_current=$current_a; (( current_b < conservative_current )) && conservative_current=$current_b
   conservative_anon=$anon_a; (( anon_b < conservative_anon )) && conservative_anon=$anon_b
   conservative_file=$file_a; (( file_b > conservative_file )) && conservative_file=$file_b
   conservative_sum=$sum_a; (( sum_b > conservative_sum )) && conservative_sum=$sum_b
-  [[ $slice_max_a == "$slice_max_b" && $slice_high_a == "$slice_high_b" ]] || return 1
+  [[ $slice_max_a == "$slice_max_b" && $slice_high_a == "$slice_high_b" \
+    && $target_max_a == "$target_max_b" && $target_high_a == "$target_high_b" ]] || return 1
   production_snapshot_json=$(jq -cn --argjson value "$second" --argjson current "$conservative_current" \
     --argjson anon "$conservative_anon" --argjson file "$conservative_file" --argjson sum "$conservative_sum" \
     '$value | .parent_memory_current_bytes=$current | .parent_memory_anon_bytes=$anon
@@ -812,12 +845,15 @@ refresh_production_snapshot() {
   production_parent_anon=$conservative_anon
   production_parent_file=$conservative_file
   production_child_max_sum=$conservative_sum
-  production_slice_memory_max=$slice_max_a
-  production_growth=$((production_slice_memory_max - production_parent_anon))
+  production_actual_slice_memory_max=$slice_max_a
+  production_target_slice_memory_max=$target_max_a
+  production_growth=$((production_target_slice_memory_max - production_parent_anon))
   production_memory_json=$(jq -c --argjson anon "$conservative_anon" --argjson file "$conservative_file" \
     '{slice,parent_control_group,parent_cgroup_procs,active_child_control_groups,children,
+    production_envelope_state,
     production_slice_memory_high_bytes,production_slice_memory_max_bytes,
     systemd_production_slice_memory_high_bytes,systemd_production_slice_memory_max_bytes,
+    target_production_slice_memory_high_bytes,target_production_slice_memory_max_bytes,
     parent_memory_current_bytes,parent_memory_peak_bytes,parent_memory_anon_bytes,parent_memory_file_bytes,parent_memory_stat,
     child_memory_max_sum_bytes,parent_memory_events}
     | .parent_memory_stat.anon=$anon | .parent_memory_stat.file=$file' <<<"$production_snapshot_json")
@@ -911,13 +947,17 @@ else
     || die 'direct production identity differs'
   before_production_projection=$(readlink -- "$PRODUCTION_BINARY")
 fi
+if [[ $TEST_ONLY == true && $source_mode == direct ]]; then
+  fixture_production_memory_high=infinity
+  fixture_production_memory_max=infinity
+fi
 
 # The before runtime contract is established from every live unit/env byte,
 # never from the candidate manifest.  This is especially important for direct
 # bootstrap: C0's R0 must be true of the installed P0 topology before any
 # shadow staging occurs.
 if [[ $FROM_CONTROLLER == direct ]]; then
-  # Direct bootstrap is the typed R0(v1, eight assets) -> R2(v2, nine assets)
+  # Direct bootstrap is the typed R0(v1, eight assets) -> R1(v2, nine assets)
   # migration. Always hash the legacy eight-asset view, even if a stale slice
   # happens to be present, so the candidate's V2 identity is not mistaken for
   # the immutable pre-bootstrap identity.
@@ -1031,11 +1071,9 @@ if [[ $old_shadow_present == true ]]; then
 fi
 
 # Direct bootstrap may run once on a host whose production slice predates V2
-# and is still unlimited.  In that one migration mode, install a runtime-only
-# lease for the duration of this Gate.  The exact previous values are retained
-# in a run-scoped state file before mutation and restored on normal EXIT paths;
-# the next serialized Gate also recovers an un-restored lease left by SIGKILL.
-# Stable V2 Gates only verify the permanent slice and never mutate it.
+# and is still unlimited.  Gate records that legacy state but never changes it;
+# the signed candidate slice is installed and verified only by Cutover. Stable
+# V2 Gates continue to require their already-active signed envelope.
 # Candidate shadow units are rendered into a run-scoped /run directory.  The
 # source template may only contribute the reviewed security/resource fields;
 # all identity, spool, restart, and lifetime fields are rewritten below.
@@ -1129,7 +1167,7 @@ record_resource() {
   host_memory_available=$available_before
   (( available_after < host_memory_available )) && host_memory_available=$available_after
   required=$(monday_shadow_memory_admission "$host_memory_available" "$HOST_MEMORY_RESERVE_BYTES" "$phase_max" \
-    "$production_parent_anon" "$production_slice_memory_max") || die "insufficient memory for $phase"
+    "$production_parent_anon" "$production_target_slice_memory_max") || die "insufficient memory for $phase"
   resource_phase_required[$phase]=$required
   resource_phase_limit[$phase]=$phase_max
   resource_phase_parent_current[$phase]=$production_parent_current
@@ -1140,7 +1178,9 @@ record_resource() {
     --argjson available_before "$available_before" --argjson available_after "$available_after" \
     --argjson reserve "$HOST_MEMORY_RESERVE_BYTES" --argjson current "$production_parent_current" \
     --argjson anon "$production_parent_anon" --argjson file "$production_parent_file" \
-    --argjson slice_max "$production_slice_memory_max" --argjson child_sum "$production_child_max_sum" \
+    --argjson slice_max "$production_actual_slice_memory_max" \
+    --argjson target_slice_max "$production_target_slice_memory_max" \
+    --argjson child_sum "$production_child_max_sum" \
     --argjson growth "$production_growth" --arg now "$now" \
     '{phase:$phase,started_at:$now,ended_at:$now,samples:1,host_memory_available_bytes:$available,
       host_memory_available_before_bytes:$available_before,host_memory_available_after_bytes:$available_after,
@@ -1148,6 +1188,7 @@ record_resource() {
       host_memory_reserve_bytes:$reserve,production_parent_memory_current_bytes:$current,
       production_parent_memory_anon_bytes:$anon,production_parent_memory_file_bytes:$file,
       production_slice_memory_max_bytes:$slice_max,
+      target_production_slice_memory_max_bytes:$target_slice_max,
       production_child_memory_max_sum_bytes:$child_sum,production_memory_growth_bytes:$growth,
       production_unallocated_bytes:$growth,
       required_bytes:$required,phase_memory_max_bytes:$phase_max}')
@@ -1234,7 +1275,7 @@ resource_monitor_identity_guard() {
       production-identity-drift 0 0 0 0 || true
     return 1
   fi
-  monday_validate_lob_production_snapshot "$snapshot" 2>/dev/null || return 2
+  monday_validate_lob_production_snapshot "$snapshot" "$source_mode" 2>/dev/null || return 2
 }
 resource_monitor_start() {
   local phase=$1 phase_max=$2 initial_available parent_pid parent_starttime
@@ -2560,7 +2601,7 @@ run_upload_units_json=$(jq -cn \
   --arg usdm_sha "${candidate_upload_unit_sha[usdm]}" \
   '{spot:{unit:$spot,sha256:$spot_sha},usdm:{unit:$usdm,sha256:$usdm_sha}}')
 gate_finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ); production_eligible=true; [[ $TEST_ONLY == true ]] && production_eligible=false
-jq -cn --arg schema monday.rust_lob_shadow_gate.v6 --arg from "$before_controller" --arg source_mode "$source_mode" --arg after "$CANDIDATE_CONTROLLER" --arg candidate "$CANDIDATE_CONTROLLER" --arg payload "$candidate_payload" --arg runtime "$candidate_runtime" --arg bundle "$candidate_bundle" --arg source "$candidate_source" --arg before_payload "$before_payload" --arg before_runtime "$before_runtime" --arg before_bundle "$before_bundle" --arg before_source "$before_source" --arg before_projection "$before_production_projection" --arg control_sha "$candidate_control_bytes_sha" --argjson control_assets "$candidate_control_assets" --argjson production_runtime "$candidate_production_runtime" --arg run "$run_id" --arg spool "$run_spool" --arg run_unit_root "$gate_unit_dir" --arg worker_slice "$GATE_WORKER_SLICE" --arg worker_slice_sha "$gate_worker_slice_sha256" --arg worker_slice_cgroup "$gate_worker_slice_control_group" --argjson worker_high "$GATE_WORKER_MEMORY_HIGH_BYTES" --argjson worker_max "$GATE_WORKER_MEMORY_MAX_BYTES" --argjson worker_events_start "$gate_worker_memory_events_start" --argjson worker_events_end "$gate_worker_memory_events_end" --argjson units "$run_units_json" --argjson upload_units "$run_upload_units_json" --arg started "$gate_started_at" --arg finished "$gate_finished_at" --argjson evidence_timeout "$EVIDENCE_TIMEOUT_SECONDS" --argjson settle "$HEALTH_SETTLE_SECONDS" --argjson segment "$GATE_SEGMENT_SECONDS" --argjson host_total "$host_memory_total" --argjson host_swap "$host_swap_total" --argjson production_memory "$production_memory_json" --argjson production_process "$production_process_json" --argjson production_assets "$production_asset_json" --argjson resources "$resource_samples" --argjson psi "$psi_windows" --argjson checks "$checks" --argjson markets "$markets_json" --argjson eligible "$production_eligible" --argjson test_only "$TEST_ONLY" --argjson before_assets "$before_assets_json" --argjson staged_assets "$staged_assets_json" --argjson restored_assets "$restored_assets_json" --arg shadow_binary "$SHADOW_BINARY" --arg candidate_binary "$candidate_binary" --arg old_shadow_target "$old_shadow_target" --arg old_shadow_target_sha "$old_shadow_target_sha256" --argjson old_shadow_present "$old_shadow_present" \
+jq -cn --arg schema monday.rust_lob_shadow_gate.v7 --arg from "$before_controller" --arg source_mode "$source_mode" --arg after "$CANDIDATE_CONTROLLER" --arg candidate "$CANDIDATE_CONTROLLER" --arg payload "$candidate_payload" --arg runtime "$candidate_runtime" --arg bundle "$candidate_bundle" --arg source "$candidate_source" --arg before_payload "$before_payload" --arg before_runtime "$before_runtime" --arg before_bundle "$before_bundle" --arg before_source "$before_source" --arg before_projection "$before_production_projection" --arg control_sha "$candidate_control_bytes_sha" --argjson control_assets "$candidate_control_assets" --argjson production_runtime "$candidate_production_runtime" --arg run "$run_id" --arg spool "$run_spool" --arg run_unit_root "$gate_unit_dir" --arg worker_slice "$GATE_WORKER_SLICE" --arg worker_slice_sha "$gate_worker_slice_sha256" --arg worker_slice_cgroup "$gate_worker_slice_control_group" --argjson worker_high "$GATE_WORKER_MEMORY_HIGH_BYTES" --argjson worker_max "$GATE_WORKER_MEMORY_MAX_BYTES" --argjson worker_events_start "$gate_worker_memory_events_start" --argjson worker_events_end "$gate_worker_memory_events_end" --argjson units "$run_units_json" --argjson upload_units "$run_upload_units_json" --arg started "$gate_started_at" --arg finished "$gate_finished_at" --argjson evidence_timeout "$EVIDENCE_TIMEOUT_SECONDS" --argjson settle "$HEALTH_SETTLE_SECONDS" --argjson segment "$GATE_SEGMENT_SECONDS" --argjson host_total "$host_memory_total" --argjson host_swap "$host_swap_total" --argjson production_memory "$production_memory_json" --argjson production_process "$production_process_json" --argjson production_assets "$production_asset_json" --argjson resources "$resource_samples" --argjson psi "$psi_windows" --argjson checks "$checks" --argjson markets "$markets_json" --argjson eligible "$production_eligible" --argjson test_only "$TEST_ONLY" --argjson before_assets "$before_assets_json" --argjson staged_assets "$staged_assets_json" --argjson restored_assets "$restored_assets_json" --arg shadow_binary "$SHADOW_BINARY" --arg candidate_binary "$candidate_binary" --arg old_shadow_target "$old_shadow_target" --arg old_shadow_target_sha "$old_shadow_target_sha256" --argjson old_shadow_present "$old_shadow_present" \
   '{schema:$schema,control_plane_version:2,passed:true,production_eligible:$eligible,test_only:$test_only,source_mode:$source_mode,from_controller_sha256:$from,transition:{before:$from,after:$after,topology:(if $source_mode == "direct" then "direct-bootstrap" else "stable" end)},candidate_controller_sha256:$candidate,candidate_payload_sha256:$payload,candidate_runtime_contract_sha256:$runtime,candidate_deployment_bundle_sha256:$bundle,candidate_deployment_source_revision:$source,candidate_control_bytes:{sha256:$control_sha,assets:$control_assets},production_runtime:$production_runtime,before:{controller:$from,payload_sha256:$before_payload,runtime_contract_sha256:$before_runtime,deployment_bundle_sha256:$before_bundle,deployment_source_revision:$before_source,production_projection:$before_projection,production_assets:$production_assets},run_id:$run,run_spool:$spool,started_at:$started,finished_at:$finished,evidence_timeout_seconds:$evidence_timeout,health_settle_seconds:$settle,segment_seconds:$segment,host_memory_total_bytes:$host_total,host_swap_total_bytes:$host_swap,production_memory:$production_memory,production_process:$production_process,production_assets:$production_assets,resource_admission:$resources,io_full_psi_windows:$psi,shadow_staging:{mode:"run-scoped",run_unit_root:$run_unit_root,spool_root:$spool,aggregate_slice:{name:$worker_slice,sha256:$worker_slice_sha,cgroup:$worker_slice_cgroup,memory_high_bytes:$worker_high,memory_max_bytes:$worker_max,memory_events:{start:$worker_events_start,end:$worker_events_end}},units:$units,upload_units:$upload_units,candidate_assets:$staged_assets,restored_assets:$restored_assets,before_assets:$before_assets,binary:{path:$run_unit_root,candidate_target:$candidate_binary,restored_target:(if $old_shadow_present then $old_shadow_target else null end),restored_target_sha256:(if $old_shadow_present then $old_shadow_target_sha else null end),restored_present:$old_shadow_present}},checks:$checks,markets:$markets}' >"$gate_json.tmp"
 chmod 0640 "$gate_json.tmp"; [[ ! -e $gate_json ]] || die 'gate receipt already exists'; mv -f -- "$gate_json.tmp" "$gate_json"
 if ! jq -e -f "$POLICY_SOURCE" "$gate_json" >/dev/null; then

@@ -183,8 +183,10 @@ jq -n --arg exe "$production_exe_sha" '
        control_group:"/system.slice/system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice/binance-lob-archiver-production@usdm.service",
        main_pid:102,process_exe_sha256:$exe,n_restarts:8,active:true,
        systemd_memory_max_bytes:2684354560,memory_max_bytes:2684354560}},
+   production_envelope_state:"signed",
    production_slice_memory_high_bytes:3221225472,production_slice_memory_max_bytes:3758096384,
    systemd_production_slice_memory_high_bytes:3221225472,systemd_production_slice_memory_max_bytes:3758096384,
+   target_production_slice_memory_high_bytes:3221225472,target_production_slice_memory_max_bytes:3758096384,
    parent_memory_current_bytes:1101067264,parent_memory_peak_bytes:5100000000,
    parent_memory_anon_bytes:317067264,parent_memory_file_bytes:784000000,
    parent_memory_stat:{anon:317067264,file:784000000},
@@ -192,6 +194,18 @@ jq -n --arg exe "$production_exe_sha" '
 ' >"$production_snapshot"
 monday_validate_lob_production_snapshot "$production_snapshot"
 production_identity=$(monday_lob_production_snapshot_identity "$production_snapshot")
+direct_production_snapshot="$ROOT/direct-production-snapshot.json"
+jq '.production_envelope_state = "legacy-unlimited"
+  | .production_slice_memory_high_bytes = null
+  | .production_slice_memory_max_bytes = null
+  | .systemd_production_slice_memory_high_bytes = null
+  | .systemd_production_slice_memory_max_bytes = null' \
+  "$production_snapshot" >"$direct_production_snapshot"
+monday_validate_lob_production_snapshot "$direct_production_snapshot" direct
+if monday_validate_lob_production_snapshot "$direct_production_snapshot" stable; then
+  printf 'stable production snapshot validation accepted a legacy unlimited envelope\n' >&2
+  exit 1
+fi
 
 # Runtime-boundary verification reads unordered KEY=VALUE output from
 # systemctl and requires the permanent aggregate slice plus both direct child
@@ -742,6 +756,21 @@ gate_sha=$(printf '%s\n' "$gate_output" | sed -n 's/^SHA-256: //p')
 [[ -f $gate && $gate_sha == "$(monday_sha256_file "$gate")" ]]
 monday_validate_v2_gate "$gate" direct "$c0" "$gate_sha"
 jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$gate" >/dev/null
+jq -e '
+  .schema == "monday.rust_lob_shadow_gate.v7"
+  and .source_mode == "direct"
+  and .production_memory.production_envelope_state == "legacy-unlimited"
+  and .production_memory.production_slice_memory_high_bytes == null
+  and .production_memory.production_slice_memory_max_bytes == null
+  and .production_memory.systemd_production_slice_memory_high_bytes == null
+  and .production_memory.systemd_production_slice_memory_max_bytes == null
+  and .production_memory.target_production_slice_memory_high_bytes == 3221225472
+  and .production_memory.target_production_slice_memory_max_bytes == 3758096384
+  and all(.resource_admission[];
+    .production_slice_memory_max_bytes == null
+    and .target_production_slice_memory_max_bytes == 3758096384
+    and .production_memory_growth_bytes
+      == (3758096384 - .production_parent_memory_anon_bytes))' "$gate" >/dev/null
 jq -e --argjson evidence_timeout "$evidence_timeout_seconds" \
   --argjson segment "$gate_segment_seconds" \
   '.evidence_timeout_seconds == $evidence_timeout and .segment_seconds == $segment
@@ -893,7 +922,7 @@ grep -Fq -- "--slice=\"\$GATE_WORKER_SLICE\"" <<<"$oss_source"
 grep -Fq -- '--property=MemoryMax=1536M' <<<"$oss_source"
 jq -e 'all(.resource_admission[];
   .required_bytes == (.phase_memory_max_bytes + .host_memory_reserve_bytes + .production_memory_growth_bytes)
-  and .production_memory_growth_bytes == (.production_slice_memory_max_bytes - .production_parent_memory_anon_bytes)
+  and .production_memory_growth_bytes == (.target_production_slice_memory_max_bytes - .production_parent_memory_anon_bytes)
   and .host_memory_reserve_bytes == 1073741824
   and .host_memory_available_bytes >= .required_bytes
   and (has("production_memory_growth_headroom_bytes") | not))' "$gate" >/dev/null

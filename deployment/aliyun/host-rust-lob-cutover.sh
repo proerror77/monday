@@ -283,7 +283,7 @@ fi
 # Independently compute R0 from every live unit/env byte.  The target
 # manifest is never used as a substitute for a missing or drifted before set.
 if [[ $FROM == direct ]]; then
-  # Direct bootstrap is the typed R0(v1, eight assets) -> R2(v2, nine assets)
+  # Direct bootstrap is the typed R0(v1, eight assets) -> R1(v2, nine assets)
   # migration; always hash the legacy eight-asset view for the before check.
   live_runtime=$(monday_rust_lob_live_runtime_contract_sha256_v1 "$ROOT") \
     || die 'legacy live runtime contract is missing or indirect'
@@ -515,7 +515,7 @@ if [[ $FROM == direct ]]; then
   [[ -n $old_production_target ]] || die 'bootstrap production projection is unresolved'
   for asset in "${PAIR_ASSETS[@]}"; do
     if [[ ${asset_state[$asset]} == absent && $asset == 'system-binance\x2dlob\x2darchiver\x2dproduction.slice' ]]; then
-      # The sole typed R0 -> R2 delta is the newly signed aggregate slice.
+      # The sole typed R0 -> R1 delta is the newly signed aggregate slice.
       continue
     fi
     [[ ${asset_state[$asset]} == present ]] || die "bootstrap runtime asset is not a direct file: $asset"
@@ -620,11 +620,10 @@ jq -e --argjson expected "$target_production_runtime" \
   || die 'target production runtime contract changed after pair commit'
 if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
   if [[ $TEST_ONLY == false ]]; then
-    # A direct bootstrap Gate may have restored a legacy runtime-only lease.
-    # Drop that transient override so the newly committed signed slice asset
-    # is the permanent source of the production envelope.
+    # Clear any legacy runtime override so the newly committed signed slice
+    # asset is the sole source of the production envelope.
     systemctl revert --runtime "$PRODUCTION_SLICE" \
-      || die 'could not clear the bootstrap production slice lease'
+      || die 'could not clear the legacy production slice runtime override'
   fi
   systemctl daemon-reload || die 'daemon-reload failed after pair commit'
   monday_rust_lob_verify_systemd_production_slice_configured "$ROOT" \
