@@ -789,6 +789,24 @@ if [[ ! -f $payload_delta_recovery || -L $payload_delta_recovery ]]; then
   exit 1
 fi
 [[ $(monday_sha256_file "$payload_delta_recovery") == "$payload_delta_recovery_sha" ]]
+payload_delta_restore_receipt="$ROOT/data/monday/evidence/restores/$c1/restore.json"
+payload_delta_restore_marker="$payload_delta_restore_receipt.sha256"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_RESTORE_HARD_CRASH_AFTER_RECEIPT=1 \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-restore.sh" \
+  --controller "$c1" --root "$ROOT" >"$ROOT/run/payload-delta-restore.err" 2>&1; then
+  printf 'post-receipt Restore unexpectedly survived SIGKILL\n' >&2
+  exit 1
+fi
+[[ -f $payload_delta_recovery && ! -L $payload_delta_recovery ]]
+[[ -f $payload_delta_restore_receipt && ! -L $payload_delta_restore_receipt ]]
+[[ -f $payload_delta_restore_marker && ! -L $payload_delta_restore_marker ]]
+payload_delta_restore_sha=$(awk '$2 == "restore.json" { count++; value=$1 } END { if (count != 1) exit 1; print value }' \
+  "$payload_delta_restore_marker")
+[[ $(monday_sha256_file "$payload_delta_restore_receipt") == "$payload_delta_restore_sha" ]]
+jq -e --arg gate "$payload_delta_gate" --arg gate_sha "$payload_delta_gate_sha" '
+  .transition_receipt == null
+  and .gate_receipt == $gate and .gate_sha256 == $gate_sha
+' "$payload_delta_restore_receipt" >/dev/null
 if ! payload_delta_restore_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c1" --root "$ROOT" 2>&1); then
   printf '%s\n' "$payload_delta_restore_output" >&2
@@ -806,7 +824,6 @@ for asset in $(monday_runtime_assets); do
 done
 [[ $(monday_rust_lob_live_runtime_contract_sha256 "$ROOT") == "$candidate_runtime_sha" ]]
 [[ ! -e $payload_delta_recovery ]]
-payload_delta_restore_receipt="$ROOT/data/monday/evidence/restores/$c1/restore.json"
 jq -e --arg gate "$payload_delta_gate" --arg gate_sha "$payload_delta_gate_sha" '
   .transition_receipt == null
   and .gate_receipt == $gate and .gate_sha256 == $gate_sha
