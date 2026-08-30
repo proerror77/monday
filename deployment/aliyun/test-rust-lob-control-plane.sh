@@ -1320,6 +1320,28 @@ jq -e '
   and .markets.spot.observation_finished_monotonic_ns
     >= .markets.spot.observation_started_monotonic_ns
   and .markets.usdm == null' "$deadline_run_json" >/dev/null
+deadline_failure_json="$(dirname -- "$deadline_run_json")/deadline-failure.json"
+deadline_health_json="$(dirname -- "$deadline_run_json")/deadline-health.json"
+deadline_segments_tsv="$(dirname -- "$deadline_run_json")/deadline-segments.tsv"
+[[ -f $deadline_failure_json && -f $deadline_health_json && -f $deadline_segments_tsv ]]
+jq -e --arg controller "$c0" \
+  --arg health_sha "$(monday_sha256_file "$deadline_health_json")" \
+  --arg segments_sha "$(monday_sha256_file "$deadline_segments_tsv")" '
+  .schema == "monday.rust_lob_shadow_gate_deadline_failure.v1"
+  and .authoritative == false and .cause == "evidence_deadline"
+  and .market == "spot" and .candidate_controller_sha256 == $controller
+  and .health_eligible == true and .segment_pair_ready == true
+  and .segment_readiness_code == 0
+  and .observation.sample_started_monotonic_ns < .observation.deadline_monotonic_ns
+  and .observation.sampled_monotonic_ns >= .observation.deadline_monotonic_ns
+  and .observation.failure_detected_monotonic_ns == .observation.sampled_monotonic_ns
+  and .health_snapshot == {file:"deadline-health.json",sha256:$health_sha}
+  and .segment_snapshot == {file:"deadline-segments.tsv",sha256:$segments_sha}' \
+  "$deadline_failure_json" >/dev/null
+jq -e '.status == "synced"' "$deadline_health_json" >/dev/null
+[[ $(wc -l <"$deadline_segments_tsv" | tr -d '[:space:]') == 2 ]]
+[[ ! -e $(dirname -- "$deadline_run_json")/gate.json \
+  && ! -e $(dirname -- "$deadline_run_json")/PASSED.sha256 ]]
 
 # Health eligibility is frozen at the same cutoff.  A live health file that
 # becomes synced only after the deadline cannot authorize the Gate.
@@ -1349,6 +1371,29 @@ jq -e '
   and .markets.spot.observation_finished_monotonic_ns
     >= .markets.spot.observation_started_monotonic_ns
   and .markets.usdm == null' "$health_deadline_run_json" >/dev/null
+health_deadline_failure_json="$(dirname -- "$health_deadline_run_json")/deadline-failure.json"
+health_deadline_health_json="$(dirname -- "$health_deadline_run_json")/deadline-health.json"
+health_deadline_segments_tsv="$(dirname -- "$health_deadline_run_json")/deadline-segments.tsv"
+[[ -f $health_deadline_failure_json && -f $health_deadline_health_json \
+  && -f $health_deadline_segments_tsv ]]
+jq -e --arg controller "$c0" \
+  --arg health_sha "$(monday_sha256_file "$health_deadline_health_json")" \
+  --arg segments_sha "$(monday_sha256_file "$health_deadline_segments_tsv")" '
+  .schema == "monday.rust_lob_shadow_gate_deadline_failure.v1"
+  and .authoritative == false and .cause == "evidence_deadline"
+  and .market == "spot" and .candidate_controller_sha256 == $controller
+  and .health_eligible == false and .segment_pair_ready == true
+  and .segment_readiness_code == 0
+  and .observation.sample_started_monotonic_ns <= .observation.sampled_monotonic_ns
+  and .observation.sampled_monotonic_ns < .observation.deadline_monotonic_ns
+  and .observation.failure_detected_monotonic_ns >= .observation.deadline_monotonic_ns
+  and .health_snapshot == {file:"deadline-health.json",sha256:$health_sha}
+  and .segment_snapshot == {file:"deadline-segments.tsv",sha256:$segments_sha}' \
+  "$health_deadline_failure_json" >/dev/null
+jq -e '.status == "syncing"' "$health_deadline_health_json" >/dev/null
+[[ $(wc -l <"$health_deadline_segments_tsv" | tr -d '[:space:]') == 2 ]]
+[[ ! -e $(dirname -- "$health_deadline_run_json")/gate.json \
+  && ! -e $(dirname -- "$health_deadline_run_json")/PASSED.sha256 ]]
 
 # Time alone never passes the Gate: one clean segment is insufficient.
 if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_SINGLE_CLEAN_SEGMENT=1 \
