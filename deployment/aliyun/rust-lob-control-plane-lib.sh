@@ -983,7 +983,7 @@ monday_validate_production_env() {
     [[ $(monday_env_value "$file" WS_SHARD_SIZE) == 25 ]] || return 1
   fi
   [[ $(monday_env_value "$file" DEPTH_MODE) == diff ]] || return 1
-  [[ $(monday_env_value "$file" SEGMENT_SECONDS) == 3600 ]] || return 1
+  [[ $(monday_env_value "$file" SEGMENT_SECONDS) == 300 ]] || return 1
   spool="/data/monday/spool/binance-lob/$market"
   [[ $(monday_env_value "$file" SPOOL_DIR) == "$spool" ]] || return 1
   [[ $(monday_env_value "$file" OSS_BUCKET) == monday-lob-apne1-1045353359 ]] || return 1

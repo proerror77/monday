@@ -103,9 +103,9 @@ production_usdm_segment_seconds=$(sed -n 's/^SEGMENT_SECONDS=//p' \
   && $upload_drain_timeout_seconds == 300 && $transient_work_timeout_seconds == 300 \
   && $spot_segment_seconds =~ ^[1-9][0-9]*$ \
   && $spot_segment_seconds == "$usdm_segment_seconds" \
-  && $production_spot_segment_seconds == 3600 \
+  && $production_spot_segment_seconds == 300 \
   && $production_spot_segment_seconds == "$production_usdm_segment_seconds" ]] || {
-  printf 'Fast Gate bounds or the unchanged production cadence drifted\n' >&2
+  printf 'Fast Gate bounds or the 300-second production cadence drifted\n' >&2
   exit 1
 }
 gate_observation_source=$(sed -n '/^run_market_gate_phase()/,/^}/p' \
