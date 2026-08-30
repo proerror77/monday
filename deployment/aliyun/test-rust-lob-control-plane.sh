@@ -467,11 +467,17 @@ jq -e --arg runtime "$candidate_runtime_sha" \
    and .authoritative == false and .production_changed == false
    and .authorizes_gate == false and .authorizes_cutover == false
    and .candidate_runtime_contract_sha256 == $runtime
+   and .production_cgroup_snapshot.production_envelope_state == "legacy-unlimited"
+   and .production_cgroup_snapshot.production_slice_memory_high_bytes == null
+   and .production_cgroup_snapshot.production_slice_memory_max_bytes == null
+   and .production_cgroup_snapshot.target_production_slice_memory_high_bytes == 3221225472
+   and .production_cgroup_snapshot.target_production_slice_memory_max_bytes == 3758096384
    and (.io_full_psi_windows | length == 1)
    and .io_full_psi_windows[0].phase == "preflight"
    and .io_full_psi_windows[0].veto == false
    and (.checks.controller and .checks.from_controller and .checks.payload
-     and .checks.runtime_contract and .checks.installed_bytes and .checks.psi_sampler)' \
+     and .checks.runtime_contract and .checks.installed_bytes
+     and .checks.production_cgroup and .checks.psi_sampler)' \
   <<<"$preflight_output" >/dev/null
 [[ ! -e "$preflight_tmpdir_guard" ]] || {
   printf 'read-only preflight created a temporary directory\n' >&2
@@ -492,6 +498,21 @@ preflight_residue_after=$(find "$ROOT/data/monday/spool/binance-lob-rust-shadow"
   printf 'read-only preflight invoked a mutating systemd action\n' >&2
   exit 1
 }
+# The read-only preflight must reject the same invalid live production cgroup
+# topology as the formal Gate.
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_EXTRA_CHILD=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --preflight-only --root "$ROOT" \
+  >"$ROOT/run/preflight-extra-cgroup-child.err" 2>&1; then
+  printf 'read-only preflight accepted an extra active production cgroup child\n' >&2
+  exit 1
+fi
+grep -Fq 'production cgroup snapshot is invalid' \
+  "$ROOT/run/preflight-extra-cgroup-child.err" || {
+  cat "$ROOT/run/preflight-extra-cgroup-child.err" >&2
+  exit 1
+}
+rm -rf -- "$ROOT/sys/fs/cgroup/system.slice/$production_slice_asset/foreign.service"
 # A direct v1 -> V2 Gate must not require C1's runtime bytes to be installed
 # before Cutover. Bind the live eight-asset topology to a distinct immutable
 # C0 runtime, then prove the 300-second C1 still passes read-only preflight.

@@ -1004,25 +1004,25 @@ trade for a static symbol. Every segment must still contain at least one real
 
 ### 2. Run the short production-catalog gate
 
-Run the formal Gate once for the exact pair. The controller release is the only
-source of the Gate script, helper, and policy; the candidate supplies only the
-payload and runtime assets. A bootstrap uses `direct` only when no controller is
-active and the running payload is byte-identical to `P0`:
+Before the formal Gate, run one read-only preflight for the exact pair. The
+controller release is the only source of the Gate script, helper, and policy;
+the candidate supplies only the payload and runtime assets. A bootstrap uses
+`direct` only when the active controller is immutable v1 and the running
+payload is byte-identical to `P0`:
 
 ```bash
 set -euo pipefail
 ./deployment/aliyun/rust-lob-control-plane.sh gate \
   --instance i-REPLACE \
   --from-controller REPLACE_WITH_ACTIVE_CONTROLLER_SHA_OR_direct \
-  --candidate-controller REPLACE_WITH_CANDIDATE_CONTROLLER_SHA
+  --candidate-controller REPLACE_WITH_CANDIDATE_CONTROLLER_SHA \
+  --preflight-only
 ```
 
-The command executes the Gate bytes from the candidate controller directory and
-binds the receipt to `C1`, `P1`, `R1`, `B1`, and `S1`. It proves the current pair,
-candidate process, market health, and Spot/USD-M OSS evidence before writing one
-immutable schema-v6 receipt. A receipt from another controller or payload is
-not reusable. No public preflight operation exists; checks that do not create
-evidence are internal to the Gate.
+Preflight emits non-authoritative JSON after validating `C0/C1`, `P1`, `R1`,
+`B1`, `S1`, installed production bytes, and the live production systemd/cgroup
+topology and executable identity. It creates no Gate evidence and authorizes
+neither Gate nor Cutover. Then run the formal Gate once:
 
 ```bash
 set -euo pipefail
@@ -1035,6 +1035,12 @@ set -euo pipefail
 The Gate has no compatibility routing. Historical receipts remain readable for
 audit but cannot authorize a new transition. Failed Gate attempts block only the
 candidate cutover; they never rewrite a release or production state.
+
+The command executes the Gate bytes from the candidate controller directory and
+binds the receipt to `C1`, `P1`, `R1`, `B1`, and `S1`. It proves the current pair,
+candidate process, market health, and Spot/USD-M OSS evidence before writing one
+immutable schema-v7 receipt. A receipt from another controller or payload is
+not reusable.
 
 The host gate owns only the runtime transition. A failed Gate blocks cutover,
 not Code, CI, Merge, or immutable Release publication. It verifies the candidate,

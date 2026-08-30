@@ -1019,8 +1019,15 @@ if [[ $PREFLIGHT_ONLY == true ]]; then
   # No temporary directory, cleanup trap, spool/evidence path, systemd unit,
   # lease, or shadow is created before this branch.  The existing lock was
   # opened read-only above; the checks here establish C/from/P/R and every
-  # installed production byte from immutable files. PSI is sampled once as
+  # installed production byte from immutable files, plus the live production
+  # systemd/cgroup topology and executable identity. PSI is sampled once as
   # advisory evidence and never authorizes or denies the Gate.
+  preflight_production_snapshot=$(capture_production_snapshot_bounded) \
+    || die 'production cgroup snapshot is invalid'
+  jq -e --arg payload "$before_payload" \
+    'all(.children[]; .process_exe_sha256 == $payload)' \
+    <<<"$preflight_production_snapshot" >/dev/null \
+    || die 'production process identity differs from the active payload'
   record_io_psi_snapshot preflight || die 'could not record preflight PSI evidence'
   jq -cn \
     --arg from "$before_controller" --arg source_mode "$source_mode" \
@@ -1028,7 +1035,9 @@ if [[ $PREFLIGHT_ONLY == true ]]; then
     --arg runtime "$candidate_runtime" --arg bundle "$candidate_bundle" \
     --arg source "$candidate_source" --arg control_sha "$candidate_control_bytes_sha" \
     --argjson control_assets "$candidate_control_assets" \
-    --argjson installed_assets "$production_asset_json" --argjson psi "$psi_windows" \
+    --argjson installed_assets "$production_asset_json" \
+    --argjson production_snapshot "$preflight_production_snapshot" \
+    --argjson psi "$psi_windows" \
     '{schema:"monday.rust_lob_shadow_gate_preflight.v1",operation:"gate",
       preflight_only:true,authoritative:false,production_changed:false,
       authorizes_gate:false,authorizes_cutover:false,source_mode:$source_mode,
@@ -1038,9 +1047,11 @@ if [[ $PREFLIGHT_ONLY == true ]]; then
       candidate_deployment_source_revision:$source,
       candidate_control_bytes:{sha256:$control_sha,assets:$control_assets},
       installed_production_assets:$installed_assets,
+      production_cgroup_snapshot:$production_snapshot,
       io_full_psi_windows:$psi,
       checks:{controller:true,from_controller:true,payload:true,
-        runtime_contract:true,installed_bytes:true,psi_sampler:true}}'
+        runtime_contract:true,installed_bytes:true,production_cgroup:true,
+        psi_sampler:true}}'
   exit 0
 fi
 
