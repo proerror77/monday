@@ -157,12 +157,17 @@ sampled_line=$(grep -Fn "observation_sampled_ns=\$(monotonic_nanoseconds)" \
   <<<"$gate_observation_source" | cut -d: -f1)
 deadline_line=$(grep -Fn 'if (( observation_sampled_ns >= observation_deadline_ns )); then' \
   <<<"$gate_observation_source" | cut -d: -f1)
-validation_line=$(grep -Fn "validate_observation_sample \"\$market\"" \
+validation_line=$(grep -Fn "validate_observation_sample \"\$market\" \"\$observation_health_snapshot\"" \
   <<<"$gate_observation_source" | cut -d: -f1)
 evidence_line=$(grep -Fn "if clean_segment_pair_ready \"\$market\" \"\$observation_segment_snapshot\"; then" \
   <<<"$gate_observation_source" | cut -d: -f1)
-(( evidence_line < sampled_line && sampled_line < deadline_line \
-  && deadline_line < validation_line ))
+health_snapshot_line=$(grep -Fn "cp -- \"\$live_health\" \"\$observation_health_snapshot.tmp\"" \
+  <<<"$gate_observation_source" | cut -d: -f1)
+health_check_line=$(grep -Fn "if health_ok \"\$market\" \"\$observation_health_snapshot\"" \
+  <<<"$gate_observation_source" | cut -d: -f1)
+(( evidence_line < health_snapshot_line && health_snapshot_line < sampled_line \
+  && sampled_line < deadline_line && deadline_line < validation_line \
+  && validation_line < health_check_line ))
 grep -Fq "observation_finished_ns=\$observation_sampled_ns" \
   <<<"$gate_observation_source"
 grep -Fq "write_run_json || die 'could not commit deadline failure run evidence'" \
@@ -1299,7 +1304,7 @@ if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_POST_SAMPLE_EVIDENCE=1 \
   printf 'Gate started a new observation sample after the evidence deadline\n' >&2
   exit 1
 fi
-grep -Fq 'did not produce two adjacent clean segments before the evidence deadline' \
+grep -Fq 'did not produce an eligible evidence sample before the evidence deadline' \
   "$deadline_failure_output"
 deadline_run_json=$(find "$ROOT/data/monday/evidence/shadow-gates/$c0" \
   -type f -name run.json -print | while IFS= read -r candidate; do
@@ -1315,6 +1320,35 @@ jq -e '
   and .markets.spot.observation_finished_monotonic_ns
     >= .markets.spot.observation_started_monotonic_ns
   and .markets.usdm == null' "$deadline_run_json" >/dev/null
+
+# Health eligibility is frozen at the same cutoff.  A live health file that
+# becomes synced only after the deadline cannot authorize the Gate.
+health_deadline_failure_output="$ROOT/run/health-deadline-failure.err"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_POST_SAMPLE_HEALTH=1 \
+  MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=1 MONDAY_GATE_TEST_SECONDS=2 \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
+  --from-controller direct --candidate-controller "$c0" --root "$ROOT" \
+  >"$health_deadline_failure_output" 2>&1; then
+  printf 'Gate accepted health that became eligible after the evidence deadline\n' >&2
+  exit 1
+fi
+grep -Fq 'did not produce an eligible evidence sample before the evidence deadline' \
+  "$health_deadline_failure_output"
+health_deadline_run_json=$(find "$ROOT/data/monday/evidence/shadow-gates/$c0" \
+  -type f -name run.json -print | while IFS= read -r candidate; do
+    if jq -e '.evidence_timeout_seconds == 2
+      and .markets.spot != null and .markets.usdm == null' \
+      "$candidate" >/dev/null; then
+      printf '%s\n' "$candidate"
+    fi
+  done)
+[[ $(printf '%s\n' "$health_deadline_run_json" \
+  | awk 'NF { count++ } END { print count + 0 }') == 1 ]]
+jq -e '
+  .markets.spot.observed_runtime_seconds >= .evidence_timeout_seconds
+  and .markets.spot.observation_finished_monotonic_ns
+    >= .markets.spot.observation_started_monotonic_ns
+  and .markets.usdm == null' "$health_deadline_run_json" >/dev/null
 
 # Time alone never passes the Gate: one clean segment is insufficient.
 if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_SINGLE_CLEAN_SEGMENT=1 \
