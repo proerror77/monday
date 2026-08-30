@@ -863,7 +863,45 @@ jq -e --argjson required "$required_gate_seconds" \
   "$gate" >/dev/null
 run_json="$(dirname -- "$gate")/run.json"
 jq -e --argjson segment "$spot_segment_seconds" \
-  '.segment_seconds == $segment' "$run_json" >/dev/null
+  --argjson required "$required_gate_seconds" \
+  '.segment_seconds == $segment
+   and .test_only == true
+   and .formal_required_duration_seconds == $required
+   and all(.markets[];
+     .observation_started_monotonic_ns == null
+     or (.observation_finished_monotonic_ns >= .observation_started_monotonic_ns))' \
+  "$run_json" >/dev/null
+# A fixture receipt must not become production evidence by editing its mode and
+# both self-reported runtimes.  Keep the adjacent run.json unchanged apart from
+# its run id and provide the marker a real cutover would require; the
+# authoritative wrapper still rejects the fixture provenance.
+tampered_run_id=20240101T000000Z-1
+tampered_dir="$(dirname -- "$(dirname -- "$gate")")/$tampered_run_id"
+tampered_spool="$ROOT/data/monday/spool/binance-lob-rust-shadow/gate/$tampered_run_id"
+tampered_unit_root="$ROOT/run/monday/rust-lob-gate/$tampered_run_id"
+mkdir -p "$tampered_dir"
+jq --arg run "$tampered_run_id" --arg spool "$tampered_spool" \
+  '.run_id = $run | .run_spool = $spool' "$run_json" >"$tampered_dir/run.json"
+jq --arg run "$tampered_run_id" --arg spool "$tampered_spool" \
+  --arg unit_root "$tampered_unit_root" --argjson required "$required_gate_seconds" \
+  '.run_id = $run
+   | .run_spool = $spool
+   | .shadow_staging.spool_root = $spool
+   | .shadow_staging.run_unit_root = $unit_root
+   | .markets.spot.spool_dir = ($spool + "/spot")
+   | .markets.usdm.spool_dir = ($spool + "/usdm")
+   | .test_only = false | .production_eligible = true
+   | .markets.spot.observed_runtime_seconds = $required
+   | .markets.usdm.observed_runtime_seconds = $required' \
+  "$gate" >"$tampered_dir/gate.json"
+tampered_gate="$tampered_dir/gate.json"
+tampered_sha=$(monday_sha256_file "$tampered_gate")
+printf '%s  gate.json\n' "$tampered_sha" >"$tampered_dir/PASSED.sha256"
+monday_validate_v2_gate "$tampered_gate" direct "$c0" "$tampered_sha"
+if monday_validate_v2_gate_authoritative "$ROOT" "$tampered_gate" direct "$c0" "$tampered_sha"; then
+  printf 'authoritative Gate validation accepted a promoted fixture receipt\n' >&2
+  exit 1
+fi
 jq -e '.shadow_staging.aggregate_slice.cgroup
   == ("/" + .shadow_staging.aggregate_slice.name)' "$gate" >/dev/null
 oss_source=$(sed -n '/^run_oss()/,/^verify_oss_roundtrips()/p' \
@@ -1136,7 +1174,7 @@ bootstrap_transition_sha=$(printf '%s\n' "$bootstrap_cutover_output" | sed -n 's
 [[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == \
   "$ROOT/opt/monday/releases/binance-lob-archiver/$p0_sha/binance-lob-archiver" ]]
 [[ $(monday_sha256_file "$bootstrap_transition") == "$bootstrap_transition_sha" ]]
-monday_validate_v2_transition "$bootstrap_transition" direct "$c0" "$gate" "$gate_sha"
+monday_validate_v2_transition "$ROOT" "$bootstrap_transition" direct "$c0" "$gate" "$gate_sha"
 bootstrap_calls="$ROOT/run/cutover-fixture.calls"
 for unit in \
   binance-lob-archiver@spot.service binance-lob-archiver@usdm.service \
@@ -1500,7 +1538,7 @@ transition_sha=$(printf '%s\n' "$cutover_output" | sed -n 's/^SHA-256: //p')
 [[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == \
   "$ROOT/opt/monday/releases/binance-lob-archiver/$p1_sha/binance-lob-archiver" ]]
 [[ $(monday_sha256_file "$transition") == "$transition_sha" ]]
-monday_validate_v2_transition "$transition" "$c0" "$c1" "$gate" "$gate_sha"
+monday_validate_v2_transition "$ROOT" "$transition" "$c0" "$c1" "$gate" "$gate_sha"
 jq -e --argjson pid "$fixture_process_pid" \
   '.production_process | .spot.main_pid == $pid and .usdm.main_pid == $pid
    and .spot.process_exe_sha256 == .usdm.process_exe_sha256

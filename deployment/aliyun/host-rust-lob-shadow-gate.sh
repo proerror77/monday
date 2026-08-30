@@ -1648,12 +1648,30 @@ gate_started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ); gate_finished=false
 declare -A phase_pid phase_exe_sha phase_session phase_segments phase_oss phase_runtime
 declare -A phase_strict_lob phase_strict_aggregate phase_strict_raw
 declare -A market_gate_started_ns market_observation_started_ns frozen_symbol_count frozen_catalog_sha256
+declare -A market_observation_started_mono_ns market_observation_finished_mono_ns
 declare -A market_observed_at_ns
 declare -A initial_upload_failure_count last_health_updated_ns last_health_advance_mono
 declare -A max_health_silence_seconds health_samples
 write_run_json() {
-  jq -cn --arg run "$run_id" --arg controller "$CANDIDATE_CONTROLLER" --arg payload "$candidate_payload" --arg runtime "$candidate_runtime" --arg spool "$run_spool" --arg worker_slice "$GATE_WORKER_SLICE" --arg worker_slice_sha "$gate_worker_slice_sha256" --arg worker_slice_cgroup "$gate_worker_slice_control_group" --argjson worker_high "$GATE_WORKER_MEMORY_HIGH_BYTES" --argjson worker_max "$GATE_WORKER_MEMORY_MAX_BYTES" --argjson segment "$GATE_SEGMENT_SECONDS" --argjson requested "$GATE_DURATION_SECONDS" --argjson settle "$HEALTH_SETTLE_DURATION_SECONDS" --argjson resources "$resource_samples" --argjson psi "$psi_windows" \
-    '{schema:"monday.rust_lob_shadow_gate_run.v3",control_plane_version:2,run_id:$run,candidate_controller_sha256:$controller,candidate_payload_sha256:$payload,candidate_runtime_contract_sha256:$runtime,run_spool:$spool,worker_slice:{name:$worker_slice,sha256:$worker_slice_sha,cgroup:$worker_slice_cgroup,memory_high_bytes:$worker_high,memory_max_bytes:$worker_max},segment_seconds:$segment,requested_duration_seconds:$requested,health_settle_seconds:$settle,resource_admission:$resources,io_full_psi_windows:$psi}' >"$run_json.tmp"
+  local test_only_json=false market markets_json='{}' observed_json
+  [[ $TEST_ONLY == false ]] || test_only_json=true
+  for market in "${markets[@]}"; do
+    observed_json=null
+    if [[ -n ${phase_runtime[$market]+x} ]]; then
+      observed_json=$(jq -cn \
+        --argjson runtime "${phase_runtime[$market]}" \
+        --argjson started_ns "${market_observation_started_mono_ns[$market]}" \
+        --argjson finished_ns "${market_observation_finished_mono_ns[$market]}" \
+        '{observed_runtime_seconds:$runtime,
+          observation_started_monotonic_ns:$started_ns,
+          observation_finished_monotonic_ns:$finished_ns}') || return 1
+    fi
+    markets_json=$(jq -cn --argjson values "$markets_json" --arg market "$market" \
+      --argjson observed "$observed_json" \
+      '$values + {($market):$observed}') || return 1
+  done
+  jq -cn --arg run "$run_id" --arg controller "$CANDIDATE_CONTROLLER" --arg payload "$candidate_payload" --arg runtime "$candidate_runtime" --arg spool "$run_spool" --arg worker_slice "$GATE_WORKER_SLICE" --arg worker_slice_sha "$gate_worker_slice_sha256" --arg worker_slice_cgroup "$gate_worker_slice_control_group" --argjson worker_high "$GATE_WORKER_MEMORY_HIGH_BYTES" --argjson worker_max "$GATE_WORKER_MEMORY_MAX_BYTES" --argjson segment "$GATE_SEGMENT_SECONDS" --argjson requested "$GATE_DURATION_SECONDS" --argjson formal_required "$REQUIRED_DURATION_SECONDS" --argjson settle "$HEALTH_SETTLE_DURATION_SECONDS" --argjson resources "$resource_samples" --argjson psi "$psi_windows" --argjson test_only "$test_only_json" --argjson markets "$markets_json" \
+    '{schema:"monday.rust_lob_shadow_gate_run.v3",control_plane_version:2,run_id:$run,candidate_controller_sha256:$controller,candidate_payload_sha256:$payload,candidate_runtime_contract_sha256:$runtime,test_only:$test_only,run_spool:$spool,worker_slice:{name:$worker_slice,sha256:$worker_slice_sha,cgroup:$worker_slice_cgroup,memory_high_bytes:$worker_high,memory_max_bytes:$worker_max},segment_seconds:$segment,requested_duration_seconds:$requested,formal_required_duration_seconds:$formal_required,health_settle_seconds:$settle,resource_admission:$resources,io_full_psi_windows:$psi,markets:$markets}' >"$run_json.tmp"
   chmod 0640 "$run_json.tmp"; mv -f -- "$run_json.tmp" "$run_json"
 }
 write_resource_monitor_failure() {
@@ -2066,7 +2084,7 @@ run_market_gate_phase() {
     '{sha256:$sha,session_id:$session,frozen_symbol_count:$symbols,
       frozen_catalog_sha256:$catalog,max_health_silence_seconds:$silence,samples:$samples}')
   observation_started_ns=$(monotonic_nanoseconds); observation_deadline_ns=$(( observation_started_ns + GATE_DURATION_SECONDS * 1000000000 )); while (( $(monotonic_nanoseconds) < observation_deadline_ns )); do validate_observation_sample "$market"; assert_host_memory_reserve; [[ $(systemctl_value "$market" NRestarts) == 0 ]] || die "$market restarted"; [[ $(systemctl_value "$market" MainPID) == "$pid" ]] || die "$market MainPID changed"; [[ $TEST_ONLY == true ]] && break; sleep 15; done
-  observation_finished_ns=$(monotonic_nanoseconds); phase_runtime["$market"]=$(( (observation_finished_ns - observation_started_ns) / 1000000000 )); systemctl stop "${unit[$market]}"; systemctl_active "${unit[$market]}" && die "$market shadow remained active"; \
+  observation_finished_ns=$(monotonic_nanoseconds); market_observation_started_mono_ns[$market]=$observation_started_ns; market_observation_finished_mono_ns[$market]=$observation_finished_ns; phase_runtime["$market"]=$(( (observation_finished_ns - observation_started_ns) / 1000000000 )); systemctl stop "${unit[$market]}"; systemctl_active "${unit[$market]}" && die "$market shadow remained active"; \
     resource_monitor_stop_or_die "shadow-$market"; \
     calibrate_psi "shadow-$market-tail"; resource_monitor_start "strict-verifier-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; \
     verify_segments "$market"; resource_monitor_stop_or_die "strict-verifier-$market"
@@ -2373,6 +2391,11 @@ for market in "${markets[@]}"; do
       strict_raw_trade_continuity_readback:$strict_raw}')
   markets_json=$(jq -cn --argjson values "$markets_json" --arg market "$market" --argjson value "$market_json" '$values + {($market):$value}')
 done
+# Commit the independently observed run evidence only after both market phases
+# and their strict readbacks have completed.  The preflight snapshot written
+# earlier remains useful for diagnostics; this atomic replacement is the source
+# cutover must verify for production eligibility.
+write_run_json || die 'could not commit final run evidence'
 run_units_json=$(jq -cn --arg spot "${unit[spot]}" --arg usdm "${unit[usdm]}" \
   '{spot:$spot,usdm:$usdm}')
 run_upload_units_json=$(jq -cn \

@@ -208,7 +208,7 @@ else
   jq -e '.test_only == true and .production_eligible == false' "$GATE" >/dev/null \
     || die 'fixture Gate must never authorize production'
 fi
-monday_validate_v2_gate "$GATE" "$FROM" "$TO" "$GATE_SHA" \
+monday_validate_v2_gate_authoritative "$ROOT" "$GATE" "$FROM" "$TO" "$GATE_SHA" \
   || die 'Gate receipt does not authorize this exact pair transition'
 gate_production_runtime=$(jq -ce '.production_runtime' "$GATE") \
   || die 'Gate receipt has no production runtime contract'

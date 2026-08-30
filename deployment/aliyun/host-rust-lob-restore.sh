@@ -237,7 +237,7 @@ verify_existing_restore_state() {
       || die 'existing restore Gate digest field is malformed'
     [[ $receipt_gate == "$named_gate" && $receipt_gate_sha == "$named_gate_sha" ]] \
       || die 'existing restore Gate identity differs from its transition'
-    monday_validate_v2_transition "$named_transition" "$transition_validator_from" "$CONTROLLER" \
+    monday_validate_v2_transition "$ROOT" "$named_transition" "$transition_validator_from" "$CONTROLLER" \
       "$named_gate" "$named_gate_sha" \
       || die 'existing restore transition failed exact Gate-chain validation'
   else
@@ -421,7 +421,7 @@ if [[ -e $active_transition_receipt || -L $active_transition_receipt ]]; then
   gate_relative=${transition_gate#"$canonical_gate_root"/}
   [[ $gate_relative =~ ^runs/[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*/gate\.json$ ]] \
     || die 'active transition Gate path is outside the canonical V2 run path'
-  monday_validate_v2_transition "$active_transition_receipt" "$transition_validator_from" "$CONTROLLER" \
+  monday_validate_v2_transition "$ROOT" "$active_transition_receipt" "$transition_validator_from" "$CONTROLLER" \
     "$transition_gate" "$transition_gate_sha" \
     || die 'active transition receipt failed its exact Gate-chain validation'
   if [[ $TEST_ONLY == false ]]; then

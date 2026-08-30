@@ -1912,12 +1912,144 @@ monday_validate_v2_gate() {
     | $value.triplets[] | [$market, .observed_at, .observed_at_ns, $value.observed_at_ns] | @tsv' "$gate")
 }
 
+# Validate the evidence that is outside the Gate receipt itself.  The ordinary
+# Gate validator deliberately remains a pure JSON/schema check for callers that
+# only have a receipt.  A transition must use this root-aware wrapper: it binds
+# the receipt to the immutable candidate's shadow cadence and to the adjacent
+# run.json written by the Gate after its observation phases complete.
+monday_validate_v2_gate_authoritative() {
+  [[ $# -eq 5 ]] || return 2
+  local root=${1%/} gate=$2 from=$3 candidate=$4 gate_sha=$5
+  local canonical_gate_root gate_relative gate_dir run_json marker marker_gate_sha
+  local gate_run gate_payload gate_runtime gate_segment gate_required gate_settle
+  local gate_test_only gate_eligible run_test_only run_formal
+  local run_requested gate_spool run_spool expected_spool market candidate_deployment candidate_gate candidate_formal env segment spot_segment usdm_segment
+  local gate_markets
+  [[ -n $root ]] || root=/
+  monday_file_direct "$gate" || return 1
+  [[ -d $root && ! -L $root ]] || return 1
+  root=$(readlink -f -- "$root") || return 1
+  gate=$(readlink -f -- "$gate") || return 1
+  monday_path_direct "$root" || return 1
+  monday_validate_v2_gate "$gate" "$from" "$candidate" "$gate_sha" || return 1
+  canonical_gate_root=$(monday_root_join "$root" "data/monday/evidence/shadow-gates/$candidate") || return 1
+  gate_relative=${gate#"$canonical_gate_root"/}
+  [[ $gate_relative =~ ^[a-f0-9]{64}/runs/[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*/gate\.json$ ]] || return 1
+  gate_dir=$(dirname -- "$gate")
+  run_json="$gate_dir/run.json"
+  monday_file_direct "$run_json" || return 1
+  gate_run=$(jq -er '.run_id | select(type == "string")' "$gate") || return 1
+  gate_payload=$(jq -er '.candidate_payload_sha256 | select(type == "string")' "$gate") || return 1
+  gate_runtime=$(jq -er '.candidate_runtime_contract_sha256 | select(type == "string")' "$gate") || return 1
+  gate_segment=$(jq -er '.segment_seconds | select(type == "number" and floor == .)' "$gate") || return 1
+  gate_required=$(jq -er '.required_duration_seconds | select(type == "number" and floor == .)' "$gate") || return 1
+  gate_settle=$(jq -er '.health_settle_seconds | select(type == "number" and floor == .)' "$gate") || return 1
+  gate_test_only=$(jq -er '.test_only | if type == "boolean" then tostring else error end' "$gate") || return 1
+  gate_eligible=$(jq -er '.production_eligible | if type == "boolean" then tostring else error end' "$gate") || return 1
+  [[ $gate_run == "$(basename -- "$gate_dir")" ]] || return 1
+  monday_path_direct "$gate_dir" || return 1
+  expected_spool=$(monday_root_join "$root" "data/monday/spool/binance-lob-rust-shadow/gate/$gate_run") || return 1
+  gate_spool=$(jq -er '.run_spool | select(type == "string")' "$gate") || return 1
+  [[ $gate_spool == "$expected_spool" ]] || return 1
+
+  # Re-read both shadow environment files from the immutable candidate.  The
+  # receipt's segment value is not authoritative, even if its hash was changed
+  # by the caller together with the JSON bytes.
+  candidate_deployment=$(monday_root_join "$root" "opt/monday/releases/binance-lob-controller/$candidate/deployment") || return 1
+  monday_verify_controller_release "$root" "$candidate" || return 1
+  candidate_gate="$candidate_deployment/host-rust-lob-shadow-gate.sh"
+  monday_file_direct "$candidate_gate" || return 1
+  candidate_formal=$(awk -F= '
+    /^readonly REQUIRED_DURATION_SECONDS=[1-9][0-9]*$/ { count++; value=$2 }
+    END { if (count != 1) exit 1; print value }
+  ' "$candidate_gate") || return 1
+  [[ $candidate_formal == "$gate_required" ]] || return 1
+  for market in spot usdm; do
+    env="$candidate_deployment/binance-lob-archiver-rust-${market}.env"
+    monday_file_direct "$env" || return 1
+    segment=$(monday_env_value "$env" SEGMENT_SECONDS) || return 1
+    [[ $segment =~ ^[1-9][0-9]*$ && $segment -ge 60 ]] || return 1
+    if [[ $market == spot ]]; then
+      spot_segment=$segment
+    else
+      usdm_segment=$segment
+    fi
+  done
+  [[ $spot_segment == "$usdm_segment" && $gate_segment == "$spot_segment" ]] || return 1
+
+  run_test_only=$(jq -er '.test_only | if type == "boolean" then tostring else error end' "$run_json") || return 1
+  run_spool=$(jq -er '.run_spool | select(type == "string")' "$run_json") || return 1
+  [[ $run_spool == "$expected_spool" ]] || return 1
+  run_formal=$(jq -er '.formal_required_duration_seconds | select(type == "number" and floor == .)' "$run_json") || return 1
+  run_requested=$(jq -er '.requested_duration_seconds | select(type == "number" and floor == .)' "$run_json") || return 1
+  gate_markets=$(jq -ce '.markets | select(type == "object")' "$gate") || return 1
+  jq -e --arg run "$gate_run" --arg candidate "$candidate" --arg payload "$gate_payload" \
+    --arg runtime "$gate_runtime" --arg expected_spool "$expected_spool" \
+    --argjson segment "$gate_segment" \
+    --argjson formal "$gate_required" --argjson settle "$gate_settle" \
+    --argjson gate_test_only "$gate_test_only" --argjson gate_eligible "$gate_eligible" \
+    --arg run_test_only "$run_test_only" \
+    --argjson run_formal "$run_formal" --argjson run_requested "$run_requested" \
+    --argjson gate_markets "$gate_markets" '
+      .schema == "monday.rust_lob_shadow_gate_run.v3"
+      and .control_plane_version == 2
+      and .run_id == $run
+      and .candidate_controller_sha256 == $candidate
+      and .candidate_payload_sha256 == $payload
+      and .candidate_runtime_contract_sha256 == $runtime
+      and .run_spool == $expected_spool
+      and .segment_seconds == $segment
+      and .formal_required_duration_seconds == $formal
+      and (.health_settle_seconds | type == "number" and floor == . and . >= 1
+        and (if $gate_test_only then true else . == $settle end))
+      and .test_only == ($run_test_only == "true")
+      and .test_only == $gate_test_only
+      and ($run_requested >= 1)
+      and (.markets | keys | sort) == ["spot", "usdm"]
+      and ($gate_markets | keys | sort) == ["spot", "usdm"]
+      and (. as $run_root | all(["spot", "usdm"][];
+        $run_root.markets[.].observed_runtime_seconds == $gate_markets[.].observed_runtime_seconds))' \
+    "$run_json" >/dev/null || return 1
+  jq -e --arg run "$gate_run" --arg spool "$expected_spool" '
+    .run_spool == $spool
+    and .shadow_staging.spool_root == $spool
+    and (.shadow_staging.run_unit_root | type == "string"
+      and endswith("/run/monday/rust-lob-gate/" + $run))
+    and all(.markets[]; .spool_dir == ($spool + "/" + .market))' \
+    "$gate" >/dev/null || return 1
+
+  # A formal Gate must carry the commit marker and a complete observation from
+  # both markets.  Fixture receipts remain useful for offline tests but can
+  # never be upgraded merely by editing the receipt: their run.json still says
+  # test_only=true and has no formal elapsed observation.
+  if [[ $gate_test_only == false ]]; then
+    [[ $gate_eligible == true && $run_test_only == false ]] || return 1
+    [[ $run_requested == "$gate_required" && $run_formal == "$gate_required" ]] || return 1
+    marker="$gate_dir/PASSED.sha256"
+    [[ -f $marker && ! -L $marker ]] || return 1
+    marker_gate_sha=$(awk '$2 == "gate.json" { count++; value=$1 } END { if (count != 1) exit 1; print value }' "$marker") || return 1
+    [[ $marker_gate_sha == "$gate_sha" ]] || return 1
+    for market in spot usdm; do
+      jq -e --arg market "$market" --argjson required "$gate_required" \
+        --argjson gate_market "$(jq -ce --arg market "$market" '.[$market]' <<<"$gate_markets")" '
+          (.markets[$market] | select(type == "object")) as $m
+          | ($m.observed_runtime_seconds | type == "number" and floor == . and . >= $required)
+          and ($m.observation_started_monotonic_ns | type == "number" and floor == . and . >= 0)
+          and ($m.observation_finished_monotonic_ns | type == "number" and floor == . and . >= $m.observation_started_monotonic_ns)
+          and (($m.observation_finished_monotonic_ns
+                - $m.observation_started_monotonic_ns) >= ($required * 1000000000))
+          and ($m.observed_runtime_seconds == $gate_market.observed_runtime_seconds)' \
+        "$run_json" >/dev/null || return 1
+    done
+  fi
+}
+
 # Validate the transition receipt and its exact V2 Gate evidence.  A cutover
 # receipt is not authoritative by itself: the immutable Gate receipt must be
 # present, hash-identical, and pass the full evidence validator above.
 monday_validate_v2_transition() {
-  [[ $# -eq 5 ]] || return 2
-  local receipt=$1 from=$2 to=$3 gate=$4 gate_sha=$5
+  [[ $# -eq 6 ]] || return 2
+  local root=${1%/} receipt=$2 from=$3 to=$4 gate=$5 gate_sha=$6
   local gate_evidence gate_payload gate_runtime gate_from gate_production_runtime pair_asset_keys controller_projection_keys
   # The stable pair contains exactly the nine runtime unit/env/slice assets
   # (production + shadow).  Recovery/health helpers remain controller assets
@@ -1928,7 +2060,7 @@ monday_validate_v2_transition() {
   [[ $from == direct || $from =~ ^[a-f0-9]{64}$ ]] || return 1
   [[ $to =~ ^[a-f0-9]{64}$ && $gate_sha =~ ^[a-f0-9]{64}$ ]] || return 1
   monday_file_direct "$gate" || return 1
-  monday_validate_v2_gate "$gate" "$from" "$to" "$gate_sha" || return 1
+  monday_validate_v2_gate_authoritative "$root" "$gate" "$from" "$to" "$gate_sha" || return 1
   gate_evidence=$(jq -ceS \
     '{candidate_control_bytes,resource_admission,io_full_psi_windows,shadow_staging,checks,markets}' \
     "$gate") || return 1
