@@ -1668,6 +1668,88 @@ write_run_json() {
     '{schema:"monday.rust_lob_shadow_gate_run.v3",control_plane_version:2,run_id:$run,candidate_controller_sha256:$controller,candidate_payload_sha256:$payload,candidate_runtime_contract_sha256:$runtime,test_only:$test_only,run_spool:$spool,worker_slice:{name:$worker_slice,sha256:$worker_slice_sha,cgroup:$worker_slice_cgroup,memory_high_bytes:$worker_high,memory_max_bytes:$worker_max},segment_seconds:$segment,evidence_timeout_seconds:$evidence_timeout,formal_evidence_timeout_seconds:$formal_evidence_timeout,health_settle_seconds:$settle,resource_admission:$resources,io_full_psi_windows:$psi,markets:$markets}' >"$run_json.tmp"
   chmod 0640 "$run_json.tmp"; mv -f -- "$run_json.tmp" "$run_json"
 }
+write_deadline_segments() {
+  local source=$1 destination=$2 count=0 records='[]'
+  local manifest manifest_sha path manifest_json data_sha data_size success_marker success_sha record
+  local temporary="$destination.tmp.$$"
+  while IFS=$'\t' read -r manifest manifest_sha; do
+    path=${manifest%.manifest.json}
+    [[ -f $manifest && -f $path && -f ${path}._SUCCESS ]] || return 1
+    [[ $(sha256_file "$manifest") == "$manifest_sha" ]] || return 1
+    manifest_json=$(jq -ce . "$manifest") || return 1
+    data_sha=$(sha256_file "$path") || return 1
+    [[ $(jq -er '.sha256 | select(type == "string" and test("^[a-f0-9]{64}$"))' \
+      "$manifest") == "$data_sha" ]] || return 1
+    success_marker=$(<"${path}._SUCCESS")
+    [[ $success_marker == "$data_sha" ]] || return 1
+    success_sha=$(sha256_file "${path}._SUCCESS") || return 1
+    data_size=$(wc -c <"$path" | tr -d '[:space:]')
+    [[ $data_size =~ ^[1-9][0-9]*$ ]] || return 1
+    record=$(jq -cn --argjson manifest "$manifest_json" \
+      --arg manifest_sha "$manifest_sha" --arg data_sha "$data_sha" \
+      --argjson data_size "$data_size" --arg success_marker "$success_marker" \
+      --arg success_sha "$success_sha" \
+      '{manifest:$manifest,manifest_sha256:$manifest_sha,data_sha256:$data_sha,
+        data_size_bytes:$data_size,success_marker:$success_marker,
+        success_sha256:$success_sha}') || return 1
+    records=$(jq -cn --argjson values "$records" --argjson value "$record" \
+      '$values + [$value]') || return 1
+    count=$((count + 1))
+  done <"$source"
+  (( count == 2 )) || return 1
+  jq -cn --argjson segments "$records" \
+    '{schema:"monday.rust_lob_shadow_gate_deadline_segments.v1",segments:$segments}' \
+    >"$temporary" || return 1
+  chmod 0440 "$temporary" || return 1
+  mv -f -- "$temporary" "$destination"
+}
+write_deadline_failure() {
+  local market=$1 readiness=$2 health_source=$3 segment_source=$4
+  local started_ns=$5 deadline_ns=$6 sample_started_ns=$7 sampled_ns=$8 failure_ns=$9
+  local elapsed health_eligible=false
+  local segment_pair_ready=false segment_snapshot_json=null
+  local health_file="$evidence_dir/deadline-health.json"
+  local segment_file="$evidence_dir/deadline-segments.json"
+  local temporary="$evidence_dir/deadline-failure.json.tmp.$$"
+  [[ -d $evidence_dir && -f $health_source ]] || return 1
+  cp -- "$health_source" "$health_file.tmp.$$" || return 1
+  chmod 0440 "$health_file.tmp.$$" || return 1
+  mv -f -- "$health_file.tmp.$$" "$health_file" || return 1
+  if health_ok "$market" "$health_file"; then
+    health_eligible=true
+  fi
+  if (( readiness == 0 )); then
+    [[ -f $segment_source ]] || return 1
+    write_deadline_segments "$segment_source" "$segment_file" || return 1
+    segment_pair_ready=true
+    segment_snapshot_json=$(jq -cn --arg file "${segment_file##*/}" \
+      --arg sha "$(sha256_file "$segment_file")" '{file:$file,sha256:$sha}') || return 1
+  fi
+  elapsed=$(( (failure_ns - started_ns) / 1000000000 ))
+  jq -cn --arg run "$run_id" --arg market "$market" \
+    --arg controller "$CANDIDATE_CONTROLLER" --arg payload "$candidate_payload" \
+    --arg runtime "$candidate_runtime" --arg health_file "${health_file##*/}" \
+    --arg health_sha "$(sha256_file "$health_file")" \
+    --argjson readiness "$readiness" --argjson health_eligible "$health_eligible" \
+    --argjson segment_pair_ready "$segment_pair_ready" \
+    --argjson segment_snapshot "$segment_snapshot_json" \
+    --argjson started "$started_ns" --argjson deadline "$deadline_ns" \
+    --argjson sample_started "$sample_started_ns" --argjson sampled "$sampled_ns" \
+    --argjson failure "$failure_ns" --argjson elapsed "$elapsed" \
+    '{schema:"monday.rust_lob_shadow_gate_deadline_failure.v1",authoritative:false,
+      cause:"evidence_deadline",run_id:$run,market:$market,
+      candidate_controller_sha256:$controller,candidate_payload_sha256:$payload,
+      candidate_runtime_contract_sha256:$runtime,
+      observation:{started_monotonic_ns:$started,deadline_monotonic_ns:$deadline,
+        sample_started_monotonic_ns:$sample_started,sampled_monotonic_ns:$sampled,
+        failure_detected_monotonic_ns:$failure,elapsed_seconds:$elapsed},
+      health_eligible:$health_eligible,segment_pair_ready:$segment_pair_ready,
+      segment_readiness_code:$readiness,
+      health_snapshot:{file:$health_file,sha256:$health_sha},
+      segment_snapshot:$segment_snapshot}' >"$temporary" || return 1
+  chmod 0640 "$temporary" || return 1
+  mv -f -- "$temporary" "$evidence_dir/deadline-failure.json"
+}
 write_resource_monitor_failure() {
   local cleanup_failed=$1 temporary diagnostic
   [[ ${resource_monitor_breach_seen:-false} == true && -d ${evidence_dir:-} ]] || return 0
@@ -2249,7 +2331,7 @@ verify_segments() {
   phase_segments["$market"]=$count
 }
 run_market_gate_phase() {
-  local market=$1 settle observation_deadline_ns observation_finished_ns observation_health_snapshot observation_sampled_ns observation_segment_snapshot observation_started_ns pid started_ns readiness live_health
+  local market=$1 settle observation_deadline_ns observation_failure_ns observation_finished_ns observation_health_snapshot observation_sample_started_ns observation_sampled_ns observation_segment_snapshot observation_started_ns pid started_ns readiness live_health
   resource_monitor_start "shadow-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; fixture_seed_market "$market"; systemctl reset-failed "${unit[$market]}" >/dev/null 2>&1 || true
   started_ns=$(date +%s%N); market_gate_started_ns[$market]=$started_ns
   systemctl start "${unit[$market]}"; pid=$(shadow_identity_wait "$market"); phase_pid["$market"]=$pid; phase_exe_sha["$market"]=$candidate_payload
@@ -2270,6 +2352,20 @@ run_market_gate_phase() {
   observation_segment_snapshot="$tmp_dir/$market-observation-segments.tsv"
   market_health_snapshot[$market]=$observation_health_snapshot
   while :; do
+    observation_failure_ns=$(monotonic_nanoseconds)
+    if [[ -n ${observation_sampled_ns:-} ]] \
+      && (( observation_failure_ns >= observation_deadline_ns )); then
+      market_observation_finished_mono_ns[$market]=$observation_failure_ns
+      phase_runtime[$market]=$(( (observation_failure_ns - observation_started_ns) / 1000000000 ))
+      write_run_json || die 'could not commit deadline failure run evidence'
+      write_deadline_failure "$market" "$readiness" "$observation_health_snapshot" \
+        "$observation_segment_snapshot" "$observation_started_ns" \
+        "$observation_deadline_ns" "$observation_sample_started_ns" \
+        "$observation_sampled_ns" "$observation_failure_ns" \
+        || die 'could not commit deadline failure sample evidence'
+      die "$market did not produce an eligible evidence sample before the evidence deadline"
+    fi
+    observation_sample_started_ns=$observation_failure_ns
     if clean_segment_pair_ready "$market" "$observation_segment_snapshot"; then
       readiness=0
     else
@@ -2284,6 +2380,11 @@ run_market_gate_phase() {
       market_observation_finished_mono_ns[$market]=$observation_sampled_ns
       phase_runtime[$market]=$(( (observation_sampled_ns - observation_started_ns) / 1000000000 ))
       write_run_json || die 'could not commit deadline failure run evidence'
+      write_deadline_failure "$market" "$readiness" "$observation_health_snapshot" \
+        "$observation_segment_snapshot" "$observation_started_ns" \
+        "$observation_deadline_ns" "$observation_sample_started_ns" \
+        "$observation_sampled_ns" "$observation_sampled_ns" \
+        || die 'could not commit deadline failure sample evidence'
       die "$market did not produce an eligible evidence sample before the evidence deadline"
     fi
     (( readiness == 1 || readiness == 0 )) || die "$market segment evidence is malformed"
