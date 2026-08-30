@@ -671,9 +671,57 @@ if [[ $FROM == direct ]]; then
       || die 'existing cutover recovery intent is indirect'
     [[ $(monday_file_mode "$recovery_intent") == 440 ]] \
       || die 'existing cutover recovery intent mode is invalid'
-    cmp -s "$recovery_intent_tmp" "$recovery_intent" \
-      || die 'existing cutover recovery intent differs from this frozen direct transition'
-    rm -f -- "$recovery_intent_tmp"
+    if cmp -s "$recovery_intent_tmp" "$recovery_intent"; then
+      rm -f -- "$recovery_intent_tmp"
+    else
+      # A fully rolled-back C0/P0/R0 may be admitted by a newly completed Gate.
+      # Retire only an intact old authority for the identical pair; any mixed
+      # topology, transition evidence, or non-Gate field drift remains closed.
+      [[ ! -e $transition_receipt && ! -L $transition_receipt \
+        && ! -e $transition_marker && ! -L $transition_marker ]] \
+        || die 'changed Gate cannot replace recovery with transition evidence present'
+      existing_recovery_gate=$(jq -er '.gate_receipt' "$recovery_intent") \
+        || die 'existing cutover recovery intent has no Gate path'
+      existing_recovery_gate_sha=$(jq -er '.gate_sha256' "$recovery_intent") \
+        || die 'existing cutover recovery intent has no Gate digest'
+      monday_validate_v2_gate_authoritative "$ROOT" "$existing_recovery_gate" direct \
+        "$TO" "$existing_recovery_gate_sha" \
+        || die 'existing cutover recovery intent Gate is not authoritative'
+      jq -e --arg from "$before_controller" --arg to "$TO" \
+        --arg before_payload "$before_payload" --arg before_runtime "$before_runtime" \
+        --arg before_projection "$before_production_projection" \
+        --arg payload "$target_payload" --arg runtime "$target_runtime" '
+          .from_controller_sha256 == $from
+          and .candidate_controller_sha256 == $to
+          and .candidate_payload_sha256 == $payload
+          and .candidate_runtime_contract_sha256 == $runtime
+          and .before.payload_sha256 == $before_payload
+          and .before.runtime_contract_sha256 == $before_runtime
+          and .before.production_projection == $before_projection
+        ' "$existing_recovery_gate" >/dev/null \
+        || die 'existing cutover recovery Gate differs from the rolled-back pair'
+      if [[ $TEST_ONLY == false ]]; then
+        jq -e '.test_only == false and .production_eligible == true' \
+          "$existing_recovery_gate" >/dev/null \
+          || die 'existing production recovery Gate is ineligible'
+      else
+        jq -e '.test_only == true and .production_eligible == false' \
+          "$existing_recovery_gate" >/dev/null \
+          || die 'existing fixture recovery Gate is invalid'
+      fi
+      jq -e --slurpfile frozen "$recovery_intent_tmp" '
+        del(.gate_receipt, .gate_sha256)
+        == ($frozen[0] | del(.gate_receipt, .gate_sha256))
+      ' "$recovery_intent" >/dev/null \
+        || die 'existing cutover recovery intent differs from the rolled-back pair'
+      rm -f -- "$recovery_intent" \
+        || die 'could not retire rolled-back cutover recovery intent'
+      sync -f "$receipt_root/$TO" \
+        || die 'could not durably retire rolled-back cutover recovery intent'
+      [[ ! -e $recovery_intent && ! -L $recovery_intent ]] \
+        || die 'rolled-back cutover recovery intent survived retirement'
+      mv -f -- "$recovery_intent_tmp" "$recovery_intent"
+    fi
   else
     mv -f -- "$recovery_intent_tmp" "$recovery_intent"
   fi

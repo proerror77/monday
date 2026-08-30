@@ -959,6 +959,47 @@ grep -Fq 'Pair restore already complete (read-only)' <<<"$payload_delta_restore_
 [[ $(monday_sha256_file "$payload_delta_restore_calls") == "$payload_delta_restore_calls_sha" ]]
 [[ $(monday_sha256_file "$payload_delta_restore_receipt") == "$payload_delta_restore_receipt_before" ]]
 [[ $(monday_sha256_file "$payload_delta_restore_receipt") == "$payload_delta_restore_sha" ]]
+# A second reboot must not reuse the previous boot's healthy file before the
+# current PID publishes.  Once a new sample crosses the current process start
+# lower bound, the same immutable receipt is read-only idempotent again.
+payload_delta_restore_pid_second_reboot=5153
+mkdir -p "$ROOT/proc/$payload_delta_restore_pid_second_reboot"
+ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p1_sha/binance-lob-archiver" \
+  "$ROOT/proc/$payload_delta_restore_pid_second_reboot/exe"
+payload_delta_second_reboot_started_ns=$(date +%s%N)
+payload_delta_previous_health_ns=$(jq -er '.updated_at_ns' \
+  "$production_spool_root/spot/health.json")
+(( payload_delta_previous_health_ns < payload_delta_second_reboot_started_ns ))
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_RESTORE_FIXTURE_SYSTEMD=1 \
+  MONDAY_RESTORE_FIXTURE_PID="$payload_delta_restore_pid_second_reboot" \
+  MONDAY_RESTORE_FIXTURE_PROCESS_STARTED_NS="$payload_delta_second_reboot_started_ns" \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-restore.sh" \
+  --controller "$c1" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'read-only Restore accepted health from the previous boot\n' >&2
+  exit 1
+fi
+[[ $(monday_sha256_file "$payload_delta_restore_calls") == "$payload_delta_restore_calls_sha" ]]
+rm -f -- "$payload_delta_restore_stop"
+(write_payload_delta_restore_health restore-second-reboot) &
+payload_delta_restore_writer=$!
+for _ in {1..60}; do
+  [[ $(jq -r '.session_id // empty' "$production_spool_root/spot/health.json" 2>/dev/null) \
+    == restore-second-reboot-spot ]] && break
+  sleep 0.05
+done
+[[ $(jq -r '.session_id // empty' "$production_spool_root/spot/health.json") \
+  == restore-second-reboot-spot ]]
+payload_delta_second_readonly=$(MONDAY_CONTROL_PLANE_TEST=1 \
+  MONDAY_RESTORE_FIXTURE_SYSTEMD=1 \
+  MONDAY_RESTORE_FIXTURE_PID="$payload_delta_restore_pid_second_reboot" \
+  MONDAY_RESTORE_FIXTURE_PROCESS_STARTED_NS="$payload_delta_second_reboot_started_ns" \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-restore.sh" \
+  --controller "$c1" --root "$ROOT")
+: >"$payload_delta_restore_stop"
+wait "$payload_delta_restore_writer"
+grep -Fq 'Pair restore already complete (read-only)' <<<"$payload_delta_second_readonly"
+[[ $(monday_sha256_file "$payload_delta_restore_calls") == "$payload_delta_restore_calls_sha" ]]
+[[ $(monday_sha256_file "$payload_delta_restore_receipt") == "$payload_delta_restore_receipt_before" ]]
 
 # Reset the same immutable C0/P0/R0, then fail only after transition.json and
 # its digest have both passed readback.  Cleanup must preserve that committed
@@ -1463,9 +1504,24 @@ for asset in host-rust-lob-recovery-queue.sh monday-collector-health.sh; do
   [[ -f $target && ! -L $target ]]
   [[ $(monday_sha256_file "$target") != "$(monday_sha256_file "$active_asset")" ]]
 done
+refreshed_gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  bash -c '
+    root=$1; shift
+    mkdir -p "$root/proc/$$"
+    printf "1 fixture S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 4242\\n" >"$root/proc/$$/stat"
+    printf "%s\\n" "$$" >"$root/run/refreshed-direct-gate.pid"
+    exec "$@"
+  ' _ "$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
+  --from-controller direct --candidate-controller "$c0" --root "$ROOT")
+refreshed_direct_gate_pid=$(cat "$ROOT/run/refreshed-direct-gate.pid")
+rm -rf -- "$ROOT/proc/$refreshed_direct_gate_pid" "$ROOT/run/refreshed-direct-gate.pid"
+refreshed_gate=$(printf '%s\n' "$refreshed_gate_output" | sed -n 's/^V2 Gate receipt: //p')
+refreshed_gate_sha=$(printf '%s\n' "$refreshed_gate_output" | sed -n 's/^SHA-256: //p')
+[[ $refreshed_gate != "$gate" && $refreshed_gate_sha != "$gate_sha" ]]
+monday_validate_v2_gate_authoritative "$ROOT" "$refreshed_gate" direct "$c0" "$refreshed_gate_sha"
 hard_crash_retry_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from direct --to "$c0" \
-  --gate-receipt "$gate" --gate-sha256 "$gate_sha" --root "$ROOT")
+  --gate-receipt "$refreshed_gate" --gate-sha256 "$refreshed_gate_sha" --root "$ROOT")
 grep -Fq 'Pair cutover complete' <<<"$hard_crash_retry_output"
 [[ $(monday_active_controller_sha "$ROOT") == "$c0" ]]
 [[ ! -e $legacy_hard_crash_recovery && ! -L $legacy_hard_crash_recovery ]]

@@ -217,11 +217,22 @@ production_runtime=$(monday_verify_production_runtime_assets \
 
 production=$(monday_root_join "$ROOT" opt/monday/bin/binance-lob-archiver)
 
+process_started_at_ns() {
+  local pid=$1 fixture_started_ns
+  if [[ $TEST_ONLY == true && $FIXTURE_SYSTEMD == true ]]; then
+    fixture_started_ns=${MONDAY_RESTORE_FIXTURE_PROCESS_STARTED_NS:-1}
+    [[ $fixture_started_ns =~ ^[1-9][0-9]*$ ]] || return 1
+    printf '%s\n' "$fixture_started_ns"
+    return 0
+  fi
+  monday_process_started_at_ns "$ROOT" "$pid"
+}
+
 verify_existing_restore_state() {
   local receipt=$1 expected_runtime=$2 receipt_only=${3:-false} stable_binary expected resolved asset target
   local named_transition named_gate named_gate_sha receipt_gate receipt_gate_sha transition_from transition_mode transition_validator_from
   local receipt_process receipt_health market unit pid restarts exe env_file spool health dataset minimum_symbols
-  local expected_pid expected_exe expected_session expected_observed current_session updated now_ns
+  local expected_exe expected_session expected_observed current_session updated now_ns process_started_ns
   [[ $receipt_only == true || $receipt_only == false ]] || die 'restore receipt verification mode is invalid'
 
   # The receipt is only an idempotency key after its complete read-only state
@@ -385,8 +396,6 @@ verify_existing_restore_state() {
       || die "existing restore production unit is not enabled: $market"
     pid=$(systemctl show "$unit" --property=MainPID --value)
     restarts=$(systemctl show "$unit" --property=NRestarts --value)
-    expected_pid=$(jq -er --arg market "$market" '.[$market].main_pid' <<<"$receipt_process") \
-      || die "existing restore process PID evidence is missing: $market"
     expected_exe=$(jq -er --arg market "$market" '.[$market].process_exe_sha256' <<<"$receipt_process") \
       || die "existing restore process executable evidence is missing: $market"
     [[ $pid =~ ^[1-9][0-9]*$ && $restarts == 0 ]] \
@@ -396,6 +405,8 @@ verify_existing_restore_state() {
     [[ $exe == "$binary" && $(monday_sha256_file "$exe") == "$expected_exe" \
       && $expected_exe == "$payload" ]] \
       || die "existing restore process executable changed: $market"
+    process_started_ns=$(process_started_at_ns "$pid") \
+      || die "existing restore process start time is unavailable: $market"
 
     env_file=$(monday_runtime_asset_target "$ROOT" "binance-lob-archiver-production-$market.env") \
       || die "existing restore environment path is invalid: $market"
@@ -422,18 +433,11 @@ verify_existing_restore_state() {
     now_ns=$(date +%s%N)
     [[ -n $current_session && $updated =~ ^[0-9]+$ \
       && $expected_observed =~ ^[0-9]+$ && $updated -ge $expected_observed \
+      && $updated -ge $process_started_ns \
       && $updated -le $now_ns ]] \
       || die "existing restore health is stale or in the future: $market"
-    # PID and health session are completion-time observations, not immutable
-    # identities across a reboot.  A new session must advance past the receipt;
-    # an unchanged session is valid only while the recorded process still runs.
-    if [[ $current_session == "$expected_session" ]]; then
-      [[ $pid == "$expected_pid" ]] \
-        || die "existing restore health is stale for the replacement process: $market"
-    else
-      (( updated > expected_observed )) \
-        || die "existing restore replacement health did not advance: $market"
-    fi
+    # Receipt PID/session values are completion-time evidence.  Current health
+    # is instead bound to the exact live executable and this PID's proc start.
     dataset=$(sed -n 's/^DATASET=//p' "$env_file" | head -n1)
     minimum_symbols=1000; [[ $market == usdm ]] && minimum_symbols=100
     monday_verify_rust_lob_runtime_health \
