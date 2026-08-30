@@ -697,10 +697,11 @@ verify_production_process() {
       if [[ -z ${expected_exe_sha[$market]:-} ]]; then expected_exe_sha[$market]=$exe_sha
       else [[ $exe_sha == "${expected_exe_sha[$market]}" ]] || die "$market production executable changed while awaiting health"; fi
 
-      now_ns=$(date +%s%N); ready=false
+      ready=false
       if [[ -f $health && ! -L $health ]]; then
         session=$(jq -er '.session_id // empty' "$health" 2>/dev/null || true)
         updated=$(jq -er '.updated_at_ns // 0' "$health" 2>/dev/null || true)
+        now_ns=$(date +%s%N)
         if [[ $updated =~ ^[0-9]+$ ]] && (( updated > now_ns )); then
           die "$market production health timestamp is in the future"
         fi

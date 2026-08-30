@@ -59,6 +59,19 @@ grep -Fqx 'MemoryMax=2048M' "$SCRIPT_DIR/binance-lob-archiver-rust@.service" || 
   printf 'shadow MemoryMax is not 2048M\n' >&2
   exit 1
 }
+required_gate_seconds=$(sed -n 's/^readonly REQUIRED_DURATION_SECONDS=//p' \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh")
+spot_segment_seconds=$(sed -n 's/^SEGMENT_SECONDS=//p' \
+  "$SCRIPT_DIR/binance-lob-archiver-rust-spot.env")
+usdm_segment_seconds=$(sed -n 's/^SEGMENT_SECONDS=//p' \
+  "$SCRIPT_DIR/binance-lob-archiver-rust-usdm.env")
+[[ $required_gate_seconds =~ ^[1-9][0-9]*$ \
+  && $spot_segment_seconds =~ ^[1-9][0-9]*$ \
+  && $spot_segment_seconds == "$usdm_segment_seconds" \
+  && $required_gate_seconds -ge $((3 * spot_segment_seconds)) ]] || {
+  printf 'Gate duration does not cover two complete shadow segments\n' >&2
+  exit 1
+}
 
 # Resource Envelope V2 reserves the production slice's unallocated aggregate
 # cap from parent memory.stat anon.  File cache and memory.current remain audit
@@ -819,6 +832,13 @@ gate_sha=$(printf '%s\n' "$gate_output" | sed -n 's/^SHA-256: //p')
 [[ -f $gate && $gate_sha == "$(monday_sha256_file "$gate")" ]]
 monday_validate_v2_gate "$gate" direct "$c0" "$gate_sha"
 jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$gate" >/dev/null
+jq -e --argjson required "$required_gate_seconds" \
+  --argjson segment "$spot_segment_seconds" \
+  '.required_duration_seconds == $required and .segment_seconds == $segment' \
+  "$gate" >/dev/null
+run_json="$(dirname -- "$gate")/run.json"
+jq -e --argjson segment "$spot_segment_seconds" \
+  '.segment_seconds == $segment' "$run_json" >/dev/null
 jq -e '.shadow_staging.aggregate_slice.cgroup
   == ("/" + .shadow_staging.aggregate_slice.name)' "$gate" >/dev/null
 oss_source=$(sed -n '/^run_oss()/,/^verify_oss_roundtrips()/p' \
@@ -847,6 +867,17 @@ if monday_validate_v2_gate "$tampered" direct "$c0" "$tampered_sha"; then
 fi
 if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$tampered" >/dev/null 2>&1; then
   printf 'Gate policy accepted a phase requirement below phase max plus reserve\n' >&2
+  exit 1
+fi
+tampered="$ROOT/tampered-segment-cadence.json"
+jq '.required_duration_seconds = (3 * .segment_seconds - 1)' "$gate" >"$tampered"
+tampered_sha=$(monday_sha256_file "$tampered")
+if monday_validate_v2_gate "$tampered" direct "$c0" "$tampered_sha"; then
+  printf 'Gate validator accepted a window shorter than three segment intervals\n' >&2
+  exit 1
+fi
+if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$tampered" >/dev/null 2>&1; then
+  printf 'Gate policy accepted a window shorter than three segment intervals\n' >&2
   exit 1
 fi
 tampered="$ROOT/tampered-production-memory.json"
