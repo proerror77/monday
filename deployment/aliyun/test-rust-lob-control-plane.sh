@@ -834,7 +834,8 @@ monday_validate_v2_gate "$gate" direct "$c0" "$gate_sha"
 jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$gate" >/dev/null
 jq -e --argjson required "$required_gate_seconds" \
   --argjson segment "$spot_segment_seconds" \
-  '.required_duration_seconds == $required and .segment_seconds == $segment' \
+  '.required_duration_seconds == $required and .segment_seconds == $segment
+   and all(.markets[]; .observed_runtime_seconds >= 0)' \
   "$gate" >/dev/null
 run_json="$(dirname -- "$gate")/run.json"
 jq -e --argjson segment "$spot_segment_seconds" \
@@ -878,6 +879,20 @@ if monday_validate_v2_gate "$tampered" direct "$c0" "$tampered_sha"; then
 fi
 if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$tampered" >/dev/null 2>&1; then
   printf 'Gate policy accepted a window shorter than three segment intervals\n' >&2
+  exit 1
+fi
+tampered="$ROOT/tampered-observed-runtime.json"
+jq '.test_only = false | .production_eligible = true
+    | .markets.spot.observed_runtime_seconds = (.required_duration_seconds - 1)
+    | .markets.usdm.observed_runtime_seconds = .required_duration_seconds' \
+  "$gate" >"$tampered"
+tampered_sha=$(monday_sha256_file "$tampered")
+if monday_validate_v2_gate "$tampered" direct "$c0" "$tampered_sha"; then
+  printf 'Gate validator accepted a short production observation\n' >&2
+  exit 1
+fi
+if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$tampered" >/dev/null 2>&1; then
+  printf 'Gate policy accepted a short production observation\n' >&2
   exit 1
 fi
 tampered="$ROOT/tampered-production-memory.json"
@@ -2293,10 +2308,6 @@ fi
 # The local operator is the only Cloud Assistant entry point. Its dry run must
 # carry an exact controller path and never expose a second routing mode.
 operator="$SCRIPT_DIR/rust-lob-control-plane.sh"
-grep -Fq 'timeout_seconds=3600' "$operator" || {
-  printf 'LOB Gate operator timeout is not capped at 3600 seconds\n' >&2
-  exit 1
-}
 grep -Fq 'timeout_seconds=300' "$operator" || {
   printf 'LOB Gate preflight operator timeout is not capped at 300 seconds\n' >&2
   exit 1
@@ -2309,13 +2320,15 @@ jq -e --arg controller "$candidate" \
   '.operation == "gate" and .controller == $controller
    and (.command | contains(("/opt/monday/releases/binance-lob-controller/" + $controller)))
    and (.command | contains("--preflight-only") | not)
-   and .preflight_only == false and .production_changed == false' <<<"$operator_json" >/dev/null
+   and .preflight_only == false and .timeout_seconds == 5400
+   and .production_changed == false' <<<"$operator_json" >/dev/null
 operator_preflight_json=$(MONDAY_CONTROL_PLANE_DRY_RUN=1 "$operator" gate \
   --instance i-fixture --from-controller "$c1" \
   --candidate-controller "$candidate" --preflight-only)
 jq -e --arg controller "$candidate" \
   '.operation == "gate" and .controller == $controller
-   and .preflight_only == true and .production_changed == false
+   and .preflight_only == true and .timeout_seconds == 300
+   and .production_changed == false
    and (.command | contains(("/opt/monday/releases/binance-lob-controller/" + $controller)))
    and (.command | contains("--preflight-only"))' \
   <<<"$operator_preflight_json" >/dev/null

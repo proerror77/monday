@@ -2037,7 +2037,7 @@ verify_segments() {
   phase_segments["$market"]=$count
 }
 run_market_gate_phase() {
-  local market=$1 settle observation pid started_ns
+  local market=$1 settle observation observation_started pid started_ns
   calibrate_psi "shadow-$market"; resource_monitor_start "shadow-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; fixture_seed_market "$market"; systemctl reset-failed "${unit[$market]}" >/dev/null 2>&1 || true
   started_ns=$(date +%s%N); market_gate_started_ns[$market]=$started_ns
   systemctl start "${unit[$market]}"; pid=$(shadow_identity_wait "$market"); phase_pid["$market"]=$pid; phase_exe_sha["$market"]=$candidate_payload
@@ -2052,8 +2052,8 @@ run_market_gate_phase() {
     --argjson samples "${health_samples[$market]}" \
     '{sha256:$sha,session_id:$session,frozen_symbol_count:$symbols,
       frozen_catalog_sha256:$catalog,max_health_silence_seconds:$silence,samples:$samples}')
-  observation=$(( $(monotonic_seconds) + GATE_DURATION_SECONDS )); while (( $(monotonic_seconds) < observation )); do validate_observation_sample "$market"; assert_host_memory_reserve; [[ $(systemctl_value "$market" NRestarts) == 0 ]] || die "$market restarted"; [[ $(systemctl_value "$market" MainPID) == "$pid" ]] || die "$market MainPID changed"; [[ $TEST_ONLY == true ]] && break; sleep 15; done
-  phase_runtime["$market"]=$GATE_DURATION_SECONDS; systemctl stop "${unit[$market]}"; systemctl_active "${unit[$market]}" && die "$market shadow remained active"; \
+  observation_started=$(monotonic_seconds); observation=$(( observation_started + GATE_DURATION_SECONDS )); while (( $(monotonic_seconds) < observation )); do validate_observation_sample "$market"; assert_host_memory_reserve; [[ $(systemctl_value "$market" NRestarts) == 0 ]] || die "$market restarted"; [[ $(systemctl_value "$market" MainPID) == "$pid" ]] || die "$market MainPID changed"; [[ $TEST_ONLY == true ]] && break; sleep 15; done
+  phase_runtime["$market"]=$(( $(monotonic_seconds) - observation_started )); systemctl stop "${unit[$market]}"; systemctl_active "${unit[$market]}" && die "$market shadow remained active"; \
     resource_monitor_stop_or_die "shadow-$market"; \
     calibrate_psi "shadow-$market-tail"; resource_monitor_start "strict-verifier-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; \
     verify_segments "$market"; resource_monitor_stop_or_die "strict-verifier-$market"

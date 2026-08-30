@@ -1800,6 +1800,8 @@ monday_validate_v2_gate() {
             and . == ("lake/raw/venue=binance/market=" + $m.market
               + "/dataset=" + $m.dataset + "/shard=all"))
           and (.observed_at_ns | type == "number" and floor == . and . >= 0)
+          and ($m.observed_runtime_seconds | type == "number" and floor == .
+            and if $root.test_only then . >= 0 else . >= $root.required_duration_seconds end)
           and ($m.segment_count | type == "number" and . >= 2 and . == ($m.segments | length))
           and ($m.oss_triplet_count | type == "number" and . >= 2 and . == ($m.triplets | length))
           and (.n_restarts | type == "number" and . == 0)

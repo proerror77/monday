@@ -101,7 +101,7 @@ case "$operation" in
       timeout_seconds=300
     else
       command_name=monday-rust-lob-shadow-gate
-      timeout_seconds=3600
+      timeout_seconds=5400
     fi
     remote_args=(--from-controller "$from_controller" --candidate-controller "$controller")
     [[ $preflight_only == true ]] && remote_args+=(--preflight-only)
@@ -150,9 +150,9 @@ command_content=$(printf '%s\n' "$remote_script" | base64 | tr -d '\n')
 if [[ ${MONDAY_CONTROL_PLANE_DRY_RUN:-0} == 1 ]]; then
   jq -cn --arg operation "$operation" --arg instance "$instance" \
     --arg controller "$controller" --arg command "$remote_script" \
-    --argjson preflight_only "$preflight_only" \
+    --argjson preflight_only "$preflight_only" --argjson timeout "$timeout_seconds" \
     '{operation:$operation,instance:$instance,controller:$controller,
-      command:$command,preflight_only:$preflight_only,
+      command:$command,preflight_only:$preflight_only,timeout_seconds:$timeout,
       production_changed:($operation == "cutover" or $operation == "restore")}'
   exit 0
 fi
