@@ -946,6 +946,19 @@ jq -e --arg gate "$payload_delta_gate" --arg gate_sha "$payload_delta_gate_sha" 
   .transition_receipt == null
   and .gate_receipt == $gate and .gate_sha256 == $gate_sha
 ' "$payload_delta_restore_receipt" >/dev/null
+# The completed recovery is immediately idempotent even though its immutable
+# receipt records the pre-reboot process.  The read-only check accepts the
+# independently verified replacement process/session and performs no writes.
+payload_delta_restore_calls="$ROOT/run/restore-fixture.calls"
+payload_delta_restore_calls_sha=$(monday_sha256_file "$payload_delta_restore_calls")
+payload_delta_restore_readonly=$(MONDAY_CONTROL_PLANE_TEST=1 \
+  MONDAY_RESTORE_FIXTURE_SYSTEMD=1 MONDAY_RESTORE_FIXTURE_PID="$payload_delta_restore_pid_after" \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-restore.sh" \
+  --controller "$c1" --root "$ROOT")
+grep -Fq 'Pair restore already complete (read-only)' <<<"$payload_delta_restore_readonly"
+[[ $(monday_sha256_file "$payload_delta_restore_calls") == "$payload_delta_restore_calls_sha" ]]
+[[ $(monday_sha256_file "$payload_delta_restore_receipt") == "$payload_delta_restore_receipt_before" ]]
+[[ $(monday_sha256_file "$payload_delta_restore_receipt") == "$payload_delta_restore_sha" ]]
 
 # Reset the same immutable C0/P0/R0, then fail only after transition.json and
 # its digest have both passed readback.  Cleanup must preserve that committed

@@ -221,7 +221,7 @@ verify_existing_restore_state() {
   local receipt=$1 expected_runtime=$2 receipt_only=${3:-false} stable_binary expected resolved asset target
   local named_transition named_gate named_gate_sha receipt_gate receipt_gate_sha transition_from transition_mode transition_validator_from
   local receipt_process receipt_health market unit pid restarts exe env_file spool health dataset minimum_symbols
-  local expected_pid expected_exe expected_restarts expected_session expected_observed current_session updated now_ns
+  local expected_pid expected_exe expected_session expected_observed current_session updated now_ns
   [[ $receipt_only == true || $receipt_only == false ]] || die 'restore receipt verification mode is invalid'
 
   # The receipt is only an idempotency key after its complete read-only state
@@ -389,10 +389,8 @@ verify_existing_restore_state() {
       || die "existing restore process PID evidence is missing: $market"
     expected_exe=$(jq -er --arg market "$market" '.[$market].process_exe_sha256' <<<"$receipt_process") \
       || die "existing restore process executable evidence is missing: $market"
-    expected_restarts=$(jq -er --arg market "$market" '.[$market].n_restarts' <<<"$receipt_process") \
-      || die "existing restore restart evidence is missing: $market"
-    [[ $pid == "$expected_pid" && $restarts == "$expected_restarts" && $restarts == 0 ]] \
-      || die "existing restore process identity changed: $market"
+    [[ $pid =~ ^[1-9][0-9]*$ && $restarts == 0 ]] \
+      || die "existing restore process identity is invalid: $market"
     exe=$(readlink -f -- "$(monday_root_join "$ROOT" "proc/$pid/exe")") \
       || die "existing restore process executable is unavailable: $market"
     [[ $exe == "$binary" && $(monday_sha256_file "$exe") == "$expected_exe" \
@@ -422,10 +420,20 @@ verify_existing_restore_state() {
     updated=$(jq -er '.updated_at_ns // 0' "$health") \
       || die "existing restore health timestamp is missing: $market"
     now_ns=$(date +%s%N)
-    [[ $current_session == "$expected_session" && $updated =~ ^[0-9]+$ \
+    [[ -n $current_session && $updated =~ ^[0-9]+$ \
       && $expected_observed =~ ^[0-9]+$ && $updated -ge $expected_observed \
       && $updated -le $now_ns ]] \
       || die "existing restore health is stale or in the future: $market"
+    # PID and health session are completion-time observations, not immutable
+    # identities across a reboot.  A new session must advance past the receipt;
+    # an unchanged session is valid only while the recorded process still runs.
+    if [[ $current_session == "$expected_session" ]]; then
+      [[ $pid == "$expected_pid" ]] \
+        || die "existing restore health is stale for the replacement process: $market"
+    else
+      (( updated > expected_observed )) \
+        || die "existing restore replacement health did not advance: $market"
+    fi
     dataset=$(sed -n 's/^DATASET=//p' "$env_file" | head -n1)
     minimum_symbols=1000; [[ $market == usdm ]] && minimum_symbols=100
     monday_verify_rust_lob_runtime_health \
