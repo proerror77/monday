@@ -478,6 +478,49 @@ preflight_residue_after=$(find "$ROOT/data/monday/spool/binance-lob-rust-shadow"
   printf 'read-only preflight invoked a mutating systemd action\n' >&2
   exit 1
 }
+# A direct v1 -> V2 Gate must not require C1's runtime bytes to be installed
+# before Cutover. Bind the live eight-asset topology to a distinct immutable
+# C0 runtime, then prove the 300-second C1 still passes read-only preflight.
+runtime_delta_envs=(
+  "$ROOT/etc/monday/binance-lob-archiver-production-spot.env"
+  "$ROOT/etc/monday/binance-lob-archiver-production-usdm.env"
+  "$ROOT/etc/monday/binance-lob-archiver-rust-spot.env"
+  "$ROOT/etc/monday/binance-lob-archiver-rust-usdm.env"
+)
+for runtime_env in "${runtime_delta_envs[@]}"; do
+  cp -p -- "$runtime_env" "$runtime_env.before-direct-delta"
+  chmod u+w "$runtime_env"
+  sed 's/^SEGMENT_SECONDS=.*/SEGMENT_SECONDS=3600/' \
+    "$runtime_env.before-direct-delta" >"$runtime_env"
+done
+legacy_delta_runtime=$(monday_rust_lob_live_runtime_contract_sha256_v1 "$ROOT")
+[[ $legacy_delta_runtime != "$candidate_runtime_sha" ]]
+legacy_delta_manifest="$ROOT/legacy-runtime-delta.json"
+jq --arg runtime "$legacy_delta_runtime" --arg source "$(printf '7%.0s' {1..40})" \
+  '.runtime_contract_sha256 = $runtime | .deployment_source_revision = $source' \
+  "$legacy_work/release.json" >"$legacy_delta_manifest"
+legacy_delta_c0=$(monday_sha256_file "$legacy_delta_manifest")
+mkdir -p "$legacy_root/$legacy_delta_c0/deployment"
+cp -p -- "$legacy_delta_manifest" "$legacy_root/$legacy_delta_c0/release.json"
+(cd "$legacy_root/$legacy_delta_c0" && sha256sum release.json >release.json.sha256)
+rm -f -- "$legacy_root/active"
+ln -s "$legacy_root/$legacy_delta_c0" "$legacy_root/active"
+runtime_delta_preflight=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --preflight-only --root "$ROOT")
+jq -e --arg from "$legacy_delta_c0" --arg candidate "$c0" \
+  --arg runtime "$candidate_runtime_sha" \
+  '.from_controller_sha256 == $from
+   and .candidate_controller_sha256 == $candidate
+   and .candidate_runtime_contract_sha256 == $runtime
+   and .checks.installed_bytes == true
+   and .production_changed == false' <<<"$runtime_delta_preflight" >/dev/null
+rm -f -- "$legacy_root/active"
+ln -s "$legacy_root/$legacy_c0" "$legacy_root/active"
+for runtime_env in "${runtime_delta_envs[@]}"; do
+  mv -f -- "$runtime_env.before-direct-delta" "$runtime_env"
+done
+[[ $(monday_rust_lob_live_runtime_contract_sha256_v1 "$ROOT") == "$legacy_runtime_sha" ]]
 # An unresolved lease left by the retired controller still blocks this Gate.
 legacy_lease="$ROOT/run/monday/rust-lob-gate/bootstrap-slice-lease-20260829T000000Z-1.json"
 mkdir -p "${legacy_lease%/*}"
