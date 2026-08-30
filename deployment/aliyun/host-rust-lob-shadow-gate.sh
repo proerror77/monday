@@ -145,17 +145,6 @@ if [[ $TEST_ONLY != true ]]; then
   id "$SERVICE_USER" >/dev/null 2>&1 || die "missing service user: $SERVICE_USER"
 fi
 
-# An older controller may have left a temporary production-envelope lease and
-# recovery timer behind. This controller never adopts or repairs that state:
-# the operator must finish the old recovery before starting a new Gate.
-if [[ -e $GATE_UNIT_ROOT || -L $GATE_UNIT_ROOT ]]; then
-  [[ -d $GATE_UNIT_ROOT && ! -L $GATE_UNIT_ROOT ]] \
-    || die 'Gate state root is not a direct directory'
-  legacy_lease=$(find "$GATE_UNIT_ROOT" -mindepth 1 -maxdepth 1 \
-    \( -type f -o -type l \) -name 'bootstrap-slice-lease-*.json' -print | head -n 1)
-  [[ -z $legacy_lease ]] || die 'unresolved legacy production-envelope lease blocks Gate'
-fi
-
 # The offline fixture supplies a tiny systemd double.  Production always uses
 # the real systemctl binary; the double only models the state fields consumed
 # by this action and cannot mutate a host unit.
@@ -465,6 +454,102 @@ io_psi_window_transition() {
 systemctl_show() { systemctl show "$1" --property="$2" --value 2>/dev/null; }
 systemctl_show_many() { systemctl show "$1" --property="$2" 2>/dev/null; }
 systemctl_active() { systemctl is-active --quiet "$1"; }
+
+# Bootstrap leases are retained only as terminal audit evidence.  A new Gate
+# neither adopts nor repairs them, so validate the complete record before
+# allowing it to coexist with the operator-owned permanent envelope.
+terminal_legacy_lease() {
+  local state=$1 state_name expected_run recovery_service recovery_timer
+  local recovery_service_state recovery_timer_state
+  [[ -f $state && ! -L $state ]] || return 1
+  state_name=${state##*/}
+  [[ $state_name =~ ^bootstrap-slice-lease-([0-9]{8}T[0-9]{6}Z-[1-9][0-9]*)\.json$ ]] \
+    || return 1
+  expected_run=${BASH_REMATCH[1]}
+  secure_file "$state"
+  jq -e --arg expected_run "$expected_run" --arg slice "$PRODUCTION_SLICE" \
+    --arg controller_root "$CONTROLLER_ROOT" --arg unit_prefix "$GATE_UNIT_PREFIX" \
+    --arg timer monday-collector-health.timer --arg service monday-collector-health.service '
+    def nonempty_string: type == "string" and length > 0;
+    def memory_limit: type == "string" and test("^(infinity|[0-9]+)$");
+    def bounded_integer:
+      type == "number" and floor == . and . >= 0 and . <= 3758096384;
+    def positive_integer: type == "number" and floor == . and . >= 1;
+    def valid_health_snapshot($unit):
+      type == "object"
+      and .unit == $unit
+      and (.load_state | nonempty_string)
+      and (.active_state | nonempty_string)
+      and (.sub_state | nonempty_string)
+      and (.unit_file_state | nonempty_string);
+    def terminal_core:
+      type == "object"
+      and .run_id == $expected_run
+      and .slice == $slice
+      and .mode == "temporary-bootstrap"
+      and (.before_memory_high | memory_limit)
+      and (.before_memory_max | memory_limit)
+      and .before_parent_control_group == ("/system.slice/" + $slice)
+      and (.before_parent_memory_current_bytes | bounded_integer)
+      and (.before_parent_memory_anon_bytes | bounded_integer)
+      and .requested_memory_high == "3072M"
+      and .requested_memory_max == "3584M"
+      and (.candidate_controller_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+      and .gate_script == ($controller_root + "/" + .candidate_controller_sha256
+        + "/deployment/host-rust-lob-shadow-gate.sh")
+      and (.gate_script_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+      and (.gate_pid | positive_integer)
+      and (.gate_starttime | positive_integer)
+      and .recovery_service == ($unit_prefix + $expected_run + "-lease-recovery.service")
+      and .recovery_timer == ($unit_prefix + $expected_run + "-lease-recovery.timer")
+      and .applied == true
+      and .restored == true
+      and (if has("recovered_by_run_id")
+           then .recovered_by_run_id == $expected_run else true end);
+    def terminal_monitor:
+      .bootstrap_monitor_containment as $monitor
+      | ($monitor | type == "object"
+        and .required == true
+        and .timer == $timer
+        and .service == $service
+        and (.before_timer | valid_health_snapshot($timer)
+          and .load_state == "loaded" and .active_state == "active")
+        and (.before_service | valid_health_snapshot($service))
+        and .pause_applied == true
+        and .timer_restored == true
+        and .service_quiesced == true
+        and (.service_was_noninactive | type == "boolean")
+        and (.service_was_noninactive == (.before_service.active_state != "inactive"))
+        and (if has("preexisting_global_health_failed")
+             then (.preexisting_global_health_failed | type == "boolean")
+               and (.preexisting_global_health_failed
+                 == (.before_service.active_state == "failed"))
+             else true end)
+        and (if has("global_health_reset_applied")
+             then .global_health_reset_applied == false else true end));
+    (.schema == "monday.rust_lob_bootstrap_slice_lease.v1" and terminal_core)
+    or (.schema == "monday.rust_lob_bootstrap_slice_lease.v2"
+      and terminal_core and terminal_monitor)
+  ' "$state" >/dev/null || return 1
+  recovery_service=$(jq -er '.recovery_service' "$state") || return 1
+  recovery_timer=$(jq -er '.recovery_timer' "$state") || return 1
+  recovery_service_state=$(systemctl_show "$recovery_service" ActiveState) || return 1
+  recovery_timer_state=$(systemctl_show "$recovery_timer" ActiveState) || return 1
+  [[ $recovery_service_state == inactive || $recovery_service_state == failed ]] || return 1
+  [[ $recovery_timer_state == inactive || $recovery_timer_state == failed ]]
+}
+
+if [[ -e $GATE_UNIT_ROOT || -L $GATE_UNIT_ROOT ]]; then
+  [[ -d $GATE_UNIT_ROOT && ! -L $GATE_UNIT_ROOT ]] \
+    || die 'Gate state root is not a direct directory'
+  if ! find "$GATE_UNIT_ROOT" -mindepth 1 -maxdepth 1 \
+    \( -type f -o -type l \) -name 'bootstrap-slice-lease-*.json' -print \
+    | sort | while IFS= read -r legacy_lease; do
+      terminal_legacy_lease "$legacy_lease" || exit 1
+    done; then
+    die 'unresolved legacy production-envelope lease blocks Gate'
+  fi
+fi
 
 # A preflight is deliberately read-only, but it uses the exact same three
 # 15-second, 1% I/O-full PSI windows as the formal Gate calibration.  Fixture
