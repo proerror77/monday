@@ -245,8 +245,22 @@ verify_existing_restore_state() {
       || die 'existing restore Gate field is malformed'
     receipt_gate_sha=$(jq -r '.gate_sha256 // empty' "$receipt") \
       || die 'existing restore Gate digest field is malformed'
-    [[ -z $receipt_gate && -z $receipt_gate_sha ]] \
-      || die 'existing restore names a Gate without its transition receipt'
+    if [[ -n $receipt_gate || -n $receipt_gate_sha ]]; then
+      [[ -n $receipt_gate && -n $receipt_gate_sha ]] \
+        || die 'existing restore recovery Gate identity is incomplete'
+      monday_validate_v2_gate_authoritative "$ROOT" "$receipt_gate" direct \
+        "$CONTROLLER" "$receipt_gate_sha" \
+        || die 'existing restore recovery Gate is not authoritative'
+      jq -e --arg payload "$payload" --arg runtime "$runtime" \
+        --argjson test_only "$TEST_ONLY" '
+          .candidate_payload_sha256 == $payload
+          and .candidate_runtime_contract_sha256 == $runtime
+          and .source_mode == "direct"
+          and .test_only == $test_only
+          and .production_eligible == ($test_only | not)
+        ' "$receipt_gate" >/dev/null \
+        || die 'existing restore recovery Gate differs from the active pair'
+    fi
   fi
 
   stable_binary="$controller_root/active/binance-lob-archiver"
@@ -397,7 +411,7 @@ fi
 
 # If this active pair already has a transition receipt, validate only the Gate
 # path and digest named by that receipt.  A crash before the receipt exists is
-# intentionally recoverable from active C alone; no Gate/previous-state scan is
+# recovered from the exact pre-commit intent below; no Gate/history scan is
 # performed.
 active_transition_receipt=$(monday_root_join "$ROOT" "data/monday/evidence/cutovers/$CONTROLLER/transition.json")
 transition_receipt_ref=; transition_gate=; transition_gate_sha=
@@ -435,10 +449,83 @@ if [[ -e $active_transition_receipt || -L $active_transition_receipt ]]; then
   fi
 fi
 
-# A power loss can leave a direct bootstrap with the active link committed but
-# its fixed projections not yet renamed.  Accept only an exact active-C source
-# (or a missing link) for that recovery case; any foreign bytes/target are a
-# hard refusal, never overwritten.
+# A power loss can leave a direct bootstrap with active=C1 while one or more
+# fixed projections still carry Gate-authorized C0/P0/R0 bytes.  The durable
+# recovery intent names that one exact Gate; without it only active-C bytes are
+# accepted.
+cutover_root=$(monday_root_join "$ROOT" data/monday/evidence/cutovers)
+recovery_intent="$cutover_root/$CONTROLLER/recovery.json"
+recovery_intent_valid=false
+recovery_gate=; recovery_gate_sha=; recovery_before_controller=
+recovery_before_payload=; recovery_before_runtime=; recovery_before_projection=
+if [[ -e $recovery_intent || -L $recovery_intent ]]; then
+  monday_file_direct "$recovery_intent" || die 'cutover recovery intent is indirect'
+  [[ $(monday_file_mode "$recovery_intent") == 440 ]] \
+    || die 'cutover recovery intent mode is invalid'
+  recovery_gate=$(jq -er '.gate_receipt' "$recovery_intent") \
+    || die 'cutover recovery intent has no Gate path'
+  recovery_gate_sha=$(jq -er '.gate_sha256' "$recovery_intent") \
+    || die 'cutover recovery intent has no Gate digest'
+  monday_validate_v2_gate_authoritative "$ROOT" "$recovery_gate" direct \
+    "$CONTROLLER" "$recovery_gate_sha" \
+    || die 'cutover recovery intent Gate is not authoritative'
+  if [[ $TEST_ONLY == false ]]; then
+    jq -e '.test_only == false and .production_eligible == true' "$recovery_gate" >/dev/null \
+      || die 'production recovery requires an eligible Gate'
+  else
+    jq -e '.test_only == true and .production_eligible == false' "$recovery_gate" >/dev/null \
+      || die 'fixture recovery requires a fixture Gate'
+  fi
+  recovery_before_controller=$(jq -er '.from_controller_sha256' "$recovery_gate") \
+    || die 'cutover recovery Gate has no before controller'
+  recovery_before_payload=$(jq -er '.before.payload_sha256' "$recovery_gate") \
+    || die 'cutover recovery Gate has no before payload'
+  recovery_before_runtime=$(jq -er '.before.runtime_contract_sha256' "$recovery_gate") \
+    || die 'cutover recovery Gate has no before runtime'
+  recovery_before_projection=$(jq -er '.before.production_projection' "$recovery_gate") \
+    || die 'cutover recovery Gate has no before production projection'
+  jq -e --arg controller "$CONTROLLER" --arg payload "$payload" --arg runtime "$runtime" \
+    --arg from "$recovery_before_controller" --arg before_payload "$recovery_before_payload" \
+    --arg before_runtime "$recovery_before_runtime" \
+    --arg before_projection "$recovery_before_projection" \
+    --arg gate "$recovery_gate" --arg gate_sha "$recovery_gate_sha" '
+      (keys | sort) == [
+        "before_payload_sha256", "before_production_projection",
+        "before_runtime_contract_sha256", "control_plane_version",
+        "controller_sha256", "from_controller_sha256", "from_source_mode",
+        "gate_receipt", "gate_sha256", "operation", "payload_sha256",
+        "runtime_contract_sha256", "schema"
+      ]
+      and .schema == "monday.rust_lob_pair_cutover_recovery.v1"
+      and .control_plane_version == 2 and .operation == "cutover"
+      and .from_source_mode == "direct"
+      and .from_controller_sha256 == $from
+      and .controller_sha256 == $controller
+      and .before_payload_sha256 == $before_payload
+      and .before_runtime_contract_sha256 == $before_runtime
+      and .before_production_projection == $before_projection
+      and .payload_sha256 == $payload
+      and .runtime_contract_sha256 == $runtime
+      and .gate_receipt == $gate and .gate_sha256 == $gate_sha
+    ' "$recovery_intent" >/dev/null \
+    || die 'cutover recovery intent differs from its exact Gate and active controller'
+  if [[ -n $transition_receipt_ref ]]; then
+    [[ $recovery_gate == "$transition_gate" && $recovery_gate_sha == "$transition_gate_sha" ]] \
+      || die 'cutover recovery intent differs from the active transition'
+  fi
+  recovery_before_binary=$(monday_root_join "$ROOT" \
+    "opt/monday/releases/binance-lob-archiver/$recovery_before_payload/binance-lob-archiver")
+  monday_file_direct "$recovery_before_binary" \
+    || die 'cutover recovery before payload is missing'
+  [[ $(monday_sha256_file "$recovery_before_binary") == "$recovery_before_payload" ]] \
+    || die 'cutover recovery before payload digest differs'
+  if [[ -z $transition_receipt_ref ]]; then
+    transition_gate=$recovery_gate
+    transition_gate_sha=$recovery_gate_sha
+  fi
+  recovery_intent_valid=true
+fi
+
 for asset in $(monday_runtime_assets); do
   target=$(monday_runtime_asset_target "$ROOT" "$asset") || die "unknown runtime asset: $asset"
   expected="$controller_root/active/deployment/$asset"
@@ -448,9 +535,18 @@ for asset in $(monday_runtime_assets); do
     monday_file_direct "$resolved" || die "runtime projection is indirect: $asset"
     cmp -s "$resolved" "$release/deployment/$asset" || die "runtime projection bytes drifted: $asset"
   elif [[ -f $target && ! -L $target ]]; then
-    cmp -s "$target" "$release/deployment/$asset" || die "runtime asset bytes drifted: $asset"
+    if cmp -s "$target" "$release/deployment/$asset"; then
+      :
+    elif [[ $recovery_intent_valid == true ]]; then
+      before_sha=$(monday_v2_gate_before_asset_sha256 "$recovery_gate" "$asset") \
+        || die "cutover recovery before asset is invalid: $asset"
+      [[ -n $before_sha && $(monday_sha256_file "$target") == "$before_sha" ]] \
+        || die "runtime asset bytes differ from active C and Gate R0: $asset"
+    else
+      die "runtime asset bytes drifted: $asset"
+    fi
   elif [[ ! -e $target ]]; then
-    : # A direct bootstrap may have crashed before this projection was linked.
+    : # The verified active controller is the sole source for a missing projection.
   else
     die "runtime projection is indirect: $asset"
   fi
@@ -501,6 +597,7 @@ for market in spot usdm; do
   fi
 done
 production=$(monday_root_join "$ROOT" opt/monday/bin/binance-lob-archiver)
+production_repair_source=$binary
 if [[ -L $production ]]; then
   production_target=$(readlink -- "$production") || die 'production projection target is unreadable'
   if [[ $production_target == "$stable_binary" ]]; then
@@ -509,14 +606,25 @@ if [[ -L $production ]]; then
   else
     production_resolved=$(readlink -f -- "$production") \
       || die 'production projection is dangling'
-    [[ $production_resolved == "$binary" && $(monday_sha256_file "$production_resolved") == "$payload" ]] \
-      || die 'production projection target drifted'
+    if [[ $production_resolved == "$binary" \
+      && $(monday_sha256_file "$production_resolved") == "$payload" ]]; then
+      :
+    elif [[ $recovery_intent_valid == true \
+      && $production_target == "$recovery_before_projection" \
+      && $production_resolved == "$recovery_before_binary" \
+      && $(monday_sha256_file "$production_resolved") == "$recovery_before_payload" ]]; then
+      monday_verify_legacy_controller_release "$ROOT" "$recovery_before_controller" "$production" >/dev/null \
+        || die 'cutover recovery production does not match immutable legacy C0/P0'
+      production_repair_source=$recovery_before_binary
+    else
+      die 'production projection target drifted'
+    fi
   fi
 elif [[ -f $production && ! -L $production ]]; then
   [[ $(monday_sha256_file "$production") == "$payload" ]] \
     || die 'production projection bytes drifted'
 elif [[ ! -e $production ]]; then
-  : # A direct bootstrap may have crashed before the stable link was linked.
+  : # The verified active controller is the sole source for a missing projection.
 else
   die 'production projection is indirect'
 fi
@@ -531,7 +639,7 @@ if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
     || die 'recovery schedulers are not stopped, disabled, and runtime-masked'
 fi
 ensure_projection() {
-  local target=$1 expected=$2 source=${3:-} temporary="$1.restore.$$" resolved
+  local target=$1 expected=$2 source=${3:-} accepted_sha=${4:-} temporary="$1.restore.$$" resolved
   mkdir -p "$(dirname -- "$target")"
   if [[ -L $target && $(readlink -- "$target") == "$expected" ]]; then
     resolved=$(readlink -f -- "$target") || return 1
@@ -543,7 +651,9 @@ ensure_projection() {
     rm -f -- "$target" || return 1
   elif [[ -e $target ]]; then
     [[ -n $source && -f $target ]] || return 1
-    cmp -s "$target" "$source" || return 1
+    cmp -s "$target" "$source" \
+      || [[ -n $accepted_sha && $(monday_sha256_file "$target") == "$accepted_sha" ]] \
+      || return 1
     rm -f -- "$target" || return 1
   fi
   rm -f -- "$temporary"
@@ -570,12 +680,18 @@ ensure_controller_projection() {
   ln -s "$expected" "$temporary" && mv -f -- "$temporary" "$target"
   [[ -L $target && $(readlink -- "$target") == "$expected" ]]
 }
-ensure_projection "$production" "$stable_binary" "$binary" || die 'could not converge stable production projection'
+ensure_projection "$production" "$stable_binary" "$production_repair_source" \
+  || die 'could not converge stable production projection'
 [[ $(readlink -f -- "$production") == "$binary" ]] || die 'stable production projection differs from active payload'
 for asset in "${PAIR_ASSETS[@]}"; do
   target=$(monday_runtime_asset_target "$ROOT" "$asset") || die "unknown runtime asset: $asset"
   expected="$projection/deployment/$asset"
-  ensure_projection "$target" "$expected" "$release/deployment/$asset" \
+  before_sha=
+  if [[ $recovery_intent_valid == true ]]; then
+    before_sha=$(monday_v2_gate_before_asset_sha256 "$recovery_gate" "$asset") \
+      || die "cutover recovery before asset is invalid during repair: $asset"
+  fi
+  ensure_projection "$target" "$expected" "$release/deployment/$asset" "$before_sha" \
     || die "could not converge stable pair projection: $asset"
   resolved=$(readlink -f -- "$target") || die "stable pair projection is dangling: $asset"
   monday_file_direct "$resolved" || die "stable pair projection is not a file: $asset"
@@ -606,6 +722,10 @@ live_runtime=$(monday_rust_lob_live_runtime_contract_sha256 "$ROOT") \
   || die 'installed runtime contract is missing or indirect after repair'
 [[ $live_runtime == "$runtime" ]] \
   || die 'installed runtime contract differs from active controller after repair'
+if [[ $recovery_intent_valid == true ]]; then
+  rm -f -- "$recovery_intent" || die 'could not clear converged cutover recovery intent'
+  recovery_intent_valid=false
+fi
 
 restore_started_ns=0
 if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then

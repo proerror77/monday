@@ -46,6 +46,10 @@ controller_root=$(monday_root_join "$ROOT" opt/monday/releases/binance-lob-contr
 production=$(monday_root_join "$ROOT" opt/monday/bin/binance-lob-archiver)
 active_link="$controller_root/active"
 stable_projection="$active_link/binance-lob-archiver"
+receipt_root=$(monday_root_join "$ROOT" data/monday/evidence/cutovers)
+recovery_intent="$receipt_root/$TO/recovery.json"
+recovery_intent_tmp="$recovery_intent.tmp.$$"
+recovery_intent_written=0
 lock_root=$(monday_root_join "$ROOT" run/lock)
 mkdir -p "$lock_root"
 exec 9>"$lock_root/monday-rust-lob-control-plane.lock"
@@ -76,7 +80,7 @@ if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
     done < <(monday_rust_lob_legacy_writer_units)
   fi
   systemctl() {
-    local action=${1:-} unit=${2:-} argument fixture_pid
+    local action=${1:-} unit=${2:-} argument fixture_pid fixture_spot_health
     case "$action" in
       start)
         for argument in "$@"; do
@@ -152,6 +156,14 @@ if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
           UnitFileState) printf '%s\n' "${fixture_unit_file_state[$unit]:-disabled}" ;;
           MainPID)
             fixture_pid=${MONDAY_CUTOVER_FIXTURE_PID:-$$}
+            if [[ $unit == *'@spot.service' ]]; then
+              fixture_spot_health=$(monday_root_join "$ROOT" \
+                data/monday/spool/binance-lob/spot/health.json)
+              if [[ -f $fixture_spot_health \
+                && ! -e "$(monday_root_join "$ROOT" run/cutover-fixture-spot-flip)" ]]; then
+                : >"$(monday_root_join "$ROOT" run/cutover-fixture-spot-observed)"
+              fi
+            fi
             if [[ $unit == *'@spot.service' && -f "$(monday_root_join "$ROOT" run/cutover-fixture-spot-flip)" ]]; then
               fixture_pid=${MONDAY_CUTOVER_FIXTURE_SPOT_FLIP_PID:-$fixture_pid}
             fi
@@ -274,6 +286,15 @@ gate_from_controller=$(jq -er '.from_controller_sha256' "$GATE") \
 if [[ $FROM == direct ]]; then
   [[ $gate_from_controller == "$legacy_controller" ]] \
     || die 'Gate receipt before controller differs from the resolved legacy active controller'
+  before_production_projection=$(readlink -- "$production") \
+    || die 'direct production projection is unreadable'
+  jq -e --arg payload "$before_payload" --arg runtime "$before_runtime" \
+    --arg projection "$before_production_projection" '
+      .before.payload_sha256 == $payload
+      and .before.runtime_contract_sha256 == $runtime
+      and .before.production_projection == $projection
+    ' "$GATE" >/dev/null \
+    || die 'Gate receipt before P/R/projection differs from the live legacy pair'
 else
   [[ $gate_from_controller == "$FROM" ]] \
     || die 'Gate receipt before controller differs from the active controller'
@@ -372,12 +393,15 @@ for asset in "${PAIR_ASSETS[@]}"; do
   source="$target_release/deployment/$asset"
   monday_file_direct "$source" || die "target pair asset is missing: $asset"
   if [[ $FROM == direct ]]; then
-    if [[ $asset == 'system-binance\x2dlob\x2darchiver\x2dproduction.slice' \
-      && ${asset_state[$asset]} == absent ]]; then
-      : # typed 8 -> 9 migration: the signed target installs this new asset
+    gate_before_asset_sha=$(monday_v2_gate_before_asset_sha256 "$GATE" "$asset") \
+      || die "Gate receipt before asset is invalid: $asset"
+    if [[ -z $gate_before_asset_sha ]]; then
+      [[ ${asset_state[$asset]} == absent ]] \
+        || die "bootstrap before asset should be absent: $asset"
     else
       [[ ${asset_state[$asset]} == present ]] || die "bootstrap runtime asset is absent: $asset"
-      cmp -s "$source" "${asset_target[$asset]}" || die "bootstrap runtime asset changed: $asset"
+      [[ ${asset_sha[$asset]} == "$gate_before_asset_sha" ]] \
+        || die "bootstrap runtime asset differs from Gate R0: $asset"
     fi
   else
     [[ ${asset_state[$asset]} == projection ]] || die "before pair asset is not a stable projection: $asset"
@@ -454,6 +478,10 @@ cleanup() {
     if (( projection_prepared == 1 )) && [[ $FROM == direct ]]; then
       restore_direct_topology || rollback_failed=true
     fi
+    if (( recovery_intent_written == 1 )) && [[ $rollback_failed == false ]]; then
+      rm -f -- "$recovery_intent" "$recovery_intent_tmp" || rollback_failed=true
+      recovery_intent_written=0
+    fi
     if (( writer_containment_started == 1 )) && [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
       if (( writer_containment_failed == 1 )); then
         rollback_failed=true
@@ -499,6 +527,7 @@ cleanup() {
       fi
     fi
   fi
+  rm -f -- "$recovery_intent_tmp"
   rm -rf -- "$tmp_root"
   exit "$status"
 }
@@ -557,6 +586,36 @@ if [[ $FROM == direct ]]; then
     || die 'bootstrap legacy runtime contract disappeared after stopping lanes'
   [[ $live_runtime_after_stop == "$before_runtime" ]] \
     || die 'bootstrap runtime contract changed after stopping lanes'
+
+  # The active link is the atomic pair commit, but the fixed production and
+  # runtime projections are repaired immediately afterwards.  Persist the
+  # exact Gate-authorized P0/R0 first so Restore can recover the intervening
+  # state without scanning historical receipts or accepting foreign bytes.
+  mkdir -p "$receipt_root/$TO"
+  for intent_parent in \
+    "$(monday_root_join "$ROOT" data)" "$(monday_root_join "$ROOT" data/monday)" \
+    "$(monday_root_join "$ROOT" data/monday/evidence)" "$receipt_root" "$receipt_root/$TO"; do
+    monday_path_direct "$intent_parent" || die "cutover recovery path is indirect: $intent_parent"
+  done
+  [[ ! -e $recovery_intent && ! -L $recovery_intent \
+    && ! -e $recovery_intent_tmp && ! -L $recovery_intent_tmp ]] \
+    || die 'cutover recovery intent already exists for target controller'
+  jq -cS -n --arg from "$before_controller" --arg to "$TO" \
+    --arg before_payload "$before_payload" --arg before_runtime "$before_runtime" \
+    --arg before_projection "$before_production_projection" \
+    --arg payload "$target_payload" --arg runtime "$target_runtime" \
+    --arg gate "$GATE" --arg gate_sha "$GATE_SHA" \
+    '{schema:"monday.rust_lob_pair_cutover_recovery.v1",control_plane_version:2,
+      operation:"cutover",from_source_mode:"direct",from_controller_sha256:$from,
+      controller_sha256:$to,before_payload_sha256:$before_payload,
+      before_runtime_contract_sha256:$before_runtime,
+      before_production_projection:$before_projection,payload_sha256:$payload,
+      runtime_contract_sha256:$runtime,gate_receipt:$gate,gate_sha256:$gate_sha}' \
+    >"$recovery_intent_tmp"
+  chmod 0440 "$recovery_intent_tmp"
+  mv -f -- "$recovery_intent_tmp" "$recovery_intent"
+  monday_file_direct "$recovery_intent" || die 'cutover recovery intent is not a direct file'
+  recovery_intent_written=1
 fi
 link_projection() {
   local link=$1 target=$2 temporary="$1.new.$$"
@@ -802,6 +861,10 @@ for asset in "${CONTROLLER_PROJECTION_ASSETS[@]}"; do
   [[ $(monday_sha256_file "$resolved") == "$(monday_sha256_file "$target_release/deployment/$asset")" ]] \
     || die "active controller projection differs from target: $asset"
 done
+if (( recovery_intent_written == 1 )); then
+  rm -f -- "$recovery_intent" || die 'could not clear converged cutover recovery intent'
+  recovery_intent_written=0
+fi
 
 recovery_scheduler_state='{}'
 if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
@@ -814,7 +877,6 @@ if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
   done
 fi
 
-receipt_root=$(monday_root_join "$ROOT" data/monday/evidence/cutovers)
 mkdir -p "$receipt_root/$TO"; receipt="$receipt_root/$TO/transition.json"
 [[ ! -e $receipt && ! -L $receipt ]] || die 'transition receipt already exists for target controller'
 completed_at_ns=$(date +%s%N)

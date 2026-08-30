@@ -2096,6 +2096,24 @@ monday_validate_v2_gate_authoritative() {
   fi
 }
 
+monday_v2_gate_before_asset_sha256() {
+  [[ $# -eq 2 ]] || return 2
+  local gate=$1 asset=$2
+  jq -er --arg asset "$asset" '
+    (if (.before.production_assets | has($asset)) then
+      .before.production_assets[$asset]
+    elif (.shadow_staging.before_assets | has($asset)) then
+      .shadow_staging.before_assets[$asset].sha256
+    else
+      error("unknown before asset")
+    end)
+    | if . == null then ""
+      elif type == "string" and test("^[a-f0-9]{64}$") then .
+      else error("invalid before asset digest")
+      end
+  ' "$gate"
+}
+
 # Validate the transition receipt and its exact V2 Gate evidence.  A cutover
 # receipt is not authoritative by itself: the immutable Gate receipt must be
 # present, hash-identical, and pass the full evidence validator above.
