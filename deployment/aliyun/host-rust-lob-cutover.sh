@@ -165,13 +165,11 @@ if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
             if [[ $unit == *'@spot.service' ]]; then
               fixture_spot_health=$(monday_root_join "$ROOT" \
                 data/monday/spool/binance-lob/spot/health.json)
-              if [[ -f $fixture_spot_health \
-                && ! -e "$(monday_root_join "$ROOT" run/cutover-fixture-spot-flip)" ]]; then
+              if [[ -e "$(monday_root_join "$ROOT" run/cutover-fixture-spot-flip)" ]]; then
+                fixture_pid=${MONDAY_CUTOVER_FIXTURE_SPOT_FLIP_PID:-$fixture_pid}
+              elif [[ -f $fixture_spot_health ]]; then
                 : >"$(monday_root_join "$ROOT" run/cutover-fixture-spot-observed)"
               fi
-            fi
-            if [[ $unit == *'@spot.service' && -f "$(monday_root_join "$ROOT" run/cutover-fixture-spot-flip)" ]]; then
-              fixture_pid=${MONDAY_CUTOVER_FIXTURE_SPOT_FLIP_PID:-$fixture_pid}
             fi
             printf '%s\n' "$fixture_pid" ;;
           NRestarts) printf '%s\n' "${MONDAY_CUTOVER_FIXTURE_RESTARTS:-0}" ;;
