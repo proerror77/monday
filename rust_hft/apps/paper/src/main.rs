@@ -3,8 +3,8 @@
 //! 零風險模式，適用於策略驗證和調試
 
 use clap::Parser;
-use runtime::{SystemBuilder, SystemConfig};
-use tracing::{info, warn};
+use runtime::SystemBuilder;
+use tracing::info;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -34,18 +34,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("配置檔案: {}", args.config);
 
     // 使用 SystemBuilder 從 YAML 配置建構系統
-    let mut system = match SystemBuilder::from_yaml(&args.config) {
-        Ok(builder) => {
-            info!("成功載入配置檔案: {}", args.config);
-            builder.auto_register_adapters().build()
-        }
-        Err(e) => {
-            warn!("無法載入配置檔案: {}, 使用預設配置", e);
-            SystemBuilder::new(SystemConfig::default())
-                .auto_register_adapters()
-                .build()
-        }
-    };
+    let mut system = SystemBuilder::from_yaml(&args.config)?
+        .auto_register_adapters()
+        .build();
+    info!("成功載入配置檔案: {}", args.config);
 
     // 啟動系統
     system.start().await?;
