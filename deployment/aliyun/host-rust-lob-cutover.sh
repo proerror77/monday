@@ -56,6 +56,7 @@ transition_marker="$transition_receipt.sha256"
 transition_marker_tmp="$transition_marker.tmp.$$"
 transition_receipt_written=0
 transition_marker_written=0
+transition_authority_committed=0
 lock_root=$(monday_root_join "$ROOT" run/lock)
 mkdir -p "$lock_root"
 exec 9>"$lock_root/monday-rust-lob-control-plane.lock"
@@ -455,6 +456,12 @@ restore_direct_topology() {
 }
 cleanup() {
   local status=$? rollback_failed=false; set +e
+  if (( status != 0 && transition_authority_committed == 1 )); then
+    printf 'cutover transition authority committed; incomplete recovery cleanup requires readback\n' >&2
+    rm -f -- "$recovery_intent_tmp" "$transition_receipt_tmp" "$transition_marker_tmp"
+    rm -rf -- "$tmp_root"
+    exit "$status"
+  fi
   if (( status != 0 )); then
     if (( committed == 1 )); then
       if ! rm -f -- "$active_link.rollback.$$"; then
@@ -998,6 +1005,10 @@ marker_sha=$(awk '$2 == "transition.json" { count++; value=$1 } END { if (count 
 [[ $marker_sha == "$receipt_sha" ]] || die 'committed transition digest marker differs during readback'
 monday_validate_v2_transition "$ROOT" "$receipt" "$FROM" "$TO" "$GATE" "$GATE_SHA" \
   || die 'committed transition receipt failed readback validation'
+transition_authority_committed=1
+if [[ ${MONDAY_CUTOVER_FAIL_AFTER_TRANSITION_COMMIT:-0} == 1 ]]; then
+  die 'fault injection after committed transition authority'
+fi
 if [[ ${MONDAY_CUTOVER_HARD_CRASH_AFTER_TRANSITION_RECEIPT:-0} == 1 ]]; then
   kill -KILL "$$"
 fi

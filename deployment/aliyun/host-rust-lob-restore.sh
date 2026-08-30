@@ -165,13 +165,23 @@ if [[ -e $restore_receipt || -L $restore_receipt \
   readonly_idempotency_check=true
 fi
 cleanup() {
-  local status=$?; set +e
+  local status=$? evidence_cleanup_failed=false; set +e
   if [[ $success != true && $status != 0 ]]; then
-    if (( restore_receipt_written == 1 )); then
-      rm -f -- "$restore_receipt"
-    fi
     if (( restore_receipt_sha_written == 1 )); then
-      rm -f -- "$restore_receipt_sha"
+      rm -f -- "$restore_receipt_sha" || evidence_cleanup_failed=true
+      if [[ $evidence_cleanup_failed == false ]]; then
+        sync -f "$receipt_root/$CONTROLLER" || evidence_cleanup_failed=true
+      fi
+      if [[ $evidence_cleanup_failed == false \
+        && ${MONDAY_RESTORE_HARD_CRASH_AFTER_DIGEST_CLEANUP:-0} == 1 ]]; then
+        kill -KILL "$$"
+      fi
+    fi
+    if (( restore_receipt_written == 1 )) && [[ $evidence_cleanup_failed == false ]]; then
+      rm -f -- "$restore_receipt" || evidence_cleanup_failed=true
+      if [[ $evidence_cleanup_failed == false ]]; then
+        sync -f "$receipt_root/$CONTROLLER" || evidence_cleanup_failed=true
+      fi
     fi
   fi
   rm -f -- "$restore_receipt_tmp" "$restore_receipt_sha_tmp"
@@ -1102,6 +1112,9 @@ if [[ $recovery_intent_valid == true ]]; then
 fi
 if [[ ${MONDAY_RESTORE_HARD_CRASH_AFTER_RECEIPT:-0} == 1 ]]; then
   kill -KILL "$$"
+fi
+if [[ ${MONDAY_RESTORE_FAIL_AFTER_RECEIPT:-0} == 1 ]]; then
+  die 'fault injection after restore receipt commit'
 fi
 success=true
 if [[ $recovery_intent_valid == true ]]; then

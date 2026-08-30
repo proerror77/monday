@@ -873,20 +873,18 @@ rm -f -- "$payload_delta_restore_stop" "$ROOT/run/restore-fixture-start-spot" \
 payload_delta_restore_writer=$!
 if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_RESTORE_FIXTURE_SYSTEMD=1 \
   MONDAY_RESTORE_FIXTURE_PID="$payload_delta_restore_pid_before" \
-  MONDAY_RESTORE_HEALTH_TIMEOUT_SECONDS=3 MONDAY_RESTORE_HARD_CRASH_AFTER_RECEIPT=1 \
+  MONDAY_RESTORE_HEALTH_TIMEOUT_SECONDS=3 MONDAY_RESTORE_FAIL_AFTER_RECEIPT=1 \
+  MONDAY_RESTORE_HARD_CRASH_AFTER_DIGEST_CLEANUP=1 \
   MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-restore.sh" \
   --controller "$c1" --root "$ROOT" >"$ROOT/run/payload-delta-restore.err" 2>&1; then
-  printf 'post-receipt Restore unexpectedly survived SIGKILL\n' >&2
+  printf 'post-receipt cleanup unexpectedly survived SIGKILL\n' >&2
   exit 1
 fi
 : >"$payload_delta_restore_stop"
 wait "$payload_delta_restore_writer"
 [[ -f $payload_delta_recovery && ! -L $payload_delta_recovery ]]
 [[ -f $payload_delta_restore_receipt && ! -L $payload_delta_restore_receipt ]]
-[[ -f $payload_delta_restore_marker && ! -L $payload_delta_restore_marker ]]
-payload_delta_restore_sha=$(awk '$2 == "restore.json" { count++; value=$1 } END { if (count != 1) exit 1; print value }' \
-  "$payload_delta_restore_marker")
-[[ $(monday_sha256_file "$payload_delta_restore_receipt") == "$payload_delta_restore_sha" ]]
+[[ ! -e $payload_delta_restore_marker && ! -L $payload_delta_restore_marker ]]
 jq -e --arg gate "$payload_delta_gate" --arg gate_sha "$payload_delta_gate_sha" '
   .transition_receipt == null
   and .gate_receipt == $gate and .gate_sha256 == $gate_sha
@@ -914,6 +912,10 @@ fi
 wait "$payload_delta_restore_writer"
 grep -Fq 'Pair restore recovery complete' <<<"$payload_delta_restore_output"
 [[ $(monday_sha256_file "$payload_delta_restore_receipt") == "$payload_delta_restore_receipt_before" ]]
+[[ -f $payload_delta_restore_marker && ! -L $payload_delta_restore_marker ]]
+payload_delta_restore_sha=$(awk '$2 == "restore.json" { count++; value=$1 } END { if (count != 1) exit 1; print value }' \
+  "$payload_delta_restore_marker")
+[[ $(monday_sha256_file "$payload_delta_restore_receipt") == "$payload_delta_restore_sha" ]]
 jq -e --argjson old_pid "$payload_delta_restore_pid_before" \
   '.process_identity.spot.main_pid == $old_pid and .process_identity.usdm.main_pid == $old_pid' \
   "$payload_delta_restore_receipt" >/dev/null
@@ -935,9 +937,9 @@ jq -e --arg gate "$payload_delta_gate" --arg gate_sha "$payload_delta_gate_sha" 
   and .gate_receipt == $gate and .gate_sha256 == $gate_sha
 ' "$payload_delta_restore_receipt" >/dev/null
 
-# Reset the same immutable C0/P0/R0, then crash only after transition.json and
-# its digest have both passed readback.  The recovery intent must still exist
-# at that point, and Restore must retain the exact transition/Gate chain.
+# Reset the same immutable C0/P0/R0, then fail only after transition.json and
+# its digest have both passed readback.  Cleanup must preserve that committed
+# authority and active C1 instead of rolling back after recovery deletion starts.
 rm -rf -- "$ROOT/data/monday/evidence/restores/$c1"
 rm -f -- "$ROOT/opt/monday/releases/binance-lob-controller/active"
 ln -s "$legacy_root/$legacy_delta_c0" "$ROOT/opt/monday/releases/binance-lob-controller/active"
@@ -963,12 +965,12 @@ done < <(monday_controller_projection_assets)
 [[ $(monday_rust_lob_live_runtime_contract_sha256_v1 "$ROOT") == "$legacy_delta_runtime" ]]
 
 if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
-  MONDAY_CUTOVER_FIXTURE_LEGACY_ACTIVE=1 MONDAY_CUTOVER_HARD_CRASH_AFTER_TRANSITION_RECEIPT=1 \
+  MONDAY_CUTOVER_FIXTURE_LEGACY_ACTIVE=1 MONDAY_CUTOVER_FAIL_AFTER_TRANSITION_COMMIT=1 \
   MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-cutover.sh" \
   --from direct --to "$c1" --gate-receipt "$payload_delta_gate" \
   --gate-sha256 "$payload_delta_gate_sha" --root "$ROOT" \
   >"$ROOT/run/payload-delta-transition.err" 2>&1; then
-  printf 'post-receipt direct payload transition unexpectedly survived SIGKILL\n' >&2
+  printf 'post-commit direct payload transition unexpectedly succeeded\n' >&2
   exit 1
 fi
 payload_delta_transition="$ROOT/data/monday/evidence/cutovers/$c1/transition.json"
