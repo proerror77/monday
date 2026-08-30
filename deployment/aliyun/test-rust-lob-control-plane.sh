@@ -153,17 +153,17 @@ production_usdm_segment_seconds=$(sed -n 's/^SEGMENT_SECONDS=//p' \
 gate_observation_source=$(sed -n '/^run_market_gate_phase()/,/^}/p' \
   "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh")
 grep -Fq "observation_started_ns=\$(monotonic_nanoseconds)" <<<"$gate_observation_source"
-iteration_started_line=$(grep -Fn "observation_iteration_started_ns=\$(monotonic_nanoseconds)" \
+sampled_line=$(grep -Fn "observation_sampled_ns=\$(monotonic_nanoseconds)" \
   <<<"$gate_observation_source" | cut -d: -f1)
-deadline_line=$(grep -Fn 'if (( observation_iteration_started_ns >= observation_deadline_ns )); then' \
+deadline_line=$(grep -Fn 'if (( observation_sampled_ns >= observation_deadline_ns )); then' \
   <<<"$gate_observation_source" | cut -d: -f1)
 validation_line=$(grep -Fn "validate_observation_sample \"\$market\"" \
   <<<"$gate_observation_source" | cut -d: -f1)
-evidence_line=$(grep -Fn "if clean_segment_pair_ready \"\$market\"; then" \
+evidence_line=$(grep -Fn "if clean_segment_pair_ready \"\$market\" \"\$observation_segment_snapshot\"; then" \
   <<<"$gate_observation_source" | cut -d: -f1)
-(( iteration_started_line < deadline_line && deadline_line < evidence_line \
-  && evidence_line < validation_line ))
-grep -Fq "observation_finished_ns=\$observation_iteration_started_ns" \
+(( evidence_line < sampled_line && sampled_line < deadline_line \
+  && deadline_line < validation_line ))
+grep -Fq "observation_finished_ns=\$observation_sampled_ns" \
   <<<"$gate_observation_source"
 grep -Fq "write_run_json || die 'could not commit deadline failure run evidence'" \
   <<<"$gate_observation_source"
@@ -1267,9 +1267,8 @@ jq -e 'all(.markets[]; . as $market
   and all(.triplets[]; .end_received_at_ns > $market.observation_started_at_ns))' \
   "$preobservation_gate" >/dev/null
 
-# A sample that starts inside the evidence window may finish validation after
-# the deadline.  The sample start remains the receipt cutoff; no later sample
-# is authorised.
+# Evidence snapshotted inside the window may finish validation after the
+# deadline.  The snapshot cutoff remains the receipt cutoff.
 cross_deadline_gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 \
   MONDAY_GATE_FIXTURE_CROSS_EVIDENCE_DEADLINE=1 \
   MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=1 MONDAY_GATE_TEST_SECONDS=1 \
@@ -1288,11 +1287,11 @@ jq -e '
     and .observation_finished_monotonic_ns >= .observation_started_monotonic_ns)' \
   "$cross_deadline_run" >/dev/null
 
-# A new iteration may not start at or after the deadline.  Persist the partial
-# observation window before failing so the non-authoritative run evidence is
-# still truthful.
+# A segment sealed while the readiness scan is running cannot move the cutoff
+# backwards.  Persist the partial window before failing so non-authoritative
+# run evidence is still truthful.
 deadline_failure_output="$ROOT/run/evidence-deadline-failure.err"
-if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_SINGLE_CLEAN_SEGMENT=1 \
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_POST_SAMPLE_EVIDENCE=1 \
   MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=1 MONDAY_GATE_TEST_SECONDS=1 \
   MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
   --from-controller direct --candidate-controller "$c0" --root "$ROOT" \

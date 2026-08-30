@@ -1829,6 +1829,7 @@ fixture_seed_market_segments() {
   fi
   [[ ${MONDAY_GATE_FIXTURE_RECONNECT_BOUNDARY:-0} == 1 ]] && segment_count=3
   [[ ${MONDAY_GATE_FIXTURE_SINGLE_CLEAN_SEGMENT:-0} == 1 ]] && segment_count=1
+  [[ ${MONDAY_GATE_FIXTURE_POST_SAMPLE_EVIDENCE:-0} == 1 ]] && segment_count=1
   for ((i = 1; i <= segment_count; i++)); do
     boundary=false
     [[ ${MONDAY_GATE_FIXTURE_RECONNECT_BOUNDARY:-0} == 1 && $i -eq 1 ]] && boundary=true
@@ -2120,8 +2121,26 @@ segment_manifest_interval() {
        else "unsafe" end) as $state
     | [$state, .start_received_at_ns, .end_received_at_ns] | @tsv' "$manifest"
 }
+snapshot_segment_record() {
+  local manifest=$1 path digest manifest_digest marker_size
+  path=${manifest%.manifest.json}
+  [[ -f $path && -f "${path}._SUCCESS" ]] || return 1
+  digest=$(jq -er '.sha256 | select(type == "string" and test("^[a-f0-9]{64}$"))' \
+    "$manifest") || return 2
+  [[ $(sha256_file "$path") == "$digest" ]] || return 2
+  marker_size=$(wc -c <"${path}._SUCCESS" | tr -d ' ')
+  [[ $marker_size == 65 && $(<"${path}._SUCCESS") == "$digest" ]] || return 2
+  manifest_digest=$(sha256_file "$manifest") || return 2
+  printf '%s\t%s\n' "$manifest" "$manifest_digest"
+}
 clean_segment_pair_ready() {
-  local market=$1 manifest path interval state start end previous_end=0 run_count=0
+  local market=$1 snapshot=$2 manifest path interval state start end previous_end=0 run_count=0 previous_manifest='' record late_start
+  rm -f -- "$snapshot" "$snapshot.tmp"
+  if [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_POST_SAMPLE_EVIDENCE:-0} == 1 ]]; then
+    late_start=$(( market_observation_started_ns[$market] + 2000 ))
+    sleep 2
+    fixture_seed_segment "$market" "$late_start" "$((late_start + 900))" false
+  fi
   while IFS= read -r manifest; do
     path=${manifest%.manifest.json}
     [[ -f $path && -f "${path}._SUCCESS" ]] || continue
@@ -2129,11 +2148,11 @@ clean_segment_pair_ready() {
       || return 2
     IFS=$'\t' read -r state start end <<<"$interval"
     if (( end <= market_observation_started_ns[$market] )); then
-      previous_end=0; run_count=0
+      previous_end=0; previous_manifest=; run_count=0
       continue
     fi
     if [[ $state != clean ]]; then
-      previous_end=0; run_count=0
+      previous_end=0; previous_manifest=; run_count=0
       continue
     fi
     if (( previous_end > 0 )); then
@@ -2146,16 +2165,28 @@ clean_segment_pair_ready() {
     else
       run_count=1
     fi
+    if (( run_count >= 2 )); then
+      record=$(snapshot_segment_record "$previous_manifest") || return 2
+      printf '%s\n' "$record" >"$snapshot.tmp"
+      record=$(snapshot_segment_record "$manifest") || return 2
+      printf '%s\n' "$record" >>"$snapshot.tmp"
+      mv -f -- "$snapshot.tmp" "$snapshot"
+      return 0
+    fi
     previous_end=$end
-    (( run_count >= 2 )) && return 0
+    previous_manifest=$manifest
   done < <(find "${spool_dir[$market]}" -maxdepth 1 -type f -name '*.jsonl.zst.manifest.json' | sort)
   return 1
 }
 verify_segments() {
-  local market=$1 dir="${spool_dir[$1]}" manifest path file digest manifest_digest success_digest expected_success count=0 previous_end=0 start end segment_json interval state
+  local market=$1 snapshot=$2 manifest snapshot_manifest_digest path file digest manifest_digest success_digest expected_success count=0 previous_end=0 start end segment_json interval state
   local -a segment_records=()
+  [[ -f $snapshot ]] || die "$market observation segment snapshot is absent"
   phase_segments_json[$market]='[]'
-  while IFS= read -r manifest; do
+  while IFS=$'\t' read -r manifest snapshot_manifest_digest; do
+    [[ $snapshot_manifest_digest =~ ^[a-f0-9]{64}$ \
+      && $(sha256_file "$manifest") == "$snapshot_manifest_digest" ]] \
+      || die "$market observation segment snapshot changed"
     path=${manifest%.manifest.json}; file=${path##*/}
     [[ -f $path && -f "${path}._SUCCESS" ]] || die "$market sealed segment is incomplete: $file"
     interval=$(segment_manifest_interval "$market" "$manifest" "${phase_session[$market]}") \
@@ -2196,7 +2227,7 @@ verify_segments() {
       --argjson value "$segment_json" '$values + [$value]')
     segment_records+=("$path" "$digest" "$manifest_digest")
     (( count >= 2 )) && break
-  done < <(find "$dir" -maxdepth 1 -type f -name '*.jsonl.zst.manifest.json' | sort)
+  done <"$snapshot"
   ((count == 2)) || die "$market has fewer than two adjacent clean segments"
   verify_adjacent_segments "${segment_records[@]}" || die "$market strict LOB continuity verifier failed"
   if [[ $market == spot ]]; then
@@ -2212,7 +2243,7 @@ verify_segments() {
   phase_segments["$market"]=$count
 }
 run_market_gate_phase() {
-  local market=$1 settle observation_deadline_ns observation_finished_ns observation_iteration_started_ns observation_started_ns pid started_ns readiness
+  local market=$1 settle observation_deadline_ns observation_finished_ns observation_sampled_ns observation_segment_snapshot observation_started_ns pid started_ns readiness
   resource_monitor_start "shadow-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; fixture_seed_market "$market"; systemctl reset-failed "${unit[$market]}" >/dev/null 2>&1 || true
   started_ns=$(date +%s%N); market_gate_started_ns[$market]=$started_ns
   systemctl start "${unit[$market]}"; pid=$(shadow_identity_wait "$market"); phase_pid["$market"]=$pid; phase_exe_sha["$market"]=$candidate_payload
@@ -2224,20 +2255,21 @@ run_market_gate_phase() {
   observation_started_ns=$(monotonic_nanoseconds)
   market_observation_started_mono_ns[$market]=$observation_started_ns
   observation_deadline_ns=$(( observation_started_ns + GATE_EVIDENCE_TIMEOUT_SECONDS * 1000000000 ))
+  observation_segment_snapshot="$tmp_dir/$market-observation-segments.tsv"
   while :; do
-    observation_iteration_started_ns=$(monotonic_nanoseconds)
-    if (( observation_iteration_started_ns >= observation_deadline_ns )); then
-      market_observation_finished_mono_ns[$market]=$observation_iteration_started_ns
-      phase_runtime[$market]=$(( (observation_iteration_started_ns - observation_started_ns) / 1000000000 ))
-      write_run_json || die 'could not commit deadline failure run evidence'
-      die "$market did not produce two adjacent clean segments before the evidence deadline"
-    fi
-    if clean_segment_pair_ready "$market"; then
+    if clean_segment_pair_ready "$market" "$observation_segment_snapshot"; then
       readiness=0
     else
       readiness=$?
-      (( readiness == 1 )) || die "$market segment evidence is malformed"
     fi
+    observation_sampled_ns=$(monotonic_nanoseconds)
+    if (( observation_sampled_ns >= observation_deadline_ns )); then
+      market_observation_finished_mono_ns[$market]=$observation_sampled_ns
+      phase_runtime[$market]=$(( (observation_sampled_ns - observation_started_ns) / 1000000000 ))
+      write_run_json || die 'could not commit deadline failure run evidence'
+      die "$market did not produce two adjacent clean segments before the evidence deadline"
+    fi
+    (( readiness == 1 || readiness == 0 )) || die "$market segment evidence is malformed"
     validate_observation_sample "$market"
     assert_host_memory_reserve
     [[ $(systemctl_value "$market" NRestarts) == 0 ]] || die "$market restarted"
@@ -2251,9 +2283,9 @@ run_market_gate_phase() {
       sleep 15
     fi
   done
-  # The final sample starts inside the evidence window.  Its validation may
-  # finish later, but cannot extend the observed window or authorize another sample.
-  observation_finished_ns=$observation_iteration_started_ns
+  # The selected triplets were complete and hashed at this cutoff.  Later
+  # validation cannot extend the evidence window or select newer segments.
+  observation_finished_ns=$observation_sampled_ns
   market_observation_finished_mono_ns[$market]=$observation_finished_ns
   phase_runtime["$market"]=$(( (observation_finished_ns - observation_started_ns) / 1000000000 ))
   phase_health_json[$market]=$(jq -cn --arg sha "$(sha256_file "${spool_dir[$market]}/health.json")" \
@@ -2265,7 +2297,7 @@ run_market_gate_phase() {
   systemctl stop "${unit[$market]}"; systemctl_active "${unit[$market]}" && die "$market shadow remained active"; \
     resource_monitor_stop_or_die "shadow-$market"; \
     resource_monitor_start "strict-verifier-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; \
-    verify_segments "$market"; resource_monitor_stop_or_die "strict-verifier-$market"
+    verify_segments "$market" "$observation_segment_snapshot"; resource_monitor_stop_or_die "strict-verifier-$market"
 }
 DRAIN_ENV_KEYS=(
   MARKET DATASET SHARD_ID SYMBOLS DEPTH_MODE WS_SHARD_SIZE SNAPSHOT_LIMIT
