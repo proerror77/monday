@@ -2164,7 +2164,7 @@ triplet_uri="oss://bucket/$triplet_object_prefix/part-1.jsonl.zst"
 triplet_now_ns=$(( $(date +%s%N) - 120000000000 ))
 triplet_now=$(monday_epoch_ns_rfc3339 "$triplet_now_ns")
 triplet_start_ns=$((triplet_now_ns - 3600000000000))
-triplet_end_ns=$((triplet_now_ns - 3599000000000))
+triplet_end_ns=$((triplet_start_ns + 300000000000))
 jq --argjson start "$triplet_start_ns" --argjson end "$triplet_end_ns" \
   '.start_received_at_ns=$start | .end_received_at_ns=$end' \
   "$triplet_manifest" >"$triplet_manifest.tmp"
@@ -2185,6 +2185,23 @@ triplet_tmp="$ROOT/triplet-readback-tmp"
 triplet_readback=$(monday_verify_upload_triplet_readback "$triplet_status" spot spot_all bucket "$triplet_prefix" \
   "$triplet_tmp" "$triplet_now" copy_triplet_fixture fixture-session 0)
 [[ $(jq -r '.data_sha256' <<<"$triplet_readback") == "$triplet_data_sha" ]]
+production_readback=$(monday_verify_upload_triplet_readback "$triplet_status" spot spot_all bucket "$triplet_prefix" \
+  "$triplet_tmp" "$triplet_now" copy_triplet_fixture fixture-session "$triplet_start_ns")
+[[ $(jq -r '.end_received_at_ns - .start_received_at_ns' <<<"$production_readback") == 300000000000 ]]
+cp -p -- "$triplet_manifest" "$triplet_manifest.full-cadence"
+partial_end_ns=$((triplet_start_ns + 1000000000))
+jq --argjson end "$partial_end_ns" '.end_received_at_ns=$end' \
+  "$triplet_manifest.full-cadence" >"$triplet_manifest"
+partial_manifest_sha=$(monday_sha256_file "$triplet_manifest")
+jq --arg sha "$partial_manifest_sha" --argjson end "$partial_end_ns" \
+  '.last_uploaded_triplet.manifest_sha256=$sha | .last_uploaded_triplet.end_received_at_ns=$end' \
+  "$triplet_status" >"$triplet_status.partial-cadence"
+if monday_verify_upload_triplet_readback "$triplet_status.partial-cadence" spot spot_all bucket "$triplet_prefix" \
+  "$triplet_tmp" "$triplet_now" copy_triplet_fixture fixture-session "$triplet_start_ns" >/dev/null 2>&1; then
+  printf 'production triplet readback accepted a partial 300-second segment\n' >&2
+  exit 1
+fi
+mv -f -- "$triplet_manifest.full-cadence" "$triplet_manifest"
 # A historical capture may predate the recovery job; only the upload commit
 # must be newer than its cutoff.
 historical_readback=$(monday_verify_upload_triplet_readback "$triplet_status" spot spot_all bucket "$triplet_prefix" \

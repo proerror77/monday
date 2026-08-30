@@ -2193,9 +2193,10 @@ monday_validate_v2_transition() {
 
 # Verify one production upload-status triplet using an injected copy function.
 # Arguments 7 and 10 are independent upload-commit and capture cutoffs; a
-# zero/empty capture cutoff permits historical recovery data.  The caller owns
-# the OSS credentials; this helper owns URI identity, triplet bytes, marker
-# content, and manifest re-download consistency.
+# zero/empty capture cutoff permits historical recovery data.  A production
+# capture cutoff also requires one complete 300-second post-cutover segment.
+# The caller owns the OSS credentials; this helper owns URI identity, triplet
+# bytes, marker content, and manifest re-download consistency.
 monday_verify_upload_triplet_readback() {
   [[ $# -ge 8 && $# -le 10 ]] || return 2
   local status=$1 market=$2 dataset=$3 expected_bucket=$4 expected_prefix=$5
@@ -2312,6 +2313,7 @@ monday_verify_upload_triplet_readback() {
   end_ns=$(jq -er '.end_received_at_ns' "$manifest_file") || return 1
   [[ $start_ns =~ ^[0-9]+$ && $end_ns =~ ^[0-9]+$ \
     && $start_ns -ge $minimum_capture_ns && $end_ns -ge $start_ns && $end_ns -le $now_ns ]] || return 1
+  (( minimum_capture_ns == 0 || end_ns - start_ns >= 300000000000 )) || return 1
   uploaded_at=$(jq -er '.uploaded_at // empty' <<<"$triplet") || true
   if [[ -n $uploaded_at ]]; then
     uploaded_ns=$(monday_iso_epoch_ns "$uploaded_at") || return 1
