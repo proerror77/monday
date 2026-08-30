@@ -113,7 +113,7 @@ impl PortfolioBudgetRiskManager {
                     .get(portfolio_name)
                     .cloned()
                     .unwrap_or_else(|| ExposureProjector::new(account));
-                let projected = match projector.project(&intent) {
+                let projected = match projector.project(intent) {
                     Ok(projected) => projected,
                     Err(reason) => {
                         reject_reason = Some(reason);
@@ -156,67 +156,6 @@ impl PortfolioBudgetRiskManager {
         account: &ports::AccountView,
     ) -> Vec<ports::OrderIntent> {
         self.filter_items(intents, account, |intent| intent)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use hft_core::{OrderType, Price, Quantity, Side, Symbol, TimeInForce};
-
-    #[test]
-    fn shared_portfolio_budget_accumulates_across_strategies() {
-        let base = crate::RiskManagerFactory::create_risk_manager(&crate::RiskConfig {
-            risk_type: "Default".to_string(),
-            global_position_limit: Decimal::from(1_000),
-            global_notional_limit: Decimal::from(100_000),
-            max_orders_per_second: 100,
-            staleness_threshold_us: u64::MAX,
-            max_daily_loss: Decimal::from(10_000),
-            max_drawdown_pct: 5.0,
-            ..Default::default()
-        });
-        let mut manager = PortfolioBudgetRiskManager::new(
-            base,
-            vec![PortfolioSpec {
-                name: "shared".to_string(),
-                strategies: vec!["alpha-a".to_string(), "alpha-b".to_string()],
-                max_notional: Some(Decimal::from(100)),
-                max_position: None,
-                ..Default::default()
-            }],
-            &[],
-        );
-        let intent = |strategy: &str| {
-            ports::OrderIntent::crypto_spot(
-                Symbol::new("BTCUSDT"),
-                Side::Buy,
-                Quantity(Decimal::from(60)),
-                OrderType::Limit,
-                Some(Price(Decimal::ONE)),
-                TimeInForce::GTC,
-                strategy.to_string(),
-                Some(VenueId::BINANCE),
-            )
-        };
-
-        let envelope = |intent, emitted_at| {
-            let mut lifecycle = ports::OrderIntentLifecycle::default();
-            lifecycle.timing.intent_emitted_mono_us = Some(emitted_at);
-            ports::OrderIntentEnvelope::new(intent, lifecycle)
-        };
-        let specs = HashMap::from([(VenueId::BINANCE, ports::VenueSpec::binance_spot())]);
-        let approved = manager.review_envelopes_with_venue_specs(
-            vec![
-                envelope(intent("alpha-a"), 1),
-                envelope(intent("alpha-b"), 2),
-            ],
-            &ports::AccountView::default(),
-            &specs,
-        );
-
-        assert_eq!(approved.len(), 1);
-        assert_eq!(approved[0].lifecycle.timing.intent_emitted_mono_us, Some(1));
     }
 }
 
@@ -290,5 +229,66 @@ impl RiskManager for PortfolioBudgetRiskManager {
 
     fn get_config_snapshot(&self) -> ports::RiskConfigSnapshot {
         self.base_risk_manager.get_config_snapshot()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hft_core::{OrderType, Price, Quantity, Side, Symbol, TimeInForce};
+
+    #[test]
+    fn shared_portfolio_budget_accumulates_across_strategies() {
+        let base = crate::RiskManagerFactory::create_risk_manager(&crate::RiskConfig {
+            risk_type: "Default".to_string(),
+            global_position_limit: Decimal::from(1_000),
+            global_notional_limit: Decimal::from(100_000),
+            max_orders_per_second: 100,
+            staleness_threshold_us: u64::MAX,
+            max_daily_loss: Decimal::from(10_000),
+            max_drawdown_pct: 5.0,
+            ..Default::default()
+        });
+        let mut manager = PortfolioBudgetRiskManager::new(
+            base,
+            vec![PortfolioSpec {
+                name: "shared".to_string(),
+                strategies: vec!["alpha-a".to_string(), "alpha-b".to_string()],
+                max_notional: Some(Decimal::from(100)),
+                max_position: None,
+                ..Default::default()
+            }],
+            &[],
+        );
+        let intent = |strategy: &str| {
+            ports::OrderIntent::crypto_spot(
+                Symbol::new("BTCUSDT"),
+                Side::Buy,
+                Quantity(Decimal::from(60)),
+                OrderType::Limit,
+                Some(Price(Decimal::ONE)),
+                TimeInForce::GTC,
+                strategy.to_string(),
+                Some(VenueId::BINANCE),
+            )
+        };
+
+        let envelope = |intent, emitted_at| {
+            let mut lifecycle = ports::OrderIntentLifecycle::default();
+            lifecycle.timing.intent_emitted_mono_us = Some(emitted_at);
+            ports::OrderIntentEnvelope::new(intent, lifecycle)
+        };
+        let specs = HashMap::from([(VenueId::BINANCE, ports::VenueSpec::binance_spot())]);
+        let approved = manager.review_envelopes_with_venue_specs(
+            vec![
+                envelope(intent("alpha-a"), 1),
+                envelope(intent("alpha-b"), 2),
+            ],
+            &ports::AccountView::default(),
+            &specs,
+        );
+
+        assert_eq!(approved.len(), 1);
+        assert_eq!(approved[0].lifecycle.timing.intent_emitted_mono_us, Some(1));
     }
 }
