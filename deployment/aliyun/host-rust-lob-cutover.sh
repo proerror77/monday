@@ -482,17 +482,19 @@ cleanup() {
     if (( projection_prepared == 1 )) && [[ $FROM == direct ]]; then
       restore_direct_topology || rollback_failed=true
     fi
-    if (( transition_receipt_written == 1 )); then
-      rm -f -- "$transition_receipt" || rollback_failed=true
-      transition_receipt_written=0
-    fi
     if (( transition_marker_written == 1 )); then
       rm -f -- "$transition_marker" || rollback_failed=true
-      transition_marker_written=0
+      if [[ $rollback_failed == false ]]; then
+        sync -f "$receipt_root/$TO" || rollback_failed=true
+      fi
+      [[ $rollback_failed == true ]] || transition_marker_written=0
     fi
-    if (( recovery_intent_written == 1 )) && [[ $rollback_failed == false ]]; then
-      rm -f -- "$recovery_intent" "$recovery_intent_tmp" || rollback_failed=true
-      recovery_intent_written=0
+    if (( transition_receipt_written == 1 )) && [[ $rollback_failed == false ]]; then
+      rm -f -- "$transition_receipt" || rollback_failed=true
+      if [[ $rollback_failed == false ]]; then
+        sync -f "$receipt_root/$TO" || rollback_failed=true
+      fi
+      [[ $rollback_failed == true ]] || transition_receipt_written=0
     fi
     if (( writer_containment_started == 1 )) && [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
       if (( writer_containment_failed == 1 )); then
@@ -538,6 +540,12 @@ cleanup() {
         printf 'pair rollback failed; all canonical writers remain contained\n' >&2
       fi
     fi
+    if (( recovery_intent_written == 1 )); then
+      # A failed direct transition keeps its exact Gate-bound recovery
+      # authority.  Even a successful in-process rollback is not a durable
+      # substitute for recovery after the next host power loss.
+      printf 'cutover failed; recovery intent retained: %s\n' "$recovery_intent" >&2
+    fi
   fi
   rm -f -- "$recovery_intent_tmp" "$transition_receipt_tmp" "$transition_marker_tmp"
   rm -rf -- "$tmp_root"
@@ -550,7 +558,7 @@ trap 'exit 143' HUP INT TERM
 # projections.  All bytes are saved before the active rename; V2 transitions
 # perform no live per-file write at all.  The active rename is deliberately
 # first so an interrupted bootstrap has one authoritative recovery source.
-old_production_target=$(readlink -f -- "$production" 2>/dev/null || true)
+old_production_target=$(readlink -- "$production" 2>/dev/null || true)
 if [[ $FROM == direct ]]; then
   [[ -n $old_production_target ]] || die 'bootstrap production projection is unresolved'
   for asset in "${PAIR_ASSETS[@]}"; do
@@ -995,6 +1003,9 @@ if [[ ${MONDAY_CUTOVER_HARD_CRASH_AFTER_TRANSITION_RECEIPT:-0} == 1 ]]; then
 fi
 if (( recovery_intent_written == 1 )); then
   rm -f -- "$recovery_intent" || die 'could not clear committed cutover recovery intent'
+  sync -f "$receipt_root/$TO" || die 'could not durably clear committed cutover recovery intent'
+  [[ ! -e $recovery_intent && ! -L $recovery_intent ]] \
+    || die 'committed cutover recovery intent survived deletion readback'
   recovery_intent_written=0
 fi
 transition_receipt_written=0

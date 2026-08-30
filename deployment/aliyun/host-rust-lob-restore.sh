@@ -159,7 +159,7 @@ restore_receipt_tmp="$restore_receipt.tmp.$$"
 restore_receipt_sha_tmp="$restore_receipt_sha.tmp.$$"
 restore_receipt_written=0
 restore_receipt_sha_written=0
-success=false; readonly_idempotency_check=false
+success=false; readonly_idempotency_check=false; resume_existing_restore=false
 if [[ -e $restore_receipt || -L $restore_receipt \
   || -e $restore_receipt_sha || -L $restore_receipt_sha ]]; then
   readonly_idempotency_check=true
@@ -212,10 +212,11 @@ production_runtime=$(monday_verify_production_runtime_assets \
 production=$(monday_root_join "$ROOT" opt/monday/bin/binance-lob-archiver)
 
 verify_existing_restore_state() {
-  local receipt=$1 expected_runtime=$2 stable_binary expected resolved asset target
+  local receipt=$1 expected_runtime=$2 receipt_only=${3:-false} stable_binary expected resolved asset target
   local named_transition named_gate named_gate_sha receipt_gate receipt_gate_sha transition_from transition_mode transition_validator_from
   local receipt_process receipt_health market unit pid restarts exe env_file spool health dataset minimum_symbols
   local expected_pid expected_exe expected_restarts expected_session expected_observed current_session updated now_ns
+  [[ $receipt_only == true || $receipt_only == false ]] || die 'restore receipt verification mode is invalid'
 
   # The receipt is only an idempotency key after its complete read-only state
   # has been proven.  In particular, a stale success file never authorizes a
@@ -283,6 +284,48 @@ verify_existing_restore_state() {
     fi
   fi
 
+  receipt_process=$(jq -ce '.process_identity' "$receipt") \
+    || die 'existing restore process identity evidence is malformed'
+  receipt_health=$(jq -ce '.health' "$receipt") \
+    || die 'existing restore health evidence is malformed'
+  if [[ $expected_runtime == false ]]; then
+    jq -e '
+      .production_enabled == false
+      and (.process_identity | type == "object" and length == 0)
+      and (.health | type == "object" and length == 0)
+    ' "$receipt" >/dev/null || die 'non-runtime restore receipt claims live production'
+  else
+    jq -e '.process_identity | type == "object" and (keys | sort) == ["spot", "usdm"]' \
+      "$receipt" >/dev/null || die 'existing restore process identity is incomplete'
+    jq -e '.health | type == "object" and (keys | sort) == ["spot", "usdm"]' \
+      "$receipt" >/dev/null || die 'existing restore health identity is incomplete'
+    for market in spot usdm; do
+      minimum_symbols=1000; [[ $market == usdm ]] && minimum_symbols=100
+      jq -e --arg market "$market" --arg payload "$payload" \
+        --argjson minimum_symbols "$minimum_symbols" '
+        .process_identity[$market] as $process
+        | .health[$market] as $health
+        | ($process | keys | sort) == [
+            "active", "main_pid", "n_restarts", "observed_at_ns",
+            "process_exe_sha256", "session_id"
+          ]
+          and ($health | keys | sort) == [
+            "observed_at_ns", "sequence_gaps", "session_id", "status", "symbol_count"
+          ]
+          and ($process.main_pid | type == "number" and . > 0)
+          and $process.process_exe_sha256 == $payload
+          and $process.n_restarts == 0 and $process.active == true
+          and ($process.session_id | type == "string" and length > 0)
+          and ($process.observed_at_ns | type == "number" and . > 0)
+          and $health.session_id == $process.session_id
+          and $health.observed_at_ns == $process.observed_at_ns
+          and $health.status == "synced" and $health.sequence_gaps == 0
+          and ($health.symbol_count | type == "number" and . >= $minimum_symbols)
+      ' "$receipt" >/dev/null || die "existing restore receipt runtime evidence is invalid: $market"
+    done
+  fi
+  [[ $receipt_only == false ]] || return 0
+
   stable_binary="$controller_root/active/binance-lob-archiver"
   [[ -L $production && $(readlink -- "$production") == "$stable_binary" \
     && $(readlink -f -- "$production") == "$binary" ]] \
@@ -316,12 +359,10 @@ verify_existing_restore_state() {
   done < <(monday_controller_projection_assets)
 
   # A test-only restore without a fixture systemd view deliberately does not
-  # claim live production.  Its receipt is still checked above for immutable
-  # identity/projection evidence; a production or systemd fixture receipt
-  # must pass the complete unit, timer, process, and health contract below.
+  # claim live production.  Its immutable evidence and projections were
+  # checked above; a production or systemd fixture receipt must also pass the
+  # complete live unit, timer, process, and health contract below.
   if [[ $expected_runtime == false ]]; then
-    jq -e '.production_enabled == false and (.process_identity | type == "object" and length == 0)' \
-      "$receipt" >/dev/null || die 'non-runtime restore receipt claims live production'
     return 0
   fi
 
@@ -329,14 +370,6 @@ verify_existing_restore_state() {
     || die 'existing restore legacy writers are not contained'
   monday_rust_lob_verify_recovery_schedulers_active \
     || die 'existing restore recovery timers are not active and enabled'
-  receipt_process=$(jq -ce '.process_identity' "$receipt") \
-    || die 'existing restore process identity evidence is malformed'
-  receipt_health=$(jq -ce '.health' "$receipt") \
-    || die 'existing restore health evidence is malformed'
-  jq -e '.process_identity | type == "object" and (keys | sort) == ["spot", "usdm"]' \
-    "$receipt" >/dev/null || die 'existing restore process identity is incomplete'
-  jq -e '.health | type == "object" and (keys | sort) == ["spot", "usdm"]' \
-    "$receipt" >/dev/null || die 'existing restore health identity is incomplete'
   for market in spot usdm; do
     unit="binance-lob-archiver-production@${market}.service"
     systemctl is-active --quiet "$unit" || die "existing restore production unit is inactive: $market"
@@ -552,10 +585,16 @@ repair_recovery_transition_marker() {
     "$active_transition_marker") == "$marker_sha" ]] || return 1
   recovery_transition_marker_repair=false
 }
+clear_recovery_intent() {
+  rm -f -- "$recovery_intent" || return 1
+  sync -f "$(dirname -- "$recovery_intent")" || return 1
+  [[ ! -e $recovery_intent && ! -L $recovery_intent ]]
+}
 
 # Idempotency is decided before containment or any projection/systemd write.
 # A crash may leave the validated restore receipt committed before its digest;
-# the still-present exact recovery intent authorizes repairing only that marker.
+# the still-present exact recovery intent authorizes repairing that marker and
+# reconverging mutable runtime identity after a host reboot.
 if [[ -e $restore_receipt || -L $restore_receipt || -e $restore_receipt_sha || -L $restore_receipt_sha ]]; then
   readonly_idempotency_check=true
   monday_file_direct "$restore_receipt" || die 'existing restore receipt is indirect or missing'
@@ -575,7 +614,6 @@ if [[ -e $restore_receipt || -L $restore_receipt || -e $restore_receipt_sha || -
      and (.completed_at | type == "string" and length > 0)' \
     "$restore_receipt" >/dev/null \
     || die 'existing restore receipt is not an exact successful active pair'
-  verify_existing_restore_state "$restore_receipt" "$expected_runtime"
   receipt_digest=$(monday_sha256_file "$restore_receipt")
   if [[ -e $restore_receipt_sha || -L $restore_receipt_sha ]]; then
     monday_file_direct "$restore_receipt_sha" || die 'existing restore receipt digest is indirect'
@@ -612,13 +650,19 @@ if [[ -e $restore_receipt || -L $restore_receipt || -e $restore_receipt_sha || -
       || die 'existing restore receipt differs from its recovery intent Gate'
     repair_recovery_transition_marker \
       || die 'could not repair the recovery transition digest'
+    # The receipt and digest are immutable completion evidence, but their PID,
+    # restart counter, and health session are observations rather than reboot-
+    # stable identity.  Validate the frozen receipt, then run the normal active-C
+    # convergence and fresh runtime readback before clearing recovery authority.
+    verify_existing_restore_state "$restore_receipt" "$expected_runtime" true
+    resume_existing_restore=true
+    readonly_idempotency_check=false
+  else
+    verify_existing_restore_state "$restore_receipt" "$expected_runtime"
     success=true
-    rm -f -- "$recovery_intent" || die 'could not clear committed restore recovery intent'
-    recovery_intent_valid=false
+    printf 'Pair restore already complete (read-only): %s\n' "$restore_receipt"
+    exit 0
   fi
-  success=true
-  printf 'Pair restore already complete (read-only): %s\n' "$restore_receipt"
-  exit 0
 fi
 
 for asset in $(monday_runtime_assets); do
@@ -948,6 +992,26 @@ sync -f "$(monday_root_join "$ROOT" etc/monday)" \
 sync -f "$(monday_root_join "$ROOT" etc/systemd/system)" \
   || die 'could not durably commit restored systemd projections'
 
+if [[ $resume_existing_restore == true ]]; then
+  [[ $runtime_observed == "$expected_runtime" ]] \
+    || die 'recovered runtime state differs from the committed restore receipt mode'
+  receipt_sha=$(monday_sha256_file "$restore_receipt")
+  marker_sha=$(awk '$2 == "restore.json" { count++; value=$1 } END { if (count != 1) exit 1; print value }' \
+    "$restore_receipt_sha") || die 'recovered restore receipt digest is malformed'
+  [[ $marker_sha == "$receipt_sha" ]] \
+    || die 'recovered restore receipt digest differs during final readback'
+  verify_existing_restore_state "$restore_receipt" "$expected_runtime" true
+  jq -e --arg gate "$recovery_gate" --arg gate_sha "$recovery_gate_sha" \
+    '.gate_receipt == $gate and .gate_sha256 == $gate_sha' "$restore_receipt" >/dev/null \
+    || die 'recovered restore receipt differs from its recovery intent Gate'
+  success=true
+  clear_recovery_intent || die 'could not clear committed restore recovery intent durably'
+  recovery_intent_valid=false
+  printf 'Pair restore recovery complete\nRestore receipt: %s\nSHA-256: %s\n' \
+    "$restore_receipt" "$receipt_sha"
+  exit 0
+fi
+
 mkdir -p "$receipt_root/$CONTROLLER"; receipt=$restore_receipt
 [[ ! -e $receipt && ! -L $receipt \
   && ! -e $restore_receipt_sha && ! -L $restore_receipt_sha \
@@ -1041,7 +1105,7 @@ if [[ ${MONDAY_RESTORE_HARD_CRASH_AFTER_RECEIPT:-0} == 1 ]]; then
 fi
 success=true
 if [[ $recovery_intent_valid == true ]]; then
-  rm -f -- "$recovery_intent" || die 'could not clear committed restore recovery intent'
+  clear_recovery_intent || die 'could not clear committed restore recovery intent durably'
   recovery_intent_valid=false
 fi
 restore_receipt_written=0
