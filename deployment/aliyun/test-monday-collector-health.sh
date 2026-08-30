@@ -531,7 +531,7 @@ reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
-write_upload "$spool_root/binance-lob/spot/upload-status.json" null null 0 7300
+write_upload "$spool_root/binance-lob/spot/upload-status.json" null null 0 700
 run_health
 expect "gate2 lob stale: exit 1" "$(rc_is 1; echo $?)"
 expect "gate2 lob stale: breach message" "$(grep_out 'binance-lob-archiver-production@spot: last upload success stale'; echo $?)"
@@ -622,12 +622,12 @@ reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
-for i in 1 2 3 4 5; do
+for i in 1 2 3; do
   : > "$spool_root/binance-lob/spot/segment-$i.manifest.json"
 done
 run_health
 expect "gate3 lob count: exit 1" "$(rc_is 1; echo $?)"
-expect "gate3 lob count: breach message" "$(grep_out 'binance-lob-archiver-production@spot: pending upload backlog 5 over limit 4'; echo $?)"
+expect "gate3 lob count: breach message" "$(grep_out 'binance-lob-archiver-production@spot: pending upload backlog 3 over limit 2'; echo $?)"
 
 reset_env
 reset_state
@@ -650,10 +650,10 @@ reset_state
 healthy_scenario
 healthy_fixtures
 : > "$spool_root/binance-lob/spot/old.manifest.json"
-touch -t 202001010000 "$spool_root/binance-lob/spot/old.manifest.json"
+touch_age "$spool_root/binance-lob/spot/old.manifest.json" 901
 run_health
 expect "gate3 lob age: exit 1" "$(rc_is 1; echo $?)"
-expect "gate3 lob age: breach message" "$(grep_out 'binance-lob-archiver-production@spot: oldest pending upload backlog age'; echo $?)"
+expect "gate3 lob age: breach message" "$(grep_out 'binance-lob-archiver-production@spot: oldest pending upload backlog age .* over 900s'; echo $?)"
 
 reset_env
 reset_state

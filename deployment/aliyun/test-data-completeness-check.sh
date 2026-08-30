@@ -223,6 +223,18 @@ expect 'complete lake: reference listed with -d (batch-partitioned)' \
 expect 'complete lake: reference not listed recursively' \
   "$(! grep -q 'dataset=reference.*--recursive' "$call_log" && echo 0 || echo 1)"
 
+# --- scenario: in-flight triplets stay inside the hour grace ----------------
+reset_env
+reset_lake
+make_complete_lake
+make_triplet "$P_SPOT" 2026-08-15 10 "segment-current.jsonl.zst"
+rm "$fake_oss/$P_SPOT/date=2026-08-15/hour=10/segment-current.jsonl.zst._SUCCESS"
+rm "$fake_oss/$P_SPOT/date=2026-08-15/hour=09/segment-2026-08-15-09.jsonl.zst.manifest.json"
+run_check --json
+expect 'in-flight triplets: exit 0' "$(rc_is 0 && echo 0 || echo 1)"
+expect 'in-flight triplets: current and in-grace violations excluded' \
+  "$(json_query '.datasets["binance-spot"].triplet_violations == []' && echo 0 || echo 1)"
+
 # --- scenario: missing hour partition ---------------------------------------
 reset_env
 reset_lake

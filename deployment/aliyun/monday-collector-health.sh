@@ -92,9 +92,8 @@ DISK_CRIT_PERCENT=15
 RESTART_MAX_DELTA=1
 # Gate 2: last_success_at freshness per lane, set just above the lane's upload
 # cadence:
-# - LOB segments rotate every SEGMENT_SECONDS (default 3600s) and the
-#   in-process upload loop runs every 300s, so a healthy lane uploads at least
-#   once per rotation; allow two full rotations.
+# - LOB production segments rotate every 300s and the in-process upload loop
+#   also runs every 300s; allow two rotation/upload opportunities.
 # - fee snapshots publish every 60s and binance-fee-upload.timer retries every
 #   60s; fee delivery is hard-gated by upload-status.json and the oneshot
 #   Result observed below.
@@ -107,7 +106,7 @@ RESTART_MAX_DELTA=1
 #   allow two full rotations, same as LOB.
 # - bybit options segments finalize on the hour and the upload timer sweeps
 #   them at :23, so 90 minutes covers one full finalize+sweep cycle.
-LOB_SUCCESS_MAX_AGE=7200
+LOB_SUCCESS_MAX_AGE=600
 FEE_SUCCESS_MAX_AGE=600
 REF_SUCCESS_MAX_AGE=1200
 POLY_SUCCESS_MAX_AGE=7200
@@ -119,8 +118,8 @@ RECOVERY_QUEUE_READY_MAX_AGE=1800
 RECOVERY_QUEUE_RUNNING_MAX_AGE=7200
 
 # Gate 3: pending backlog bounds per lane (count limit, oldest-artifact age).
-LOB_PENDING_MAX=4
-LOB_PENDING_MAX_AGE=10800
+LOB_PENDING_MAX=2
+LOB_PENDING_MAX_AGE=900
 FEE_PENDING_MAX=120
 FEE_PENDING_MAX_AGE=7200
 REF_PENDING_MAX=24
