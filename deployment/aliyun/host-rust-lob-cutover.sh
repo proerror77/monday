@@ -248,7 +248,6 @@ if [[ $FROM == direct ]]; then
   direct_payload_path=$(readlink -f -- "$production" 2>/dev/null || true)
   monday_file_direct "$direct_payload_path" || die 'direct production payload is missing'
   before_payload=$(monday_sha256_file "$direct_payload_path")
-  [[ $before_payload == "$target_payload" ]] || die 'bootstrap requires an unchanged payload'
   before_runtime=$(jq -er '.runtime_contract_sha256' "$legacy_target/release.json") \
     || die 'legacy controller runtime is invalid'
 else
@@ -547,7 +546,7 @@ if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
 fi
 if [[ $FROM == direct ]]; then
   # The containment boundary must not widen the bootstrap identity window. Re-read
-  # the unchanged direct payload and all live runtime bytes immediately before
+  # the frozen direct payload and all live runtime bytes immediately before
   # active=C1 is committed; the target manifest is never used as R0 evidence.
   direct_payload_after_stop=$(readlink -f -- "$production" 2>/dev/null || true)
   monday_file_direct "$direct_payload_after_stop" \

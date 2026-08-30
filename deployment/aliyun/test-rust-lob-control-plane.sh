@@ -403,8 +403,8 @@ cp -p -- "$legacy_work/deployment/host-rust-lob-recovery-queue.sh" \
 cp -p -- "$legacy_work/deployment/monday-collector-health.sh" \
   "$ROOT/opt/monday/bin/monday-collector-health.sh"
 
-# Bootstrap uses an explicit direct before topology and requires P1 == P0;
-# the candidate runtime is R2, while the live legacy topology is R0.
+# Bootstrap uses an explicit direct before topology.  The live legacy P0/R0
+# stays frozen until Cutover while the candidate may carry a new P1/R1.
 ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p0_sha/binance-lob-archiver" \
   "$ROOT/opt/monday/bin/binance-lob-archiver"
 # Live runtime digesting is read-only: even with a nonexistent TMPDIR, the
@@ -479,6 +479,23 @@ jq -e --arg runtime "$candidate_runtime_sha" \
      and .checks.runtime_contract and .checks.installed_bytes
      and .checks.production_cgroup and .checks.psi_sampler)' \
   <<<"$preflight_output" >/dev/null
+# A direct v1 -> V2 migration must be able to Gate a new payload while the
+# immutable legacy payload keeps running until Cutover.
+[[ $p0_sha != "$p1_sha" ]]
+if ! payload_delta_preflight=$(TMPDIR="$preflight_tmpdir_guard" \
+  MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c1" --preflight-only --root "$ROOT" 2>&1); then
+  printf '%s\n' "$payload_delta_preflight" >&2
+  printf 'read-only preflight rejected a direct payload transition\n' >&2
+  exit 1
+fi
+jq -e --arg from "$legacy_c0" --arg before "$p0_sha" --arg candidate "$p1_sha" \
+  '.from_controller_sha256 == $from
+   and .candidate_payload_sha256 == $candidate
+   and all(.production_cgroup_snapshot.children[];
+     .process_exe_sha256 == $before)
+   and .production_changed == false' <<<"$payload_delta_preflight" >/dev/null
 [[ ! -e "$preflight_tmpdir_guard" ]] || {
   printf 'read-only preflight created a temporary directory\n' >&2
   exit 1
@@ -670,17 +687,29 @@ fi
   printf 'lock-contention preflight invoked a mutating systemd action\n' >&2
   exit 1
 }
-# A failed identity check must fail before any write as well.  c1 carries a
-# different payload than the direct legacy production P0 and is rejected
-# before preflight sampling or any run-scoped setup.
+# A failed identity check must fail before any write as well.  Point production
+# at bytes that differ from immutable legacy C0, then restore the exact link.
 preflight_residue_before=$preflight_residue_after
+direct_production="$ROOT/opt/monday/bin/binance-lob-archiver"
+direct_production_before=$(readlink -- "$direct_production")
+rm -f -- "$direct_production"
+ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p1_sha/binance-lob-archiver" \
+  "$direct_production"
+identity_preflight_succeeded=false
 if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
   --candidate-controller "$c1" --preflight-only --root "$ROOT" \
-  >/dev/null 2>"$ROOT/run/preflight-failure.err"; then
-  printf 'read-only preflight accepted a mismatched direct payload\n' >&2
+  >"$ROOT/run/preflight-failure.err" 2>&1; then
+  identity_preflight_succeeded=true
+fi
+rm -f -- "$direct_production"
+ln -s "$direct_production_before" "$direct_production"
+if [[ $identity_preflight_succeeded == true ]]; then
+  printf 'read-only preflight accepted production bytes outside legacy C0\n' >&2
   exit 1
 fi
+grep -Fq 'direct bootstrap requires an immutable v1 active controller' \
+  "$ROOT/run/preflight-failure.err"
 preflight_residue_after=$(find "$ROOT/data/monday/spool/binance-lob-rust-shadow" \
   "$ROOT/data/monday/evidence/shadow-gates" "$ROOT/run/monday/rust-lob-gate" \
   "$ROOT/run/systemd/system" -mindepth 1 -print 2>/dev/null | LC_ALL=C sort || true)
@@ -688,6 +717,44 @@ preflight_residue_after=$(find "$ROOT/data/monday/spool/binance-lob-rust-shadow"
   printf 'failed read-only preflight left run-scoped residue\n' >&2
   exit 1
 }
+
+# A different candidate payload must remain eligible through the direct
+# Cutover boundary.  Stop immediately after active=C1 and prove rollback
+# restores the exact immutable legacy pair.
+payload_delta_gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  bash -c '
+    root=$1; shift
+    mkdir -p "$root/proc/$$"
+    printf "1 fixture S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 4242\\n" >"$root/proc/$$/stat"
+    printf "%s\\n" "$$" >"$root/run/payload-delta-gate.pid"
+    exec "$@"
+  ' _ "$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
+  --from-controller direct --candidate-controller "$c1" --root "$ROOT")
+payload_delta_gate_pid=$(cat "$ROOT/run/payload-delta-gate.pid")
+rm -rf -- "$ROOT/proc/$payload_delta_gate_pid" "$ROOT/run/payload-delta-gate.pid"
+payload_delta_gate=$(printf '%s\n' "$payload_delta_gate_output" | sed -n 's/^V2 Gate receipt: //p')
+payload_delta_gate_sha=$(printf '%s\n' "$payload_delta_gate_output" | sed -n 's/^SHA-256: //p')
+monday_validate_v2_gate "$payload_delta_gate" direct "$c1" "$payload_delta_gate_sha"
+rm -f -- "$ROOT/run/cutover-fixture.calls"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
+  MONDAY_CUTOVER_FIXTURE_LEGACY_ACTIVE=1 MONDAY_CUTOVER_FAIL_AFTER_ACTIVE=1 \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-cutover.sh" \
+  --from direct --to "$c1" --gate-receipt "$payload_delta_gate" \
+  --gate-sha256 "$payload_delta_gate_sha" --root "$ROOT" \
+  >"$ROOT/run/payload-delta-cutover.err" 2>&1; then
+  printf 'fault-injected direct payload transition unexpectedly succeeded\n' >&2
+  exit 1
+fi
+if ! grep -Fq 'fault injection after active pair commit before daemon reload' \
+  "$ROOT/run/payload-delta-cutover.err"; then
+  cat "$ROOT/run/payload-delta-cutover.err" >&2
+  printf 'direct payload transition did not reach the active commit boundary\n' >&2
+  exit 1
+fi
+[[ $(monday_active_controller_sha "$ROOT") == "$legacy_c0" ]]
+[[ $(readlink -- "$direct_production") == "$direct_production_before" ]]
+rm -rf -- "$(dirname -- "$payload_delta_gate")"
+rm -f -- "$ROOT/run/cutover-fixture.calls"
 
 # (d) A resource monitor breach must return to its caller so EXIT cleanup can
 # remove every run-scoped writer path without changing production.

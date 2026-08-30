@@ -939,7 +939,6 @@ else
   legacy_payload=$(jq -er '.artifact_sha256' "$legacy_target/release.json") || die 'legacy controller payload is invalid'
   legacy_runtime=$(jq -er '.runtime_contract_sha256' "$legacy_target/release.json") || die 'legacy controller runtime is invalid'
   [[ $before_payload == "$legacy_payload" ]] || die 'direct production does not match the legacy controller payload'
-  [[ $before_payload == "$candidate_payload" ]] || die 'direct bootstrap requires P0 equal to P1'
   before_runtime=$legacy_runtime
   before_bundle=$(jq -er '.deployment_bundle_sha256' "$legacy_target/release.json") || die 'legacy controller bundle is invalid'
   before_source=$(jq -er '.deployment_source_revision' "$legacy_target/release.json") || die 'legacy controller source is invalid'
