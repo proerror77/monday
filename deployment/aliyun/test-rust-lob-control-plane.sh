@@ -1292,6 +1292,25 @@ jq -e '
     and .observation_finished_monotonic_ns >= .observation_started_monotonic_ns)' \
   "$cross_deadline_run" >/dev/null
 
+validate_deadline_segments() {
+  jq -e '
+    .schema == "monday.rust_lob_shadow_gate_deadline_segments.v1"
+    and (.segments | length) == 2
+    and all(.segments[];
+      .manifest.has_replay_safe_checkpoint == true
+      and .manifest.lob_continuity.sequence_gaps == 0
+      and .manifest.lob_continuity.reconnect_boundary == false
+      and .manifest.sha256 == .data_sha256
+      and .success_marker == .data_sha256
+      and .data_size_bytes > 0
+      and (.manifest_sha256 | test("^[a-f0-9]{64}$"))
+      and (.success_sha256 | test("^[a-f0-9]{64}$")))
+    and .segments[0].manifest.end_received_at_ns
+      <= .segments[1].manifest.start_received_at_ns
+    and .segments[0].manifest.lob_continuity.capture_session_id
+      == .segments[1].manifest.lob_continuity.capture_session_id' "$1" >/dev/null
+}
+
 # A segment sealed while the readiness scan is running cannot move the cutoff
 # backwards.  Persist the partial window before failing so non-authoritative
 # run evidence is still truthful.
@@ -1322,11 +1341,11 @@ jq -e '
   and .markets.usdm == null' "$deadline_run_json" >/dev/null
 deadline_failure_json="$(dirname -- "$deadline_run_json")/deadline-failure.json"
 deadline_health_json="$(dirname -- "$deadline_run_json")/deadline-health.json"
-deadline_segments_tsv="$(dirname -- "$deadline_run_json")/deadline-segments.tsv"
-[[ -f $deadline_failure_json && -f $deadline_health_json && -f $deadline_segments_tsv ]]
+deadline_segments_json="$(dirname -- "$deadline_run_json")/deadline-segments.json"
+[[ -f $deadline_failure_json && -f $deadline_health_json && -f $deadline_segments_json ]]
 jq -e --arg controller "$c0" \
   --arg health_sha "$(monday_sha256_file "$deadline_health_json")" \
-  --arg segments_sha "$(monday_sha256_file "$deadline_segments_tsv")" '
+  --arg segments_sha "$(monday_sha256_file "$deadline_segments_json")" '
   .schema == "monday.rust_lob_shadow_gate_deadline_failure.v1"
   and .authoritative == false and .cause == "evidence_deadline"
   and .market == "spot" and .candidate_controller_sha256 == $controller
@@ -1336,10 +1355,10 @@ jq -e --arg controller "$c0" \
   and .observation.sampled_monotonic_ns >= .observation.deadline_monotonic_ns
   and .observation.failure_detected_monotonic_ns == .observation.sampled_monotonic_ns
   and .health_snapshot == {file:"deadline-health.json",sha256:$health_sha}
-  and .segment_snapshot == {file:"deadline-segments.tsv",sha256:$segments_sha}' \
+  and .segment_snapshot == {file:"deadline-segments.json",sha256:$segments_sha}' \
   "$deadline_failure_json" >/dev/null
 jq -e '.status == "synced"' "$deadline_health_json" >/dev/null
-[[ $(wc -l <"$deadline_segments_tsv" | tr -d '[:space:]') == 2 ]]
+validate_deadline_segments "$deadline_segments_json"
 [[ ! -e $(dirname -- "$deadline_run_json")/gate.json \
   && ! -e $(dirname -- "$deadline_run_json")/PASSED.sha256 ]]
 
@@ -1373,12 +1392,12 @@ jq -e '
   and .markets.usdm == null' "$health_deadline_run_json" >/dev/null
 health_deadline_failure_json="$(dirname -- "$health_deadline_run_json")/deadline-failure.json"
 health_deadline_health_json="$(dirname -- "$health_deadline_run_json")/deadline-health.json"
-health_deadline_segments_tsv="$(dirname -- "$health_deadline_run_json")/deadline-segments.tsv"
+health_deadline_segments_json="$(dirname -- "$health_deadline_run_json")/deadline-segments.json"
 [[ -f $health_deadline_failure_json && -f $health_deadline_health_json \
-  && -f $health_deadline_segments_tsv ]]
+  && -f $health_deadline_segments_json ]]
 jq -e --arg controller "$c0" \
   --arg health_sha "$(monday_sha256_file "$health_deadline_health_json")" \
-  --arg segments_sha "$(monday_sha256_file "$health_deadline_segments_tsv")" '
+  --arg segments_sha "$(monday_sha256_file "$health_deadline_segments_json")" '
   .schema == "monday.rust_lob_shadow_gate_deadline_failure.v1"
   and .authoritative == false and .cause == "evidence_deadline"
   and .market == "spot" and .candidate_controller_sha256 == $controller
@@ -1388,10 +1407,10 @@ jq -e --arg controller "$c0" \
   and .observation.sampled_monotonic_ns < .observation.deadline_monotonic_ns
   and .observation.failure_detected_monotonic_ns >= .observation.deadline_monotonic_ns
   and .health_snapshot == {file:"deadline-health.json",sha256:$health_sha}
-  and .segment_snapshot == {file:"deadline-segments.tsv",sha256:$segments_sha}' \
+  and .segment_snapshot == {file:"deadline-segments.json",sha256:$segments_sha}' \
   "$health_deadline_failure_json" >/dev/null
 jq -e '.status == "syncing"' "$health_deadline_health_json" >/dev/null
-[[ $(wc -l <"$health_deadline_segments_tsv" | tr -d '[:space:]') == 2 ]]
+validate_deadline_segments "$health_deadline_segments_json"
 [[ ! -e $(dirname -- "$health_deadline_run_json")/gate.json \
   && ! -e $(dirname -- "$health_deadline_run_json")/PASSED.sha256 ]]
 
