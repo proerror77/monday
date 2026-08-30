@@ -896,9 +896,8 @@ else
     || die 'direct bootstrap requires an immutable v1 active controller'
   before_controller=$legacy_controller
   before_release="$legacy_target"
-  # Never source or execute the legacy deployment.  C0 contributes only its
-  # immutable manifest identity; all candidate control bytes come from C1.
-  before_deployment=$candidate_deployment
+  # Never source or execute the legacy deployment. C0 contributes its
+  # immutable manifest/runtime identity; all control bytes come from C1.
   production_target=$(readlink -f -- "$PRODUCTION_BINARY") || die 'direct bootstrap requires a production binary'
   before_payload=$(sha256_file "$production_target") || die 'direct bootstrap requires a production binary'
   legacy_payload=$(jq -er '.artifact_sha256' "$legacy_target/release.json") || die 'legacy controller payload is invalid'
@@ -931,6 +930,9 @@ else
 fi
 [[ $live_runtime == "$before_runtime" ]] \
   || die 'before runtime bytes differ from the immutable before controller'
+# In direct mode this C0-bound digest is the authority for all eight installed
+# runtime assets. C1 may legitimately differ until Cutover installs it. Stable
+# V2 transitions additionally compare each installed file with C0 below.
 
 production_asset_json='{}'
 for asset in "${PRODUCTION_ASSETS[@]}"; do
@@ -953,8 +955,10 @@ for asset in "${PRODUCTION_ASSETS[@]}"; do
     continue
   fi
   regular_file "$production_resolved" || die "installed production asset is missing: $production_target"
-  cmp -s "$before_deployment/$asset" "$production_resolved" \
-    || die "installed production asset differs from before controller: $asset"
+  if [[ $FROM_CONTROLLER != direct ]]; then
+    cmp -s "$before_deployment/$asset" "$production_resolved" \
+      || die "installed production asset differs from before controller: $asset"
+  fi
   production_asset_json=$(jq -cn --argjson values "$production_asset_json" --arg asset "$asset" --arg sha "$(sha256_file "$production_resolved")" '$values + {($asset):$sha}')
 done
 
@@ -1692,8 +1696,9 @@ gate_worker_memory_events_start=$(gate_worker_memory_events_snapshot) \
 memory_events_no_oom "$gate_worker_memory_events_start" "$gate_worker_memory_events_start" \
   || die 'run-scoped Gate worker slice memory.events baseline is invalid'
 
-# The operator applies the signed production envelope before invoking Gate.
-# This readback fails closed without mutating production limits.
+# Gate reads the active production envelope in place. Candidate runtime bytes
+# remain inactive until Cutover; this snapshot fails closed without changing
+# production limits.
 if [[ $TEST_ONLY == true ]]; then
   refresh_production_snapshot || die 'fixture production cgroup snapshot is invalid'
 else
@@ -1734,9 +1739,6 @@ if [[ $FROM_CONTROLLER != direct ]]; then
 else
   for asset in "${SHADOW_ASSETS[@]}"; do
     [[ ${saved_state[$asset]} == present || ${saved_state[$asset]} == projection ]] || die "direct bootstrap shadow asset is absent: $asset"
-    shadow_resolved=${installed_asset[$asset]}
-    [[ ${saved_state[$asset]} == projection ]] && shadow_resolved=$(readlink -f -- "$shadow_resolved")
-    cmp -s "$candidate_deployment/$asset" "$shadow_resolved" || die "direct bootstrap installed shadow asset differs: $asset"
   done
 fi
 
