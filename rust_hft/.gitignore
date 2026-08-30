@@ -1,4 +1,6 @@
 spec-kit/.codex/
+/.cargo_home/
+/.rustup_home/
 .env
 .env.local
 .env.*

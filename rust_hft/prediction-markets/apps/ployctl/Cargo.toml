@@ -11,7 +11,5 @@ description = "Ploy control-plane client workspace entry point"
 chrono.workspace = true
 ploy-control-client.workspace = true
 ploy-operator-contracts.workspace = true
-ploy-platform.workspace = true
 rust_decimal.workspace = true
-serde.workspace = true
 serde_json.workspace = true
