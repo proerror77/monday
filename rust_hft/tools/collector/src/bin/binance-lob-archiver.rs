@@ -4948,13 +4948,21 @@ fn apply_upload_failure(status: &mut UploadStatus, error: &anyhow::Error) {
 }
 
 async fn upload_pending(config: &UploadConfig) -> anyhow::Result<LobUploadOutcome> {
+    let retain_uploaded_triplets = env_parse("MONDAY_RETAIN_UPLOADED_TRIPLETS", false)?;
     let config = config.clone();
-    tokio::task::spawn_blocking(move || upload_pending_blocking_with(&config, &mut run_oss_checked))
-        .await?
+    tokio::task::spawn_blocking(move || {
+        upload_pending_blocking_with(
+            &config,
+            retain_uploaded_triplets,
+            &mut run_oss_checked,
+        )
+    })
+    .await?
 }
 
 fn upload_pending_blocking_with<F>(
     config: &UploadConfig,
+    retain_uploaded_triplets: bool,
     runner: &mut F,
 ) -> anyhow::Result<LobUploadOutcome>
 where
@@ -4966,7 +4974,7 @@ where
     }
     let mut outcome = LobUploadOutcome::default();
     for manifest in files_with_suffix(&config.spool_dir, ".manifest.json")? {
-        match upload_one_with(config, &manifest, runner) {
+        match upload_one_with(config, &manifest, retain_uploaded_triplets, runner) {
             Ok(segment) => {
                 if segment.retried {
                     outcome.retried += 1;
@@ -5370,6 +5378,7 @@ where
 fn upload_one_with<F>(
     config: &UploadConfig,
     manifest: &Path,
+    retain_uploaded_triplet: bool,
     runner: &mut F,
 ) -> anyhow::Result<UploadedSegment>
 where
@@ -5414,8 +5423,10 @@ where
         Ok(())
     };
     let retried = upload_segment_triplet_with(config, &prefix, &members, verify, runner)?;
-    let marker = write_uploaded_cleanup_marker(&data, manifest, &success)?;
-    cleanup_uploaded_marker(&marker)?;
+    if !retain_uploaded_triplet {
+        let marker = write_uploaded_cleanup_marker(&data, manifest, &success)?;
+        cleanup_uploaded_marker(&marker)?;
+    }
     Ok(UploadedSegment {
         retried,
         object: format!(
@@ -6685,7 +6696,7 @@ mod tests {
         let mut fake = FakeOss::default();
 
         let segment =
-            upload_one_with(&dirs.config(), &fixture.manifest, &mut |command, timeout| {
+            upload_one_with(&dirs.config(), &fixture.manifest, false, &mut |command, timeout| {
                 fake.run(&dirs.bucket, command, timeout)
             })
             .unwrap();
@@ -6717,6 +6728,43 @@ mod tests {
     }
 
     #[test]
+    fn verified_readback_can_be_retained_until_a_later_drain() {
+        let dirs = UploadTestDir::new();
+        let fixture = dirs.write_segment("1700000000000000000", b"segment-bytes");
+        let mut fake = FakeOss::default();
+
+        let uploaded = upload_one_with(
+            &dirs.config(),
+            &fixture.manifest,
+            true,
+            &mut |command, timeout| fake.run(&dirs.bucket, command, timeout),
+        )
+        .unwrap();
+
+        assert!(!uploaded.retried);
+        assert_eq!(fake.uploads, 3);
+        fixture.assert_local_retained();
+        assert!(files_with_suffix(&dirs.spool, UPLOADED_CLEANUP_SUFFIX)
+            .unwrap()
+            .is_empty());
+
+        let drained = upload_one_with(
+            &dirs.config(),
+            &fixture.manifest,
+            false,
+            &mut |command, timeout| fake.run(&dirs.bucket, command, timeout),
+        )
+        .unwrap();
+
+        assert!(drained.retried);
+        assert_eq!(fake.uploads, 3);
+        fixture.assert_local_removed();
+        assert!(files_with_suffix(&dirs.spool, UPLOADED_CLEANUP_SUFFIX)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn corrupted_readback_retains_the_local_triplet() {
         let dirs = UploadTestDir::new();
         let fixture = dirs.write_segment("1700000000000000000", b"segment-bytes");
@@ -6725,7 +6773,7 @@ mod tests {
             corrupt_segment: Some("1700000000000000000".into()),
         };
 
-        let error = upload_one_with(&dirs.config(), &fixture.manifest, &mut |command, timeout| {
+        let error = upload_one_with(&dirs.config(), &fixture.manifest, false, &mut |command, timeout| {
             fake.run(&dirs.bucket, command, timeout)
         })
         .unwrap_err();
@@ -6744,7 +6792,7 @@ mod tests {
         fixture.seed_remote(&dirs.bucket, b"different-remote-bytes");
         let mut fake = FakeOss::default();
 
-        let error = upload_one_with(&dirs.config(), &fixture.manifest, &mut |command, timeout| {
+        let error = upload_one_with(&dirs.config(), &fixture.manifest, false, &mut |command, timeout| {
             fake.run(&dirs.bucket, command, timeout)
         })
         .unwrap_err();
@@ -6767,7 +6815,7 @@ mod tests {
         let mut fake = FakeOss::default();
 
         let segment =
-            upload_one_with(&dirs.config(), &fixture.manifest, &mut |command, timeout| {
+            upload_one_with(&dirs.config(), &fixture.manifest, false, &mut |command, timeout| {
                 fake.run(&dirs.bucket, command, timeout)
             })
             .unwrap();
@@ -6789,7 +6837,7 @@ mod tests {
             corrupt_segment: Some("1700000000000000001".into()),
         };
 
-        let outcome = upload_pending_blocking_with(&config, &mut |command, timeout| {
+        let outcome = upload_pending_blocking_with(&config, false, &mut |command, timeout| {
             fake.run(&bucket, command, timeout)
         })
         .unwrap();
@@ -8656,7 +8704,7 @@ mod tests {
             .contains("raw-trade data is incomplete"));
 
         let mut fake = FakeOss::default();
-        let outcome = upload_pending_blocking_with(&dirs.config(), &mut |command, timeout| {
+        let outcome = upload_pending_blocking_with(&dirs.config(), false, &mut |command, timeout| {
             fake.run(&dirs.bucket, command, timeout)
         })
         .unwrap();
@@ -9188,7 +9236,7 @@ mod tests {
         verify_binance_market_tape_for_strict_gate(vec![sealed]).unwrap();
 
         let mut fake = FakeOss::default();
-        let outcome = upload_pending_blocking_with(&dirs.config(), &mut |command, timeout| {
+        let outcome = upload_pending_blocking_with(&dirs.config(), false, &mut |command, timeout| {
             fake.run(&dirs.bucket, command, timeout)
         })
         .unwrap();
@@ -9458,7 +9506,7 @@ mod tests {
         verify_binance_market_tape_for_strict_gate(vec![sealed]).unwrap();
 
         let mut fake = FakeOss::default();
-        let outcome = upload_pending_blocking_with(&dirs.config(), &mut |command, timeout| {
+        let outcome = upload_pending_blocking_with(&dirs.config(), false, &mut |command, timeout| {
             fake.run(&dirs.bucket, command, timeout)
         })
         .unwrap();

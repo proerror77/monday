@@ -1053,8 +1053,10 @@ finishes as soon as two new adjacent clean segments exist. Each market has a
 600-second evidence deadline; elapsed monotonic time is recorded, not used as a
 minimum observation duration. It never drains or recovers an
 older Shadow run. Any incomplete files left by a failed run remain confined to
-that run's spool and cannot block the next Gate; files already uploaded and
-cleaned retain their OSS triplet evidence instead of a duplicate local copy.
+that run's spool and cannot block the next Gate. During each market observation,
+the Shadow uploader retains locally the triplets it has already verified from OSS
+so the Gate cannot miss valid evidence between polls. The existing bounded drain
+then re-verifies those identical OSS objects and removes the local copies.
 The Gate's 120-second run-scoped cadence does not alter the signed production
 environment; production cadence is verified independently after cutover.
 After Cutover, the production lanes share the signed aggregate slice
