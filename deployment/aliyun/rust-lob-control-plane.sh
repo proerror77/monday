@@ -15,6 +15,14 @@ usage() {
 }
 
 die() { printf '%s\n' "$*" >&2; exit 1; }
+# The host timeout is the Gate's global budget.  Per-phase deadlines are
+# subordinate stop conditions, not additive reservations.  Leave a bounded
+# cleanup window inside Cloud Assistant's hard 40-minute operator cap.
+readonly GATE_HOST_TIMEOUT_SECONDS=2100
+readonly GATE_KILL_AFTER_SECONDS=240
+readonly GATE_OPERATOR_TIMEOUT_SECONDS=2400
+(( GATE_HOST_TIMEOUT_SECONDS + GATE_KILL_AFTER_SECONDS < GATE_OPERATOR_TIMEOUT_SECONDS )) \
+  || die 'Gate host and cleanup budgets must fit inside the operator timeout'
 
 for command in base64 jq tr; do
   command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
@@ -40,6 +48,8 @@ controller=
 transition_receipt=
 receipt_sha=
 preflight_only=false
+host_timeout_seconds=0
+host_kill_after_seconds=0
 region=${REGION_ID:-ap-northeast-1}
 profile=${ALIYUN_LOCAL_PROFILE:-default}
 
@@ -101,7 +111,9 @@ case "$operation" in
       timeout_seconds=300
     else
       command_name=monday-rust-lob-shadow-gate
-      timeout_seconds=3600
+      timeout_seconds=$GATE_OPERATOR_TIMEOUT_SECONDS
+      host_timeout_seconds=$GATE_HOST_TIMEOUT_SECONDS
+      host_kill_after_seconds=$GATE_KILL_AFTER_SECONDS
     fi
     remote_args=(--from-controller "$from_controller" --candidate-controller "$controller")
     [[ $preflight_only == true ]] && remote_args+=(--preflight-only)
@@ -140,7 +152,12 @@ case "$operation" in
 esac
 
 controller_path="/opt/monday/releases/binance-lob-controller/$controller/deployment/$host_script"
-printf -v remote_script 'set -Eeuo pipefail\nexec env -i HOME=/root LC_ALL=C PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin %q' "$controller_path"
+if (( host_timeout_seconds > 0 )); then
+  printf -v remote_script 'set -Eeuo pipefail\nexec env -i HOME=/root LC_ALL=C PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin timeout --signal=TERM --kill-after=%ss %ss %q' \
+    "$host_kill_after_seconds" "$host_timeout_seconds" "$controller_path"
+else
+  printf -v remote_script 'set -Eeuo pipefail\nexec env -i HOME=/root LC_ALL=C PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin %q' "$controller_path"
+fi
 for arg in "${remote_args[@]}"; do
   printf -v escaped ' %q' "$arg"
   remote_script+=$escaped
@@ -150,9 +167,11 @@ command_content=$(printf '%s\n' "$remote_script" | base64 | tr -d '\n')
 if [[ ${MONDAY_CONTROL_PLANE_DRY_RUN:-0} == 1 ]]; then
   jq -cn --arg operation "$operation" --arg instance "$instance" \
     --arg controller "$controller" --arg command "$remote_script" \
-    --argjson preflight_only "$preflight_only" \
+    --argjson preflight_only "$preflight_only" --argjson timeout "$timeout_seconds" \
+    --argjson host_timeout "$host_timeout_seconds" --argjson kill_after "$host_kill_after_seconds" \
     '{operation:$operation,instance:$instance,controller:$controller,
-      command:$command,preflight_only:$preflight_only,
+      command:$command,preflight_only:$preflight_only,timeout_seconds:$timeout,
+      host_timeout_seconds:$host_timeout,host_kill_after_seconds:$kill_after,
       production_changed:($operation == "cutover" or $operation == "restore")}'
   exit 0
 fi

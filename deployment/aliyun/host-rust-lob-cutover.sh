@@ -208,7 +208,7 @@ else
   jq -e '.test_only == true and .production_eligible == false' "$GATE" >/dev/null \
     || die 'fixture Gate must never authorize production'
 fi
-monday_validate_v2_gate "$GATE" "$FROM" "$TO" "$GATE_SHA" \
+monday_validate_v2_gate_authoritative "$ROOT" "$GATE" "$FROM" "$TO" "$GATE_SHA" \
   || die 'Gate receipt does not authorize this exact pair transition'
 gate_production_runtime=$(jq -ce '.production_runtime' "$GATE") \
   || die 'Gate receipt has no production runtime contract'
@@ -697,10 +697,11 @@ verify_production_process() {
       if [[ -z ${expected_exe_sha[$market]:-} ]]; then expected_exe_sha[$market]=$exe_sha
       else [[ $exe_sha == "${expected_exe_sha[$market]}" ]] || die "$market production executable changed while awaiting health"; fi
 
-      now_ns=$(date +%s%N); ready=false
+      ready=false
       if [[ -f $health && ! -L $health ]]; then
         session=$(jq -er '.session_id // empty' "$health" 2>/dev/null || true)
         updated=$(jq -er '.updated_at_ns // 0' "$health" 2>/dev/null || true)
+        now_ns=$(date +%s%N)
         if [[ $updated =~ ^[0-9]+$ ]] && (( updated > now_ns )); then
           die "$market production health timestamp is in the future"
         fi

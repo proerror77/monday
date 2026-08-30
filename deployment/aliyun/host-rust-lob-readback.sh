@@ -125,7 +125,7 @@ for gate_parent in \
   "$canonical_gate_root" "$canonical_gate_root/runs" "$gate_dir"; do
   monday_path_direct "$gate_parent" || die "transition Gate parent is indirect: $gate_parent"
 done
-monday_validate_v2_transition "$TRANSITION_RECEIPT" "$transition_validator_from" "$CONTROLLER" \
+monday_validate_v2_transition "$ROOT" "$TRANSITION_RECEIPT" "$transition_validator_from" "$CONTROLLER" \
   "$transition_gate" "$transition_gate_sha" \
   || die 'transition receipt failed the exact V2 Gate-chain validator'
 transition_process=$(jq -ce '.production_process' "$TRANSITION_RECEIPT") \

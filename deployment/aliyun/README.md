@@ -1039,13 +1039,17 @@ The host gate owns only the runtime transition. A failed Gate blocks cutover,
 not Code, CI, Merge, or immutable Release publication. It verifies the candidate,
 Spot `SYMBOLS=ALL`, and the exact frozen 100-symbol USD-M production allowlist,
 then creates a fresh spool under
-`/data/monday/spool/binance-lob-rust-shadow/runs/<artifact>/<run-id>/`, starts
+`/data/monday/spool/binance-lob-rust-shadow/gate/<run-id>/`, starts
 each market sequentially with `SEGMENT_SECONDS=120`, waits at most 240 seconds for initial
-configured-catalog health, freezes both session IDs and catalog digests, and then uses
-monotonic time to observe at least 240 seconds. It never drains or recovers an
+configured-catalog health, freezes both session IDs and catalog digests, and then
+finishes as soon as two new adjacent clean segments exist. Each market has a
+600-second evidence deadline; elapsed monotonic time is recorded, not used as a
+minimum observation duration. It never drains or recovers an
 older Shadow run. Any incomplete files left by a failed run remain confined to
 that run's spool and cannot block the next Gate; files already uploaded and
 cleaned retain their OSS triplet evidence instead of a duplicate local copy.
+The Gate's 120-second run-scoped cadence does not alter the signed production
+environment; production cadence is verified independently after cutover.
 The production lanes share the signed aggregate slice
 `system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice` with a 3072MiB
 high watermark and 3584MiB hard limit; each production child remains bounded
@@ -1064,8 +1068,11 @@ and their two cgroups must be direct children of it. The parent `cgroup.procs`
 must be empty, the active child set must be exactly those two services, and both
 systemd `MemoryMax` and child `memory.max` must be exactly 2,560MiB. The snapshot records parent
 `memory.current`, `memory.peak`, `memory.stat` (`anon` and `file`), and
-`memory.events`, plus PID/executable hash and `NRestarts`; a five-second monitor
-fails closed on any membership, limit, or identity drift. Paired reads use the
+`memory.events`, plus PID/executable hash and `NRestarts`; PID and restart
+changes alone are audit-only, while a five-second monitor fails closed on any
+membership, limit, or executable identity drift. A temporarily invalid
+snapshot gets a bounded 120-second grace before the monitor fails closed.
+Paired reads use the
 conservative `MemAvailable`/`anon` values for admission; current, file, peak,
 and events remain audit evidence. The required bytes are exactly:
 
@@ -1075,34 +1082,22 @@ host reserve (1GiB) + phase memory budget +
 ```
 
 Active production usage is already reflected in `MemAvailable`; no static
-two-lane growth reservation is added a second time. Where a PSI calibration is
-required (preflight and the Shadow/tail transitions), it completes before the
-fresh admission; upload-drain and OSS readback use their resource monitor's
-admission immediately before their first start/external call. The active phase
-still stops if the live reserve or PSI stop rule is breached. The Gate receipt
-stores the exact per-phase current/sum/growth/reserve/limit/required values and
-the production cgroup snapshot; `MemoryPeak` and `memory.events` are audit-only,
-never inputs to the formula. An over-limit or malformed phase fails closed
-instead of increasing the host size or weakening the reserve.
+two-lane growth reservation is added a second time. Each phase re-checks the
+resource admission immediately before its first start or external call. The
+Gate receipt stores the exact per-phase current/sum/growth/reserve/limit/required
+values and the production cgroup snapshot; `MemoryPeak` is audit-only, while
+`memory.events` must show no new `oom` or `oom_kill` counter. An over-limit or
+malformed phase fails closed instead of increasing the host size or weakening
+the reserve.
 The first direct bootstrap may take a narrowly scoped runtime lease when the
 legacy slice is still unlimited; the prior limits are recorded in the Gate
 receipt and restored (including on abnormal exit) before the receipt can pass.
 Cutover, restore, and readback each re-check the permanent slice and both child
 unit memberships before claiming a successful pair.
-The Gate also samples Linux I/O `full` PSI from `/proc/pressure/io` on a
-15-second cadence.
-Preflight records four cumulative samples as three windows; every resource phase
-continues sampling for its complete phase, including compression, validation,
-and OSS readback. Shadow/tail transitions perform the same PSI calibration
-before admission; upload-drain and OSS phases do not add a second calibration
-wait. Evidence records the actual
-monotonic elapsed time for each window. A window is a hit when its `full` stall
-ratio is at least 1%, equivalent to 150,000 microseconds over 15 seconds. Three consecutive
-hits terminate the current candidate or transient process, run normal cleanup,
-and cannot write `PASSED.sha256`; a lower window resets the count. Missing,
-non-integer, interrupted, or regressing PSI counters fail closed. Existing
-background services are judged only by their measured PSI effect; this control
-does not stop or reconfigure external upload timers.
+`io_full_psi_windows` records one advisory PSI snapshot for each of the nine
+resource phases. PSI never authorizes or denies a Gate and cannot terminate a
+candidate; memory reserve, OOM counters, and exact identity remain the
+fail-closed controls.
 The Gate fails unless all of these are true for the entire candidate run:
 
 - both units stay active with `NRestarts=0`;
@@ -1116,11 +1111,13 @@ The Gate fails unless all of these are true for the entire candidate run:
 - CPU accounting and peak memory stay inside the systemd limits;
 - after stop, the candidate's `--upload-only` drain leaves no partial,
   temporary, corrupt, compressed, success-marker, or cleanup-marker artifact;
-- for each market, at least two manifests opened after this isolated candidate
-  run starts are downloaded from OSS with their data object and
-  reproduce the manifest SHA-256; each manifest contains real aggregate trades,
-  complete checkpoint coverage, and either sequence-checked diffs or explicit
-  static-symbol evidence derived from the verified subscription set.
+- for each market, exactly two new adjacent replay-safe manifests from the
+  isolated candidate run are downloaded from OSS with their data objects and
+  reproduce the local interval and SHA-256; a reconnect-boundary segment is
+  skipped, while two later clean segments may qualify. Each selected manifest
+  contains real aggregate trades, complete checkpoint coverage, and either
+  sequence-checked diffs or explicit static-symbol evidence derived from the
+  verified subscription set.
 
 A successful production gate writes:
 
@@ -1131,7 +1128,8 @@ A successful production gate writes:
 ```
 
 Every invocation gets a new append-only run directory; prior gate evidence is
-never deleted or replaced. The marker hashes exactly that run's `gate.json`.
+never deleted or replaced. The marker hashes exactly that run's `gate.json` and
+`run.json`.
 Evidence binds the binary, the controller release digest, and the content hash
 of the nine production/Shadow unit, slice, and environment files. It records the clean
 source revision and full deployment-bundle SHA-256 separately, so a
@@ -1139,9 +1137,11 @@ controller-only fix cannot reuse a prior v6 receipt; it must name the new
 controller digest in a fresh Gate. Unit or environment changes likewise require
 a fresh Gate. A second production
 gate for an identity that already has a passing run is refused, and cutover
-requires exactly one immutable passing run. A short test override is
-available only for script testing; it writes `passed=false` and never creates
-`PASSED.sha256`, so it cannot authorize cutover.
+requires exactly one immutable passing run. The formal operator has a 40-minute
+outer timeout; the host Gate receives TERM at 35 minutes and has four minutes
+for bounded stop and cleanup. A short override is available only for script
+testing; it writes `test_only=true`, `production_eligible=false`, and never
+creates `PASSED.sha256`, so it cannot authorize cutover.
 
 ### 3. Cut over or roll back
 

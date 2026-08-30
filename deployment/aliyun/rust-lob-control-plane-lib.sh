@@ -792,7 +792,6 @@ monday_unit_normalized() {
         'Service|Environment|HOME=/var/lib/hft-collector'
         'Service|EnvironmentFile|/etc/monday/binance-lob-archiver-rust-%i.env'
         'Service|ExecStart|/opt/monday/bin/binance-lob-archiver-shadow --upload-only'
-        'Service|TimeoutStartSec|0'
         'Service|NoNewPrivileges|true'
         'Service|PrivateTmp|true'
         'Service|ProtectSystem|strict'
@@ -810,8 +809,13 @@ monday_unit_normalized() {
       )
       if [[ $kind == shadow_upload_run ]]; then
         expected+=(
+          'Service|TimeoutStartSec|300'
           'Service|Restart|no'
-          'Service|RuntimeMaxSec|1800'
+          'Service|RuntimeMaxSec|300'
+        )
+      else
+        expected+=(
+          'Service|TimeoutStartSec|0'
         )
       fi ;;
     *) return 2 ;;
@@ -1265,10 +1269,10 @@ monday_validate_lob_production_snapshot() {
   fi
 }
 
-# Emit only identity-bearing fields for comparison between the Gate start and
-# every later resource-monitor sample.  Memory current/peak/events are audit
-# values and intentionally excluded so normal usage changes do not look like
-# process or cgroup identity drift.
+# Emit the stable production contract for comparison between the Gate start and
+# every later resource-monitor sample.  The six-hour lifecycle restart may
+# change PID/NRestarts; each full snapshot still proves cgroup membership,
+# active state, executable digest, limits, and OOM counters independently.
 monday_lob_production_snapshot_identity() {
   [[ $# -eq 1 ]] || return 2
   local source=$1
@@ -1277,7 +1281,7 @@ monday_lob_production_snapshot_identity() {
       production_slice_memory_high_bytes,production_slice_memory_max_bytes,
       systemd_production_slice_memory_high_bytes,systemd_production_slice_memory_max_bytes,
       children: (.children | with_entries(.value |= {
-        market,slice,control_group,main_pid,process_exe_sha256,n_restarts,active,
+        market,slice,control_group,process_exe_sha256,active,
         systemd_memory_max_bytes,memory_max_bytes
       }))}'
   if [[ -f $source && ! -L $source ]]; then
@@ -1343,34 +1347,6 @@ monday_rust_lob_verify_systemd_production_slice() {
   [[ $# -eq 1 ]] || return 2
   monday_rust_lob_verify_systemd_production_slice_configured "$1" \
     && monday_rust_lob_verify_systemd_production_membership "$1"
-}
-
-# Read cumulative I/O-full stall time from a Linux PSI source.
-monday_io_full_psi_total_us() {
-  [[ $# -eq 1 && -f $1 && ! -L $1 ]] || return 2
-  awk '$1 == "full" { rows += 1; for (i = 2; i <= NF; i++) {
-    if ($i ~ /^total=[0-9]+$/) { totals += 1; value = substr($i, 7) }
-  }} END { if (rows != 1 || totals != 1 || value !~ /^(0|[1-9][0-9]*)$/) exit 1; print value }' "$1"
-}
-
-# Output: delta_us ratio hit consecutive_hits. Threshold is normalized to the
-# reference window and any non-hit resets the consecutive count.
-monday_io_full_psi_window() {
-  [[ $# -eq 6 ]] || return 2
-  local previous=$1 current=$2 window_us=$3 reference_window_us=$4
-  local threshold_us=$5 consecutive=$6 value delta hit next ratio
-  for value in "$previous" "$current" "$window_us" "$reference_window_us" "$threshold_us" "$consecutive"; do
-    [[ $value =~ ^(0|[1-9][0-9]{0,18})$ ]] || return 2
-    (( value <= 9223372036854775807 )) || return 2
-  done
-  ((current >= previous && window_us > 0 && reference_window_us > 0 && threshold_us > 0)) || return 2
-  delta=$((current - previous))
-  if awk -v delta="$delta" -v window="$window_us" -v threshold="$threshold_us" \
-    -v reference="$reference_window_us" 'BEGIN { exit !((delta / window) >= (threshold / reference)) }'; then
-    hit=true; next=$((consecutive + 1))
-  else hit=false; next=0; fi
-  ratio=$(awk -v delta="$delta" -v window="$window_us" 'BEGIN { printf "%.9f", delta / window }')
-  printf '%s %s %s %s\n' "$delta" "$ratio" "$hit" "$next"
 }
 
 # Replay-unsafe manifests may only trail the safe observation window.
@@ -1510,6 +1486,36 @@ monday_validate_v2_gate() {
         else
           null
         end;
+      def valid_memory_event_counters:
+        type == "object"
+        and (.high | type == "number" and floor == . and . >= 0)
+        and (.oom | type == "number" and floor == . and . >= 0)
+        and (.oom_kill | type == "number" and floor == . and . >= 0);
+      def valid_no_oom_events:
+        . as $events
+        | ($events | type == "object")
+        and ($events.start | valid_memory_event_counters)
+        and ($events.end | valid_memory_event_counters)
+        and ($events.end.high >= $events.start.high)
+        and ($events.end.oom >= $events.start.oom)
+        and ($events.end.oom_kill >= $events.start.oom_kill)
+        and ($events.end.oom == $events.start.oom)
+        and ($events.end.oom_kill == $events.start.oom_kill);
+      def valid_psi_observation:
+        type == "object"
+        and .schema == "monday.io_psi_observation.v1"
+        and (.phase | type == "string" and length > 0)
+        and (.observed_at | type == "string"
+          and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+        and (.available | type == "boolean")
+        and .veto == false
+        and (if .available then
+          (.full | type == "object"
+            and (.avg10 | type == "number" and . >= 0)
+            and (.avg60 | type == "number" and . >= 0)
+            and (.avg300 | type == "number" and . >= 0)
+            and (.total_us | type == "number" and floor == . and . >= 0))
+          else (has("full") | not) end);
       def expected_lob_slice:
         "system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice";
       def valid_lob_slice:
@@ -1536,6 +1542,10 @@ monday_validate_v2_gate() {
       and (.production_eligible | type == "boolean")
       and (.test_only | type == "boolean")
       and (if .test_only then .production_eligible == false else .production_eligible == true end)
+      and (.segment_seconds | type == "number" and floor == . and . == 120)
+      and (.evidence_timeout_seconds | type == "number" and floor == . and . == 600)
+      and (.health_settle_seconds | type == "number" and floor == .
+        and (if $root.test_only then . >= 1 else . == 240 end))
       and (.source_mode == "stable" or .source_mode == "direct")
       and (.from_controller_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
       and (if $from == "direct" then
@@ -1635,10 +1645,9 @@ monday_validate_v2_gate() {
           and ((.usdm.symbols | split(",") | unique) | length == 100)))
       and (.production_process | type == "object"
         and (keys | sort) == ["spot", "usdm"]
-        and all(.[]; .active == true
-          and (.main_pid | type == "number" and floor == . and . >= 1)
-          and (.process_exe_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
-          and (.n_restarts | type == "number" and floor == . and . >= 0)))
+        and all(.[]; (keys | sort) == ["active", "process_exe_sha256"]
+          and .active == true
+          and (.process_exe_sha256 | type == "string" and test("^[a-f0-9]{64}$"))))
       and (.production_memory | . as $pm
         | (type == "object"
         and (.slice | valid_lob_slice)
@@ -1684,12 +1693,6 @@ monday_validate_v2_gate() {
         and (.parent_memory_current_bytes <= .child_memory_max_sum_bytes)
         and (.parent_memory_events | type == "object"
           and all(.[]; type == "number" and floor == . and . >= 0))))
-      and (.production_process.spot.main_pid == .production_memory.children.spot.main_pid
-        and .production_process.usdm.main_pid == .production_memory.children.usdm.main_pid
-        and .production_process.spot.process_exe_sha256 == .production_memory.children.spot.process_exe_sha256
-        and .production_process.usdm.process_exe_sha256 == .production_memory.children.usdm.process_exe_sha256
-        and .production_process.spot.n_restarts == .production_memory.children.spot.n_restarts
-        and .production_process.usdm.n_restarts == .production_memory.children.usdm.n_restarts)
       and (.resource_admission | type == "array" and length == 9
         and ((map(.phase) | sort)
           == ["oss-readback-spot","oss-readback-usdm","preflight","shadow-spot","shadow-usdm","strict-verifier-spot","strict-verifier-usdm","upload-drain-spot","upload-drain-usdm"])
@@ -1723,16 +1726,10 @@ monday_validate_v2_gate() {
               and . == ($expected_phase_max + $r.host_memory_reserve_bytes + $r.production_memory_growth_bytes)
               and . <= $r.host_memory_available_bytes)
             and (.phase_memory_max_bytes | type == "number" and . == $expected_phase_max))))
-      and (.io_full_psi_windows | type == "array" and length >= 3
-        and all(.[]; . as $p
-          | (.phase | type == "string" and length > 0)
-          and (.stage | type == "string" and length > 0)
-          and (.hit | type == "boolean")
-          and ($p.consecutive_hits | type == "number" and . >= 0)
-          and (if $p.stage == "calibration"
-               then ($p.delta_us | type == "number" and . >= 0)
-                 and ($p.ratio | type == "number" and . >= 0)
-               else true end)))
+      and (.io_full_psi_windows | type == "array" and length == 9
+        and ((map(.phase) | sort)
+          == ["oss-readback-spot","oss-readback-usdm","preflight","shadow-spot","shadow-usdm","strict-verifier-spot","strict-verifier-usdm","upload-drain-spot","upload-drain-usdm"])
+        and all(.[]; valid_psi_observation))
       and (.shadow_staging | type == "object"
       and .mode == "run-scoped"
       and (.run_unit_root | type == "string" and test("/run/monday/rust-lob-gate/[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*$"))
@@ -1742,7 +1739,8 @@ monday_validate_v2_gate() {
         and (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))
         and (. as $slice | ($slice.cgroup | type == "string" and . == ("/" + $slice.name)))
         and (.memory_high_bytes | type == "number" and floor == . and . == 1342177280)
-        and (.memory_max_bytes | type == "number" and floor == . and . == 1610612736))
+        and (.memory_max_bytes | type == "number" and floor == . and . == 1610612736)
+        and (.memory_events | valid_no_oom_events))
       and (.units | type == "object" and (keys | sort) == ["spot", "usdm"]
           and (.spot | type == "string" and test("^monday-rust-lob-gate-[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*-spot\\.service$"))
           and (.usdm | type == "string" and test("^monday-rust-lob-gate-[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*-usdm\\.service$")))
@@ -1769,7 +1767,7 @@ monday_validate_v2_gate() {
             or (.restored_target_sha256 | type == "string" and test("^[a-f0-9]{64}$")))))
         and (.binary.path == .run_unit_root)
       and (.checks | type == "object"
-        and .before_pair_unchanged == true
+        and .before_pair_contract_unchanged == true
         and .production_runtime_verified == true
         and .shadow_staging_verified == true
         and .shadow_assets_restored == true
@@ -1779,7 +1777,10 @@ monday_validate_v2_gate() {
         and .final_identity == true
         and .controller_control_bytes == true
         and .shadow_link_restored == true
-        and .health_freshness == true)
+        and .health_freshness == true
+        and .candidate_no_oom == true
+        and .production_no_oom == true
+        and (.production_memory_events | valid_no_oom_events))
       and (.markets | type == "object" and ((keys | sort) == ["spot", "usdm"])
         and (to_entries | all(.[]; .value.market == .key))
         and all(.[]; . as $m
@@ -1796,9 +1797,13 @@ monday_validate_v2_gate() {
           and (.expected_oss_prefix | type == "string"
             and . == ("lake/raw/venue=binance/market=" + $m.market
               + "/dataset=" + $m.dataset + "/shard=all"))
+          and (.observation_started_at_ns | type == "number" and floor == . and . >= 0
+            and . <= $m.observed_at_ns)
           and (.observed_at_ns | type == "number" and floor == . and . >= 0)
-          and ($m.segment_count | type == "number" and . >= 2 and . == ($m.segments | length))
-          and ($m.oss_triplet_count | type == "number" and . >= 2 and . == ($m.triplets | length))
+          and ($m.observed_runtime_seconds | type == "number" and floor == . and . >= 0
+            and . <= $root.evidence_timeout_seconds)
+          and ($m.segment_count | type == "number" and . == 2 and . == ($m.segments | length))
+          and ($m.oss_triplet_count | type == "number" and . == 2 and . == ($m.triplets | length))
           and (.n_restarts | type == "number" and . == 0)
           and (.process_identity_verified == true)
           and (.installed_shadow_assets_verified == true)
@@ -1809,7 +1814,7 @@ monday_validate_v2_gate() {
             .strict_aggregate_trade_continuity_readback == true
             and .strict_raw_trade_continuity_readback == true
           else true end)
-          and (.segments | type == "array" and length >= 2
+          and (.segments | type == "array" and length == 2
             and all(.[];
               (.file | type == "string" and test("^part-[0-9]+\\.jsonl\\.zst$"))
               and (.path | type == "string" and length > 0)
@@ -1819,9 +1824,10 @@ monday_validate_v2_gate() {
               and (.start_received_at_ns | type == "number" and . >= 0)
               and (.end_received_at_ns | type == "number")
               and (.end_received_at_ns >= .start_received_at_ns)
+              and (.end_received_at_ns > $m.observation_started_at_ns)
               and (.end_received_at_ns <= $m.observed_at_ns)
               and (.session_id | type == "string" and . == $m.session_id)))
-          and (.triplets | type == "array" and length >= 2
+          and (.triplets | type == "array" and length == 2
             and all(.[];
               (.market | type == "string" and . == $m.market)
               and (.dataset | type == "string" and . == $m.dataset)
@@ -1858,11 +1864,18 @@ monday_validate_v2_gate() {
               and (.start_received_at_ns | type == "number" and . >= 0)
               and (.end_received_at_ns | type == "number")
               and (.end_received_at_ns >= .start_received_at_ns)
+              and (.end_received_at_ns > $m.observation_started_at_ns)
               and (.end_received_at_ns <= $m.observed_at_ns)
               and (.observed_at | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$"))
               and (.observed_at_ns | type == "number" and floor == . and . >= 0)
               and (.session_id | type == "string" and . == $m.session_id)
-              and (.catalog_sha256 | type == "string" and . == $m.health.frozen_catalog_sha256)))
+              and (.catalog_sha256 | type == "string" and . == $m.health.frozen_catalog_sha256))
+            and (.[1].start_received_at_ns >= .[0].end_received_at_ns)
+            and (.[1].start_received_at_ns - .[0].end_received_at_ns <= 90000000000))
+          and ($m.segments[1].start_received_at_ns >= $m.segments[0].end_received_at_ns)
+          and ($m.segments[1].start_received_at_ns - $m.segments[0].end_received_at_ns <= 90000000000)
+          and (($m.segments | map([.data_sha256, .start_received_at_ns, .end_received_at_ns]))
+            == ($m.triplets | map([.data_sha256, .start_received_at_ns, .end_received_at_ns])))
           and (.health | type == "object"
             and (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))
             and (.session_id | type == "string" and length > 0)
@@ -1907,12 +1920,159 @@ monday_validate_v2_gate() {
     | $value.triplets[] | [$market, .observed_at, .observed_at_ns, $value.observed_at_ns] | @tsv' "$gate")
 }
 
+# Validate the evidence that is outside the Gate receipt itself.  The ordinary
+# Gate validator deliberately remains a pure JSON/schema check for callers that
+# only have a receipt.  A transition must use this root-aware wrapper: it binds
+# the receipt to the immutable candidate's Gate cadence and evidence deadline,
+# and to the adjacent run.json written after its observation phases complete.
+monday_validate_v2_gate_authoritative() {
+  [[ $# -eq 5 ]] || return 2
+  local root=${1%/} gate=$2 from=$3 candidate=$4 gate_sha=$5
+  local canonical_gate_root gate_relative gate_dir run_json marker marker_gate_sha marker_run_sha
+  local gate_run gate_payload gate_runtime gate_segment gate_evidence_timeout gate_settle
+  local gate_test_only gate_eligible run_test_only run_formal_evidence_timeout
+  local run_evidence_timeout gate_spool run_spool expected_spool market candidate_deployment candidate_gate candidate_evidence_timeout candidate_gate_segment env segment spot_segment usdm_segment
+  local gate_markets
+  [[ -n $root ]] || root=/
+  monday_file_direct "$gate" || return 1
+  [[ -d $root && ! -L $root ]] || return 1
+  root=$(readlink -f -- "$root") || return 1
+  gate=$(readlink -f -- "$gate") || return 1
+  monday_path_direct "$root" || return 1
+  monday_validate_v2_gate "$gate" "$from" "$candidate" "$gate_sha" || return 1
+  canonical_gate_root=$(monday_root_join "$root" "data/monday/evidence/shadow-gates/$candidate") || return 1
+  gate_relative=${gate#"$canonical_gate_root"/}
+  [[ $gate_relative =~ ^[a-f0-9]{64}/runs/[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*/gate\.json$ ]] || return 1
+  gate_dir=$(dirname -- "$gate")
+  run_json="$gate_dir/run.json"
+  monday_file_direct "$run_json" || return 1
+  gate_run=$(jq -er '.run_id | select(type == "string")' "$gate") || return 1
+  gate_payload=$(jq -er '.candidate_payload_sha256 | select(type == "string")' "$gate") || return 1
+  gate_runtime=$(jq -er '.candidate_runtime_contract_sha256 | select(type == "string")' "$gate") || return 1
+  gate_segment=$(jq -er '.segment_seconds | select(type == "number" and floor == .)' "$gate") || return 1
+  gate_evidence_timeout=$(jq -er '.evidence_timeout_seconds | select(type == "number" and floor == .)' "$gate") || return 1
+  gate_settle=$(jq -er '.health_settle_seconds | select(type == "number" and floor == .)' "$gate") || return 1
+  gate_test_only=$(jq -er '.test_only | if type == "boolean" then tostring else error end' "$gate") || return 1
+  gate_eligible=$(jq -er '.production_eligible | if type == "boolean" then tostring else error end' "$gate") || return 1
+  [[ $gate_run == "$(basename -- "$gate_dir")" ]] || return 1
+  monday_path_direct "$gate_dir" || return 1
+  expected_spool=$(monday_root_join "$root" "data/monday/spool/binance-lob-rust-shadow/gate/$gate_run") || return 1
+  gate_spool=$(jq -er '.run_spool | select(type == "string")' "$gate") || return 1
+  [[ $gate_spool == "$expected_spool" ]] || return 1
+
+  # Re-read the Gate constants from the immutable candidate.  Receipt values
+  # are not authoritative, even if the caller edits both JSON and its hash.
+  candidate_deployment=$(monday_root_join "$root" "opt/monday/releases/binance-lob-controller/$candidate/deployment") || return 1
+  monday_verify_controller_release "$root" "$candidate" || return 1
+  candidate_gate="$candidate_deployment/host-rust-lob-shadow-gate.sh"
+  monday_file_direct "$candidate_gate" || return 1
+  candidate_evidence_timeout=$(awk -F= '
+    /^readonly EVIDENCE_TIMEOUT_SECONDS=[1-9][0-9]*$/ { count++; value=$2 }
+    END { if (count != 1) exit 1; print value }
+  ' "$candidate_gate") || return 1
+  candidate_gate_segment=$(awk -F= '
+    /^readonly GATE_SEGMENT_SECONDS=[1-9][0-9]*$/ { count++; value=$2 }
+    END { if (count != 1) exit 1; print value }
+  ' "$candidate_gate") || return 1
+  [[ $candidate_evidence_timeout == "$gate_evidence_timeout" \
+    && $candidate_gate_segment == "$gate_segment" ]] || return 1
+  for market in spot usdm; do
+    env="$candidate_deployment/binance-lob-archiver-rust-${market}.env"
+    monday_file_direct "$env" || return 1
+    segment=$(monday_env_value "$env" SEGMENT_SECONDS) || return 1
+    [[ $segment =~ ^[1-9][0-9]*$ && $segment -ge 60 ]] || return 1
+    if [[ $market == spot ]]; then
+      spot_segment=$segment
+    else
+      usdm_segment=$segment
+    fi
+  done
+  [[ $spot_segment == "$usdm_segment" ]] || return 1
+
+  run_test_only=$(jq -er '.test_only | if type == "boolean" then tostring else error end' "$run_json") || return 1
+  run_spool=$(jq -er '.run_spool | select(type == "string")' "$run_json") || return 1
+  [[ $run_spool == "$expected_spool" ]] || return 1
+  run_formal_evidence_timeout=$(jq -er '.formal_evidence_timeout_seconds | select(type == "number" and floor == .)' "$run_json") || return 1
+  run_evidence_timeout=$(jq -er '.evidence_timeout_seconds | select(type == "number" and floor == .)' "$run_json") || return 1
+  gate_markets=$(jq -ce '.markets | select(type == "object")' "$gate") || return 1
+  jq -e --arg run "$gate_run" --arg candidate "$candidate" --arg payload "$gate_payload" \
+    --arg runtime "$gate_runtime" --arg expected_spool "$expected_spool" \
+    --argjson segment "$gate_segment" \
+    --argjson formal_evidence_timeout "$gate_evidence_timeout" --argjson settle "$gate_settle" \
+    --argjson gate_test_only "$gate_test_only" --argjson gate_eligible "$gate_eligible" \
+    --arg run_test_only "$run_test_only" \
+    --argjson run_formal_evidence_timeout "$run_formal_evidence_timeout" --argjson run_evidence_timeout "$run_evidence_timeout" \
+    --argjson gate_markets "$gate_markets" '
+      .schema == "monday.rust_lob_shadow_gate_run.v3"
+      and .control_plane_version == 2
+      and .run_id == $run
+      and .candidate_controller_sha256 == $candidate
+      and .candidate_payload_sha256 == $payload
+      and .candidate_runtime_contract_sha256 == $runtime
+      and .run_spool == $expected_spool
+      and .segment_seconds == $segment
+      and .formal_evidence_timeout_seconds == $formal_evidence_timeout
+      and .evidence_timeout_seconds == $run_evidence_timeout
+      and (.health_settle_seconds | type == "number" and floor == . and . >= 1
+        and (if $gate_test_only then true else . == $settle end))
+      and .test_only == ($run_test_only == "true")
+      and .test_only == $gate_test_only
+      and ($run_evidence_timeout >= 1 and $run_evidence_timeout <= $run_formal_evidence_timeout)
+      and (.markets | keys | sort) == ["spot", "usdm"]
+      and ($gate_markets | keys | sort) == ["spot", "usdm"]
+      and (. as $run_root | all(["spot", "usdm"][];
+        . as $market
+        | $run_root.markets[$market] as $m
+        | ($m.observed_runtime_seconds | type == "number" and floor == . and . >= 0
+          and . <= $run_evidence_timeout)
+        and ($m.observation_started_at_ns | type == "number" and floor == . and . >= 0)
+        and ($m.observation_started_monotonic_ns | type == "number" and floor == . and . >= 0)
+        and ($m.observation_finished_monotonic_ns | type == "number" and floor == .
+          and . >= $m.observation_started_monotonic_ns)
+        and (($m.observation_finished_monotonic_ns - $m.observation_started_monotonic_ns)
+          >= ($m.observed_runtime_seconds * 1000000000))
+        and (($m.observation_finished_monotonic_ns - $m.observation_started_monotonic_ns)
+          < (($m.observed_runtime_seconds + 1) * 1000000000))
+        and ($m.observed_runtime_seconds == $gate_markets[$market].observed_runtime_seconds)
+        and ($m.observation_started_at_ns == $gate_markets[$market].observation_started_at_ns)))' \
+    "$run_json" >/dev/null || return 1
+  jq -e --arg run "$gate_run" --arg spool "$expected_spool" '
+    .run_spool == $spool
+    and .shadow_staging.spool_root == $spool
+    and (.shadow_staging.run_unit_root | type == "string"
+      and endswith("/run/monday/rust-lob-gate/" + $run))
+    and all(.markets[]; .spool_dir == ($spool + "/" + .market))' \
+    "$gate" >/dev/null || return 1
+
+  # A formal Gate must carry the commit marker and a complete observation from
+  # both markets.  Fixture receipts remain useful for offline tests but can
+  # never be upgraded merely by editing the receipt: their adjacent run
+  # provenance remains test_only=true and no formal marker is published.
+  if [[ $gate_test_only == false ]]; then
+    [[ $gate_eligible == true && $run_test_only == false ]] || return 1
+    [[ $run_evidence_timeout == "$gate_evidence_timeout" \
+      && $run_formal_evidence_timeout == "$gate_evidence_timeout" ]] || return 1
+    marker="$gate_dir/PASSED.sha256"
+    [[ -f $marker && ! -L $marker ]] || return 1
+    [[ $(monday_file_mode "$gate_dir") == 550 \
+      && $(monday_file_mode "$gate") == 440 \
+      && $(monday_file_mode "$run_json") == 440 \
+      && $(monday_file_mode "$marker") == 440 ]] || return 1
+    [[ $(wc -l <"$marker" | tr -d '[:space:]') == 2 ]] || return 1
+    marker_gate_sha=$(awk '$2 == "gate.json" { count++; value=$1 } END { if (count != 1) exit 1; print value }' "$marker") || return 1
+    marker_run_sha=$(awk '$2 == "run.json" { count++; value=$1 } END { if (count != 1) exit 1; print value }' "$marker") || return 1
+    [[ $marker_gate_sha == "$gate_sha" \
+      && $marker_run_sha == "$(monday_sha256_file "$run_json")" ]] || return 1
+    (cd "$gate_dir" && sha256sum --check --strict PASSED.sha256 >/dev/null) || return 1
+  fi
+}
+
 # Validate the transition receipt and its exact V2 Gate evidence.  A cutover
 # receipt is not authoritative by itself: the immutable Gate receipt must be
 # present, hash-identical, and pass the full evidence validator above.
 monday_validate_v2_transition() {
-  [[ $# -eq 5 ]] || return 2
-  local receipt=$1 from=$2 to=$3 gate=$4 gate_sha=$5
+  [[ $# -eq 6 ]] || return 2
+  local root=${1%/} receipt=$2 from=$3 to=$4 gate=$5 gate_sha=$6
   local gate_evidence gate_payload gate_runtime gate_from gate_production_runtime pair_asset_keys controller_projection_keys
   # The stable pair contains exactly the nine runtime unit/env/slice assets
   # (production + shadow).  Recovery/health helpers remain controller assets
@@ -1923,7 +2083,7 @@ monday_validate_v2_transition() {
   [[ $from == direct || $from =~ ^[a-f0-9]{64}$ ]] || return 1
   [[ $to =~ ^[a-f0-9]{64}$ && $gate_sha =~ ^[a-f0-9]{64}$ ]] || return 1
   monday_file_direct "$gate" || return 1
-  monday_validate_v2_gate "$gate" "$from" "$to" "$gate_sha" || return 1
+  monday_validate_v2_gate_authoritative "$root" "$gate" "$from" "$to" "$gate_sha" || return 1
   gate_evidence=$(jq -ceS \
     '{candidate_control_bytes,resource_admission,io_full_psi_windows,shadow_staging,checks,markets}' \
     "$gate") || return 1
@@ -1991,7 +2151,9 @@ monday_validate_v2_transition() {
       and (.resource_admission | type == "array" and length == 9
         and ((map(.phase) | sort)
           == ["oss-readback-spot","oss-readback-usdm","preflight","shadow-spot","shadow-usdm","strict-verifier-spot","strict-verifier-usdm","upload-drain-spot","upload-drain-usdm"]))
-      and (.io_full_psi_windows | type == "array" and length >= 3))
+      and (.io_full_psi_windows | type == "array" and length == 9
+        and ((map(.phase) | sort)
+          == ["oss-readback-spot","oss-readback-usdm","preflight","shadow-spot","shadow-usdm","strict-verifier-spot","strict-verifier-usdm","upload-drain-spot","upload-drain-usdm"])))
       and (.before | type == "object"
       and (.controller == (if $from == "direct" then $gate_from else $from end))
       and (.payload_sha256 | type == "string" and test("^[a-f0-9]{64}$"))

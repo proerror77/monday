@@ -51,6 +51,22 @@ gate_slice_create_line=$(grep -nF "printf '[Slice]\\nMemoryHigh=1280M" \
   printf 'Gate cleanup trap must precede run-scoped slice creation\n' >&2
   exit 1
 }
+gate_protect_line=$(grep -nF "chmod 0440 \"\$gate_json\" \"\$run_json\" \"\$passed_marker_tmp\"" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" | head -n1 | cut -d: -f1)
+gate_marker_line=$(grep -nF "mv -f -- \"\$passed_marker_tmp\" \"\$passed_marker\"" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" | head -n1 | cut -d: -f1)
+gate_close_dir_line=$(grep -nF "chmod 0550 \"\$evidence_dir\"" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" | head -n1 | cut -d: -f1)
+gate_publish_dir_line=$(grep -nF "mv -- \"\$evidence_dir\" \"\$final_evidence_dir\"" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" | head -n1 | cut -d: -f1)
+[[ $gate_protect_line =~ ^[0-9]+$ && $gate_marker_line =~ ^[0-9]+$ \
+  && $gate_close_dir_line =~ ^[0-9]+$ && $gate_publish_dir_line =~ ^[0-9]+$ \
+  && $gate_protect_line -lt $gate_marker_line \
+  && $gate_marker_line -lt $gate_close_dir_line \
+  && $gate_close_dir_line -lt $gate_publish_dir_line ]] || {
+  printf 'Gate evidence is not fully protected before atomic directory publication\n' >&2
+  exit 1
+}
 grep -Fqx 'MemoryHigh=1792M' "$SCRIPT_DIR/binance-lob-archiver-rust@.service" || {
   printf 'shadow MemoryHigh is not 1792M\n' >&2
   exit 1
@@ -59,6 +75,43 @@ grep -Fqx 'MemoryMax=2048M' "$SCRIPT_DIR/binance-lob-archiver-rust@.service" || 
   printf 'shadow MemoryMax is not 2048M\n' >&2
   exit 1
 }
+evidence_timeout_seconds=$(sed -n 's/^readonly EVIDENCE_TIMEOUT_SECONDS=//p' \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh")
+gate_segment_seconds=$(sed -n 's/^readonly GATE_SEGMENT_SECONDS=//p' \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh")
+health_settle_seconds=$(sed -n 's/^readonly HEALTH_SETTLE_SECONDS=//p' \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh")
+shadow_runtime_max_seconds=$(sed -n 's/^readonly SHADOW_RUNTIME_MAX_SECONDS=//p' \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh")
+shadow_stop_timeout_seconds=$(sed -n 's/^readonly SHADOW_STOP_TIMEOUT_SECONDS=//p' \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh")
+upload_drain_timeout_seconds=$(sed -n 's/^readonly UPLOAD_DRAIN_TIMEOUT_SECONDS=//p' \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh")
+transient_work_timeout_seconds=$(sed -n 's/^readonly TRANSIENT_WORK_TIMEOUT_SECONDS=//p' \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh")
+spot_segment_seconds=$(sed -n 's/^SEGMENT_SECONDS=//p' \
+  "$SCRIPT_DIR/binance-lob-archiver-rust-spot.env")
+usdm_segment_seconds=$(sed -n 's/^SEGMENT_SECONDS=//p' \
+  "$SCRIPT_DIR/binance-lob-archiver-rust-usdm.env")
+production_spot_segment_seconds=$(sed -n 's/^SEGMENT_SECONDS=//p' \
+  "$SCRIPT_DIR/binance-lob-archiver-production-spot.env")
+production_usdm_segment_seconds=$(sed -n 's/^SEGMENT_SECONDS=//p' \
+  "$SCRIPT_DIR/binance-lob-archiver-production-usdm.env")
+[[ $evidence_timeout_seconds == 600 \
+  && $gate_segment_seconds == 120 && $health_settle_seconds == 240 \
+  && $shadow_runtime_max_seconds == 900 && $shadow_stop_timeout_seconds == 60 \
+  && $upload_drain_timeout_seconds == 300 && $transient_work_timeout_seconds == 300 \
+  && $spot_segment_seconds =~ ^[1-9][0-9]*$ \
+  && $spot_segment_seconds == "$usdm_segment_seconds" \
+  && $production_spot_segment_seconds == 3600 \
+  && $production_spot_segment_seconds == "$production_usdm_segment_seconds" ]] || {
+  printf 'Fast Gate bounds or the unchanged production cadence drifted\n' >&2
+  exit 1
+}
+gate_observation_source=$(sed -n '/^run_market_gate_phase()/,/^}/p' \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh")
+grep -Fq "observation_started_ns=\$(monotonic_nanoseconds)" <<<"$gate_observation_source"
+grep -Fq "observation_finished_ns=\$(monotonic_nanoseconds)" <<<"$gate_observation_source"
 
 # Resource Envelope V2 reserves the production slice's unallocated aggregate
 # cap from parent memory.stat anon.  File cache and memory.current remain audit
@@ -180,13 +233,14 @@ for mutation in extra-child non-direct wrong-limit identity; do
       jq '.children.usdm.memory_max_bytes = 2147483648 | .child_memory_max_sum_bytes = 4831838208' \
         "$production_snapshot" >"$mutated_snapshot" ;;
     identity)
-      jq '.children.spot.n_restarts = 9' "$production_snapshot" >"$mutated_snapshot" ;;
+      jq '.children.spot.main_pid = 99999 | .children.spot.n_restarts = 99' \
+        "$production_snapshot" >"$mutated_snapshot" ;;
   esac
   if [[ $mutation == identity ]]; then
     monday_validate_lob_production_snapshot "$mutated_snapshot"
     mutated_identity=$(monday_lob_production_snapshot_identity "$mutated_snapshot")
-    [[ $mutated_identity != "$production_identity" ]] || {
-      printf 'production snapshot identity did not change after restart drift\n' >&2
+    [[ $mutated_identity == "$production_identity" ]] || {
+      printf 'production snapshot identity changed after PID/restart-only drift\n' >&2
       exit 1
     }
   elif monday_validate_lob_production_snapshot "$mutated_snapshot"; then
@@ -194,6 +248,26 @@ for mutation in extra-child non-direct wrong-limit identity; do
     exit 1
   fi
 done
+
+# PID and restart counters are volatile audit fields, not stable identity.
+# Executable and cgroup changes remain identity drift even when the snapshot
+# is otherwise structurally valid.
+identity_exe_snapshot="$ROOT/production-snapshot-identity-exe.json"
+identity_exe_sha=$(printf 'b%.0s' {1..64})
+jq --arg exe "$identity_exe_sha" \
+  '.children.spot.process_exe_sha256 = $exe' "$production_snapshot" \
+  >"$identity_exe_snapshot"
+[[ $(monday_lob_production_snapshot_identity "$identity_exe_snapshot") != "$production_identity" ]] || {
+  printf 'production snapshot identity ignored executable drift\n' >&2
+  exit 1
+}
+identity_cgroup_snapshot="$ROOT/production-snapshot-identity-cgroup.json"
+jq '.children.spot.control_group += "-changed"' "$production_snapshot" \
+  >"$identity_cgroup_snapshot"
+[[ $(monday_lob_production_snapshot_identity "$identity_cgroup_snapshot") != "$production_identity" ]] || {
+  printf 'production snapshot identity ignored cgroup drift\n' >&2
+  exit 1
+}
 
 jq '.parent_cgroup_procs=[4242]' "$production_snapshot" >"$mutated_snapshot"
 if monday_validate_lob_production_snapshot "$mutated_snapshot"; then
@@ -343,55 +417,6 @@ mv -f -- "$legacy_production_service.before-delta" "$legacy_production_service"
 # production bytes as the formal Gate, then emit advisory JSON without creating
 # or truncating the existing lock, run spool, evidence, worker slice, lease,
 # shadow, or systemd unit.
-psi_window_us=15000000
-psi_threshold_us=150000
-read -r psi_delta psi_ratio psi_hit psi_count < <(monday_io_full_psi_window \
-  0 "$psi_threshold_us" "$psi_window_us" "$psi_window_us" "$psi_threshold_us" 0)
-[[ $psi_delta == "$psi_threshold_us" && $psi_ratio == 0.010000000 \
-  && $psi_hit == true && $psi_count == 1 ]] || {
-  printf 'PSI threshold boundary did not record the first continuous hit\n' >&2
-  exit 1
-}
-read -r psi_delta psi_ratio psi_hit psi_count < <(monday_io_full_psi_window \
-  "$psi_threshold_us" "$((psi_threshold_us * 2))" "$psi_window_us" "$psi_window_us" "$psi_threshold_us" "$psi_count")
-[[ $psi_hit == true && $psi_count == 2 ]] || {
-  printf 'PSI continuous-hit count did not advance to two\n' >&2
-  exit 1
-}
-read -r psi_delta psi_ratio psi_hit psi_count < <(monday_io_full_psi_window \
-  "$((psi_threshold_us * 2))" "$((psi_threshold_us * 3))" "$psi_window_us" "$psi_window_us" "$psi_threshold_us" "$psi_count")
-[[ $psi_hit == true && $psi_count == 3 ]] || {
-  printf 'PSI continuous-hit count did not advance to three\n' >&2
-  exit 1
-}
-read -r psi_delta psi_ratio psi_hit psi_count < <(monday_io_full_psi_window \
-  "$((psi_threshold_us * 3))" "$((psi_threshold_us * 3))" "$psi_window_us" "$psi_window_us" "$psi_threshold_us" "$psi_count")
-[[ $psi_hit == false && $psi_count == 0 ]] || {
-  printf 'PSI sub-threshold sample did not reset the continuous-hit count\n' >&2
-  exit 1
-}
-# The shared ratio helper still supports arbitrary elapsed intervals for
-# callers that need the math.  The Gate adapter below refuses to adjudicate
-# any interval shorter than the 15-second reference window.
-read -r psi_delta psi_ratio psi_hit psi_count < <(monday_io_full_psi_window \
-  0 49999 5000000 "$psi_window_us" "$psi_threshold_us" 0)
-[[ $psi_delta == 49999 && $psi_hit == false && $psi_count == 0 ]] || {
-  printf 'five-second PSI sample accepted a below-boundary delta\n' >&2
-  exit 1
-}
-read -r psi_delta psi_ratio psi_hit psi_count < <(monday_io_full_psi_window \
-  0 50000 5000000 "$psi_window_us" "$psi_threshold_us" 0)
-[[ $psi_delta == 50000 && $psi_hit == true && $psi_count == 1 ]] || {
-  printf 'shared PSI ratio helper rejected the exact scaled boundary\n' >&2
-  exit 1
-}
-gate_monitor_source=$(sed -n '/^resource_monitor_start()/,/^resource_monitor_breach_cause()/p' \
-  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh")
-grep -Fq 'elapsed_us >= IO_PSI_WINDOW_US' <<<"$gate_monitor_source"
-if grep -Fq 'delta * 3' <<<"$gate_monitor_source"; then
-  printf 'resource monitor still adjudicates PSI on a five-second scaled delta\n' >&2
-  exit 1
-fi
 preflight_residue_before=$(find "$ROOT/data/monday/spool/binance-lob-rust-shadow" \
   "$ROOT/data/monday/evidence/shadow-gates" "$ROOT/run/monday/rust-lob-gate" \
   "$ROOT/run/systemd/system" -mindepth 1 -print 2>/dev/null | LC_ALL=C sort || true)
@@ -400,6 +425,25 @@ preflight_lock_sha=$(monday_sha256_file "$preflight_lock_path")
 preflight_tmpdir_guard="$ROOT/nonexistent-preflight-tmp"
 rm -rf -- "$preflight_tmpdir_guard"
 rm -f -- "$ROOT/run/gate-fixture.calls"
+subminute_env="$source_dir/binance-lob-archiver-rust-spot.env"
+cp -p -- "$subminute_env" "$subminute_env.before-test"
+sed 's/^SEGMENT_SECONDS=.*/SEGMENT_SECONDS=59/' "$subminute_env.before-test" >"$subminute_env"
+subminute_manifest="$ROOT/subminute-manifest.json"
+publish_fixture "$p0" "$subminute_manifest" >/dev/null
+subminute_controller=$(monday_sha256_file "$subminute_manifest")
+mv -f -- "$subminute_env.before-test" "$subminute_env"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$subminute_controller" --preflight-only --root "$ROOT" \
+  >"$ROOT/run/preflight-subminute-segment.out" 2>&1; then
+  printf 'read-only preflight accepted a sub-minute segment cadence\n' >&2
+  exit 1
+fi
+grep -Fq 'spot shadow SEGMENT_SECONDS is below the collector minimum' \
+  "$ROOT/run/preflight-subminute-segment.out" || {
+  cat "$ROOT/run/preflight-subminute-segment.out" >&2
+  exit 1
+}
 preflight_output=$(TMPDIR="$preflight_tmpdir_guard" MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
   --candidate-controller "$c0" --preflight-only --root "$ROOT")
@@ -409,31 +453,12 @@ jq -e --arg runtime "$candidate_runtime_sha" \
    and .authoritative == false and .production_changed == false
    and .authorizes_gate == false and .authorizes_cutover == false
    and .candidate_runtime_contract_sha256 == $runtime
-   and (.io_full_psi_windows | length == 3)
+   and (.io_full_psi_windows | length == 1)
+   and .io_full_psi_windows[0].phase == "preflight"
+   and .io_full_psi_windows[0].veto == false
    and (.checks.controller and .checks.from_controller and .checks.payload
      and .checks.runtime_contract and .checks.installed_bytes and .checks.psi_sampler)' \
   <<<"$preflight_output" >/dev/null
-# (a) Five-second observations are accumulated but never adjudicated.  Three
-# complete 15-second windows are formed from 5-second samples; the first
-# window is a hit, but later sub-threshold windows prevent a stop.
-preflight_subwindow_output=$(MONDAY_CONTROL_PLANE_TEST=1 \
-  MONDAY_GATE_FIXTURE_PREFLIGHT_PSI_VALUES=0,50000,100000,150000,160000,170000,180000,190000,200000,210000 \
-  MONDAY_GATE_FIXTURE_PREFLIGHT_PSI_MONOTONIC_VALUES=0,5000000,10000000,15000000,20000000,25000000,30000000,35000000,40000000,45000000 \
-  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
-  --candidate-controller "$c0" --preflight-only --root "$ROOT")
-jq -e '.io_full_psi_windows | length == 3
-  and all(.[]; .elapsed_us == 15000000 and .window_us == 15000000)
-  and (map(.consecutive_hits) | max) == 1' <<<"$preflight_subwindow_output" >/dev/null
-# (b) The threshold ratio uses the actual monotonic elapsed time, not a fixed
-# 15-second denominator (160,000us over 16 seconds is exactly 1%).
-preflight_elapsed_output=$(MONDAY_CONTROL_PLANE_TEST=1 \
-  MONDAY_GATE_FIXTURE_PREFLIGHT_PSI_VALUES=0,160000,170000,180000 \
-  MONDAY_GATE_FIXTURE_PREFLIGHT_PSI_MONOTONIC_VALUES=0,16000000,32000000,48000000 \
-  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
-  --candidate-controller "$c0" --preflight-only --root "$ROOT")
-jq -e '.io_full_psi_windows | length == 3
-  and all(.[]; .elapsed_us == 16000000)
-  and .[0].ratio == 0.01 and .[0].delta_us == 160000' <<<"$preflight_elapsed_output" >/dev/null
 [[ ! -e "$preflight_tmpdir_guard" ]] || {
   printf 'read-only preflight created a temporary directory\n' >&2
   exit 1
@@ -567,31 +592,6 @@ fi
   printf 'lock-contention preflight invoked a mutating systemd action\n' >&2
   exit 1
 }
-# (c) PSI is observational evidence. Three continuous threshold hits are
-# recorded without mutating production or rejecting the read-only preflight.
-preflight_residue_before=$preflight_residue_after
-rm -f -- "$ROOT/run/gate-fixture.calls"
-preflight_psi_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_PREFLIGHT_PSI_VALUES=0,150000,300000,450000 \
-  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
-  --candidate-controller "$c0" --preflight-only --root "$ROOT" \
-  2>"$ROOT/run/preflight-psi.err")
-jq -e '(.io_full_psi_windows | length) == 3
-  and ([.io_full_psi_windows[].consecutive_hits] | max) == 3' <<<"$preflight_psi_output" >/dev/null
-preflight_residue_after=$(find "$ROOT/data/monday/spool/binance-lob-rust-shadow" \
-  "$ROOT/data/monday/evidence/shadow-gates" "$ROOT/run/monday/rust-lob-gate" \
-  "$ROOT/run/systemd/system" -mindepth 1 -print 2>/dev/null | LC_ALL=C sort || true)
-[[ $preflight_residue_after == "$preflight_residue_before" ]] || {
-  printf 'PSI preflight left run-scoped residue\n' >&2
-  exit 1
-}
-[[ $(monday_sha256_file "$preflight_lock_path") == "$preflight_lock_sha" ]] || {
-  printf 'PSI preflight changed the existing lock file\n' >&2
-  exit 1
-}
-[[ ! -s "$ROOT/run/gate-fixture.calls" ]] || {
-  printf 'PSI preflight invoked a mutating systemd action\n' >&2
-  exit 1
-}
 # A failed identity check must fail before any write as well.  c1 carries a
 # different payload than the direct legacy production P0 and is rejected
 # before preflight sampling or any run-scoped setup.
@@ -683,126 +683,6 @@ if grep -Fq 'resource monitor breached during' "$ROOT/run/resource-stop-failure.
   exit 1
 fi
 
-# Exercise the asynchronous resource monitor through its real start/stop
-# state machine without sleeping.  The fixture supplies cumulative PSI totals
-# and monotonic timestamps; production still uses /proc and five-second polls.
-run_async_resource_monitor() {
-  local label=$1 values=$2 monotonic_values=$3 sample_limit=$4 initial_failure=${5:-0} fail_at=${6:-}
-  local output="$ROOT/run/async-resource-$label.err" before_runs after_runs
-  async_monitor_rc=0; async_monitor_run=; async_monitor_output=$output
-  before_runs=$(find "$ROOT/data/monday/evidence/shadow-gates/$c0/$candidate_runtime_sha/runs" \
-    -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | LC_ALL=C sort || true)
-  if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_RESOURCE_MONITOR_ASYNC=1 \
-    MONDAY_GATE_FIXTURE_RESOURCE_MONITOR_ONLY=1 \
-    MONDAY_GATE_FIXTURE_RESOURCE_PSI_VALUES="$values" \
-    MONDAY_GATE_FIXTURE_RESOURCE_PSI_MONOTONIC_VALUES="$monotonic_values" \
-    MONDAY_GATE_FIXTURE_RESOURCE_PSI_SAMPLE_LIMIT="$sample_limit" \
-    MONDAY_GATE_FIXTURE_RESOURCE_PSI_INITIAL_FAILURE="$initial_failure" \
-    MONDAY_GATE_FIXTURE_RESOURCE_PSI_FAIL_AT="$fail_at" \
-    MONDAY_GATE_FIXTURE_RECORD_CALLS=1 MONDAY_ROOT="$ROOT" \
-    bash -c '
-      root=$1; shift
-      mkdir -p "$root/proc/$$"
-      printf "1 fixture S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 4242\\n" >"$root/proc/$$/stat"
-      exec "$@"
-    ' _ "$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
-    --candidate-controller "$c0" --root "$ROOT" >"$output" 2>&1; then
-    async_monitor_rc=0
-  else
-    async_monitor_rc=$?
-  fi
-  after_runs=$(find "$ROOT/data/monday/evidence/shadow-gates/$c0/$candidate_runtime_sha/runs" \
-    -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | LC_ALL=C sort || true)
-  async_monitor_run=$(comm -13 <(printf '%s\n' "$before_runs") \
-    <(printf '%s\n' "$after_runs") | sed '/^$/d' | tail -n1)
-  [[ -n $async_monitor_run ]] || {
-    printf 'async resource fixture %s did not leave an evidence run\n' "$label" >&2
-    cat "$output" >&2
-    exit 1
-  }
-}
-assert_async_monitor_cleanup() {
-  local label=$1 expected_rc=$2 expected_cause=${3:-}
-  [[ $async_monitor_rc == "$expected_rc" ]] || {
-    printf 'async resource fixture %s returned %s (expected %s)\n' \
-      "$label" "$async_monitor_rc" "$expected_rc" >&2
-    cat "$async_monitor_output" >&2
-    exit 1
-  }
-  [[ ! -e "$ROOT/run/monday/rust-lob-gate/${async_monitor_run##*/}" \
-    && ! -e "$ROOT/data/monday/spool/binance-lob-rust-shadow/gate/${async_monitor_run##*/}" ]] || {
-    printf 'async resource fixture %s left run-scoped residue\n' "$label" >&2
-    exit 1
-  }
-  if find "$async_monitor_run" -type f \( -name gate.json -o -name PASSED.sha256 \) \
-    -print -quit 2>/dev/null | grep -q .; then
-    printf 'async resource fixture %s left an authoritative receipt\n' "$label" >&2
-    exit 1
-  fi
-  [[ $(monday_active_controller_sha "$ROOT") == "$resource_breach_active_before" \
-    && $(readlink -- "$ROOT/opt/monday/bin/binance-lob-archiver") == "$resource_breach_payload_before" \
-    && $(monday_sha256_file "$production_spool_root/spot/upload-status.json") == "$production_spot_status_sha" \
-    && $(monday_sha256_file "$production_spool_root/usdm/upload-status.json") == "$production_usdm_status_sha" ]] || {
-    printf 'async resource fixture %s changed the production pair or spool\n' "$label" >&2
-    exit 1
-  }
-  if [[ -n $expected_cause ]]; then
-    async_monitor_failure="$async_monitor_run/resource-monitor-failure.json"
-    jq -e --arg cause "$expected_cause" \
-      '.authoritative == false and .cause == $cause and (.diagnostic.authoritative == false)' \
-      "$async_monitor_failure" >/dev/null || {
-      printf 'async resource fixture %s missing %s failure diagnostic\n' "$label" "$expected_cause" >&2
-      exit 1
-    }
-    grep -Fq "resource monitor breached during preflight: $expected_cause" "$async_monitor_output" || {
-      printf 'async resource fixture %s did not report %s\n' "$label" "$expected_cause" >&2
-      exit 1
-    }
-  fi
-}
-
-# (f) Five/ten-second observations do not adjudicate a hit; the first hit is
-# recorded only when a full 15-second window closes.
-run_async_resource_monitor first-hit 0,50000,100000,150000 0,5000000,10000000,15000000 3
-assert_async_monitor_cleanup first-hit 0
-first_hit_run_json="$async_monitor_run/run.json"
-jq -e '([.io_full_psi_windows[] | select(.stage == "runtime")] | length == 1)
-  and ([.io_full_psi_windows[] | select(.stage == "runtime")][0]
-    | .elapsed_us == 15000000 and .window_us == 15000000
-      and .delta_us == 150000 and .ratio == 0.01 and .hit == true
-      and .consecutive_hits == 1)' "$first_hit_run_json" >/dev/null
-# (g) A 10s/80ms high partial interval is ignored; the complete 15s window is
-# below the 1% threshold.
-run_async_resource_monitor partial-no-hit 0,40000,80000,90000,100000 \
-  0,5000000,10000000,10080000,15000000 4
-assert_async_monitor_cleanup partial-no-hit 0
-jq -e '([.io_full_psi_windows[] | select(.stage == "runtime")][0]
-  | .elapsed_us == 15000000 and .delta_us == 100000 and .hit == false
-    and .consecutive_hits == 0)' "$async_monitor_run/run.json" >/dev/null
-# (h) Three complete threshold windows remain observational evidence.
-run_async_resource_monitor three-window-observation \
-  0,150000,300000,450000 0,15000000,30000000,45000000 3
-assert_async_monitor_cleanup three-window-observation 0
-jq -e '([.io_full_psi_windows[] | select(.stage == "runtime")]
-  | map(.consecutive_hits)) == [1,2,3]' "$async_monitor_run/run.json" >/dev/null
-# (i) A low complete window resets the consecutive counter before a later hit.
-run_async_resource_monitor low-window-reset \
-  0,150000,160000,310000 0,15000000,30000000,45000000 3
-assert_async_monitor_cleanup low-window-reset 0
-jq -e '([.io_full_psi_windows[] | select(.stage == "runtime")] | map(.consecutive_hits))
-  == [1,0,1]' "$async_monitor_run/run.json" >/dev/null
-# (j) Cumulative PSI counters may not regress.
-run_async_resource_monitor counter-regression 0,150000,100000 \
-  0,15000000,30000000 2
-assert_async_monitor_cleanup counter-regression 143 psi-regressed
-# (k) Initial and running PSI failures are explicit fail-closed breaches; no
-# fallback zero is accepted.  The second case uses a non-integer counter.
-run_async_resource_monitor initial-unavailable 0,0 0,15000000 1 1
-assert_async_monitor_cleanup initial-unavailable 1 psi-unavailable
-run_async_resource_monitor current-noninteger 0,50000,not-an-integer \
-  0,5000000,10000000 2
-assert_async_monitor_cleanup current-noninteger 143 psi-unavailable
-
 gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   bash -c '
     root=$1; shift
@@ -819,6 +699,148 @@ gate_sha=$(printf '%s\n' "$gate_output" | sed -n 's/^SHA-256: //p')
 [[ -f $gate && $gate_sha == "$(monday_sha256_file "$gate")" ]]
 monday_validate_v2_gate "$gate" direct "$c0" "$gate_sha"
 jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$gate" >/dev/null
+jq -e --argjson evidence_timeout "$evidence_timeout_seconds" \
+  --argjson segment "$gate_segment_seconds" \
+  '.evidence_timeout_seconds == $evidence_timeout and .segment_seconds == $segment
+   and (.io_full_psi_windows | length == 9)
+   and all(.io_full_psi_windows[]; .veto == false)
+   and all(.markets[]; . as $market
+     | .observed_runtime_seconds >= 0 and .observed_runtime_seconds <= $evidence_timeout
+     and .observation_started_at_ns <= .observed_at_ns
+     and .segment_count == 2 and .oss_triplet_count == 2
+     and all(.segments[]; .end_received_at_ns > $market.observation_started_at_ns)
+     and all(.triplets[]; .end_received_at_ns > $market.observation_started_at_ns))' \
+  "$gate" >/dev/null
+run_json="$(dirname -- "$gate")/run.json"
+jq -e --argjson segment "$gate_segment_seconds" \
+  --argjson evidence_timeout "$evidence_timeout_seconds" \
+  '.segment_seconds == $segment
+   and .test_only == true
+   and .evidence_timeout_seconds == $evidence_timeout
+   and .formal_evidence_timeout_seconds == $evidence_timeout
+   and all(.markets[];
+     .observation_started_at_ns >= 0
+     and .observation_finished_monotonic_ns >= .observation_started_monotonic_ns
+     and (.observation_finished_monotonic_ns - .observation_started_monotonic_ns)
+       >= (.observed_runtime_seconds * 1000000000)
+     and (.observation_finished_monotonic_ns - .observation_started_monotonic_ns)
+       < ((.observed_runtime_seconds + 1) * 1000000000))' \
+  "$run_json" >/dev/null
+jq -e --slurpfile gate "$gate" '
+  .markets as $run_markets
+  | all(["spot", "usdm"][]; . as $market
+    | $run_markets[$market].observation_started_at_ns
+      == $gate[0].markets[$market].observation_started_at_ns)' \
+  "$run_json" >/dev/null
+# A reconnect-boundary segment is skipped, but two later adjacent clean
+# segments can still satisfy the evidence-driven Gate.
+reconnect_gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 \
+  MONDAY_GATE_FIXTURE_RECONNECT_BOUNDARY=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --root "$ROOT")
+reconnect_gate=$(printf '%s\n' "$reconnect_gate_output" | sed -n 's/^V2 Gate receipt: //p')
+reconnect_gate_sha=$(printf '%s\n' "$reconnect_gate_output" | sed -n 's/^SHA-256: //p')
+monday_validate_v2_gate "$reconnect_gate" direct "$c0" "$reconnect_gate_sha"
+jq -e 'all(.markets[];
+  .segment_count == 2 and .oss_triplet_count == 2
+  and (.segments | length == 2) and (.triplets | length == 2))' \
+  "$reconnect_gate" >/dev/null
+
+# Clean files sealed before observation starts are audit input only.  The local
+# selector and OSS readback must both choose the later adjacent pair.
+preobservation_gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 \
+  MONDAY_GATE_FIXTURE_PREOBSERVATION_SEGMENTS=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --root "$ROOT")
+preobservation_gate=$(printf '%s\n' "$preobservation_gate_output" | sed -n 's/^V2 Gate receipt: //p')
+preobservation_gate_sha=$(printf '%s\n' "$preobservation_gate_output" | sed -n 's/^SHA-256: //p')
+monday_validate_v2_gate "$preobservation_gate" direct "$c0" "$preobservation_gate_sha"
+jq -e 'all(.markets[]; . as $market
+  | all(.segments[]; .end_received_at_ns > $market.observation_started_at_ns)
+  and all(.triplets[]; .end_received_at_ns > $market.observation_started_at_ns))' \
+  "$preobservation_gate" >/dev/null
+
+# Time alone never passes the Gate: one clean segment is insufficient.
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_SINGLE_CLEAN_SEGMENT=1 \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
+  --from-controller direct --candidate-controller "$c0" --root "$ROOT" \
+  >"$ROOT/run/single-clean-segment.err" 2>&1; then
+  printf 'Gate accepted a single clean segment\n' >&2
+  exit 1
+fi
+grep -Fq 'fixture did not produce two adjacent clean segments' \
+  "$ROOT/run/single-clean-segment.err"
+# Candidate and production cgroup memory.events are part of the same Gate
+# evidence.  An OOM counter increment in the run-scoped worker slice must
+# fail the Gate before any receipt or marker can be authorized.
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_GATE_OOM=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --root "$ROOT" \
+  >"$ROOT/run/gate-oom.err" 2>&1; then
+  printf 'Gate accepted a run-scoped worker OOM counter increment\n' >&2
+  exit 1
+fi
+grep -Fq 'run-scoped Gate worker slice memory.events recorded an OOM during Gate' \
+  "$ROOT/run/gate-oom.err" || {
+  cat "$ROOT/run/gate-oom.err" >&2
+  exit 1
+}
+# A fixture receipt must not become production evidence by editing its mode.
+# Keep the adjacent run.json's provenance unchanged while moving its canonical
+# run paths and provide the marker a real cutover would require; the
+# authoritative wrapper still rejects the fixture provenance.
+tampered_run_id=20240101T000000Z-1
+tampered_dir="$(dirname -- "$(dirname -- "$gate")")/$tampered_run_id"
+tampered_spool="$ROOT/data/monday/spool/binance-lob-rust-shadow/gate/$tampered_run_id"
+tampered_unit_root="$ROOT/run/monday/rust-lob-gate/$tampered_run_id"
+mkdir -p "$tampered_dir"
+jq --arg run "$tampered_run_id" --arg spool "$tampered_spool" \
+  '.run_id = $run | .run_spool = $spool' "$run_json" >"$tampered_dir/run.json"
+jq --arg run "$tampered_run_id" --arg spool "$tampered_spool" \
+  --arg unit_root "$tampered_unit_root" \
+  '.run_id = $run
+   | .run_spool = $spool
+   | .shadow_staging.spool_root = $spool
+   | .shadow_staging.run_unit_root = $unit_root
+   | .markets.spot.spool_dir = ($spool + "/spot")
+   | .markets.usdm.spool_dir = ($spool + "/usdm")
+   | .test_only = false | .production_eligible = true' \
+  "$gate" >"$tampered_dir/gate.json"
+tampered_gate="$tampered_dir/gate.json"
+tampered_sha=$(monday_sha256_file "$tampered_gate")
+tampered_run_sha=$(monday_sha256_file "$tampered_dir/run.json")
+printf '%s  gate.json\n%s  run.json\n' "$tampered_sha" "$tampered_run_sha" \
+  >"$tampered_dir/PASSED.sha256"
+chmod 0440 "$tampered_gate" "$tampered_dir/run.json" "$tampered_dir/PASSED.sha256"
+chmod 0550 "$tampered_dir"
+(cd "$tampered_dir" && sha256sum --check --strict PASSED.sha256 >/dev/null)
+monday_validate_v2_gate "$tampered_gate" direct "$c0" "$tampered_sha"
+if monday_validate_v2_gate_authoritative "$ROOT" "$tampered_gate" direct "$c0" "$tampered_sha"; then
+  printf 'authoritative Gate validation accepted a promoted fixture receipt\n' >&2
+  exit 1
+fi
+# A terminal-looking receipt without its adjacent run.json/marker is audit
+# residue only.  It must not permanently block a fresh Gate for the candidate.
+incomplete_prior_dir="$ROOT/data/monday/evidence/shadow-gates/$c0/$candidate_runtime_sha/runs/20240101T000000Z-2"
+mkdir -p "$incomplete_prior_dir"
+jq '.test_only = false | .production_eligible = true' \
+  "$gate" >"$incomplete_prior_dir/gate.json"
+incomplete_prior_gate="$incomplete_prior_dir/gate.json"
+incomplete_prior_sha=$(monday_sha256_file "$incomplete_prior_gate")
+if monday_validate_v2_gate_authoritative "$ROOT" "$incomplete_prior_gate" direct "$c0" \
+  "$incomplete_prior_sha"; then
+  printf 'authoritative Gate validation accepted an incomplete terminalization\n' >&2
+  exit 1
+fi
+next_gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --root "$ROOT")
+next_gate=$(printf '%s\n' "$next_gate_output" | sed -n 's/^V2 Gate receipt: //p')
+next_gate_sha=$(printf '%s\n' "$next_gate_output" | sed -n 's/^SHA-256: //p')
+[[ -f $next_gate && $next_gate_sha == "$(monday_sha256_file "$next_gate")" ]] || {
+  printf 'incomplete prior Gate receipt blocked a fresh candidate run\n' >&2
+  exit 1
+}
 jq -e '.shadow_staging.aggregate_slice.cgroup
   == ("/" + .shadow_staging.aggregate_slice.name)' "$gate" >/dev/null
 oss_source=$(sed -n '/^run_oss()/,/^verify_oss_roundtrips()/p' \
@@ -847,6 +869,33 @@ if monday_validate_v2_gate "$tampered" direct "$c0" "$tampered_sha"; then
 fi
 if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$tampered" >/dev/null 2>&1; then
   printf 'Gate policy accepted a phase requirement below phase max plus reserve\n' >&2
+  exit 1
+fi
+tampered="$ROOT/tampered-segment-identity.json"
+tampered_data_sha=$(printf 'f%.0s' {1..64})
+jq --arg sha "$tampered_data_sha" '
+    .markets.spot.triplets[1].data_sha256 = $sha
+    | .markets.spot.triplets[1].success_content = ($sha + "\n")' \
+  "$gate" >"$tampered"
+tampered_sha=$(monday_sha256_file "$tampered")
+if monday_validate_v2_gate "$tampered" direct "$c0" "$tampered_sha"; then
+  printf 'Gate validator accepted mismatched local and OSS segment identity\n' >&2
+  exit 1
+fi
+if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$tampered" >/dev/null 2>&1; then
+  printf 'Gate policy accepted mismatched local and OSS segment identity\n' >&2
+  exit 1
+fi
+tampered="$ROOT/tampered-observation-cutoff.json"
+jq '.markets.spot.observation_started_at_ns = .markets.spot.segments[0].end_received_at_ns' \
+  "$gate" >"$tampered"
+tampered_sha=$(monday_sha256_file "$tampered")
+if monday_validate_v2_gate "$tampered" direct "$c0" "$tampered_sha"; then
+  printf 'Gate validator accepted pre-observation segment evidence\n' >&2
+  exit 1
+fi
+if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$tampered" >/dev/null 2>&1; then
+  printf 'Gate policy accepted pre-observation segment evidence\n' >&2
   exit 1
 fi
 tampered="$ROOT/tampered-production-memory.json"
@@ -1066,7 +1115,7 @@ bootstrap_transition_sha=$(printf '%s\n' "$bootstrap_cutover_output" | sed -n 's
 [[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == \
   "$ROOT/opt/monday/releases/binance-lob-archiver/$p0_sha/binance-lob-archiver" ]]
 [[ $(monday_sha256_file "$bootstrap_transition") == "$bootstrap_transition_sha" ]]
-monday_validate_v2_transition "$bootstrap_transition" direct "$c0" "$gate" "$gate_sha"
+monday_validate_v2_transition "$ROOT" "$bootstrap_transition" direct "$c0" "$gate" "$gate_sha"
 bootstrap_calls="$ROOT/run/cutover-fixture.calls"
 for unit in \
   binance-lob-archiver@spot.service binance-lob-archiver@usdm.service \
@@ -1091,9 +1140,9 @@ while IFS= read -r asset; do
     "$ROOT/opt/monday/releases/binance-lob-controller/active/deployment/$asset" ]]
 done < <(monday_runtime_assets)
 
-# PSI calibration alone does not authorize a phase.  If MemAvailable falls
-# between calibration and the fresh Shadow admission, the Gate must reject
-# before systemctl start and leave no candidate writer running.
+# Fresh resource admission must be checked immediately before a phase.  If
+# MemAvailable falls before the Shadow admission, the Gate must reject before
+# systemctl start and leave no candidate writer running.
 rm -f -- "$ROOT/run/gate-fixture.calls"
 if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_FRESH_ADMISSION_FAIL=1 \
   MONDAY_GATE_FIXTURE_RECORD_CALLS=1 MONDAY_ROOT="$ROOT" \
@@ -1125,7 +1174,7 @@ if [[ -f $ROOT/run/gate-fixture.calls ]] && grep -Eq \
 fi
 
 # The asynchronous monitor is a synchronous guard in TEST_ONLY.  A changed
-# production restart identity writes the breach marker and blocks the first
+# production executable identity writes the breach marker and blocks the first
 # phase, so no candidate writer or receipt can be produced.
 rm -f -- "$ROOT/run/gate-fixture.calls"
 if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_IDENTITY_DRIFT=1 \
@@ -1430,7 +1479,7 @@ transition_sha=$(printf '%s\n' "$cutover_output" | sed -n 's/^SHA-256: //p')
 [[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == \
   "$ROOT/opt/monday/releases/binance-lob-archiver/$p1_sha/binance-lob-archiver" ]]
 [[ $(monday_sha256_file "$transition") == "$transition_sha" ]]
-monday_validate_v2_transition "$transition" "$c0" "$c1" "$gate" "$gate_sha"
+monday_validate_v2_transition "$ROOT" "$transition" "$c0" "$c1" "$gate" "$gate_sha"
 jq -e --argjson pid "$fixture_process_pid" \
   '.production_process | .spot.main_pid == $pid and .usdm.main_pid == $pid
    and .spot.process_exe_sha256 == .usdm.process_exe_sha256
@@ -1470,6 +1519,15 @@ if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_TAMPER_OSS=1 MONDAY_ROOT="$RO
   printf 'OSS-tampered Gate unexpectedly succeeded\n' >&2
   exit 1
 fi
+[[ $(monday_active_controller_sha "$ROOT") == "$active_before_failure" ]]
+[[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == "$production_before_failure" ]]
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_TRAILING_UNSAFE=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c1" \
+  --candidate-controller "$c2" --root "$ROOT" >"$ROOT/run/trailing-unsafe.err" 2>&1; then
+  printf 'Gate accepted a trailing replay-unsafe OSS manifest\n' >&2
+  exit 1
+fi
+grep -Fq 'replay-safe manifest ordering failed' "$ROOT/run/trailing-unsafe.err"
 [[ $(monday_active_controller_sha "$ROOT") == "$active_before_failure" ]]
 [[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == "$production_before_failure" ]]
 if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_EXTRA_NESTED=1 MONDAY_ROOT="$ROOT" \
@@ -1919,8 +1977,14 @@ done
 [[ $(readlink -- "$ROOT/opt/monday/bin/binance-lob-archiver-shadow") == "$shadow_link_before_sigkill" ]]
 stale_gate_dir=$(find "$ROOT/run/monday/rust-lob-gate" -mindepth 1 -maxdepth 1 -type d -print -quit)
 [[ -n $stale_gate_dir && -f "$stale_gate_dir/monday-rust-lob-gate-$(basename -- "$stale_gate_dir")-spot.service" ]]
+stale_upload_unit="$stale_gate_dir/monday-rust-lob-gate-$(basename -- "$stale_gate_dir")-spot-upload.service"
+[[ -f $stale_upload_unit ]]
 grep -Fqx 'Restart=no' "$stale_gate_dir/monday-rust-lob-gate-$(basename -- "$stale_gate_dir")-spot.service"
-grep -Fqx 'RuntimeMaxSec=1800' "$stale_gate_dir/monday-rust-lob-gate-$(basename -- "$stale_gate_dir")-spot.service"
+grep -Fqx 'RuntimeMaxSec=900' "$stale_gate_dir/monday-rust-lob-gate-$(basename -- "$stale_gate_dir")-spot.service"
+grep -Fqx 'TimeoutStopSec=60' "$stale_gate_dir/monday-rust-lob-gate-$(basename -- "$stale_gate_dir")-spot.service"
+grep -Fqx 'Restart=no' "$stale_upload_unit"
+grep -Fqx 'RuntimeMaxSec=300' "$stale_upload_unit"
+grep -Fqx 'TimeoutStartSec=300' "$stale_upload_unit"
 stale_run=$(basename -- "$stale_gate_dir")
 [[ -d "$ROOT/data/monday/spool/binance-lob-rust-shadow/gate/$stale_run" ]]
 stale_search_unit="$ROOT/run/systemd/system/monday-rust-lob-gate-${stale_run}-spot.service"
@@ -2262,10 +2326,6 @@ fi
 # The local operator is the only Cloud Assistant entry point. Its dry run must
 # carry an exact controller path and never expose a second routing mode.
 operator="$SCRIPT_DIR/rust-lob-control-plane.sh"
-grep -Fq 'timeout_seconds=3600' "$operator" || {
-  printf 'LOB Gate operator timeout is not capped at 3600 seconds\n' >&2
-  exit 1
-}
 grep -Fq 'timeout_seconds=300' "$operator" || {
   printf 'LOB Gate preflight operator timeout is not capped at 300 seconds\n' >&2
   exit 1
@@ -2277,14 +2337,20 @@ operator_json=$(MONDAY_CONTROL_PLANE_DRY_RUN=1 "$operator" gate \
 jq -e --arg controller "$candidate" \
   '.operation == "gate" and .controller == $controller
    and (.command | contains(("/opt/monday/releases/binance-lob-controller/" + $controller)))
+   and (.command | contains("timeout --signal=TERM --kill-after=240s 2100s"))
    and (.command | contains("--preflight-only") | not)
-   and .preflight_only == false and .production_changed == false' <<<"$operator_json" >/dev/null
+   and .preflight_only == false and .timeout_seconds == 2400
+   and .host_timeout_seconds == 2100 and .host_kill_after_seconds == 240
+   and (.host_timeout_seconds + .host_kill_after_seconds < .timeout_seconds)
+   and .production_changed == false' <<<"$operator_json" >/dev/null
 operator_preflight_json=$(MONDAY_CONTROL_PLANE_DRY_RUN=1 "$operator" gate \
   --instance i-fixture --from-controller "$c1" \
   --candidate-controller "$candidate" --preflight-only)
 jq -e --arg controller "$candidate" \
   '.operation == "gate" and .controller == $controller
-   and .preflight_only == true and .production_changed == false
+   and .preflight_only == true and .timeout_seconds == 300
+   and .host_timeout_seconds == 0 and .host_kill_after_seconds == 0
+   and .production_changed == false
    and (.command | contains(("/opt/monday/releases/binance-lob-controller/" + $controller)))
    and (.command | contains("--preflight-only"))' \
   <<<"$operator_preflight_json" >/dev/null
