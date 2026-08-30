@@ -67,6 +67,48 @@ gate_publish_dir_line=$(grep -nF "mv -- \"\$evidence_dir\" \"\$final_evidence_di
   printf 'Gate evidence is not fully protected before atomic directory publication\n' >&2
   exit 1
 }
+
+# Recovery authority must cross a durability barrier before active=C1, and
+# Gate-bearing success evidence must be durable before that authority is
+# removed.  Readback alone proves bytes, not power-loss ordering.
+cutover_script="$SCRIPT_DIR/host-rust-lob-cutover.sh"
+restore_script="$SCRIPT_DIR/host-rust-lob-restore.sh"
+cutover_intent_flush_line=$(grep -nF "could not durably flush cutover recovery intent" "$cutover_script" | cut -d: -f1)
+cutover_intent_commit_line=$(grep -nF "could not durably commit cutover recovery intent" "$cutover_script" | cut -d: -f1)
+cutover_active_line=$(grep -nF "monday_atomic_symlink \"\$target_release\" \"\$active_link\"" "$cutover_script" | cut -d: -f1)
+cutover_active_sync_line=$(grep -nF "could not durably commit active controller switch" "$cutover_script" | cut -d: -f1)
+cutover_active_crash_line=$(grep -nF 'MONDAY_CUTOVER_HARD_CRASH_AFTER_ACTIVE:-' "$cutover_script" | cut -d: -f1)
+cutover_transition_flush_line=$(grep -nF "could not durably flush transition receipt" "$cutover_script" | cut -d: -f1)
+cutover_transition_commit_line=$(grep -nF "could not durably commit transition digest" "$cutover_script" | cut -d: -f1)
+cutover_transition_crash_line=$(grep -nF 'MONDAY_CUTOVER_HARD_CRASH_AFTER_TRANSITION_RECEIPT' "$cutover_script" | cut -d: -f1)
+cutover_intent_clear_line=$(grep -nF "could not clear committed cutover recovery intent" "$cutover_script" | tail -n1 | cut -d: -f1)
+restore_receipt_flush_line=$(grep -nF "could not durably flush restore receipt'" "$restore_script" | cut -d: -f1)
+restore_receipt_commit_line=$(grep -nF "could not durably commit restore receipt digest" "$restore_script" | cut -d: -f1)
+restore_receipt_crash_line=$(grep -nF 'MONDAY_RESTORE_HARD_CRASH_AFTER_RECEIPT' "$restore_script" | cut -d: -f1)
+restore_intent_clear_line=$(grep -nF "could not clear committed restore recovery intent" "$restore_script" | tail -n1 | cut -d: -f1)
+[[ $cutover_intent_flush_line =~ ^[0-9]+$ && $cutover_intent_commit_line =~ ^[0-9]+$ \
+  && $cutover_active_line =~ ^[0-9]+$ && $cutover_active_sync_line =~ ^[0-9]+$ && $cutover_active_crash_line =~ ^[0-9]+$ \
+  && $cutover_transition_flush_line =~ ^[0-9]+$ && $cutover_transition_commit_line =~ ^[0-9]+$ && $cutover_transition_crash_line =~ ^[0-9]+$ \
+  && $cutover_intent_clear_line =~ ^[0-9]+$ && $restore_receipt_flush_line =~ ^[0-9]+$ \
+  && $restore_receipt_commit_line =~ ^[0-9]+$ && $restore_receipt_crash_line =~ ^[0-9]+$ && $restore_intent_clear_line =~ ^[0-9]+$ \
+  && $cutover_intent_flush_line -lt $cutover_intent_commit_line \
+  && $cutover_intent_commit_line -lt $cutover_active_line \
+  && $cutover_active_line -lt $cutover_active_sync_line \
+  && $cutover_active_sync_line -lt $cutover_active_crash_line \
+  && $cutover_transition_flush_line -lt $cutover_transition_commit_line \
+  && $cutover_transition_commit_line -lt $cutover_transition_crash_line \
+  && $cutover_transition_crash_line -lt $cutover_intent_clear_line \
+  && $restore_receipt_flush_line -lt $restore_receipt_commit_line \
+  && $restore_receipt_commit_line -lt $restore_receipt_crash_line \
+  && $restore_receipt_crash_line -lt $restore_intent_clear_line ]] || {
+  printf 'cutover/restore evidence can cross a power-loss boundary before its authority is durable\n' >&2
+  exit 1
+}
+cutover_cleanup_source=$(sed -n '/^cleanup() {$/,/^}$/p' "$cutover_script")
+if grep -Fq "rm -f -- \"\$recovery_intent\"" <<<"$cutover_cleanup_source"; then
+  printf 'failed cutover cleanup can clear durable recovery authority\n' >&2
+  exit 1
+fi
 grep -Fqx 'MemoryHigh=1792M' "$SCRIPT_DIR/binance-lob-archiver-rust@.service" || {
   printf 'shadow MemoryHigh is not 1792M\n' >&2
   exit 1
@@ -403,10 +445,10 @@ cp -p -- "$legacy_work/deployment/host-rust-lob-recovery-queue.sh" \
 cp -p -- "$legacy_work/deployment/monday-collector-health.sh" \
   "$ROOT/opt/monday/bin/monday-collector-health.sh"
 
-# Bootstrap uses an explicit direct before topology and requires P1 == P0;
-# the candidate runtime is R2, while the live legacy topology is R0.
-ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p0_sha/binance-lob-archiver" \
-  "$ROOT/opt/monday/bin/binance-lob-archiver"
+# Bootstrap uses an explicit direct before topology.  The live legacy P0/R0
+# stays frozen until Cutover while the candidate may carry a new P1/R1.
+legacy_production_projection="../releases/binance-lob-archiver/$p0_sha/binance-lob-archiver"
+ln -s "$legacy_production_projection" "$ROOT/opt/monday/bin/binance-lob-archiver"
 # Live runtime digesting is read-only: even with a nonexistent TMPDIR, the
 # canonical v1 asset order and digest must match the fixture's recorded R0.
 runtime_tmpdir_guard="$ROOT/nonexistent-runtime-tmp"
@@ -479,6 +521,23 @@ jq -e --arg runtime "$candidate_runtime_sha" \
      and .checks.runtime_contract and .checks.installed_bytes
      and .checks.production_cgroup and .checks.psi_sampler)' \
   <<<"$preflight_output" >/dev/null
+# A direct v1 -> V2 migration must be able to Gate a new payload while the
+# immutable legacy payload keeps running until Cutover.
+[[ $p0_sha != "$p1_sha" ]]
+if ! payload_delta_preflight=$(TMPDIR="$preflight_tmpdir_guard" \
+  MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c1" --preflight-only --root "$ROOT" 2>&1); then
+  printf '%s\n' "$payload_delta_preflight" >&2
+  printf 'read-only preflight rejected a direct payload transition\n' >&2
+  exit 1
+fi
+jq -e --arg from "$legacy_c0" --arg before "$p0_sha" --arg candidate "$p1_sha" \
+  '.from_controller_sha256 == $from
+   and .candidate_payload_sha256 == $candidate
+   and all(.production_cgroup_snapshot.children[];
+     .process_exe_sha256 == $before)
+   and .production_changed == false' <<<"$payload_delta_preflight" >/dev/null
 [[ ! -e "$preflight_tmpdir_guard" ]] || {
   printf 'read-only preflight created a temporary directory\n' >&2
   exit 1
@@ -522,11 +581,22 @@ runtime_delta_envs=(
   "$ROOT/etc/monday/binance-lob-archiver-rust-spot.env"
   "$ROOT/etc/monday/binance-lob-archiver-rust-usdm.env"
 )
+write_legacy_runtime_delta() {
+  local source=$1 target=$2
+  case ${target##*/} in
+    binance-lob-archiver-production-spot.env)
+      sed -e 's/^SEGMENT_SECONDS=.*/SEGMENT_SECONDS=3600/' \
+        -e 's|^SPOOL_DIR=.*|SPOOL_DIR=/data/monday/spool/binance-lob-v1/spot|' "$source" >"$target" ;;
+    binance-lob-archiver-production-usdm.env)
+      sed -e 's/^SEGMENT_SECONDS=.*/SEGMENT_SECONDS=3600/' \
+        -e 's|^SPOOL_DIR=.*|SPOOL_DIR=/data/monday/spool/binance-lob-v1/usdm|' "$source" >"$target" ;;
+    *) sed 's/^SEGMENT_SECONDS=.*/SEGMENT_SECONDS=3600/' "$source" >"$target" ;;
+  esac
+}
 for runtime_env in "${runtime_delta_envs[@]}"; do
   cp -p -- "$runtime_env" "$runtime_env.before-direct-delta"
   chmod u+w "$runtime_env"
-  sed 's/^SEGMENT_SECONDS=.*/SEGMENT_SECONDS=3600/' \
-    "$runtime_env.before-direct-delta" >"$runtime_env"
+  write_legacy_runtime_delta "$runtime_env.before-direct-delta" "$runtime_env"
 done
 legacy_delta_runtime=$(monday_rust_lob_live_runtime_contract_sha256_v1 "$ROOT")
 [[ $legacy_delta_runtime != "$candidate_runtime_sha" ]]
@@ -670,17 +740,29 @@ fi
   printf 'lock-contention preflight invoked a mutating systemd action\n' >&2
   exit 1
 }
-# A failed identity check must fail before any write as well.  c1 carries a
-# different payload than the direct legacy production P0 and is rejected
-# before preflight sampling or any run-scoped setup.
+# A failed identity check must fail before any write as well.  Point production
+# at bytes that differ from immutable legacy C0, then restore the exact link.
 preflight_residue_before=$preflight_residue_after
+direct_production="$ROOT/opt/monday/bin/binance-lob-archiver"
+direct_production_before=$(readlink -- "$direct_production")
+rm -f -- "$direct_production"
+ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p1_sha/binance-lob-archiver" \
+  "$direct_production"
+identity_preflight_succeeded=false
 if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
   --candidate-controller "$c1" --preflight-only --root "$ROOT" \
-  >/dev/null 2>"$ROOT/run/preflight-failure.err"; then
-  printf 'read-only preflight accepted a mismatched direct payload\n' >&2
+  >"$ROOT/run/preflight-failure.err" 2>&1; then
+  identity_preflight_succeeded=true
+fi
+rm -f -- "$direct_production"
+ln -s "$direct_production_before" "$direct_production"
+if [[ $identity_preflight_succeeded == true ]]; then
+  printf 'read-only preflight accepted production bytes outside legacy C0\n' >&2
   exit 1
 fi
+grep -Fq 'direct bootstrap requires an immutable v1 active controller' \
+  "$ROOT/run/preflight-failure.err"
 preflight_residue_after=$(find "$ROOT/data/monday/spool/binance-lob-rust-shadow" \
   "$ROOT/data/monday/evidence/shadow-gates" "$ROOT/run/monday/rust-lob-gate" \
   "$ROOT/run/systemd/system" -mindepth 1 -print 2>/dev/null | LC_ALL=C sort || true)
@@ -688,6 +770,325 @@ preflight_residue_after=$(find "$ROOT/data/monday/spool/binance-lob-rust-shadow"
   printf 'failed read-only preflight left run-scoped residue\n' >&2
   exit 1
 }
+
+# A different candidate payload and runtime must remain recoverable through the
+# direct Cutover boundary.  Reinstall the distinct legacy cadence and bind it to
+# its immutable C0 before producing the Gate used by this crash transition.
+for runtime_env in "${runtime_delta_envs[@]}"; do
+  cp -p -- "$runtime_env" "$runtime_env.before-payload-delta"
+  chmod u+w "$runtime_env"
+  write_legacy_runtime_delta "$runtime_env.before-payload-delta" "$runtime_env"
+done
+rm -f -- "$legacy_root/active"
+ln -s "$legacy_root/$legacy_delta_c0" "$legacy_root/active"
+[[ $(monday_rust_lob_live_runtime_contract_sha256_v1 "$ROOT") == "$legacy_delta_runtime" ]]
+# SIGKILL after the recovery intent but before active=C1 must leave C0/P0/R0
+# frozen and permit one identical retry.  The retry is then killed immediately
+# after active=C1; Restore must converge that authorized intermediate state to
+# C1/P1/R1 without guessing another Gate, payload, or runtime.
+if ! payload_delta_gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  bash -c '
+    root=$1; shift
+    mkdir -p "$root/proc/$$"
+    printf "1 fixture S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 4242\\n" >"$root/proc/$$/stat"
+    printf "%s\\n" "$$" >"$root/run/payload-delta-gate.pid"
+    exec "$@"
+  ' _ "$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
+  --from-controller direct --candidate-controller "$c1" --root "$ROOT" 2>&1); then
+  printf '%s\n' "$payload_delta_gate_output" >&2
+  printf 'formal Gate rejected a direct payload transition\n' >&2
+  exit 1
+fi
+payload_delta_gate_pid=$(cat "$ROOT/run/payload-delta-gate.pid")
+rm -rf -- "$ROOT/proc/$payload_delta_gate_pid" "$ROOT/run/payload-delta-gate.pid"
+payload_delta_gate=$(printf '%s\n' "$payload_delta_gate_output" | sed -n 's/^V2 Gate receipt: //p')
+payload_delta_gate_sha=$(printf '%s\n' "$payload_delta_gate_output" | sed -n 's/^SHA-256: //p')
+monday_validate_v2_gate "$payload_delta_gate" direct "$c1" "$payload_delta_gate_sha"
+rm -f -- "$ROOT/run/cutover-fixture.calls"
+payload_delta_recovery="$ROOT/data/monday/evidence/cutovers/$c1/recovery.json"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
+  MONDAY_CUTOVER_FIXTURE_LEGACY_ACTIVE=1 MONDAY_CUTOVER_HARD_CRASH_AFTER_RECOVERY_INTENT=1 \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-cutover.sh" \
+  --from direct --to "$c1" --gate-receipt "$payload_delta_gate" \
+  --gate-sha256 "$payload_delta_gate_sha" --root "$ROOT" \
+  >"$ROOT/run/payload-delta-precommit.err" 2>&1; then
+  printf 'pre-commit direct payload transition unexpectedly survived SIGKILL\n' >&2
+  exit 1
+fi
+[[ $(monday_active_controller_sha "$ROOT") == "$legacy_delta_c0" ]]
+[[ $(readlink -- "$direct_production") == "$direct_production_before" ]]
+[[ $(monday_rust_lob_live_runtime_contract_sha256_v1 "$ROOT") == "$legacy_delta_runtime" ]]
+if [[ ! -f $payload_delta_recovery || -L $payload_delta_recovery ]]; then
+  printf 'pre-commit hard crash did not preserve its recovery intent\n' >&2
+  exit 1
+fi
+payload_delta_recovery_sha=$(monday_sha256_file "$payload_delta_recovery")
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
+  MONDAY_CUTOVER_FIXTURE_LEGACY_ACTIVE=1 MONDAY_CUTOVER_HARD_CRASH_AFTER_ACTIVE=1 \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-cutover.sh" \
+  --from direct --to "$c1" --gate-receipt "$payload_delta_gate" \
+  --gate-sha256 "$payload_delta_gate_sha" --root "$ROOT" \
+  >"$ROOT/run/payload-delta-cutover.err" 2>&1; then
+  printf 'hard-crash direct payload transition unexpectedly survived SIGKILL\n' >&2
+  exit 1
+fi
+[[ $(monday_active_controller_sha "$ROOT") == "$c1" ]]
+[[ $(readlink -- "$direct_production") == "$direct_production_before" ]]
+[[ $(monday_rust_lob_live_runtime_contract_sha256_v1 "$ROOT") == "$legacy_delta_runtime" ]]
+if [[ ! -f $payload_delta_recovery || -L $payload_delta_recovery ]]; then
+  cat "$ROOT/run/payload-delta-cutover.err" >&2
+  printf 'hard-crash cutover did not preserve its recovery intent\n' >&2
+  exit 1
+fi
+[[ $(monday_sha256_file "$payload_delta_recovery") == "$payload_delta_recovery_sha" ]]
+payload_delta_restore_receipt="$ROOT/data/monday/evidence/restores/$c1/restore.json"
+payload_delta_restore_marker="$payload_delta_restore_receipt.sha256"
+payload_delta_restore_stop="$ROOT/run/payload-delta-restore-health.stop"
+write_payload_delta_restore_health() {
+  local session_prefix=$1 observed market symbols dataset
+  while [[ ! -e "$ROOT/run/restore-fixture-start-spot" ]]; do
+    [[ -e $payload_delta_restore_stop ]] && return 0
+    sleep 0.05
+  done
+  while [[ ! -e $payload_delta_restore_stop ]]; do
+    observed=$(date +%s%N)
+    for market in spot usdm; do
+      symbols=1000; dataset=spot_all
+      [[ $market == usdm ]] && symbols=100 && dataset=usdm_perpetual_top100_lob
+      jq -cn --arg market "$market" --arg dataset "$dataset" \
+        --arg session "$session_prefix-$market" --argjson symbols "$symbols" \
+        --argjson observed "$observed" '
+          {market:$market,dataset:$dataset,status:"synced",sequence_gaps:0,
+           symbol_count:$symbols,snapshot_ready_count:$symbols,bridged_count:$symbols,
+           stream_coverage_verified_count:$symbols,snapshot_only_symbols:[],
+           all_symbols_bridged:true,all_stream_coverage_verified:true,
+           full_stream_coverage_verified:true,pending_upload_segments:0,
+           queue_saturated:false,disk_warning:false,upload_warning:false,
+           session_id:$session,updated_at_ns:$observed}
+        ' >"$production_spool_root/$market/health.json.tmp"
+      mv -f -- "$production_spool_root/$market/health.json.tmp" \
+        "$production_spool_root/$market/health.json"
+    done
+    sleep 0.05
+  done
+}
+payload_delta_restore_pid_before=5151
+mkdir -p "$ROOT/proc/$payload_delta_restore_pid_before"
+ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p1_sha/binance-lob-archiver" \
+  "$ROOT/proc/$payload_delta_restore_pid_before/exe"
+rm -f -- "$payload_delta_restore_stop" "$ROOT/run/restore-fixture-start-spot" \
+  "$ROOT/run/restore-fixture-start-usdm" "$production_spool_root/spot/health.json" \
+  "$production_spool_root/usdm/health.json"
+(write_payload_delta_restore_health restore-reboot-before) &
+payload_delta_restore_writer=$!
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_RESTORE_FIXTURE_SYSTEMD=1 \
+  MONDAY_RESTORE_FIXTURE_PID="$payload_delta_restore_pid_before" \
+  MONDAY_RESTORE_HEALTH_TIMEOUT_SECONDS=3 MONDAY_RESTORE_FAIL_AFTER_RECEIPT=1 \
+  MONDAY_RESTORE_HARD_CRASH_AFTER_DIGEST_CLEANUP=1 \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-restore.sh" \
+  --controller "$c1" --root "$ROOT" >"$ROOT/run/payload-delta-restore.err" 2>&1; then
+  printf 'post-receipt cleanup unexpectedly survived SIGKILL\n' >&2
+  exit 1
+fi
+: >"$payload_delta_restore_stop"
+wait "$payload_delta_restore_writer"
+[[ -f $payload_delta_recovery && ! -L $payload_delta_recovery ]]
+[[ -f $payload_delta_restore_receipt && ! -L $payload_delta_restore_receipt ]]
+[[ ! -e $payload_delta_restore_marker && ! -L $payload_delta_restore_marker ]]
+jq -e --arg gate "$payload_delta_gate" --arg gate_sha "$payload_delta_gate_sha" '
+  .transition_receipt == null
+  and .gate_receipt == $gate and .gate_sha256 == $gate_sha
+' "$payload_delta_restore_receipt" >/dev/null
+payload_delta_restore_receipt_before=$(monday_sha256_file "$payload_delta_restore_receipt")
+payload_delta_restore_pid_after=5152
+mkdir -p "$ROOT/proc/$payload_delta_restore_pid_after"
+ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p1_sha/binance-lob-archiver" \
+  "$ROOT/proc/$payload_delta_restore_pid_after/exe"
+rm -f -- "$payload_delta_restore_stop" "$ROOT/run/restore-fixture-start-spot" \
+  "$ROOT/run/restore-fixture-start-usdm"
+(write_payload_delta_restore_health restore-reboot-after) &
+payload_delta_restore_writer=$!
+if ! payload_delta_restore_output=$(MONDAY_CONTROL_PLANE_TEST=1 \
+  MONDAY_RESTORE_FIXTURE_SYSTEMD=1 MONDAY_RESTORE_FIXTURE_PID="$payload_delta_restore_pid_after" \
+  MONDAY_RESTORE_HEALTH_TIMEOUT_SECONDS=3 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c1" --root "$ROOT" 2>&1); then
+  : >"$payload_delta_restore_stop"
+  wait "$payload_delta_restore_writer"
+  printf '%s\n' "$payload_delta_restore_output" >&2
+  printf 'Restore rejected post-receipt recovery after a host reboot\n' >&2
+  exit 1
+fi
+: >"$payload_delta_restore_stop"
+wait "$payload_delta_restore_writer"
+grep -Fq 'Pair restore recovery complete' <<<"$payload_delta_restore_output"
+[[ $(monday_sha256_file "$payload_delta_restore_receipt") == "$payload_delta_restore_receipt_before" ]]
+[[ -f $payload_delta_restore_marker && ! -L $payload_delta_restore_marker ]]
+payload_delta_restore_sha=$(awk '$2 == "restore.json" { count++; value=$1 } END { if (count != 1) exit 1; print value }' \
+  "$payload_delta_restore_marker")
+[[ $(monday_sha256_file "$payload_delta_restore_receipt") == "$payload_delta_restore_sha" ]]
+jq -e --argjson old_pid "$payload_delta_restore_pid_before" \
+  '.process_identity.spot.main_pid == $old_pid and .process_identity.usdm.main_pid == $old_pid' \
+  "$payload_delta_restore_receipt" >/dev/null
+jq -e '.session_id == "restore-reboot-after-spot"' \
+  "$production_spool_root/spot/health.json" >/dev/null
+[[ $(readlink -- "$direct_production") == \
+  "$ROOT/opt/monday/releases/binance-lob-controller/active/binance-lob-archiver" ]]
+[[ $(readlink -f -- "$direct_production") == \
+  "$ROOT/opt/monday/releases/binance-lob-archiver/$p1_sha/binance-lob-archiver" ]]
+for asset in $(monday_runtime_assets); do
+  target=$(monday_runtime_asset_target "$ROOT" "$asset")
+  [[ -L $target && $(readlink -- "$target") == \
+    "$ROOT/opt/monday/releases/binance-lob-controller/active/deployment/$asset" ]]
+done
+[[ $(monday_rust_lob_live_runtime_contract_sha256 "$ROOT") == "$candidate_runtime_sha" ]]
+[[ ! -e $payload_delta_recovery ]]
+jq -e --arg gate "$payload_delta_gate" --arg gate_sha "$payload_delta_gate_sha" '
+  .transition_receipt == null
+  and .gate_receipt == $gate and .gate_sha256 == $gate_sha
+' "$payload_delta_restore_receipt" >/dev/null
+# The completed recovery is immediately idempotent even though its immutable
+# receipt records the pre-reboot process.  The read-only check accepts the
+# independently verified replacement process/session and performs no writes.
+payload_delta_restore_calls="$ROOT/run/restore-fixture.calls"
+payload_delta_restore_calls_sha=$(monday_sha256_file "$payload_delta_restore_calls")
+payload_delta_restore_readonly=$(MONDAY_CONTROL_PLANE_TEST=1 \
+  MONDAY_RESTORE_FIXTURE_SYSTEMD=1 MONDAY_RESTORE_FIXTURE_PID="$payload_delta_restore_pid_after" \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-restore.sh" \
+  --controller "$c1" --root "$ROOT")
+grep -Fq 'Pair restore already complete (read-only)' <<<"$payload_delta_restore_readonly"
+[[ $(monday_sha256_file "$payload_delta_restore_calls") == "$payload_delta_restore_calls_sha" ]]
+[[ $(monday_sha256_file "$payload_delta_restore_receipt") == "$payload_delta_restore_receipt_before" ]]
+[[ $(monday_sha256_file "$payload_delta_restore_receipt") == "$payload_delta_restore_sha" ]]
+# A second reboot must not reuse the previous boot's healthy file before the
+# current PID publishes.  Once a new sample crosses the current process start
+# lower bound, the same immutable receipt is read-only idempotent again.
+payload_delta_restore_pid_second_reboot=5153
+mkdir -p "$ROOT/proc/$payload_delta_restore_pid_second_reboot"
+ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p1_sha/binance-lob-archiver" \
+  "$ROOT/proc/$payload_delta_restore_pid_second_reboot/exe"
+payload_delta_second_reboot_started_ns=$(date +%s%N)
+payload_delta_previous_health_ns=$(jq -er '.updated_at_ns' \
+  "$production_spool_root/spot/health.json")
+(( payload_delta_previous_health_ns < payload_delta_second_reboot_started_ns ))
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_RESTORE_FIXTURE_SYSTEMD=1 \
+  MONDAY_RESTORE_FIXTURE_PID="$payload_delta_restore_pid_second_reboot" \
+  MONDAY_RESTORE_FIXTURE_PROCESS_STARTED_NS="$payload_delta_second_reboot_started_ns" \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-restore.sh" \
+  --controller "$c1" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'read-only Restore accepted health from the previous boot\n' >&2
+  exit 1
+fi
+[[ $(monday_sha256_file "$payload_delta_restore_calls") == "$payload_delta_restore_calls_sha" ]]
+rm -f -- "$payload_delta_restore_stop"
+(write_payload_delta_restore_health restore-second-reboot) &
+payload_delta_restore_writer=$!
+for _ in {1..60}; do
+  [[ $(jq -r '.session_id // empty' "$production_spool_root/spot/health.json" 2>/dev/null) \
+    == restore-second-reboot-spot ]] && break
+  sleep 0.05
+done
+[[ $(jq -r '.session_id // empty' "$production_spool_root/spot/health.json") \
+  == restore-second-reboot-spot ]]
+payload_delta_second_readonly=$(MONDAY_CONTROL_PLANE_TEST=1 \
+  MONDAY_RESTORE_FIXTURE_SYSTEMD=1 \
+  MONDAY_RESTORE_FIXTURE_PID="$payload_delta_restore_pid_second_reboot" \
+  MONDAY_RESTORE_FIXTURE_PROCESS_STARTED_NS="$payload_delta_second_reboot_started_ns" \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-restore.sh" \
+  --controller "$c1" --root "$ROOT")
+: >"$payload_delta_restore_stop"
+wait "$payload_delta_restore_writer"
+grep -Fq 'Pair restore already complete (read-only)' <<<"$payload_delta_second_readonly"
+[[ $(monday_sha256_file "$payload_delta_restore_calls") == "$payload_delta_restore_calls_sha" ]]
+[[ $(monday_sha256_file "$payload_delta_restore_receipt") == "$payload_delta_restore_receipt_before" ]]
+
+# Reset the same immutable C0/P0/R0, then fail only after transition.json and
+# its digest have both passed readback.  Cleanup must preserve that committed
+# authority and active C1 instead of rolling back after recovery deletion starts.
+rm -rf -- "$ROOT/data/monday/evidence/restores/$c1"
+rm -f -- "$ROOT/opt/monday/releases/binance-lob-controller/active"
+ln -s "$legacy_root/$legacy_delta_c0" "$ROOT/opt/monday/releases/binance-lob-controller/active"
+rm -f -- "$direct_production"
+ln -s "$direct_production_before" "$direct_production"
+rm -f -- "$(monday_runtime_asset_target "$ROOT" "$production_slice_asset")"
+while IFS= read -r asset; do
+  [[ $asset == "$production_slice_asset" ]] && continue
+  target=$(monday_runtime_asset_target "$ROOT" "$asset")
+  rm -f -- "$target"
+  cp -p -- "$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/$asset" "$target"
+done < <(monday_runtime_assets)
+for runtime_env in "${runtime_delta_envs[@]}"; do
+  chmod u+w "$runtime_env"
+  write_legacy_runtime_delta "$runtime_env.before-payload-delta" "$runtime_env"
+done
+while IFS= read -r asset; do
+  target=$(monday_controller_projection_target "$ROOT" "$asset")
+  rm -f -- "$target"
+  cp -p -- "$legacy_root/$legacy_c0/deployment/$asset" "$target"
+done < <(monday_controller_projection_assets)
+[[ $(monday_rust_lob_live_runtime_contract_sha256_v1 "$ROOT") == "$legacy_delta_runtime" ]]
+
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
+  MONDAY_CUTOVER_FIXTURE_LEGACY_ACTIVE=1 MONDAY_CUTOVER_FAIL_AFTER_TRANSITION_COMMIT=1 \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-cutover.sh" \
+  --from direct --to "$c1" --gate-receipt "$payload_delta_gate" \
+  --gate-sha256 "$payload_delta_gate_sha" --root "$ROOT" \
+  >"$ROOT/run/payload-delta-transition.err" 2>&1; then
+  printf 'post-commit direct payload transition unexpectedly succeeded\n' >&2
+  exit 1
+fi
+payload_delta_transition="$ROOT/data/monday/evidence/cutovers/$c1/transition.json"
+payload_delta_transition_marker="$payload_delta_transition.sha256"
+[[ -f $payload_delta_transition && ! -L $payload_delta_transition ]]
+[[ -f $payload_delta_transition_marker && ! -L $payload_delta_transition_marker ]]
+[[ -f $payload_delta_recovery && ! -L $payload_delta_recovery ]]
+payload_delta_transition_sha=$(awk '$2 == "transition.json" { count++; value=$1 } END { if (count != 1) exit 1; print value }' \
+  "$payload_delta_transition_marker")
+[[ $(monday_sha256_file "$payload_delta_transition") == "$payload_delta_transition_sha" ]]
+monday_validate_v2_transition "$ROOT" "$payload_delta_transition" direct "$c1" \
+  "$payload_delta_gate" "$payload_delta_gate_sha"
+[[ $(monday_active_controller_sha "$ROOT") == "$c1" ]]
+[[ $(monday_rust_lob_live_runtime_contract_sha256 "$ROOT") == "$candidate_runtime_sha" ]]
+# Model the narrower receipt-before-digest power-loss point.  The same durable
+# intent must let Restore reconstruct the exact digest before clearing itself.
+rm -f -- "$payload_delta_transition_marker"
+MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c1" --root "$ROOT" >/dev/null
+[[ ! -e $payload_delta_recovery ]]
+[[ -f $payload_delta_transition_marker && ! -L $payload_delta_transition_marker ]]
+[[ $(awk '$2 == "transition.json" { count++; value=$1 } END { if (count != 1) exit 1; print value }' \
+  "$payload_delta_transition_marker") == "$payload_delta_transition_sha" ]]
+payload_delta_restore_receipt="$ROOT/data/monday/evidence/restores/$c1/restore.json"
+jq -e --arg transition "$payload_delta_transition" \
+  --arg gate "$payload_delta_gate" --arg gate_sha "$payload_delta_gate_sha" '
+    .transition_receipt == $transition
+    and .gate_receipt == $gate and .gate_sha256 == $gate_sha
+  ' "$payload_delta_restore_receipt" >/dev/null
+
+# Return to the immutable legacy pair so the remaining direct-bootstrap
+# rejection and ordinary success cases keep their original starting state.
+rm -rf -- "$ROOT/data/monday/evidence/restores/$c1"
+rm -rf -- "$ROOT/data/monday/evidence/cutovers/$c1"
+rm -f -- "$ROOT/opt/monday/releases/binance-lob-controller/active"
+ln -s "$legacy_root/$legacy_c0" "$ROOT/opt/monday/releases/binance-lob-controller/active"
+rm -f -- "$direct_production"
+ln -s "$direct_production_before" "$direct_production"
+rm -f -- "$(monday_runtime_asset_target "$ROOT" "$production_slice_asset")"
+while IFS= read -r asset; do
+  [[ $asset == "$production_slice_asset" ]] && continue
+  target=$(monday_runtime_asset_target "$ROOT" "$asset")
+  rm -f -- "$target"
+  cp -p -- "$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/$asset" "$target"
+done < <(monday_runtime_assets)
+while IFS= read -r asset; do
+  target=$(monday_controller_projection_target "$ROOT" "$asset")
+  rm -f -- "$target"
+  cp -p -- "$legacy_root/$legacy_c0/deployment/$asset" "$target"
+done < <(monday_controller_projection_assets)
+for runtime_env in "${runtime_delta_envs[@]}"; do
+  rm -f -- "$runtime_env.before-payload-delta"
+done
+rm -rf -- "$(dirname -- "$payload_delta_gate")"
+rm -f -- "$ROOT/run/cutover-fixture.calls"
 
 # (d) A resource monitor breach must return to its caller so EXIT cleanup can
 # remove every run-scoped writer path without changing production.
@@ -1073,17 +1474,27 @@ if monday_verify_production_runtime_assets "$ROOT" "$production_verify_dir" "$p0
   exit 1
 fi
 
-# A hard stop immediately after active=C1 must leave that one commit as the
-# recovery source.  Restore then establishes every stable projection from C1;
-# no receipt or guessed previous state is needed.  Rebuild the direct legacy
-# topology afterwards so the normal bootstrap path remains covered below.
-if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_HARD_CRASH_AFTER_ACTIVE=1 MONDAY_ROOT="$ROOT" \
+# Failed bootstrap cleanup must durably restore the raw C0/P0/R0 topology and
+# remove partial evidence before active rolls back.  A hard stop immediately
+# after that last rollback therefore leaves a complete C0 that accepts the one
+# identical retry, not a mixed topology that requires guessed recovery.
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FAIL_AFTER_ACTIVE=1 \
+  MONDAY_CUTOVER_HARD_CRASH_AFTER_ACTIVE_ROLLBACK=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from direct --to "$c0" \
   --gate-receipt "$gate" --gate-sha256 "$gate_sha" --root "$ROOT" >/dev/null 2>&1; then
-  printf 'hard-crash cutover unexpectedly survived SIGKILL\n' >&2
+  printf 'post-rollback hard-crash cutover unexpectedly survived SIGKILL\n' >&2
   exit 1
 fi
-[[ $(monday_active_controller_sha "$ROOT") == "$c0" ]]
+[[ $(monday_active_controller_sha "$ROOT") == "$legacy_c0" ]]
+legacy_hard_crash_recovery="$ROOT/data/monday/evidence/cutovers/$c0/recovery.json"
+if [[ ! -f $legacy_hard_crash_recovery || -L $legacy_hard_crash_recovery ]]; then
+  printf 'same-payload hard crash did not preserve its recovery intent\n' >&2
+  exit 1
+fi
+if [[ ! -L $ROOT/opt/monday/bin/binance-lob-archiver ]]; then
+  printf 'same-payload hard crash removed the direct production projection\n' >&2
+  exit 1
+fi
 for asset in binance-lob-archiver-rust-spot.env binance-lob-archiver-rust-usdm.env; do
   [[ -f "$(monday_runtime_asset_target "$ROOT" "$asset")" && ! -L "$(monday_runtime_asset_target "$ROOT" "$asset")" ]]
 done
@@ -1093,19 +1504,32 @@ for asset in host-rust-lob-recovery-queue.sh monday-collector-health.sh; do
   [[ -f $target && ! -L $target ]]
   [[ $(monday_sha256_file "$target") != "$(monday_sha256_file "$active_asset")" ]]
 done
-MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
-  "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c0" --root "$ROOT" >/dev/null
-for asset in host-rust-lob-recovery-queue.sh monday-collector-health.sh; do
-  target=$(monday_controller_projection_target "$ROOT" "$asset")
-  expected="$ROOT/opt/monday/releases/binance-lob-controller/active/deployment/$asset"
-  [[ -L $target && $(readlink -- "$target") == "$expected" ]]
-  cmp -s "$(readlink -f -- "$target")" "$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/$asset"
-done
+refreshed_gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  bash -c '
+    root=$1; shift
+    mkdir -p "$root/proc/$$"
+    printf "1 fixture S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 4242\\n" >"$root/proc/$$/stat"
+    printf "%s\\n" "$$" >"$root/run/refreshed-direct-gate.pid"
+    exec "$@"
+  ' _ "$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
+  --from-controller direct --candidate-controller "$c0" --root "$ROOT")
+refreshed_direct_gate_pid=$(cat "$ROOT/run/refreshed-direct-gate.pid")
+rm -rf -- "$ROOT/proc/$refreshed_direct_gate_pid" "$ROOT/run/refreshed-direct-gate.pid"
+refreshed_gate=$(printf '%s\n' "$refreshed_gate_output" | sed -n 's/^V2 Gate receipt: //p')
+refreshed_gate_sha=$(printf '%s\n' "$refreshed_gate_output" | sed -n 's/^SHA-256: //p')
+[[ $refreshed_gate != "$gate" && $refreshed_gate_sha != "$gate_sha" ]]
+monday_validate_v2_gate_authoritative "$ROOT" "$refreshed_gate" direct "$c0" "$refreshed_gate_sha"
+hard_crash_retry_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from direct --to "$c0" \
+  --gate-receipt "$refreshed_gate" --gate-sha256 "$refreshed_gate_sha" --root "$ROOT")
+grep -Fq 'Pair cutover complete' <<<"$hard_crash_retry_output"
+[[ $(monday_active_controller_sha "$ROOT") == "$c0" ]]
+[[ ! -e $legacy_hard_crash_recovery && ! -L $legacy_hard_crash_recovery ]]
+rm -rf -- "$ROOT/data/monday/evidence/cutovers/$c0"
 rm -f -- "$ROOT/opt/monday/releases/binance-lob-controller/active"
 ln -s "$legacy_root/$legacy_c0" "$ROOT/opt/monday/releases/binance-lob-controller/active"
 rm -f -- "$ROOT/opt/monday/bin/binance-lob-archiver"
-ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p0_sha/binance-lob-archiver" \
-  "$ROOT/opt/monday/bin/binance-lob-archiver"
+ln -s "$direct_production_before" "$ROOT/opt/monday/bin/binance-lob-archiver"
 rm -f -- "$(monday_runtime_asset_target "$ROOT" "$production_slice_asset")"
 while IFS= read -r asset; do
   [[ $asset == "$production_slice_asset" ]] && continue
@@ -1138,8 +1562,7 @@ cp -p -- "$legacy_alt_work/deployment/"* "$legacy_root/$legacy_alt_c0/deployment
 rm -f -- "$legacy_root/active"
 ln -s "$legacy_root/$legacy_alt_c0" "$legacy_root/active"
 rm -f -- "$ROOT/opt/monday/bin/binance-lob-archiver"
-ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p0_sha/binance-lob-archiver" \
-  "$ROOT/opt/monday/bin/binance-lob-archiver"
+ln -s "$direct_production_before" "$ROOT/opt/monday/bin/binance-lob-archiver"
 if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from direct --to "$c0" \
   --gate-receipt "$gate" --gate-sha256 "$gate_sha" --root "$ROOT" \
@@ -1150,8 +1573,7 @@ fi
 rm -f -- "$legacy_root/active"
 ln -s "$legacy_root/$legacy_c0" "$legacy_root/active"
 rm -f -- "$ROOT/opt/monday/bin/binance-lob-archiver"
-ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p0_sha/binance-lob-archiver" \
-  "$ROOT/opt/monday/bin/binance-lob-archiver"
+ln -s "$direct_production_before" "$ROOT/opt/monday/bin/binance-lob-archiver"
 
 # Bootstrap must independently bind the live R0 bytes.  A missing or drifted
 # shadow runtime asset is rejected before any active/controller projection is
@@ -1181,12 +1603,24 @@ cp -p -- "$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/binanc
 # states from the snapshot, including active legacy units; it must not leave
 # the migration partially contained.
 if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
-  MONDAY_CUTOVER_FIXTURE_LEGACY_ACTIVE=1 MONDAY_CUTOVER_FAIL_AFTER_ACTIVE=1 \
+  MONDAY_CUTOVER_FIXTURE_LEGACY_ACTIVE=1 MONDAY_CUTOVER_FAIL_AFTER_TRANSITION_EVIDENCE_COMMIT=1 \
   MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from direct --to "$c0" \
   --gate-receipt "$gate" --gate-sha256 "$gate_sha" --root "$ROOT" >/dev/null 2>&1; then
   printf 'fault-injected direct bootstrap unexpectedly succeeded\n' >&2
   exit 1
 fi
+if [[ $(readlink -- "$direct_production") != "$direct_production_before" ]]; then
+  printf 'failed direct bootstrap did not preserve the raw production projection\n' >&2
+  exit 1
+fi
+direct_failure_recovery="$ROOT/data/monday/evidence/cutovers/$c0/recovery.json"
+direct_failure_transition="$ROOT/data/monday/evidence/cutovers/$c0/transition.json"
+if [[ ! -f $direct_failure_recovery || -L $direct_failure_recovery ]]; then
+  printf 'failed direct bootstrap cleared its recovery authority\n' >&2
+  exit 1
+fi
+[[ ! -e $direct_failure_transition && ! -L $direct_failure_transition \
+  && ! -e $direct_failure_transition.sha256 && ! -L $direct_failure_transition.sha256 ]]
 direct_failure_calls="$ROOT/run/cutover-fixture.calls"
 for unit in \
   binance-lob-archiver@spot.service binance-lob-archiver@usdm.service \
@@ -1200,6 +1634,7 @@ bootstrap_cutover_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SY
   MONDAY_CUTOVER_FIXTURE_LEGACY_ACTIVE=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from direct --to "$c0" \
   --gate-receipt "$gate" --gate-sha256 "$gate_sha" --root "$ROOT")
+[[ ! -e $direct_failure_recovery && ! -L $direct_failure_recovery ]]
 bootstrap_transition=$(printf '%s\n' "$bootstrap_cutover_output" | sed -n 's/^Transition receipt: //p')
 bootstrap_transition_sha=$(printf '%s\n' "$bootstrap_cutover_output" | sed -n 's/^SHA-256: //p')
 [[ $(monday_active_controller_sha "$ROOT") == "$c0" ]]
@@ -1538,20 +1973,26 @@ write_cutover_fixture_health() {
       '{market:"spot",dataset:"spot_all",status:"synced",sequence_gaps:0,symbol_count:1000,snapshot_ready_count:1000,bridged_count:1000,stream_coverage_verified_count:1000,snapshot_only_symbols:[],all_symbols_bridged:true,all_stream_coverage_verified:true,full_stream_coverage_verified:true,pending_upload_segments:0,queue_saturated:false,disk_warning:false,upload_warning:false,session_id:"cutover-fixture-spot",updated_at_ns:$observed}' \
       >"$production_spool_root/spot/health.json.tmp"
     mv -f -- "$production_spool_root/spot/health.json.tmp" "$production_spool_root/spot/health.json"
-    if (( elapsed >= 3 )); then
-      if [[ ${FIXTURE_SPOT_FLIP:-0} == 1 ]]; then
-        : >"$ROOT/run/cutover-fixture-spot-flip"
+    if [[ ${FIXTURE_SPOT_FLIP:-0} == 1 ]]; then
+      if [[ ! -e "$ROOT/run/cutover-fixture-spot-observed" ]]; then
+        sleep 0.1
+        continue
       fi
-      jq -cn --argjson observed "$observed_at_ns" \
-        '{market:"usdm",dataset:"usdm_perpetual_top100_lob",status:"synced",sequence_gaps:0,symbol_count:100,snapshot_ready_count:100,bridged_count:100,stream_coverage_verified_count:100,snapshot_only_symbols:[],all_symbols_bridged:true,all_stream_coverage_verified:true,full_stream_coverage_verified:true,pending_upload_segments:0,queue_saturated:false,disk_warning:false,upload_warning:false,session_id:"cutover-fixture-usdm",updated_at_ns:$observed}' \
-        >"$production_spool_root/usdm/health.json.tmp"
-      mv -f -- "$production_spool_root/usdm/health.json.tmp" "$production_spool_root/usdm/health.json"
+      : >"$ROOT/run/cutover-fixture-spot-flip"
+    elif (( elapsed < 3 )); then
+      sleep 0.1
+      continue
     fi
+    jq -cn --argjson observed "$observed_at_ns" \
+      '{market:"usdm",dataset:"usdm_perpetual_top100_lob",status:"synced",sequence_gaps:0,symbol_count:100,snapshot_ready_count:100,bridged_count:100,stream_coverage_verified_count:100,snapshot_only_symbols:[],all_symbols_bridged:true,all_stream_coverage_verified:true,full_stream_coverage_verified:true,pending_upload_segments:0,queue_saturated:false,disk_warning:false,upload_warning:false,session_id:"cutover-fixture-usdm",updated_at_ns:$observed}' \
+      >"$production_spool_root/usdm/health.json.tmp"
+    mv -f -- "$production_spool_root/usdm/health.json.tmp" "$production_spool_root/usdm/health.json"
     (( elapsed < 15 )) || break
     sleep 0.1
   done
 }
 rm -f -- "$ROOT/run/cutover-fixture-health.stop" "$ROOT/run/cutover-fixture-spot-flip" \
+  "$ROOT/run/cutover-fixture-spot-observed" \
   "$production_spool_root/spot/health.json" "$production_spool_root/usdm/health.json"
 (
   write_cutover_fixture_health
@@ -1652,6 +2093,7 @@ ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p2_sha/binance-lob-archiv
 ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p2_sha/binance-lob-archiver" \
   "$ROOT/proc/$flip_fixture_pid_after/exe"
 rm -f -- "$ROOT/run/cutover-fixture-health.stop" "$ROOT/run/cutover-fixture-spot-flip" \
+  "$ROOT/run/cutover-fixture-spot-observed" \
   "$production_spool_root/spot/health.json" "$production_spool_root/usdm/health.json"
 (
   FIXTURE_SPOT_FLIP=1 write_cutover_fixture_health
@@ -1776,6 +2218,15 @@ cutover_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   --gate-receipt "$gate2" --gate-sha256 "$gate2_sha" --root "$ROOT")
 transition2=$(printf '%s\n' "$cutover_output" | sed -n 's/^Transition receipt: //p')
 transition2_sha=$(printf '%s\n' "$cutover_output" | sed -n 's/^SHA-256: //p')
+transition2_marker="$transition2.sha256"
+mv -- "$transition2_marker" "$transition2_marker.held"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c2" --root "$ROOT" \
+  >/dev/null 2>&1; then
+  printf 'restore accepted transition evidence without its durable digest\n' >&2
+  exit 1
+fi
+mv -- "$transition2_marker.held" "$transition2_marker"
 rm "$ROOT/opt/monday/bin/binance-lob-archiver"
 MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c2" --root "$ROOT" >/dev/null
@@ -1933,6 +2384,29 @@ done
 run_restore_health_fixture success
 grep -Fq 'enable binance-lob-archiver-production@spot.service' "$restore_calls"
 grep -Fq 'enable binance-lob-archiver-production@usdm.service' "$restore_calls"
+
+# Merely finding restore evidence must not suppress containment before the
+# active immutable pair is proven.  Break active with a valid receipt present,
+# then require fail-closed cleanup to mask every canonical writer.
+restore_active="$ROOT/opt/monday/releases/binance-lob-controller/active"
+restore_active_target=$(readlink -- "$restore_active")
+rm -f -- "$restore_calls" "$restore_active"
+ln -s "$ROOT/opt/monday/releases/binance-lob-controller/missing" "$restore_active"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_RESTORE_FIXTURE_SYSTEMD=1 \
+  MONDAY_RESTORE_FIXTURE_PID="$restore_fixture_pid" MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c2" --root "$ROOT" \
+  >/dev/null 2>&1; then
+  printf 'restore evidence suppressed containment for an invalid active pair\n' >&2
+  exit 1
+fi
+for unit in \
+  binance-lob-archiver@spot.service binance-lob-archiver@usdm.service \
+  binance-lob-archiver-upload@spot.service binance-lob-archiver-upload@usdm.service \
+  binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service; do
+  grep -Fq "mask $unit" "$restore_calls"
+done
+rm -f -- "$restore_active"
+ln -s "$restore_active_target" "$restore_active"
 
 # A repeated successful restore is a read-only idempotency check.  It must
 # verify the live pair/timers/health contract without issuing any systemd

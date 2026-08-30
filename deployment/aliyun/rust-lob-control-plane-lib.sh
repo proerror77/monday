@@ -90,6 +90,39 @@ monday_epoch_ns_rfc3339() {
   printf '%s.%09dZ\n' "$date_value" "$fraction"
 }
 
+# Resolve one Linux process start tick to epoch nanoseconds using the same
+# kernel uptime clock.  An optional now value keeps the arithmetic testable.
+monday_process_started_at_ns() {
+  [[ $# -eq 2 || $# -eq 3 ]] || return 2
+  local root=${1%/} pid=$2 now_ns=${3:-} proc_root stat_record stat_tail
+  local start_ticks clock_ticks uptime uptime_seconds uptime_fraction
+  local uptime_ns start_monotonic_ns
+  [[ -n $root ]] || root=/
+  [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
+  proc_root=$(monday_root_join "$root" proc) || return 1
+  [[ -r $proc_root/$pid/stat && -r $proc_root/uptime ]] || return 1
+  stat_record=$(<"$proc_root/$pid/stat") || return 1
+  stat_tail=${stat_record##*) }
+  [[ $stat_tail != "$stat_record" ]] || return 1
+  start_ticks=$(awk '{ if ($20 !~ /^[0-9]+$/) exit 1; print $20 }' <<<"$stat_tail") \
+    || return 1
+  clock_ticks=$(getconf CLK_TCK) || return 1
+  [[ $clock_ticks =~ ^[1-9][0-9]*$ ]] || return 1
+  read -r uptime _ <"$proc_root/uptime" || return 1
+  [[ $uptime =~ ^[0-9]+\.[0-9]+$ ]] || return 1
+  uptime_seconds=${uptime%%.*}
+  uptime_fraction=${uptime#*.}000000000
+  uptime_fraction=${uptime_fraction:0:9}
+  uptime_ns=$((10#$uptime_seconds * 1000000000 + 10#$uptime_fraction))
+  # shellcheck disable=SC2017 # quotient/remainder avoids long-uptime overflow
+  start_monotonic_ns=$((start_ticks / clock_ticks * 1000000000 \
+    + start_ticks % clock_ticks * 1000000000 / clock_ticks))
+  (( start_monotonic_ns <= uptime_ns )) || return 1
+  if [[ -z $now_ns ]]; then now_ns=$(date +%s%N) || return 1; fi
+  [[ $now_ns =~ ^[1-9][0-9]*$ ]] || return 1
+  printf '%s\n' "$((now_ns - uptime_ns + start_monotonic_ns))"
+}
+
 monday_validate_component() {
   [[ $# -eq 1 && $1 =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ && $1 != . && $1 != .. && $1 != *%* && $1 != *\\* ]]
 }
@@ -2094,6 +2127,24 @@ monday_validate_v2_gate_authoritative() {
       && $marker_run_sha == "$(monday_sha256_file "$run_json")" ]] || return 1
     (cd "$gate_dir" && sha256sum --check --strict PASSED.sha256 >/dev/null) || return 1
   fi
+}
+
+monday_v2_gate_before_asset_sha256() {
+  [[ $# -eq 2 ]] || return 2
+  local gate=$1 asset=$2
+  jq -er --arg asset "$asset" '
+    (if (.before.production_assets | has($asset)) then
+      .before.production_assets[$asset]
+    elif (.shadow_staging.before_assets | has($asset)) then
+      .shadow_staging.before_assets[$asset].sha256
+    else
+      error("unknown before asset")
+    end)
+    | if . == null then ""
+      elif type == "string" and test("^[a-f0-9]{64}$") then .
+      else error("invalid before asset digest")
+      end
+  ' "$gate"
 }
 
 # Validate the transition receipt and its exact V2 Gate evidence.  A cutover
