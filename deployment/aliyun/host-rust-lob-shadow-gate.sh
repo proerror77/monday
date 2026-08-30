@@ -369,6 +369,13 @@ meminfo_bytes() {
   printf '%s\n' "$((value * 1024))"
 }
 monotonic_seconds() { if [[ $TEST_ONLY == true && ! -r "$PROC_ROOT/uptime" ]]; then printf '%s\n' "$(date +%s)"; else awk '{print int($1)}' "$PROC_ROOT/uptime"; fi; }
+monotonic_nanoseconds() {
+  if [[ $TEST_ONLY == true && ! -r "$PROC_ROOT/uptime" ]]; then
+    date +%s%N
+  else
+    awk '{split($1, part, "."); fraction=part[2]; while (length(fraction) < 9) fraction=fraction "0"; print part[1] substr(fraction, 1, 9)}' "$PROC_ROOT/uptime"
+  fi
+}
 preflight_psi_monotonic_sample_number=0
 io_psi_monotonic_us() {
   local -a values=() value
@@ -981,6 +988,25 @@ for asset in "${PRODUCTION_ASSETS[@]}"; do
   production_asset_json=$(jq -cn --argjson values "$production_asset_json" --arg asset "$asset" --arg sha "$(sha256_file "$production_resolved")" '$values + {($asset):$sha}')
 done
 
+declare -A market_env shadow_segment_seconds
+markets=(spot usdm)
+for market in "${markets[@]}"; do
+  market_env[$market]="$candidate_deployment/binance-lob-archiver-rust-${market}.env"
+  shadow_segment_seconds[$market]=$(env_value "${market_env[$market]}" SEGMENT_SECONDS)
+  [[ ${shadow_segment_seconds[$market]} =~ ^[1-9][0-9]*$ ]] \
+    || die "$market shadow SEGMENT_SECONDS is invalid"
+  (( shadow_segment_seconds[$market] >= 60 )) \
+    || die "$market shadow SEGMENT_SECONDS is below the collector minimum"
+done
+GATE_SEGMENT_SECONDS=${shadow_segment_seconds[spot]}
+[[ $GATE_SEGMENT_SECONDS == "${shadow_segment_seconds[usdm]}" ]] \
+  || die 'shadow markets use different segment durations'
+# Rotations are wall-clock aligned. Three full intervals leave two sealed
+# segments before the Gate stops the writer, even if observation begins just
+# after a boundary.
+(( REQUIRED_DURATION_SECONDS >= 3 * GATE_SEGMENT_SECONDS )) \
+  || die 'formal Gate window cannot produce two complete shadow segments'
+
 if [[ $PREFLIGHT_ONLY == true ]]; then
   # No temporary directory, cleanup trap, spool/evidence path, systemd unit,
   # lease, or shadow is created before this branch.  The existing lock was
@@ -1082,22 +1108,17 @@ verify_shadow_unit_template() {
   [[ $(grep -c '^EnvironmentFile=' "$file" || true) -eq 2 ]] || return 1
 }
 
-declare -A market_env spool_dir candidate_shadow_spool shadow_segment_seconds dataset symbols unit upload_unit expected_oss_prefix
+declare -A spool_dir candidate_shadow_spool dataset symbols unit upload_unit expected_oss_prefix
 declare -A candidate_upload_unit_sha
 declare -A oss_bucket oss_endpoint oss_region aliyun_profile
 declare -A phase_segments_json phase_triplets_json phase_health_json
-markets=(spot usdm)
 for market in "${markets[@]}"; do
-  market_env[$market]="$candidate_deployment/binance-lob-archiver-rust-${market}.env"
   dataset[$market]=$(env_value "${market_env[$market]}" DATASET); symbols[$market]=$(env_value "${market_env[$market]}" SYMBOLS)
   oss_bucket[$market]=$(env_value "${market_env[$market]}" OSS_BUCKET)
   oss_endpoint[$market]=$(env_value "${market_env[$market]}" OSS_ENDPOINT)
   oss_region[$market]=$(env_value "${market_env[$market]}" OSS_REGION)
   aliyun_profile[$market]=$(env_value "${market_env[$market]}" ALIYUN_PROFILE)
   [[ $(env_value "${market_env[$market]}" MARKET) == "$market" ]] || die "$market env has wrong market"
-  shadow_segment_seconds[$market]=$(env_value "${market_env[$market]}" SEGMENT_SECONDS)
-  [[ ${shadow_segment_seconds[$market]} =~ ^[1-9][0-9]*$ ]] \
-    || die "$market shadow SEGMENT_SECONDS is invalid"
   candidate_shadow_spool[$market]=$(env_value "${market_env[$market]}" SPOOL_DIR)
   [[ ${candidate_shadow_spool[$market]} != /data/monday/spool/binance-lob \
     && ${candidate_shadow_spool[$market]} != /data/monday/spool/binance-lob/* ]] \
@@ -1115,14 +1136,6 @@ for market in "${markets[@]}"; do
   spool_dir[$market]=""
   unit[$market]=""
 done
-GATE_SEGMENT_SECONDS=${shadow_segment_seconds[spot]}
-[[ $GATE_SEGMENT_SECONDS == "${shadow_segment_seconds[usdm]}" ]] \
-  || die 'shadow markets use different segment durations'
-# Rotations are wall-clock aligned. Three full intervals leave two sealed
-# segments before the Gate stops the writer, even if observation begins just
-# after a boundary.
-(( REQUIRED_DURATION_SECONDS >= 3 * GATE_SEGMENT_SECONDS )) \
-  || die 'formal Gate window cannot produce two complete shadow segments'
 if [[ $TEST_ONLY != true ]]; then
   [[ ${symbols[spot]} == ALL && ${dataset[spot]} == spot_all_rust_shadow ]] || die 'Spot identity is invalid'
   is_usdm_top100 "${symbols[usdm]}" || die 'USD-M catalog is not frozen'
@@ -2037,7 +2050,7 @@ verify_segments() {
   phase_segments["$market"]=$count
 }
 run_market_gate_phase() {
-  local market=$1 settle observation observation_started pid started_ns
+  local market=$1 settle observation_deadline_ns observation_finished_ns observation_started_ns pid started_ns
   calibrate_psi "shadow-$market"; resource_monitor_start "shadow-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; fixture_seed_market "$market"; systemctl reset-failed "${unit[$market]}" >/dev/null 2>&1 || true
   started_ns=$(date +%s%N); market_gate_started_ns[$market]=$started_ns
   systemctl start "${unit[$market]}"; pid=$(shadow_identity_wait "$market"); phase_pid["$market"]=$pid; phase_exe_sha["$market"]=$candidate_payload
@@ -2052,8 +2065,8 @@ run_market_gate_phase() {
     --argjson samples "${health_samples[$market]}" \
     '{sha256:$sha,session_id:$session,frozen_symbol_count:$symbols,
       frozen_catalog_sha256:$catalog,max_health_silence_seconds:$silence,samples:$samples}')
-  observation_started=$(monotonic_seconds); observation=$(( observation_started + GATE_DURATION_SECONDS )); while (( $(monotonic_seconds) < observation )); do validate_observation_sample "$market"; assert_host_memory_reserve; [[ $(systemctl_value "$market" NRestarts) == 0 ]] || die "$market restarted"; [[ $(systemctl_value "$market" MainPID) == "$pid" ]] || die "$market MainPID changed"; [[ $TEST_ONLY == true ]] && break; sleep 15; done
-  phase_runtime["$market"]=$(( $(monotonic_seconds) - observation_started )); systemctl stop "${unit[$market]}"; systemctl_active "${unit[$market]}" && die "$market shadow remained active"; \
+  observation_started_ns=$(monotonic_nanoseconds); observation_deadline_ns=$(( observation_started_ns + GATE_DURATION_SECONDS * 1000000000 )); while (( $(monotonic_nanoseconds) < observation_deadline_ns )); do validate_observation_sample "$market"; assert_host_memory_reserve; [[ $(systemctl_value "$market" NRestarts) == 0 ]] || die "$market restarted"; [[ $(systemctl_value "$market" MainPID) == "$pid" ]] || die "$market MainPID changed"; [[ $TEST_ONLY == true ]] && break; sleep 15; done
+  observation_finished_ns=$(monotonic_nanoseconds); phase_runtime["$market"]=$(( (observation_finished_ns - observation_started_ns) / 1000000000 )); systemctl stop "${unit[$market]}"; systemctl_active "${unit[$market]}" && die "$market shadow remained active"; \
     resource_monitor_stop_or_die "shadow-$market"; \
     calibrate_psi "shadow-$market-tail"; resource_monitor_start "strict-verifier-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; \
     verify_segments "$market"; resource_monitor_stop_or_die "strict-verifier-$market"

@@ -67,11 +67,16 @@ usdm_segment_seconds=$(sed -n 's/^SEGMENT_SECONDS=//p' \
   "$SCRIPT_DIR/binance-lob-archiver-rust-usdm.env")
 [[ $required_gate_seconds =~ ^[1-9][0-9]*$ \
   && $spot_segment_seconds =~ ^[1-9][0-9]*$ \
+  && $spot_segment_seconds -ge 60 \
   && $spot_segment_seconds == "$usdm_segment_seconds" \
   && $required_gate_seconds -ge $((3 * spot_segment_seconds)) ]] || {
   printf 'Gate duration does not cover two complete shadow segments\n' >&2
   exit 1
 }
+gate_observation_source=$(sed -n '/^run_market_gate_phase()/,/^}/p' \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh")
+grep -Fq "observation_started_ns=\$(monotonic_nanoseconds)" <<<"$gate_observation_source"
+grep -Fq "observation_finished_ns=\$(monotonic_nanoseconds)" <<<"$gate_observation_source"
 
 # Resource Envelope V2 reserves the production slice's unallocated aggregate
 # cap from parent memory.stat anon.  File cache and memory.current remain audit
@@ -413,6 +418,25 @@ preflight_lock_sha=$(monday_sha256_file "$preflight_lock_path")
 preflight_tmpdir_guard="$ROOT/nonexistent-preflight-tmp"
 rm -rf -- "$preflight_tmpdir_guard"
 rm -f -- "$ROOT/run/gate-fixture.calls"
+subminute_env="$source_dir/binance-lob-archiver-rust-spot.env"
+cp -p -- "$subminute_env" "$subminute_env.before-test"
+sed 's/^SEGMENT_SECONDS=.*/SEGMENT_SECONDS=59/' "$subminute_env.before-test" >"$subminute_env"
+subminute_manifest="$ROOT/subminute-manifest.json"
+publish_fixture "$p0" "$subminute_manifest" >/dev/null
+subminute_controller=$(monday_sha256_file "$subminute_manifest")
+mv -f -- "$subminute_env.before-test" "$subminute_env"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$subminute_controller" --preflight-only --root "$ROOT" \
+  >"$ROOT/run/preflight-subminute-segment.out" 2>&1; then
+  printf 'read-only preflight accepted a sub-minute segment cadence\n' >&2
+  exit 1
+fi
+grep -Fq 'spot shadow SEGMENT_SECONDS is below the collector minimum' \
+  "$ROOT/run/preflight-subminute-segment.out" || {
+  cat "$ROOT/run/preflight-subminute-segment.out" >&2
+  exit 1
+}
 preflight_output=$(TMPDIR="$preflight_tmpdir_guard" MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
   --candidate-controller "$c0" --preflight-only --root "$ROOT")
