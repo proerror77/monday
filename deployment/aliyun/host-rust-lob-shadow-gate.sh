@@ -2410,5 +2410,11 @@ chmod 0640 "$gate_json.tmp"; [[ ! -e $gate_json ]] || die 'gate receipt already 
 if ! jq -e -f "$POLICY_SOURCE" "$gate_json" >/dev/null; then
   die 'V2 Gate policy rejected the receipt'
 fi
-if [[ $production_eligible == true ]]; then gate_sha=$(sha256_file "$gate_json"); printf '%s  gate.json\n' "$gate_sha" >"$passed_marker.tmp"; chmod 0640 "$passed_marker.tmp"; mv -f -- "$passed_marker.tmp" "$passed_marker"; fi
+if [[ $production_eligible == true ]]; then
+  gate_sha=$(sha256_file "$gate_json"); run_sha=$(sha256_file "$run_json")
+  (set -C; printf '%s  gate.json\n%s  run.json\n' "$gate_sha" "$run_sha" >"$passed_marker") \
+    || die 'could not publish immutable Gate marker'
+  chmod 0440 "$gate_json" "$run_json" "$passed_marker"
+  chmod 0550 "$evidence_dir"
+fi
 gate_finished=true; printf 'V2 Gate receipt: %s\nSHA-256: %s\n' "$gate_json" "$(sha256_file "$gate_json")"; [[ $production_eligible == true ]] && printf 'production shadow gate passed\n' || printf 'fixture Gate completed; not eligible for cutover\n'

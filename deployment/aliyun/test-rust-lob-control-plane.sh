@@ -872,8 +872,9 @@ jq -e --argjson segment "$spot_segment_seconds" \
      or (.observation_finished_monotonic_ns >= .observation_started_monotonic_ns))' \
   "$run_json" >/dev/null
 # A fixture receipt must not become production evidence by editing its mode and
-# both self-reported runtimes.  Keep the adjacent run.json unchanged apart from
-# its run id and provide the marker a real cutover would require; the
+# both self-reported runtimes.  Keep the adjacent run.json's provenance
+# unchanged while moving its canonical run paths, and provide the marker a real
+# cutover would require; the
 # authoritative wrapper still rejects the fixture provenance.
 tampered_run_id=20240101T000000Z-1
 tampered_dir="$(dirname -- "$(dirname -- "$gate")")/$tampered_run_id"
@@ -896,7 +897,12 @@ jq --arg run "$tampered_run_id" --arg spool "$tampered_spool" \
   "$gate" >"$tampered_dir/gate.json"
 tampered_gate="$tampered_dir/gate.json"
 tampered_sha=$(monday_sha256_file "$tampered_gate")
-printf '%s  gate.json\n' "$tampered_sha" >"$tampered_dir/PASSED.sha256"
+tampered_run_sha=$(monday_sha256_file "$tampered_dir/run.json")
+printf '%s  gate.json\n%s  run.json\n' "$tampered_sha" "$tampered_run_sha" \
+  >"$tampered_dir/PASSED.sha256"
+chmod 0440 "$tampered_gate" "$tampered_dir/run.json" "$tampered_dir/PASSED.sha256"
+chmod 0550 "$tampered_dir"
+(cd "$tampered_dir" && sha256sum --check --strict PASSED.sha256 >/dev/null)
 monday_validate_v2_gate "$tampered_gate" direct "$c0" "$tampered_sha"
 if monday_validate_v2_gate_authoritative "$ROOT" "$tampered_gate" direct "$c0" "$tampered_sha"; then
   printf 'authoritative Gate validation accepted a promoted fixture receipt\n' >&2

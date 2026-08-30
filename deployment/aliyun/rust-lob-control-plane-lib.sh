@@ -1920,7 +1920,7 @@ monday_validate_v2_gate() {
 monday_validate_v2_gate_authoritative() {
   [[ $# -eq 5 ]] || return 2
   local root=${1%/} gate=$2 from=$3 candidate=$4 gate_sha=$5
-  local canonical_gate_root gate_relative gate_dir run_json marker marker_gate_sha
+  local canonical_gate_root gate_relative gate_dir run_json marker marker_gate_sha marker_run_sha
   local gate_run gate_payload gate_runtime gate_segment gate_required gate_settle
   local gate_test_only gate_eligible run_test_only run_formal
   local run_requested gate_spool run_spool expected_spool market candidate_deployment candidate_gate candidate_formal env segment spot_segment usdm_segment
@@ -2027,8 +2027,16 @@ monday_validate_v2_gate_authoritative() {
     [[ $run_requested == "$gate_required" && $run_formal == "$gate_required" ]] || return 1
     marker="$gate_dir/PASSED.sha256"
     [[ -f $marker && ! -L $marker ]] || return 1
+    [[ $(monday_file_mode "$gate_dir") == 550 \
+      && $(monday_file_mode "$gate") == 440 \
+      && $(monday_file_mode "$run_json") == 440 \
+      && $(monday_file_mode "$marker") == 440 ]] || return 1
+    [[ $(wc -l <"$marker" | tr -d '[:space:]') == 2 ]] || return 1
     marker_gate_sha=$(awk '$2 == "gate.json" { count++; value=$1 } END { if (count != 1) exit 1; print value }' "$marker") || return 1
-    [[ $marker_gate_sha == "$gate_sha" ]] || return 1
+    marker_run_sha=$(awk '$2 == "run.json" { count++; value=$1 } END { if (count != 1) exit 1; print value }' "$marker") || return 1
+    [[ $marker_gate_sha == "$gate_sha" \
+      && $marker_run_sha == "$(monday_sha256_file "$run_json")" ]] || return 1
+    (cd "$gate_dir" && sha256sum --check --strict PASSED.sha256 >/dev/null) || return 1
     for market in spot usdm; do
       jq -e --arg market "$market" --argjson required "$gate_required" \
         --argjson gate_market "$(jq -ce --arg market "$market" '.[$market]' <<<"$gate_markets")" '
