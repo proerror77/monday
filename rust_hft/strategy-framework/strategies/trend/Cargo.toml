@@ -10,7 +10,6 @@ ports = { package = "hft-ports", path = "../../../market-core/ports" }
 serde = { workspace = true }
 log = "0.4"
 tracing = { workspace = true }
-chrono = { version = "0.4", features = ["serde"] }
 num-traits = "0.2"
 
 [lib]

@@ -6,13 +6,10 @@
 //! 2. 私有 WebSocket 接收成交回報、訂單狀態更新
 //! 3. Live/Paper 模式切換
 //! 4. 精度保護與錯誤處理
-//! 5. 完整的可觀測性與指標
+//! 5. 結構化可觀測性
 //! 6. 韌性機制：重試、熔斷器、告警通知
 
 #![allow(dead_code)]
-#[cfg(feature = "metrics")]
-pub mod metrics;
-
 use async_trait::async_trait;
 use execution::{
     AlertCallback, CircuitBreakerConfig, CircuitState, ExecutionAlert, ExecutionAlertType,
@@ -1004,12 +1001,6 @@ impl BitgetExecutionClient {
                             "訂單確認事件發送失敗: order_id={}, error={}",
                             update.ord_id, e
                         );
-                        #[cfg(feature = "metrics")]
-                        {
-                            crate::metrics::EVENT_SEND_ERRORS
-                                .with_label_values(&["order_ack_send_failed"])
-                                .inc();
-                        }
                     }
                 }
                 "cancelled" => {
@@ -1027,12 +1018,6 @@ impl BitgetExecutionClient {
                             "訂單取消事件發送失敗: order_id={}, error={}",
                             update.ord_id, e
                         );
-                        #[cfg(feature = "metrics")]
-                        {
-                            crate::metrics::EVENT_SEND_ERRORS
-                                .with_label_values(&["order_canceled_send_failed"])
-                                .inc();
-                        }
                     }
                 }
                 "rejected" => {
@@ -1051,12 +1036,6 @@ impl BitgetExecutionClient {
                             "訂單拒絕事件發送失敗: order_id={}, error={}",
                             update.ord_id, e
                         );
-                        #[cfg(feature = "metrics")]
-                        {
-                            crate::metrics::EVENT_SEND_ERRORS
-                                .with_label_values(&["order_rejected_send_failed"])
-                                .inc();
-                        }
                     }
                 }
                 "filled" | "partially_filled" => {
@@ -1131,13 +1110,6 @@ impl BitgetExecutionClient {
                         "成交價格解析失敗: order_id={}, price={}, error={}, payload={:?}",
                         fill.ord_id, fill.price, e, fill
                     );
-                    // 記錄指標
-                    #[cfg(feature = "metrics")]
-                    {
-                        crate::metrics::FILL_PARSE_ERRORS
-                            .with_label_values(&["price_parse_error"])
-                            .inc();
-                    }
                     continue; // 不發送事件
                 }
             };
@@ -1149,13 +1121,6 @@ impl BitgetExecutionClient {
                         "成交數量解析失敗: order_id={}, size={}, error={}, payload={:?}",
                         fill.ord_id, fill.size, e, fill
                     );
-                    // 記錄指標
-                    #[cfg(feature = "metrics")]
-                    {
-                        crate::metrics::FILL_PARSE_ERRORS
-                            .with_label_values(&["quantity_parse_error"])
-                            .inc();
-                    }
                     continue; // 不發送事件
                 }
             };
@@ -1174,12 +1139,6 @@ impl BitgetExecutionClient {
                 fill_id: fill.trade_id,
             }) {
                 warn!("成交事件發送失敗: order_id={}, error={}", fill.ord_id, e);
-                #[cfg(feature = "metrics")]
-                {
-                    crate::metrics::EVENT_SEND_ERRORS
-                        .with_label_values(&["fill_event_send_failed"])
-                        .inc();
-                }
             }
         }
 
@@ -1188,8 +1147,6 @@ impl BitgetExecutionClient {
 
     /// 解析時間戳字符串為統一時間戳
     fn parse_unified_timestamp(time_str: &str) -> HftResult<UnifiedTimestamp> {
-        let _start_time = std::time::Instant::now();
-
         // Bitget 時間戳通常是毫秒格式
         let millis = time_str
             .parse::<u64>()
@@ -1204,15 +1161,6 @@ impl BitgetExecutionClient {
                 "時間戳驗證失敗: exchange_ts={}, local_ts={}",
                 unified.exchange_ts, unified.local_ts
             )));
-        }
-
-        // 記錄轉換延遲指標
-        #[cfg(feature = "metrics")]
-        {
-            let conversion_time = start_time.elapsed().as_micros() as f64;
-            crate::metrics::TIMESTAMP_CONVERSION_LATENCY
-                .with_label_values(&["unified_ts"])
-                .observe(conversion_time);
         }
 
         Ok(unified)
@@ -1248,13 +1196,6 @@ impl BitgetExecutionClient {
     #[allow(dead_code)]
     fn add_fill_to_cache(&mut self, fill_id: &str) {
         self.fill_id_cache.insert(fill_id.to_string());
-
-        #[cfg(feature = "metrics")]
-        {
-            crate::metrics::FILL_DEDUPLICATION
-                .with_label_values(&["cache_add"])
-                .inc();
-        }
     }
 
     /// 清理 Fill ID 緩存 (簡單的全量清理策略)
@@ -1285,13 +1226,6 @@ impl BitgetExecutionClient {
             "Fill ID 緩存清理完成: {} -> {}",
             cache_size_before, cache_size_after
         );
-
-        #[cfg(feature = "metrics")]
-        {
-            crate::metrics::FILL_DEDUPLICATION
-                .with_label_values(&["cache_cleanup"])
-                .inc();
-        }
     }
 
     /// 轉換 Side 枚舉

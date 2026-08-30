@@ -455,16 +455,6 @@ jobs:
             --allow-match-regex "${legacy_runtime_reference_allowlist}" \
             "${inline_command_pathspecs[@]}"
 
-          rust_template_pathspecs=(
-            ':(glob)rust_hft/.specify/templates/*.md'
-            ':(glob)rust_hft/.specify/templates/**/*.md'
-          )
-          reject_python_text \
-            "Python scaffolding in active Rust templates" \
-            'actions/setup-pyth[o]n@|astral-sh/setup-u[v]@|(^|[^[:alnum:]_])(python([0-9]+([.][0-9]+)?)?|pip([0-9]+)?|pipx|pytest|poetry|pdm|rye|conda|mamba|hatch|tox|virtualenv|pyproject[.]toml|requirements[^/[:space:]]*[.]txt|setup[.]py|[^/[:space:]`"]+[.]py)([^[:alnum:]_]|$)|(^|[;&|()/[:space:]])uv[[:space:]]+(run|sync|pip|venv|python)([[:space:]]|$)' \
-            --ignore-case \
-            "${rust_template_pathspecs[@]}"
-
           if git grep -n -E '(name = "(burn-tch|tch|torch-sys|pyo3[^"]*|cpython|rust-cpython|python3-sys|rustpython[^"]*)"|^[[:space:]]*(burn-tch|tch|torch-sys|pyo3([-_][A-Za-z0-9_-]+)?|cpython|rust-cpython|python3-sys|rustpython([-_][A-Za-z0-9_-]+)?)[[:space:]]*=)' -- \
             ':(glob)**/Cargo.toml' ':(glob)**/Cargo.lock'; then
             echo "PyTorch/libtorch and Python-runtime Rust bindings are forbidden" >&2

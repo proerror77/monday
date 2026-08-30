@@ -13,7 +13,6 @@ data:
   bitget-symbols: "BTCUSDT,ETHUSDT,SOLUSDT"
   binance-symbols: "BTCUSDT,ETHUSDT,SOLUSDT"
   bybit-symbols: "BTCUSDT,ETHUSDT,SOLUSDT"
-  hyperliquid-symbols: "BTC,ETH,SOL"
 
   # Runtime starts fail-closed in quotes-only mode. A signed deployment bundle
   # may transition it to paper or shadow after all authority checks pass.

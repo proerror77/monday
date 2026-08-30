@@ -4216,22 +4216,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "hft-instrument"
-version = "0.1.0"
-dependencies = [
- "hft-core",
- "rust_decimal",
- "serde",
-]
-
-[[package]]
 name = "hft-integration"
 version = "0.1.0"
 dependencies = [
  "base64 0.21.7",
  "bytes",
  "chrono",
- "futures",
  "futures-util",
  "hex",
  "hft-core",
@@ -4243,7 +4233,6 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.26.2",
  "tracing",
- "url",
 ]
 
 [[package]]
@@ -4253,7 +4242,6 @@ dependencies = [
  "async-trait",
  "futures",
  "hft-core",
- "hft-instrument",
  "hft-snapshot",
  "rust_decimal",
  "serde",
@@ -5875,10 +5863,8 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "ploy-operator-contracts",
- "ploy-trading",
  "rust_decimal",
  "serde",
- "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -5951,8 +5937,6 @@ dependencies = [
  "ploy-strategy-runtime",
  "rustls",
  "sqlx",
- "tokio",
- "tracing",
  "tracing-subscriber",
 ]
 
@@ -6020,9 +6004,7 @@ dependencies = [
  "chrono",
  "ploy-control-client",
  "ploy-operator-contracts",
- "ploy-platform",
  "rust_decimal",
- "serde",
  "serde_json",
 ]
 

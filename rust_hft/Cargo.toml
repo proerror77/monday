@@ -16,7 +16,6 @@ members = [
     # Market Core
     "market-core/core",
     "market-core/ports",
-    "market-core/instrument",
     "market-core/snapshot",
     "market-core/engine",
     "market-core/integration",
@@ -28,13 +27,9 @@ members = [
     "data-pipelines/adapters/adapter-bitget",
     "data-pipelines/adapters/adapter-binance",
     "data-pipelines/adapters/adapter-binance-prediction",
-    "data-pipelines/adapters/adapter-backpack",
     "data-pipelines/adapters/adapter-mock",
-    "data-pipelines/adapters/adapter-replay",
     "data-pipelines/adapters/adapter-asterdex",
-    "data-pipelines/adapters/adapter-hyperliquid",
     "data-pipelines/adapters/adapter-bybit",
-    "data-pipelines/adapters/adapter-lighter",
     "data-pipelines/adapters/adapter-grvt",
     "data-pipelines/adapters/adapter-ondo-perps",
     "data-pipelines/adapters/adapter-polymarket",
@@ -59,11 +54,8 @@ members = [
     "execution-gateway/adapters/adapter-binance",
     "execution-gateway/adapters/adapter-binance-prediction",
     "execution-gateway/adapters/adapter-okx",
-    "execution-gateway/adapters/adapter-hyperliquid",
     "execution-gateway/adapters/adapter-bybit",
     "execution-gateway/adapters/adapter-asterdex",
-    "execution-gateway/adapters/adapter-backpack",
-    "execution-gateway/adapters/adapter-lighter",
     "execution-gateway/adapters/adapter-grvt",
     "execution-gateway/adapters/adapter-ondo-perps",
     "execution-gateway/adapters/adapter-polymarket",
@@ -75,7 +67,6 @@ members = [
     "infra-services/core/secrets",
     "infra-services/core/ipc",
     "infra-services/core/grpc-server",
-    "infra-services/testing",
 
     # Research Core
     "research-core/factor-dsl",
@@ -108,8 +99,6 @@ members = [
 
     # Tools & Utilities
     "tools/collector",
-    "tools/dataset",
-    "tools/hyperliquid-demo",
     "tools/ws_test",
     "tools/harnessctl",
     "tools/listing-monitor"
@@ -263,5 +252,4 @@ codegen-units = 1
 debug = false
 
 [patch.crates-io]
-sqlx = { git = "https://github.com/proerror77/sqlx-security-695", rev = "6690e9870298d7b65042538f4c1e943ed3e318ec" }
 rust_decimal = { git = "https://github.com/proerror77/monday-rust-decimal-security-694", rev = "4f7bc6f02d7920b6416988914ae86d25f6670b22" }

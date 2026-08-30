@@ -6,9 +6,6 @@ description = "OMS/ExecutionClient：Live(REST+私有WS)/Sim(queue)"
 
 [dependencies]
 hft-core = { package = "hft-core", path = "../../market-core/core" }
-ports = { package = "hft-ports", path = "../../market-core/ports" }
-integration = { package = "hft-integration", path = "../../market-core/integration" }
-serde = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
