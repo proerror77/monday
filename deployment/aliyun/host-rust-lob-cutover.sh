@@ -454,6 +454,14 @@ restore_direct_topology() {
     esac
   done
 }
+rollback_active() {
+  rm -f -- "$active_link.rollback.$$" || return 1
+  ln -s "$old_active_target" "$active_link.rollback.$$" || return 1
+  rm -f -- "$active_link" || return 1
+  mv -f -- "$active_link.rollback.$$" "$active_link" || return 1
+  [[ -L $active_link && $(readlink -- "$active_link") == "$old_active_target" ]] || return 1
+  sync -f "$controller_root"
+}
 cleanup() {
   local status=$? rollback_failed=false; set +e
   if (( status != 0 && transition_authority_committed == 1 )); then
@@ -463,16 +471,8 @@ cleanup() {
     exit "$status"
   fi
   if (( status != 0 )); then
-    if (( committed == 1 )); then
-      if ! rm -f -- "$active_link.rollback.$$"; then
-        rollback_failed=true
-      elif ! ln -s "$old_active_target" "$active_link.rollback.$$"; then
-        rollback_failed=true
-      elif ! rm -f -- "$active_link"; then
-        rollback_failed=true
-      elif ! mv -f -- "$active_link.rollback.$$" "$active_link"; then
-        rollback_failed=true
-      fi
+    if [[ $FROM != direct ]] && (( committed == 1 )); then
+      if rollback_active; then committed=0; else rollback_failed=true; fi
     fi
     if (( production_prepared == 1 )); then
       rm -f -- "$production" || rollback_failed=true
@@ -489,7 +489,15 @@ cleanup() {
     if (( projection_prepared == 1 )) && [[ $FROM == direct ]]; then
       restore_direct_topology || rollback_failed=true
     fi
-    if (( transition_marker_written == 1 )); then
+    # Keep active=C1 as the recovery authority until raw P0/R0 and incomplete
+    # evidence are durably gone; only the final active rename exposes C0 again.
+    if [[ $FROM == direct && $rollback_failed == false ]] \
+      && (( production_prepared == 1 || projection_prepared == 1 )); then
+      sync -f "$(monday_root_join "$ROOT" opt/monday)" || rollback_failed=true
+      sync -f "$(monday_root_join "$ROOT" etc/monday)" || rollback_failed=true
+      sync -f "$(monday_root_join "$ROOT" etc/systemd/system)" || rollback_failed=true
+    fi
+    if (( transition_marker_written == 1 )) && [[ $rollback_failed == false ]]; then
       rm -f -- "$transition_marker" || rollback_failed=true
       if [[ $rollback_failed == false ]]; then
         sync -f "$receipt_root/$TO" || rollback_failed=true
@@ -502,6 +510,19 @@ cleanup() {
         sync -f "$receipt_root/$TO" || rollback_failed=true
       fi
       [[ $rollback_failed == true ]] || transition_receipt_written=0
+    fi
+    if [[ $FROM == direct && $rollback_failed == false ]] && (( committed == 1 )); then
+      if [[ ${MONDAY_CUTOVER_HARD_CRASH_BEFORE_ACTIVE_ROLLBACK:-0} == 1 ]]; then
+        kill -KILL "$$"
+      fi
+      if rollback_active; then
+        committed=0
+        if [[ ${MONDAY_CUTOVER_HARD_CRASH_AFTER_ACTIVE_ROLLBACK:-0} == 1 ]]; then
+          kill -KILL "$$"
+        fi
+      else
+        rollback_failed=true
+      fi
     fi
     if (( writer_containment_started == 1 )) && [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
       if (( writer_containment_failed == 1 )); then
@@ -994,6 +1015,9 @@ sync -f "$receipt_root/$TO" || die 'could not durably commit transition receipt'
 mv -f -- "$transition_marker_tmp" "$transition_marker"
 transition_marker_written=1
 sync -f "$receipt_root/$TO" || die 'could not durably commit transition digest'
+if [[ ${MONDAY_CUTOVER_FAIL_AFTER_TRANSITION_EVIDENCE_COMMIT:-0} == 1 ]]; then
+  die 'fault injection after transition evidence commit before readback'
+fi
 monday_file_direct "$receipt" || die 'committed transition receipt is not a direct file'
 monday_file_direct "$transition_marker" || die 'committed transition digest is not a direct file'
 [[ $(monday_file_mode "$receipt") == 640 && $(monday_file_mode "$transition_marker") == 440 ]] \

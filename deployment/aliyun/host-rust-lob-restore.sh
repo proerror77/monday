@@ -160,10 +160,6 @@ restore_receipt_sha_tmp="$restore_receipt_sha.tmp.$$"
 restore_receipt_written=0
 restore_receipt_sha_written=0
 success=false; readonly_idempotency_check=false; resume_existing_restore=false
-if [[ -e $restore_receipt || -L $restore_receipt \
-  || -e $restore_receipt_sha || -L $restore_receipt_sha ]]; then
-  readonly_idempotency_check=true
-fi
 cleanup() {
   local status=$? evidence_cleanup_failed=false; set +e
   if [[ $success != true && $status != 0 ]]; then
@@ -606,7 +602,6 @@ clear_recovery_intent() {
 # the still-present exact recovery intent authorizes repairing that marker and
 # reconverging mutable runtime identity after a host reboot.
 if [[ -e $restore_receipt || -L $restore_receipt || -e $restore_receipt_sha || -L $restore_receipt_sha ]]; then
-  readonly_idempotency_check=true
   monday_file_direct "$restore_receipt" || die 'existing restore receipt is indirect or missing'
   [[ $(monday_file_mode "$restore_receipt") == 440 ]] \
     || die 'existing restore receipt mode is invalid'
@@ -666,8 +661,8 @@ if [[ -e $restore_receipt || -L $restore_receipt || -e $restore_receipt_sha || -
     # convergence and fresh runtime readback before clearing recovery authority.
     verify_existing_restore_state "$restore_receipt" "$expected_runtime" true
     resume_existing_restore=true
-    readonly_idempotency_check=false
   else
+    readonly_idempotency_check=true
     verify_existing_restore_state "$restore_receipt" "$expected_runtime"
     success=true
     printf 'Pair restore already complete (read-only): %s\n' "$restore_receipt"

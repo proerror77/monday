@@ -77,7 +77,7 @@ cutover_intent_flush_line=$(grep -nF "could not durably flush cutover recovery i
 cutover_intent_commit_line=$(grep -nF "could not durably commit cutover recovery intent" "$cutover_script" | cut -d: -f1)
 cutover_active_line=$(grep -nF "monday_atomic_symlink \"\$target_release\" \"\$active_link\"" "$cutover_script" | cut -d: -f1)
 cutover_active_sync_line=$(grep -nF "could not durably commit active controller switch" "$cutover_script" | cut -d: -f1)
-cutover_active_crash_line=$(grep -nF 'MONDAY_CUTOVER_HARD_CRASH_AFTER_ACTIVE' "$cutover_script" | cut -d: -f1)
+cutover_active_crash_line=$(grep -nF 'MONDAY_CUTOVER_HARD_CRASH_AFTER_ACTIVE:-' "$cutover_script" | cut -d: -f1)
 cutover_transition_flush_line=$(grep -nF "could not durably flush transition receipt" "$cutover_script" | cut -d: -f1)
 cutover_transition_commit_line=$(grep -nF "could not durably commit transition digest" "$cutover_script" | cut -d: -f1)
 cutover_transition_crash_line=$(grep -nF 'MONDAY_CUTOVER_HARD_CRASH_AFTER_TRANSITION_RECEIPT' "$cutover_script" | cut -d: -f1)
@@ -1411,17 +1411,18 @@ if monday_verify_production_runtime_assets "$ROOT" "$production_verify_dir" "$p0
   exit 1
 fi
 
-# A hard stop immediately after active=C1 must leave that one commit as the
-# recovery source.  Restore then establishes every stable projection from C1;
-# no receipt or guessed previous state is needed.  Rebuild the direct legacy
-# topology afterwards so the normal bootstrap path remains covered below.
-if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_HARD_CRASH_AFTER_ACTIVE=1 MONDAY_ROOT="$ROOT" \
+# Failed bootstrap cleanup must durably restore the raw C0/P0/R0 topology and
+# remove partial evidence before active rolls back.  A hard stop immediately
+# after that last rollback therefore leaves a complete C0 that accepts the one
+# identical retry, not a mixed topology that requires guessed recovery.
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FAIL_AFTER_ACTIVE=1 \
+  MONDAY_CUTOVER_HARD_CRASH_AFTER_ACTIVE_ROLLBACK=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from direct --to "$c0" \
   --gate-receipt "$gate" --gate-sha256 "$gate_sha" --root "$ROOT" >/dev/null 2>&1; then
-  printf 'hard-crash cutover unexpectedly survived SIGKILL\n' >&2
+  printf 'post-rollback hard-crash cutover unexpectedly survived SIGKILL\n' >&2
   exit 1
 fi
-[[ $(monday_active_controller_sha "$ROOT") == "$c0" ]]
+[[ $(monday_active_controller_sha "$ROOT") == "$legacy_c0" ]]
 legacy_hard_crash_recovery="$ROOT/data/monday/evidence/cutovers/$c0/recovery.json"
 if [[ ! -f $legacy_hard_crash_recovery || -L $legacy_hard_crash_recovery ]]; then
   printf 'same-payload hard crash did not preserve its recovery intent\n' >&2
@@ -1440,14 +1441,13 @@ for asset in host-rust-lob-recovery-queue.sh monday-collector-health.sh; do
   [[ -f $target && ! -L $target ]]
   [[ $(monday_sha256_file "$target") != "$(monday_sha256_file "$active_asset")" ]]
 done
-MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
-  "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c0" --root "$ROOT" >/dev/null
-for asset in host-rust-lob-recovery-queue.sh monday-collector-health.sh; do
-  target=$(monday_controller_projection_target "$ROOT" "$asset")
-  expected="$ROOT/opt/monday/releases/binance-lob-controller/active/deployment/$asset"
-  [[ -L $target && $(readlink -- "$target") == "$expected" ]]
-  cmp -s "$(readlink -f -- "$target")" "$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/$asset"
-done
+hard_crash_retry_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from direct --to "$c0" \
+  --gate-receipt "$gate" --gate-sha256 "$gate_sha" --root "$ROOT")
+grep -Fq 'Pair cutover complete' <<<"$hard_crash_retry_output"
+[[ $(monday_active_controller_sha "$ROOT") == "$c0" ]]
+[[ ! -e $legacy_hard_crash_recovery && ! -L $legacy_hard_crash_recovery ]]
+rm -rf -- "$ROOT/data/monday/evidence/cutovers/$c0"
 rm -f -- "$ROOT/opt/monday/releases/binance-lob-controller/active"
 ln -s "$legacy_root/$legacy_c0" "$ROOT/opt/monday/releases/binance-lob-controller/active"
 rm -f -- "$ROOT/opt/monday/bin/binance-lob-archiver"
@@ -1525,7 +1525,7 @@ cp -p -- "$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/binanc
 # states from the snapshot, including active legacy units; it must not leave
 # the migration partially contained.
 if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
-  MONDAY_CUTOVER_FIXTURE_LEGACY_ACTIVE=1 MONDAY_CUTOVER_FAIL_AFTER_ACTIVE=1 \
+  MONDAY_CUTOVER_FIXTURE_LEGACY_ACTIVE=1 MONDAY_CUTOVER_FAIL_AFTER_TRANSITION_EVIDENCE_COMMIT=1 \
   MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from direct --to "$c0" \
   --gate-receipt "$gate" --gate-sha256 "$gate_sha" --root "$ROOT" >/dev/null 2>&1; then
   printf 'fault-injected direct bootstrap unexpectedly succeeded\n' >&2
@@ -1536,10 +1536,13 @@ if [[ $(readlink -- "$direct_production") != "$direct_production_before" ]]; the
   exit 1
 fi
 direct_failure_recovery="$ROOT/data/monday/evidence/cutovers/$c0/recovery.json"
+direct_failure_transition="$ROOT/data/monday/evidence/cutovers/$c0/transition.json"
 if [[ ! -f $direct_failure_recovery || -L $direct_failure_recovery ]]; then
   printf 'failed direct bootstrap cleared its recovery authority\n' >&2
   exit 1
 fi
+[[ ! -e $direct_failure_transition && ! -L $direct_failure_transition \
+  && ! -e $direct_failure_transition.sha256 && ! -L $direct_failure_transition.sha256 ]]
 direct_failure_calls="$ROOT/run/cutover-fixture.calls"
 for unit in \
   binance-lob-archiver@spot.service binance-lob-archiver@usdm.service \
@@ -2303,6 +2306,29 @@ done
 run_restore_health_fixture success
 grep -Fq 'enable binance-lob-archiver-production@spot.service' "$restore_calls"
 grep -Fq 'enable binance-lob-archiver-production@usdm.service' "$restore_calls"
+
+# Merely finding restore evidence must not suppress containment before the
+# active immutable pair is proven.  Break active with a valid receipt present,
+# then require fail-closed cleanup to mask every canonical writer.
+restore_active="$ROOT/opt/monday/releases/binance-lob-controller/active"
+restore_active_target=$(readlink -- "$restore_active")
+rm -f -- "$restore_calls" "$restore_active"
+ln -s "$ROOT/opt/monday/releases/binance-lob-controller/missing" "$restore_active"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_RESTORE_FIXTURE_SYSTEMD=1 \
+  MONDAY_RESTORE_FIXTURE_PID="$restore_fixture_pid" MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c2" --root "$ROOT" \
+  >/dev/null 2>&1; then
+  printf 'restore evidence suppressed containment for an invalid active pair\n' >&2
+  exit 1
+fi
+for unit in \
+  binance-lob-archiver@spot.service binance-lob-archiver@usdm.service \
+  binance-lob-archiver-upload@spot.service binance-lob-archiver-upload@usdm.service \
+  binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service; do
+  grep -Fq "mask $unit" "$restore_calls"
+done
+rm -f -- "$restore_active"
+ln -s "$restore_active_target" "$restore_active"
 
 # A repeated successful restore is a read-only idempotency check.  It must
 # verify the live pair/timers/health contract without issuing any systemd
