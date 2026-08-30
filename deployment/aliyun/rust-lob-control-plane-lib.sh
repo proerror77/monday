@@ -792,7 +792,6 @@ monday_unit_normalized() {
         'Service|Environment|HOME=/var/lib/hft-collector'
         'Service|EnvironmentFile|/etc/monday/binance-lob-archiver-rust-%i.env'
         'Service|ExecStart|/opt/monday/bin/binance-lob-archiver-shadow --upload-only'
-        'Service|TimeoutStartSec|0'
         'Service|NoNewPrivileges|true'
         'Service|PrivateTmp|true'
         'Service|ProtectSystem|strict'
@@ -810,8 +809,13 @@ monday_unit_normalized() {
       )
       if [[ $kind == shadow_upload_run ]]; then
         expected+=(
+          'Service|TimeoutStartSec|300'
           'Service|Restart|no'
           'Service|RuntimeMaxSec|300'
+        )
+      else
+        expected+=(
+          'Service|TimeoutStartSec|0'
         )
       fi ;;
     *) return 2 ;;
@@ -1265,10 +1269,10 @@ monday_validate_lob_production_snapshot() {
   fi
 }
 
-# Emit only identity-bearing fields for comparison between the Gate start and
-# every later resource-monitor sample.  Memory current/peak/events are audit
-# values and intentionally excluded so normal usage changes do not look like
-# process or cgroup identity drift.
+# Emit the stable production contract for comparison between the Gate start and
+# every later resource-monitor sample.  The six-hour lifecycle restart may
+# change PID/NRestarts; each full snapshot still proves cgroup membership,
+# active state, executable digest, limits, and OOM counters independently.
 monday_lob_production_snapshot_identity() {
   [[ $# -eq 1 ]] || return 2
   local source=$1
@@ -1763,7 +1767,7 @@ monday_validate_v2_gate() {
             or (.restored_target_sha256 | type == "string" and test("^[a-f0-9]{64}$")))))
         and (.binary.path == .run_unit_root)
       and (.checks | type == "object"
-        and .before_pair_unchanged == true
+        and .before_pair_contract_unchanged == true
         and .production_runtime_verified == true
         and .shadow_staging_verified == true
         and .shadow_assets_restored == true
@@ -1793,6 +1797,8 @@ monday_validate_v2_gate() {
           and (.expected_oss_prefix | type == "string"
             and . == ("lake/raw/venue=binance/market=" + $m.market
               + "/dataset=" + $m.dataset + "/shard=all"))
+          and (.observation_started_at_ns | type == "number" and floor == . and . >= 0
+            and . <= $m.observed_at_ns)
           and (.observed_at_ns | type == "number" and floor == . and . >= 0)
           and ($m.observed_runtime_seconds | type == "number" and floor == . and . >= 0
             and . <= $root.evidence_timeout_seconds)
@@ -1818,6 +1824,7 @@ monday_validate_v2_gate() {
               and (.start_received_at_ns | type == "number" and . >= 0)
               and (.end_received_at_ns | type == "number")
               and (.end_received_at_ns >= .start_received_at_ns)
+              and (.end_received_at_ns > $m.observation_started_at_ns)
               and (.end_received_at_ns <= $m.observed_at_ns)
               and (.session_id | type == "string" and . == $m.session_id)))
           and (.triplets | type == "array" and length == 2
@@ -1857,6 +1864,7 @@ monday_validate_v2_gate() {
               and (.start_received_at_ns | type == "number" and . >= 0)
               and (.end_received_at_ns | type == "number")
               and (.end_received_at_ns >= .start_received_at_ns)
+              and (.end_received_at_ns > $m.observation_started_at_ns)
               and (.end_received_at_ns <= $m.observed_at_ns)
               and (.observed_at | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$"))
               and (.observed_at_ns | type == "number" and floor == . and . >= 0)
@@ -2017,6 +2025,7 @@ monday_validate_v2_gate_authoritative() {
         | $run_root.markets[$market] as $m
         | ($m.observed_runtime_seconds | type == "number" and floor == . and . >= 0
           and . <= $run_evidence_timeout)
+        and ($m.observation_started_at_ns | type == "number" and floor == . and . >= 0)
         and ($m.observation_started_monotonic_ns | type == "number" and floor == . and . >= 0)
         and ($m.observation_finished_monotonic_ns | type == "number" and floor == .
           and . >= $m.observation_started_monotonic_ns)
@@ -2024,7 +2033,8 @@ monday_validate_v2_gate_authoritative() {
           >= ($m.observed_runtime_seconds * 1000000000))
         and (($m.observation_finished_monotonic_ns - $m.observation_started_monotonic_ns)
           < (($m.observed_runtime_seconds + 1) * 1000000000))
-        and ($m.observed_runtime_seconds == $gate_markets[$market].observed_runtime_seconds)))' \
+        and ($m.observed_runtime_seconds == $gate_markets[$market].observed_runtime_seconds)
+        and ($m.observation_started_at_ns == $gate_markets[$market].observation_started_at_ns)))' \
     "$run_json" >/dev/null || return 1
   jq -e --arg run "$gate_run" --arg spool "$expected_spool" '
     .run_spool == $spool

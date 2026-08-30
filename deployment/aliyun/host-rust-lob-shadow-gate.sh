@@ -821,10 +821,9 @@ refresh_production_snapshot() {
     parent_memory_current_bytes,parent_memory_peak_bytes,parent_memory_anon_bytes,parent_memory_file_bytes,parent_memory_stat,
     child_memory_max_sum_bytes,parent_memory_events}
     | .parent_memory_stat.anon=$anon | .parent_memory_stat.file=$file' <<<"$production_snapshot_json")
-  # The Gate's stable production identity deliberately excludes volatile PID
-  # and restart counters.  The authoritative cgroup snapshot below still
-  # validates those fields directly; this projection is only the stable
-  # process identity carried by the receipt.
+  # The Gate's stable production contract permits the six-hour lifecycle
+  # restart, so PID/NRestarts remain audit fields.  Every full snapshot still
+  # proves active child membership and the exact executable digest.
   production_process_json=$(jq -c '(.children | with_entries(.value |= {process_exe_sha256,active}))' <<<"$production_snapshot_json")
   if [[ -z ${production_snapshot_identity_json:-} ]]; then
     production_snapshot_identity_json=$first_identity
@@ -1598,9 +1597,11 @@ write_run_json() {
     if [[ -n ${phase_runtime[$market]+x} ]]; then
       observed_json=$(jq -cn \
         --argjson runtime "${phase_runtime[$market]}" \
+        --argjson started_at_ns "${market_observation_started_ns[$market]}" \
         --argjson started_ns "${market_observation_started_mono_ns[$market]}" \
         --argjson finished_ns "${market_observation_finished_mono_ns[$market]}" \
         '{observed_runtime_seconds:$runtime,
+          observation_started_at_ns:$started_at_ns,
           observation_started_monotonic_ns:$started_ns,
           observation_finished_monotonic_ns:$finished_ns}') || return 1
     fi
@@ -1740,18 +1741,43 @@ else
 fi
 
 fixture_seed_market() {
-  local market=$1 dir="${spool_dir[$1]}" i file data_sha now boundary=false segment_count=2
+  local market=$1 dir="${spool_dir[$1]}" now
   [[ $TEST_ONLY == true ]] || return 0
-  [[ ${MONDAY_GATE_FIXTURE_RECONNECT_BOUNDARY:-0} == 1 ]] && segment_count=3
-  [[ ${MONDAY_GATE_FIXTURE_SINGLE_CLEAN_SEGMENT:-0} == 1 ]] && segment_count=1
   now=$(monotonic_seconds); mkdir -p "$dir"
   jq -cn --arg market "$market" --arg dataset "${dataset[$market]}" --arg session "fixture-$run_id-$market" --argjson updated "$((now * 1000000000))" '{market:$market,dataset:$dataset,updated_at_ns:$updated,status:"synced",sequence_gaps:0,symbol_count:1,symbols:{FIXTURE:{}},snapshot_ready_count:1,bridged_count:1,stream_coverage_verified_count:1,snapshot_only_symbols:[],all_symbols_bridged:true,all_stream_coverage_verified:true,full_stream_coverage_verified:true,queue_saturated:false,disk_warning:false,upload_warning:false,upload_failure_count:0,session_id:$session}' >"$dir/health.json"
+}
+fixture_seed_segment() {
+  local market=$1 start=$2 end=$3 boundary=$4 dir="${spool_dir[$1]}" file data_sha
+  file="part-$start.jsonl"
+  printf '{"schema":"binance.market_tape.v2","type":"session_start"}\n' >"$dir/$file"
+  zstd -q -f "$dir/$file" -o "$dir/$file.zst"
+  rm -f -- "$dir/$file"; file="$file.zst"; data_sha=$(sha256_file "$dir/$file")
+  jq -cn --arg market "$market" --arg dataset "${dataset[$market]}" --arg file "$file" \
+    --arg sha "$data_sha" --arg session "fixture-$run_id-$market" \
+    --argjson start "$start" --argjson end "$end" --argjson boundary "$boundary" \
+    '{schema:"binance.market_tape.v2",market:$market,dataset:$dataset,shard_id:"all",
+      start_received_at_ns:$start,end_received_at_ns:$end,file:$file,sha256:$sha,
+      symbols:["FIXTURE"],stream_types:["depth@100ms"],
+      event_types:{agg_trade:0,raw_trade:0,book_ticker:0,force_order:0},
+      has_replay_safe_checkpoint:true,
+      lob_continuity:{sequence_gaps:0,reconnect_boundary:$boundary,capture_session_id:$session}}' \
+    >"$dir/$file.manifest.json"
+  printf '%s\n' "$data_sha" >"$dir/$file._SUCCESS"
+}
+fixture_seed_market_segments() {
+  local market=$1 cutoff=${market_observation_started_ns[$1]} i start end boundary=false segment_count=2
+  [[ $TEST_ONLY == true ]] || return 0
+  if [[ ${MONDAY_GATE_FIXTURE_PREOBSERVATION_SEGMENTS:-0} == 1 ]]; then
+    fixture_seed_segment "$market" "$((cutoff - 4000))" "$((cutoff - 3100))" false
+    fixture_seed_segment "$market" "$((cutoff - 3000))" "$((cutoff - 2100))" false
+  fi
+  [[ ${MONDAY_GATE_FIXTURE_RECONNECT_BOUNDARY:-0} == 1 ]] && segment_count=3
+  [[ ${MONDAY_GATE_FIXTURE_SINGLE_CLEAN_SEGMENT:-0} == 1 ]] && segment_count=1
   for ((i = 1; i <= segment_count; i++)); do
     boundary=false
     [[ ${MONDAY_GATE_FIXTURE_RECONNECT_BOUNDARY:-0} == 1 && $i -eq 1 ]] && boundary=true
-    file="part-$((now+i)).jsonl"; printf '{"schema":"binance.market_tape.v2","type":"session_start"}\n' >"$dir/$file"; zstd -q -f "$dir/$file" -o "$dir/$file.zst"; rm -f -- "$dir/$file"; file="$file.zst"; data_sha=$(sha256_file "$dir/$file")
-    jq -cn --arg market "$market" --arg dataset "${dataset[$market]}" --arg file "$file" --arg sha "$data_sha" --arg session "fixture-$run_id-$market" --argjson start "$((now+i*1000))" --argjson end "$((now+i*1000+900))" --argjson boundary "$boundary" '{schema:"binance.market_tape.v2",market:$market,dataset:$dataset,shard_id:"all",start_received_at_ns:$start,end_received_at_ns:$end,file:$file,sha256:$sha,symbols:["FIXTURE"],stream_types:["depth@100ms"],event_types:{agg_trade:0,raw_trade:0,book_ticker:0,force_order:0},has_replay_safe_checkpoint:true,lob_continuity:{sequence_gaps:0,reconnect_boundary:$boundary,capture_session_id:$session}}' >"$dir/$file.manifest.json"
-    printf '%s\n' "$data_sha" >"$dir/$file._SUCCESS"
+    start=$((cutoff + i * 1000)); end=$((start + 900))
+    fixture_seed_segment "$market" "$start" "$end" "$boundary"
   done
 }
 render_shadow_unit() {
@@ -1784,6 +1810,7 @@ Restart=no\
 RuntimeMaxSec='"$UPLOAD_DRAIN_TIMEOUT_SECONDS" \
       -e "s|^EnvironmentFile=.*$|EnvironmentFile=$rendered_env|" \
       -e "s|^ExecStart=.*$|ExecStart=$candidate_binary --upload-only|" \
+      -e "s|^TimeoutStartSec=.*$|TimeoutStartSec=$UPLOAD_DRAIN_TIMEOUT_SECONDS|" \
       -e "s|^ReadWritePaths=.*$|ReadWritePaths=$spool|" \
       "$source_upload" >"$rendered_upload"
   sed -e "s|^SPOOL_DIR=.*$|SPOOL_DIR=$spool|" \
@@ -1802,6 +1829,7 @@ RuntimeMaxSec='"$UPLOAD_DRAIN_TIMEOUT_SECONDS" \
   [[ $(grep -Fxc "Slice=$GATE_WORKER_SLICE" "$rendered_upload" || true) -eq 1 ]] || die "$market Gate upload worker slice is not exact"
   [[ $(grep -Fxc 'Restart=no' "$rendered_upload" || true) -eq 1 ]] || die "$market Gate upload restart policy is not bounded"
   [[ $(grep -Fxc "RuntimeMaxSec=$UPLOAD_DRAIN_TIMEOUT_SECONDS" "$rendered_upload" || true) -eq 1 ]] || die "$market Gate upload runtime is not bounded"
+  [[ $(grep -Fxc "TimeoutStartSec=$UPLOAD_DRAIN_TIMEOUT_SECONDS" "$rendered_upload" || true) -eq 1 ]] || die "$market Gate upload start is not bounded"
   canonical_upload="$tmp_dir/$market-shadow-upload-source.service"
   sed -e "/^Slice=$GATE_WORKER_SLICE$/d" \
       -e "s|^EnvironmentFile=$rendered_env$|EnvironmentFile=/etc/monday/binance-lob-archiver-rust-%i.env|" \
@@ -2036,6 +2064,10 @@ clean_segment_pair_ready() {
     interval=$(segment_manifest_interval "$market" "$manifest" "${phase_session[$market]}") \
       || return 2
     IFS=$'\t' read -r state start end <<<"$interval"
+    if (( end <= market_observation_started_ns[$market] )); then
+      previous_end=0; run_count=0
+      continue
+    fi
     if [[ $state != clean ]]; then
       previous_end=0; run_count=0
       continue
@@ -2065,6 +2097,10 @@ verify_segments() {
     interval=$(segment_manifest_interval "$market" "$manifest" "${phase_session[$market]}") \
       || die "$market manifest failed strict checks"
     IFS=$'\t' read -r state start end <<<"$interval"
+    if (( end <= market_observation_started_ns[$market] )); then
+      previous_end=0; count=0; segment_records=(); phase_segments_json[$market]='[]'
+      continue
+    fi
     case $state in
       boundary)
         previous_end=0; count=0; segment_records=(); phase_segments_json[$market]='[]'
@@ -2120,7 +2156,7 @@ run_market_gate_phase() {
     kill -KILL "$$"
   fi
   settle=$(( $(monotonic_seconds) + HEALTH_SETTLE_DURATION_SECONDS )); while ! health_ok "$market"; do (( $(monotonic_seconds) < settle )) || die "$market health did not settle"; [[ $(systemctl_value "$market" NRestarts) == 0 ]] || die "$market restarted while settling"; [[ $(systemctl_value "$market" MainPID) == "$pid" ]] || die "$market MainPID changed while settling"; assert_host_memory_reserve; sleep 1; done
-  phase_session["$market"]=$(jq -er '.session_id' "${spool_dir[$market]}/health.json"); frozen_symbol_count[$market]=$(jq -er '.symbol_count' "${spool_dir[$market]}/health.json"); frozen_catalog_sha256[$market]=$(health_catalog_sha256 "$market"); initial_upload_failure_count[$market]=$(jq -er '.upload_failure_count' "${spool_dir[$market]}/health.json"); last_health_updated_ns[$market]=$(jq -er '.updated_at_ns' "${spool_dir[$market]}/health.json"); last_health_advance_mono[$market]=$(monotonic_seconds); max_health_silence_seconds[$market]=0; health_samples[$market]=1; market_observation_started_ns[$market]=$(date +%s%N)
+  phase_session["$market"]=$(jq -er '.session_id' "${spool_dir[$market]}/health.json"); frozen_symbol_count[$market]=$(jq -er '.symbol_count' "${spool_dir[$market]}/health.json"); frozen_catalog_sha256[$market]=$(health_catalog_sha256 "$market"); initial_upload_failure_count[$market]=$(jq -er '.upload_failure_count' "${spool_dir[$market]}/health.json"); last_health_updated_ns[$market]=$(jq -er '.updated_at_ns' "${spool_dir[$market]}/health.json"); last_health_advance_mono[$market]=$(monotonic_seconds); max_health_silence_seconds[$market]=0; health_samples[$market]=1; market_observation_started_ns[$market]=$(date +%s%N); fixture_seed_market_segments "$market"
   observation_started_ns=$(monotonic_nanoseconds)
   observation_deadline_ns=$(( observation_started_ns + GATE_EVIDENCE_TIMEOUT_SECONDS * 1000000000 ))
   while :; do
@@ -2302,7 +2338,7 @@ verify_oss_roundtrips() {
     start=$(jq -er '.start_received_at_ns' "$manifest"); end=$(jq -er '.end_received_at_ns' "$manifest")
     [[ $start =~ ^[0-9]+$ && $end =~ ^[0-9]+$ && $end -le $observed_cutoff_ns ]] \
       || die "$market OSS manifest is future-dated"
-    if [[ $TEST_ONLY != true ]] && ((end <= market_observation_started_ns[$market])); then
+    if ((end <= market_observation_started_ns[$market])); then
       continue
     fi
     interval=$(segment_manifest_interval "$market" "$manifest" "${phase_session[$market]}") \
@@ -2443,7 +2479,7 @@ memory_events_no_oom "$gate_worker_memory_events_start" "$gate_worker_memory_eve
 
 checks=$(jq -cn --argjson production_events_start "$production_memory_events_start" \
   --argjson production_events_end "$production_memory_events_end" \
-  '{before_pair_unchanged:true,production_runtime_verified:true,shadow_staging_verified:true,shadow_assets_restored:true,resource_preflight:true,oss_triplets:true,strict_segment_verifier:true,final_identity:true,controller_control_bytes:true,shadow_link_restored:true,health_freshness:true,candidate_no_oom:true,production_no_oom:true,production_memory_events:{start:$production_events_start,end:$production_events_end}}')
+  '{before_pair_contract_unchanged:true,production_runtime_verified:true,shadow_staging_verified:true,shadow_assets_restored:true,resource_preflight:true,oss_triplets:true,strict_segment_verifier:true,final_identity:true,controller_control_bytes:true,shadow_link_restored:true,health_freshness:true,candidate_no_oom:true,production_no_oom:true,production_memory_events:{start:$production_events_start,end:$production_events_end}}')
 before_assets_json='{}'; staged_assets_json='{}'; restored_assets_json='{}'
 for asset in "${SHADOW_ASSETS[@]}"; do
   restored_asset_sha[$asset]="${saved_sha[$asset]:-}"
@@ -2483,12 +2519,15 @@ for market in "${markets[@]}"; do
     --argjson strict_lob "${phase_strict_lob[$market]:-false}" \
     --argjson strict_aggregate "${phase_strict_aggregate[$market]:-false}" \
     --argjson strict_raw "${phase_strict_raw[$market]:-false}" \
+    --argjson observation_started_at_ns "${market_observation_started_ns[$market]}" \
     --argjson observed_at_ns "${market_observed_at_ns[$market]}" \
     '{market:$market,unit:$unit,dataset:$dataset,session_id:$session,main_pid:$pid,
       process_exe_sha256:$exe,n_restarts:0,observed_runtime_seconds:$runtime,
       spool_dir:$spool,shard_id:$shard,oss_bucket:$configured_bucket,oss_endpoint:$endpoint,
       oss_region:$region,aliyun_profile:$profile,segment_count:$segments,oss_triplet_count:$oss,health_sha256:$health,
-      expected_oss_bucket:$bucket,expected_oss_prefix:$prefix,observed_at_ns:$observed_at_ns,segments:$segment_evidence,
+      expected_oss_bucket:$bucket,expected_oss_prefix:$prefix,
+      observation_started_at_ns:$observation_started_at_ns,observed_at_ns:$observed_at_ns,
+      segments:$segment_evidence,
       triplets:$triplet_evidence,health:$health_evidence,
       process_identity_verified:true,installed_shadow_assets_verified:true,
       strict_lob_continuity_readback:$strict_lob,

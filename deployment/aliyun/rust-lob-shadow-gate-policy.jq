@@ -353,7 +353,7 @@ and (.shadow_staging | type == "object"
       or (.restored_target_sha256 | type == "string" and test("^[a-f0-9]{64}$")))))
   and (.binary.path == .run_unit_root)
 and (.checks | type == "object"
-  and .before_pair_unchanged == true
+  and .before_pair_contract_unchanged == true
   and .shadow_staging_verified == true
   and .production_runtime_verified == true
   and .shadow_assets_restored == true
@@ -383,6 +383,8 @@ and (.markets | type == "object" and ((keys | sort) == ["spot", "usdm"])
     and (.expected_oss_prefix | type == "string"
       and . == ("lake/raw/venue=binance/market=" + $m.market
         + "/dataset=" + $m.dataset + "/shard=all"))
+    and (.observation_started_at_ns | type == "number" and floor == . and . >= 0
+      and . <= $m.observed_at_ns)
     and (.observed_at_ns | type == "number" and floor == . and . >= 0)
     and ($m.observed_runtime_seconds | type == "number" and floor == . and . >= 0
       and . <= $root.evidence_timeout_seconds)
@@ -408,6 +410,7 @@ and (.markets | type == "object" and ((keys | sort) == ["spot", "usdm"])
         and (.start_received_at_ns | type == "number" and . >= 0)
         and (.end_received_at_ns | type == "number")
         and (.end_received_at_ns >= .start_received_at_ns)
+        and (.end_received_at_ns > $m.observation_started_at_ns)
         and (.end_received_at_ns <= $m.observed_at_ns)
         and (.session_id | type == "string" and . == $m.session_id)))
     and (.triplets | type == "array" and length == 2
@@ -447,6 +450,7 @@ and (.markets | type == "object" and ((keys | sort) == ["spot", "usdm"])
         and (.start_received_at_ns | type == "number" and . >= 0)
         and (.end_received_at_ns | type == "number")
         and (.end_received_at_ns >= .start_received_at_ns)
+        and (.end_received_at_ns > $m.observation_started_at_ns)
         and (.end_received_at_ns <= $m.observed_at_ns)
         and (.observed_at | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$"))
         and (.observed_at_ns | type == "number" and floor == . and . >= 0)

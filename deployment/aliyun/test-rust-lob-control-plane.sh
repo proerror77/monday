@@ -704,9 +704,12 @@ jq -e --argjson evidence_timeout "$evidence_timeout_seconds" \
   '.evidence_timeout_seconds == $evidence_timeout and .segment_seconds == $segment
    and (.io_full_psi_windows | length == 9)
    and all(.io_full_psi_windows[]; .veto == false)
-   and all(.markets[];
-     .observed_runtime_seconds >= 0 and .observed_runtime_seconds <= $evidence_timeout
-     and .segment_count == 2 and .oss_triplet_count == 2)' \
+   and all(.markets[]; . as $market
+     | .observed_runtime_seconds >= 0 and .observed_runtime_seconds <= $evidence_timeout
+     and .observation_started_at_ns <= .observed_at_ns
+     and .segment_count == 2 and .oss_triplet_count == 2
+     and all(.segments[]; .end_received_at_ns > $market.observation_started_at_ns)
+     and all(.triplets[]; .end_received_at_ns > $market.observation_started_at_ns))' \
   "$gate" >/dev/null
 run_json="$(dirname -- "$gate")/run.json"
 jq -e --argjson segment "$gate_segment_seconds" \
@@ -716,11 +719,18 @@ jq -e --argjson segment "$gate_segment_seconds" \
    and .evidence_timeout_seconds == $evidence_timeout
    and .formal_evidence_timeout_seconds == $evidence_timeout
    and all(.markets[];
-     .observation_finished_monotonic_ns >= .observation_started_monotonic_ns
+     .observation_started_at_ns >= 0
+     and .observation_finished_monotonic_ns >= .observation_started_monotonic_ns
      and (.observation_finished_monotonic_ns - .observation_started_monotonic_ns)
        >= (.observed_runtime_seconds * 1000000000)
      and (.observation_finished_monotonic_ns - .observation_started_monotonic_ns)
        < ((.observed_runtime_seconds + 1) * 1000000000))' \
+  "$run_json" >/dev/null
+jq -e --slurpfile gate "$gate" '
+  .markets as $run_markets
+  | all(["spot", "usdm"][]; . as $market
+    | $run_markets[$market].observation_started_at_ns
+      == $gate[0].markets[$market].observation_started_at_ns)' \
   "$run_json" >/dev/null
 # A reconnect-boundary segment is skipped, but two later adjacent clean
 # segments can still satisfy the evidence-driven Gate.
@@ -735,6 +745,20 @@ jq -e 'all(.markets[];
   .segment_count == 2 and .oss_triplet_count == 2
   and (.segments | length == 2) and (.triplets | length == 2))' \
   "$reconnect_gate" >/dev/null
+
+# Clean files sealed before observation starts are audit input only.  The local
+# selector and OSS readback must both choose the later adjacent pair.
+preobservation_gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 \
+  MONDAY_GATE_FIXTURE_PREOBSERVATION_SEGMENTS=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --root "$ROOT")
+preobservation_gate=$(printf '%s\n' "$preobservation_gate_output" | sed -n 's/^V2 Gate receipt: //p')
+preobservation_gate_sha=$(printf '%s\n' "$preobservation_gate_output" | sed -n 's/^SHA-256: //p')
+monday_validate_v2_gate "$preobservation_gate" direct "$c0" "$preobservation_gate_sha"
+jq -e 'all(.markets[]; . as $market
+  | all(.segments[]; .end_received_at_ns > $market.observation_started_at_ns)
+  and all(.triplets[]; .end_received_at_ns > $market.observation_started_at_ns))' \
+  "$preobservation_gate" >/dev/null
 
 # Time alone never passes the Gate: one clean segment is insufficient.
 if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_SINGLE_CLEAN_SEGMENT=1 \
@@ -860,6 +884,18 @@ if monday_validate_v2_gate "$tampered" direct "$c0" "$tampered_sha"; then
 fi
 if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$tampered" >/dev/null 2>&1; then
   printf 'Gate policy accepted mismatched local and OSS segment identity\n' >&2
+  exit 1
+fi
+tampered="$ROOT/tampered-observation-cutoff.json"
+jq '.markets.spot.observation_started_at_ns = .markets.spot.segments[0].end_received_at_ns' \
+  "$gate" >"$tampered"
+tampered_sha=$(monday_sha256_file "$tampered")
+if monday_validate_v2_gate "$tampered" direct "$c0" "$tampered_sha"; then
+  printf 'Gate validator accepted pre-observation segment evidence\n' >&2
+  exit 1
+fi
+if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$tampered" >/dev/null 2>&1; then
+  printf 'Gate policy accepted pre-observation segment evidence\n' >&2
   exit 1
 fi
 tampered="$ROOT/tampered-production-memory.json"
@@ -1932,9 +1968,14 @@ done
 [[ $(readlink -- "$ROOT/opt/monday/bin/binance-lob-archiver-shadow") == "$shadow_link_before_sigkill" ]]
 stale_gate_dir=$(find "$ROOT/run/monday/rust-lob-gate" -mindepth 1 -maxdepth 1 -type d -print -quit)
 [[ -n $stale_gate_dir && -f "$stale_gate_dir/monday-rust-lob-gate-$(basename -- "$stale_gate_dir")-spot.service" ]]
+stale_upload_unit="$stale_gate_dir/monday-rust-lob-gate-$(basename -- "$stale_gate_dir")-spot-upload.service"
+[[ -f $stale_upload_unit ]]
 grep -Fqx 'Restart=no' "$stale_gate_dir/monday-rust-lob-gate-$(basename -- "$stale_gate_dir")-spot.service"
 grep -Fqx 'RuntimeMaxSec=900' "$stale_gate_dir/monday-rust-lob-gate-$(basename -- "$stale_gate_dir")-spot.service"
 grep -Fqx 'TimeoutStopSec=60' "$stale_gate_dir/monday-rust-lob-gate-$(basename -- "$stale_gate_dir")-spot.service"
+grep -Fqx 'Restart=no' "$stale_upload_unit"
+grep -Fqx 'RuntimeMaxSec=300' "$stale_upload_unit"
+grep -Fqx 'TimeoutStartSec=300' "$stale_upload_unit"
 stale_run=$(basename -- "$stale_gate_dir")
 [[ -d "$ROOT/data/monday/spool/binance-lob-rust-shadow/gate/$stale_run" ]]
 stale_search_unit="$ROOT/run/systemd/system/monday-rust-lob-gate-${stale_run}-spot.service"
@@ -2291,6 +2332,7 @@ jq -e --arg controller "$candidate" \
    and (.command | contains("--preflight-only") | not)
    and .preflight_only == false and .timeout_seconds == 2400
    and .host_timeout_seconds == 2100 and .host_kill_after_seconds == 240
+   and (.host_timeout_seconds + .host_kill_after_seconds < .timeout_seconds)
    and .production_changed == false' <<<"$operator_json" >/dev/null
 operator_preflight_json=$(MONDAY_CONTROL_PLANE_DRY_RUN=1 "$operator" gate \
   --instance i-fixture --from-controller "$c1" \

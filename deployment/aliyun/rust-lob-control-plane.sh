@@ -15,9 +15,14 @@ usage() {
 }
 
 die() { printf '%s\n' "$*" >&2; exit 1; }
+# The host timeout is the Gate's global budget.  Per-phase deadlines are
+# subordinate stop conditions, not additive reservations.  Leave a bounded
+# cleanup window inside Cloud Assistant's hard 40-minute operator cap.
 readonly GATE_HOST_TIMEOUT_SECONDS=2100
 readonly GATE_KILL_AFTER_SECONDS=240
 readonly GATE_OPERATOR_TIMEOUT_SECONDS=2400
+(( GATE_HOST_TIMEOUT_SECONDS + GATE_KILL_AFTER_SECONDS < GATE_OPERATOR_TIMEOUT_SECONDS )) \
+  || die 'Gate host and cleanup budgets must fit inside the operator timeout'
 
 for command in base64 jq tr; do
   command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
