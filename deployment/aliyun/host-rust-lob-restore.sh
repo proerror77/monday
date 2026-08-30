@@ -414,7 +414,9 @@ fi
 # recovered from the exact pre-commit intent below; no Gate/history scan is
 # performed.
 active_transition_receipt=$(monday_root_join "$ROOT" "data/monday/evidence/cutovers/$CONTROLLER/transition.json")
+active_transition_marker="$active_transition_receipt.sha256"
 transition_receipt_ref=; transition_gate=; transition_gate_sha=
+recovery_transition_marker_repair=false
 if [[ -e $active_transition_receipt || -L $active_transition_receipt ]]; then
   transition_receipt_ref=$active_transition_receipt
   monday_file_direct "$active_transition_receipt" || die 'active transition receipt is indirect'
@@ -512,6 +514,18 @@ if [[ -e $recovery_intent || -L $recovery_intent ]]; then
   if [[ -n $transition_receipt_ref ]]; then
     [[ $recovery_gate == "$transition_gate" && $recovery_gate_sha == "$transition_gate_sha" ]] \
       || die 'cutover recovery intent differs from the active transition'
+    if [[ -e $active_transition_marker || -L $active_transition_marker ]]; then
+      monday_file_direct "$active_transition_marker" \
+        || die 'active transition digest is indirect'
+      [[ $(monday_file_mode "$active_transition_marker") == 440 ]] \
+        || die 'active transition digest mode is invalid'
+      transition_marker_sha=$(awk '$2 == "transition.json" { count++; value=$1 } END { if (count != 1) exit 1; print value }' \
+        "$active_transition_marker") || die 'active transition digest is malformed'
+      [[ $transition_marker_sha == "$(monday_sha256_file "$active_transition_receipt")" ]] \
+        || die 'active transition digest differs from its receipt'
+    else
+      recovery_transition_marker_repair=true
+    fi
   fi
   recovery_before_binary=$(monday_root_join "$ROOT" \
     "opt/monday/releases/binance-lob-archiver/$recovery_before_payload/binance-lob-archiver")
@@ -723,6 +737,23 @@ live_runtime=$(monday_rust_lob_live_runtime_contract_sha256 "$ROOT") \
 [[ $live_runtime == "$runtime" ]] \
   || die 'installed runtime contract differs from active controller after repair'
 if [[ $recovery_intent_valid == true ]]; then
+  if [[ $recovery_transition_marker_repair == true ]]; then
+    recovery_transition_marker_tmp="$active_transition_marker.restore.$$"
+    [[ ! -e $recovery_transition_marker_tmp && ! -L $recovery_transition_marker_tmp \
+      && ! -e $active_transition_marker && ! -L $active_transition_marker ]] \
+      || die 'transition digest repair path already exists'
+    transition_marker_sha=$(monday_sha256_file "$active_transition_receipt")
+    printf '%s  transition.json\n' "$transition_marker_sha" >"$recovery_transition_marker_tmp"
+    chmod 0440 "$recovery_transition_marker_tmp"
+    mv -f -- "$recovery_transition_marker_tmp" "$active_transition_marker"
+    monday_file_direct "$active_transition_marker" \
+      || die 'repaired transition digest is not a direct file'
+    [[ $(monday_file_mode "$active_transition_marker") == 440 ]] \
+      || die 'repaired transition digest mode is invalid'
+    [[ $(awk '$2 == "transition.json" { count++; value=$1 } END { if (count != 1) exit 1; print value }' \
+      "$active_transition_marker") == "$transition_marker_sha" ]] \
+      || die 'repaired transition digest failed readback'
+  fi
   rm -f -- "$recovery_intent" || die 'could not clear converged cutover recovery intent'
   recovery_intent_valid=false
 fi

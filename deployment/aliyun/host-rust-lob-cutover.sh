@@ -50,6 +50,12 @@ receipt_root=$(monday_root_join "$ROOT" data/monday/evidence/cutovers)
 recovery_intent="$receipt_root/$TO/recovery.json"
 recovery_intent_tmp="$recovery_intent.tmp.$$"
 recovery_intent_written=0
+transition_receipt="$receipt_root/$TO/transition.json"
+transition_receipt_tmp="$transition_receipt.tmp.$$"
+transition_marker="$transition_receipt.sha256"
+transition_marker_tmp="$transition_marker.tmp.$$"
+transition_receipt_written=0
+transition_marker_written=0
 lock_root=$(monday_root_join "$ROOT" run/lock)
 mkdir -p "$lock_root"
 exec 9>"$lock_root/monday-rust-lob-control-plane.lock"
@@ -478,6 +484,14 @@ cleanup() {
     if (( projection_prepared == 1 )) && [[ $FROM == direct ]]; then
       restore_direct_topology || rollback_failed=true
     fi
+    if (( transition_receipt_written == 1 )); then
+      rm -f -- "$transition_receipt" || rollback_failed=true
+      transition_receipt_written=0
+    fi
+    if (( transition_marker_written == 1 )); then
+      rm -f -- "$transition_marker" || rollback_failed=true
+      transition_marker_written=0
+    fi
     if (( recovery_intent_written == 1 )) && [[ $rollback_failed == false ]]; then
       rm -f -- "$recovery_intent" "$recovery_intent_tmp" || rollback_failed=true
       recovery_intent_written=0
@@ -527,7 +541,7 @@ cleanup() {
       fi
     fi
   fi
-  rm -f -- "$recovery_intent_tmp"
+  rm -f -- "$recovery_intent_tmp" "$transition_receipt_tmp" "$transition_marker_tmp"
   rm -rf -- "$tmp_root"
   exit "$status"
 }
@@ -597,9 +611,8 @@ if [[ $FROM == direct ]]; then
     "$(monday_root_join "$ROOT" data/monday/evidence)" "$receipt_root" "$receipt_root/$TO"; do
     monday_path_direct "$intent_parent" || die "cutover recovery path is indirect: $intent_parent"
   done
-  [[ ! -e $recovery_intent && ! -L $recovery_intent \
-    && ! -e $recovery_intent_tmp && ! -L $recovery_intent_tmp ]] \
-    || die 'cutover recovery intent already exists for target controller'
+  [[ ! -e $recovery_intent_tmp && ! -L $recovery_intent_tmp ]] \
+    || die 'cutover recovery intent temporary path already exists'
   jq -cS -n --arg from "$before_controller" --arg to "$TO" \
     --arg before_payload "$before_payload" --arg before_runtime "$before_runtime" \
     --arg before_projection "$before_production_projection" \
@@ -613,9 +626,22 @@ if [[ $FROM == direct ]]; then
       runtime_contract_sha256:$runtime,gate_receipt:$gate,gate_sha256:$gate_sha}' \
     >"$recovery_intent_tmp"
   chmod 0440 "$recovery_intent_tmp"
-  mv -f -- "$recovery_intent_tmp" "$recovery_intent"
+  if [[ -e $recovery_intent || -L $recovery_intent ]]; then
+    monday_file_direct "$recovery_intent" \
+      || die 'existing cutover recovery intent is indirect'
+    [[ $(monday_file_mode "$recovery_intent") == 440 ]] \
+      || die 'existing cutover recovery intent mode is invalid'
+    cmp -s "$recovery_intent_tmp" "$recovery_intent" \
+      || die 'existing cutover recovery intent differs from this frozen direct transition'
+    rm -f -- "$recovery_intent_tmp"
+  else
+    mv -f -- "$recovery_intent_tmp" "$recovery_intent"
+  fi
   monday_file_direct "$recovery_intent" || die 'cutover recovery intent is not a direct file'
   recovery_intent_written=1
+  if [[ ${MONDAY_CUTOVER_HARD_CRASH_AFTER_RECOVERY_INTENT:-0} == 1 ]]; then
+    kill -KILL "$$"
+  fi
 fi
 link_projection() {
   local link=$1 target=$2 temporary="$1.new.$$"
@@ -861,11 +887,6 @@ for asset in "${CONTROLLER_PROJECTION_ASSETS[@]}"; do
   [[ $(monday_sha256_file "$resolved") == "$(monday_sha256_file "$target_release/deployment/$asset")" ]] \
     || die "active controller projection differs from target: $asset"
 done
-if (( recovery_intent_written == 1 )); then
-  rm -f -- "$recovery_intent" || die 'could not clear converged cutover recovery intent'
-  recovery_intent_written=0
-fi
-
 recovery_scheduler_state='{}'
 if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
   for recovery_timer in $(monday_rust_lob_recovery_timer_units); do
@@ -877,8 +898,12 @@ if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
   done
 fi
 
-mkdir -p "$receipt_root/$TO"; receipt="$receipt_root/$TO/transition.json"
-[[ ! -e $receipt && ! -L $receipt ]] || die 'transition receipt already exists for target controller'
+mkdir -p "$receipt_root/$TO"; receipt=$transition_receipt
+[[ ! -e $receipt && ! -L $receipt \
+  && ! -e $transition_marker && ! -L $transition_marker \
+  && ! -e $transition_receipt_tmp && ! -L $transition_receipt_tmp \
+  && ! -e $transition_marker_tmp && ! -L $transition_marker_tmp ]] \
+  || die 'transition receipt already exists for target controller'
 completed_at_ns=$(date +%s%N)
 [[ $completed_at_ns =~ ^[0-9]+$ ]] || die 'cutover completion timestamp is unavailable'
 completed_at=$(monday_epoch_ns_rfc3339 "$completed_at_ns") || die 'cutover completion timestamp is invalid'
@@ -901,7 +926,7 @@ for asset in "${CONTROLLER_PROJECTION_ASSETS[@]}"; do
     '$values + {($asset):{target:$target,sha256:$sha}}')
 done
 gate_evidence=$(jq -cS '{candidate_control_bytes,resource_admission,io_full_psi_windows,shadow_staging,checks,markets}' "$GATE")
-transition_tmp="$receipt.tmp.$$"
+transition_tmp=$transition_receipt_tmp
 source_mode=stable
 [[ $FROM == direct ]] && source_mode=direct
   jq -cS -n --arg from "$before_controller" --arg source_mode "$source_mode" --arg to "$TO" --arg payload "$target_payload" --arg runtime "$target_runtime" \
@@ -926,7 +951,35 @@ source_mode=stable
       production_projection:$stable,assets:$before_assets},
     installed_assets:$installed_assets,installed_projections:$installed_projections,
     installed_controller_projections:$installed_controller_projections,result:"success"}' >"$transition_tmp"
-chmod 0640 "$transition_tmp"; mv -f -- "$transition_tmp" "$receipt"
-receipt_sha=$(monday_sha256_file "$receipt"); printf '%s  transition.json\n' "$receipt_sha" >"$receipt.sha256"; chmod 0440 "$receipt.sha256"
+chmod 0640 "$transition_tmp"
+monday_validate_v2_transition "$ROOT" "$transition_tmp" "$FROM" "$TO" "$GATE" "$GATE_SHA" \
+  || die 'new transition receipt failed validation before commit'
+receipt_sha=$(monday_sha256_file "$transition_tmp")
+printf '%s  transition.json\n' "$receipt_sha" >"$transition_marker_tmp"
+chmod 0440 "$transition_marker_tmp"
+mv -f -- "$transition_tmp" "$receipt"
+transition_receipt_written=1
+mv -f -- "$transition_marker_tmp" "$transition_marker"
+transition_marker_written=1
+monday_file_direct "$receipt" || die 'committed transition receipt is not a direct file'
+monday_file_direct "$transition_marker" || die 'committed transition digest is not a direct file'
+[[ $(monday_file_mode "$receipt") == 640 && $(monday_file_mode "$transition_marker") == 440 ]] \
+  || die 'committed transition evidence mode is invalid'
+[[ $(monday_sha256_file "$receipt") == "$receipt_sha" ]] \
+  || die 'committed transition receipt digest changed during readback'
+marker_sha=$(awk '$2 == "transition.json" { count++; value=$1 } END { if (count != 1) exit 1; print value }' \
+  "$transition_marker") || die 'committed transition digest marker is malformed'
+[[ $marker_sha == "$receipt_sha" ]] || die 'committed transition digest marker differs during readback'
+monday_validate_v2_transition "$ROOT" "$receipt" "$FROM" "$TO" "$GATE" "$GATE_SHA" \
+  || die 'committed transition receipt failed readback validation'
+if [[ ${MONDAY_CUTOVER_HARD_CRASH_AFTER_TRANSITION_RECEIPT:-0} == 1 ]]; then
+  kill -KILL "$$"
+fi
+if (( recovery_intent_written == 1 )); then
+  rm -f -- "$recovery_intent" || die 'could not clear committed cutover recovery intent'
+  recovery_intent_written=0
+fi
+transition_receipt_written=0
+transition_marker_written=0
 trap - EXIT
 printf 'Pair cutover complete\nTransition receipt: %s\nSHA-256: %s\n' "$receipt" "$receipt_sha"
