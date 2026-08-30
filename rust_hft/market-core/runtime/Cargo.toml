@@ -25,11 +25,9 @@ portfolio_core = { package = "hft-portfolio-core", path = "../../risk-control/po
 adapter-bitget-data = { package = "hft-data-adapter-bitget", path = "../../data-pipelines/adapters/adapter-bitget", optional = true }
 adapter-binance-data = { package = "hft-data-adapter-binance", path = "../../data-pipelines/adapters/adapter-binance", optional = true }
 adapter-binance-prediction-data = { package = "hft-data-adapter-binance-prediction", path = "../../data-pipelines/adapters/adapter-binance-prediction", optional = true }
-adapter-backpack-data = { package = "hft-data-adapter-backpack", path = "../../data-pipelines/adapters/adapter-backpack", optional = true }
 adapter-bybit-data = { package = "hft-data-adapter-bybit", path = "../../data-pipelines/adapters/adapter-bybit", optional = true }
 adapter-mock-data = { package = "hft-data-adapter-mock", path = "../../data-pipelines/adapters/adapter-mock", optional = true }
 adapter-asterdex-data = { package = "hft-data-adapter-asterdex", path = "../../data-pipelines/adapters/adapter-asterdex", optional = true }
-adapter-lighter-data = { package = "hft-data-adapter-lighter", path = "../../data-pipelines/adapters/adapter-lighter", optional = true }
 adapter-grvt-data = { package = "hft-data-adapter-grvt", path = "../../data-pipelines/adapters/adapter-grvt", optional = true }
 adapter-ondo-perps-data = { package = "hft-data-adapter-ondo-perps", path = "../../data-pipelines/adapters/adapter-ondo-perps", optional = true }
 adapter-polymarket-data = { package = "hft-data-adapter-polymarket", path = "../../data-pipelines/adapters/adapter-polymarket", optional = true }
@@ -38,13 +36,9 @@ adapter-polymarket-data = { package = "hft-data-adapter-polymarket", path = "../
 adapter-bitget-execution = { package = "hft-execution-adapter-bitget", path = "../../execution-gateway/adapters/adapter-bitget", optional = true }
 adapter-binance-execution = { package = "hft-execution-adapter-binance", path = "../../execution-gateway/adapters/adapter-binance", optional = true }
 adapter-binance-prediction-execution = { package = "hft-execution-adapter-binance-prediction", path = "../../execution-gateway/adapters/adapter-binance-prediction", optional = true }
-adapter-backpack-execution = { package = "hft-execution-adapter-backpack", path = "../../execution-gateway/adapters/adapter-backpack", optional = true }
 adapter-bybit-execution = { package = "hft-execution-adapter-bybit", path = "../../execution-gateway/adapters/adapter-bybit", optional = true }
 adapter-okx-execution = { package = "hft-execution-adapter-okx", path = "../../execution-gateway/adapters/adapter-okx", optional = true }
-adapter-hyperliquid-data = { package = "hft-data-adapter-hyperliquid", path = "../../data-pipelines/adapters/adapter-hyperliquid", optional = true }
-adapter-hyperliquid-execution = { package = "hft-execution-adapter-hyperliquid", path = "../../execution-gateway/adapters/adapter-hyperliquid", optional = true }
 adapter-asterdex-execution = { package = "hft-execution-adapter-asterdex", path = "../../execution-gateway/adapters/adapter-asterdex", optional = true }
-adapter-lighter-execution = { package = "hft-execution-adapter-lighter", path = "../../execution-gateway/adapters/adapter-lighter", optional = true }
 adapter-grvt-execution = { package = "hft-execution-adapter-grvt", path = "../../execution-gateway/adapters/adapter-grvt", optional = true }
 adapter-ondo-perps-execution = { package = "hft-execution-adapter-ondo-perps", path = "../../execution-gateway/adapters/adapter-ondo-perps", optional = true }
 adapter-polymarket-execution = { package = "hft-execution-adapter-polymarket", path = "../../execution-gateway/adapters/adapter-polymarket", optional = true }
@@ -98,23 +92,18 @@ full_runtime_test = ["tokio/test-util"]
 json-simd = [
     "adapter-bitget-data?/json-simd",
     "adapter-binance-data?/json-simd",
-    "adapter-backpack-data?/json-simd",
     "adapter-bybit-data?/json-simd",
     "adapter-asterdex-data?/json-simd",
-    "adapter-lighter-data?/json-simd",
     "adapter-grvt-data?/json-simd",
-    "adapter-hyperliquid-data?/json-simd",
 ]
 
 # Data adapters
 adapter-bitget-data = ["dep:adapter-bitget-data"]
 adapter-binance-data = ["dep:adapter-binance-data"]
 adapter-binance-prediction-data = ["dep:adapter-binance-prediction-data"]
-adapter-backpack-data = ["dep:adapter-backpack-data"]
 adapter-bybit-data = ["dep:adapter-bybit-data"]
 adapter-mock-data = ["dep:adapter-mock-data"]
 adapter-asterdex-data = ["dep:adapter-asterdex-data"]
-adapter-lighter-data = ["dep:adapter-lighter-data"]
 adapter-grvt-data = ["dep:adapter-grvt-data"]
 adapter-ondo-perps-data = ["dep:adapter-ondo-perps-data"]
 adapter-polymarket-data = ["dep:adapter-polymarket-data"]
@@ -123,13 +112,9 @@ adapter-polymarket-data = ["dep:adapter-polymarket-data"]
 adapter-bitget-execution = ["dep:adapter-bitget-execution"]
 adapter-binance-execution = ["dep:adapter-binance-execution"]
 adapter-binance-prediction-execution = ["dep:adapter-binance-prediction-execution"]
-adapter-backpack-execution = ["dep:adapter-backpack-execution"]
 adapter-bybit-execution = ["dep:adapter-bybit-execution"]
 adapter-okx-execution = ["dep:adapter-okx-execution"]
-adapter-hyperliquid-data = ["dep:adapter-hyperliquid-data"]
-adapter-hyperliquid-execution = ["dep:adapter-hyperliquid-execution"]
 adapter-asterdex-execution = ["dep:adapter-asterdex-execution"]
-adapter-lighter-execution = ["dep:adapter-lighter-execution"]
 adapter-grvt-execution = ["dep:adapter-grvt-execution"]
 adapter-ondo-perps-execution = ["dep:adapter-ondo-perps-execution"]
 adapter-polymarket-execution = ["dep:adapter-polymarket-execution", "dep:secrecy"]
@@ -153,15 +138,12 @@ infra-secrets = ["dep:infra-secrets"]
 bitget = ["adapter-bitget-data", "adapter-bitget-execution"]
 binance = ["adapter-binance-data", "adapter-binance-execution"]
 binance-prediction = ["adapter-binance-prediction-data", "adapter-binance-prediction-execution"]
-backpack = ["adapter-backpack-data", "adapter-backpack-execution"]
 bybit = ["adapter-bybit-data", "adapter-bybit-execution"]
 okx = ["adapter-okx-execution"]
-hyperliquid = ["adapter-hyperliquid-data", "adapter-hyperliquid-execution"]
 asterdex = ["adapter-asterdex-data", "adapter-asterdex-execution"]
-lighter = ["adapter-lighter-data", "adapter-lighter-execution"]
 grvt = ["adapter-grvt-data", "adapter-grvt-execution"]
 ondo-perps = ["adapter-ondo-perps-data", "adapter-ondo-perps-execution"]
 polymarket = ["adapter-polymarket-data", "adapter-polymarket-execution"]
 mock = ["adapter-mock-data"]
 all-strategies = ["strategy-trend", "strategy-arbitrage", "strategy-imbalance", "strategy-formula", "strategy-dl", "strategy-lob-flow-grid"]
-full = ["bitget", "binance", "binance-prediction", "bybit", "okx", "hyperliquid", "asterdex", "lighter", "backpack", "grvt", "ondo-perps", "polymarket", "all-strategies", "adapter-mock-data"]
+full = ["bitget", "binance", "binance-prediction", "bybit", "okx", "asterdex", "grvt", "ondo-perps", "polymarket", "all-strategies", "adapter-mock-data"]

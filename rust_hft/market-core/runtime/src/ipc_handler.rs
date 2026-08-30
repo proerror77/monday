@@ -1021,6 +1021,7 @@ mod tests {
             failures: vec![engine::execution_worker::CancelFailure {
                 order_id: OrderId("failed".to_string()),
                 reason: "venue rejected cancellation".to_string(),
+                outcome_unknown: false,
             }],
         };
 

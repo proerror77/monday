@@ -153,12 +153,8 @@ assert_owning_packages "$preflight_and_rust" 'future-rust-tool'
 assert_flag "$preflight_and_rust" toolchain true
 
 owning_package_cases=(
-  'hft-data-adapter-replay|rust_hft/data-pipelines/adapters/adapter-replay/src/lib.rs'
-  'hft-testing|rust_hft/infra-services/testing/src/lib.rs'
   'hft-binance-md|rust_hft/apps/binance-md/src/main.rs'
   'hft-replay|rust_hft/apps/replay/src/main.rs'
-  'hft-dataset|rust_hft/tools/dataset/src/main.rs'
-  'hyperliquid-demo|rust_hft/tools/hyperliquid-demo/src/main.rs'
   'ws-connection-test|rust_hft/tools/ws_test/src/main.rs'
   'listing-monitor|rust_hft/tools/listing-monitor/src/main.rs'
   'future-rust-tool|rust_hft/tools/future-rust-tool/src/lib.rs'

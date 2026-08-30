@@ -1,12 +1,11 @@
 //! 系統建構器 - 宣告式裝配與註冊
 use crate::sharding::ShardConfig;
 use serde::{Deserialize, Serialize};
-// use serde_yaml::Value as YamlValue; // 移除未使用引用
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
 #[cfg(feature = "infra-secrets")]
-use infra_secrets::{SecretsConfig, SecretsManager};
+use infra_secrets::SecretsManager;
 
 // strategy_factory 僅在 runtime_management 使用
 use crate::portfolio_manager::PortfolioManager;
@@ -94,27 +93,6 @@ pub struct AccountConfig {
     #[serde(default)]
     pub credentials: Option<AccountCredentials>,
 }
-
-// SystemEngineConfig 與 CpuAffinityConfig 已移至 config_types 模組
-
-// FlipPolicy 現在從 engine::dataflow 導入
-
-// VenueConfig 已移至 config_types
-
-// VenueType 已移至 config_types
-
-// VenueCapabilities 已移至 config_types
-
-// StrategyConfig 已移至 config_types
-
-/// 投資組合設定，用於聚合多策略並套用整體限制
-// PortfolioSpec 已移至 config_types
-
-// StrategyType 已移至 config_types
-
-// StrategyParams 已移至 config_types
-
-// LobFlowGridParams 已移至 config_types
 
 #[cfg(feature = "strategy-lob-flow-grid")]
 fn apply_lob_flow_overrides(
@@ -414,9 +392,7 @@ impl SystemBuilder {
             return Ok(self);
         }
 
-        // 初始化 SecretsManager
-        let secrets_config = SecretsConfig::from_env();
-        let manager = SecretsManager::new(secrets_config).await?;
+        let manager = SecretsManager::from_env();
 
         info!("SecretsManager 已初始化，開始解析憑證");
 
@@ -440,7 +416,7 @@ impl SystemBuilder {
 
         // 解析 api_key 參考
         if let Some(ref secret_ref) = venue.secret_ref_api_key {
-            match manager.get_secret(secret_ref).await {
+            match manager.get_secret(secret_ref) {
                 Ok(secret_value) => match secret_value.to_string_safe() {
                     Ok(api_key) => {
                         venue.api_key = Some(api_key);
@@ -468,7 +444,7 @@ impl SystemBuilder {
 
         // 解析 secret 參考
         if let Some(ref secret_ref) = venue.secret_ref_secret {
-            match manager.get_secret(secret_ref).await {
+            match manager.get_secret(secret_ref) {
                 Ok(secret_value) => match secret_value.to_string_safe() {
                     Ok(secret) => {
                         venue.secret = Some(secret);
@@ -496,7 +472,7 @@ impl SystemBuilder {
 
         // 解析 passphrase 參考
         if let Some(ref secret_ref) = venue.secret_ref_passphrase {
-            match manager.get_secret(secret_ref).await {
+            match manager.get_secret(secret_ref) {
                 Ok(secret_value) => match secret_value.to_string_safe() {
                     Ok(passphrase) => {
                         venue.passphrase = Some(passphrase);
@@ -966,22 +942,6 @@ impl SystemRuntime {
                         info!("GRVT 行情已橋接至引擎");
                     }
                 }
-                VenueType::Hyperliquid => {
-                    #[cfg(feature = "adapter-hyperliquid-data")]
-                    {
-                        let market_config = venue_cfg
-                            .as_ref()
-                            .map(|cfg| parse_hyperliquid_market_config(cfg, &symbols))
-                            .unwrap_or_else(|| {
-                                adapter_hyperliquid_data::HyperliquidMarketConfig::default()
-                            });
-                        let stream =
-                            adapter_hyperliquid_data::HyperliquidMarketStream::new(market_config);
-                        let consumer = bridge.bridge_stream(stream, symbols).await?;
-                        self.engine.lock().await.register_event_consumer(consumer);
-                        info!("Hyperliquid 行情已橋接至引擎");
-                    }
-                }
                 VenueType::OndoPerps => {
                     #[cfg(feature = "adapter-ondo-perps-data")]
                     {
@@ -1010,20 +970,6 @@ impl SystemRuntime {
                         info!("Polymarket public CLOB market data bridged into the engine");
                     }
                 }
-                VenueType::Backpack => {
-                    #[cfg(feature = "adapter-backpack-data")]
-                    {
-                        let market_config = venue_cfg
-                            .as_ref()
-                            .and_then(|cfg| parse_backpack_market_config(cfg, &symbols))
-                            .unwrap_or_else(adapter_backpack_data::BackpackMarketConfig::default);
-                        let stream =
-                            adapter_backpack_data::BackpackMarketStream::new(market_config);
-                        let consumer = bridge.bridge_stream(stream, symbols).await?;
-                        self.engine.lock().await.register_event_consumer(consumer);
-                        info!("Backpack 行情已橋接至引擎");
-                    }
-                }
                 VenueType::Mock => {
                     #[cfg(feature = "adapter-mock-data")]
                     {
@@ -1039,15 +985,6 @@ impl SystemRuntime {
                         let consumer = bridge.bridge_stream(stream, symbols).await?;
                         self.engine.lock().await.register_event_consumer(consumer);
                         info!("Aster DEX 行情已橋接至引擎");
-                    }
-                }
-                VenueType::Lighter => {
-                    #[cfg(feature = "adapter-lighter-data")]
-                    {
-                        let stream = adapter_lighter_data::LighterMarketStream::new();
-                        let consumer = bridge.bridge_stream(stream, symbols).await?;
-                        self.engine.lock().await.register_event_consumer(consumer);
-                        info!("Lighter 行情已橋接至引擎");
                     }
                 }
                 _ => {}
@@ -1656,99 +1593,6 @@ fn parse_binance_capabilities(
     caps
 }
 
-#[cfg(feature = "adapter-hyperliquid-data")]
-fn parse_hyperliquid_market_config(
-    venue_cfg: &VenueConfig,
-    symbols: &[Symbol],
-) -> adapter_hyperliquid_data::HyperliquidMarketConfig {
-    let mut config = adapter_hyperliquid_data::HyperliquidMarketConfig::default();
-
-    // 覆蓋 ws_base_url（如果提供）
-    if let Some(ws) = venue_cfg.ws_public.clone() {
-        config.ws_base_url = ws;
-    }
-
-    // 從 data_config 讀取其他配置（如果提供）
-    if let Some(value) = venue_cfg.data_config.clone() {
-        if let Ok(reconnect) = serde_yaml::from_value::<serde_yaml::Mapping>(value.clone())
-            .and_then(|m| {
-                m.get("reconnect_interval_ms")
-                    .and_then(|v| serde_yaml::from_value(v.clone()).ok())
-            })
-        {
-            config.reconnect_interval_ms = reconnect;
-        }
-        if let Ok(heartbeat) = serde_yaml::from_value::<serde_yaml::Mapping>(value.clone())
-            .and_then(|m| {
-                m.get("heartbeat_interval_ms")
-                    .and_then(|v| serde_yaml::from_value(v.clone()).ok())
-            })
-        {
-            config.heartbeat_interval_ms = heartbeat;
-        }
-    }
-
-    // 使用傳入的 symbols
-    config.symbols = symbols.to_vec();
-    config
-}
-
-#[cfg(feature = "adapter-backpack-data")]
-fn parse_backpack_market_config(
-    venue_cfg: &VenueConfig,
-    symbols: &[Symbol],
-) -> Option<adapter_backpack_data::BackpackMarketConfig> {
-    let mut config = adapter_backpack_data::BackpackMarketConfig::default();
-
-    if let Some(value) = venue_cfg.data_config.clone() {
-        if let Some(parsed) = deserialize_backpack_market_value(value) {
-            config = parsed;
-        } else {
-            warn!(
-                "Backpack data_config 解析失敗 (venue: {}), 將使用預設設定",
-                venue_cfg.name
-            );
-        }
-    }
-
-    if let Some(ws) = venue_cfg.ws_public.clone() {
-        if config.ws_url == adapter_backpack_data::DEFAULT_WS_URL {
-            config.ws_url = ws;
-        }
-    }
-
-    if config.default_symbols.is_empty() && !symbols.is_empty() {
-        config.default_symbols = symbols.to_vec();
-    }
-
-    Some(config)
-}
-
-#[cfg(feature = "adapter-backpack-data")]
-fn deserialize_backpack_market_value(
-    value: YamlValue,
-) -> Option<adapter_backpack_data::BackpackMarketConfig> {
-    match value {
-        YamlValue::Mapping(mut map) => {
-            if let Some(adapter) = map
-                .get(&YamlValue::from("adapter_type"))
-                .and_then(|v| v.as_str())
-            {
-                if !adapter.eq_ignore_ascii_case("backpack") {
-                    warn!(
-                        "data_config.adapter_type = {} 非 backpack，忽略自訂配置",
-                        adapter
-                    );
-                    return None;
-                }
-            }
-            map.remove(&YamlValue::from("adapter_type"));
-            serde_yaml::from_value(YamlValue::Mapping(map)).ok()
-        }
-        other => serde_yaml::from_value(other).ok(),
-    }
-}
-
 fn spawn_engine_loop(
     engine_arc: Arc<Mutex<Engine>>,
     notify: Arc<Notify>,
@@ -2286,6 +2130,7 @@ mod tests {
                 }],
                 sequence: 1,
                 source_venue: Some(VenueId::BINANCE),
+                timestamps: MarketDataTimestamps::default(),
             }))
             .expect("queue a strategy-producing market event");
 
@@ -2372,50 +2217,6 @@ mod tests {
             ipc_task.abort();
             let _ = ipc_task.await;
         }
-    }
-
-    #[cfg(feature = "adapter-backpack-data")]
-    #[test]
-    fn backpack_market_config_overrides_defaults() {
-        let data_yaml = serde_yaml::from_str::<YamlValue>(
-            r#"
-adapter_type: backpack
-ws_url: wss://api.custom
-subscribe_depth: false
-reconnect_interval_ms: 2000
-default_symbols:
-  - SOL_USDC
-"#,
-        )
-        .unwrap();
-
-        let venue_cfg = VenueConfig {
-            name: "backpack".to_string(),
-            account_id: None,
-            venue_type: VenueType::Backpack,
-            ws_public: Some("wss://custom".to_string()),
-            ws_private: None,
-            rest: Some("https://overridden".to_string()),
-            api_key: None,
-            secret: None,
-            passphrase: None,
-            execution_mode: Some("Paper".to_string()),
-            capabilities: VenueCapabilities::default(),
-            inst_type: None,
-            simulate_execution: false,
-            symbol_catalog: Vec::<InstrumentId>::new(),
-            data_config: Some(data_yaml),
-            execution_config: None,
-        };
-
-        let symbols = vec![Symbol::new("BTC_USDC")];
-        let cfg = parse_backpack_market_config(&venue_cfg, &symbols).unwrap();
-
-        assert_eq!(cfg.ws_url, "wss://api.custom");
-        assert!(!cfg.subscribe_depth);
-        assert!(cfg.subscribe_trades);
-        assert_eq!(cfg.reconnect_interval_ms, 2000);
-        assert_eq!(cfg.default_symbols, vec![Symbol::new("SOL_USDC")]);
     }
 
     // ===== Credential Resolution Integration Tests =====

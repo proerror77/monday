@@ -115,6 +115,17 @@ Migrate the imported PLOY compatibility code into Monday's canonical market-fami
   lockfiles plus the governed prediction-policy identity.
 - [x] Pass focused metadata, build, policy-identity test, and Clippy checks; the
   one transient engine timing assertion passed on exact rerun.
+- [x] Retire the unsupported Backpack, Hyperliquid, and Lighter runtime adapter
+  groups, plus replay/dataset/demo tools, active configs, guides, and Spec Kit
+  scaffolding; keep the Hyperliquid collector and historical audit records.
+- [x] Reject retired runtime venue configs explicitly while retaining shared
+  venue identities needed by acquisition and historical data.
+- [x] Collapse the secrets subsystem to its only implemented environment
+  backend and remove the unused dynamic backend/config/credential surfaces.
+- [x] Refresh stale runtime test fixtures and serialize the remaining default
+  IPC lifecycle test; all 79 runtime all-feature tests now pass.
+- [x] Pass root/nested locked metadata, CI scope selection, affected all-feature
+  builds/tests, prediction-policy identity tests, focused Clippy, and diff checks.
 
 ## Safety
 
