@@ -1,6 +1,6 @@
 ---
 name: monday-worktree-audit
-description: Classify Monday Git worktrees as registered-clean, dirty, or Git-prunable without deleting or cleaning them. Use for worktree inventory, branch cleanup planning, disk-usage review, stale-worktree questions, ownership conflicts, or before any request to remove a worktree or branch.
+description: Classify requested Monday Git worktrees as registered-clean, dirty, or Git-prunable without deleting or cleaning them. Use for explicit inventory, cleanup planning, stale-worktree, disk-usage, or ownership-conflict requests; do not use merely because ordinary work creates or uses a known worktree.
 ---
 
 # Monday Worktree Audit
@@ -9,9 +9,9 @@ Produce a read-only inventory. Classification is not deletion authorization.
 
 ## Workflow
 
-1. From the repository, run `.github/scripts/agent-worktree-preflight.sh report`.
-2. Read `git worktree list --porcelain` and preserve each exact path, branch or detached `HEAD`, and Git's `prunable` marker.
-3. Enumerate local branches with `git for-each-ref refs/heads` and report branches not attached to any worktree separately.
+1. Scope the audit to the named paths. Run `.github/scripts/agent-worktree-preflight.sh report` for a repository-wide inventory or cleanup plan.
+2. Read `git worktree list --porcelain` once and preserve each in-scope path, branch or detached `HEAD`, and Git's `prunable` marker.
+3. Enumerate unattached local branches only for repository-wide inventory or branch-cleanup requests.
 4. For every dirty entry, report changed and untracked paths without modifying them.
 5. For any cleanup candidate, additionally read its ownership record, exact `HEAD`, upstream/push state, open or closed PR state, merge state, and active-session use.
    Lock-file existence is not lock ownership; record a lock as active only with `flock` or holder evidence.
@@ -30,7 +30,7 @@ Produce a read-only inventory. Classification is not deletion authorization.
 
 ## Output
 
-Return totals for `registered-clean`, `dirty`, and `prunable`, followed by:
+For a repository-wide audit, return totals for `registered-clean`, `dirty`, and `prunable`. Then report the in-scope entries as:
 `Path | Branch/HEAD | State | Dirty/unpushed | PR | Owner/use | Cleanup safety | Reason`.
 Then list unattached branches as `Branch | HEAD | Upstream/unpushed | PR | Owner/use | Cleanup safety | Reason`.
 List only evidence-backed cleanup candidates in a separate final section; do not recommend deletion without an exact authorized path list.

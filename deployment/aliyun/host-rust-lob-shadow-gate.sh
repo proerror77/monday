@@ -12,7 +12,6 @@ readonly SHADOW_STOP_TIMEOUT_SECONDS=60
 readonly UPLOAD_DRAIN_TIMEOUT_SECONDS=300
 readonly TRANSIENT_WORK_TIMEOUT_SECONDS=300
 readonly MAX_HEALTH_SILENCE_SECONDS=120
-readonly MAX_SEGMENT_GAP_NS=90000000000
 readonly HOST_MEMORY_RESERVE_BYTES=1073741824
 readonly TARGET_PRODUCTION_SLICE_MEMORY_HIGH_BYTES=3221225472
 readonly TARGET_PRODUCTION_SLICE_MEMORY_MAX_BYTES=3758096384
@@ -1696,9 +1695,9 @@ write_deadline_segments() {
       '$values + [$value]') || return 1
     count=$((count + 1))
   done <"$source"
-  (( count == 2 )) || return 1
+  (( count == 1 )) || return 1
   jq -cn --argjson segments "$records" \
-    '{schema:"monday.rust_lob_shadow_gate_deadline_segments.v1",segments:$segments}' \
+    '{schema:"monday.rust_lob_shadow_gate_deadline_segments.v2",segments:$segments}' \
     >"$temporary" || return 1
   chmod 0440 "$temporary" || return 1
   mv -f -- "$temporary" "$destination"
@@ -1707,7 +1706,7 @@ write_deadline_failure() {
   local market=$1 readiness=$2 health_source=$3 segment_source=$4
   local started_ns=$5 deadline_ns=$6 sample_started_ns=$7 sampled_ns=$8 failure_ns=$9
   local elapsed health_eligible=false
-  local segment_pair_ready=false segment_snapshot_json=null
+  local segment_ready=false segment_snapshot_json=null
   local health_file="$evidence_dir/deadline-health.json"
   local segment_file="$evidence_dir/deadline-segments.json"
   local temporary="$evidence_dir/deadline-failure.json.tmp.$$"
@@ -1721,7 +1720,7 @@ write_deadline_failure() {
   if (( readiness == 0 )); then
     [[ -f $segment_source ]] || return 1
     write_deadline_segments "$segment_source" "$segment_file" || return 1
-    segment_pair_ready=true
+    segment_ready=true
     segment_snapshot_json=$(jq -cn --arg file "${segment_file##*/}" \
       --arg sha "$(sha256_file "$segment_file")" '{file:$file,sha256:$sha}') || return 1
   fi
@@ -1731,19 +1730,19 @@ write_deadline_failure() {
     --arg runtime "$candidate_runtime" --arg health_file "${health_file##*/}" \
     --arg health_sha "$(sha256_file "$health_file")" \
     --argjson readiness "$readiness" --argjson health_eligible "$health_eligible" \
-    --argjson segment_pair_ready "$segment_pair_ready" \
+    --argjson segment_ready "$segment_ready" \
     --argjson segment_snapshot "$segment_snapshot_json" \
     --argjson started "$started_ns" --argjson deadline "$deadline_ns" \
     --argjson sample_started "$sample_started_ns" --argjson sampled "$sampled_ns" \
     --argjson failure "$failure_ns" --argjson elapsed "$elapsed" \
-    '{schema:"monday.rust_lob_shadow_gate_deadline_failure.v1",authoritative:false,
+    '{schema:"monday.rust_lob_shadow_gate_deadline_failure.v2",authoritative:false,
       cause:"evidence_deadline",run_id:$run,market:$market,
       candidate_controller_sha256:$controller,candidate_payload_sha256:$payload,
       candidate_runtime_contract_sha256:$runtime,
       observation:{started_monotonic_ns:$started,deadline_monotonic_ns:$deadline,
         sample_started_monotonic_ns:$sample_started,sampled_monotonic_ns:$sampled,
         failure_detected_monotonic_ns:$failure,elapsed_seconds:$elapsed},
-      health_eligible:$health_eligible,segment_pair_ready:$segment_pair_ready,
+      health_eligible:$health_eligible,segment_ready:$segment_ready,
       segment_readiness_code:$readiness,
       health_snapshot:{file:$health_file,sha256:$health_sha},
       segment_snapshot:$segment_snapshot}' >"$temporary" || return 1
@@ -1903,24 +1902,22 @@ fixture_seed_segment() {
   printf '%s\n' "$data_sha" >"$dir/$file._SUCCESS"
 }
 fixture_seed_market_segments() {
-  local market=$1 cutoff=${market_observation_started_ns[$1]} i start end boundary=false segment_count=2
+  local market=$1 cutoff=${market_observation_started_ns[$1]} i start end boundary=false replay_safe=true segment_count=1
   [[ $TEST_ONLY == true ]] || return 0
   if [[ ${MONDAY_GATE_FIXTURE_PREOBSERVATION_SEGMENTS:-0} == 1 ]]; then
     fixture_seed_segment "$market" "$((cutoff - 4000))" "$((cutoff - 3100))" false
     fixture_seed_segment "$market" "$((cutoff - 3000))" "$((cutoff - 2100))" false
   fi
-  [[ ${MONDAY_GATE_FIXTURE_RECONNECT_BOUNDARY:-0} == 1 ]] && segment_count=3
-  [[ ${MONDAY_GATE_FIXTURE_SINGLE_CLEAN_SEGMENT:-0} == 1 ]] && segment_count=1
-  [[ ${MONDAY_GATE_FIXTURE_POST_SAMPLE_EVIDENCE:-0} == 1 ]] && segment_count=1
+  [[ ${MONDAY_GATE_FIXTURE_RECONNECT_BOUNDARY:-0} == 1 ]] && segment_count=2
+  [[ ${MONDAY_GATE_FIXTURE_UNSAFE_THEN_CLEAN:-0} == 1 ]] && segment_count=2
+  [[ ${MONDAY_GATE_FIXTURE_POST_SAMPLE_EVIDENCE:-0} == 1 ]] && segment_count=0
   for ((i = 1; i <= segment_count; i++)); do
-    boundary=false
+    boundary=false; replay_safe=true
     [[ ${MONDAY_GATE_FIXTURE_RECONNECT_BOUNDARY:-0} == 1 && $i -eq 1 ]] && boundary=true
+    [[ ${MONDAY_GATE_FIXTURE_UNSAFE_THEN_CLEAN:-0} == 1 && $i -eq 1 ]] && replay_safe=false
     start=$((cutoff + i * 1000)); end=$((start + 900))
-    fixture_seed_segment "$market" "$start" "$end" "$boundary"
+    fixture_seed_segment "$market" "$start" "$end" "$boundary" "$replay_safe"
   done
-  if [[ ${MONDAY_GATE_FIXTURE_TRAILING_UNSAFE:-0} == 1 ]]; then
-    fixture_seed_segment "$market" "$((cutoff + 2500))" "$((cutoff + 3500))" false false
-  fi
 }
 render_shadow_unit() {
   local market=$1 source_unit source_upload source_env rendered_unit rendered_upload rendered_env spool canonical_upload
@@ -2027,15 +2024,15 @@ run_strict_verifier() {
     --property=OOMScoreAdjust=500 --property=Restart=no --property=RuntimeMaxSec="$TRANSIENT_WORK_TIMEOUT_SECONDS" \
     --uid="$SERVICE_USER" -- "$candidate_binary" "$@"
 }
-run_strict_verifier_pair() { run_strict_verifier --require-lob-continuity "$@"; }
-verify_adjacent_segments() {
+run_strict_lob_verifier() { run_strict_verifier --require-lob-continuity "$@"; }
+verify_clean_segments() {
   local -a args=(); local path digest manifest_digest
   (($# > 0 && $# % 3 == 0)) || return 1
   while (($#)); do
     path=$1; digest=$2; manifest_digest=$3; shift 3
     args+=(--verify-segment "$path" --segment-content-sha256 "$digest" --segment-manifest-sha256 "$manifest_digest")
   done
-  run_strict_verifier_pair "${args[@]}"
+  run_strict_lob_verifier "${args[@]}"
 }
 verify_aggregate_trade_continuity() {
   local -a args=(--verify-aggregate-trade-continuity); local path digest manifest_digest
@@ -2221,8 +2218,8 @@ snapshot_segment_record() {
   manifest_digest=$(sha256_file "$manifest") || return 2
   printf '%s\t%s\n' "$manifest" "$manifest_digest"
 }
-clean_segment_pair_ready() {
-  local market=$1 snapshot=$2 manifest path interval state start end previous_end=0 run_count=0 previous_manifest='' record late_start
+clean_segment_ready() {
+  local market=$1 snapshot=$2 manifest path interval state start end record late_start
   rm -f -- "$snapshot" "$snapshot.tmp"
   if [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_POST_SAMPLE_EVIDENCE:-0} == 1 ]]; then
     late_start=$(( market_observation_started_ns[$market] + 2000 ))
@@ -2235,39 +2232,17 @@ clean_segment_pair_ready() {
     interval=$(segment_manifest_interval "$market" "$manifest" "${phase_session[$market]}") \
       || return 2
     IFS=$'\t' read -r state start end <<<"$interval"
-    if (( end <= market_observation_started_ns[$market] )); then
-      previous_end=0; previous_manifest=; run_count=0
-      continue
-    fi
-    if [[ $state != clean ]]; then
-      previous_end=0; previous_manifest=; run_count=0
-      continue
-    fi
-    if (( previous_end > 0 )); then
-      (( start >= previous_end )) || return 2
-      if (( start - previous_end <= MAX_SEGMENT_GAP_NS )); then
-        run_count=$((run_count + 1))
-      else
-        run_count=1
-      fi
-    else
-      run_count=1
-    fi
-    if (( run_count >= 2 )); then
-      record=$(snapshot_segment_record "$previous_manifest") || return 2
-      printf '%s\n' "$record" >"$snapshot.tmp"
-      record=$(snapshot_segment_record "$manifest") || return 2
-      printf '%s\n' "$record" >>"$snapshot.tmp"
-      mv -f -- "$snapshot.tmp" "$snapshot"
-      return 0
-    fi
-    previous_end=$end
-    previous_manifest=$manifest
+    (( end > market_observation_started_ns[$market] )) || continue
+    [[ $state == clean ]] || continue
+    record=$(snapshot_segment_record "$manifest") || return 2
+    printf '%s\n' "$record" >"$snapshot.tmp"
+    mv -f -- "$snapshot.tmp" "$snapshot"
+    return 0
   done < <(find "${spool_dir[$market]}" -maxdepth 1 -type f -name '*.jsonl.zst.manifest.json' | sort)
   return 1
 }
 verify_segments() {
-  local market=$1 snapshot=$2 manifest snapshot_manifest_digest path file digest manifest_digest success_digest expected_success count=0 previous_end=0 start end segment_json interval state
+  local market=$1 snapshot=$2 manifest snapshot_manifest_digest path file digest manifest_digest success_digest expected_success count=0 start end segment_json interval state
   local -a segment_records=()
   [[ -f $snapshot ]] || die "$market observation segment snapshot is absent"
   phase_segments_json[$market]='[]'
@@ -2280,31 +2255,19 @@ verify_segments() {
     interval=$(segment_manifest_interval "$market" "$manifest" "${phase_session[$market]}") \
       || die "$market manifest failed strict checks"
     IFS=$'\t' read -r state start end <<<"$interval"
-    if (( end <= market_observation_started_ns[$market] )); then
-      previous_end=0; count=0; segment_records=(); phase_segments_json[$market]='[]'
-      continue
-    fi
+    (( end > market_observation_started_ns[$market] )) || continue
     case $state in
-      boundary)
-        previous_end=0; count=0; segment_records=(); phase_segments_json[$market]='[]'
-        continue
-        ;;
+      boundary) continue ;;
       unsafe) die "$market manifest is not replay-safe" ;;
       clean) ;;
       *) die "$market manifest classification is invalid" ;;
     esac
-    if (( previous_end > 0 )); then
-      (( start >= previous_end )) || die "$market segments overlap"
-      if (( start - previous_end > MAX_SEGMENT_GAP_NS )); then
-        count=0; segment_records=(); phase_segments_json[$market]='[]'
-      fi
-    fi
     file=${path##*/}; digest=$(sha256_file "$path"); expected_success="$tmp_dir/$market-$file.expected-success"; printf '%s\n' "$digest" >"$expected_success"; cmp -s "$path._SUCCESS" "$expected_success" || die "$market _SUCCESS digest mismatch"
     success_digest=$(sha256_file "$path._SUCCESS")
     manifest_digest=$(sha256_file "$manifest")
     jq -e --arg digest "$digest" '.sha256 == $digest' "$manifest" >/dev/null \
       || die "$market manifest data digest is invalid"
-    previous_end=$end; count=$((count+1))
+    count=$((count+1))
     segment_json=$(jq -cn --arg file "$file" --arg path "$path" --arg data_sha "$digest" \
       --arg manifest_sha "$manifest_digest" --arg success_sha "$success_digest" \
       --argjson start "$start" --argjson end "$end" --arg session "${phase_session[$market]}" \
@@ -2314,10 +2277,10 @@ verify_segments() {
     phase_segments_json[$market]=$(jq -cn --argjson values "${phase_segments_json[$market]}" \
       --argjson value "$segment_json" '$values + [$value]')
     segment_records+=("$path" "$digest" "$manifest_digest")
-    (( count >= 2 )) && break
+    (( count >= 1 )) && break
   done <"$snapshot"
-  ((count == 2)) || die "$market has fewer than two adjacent clean segments"
-  verify_adjacent_segments "${segment_records[@]}" || die "$market strict LOB continuity verifier failed"
+  ((count == 1)) || die "$market has no clean segment"
+  verify_clean_segments "${segment_records[@]}" || die "$market strict LOB continuity verifier failed"
   if [[ $market == spot ]]; then
     verify_aggregate_trade_continuity "${segment_records[@]}" || die "$market strict aggregate-trade continuity verifier failed"
     verify_raw_trade_continuity "${segment_records[@]}" || die "$market strict raw-trade continuity verifier failed"
@@ -2366,7 +2329,7 @@ run_market_gate_phase() {
       die "$market did not produce an eligible evidence sample before the evidence deadline"
     fi
     observation_sample_started_ns=$observation_failure_ns
-    if clean_segment_pair_ready "$market" "$observation_segment_snapshot"; then
+    if clean_segment_ready "$market" "$observation_segment_snapshot"; then
       readiness=0
     else
       readiness=$?
@@ -2395,7 +2358,7 @@ run_market_gate_phase() {
     if health_ok "$market" "$observation_health_snapshot" && (( readiness == 0 )); then break; fi
     if [[ $TEST_ONLY == true ]]; then
       [[ ${MONDAY_ALLOW_SHORT_GATE_FOR_TESTS:-0} == 1 ]] \
-        || die "$market fixture did not produce two adjacent clean segments"
+        || die "$market fixture did not produce a clean segment"
       sleep 1
     else
       sleep 15
@@ -2497,14 +2460,12 @@ run_oss() {
 verify_oss_roundtrips() {
   local market=$1 readback="$tmp_dir/oss-$1" listing="$tmp_dir/oss-$1.list" uri manifest final_manifest data success expected_success file digest manifest_digest success_digest line token triplet_json observed_at observed_cutoff_ns
   local expected_bucket manifest_name object_prefix data_uri success_uri expected_file
-  local candidates_file unsafe_file interval state manifest_index=0 pair_selected=false
+  local interval state manifest_index=0 segment_selected=false
   resource_monitor_start "oss-readback-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"
   observed_cutoff_ns=$(date +%s%N)
   [[ $observed_cutoff_ns =~ ^[0-9]+$ ]] || die "$market OSS observation clock is unavailable"
-  local start end previous_end=0 count=0; local -a roundtrip_records=(); mkdir -p "$readback"
+  local start end count=0; local -a roundtrip_records=(); mkdir -p "$readback"
   phase_triplets_json[$market]='[]'
-  candidates_file="$readback/replay-safe.tsv"; unsafe_file="$readback/replay-unsafe.tsv"
-  : >"$candidates_file"; : >"$unsafe_file"
   local prefix
   if [[ $TEST_ONLY == true ]]; then
     prefix="oss://fixture/lake/raw/venue=binance/market=$market/dataset=${dataset[$market]}/shard=all/"
@@ -2533,7 +2494,7 @@ verify_oss_roundtrips() {
     [[ $token == *.manifest.json ]] && printf 'oss://%s/%s\n' "${oss_bucket[$market]}" "$token" >>"$readback/manifest-uris"
   done <"$listing"
   sort -u -o "$readback/manifest-uris" "$readback/manifest-uris"
-  # Validate the complete listing before selecting the first qualifying pair;
+  # Validate the complete listing before selecting the first qualifying segment;
   # otherwise a malformed later object could hide behind an early success.
   while IFS= read -r uri; do
     [[ -n $uri ]] || continue
@@ -2571,29 +2532,11 @@ verify_oss_roundtrips() {
     jq -e '(.file | type == "string" and test("^part-[0-9]+\\.jsonl\\.zst$"))' \
       "$manifest" >/dev/null || die "$market OSS manifest filename is invalid"
     case $state in
-      boundary)
-        [[ $pair_selected == false ]] || continue
-        previous_end=0; count=0; roundtrip_records=(); phase_triplets_json[$market]='[]'
-        continue
-        ;;
-      unsafe)
-        printf '%s\t%s\t%s\n' "$start" "$end" "$uri" >>"$unsafe_file"
-        [[ $pair_selected == false ]] || continue
-        previous_end=0; count=0; roundtrip_records=(); phase_triplets_json[$market]='[]'
-        continue
-        ;;
+      boundary|unsafe) continue ;;
       clean) ;;
       *) die "$market OSS manifest classification is invalid" ;;
     esac
-    printf '%s\t%s\t%s\n' "$start" "$end" "$uri" >>"$candidates_file"
-    [[ $pair_selected == false ]] || continue
-    if (( previous_end > 0 )); then
-      (( start >= previous_end )) || die "$market OSS segments overlap"
-      if (( start - previous_end > MAX_SEGMENT_GAP_NS )); then
-        count=0; roundtrip_records=(); phase_triplets_json[$market]='[]'
-      fi
-    fi
-    previous_end=$end
+    [[ $segment_selected == false ]] || continue
     expected_file=${manifest_name%.manifest.json}
     file=$(jq -er '.file' "$manifest"); [[ $file == "$expected_file" ]] \
       || die "$market OSS manifest filename does not match its object URI"
@@ -2629,18 +2572,16 @@ verify_oss_roundtrips() {
       --argjson value "$triplet_json" '$values + [$value]')
     roundtrip_records+=("$data" "$digest" "$manifest_digest")
     count=$((count + 1))
-    (( count < 2 )) || pair_selected=true
+    segment_selected=true
   done <"$readback/manifest-uris"
-  [[ $pair_selected == true && $count -eq 2 ]] \
-    || die "$market OSS readback has fewer than two adjacent clean triplets"
-  monday_validate_replay_safe_manifest_order "$market" "$candidates_file" "$unsafe_file" \
-    || die "$market replay-safe manifest ordering failed"
+  [[ $segment_selected == true && $count -eq 1 ]] \
+    || die "$market OSS readback has no clean triplet"
   jq -e -n --argjson segments "${phase_segments_json[$market]}" \
     --argjson triplets "${phase_triplets_json[$market]}" '
       ($segments | map([.data_sha256, .start_received_at_ns, .end_received_at_ns]))
       == ($triplets | map([.data_sha256, .start_received_at_ns, .end_received_at_ns]))' \
     || die "$market OSS triplets do not match the selected local segments"
-  verify_adjacent_segments "${roundtrip_records[@]}" || die "$market OSS strict LOB continuity verifier failed"
+  verify_clean_segments "${roundtrip_records[@]}" || die "$market OSS strict LOB continuity verifier failed"
   if [[ $market == spot ]]; then
     verify_aggregate_trade_continuity "${roundtrip_records[@]}" || die "$market OSS strict aggregate-trade continuity verifier failed"
     verify_raw_trade_continuity "${roundtrip_records[@]}" || die "$market OSS strict raw-trade continuity verifier failed"
@@ -2778,7 +2719,7 @@ run_upload_units_json=$(jq -cn \
   --arg usdm_sha "${candidate_upload_unit_sha[usdm]}" \
   '{spot:{unit:$spot,sha256:$spot_sha},usdm:{unit:$usdm,sha256:$usdm_sha}}')
 gate_finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ); production_eligible=true; [[ $TEST_ONLY == true ]] && production_eligible=false
-jq -cn --arg schema monday.rust_lob_shadow_gate.v7 --arg from "$before_controller" --arg source_mode "$source_mode" --arg after "$CANDIDATE_CONTROLLER" --arg candidate "$CANDIDATE_CONTROLLER" --arg payload "$candidate_payload" --arg runtime "$candidate_runtime" --arg bundle "$candidate_bundle" --arg source "$candidate_source" --arg before_payload "$before_payload" --arg before_runtime "$before_runtime" --arg before_bundle "$before_bundle" --arg before_source "$before_source" --arg before_projection "$before_production_projection" --arg control_sha "$candidate_control_bytes_sha" --argjson control_assets "$candidate_control_assets" --argjson production_runtime "$candidate_production_runtime" --arg run "$run_id" --arg spool "$run_spool" --arg run_unit_root "$gate_unit_dir" --arg worker_slice "$GATE_WORKER_SLICE" --arg worker_slice_sha "$gate_worker_slice_sha256" --arg worker_slice_cgroup "$gate_worker_slice_control_group" --argjson worker_high "$GATE_WORKER_MEMORY_HIGH_BYTES" --argjson worker_max "$GATE_WORKER_MEMORY_MAX_BYTES" --argjson worker_events_start "$gate_worker_memory_events_start" --argjson worker_events_end "$gate_worker_memory_events_end" --argjson units "$run_units_json" --argjson upload_units "$run_upload_units_json" --arg started "$gate_started_at" --arg finished "$gate_finished_at" --argjson evidence_timeout "$EVIDENCE_TIMEOUT_SECONDS" --argjson settle "$HEALTH_SETTLE_SECONDS" --argjson segment "$GATE_SEGMENT_SECONDS" --argjson host_total "$host_memory_total" --argjson host_swap "$host_swap_total" --argjson production_memory "$production_memory_json" --argjson production_process "$production_process_json" --argjson production_assets "$production_asset_json" --argjson resources "$resource_samples" --argjson psi "$psi_windows" --argjson checks "$checks" --argjson markets "$markets_json" --argjson eligible "$production_eligible" --argjson test_only "$TEST_ONLY" --argjson before_assets "$before_assets_json" --argjson staged_assets "$staged_assets_json" --argjson restored_assets "$restored_assets_json" --arg shadow_binary "$SHADOW_BINARY" --arg candidate_binary "$candidate_binary" --arg old_shadow_target "$old_shadow_target" --arg old_shadow_target_sha "$old_shadow_target_sha256" --argjson old_shadow_present "$old_shadow_present" \
+jq -cn --arg schema monday.rust_lob_shadow_gate.v8 --arg from "$before_controller" --arg source_mode "$source_mode" --arg after "$CANDIDATE_CONTROLLER" --arg candidate "$CANDIDATE_CONTROLLER" --arg payload "$candidate_payload" --arg runtime "$candidate_runtime" --arg bundle "$candidate_bundle" --arg source "$candidate_source" --arg before_payload "$before_payload" --arg before_runtime "$before_runtime" --arg before_bundle "$before_bundle" --arg before_source "$before_source" --arg before_projection "$before_production_projection" --arg control_sha "$candidate_control_bytes_sha" --argjson control_assets "$candidate_control_assets" --argjson production_runtime "$candidate_production_runtime" --arg run "$run_id" --arg spool "$run_spool" --arg run_unit_root "$gate_unit_dir" --arg worker_slice "$GATE_WORKER_SLICE" --arg worker_slice_sha "$gate_worker_slice_sha256" --arg worker_slice_cgroup "$gate_worker_slice_control_group" --argjson worker_high "$GATE_WORKER_MEMORY_HIGH_BYTES" --argjson worker_max "$GATE_WORKER_MEMORY_MAX_BYTES" --argjson worker_events_start "$gate_worker_memory_events_start" --argjson worker_events_end "$gate_worker_memory_events_end" --argjson units "$run_units_json" --argjson upload_units "$run_upload_units_json" --arg started "$gate_started_at" --arg finished "$gate_finished_at" --argjson evidence_timeout "$EVIDENCE_TIMEOUT_SECONDS" --argjson settle "$HEALTH_SETTLE_SECONDS" --argjson segment "$GATE_SEGMENT_SECONDS" --argjson host_total "$host_memory_total" --argjson host_swap "$host_swap_total" --argjson production_memory "$production_memory_json" --argjson production_process "$production_process_json" --argjson production_assets "$production_asset_json" --argjson resources "$resource_samples" --argjson psi "$psi_windows" --argjson checks "$checks" --argjson markets "$markets_json" --argjson eligible "$production_eligible" --argjson test_only "$TEST_ONLY" --argjson before_assets "$before_assets_json" --argjson staged_assets "$staged_assets_json" --argjson restored_assets "$restored_assets_json" --arg shadow_binary "$SHADOW_BINARY" --arg candidate_binary "$candidate_binary" --arg old_shadow_target "$old_shadow_target" --arg old_shadow_target_sha "$old_shadow_target_sha256" --argjson old_shadow_present "$old_shadow_present" \
   '{schema:$schema,control_plane_version:2,passed:true,production_eligible:$eligible,test_only:$test_only,source_mode:$source_mode,from_controller_sha256:$from,transition:{before:$from,after:$after,topology:(if $source_mode == "direct" then "direct-bootstrap" else "stable" end)},candidate_controller_sha256:$candidate,candidate_payload_sha256:$payload,candidate_runtime_contract_sha256:$runtime,candidate_deployment_bundle_sha256:$bundle,candidate_deployment_source_revision:$source,candidate_control_bytes:{sha256:$control_sha,assets:$control_assets},production_runtime:$production_runtime,before:{controller:$from,payload_sha256:$before_payload,runtime_contract_sha256:$before_runtime,deployment_bundle_sha256:$before_bundle,deployment_source_revision:$before_source,production_projection:$before_projection,production_assets:$production_assets},run_id:$run,run_spool:$spool,started_at:$started,finished_at:$finished,evidence_timeout_seconds:$evidence_timeout,health_settle_seconds:$settle,segment_seconds:$segment,host_memory_total_bytes:$host_total,host_swap_total_bytes:$host_swap,production_memory:$production_memory,production_process:$production_process,production_assets:$production_assets,resource_admission:$resources,io_full_psi_windows:$psi,shadow_staging:{mode:"run-scoped",run_unit_root:$run_unit_root,spool_root:$spool,aggregate_slice:{name:$worker_slice,sha256:$worker_slice_sha,cgroup:$worker_slice_cgroup,memory_high_bytes:$worker_high,memory_max_bytes:$worker_max,memory_events:{start:$worker_events_start,end:$worker_events_end}},units:$units,upload_units:$upload_units,candidate_assets:$staged_assets,restored_assets:$restored_assets,before_assets:$before_assets,binary:{path:$run_unit_root,candidate_target:$candidate_binary,restored_target:(if $old_shadow_present then $old_shadow_target else null end),restored_target_sha256:(if $old_shadow_present then $old_shadow_target_sha else null end),restored_present:$old_shadow_present}},checks:$checks,markets:$markets}' >"$gate_json.tmp"
 chmod 0640 "$gate_json.tmp"; [[ ! -e $gate_json ]] || die 'gate receipt already exists'; mv -f -- "$gate_json.tmp" "$gate_json"
 if ! jq -e -f "$POLICY_SOURCE" "$gate_json" >/dev/null; then

@@ -1398,26 +1398,6 @@ monday_rust_lob_verify_systemd_production_slice() {
     && monday_rust_lob_verify_systemd_production_membership "$1"
 }
 
-# Replay-unsafe manifests may only trail the safe observation window.
-monday_validate_replay_safe_manifest_order() {
-  [[ $# -eq 3 ]] || return 2
-  local market=$1 candidates=$2 unsafe_candidates=$3
-  local unsafe_start unsafe_end unsafe_uri
-  [[ -f $candidates && -f $unsafe_candidates ]] || return 2
-  [[ -s $unsafe_candidates ]] || return 0
-  while IFS=$'\t' read -r unsafe_start unsafe_end unsafe_uri; do
-    if awk -F '\t' -v start="$unsafe_start" -v end="$unsafe_end" \
-      '$1 < end && start < $2 { overlap=1 } END { exit(overlap ? 0 : 1) }' "$candidates"; then
-      printf '%s replay-unsafe manifest overlaps a replay-safe segment: %s\n' "$market" "$unsafe_uri" >&2
-      return 1
-    fi
-    if awk -F '\t' -v start="$unsafe_start" '$1 > start { found=1 } END { exit(found ? 0 : 1) }' "$candidates"; then
-      printf '%s has a replay-unsafe manifest before a later replay-safe manifest: %s\n' "$market" "$unsafe_uri" >&2
-      return 1
-    fi
-  done < <(sort -n -k1,1 "$unsafe_candidates")
-}
-
 monday_validate_v2_manifest() {
   [[ $# -eq 1 && -f $1 && ! -L $1 ]] || return 2
   jq -e '
@@ -1585,7 +1565,7 @@ monday_validate_v2_gate() {
             and .key == "system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice"
             and .value == null));
       . as $root |
-      .schema == "monday.rust_lob_shadow_gate.v7"
+      .schema == "monday.rust_lob_shadow_gate.v8"
       and .control_plane_version == 2
       and .passed == true
       and (.production_eligible | type == "boolean")
@@ -1864,8 +1844,8 @@ monday_validate_v2_gate() {
           and (.observed_at_ns | type == "number" and floor == . and . >= 0)
           and ($m.observed_runtime_seconds | type == "number" and floor == . and . >= 0
             and . <= $root.evidence_timeout_seconds)
-          and ($m.segment_count | type == "number" and . == 2 and . == ($m.segments | length))
-          and ($m.oss_triplet_count | type == "number" and . == 2 and . == ($m.triplets | length))
+          and ($m.segment_count | type == "number" and . == 1 and . == ($m.segments | length))
+          and ($m.oss_triplet_count | type == "number" and . == 1 and . == ($m.triplets | length))
           and (.n_restarts | type == "number" and . == 0)
           and (.process_identity_verified == true)
           and (.installed_shadow_assets_verified == true)
@@ -1876,7 +1856,7 @@ monday_validate_v2_gate() {
             .strict_aggregate_trade_continuity_readback == true
             and .strict_raw_trade_continuity_readback == true
           else true end)
-          and (.segments | type == "array" and length == 2
+          and (.segments | type == "array" and length == 1
             and all(.[];
               (.file | type == "string" and test("^part-[0-9]+\\.jsonl\\.zst$"))
               and (.path | type == "string" and length > 0)
@@ -1889,7 +1869,7 @@ monday_validate_v2_gate() {
               and (.end_received_at_ns > $m.observation_started_at_ns)
               and (.end_received_at_ns <= $m.observed_at_ns)
               and (.session_id | type == "string" and . == $m.session_id)))
-          and (.triplets | type == "array" and length == 2
+          and (.triplets | type == "array" and length == 1
             and all(.[];
               (.market | type == "string" and . == $m.market)
               and (.dataset | type == "string" and . == $m.dataset)
@@ -1931,11 +1911,7 @@ monday_validate_v2_gate() {
               and (.observed_at | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$"))
               and (.observed_at_ns | type == "number" and floor == . and . >= 0)
               and (.session_id | type == "string" and . == $m.session_id)
-              and (.catalog_sha256 | type == "string" and . == $m.health.frozen_catalog_sha256))
-            and (.[1].start_received_at_ns >= .[0].end_received_at_ns)
-            and (.[1].start_received_at_ns - .[0].end_received_at_ns <= 90000000000))
-          and ($m.segments[1].start_received_at_ns >= $m.segments[0].end_received_at_ns)
-          and ($m.segments[1].start_received_at_ns - $m.segments[0].end_received_at_ns <= 90000000000)
+              and (.catalog_sha256 | type == "string" and . == $m.health.frozen_catalog_sha256)))
           and (($m.segments | map([.data_sha256, .start_received_at_ns, .end_received_at_ns]))
             == ($m.triplets | map([.data_sha256, .start_received_at_ns, .end_received_at_ns])))
           and (.health | type == "object"

@@ -113,7 +113,7 @@ def valid_production_asset_map($keys; $source_mode):
     "binance-lob-archiver-rust-spot.env",
     "binance-lob-archiver-rust-usdm.env"
   ] | sort) as $shadow_asset_keys
-| $root.schema == "monday.rust_lob_shadow_gate.v7"
+| $root.schema == "monday.rust_lob_shadow_gate.v8"
 and .control_plane_version == 2
 and .passed == true
 and (.production_eligible | type == "boolean")
@@ -401,8 +401,8 @@ and (.markets | type == "object" and ((keys | sort) == ["spot", "usdm"])
     and (.observed_at_ns | type == "number" and floor == . and . >= 0)
     and ($m.observed_runtime_seconds | type == "number" and floor == . and . >= 0
       and . <= $root.evidence_timeout_seconds)
-    and ($m.segment_count | type == "number" and . == 2 and . == ($m.segments | length))
-    and ($m.oss_triplet_count | type == "number" and . == 2 and . == ($m.triplets | length))
+    and ($m.segment_count | type == "number" and . == 1 and . == ($m.segments | length))
+    and ($m.oss_triplet_count | type == "number" and . == 1 and . == ($m.triplets | length))
     and (.n_restarts | type == "number" and . == 0)
     and .process_identity_verified == true
     and .installed_shadow_assets_verified == true
@@ -413,7 +413,7 @@ and (.markets | type == "object" and ((keys | sort) == ["spot", "usdm"])
       .strict_aggregate_trade_continuity_readback == true
       and .strict_raw_trade_continuity_readback == true
     else true end)
-    and (.segments | type == "array" and length == 2
+    and (.segments | type == "array" and length == 1
       and all(.[];
         (.file | type == "string" and test("^part-[0-9]+\\.jsonl\\.zst$"))
         and (.path | type == "string" and length > 0)
@@ -426,7 +426,7 @@ and (.markets | type == "object" and ((keys | sort) == ["spot", "usdm"])
         and (.end_received_at_ns > $m.observation_started_at_ns)
         and (.end_received_at_ns <= $m.observed_at_ns)
         and (.session_id | type == "string" and . == $m.session_id)))
-    and (.triplets | type == "array" and length == 2
+    and (.triplets | type == "array" and length == 1
       and all(.[];
         (.market | type == "string" and . == $m.market)
         and (.dataset | type == "string" and . == $m.dataset)
@@ -468,11 +468,7 @@ and (.markets | type == "object" and ((keys | sort) == ["spot", "usdm"])
         and (.observed_at | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$"))
         and (.observed_at_ns | type == "number" and floor == . and . >= 0)
         and (.session_id | type == "string" and . == $m.session_id)
-        and (.catalog_sha256 | type == "string" and . == $m.health.frozen_catalog_sha256))
-      and (.[1].start_received_at_ns >= .[0].end_received_at_ns)
-      and (.[1].start_received_at_ns - .[0].end_received_at_ns <= 90000000000))
-    and ($m.segments[1].start_received_at_ns >= $m.segments[0].end_received_at_ns)
-    and ($m.segments[1].start_received_at_ns - $m.segments[0].end_received_at_ns <= 90000000000)
+        and (.catalog_sha256 | type == "string" and . == $m.health.frozen_catalog_sha256)))
     and (($m.segments | map([.data_sha256, .start_received_at_ns, .end_received_at_ns]))
       == ($m.triplets | map([.data_sha256, .start_received_at_ns, .end_received_at_ns])))
     and (.health | type == "object"
