@@ -721,7 +721,7 @@ preflight_residue_after=$(find "$ROOT/data/monday/spool/binance-lob-rust-shadow"
 # A different candidate payload must remain eligible through the direct
 # Cutover boundary.  Stop immediately after active=C1 and prove rollback
 # restores the exact immutable legacy pair.
-payload_delta_gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+if ! payload_delta_gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
   bash -c '
     root=$1; shift
     mkdir -p "$root/proc/$$"
@@ -729,7 +729,11 @@ payload_delta_gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
     printf "%s\\n" "$$" >"$root/run/payload-delta-gate.pid"
     exec "$@"
   ' _ "$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
-  --from-controller direct --candidate-controller "$c1" --root "$ROOT")
+  --from-controller direct --candidate-controller "$c1" --root "$ROOT" 2>&1); then
+  printf '%s\n' "$payload_delta_gate_output" >&2
+  printf 'formal Gate rejected a direct payload transition\n' >&2
+  exit 1
+fi
 payload_delta_gate_pid=$(cat "$ROOT/run/payload-delta-gate.pid")
 rm -rf -- "$ROOT/proc/$payload_delta_gate_pid" "$ROOT/run/payload-delta-gate.pid"
 payload_delta_gate=$(printf '%s\n' "$payload_delta_gate_output" | sed -n 's/^V2 Gate receipt: //p')
