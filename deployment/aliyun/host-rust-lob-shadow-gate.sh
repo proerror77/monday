@@ -1853,6 +1853,8 @@ render_shadow_unit() {
     || die 'candidate shadow upload template failed security/resource verification'
   [[ -n $spool && $spool == "$run_spool/$market" ]] || die "$market Gate spool is not run-scoped"
   sed -e '/^EnvironmentFile=-\/run\/monday\/binance-lob-archiver-rust-%i-soak.env$/d' \
+      -e "/^EnvironmentFile=\/etc\/monday\/binance-lob-archiver-rust-%i.env$/a\\
+Environment=MONDAY_RETAIN_UPLOADED_TRIPLETS=true" \
       -e "/^\[Service\]$/a\\
 Slice=$GATE_WORKER_SLICE" \
       -e "s|^EnvironmentFile=/etc/monday/binance-lob-archiver-rust-%i.env$|EnvironmentFile=$rendered_env|" \
@@ -1878,11 +1880,13 @@ RuntimeMaxSec='"$UPLOAD_DRAIN_TIMEOUT_SECONDS" \
       "$source_env" >"$rendered_env"
   chmod 0640 "$rendered_unit" "$rendered_upload" "$rendered_env"
   [[ $(grep -Fxc "EnvironmentFile=$rendered_env" "$rendered_unit" || true) -eq 1 ]] || die "$market Gate unit env path is not exact"
+  [[ $(grep -Fxc 'Environment=MONDAY_RETAIN_UPLOADED_TRIPLETS=true' "$rendered_unit" || true) -eq 1 ]] || die "$market Gate unit must retain verified upload evidence"
   [[ $(grep -Fxc 'Restart=no' "$rendered_unit" || true) -eq 1 ]] || die "$market Gate unit restart policy is not bounded"
   [[ $(grep -Fxc "RuntimeMaxSec=$SHADOW_RUNTIME_MAX_SECONDS" "$rendered_unit" || true) -eq 1 ]] || die "$market Gate unit runtime is not bounded"
   [[ $(grep -Fxc "TimeoutStopSec=$SHADOW_STOP_TIMEOUT_SECONDS" "$rendered_unit" || true) -eq 1 ]] || die "$market Gate unit stop is not bounded"
   [[ $(grep -Fxc "ReadWritePaths=$spool" "$rendered_unit" || true) -eq 1 ]] || die "$market Gate unit spool is not exact"
   [[ $(grep -Fxc "EnvironmentFile=$rendered_env" "$rendered_upload" || true) -eq 1 ]] || die "$market Gate upload env path is not exact"
+  [[ $(grep -Fc 'MONDAY_RETAIN_UPLOADED_TRIPLETS' "$rendered_upload" || true) -eq 0 ]] || die "$market Gate upload drain must clean verified upload evidence"
   [[ $(grep -Fxc "ExecStart=$candidate_binary --upload-only" "$rendered_upload" || true) -eq 1 ]] || die "$market Gate upload identity is not exact"
   [[ $(grep -Fxc "ReadWritePaths=$spool" "$rendered_upload" || true) -eq 1 ]] || die "$market Gate upload spool is not exact"
   [[ $(grep -Fxc "Slice=$GATE_WORKER_SLICE" "$rendered_unit" || true) -eq 1 ]] || die "$market Gate worker slice is not exact"
