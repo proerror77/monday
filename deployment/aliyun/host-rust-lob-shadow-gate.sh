@@ -4,15 +4,17 @@ umask 027
 export LC_ALL=C
 
 # V2 shadow Gate. Candidate controller C1 owns this script and its policy.
-readonly REQUIRED_DURATION_SECONDS=900
+readonly GATE_SEGMENT_SECONDS=120
+readonly EVIDENCE_TIMEOUT_SECONDS=600
 readonly HEALTH_SETTLE_SECONDS=240
+readonly SHADOW_RUNTIME_MAX_SECONDS=900
+readonly SHADOW_STOP_TIMEOUT_SECONDS=60
+readonly UPLOAD_DRAIN_TIMEOUT_SECONDS=300
+readonly TRANSIENT_WORK_TIMEOUT_SECONDS=300
 readonly MAX_HEALTH_SILENCE_SECONDS=120
 readonly MAX_SEGMENT_GAP_NS=90000000000
 readonly HOST_MEMORY_RESERVE_BYTES=1073741824
 readonly STRICT_VERIFIER_MEMORY_MAX_BYTES=1610612736
-readonly IO_PSI_WINDOW_SECONDS=15
-readonly IO_PSI_WINDOW_US=15000000
-readonly IO_PSI_FULL_DELTA_LIMIT_US=150000
 readonly UPLOAD_DRAIN_MEMORY_MAX_BYTES=536870912
 readonly SHADOW_IDENTITY_WAIT_SECONDS=15
 readonly SHADOW_IDENTITY_TEST_ATTEMPTS=8
@@ -75,7 +77,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 monday_control_plane_validate_mode "$ROOT" "$TEST_ONLY" \
   || die 'production uses canonical root or fixture mode lacks an explicit sentinel'
 
-GATE_DURATION_SECONDS=$REQUIRED_DURATION_SECONDS
+GATE_EVIDENCE_TIMEOUT_SECONDS=$EVIDENCE_TIMEOUT_SECONDS
 HEALTH_SETTLE_DURATION_SECONDS=$HEALTH_SETTLE_SECONDS
 resolve_test_duration() {
   local name value current formal
@@ -85,10 +87,10 @@ resolve_test_duration() {
     [[ $TEST_ONLY == true && ${MONDAY_ALLOW_SHORT_GATE_FOR_TESTS:-0} == 1 ]] \
       || die "$name is only allowed for an explicitly authorised fixture Gate"
     [[ $value =~ ^[1-9][0-9]*$ ]] || die "$name must be a positive integer"
-    if [[ $name == MONDAY_GATE_TEST_SECONDS ]]; then current=$value; formal=$REQUIRED_DURATION_SECONDS
+    if [[ $name == MONDAY_GATE_TEST_SECONDS ]]; then current=$value; formal=$EVIDENCE_TIMEOUT_SECONDS
     else current=$value; formal=$HEALTH_SETTLE_SECONDS; fi
     (( current < formal )) || die "$name must be shorter than the formal Gate contract"
-    if [[ $name == MONDAY_GATE_TEST_SECONDS ]]; then GATE_DURATION_SECONDS=$current
+    if [[ $name == MONDAY_GATE_TEST_SECONDS ]]; then GATE_EVIDENCE_TIMEOUT_SECONDS=$current
     else HEALTH_SETTLE_DURATION_SECONDS=$current; fi
   done
 }
@@ -103,9 +105,9 @@ DATA_ROOT=$(monday_root_join "$ROOT" data/monday); EVIDENCE_ROOT="$DATA_ROOT/evi
 # Gate writers are always run-scoped.  Nothing under /etc or the stable
 # /opt/monday/bin projection is mutated by this operation.
 RUN_SPOOL_ROOT="$DATA_ROOT/spool/binance-lob-rust-shadow/gate"; PROC_ROOT=$(monday_root_join "$ROOT" proc)
+PSI_SOURCE="$PROC_ROOT/pressure/io"
 CGROUP_ROOT=$(monday_root_join "$ROOT" sys/fs/cgroup)
 GATE_UNIT_ROOT="$OVERRIDE_ROOT/rust-lob-gate"; GATE_SYSTEMD_ROOT=$(monday_root_join "$ROOT" run/systemd/system); SHADOW_BINARY="$BIN_ROOT/binance-lob-archiver-shadow"
-PSI_SOURCE="$PROC_ROOT/pressure/io"
 PRODUCTION_BINARY="$BIN_ROOT/binance-lob-archiver"
 LIB_SOURCE="$SCRIPT_DIR/rust-lob-control-plane-lib.sh"; POLICY_SOURCE="$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq"
 [[ -f $LIB_SOURCE && -f $POLICY_SOURCE ]] || die 'V2 control-plane assets are missing'
@@ -141,7 +143,7 @@ if [[ $TEST_ONLY != true ]]; then
     command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
   done
   mountpoint -q "$(monday_root_join "$ROOT" data)" || die 'data filesystem must be a mount point'
-  [[ -r "$PROC_ROOT/uptime" && -r $PSI_SOURCE ]] || die 'proc timing/PSI sources are unavailable'
+  [[ -r "$PROC_ROOT/uptime" ]] || die 'proc timing source is unavailable'
   id "$SERVICE_USER" >/dev/null 2>&1 || die "missing service user: $SERVICE_USER"
 fi
 
@@ -165,6 +167,11 @@ if [[ $TEST_ONLY == true ]]; then
       start)
         [[ ${MONDAY_GATE_FIXTURE_RECORD_CALLS:-0} == 1 ]] && printf 'start %s\n' "$unit_name" >>"$ROOT/run/gate-fixture.calls"
         fixture_unit_state[$unit_name]=active
+        if [[ $unit_name == "${GATE_WORKER_SLICE:-}" ]]; then
+          local gate_cgroup="$CGROUP_ROOT/$GATE_WORKER_SLICE"
+          mkdir -p "$gate_cgroup"
+          printf 'high 0\noom 0\noom_kill 0\n' >"$gate_cgroup/memory.events"
+        fi
         if [[ $unit_name == monday-rust-lob-gate-*.service ]]; then
           printf '0\n' >"$ROOT/run/gate-fixture.identity.${unit_name//[^A-Za-z0-9_.-]/_}"
         fi
@@ -358,7 +365,7 @@ meminfo_bytes() {
     MemTotal) printf '8589934592\n';;
     MemAvailable)
       if [[ ${MONDAY_GATE_FIXTURE_FRESH_ADMISSION_FAIL:-0} == 1 \
-        && ${fixture_last_calibrated_phase:-} == shadow-spot ]]; then
+        && ${resource_monitor_phase:-} == shadow-spot ]]; then
         printf '3000000000\n'
       else
         printf '6442450944\n'
@@ -376,41 +383,52 @@ monotonic_nanoseconds() {
     awk '{split($1, part, "."); fraction=part[2]; while (length(fraction) < 9) fraction=fraction "0"; print part[1] substr(fraction, 1, 9)}' "$PROC_ROOT/uptime"
   fi
 }
-preflight_psi_monotonic_sample_number=0
-io_psi_monotonic_us() {
-  local -a values=() value
-  if [[ $TEST_ONLY == true && $PREFLIGHT_ONLY == true \
-    && -n ${MONDAY_GATE_FIXTURE_PREFLIGHT_PSI_MONOTONIC_VALUES:-} ]]; then
-    IFS=, read -r -a values <<<"$MONDAY_GATE_FIXTURE_PREFLIGHT_PSI_MONOTONIC_VALUES"
-    value=${values[${preflight_psi_monotonic_sample_number:-0}]:-}
-    [[ $value =~ ^(0|[1-9][0-9]*)$ ]] || return 1
-    printf '%s\n' "$value"
-  elif [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RESOURCE_MONITOR_ASYNC:-0} == 1 \
-    && -n ${MONDAY_GATE_FIXTURE_RESOURCE_PSI_MONOTONIC_VALUES:-} ]]; then
-    IFS=, read -r -a values <<<"$MONDAY_GATE_FIXTURE_RESOURCE_PSI_MONOTONIC_VALUES"
-    value=${values[${resource_psi_monotonic_sample_number:-0}]:-}
-    if [[ ${MONDAY_GATE_FIXTURE_RESOURCE_PSI_MONOTONIC_INITIAL_FAILURE:-0} == 1 \
-      && ${resource_psi_monotonic_sample_number:-0} == 0 ]]; then
-      return 1
-    fi
-    if [[ -n ${MONDAY_GATE_FIXTURE_RESOURCE_PSI_MONOTONIC_FAIL_AT:-} \
-      && ${resource_psi_monotonic_sample_number:-0} == "$MONDAY_GATE_FIXTURE_RESOURCE_PSI_MONOTONIC_FAIL_AT" ]]; then
-      return 1
-    fi
-    [[ $value =~ ^(0|[1-9][0-9]*)$ ]] || return 1
-    printf '%s\n' "$value"
-  elif [[ $TEST_ONLY == true && ! -r "$PROC_ROOT/uptime" ]]; then
-    # Fixture roots intentionally omit /proc/uptime.  Advance one exact
-    # reference window per observed sample so the offline contract exercises
-    # the same elapsed-time gate without sleeping.
-    if [[ ${MONDAY_GATE_FIXTURE_RESOURCE_MONITOR_ASYNC:-0} == 1 ]]; then
-      printf '%s\n' "$(( ${resource_psi_monotonic_sample_number:-0} * 5000000 ))"
-    else
-      printf '%s\n' "$(( ${preflight_psi_monotonic_sample_number:-0} * IO_PSI_WINDOW_US ))"
-    fi
+io_psi_snapshot() {
+  local phase=$1 observed line avg10 avg60 avg300 total
+  observed=$(date -u +%Y-%m-%dT%H:%M:%SZ) || return 1
+  if [[ $TEST_ONLY == true ]]; then
+    avg10=0.00; avg60=0.00; avg300=0.00; total=0
+  elif line=$(awk '
+      $1 == "full" {
+        count++
+        for (i = 2; i <= NF; i++) {
+          split($i, item, "=")
+          if (item[1] == "avg10") avg10 = item[2]
+          else if (item[1] == "avg60") avg60 = item[2]
+          else if (item[1] == "avg300") avg300 = item[2]
+          else if (item[1] == "total") total = item[2]
+        }
+      }
+      END {
+        if (count != 1 || avg10 == "" || avg60 == "" || avg300 == "" || total == "") exit 1
+        print avg10, avg60, avg300, total
+      }' "$PSI_SOURCE" 2>/dev/null); then
+    read -r avg10 avg60 avg300 total <<<"$line"
   else
-    awk '{printf "%.0f\n", $1 * 1000000}' "$PROC_ROOT/uptime"
+    jq -cn --arg phase "$phase" --arg observed "$observed" \
+      '{schema:"monday.io_psi_observation.v1",phase:$phase,observed_at:$observed,
+        available:false,veto:false}'
+    return
   fi
+  if [[ ! $avg10 =~ ^[0-9]+([.][0-9]+)?$ || ! $avg60 =~ ^[0-9]+([.][0-9]+)?$ \
+    || ! $avg300 =~ ^[0-9]+([.][0-9]+)?$ || ! $total =~ ^[0-9]+$ ]]; then
+    jq -cn --arg phase "$phase" --arg observed "$observed" \
+      '{schema:"monday.io_psi_observation.v1",phase:$phase,observed_at:$observed,
+        available:false,veto:false}'
+    return
+  fi
+  jq -cn --arg phase "$phase" --arg observed "$observed" \
+    --argjson avg10 "$avg10" --argjson avg60 "$avg60" --argjson avg300 "$avg300" \
+    --argjson total "$total" \
+    '{schema:"monday.io_psi_observation.v1",phase:$phase,observed_at:$observed,
+      available:true,veto:false,full:{avg10:$avg10,avg60:$avg60,avg300:$avg300,total_us:$total}}'
+}
+psi_windows='[]'
+record_io_psi_snapshot() {
+  local snapshot
+  snapshot=$(io_psi_snapshot "$1") || return 1
+  psi_windows=$(jq -cn --argjson values "$psi_windows" --argjson value "$snapshot" \
+    '$values + [$value]')
 }
 proc_starttime() {
   local pid=$1 stat_file
@@ -418,45 +436,6 @@ proc_starttime() {
   stat_file="$PROC_ROOT/$pid/stat"
   [[ -r $stat_file ]] || return 1
   awk '{ if ($22 !~ /^[0-9]+$/) exit 1; print $22 }' "$stat_file"
-}
-preflight_psi_sample_number=0
-resource_psi_sample_number=0
-resource_psi_monotonic_sample_number=0
-io_total_us() {
-  if [[ $TEST_ONLY == true && $PREFLIGHT_ONLY == true \
-    && -n ${MONDAY_GATE_FIXTURE_PREFLIGHT_PSI_VALUES:-} ]]; then
-    local -a values=() value
-    IFS=, read -r -a values <<<"$MONDAY_GATE_FIXTURE_PREFLIGHT_PSI_VALUES"
-    value=${values[${preflight_psi_sample_number:-0}]:-}
-    [[ $value =~ ^(0|[1-9][0-9]*)$ ]] || return 1
-    printf '%s\n' "$value"
-  elif [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RESOURCE_MONITOR_ASYNC:-0} == 1 \
-    && -n ${MONDAY_GATE_FIXTURE_RESOURCE_PSI_VALUES:-} ]]; then
-    local -a values=() value
-    IFS=, read -r -a values <<<"$MONDAY_GATE_FIXTURE_RESOURCE_PSI_VALUES"
-    value=${values[${resource_psi_sample_number:-0}]:-}
-    if [[ ${MONDAY_GATE_FIXTURE_RESOURCE_PSI_INITIAL_FAILURE:-0} == 1 \
-      && ${resource_psi_sample_number:-0} == 0 ]]; then
-      return 1
-    fi
-    if [[ -n ${MONDAY_GATE_FIXTURE_RESOURCE_PSI_FAIL_AT:-} \
-      && ${resource_psi_sample_number:-0} == "$MONDAY_GATE_FIXTURE_RESOURCE_PSI_FAIL_AT" ]]; then
-      return 1
-    fi
-    [[ $value =~ ^(0|[1-9][0-9]*)$ ]] || return 1
-    printf '%s\n' "$value"
-  elif [[ $TEST_ONLY == true && ! -f $PSI_SOURCE ]]; then
-    printf '0\n'
-  else
-    monday_io_full_psi_total_us "$PSI_SOURCE"
-  fi
-}
-
-io_psi_window_transition() {
-  local previous=$1 current=$2 elapsed_us=$3 consecutive=$4
-  [[ $elapsed_us =~ ^[1-9][0-9]*$ && $elapsed_us -ge $IO_PSI_WINDOW_US ]] || return 3
-  monday_io_full_psi_window "$previous" "$current" "$elapsed_us" \
-    "$IO_PSI_WINDOW_US" "$IO_PSI_FULL_DELTA_LIMIT_US" "$consecutive"
 }
 systemctl_show() { systemctl show "$1" --property="$2" --value 2>/dev/null; }
 systemctl_show_many() { systemctl show "$1" --property="$2" 2>/dev/null; }
@@ -558,43 +537,6 @@ if [[ -e $GATE_UNIT_ROOT || -L $GATE_UNIT_ROOT ]]; then
   fi
 fi
 
-# A preflight is deliberately read-only, but it uses the exact same three
-# 15-second, 1% I/O-full PSI windows as the formal Gate calibration.  Fixture
-# mode keeps the loop deterministic by reading its zero-valued PSI source
-# without sleeping; production always sleeps for each full reference window.
-preflight_psi_windows='[]'
-sample_preflight_psi() {
-  local previous current previous_mono current_mono transition delta ratio hit consecutive=0 i elapsed_us
-  preflight_psi_sample_number=0
-  preflight_psi_monotonic_sample_number=0
-  previous=$(io_total_us) || return 1
-  previous_mono=$(io_psi_monotonic_us) || return 1
-  for i in 1 2 3; do
-    while :; do
-      preflight_psi_sample_number=$((preflight_psi_sample_number + 1))
-      preflight_psi_monotonic_sample_number=$preflight_psi_sample_number
-      [[ $TEST_ONLY == true ]] || sleep "$IO_PSI_WINDOW_SECONDS"
-      current=$(io_total_us) || return 1
-      current_mono=$(io_psi_monotonic_us) || return 1
-      [[ $current_mono =~ ^(0|[1-9][0-9]*)$ && $previous_mono =~ ^(0|[1-9][0-9]*)$ \
-        && $current_mono -gt $previous_mono ]] || return 1
-      elapsed_us=$((current_mono - previous_mono))
-      (( elapsed_us >= IO_PSI_WINDOW_US )) || continue
-      transition=$(io_psi_window_transition "$previous" "$current" \
-        "$elapsed_us" "$consecutive") || return 1
-      break
-    done
-    read -r delta ratio hit consecutive <<<"$transition"
-    preflight_psi_windows=$(jq -cn --argjson values "$preflight_psi_windows" \
-      --arg phase preflight --argjson delta "$delta" --argjson ratio "$ratio" \
-      --argjson hit "$hit" --argjson consecutive "$consecutive" \
-      --argjson elapsed "$elapsed_us" \
-      '$values + [{phase:$phase,stage:"calibration",delta_us:$delta,ratio:$ratio,
-        elapsed_us:$elapsed,window_us:$elapsed,hit:$hit,consecutive_hits:$consecutive}]') || return 1
-    previous=$current; previous_mono=$current_mono
-  done
-}
-
 cgroup_file_value() {
   local path=$1
   [[ -f $path && ! -L $path ]] || return 1
@@ -637,7 +579,7 @@ cgroup_child_path() {
 
 fixture_prepare_production_cgroup() {
   [[ $TEST_ONLY == true ]] || return 0
-  local parent="$CGROUP_ROOT/system.slice/$PRODUCTION_SLICE" child unit market fixture_pid fixture_cgroup_pid
+  local parent="$CGROUP_ROOT/system.slice/$PRODUCTION_SLICE" child unit market fixture_pid fixture_cgroup_pid fixture_exe
   local fixture_parent_current=${MONDAY_GATE_FIXTURE_PRODUCTION_PARENT_CURRENT:-1101067264}
   local fixture_parent_anon=${MONDAY_GATE_FIXTURE_PRODUCTION_PARENT_ANON:-317067264}
   mkdir -p "$parent"
@@ -662,8 +604,11 @@ fixture_prepare_production_cgroup() {
     printf '2684354560\n' >"$child/memory.max"
     mkdir -p "$PROC_ROOT/$fixture_pid"
     rm -f -- "$PROC_ROOT/$fixture_pid/exe"
-    ln -s "$RELEASE_ROOT/$before_payload/binance-lob-archiver" \
-      "$PROC_ROOT/$fixture_pid/exe"
+    fixture_exe="$RELEASE_ROOT/$before_payload/binance-lob-archiver"
+    if [[ ${MONDAY_GATE_FIXTURE_PRODUCTION_EXE_DRIFT:-0} == 1 && $market == spot ]]; then
+      fixture_exe=$LIB_SOURCE
+    fi
+    ln -s "$fixture_exe" "$PROC_ROOT/$fixture_pid/exe"
   done
   if [[ ${MONDAY_GATE_FIXTURE_EXTRA_CHILD:-0} != 1 ]]; then
     rm -rf -- "$parent/foreign.service"
@@ -720,7 +665,7 @@ capture_production_snapshot() {
     [[ $pid =~ ^[1-9][0-9]*$ && $n_restarts =~ ^[0-9]+$ ]] || return 1
     [[ -r "$PROC_ROOT/$pid/exe" ]] || return 1
     exe_sha=$(sha256_file "$(readlink -f -- "$PROC_ROOT/$pid/exe")") || return 1
-    [[ $exe_sha == "$before_payload" ]] || return 1
+    [[ $exe_sha =~ ^[a-f0-9]{64}$ ]] || return 1
     if [[ -z $expected_slice ]]; then
       expected_slice=$slice
       expected_parent="/system.slice/$slice"
@@ -802,6 +747,26 @@ capture_production_snapshot() {
       parent_memory_anon_bytes:$anon,parent_memory_file_bytes:$file,parent_memory_stat:$stat,
       child_memory_max_sum_bytes:$sum,parent_memory_events:$events}'
 }
+capture_production_snapshot_bounded() {
+  local snapshot deadline now
+  if [[ $TEST_ONLY == true ]]; then
+    snapshot=$(capture_production_snapshot) || return 1
+    monday_validate_lob_production_snapshot "$snapshot" >/dev/null || return 1
+    printf '%s\n' "$snapshot"
+    return 0
+  fi
+  deadline=$(( $(monotonic_seconds) + MAX_HEALTH_SILENCE_SECONDS ))
+  while :; do
+    snapshot=$(capture_production_snapshot 2>/dev/null || true)
+    if [[ -n $snapshot ]] && monday_validate_lob_production_snapshot "$snapshot" >/dev/null 2>&1; then
+      printf '%s\n' "$snapshot"
+      return 0
+    fi
+    now=$(monotonic_seconds)
+    (( now >= deadline )) && return 1
+    sleep 1
+  done
+}
 
 production_snapshot_json=''; production_snapshot_identity_json=''
 production_parent_current=''; production_parent_anon=''; production_parent_file=''
@@ -810,14 +775,16 @@ production_memory_json='{}' production_process_json='{}'
 refresh_production_snapshot() {
   local first second first_identity second_identity current_a current_b anon_a anon_b file_a file_b
   local sum_a sum_b slice_max_a slice_max_b slice_high_a slice_high_b conservative_current conservative_anon conservative_file conservative_sum
-  first=$(capture_production_snapshot) || return 1
-  monday_validate_lob_production_snapshot "$first" || return 1
+  first=$(capture_production_snapshot_bounded) || return 1
+  jq -e --arg payload "$before_payload" \
+    'all(.children[]; .process_exe_sha256 == $payload)' <<<"$first" >/dev/null || return 1
   first_identity=$(monday_lob_production_snapshot_identity "$first") || return 1
   if [[ -n ${production_snapshot_identity_json:-} && $first_identity != "$production_snapshot_identity_json" ]]; then
     return 1
   fi
-  second=$(capture_production_snapshot) || return 1
-  monday_validate_lob_production_snapshot "$second" || return 1
+  second=$(capture_production_snapshot_bounded) || return 1
+  jq -e --arg payload "$before_payload" \
+    'all(.children[]; .process_exe_sha256 == $payload)' <<<"$second" >/dev/null || return 1
   second_identity=$(monday_lob_production_snapshot_identity "$second") || return 1
   [[ $second_identity == "$first_identity" ]] || return 1
   current_a=$(jq -er '.parent_memory_current_bytes' <<<"$first") || return 1
@@ -854,7 +821,11 @@ refresh_production_snapshot() {
     parent_memory_current_bytes,parent_memory_peak_bytes,parent_memory_anon_bytes,parent_memory_file_bytes,parent_memory_stat,
     child_memory_max_sum_bytes,parent_memory_events}
     | .parent_memory_stat.anon=$anon | .parent_memory_stat.file=$file' <<<"$production_snapshot_json")
-  production_process_json=$(jq -c '(.children | with_entries(.value |= {main_pid,process_exe_sha256,n_restarts,active}))' <<<"$production_snapshot_json")
+  # The Gate's stable production identity deliberately excludes volatile PID
+  # and restart counters.  The authoritative cgroup snapshot below still
+  # validates those fields directly; this projection is only the stable
+  # process identity carried by the receipt.
+  production_process_json=$(jq -c '(.children | with_entries(.value |= {process_exe_sha256,active}))' <<<"$production_snapshot_json")
   if [[ -z ${production_snapshot_identity_json:-} ]]; then
     production_snapshot_identity_json=$first_identity
   fi
@@ -998,31 +969,23 @@ for market in "${markets[@]}"; do
   (( shadow_segment_seconds[$market] >= 60 )) \
     || die "$market shadow SEGMENT_SECONDS is below the collector minimum"
 done
-GATE_SEGMENT_SECONDS=${shadow_segment_seconds[spot]}
-[[ $GATE_SEGMENT_SECONDS == "${shadow_segment_seconds[usdm]}" ]] \
-  || die 'shadow markets use different segment durations'
-# Rotations are wall-clock aligned. Three full intervals leave two sealed
-# segments before the Gate stops the writer, even if observation begins just
-# after a boundary.
-(( REQUIRED_DURATION_SECONDS >= 3 * GATE_SEGMENT_SECONDS )) \
-  || die 'formal Gate window cannot produce two complete shadow segments'
+[[ ${shadow_segment_seconds[spot]} == "${shadow_segment_seconds[usdm]}" ]] \
+  || die 'shadow markets use different configured segment durations'
 
 if [[ $PREFLIGHT_ONLY == true ]]; then
   # No temporary directory, cleanup trap, spool/evidence path, systemd unit,
   # lease, or shadow is created before this branch.  The existing lock was
   # opened read-only above; the checks here establish C/from/P/R and every
-  # installed production byte from immutable files.  This final sampler is the
-  # same three-window PSI boundary used by a formal Gate.  The result is
-  # advisory only: the formal Gate repeats every check while holding its lock.
-  sample_preflight_psi || die 'I/O PSI preflight failed'
+  # installed production byte from immutable files. PSI is sampled once as
+  # advisory evidence and never authorizes or denies the Gate.
+  record_io_psi_snapshot preflight || die 'could not record preflight PSI evidence'
   jq -cn \
     --arg from "$before_controller" --arg source_mode "$source_mode" \
     --arg candidate "$CANDIDATE_CONTROLLER" --arg payload "$candidate_payload" \
     --arg runtime "$candidate_runtime" --arg bundle "$candidate_bundle" \
     --arg source "$candidate_source" --arg control_sha "$candidate_control_bytes_sha" \
     --argjson control_assets "$candidate_control_assets" \
-    --argjson installed_assets "$production_asset_json" \
-    --argjson psi_windows "$preflight_psi_windows" \
+    --argjson installed_assets "$production_asset_json" --argjson psi "$psi_windows" \
     '{schema:"monday.rust_lob_shadow_gate_preflight.v1",operation:"gate",
       preflight_only:true,authoritative:false,production_changed:false,
       authorizes_gate:false,authorizes_cutover:false,source_mode:$source_mode,
@@ -1032,7 +995,7 @@ if [[ $PREFLIGHT_ONLY == true ]]; then
       candidate_deployment_source_revision:$source,
       candidate_control_bytes:{sha256:$control_sha,assets:$control_assets},
       installed_production_assets:$installed_assets,
-      io_full_psi_windows:$psi_windows,
+      io_full_psi_windows:$psi,
       checks:{controller:true,from_controller:true,payload:true,
         runtime_contract:true,installed_bytes:true,psi_sampler:true}}'
   exit 0
@@ -1149,8 +1112,8 @@ done
 
 host_memory_total=$(meminfo_bytes MemTotal) || die 'MemTotal is unavailable'; host_memory_available=$(meminfo_bytes MemAvailable) || die 'MemAvailable is unavailable'; host_swap_total=$(meminfo_bytes SwapTotal) || die 'SwapTotal is unavailable'
 
-resource_samples='[]'; psi_windows='[]'; resource_monitor_pid=; resource_monitor_control=; resource_monitor_log=; resource_monitor_phase=
-resource_monitor_psi_log=; resource_monitor_breach_seen=false; resource_monitor_breach_phase=
+resource_samples='[]'; resource_monitor_pid=; resource_monitor_control=; resource_monitor_log=; resource_monitor_phase=
+resource_monitor_breach_seen=false; resource_monitor_breach_phase=
 resource_monitor_breach_diagnostic_json='null'; resource_monitor_teardown_failed=false
 strict_unit_seq=0
 oss_unit_seq=0
@@ -1186,6 +1149,7 @@ record_resource() {
       production_unallocated_bytes:$growth,
       required_bytes:$required,phase_memory_max_bytes:$phase_max}')
   resource_samples=$(jq -cn --argjson values "$resource_samples" --argjson value "$sample" '$values + [$value]')
+  record_io_psi_snapshot "$phase" || die "could not record PSI evidence for $phase"
 }
 verify_gate_worker_slice() {
   local output item key value
@@ -1205,6 +1169,42 @@ verify_gate_worker_slice() {
     && ${fields[ControlGroup]:-} == "/$GATE_WORKER_SLICE" ]] || return 1
   gate_worker_slice_control_group=${fields[ControlGroup]}
 }
+gate_worker_memory_events_snapshot() {
+  local path snapshot count_file count
+  path=$(cgroup_child_path "$gate_worker_slice_control_group") || return 1
+  monday_path_direct "$path" || return 1
+  snapshot=$(cgroup_events_json "$path/memory.events") || return 1
+  if [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_GATE_OOM:-0} == 1 ]]; then
+    # Command substitutions execute this helper in a subshell, so keep the
+    # fixture's read count in the run-scoped temp directory instead of relying
+    # on a shell variable surviving between baseline and final reads.
+    count_file="$tmp_dir/gate-worker-memory-events-read-count"; count=0
+    if [[ -f $count_file ]]; then read -r count <"$count_file" || count=0; fi
+    [[ $count =~ ^[0-9]+$ ]] || count=0
+    count=$((count + 1)); printf '%s\n' "$count" >"$count_file"
+    if (( count >= 2 )); then
+      snapshot=$(jq -c '.oom += 1 | .oom_kill += 1' <<<"$snapshot") || return 1
+    fi
+  fi
+  printf '%s\n' "$snapshot"
+}
+memory_events_no_oom() {
+  [[ $# -eq 2 ]] || return 2
+  local start=$1 end=$2
+  jq -e -n --argjson start "$start" --argjson end "$end" '
+    def valid:
+      type == "object"
+      and (.high | type == "number" and floor == . and . >= 0)
+      and (.oom | type == "number" and floor == . and . >= 0)
+      and (.oom_kill | type == "number" and floor == . and . >= 0);
+    ($start | valid) and ($end | valid)
+    and ($end.high >= $start.high)
+    and ($end.oom >= $start.oom)
+    and ($end.oom_kill >= $start.oom_kill)
+    and ($end.oom == $start.oom)
+    and ($end.oom_kill == $start.oom_kill)
+  ' >/dev/null
+}
 resource_monitor_record_breach() {
   local phase=$1 cause=$2 elapsed_us=${3:-0} delta_us=${4:-0} ratio=${5:-0} consecutive_hits=${6:-0}
   local temporary
@@ -1222,20 +1222,19 @@ resource_monitor_record_breach() {
 }
 resource_monitor_identity_guard() {
   local snapshot=$1 snapshot_identity
-  if [[ -z $snapshot ]] || ! monday_validate_lob_production_snapshot "$snapshot" 2>/dev/null; then
-    resource_monitor_record_breach "${resource_monitor_phase:-unknown}" \
-      production-snapshot-invalid 0 0 0 0 || true
-    return 1
-  fi
+  [[ -n $snapshot ]] || return 2
   snapshot_identity=$(monday_lob_production_snapshot_identity "$snapshot" 2>/dev/null || true)
-  if [[ -z $snapshot_identity || $snapshot_identity != "$production_snapshot_identity_json" ]]; then
+  [[ -n $snapshot_identity ]] || return 2
+  if [[ -n ${production_snapshot_identity_json:-} \
+    && $snapshot_identity != "$production_snapshot_identity_json" ]]; then
     resource_monitor_record_breach "${resource_monitor_phase:-unknown}" \
       production-identity-drift 0 0 0 0 || true
     return 1
   fi
+  monday_validate_lob_production_snapshot "$snapshot" 2>/dev/null || return 2
 }
 resource_monitor_start() {
-  local phase=$1 phase_max=$2 initial_available initial_psi initial_psi_mono parent_pid parent_starttime
+  local phase=$1 phase_max=$2 initial_available parent_pid parent_starttime
   resource_monitor_phase=$phase
   record_resource "$phase" "$phase_max"
   verify_gate_worker_slice || die "run-scoped Gate worker slice is not an exact live envelope before $phase"
@@ -1243,10 +1242,16 @@ resource_monitor_start() {
     # The fixture normally skips the asynchronous monitor, but this hook
     # exercises the same identity guard synchronously before a writer starts.
     if [[ ${MONDAY_GATE_FIXTURE_IDENTITY_DRIFT:-0} == 1 ]]; then
-      MONDAY_GATE_FIXTURE_PRODUCTION_RESTARTS=9
+      MONDAY_GATE_FIXTURE_PRODUCTION_EXE_DRIFT=1
       local snapshot
       snapshot=$(capture_production_snapshot 2>/dev/null || true)
-      resource_monitor_identity_guard "$snapshot" || die "production identity drifted before $phase"
+      local identity_status=0
+      if resource_monitor_identity_guard "$snapshot"; then
+        identity_status=0
+      else
+        identity_status=$?
+      fi
+      (( identity_status == 1 )) && die "production identity drifted before $phase"
     fi
     if [[ ${MONDAY_GATE_FIXTURE_RESOURCE_BREACH:-0} == 1 && $phase == preflight ]]; then
       resource_monitor_record_breach "$phase" fixture-resource-breach 0 0 0 0 || die 'could not record fixture resource breach'
@@ -1257,52 +1262,26 @@ resource_monitor_start() {
     return 0
   fi
   if [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RESOURCE_MONITOR_ASYNC:-0} == 1 ]]; then
-    [[ ${MONDAY_GATE_FIXTURE_RESOURCE_PSI_SAMPLE_LIMIT:-} =~ ^[1-9][0-9]*$ ]] \
+    [[ ${MONDAY_GATE_FIXTURE_RESOURCE_MONITOR_SAMPLE_LIMIT:-} =~ ^[1-9][0-9]*$ ]] \
       || die 'async resource monitor fixture requires a positive sample limit'
   fi
   resource_monitor_control="$tmp_dir/resource-monitor-$phase.running"
   resource_monitor_log="$tmp_dir/resource-monitor-$phase.tsv"
-  resource_monitor_psi_log="$tmp_dir/resource-monitor-$phase.psi.ndjson"
   : >"$resource_monitor_control"; : >"$resource_monitor_log"
-  : >"$resource_monitor_psi_log"
-  resource_psi_sample_number=0
-  resource_psi_monotonic_sample_number=0
   initial_available=$(meminfo_bytes MemAvailable) || die 'MemAvailable became unavailable during Gate'
   if [[ ! $initial_available =~ ^(0|[1-9][0-9]*)$ ]]; then
     resource_monitor_record_breach "$phase" memory-breach 0 0 0 0 || true
     resource_monitor_capture_breach "$phase" || true
     die "MemAvailable became invalid before $phase"
   fi
-  if ! initial_psi=$(io_total_us 2>/dev/null); then
-    resource_monitor_record_breach "$phase" psi-unavailable 0 0 0 0 || true
-    resource_monitor_capture_breach "$phase" || true
-    die "I/O PSI unavailable before $phase"
-  fi
-  if [[ ! $initial_psi =~ ^(0|[1-9][0-9]*)$ ]]; then
-    resource_monitor_record_breach "$phase" psi-unavailable 0 0 0 0 || true
-    resource_monitor_capture_breach "$phase" || true
-    die "I/O PSI value is invalid before $phase"
-  fi
-  if ! initial_psi_mono=$(io_psi_monotonic_us 2>/dev/null); then
-    resource_monitor_record_breach "$phase" psi-unavailable 0 0 0 0 || true
-    resource_monitor_capture_breach "$phase" || true
-    die "I/O PSI monotonic clock unavailable before $phase"
-  fi
-  if [[ ! $initial_psi_mono =~ ^(0|[1-9][0-9]*)$ ]]; then
-    resource_monitor_record_breach "$phase" psi-unavailable 0 0 0 0 || true
-    resource_monitor_capture_breach "$phase" || true
-    die "I/O PSI monotonic value is invalid before $phase"
-  fi
-  printf '%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$initial_available" "$initial_psi" >"$resource_monitor_log"
+  printf '%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$initial_available" >"$resource_monitor_log"
   parent_pid=$$
   parent_starttime=$(proc_starttime "$parent_pid") || die 'resource monitor parent starttime is unavailable'
   printf '%s %s\n' "$parent_pid" "$parent_starttime" >"$tmp_dir/resource-monitor-$phase.parent"
   (
-    local last_psi=$initial_psi window_start_psi=$initial_psi
-    local window_start_mono=$initial_psi_mono current_mono elapsed_us
-    local available current_psi current_parent_starttime transition delta ratio hit consecutive_hits=0
-    local snapshot window_start_at current_at fixture_sample_limit=${MONDAY_GATE_FIXTURE_RESOURCE_PSI_SAMPLE_LIMIT:-}
-    window_start_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    local available current_parent_starttime snapshot invalid_since=0 now
+    local fixture_sample_limit=${MONDAY_GATE_FIXTURE_RESOURCE_MONITOR_SAMPLE_LIMIT:-}
+    local monitor_sample_number=0 identity_status
     while [[ -e $resource_monitor_control ]]; do
       current_parent_starttime=$(proc_starttime "$parent_pid" 2>/dev/null || true)
       if ! kill -0 "$parent_pid" 2>/dev/null || [[ -z $current_parent_starttime || $current_parent_starttime != "$parent_starttime" ]]; then
@@ -1310,72 +1289,43 @@ resource_monitor_start() {
         break
       fi
       available=$(meminfo_bytes MemAvailable 2>/dev/null || printf 0)
-      if [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RESOURCE_MONITOR_ASYNC:-0} == 1 ]]; then
-        resource_psi_sample_number=$((resource_psi_sample_number + 1))
-        resource_psi_monotonic_sample_number=$resource_psi_sample_number
-      fi
-      if ! current_psi=$(io_total_us 2>/dev/null) \
-        || [[ ! $current_psi =~ ^(0|[1-9][0-9]*)$ ]]; then
-        resource_monitor_record_breach "$phase" psi-unavailable 0 0 0 "$consecutive_hits" || true
-        kill -TERM "$parent_pid" 2>/dev/null || true
-        break
-      fi
-      if ! current_mono=$(io_psi_monotonic_us 2>/dev/null) \
-        || [[ ! $current_mono =~ ^(0|[1-9][0-9]*)$ ]]; then
-        resource_monitor_record_breach "$phase" psi-unavailable 0 0 0 "$consecutive_hits" || true
-        kill -TERM "$parent_pid" 2>/dev/null || true
-        break
-      fi
-      printf '%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$available" "$current_psi" >>"$resource_monitor_log"
+      monitor_sample_number=$((monitor_sample_number + 1))
+      printf '%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$available" >>"$resource_monitor_log"
       snapshot=$(capture_production_snapshot 2>/dev/null || true)
-      if ! resource_monitor_identity_guard "$snapshot"; then
-        kill -TERM "$parent_pid" 2>/dev/null || true
-        break
-      fi
-      if (( available < HOST_MEMORY_RESERVE_BYTES )); then
-        resource_monitor_record_breach "$phase" memory-breach 0 0 0 "$consecutive_hits" || true
-        kill -TERM "$parent_pid" 2>/dev/null || true
-        break
-      fi
-      if [[ ! $current_mono =~ ^(0|[1-9][0-9]*)$ ]] || (( current_mono <= window_start_mono )); then
-        resource_monitor_record_breach "$phase" psi-regressed 0 0 0 "$consecutive_hits" || true
-        kill -TERM "$parent_pid" 2>/dev/null || true
-        break
-      fi
-      elapsed_us=$((current_mono - window_start_mono))
-      if (( current_psi < last_psi )); then
-        resource_monitor_record_breach "$phase" psi-regressed "$elapsed_us" 0 0 "$consecutive_hits" || true
-        kill -TERM "$parent_pid" 2>/dev/null || true
-        break
-      fi
-      if (( elapsed_us >= IO_PSI_WINDOW_US )); then
-        current_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-        transition=$(io_psi_window_transition "$window_start_psi" "$current_psi" \
-          "$elapsed_us" "$consecutive_hits") || {
-          resource_monitor_record_breach "$phase" psi-regressed "$elapsed_us" 0 0 "$consecutive_hits" || true
+      if resource_monitor_identity_guard "$snapshot"; then
+        identity_status=0
+      else
+        identity_status=$?
+        if (( identity_status == 1 )); then
           kill -TERM "$parent_pid" 2>/dev/null || true
           break
-        }
-        read -r delta ratio hit consecutive_hits <<<"$transition"
-        jq -cn --arg phase "$phase" --arg stage runtime \
-          --arg started_at "$window_start_at" --arg finished_at "$current_at" \
-          --argjson previous_total_us "$window_start_psi" \
-          --argjson current_total_us "$current_psi" --argjson delta_us "$delta" \
-          --argjson elapsed_us "$elapsed_us" --argjson window_us "$elapsed_us" \
-          --argjson ratio "$ratio" --argjson hit "$hit" \
-          --argjson consecutive_hits "$consecutive_hits" \
-          '{phase:$phase,stage:$stage,started_at:$started_at,finished_at:$finished_at,
-            previous_total_us:$previous_total_us,current_total_us:$current_total_us,
-            delta_us:$delta_us,elapsed_us:$elapsed_us,window_us:$window_us,
-            ratio:$ratio,hit:$hit,consecutive_hits:$consecutive_hits}' \
-          >>"$resource_monitor_psi_log" || true
-        window_start_psi=$current_psi
-        window_start_mono=$current_mono
-        window_start_at=$current_at
+        fi
+        # A transiently unavailable snapshot is inconclusive.  Continue the
+        # monitor; the next bounded phase refresh still fails closed if the
+        # production pair remains down or malformed.  Fall through to the
+        # common memory checks and their bounded sleep so this path cannot
+        # busy-loop or skip resource protection during a restart.
       fi
-      last_psi=$current_psi
+      if (( identity_status == 2 )); then
+        now=$(monotonic_seconds)
+        if (( invalid_since == 0 )); then
+          invalid_since=$now
+        elif (( now - invalid_since >= MAX_HEALTH_SILENCE_SECONDS )); then
+          resource_monitor_record_breach "$phase" production-snapshot-invalid 0 0 0 0 || true
+          kill -TERM "$parent_pid" 2>/dev/null || true
+          break
+        fi
+      else
+        invalid_since=0
+      fi
+      if (( available < HOST_MEMORY_RESERVE_BYTES )); then
+        resource_monitor_record_breach "$phase" memory-breach 0 0 0 0 || true
+        kill -TERM "$parent_pid" 2>/dev/null || true
+        break
+      fi
       if [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RESOURCE_MONITOR_ASYNC:-0} == 1 ]]; then
-        if (( resource_psi_sample_number >= fixture_sample_limit )); then
+        if [[ $fixture_sample_limit =~ ^[1-9][0-9]*$ ]] \
+          && (( monitor_sample_number >= fixture_sample_limit )); then
           rm -f -- "$resource_monitor_control"
           break
         fi
@@ -1395,7 +1345,7 @@ resource_monitor_breach_cause() {
     IFS= read -r cause <"$tmp_dir/resource-monitor-breach" || cause=unknown
   fi
   case "$cause" in
-    fixture-resource-breach|memory-breach|production-identity-drift|production-snapshot-invalid|psi-regressed|psi-unavailable) ;;
+    fixture-resource-breach|memory-breach|production-identity-drift|production-snapshot-invalid) ;;
     *) cause=unknown ;;
   esac
   printf '%s\n' "$cause"
@@ -1457,11 +1407,6 @@ resource_monitor_stop() {
     resource_monitor_capture_breach "${phase:-unknown}" || true
   fi
   resource_monitor_pid=; resource_monitor_phase=; resource_monitor_control=
-  if [[ -s ${resource_monitor_psi_log:-} ]]; then
-    local runtime_psi_windows
-    runtime_psi_windows=$(jq -sc '.' "$resource_monitor_psi_log" 2>/dev/null || printf '[]')
-    psi_windows=$(jq -cn --argjson prior "$psi_windows" --argjson runtime "$runtime_psi_windows" '$prior + $runtime')
-  fi
   [[ $breach == false ]] || return 1
   resource_samples=$(jq -cn --argjson prior "$resource_samples" --arg phase "$phase" --arg ended "$ended" \
     --argjson samples "${samples:-0}" --argjson max "${max_available:-0}" --argjson current "${current_available:-0}" \
@@ -1493,37 +1438,6 @@ resource_monitor_stop_or_die() {
   fi
   die "resource monitor teardown failed during $phase"
 }
-calibrate_psi() {
-  local phase=$1 previous current previous_mono current_mono transition delta ratio hit consecutive=0 i elapsed_us
-  if [[ $TEST_ONLY == true ]]; then
-    fixture_last_calibrated_phase=$phase
-    psi_windows=$(jq -cn --argjson values "$psi_windows" --arg phase "$phase" '$values + [{phase:$phase,stage:"fixture",hit:false,consecutive_hits:0}]'); return
-  fi
-  previous=$(io_total_us) || die "I/O PSI unavailable before $phase"
-  previous_mono=$(io_psi_monotonic_us) || die "monotonic clock is unavailable before $phase"
-  for i in 1 2 3; do
-    while :; do
-      sleep "$IO_PSI_WINDOW_SECONDS"
-      current=$(io_total_us) || die "I/O PSI unavailable during $phase"
-      current_mono=$(io_psi_monotonic_us) || die "monotonic clock is unavailable during $phase"
-      [[ $current_mono =~ ^(0|[1-9][0-9]*)$ && $previous_mono =~ ^(0|[1-9][0-9]*)$ \
-        && $current_mono -gt $previous_mono ]] || die 'I/O PSI monotonic clock moved backwards'
-      elapsed_us=$((current_mono - previous_mono))
-      (( elapsed_us >= IO_PSI_WINDOW_US )) || continue
-      transition=$(io_psi_window_transition "$previous" "$current" \
-        "$elapsed_us" "$consecutive") || die 'I/O PSI moved backwards'
-      break
-    done
-    read -r delta ratio hit consecutive <<<"$transition"
-    psi_windows=$(jq -cn --argjson values "$psi_windows" --arg phase "$phase" \
-      --argjson delta "$delta" --argjson ratio "$ratio" --argjson hit "$hit" \
-      --argjson consecutive "$consecutive" --argjson elapsed "$elapsed_us" \
-      '$values + [{phase:$phase,stage:"calibration",delta_us:$delta,ratio:$ratio,
-        elapsed_us:$elapsed,window_us:$elapsed,hit:$hit,consecutive_hits:$consecutive}]') \
-      || die 'could not record I/O PSI calibration window'
-    previous=$current; previous_mono=$current_mono
-  done
-}
 assert_host_memory_reserve() {
   local available
   [[ $TEST_ONLY == true ]] && return 0
@@ -1532,7 +1446,10 @@ assert_host_memory_reserve() {
 }
 
 run_id=$(date -u +%Y%m%dT%H%M%SZ)-$$
-evidence_dir="$EVIDENCE_ROOT/$CANDIDATE_CONTROLLER/$candidate_runtime/runs/$run_id"; gate_json="$evidence_dir/gate.json"; passed_marker="$evidence_dir/PASSED.sha256"; run_spool="$RUN_SPOOL_ROOT/$run_id"; run_json="$evidence_dir/run.json"
+evidence_dir="$EVIDENCE_ROOT/$CANDIDATE_CONTROLLER/$candidate_runtime/runs/$run_id"
+final_evidence_dir=$evidence_dir
+publishing_evidence_dir="$evidence_dir.publishing"
+gate_json="$evidence_dir/gate.json"; passed_marker="$evidence_dir/PASSED.sha256"; passed_marker_tmp="$evidence_dir/.PASSED.sha256.tmp"; run_spool="$RUN_SPOOL_ROOT/$run_id"; run_json="$evidence_dir/run.json"
 gate_unit_dir="$GATE_UNIT_ROOT/$run_id"
 # All Gate workers share one run-scoped hard envelope.  The production pair
 # remains in its separately governed permanent slice; this transient slice is
@@ -1544,6 +1461,10 @@ gate_worker_slice_file="$GATE_SYSTEMD_ROOT/$GATE_WORKER_SLICE"
 GATE_WORKER_MEMORY_HIGH_BYTES=1342177280
 GATE_WORKER_MEMORY_MAX_BYTES=1610612736
 gate_worker_slice_control_group=
+gate_worker_memory_events_start='{}'
+gate_worker_memory_events_end='{}'
+production_memory_events_start='{}'
+production_memory_events_end='{}'
 
 # BSD/GNU install only applies -m to the leaf when creating a nested path.
 # Create each shadow spool component explicitly so the collector user can
@@ -1639,12 +1560,29 @@ for market in "${markets[@]}"; do
 done
 if [[ ${MONDAY_GATE_FIXTURE_PATH_ONLY:-0} != 1 ]]; then
   while IFS= read -r prior_receipt; do
-    if jq -e '(.schema | test("^monday[.]rust_lob_shadow_gate[.]v[0-9]+$")) and .passed == true' "$prior_receipt" >/dev/null 2>&1; then
+    prior_gate_sha=$(sha256_file "$prior_receipt") || continue
+    prior_source_mode=$(jq -er '.source_mode | select(. == "direct" or . == "stable")' "$prior_receipt" 2>/dev/null) || continue
+    prior_test_only=$(jq -er '.test_only | if type == "boolean" then tostring else error end' \
+      "$prior_receipt" 2>/dev/null) || continue
+    prior_eligible=$(jq -er '.production_eligible | if type == "boolean" then tostring else error end' \
+      "$prior_receipt" 2>/dev/null) || continue
+    [[ $prior_test_only == false && $prior_eligible == true ]] || continue
+    if [[ $prior_source_mode == direct ]]; then
+      prior_from=direct
+    else
+      prior_from=$(jq -er '.from_controller_sha256 | select(type == "string" and test("^[a-f0-9]{64}$"))' \
+        "$prior_receipt" 2>/dev/null) || continue
+    fi
+    # Only a complete formal receipt, including its adjacent run evidence and
+    # immutable marker, blocks another Gate for this candidate.  Failed or
+    # incomplete receipts remain audit evidence but cannot deadlock recovery.
+    if monday_validate_v2_gate_authoritative "$ROOT" "$prior_receipt" "$prior_from" \
+      "$CANDIDATE_CONTROLLER" "$prior_gate_sha" >/dev/null 2>&1; then
       die 'a passed Gate receipt already exists for this controller identity'
     fi
   done < <(find "$EVIDENCE_ROOT/$CANDIDATE_CONTROLLER/$candidate_runtime" -type f -name gate.json -print)
 fi
-gate_started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ); gate_finished=false
+gate_started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ); gate_finished=false; marker_authoritative=false
 declare -A phase_pid phase_exe_sha phase_session phase_segments phase_oss phase_runtime
 declare -A phase_strict_lob phase_strict_aggregate phase_strict_raw
 declare -A market_gate_started_ns market_observation_started_ns frozen_symbol_count frozen_catalog_sha256
@@ -1670,8 +1608,8 @@ write_run_json() {
       --argjson observed "$observed_json" \
       '$values + {($market):$observed}') || return 1
   done
-  jq -cn --arg run "$run_id" --arg controller "$CANDIDATE_CONTROLLER" --arg payload "$candidate_payload" --arg runtime "$candidate_runtime" --arg spool "$run_spool" --arg worker_slice "$GATE_WORKER_SLICE" --arg worker_slice_sha "$gate_worker_slice_sha256" --arg worker_slice_cgroup "$gate_worker_slice_control_group" --argjson worker_high "$GATE_WORKER_MEMORY_HIGH_BYTES" --argjson worker_max "$GATE_WORKER_MEMORY_MAX_BYTES" --argjson segment "$GATE_SEGMENT_SECONDS" --argjson requested "$GATE_DURATION_SECONDS" --argjson formal_required "$REQUIRED_DURATION_SECONDS" --argjson settle "$HEALTH_SETTLE_DURATION_SECONDS" --argjson resources "$resource_samples" --argjson psi "$psi_windows" --argjson test_only "$test_only_json" --argjson markets "$markets_json" \
-    '{schema:"monday.rust_lob_shadow_gate_run.v3",control_plane_version:2,run_id:$run,candidate_controller_sha256:$controller,candidate_payload_sha256:$payload,candidate_runtime_contract_sha256:$runtime,test_only:$test_only,run_spool:$spool,worker_slice:{name:$worker_slice,sha256:$worker_slice_sha,cgroup:$worker_slice_cgroup,memory_high_bytes:$worker_high,memory_max_bytes:$worker_max},segment_seconds:$segment,requested_duration_seconds:$requested,formal_required_duration_seconds:$formal_required,health_settle_seconds:$settle,resource_admission:$resources,io_full_psi_windows:$psi,markets:$markets}' >"$run_json.tmp"
+  jq -cn --arg run "$run_id" --arg controller "$CANDIDATE_CONTROLLER" --arg payload "$candidate_payload" --arg runtime "$candidate_runtime" --arg spool "$run_spool" --arg worker_slice "$GATE_WORKER_SLICE" --arg worker_slice_sha "$gate_worker_slice_sha256" --arg worker_slice_cgroup "$gate_worker_slice_control_group" --argjson worker_high "$GATE_WORKER_MEMORY_HIGH_BYTES" --argjson worker_max "$GATE_WORKER_MEMORY_MAX_BYTES" --argjson segment "$GATE_SEGMENT_SECONDS" --argjson evidence_timeout "$GATE_EVIDENCE_TIMEOUT_SECONDS" --argjson formal_evidence_timeout "$EVIDENCE_TIMEOUT_SECONDS" --argjson settle "$HEALTH_SETTLE_DURATION_SECONDS" --argjson resources "$resource_samples" --argjson psi "$psi_windows" --argjson test_only "$test_only_json" --argjson markets "$markets_json" \
+    '{schema:"monday.rust_lob_shadow_gate_run.v3",control_plane_version:2,run_id:$run,candidate_controller_sha256:$controller,candidate_payload_sha256:$payload,candidate_runtime_contract_sha256:$runtime,test_only:$test_only,run_spool:$spool,worker_slice:{name:$worker_slice,sha256:$worker_slice_sha,cgroup:$worker_slice_cgroup,memory_high_bytes:$worker_high,memory_max_bytes:$worker_max},segment_seconds:$segment,evidence_timeout_seconds:$evidence_timeout,formal_evidence_timeout_seconds:$formal_evidence_timeout,health_settle_seconds:$settle,resource_admission:$resources,io_full_psi_windows:$psi,markets:$markets}' >"$run_json.tmp"
   chmod 0640 "$run_json.tmp"; mv -f -- "$run_json.tmp" "$run_json"
 }
 write_resource_monitor_failure() {
@@ -1708,7 +1646,25 @@ cleanup() {
   [[ $TEST_ONLY == true ]] || systemctl daemon-reload >/dev/null 2>&1 || cleanup_failed=true
   write_resource_monitor_failure "$cleanup_failed" || cleanup_failed=true
   rm -rf -- "$gate_unit_dir" "$run_spool" "$tmp_dir"
-  [[ $gate_finished == true ]] || rm -f -- "$passed_marker" "$evidence_dir/.PASSED.sha256.tmp"
+  # A trap may run after the marker has been atomically published but before
+  # the normal success path can set gate_finished.  Preserve such a marker
+  # only when the existing authoritative validator proves its paired receipt,
+  # run evidence, and immutable identity; otherwise remove only residue.
+  marker_authoritative=${marker_authoritative:-false}
+  if [[ $gate_finished != true && $marker_authoritative != true \
+    && -f $passed_marker && ! -L $passed_marker && -f $gate_json ]]; then
+    cleanup_gate_sha=$(sha256_file "$gate_json" 2>/dev/null || true)
+    cleanup_from=${before_controller:-}
+    [[ ${source_mode:-} == direct ]] && cleanup_from=direct
+    if [[ $cleanup_gate_sha =~ ^[a-f0-9]{64}$ && \
+      ( $cleanup_from == direct || $cleanup_from =~ ^[a-f0-9]{64}$ ) ]]; then
+      monday_validate_v2_gate_authoritative "$ROOT" "$gate_json" "$cleanup_from" \
+        "$CANDIDATE_CONTROLLER" "$cleanup_gate_sha" >/dev/null 2>&1 \
+        && marker_authoritative=true
+    fi
+  fi
+  [[ $gate_finished == true || $marker_authoritative == true ]] || rm -f -- "$passed_marker"
+  rm -f -- "$passed_marker_tmp"
   [[ $cleanup_failed == false ]] || { printf 'run-scoped Gate cleanup was incomplete\n' >&2; status=1; }; exit "$status"
 }
 trap cleanup EXIT; trap 'exit 143' HUP INT TERM
@@ -1730,6 +1686,10 @@ gate_worker_slice_sha256=$(sha256_file "$gate_worker_slice_file")
 systemctl start "$GATE_WORKER_SLICE" >/dev/null 2>&1 \
   || die 'could not activate run-scoped Gate worker slice'
 verify_gate_worker_slice || die 'run-scoped Gate worker slice did not read back exactly'
+gate_worker_memory_events_start=$(gate_worker_memory_events_snapshot) \
+  || die 'run-scoped Gate worker slice memory.events is unavailable'
+memory_events_no_oom "$gate_worker_memory_events_start" "$gate_worker_memory_events_start" \
+  || die 'run-scoped Gate worker slice memory.events baseline is invalid'
 
 # The operator applies the signed production envelope before invoking Gate.
 # This readback fails closed without mutating production limits.
@@ -1738,6 +1698,10 @@ if [[ $TEST_ONLY == true ]]; then
 else
   refresh_production_snapshot || die 'production cgroup snapshot is invalid'
 fi
+production_memory_events_start=$(jq -ce '.parent_memory_events' <<<"$production_snapshot_json") \
+  || die 'production cgroup memory.events baseline is invalid'
+memory_events_no_oom "$production_memory_events_start" "$production_memory_events_start" \
+  || die 'production cgroup memory.events baseline is invalid'
 
 # Fixture-only path coverage reaches the same run-scoped preparation without
 # opening sockets, invoking OSS, or starting an external market process.
@@ -1754,7 +1718,7 @@ if [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_PATH_ONLY:-0} == 1 ]]; then
   exit 0
 fi
 
-calibrate_psi preflight; resource_monitor_start preflight "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; \
+resource_monitor_start preflight "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; \
   resource_monitor_stop_or_die preflight; write_run_json
 if [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RESOURCE_MONITOR_ONLY:-0} == 1 ]]; then
   exit 0
@@ -1776,12 +1740,17 @@ else
 fi
 
 fixture_seed_market() {
-  local market=$1 dir="${spool_dir[$1]}" i file data_sha now; [[ $TEST_ONLY == true ]] || return 0
+  local market=$1 dir="${spool_dir[$1]}" i file data_sha now boundary=false segment_count=2
+  [[ $TEST_ONLY == true ]] || return 0
+  [[ ${MONDAY_GATE_FIXTURE_RECONNECT_BOUNDARY:-0} == 1 ]] && segment_count=3
+  [[ ${MONDAY_GATE_FIXTURE_SINGLE_CLEAN_SEGMENT:-0} == 1 ]] && segment_count=1
   now=$(monotonic_seconds); mkdir -p "$dir"
   jq -cn --arg market "$market" --arg dataset "${dataset[$market]}" --arg session "fixture-$run_id-$market" --argjson updated "$((now * 1000000000))" '{market:$market,dataset:$dataset,updated_at_ns:$updated,status:"synced",sequence_gaps:0,symbol_count:1,symbols:{FIXTURE:{}},snapshot_ready_count:1,bridged_count:1,stream_coverage_verified_count:1,snapshot_only_symbols:[],all_symbols_bridged:true,all_stream_coverage_verified:true,full_stream_coverage_verified:true,queue_saturated:false,disk_warning:false,upload_warning:false,upload_failure_count:0,session_id:$session}' >"$dir/health.json"
-  for i in 1 2; do
+  for ((i = 1; i <= segment_count; i++)); do
+    boundary=false
+    [[ ${MONDAY_GATE_FIXTURE_RECONNECT_BOUNDARY:-0} == 1 && $i -eq 1 ]] && boundary=true
     file="part-$((now+i)).jsonl"; printf '{"schema":"binance.market_tape.v2","type":"session_start"}\n' >"$dir/$file"; zstd -q -f "$dir/$file" -o "$dir/$file.zst"; rm -f -- "$dir/$file"; file="$file.zst"; data_sha=$(sha256_file "$dir/$file")
-    jq -cn --arg market "$market" --arg dataset "${dataset[$market]}" --arg file "$file" --arg sha "$data_sha" --arg session "fixture-$run_id-$market" --argjson start "$((now+i*1000))" --argjson end "$((now+i*1000+900))" '{schema:"binance.market_tape.v2",market:$market,dataset:$dataset,shard_id:"all",start_received_at_ns:$start,end_received_at_ns:$end,file:$file,sha256:$sha,symbols:["FIXTURE"],stream_types:["depth@100ms"],event_types:{agg_trade:0,raw_trade:0,book_ticker:0,force_order:0},has_replay_safe_checkpoint:true,lob_continuity:{sequence_gaps:0,reconnect_boundary:false,capture_session_id:$session}}' >"$dir/$file.manifest.json"
+    jq -cn --arg market "$market" --arg dataset "${dataset[$market]}" --arg file "$file" --arg sha "$data_sha" --arg session "fixture-$run_id-$market" --argjson start "$((now+i*1000))" --argjson end "$((now+i*1000+900))" --argjson boundary "$boundary" '{schema:"binance.market_tape.v2",market:$market,dataset:$dataset,shard_id:"all",start_received_at_ns:$start,end_received_at_ns:$end,file:$file,sha256:$sha,symbols:["FIXTURE"],stream_types:["depth@100ms"],event_types:{agg_trade:0,raw_trade:0,book_ticker:0,force_order:0},has_replay_safe_checkpoint:true,lob_continuity:{sequence_gaps:0,reconnect_boundary:$boundary,capture_session_id:$session}}' >"$dir/$file.manifest.json"
     printf '%s\n' "$data_sha" >"$dir/$file._SUCCESS"
   done
 }
@@ -1804,23 +1773,27 @@ Slice=$GATE_WORKER_SLICE" \
       -e "s|^ExecStartPre=.*$|ExecStartPre=$candidate_binary --self-test|" \
       -e "s|^ExecStart=.*$|ExecStart=$candidate_binary|" \
       -e 's|^Restart=.*$|Restart=no|' \
-      -e 's|^RuntimeMaxSec=.*$|RuntimeMaxSec=1800|' \
+      -e "s|^RuntimeMaxSec=.*$|RuntimeMaxSec=$SHADOW_RUNTIME_MAX_SECONDS|" \
+      -e "s|^TimeoutStopSec=.*$|TimeoutStopSec=$SHADOW_STOP_TIMEOUT_SECONDS|" \
       -e "s|^ReadWritePaths=.*$|ReadWritePaths=$spool|" \
       "$source_unit" >"$rendered_unit"
   # shellcheck disable=SC2086
   sed -e '/^\[Service\]$/a\
 Slice='$GATE_WORKER_SLICE'\
 Restart=no\
-RuntimeMaxSec=1800' \
+RuntimeMaxSec='"$UPLOAD_DRAIN_TIMEOUT_SECONDS" \
       -e "s|^EnvironmentFile=.*$|EnvironmentFile=$rendered_env|" \
       -e "s|^ExecStart=.*$|ExecStart=$candidate_binary --upload-only|" \
       -e "s|^ReadWritePaths=.*$|ReadWritePaths=$spool|" \
       "$source_upload" >"$rendered_upload"
-  sed -e "s|^SPOOL_DIR=.*$|SPOOL_DIR=$spool|" "$source_env" >"$rendered_env"
+  sed -e "s|^SPOOL_DIR=.*$|SPOOL_DIR=$spool|" \
+      -e "s|^SEGMENT_SECONDS=.*$|SEGMENT_SECONDS=$GATE_SEGMENT_SECONDS|" \
+      "$source_env" >"$rendered_env"
   chmod 0640 "$rendered_unit" "$rendered_upload" "$rendered_env"
   [[ $(grep -Fxc "EnvironmentFile=$rendered_env" "$rendered_unit" || true) -eq 1 ]] || die "$market Gate unit env path is not exact"
   [[ $(grep -Fxc 'Restart=no' "$rendered_unit" || true) -eq 1 ]] || die "$market Gate unit restart policy is not bounded"
-  [[ $(grep -Fxc 'RuntimeMaxSec=1800' "$rendered_unit" || true) -eq 1 ]] || die "$market Gate unit runtime is not bounded"
+  [[ $(grep -Fxc "RuntimeMaxSec=$SHADOW_RUNTIME_MAX_SECONDS" "$rendered_unit" || true) -eq 1 ]] || die "$market Gate unit runtime is not bounded"
+  [[ $(grep -Fxc "TimeoutStopSec=$SHADOW_STOP_TIMEOUT_SECONDS" "$rendered_unit" || true) -eq 1 ]] || die "$market Gate unit stop is not bounded"
   [[ $(grep -Fxc "ReadWritePaths=$spool" "$rendered_unit" || true) -eq 1 ]] || die "$market Gate unit spool is not exact"
   [[ $(grep -Fxc "EnvironmentFile=$rendered_env" "$rendered_upload" || true) -eq 1 ]] || die "$market Gate upload env path is not exact"
   [[ $(grep -Fxc "ExecStart=$candidate_binary --upload-only" "$rendered_upload" || true) -eq 1 ]] || die "$market Gate upload identity is not exact"
@@ -1828,7 +1801,7 @@ RuntimeMaxSec=1800' \
   [[ $(grep -Fxc "Slice=$GATE_WORKER_SLICE" "$rendered_unit" || true) -eq 1 ]] || die "$market Gate worker slice is not exact"
   [[ $(grep -Fxc "Slice=$GATE_WORKER_SLICE" "$rendered_upload" || true) -eq 1 ]] || die "$market Gate upload worker slice is not exact"
   [[ $(grep -Fxc 'Restart=no' "$rendered_upload" || true) -eq 1 ]] || die "$market Gate upload restart policy is not bounded"
-  [[ $(grep -Fxc 'RuntimeMaxSec=1800' "$rendered_upload" || true) -eq 1 ]] || die "$market Gate upload runtime is not bounded"
+  [[ $(grep -Fxc "RuntimeMaxSec=$UPLOAD_DRAIN_TIMEOUT_SECONDS" "$rendered_upload" || true) -eq 1 ]] || die "$market Gate upload runtime is not bounded"
   canonical_upload="$tmp_dir/$market-shadow-upload-source.service"
   sed -e "/^Slice=$GATE_WORKER_SLICE$/d" \
       -e "s|^EnvironmentFile=$rendered_env$|EnvironmentFile=/etc/monday/binance-lob-archiver-rust-%i.env|" \
@@ -1838,6 +1811,7 @@ RuntimeMaxSec=1800' \
   monday_validate_unit_allowlist "$canonical_upload" shadow_upload_run \
     || die "$market rendered shadow upload unit failed security/resource verification"
   [[ $(grep -Fxc "SPOOL_DIR=$spool" "$rendered_env" || true) -eq 1 ]] || die "$market Gate env spool is not exact"
+  [[ $(grep -Fxc "SEGMENT_SECONDS=$GATE_SEGMENT_SECONDS" "$rendered_env" || true) -eq 1 ]] || die "$market Gate env segment duration is not run-scoped"
   [[ $TEST_ONLY == true ]] || systemd-analyze verify "$rendered_unit" "$rendered_upload" || die "$market Gate unit failed systemd-analyze verify"
   unit[$market]="monday-rust-lob-gate-${run_id}-${market}.service"
   # systemd does not search the private evidence directory.  Install a
@@ -1876,7 +1850,7 @@ run_strict_verifier() {
     --unit="${GATE_UNIT_PREFIX}${run_id}-strict-${strict_unit_seq}.service" \
     --slice="$GATE_WORKER_SLICE" \
     --property=MemoryMax=1536M --property=MemoryHigh=1280M \
-    --property=OOMScoreAdjust=500 --property=Restart=no --property=RuntimeMaxSec=1800 \
+    --property=OOMScoreAdjust=500 --property=Restart=no --property=RuntimeMaxSec="$TRANSIENT_WORK_TIMEOUT_SECONDS" \
     --uid="$SERVICE_USER" -- "$candidate_binary" "$@"
 }
 run_strict_verifier_pair() { run_strict_verifier --require-lob-continuity "$@"; }
@@ -1999,7 +1973,12 @@ health_catalog_sha256() {
 
 validate_observation_sample() {
   local market=$1 health="${spool_dir[$1]}/health.json" session symbols_now catalog upload_failures updated_ns current_mono
-  health_ok "$market" || die "$market health failed during observation"
+  jq -e '
+    .queue_saturated == false
+    and .disk_warning == false
+    and .upload_warning == false
+    and (.upload_failure_count | type == "number" and floor == . and . >= 0)' \
+    "$health" >/dev/null || die "$market health reported a fatal observation condition"
   session=$(jq -er '.session_id' "$health")
   [[ $session == "${phase_session[$market]}" ]] || die "$market collector session changed during observation"
   symbols_now=$(jq -er '.symbol_count' "$health")
@@ -2028,21 +2007,85 @@ validate_observation_sample() {
   max_health_silence_seconds[$market]=$next_gap
   health_samples[$market]=$((health_samples[$market] + increment))
 }
+segment_manifest_interval() {
+  local market=$1 manifest=$2 session=$3
+  jq -er --arg market "$market" --arg dataset "${dataset[$market]}" --arg session "$session" '
+    . as $manifest
+    | select(
+      .schema == "binance.market_tape.v2"
+      and .market == $market
+      and .dataset == $dataset
+      and (.start_received_at_ns | type == "number" and floor == . and . >= 0)
+      and ($manifest.end_received_at_ns | type == "number" and floor == .
+        and . >= $manifest.start_received_at_ns)
+      and (.has_replay_safe_checkpoint | type == "boolean")
+      and (.lob_continuity | type == "object")
+      and (.lob_continuity.sequence_gaps | type == "number" and floor == . and . >= 0)
+      and (.lob_continuity.reconnect_boundary | type == "boolean")
+      and .lob_continuity.capture_session_id == $session)
+    | (if .lob_continuity.reconnect_boundary then "boundary"
+       elif .has_replay_safe_checkpoint and .lob_continuity.sequence_gaps == 0 then "clean"
+       else "unsafe" end) as $state
+    | [$state, .start_received_at_ns, .end_received_at_ns] | @tsv' "$manifest"
+}
+clean_segment_pair_ready() {
+  local market=$1 manifest path interval state start end previous_end=0 run_count=0
+  while IFS= read -r manifest; do
+    path=${manifest%.manifest.json}
+    [[ -f $path && -f "${path}._SUCCESS" ]] || continue
+    interval=$(segment_manifest_interval "$market" "$manifest" "${phase_session[$market]}") \
+      || return 2
+    IFS=$'\t' read -r state start end <<<"$interval"
+    if [[ $state != clean ]]; then
+      previous_end=0; run_count=0
+      continue
+    fi
+    if (( previous_end > 0 )); then
+      (( start >= previous_end )) || return 2
+      if (( start - previous_end <= MAX_SEGMENT_GAP_NS )); then
+        run_count=$((run_count + 1))
+      else
+        run_count=1
+      fi
+    else
+      run_count=1
+    fi
+    previous_end=$end
+    (( run_count >= 2 )) && return 0
+  done < <(find "${spool_dir[$market]}" -maxdepth 1 -type f -name '*.jsonl.zst.manifest.json' | sort)
+  return 1
+}
 verify_segments() {
-  local market=$1 dir="${spool_dir[$1]}" path file digest manifest_digest success_digest expected_success count=0 previous_end=0 start end segment_json
+  local market=$1 dir="${spool_dir[$1]}" manifest path file digest manifest_digest success_digest expected_success count=0 previous_end=0 start end segment_json interval state
   local -a segment_records=()
   phase_segments_json[$market]='[]'
-  while IFS= read -r path; do
+  while IFS= read -r manifest; do
+    path=${manifest%.manifest.json}; file=${path##*/}
+    [[ -f $path && -f "${path}._SUCCESS" ]] || die "$market sealed segment is incomplete: $file"
+    interval=$(segment_manifest_interval "$market" "$manifest" "${phase_session[$market]}") \
+      || die "$market manifest failed strict checks"
+    IFS=$'\t' read -r state start end <<<"$interval"
+    case $state in
+      boundary)
+        previous_end=0; count=0; segment_records=(); phase_segments_json[$market]='[]'
+        continue
+        ;;
+      unsafe) die "$market manifest is not replay-safe" ;;
+      clean) ;;
+      *) die "$market manifest classification is invalid" ;;
+    esac
+    if (( previous_end > 0 )); then
+      (( start >= previous_end )) || die "$market segments overlap"
+      if (( start - previous_end > MAX_SEGMENT_GAP_NS )); then
+        count=0; segment_records=(); phase_segments_json[$market]='[]'
+      fi
+    fi
     file=${path##*/}; digest=$(sha256_file "$path"); expected_success="$tmp_dir/$market-$file.expected-success"; printf '%s\n' "$digest" >"$expected_success"; cmp -s "$path._SUCCESS" "$expected_success" || die "$market _SUCCESS digest mismatch"
     success_digest=$(sha256_file "$path._SUCCESS")
-    manifest_digest=$(sha256_file "$path.manifest.json")
-    jq -e --arg market "$market" --arg digest "$digest" --arg session "${phase_session[$market]}" \
-      '.schema == "binance.market_tape.v2" and .market == $market and .sha256 == $digest
-       and .has_replay_safe_checkpoint == true and .lob_continuity.sequence_gaps == 0
-       and .lob_continuity.reconnect_boundary == false
-       and .lob_continuity.capture_session_id == $session' \
-      "$path.manifest.json" >/dev/null || die "$market manifest failed strict checks"
-    start=$(jq -er '.start_received_at_ns' "$path.manifest.json"); end=$(jq -er '.end_received_at_ns' "$path.manifest.json"); ((previous_end == 0 || start >= previous_end)) || die "$market segments overlap"; ((previous_end == 0 || start-previous_end <= MAX_SEGMENT_GAP_NS)) || die "$market segment gap is too large"; previous_end=$end; count=$((count+1))
+    manifest_digest=$(sha256_file "$manifest")
+    jq -e --arg digest "$digest" '.sha256 == $digest' "$manifest" >/dev/null \
+      || die "$market manifest data digest is invalid"
+    previous_end=$end; count=$((count+1))
     segment_json=$(jq -cn --arg file "$file" --arg path "$path" --arg data_sha "$digest" \
       --arg manifest_sha "$manifest_digest" --arg success_sha "$success_digest" \
       --argjson start "$start" --argjson end "$end" --arg session "${phase_session[$market]}" \
@@ -2052,8 +2095,9 @@ verify_segments() {
     phase_segments_json[$market]=$(jq -cn --argjson values "${phase_segments_json[$market]}" \
       --argjson value "$segment_json" '$values + [$value]')
     segment_records+=("$path" "$digest" "$manifest_digest")
-  done < <(find "$dir" -maxdepth 1 -type f -name '*.jsonl.zst' | sort)
-  ((count >= 2)) || die "$market has fewer than two complete segments"
+    (( count >= 2 )) && break
+  done < <(find "$dir" -maxdepth 1 -type f -name '*.jsonl.zst.manifest.json' | sort)
+  ((count == 2)) || die "$market has fewer than two adjacent clean segments"
   verify_adjacent_segments "${segment_records[@]}" || die "$market strict LOB continuity verifier failed"
   if [[ $market == spot ]]; then
     verify_aggregate_trade_continuity "${segment_records[@]}" || die "$market strict aggregate-trade continuity verifier failed"
@@ -2068,8 +2112,8 @@ verify_segments() {
   phase_segments["$market"]=$count
 }
 run_market_gate_phase() {
-  local market=$1 settle observation_deadline_ns observation_finished_ns observation_started_ns pid started_ns
-  calibrate_psi "shadow-$market"; resource_monitor_start "shadow-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; fixture_seed_market "$market"; systemctl reset-failed "${unit[$market]}" >/dev/null 2>&1 || true
+  local market=$1 settle observation_deadline_ns observation_finished_ns observation_started_ns pid started_ns readiness
+  resource_monitor_start "shadow-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; fixture_seed_market "$market"; systemctl reset-failed "${unit[$market]}" >/dev/null 2>&1 || true
   started_ns=$(date +%s%N); market_gate_started_ns[$market]=$started_ns
   systemctl start "${unit[$market]}"; pid=$(shadow_identity_wait "$market"); phase_pid["$market"]=$pid; phase_exe_sha["$market"]=$candidate_payload
   if [[ $TEST_ONLY == true && ( ${MONDAY_GATE_FIXTURE_SIGKILL:-0} == 1 || ${MONDAY_GATE_HARD_CRASH_AFTER_SHADOW_START:-0} == 1 ) && $market == spot ]]; then
@@ -2077,16 +2121,40 @@ run_market_gate_phase() {
   fi
   settle=$(( $(monotonic_seconds) + HEALTH_SETTLE_DURATION_SECONDS )); while ! health_ok "$market"; do (( $(monotonic_seconds) < settle )) || die "$market health did not settle"; [[ $(systemctl_value "$market" NRestarts) == 0 ]] || die "$market restarted while settling"; [[ $(systemctl_value "$market" MainPID) == "$pid" ]] || die "$market MainPID changed while settling"; assert_host_memory_reserve; sleep 1; done
   phase_session["$market"]=$(jq -er '.session_id' "${spool_dir[$market]}/health.json"); frozen_symbol_count[$market]=$(jq -er '.symbol_count' "${spool_dir[$market]}/health.json"); frozen_catalog_sha256[$market]=$(health_catalog_sha256 "$market"); initial_upload_failure_count[$market]=$(jq -er '.upload_failure_count' "${spool_dir[$market]}/health.json"); last_health_updated_ns[$market]=$(jq -er '.updated_at_ns' "${spool_dir[$market]}/health.json"); last_health_advance_mono[$market]=$(monotonic_seconds); max_health_silence_seconds[$market]=0; health_samples[$market]=1; market_observation_started_ns[$market]=$(date +%s%N)
+  observation_started_ns=$(monotonic_nanoseconds)
+  observation_deadline_ns=$(( observation_started_ns + GATE_EVIDENCE_TIMEOUT_SECONDS * 1000000000 ))
+  while :; do
+    validate_observation_sample "$market"
+    assert_host_memory_reserve
+    [[ $(systemctl_value "$market" NRestarts) == 0 ]] || die "$market restarted"
+    [[ $(systemctl_value "$market" MainPID) == "$pid" ]] || die "$market MainPID changed"
+    (( $(monotonic_nanoseconds) < observation_deadline_ns )) \
+      || die "$market did not produce two adjacent clean segments before the evidence deadline"
+    if health_ok "$market"; then
+      if clean_segment_pair_ready "$market"; then
+        break
+      else
+        readiness=$?
+        (( readiness == 1 )) || die "$market segment evidence is malformed"
+      fi
+    fi
+    [[ $TEST_ONLY == false ]] \
+      || die "$market fixture did not produce two adjacent clean segments"
+    sleep 15
+  done
+  observation_finished_ns=$(monotonic_nanoseconds)
+  market_observation_started_mono_ns[$market]=$observation_started_ns
+  market_observation_finished_mono_ns[$market]=$observation_finished_ns
+  phase_runtime["$market"]=$(( (observation_finished_ns - observation_started_ns) / 1000000000 ))
   phase_health_json[$market]=$(jq -cn --arg sha "$(sha256_file "${spool_dir[$market]}/health.json")" \
     --arg session "${phase_session[$market]}" --argjson symbols "${frozen_symbol_count[$market]}" \
     --arg catalog "${frozen_catalog_sha256[$market]}" --argjson silence "${max_health_silence_seconds[$market]}" \
     --argjson samples "${health_samples[$market]}" \
     '{sha256:$sha,session_id:$session,frozen_symbol_count:$symbols,
       frozen_catalog_sha256:$catalog,max_health_silence_seconds:$silence,samples:$samples}')
-  observation_started_ns=$(monotonic_nanoseconds); observation_deadline_ns=$(( observation_started_ns + GATE_DURATION_SECONDS * 1000000000 )); while (( $(monotonic_nanoseconds) < observation_deadline_ns )); do validate_observation_sample "$market"; assert_host_memory_reserve; [[ $(systemctl_value "$market" NRestarts) == 0 ]] || die "$market restarted"; [[ $(systemctl_value "$market" MainPID) == "$pid" ]] || die "$market MainPID changed"; [[ $TEST_ONLY == true ]] && break; sleep 15; done
-  observation_finished_ns=$(monotonic_nanoseconds); market_observation_started_mono_ns[$market]=$observation_started_ns; market_observation_finished_mono_ns[$market]=$observation_finished_ns; phase_runtime["$market"]=$(( (observation_finished_ns - observation_started_ns) / 1000000000 )); systemctl stop "${unit[$market]}"; systemctl_active "${unit[$market]}" && die "$market shadow remained active"; \
+  systemctl stop "${unit[$market]}"; systemctl_active "${unit[$market]}" && die "$market shadow remained active"; \
     resource_monitor_stop_or_die "shadow-$market"; \
-    calibrate_psi "shadow-$market-tail"; resource_monitor_start "strict-verifier-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; \
+    resource_monitor_start "strict-verifier-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; \
     verify_segments "$market"; resource_monitor_stop_or_die "strict-verifier-$market"
 }
 DRAIN_ENV_KEYS=(
@@ -2159,7 +2227,7 @@ run_oss() {
       --unit="${GATE_UNIT_PREFIX}${run_id}-oss-${market}-${oss_unit_seq}.service" \
       --slice="$GATE_WORKER_SLICE" \
       --property=MemoryMax=1536M --property=MemoryHigh=1280M \
-      --property=OOMScoreAdjust=500 --property=Restart=no --property=RuntimeMaxSec=1800 \
+      --property=OOMScoreAdjust=500 --property=Restart=no --property=RuntimeMaxSec="$TRANSIENT_WORK_TIMEOUT_SECONDS" \
       -- runuser --user "$SERVICE_USER" -- env -i HOME="$SERVICE_HOME" PATH="$SAFE_PATH" \
       ALIYUN_PROFILE="${aliyun_profile[$market]}" /usr/local/bin/aliyun ossutil "$@" \
       --profile "${aliyun_profile[$market]}" --endpoint "${oss_endpoint[$market]}" \
@@ -2167,9 +2235,9 @@ run_oss() {
   fi
 }
 verify_oss_roundtrips() {
-  local market=$1 readback="$tmp_dir/oss-$1" listing="$tmp_dir/oss-$1.list" uri manifest final_manifest data success expected_success file digest manifest_digest success_digest line token replay_safe triplet_json observed_at observed_cutoff_ns
+  local market=$1 readback="$tmp_dir/oss-$1" listing="$tmp_dir/oss-$1.list" uri manifest final_manifest data success expected_success file digest manifest_digest success_digest line token triplet_json observed_at observed_cutoff_ns
   local expected_bucket manifest_name object_prefix data_uri success_uri expected_file
-  local candidates_file unsafe_file
+  local candidates_file unsafe_file interval state manifest_index=0
   resource_monitor_start "oss-readback-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"
   observed_cutoff_ns=$(date +%s%N)
   [[ $observed_cutoff_ns =~ ^[0-9]+$ ]] || die "$market OSS observation clock is unavailable"
@@ -2205,6 +2273,14 @@ verify_oss_roundtrips() {
     [[ $token == *.manifest.json ]] && printf 'oss://%s/%s\n' "${oss_bucket[$market]}" "$token" >>"$readback/manifest-uris"
   done <"$listing"
   sort -u -o "$readback/manifest-uris" "$readback/manifest-uris"
+  # Validate the complete listing before selecting the first qualifying pair;
+  # otherwise a malformed later object could hide behind an early success.
+  while IFS= read -r uri; do
+    [[ -n $uri ]] || continue
+    monday_validate_lob_object_uri "$market" "${dataset[$market]}" \
+      "$expected_bucket" "$uri" manifest \
+      || die "$market OSS manifest URI failed strict validation: $uri"
+  done <"$readback/manifest-uris"
   while IFS= read -r uri; do
     [[ -n $uri ]] || continue
     manifest_name=${uri##*/}
@@ -2214,7 +2290,8 @@ verify_oss_roundtrips() {
     object_prefix=${object_prefix%/"$manifest_name"}
     [[ $object_prefix == "${expected_oss_prefix[$market]}"/* ]] \
       || die "$market OSS manifest URI is outside the configured base prefix: $uri"
-    manifest="$readback/discovered-$count.json"; run_oss "$market" cp "$uri" "$manifest" --force --no-progress >/dev/null
+    manifest_index=$((manifest_index + 1))
+    manifest="$readback/discovered-$manifest_index.json"; run_oss "$market" cp "$uri" "$manifest" --force --no-progress >/dev/null
     jq -e --arg market "$market" \
       '.market == $market
        and (.start_received_at_ns | type == "number" and floor == . and . >= 0)
@@ -2228,20 +2305,32 @@ verify_oss_roundtrips() {
     if [[ $TEST_ONLY != true ]] && ((end <= market_observation_started_ns[$market])); then
       continue
     fi
-    jq -e --arg session "${phase_session[$market]}" \
-      '.schema == "binance.market_tape.v2"
-       and (.has_replay_safe_checkpoint | type == "boolean") and .lob_continuity.sequence_gaps == 0
-       and .lob_continuity.reconnect_boundary == false
-       and .lob_continuity.capture_session_id == $session
-       and (.file | type == "string" and test("^part-[0-9]+\\.jsonl\\.zst$"))' \
-      "$manifest" >/dev/null || die "$market OSS manifest failed strict verification"
-    replay_safe=$(jq -er '.has_replay_safe_checkpoint' "$manifest")
-    if [[ $replay_safe != true ]]; then
-      printf '%s\t%s\t%s\n' "$start" "$end" "$uri" >>"$unsafe_file"
-      continue
-    fi
+    interval=$(segment_manifest_interval "$market" "$manifest" "${phase_session[$market]}") \
+      || die "$market OSS manifest failed strict verification"
+    IFS=$'\t' read -r state start end <<<"$interval"
+    jq -e '(.file | type == "string" and test("^part-[0-9]+\\.jsonl\\.zst$"))' \
+      "$manifest" >/dev/null || die "$market OSS manifest filename is invalid"
+    case $state in
+      boundary)
+        previous_end=0; count=0; roundtrip_records=(); phase_triplets_json[$market]='[]'
+        continue
+        ;;
+      unsafe)
+        printf '%s\t%s\t%s\n' "$start" "$end" "$uri" >>"$unsafe_file"
+        previous_end=0; count=0; roundtrip_records=(); phase_triplets_json[$market]='[]'
+        continue
+        ;;
+      clean) ;;
+      *) die "$market OSS manifest classification is invalid" ;;
+    esac
     printf '%s\t%s\t%s\n' "$start" "$end" "$uri" >>"$candidates_file"
-    ((previous_end == 0 || start >= previous_end)) || die "$market OSS segments overlap"; ((previous_end == 0 || start - previous_end <= MAX_SEGMENT_GAP_NS)) || die "$market OSS continuity gap exceeded"; previous_end=$end
+    if (( previous_end > 0 )); then
+      (( start >= previous_end )) || die "$market OSS segments overlap"
+      if (( start - previous_end > MAX_SEGMENT_GAP_NS )); then
+        count=0; roundtrip_records=(); phase_triplets_json[$market]='[]'
+      fi
+    fi
+    previous_end=$end
     expected_file=${manifest_name%.manifest.json}
     file=$(jq -er '.file' "$manifest"); [[ $file == "$expected_file" ]] \
       || die "$market OSS manifest filename does not match its object URI"
@@ -2277,10 +2366,16 @@ verify_oss_roundtrips() {
       --argjson value "$triplet_json" '$values + [$value]')
     roundtrip_records+=("$data" "$digest" "$manifest_digest")
     count=$((count + 1))
+    (( count >= 2 )) && break
   done <"$readback/manifest-uris"
-  ((count >= 2)) || die "$market OSS readback has fewer than two triplets"
+  ((count == 2)) || die "$market OSS readback has fewer than two adjacent clean triplets"
   monday_validate_replay_safe_manifest_order "$market" "$candidates_file" "$unsafe_file" \
     || die "$market replay-safe manifest ordering failed"
+  jq -e -n --argjson segments "${phase_segments_json[$market]}" \
+    --argjson triplets "${phase_triplets_json[$market]}" '
+      ($segments | map([.data_sha256, .start_received_at_ns, .end_received_at_ns]))
+      == ($triplets | map([.data_sha256, .start_received_at_ns, .end_received_at_ns]))' \
+    || die "$market OSS triplets do not match the selected local segments"
   verify_adjacent_segments "${roundtrip_records[@]}" || die "$market OSS strict LOB continuity verifier failed"
   if [[ $market == spot ]]; then
     verify_aggregate_trade_continuity "${roundtrip_records[@]}" || die "$market OSS strict aggregate-trade continuity verifier failed"
@@ -2337,8 +2432,18 @@ if [[ $old_shadow_present == true ]]; then
     || die 'restored shadow binary bytes changed during Gate'
 fi
 refresh_production_snapshot || die 'production cgroup identity changed during Gate'
+production_memory_events_end=$(jq -ce '.parent_memory_events' <<<"$production_snapshot_json") \
+  || die 'production cgroup memory.events final readback is invalid'
+memory_events_no_oom "$production_memory_events_start" "$production_memory_events_end" \
+  || die 'production cgroup memory.events recorded an OOM during Gate'
+gate_worker_memory_events_end=$(gate_worker_memory_events_snapshot) \
+  || die 'run-scoped Gate worker slice memory.events final readback is invalid'
+memory_events_no_oom "$gate_worker_memory_events_start" "$gate_worker_memory_events_end" \
+  || die 'run-scoped Gate worker slice memory.events recorded an OOM during Gate'
 
-checks=$(jq -cn '{before_pair_unchanged:true,production_runtime_verified:true,shadow_staging_verified:true,shadow_assets_restored:true,resource_preflight:true,oss_triplets:true,strict_segment_verifier:true,final_identity:true,controller_control_bytes:true,shadow_link_restored:true,health_freshness:true}')
+checks=$(jq -cn --argjson production_events_start "$production_memory_events_start" \
+  --argjson production_events_end "$production_memory_events_end" \
+  '{before_pair_unchanged:true,production_runtime_verified:true,shadow_staging_verified:true,shadow_assets_restored:true,resource_preflight:true,oss_triplets:true,strict_segment_verifier:true,final_identity:true,controller_control_bytes:true,shadow_link_restored:true,health_freshness:true,candidate_no_oom:true,production_no_oom:true,production_memory_events:{start:$production_events_start,end:$production_events_end}}')
 before_assets_json='{}'; staged_assets_json='{}'; restored_assets_json='{}'
 for asset in "${SHADOW_ASSETS[@]}"; do
   restored_asset_sha[$asset]="${saved_sha[$asset]:-}"
@@ -2404,17 +2509,42 @@ run_upload_units_json=$(jq -cn \
   --arg usdm_sha "${candidate_upload_unit_sha[usdm]}" \
   '{spot:{unit:$spot,sha256:$spot_sha},usdm:{unit:$usdm,sha256:$usdm_sha}}')
 gate_finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ); production_eligible=true; [[ $TEST_ONLY == true ]] && production_eligible=false
-jq -cn --arg schema monday.rust_lob_shadow_gate.v6 --arg from "$before_controller" --arg source_mode "$source_mode" --arg after "$CANDIDATE_CONTROLLER" --arg candidate "$CANDIDATE_CONTROLLER" --arg payload "$candidate_payload" --arg runtime "$candidate_runtime" --arg bundle "$candidate_bundle" --arg source "$candidate_source" --arg before_payload "$before_payload" --arg before_runtime "$before_runtime" --arg before_bundle "$before_bundle" --arg before_source "$before_source" --arg before_projection "$before_production_projection" --arg control_sha "$candidate_control_bytes_sha" --argjson control_assets "$candidate_control_assets" --argjson production_runtime "$candidate_production_runtime" --arg run "$run_id" --arg spool "$run_spool" --arg run_unit_root "$gate_unit_dir" --arg worker_slice "$GATE_WORKER_SLICE" --arg worker_slice_sha "$gate_worker_slice_sha256" --arg worker_slice_cgroup "$gate_worker_slice_control_group" --argjson worker_high "$GATE_WORKER_MEMORY_HIGH_BYTES" --argjson worker_max "$GATE_WORKER_MEMORY_MAX_BYTES" --argjson units "$run_units_json" --argjson upload_units "$run_upload_units_json" --arg started "$gate_started_at" --arg finished "$gate_finished_at" --argjson required "$REQUIRED_DURATION_SECONDS" --argjson settle "$HEALTH_SETTLE_SECONDS" --argjson segment "$GATE_SEGMENT_SECONDS" --argjson host_total "$host_memory_total" --argjson host_swap "$host_swap_total" --argjson production_memory "$production_memory_json" --argjson production_process "$production_process_json" --argjson production_assets "$production_asset_json" --argjson resources "$resource_samples" --argjson psi "$psi_windows" --argjson checks "$checks" --argjson markets "$markets_json" --argjson eligible "$production_eligible" --argjson test_only "$TEST_ONLY" --argjson before_assets "$before_assets_json" --argjson staged_assets "$staged_assets_json" --argjson restored_assets "$restored_assets_json" --arg shadow_binary "$SHADOW_BINARY" --arg candidate_binary "$candidate_binary" --arg old_shadow_target "$old_shadow_target" --arg old_shadow_target_sha "$old_shadow_target_sha256" --argjson old_shadow_present "$old_shadow_present" \
-  '{schema:$schema,control_plane_version:2,passed:true,production_eligible:$eligible,test_only:$test_only,source_mode:$source_mode,from_controller_sha256:$from,transition:{before:$from,after:$after,topology:(if $source_mode == "direct" then "direct-bootstrap" else "stable" end)},candidate_controller_sha256:$candidate,candidate_payload_sha256:$payload,candidate_runtime_contract_sha256:$runtime,candidate_deployment_bundle_sha256:$bundle,candidate_deployment_source_revision:$source,candidate_control_bytes:{sha256:$control_sha,assets:$control_assets},production_runtime:$production_runtime,before:{controller:$from,payload_sha256:$before_payload,runtime_contract_sha256:$before_runtime,deployment_bundle_sha256:$before_bundle,deployment_source_revision:$before_source,production_projection:$before_projection,production_assets:$production_assets},run_id:$run,run_spool:$spool,started_at:$started,finished_at:$finished,required_duration_seconds:$required,health_settle_seconds:$settle,segment_seconds:$segment,host_memory_total_bytes:$host_total,host_swap_total_bytes:$host_swap,production_memory:$production_memory,production_process:$production_process,production_assets:$production_assets,resource_admission:$resources,io_full_psi_windows:$psi,shadow_staging:{mode:"run-scoped",run_unit_root:$run_unit_root,spool_root:$spool,aggregate_slice:{name:$worker_slice,sha256:$worker_slice_sha,cgroup:$worker_slice_cgroup,memory_high_bytes:$worker_high,memory_max_bytes:$worker_max},units:$units,upload_units:$upload_units,candidate_assets:$staged_assets,restored_assets:$restored_assets,before_assets:$before_assets,binary:{path:$run_unit_root,candidate_target:$candidate_binary,restored_target:(if $old_shadow_present then $old_shadow_target else null end),restored_target_sha256:(if $old_shadow_present then $old_shadow_target_sha else null end),restored_present:$old_shadow_present}},checks:$checks,markets:$markets}' >"$gate_json.tmp"
+jq -cn --arg schema monday.rust_lob_shadow_gate.v6 --arg from "$before_controller" --arg source_mode "$source_mode" --arg after "$CANDIDATE_CONTROLLER" --arg candidate "$CANDIDATE_CONTROLLER" --arg payload "$candidate_payload" --arg runtime "$candidate_runtime" --arg bundle "$candidate_bundle" --arg source "$candidate_source" --arg before_payload "$before_payload" --arg before_runtime "$before_runtime" --arg before_bundle "$before_bundle" --arg before_source "$before_source" --arg before_projection "$before_production_projection" --arg control_sha "$candidate_control_bytes_sha" --argjson control_assets "$candidate_control_assets" --argjson production_runtime "$candidate_production_runtime" --arg run "$run_id" --arg spool "$run_spool" --arg run_unit_root "$gate_unit_dir" --arg worker_slice "$GATE_WORKER_SLICE" --arg worker_slice_sha "$gate_worker_slice_sha256" --arg worker_slice_cgroup "$gate_worker_slice_control_group" --argjson worker_high "$GATE_WORKER_MEMORY_HIGH_BYTES" --argjson worker_max "$GATE_WORKER_MEMORY_MAX_BYTES" --argjson worker_events_start "$gate_worker_memory_events_start" --argjson worker_events_end "$gate_worker_memory_events_end" --argjson units "$run_units_json" --argjson upload_units "$run_upload_units_json" --arg started "$gate_started_at" --arg finished "$gate_finished_at" --argjson evidence_timeout "$EVIDENCE_TIMEOUT_SECONDS" --argjson settle "$HEALTH_SETTLE_SECONDS" --argjson segment "$GATE_SEGMENT_SECONDS" --argjson host_total "$host_memory_total" --argjson host_swap "$host_swap_total" --argjson production_memory "$production_memory_json" --argjson production_process "$production_process_json" --argjson production_assets "$production_asset_json" --argjson resources "$resource_samples" --argjson psi "$psi_windows" --argjson checks "$checks" --argjson markets "$markets_json" --argjson eligible "$production_eligible" --argjson test_only "$TEST_ONLY" --argjson before_assets "$before_assets_json" --argjson staged_assets "$staged_assets_json" --argjson restored_assets "$restored_assets_json" --arg shadow_binary "$SHADOW_BINARY" --arg candidate_binary "$candidate_binary" --arg old_shadow_target "$old_shadow_target" --arg old_shadow_target_sha "$old_shadow_target_sha256" --argjson old_shadow_present "$old_shadow_present" \
+  '{schema:$schema,control_plane_version:2,passed:true,production_eligible:$eligible,test_only:$test_only,source_mode:$source_mode,from_controller_sha256:$from,transition:{before:$from,after:$after,topology:(if $source_mode == "direct" then "direct-bootstrap" else "stable" end)},candidate_controller_sha256:$candidate,candidate_payload_sha256:$payload,candidate_runtime_contract_sha256:$runtime,candidate_deployment_bundle_sha256:$bundle,candidate_deployment_source_revision:$source,candidate_control_bytes:{sha256:$control_sha,assets:$control_assets},production_runtime:$production_runtime,before:{controller:$from,payload_sha256:$before_payload,runtime_contract_sha256:$before_runtime,deployment_bundle_sha256:$before_bundle,deployment_source_revision:$before_source,production_projection:$before_projection,production_assets:$production_assets},run_id:$run,run_spool:$spool,started_at:$started,finished_at:$finished,evidence_timeout_seconds:$evidence_timeout,health_settle_seconds:$settle,segment_seconds:$segment,host_memory_total_bytes:$host_total,host_swap_total_bytes:$host_swap,production_memory:$production_memory,production_process:$production_process,production_assets:$production_assets,resource_admission:$resources,io_full_psi_windows:$psi,shadow_staging:{mode:"run-scoped",run_unit_root:$run_unit_root,spool_root:$spool,aggregate_slice:{name:$worker_slice,sha256:$worker_slice_sha,cgroup:$worker_slice_cgroup,memory_high_bytes:$worker_high,memory_max_bytes:$worker_max,memory_events:{start:$worker_events_start,end:$worker_events_end}},units:$units,upload_units:$upload_units,candidate_assets:$staged_assets,restored_assets:$restored_assets,before_assets:$before_assets,binary:{path:$run_unit_root,candidate_target:$candidate_binary,restored_target:(if $old_shadow_present then $old_shadow_target else null end),restored_target_sha256:(if $old_shadow_present then $old_shadow_target_sha else null end),restored_present:$old_shadow_present}},checks:$checks,markets:$markets}' >"$gate_json.tmp"
 chmod 0640 "$gate_json.tmp"; [[ ! -e $gate_json ]] || die 'gate receipt already exists'; mv -f -- "$gate_json.tmp" "$gate_json"
 if ! jq -e -f "$POLICY_SOURCE" "$gate_json" >/dev/null; then
   die 'V2 Gate policy rejected the receipt'
 fi
 if [[ $production_eligible == true ]]; then
   gate_sha=$(sha256_file "$gate_json"); run_sha=$(sha256_file "$run_json")
-  (set -C; printf '%s  gate.json\n%s  run.json\n' "$gate_sha" "$run_sha" >"$passed_marker") \
+  [[ ! -e $publishing_evidence_dir && ! -L $publishing_evidence_dir ]] \
+    || die 'Gate publishing directory already exists'
+  mv -- "$evidence_dir" "$publishing_evidence_dir" \
+    || die 'could not stage Gate evidence for atomic publication'
+  evidence_dir=$publishing_evidence_dir
+  gate_json="$evidence_dir/gate.json"; run_json="$evidence_dir/run.json"
+  passed_marker="$evidence_dir/PASSED.sha256"
+  passed_marker_tmp="$evidence_dir/.PASSED.sha256.tmp"
+  [[ ! -e $passed_marker && ! -L $passed_marker && ! -e $passed_marker_tmp && ! -L $passed_marker_tmp ]] \
+    || die 'Gate marker already exists'
+  (set -C; printf '%s  gate.json\n%s  run.json\n' "$gate_sha" "$run_sha" >"$passed_marker_tmp") \
     || die 'could not publish immutable Gate marker'
-  chmod 0440 "$gate_json" "$run_json" "$passed_marker"
-  chmod 0550 "$evidence_dir"
+  chmod 0440 "$gate_json" "$run_json" "$passed_marker_tmp" \
+    || die 'could not protect Gate evidence before marker publish'
+  mv -f -- "$passed_marker_tmp" "$passed_marker" \
+    || die 'could not publish immutable Gate marker'
+  chmod 0550 "$evidence_dir" || die 'could not close Gate evidence directory'
+  mv -- "$evidence_dir" "$final_evidence_dir" \
+    || die 'could not atomically publish Gate evidence directory'
+  evidence_dir=$final_evidence_dir
+  gate_json="$evidence_dir/gate.json"; run_json="$evidence_dir/run.json"
+  passed_marker="$evidence_dir/PASSED.sha256"
+  passed_marker_tmp="$evidence_dir/.PASSED.sha256.tmp"
+  authoritative_from=$before_controller
+  [[ $source_mode == direct ]] && authoritative_from=direct
+  monday_validate_v2_gate_authoritative "$ROOT" "$gate_json" "$authoritative_from" \
+    "$CANDIDATE_CONTROLLER" "$gate_sha" \
+    || die 'authoritative Gate readback rejected the published marker'
+  marker_authoritative=true
 fi
 gate_finished=true; printf 'V2 Gate receipt: %s\nSHA-256: %s\n' "$gate_json" "$(sha256_file "$gate_json")"; [[ $production_eligible == true ]] && printf 'production shadow gate passed\n' || printf 'fixture Gate completed; not eligible for cutover\n'

@@ -29,6 +29,39 @@ def expected_phase_memory_max:
     null
   end;
 
+def valid_memory_event_counters:
+  type == "object"
+  and (.high | type == "number" and floor == . and . >= 0)
+  and (.oom | type == "number" and floor == . and . >= 0)
+  and (.oom_kill | type == "number" and floor == . and . >= 0);
+
+def valid_no_oom_events:
+  . as $events
+  | ($events | type == "object")
+  and ($events.start | valid_memory_event_counters)
+  and ($events.end | valid_memory_event_counters)
+  and ($events.end.high >= $events.start.high)
+  and ($events.end.oom >= $events.start.oom)
+  and ($events.end.oom_kill >= $events.start.oom_kill)
+  and ($events.end.oom == $events.start.oom)
+  and ($events.end.oom_kill == $events.start.oom_kill);
+
+def valid_psi_observation:
+  type == "object"
+  and .schema == "monday.io_psi_observation.v1"
+  and (.phase | type == "string" and length > 0)
+  and (.observed_at | type == "string"
+    and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+  and (.available | type == "boolean")
+  and .veto == false
+  and (if .available then
+    (.full | type == "object"
+      and (.avg10 | type == "number" and . >= 0)
+      and (.avg60 | type == "number" and . >= 0)
+      and (.avg300 | type == "number" and . >= 0)
+      and (.total_us | type == "number" and floor == . and . >= 0))
+    else (has("full") | not) end);
+
 def expected_lob_slice:
   "system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice";
 
@@ -86,9 +119,10 @@ and .passed == true
 and (.production_eligible | type == "boolean")
 and (.test_only | type == "boolean")
 and (if .test_only then .production_eligible == false else .production_eligible == true end)
-and (.segment_seconds | type == "number" and floor == . and . >= 60)
-and (.required_duration_seconds | type == "number" and floor == . and . >= (3 * $root.segment_seconds))
-and (.health_settle_seconds | type == "number" and floor == . and . >= 1)
+and (.segment_seconds | type == "number" and floor == . and . == 120)
+and (.evidence_timeout_seconds | type == "number" and floor == . and . == 600)
+and (.health_settle_seconds | type == "number" and floor == .
+  and (if $root.test_only then . >= 1 else . == 240 end))
 and (.source_mode == "stable" or .source_mode == "direct")
 and (.from_controller_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
 and (.candidate_controller_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
@@ -189,10 +223,9 @@ and (.production_runtime | type == "object"
     and ((.usdm.symbols | split(",") | unique) | length == 100)))
 and (.production_process | type == "object"
   and (keys | sort) == ["spot", "usdm"]
-  and all(.[]; .active == true
-    and (.main_pid | type == "number" and floor == . and . >= 1)
-    and (.process_exe_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
-    and (.n_restarts | type == "number" and floor == . and . >= 0)))
+  and all(.[]; (keys | sort) == ["active", "process_exe_sha256"]
+    and .active == true
+    and (.process_exe_sha256 | type == "string" and test("^[a-f0-9]{64}$"))))
 and (.production_memory | . as $pm
   | (type == "object"
   and (.slice | valid_lob_slice)
@@ -239,12 +272,6 @@ and (.production_memory | . as $pm
   and (.parent_memory_current_bytes <= .child_memory_max_sum_bytes)
   and (.parent_memory_events | type == "object"
     and all(.[]; type == "number" and floor == . and . >= 0))))
-and (.production_process.spot.main_pid == .production_memory.children.spot.main_pid
-  and .production_process.usdm.main_pid == .production_memory.children.usdm.main_pid
-  and .production_process.spot.process_exe_sha256 == .production_memory.children.spot.process_exe_sha256
-  and .production_process.usdm.process_exe_sha256 == .production_memory.children.usdm.process_exe_sha256
-  and .production_process.spot.n_restarts == .production_memory.children.spot.n_restarts
-  and .production_process.usdm.n_restarts == .production_memory.children.usdm.n_restarts)
 and (.resource_admission | type == "array" and length == 9
   and ((map(.phase) | sort)
     == ["oss-readback-spot","oss-readback-usdm","preflight","shadow-spot","shadow-usdm","strict-verifier-spot","strict-verifier-usdm","upload-drain-spot","upload-drain-usdm"])
@@ -278,16 +305,10 @@ and (.resource_admission | type == "array" and length == 9
         and . == ($expected_phase_max + $r.host_memory_reserve_bytes + $r.production_memory_growth_bytes)
         and . <= $r.host_memory_available_bytes)
       and (.phase_memory_max_bytes | type == "number" and . == $expected_phase_max))))
-and (.io_full_psi_windows | type == "array" and length >= 3
-  and all(.[]; . as $p
-    | (.phase | type == "string" and length > 0)
-    and (.stage | type == "string" and length > 0)
-    and (.hit | type == "boolean")
-    and ($p.consecutive_hits | type == "number" and . >= 0)
-    and (if $p.stage == "calibration"
-         then ($p.delta_us | type == "number" and . >= 0)
-           and ($p.ratio | type == "number" and . >= 0)
-         else true end)))
+and (.io_full_psi_windows | type == "array" and length == 9
+  and ((map(.phase) | sort)
+    == ["oss-readback-spot","oss-readback-usdm","preflight","shadow-spot","shadow-usdm","strict-verifier-spot","strict-verifier-usdm","upload-drain-spot","upload-drain-usdm"])
+  and all(.[]; valid_psi_observation))
 and (.shadow_staging | type == "object"
   and .mode == "run-scoped"
   and (.run_unit_root | type == "string" and test("/run/monday/rust-lob-gate/[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*$"))
@@ -297,7 +318,8 @@ and (.shadow_staging | type == "object"
     and (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))
     and (. as $slice | ($slice.cgroup | type == "string" and . == ("/" + $slice.name)))
     and (.memory_high_bytes | type == "number" and floor == . and . == 1342177280)
-    and (.memory_max_bytes | type == "number" and floor == . and . == 1610612736))
+    and (.memory_max_bytes | type == "number" and floor == . and . == 1610612736)
+    and (.memory_events | valid_no_oom_events))
   and (.units | type == "object" and (keys | sort) == ["spot", "usdm"]
     and (.spot | type == "string" and test("^monday-rust-lob-gate-[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*-spot\\.service$"))
     and (.usdm | type == "string" and test("^monday-rust-lob-gate-[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*-usdm\\.service$")))
@@ -341,7 +363,10 @@ and (.checks | type == "object"
   and .final_identity == true
   and .controller_control_bytes == true
   and .shadow_link_restored == true
-  and .health_freshness == true)
+  and .health_freshness == true
+  and .candidate_no_oom == true
+  and .production_no_oom == true
+  and (.production_memory_events | valid_no_oom_events))
 and (.markets | type == "object" and ((keys | sort) == ["spot", "usdm"])
   and (to_entries | all(.[]; .value.market == .key))
   and all(.[]; . as $m
@@ -359,10 +384,10 @@ and (.markets | type == "object" and ((keys | sort) == ["spot", "usdm"])
       and . == ("lake/raw/venue=binance/market=" + $m.market
         + "/dataset=" + $m.dataset + "/shard=all"))
     and (.observed_at_ns | type == "number" and floor == . and . >= 0)
-    and ($m.observed_runtime_seconds | type == "number" and floor == .
-      and if $root.test_only then . >= 0 else . >= $root.required_duration_seconds end)
-    and ($m.segment_count | type == "number" and . >= 2 and . == ($m.segments | length))
-    and ($m.oss_triplet_count | type == "number" and . >= 2 and . == ($m.triplets | length))
+    and ($m.observed_runtime_seconds | type == "number" and floor == . and . >= 0
+      and . <= $root.evidence_timeout_seconds)
+    and ($m.segment_count | type == "number" and . == 2 and . == ($m.segments | length))
+    and ($m.oss_triplet_count | type == "number" and . == 2 and . == ($m.triplets | length))
     and (.n_restarts | type == "number" and . == 0)
     and .process_identity_verified == true
     and .installed_shadow_assets_verified == true
@@ -373,7 +398,7 @@ and (.markets | type == "object" and ((keys | sort) == ["spot", "usdm"])
       .strict_aggregate_trade_continuity_readback == true
       and .strict_raw_trade_continuity_readback == true
     else true end)
-    and (.segments | type == "array" and length >= 2
+    and (.segments | type == "array" and length == 2
       and all(.[];
         (.file | type == "string" and test("^part-[0-9]+\\.jsonl\\.zst$"))
         and (.path | type == "string" and length > 0)
@@ -385,7 +410,7 @@ and (.markets | type == "object" and ((keys | sort) == ["spot", "usdm"])
         and (.end_received_at_ns >= .start_received_at_ns)
         and (.end_received_at_ns <= $m.observed_at_ns)
         and (.session_id | type == "string" and . == $m.session_id)))
-    and (.triplets | type == "array" and length >= 2
+    and (.triplets | type == "array" and length == 2
       and all(.[];
         (.market | type == "string" and . == $m.market)
         and (.dataset | type == "string" and . == $m.dataset)
@@ -426,7 +451,13 @@ and (.markets | type == "object" and ((keys | sort) == ["spot", "usdm"])
         and (.observed_at | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$"))
         and (.observed_at_ns | type == "number" and floor == . and . >= 0)
         and (.session_id | type == "string" and . == $m.session_id)
-        and (.catalog_sha256 | type == "string" and . == $m.health.frozen_catalog_sha256)))
+        and (.catalog_sha256 | type == "string" and . == $m.health.frozen_catalog_sha256))
+      and (.[1].start_received_at_ns >= .[0].end_received_at_ns)
+      and (.[1].start_received_at_ns - .[0].end_received_at_ns <= 90000000000))
+    and ($m.segments[1].start_received_at_ns >= $m.segments[0].end_received_at_ns)
+    and ($m.segments[1].start_received_at_ns - $m.segments[0].end_received_at_ns <= 90000000000)
+    and (($m.segments | map([.data_sha256, .start_received_at_ns, .end_received_at_ns]))
+      == ($m.triplets | map([.data_sha256, .start_received_at_ns, .end_received_at_ns])))
     and (.health | type == "object"
       and (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))
       and (.session_id | type == "string" and length > 0)
