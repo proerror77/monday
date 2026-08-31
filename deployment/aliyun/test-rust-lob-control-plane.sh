@@ -2228,6 +2228,12 @@ if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_TAMPER_OSS=1 MONDAY_ROOT="$RO
   printf 'OSS-tampered Gate unexpectedly succeeded\n' >&2
   exit 1
 fi
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_TAMPER_OSS_MANIFEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c1" \
+  --candidate-controller "$c2" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'OSS-manifest-tampered Gate unexpectedly succeeded\n' >&2
+  exit 1
+fi
 [[ $(monday_active_controller_sha "$ROOT") == "$active_before_failure" ]]
 [[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == "$production_before_failure" ]]
 if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_EXTRA_NESTED=1 MONDAY_ROOT="$ROOT" \
