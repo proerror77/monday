@@ -284,7 +284,7 @@ if [[ $TEST_ONLY == true ]]; then
     esac
   }
   aliyun() {
-    local tool=${1:-} action=${2:-} source target object
+    local tool=${1:-} action=${2:-} source object
     [[ $tool == ossutil ]] || return 2
     shift 2
     case "$action" in
@@ -301,13 +301,13 @@ if [[ $TEST_ONLY == true ]]; then
           fi
         done
         ;;
-      cp)
-        source=${1:-}; target=${2:-}
+      cat)
+        source=${1:-}
         object=${source##*/}
-        [[ $object != "$source" && -n $target ]] || return 2
-        cp -p -- "${spool_dir[$OSS_FIXTURE_MARKET]}/date=2026-08-28/hour=05/$object" "$target"
+        [[ $object != "$source" ]] || return 2
+        cat -- "${spool_dir[$OSS_FIXTURE_MARKET]}/date=2026-08-28/hour=05/$object"
         if [[ ${MONDAY_GATE_FIXTURE_TAMPER_OSS:-0} == 1 && $object == *.jsonl.zst ]]; then
-          printf '\n' >>"$target"
+          printf '\n'
         fi
         ;;
       *) return 2 ;;
@@ -2522,7 +2522,7 @@ verify_oss_roundtrips() {
     [[ $object_prefix == "${expected_oss_prefix[$market]}"/* ]] \
       || die "$market OSS manifest URI is outside the configured base prefix: $uri"
     manifest_index=$((manifest_index + 1))
-    manifest="$readback/discovered-$manifest_index.json"; run_oss "$market" cp "$uri" "$manifest" --force --no-progress >/dev/null
+    manifest="$readback/discovered-$manifest_index.json"; run_oss "$market" cat "$uri" >"$manifest"
     jq -e --arg market "$market" \
       '.market == $market
        and (.start_received_at_ns | type == "number" and floor == . and . >= 0)
@@ -2561,9 +2561,9 @@ verify_oss_roundtrips() {
       || die "$market OSS success URI failed strict validation: $success_uri"
     digest=$(jq -er '.sha256' "$manifest"); manifest_digest=$(sha256_file "$manifest")
     data="$readback/$file"; success="$data._SUCCESS"; final_manifest="$data.manifest.json"
-    run_oss "$market" cp "$uri" "$final_manifest" --force --no-progress >/dev/null
+    run_oss "$market" cat "$uri" >"$final_manifest"
     [[ $(sha256_file "$final_manifest") == "$manifest_digest" ]] || die "$market OSS manifest changed between reads"
-    run_oss "$market" cp "$data_uri" "$data" --force --no-progress >/dev/null; run_oss "$market" cp "$success_uri" "$success" --force --no-progress >/dev/null
+    run_oss "$market" cat "$data_uri" >"$data"; run_oss "$market" cat "$success_uri" >"$success"
     expected_success="$readback/$file.expected-success"; printf '%s\n' "$digest" >"$expected_success"; [[ $(sha256_file "$data") == "$digest" ]] || die "$market OSS data digest mismatch"; cmp -s "$success" "$expected_success" || die "$market OSS success marker mismatch"
     success_digest=$(sha256_file "$success")
     observed_at=$(monday_epoch_ns_rfc3339 "$observed_cutoff_ns")
