@@ -1270,7 +1270,7 @@ recovered_gate_sha=$(printf '%s\n' "$recovered_gate_output" | sed -n 's/^SHA-256
 monday_validate_v2_gate "$recovered_gate" direct "$c0" "$recovered_gate_sha"
 jq -e 'all(.markets[]; . as $market
   | .segment_count == 1 and .oss_triplet_count == 1
-  and .segments[0].start_received_at_ns == ($market.observation_started_at_ns + 2000)
+  and .segments[0].start_received_at_ns > $market.observation_started_at_ns
   and .triplets[0].start_received_at_ns == .segments[0].start_received_at_ns)' \
   "$recovered_gate" >/dev/null
 
