@@ -309,6 +309,9 @@ if [[ $TEST_ONLY == true ]]; then
         if [[ ${MONDAY_GATE_FIXTURE_TAMPER_OSS:-0} == 1 && $object == *.jsonl.zst ]]; then
           printf '\n'
         fi
+        if [[ ${MONDAY_GATE_FIXTURE_TAMPER_OSS_MANIFEST:-0} == 1 && $object == *.manifest.json ]]; then
+          printf '\n'
+        fi
         ;;
       *) return 2 ;;
     esac
@@ -2472,7 +2475,7 @@ verify_oss_roundtrips() {
   resource_monitor_start "oss-readback-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"
   observed_cutoff_ns=$(date +%s%N)
   [[ $observed_cutoff_ns =~ ^[0-9]+$ ]] || die "$market OSS observation clock is unavailable"
-  local start end count=0; local -a roundtrip_records=(); mkdir -p "$readback"
+  local start end count=0; mkdir -p "$readback"
   phase_triplets_json[$market]='[]'
   conflicts_file="$readback/replay-conflicts.tsv"
   : >"$conflicts_file"
@@ -2583,7 +2586,6 @@ verify_oss_roundtrips() {
         catalog_sha256:$catalog}')
     phase_triplets_json[$market]=$(jq -cn --argjson values "${phase_triplets_json[$market]}" \
       --argjson value "$triplet_json" '$values + [$value]')
-    roundtrip_records+=("$data" "$digest" "$manifest_digest")
     count=$((count + 1))
     selected_start=$start; selected_end=$end
     segment_selected=true
@@ -2595,16 +2597,15 @@ verify_oss_roundtrips() {
       die "$market replay-unsafe manifest overlaps selected clean segment: $conflict_uri"
     fi
   done <"$conflicts_file"
+  # The local triplet was already semantically verified. Exact byte identity is
+  # sufficient for the OSS readback; running the same verifier twice adds no evidence.
   jq -e -n --argjson segments "${phase_segments_json[$market]}" \
     --argjson triplets "${phase_triplets_json[$market]}" '
-      ($segments | map([.data_sha256, .start_received_at_ns, .end_received_at_ns]))
-      == ($triplets | map([.data_sha256, .start_received_at_ns, .end_received_at_ns]))' \
+      ($segments | map([.data_sha256, .manifest_sha256, .success_sha256,
+        .start_received_at_ns, .end_received_at_ns, .session_id]))
+      == ($triplets | map([.data_sha256, .manifest_sha256, .success_sha256,
+        .start_received_at_ns, .end_received_at_ns, .session_id]))' \
     || die "$market OSS triplets do not match the selected local segments"
-  verify_clean_segments "${roundtrip_records[@]}" || die "$market OSS strict LOB continuity verifier failed"
-  if [[ $market == spot ]]; then
-    verify_aggregate_trade_continuity "${roundtrip_records[@]}" || die "$market OSS strict aggregate-trade continuity verifier failed"
-    verify_raw_trade_continuity "${roundtrip_records[@]}" || die "$market OSS strict raw-trade continuity verifier failed"
-  fi
   market_observed_at_ns[$market]=$observed_cutoff_ns
   phase_oss[$market]=$count
   resource_monitor_stop_or_die "$market OSS"
