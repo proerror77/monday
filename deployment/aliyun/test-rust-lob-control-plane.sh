@@ -7,6 +7,7 @@ export MONDAY_CONTROL_PLANE_FIXTURE_SENTINEL=monday-v2-fixture
 ROOT=$(readlink -f "$(mktemp -d)")
 fixture_root=$ROOT
 trap 'chmod -R u+w "$ROOT" 2>/dev/null || true; rm -rf "$ROOT"' EXIT
+trap 'status=$?; printf "ERR status=%s line=%s command=%s\n" "$status" "$LINENO" "$BASH_COMMAND" >&2' ERR
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
 # shellcheck disable=SC1091
