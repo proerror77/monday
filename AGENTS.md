@@ -39,9 +39,11 @@
   review, test, or merge authorizes only the corresponding development and Git
   states; it does not authorize artifact publication, a production Gate,
   cutover, deployment, collector mutation, or runtime mutation.
-- The default development loop is `Code -> focused validation`. When publication
-  or merge is explicitly requested, extend it only to `PR -> exact-head CI ->
-  merge`, then stop. A production Gate is never part of this loop.
+- The default development loop is `Code -> focused validation`. Extend it only
+  through the explicitly requested Git state: publish a PR and stop when a PR is
+  requested; verify exact-head CI and stop when CI is requested; merge only when
+  merge is explicitly requested and exact-head required checks pass. A production
+  Gate is never part of this loop.
 - Cross a collector or runtime boundary only on explicit production authorization.
   Use the shortest applicable sequence: `release -> one Gate -> cutover ->
   Runtime -> independent Readback`. Do not insert repeated Gates, ad hoc evidence

@@ -448,7 +448,8 @@ for path in "${paths[@]}"; do
     rust_hft/deployment/docker/*|rust_hft/deployment/k8s/*|rust_hft/.dockerignore|\
     rust_hft/Cargo.toml|rust_hft/Cargo.lock|rust_hft/prediction-markets/Cargo.toml|\
     rust_hft/prediction-markets/Cargo.lock|rust_hft/prediction-markets/ploy-frontend/*|\
-    rust_hft/prediction-markets/*.md|rust_hft/rust-toolchain*|rust_hft/.cargo/*)
+    rust_hft/prediction-markets/*.md|rust_hft/rust-toolchain*|rust_hft/.cargo/*|\
+    rust_hft/AGENTS.md|rust_hft/*/AGENTS.md|rust_hft/CLAUDE.md|rust_hft/*/CLAUDE.md)
       continue
       ;;
   esac
