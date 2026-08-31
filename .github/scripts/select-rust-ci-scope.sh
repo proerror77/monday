@@ -211,6 +211,10 @@ fi
 needs_metadata=false
 for path in "${paths[@]}"; do
   case "$path" in
+    AGENTS.md|*/AGENTS.md|CLAUDE.md|*/CLAUDE.md)
+      [[ $event == pull_request ]] && select_job ploy/commit-hygiene
+      continue
+      ;;
     .github/workflows/ploy-ci.yml)
       [[ $event == pull_request ]] && select_job ploy/commit-hygiene
       select_job ploy/workflow-lint
