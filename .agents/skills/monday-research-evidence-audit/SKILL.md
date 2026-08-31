@@ -1,11 +1,13 @@
 ---
 name: monday-research-evidence-audit
-description: Audit one Monday research run from authenticated input through its canonical execution seam, terminal evidence, immutable publication, and independent readback. Use for ResearchSnapshot, evaluator/MCTS, Campaign trial-ledger, baseline Gate, sealed-holdout, cohort-completeness, or research-success claims. For Code/CI/merge/release/deployment status, use monday-delivery-status instead.
+description: Audit one explicitly requested Monday research run from authenticated input through its canonical execution seam, terminal evidence, immutable publication, and independent readback. Use for ResearchSnapshot, evaluator/MCTS, Campaign trial-ledger, baseline Gate, sealed-holdout, cohort-completeness, or research-success claims; do not use for collector health, Gate changes, ordinary code progress, or implementation work. For Code/CI/merge/release/deployment status, use monday-delivery-status instead.
 ---
 
 # Monday Research Evidence Audit
 
 Audit existing evidence only. Do not collect data, run evaluation, publish results, or touch production.
+This Skill reports an existing research result; it is not a workflow prerequisite
+for modifying research or collector code.
 
 ## Workflow
 

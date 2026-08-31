@@ -7,6 +7,7 @@ export MONDAY_CONTROL_PLANE_FIXTURE_SENTINEL=monday-v2-fixture
 ROOT=$(readlink -f "$(mktemp -d)")
 fixture_root=$ROOT
 trap 'chmod -R u+w "$ROOT" 2>/dev/null || true; rm -rf "$ROOT"' EXIT
+trap 'status=$?; printf "ERR status=%s line=%s command=%s\n" "$status" "$LINENO" "$BASH_COMMAND" >&2' ERR
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
 # shellcheck disable=SC1091
@@ -159,7 +160,7 @@ deadline_line=$(grep -Fn 'if (( observation_sampled_ns >= observation_deadline_n
   <<<"$gate_observation_source" | cut -d: -f1)
 validation_line=$(grep -Fn "validate_observation_sample \"\$market\" \"\$observation_health_snapshot\"" \
   <<<"$gate_observation_source" | cut -d: -f1)
-evidence_line=$(grep -Fn "if clean_segment_pair_ready \"\$market\" \"\$observation_segment_snapshot\"; then" \
+evidence_line=$(grep -Fn "if clean_segment_ready \"\$market\" \"\$observation_segment_snapshot\"; then" \
   <<<"$gate_observation_source" | cut -d: -f1)
 health_snapshot_line=$(grep -Fn "cp -- \"\$live_health\" \"\$observation_health_snapshot.tmp\"" \
   <<<"$gate_observation_source" | cut -d: -f1)
@@ -1197,7 +1198,7 @@ gate_sha=$(printf '%s\n' "$gate_output" | sed -n 's/^SHA-256: //p')
 monday_validate_v2_gate "$gate" direct "$c0" "$gate_sha"
 jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$gate" >/dev/null
 jq -e '
-  .schema == "monday.rust_lob_shadow_gate.v7"
+  .schema == "monday.rust_lob_shadow_gate.v8"
   and .source_mode == "direct"
   and .production_memory.production_envelope_state == "legacy-unlimited"
   and .production_memory.production_slice_memory_high_bytes == null
@@ -1219,9 +1220,9 @@ jq -e --argjson evidence_timeout "$evidence_timeout_seconds" \
    and all(.markets[]; . as $market
      | .observed_runtime_seconds >= 0 and .observed_runtime_seconds <= $evidence_timeout
      and .observation_started_at_ns <= .observed_at_ns
-     and .segment_count == 2 and .oss_triplet_count == 2
-     and all(.segments[]; .end_received_at_ns > $market.observation_started_at_ns)
-     and all(.triplets[]; .end_received_at_ns > $market.observation_started_at_ns))' \
+     and .segment_count == 1 and .oss_triplet_count == 1
+     and all(.segments[]; .start_received_at_ns >= $market.observation_started_at_ns)
+     and all(.triplets[]; .start_received_at_ns >= $market.observation_started_at_ns))' \
   "$gate" >/dev/null
 run_json="$(dirname -- "$gate")/run.json"
 jq -e --argjson segment "$gate_segment_seconds" \
@@ -1244,8 +1245,8 @@ jq -e --slurpfile gate "$gate" '
     | $run_markets[$market].observation_started_at_ns
       == $gate[0].markets[$market].observation_started_at_ns)' \
   "$run_json" >/dev/null
-# A reconnect-boundary segment is skipped, but two later adjacent clean
-# segments can still satisfy the evidence-driven Gate.
+# A reconnect-boundary segment is skipped, but one later clean segment can
+# still satisfy the evidence-driven Gate.
 reconnect_gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 \
   MONDAY_GATE_FIXTURE_RECONNECT_BOUNDARY=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
@@ -1254,12 +1255,40 @@ reconnect_gate=$(printf '%s\n' "$reconnect_gate_output" | sed -n 's/^V2 Gate rec
 reconnect_gate_sha=$(printf '%s\n' "$reconnect_gate_output" | sed -n 's/^SHA-256: //p')
 monday_validate_v2_gate "$reconnect_gate" direct "$c0" "$reconnect_gate_sha"
 jq -e 'all(.markets[];
-  .segment_count == 2 and .oss_triplet_count == 2
-  and (.segments | length == 2) and (.triplets | length == 2))' \
+  .segment_count == 1 and .oss_triplet_count == 1
+  and (.segments | length == 1) and (.triplets | length == 1))' \
   "$reconnect_gate" >/dev/null
 
+# An unsafe segment is skipped.  One later clean segment proves that the
+# collector recovered without turning earlier audit evidence into a veto.
+recovered_gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 \
+  MONDAY_GATE_FIXTURE_UNSAFE_THEN_CLEAN=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --root "$ROOT")
+recovered_gate=$(printf '%s\n' "$recovered_gate_output" | sed -n 's/^V2 Gate receipt: //p')
+recovered_gate_sha=$(printf '%s\n' "$recovered_gate_output" | sed -n 's/^SHA-256: //p')
+monday_validate_v2_gate "$recovered_gate" direct "$c0" "$recovered_gate_sha"
+jq -e 'all(.markets[]; . as $market
+  | .segment_count == 1 and .oss_triplet_count == 1
+  and .segments[0].start_received_at_ns > $market.observation_started_at_ns
+  and .triplets[0].start_received_at_ns == .segments[0].start_received_at_ns)' \
+  "$recovered_gate" >/dev/null
+
+# Recovery remains allowed only when the unsafe audit segment is disjoint from
+# the selected clean segment.
+overlap_failure_output="$ROOT/run/overlapping-unsafe.err"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_OVERLAPPING_UNSAFE=1 \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
+  --from-controller direct --candidate-controller "$c0" --root "$ROOT" \
+  >"$overlap_failure_output" 2>&1; then
+  printf 'Gate accepted an unsafe manifest overlapping its clean segment\n' >&2
+  exit 1
+fi
+grep -Fq 'replay-unsafe manifest overlaps selected clean segment' \
+  "$overlap_failure_output"
+
 # Clean files sealed before observation starts are audit input only.  The local
-# selector and OSS readback must both choose the later adjacent pair.
+# selector and OSS readback must both choose the later clean segment.
 preobservation_gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 \
   MONDAY_GATE_FIXTURE_PREOBSERVATION_SEGMENTS=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
@@ -1268,8 +1297,8 @@ preobservation_gate=$(printf '%s\n' "$preobservation_gate_output" | sed -n 's/^V
 preobservation_gate_sha=$(printf '%s\n' "$preobservation_gate_output" | sed -n 's/^SHA-256: //p')
 monday_validate_v2_gate "$preobservation_gate" direct "$c0" "$preobservation_gate_sha"
 jq -e 'all(.markets[]; . as $market
-  | all(.segments[]; .end_received_at_ns > $market.observation_started_at_ns)
-  and all(.triplets[]; .end_received_at_ns > $market.observation_started_at_ns))' \
+  | all(.segments[]; .start_received_at_ns >= $market.observation_started_at_ns)
+  and all(.triplets[]; .start_received_at_ns >= $market.observation_started_at_ns))' \
   "$preobservation_gate" >/dev/null
 
 # Evidence snapshotted inside the window may finish validation after the
@@ -1294,8 +1323,8 @@ jq -e '
 
 validate_deadline_segments() {
   jq -e '
-    .schema == "monday.rust_lob_shadow_gate_deadline_segments.v1"
-    and (.segments | length) == 2
+    .schema == "monday.rust_lob_shadow_gate_deadline_segments.v2"
+    and (.segments | length) == 1
     and all(.segments[];
       .manifest.has_replay_safe_checkpoint == true
       and .manifest.lob_continuity.sequence_gaps == 0
@@ -1304,11 +1333,7 @@ validate_deadline_segments() {
       and .success_marker == .data_sha256
       and .data_size_bytes > 0
       and (.manifest_sha256 | test("^[a-f0-9]{64}$"))
-      and (.success_sha256 | test("^[a-f0-9]{64}$")))
-    and .segments[0].manifest.end_received_at_ns
-      <= .segments[1].manifest.start_received_at_ns
-    and .segments[0].manifest.lob_continuity.capture_session_id
-      == .segments[1].manifest.lob_continuity.capture_session_id' "$1" >/dev/null
+      and (.success_sha256 | test("^[a-f0-9]{64}$")))' "$1" >/dev/null
 }
 
 # A segment sealed while the readiness scan is running cannot move the cutoff
@@ -1346,10 +1371,10 @@ deadline_segments_json="$(dirname -- "$deadline_run_json")/deadline-segments.jso
 jq -e --arg controller "$c0" \
   --arg health_sha "$(monday_sha256_file "$deadline_health_json")" \
   --arg segments_sha "$(monday_sha256_file "$deadline_segments_json")" '
-  .schema == "monday.rust_lob_shadow_gate_deadline_failure.v1"
+  .schema == "monday.rust_lob_shadow_gate_deadline_failure.v2"
   and .authoritative == false and .cause == "evidence_deadline"
   and .market == "spot" and .candidate_controller_sha256 == $controller
-  and .health_eligible == true and .segment_pair_ready == true
+  and .health_eligible == true and .segment_ready == true
   and .segment_readiness_code == 0
   and .observation.sample_started_monotonic_ns < .observation.deadline_monotonic_ns
   and .observation.sampled_monotonic_ns >= .observation.deadline_monotonic_ns
@@ -1398,10 +1423,10 @@ health_deadline_segments_json="$(dirname -- "$health_deadline_run_json")/deadlin
 jq -e --arg controller "$c0" \
   --arg health_sha "$(monday_sha256_file "$health_deadline_health_json")" \
   --arg segments_sha "$(monday_sha256_file "$health_deadline_segments_json")" '
-  .schema == "monday.rust_lob_shadow_gate_deadline_failure.v1"
+  .schema == "monday.rust_lob_shadow_gate_deadline_failure.v2"
   and .authoritative == false and .cause == "evidence_deadline"
   and .market == "spot" and .candidate_controller_sha256 == $controller
-  and .health_eligible == false and .segment_pair_ready == true
+  and .health_eligible == false and .segment_ready == true
   and .segment_readiness_code == 0
   and .observation.sample_started_monotonic_ns <= .observation.sampled_monotonic_ns
   and .observation.sampled_monotonic_ns < .observation.deadline_monotonic_ns
@@ -1414,16 +1439,6 @@ validate_deadline_segments "$health_deadline_segments_json"
 [[ ! -e $(dirname -- "$health_deadline_run_json")/gate.json \
   && ! -e $(dirname -- "$health_deadline_run_json")/PASSED.sha256 ]]
 
-# Time alone never passes the Gate: one clean segment is insufficient.
-if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_SINGLE_CLEAN_SEGMENT=1 \
-  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
-  --from-controller direct --candidate-controller "$c0" --root "$ROOT" \
-  >"$ROOT/run/single-clean-segment.err" 2>&1; then
-  printf 'Gate accepted a single clean segment\n' >&2
-  exit 1
-fi
-grep -Fq 'fixture did not produce two adjacent clean segments' \
-  "$ROOT/run/single-clean-segment.err"
 # Candidate and production cgroup memory.events are part of the same Gate
 # evidence.  An OOM counter increment in the run-scoped worker slice must
 # fail the Gate before any receipt or marker can be authorized.
@@ -1440,7 +1455,7 @@ grep -Fq 'run-scoped Gate worker slice memory.events recorded an OOM during Gate
   exit 1
 }
 # A fixture receipt must not become production evidence by editing its mode.
-# Keep the adjacent run.json's provenance unchanged while moving its canonical
+# Keep the accompanying run.json's provenance unchanged while moving its canonical
 # run paths and provide the marker a real cutover would require; the
 # authoritative wrapper still rejects the fixture provenance.
 tampered_run_id=20240101T000000Z-1
@@ -1528,8 +1543,8 @@ fi
 tampered="$ROOT/tampered-segment-identity.json"
 tampered_data_sha=$(printf 'f%.0s' {1..64})
 jq --arg sha "$tampered_data_sha" '
-    .markets.spot.triplets[1].data_sha256 = $sha
-    | .markets.spot.triplets[1].success_content = ($sha + "\n")' \
+    .markets.spot.triplets[0].data_sha256 = $sha
+    | .markets.spot.triplets[0].success_content = ($sha + "\n")' \
   "$gate" >"$tampered"
 tampered_sha=$(monday_sha256_file "$tampered")
 if monday_validate_v2_gate "$tampered" direct "$c0" "$tampered_sha"; then
@@ -2213,15 +2228,6 @@ if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_TAMPER_OSS=1 MONDAY_ROOT="$RO
   printf 'OSS-tampered Gate unexpectedly succeeded\n' >&2
   exit 1
 fi
-[[ $(monday_active_controller_sha "$ROOT") == "$active_before_failure" ]]
-[[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == "$production_before_failure" ]]
-if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_TRAILING_UNSAFE=1 MONDAY_ROOT="$ROOT" \
-  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c1" \
-  --candidate-controller "$c2" --root "$ROOT" >"$ROOT/run/trailing-unsafe.err" 2>&1; then
-  printf 'Gate accepted a trailing replay-unsafe OSS manifest\n' >&2
-  exit 1
-fi
-grep -Fq 'replay-safe manifest ordering failed' "$ROOT/run/trailing-unsafe.err"
 [[ $(monday_active_controller_sha "$ROOT") == "$active_before_failure" ]]
 [[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == "$production_before_failure" ]]
 if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_EXTRA_NESTED=1 MONDAY_ROOT="$ROOT" \

@@ -40,6 +40,9 @@
   and old green runs are not current truth.
 - Keep Code, CI, merge, release, runtime, and readback as separate states. Claim
   only the latest state backed by an exact SHA/digest and direct readback.
+- These are evidence labels, not a mandatory promotion checklist. Stop at the
+  terminal state the user requested; a local implementation normally ends at
+  Code plus focused validation.
 - A production Gate protects its runtime transition. It is not a prerequisite
   for development, code review, CI, merge, artifact publication, or a release
   that does not cross that boundary. A failed Gate blocks only its cutover.

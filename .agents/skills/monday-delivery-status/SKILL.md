@@ -1,20 +1,22 @@
 ---
 name: monday-delivery-status
-description: Report Monday source-delivery truth as separate Code, CI, merge, release, runtime, and readback states with exact live identities. Use for "现在卡在哪里", "是否完成", "能否上线", PR/CI, release, deployment, or shipped claims. For evidence inside a research run, use monday-research-evidence-audit instead.
+description: Audit explicitly requested Monday source-delivery state across Code, CI, merge, release, runtime, and readback. Use only for PR/CI, release, deployment, go-live, or shipped-state verification; do not use for ETA, percentage-complete, or brief progress during active implementation. For evidence inside a research run, use monday-research-evidence-audit instead.
 ---
 
 # Monday Delivery Status
 
-Produce a read-only status report. Never infer a later state from an earlier one.
+Produce a read-only report through the terminal state the user asked to verify.
+The states are evidence labels, not required implementation steps. Never infer a
+later state from an earlier one.
 
 ## Workflow
 
-1. Identify the requested branch, PR, release, service, and environment. If the user names only a local change, start from the current branch and `HEAD`.
-2. Read local branch, `HEAD`, worktree status, and upstream without changing files.
-3. Refresh live GitHub evidence. Read the PR head SHA, merge state, required checks, reviews, target branch, and latest relevant workflow or release artifact.
-4. Read deployment and runtime state only when the target and access path are known. Record the deployed image/SHA, configuration identity, health, and named controller if present.
-5. Read the final external artifact or service independently. Verify that its immutable identity and configuration match `Runtime`; otherwise mark `Runtime` or `Readback` `unknown`. A publish command or healthy process is not readback.
-6. Mark each state `passed`, `failed`, `pending`, `blocked`, or `unknown`. Use `unknown` when direct evidence is unavailable.
+1. Identify the highest state the user explicitly asked to verify and the relevant branch, PR, release, service, or environment.
+2. Read local branch, `HEAD`, worktree status, and upstream only when Code or a later state is in scope.
+3. Refresh GitHub only when CI, merge, release, or evidence needed for one of those requested states is in scope.
+4. Read deployment and runtime only when Runtime or Readback is requested and the target and access path are known.
+5. Read the external artifact or service independently only for requested Readback. Verify that its immutable identity and configuration match Runtime.
+6. Mark only the states through the requested terminal state as `passed`, `failed`, `pending`, `blocked`, or `unknown`.
 
 ## State contract
 
@@ -31,11 +33,13 @@ A production Gate failure blocks cutover only. It never blocks or downgrades Cod
 
 ## Stop conditions
 
-- Stop mutation entirely; this Skill never reruns CI, merges, deploys, restarts, or changes configuration.
+- Audit actions are read-only; never mutate merely to improve the reported state.
+- If implementation is already active, answer a brief progress question from current task evidence and continue the implementation without invoking this audit.
+- Do not carry this audit workflow into a later implementation turn.
 - Stop and report `blocked` if branch or PR head moves during the audit.
 - Report authentication, network, or permission gaps as `unknown`; do not reuse stale screenshots or old green runs.
 
 ## Output
 
-Return one row per state with: `State | Result | Exact identity | Direct evidence | Blocker/next check`.
+Return one row per requested state with: `State | Result | Exact identity | Direct evidence | Blocker/next check`.
 End with one sentence naming the earliest incomplete state; that is the current blocker.

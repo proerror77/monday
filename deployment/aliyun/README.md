@@ -1039,7 +1039,7 @@ candidate cutover; they never rewrite a release or production state.
 The command executes the Gate bytes from the candidate controller directory and
 binds the receipt to `C1`, `P1`, `R1`, `B1`, and `S1`. It proves the current pair,
 candidate process, market health, and Spot/USD-M OSS evidence before writing one
-immutable schema-v7 receipt. A receipt from another controller or payload is
+immutable schema-v8 receipt. A receipt from another controller or payload is
 not reusable.
 
 The host gate owns only the runtime transition. A failed Gate blocks cutover,
@@ -1049,7 +1049,7 @@ then creates a fresh spool under
 `/data/monday/spool/binance-lob-rust-shadow/gate/<run-id>/`, starts
 each market sequentially with `SEGMENT_SECONDS=120`, waits at most 240 seconds for initial
 configured-catalog health, freezes both session IDs and catalog digests, and then
-finishes as soon as two new adjacent clean segments exist. Each market has a
+finishes as soon as one clean segment that starts after that freeze exists. Each market has a
 600-second evidence deadline; elapsed monotonic time is recorded, not used as a
 minimum observation duration. It never drains or recovers an
 older Shadow run. Any incomplete files left by a failed run remain confined to
