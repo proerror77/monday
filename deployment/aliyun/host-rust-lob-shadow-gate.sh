@@ -288,19 +288,6 @@ if [[ $TEST_ONLY == true ]]; then
     [[ $tool == ossutil ]] || return 2
     shift 2
     case "$action" in
-      ls)
-        fixture_date=2026-08-28
-        fixture_hour=05
-        for object in "${spool_dir[$OSS_FIXTURE_MARKET]}"/date=2026-08-28/hour=05/*.manifest.json; do
-          [[ -f $object ]] || continue
-          printf 'oss://fixture/lake/raw/venue=binance/market=%s/dataset=%s/shard=all/date=%s/hour=%s/%s\n' \
-            "$OSS_FIXTURE_MARKET" "${dataset[$OSS_FIXTURE_MARKET]}" "$fixture_date" "$fixture_hour" "${object##*/}"
-          if [[ ${MONDAY_GATE_FIXTURE_EXTRA_NESTED:-0} == 1 ]]; then
-            printf 'oss://fixture/lake/raw/venue=binance/market=%s/dataset=%s/shard=all/extra/date=%s/hour=%s/%s\n' \
-              "$OSS_FIXTURE_MARKET" "${dataset[$OSS_FIXTURE_MARKET]}" "$fixture_date" "$fixture_hour" "${object##*/}"
-          fi
-        done
-        ;;
       cat)
         source=${1:-}
         object=${source##*/}
@@ -2253,6 +2240,7 @@ clean_segment_ready() {
 }
 verify_segments() {
   local market=$1 snapshot=$2 manifest snapshot_manifest_digest path file digest manifest_digest success_digest expected_success count=0 start end segment_json interval state
+  local candidate_manifest candidate_interval candidate_state candidate_start candidate_end
   local -a segment_records=()
   [[ -f $snapshot ]] || die "$market observation segment snapshot is absent"
   phase_segments_json[$market]='[]'
@@ -2290,6 +2278,15 @@ verify_segments() {
     (( count >= 1 )) && break
   done <"$snapshot"
   ((count == 1)) || die "$market has no clean segment"
+  while IFS= read -r candidate_manifest; do
+    candidate_interval=$(segment_manifest_interval "$market" "$candidate_manifest" "${phase_session[$market]}") \
+      || die "$market manifest failed strict checks"
+    IFS=$'\t' read -r candidate_state candidate_start candidate_end <<<"$candidate_interval"
+    if [[ $candidate_state == boundary || $candidate_state == unsafe ]] \
+      && (( candidate_start < end && start < candidate_end )); then
+      die "$market replay-unsafe local segment overlaps selected clean segment: $candidate_manifest"
+    fi
+  done < <(find "${spool_dir[$market]}" -type f -name '*.jsonl.zst.manifest.json' | sort)
   verify_clean_segments "${segment_records[@]}" || die "$market strict LOB continuity verifier failed"
   if [[ $market == spot ]]; then
     verify_aggregate_trade_continuity "${segment_records[@]}" || die "$market strict aggregate-trade continuity verifier failed"
@@ -2459,7 +2456,7 @@ run_oss() {
     systemd-run --quiet --pipe --wait --collect \
       --unit="${GATE_UNIT_PREFIX}${run_id}-oss-${market}-${oss_unit_seq}.service" \
       --slice="$GATE_WORKER_SLICE" \
-      --property=MemoryMax=1536M --property=MemoryHigh=1280M \
+      --property=MemoryMax=512M --property=MemoryHigh=384M \
       --property=OOMScoreAdjust=500 --property=Restart=no --property=RuntimeMaxSec="$TRANSIENT_WORK_TIMEOUT_SECONDS" \
       -- runuser --user "$SERVICE_USER" -- env -i HOME="$SERVICE_HOME" PATH="$SAFE_PATH" \
       ALIYUN_PROFILE="${aliyun_profile[$market]}" /usr/local/bin/aliyun ossutil "$@" \
@@ -2468,18 +2465,13 @@ run_oss() {
   fi
 }
 verify_oss_roundtrips() {
-  local market=$1 readback="$tmp_dir/oss-$1" listing="$tmp_dir/oss-$1.list" uri manifest final_manifest data success expected_success file digest manifest_digest success_digest line token triplet_json observed_at observed_cutoff_ns
-  local expected_bucket manifest_name object_prefix data_uri success_uri expected_file
-  local conflicts_file interval state manifest_index=0 segment_selected=false
-  local conflict_start conflict_end conflict_uri selected_start=0 selected_end=0
-  resource_monitor_start "oss-readback-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"
-  observed_cutoff_ns=$(date +%s%N)
-  [[ $observed_cutoff_ns =~ ^[0-9]+$ ]] || die "$market OSS observation clock is unavailable"
-  local start end count=0; mkdir -p "$readback"
+  local market=$1 readback="$tmp_dir/oss-$1" selected local_path relative_path file
+  local manifest data success expected_success data_uri manifest_uri success_uri object_prefix
+  local digest manifest_digest success_digest expected_manifest_digest expected_success_digest
+  local start end session triplet_json observed_at observed_cutoff_ns expected_bucket prefix
+  resource_monitor_start "oss-readback-$market" "$UPLOAD_DRAIN_MEMORY_MAX_BYTES"
+  mkdir -p "$readback"
   phase_triplets_json[$market]='[]'
-  conflicts_file="$readback/replay-conflicts.tsv"
-  : >"$conflicts_file"
-  local prefix
   if [[ $TEST_ONLY == true ]]; then
     prefix="oss://fixture/lake/raw/venue=binance/market=$market/dataset=${dataset[$market]}/shard=all/"
   else
@@ -2495,108 +2487,59 @@ verify_oss_roundtrips() {
     || die "$market OSS base prefix is invalid"
   expected_bucket=${oss_bucket[$market]}
   [[ $TEST_ONLY == true ]] && expected_bucket=fixture
-  run_oss "$market" ls "$prefix" --recursive --short-format >"$listing"
-  : >"$readback/manifest-uris"
-  while IFS= read -r line; do
-    line=${line%$'\r'}
-    if [[ $line =~ (oss://[^[:space:]]+\.manifest\.json) ]]; then
-      printf '%s\n' "${BASH_REMATCH[1]}" >>"$readback/manifest-uris"
-      continue
-    fi
-    token=${line##*[$' \t']}; token=${token#/}
-    [[ $token == *.manifest.json ]] && printf 'oss://%s/%s\n' "${oss_bucket[$market]}" "$token" >>"$readback/manifest-uris"
-  done <"$listing"
-  sort -u -o "$readback/manifest-uris" "$readback/manifest-uris"
-  # Validate the complete listing before selecting the first qualifying segment;
-  # otherwise a malformed later object could hide behind an early success.
-  while IFS= read -r uri; do
-    [[ -n $uri ]] || continue
-    monday_validate_lob_object_uri "$market" "${dataset[$market]}" \
-      "$expected_bucket" "$uri" manifest \
-      || die "$market OSS manifest URI failed strict validation: $uri"
-  done <"$readback/manifest-uris"
-  while IFS= read -r uri; do
-    [[ -n $uri ]] || continue
-    manifest_name=${uri##*/}
-    monday_validate_lob_object_uri "$market" "${dataset[$market]}" "$expected_bucket" "$uri" manifest \
-      || die "$market OSS manifest URI failed strict validation: $uri"
-    object_prefix=${uri#"oss://$expected_bucket/"}
-    object_prefix=${object_prefix%/"$manifest_name"}
-    [[ $object_prefix == "${expected_oss_prefix[$market]}"/* ]] \
-      || die "$market OSS manifest URI is outside the configured base prefix: $uri"
-    manifest_index=$((manifest_index + 1))
-    manifest="$readback/discovered-$manifest_index.json"; run_oss "$market" cat "$uri" >"$manifest"
-    jq -e --arg market "$market" \
-      '.market == $market
-       and (.start_received_at_ns | type == "number" and floor == . and . >= 0)
-       and (.end_received_at_ns | type == "number" and floor == . and . >= 0)
-       and .end_received_at_ns >= .start_received_at_ns
-       and (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))' \
-      "$manifest" >/dev/null || die "$market OSS manifest failed strict verification"
-    start=$(jq -er '.start_received_at_ns' "$manifest"); end=$(jq -er '.end_received_at_ns' "$manifest")
-    [[ $start =~ ^[0-9]+$ && $end =~ ^[0-9]+$ && $end -le $observed_cutoff_ns ]] \
-      || die "$market OSS manifest is future-dated"
-    if ((end <= market_observation_started_ns[$market])); then
-      continue
-    fi
-    interval=$(segment_manifest_interval "$market" "$manifest" "${phase_session[$market]}") \
-      || die "$market OSS manifest failed strict verification"
-    IFS=$'\t' read -r state start end <<<"$interval"
-    jq -e '(.file | type == "string" and test("^part-[0-9]+\\.jsonl\\.zst$"))' \
-      "$manifest" >/dev/null || die "$market OSS manifest filename is invalid"
-    case $state in
-      boundary|unsafe)
-        printf '%s\t%s\t%s\n' "$start" "$end" "$uri" >>"$conflicts_file"
-        continue
-        ;;
-      clean) (( start >= market_observation_started_ns[$market] )) || continue ;;
-      *) die "$market OSS manifest classification is invalid" ;;
-    esac
-    [[ $segment_selected == false ]] || continue
-    expected_file=${manifest_name%.manifest.json}
-    file=$(jq -er '.file' "$manifest"); [[ $file == "$expected_file" ]] \
-      || die "$market OSS manifest filename does not match its object URI"
-    data_uri="oss://$expected_bucket/$object_prefix/$file"
-    success_uri="oss://$expected_bucket/$object_prefix/$file._SUCCESS"
-    monday_validate_lob_object_uri "$market" "${dataset[$market]}" "$expected_bucket" "$data_uri" data \
-      || die "$market OSS data URI failed strict validation: $data_uri"
-    monday_validate_lob_object_uri "$market" "${dataset[$market]}" "$expected_bucket" "$success_uri" success \
-      || die "$market OSS success URI failed strict validation: $success_uri"
-    digest=$(jq -er '.sha256' "$manifest"); manifest_digest=$(sha256_file "$manifest")
-    data="$readback/$file"; success="$data._SUCCESS"; final_manifest="$data.manifest.json"
-    run_oss "$market" cat "$uri" >"$final_manifest"
-    [[ $(sha256_file "$final_manifest") == "$manifest_digest" ]] || die "$market OSS manifest changed between reads"
-    run_oss "$market" cat "$data_uri" >"$data"; run_oss "$market" cat "$success_uri" >"$success"
-    expected_success="$readback/$file.expected-success"; printf '%s\n' "$digest" >"$expected_success"; [[ $(sha256_file "$data") == "$digest" ]] || die "$market OSS data digest mismatch"; cmp -s "$success" "$expected_success" || die "$market OSS success marker mismatch"
-    success_digest=$(sha256_file "$success")
-    observed_at=$(monday_epoch_ns_rfc3339 "$observed_cutoff_ns")
-    triplet_json=$(jq -cn --arg market "$market" --arg dataset "${dataset[$market]}" \
-      --arg data_uri "$data_uri" --arg manifest_uri "$uri" \
-      --arg success_uri "$success_uri" --arg data_sha "$digest" \
-      --arg manifest_sha "$manifest_digest" --arg success_sha "$success_digest" \
-      --arg prefix "$object_prefix" --arg observed "$observed_at" \
-      --arg session "${phase_session[$market]}" --arg catalog "${frozen_catalog_sha256[$market]}" \
-      --argjson start "$start" --argjson end "$end" \
-      --argjson observed_ns "$observed_cutoff_ns" \
-      '{market:$market,dataset:$dataset,data_uri:$data_uri,manifest_uri:$manifest_uri,success_uri:$success_uri,
-        data_sha256:$data_sha,manifest_sha256:$manifest_sha,success_sha256:$success_sha,
-        success_content:($data_sha + "\n"),object_prefix:$prefix,observed_at:$observed,
-        observed_at_ns:$observed_ns,
-        start_received_at_ns:$start,end_received_at_ns:$end,session_id:$session,
-        catalog_sha256:$catalog}')
-    phase_triplets_json[$market]=$(jq -cn --argjson values "${phase_triplets_json[$market]}" \
-      --argjson value "$triplet_json" '$values + [$value]')
-    count=$((count + 1))
-    selected_start=$start; selected_end=$end
-    segment_selected=true
-  done <"$readback/manifest-uris"
-  [[ $segment_selected == true && $count -eq 1 ]] \
-    || die "$market OSS readback has no clean triplet"
-  while IFS=$'\t' read -r conflict_start conflict_end conflict_uri; do
-    if (( conflict_start < selected_end && selected_start < conflict_end )); then
-      die "$market replay-unsafe manifest overlaps selected clean segment: $conflict_uri"
-    fi
-  done <"$conflicts_file"
+  [[ $(jq -r 'length' <<<"${phase_segments_json[$market]}") == 1 ]] \
+    || die "$market local segment identity is not singular"
+  selected=$(jq -cer '.[0]' <<<"${phase_segments_json[$market]}")
+  local_path=$(jq -er '.path' <<<"$selected")
+  relative_path=${local_path#"${spool_dir[$market]}/"}
+  [[ $local_path == "${spool_dir[$market]}/$relative_path" \
+    && $relative_path =~ ^date=[0-9]{4}-[0-9]{2}-[0-9]{2}/hour=[0-9]{2}/part-[0-9]+\.jsonl\.zst$ ]] \
+    || die "$market local segment path is outside its run spool"
+  file=${relative_path##*/}
+  data_uri="$prefix$relative_path"
+  manifest_uri="$data_uri.manifest.json"
+  success_uri="$data_uri._SUCCESS"
+  monday_validate_lob_object_uri "$market" "${dataset[$market]}" "$expected_bucket" "$data_uri" data \
+    || die "$market OSS data URI failed strict validation: $data_uri"
+  monday_validate_lob_object_uri "$market" "${dataset[$market]}" "$expected_bucket" "$manifest_uri" manifest \
+    || die "$market OSS manifest URI failed strict validation: $manifest_uri"
+  monday_validate_lob_object_uri "$market" "${dataset[$market]}" "$expected_bucket" "$success_uri" success \
+    || die "$market OSS success URI failed strict validation: $success_uri"
+  manifest="$readback/$file.manifest.json"; data="$readback/$file"; success="$data._SUCCESS"
+  run_oss "$market" cat "$manifest_uri" >"$manifest"
+  run_oss "$market" cat "$data_uri" >"$data"
+  run_oss "$market" cat "$success_uri" >"$success"
+  observed_cutoff_ns=$(date +%s%N)
+  [[ $observed_cutoff_ns =~ ^[0-9]+$ ]] || die "$market OSS observation clock is unavailable"
+  digest=$(jq -er '.data_sha256' <<<"$selected")
+  expected_manifest_digest=$(jq -er '.manifest_sha256' <<<"$selected")
+  expected_success_digest=$(jq -er '.success_sha256' <<<"$selected")
+  manifest_digest=$(sha256_file "$manifest"); success_digest=$(sha256_file "$success")
+  [[ $(sha256_file "$data") == "$digest" ]] || die "$market OSS data digest mismatch"
+  [[ $manifest_digest == "$expected_manifest_digest" ]] || die "$market OSS manifest digest mismatch"
+  [[ $success_digest == "$expected_success_digest" ]] || die "$market OSS success digest mismatch"
+  expected_success="$readback/$file.expected-success"; printf '%s\n' "$digest" >"$expected_success"
+  cmp -s "$success" "$expected_success" || die "$market OSS success marker mismatch"
+  start=$(jq -er '.start_received_at_ns' <<<"$selected"); end=$(jq -er '.end_received_at_ns' <<<"$selected")
+  session=$(jq -er '.session_id' <<<"$selected")
+  [[ $start =~ ^[0-9]+$ && $end =~ ^[0-9]+$ && $start -ge ${market_observation_started_ns[$market]} \
+    && $end -ge $start && $end -le $observed_cutoff_ns && $session == "${phase_session[$market]}" ]] \
+    || die "$market local segment identity is invalid at OSS readback"
+  object_prefix=${data_uri#"oss://$expected_bucket/"}; object_prefix=${object_prefix%/"$file"}
+  observed_at=$(monday_epoch_ns_rfc3339 "$observed_cutoff_ns")
+  triplet_json=$(jq -cn --arg market "$market" --arg dataset "${dataset[$market]}" \
+    --arg data_uri "$data_uri" --arg manifest_uri "$manifest_uri" \
+    --arg success_uri "$success_uri" --arg data_sha "$digest" \
+    --arg manifest_sha "$manifest_digest" --arg success_sha "$success_digest" \
+    --arg prefix "$object_prefix" --arg observed "$observed_at" \
+    --arg session "$session" --arg catalog "${frozen_catalog_sha256[$market]}" \
+    --argjson start "$start" --argjson end "$end" --argjson observed_ns "$observed_cutoff_ns" \
+    '{market:$market,dataset:$dataset,data_uri:$data_uri,manifest_uri:$manifest_uri,success_uri:$success_uri,
+      data_sha256:$data_sha,manifest_sha256:$manifest_sha,success_sha256:$success_sha,
+      success_content:($data_sha + "\n"),object_prefix:$prefix,observed_at:$observed,
+      observed_at_ns:$observed_ns,start_received_at_ns:$start,end_received_at_ns:$end,
+      session_id:$session,catalog_sha256:$catalog}')
+  phase_triplets_json[$market]=$(jq -cn --argjson value "$triplet_json" '[$value]')
   # The local triplet was already semantically verified. Exact byte identity is
   # sufficient for the OSS readback; running the same verifier twice adds no evidence.
   jq -e -n --argjson segments "${phase_segments_json[$market]}" \
@@ -2607,7 +2550,7 @@ verify_oss_roundtrips() {
         .start_received_at_ns, .end_received_at_ns, .session_id]))' \
     || die "$market OSS triplets do not match the selected local segments"
   market_observed_at_ns[$market]=$observed_cutoff_ns
-  phase_oss[$market]=$count
+  phase_oss[$market]=1
   resource_monitor_stop_or_die "$market OSS"
 }
 
