@@ -254,7 +254,7 @@ require_empty_segment_spool() {
 
 secure_release_identity() {
   local release_json artifact_json runtime_contract env_sha release_env_sha
-  local controller_release controller_sha controller_manifest controller_deployment installed_recovery
+  local controller_release controller_sha controller_manifest controller_deployment installed_recovery installed_env
   path_is_direct_or_absent "$OPT_ROOT" || fail "release path contains a symlink: $OPT_ROOT"
   path_is_direct_or_absent "$BIN_DIR" || fail "release path contains a symlink: $BIN_DIR"
   path_is_direct_or_absent "$RELEASE_ROOT" || fail "release path contains a symlink: $RELEASE_ROOT"
@@ -343,9 +343,16 @@ secure_release_identity() {
       and .runtime_contract_sha256 == $runtime' \
     "$release_json" >/dev/null \
     || fail "release metadata does not match the production binary: $release_json"
-  secure_regular_file "$ENV_FILE" 0
+  [[ -L $ENV_FILE ]] \
+    || fail "installed env is not the active controller projection: $ENV_FILE"
+  [[ $(readlink -- "$ENV_FILE") == \
+    "$ACTIVE_CONTROLLER/deployment/binance-lob-archiver-production-$MARKET.env" ]] \
+    || fail "installed env does not resolve through the active controller: $ENV_FILE"
+  installed_env=$(readlink -f -- "$ENV_FILE") \
+    || fail "installed env projection is dangling: $ENV_FILE"
+  secure_regular_file "$installed_env" 0
   secure_regular_file "$RELEASE_ENV_FILE" 0
-  env_sha=$(sha256sum "$ENV_FILE" | awk '{print $1}')
+  env_sha=$(sha256sum "$installed_env" | awk '{print $1}')
   release_env_sha=$(sha256sum "$RELEASE_ENV_FILE" | awk '{print $1}')
   [[ $env_sha == "$release_env_sha" ]] \
     || fail "installed env drifted from digest-addressed release env: $ENV_FILE"
