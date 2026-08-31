@@ -26,6 +26,9 @@ printf '%s\n' .github/workflows/security.yml >"$tmp_dir/unknown-workflow.txt"
 printf '%s\n' .github/workflows/security-enabled.yml >"$tmp_dir/security-workflow.txt"
 printf '%s\n' .github/ISSUE_TEMPLATE/engineering-change.yml >"$tmp_dir/governance-template.txt"
 printf '%s\n' docs/agents/issue-tracker.md >"$tmp_dir/governance-doc.txt"
+printf '%s\n' AGENTS.md rust_hft/tools/collector/AGENTS.md >"$tmp_dir/agent-instructions.txt"
+printf '%s\n' rust_hft/CLAUDE.md rust_hft/tools/collector/src/polymarket/reference.rs \
+  >"$tmp_dir/agent-instructions-with-code.txt"
 printf '%s\n' Makefile >"$tmp_dir/unknown-root.txt"
 printf '%s\n' config/risk.toml >"$tmp_dir/unknown-nested.txt"
 printf '%s\n' deployment/aliyun/host-rust-lob-cutover.sh >"$tmp_dir/lob-control.txt"
@@ -117,6 +120,8 @@ job_cases=(
   'security-workflow-push|push|security-workflow.txt|ploy/workflow-lint'
   'governance-template|pull_request|governance-template.txt|ploy/commit-hygiene,ploy/workflow-lint'
   'governance-doc|pull_request|governance-doc.txt|ploy/commit-hygiene,ploy/workflow-lint'
+  'agent-instructions|pull_request|agent-instructions.txt|ploy/commit-hygiene'
+  'agent-instructions-with-code|pull_request|agent-instructions-with-code.txt|ploy/commit-hygiene,ci/rust,ci/polymarket-evidence-compiler-image'
   'preflight-only|pull_request|preflight-only.txt|ploy/commit-hygiene'
   'unknown-workflow|pull_request|unknown-workflow.txt|ci/rust-shell-scripts,ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/workflow-lint,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
   'unknown-root|pull_request|unknown-root.txt|ci/rust-shell-scripts,ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'

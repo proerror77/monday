@@ -33,6 +33,26 @@
   shims or fallbacks; preserve applied migrations and audit history as read-only
   records.
 
+## Default delivery loop
+
+- Start from the terminal state the user requested. A request to fix, optimize,
+  review, test, or merge authorizes only the corresponding development and Git
+  states; it does not authorize artifact publication, a production Gate,
+  cutover, deployment, collector mutation, or runtime mutation.
+- The default development loop is `Code -> focused validation`. Extend it only
+  through the explicitly requested Git state: publish a PR and stop when a PR is
+  requested; verify exact-head CI and stop when CI is requested; merge only when
+  merge is explicitly requested and exact-head required checks pass. A production
+  Gate is never part of this loop.
+- Cross a collector or runtime boundary only on explicit production authorization.
+  Use the shortest applicable sequence: `release -> one Gate -> cutover ->
+  Runtime -> independent Readback`. Do not insert repeated Gates, ad hoc evidence
+  stages, or unrelated investigations. Re-run a failed stage only after its cause
+  or relevant input changed and state the new hypothesis.
+- A control-plane code fix follows the development loop like any other code. Its
+  Gate belongs to the later production transition it protects, not to its PR or
+  merge. Keep Governance changes separate from that production transition.
+
 ## Evidence and safety
 
 - Refresh only the source of truth that can affect the next decision. Recheck
