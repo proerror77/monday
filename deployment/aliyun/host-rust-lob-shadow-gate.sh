@@ -1910,12 +1910,18 @@ fixture_seed_market_segments() {
   fi
   [[ ${MONDAY_GATE_FIXTURE_RECONNECT_BOUNDARY:-0} == 1 ]] && segment_count=2
   [[ ${MONDAY_GATE_FIXTURE_UNSAFE_THEN_CLEAN:-0} == 1 ]] && segment_count=2
+  [[ ${MONDAY_GATE_FIXTURE_OVERLAPPING_UNSAFE:-0} == 1 ]] && segment_count=2
   [[ ${MONDAY_GATE_FIXTURE_POST_SAMPLE_EVIDENCE:-0} == 1 ]] && segment_count=0
   for ((i = 1; i <= segment_count; i++)); do
     boundary=false; replay_safe=true
     [[ ${MONDAY_GATE_FIXTURE_RECONNECT_BOUNDARY:-0} == 1 && $i -eq 1 ]] && boundary=true
-    [[ ${MONDAY_GATE_FIXTURE_UNSAFE_THEN_CLEAN:-0} == 1 && $i -eq 1 ]] && replay_safe=false
+    if [[ $i -eq 1 && ( ${MONDAY_GATE_FIXTURE_UNSAFE_THEN_CLEAN:-0} == 1 \
+      || ${MONDAY_GATE_FIXTURE_OVERLAPPING_UNSAFE:-0} == 1 ) ]]; then
+      replay_safe=false
+    fi
     start=$((cutoff + i * 1000)); end=$((start + 900))
+    [[ ${MONDAY_GATE_FIXTURE_OVERLAPPING_UNSAFE:-0} == 1 && $i -eq 1 ]] \
+      && end=$((cutoff + 2100))
     fixture_seed_segment "$market" "$start" "$end" "$boundary" "$replay_safe"
   done
 }
@@ -2232,7 +2238,7 @@ clean_segment_ready() {
     interval=$(segment_manifest_interval "$market" "$manifest" "${phase_session[$market]}") \
       || return 2
     IFS=$'\t' read -r state start end <<<"$interval"
-    (( end > market_observation_started_ns[$market] )) || continue
+    (( start >= market_observation_started_ns[$market] )) || continue
     [[ $state == clean ]] || continue
     record=$(snapshot_segment_record "$manifest") || return 2
     printf '%s\n' "$record" >"$snapshot.tmp"
@@ -2255,7 +2261,7 @@ verify_segments() {
     interval=$(segment_manifest_interval "$market" "$manifest" "${phase_session[$market]}") \
       || die "$market manifest failed strict checks"
     IFS=$'\t' read -r state start end <<<"$interval"
-    (( end > market_observation_started_ns[$market] )) || continue
+    (( start >= market_observation_started_ns[$market] )) || continue
     case $state in
       boundary) continue ;;
       unsafe) die "$market manifest is not replay-safe" ;;
@@ -2460,12 +2466,15 @@ run_oss() {
 verify_oss_roundtrips() {
   local market=$1 readback="$tmp_dir/oss-$1" listing="$tmp_dir/oss-$1.list" uri manifest final_manifest data success expected_success file digest manifest_digest success_digest line token triplet_json observed_at observed_cutoff_ns
   local expected_bucket manifest_name object_prefix data_uri success_uri expected_file
-  local interval state manifest_index=0 segment_selected=false
+  local conflicts_file interval state manifest_index=0 segment_selected=false
+  local conflict_start conflict_end conflict_uri selected_start=0 selected_end=0
   resource_monitor_start "oss-readback-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"
   observed_cutoff_ns=$(date +%s%N)
   [[ $observed_cutoff_ns =~ ^[0-9]+$ ]] || die "$market OSS observation clock is unavailable"
   local start end count=0; local -a roundtrip_records=(); mkdir -p "$readback"
   phase_triplets_json[$market]='[]'
+  conflicts_file="$readback/replay-conflicts.tsv"
+  : >"$conflicts_file"
   local prefix
   if [[ $TEST_ONLY == true ]]; then
     prefix="oss://fixture/lake/raw/venue=binance/market=$market/dataset=${dataset[$market]}/shard=all/"
@@ -2532,8 +2541,11 @@ verify_oss_roundtrips() {
     jq -e '(.file | type == "string" and test("^part-[0-9]+\\.jsonl\\.zst$"))' \
       "$manifest" >/dev/null || die "$market OSS manifest filename is invalid"
     case $state in
-      boundary|unsafe) continue ;;
-      clean) ;;
+      boundary|unsafe)
+        printf '%s\t%s\t%s\n' "$start" "$end" "$uri" >>"$conflicts_file"
+        continue
+        ;;
+      clean) (( start >= market_observation_started_ns[$market] )) || continue ;;
       *) die "$market OSS manifest classification is invalid" ;;
     esac
     [[ $segment_selected == false ]] || continue
@@ -2572,10 +2584,16 @@ verify_oss_roundtrips() {
       --argjson value "$triplet_json" '$values + [$value]')
     roundtrip_records+=("$data" "$digest" "$manifest_digest")
     count=$((count + 1))
+    selected_start=$start; selected_end=$end
     segment_selected=true
   done <"$readback/manifest-uris"
   [[ $segment_selected == true && $count -eq 1 ]] \
     || die "$market OSS readback has no clean triplet"
+  while IFS=$'\t' read -r conflict_start conflict_end conflict_uri; do
+    if (( conflict_start < selected_end && selected_start < conflict_end )); then
+      die "$market replay-unsafe manifest overlaps selected clean segment: $conflict_uri"
+    fi
+  done <"$conflicts_file"
   jq -e -n --argjson segments "${phase_segments_json[$market]}" \
     --argjson triplets "${phase_triplets_json[$market]}" '
       ($segments | map([.data_sha256, .start_received_at_ns, .end_received_at_ns]))

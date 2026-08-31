@@ -1221,8 +1221,8 @@ jq -e --argjson evidence_timeout "$evidence_timeout_seconds" \
      | .observed_runtime_seconds >= 0 and .observed_runtime_seconds <= $evidence_timeout
      and .observation_started_at_ns <= .observed_at_ns
      and .segment_count == 1 and .oss_triplet_count == 1
-     and all(.segments[]; .end_received_at_ns > $market.observation_started_at_ns)
-     and all(.triplets[]; .end_received_at_ns > $market.observation_started_at_ns))' \
+     and all(.segments[]; .start_received_at_ns >= $market.observation_started_at_ns)
+     and all(.triplets[]; .start_received_at_ns >= $market.observation_started_at_ns))' \
   "$gate" >/dev/null
 run_json="$(dirname -- "$gate")/run.json"
 jq -e --argjson segment "$gate_segment_seconds" \
@@ -1274,6 +1274,19 @@ jq -e 'all(.markets[]; . as $market
   and .triplets[0].start_received_at_ns == .segments[0].start_received_at_ns)' \
   "$recovered_gate" >/dev/null
 
+# Recovery remains allowed only when the unsafe audit segment is disjoint from
+# the selected clean segment.
+overlap_failure_output="$ROOT/run/overlapping-unsafe.err"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_OVERLAPPING_UNSAFE=1 \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
+  --from-controller direct --candidate-controller "$c0" --root "$ROOT" \
+  >"$overlap_failure_output" 2>&1; then
+  printf 'Gate accepted an unsafe manifest overlapping its clean segment\n' >&2
+  exit 1
+fi
+grep -Fq 'replay-unsafe manifest overlaps selected clean segment' \
+  "$overlap_failure_output"
+
 # Clean files sealed before observation starts are audit input only.  The local
 # selector and OSS readback must both choose the later clean segment.
 preobservation_gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 \
@@ -1284,8 +1297,8 @@ preobservation_gate=$(printf '%s\n' "$preobservation_gate_output" | sed -n 's/^V
 preobservation_gate_sha=$(printf '%s\n' "$preobservation_gate_output" | sed -n 's/^SHA-256: //p')
 monday_validate_v2_gate "$preobservation_gate" direct "$c0" "$preobservation_gate_sha"
 jq -e 'all(.markets[]; . as $market
-  | all(.segments[]; .end_received_at_ns > $market.observation_started_at_ns)
-  and all(.triplets[]; .end_received_at_ns > $market.observation_started_at_ns))' \
+  | all(.segments[]; .start_received_at_ns >= $market.observation_started_at_ns)
+  and all(.triplets[]; .start_received_at_ns >= $market.observation_started_at_ns))' \
   "$preobservation_gate" >/dev/null
 
 # Evidence snapshotted inside the window may finish validation after the
