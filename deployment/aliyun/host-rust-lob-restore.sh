@@ -888,7 +888,7 @@ if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
   systemctl daemon-reload || die 'daemon-reload failed'
   monday_rust_lob_verify_systemd_production_slice_configured "$ROOT" \
     || die 'permanent production slice verification failed before restore'
-  systemctl unmask binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service \
+  systemctl unmask --runtime binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service \
     || die 'could not unmask V2 production lanes'
   systemctl start binance-lob-archiver-production@spot.service \
     || die 'Spot failed to start during restore'

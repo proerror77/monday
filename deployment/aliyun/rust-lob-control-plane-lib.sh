@@ -373,7 +373,7 @@ monday_rust_lob_verify_recovery_schedulers_contained() {
 monday_rust_lob_enable_recovery_schedulers() {
   local unit failed=0
   while IFS= read -r unit; do
-    systemctl unmask "$unit" >/dev/null 2>&1 || failed=1
+    systemctl unmask --runtime "$unit" >/dev/null 2>&1 || failed=1
   done < <(monday_rust_lob_recovery_scheduler_units)
   while IFS= read -r unit; do
     systemctl enable "$unit" >/dev/null 2>&1 || failed=1
@@ -509,7 +509,7 @@ monday_rust_lob_restore_writer_snapshot() {
     # A not-found unit has no enable state to restore; remove the temporary
     # mask and leave it absent.  This also handles hosts without old units.
     if [[ $load == not-found ]]; then
-      systemctl unmask "$unit" >/dev/null 2>&1 || failed=1
+      systemctl unmask --runtime "$unit" >/dev/null 2>&1 || failed=1
       continue
     fi
     systemctl stop "$unit" >/dev/null 2>&1 || failed=1
@@ -517,10 +517,10 @@ monday_rust_lob_restore_writer_snapshot() {
       masked|masked-runtime|masked-runtime*)
         systemctl mask --runtime "$unit" >/dev/null 2>&1 || failed=1 ;;
       enabled|enabled-runtime|enabled-presets|indirect|generated|linked|linked-runtime)
-        systemctl unmask "$unit" >/dev/null 2>&1 || failed=1
+        systemctl unmask --runtime "$unit" >/dev/null 2>&1 || failed=1
         systemctl enable "$unit" >/dev/null 2>&1 || failed=1 ;;
       *)
-        systemctl unmask "$unit" >/dev/null 2>&1 || failed=1
+        systemctl unmask --runtime "$unit" >/dev/null 2>&1 || failed=1
         systemctl disable "$unit" >/dev/null 2>&1 || failed=1 ;;
     esac
     if [[ $active == active || $active == activating ]]; then

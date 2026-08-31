@@ -804,7 +804,7 @@ if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
   monday_rust_lob_verify_systemd_production_slice_configured "$ROOT" \
     || die 'permanent production slice verification failed before start'
   cutover_started_ns=$(date +%s%N)
-  systemctl unmask binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service \
+  systemctl unmask --runtime binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service \
     || die 'could not unmask V2 production lanes'
   systemctl enable binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service \
     || die 'could not enable V2 production lanes before start'

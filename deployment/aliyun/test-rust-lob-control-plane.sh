@@ -74,6 +74,14 @@ gate_publish_dir_line=$(grep -nF "mv -- \"\$evidence_dir\" \"\$final_evidence_di
 # removed.  Readback alone proves bytes, not power-loss ordering.
 cutover_script="$SCRIPT_DIR/host-rust-lob-cutover.sh"
 restore_script="$SCRIPT_DIR/host-rust-lob-restore.sh"
+for unmask_script in "$SCRIPT_DIR/rust-lob-control-plane-lib.sh" "$cutover_script" "$restore_script"; do
+  while IFS= read -r unmask_line; do
+    [[ $unmask_line == *'systemctl unmask --runtime '* ]] || {
+      printf 'runtime mask is cleared without --runtime: %s\n' "$unmask_script" >&2
+      exit 1
+    }
+  done < <(grep -F 'systemctl unmask ' "$unmask_script")
+done
 cutover_intent_flush_line=$(grep -nF "could not durably flush cutover recovery intent" "$cutover_script" | cut -d: -f1)
 cutover_intent_commit_line=$(grep -nF "could not durably commit cutover recovery intent" "$cutover_script" | cut -d: -f1)
 cutover_active_line=$(grep -nF "monday_atomic_symlink \"\$target_release\" \"\$active_link\"" "$cutover_script" | cut -d: -f1)
