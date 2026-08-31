@@ -1274,6 +1274,19 @@ jq -e 'all(.markets[]; . as $market
   and .triplets[0].start_received_at_ns == .segments[0].start_received_at_ns)' \
   "$recovered_gate" >/dev/null
 
+# Only conflicting evidence emitted by this Gate run remains a veto; unrelated
+# historical OSS manifests are outside the collector-candidate contract.
+overlap_failure_output="$ROOT/run/overlapping-unsafe.err"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_OVERLAPPING_UNSAFE=1 \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
+  --from-controller direct --candidate-controller "$c0" --root "$ROOT" \
+  >"$overlap_failure_output" 2>&1; then
+  printf 'Gate accepted an unsafe local segment overlapping its clean segment\n' >&2
+  exit 1
+fi
+grep -Fq 'replay-unsafe local segment overlaps selected clean segment' \
+  "$overlap_failure_output"
+
 # Clean files sealed before observation starts are audit input only.  The local
 # selector and OSS readback must both choose the later clean segment.
 preobservation_gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 \

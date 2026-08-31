@@ -1901,14 +1901,18 @@ fixture_seed_market_segments() {
   fi
   [[ ${MONDAY_GATE_FIXTURE_RECONNECT_BOUNDARY:-0} == 1 ]] && segment_count=2
   [[ ${MONDAY_GATE_FIXTURE_UNSAFE_THEN_CLEAN:-0} == 1 ]] && segment_count=2
+  [[ ${MONDAY_GATE_FIXTURE_OVERLAPPING_UNSAFE:-0} == 1 ]] && segment_count=2
   [[ ${MONDAY_GATE_FIXTURE_POST_SAMPLE_EVIDENCE:-0} == 1 ]] && segment_count=0
   for ((i = 1; i <= segment_count; i++)); do
     boundary=false; replay_safe=true
     [[ ${MONDAY_GATE_FIXTURE_RECONNECT_BOUNDARY:-0} == 1 && $i -eq 1 ]] && boundary=true
-    if [[ $i -eq 1 && ${MONDAY_GATE_FIXTURE_UNSAFE_THEN_CLEAN:-0} == 1 ]]; then
+    if [[ $i -eq 1 && ( ${MONDAY_GATE_FIXTURE_UNSAFE_THEN_CLEAN:-0} == 1 \
+      || ${MONDAY_GATE_FIXTURE_OVERLAPPING_UNSAFE:-0} == 1 ) ]]; then
       replay_safe=false
     fi
     start=$((cutoff + i * 1000)); end=$((start + 900))
+    [[ ${MONDAY_GATE_FIXTURE_OVERLAPPING_UNSAFE:-0} == 1 && $i -eq 1 ]] \
+      && end=$((cutoff + 2100))
     fixture_seed_segment "$market" "$start" "$end" "$boundary" "$replay_safe"
   done
 }
@@ -2236,6 +2240,7 @@ clean_segment_ready() {
 }
 verify_segments() {
   local market=$1 snapshot=$2 manifest snapshot_manifest_digest path file digest manifest_digest success_digest expected_success count=0 start end segment_json interval state
+  local candidate_manifest candidate_interval candidate_state candidate_start candidate_end
   local -a segment_records=()
   [[ -f $snapshot ]] || die "$market observation segment snapshot is absent"
   phase_segments_json[$market]='[]'
@@ -2273,6 +2278,15 @@ verify_segments() {
     (( count >= 1 )) && break
   done <"$snapshot"
   ((count == 1)) || die "$market has no clean segment"
+  while IFS= read -r candidate_manifest; do
+    candidate_interval=$(segment_manifest_interval "$market" "$candidate_manifest" "${phase_session[$market]}") \
+      || die "$market manifest failed strict checks"
+    IFS=$'\t' read -r candidate_state candidate_start candidate_end <<<"$candidate_interval"
+    if [[ $candidate_state == boundary || $candidate_state == unsafe ]] \
+      && (( candidate_start < end && start < candidate_end )); then
+      die "$market replay-unsafe local segment overlaps selected clean segment: $candidate_manifest"
+    fi
+  done < <(find "${spool_dir[$market]}" -type f -name '*.jsonl.zst.manifest.json' | sort)
   verify_clean_segments "${segment_records[@]}" || die "$market strict LOB continuity verifier failed"
   if [[ $market == spot ]]; then
     verify_aggregate_trade_continuity "${segment_records[@]}" || die "$market strict aggregate-trade continuity verifier failed"
