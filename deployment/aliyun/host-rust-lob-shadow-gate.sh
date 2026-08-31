@@ -291,7 +291,7 @@ if [[ $TEST_ONLY == true ]]; then
       ls)
         fixture_date=2026-08-28
         fixture_hour=05
-        for object in "${spool_dir[$OSS_FIXTURE_MARKET]}"/*.manifest.json; do
+        for object in "${spool_dir[$OSS_FIXTURE_MARKET]}"/date=2026-08-28/hour=05/*.manifest.json; do
           [[ -f $object ]] || continue
           printf 'oss://fixture/lake/raw/venue=binance/market=%s/dataset=%s/shard=all/date=%s/hour=%s/%s\n' \
             "$OSS_FIXTURE_MARKET" "${dataset[$OSS_FIXTURE_MARKET]}" "$fixture_date" "$fixture_hour" "${object##*/}"
@@ -305,7 +305,7 @@ if [[ $TEST_ONLY == true ]]; then
         source=${1:-}; target=${2:-}
         object=${source##*/}
         [[ $object != "$source" && -n $target ]] || return 2
-        cp -p -- "${spool_dir[$OSS_FIXTURE_MARKET]}/$object" "$target"
+        cp -p -- "${spool_dir[$OSS_FIXTURE_MARKET]}/date=2026-08-28/hour=05/$object" "$target"
         if [[ ${MONDAY_GATE_FIXTURE_TAMPER_OSS:-0} == 1 && $object == *.jsonl.zst ]]; then
           printf '\n' >>"$target"
         fi
@@ -1882,7 +1882,8 @@ fixture_seed_market() {
 }
 fixture_seed_segment() {
   local market=$1 start=$2 end=$3 boundary=$4 replay_safe=${5:-true} gaps=0
-  local dir="${spool_dir[$1]}" file data_sha
+  local dir="${spool_dir[$1]}/date=2026-08-28/hour=05" file data_sha
+  mkdir -p "$dir"
   [[ $replay_safe == true ]] || gaps=1
   file="part-$start.jsonl"
   printf '{"schema":"binance.market_tape.v2","type":"session_start"}\n' >"$dir/$file"
@@ -2244,7 +2245,7 @@ clean_segment_ready() {
     printf '%s\n' "$record" >"$snapshot.tmp"
     mv -f -- "$snapshot.tmp" "$snapshot"
     return 0
-  done < <(find "${spool_dir[$market]}" -maxdepth 1 -type f -name '*.jsonl.zst.manifest.json' | sort)
+  done < <(find "${spool_dir[$market]}" -type f -name '*.jsonl.zst.manifest.json' | sort)
   return 1
 }
 verify_segments() {
