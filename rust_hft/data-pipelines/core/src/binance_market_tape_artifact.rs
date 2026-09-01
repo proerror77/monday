@@ -448,6 +448,16 @@ pub fn verify_binance_market_tape_for_strict_gate(
     .map(|_| ())
 }
 
+pub fn verify_binance_market_tape_series_for_strict_gate(
+    sealed: Vec<SealedBinanceMarketTapeTriplet>,
+) -> Result<Vec<VerifiedBinanceMarketTapeSeries>> {
+    let require_trade_summaries = sealed
+        .first()
+        .map(|segment| !manifest_is_usdm_lob_only(&segment.manifest))
+        .ok_or_else(|| anyhow!("market-tape segment set is empty"))?;
+    verify_binance_market_tape_series_with_requirements(sealed, require_trade_summaries, true)
+}
+
 fn verify_binance_market_tape_with_requirements(
     sealed: Vec<SealedBinanceMarketTapeTriplet>,
     require_trade_summaries: bool,

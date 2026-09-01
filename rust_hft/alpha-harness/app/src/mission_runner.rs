@@ -3403,9 +3403,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn execute_rejects_snapshot_missing_aggregate_trade_modality() {
-        let mut fixture = fixture("missing-aggregate-trade-modality");
-        fixture.materialization["snapshot"]["required_modalities"] = serde_json::json!(["lob"]);
+    fn execute_rejects_snapshot_missing_lob_modality() {
+        let mut fixture = fixture("missing-lob-modality");
+        fixture.materialization["snapshot"]["required_modalities"] =
+            serde_json::json!(["aggregate_trade"]);
         fixture.materialization["snapshot_sha256"] = serde_json::json!("0".repeat(64));
         resign_materialization_outer(&mut fixture);
 

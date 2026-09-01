@@ -411,15 +411,46 @@ alpha-harness mission campaign-freeze \
   --research-plan /private/path/next-research-plan.json
 ```
 
-The LLM sees only bounded negative-result evidence and may choose one admitted
+The Campaign result schema is `cex-campaign-result-v5`. It carries bounded,
+structured factor-screening and Ridge/CART metrics for each round, so the LLM
+can select the next admitted focus from actual failure evidence instead of only
+seeing `baseline_gate_failed`. The LLM may choose one admitted
 feature focus plus a falsifiable hypothesis. The existing governed GP templates
 remain deterministic. The LLM cannot change data, fees, validation, trial
 limits, holdout, Kubernetes, risk, or execution authority. The output is
 create-once, limited to three follow-up generations, and its content hash
 changes the child Campaign identity. LLM
 credentials remain outside ACK; the existing dispatcher is still the only path
-that creates the next suspended Job. There is no resident controller or
-automatic retry loop in the namespace.
+that creates the next suspended Job.
+
+`scripts/campaign-cycle-controller.sh` is the bounded external controller for
+the complete loop. Run it from a trusted Tokyo VPC control-plane host with
+`alpha-harness`, `aliyun`, `kubectl`, `jq`, LLM environment variables, and an
+executable signer. The signer remains a separate trust boundary and receives
+the frozen signing plan; the controller never logs signed URLs. Its mode-0700
+work directory is input-bound and resumable: after dispatch, a transient
+control-plane or OSS failure resumes the same request and Job instead of
+re-signing or resubmitting a new identity. Signed request/submission files are
+removed once that generation is processed. For example:
+
+```bash
+deployment/aliyun/research/scripts/campaign-cycle-controller.sh \
+  --campaign-inputs /private/run/campaign-inputs.json \
+  --input-root /private/run \
+  --source-revision REPLACE_EXACT_GIT_SHA \
+  --image registry/research-runner@sha256:REPLACE_DIGEST \
+  --campaign-root https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/campaigns \
+  --signer /private/bin/monday-campaign-oss-signer \
+  --work-dir /private/cycles/REPLACE_RUN_ID \
+  --seed 7 --seed 11
+```
+
+The controller performs `freeze -> sign -> finalize -> dispatch -> K8S Job
+wait -> Pod image readback -> immutable per-round OSS readback -> learn -> child
+Campaign`, deleting the input Secret after terminal Job/Pod capture and
+stopping on a candidate or after at most three follow-ups. It is not resident
+in the ACK namespace and has no order, execution, risk-limit, or runtime-resume
+authority.
 
 Wrap the final request with `attempt_id` and the exact digest-pinned `image` in
 the private submission file, then submit it directly:
