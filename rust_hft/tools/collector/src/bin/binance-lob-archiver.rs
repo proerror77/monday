@@ -44,6 +44,9 @@ const BUILD_SOURCE_REVISION: &str = match option_env!("MONDAY_SOURCE_REVISION") 
     None => "unbound-source-revision",
 };
 const USDM_TOP100_LOB_DATASET: &str = "usdm_perpetual_top100_lob";
+const USDM_TOP100_LOB_TRADE_DATASET: &str = "usdm_perpetual_top100_lob_trade";
+const USDM_TOP100_LOB_TRADE_SHADOW_DATASET: &str =
+    "usdm_perpetual_top100_lob_trade_rust_shadow";
 
 #[derive(Debug, Parser)]
 #[command(name = "binance-lob-archiver", version = BUILD_SOURCE_REVISION)]
@@ -398,9 +401,11 @@ impl Config {
         if catalog.symbols.is_empty() {
             anyhow::bail!("SYMBOLS must not be empty");
         }
+        let dataset = env_string("DATASET", &format!("{}_all", market.as_str()));
+        validate_dataset_contract(market, &dataset, &catalog.symbols)?;
         Ok(Self {
             market,
-            dataset: env_string("DATASET", &format!("{}_all", market.as_str())),
+            dataset,
             shard_id: env_string("SHARD_ID", "all"),
             symbols: catalog.symbols,
             security_token_symbols: catalog.security_token_symbols,
@@ -513,6 +518,31 @@ impl Config {
                                     "wss://data-stream.binance.vision/stream?streams={book_tickers}"
                                 ),
                                 streams: book_ticker_streams,
+                            },
+                        ]
+                    }
+                    Market::Usdm if is_usdm_top100_lob_trade_dataset(&self.dataset) => {
+                        let aggregate_trade_streams = symbols
+                            .iter()
+                            .map(|symbol| format!("{}@aggTrade", symbol.to_ascii_lowercase()))
+                            .collect::<BTreeSet<_>>();
+                        let aggregate_trades = aggregate_trade_streams
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("/");
+                        vec![
+                            StreamShard {
+                                url: format!(
+                                    "wss://fstream.binance.com/public/stream?streams={depth}"
+                                ),
+                                streams: depth_streams,
+                            },
+                            StreamShard {
+                                url: format!(
+                                    "wss://fstream.binance.com/market/stream?streams={aggregate_trades}"
+                                ),
+                                streams: aggregate_trade_streams,
                             },
                         ]
                     }
@@ -1593,14 +1623,40 @@ fn stream_types_for_market(market: Market) -> Vec<String> {
             "trade".to_owned(),
             "bookTicker".to_owned(),
         ],
-        // USD-M Top100 is intentionally depth-only; historical Top100 tapes
-        // that also carried bookTicker remain readable via recovery.
+        // The original USD-M Top100 dataset remains depth-only; combined
+        // datasets declare their additional streams explicitly below.
         Market::Usdm => vec!["depth@100ms".to_owned()],
     }
 }
 
+fn validate_dataset_contract(
+    market: Market,
+    dataset: &str,
+    symbols: &[String],
+) -> anyhow::Result<()> {
+    if !is_usdm_top100_lob_trade_dataset(dataset) {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        market == Market::Usdm,
+        "{dataset} requires MARKET=usdm"
+    );
+    anyhow::ensure!(
+        symbols.len() == 100 && symbols.iter().collect::<BTreeSet<_>>().len() == 100,
+        "{dataset} requires exactly 100 unique symbols"
+    );
+    Ok(())
+}
+
 fn is_legacy_usdm_dataset(dataset: &str) -> bool {
     matches!(dataset, "usdm_all" | "usdm_perpetual_all")
+}
+
+fn is_usdm_top100_lob_trade_dataset(dataset: &str) -> bool {
+    matches!(
+        dataset,
+        USDM_TOP100_LOB_TRADE_DATASET | USDM_TOP100_LOB_TRADE_SHADOW_DATASET
+    )
 }
 
 fn is_usdm_top100_depth_only_stream_types(stream_types: &[String]) -> bool {
@@ -1612,7 +1668,9 @@ fn historical_usdm_top100_stream_types() -> Vec<String> {
 }
 
 fn stream_types_for_dataset(market: Market, dataset: &str) -> Vec<String> {
-    if market == Market::Usdm && is_legacy_usdm_dataset(dataset) {
+    if market == Market::Usdm && is_usdm_top100_lob_trade_dataset(dataset) {
+        vec!["depth@100ms".to_owned(), "aggTrade".to_owned()]
+    } else if market == Market::Usdm && is_legacy_usdm_dataset(dataset) {
         vec![
             "depth@100ms".to_owned(),
             "aggTrade".to_owned(),
@@ -1633,6 +1691,9 @@ fn stream_types_for_recovery(market: Market, dataset: &str) -> anyhow::Result<Ve
         // recorded five-family contract distinct from the new LOB identity.
         (Market::Usdm, dataset) if is_legacy_usdm_dataset(dataset) => {
             Ok(stream_types_for_dataset(Market::Usdm, dataset))
+        }
+        (Market::Usdm, USDM_TOP100_LOB_TRADE_DATASET) => {
+            Ok(stream_types_for_dataset(Market::Usdm, USDM_TOP100_LOB_TRADE_DATASET))
         }
         (Market::Usdm, USDM_TOP100_LOB_DATASET) => Ok(stream_types_for_market(Market::Usdm)),
         _ => anyhow::bail!("unsupported recovery market/dataset identity: {market:?}/{dataset}"),
@@ -5774,6 +5835,10 @@ mod tests {
             stream_types_for_recovery(Market::Usdm, "usdm_perpetual_top100_lob").unwrap(),
             vec!["depth@100ms".to_owned()]
         );
+        assert_eq!(
+            stream_types_for_recovery(Market::Usdm, USDM_TOP100_LOB_TRADE_DATASET).unwrap(),
+            vec!["depth@100ms".to_owned(), "aggTrade".to_owned()]
+        );
         assert!(stream_types_for_recovery(Market::Usdm, "unexpected").is_err());
     }
 
@@ -7255,6 +7320,75 @@ mod tests {
             usdm_config.stream_types(),
             ["depth@100ms"]
         );
+    }
+
+    #[test]
+    fn combined_usdm_dataset_subscribes_depth_and_aggregate_trades_only() {
+        let mut config = test_config("http://unused".into());
+        config.market = Market::Usdm;
+        config.dataset = USDM_TOP100_LOB_TRADE_DATASET.into();
+        config.symbols = (0..100).map(|index| format!("S{index:03}USDT")).collect();
+        config.ws_shard_size = 25;
+
+        assert_eq!(config.stream_types(), ["depth@100ms", "aggTrade"]);
+        let shards = config.stream_shards();
+        assert_eq!(shards.len(), 8);
+        assert_eq!(
+            shards.iter().map(|shard| shard.streams.len()).sum::<usize>(),
+            200
+        );
+        assert_eq!(
+            shards
+                .iter()
+                .filter(|shard| shard
+                    .streams
+                    .iter()
+                    .all(|stream| stream.ends_with("@depth@100ms")))
+                .count(),
+            4
+        );
+        assert_eq!(
+            shards
+                .iter()
+                .filter(|shard| shard
+                    .streams
+                    .iter()
+                    .all(|stream| stream.ends_with("@aggTrade")))
+                .count(),
+            4
+        );
+        assert!(shards.iter().all(|shard| shard.streams.iter().all(|stream| {
+            stream.ends_with("@depth@100ms") || stream.ends_with("@aggTrade")
+        })));
+    }
+
+    #[test]
+    fn combined_usdm_dataset_requires_a_unique_frozen_top100_catalog() {
+        let symbols = (0..100)
+            .map(|index| format!("S{index:03}USDT"))
+            .collect::<Vec<_>>();
+        validate_dataset_contract(Market::Usdm, USDM_TOP100_LOB_TRADE_DATASET, &symbols)
+            .unwrap();
+        assert!(validate_dataset_contract(
+            Market::Spot,
+            USDM_TOP100_LOB_TRADE_DATASET,
+            &symbols
+        )
+        .is_err());
+        assert!(validate_dataset_contract(
+            Market::Usdm,
+            USDM_TOP100_LOB_TRADE_DATASET,
+            &symbols[..99]
+        )
+        .is_err());
+        let mut duplicate = symbols;
+        duplicate[99] = duplicate[0].clone();
+        assert!(validate_dataset_contract(
+            Market::Usdm,
+            USDM_TOP100_LOB_TRADE_DATASET,
+            &duplicate
+        )
+        .is_err());
     }
 
     #[test]

@@ -1,0 +1,36 @@
+[Unit]
+Description=Monday Binance USD-M private account event archiver
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/data
+ConditionPathIsMountPoint=/data
+
+[Service]
+Type=simple
+User=hftcollector
+Group=hftcollector
+LoadCredential=binance-account.json:/etc/monday/credentials/binance-account.json
+ExecStart=/opt/monday/bin/binance-usdm-account-archiver --output-root /data/monday/spool/binance-usdm-account --segment-seconds 300 --account-secret-file %d/binance-account.json
+Restart=always
+RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=600
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+StateDirectory=hft-collector
+ReadWritePaths=/data/monday/spool/binance-usdm-account
+RestrictAddressFamilies=AF_INET AF_INET6
+UMask=0077
+CPUQuota=20%
+MemoryHigh=256M
+MemoryMax=384M
+
+[Install]
+WantedBy=multi-user.target

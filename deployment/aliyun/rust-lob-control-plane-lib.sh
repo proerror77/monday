@@ -1111,7 +1111,7 @@ monday_verify_production_runtime_assets() {
   [[ $(grep -c '^Restart=' "$upload" || true) -eq 0 ]] || return 1
 
   monday_validate_production_env "$spot_env" spot spot_all || return 1
-  monday_validate_production_env "$usdm_env" usdm usdm_perpetual_top100_lob || return 1
+  monday_validate_production_env "$usdm_env" usdm usdm_perpetual_top100_lob_trade || return 1
   target=$(monday_root_join "$root" "opt/monday/releases/binance-lob-archiver/$payload/binance-lob-archiver") || return 1
   monday_file_direct "$target" || return 1
   [[ -x $target && $(monday_sha256_file "$target") == "$payload" ]] || return 1
@@ -1125,7 +1125,7 @@ monday_verify_production_runtime_assets() {
     --arg spot_market spot --arg spot_dataset spot_all \
     --arg spot_symbols "$(monday_env_value "$spot_env" SYMBOLS)" \
     --arg spot_spool /data/monday/spool/binance-lob/spot \
-    --arg usdm_market usdm --arg usdm_dataset usdm_perpetual_top100_lob \
+    --arg usdm_market usdm --arg usdm_dataset usdm_perpetual_top100_lob_trade \
     --arg usdm_symbols "$(monday_env_value "$usdm_env" SYMBOLS)" \
     --arg usdm_spool /data/monday/spool/binance-lob/usdm \
     '{spot:{market:$spot_market,dataset:$spot_dataset,symbols:$spot_symbols,shard_id:"all",spool_dir:$spot_spool,oss_bucket:"monday-lob-apne1-1045353359",oss_endpoint:"oss-ap-northeast-1-internal.aliyuncs.com",oss_region:"ap-northeast-1",aliyun_profile:"ecs-role"},usdm:{market:$usdm_market,dataset:$usdm_dataset,symbols:$usdm_symbols,shard_id:"all",spool_dir:$usdm_spool,oss_bucket:"monday-lob-apne1-1045353359",oss_endpoint:"oss-ap-northeast-1-internal.aliyuncs.com",oss_region:"ap-northeast-1",aliyun_profile:"ecs-role",ws_shard_size:25}}') || return 1
@@ -1662,7 +1662,7 @@ monday_validate_v2_gate() {
             and .oss_endpoint == "oss-ap-northeast-1-internal.aliyuncs.com"
             and .oss_region == "ap-northeast-1" and .aliyun_profile == "ecs-role")
           and (.usdm | type == "object"
-            and .market == "usdm" and .dataset == "usdm_perpetual_top100_lob"
+            and .market == "usdm" and .dataset == "usdm_perpetual_top100_lob_trade"
             and .shard_id == "all" and .ws_shard_size == 25
             and .spool_dir == "/data/monday/spool/binance-lob/usdm"
             and .oss_bucket == "monday-lob-apne1-1045353359"

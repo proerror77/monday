@@ -211,7 +211,7 @@ and (.production_runtime | type == "object"
       and .oss_endpoint == "oss-ap-northeast-1-internal.aliyuncs.com"
       and .oss_region == "ap-northeast-1" and .aliyun_profile == "ecs-role")
     and (.usdm | type == "object"
-      and .market == "usdm" and .dataset == "usdm_perpetual_top100_lob"
+      and .market == "usdm" and .dataset == "usdm_perpetual_top100_lob_trade"
       and .shard_id == "all" and .ws_shard_size == 25
       and .spool_dir == "/data/monday/spool/binance-lob/usdm"
       and .oss_bucket == "monday-lob-apne1-1045353359"

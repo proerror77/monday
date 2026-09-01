@@ -267,7 +267,7 @@ Governed datasets and their completeness rules:
 | Dataset | Lake prefix | Rule |
 | --- | --- | --- |
 | `binance-spot` | `venue=binance/market=spot/dataset=spot_all/shard=all/` | hour present; each `*.jsonl.zst` carries `.manifest.json` + `._SUCCESS` |
-| `binance-usdm` | `venue=binance/market=usdm/dataset=usdm_perpetual_top100_lob/shard=all/` | same triplet |
+| `binance-usdm` | `venue=binance/market=usdm/dataset=usdm_perpetual_top100_lob_trade/shard=all/` | same triplet |
 | `bybit-options` | `venue=bybit/market=option/dataset=options_quotes/` | hour present; each `*.ndjson.zst` carries its `.zst`-stripped `.manifest.json` (no `_SUCCESS` by design) |
 | `polymarket-crypto-expiry` | `venue=polymarket/dataset=crypto_expiry/` | hour present; triplet |
 | `binance-usdm-reference` | `venue=binance_usdm/dataset=reference/` | hour presence only (batch-partitioned, listed with `-d`) |
@@ -971,7 +971,7 @@ segments, isolated spools, and isolated OSS datasets:
 | Market | Shadow spool | Shadow dataset |
 | --- | --- | --- |
 | Spot | `/data/monday/spool/binance-lob-rust-shadow/spot` | `spot_all_rust_shadow` |
-| USD-M | `/data/monday/spool/binance-lob-rust-shadow/usdm` | `usdm_perpetual_top100_lob_rust_shadow` |
+| USD-M | `/data/monday/spool/binance-lob-rust-shadow/usdm` | `usdm_perpetual_top100_lob_trade_rust_shadow` |
 
 The dataset and shard identifiers remain the canonical lane names; every
 manifest's explicit symbol list and catalog digest are the authority for its
@@ -982,10 +982,11 @@ merged exact-frame parser E2E remains the parser evidence.
 
 Each session proves the exact expected subscription set on every WebSocket
 shard with `LIST_SUBSCRIPTIONS` before it requests snapshots. Only a
-`binance.market_tape.v2` candidate is eligible for the V2 Gate; it declares its per-symbol stream-type list
-(`depth@100ms`, `aggTrade`, `trade`, `bookTicker`, plus USD-M-only
-`forceOrder`) in the manifest and every `session_start` row, and coverage is
-verified against that declared list. Historical `binance.market_tape.v1`
+`binance.market_tape.v2` candidate is eligible for the V2 Gate; it declares its
+dataset-specific per-symbol stream-type list in the manifest and every
+`session_start` row. Spot keeps the full public tape, while the USD-M combined
+dataset declares `depth@100ms` and `aggTrade`; coverage is verified against that
+declared list. Historical `binance.market_tape.v1`
 evidence remains readable for audit only; it cannot authorize a new V2 release,
 Gate, or cutover.
 Every segment also retains the sorted stream list returned for each shard in a
@@ -998,9 +999,9 @@ full-family coverage without weakening the depth-only readiness fields. A
 symbol that receives no depth or trade event during
 a segment is complete only when it has an unchanged two-sided snapshot-backed
 checkpoint and verified stream coverage; the collector never invents a diff or
-trade for a static symbol. Every segment must still contain at least one real
-`agg_trade` for its market dataset, and a v2 segment must additionally carry
-`raw_trade` and `book_ticker` events for the same scope.
+trade for a static symbol. Every combined USD-M segment must contain real
+`agg_trade` evidence, while Spot retains its stricter aggregate-trade,
+raw-trade, and book-ticker checks.
 
 ### 2. Run the short production-catalog gate
 
