@@ -6,8 +6,7 @@ use data::binance_lob_replay::{
 };
 use data::binance_market_tape::AggregateTrade;
 use data::binance_market_tape_artifact::{
-    seal_binance_market_tape_triplet,
-    verify_binance_market_tape_series_with_required_trade_and_lob_summaries,
+    seal_binance_market_tape_triplet, verify_binance_market_tape_series_for_strict_gate,
     BinanceMarketTapeTriplet, BinanceMarketTapeTrustAnchor, ReplayedBinanceBookEvent,
     VerifiedBinanceMarketTapeSeries,
 };
@@ -319,6 +318,7 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         .context("bucket size overflow")?;
     let mut replay = Replay::new(bucket_ns, args.top_depth);
     let mut aggregate_trades = Vec::new();
+    let mut has_aggregate_trades = None;
     for series in &verified_series {
         let verified = series.verified();
         let book = verified
@@ -331,15 +331,15 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
                     series.session_id()
                 )
             })?;
-        if verified
+        let series_has_aggregate_trades = verified
             .segments()
             .iter()
-            .all(|segment| !segment.trade_summaries.contains_key(&symbol))
+            .any(|segment| segment.trade_summaries.contains_key(&symbol));
+        if has_aggregate_trades
+            .replace(series_has_aggregate_trades)
+            .is_some_and(|previous| previous != series_has_aggregate_trades)
         {
-            bail!(
-                "verified market-tape series {} does not contain aggregate trades for requested symbol {symbol}",
-                series.session_id()
-            );
+            bail!("verified market-tape series mix LOB-only and aggregate-trade modalities");
         }
         aggregate_trades.extend(
             verified
@@ -350,6 +350,7 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         );
         replay.consume(book.events())?;
     }
+    let has_aggregate_trades = has_aggregate_trades.unwrap_or(false);
 
     let revision = source_revision(&source_segments);
     let created_at = Utc::now();
@@ -367,6 +368,7 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
     let rows = materialize_rows(
         &replay.samples,
         &aggregate_trades,
+        has_aggregate_trades,
         args,
         &source_revisions,
         &symbol,
@@ -406,10 +408,14 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         instrument_type: args.market.as_str().to_string(),
         symbol: symbol.clone(),
         replay_clock: CEX_REPLAY_CLOCK_RECEIVED_AT_NS.to_string(),
-        required_modalities: BTreeSet::from([
-            CEX_MODALITY_LOB.to_string(),
-            CEX_MODALITY_AGGREGATE_TRADE.to_string(),
-        ]),
+        required_modalities: if has_aggregate_trades {
+            BTreeSet::from([
+                CEX_MODALITY_LOB.to_string(),
+                CEX_MODALITY_AGGREGATE_TRADE.to_string(),
+            ])
+        } else {
+            BTreeSet::from([CEX_MODALITY_LOB.to_string()])
+        },
         source_segments: source_segments
             .iter()
             .map(|segment| CexReplaySegmentIdentity {
@@ -503,7 +509,7 @@ fn verify_segments(
         sealed.push(seal_binance_market_tape_triplet(&triplet, &trust)?);
     }
     Ok((
-        verify_binance_market_tape_series_with_required_trade_and_lob_summaries(sealed)?,
+        verify_binance_market_tape_series_for_strict_gate(sealed)?,
         paths,
     ))
 }
@@ -919,6 +925,7 @@ fn sample_book(
 fn materialize_rows(
     samples: &[BookSample],
     aggregate_trades: &[AggregateTrade],
+    has_aggregate_trades: bool,
     args: &Args,
     source_revisions: &BTreeMap<String, String>,
     symbol: &str,
@@ -1014,6 +1021,16 @@ fn materialize_rows(
             ),
             ("spread_bps".to_string(), current.spread_bps),
         ]);
+        if !has_aggregate_trades {
+            for field in [
+                "aggregate_trade_base_volume",
+                "aggregate_trade_count",
+                "aggregate_trade_flow_imbalance",
+                "aggregate_trade_quote_volume",
+            ] {
+                features.remove(field);
+            }
+        }
         if let Some(value) = current.weighted_book_imbalance_top5 {
             features.insert("weighted_book_imbalance_top5".to_string(), value);
         }
@@ -1023,7 +1040,11 @@ fn materialize_rows(
         if let Some(value) = current.vwap_center_deviation_top5_bps {
             features.insert("vwap_center_deviation_top5_bps".to_string(), value);
         }
-        let modalities = BTreeSet::from([DataModality::Lob, DataModality::TradeTick]);
+        let modalities = if has_aggregate_trades {
+            BTreeSet::from([DataModality::Lob, DataModality::TradeTick])
+        } else {
+            BTreeSet::from([DataModality::Lob])
+        };
         if !label.is_finite() || features.values().any(|value| !value.is_finite()) {
             bail!("materialized feature or label is not finite");
         }
@@ -1145,7 +1166,7 @@ mod tests {
     use clap::CommandFactory;
     use data::binance_market_tape::{
         AggregateTrade, AggregateTradeSummaryBuilder, LobContinuitySummaryBuilder,
-        AGGREGATE_TRADE_SUMMARY_CONTRACT,
+        AGGREGATE_TRADE_SUMMARY_CONTRACT, MARKET_TAPE_SCHEMA_V2,
     };
     use data::binance_usdm_reference::{
         ActivePerpetualContract, CompleteReferenceBatch, MarkIndexFundingObservation,
@@ -1275,6 +1296,29 @@ mod tests {
             diff(6_400, 181, 181, 180, json!([]), json!([["101.5", "5"]])),
             json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(6_500),"type":"checkpoint","session_id":"session-1","symbol":"BTCUSDT","last_update_id":181,"synced":true,"bridged":true,"continuity_complete":true,"stream_coverage_verified":true,"bids":[["100","12"],["99","5"],["98","4"],["97","3"],["96","2"]],"asks":[["101.5","5"],["102","4"],["103","6"],["104","5"],["105","4"],["106","3"]],"reason":"test","replay_safe":true}),
         ]
+    }
+
+    fn lob_only_rows(market: &str) -> Vec<Value> {
+        let mut rows = valid_rows(market)
+            .into_iter()
+            .filter(|row| row["type"] != "agg_trade")
+            .collect::<Vec<_>>();
+        for row in &mut rows {
+            row["schema"] = json!(MARKET_TAPE_SCHEMA_V2);
+        }
+        let session = rows
+            .iter_mut()
+            .find(|row| row["type"] == "session_start")
+            .unwrap();
+        session["websocket_shards"] = json!(1);
+        session["websocket_streams"] = json!(1);
+        session["stream_types"] = json!(["depth@100ms"]);
+        let coverage = rows
+            .iter_mut()
+            .find(|row| row["type"] == "stream_coverage")
+            .unwrap();
+        coverage["shards"] = json!([["btcusdt@depth@100ms"]]);
+        rows
     }
 
     fn shift_rows(rows: &mut [Value], delta_ns: u64) {
@@ -1486,18 +1530,21 @@ mod tests {
                 .filter_map(|row| row["symbol"].as_str())
                 .map(str::to_string)
                 .collect::<BTreeSet<_>>();
+            let schema = rows[0]["schema"].as_str().unwrap();
+            let lob_only = schema == MARKET_TAPE_SCHEMA_V2
+                && !rows.iter().any(|row| row["type"] == "agg_trade");
             let manifest_value = json!({
-                "schema": "binance.market_tape.v1",
+                "schema": schema,
                 "venue": "binance",
                 "market": market.as_str(),
-                "dataset": format!("{}_all", market.as_str()),
+                "dataset": if lob_only { "usdm_perpetual_top100_lob".to_string() } else { format!("{}_all", market.as_str()) },
                 "shard_id": "all",
                 "mode": "diff",
                 "symbols": ["BTCUSDT"],
                 "security_token_symbols": [],
                 "excluded_symbols": [],
                 "snapshot_limit": 1_000,
-                "replay_scope": "captured_aggregate_trades_plus_snapshot_seed_plus_sequence_checked_diffs",
+                "replay_scope": if lob_only { "captured_snapshot_seed_plus_sequence_checked_diffs" } else { "captured_aggregate_trades_plus_snapshot_seed_plus_sequence_checked_diffs" },
                 "venue_depth_complete": false,
                 "events": rows.len(),
                 "event_types": event_types,
@@ -1515,11 +1562,12 @@ mod tests {
                 "file": "part-1.jsonl.zst",
                 "bytes": data.metadata().unwrap().len(),
                 "sha256": content_sha256,
-                "trade_representation": "aggregate_trade_only",
-                "price_surface_derivation": "latest aggregate trade price",
-                "trade_summary_contract": AGGREGATE_TRADE_SUMMARY_CONTRACT,
-                "trade_summaries": trade_summaries.finish().unwrap(),
-                "lob_continuity": lob_continuity.finish().unwrap()
+                "trade_representation": (!lob_only).then_some("aggregate_trade_only"),
+                "price_surface_derivation": (!lob_only).then_some("latest aggregate trade price"),
+                "trade_summary_contract": (!lob_only).then_some(AGGREGATE_TRADE_SUMMARY_CONTRACT),
+                "trade_summaries": (!lob_only).then(|| trade_summaries.finish().unwrap()),
+                "lob_continuity": lob_continuity.finish().unwrap(),
+                "stream_types": (schema == MARKET_TAPE_SCHEMA_V2).then(|| vec!["depth@100ms"])
             });
             let mut manifest_bytes = serde_json::to_vec(&manifest_value).unwrap();
             manifest_bytes.push(b'\n');
@@ -1613,11 +1661,7 @@ mod tests {
         let fixture = Fixture::new(Market::Usdm, &valid_rows("usdm"));
         let mut manifest: Value =
             serde_json::from_slice(&std::fs::read(&fixture.manifest).unwrap()).unwrap();
-        for field in [
-            "trade_summary_contract",
-            "trade_summaries",
-            "lob_continuity",
-        ] {
+        for field in ["trade_summary_contract", "trade_summaries"] {
             manifest.as_object_mut().unwrap().remove(field);
         }
         let mut bytes = serde_json::to_vec(&manifest).unwrap();
@@ -1739,6 +1783,28 @@ mod tests {
                 fixture.references[0].data_sha256
             ))
             .is_file());
+    }
+
+    #[test]
+    fn materializes_production_top100_lob_without_synthetic_trades() {
+        let fixture = Fixture::new(Market::Usdm, &lob_only_rows("usdm"));
+        let published = materialize(&fixture.args()).unwrap();
+        let rows = BufReader::new(File::open(&published.report.artifact_path).unwrap())
+            .lines()
+            .map(|line| serde_json::from_str::<PointInTimeFeatureRow>(&line.unwrap()).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            published.report.snapshot.required_modalities,
+            BTreeSet::from([CEX_MODALITY_LOB.to_string()])
+        );
+        assert_eq!(rows[0].modalities, BTreeSet::from([DataModality::Lob]));
+        assert!(rows[0].features.contains_key("ofi_top5"));
+        assert!(rows[0].features.contains_key("mid_return_1"));
+        assert!(!rows[0]
+            .features
+            .keys()
+            .any(|name| name.starts_with("aggregate_trade_")));
     }
 
     #[test]

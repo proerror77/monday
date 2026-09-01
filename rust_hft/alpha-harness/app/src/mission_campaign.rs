@@ -19,7 +19,10 @@ use crate::{
         cex_global_holdout_claim_object, validate_dns_label,
     },
 };
-use alpha_domain::{canonical_json_hash, CexBaselineGateV1, CexFactorBankRevisionV2};
+use alpha_domain::{
+    canonical_json_hash, factor_ast_source_features, CandidateEvaluation, CexBaselineFailureCodeV1,
+    CexBaselineGateV1, CexFactorBankRevisionV2, CexFactorRejectionCodeV1,
+};
 use alpha_engine::engines::CexFactorBankMctsResultV1;
 use alpha_engine::llm::{HypothesisArtifact, LlmConfig, OpenAiCompatibleClient};
 use anyhow::{bail, Context};
@@ -38,7 +41,7 @@ use zip::ZipArchive;
 const CAMPAIGN_FREEZE_SCHEMA_V1: &str = "cex-campaign-freeze-v1";
 const CAMPAIGN_INPUTS_SCHEMA_V1: &str = "monday.cex_campaign_inputs.v1";
 const CAMPAIGN_REQUEST_SCHEMA_V4: &str = "cex-campaign-request-v4";
-const CAMPAIGN_RESULT_SCHEMA_V4: &str = "cex-campaign-result-v4";
+const CAMPAIGN_RESULT_SCHEMA_V5: &str = "cex-campaign-result-v5";
 const CAMPAIGN_IDENTITY_SCHEMA_V4: &str = "cex-campaign-identity-v4";
 const STOP_RULE_V2: &str = "bounded_multi_round_single_finalize_v2";
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
@@ -174,6 +177,39 @@ struct CampaignIdReport {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct CampaignEvaluationFeedbackV1 {
+    passed: bool,
+    score: f64,
+    time_series_ic: Option<f64>,
+    time_series_rank_ic: Option<f64>,
+    cumulative_net_return: f64,
+    max_drawdown: f64,
+    net_sharpe: f64,
+    trade_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct CampaignFactorFeedbackV1 {
+    source_features: Vec<String>,
+    rejection_codes: Vec<CexFactorRejectionCodeV1>,
+    evaluation: Option<CampaignEvaluationFeedbackV1>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct CampaignRoundFeedbackV1 {
+    factor_attempts: usize,
+    accepted_factors: usize,
+    factors: Vec<CampaignFactorFeedbackV1>,
+    baseline_gate_passed: bool,
+    baseline_failure_codes: Vec<CexBaselineFailureCodeV1>,
+    ridge: Option<CampaignEvaluationFeedbackV1>,
+    cart: Option<CampaignEvaluationFeedbackV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct CampaignMissionLedgerV1 {
     round_id: String,
     seed: u64,
@@ -194,6 +230,7 @@ struct CampaignMissionLedgerV1 {
     selected_score: Option<f64>,
     consumed_trials: usize,
     termination_reason: String,
+    feedback: CampaignRoundFeedbackV1,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -361,6 +398,7 @@ fn campaign_learning_prompt(
             "round_id": round.round_id,
             "termination_reason": round.termination_reason,
             "consumed_trials": round.consumed_trials,
+            "feedback": round.feedback,
         })).collect::<Vec<_>>(),
     });
     format!(
@@ -694,7 +732,7 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
         };
 
     let result = CampaignResultV1 {
-        schema_version: CAMPAIGN_RESULT_SCHEMA_V4.to_string(),
+        schema_version: CAMPAIGN_RESULT_SCHEMA_V5.to_string(),
         campaign_id: loaded.request.campaign_id.clone(),
         request_sha256: loaded.sha256.clone(),
         build_source_revision: loaded.request.build_source_revision.clone(),
@@ -1091,6 +1129,30 @@ fn collect_round_ledger(
             cart.as_ref(),
         )
         .map_err(anyhow::Error::msg)?;
+    let feedback = CampaignRoundFeedbackV1 {
+        factor_attempts: factor_bank.attempts.len(),
+        accepted_factors: factor_bank.entries.len(),
+        factors: factor_bank
+            .attempts
+            .iter()
+            .map(|attempt| CampaignFactorFeedbackV1 {
+                source_features: factor_ast_source_features(&attempt.canonical_ast),
+                rejection_codes: attempt.rejection_codes.clone(),
+                evaluation: attempt
+                    .evaluation
+                    .as_ref()
+                    .map(|evaluation| campaign_evaluation_feedback(&evaluation.evidence)),
+            })
+            .collect(),
+        baseline_gate_passed: baseline_gate.passed,
+        baseline_failure_codes: baseline_gate.failure_codes.clone(),
+        ridge: ridge
+            .as_ref()
+            .map(|artifact| campaign_evaluation_feedback(&artifact.evaluation)),
+        cart: cart
+            .as_ref()
+            .map(|artifact| campaign_evaluation_feedback(&artifact.evaluation)),
+    };
     let strategy_path = results.join("combination-walk-forward.json");
     let subset_result = load_round_subset_result(&results)?;
     let consumed_trials = factor_bank.attempts.len()
@@ -1169,7 +1231,21 @@ fn collect_round_ledger(
         selected_score,
         consumed_trials,
         termination_reason,
+        feedback,
     })
+}
+
+fn campaign_evaluation_feedback(evaluation: &CandidateEvaluation) -> CampaignEvaluationFeedbackV1 {
+    CampaignEvaluationFeedbackV1 {
+        passed: evaluation.passed,
+        score: evaluation.score,
+        time_series_ic: evaluation.metrics.predictive.time_series_ic,
+        time_series_rank_ic: evaluation.metrics.predictive.time_series_rank_ic,
+        cumulative_net_return: evaluation.metrics.cumulative_net_return,
+        max_drawdown: evaluation.metrics.max_drawdown,
+        net_sharpe: evaluation.metrics.net_sharpe,
+        trade_count: evaluation.metrics.trade_count,
+    }
 }
 
 fn campaign_round_claim_urls(
@@ -1336,7 +1412,7 @@ fn validate_negative_campaign_result(
     result: &CampaignResultV1,
     result_sha256: &str,
 ) -> anyhow::Result<()> {
-    if result.schema_version != CAMPAIGN_RESULT_SCHEMA_V4
+    if result.schema_version != CAMPAIGN_RESULT_SCHEMA_V5
         || result.campaign_id != loaded.request.campaign_id
         || result.request_sha256 != loaded.sha256
         || result.build_source_revision != loaded.request.build_source_revision
@@ -1384,8 +1460,88 @@ fn validate_negative_campaign_result(
         }
         normalized_sha256("Campaign round Mission", &round.mission_sha256)?;
         normalized_sha256("Campaign round result", &round.result_bundle_sha256)?;
+        validate_campaign_round_feedback(
+            &round.feedback,
+            loaded.request.research_plan.max_candidates()?,
+        )?;
     }
     Ok(())
+}
+
+fn validate_campaign_round_feedback(
+    feedback: &CampaignRoundFeedbackV1,
+    max_factors: usize,
+) -> anyhow::Result<()> {
+    let allowed_fields = allowed_research_feature_fields();
+    if feedback.factor_attempts != feedback.factors.len()
+        || feedback.factor_attempts > max_factors
+        || feedback.accepted_factors
+            != feedback
+                .factors
+                .iter()
+                .filter(|factor| {
+                    factor.rejection_codes.is_empty()
+                        && factor
+                            .evaluation
+                            .as_ref()
+                            .is_some_and(|evaluation| evaluation.passed)
+                })
+                .count()
+        || feedback.factors.iter().any(|factor| {
+            factor.source_features.is_empty()
+                || factor
+                    .source_features
+                    .iter()
+                    .any(|field| !allowed_fields.contains(field))
+                || (factor.rejection_codes.is_empty()
+                    != factor
+                        .evaluation
+                        .as_ref()
+                        .is_some_and(|evaluation| evaluation.passed))
+                || factor
+                    .evaluation
+                    .as_ref()
+                    .is_some_and(|evaluation| !valid_campaign_evaluation_feedback(evaluation))
+        })
+    {
+        bail!("Campaign result factor feedback is invalid");
+    }
+    let baselines_match = match (&feedback.ridge, &feedback.cart) {
+        (None, None) => {
+            feedback.accepted_factors == 0
+                && !feedback.baseline_gate_passed
+                && feedback.baseline_failure_codes == [CexBaselineFailureCodeV1::EmptyFactorBank]
+        }
+        (Some(ridge), Some(cart)) => {
+            feedback.accepted_factors > 0
+                && valid_campaign_evaluation_feedback(ridge)
+                && valid_campaign_evaluation_feedback(cart)
+                && feedback.baseline_gate_passed == (ridge.passed && cart.passed)
+                && feedback.baseline_gate_passed == feedback.baseline_failure_codes.is_empty()
+                && (feedback.baseline_gate_passed
+                    || feedback.baseline_failure_codes
+                        == [CexBaselineFailureCodeV1::InsufficientEvidence])
+        }
+        _ => false,
+    };
+    if !baselines_match {
+        bail!("Campaign result baseline feedback is invalid");
+    }
+    Ok(())
+}
+
+fn valid_campaign_evaluation_feedback(feedback: &CampaignEvaluationFeedbackV1) -> bool {
+    feedback.score.is_finite()
+        && feedback
+            .time_series_ic
+            .is_none_or(|value| value.is_finite() && (-1.0..=1.0).contains(&value))
+        && feedback
+            .time_series_rank_ic
+            .is_none_or(|value| value.is_finite() && (-1.0..=1.0).contains(&value))
+        && feedback.cumulative_net_return.is_finite()
+        && feedback.max_drawdown.is_finite()
+        && (0.0..=1.0).contains(&feedback.max_drawdown)
+        && feedback.net_sharpe.is_finite()
 }
 
 pub(crate) fn serialize_request(request: &CampaignRequest) -> anyhow::Result<Vec<u8>> {
@@ -2119,6 +2275,8 @@ mod tests {
 
         let prompt = campaign_learning_prompt(&loaded, &result, &result_sha256);
         assert!(!prompt.contains(&loaded.request.feature_url));
+        assert!(prompt.contains("evaluation_failed"));
+        assert!(prompt.contains("baseline_failure_codes"));
         let artifact = HypothesisArtifact {
             hypothesis: "Near-depth concentration changes predict forward return".to_string(),
             field: "near_depth_concentration_skew_top5".to_string(),
@@ -2277,6 +2435,7 @@ mod tests {
             selected_score: Some(10.0),
             consumed_trials: 4,
             termination_reason: "pre_holdout_candidate_kept".to_string(),
+            feedback: CampaignRoundFeedbackV1::default(),
         };
         let higher_hash = CampaignMissionLedgerV1 {
             round_id: "r2".to_string(),
@@ -2298,6 +2457,7 @@ mod tests {
             selected_score: Some(10.0),
             consumed_trials: 4,
             termination_reason: "pre_holdout_candidate_kept".to_string(),
+            feedback: CampaignRoundFeedbackV1::default(),
         };
 
         assert!(compare_round_selection(&higher_hash, &lower_hash).is_lt());
@@ -2818,7 +2978,7 @@ mod tests {
         let result: serde_json::Value =
             serde_json::from_slice(&std::fs::read(work_dir.join("campaign-result.json")).unwrap())
                 .unwrap();
-        assert_eq!(result["schema_version"], CAMPAIGN_RESULT_SCHEMA_V4);
+        assert_eq!(result["schema_version"], CAMPAIGN_RESULT_SCHEMA_V5);
         assert_eq!(
             result["campaign_inputs_sha256"],
             serde_json::json!(request.campaign_inputs_sha256)
@@ -3240,9 +3400,10 @@ mod tests {
     }
 
     fn negative_campaign_result(loaded: &LoadedRequest) -> CampaignResultV1 {
-        let consumed_per_round = loaded.request.declared_total_trials / loaded.request.rounds.len();
+        let factor_attempts = loaded.request.research_plan.max_candidates().unwrap();
+        let consumed_per_round = factor_attempts;
         CampaignResultV1 {
-            schema_version: CAMPAIGN_RESULT_SCHEMA_V4.to_string(),
+            schema_version: CAMPAIGN_RESULT_SCHEMA_V5.to_string(),
             campaign_id: loaded.request.campaign_id.clone(),
             request_sha256: loaded.sha256.clone(),
             build_source_revision: loaded.request.build_source_revision.clone(),
@@ -3280,6 +3441,21 @@ mod tests {
                     selected_score: None,
                     consumed_trials: consumed_per_round,
                     termination_reason: "search_exhausted".to_string(),
+                    feedback: CampaignRoundFeedbackV1 {
+                        factor_attempts,
+                        accepted_factors: 0,
+                        factors: (0..factor_attempts)
+                            .map(|_| CampaignFactorFeedbackV1 {
+                                source_features: vec!["book_imbalance".to_string()],
+                                rejection_codes: vec![CexFactorRejectionCodeV1::EvaluationFailed],
+                                evaluation: None,
+                            })
+                            .collect(),
+                        baseline_gate_passed: false,
+                        baseline_failure_codes: vec![CexBaselineFailureCodeV1::EmptyFactorBank],
+                        ridge: None,
+                        cart: None,
+                    },
                 })
                 .collect(),
             selected_round_id: None,
