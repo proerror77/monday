@@ -1,10 +1,14 @@
 use crate::{
     cli::{
         print_json, CampaignExecuteArgs, CampaignFinalizeArgs, CampaignFreezeArgs, CampaignIdArgs,
-        ExecuteMissionArgs, BUILD_SOURCE_REVISION,
+        CampaignLearnArgs, ExecuteMissionArgs, BUILD_SOURCE_REVISION,
     },
     data_mission, mission_dispatch,
-    mission_render::render_cex_bundle,
+    mission_render::{
+        allowed_research_feature_fields, render_cex_bundle, required_named_template_fields,
+        CexCampaignLlmProvenanceV1, CexCampaignResearchParentV1, CexCampaignResearchPlanV1,
+        MAX_RESEARCH_PLAN_GENERATION,
+    },
     mission_runner::{
         execute_report, fetch_to_file, finalize_existing_search_round, normalized_sha256,
         publish_immutable_file, recover_execution_report_from_published_result, valid_git_revision,
@@ -17,6 +21,7 @@ use crate::{
 };
 use alpha_domain::{canonical_json_hash, CexBaselineGateV1, CexFactorBankRevisionV2};
 use alpha_engine::engines::CexFactorBankMctsResultV1;
+use alpha_engine::llm::{HypothesisArtifact, LlmConfig, OpenAiCompatibleClient};
 use anyhow::{bail, Context};
 use hft_backtest::config::verify_canonical_replay_artifact_streaming;
 use reqwest::{blocking::Client, redirect::Policy, StatusCode};
@@ -24,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs::File,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -32,16 +37,20 @@ use zip::ZipArchive;
 
 const CAMPAIGN_FREEZE_SCHEMA_V1: &str = "cex-campaign-freeze-v1";
 const CAMPAIGN_INPUTS_SCHEMA_V1: &str = "monday.cex_campaign_inputs.v1";
-const CAMPAIGN_REQUEST_SCHEMA_V3: &str = "cex-campaign-request-v3";
-const CAMPAIGN_RESULT_SCHEMA_V3: &str = "cex-campaign-result-v3";
-const CAMPAIGN_IDENTITY_SCHEMA_V3: &str = "cex-campaign-identity-v3";
+const CAMPAIGN_REQUEST_SCHEMA_V4: &str = "cex-campaign-request-v4";
+const CAMPAIGN_RESULT_SCHEMA_V4: &str = "cex-campaign-result-v4";
+const CAMPAIGN_IDENTITY_SCHEMA_V4: &str = "cex-campaign-identity-v4";
 const STOP_RULE_V2: &str = "bounded_multi_round_single_finalize_v2";
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
 const MAX_CAMPAIGN_RESULT_BYTES: u64 = 1024 * 1024;
 const MAX_RESULT_BUNDLE_FILES: usize = 256;
 
-fn declared_total_trials_for_rounds(round_count: usize) -> anyhow::Result<usize> {
-    crate::mission_render::max_candidates_for_tests()
+fn declared_total_trials_for_rounds(
+    research_plan: &CexCampaignResearchPlanV1,
+    round_count: usize,
+) -> anyhow::Result<usize> {
+    research_plan
+        .max_candidates()?
         .checked_mul(2)
         .and_then(|count| count.checked_mul(round_count))
         .context("campaign declared_total_trials overflowed")
@@ -57,6 +66,7 @@ pub(crate) struct CampaignRequest {
     pub(crate) campaign_inputs_sha256: String,
     pub(crate) producer_source_revision: String,
     pub(crate) producer_image_identity: String,
+    pub(crate) research_plan: CexCampaignResearchPlanV1,
     pub(crate) feature_url: String,
     pub(crate) feature_sha256: String,
     pub(crate) materialization_url: String,
@@ -163,7 +173,7 @@ struct CampaignIdReport {
     matches_request: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct CampaignMissionLedgerV1 {
     round_id: String,
     seed: u64,
@@ -186,7 +196,7 @@ struct CampaignMissionLedgerV1 {
     termination_reason: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct CampaignFinalizationV1 {
     round_id: String,
     precommit_id: String,
@@ -206,9 +216,9 @@ struct CampaignFinalizationV1 {
     promotion_record_sha256: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct CampaignResultV1 {
-    schema_version: &'static str,
+    schema_version: String,
     campaign_id: String,
     request_sha256: String,
     build_source_revision: String,
@@ -216,16 +226,27 @@ struct CampaignResultV1 {
     campaign_inputs_sha256: String,
     producer_source_revision: String,
     producer_image_identity: String,
+    research_plan_sha256: String,
     holdout_id: String,
     declared_total_trials: usize,
     consumed_trials: usize,
-    stop_rule: &'static str,
+    stop_rule: String,
     termination_reason: String,
     rounds: Vec<CampaignMissionLedgerV1>,
     selected_round_id: Option<String>,
     selected_candidate_id: Option<String>,
     selected_candidate_content_hash: Option<String>,
     finalization: Option<CampaignFinalizationV1>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CampaignLearnReport {
+    parent_campaign_id: String,
+    parent_request_sha256: String,
+    parent_campaign_result_sha256: String,
+    research_plan_sha256: String,
+    output: String,
+    reused_existing: bool,
 }
 
 #[derive(Debug)]
@@ -271,6 +292,145 @@ pub fn freeze(args: CampaignFreezeArgs) -> anyhow::Result<()> {
         holdout_id: request.holdout_id.clone(),
         declared_total_trials: request.declared_total_trials,
         output: args.output.display().to_string(),
+    })
+}
+
+pub fn learn(args: CampaignLearnArgs) -> anyhow::Result<()> {
+    let loaded = load_request(&args.request)?;
+    validate_request(&loaded.request)?;
+    let result = load_campaign_result(&args.result)?;
+    let result_sha256 = crate::mission_runner::sha256_file(&args.result)?;
+    if result_sha256 != normalized_sha256("parent Campaign result", &args.result_sha256)? {
+        bail!("parent Campaign result SHA256 mismatch");
+    }
+    validate_negative_campaign_result(&loaded, &result, &result_sha256)?;
+
+    if args.output.try_exists()? {
+        let plan = load_research_plan(&args.output)?;
+        validate_existing_follow_up_plan(&plan, &loaded, &result_sha256)?;
+        return print_json(&campaign_learn_report(
+            &args.output,
+            &loaded,
+            &result_sha256,
+            &plan,
+            true,
+        )?);
+    }
+
+    if args.max_tokens == 0 {
+        bail!("Campaign learning max_tokens must be positive");
+    }
+    if loaded.request.research_plan.generation >= MAX_RESEARCH_PLAN_GENERATION {
+        bail!("Campaign learning exhausted the bounded follow-up generations");
+    }
+    let client = OpenAiCompatibleClient::new(LlmConfig::from_env().map_err(anyhow::Error::msg)?)
+        .map_err(anyhow::Error::msg)?;
+    let prompt = campaign_learning_prompt(&loaded, &result, &result_sha256);
+    let artifact = client
+        .generate_hypothesis_bounded(&prompt, args.max_tokens)
+        .map_err(anyhow::Error::msg)?;
+    let plan = follow_up_plan_from_artifact(&loaded, &result_sha256, artifact)?;
+    write_research_plan_create_once(&args.output, &plan)?;
+    print_json(&campaign_learn_report(
+        &args.output,
+        &loaded,
+        &result_sha256,
+        &plan,
+        false,
+    )?)
+}
+
+fn campaign_learning_prompt(
+    loaded: &LoadedRequest,
+    result: &CampaignResultV1,
+    result_sha256: &str,
+) -> String {
+    let allowed_fields = allowed_research_feature_fields();
+    let evidence = serde_json::json!({
+        "parent_campaign_id": loaded.request.campaign_id,
+        "parent_request_sha256": loaded.sha256,
+        "parent_campaign_result_sha256": result_sha256,
+        "termination_reason": result.termination_reason,
+        "current_research_plan": {
+            "objective": loaded.request.research_plan.objective,
+            "hypothesis": loaded.request.research_plan.hypothesis,
+            "focus_field": loaded.request.research_plan.focus_field,
+            "feature_fields": loaded.request.research_plan.feature_fields,
+        },
+        "rounds": result.rounds.iter().map(|round| serde_json::json!({
+            "round_id": round.round_id,
+            "termination_reason": round.termination_reason,
+            "consumed_trials": round.consumed_trials,
+        })).collect::<Vec<_>>(),
+    });
+    format!(
+        "Propose one falsifiable follow-up hypothesis for a bounded Binance USD-M BTCUSDT 1s/h5/top5 research Campaign. Select exactly one focus field from {allowed_fields:?}, set operator to identity, and set window to null. The deterministic controller will retain required named-template fields and narrow the GP field set; it will test the existing governed atomic templates. You cannot change data, fees, validation thresholds, budgets, holdout, Kubernetes, runtime, risk, or execution authority. Return only the governed hypothesis artifact. Negative Campaign evidence: {evidence}"
+    )
+}
+
+fn follow_up_plan_from_artifact(
+    loaded: &LoadedRequest,
+    result_sha256: &str,
+    artifact: HypothesisArtifact,
+) -> anyhow::Result<CexCampaignResearchPlanV1> {
+    let allowed_fields = allowed_research_feature_fields();
+    if !allowed_fields.iter().any(|field| field == &artifact.field) {
+        bail!("LLM proposed a feature field outside the admitted CEX research fields");
+    }
+    if artifact.operator != "identity" || artifact.window.is_some() {
+        bail!("LLM proposed an operator/window outside the field-focus contract");
+    }
+    let mut feature_fields = required_named_template_fields();
+    feature_fields.push(artifact.field.clone());
+    feature_fields.sort();
+    feature_fields.dedup();
+    if loaded.request.research_plan.focus_field == artifact.field
+        && loaded.request.research_plan.feature_fields == feature_fields
+    {
+        bail!("LLM proposed an unchanged CEX research search focus");
+    }
+    let plan = CexCampaignResearchPlanV1 {
+        schema_version: "cex-campaign-research-plan-v1".to_string(),
+        generation: loaded.request.research_plan.generation + 1,
+        objective: format!(
+            "Evaluate bounded follow-up after {}",
+            loaded.request.campaign_id
+        ),
+        hypothesis: artifact.hypothesis,
+        focus_field: artifact.field,
+        feature_fields,
+        parent: Some(CexCampaignResearchParentV1 {
+            campaign_id: loaded.request.campaign_id.clone(),
+            request_sha256: loaded.sha256.clone(),
+            campaign_result_sha256: result_sha256.to_string(),
+        }),
+        llm: Some(CexCampaignLlmProvenanceV1 {
+            provider: artifact.provider,
+            model: artifact.model,
+            prompt_sha256: artifact.prompt_hash,
+            prompt_tokens: artifact.token_usage.prompt_tokens,
+            completion_tokens: artifact.token_usage.completion_tokens,
+            total_tokens: artifact.token_usage.total_tokens,
+        }),
+    };
+    plan.validate()?;
+    Ok(plan)
+}
+
+fn campaign_learn_report(
+    output: &Path,
+    loaded: &LoadedRequest,
+    result_sha256: &str,
+    plan: &CexCampaignResearchPlanV1,
+    reused_existing: bool,
+) -> anyhow::Result<CampaignLearnReport> {
+    Ok(CampaignLearnReport {
+        parent_campaign_id: loaded.request.campaign_id.clone(),
+        parent_request_sha256: loaded.sha256.clone(),
+        parent_campaign_result_sha256: result_sha256.to_string(),
+        research_plan_sha256: plan.content_hash()?,
+        output: output.display().to_string(),
+        reused_existing,
     })
 }
 
@@ -391,6 +551,7 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
         let rendered = render_cex_bundle(
             &feature_path,
             &materialization_path,
+            &loaded.request.research_plan,
             round.seed,
             loaded.request.declared_total_trials,
         )?;
@@ -533,7 +694,7 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
         };
 
     let result = CampaignResultV1 {
-        schema_version: CAMPAIGN_RESULT_SCHEMA_V3,
+        schema_version: CAMPAIGN_RESULT_SCHEMA_V4.to_string(),
         campaign_id: loaded.request.campaign_id.clone(),
         request_sha256: loaded.sha256.clone(),
         build_source_revision: loaded.request.build_source_revision.clone(),
@@ -541,10 +702,11 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
         campaign_inputs_sha256: loaded.request.campaign_inputs_sha256.clone(),
         producer_source_revision: loaded.request.producer_source_revision.clone(),
         producer_image_identity: loaded.request.producer_image_identity.clone(),
+        research_plan_sha256: loaded.request.research_plan.content_hash()?,
         holdout_id: loaded.request.holdout_id.clone(),
         declared_total_trials: loaded.request.declared_total_trials,
         consumed_trials,
-        stop_rule: STOP_RULE_V2,
+        stop_rule: STOP_RULE_V2.to_string(),
         termination_reason: if finalization.is_some() {
             "campaign_finalized".to_string()
         } else if selected_round.is_some() {
@@ -641,7 +803,13 @@ fn freeze_request(args: &CampaignFreezeArgs) -> anyhow::Result<(CampaignRequest,
         None,
         None,
     )?;
-    let declared_total_trials = declared_total_trials_for_rounds(args.seeds.len())?;
+    let research_plan = args
+        .research_plan
+        .as_deref()
+        .map(load_research_plan)
+        .transpose()?
+        .unwrap_or_else(CexCampaignResearchPlanV1::canonical);
+    let declared_total_trials = declared_total_trials_for_rounds(&research_plan, args.seeds.len())?;
     let probe_seed = *args
         .seeds
         .first()
@@ -649,6 +817,7 @@ fn freeze_request(args: &CampaignFreezeArgs) -> anyhow::Result<(CampaignRequest,
     let rendered = render_cex_bundle(
         &feature_path,
         &materialization_path,
+        &research_plan,
         probe_seed,
         declared_total_trials,
     )?;
@@ -665,6 +834,7 @@ fn freeze_request(args: &CampaignFreezeArgs) -> anyhow::Result<(CampaignRequest,
             &campaign_inputs_sha256,
             &receipt.source_revision,
             &producer_image_identity,
+            &research_plan,
             &build_source_revision,
             &image_identity,
             &campaign_root,
@@ -1092,6 +1262,132 @@ fn load_request(path: &Path) -> anyhow::Result<LoadedRequest> {
     })
 }
 
+fn load_campaign_result(path: &Path) -> anyhow::Result<CampaignResultV1> {
+    let mut file =
+        File::open(path).with_context(|| format!("open Campaign result {}", path.display()))?;
+    if file.metadata()?.len() > MAX_CAMPAIGN_RESULT_BYTES {
+        bail!("Campaign result exceeds {MAX_CAMPAIGN_RESULT_BYTES} bytes");
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse Campaign result {}", path.display()))
+}
+
+fn load_research_plan(path: &Path) -> anyhow::Result<CexCampaignResearchPlanV1> {
+    let mut file = File::open(path)
+        .with_context(|| format!("open CEX Campaign research plan {}", path.display()))?;
+    if file.metadata()?.len() > MAX_REQUEST_BYTES {
+        bail!("CEX Campaign research plan exceeds {MAX_REQUEST_BYTES} bytes");
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let plan: CexCampaignResearchPlanV1 = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse CEX Campaign research plan {}", path.display()))?;
+    plan.validate()?;
+    Ok(plan)
+}
+
+fn write_research_plan_create_once(
+    path: &Path,
+    plan: &CexCampaignResearchPlanV1,
+) -> anyhow::Result<()> {
+    plan.validate()?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    serde_json::to_writer_pretty(temporary.as_file_mut(), plan)?;
+    temporary.as_file_mut().flush()?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist_noclobber(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("create CEX Campaign research plan {}", path.display()))?;
+    Ok(())
+}
+
+fn validate_existing_follow_up_plan(
+    plan: &CexCampaignResearchPlanV1,
+    loaded: &LoadedRequest,
+    result_sha256: &str,
+) -> anyhow::Result<()> {
+    plan.validate()?;
+    let parent = plan
+        .parent
+        .as_ref()
+        .context("existing research plan is not a follow-up")?;
+    if parent.campaign_id != loaded.request.campaign_id
+        || parent.request_sha256 != loaded.sha256
+        || parent.campaign_result_sha256 != result_sha256
+        || plan.generation != loaded.request.research_plan.generation + 1
+    {
+        bail!("existing research plan does not match the parent Campaign evidence");
+    }
+    if plan.focus_field == loaded.request.research_plan.focus_field
+        && plan.feature_fields == loaded.request.research_plan.feature_fields
+    {
+        bail!("existing research plan does not change the parent search focus");
+    }
+    Ok(())
+}
+
+fn validate_negative_campaign_result(
+    loaded: &LoadedRequest,
+    result: &CampaignResultV1,
+    result_sha256: &str,
+) -> anyhow::Result<()> {
+    if result.schema_version != CAMPAIGN_RESULT_SCHEMA_V4
+        || result.campaign_id != loaded.request.campaign_id
+        || result.request_sha256 != loaded.sha256
+        || result.build_source_revision != loaded.request.build_source_revision
+        || result.image_identity != loaded.request.image_identity
+        || result.campaign_inputs_sha256 != loaded.request.campaign_inputs_sha256
+        || result.producer_source_revision != loaded.request.producer_source_revision
+        || result.producer_image_identity != loaded.request.producer_image_identity
+        || result.research_plan_sha256 != loaded.request.research_plan.content_hash()?
+        || result.holdout_id != loaded.request.holdout_id
+        || result.declared_total_trials != loaded.request.declared_total_trials
+        || result.stop_rule != STOP_RULE_V2
+    {
+        bail!("Campaign result does not match the parent request identity");
+    }
+    normalized_sha256("parent Campaign result", result_sha256)?;
+    if result.termination_reason != "campaign_no_candidate"
+        || result.selected_round_id.is_some()
+        || result.selected_candidate_id.is_some()
+        || result.selected_candidate_content_hash.is_some()
+        || result.finalization.is_some()
+        || result.rounds.len() != loaded.request.rounds.len()
+    {
+        bail!("Campaign learning requires one terminal no-candidate result");
+    }
+    let consumed_trials = result
+        .rounds
+        .iter()
+        .try_fold(0_usize, |total, round| {
+            total.checked_add(round.consumed_trials)
+        })
+        .context("Campaign result consumed trial count overflowed")?;
+    if consumed_trials != result.consumed_trials || consumed_trials > result.declared_total_trials {
+        bail!("Campaign result consumed trial count is invalid");
+    }
+    for (round, expected) in result.rounds.iter().zip(&loaded.request.rounds) {
+        if round.round_id != expected.round_id
+            || round.seed != expected.seed
+            || round.request_sha256.as_deref() != Some(loaded.sha256.as_str())
+            || round.result_bundle_sha256 != round.result_readback_bundle_sha256
+            || round.selected_candidate_id.is_some()
+            || round.selected_candidate_content_hash.is_some()
+            || round.selected_score.is_some()
+        {
+            bail!("Campaign result round evidence does not match the parent request");
+        }
+        normalized_sha256("Campaign round Mission", &round.mission_sha256)?;
+        normalized_sha256("Campaign round result", &round.result_bundle_sha256)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn serialize_request(request: &CampaignRequest) -> anyhow::Result<Vec<u8>> {
     serde_json::to_vec_pretty(request).map_err(anyhow::Error::new)
 }
@@ -1102,9 +1398,10 @@ pub(crate) fn valid_request_for_tests() -> CampaignRequest {
 }
 
 pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> {
-    if request.schema_version != CAMPAIGN_REQUEST_SCHEMA_V3 {
-        bail!("campaign request schema_version must be {CAMPAIGN_REQUEST_SCHEMA_V3}");
+    if request.schema_version != CAMPAIGN_REQUEST_SCHEMA_V4 {
+        bail!("campaign request schema_version must be {CAMPAIGN_REQUEST_SCHEMA_V4}");
     }
+    request.research_plan.validate()?;
     validate_campaign_id(&request.campaign_id)?;
     if request.image_identity
         != normalized_sha256("campaign image identity", &request.image_identity)?
@@ -1178,7 +1475,8 @@ pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> 
     if request.rounds.len() < 2 {
         bail!("campaign request must declare at least two rounds");
     }
-    let minimum_total_trials = declared_total_trials_for_rounds(request.rounds.len())?;
+    let minimum_total_trials =
+        declared_total_trials_for_rounds(&request.research_plan, request.rounds.len())?;
     if request.declared_total_trials < minimum_total_trials {
         bail!("campaign declared_total_trials is below the minimum multi-round trial family");
     }
@@ -1248,20 +1546,23 @@ fn build_request_from_parts(
     campaign_inputs_sha256: &str,
     producer_source_revision: &str,
     producer_image_identity: &str,
+    research_plan: &CexCampaignResearchPlanV1,
     build_source_revision: &str,
     image_identity: &str,
     campaign_root: &str,
     holdout_id: &str,
     seeds: &[u64],
 ) -> anyhow::Result<CampaignRequest> {
+    research_plan.validate()?;
     let mut request = CampaignRequest {
-        schema_version: CAMPAIGN_REQUEST_SCHEMA_V3.to_string(),
+        schema_version: CAMPAIGN_REQUEST_SCHEMA_V4.to_string(),
         campaign_id: "placeholder".to_string(),
         build_source_revision: build_source_revision.to_string(),
         image_identity: image_identity.to_string(),
         campaign_inputs_sha256: campaign_inputs_sha256.to_string(),
         producer_source_revision: producer_source_revision.to_string(),
         producer_image_identity: producer_image_identity.to_string(),
+        research_plan: research_plan.clone(),
         feature_url: feature_url.to_string(),
         feature_sha256: feature_sha256.to_string(),
         materialization_url: materialization_url.to_string(),
@@ -1271,7 +1572,7 @@ fn build_request_from_parts(
         replay_manifest_url: replay_manifest_url.to_string(),
         replay_manifest_sha256: replay_manifest_sha256.to_string(),
         holdout_id: holdout_id.to_string(),
-        declared_total_trials: declared_total_trials_for_rounds(seeds.len())?,
+        declared_total_trials: declared_total_trials_for_rounds(research_plan, seeds.len())?,
         rounds: seeds
             .iter()
             .enumerate()
@@ -1518,7 +1819,7 @@ fn signing_action_put(name: &str, object: String, content_type: &str) -> Campaig
 
 pub(crate) fn expected_campaign_id(request: &CampaignRequest) -> anyhow::Result<String> {
     let identity = serde_json::json!({
-        "identity_schema_version": CAMPAIGN_IDENTITY_SCHEMA_V3,
+        "identity_schema_version": CAMPAIGN_IDENTITY_SCHEMA_V4,
         "request_schema_version": request.schema_version,
         "build_source_revision": normalized_source_revision(
             "campaign source revision",
@@ -1537,6 +1838,7 @@ pub(crate) fn expected_campaign_id(request: &CampaignRequest) -> anyhow::Result<
             "campaign producer image identity",
             &request.producer_image_identity,
         )?,
+        "research_plan": &request.research_plan,
         "feature": {
             "object": canonical_tokyo_oss_internal_object("campaign feature", &request.feature_url)?,
             "sha256": normalized_sha256("campaign feature", &request.feature_sha256)?,
@@ -1665,9 +1967,10 @@ fn immutable_publish_conflict(error: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 fn validate_local_test_request(request: &CampaignRequest) -> anyhow::Result<()> {
-    if request.schema_version != CAMPAIGN_REQUEST_SCHEMA_V3 {
-        bail!("campaign request schema_version must be {CAMPAIGN_REQUEST_SCHEMA_V3}");
+    if request.schema_version != CAMPAIGN_REQUEST_SCHEMA_V4 {
+        bail!("campaign request schema_version must be {CAMPAIGN_REQUEST_SCHEMA_V4}");
     }
+    request.research_plan.validate()?;
     validate_campaign_id(&request.campaign_id)?;
     normalized_sha256("campaign image identity", &request.image_identity)?;
     normalized_sha256(
@@ -1691,7 +1994,8 @@ fn validate_local_test_request(request: &CampaignRequest) -> anyhow::Result<()> 
     if request.rounds.len() < 2 {
         bail!("campaign request must declare at least two rounds");
     }
-    let minimum_total_trials = declared_total_trials_for_rounds(request.rounds.len())?;
+    let minimum_total_trials =
+        declared_total_trials_for_rounds(&request.research_plan, request.rounds.len())?;
     if request.declared_total_trials < minimum_total_trials {
         bail!("campaign declared_total_trials is below the minimum multi-round trial family");
     }
@@ -1807,6 +2111,63 @@ mod tests {
     }
 
     #[test]
+    fn negative_campaign_creates_one_parent_bound_follow_up_plan() {
+        let loaded = loaded_request_for_learning();
+        let result_sha256 = "9".repeat(64);
+        let result = negative_campaign_result(&loaded);
+        validate_negative_campaign_result(&loaded, &result, &result_sha256).unwrap();
+
+        let prompt = campaign_learning_prompt(&loaded, &result, &result_sha256);
+        assert!(!prompt.contains(&loaded.request.feature_url));
+        let artifact = HypothesisArtifact {
+            hypothesis: "Near-depth concentration changes predict forward return".to_string(),
+            field: "near_depth_concentration_skew_top5".to_string(),
+            operator: "identity".to_string(),
+            window: None,
+            provider: "test".to_string(),
+            model: "test".to_string(),
+            prompt_hash: "8".repeat(64),
+            token_usage: alpha_engine::llm::TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+            },
+        };
+        let plan = follow_up_plan_from_artifact(&loaded, &result_sha256, artifact.clone()).unwrap();
+        validate_existing_follow_up_plan(&plan, &loaded, &result_sha256).unwrap();
+        assert_eq!(plan.generation, 1);
+        assert_eq!(plan.parent.as_ref().unwrap().request_sha256, loaded.sha256);
+        assert_eq!(plan.max_candidates().unwrap(), 12);
+
+        let mut child = loaded.request.clone();
+        child.research_plan = plan.clone();
+        assert_ne!(
+            expected_campaign_id(&child).unwrap(),
+            loaded.request.campaign_id
+        );
+
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("next-plan.json");
+        write_research_plan_create_once(&output, &plan).unwrap();
+        assert_eq!(load_research_plan(&output).unwrap(), plan);
+        assert!(write_research_plan_create_once(&output, &plan).is_err());
+
+        let mut invalid = artifact;
+        invalid.operator = "delta".to_string();
+        invalid.window = Some(5);
+        assert!(follow_up_plan_from_artifact(&loaded, &result_sha256, invalid).is_err());
+    }
+
+    #[test]
+    fn campaign_learning_rejects_result_identity_drift() {
+        let loaded = loaded_request_for_learning();
+        let mut result = negative_campaign_result(&loaded);
+        result.request_sha256 = "7".repeat(64);
+
+        assert!(validate_negative_campaign_result(&loaded, &result, &"9".repeat(64)).is_err());
+    }
+
+    #[test]
     fn validate_request_rejects_http_transport() {
         let mut request = valid_request();
         request.feature_url = request.feature_url.replacen("https://", "http://", 1);
@@ -1888,7 +2249,8 @@ mod tests {
     #[test]
     fn validate_request_rejects_underdeclared_total_trials() {
         let mut request = valid_request();
-        request.declared_total_trials = declared_total_trials_for_rounds(1).unwrap();
+        request.declared_total_trials =
+            declared_total_trials_for_rounds(&request.research_plan, 1).unwrap();
         request.campaign_id = expected_campaign_id(&request).unwrap();
         assert!(validate_request(&request).is_err());
     }
@@ -2040,6 +2402,7 @@ mod tests {
             &"5".repeat(64),
             &"a".repeat(40),
             &"6".repeat(64),
+            &CexCampaignResearchPlanV1::canonical(),
             BUILD_SOURCE_REVISION,
             &"1".repeat(64),
             "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/campaigns",
@@ -2152,6 +2515,7 @@ mod tests {
             image: executor_image_ref.clone(),
             campaign_root: format!("{TEST_ROOT}/campaigns"),
             seeds: vec![7, 11],
+            research_plan: None,
             output: output.clone(),
         })
         .unwrap();
@@ -2200,6 +2564,7 @@ mod tests {
             image: "registry/research-runner:latest".to_string(),
             campaign_root: format!("{TEST_ROOT}/campaigns"),
             seeds: vec![7, 11],
+            research_plan: None,
             output: root.path().join("invalid-freeze.json"),
         })
         .unwrap_err();
@@ -2223,6 +2588,7 @@ mod tests {
             image: executor_image_ref.clone(),
             campaign_root: format!("{TEST_ROOT}/campaigns"),
             seeds: vec![7, 11],
+            research_plan: None,
             output: root.path().join("invalid-replay-freeze.json"),
         })
         .unwrap_err();
@@ -2237,6 +2603,7 @@ mod tests {
             image: executor_image_ref,
             campaign_root: format!("{TEST_ROOT}/campaigns"),
             seeds: vec![7, 11],
+            research_plan: None,
             output: root.path().join("invalid-source-freeze.json"),
         })
         .unwrap_err();
@@ -2451,7 +2818,7 @@ mod tests {
         let result: serde_json::Value =
             serde_json::from_slice(&std::fs::read(work_dir.join("campaign-result.json")).unwrap())
                 .unwrap();
-        assert_eq!(result["schema_version"], CAMPAIGN_RESULT_SCHEMA_V3);
+        assert_eq!(result["schema_version"], CAMPAIGN_RESULT_SCHEMA_V4);
         assert_eq!(
             result["campaign_inputs_sha256"],
             serde_json::json!(request.campaign_inputs_sha256)
@@ -2464,7 +2831,8 @@ mod tests {
             result["producer_image_identity"],
             serde_json::json!(request.producer_image_identity)
         );
-        let declared_total_trials = declared_total_trials_for_rounds(2).unwrap();
+        let declared_total_trials =
+            declared_total_trials_for_rounds(&request.research_plan, 2).unwrap();
         assert_eq!(result["rounds"].as_array().unwrap().len(), 2);
         assert_eq!(result["declared_total_trials"], declared_total_trials);
         assert_eq!(result["consumed_trials"], declared_total_trials);
@@ -2769,14 +3137,16 @@ mod tests {
     fn valid_request() -> CampaignRequest {
         const TEST_ROOT: &str =
             "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research";
+        let research_plan = CexCampaignResearchPlanV1::canonical();
         let mut request = CampaignRequest {
-            schema_version: CAMPAIGN_REQUEST_SCHEMA_V3.to_string(),
+            schema_version: CAMPAIGN_REQUEST_SCHEMA_V4.to_string(),
             campaign_id: String::new(),
             build_source_revision: "a".repeat(40),
             image_identity: "1".repeat(64),
             campaign_inputs_sha256: "f".repeat(64),
             producer_source_revision: "b".repeat(40),
             producer_image_identity: "e".repeat(64),
+            research_plan: research_plan.clone(),
             feature_url: format!("{TEST_ROOT}/features.jsonl"),
             feature_sha256: "1".repeat(64),
             materialization_url: format!("{TEST_ROOT}/materialization.json"),
@@ -2786,7 +3156,7 @@ mod tests {
             replay_manifest_url: format!("{TEST_ROOT}/replay-manifest.json"),
             replay_manifest_sha256: "4".repeat(64),
             holdout_id: "cex-holdout-test".to_string(),
-            declared_total_trials: declared_total_trials_for_rounds(2).unwrap(),
+            declared_total_trials: declared_total_trials_for_rounds(&research_plan, 2).unwrap(),
             rounds: vec![
                 CampaignRoundRequest {
                     round_id: "r1".to_string(),
@@ -2863,6 +3233,62 @@ mod tests {
         request
     }
 
+    fn loaded_request_for_learning() -> LoadedRequest {
+        let request = valid_request();
+        let sha256 = hex::encode(Sha256::digest(serialize_request(&request).unwrap()));
+        LoadedRequest { request, sha256 }
+    }
+
+    fn negative_campaign_result(loaded: &LoadedRequest) -> CampaignResultV1 {
+        let consumed_per_round = loaded.request.declared_total_trials / loaded.request.rounds.len();
+        CampaignResultV1 {
+            schema_version: CAMPAIGN_RESULT_SCHEMA_V4.to_string(),
+            campaign_id: loaded.request.campaign_id.clone(),
+            request_sha256: loaded.sha256.clone(),
+            build_source_revision: loaded.request.build_source_revision.clone(),
+            image_identity: loaded.request.image_identity.clone(),
+            campaign_inputs_sha256: loaded.request.campaign_inputs_sha256.clone(),
+            producer_source_revision: loaded.request.producer_source_revision.clone(),
+            producer_image_identity: loaded.request.producer_image_identity.clone(),
+            research_plan_sha256: loaded.request.research_plan.content_hash().unwrap(),
+            holdout_id: loaded.request.holdout_id.clone(),
+            declared_total_trials: loaded.request.declared_total_trials,
+            consumed_trials: consumed_per_round * loaded.request.rounds.len(),
+            stop_rule: STOP_RULE_V2.to_string(),
+            termination_reason: "campaign_no_candidate".to_string(),
+            rounds: loaded
+                .request
+                .rounds
+                .iter()
+                .map(|round| CampaignMissionLedgerV1 {
+                    round_id: round.round_id.clone(),
+                    seed: round.seed,
+                    mission_id: format!("mission-{}", round.round_id),
+                    mission_sha256: "5".repeat(64),
+                    request_sha256: Some(loaded.sha256.clone()),
+                    result_bundle_sha256: "6".repeat(64),
+                    result_readback_bundle_sha256: "6".repeat(64),
+                    replay_receipt_id: None,
+                    replay_gate_passed: Some(false),
+                    final_precommit_id: None,
+                    sealed_receipt_id: None,
+                    sealed_passed: None,
+                    strategy_bundle_id: None,
+                    promotion_id: None,
+                    selected_candidate_id: None,
+                    selected_candidate_content_hash: None,
+                    selected_score: None,
+                    consumed_trials: consumed_per_round,
+                    termination_reason: "search_exhausted".to_string(),
+                })
+                .collect(),
+            selected_round_id: None,
+            selected_candidate_id: None,
+            selected_candidate_content_hash: None,
+            finalization: None,
+        }
+    }
+
     struct CampaignE2eFixture {
         _root: tempfile::TempDir,
         _replay_root: tempfile::TempDir,
@@ -2924,8 +3350,9 @@ mod tests {
         let rendered = render_cex_bundle(
             &render_fixture.feature_path,
             &render_fixture.materialization_path,
+            &CexCampaignResearchPlanV1::canonical(),
             7,
-            declared_total_trials_for_rounds(2).unwrap(),
+            declared_total_trials_for_rounds(&CexCampaignResearchPlanV1::canonical(), 2).unwrap(),
         )
         .unwrap();
         let root = tempfile::tempdir().unwrap();
@@ -2999,14 +3426,16 @@ mod tests {
             &hex::encode(Sha256::digest(&seed_bytes))[..16]
         );
         let published = root.join("published");
+        let research_plan = CexCampaignResearchPlanV1::canonical();
         CampaignRequest {
-            schema_version: CAMPAIGN_REQUEST_SCHEMA_V3.to_string(),
+            schema_version: CAMPAIGN_REQUEST_SCHEMA_V4.to_string(),
             campaign_id: campaign_id.clone(),
             build_source_revision: BUILD_SOURCE_REVISION.to_string(),
             image_identity: "1".repeat(64),
             campaign_inputs_sha256: "f".repeat(64),
             producer_source_revision: BUILD_SOURCE_REVISION.to_string(),
             producer_image_identity: "e".repeat(64),
+            research_plan: research_plan.clone(),
             feature_url: feature_path.to_string_lossy().into_owned(),
             feature_sha256: crate::mission_runner::sha256_file(feature_path).unwrap(),
             materialization_url: materialization_path.to_string_lossy().into_owned(),
@@ -3019,7 +3448,8 @@ mod tests {
             replay_manifest_sha256: crate::mission_runner::sha256_file(replay_manifest_path)
                 .unwrap(),
             holdout_id: holdout_id.to_string(),
-            declared_total_trials: declared_total_trials_for_rounds(seeds.len()).unwrap(),
+            declared_total_trials: declared_total_trials_for_rounds(&research_plan, seeds.len())
+                .unwrap(),
             rounds: seeds
                 .iter()
                 .enumerate()

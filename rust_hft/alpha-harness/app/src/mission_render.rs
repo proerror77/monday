@@ -20,11 +20,13 @@ use alpha_domain::{
 use anyhow::{bail, Context};
 use hft_collector::{import_feature_dataset, FeatureDatasetManifest};
 use hft_research_manifest::CexReplayDatasetManifestV5;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 const STABLE_VERSION: &str = "binance-btcusdt-usdm-1s-h5-top5-factor-plan-v5";
 const STABLE_HYPOTHESIS_ID: &str = "l2-microstructure-factor-plan-v5";
+const RESEARCH_PLAN_SCHEMA_V1: &str = "cex-campaign-research-plan-v1";
+pub(crate) const MAX_RESEARCH_PLAN_GENERATION: u8 = 3;
 const INITIAL_TRAIN_ROWS: usize = 7_200;
 const VALIDATION_ROWS: usize = 3_600;
 const FOLD_COUNT: usize = 3;
@@ -52,16 +54,170 @@ const FEATURE_FIELDS: [&str; 8] = [
     "vwap_center_deviation_top5_bps",
     "weighted_book_imbalance_top5",
 ];
-const MAX_CANDIDATES: usize = FEATURE_FIELDS.len() * 2 + 4;
+const REQUIRED_NAMED_TEMPLATE_FIELDS: [&str; 3] = [
+    "book_imbalance",
+    "spread_bps",
+    "weighted_book_imbalance_top5",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CexCampaignResearchPlanV1 {
+    pub(crate) schema_version: String,
+    pub(crate) generation: u8,
+    pub(crate) objective: String,
+    pub(crate) hypothesis: String,
+    pub(crate) focus_field: String,
+    pub(crate) feature_fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) parent: Option<CexCampaignResearchParentV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) llm: Option<CexCampaignLlmProvenanceV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CexCampaignResearchParentV1 {
+    pub(crate) campaign_id: String,
+    pub(crate) request_sha256: String,
+    pub(crate) campaign_result_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CexCampaignLlmProvenanceV1 {
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    pub(crate) prompt_sha256: String,
+    pub(crate) prompt_tokens: u64,
+    pub(crate) completion_tokens: u64,
+    pub(crate) total_tokens: u64,
+}
+
+impl CexCampaignResearchPlanV1 {
+    pub(crate) fn canonical() -> Self {
+        Self {
+            schema_version: RESEARCH_PLAN_SCHEMA_V1.to_string(),
+            generation: 0,
+            objective: "Screen atomic and named composite L2 microstructure factors, including inverse spread, cross-depth pressure consensus, top-five depth concentration, and VWAP-center displacement, on Binance USD-M BTCUSDT 1s/h5/top5 under governed dynamic-v3 GP"
+                .to_string(),
+            hypothesis: "L1 pressure, top-five depth balance, inverse spread, cross-depth pressure consensus, near-touch depth concentration, linearly weighted top-five pressure, and top-five VWAP-center displacement predict the next five one-second BTCUSDT mid-price returns"
+                .to_string(),
+            focus_field: "book_imbalance_top5".to_string(),
+            feature_fields: FEATURE_FIELDS.into_iter().map(str::to_string).collect(),
+            parent: None,
+            llm: None,
+        }
+    }
+
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        if self.schema_version != RESEARCH_PLAN_SCHEMA_V1 {
+            bail!("CEX Campaign research plan schema_version must be {RESEARCH_PLAN_SCHEMA_V1}");
+        }
+        for (label, value) in [
+            ("objective", self.objective.as_str()),
+            ("hypothesis", self.hypothesis.as_str()),
+            ("focus_field", self.focus_field.as_str()),
+        ] {
+            if value.trim().is_empty() || value.len() > 4_096 || value.chars().any(char::is_control)
+            {
+                bail!("CEX Campaign research plan {label} is invalid");
+            }
+        }
+        let allowed = FEATURE_FIELDS
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        if self.feature_fields.is_empty()
+            || self
+                .feature_fields
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || self
+                .feature_fields
+                .iter()
+                .any(|field| !allowed.contains(field.as_str()))
+            || !self
+                .feature_fields
+                .iter()
+                .any(|field| field == &self.focus_field)
+            || REQUIRED_NAMED_TEMPLATE_FIELDS
+                .iter()
+                .any(|required| !self.feature_fields.iter().any(|field| field == required))
+        {
+            bail!("CEX Campaign research plan feature fields are invalid");
+        }
+        match (&self.parent, &self.llm) {
+            (None, None) if self.generation == 0 => {}
+            (Some(parent), Some(llm)) => {
+                if self.generation == 0 || self.generation > MAX_RESEARCH_PLAN_GENERATION {
+                    bail!("CEX Campaign follow-up generation is outside the bounded loop");
+                }
+                if !parent.campaign_id.starts_with("cex-campaign-")
+                    || parent.campaign_id.len() > 63
+                    || parent.campaign_id.bytes().any(|byte| {
+                        !(byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                    })
+                    || normalized_sha256("parent Campaign request", &parent.request_sha256)?
+                        != parent.request_sha256
+                    || normalized_sha256("parent Campaign result", &parent.campaign_result_sha256)?
+                        != parent.campaign_result_sha256
+                {
+                    bail!("CEX Campaign research plan parent binding is invalid");
+                }
+                for (label, value) in [
+                    ("LLM provider", llm.provider.as_str()),
+                    ("LLM model", llm.model.as_str()),
+                ] {
+                    if value.trim().is_empty()
+                        || value.len() > 256
+                        || value.chars().any(char::is_control)
+                    {
+                        bail!("CEX Campaign research plan {label} is invalid");
+                    }
+                }
+                if normalized_sha256("LLM prompt", &llm.prompt_sha256)? != llm.prompt_sha256
+                    || llm.prompt_tokens == 0
+                    || llm.completion_tokens == 0
+                    || llm.total_tokens != llm.prompt_tokens.saturating_add(llm.completion_tokens)
+                {
+                    bail!("CEX Campaign research plan LLM provenance is invalid");
+                }
+            }
+            _ => bail!("CEX Campaign follow-up requires both parent and LLM provenance"),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn content_hash(&self) -> anyhow::Result<String> {
+        self.validate()?;
+        canonical_json_hash(self).map_err(anyhow::Error::new)
+    }
+
+    pub(crate) fn max_candidates(&self) -> anyhow::Result<usize> {
+        self.validate()?;
+        self.feature_fields
+            .len()
+            .checked_mul(2)
+            .and_then(|count| count.checked_add(4))
+            .context("CEX Campaign research plan candidate budget overflowed")
+    }
+}
+
+pub(crate) fn allowed_research_feature_fields() -> Vec<String> {
+    FEATURE_FIELDS.into_iter().map(str::to_string).collect()
+}
+
+pub(crate) fn required_named_template_fields() -> Vec<String> {
+    REQUIRED_NAMED_TEMPLATE_FIELDS
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
 
 #[derive(Debug)]
 pub(crate) struct RenderedCexMission {
     pub(crate) mission: CexResearchMissionArtifactV1,
     pub(crate) mission_id: String,
-}
-
-pub(crate) fn max_candidates_for_tests() -> usize {
-    MAX_CANDIDATES
 }
 
 #[derive(Debug, Serialize)]
@@ -95,9 +251,11 @@ fn sealed_holdout_cohort_sha256(
 pub(crate) fn render_cex_bundle(
     feature: &Path,
     materialization_path: &Path,
+    research_plan: &CexCampaignResearchPlanV1,
     seed: u64,
     multiple_testing_trials: usize,
 ) -> anyhow::Result<RenderedCexMission> {
+    research_plan.validate()?;
     validate_input_sizes(feature, materialization_path)?;
     let feature_sha256 = sha256_file(feature)?;
     let materialization_sha256 = sha256_file(materialization_path)?;
@@ -132,27 +290,43 @@ pub(crate) fn render_cex_bundle(
         "source_revision": materialization.source_revision,
     }))?;
     let sealed_holdout_cohort_sha256 = sealed_holdout_cohort_sha256(&materialization)?;
+    let research_plan_sha256 = research_plan.content_hash()?;
+    let stable_version = if research_plan == &CexCampaignResearchPlanV1::canonical() {
+        STABLE_VERSION.to_string()
+    } else {
+        format!("{STABLE_VERSION}-plan-{}", &research_plan_sha256[..16])
+    };
+    let gp_policy_id = if research_plan == &CexCampaignResearchPlanV1::canonical() {
+        GP_POLICY_ID.to_string()
+    } else {
+        format!("{GP_POLICY_ID}-{}", &research_plan_sha256[..16])
+    };
+    let hypothesis_id = if research_plan == &CexCampaignResearchPlanV1::canonical() {
+        STABLE_HYPOTHESIS_ID.to_string()
+    } else {
+        format!("l2-microstructure-followup-{}", &research_plan_sha256[..16])
+    };
     let search_lineage_id = format!(
-        "{STABLE_VERSION}-lineage-seed-{seed}-{}",
+        "{stable_version}-lineage-seed-{seed}-{}",
         &frozen_input_sha256[..16]
     );
-    let input_lineage_id = format!("{STABLE_VERSION}-input-{}", &materialization_sha256[..16]);
+    let input_lineage_id = format!("{stable_version}-input-{}", &materialization_sha256[..16]);
     let holdout_id = format!("cex-holdout-{}", &sealed_holdout_cohort_sha256[..48]);
     let evaluation_protocol = approved_evaluation_protocol(&materialization)?;
     let search = CexResearchSearchPlanV1 {
         seed,
         budget: SearchBudget {
-            max_candidates: MAX_CANDIDATES,
+            max_candidates: research_plan.max_candidates()?,
             max_expansions: MAX_EXPANSIONS,
             max_tokens: 0,
             max_seconds: 0,
         },
-        max_new_iterations: MAX_CANDIDATES,
+        max_new_iterations: research_plan.max_candidates()?,
         multiple_testing_trials,
     };
     let gp_policy = CexGpPolicyV1::controlled_dynamic_v3(
-        GP_POLICY_ID,
-        FEATURE_FIELDS.into_iter().map(str::to_string).collect(),
+        gp_policy_id,
+        research_plan.feature_fields.clone(),
         search.seed,
         &search.budget,
     )?;
@@ -175,8 +349,7 @@ pub(crate) fn render_cex_bundle(
     let mission = CexResearchMissionArtifactV1 {
         schema_version: CEX_RESEARCH_MISSION_SCHEMA_V1.to_string(),
         spec: CexResearchMissionSpecV1 {
-            objective: "Screen atomic and named composite L2 microstructure factors, including inverse spread, cross-depth pressure consensus, top-five depth concentration, and VWAP-center displacement, on Binance USD-M BTCUSDT 1s/h5/top5 under governed dynamic-v3 GP"
-                .to_string(),
+            objective: research_plan.objective.clone(),
             search_lineage_id,
             data_mission_id: materialization.mission_id.clone(),
             instrument: CexResearchInstrumentV1 {
@@ -189,8 +362,8 @@ pub(crate) fn render_cex_bundle(
                 },
             },
             hypotheses: vec![CexResearchHypothesisV1 {
-                hypothesis_id: STABLE_HYPOTHESIS_ID.to_string(),
-                statement: "L1 pressure, top-five depth balance, inverse spread, cross-depth pressure consensus, near-touch depth concentration, linearly weighted top-five pressure, and top-five VWAP-center displacement predict the next five one-second BTCUSDT mid-price returns".to_string(),
+                hypothesis_id,
+                statement: research_plan.hypothesis.clone(),
                 target: CexResearchHypothesisTargetV1 {
                     name: "forward_mid_return".to_string(),
                     horizon: EvaluationLabelSpecV1 {
@@ -198,7 +371,7 @@ pub(crate) fn render_cex_bundle(
                         observation_frequency_millis: materialization.bucket_ms,
                     },
                 },
-                required_feature_families: FEATURE_FIELDS.into_iter().map(str::to_string).collect(),
+                required_feature_families: research_plan.feature_fields.clone(),
                 required_template_families: vec![
                     "atomic_l2_microstructure".to_string(),
                     "named_composite_l2_microstructure".to_string(),
@@ -288,7 +461,7 @@ pub(crate) fn render_cex_bundle(
                 signature: None,
                 holdout_id: None,
             }],
-            feature_fields: FEATURE_FIELDS.into_iter().map(str::to_string).collect(),
+            feature_fields: research_plan.feature_fields.clone(),
             search,
             evaluation_protocol,
             holdout: CexResearchHoldoutV1 {
@@ -432,7 +605,10 @@ pub(crate) mod tests {
     };
 
     fn default_trials() -> usize {
-        max_candidates_for_tests() * 2
+        CexCampaignResearchPlanV1::canonical()
+            .max_candidates()
+            .unwrap()
+            * 2
     }
 
     #[test]
@@ -441,14 +617,14 @@ pub(crate) mod tests {
         let rendered = render_cex_bundle(
             &fixture.feature_path,
             &fixture.materialization_path,
+            &CexCampaignResearchPlanV1::canonical(),
             7,
             default_trials(),
         )
         .unwrap();
         let mission = rendered.mission;
         assert_eq!(MIN_ROWS, 21_608);
-        assert_eq!(MAX_CANDIDATES, 20);
-        assert_eq!(mission.spec.search.budget.max_candidates, MAX_CANDIDATES);
+        assert_eq!(mission.spec.search.budget.max_candidates, 20);
         assert_eq!(
             mission.spec.search.planned_gp_and_subset_trials().unwrap(),
             40
@@ -514,11 +690,64 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn follow_up_plan_narrows_the_governed_gp_search() {
+        let fixture = Fixture::new(MIN_ROWS);
+        let plan = CexCampaignResearchPlanV1 {
+            schema_version: RESEARCH_PLAN_SCHEMA_V1.to_string(),
+            generation: 1,
+            objective: "Test one bounded follow-up".to_string(),
+            hypothesis: "Near-depth concentration changes predict forward return".to_string(),
+            focus_field: "near_depth_concentration_skew_top5".to_string(),
+            feature_fields: vec![
+                "book_imbalance".to_string(),
+                "near_depth_concentration_skew_top5".to_string(),
+                "spread_bps".to_string(),
+                "weighted_book_imbalance_top5".to_string(),
+            ],
+            parent: Some(CexCampaignResearchParentV1 {
+                campaign_id: format!("cex-campaign-{}", "1".repeat(32)),
+                request_sha256: "2".repeat(64),
+                campaign_result_sha256: "3".repeat(64),
+            }),
+            llm: Some(CexCampaignLlmProvenanceV1 {
+                provider: "test".to_string(),
+                model: "test".to_string(),
+                prompt_sha256: "4".repeat(64),
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+            }),
+        };
+        let rendered = render_cex_bundle(
+            &fixture.feature_path,
+            &fixture.materialization_path,
+            &plan,
+            7,
+            plan.max_candidates().unwrap() * 2,
+        )
+        .unwrap();
+
+        assert_eq!(rendered.mission.spec.objective, plan.objective);
+        assert_eq!(rendered.mission.spec.feature_fields, plan.feature_fields);
+        assert_eq!(rendered.mission.spec.search.budget.max_candidates, 12);
+        assert_ne!(rendered.mission.spec.policies.gp.id, GP_POLICY_ID);
+
+        let mut invalid = plan.clone();
+        invalid.feature_fields.push("open_interest".to_string());
+        assert!(invalid.validate().is_err());
+
+        let mut exhausted = plan;
+        exhausted.generation = MAX_RESEARCH_PLAN_GENERATION + 1;
+        assert!(exhausted.validate().is_err());
+    }
+
+    #[test]
     fn render_cex_rejects_short_materializations() {
         let fixture = Fixture::new(MIN_ROWS - 1);
         let error = render_cex_bundle(
             &fixture.feature_path,
             &fixture.materialization_path,
+            &CexCampaignResearchPlanV1::canonical(),
             7,
             default_trials(),
         )
@@ -532,6 +761,7 @@ pub(crate) mod tests {
         let error = render_cex_bundle(
             &fixture.feature_path,
             &fixture.materialization_path,
+            &CexCampaignResearchPlanV1::canonical(),
             7,
             default_trials(),
         )
@@ -586,6 +816,7 @@ pub(crate) mod tests {
             assert!(render_cex_bundle(
                 &fixture.feature_path,
                 &fixture.materialization_path,
+                &CexCampaignResearchPlanV1::canonical(),
                 7,
                 default_trials(),
             )
@@ -605,6 +836,7 @@ pub(crate) mod tests {
         let error = render_cex_bundle(
             &fixture.feature_path,
             &fixture.materialization_path,
+            &CexCampaignResearchPlanV1::canonical(),
             7,
             default_trials(),
         )
@@ -621,6 +853,7 @@ pub(crate) mod tests {
         let error = render_cex_bundle(
             &fixture.feature_path,
             &fixture.materialization_path,
+            &CexCampaignResearchPlanV1::canonical(),
             7,
             default_trials(),
         )
@@ -643,6 +876,7 @@ pub(crate) mod tests {
         let error = render_cex_bundle(
             &fixture.feature_path,
             &fixture.materialization_path,
+            &CexCampaignResearchPlanV1::canonical(),
             7,
             default_trials(),
         )
@@ -656,6 +890,7 @@ pub(crate) mod tests {
         let first = render_cex_bundle(
             &fixture.feature_path,
             &fixture.materialization_path,
+            &CexCampaignResearchPlanV1::canonical(),
             7,
             default_trials(),
         )
@@ -663,6 +898,7 @@ pub(crate) mod tests {
         let second = render_cex_bundle(
             &fixture.feature_path,
             &fixture.materialization_path,
+            &CexCampaignResearchPlanV1::canonical(),
             11,
             default_trials(),
         )
@@ -686,6 +922,7 @@ pub(crate) mod tests {
         let first = render_cex_bundle(
             &fixture.feature_path,
             &fixture.materialization_path,
+            &CexCampaignResearchPlanV1::canonical(),
             7,
             default_trials(),
         )
@@ -723,6 +960,7 @@ pub(crate) mod tests {
         let second = render_cex_bundle(
             &fixture.feature_path,
             &fixture.materialization_path,
+            &CexCampaignResearchPlanV1::canonical(),
             7,
             default_trials(),
         )
