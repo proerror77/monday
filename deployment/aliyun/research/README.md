@@ -427,8 +427,11 @@ that creates the next suspended Job.
 the complete loop. Run it from a trusted Tokyo VPC control-plane host with
 `alpha-harness`, `aliyun`, `kubectl`, `jq`, LLM environment variables, and an
 executable signer. The signer remains a separate trust boundary and receives
-the frozen signing plan; the controller never logs signed URLs and removes its
-signed request/submission files automatically. For example:
+the frozen signing plan; the controller never logs signed URLs. Its mode-0700
+work directory is input-bound and resumable: after dispatch, a transient
+control-plane or OSS failure resumes the same request and Job instead of
+re-signing or resubmitting a new identity. Signed request/submission files are
+removed once that generation is processed. For example:
 
 ```bash
 deployment/aliyun/research/scripts/campaign-cycle-controller.sh \
@@ -443,9 +446,11 @@ deployment/aliyun/research/scripts/campaign-cycle-controller.sh \
 ```
 
 The controller performs `freeze -> sign -> finalize -> dispatch -> K8S Job
-wait -> direct OSS readback -> learn -> child Campaign`, stopping on a
-candidate or after at most three follow-ups. It is not resident in the ACK
-namespace and has no order, execution, risk-limit, or runtime-resume authority.
+wait -> Pod image readback -> immutable per-round OSS readback -> learn -> child
+Campaign`, deleting the input Secret after terminal Job/Pod capture and
+stopping on a candidate or after at most three follow-ups. It is not resident
+in the ACK namespace and has no order, execution, risk-limit, or runtime-resume
+authority.
 
 Wrap the final request with `attempt_id` and the exact digest-pinned `image` in
 the private submission file, then submit it directly:

@@ -1479,13 +1479,7 @@ fn validate_campaign_round_feedback(
             != feedback
                 .factors
                 .iter()
-                .filter(|factor| {
-                    factor.rejection_codes.is_empty()
-                        && factor
-                            .evaluation
-                            .as_ref()
-                            .is_some_and(|evaluation| evaluation.passed)
-                })
+                .filter(|factor| factor.rejection_codes.is_empty())
                 .count()
         || feedback.factors.iter().any(|factor| {
             factor.source_features.is_empty()
@@ -1493,11 +1487,7 @@ fn validate_campaign_round_feedback(
                     .source_features
                     .iter()
                     .any(|field| !allowed_fields.contains(field))
-                || (factor.rejection_codes.is_empty()
-                    != factor
-                        .evaluation
-                        .as_ref()
-                        .is_some_and(|evaluation| evaluation.passed))
+                || (factor.rejection_codes.is_empty() && factor.evaluation.is_none())
                 || factor
                     .evaluation
                     .as_ref()
@@ -2314,6 +2304,37 @@ mod tests {
         invalid.operator = "delta".to_string();
         invalid.window = Some(5);
         assert!(follow_up_plan_from_artifact(&loaded, &result_sha256, invalid).is_err());
+    }
+
+    #[test]
+    fn campaign_feedback_accepts_predictive_factor_that_failed_trading_gates() {
+        let failed_trading_evaluation = CampaignEvaluationFeedbackV1 {
+            passed: false,
+            score: 0.1,
+            time_series_ic: Some(0.05),
+            time_series_rank_ic: Some(0.04),
+            cumulative_net_return: -0.01,
+            max_drawdown: 0.02,
+            net_sharpe: -0.2,
+            trade_count: 10,
+        };
+        let mut feedback = CampaignRoundFeedbackV1 {
+            factor_attempts: 1,
+            accepted_factors: 1,
+            factors: vec![CampaignFactorFeedbackV1 {
+                source_features: vec!["book_imbalance".to_string()],
+                rejection_codes: Vec::new(),
+                evaluation: Some(failed_trading_evaluation.clone()),
+            }],
+            baseline_gate_passed: false,
+            baseline_failure_codes: vec![CexBaselineFailureCodeV1::InsufficientEvidence],
+            ridge: Some(failed_trading_evaluation.clone()),
+            cart: Some(failed_trading_evaluation),
+        };
+
+        validate_campaign_round_feedback(&feedback, 1).unwrap();
+        feedback.accepted_factors = 0;
+        assert!(validate_campaign_round_feedback(&feedback, 1).is_err());
     }
 
     #[test]
