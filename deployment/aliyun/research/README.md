@@ -373,9 +373,9 @@ input GET + SHA admission
   -> campaign-result.json PUT + GET/SHA readback
 ```
 
-The request schema is `cex-campaign-request-v3`. It separately binds the exact
+The request schema is `cex-campaign-request-v4`. It separately binds the exact
 executor Git revision and image digest plus the input receipt SHA-256, producer
-Git revision, and producer image digest. It also binds the
+Git revision, producer image digest, and validated research-plan content. It also binds the
 feature/materialization/replay objects and SHA-256 values, expected holdout ID,
 campaign-wide `declared_total_trials`, and at least two `rounds`. Each round
 carries a unique `round_id`, a unique seed, and Mission/result PUT and readback
@@ -395,6 +395,32 @@ alpha-harness mission campaign-id \
   --request /private/path/campaign-request.json
 ```
 
+The first freeze uses the built-in canonical research plan. After an immutable
+`campaign-result.json` ends with `campaign_no_candidate`, a trusted external
+control-plane process may create one parent-bound follow-up plan:
+
+```bash
+alpha-harness mission campaign-learn \
+  --request /private/path/campaign-request.json \
+  --result /private/path/campaign-result.json \
+  --result-sha256 REPLACE_EXACT_RESULT_SHA256 \
+  --output /private/path/next-research-plan.json
+
+alpha-harness mission campaign-freeze \
+  ... \
+  --research-plan /private/path/next-research-plan.json
+```
+
+The LLM sees only bounded negative-result evidence and may choose one admitted
+feature focus plus a falsifiable hypothesis. The existing governed GP templates
+remain deterministic. The LLM cannot change data, fees, validation, trial
+limits, holdout, Kubernetes, risk, or execution authority. The output is
+create-once, limited to three follow-up generations, and its content hash
+changes the child Campaign identity. LLM
+credentials remain outside ACK; the existing dispatcher is still the only path
+that creates the next suspended Job. There is no resident controller or
+automatic retry loop in the namespace.
+
 Wrap the final request with `attempt_id` and the exact digest-pinned `image` in
 the private submission file, then submit it directly:
 
@@ -413,8 +439,11 @@ exchange account file, API key, or order/execution entrypoint. Each round
 records `results/mission-admission.json`, which binds the current request SHA
 and the round's Mission SHA alongside the campaign and round IDs.
 
-One Campaign maps to multiple rounds. The fixed v4 factor plan uses 8 snapshot
-L2 terminals, 16 atomic candidates, 32 trials per round, the six-hour protocol
+One Campaign maps to multiple rounds. The canonical v4 factor plan uses 8
+snapshot L2 terminals and 20 bounded candidate slots. A follow-up retains the
+three named-template fields plus one admitted focus field and therefore uses 12
+candidate slots. The request derives the total trial limit from the exact plan
+and round count. Both use the six-hour protocol
 `7200 + 3*(3600+1) + 5 + 3600 = 21608`, and the `$1000 / Top5 5%` capacity
 screen. GP and subset MCTS already provide the bounded search iterations. A
 negative Campaign produces no holdout claim. A selected round may finalize once

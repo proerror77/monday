@@ -81,6 +81,7 @@ enum MissionCommand {
     Execute(Box<ExecuteMissionArgs>),
     CampaignExecute(CampaignExecuteArgs),
     CampaignFreeze(CampaignFreezeArgs),
+    CampaignLearn(CampaignLearnArgs),
     CampaignFinalize(CampaignFinalizeArgs),
     CampaignId(CampaignIdArgs),
     Dispatch {
@@ -172,6 +173,22 @@ pub struct CampaignFreezeArgs {
     pub campaign_root: String,
     #[arg(long = "seed", required = true)]
     pub seeds: Vec<u64>,
+    #[arg(long)]
+    pub research_plan: Option<PathBuf>,
+    #[arg(long)]
+    pub output: PathBuf,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CampaignLearnArgs {
+    #[arg(long)]
+    pub request: PathBuf,
+    #[arg(long)]
+    pub result: PathBuf,
+    #[arg(long)]
+    pub result_sha256: String,
+    #[arg(long, default_value_t = 500)]
+    pub max_tokens: u64,
     #[arg(long)]
     pub output: PathBuf,
 }
@@ -753,6 +770,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     .context("campaign execution worker failed")?
             }
             MissionCommand::CampaignFreeze(args) => mission_campaign::freeze(args),
+            MissionCommand::CampaignLearn(args) => mission_campaign::learn(args),
             MissionCommand::CampaignFinalize(args) => mission_campaign::finalize(args),
             MissionCommand::CampaignId(args) => mission_campaign::print_expected_id(args),
             MissionCommand::Dispatch { command } => match command {
@@ -1100,6 +1118,12 @@ mod tests {
     #[test]
     fn parses_mission_campaign_freeze() {
         let args = "alpha-harness mission campaign-freeze --campaign-inputs campaign-inputs.json --input-root /mounted/run --source-revision aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --image registry/research-runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --campaign-root https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/campaigns --seed 7 --seed 11 --output freeze.json";
+        assert!(Cli::try_parse_from(args.split_whitespace()).is_ok());
+    }
+
+    #[test]
+    fn parses_mission_campaign_learn() {
+        let args = "alpha-harness mission campaign-learn --request campaign.json --result campaign-result.json --result-sha256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --max-tokens 300 --output next-plan.json";
         assert!(Cli::try_parse_from(args.split_whitespace()).is_ok());
     }
 
