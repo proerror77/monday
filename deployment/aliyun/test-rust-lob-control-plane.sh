@@ -881,7 +881,7 @@ write_payload_delta_restore_health() {
     observed=$(date +%s%N)
     for market in spot usdm; do
       symbols=1000; dataset=spot_all
-      [[ $market == usdm ]] && symbols=100 && dataset=usdm_perpetual_top100_lob
+      [[ $market == usdm ]] && symbols=100 && dataset=usdm_perpetual_top100_lob_trade
       jq -cn --arg market "$market" --arg dataset "$dataset" \
         --arg session "$session_prefix-$market" --argjson symbols "$symbols" \
         --argjson observed "$observed" '
@@ -2167,7 +2167,7 @@ write_cutover_fixture_health() {
       continue
     fi
     jq -cn --argjson observed "$observed_at_ns" \
-      '{market:"usdm",dataset:"usdm_perpetual_top100_lob",status:"synced",sequence_gaps:0,symbol_count:100,snapshot_ready_count:100,bridged_count:100,stream_coverage_verified_count:100,snapshot_only_symbols:[],all_symbols_bridged:true,all_stream_coverage_verified:true,full_stream_coverage_verified:true,pending_upload_segments:0,queue_saturated:false,disk_warning:false,upload_warning:false,session_id:"cutover-fixture-usdm",updated_at_ns:$observed}' \
+      '{market:"usdm",dataset:"usdm_perpetual_top100_lob_trade",status:"synced",sequence_gaps:0,symbol_count:100,snapshot_ready_count:100,bridged_count:100,stream_coverage_verified_count:100,snapshot_only_symbols:[],all_symbols_bridged:true,all_stream_coverage_verified:true,full_stream_coverage_verified:true,pending_upload_segments:0,queue_saturated:false,disk_warning:false,upload_warning:false,session_id:"cutover-fixture-usdm",updated_at_ns:$observed}' \
       >"$production_spool_root/usdm/health.json.tmp"
     mv -f -- "$production_spool_root/usdm/health.json.tmp" "$production_spool_root/usdm/health.json"
     (( elapsed < 15 )) || break
@@ -2433,7 +2433,7 @@ write_restore_fixture_health() {
     observed=$(date +%s%N)
     for market in spot usdm; do
       symbols=1000; dataset=spot_all
-      [[ $market == usdm ]] && symbols=100 && dataset=usdm_perpetual_top100_lob
+      [[ $market == usdm ]] && symbols=100 && dataset=usdm_perpetual_top100_lob_trade
       status=synced; gaps=0; ready=$symbols
       case $mode in
         unsynced) status=starting ;;

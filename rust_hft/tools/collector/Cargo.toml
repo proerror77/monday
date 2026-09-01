@@ -88,6 +88,10 @@ name = "binance-lob-archiver"
 path = "src/bin/binance-lob-archiver.rs"
 
 [[bin]]
+name = "binance-usdm-account-archiver"
+path = "src/bin/binance-usdm-account-archiver.rs"
+
+[[bin]]
 name = "polymarket-raw-ops"
 path = "src/bin/polymarket-raw-ops.rs"
 

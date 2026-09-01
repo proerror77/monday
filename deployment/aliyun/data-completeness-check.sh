@@ -49,7 +49,7 @@
 #   COMPLETENESS_GRACE_HOURS_{SPOT,USDM,BYBIT,POLYMARKET,REFERENCE}
 #                                 per-dataset grace override
 #   COMPLETENESS_START_EPOCH_USDM
-#                                 optional UTC epoch when the LOB-only USD-M
+#                                 optional UTC epoch when the combined USD-M
 #                                 dataset became authoritative; when omitted,
 #                                 the first landed hour in the window is used
 #                                 as a fail-closed activation boundary
@@ -403,7 +403,7 @@ check_dataset binance-spot \
   'lake/raw/venue=binance/market=spot/dataset=spot_all/shard=all/' \
   triplet "$GRACE_SPOT" ""
 check_dataset binance-usdm \
-  'lake/raw/venue=binance/market=usdm/dataset=usdm_perpetual_top100_lob/shard=all/' \
+  'lake/raw/venue=binance/market=usdm/dataset=usdm_perpetual_top100_lob_trade/shard=all/' \
   triplet "$GRACE_USDM" "$START_EPOCH_USDM"
 check_dataset bybit-options \
   'lake/raw/venue=bybit/market=option/dataset=options_quotes/' \

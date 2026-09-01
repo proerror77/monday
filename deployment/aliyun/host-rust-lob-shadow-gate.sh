@@ -1142,7 +1142,7 @@ done
 if [[ $TEST_ONLY != true ]]; then
   [[ ${symbols[spot]} == ALL && ${dataset[spot]} == spot_all_rust_shadow ]] || die 'Spot identity is invalid'
   is_usdm_top100 "${symbols[usdm]}" || die 'USD-M catalog is not frozen'
-  [[ ${dataset[usdm]} == usdm_perpetual_top100_lob_rust_shadow ]] || die 'USD-M dataset identity is invalid'
+  [[ ${dataset[usdm]} == usdm_perpetual_top100_lob_trade_rust_shadow ]] || die 'USD-M dataset identity is invalid'
 fi
 for market in "${markets[@]}"; do
   phase_segments_json[$market]='[]'
@@ -2288,13 +2288,16 @@ verify_segments() {
     fi
   done < <(find "${spool_dir[$market]}" -type f -name '*.jsonl.zst.manifest.json' | sort)
   verify_clean_segments "${segment_records[@]}" || die "$market strict LOB continuity verifier failed"
-  if [[ $market == spot ]]; then
+  if [[ $market == spot || ${dataset[$market]} == usdm_perpetual_top100_lob_trade_rust_shadow ]]; then
     verify_aggregate_trade_continuity "${segment_records[@]}" || die "$market strict aggregate-trade continuity verifier failed"
-    verify_raw_trade_continuity "${segment_records[@]}" || die "$market strict raw-trade continuity verifier failed"
     phase_strict_aggregate[$market]=true
-    phase_strict_raw[$market]=true
   else
     phase_strict_aggregate[$market]=false
+  fi
+  if [[ $market == spot ]]; then
+    verify_raw_trade_continuity "${segment_records[@]}" || die "$market strict raw-trade continuity verifier failed"
+    phase_strict_raw[$market]=true
+  else
     phase_strict_raw[$market]=false
   fi
   phase_strict_lob[$market]=true

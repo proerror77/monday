@@ -589,6 +589,7 @@ jobs:
           container_id=$(docker create "$IMAGE")
           trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
           docker cp "$container_id:/usr/local/bin/binance-lob-archiver" artifact/binance-lob-archiver
+          docker cp "$container_id:/usr/local/bin/binance-usdm-account-archiver" artifact/binance-usdm-account-archiver
           docker cp "$container_id:/usr/local/bin/polymarket-raw-ops" artifact/polymarket-raw-ops
           docker cp "$container_id:/usr/local/bin/bybit-options-archiver" artifact/bybit-options-archiver
           docker cp "$container_id:/usr/local/bin/binance-usdm-reference-collector" artifact/binance-usdm-reference-collector
@@ -597,6 +598,7 @@ jobs:
           docker cp "$container_id:/usr/local/bin/binance-fee-snapshot" artifact/binance-fee-snapshot
           docker cp "$container_id:/usr/local/bin/binance-fee-snapshot-upload" artifact/binance-fee-snapshot-upload
           chmod 0755 artifact/binance-lob-archiver
+          chmod 0755 artifact/binance-usdm-account-archiver
           chmod 0755 artifact/polymarket-raw-ops
           chmod 0755 artifact/bybit-options-archiver
           chmod 0755 artifact/binance-usdm-reference-collector
@@ -606,6 +608,8 @@ jobs:
           chmod 0755 artifact/binance-fee-snapshot-upload
           artifact/binance-lob-archiver --version \
             | grep -Fqx 'binance-lob-archiver ${{ needs.selector.outputs.source_sha }}'
+          artifact/binance-usdm-account-archiver --version \
+            | grep -Fqx 'binance-usdm-account-archiver ${{ needs.selector.outputs.source_sha }}'
           artifact/polymarket-raw-ops --version \
             | grep -Fqx 'polymarket-raw-ops ${{ needs.selector.outputs.source_sha }}'
           artifact/bybit-options-archiver --version \
@@ -613,6 +617,8 @@ jobs:
           (
             cd artifact
             sha256sum binance-lob-archiver | tee binance-lob-archiver.sha256
+            sha256sum binance-usdm-account-archiver \
+              | tee binance-usdm-account-archiver.sha256
             sha256sum polymarket-raw-ops | tee polymarket-raw-ops.sha256
             sha256sum bybit-options-archiver | tee bybit-options-archiver.sha256
             sha256sum binance-usdm-reference-collector \
@@ -698,6 +704,17 @@ jobs:
               -czf ../../artifact/binance-fee-production-control.tar.gz \
               "${fee_production_assets[@]}"
           )
+          account_production_assets=(
+            binance-usdm-account-archiver.service
+          )
+          (
+            cd deployment/aliyun
+            sha256sum "${account_production_assets[@]}" \
+              > ../../artifact/binance-usdm-account-production-control-assets.sha256
+            tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+              -czf ../../artifact/binance-usdm-account-production-control.tar.gz \
+              "${account_production_assets[@]}"
+          )
           (
             cd artifact
             candidate_sha=$(awk 'NR == 1 {print $1}' polymarket-raw-ops.sha256)
@@ -747,6 +764,30 @@ jobs:
             printf '%s  %s\n' "$fee_control_archive_sha" \
               binance-fee-production-control.tar.gz \
               > binance-fee-production-control.tar.gz.sha256
+            account_candidate_sha=$(awk 'NR == 1 {print $1}' \
+              binance-usdm-account-archiver.sha256)
+            account_control_manifest_sha=$(sha256sum \
+              binance-usdm-account-production-control-assets.sha256 | awk '{print $1}')
+            account_control_archive_sha=$(sha256sum \
+              binance-usdm-account-production-control.tar.gz | awk '{print $1}')
+            printf '%s  %s\n' "$account_control_archive_sha" \
+              binance-usdm-account-production-control.tar.gz \
+              > binance-usdm-account-production-control.tar.gz.sha256
+            jq -S -n \
+              --arg source_revision '${{ needs.selector.outputs.source_sha }}' \
+              --arg candidate_sha256 "$account_candidate_sha" \
+              --arg control_manifest_sha256 "$account_control_manifest_sha" \
+              --arg control_archive_sha256 "$account_control_archive_sha" \
+              '{schema:"monday.binance_usdm_account_release.v1",
+                source_revision:$source_revision,
+                candidate:{file:"binance-usdm-account-archiver",sha256:$candidate_sha256},
+                control_manifest:{file:"binance-usdm-account-production-control-assets.sha256",
+                  sha256:$control_manifest_sha256},
+                control_archive:{file:"binance-usdm-account-production-control.tar.gz",
+                  sha256:$control_archive_sha256}}' \
+              > binance-usdm-account-release.json
+            sha256sum binance-usdm-account-release.json \
+              > binance-usdm-account-release.json.sha256
             jq -S -n \
               --arg source_revision '${{ needs.selector.outputs.source_sha }}' \
               --arg candidate_sha256 "$fee_candidate_sha" \
