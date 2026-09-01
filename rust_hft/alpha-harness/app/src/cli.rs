@@ -770,7 +770,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     .context("campaign execution worker failed")?
             }
             MissionCommand::CampaignFreeze(args) => mission_campaign::freeze(args),
-            MissionCommand::CampaignLearn(args) => mission_campaign::learn(args),
+            MissionCommand::CampaignLearn(args) => {
+                tokio::task::spawn_blocking(move || mission_campaign::learn(args))
+                    .await
+                    .context("campaign learning worker failed")?
+            }
             MissionCommand::CampaignFinalize(args) => mission_campaign::finalize(args),
             MissionCommand::CampaignId(args) => mission_campaign::print_expected_id(args),
             MissionCommand::Dispatch { command } => match command {
