@@ -7,6 +7,7 @@ JOB_TEMPLATE=$SCRIPT_DIR/k8s/cex-materialization-job.example.yaml
 
 [ "$(grep -c ' /reference/lake/raw$' "$JOB_TEMPLATE")" -eq 2 ]
 ! grep -q ' /lake/reference$' "$JOB_TEMPLATE"
+grep -q '^  activeDeadlineSeconds: 7200$' "$JOB_TEMPLATE"
 
 for tool in awk find sed sha256sum mktemp chmod grep; do
   command -v "$tool" >/dev/null 2>&1 || {
