@@ -8,7 +8,7 @@ usage: cex-materialization-entrypoint.sh \
   --raw-root /lake/raw \
   --output-root /lake/output \
   --work-dir /work \
-  [--reference-root /lake/reference] \
+  [--reference-root /reference/lake/raw] \
   [--binary-dir /usr/local/bin] \
   [--dry-run]
 EOF

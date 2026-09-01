@@ -181,7 +181,9 @@ entrypoint for one frozen CEX run identity. It does not enumerate OSS, mutate
 old YAML, or compile Rust in-cluster. The Job:
 
 - mounts a read-only raw OSS CSI PVC at `/lake/raw`;
-- mounts a read-only reference OSS CSI PVC at `/lake/reference`;
+- mounts a read-only reference OSS CSI PVC at `/reference/lake/raw`, preserving
+  the canonical `lake/raw/venue=binance_usdm/dataset=reference/...` partition
+  suffix required by the read-only artifact verifier;
 - mounts one stable-lane output OSS CSI PVC at `/lake/output`;
 - loads one frozen inventory file and the repo-owned entrypoint script from
   ConfigMaps;
