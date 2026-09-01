@@ -193,6 +193,9 @@ old YAML, or compile Rust in-cluster. The Job:
   frozen data SHA-256;
 - slices only the requested symbol with `binance-market-tape-slicer`;
 - runs `lob-pit-materializer` and `binance-replay-parquet-materializer`;
+- emits bounded logfmt `stage_start`, `stage_progress`, and `stage_complete`
+  events to the Pod log while retaining the JSON state/receipt files (raw
+  verification and slicing every 10 objects, reference verification every 50);
 - re-hashes the four produced Campaign inputs on the mounted output prefix; and
 - writes `receipts/campaign-inputs.json` plus a small receipt.
 
