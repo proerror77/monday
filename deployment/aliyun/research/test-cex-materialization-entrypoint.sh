@@ -190,7 +190,32 @@ sh "$ENTRYPOINT" \
   --reference-root "$REF_ROOT" \
   --output-root "$OUT_ROOT" \
   --work-dir "$WORK_ROOT" \
-  --binary-dir "$BIN_DIR" >/dev/null
+  --binary-dir "$BIN_DIR" >/dev/null 2>"$ROOT/run.log"
+
+grep -Fq "progress_event raw_verification \"\$i\" \"\$raw_segment_count\" 10" "$ENTRYPOINT"
+grep -Fq "progress_event reference_verification \"\$i\" \"\$reference_count\" 50" "$ENTRYPOINT"
+grep -Fq "progress_event slicing \"\$i\" \"\$raw_segment_count\" 10" "$ENTRYPOINT"
+for event in \
+  'event=stage_start run_id=test-run-1 stage=raw_verification current=0 total=2' \
+  'event=stage_progress run_id=test-run-1 stage=raw_verification current=2 total=2' \
+  'event=stage_complete run_id=test-run-1 stage=raw_verification current=2 total=2' \
+  'event=stage_start run_id=test-run-1 stage=reference_verification current=0 total=2' \
+  'event=stage_progress run_id=test-run-1 stage=reference_verification current=2 total=2' \
+  'event=stage_complete run_id=test-run-1 stage=reference_verification current=2 total=2' \
+  'event=stage_start run_id=test-run-1 stage=slicing current=0 total=2' \
+  'event=stage_progress run_id=test-run-1 stage=slicing current=2 total=2' \
+  'event=stage_complete run_id=test-run-1 stage=slicing current=2 total=2' \
+  'event=stage_start run_id=test-run-1 stage=pit_materialization current=0 total=1' \
+  'event=stage_complete run_id=test-run-1 stage=pit_materialization current=1 total=1' \
+  'event=stage_start run_id=test-run-1 stage=replay_materialization current=0 total=1' \
+  'event=stage_complete run_id=test-run-1 stage=replay_materialization current=1 total=1' \
+  'event=stage_start run_id=test-run-1 stage=receipt_build current=0 total=1' \
+  'event=stage_complete run_id=test-run-1 stage=receipt_build current=1 total=1' \
+  'event=stage_start run_id=test-run-1 stage=publish current=0 total=1' \
+  'event=stage_complete run_id=test-run-1 stage=publish current=1 total=1'; do
+  grep -Fqx "$event" "$ROOT/run.log"
+done
+grep -Fq 'event=run_complete run_id=test-run-1 feature_sha256=' "$ROOT/run.log"
 
 RUN_ROOT=$OUT_ROOT/test-run-1
 [ -f "$WORK_ROOT/staged-output/artifacts/materialization/decoy.reference.data" ]

@@ -19,6 +19,20 @@ log() {
   printf '%s\n' "$*" >&2
 }
 
+stage_event() {
+  log "event=$1 run_id=$run_id stage=$2 current=$3 total=$4"
+}
+
+progress_event() {
+  progress_stage=$1
+  progress_current=$2
+  progress_total=$3
+  progress_interval=$4
+  if [ "$progress_current" -eq "$progress_total" ] || [ $((progress_current % progress_interval)) -eq 0 ]; then
+    stage_event stage_progress "$progress_stage" "$progress_current" "$progress_total"
+  fi
+}
+
 die() {
   log "breach: $*"
   exit 1
@@ -394,6 +408,8 @@ fi
   [ -x "$REPLAY_BIN" ] || die "replay binary is not executable: $REPLAY_BIN"
 }
 
+log "event=run_start run_id=$run_id raw_segments=$raw_segment_count references=$reference_count dry_run=$DRY_RUN"
+stage_event stage_start raw_verification 0 "$raw_segment_count"
 i=1
 while [ "$i" -le "$raw_segment_count" ]; do
   rel=$(inventory_get "RAW_SEGMENT_$i")
@@ -407,13 +423,16 @@ while [ "$i" -le "$raw_segment_count" ]; do
   printf '%s\n' "$data" >"$STATE_ROOT/raw-segment-$i.path"
   printf '%s\n' "$sha" >"$STATE_ROOT/raw-segment-$i.sha256"
   printf '%s\n' "$manifest_sha" >"$STATE_ROOT/raw-segment-$i.manifest-sha256"
+  progress_event raw_verification "$i" "$raw_segment_count" 10
   i=$((i + 1))
 done
+stage_event stage_complete raw_verification "$raw_segment_count" "$raw_segment_count"
 
 if [ "$reference_count" -gt 0 ]; then
   [ -n "$REFERENCE_ROOT" ] || die "REFERENCE_ROOT is required when REFERENCE_COUNT > 0"
 fi
 
+stage_event stage_start reference_verification 0 "$reference_count"
 i=1
 while [ "$i" -le "$reference_count" ]; do
   rel=$(inventory_get "REFERENCE_$i")
@@ -427,8 +446,10 @@ while [ "$i" -le "$reference_count" ]; do
   printf '%s\n' "$data" >"$STATE_ROOT/reference-$i.path"
   printf '%s\n' "$sha" >"$STATE_ROOT/reference-$i.sha256"
   printf '%s\n' "$manifest_sha" >"$STATE_ROOT/reference-$i.manifest-sha256"
+  progress_event reference_verification "$i" "$reference_count" 50
   i=$((i + 1))
 done
+stage_event stage_complete reference_verification "$reference_count" "$reference_count"
 
 if [ "$DRY_RUN" -eq 1 ]; then
   printf '{\n'
@@ -445,9 +466,11 @@ if [ "$DRY_RUN" -eq 1 ]; then
   printf '  "raw_segment_count": %s,\n' "$raw_segment_count"
   printf '  "reference_count": %s\n' "$reference_count"
   printf '}\n'
+  log "event=run_complete run_id=$run_id mode=dry_run"
   exit 0
 fi
 
+stage_event stage_start slicing 0 "$raw_segment_count"
 i=1
 while [ "$i" -le "$raw_segment_count" ]; do
   raw_path=$(cat "$STATE_ROOT/raw-segment-$i.path")
@@ -466,8 +489,10 @@ while [ "$i" -le "$raw_segment_count" ]; do
   printf '%s\n' "$slice_path" >"$STATE_ROOT/slice-$i.path"
   printf '%s\n' "$slice_sha" >"$STATE_ROOT/slice-$i.sha256"
   printf '%s\n' "$slice_manifest_sha" >"$STATE_ROOT/slice-$i.manifest-sha256"
+  progress_event slicing "$i" "$raw_segment_count" 10
   i=$((i + 1))
 done
+stage_event stage_complete slicing "$raw_segment_count" "$raw_segment_count"
 
 pit_stdout=$STATE_ROOT/lob-pit-materializer.json
 set -- "$PIT_BIN" \
@@ -494,6 +519,7 @@ while [ "$i" -le "$reference_count" ]; do
     --reference-manifest-sha256 "$(cat "$STATE_ROOT/reference-$i.manifest-sha256")"
   i=$((i + 1))
 done
+stage_event stage_start pit_materialization 0 1
 "$@" >"$pit_stdout"
 
 feature_path=$(json_string_field artifact_path "$pit_stdout")
@@ -513,6 +539,7 @@ materialization_rewritten_path=$LOCAL_MATERIALIZATION_DIR/$materialization_sha.m
 mv "$rewritten_materialization" "$materialization_rewritten_path"
 rm -f "$materialization_path"
 materialization_path=$materialization_rewritten_path
+stage_event stage_complete pit_materialization 1 1
 
 replay_stdout=$STATE_ROOT/replay-materializer.json
 set -- "$REPLAY_BIN" \
@@ -528,6 +555,7 @@ while [ "$i" -le "$raw_segment_count" ]; do
     --segment-manifest-sha256 "$(cat "$STATE_ROOT/slice-$i.manifest-sha256")"
   i=$((i + 1))
 done
+stage_event stage_start replay_materialization 0 1
 "$@" >"$replay_stdout"
 
 replay_manifest_path=$(json_string_field manifest_path "$replay_stdout")
@@ -539,11 +567,13 @@ replay_artifact_path=$LOCAL_REPLAY_DIR/$replay_artifact_rel
 [ -f "$replay_manifest_path" ] || die "replay manifest is missing: $replay_manifest_path"
 [ "$(sha256_file "$replay_artifact_path")" = "$replay_artifact_sha" ] || die "replay artifact readback SHA mismatch"
 [ "$(sha256_file "$replay_manifest_path")" = "$replay_manifest_sha" ] || die "replay manifest readback SHA mismatch"
+stage_event stage_complete replay_materialization 1 1
 
 materialization_publish_path=$(published_path_for "$materialization_path" "$LOCAL_MATERIALIZATION_DIR" "$MATERIALIZATION_DIR" "materialization report")
 replay_artifact_publish_path=$(published_path_for "$replay_artifact_path" "$LOCAL_REPLAY_DIR" "$REPLAY_DIR" "replay artifact")
 replay_manifest_publish_path=$(published_path_for "$replay_manifest_path" "$LOCAL_REPLAY_DIR" "$REPLAY_DIR" "replay manifest")
 
+stage_event stage_start receipt_build 0 1
 cp "$INVENTORY" "$LOCAL_RECEIPT_DIR/frozen-inventory.env"
 inventory_copy_sha=$(sha256_file "$LOCAL_RECEIPT_DIR/frozen-inventory.env")
 [ "$inventory_copy_sha" = "$inventory_sha256" ] || die "inventory copy SHA mismatch"
@@ -604,6 +634,8 @@ campaign_inputs_sha=$(sha256_file "$LOCAL_RECEIPT_DIR/campaign-inputs.json")
 } >"$LOCAL_RECEIPT_DIR/materialization-receipt.json"
 
 materialization_receipt_sha=$(sha256_file "$LOCAL_RECEIPT_DIR/materialization-receipt.json")
+stage_event stage_complete receipt_build 1 1
+stage_event stage_start publish 0 1
 mkdir -p "$MATERIALIZATION_DIR" "$REPLAY_DIR" "$RECEIPT_DIR"
 publish_verified_file "feature artifact" "$feature_path" "$feature_publish_path" "$feature_sha"
 publish_verified_file "materialization report" "$materialization_path" "$materialization_publish_path" "$materialization_sha"
@@ -612,5 +644,6 @@ publish_verified_file "replay manifest" "$replay_manifest_path" "$replay_manifes
 publish_verified_file "frozen inventory" "$LOCAL_RECEIPT_DIR/frozen-inventory.env" "$RECEIPT_DIR/frozen-inventory.env" "$inventory_sha256"
 publish_verified_file "campaign inputs" "$LOCAL_RECEIPT_DIR/campaign-inputs.json" "$RECEIPT_DIR/campaign-inputs.json" "$campaign_inputs_sha"
 publish_verified_file "materialization receipt" "$LOCAL_RECEIPT_DIR/materialization-receipt.json" "$RECEIPT_DIR/materialization-receipt.json" "$materialization_receipt_sha"
+stage_event stage_complete publish 1 1
 
-log "run_id=$run_id feature_sha256=$feature_sha materialization_sha256=$materialization_sha replay_artifact_sha256=$replay_artifact_sha replay_manifest_sha256=$replay_manifest_sha"
+log "event=run_complete run_id=$run_id feature_sha256=$feature_sha materialization_sha256=$materialization_sha replay_artifact_sha256=$replay_artifact_sha replay_manifest_sha256=$replay_manifest_sha"
