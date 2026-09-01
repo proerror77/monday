@@ -1692,8 +1692,8 @@ fn stream_types_for_recovery(market: Market, dataset: &str) -> anyhow::Result<Ve
         (Market::Usdm, dataset) if is_legacy_usdm_dataset(dataset) => {
             Ok(stream_types_for_dataset(Market::Usdm, dataset))
         }
-        (Market::Usdm, USDM_TOP100_LOB_TRADE_DATASET) => {
-            Ok(stream_types_for_dataset(Market::Usdm, USDM_TOP100_LOB_TRADE_DATASET))
+        (Market::Usdm, dataset) if is_usdm_top100_lob_trade_dataset(dataset) => {
+            Ok(stream_types_for_dataset(Market::Usdm, dataset))
         }
         (Market::Usdm, USDM_TOP100_LOB_DATASET) => Ok(stream_types_for_market(Market::Usdm)),
         _ => anyhow::bail!("unsupported recovery market/dataset identity: {market:?}/{dataset}"),
@@ -5837,6 +5837,14 @@ mod tests {
         );
         assert_eq!(
             stream_types_for_recovery(Market::Usdm, USDM_TOP100_LOB_TRADE_DATASET).unwrap(),
+            vec!["depth@100ms".to_owned(), "aggTrade".to_owned()]
+        );
+        assert_eq!(
+            stream_types_for_recovery(
+                Market::Usdm,
+                USDM_TOP100_LOB_TRADE_SHADOW_DATASET,
+            )
+            .unwrap(),
             vec!["depth@100ms".to_owned(), "aggTrade".to_owned()]
         );
         assert!(stream_types_for_recovery(Market::Usdm, "unexpected").is_err());

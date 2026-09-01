@@ -6,6 +6,7 @@ use hft_collector::lob_archiver::{command_status_with_timeout, segment_partition
 use integration::signing::{BinanceCredentials, BinanceSigner};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -14,6 +15,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info};
 
@@ -27,6 +29,8 @@ const LISTEN_KEY_PATH: &str = "/fapi/v1/listenKey";
 const ACCOUNT_PATH: &str = "/fapi/v3/account";
 const LOCK_FILE: &str = ".binance-usdm-account-archiver.lock";
 const ZSTD_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_MAX_SPOOL_BYTES: u64 = 50 * 1024 * 1024 * 1024;
+const DEFAULT_MIN_FREE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 const BUILD_SOURCE_REVISION: &str = match option_env!("MONDAY_SOURCE_REVISION") {
     Some(revision) => revision,
     None => "unbound-source-revision",
@@ -55,6 +59,12 @@ struct Args {
 
     #[arg(long, default_value_t = 82_800)]
     max_session_seconds: u64,
+
+    #[arg(long, default_value_t = DEFAULT_MAX_SPOOL_BYTES)]
+    max_spool_bytes: u64,
+
+    #[arg(long, default_value_t = DEFAULT_MIN_FREE_BYTES)]
+    min_free_bytes: u64,
 
     #[arg(long, required_unless_present = "self_test")]
     account_secret_file: Option<PathBuf>,
@@ -86,17 +96,22 @@ impl Args {
             || !(60..=3_599).contains(&self.keepalive_seconds)
             || !(1..=60).contains(&self.request_timeout_seconds)
             || !(300..=86_400).contains(&self.max_session_seconds)
+            || self.max_spool_bytes == 0
+            || self.min_free_bytes == 0
         {
-            bail!("collector intervals and timeout must stay within their safe bounds");
+            bail!("collector arguments must stay within their safe bounds");
         }
         Ok(())
     }
 }
 
+#[derive(Clone)]
 struct AccountSource {
     client: reqwest::Client,
     api_key: String,
     signer: BinanceSigner,
+    runtime_account_id: String,
+    account_fingerprint: String,
 }
 
 #[derive(Deserialize)]
@@ -110,7 +125,9 @@ struct BinanceAccountSecret {
 impl AccountSource {
     fn from_secret_file(path: &Path, timeout: Duration) -> Result<Self> {
         let secret = read_account_secret(path)?;
+        let runtime_account_id = secret.runtime_account_id;
         let api_key = secret.api_key;
+        let account_fingerprint = hex::encode(Sha256::digest(api_key.as_bytes()));
         let signer = BinanceSigner::new(BinanceCredentials::new(api_key.clone(), secret.secret));
         Ok(Self {
             client: reqwest::Client::builder()
@@ -119,6 +136,8 @@ impl AccountSource {
                 .context("build Binance account HTTP client")?,
             api_key,
             signer,
+            runtime_account_id,
+            account_fingerprint,
         })
     }
 
@@ -330,6 +349,38 @@ fn validate_required_payload(event_type: &str, event: &Value) -> Result<()> {
     Ok(())
 }
 
+fn spool_usage_bytes(root: &Path) -> Result<u64> {
+    let mut directories = vec![root.to_path_buf()];
+    let mut bytes = 0_u64;
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                bail!("private account spool contains a symlink");
+            }
+            if file_type.is_dir() {
+                directories.push(entry.path());
+            } else if file_type.is_file() {
+                bytes = bytes
+                    .checked_add(entry.metadata()?.len())
+                    .context("private account spool size overflowed")?;
+            } else {
+                bail!("private account spool contains a special file");
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+fn enforce_spool_bounds(root: &Path, max_spool_bytes: u64, min_free_bytes: u64) -> Result<u64> {
+    let used = spool_usage_bytes(root)?;
+    if used > max_spool_bytes || fs4::available_space(root)? < min_free_bytes {
+        bail!("private account spool crossed its fail-closed storage bound");
+    }
+    Ok(used)
+}
+
 struct AccountSegment {
     start_ns: u64,
     end_ns: u64,
@@ -338,6 +389,11 @@ struct AccountSegment {
     writer: BufWriter<File>,
     counts: BTreeMap<String, u64>,
     zstd_timeout: Duration,
+    runtime_account_id: String,
+    account_fingerprint: String,
+    base_spool_bytes: u64,
+    max_spool_bytes: u64,
+    min_free_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -350,7 +406,16 @@ struct AccountSegmentArtifacts {
 }
 
 impl AccountSegment {
-    fn create(root: &Path, start_ns: u64, zstd_timeout: Duration) -> Result<Self> {
+    fn create(
+        root: &Path,
+        start_ns: u64,
+        zstd_timeout: Duration,
+        runtime_account_id: &str,
+        account_fingerprint: &str,
+        max_spool_bytes: u64,
+        min_free_bytes: u64,
+    ) -> Result<Self> {
+        let base_spool_bytes = enforce_spool_bounds(root, max_spool_bytes, min_free_bytes)?;
         let (date, hour) = segment_partition(start_ns)?;
         let directory = root
             .join(format!("date={date}"))
@@ -372,6 +437,11 @@ impl AccountSegment {
             writer: BufWriter::with_capacity(64 * 1024, file),
             counts: BTreeMap::new(),
             zstd_timeout,
+            runtime_account_id: runtime_account_id.to_owned(),
+            account_fingerprint: account_fingerprint.to_owned(),
+            base_spool_bytes,
+            max_spool_bytes,
+            min_free_bytes,
         })
     }
 
@@ -383,6 +453,8 @@ impl AccountSegment {
             "schema": DATA_SCHEMA,
             "received_at_ns": received_at_ns,
             "type": event_type,
+            "runtime_account_id": self.runtime_account_id,
+            "account_fingerprint": self.account_fingerprint,
             "payload": payload,
         });
         let mut bytes = serde_json::to_vec(&row)?;
@@ -390,6 +462,12 @@ impl AccountSegment {
         self.writer.write_all(&bytes)?;
         self.writer.flush()?;
         self.writer.get_ref().sync_data()?;
+        let segment_bytes = self.writer.get_ref().metadata()?.len();
+        if self.base_spool_bytes.saturating_add(segment_bytes) > self.max_spool_bytes
+            || fs4::available_space(&self.root)? < self.min_free_bytes
+        {
+            bail!("private account spool crossed its fail-closed storage bound");
+        }
         self.end_ns = self.end_ns.max(received_at_ns);
         *self.counts.entry(event_type.to_owned()).or_default() += 1;
         Ok(())
@@ -402,6 +480,11 @@ impl AccountSegment {
         if self.path.metadata()?.len() == 0 {
             fs::remove_file(self.path)?;
             return Ok(None);
+        }
+
+        let raw_bytes = self.path.metadata()?.len();
+        if fs4::available_space(&self.root)? < self.min_free_bytes.saturating_add(raw_bytes) {
+            bail!("private account spool lacks room to seal its active segment");
         }
 
         let data = self
@@ -436,6 +519,12 @@ impl AccountSegment {
                 .unwrap_or_default()
         ));
         let events = self.counts.values().sum::<u64>();
+        let capture_gap_events = self.counts.get("CAPTURE_GAP").copied().unwrap_or(0);
+        let order_lifecycle_truth = if capture_gap_events == 0 {
+            "session_observed_only"
+        } else {
+            "incomplete_gap_recorded"
+        };
         atomic_write_json(
             &manifest,
             &json!({
@@ -445,11 +534,16 @@ impl AccountSegment {
                 "market": "usdm",
                 "dataset": DATASET,
                 "source_revision": BUILD_SOURCE_REVISION,
+                "runtime_account_id": self.runtime_account_id,
+                "account_fingerprint": self.account_fingerprint,
                 "private_data": true,
                 "credentials_in_artifact": false,
                 "stream_types": ["ORDER_TRADE_UPDATE", "ACCOUNT_UPDATE"],
                 "ordering_contract": "nondecreasing E and T per event type; exact consecutive duplicates fail closed within one websocket session",
-                "gap_detection": "no exchange sequence id; reconcile with REST account snapshots",
+                "gap_detection": "no exchange sequence id; CAPTURE_GAP is terminal for missed order lifecycle events",
+                "rest_reconciliation_scope": "current balances and positions only; never recovers missed order events",
+                "capture_gap_events": capture_gap_events,
+                "order_lifecycle_truth": order_lifecycle_truth,
                 "events": events,
                 "event_types": self.counts,
                 "start_received_at_ns": self.start_ns,
@@ -480,6 +574,7 @@ impl AccountSegment {
         )?;
         fs::remove_file(&self.path)?;
         sync_parent(&data)?;
+        enforce_spool_bounds(&self.root, self.max_spool_bytes, self.min_free_bytes)?;
         Ok(Some(AccountSegmentArtifacts {
             data,
             manifest,
@@ -533,6 +628,18 @@ fn incomplete_artifacts(root: &Path) -> Result<Vec<PathBuf>> {
     }
     incomplete.sort();
     Ok(incomplete)
+}
+
+fn verify_spool_ready(root: &Path, max_spool_bytes: u64, min_free_bytes: u64) -> Result<()> {
+    enforce_spool_bounds(root, max_spool_bytes, min_free_bytes)?;
+    let incomplete = incomplete_artifacts(root)?;
+    if !incomplete.is_empty() {
+        bail!(
+            "private account spool contains {} incomplete artifacts",
+            incomplete.len()
+        );
+    }
+    Ok(())
 }
 
 fn atomic_write_json(path: &Path, value: &Value) -> Result<()> {
@@ -598,7 +705,15 @@ async fn rotate_if_due(
     if !segment.should_rotate(received_at_ns, args.segment_seconds) {
         return Ok(());
     }
-    let mut next = AccountSegment::create(&segment.root, received_at_ns, ZSTD_TIMEOUT)?;
+    let mut next = AccountSegment::create(
+        &segment.root,
+        received_at_ns,
+        ZSTD_TIMEOUT,
+        &segment.runtime_account_id,
+        &segment.account_fingerprint,
+        segment.max_spool_bytes,
+        segment.min_free_bytes,
+    )?;
     next.write(
         "SESSION_CONTINUED",
         json!({"session_id":session_id}),
@@ -607,6 +722,29 @@ async fn rotate_if_due(
     let previous = std::mem::replace(segment, next);
     previous.close()?;
     Ok(())
+}
+
+fn spawn_reconciliation(
+    source: AccountSource,
+    delay: Duration,
+) -> JoinHandle<Result<TimedAccountSnapshot>> {
+    tokio::spawn(async move {
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        source.reconcile().await
+    })
+}
+
+fn spawn_keepalive(
+    source: AccountSource,
+    listen_key: String,
+    delay: Duration,
+) -> JoinHandle<Result<()>> {
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        source.keepalive(&listen_key).await
+    })
 }
 
 async fn run_session(
@@ -621,7 +759,15 @@ async fn run_session(
         .map_err(|_| anyhow::anyhow!("Binance private websocket connection failed"))?;
     let session_id = format!("{:x}-{}", now_ns()?, std::process::id());
     let start_ns = now_ns()?;
-    let mut segment = AccountSegment::create(&args.output_root, start_ns, ZSTD_TIMEOUT)?;
+    let mut segment = AccountSegment::create(
+        &args.output_root,
+        start_ns,
+        ZSTD_TIMEOUT,
+        &source.runtime_account_id,
+        &source.account_fingerprint,
+        args.max_spool_bytes,
+        args.min_free_bytes,
+    )?;
     segment.write(
         "SESSION_START",
         json!({
@@ -630,25 +776,11 @@ async fn run_session(
         }),
         start_ns,
     )?;
+    let mut reconciliation = spawn_reconciliation(source.clone(), Duration::ZERO);
+    let keepalive_delay = Duration::from_secs(args.keepalive_seconds);
+    let mut keepalive = spawn_keepalive(source.clone(), listen_key.clone(), keepalive_delay);
     let result: Result<bool> = async {
-        let initial = source.reconcile().await?;
-        segment.write(
-            "REST_ACCOUNT_RECONCILIATION",
-            json!({
-                "session_id":session_id,
-                "requested_at_ns":initial.requested_at_ns,
-                "account":initial.value,
-            }),
-            initial.received_at_ns,
-        )?;
-
         let mut clocks = UserEventClockValidator::default();
-        let mut reconcile_interval =
-            tokio::time::interval(Duration::from_secs(args.reconciliation_seconds));
-        let mut keepalive_interval =
-            tokio::time::interval(Duration::from_secs(args.keepalive_seconds));
-        reconcile_interval.tick().await;
-        keepalive_interval.tick().await;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(args.max_session_seconds);
 
         loop {
@@ -662,13 +794,15 @@ async fn run_session(
                 _ = tokio::time::sleep_until(deadline) => {
                     break Ok(false);
                 }
-                _ = keepalive_interval.tick() => {
-                    if source.keepalive(&listen_key).await.is_err() {
+                kept_alive = &mut keepalive => {
+                    if kept_alive.is_err() || kept_alive.is_ok_and(|result| result.is_err()) {
                         break Err(anyhow::anyhow!("private websocket keepalive failed"));
                     }
+                    keepalive = spawn_keepalive(source.clone(), listen_key.clone(), keepalive_delay);
                 }
-                _ = reconcile_interval.tick() => {
-                    let snapshot = source.reconcile().await
+                reconciled = &mut reconciliation => {
+                    let snapshot = reconciled
+                        .map_err(|_| anyhow::anyhow!("private account reconciliation task failed"))?
                         .map_err(|_| anyhow::anyhow!("private account reconciliation failed"))?;
                     rotate_if_due(&mut segment, args, &session_id, snapshot.received_at_ns).await?;
                     segment.write(
@@ -680,6 +814,10 @@ async fn run_session(
                         }),
                         snapshot.received_at_ns,
                     )?;
+                    reconciliation = spawn_reconciliation(
+                        source.clone(),
+                        Duration::from_secs(args.reconciliation_seconds),
+                    );
                 }
                 message = websocket.next() => {
                     let received_at_ns = now_ns()?;
@@ -740,19 +878,33 @@ async fn run_session(
     }
     .await;
 
+    reconciliation.abort();
+    keepalive.abort();
+
     let end_ns = now_ns()?;
     let reason = match &result {
         Ok(true) => "shutdown".to_owned(),
-        Ok(false) => "completed".to_owned(),
+        Ok(false) => "session_rollover".to_owned(),
         Err(error) => error.to_string(),
     };
-    let final_write = segment.write(
+    let gap_write = segment.write(
+        "CAPTURE_GAP",
+        json!({
+            "session_id":session_id,
+            "reason":reason,
+            "terminal_for_order_lifecycle":true,
+            "rest_reconciliation_recovers_order_history":false,
+        }),
+        end_ns,
+    );
+    let end_write = segment.write(
         "SESSION_END",
         json!({"session_id":session_id,"reason":reason}),
         end_ns,
     );
     let final_close = segment.close();
-    final_write?;
+    gap_write?;
+    end_write?;
     final_close?;
     result
 }
@@ -787,7 +939,15 @@ fn self_test() -> Result<()> {
     fs::set_permissions(&output, fs::Permissions::from_mode(0o700))?;
     ensure_private_directory(&output)?;
     let start_ns = now_ns()?;
-    let mut segment = AccountSegment::create(&output, start_ns, Duration::from_secs(30))?;
+    let mut segment = AccountSegment::create(
+        &output,
+        start_ns,
+        Duration::from_secs(30),
+        "self-test-account",
+        &"0".repeat(64),
+        u64::MAX,
+        0,
+    )?;
     segment.write(
         "ORDER_TRADE_UPDATE",
         json!({"event":{"e":"ORDER_TRADE_UPDATE","E":1,"T":1,"o":{"s":"BTCUSDT","c":"self-test","i":1,"x":"NEW","X":"NEW","q":"1","z":"0","l":"0","L":"0","t":0,"m":false}}}),
@@ -818,13 +978,7 @@ async fn main() -> Result<()> {
     }
     ensure_private_directory(&args.output_root)?;
     let _lock = SpoolLock::acquire(&args.output_root)?;
-    let incomplete = incomplete_artifacts(&args.output_root)?;
-    if !incomplete.is_empty() {
-        bail!(
-            "private account spool contains {} incomplete artifacts",
-            incomplete.len()
-        );
-    }
+    verify_spool_ready(&args.output_root, args.max_spool_bytes, args.min_free_bytes)?;
     let secret_file = args
         .account_secret_file
         .as_deref()
@@ -841,6 +995,14 @@ async fn main() -> Result<()> {
             Ok(true) => break,
             Ok(false) => backoff = 1,
             Err(error) => {
+                if let Err(spool_error) =
+                    verify_spool_ready(&args.output_root, args.max_spool_bytes, args.min_free_bytes)
+                {
+                    signal_task.abort();
+                    return Err(
+                        spool_error.context("private account spool is unsafe after failure")
+                    );
+                }
                 error!(error = %error, backoff, "private account session failed; reconnecting");
                 let mut retry_shutdown = shutdown_rx.clone();
                 tokio::select! {
@@ -918,8 +1080,16 @@ mod tests {
             .unwrap();
         let output = fs::canonicalize(root.path()).unwrap();
         let start_ns = 1_700_000_000_000_000_000;
-        let mut segment =
-            AccountSegment::create(&output, start_ns, Duration::from_secs(30)).unwrap();
+        let mut segment = AccountSegment::create(
+            &output,
+            start_ns,
+            Duration::from_secs(30),
+            "research-account",
+            &"a".repeat(64),
+            u64::MAX,
+            0,
+        )
+        .unwrap();
         segment
             .write(
                 "ORDER_TRADE_UPDATE",
@@ -932,6 +1102,13 @@ mod tests {
                 "REST_ACCOUNT_RECONCILIATION",
                 json!({"account":{"assets":[],"positions":[]}}),
                 start_ns + 1,
+            )
+            .unwrap();
+        segment
+            .write(
+                "CAPTURE_GAP",
+                json!({"terminal_for_order_lifecycle":true}),
+                start_ns + 2,
             )
             .unwrap();
         let artifacts = segment.close().unwrap().unwrap();
@@ -956,11 +1133,17 @@ mod tests {
         .unwrap();
         assert_eq!(first_row["payload"]["event"]["o"]["c"], "client-1");
         assert_eq!(first_row["payload"]["event"]["o"]["i"], 42);
+        assert_eq!(first_row["runtime_account_id"], "research-account");
+        assert_eq!(first_row["account_fingerprint"], "a".repeat(64));
         let manifest: Value =
             serde_json::from_reader(File::open(&artifacts.manifest).unwrap()).unwrap();
         assert_eq!(manifest["dataset"], DATASET);
         assert_eq!(manifest["source_revision"], BUILD_SOURCE_REVISION);
         assert_eq!(manifest["credentials_in_artifact"], false);
+        assert_eq!(manifest["runtime_account_id"], "research-account");
+        assert_eq!(manifest["account_fingerprint"], "a".repeat(64));
+        assert_eq!(manifest["capture_gap_events"], 1);
+        assert_eq!(manifest["order_lifecycle_truth"], "incomplete_gap_recorded");
         assert_eq!(
             manifest["stream_types"],
             json!(["ORDER_TRADE_UPDATE", "ACCOUNT_UPDATE"])
@@ -994,7 +1177,18 @@ mod tests {
         let part = output.join("orphan.jsonl.part");
         fs::write(&part, b"preserve me\n").unwrap();
         assert_eq!(incomplete_artifacts(&output).unwrap(), vec![part.clone()]);
+        assert!(verify_spool_ready(&output, u64::MAX, 0).is_err());
         assert!(part.is_file());
+    }
+
+    #[test]
+    fn private_spool_bounds_fail_closed_without_deleting_data() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("sealed-data");
+        fs::write(&path, b"preserve me").unwrap();
+        assert!(enforce_spool_bounds(root.path(), 1, 0).is_err());
+        assert!(enforce_spool_bounds(root.path(), u64::MAX, u64::MAX).is_err());
+        assert!(path.is_file());
     }
 
     #[test]
