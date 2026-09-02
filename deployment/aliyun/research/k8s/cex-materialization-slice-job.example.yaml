@@ -5,8 +5,10 @@
 # does not run PIT, replay, or final receipt publication. backoffLimit stays 0
 # so a failed shard is not silently retried.
 #
-# Benchmark shard-count 1 then 2, 4, and 8 on ACK before raising parallelism.
-# Shared OSS CSI can make high fan-out slower if the bottleneck is I/O.
+# Keep completions at the shard split (8 here). Start parallelism at 1, then
+# time 2, 4, and 8 on ACK before raising fan-out. Shared OSS CSI can make high
+# concurrency slower if the bottleneck is I/O. The entrypoint reads the shard
+# index from the JOB_COMPLETION_INDEX env downward API, not from Job args.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -28,7 +30,7 @@ spec:
   suspend: true
   completionMode: Indexed
   completions: 8
-  parallelism: 2
+  parallelism: 1
   backoffLimit: 0
   activeDeadlineSeconds: 3600
   ttlSecondsAfterFinished: 86400
@@ -58,18 +60,23 @@ spec:
         - name: cex-materialization-slice
           image: crpi-ygobwehhof7qs9m3-vpc.ap-northeast-1.personal.cr.aliyuncs.com/wildcard0923/research-runner@sha256:REPLACE_WITH_IMMUTABLE_DIGEST
           imagePullPolicy: IfNotPresent
-          command: ["/bin/sh", "-c"]
+          command: ["/bin/sh"]
           args:
-            - >
-              exec /contract/cex-materialization-entrypoint.sh
-              --inventory /inventory/frozen.env
-              --raw-root /lake/raw
-              --output-root /lake/output
-              --work-dir /work
-              --binary-dir /usr/local/bin
-              --role slice
-              --shard-index "$JOB_COMPLETION_INDEX"
-              --shard-count 8
+            - /contract/cex-materialization-entrypoint.sh
+            - --inventory
+            - /inventory/frozen.env
+            - --raw-root
+            - /lake/raw
+            - --output-root
+            - /lake/output
+            - --work-dir
+            - /work
+            - --binary-dir
+            - /usr/local/bin
+            - --role
+            - slice
+            - --shard-count
+            - "8"
           env:
             - name: JOB_COMPLETION_INDEX
               valueFrom:

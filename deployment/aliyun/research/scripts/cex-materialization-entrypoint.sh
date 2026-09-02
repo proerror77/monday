@@ -628,15 +628,26 @@ load_shard_receipts() {
   : >"$seen_indexes"
   shard_i=0
   while [ "$shard_i" -lt "$SHARD_COUNT" ]; do
-    shard_receipt=$SHARD_ROOT/$shard_i/receipt.json
-    shard_manifest=$SHARD_ROOT/$shard_i/segments
+    shard_bounds "$shard_i" "$SHARD_COUNT" "$raw_segment_count"
+    expected_start=$SHARD_START
+    expected_end=$SHARD_END
+    shard_dir=$SHARD_ROOT/$shard_i
+    shard_receipt=$shard_dir/receipt.json
+    shard_manifest=$shard_dir/segments
+    shard_success=$shard_dir/_SUCCESS
     [ -f "$shard_receipt" ] || die "shard receipt is missing: $shard_receipt"
     [ -f "$shard_manifest" ] || die "shard segment list is missing: $shard_manifest"
+    [ -f "$shard_success" ] || die "shard success marker is missing: $shard_success"
     [ "$(json_string_field schema_version "$shard_receipt")" = "monday.cex_materialization_shard_receipt.v1" ] || die "shard $shard_i schema drifted"
     [ "$(json_string_field run_id "$shard_receipt")" = "$run_id" ] || die "shard $shard_i run_id drifted"
     [ "$(json_string_field inventory_sha256 "$shard_receipt")" = "$inventory_sha256" ] || die "shard $shard_i inventory SHA drifted"
     [ "$(json_string_field shard_index "$shard_receipt")" = "$shard_i" ] || die "shard $shard_i index drifted"
     [ "$(json_string_field shard_count "$shard_receipt")" = "$SHARD_COUNT" ] || die "shard $shard_i count drifted"
+    [ "$(json_string_field segment_start "$shard_receipt")" = "$expected_start" ] || die "shard $shard_i segment_start drifted"
+    [ "$(json_string_field segment_end "$shard_receipt")" = "$expected_end" ] || die "shard $shard_i segment_end drifted"
+    receipt_sha=$(sha256_file "$shard_receipt")
+    [ "$(cat "$shard_success")" = "$receipt_sha" ] || die "shard $shard_i success marker mismatch"
+    expected_next=$expected_start
     while IFS='	' read -r segment_index relative_path slice_sha slice_manifest_sha || [ -n "$segment_index" ]; do
       [ -n "$segment_index" ] || continue
       case "$segment_index" in
@@ -644,7 +655,8 @@ load_shard_receipts() {
           die "shard $shard_i has an invalid segment index: $segment_index"
           ;;
       esac
-      [ "$segment_index" -le "$raw_segment_count" ] || die "shard $shard_i segment $segment_index exceeds RAW_SEGMENT_COUNT"
+      [ "$segment_index" -eq "$expected_next" ] || die "shard $shard_i segment out of order: expected $expected_next observed $segment_index"
+      [ "$segment_index" -le "$expected_end" ] || die "shard $shard_i segment $segment_index exceeds shard bounds"
       grep -qx "$segment_index" "$seen_indexes" && die "duplicate sliced segment: $segment_index"
       printf '%s\n' "$segment_index" >>"$seen_indexes"
       canonical_relpath "$relative_path" || die "shard $shard_i segment $segment_index path is unsafe"
@@ -660,7 +672,9 @@ load_shard_receipts() {
       printf '%s\n' "$published_slice" >"$STATE_ROOT/slice-$segment_index.path"
       printf '%s\n' "$slice_sha" >"$STATE_ROOT/slice-$segment_index.sha256"
       printf '%s\n' "$slice_manifest_sha" >"$STATE_ROOT/slice-$segment_index.manifest-sha256"
+      expected_next=$((expected_next + 1))
     done <"$shard_manifest"
+    [ "$expected_next" -eq $((expected_end + 1)) ] || die "shard $shard_i did not cover $expected_start..$expected_end"
     progress_event shard_reduce $((shard_i + 1)) "$SHARD_COUNT" 1
     shard_i=$((shard_i + 1))
   done

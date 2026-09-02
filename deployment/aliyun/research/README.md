@@ -289,11 +289,14 @@ Campaign execution stays a single Pod; this change only parallelizes
 materialization slicing. Final PIT, replay, receipt publication, and sealed
 holdout remain single-writer.
 
-Before raising fan-out, time the same frozen inventory at shard-count 1, then 2,
-4, and 8 on ACK. Inputs and shard outputs share the OSS CSI volume; if the
-bottleneck is OSS I/O, more Pods can be slower. Historical CPU/I/O for completed
-Pods is not retained, so the first cloud run is a benchmark, not a claim that
-CPU was previously wasted.
+The Indexed example keeps `completions: 8` as the shard split and starts at
+`parallelism: 1`. Time that same frozen inventory at parallelism 1, then 2, 4,
+and 8 on ACK before raising fan-out. Inputs and shard outputs share the OSS CSI
+volume; if the bottleneck is OSS I/O, more Pods can be slower. Historical
+CPU/I/O for completed Pods is not retained, so the first cloud run is a
+benchmark, not a claim that CPU was previously wasted. The slice Job reads
+`JOB_COMPLETION_INDEX` from the downward API; Kubernetes args do not expand
+`$(JOB_COMPLETION_INDEX)`.
 
 The Job template starts suspended. Read back the rendered inventory, output PV/PVC
 identities, and mounted lane root first, then unsuspend explicitly.
