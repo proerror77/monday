@@ -2663,6 +2663,10 @@ run_readback_fixture() {
       and .health_policy_verified == true
       and .process_identity.spot.unit_file_state == "enabled"
       and .process_identity.usdm.unit_file_state == "enabled"' "$readback_out" >/dev/null
+    grep -Fq '  local observed_active market' "$SCRIPT_DIR/host-rust-lob-readback.sh" || {
+      printf 'readback stability check leaks its market loop variable\n' >&2
+      exit 1
+    }
   else
     if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_READBACK_FIXTURE_SYSTEMD=1 \
       MONDAY_READBACK_FIXTURE_PID="$readback_fixture_pid" \

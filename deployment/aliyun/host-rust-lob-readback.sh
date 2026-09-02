@@ -300,7 +300,7 @@ assert_transition_process_identity() {
 }
 assert_transition_process_identity
 assert_runtime_stable() {
-  local observed_active
+  local observed_active market
   observed_active=$(monday_active_controller_sha "$ROOT") || die 'active controller disappeared during OSS readback'
   [[ $observed_active == "$CONTROLLER" ]] || die 'active controller changed during OSS readback'
   [[ -L $production && $(readlink -- "$production") == "$production_projection" \
@@ -453,6 +453,12 @@ for market in spot usdm; do
     [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 ]] || die "${market} upload status is missing"
   fi
 done
+if [[ $TEST_ONLY == false ]]; then
+  jq -e 'length == 2 and (map(.market) | sort) == ["spot", "usdm"]' <<<"$markets" >/dev/null \
+    || die 'paired OSS readback did not cover exactly Spot and USD-M'
+  jq -e '(keys | sort) == ["spot", "usdm"]' <<<"$status_observations" >/dev/null \
+    || die 'paired upload-status readback did not cover exactly Spot and USD-M'
+fi
 
 # OSS reads are independent, and each triplet was bracketed by this same
 # active-pair/process check.  Re-read and hash both status files together
