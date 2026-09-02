@@ -2004,12 +2004,12 @@ fn run_cex_supervised_model_research(
             "walk_forward_folds": context.folds().len(),
         }),
     );
-    let ridge =
-        evaluate_cex_supervised_model(context, factor_bank, ridge).map_err(anyhow::Error::msg)?;
-    let cart =
-        evaluate_cex_supervised_model(context, factor_bank, cart).map_err(anyhow::Error::msg)?;
-    let burn =
-        evaluate_cex_supervised_model(context, factor_bank, burn).map_err(anyhow::Error::msg)?;
+    let ridge = evaluate_cex_supervised_model(context, factor_bank, ridge)
+        .map_err(|error| anyhow::anyhow!("ridge supervised evaluation failed: {error}"))?;
+    let cart = evaluate_cex_supervised_model(context, factor_bank, cart)
+        .map_err(|error| anyhow::anyhow!("shallow CART supervised evaluation failed: {error}"))?;
+    let burn = evaluate_cex_supervised_model(context, factor_bank, burn)
+        .map_err(|error| anyhow::anyhow!("Burn MLP supervised evaluation failed: {error}"))?;
     for (name, evaluation) in [("ridge", &ridge), ("cart", &cart), ("burn_mlp", &burn)] {
         evaluation.validate().map_err(anyhow::Error::msg)?;
         store.put_registry_revision(&RegistryRevision {

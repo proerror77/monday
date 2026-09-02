@@ -1215,6 +1215,11 @@ pub struct CandidateEvaluation {
 impl CandidateEvaluation {
     pub fn validate(&self) -> Result<(), DomainError> {
         self.validate_inner(false)
+            .map_err(|_| DomainError::InvalidEvaluationEvidence)
+    }
+
+    pub fn validate_reason(&self) -> Result<(), String> {
+        self.validate_inner(false).map_err(str::to_string)
     }
 
     /// Compatibility-only validation for restoring proposal-engine search state.
@@ -1230,9 +1235,10 @@ impl CandidateEvaluation {
                     | "onnx-purged-walk-forward-v2"
             );
         self.validate_inner(legacy_unbound_walk_forward)
+            .map_err(|_| DomainError::InvalidEvaluationEvidence)
     }
 
-    fn validate_inner(&self, allow_unbound_historical_replay: bool) -> Result<(), DomainError> {
+    fn validate_inner(&self, allow_unbound_historical_replay: bool) -> Result<(), &'static str> {
         let protocol = match self.protocol_binding() {
             Ok((protocol, _)) => Some(protocol),
             Err(_)
@@ -1242,7 +1248,7 @@ impl CandidateEvaluation {
             {
                 None
             }
-            Err(_) => return Err(DomainError::InvalidEvaluationEvidence),
+            Err(_) => return Err("protocol binding is invalid"),
         };
         let finite_metrics = [
             self.metrics.mean_net_return,
@@ -1283,13 +1289,13 @@ impl CandidateEvaluation {
             .folds
             .iter()
             .try_fold(0_usize, |total, fold| total.checked_add(fold.row_count))
-            .ok_or(DomainError::InvalidEvaluationEvidence)?;
+            .ok_or("fold row counts overflowed")?;
         let trade_count = self
             .metrics
             .folds
             .iter()
             .try_fold(0_usize, |total, fold| total.checked_add(fold.trade_count))
-            .ok_or(DomainError::InvalidEvaluationEvidence)?;
+            .ok_or("fold trade counts overflowed")?;
         let total_turnover = self
             .metrics
             .folds
@@ -1329,34 +1335,62 @@ impl CandidateEvaluation {
             .map(|fold| fold.net_sharpe)
             .sum::<f64>()
             / self.metrics.folds.len().max(1) as f64;
-        if self.evaluator_version.trim().is_empty()
-            || !self.evaluator_config.is_object()
-            || self.metrics.row_count == 0
-            || self.metrics.folds.is_empty()
-            || !self.score.is_finite()
-            || !finite_metrics
-            || self.metrics.max_drawdown < 0.0
-            || self.metrics.total_turnover < 0.0
-            || !self.metrics.predictive.valid_for(&self.metrics.folds)
-            || self.metrics.predictive.row_count != self.metrics.row_count
-            || self.score.to_bits() != self.metrics.adjusted_score.to_bits()
-            || self.passed != self.failure_reasons.is_empty()
-            || row_count != self.metrics.row_count
-            || trade_count != self.metrics.trade_count
-            || !approximately_equal(total_turnover, self.metrics.total_turnover)
-            || self
-                .metrics
-                .folds
-                .iter()
-                .enumerate()
-                .any(|(index, fold)| fold.fold_index != index + 1)
-            || !approximately_equal(cumulative_net_return, self.metrics.cumulative_net_return)
-            || !approximately_equal(weighted_mean, self.metrics.mean_net_return)
-            || !approximately_equal(maximum_drawdown, self.metrics.max_drawdown)
-            || !approximately_equal(net_sharpe, self.metrics.net_sharpe)
-            || !approximately_equal(raw_score, self.metrics.raw_score)
+        if self.evaluator_version.trim().is_empty() {
+            return Err("evaluator version is empty");
+        }
+        if !self.evaluator_config.is_object() {
+            return Err("evaluator config is not an object");
+        }
+        if self.metrics.row_count == 0 || self.metrics.folds.is_empty() {
+            return Err("evaluation has no rows or folds");
+        }
+        if !self.score.is_finite() || !finite_metrics {
+            return Err("score or fold metrics are non-finite");
+        }
+        if self.metrics.max_drawdown < 0.0 || self.metrics.total_turnover < 0.0 {
+            return Err("drawdown or turnover is negative");
+        }
+        if !self.metrics.predictive.valid_for(&self.metrics.folds) {
+            return Err("predictive metrics do not match trading folds");
+        }
+        if self.metrics.predictive.row_count != self.metrics.row_count {
+            return Err("predictive row count does not match trading row count");
+        }
+        if self.score.to_bits() != self.metrics.adjusted_score.to_bits() {
+            return Err("score bits do not match adjusted_score");
+        }
+        if self.passed != self.failure_reasons.is_empty() {
+            return Err("passed flag does not match failure reasons");
+        }
+        if row_count != self.metrics.row_count || trade_count != self.metrics.trade_count {
+            return Err("aggregate row or trade count does not match folds");
+        }
+        if !approximately_equal(total_turnover, self.metrics.total_turnover) {
+            return Err("aggregate turnover does not match folds");
+        }
+        if self
+            .metrics
+            .folds
+            .iter()
+            .enumerate()
+            .any(|(index, fold)| fold.fold_index != index + 1)
         {
-            return Err(DomainError::InvalidEvaluationEvidence);
+            return Err("fold indexes are not contiguous");
+        }
+        if !approximately_equal(cumulative_net_return, self.metrics.cumulative_net_return) {
+            return Err("aggregate cumulative return does not match folds");
+        }
+        if !approximately_equal(weighted_mean, self.metrics.mean_net_return) {
+            return Err("weighted fold mean does not match aggregate mean");
+        }
+        if !approximately_equal(maximum_drawdown, self.metrics.max_drawdown) {
+            return Err("aggregate drawdown does not match folds");
+        }
+        if !approximately_equal(net_sharpe, self.metrics.net_sharpe) {
+            return Err("aggregate Sharpe does not match folds");
+        }
+        if !approximately_equal(raw_score, self.metrics.raw_score) {
+            return Err("aggregate raw score does not match folds");
         }
         if let Some(protocol) = protocol {
             let (expected_folds, expected_rows, expected_fold_rows) =
@@ -1369,7 +1403,7 @@ impl CandidateEvaluation {
                             .walk_forward
                             .validation_rows
                             .checked_mul(protocol.walk_forward.fold_count)
-                            .ok_or(DomainError::InvalidEvaluationEvidence)?,
+                            .ok_or("walk-forward row count overflowed")?,
                         protocol.walk_forward.validation_rows,
                     ),
                     SEALED_HOLDOUT_EVALUATOR_VERSION | ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION => (
@@ -1387,19 +1421,25 @@ impl CandidateEvaluation {
                         .folds
                         .iter()
                         .any(|fold| fold.row_count != expected_fold_rows))
-                || if protocol.costs.capacity_enabled() {
-                    self.metrics
-                        .folds
-                        .iter()
-                        .any(|fold| fold.max_book_depth_fraction.is_none())
-                } else {
-                    self.metrics
-                        .folds
-                        .iter()
-                        .any(|fold| fold.max_book_depth_fraction.is_some())
-                }
             {
-                return Err(DomainError::InvalidEvaluationEvidence);
+                return Err("fold counts do not match the evaluation protocol");
+            }
+            if protocol.costs.capacity_enabled() {
+                if self
+                    .metrics
+                    .folds
+                    .iter()
+                    .any(|fold| fold.max_book_depth_fraction.is_none())
+                {
+                    return Err("capacity-enabled protocol is missing book-depth fractions");
+                }
+            } else if self
+                .metrics
+                .folds
+                .iter()
+                .any(|fold| fold.max_book_depth_fraction.is_some())
+            {
+                return Err("capacity-disabled protocol has book-depth fractions");
             }
         }
         if matches!(
@@ -1410,7 +1450,9 @@ impl CandidateEvaluation {
                 | ONNX_WALK_FORWARD_EVALUATOR_VERSION
                 | ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION
         ) {
-            let config = self.formula_config()?;
+            let config = self
+                .formula_config()
+                .map_err(|_| "evaluator config is invalid")?;
             let require_icir = matches!(
                 self.evaluator_version.as_str(),
                 WALK_FORWARD_EVALUATOR_VERSION
@@ -1434,13 +1476,14 @@ impl CandidateEvaluation {
                 })
                 && capacity_passed
                 && self.metrics.adjusted_score >= config.min_aggregate_score;
-            if self.passed != policy_passed
-                || !approximately_equal(
-                    config.adjusted_score(self.metrics.raw_score)?,
-                    self.metrics.adjusted_score,
-                )
-            {
-                return Err(DomainError::InvalidEvaluationEvidence);
+            if self.passed != policy_passed {
+                return Err("passed flag does not match evaluator policy");
+            }
+            let expected_adjusted = config
+                .adjusted_score(self.metrics.raw_score)
+                .map_err(|_| "adjusted score is not finite")?;
+            if !approximately_equal(expected_adjusted, self.metrics.adjusted_score) {
+                return Err("adjusted score does not match the evaluator formula");
             }
         }
         Ok(())

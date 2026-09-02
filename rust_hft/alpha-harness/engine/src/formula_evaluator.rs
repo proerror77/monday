@@ -412,7 +412,6 @@ impl FormulaEvaluator {
             self.predictive_gates(rows, predictions, &ranges, evaluator_version);
 
         let mut fold_metrics = Vec::with_capacity(ranges.len());
-        let mut all_returns = Vec::new();
         let mut ledger = Vec::new();
         let mut equity = 1.0_f64;
         for (fold_index, range) in ranges.into_iter().enumerate() {
@@ -489,14 +488,9 @@ impl FormulaEvaluator {
                 raw_score,
                 max_book_depth_fraction,
             });
-            all_returns.extend(returns);
         }
-        let raw_score = mean(
-            &fold_metrics
-                .iter()
-                .map(|fold| fold.raw_score)
-                .collect::<Vec<_>>(),
-        );
+        let raw_score = fold_metrics.iter().map(|fold| fold.raw_score).sum::<f64>()
+            / fold_metrics.len().max(1) as f64;
         let adjusted_score = self
             .config
             .adjusted_score(raw_score)
@@ -511,23 +505,27 @@ impl FormulaEvaluator {
             predictive,
             failures,
         } = predictive_stage;
+        let row_count = fold_metrics.iter().map(|fold| fold.row_count).sum();
         let metrics = EvaluationMetrics {
             predictive,
-            row_count: all_returns.len(),
+            row_count,
             trade_count: fold_metrics.iter().map(|fold| fold.trade_count).sum(),
             total_turnover: fold_metrics.iter().map(|fold| fold.total_turnover).sum(),
-            mean_net_return: mean(&all_returns),
-            cumulative_net_return: all_returns.iter().sum(),
+            mean_net_return: fold_metrics
+                .iter()
+                .map(|fold| fold.mean_net_return * fold.row_count as f64)
+                .sum::<f64>()
+                / row_count.max(1) as f64,
+            cumulative_net_return: fold_metrics
+                .iter()
+                .map(|fold| fold.cumulative_net_return)
+                .sum(),
             max_drawdown: fold_metrics
                 .iter()
                 .map(|fold| fold.max_drawdown)
                 .fold(0.0, f64::max),
-            net_sharpe: mean(
-                &fold_metrics
-                    .iter()
-                    .map(|fold| fold.net_sharpe)
-                    .collect::<Vec<_>>(),
-            ),
+            net_sharpe: fold_metrics.iter().map(|fold| fold.net_sharpe).sum::<f64>()
+                / fold_metrics.len().max(1) as f64,
             raw_score,
             adjusted_score,
             folds: fold_metrics,
@@ -544,7 +542,9 @@ impl FormulaEvaluator {
             ),
             metrics,
         };
-        evaluation.validate().map_err(|error| error.to_string())?;
+        evaluation
+            .validate_reason()
+            .map_err(|reason| format!("evaluation evidence is inconsistent: {reason}"))?;
         Ok(PositionEvaluationReport { evaluation, ledger })
     }
 }
@@ -796,8 +796,12 @@ fn transaction_cost(
         let depth_notional = row.features.get(depth_feature).copied().unwrap_or(0.0)
             * row.features.get("mid_price").copied().unwrap_or(0.0);
         if turnover > f64::EPSILON {
-            *max_fraction =
-                (*max_fraction).max(costs.position_notional_usd * turnover / depth_notional);
+            let fraction = if depth_notional.is_finite() && depth_notional > 0.0 {
+                costs.position_notional_usd * turnover / depth_notional
+            } else {
+                f64::MAX
+            };
+            *max_fraction = (*max_fraction).max(fraction);
         }
     }
     (row.fee_bps.max(0.0) - costs.rebate_bps
@@ -872,7 +876,9 @@ fn pearson_correlation(left: &[f64], right: &[f64]) -> Option<f64> {
         right_variance += right_centered.powi(2);
     }
     let denominator = (left_variance * right_variance).sqrt();
-    (denominator > 0.0).then(|| (covariance / denominator).clamp(-1.0, 1.0))
+    (denominator > 0.0)
+        .then(|| (covariance / denominator).clamp(-1.0, 1.0))
+        .filter(|value| value.is_finite())
 }
 
 fn spearman_correlation(left: &[f64], right: &[f64]) -> Option<f64> {
