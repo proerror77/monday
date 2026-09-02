@@ -192,6 +192,9 @@ old YAML, or compile Rust in-cluster. The Job:
   and checks that each `_SUCCESS` marker exists and its content equals the
   frozen data SHA-256;
 - slices only the requested symbol with `binance-market-tape-slicer`;
+- may split that slicing across a native Indexed Job (`--role slice`) and a
+  single-writer reducer (`--role reduce`) that checks every segment is present
+  exactly once and in inventory order before PIT/replay/publish;
 - runs `lob-pit-materializer` and `binance-replay-parquet-materializer`;
 - emits `monday.research_event.v1` process events to stderr while retaining the
   JSON state/receipt files: shell orchestration uses logfmt and Rust workers use
@@ -266,6 +269,31 @@ kubectl apply -f deployment/aliyun/research/k8s/cex-materialization-job.example.
 kubectl -n monday-research patch job REPLACE_MATERIALIZATION_JOB_NAME \
   --type merge -p '{"spec":{"suspend":false}}'
 ```
+
+`k8s/cex-materialization-job.example.yaml` remains the single-Pod `--role all`
+path and is the `parallelism=1` benchmark. To slice in parallel, use the
+Indexed Job example plus a later reducer; do not introduce Argo or Kubeflow:
+
+```bash
+kubectl apply -f deployment/aliyun/research/k8s/cex-materialization-slice-job.example.yaml
+kubectl -n monday-research patch job REPLACE_MATERIALIZATION_SLICE_JOB_NAME \
+  --type merge -p '{"spec":{"suspend":false}}'
+# After every indexed completion succeeds, submit the reducer.
+kubectl apply -f deployment/aliyun/research/k8s/cex-materialization-reduce-job.example.yaml
+kubectl -n monday-research patch job REPLACE_MATERIALIZATION_REDUCE_JOB_NAME \
+  --type merge -p '{"spec":{"suspend":false}}'
+```
+
+Keep `backoffLimit: 0`. A failed shard or reducer is not retried automatically.
+Campaign execution stays a single Pod; this change only parallelizes
+materialization slicing. Final PIT, replay, receipt publication, and sealed
+holdout remain single-writer.
+
+Before raising fan-out, time the same frozen inventory at shard-count 1, then 2,
+4, and 8 on ACK. Inputs and shard outputs share the OSS CSI volume; if the
+bottleneck is OSS I/O, more Pods can be slower. Historical CPU/I/O for completed
+Pods is not retained, so the first cloud run is a benchmark, not a claim that
+CPU was previously wasted.
 
 The Job template starts suspended. Read back the rendered inventory, output PV/PVC
 identities, and mounted lane root first, then unsuspend explicitly.
