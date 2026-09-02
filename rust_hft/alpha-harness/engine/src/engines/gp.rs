@@ -5,6 +5,7 @@ use crate::{
 };
 use alpha_domain::{
     CandidateArtifact, CexGpPolicyV1, EngineKind, CEX_GP_POLICY_SCHEMA_V2, CEX_GP_POLICY_SCHEMA_V3,
+    CEX_GP_POLICY_SCHEMA_V4,
 };
 use hft_factor_dsl::{FactorAst, FactorOperator, FactorTerminal};
 use std::collections::BTreeSet;
@@ -168,6 +169,7 @@ impl GeneticProgrammingEngine {
         let candidate = match policy.schema_version.as_str() {
             CEX_GP_POLICY_SCHEMA_V2 => self.atomic_dynamic_template(template_index)?,
             CEX_GP_POLICY_SCHEMA_V3 => self.dynamic_v3_template(template_index)?,
+            CEX_GP_POLICY_SCHEMA_V4 => self.dynamic_v4_template(template_index)?,
             _ => None,
         };
         if let Some(candidate) = candidate {
@@ -223,13 +225,21 @@ impl ProposalEngine for GeneticProgrammingEngine {
         }
         if let Some(ast) = self.governed_template(iteration_index)? {
             self.seen.insert(ast.to_string());
+            let hypothesis = if self
+                .governed_policy
+                .as_ref()
+                .is_some_and(|policy| policy.schema_version == CEX_GP_POLICY_SCHEMA_V4)
+            {
+                "fixed causal normalization over one registered factor field"
+            } else {
+                "fixed causal normalization and entry threshold over one registered factor field"
+            };
             return Ok(EngineProposal {
                 candidate_id: format!(
                     "{}-gp-{iteration_index}",
                     self.candidate_namespace.as_deref().unwrap_or(mission_id)
                 ),
-                hypothesis: "fixed causal normalization and entry threshold over one registered factor field"
-                    .to_string(),
+                hypothesis: hypothesis.to_string(),
                 artifact: CandidateArtifact::Formula(ast),
                 expansions: 1,
                 tokens: 0,
@@ -320,6 +330,43 @@ impl GeneticProgrammingEngine {
                 standardized_field("weighted_book_imbalance_top5")?,
                 add_one_plus_one()?,
             )?,
+            _ => return Ok(None),
+        };
+        Ok(Some(candidate))
+    }
+
+    fn dynamic_v4_template(&self, template_index: usize) -> Result<Option<FactorAst>, String> {
+        let atomic_templates = self.fields.len() * 2;
+        if template_index < atomic_templates {
+            let Some(field) = self.fields.get(template_index / 2) else {
+                return Ok(None);
+            };
+            return if template_index.is_multiple_of(2) {
+                standardized_field(field).map(Some)
+            } else {
+                standardized_delta(field).map(Some)
+            };
+        }
+        let named_index = template_index - atomic_templates;
+        let candidate = match named_index {
+            0 => negate(standardized_field("spread_bps")?)?,
+            1 => negate(standardized_delta("spread_bps")?)?,
+            2 => FactorAst::call(
+                FactorOperator::Add,
+                vec![
+                    standardized_field("book_imbalance")?,
+                    standardized_field("weighted_book_imbalance_top5")?,
+                ],
+            )
+            .map_err(|error| error.to_string())?,
+            3 => FactorAst::call(
+                FactorOperator::Sub,
+                vec![
+                    standardized_field("weighted_book_imbalance_top5")?,
+                    standardized_field("book_imbalance")?,
+                ],
+            )
+            .map_err(|error| error.to_string())?,
             _ => return Ok(None),
         };
         Ok(Some(candidate))
@@ -747,7 +794,7 @@ mod tests {
     }
 
     #[test]
-    fn governed_gp_v3_emits_sixteen_atomic_then_four_named_templates() {
+    fn governed_gp_v3_preserves_thresholded_templates() {
         let budget = governed_budget(20);
         let fields = named_template_fields();
         let v2_templates = governed_templates(
@@ -759,11 +806,10 @@ mod tests {
             "3fb55524158416564acd9c01dd780b2b3b9934c990fb764ae93afef38a1504d4"
         );
         let templates = governed_templates(
-            CexGpPolicyV1::controlled_dynamic_v3("policy", fields, 7, &budget).unwrap(),
+            CexGpPolicyV1::controlled_dynamic_v3("policy", fields.clone(), 7, &budget).unwrap(),
             20,
         );
         assert_eq!(&templates[..16], v2_templates.as_slice());
-
         let expected_named = vec![
             CandidateArtifact::Formula(
                 thresholded_standard_signal(
@@ -792,7 +838,91 @@ mod tests {
                 .unwrap(),
             ),
         ];
+        assert_eq!(&templates[16..], expected_named.as_slice());
+    }
+
+    #[test]
+    fn governed_gp_v4_emits_continuous_atomic_and_composite_factors() {
+        let budget = governed_budget(20);
+        let fields = named_template_fields();
+        let templates = governed_templates(
+            CexGpPolicyV1::controlled_dynamic_v4("policy", fields.clone(), 7, &budget).unwrap(),
+            20,
+        );
+        let expected_atomic = fields
+            .iter()
+            .flat_map(|field| {
+                [
+                    CandidateArtifact::Formula(standardized_field(field).unwrap()),
+                    CandidateArtifact::Formula(standardized_delta(field).unwrap()),
+                ]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(&templates[..16], expected_atomic.as_slice());
+        let expected_named = vec![
+            CandidateArtifact::Formula(negate(standardized_field("spread_bps").unwrap()).unwrap()),
+            CandidateArtifact::Formula(negate(standardized_delta("spread_bps").unwrap()).unwrap()),
+            CandidateArtifact::Formula(
+                FactorAst::call(
+                    FactorOperator::Add,
+                    vec![
+                        standardized_field("book_imbalance").unwrap(),
+                        standardized_field("weighted_book_imbalance_top5").unwrap(),
+                    ],
+                )
+                .unwrap(),
+            ),
+            CandidateArtifact::Formula(
+                FactorAst::call(
+                    FactorOperator::Sub,
+                    vec![
+                        standardized_field("weighted_book_imbalance_top5").unwrap(),
+                        standardized_field("book_imbalance").unwrap(),
+                    ],
+                )
+                .unwrap(),
+            ),
+        ];
 
         assert_eq!(&templates[16..], expected_named.as_slice());
+    }
+
+    #[test]
+    fn governed_gp_v4_does_not_rewrite_v3_hypothesis_evidence() {
+        let budget = governed_budget(20);
+        let dataset = super::super::test_dataset();
+        for (policy, expected) in [
+            (
+                CexGpPolicyV1::controlled_dynamic_v3(
+                    "policy-v3",
+                    named_template_fields(),
+                    7,
+                    &budget,
+                )
+                .unwrap(),
+                "fixed causal normalization and entry threshold over one registered factor field",
+            ),
+            (
+                CexGpPolicyV1::controlled_dynamic_v4(
+                    "policy-v4",
+                    named_template_fields(),
+                    7,
+                    &budget,
+                )
+                .unwrap(),
+                "fixed causal normalization over one registered factor field",
+            ),
+        ] {
+            let mut engine = GeneticProgrammingEngine::new_governed(policy, "mission").unwrap();
+            let proposal = engine
+                .propose(
+                    "mission",
+                    1,
+                    &dataset.proposal_context(),
+                    &governed_remaining(20),
+                )
+                .unwrap();
+            assert_eq!(proposal.hypothesis, expected);
+        }
     }
 }

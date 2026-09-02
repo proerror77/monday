@@ -417,11 +417,12 @@ alpha-harness mission campaign-freeze \
   --research-plan /private/path/next-research-plan.json
 ```
 
-The Campaign result schema is `cex-campaign-result-v5`. It carries bounded,
-structured factor-screening and Ridge/CART metrics for each round, so the LLM
-can select the next admitted focus from actual failure evidence instead of only
-seeing `baseline_gate_failed`. The LLM may choose one admitted
-feature focus plus a falsifiable hypothesis. The existing governed GP templates
+The Campaign result schema is `cex-campaign-result-v6`. It carries bounded,
+structured continuous-factor screening, Ridge/CART OOS metrics, selected-model
+identity, and cost-aware L2 replay feedback for each round, so the LLM can
+select the next admitted focus from the actual failure stage instead of only
+seeing `baseline_gate_failed`. The LLM may choose one admitted feature focus
+plus a falsifiable hypothesis. Governed factor generation and model training
 remain deterministic. The LLM cannot change data, fees, validation, trial
 limits, holdout, Kubernetes, risk, or execution authority. The output is
 create-once, limited to three follow-up generations, and its content hash
@@ -482,11 +483,14 @@ three named-template fields plus one admitted focus field and therefore uses 12
 candidate slots. The request derives the total trial limit from the exact plan
 and round count. Both use the six-hour protocol
 `7200 + 3*(3600+1) + 5 + 3600 = 21608`, and the `$1000 / Top5 5%` capacity
-screen. GP and subset MCTS already provide the bounded search iterations. A
-negative Campaign produces no holdout claim. A selected round may finalize once
-against the global holdout claim, but there is no second holdout winner and no
-second finalization pass. A claim without a complete sealed receipt/result is
-terminal and inconclusive, not retry authority.
+screen. A v4 Campaign counts its governed factor attempts plus the two
+supervised models;
+it does not run subset MCTS. A negative Campaign produces no holdout claim and
+feeds its typed model/replay failures to the bounded external learning step. A
+selected v4 round remains pre-holdout and has no deployment or order authority.
+The legacy formula lane alone may finalize once against the global holdout
+claim; a claim without a complete sealed receipt/result is terminal and
+inconclusive, not retry authority.
 
 Job completion alone is not research completion. Require the exact image ID,
 terminal Job/Pod state, Mission readback SHA, result readback SHA, and Campaign

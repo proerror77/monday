@@ -1,6 +1,6 @@
 use crate::{
     evaluation::{EngineContext, WalkForwardFold},
-    formula_evaluator::{evaluate_ast, FormulaEvaluator},
+    formula_evaluator::{evaluate_ast, FormulaEvaluator, PositionEvaluationReport},
 };
 use alpha_domain::{
     canonical_json_hash, CexBaselineArtifactV1, CexBaselineCartNodeV1, CexBaselineFoldV1,
@@ -12,11 +12,165 @@ use serde_json::json;
 
 use crate::engines::solve;
 
+const BPS: f64 = 10_000.0;
+const CEX_SUPERVISED_CANDIDATE_SCHEMA_V1: &str = "cex-supervised-model-candidate-v1";
+const CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V1: &str = "cex-supervised-decision-policy-v1";
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CexBaselineRun {
     pub ridge: Option<CexBaselineArtifactV1>,
     pub cart: Option<CexBaselineArtifactV1>,
     pub gate: CexBaselineGateV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CexSupervisedSizingRuleV1 {
+    ExcessExpectedReturnOverRoundTripCost,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexSupervisedDecisionPolicyV1 {
+    pub schema_version: String,
+    pub round_trip_cost_multiplier: f64,
+    pub sizing_rule: CexSupervisedSizingRuleV1,
+    pub max_abs_position: f64,
+}
+
+impl CexSupervisedDecisionPolicyV1 {
+    fn controlled_v1() -> Self {
+        Self {
+            schema_version: CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V1.to_string(),
+            round_trip_cost_multiplier: 2.0,
+            sizing_rule: CexSupervisedSizingRuleV1::ExcessExpectedReturnOverRoundTripCost,
+            max_abs_position: 1.0,
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.schema_version != CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V1
+            || self.round_trip_cost_multiplier.to_bits() != 2.0_f64.to_bits()
+            || self.sizing_rule != CexSupervisedSizingRuleV1::ExcessExpectedReturnOverRoundTripCost
+            || self.max_abs_position.to_bits() != 1.0_f64.to_bits()
+        {
+            return Err("CEX supervised decision policy drifted".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexSupervisedModelCandidateV1 {
+    pub schema_version: String,
+    pub artifact_id: String,
+    pub mission_id: String,
+    pub model_artifact: CexResearchContentRefV1,
+    pub model_kind: CexBaselineModelKindV1,
+    pub factor_bank_revision_id: String,
+    pub research_dataset: CexResearchContentRefV1,
+    pub walk_forward_partition: CexResearchContentRefV1,
+    pub evaluation_policy: CexResearchContentRefV1,
+    pub decision_policy: CexSupervisedDecisionPolicyV1,
+    pub predictions_sha256: String,
+    pub target_positions_sha256: String,
+    pub evaluation: alpha_domain::CandidateEvaluation,
+    pub deployment_authority: bool,
+    pub order_submission_authority: bool,
+}
+
+impl CexSupervisedModelCandidateV1 {
+    fn finalize(mut self) -> Result<Self, String> {
+        self.artifact_id = self.expected_artifact_id()?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        self.model_artifact
+            .validate()
+            .map_err(|error| error.to_string())?;
+        self.research_dataset
+            .validate()
+            .map_err(|error| error.to_string())?;
+        self.walk_forward_partition
+            .validate()
+            .map_err(|error| error.to_string())?;
+        self.evaluation_policy
+            .validate()
+            .map_err(|error| error.to_string())?;
+        self.decision_policy.validate()?;
+        self.evaluation
+            .validate()
+            .map_err(|error| error.to_string())?;
+        if self.schema_version != CEX_SUPERVISED_CANDIDATE_SCHEMA_V1
+            || self.artifact_id != self.expected_artifact_id()?
+            || self.mission_id.trim().is_empty()
+            || self.factor_bank_revision_id.trim().is_empty()
+            || !is_sha256(&self.predictions_sha256)
+            || !is_sha256(&self.target_positions_sha256)
+            || self.deployment_authority
+            || self.order_submission_authority
+            || self.evaluation.evaluator_version != CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION
+            || self
+                .evaluation
+                .protocol_binding()
+                .map_err(|error| error.to_string())?
+                .1
+                != self.evaluation_policy.content_sha256
+        {
+            return Err("CEX supervised model candidate is invalid".to_string());
+        }
+        Ok(())
+    }
+
+    fn expected_artifact_id(&self) -> Result<String, String> {
+        let mut semantic = self.clone();
+        semantic.artifact_id.clear();
+        Ok(format!(
+            "cex-supervised-model-candidate-{}",
+            canonical_json_hash(&semantic).map_err(|error| error.to_string())?
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexSupervisedModelEvaluationV1 {
+    pub candidate: CexSupervisedModelCandidateV1,
+    pub predictions: Vec<f64>,
+    pub target_positions: Vec<f64>,
+    pub report: PositionEvaluationReport,
+}
+
+impl CexSupervisedModelEvaluationV1 {
+    pub fn validate(&self) -> Result<(), String> {
+        self.candidate.validate()?;
+        if self.candidate.predictions_sha256
+            != canonical_json_hash(&self.predictions).map_err(|error| error.to_string())?
+            || self.candidate.target_positions_sha256
+                != canonical_json_hash(&self.target_positions).map_err(|error| error.to_string())?
+            || self.candidate.evaluation != self.report.evaluation
+            || self.predictions.len() != self.target_positions.len()
+            || self.report.ledger.iter().any(|point| {
+                point.row_index >= self.predictions.len()
+                    || point.prediction.to_bits() != self.predictions[point.row_index].to_bits()
+                    || point.target_position.to_bits()
+                        != self.target_positions[point.row_index].to_bits()
+            })
+        {
+            return Err("CEX supervised model evaluation evidence drifted".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 pub fn verify_cex_baseline_artifact(
@@ -205,6 +359,116 @@ pub fn evaluate_cex_baselines(
         cart: Some(cart),
         gate,
     })
+}
+
+pub fn evaluate_cex_supervised_model(
+    context: &EngineContext<'_>,
+    factor_bank: &CexFactorBankRevisionV2,
+    artifact: &CexBaselineArtifactV1,
+) -> Result<CexSupervisedModelEvaluationV1, String> {
+    verify_cex_baseline_artifact(context, factor_bank, artifact)?;
+    let mut predictions = vec![0.0; context.rows().len()];
+    let mut assigned = vec![false; context.rows().len()];
+    for fold in &artifact.folds {
+        for (index, prediction) in
+            (fold.validation_range.start..fold.validation_range.end).zip(&fold.predictions)
+        {
+            if assigned[index] {
+                return Err("supervised model validation ranges overlap".to_string());
+            }
+            predictions[index] = *prediction;
+            assigned[index] = true;
+        }
+    }
+    let decision_policy = CexSupervisedDecisionPolicyV1::controlled_v1();
+    let mut target_positions = vec![0.0; context.rows().len()];
+    for fold in context.folds() {
+        for index in fold.validation.clone() {
+            target_positions[index] = cost_aware_target_position(
+                predictions[index],
+                &context.rows()[index],
+                &context.protocol().costs,
+                &decision_policy,
+            )?;
+        }
+    }
+    let evaluator = FormulaEvaluator::new(artifact.baseline_policy.evaluator_config.clone())?;
+    let report = evaluator.evaluate_predictions_and_positions(
+        context.rows(),
+        &predictions,
+        &target_positions,
+        context.folds().iter().map(|fold| fold.validation.clone()),
+        CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION,
+        context.protocol(),
+    )?;
+    let model_sha256 = canonical_json_hash(artifact).map_err(|error| error.to_string())?;
+    let candidate = CexSupervisedModelCandidateV1 {
+        schema_version: CEX_SUPERVISED_CANDIDATE_SCHEMA_V1.to_string(),
+        artifact_id: String::new(),
+        mission_id: artifact.mission_id.clone(),
+        model_artifact: CexResearchContentRefV1 {
+            id: artifact.artifact_id.clone(),
+            content_sha256: model_sha256,
+        },
+        model_kind: artifact.model_kind,
+        factor_bank_revision_id: artifact.factor_bank_revision_id.clone(),
+        research_dataset: artifact.research_dataset.clone(),
+        walk_forward_partition: artifact.walk_forward_partition.clone(),
+        evaluation_policy: artifact.evaluation_policy.clone(),
+        decision_policy,
+        predictions_sha256: canonical_json_hash(&predictions).map_err(|error| error.to_string())?,
+        target_positions_sha256: canonical_json_hash(&target_positions)
+            .map_err(|error| error.to_string())?,
+        evaluation: report.evaluation.clone(),
+        deployment_authority: false,
+        order_submission_authority: false,
+    }
+    .finalize()?;
+    let evaluation = CexSupervisedModelEvaluationV1 {
+        candidate,
+        predictions,
+        target_positions,
+        report,
+    };
+    evaluation.validate()?;
+    Ok(evaluation)
+}
+
+fn cost_aware_target_position(
+    prediction: f64,
+    row: &crate::evaluation::ResearchRow,
+    costs: &alpha_domain::EvaluationCostsV1,
+    policy: &CexSupervisedDecisionPolicyV1,
+) -> Result<f64, String> {
+    policy.validate()?;
+    if !prediction.is_finite() {
+        return Err("supervised model prediction is not finite".to_string());
+    }
+    let spread_bps = if costs.cross_spread {
+        row.features
+            .get("spread_bps")
+            .copied()
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .ok_or_else(|| "cost-aware ML decision requires spread_bps".to_string())?
+            / 2.0
+    } else {
+        0.0
+    };
+    let one_way_cost_bps = row.fee_bps.max(0.0) - costs.rebate_bps
+        + row.latency_bps.max(0.0)
+        + costs.slippage_bps
+        + spread_bps;
+    let minimum_edge =
+        (policy.round_trip_cost_multiplier * one_way_cost_bps + row.funding_bps.max(0.0)).max(0.0)
+            / BPS;
+    let absolute_prediction = prediction.abs();
+    if absolute_prediction <= minimum_edge || absolute_prediction <= f64::EPSILON {
+        return Ok(0.0);
+    }
+    let magnitude = ((absolute_prediction - minimum_edge)
+        / (absolute_prediction + minimum_edge).max(f64::EPSILON))
+    .clamp(0.0, policy.max_abs_position);
+    Ok(prediction.signum() * magnitude)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -828,6 +1092,7 @@ fn normalize_zero(value: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
 
     #[test]
     fn ridge_is_deterministic_and_constant_columns_are_safe() {
@@ -870,5 +1135,41 @@ mod tests {
         );
         assert_eq!(predict_cart(&model, &[2.0, 1.0]).unwrap(), 1.0);
         assert_eq!(sse_from_sums(1.0, 0.99999999999999, 1), 0.0);
+    }
+
+    #[test]
+    fn supervised_policy_trades_only_excess_edge_and_keeps_fractional_size() {
+        let row = crate::evaluation::ResearchRow {
+            series_id: 1,
+            available_time: Utc::now(),
+            signal: 0.0,
+            features: std::collections::BTreeMap::from([("spread_bps".to_string(), 2.0)]),
+            label: 0.0,
+            fee_bps: 2.0,
+            funding_bps: 1.0,
+            pit_funding: true,
+            latency_bps: 1.0,
+        };
+        let costs = alpha_domain::EvaluationCostsV1 {
+            fee_bps: 2.0,
+            rebate_bps: 0.0,
+            funding_bps: 1.0,
+            latency_bps: 1.0,
+            slippage_bps: 1.0,
+            cross_spread: true,
+            position_notional_usd: 0.0,
+            capacity_depth_levels: 0,
+            max_book_depth_fraction: 0.0,
+        };
+        let policy = CexSupervisedDecisionPolicyV1::controlled_v1();
+
+        assert_eq!(
+            cost_aware_target_position(0.0009, &row, &costs, &policy).unwrap(),
+            0.0
+        );
+        let long = cost_aware_target_position(0.002, &row, &costs, &policy).unwrap();
+        let short = cost_aware_target_position(-0.002, &row, &costs, &policy).unwrap();
+        assert!(long > 0.0 && long < 1.0);
+        assert_eq!(short, -long);
     }
 }

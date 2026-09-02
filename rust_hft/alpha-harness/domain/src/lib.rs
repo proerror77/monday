@@ -28,6 +28,7 @@ pub const CEX_RESEARCH_MISSION_SCHEMA_V1: &str = "cex-research-mission-v1";
 pub const CEX_GP_POLICY_SCHEMA_V1: &str = "cex-gp-policy-v1";
 pub const CEX_GP_POLICY_SCHEMA_V2: &str = "cex-gp-policy-v2";
 pub const CEX_GP_POLICY_SCHEMA_V3: &str = "cex-gp-policy-v3";
+pub const CEX_GP_POLICY_SCHEMA_V4: &str = "cex-gp-policy-v4";
 pub const CEX_FACTOR_BANK_SCHEMA_V1: &str = "cex-factor-bank-v1";
 pub const CEX_FACTOR_BANK_SCHEMA_V2: &str = "cex-factor-bank-v2";
 pub const CEX_FACTOR_BANK_SCHEMA_V3: &str = "cex-factor-bank-v3";
@@ -721,13 +722,25 @@ impl CexResearchMissionSpecV1 {
         CexEqualAbsoluteWeightPolicyV1::controlled_v1(self.policies.weight.id.clone())?
             .validate_binding(&self.policies.weight)?;
         self.search.budget.validate()?;
-        if CexGpPolicyV1::controlled_dynamic_v3(
-            self.policies.gp.id.clone(),
-            self.feature_fields.clone(),
-            self.search.seed,
-            &self.search.budget,
-        )
-        .is_ok_and(|policy| policy.validate_binding(&self.policies.gp).is_ok())
+        let named_template_policy = [
+            CexGpPolicyV1::controlled_dynamic_v3(
+                self.policies.gp.id.clone(),
+                self.feature_fields.clone(),
+                self.search.seed,
+                &self.search.budget,
+            ),
+            CexGpPolicyV1::controlled_dynamic_v4(
+                self.policies.gp.id.clone(),
+                self.feature_fields.clone(),
+                self.search.seed,
+                &self.search.budget,
+            ),
+        ]
+        .into_iter()
+        .any(|policy| {
+            policy.is_ok_and(|policy| policy.validate_binding(&self.policies.gp).is_ok())
+        });
+        if named_template_policy
             && self.search.max_new_iterations != self.search.budget.max_candidates
         {
             return Err(DomainError::InvalidCexResearchMission(
@@ -1620,26 +1633,42 @@ impl CexGpPolicyV1 {
         budget: &SearchBudget,
     ) -> Result<Self, DomainError> {
         Self::normalize_admitted_fields(&mut admitted_fields);
+        let continuous = schema_version == CEX_GP_POLICY_SCHEMA_V4;
+        let constants = if continuous {
+            vec!["-1", "5", "20"]
+        } else {
+            vec!["-1", "0", "1", "5", "20"]
+        }
+        .into_iter()
+        .map(str::to_string)
+        .collect();
         let policy = Self {
             schema_version: schema_version.to_string(),
             policy_id: policy_id.into(),
             admitted_fields,
-            operators: vec![
-                FactorOperator::ZScore,
-                FactorOperator::Delta,
-                FactorOperator::Add,
-                FactorOperator::Sub,
-                FactorOperator::Mul,
-                FactorOperator::GreaterThan,
-                FactorOperator::LessThan,
-                FactorOperator::IfElse,
-            ],
+            operators: if continuous {
+                vec![
+                    FactorOperator::ZScore,
+                    FactorOperator::Delta,
+                    FactorOperator::Add,
+                    FactorOperator::Sub,
+                    FactorOperator::Mul,
+                ]
+            } else {
+                vec![
+                    FactorOperator::ZScore,
+                    FactorOperator::Delta,
+                    FactorOperator::Add,
+                    FactorOperator::Sub,
+                    FactorOperator::Mul,
+                    FactorOperator::GreaterThan,
+                    FactorOperator::LessThan,
+                    FactorOperator::IfElse,
+                ]
+            },
             windows: vec![5, 20],
-            constants: ["-1", "0", "1", "5", "20"]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            max_ast_depth: 7,
+            constants,
+            max_ast_depth: if continuous { 4 } else { 7 },
             max_ast_nodes: 31,
             population_limit: 32,
             seed,
@@ -1707,6 +1736,21 @@ impl CexGpPolicyV1 {
         )
     }
 
+    pub fn controlled_dynamic_v4(
+        policy_id: impl Into<String>,
+        admitted_fields: Vec<String>,
+        seed: u64,
+        budget: &SearchBudget,
+    ) -> Result<Self, DomainError> {
+        Self::controlled_dynamic(
+            CEX_GP_POLICY_SCHEMA_V4,
+            policy_id,
+            admitted_fields,
+            seed,
+            budget,
+        )
+    }
+
     pub fn validate(&self) -> Result<(), DomainError> {
         let governed_v1 = self.schema_version == CEX_GP_POLICY_SCHEMA_V1
             && self.operators
@@ -1718,7 +1762,7 @@ impl CexGpPolicyV1 {
             && self.windows.is_empty()
             && self.constants.is_empty()
             && self.max_ast_depth == 5;
-        let governed_dynamic = matches!(
+        let governed_thresholded_dynamic = matches!(
             self.schema_version.as_str(),
             CEX_GP_POLICY_SCHEMA_V2 | CEX_GP_POLICY_SCHEMA_V3
         ) && self.operators
@@ -1735,7 +1779,19 @@ impl CexGpPolicyV1 {
             && self.windows == [5, 20]
             && self.constants == ["-1", "0", "1", "5", "20"]
             && self.max_ast_depth == 7;
-        if !(governed_v1 || governed_dynamic)
+        let governed_continuous_dynamic = self.schema_version == CEX_GP_POLICY_SCHEMA_V4
+            && self.operators
+                == [
+                    FactorOperator::ZScore,
+                    FactorOperator::Delta,
+                    FactorOperator::Add,
+                    FactorOperator::Sub,
+                    FactorOperator::Mul,
+                ]
+            && self.windows == [5, 20]
+            && self.constants == ["-1", "5", "20"]
+            && self.max_ast_depth == 4;
+        if !(governed_v1 || governed_thresholded_dynamic || governed_continuous_dynamic)
             || self.policy_id.trim().is_empty()
             || self.admitted_fields.is_empty()
             || self
@@ -1764,11 +1820,17 @@ impl CexGpPolicyV1 {
                 "governed GP cannot depend on a wall-clock budget",
             ));
         }
-        if self.schema_version == CEX_GP_POLICY_SCHEMA_V3
-            && self.budget.max_candidates != self.admitted_fields.len() * 2 + 4
+        if matches!(
+            self.schema_version.as_str(),
+            CEX_GP_POLICY_SCHEMA_V3 | CEX_GP_POLICY_SCHEMA_V4
+        ) && self.budget.max_candidates != self.admitted_fields.len() * 2 + 4
         {
             return Err(DomainError::InvalidCexGpPolicy(
-                "governed GP v3 requires exactly two atomic slots per field plus four named templates",
+                if self.schema_version == CEX_GP_POLICY_SCHEMA_V3 {
+                    "governed GP v3 requires exactly two atomic slots per field plus four named templates"
+                } else {
+                    "governed GP v4 requires exactly two atomic slots per field plus four named templates"
+                },
             ));
         }
         let has_named_template_fields = [
@@ -1782,9 +1844,17 @@ impl CexGpPolicyV1 {
                 .iter()
                 .any(|admitted| admitted == field)
         });
-        if self.schema_version == CEX_GP_POLICY_SCHEMA_V3 && !has_named_template_fields {
+        if matches!(
+            self.schema_version.as_str(),
+            CEX_GP_POLICY_SCHEMA_V3 | CEX_GP_POLICY_SCHEMA_V4
+        ) && !has_named_template_fields
+        {
             return Err(DomainError::InvalidCexGpPolicy(
-                "governed GP v3 requires the named-template fields",
+                if self.schema_version == CEX_GP_POLICY_SCHEMA_V3 {
+                    "governed GP v3 requires the named-template fields"
+                } else {
+                    "governed GP v4 requires the named-template fields"
+                },
             ));
         }
         let mut event_domain = None;

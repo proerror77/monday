@@ -12,7 +12,9 @@ use crate::{
     mission_runner::{
         execute_report, fetch_to_file, finalize_existing_search_round, normalized_sha256,
         publish_immutable_file, recover_execution_report_from_published_result, valid_git_revision,
-        validate_cex_holdout_id, ExecutionBinding, MAX_RESULT_BUNDLE_BYTES,
+        validate_cex_holdout_id, validate_supervised_candidate_binding,
+        validate_supervised_replay_binding, CexEventReplayReceiptV1, CexSupervisedModelSelectionV1,
+        ExecutionBinding, MAX_RESULT_BUNDLE_BYTES,
     },
     prediction_dispatch::{
         canonical_tokyo_oss_internal_object, cex_campaign_round_root,
@@ -21,10 +23,10 @@ use crate::{
 };
 use alpha_domain::{
     canonical_json_hash, factor_ast_source_features, CandidateEvaluation, CexBaselineFailureCodeV1,
-    CexBaselineGateV1, CexFactorBankRevisionV2, CexFactorRejectionCodeV1,
+    CexBaselineGateV1, CexFactorBankRevisionV2, CexFactorRejectionCodeV1, CEX_GP_POLICY_SCHEMA_V4,
 };
-use alpha_engine::engines::CexFactorBankMctsResultV1;
 use alpha_engine::llm::{HypothesisArtifact, LlmConfig, OpenAiCompatibleClient};
+use alpha_engine::{baselines::CexSupervisedModelCandidateV1, engines::CexFactorBankMctsResultV1};
 use anyhow::{bail, Context};
 use hft_backtest::config::verify_canonical_replay_artifact_streaming;
 use reqwest::{blocking::Client, redirect::Policy, StatusCode};
@@ -42,6 +44,7 @@ const CAMPAIGN_FREEZE_SCHEMA_V1: &str = "cex-campaign-freeze-v1";
 const CAMPAIGN_INPUTS_SCHEMA_V1: &str = "monday.cex_campaign_inputs.v1";
 const CAMPAIGN_REQUEST_SCHEMA_V4: &str = "cex-campaign-request-v4";
 const CAMPAIGN_RESULT_SCHEMA_V5: &str = "cex-campaign-result-v5";
+const CAMPAIGN_RESULT_SCHEMA_V6: &str = "cex-campaign-result-v6";
 const CAMPAIGN_IDENTITY_SCHEMA_V4: &str = "cex-campaign-identity-v4";
 const STOP_RULE_V2: &str = "bounded_multi_round_single_finalize_v2";
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
@@ -197,6 +200,19 @@ struct CampaignFactorFeedbackV1 {
     evaluation: Option<CampaignEvaluationFeedbackV1>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct CampaignReplayFeedbackV1 {
+    passed: bool,
+    failures: Vec<String>,
+    position_changes: usize,
+    total_turnover: f64,
+    mean_net_return: f64,
+    cumulative_net_return: f64,
+    max_drawdown: f64,
+    net_sharpe: f64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct CampaignRoundFeedbackV1 {
@@ -207,6 +223,14 @@ struct CampaignRoundFeedbackV1 {
     baseline_failure_codes: Vec<CexBaselineFailureCodeV1>,
     ridge: Option<CampaignEvaluationFeedbackV1>,
     cart: Option<CampaignEvaluationFeedbackV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    supervised_ridge: Option<CampaignEvaluationFeedbackV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    supervised_cart: Option<CampaignEvaluationFeedbackV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    supervised_selected_candidate_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    supervised_replay: Option<CampaignReplayFeedbackV1>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -220,6 +244,12 @@ struct CampaignMissionLedgerV1 {
     result_readback_bundle_sha256: String,
     replay_receipt_id: Option<String>,
     replay_gate_passed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    supervised_candidate_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    supervised_replay_receipt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    supervised_replay_gate_passed: Option<bool>,
     final_precommit_id: Option<String>,
     sealed_receipt_id: Option<String>,
     sealed_passed: Option<bool>,
@@ -402,7 +432,7 @@ fn campaign_learning_prompt(
         })).collect::<Vec<_>>(),
     });
     format!(
-        "Propose one falsifiable follow-up hypothesis for a bounded Binance USD-M BTCUSDT 1s/h5/top5 research Campaign. Select exactly one focus field from {allowed_fields:?}, set operator to identity, and set window to null. The deterministic controller will retain required named-template fields and narrow the GP field set; it will test the existing governed atomic templates. You cannot change data, fees, validation thresholds, budgets, holdout, Kubernetes, runtime, risk, or execution authority. Return only the governed hypothesis artifact. Negative Campaign evidence: {evidence}"
+        "Propose one falsifiable follow-up hypothesis for a bounded Binance USD-M BTCUSDT 1s/h5/top5 research Campaign. Select exactly one focus field from {allowed_fields:?}, set operator to identity, and set window to null. The deterministic controller will retain required named-template fields, generate continuous governed factors, train Ridge and shallow CART with purged walk-forward data, and replay the selected cost-aware positions. You cannot change data, fees, validation thresholds, budgets, holdout, Kubernetes, runtime, risk, or execution authority. Return only the governed hypothesis artifact. Negative Campaign evidence: {evidence}"
     )
 }
 
@@ -660,7 +690,10 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
             .is_none_or(|current: &CampaignMissionLedgerV1| {
                 compare_round_selection(&ledger, current).is_gt()
             });
-        if ledger.replay_gate_passed == Some(true) && ledger.selected_score.is_some() && is_better {
+        let selected_gate = ledger
+            .supervised_replay_gate_passed
+            .or(ledger.replay_gate_passed);
+        if selected_gate == Some(true) && ledger.selected_score.is_some() && is_better {
             selected_round = Some(ledger.clone());
             selected_mission = Some(rendered.mission);
             selected_execute_dir = Some(execute_dir.clone());
@@ -672,9 +705,9 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
     if consumed_trials > loaded.request.declared_total_trials {
         bail!("campaign consumed trials exceeded declared_total_trials");
     }
-    let finalization =
-        if let (Some(selected_round), Some(selected_mission), Some(selected_execute_dir)) =
-            (&selected_round, &selected_mission, &selected_execute_dir)
+    let finalization = match (&selected_round, &selected_mission, &selected_execute_dir) {
+        (Some(selected_round), Some(selected_mission), Some(selected_execute_dir))
+            if selected_round.supervised_candidate_id.is_none() =>
         {
             let finalization_dir = mission_dir.join("finalization");
             let report = finalize_existing_search_round(
@@ -727,12 +760,12 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
                     .then(|| crate::mission_runner::sha256_file(&promotion_record_path))
                     .transpose()?,
             })
-        } else {
-            None
-        };
+        }
+        _ => None,
+    };
 
     let result = CampaignResultV1 {
-        schema_version: CAMPAIGN_RESULT_SCHEMA_V5.to_string(),
+        schema_version: CAMPAIGN_RESULT_SCHEMA_V6.to_string(),
         campaign_id: loaded.request.campaign_id.clone(),
         request_sha256: loaded.sha256.clone(),
         build_source_revision: loaded.request.build_source_revision.clone(),
@@ -1087,6 +1120,97 @@ fn extract_bundle(bundle: &Path, destination: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+struct SupervisedRoundEvidence {
+    ridge: CexSupervisedModelCandidateV1,
+    cart: CexSupervisedModelCandidateV1,
+    selected: CexSupervisedModelCandidateV1,
+    replay: Option<CexEventReplayReceiptV1>,
+}
+
+fn load_supervised_round_evidence(
+    results: &Path,
+    mission: &alpha_domain::CexResearchMissionArtifactV1,
+    factor_bank: &CexFactorBankRevisionV2,
+    ridge_baseline: Option<&alpha_domain::CexBaselineArtifactV1>,
+    cart_baseline: Option<&alpha_domain::CexBaselineArtifactV1>,
+    report: &crate::mission_runner::ExecutionReport,
+) -> anyhow::Result<Option<SupervisedRoundEvidence>> {
+    if factor_bank.entries.is_empty() {
+        if report.supervised_candidate_id.is_some()
+            || report.supervised_replay_receipt_id.is_some()
+            || report.supervised_replay_gate_passed.is_some()
+            || results
+                .join("supervised-model-selection.json")
+                .try_exists()?
+        {
+            bail!("empty Factor Bank cannot produce supervised ML artifacts");
+        }
+        return Ok(None);
+    }
+    let ridge_baseline = ridge_baseline.context("supervised ML is missing its Ridge baseline")?;
+    let cart_baseline = cart_baseline.context("supervised ML is missing its CART baseline")?;
+    let ridge: CexSupervisedModelCandidateV1 = serde_json::from_slice(&std::fs::read(
+        results.join("ridge-supervised-candidate.json"),
+    )?)?;
+    let cart: CexSupervisedModelCandidateV1 = serde_json::from_slice(&std::fs::read(
+        results.join("cart-supervised-candidate.json"),
+    )?)?;
+    validate_supervised_candidate_binding(&ridge, mission, factor_bank, ridge_baseline)?;
+    validate_supervised_candidate_binding(&cart, mission, factor_bank, cart_baseline)?;
+    let selection: CexSupervisedModelSelectionV1 = serde_json::from_slice(&std::fs::read(
+        results.join("supervised-model-selection.json"),
+    )?)?;
+    selection.validate()?;
+    if selection.mission_id != mission.semantic_id()? {
+        bail!("supervised selection does not match its Campaign Mission");
+    }
+    let selected = [&ridge, &cart]
+        .into_iter()
+        .find(|candidate| {
+            candidate.artifact_id == selection.selected_candidate.id
+                && canonical_json_hash(*candidate)
+                    .is_ok_and(|hash| hash == selection.selected_candidate.content_sha256)
+        })
+        .cloned()
+        .context("supervised selection does not bind Ridge or CART")?;
+    if selection.replay_eligible != selected.evaluation.passed
+        || report.supervised_candidate_id.as_deref() != Some(selected.artifact_id.as_str())
+    {
+        bail!("supervised selection verdict drifted from its model evidence");
+    }
+    let replay_path = results.join("supervised-event-replay-receipt.json");
+    let replay = replay_path
+        .try_exists()?
+        .then(|| std::fs::read(&replay_path))
+        .transpose()?
+        .map(|bytes| serde_json::from_slice::<CexEventReplayReceiptV1>(&bytes))
+        .transpose()?;
+    if let Some(replay) = &replay {
+        validate_supervised_replay_binding(
+            replay,
+            &selection,
+            &selected,
+            mission,
+            &selection.mission_id,
+        )?;
+    } else if selection.replay_eligible {
+        bail!("eligible supervised selection is missing its event replay receipt");
+    }
+    if report.supervised_replay_receipt_id.as_deref()
+        != replay.as_ref().map(|receipt| receipt.receipt_id.as_str())
+        || report.supervised_replay_gate_passed
+            != replay.as_ref().map(|receipt| receipt.gate.passed)
+    {
+        bail!("supervised replay report drifted from its receipt");
+    }
+    Ok(Some(SupervisedRoundEvidence {
+        ridge,
+        cart,
+        selected,
+        replay,
+    }))
+}
+
 fn collect_round_ledger(
     execute_dir: &Path,
     round: &CampaignRoundRequest,
@@ -1129,6 +1253,25 @@ fn collect_round_ledger(
             cart.as_ref(),
         )
         .map_err(anyhow::Error::msg)?;
+    let supervised_ml = factor_bank.gp_policy.schema_version == CEX_GP_POLICY_SCHEMA_V4;
+    let supervised = if supervised_ml {
+        load_supervised_round_evidence(
+            &results,
+            &control_mission,
+            &factor_bank,
+            ridge.as_ref(),
+            cart.as_ref(),
+            report,
+        )?
+    } else {
+        if report.supervised_candidate_id.is_some()
+            || report.supervised_replay_receipt_id.is_some()
+            || report.supervised_replay_gate_passed.is_some()
+        {
+            bail!("legacy Campaign round contains supervised ML evidence");
+        }
+        None
+    };
     let feedback = CampaignRoundFeedbackV1 {
         factor_attempts: factor_bank.attempts.len(),
         accepted_factors: factor_bank.entries.len(),
@@ -1152,14 +1295,31 @@ fn collect_round_ledger(
         cart: cart
             .as_ref()
             .map(|artifact| campaign_evaluation_feedback(&artifact.evaluation)),
+        supervised_ridge: supervised
+            .as_ref()
+            .map(|evidence| campaign_evaluation_feedback(&evidence.ridge.evaluation)),
+        supervised_cart: supervised
+            .as_ref()
+            .map(|evidence| campaign_evaluation_feedback(&evidence.cart.evaluation)),
+        supervised_selected_candidate_id: supervised
+            .as_ref()
+            .map(|evidence| evidence.selected.artifact_id.clone()),
+        supervised_replay: supervised
+            .as_ref()
+            .and_then(|evidence| evidence.replay.as_ref())
+            .map(campaign_replay_feedback),
     };
     let strategy_path = results.join("combination-walk-forward.json");
     let subset_result = load_round_subset_result(&results)?;
     let consumed_trials = factor_bank.attempts.len()
-        + subset_result
-            .as_ref()
-            .map(|result| result.candidates_evaluated)
-            .unwrap_or(0);
+        + if supervised_ml && !factor_bank.entries.is_empty() {
+            2
+        } else {
+            subset_result
+                .as_ref()
+                .map(|result| result.candidates_evaluated)
+                .unwrap_or(0)
+        };
     let strategy_exists = strategy_path.try_exists()?;
     let (
         termination_reason,
@@ -1171,6 +1331,40 @@ fn collect_round_ledger(
             bail!("empty Factor Bank cannot produce subset search artifacts");
         }
         ("no_accepted_factors".to_string(), None, None, None)
+    } else if supervised_ml {
+        if subset_result.is_some()
+            || strategy_exists
+            || report.replay_receipt_id.is_some()
+            || report.replay_gate_passed.is_some()
+        {
+            bail!("supervised ML round cannot produce legacy subset-search artifacts");
+        }
+        let evidence = supervised
+            .as_ref()
+            .context("supervised ML round is missing model selection evidence")?;
+        if !evidence.selected.evaluation.passed {
+            ("no_passing_supervised_model".to_string(), None, None, None)
+        } else {
+            let replay = evidence
+                .replay
+                .as_ref()
+                .context("passing supervised model is missing event replay")?;
+            if replay.gate.passed {
+                (
+                    "supervised_pre_holdout_candidate_kept".to_string(),
+                    Some(evidence.selected.artifact_id.clone()),
+                    Some(canonical_json_hash(&evidence.selected)?),
+                    Some(evidence.selected.evaluation.score),
+                )
+            } else {
+                (
+                    "supervised_replay_gate_failed".to_string(),
+                    None,
+                    None,
+                    None,
+                )
+            }
+        }
     } else if !baseline_gate.passed {
         if subset_result.is_some() || strategy_exists || report.replay_receipt_id.is_some() {
             bail!("failed baseline gate cannot produce subset search artifacts");
@@ -1221,6 +1415,9 @@ fn collect_round_ledger(
         result_readback_bundle_sha256: report.readback_bundle_sha256.clone(),
         replay_receipt_id: report.replay_receipt_id.clone(),
         replay_gate_passed: report.replay_gate_passed,
+        supervised_candidate_id: report.supervised_candidate_id.clone(),
+        supervised_replay_receipt_id: report.supervised_replay_receipt_id.clone(),
+        supervised_replay_gate_passed: report.supervised_replay_gate_passed,
         final_precommit_id: report.final_precommit_id.clone(),
         sealed_receipt_id: report.sealed_receipt_id.clone(),
         sealed_passed: report.sealed_passed,
@@ -1245,6 +1442,19 @@ fn campaign_evaluation_feedback(evaluation: &CandidateEvaluation) -> CampaignEva
         max_drawdown: evaluation.metrics.max_drawdown,
         net_sharpe: evaluation.metrics.net_sharpe,
         trade_count: evaluation.metrics.trade_count,
+    }
+}
+
+fn campaign_replay_feedback(receipt: &CexEventReplayReceiptV1) -> CampaignReplayFeedbackV1 {
+    CampaignReplayFeedbackV1 {
+        passed: receipt.gate.passed,
+        failures: receipt.gate.failures.clone(),
+        position_changes: receipt.metrics.position_changes,
+        total_turnover: receipt.metrics.total_turnover,
+        mean_net_return: receipt.metrics.mean_net_return,
+        cumulative_net_return: receipt.metrics.cumulative_net_return,
+        max_drawdown: receipt.metrics.max_drawdown,
+        net_sharpe: receipt.metrics.net_sharpe,
     }
 }
 
@@ -1412,8 +1622,10 @@ fn validate_negative_campaign_result(
     result: &CampaignResultV1,
     result_sha256: &str,
 ) -> anyhow::Result<()> {
-    if result.schema_version != CAMPAIGN_RESULT_SCHEMA_V5
-        || result.campaign_id != loaded.request.campaign_id
+    if !matches!(
+        result.schema_version.as_str(),
+        CAMPAIGN_RESULT_SCHEMA_V5 | CAMPAIGN_RESULT_SCHEMA_V6
+    ) || result.campaign_id != loaded.request.campaign_id
         || result.request_sha256 != loaded.sha256
         || result.build_source_revision != loaded.request.build_source_revision
         || result.image_identity != loaded.request.image_identity
@@ -1455,6 +1667,15 @@ fn validate_negative_campaign_result(
             || round.selected_candidate_id.is_some()
             || round.selected_candidate_content_hash.is_some()
             || round.selected_score.is_some()
+            || round.supervised_candidate_id != round.feedback.supervised_selected_candidate_id
+            || round.supervised_replay_gate_passed
+                != round
+                    .feedback
+                    .supervised_replay
+                    .as_ref()
+                    .map(|replay| replay.passed)
+            || round.supervised_replay_receipt_id.is_some()
+                != round.feedback.supervised_replay.is_some()
         {
             bail!("Campaign result round evidence does not match the parent request");
         }
@@ -1517,6 +1738,27 @@ fn validate_campaign_round_feedback(
     if !baselines_match {
         bail!("Campaign result baseline feedback is invalid");
     }
+    let supervised_match = match (
+        &feedback.supervised_ridge,
+        &feedback.supervised_cart,
+        &feedback.supervised_selected_candidate_id,
+    ) {
+        (None, None, None) => feedback.supervised_replay.is_none(),
+        (Some(ridge), Some(cart), Some(candidate_id)) => {
+            feedback.accepted_factors > 0
+                && !candidate_id.trim().is_empty()
+                && valid_campaign_evaluation_feedback(ridge)
+                && valid_campaign_evaluation_feedback(cart)
+                && feedback
+                    .supervised_replay
+                    .as_ref()
+                    .is_none_or(valid_campaign_replay_feedback)
+        }
+        _ => false,
+    };
+    if !supervised_match {
+        bail!("Campaign result supervised ML feedback is invalid");
+    }
     Ok(())
 }
 
@@ -1528,6 +1770,21 @@ fn valid_campaign_evaluation_feedback(feedback: &CampaignEvaluationFeedbackV1) -
         && feedback
             .time_series_rank_ic
             .is_none_or(|value| value.is_finite() && (-1.0..=1.0).contains(&value))
+        && feedback.cumulative_net_return.is_finite()
+        && feedback.max_drawdown.is_finite()
+        && (0.0..=1.0).contains(&feedback.max_drawdown)
+        && feedback.net_sharpe.is_finite()
+}
+
+fn valid_campaign_replay_feedback(feedback: &CampaignReplayFeedbackV1) -> bool {
+    feedback.passed == feedback.failures.is_empty()
+        && feedback
+            .failures
+            .iter()
+            .all(|failure| !failure.trim().is_empty())
+        && feedback.total_turnover.is_finite()
+        && feedback.total_turnover >= 0.0
+        && feedback.mean_net_return.is_finite()
         && feedback.cumulative_net_return.is_finite()
         && feedback.max_drawdown.is_finite()
         && (0.0..=1.0).contains(&feedback.max_drawdown)
@@ -2330,6 +2587,7 @@ mod tests {
             baseline_failure_codes: vec![CexBaselineFailureCodeV1::InsufficientEvidence],
             ridge: Some(failed_trading_evaluation.clone()),
             cart: Some(failed_trading_evaluation),
+            ..CampaignRoundFeedbackV1::default()
         };
 
         validate_campaign_round_feedback(&feedback, 1).unwrap();
@@ -2446,6 +2704,9 @@ mod tests {
             result_readback_bundle_sha256: "b".repeat(64),
             replay_receipt_id: Some("receipt-1".to_string()),
             replay_gate_passed: Some(true),
+            supervised_candidate_id: None,
+            supervised_replay_receipt_id: None,
+            supervised_replay_gate_passed: None,
             final_precommit_id: None,
             sealed_receipt_id: None,
             sealed_passed: None,
@@ -2468,6 +2729,9 @@ mod tests {
             result_readback_bundle_sha256: "d".repeat(64),
             replay_receipt_id: Some("receipt-2".to_string()),
             replay_gate_passed: Some(true),
+            supervised_candidate_id: None,
+            supervised_replay_receipt_id: None,
+            supervised_replay_gate_passed: None,
             final_precommit_id: None,
             sealed_receipt_id: None,
             sealed_passed: None,
@@ -2607,7 +2871,7 @@ mod tests {
         let producer_revision = "b".repeat(40);
         let producer_image_ref = format!("registry/research-runner@sha256:{}", "1".repeat(64));
         let executor_image_ref = format!("registry/research-runner@sha256:{}", "2".repeat(64));
-        let fixture = campaign_e2e_fixture("campaign-freeze", false, false);
+        let fixture = campaign_e2e_fixture("campaign-freeze", false, false, false);
         let root = tempfile::tempdir().unwrap();
         let input_root = root.path().join("remounted-run");
         std::fs::create_dir_all(&input_root).unwrap();
@@ -2976,30 +3240,18 @@ mod tests {
     }
 
     #[test]
-    fn execute_runs_two_rounds_and_finalizes_exactly_once() {
-        let fixture = campaign_e2e_fixture("campaign-e2e-positive", false, false);
+    fn execute_rejects_label_only_edge_after_event_replay() {
+        let fixture = campaign_e2e_fixture("campaign-e2e-positive", false, false, false);
         let request = load_request(&fixture.args.request).unwrap().request;
         execute(fixture.args).unwrap();
 
         let work_dir = fixture.work_dir;
         assert!(work_dir.join("shared-inputs/features.jsonl").exists());
         assert!(work_dir.join("shared-inputs/materialization.json").exists());
-        assert!(work_dir
-            .join("mission/r1/admission/mission-readback.json")
-            .exists());
-        assert!(work_dir
-            .join("mission/r2/admission/mission-readback.json")
-            .exists());
-        assert!(work_dir
-            .join("mission/r1/execute/results/factor-bank.json")
-            .exists());
-        assert!(work_dir
-            .join("mission/r2/execute/results/factor-bank.json")
-            .exists());
         let result: serde_json::Value =
             serde_json::from_slice(&std::fs::read(work_dir.join("campaign-result.json")).unwrap())
                 .unwrap();
-        assert_eq!(result["schema_version"], CAMPAIGN_RESULT_SCHEMA_V5);
+        assert_eq!(result["schema_version"], CAMPAIGN_RESULT_SCHEMA_V6);
         assert_eq!(
             result["campaign_inputs_sha256"],
             serde_json::json!(request.campaign_inputs_sha256)
@@ -3016,43 +3268,76 @@ mod tests {
             declared_total_trials_for_rounds(&request.research_plan, 2).unwrap();
         assert_eq!(result["rounds"].as_array().unwrap().len(), 2);
         assert_eq!(result["declared_total_trials"], declared_total_trials);
-        assert_eq!(result["consumed_trials"], declared_total_trials);
+        assert_eq!(
+            result["consumed_trials"],
+            (request.research_plan.max_candidates().unwrap() + 2) * 2
+        );
         for round in ["r1", "r2"] {
-            let mission: serde_json::Value = serde_json::from_slice(
-                &std::fs::read(
-                    work_dir.join(format!("mission/{round}/admission/mission-readback.json")),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(
-                mission["spec"]["search"]["multiple_testing_trials"],
-                declared_total_trials
-            );
-            let subset: serde_json::Value = serde_json::from_slice(
-                &std::fs::read(work_dir.join(format!(
-                    "mission/{round}/execute/results/factor-subset-mcts-result.json"
-                )))
-                .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(
-                subset["selected"]["evaluation"]["evaluator_config"]["multiple_testing_trials"],
-                declared_total_trials
-            );
+            let results = work_dir.join(format!("mission/{round}/execute/results"));
+            assert!(results.join("factor-bank.json").exists());
+            assert!(results.join("supervised-model-selection.json").exists());
+            assert!(results
+                .join("supervised-event-replay-receipt.json")
+                .exists());
+            assert!(!results.join("factor-subset-mcts-result.json").exists());
+            assert!(!results.join("cex-event-replay-receipt.json").exists());
         }
+        assert_eq!(result["termination_reason"], "campaign_no_candidate");
+        assert!(result["rounds"].as_array().unwrap().iter().all(|round| {
+            round["termination_reason"] == "supervised_replay_gate_failed"
+                && round["supervised_replay_gate_passed"] == false
+                && round["feedback"]["supervised_replay"]["mean_net_return"]
+                    .as_f64()
+                    .is_some_and(|value| value < 0.0)
+        }));
+        assert!(result["selected_round_id"].is_null());
+        assert!(result["finalization"].is_null());
+        assert!(!fixture.global_claim_path.exists());
+    }
+
+    #[test]
+    fn execute_keeps_profitable_ml_replay_without_legacy_finalization() {
+        let fixture = campaign_e2e_fixture("campaign-e2e-ml-positive", false, false, true);
+        execute(fixture.args).unwrap();
+
+        let result: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture.work_dir.join("campaign-result.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result["schema_version"], CAMPAIGN_RESULT_SCHEMA_V6);
+        assert_eq!(
+            result["termination_reason"],
+            "campaign_selected_pre_holdout"
+        );
         assert!(result["selected_round_id"].is_string());
-        assert!(result["finalization"].is_object());
-        let finalization = &result["finalization"];
-        assert!(finalization["final_precommit"].is_object());
-        assert!(finalization["sealed_holdout_claim"].is_object());
-        assert!(finalization["sealed_holdout_receipt"].is_object());
-        assert!(fixture.global_claim_path.exists());
+        assert!(result["selected_candidate_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("cex-supervised-model-candidate-")));
+        assert!(result["finalization"].is_null());
+        assert!(!fixture.global_claim_path.exists());
+        assert!(result["rounds"].as_array().unwrap().iter().all(|round| {
+            round["termination_reason"] == "supervised_pre_holdout_candidate_kept"
+                && round["supervised_replay_gate_passed"] == true
+                && round["feedback"]["supervised_replay"]["mean_net_return"]
+                    .as_f64()
+                    .is_some_and(|value| value > 0.0)
+                && round["feedback"]["supervised_replay"]["net_sharpe"]
+                    .as_f64()
+                    .is_some_and(|value| value >= 2.0)
+        }));
+        for round in ["r1", "r2"] {
+            let results = fixture
+                .work_dir
+                .join(format!("mission/{round}/execute/results"));
+            assert!(!results.join("factor-subset-mcts-result.json").exists());
+            assert!(!results.join("cex-event-replay-receipt.json").exists());
+            assert!(!results.join("finalization-report.json").exists());
+        }
     }
 
     #[test]
     fn execute_negative_campaign_creates_no_claim() {
-        let fixture = campaign_e2e_fixture("campaign-e2e-negative", true, false);
+        let fixture = campaign_e2e_fixture("campaign-e2e-negative", true, false, false);
         execute(fixture.args).unwrap();
 
         let result: serde_json::Value = serde_json::from_slice(
@@ -3068,8 +3353,8 @@ mod tests {
     }
 
     #[test]
-    fn collect_round_ledger_marks_missing_selection_as_no_passing_subset() {
-        let fixture = campaign_e2e_fixture("campaign-ledger-no-selection", false, false);
+    fn collect_round_ledger_rejects_supervised_replay_report_drift() {
+        let fixture = campaign_e2e_fixture("campaign-ledger-no-selection", false, false, false);
         execute(fixture.args.clone()).unwrap();
 
         let request = load_request(&fixture.args.request).unwrap().request;
@@ -3077,89 +3362,17 @@ mod tests {
         let execute_dir = fixture
             .work_dir
             .join(format!("mission/{}/execute", round.round_id));
-        let results = execute_dir.join("results");
-        let subset_path = results.join("factor-subset-mcts-result.json");
         let mut report = recover_round_report(&fixture.work_dir, &request, &round);
-        report.replay_gate_passed = Some(false);
-        let failed_replay = collect_round_ledger(&execute_dir, &round, &report).unwrap();
-        assert_eq!(failed_replay.termination_reason, "replay_gate_failed");
-        assert!(failed_replay.selected_candidate_id.is_none());
-        assert!(failed_replay.selected_score.is_none());
-
-        let mut subset: CexFactorBankMctsResultV1 =
-            serde_json::from_slice(&std::fs::read(&subset_path).unwrap()).unwrap();
-        subset.selected = None;
-        data_mission::write_json_atomic(&subset_path, &subset).unwrap();
-        std::fs::remove_file(results.join("combination-walk-forward.json")).unwrap();
-
-        report.replay_receipt_id = None;
-        report.replay_gate_passed = None;
-        let ledger = collect_round_ledger(&execute_dir, &round, &report).unwrap();
-
-        assert_eq!(ledger.termination_reason, "no_passing_subset");
-        assert!(ledger.selected_candidate_id.is_none());
-        assert!(ledger.selected_candidate_content_hash.is_none());
-        assert!(ledger.selected_score.is_none());
-
-        let ridge_path = results.join("ridge-baseline.json");
-        let ridge: alpha_domain::CexBaselineArtifactV1 =
-            serde_json::from_slice(&std::fs::read(&ridge_path).unwrap()).unwrap();
-        let cart: alpha_domain::CexBaselineArtifactV1 =
-            serde_json::from_slice(&std::fs::read(results.join("cart-baseline.json")).unwrap())
-                .unwrap();
-        let mut evaluation = ridge.evaluation.clone();
-        evaluation.metrics.folds[0].trade_count = 0;
-        evaluation.metrics.trade_count = evaluation
-            .metrics
-            .folds
-            .iter()
-            .map(|fold| fold.trade_count)
-            .sum();
-        evaluation.passed = false;
-        evaluation.failure_reasons = vec!["forced baseline failure".to_string()];
-        let ridge = alpha_domain::CexBaselineArtifactV1::new(
-            ridge.mission_id.clone(),
-            ridge.factor_bank_revision_id.clone(),
-            ridge.factor_ids.clone(),
-            ridge.target.clone(),
-            ridge.research_dataset.clone(),
-            ridge.walk_forward_partition.clone(),
-            ridge.evaluation_policy.clone(),
-            ridge.baseline_policy.clone(),
-            ridge.model_kind,
-            ridge.folds.clone(),
-            evaluation,
-        )
-        .unwrap();
-        let gate = CexBaselineGateV1::new(&ridge, &cart).unwrap();
-        let gate_path = results.join("baseline-gate.json");
-        data_mission::write_json_atomic(&ridge_path, &ridge).unwrap();
-        data_mission::write_json_atomic(&gate_path, &gate).unwrap();
-        std::fs::remove_file(&subset_path).unwrap();
-
-        let baseline_failed = collect_round_ledger(&execute_dir, &round, &report).unwrap();
-        assert_eq!(baseline_failed.termination_reason, "baseline_gate_failed");
-        assert!(baseline_failed.selected_candidate_id.is_none());
-
-        let mut mismatched_gate = gate;
-        mismatched_gate.mission_id = "cex-research-mission-other".to_string();
-        mismatched_gate.gate_id.clear();
-        mismatched_gate.gate_id = format!(
-            "cex-baseline-gate-{}",
-            canonical_json_hash(&mismatched_gate).unwrap()
-        );
-        mismatched_gate.validate().unwrap();
-        data_mission::write_json_atomic(&gate_path, &mismatched_gate).unwrap();
-
+        report.supervised_replay_gate_passed = Some(true);
         let error = collect_round_ledger(&execute_dir, &round, &report).unwrap_err();
         assert!(error
             .to_string()
-            .contains("baseline gate producer binding drifted"));
+            .contains("supervised replay report drifted from its receipt"));
     }
 
     #[test]
-    fn collect_round_ledger_rejects_missing_subset_result_for_nonempty_factor_bank() {
-        let fixture = campaign_e2e_fixture("campaign-ledger-missing-result", false, false);
+    fn collect_round_ledger_rejects_missing_supervised_replay() {
+        let fixture = campaign_e2e_fixture("campaign-ledger-missing-result", false, false, false);
         execute(fixture.args.clone()).unwrap();
 
         let request = load_request(&fixture.args.request).unwrap().request;
@@ -3168,28 +3381,26 @@ mod tests {
             .work_dir
             .join(format!("mission/{}/execute", round.round_id));
         let results = execute_dir.join("results");
-        std::fs::remove_file(results.join("factor-subset-mcts-result.json")).unwrap();
+        std::fs::remove_file(results.join("supervised-event-replay-receipt.json")).unwrap();
+        let mut report = recover_round_report(&fixture.work_dir, &request, &round);
+        report.supervised_replay_receipt_id = None;
+        report.supervised_replay_gate_passed = None;
 
-        let error = collect_round_ledger(
-            &execute_dir,
-            &round,
-            &recover_round_report(&fixture.work_dir, &request, &round),
-        )
-        .unwrap_err();
+        let error = collect_round_ledger(&execute_dir, &round, &report).unwrap_err();
 
         assert!(error
             .to_string()
-            .contains("non-empty Factor Bank is missing factor subset MCTS result"));
+            .contains("eligible supervised selection is missing its event replay receipt"));
     }
 
     #[test]
-    fn existing_global_claim_blocks_finalize_but_search_rounds_complete() {
-        let fixture = campaign_e2e_fixture("campaign-e2e-existing-claim", false, true);
-        let error = execute(fixture.args).unwrap_err();
+    fn supervised_search_does_not_touch_an_existing_global_claim() {
+        let fixture = campaign_e2e_fixture("campaign-e2e-existing-claim", false, true, false);
+        execute(fixture.args).unwrap();
 
-        assert!(
-            error.to_string().contains("already claimed")
-                || error.to_string().contains("terminal and inconclusive")
+        assert_eq!(
+            std::fs::read(&fixture.global_claim_path).unwrap(),
+            b"claimed"
         );
         assert!(fixture
             .work_dir
@@ -3452,6 +3663,9 @@ mod tests {
                     result_readback_bundle_sha256: "6".repeat(64),
                     replay_receipt_id: None,
                     replay_gate_passed: Some(false),
+                    supervised_candidate_id: None,
+                    supervised_replay_receipt_id: None,
+                    supervised_replay_gate_passed: None,
                     final_precommit_id: None,
                     sealed_receipt_id: None,
                     sealed_passed: None,
@@ -3476,6 +3690,7 @@ mod tests {
                         baseline_failure_codes: vec![CexBaselineFailureCodeV1::EmptyFactorBank],
                         ridge: None,
                         cart: None,
+                        ..CampaignRoundFeedbackV1::default()
                     },
                 })
                 .collect(),
@@ -3501,6 +3716,7 @@ mod tests {
         name: &str,
         zero_labels: bool,
         preexisting_claim: bool,
+        replay_tracks_features: bool,
     ) -> CampaignE2eFixture {
         let render_fixture = mission_render::tests::Fixture::new(21_608);
         let mut rows = mission_render::tests::read_feature_rows(&render_fixture.feature_path);
@@ -3509,6 +3725,7 @@ mod tests {
                 row.label = 0.0;
             }
         } else {
+            let mut mid_price = 60_000.0_f64;
             for (index, row) in rows.iter_mut().enumerate() {
                 let direction: f64 = if (index / 100).is_multiple_of(2) {
                     1.0
@@ -3530,7 +3747,25 @@ mod tests {
                     .insert("vwap_center_deviation_top5_bps".to_string(), direction);
                 row.features
                     .insert("weighted_book_imbalance_top5".to_string(), direction);
-                row.label = direction * 0.001;
+                if replay_tracks_features {
+                    row.features.insert("mid_price".to_string(), mid_price);
+                    mid_price *= 1.0 + direction * 0.0005;
+                } else {
+                    row.label = direction * 0.001;
+                }
+            }
+            if replay_tracks_features {
+                let mid_prices = rows
+                    .iter()
+                    .map(|row| row.features["mid_price"])
+                    .collect::<Vec<_>>();
+                for (index, row) in rows.iter_mut().enumerate() {
+                    let future = mid_prices
+                        .get(index + 5)
+                        .copied()
+                        .unwrap_or(mid_prices[index]);
+                    row.label = future / mid_prices[index] - 1.0;
+                }
             }
         }
         mission_render::tests::rewrite_feature_rows(&render_fixture.feature_path, &rows);
@@ -3543,6 +3778,7 @@ mod tests {
             replay_root.path(),
             &render_fixture.feature_path,
             &render_fixture.materialization_path,
+            replay_tracks_features,
         );
         let rendered = render_cex_bundle(
             &render_fixture.feature_path,
@@ -3706,6 +3942,7 @@ mod tests {
         root: &Path,
         feature_path: &Path,
         materialization_path: &Path,
+        replay_tracks_features: bool,
     ) -> (PathBuf, PathBuf) {
         const MESSAGE: &str = "
 message binance_replay {
@@ -3731,10 +3968,13 @@ message binance_replay {
         let source_start_ns = source_segments[0]["start_received_at_ns"].as_u64().unwrap();
         let source_end_ns = source_segments[0]["end_received_at_ns"].as_u64().unwrap();
         let source_events = source_segments[0]["events"].as_u64().unwrap();
-        let levels = serde_json::json!({
-            "bids": [["59999", "10"], ["59998", "10"], ["59997", "10"], ["59996", "10"], ["59995", "10"]],
-            "asks": [["60001", "10"], ["60002", "10"], ["60003", "10"], ["60004", "10"], ["60005", "10"]]
-        });
+        let initial_mid = if replay_tracks_features {
+            rows[0].features["mid_price"]
+        } else {
+            60_000.0
+        };
+        let initial_levels = replay_book_levels(initial_mid, "10");
+        let mut previous_mid = initial_mid;
         let mut timestamps = Vec::with_capacity(rows.len() + 2);
         let mut sequences = Vec::with_capacity(rows.len() + 2);
         let mut events = Vec::with_capacity(rows.len() + 2);
@@ -3749,17 +3989,28 @@ message binance_replay {
                 );
                 sequences.push(1);
                 events.push("snapshot".to_string());
-                payloads.push(serde_json::to_string(&levels).unwrap());
+                payloads.push(serde_json::to_string(&initial_levels).unwrap());
             }
+            let current_mid = if replay_tracks_features {
+                row.features["mid_price"]
+            } else {
+                initial_mid
+            };
+            let update = if replay_tracks_features && index > 0 {
+                replay_book_delta(previous_mid, current_mid)
+            } else {
+                replay_book_levels(current_mid, "10")
+            };
             timestamps.push(row.feature_available_time.timestamp_micros() + 100);
             sequences.push(i64::try_from(index + 2).unwrap());
             events.push("l2_update".to_string());
-            payloads.push(serde_json::to_string(&levels).unwrap());
+            payloads.push(serde_json::to_string(&update).unwrap());
+            previous_mid = current_mid;
         }
         timestamps.push(rows.last().unwrap().label_available_time.timestamp_micros() + 100);
         sequences.push(i64::try_from(timestamps.len()).unwrap());
         events.push("l2_update".to_string());
-        payloads.push(serde_json::to_string(&levels).unwrap());
+        payloads.push(serde_json::to_string(&replay_book_levels(previous_mid, "10")).unwrap());
         let temporary_artifact = root.join("replay.parquet");
         let schema = Arc::new(parse_message_type(MESSAGE).unwrap());
         let properties = Arc::new(WriterProperties::builder().build());
@@ -3816,6 +4067,36 @@ message binance_replay {
         )
         .unwrap();
         (replay_artifact_path, replay_manifest_path)
+    }
+
+    fn replay_book_levels(mid: f64, quantity: &str) -> serde_json::Value {
+        let bids = (1..=5)
+            .map(|offset| {
+                [
+                    format!("{:.8}", mid - f64::from(offset)),
+                    quantity.to_string(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let asks = (1..=5)
+            .map(|offset| {
+                [
+                    format!("{:.8}", mid + f64::from(offset)),
+                    quantity.to_string(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({"bids": bids, "asks": asks})
+    }
+
+    fn replay_book_delta(previous_mid: f64, current_mid: f64) -> serde_json::Value {
+        let previous = replay_book_levels(previous_mid, "0");
+        let current = replay_book_levels(current_mid, "10");
+        let mut bids = previous["bids"].as_array().unwrap().clone();
+        bids.extend(current["bids"].as_array().unwrap().iter().cloned());
+        let mut asks = previous["asks"].as_array().unwrap().clone();
+        asks.extend(current["asks"].as_array().unwrap().iter().cloned());
+        serde_json::json!({"bids": bids, "asks": asks})
     }
 
     fn write_replay_i64_column(group: &mut SerializedRowGroupWriter<'_, File>, values: &[i64]) {

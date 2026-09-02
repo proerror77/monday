@@ -210,7 +210,7 @@ if [[ "$source_object" == *"/campaign-result.json"* ]]; then
     --arg bundle_r1_sha "$bundle_r1_sha" \
     --arg bundle_r2_sha "$bundle_r2_sha" \
     --argjson generation "$generation" '{
-      schema_version:"cex-campaign-result-v5",
+      schema_version:"cex-campaign-result-v6",
       campaign_id:$request[0].campaign_id,
       request_sha256:$request_sha256,
       build_source_revision:$request[0].build_source_revision,

@@ -310,7 +310,7 @@ while ((generation <= max_follow_ups)); do
     result_url="$(jq -er '.campaign_result_readback_url' "$request")"
     oss_readback "$result_url" "$result"
     jq -e --slurpfile request_doc "$request" --arg request_sha256 "$request_sha256" '
-      .schema_version == "cex-campaign-result-v5"
+      .schema_version == "cex-campaign-result-v6"
       and .campaign_id == $request_doc[0].campaign_id
       and .request_sha256 == $request_sha256
       and .build_source_revision == $request_doc[0].build_source_revision
