@@ -4,10 +4,31 @@ set -eu
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 ENTRYPOINT=$SCRIPT_DIR/scripts/cex-materialization-entrypoint.sh
 JOB_TEMPLATE=$SCRIPT_DIR/k8s/cex-materialization-job.example.yaml
+SLICE_JOB=$SCRIPT_DIR/k8s/cex-materialization-slice-job.example.yaml
+REDUCE_JOB=$SCRIPT_DIR/k8s/cex-materialization-reduce-job.example.yaml
 
 [ "$(grep -c ' /reference/lake/raw$' "$JOB_TEMPLATE")" -eq 2 ]
 ! grep -q ' /lake/reference$' "$JOB_TEMPLATE"
 grep -q '^  activeDeadlineSeconds: 7200$' "$JOB_TEMPLATE"
+grep -q '^  completionMode: NonIndexed$' "$JOB_TEMPLATE"
+grep -q '^  completions: 1$' "$JOB_TEMPLATE"
+grep -q '^  parallelism: 1$' "$JOB_TEMPLATE"
+grep -q '^  backoffLimit: 0$' "$JOB_TEMPLATE"
+grep -q -- '--role' "$JOB_TEMPLATE"
+grep -q '^  completionMode: Indexed$' "$SLICE_JOB"
+grep -q '^  completions: 8$' "$SLICE_JOB"
+grep -q '^  parallelism: 1$' "$SLICE_JOB"
+grep -q '^  backoffLimit: 0$' "$SLICE_JOB"
+grep -q 'command: \["/bin/sh"\]' "$SLICE_JOB"
+! grep -E '^[[:space:]]+- \$\(JOB_COMPLETION_INDEX\)$' "$SLICE_JOB"
+! grep -q 'exec /contract/' "$SLICE_JOB"
+grep -F 'fieldPath: metadata.annotations['"'"'batch.kubernetes.io/job-completion-index'"'"']' "$SLICE_JOB" >/dev/null
+grep -q '^  completionMode: NonIndexed$' "$REDUCE_JOB"
+grep -q '^  completions: 1$' "$REDUCE_JOB"
+grep -q '^  parallelism: 1$' "$REDUCE_JOB"
+grep -q '^  backoffLimit: 0$' "$REDUCE_JOB"
+grep -q '^  activeDeadlineSeconds: 7200$' "$REDUCE_JOB"
+! grep -qiE 'argo|kubeflow' "$SLICE_JOB" "$REDUCE_JOB" "$JOB_TEMPLATE"
 
 for tool in awk find sed sha256sum mktemp chmod grep; do
   command -v "$tool" >/dev/null 2>&1 || {
@@ -192,7 +213,7 @@ sh "$ENTRYPOINT" \
   --work-dir "$WORK_ROOT" \
   --binary-dir "$BIN_DIR" >/dev/null 2>"$ROOT/run.log"
 
-grep -Fq "progress_event raw_verification \"\$i\" \"\$raw_segment_count\" 10" "$ENTRYPOINT"
+grep -Fq "progress_event raw_verification \"\$seen\" \"\$verify_total\" 10" "$ENTRYPOINT"
 grep -Fq "progress_event reference_verification \"\$i\" \"\$reference_count\" 50" "$ENTRYPOINT"
 grep -Fq "progress_event slicing \"\$i\" \"\$raw_segment_count\" 10" "$ENTRYPOINT"
 for event in \
@@ -260,5 +281,474 @@ if sh "$ENTRYPOINT" \
 fi
 grep -q 'output prefix already exists' "$ROOT/replay.err"
 grep -q 'schema_version=monday.research_event.v1 component=cex-materialization event=run_failed' "$ROOT/replay.err"
+
+SHARD_ROOT=$(mktemp -d)
+trap 'rm -rf "$ROOT" "$SHARD_ROOT"' EXIT
+RAW4=$SHARD_ROOT/raw
+OUT4=$SHARD_ROOT/output
+REF4=$SHARD_ROOT/reference
+mkdir -p "$RAW4" "$OUT4" "$REF4"
+raw3=$(write_triplet "$RAW4/venue=binance/market=usdm/dataset=usdm_all/shard=all/date=2026-08-18/hour=03/part-3.jsonl.zst" raw-segment-3 raw-manifest-3)
+raw4=$(write_triplet "$RAW4/venue=binance/market=usdm/dataset=usdm_all/shard=all/date=2026-08-18/hour=04/part-4.jsonl.zst" raw-segment-4 raw-manifest-4)
+ref3=$(write_triplet "$REF4/venue=binance/market=usdm/dataset=reference/batch-001/reference.ndjson" ref-segment-1 ref-manifest-1)
+
+cat >"$SHARD_ROOT/inventory.env" <<EOF
+RUN_ID=test-run-shards
+SOURCE_REVISION=0123456789abcdef0123456789abcdef01234567
+IMAGE_REF=registry/research-runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+MISSION_ID=data-btcusdt-usdm-test
+MARKET=usdm
+SYMBOL=BTCUSDT
+BUCKET_MS=1000
+LABEL_HORIZON_BUCKETS=5
+TOP_DEPTH=5
+OUTPUT_PREFIX=test-run-shards
+RAW_SEGMENT_COUNT=4
+RAW_SEGMENT_1=venue=binance/market=usdm/dataset=usdm_all/shard=all/date=2026-08-18/hour=01/part-1.jsonl.zst
+RAW_SEGMENT_1_SHA256=$(printf '%s' "$raw1" | awk -F'|' '{print $1}')
+RAW_SEGMENT_1_MANIFEST_SHA256=$(printf '%s' "$raw1" | awk -F'|' '{print $2}')
+RAW_SEGMENT_2=venue=binance/market=usdm/dataset=usdm_all/shard=all/date=2026-08-18/hour=02/part-2.jsonl.zst
+RAW_SEGMENT_2_SHA256=$(printf '%s' "$raw2" | awk -F'|' '{print $1}')
+RAW_SEGMENT_2_MANIFEST_SHA256=$(printf '%s' "$raw2" | awk -F'|' '{print $2}')
+RAW_SEGMENT_3=venue=binance/market=usdm/dataset=usdm_all/shard=all/date=2026-08-18/hour=03/part-3.jsonl.zst
+RAW_SEGMENT_3_SHA256=$(printf '%s' "$raw3" | awk -F'|' '{print $1}')
+RAW_SEGMENT_3_MANIFEST_SHA256=$(printf '%s' "$raw3" | awk -F'|' '{print $2}')
+RAW_SEGMENT_4=venue=binance/market=usdm/dataset=usdm_all/shard=all/date=2026-08-18/hour=04/part-4.jsonl.zst
+RAW_SEGMENT_4_SHA256=$(printf '%s' "$raw4" | awk -F'|' '{print $1}')
+RAW_SEGMENT_4_MANIFEST_SHA256=$(printf '%s' "$raw4" | awk -F'|' '{print $2}')
+REFERENCE_COUNT=1
+REFERENCE_1=venue=binance/market=usdm/dataset=reference/batch-001/reference.ndjson
+REFERENCE_1_SHA256=$(printf '%s' "$ref3" | awk -F'|' '{print $1}')
+REFERENCE_1_MANIFEST_SHA256=$(printf '%s' "$ref3" | awk -F'|' '{print $2}')
+EOF
+
+mkdir -p "$(dirname "$RAW4/$raw1_rel")" "$(dirname "$RAW4/$raw2_rel")"
+cp "$RAW_ROOT/$raw1_rel" "$RAW4/$raw1_rel"
+cp "$RAW_ROOT/$raw1_rel.manifest.json" "$RAW4/$raw1_rel.manifest.json"
+cp "$RAW_ROOT/$raw1_rel._SUCCESS" "$RAW4/$raw1_rel._SUCCESS"
+cp "$RAW_ROOT/$raw2_rel" "$RAW4/$raw2_rel"
+cp "$RAW_ROOT/$raw2_rel.manifest.json" "$RAW4/$raw2_rel.manifest.json"
+cp "$RAW_ROOT/$raw2_rel._SUCCESS" "$RAW4/$raw2_rel._SUCCESS"
+
+run_role() {
+  role=$1
+  work=$2
+  shift 2
+  sh "$ENTRYPOINT" \
+    --inventory "$SHARD_ROOT/inventory.env" \
+    --raw-root "$RAW4" \
+    --reference-root "$REF4" \
+    --output-root "$OUT4" \
+    --work-dir "$work" \
+    --binary-dir "$BIN_DIR" \
+    --role "$role" \
+    "$@"
+}
+
+run_role slice "$SHARD_ROOT/work-0" --shard-index 0 --shard-count 2 >/dev/null
+JOB_COMPLETION_INDEX=1 run_role slice "$SHARD_ROOT/work-1" --shard-count 2 >/dev/null
+[ -f "$OUT4/test-run-shards/shards/0/receipt.json" ]
+[ -f "$OUT4/test-run-shards/shards/1/receipt.json" ]
+[ -f "$OUT4/test-run-shards/shards/0/_SUCCESS" ]
+[ -f "$OUT4/test-run-shards/shards/1/_SUCCESS" ]
+[ "$(wc -l <"$OUT4/test-run-shards/shards/0/segments" | tr -d ' ')" = 2 ]
+[ "$(wc -l <"$OUT4/test-run-shards/shards/1/segments" | tr -d ' ')" = 2 ]
+run_role reduce "$SHARD_ROOT/work-reduce" --shard-count 2 >/dev/null
+[ -f "$OUT4/test-run-shards/receipts/campaign-inputs.json" ]
+[ -f "$OUT4/test-run-shards/receipts/materialization-receipt.json" ]
+grep -q '"relative_path": "artifacts/materialization/feature-test.jsonl"' "$OUT4/test-run-shards/receipts/campaign-inputs.json"
+
+collect_slice_shas() {
+  run_root=$1
+  i=1
+  while [ "$i" -le 4 ]; do
+    slice_file=$(find "$run_root/artifacts/slices/segment-$i" -maxdepth 1 -type f -name '*.jsonl.zst')
+    [ -n "$slice_file" ]
+    sha256sum "$slice_file" | awk '{print $1}'
+    i=$((i + 1))
+  done
+}
+
+two_shard_shas=$(collect_slice_shas "$OUT4/test-run-shards")
+
+run_prefixed_shards() {
+  prefix=$1
+  count=$2
+  dest=$SHARD_ROOT/$prefix
+  mkdir -p "$dest/raw" "$dest/output" "$dest/reference"
+  cp -R "$RAW4/." "$dest/raw/"
+  cp -R "$REF4/." "$dest/reference/"
+  sed "s/OUTPUT_PREFIX=test-run-shards/OUTPUT_PREFIX=$prefix/" "$SHARD_ROOT/inventory.env" >"$dest/inventory.env"
+  idx=0
+  while [ "$idx" -lt "$count" ]; do
+    sh "$ENTRYPOINT" \
+      --inventory "$dest/inventory.env" \
+      --raw-root "$dest/raw" \
+      --reference-root "$dest/reference" \
+      --output-root "$dest/output" \
+      --work-dir "$dest/work-$idx" \
+      --binary-dir "$BIN_DIR" \
+      --role slice \
+      --shard-index "$idx" \
+      --shard-count "$count" >/dev/null
+    idx=$((idx + 1))
+  done
+  sh "$ENTRYPOINT" \
+    --inventory "$dest/inventory.env" \
+    --raw-root "$dest/raw" \
+    --reference-root "$dest/reference" \
+    --output-root "$dest/output" \
+    --work-dir "$dest/work-reduce" \
+    --binary-dir "$BIN_DIR" \
+    --role reduce \
+    --shard-count "$count" >/dev/null
+  [ -f "$dest/output/$prefix/receipts/campaign-inputs.json" ]
+  collect_slice_shas "$dest/output/$prefix"
+}
+
+one_shard_shas=$(run_prefixed_shards test-run-1shard 1)
+four_shard_shas=$(run_prefixed_shards test-run-4shard 4)
+[ "$two_shard_shas" = "$one_shard_shas" ]
+[ "$two_shard_shas" = "$four_shard_shas" ]
+
+if JOB_COMPLETION_INDEX= run_role slice "$SHARD_ROOT/work-no-index" --shard-count 2 >/dev/null 2>"$SHARD_ROOT/no-index.err"; then
+  printf 'expected missing shard-index to fail\n' >&2
+  exit 1
+fi
+grep -q 'shard-index must be a non-negative integer' "$SHARD_ROOT/no-index.err"
+
+NOREF=$SHARD_ROOT/noref
+mkdir -p "$NOREF/raw" "$NOREF/output"
+cp -R "$RAW4/." "$NOREF/raw/"
+sed 's/OUTPUT_PREFIX=test-run-shards/OUTPUT_PREFIX=test-run-noref/' "$SHARD_ROOT/inventory.env" >"$NOREF/inventory.env"
+sh "$ENTRYPOINT" \
+  --inventory "$NOREF/inventory.env" \
+  --raw-root "$NOREF/raw" \
+  --output-root "$NOREF/output" \
+  --work-dir "$NOREF/work-0" \
+  --binary-dir "$BIN_DIR" \
+  --role slice \
+  --shard-index 0 \
+  --shard-count 2 >/dev/null
+[ -f "$NOREF/output/test-run-noref/shards/0/receipt.json" ]
+grep -q '"segments_sha256":' "$NOREF/output/test-run-noref/shards/0/receipt.json"
+
+if run_role slice "$SHARD_ROOT/work-0-again" --shard-index 0 --shard-count 2 >/dev/null 2>"$SHARD_ROOT/slice-dup.err"; then
+  printf 'expected duplicate shard receipt to fail\n' >&2
+  exit 1
+fi
+grep -q 'shard receipt already exists' "$SHARD_ROOT/slice-dup.err"
+
+if run_role reduce "$SHARD_ROOT/work-reduce-again" --shard-count 2 >/dev/null 2>"$SHARD_ROOT/reduce-dup.err"; then
+  printf 'expected duplicate reduce publish to fail\n' >&2
+  exit 1
+fi
+grep -q 'reduce publish already exists' "$SHARD_ROOT/reduce-dup.err"
+
+MISSING=$SHARD_ROOT/missing
+mkdir -p "$MISSING/raw" "$MISSING/output" "$MISSING/reference"
+cp -R "$RAW4/." "$MISSING/raw/"
+cp -R "$REF4/." "$MISSING/reference/"
+sed 's/OUTPUT_PREFIX=test-run-shards/OUTPUT_PREFIX=test-run-missing/' "$SHARD_ROOT/inventory.env" >"$MISSING/inventory.env"
+sh "$ENTRYPOINT" \
+  --inventory "$MISSING/inventory.env" \
+  --raw-root "$MISSING/raw" \
+  --reference-root "$MISSING/reference" \
+  --output-root "$MISSING/output" \
+  --work-dir "$MISSING/work-0" \
+  --binary-dir "$BIN_DIR" \
+  --role slice \
+  --shard-index 0 \
+  --shard-count 2 >/dev/null
+if sh "$ENTRYPOINT" \
+  --inventory "$MISSING/inventory.env" \
+  --raw-root "$MISSING/raw" \
+  --reference-root "$MISSING/reference" \
+  --output-root "$MISSING/output" \
+  --work-dir "$MISSING/work-reduce" \
+  --binary-dir "$BIN_DIR" \
+  --role reduce \
+  --shard-count 2 >/dev/null 2>"$MISSING/reduce.err"; then
+  printf 'expected missing shard reducer to fail\n' >&2
+  exit 1
+fi
+grep -q 'shard receipt is missing' "$MISSING/reduce.err"
+
+DUPSEG=$SHARD_ROOT/dupseg
+mkdir -p "$DUPSEG/raw" "$DUPSEG/output" "$DUPSEG/reference"
+cp -R "$RAW4/." "$DUPSEG/raw/"
+cp -R "$REF4/." "$DUPSEG/reference/"
+sed 's/OUTPUT_PREFIX=test-run-shards/OUTPUT_PREFIX=test-run-dupseg/' "$SHARD_ROOT/inventory.env" >"$DUPSEG/inventory.env"
+sh "$ENTRYPOINT" \
+  --inventory "$DUPSEG/inventory.env" \
+  --raw-root "$DUPSEG/raw" \
+  --reference-root "$DUPSEG/reference" \
+  --output-root "$DUPSEG/output" \
+  --work-dir "$DUPSEG/work-0" \
+  --binary-dir "$BIN_DIR" \
+  --role slice \
+  --shard-index 0 \
+  --shard-count 2 >/dev/null
+sh "$ENTRYPOINT" \
+  --inventory "$DUPSEG/inventory.env" \
+  --raw-root "$DUPSEG/raw" \
+  --reference-root "$DUPSEG/reference" \
+  --output-root "$DUPSEG/output" \
+  --work-dir "$DUPSEG/work-1" \
+  --binary-dir "$BIN_DIR" \
+  --role slice \
+  --shard-index 1 \
+  --shard-count 2 >/dev/null
+cp "$DUPSEG/output/test-run-dupseg/shards/0/segments" "$DUPSEG/output/test-run-dupseg/shards/1/segments"
+if sh "$ENTRYPOINT" \
+  --inventory "$DUPSEG/inventory.env" \
+  --raw-root "$DUPSEG/raw" \
+  --reference-root "$DUPSEG/reference" \
+  --output-root "$DUPSEG/output" \
+  --work-dir "$DUPSEG/work-reduce" \
+  --binary-dir "$BIN_DIR" \
+  --role reduce \
+  --shard-count 2 >/dev/null 2>"$DUPSEG/reduce.err"; then
+  printf 'expected duplicate segment reducer to fail\n' >&2
+  exit 1
+fi
+grep -q 'segment list SHA mismatch' "$DUPSEG/reduce.err"
+
+ORDER=$SHARD_ROOT/order
+mkdir -p "$ORDER/raw" "$ORDER/output" "$ORDER/reference"
+cp -R "$RAW4/." "$ORDER/raw/"
+cp -R "$REF4/." "$ORDER/reference/"
+sed 's/OUTPUT_PREFIX=test-run-shards/OUTPUT_PREFIX=test-run-order/' "$SHARD_ROOT/inventory.env" >"$ORDER/inventory.env"
+sh "$ENTRYPOINT" \
+  --inventory "$ORDER/inventory.env" \
+  --raw-root "$ORDER/raw" \
+  --reference-root "$ORDER/reference" \
+  --output-root "$ORDER/output" \
+  --work-dir "$ORDER/work-0" \
+  --binary-dir "$BIN_DIR" \
+  --role slice \
+  --shard-index 0 \
+  --shard-count 2 >/dev/null
+sh "$ENTRYPOINT" \
+  --inventory "$ORDER/inventory.env" \
+  --raw-root "$ORDER/raw" \
+  --reference-root "$ORDER/reference" \
+  --output-root "$ORDER/output" \
+  --work-dir "$ORDER/work-1" \
+  --binary-dir "$BIN_DIR" \
+  --role slice \
+  --shard-index 1 \
+  --shard-count 2 >/dev/null
+awk '{lines[NR]=$0} END {print lines[2]; print lines[1]}' \
+  "$ORDER/output/test-run-order/shards/0/segments" >"$ORDER/segments.swapped"
+mv "$ORDER/segments.swapped" "$ORDER/output/test-run-order/shards/0/segments"
+new_seg_sha=$(sha256sum "$ORDER/output/test-run-order/shards/0/segments" | awk '{print $1}')
+sed "s/\"segments_sha256\": \"[0-9a-f]*\"/\"segments_sha256\": \"$new_seg_sha\"/" \
+  "$ORDER/output/test-run-order/shards/0/receipt.json" >"$ORDER/receipt.swapped"
+mv "$ORDER/receipt.swapped" "$ORDER/output/test-run-order/shards/0/receipt.json"
+sha256sum "$ORDER/output/test-run-order/shards/0/receipt.json" | awk '{print $1}' \
+  >"$ORDER/output/test-run-order/shards/0/_SUCCESS"
+if sh "$ENTRYPOINT" \
+  --inventory "$ORDER/inventory.env" \
+  --raw-root "$ORDER/raw" \
+  --reference-root "$ORDER/reference" \
+  --output-root "$ORDER/output" \
+  --work-dir "$ORDER/work-reduce" \
+  --binary-dir "$BIN_DIR" \
+  --role reduce \
+  --shard-count 2 >/dev/null 2>"$ORDER/reduce.err"; then
+  printf 'expected out-of-order reducer to fail\n' >&2
+  exit 1
+fi
+grep -q 'segment out of order' "$ORDER/reduce.err"
+
+MISSING_SUCCESS=$SHARD_ROOT/missing-success
+mkdir -p "$MISSING_SUCCESS/raw" "$MISSING_SUCCESS/output" "$MISSING_SUCCESS/reference"
+cp -R "$RAW4/." "$MISSING_SUCCESS/raw/"
+cp -R "$REF4/." "$MISSING_SUCCESS/reference/"
+sed 's/OUTPUT_PREFIX=test-run-shards/OUTPUT_PREFIX=test-run-missing-success/' "$SHARD_ROOT/inventory.env" >"$MISSING_SUCCESS/inventory.env"
+sh "$ENTRYPOINT" \
+  --inventory "$MISSING_SUCCESS/inventory.env" \
+  --raw-root "$MISSING_SUCCESS/raw" \
+  --reference-root "$MISSING_SUCCESS/reference" \
+  --output-root "$MISSING_SUCCESS/output" \
+  --work-dir "$MISSING_SUCCESS/work-0" \
+  --binary-dir "$BIN_DIR" \
+  --role slice \
+  --shard-index 0 \
+  --shard-count 2 >/dev/null
+sh "$ENTRYPOINT" \
+  --inventory "$MISSING_SUCCESS/inventory.env" \
+  --raw-root "$MISSING_SUCCESS/raw" \
+  --reference-root "$MISSING_SUCCESS/reference" \
+  --output-root "$MISSING_SUCCESS/output" \
+  --work-dir "$MISSING_SUCCESS/work-1" \
+  --binary-dir "$BIN_DIR" \
+  --role slice \
+  --shard-index 1 \
+  --shard-count 2 >/dev/null
+rm -f "$MISSING_SUCCESS/output/test-run-missing-success/shards/0/_SUCCESS"
+if sh "$ENTRYPOINT" \
+  --inventory "$MISSING_SUCCESS/inventory.env" \
+  --raw-root "$MISSING_SUCCESS/raw" \
+  --reference-root "$MISSING_SUCCESS/reference" \
+  --output-root "$MISSING_SUCCESS/output" \
+  --work-dir "$MISSING_SUCCESS/work-reduce" \
+  --binary-dir "$BIN_DIR" \
+  --role reduce \
+  --shard-count 2 >/dev/null 2>"$MISSING_SUCCESS/reduce.err"; then
+  printf 'expected missing shard success marker to fail\n' >&2
+  exit 1
+fi
+grep -q 'shard success marker is missing' "$MISSING_SUCCESS/reduce.err"
+
+BOUNDS=$SHARD_ROOT/bounds
+mkdir -p "$BOUNDS/raw" "$BOUNDS/output" "$BOUNDS/reference"
+cp -R "$RAW4/." "$BOUNDS/raw/"
+cp -R "$REF4/." "$BOUNDS/reference/"
+sed 's/OUTPUT_PREFIX=test-run-shards/OUTPUT_PREFIX=test-run-bounds/' "$SHARD_ROOT/inventory.env" >"$BOUNDS/inventory.env"
+sh "$ENTRYPOINT" \
+  --inventory "$BOUNDS/inventory.env" \
+  --raw-root "$BOUNDS/raw" \
+  --reference-root "$BOUNDS/reference" \
+  --output-root "$BOUNDS/output" \
+  --work-dir "$BOUNDS/work-0" \
+  --binary-dir "$BIN_DIR" \
+  --role slice \
+  --shard-index 0 \
+  --shard-count 2 >/dev/null
+sh "$ENTRYPOINT" \
+  --inventory "$BOUNDS/inventory.env" \
+  --raw-root "$BOUNDS/raw" \
+  --reference-root "$BOUNDS/reference" \
+  --output-root "$BOUNDS/output" \
+  --work-dir "$BOUNDS/work-1" \
+  --binary-dir "$BIN_DIR" \
+  --role slice \
+  --shard-index 1 \
+  --shard-count 2 >/dev/null
+sed 's/"segment_end": "2"/"segment_end": "3"/' \
+  "$BOUNDS/output/test-run-bounds/shards/0/receipt.json" >"$BOUNDS/receipt.drifted"
+mv "$BOUNDS/receipt.drifted" "$BOUNDS/output/test-run-bounds/shards/0/receipt.json"
+sha256sum "$BOUNDS/output/test-run-bounds/shards/0/receipt.json" | awk '{print $1}' \
+  >"$BOUNDS/output/test-run-bounds/shards/0/_SUCCESS"
+if sh "$ENTRYPOINT" \
+  --inventory "$BOUNDS/inventory.env" \
+  --raw-root "$BOUNDS/raw" \
+  --reference-root "$BOUNDS/reference" \
+  --output-root "$BOUNDS/output" \
+  --work-dir "$BOUNDS/work-reduce" \
+  --binary-dir "$BIN_DIR" \
+  --role reduce \
+  --shard-count 2 >/dev/null 2>"$BOUNDS/reduce.err"; then
+  printf 'expected drifted shard bounds to fail\n' >&2
+  exit 1
+fi
+grep -q 'segment_end drifted' "$BOUNDS/reduce.err"
+
+SEGLIST=$SHARD_ROOT/seglist
+mkdir -p "$SEGLIST/raw" "$SEGLIST/output" "$SEGLIST/reference"
+cp -R "$RAW4/." "$SEGLIST/raw/"
+cp -R "$REF4/." "$SEGLIST/reference/"
+sed 's/OUTPUT_PREFIX=test-run-shards/OUTPUT_PREFIX=test-run-seglist/' "$SHARD_ROOT/inventory.env" >"$SEGLIST/inventory.env"
+sh "$ENTRYPOINT" \
+  --inventory "$SEGLIST/inventory.env" \
+  --raw-root "$SEGLIST/raw" \
+  --reference-root "$SEGLIST/reference" \
+  --output-root "$SEGLIST/output" \
+  --work-dir "$SEGLIST/work-0" \
+  --binary-dir "$BIN_DIR" \
+  --role slice \
+  --shard-index 0 \
+  --shard-count 2 >/dev/null
+sh "$ENTRYPOINT" \
+  --inventory "$SEGLIST/inventory.env" \
+  --raw-root "$SEGLIST/raw" \
+  --reference-root "$SEGLIST/reference" \
+  --output-root "$SEGLIST/output" \
+  --work-dir "$SEGLIST/work-1" \
+  --binary-dir "$BIN_DIR" \
+  --role slice \
+  --shard-index 1 \
+  --shard-count 2 >/dev/null
+awk 'NR==1 {print} NR==2 {print} END {print}' \
+  "$SEGLIST/output/test-run-seglist/shards/0/segments" >"$SEGLIST/segments.tampered"
+mv "$SEGLIST/segments.tampered" "$SEGLIST/output/test-run-seglist/shards/0/segments"
+if sh "$ENTRYPOINT" \
+  --inventory "$SEGLIST/inventory.env" \
+  --raw-root "$SEGLIST/raw" \
+  --reference-root "$SEGLIST/reference" \
+  --output-root "$SEGLIST/output" \
+  --work-dir "$SEGLIST/work-reduce" \
+  --binary-dir "$BIN_DIR" \
+  --role reduce \
+  --shard-count 2 >/dev/null 2>"$SEGLIST/reduce.err"; then
+  printf 'expected tampered shard segment list to fail\n' >&2
+  exit 1
+fi
+grep -q 'segment list SHA mismatch' "$SEGLIST/reduce.err"
+
+PATHBIND=$SHARD_ROOT/pathbind
+mkdir -p "$PATHBIND/raw" "$PATHBIND/output" "$PATHBIND/reference"
+cp -R "$RAW4/." "$PATHBIND/raw/"
+cp -R "$REF4/." "$PATHBIND/reference/"
+sed 's/OUTPUT_PREFIX=test-run-shards/OUTPUT_PREFIX=test-run-pathbind/' "$SHARD_ROOT/inventory.env" >"$PATHBIND/inventory.env"
+sh "$ENTRYPOINT" \
+  --inventory "$PATHBIND/inventory.env" \
+  --raw-root "$PATHBIND/raw" \
+  --reference-root "$PATHBIND/reference" \
+  --output-root "$PATHBIND/output" \
+  --work-dir "$PATHBIND/work-0" \
+  --binary-dir "$BIN_DIR" \
+  --role slice \
+  --shard-index 0 \
+  --shard-count 2 >/dev/null
+sh "$ENTRYPOINT" \
+  --inventory "$PATHBIND/inventory.env" \
+  --raw-root "$PATHBIND/raw" \
+  --reference-root "$PATHBIND/reference" \
+  --output-root "$PATHBIND/output" \
+  --work-dir "$PATHBIND/work-1" \
+  --binary-dir "$BIN_DIR" \
+  --role slice \
+  --shard-index 1 \
+  --shard-count 2 >/dev/null
+awk -F '	' 'NR==1 {print $1 "\t" line2_path "\t" $3 "\t" $4; next} {print}' \
+  line2_path="$(awk -F '	' 'NR==2 {print $2}' "$PATHBIND/output/test-run-pathbind/shards/0/segments")" \
+  "$PATHBIND/output/test-run-pathbind/shards/0/segments" >"$PATHBIND/segments.rebound"
+mv "$PATHBIND/segments.rebound" "$PATHBIND/output/test-run-pathbind/shards/0/segments"
+new_seg_sha=$(sha256sum "$PATHBIND/output/test-run-pathbind/shards/0/segments" | awk '{print $1}')
+sed "s/\"segments_sha256\": \"[0-9a-f]*\"/\"segments_sha256\": \"$new_seg_sha\"/" \
+  "$PATHBIND/output/test-run-pathbind/shards/0/receipt.json" >"$PATHBIND/receipt.rebound"
+mv "$PATHBIND/receipt.rebound" "$PATHBIND/output/test-run-pathbind/shards/0/receipt.json"
+sha256sum "$PATHBIND/output/test-run-pathbind/shards/0/receipt.json" | awk '{print $1}' \
+  >"$PATHBIND/output/test-run-pathbind/shards/0/_SUCCESS"
+if sh "$ENTRYPOINT" \
+  --inventory "$PATHBIND/inventory.env" \
+  --raw-root "$PATHBIND/raw" \
+  --reference-root "$PATHBIND/reference" \
+  --output-root "$PATHBIND/output" \
+  --work-dir "$PATHBIND/work-reduce" \
+  --binary-dir "$BIN_DIR" \
+  --role reduce \
+  --shard-count 2 >/dev/null 2>"$PATHBIND/reduce.err"; then
+  printf 'expected rebound shard path to fail\n' >&2
+  exit 1
+fi
+grep -q 'path is not bound to its index' "$PATHBIND/reduce.err"
+
+if sh "$ENTRYPOINT" \
+  --inventory "$SHARD_ROOT/inventory.env" \
+  --raw-root "$RAW4" \
+  --output-root "$OUT4" \
+  --work-dir "$SHARD_ROOT/work-bad-count" \
+  --binary-dir "$BIN_DIR" \
+  --role slice \
+  --shard-index 0 \
+  --shard-count 8 >/dev/null 2>"$SHARD_ROOT/count.err"; then
+  printf 'expected shard-count above RAW_SEGMENT_COUNT to fail\n' >&2
+  exit 1
+fi
+grep -q 'shard-count must not exceed RAW_SEGMENT_COUNT' "$SHARD_ROOT/count.err"
 
 printf 'cex materialization contract: ok\n'

@@ -1,20 +1,25 @@
+# Suspended single-writer reduce Job. Submit only after the matching Indexed
+# slice Job has completions=N succeeded, then unsuspend. It checks N/N shard
+# receipts, no duplicate or missing segment indexes, then runs PIT, replay,
+# and create-once receipt publication. backoffLimit stays 0.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: REPLACE_MATERIALIZATION_JOB_NAME
+  name: REPLACE_MATERIALIZATION_REDUCE_JOB_NAME
   namespace: monday-research
   labels:
-    app.kubernetes.io/name: monday-cex-materialization
+    app.kubernetes.io/name: monday-cex-materialization-reduce
     app.kubernetes.io/part-of: monday
     research.monday/contract: cex-materialization-v1
   annotations:
     research.monday/source-revision: REPLACE_WITH_40_HEX_SOURCE_SHA
     research.monday/image-ref: crpi-ygobwehhof7qs9m3-vpc.ap-northeast-1.personal.cr.aliyuncs.com/wildcard0923/research-runner@sha256:REPLACE_WITH_IMMUTABLE_DIGEST
     research.monday/inventory-configmap: REPLACE_WITH_INVENTORY_CONFIGMAP
-    research.monday/raw-pvc: REPLACE_WITH_RAW_PVC_NAME
     research.monday/reference-pvc: REPLACE_WITH_REFERENCE_PVC_NAME
     research.monday/output-pvc: REPLACE_WITH_OUTPUT_PVC_NAME
     research.monday/output-write: unique-prefix-plus-readback
+    research.monday/shard-count: "8"
+    research.monday/sealed-holdout: single-writer
 spec:
   suspend: true
   completionMode: NonIndexed
@@ -26,7 +31,7 @@ spec:
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: monday-cex-materialization
+        app.kubernetes.io/name: monday-cex-materialization-reduce
         app.kubernetes.io/part-of: monday
         research.monday/contract: cex-materialization-v1
     spec:
@@ -46,7 +51,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       containers:
-        - name: cex-materialization
+        - name: cex-materialization-reduce
           image: crpi-ygobwehhof7qs9m3-vpc.ap-northeast-1.personal.cr.aliyuncs.com/wildcard0923/research-runner@sha256:REPLACE_WITH_IMMUTABLE_DIGEST
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh"]
@@ -65,7 +70,9 @@ spec:
             - --binary-dir
             - /usr/local/bin
             - --role
-            - all
+            - reduce
+            - --shard-count
+            - "8"
           resources:
             requests:
               cpu: "3500m"

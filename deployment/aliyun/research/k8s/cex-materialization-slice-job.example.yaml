@@ -1,10 +1,21 @@
+# Suspended Indexed slice Job. Resolve every REPLACE_* value, then unsuspend
+# only after inventory and PVC identities are read back.
+#
+# This Job only slices assigned raw segments onto the shared output prefix. It
+# does not run PIT, replay, or final receipt publication. backoffLimit stays 0
+# so a failed shard is not silently retried.
+#
+# Keep completions at the shard split (8 here). Start parallelism at 1, then
+# time 2, 4, and 8 on ACK before raising fan-out. Shared OSS CSI can make high
+# concurrency slower if the bottleneck is I/O. The entrypoint reads the shard
+# index from the JOB_COMPLETION_INDEX env downward API, not from Job args.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: REPLACE_MATERIALIZATION_JOB_NAME
+  name: REPLACE_MATERIALIZATION_SLICE_JOB_NAME
   namespace: monday-research
   labels:
-    app.kubernetes.io/name: monday-cex-materialization
+    app.kubernetes.io/name: monday-cex-materialization-slice
     app.kubernetes.io/part-of: monday
     research.monday/contract: cex-materialization-v1
   annotations:
@@ -12,21 +23,21 @@ metadata:
     research.monday/image-ref: crpi-ygobwehhof7qs9m3-vpc.ap-northeast-1.personal.cr.aliyuncs.com/wildcard0923/research-runner@sha256:REPLACE_WITH_IMMUTABLE_DIGEST
     research.monday/inventory-configmap: REPLACE_WITH_INVENTORY_CONFIGMAP
     research.monday/raw-pvc: REPLACE_WITH_RAW_PVC_NAME
-    research.monday/reference-pvc: REPLACE_WITH_REFERENCE_PVC_NAME
     research.monday/output-pvc: REPLACE_WITH_OUTPUT_PVC_NAME
-    research.monday/output-write: unique-prefix-plus-readback
+    research.monday/output-write: shard-create-once
+    research.monday/shard-count: "8"
 spec:
   suspend: true
-  completionMode: NonIndexed
-  completions: 1
+  completionMode: Indexed
+  completions: 8
   parallelism: 1
   backoffLimit: 0
-  activeDeadlineSeconds: 7200
+  activeDeadlineSeconds: 3600
   ttlSecondsAfterFinished: 86400
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: monday-cex-materialization
+        app.kubernetes.io/name: monday-cex-materialization-slice
         app.kubernetes.io/part-of: monday
         research.monday/contract: cex-materialization-v1
     spec:
@@ -46,7 +57,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       containers:
-        - name: cex-materialization
+        - name: cex-materialization-slice
           image: crpi-ygobwehhof7qs9m3-vpc.ap-northeast-1.personal.cr.aliyuncs.com/wildcard0923/research-runner@sha256:REPLACE_WITH_IMMUTABLE_DIGEST
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh"]
@@ -56,8 +67,6 @@ spec:
             - /inventory/frozen.env
             - --raw-root
             - /lake/raw
-            - --reference-root
-            - /reference/lake/raw
             - --output-root
             - /lake/output
             - --work-dir
@@ -65,7 +74,14 @@ spec:
             - --binary-dir
             - /usr/local/bin
             - --role
-            - all
+            - slice
+            - --shard-count
+            - "8"
+          env:
+            - name: JOB_COMPLETION_INDEX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
           resources:
             requests:
               cpu: "3500m"
@@ -88,9 +104,6 @@ spec:
               readOnly: true
             - name: raw
               mountPath: /lake/raw
-              readOnly: true
-            - name: reference
-              mountPath: /reference/lake/raw
               readOnly: true
             - name: output
               mountPath: /lake/output
@@ -116,10 +129,6 @@ spec:
         - name: raw
           persistentVolumeClaim:
             claimName: REPLACE_WITH_RAW_PVC_NAME
-            readOnly: true
-        - name: reference
-          persistentVolumeClaim:
-            claimName: REPLACE_WITH_REFERENCE_PVC_NAME
             readOnly: true
         - name: output
           persistentVolumeClaim:
