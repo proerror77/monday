@@ -417,6 +417,22 @@ if JOB_COMPLETION_INDEX= run_role slice "$SHARD_ROOT/work-no-index" --shard-coun
 fi
 grep -q 'shard-index must be a non-negative integer' "$SHARD_ROOT/no-index.err"
 
+NOREF=$SHARD_ROOT/noref
+mkdir -p "$NOREF/raw" "$NOREF/output"
+cp -R "$RAW4/." "$NOREF/raw/"
+sed 's/OUTPUT_PREFIX=test-run-shards/OUTPUT_PREFIX=test-run-noref/' "$SHARD_ROOT/inventory.env" >"$NOREF/inventory.env"
+sh "$ENTRYPOINT" \
+  --inventory "$NOREF/inventory.env" \
+  --raw-root "$NOREF/raw" \
+  --output-root "$NOREF/output" \
+  --work-dir "$NOREF/work-0" \
+  --binary-dir "$BIN_DIR" \
+  --role slice \
+  --shard-index 0 \
+  --shard-count 2 >/dev/null
+[ -f "$NOREF/output/test-run-noref/shards/0/receipt.json" ]
+grep -q '"segments_sha256":' "$NOREF/output/test-run-noref/shards/0/receipt.json"
+
 if run_role slice "$SHARD_ROOT/work-0-again" --shard-index 0 --shard-count 2 >/dev/null 2>"$SHARD_ROOT/slice-dup.err"; then
   printf 'expected duplicate shard receipt to fail\n' >&2
   exit 1
@@ -496,7 +512,7 @@ if sh "$ENTRYPOINT" \
   printf 'expected duplicate segment reducer to fail\n' >&2
   exit 1
 fi
-grep -q 'segment out of order' "$DUPSEG/reduce.err"
+grep -q 'segment list SHA mismatch' "$DUPSEG/reduce.err"
 
 ORDER=$SHARD_ROOT/order
 mkdir -p "$ORDER/raw" "$ORDER/output" "$ORDER/reference"
@@ -526,6 +542,12 @@ sh "$ENTRYPOINT" \
 awk '{lines[NR]=$0} END {print lines[2]; print lines[1]}' \
   "$ORDER/output/test-run-order/shards/0/segments" >"$ORDER/segments.swapped"
 mv "$ORDER/segments.swapped" "$ORDER/output/test-run-order/shards/0/segments"
+new_seg_sha=$(sha256sum "$ORDER/output/test-run-order/shards/0/segments" | awk '{print $1}')
+sed "s/\"segments_sha256\": \"[0-9a-f]*\"/\"segments_sha256\": \"$new_seg_sha\"/" \
+  "$ORDER/output/test-run-order/shards/0/receipt.json" >"$ORDER/receipt.swapped"
+mv "$ORDER/receipt.swapped" "$ORDER/output/test-run-order/shards/0/receipt.json"
+sha256sum "$ORDER/output/test-run-order/shards/0/receipt.json" | awk '{print $1}' \
+  >"$ORDER/output/test-run-order/shards/0/_SUCCESS"
 if sh "$ENTRYPOINT" \
   --inventory "$ORDER/inventory.env" \
   --raw-root "$ORDER/raw" \
@@ -623,6 +645,97 @@ if sh "$ENTRYPOINT" \
   exit 1
 fi
 grep -q 'segment_end drifted' "$BOUNDS/reduce.err"
+
+SEGLIST=$SHARD_ROOT/seglist
+mkdir -p "$SEGLIST/raw" "$SEGLIST/output" "$SEGLIST/reference"
+cp -R "$RAW4/." "$SEGLIST/raw/"
+cp -R "$REF4/." "$SEGLIST/reference/"
+sed 's/OUTPUT_PREFIX=test-run-shards/OUTPUT_PREFIX=test-run-seglist/' "$SHARD_ROOT/inventory.env" >"$SEGLIST/inventory.env"
+sh "$ENTRYPOINT" \
+  --inventory "$SEGLIST/inventory.env" \
+  --raw-root "$SEGLIST/raw" \
+  --reference-root "$SEGLIST/reference" \
+  --output-root "$SEGLIST/output" \
+  --work-dir "$SEGLIST/work-0" \
+  --binary-dir "$BIN_DIR" \
+  --role slice \
+  --shard-index 0 \
+  --shard-count 2 >/dev/null
+sh "$ENTRYPOINT" \
+  --inventory "$SEGLIST/inventory.env" \
+  --raw-root "$SEGLIST/raw" \
+  --reference-root "$SEGLIST/reference" \
+  --output-root "$SEGLIST/output" \
+  --work-dir "$SEGLIST/work-1" \
+  --binary-dir "$BIN_DIR" \
+  --role slice \
+  --shard-index 1 \
+  --shard-count 2 >/dev/null
+awk 'NR==1 {print} NR==2 {print} END {print}' \
+  "$SEGLIST/output/test-run-seglist/shards/0/segments" >"$SEGLIST/segments.tampered"
+mv "$SEGLIST/segments.tampered" "$SEGLIST/output/test-run-seglist/shards/0/segments"
+if sh "$ENTRYPOINT" \
+  --inventory "$SEGLIST/inventory.env" \
+  --raw-root "$SEGLIST/raw" \
+  --reference-root "$SEGLIST/reference" \
+  --output-root "$SEGLIST/output" \
+  --work-dir "$SEGLIST/work-reduce" \
+  --binary-dir "$BIN_DIR" \
+  --role reduce \
+  --shard-count 2 >/dev/null 2>"$SEGLIST/reduce.err"; then
+  printf 'expected tampered shard segment list to fail\n' >&2
+  exit 1
+fi
+grep -q 'segment list SHA mismatch' "$SEGLIST/reduce.err"
+
+PATHBIND=$SHARD_ROOT/pathbind
+mkdir -p "$PATHBIND/raw" "$PATHBIND/output" "$PATHBIND/reference"
+cp -R "$RAW4/." "$PATHBIND/raw/"
+cp -R "$REF4/." "$PATHBIND/reference/"
+sed 's/OUTPUT_PREFIX=test-run-shards/OUTPUT_PREFIX=test-run-pathbind/' "$SHARD_ROOT/inventory.env" >"$PATHBIND/inventory.env"
+sh "$ENTRYPOINT" \
+  --inventory "$PATHBIND/inventory.env" \
+  --raw-root "$PATHBIND/raw" \
+  --reference-root "$PATHBIND/reference" \
+  --output-root "$PATHBIND/output" \
+  --work-dir "$PATHBIND/work-0" \
+  --binary-dir "$BIN_DIR" \
+  --role slice \
+  --shard-index 0 \
+  --shard-count 2 >/dev/null
+sh "$ENTRYPOINT" \
+  --inventory "$PATHBIND/inventory.env" \
+  --raw-root "$PATHBIND/raw" \
+  --reference-root "$PATHBIND/reference" \
+  --output-root "$PATHBIND/output" \
+  --work-dir "$PATHBIND/work-1" \
+  --binary-dir "$BIN_DIR" \
+  --role slice \
+  --shard-index 1 \
+  --shard-count 2 >/dev/null
+awk -F '	' 'NR==1 {print $1 "\t" line2_path "\t" $3 "\t" $4; next} {print}' \
+  line2_path="$(awk -F '	' 'NR==2 {print $2}' "$PATHBIND/output/test-run-pathbind/shards/0/segments")" \
+  "$PATHBIND/output/test-run-pathbind/shards/0/segments" >"$PATHBIND/segments.rebound"
+mv "$PATHBIND/segments.rebound" "$PATHBIND/output/test-run-pathbind/shards/0/segments"
+new_seg_sha=$(sha256sum "$PATHBIND/output/test-run-pathbind/shards/0/segments" | awk '{print $1}')
+sed "s/\"segments_sha256\": \"[0-9a-f]*\"/\"segments_sha256\": \"$new_seg_sha\"/" \
+  "$PATHBIND/output/test-run-pathbind/shards/0/receipt.json" >"$PATHBIND/receipt.rebound"
+mv "$PATHBIND/receipt.rebound" "$PATHBIND/output/test-run-pathbind/shards/0/receipt.json"
+sha256sum "$PATHBIND/output/test-run-pathbind/shards/0/receipt.json" | awk '{print $1}' \
+  >"$PATHBIND/output/test-run-pathbind/shards/0/_SUCCESS"
+if sh "$ENTRYPOINT" \
+  --inventory "$PATHBIND/inventory.env" \
+  --raw-root "$PATHBIND/raw" \
+  --reference-root "$PATHBIND/reference" \
+  --output-root "$PATHBIND/output" \
+  --work-dir "$PATHBIND/work-reduce" \
+  --binary-dir "$BIN_DIR" \
+  --role reduce \
+  --shard-count 2 >/dev/null 2>"$PATHBIND/reduce.err"; then
+  printf 'expected rebound shard path to fail\n' >&2
+  exit 1
+fi
+grep -q 'path is not bound to its index' "$PATHBIND/reduce.err"
 
 if sh "$ENTRYPOINT" \
   --inventory "$SHARD_ROOT/inventory.env" \

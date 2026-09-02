@@ -577,7 +577,7 @@ if [ "$ROLE" != "reduce" ]; then
   fi
 fi
 
-if [ "$reference_count" -gt 0 ]; then
+if [ "$ROLE" != "slice" ] && [ "$reference_count" -gt 0 ]; then
   [ -n "$REFERENCE_ROOT" ] || die "REFERENCE_ROOT is required when REFERENCE_COUNT > 0"
 fi
 
@@ -625,7 +625,9 @@ fi
 load_shard_receipts() {
   stage_event stage_start shard_reduce 0 "$SHARD_COUNT"
   seen_indexes=$STATE_ROOT/seen-indexes
+  seen_paths=$STATE_ROOT/seen-paths
   : >"$seen_indexes"
+  : >"$seen_paths"
   shard_i=0
   while [ "$shard_i" -lt "$SHARD_COUNT" ]; do
     shard_bounds "$shard_i" "$SHARD_COUNT" "$raw_segment_count"
@@ -645,6 +647,8 @@ load_shard_receipts() {
     [ "$(json_string_field shard_count "$shard_receipt")" = "$SHARD_COUNT" ] || die "shard $shard_i count drifted"
     [ "$(json_string_field segment_start "$shard_receipt")" = "$expected_start" ] || die "shard $shard_i segment_start drifted"
     [ "$(json_string_field segment_end "$shard_receipt")" = "$expected_end" ] || die "shard $shard_i segment_end drifted"
+    expected_segments_sha=$(json_string_field segments_sha256 "$shard_receipt")
+    [ "$(sha256_file "$shard_manifest")" = "$expected_segments_sha" ] || die "shard $shard_i segment list SHA mismatch"
     receipt_sha=$(sha256_file "$shard_receipt")
     [ "$(cat "$shard_success")" = "$receipt_sha" ] || die "shard $shard_i success marker mismatch"
     expected_next=$expected_start
@@ -660,6 +664,15 @@ load_shard_receipts() {
       grep -qx "$segment_index" "$seen_indexes" && die "duplicate sliced segment: $segment_index"
       printf '%s\n' "$segment_index" >>"$seen_indexes"
       canonical_relpath "$relative_path" || die "shard $shard_i segment $segment_index path is unsafe"
+      case "$relative_path" in
+        artifacts/slices/segment-"$segment_index"/*)
+          ;;
+        *)
+          die "shard $shard_i segment $segment_index path is not bound to its index: $relative_path"
+          ;;
+      esac
+      grep -qx "$relative_path" "$seen_paths" && die "duplicate published slice path: $relative_path"
+      printf '%s\n' "$relative_path" >>"$seen_paths"
       published_slice=$RUN_ROOT/$relative_path
       published_manifest=$published_slice.manifest.json
       published_success=$published_slice._SUCCESS
@@ -724,6 +737,7 @@ elif [ "$ROLE" = "slice" ]; then
     i=$((i + 1))
   done
   stage_event stage_complete slicing "$shard_total" "$shard_total"
+  segments_sha=$(sha256_file "$STATE_ROOT/shard-segments")
   {
     printf '{\n'
     printf '  "schema_version": "monday.cex_materialization_shard_receipt.v1",\n'
@@ -732,7 +746,8 @@ elif [ "$ROLE" = "slice" ]; then
     printf '  "shard_index": "%s",\n' "$SHARD_INDEX"
     printf '  "shard_count": "%s",\n' "$SHARD_COUNT"
     printf '  "segment_start": "%s",\n' "$SHARD_START"
-    printf '  "segment_end": "%s"\n' "$SHARD_END"
+    printf '  "segment_end": "%s",\n' "$SHARD_END"
+    printf '  "segments_sha256": "%s"\n' "$segments_sha"
     printf '}\n'
   } >"$STATE_ROOT/shard-receipt.json"
   shard_receipt_sha=$(sha256_file "$STATE_ROOT/shard-receipt.json")
