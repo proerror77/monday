@@ -2261,6 +2261,7 @@ monday_verify_upload_triplet_readback() {
   local data_sha manifest_sha success_sha failure_count object_prefix first_manifest second_manifest uploaded_at uploaded_ns
   local data_file manifest_file success_file expected_success_file expected_prefix_norm data_file_name
   local success_at success_ns start_ns end_ns minimum_success_ns minimum_capture_ns now_ns manifest_session
+  local capture_boundary_ns
   monday_file_direct "$status" || return 1
   jq -e '
     type == "object"
@@ -2368,7 +2369,12 @@ monday_verify_upload_triplet_readback() {
   end_ns=$(jq -er '.end_received_at_ns' "$manifest_file") || return 1
   [[ $start_ns =~ ^[0-9]+$ && $end_ns =~ ^[0-9]+$ \
     && $start_ns -ge $minimum_capture_ns && $end_ns -ge $start_ns && $end_ns -le $now_ns ]] || return 1
-  (( minimum_capture_ns == 0 || end_ns - start_ns >= 300000000000 )) || return 1
+  if (( minimum_capture_ns != 0 )); then
+    capture_boundary_ns=$((start_ns / 300000000000 * 300000000000))
+    # Event bounds can be milliseconds short of the scheduled wall-clock span.
+    (( start_ns - capture_boundary_ns <= 1000000000 \
+      && end_ns >= capture_boundary_ns + 300000000000 )) || return 1
+  fi
   uploaded_at=$(jq -er '.uploaded_at // empty' <<<"$triplet") || true
   if [[ -n $uploaded_at ]]; then
     uploaded_ns=$(monday_iso_epoch_ns "$uploaded_at") || return 1
