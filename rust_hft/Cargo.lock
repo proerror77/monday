@@ -634,6 +634,7 @@ dependencies = [
  "hft-core",
  "hft-factor-dsl",
  "hft-research-manifest",
+ "hft-research-ml",
  "hft-search-kernel",
  "hft-strategy-formula",
  "reqwest 0.12.28",

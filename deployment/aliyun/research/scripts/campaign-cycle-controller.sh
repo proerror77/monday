@@ -1,7 +1,19 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+
+controller_stage="preflight"
+current_generation="unknown"
+
+log_event() {
+  local event="$1"
+  shift
+  printf 'schema_version=monday.research_event.v1 component=campaign-cycle-controller event=%s' "$event" >&2
+  printf ' %s' "$@" >&2
+  printf '\n' >&2
+}
 
 die() {
+  log_event cycle_failed "generation=$current_generation" "stage=$controller_stage" "reason=$*"
   echo "campaign-cycle-controller: $*" >&2
   exit 1
 }
@@ -95,6 +107,7 @@ cleanup_sensitive_files() {
 }
 trap cleanup_sensitive_files EXIT
 trap 'exit 130' HUP INT TERM
+trap 'status=$?; trap - ERR; die "command failed at line $LINENO with exit $status"' ERR
 
 sha256_file() {
   if command -v shasum >/dev/null; then
@@ -119,7 +132,7 @@ oss_readback() {
   partial="$destination.partial"
   rm -f -- "$partial"
   "$aliyun_cli" ossutil cp "oss://$bucket/$key" "$partial" \
-    --endpoint oss-ap-northeast-1.aliyuncs.com
+    --endpoint oss-ap-northeast-1.aliyuncs.com >&2
   mv -f -- "$partial" "$destination"
 }
 
@@ -171,8 +184,17 @@ else
   mv -- "$state_tmp" "$state"
 fi
 state_tmp=""
+log_event cycle_started \
+  "campaign_inputs_sha256=$campaign_inputs_sha256" \
+  "source_revision=$source_revision" \
+  "image=$image" \
+  "seed_count=${#seeds[@]}" \
+  "max_follow_ups=$max_follow_ups" \
+  "context=$context" \
+  "namespace=$namespace"
 
 if [[ -s "$work_dir/cycle-result.json" ]]; then
+  log_event cycle_checkpoint_reused "result=cycle-result.json"
   jq . "$work_dir/cycle-result.json"
   exit 0
 fi
@@ -180,6 +202,8 @@ fi
 research_plan=""
 generation=0
 while ((generation <= max_follow_ups)); do
+  current_generation="$generation"
+  controller_stage="generation"
   generation_dir="$work_dir/generation-$generation"
   mkdir -p "$generation_dir"
   freeze="$generation_dir/freeze.json"
@@ -193,11 +217,16 @@ while ((generation <= max_follow_ups)); do
   [[ ! -e "$generation_dir/terminal-failure" ]] \
     || die "Campaign generation $generation already reached a terminal failure"
   if [[ -e "$generation_dir/generation-complete" ]]; then
+    log_event generation_checkpoint_reused "generation=$generation"
     research_plan="$generation_dir/next-research-plan.json"
     [[ -s "$research_plan" ]] || die "completed generation is missing its follow-up plan"
     generation=$((generation + 1))
     continue
   fi
+  log_event generation_started \
+    "generation=$generation" \
+    "research_plan=${research_plan:-initial}" \
+    "seed_count=${#seeds[@]}"
 
   freeze_args=(
     mission campaign-freeze
@@ -213,14 +242,25 @@ while ((generation <= max_follow_ups)); do
   done
   [[ -z "$research_plan" ]] || freeze_args+=(--research-plan "$research_plan")
   if [[ ! -e "$generation_dir/frozen" ]]; then
+    controller_stage="freeze"
+    log_event stage_started "generation=$generation" "stage=freeze"
     rm -f -- "$freeze" "$freeze_report"
     "$alpha_harness" "${freeze_args[@]}" >"$freeze_report"
     [[ -s "$freeze" && -s "$freeze_report" ]] || die "Campaign freeze did not produce complete evidence"
     : >"$generation_dir/frozen"
+    log_event stage_completed \
+      "generation=$generation" \
+      "stage=freeze" \
+      "campaign_id=$(jq -er '.campaign_id' "$freeze_report")" \
+      "declared_total_trials=$(jq -er '.declared_total_trials' "$freeze_report")"
+  else
+    log_event stage_checkpoint_reused "generation=$generation" "stage=freeze"
   fi
   [[ -s "$freeze" && -s "$freeze_report" ]] || die "Campaign freeze checkpoint is incomplete"
 
   if [[ ! -e "$generation_dir/finalized" ]]; then
+    controller_stage="sign_finalize"
+    log_event stage_started "generation=$generation" "stage=sign_finalize"
     rm -f -- "$signed_request" "$request" "$submission" "$finalize_report"
     "$signer" --freeze "$freeze" --output "$signed_request" >/dev/null
     [[ -s "$signed_request" ]] || die "signer did not create a signed request"
@@ -237,6 +277,8 @@ while ((generation <= max_follow_ups)); do
     chmod 600 "$request" "$submission"
     rm -f -- "$signed_request"
     : >"$generation_dir/finalized"
+  else
+    log_event stage_checkpoint_reused "generation=$generation" "stage=sign_finalize"
   fi
   [[ -s "$request" && -s "$finalize_report" ]] || die "Campaign finalize checkpoint is incomplete"
 
@@ -245,8 +287,16 @@ while ((generation <= max_follow_ups)); do
   job_name="$(jq -er '.job_name' "$finalize_report")"
   [[ "$(sha256_file "$request")" == "$request_sha256" ]] \
     || die "Campaign request no longer matches its finalized SHA256"
+  log_event stage_completed \
+    "generation=$generation" \
+    "stage=sign_finalize" \
+    "campaign_id=$campaign_id" \
+    "request_sha256=$request_sha256" \
+    "job_name=$job_name"
 
   if [[ ! -e "$generation_dir/dispatched" ]]; then
+    controller_stage="dispatch"
+    log_event stage_started "generation=$generation" "stage=dispatch" "job_name=$job_name"
     [[ -s "$submission" ]] || die "finalized Campaign is missing its resumable submission"
     "$alpha_harness" mission dispatch submit \
       --submission "$submission" \
@@ -255,15 +305,24 @@ while ((generation <= max_follow_ups)); do
     mv -f -- "$dispatch_report.partial" "$dispatch_report"
     : >"$generation_dir/dispatched"
     rm -f -- "$submission"
+    log_event stage_completed "generation=$generation" "stage=dispatch" "job_name=$job_name"
+  else
+    log_event stage_checkpoint_reused "generation=$generation" "stage=dispatch" "job_name=$job_name"
   fi
   [[ -s "$dispatch_report" ]] || die "Campaign dispatch checkpoint is incomplete"
 
   job_status="$generation_dir/job-status.json"
   pod_status="$generation_dir/pod-status.json"
   if [[ ! -e "$generation_dir/provenance-readback-complete" ]]; then
+    controller_stage="kubernetes_runtime_readback"
+    log_event stage_started \
+      "generation=$generation" \
+      "stage=kubernetes_runtime_readback" \
+      "job_name=$job_name" \
+      "timeout=$job_timeout"
     wait_completed=true
     if ! "$kubectl_cli" --context "$context" --namespace "$namespace" wait \
-      --for=condition=complete "job/$job_name" --timeout="$job_timeout"; then
+      --for=condition=complete "job/$job_name" --timeout="$job_timeout" >&2; then
       wait_completed=false
     fi
     "$kubectl_cli" --context "$context" --namespace "$namespace" get \
@@ -298,6 +357,17 @@ while ((generation <= max_follow_ups)); do
       die "Campaign Pod or image provenance does not match the submitted request"
     fi
     : >"$generation_dir/provenance-readback-complete"
+    log_event stage_completed \
+      "generation=$generation" \
+      "stage=kubernetes_runtime_readback" \
+      "job_name=$job_name" \
+      "request_sha256=$request_sha256" \
+      "image_identity=$image_identity"
+  else
+    log_event stage_checkpoint_reused \
+      "generation=$generation" \
+      "stage=kubernetes_runtime_readback" \
+      "job_name=$job_name"
   fi
   image_identity="$(jq -er '.image_identity' "$request")"
   verify_kubernetes_provenance \
@@ -307,10 +377,15 @@ while ((generation <= max_follow_ups)); do
   round_readback_dir="$generation_dir/round-readback"
   mkdir -p "$round_readback_dir"
   if [[ ! -e "$generation_dir/result-readback-complete" ]]; then
+    controller_stage="oss_result_readback"
+    log_event stage_started \
+      "generation=$generation" \
+      "stage=oss_result_readback" \
+      "campaign_id=$campaign_id"
     result_url="$(jq -er '.campaign_result_readback_url' "$request")"
     oss_readback "$result_url" "$result"
     jq -e --slurpfile request_doc "$request" --arg request_sha256 "$request_sha256" '
-      .schema_version == "cex-campaign-result-v5"
+      .schema_version == "cex-campaign-result-v6"
       and .campaign_id == $request_doc[0].campaign_id
       and .request_sha256 == $request_sha256
       and .build_source_revision == $request_doc[0].build_source_revision
@@ -357,8 +432,19 @@ while ((generation <= max_follow_ups)); do
       [[ "$(sha256_file "$bundle_readback")" == "$bundle_sha256" \
         && "$bundle_sha256" == "$bundle_readback_sha256" ]] \
         || die "Campaign round result readback SHA256 mismatch: $request_round_id"
+      log_event round_readback_completed \
+        "generation=$generation" \
+        "round_index=$round_index" \
+        "round_id=$request_round_id" \
+        "mission_sha256=$mission_sha256" \
+        "result_bundle_sha256=$bundle_sha256"
     done
     : >"$generation_dir/result-readback-complete"
+  else
+    log_event stage_checkpoint_reused \
+      "generation=$generation" \
+      "stage=oss_result_readback" \
+      "campaign_id=$campaign_id"
   fi
 
   result_sha256="$(sha256_file "$result")"
@@ -379,6 +465,14 @@ while ((generation <= max_follow_ups)); do
   done
   termination_reason="$(jq -er '.termination_reason' "$result")"
   observed_image_id="$(jq -er '.items[0].status.containerStatuses[] | select(.name == "alpha-campaign") | .imageID' "$pod_status")"
+  log_event stage_completed \
+    "generation=$generation" \
+    "stage=oss_result_readback" \
+    "campaign_id=$campaign_id" \
+    "campaign_result_sha256=$result_sha256" \
+    "termination_reason=$termination_reason" \
+    "round_count=$request_round_count" \
+    "consumed_trials=$(jq -er '.consumed_trials' "$result")"
 
   jq -n \
     --argjson generation "$generation" \
@@ -396,6 +490,12 @@ while ((generation <= max_follow_ups)); do
     cp "$generation_dir/generation-report.json" "$work_dir/cycle-result.json"
     : >"$generation_dir/generation-complete"
     rm -f -- "$request"
+    controller_stage="complete"
+    log_event cycle_completed \
+      "generation=$generation" \
+      "campaign_id=$campaign_id" \
+      "termination_reason=$termination_reason" \
+      "campaign_result_sha256=$result_sha256"
     jq . "$work_dir/cycle-result.json"
     exit 0
   fi
@@ -404,11 +504,23 @@ while ((generation <= max_follow_ups)); do
       >"$work_dir/cycle-result.json"
     : >"$generation_dir/generation-complete"
     rm -f -- "$request"
+    controller_stage="complete"
+    log_event cycle_completed \
+      "generation=$generation" \
+      "campaign_id=$campaign_id" \
+      "termination_reason=bounded_loop_exhausted" \
+      "campaign_result_sha256=$result_sha256"
     jq . "$work_dir/cycle-result.json"
     exit 0
   fi
 
   research_plan="$generation_dir/next-research-plan.json"
+  controller_stage="campaign_learning"
+  log_event stage_started \
+    "generation=$generation" \
+    "stage=campaign_learning" \
+    "parent_campaign_id=$campaign_id" \
+    "parent_result_sha256=$result_sha256"
   "$alpha_harness" mission campaign-learn \
     --request "$request" \
     --result "$result" \
@@ -418,6 +530,11 @@ while ((generation <= max_follow_ups)); do
   mv -f -- "$generation_dir/learn-report.json.partial" "$generation_dir/learn-report.json"
   [[ -s "$research_plan" && -s "$generation_dir/learn-report.json" ]] \
     || die "Campaign learning did not produce a complete child research plan"
+  log_event stage_completed \
+    "generation=$generation" \
+    "stage=campaign_learning" \
+    "parent_campaign_id=$campaign_id" \
+    "research_plan_sha256=$(jq -er '.research_plan_sha256' "$generation_dir/learn-report.json")"
   : >"$generation_dir/generation-complete"
   rm -f -- "$request"
   generation=$((generation + 1))

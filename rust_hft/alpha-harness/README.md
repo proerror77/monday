@@ -12,11 +12,12 @@ Rust CLI and libraries for the governed CEX Campaign and prediction research pla
 
 | Contract | Status | Current terminal evidence |
 | --- | --- | --- |
-| CEX Cloud Campaign | Implemented through cloud admission, immutable shared-input download, bounded multi-round Campaign execution, GP, immutable Factor Bank, deterministic Ridge/CART baselines, and bounded subset MCTS | Create-once per-round Mission/result objects, deterministic pre-holdout winner selection, one finalization/global holdout claim, and independent readback with exact SHA-256 matches |
-| Factor-Bank subset MCTS | Implemented | Content-bound checkpoint, add/remove/swap trace, and passing equal-absolute-weight selection or an explicit no-selection result; sealed holdout remains closed |
-| Four-stage combination walk-forward | Implemented | A passing subset emits a content-addressed, research-only Signal/Sizing/Risk/Execution artifact with same-protocol Ridge/CART evidence; no selection emits no strategy |
-| Event-level L2 replay receipt | Implemented | Canonical event replay emits a content-bound receipt and explicit queue/partial-fill/impact/capacity disclosures |
-| Final precommit and sealed holdout | Implemented | Exact precommit, at-most-once sealed opening, immutable receipt, bundle, and promotion lineage |
+| CEX Cloud Campaign | Implemented through cloud admission, immutable shared-input download, bounded multi-round Campaign execution, continuous GP, immutable Factor Bank, purged walk-forward Ridge/CART, and cost-aware model replay | Create-once per-round Mission/result objects, typed OOS/equity/replay feedback, deterministic pre-holdout winner selection, and independent readback with exact SHA-256 matches |
+| Supervised ML research lane | Implemented for governed GP v4 | Continuous factors feed Ridge, shallow CART, and a Burn MLP; only OOS predictions create fractional target positions, and the same positions must pass canonical L2 event replay before selection |
+| Legacy Factor-Bank subset MCTS | Preserved for governed GP v1-v3 | Content-bound checkpoint, add/remove/swap trace, and passing equal-absolute-weight selection or an explicit no-selection result; sealed holdout remains closed |
+| Legacy four-stage combination walk-forward | Preserved for governed GP v1-v3 | A passing subset emits a content-addressed, research-only Signal/Sizing/Risk/Execution artifact with same-protocol Ridge/CART evidence; no selection emits no strategy |
+| Event-level L2 replay receipt | Implemented | Canonical event replay emits a content-bound receipt, net-return/Sharpe gates, and explicit queue/partial-fill/impact/capacity disclosures |
+| Final precommit and sealed holdout | Preserved for the legacy formula lane only | The ML v4 lane stops pre-holdout and carries no deployment or order authority |
 | Signed Paper/Shadow intake | Implemented | Signed four-stage CEX bundles reach the fail-closed Paper/Shadow boundary; this grants no LiveSmall authority |
 | Exact-main CEX run and readback | Pending [#606](https://github.com/proerror77/monday/issues/606) | A fresh credential-free USD-M Mission still needs cloud Runtime and independent result readback |
 | Prediction Mission v4 | Implemented for `pipeline_smoke` and deterministic `research_trial` | Authenticated partition readmission plus task-isolated settlement, UP-execution, and DOWN-execution result receipts; no external proposal provider |
@@ -26,8 +27,10 @@ immutable Campaign request and does not read feature rows or run search locally.
 The workstation only freezes, signs, and submits identities. One cloud ACK
 Job/Pod downloads the shared inputs once, admits the request, renders and
 executes each round search-only, performs create-once Mission/result readback
-per round, selects the deterministic pre-holdout winner, and finalizes exactly
-once against the global holdout claim. Low-level Mission and LoopRun commands
+per round, and selects the deterministic pre-holdout winner. A governed GP v4
+Campaign stops there; a negative result can feed the bounded external LLM
+controller, while the legacy formula lane alone retains sealed finalization.
+Low-level Mission and LoopRun commands
 remain diagnostics and implementation surfaces; they are not alternate evidence
 paths around this contract.
 
@@ -103,10 +106,11 @@ round IDs.
 
 One Campaign contains multiple rounds. Each round renders one Mission, executes
 search only, and can produce at most one passing pre-holdout result. The
-Campaign selects one deterministic pre-holdout winner from the passing rounds,
-then performs exactly one finalization against the global holdout claim. If no
-round passes, the Campaign ends negative and no claim is made. There is no
-second holdout winner.
+Campaign selects one deterministic pre-holdout winner from the passing rounds.
+The v4 ML lane stops there. If no round passes, the Campaign ends negative and
+no claim is made; its typed factor/model/replay failures can seed a bounded
+follow-up. Only the legacy formula lane retains one finalization against the
+global holdout claim.
 
 The direct `mission execute` and checkpoint-resume surfaces remain diagnostic.
 They are not the cloud Campaign production path.
@@ -123,34 +127,25 @@ read-only. Unknown fields, Prediction Market fields, action requests, hash
 drift, cross-instrument inputs, and same-search exposed-holdout feedback fail
 before Mission admission. `operational.submitted_at` is retained for audit but
 does not alter the semantic Mission identity. The fixed v4 factor plan uses 8
-snapshot L2 terminals, 16 atomic candidates, 32 trials per round, the six-hour
+snapshot L2 terminals, 16 atomic plus 4 named continuous candidates, the
+six-hour
 protocol `7200 + 3*(3600+1) + 5 + 3600 = 21608`, and the $1000 / Top5 5%
-capacity screen. After both baseline artifacts are sealed, a non-empty Factor
-Bank enters canonical subset search through add, remove, and swap actions,
-scores mechanically oriented equal-absolute-weight signals on the research
-folds, and emits the
-typed weight policy plus deterministic checkpoint, trace, and terminal-result
-artifacts. GP screening and subset search share one multiplicity correction
-sized for both bounded candidate families; only passing subset evaluations are
-selectable; a terminal search with no passing subset publishes `selected: null`
-instead of dropping the negative result. A passing selection also emits
-`combination-walk-forward.json`: four content-addressed stages linked from the
-immutable Factor Bank through fixed equal-absolute Signal weights, sign-based
-bounded Sizing, evaluator-owned Risk limits, and the exact Binance bucketed-L2
-cost/execution assumptions. The same artifact binds the selected walk-forward
-metrics and both mandatory baseline benchmark evaluations under one protocol
-while keeping the holdout unopened and carrying neither deployment nor
-order-submission authority. Its selected result is accepted only after exact
-checkpoint replay derives the same terminal metadata, subset, and evaluation.
-Sealed-holdout evaluation requires the separate governed precommit boundary.
-This schema binds prior-evidence identities; later holdout and Paper/Shadow
-gates own receipt and signature verification.
+capacity screen. A non-empty Factor Bank trains deterministic Ridge, shallow
+CART, and one Burn ndarray MLP on the same purged folds. Only validation-fold predictions become cost-aware
+fractional positions; training, purge, embargo, and sealed-holdout rows remain
+flat. A model is selectable only after its OOS predictive/trading gates and the
+same-position canonical L2 event replay both pass. The report persists the
+prediction/position ledger, additive equity, turnover, drawdown, net return,
+Sharpe, exact model/factor/data identities, and explicit L2 limitations. It
+keeps the holdout unopened and carries neither deployment nor order-submission
+authority. Governed GP v1-v3 continue to use the legacy Factor-Bank subset MCTS
+and four-stage formula artifacts for historical compatibility.
 
 The hidden diagnostic `mission run` surface requires `--feature-fields`.
 Supply comma-delimited fields that are present in the prepared dataset,
 live-executable, and all belong to the same live event domain. GP and LLM
 produce validated Formula candidates. The low-level CLI rejects `mcts`;
-Factor-Bank subset MCTS is owned only by the Campaign execution seam.
+legacy Factor-Bank subset MCTS is owned only by the Campaign execution seam.
 `bayesian` and `offline-rl` remain research engines but are rejected before
 opening mission state because their proposal grammars cannot produce
 live-executable formulas. LLM diagnostics require:
@@ -171,8 +166,9 @@ For an LLM mission, `objective` and `hypothesis_scope` are the governed research
 `mission create`, `mission execute`, `mission run`, `mission resume`, and
 `loop run` remain parseable only for focused diagnostics and legacy checkpoint
 inspection. They are hidden from CLI help and are not runnable CEX completion
-paths. The Campaign seam owns Factor-Bank subset MCTS, exact checkpoint resume,
-round accounting, winner selection, and the one sealed-holdout finalization.
+paths. The Campaign seam owns v4 supervised-model selection and replay, legacy
+Factor-Bank subset MCTS/checkpoint resume, round accounting, and winner
+selection. Only the legacy formula lane owns sealed-holdout finalization.
 Missing evaluation, holdout, Paper, Shadow, or human evidence still fails or
 pauses closed; invoking a diagnostic command never supplies that evidence.
 

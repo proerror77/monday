@@ -28,6 +28,7 @@ pub const CEX_RESEARCH_MISSION_SCHEMA_V1: &str = "cex-research-mission-v1";
 pub const CEX_GP_POLICY_SCHEMA_V1: &str = "cex-gp-policy-v1";
 pub const CEX_GP_POLICY_SCHEMA_V2: &str = "cex-gp-policy-v2";
 pub const CEX_GP_POLICY_SCHEMA_V3: &str = "cex-gp-policy-v3";
+pub const CEX_GP_POLICY_SCHEMA_V4: &str = "cex-gp-policy-v4";
 pub const CEX_FACTOR_BANK_SCHEMA_V1: &str = "cex-factor-bank-v1";
 pub const CEX_FACTOR_BANK_SCHEMA_V2: &str = "cex-factor-bank-v2";
 pub const CEX_FACTOR_BANK_SCHEMA_V3: &str = "cex-factor-bank-v3";
@@ -721,13 +722,25 @@ impl CexResearchMissionSpecV1 {
         CexEqualAbsoluteWeightPolicyV1::controlled_v1(self.policies.weight.id.clone())?
             .validate_binding(&self.policies.weight)?;
         self.search.budget.validate()?;
-        if CexGpPolicyV1::controlled_dynamic_v3(
-            self.policies.gp.id.clone(),
-            self.feature_fields.clone(),
-            self.search.seed,
-            &self.search.budget,
-        )
-        .is_ok_and(|policy| policy.validate_binding(&self.policies.gp).is_ok())
+        let named_template_policy = [
+            CexGpPolicyV1::controlled_dynamic_v3(
+                self.policies.gp.id.clone(),
+                self.feature_fields.clone(),
+                self.search.seed,
+                &self.search.budget,
+            ),
+            CexGpPolicyV1::controlled_dynamic_v4(
+                self.policies.gp.id.clone(),
+                self.feature_fields.clone(),
+                self.search.seed,
+                &self.search.budget,
+            ),
+        ]
+        .into_iter()
+        .any(|policy| {
+            policy.is_ok_and(|policy| policy.validate_binding(&self.policies.gp).is_ok())
+        });
+        if named_template_policy
             && self.search.max_new_iterations != self.search.budget.max_candidates
         {
             return Err(DomainError::InvalidCexResearchMission(
@@ -1202,6 +1215,11 @@ pub struct CandidateEvaluation {
 impl CandidateEvaluation {
     pub fn validate(&self) -> Result<(), DomainError> {
         self.validate_inner(false)
+            .map_err(|_| DomainError::InvalidEvaluationEvidence)
+    }
+
+    pub fn validate_reason(&self) -> Result<(), String> {
+        self.validate_inner(false).map_err(str::to_string)
     }
 
     /// Compatibility-only validation for restoring proposal-engine search state.
@@ -1217,9 +1235,10 @@ impl CandidateEvaluation {
                     | "onnx-purged-walk-forward-v2"
             );
         self.validate_inner(legacy_unbound_walk_forward)
+            .map_err(|_| DomainError::InvalidEvaluationEvidence)
     }
 
-    fn validate_inner(&self, allow_unbound_historical_replay: bool) -> Result<(), DomainError> {
+    fn validate_inner(&self, allow_unbound_historical_replay: bool) -> Result<(), &'static str> {
         let protocol = match self.protocol_binding() {
             Ok((protocol, _)) => Some(protocol),
             Err(_)
@@ -1229,7 +1248,7 @@ impl CandidateEvaluation {
             {
                 None
             }
-            Err(_) => return Err(DomainError::InvalidEvaluationEvidence),
+            Err(_) => return Err("protocol binding is invalid"),
         };
         let finite_metrics = [
             self.metrics.mean_net_return,
@@ -1270,13 +1289,13 @@ impl CandidateEvaluation {
             .folds
             .iter()
             .try_fold(0_usize, |total, fold| total.checked_add(fold.row_count))
-            .ok_or(DomainError::InvalidEvaluationEvidence)?;
+            .ok_or("fold row counts overflowed")?;
         let trade_count = self
             .metrics
             .folds
             .iter()
             .try_fold(0_usize, |total, fold| total.checked_add(fold.trade_count))
-            .ok_or(DomainError::InvalidEvaluationEvidence)?;
+            .ok_or("fold trade counts overflowed")?;
         let total_turnover = self
             .metrics
             .folds
@@ -1316,34 +1335,62 @@ impl CandidateEvaluation {
             .map(|fold| fold.net_sharpe)
             .sum::<f64>()
             / self.metrics.folds.len().max(1) as f64;
-        if self.evaluator_version.trim().is_empty()
-            || !self.evaluator_config.is_object()
-            || self.metrics.row_count == 0
-            || self.metrics.folds.is_empty()
-            || !self.score.is_finite()
-            || !finite_metrics
-            || self.metrics.max_drawdown < 0.0
-            || self.metrics.total_turnover < 0.0
-            || !self.metrics.predictive.valid_for(&self.metrics.folds)
-            || self.metrics.predictive.row_count != self.metrics.row_count
-            || self.score.to_bits() != self.metrics.adjusted_score.to_bits()
-            || self.passed != self.failure_reasons.is_empty()
-            || row_count != self.metrics.row_count
-            || trade_count != self.metrics.trade_count
-            || !approximately_equal(total_turnover, self.metrics.total_turnover)
-            || self
-                .metrics
-                .folds
-                .iter()
-                .enumerate()
-                .any(|(index, fold)| fold.fold_index != index + 1)
-            || !approximately_equal(cumulative_net_return, self.metrics.cumulative_net_return)
-            || !approximately_equal(weighted_mean, self.metrics.mean_net_return)
-            || !approximately_equal(maximum_drawdown, self.metrics.max_drawdown)
-            || !approximately_equal(net_sharpe, self.metrics.net_sharpe)
-            || !approximately_equal(raw_score, self.metrics.raw_score)
+        if self.evaluator_version.trim().is_empty() {
+            return Err("evaluator version is empty");
+        }
+        if !self.evaluator_config.is_object() {
+            return Err("evaluator config is not an object");
+        }
+        if self.metrics.row_count == 0 || self.metrics.folds.is_empty() {
+            return Err("evaluation has no rows or folds");
+        }
+        if !self.score.is_finite() || !finite_metrics {
+            return Err("score or fold metrics are non-finite");
+        }
+        if self.metrics.max_drawdown < 0.0 || self.metrics.total_turnover < 0.0 {
+            return Err("drawdown or turnover is negative");
+        }
+        if !self.metrics.predictive.valid_for(&self.metrics.folds) {
+            return Err("predictive metrics do not match trading folds");
+        }
+        if self.metrics.predictive.row_count != self.metrics.row_count {
+            return Err("predictive row count does not match trading row count");
+        }
+        if self.score.to_bits() != self.metrics.adjusted_score.to_bits() {
+            return Err("score bits do not match adjusted_score");
+        }
+        if self.passed != self.failure_reasons.is_empty() {
+            return Err("passed flag does not match failure reasons");
+        }
+        if row_count != self.metrics.row_count || trade_count != self.metrics.trade_count {
+            return Err("aggregate row or trade count does not match folds");
+        }
+        if !approximately_equal(total_turnover, self.metrics.total_turnover) {
+            return Err("aggregate turnover does not match folds");
+        }
+        if self
+            .metrics
+            .folds
+            .iter()
+            .enumerate()
+            .any(|(index, fold)| fold.fold_index != index + 1)
         {
-            return Err(DomainError::InvalidEvaluationEvidence);
+            return Err("fold indexes are not contiguous");
+        }
+        if !approximately_equal(cumulative_net_return, self.metrics.cumulative_net_return) {
+            return Err("aggregate cumulative return does not match folds");
+        }
+        if !approximately_equal(weighted_mean, self.metrics.mean_net_return) {
+            return Err("weighted fold mean does not match aggregate mean");
+        }
+        if !approximately_equal(maximum_drawdown, self.metrics.max_drawdown) {
+            return Err("aggregate drawdown does not match folds");
+        }
+        if !approximately_equal(net_sharpe, self.metrics.net_sharpe) {
+            return Err("aggregate Sharpe does not match folds");
+        }
+        if !approximately_equal(raw_score, self.metrics.raw_score) {
+            return Err("aggregate raw score does not match folds");
         }
         if let Some(protocol) = protocol {
             let (expected_folds, expected_rows, expected_fold_rows) =
@@ -1356,7 +1403,7 @@ impl CandidateEvaluation {
                             .walk_forward
                             .validation_rows
                             .checked_mul(protocol.walk_forward.fold_count)
-                            .ok_or(DomainError::InvalidEvaluationEvidence)?,
+                            .ok_or("walk-forward row count overflowed")?,
                         protocol.walk_forward.validation_rows,
                     ),
                     SEALED_HOLDOUT_EVALUATOR_VERSION | ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION => (
@@ -1374,19 +1421,25 @@ impl CandidateEvaluation {
                         .folds
                         .iter()
                         .any(|fold| fold.row_count != expected_fold_rows))
-                || if protocol.costs.capacity_enabled() {
-                    self.metrics
-                        .folds
-                        .iter()
-                        .any(|fold| fold.max_book_depth_fraction.is_none())
-                } else {
-                    self.metrics
-                        .folds
-                        .iter()
-                        .any(|fold| fold.max_book_depth_fraction.is_some())
-                }
             {
-                return Err(DomainError::InvalidEvaluationEvidence);
+                return Err("fold counts do not match the evaluation protocol");
+            }
+            if protocol.costs.capacity_enabled() {
+                if self
+                    .metrics
+                    .folds
+                    .iter()
+                    .any(|fold| fold.max_book_depth_fraction.is_none())
+                {
+                    return Err("capacity-enabled protocol is missing book-depth fractions");
+                }
+            } else if self
+                .metrics
+                .folds
+                .iter()
+                .any(|fold| fold.max_book_depth_fraction.is_some())
+            {
+                return Err("capacity-disabled protocol has book-depth fractions");
             }
         }
         if matches!(
@@ -1397,7 +1450,9 @@ impl CandidateEvaluation {
                 | ONNX_WALK_FORWARD_EVALUATOR_VERSION
                 | ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION
         ) {
-            let config = self.formula_config()?;
+            let config = self
+                .formula_config()
+                .map_err(|_| "evaluator config is invalid")?;
             let require_icir = matches!(
                 self.evaluator_version.as_str(),
                 WALK_FORWARD_EVALUATOR_VERSION
@@ -1421,13 +1476,14 @@ impl CandidateEvaluation {
                 })
                 && capacity_passed
                 && self.metrics.adjusted_score >= config.min_aggregate_score;
-            if self.passed != policy_passed
-                || !approximately_equal(
-                    config.adjusted_score(self.metrics.raw_score)?,
-                    self.metrics.adjusted_score,
-                )
-            {
-                return Err(DomainError::InvalidEvaluationEvidence);
+            if self.passed != policy_passed {
+                return Err("passed flag does not match evaluator policy");
+            }
+            let expected_adjusted = config
+                .adjusted_score(self.metrics.raw_score)
+                .map_err(|_| "adjusted score is not finite")?;
+            if !approximately_equal(expected_adjusted, self.metrics.adjusted_score) {
+                return Err("adjusted score does not match the evaluator formula");
             }
         }
         Ok(())
@@ -1620,26 +1676,42 @@ impl CexGpPolicyV1 {
         budget: &SearchBudget,
     ) -> Result<Self, DomainError> {
         Self::normalize_admitted_fields(&mut admitted_fields);
+        let continuous = schema_version == CEX_GP_POLICY_SCHEMA_V4;
+        let constants = if continuous {
+            vec!["-1", "5", "20"]
+        } else {
+            vec!["-1", "0", "1", "5", "20"]
+        }
+        .into_iter()
+        .map(str::to_string)
+        .collect();
         let policy = Self {
             schema_version: schema_version.to_string(),
             policy_id: policy_id.into(),
             admitted_fields,
-            operators: vec![
-                FactorOperator::ZScore,
-                FactorOperator::Delta,
-                FactorOperator::Add,
-                FactorOperator::Sub,
-                FactorOperator::Mul,
-                FactorOperator::GreaterThan,
-                FactorOperator::LessThan,
-                FactorOperator::IfElse,
-            ],
+            operators: if continuous {
+                vec![
+                    FactorOperator::ZScore,
+                    FactorOperator::Delta,
+                    FactorOperator::Add,
+                    FactorOperator::Sub,
+                    FactorOperator::Mul,
+                ]
+            } else {
+                vec![
+                    FactorOperator::ZScore,
+                    FactorOperator::Delta,
+                    FactorOperator::Add,
+                    FactorOperator::Sub,
+                    FactorOperator::Mul,
+                    FactorOperator::GreaterThan,
+                    FactorOperator::LessThan,
+                    FactorOperator::IfElse,
+                ]
+            },
             windows: vec![5, 20],
-            constants: ["-1", "0", "1", "5", "20"]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            max_ast_depth: 7,
+            constants,
+            max_ast_depth: if continuous { 4 } else { 7 },
             max_ast_nodes: 31,
             population_limit: 32,
             seed,
@@ -1707,6 +1779,21 @@ impl CexGpPolicyV1 {
         )
     }
 
+    pub fn controlled_dynamic_v4(
+        policy_id: impl Into<String>,
+        admitted_fields: Vec<String>,
+        seed: u64,
+        budget: &SearchBudget,
+    ) -> Result<Self, DomainError> {
+        Self::controlled_dynamic(
+            CEX_GP_POLICY_SCHEMA_V4,
+            policy_id,
+            admitted_fields,
+            seed,
+            budget,
+        )
+    }
+
     pub fn validate(&self) -> Result<(), DomainError> {
         let governed_v1 = self.schema_version == CEX_GP_POLICY_SCHEMA_V1
             && self.operators
@@ -1718,7 +1805,7 @@ impl CexGpPolicyV1 {
             && self.windows.is_empty()
             && self.constants.is_empty()
             && self.max_ast_depth == 5;
-        let governed_dynamic = matches!(
+        let governed_thresholded_dynamic = matches!(
             self.schema_version.as_str(),
             CEX_GP_POLICY_SCHEMA_V2 | CEX_GP_POLICY_SCHEMA_V3
         ) && self.operators
@@ -1735,7 +1822,19 @@ impl CexGpPolicyV1 {
             && self.windows == [5, 20]
             && self.constants == ["-1", "0", "1", "5", "20"]
             && self.max_ast_depth == 7;
-        if !(governed_v1 || governed_dynamic)
+        let governed_continuous_dynamic = self.schema_version == CEX_GP_POLICY_SCHEMA_V4
+            && self.operators
+                == [
+                    FactorOperator::ZScore,
+                    FactorOperator::Delta,
+                    FactorOperator::Add,
+                    FactorOperator::Sub,
+                    FactorOperator::Mul,
+                ]
+            && self.windows == [5, 20]
+            && self.constants == ["-1", "5", "20"]
+            && self.max_ast_depth == 4;
+        if !(governed_v1 || governed_thresholded_dynamic || governed_continuous_dynamic)
             || self.policy_id.trim().is_empty()
             || self.admitted_fields.is_empty()
             || self
@@ -1764,11 +1863,17 @@ impl CexGpPolicyV1 {
                 "governed GP cannot depend on a wall-clock budget",
             ));
         }
-        if self.schema_version == CEX_GP_POLICY_SCHEMA_V3
-            && self.budget.max_candidates != self.admitted_fields.len() * 2 + 4
+        if matches!(
+            self.schema_version.as_str(),
+            CEX_GP_POLICY_SCHEMA_V3 | CEX_GP_POLICY_SCHEMA_V4
+        ) && self.budget.max_candidates != self.admitted_fields.len() * 2 + 4
         {
             return Err(DomainError::InvalidCexGpPolicy(
-                "governed GP v3 requires exactly two atomic slots per field plus four named templates",
+                if self.schema_version == CEX_GP_POLICY_SCHEMA_V3 {
+                    "governed GP v3 requires exactly two atomic slots per field plus four named templates"
+                } else {
+                    "governed GP v4 requires exactly two atomic slots per field plus four named templates"
+                },
             ));
         }
         let has_named_template_fields = [
@@ -1782,9 +1887,17 @@ impl CexGpPolicyV1 {
                 .iter()
                 .any(|admitted| admitted == field)
         });
-        if self.schema_version == CEX_GP_POLICY_SCHEMA_V3 && !has_named_template_fields {
+        if matches!(
+            self.schema_version.as_str(),
+            CEX_GP_POLICY_SCHEMA_V3 | CEX_GP_POLICY_SCHEMA_V4
+        ) && !has_named_template_fields
+        {
             return Err(DomainError::InvalidCexGpPolicy(
-                "governed GP v3 requires the named-template fields",
+                if self.schema_version == CEX_GP_POLICY_SCHEMA_V3 {
+                    "governed GP v3 requires the named-template fields"
+                } else {
+                    "governed GP v4 requires the named-template fields"
+                },
             ));
         }
         let mut event_domain = None;
@@ -2516,6 +2629,7 @@ impl CexBaselinePolicyV1 {
 pub enum CexBaselineModelKindV1 {
     Ridge,
     ShallowCart,
+    BurnMlp,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2530,6 +2644,20 @@ pub enum CexBaselineModelV1 {
     ShallowCart {
         root: CexBaselineCartNodeV1,
     },
+    BurnMlp {
+        request_semantic_sha256: String,
+        semantic_model_sha256: String,
+        config_sha256: String,
+        trainer_version: String,
+        symbol: String,
+        venue: String,
+        row_count: usize,
+        seed: u64,
+        hidden_dim: usize,
+        epochs: usize,
+        learning_rate: f64,
+        min_rows: usize,
+    },
 }
 
 impl CexBaselineModelV1 {
@@ -2537,6 +2665,7 @@ impl CexBaselineModelV1 {
         match self {
             Self::Ridge { .. } => CexBaselineModelKindV1::Ridge,
             Self::ShallowCart { .. } => CexBaselineModelKindV1::ShallowCart,
+            Self::BurnMlp { .. } => CexBaselineModelKindV1::BurnMlp,
         }
     }
 }
@@ -2926,6 +3055,37 @@ fn model_validate(
             Ok(())
         }
         CexBaselineModelV1::ShallowCart { root } => validate_cart_node(root, arity, policy, 0),
+        CexBaselineModelV1::BurnMlp {
+            request_semantic_sha256,
+            semantic_model_sha256,
+            config_sha256,
+            trainer_version,
+            symbol,
+            venue,
+            row_count,
+            hidden_dim,
+            epochs,
+            learning_rate,
+            min_rows,
+            ..
+        } if valid_content_sha256(request_semantic_sha256)
+            && valid_content_sha256(semantic_model_sha256)
+            && valid_content_sha256(config_sha256)
+            && !trainer_version.trim().is_empty()
+            && !symbol.trim().is_empty()
+            && symbol.trim() == symbol
+            && !venue.trim().is_empty()
+            && venue.trim() == venue
+            && *hidden_dim > 0
+            && *epochs > 0
+            && learning_rate.is_finite()
+            && *learning_rate > 0.0
+            && *min_rows > 0
+            && *row_count >= *min_rows
+            && arity > 0 =>
+        {
+            Ok(())
+        }
         _ => Err(DomainError::InvalidCexBaseline("fitted model is invalid")),
     }
 }

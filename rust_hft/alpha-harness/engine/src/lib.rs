@@ -31,6 +31,20 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "kernel")]
 use thiserror::Error;
 
+#[cfg(feature = "kernel")]
+fn kernel_research_event(event: &str, details: serde_json::Value) {
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "schema_version": "monday.research_event.v1",
+            "timestamp": Utc::now().to_rfc3339(),
+            "component": "alpha-engine-kernel",
+            "event": event,
+            "details": details,
+        })
+    );
+}
+
 #[derive(Debug, Error)]
 #[cfg(feature = "kernel")]
 pub enum EngineError {
@@ -319,6 +333,18 @@ where
         let mut new_iterations = 0;
         let proposal_context = dataset.proposal_context_for_mission(&mission);
         let evaluation_context = dataset.engine_context();
+        kernel_research_event(
+            "factor_search_started",
+            serde_json::json!({
+                "mission_id": mission_id,
+                "engine": self.proposal_engine.kind(),
+                "existing_iterations": total_iterations,
+                "max_new_iterations": control.max_new_iterations,
+                "search_budget": &mission.search_budget,
+                "dataset_rows": evaluation_context.rows().len(),
+                "walk_forward_folds": evaluation_context.folds().len(),
+            }),
+        );
 
         if kept >= mission.completion_policy.min_kept_candidates {
             let reason = MissionTerminalReason::CompletionPolicySatisfied {
@@ -353,6 +379,20 @@ where
             let iteration_id = format!("{mission_id}-iteration-{index}");
             let created_at = Utc::now();
             let remaining = remaining_budget(&mission.search_budget, &usage);
+            kernel_research_event(
+                "factor_iteration_started",
+                serde_json::json!({
+                    "mission_id": mission_id,
+                    "iteration_id": &iteration_id,
+                    "iteration_index": index,
+                    "remaining_budget": {
+                        "candidates": remaining.candidates,
+                        "expansions": remaining.expansions,
+                        "tokens": remaining.tokens,
+                        "milliseconds": remaining.milliseconds,
+                    },
+                }),
+            );
             let started = std::time::Instant::now();
             let proposal =
                 self.proposal_engine
@@ -546,6 +586,25 @@ where
                     &checkpoint,
                 )?;
             }
+            let evaluation_evidence = evaluation.as_ref().and_then(|record| {
+                serde_json::from_value::<CandidateEvaluation>(record.payload.clone()).ok()
+            });
+            kernel_research_event(
+                "factor_iteration_completed",
+                serde_json::json!({
+                    "mission_id": mission_id,
+                    "iteration_id": &iteration.iteration_id,
+                    "iteration_index": index,
+                    "hypothesis": &iteration.hypothesis,
+                    "candidate_id": &iteration.candidate_artifact_id,
+                    "candidate": candidate.map(|(_, artifact)| artifact),
+                    "verdict": &iteration.verdict,
+                    "failure_class": &iteration.failure_class,
+                    "failure_explanation": &iteration.failure_explanation,
+                    "evaluation": evaluation_evidence,
+                    "budget_usage": &iteration.budget_usage,
+                }),
+            );
             total_iterations += 1;
             new_iterations += 1;
             if kept >= mission.completion_policy.min_kept_candidates {

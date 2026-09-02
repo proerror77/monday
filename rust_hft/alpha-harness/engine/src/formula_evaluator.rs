@@ -24,19 +24,53 @@ pub struct FormulaEvaluator {
     config: FormulaEvaluatorConfig,
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PositionEvaluationPoint {
+    pub row_index: usize,
+    pub series_id: u64,
+    pub available_time: chrono::DateTime<chrono::Utc>,
+    pub fold_index: usize,
+    pub prediction: f64,
+    pub target_position: f64,
+    pub gross_return: f64,
+    pub transaction_cost: f64,
+    pub funding_cost: f64,
+    pub net_return: f64,
+    pub equity: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PositionEvaluationReport {
+    pub evaluation: CandidateEvaluation,
+    pub ledger: Vec<PositionEvaluationPoint>,
+}
+
 struct PredictiveGateResult {
     predictive: PredictiveMetrics,
     failures: Vec<String>,
 }
 
+struct PositionReturnPoint {
+    row_index: usize,
+    series_id: u64,
+    available_time: chrono::DateTime<chrono::Utc>,
+    target_position: f64,
+    gross_return: f64,
+    transaction_cost: f64,
+    funding_cost: f64,
+    net_return: f64,
+}
+
 impl PredictiveGateResult {
-    fn map_positions_to_net_returns(
+    fn target_positions_to_net_returns(
         &self,
         rows: &[ResearchRow],
-        signals: &[f64],
+        target_positions: &[f64],
         range: std::ops::Range<usize>,
         costs: &EvaluationCostsV1,
-    ) -> (Vec<f64>, usize, f64, Option<f64>) {
+    ) -> (Vec<PositionReturnPoint>, usize, f64, Option<f64>) {
         let mut previous_position = 0.0;
         let mut trade_count = 0;
         let mut total_turnover = 0.0;
@@ -49,12 +83,12 @@ impl PredictiveGateResult {
         let mut max_book_depth_fraction = capacity_features.as_ref().map(|_| 0.0_f64);
         let range_start = range.start;
         let range_end = range.end;
-        let returns = (range_start..range_end)
+        let points = (range_start..range_end)
             .map(|index| {
                 if index == range_start || rows[index - 1].series_id != rows[index].series_id {
                     previous_position = 0.0;
                 }
-                let position = signal_position(signals[index]);
+                let position = target_positions[index];
                 let position_change = position - previous_position;
                 let turnover = position_change.abs();
                 total_turnover += turnover;
@@ -62,23 +96,23 @@ impl PredictiveGateResult {
                     trade_count += 1;
                 }
                 let row = &rows[index];
-                let mut net = position * row.label
-                    - transaction_cost(
-                        row,
-                        turnover,
-                        position_change,
-                        costs,
-                        &capacity_features,
-                        &mut max_book_depth_fraction,
-                    )
-                    - row.funding_bps.max(0.0) * position.abs() / BPS;
+                let gross_return = position * row.label;
+                let mut transaction_cost_value = transaction_cost(
+                    row,
+                    turnover,
+                    position_change,
+                    costs,
+                    &capacity_features,
+                    &mut max_book_depth_fraction,
+                );
+                let funding_cost = row.funding_bps.max(0.0) * position.abs() / BPS;
                 let series_end =
                     index + 1 == range_end || rows[index + 1].series_id != row.series_id;
                 previous_position = position;
                 if series_end && position.abs() > f64::EPSILON {
                     total_turnover += position.abs();
                     trade_count += 1;
-                    net -= transaction_cost(
+                    transaction_cost_value += transaction_cost(
                         row,
                         position.abs(),
                         -position,
@@ -88,15 +122,20 @@ impl PredictiveGateResult {
                     );
                     previous_position = 0.0;
                 }
-                net
+                let net_return = gross_return - transaction_cost_value - funding_cost;
+                PositionReturnPoint {
+                    row_index: index,
+                    series_id: row.series_id,
+                    available_time: row.available_time,
+                    target_position: position,
+                    gross_return,
+                    transaction_cost: transaction_cost_value,
+                    funding_cost,
+                    net_return,
+                }
             })
             .collect();
-        (
-            returns,
-            trade_count,
-            total_turnover,
-            max_book_depth_fraction,
-        )
+        (points, trade_count, total_turnover, max_book_depth_fraction)
     }
 }
 
@@ -219,6 +258,25 @@ impl FormulaEvaluator {
         self.evaluate_ranges(rows, signals, ranges, evaluator_version, protocol)
     }
 
+    pub(crate) fn evaluate_predictions_and_positions(
+        &self,
+        rows: &[ResearchRow],
+        predictions: &[f64],
+        target_positions: &[f64],
+        ranges: impl IntoIterator<Item = std::ops::Range<usize>>,
+        evaluator_version: &str,
+        protocol: &EvaluationProtocolV1,
+    ) -> Result<PositionEvaluationReport, String> {
+        self.evaluate_prediction_position_ranges(
+            rows,
+            predictions,
+            target_positions,
+            ranges,
+            evaluator_version,
+            protocol,
+        )
+    }
+
     pub fn evaluate_sealed(
         &self,
         proposal: &EngineProposal,
@@ -245,9 +303,34 @@ impl FormulaEvaluator {
         evaluator_version: &str,
         protocol: &EvaluationProtocolV1,
     ) -> Result<CandidateEvaluation, String> {
+        let target_positions = signals
+            .iter()
+            .copied()
+            .map(signal_position)
+            .collect::<Vec<_>>();
+        self.evaluate_prediction_position_ranges(
+            rows,
+            signals,
+            &target_positions,
+            ranges,
+            evaluator_version,
+            protocol,
+        )
+        .map(|report| report.evaluation)
+    }
+
+    fn evaluate_prediction_position_ranges(
+        &self,
+        rows: &[ResearchRow],
+        predictions: &[f64],
+        target_positions: &[f64],
+        ranges: impl IntoIterator<Item = std::ops::Range<usize>>,
+        evaluator_version: &str,
+        protocol: &EvaluationProtocolV1,
+    ) -> Result<PositionEvaluationReport, String> {
         protocol.validate().map_err(|error| error.to_string())?;
-        if signals.len() != rows.len() {
-            return Err("formula output length does not match dataset".to_string());
+        if predictions.len() != rows.len() || target_positions.len() != rows.len() {
+            return Err("prediction or target-position length does not match dataset".to_string());
         }
         if rows.iter().any(|row| {
             row.fee_bps.to_bits() != protocol.costs.fee_bps.to_bits()
@@ -287,11 +370,17 @@ impl FormulaEvaluator {
                 );
             }
         }
-        if signals
+        if predictions
             .iter()
             .any(|value| !value.is_finite() || value.abs() > self.config.max_abs_signal)
         {
-            return Err("formula produced an invalid or unbounded signal".to_string());
+            return Err("model produced an invalid or unbounded prediction".to_string());
+        }
+        if target_positions
+            .iter()
+            .any(|value| !value.is_finite() || value.abs() > 1.0)
+        {
+            return Err("decision policy produced an invalid target position".to_string());
         }
 
         let ranges = ranges.into_iter().collect::<Vec<_>>();
@@ -319,13 +408,35 @@ impl FormulaEvaluator {
         }
 
         // Position mapping requires this token, so predictive gates cannot be skipped.
-        let mut predictive_stage = self.predictive_gates(rows, signals, &ranges, evaluator_version);
+        let mut predictive_stage =
+            self.predictive_gates(rows, predictions, &ranges, evaluator_version);
 
         let mut fold_metrics = Vec::with_capacity(ranges.len());
-        let mut all_returns = Vec::new();
+        let mut ledger = Vec::new();
+        let mut equity = 1.0_f64;
         for (fold_index, range) in ranges.into_iter().enumerate() {
-            let (returns, trade_count, total_turnover, max_book_depth_fraction) = predictive_stage
-                .map_positions_to_net_returns(rows, signals, range, &protocol.costs);
+            let (points, trade_count, total_turnover, max_book_depth_fraction) = predictive_stage
+                .target_positions_to_net_returns(rows, target_positions, range, &protocol.costs);
+            let returns = points
+                .iter()
+                .map(|point| point.net_return)
+                .collect::<Vec<_>>();
+            for point in points {
+                equity += point.net_return;
+                ledger.push(PositionEvaluationPoint {
+                    row_index: point.row_index,
+                    series_id: point.series_id,
+                    available_time: point.available_time,
+                    fold_index: fold_index + 1,
+                    prediction: predictions[point.row_index],
+                    target_position: point.target_position,
+                    gross_return: point.gross_return,
+                    transaction_cost: point.transaction_cost,
+                    funding_cost: point.funding_cost,
+                    net_return: point.net_return,
+                    equity,
+                });
+            }
             let mean = mean(&returns);
             let net_sharpe = sharpe_ratio(&returns, mean);
             let raw_score = t_statistic(&returns, mean);
@@ -377,14 +488,9 @@ impl FormulaEvaluator {
                 raw_score,
                 max_book_depth_fraction,
             });
-            all_returns.extend(returns);
         }
-        let raw_score = mean(
-            &fold_metrics
-                .iter()
-                .map(|fold| fold.raw_score)
-                .collect::<Vec<_>>(),
-        );
+        let raw_score = fold_metrics.iter().map(|fold| fold.raw_score).sum::<f64>()
+            / fold_metrics.len().max(1) as f64;
         let adjusted_score = self
             .config
             .adjusted_score(raw_score)
@@ -399,23 +505,27 @@ impl FormulaEvaluator {
             predictive,
             failures,
         } = predictive_stage;
+        let row_count = fold_metrics.iter().map(|fold| fold.row_count).sum();
         let metrics = EvaluationMetrics {
             predictive,
-            row_count: all_returns.len(),
+            row_count,
             trade_count: fold_metrics.iter().map(|fold| fold.trade_count).sum(),
             total_turnover: fold_metrics.iter().map(|fold| fold.total_turnover).sum(),
-            mean_net_return: mean(&all_returns),
-            cumulative_net_return: all_returns.iter().sum(),
+            mean_net_return: fold_metrics
+                .iter()
+                .map(|fold| fold.mean_net_return * fold.row_count as f64)
+                .sum::<f64>()
+                / row_count.max(1) as f64,
+            cumulative_net_return: fold_metrics
+                .iter()
+                .map(|fold| fold.cumulative_net_return)
+                .sum(),
             max_drawdown: fold_metrics
                 .iter()
                 .map(|fold| fold.max_drawdown)
                 .fold(0.0, f64::max),
-            net_sharpe: mean(
-                &fold_metrics
-                    .iter()
-                    .map(|fold| fold.net_sharpe)
-                    .collect::<Vec<_>>(),
-            ),
+            net_sharpe: fold_metrics.iter().map(|fold| fold.net_sharpe).sum::<f64>()
+                / fold_metrics.len().max(1) as f64,
             raw_score,
             adjusted_score,
             folds: fold_metrics,
@@ -432,8 +542,10 @@ impl FormulaEvaluator {
             ),
             metrics,
         };
-        evaluation.validate().map_err(|error| error.to_string())?;
-        Ok(evaluation)
+        evaluation
+            .validate_reason()
+            .map_err(|reason| format!("evaluation evidence is inconsistent: {reason}"))?;
+        Ok(PositionEvaluationReport { evaluation, ledger })
     }
 }
 
@@ -684,8 +796,12 @@ fn transaction_cost(
         let depth_notional = row.features.get(depth_feature).copied().unwrap_or(0.0)
             * row.features.get("mid_price").copied().unwrap_or(0.0);
         if turnover > f64::EPSILON {
-            *max_fraction =
-                (*max_fraction).max(costs.position_notional_usd * turnover / depth_notional);
+            let fraction = if depth_notional.is_finite() && depth_notional > 0.0 {
+                costs.position_notional_usd * turnover / depth_notional
+            } else {
+                f64::MAX
+            };
+            *max_fraction = (*max_fraction).max(fraction);
         }
     }
     (row.fee_bps.max(0.0) - costs.rebate_bps
@@ -760,7 +876,9 @@ fn pearson_correlation(left: &[f64], right: &[f64]) -> Option<f64> {
         right_variance += right_centered.powi(2);
     }
     let denominator = (left_variance * right_variance).sqrt();
-    (denominator > 0.0).then(|| (covariance / denominator).clamp(-1.0, 1.0))
+    (denominator > 0.0)
+        .then(|| (covariance / denominator).clamp(-1.0, 1.0))
+        .filter(|value| value.is_finite())
 }
 
 fn spearman_correlation(left: &[f64], right: &[f64]) -> Option<f64> {
@@ -829,6 +947,28 @@ mod tests {
     use crate::evaluation::{prepare_dataset, ResearchRow};
     use alpha_domain::{EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationWalkForwardV1};
     use chrono::{Duration, Utc};
+
+    fn map_signal_returns(
+        gate: &PredictiveGateResult,
+        rows: &[ResearchRow],
+        signals: &[f64],
+        range: std::ops::Range<usize>,
+        costs: &EvaluationCostsV1,
+    ) -> (Vec<f64>, usize, f64, Option<f64>) {
+        let positions = signals
+            .iter()
+            .copied()
+            .map(signal_position)
+            .collect::<Vec<_>>();
+        let (points, trades, turnover, capacity) =
+            gate.target_positions_to_net_returns(rows, &positions, range, costs);
+        (
+            points.into_iter().map(|point| point.net_return).collect(),
+            trades,
+            turnover,
+            capacity,
+        )
+    }
 
     fn proposal(ast: FactorAst) -> EngineProposal {
         EngineProposal {
@@ -936,6 +1076,48 @@ mod tests {
     }
 
     #[test]
+    fn model_predictions_keep_magnitude_and_emit_a_reconciled_equity_ledger() {
+        let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
+        let prepared = dataset(0.0);
+        let context = prepared.engine_context();
+        let predictions = context
+            .rows()
+            .iter()
+            .map(|row| row.label)
+            .collect::<Vec<_>>();
+        let positions = predictions
+            .iter()
+            .map(|prediction| prediction.signum() * 0.25)
+            .collect::<Vec<_>>();
+        let report = evaluator
+            .evaluate_predictions_and_positions(
+                context.rows(),
+                &predictions,
+                &positions,
+                context.folds().iter().map(|fold| fold.validation.clone()),
+                CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION,
+                context.protocol(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            report.evaluation.metrics.predictive.time_series_ic,
+            Some(1.0)
+        );
+        assert!(report
+            .ledger
+            .iter()
+            .all(|point| point.target_position.abs() == 0.25));
+        let cumulative = report
+            .ledger
+            .iter()
+            .map(|point| point.net_return)
+            .sum::<f64>();
+        assert!((cumulative - report.evaluation.metrics.cumulative_net_return).abs() < 1.0e-12);
+        assert!((report.ledger.last().unwrap().equity - (1.0 + cumulative)).abs() < 1.0e-12);
+    }
+
+    #[test]
     fn predictive_gate_stage_is_required_before_trade_mapping() {
         let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
         let dataset = dataset(f64::MAX);
@@ -959,16 +1141,16 @@ mod tests {
         );
 
         assert_eq!(predictive_stage.predictive.time_series_ic, Some(1.0));
-        assert!(predictive_stage
-            .map_positions_to_net_returns(
-                context.rows(),
-                &signals,
-                ranges[0].clone(),
-                &context.protocol().costs,
-            )
-            .0
-            .iter()
-            .any(|value| !value.is_finite()));
+        assert!(map_signal_returns(
+            &predictive_stage,
+            context.rows(),
+            &signals,
+            ranges[0].clone(),
+            &context.protocol().costs,
+        )
+        .0
+        .iter()
+        .any(|value| !value.is_finite()));
     }
 
     #[test]
@@ -1000,7 +1182,7 @@ mod tests {
             );
 
         let (net_returns, trade_count, _, max_book_depth_fraction) =
-            gate.map_positions_to_net_returns(&input, &signals, 0..3, &costs);
+            map_signal_returns(&gate, &input, &signals, 0..3, &costs);
 
         assert_eq!(trade_count, 4);
         assert_eq!(max_book_depth_fraction, None);
@@ -1085,7 +1267,7 @@ mod tests {
             );
 
         let (net_returns, trade_count, _, _) =
-            gate.map_positions_to_net_returns(&input, &signals, 0..3, &costs);
+            map_signal_returns(&gate, &input, &signals, 0..3, &costs);
 
         assert_eq!(trade_count, 3);
         assert!((net_returns[0] + 0.00025).abs() < 1.0e-12);
@@ -1232,7 +1414,7 @@ mod tests {
             );
 
         let (net_returns, trade_count, total_turnover, _) =
-            gate.map_positions_to_net_returns(&input, &signals, 0..3, &costs);
+            map_signal_returns(&gate, &input, &signals, 0..3, &costs);
 
         assert_eq!(trade_count, 4);
         assert_eq!(total_turnover, 4.0);
@@ -1269,7 +1451,7 @@ mod tests {
             );
 
         let (_, trade_count, _, max_fraction) =
-            gate.map_positions_to_net_returns(&input, &signals, 0..3, &costs);
+            map_signal_returns(&gate, &input, &signals, 0..3, &costs);
 
         assert_eq!(trade_count, 4);
         assert_eq!(max_fraction, Some(0.4));

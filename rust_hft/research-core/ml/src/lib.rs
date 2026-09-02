@@ -35,7 +35,15 @@ pub type CpuBackend = NdArray<f32>;
 pub type CpuAutodiffBackend = Autodiff<CpuBackend>;
 
 static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
-static MODEL_INITIALIZATION_LOCK: Mutex<()> = Mutex::new(());
+// Burn's NdArray backend keeps process-global RNG and workspace state. Init,
+// train, predict, digest, and bundle load/save must not overlap in-process.
+static NDARRAY_BACKEND_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_ndarray_backend() -> Result<std::sync::MutexGuard<'static, ()>, ContractTrainingError> {
+    NDARRAY_BACKEND_LOCK.lock().map_err(|_| {
+        ContractTrainingError::Artifact("ndarray backend lock was poisoned".to_string())
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -808,6 +816,7 @@ impl TrainedContractModel {
         if features.iter().any(|value| !value.is_finite()) {
             return Err(ContractTrainingError::NonFiniteValue { row: 0 });
         }
+        let _backend_guard = lock_ndarray_backend()?;
         let device = NdArrayDevice::Cpu;
         let tensor = Tensor::<CpuBackend, 2>::from_data(
             TensorData::new(features.to_vec(), [1, features.len()]),
@@ -851,11 +860,13 @@ impl TrainedContractModel {
                 "dataset_manifest_sha256",
                 self.request.dataset.dataset_manifest_sha256.as_str(),
             );
+        let backend_guard = lock_ndarray_backend()?;
         if let Err(error) = self.model.save_into(&mut store) {
             let _ = fs::remove_file(&model_staging_path);
             return Err(ContractTrainingError::Artifact(error.to_string()));
         }
         drop(store);
+        drop(backend_guard);
         let bytes = fs::read(&model_staging_path)
             .map_err(|error| ContractTrainingError::Artifact(error.to_string()))?;
         let model_sha256 = Sha256Digest::of_bytes(&bytes);
@@ -922,6 +933,7 @@ pub fn load_contract_model_bundle(
     }
     let device = NdArrayDevice::Cpu;
     let config = manifest.request.config();
+    let _backend_guard = lock_ndarray_backend()?;
     let mut model = ReturnRegressorConfig::new(config.input_dim, config.hidden_dim)
         .init_model::<CpuBackend>(&device);
     let mut store =
@@ -975,20 +987,14 @@ fn train_parsed_contract_model(
     validate_dataset_binding(dataset, config)?;
 
     let device = NdArrayDevice::Cpu;
-    let mut model = {
-        let initialization_guard = MODEL_INITIALIZATION_LOCK.lock().map_err(|_| {
-            ContractTrainingError::Artifact("model initialization lock was poisoned".to_string())
-        })?;
-        CpuAutodiffBackend::seed(&device, config.seed);
-        let model = ReturnRegressorConfig::new(config.input_dim, config.hidden_dim)
-            .init_model::<CpuAutodiffBackend>(&device);
-        let _ = model.hidden.weight.val();
-        let _ = model.hidden.bias.as_ref().map(|bias| bias.val());
-        let _ = model.output.weight.val();
-        let _ = model.output.bias.as_ref().map(|bias| bias.val());
-        drop(initialization_guard);
-        model
-    };
+    let _backend_guard = lock_ndarray_backend()?;
+    CpuAutodiffBackend::seed(&device, config.seed);
+    let mut model = ReturnRegressorConfig::new(config.input_dim, config.hidden_dim)
+        .init_model::<CpuAutodiffBackend>(&device);
+    let _ = model.hidden.weight.val();
+    let _ = model.hidden.bias.as_ref().map(|bias| bias.val());
+    let _ = model.output.weight.val();
+    let _ = model.output.bias.as_ref().map(|bias| bias.val());
     let mut optimizer = AdamConfig::new().init();
     let features = rows
         .iter()

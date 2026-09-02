@@ -193,9 +193,10 @@ old YAML, or compile Rust in-cluster. The Job:
   frozen data SHA-256;
 - slices only the requested symbol with `binance-market-tape-slicer`;
 - runs `lob-pit-materializer` and `binance-replay-parquet-materializer`;
-- emits bounded logfmt `stage_start`, `stage_progress`, and `stage_complete`
-  events to the Pod log while retaining the JSON state/receipt files (raw
-  verification and slicing every 10 objects, reference verification every 50);
+- emits `monday.research_event.v1` process events to stderr while retaining the
+  JSON state/receipt files: shell orchestration uses logfmt and Rust workers use
+  one-line JSON (raw verification, slicing, and PIT segment verification every
+  10 objects; reference verification every 50; row processing every 100,000);
 - re-hashes the four produced Campaign inputs on the mounted output prefix; and
 - writes `receipts/campaign-inputs.json` plus a small receipt.
 
@@ -207,6 +208,27 @@ single source of truth for run-specific object identity:
 
 - `OUTPUT_PREFIX` selects the run-scoped subdirectory under the fixed mounted
   lane root `research/cex-materialization`.
+
+### Research process logs
+
+Follow a running Job with `kubectl logs -f job/JOB_NAME --timestamps`. Every
+line carrying `schema_version=monday.research_event.v1` or the equivalent JSON
+field is a process event, not a completion claim. The event stream covers:
+
+- frozen run/Mission/Campaign identity and input SHA-256 values;
+- raw/reference verification, slicing, PIT feature materialization, and replay
+  Parquet publication with bounded counters;
+- factor hypothesis/formula/verdict, Factor Bank admission, Ridge/CART training,
+  OOS metrics, predictions/positions/ledger identities, and final equity;
+- event replay assumptions, fill/cost metrics, capacity/risk gates, and the
+  selected model or explicit skip reason;
+- result publication/readback, Campaign rounds, termination, and bounded LLM
+  follow-up-plan identity.
+
+The final JSON receipts and immutable SHA readbacks remain authoritative. Logs
+must never contain labels, sealed-holdout contents, raw rows, credentials, or
+signed URLs; a successful log line without its matching receipt/readback is not
+research completion.
 
 The output volume template is
 `k8s/cex-materialization-output-volume.example.yaml`. Keep its PV `path` as a
@@ -417,11 +439,12 @@ alpha-harness mission campaign-freeze \
   --research-plan /private/path/next-research-plan.json
 ```
 
-The Campaign result schema is `cex-campaign-result-v5`. It carries bounded,
-structured factor-screening and Ridge/CART metrics for each round, so the LLM
-can select the next admitted focus from actual failure evidence instead of only
-seeing `baseline_gate_failed`. The LLM may choose one admitted
-feature focus plus a falsifiable hypothesis. The existing governed GP templates
+The Campaign result schema is `cex-campaign-result-v6`. It carries bounded,
+structured continuous-factor screening, Ridge/CART OOS metrics, selected-model
+identity, and cost-aware L2 replay feedback for each round, so the LLM can
+select the next admitted focus from the actual failure stage instead of only
+seeing `baseline_gate_failed`. The LLM may choose one admitted feature focus
+plus a falsifiable hypothesis. Governed factor generation and model training
 remain deterministic. The LLM cannot change data, fees, validation, trial
 limits, holdout, Kubernetes, risk, or execution authority. The output is
 create-once, limited to three follow-up generations, and its content hash
@@ -482,11 +505,14 @@ three named-template fields plus one admitted focus field and therefore uses 12
 candidate slots. The request derives the total trial limit from the exact plan
 and round count. Both use the six-hour protocol
 `7200 + 3*(3600+1) + 5 + 3600 = 21608`, and the `$1000 / Top5 5%` capacity
-screen. GP and subset MCTS already provide the bounded search iterations. A
-negative Campaign produces no holdout claim. A selected round may finalize once
-against the global holdout claim, but there is no second holdout winner and no
-second finalization pass. A claim without a complete sealed receipt/result is
-terminal and inconclusive, not retry authority.
+screen. A v4 Campaign counts its governed factor attempts plus the three
+supervised models (Ridge, CART, Burn MLP);
+it does not run subset MCTS. A negative Campaign produces no holdout claim and
+feeds its typed model/replay failures to the bounded external learning step. A
+selected v4 round remains pre-holdout and has no deployment or order authority.
+The legacy formula lane alone may finalize once against the global holdout
+claim; a claim without a complete sealed receipt/result is terminal and
+inconclusive, not retry authority.
 
 Job completion alone is not research completion. Require the exact image ID,
 terminal Job/Pod state, Mission readback SHA, result readback SHA, and Campaign

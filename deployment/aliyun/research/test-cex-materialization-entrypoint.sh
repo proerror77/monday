@@ -213,9 +213,16 @@ for event in \
   'event=stage_complete run_id=test-run-1 stage=receipt_build current=1 total=1' \
   'event=stage_start run_id=test-run-1 stage=publish current=0 total=1' \
   'event=stage_complete run_id=test-run-1 stage=publish current=1 total=1'; do
-  grep -Fqx "$event" "$ROOT/run.log"
+  grep -Fq "$event" "$ROOT/run.log"
 done
-grep -Fq 'event=run_complete run_id=test-run-1 feature_sha256=' "$ROOT/run.log"
+grep -Fq 'schema_version=monday.research_event.v1 component=cex-materialization event=run_start run_id=test-run-1 mission_id=data-btcusdt-usdm-test market=usdm symbol=BTCUSDT' "$ROOT/run.log"
+grep -Fq 'event=stage_progress run_id=test-run-1 stage=raw_verification current=2 total=2 last_index=2 content_sha256=' "$ROOT/run.log"
+grep -Fq 'event=stage_progress run_id=test-run-1 stage=reference_verification current=2 total=2 last_index=2 data_sha256=' "$ROOT/run.log"
+grep -Fq 'event=stage_progress run_id=test-run-1 stage=slicing current=2 total=2 last_index=2 slice_sha256=' "$ROOT/run.log"
+grep -Fq 'event=stage_complete run_id=test-run-1 stage=pit_materialization current=1 total=1 feature_sha256=' "$ROOT/run.log"
+grep -Fq 'event=stage_complete run_id=test-run-1 stage=replay_materialization current=1 total=1 replay_artifact_sha256=' "$ROOT/run.log"
+grep -Fq 'event=artifact_publish_complete run_id=test-run-1 stage=publish artifact=campaign_inputs' "$ROOT/run.log"
+grep -Fq 'event=run_complete run_id=test-run-1 mission_id=data-btcusdt-usdm-test feature_sha256=' "$ROOT/run.log"
 
 RUN_ROOT=$OUT_ROOT/test-run-1
 [ -f "$WORK_ROOT/staged-output/artifacts/materialization/decoy.reference.data" ]
@@ -252,5 +259,6 @@ if sh "$ENTRYPOINT" \
   exit 1
 fi
 grep -q 'output prefix already exists' "$ROOT/replay.err"
+grep -q 'schema_version=monday.research_event.v1 component=cex-materialization event=run_failed' "$ROOT/replay.err"
 
 printf 'cex materialization contract: ok\n'

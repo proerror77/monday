@@ -99,7 +99,7 @@ impl CexCampaignResearchPlanV1 {
         Self {
             schema_version: RESEARCH_PLAN_SCHEMA_V1.to_string(),
             generation: 0,
-            objective: "Screen atomic and named composite L2 microstructure factors, including inverse spread, cross-depth pressure consensus, top-five depth concentration, and VWAP-center displacement, on Binance USD-M BTCUSDT 1s/h5/top5 under governed dynamic-v3 GP"
+            objective: "Generate and screen continuous L2 microstructure factors, including inverse spread, cross-depth pressure consensus, top-five depth concentration, and VWAP-center displacement, then evaluate Ridge and shallow CART with purged walk-forward OOS predictions on Binance USD-M BTCUSDT 1s/h5/top5 under governed dynamic-v4 GP"
                 .to_string(),
             hypothesis: "L1 pressure, top-five depth balance, inverse spread, cross-depth pressure consensus, near-touch depth concentration, linearly weighted top-five pressure, and top-five VWAP-center displacement predict the next five one-second BTCUSDT mid-price returns"
                 .to_string(),
@@ -324,7 +324,7 @@ pub(crate) fn render_cex_bundle(
         max_new_iterations: research_plan.max_candidates()?,
         multiple_testing_trials,
     };
-    let gp_policy = CexGpPolicyV1::controlled_dynamic_v3(
+    let gp_policy = CexGpPolicyV1::controlled_dynamic_v4(
         gp_policy_id,
         research_plan.feature_fields.clone(),
         search.seed,
@@ -676,7 +676,7 @@ pub(crate) mod tests {
             ]
         );
         assert_eq!(mission.spec.policies.gp.id, GP_POLICY_ID);
-        let expected_gp = CexGpPolicyV1::controlled_dynamic_v3(
+        let expected_gp = CexGpPolicyV1::controlled_dynamic_v4(
             mission.spec.policies.gp.id.clone(),
             mission.spec.feature_fields.clone(),
             mission.spec.search.seed,

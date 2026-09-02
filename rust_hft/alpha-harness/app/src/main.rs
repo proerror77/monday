@@ -15,5 +15,13 @@ use clap::Parser;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
-    cli::run(cli::Cli::parse()).await
+    let result = cli::run(cli::Cli::parse()).await;
+    if result.is_err() {
+        mission_runner::research_event(
+            "alpha-harness",
+            "command_failed",
+            serde_json::json!({"reason_code": "command_failed"}),
+        );
+    }
+    result
 }
