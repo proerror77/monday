@@ -2586,6 +2586,7 @@ impl CexBaselinePolicyV1 {
 pub enum CexBaselineModelKindV1 {
     Ridge,
     ShallowCart,
+    BurnMlp,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2600,6 +2601,20 @@ pub enum CexBaselineModelV1 {
     ShallowCart {
         root: CexBaselineCartNodeV1,
     },
+    BurnMlp {
+        request_semantic_sha256: String,
+        semantic_model_sha256: String,
+        config_sha256: String,
+        trainer_version: String,
+        symbol: String,
+        venue: String,
+        row_count: usize,
+        seed: u64,
+        hidden_dim: usize,
+        epochs: usize,
+        learning_rate: f64,
+        min_rows: usize,
+    },
 }
 
 impl CexBaselineModelV1 {
@@ -2607,6 +2622,7 @@ impl CexBaselineModelV1 {
         match self {
             Self::Ridge { .. } => CexBaselineModelKindV1::Ridge,
             Self::ShallowCart { .. } => CexBaselineModelKindV1::ShallowCart,
+            Self::BurnMlp { .. } => CexBaselineModelKindV1::BurnMlp,
         }
     }
 }
@@ -2996,6 +3012,37 @@ fn model_validate(
             Ok(())
         }
         CexBaselineModelV1::ShallowCart { root } => validate_cart_node(root, arity, policy, 0),
+        CexBaselineModelV1::BurnMlp {
+            request_semantic_sha256,
+            semantic_model_sha256,
+            config_sha256,
+            trainer_version,
+            symbol,
+            venue,
+            row_count,
+            hidden_dim,
+            epochs,
+            learning_rate,
+            min_rows,
+            ..
+        } if valid_content_sha256(request_semantic_sha256)
+            && valid_content_sha256(semantic_model_sha256)
+            && valid_content_sha256(config_sha256)
+            && !trainer_version.trim().is_empty()
+            && !symbol.trim().is_empty()
+            && symbol.trim() == symbol
+            && !venue.trim().is_empty()
+            && venue.trim() == venue
+            && *hidden_dim > 0
+            && *epochs > 0
+            && learning_rate.is_finite()
+            && *learning_rate > 0.0
+            && *min_rows > 0
+            && *row_count >= *min_rows
+            && arity > 0 =>
+        {
+            Ok(())
+        }
         _ => Err(DomainError::InvalidCexBaseline("fitted model is invalid")),
     }
 }

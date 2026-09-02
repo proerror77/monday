@@ -200,6 +200,10 @@ fn cli_materializes_a_verified_triplet_into_a_content_addressed_parquet_partitio
         "materializer stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("\"schema_version\":\"monday.research_event.v1\""));
+    assert!(stderr.contains("\"event\":\"replay_materialization_started\""));
+    assert!(stderr.contains("\"event\":\"replay_materialization_completed\""));
     let published: Value = serde_json::from_slice(&output.stdout).unwrap();
     let manifest_path = PathBuf::from(published["manifest_path"].as_str().unwrap());
     let manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
@@ -256,6 +260,8 @@ fn cli_rejects_a_corrupted_raw_triplet_without_publishing_a_partition() {
     let output = fixture.materialize(&artifact_dir);
 
     assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("\"event\":\"replay_materialization_failed\""));
     assert!(!artifact_dir.exists());
 }
 

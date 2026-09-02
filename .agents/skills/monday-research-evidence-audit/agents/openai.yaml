@@ -1,4 +1,4 @@
 interface:
   display_name: "Monday Research Evidence Audit"
-  short_description: "Audit the research chain without mutations"
-  default_prompt: "Use $monday-research-evidence-audit to audit this Monday research evidence chain."
+  short_description: "Audit research evidence and process logs without mutations"
+  default_prompt: "Use $monday-research-evidence-audit to audit this Monday research evidence chain and its structured process logs."

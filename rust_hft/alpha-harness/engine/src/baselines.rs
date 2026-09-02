@@ -1,26 +1,57 @@
 use crate::{
-    evaluation::{EngineContext, WalkForwardFold},
+    evaluation::{EngineContext, ResearchRow, WalkForwardFold},
     formula_evaluator::{evaluate_ast, FormulaEvaluator, PositionEvaluationReport},
 };
 use alpha_domain::{
     canonical_json_hash, CexBaselineArtifactV1, CexBaselineCartNodeV1, CexBaselineFoldV1,
     CexBaselineGateV1, CexBaselineModelKindV1, CexBaselineModelV1, CexBaselinePolicyV1,
     CexBaselineRangeV1, CexFactorBankRevisionV2, CexFactorOrientationV1, CexResearchContentRefV1,
-    CexResearchHypothesisTargetV1, CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION,
+    CexResearchHypothesisTargetV1, EvaluationLabelSpecV1,
+    CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION,
+};
+use hft_research_ml::{
+    train_contract_model, ContractDatasetBinding, ContractTrainingConfig, ContractTrainingRow,
+    FeatureName, PositiveDurationMs, PurgedWalkForwardSplit, SealedTrainingRequest, Sha256Digest,
+    SplitId, SplitRole, Symbol, TimestampMs, TrainingRequest, Venue,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::engines::solve;
 
 const BPS: f64 = 10_000.0;
 const CEX_SUPERVISED_CANDIDATE_SCHEMA_V1: &str = "cex-supervised-model-candidate-v1";
 const CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V1: &str = "cex-supervised-decision-policy-v1";
+const CEX_BURN_HIDDEN_DIM: usize = 8;
+const CEX_BURN_EPOCHS: usize = 8;
+const CEX_BURN_LEARNING_RATE: f64 = 1e-3;
+const CEX_BURN_MIN_ROWS: usize = 8;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CexBaselineRun {
     pub ridge: Option<CexBaselineArtifactV1>,
     pub cart: Option<CexBaselineArtifactV1>,
+    pub burn: Option<CexBaselineArtifactV1>,
     pub gate: CexBaselineGateV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CexBurnFitIdentity<'a> {
+    pub symbol: &'a str,
+    pub venue: &'a str,
+}
+
+struct CexBurnFoldFit<'a> {
+    rows: &'a [ResearchRow],
+    features: &'a [Vec<f64>],
+    fold: &'a WalkForwardFold,
+    fold_index: usize,
+    mission_id: &'a str,
+    identity: CexBurnFitIdentity<'a>,
+    factor_ids: &'a [String],
+    horizon: &'a EvaluationLabelSpecV1,
+    evaluation_policy_sha256: &'a str,
+    dataset_sha256: &'a str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -269,6 +300,27 @@ pub fn verify_cex_baseline_artifact(
                 }
                 predict_fold_cart(&tree, &features, &validation)?
             }
+            CexBaselineModelV1::BurnMlp { symbol, venue, .. } => {
+                let (refit_model, predictions) = fit_burn_fold(CexBurnFoldFit {
+                    rows: context.rows(),
+                    features: &features,
+                    fold: context_fold,
+                    fold_index: fold.fold_index,
+                    mission_id: &artifact.mission_id,
+                    identity: CexBurnFitIdentity { symbol, venue },
+                    factor_ids: &factor_ids,
+                    horizon: &artifact.target.horizon,
+                    evaluation_policy_sha256: &artifact.evaluation_policy.content_sha256,
+                    dataset_sha256: &factor_bank.research_dataset.content_sha256,
+                })?;
+                if refit_model != fold.model {
+                    return Err(format!(
+                        "baseline fold {} Burn MLP model drifted",
+                        fold_index + 1
+                    ));
+                }
+                predictions
+            }
         };
         if !predictions_equal(&predictions, &fold.predictions) {
             return Err(format!(
@@ -302,6 +354,7 @@ pub fn evaluate_cex_baselines(
     mission_id: &str,
     target: CexResearchHypothesisTargetV1,
     evaluation_policy: &CexResearchContentRefV1,
+    burn: Option<CexBurnFitIdentity<'_>>,
 ) -> Result<CexBaselineRun, String> {
     if mission_id.trim().is_empty() {
         return Err("baseline mission identity is empty".to_string());
@@ -325,6 +378,7 @@ pub fn evaluate_cex_baselines(
         return Ok(CexBaselineRun {
             ridge: None,
             cart: None,
+            burn: None,
             gate,
         });
     }
@@ -345,18 +399,34 @@ pub fn evaluate_cex_baselines(
         context,
         policy,
         mission_id,
-        target,
+        target.clone(),
         evaluation_policy,
         factor_bank,
-        factor_ids,
+        factor_ids.clone(),
         &feature_rows,
         BaselineKind::ShallowCart,
     )?;
+    let burn = burn
+        .map(|identity| {
+            fit_artifact(
+                context,
+                policy,
+                mission_id,
+                target,
+                evaluation_policy,
+                factor_bank,
+                factor_ids,
+                &feature_rows,
+                BaselineKind::BurnMlp { identity },
+            )
+        })
+        .transpose()?;
     let gate = CexBaselineGateV1::new(&ridge, &cart)
         .map_err(|error| format!("baseline gate failed: {error}"))?;
     Ok(CexBaselineRun {
         ridge: Some(ridge),
         cart: Some(cart),
+        burn,
         gate,
     })
 }
@@ -472,9 +542,10 @@ fn cost_aware_target_position(
 }
 
 #[derive(Debug, Clone, Copy)]
-enum BaselineKind {
+enum BaselineKind<'a> {
     Ridge,
     ShallowCart,
+    BurnMlp { identity: CexBurnFitIdentity<'a> },
 }
 
 fn validate_context_identity(
@@ -602,7 +673,7 @@ fn fit_artifact(
     factor_bank: &CexFactorBankRevisionV2,
     factor_ids: Vec<String>,
     features: &[Vec<f64>],
-    kind: BaselineKind,
+    kind: BaselineKind<'_>,
 ) -> Result<CexBaselineArtifactV1, String> {
     let evaluator = FormulaEvaluator::new(policy.evaluator_config.clone())?;
     let mut folds = Vec::with_capacity(context.folds().len());
@@ -641,6 +712,18 @@ fn fit_artifact(
                     predictions,
                 )
             }
+            BaselineKind::BurnMlp { identity } => fit_burn_fold(CexBurnFoldFit {
+                rows: context.rows(),
+                features,
+                fold,
+                fold_index: fold_index + 1,
+                mission_id,
+                identity,
+                factor_ids: &factor_ids,
+                horizon: &target.horizon,
+                evaluation_policy_sha256: &evaluation_policy.content_sha256,
+                dataset_sha256: &factor_bank.research_dataset.content_sha256,
+            })?,
         };
         for (index, prediction) in fold.validation.clone().zip(&predictions) {
             signals[index] = *prediction;
@@ -668,6 +751,7 @@ fn fit_artifact(
     let model_kind = match kind {
         BaselineKind::Ridge => CexBaselineModelKindV1::Ridge,
         BaselineKind::ShallowCart => CexBaselineModelKindV1::ShallowCart,
+        BaselineKind::BurnMlp { .. } => CexBaselineModelKindV1::BurnMlp,
     };
     let artifact = CexBaselineArtifactV1::new(
         mission_id.to_string(),
@@ -685,6 +769,222 @@ fn fit_artifact(
     .map_err(|error| format!("baseline artifact validation failed: {error}"))?;
     verify_cex_baseline_artifact(context, factor_bank, &artifact)?;
     Ok(artifact)
+}
+
+fn fit_burn_fold(fit: CexBurnFoldFit<'_>) -> Result<(CexBaselineModelV1, Vec<f64>), String> {
+    let CexBurnFoldFit {
+        rows,
+        features,
+        fold,
+        fold_index,
+        mission_id,
+        identity,
+        factor_ids,
+        horizon,
+        evaluation_policy_sha256,
+        dataset_sha256,
+    } = fit;
+    if fold.train.end > rows.len()
+        || fold.validation.end > rows.len()
+        || fold.train.end > features.len()
+        || fold.validation.end > features.len()
+    {
+        return Err("Burn MLP fold range exceeds the research matrix".to_string());
+    }
+    let horizon_ms = horizon
+        .horizon_buckets
+        .checked_mul(
+            usize::try_from(horizon.observation_frequency_millis)
+                .map_err(|_| "Burn MLP label horizon overflowed".to_string())?,
+        )
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or_else(|| "Burn MLP label horizon overflowed".to_string())?;
+    if horizon_ms <= 0 {
+        return Err("Burn MLP label horizon must be positive".to_string());
+    }
+    let mut training_rows = Vec::with_capacity(fold.train.end.saturating_sub(fold.train.start));
+    for index in fold.train.clone() {
+        let observed_at_ms = timestamp_ms(rows[index].available_time)?;
+        let label_available_at_ms = observed_at_ms
+            .checked_add(horizon_ms)
+            .ok_or_else(|| format!("Burn MLP row {index} label clock overflowed"))?;
+        let feature_row = features[index]
+            .iter()
+            .map(|value| {
+                if value.is_finite() {
+                    Ok(*value as f32)
+                } else {
+                    Err(format!("Burn MLP row {index} has a non-finite feature"))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if !rows[index].label.is_finite() {
+            return Err(format!("Burn MLP row {index} has a non-finite label"));
+        }
+        training_rows.push(ContractTrainingRow {
+            observed_at_ms: TimestampMs::new(observed_at_ms),
+            feature_max_available_at_ms: TimestampMs::new(observed_at_ms),
+            label_available_at_ms: TimestampMs::new(label_available_at_ms),
+            features: feature_row,
+            forward_return: rows[index].label as f32,
+        });
+    }
+    if training_rows.len() < CEX_BURN_MIN_ROWS {
+        return Err(format!(
+            "Burn MLP fold {fold_index} has {} training rows; {CEX_BURN_MIN_ROWS} are required",
+            training_rows.len()
+        ));
+    }
+    let first_observed = training_rows[0].observed_at_ms.get();
+    let last_observed = training_rows
+        .last()
+        .ok_or_else(|| format!("Burn MLP fold {fold_index} lost its training rows"))?
+        .observed_at_ms
+        .get();
+    let cutoff_ms = last_observed
+        .checked_add(horizon_ms)
+        .ok_or_else(|| format!("Burn MLP fold {fold_index} cutoff overflowed"))?;
+    let next_split_start_ms = cutoff_ms
+        .checked_add(horizon_ms)
+        .ok_or_else(|| format!("Burn MLP fold {fold_index} embargo overflowed"))?;
+    let ordered_features = factor_ids
+        .iter()
+        .map(|factor_id| {
+            FeatureName::new(factor_id.clone())
+                .map_err(|error| format!("Burn MLP factor id is invalid: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let dataset = ContractDatasetBinding::new(
+        parse_sha256(dataset_sha256)?,
+        sha256_json(&factor_ids)?,
+        parse_sha256(evaluation_policy_sha256)?,
+        ordered_features,
+        Symbol::new(identity.symbol)
+            .map_err(|error| format!("Burn MLP symbol is invalid: {error}"))?,
+        Venue::new(identity.venue)
+            .map_err(|error| format!("Burn MLP venue is invalid: {error}"))?,
+        PositiveDurationMs::new(
+            u64::try_from(horizon_ms)
+                .map_err(|_| "Burn MLP label horizon overflowed".to_string())?,
+        )
+        .map_err(|error| format!("Burn MLP horizon is invalid: {error}"))?,
+    )
+    .map_err(|error| format!("Burn MLP dataset binding failed: {error}"))?;
+    let seed = burn_fold_seed(mission_id, fold_index, factor_ids);
+    let config = ContractTrainingConfig {
+        input_dim: factor_ids.len(),
+        hidden_dim: CEX_BURN_HIDDEN_DIM,
+        epochs: CEX_BURN_EPOCHS,
+        learning_rate: CEX_BURN_LEARNING_RATE,
+        min_rows: CEX_BURN_MIN_ROWS,
+        seed,
+    };
+    let rows_artifact = serde_json::to_vec(&training_rows)
+        .map_err(|error| format!("Burn MLP training rows failed to serialize: {error}"))?;
+    let split = PurgedWalkForwardSplit::new(
+        SplitId::new(format!("cex-burn-fold-{fold_index}-train"))
+            .map_err(|error| format!("Burn MLP split id is invalid: {error}"))?,
+        SplitRole::Train,
+        TimestampMs::new(first_observed),
+        TimestampMs::new(cutoff_ms),
+        TimestampMs::new(next_split_start_ms),
+        PositiveDurationMs::new(
+            u64::try_from(horizon_ms)
+                .map_err(|_| "Burn MLP label horizon overflowed".to_string())?,
+        )
+        .map_err(|error| format!("Burn MLP purge is invalid: {error}"))?,
+        PositiveDurationMs::new(
+            u64::try_from(horizon_ms)
+                .map_err(|_| "Burn MLP label horizon overflowed".to_string())?,
+        )
+        .map_err(|error| format!("Burn MLP embargo is invalid: {error}"))?,
+    )
+    .map_err(|error| format!("Burn MLP split failed: {error}"))?;
+    let request = TrainingRequest::new(
+        Sha256Digest::of_bytes(&rows_artifact),
+        dataset,
+        split,
+        config,
+    )
+    .map_err(|error| format!("Burn MLP training request failed: {error}"))?;
+    let request_bytes = serde_json::to_vec(&request)
+        .map_err(|error| format!("Burn MLP training request failed to serialize: {error}"))?;
+    let request_digest = Sha256Digest::of_bytes(&request_bytes);
+    let sealed = SealedTrainingRequest::from_bytes(&request_bytes, &request_digest)
+        .map_err(|error| format!("Burn MLP training request failed to seal: {error}"))?;
+    let trained = train_contract_model(&rows_artifact, &sealed)
+        .map_err(|error| format!("Burn MLP training failed: {error}"))?;
+    let mut predictions =
+        Vec::with_capacity(fold.validation.end.saturating_sub(fold.validation.start));
+    for index in fold.validation.clone() {
+        let feature_row = features[index]
+            .iter()
+            .map(|value| {
+                if value.is_finite() {
+                    Ok(*value as f32)
+                } else {
+                    Err(format!(
+                        "Burn MLP validation row {index} has a non-finite feature"
+                    ))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let prediction = trained
+            .predict(&feature_row)
+            .map_err(|error| format!("Burn MLP validation row {index} failed: {error}"))?;
+        if !prediction.is_finite() {
+            return Err(format!(
+                "Burn MLP validation row {index} produced a non-finite prediction"
+            ));
+        }
+        predictions.push(normalize_zero(f64::from(prediction)));
+    }
+    let diagnostics = trained.diagnostics();
+    Ok((
+        CexBaselineModelV1::BurnMlp {
+            request_semantic_sha256: diagnostics.request_semantic_sha256.as_str().to_string(),
+            semantic_model_sha256: diagnostics.semantic_model_sha256.as_str().to_string(),
+            config_sha256: diagnostics.config_sha256.as_str().to_string(),
+            trainer_version: diagnostics.trainer_version.clone(),
+            symbol: identity.symbol.to_string(),
+            venue: identity.venue.to_string(),
+            row_count: diagnostics.row_count,
+            seed,
+            hidden_dim: CEX_BURN_HIDDEN_DIM,
+            epochs: CEX_BURN_EPOCHS,
+            learning_rate: CEX_BURN_LEARNING_RATE,
+            min_rows: CEX_BURN_MIN_ROWS,
+        },
+        predictions,
+    ))
+}
+
+fn timestamp_ms(time: chrono::DateTime<chrono::Utc>) -> Result<i64, String> {
+    Ok(time.timestamp_millis())
+}
+
+fn parse_sha256(value: &str) -> Result<Sha256Digest, String> {
+    Sha256Digest::try_from(value.to_string()).map_err(|error| error.to_string())
+}
+
+fn sha256_json(value: &impl serde::Serialize) -> Result<Sha256Digest, String> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|error| format!("Burn MLP identity hash failed: {error}"))?;
+    Ok(Sha256Digest::of_bytes(&bytes))
+}
+
+fn burn_fold_seed(mission_id: &str, fold_index: usize, factor_ids: &[String]) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(mission_id.as_bytes());
+    hasher.update(fold_index.to_le_bytes());
+    for factor_id in factor_ids {
+        hasher.update(factor_id.as_bytes());
+        hasher.update([0xff]);
+    }
+    let digest = hasher.finalize();
+    let mut seed = [0_u8; 8];
+    seed.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(seed)
 }
 
 fn labels(rows: &[crate::evaluation::ResearchRow]) -> Vec<f64> {
@@ -1171,5 +1471,74 @@ mod tests {
         let short = cost_aware_target_position(-0.002, &row, &costs, &policy).unwrap();
         assert!(long > 0.0 && long < 1.0);
         assert_eq!(short, -long);
+    }
+
+    #[test]
+    fn burn_mlp_is_deterministic_and_ignores_validation_labels() {
+        let rows = (0..20)
+            .map(|index| ResearchRow {
+                series_id: 1,
+                available_time: chrono::DateTime::<Utc>::from_timestamp(index as i64, 0).unwrap(),
+                signal: 0.0,
+                features: std::collections::BTreeMap::new(),
+                label: (index as f64 - 10.0) / 1_000.0,
+                fee_bps: 2.0,
+                funding_bps: 0.0,
+                pit_funding: true,
+                latency_bps: 0.0,
+            })
+            .collect::<Vec<_>>();
+        let features = rows
+            .iter()
+            .enumerate()
+            .map(|(index, _)| vec![index as f64 / 20.0])
+            .collect::<Vec<_>>();
+        let fold = WalkForwardFold {
+            train: 0..12,
+            purge: 12..13,
+            validation: 13..16,
+            embargo: 16..20,
+        };
+        let horizon = EvaluationLabelSpecV1 {
+            horizon_buckets: 1,
+            observation_frequency_millis: 1_000,
+        };
+        let dataset_sha = "a".repeat(64);
+        let evaluation_sha = "b".repeat(64);
+        let identity = CexBurnFitIdentity {
+            symbol: "BTCUSDT",
+            venue: "binance-usdm",
+        };
+        let factor_ids = ["cex-factor-1".to_string()];
+        let fit = |rows: &[ResearchRow]| {
+            fit_burn_fold(CexBurnFoldFit {
+                rows,
+                features: &features,
+                fold: &fold,
+                fold_index: 1,
+                mission_id: "cex-mission-burn",
+                identity,
+                factor_ids: &factor_ids,
+                horizon: &horizon,
+                evaluation_policy_sha256: &evaluation_sha,
+                dataset_sha256: &dataset_sha,
+            })
+        };
+        let (left_model, left_predictions) = fit(&rows).unwrap();
+        let (right_model, right_predictions) = fit(&rows).unwrap();
+        assert_eq!(left_model, right_model);
+        assert_eq!(left_predictions, right_predictions);
+        assert_eq!(left_predictions.len(), 3);
+
+        let mut mutated = rows.clone();
+        for row in &mut mutated[13..16] {
+            row.label = 9.9;
+        }
+        let (mutated_model, _) = fit(&mutated).unwrap();
+        assert_eq!(left_model, mutated_model);
+        assert!(matches!(
+            left_model,
+            CexBaselineModelV1::BurnMlp { row_count: 12, .. }
+        ));
     }
 }

@@ -274,8 +274,21 @@ fi
 test -s "$root/cycle/generation-0/request.json"
 test "$(<"$FAKE_STATE/signer-count")" == 1
 test "$(<"$FAKE_STATE/dispatch-count")" == 1
+grep -Fq 'schema_version=monday.research_event.v1 component=campaign-cycle-controller event=cycle_failed generation=0 stage=oss_result_readback' "$root/first.stderr"
 
-"$controller" "${controller_args[@]}" >/dev/null
+"$controller" "${controller_args[@]}" >"$root/second.stdout" 2>"$root/second.stderr"
+
+for event in \
+  'event=cycle_started' \
+  'event=generation_started generation=0' \
+  'event=stage_checkpoint_reused generation=0 stage=kubernetes_runtime_readback' \
+  'event=round_readback_completed generation=0 round_index=0 round_id=r1' \
+  'event=stage_completed generation=0 stage=oss_result_readback' \
+  'event=stage_started generation=0 stage=campaign_learning' \
+  'event=generation_started generation=1' \
+  'event=cycle_completed generation=1 campaign_id=campaign-g1 termination_reason=campaign_finalized'; do
+  grep -Fq "$event" "$root/second.stderr"
+done
 
 jq -e '.generation == 1 and .termination_reason == "campaign_finalized" and .round_readback_count == 2' \
   "$root/cycle/cycle-result.json" >/dev/null

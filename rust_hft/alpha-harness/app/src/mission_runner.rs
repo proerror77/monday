@@ -7,10 +7,10 @@ use crate::{
 };
 use alpha_domain::{
     canonical_json_hash, CandidateArtifact, CandidateEvaluation, CexBaselineArtifactV1,
-    CexBaselineGateV1, CexBaselinePolicyV1, CexEqualAbsoluteWeightPolicyV1, CexEventReplayPolicyV1,
-    CexFactorBankRevisionV2, CexFactorEvaluationEvidenceV2, CexFactorRejectionCodeV1,
-    CexFactorScreeningAttemptV2, CexFactorScreeningVerdictV1, CexFinalPrecommitV1,
-    CexFourStageStrategyCandidateV1, CexGpPolicyV1, CexResearchContentRefV1,
+    CexBaselineGateV1, CexBaselineModelKindV1, CexBaselinePolicyV1, CexEqualAbsoluteWeightPolicyV1,
+    CexEventReplayPolicyV1, CexFactorBankRevisionV2, CexFactorEvaluationEvidenceV2,
+    CexFactorRejectionCodeV1, CexFactorScreeningAttemptV2, CexFactorScreeningVerdictV1,
+    CexFinalPrecommitV1, CexFourStageStrategyCandidateV1, CexGpPolicyV1, CexResearchContentRefV1,
     CexResearchHoldoutStateV1, CexResearchMissionArtifactV1, CexSealedHoldoutClaimV1, EngineKind,
     EvaluationCostsV1, FormulaEvaluatorConfig, IterationVerdict, MissionCompletionPolicy,
     MissionStatus, PromotionRecord, ResearchIteration, ResearchMission, SearchBudgetUsage,
@@ -19,8 +19,8 @@ use alpha_domain::{
 };
 use alpha_engine::{
     baselines::{
-        evaluate_cex_baselines, evaluate_cex_supervised_model, CexSupervisedModelCandidateV1,
-        CexSupervisedModelEvaluationV1,
+        evaluate_cex_baselines, evaluate_cex_supervised_model, CexBurnFitIdentity,
+        CexSupervisedModelCandidateV1, CexSupervisedModelEvaluationV1,
     },
     engines::{
         CexCombinationResearchArtifactV1, CexFactorBankMcts, CexFactorBankMctsCheckpointV1,
@@ -69,6 +69,7 @@ use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 const MATERIALIZATION_KIND: &str = "lob_point_in_time_materialization";
 const CEX_BASELINE_POLICY_REGISTRY_KIND: &str = "cex_baseline_policy";
 const CEX_BASELINE_RIDGE_REGISTRY_KIND: &str = "cex_baseline_ridge";
+const CEX_BASELINE_BURN_REGISTRY_KIND: &str = "cex_baseline_burn_mlp";
 const CEX_BASELINE_CART_REGISTRY_KIND: &str = "cex_baseline_cart";
 const CEX_BASELINE_GATE_REGISTRY_KIND: &str = "cex_baseline_gate";
 const CEX_SUPERVISED_MODEL_REGISTRY_KIND: &str = "cex_supervised_model_candidate";
@@ -90,6 +91,34 @@ const CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V2: &str = "cex-event-replay-receipt-v2";
 const CEX_SUPERVISED_MODEL_SELECTION_SCHEMA_VERSION: &str = "cex-supervised-model-selection-v1";
 // ponytail: fixed batching bounds checkpoint I/O; make it configurable only if recovery data requires it.
 const MCTS_CHECKPOINT_INTERVAL: u64 = 256;
+
+fn research_event_value(
+    component: &str,
+    event: &str,
+    details: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": "monday.research_event.v1",
+        "timestamp": Utc::now().to_rfc3339(),
+        "component": component,
+        "event": event,
+        "details": details,
+    })
+}
+
+pub(crate) fn research_event(component: &str, event: &str, details: serde_json::Value) {
+    eprintln!("{}", research_event_value(component, event, details));
+}
+
+fn evaluation_log_summary(evaluation: &CandidateEvaluation) -> serde_json::Value {
+    serde_json::json!({
+        "passed": evaluation.passed,
+        "score": evaluation.score,
+        "failure_reasons": &evaluation.failure_reasons,
+        "evaluator_version": &evaluation.evaluator_version,
+        "metrics": &evaluation.metrics,
+    })
+}
 
 fn bound_gp_policy(mission: &CexResearchMissionArtifactV1) -> anyhow::Result<CexGpPolicyV1> {
     let binding = &mission.spec.policies.gp;
@@ -284,7 +313,7 @@ impl CexSupervisedModelSelectionV1 {
         self.selected_candidate.validate()?;
         if self.schema_version != CEX_SUPERVISED_MODEL_SELECTION_SCHEMA_VERSION
             || self.mission_id.trim().is_empty()
-            || self.criterion != "passed_then_adjusted_score_desc_ridge_tie_break"
+            || self.criterion != "passed_then_adjusted_score_desc_ridge_cart_burn_tie_break"
             || self.deployment_authority
             || self.order_submission_authority
         {
@@ -491,6 +520,29 @@ pub(crate) fn execute_report(
     args: ExecuteMissionArgs,
     binding: ExecutionBinding,
 ) -> anyhow::Result<ExecutionReport> {
+    let binding_log = match &binding {
+        ExecutionBinding::Direct => serde_json::json!({"kind": "direct_diagnostic"}),
+        ExecutionBinding::Campaign {
+            campaign_id,
+            round_id,
+            request_sha256,
+        } => serde_json::json!({
+            "kind": "campaign",
+            "campaign_id": campaign_id,
+            "round_id": round_id,
+            "request_sha256": request_sha256,
+        }),
+    };
+    research_event(
+        "alpha-harness",
+        "mission_execution_started",
+        serde_json::json!({
+            "requested_mission_id": &args.mission_id,
+            "holdout_id": &args.holdout_id,
+            "build_source_revision": BUILD_SOURCE_REVISION,
+            "binding": binding_log,
+        }),
+    );
     validate_args(&args, &binding)?;
     let client = Client::builder()
         .timeout(Duration::from_secs(120))
@@ -584,9 +636,46 @@ pub(crate) fn execute_report(
         bail!("CEX Research Mission holdout ID does not match the requested holdout ID");
     }
     validate_holdout_claim_binding(&args, &control_mission.spec.holdout.holdout_id, &binding)?;
+    research_event(
+        "alpha-harness",
+        "research_scope_admitted",
+        serde_json::json!({
+            "mission_id": &mission_id,
+            "mission_sha256": &mission_sha256,
+            "objective": &control_mission.spec.objective,
+            "hypotheses": &control_mission.spec.hypotheses,
+            "instrument": &control_mission.spec.instrument,
+            "feature_fields": &control_mission.spec.feature_fields,
+            "search": &control_mission.spec.search,
+            "evaluation_protocol": &control_mission.spec.evaluation_protocol,
+            "policies": &control_mission.spec.policies,
+            "holdout_id": &control_mission.spec.holdout.holdout_id,
+            "supervised_ml": supervised_ml,
+            "binding": match &binding {
+                ExecutionBinding::Direct => serde_json::json!({"kind": "direct_diagnostic"}),
+                ExecutionBinding::Campaign { campaign_id, round_id, request_sha256 } => serde_json::json!({
+                    "kind": "campaign",
+                    "campaign_id": campaign_id,
+                    "round_id": round_id,
+                    "request_sha256": request_sha256,
+                }),
+            },
+        }),
+    );
     let validation = ValidationArgs::from_protocol(&control_mission.spec.evaluation_protocol);
     let engine = EngineChoice::Gp;
 
+    research_event(
+        "alpha-harness",
+        "input_admission_started",
+        serde_json::json!({
+            "mission_id": &mission_id,
+            "feature_sha256": &control_mission.spec.inputs.feature.content_sha256,
+            "materialization_sha256": &control_mission.spec.inputs.materialization.content_sha256,
+            "replay_artifact_sha256": &replay_artifact_sha256,
+            "replay_manifest_sha256": &args.replay_manifest_sha256,
+        }),
+    );
     let (_, feature_sha256) =
         fetch_to_file(&client, &args.feature_url, &feature_path, MAX_FEATURE_BYTES)?;
     let (_, materialization_sha256) = fetch_to_file(
@@ -674,6 +763,24 @@ pub(crate) fn execute_report(
             "feature_manifest_path": &feature_manifest_path,
         }),
     )?;
+    research_event(
+        "alpha-harness",
+        "input_admission_completed",
+        serde_json::json!({
+            "mission_id": &mission_id,
+            "market": &materialization.market,
+            "symbol": &materialization.symbol,
+            "rows": materialization.rows,
+            "series_count": materialization.series_count,
+            "first_event_time": materialization.first_event_time,
+            "last_event_time": materialization.last_event_time,
+            "dataset_manifest_id": &dataset_manifest.manifest_id,
+            "feature_sha256": &feature_sha256,
+            "materialization_sha256": &materialization_sha256,
+            "replay_artifact_sha256": &replay_artifact_sha256,
+            "replay_manifest_sha256": &fetched_replay_manifest_sha256,
+        }),
+    );
     std::fs::copy(
         &materialization_path,
         results_dir.join("materialization.json"),
@@ -788,6 +895,18 @@ pub(crate) fn execute_report(
         max_new_iterations: Some(control_mission.spec.search.max_new_iterations),
         dataset: dataset.clone(),
     };
+    research_event(
+        "alpha-harness",
+        "factor_search_stage_started",
+        serde_json::json!({
+            "mission_id": &mission_id,
+            "engine": "genetic_programming",
+            "gp_policy_id": &gp_policy.policy_id,
+            "gp_policy_schema": &gp_policy.schema_version,
+            "max_candidates": control_mission.spec.search.budget.max_candidates,
+            "multiple_testing_trials": control_mission.spec.search.multiple_testing_trials,
+        }),
+    );
     let mut run_report = mission::execute_governed_gp_mission(
         &run_args,
         false,
@@ -809,10 +928,60 @@ pub(crate) fn execute_report(
         }
     }
     data_mission::write_json_atomic(&results_dir.join("mission-run.json"), &run_report)?;
+    research_event(
+        "alpha-harness",
+        "factor_search_stage_completed",
+        serde_json::json!({
+            "mission_id": &mission_id,
+            "status": &run_report.status,
+            "terminal_reason": &run_report.terminal_reason,
+            "total_iterations": run_report.total_iterations,
+            "new_iterations": run_report.new_iterations,
+            "research_dataset": &run_report.research_dataset,
+            "walk_forward_partition": &run_report.walk_forward_partition,
+        }),
+    );
 
     let mut store = AlphaStore::open(&db)?;
     let lineage = store.mission_lineage(&mission_id)?;
     let factor_bank = build_factor_bank(&control_mission, &gp_policy, &run_report, &lineage)?;
+    for (index, attempt) in factor_bank.attempts.iter().enumerate() {
+        research_event(
+            "alpha-harness",
+            "factor_screening_completed",
+            serde_json::json!({
+                "mission_id": &mission_id,
+                "attempt": index + 1,
+                "attempt_total": factor_bank.attempts.len(),
+                "candidate_id": &attempt.candidate_id,
+                "canonical_ast": &attempt.canonical_ast,
+                "ast_sha256": &attempt.ast_sha256,
+                "post_warmup_coverage_rows": attempt.post_warmup_coverage_rows,
+                "verdict": &attempt.verdict,
+                "rejection_codes": &attempt.rejection_codes,
+                "rejection_details": &attempt.rejection_details,
+                "evaluation": attempt
+                    .evaluation
+                    .as_ref()
+                    .map(|evidence| evaluation_log_summary(&evidence.evidence)),
+            }),
+        );
+    }
+    research_event(
+        "alpha-harness",
+        "factor_bank_completed",
+        serde_json::json!({
+            "mission_id": &mission_id,
+            "revision_id": &factor_bank.revision_id,
+            "attempted_factors": factor_bank.attempts.len(),
+            "accepted_factors": factor_bank.entries.len(),
+            "accepted_factor_ids": factor_bank
+                .entries
+                .iter()
+                .map(|entry| entry.factor_id.as_str())
+                .collect::<Vec<_>>(),
+        }),
+    );
     let factor_bank_payload = serde_json::to_value(&factor_bank)?;
     store.put_registry_revision(&RegistryRevision {
         revision_id: factor_bank.revision_id.clone(),
@@ -832,6 +1001,31 @@ pub(crate) fn execute_report(
     }
     let baseline_dataset = prepare_dataset(baseline_rows, &evaluation_protocol)?;
     let baseline_context = baseline_dataset.engine_context();
+    research_event(
+        "alpha-harness",
+        "baseline_training_started",
+        serde_json::json!({
+            "mission_id": &mission_id,
+            "factor_bank_revision_id": &factor_bank.revision_id,
+            "factor_count": factor_bank.entries.len(),
+            "rows": baseline_context.rows().len(),
+            "walk_forward_folds": baseline_context.folds().len(),
+            "models": if supervised_ml {
+                serde_json::json!(["ridge", "shallow_cart", "burn_mlp"])
+            } else {
+                serde_json::json!(["ridge", "shallow_cart"])
+            },
+        }),
+    );
+    let burn_venue = format!(
+        "{}-{}",
+        control_mission.spec.instrument.venue.as_str(),
+        control_mission.spec.instrument.market.as_str()
+    );
+    let burn_identity = supervised_ml.then_some(CexBurnFitIdentity {
+        symbol: control_mission.spec.instrument.symbol.as_str(),
+        venue: burn_venue.as_str(),
+    });
     let baseline_run = evaluate_cex_baselines(
         &baseline_context,
         &factor_bank,
@@ -839,8 +1033,36 @@ pub(crate) fn execute_report(
         &mission_id,
         baseline_target,
         &control_mission.spec.policies.evaluation,
+        burn_identity,
     )
     .map_err(anyhow::Error::msg)?;
+    for (name, artifact) in [
+        ("ridge", baseline_run.ridge.as_ref()),
+        ("shallow_cart", baseline_run.cart.as_ref()),
+        ("burn_mlp", baseline_run.burn.as_ref()),
+    ] {
+        research_event(
+            "alpha-harness",
+            "baseline_model_completed",
+            serde_json::json!({
+                "mission_id": &mission_id,
+                "model": name,
+                "artifact_id": artifact.map(|value| value.artifact_id.as_str()),
+                "factor_ids": artifact.map(|value| &value.factor_ids),
+                "evaluation": artifact.map(|value| evaluation_log_summary(&value.evaluation)),
+            }),
+        );
+    }
+    research_event(
+        "alpha-harness",
+        "baseline_gate_completed",
+        serde_json::json!({
+            "mission_id": &mission_id,
+            "gate_id": &baseline_run.gate.gate_id,
+            "passed": baseline_run.gate.passed,
+            "failure_codes": &baseline_run.gate.failure_codes,
+        }),
+    );
     persist_baseline_evidence(
         &mut store,
         &results_dir,
@@ -884,6 +1106,25 @@ pub(crate) fn execute_report(
             )
         })
         .transpose()?;
+    if supervised_ml && supervised_replay_report.is_none() {
+        research_event(
+            "alpha-harness",
+            "event_replay_skipped",
+            serde_json::json!({
+                "mission_id": &mission_id,
+                "reason": supervised_model.as_ref().map_or(
+                    "no_supervised_model",
+                    |_| "supervised_model_gate_failed"
+                ),
+                "selected_candidate_id": supervised_model
+                    .as_ref()
+                    .map(|evaluation| evaluation.candidate.artifact_id.as_str()),
+                "model_passed": supervised_model
+                    .as_ref()
+                    .map(|evaluation| evaluation.candidate.evaluation.passed),
+            }),
+        );
+    }
     if let Some(receipt) = &supervised_replay_report {
         store.put_registry_revision(&RegistryRevision {
             revision_id: receipt.receipt_id.clone(),
@@ -974,6 +1215,8 @@ pub(crate) fn execute_report(
         _ => None,
     };
     let lineage = store.mission_lineage(&mission_id)?;
+    let candidate_count = lineage.candidates.len();
+    let evaluation_count = lineage.evaluations.len();
     let checkpoint = match store.get_checkpoint(&mission_id) {
         Ok(checkpoint) => Some(checkpoint),
         Err(StoreError::NotFound) => None,
@@ -998,9 +1241,27 @@ pub(crate) fn execute_report(
         }),
     )?;
     drop(store);
+    research_event(
+        "alpha-harness",
+        "result_bundle_started",
+        serde_json::json!({
+            "mission_id": &mission_id,
+            "candidate_count": candidate_count,
+            "evaluation_count": evaluation_count,
+        }),
+    );
     create_bundle(&args.work_dir, &bundle, [&results_dir, &artifact_dir])?;
     let bundle_bytes = checked_result_bundle_bytes(&bundle)?;
     let bundle_sha256 = sha256_file(&bundle)?;
+    research_event(
+        "alpha-harness",
+        "result_publish_started",
+        serde_json::json!({
+            "mission_id": &mission_id,
+            "bundle_bytes": bundle_bytes,
+            "bundle_sha256": &bundle_sha256,
+        }),
+    );
     publish_result(&client, &args.result_put_url, &bundle)?;
     let readback_bundle = input_dir.join("published-result-readback.zip");
     let (_, readback_sha256) = fetch_to_file(
@@ -1012,7 +1273,17 @@ pub(crate) fn execute_report(
     if readback_sha256 != bundle_sha256 {
         bail!("published CEX result readback SHA256 mismatch");
     }
-    Ok(ExecutionReport {
+    research_event(
+        "alpha-harness",
+        "result_readback_completed",
+        serde_json::json!({
+            "mission_id": &mission_id,
+            "bundle_bytes": bundle_bytes,
+            "bundle_sha256": &bundle_sha256,
+            "readback_bundle_sha256": &readback_sha256,
+        }),
+    );
+    let report = ExecutionReport {
         mission_id,
         mission_sha256,
         campaign_id,
@@ -1052,7 +1323,25 @@ pub(crate) fn execute_report(
         promotion_id: finalization
             .as_ref()
             .and_then(|report| report.promotion_id.clone()),
-    })
+    };
+    research_event(
+        "alpha-harness",
+        "mission_execution_completed",
+        serde_json::json!({
+            "mission_id": &report.mission_id,
+            "campaign_id": &report.campaign_id,
+            "round_id": &report.round_id,
+            "engine": report.engine,
+            "bundle_sha256": &report.bundle_sha256,
+            "supervised_candidate_id": &report.supervised_candidate_id,
+            "supervised_replay_receipt_id": &report.supervised_replay_receipt_id,
+            "supervised_replay_gate_passed": report.supervised_replay_gate_passed,
+            "legacy_replay_receipt_id": &report.replay_receipt_id,
+            "legacy_replay_gate_passed": report.replay_gate_passed,
+            "sealed_passed": report.sealed_passed,
+        }),
+    );
+    Ok(report)
 }
 
 fn ensure_promotable_cex_costs(costs: &EvaluationCostsV1) -> anyhow::Result<()> {
@@ -1475,6 +1764,7 @@ pub(crate) fn finalize_existing_search_round(
     let baselines = alpha_engine::baselines::CexBaselineRun {
         ridge: Some(ridge),
         cart: Some(cart),
+        burn: None,
         gate,
     };
     finalize_cex_candidate(
@@ -1595,10 +1885,15 @@ fn persist_baseline_evidence(
     factor_bank: &CexFactorBankRevisionV2,
     run: &alpha_engine::baselines::CexBaselineRun,
 ) -> anyhow::Result<()> {
-    let alpha_engine::baselines::CexBaselineRun { ridge, cart, gate } = run;
+    let alpha_engine::baselines::CexBaselineRun {
+        ridge,
+        cart,
+        burn,
+        gate,
+    } = run;
     let asset_id = control_mission.spec.instrument.symbol.clone();
     if factor_bank.entries.is_empty() {
-        if ridge.is_some() || cart.is_some() {
+        if ridge.is_some() || cart.is_some() || burn.is_some() {
             bail!("empty Factor Bank baseline evaluation returned model artifacts");
         }
         gate.validate_binding(control_mission, baseline_policy, factor_bank, None, None)?;
@@ -1657,6 +1952,18 @@ fn persist_baseline_evidence(
     }
     data_mission::write_json_atomic(&results_dir.join("ridge-baseline.json"), ridge)?;
     data_mission::write_json_atomic(&results_dir.join("cart-baseline.json"), cart)?;
+    if let Some(burn) = burn {
+        burn.validate_binding(control_mission, baseline_policy, factor_bank)?;
+        store.put_registry_revision(&RegistryRevision {
+            revision_id: burn.artifact_id.clone(),
+            registry_kind: CEX_BASELINE_BURN_REGISTRY_KIND.to_string(),
+            asset_id: asset_id.clone(),
+            parent_revision_id: Some(factor_bank.revision_id.clone()),
+            payload: serde_json::to_value(burn)?,
+            created_at: Utc::now(),
+        })?;
+        data_mission::write_json_atomic(&results_dir.join("burn-mlp-baseline.json"), burn)?;
+    }
     data_mission::write_json_atomic(&results_dir.join("baseline-gate.json"), gate)?;
     Ok(())
 }
@@ -1669,17 +1976,41 @@ fn run_cex_supervised_model_research(
     context: &EngineContext<'_>,
     baselines: &alpha_engine::baselines::CexBaselineRun,
 ) -> anyhow::Result<Option<CexSupervisedModelEvaluationV1>> {
-    let (Some(ridge), Some(cart)) = (&baselines.ridge, &baselines.cart) else {
+    let (Some(ridge), Some(cart), Some(burn)) =
+        (&baselines.ridge, &baselines.cart, &baselines.burn)
+    else {
         if factor_bank.entries.is_empty() {
+            research_event(
+                "alpha-harness",
+                "supervised_training_skipped",
+                serde_json::json!({
+                    "mission_id": mission.semantic_id()?,
+                    "reason": "empty_factor_bank",
+                }),
+            );
             return Ok(None);
         }
-        bail!("non-empty Factor Bank is missing supervised baseline models");
+        bail!("non-empty Factor Bank is missing supervised Ridge, CART, or Burn MLP models");
     };
+    research_event(
+        "alpha-harness",
+        "supervised_training_started",
+        serde_json::json!({
+            "mission_id": mission.semantic_id()?,
+            "factor_bank_revision_id": &factor_bank.revision_id,
+            "factor_count": factor_bank.entries.len(),
+            "models": ["ridge", "shallow_cart", "burn_mlp"],
+            "rows": context.rows().len(),
+            "walk_forward_folds": context.folds().len(),
+        }),
+    );
     let ridge =
         evaluate_cex_supervised_model(context, factor_bank, ridge).map_err(anyhow::Error::msg)?;
     let cart =
         evaluate_cex_supervised_model(context, factor_bank, cart).map_err(anyhow::Error::msg)?;
-    for (name, evaluation) in [("ridge", &ridge), ("cart", &cart)] {
+    let burn =
+        evaluate_cex_supervised_model(context, factor_bank, burn).map_err(anyhow::Error::msg)?;
+    for (name, evaluation) in [("ridge", &ridge), ("cart", &cart), ("burn_mlp", &burn)] {
         evaluation.validate().map_err(anyhow::Error::msg)?;
         store.put_registry_revision(&RegistryRevision {
             revision_id: evaluation.candidate.artifact_id.clone(),
@@ -1697,23 +2028,29 @@ fn run_cex_supervised_model_research(
             &results_dir.join(format!("{name}-supervised-candidate.json")),
             &evaluation.candidate,
         )?;
+        research_event(
+            "alpha-harness",
+            "supervised_model_completed",
+            serde_json::json!({
+                "mission_id": &evaluation.candidate.mission_id,
+                "model": name,
+                "model_kind": &evaluation.candidate.model_kind,
+                "candidate_id": &evaluation.candidate.artifact_id,
+                "model_artifact": &evaluation.candidate.model_artifact,
+                "predictions_sha256": &evaluation.candidate.predictions_sha256,
+                "target_positions_sha256": &evaluation.candidate.target_positions_sha256,
+                "ledger_rows": evaluation.report.ledger.len(),
+                "final_equity": evaluation.report.ledger.last().map(|point| point.equity),
+                "equity_ledger_artifact": format!("{name}-supervised-backtest.json"),
+                "evaluation": evaluation_log_summary(&evaluation.candidate.evaluation),
+            }),
+        );
     }
-    let ridge_is_selected = if ridge.candidate.evaluation.passed != cart.candidate.evaluation.passed
-    {
-        ridge.candidate.evaluation.passed
-    } else {
-        !ridge
-            .candidate
-            .evaluation
-            .score
-            .total_cmp(&cart.candidate.evaluation.score)
-            .is_lt()
-    };
-    let selected = if ridge_is_selected { ridge } else { cart };
+    let selected = select_supervised_model(ridge, cart, burn);
     let selection = CexSupervisedModelSelectionV1 {
         schema_version: CEX_SUPERVISED_MODEL_SELECTION_SCHEMA_VERSION.to_string(),
         mission_id: selected.candidate.mission_id.clone(),
-        criterion: "passed_then_adjusted_score_desc_ridge_tie_break".to_string(),
+        criterion: "passed_then_adjusted_score_desc_ridge_cart_burn_tie_break".to_string(),
         selected_candidate: content_reference(
             &selected.candidate.artifact_id,
             &selected.candidate,
@@ -1727,7 +2064,72 @@ fn run_cex_supervised_model_research(
         &results_dir.join("supervised-model-selection.json"),
         &selection,
     )?;
+    research_event(
+        "alpha-harness",
+        "supervised_model_selected",
+        serde_json::json!({
+            "mission_id": &selection.mission_id,
+            "criterion": &selection.criterion,
+            "selected_candidate": &selection.selected_candidate,
+            "model_kind": &selected.candidate.model_kind,
+            "passed": selected.candidate.evaluation.passed,
+            "replay_eligible": selection.replay_eligible,
+            "deployment_authority": selection.deployment_authority,
+            "order_submission_authority": selection.order_submission_authority,
+        }),
+    );
     Ok(Some(selected))
+}
+
+fn select_supervised_model(
+    ridge: CexSupervisedModelEvaluationV1,
+    cart: CexSupervisedModelEvaluationV1,
+    burn: CexSupervisedModelEvaluationV1,
+) -> CexSupervisedModelEvaluationV1 {
+    let mut selected = ridge;
+    if supervised_model_ranks_ahead(&cart, &selected) {
+        selected = cart;
+    }
+    if supervised_model_ranks_ahead(&burn, &selected) {
+        selected = burn;
+    }
+    selected
+}
+
+fn supervised_model_ranks_ahead(
+    left: &CexSupervisedModelEvaluationV1,
+    right: &CexSupervisedModelEvaluationV1,
+) -> bool {
+    match left
+        .candidate
+        .evaluation
+        .passed
+        .cmp(&right.candidate.evaluation.passed)
+    {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => match left
+            .candidate
+            .evaluation
+            .score
+            .total_cmp(&right.candidate.evaluation.score)
+        {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            std::cmp::Ordering::Equal => {
+                supervised_model_kind_rank(left.candidate.model_kind)
+                    < supervised_model_kind_rank(right.candidate.model_kind)
+            }
+        },
+    }
+}
+
+fn supervised_model_kind_rank(kind: CexBaselineModelKindV1) -> u8 {
+    match kind {
+        CexBaselineModelKindV1::Ridge => 0,
+        CexBaselineModelKindV1::ShallowCart => 1,
+        CexBaselineModelKindV1::BurnMlp => 2,
+    }
 }
 
 fn run_factor_bank_subset_search(
@@ -2003,6 +2405,28 @@ fn run_cex_target_position_replay(
         capacity_depth_levels: candidate.capacity_depth_levels,
         trade_tape_declared: false,
     };
+    research_event(
+        "alpha-harness",
+        "event_replay_started",
+        serde_json::json!({
+            "mission_id": mission_id,
+            "candidate": &candidate.reference,
+            "decision_scope": candidate.decision_scope,
+            "research_decision_count": candidate.research_decision_count,
+            "canonical_decision_count": decisions.len(),
+            "first_decision_time_us": first_decision_time,
+            "last_decision_time_us": last_decision_time,
+            "replay_artifact_sha256": replay_artifact_sha256,
+            "replay_manifest_sha256": &replay_manifest_sha256,
+            "replay_config": &replay_config,
+            "limitations": {
+                "queue_position": false,
+                "partial_fills": false,
+                "market_impact": false,
+                "true_capacity": false,
+            },
+        }),
+    );
     let (replay_evidence, metrics) = verify_and_replay_canonical_target_positions(
         replay_artifact_path,
         replay_manifest_path,
@@ -2122,6 +2546,20 @@ fn run_cex_target_position_replay(
     }
     .finalize()?;
     data_mission::write_json_atomic(&results_dir.join(receipt_name), &receipt)?;
+    research_event(
+        "alpha-harness",
+        "event_replay_completed",
+        serde_json::json!({
+            "mission_id": mission_id,
+            "candidate": &receipt.strategy,
+            "receipt_id": &receipt.receipt_id,
+            "receipt_artifact": receipt_name,
+            "decision_scope": &receipt.decision_scope,
+            "metrics": &receipt.metrics,
+            "gate": &receipt.gate,
+            "capabilities": &receipt.capabilities,
+        }),
+    );
     Ok(receipt)
 }
 
@@ -3455,6 +3893,28 @@ pub(crate) mod tests {
     use alpha_engine::engines::{CexCombinationResearchArtifactV1, CexFactorBankMctsResultV1};
     use alpha_store::ApprovalRecord;
     use ed25519_dalek::SigningKey;
+
+    #[test]
+    fn research_event_has_stable_structured_contract() {
+        let event = research_event_value(
+            "alpha-harness",
+            "model_completed",
+            serde_json::json!({"mission_id": "mission-1", "passed": false}),
+        );
+        assert_eq!(
+            event["schema_version"],
+            serde_json::json!("monday.research_event.v1")
+        );
+        assert_eq!(event["component"], serde_json::json!("alpha-harness"));
+        assert_eq!(event["event"], serde_json::json!("model_completed"));
+        assert_eq!(
+            event["details"]["mission_id"],
+            serde_json::json!("mission-1")
+        );
+        assert!(event["timestamp"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+    }
 
     fn cex_triplet(byte: char) -> hft_research_manifest::CexArtifactTripletV2 {
         hft_research_manifest::CexArtifactTripletV2 {
@@ -5966,6 +6426,7 @@ pub(crate) mod tests {
             &fixture.mission.semantic_id().unwrap(),
             fixture.mission.spec.hypotheses[0].target.clone(),
             &fixture.mission.spec.policies.evaluation,
+            None,
         )
         .unwrap();
         assert!(!failed_baselines.gate.passed);

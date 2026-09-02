@@ -19,8 +19,17 @@ log() {
   printf '%s\n' "$*" >&2
 }
 
+run_id=unknown
+current_stage=preflight
+
 stage_event() {
-  log "event=$1 run_id=$run_id stage=$2 current=$3 total=$4"
+  event=$1
+  stage=$2
+  current=$3
+  total=$4
+  shift 4
+  current_stage=$stage
+  log "schema_version=monday.research_event.v1 component=cex-materialization event=$event run_id=$run_id stage=$stage current=$current total=$total $*"
 }
 
 progress_event() {
@@ -28,12 +37,14 @@ progress_event() {
   progress_current=$2
   progress_total=$3
   progress_interval=$4
+  shift 4
   if [ "$progress_current" -eq "$progress_total" ] || [ $((progress_current % progress_interval)) -eq 0 ]; then
-    stage_event stage_progress "$progress_stage" "$progress_current" "$progress_total"
+    stage_event stage_progress "$progress_stage" "$progress_current" "$progress_total" "$@"
   fi
 }
 
 die() {
+  log "schema_version=monday.research_event.v1 component=cex-materialization event=run_failed run_id=$run_id stage=$current_stage reason=$*"
   log "breach: $*"
   exit 1
 }
@@ -162,6 +173,7 @@ publish_verified_file() {
   publish_destination=$3
   publish_expected_sha=$4
   publish_temporary=$publish_destination.$$.tmp
+  log "schema_version=monday.research_event.v1 component=cex-materialization event=artifact_publish_start run_id=$run_id stage=publish artifact=$publish_label sha256=$publish_expected_sha"
   [ -f "$publish_source" ] || die "$publish_label source is missing: $publish_source"
   [ "$(sha256_file "$publish_source")" = "$publish_expected_sha" ] || die "$publish_label source SHA mismatch"
   [ ! -e "$publish_destination" ] || die "$publish_label destination already exists: $publish_destination"
@@ -180,6 +192,7 @@ publish_verified_file() {
   fi
   [ -f "$publish_destination" ] || die "$publish_label was not published: $publish_destination"
   [ "$(sha256_file "$publish_destination")" = "$publish_expected_sha" ] || die "$publish_label published readback SHA mismatch"
+  log "schema_version=monday.research_event.v1 component=cex-materialization event=artifact_publish_complete run_id=$run_id stage=publish artifact=$publish_label sha256=$publish_expected_sha"
 }
 
 rewrite_materialization_artifact_path() {
@@ -408,7 +421,7 @@ fi
   [ -x "$REPLAY_BIN" ] || die "replay binary is not executable: $REPLAY_BIN"
 }
 
-log "event=run_start run_id=$run_id raw_segments=$raw_segment_count references=$reference_count dry_run=$DRY_RUN"
+log "schema_version=monday.research_event.v1 component=cex-materialization event=run_start run_id=$run_id mission_id=$mission_id market=$market symbol=$symbol bucket_ms=$bucket_ms label_horizon_buckets=$label_horizon_buckets top_depth=$top_depth raw_segments=$raw_segment_count references=$reference_count source_revision=$source_revision image_ref=$image_ref inventory_sha256=$inventory_sha256 dry_run=$DRY_RUN"
 stage_event stage_start raw_verification 0 "$raw_segment_count"
 i=1
 while [ "$i" -le "$raw_segment_count" ]; do
@@ -423,7 +436,7 @@ while [ "$i" -le "$raw_segment_count" ]; do
   printf '%s\n' "$data" >"$STATE_ROOT/raw-segment-$i.path"
   printf '%s\n' "$sha" >"$STATE_ROOT/raw-segment-$i.sha256"
   printf '%s\n' "$manifest_sha" >"$STATE_ROOT/raw-segment-$i.manifest-sha256"
-  progress_event raw_verification "$i" "$raw_segment_count" 10
+  progress_event raw_verification "$i" "$raw_segment_count" 10 "last_index=$i content_sha256=$sha manifest_sha256=$manifest_sha"
   i=$((i + 1))
 done
 stage_event stage_complete raw_verification "$raw_segment_count" "$raw_segment_count"
@@ -446,7 +459,7 @@ while [ "$i" -le "$reference_count" ]; do
   printf '%s\n' "$data" >"$STATE_ROOT/reference-$i.path"
   printf '%s\n' "$sha" >"$STATE_ROOT/reference-$i.sha256"
   printf '%s\n' "$manifest_sha" >"$STATE_ROOT/reference-$i.manifest-sha256"
-  progress_event reference_verification "$i" "$reference_count" 50
+  progress_event reference_verification "$i" "$reference_count" 50 "last_index=$i data_sha256=$sha manifest_sha256=$manifest_sha"
   i=$((i + 1))
 done
 stage_event stage_complete reference_verification "$reference_count" "$reference_count"
@@ -466,7 +479,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
   printf '  "raw_segment_count": %s,\n' "$raw_segment_count"
   printf '  "reference_count": %s\n' "$reference_count"
   printf '}\n'
-  log "event=run_complete run_id=$run_id mode=dry_run"
+  log "schema_version=monday.research_event.v1 component=cex-materialization event=run_complete run_id=$run_id mode=dry_run inventory_sha256=$inventory_sha256"
   exit 0
 fi
 
@@ -476,7 +489,9 @@ while [ "$i" -le "$raw_segment_count" ]; do
   raw_path=$(cat "$STATE_ROOT/raw-segment-$i.path")
   slice_dir=$SLICE_ROOT/segment-$i
   mkdir -p "$slice_dir"
-  "$SLICER_BIN" --segment "$raw_path" --output-dir "$slice_dir" --symbols "$symbol" >"$STATE_ROOT/slicer-$i.json"
+  if ! "$SLICER_BIN" --segment "$raw_path" --output-dir "$slice_dir" --symbols "$symbol" >"$STATE_ROOT/slicer-$i.json"; then
+    die "slicer failed for segment $i"
+  fi
   slice_path=$(single_file "$slice_dir" '*.jsonl.zst')
   slice_manifest=$slice_path.manifest.json
   slice_success=$slice_path._SUCCESS
@@ -489,7 +504,7 @@ while [ "$i" -le "$raw_segment_count" ]; do
   printf '%s\n' "$slice_path" >"$STATE_ROOT/slice-$i.path"
   printf '%s\n' "$slice_sha" >"$STATE_ROOT/slice-$i.sha256"
   printf '%s\n' "$slice_manifest_sha" >"$STATE_ROOT/slice-$i.manifest-sha256"
-  progress_event slicing "$i" "$raw_segment_count" 10
+  progress_event slicing "$i" "$raw_segment_count" 10 "last_index=$i slice_sha256=$slice_sha manifest_sha256=$slice_manifest_sha state_file=slicer-$i.json"
   i=$((i + 1))
 done
 stage_event stage_complete slicing "$raw_segment_count" "$raw_segment_count"
@@ -520,7 +535,9 @@ while [ "$i" -le "$reference_count" ]; do
   i=$((i + 1))
 done
 stage_event stage_start pit_materialization 0 1
-"$@" >"$pit_stdout"
+if ! "$@" >"$pit_stdout"; then
+  die "PIT materializer failed"
+fi
 
 feature_path=$(json_string_field artifact_path "$pit_stdout")
 feature_sha=$(json_string_field artifact_sha256 "$pit_stdout")
@@ -539,7 +556,7 @@ materialization_rewritten_path=$LOCAL_MATERIALIZATION_DIR/$materialization_sha.m
 mv "$rewritten_materialization" "$materialization_rewritten_path"
 rm -f "$materialization_path"
 materialization_path=$materialization_rewritten_path
-stage_event stage_complete pit_materialization 1 1
+stage_event stage_complete pit_materialization 1 1 "feature_sha256=$feature_sha materialization_sha256=$materialization_sha"
 
 replay_stdout=$STATE_ROOT/replay-materializer.json
 set -- "$REPLAY_BIN" \
@@ -556,7 +573,9 @@ while [ "$i" -le "$raw_segment_count" ]; do
   i=$((i + 1))
 done
 stage_event stage_start replay_materialization 0 1
-"$@" >"$replay_stdout"
+if ! "$@" >"$replay_stdout"; then
+  die "replay materializer failed"
+fi
 
 replay_manifest_path=$(json_string_field manifest_path "$replay_stdout")
 replay_manifest_sha=$(json_string_field manifest_sha256 "$replay_stdout")
@@ -567,7 +586,7 @@ replay_artifact_path=$LOCAL_REPLAY_DIR/$replay_artifact_rel
 [ -f "$replay_manifest_path" ] || die "replay manifest is missing: $replay_manifest_path"
 [ "$(sha256_file "$replay_artifact_path")" = "$replay_artifact_sha" ] || die "replay artifact readback SHA mismatch"
 [ "$(sha256_file "$replay_manifest_path")" = "$replay_manifest_sha" ] || die "replay manifest readback SHA mismatch"
-stage_event stage_complete replay_materialization 1 1
+stage_event stage_complete replay_materialization 1 1 "replay_artifact_sha256=$replay_artifact_sha replay_manifest_sha256=$replay_manifest_sha"
 
 materialization_publish_path=$(published_path_for "$materialization_path" "$LOCAL_MATERIALIZATION_DIR" "$MATERIALIZATION_DIR" "materialization report")
 replay_artifact_publish_path=$(published_path_for "$replay_artifact_path" "$LOCAL_REPLAY_DIR" "$REPLAY_DIR" "replay artifact")
@@ -634,16 +653,16 @@ campaign_inputs_sha=$(sha256_file "$LOCAL_RECEIPT_DIR/campaign-inputs.json")
 } >"$LOCAL_RECEIPT_DIR/materialization-receipt.json"
 
 materialization_receipt_sha=$(sha256_file "$LOCAL_RECEIPT_DIR/materialization-receipt.json")
-stage_event stage_complete receipt_build 1 1
+stage_event stage_complete receipt_build 1 1 "campaign_inputs_sha256=$campaign_inputs_sha materialization_receipt_sha256=$materialization_receipt_sha"
 stage_event stage_start publish 0 1
 mkdir -p "$MATERIALIZATION_DIR" "$REPLAY_DIR" "$RECEIPT_DIR"
-publish_verified_file "feature artifact" "$feature_path" "$feature_publish_path" "$feature_sha"
-publish_verified_file "materialization report" "$materialization_path" "$materialization_publish_path" "$materialization_sha"
-publish_verified_file "replay artifact" "$replay_artifact_path" "$replay_artifact_publish_path" "$replay_artifact_sha"
-publish_verified_file "replay manifest" "$replay_manifest_path" "$replay_manifest_publish_path" "$replay_manifest_sha"
-publish_verified_file "frozen inventory" "$LOCAL_RECEIPT_DIR/frozen-inventory.env" "$RECEIPT_DIR/frozen-inventory.env" "$inventory_sha256"
-publish_verified_file "campaign inputs" "$LOCAL_RECEIPT_DIR/campaign-inputs.json" "$RECEIPT_DIR/campaign-inputs.json" "$campaign_inputs_sha"
-publish_verified_file "materialization receipt" "$LOCAL_RECEIPT_DIR/materialization-receipt.json" "$RECEIPT_DIR/materialization-receipt.json" "$materialization_receipt_sha"
-stage_event stage_complete publish 1 1
+publish_verified_file feature_artifact "$feature_path" "$feature_publish_path" "$feature_sha"
+publish_verified_file materialization_report "$materialization_path" "$materialization_publish_path" "$materialization_sha"
+publish_verified_file replay_artifact "$replay_artifact_path" "$replay_artifact_publish_path" "$replay_artifact_sha"
+publish_verified_file replay_manifest "$replay_manifest_path" "$replay_manifest_publish_path" "$replay_manifest_sha"
+publish_verified_file frozen_inventory "$LOCAL_RECEIPT_DIR/frozen-inventory.env" "$RECEIPT_DIR/frozen-inventory.env" "$inventory_sha256"
+publish_verified_file campaign_inputs "$LOCAL_RECEIPT_DIR/campaign-inputs.json" "$RECEIPT_DIR/campaign-inputs.json" "$campaign_inputs_sha"
+publish_verified_file materialization_receipt "$LOCAL_RECEIPT_DIR/materialization-receipt.json" "$RECEIPT_DIR/materialization-receipt.json" "$materialization_receipt_sha"
+stage_event stage_complete publish 1 1 "artifact_count=7 campaign_inputs_sha256=$campaign_inputs_sha materialization_receipt_sha256=$materialization_receipt_sha"
 
-log "event=run_complete run_id=$run_id feature_sha256=$feature_sha materialization_sha256=$materialization_sha replay_artifact_sha256=$replay_artifact_sha replay_manifest_sha256=$replay_manifest_sha"
+log "schema_version=monday.research_event.v1 component=cex-materialization event=run_complete run_id=$run_id mission_id=$mission_id feature_sha256=$feature_sha materialization_sha256=$materialization_sha replay_artifact_sha256=$replay_artifact_sha replay_manifest_sha256=$replay_manifest_sha campaign_inputs_sha256=$campaign_inputs_sha materialization_receipt_sha256=$materialization_receipt_sha"

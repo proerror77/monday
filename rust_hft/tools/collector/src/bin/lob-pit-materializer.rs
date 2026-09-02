@@ -23,6 +23,7 @@ use hft_research_manifest::{
 };
 use rust_decimal::{prelude::ToPrimitive, Decimal};
 use serde::Serialize;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -157,6 +158,19 @@ struct RuleObservation {
     triplet: CexArtifactTripletV2,
 }
 
+fn log_event(event: &str, details: Value) {
+    eprintln!(
+        "{}",
+        json!({
+            "schema_version": "monday.research_event.v1",
+            "timestamp": Utc::now().to_rfc3339(),
+            "component": "lob-pit-materializer",
+            "event": event,
+            "details": details,
+        })
+    );
+}
+
 struct Replay {
     bucket_ns: u64,
     depth: usize,
@@ -283,7 +297,42 @@ impl Replay {
 }
 
 fn main() -> Result<()> {
-    let published = materialize(&Args::parse())?;
+    let args = Args::parse();
+    log_event(
+        "pit_materialization_started",
+        json!({
+            "mission_id": &args.mission_id,
+            "market": args.market.as_str(),
+            "symbol": &args.symbol,
+            "bucket_ms": args.bucket_ms,
+            "label_horizon_buckets": args.label_horizon_buckets,
+            "top_depth": args.top_depth,
+            "segment_count": args.segment.len(),
+            "reference_count": args.reference_data.len(),
+        }),
+    );
+    let published = materialize(&args).inspect_err(|_| {
+        log_event(
+            "pit_materialization_failed",
+            json!({"reason_code": "materialization_failed"}),
+        );
+    })?;
+    log_event(
+        "pit_materialization_completed",
+        json!({
+            "mission_id": &published.report.mission_id,
+            "market": &published.report.market,
+            "symbol": &published.report.symbol,
+            "source_revision": &published.report.source_revision,
+            "series_count": published.report.series_count,
+            "rows": published.report.rows,
+            "first_event_time": published.report.first_event_time,
+            "last_event_time": published.report.last_event_time,
+            "artifact_sha256": &published.report.artifact_sha256,
+            "snapshot_sha256": &published.report.snapshot_sha256,
+            "report_sha256": &published.report_sha256,
+        }),
+    );
     serde_json::to_writer_pretty(std::io::stdout().lock(), &published)?;
     println!();
     Ok(())
@@ -301,7 +350,18 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
     if args.market != Market::Usdm {
         bail!("credential-free canonical materialization currently supports USD-M only");
     }
+    log_event(
+        "segment_verification_started",
+        json!({"segment_count": args.segment.len()}),
+    );
     let (verified_series, segment_paths) = verify_segments(args)?;
+    log_event(
+        "segment_verification_completed",
+        json!({
+            "segment_count": args.segment.len(),
+            "verified_series_count": verified_series.len(),
+        }),
+    );
     if verified_series.iter().any(|series| {
         series
             .verified()
@@ -319,7 +379,11 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
     let mut replay = Replay::new(bucket_ns, args.top_depth);
     let mut aggregate_trades = Vec::new();
     let mut has_aggregate_trades = None;
-    for series in &verified_series {
+    log_event(
+        "lob_replay_started",
+        json!({"verified_series_count": verified_series.len(), "symbol": &symbol}),
+    );
+    for (series_index, series) in verified_series.iter().enumerate() {
         let verified = series.verified();
         let book = verified
             .replayed_books()
@@ -349,8 +413,28 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
                 .cloned(),
         );
         replay.consume(book.events())?;
+        log_event(
+            "lob_replay_progress",
+            json!({
+                "completed_series": series_index + 1,
+                "total_series": verified_series.len(),
+                "session_id": series.session_id(),
+                "book_events": book.events().len(),
+                "samples": replay.samples.len(),
+                "aggregate_trades": aggregate_trades.len(),
+            }),
+        );
     }
     let has_aggregate_trades = has_aggregate_trades.unwrap_or(false);
+    log_event(
+        "lob_replay_completed",
+        json!({
+            "series_count": verified_series.len(),
+            "samples": replay.samples.len(),
+            "aggregate_trades": aggregate_trades.len(),
+            "has_aggregate_trades": has_aggregate_trades,
+        }),
+    );
 
     let revision = source_revision(&source_segments);
     let created_at = Utc::now();
@@ -365,6 +449,14 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         format!("binance-{}-lob", args.market.as_str()),
         revision.clone(),
     )]);
+    log_event(
+        "pit_feature_rows_started",
+        json!({
+            "samples": replay.samples.len(),
+            "aggregate_trades": aggregate_trades.len(),
+            "has_aggregate_trades": has_aggregate_trades,
+        }),
+    );
     let rows = materialize_rows(
         &replay.samples,
         &aggregate_trades,
@@ -374,6 +466,10 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         &symbol,
         ingestion_time,
     )?;
+    log_event(
+        "pit_feature_rows_completed",
+        json!({"rows": rows.len(), "source_revision": &revision}),
+    );
     let artifact_bytes = encode_rows(&rows)?;
     let artifact_sha256 = hex::encode(Sha256::digest(&artifact_bytes));
     let artifact_path = args.artifact_dir.join(format!("{artifact_sha256}.jsonl"));
@@ -395,6 +491,14 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
             .context("label horizon overflow")?,
         )
         .context("label availability time overflows")?;
+    log_event(
+        "reference_binding_started",
+        json!({
+            "reference_count": args.reference_data.len(),
+            "first_event_time": first_event_time,
+            "label_available_through": label_available_through,
+        }),
+    );
     let (instrument_rules, series) = bind_usdm_reference(
         args,
         &symbol,
@@ -402,6 +506,15 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         first_event_time,
         label_available_through,
     )?;
+    log_event(
+        "reference_binding_completed",
+        json!({
+            "reference_count": args.reference_data.len(),
+            "replay_series_count": series.len(),
+            "rules_available_at": instrument_rules.available_at,
+            "rules_valid_through": instrument_rules.valid_through,
+        }),
+    );
     let snapshot = CexReplaySnapshotV5 {
         schema_version: CEX_REPLAY_SNAPSHOT_SCHEMA_V5.to_string(),
         venue: "binance".to_string(),
@@ -437,7 +550,15 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         series,
     };
     snapshot.validate().map_err(anyhow::Error::new)?;
+    log_event(
+        "pit_artifact_publish_started",
+        json!({"artifact_sha256": &artifact_sha256, "rows": rows.len()}),
+    );
     publish_immutable(&artifact_path, &artifact_bytes)?;
+    log_event(
+        "pit_artifact_publish_completed",
+        json!({"artifact_sha256": &artifact_sha256}),
+    );
     let snapshot_sha256 = snapshot.sha256();
 
     let report = MaterializationReport {
@@ -466,7 +587,15 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
     let report_path = args
         .artifact_dir
         .join(format!("{report_sha256}.materialization.json"));
+    log_event(
+        "pit_report_publish_started",
+        json!({"report_sha256": &report_sha256}),
+    );
     publish_immutable(&report_path, &report_bytes)?;
+    log_event(
+        "pit_report_publish_completed",
+        json!({"report_sha256": &report_sha256}),
+    );
     Ok(PublishedMaterialization {
         report,
         report_path,
@@ -491,11 +620,12 @@ fn verify_segments(
     }
     let mut paths = BTreeMap::new();
     let mut sealed = Vec::with_capacity(count);
-    for ((path, content_sha256), manifest_sha256) in args
+    for (index, ((path, content_sha256), manifest_sha256)) in args
         .segment
         .iter()
         .zip(&args.segment_content_sha256)
         .zip(&args.segment_manifest_sha256)
+        .enumerate()
     {
         if paths.insert(content_sha256.clone(), path.clone()).is_some() {
             bail!("duplicate LOB segment supplied");
@@ -507,6 +637,17 @@ fn verify_segments(
         };
         let trust = BinanceMarketTapeTrustAnchor::from_lower_hex(content_sha256, manifest_sha256)?;
         sealed.push(seal_binance_market_tape_triplet(&triplet, &trust)?);
+        if (index + 1).is_multiple_of(10) || index + 1 == count {
+            log_event(
+                "segment_verification_progress",
+                json!({
+                    "completed_segments": index + 1,
+                    "total_segments": count,
+                    "content_sha256": content_sha256,
+                    "manifest_sha256": manifest_sha256,
+                }),
+            );
+        }
     }
     Ok((
         verify_binance_market_tape_series_for_strict_gate(sealed)?,
@@ -575,11 +716,12 @@ fn bind_usdm_reference(
     let mut rule_times = Vec::with_capacity(count);
     let mut evidence = Vec::with_capacity(count);
     let mut observations = Vec::with_capacity(count);
-    for ((data_path, data_sha256), manifest_sha256) in args
+    for (index, ((data_path, data_sha256), manifest_sha256)) in args
         .reference_data
         .iter()
         .zip(&args.reference_data_sha256)
         .zip(&args.reference_manifest_sha256)
+        .enumerate()
     {
         let published = PublishedReferenceArtifact {
             data_path: data_path.clone(),
@@ -621,6 +763,18 @@ fn bind_usdm_reference(
         rule_times.push(available_at);
         push_unique_observation(&mut observations, available_at, &triplet);
         push_unique_triplet(&mut evidence, &triplet);
+        if (index + 1).is_multiple_of(50) || index + 1 == count {
+            log_event(
+                "reference_binding_progress",
+                json!({
+                    "completed_references": index + 1,
+                    "total_references": count,
+                    "data_sha256": data_sha256,
+                    "manifest_sha256": manifest_sha256,
+                    "available_at": available_at,
+                }),
+            );
+        }
     }
     rule_times.sort_unstable();
     observations.sort_by_key(|observation| observation.available_at);
@@ -937,6 +1091,16 @@ fn materialize_rows(
         .filter(|trade| trade.symbol == symbol)
         .collect::<Vec<_>>();
     for index in 1..samples.len().saturating_sub(args.label_horizon_buckets) {
+        if index.is_multiple_of(100_000) {
+            log_event(
+                "pit_feature_rows_progress",
+                json!({
+                    "processed_samples": index,
+                    "total_samples": samples.len(),
+                    "materialized_rows": rows.len(),
+                }),
+            );
+        }
         let previous = &samples[index - 1];
         let current = &samples[index];
         let future = &samples[index + args.label_horizon_buckets];

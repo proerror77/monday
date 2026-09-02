@@ -20,7 +20,7 @@ use data::binance_market_tape_artifact::{
     BinanceMarketTapeTriplet, BinanceMarketTapeTrustAnchor,
 };
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -93,6 +93,19 @@ struct SliceReport {
     slices: Vec<SliceEvidence>,
 }
 
+fn log_event(event: &str, details: Value) {
+    eprintln!(
+        "{}",
+        json!({
+            "schema_version": "monday.research_event.v1",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "component": "binance-market-tape-slicer",
+            "event": event,
+            "details": details,
+        })
+    );
+}
+
 enum RowAttribution {
     Session,
     Symbol(String),
@@ -125,7 +138,33 @@ struct SliceBuild {
 }
 
 fn main() -> Result<()> {
-    let report = slice_segment(&Args::parse())?;
+    let args = Args::parse();
+    log_event(
+        "slicing_started",
+        json!({
+            "segment": &args.segment,
+            "output_dir": &args.output_dir,
+            "symbols": &args.symbols,
+            "max_slice_bytes": args.max_slice_bytes,
+        }),
+    );
+    let report = slice_segment(&args).inspect_err(|_| {
+        log_event(
+            "slicing_failed",
+            json!({"reason_code": "slice_segment_failed"}),
+        );
+    })?;
+    log_event(
+        "slicing_completed",
+        json!({
+            "source_sha256": &report.source.sha256,
+            "source_manifest_sha256": &report.source.manifest_sha256,
+            "source_events": report.source.events,
+            "selected_symbols": report.source.selected_symbols,
+            "slice_count": report.slices.len(),
+            "slice_events": report.slices.iter().map(|slice| slice.events).sum::<u64>(),
+        }),
+    );
     serde_json::to_writer_pretty(std::io::stdout().lock(), &report)?;
     println!();
     Ok(())
@@ -166,7 +205,21 @@ fn slice_segment(args: &Args) -> Result<SliceReport> {
         bail!("source success marker does not match the manifest content digest");
     }
 
+    log_event(
+        "source_scan_started",
+        json!({"segment": &segment, "selected_symbols": &selected}),
+    );
     let scan = scan_segment(&segment, &manifest_bytes)?;
+    log_event(
+        "source_scan_completed",
+        json!({
+            "source_sha256": &scan.content_sha256,
+            "manifest_sha256": &scan.manifest_sha256,
+            "events": scan.events,
+            "decompressed_bytes": scan.decompressed_bytes,
+            "observed_symbols": scan.observed_symbols.len(),
+        }),
+    );
     if scan.content_sha256 != expected_content_sha256 {
         bail!("source segment bytes do not match the manifest content digest");
     }
@@ -181,6 +234,14 @@ fn slice_segment(args: &Args) -> Result<SliceReport> {
         scan.session_bytes,
         args.max_slice_bytes,
     )?;
+    log_event(
+        "slice_plan_completed",
+        json!({
+            "slice_count": plans.len(),
+            "slice_symbols": &plans,
+            "max_slice_bytes": args.max_slice_bytes,
+        }),
+    );
     let mut slice_of = BTreeMap::new();
     for (index, symbols) in plans.iter().enumerate() {
         for symbol in symbols {
@@ -226,6 +287,10 @@ fn slice_segment(args: &Args) -> Result<SliceReport> {
         emit_row(build, &coverage, None)?;
     }
 
+    log_event(
+        "row_routing_started",
+        json!({"source_events": scan.events, "slice_count": builds.len()}),
+    );
     let routed_digest = route_rows(&segment, &slice_of, &mut builds)?;
     if routed_digest != scan.content_sha256 {
         bail!("source segment changed between slicing passes");
@@ -234,12 +299,22 @@ fn slice_segment(args: &Args) -> Result<SliceReport> {
     let mut slices = Vec::with_capacity(builds.len());
     for (index, build) in builds.into_iter().enumerate() {
         let name = format!("{stem}.slice-{:03}.jsonl.zst", index + 1);
-        slices.push(publish_slice(
-            build,
-            &source_manifest,
-            &output_dir,
-            &name,
-        )?);
+        let slice = publish_slice(build, &source_manifest, &output_dir, &name)?;
+        log_event(
+            "slice_published",
+            json!({
+                "slice_index": index + 1,
+                "slice_total": plans.len(),
+                "file": &slice.file,
+                "sha256": &slice.sha256,
+                "manifest_sha256": &slice.manifest_sha256,
+                "symbols": &slice.symbols,
+                "events": slice.events,
+                "decompressed_bytes": slice.decompressed_bytes,
+                "compressed_bytes": slice.compressed_bytes,
+            }),
+        );
+        slices.push(slice);
     }
 
     Ok(SliceReport {
@@ -467,6 +542,15 @@ fn scan_segment(segment: &Path, manifest_bytes: &[u8]) -> Result<SourceScan> {
             .events
             .checked_add(1)
             .context("segment event count overflow")?;
+        if scan.events.is_multiple_of(100_000) {
+            log_event(
+                "source_scan_progress",
+                json!({
+                    "events": scan.events,
+                    "decompressed_bytes": scan.decompressed_bytes,
+                }),
+            );
+        }
         match attribute_row(raw)? {
             RowAttribution::Session => {
                 let bytes = line.len() as u64 + 1 + SESSION_ROW_SLACK_BYTES;
@@ -505,13 +589,26 @@ fn route_rows(
     slice_of: &BTreeMap<String, usize>,
     builds: &mut [SliceBuild],
 ) -> Result<String> {
+    let mut routed_rows = 0_u64;
     stream_segment(segment, |line, raw| {
         if let RowAttribution::Symbol(symbol) = attribute_row(raw)? {
             if let Some(&index) = slice_of.get(&symbol) {
                 emit_row(&mut builds[index], raw, Some(line))?;
+                routed_rows = routed_rows
+                    .checked_add(1)
+                    .context("routed row count overflow")?;
+                if routed_rows.is_multiple_of(100_000) {
+                    log_event("row_routing_progress", json!({"routed_rows": routed_rows}));
+                }
             }
         }
         Ok(())
+    })
+    .inspect(|digest| {
+        log_event(
+            "row_routing_completed",
+            json!({"routed_rows": routed_rows, "source_sha256": digest}),
+        );
     })
 }
 

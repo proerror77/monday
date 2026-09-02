@@ -13,7 +13,7 @@ Rust CLI and libraries for the governed CEX Campaign and prediction research pla
 | Contract | Status | Current terminal evidence |
 | --- | --- | --- |
 | CEX Cloud Campaign | Implemented through cloud admission, immutable shared-input download, bounded multi-round Campaign execution, continuous GP, immutable Factor Bank, purged walk-forward Ridge/CART, and cost-aware model replay | Create-once per-round Mission/result objects, typed OOS/equity/replay feedback, deterministic pre-holdout winner selection, and independent readback with exact SHA-256 matches |
-| Supervised ML research lane | Implemented for governed GP v4 | Continuous factors feed Ridge and shallow CART; only OOS predictions create fractional target positions, and the same positions must pass canonical L2 event replay before selection |
+| Supervised ML research lane | Implemented for governed GP v4 | Continuous factors feed Ridge, shallow CART, and a Burn MLP; only OOS predictions create fractional target positions, and the same positions must pass canonical L2 event replay before selection |
 | Legacy Factor-Bank subset MCTS | Preserved for governed GP v1-v3 | Content-bound checkpoint, add/remove/swap trace, and passing equal-absolute-weight selection or an explicit no-selection result; sealed holdout remains closed |
 | Legacy four-stage combination walk-forward | Preserved for governed GP v1-v3 | A passing subset emits a content-addressed, research-only Signal/Sizing/Risk/Execution artifact with same-protocol Ridge/CART evidence; no selection emits no strategy |
 | Event-level L2 replay receipt | Implemented | Canonical event replay emits a content-bound receipt, net-return/Sharpe gates, and explicit queue/partial-fill/impact/capacity disclosures |
@@ -130,8 +130,8 @@ does not alter the semantic Mission identity. The fixed v4 factor plan uses 8
 snapshot L2 terminals, 16 atomic plus 4 named continuous candidates, the
 six-hour
 protocol `7200 + 3*(3600+1) + 5 + 3600 = 21608`, and the $1000 / Top5 5%
-capacity screen. A non-empty Factor Bank trains deterministic Ridge and shallow
-CART on purged folds. Only validation-fold predictions become cost-aware
+capacity screen. A non-empty Factor Bank trains deterministic Ridge, shallow
+CART, and one Burn ndarray MLP on the same purged folds. Only validation-fold predictions become cost-aware
 fractional positions; training, purge, embargo, and sealed-holdout rows remain
 flat. A model is selectable only after its OOS predictive/trading gates and the
 same-position canonical L2 event replay both pass. The report persists the

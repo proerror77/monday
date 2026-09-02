@@ -11,8 +11,8 @@ use crate::{
     },
     mission_runner::{
         execute_report, fetch_to_file, finalize_existing_search_round, normalized_sha256,
-        publish_immutable_file, recover_execution_report_from_published_result, valid_git_revision,
-        validate_cex_holdout_id, validate_supervised_candidate_binding,
+        publish_immutable_file, recover_execution_report_from_published_result, research_event,
+        valid_git_revision, validate_cex_holdout_id, validate_supervised_candidate_binding,
         validate_supervised_replay_binding, CexEventReplayReceiptV1, CexSupervisedModelSelectionV1,
         ExecutionBinding, MAX_RESULT_BUNDLE_BYTES,
     },
@@ -224,9 +224,13 @@ struct CampaignRoundFeedbackV1 {
     ridge: Option<CampaignEvaluationFeedbackV1>,
     cart: Option<CampaignEvaluationFeedbackV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    burn: Option<CampaignEvaluationFeedbackV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     supervised_ridge: Option<CampaignEvaluationFeedbackV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     supervised_cart: Option<CampaignEvaluationFeedbackV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    supervised_burn: Option<CampaignEvaluationFeedbackV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     supervised_selected_candidate_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -261,6 +265,31 @@ struct CampaignMissionLedgerV1 {
     consumed_trials: usize,
     termination_reason: String,
     feedback: CampaignRoundFeedbackV1,
+}
+
+fn round_log_summary(round: &CampaignMissionLedgerV1) -> serde_json::Value {
+    serde_json::json!({
+        "round_id": &round.round_id,
+        "seed": round.seed,
+        "mission_id": &round.mission_id,
+        "mission_sha256": &round.mission_sha256,
+        "result_bundle_sha256": &round.result_bundle_sha256,
+        "consumed_trials": round.consumed_trials,
+        "termination_reason": &round.termination_reason,
+        "factor_attempts": round.feedback.factor_attempts,
+        "accepted_factors": round.feedback.accepted_factors,
+        "baseline_gate_passed": round.feedback.baseline_gate_passed,
+        "baseline_failure_codes": &round.feedback.baseline_failure_codes,
+        "ridge": &round.feedback.ridge,
+        "cart": &round.feedback.cart,
+        "burn": &round.feedback.burn,
+        "supervised_ridge": &round.feedback.supervised_ridge,
+        "supervised_cart": &round.feedback.supervised_cart,
+        "supervised_burn": &round.feedback.supervised_burn,
+        "supervised_replay": &round.feedback.supervised_replay,
+        "selected_candidate_id": &round.selected_candidate_id,
+        "selected_score": round.selected_score,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -342,6 +371,21 @@ pub fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
     if !valid_git_revision(BUILD_SOURCE_REVISION) {
         bail!("alpha-harness was built without an exact source revision");
     }
+    research_event(
+        "alpha-harness",
+        "campaign_execution_started",
+        serde_json::json!({
+            "campaign_id": &loaded.request.campaign_id,
+            "request_sha256": &loaded.sha256,
+            "build_source_revision": &loaded.request.build_source_revision,
+            "image_identity": &loaded.request.image_identity,
+            "campaign_inputs_sha256": &loaded.request.campaign_inputs_sha256,
+            "research_plan": &loaded.request.research_plan,
+            "round_count": loaded.request.rounds.len(),
+            "declared_total_trials": loaded.request.declared_total_trials,
+            "holdout_id": &loaded.request.holdout_id,
+        }),
+    );
     execute_loaded_request(args, loaded)
 }
 
@@ -354,6 +398,20 @@ pub fn freeze(args: CampaignFreezeArgs) -> anyhow::Result<()> {
         canonical_request: request.clone(),
     };
     data_mission::write_json_atomic(&args.output, &plan)?;
+    research_event(
+        "alpha-harness",
+        "campaign_freeze_completed",
+        serde_json::json!({
+            "campaign_id": &request.campaign_id,
+            "campaign_inputs_sha256": &plan.campaign_inputs_sha256,
+            "research_plan": &request.research_plan,
+            "round_count": request.rounds.len(),
+            "declared_total_trials": request.declared_total_trials,
+            "holdout_id": &request.holdout_id,
+            "build_source_revision": &request.build_source_revision,
+            "image_identity": &request.image_identity,
+        }),
+    );
     print_json(&CampaignFreezeReport {
         campaign_id: request.campaign_id.clone(),
         holdout_id: request.holdout_id.clone(),
@@ -371,17 +429,35 @@ pub fn learn(args: CampaignLearnArgs) -> anyhow::Result<()> {
         bail!("parent Campaign result SHA256 mismatch");
     }
     validate_negative_campaign_result(&loaded, &result, &result_sha256)?;
+    research_event(
+        "alpha-harness",
+        "campaign_learning_started",
+        serde_json::json!({
+            "parent_campaign_id": &loaded.request.campaign_id,
+            "parent_request_sha256": &loaded.sha256,
+            "parent_campaign_result_sha256": &result_sha256,
+            "parent_generation": loaded.request.research_plan.generation,
+            "termination_reason": &result.termination_reason,
+            "round_feedback": result.rounds.iter().map(round_log_summary).collect::<Vec<_>>(),
+            "max_tokens": args.max_tokens,
+        }),
+    );
 
     if args.output.try_exists()? {
         let plan = load_research_plan(&args.output)?;
         validate_existing_follow_up_plan(&plan, &loaded, &result_sha256)?;
-        return print_json(&campaign_learn_report(
-            &args.output,
-            &loaded,
-            &result_sha256,
-            &plan,
-            true,
-        )?);
+        let report = campaign_learn_report(&args.output, &loaded, &result_sha256, &plan, true)?;
+        research_event(
+            "alpha-harness",
+            "campaign_learning_completed",
+            serde_json::json!({
+                "parent_campaign_id": &report.parent_campaign_id,
+                "research_plan_sha256": &report.research_plan_sha256,
+                "child_research_plan": &plan,
+                "reused_existing": true,
+            }),
+        );
+        return print_json(&report);
     }
 
     if args.max_tokens == 0 {
@@ -398,13 +474,18 @@ pub fn learn(args: CampaignLearnArgs) -> anyhow::Result<()> {
         .map_err(anyhow::Error::msg)?;
     let plan = follow_up_plan_from_artifact(&loaded, &result_sha256, artifact)?;
     write_research_plan_create_once(&args.output, &plan)?;
-    print_json(&campaign_learn_report(
-        &args.output,
-        &loaded,
-        &result_sha256,
-        &plan,
-        false,
-    )?)
+    let report = campaign_learn_report(&args.output, &loaded, &result_sha256, &plan, false)?;
+    research_event(
+        "alpha-harness",
+        "campaign_learning_completed",
+        serde_json::json!({
+            "parent_campaign_id": &report.parent_campaign_id,
+            "research_plan_sha256": &report.research_plan_sha256,
+            "child_research_plan": &plan,
+            "reused_existing": false,
+        }),
+    );
+    print_json(&report)
 }
 
 fn campaign_learning_prompt(
@@ -518,6 +599,18 @@ pub fn finalize(args: CampaignFinalizeArgs) -> anyhow::Result<()> {
         &args.image,
         loaded.request.clone(),
     )?;
+    research_event(
+        "alpha-harness",
+        "campaign_finalize_completed",
+        serde_json::json!({
+            "campaign_id": &loaded.request.campaign_id,
+            "request_sha256": &rendered.request_sha256,
+            "submission_identity_sha256": &rendered.submission_identity_sha256,
+            "job_name": &rendered.job_name,
+            "attempt_id": &args.attempt_id,
+            "image": &args.image,
+        }),
+    );
     print_json(&CampaignFinalizeReport {
         campaign_id: loaded.request.campaign_id.clone(),
         holdout_id: loaded.request.holdout_id.clone(),
@@ -568,6 +661,20 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
         .build()?;
     data_mission::write_json_atomic(&local_request_path, &loaded.request)?;
 
+    research_event(
+        "alpha-harness",
+        "campaign_input_download_started",
+        serde_json::json!({
+            "campaign_id": &loaded.request.campaign_id,
+            "request_sha256": &loaded.sha256,
+            "expected": {
+                "feature_sha256": &loaded.request.feature_sha256,
+                "materialization_sha256": &loaded.request.materialization_sha256,
+                "replay_artifact_sha256": &loaded.request.replay_artifact_sha256,
+                "replay_manifest_sha256": &loaded.request.replay_manifest_sha256,
+            },
+        }),
+    );
     let feature_path = shared_input_dir.join("features.jsonl");
     fetch_verified(
         &client,
@@ -610,12 +717,36 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
         &loaded.request.replay_manifest_sha256,
         16 * 1024 * 1024,
     )?;
+    research_event(
+        "alpha-harness",
+        "campaign_input_download_completed",
+        serde_json::json!({
+            "campaign_id": &loaded.request.campaign_id,
+            "feature_sha256": &loaded.request.feature_sha256,
+            "materialization_sha256": &loaded.request.materialization_sha256,
+            "replay_artifact_sha256": &loaded.request.replay_artifact_sha256,
+            "replay_manifest_sha256": &loaded.request.replay_manifest_sha256,
+        }),
+    );
 
     let mut ledgers = Vec::with_capacity(loaded.request.rounds.len());
     let mut selected_round = None;
     let mut selected_mission = None;
     let mut selected_execute_dir = None;
-    for round in &loaded.request.rounds {
+    for (round_index, round) in loaded.request.rounds.iter().enumerate() {
+        research_event(
+            "alpha-harness",
+            "campaign_round_started",
+            serde_json::json!({
+                "campaign_id": &loaded.request.campaign_id,
+                "request_sha256": &loaded.sha256,
+                "round_id": &round.round_id,
+                "round_index": round_index + 1,
+                "round_total": loaded.request.rounds.len(),
+                "seed": round.seed,
+                "research_plan": &loaded.request.research_plan,
+            }),
+        );
         let rendered = render_cex_bundle(
             &feature_path,
             &materialization_path,
@@ -640,6 +771,16 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
             &mission_local_path,
             &mission_readback_path,
         )?;
+        research_event(
+            "alpha-harness",
+            "campaign_round_mission_readback_completed",
+            serde_json::json!({
+                "campaign_id": &loaded.request.campaign_id,
+                "round_id": &round.round_id,
+                "mission_id": &rendered.mission_id,
+                "mission_sha256": &mission_sha256,
+            }),
+        );
 
         let binding = ExecutionBinding::Campaign {
             campaign_id: loaded.request.campaign_id.clone(),
@@ -648,43 +789,68 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
         };
         let recovered_result_path = round_dir.join("published-result-readback.zip");
         let execute_dir = round_dir.join("execute");
-        let report = if let Some(report) = recover_execution_report_from_published_result(
-            &client,
-            &round.result_readback_url,
-            &recovered_result_path,
-            &rendered.mission_id,
-            &mission_sha256,
-            &binding,
-        )? {
+        let (report, reused_published_result) = if let Some(report) =
+            recover_execution_report_from_published_result(
+                &client,
+                &round.result_readback_url,
+                &recovered_result_path,
+                &rendered.mission_id,
+                &mission_sha256,
+                &binding,
+            )? {
             extract_bundle(&recovered_result_path, &execute_dir)?;
-            report
+            (report, true)
         } else {
             let (round_claim_put_url, round_claim_readback_url) =
                 campaign_round_claim_urls(&loaded.request, round)?;
-            execute_report(
-                ExecuteMissionArgs {
-                    work_dir: execute_dir.clone(),
-                    mission_id: rendered.mission_id.clone(),
-                    holdout_id: loaded.request.holdout_id.clone(),
-                    mission_url: mission_readback_path.to_string_lossy().into_owned(),
-                    mission_sha256: mission_sha256.clone(),
-                    feature_url: feature_path.to_string_lossy().into_owned(),
-                    materialization_url: materialization_path.to_string_lossy().into_owned(),
-                    replay_artifact_url: replay_artifact_path.to_string_lossy().into_owned(),
-                    replay_artifact_sha256: loaded.request.replay_artifact_sha256.clone(),
-                    replay_manifest_url: replay_manifest_path.to_string_lossy().into_owned(),
-                    replay_manifest_sha256: loaded.request.replay_manifest_sha256.clone(),
-                    resume_url: None,
-                    resume_sha256: None,
-                    result_put_url: round.result_put_url.clone(),
-                    result_readback_url: round.result_readback_url.clone(),
-                    holdout_claim_put_url: round_claim_put_url,
-                    holdout_claim_readback_url: round_claim_readback_url,
-                },
-                binding,
-            )?
+            (
+                execute_report(
+                    ExecuteMissionArgs {
+                        work_dir: execute_dir.clone(),
+                        mission_id: rendered.mission_id.clone(),
+                        holdout_id: loaded.request.holdout_id.clone(),
+                        mission_url: mission_readback_path.to_string_lossy().into_owned(),
+                        mission_sha256: mission_sha256.clone(),
+                        feature_url: feature_path.to_string_lossy().into_owned(),
+                        materialization_url: materialization_path.to_string_lossy().into_owned(),
+                        replay_artifact_url: replay_artifact_path.to_string_lossy().into_owned(),
+                        replay_artifact_sha256: loaded.request.replay_artifact_sha256.clone(),
+                        replay_manifest_url: replay_manifest_path.to_string_lossy().into_owned(),
+                        replay_manifest_sha256: loaded.request.replay_manifest_sha256.clone(),
+                        resume_url: None,
+                        resume_sha256: None,
+                        result_put_url: round.result_put_url.clone(),
+                        result_readback_url: round.result_readback_url.clone(),
+                        holdout_claim_put_url: round_claim_put_url,
+                        holdout_claim_readback_url: round_claim_readback_url,
+                    },
+                    binding,
+                )?,
+                false,
+            )
         };
         let ledger = collect_round_ledger(&execute_dir, round, &report)?;
+        research_event(
+            "alpha-harness",
+            "campaign_round_completed",
+            serde_json::json!({
+                "campaign_id": &loaded.request.campaign_id,
+                "round_id": &round.round_id,
+                "mission_id": &ledger.mission_id,
+                "mission_sha256": &ledger.mission_sha256,
+                "result_bundle_sha256": &ledger.result_bundle_sha256,
+                "result_readback_bundle_sha256": &ledger.result_readback_bundle_sha256,
+                "reused_published_result": reused_published_result,
+                "consumed_trials": ledger.consumed_trials,
+                "termination_reason": &ledger.termination_reason,
+                "selected_candidate_id": &ledger.selected_candidate_id,
+                "selected_score": ledger.selected_score,
+                "feedback": round_log_summary(&ledger),
+                "replay_gate_passed": ledger
+                    .supervised_replay_gate_passed
+                    .or(ledger.replay_gate_passed),
+            }),
+        );
         let is_better = selected_round
             .as_ref()
             .is_none_or(|current: &CampaignMissionLedgerV1| {
@@ -694,6 +860,17 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
             .supervised_replay_gate_passed
             .or(ledger.replay_gate_passed);
         if selected_gate == Some(true) && ledger.selected_score.is_some() && is_better {
+            research_event(
+                "alpha-harness",
+                "campaign_pre_holdout_selection_updated",
+                serde_json::json!({
+                    "campaign_id": &loaded.request.campaign_id,
+                    "round_id": &ledger.round_id,
+                    "candidate_id": &ledger.selected_candidate_id,
+                    "selected_score": ledger.selected_score,
+                    "replay_gate_passed": selected_gate,
+                }),
+            );
             selected_round = Some(ledger.clone());
             selected_mission = Some(rendered.mission);
             selected_execute_dir = Some(execute_dir.clone());
@@ -705,6 +882,20 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
     if consumed_trials > loaded.request.declared_total_trials {
         bail!("campaign consumed trials exceeded declared_total_trials");
     }
+    research_event(
+        "alpha-harness",
+        "campaign_rounds_completed",
+        serde_json::json!({
+            "campaign_id": &loaded.request.campaign_id,
+            "round_count": ledgers.len(),
+            "consumed_trials": consumed_trials,
+            "declared_total_trials": loaded.request.declared_total_trials,
+            "selected_round_id": selected_round.as_ref().map(|round| round.round_id.as_str()),
+            "selected_candidate_id": selected_round
+                .as_ref()
+                .and_then(|round| round.selected_candidate_id.as_deref()),
+        }),
+    );
     let finalization = match (&selected_round, &selected_mission, &selected_execute_dir) {
         (Some(selected_round), Some(selected_mission), Some(selected_execute_dir))
             if selected_round.supervised_candidate_id.is_none() =>
@@ -795,6 +986,19 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
             .and_then(|round| round.selected_candidate_content_hash.clone()),
         finalization,
     };
+    research_event(
+        "alpha-harness",
+        "campaign_result_publish_started",
+        serde_json::json!({
+            "campaign_id": &result.campaign_id,
+            "request_sha256": &result.request_sha256,
+            "termination_reason": &result.termination_reason,
+            "consumed_trials": result.consumed_trials,
+            "declared_total_trials": result.declared_total_trials,
+            "selected_round_id": &result.selected_round_id,
+            "selected_candidate_id": &result.selected_candidate_id,
+        }),
+    );
     data_mission::write_json_atomic(&local_result_path, &result)?;
     if local_result_path.metadata()?.len() > MAX_CAMPAIGN_RESULT_BYTES {
         bail!("campaign result exceeds {MAX_CAMPAIGN_RESULT_BYTES} bytes");
@@ -807,6 +1011,21 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
         &local_result_path,
         &local_result_readback_path,
     )?;
+    research_event(
+        "alpha-harness",
+        "campaign_execution_completed",
+        serde_json::json!({
+            "campaign_id": &result.campaign_id,
+            "request_sha256": &result.request_sha256,
+            "campaign_result_sha256": &result_sha256,
+            "campaign_result_readback_sha256": &result_sha256,
+            "termination_reason": &result.termination_reason,
+            "selected_round_id": &result.selected_round_id,
+            "selected_candidate_id": &result.selected_candidate_id,
+            "round_count": result.rounds.len(),
+            "consumed_trials": result.consumed_trials,
+        }),
+    );
     print_json(&serde_json::json!({
         "campaign_id": result.campaign_id,
         "request_sha256": result.request_sha256,
@@ -1123,6 +1342,7 @@ fn extract_bundle(bundle: &Path, destination: &Path) -> anyhow::Result<()> {
 struct SupervisedRoundEvidence {
     ridge: CexSupervisedModelCandidateV1,
     cart: CexSupervisedModelCandidateV1,
+    burn: CexSupervisedModelCandidateV1,
     selected: CexSupervisedModelCandidateV1,
     replay: Option<CexEventReplayReceiptV1>,
 }
@@ -1133,6 +1353,7 @@ fn load_supervised_round_evidence(
     factor_bank: &CexFactorBankRevisionV2,
     ridge_baseline: Option<&alpha_domain::CexBaselineArtifactV1>,
     cart_baseline: Option<&alpha_domain::CexBaselineArtifactV1>,
+    burn_baseline: Option<&alpha_domain::CexBaselineArtifactV1>,
     report: &crate::mission_runner::ExecutionReport,
 ) -> anyhow::Result<Option<SupervisedRoundEvidence>> {
     if factor_bank.entries.is_empty() {
@@ -1149,14 +1370,19 @@ fn load_supervised_round_evidence(
     }
     let ridge_baseline = ridge_baseline.context("supervised ML is missing its Ridge baseline")?;
     let cart_baseline = cart_baseline.context("supervised ML is missing its CART baseline")?;
+    let burn_baseline = burn_baseline.context("supervised ML is missing its Burn MLP baseline")?;
     let ridge: CexSupervisedModelCandidateV1 = serde_json::from_slice(&std::fs::read(
         results.join("ridge-supervised-candidate.json"),
     )?)?;
     let cart: CexSupervisedModelCandidateV1 = serde_json::from_slice(&std::fs::read(
         results.join("cart-supervised-candidate.json"),
     )?)?;
+    let burn: CexSupervisedModelCandidateV1 = serde_json::from_slice(&std::fs::read(
+        results.join("burn_mlp-supervised-candidate.json"),
+    )?)?;
     validate_supervised_candidate_binding(&ridge, mission, factor_bank, ridge_baseline)?;
     validate_supervised_candidate_binding(&cart, mission, factor_bank, cart_baseline)?;
+    validate_supervised_candidate_binding(&burn, mission, factor_bank, burn_baseline)?;
     let selection: CexSupervisedModelSelectionV1 = serde_json::from_slice(&std::fs::read(
         results.join("supervised-model-selection.json"),
     )?)?;
@@ -1164,7 +1390,7 @@ fn load_supervised_round_evidence(
     if selection.mission_id != mission.semantic_id()? {
         bail!("supervised selection does not match its Campaign Mission");
     }
-    let selected = [&ridge, &cart]
+    let selected = [&ridge, &cart, &burn]
         .into_iter()
         .find(|candidate| {
             candidate.artifact_id == selection.selected_candidate.id
@@ -1172,7 +1398,7 @@ fn load_supervised_round_evidence(
                     .is_ok_and(|hash| hash == selection.selected_candidate.content_sha256)
         })
         .cloned()
-        .context("supervised selection does not bind Ridge or CART")?;
+        .context("supervised selection does not bind Ridge, CART, or Burn MLP")?;
     if selection.replay_eligible != selected.evaluation.passed
         || report.supervised_candidate_id.as_deref() != Some(selected.artifact_id.as_str())
     {
@@ -1206,6 +1432,7 @@ fn load_supervised_round_evidence(
     Ok(Some(SupervisedRoundEvidence {
         ridge,
         cart,
+        burn,
         selected,
         replay,
     }))
@@ -1241,6 +1468,17 @@ fn collect_round_ledger(
             ),
         )
     };
+    let burn = if factor_bank.entries.is_empty()
+        || factor_bank.gp_policy.schema_version != CEX_GP_POLICY_SCHEMA_V4
+    {
+        None
+    } else {
+        Some(
+            serde_json::from_slice::<alpha_domain::CexBaselineArtifactV1>(&std::fs::read(
+                results.join("burn-mlp-baseline.json"),
+            )?)?,
+        )
+    };
     if report.mission_id != control_mission.semantic_id()? {
         bail!("round execution report mission identity drifted");
     }
@@ -1261,6 +1499,7 @@ fn collect_round_ledger(
             &factor_bank,
             ridge.as_ref(),
             cart.as_ref(),
+            burn.as_ref(),
             report,
         )?
     } else {
@@ -1295,12 +1534,18 @@ fn collect_round_ledger(
         cart: cart
             .as_ref()
             .map(|artifact| campaign_evaluation_feedback(&artifact.evaluation)),
+        burn: burn
+            .as_ref()
+            .map(|artifact| campaign_evaluation_feedback(&artifact.evaluation)),
         supervised_ridge: supervised
             .as_ref()
             .map(|evidence| campaign_evaluation_feedback(&evidence.ridge.evaluation)),
         supervised_cart: supervised
             .as_ref()
             .map(|evidence| campaign_evaluation_feedback(&evidence.cart.evaluation)),
+        supervised_burn: supervised
+            .as_ref()
+            .map(|evidence| campaign_evaluation_feedback(&evidence.burn.evaluation)),
         supervised_selected_candidate_id: supervised
             .as_ref()
             .map(|evidence| evidence.selected.artifact_id.clone()),
@@ -1313,7 +1558,7 @@ fn collect_round_ledger(
     let subset_result = load_round_subset_result(&results)?;
     let consumed_trials = factor_bank.attempts.len()
         + if supervised_ml && !factor_bank.entries.is_empty() {
-            2
+            3
         } else {
             subset_result
                 .as_ref()
@@ -1741,14 +1986,20 @@ fn validate_campaign_round_feedback(
     let supervised_match = match (
         &feedback.supervised_ridge,
         &feedback.supervised_cart,
+        &feedback.supervised_burn,
         &feedback.supervised_selected_candidate_id,
     ) {
-        (None, None, None) => feedback.supervised_replay.is_none(),
-        (Some(ridge), Some(cart), Some(candidate_id)) => {
+        (None, None, None, None) => feedback.supervised_replay.is_none() && feedback.burn.is_none(),
+        (Some(ridge), Some(cart), Some(burn), Some(candidate_id)) => {
             feedback.accepted_factors > 0
                 && !candidate_id.trim().is_empty()
                 && valid_campaign_evaluation_feedback(ridge)
                 && valid_campaign_evaluation_feedback(cart)
+                && valid_campaign_evaluation_feedback(burn)
+                && feedback
+                    .burn
+                    .as_ref()
+                    .is_some_and(valid_campaign_evaluation_feedback)
                 && feedback
                     .supervised_replay
                     .as_ref()
@@ -3270,12 +3521,14 @@ mod tests {
         assert_eq!(result["declared_total_trials"], declared_total_trials);
         assert_eq!(
             result["consumed_trials"],
-            (request.research_plan.max_candidates().unwrap() + 2) * 2
+            (request.research_plan.max_candidates().unwrap() + 3) * 2
         );
         for round in ["r1", "r2"] {
             let results = work_dir.join(format!("mission/{round}/execute/results"));
             assert!(results.join("factor-bank.json").exists());
             assert!(results.join("supervised-model-selection.json").exists());
+            assert!(results.join("burn-mlp-baseline.json").exists());
+            assert!(results.join("burn_mlp-supervised-candidate.json").exists());
             assert!(results
                 .join("supervised-event-replay-receipt.json")
                 .exists());
