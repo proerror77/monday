@@ -384,7 +384,15 @@ while ((generation <= max_follow_ups)); do
       "campaign_id=$campaign_id"
     result_url="$(jq -er '.campaign_result_readback_url' "$request")"
     oss_readback "$result_url" "$result"
-    jq -e --slurpfile request_doc "$request" --arg request_sha256 "$request_sha256" '
+    expected_learning_directive_sha256="none"
+    if jq -e '.research_plan.learning_directive != null' "$request" >/dev/null; then
+      expected_learning_directive_sha256="$(
+        sha256_file <(jq -cj '.research_plan.learning_directive' "$request")
+      )"
+    fi
+    jq -e --slurpfile request_doc "$request" \
+      --arg request_sha256 "$request_sha256" \
+      --arg expected_learning_directive_sha256 "$expected_learning_directive_sha256" '
       .schema_version == "cex-campaign-result-v7"
       and .campaign_id == $request_doc[0].campaign_id
       and .request_sha256 == $request_sha256
@@ -399,7 +407,7 @@ while ((generation <= max_follow_ups)); do
         if ($request_doc[0].research_plan.learning_directive // null) == null then
           .learning_directive_sha256 == null
         else
-          (.learning_directive_sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+          .learning_directive_sha256 == $expected_learning_directive_sha256
         end
       )
       and .holdout_id == $request_doc[0].holdout_id

@@ -214,6 +214,13 @@ if [[ "$source_object" == *"/campaign-result.json"* ]]; then
   mission_r2_sha="$(sha_text "mission-g$generation-r2")"
   bundle_r1_sha="$(sha_text "bundle-g$generation-r1")"
   bundle_r2_sha="$(sha_text "bundle-g$generation-r2")"
+  directive_sha="$(sha_text "$(jq -c '.research_plan.learning_directive' "$FAKE_STATE/request.json")")"
+  if [[ "$generation" == 1 && ! -e "$FAKE_STATE/bad-directive-digest-once" ]]; then
+    : >"$FAKE_STATE/bad-directive-digest-once"
+    directive_sha="$(printf '9%.0s' {1..64})"
+  else
+    printf '%s\n' "$directive_sha" >"$FAKE_STATE/directive-sha256"
+  fi
   jq -n \
     --slurpfile request "$FAKE_STATE/request.json" \
     --arg request_sha256 "$request_sha256" \
@@ -222,6 +229,7 @@ if [[ "$source_object" == *"/campaign-result.json"* ]]; then
     --arg mission_r2_sha "$mission_r2_sha" \
     --arg bundle_r1_sha "$bundle_r1_sha" \
     --arg bundle_r2_sha "$bundle_r2_sha" \
+    --arg directive_sha "$directive_sha" \
     --argjson generation "$generation" '{
       schema_version:"cex-campaign-result-v7",
       campaign_id:$request[0].campaign_id,
@@ -233,7 +241,7 @@ if [[ "$source_object" == *"/campaign-result.json"* ]]; then
       producer_image_identity:$request[0].producer_image_identity,
       research_plan_sha256:("e" * 64),
       learning_directive:$request[0].research_plan.learning_directive,
-      learning_directive_sha256:(if $request[0].research_plan.learning_directive == null then null else ("9" * 64) end),
+      learning_directive_sha256:(if $request[0].research_plan.learning_directive == null then null else $directive_sha end),
       search_policy_revision:$request[0].research_plan.search_policy_revision,
       holdout_id:$request[0].holdout_id,
       declared_total_trials:$request[0].declared_total_trials,
@@ -292,21 +300,29 @@ test "$(<"$FAKE_STATE/signer-count")" == 1
 test "$(<"$FAKE_STATE/dispatch-count")" == 1
 grep -Fq 'schema_version=monday.research_event.v1 component=campaign-cycle-controller event=cycle_failed generation=0 stage=oss_result_readback' "$root/first.stderr"
 
-"$controller" "${controller_args[@]}" >"$root/second.stdout" 2>"$root/second.stderr"
+if "$controller" "${controller_args[@]}" >"$root/second.stdout" 2>"$root/second.stderr"; then
+  echo "controller accepted a mismatched learning-directive digest" >&2
+  exit 1
+fi
+grep -Fq 'schema_version=monday.research_event.v1 component=campaign-cycle-controller event=cycle_failed generation=1 stage=oss_result_readback' "$root/second.stderr"
+
+if ! "$controller" "${controller_args[@]}" >"$root/third.stdout" 2>"$root/third.stderr"; then
+  cat "$root/third.stderr" >&2
+  exit 1
+fi
 
 for event in \
   'event=cycle_started' \
-  'event=generation_started generation=0' \
-  'event=stage_checkpoint_reused generation=0 stage=kubernetes_runtime_readback' \
-  'event=round_readback_completed generation=0 round_index=0 round_id=r1' \
-  'event=stage_completed generation=0 stage=oss_result_readback' \
-  'event=stage_started generation=0 stage=campaign_learning' \
-  'event=generation_started generation=1' \
+  'event=generation_checkpoint_reused generation=0' \
+  'event=stage_checkpoint_reused generation=1 stage=kubernetes_runtime_readback' \
+  'event=round_readback_completed generation=1 round_index=0 round_id=r1' \
+  'event=stage_completed generation=1 stage=oss_result_readback' \
   'event=cycle_completed generation=1 campaign_id=campaign-g1 termination_reason=campaign_finalized'; do
-  grep -Fq "$event" "$root/second.stderr"
+  grep -Fq "$event" "$root/third.stderr"
 done
 
-jq -e '.generation == 1 and .termination_reason == "campaign_finalized" and .round_readback_count == 2 and .learning_directive_sha256 == ("9" * 64) and .search_policy_revision_id == ("cex-search-policy-" + ("1" * 64))' \
+jq -e --arg directive_sha256 "$(<"$FAKE_STATE/directive-sha256")" \
+  '.generation == 1 and .termination_reason == "campaign_finalized" and .round_readback_count == 2 and .learning_directive_sha256 == $directive_sha256 and .search_policy_revision_id == ("cex-search-policy-" + ("1" * 64))' \
   "$root/cycle/cycle-result.json" >/dev/null
 test -s "$root/cycle/generation-0/next-research-plan.json"
 test "$(<"$FAKE_STATE/signer-count")" == 2
