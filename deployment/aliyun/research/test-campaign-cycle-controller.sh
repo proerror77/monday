@@ -2,11 +2,13 @@
 set -euo pipefail
 
 root="$(mktemp -d)"
+root="$(cd "$root" && pwd -P)"
 trap 'rm -rf -- "$root"' EXIT
 bin="$root/bin"
+start_dir="$root/start"
 export FAKE_STATE="$root/state"
-mkdir "$bin" "$root/input" "$FAKE_STATE"
-touch "$root/campaign-inputs.json"
+mkdir "$bin" "$start_dir" "$start_dir/input" "$FAKE_STATE"
+touch "$start_dir/campaign-inputs.json"
 
 cat >"$bin/alpha-harness" <<'EOF'
 #!/usr/bin/env bash
@@ -284,8 +286,8 @@ controller_args=(
   --alpha-harness "$bin/alpha-harness"
   --aliyun "$bin/aliyun"
   --kubectl "$bin/kubectl"
-  --campaign-inputs "$root/campaign-inputs.json"
-  --input-root "$root/input"
+  --campaign-inputs campaign-inputs.json
+  --input-root input
   --source-revision "$source_revision"
   --image "registry.example/research@sha256:$image_digest"
   --campaign-root https://bucket.oss-ap-northeast-1-internal.aliyuncs.com/research/campaigns
@@ -303,10 +305,14 @@ resume_args=(
   --work-dir "$root/cycle"
 )
 
-if "$controller" "${controller_args[@]}" >"$root/first.stdout" 2>"$root/first.stderr"; then
+if (cd "$start_dir" && "$controller" "${controller_args[@]}") \
+  >"$root/first.stdout" 2>"$root/first.stderr"; then
   echo "first controller run unexpectedly succeeded" >&2
   exit 1
 fi
+test "$(jq -r '.campaign_inputs' "$root/cycle/controller-inputs.json")" \
+  = "$start_dir/campaign-inputs.json"
+test "$(jq -r '.input_root' "$root/cycle/controller-inputs.json")" = "$start_dir/input"
 test -s "$root/cycle/generation-0/request.json"
 test "$(<"$FAKE_STATE/signer-count")" == 1
 test "$(<"$FAKE_STATE/dispatch-count")" == 1

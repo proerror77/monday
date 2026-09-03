@@ -256,6 +256,11 @@ done
 [[ "$max_follow_ups" =~ ^[0-3]$ ]] || die "--max-follow-ups must be between 0 and 3"
 [[ "$max_tokens" =~ ^[1-9][0-9]*$ ]] || die "--max-tokens must be positive"
 [[ ! -e "$work_dir" || -d "$work_dir" ]] || die "--work-dir must be a directory"
+campaign_inputs_dir="$(cd "$(dirname "$campaign_inputs")" && pwd -P)" \
+  || die "campaign inputs directory does not exist: $(dirname "$campaign_inputs")"
+campaign_inputs="$campaign_inputs_dir/$(basename "$campaign_inputs")"
+[[ -f "$campaign_inputs" ]] || die "campaign inputs file does not exist: $campaign_inputs"
+input_root="$(cd "$input_root" && pwd -P)" || die "input root does not exist: $input_root"
 [[ -x "$signer" ]] || die "signer is not executable: $signer"
 command -v "$alpha_harness" >/dev/null || die "alpha-harness executable not found"
 command -v "$aliyun_cli" >/dev/null || die "aliyun executable not found"
