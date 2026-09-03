@@ -155,7 +155,10 @@ set -euo pipefail
 request_sha256="$(<"$FAKE_STATE/request-sha256")"
 job_name="$(<"$FAKE_STATE/job-name")"
 case " $* " in
-  *" wait "*) exit 0 ;;
+  *" wait "*)
+    printf '%s\n' "$*" >>"$FAKE_STATE/job-waits"
+    exit 0
+    ;;
   *" get job/"*)
     jq -n --arg job_name "$job_name" --arg request_sha256 "$request_sha256" '{
       metadata:{name:$job_name,annotations:{"research.monday/request-sha256":$request_sha256}},
@@ -328,6 +331,7 @@ test -s "$root/cycle/generation-0/next-research-plan.json"
 test "$(<"$FAKE_STATE/signer-count")" == 2
 test "$(<"$FAKE_STATE/dispatch-count")" == 2
 test "$(wc -l <"$FAKE_STATE/deleted-secrets" | tr -d ' ')" == 2
+test "$(grep -c -- '--timeout=7h' "$FAKE_STATE/job-waits")" == 2
 for generation in 0 1; do
   test -e "$root/cycle/generation-$generation/provenance-readback-complete"
   test -e "$root/cycle/generation-$generation/result-readback-complete"
