@@ -3,7 +3,8 @@ set -euo pipefail
 
 root="$(mktemp -d)"
 root="$(cd "$root" && pwd -P)"
-trap 'rm -rf -- "$root"' EXIT
+mac_work_dir="$(mktemp -d /tmp/monday-cex-e2e.XXXXXX)"
+trap 'rm -rf -- "$root" "$mac_work_dir"' EXIT
 bin="$root/bin"
 start_dir="$root/start"
 export FAKE_STATE="$root/state"
@@ -194,6 +195,9 @@ cat >"$bin/aliyun" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 [[ "$1 $2" == "ossutil cp" ]]
+[[ " $* " == *" --endpoint oss-ap-northeast-1-internal.aliyuncs.com "* ]]
+[[ " $* " != *" --endpoint oss-ap-northeast-1.aliyuncs.com "* ]]
+printf '%s\n' "$*" >>"$FAKE_STATE/ossutil-calls"
 source_object="$3"
 destination="$4"
 generation=0
@@ -276,7 +280,15 @@ else
 fi
 EOF
 
-chmod +x "$bin/alpha-harness" "$bin/signer" "$bin/kubectl" "$bin/aliyun"
+cat >"$bin/uname" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "${1:-}" == "-s" ]]
+printf '%s\n' "${FAKE_UNAME:-Linux}"
+EOF
+
+chmod +x "$bin/alpha-harness" "$bin/signer" "$bin/kubectl" "$bin/aliyun" "$bin/uname"
+export PATH="$bin:$PATH"
 
 controller="$(cd "$(dirname "$0")" && pwd)/scripts/campaign-cycle-controller.sh"
 source_revision="$(printf 'a%.0s' {1..40})"
@@ -292,41 +304,102 @@ controller_args=(
   --image "registry.example/research@sha256:$image_digest"
   --campaign-root https://bucket.oss-ap-northeast-1-internal.aliyuncs.com/research/campaigns
   --signer "$bin/signer"
-  --work-dir "$root/cycle"
+  --work-dir "$mac_work_dir"
   --seed 7 --seed 11
   --max-follow-ups 1
 )
-resume_args=(
-  resume
+ack_args=(
+  ack-readback
+  --alpha-harness "$bin/alpha-harness"
+  --aliyun "$bin/aliyun"
+  --kubectl "$bin/kubectl"
+  --work-dir "$root/campaign-root/cycle"
+)
+approve_args=(
+  approve
   --alpha-harness "$bin/alpha-harness"
   --aliyun "$bin/aliyun"
   --kubectl "$bin/kubectl"
   --signer "$bin/signer"
-  --work-dir "$root/cycle"
+  --work-dir "$root/campaign-root/cycle"
 )
 
-if (cd "$start_dir" && "$controller" "${controller_args[@]}") \
-  >"$root/first.stdout" 2>"$root/first.stderr"; then
-  echo "first controller run unexpectedly succeeded" >&2
+if ! (cd "$start_dir" && FAKE_UNAME=Darwin "$controller" "${controller_args[@]}") \
+  >"$root/start.stdout" 2>"$root/start.stderr"; then
+  cat "$root/start.stderr" >&2
   exit 1
 fi
-test "$(jq -r '.campaign_inputs' "$root/cycle/controller-inputs.json")" \
+test "$(jq -r '.campaign_inputs' "$mac_work_dir/controller-inputs.json")" \
   = "$start_dir/campaign-inputs.json"
-test "$(jq -r '.input_root' "$root/cycle/controller-inputs.json")" = "$start_dir/input"
-test -s "$root/cycle/generation-0/request.json"
+test "$(jq -r '.input_root' "$mac_work_dir/controller-inputs.json")" = "$start_dir/input"
+test -s "$mac_work_dir/generation-0/request.json"
 test "$(<"$FAKE_STATE/signer-count")" == 1
 test "$(<"$FAKE_STATE/dispatch-count")" == 1
-grep -Fq 'schema_version=monday.research_event.v1 component=campaign-cycle-controller event=cycle_failed generation=0 stage=oss_result_readback' "$root/first.stderr"
+grep -Fq 'kind: Job' "$root/start.stdout"
+request_sha256="$(jq -r '.request_sha256' "$mac_work_dir/generation-0/finalize-report.json")"
+grep -Fq "name: campaign-cycle-${request_sha256:0:16}" "$root/start.stdout"
+grep -Fq 'research.monday/campaign-id: campaign-g0' "$root/start.stdout"
+grep -Fq "/campaign-root/cycles/${mac_work_dir##*/}" "$root/start.stdout"
+grep -Fq 'event=stage_completed generation=0 stage=ack_handoff' "$root/start.stderr"
+test ! -e "$FAKE_STATE/ossutil-calls"
+test -z "$(find "$mac_work_dir" -name '*results.zip' -print -quit)"
 jq -e '
   .schema_version == "monday.campaign_cycle_status.v1"
   and .checkpoint_status == "incomplete"
   and .generation == 0
-  and .next_stage == "oss_result_readback"
+  and .next_stage == "kubernetes_runtime_readback"
   and .campaign_id == "campaign-g0"
   and .job_name == "job-g0"
-' < <("$controller" status --work-dir "$root/cycle") >/dev/null
+' < <("$controller" status --work-dir "$mac_work_dir") >/dev/null
 
-if "$controller" "${resume_args[@]}" >"$root/second.stdout" 2>"$root/second.stderr"; then
+darwin_ack_args=(
+  ack-readback
+  --alpha-harness "$bin/alpha-harness"
+  --aliyun "$bin/aliyun"
+  --kubectl "$bin/kubectl"
+  --work-dir "$mac_work_dir"
+)
+if FAKE_UNAME=Darwin "$controller" "${darwin_ack_args[@]}" \
+  >"$root/darwin.stdout" 2>"$root/darwin.stderr"; then
+  echo "Darwin ACK readback unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -Fq 'stage=oss_result_readback' "$root/darwin.stderr"
+grep -Fq 'OSS result readback is forbidden on Darwin' "$root/darwin.stderr"
+test ! -e "$FAKE_STATE/ossutil-calls"
+test -z "$(find "$mac_work_dir" -name '*results.zip' -print -quit)"
+
+mkdir -p "$root/campaign-root"
+cp -R "$mac_work_dir" "$root/campaign-root/cycle"
+mv "$start_dir/campaign-inputs.json" "$root/campaign-inputs.offline"
+mv "$start_dir/input" "$root/input.offline"
+
+if "$controller" "${ack_args[@]}" >"$root/first.stdout" 2>"$root/first.stderr"; then
+  echo "first ACK readback unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -Fq 'schema_version=monday.research_event.v1 component=campaign-cycle-controller event=cycle_failed generation=0 stage=oss_result_readback' "$root/first.stderr"
+
+if ! "$controller" "${ack_args[@]}" >"$root/learn.stdout" 2>"$root/learn.stderr"; then
+  cat "$root/learn.stderr" >&2
+  exit 1
+fi
+grep -Fq 'event=stage_completed generation=0 stage=approval_handoff next_generation=1' "$root/learn.stderr"
+test -s "$root/campaign-root/cycle/generation-0/next-research-plan.json"
+mv "$root/campaign-inputs.offline" "$start_dir/campaign-inputs.json"
+mv "$root/input.offline" "$start_dir/input"
+
+oss_calls_before_approve="$(wc -l <"$FAKE_STATE/ossutil-calls" | tr -d ' ')"
+if ! FAKE_UNAME=Darwin "$controller" "${approve_args[@]}" \
+  >"$root/approve.stdout" 2>"$root/approve.stderr"; then
+  cat "$root/approve.stderr" >&2
+  exit 1
+fi
+grep -Fq 'kind: Job' "$root/approve.stdout"
+grep -Fq 'event=stage_completed generation=1 stage=ack_handoff' "$root/approve.stderr"
+test "$(wc -l <"$FAKE_STATE/ossutil-calls" | tr -d ' ')" == "$oss_calls_before_approve"
+
+if "$controller" "${ack_args[@]}" >"$root/second.stdout" 2>"$root/second.stderr"; then
   echo "controller accepted a mismatched learning-directive digest" >&2
   exit 1
 fi
@@ -337,9 +410,9 @@ jq -e '
   and .next_stage == "oss_result_readback"
   and .campaign_id == "campaign-g1"
   and .job_name == "job-g1"
-' < <("$controller" status --work-dir "$root/cycle") >/dev/null
+' < <("$controller" status --work-dir "$root/campaign-root/cycle") >/dev/null
 
-if ! "$controller" "${resume_args[@]}" >"$root/third.stdout" 2>"$root/third.stderr"; then
+if ! "$controller" "${ack_args[@]}" >"$root/third.stdout" 2>"$root/third.stderr"; then
   cat "$root/third.stderr" >&2
   exit 1
 fi
@@ -356,28 +429,28 @@ done
 
 jq -e --arg directive_sha256 "$(<"$FAKE_STATE/directive-sha256")" \
   '.generation == 1 and .termination_reason == "campaign_finalized" and .round_readback_count == 2 and .learning_directive_sha256 == $directive_sha256 and .search_policy_revision_id == ("cex-search-policy-" + ("1" * 64))' \
-  "$root/cycle/cycle-result.json" >/dev/null
+  "$root/campaign-root/cycle/cycle-result.json" >/dev/null
 jq -e '
   .checkpoint_status == "complete"
   and .generation == 1
   and .next_stage == null
   and .termination_reason == "campaign_finalized"
-' < <("$controller" status --work-dir "$root/cycle") >/dev/null
-test -s "$root/cycle/generation-0/next-research-plan.json"
+' < <("$controller" status --work-dir "$root/campaign-root/cycle") >/dev/null
 test "$(<"$FAKE_STATE/signer-count")" == 2
 test "$(<"$FAKE_STATE/dispatch-count")" == 2
 test "$(wc -l <"$FAKE_STATE/deleted-secrets" | tr -d ' ')" == 2
 test "$(grep -c -- '--timeout=7h' "$FAKE_STATE/job-waits")" == 2
 for generation in 0 1; do
-  test -e "$root/cycle/generation-$generation/provenance-readback-complete"
-  test -e "$root/cycle/generation-$generation/result-readback-complete"
+  test -e "$root/campaign-root/cycle/generation-$generation/provenance-readback-complete"
+  test -e "$root/campaign-root/cycle/generation-$generation/result-readback-complete"
   for round_index in 0 1; do
-    test -s "$root/cycle/generation-$generation/round-readback/round-$round_index-mission.json"
-    test -s "$root/cycle/generation-$generation/round-readback/round-$round_index-results.zip"
+    test -s "$root/campaign-root/cycle/generation-$generation/round-readback/round-$round_index-mission.json"
+    test -s "$root/campaign-root/cycle/generation-$generation/round-readback/round-$round_index-results.zip"
   done
   for sensitive in signed-request.json request.json submission.json; do
-    test ! -e "$root/cycle/generation-$generation/$sensitive"
+    test ! -e "$root/campaign-root/cycle/generation-$generation/$sensitive"
   done
 done
+test -z "$(find "$mac_work_dir" -name '*results.zip' -print -quit)"
 
 echo "campaign cycle controller test: PASS"

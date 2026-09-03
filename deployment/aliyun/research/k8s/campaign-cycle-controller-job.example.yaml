@@ -1,0 +1,93 @@
+# Rendered handoff target for `campaign-cycle-controller.sh start|approve`.
+# Replace every REPLACE_* value, review it, and apply it only as a separate
+# operator action. This Job never executes Campaign orders or changes runtime
+# risk. Its image must contain bash, jq, kubectl, aliyun/ossutil, alpha-harness,
+# and campaign-cycle-controller.sh at the path below.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: REPLACE_CONTROLLER_JOB_NAME
+  namespace: monday-research
+  annotations:
+    research.monday/campaign-id: REPLACE_CAMPAIGN_ID
+    research.monday/request-sha256: REPLACE_REQUEST_SHA256
+    research.monday/lane: cex_campaign_cycle_readback
+  labels:
+    app.kubernetes.io/name: monday-campaign-cycle-controller
+    app.kubernetes.io/part-of: monday
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 28800
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      annotations:
+        research.monday/campaign-id: REPLACE_CAMPAIGN_ID
+        research.monday/request-sha256: REPLACE_REQUEST_SHA256
+        research.monday/lane: cex_campaign_cycle_readback
+      labels:
+        app.kubernetes.io/name: monday-campaign-cycle-controller
+        app.kubernetes.io/part-of: monday
+    spec:
+      restartPolicy: Never
+      serviceAccountName: monday-campaign-cycle-controller
+      automountServiceAccountToken: true
+      imagePullSecrets:
+        - name: monday-acr
+      nodeSelector:
+        kubernetes.io/arch: amd64
+        workload: backtest
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: campaign-cycle-controller
+          image: REPLACE_CONTROLLER_IMAGE@sha256:REPLACE_CONTROLLER_IMAGE_SHA256
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - /opt/monday/deployment/aliyun/research/scripts/campaign-cycle-controller.sh
+          args:
+            - ack-readback
+            - --work-dir
+            - /campaign-root/cycles/REPLACE_CYCLE_ID
+            - --alpha-harness
+            - /usr/local/bin/alpha-harness
+            - --aliyun
+            - aliyun
+            - --kubectl
+            - kubectl
+          envFrom:
+            # Research-only LLM configuration for campaign-learn. Never point
+            # this at an exchange, trading, execution, or runtime Secret.
+            - secretRef:
+                name: REPLACE_RESEARCH_LEARNING_SECRET
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            # The approved controller checkpoint and all learn artifacts stay
+            # on the campaign-root-backed volume, never laptop /tmp.
+            - name: campaign-root
+              mountPath: /campaign-root
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: campaign-root
+          persistentVolumeClaim:
+            claimName: REPLACE_CAMPAIGN_ROOT_PVC
+        - name: tmp
+          emptyDir: {}

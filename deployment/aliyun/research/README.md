@@ -483,56 +483,86 @@ The feature set, evaluator, fees, validation, budgets, holdout, and model kinds
 remain frozen. The LLM supplies only the falsifiable hypothesis text and cannot
 change the pinned policy revision, Kubernetes, risk, or execution authority.
 The output is create-once, limited to three follow-up generations, and its
-content hash changes the child Campaign identity. LLM
-credentials remain outside ACK; the existing dispatcher is still the only path
-that creates the next suspended Job.
+content hash changes the child Campaign identity. The Campaign execution Job
+still receives no LLM credentials. Only the separate ACK controller Job may
+receive the research-learning Secret used by `campaign-learn`; the existing
+dispatcher is still the only path that creates the next suspended execution
+Job.
 
-`scripts/campaign-cycle-controller.sh` is the bounded external controller for
-the complete loop. Run it from a trusted Tokyo VPC control-plane host with
-`alpha-harness`, `aliyun`, `kubectl`, `jq`, LLM environment variables, and an
-executable signer. The signer remains a separate trust boundary and receives
-the frozen signing plan; the controller never logs signed URLs. Its mode-0700
-work directory is input-bound and resumable: after dispatch, a transient
-control-plane or OSS failure resumes the same request and Job instead of
-re-signing or resubmitting a new identity. Signed request/submission files are
-removed once that generation is processed. For example:
+`scripts/campaign-cycle-controller.sh` separates the local control plane from
+ACK data-plane readback. A workstation may run only `start`, `status`, or
+`approve`. `start` freezes, signs, finalizes, and dispatches one approved
+generation, then prints `k8s/campaign-cycle-controller-job.example.yaml` to
+stdout for review. It does not wait for the Campaign Job, enter
+`oss_result_readback`, run `campaign-learn`, or copy any `results.zip` object.
+`approve` performs the same bounded preparation for one learned child
+generation and prints a fresh ACK Job handoff. Applying either printed Job is a
+separate operator action; the controller does not apply it.
+
+The signer remains a separate trust boundary and receives the frozen signing
+plan. The controller never logs signed URLs. Its mode-0700 work directory is
+input-bound and resumable across these explicit handoffs. Signed
+request/submission files are removed once that generation is processed. Keep
+the control checkpoint on the campaign-root-backed volume used by the ACK Job,
+not below laptop `/tmp/monday-cex-e2e*`. For example:
 
 ```bash
 deployment/aliyun/research/scripts/campaign-cycle-controller.sh start \
-  --campaign-inputs /private/run/campaign-inputs.json \
-  --input-root /private/run \
+  --campaign-inputs /campaign-root/inputs/campaign-inputs.json \
+  --input-root /campaign-root/inputs \
   --source-revision REPLACE_EXACT_GIT_SHA \
   --image registry/research-runner@sha256:REPLACE_DIGEST \
   --campaign-root https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/campaigns \
   --signer /private/bin/monday-campaign-oss-signer \
-  --work-dir /private/cycles/REPLACE_RUN_ID \
+  --work-dir /campaign-root/cycles/REPLACE_RUN_ID \
   --seed 7 --seed 11
 ```
 
 The first start persists every non-secret cycle input in the private work
-directory. Inspect or resume that exact cycle without reconstructing those
+directory. Inspect that exact cycle, or approve a child after the ACK readback
+Job has written its bounded learning plan, without reconstructing those
 arguments:
 
 ```bash
 deployment/aliyun/research/scripts/campaign-cycle-controller.sh status \
-  --work-dir /private/cycles/REPLACE_RUN_ID
+  --work-dir /campaign-root/cycles/REPLACE_RUN_ID
 
-deployment/aliyun/research/scripts/campaign-cycle-controller.sh resume \
-  --work-dir /private/cycles/REPLACE_RUN_ID \
+deployment/aliyun/research/scripts/campaign-cycle-controller.sh approve \
+  --work-dir /campaign-root/cycles/REPLACE_RUN_ID \
   --signer /private/bin/monday-campaign-oss-signer
 ```
 
 `status` reports the local checkpoint and next controller stage; it does not
-claim live Kubernetes state. `resume` revalidates the persisted input binding
-and continues the same Campaign identity. The signer must be supplied again so
-a restarted controller cannot cross that trust boundary implicitly.
+claim live Kubernetes state. `approve` revalidates the persisted input binding
+before it signs or dispatches the next Campaign identity. The signer must be
+supplied again so a restarted controller cannot cross that trust boundary
+implicitly.
 
-The controller performs `freeze -> sign -> finalize -> dispatch -> K8S Job
-wait -> Pod image readback -> immutable per-round OSS readback -> learn -> child
-Campaign`, deleting the input Secret after terminal Job/Pod capture and
-stopping on a candidate or after at most three follow-ups. It is not resident
-in the ACK namespace and has no order, execution, risk-limit, or runtime-resume
-authority.
+The printed ACK Job runs `ack-readback` from
+`/campaign-root/cycles/REPLACE_CYCLE_ID`. Its campaign-root PVC must be bound to
+the Tokyo internal OSS campaign prefix, following the retained OSS CSI pattern
+in `k8s/cex-materialization-output-volume.example.yaml`; it must not point to a
+laptop path. Do not reuse `k8s/alpha-mission-job.example.yaml`: that Job remains
+the tokenless `campaign-execute` shape, while the controller Job has a distinct
+image and narrow readback ServiceAccount. On ACK, the controller waits for the
+already-approved Campaign Job, reads the exact Job and Pod provenance, deletes
+only that Job's exact `<job-name>-inputs` Secret, and performs every OSS GET with
+`oss-ap-northeast-1-internal.aliyuncs.com`. It verifies the Campaign result,
+each Mission, and each `results.zip` SHA-256 before running `campaign-learn`.
+The downloaded evidence, `next-research-plan.json`, and learn report remain on
+the campaign-root OSS volume. They are never copied to Mac `/tmp`.
+
+Darwin is fail-closed inside `oss_readback`: any attempt to run the ACK
+readback mode on macOS exits non-zero before creating a partial destination or
+any `round-*-results.zip`. `start`, `status`, and `approve` therefore remain
+local control-plane operations only. The ACK Job uses the namespace-scoped
+ServiceAccount and Role in
+`k8s/campaign-cycle-controller-rbac.example.yaml`: exact Job read/watch, Pod
+read/list for the Job-owned Pod, and deletion of one exact `*-inputs` Secret.
+It has no create/patch authority, cluster-wide authority, exchange credential,
+order, risk-limit, or runtime-resume access. After a negative generation, the
+ACK Job stops at `approval_handoff`; a workstation may inspect `status` and
+explicitly approve the next bounded generation.
 
 Wrap the final request with `attempt_id` and the exact digest-pinned `image` in
 the private submission file, then submit it directly:

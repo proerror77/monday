@@ -27,8 +27,12 @@ Usage: campaign-cycle-controller.sh [start] \
   [--context NAME] [--namespace NAME] [--max-follow-ups 3] \
   [--max-tokens 300] [--job-timeout 7h]
 
-       campaign-cycle-controller.sh resume \
+       campaign-cycle-controller.sh approve \
   --work-dir DIR --signer EXECUTABLE \
+  [--alpha-harness EXECUTABLE] [--aliyun EXECUTABLE] [--kubectl EXECUTABLE]
+
+       campaign-cycle-controller.sh ack-readback \
+  --work-dir DIR \
   [--alpha-harness EXECUTABLE] [--aliyun EXECUTABLE] [--kubectl EXECUTABLE]
 
        campaign-cycle-controller.sh status --work-dir DIR
@@ -38,6 +42,25 @@ The signer is a separate trust boundary. It is invoked as:
 It must sign every action in the frozen signing plan without changing the
 query-free object identity, HTTP method, content type, or required headers.
 EOF
+}
+
+print_ack_controller_job() {
+  local campaign_id="$1"
+  local request_sha256="$2"
+  local controller_work_dir="$3"
+  local script_dir job_template cycle_id
+  script_dir="$(cd "$(dirname "$0")" && pwd -P)"
+  job_template="$script_dir/../k8s/campaign-cycle-controller-job.example.yaml"
+  [[ -s "$job_template" ]] || die "ACK controller Job template is missing: $job_template"
+  cycle_id="${controller_work_dir##*/}"
+  [[ "$cycle_id" =~ ^[A-Za-z0-9._-]+$ ]] \
+    || die "work directory basename is unsafe for an ACK Job handoff: $cycle_id"
+  sed \
+    -e "s/REPLACE_CONTROLLER_JOB_NAME/campaign-cycle-${request_sha256:0:16}/g" \
+    -e "s/REPLACE_CAMPAIGN_ID/$campaign_id/g" \
+    -e "s/REPLACE_REQUEST_SHA256/$request_sha256/g" \
+    -e "s/REPLACE_CYCLE_ID/$cycle_id/g" \
+    "$job_template"
 }
 
 validate_controller_state() {
@@ -185,7 +208,7 @@ seeds=()
 mode="start"
 
 case "${1:-}" in
-  start|resume|status)
+  start|approve|ack-readback|status)
     mode="$1"
     shift
     ;;
@@ -210,25 +233,25 @@ while (($#)); do
     --alpha-harness) alpha_harness="$2"; shift 2 ;;
     --aliyun) aliyun_cli="$2"; shift 2 ;;
     --kubectl) kubectl_cli="$2"; shift 2 ;;
-    --campaign-inputs) [[ "$mode" == "start" ]] || die "resume loads --campaign-inputs from controller state"; campaign_inputs="$2"; shift 2 ;;
-    --input-root) [[ "$mode" == "start" ]] || die "resume loads --input-root from controller state"; input_root="$2"; shift 2 ;;
-    --source-revision) [[ "$mode" == "start" ]] || die "resume loads --source-revision from controller state"; source_revision="$2"; shift 2 ;;
-    --image) [[ "$mode" == "start" ]] || die "resume loads --image from controller state"; image="$2"; shift 2 ;;
-    --campaign-root) [[ "$mode" == "start" ]] || die "resume loads --campaign-root from controller state"; campaign_root="$2"; shift 2 ;;
+    --campaign-inputs) [[ "$mode" == "start" ]] || die "$mode loads --campaign-inputs from controller state"; campaign_inputs="$2"; shift 2 ;;
+    --input-root) [[ "$mode" == "start" ]] || die "$mode loads --input-root from controller state"; input_root="$2"; shift 2 ;;
+    --source-revision) [[ "$mode" == "start" ]] || die "$mode loads --source-revision from controller state"; source_revision="$2"; shift 2 ;;
+    --image) [[ "$mode" == "start" ]] || die "$mode loads --image from controller state"; image="$2"; shift 2 ;;
+    --campaign-root) [[ "$mode" == "start" ]] || die "$mode loads --campaign-root from controller state"; campaign_root="$2"; shift 2 ;;
     --signer) signer="$2"; shift 2 ;;
     --work-dir) work_dir="$2"; shift 2 ;;
-    --seed) [[ "$mode" == "start" ]] || die "resume loads --seed from controller state"; seeds+=("$2"); shift 2 ;;
-    --context) [[ "$mode" == "start" ]] || die "resume loads --context from controller state"; context="$2"; shift 2 ;;
-    --namespace) [[ "$mode" == "start" ]] || die "resume loads --namespace from controller state"; namespace="$2"; shift 2 ;;
-    --max-follow-ups) [[ "$mode" == "start" ]] || die "resume loads --max-follow-ups from controller state"; max_follow_ups="$2"; shift 2 ;;
-    --max-tokens) [[ "$mode" == "start" ]] || die "resume loads --max-tokens from controller state"; max_tokens="$2"; shift 2 ;;
-    --job-timeout) [[ "$mode" == "start" ]] || die "resume loads --job-timeout from controller state"; job_timeout="$2"; shift 2 ;;
+    --seed) [[ "$mode" == "start" ]] || die "$mode loads --seed from controller state"; seeds+=("$2"); shift 2 ;;
+    --context) [[ "$mode" == "start" ]] || die "$mode loads --context from controller state"; context="$2"; shift 2 ;;
+    --namespace) [[ "$mode" == "start" ]] || die "$mode loads --namespace from controller state"; namespace="$2"; shift 2 ;;
+    --max-follow-ups) [[ "$mode" == "start" ]] || die "$mode loads --max-follow-ups from controller state"; max_follow_ups="$2"; shift 2 ;;
+    --max-tokens) [[ "$mode" == "start" ]] || die "$mode loads --max-tokens from controller state"; max_tokens="$2"; shift 2 ;;
+    --job-timeout) [[ "$mode" == "start" ]] || die "$mode loads --job-timeout from controller state"; job_timeout="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
 
-if [[ "$mode" == "resume" ]]; then
+if [[ "$mode" == "approve" || "$mode" == "ack-readback" ]]; then
   [[ -n "$work_dir" ]] || die "--work-dir is required"
   command -v jq >/dev/null || die "jq is required"
   state="$work_dir/controller-inputs.json"
@@ -249,19 +272,24 @@ if [[ "$mode" == "resume" ]]; then
   done < <(jq -er '.seeds[]' "$state")
 fi
 
-for required in campaign_inputs input_root source_revision image campaign_root signer work_dir; do
+for required in campaign_inputs input_root source_revision image campaign_root work_dir; do
   [[ -n "${!required}" ]] || die "--${required//_/-} is required"
 done
+if [[ "$mode" != "ack-readback" ]]; then
+  [[ -n "$signer" ]] || die "--signer is required"
+fi
 ((${#seeds[@]} >= 2)) || die "at least two --seed values are required"
 [[ "$max_follow_ups" =~ ^[0-3]$ ]] || die "--max-follow-ups must be between 0 and 3"
 [[ "$max_tokens" =~ ^[1-9][0-9]*$ ]] || die "--max-tokens must be positive"
 [[ ! -e "$work_dir" || -d "$work_dir" ]] || die "--work-dir must be a directory"
-campaign_inputs_dir="$(cd "$(dirname "$campaign_inputs")" && pwd -P)" \
-  || die "campaign inputs directory does not exist: $(dirname "$campaign_inputs")"
-campaign_inputs="$campaign_inputs_dir/$(basename "$campaign_inputs")"
-[[ -f "$campaign_inputs" ]] || die "campaign inputs file does not exist: $campaign_inputs"
-input_root="$(cd "$input_root" && pwd -P)" || die "input root does not exist: $input_root"
-[[ -x "$signer" ]] || die "signer is not executable: $signer"
+if [[ "$mode" != "ack-readback" ]]; then
+  campaign_inputs_dir="$(cd "$(dirname "$campaign_inputs")" && pwd -P)" \
+    || die "campaign inputs directory does not exist: $(dirname "$campaign_inputs")"
+  campaign_inputs="$campaign_inputs_dir/$(basename "$campaign_inputs")"
+  [[ -f "$campaign_inputs" ]] || die "campaign inputs file does not exist: $campaign_inputs"
+  input_root="$(cd "$input_root" && pwd -P)" || die "input root does not exist: $input_root"
+  [[ -x "$signer" ]] || die "signer is not executable: $signer"
+fi
 command -v "$alpha_harness" >/dev/null || die "alpha-harness executable not found"
 command -v "$aliyun_cli" >/dev/null || die "aliyun executable not found"
 command -v "$kubectl_cli" >/dev/null || die "kubectl executable not found"
@@ -302,6 +330,8 @@ oss_readback() {
   local destination="$2"
   local canonical_url="${object_url%%\?*}"
   local host_and_key host key bucket partial
+  [[ "$(uname -s)" != "Darwin" ]] \
+    || die "OSS result readback is forbidden on Darwin; run the ACK controller Job"
   [[ "$canonical_url" == https://*/* ]] || die "OSS readback URL is not canonical HTTPS"
   host_and_key="${canonical_url#https://}"
   host="${host_and_key%%/*}"
@@ -312,7 +342,7 @@ oss_readback() {
   partial="$destination.partial"
   rm -f -- "$partial"
   "$aliyun_cli" ossutil cp "oss://$bucket/$key" "$partial" \
-    --endpoint oss-ap-northeast-1.aliyuncs.com >&2
+    --endpoint oss-ap-northeast-1-internal.aliyuncs.com >&2
   mv -f -- "$partial" "$destination"
 }
 
@@ -338,30 +368,34 @@ verify_kubernetes_provenance() {
   ' "$pod_status" >/dev/null
 }
 
-campaign_inputs_sha256="$(sha256_file "$campaign_inputs")"
-seeds_json="$(printf '%s\n' "${seeds[@]}" | jq -R 'tonumber' | jq -s '.')"
 state="$work_dir/controller-inputs.json"
-state_tmp="$state.partial.$$"
-jq -n \
-  --arg campaign_inputs "$campaign_inputs" \
-  --arg campaign_inputs_sha256 "$campaign_inputs_sha256" \
-  --arg input_root "$input_root" \
-  --arg source_revision "$source_revision" \
-  --arg image "$image" \
-  --arg campaign_root "$campaign_root" \
-  --arg context "$context" \
-  --arg namespace "$namespace" \
-  --argjson max_follow_ups "$max_follow_ups" \
-  --argjson max_tokens "$max_tokens" \
-  --arg job_timeout "$job_timeout" \
-  --argjson seeds "$seeds_json" \
-  '{campaign_inputs:$campaign_inputs,campaign_inputs_sha256:$campaign_inputs_sha256,input_root:$input_root,source_revision:$source_revision,image:$image,campaign_root:$campaign_root,context:$context,namespace:$namespace,max_follow_ups:$max_follow_ups,max_tokens:$max_tokens,job_timeout:$job_timeout,seeds:$seeds}' \
-  >"$state_tmp"
-if [[ -e "$state" ]]; then
-  cmp -s "$state_tmp" "$state" || die "existing work directory belongs to different controller inputs"
-  rm -f -- "$state_tmp"
+if [[ "$mode" == "ack-readback" ]]; then
+  campaign_inputs_sha256="$(jq -er '.campaign_inputs_sha256' "$state")"
 else
-  mv -- "$state_tmp" "$state"
+  campaign_inputs_sha256="$(sha256_file "$campaign_inputs")"
+  seeds_json="$(printf '%s\n' "${seeds[@]}" | jq -R 'tonumber' | jq -s '.')"
+  state_tmp="$state.partial.$$"
+  jq -n \
+    --arg campaign_inputs "$campaign_inputs" \
+    --arg campaign_inputs_sha256 "$campaign_inputs_sha256" \
+    --arg input_root "$input_root" \
+    --arg source_revision "$source_revision" \
+    --arg image "$image" \
+    --arg campaign_root "$campaign_root" \
+    --arg context "$context" \
+    --arg namespace "$namespace" \
+    --argjson max_follow_ups "$max_follow_ups" \
+    --argjson max_tokens "$max_tokens" \
+    --arg job_timeout "$job_timeout" \
+    --argjson seeds "$seeds_json" \
+    '{campaign_inputs:$campaign_inputs,campaign_inputs_sha256:$campaign_inputs_sha256,input_root:$input_root,source_revision:$source_revision,image:$image,campaign_root:$campaign_root,context:$context,namespace:$namespace,max_follow_ups:$max_follow_ups,max_tokens:$max_tokens,job_timeout:$job_timeout,seeds:$seeds}' \
+    >"$state_tmp"
+  if [[ -e "$state" ]]; then
+    cmp -s "$state_tmp" "$state" || die "existing work directory belongs to different controller inputs"
+    rm -f -- "$state_tmp"
+  else
+    mv -- "$state_tmp" "$state"
+  fi
 fi
 state_tmp=""
 log_event cycle_started \
@@ -373,6 +407,11 @@ log_event cycle_started \
   "max_follow_ups=$max_follow_ups" \
   "context=$context" \
   "namespace=$namespace"
+
+kubectl_readback_args=(--namespace "$namespace")
+if [[ "$mode" != "ack-readback" ]]; then
+  kubectl_readback_args=(--context "$context" --namespace "$namespace")
+fi
 
 if [[ -s "$work_dir/cycle-result.json" ]]; then
   log_event cycle_checkpoint_reused "result=cycle-result.json"
@@ -403,6 +442,9 @@ while ((generation <= max_follow_ups)); do
     [[ -s "$research_plan" ]] || die "completed generation is missing its follow-up plan"
     generation=$((generation + 1))
     continue
+  fi
+  if [[ "$mode" == "ack-readback" && ! -e "$generation_dir/dispatched" ]]; then
+    die "ACK readback requires an approved, dispatched Campaign generation"
   fi
   log_event generation_started \
     "generation=$generation" \
@@ -492,6 +534,17 @@ while ((generation <= max_follow_ups)); do
   fi
   [[ -s "$dispatch_report" ]] || die "Campaign dispatch checkpoint is incomplete"
 
+  if [[ "$mode" != "ack-readback" ]]; then
+    controller_stage="ack_handoff"
+    log_event stage_completed \
+      "generation=$generation" \
+      "stage=ack_handoff" \
+      "job_name=$job_name" \
+      "template=campaign-cycle-controller-job.example.yaml"
+    print_ack_controller_job "$campaign_id" "$request_sha256" "$work_dir"
+    exit 0
+  fi
+
   job_status="$generation_dir/job-status.json"
   pod_status="$generation_dir/pod-status.json"
   if [[ ! -e "$generation_dir/provenance-readback-complete" ]]; then
@@ -502,19 +555,19 @@ while ((generation <= max_follow_ups)); do
       "job_name=$job_name" \
       "timeout=$job_timeout"
     wait_completed=true
-    if ! "$kubectl_cli" --context "$context" --namespace "$namespace" wait \
+    if ! "$kubectl_cli" "${kubectl_readback_args[@]}" wait \
       --for=condition=complete "job/$job_name" --timeout="$job_timeout" >&2; then
       wait_completed=false
     fi
-    "$kubectl_cli" --context "$context" --namespace "$namespace" get \
+    "$kubectl_cli" "${kubectl_readback_args[@]}" get \
       "job/$job_name" -o json >"$job_status" \
       || die "Campaign Job status readback failed: $job_name"
     job_complete="$(jq -r '(.status.conditions // [] | any(.type == "Complete" and .status == "True"))' "$job_status")"
     job_failed="$(jq -r '(.status.conditions // [] | any(.type == "Failed" and .status == "True"))' "$job_status")"
     if [[ "$job_failed" == true ]]; then
-      "$kubectl_cli" --context "$context" --namespace "$namespace" get pods \
+      "$kubectl_cli" "${kubectl_readback_args[@]}" get pods \
         -l "job-name=$job_name" -o json >"$pod_status" || true
-      "$kubectl_cli" --context "$context" --namespace "$namespace" delete \
+      "$kubectl_cli" "${kubectl_readback_args[@]}" delete \
         secret "$job_name-inputs" --ignore-not-found=true >/dev/null
       rm -f -- "$request"
       : >"$generation_dir/terminal-failure"
@@ -523,11 +576,11 @@ while ((generation <= max_follow_ups)); do
     [[ "$job_complete" == true ]] \
       || { [[ "$wait_completed" == true ]] && die "Campaign Job completion condition is missing: $job_name"; die "Campaign Job wait ended before terminal status: $job_name"; }
     pod_readback_ok=true
-    if ! "$kubectl_cli" --context "$context" --namespace "$namespace" get pods \
+    if ! "$kubectl_cli" "${kubectl_readback_args[@]}" get pods \
       -l "job-name=$job_name" -o json >"$pod_status"; then
       pod_readback_ok=false
     fi
-    "$kubectl_cli" --context "$context" --namespace "$namespace" delete \
+    "$kubectl_cli" "${kubectl_readback_args[@]}" delete \
       secret "$job_name-inputs" --ignore-not-found=true >/dev/null
     [[ "$pod_readback_ok" == true ]] || die "Campaign Pod status readback failed: $job_name"
     image_identity="$(jq -er '.image_identity' "$request")"
@@ -744,5 +797,15 @@ while ((generation <= max_follow_ups)); do
     "research_plan_sha256=$(jq -er '.research_plan_sha256' "$generation_dir/learn-report.json")"
   : >"$generation_dir/generation-complete"
   rm -f -- "$request"
+  if [[ "$mode" == "ack-readback" ]]; then
+    controller_stage="approval_handoff"
+    log_event stage_completed \
+      "generation=$generation" \
+      "stage=approval_handoff" \
+      "next_generation=$((generation + 1))" \
+      "research_plan_sha256=$(jq -er '.research_plan_sha256' "$generation_dir/learn-report.json")"
+    cycle_status "$work_dir"
+    exit 0
+  fi
   generation=$((generation + 1))
 done
