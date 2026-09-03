@@ -384,8 +384,16 @@ while ((generation <= max_follow_ups)); do
       "campaign_id=$campaign_id"
     result_url="$(jq -er '.campaign_result_readback_url' "$request")"
     oss_readback "$result_url" "$result"
-    jq -e --slurpfile request_doc "$request" --arg request_sha256 "$request_sha256" '
-      .schema_version == "cex-campaign-result-v6"
+    expected_learning_directive_sha256="none"
+    if jq -e '.research_plan.learning_directive != null' "$request" >/dev/null; then
+      expected_learning_directive_sha256="$(
+        sha256_file <(jq -cj '.research_plan.learning_directive' "$request")
+      )"
+    fi
+    jq -e --slurpfile request_doc "$request" \
+      --arg request_sha256 "$request_sha256" \
+      --arg expected_learning_directive_sha256 "$expected_learning_directive_sha256" '
+      .schema_version == "cex-campaign-result-v7"
       and .campaign_id == $request_doc[0].campaign_id
       and .request_sha256 == $request_sha256
       and .build_source_revision == $request_doc[0].build_source_revision
@@ -393,6 +401,15 @@ while ((generation <= max_follow_ups)); do
       and .campaign_inputs_sha256 == $request_doc[0].campaign_inputs_sha256
       and .producer_source_revision == $request_doc[0].producer_source_revision
       and .producer_image_identity == $request_doc[0].producer_image_identity
+      and .search_policy_revision == $request_doc[0].research_plan.search_policy_revision
+      and .learning_directive == ($request_doc[0].research_plan.learning_directive // null)
+      and (
+        if ($request_doc[0].research_plan.learning_directive // null) == null then
+          .learning_directive_sha256 == null
+        else
+          .learning_directive_sha256 == $expected_learning_directive_sha256
+        end
+      )
       and .holdout_id == $request_doc[0].holdout_id
       and .declared_total_trials == $request_doc[0].declared_total_trials
       and .stop_rule == "bounded_multi_round_single_finalize_v2"
@@ -465,12 +482,16 @@ while ((generation <= max_follow_ups)); do
   done
   termination_reason="$(jq -er '.termination_reason' "$result")"
   observed_image_id="$(jq -er '.items[0].status.containerStatuses[] | select(.name == "alpha-campaign") | .imageID' "$pod_status")"
+  search_policy_revision_id="$(jq -er '.search_policy_revision.revision_id' "$result")"
+  learning_directive_sha256="$(jq -r '.learning_directive_sha256 // "none"' "$result")"
   log_event stage_completed \
     "generation=$generation" \
     "stage=oss_result_readback" \
     "campaign_id=$campaign_id" \
     "campaign_result_sha256=$result_sha256" \
     "termination_reason=$termination_reason" \
+    "learning_directive_sha256=$learning_directive_sha256" \
+    "search_policy_revision_id=$search_policy_revision_id" \
     "round_count=$request_round_count" \
     "consumed_trials=$(jq -er '.consumed_trials' "$result")"
 
@@ -482,8 +503,10 @@ while ((generation <= max_follow_ups)); do
     --arg result_sha256 "$result_sha256" \
     --arg termination_reason "$termination_reason" \
     --arg observed_image_id "$observed_image_id" \
+    --arg learning_directive_sha256 "$learning_directive_sha256" \
+    --arg search_policy_revision_id "$search_policy_revision_id" \
     --argjson round_readback_count "$request_round_count" \
-    '{generation:$generation,campaign_id:$campaign_id,request_sha256:$request_sha256,job_name:$job_name,campaign_result_sha256:$result_sha256,termination_reason:$termination_reason,observed_image_id:$observed_image_id,round_readback_count:$round_readback_count}' \
+    '{generation:$generation,campaign_id:$campaign_id,request_sha256:$request_sha256,job_name:$job_name,campaign_result_sha256:$result_sha256,termination_reason:$termination_reason,observed_image_id:$observed_image_id,learning_directive_sha256:$learning_directive_sha256,search_policy_revision_id:$search_policy_revision_id,round_readback_count:$round_readback_count}' \
     >"$generation_dir/generation-report.json"
 
   if [[ "$termination_reason" != "campaign_no_candidate" ]]; then
@@ -534,6 +557,9 @@ while ((generation <= max_follow_ups)); do
     "generation=$generation" \
     "stage=campaign_learning" \
     "parent_campaign_id=$campaign_id" \
+    "failure_class=$(jq -er '.failure_class' "$generation_dir/learn-report.json")" \
+    "learning_directive_sha256=$(jq -er '.learning_directive_sha256' "$generation_dir/learn-report.json")" \
+    "search_policy_revision_id=$(jq -er '.search_policy_revision_id' "$generation_dir/learn-report.json")" \
     "research_plan_sha256=$(jq -er '.research_plan_sha256' "$generation_dir/learn-report.json")"
   : >"$generation_dir/generation-complete"
   rm -f -- "$request"

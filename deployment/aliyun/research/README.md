@@ -473,16 +473,17 @@ alpha-harness mission campaign-freeze \
   --research-plan /private/path/next-research-plan.json
 ```
 
-The Campaign result schema is `cex-campaign-result-v6`. It carries bounded,
+The Campaign result schema is `cex-campaign-result-v7`. It carries bounded,
 structured continuous-factor screening, Ridge/CART OOS metrics, selected-model
-identity, and cost-aware L2 replay feedback for each round, so the LLM can
-select the next admitted focus from the actual failure stage instead of only
-seeing `baseline_gate_failed`. The LLM may choose one admitted feature focus
-plus a falsifiable hypothesis. Governed factor generation and model training
-remain deterministic. The LLM cannot change data, fees, validation, trial
-limits, holdout, Kubernetes, risk, or execution authority. The output is
-create-once, limited to three follow-up generations, and its content hash
-changes the child Campaign identity. LLM
+identity, cost-aware L2 replay feedback, the deterministic failure class, and
+the exact learning-directive/search-policy revision lineage for each round.
+`no_trades_after_costs` admits only the registered prediction-identity mapping;
+`overtrade_capacity` admits only the registered hysteretic cost-aware mapping.
+The feature set, evaluator, fees, validation, budgets, holdout, and model kinds
+remain frozen. The LLM supplies only the falsifiable hypothesis text and cannot
+change the pinned policy revision, Kubernetes, risk, or execution authority.
+The output is create-once, limited to three follow-up generations, and its
+content hash changes the child Campaign identity. LLM
 credentials remain outside ACK; the existing dispatcher is still the only path
 that creates the next suspended Job.
 
@@ -533,10 +534,9 @@ exchange account file, API key, or order/execution entrypoint. Each round
 records `results/mission-admission.json`, which binds the current request SHA
 and the round's Mission SHA alongside the campaign and round IDs.
 
-One Campaign maps to multiple rounds. The canonical v4 factor plan uses 8
-snapshot L2 terminals and 20 bounded candidate slots. A follow-up retains the
-three named-template fields plus one admitted focus field and therefore uses 12
-candidate slots. The request derives the total trial limit from the exact plan
+One Campaign maps to multiple rounds. The canonical v4 factor plan and every
+bounded policy follow-up retain all 8 snapshot L2 terminals and 20 candidate
+slots. The request derives the total trial limit from the exact plan
 and round count. Both use the six-hour protocol
 `7200 + 3*(3600+1) + 5 + 3600 = 21608`, and the `$1000 / Top5 5%` capacity
 screen. A v4 Campaign counts its governed factor attempts plus the three
