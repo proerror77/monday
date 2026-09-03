@@ -7,8 +7,8 @@ use crate::{
     mission_render::{
         allowed_research_feature_fields, render_cex_bundle, CexCampaignFailureClassV1,
         CexCampaignLearningDirectiveV1, CexCampaignLlmProvenanceV1, CexCampaignPositionPolicyV1,
-        CexCampaignResearchParentV1, CexCampaignResearchPlanV1, CexCampaignSearchPolicyRevisionV1,
-        MAX_RESEARCH_PLAN_GENERATION,
+        CexCampaignResearchEvidenceSignatureV1, CexCampaignResearchParentV1,
+        CexCampaignResearchPlanV1, CexCampaignSearchPolicyRevisionV1, MAX_RESEARCH_PLAN_GENERATION,
     },
     mission_runner::{
         execute_report, fetch_to_file, finalize_existing_search_round, normalized_sha256,
@@ -43,11 +43,12 @@ use zip::ZipArchive;
 
 const CAMPAIGN_FREEZE_SCHEMA_V1: &str = "cex-campaign-freeze-v1";
 const CAMPAIGN_INPUTS_SCHEMA_V1: &str = "monday.cex_campaign_inputs.v1";
-const CAMPAIGN_REQUEST_SCHEMA_V4: &str = "cex-campaign-request-v4";
-const CAMPAIGN_RESULT_SCHEMA_V5: &str = "cex-campaign-result-v5";
-const CAMPAIGN_RESULT_SCHEMA_V6: &str = "cex-campaign-result-v6";
-const CAMPAIGN_RESULT_SCHEMA_V7: &str = "cex-campaign-result-v7";
-const CAMPAIGN_IDENTITY_SCHEMA_V4: &str = "cex-campaign-identity-v4";
+const CAMPAIGN_REQUEST_SCHEMA_V5: &str = "cex-campaign-request-v5";
+const CAMPAIGN_RESULT_SCHEMA_V8: &str = "cex-campaign-result-v8";
+const CAMPAIGN_IDENTITY_SCHEMA_V5: &str = "cex-campaign-identity-v5";
+const CAMPAIGN_ROUND_IDENTITY_SCHEMA_V1: &str = "cex-campaign-round-identity-v1";
+const CAMPAIGN_DATA_FINGERPRINT_SCHEMA_V1: &str = "cex-campaign-31h-data-fingerprint-v1";
+const CAMPAIGN_DATA_WINDOW_HOURS: u8 = 31;
 const STOP_RULE_V2: &str = "bounded_multi_round_single_finalize_v2";
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
 const MAX_CAMPAIGN_RESULT_BYTES: u64 = 1024 * 1024;
@@ -97,10 +98,21 @@ pub(crate) struct CampaignRequest {
 pub(crate) struct CampaignRoundRequest {
     pub(crate) round_id: String,
     pub(crate) seed: u64,
+    pub(crate) identity: CampaignRoundIdentityV1,
     pub(crate) mission_put_url: String,
     pub(crate) mission_readback_url: String,
     pub(crate) result_put_url: String,
     pub(crate) result_readback_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CampaignRoundIdentityV1 {
+    pub(crate) schema_version: String,
+    pub(crate) data_window_hours: u8,
+    pub(crate) data_fingerprint_sha256: String,
+    pub(crate) image_identity: String,
+    pub(crate) build_source_revision: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,6 +217,7 @@ struct CampaignEvaluationFeedbackV1 {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct CampaignFactorFeedbackV1 {
+    factor_signature_sha256: String,
     source_features: Vec<String>,
     rejection_codes: Vec<CexFactorRejectionCodeV1>,
     evaluation: Option<CampaignEvaluationFeedbackV1>,
@@ -242,6 +255,8 @@ struct CampaignRoundFeedbackV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     supervised_burn: Option<CampaignEvaluationFeedbackV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    supervised_selected: Option<CampaignEvaluationFeedbackV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     supervised_selected_candidate_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     supervised_replay: Option<CampaignReplayFeedbackV1>,
@@ -251,6 +266,7 @@ struct CampaignRoundFeedbackV1 {
 struct CampaignMissionLedgerV1 {
     round_id: String,
     seed: u64,
+    identity: CampaignRoundIdentityV1,
     mission_id: String,
     mission_sha256: String,
     request_sha256: Option<String>,
@@ -281,6 +297,7 @@ fn round_log_summary(round: &CampaignMissionLedgerV1) -> serde_json::Value {
     serde_json::json!({
         "round_id": &round.round_id,
         "seed": round.seed,
+        "identity": &round.identity,
         "mission_id": &round.mission_id,
         "mission_sha256": &round.mission_sha256,
         "result_bundle_sha256": &round.result_bundle_sha256,
@@ -296,6 +313,7 @@ fn round_log_summary(round: &CampaignMissionLedgerV1) -> serde_json::Value {
         "supervised_ridge": &round.feedback.supervised_ridge,
         "supervised_cart": &round.feedback.supervised_cart,
         "supervised_burn": &round.feedback.supervised_burn,
+        "supervised_selected": &round.feedback.supervised_selected,
         "supervised_replay": &round.feedback.supervised_replay,
         "selected_candidate_id": &round.selected_candidate_id,
         "selected_score": round.selected_score,
@@ -357,11 +375,24 @@ struct CampaignLearnReport {
     parent_request_sha256: String,
     parent_campaign_result_sha256: String,
     failure_class: CexCampaignFailureClassV1,
-    learning_directive_sha256: String,
-    search_policy_revision_id: String,
-    research_plan_sha256: String,
-    output: String,
+    outcome: CampaignLearnOutcomeV1,
+    evidence_signature: CexCampaignResearchEvidenceSignatureV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    learning_directive_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    search_policy_revision_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    research_plan_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<String>,
     reused_existing: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CampaignLearnOutcomeV1 {
+    FollowUp,
+    NoImprovement,
 }
 
 #[derive(Debug)]
@@ -449,6 +480,33 @@ pub fn learn(args: CampaignLearnArgs) -> anyhow::Result<()> {
     }
     validate_negative_campaign_result(&loaded, &result, &result_sha256)?;
     let failure_class = classify_campaign_failure(&result)?;
+    let evidence_signature = campaign_research_evidence_signature(&loaded.request, &result)?;
+    if campaign_has_no_improvement(&loaded.request, &evidence_signature) {
+        let report = CampaignLearnReport {
+            parent_campaign_id: loaded.request.campaign_id.clone(),
+            parent_request_sha256: loaded.sha256.clone(),
+            parent_campaign_result_sha256: result_sha256,
+            failure_class,
+            outcome: CampaignLearnOutcomeV1::NoImprovement,
+            evidence_signature,
+            learning_directive_sha256: None,
+            search_policy_revision_id: None,
+            research_plan_sha256: None,
+            output: None,
+            reused_existing: false,
+        };
+        research_event(
+            "alpha-harness",
+            "campaign_learning_stopped",
+            serde_json::json!({
+                "parent_campaign_id": &report.parent_campaign_id,
+                "failure_class": report.failure_class,
+                "outcome": report.outcome,
+                "evidence_signature": &report.evidence_signature,
+            }),
+        );
+        return print_json(&report);
+    }
     let (search_policy_revision, learning_directive) =
         next_campaign_policy_revision(&loaded, &result_sha256, failure_class)?;
     research_event(
@@ -476,8 +534,16 @@ pub fn learn(args: CampaignLearnArgs) -> anyhow::Result<()> {
             &result_sha256,
             &learning_directive,
             &search_policy_revision,
+            &evidence_signature,
         )?;
-        let report = campaign_learn_report(&args.output, &loaded, &result_sha256, &plan, true)?;
+        let report = campaign_learn_report(
+            &args.output,
+            &loaded,
+            &result_sha256,
+            &evidence_signature,
+            &plan,
+            true,
+        )?;
         research_event(
             "alpha-harness",
             "campaign_learning_completed",
@@ -514,10 +580,18 @@ pub fn learn(args: CampaignLearnArgs) -> anyhow::Result<()> {
         &result_sha256,
         learning_directive,
         search_policy_revision,
+        evidence_signature.clone(),
         artifact,
     )?;
     write_research_plan_create_once(&args.output, &plan)?;
-    let report = campaign_learn_report(&args.output, &loaded, &result_sha256, &plan, false)?;
+    let report = campaign_learn_report(
+        &args.output,
+        &loaded,
+        &result_sha256,
+        &evidence_signature,
+        &plan,
+        false,
+    )?;
     research_event(
         "alpha-harness",
         "campaign_learning_completed",
@@ -529,6 +603,13 @@ pub fn learn(args: CampaignLearnArgs) -> anyhow::Result<()> {
         }),
     );
     print_json(&report)
+}
+
+fn campaign_has_no_improvement(
+    request: &CampaignRequest,
+    evidence_signature: &CexCampaignResearchEvidenceSignatureV1,
+) -> bool {
+    request.research_plan.parent_evidence_signature.as_ref() == Some(evidence_signature)
 }
 
 fn classify_campaign_failure(
@@ -556,19 +637,25 @@ fn classify_campaign_failure(
 fn selected_supervised_feedback(
     feedback: &CampaignRoundFeedbackV1,
 ) -> Option<&CampaignEvaluationFeedbackV1> {
-    let mut selected = feedback.supervised_ridge.as_ref()?;
-    for candidate in [
-        feedback.supervised_cart.as_ref()?,
-        feedback.supervised_burn.as_ref()?,
-    ] {
-        if candidate.passed && !selected.passed
-            || (candidate.passed == selected.passed
-                && candidate.score.total_cmp(&selected.score).is_gt())
-        {
-            selected = candidate;
-        }
-    }
-    Some(selected)
+    feedback.supervised_selected.as_ref()
+}
+
+fn campaign_research_evidence_signature(
+    request: &CampaignRequest,
+    result: &CampaignResultV1,
+) -> anyhow::Result<CexCampaignResearchEvidenceSignatureV1> {
+    let feature_fields_sha256 = canonical_json_hash(&request.research_plan.feature_fields)?;
+    let mut factor_signatures = result
+        .rounds
+        .iter()
+        .flat_map(|round| round.feedback.factors.iter())
+        .map(|factor| factor.factor_signature_sha256.as_str())
+        .collect::<Vec<_>>();
+    factor_signatures.sort_unstable();
+    CexCampaignResearchEvidenceSignatureV1::new(
+        feature_fields_sha256,
+        canonical_json_hash(&factor_signatures)?,
+    )
 }
 
 fn next_campaign_policy_revision(
@@ -659,6 +746,7 @@ fn follow_up_plan_from_artifact(
     result_sha256: &str,
     learning_directive: CexCampaignLearningDirectiveV1,
     search_policy_revision: CexCampaignSearchPolicyRevisionV1,
+    parent_evidence_signature: CexCampaignResearchEvidenceSignatureV1,
     artifact: HypothesisArtifact,
 ) -> anyhow::Result<CexCampaignResearchPlanV1> {
     if artifact.field != loaded.request.research_plan.focus_field
@@ -685,6 +773,7 @@ fn follow_up_plan_from_artifact(
         feature_fields: loaded.request.research_plan.feature_fields.clone(),
         search_policy_revision,
         attempted_search_policy_revision_ids,
+        parent_evidence_signature: Some(parent_evidence_signature),
         parent: Some(CexCampaignResearchParentV1 {
             campaign_id: loaded.request.campaign_id.clone(),
             request_sha256: loaded.sha256.clone(),
@@ -708,6 +797,7 @@ fn campaign_learn_report(
     output: &Path,
     loaded: &LoadedRequest,
     result_sha256: &str,
+    evidence_signature: &CexCampaignResearchEvidenceSignatureV1,
     plan: &CexCampaignResearchPlanV1,
     reused_existing: bool,
 ) -> anyhow::Result<CampaignLearnReport> {
@@ -720,10 +810,12 @@ fn campaign_learn_report(
         parent_request_sha256: loaded.sha256.clone(),
         parent_campaign_result_sha256: result_sha256.to_string(),
         failure_class: directive.failure_class,
-        learning_directive_sha256: directive.content_hash()?,
-        search_policy_revision_id: plan.search_policy_revision.revision_id.clone(),
-        research_plan_sha256: plan.content_hash()?,
-        output: output.display().to_string(),
+        outcome: CampaignLearnOutcomeV1::FollowUp,
+        evidence_signature: evidence_signature.clone(),
+        learning_directive_sha256: Some(directive.content_hash()?),
+        search_policy_revision_id: Some(plan.search_policy_revision.revision_id.clone()),
+        research_plan_sha256: Some(plan.content_hash()?),
+        output: Some(output.display().to_string()),
         reused_existing,
     })
 }
@@ -1101,7 +1193,7 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
     };
 
     let result = CampaignResultV1 {
-        schema_version: CAMPAIGN_RESULT_SCHEMA_V7.to_string(),
+        schema_version: CAMPAIGN_RESULT_SCHEMA_V8.to_string(),
         campaign_id: loaded.request.campaign_id.clone(),
         request_sha256: loaded.sha256.clone(),
         build_source_revision: loaded.request.build_source_revision.clone(),
@@ -1671,15 +1763,18 @@ fn collect_round_ledger(
         factors: factor_bank
             .attempts
             .iter()
-            .map(|attempt| CampaignFactorFeedbackV1 {
-                source_features: factor_ast_source_features(&attempt.canonical_ast),
-                rejection_codes: attempt.rejection_codes.clone(),
-                evaluation: attempt
-                    .evaluation
-                    .as_ref()
-                    .map(|evaluation| campaign_evaluation_feedback(&evaluation.evidence)),
+            .map(|attempt| {
+                Ok(CampaignFactorFeedbackV1 {
+                    factor_signature_sha256: canonical_json_hash(&attempt.canonical_ast)?,
+                    source_features: factor_ast_source_features(&attempt.canonical_ast),
+                    rejection_codes: attempt.rejection_codes.clone(),
+                    evaluation: attempt
+                        .evaluation
+                        .as_ref()
+                        .map(|evaluation| campaign_evaluation_feedback(&evaluation.evidence)),
+                })
             })
-            .collect(),
+            .collect::<anyhow::Result<Vec<_>>>()?,
         baseline_gate_passed: baseline_gate.passed,
         baseline_failure_codes: baseline_gate.failure_codes.clone(),
         ridge: ridge
@@ -1700,6 +1795,9 @@ fn collect_round_ledger(
         supervised_burn: supervised
             .as_ref()
             .map(|evidence| campaign_evaluation_feedback(&evidence.burn.evaluation)),
+        supervised_selected: supervised
+            .as_ref()
+            .map(|evidence| campaign_evaluation_feedback(&evidence.selected.evaluation)),
         supervised_selected_candidate_id: supervised
             .as_ref()
             .map(|evidence| evidence.selected.artifact_id.clone()),
@@ -1807,6 +1905,7 @@ fn collect_round_ledger(
     Ok(CampaignMissionLedgerV1 {
         round_id: round.round_id.clone(),
         seed: round.seed,
+        identity: round.identity.clone(),
         mission_id: report.mission_id.clone(),
         mission_sha256: report.mission_sha256.clone(),
         request_sha256: report.request_sha256.clone(),
@@ -2014,6 +2113,7 @@ fn validate_existing_follow_up_plan(
     result_sha256: &str,
     expected_directive: &CexCampaignLearningDirectiveV1,
     expected_revision: &CexCampaignSearchPolicyRevisionV1,
+    expected_evidence_signature: &CexCampaignResearchEvidenceSignatureV1,
 ) -> anyhow::Result<()> {
     plan.validate()?;
     let parent = plan
@@ -2025,6 +2125,7 @@ fn validate_existing_follow_up_plan(
         || parent.campaign_result_sha256 != result_sha256
         || plan.generation != loaded.request.research_plan.generation + 1
         || plan.learning_directive.as_ref() != Some(expected_directive)
+        || plan.parent_evidence_signature.as_ref() != Some(expected_evidence_signature)
         || &plan.search_policy_revision != expected_revision
         || plan
             .attempted_search_policy_revision_ids
@@ -2052,10 +2153,8 @@ fn validate_negative_campaign_result(
     result: &CampaignResultV1,
     result_sha256: &str,
 ) -> anyhow::Result<()> {
-    if !matches!(
-        result.schema_version.as_str(),
-        CAMPAIGN_RESULT_SCHEMA_V5 | CAMPAIGN_RESULT_SCHEMA_V6 | CAMPAIGN_RESULT_SCHEMA_V7
-    ) || result.campaign_id != loaded.request.campaign_id
+    if result.schema_version != CAMPAIGN_RESULT_SCHEMA_V8
+        || result.campaign_id != loaded.request.campaign_id
         || result.request_sha256 != loaded.sha256
         || result.build_source_revision != loaded.request.build_source_revision
         || result.image_identity != loaded.request.image_identity
@@ -2076,19 +2175,12 @@ fn validate_negative_campaign_result(
         .as_ref()
         .map(CexCampaignLearningDirectiveV1::content_hash)
         .transpose()?;
-    if result.schema_version == CAMPAIGN_RESULT_SCHEMA_V7 {
-        if result.learning_directive != loaded.request.research_plan.learning_directive
-            || result.learning_directive_sha256 != expected_directive_sha256
-            || result.search_policy_revision.as_ref()
-                != Some(&loaded.request.research_plan.search_policy_revision)
-        {
-            bail!("Campaign result learning lineage does not match the parent request");
-        }
-    } else if result.learning_directive.is_some()
-        || result.learning_directive_sha256.is_some()
-        || result.search_policy_revision.is_some()
+    if result.learning_directive != loaded.request.research_plan.learning_directive
+        || result.learning_directive_sha256 != expected_directive_sha256
+        || result.search_policy_revision.as_ref()
+            != Some(&loaded.request.research_plan.search_policy_revision)
     {
-        bail!("legacy Campaign result carries unsupported learning lineage");
+        bail!("Campaign result learning lineage does not match the parent request");
     }
     normalized_sha256("parent Campaign result", result_sha256)?;
     if result.termination_reason != "campaign_no_candidate"
@@ -2113,6 +2205,7 @@ fn validate_negative_campaign_result(
     for (round, expected) in result.rounds.iter().zip(&loaded.request.rounds) {
         if round.round_id != expected.round_id
             || round.seed != expected.seed
+            || round.identity != expected.identity
             || round.request_sha256.as_deref() != Some(loaded.sha256.as_str())
             || round.result_bundle_sha256 != round.result_readback_bundle_sha256
             || round.selected_candidate_id.is_some()
@@ -2154,7 +2247,8 @@ fn validate_campaign_round_feedback(
                 .filter(|factor| factor.rejection_codes.is_empty())
                 .count()
         || feedback.factors.iter().any(|factor| {
-            factor.source_features.is_empty()
+            normalized_sha256("Campaign factor signature", &factor.factor_signature_sha256).is_err()
+                || factor.source_features.is_empty()
                 || factor
                     .source_features
                     .iter()
@@ -2193,15 +2287,20 @@ fn validate_campaign_round_feedback(
         &feedback.supervised_ridge,
         &feedback.supervised_cart,
         &feedback.supervised_burn,
+        &feedback.supervised_selected,
         &feedback.supervised_selected_candidate_id,
     ) {
-        (None, None, None, None) => feedback.supervised_replay.is_none() && feedback.burn.is_none(),
-        (Some(ridge), Some(cart), Some(burn), Some(candidate_id)) => {
+        (None, None, None, None, None) => {
+            feedback.supervised_replay.is_none() && feedback.burn.is_none()
+        }
+        (Some(ridge), Some(cart), Some(burn), Some(selected), Some(candidate_id)) => {
             feedback.accepted_factors > 0
                 && !candidate_id.trim().is_empty()
                 && valid_campaign_evaluation_feedback(ridge)
                 && valid_campaign_evaluation_feedback(cart)
                 && valid_campaign_evaluation_feedback(burn)
+                && valid_campaign_evaluation_feedback(selected)
+                && [ridge, cart, burn].contains(&selected)
                 && feedback
                     .burn
                     .as_ref()
@@ -2276,8 +2375,8 @@ pub(crate) fn valid_request_for_tests() -> CampaignRequest {
 }
 
 pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> {
-    if request.schema_version != CAMPAIGN_REQUEST_SCHEMA_V4 {
-        bail!("campaign request schema_version must be {CAMPAIGN_REQUEST_SCHEMA_V4}");
+    if request.schema_version != CAMPAIGN_REQUEST_SCHEMA_V5 {
+        bail!("campaign request schema_version must be {CAMPAIGN_REQUEST_SCHEMA_V5}");
     }
     request.research_plan.validate()?;
     validate_campaign_id(&request.campaign_id)?;
@@ -2360,10 +2459,26 @@ pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> 
     }
     let mut round_ids = std::collections::BTreeSet::new();
     let mut seeds = std::collections::BTreeSet::new();
+    let expected_data_fingerprint_sha256 = campaign_data_fingerprint_sha256(
+        &request.campaign_inputs_sha256,
+        &request.producer_source_revision,
+        &request.feature_sha256,
+        &request.materialization_sha256,
+        &request.replay_artifact_sha256,
+        &request.replay_manifest_sha256,
+    )?;
     for round in &request.rounds {
         validate_dns_label("campaign round id", &round.round_id)?;
         if !round_ids.insert(round.round_id.as_str()) || !seeds.insert(round.seed) {
             bail!("campaign rounds must have unique ids and seeds");
+        }
+        if round.identity.schema_version != CAMPAIGN_ROUND_IDENTITY_SCHEMA_V1
+            || round.identity.data_window_hours != CAMPAIGN_DATA_WINDOW_HOURS
+            || round.identity.data_fingerprint_sha256 != expected_data_fingerprint_sha256
+            || round.identity.image_identity != request.image_identity
+            || round.identity.build_source_revision != request.build_source_revision
+        {
+            bail!("campaign round identity does not bind the 31h data, image, and source");
         }
         let mission_object =
             canonical_tokyo_oss_internal_object("campaign mission", &round.mission_put_url)?;
@@ -2432,8 +2547,16 @@ fn build_request_from_parts(
     seeds: &[u64],
 ) -> anyhow::Result<CampaignRequest> {
     research_plan.validate()?;
+    let data_fingerprint_sha256 = campaign_data_fingerprint_sha256(
+        campaign_inputs_sha256,
+        producer_source_revision,
+        feature_sha256,
+        materialization_sha256,
+        replay_artifact_sha256,
+        replay_manifest_sha256,
+    )?;
     let mut request = CampaignRequest {
-        schema_version: CAMPAIGN_REQUEST_SCHEMA_V4.to_string(),
+        schema_version: CAMPAIGN_REQUEST_SCHEMA_V5.to_string(),
         campaign_id: "placeholder".to_string(),
         build_source_revision: build_source_revision.to_string(),
         image_identity: image_identity.to_string(),
@@ -2457,6 +2580,13 @@ fn build_request_from_parts(
             .map(|(index, seed)| CampaignRoundRequest {
                 round_id: format!("r{}", index + 1),
                 seed: *seed,
+                identity: CampaignRoundIdentityV1 {
+                    schema_version: CAMPAIGN_ROUND_IDENTITY_SCHEMA_V1.to_string(),
+                    data_window_hours: CAMPAIGN_DATA_WINDOW_HOURS,
+                    data_fingerprint_sha256: data_fingerprint_sha256.clone(),
+                    image_identity: image_identity.to_string(),
+                    build_source_revision: build_source_revision.to_string(),
+                },
                 mission_put_url: format!(
                     "{campaign_root}/campaign-id=placeholder/round=r{}/mission.json",
                     index + 1
@@ -2504,6 +2634,42 @@ fn build_request_from_parts(
     request.campaign_result_readback_url = request.campaign_result_put_url.clone();
     validate_request(&request)?;
     Ok(request)
+}
+
+fn campaign_data_fingerprint_sha256(
+    campaign_inputs_sha256: &str,
+    producer_source_revision: &str,
+    feature_sha256: &str,
+    materialization_sha256: &str,
+    replay_artifact_sha256: &str,
+    replay_manifest_sha256: &str,
+) -> anyhow::Result<String> {
+    canonical_json_hash(&serde_json::json!({
+        "schema_version": CAMPAIGN_DATA_FINGERPRINT_SCHEMA_V1,
+        "window_hours": CAMPAIGN_DATA_WINDOW_HOURS,
+        "campaign_inputs_sha256": normalized_sha256(
+            "campaign inputs receipt SHA256",
+            campaign_inputs_sha256,
+        )?,
+        "producer_source_revision": normalized_source_revision(
+            "campaign producer_source_revision",
+            producer_source_revision,
+        )?,
+        "feature_sha256": normalized_sha256("campaign feature", feature_sha256)?,
+        "materialization_sha256": normalized_sha256(
+            "campaign materialization",
+            materialization_sha256,
+        )?,
+        "replay_artifact_sha256": normalized_sha256(
+            "campaign replay artifact",
+            replay_artifact_sha256,
+        )?,
+        "replay_manifest_sha256": normalized_sha256(
+            "campaign replay manifest",
+            replay_manifest_sha256,
+        )?,
+    }))
+    .map_err(anyhow::Error::new)
 }
 
 fn canonicalize_request_transport(request: &CampaignRequest) -> anyhow::Result<CampaignRequest> {
@@ -2697,7 +2863,7 @@ fn signing_action_put(name: &str, object: String, content_type: &str) -> Campaig
 
 pub(crate) fn expected_campaign_id(request: &CampaignRequest) -> anyhow::Result<String> {
     let identity = serde_json::json!({
-        "identity_schema_version": CAMPAIGN_IDENTITY_SCHEMA_V4,
+        "identity_schema_version": CAMPAIGN_IDENTITY_SCHEMA_V5,
         "request_schema_version": request.schema_version,
         "build_source_revision": normalized_source_revision(
             "campaign source revision",
@@ -2745,6 +2911,7 @@ pub(crate) fn expected_campaign_id(request: &CampaignRequest) -> anyhow::Result<
             .map(|round| serde_json::json!({
                 "round_id": round.round_id,
                 "seed": round.seed,
+                "identity": round.identity,
             }))
             .collect::<Vec<_>>(),
         "stop_rule": STOP_RULE_V2,
@@ -2845,8 +3012,8 @@ fn immutable_publish_conflict(error: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 fn validate_local_test_request(request: &CampaignRequest) -> anyhow::Result<()> {
-    if request.schema_version != CAMPAIGN_REQUEST_SCHEMA_V4 {
-        bail!("campaign request schema_version must be {CAMPAIGN_REQUEST_SCHEMA_V4}");
+    if request.schema_version != CAMPAIGN_REQUEST_SCHEMA_V5 {
+        bail!("campaign request schema_version must be {CAMPAIGN_REQUEST_SCHEMA_V5}");
     }
     request.research_plan.validate()?;
     validate_campaign_id(&request.campaign_id)?;
@@ -2879,6 +3046,14 @@ fn validate_local_test_request(request: &CampaignRequest) -> anyhow::Result<()> 
     }
     let mut round_ids = std::collections::BTreeSet::new();
     let mut seeds = std::collections::BTreeSet::new();
+    let expected_data_fingerprint_sha256 = campaign_data_fingerprint_sha256(
+        &request.campaign_inputs_sha256,
+        &request.producer_source_revision,
+        &request.feature_sha256,
+        &request.materialization_sha256,
+        &request.replay_artifact_sha256,
+        &request.replay_manifest_sha256,
+    )?;
     for path in [
         &request.feature_url,
         &request.materialization_url,
@@ -2902,6 +3077,14 @@ fn validate_local_test_request(request: &CampaignRequest) -> anyhow::Result<()> 
         validate_dns_label("campaign round id", &round.round_id)?;
         if !round_ids.insert(round.round_id.as_str()) || !seeds.insert(round.seed) {
             bail!("campaign rounds must have unique ids and seeds");
+        }
+        if round.identity.schema_version != CAMPAIGN_ROUND_IDENTITY_SCHEMA_V1
+            || round.identity.data_window_hours != CAMPAIGN_DATA_WINDOW_HOURS
+            || round.identity.data_fingerprint_sha256 != expected_data_fingerprint_sha256
+            || round.identity.image_identity != request.image_identity
+            || round.identity.build_source_revision != request.build_source_revision
+        {
+            bail!("campaign round identity does not bind the 31h data, image, and source");
         }
         if round.mission_put_url != round.mission_readback_url
             || round.result_put_url != round.result_readback_url
@@ -2989,13 +3172,33 @@ mod tests {
     }
 
     #[test]
+    fn round_identity_binds_31h_data_image_digest_and_code_sha() {
+        let request = valid_request();
+        assert_eq!(request.rounds[0].identity.data_window_hours, 31);
+        validate_request(&request).unwrap();
+        let original = expected_campaign_id(&request).unwrap();
+
+        for mutate in [
+            |round: &mut CampaignRoundIdentityV1| round.data_fingerprint_sha256 = "9".repeat(64),
+            |round: &mut CampaignRoundIdentityV1| round.image_identity = "8".repeat(64),
+            |round: &mut CampaignRoundIdentityV1| round.build_source_revision = "c".repeat(40),
+        ] {
+            let mut drifted = request.clone();
+            mutate(&mut drifted.rounds[0].identity);
+            assert_ne!(expected_campaign_id(&drifted).unwrap(), original);
+            drifted.campaign_id = expected_campaign_id(&drifted).unwrap();
+            assert!(validate_request(&drifted).is_err());
+        }
+    }
+
+    #[test]
     fn negative_campaign_creates_one_parent_bound_follow_up_plan() {
         let loaded = loaded_request_for_learning();
         let result_sha256 = "9".repeat(64);
         let result = negative_campaign_result(&loaded);
         validate_negative_campaign_result(&loaded, &result, &result_sha256).unwrap();
         let failure_class = classify_campaign_failure(&result).unwrap();
-        assert_eq!(failure_class, CexCampaignFailureClassV1::NoTradesAfterCosts);
+        assert_eq!(failure_class, CexCampaignFailureClassV1::OvertradeCapacity);
         let (search_policy_revision, learning_directive) =
             next_campaign_policy_revision(&loaded, &result_sha256, failure_class).unwrap();
 
@@ -3009,7 +3212,7 @@ mod tests {
         assert!(!prompt.contains(&loaded.request.feature_url));
         assert!(prompt.contains("evaluation_failed"));
         assert!(prompt.contains("baseline_failure_codes"));
-        assert!(prompt.contains("no_trades_after_costs"));
+        assert!(prompt.contains("overtrade_capacity"));
         let artifact = HypothesisArtifact {
             hypothesis: "The registered identity mapping restores evaluable positions".to_string(),
             field: loaded.request.research_plan.focus_field.clone(),
@@ -3029,6 +3232,7 @@ mod tests {
             &result_sha256,
             learning_directive.clone(),
             search_policy_revision.clone(),
+            campaign_research_evidence_signature(&loaded.request, &result).unwrap(),
             artifact.clone(),
         )
         .unwrap();
@@ -3038,6 +3242,7 @@ mod tests {
             &result_sha256,
             &learning_directive,
             &search_policy_revision,
+            plan.parent_evidence_signature.as_ref().unwrap(),
         )
         .unwrap();
         assert_eq!(plan.generation, 1);
@@ -3045,7 +3250,7 @@ mod tests {
         assert_eq!(plan.max_candidates().unwrap(), 20);
         assert_eq!(
             plan.search_policy_revision.position_policy,
-            CexCampaignPositionPolicyV1::PredictionIdentity
+            CexCampaignPositionPolicyV1::HystereticCostAware
         );
         assert_eq!(plan.learning_directive, Some(learning_directive.clone()));
         assert_eq!(plan.focus_field, loaded.request.research_plan.focus_field);
@@ -3075,22 +3280,17 @@ mod tests {
             &result_sha256,
             learning_directive,
             search_policy_revision,
+            campaign_research_evidence_signature(&loaded.request, &result).unwrap(),
             invalid,
         )
         .is_err());
     }
 
     #[test]
-    fn overtrade_campaign_selects_only_the_hysteretic_policy() {
+    fn selected_capacity_breach_is_not_reclassified_by_a_higher_score() {
         let loaded = loaded_request_for_learning();
         let result_sha256 = "9".repeat(64);
-        let mut result = negative_campaign_result(&loaded);
-        for round in &mut result.rounds {
-            let burn = round.feedback.supervised_burn.as_mut().unwrap();
-            burn.score = 1.0;
-            round.supervised_candidate_id = Some("selected-burn".to_string());
-            round.feedback.supervised_selected_candidate_id = Some("selected-burn".to_string());
-        }
+        let result = negative_campaign_result(&loaded);
         validate_negative_campaign_result(&loaded, &result, &result_sha256).unwrap();
 
         let failure_class = classify_campaign_failure(&result).unwrap();
@@ -3103,6 +3303,28 @@ mod tests {
         );
         assert_eq!(directive.failure_class, failure_class);
         assert_eq!(directive.search_policy_revision_id, revision.revision_id);
+    }
+
+    #[test]
+    fn unchanged_child_feature_and_factor_signatures_stop_learning() {
+        let mut loaded = loaded_request_for_learning();
+        let mut result = negative_campaign_result(&loaded);
+        let parent_signature =
+            campaign_research_evidence_signature(&loaded.request, &result).unwrap();
+        assert!(!campaign_has_no_improvement(
+            &loaded.request,
+            &parent_signature
+        ));
+
+        loaded.request.research_plan.parent_evidence_signature = Some(parent_signature.clone());
+        assert!(campaign_has_no_improvement(
+            &loaded.request,
+            &parent_signature
+        ));
+
+        result.rounds[0].feedback.factors[0].factor_signature_sha256 = "f".repeat(64);
+        let changed = campaign_research_evidence_signature(&loaded.request, &result).unwrap();
+        assert!(!campaign_has_no_improvement(&loaded.request, &changed));
     }
 
     #[test]
@@ -3168,6 +3390,7 @@ mod tests {
             factor_attempts: 1,
             accepted_factors: 1,
             factors: vec![CampaignFactorFeedbackV1 {
+                factor_signature_sha256: "7".repeat(64),
                 source_features: vec!["book_imbalance".to_string()],
                 rejection_codes: Vec::new(),
                 evaluation: Some(failed_trading_evaluation.clone()),
@@ -3286,6 +3509,7 @@ mod tests {
         let lower_hash = CampaignMissionLedgerV1 {
             round_id: "r1".to_string(),
             seed: 11,
+            identity: valid_request().rounds[0].identity.clone(),
             request_sha256: Some("0".repeat(64)),
             mission_id: "m1".to_string(),
             mission_sha256: "a".repeat(64),
@@ -3311,6 +3535,7 @@ mod tests {
         let higher_hash = CampaignMissionLedgerV1 {
             round_id: "r2".to_string(),
             seed: 17,
+            identity: valid_request().rounds[1].identity.clone(),
             request_sha256: Some("1".repeat(64)),
             mission_id: "m2".to_string(),
             mission_sha256: "c".repeat(64),
@@ -3840,7 +4065,7 @@ mod tests {
         let result: serde_json::Value =
             serde_json::from_slice(&std::fs::read(work_dir.join("campaign-result.json")).unwrap())
                 .unwrap();
-        assert_eq!(result["schema_version"], CAMPAIGN_RESULT_SCHEMA_V7);
+        assert_eq!(result["schema_version"], CAMPAIGN_RESULT_SCHEMA_V8);
         assert_eq!(
             result["campaign_inputs_sha256"],
             serde_json::json!(request.campaign_inputs_sha256)
@@ -3895,7 +4120,7 @@ mod tests {
             &std::fs::read(fixture.work_dir.join("campaign-result.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(result["schema_version"], CAMPAIGN_RESULT_SCHEMA_V7);
+        assert_eq!(result["schema_version"], CAMPAIGN_RESULT_SCHEMA_V8);
         assert_eq!(
             result["termination_reason"],
             "campaign_selected_pre_holdout"
@@ -4121,8 +4346,23 @@ mod tests {
         const TEST_ROOT: &str =
             "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research";
         let research_plan = CexCampaignResearchPlanV1::canonical();
+        let round_identity = CampaignRoundIdentityV1 {
+            schema_version: CAMPAIGN_ROUND_IDENTITY_SCHEMA_V1.to_string(),
+            data_window_hours: CAMPAIGN_DATA_WINDOW_HOURS,
+            data_fingerprint_sha256: campaign_data_fingerprint_sha256(
+                &"f".repeat(64),
+                &"b".repeat(40),
+                &"1".repeat(64),
+                &"2".repeat(64),
+                &"3".repeat(64),
+                &"4".repeat(64),
+            )
+            .unwrap(),
+            image_identity: "1".repeat(64),
+            build_source_revision: "a".repeat(40),
+        };
         let mut request = CampaignRequest {
-            schema_version: CAMPAIGN_REQUEST_SCHEMA_V4.to_string(),
+            schema_version: CAMPAIGN_REQUEST_SCHEMA_V5.to_string(),
             campaign_id: String::new(),
             build_source_revision: "a".repeat(40),
             image_identity: "1".repeat(64),
@@ -4144,6 +4384,7 @@ mod tests {
                 CampaignRoundRequest {
                     round_id: "r1".to_string(),
                     seed: 11,
+                    identity: round_identity.clone(),
                     mission_put_url: format!(
                         "{TEST_ROOT}/campaign-id=placeholder/round=r1/mission.json"
                     ),
@@ -4160,6 +4401,7 @@ mod tests {
                 CampaignRoundRequest {
                     round_id: "r2".to_string(),
                     seed: 17,
+                    identity: round_identity,
                     mission_put_url: format!(
                         "{TEST_ROOT}/campaign-id=placeholder/round=r2/mission.json"
                     ),
@@ -4254,7 +4496,7 @@ mod tests {
             capacity_breached: true,
         };
         CampaignResultV1 {
-            schema_version: CAMPAIGN_RESULT_SCHEMA_V7.to_string(),
+            schema_version: CAMPAIGN_RESULT_SCHEMA_V8.to_string(),
             campaign_id: loaded.request.campaign_id.clone(),
             request_sha256: loaded.sha256.clone(),
             build_source_revision: loaded.request.build_source_revision.clone(),
@@ -4287,6 +4529,7 @@ mod tests {
                 .map(|round| CampaignMissionLedgerV1 {
                     round_id: round.round_id.clone(),
                     seed: round.seed,
+                    identity: round.identity.clone(),
                     mission_id: format!("mission-{}", round.round_id),
                     mission_sha256: "5".repeat(64),
                     request_sha256: Some(loaded.sha256.clone()),
@@ -4294,7 +4537,7 @@ mod tests {
                     result_readback_bundle_sha256: "6".repeat(64),
                     replay_receipt_id: None,
                     replay_gate_passed: Some(false),
-                    supervised_candidate_id: Some("selected-ridge".to_string()),
+                    supervised_candidate_id: Some("selected-burn".to_string()),
                     supervised_replay_receipt_id: None,
                     supervised_replay_gate_passed: None,
                     final_precommit_id: None,
@@ -4312,6 +4555,7 @@ mod tests {
                         accepted_factors: 1,
                         factors: (0..factor_attempts)
                             .map(|index| CampaignFactorFeedbackV1 {
+                                factor_signature_sha256: format!("{index:064x}"),
                                 source_features: vec!["book_imbalance".to_string()],
                                 rejection_codes: if index == 0 {
                                     Vec::new()
@@ -4331,7 +4575,8 @@ mod tests {
                         supervised_ridge: Some(no_trades.clone()),
                         supervised_cart: Some(no_trades.clone()),
                         supervised_burn: Some(overtrade.clone()),
-                        supervised_selected_candidate_id: Some("selected-ridge".to_string()),
+                        supervised_selected: Some(overtrade.clone()),
+                        supervised_selected_candidate_id: Some("selected-burn".to_string()),
                         supervised_replay: None,
                     },
                 })
@@ -4502,8 +4747,30 @@ mod tests {
         );
         let published = root.join("published");
         let research_plan = CexCampaignResearchPlanV1::canonical();
+        let feature_sha256 = crate::mission_runner::sha256_file(feature_path).unwrap();
+        let materialization_sha256 =
+            crate::mission_runner::sha256_file(materialization_path).unwrap();
+        let replay_artifact_sha256 =
+            crate::mission_runner::sha256_file(replay_artifact_path).unwrap();
+        let replay_manifest_sha256 =
+            crate::mission_runner::sha256_file(replay_manifest_path).unwrap();
+        let round_identity = CampaignRoundIdentityV1 {
+            schema_version: CAMPAIGN_ROUND_IDENTITY_SCHEMA_V1.to_string(),
+            data_window_hours: CAMPAIGN_DATA_WINDOW_HOURS,
+            data_fingerprint_sha256: campaign_data_fingerprint_sha256(
+                &"f".repeat(64),
+                BUILD_SOURCE_REVISION,
+                &feature_sha256,
+                &materialization_sha256,
+                &replay_artifact_sha256,
+                &replay_manifest_sha256,
+            )
+            .unwrap(),
+            image_identity: "1".repeat(64),
+            build_source_revision: BUILD_SOURCE_REVISION.to_string(),
+        };
         CampaignRequest {
-            schema_version: CAMPAIGN_REQUEST_SCHEMA_V4.to_string(),
+            schema_version: CAMPAIGN_REQUEST_SCHEMA_V5.to_string(),
             campaign_id: campaign_id.clone(),
             build_source_revision: BUILD_SOURCE_REVISION.to_string(),
             image_identity: "1".repeat(64),
@@ -4512,16 +4779,13 @@ mod tests {
             producer_image_identity: "e".repeat(64),
             research_plan: research_plan.clone(),
             feature_url: feature_path.to_string_lossy().into_owned(),
-            feature_sha256: crate::mission_runner::sha256_file(feature_path).unwrap(),
+            feature_sha256,
             materialization_url: materialization_path.to_string_lossy().into_owned(),
-            materialization_sha256: crate::mission_runner::sha256_file(materialization_path)
-                .unwrap(),
+            materialization_sha256,
             replay_artifact_url: replay_artifact_path.to_string_lossy().into_owned(),
-            replay_artifact_sha256: crate::mission_runner::sha256_file(replay_artifact_path)
-                .unwrap(),
+            replay_artifact_sha256,
             replay_manifest_url: replay_manifest_path.to_string_lossy().into_owned(),
-            replay_manifest_sha256: crate::mission_runner::sha256_file(replay_manifest_path)
-                .unwrap(),
+            replay_manifest_sha256,
             holdout_id: holdout_id.to_string(),
             declared_total_trials: declared_total_trials_for_rounds(&research_plan, seeds.len())
                 .unwrap(),
@@ -4531,6 +4795,7 @@ mod tests {
                 .map(|(index, seed)| CampaignRoundRequest {
                     round_id: format!("r{}", index + 1),
                     seed: *seed,
+                    identity: round_identity.clone(),
                     mission_put_url: published
                         .join(format!(
                             "campaign-id={campaign_id}/round=r{}/mission.json",

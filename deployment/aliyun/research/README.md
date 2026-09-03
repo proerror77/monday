@@ -435,13 +435,16 @@ input GET + SHA admission
   -> campaign-result.json PUT + GET/SHA readback
 ```
 
-The request schema is `cex-campaign-request-v4`. It separately binds the exact
+The request schema is `cex-campaign-request-v5`. It separately binds the exact
 executor Git revision and image digest plus the input receipt SHA-256, producer
 Git revision, producer image digest, and validated research-plan content. It also binds the
 feature/materialization/replay objects and SHA-256 values, expected holdout ID,
 campaign-wide `declared_total_trials`, and at least two `rounds`. Each round
 carries a unique `round_id`, a unique seed, and Mission/result PUT and readback
-URLs. It also carries the global
+URLs. Every round also carries one fail-closed identity tuple: the 31-hour data
+fingerprint, the digest-pinned research image, and the exact Git source SHA.
+Changing any member changes the Campaign identity, and a result whose round
+tuple differs from its request is rejected. The request also carries the global
 `holdout-id-sha256=<SHA256(HOLDOUT_ID)>/sealed-holdout-claim.json` URLs and one
 Campaign-result object. All URLs are HTTPS signed URLs for exact objects; PUT
 signatures must cover `Content-Type` and `x-oss-forbid-overwrite:true`.
@@ -473,16 +476,24 @@ alpha-harness mission campaign-freeze \
   --research-plan /private/path/next-research-plan.json
 ```
 
-The Campaign result schema is `cex-campaign-result-v7`. It carries bounded,
+The Campaign result schema is `cex-campaign-result-v8`. It carries bounded,
 structured continuous-factor screening, Ridge/CART OOS metrics, selected-model
 identity, cost-aware L2 replay feedback, the deterministic failure class, and
 the exact learning-directive/search-policy revision lineage for each round.
-`no_trades_after_costs` admits only the registered prediction-identity mapping;
+Failure classification reads the selected model evaluation recorded by the
+selection artifact; it never reselects Ridge/CART/Burn by score during learn.
+Thus a selected candidate with fills and `capacity_breached=true` is
+`overtrade_capacity`, even when an unselected zero-trade candidate has a higher
+score. `no_trades_after_costs` admits only the registered prediction-identity mapping;
 `overtrade_capacity` admits only the registered hysteretic cost-aware mapping.
 The feature set, evaluator, fees, validation, budgets, holdout, and model kinds
 remain frozen. The LLM supplies only the falsifiable hypothesis text and cannot
 change the pinned policy revision, Kubernetes, risk, or execution authority.
-The output is create-once, limited to three follow-up generations, and its
+Each follow-up records its parent's feature-fields and actual factor-signature
+digest. If a child produces the same evidence signature, `campaign-learn`
+returns typed `no_improvement`; the controller publishes that report and ends
+the cycle immediately, regardless of unused `max-follow-ups`. The output is
+create-once, limited to three follow-up generations, and its
 content hash changes the child Campaign identity. The Campaign execution Job
 still receives no LLM credentials. Only the separate ACK controller Job may
 receive the research-learning Secret used by `campaign-learn`; the existing
@@ -549,8 +560,15 @@ already-approved Campaign Job, reads the exact Job and Pod provenance, deletes
 only that Job's exact `<job-name>-inputs` Secret, and performs every OSS GET with
 `oss-ap-northeast-1-internal.aliyuncs.com`. It verifies the Campaign result,
 each Mission, and each `results.zip` SHA-256 before running `campaign-learn`.
-The downloaded evidence, `next-research-plan.json`, and learn report remain on
-the campaign-root OSS volume. They are never copied to Mac `/tmp`.
+The operator replaces `REPLACE_CAMPAIGN_POD_NAME` after that Pod exists; RBAC
+then permits `get` only for that exact Pod, not namespace-wide Pod listing.
+The controller writes the create-once learn report and, only for `follow_up`,
+the next research plan beneath the Campaign root in OSS, then reads each back
+through `oss-ap-northeast-1-internal.aliyuncs.com` and checks SHA-256. The
+downloaded evidence and learn artifacts remain on the campaign-root OSS volume.
+The Pod's research-only RAM identity must be limited to GET on that Campaign
+prefix and create-only PUT on its `learning/` prefix; do not mount exchange or
+trading credentials. These artifacts are never copied to Mac `/tmp`.
 
 Darwin is fail-closed inside `oss_readback`: any attempt to run the ACK
 readback mode on macOS exits non-zero before creating a partial destination or

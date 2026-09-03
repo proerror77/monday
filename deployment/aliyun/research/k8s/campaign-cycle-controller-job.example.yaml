@@ -55,6 +55,10 @@ spec:
             - ack-readback
             - --work-dir
             - /campaign-root/cycles/REPLACE_CYCLE_ID
+            # Replace after the approved Campaign Job creates its Pod. The
+            # controller SA is bound to this exact Pod name.
+            - --campaign-pod-name
+            - REPLACE_CAMPAIGN_POD_NAME
             - --alpha-harness
             - /usr/local/bin/alpha-harness
             - --aliyun
