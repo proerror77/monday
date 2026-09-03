@@ -498,7 +498,7 @@ re-signing or resubmitting a new identity. Signed request/submission files are
 removed once that generation is processed. For example:
 
 ```bash
-deployment/aliyun/research/scripts/campaign-cycle-controller.sh \
+deployment/aliyun/research/scripts/campaign-cycle-controller.sh start \
   --campaign-inputs /private/run/campaign-inputs.json \
   --input-root /private/run \
   --source-revision REPLACE_EXACT_GIT_SHA \
@@ -508,6 +508,24 @@ deployment/aliyun/research/scripts/campaign-cycle-controller.sh \
   --work-dir /private/cycles/REPLACE_RUN_ID \
   --seed 7 --seed 11
 ```
+
+The first start persists every non-secret cycle input in the private work
+directory. Inspect or resume that exact cycle without reconstructing those
+arguments:
+
+```bash
+deployment/aliyun/research/scripts/campaign-cycle-controller.sh status \
+  --work-dir /private/cycles/REPLACE_RUN_ID
+
+deployment/aliyun/research/scripts/campaign-cycle-controller.sh resume \
+  --work-dir /private/cycles/REPLACE_RUN_ID \
+  --signer /private/bin/monday-campaign-oss-signer
+```
+
+`status` reports the local checkpoint and next controller stage; it does not
+claim live Kubernetes state. `resume` revalidates the persisted input binding
+and continues the same Campaign identity. The signer must be supplied again so
+a restarted controller cannot cross that trust boundary implicitly.
 
 The controller performs `freeze -> sign -> finalize -> dispatch -> K8S Job
 wait -> Pod image readback -> immutable per-round OSS readback -> learn -> child
