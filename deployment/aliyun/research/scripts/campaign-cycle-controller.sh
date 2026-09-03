@@ -25,7 +25,7 @@ Usage: campaign-cycle-controller.sh \
   --image IMAGE@sha256:DIGEST --campaign-root HTTPS_URL \
   --signer EXECUTABLE --work-dir DIR --seed N --seed N \
   [--context NAME] [--namespace NAME] [--max-follow-ups 3] \
-  [--max-tokens 300] [--job-timeout 4h]
+  [--max-tokens 300] [--job-timeout 7h]
 
 The signer is a separate trust boundary. It is invoked as:
   SIGNER --freeze FREEZE_JSON --output SIGNED_REQUEST_JSON
@@ -41,7 +41,7 @@ context="monday-research-apne1"
 namespace="monday-research"
 max_follow_ups=3
 max_tokens=300
-job_timeout="4h"
+job_timeout="7h"
 campaign_inputs=""
 input_root=""
 source_revision=""
