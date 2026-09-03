@@ -29,6 +29,7 @@ const STABLE_HYPOTHESIS_ID: &str = "l2-microstructure-factor-plan-v5";
 const RESEARCH_PLAN_SCHEMA_V2: &str = "cex-campaign-research-plan-v2";
 const SEARCH_POLICY_REVISION_SCHEMA_V1: &str = "cex-campaign-search-policy-revision-v1";
 const LEARNING_DIRECTIVE_SCHEMA_V1: &str = "cex-campaign-learning-directive-v1";
+const RESEARCH_EVIDENCE_SIGNATURE_SCHEMA_V1: &str = "cex-campaign-research-evidence-signature-v1";
 pub(crate) const MAX_RESEARCH_PLAN_GENERATION: u8 = 3;
 const INITIAL_TRAIN_ROWS: usize = 7_200;
 const VALIDATION_ROWS: usize = 3_600;
@@ -237,11 +238,48 @@ pub(crate) struct CexCampaignResearchPlanV1 {
     pub(crate) search_policy_revision: CexCampaignSearchPolicyRevisionV1,
     pub(crate) attempted_search_policy_revision_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) parent_evidence_signature: Option<CexCampaignResearchEvidenceSignatureV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) parent: Option<CexCampaignResearchParentV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) learning_directive: Option<CexCampaignLearningDirectiveV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) llm: Option<CexCampaignLlmProvenanceV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CexCampaignResearchEvidenceSignatureV1 {
+    pub(crate) schema_version: String,
+    pub(crate) feature_fields_sha256: String,
+    pub(crate) factor_signatures_sha256: String,
+}
+
+impl CexCampaignResearchEvidenceSignatureV1 {
+    pub(crate) fn new(
+        feature_fields_sha256: String,
+        factor_signatures_sha256: String,
+    ) -> anyhow::Result<Self> {
+        let signature = Self {
+            schema_version: RESEARCH_EVIDENCE_SIGNATURE_SCHEMA_V1.to_string(),
+            feature_fields_sha256,
+            factor_signatures_sha256,
+        };
+        signature.validate()?;
+        Ok(signature)
+    }
+
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        if self.schema_version != RESEARCH_EVIDENCE_SIGNATURE_SCHEMA_V1
+            || normalized_sha256("Campaign feature fields", &self.feature_fields_sha256)?
+                != self.feature_fields_sha256
+            || normalized_sha256("Campaign factor signatures", &self.factor_signatures_sha256)?
+                != self.factor_signatures_sha256
+        {
+            bail!("CEX Campaign research evidence signature is invalid");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -276,6 +314,7 @@ impl CexCampaignResearchPlanV1 {
             focus_field: "book_imbalance_top5".to_string(),
             feature_fields: FEATURE_FIELDS.into_iter().map(str::to_string).collect(),
             attempted_search_policy_revision_ids: vec![search_policy_revision.revision_id.clone()],
+            parent_evidence_signature: None,
             search_policy_revision,
             parent: None,
             learning_directive: None,
@@ -345,6 +384,7 @@ impl CexCampaignResearchPlanV1 {
         match (&self.parent, &self.learning_directive, &self.llm) {
             (None, None, None)
                 if self.generation == 0
+                    && self.parent_evidence_signature.is_none()
                     && self.search_policy_revision
                         == CexCampaignSearchPolicyRevisionV1::canonical() => {}
             (Some(parent), Some(directive), Some(llm)) => {
@@ -364,6 +404,10 @@ impl CexCampaignResearchPlanV1 {
                     bail!("CEX Campaign research plan parent binding is invalid");
                 }
                 directive.validate()?;
+                self.parent_evidence_signature
+                    .as_ref()
+                    .context("CEX Campaign follow-up is missing its parent evidence signature")?
+                    .validate()?;
                 let expected_position_policy = match directive.failure_class {
                     CexCampaignFailureClassV1::NoTradesAfterCosts => {
                         CexCampaignPositionPolicyV1::PredictionIdentity
@@ -947,6 +991,10 @@ pub(crate) mod tests {
                 canonical.search_policy_revision.revision_id.clone(),
                 learning_directive.search_policy_revision_id.clone(),
             ],
+            parent_evidence_signature: Some(
+                CexCampaignResearchEvidenceSignatureV1::new("5".repeat(64), "6".repeat(64))
+                    .unwrap(),
+            ),
             parent: Some(parent),
             learning_directive: Some(learning_directive),
             llm: Some(CexCampaignLlmProvenanceV1 {

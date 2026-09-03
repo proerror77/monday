@@ -1,0 +1,43 @@
+# Namespace-scoped readback authority for one approved Campaign generation.
+# Replace all resourceNames for every approved generation. Kubernetes RBAC
+# cannot suffix-match Secret names, so do not replace the exact `-inputs` name
+# with a wildcard or grant namespace-wide Secret deletion.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: monday-campaign-cycle-controller
+  namespace: monday-research
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: monday-campaign-cycle-controller-readback
+  namespace: monday-research
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    resourceNames: ["REPLACE_CAMPAIGN_JOB_NAME"]
+    verbs: ["get", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    resourceNames: ["REPLACE_CAMPAIGN_POD_NAME"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["REPLACE_CAMPAIGN_JOB_NAME-inputs"]
+    verbs: ["delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: monday-campaign-cycle-controller-readback
+  namespace: monday-research
+subjects:
+  - kind: ServiceAccount
+    name: monday-campaign-cycle-controller
+    namespace: monday-research
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: monday-campaign-cycle-controller-readback
