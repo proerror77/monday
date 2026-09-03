@@ -280,6 +280,7 @@ controller="$(cd "$(dirname "$0")" && pwd)/scripts/campaign-cycle-controller.sh"
 source_revision="$(printf 'a%.0s' {1..40})"
 image_digest="$(printf 'a%.0s' {1..64})"
 controller_args=(
+  start
   --alpha-harness "$bin/alpha-harness"
   --aliyun "$bin/aliyun"
   --kubectl "$bin/kubectl"
@@ -293,6 +294,14 @@ controller_args=(
   --seed 7 --seed 11
   --max-follow-ups 1
 )
+resume_args=(
+  resume
+  --alpha-harness "$bin/alpha-harness"
+  --aliyun "$bin/aliyun"
+  --kubectl "$bin/kubectl"
+  --signer "$bin/signer"
+  --work-dir "$root/cycle"
+)
 
 if "$controller" "${controller_args[@]}" >"$root/first.stdout" 2>"$root/first.stderr"; then
   echo "first controller run unexpectedly succeeded" >&2
@@ -302,14 +311,29 @@ test -s "$root/cycle/generation-0/request.json"
 test "$(<"$FAKE_STATE/signer-count")" == 1
 test "$(<"$FAKE_STATE/dispatch-count")" == 1
 grep -Fq 'schema_version=monday.research_event.v1 component=campaign-cycle-controller event=cycle_failed generation=0 stage=oss_result_readback' "$root/first.stderr"
+jq -e '
+  .schema_version == "monday.campaign_cycle_status.v1"
+  and .checkpoint_status == "incomplete"
+  and .generation == 0
+  and .next_stage == "oss_result_readback"
+  and .campaign_id == "campaign-g0"
+  and .job_name == "job-g0"
+' < <("$controller" status --work-dir "$root/cycle") >/dev/null
 
-if "$controller" "${controller_args[@]}" >"$root/second.stdout" 2>"$root/second.stderr"; then
+if "$controller" "${resume_args[@]}" >"$root/second.stdout" 2>"$root/second.stderr"; then
   echo "controller accepted a mismatched learning-directive digest" >&2
   exit 1
 fi
 grep -Fq 'schema_version=monday.research_event.v1 component=campaign-cycle-controller event=cycle_failed generation=1 stage=oss_result_readback' "$root/second.stderr"
+jq -e '
+  .checkpoint_status == "incomplete"
+  and .generation == 1
+  and .next_stage == "oss_result_readback"
+  and .campaign_id == "campaign-g1"
+  and .job_name == "job-g1"
+' < <("$controller" status --work-dir "$root/cycle") >/dev/null
 
-if ! "$controller" "${controller_args[@]}" >"$root/third.stdout" 2>"$root/third.stderr"; then
+if ! "$controller" "${resume_args[@]}" >"$root/third.stdout" 2>"$root/third.stderr"; then
   cat "$root/third.stderr" >&2
   exit 1
 fi
@@ -327,6 +351,12 @@ done
 jq -e --arg directive_sha256 "$(<"$FAKE_STATE/directive-sha256")" \
   '.generation == 1 and .termination_reason == "campaign_finalized" and .round_readback_count == 2 and .learning_directive_sha256 == $directive_sha256 and .search_policy_revision_id == ("cex-search-policy-" + ("1" * 64))' \
   "$root/cycle/cycle-result.json" >/dev/null
+jq -e '
+  .checkpoint_status == "complete"
+  and .generation == 1
+  and .next_stage == null
+  and .termination_reason == "campaign_finalized"
+' < <("$controller" status --work-dir "$root/cycle") >/dev/null
 test -s "$root/cycle/generation-0/next-research-plan.json"
 test "$(<"$FAKE_STATE/signer-count")" == 2
 test "$(<"$FAKE_STATE/dispatch-count")" == 2

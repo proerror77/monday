@@ -20,18 +20,150 @@ die() {
 
 usage() {
   cat <<'EOF'
-Usage: campaign-cycle-controller.sh \
+Usage: campaign-cycle-controller.sh [start] \
   --campaign-inputs FILE --input-root DIR --source-revision SHA \
   --image IMAGE@sha256:DIGEST --campaign-root HTTPS_URL \
   --signer EXECUTABLE --work-dir DIR --seed N --seed N \
   [--context NAME] [--namespace NAME] [--max-follow-ups 3] \
   [--max-tokens 300] [--job-timeout 7h]
 
+       campaign-cycle-controller.sh resume \
+  --work-dir DIR --signer EXECUTABLE \
+  [--alpha-harness EXECUTABLE] [--aliyun EXECUTABLE] [--kubectl EXECUTABLE]
+
+       campaign-cycle-controller.sh status --work-dir DIR
+
 The signer is a separate trust boundary. It is invoked as:
   SIGNER --freeze FREEZE_JSON --output SIGNED_REQUEST_JSON
 It must sign every action in the frozen signing plan without changing the
 query-free object identity, HTTP method, content type, or required headers.
 EOF
+}
+
+validate_controller_state() {
+  local controller_state="$1"
+  jq -e '
+    (.campaign_inputs | type == "string")
+    and (.campaign_inputs_sha256 | type == "string")
+    and (.input_root | type == "string")
+    and (.source_revision | type == "string")
+    and (.image | type == "string")
+    and (.campaign_root | type == "string")
+    and (.context | type == "string")
+    and (.namespace | type == "string")
+    and (.max_follow_ups | type == "number")
+    and (.max_tokens | type == "number")
+    and (.job_timeout | type == "string")
+    and (.seeds | type == "array" and length >= 2)
+    and all(.seeds[]; type == "number")
+  ' "$controller_state" >/dev/null || die "controller state is invalid: $controller_state"
+}
+
+cycle_status() {
+  local status_dir="$1"
+  local status_state="$status_dir/controller-inputs.json"
+  local status_result="$status_dir/cycle-result.json"
+  local generation_dir candidate
+  local generation=-1
+  local checkpoint_status="incomplete"
+  local next_stage="freeze"
+  local campaign_id=""
+  local request_sha256=""
+  local job_name=""
+  local termination_reason=""
+
+  [[ -d "$status_dir" ]] || die "work directory does not exist: $status_dir"
+  [[ -s "$status_state" ]] || die "controller state is missing: $status_state"
+  validate_controller_state "$status_state"
+
+  if [[ -s "$status_result" ]]; then
+    jq -e '.generation | type == "number"' "$status_result" >/dev/null \
+      || die "cycle result is invalid: $status_result"
+    jq -n --slurpfile inputs "$status_state" --slurpfile result "$status_result" '{
+      schema_version:"monday.campaign_cycle_status.v1",
+      checkpoint_status:"complete",
+      generation:$result[0].generation,
+      next_stage:null,
+      campaign_inputs_sha256:$inputs[0].campaign_inputs_sha256,
+      source_revision:$inputs[0].source_revision,
+      image:$inputs[0].image,
+      campaign_id:($result[0].campaign_id // null),
+      request_sha256:($result[0].request_sha256 // null),
+      job_name:($result[0].job_name // null),
+      termination_reason:($result[0].termination_reason // null)
+    }'
+    return
+  fi
+
+  for generation_dir in "$status_dir"/generation-*; do
+    [[ -d "$generation_dir" ]] || continue
+    candidate="${generation_dir##*/generation-}"
+    [[ "$candidate" =~ ^[0-9]+$ ]] || continue
+    if ((candidate > generation)); then
+      generation="$candidate"
+    fi
+  done
+  if ((generation < 0)); then
+    generation=0
+    generation_dir="$status_dir/generation-0"
+  else
+    generation_dir="$status_dir/generation-$generation"
+  fi
+
+  if [[ -e "$generation_dir/terminal-failure" ]]; then
+    checkpoint_status="terminal_failure"
+    next_stage=""
+  elif [[ -e "$generation_dir/generation-complete" ]]; then
+    next_stage="next_generation"
+  elif [[ -e "$generation_dir/result-readback-complete" ]]; then
+    if [[ -s "$generation_dir/campaign-result.json" ]]; then
+      termination_reason="$(jq -r '.termination_reason // empty' "$generation_dir/campaign-result.json")"
+    fi
+    if [[ "$termination_reason" == "campaign_no_candidate" ]]; then
+      next_stage="campaign_learning"
+    else
+      next_stage="finalize_cycle"
+    fi
+  elif [[ -e "$generation_dir/provenance-readback-complete" ]]; then
+    next_stage="oss_result_readback"
+  elif [[ -e "$generation_dir/dispatched" ]]; then
+    next_stage="kubernetes_runtime_readback"
+  elif [[ -e "$generation_dir/finalized" ]]; then
+    next_stage="dispatch"
+  elif [[ -e "$generation_dir/frozen" ]]; then
+    next_stage="sign_finalize"
+  fi
+
+  if [[ -s "$generation_dir/finalize-report.json" ]]; then
+    campaign_id="$(jq -r '.campaign_id // empty' "$generation_dir/finalize-report.json")"
+    request_sha256="$(jq -r '.request_sha256 // empty' "$generation_dir/finalize-report.json")"
+    job_name="$(jq -r '.job_name // empty' "$generation_dir/finalize-report.json")"
+  fi
+  if [[ -z "$termination_reason" && -s "$generation_dir/campaign-result.json" ]]; then
+    termination_reason="$(jq -r '.termination_reason // empty' "$generation_dir/campaign-result.json")"
+  fi
+
+  jq -n \
+    --slurpfile inputs "$status_state" \
+    --arg checkpoint_status "$checkpoint_status" \
+    --argjson generation "$generation" \
+    --arg next_stage "$next_stage" \
+    --arg campaign_id "$campaign_id" \
+    --arg request_sha256 "$request_sha256" \
+    --arg job_name "$job_name" \
+    --arg termination_reason "$termination_reason" '{
+      schema_version:"monday.campaign_cycle_status.v1",
+      checkpoint_status:$checkpoint_status,
+      generation:$generation,
+      next_stage:(if $next_stage == "" then null else $next_stage end),
+      campaign_inputs_sha256:$inputs[0].campaign_inputs_sha256,
+      source_revision:$inputs[0].source_revision,
+      image:$inputs[0].image,
+      campaign_id:(if $campaign_id == "" then null else $campaign_id end),
+      request_sha256:(if $request_sha256 == "" then null else $request_sha256 end),
+      job_name:(if $job_name == "" then null else $job_name end),
+      termination_reason:(if $termination_reason == "" then null else $termination_reason end)
+    }'
 }
 
 alpha_harness="alpha-harness"
@@ -50,29 +182,72 @@ campaign_root=""
 signer=""
 work_dir=""
 seeds=()
+mode="start"
+
+case "${1:-}" in
+  start|resume|status)
+    mode="$1"
+    shift
+    ;;
+esac
+
+if [[ "$mode" == "status" ]]; then
+  while (($#)); do
+    case "$1" in
+      --work-dir) work_dir="$2"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "status accepts only --work-dir" ;;
+    esac
+  done
+  [[ -n "$work_dir" ]] || die "--work-dir is required"
+  command -v jq >/dev/null || die "jq is required"
+  cycle_status "$work_dir"
+  exit 0
+fi
 
 while (($#)); do
   case "$1" in
     --alpha-harness) alpha_harness="$2"; shift 2 ;;
     --aliyun) aliyun_cli="$2"; shift 2 ;;
     --kubectl) kubectl_cli="$2"; shift 2 ;;
-    --campaign-inputs) campaign_inputs="$2"; shift 2 ;;
-    --input-root) input_root="$2"; shift 2 ;;
-    --source-revision) source_revision="$2"; shift 2 ;;
-    --image) image="$2"; shift 2 ;;
-    --campaign-root) campaign_root="$2"; shift 2 ;;
+    --campaign-inputs) [[ "$mode" == "start" ]] || die "resume loads --campaign-inputs from controller state"; campaign_inputs="$2"; shift 2 ;;
+    --input-root) [[ "$mode" == "start" ]] || die "resume loads --input-root from controller state"; input_root="$2"; shift 2 ;;
+    --source-revision) [[ "$mode" == "start" ]] || die "resume loads --source-revision from controller state"; source_revision="$2"; shift 2 ;;
+    --image) [[ "$mode" == "start" ]] || die "resume loads --image from controller state"; image="$2"; shift 2 ;;
+    --campaign-root) [[ "$mode" == "start" ]] || die "resume loads --campaign-root from controller state"; campaign_root="$2"; shift 2 ;;
     --signer) signer="$2"; shift 2 ;;
     --work-dir) work_dir="$2"; shift 2 ;;
-    --seed) seeds+=("$2"); shift 2 ;;
-    --context) context="$2"; shift 2 ;;
-    --namespace) namespace="$2"; shift 2 ;;
-    --max-follow-ups) max_follow_ups="$2"; shift 2 ;;
-    --max-tokens) max_tokens="$2"; shift 2 ;;
-    --job-timeout) job_timeout="$2"; shift 2 ;;
+    --seed) [[ "$mode" == "start" ]] || die "resume loads --seed from controller state"; seeds+=("$2"); shift 2 ;;
+    --context) [[ "$mode" == "start" ]] || die "resume loads --context from controller state"; context="$2"; shift 2 ;;
+    --namespace) [[ "$mode" == "start" ]] || die "resume loads --namespace from controller state"; namespace="$2"; shift 2 ;;
+    --max-follow-ups) [[ "$mode" == "start" ]] || die "resume loads --max-follow-ups from controller state"; max_follow_ups="$2"; shift 2 ;;
+    --max-tokens) [[ "$mode" == "start" ]] || die "resume loads --max-tokens from controller state"; max_tokens="$2"; shift 2 ;;
+    --job-timeout) [[ "$mode" == "start" ]] || die "resume loads --job-timeout from controller state"; job_timeout="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
+
+if [[ "$mode" == "resume" ]]; then
+  [[ -n "$work_dir" ]] || die "--work-dir is required"
+  command -v jq >/dev/null || die "jq is required"
+  state="$work_dir/controller-inputs.json"
+  [[ -s "$state" ]] || die "controller state is missing: $state"
+  validate_controller_state "$state"
+  campaign_inputs="$(jq -er '.campaign_inputs' "$state")"
+  input_root="$(jq -er '.input_root' "$state")"
+  source_revision="$(jq -er '.source_revision' "$state")"
+  image="$(jq -er '.image' "$state")"
+  campaign_root="$(jq -er '.campaign_root' "$state")"
+  context="$(jq -er '.context' "$state")"
+  namespace="$(jq -er '.namespace' "$state")"
+  max_follow_ups="$(jq -er '.max_follow_ups' "$state")"
+  max_tokens="$(jq -er '.max_tokens' "$state")"
+  job_timeout="$(jq -er '.job_timeout' "$state")"
+  while IFS= read -r seed; do
+    seeds+=("$seed")
+  done < <(jq -er '.seeds[]' "$state")
+fi
 
 for required in campaign_inputs input_root source_revision image campaign_root signer work_dir; do
   [[ -n "${!required}" ]] || die "--${required//_/-} is required"
@@ -185,6 +360,7 @@ else
 fi
 state_tmp=""
 log_event cycle_started \
+  "mode=$mode" \
   "campaign_inputs_sha256=$campaign_inputs_sha256" \
   "source_revision=$source_revision" \
   "image=$image" \
