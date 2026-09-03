@@ -20,7 +20,8 @@ use alpha_domain::{
 use alpha_engine::{
     baselines::{
         evaluate_cex_baselines, evaluate_cex_supervised_model, CexBurnFitIdentity,
-        CexSupervisedModelCandidateV1, CexSupervisedModelEvaluationV1,
+        CexSupervisedDecisionPolicyV1, CexSupervisedModelCandidateV1,
+        CexSupervisedModelEvaluationV1,
     },
     engines::{
         CexCombinationResearchArtifactV1, CexFactorBankMcts, CexFactorBankMctsCheckpointV1,
@@ -169,6 +170,25 @@ fn bound_gp_policy(mission: &CexResearchMissionArtifactV1) -> anyhow::Result<Cex
         bail!("named-template GP requires max_new_iterations to equal max_candidates");
     }
     Ok(continuous_templates)
+}
+
+fn bound_supervised_decision_policy(
+    mission: &CexResearchMissionArtifactV1,
+) -> anyhow::Result<CexSupervisedDecisionPolicyV1> {
+    let binding = &mission.spec.policies.supervised_decision;
+    if !binding.id.starts_with("cex-search-policy-") {
+        bail!("CEX supervised decision policy has an invalid revision identity");
+    }
+    for policy in [
+        CexSupervisedDecisionPolicyV1::controlled_v1(),
+        CexSupervisedDecisionPolicyV1::prediction_identity_v1(),
+        CexSupervisedDecisionPolicyV1::hysteretic_cost_aware_v1(),
+    ] {
+        if policy.content_hash().map_err(anyhow::Error::msg)? == binding.content_sha256 {
+            return Ok(policy);
+        }
+    }
+    bail!("CEX supervised decision policy is outside the registered policy set")
 }
 
 #[derive(Debug, Deserialize)]
@@ -618,6 +638,7 @@ pub(crate) fn execute_report(
     mission::validate_live_feature_fields(&control_mission.spec.feature_fields)?;
     let gp_policy = bound_gp_policy(&control_mission)?;
     let supervised_ml = gp_policy.schema_version == CEX_GP_POLICY_SCHEMA_V4;
+    let supervised_decision_policy = bound_supervised_decision_policy(&control_mission)?;
     data_mission::write_json_atomic(&results_dir.join("gp-policy.json"), &gp_policy)?;
     let baseline_policy =
         CexBaselinePolicyV1::controlled_v1(control_mission.spec.policies.baseline.id.clone())?;
@@ -1080,6 +1101,7 @@ pub(crate) fn execute_report(
                 &factor_bank,
                 &baseline_context,
                 &baseline_run,
+                &supervised_decision_policy,
             )
         })
         .transpose()?
@@ -1975,6 +1997,7 @@ fn run_cex_supervised_model_research(
     factor_bank: &CexFactorBankRevisionV2,
     context: &EngineContext<'_>,
     baselines: &alpha_engine::baselines::CexBaselineRun,
+    decision_policy: &CexSupervisedDecisionPolicyV1,
 ) -> anyhow::Result<Option<CexSupervisedModelEvaluationV1>> {
     let (Some(ridge), Some(cart), Some(burn)) =
         (&baselines.ridge, &baselines.cart, &baselines.burn)
@@ -2004,11 +2027,11 @@ fn run_cex_supervised_model_research(
             "walk_forward_folds": context.folds().len(),
         }),
     );
-    let ridge = evaluate_cex_supervised_model(context, factor_bank, ridge)
+    let ridge = evaluate_cex_supervised_model(context, factor_bank, ridge, decision_policy)
         .map_err(|error| anyhow::anyhow!("ridge supervised evaluation failed: {error}"))?;
-    let cart = evaluate_cex_supervised_model(context, factor_bank, cart)
+    let cart = evaluate_cex_supervised_model(context, factor_bank, cart, decision_policy)
         .map_err(|error| anyhow::anyhow!("shallow CART supervised evaluation failed: {error}"))?;
-    let burn = evaluate_cex_supervised_model(context, factor_bank, burn)
+    let burn = evaluate_cex_supervised_model(context, factor_bank, burn, decision_policy)
         .map_err(|error| anyhow::anyhow!("Burn MLP supervised evaluation failed: {error}"))?;
     for (name, evaluation) in [("ridge", &ridge), ("cart", &cart), ("burn_mlp", &burn)] {
         evaluation.validate().map_err(anyhow::Error::msg)?;
@@ -3551,6 +3574,11 @@ pub(crate) fn validate_supervised_candidate_binding(
         || candidate.research_dataset != factor_bank.research_dataset
         || candidate.walk_forward_partition != factor_bank.walk_forward_partition
         || candidate.evaluation_policy != factor_bank.evaluation_policy
+        || candidate
+            .decision_policy
+            .content_hash()
+            .map_err(anyhow::Error::msg)?
+            != mission.spec.policies.supervised_decision.content_sha256
     {
         bail!("CEX supervised candidate does not bind its Factor Bank and baseline model");
     }
@@ -7377,6 +7405,7 @@ message binance_replay {
         )
         .unwrap();
         let baseline_policy = CexBaselinePolicyV1::controlled_v1("baseline-policy-1").unwrap();
+        let supervised_decision_policy = CexSupervisedDecisionPolicyV1::controlled_v1();
         let weight_policy =
             CexEqualAbsoluteWeightPolicyV1::controlled_v1("weight-policy-1").unwrap();
         let replay_policy = CexEventReplayPolicyV1::controlled_v1(
@@ -7456,6 +7485,10 @@ message binance_replay {
                     baseline: CexResearchContentRefV1 {
                         id: baseline_policy.policy_id.clone(),
                         content_sha256: baseline_policy.content_hash().unwrap(),
+                    },
+                    supervised_decision: CexResearchContentRefV1 {
+                        id: "cex-search-policy-test".to_string(),
+                        content_sha256: supervised_decision_policy.content_hash().unwrap(),
                     },
                     subset_search: CexResearchContentRefV1 {
                         id: "subset-search-policy-1".to_string(),

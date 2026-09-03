@@ -61,7 +61,20 @@ case "$1 $2" in
           campaign_inputs_sha256:("b" * 64),
           producer_source_revision:("c" * 40),
           producer_image_identity:("d" * 64),
-          research_plan:{generation:$generation},
+          research_plan:{
+            schema_version:"cex-campaign-research-plan-v2",
+            generation:$generation,
+            search_policy_revision:{
+              schema_version:"cex-campaign-search-policy-revision-v1",
+              revision_id:("cex-search-policy-" + (if $generation == 0 then ("0" * 64) else ("1" * 64) end)),
+              parent_revision_id:(if $generation == 0 then null else ("cex-search-policy-" + ("0" * 64)) end),
+              position_policy:(if $generation == 0 then "cost_aware" else "prediction_identity" end)
+            },
+            learning_directive:(if $generation == 0 then null else {
+              schema_version:"cex-campaign-learning-directive-v1",
+              failure_class:"no_trades_after_costs"
+            } end)
+          },
           holdout_id:"holdout-test",
           declared_total_trials:4,
           rounds:[
@@ -108,8 +121,8 @@ case "$1 $2" in
     ;;
   "mission campaign-learn")
     output="$(value_after --output "$@")"
-    printf '{"schema_version":"cex-campaign-research-plan-v1"}\n' >"$output"
-    printf '{"learned":true}\n'
+    printf '{"schema_version":"cex-campaign-research-plan-v2"}\n' >"$output"
+    jq -n '{failure_class:"no_trades_after_costs",learning_directive_sha256:("9" * 64),search_policy_revision_id:("cex-search-policy-" + ("1" * 64)),research_plan_sha256:("e" * 64)}'
     ;;
   *)
     echo "unexpected alpha-harness invocation: $*" >&2
@@ -210,7 +223,7 @@ if [[ "$source_object" == *"/campaign-result.json"* ]]; then
     --arg bundle_r1_sha "$bundle_r1_sha" \
     --arg bundle_r2_sha "$bundle_r2_sha" \
     --argjson generation "$generation" '{
-      schema_version:"cex-campaign-result-v6",
+      schema_version:"cex-campaign-result-v7",
       campaign_id:$request[0].campaign_id,
       request_sha256:$request_sha256,
       build_source_revision:$request[0].build_source_revision,
@@ -219,6 +232,9 @@ if [[ "$source_object" == *"/campaign-result.json"* ]]; then
       producer_source_revision:$request[0].producer_source_revision,
       producer_image_identity:$request[0].producer_image_identity,
       research_plan_sha256:("e" * 64),
+      learning_directive:$request[0].research_plan.learning_directive,
+      learning_directive_sha256:(if $request[0].research_plan.learning_directive == null then null else ("9" * 64) end),
+      search_policy_revision:$request[0].research_plan.search_policy_revision,
       holdout_id:$request[0].holdout_id,
       declared_total_trials:$request[0].declared_total_trials,
       consumed_trials:2,
@@ -290,7 +306,7 @@ for event in \
   grep -Fq "$event" "$root/second.stderr"
 done
 
-jq -e '.generation == 1 and .termination_reason == "campaign_finalized" and .round_readback_count == 2' \
+jq -e '.generation == 1 and .termination_reason == "campaign_finalized" and .round_readback_count == 2 and .learning_directive_sha256 == ("9" * 64) and .search_policy_revision_id == ("cex-search-policy-" + ("1" * 64))' \
   "$root/cycle/cycle-result.json" >/dev/null
 test -s "$root/cycle/generation-0/next-research-plan.json"
 test "$(<"$FAKE_STATE/signer-count")" == 2

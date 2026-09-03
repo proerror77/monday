@@ -58,6 +58,8 @@ struct CexBurnFoldFit<'a> {
 #[serde(rename_all = "snake_case")]
 pub enum CexSupervisedSizingRuleV1 {
     ExcessExpectedReturnOverRoundTripCost,
+    PredictionIdentity,
+    HystereticExcessExpectedReturnOverRoundTripCost,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -70,7 +72,7 @@ pub struct CexSupervisedDecisionPolicyV1 {
 }
 
 impl CexSupervisedDecisionPolicyV1 {
-    fn controlled_v1() -> Self {
+    pub fn controlled_v1() -> Self {
         Self {
             schema_version: CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V1.to_string(),
             round_trip_cost_multiplier: 2.0,
@@ -79,15 +81,46 @@ impl CexSupervisedDecisionPolicyV1 {
         }
     }
 
-    fn validate(&self) -> Result<(), String> {
+    pub fn prediction_identity_v1() -> Self {
+        Self {
+            schema_version: CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V1.to_string(),
+            round_trip_cost_multiplier: 0.0,
+            sizing_rule: CexSupervisedSizingRuleV1::PredictionIdentity,
+            max_abs_position: 1.0,
+        }
+    }
+
+    pub fn hysteretic_cost_aware_v1() -> Self {
+        Self {
+            schema_version: CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V1.to_string(),
+            round_trip_cost_multiplier: 2.0,
+            sizing_rule: CexSupervisedSizingRuleV1::HystereticExcessExpectedReturnOverRoundTripCost,
+            max_abs_position: 1.0,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        let admitted = match self.sizing_rule {
+            CexSupervisedSizingRuleV1::ExcessExpectedReturnOverRoundTripCost
+            | CexSupervisedSizingRuleV1::HystereticExcessExpectedReturnOverRoundTripCost => {
+                self.round_trip_cost_multiplier.to_bits() == 2.0_f64.to_bits()
+            }
+            CexSupervisedSizingRuleV1::PredictionIdentity => {
+                self.round_trip_cost_multiplier.to_bits() == 0.0_f64.to_bits()
+            }
+        };
         if self.schema_version != CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V1
-            || self.round_trip_cost_multiplier.to_bits() != 2.0_f64.to_bits()
-            || self.sizing_rule != CexSupervisedSizingRuleV1::ExcessExpectedReturnOverRoundTripCost
+            || !admitted
             || self.max_abs_position.to_bits() != 1.0_f64.to_bits()
         {
             return Err("CEX supervised decision policy drifted".to_string());
         }
         Ok(())
+    }
+
+    pub fn content_hash(&self) -> Result<String, String> {
+        self.validate()?;
+        canonical_json_hash(self).map_err(|error| error.to_string())
     }
 }
 
@@ -435,8 +468,10 @@ pub fn evaluate_cex_supervised_model(
     context: &EngineContext<'_>,
     factor_bank: &CexFactorBankRevisionV2,
     artifact: &CexBaselineArtifactV1,
+    decision_policy: &CexSupervisedDecisionPolicyV1,
 ) -> Result<CexSupervisedModelEvaluationV1, String> {
     verify_cex_baseline_artifact(context, factor_bank, artifact)?;
+    decision_policy.validate()?;
     let mut predictions = vec![0.0; context.rows().len()];
     let mut assigned = vec![false; context.rows().len()];
     for fold in &artifact.folds {
@@ -450,18 +485,7 @@ pub fn evaluate_cex_supervised_model(
             assigned[index] = true;
         }
     }
-    let decision_policy = CexSupervisedDecisionPolicyV1::controlled_v1();
-    let mut target_positions = vec![0.0; context.rows().len()];
-    for fold in context.folds() {
-        for index in fold.validation.clone() {
-            target_positions[index] = cost_aware_target_position(
-                predictions[index],
-                &context.rows()[index],
-                &context.protocol().costs,
-                &decision_policy,
-            )?;
-        }
-    }
+    let target_positions = supervised_target_positions(context, &predictions, decision_policy)?;
     let evaluator = FormulaEvaluator::new(artifact.baseline_policy.evaluator_config.clone())?;
     let report = evaluator.evaluate_predictions_and_positions(
         context.rows(),
@@ -485,7 +509,7 @@ pub fn evaluate_cex_supervised_model(
         research_dataset: artifact.research_dataset.clone(),
         walk_forward_partition: artifact.walk_forward_partition.clone(),
         evaluation_policy: artifact.evaluation_policy.clone(),
-        decision_policy,
+        decision_policy: decision_policy.clone(),
         predictions_sha256: canonical_json_hash(&predictions).map_err(|error| error.to_string())?,
         target_positions_sha256: canonical_json_hash(&target_positions)
             .map_err(|error| error.to_string())?,
@@ -502,6 +526,53 @@ pub fn evaluate_cex_supervised_model(
     };
     evaluation.validate()?;
     Ok(evaluation)
+}
+
+fn supervised_target_positions(
+    context: &EngineContext<'_>,
+    predictions: &[f64],
+    policy: &CexSupervisedDecisionPolicyV1,
+) -> Result<Vec<f64>, String> {
+    policy.validate()?;
+    if predictions.len() != context.rows().len() {
+        return Err("supervised prediction length does not match dataset".to_string());
+    }
+    let mut positions = vec![0.0; predictions.len()];
+    for fold in context.folds() {
+        let mut previous_position = 0.0;
+        let mut previous_series_id = None;
+        for index in fold.validation.clone() {
+            let row = &context.rows()[index];
+            if previous_series_id != Some(row.series_id) {
+                previous_position = 0.0;
+                previous_series_id = Some(row.series_id);
+            }
+            let prediction = predictions[index];
+            if !prediction.is_finite() {
+                return Err("supervised model prediction is not finite".to_string());
+            }
+            let position = match policy.sizing_rule {
+                CexSupervisedSizingRuleV1::ExcessExpectedReturnOverRoundTripCost => {
+                    cost_aware_target_position(prediction, row, &context.protocol().costs, policy)?
+                }
+                CexSupervisedSizingRuleV1::PredictionIdentity => {
+                    prediction.clamp(-policy.max_abs_position, policy.max_abs_position)
+                }
+                CexSupervisedSizingRuleV1::HystereticExcessExpectedReturnOverRoundTripCost => {
+                    hysteretic_cost_aware_target_position(
+                        prediction,
+                        previous_position,
+                        row,
+                        &context.protocol().costs,
+                        policy,
+                    )?
+                }
+            };
+            positions[index] = position;
+            previous_position = position;
+        }
+    }
+    Ok(positions)
 }
 
 fn cost_aware_target_position(
@@ -528,9 +599,11 @@ fn cost_aware_target_position(
         + row.latency_bps.max(0.0)
         + costs.slippage_bps
         + spread_bps;
-    let minimum_edge =
-        (policy.round_trip_cost_multiplier * one_way_cost_bps + row.funding_bps.max(0.0)).max(0.0)
-            / BPS;
+    let minimum_edge = minimum_edge(
+        one_way_cost_bps,
+        row.funding_bps,
+        policy.round_trip_cost_multiplier,
+    );
     let absolute_prediction = prediction.abs();
     if absolute_prediction <= minimum_edge || absolute_prediction <= f64::EPSILON {
         return Ok(0.0);
@@ -539,6 +612,48 @@ fn cost_aware_target_position(
         / (absolute_prediction + minimum_edge).max(f64::EPSILON))
     .clamp(0.0, policy.max_abs_position);
     Ok(prediction.signum() * magnitude)
+}
+
+fn hysteretic_cost_aware_target_position(
+    prediction: f64,
+    previous_position: f64,
+    row: &crate::evaluation::ResearchRow,
+    costs: &alpha_domain::EvaluationCostsV1,
+    policy: &CexSupervisedDecisionPolicyV1,
+) -> Result<f64, String> {
+    let proposed = cost_aware_target_position(prediction, row, costs, policy)?;
+    if previous_position.abs() <= f64::EPSILON || prediction.signum() != previous_position.signum()
+    {
+        return Ok(proposed);
+    }
+    let spread_bps = if costs.cross_spread {
+        row.features
+            .get("spread_bps")
+            .copied()
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .ok_or_else(|| "cost-aware ML decision requires spread_bps".to_string())?
+            / 2.0
+    } else {
+        0.0
+    };
+    let one_way_cost_bps = row.fee_bps.max(0.0) - costs.rebate_bps
+        + row.latency_bps.max(0.0)
+        + costs.slippage_bps
+        + spread_bps;
+    let exit_edge = minimum_edge(
+        one_way_cost_bps,
+        row.funding_bps,
+        policy.round_trip_cost_multiplier / 2.0,
+    );
+    if prediction.signum() == previous_position.signum() && prediction.abs() > exit_edge {
+        Ok(previous_position)
+    } else {
+        Ok(proposed)
+    }
+}
+
+fn minimum_edge(one_way_cost_bps: f64, funding_bps: f64, multiplier: f64) -> f64 {
+    (multiplier * one_way_cost_bps + funding_bps.max(0.0)).max(0.0) / BPS
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1471,6 +1586,61 @@ mod tests {
         let short = cost_aware_target_position(-0.002, &row, &costs, &policy).unwrap();
         assert!(long > 0.0 && long < 1.0);
         assert_eq!(short, -long);
+    }
+
+    #[test]
+    fn registered_supervised_position_policies_have_distinct_bounded_behavior() {
+        let row = crate::evaluation::ResearchRow {
+            series_id: 1,
+            available_time: Utc::now(),
+            signal: 0.0,
+            features: std::collections::BTreeMap::from([("spread_bps".to_string(), 2.0)]),
+            label: 0.0,
+            fee_bps: 2.0,
+            funding_bps: 1.0,
+            pit_funding: true,
+            latency_bps: 1.0,
+        };
+        let costs = alpha_domain::EvaluationCostsV1 {
+            fee_bps: 2.0,
+            rebate_bps: 0.0,
+            funding_bps: 1.0,
+            latency_bps: 1.0,
+            slippage_bps: 1.0,
+            cross_spread: true,
+            position_notional_usd: 0.0,
+            capacity_depth_levels: 0,
+            max_book_depth_fraction: 0.0,
+        };
+        let controlled = CexSupervisedDecisionPolicyV1::controlled_v1();
+        let identity = CexSupervisedDecisionPolicyV1::prediction_identity_v1();
+        let hysteretic = CexSupervisedDecisionPolicyV1::hysteretic_cost_aware_v1();
+
+        assert_eq!(
+            cost_aware_target_position(0.0009, &row, &costs, &controlled).unwrap(),
+            0.0
+        );
+        assert_eq!(
+            0.0009_f64.clamp(-identity.max_abs_position, identity.max_abs_position),
+            0.0009
+        );
+        let entered = cost_aware_target_position(0.002, &row, &costs, &hysteretic).unwrap();
+        assert!(entered > 0.0);
+        assert_eq!(
+            hysteretic_cost_aware_target_position(0.0007, entered, &row, &costs, &hysteretic,)
+                .unwrap(),
+            entered
+        );
+        assert_eq!(
+            hysteretic_cost_aware_target_position(0.0004, entered, &row, &costs, &hysteretic,)
+                .unwrap(),
+            0.0
+        );
+        assert_eq!(
+            hysteretic_cost_aware_target_position(-0.0007, -entered, &row, &costs, &hysteretic,)
+                .unwrap(),
+            -entered
+        );
     }
 
     #[test]

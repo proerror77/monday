@@ -364,6 +364,7 @@ pub struct CexResearchPolicyBindingsV1 {
     pub gp: CexResearchContentRefV1,
     pub screening: CexResearchContentRefV1,
     pub baseline: CexResearchContentRefV1,
+    pub supervised_decision: CexResearchContentRefV1,
     pub subset_search: CexResearchContentRefV1,
     pub weight: CexResearchContentRefV1,
     pub evaluation: CexResearchContentRefV1,
@@ -377,6 +378,7 @@ impl CexResearchPolicyBindingsV1 {
             &self.gp,
             &self.screening,
             &self.baseline,
+            &self.supervised_decision,
             &self.subset_search,
             &self.weight,
             &self.evaluation,
@@ -5502,6 +5504,7 @@ mod tests {
                         content_sha256: screening_policy_sha256,
                     },
                     baseline: reference("baseline-policy-1", '3'),
+                    supervised_decision: reference("cex-search-policy-test", '8'),
                     subset_search: CexResearchContentRefV1 {
                         id: "subset-search-policy-1".to_string(),
                         content_sha256: canonical_json_hash(&search).unwrap(),
