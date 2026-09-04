@@ -74,7 +74,9 @@ Recommended first production shape:
   `workload=backtest`, scales from zero to four nodes, and returns to zero after
   jobs finish.
 - One backtest Pod per worker; each Pod processes a batch of parameters.
-- A prebuilt image from `rust_hft/deployment/docker/Dockerfile.research`.
+- A prebuilt runner image from `rust_hft/deployment/docker/Dockerfile.research`.
+- A separate ACK controller image from
+  `deployment/aliyun/research/Dockerfile.campaign-cycle-controller`.
 
 The existing AWS/EKS manifests under `rust_hft/deployment/k8s` are not inputs to
 this deployment.
@@ -509,6 +511,11 @@ stdout for review. It does not wait for the Campaign Job, enter
 `approve` performs the same bounded preparation for one learned child
 generation and prints a fresh ACK Job handoff. Applying either printed Job is a
 separate operator action; the controller does not apply it.
+
+The ACR publication workflow publishes `campaign-cycle-controller` alongside
+`research-runner` from the same authenticated research binary artifact. Pin the
+controller Job to that image's digest and verify its
+`org.opencontainers.image.revision` label before applying the Job.
 
 The signer remains a separate trust boundary and receives the frozen signing
 plan. The controller never logs signed URLs. Its mode-0700 work directory is

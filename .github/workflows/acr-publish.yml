@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: Image target to publish (polymarket-raw-ops uses binance-lob-archiver's full collector bundle)
+        description: Image target (research-runner also publishes its paired Campaign controller)
         required: true
         default: all
         type: choice
@@ -194,12 +194,16 @@ jobs:
           TARGET: ${{ steps.source.outputs.publish_target }}
         run: |
           matrix=$(jq -cn --arg target "$TARGET" '
-            [{repository:"research-runner",file:"rust_hft/deployment/docker/Dockerfile.research",target:"prebuilt"},
-             {repository:"hft-trading",file:"rust_hft/deployment/docker/Dockerfile.trading",target:"runtime"},
-             {repository:"binance-lob-archiver",file:"rust_hft/deployment/docker/Dockerfile.binance-lob-archiver",target:"runtime"},
-             {repository:"polymarket-evidence-compiler",file:"rust_hft/deployment/docker/Dockerfile.polymarket-evidence-compiler",target:"runtime"},
-             {repository:"polymarket-market-recorder",file:"rust_hft/deployment/docker/Dockerfile.polymarket-market-recorder",target:"runtime"}]
-            | {include: map(select($target == "all" or .repository == $target))}')
+            [{repository:"research-runner",context:"rust_hft",file:"rust_hft/deployment/docker/Dockerfile.research",target:"prebuilt",research_artifact:true},
+             {repository:"campaign-cycle-controller",context:".",file:"deployment/aliyun/research/Dockerfile.campaign-cycle-controller",target:"prebuilt",research_artifact:true},
+             {repository:"hft-trading",context:"rust_hft",file:"rust_hft/deployment/docker/Dockerfile.trading",target:"runtime",research_artifact:false},
+             {repository:"binance-lob-archiver",context:"rust_hft",file:"rust_hft/deployment/docker/Dockerfile.binance-lob-archiver",target:"runtime",research_artifact:false},
+             {repository:"polymarket-evidence-compiler",context:"rust_hft",file:"rust_hft/deployment/docker/Dockerfile.polymarket-evidence-compiler",target:"runtime",research_artifact:false},
+             {repository:"polymarket-market-recorder",context:"rust_hft",file:"rust_hft/deployment/docker/Dockerfile.polymarket-market-recorder",target:"runtime",research_artifact:false}]
+            | {include: map(select(
+                $target == "all" or .repository == $target
+                or ($target == "research-runner" and .repository == "campaign-cycle-controller")
+              ))}')
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   research-runner-binaries:
@@ -317,7 +321,7 @@ jobs:
           ref: ${{ needs.selector.outputs.source_sha }}
 
       - name: Require selected research release source
-        if: matrix.repository == 'research-runner'
+        if: matrix.research_artifact
         env:
           RESEARCH_MODE: ${{ needs.selector.outputs.research_mode }}
           REBUILD_RESULT: ${{ needs.research-runner-binaries.result }}
@@ -330,7 +334,7 @@ jobs:
         run: deployment/aliyun/test-binance-fee-release-contract.sh
 
       - name: Download research runner binaries
-        if: matrix.repository == 'research-runner'
+        if: matrix.research_artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: research-image-release-${{ needs.selector.outputs.source_sha }}
@@ -339,7 +343,7 @@ jobs:
           github-token: ${{ github.token }}
 
       - name: Restore research runner binary modes
-        if: matrix.repository == 'research-runner'
+        if: matrix.research_artifact
         run: |
           chmod 0755 \
             research-release/research-bin/hft-backtest \
@@ -352,7 +356,7 @@ jobs:
             research-release/research-bin/monday-prediction-snapshot
 
       - name: Verify research runner binary artifact
-        if: matrix.repository == 'research-runner'
+        if: matrix.research_artifact
         run: |
           .github/scripts/research-image-release-artifact.sh verify research-release \
             "${{ needs.selector.outputs.source_sha }}" \
@@ -381,7 +385,7 @@ jobs:
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
-          context: rust_hft
+          context: ${{ matrix.context }}
           file: ${{ matrix.file }}
           target: ${{ matrix.target }}
           platforms: linux/amd64
@@ -498,6 +502,31 @@ jobs:
             --entrypoint /usr/local/bin/binance-replay-parquet-materializer \
             "$IMAGE" \
             --help >/dev/null
+
+      - name: Verify Campaign cycle controller image
+        if: matrix.repository == 'campaign-cycle-controller'
+        env:
+          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
+          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          docker pull "$IMAGE"
+          actual_source_revision=$(docker image inspect \
+            --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+            "$IMAGE")
+          test "$actual_source_revision" = "$SOURCE_REVISION"
+          docker run --rm --entrypoint /bin/bash "$IMAGE" -ceu '
+            command -v jq
+            test -x /usr/local/bin/aliyun
+            test -x /usr/local/bin/kubectl
+            test -x /usr/local/bin/alpha-harness
+            test -x /opt/monday/deployment/aliyun/research/scripts/campaign-cycle-controller.sh
+          '
+          docker run --rm --entrypoint /usr/local/bin/alpha-harness "$IMAGE" \
+            --version | grep -Fqx "alpha-harness $SOURCE_REVISION"
+          docker run --rm --entrypoint /usr/local/bin/aliyun "$IMAGE" version
+          docker run --rm --entrypoint /usr/local/bin/kubectl "$IMAGE" \
+            version --client=true
 
       - name: Package bare-metal trading host contract
         if: matrix.repository == 'hft-trading'

@@ -1,0 +1,48 @@
+# syntax=docker/dockerfile:1.7
+
+FROM debian:bookworm-slim AS controller-tools
+
+ARG TARGETARCH
+ARG ALIYUN_CLI_VERSION=3.4.6
+ARG KUBECTL_VERSION=v1.35.3
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && case "$TARGETARCH" in \
+         amd64) aliyun_sha256=9f7c993bd1b16c530f219bc1976bf78057879db4b1bae857b2952676eb7466f6; kubectl_sha256=fd31c7d7129260e608f6faf92d5984c3267ad0b5ead3bced2fe125686e286ad6 ;; \
+         arm64) aliyun_sha256=042833125a21dcafb6279811db4e4e772049404421ae60b565a3123147959092; kubectl_sha256=6f0cd088a82dde5d5807122056069e2fac4ed447cc518efc055547ae46525f14 ;; \
+         *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+       esac \
+    && aliyun_archive="aliyun-cli-linux-${ALIYUN_CLI_VERSION}-${TARGETARCH}.tgz" \
+    && curl -fsSLo "/tmp/$aliyun_archive" "https://aliyuncli.alicdn.com/$aliyun_archive" \
+    && echo "$aliyun_sha256  /tmp/$aliyun_archive" | sha256sum -c - \
+    && tar -xzf "/tmp/$aliyun_archive" -C /usr/local/bin aliyun \
+    && curl -fsSLo /usr/local/bin/kubectl \
+       "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl" \
+    && echo "$kubectl_sha256  /usr/local/bin/kubectl" | sha256sum -c - \
+    && chmod 0755 /usr/local/bin/kubectl \
+    && aliyun version \
+    && kubectl version --client=true
+
+FROM debian:bookworm-slim AS prebuilt
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    ca-certificates \
+    jq \
+    tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 1000 research \
+    && mkdir -p /work \
+    && chown research:research /work
+
+COPY --from=controller-tools /usr/local/bin/aliyun /usr/local/bin/aliyun
+COPY --from=controller-tools /usr/local/bin/kubectl /usr/local/bin/kubectl
+COPY --chmod=0755 rust_hft/research-bin/alpha-harness /usr/local/bin/alpha-harness
+COPY --chmod=0755 deployment/aliyun/research/scripts/campaign-cycle-controller.sh \
+    /opt/monday/deployment/aliyun/research/scripts/campaign-cycle-controller.sh
+
+USER research
+WORKDIR /work
+ENTRYPOINT ["/usr/bin/tini", "--", "/bin/bash", "/opt/monday/deployment/aliyun/research/scripts/campaign-cycle-controller.sh"]
