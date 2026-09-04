@@ -15,7 +15,7 @@ use alpha_domain::{
     CexResearchMissionArtifactV1, CexResearchMissionSpecV1, CexResearchOperationalMetadataV1,
     CexResearchPolicyBindingsV1, CexResearchSearchPlanV1, CexResearchVenueV1, EvaluationCostsV1,
     EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1, SearchBudget,
-    CEX_RESEARCH_MISSION_SCHEMA_V1,
+    CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD, CEX_RESEARCH_MISSION_SCHEMA_V1,
 };
 use alpha_engine::baselines::CexSupervisedDecisionPolicyV1;
 use anyhow::{bail, Context};
@@ -29,7 +29,7 @@ const STABLE_HYPOTHESIS_ID: &str = "l2-microstructure-factor-plan-v5";
 const RESEARCH_PLAN_SCHEMA_V2: &str = "cex-campaign-research-plan-v2";
 const SEARCH_POLICY_REVISION_SCHEMA_V1: &str = "cex-campaign-search-policy-revision-v1";
 const LEARNING_DIRECTIVE_SCHEMA_V1: &str = "cex-campaign-learning-directive-v1";
-const RESEARCH_EVIDENCE_SIGNATURE_SCHEMA_V1: &str = "cex-campaign-research-evidence-signature-v1";
+const RESEARCH_EVIDENCE_SIGNATURE_SCHEMA_V2: &str = "cex-campaign-research-evidence-signature-v2";
 pub(crate) const MAX_RESEARCH_PLAN_GENERATION: u8 = 3;
 const INITIAL_TRAIN_ROWS: usize = 7_200;
 const VALIDATION_ROWS: usize = 3_600;
@@ -48,7 +48,8 @@ const SCREENING_POLICY_ID: &str = "binance-btcusdt-usdm-1s-h5-top5-screening-pol
 const SUBSET_POLICY_ID: &str = "binance-btcusdt-usdm-1s-h5-top5-subset-policy";
 const EVALUATION_POLICY_ID: &str = "binance-btcusdt-usdm-1s-h5-top5-evaluation-policy";
 const HOLDOUT_POLICY_ID: &str = "binance-btcusdt-usdm-1s-h5-top5-holdout-policy";
-const FEATURE_FIELDS: [&str; 8] = [
+const FEATURE_FIELDS: [&str; 9] = [
+    CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD,
     "ask_depth_top5",
     "bid_depth_top5",
     "book_imbalance",
@@ -70,6 +71,7 @@ const REQUIRED_NAMED_TEMPLATE_FIELDS: [&str; 3] = [
 pub(crate) enum CexCampaignFailureClassV1 {
     NoTradesAfterCosts,
     OvertradeCapacity,
+    PositiveIcNegativeNet,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -238,7 +240,7 @@ pub(crate) struct CexCampaignResearchPlanV1 {
     pub(crate) search_policy_revision: CexCampaignSearchPolicyRevisionV1,
     pub(crate) attempted_search_policy_revision_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) parent_evidence_signature: Option<CexCampaignResearchEvidenceSignatureV1>,
+    pub(crate) parent_evidence_signature: Option<CexCampaignResearchEvidenceSignatureV2>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) parent: Option<CexCampaignResearchParentV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -249,32 +251,50 @@ pub(crate) struct CexCampaignResearchPlanV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct CexCampaignResearchEvidenceSignatureV1 {
+pub(crate) struct CexCampaignResearchEvidenceSignatureV2 {
     pub(crate) schema_version: String,
+    pub(crate) campaign_inputs_sha256: String,
+    pub(crate) search_policy_revision_id: String,
     pub(crate) feature_fields_sha256: String,
     pub(crate) factor_signatures_sha256: String,
+    pub(crate) evaluation_feedback_sha256: String,
 }
 
-impl CexCampaignResearchEvidenceSignatureV1 {
+impl CexCampaignResearchEvidenceSignatureV2 {
     pub(crate) fn new(
+        campaign_inputs_sha256: String,
+        search_policy_revision_id: String,
         feature_fields_sha256: String,
         factor_signatures_sha256: String,
+        evaluation_feedback_sha256: String,
     ) -> anyhow::Result<Self> {
         let signature = Self {
-            schema_version: RESEARCH_EVIDENCE_SIGNATURE_SCHEMA_V1.to_string(),
+            schema_version: RESEARCH_EVIDENCE_SIGNATURE_SCHEMA_V2.to_string(),
+            campaign_inputs_sha256,
+            search_policy_revision_id,
             feature_fields_sha256,
             factor_signatures_sha256,
+            evaluation_feedback_sha256,
         };
         signature.validate()?;
         Ok(signature)
     }
 
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
-        if self.schema_version != RESEARCH_EVIDENCE_SIGNATURE_SCHEMA_V1
+        if self.schema_version != RESEARCH_EVIDENCE_SIGNATURE_SCHEMA_V2
+            || normalized_sha256("Campaign inputs", &self.campaign_inputs_sha256)?
+                != self.campaign_inputs_sha256
+            || !self
+                .search_policy_revision_id
+                .starts_with("cex-search-policy-")
             || normalized_sha256("Campaign feature fields", &self.feature_fields_sha256)?
                 != self.feature_fields_sha256
             || normalized_sha256("Campaign factor signatures", &self.factor_signatures_sha256)?
                 != self.factor_signatures_sha256
+            || normalized_sha256(
+                "Campaign evaluation feedback",
+                &self.evaluation_feedback_sha256,
+            )? != self.evaluation_feedback_sha256
         {
             bail!("CEX Campaign research evidence signature is invalid");
         }
@@ -307,9 +327,9 @@ impl CexCampaignResearchPlanV1 {
         Self {
             schema_version: RESEARCH_PLAN_SCHEMA_V2.to_string(),
             generation: 0,
-            objective: "Generate and screen continuous L2 microstructure factors, including inverse spread, cross-depth pressure consensus, top-five depth concentration, and VWAP-center displacement, then evaluate Ridge and shallow CART with purged walk-forward OOS predictions on Binance USD-M BTCUSDT 1s/h5/top5 under governed dynamic-v4 GP"
+            objective: "Generate and screen continuous L2 and aggregate-trade microstructure factors, including aggressive trade-flow imbalance, inverse spread, cross-depth pressure consensus, top-five depth concentration, and VWAP-center displacement, then evaluate Ridge and shallow CART with purged walk-forward OOS predictions on Binance USD-M BTCUSDT 1s/h5/top5 under governed dynamic-v4 GP"
                 .to_string(),
-            hypothesis: "L1 pressure, top-five depth balance, inverse spread, cross-depth pressure consensus, near-touch depth concentration, linearly weighted top-five pressure, and top-five VWAP-center displacement predict the next five one-second BTCUSDT mid-price returns"
+            hypothesis: "Aggressive trade-flow imbalance, L1 pressure, top-five depth balance, inverse spread, cross-depth pressure consensus, near-touch depth concentration, linearly weighted top-five pressure, and top-five VWAP-center displacement predict the next five one-second BTCUSDT mid-price returns"
                 .to_string(),
             focus_field: "book_imbalance_top5".to_string(),
             feature_fields: FEATURE_FIELDS.into_iter().map(str::to_string).collect(),
@@ -413,6 +433,9 @@ impl CexCampaignResearchPlanV1 {
                         CexCampaignPositionPolicyV1::PredictionIdentity
                     }
                     CexCampaignFailureClassV1::OvertradeCapacity => {
+                        CexCampaignPositionPolicyV1::HystereticCostAware
+                    }
+                    CexCampaignFailureClassV1::PositiveIcNegativeNet => {
                         CexCampaignPositionPolicyV1::HystereticCostAware
                     }
                 };
@@ -892,10 +915,10 @@ pub(crate) mod tests {
         .unwrap();
         let mission = rendered.mission;
         assert_eq!(MIN_ROWS, 21_608);
-        assert_eq!(mission.spec.search.budget.max_candidates, 20);
+        assert_eq!(mission.spec.search.budget.max_candidates, 22);
         assert_eq!(
             mission.spec.search.planned_gp_and_subset_trials().unwrap(),
-            40
+            44
         );
         assert_eq!(mission.spec.search.budget.max_expansions, MAX_EXPANSIONS);
         assert_eq!(
@@ -992,8 +1015,14 @@ pub(crate) mod tests {
                 learning_directive.search_policy_revision_id.clone(),
             ],
             parent_evidence_signature: Some(
-                CexCampaignResearchEvidenceSignatureV1::new("5".repeat(64), "6".repeat(64))
-                    .unwrap(),
+                CexCampaignResearchEvidenceSignatureV2::new(
+                    "5".repeat(64),
+                    format!("cex-search-policy-{}", "6".repeat(64)),
+                    "7".repeat(64),
+                    "8".repeat(64),
+                    "9".repeat(64),
+                )
+                .unwrap(),
             ),
             parent: Some(parent),
             learning_directive: Some(learning_directive),
@@ -1017,7 +1046,7 @@ pub(crate) mod tests {
 
         assert_eq!(rendered.mission.spec.objective, plan.objective);
         assert_eq!(rendered.mission.spec.feature_fields, plan.feature_fields);
-        assert_eq!(rendered.mission.spec.search.budget.max_candidates, 20);
+        assert_eq!(rendered.mission.spec.search.budget.max_candidates, 22);
         assert_ne!(rendered.mission.spec.policies.gp.id, GP_POLICY_ID);
         assert_eq!(
             rendered.mission.spec.policies.supervised_decision.id,
@@ -1451,6 +1480,10 @@ pub(crate) mod tests {
                 )]),
                 modalities: BTreeSet::from([DataModality::Lob, DataModality::TradeTick]),
                 features: BTreeMap::from([
+                    (
+                        CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD.to_string(),
+                        -0.2,
+                    ),
                     ("ask_depth_top5".to_string(), 10.0),
                     ("bid_depth_top5".to_string(), 10.0),
                     ("book_imbalance".to_string(), 0.1),

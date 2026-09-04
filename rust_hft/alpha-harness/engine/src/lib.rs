@@ -25,7 +25,6 @@ use chrono::Utc;
 #[cfg(feature = "kernel")]
 use evaluation::PreparedDataset;
 use evaluation::{EngineContext, ProposalContext};
-#[cfg(feature = "kernel")]
 use hft_factor_dsl::validate_live_formula;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "kernel")]
@@ -183,6 +182,15 @@ pub struct RemainingBudget {
 }
 
 pub trait CandidateEvaluator {
+    fn validate_proposal(&self, proposal: &EngineProposal) -> Result<(), String> {
+        match &proposal.artifact {
+            CandidateArtifact::Formula(ast) => validate_live_formula(ast)
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            _ => Ok(()),
+        }
+    }
+
     fn evaluate(
         &self,
         proposal: &EngineProposal,
@@ -418,13 +426,7 @@ where
                             "proposal duplicated an existing candidate artifact".to_string(),
                         ))
                     } else if within_budget {
-                        let live_capability = match &proposal.artifact {
-                            CandidateArtifact::Formula(ast) => validate_live_formula(ast)
-                                .map(|_| ())
-                                .map_err(|error| error.to_string()),
-                            _ => Ok(()),
-                        };
-                        match live_capability {
+                        match self.evaluator.validate_proposal(&proposal) {
                             Err(error) => Err(("live_capability_reject", error)),
                             Ok(()) => self
                                 .evaluator

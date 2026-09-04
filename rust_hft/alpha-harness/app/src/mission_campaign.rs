@@ -7,7 +7,7 @@ use crate::{
     mission_render::{
         allowed_research_feature_fields, render_cex_bundle, CexCampaignFailureClassV1,
         CexCampaignLearningDirectiveV1, CexCampaignLlmProvenanceV1, CexCampaignPositionPolicyV1,
-        CexCampaignResearchEvidenceSignatureV1, CexCampaignResearchParentV1,
+        CexCampaignResearchEvidenceSignatureV2, CexCampaignResearchParentV1,
         CexCampaignResearchPlanV1, CexCampaignSearchPolicyRevisionV1, MAX_RESEARCH_PLAN_GENERATION,
     },
     mission_runner::{
@@ -376,7 +376,7 @@ struct CampaignLearnReport {
     parent_campaign_result_sha256: String,
     failure_class: CexCampaignFailureClassV1,
     outcome: CampaignLearnOutcomeV1,
-    evidence_signature: CexCampaignResearchEvidenceSignatureV1,
+    evidence_signature: CexCampaignResearchEvidenceSignatureV2,
     #[serde(skip_serializing_if = "Option::is_none")]
     learning_directive_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -607,9 +607,19 @@ pub fn learn(args: CampaignLearnArgs) -> anyhow::Result<()> {
 
 fn campaign_has_no_improvement(
     request: &CampaignRequest,
-    evidence_signature: &CexCampaignResearchEvidenceSignatureV1,
+    evidence_signature: &CexCampaignResearchEvidenceSignatureV2,
 ) -> bool {
-    request.research_plan.parent_evidence_signature.as_ref() == Some(evidence_signature)
+    request
+        .research_plan
+        .parent_evidence_signature
+        .as_ref()
+        .is_some_and(|parent| {
+            parent.campaign_inputs_sha256 == evidence_signature.campaign_inputs_sha256
+                && parent.feature_fields_sha256 == evidence_signature.feature_fields_sha256
+                && parent.factor_signatures_sha256 == evidence_signature.factor_signatures_sha256
+                && parent.evaluation_feedback_sha256
+                    == evidence_signature.evaluation_feedback_sha256
+        })
 }
 
 fn classify_campaign_failure(
@@ -623,6 +633,11 @@ fn classify_campaign_failure(
             CexCampaignFailureClassV1::NoTradesAfterCosts
         } else if selected.capacity_breached {
             CexCampaignFailureClassV1::OvertradeCapacity
+        } else if selected.time_series_ic.is_some_and(|value| value > 0.0)
+            && selected.cumulative_net_return < 0.0
+            && selected.net_sharpe < 0.0
+        {
+            CexCampaignFailureClassV1::PositiveIcNegativeNet
         } else {
             bail!("Campaign failure is outside the admitted learning classes");
         };
@@ -643,7 +658,7 @@ fn selected_supervised_feedback(
 fn campaign_research_evidence_signature(
     request: &CampaignRequest,
     result: &CampaignResultV1,
-) -> anyhow::Result<CexCampaignResearchEvidenceSignatureV1> {
+) -> anyhow::Result<CexCampaignResearchEvidenceSignatureV2> {
     let feature_fields_sha256 = canonical_json_hash(&request.research_plan.feature_fields)?;
     let mut factor_signatures = result
         .rounds
@@ -652,9 +667,26 @@ fn campaign_research_evidence_signature(
         .map(|factor| factor.factor_signature_sha256.as_str())
         .collect::<Vec<_>>();
     factor_signatures.sort_unstable();
-    CexCampaignResearchEvidenceSignatureV1::new(
+    let evaluation_feedback_sha256 = canonical_json_hash(&serde_json::json!({
+        "termination_reason": &result.termination_reason,
+        "rounds": result.rounds.iter().map(|round| serde_json::json!({
+            "round_id": &round.round_id,
+            "termination_reason": &round.termination_reason,
+            "selected_candidate_id": &round.feedback.supervised_selected_candidate_id,
+            "selected": &round.feedback.supervised_selected,
+            "replay": &round.feedback.supervised_replay,
+        })).collect::<Vec<_>>(),
+    }))?;
+    CexCampaignResearchEvidenceSignatureV2::new(
+        request.campaign_inputs_sha256.clone(),
+        request
+            .research_plan
+            .search_policy_revision
+            .revision_id
+            .clone(),
         feature_fields_sha256,
         canonical_json_hash(&factor_signatures)?,
+        evaluation_feedback_sha256,
     )
 }
 
@@ -671,6 +703,9 @@ fn next_campaign_policy_revision(
             CexCampaignPositionPolicyV1::PredictionIdentity
         }
         CexCampaignFailureClassV1::OvertradeCapacity => {
+            CexCampaignPositionPolicyV1::HystereticCostAware
+        }
+        CexCampaignFailureClassV1::PositiveIcNegativeNet => {
             CexCampaignPositionPolicyV1::HystereticCostAware
         }
     };
@@ -746,7 +781,7 @@ fn follow_up_plan_from_artifact(
     result_sha256: &str,
     learning_directive: CexCampaignLearningDirectiveV1,
     search_policy_revision: CexCampaignSearchPolicyRevisionV1,
-    parent_evidence_signature: CexCampaignResearchEvidenceSignatureV1,
+    parent_evidence_signature: CexCampaignResearchEvidenceSignatureV2,
     artifact: HypothesisArtifact,
 ) -> anyhow::Result<CexCampaignResearchPlanV1> {
     if artifact.field != loaded.request.research_plan.focus_field
@@ -797,7 +832,7 @@ fn campaign_learn_report(
     output: &Path,
     loaded: &LoadedRequest,
     result_sha256: &str,
-    evidence_signature: &CexCampaignResearchEvidenceSignatureV1,
+    evidence_signature: &CexCampaignResearchEvidenceSignatureV2,
     plan: &CexCampaignResearchPlanV1,
     reused_existing: bool,
 ) -> anyhow::Result<CampaignLearnReport> {
@@ -2113,7 +2148,7 @@ fn validate_existing_follow_up_plan(
     result_sha256: &str,
     expected_directive: &CexCampaignLearningDirectiveV1,
     expected_revision: &CexCampaignSearchPolicyRevisionV1,
-    expected_evidence_signature: &CexCampaignResearchEvidenceSignatureV1,
+    expected_evidence_signature: &CexCampaignResearchEvidenceSignatureV2,
 ) -> anyhow::Result<()> {
     plan.validate()?;
     let parent = plan
@@ -2393,6 +2428,14 @@ pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> 
         )?
     {
         bail!("campaign inputs receipt SHA256 must be normalized");
+    }
+    if request
+        .research_plan
+        .parent_evidence_signature
+        .as_ref()
+        .is_some_and(|parent| parent.campaign_inputs_sha256 != request.campaign_inputs_sha256)
+    {
+        bail!("CEX Campaign follow-up parent evidence does not match Campaign inputs");
     }
     normalized_source_revision(
         "campaign producer_source_revision",
@@ -3247,7 +3290,7 @@ mod tests {
         .unwrap();
         assert_eq!(plan.generation, 1);
         assert_eq!(plan.parent.as_ref().unwrap().request_sha256, loaded.sha256);
-        assert_eq!(plan.max_candidates().unwrap(), 20);
+        assert_eq!(plan.max_candidates().unwrap(), 22);
         assert_eq!(
             plan.search_policy_revision.position_policy,
             CexCampaignPositionPolicyV1::HystereticCostAware
@@ -3265,6 +3308,11 @@ mod tests {
             expected_campaign_id(&child).unwrap(),
             loaded.request.campaign_id
         );
+        child.campaign_inputs_sha256 = "e".repeat(64);
+        assert!(validate_request(&child)
+            .unwrap_err()
+            .to_string()
+            .contains("follow-up parent evidence does not match Campaign inputs"));
 
         let root = tempfile::tempdir().unwrap();
         let output = root.path().join("next-plan.json");
@@ -3306,7 +3354,29 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_child_feature_and_factor_signatures_stop_learning() {
+    fn positive_ic_negative_net_creates_a_hysteretic_directive() {
+        let loaded = loaded_request_for_learning();
+        let result_sha256 = "9".repeat(64);
+        let result = positive_ic_negative_net_result(&loaded);
+        validate_negative_campaign_result(&loaded, &result, &result_sha256).unwrap();
+
+        let failure_class = classify_campaign_failure(&result).unwrap();
+        assert_eq!(
+            failure_class,
+            CexCampaignFailureClassV1::PositiveIcNegativeNet
+        );
+        let (revision, directive) =
+            next_campaign_policy_revision(&loaded, &result_sha256, failure_class).unwrap();
+        assert_eq!(
+            revision.position_policy,
+            CexCampaignPositionPolicyV1::HystereticCostAware
+        );
+        assert_eq!(directive.failure_class, failure_class);
+        assert_eq!(directive.search_policy_revision_id, revision.revision_id);
+    }
+
+    #[test]
+    fn evidence_signature_binds_inputs_policy_factors_and_evaluation() {
         let mut loaded = loaded_request_for_learning();
         let mut result = negative_campaign_result(&loaded);
         let parent_signature =
@@ -3322,9 +3392,63 @@ mod tests {
             &parent_signature
         ));
 
+        let parent_revision_id = loaded
+            .request
+            .research_plan
+            .search_policy_revision
+            .revision_id
+            .clone();
+        loaded.request.research_plan.search_policy_revision =
+            CexCampaignSearchPolicyRevisionV1::new(
+                Some(parent_revision_id),
+                CexCampaignPositionPolicyV1::HystereticCostAware,
+            )
+            .unwrap();
+        let child_signature =
+            campaign_research_evidence_signature(&loaded.request, &result).unwrap();
+        assert_ne!(child_signature, parent_signature);
+        assert!(campaign_has_no_improvement(
+            &loaded.request,
+            &child_signature
+        ));
+
+        let original_factor_signature = result.rounds[0].feedback.factors[0]
+            .factor_signature_sha256
+            .clone();
         result.rounds[0].feedback.factors[0].factor_signature_sha256 = "f".repeat(64);
-        let changed = campaign_research_evidence_signature(&loaded.request, &result).unwrap();
-        assert!(!campaign_has_no_improvement(&loaded.request, &changed));
+        let changed_factors =
+            campaign_research_evidence_signature(&loaded.request, &result).unwrap();
+        assert!(!campaign_has_no_improvement(
+            &loaded.request,
+            &changed_factors
+        ));
+        result.rounds[0].feedback.factors[0].factor_signature_sha256 = original_factor_signature;
+
+        loaded.request.campaign_inputs_sha256 = "e".repeat(64);
+        let changed_inputs =
+            campaign_research_evidence_signature(&loaded.request, &result).unwrap();
+        assert_ne!(
+            changed_inputs.campaign_inputs_sha256,
+            parent_signature.campaign_inputs_sha256
+        );
+        assert!(!campaign_has_no_improvement(
+            &loaded.request,
+            &changed_inputs
+        ));
+
+        loaded.request.campaign_inputs_sha256 = result.campaign_inputs_sha256.clone();
+        result.rounds[0]
+            .feedback
+            .supervised_selected
+            .as_mut()
+            .unwrap()
+            .net_sharpe -= 0.1;
+        let changed_evaluation =
+            campaign_research_evidence_signature(&loaded.request, &result).unwrap();
+        assert!(!campaign_has_no_improvement(
+            &loaded.request,
+            &changed_evaluation
+        ));
     }
 
     #[test]
@@ -3366,6 +3490,12 @@ mod tests {
             &loaded,
             &"9".repeat(64),
             CexCampaignFailureClassV1::OvertradeCapacity,
+        )
+        .is_err());
+        assert!(next_campaign_policy_revision(
+            &loaded,
+            &"9".repeat(64),
+            CexCampaignFailureClassV1::PositiveIcNegativeNet,
         )
         .is_err());
     }
@@ -4586,6 +4716,31 @@ mod tests {
             selected_candidate_content_hash: None,
             finalization: None,
         }
+    }
+
+    fn positive_ic_negative_net_result(loaded: &LoadedRequest) -> CampaignResultV1 {
+        let mut result = negative_campaign_result(loaded);
+        let selected = CampaignEvaluationFeedbackV1 {
+            passed: false,
+            score: -20.605987220447407,
+            time_series_ic: Some(0.21292829708865732),
+            time_series_rank_ic: Some(0.2764773346418556),
+            cumulative_net_return: -0.000019082591104964222,
+            max_drawdown: 0.000006843160778702284,
+            net_sharpe: -0.32380961996553226,
+            trade_count: 3_175,
+            total_turnover: 0.09975051317061064,
+            max_book_depth_fraction: Some(0.00007752219388635406),
+            max_book_depth_fraction_limit: Some(0.05),
+            capacity_breached: false,
+        };
+        for round in &mut result.rounds {
+            round.supervised_candidate_id = Some("selected-cart".to_string());
+            round.feedback.supervised_cart = Some(selected.clone());
+            round.feedback.supervised_selected = Some(selected.clone());
+            round.feedback.supervised_selected_candidate_id = Some("selected-cart".to_string());
+        }
+        result
     }
 
     struct CampaignE2eFixture {

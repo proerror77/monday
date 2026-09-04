@@ -635,7 +635,9 @@ pub(crate) fn execute_report(
     {
         bail!("CEX Research Mission hypotheses do not share one frozen baseline target");
     }
-    mission::validate_live_feature_fields(&control_mission.spec.feature_fields)?;
+    if !binding.is_search_only() {
+        mission::validate_live_feature_fields(&control_mission.spec.feature_fields)?;
+    }
     let gp_policy = bound_gp_policy(&control_mission)?;
     let supervised_ml = gp_policy.schema_version == CEX_GP_POLICY_SCHEMA_V4;
     let supervised_decision_policy = bound_supervised_decision_policy(&control_mission)?;
