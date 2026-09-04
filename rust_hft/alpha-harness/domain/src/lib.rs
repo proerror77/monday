@@ -5,7 +5,8 @@ pub mod runtime_latency_evidence;
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hft_factor_dsl::{
-    validate_live_formula, FactorAst, FactorOperator, FactorTerminal, LiveFormulaCapabilityError,
+    validate_live_formula, FactorAst, FactorOperator, FactorTerminal, LiveFormulaCapability,
+    LiveFormulaCapabilityError,
 };
 use hft_research_manifest::{ArtifactRef, CexInstrumentRulesV2, ManifestId};
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,8 @@ pub const LOB_ONNX_PREPROCESSING_VERSION: &str = "lob-relative-price-log-size-v1
 pub const EVALUATION_PROTOCOL_VERSION_V1: &str = "evaluation-protocol-v1";
 pub const CEX_MCTS_RESEARCH_RECEIPT_VERSION_V1: &str = "cex-mcts-research-receipt-v1";
 pub const CEX_RESEARCH_MISSION_SCHEMA_V1: &str = "cex-research-mission-v1";
+pub const CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD: &str =
+    "aggregate_trade_flow_imbalance";
 pub const CEX_GP_POLICY_SCHEMA_V1: &str = "cex-gp-policy-v1";
 pub const CEX_GP_POLICY_SCHEMA_V2: &str = "cex-gp-policy-v2";
 pub const CEX_GP_POLICY_SCHEMA_V3: &str = "cex-gp-policy-v3";
@@ -1664,6 +1667,25 @@ pub struct CexGpPolicyV1 {
     pub budget: SearchBudget,
 }
 
+fn validate_cex_research_formula(ast: &FactorAst) -> Result<LiveFormulaCapability, DomainError> {
+    fn live_capability_surrogate(ast: &FactorAst) -> FactorAst {
+        match ast {
+            FactorAst::Terminal(FactorTerminal::Field(field))
+                if field == CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD =>
+            {
+                FactorAst::Terminal(FactorTerminal::Field("book_imbalance".to_string()))
+            }
+            FactorAst::Terminal(terminal) => FactorAst::Terminal(terminal.clone()),
+            FactorAst::Call { operator, args } => FactorAst::Call {
+                operator: operator.clone(),
+                args: args.iter().map(live_capability_surrogate).collect(),
+            },
+        }
+    }
+
+    Ok(validate_live_formula(&live_capability_surrogate(ast))?)
+}
+
 impl CexGpPolicyV1 {
     fn normalize_admitted_fields(admitted_fields: &mut Vec<String>) {
         admitted_fields.sort();
@@ -1904,8 +1926,9 @@ impl CexGpPolicyV1 {
         }
         let mut event_domain = None;
         for field in &self.admitted_fields {
-            let capability =
-                validate_live_formula(&FactorAst::Terminal(FactorTerminal::Field(field.clone())))?;
+            let capability = validate_cex_research_formula(&FactorAst::Terminal(
+                FactorTerminal::Field(field.clone()),
+            ))?;
             if event_domain.is_some_and(|domain| domain != capability.event_domain) {
                 return Err(DomainError::InvalidCexGpPolicy(
                     "governed GP fields span live event domains",
@@ -1935,7 +1958,7 @@ impl CexGpPolicyV1 {
         self.validate()?;
         ast.validate()
             .map_err(|_| DomainError::InvalidCexGpCandidate("AST is structurally invalid"))?;
-        validate_live_formula(ast)?;
+        validate_cex_research_formula(ast)?;
         let mut stack = vec![(ast, 1_usize)];
         let mut nodes = 0_usize;
         while let Some((node, depth)) = stack.pop() {
@@ -6549,6 +6572,28 @@ mod tests {
             &wall_clock,
         )
         .is_err());
+    }
+
+    #[test]
+    fn governed_gp_accepts_trade_flow_without_granting_live_capability() {
+        let field = FactorAst::Terminal(FactorTerminal::Field(
+            CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD.to_string(),
+        ));
+        assert!(validate_live_formula(&field).is_err());
+
+        let policy = CexGpPolicyV1::controlled_v1(
+            "research-trade-flow-policy",
+            vec![CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD.to_string()],
+            7,
+            &SearchBudget {
+                max_candidates: 2,
+                max_expansions: 16,
+                max_tokens: 0,
+                max_seconds: 0,
+            },
+        )
+        .unwrap();
+        policy.validate_candidate(&field).unwrap();
     }
 
     #[test]

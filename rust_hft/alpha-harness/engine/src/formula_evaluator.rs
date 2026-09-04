@@ -7,7 +7,7 @@ use crate::{
     FoldEvaluationMetrics, FoldPredictiveMetrics, PredictiveMetrics,
 };
 use alpha_domain::{
-    CandidateArtifact, EvaluationCostsV1, EvaluationProtocolV1,
+    CandidateArtifact, CexGpPolicyV1, EvaluationCostsV1, EvaluationProtocolV1,
     CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION, ONNX_WALK_FORWARD_EVALUATOR_VERSION,
     SEALED_HOLDOUT_EVALUATOR_VERSION,
 };
@@ -22,6 +22,7 @@ const BPS: f64 = 10_000.0;
 
 pub struct FormulaEvaluator {
     config: FormulaEvaluatorConfig,
+    governed_gp_policy: Option<CexGpPolicyV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -151,9 +152,22 @@ impl FormulaEvaluator {
         Self::new(FormulaEvaluatorConfig::for_mission(mission).map_err(|error| error.to_string())?)
     }
 
+    pub fn for_governed_mission(
+        mission: &alpha_domain::ResearchMission,
+        gp_policy: &CexGpPolicyV1,
+    ) -> Result<Self, String> {
+        gp_policy.validate().map_err(|error| error.to_string())?;
+        let mut evaluator = Self::for_mission(mission)?;
+        evaluator.governed_gp_policy = Some(gp_policy.clone());
+        Ok(evaluator)
+    }
+
     pub fn new(config: FormulaEvaluatorConfig) -> Result<Self, String> {
         config.validate().map_err(|error| error.to_string())?;
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            governed_gp_policy: None,
+        })
     }
 
     pub fn config_evidence(&self) -> Result<serde_json::Value, String> {
@@ -282,7 +296,7 @@ impl FormulaEvaluator {
         proposal: &EngineProposal,
         dataset: &PreparedDataset,
     ) -> Result<CandidateEvaluation, String> {
-        let ast = formula(proposal)?;
+        let ast = formula(proposal, self.governed_gp_policy.as_ref())?;
         evaluate_sealed_holdout(dataset, |rows| {
             let signals = evaluate_ast(ast, rows)?;
             self.evaluate_ranges(
@@ -550,12 +564,16 @@ impl FormulaEvaluator {
 }
 
 impl CandidateEvaluator for FormulaEvaluator {
+    fn validate_proposal(&self, proposal: &EngineProposal) -> Result<(), String> {
+        formula(proposal, self.governed_gp_policy.as_ref()).map(|_| ())
+    }
+
     fn evaluate(
         &self,
         proposal: &EngineProposal,
         context: &EngineContext<'_>,
     ) -> Result<CandidateEvaluation, String> {
-        let ast = formula(proposal)?;
+        let ast = formula(proposal, self.governed_gp_policy.as_ref())?;
         let signals = evaluate_ast(ast, context.rows())?;
         self.evaluate_ranges(
             context.rows(),
@@ -567,11 +585,20 @@ impl CandidateEvaluator for FormulaEvaluator {
     }
 }
 
-fn formula(proposal: &EngineProposal) -> Result<&FactorAst, String> {
+fn formula<'a>(
+    proposal: &'a EngineProposal,
+    governed_gp_policy: Option<&CexGpPolicyV1>,
+) -> Result<&'a FactorAst, String> {
     match &proposal.artifact {
         CandidateArtifact::Formula(ast) => {
-            ast.validate().map_err(|error| error.to_string())?;
-            validate_live_formula(ast).map_err(|error| error.to_string())?;
+            if let Some(policy) = governed_gp_policy {
+                policy
+                    .validate_candidate(ast)
+                    .map_err(|error| error.to_string())?;
+            } else {
+                ast.validate().map_err(|error| error.to_string())?;
+                validate_live_formula(ast).map_err(|error| error.to_string())?;
+            }
             Ok(ast)
         }
         CandidateArtifact::CexFourStage(strategy) => {
