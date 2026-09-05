@@ -38,11 +38,12 @@ jobs:
 
           # Automated review prompt
           direct_prompt: |
-            Please review this pull request and provide feedback on:
-            - Code quality and best practices
-            - Potential bugs or issues
-            - Performance considerations
-            - Security concerns
-            - Test coverage
-
-            Be constructive and helpful in your feedback.
+            Review the current PR diff against the nearest AGENTS.md and the
+            requested behavior. Report actionable defects with file/line evidence,
+            a concrete trigger, and the resulting impact; omit generic style advice.
+            Check affected contracts, especially research/execution separation,
+            real-data provenance, sealed holdouts, and fail-closed runtime limits.
+            Select validation by changed behavior and credible regression risk.
+            Do not demand a full suite or production Gate for ordinary code changes.
+            Distinguish verified defects from untested concerns. If no actionable
+            defects are found, say so and state any material validation limitations.

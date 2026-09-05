@@ -26,6 +26,8 @@ printf '%s\n' .github/workflows/security.yml >"$tmp_dir/unknown-workflow.txt"
 printf '%s\n' .github/workflows/security-enabled.yml >"$tmp_dir/security-workflow.txt"
 printf '%s\n' .github/ISSUE_TEMPLATE/engineering-change.yml >"$tmp_dir/governance-template.txt"
 printf '%s\n' docs/agents/issue-tracker.md >"$tmp_dir/governance-doc.txt"
+printf '%s\n' .agents/skills/monday-research-evidence-audit/SKILL.md >"$tmp_dir/skill.txt"
+printf '%s\n' .agents/skills/monday-delivery-status/agents/openai.yaml >"$tmp_dir/skill-ui.txt"
 printf '%s\n' AGENTS.md rust_hft/tools/collector/AGENTS.md >"$tmp_dir/agent-instructions.txt"
 printf '%s\n' rust_hft/CLAUDE.md rust_hft/tools/collector/src/polymarket/reference.rs \
   >"$tmp_dir/agent-instructions-with-code.txt"
@@ -121,6 +123,9 @@ job_cases=(
   'security-workflow-push|push|security-workflow.txt|ploy/workflow-lint'
   'governance-template|pull_request|governance-template.txt|ploy/commit-hygiene,ploy/workflow-lint'
   'governance-doc|pull_request|governance-doc.txt|ploy/commit-hygiene,ploy/workflow-lint'
+  'skill|pull_request|skill.txt|ploy/commit-hygiene,ploy/workflow-lint'
+  'skill-push|push|skill.txt|ploy/workflow-lint'
+  'skill-ui|pull_request|skill-ui.txt|ploy/commit-hygiene,ploy/workflow-lint'
   'agent-instructions|pull_request|agent-instructions.txt|ploy/commit-hygiene'
   'agent-instructions-with-code|pull_request|agent-instructions-with-code.txt|ploy/commit-hygiene,ci/rust,ci/polymarket-evidence-compiler-image'
   'preflight-only|pull_request|preflight-only.txt|ploy/commit-hygiene'
@@ -354,6 +359,35 @@ grep -Fqx "            mapfile -d '' workflow_files < <(" "$ploy_workflow"
 grep -Fq -- '--diff-filter=ACMR -z' "$ploy_workflow"
 grep -Fqx '          if ((${#workflow_files[@]} == 0)); then' "$ploy_workflow"
 grep -Fqx '          "${HOME}/go/bin/actionlint" -color "${workflow_files[@]}"' "$ploy_workflow"
+# Exercise the actual CI validator with valid and invalid metadata.
+sed -n "/^          ruby -ryaml <<'RUBY'$/,/^          RUBY$/p" "$ploy_workflow" \
+  | sed 's/^          //' >"$tmp_dir/validate-skills.sh"
+test -s "$tmp_dir/validate-skills.sh"
+metadata_case() {
+  local label=$1 name=$2 description=$3 extra=$4 ui=$5 expected=$6 result=0
+  local root="$tmp_dir/metadata-$label"
+  local skill="$root/.agents/skills/$name"
+  mkdir -p "$skill/agents"
+  printf '%s\n' '---' "name: $name" "description: $description" "$extra" '---' 'Body' >"$skill/SKILL.md"
+  printf '%s\n' "$ui" >"$skill/agents/openai.yaml"
+  (cd "$root" && bash "$tmp_dir/validate-skills.sh") >"$root/result" 2>&1 || result=$?
+  if [[ $expected == pass && $result != 0 || $expected == fail && $result == 0 ]]; then
+    printf 'metadata case %s: expected %s, exit %s\n' "$label" "$expected" "$result" >&2
+    cat "$root/result" >&2
+    exit 1
+  fi
+}
+metadata_case valid example Audit '' 'interface: {display_name: Example}' pass
+metadata_case optional-interface example Audit '' 'interface: {}' pass
+metadata_case underscore invalid_skill Audit '' 'interface: {}' fail
+metadata_case long-name "$(printf '%065d' 0)" Audit '' 'interface: {}' fail
+metadata_case angle-bracket example '"<audit>"' '' 'interface: {}' fail
+metadata_case unknown-key example Audit 'unsupported: true' 'interface: {}' fail
+metadata_case interface-type example Audit '' 'interface: broken' fail
+metadata_case field-type example Audit '' 'interface: {display_name: 42}' fail
+metadata_case short-description example Audit '' 'interface: {short_description: tiny}' fail
+metadata_case prompt example Audit '' 'interface: {default_prompt: Audit this}' fail
+metadata_case color example Audit '' 'interface: {brand_color: red}' fail
 # sccache must use the #559/#566 pattern (sccache-action + per-job local
 # cache, rustc/sccache-versioned rust-cache keys, continue-on-error fallback) in
 # EVERY ploy-ci job that compiles Rust on the runner, and the homegrown

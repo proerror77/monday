@@ -1,6 +1,6 @@
 ---
 name: monday-research-evidence-audit
-description: Audit one explicitly requested Monday research run from authenticated input through its canonical execution seam, structured process logs, terminal evidence, immutable publication, and independent readback. Use for ResearchSnapshot, evaluator/ML/MCTS, Campaign trial-ledger, baseline or replay Gate, sealed-holdout, cohort-completeness, observability, or research-success claims; do not use for collector health, Gate changes, ordinary code progress, or implementation work. For Code/CI/merge/release/deployment status, use monday-delivery-status instead.
+description: Audit an existing Monday research run's input, terminal evidence, publication, and logs. Excludes implementation progress, collector health, and source-delivery status.
 ---
 
 # Monday Research Evidence Audit
@@ -12,7 +12,7 @@ for modifying research or collector code.
 ## Workflow
 
 1. Name one research contract, venue/instrument, time window, canonical execution seam, and expected terminal artifact. The CEX cloud path is `mission campaign-freeze` -> `mission campaign-finalize` -> `mission dispatch submit` -> `mission campaign-execute`; Prediction uses `prediction execute`. Direct `mission execute`, low-level `mission run`, and legacy `loop run` are diagnostics, not alternate completion seams.
-2. Follow immutable identities through these seven stages:
+2. Derive required stages from that run's contract and evidenced execution path. Use the following identity boundaries where applicable:
    - authenticated input manifest and source digest;
    - venue admission or verifier receipt plus cohort/partition and `ResearchSnapshot` digest;
    - admitted typed Campaign and per-round Mission, policy/configuration digest, and evaluator repository/binary/OCI identity;
@@ -20,13 +20,19 @@ for modifying research or collector code.
    - explicit final state: no candidate, selected pre-holdout, or finalized; verify round holdouts stayed closed and the selected sealed holdout opened at most once;
    - immutable result bundle and checksum;
    - independent OSS or artifact-store readback of the same bytes and checksum.
-3. Audit the process log independently from the immutable evidence chain. Require
-   `monday.research_event.v1` events, or the shell-compatible equivalent, for:
+   Mark a stage `not applicable` only when the contract and terminal evidence
+   justify its omission, such as replay after an evidenced no-candidate result.
+   Absent evidence alone never makes a stage optional. Preserve required terminal
+   publication and readback even when research ends without a candidate.
+3. Audit the process log independently from the immutable evidence chain. For
+   applicable stages, require `monday.research_event.v1` events, or the
+   shell-compatible equivalent, for:
    - run identity and research scope: Campaign/Mission/round, venue, instrument,
      horizon, hypothesis, input and policy identities;
-   - stage start, bounded progress, completion, and failure for validation,
-     slicing, PIT materialization, factor search, Factor Bank, Ridge/CART,
-     OOS position evaluation, L2 replay, result publication, and readback;
+   - stage start, bounded progress where needed, and the actual completion or
+     failure outcome; stages may include validation, slicing, PIT materialization,
+     factor search, Factor Bank, the selected model family, OOS position
+     evaluation, L2 replay, result publication, and readback;
    - factor formula plus screening verdict, model aggregate metrics plus equity
      ledger identity, replay metrics plus Gate failures, Campaign termination,
      and bounded LLM follow-up identity;
@@ -36,7 +42,7 @@ for modifying research or collector code.
    corresponding process events `log_missing` even when its artifacts pass.
 4. At each boundary, compare both the referenced identity and the actual content. Record `passed`, `missing`, `mismatch`, `stale`, `unknown`, `log_missing`, or `not applicable`. Use `unknown` for authentication, network, permission, or other observability gaps; reserve `missing` for verified absence.
 5. Check that fixtures, synthetic substitutes, unrelated collector health, CI success, and preparation logs are not being used as terminal research evidence.
-6. The overall result passes only when every required identity boundary passes for the same contract and window. Report log completeness separately so an observability failure cannot be mistaken for an artifact-integrity failure.
+6. The evidence audit passes only when every required identity boundary passes for the same contract and window. An evidenced no-candidate or negative-return result may pass this audit; it does not prove profitability or deployment readiness. Report log completeness separately so an observability failure cannot be mistaken for an artifact-integrity failure.
 
 ## Safety boundaries
 
@@ -51,5 +57,5 @@ Stop following a branch when an identity breaks or cannot be read back. Continue
 
 ## Output
 
-Return `Stage | Result | Expected identity | Observed identity | Evidence | Gap` for the seven identity stages in step 2, followed by `Log stage | Result | Expected events | Observed events | Evidence | Gap` for step 3.
-End with `Overall: passed` or `Overall: incomplete`, followed by the earliest broken boundary and the smallest read-only check needed next.
+Return `Stage | Result | Expected identity | Observed identity | Evidence | Gap` for the run's identity boundaries, explaining any `not applicable` stages. Report applicable log stages separately.
+End with `Evidence audit: passed` or `Evidence audit: incomplete` and the research outcome separately. If incomplete, name the earliest broken boundary and the next read-only check; otherwise state that no evidence gap was found.
