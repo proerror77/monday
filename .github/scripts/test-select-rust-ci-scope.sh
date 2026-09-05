@@ -359,6 +359,35 @@ grep -Fqx "            mapfile -d '' workflow_files < <(" "$ploy_workflow"
 grep -Fq -- '--diff-filter=ACMR -z' "$ploy_workflow"
 grep -Fqx '          if ((${#workflow_files[@]} == 0)); then' "$ploy_workflow"
 grep -Fqx '          "${HOME}/go/bin/actionlint" -color "${workflow_files[@]}"' "$ploy_workflow"
+# Exercise the actual CI validator with valid and invalid metadata.
+sed -n "/^          ruby -ryaml <<'RUBY'$/,/^          RUBY$/p" "$ploy_workflow" \
+  | sed 's/^          //' >"$tmp_dir/validate-skills.sh"
+test -s "$tmp_dir/validate-skills.sh"
+metadata_case() {
+  local label=$1 name=$2 description=$3 extra=$4 ui=$5 expected=$6 result=0
+  local root="$tmp_dir/metadata-$label"
+  local skill="$root/.agents/skills/$name"
+  mkdir -p "$skill/agents"
+  printf '%s\n' '---' "name: $name" "description: $description" "$extra" '---' 'Body' >"$skill/SKILL.md"
+  printf '%s\n' "$ui" >"$skill/agents/openai.yaml"
+  (cd "$root" && bash "$tmp_dir/validate-skills.sh") >"$root/result" 2>&1 || result=$?
+  if [[ $expected == pass && $result != 0 || $expected == fail && $result == 0 ]]; then
+    printf 'metadata case %s: expected %s, exit %s\n' "$label" "$expected" "$result" >&2
+    cat "$root/result" >&2
+    exit 1
+  fi
+}
+metadata_case valid example Audit '' 'interface: {display_name: Example}' pass
+metadata_case optional-interface example Audit '' 'interface: {}' pass
+metadata_case underscore invalid_skill Audit '' 'interface: {}' fail
+metadata_case long-name "$(printf '%065d' 0)" Audit '' 'interface: {}' fail
+metadata_case angle-bracket example '"<audit>"' '' 'interface: {}' fail
+metadata_case unknown-key example Audit 'unsupported: true' 'interface: {}' fail
+metadata_case interface-type example Audit '' 'interface: broken' fail
+metadata_case field-type example Audit '' 'interface: {display_name: 42}' fail
+metadata_case short-description example Audit '' 'interface: {short_description: tiny}' fail
+metadata_case prompt example Audit '' 'interface: {default_prompt: Audit this}' fail
+metadata_case color example Audit '' 'interface: {brand_color: red}' fail
 # sccache must use the #559/#566 pattern (sccache-action + per-job local
 # cache, rustc/sccache-versioned rust-cache keys, continue-on-error fallback) in
 # EVERY ploy-ci job that compiles Rust on the runner, and the homegrown
