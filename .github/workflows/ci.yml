@@ -120,6 +120,16 @@ jobs:
         if: steps.scope.outputs.control == 'true'
         run: sudo apt-get update && sudo apt-get install -y shellcheck
 
+      - name: Verify Campaign controller recovery
+        if: steps.scope.outputs.control == 'true'
+        run: |
+          bash -n deployment/aliyun/research/scripts/campaign-cycle-controller.sh \
+            deployment/aliyun/research/test-campaign-cycle-controller.sh
+          shellcheck -e SC2154 \
+            deployment/aliyun/research/scripts/campaign-cycle-controller.sh \
+            deployment/aliyun/research/test-campaign-cycle-controller.sh
+          deployment/aliyun/research/test-campaign-cycle-controller.sh
+
       - name: Verify collector release shell contracts
         if: steps.scope.outputs.control == 'true'
         working-directory: rust_hft
