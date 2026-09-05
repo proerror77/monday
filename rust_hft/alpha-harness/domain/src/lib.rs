@@ -1,5 +1,6 @@
 //! Trust-boundary contracts for bounded Loop Engineer research and runtime deployment.
 
+pub mod campaign_control;
 pub mod runtime_latency_evidence;
 
 use chrono::{DateTime, Utc};
