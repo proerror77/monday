@@ -355,11 +355,12 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         json!({"segment_count": args.segment.len()}),
     );
     let (verified_series, segment_paths) = verify_segments(args)?;
+    let series_count = verified_series.len();
     log_event(
         "segment_verification_completed",
         json!({
             "segment_count": args.segment.len(),
-            "verified_series_count": verified_series.len(),
+            "verified_series_count": series_count,
         }),
     );
     if verified_series.iter().any(|series| {
@@ -381,9 +382,9 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
     let mut has_aggregate_trades = None;
     log_event(
         "lob_replay_started",
-        json!({"verified_series_count": verified_series.len(), "symbol": &symbol}),
+        json!({"verified_series_count": series_count, "symbol": &symbol}),
     );
-    for (series_index, series) in verified_series.iter().enumerate() {
+    for (series_index, series) in verified_series.into_iter().enumerate() {
         let verified = series.verified();
         let book = verified
             .replayed_books()
@@ -417,7 +418,7 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
             "lob_replay_progress",
             json!({
                 "completed_series": series_index + 1,
-                "total_series": verified_series.len(),
+                "total_series": series_count,
                 "session_id": series.session_id(),
                 "book_events": book.events().len(),
                 "samples": replay.samples.len(),
@@ -429,7 +430,7 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
     log_event(
         "lob_replay_completed",
         json!({
-            "series_count": verified_series.len(),
+            "series_count": series_count,
             "samples": replay.samples.len(),
             "aggregate_trades": aggregate_trades.len(),
             "has_aggregate_trades": has_aggregate_trades,
