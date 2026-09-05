@@ -1260,6 +1260,100 @@ mod tests {
     }
 
     #[test]
+    fn cumulative_budget_survives_root_change_and_reopen() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "monday-campaign-ledger-reopen-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let db = dir.join("control.duckdb");
+        let mut first = grant("root-1");
+        first.family.max_trials = 150;
+        let first = verify(first);
+        let mut second = grant("root-2");
+        second.family.max_trials = 150;
+        let second = verify(second);
+        let attempt = reservation(&first, 0, 100);
+        {
+            let mut store = AlphaStore::open(&db).unwrap();
+            store.record_approval(&approval(&first, APPROVAL)).unwrap();
+            store
+                .register_campaign_root(&first, APPROVAL, t0())
+                .unwrap();
+            store
+                .reserve_campaign_attempt(&first, &attempt, minutes(10))
+                .unwrap();
+            store
+                .settle_campaign_attempt(
+                    FAMILY,
+                    &settlement(&attempt, CampaignAttemptOutcomeV1::Failed, None),
+                    minutes(20),
+                )
+                .unwrap();
+        }
+
+        // Restart: the unknown consumption is still charged after reopening.
+        let mut store = AlphaStore::open(&db).unwrap();
+        let usage = store.campaign_family_usage(FAMILY).unwrap();
+        assert_eq!(
+            (
+                usage.pending_trials,
+                usage.consumed_trials,
+                usage.uncertain_trials
+            ),
+            (0, 0, 100)
+        );
+        assert!(store
+            .reserve_campaign_attempt(&first, &reservation(&first, 1, 1), minutes(30))
+            .is_err());
+
+        // Root change: a new root under the same family cannot reset the
+        // family's cumulative charge; only the remaining 50 trials are grantable.
+        store
+            .record_approval(&approval(&second, "approval-2"))
+            .unwrap();
+        store
+            .register_campaign_root(&second, "approval-2", minutes(30))
+            .unwrap();
+        assert!(store
+            .reserve_campaign_attempt(&second, &reservation(&second, 0, 51), minutes(31))
+            .is_err());
+        store
+            .reserve_campaign_attempt(&second, &reservation(&second, 0, 50), minutes(31))
+            .unwrap();
+        let usage = store.campaign_family_usage(FAMILY).unwrap();
+        assert_eq!((usage.pending_trials, usage.uncertain_trials), (50, 100));
+        assert_eq!(usage.accounted_trials().unwrap(), 150);
+        assert_eq!(
+            store
+                .campaign_root_usage(FAMILY, second.content_sha256())
+                .unwrap()
+                .pending_trials,
+            50
+        );
+        drop(store);
+
+        let store = AlphaStore::open(&db).unwrap();
+        assert_eq!(
+            kinds(&store.campaign_family_receipts(FAMILY).unwrap()),
+            [
+                "root_registered",
+                "attempt_reserved",
+                "attempt_settled",
+                "root_registered",
+                "attempt_reserved"
+            ]
+        );
+        assert_eq!(store.campaign_family_usage(FAMILY).unwrap(), usage);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn dispatch_admission_requires_readback_of_every_prior_receipt() {
         let (mut store, verified) = registered();
         let attempt = reservation(&verified, 0, 44);
