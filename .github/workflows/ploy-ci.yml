@@ -119,6 +119,56 @@ jobs:
       - name: Install actionlint
         run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.8
 
+      - name: Validate skill metadata
+        working-directory: .
+        run: |
+          ruby -ryaml <<'RUBY'
+          files = Dir['.agents/skills/*/SKILL.md']
+          abort 'No skills found' if files.empty?
+          files.each do |file|
+            text = File.read(file)
+            header = text.match(/\A---\r?\n(.*?)\r?\n---(?:\r?\n|\z)/m)
+            abort "#{file}: missing frontmatter" unless header
+            data = YAML.safe_load(header[1])
+            unless data.is_a?(Hash) && %w[name description].all? { |key| data[key].is_a?(String) && !data[key].strip.empty? }
+              abort "#{file}: name and description must be nonempty strings"
+            end
+            expected = File.basename(File.dirname(file))
+            abort "#{file}: name differs from path" unless data['name'] == expected
+            unless expected.length <= 64 && expected.match?(/\A[a-z0-9]+(?:-[a-z0-9]+)*\z/)
+              abort "#{file}: invalid skill name"
+            end
+            if data['description'].length > 1024 || data['description'].match?(/[<>]/)
+              abort "#{file}: invalid description"
+            end
+            unless (data.keys - %w[name description license allowed-tools metadata]).empty?
+              abort "#{file}: unsupported frontmatter keys"
+            end
+          end
+          Dir['.agents/skills/*/agents/openai.yaml'].each do |file|
+            data = YAML.safe_load(File.read(file))
+            abort "#{file}: expected a YAML mapping" unless data.is_a?(Hash)
+            next unless data.key?('interface')
+            ui = data['interface']
+            unless ui.is_a?(Hash) && ui.values.all? { |value| value.is_a?(String) }
+              abort "#{file}: interface must map fields to strings"
+            end
+            fields = %w[display_name short_description icon_small icon_large brand_color default_prompt]
+            abort "#{file}: unsupported interface fields" unless (ui.keys - fields).empty?
+            if ui.key?('short_description') && !(25..64).cover?(ui['short_description'].length)
+              abort "#{file}: short_description must be 25-64 characters"
+            end
+            if ui.key?('brand_color') && !ui['brand_color'].match?(/\A#[0-9a-fA-F]{6}\z/)
+              abort "#{file}: invalid brand_color"
+            end
+            skill = File.basename(File.dirname(File.dirname(file)))
+            if ui.key?('default_prompt') && !ui['default_prompt'].include?("$#{skill}")
+              abort "#{file}: default_prompt must mention $#{skill}"
+            end
+          end
+          puts 'Skill metadata valid'
+          RUBY
+
       - name: Run actionlint
         working-directory: .
         env:

@@ -299,6 +299,7 @@ for path in "${paths[@]}"; do
       select_all_security_jobs
       continue
       ;;
+    .agents/skills/*/SKILL.md|.agents/skills/*/agents/openai.yaml|\
     .github/workflows/claude.yml|.github/workflows/claude-code-review.yml|\
     .github/ISSUE_TEMPLATE/*|.github/pull_request_template.md|\
     docs/agents/issue-tracker.md|docs/agents/triage-labels.md)
