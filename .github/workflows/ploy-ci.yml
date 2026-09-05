@@ -119,6 +119,29 @@ jobs:
       - name: Install actionlint
         run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.8
 
+      - name: Validate skill metadata
+        working-directory: .
+        run: |
+          ruby -ryaml <<'RUBY'
+          files = Dir['.agents/skills/*/SKILL.md']
+          abort 'No skills found' if files.empty?
+          files.each do |file|
+            text = File.read(file)
+            header = text.match(/\A---\r?\n(.*?)\r?\n---(?:\r?\n|\z)/m)
+            abort "#{file}: missing frontmatter" unless header
+            data = YAML.safe_load(header[1])
+            unless data.is_a?(Hash) && %w[name description].all? { |key| data[key].is_a?(String) && !data[key].strip.empty? }
+              abort "#{file}: name and description must be nonempty strings"
+            end
+            expected = File.basename(File.dirname(file))
+            abort "#{file}: name differs from path" unless data['name'] == expected
+          end
+          Dir['.agents/skills/*/agents/openai.yaml'].each do |file|
+            abort "#{file}: expected a YAML mapping" unless YAML.safe_load(File.read(file)).is_a?(Hash)
+          end
+          puts 'Skill metadata valid'
+          RUBY
+
       - name: Run actionlint
         working-directory: .
         env:

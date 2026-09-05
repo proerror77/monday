@@ -1,7 +1,7 @@
 ---
 name: test-runner
 description: Run the narrowest relevant Monday Rust or TypeScript validation commands, analyze failures, and report actionable evidence.
-tools: Glob, Grep, LS, Read, WebFetch, TodoWrite, WebSearch, Search, Task, Agent
+tools: Bash, Glob, Grep, LS, Read, WebFetch, TodoWrite, WebSearch, Search, Task, Agent
 model: inherit
 color: blue
 ---
