@@ -57,10 +57,45 @@ pub struct CampaignRootBudgetV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CampaignSelectionFeedbackV1 {
+    /// Current walk-forward feedback is consumed by both search and learning.
+    /// Independent selection is deliberately not representable until its
+    /// evaluator/reader isolation is implemented and verified.
+    SearchAndLearningVisibleWalkForward,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignEvaluationViewsV1 {
+    pub search_view_sha256: String,
+    pub selection_view_sha256: String,
+    pub selection_feedback: CampaignSelectionFeedbackV1,
+}
+
+impl CampaignEvaluationViewsV1 {
+    pub fn validate(&self) -> Result<()> {
+        digest(&self.search_view_sha256, 64)?;
+        digest(&self.selection_view_sha256, 64)?;
+        if self.search_view_sha256 != self.selection_view_sha256 {
+            return Err(CampaignControlError::Invalid(
+                "v1 selection must declare the shared walk-forward view",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn evidence_label(&self) -> &'static str {
+        "search_visible_validation"
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CampaignExecutionBindingV1 {
     pub campaign_inputs_sha256: String,
     pub evaluation_protocol_sha256: String,
+    pub evaluation_views: CampaignEvaluationViewsV1,
     pub source_revision: String,
     pub runner_image: String,
     pub controller_image: String,
@@ -72,6 +107,7 @@ impl CampaignExecutionBindingV1 {
     pub fn validate(&self) -> Result<()> {
         digest(&self.campaign_inputs_sha256, 64)?;
         digest(&self.evaluation_protocol_sha256, 64)?;
+        self.evaluation_views.validate()?;
         digest(&self.source_revision, 40)?;
         image(&self.runner_image)?;
         image(&self.controller_image)?;
@@ -117,8 +153,7 @@ impl CampaignRootGrantV1 {
                 .ok_or(CampaignControlError::Invalid("policy revision ID"))?;
             digest(sha, 64)?;
         }
-        if self.max_follow_ups > 3
-            || self.valid_from >= self.expires_at
+        if self.valid_from >= self.expires_at
             || self.family.max_trials == 0
             || self.budget.max_trials == 0
             || self.budget.max_trials > self.family.max_trials
@@ -151,6 +186,8 @@ pub struct SignedCampaignRootGrantV1 {
 pub struct VerifiedCampaignRootGrant {
     grant: CampaignRootGrantV1,
     content_sha256: String,
+    signed: SignedCampaignRootGrantV1,
+    verifying_key: VerifyingKey,
 }
 
 impl VerifiedCampaignRootGrant {
@@ -160,6 +197,16 @@ impl VerifiedCampaignRootGrant {
 
     pub fn content_sha256(&self) -> &str {
         &self.content_sha256
+    }
+
+    pub fn signed_grant(&self) -> &SignedCampaignRootGrantV1 {
+        &self.signed
+    }
+
+    /// Public verification material for authenticated historical receipts. A
+    /// new admission must still use the operator's current trusted-key set.
+    pub fn verifying_key(&self) -> &VerifyingKey {
+        &self.verifying_key
     }
 
     pub fn validate_active_at(&self, now: DateTime<Utc>) -> Result<()> {
@@ -247,6 +294,8 @@ pub fn verify_campaign_root_grant(
     let verified = VerifiedCampaignRootGrant {
         grant: signed.grant.clone(),
         content_sha256: signed.content_sha256.clone(),
+        signed: signed.clone(),
+        verifying_key: *key,
     };
     verified.validate_active_at(now)?;
     Ok(verified)
@@ -322,6 +371,50 @@ impl CampaignAttemptReservationV1 {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CampaignAttemptOutcomeV1 {
+    NoCandidate,
+    SelectedPreHoldout,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignAttemptSettlementV1 {
+    pub operation_id: String,
+    pub reservation_sha256: String,
+    /// The controller must verify the terminal Job and these immutable evidence
+    /// bytes before settlement; a hash by itself is not execution evidence.
+    pub evidence_sha256: String,
+    pub outcome: CampaignAttemptOutcomeV1,
+    /// None preserves the full reservation when terminal infrastructure failure
+    /// leaves actual trial consumption unknown. It must never mean zero.
+    pub consumed_trials: Option<u64>,
+}
+
+impl CampaignAttemptSettlementV1 {
+    pub fn validate_against(&self, attempt: &CampaignAttemptReservationV1) -> Result<()> {
+        if self.operation_id != attempt.operation_id()?
+            || self.reservation_sha256 != attempt.content_hash()?
+            || self
+                .consumed_trials
+                .is_some_and(|count| count > attempt.declared_trials)
+            || (matches!(
+                self.outcome,
+                CampaignAttemptOutcomeV1::NoCandidate
+                    | CampaignAttemptOutcomeV1::SelectedPreHoldout
+            ) && self.consumed_trials.is_none())
+        {
+            return Err(CampaignControlError::Invalid(
+                "attempt settlement binding or consumption",
+            ));
+        }
+        digest(&self.evidence_sha256, 64)
+    }
+}
+
 fn signing_message(hash: &str) -> String {
     format!("{ROOT_GRANT_SCHEMA}:{hash}")
 }
@@ -384,6 +477,12 @@ mod tests {
             execution: CampaignExecutionBindingV1 {
                 campaign_inputs_sha256: "2".repeat(64),
                 evaluation_protocol_sha256: "3".repeat(64),
+                evaluation_views: CampaignEvaluationViewsV1 {
+                    search_view_sha256: "b".repeat(64),
+                    selection_view_sha256: "b".repeat(64),
+                    selection_feedback:
+                        CampaignSelectionFeedbackV1::SearchAndLearningVisibleWalkForward,
+                },
                 source_revision: "a".repeat(40),
                 runner_image: format!("registry/research@sha256:{}", "4".repeat(64)),
                 controller_image: format!("registry/controller@sha256:{}", "5".repeat(64)),
@@ -557,5 +656,94 @@ mod tests {
         let mut changed = grant.grant().clone();
         changed.budget.max_trials = changed.family.max_trials + 1;
         assert!(changed.validate().is_err());
+    }
+
+    #[test]
+    fn view_exposure_is_signed_and_cannot_claim_independent_selection() {
+        let (grant, _) = verified();
+        assert_eq!(
+            grant.grant().execution.evaluation_views.evidence_label(),
+            "search_visible_validation"
+        );
+        let mut changed = grant.grant().clone();
+        changed.execution.evaluation_views.selection_view_sha256 = "c".repeat(64);
+        assert!(changed.validate().is_err());
+        let mut value = serde_json::to_value(grant.grant()).unwrap();
+        value["execution"]["evaluation_views"]["selection_feedback"] =
+            "independent_selection".into();
+        assert!(serde_json::from_value::<CampaignRootGrantV1>(value).is_err());
+        let (mut grant, key, now) = fixture();
+        let signed = sign_campaign_root_grant(grant.clone(), "operator".into(), &key).unwrap();
+        grant.execution.evaluation_views.search_view_sha256 = "c".repeat(64);
+        grant.execution.evaluation_views.selection_view_sha256 = "c".repeat(64);
+        assert_ne!(signed.content_sha256, grant.content_hash().unwrap());
+        let mut changed_signed = signed;
+        changed_signed.grant = grant;
+        changed_signed.content_sha256 = changed_signed.grant.content_hash().unwrap();
+        assert!(verify_campaign_root_grant(
+            &changed_signed,
+            &BTreeMap::from([("operator".into(), key.verifying_key())]),
+            now
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn generation_ceiling_comes_from_the_signed_grant() {
+        let (mut grant, key, now) = fixture();
+        grant.max_follow_ups = 5;
+        let signed = sign_campaign_root_grant(grant, "operator".into(), &key).unwrap();
+        let verified = verify_campaign_root_grant(
+            &signed,
+            &BTreeMap::from([("operator".into(), key.verifying_key())]),
+            now,
+        )
+        .unwrap();
+        let mut a = attempt(&verified);
+        a.generation = 5;
+        a.parent_result_sha256 = Some("b".repeat(64));
+        assert!(verified.validate_attempt_scope(&a, now).is_ok());
+        a.generation = 6;
+        assert!(verified.validate_attempt_scope(&a, now).is_err());
+    }
+
+    #[test]
+    fn settlement_keeps_unknown_consumption_distinct_from_zero() {
+        let (grant, _) = verified();
+        let reservation = attempt(&grant);
+        let mut settlement = CampaignAttemptSettlementV1 {
+            operation_id: reservation.operation_id().unwrap(),
+            reservation_sha256: reservation.content_hash().unwrap(),
+            evidence_sha256: "d".repeat(64),
+            outcome: CampaignAttemptOutcomeV1::Failed,
+            consumed_trials: None,
+        };
+        assert!(settlement.validate_against(&reservation).is_ok());
+        settlement.outcome = CampaignAttemptOutcomeV1::NoCandidate;
+        assert!(settlement.validate_against(&reservation).is_err());
+        settlement.consumed_trials = Some(0);
+        assert!(settlement.validate_against(&reservation).is_ok());
+        settlement.consumed_trials = Some(reservation.declared_trials + 1);
+        assert!(settlement.validate_against(&reservation).is_err());
+    }
+
+    #[test]
+    fn settlement_is_bound_to_the_exact_reservation() {
+        let (grant, _) = verified();
+        let reservation = attempt(&grant);
+        let settlement = CampaignAttemptSettlementV1 {
+            operation_id: reservation.operation_id().unwrap(),
+            reservation_sha256: reservation.content_hash().unwrap(),
+            evidence_sha256: "d".repeat(64),
+            outcome: CampaignAttemptOutcomeV1::NoCandidate,
+            consumed_trials: Some(10),
+        };
+        assert!(settlement.validate_against(&reservation).is_ok());
+        let mut changed = reservation.clone();
+        changed.declared_trials += 1;
+        assert!(settlement.validate_against(&changed).is_err());
+        changed = reservation;
+        changed.attempt_ordinal += 1;
+        assert!(settlement.validate_against(&changed).is_err());
     }
 }
