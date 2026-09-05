@@ -611,6 +611,10 @@ releasing each full event payload after replay. A prior 28 GiB run succeeded,
 but its peak was not measured; 28 GiB is not an established memory requirement.
 PR #1098 supplies the separate controller image, its handoff template, and CI
 and publication probes using the same verified binary artifact as the runner.
+Its image smoke exposed a template-permission defect: `COPY --chmod=0644`
+created the destination `k8s` directory without search permission. The image
+explicitly sets that directory to `0755` while retaining `0644` on the YAML;
+the non-root template-readability probe is required in both CI and publication.
 Passing these probes establishes packaging, not a completed ACK learning loop.
 
 Run the remaining acceptance stages serially:

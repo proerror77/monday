@@ -44,6 +44,8 @@ COPY --chmod=0755 deployment/aliyun/research/scripts/campaign-cycle-controller.s
     /opt/monday/deployment/aliyun/research/scripts/campaign-cycle-controller.sh
 COPY --chmod=0644 deployment/aliyun/research/k8s/campaign-cycle-controller-job.example.yaml \
     /opt/monday/deployment/aliyun/research/k8s/campaign-cycle-controller-job.example.yaml
+# COPY applies its mode to newly created destination directories too.
+RUN chmod 0755 /opt/monday/deployment/aliyun/research/k8s
 
 USER research
 WORKDIR /work
