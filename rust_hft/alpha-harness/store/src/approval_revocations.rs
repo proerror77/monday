@@ -6,7 +6,7 @@ use super::{
 };
 use alpha_domain::canonical_json_hash;
 use chrono::{DateTime, Utc};
-use duckdb::params;
+use duckdb::{params, Connection, Transaction};
 use serde::{Deserialize, Serialize};
 
 const SCHEMA: &str = "monday.approval_revocation.v1";
@@ -32,7 +32,7 @@ impl ApprovalRevocationV1 {
         Ok(format!("approval-revocation-{}", self.content_hash()?))
     }
 
-    fn apply_to(
+    pub(crate) fn apply_to(
         &self,
         mut approval: ApprovalRecord,
         hash: &str,
@@ -56,6 +56,116 @@ impl ApprovalRevocationV1 {
     }
 }
 
+pub(crate) fn read_revocation_evidence(
+    conn: &Connection,
+    key: &[u8; 32],
+    approval_id: &str,
+) -> Result<Option<ApprovalRevocationV1>, StoreError> {
+    let row = conn.query_row(
+            "SELECT revocation_id, payload_json, content_hash, auth_tag FROM approval_revocations WHERE approval_id = ?",
+            params![approval_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
+        );
+    let (id, json, hash, auth_tag) = match row {
+        Ok(row) => row,
+        Err(duckdb::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(error) => return Err(database_error(error)),
+    };
+    let event: ApprovalRevocationV1 =
+        decode_authenticated(key, AUTH_DOMAIN, &id, &json, &hash, &auth_tag)?;
+    if event.revocation_id()? != id {
+        return Err(StoreError::ContentHashMismatch);
+    }
+    let (approval, approval_hash) = read_json_row_with_hash(
+        conn,
+        "SELECT payload_json, content_hash FROM approvals WHERE approval_id = ?",
+        approval_id,
+    )?;
+    event.apply_to(approval, &approval_hash)?;
+    Ok(Some(event))
+}
+
+pub(crate) fn serialize_approval_mutation(
+    conn: &Transaction<'_>,
+    approval_id: &str,
+) -> Result<(), StoreError> {
+    conn.execute("INSERT INTO approval_control_heads SELECT approval_id, 0 FROM approvals WHERE approval_id = ? ON CONFLICT DO NOTHING", params![approval_id]).map_err(database_error)?;
+    let changed = conn
+        .execute(
+            "UPDATE approval_control_heads SET revision = revision + 1 WHERE approval_id = ?",
+            params![approval_id],
+        )
+        .map_err(database_error)?;
+    if changed != 1 {
+        return Err(StoreError::NotFound);
+    }
+    Ok(())
+}
+
+pub(crate) fn insert_revocation_evidence(
+    conn: &Transaction<'_>,
+    key: &[u8; 32],
+    event: &ApprovalRevocationV1,
+) -> Result<(), StoreError> {
+    let (approval, hash) = read_json_row_with_hash(
+        conn,
+        "SELECT payload_json, content_hash FROM approvals WHERE approval_id = ?",
+        &event.approval_id,
+    )?;
+    event.apply_to(approval, &hash)?;
+    if let Some(existing) = read_revocation_evidence(conn, key, &event.approval_id)? {
+        return if existing == *event {
+            Ok(())
+        } else {
+            Err(StoreError::Domain("conflicting revocation evidence".into()))
+        };
+    }
+    let id = event.revocation_id()?;
+    let (json, hash) = encoded(event)?;
+    let auth = authentication_tag(key, AUTH_DOMAIN, &id, &json)?;
+    conn.execute(
+        "INSERT INTO approval_revocations VALUES (?, ?, ?, ?, ?)",
+        params![event.approval_id, id, json, hash, auth],
+    )
+    .map_err(database_error)?;
+    append_journal(
+        conn,
+        None,
+        "approval_revoked",
+        &event.approval_id,
+        &hash,
+        event.revoked_at,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn read_effective_approval(
+    conn: &Connection,
+    key: &[u8; 32],
+    approval_id: &str,
+) -> Result<ApprovalRecord, StoreError> {
+    let (approval, hash) = read_json_row_with_hash(
+        conn,
+        "SELECT payload_json, content_hash FROM approvals WHERE approval_id = ?",
+        approval_id,
+    )?;
+    if let Some(revocation) = read_revocation_evidence(conn, key, approval_id)? {
+        return revocation.apply_to(approval, &hash);
+    }
+    if approval.revoked_at.is_none() {
+        let recorded: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM run_journal WHERE event_kind = 'approval_revoked' AND record_id = ?)",
+                params![approval_id], |row| row.get(0),
+            ).map_err(database_error)?;
+        if recorded {
+            return Err(StoreError::Domain(
+                "recorded approval revocation evidence is missing".into(),
+            ));
+        }
+    }
+    Ok(approval)
+}
+
 impl AlphaStore {
     /// Original stored evidence, without overlaying a later revocation. Existing
     /// pre-migration rows are returned unchanged as historical snapshots.
@@ -74,50 +184,12 @@ impl AlphaStore {
         &self,
         approval_id: &str,
     ) -> Result<Option<ApprovalRevocationV1>, StoreError> {
-        let row = self.connection.query_row(
-            "SELECT revocation_id, payload_json, content_hash, auth_tag FROM approval_revocations WHERE approval_id = ?",
-            params![approval_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
-        );
-        let (id, json, hash, auth_tag) = match row {
-            Ok(row) => row,
-            Err(duckdb::Error::QueryReturnedNoRows) => return Ok(None),
-            Err(error) => return Err(database_error(error)),
-        };
-        let event: ApprovalRevocationV1 = decode_authenticated(
-            &self.integrity_key,
-            AUTH_DOMAIN,
-            &id,
-            &json,
-            &hash,
-            &auth_tag,
-        )?;
-        if event.revocation_id()? != id {
-            return Err(StoreError::ContentHashMismatch);
-        }
-        let (approval, approval_hash) = self.get_approval_evidence(approval_id)?;
-        event.apply_to(approval, &approval_hash)?;
-        Ok(Some(event))
+        read_revocation_evidence(&self.connection, &self.integrity_key, approval_id)
     }
 
     /// All authorization consumers use this effective view, never raw SQL rows.
     pub fn get_approval(&self, approval_id: &str) -> Result<ApprovalRecord, StoreError> {
-        let (approval, hash) = self.get_approval_evidence(approval_id)?;
-        if let Some(revocation) = self.get_approval_revocation(approval_id)? {
-            return revocation.apply_to(approval, &hash);
-        }
-        if approval.revoked_at.is_none() {
-            let recorded: bool = self.connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM run_journal WHERE event_kind = 'approval_revoked' AND record_id = ?)",
-                params![approval_id], |row| row.get(0),
-            ).map_err(database_error)?;
-            if recorded {
-                return Err(StoreError::Domain(
-                    "recorded approval revocation evidence is missing".into(),
-                ));
-            }
-        }
-        Ok(approval)
+        read_effective_approval(&self.connection, &self.integrity_key, approval_id)
     }
 
     pub fn revoke_approval(
@@ -145,7 +217,7 @@ impl AlphaStore {
         event: &ApprovalRevocationV1,
     ) -> Result<ApprovalRecord, StoreError> {
         let (approval, original_hash) = self.get_approval_evidence(&event.approval_id)?;
-        let effective = event.apply_to(approval, &original_hash)?;
+        let effective = event.apply_to(approval.clone(), &original_hash)?;
         if let Some(existing) = self.get_approval_revocation(&event.approval_id)? {
             if existing == *event {
                 return Ok(effective);
@@ -157,22 +229,14 @@ impl AlphaStore {
         // Also reject a missing revocation after a recorded event; do not repair
         // damaged history by inventing a new revocation with different bytes.
         self.get_approval(&event.approval_id)?;
-        let id = event.revocation_id()?;
-        let (json, hash) = encoded(event)?;
-        let auth_tag = authentication_tag(&self.integrity_key, AUTH_DOMAIN, &id, &json)?;
         let tx = self.connection.transaction().map_err(database_error)?;
-        tx.execute(
-            "INSERT INTO approval_revocations VALUES (?, ?, ?, ?, ?)",
-            params![event.approval_id, id, json, hash, auth_tag],
-        )
-        .map_err(database_error)?;
-        append_journal(
+        serialize_approval_mutation(&tx, &event.approval_id)?;
+        insert_revocation_evidence(&tx, &self.integrity_key, event)?;
+        super::campaign_ledger::append_registered_root_revocation(
             &tx,
-            None,
-            "approval_revoked",
-            &event.approval_id,
-            &hash,
-            event.revoked_at,
+            &self.integrity_key,
+            &approval,
+            event,
         )?;
         tx.commit().map_err(database_error)?;
         Ok(effective)

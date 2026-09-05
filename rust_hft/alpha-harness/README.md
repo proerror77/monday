@@ -305,7 +305,24 @@ search/learning-visible walk-forward view and labels its evidence
 `search_visible_validation`; it cannot claim independently isolated selection.
 Generation ceilings are signed grant fields, while budgets, available policies
 and verified executor capabilities may stop a cycle earlier. These contracts
-are not yet a substitute for cumulative ledger admission or dispatch checks.
+are not a substitute for the cumulative ledger below; dispatch admission
+consults the ledger, never the grant alone.
+
+Cumulative admission lives in the `alpha-store` Campaign family ledger
+(`campaign_ledger`). Every family has one authenticated head and an append-only,
+hash-linked chain of `monday.campaign_ledger_receipt.v1` receipts: root
+registration (signed grant plus its approval bytes), attempt reservation,
+terminal settlement, and approval revocation. Reservations charge declared
+trials, Job seconds and LLM tokens before any external operation; a settlement
+with unknown consumption after a failed Job keeps the full reservation charged
+and is never read as zero. Revoking a `campaign_root` approval appends the
+revocation receipt to its family chain in the same DuckDB transaction as the
+revocation evidence, so neither can exist without the other. Receipts publish to
+create-once sequence keys, and dispatch admission requires an independent
+readback acknowledgement for every earlier receipt. A family snapshot replays
+into a fresh store only under the original integrity key; publication
+acknowledgements are never inferred from a backup. No live dispatch is wired to
+this ledger.
 
 Native contract models are trained by `hft-research-ml` with Burn. The trainer
 requires point-in-time rows, an exact feature order, a content-addressed dataset

@@ -1,6 +1,7 @@
 //! Transactional DuckDB source of truth for the bounded Loop Engineer control plane.
 
 pub mod approval_revocations;
+pub mod campaign_ledger;
 
 use alpha_domain::{
     canonical_json_hash, AttributionKind, AttributionMode, CandidateArtifact, CandidateEvaluation,
@@ -35,6 +36,7 @@ const MIGRATION_001: &str = include_str!("../migrations/001_control_plane.sql");
 const MIGRATION_002: &str = include_str!("../migrations/002_promotion_bundles.sql");
 const MIGRATION_003: &str = include_str!("../migrations/003_loop_runs_and_engine_checkpoints.sql");
 const MIGRATION_004: &str = include_str!("../migrations/004_approval_revocations.sql");
+const MIGRATION_005: &str = include_str!("../migrations/005_campaign_family_ledger.sql");
 const INTEGRITY_KEY_ENV: &str = "ALPHA_STORE_INTEGRITY_KEY_HEX";
 const INTEGRITY_KEY_BYTES: usize = 32;
 const MISSION_EVALUATION_PROTOCOL_KIND: &str = "mission_evaluation_protocol";
@@ -600,6 +602,9 @@ impl AlphaStore {
             .map_err(database_error)?;
         self.connection
             .execute_batch(MIGRATION_004)
+            .map_err(database_error)?;
+        self.connection
+            .execute_batch(MIGRATION_005)
             .map_err(database_error)
     }
 
