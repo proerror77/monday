@@ -1,5 +1,7 @@
 //! Transactional DuckDB source of truth for the bounded Loop Engineer control plane.
 
+pub mod approval_revocations;
+
 use alpha_domain::{
     canonical_json_hash, AttributionKind, AttributionMode, CandidateArtifact, CandidateEvaluation,
     CexBaselineArtifactV1, CexFactorBankRevisionV2, CexFinalPrecommitV1,
@@ -32,6 +34,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 const MIGRATION_001: &str = include_str!("../migrations/001_control_plane.sql");
 const MIGRATION_002: &str = include_str!("../migrations/002_promotion_bundles.sql");
 const MIGRATION_003: &str = include_str!("../migrations/003_loop_runs_and_engine_checkpoints.sql");
+const MIGRATION_004: &str = include_str!("../migrations/004_approval_revocations.sql");
 const INTEGRITY_KEY_ENV: &str = "ALPHA_STORE_INTEGRITY_KEY_HEX";
 const INTEGRITY_KEY_BYTES: usize = 32;
 const MISSION_EVALUATION_PROTOCOL_KIND: &str = "mission_evaluation_protocol";
@@ -594,6 +597,9 @@ impl AlphaStore {
             .map_err(database_error)?;
         self.connection
             .execute_batch(MIGRATION_003)
+            .map_err(database_error)?;
+        self.connection
+            .execute_batch(MIGRATION_004)
             .map_err(database_error)
     }
 
@@ -2409,27 +2415,24 @@ impl AlphaStore {
             let mut statement = self
                 .connection
                 .prepare(
-                    "SELECT payload_json, content_hash FROM approvals
+                    "SELECT approval_id FROM approvals
                      WHERE approval_class = 'human_live_small' AND subject_id = ?
                      ORDER BY created_at DESC, approval_id DESC",
                 )
                 .map_err(database_error)?;
             let rows = statement
                 .query_map(params![promotion.promotion_id], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    row.get::<_, String>(0)
                 })
                 .map_err(database_error)?;
             let mut approvals = Vec::new();
             for row in rows {
-                let (json, hash) = row.map_err(database_error)?;
-                verify_hash(&json, &hash)?;
-                approvals.push(
-                    serde_json::from_str::<ApprovalRecord>(&json).map_err(serialization_error)?,
-                );
+                approvals.push(row.map_err(database_error)?);
             }
             approvals
         };
-        for approval in approvals {
+        for approval_id in approvals {
+            let approval = self.get_approval(&approval_id)?;
             if approval.validate().is_err() || !approval.is_active_at(at) {
                 continue;
             }
@@ -2453,6 +2456,11 @@ impl AlphaStore {
 
     pub fn record_approval(&mut self, approval: &ApprovalRecord) -> Result<(), StoreError> {
         approval.validate()?;
+        if approval.revoked_at.is_some() {
+            return Err(StoreError::Domain(
+                "record the original approval, then append its revocation".to_string(),
+            ));
+        }
         self.insert_json_record(
             "approvals",
             &approval.approval_id,
@@ -2483,53 +2491,6 @@ impl AlphaStore {
                 Ok(())
             },
         )
-    }
-
-    pub fn get_approval(&self, approval_id: &str) -> Result<ApprovalRecord, StoreError> {
-        read_json_row(
-            &self.connection,
-            "SELECT payload_json, content_hash FROM approvals WHERE approval_id = ?",
-            approval_id,
-        )
-    }
-
-    pub fn revoke_approval(
-        &mut self,
-        approval_id: &str,
-        revoked_by: &str,
-        reason: &str,
-        at: DateTime<Utc>,
-    ) -> Result<ApprovalRecord, StoreError> {
-        require_text(revoked_by)?;
-        require_text(reason)?;
-        let mut approval = self.get_approval(approval_id)?;
-        if approval.revoked_at.is_some() {
-            return Err(StoreError::Domain(
-                "approval is already revoked".to_string(),
-            ));
-        }
-        approval.revoked_at = Some(at);
-        approval.revoked_by = Some(revoked_by.to_string());
-        approval.revocation_reason = Some(reason.to_string());
-        approval.validate()?;
-        let (json, hash) = encoded(&approval)?;
-        let transaction = self.connection.transaction().map_err(database_error)?;
-        transaction
-            .execute(
-                "UPDATE approvals SET payload_json = ?, content_hash = ?, revoked_at = ?, revoked_by = ?, revocation_reason = ? WHERE approval_id = ?",
-                params![json, hash, at.to_rfc3339(), revoked_by, reason, approval_id],
-            )
-            .map_err(database_error)?;
-        append_journal(
-            &transaction,
-            None,
-            "approval_revoked",
-            approval_id,
-            &hash,
-            at,
-        )?;
-        transaction.commit().map_err(database_error)?;
-        Ok(approval)
     }
 
     pub fn store_deployment(
@@ -4455,6 +4416,13 @@ mod tests {
             created_at: now,
         };
         store.record_approval(&approval).unwrap();
+        let original_evidence = |store: &AlphaStore| {
+            store.connection.query_row(
+                "SELECT payload_json, content_hash FROM approvals WHERE approval_id = 'approval-1'",
+                [], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            ).unwrap()
+        };
+        let before = original_evidence(&store);
         assert!(store.get_approval("approval-1").unwrap().is_active_at(now));
 
         store
@@ -4465,6 +4433,11 @@ mod tests {
                 now + chrono::Duration::seconds(1),
             )
             .unwrap();
+        assert_eq!(
+            before,
+            original_evidence(&store),
+            "revocation must preserve original approval evidence"
+        );
         assert!(!store
             .get_approval("approval-1")
             .unwrap()

@@ -287,6 +287,26 @@ cargo run -p alpha-harness -- deployment sign \
 
 The deployment signing key file contains exactly 32 bytes as hex and is never stored in DuckDB or passed to the runtime. Live-small signing requires a persisted `human_live_small` approval whose `scope_hash` matches venue, instruments, and live-small intent. Runtime-owned `policy.json` must independently carry the referenced approval id, class, promotion subject, scope hash, signer, validity window, and revocation state; an envelope signer cannot self-assert an approval id. The runtime still refuses live-small activation until universal order/slippage enforcement and real-venue reconciliation/reduce-only acceptance tests pass.
 
+Approval creation preserves the original payload and content hash. Revocation
+appends a `monday.approval_revocation.v1` record bound to that original hash;
+it never updates the original approval row. `get_approval` returns the effective
+view with revocation applied, including for eligibility checks.
+`get_approval_evidence` is for inspecting original evidence, not authorizing an
+operation. Identical revocation replay is idempotent; conflicting revocations,
+invalid authenticity tags and missing evidence after a recorded revocation fail
+closed. Existing legacy rows that already contain revocation metadata remain
+read-only historical snapshots; the migration does not invent their lost
+pre-revocation bytes. An authenticated exported revocation can be replayed after
+its exact original approval to reconstruct the effective view.
+
+The new Campaign grant contract records both search and selection view hashes
+and their feedback visibility. Its initial version explicitly uses the shared,
+search/learning-visible walk-forward view and labels its evidence
+`search_visible_validation`; it cannot claim independently isolated selection.
+Generation ceilings are signed grant fields, while budgets, available policies
+and verified executor capabilities may stop a cycle earlier. These contracts
+are not yet a substitute for cumulative ledger admission or dispatch checks.
+
 Native contract models are trained by `hft-research-ml` with Burn. The trainer
 requires point-in-time rows, an exact feature order, a content-addressed dataset
 manifest, a fixed split identifier, purge/embargo metadata, and a deterministic
