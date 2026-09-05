@@ -17,7 +17,7 @@ product or execution authority.
 - Run frontend commands with `npm --prefix ploy-frontend`; run sidecar checks with `cargo test -p ploy-agent-sidecar`.
 - Do not create new `ploy-*` crates, a `products/ploy` tree, or another venue execution path. Put new capabilities in the canonical Monday module named in `docs/architecture/PREDICTION_MARKETS.md`.
 - Use current GitHub issue and PR metadata for durable non-trivial work; `tasks/todo.md` is a historical migration checklist, not an authority.
-- Use `apply_patch` for manual edits, preserve unrelated changes, and verify with focused checks before the full PLOY CI lane.
+- Use `apply_patch` for manual edits, preserve unrelated changes, and verify affected behavior and contracts. Run the PLOY CI lane when requested or required by the delivery contract.
 - Do not run a local PostgreSQL instance. Database-backed validation belongs in GitHub Actions.
 
 ## Legacy material

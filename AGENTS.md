@@ -23,12 +23,14 @@
 - Solve the problem directly. Use a skill, issue, specification, branch, or
   worktree only when it reduces uncertainty, coordinates durable work, or
   isolates concurrent writes; never create one merely to satisfy a workflow.
-- For a defect, prove the root cause with the smallest observable check, fix the
+- For a defect, prove the root cause with an observable check, fix the
   shared cause, and rerun that check. Do not patch symptoms or repeat an unchanged
   experiment under a new task or issue.
-- Make the smallest end-to-end change that satisfies the current contract. Reuse
-  existing code, platform features, and installed dependencies before adding
-  abstractions, infrastructure, configuration, or dependencies.
+- Deliver the complete authorized outcome with correct behavior, coherent
+  architecture, and long-term maintainability. Choose the implementation on
+  those merits, not line count or diff size. Cross-module fixes, refactors, and
+  contract migrations are appropriate when the outcome requires them; preserve
+  unrelated user changes and explain material tradeoffs.
 - Backward compatibility is not a goal. Remove obsolete paths instead of adding
   shims or fallbacks; preserve applied migrations and audit history as read-only
   records.
@@ -43,44 +45,44 @@
   through the explicitly requested Git state: publish a PR and stop when a PR is
   requested; verify exact-head CI and stop when CI is requested; merge only when
   merge is explicitly requested and exact-head required checks pass. A production
-  Gate is never part of this loop.
+  Gate protects only a separately authorized collector or runtime transition.
+  It is not a prerequisite for development, CI, merge, or artifact publication;
+  a failed Gate blocks only its cutover.
 - Cross a collector or runtime boundary only on explicit production authorization.
-  Use the shortest applicable sequence: `release -> one Gate -> cutover ->
+  Follow the applicable transition contract: `release -> one Gate -> cutover ->
   Runtime -> independent Readback`. Do not insert repeated Gates, ad hoc evidence
   stages, or unrelated investigations. Re-run a failed stage only after its cause
   or relevant input changed and state the new hypothesis.
-- A control-plane code fix follows the development loop like any other code. Its
-  Gate belongs to the later production transition it protects, not to its PR or
-  merge. Keep Governance changes separate from that production transition.
+- A control-plane code fix follows the same development loop. Keep Governance
+  changes separate from the production transition they protect.
 
 ## Evidence and safety
 
 - Refresh only the source of truth that can affect the next decision. Recheck
   branch and live identities before publishing or mutating runtime; local state
   and old green runs are not current truth.
-- Keep Code, CI, merge, release, runtime, and readback as separate states. Claim
-  only the latest state backed by an exact SHA/digest and direct readback.
-- These are evidence labels, not a mandatory promotion checklist. Stop at the
-  terminal state the user requested; a local implementation normally ends at
-  Code plus focused validation.
-- A production Gate protects its runtime transition. It is not a prerequisite
-  for development, code review, CI, merge, artifact publication, or a release
-  that does not cross that boundary. A failed Gate blocks only its cutover.
-- Default development and control-plane verification to the smallest targeted
-  check, normally no longer than 15 minutes. Run the full Gate once, immediately
-  before a candidate crosses the collector or runtime boundary it protects.
+- Keep Code, CI, merge, release, runtime, and readback as separate evidence labels,
+  not a mandatory promotion checklist. Back claims with exact identities and
+  direct evidence. For uncommitted local Code, identify the base SHA and reviewed
+  working-tree changes, including relevant untracked files; do not imply that
+  they are committed or published.
+- Select development and control-plane checks by affected behavior and regression
+  risk. Start with targeted checks, normally within 15 minutes, and broaden when
+  cross-module contracts or new evidence require it. Run the full Gate once,
+  immediately before a candidate crosses the collector or runtime boundary it protects.
 - Keep each change independently testable and rollbackable. Do not mix Research,
   Governance, and Runtime.
 - Never replace missing real data with fixtures, fabricate completeness, weaken a
   fail-closed gate, or call a successful preparation step terminal evidence.
-- Publishing an issue, PR, artifact, image, or job is not completion. Read back
-  its relationships, checks, immutable identity, terminal result, and output.
+- For a requested issue, PR, or artifact, completion requires reading back its
+  identity and the properties or relationships required by that request. Do not
+  require later delivery states unless requested. For an asynchronous job whose
+  result is requested, verify its terminal result and output, not just submission.
 - Remote build or validation tasks must use `monday-remote-build`; never place a
   workspace, toolchain, Cargo cache, or target directory on an `ack-system` node.
 - Runtime, deployment, and collector cutovers require one named controller,
   exact target and rollback identities, stop rules, automatic cleanup, and direct
-  readback. A failed attempt may run again only after its cause or relevant input
-  changed and the new hypothesis is stated.
+  readback.
 
 ## Scope and ownership
 
@@ -90,6 +92,9 @@
 - Re-read branch, `HEAD`, status, and PR head before publishing or merging. Stop
   on movement or overlap. Do not delete branches or worktrees without explicit
   authorization and safety checks.
+- After a requested merge, synchronize the originating checkout when it can be
+  done without overwriting other work. Preserve unrelated changes and report any
+  checkout that could not be synchronized; do not silently update other sessions' worktrees.
 - A PR contains one independently reviewable behavior; follow the PR template.
 - Use one issue for one behavior or runtime outcome. Record bounded attempts,
   failures, cleanup, and evidence on that issue; create another only when the
@@ -98,8 +103,9 @@
 
 ## Focused validation
 
-- Run the smallest check that can disprove the change, then the owning crate or
-  workflow check. Do not compile the full workspace for ordinary changes.
+- Run checks that can disprove the changed behavior and cover affected contracts,
+  followed by the owning crate or workflow check. Broaden to cross-crate or full
+  workspace validation when justified by the change or failures, not by habit.
 - From `rust_hft/`, use `cargo test -p <changed-crate> --locked` and scoped Clippy.
   Run `cargo metadata --locked --no-deps` only after workspace-graph changes.
 - For instruction, workflow, or shell changes, run `git diff --check` plus the
