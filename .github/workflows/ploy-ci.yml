@@ -302,6 +302,17 @@ jobs:
           cache-from: type=gha,scope=prediction-research-image
           cache-to: type=gha,mode=max,scope=prediction-research-image
 
+      - name: Build the Campaign cycle controller image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: deployment/aliyun/research/Dockerfile.campaign-cycle-controller
+          target: prebuilt
+          load: true
+          tags: monday-campaign-cycle-controller-smoke:local
+          cache-from: type=gha,scope=prediction-campaign-cycle-controller-image
+          cache-to: type=gha,mode=max,scope=prediction-campaign-cycle-controller-image
+
       - name: Probe precompiled prediction entrypoints
         run: |
           set -euo pipefail
@@ -325,6 +336,22 @@ jobs:
             --entrypoint /usr/local/bin/binance-replay-parquet-materializer \
             monday-research-smoke:local \
             --help >/dev/null
+          docker run --rm --entrypoint /bin/bash \
+            monday-campaign-cycle-controller-smoke:local -ceu '
+              command -v jq
+              test -x /usr/local/bin/aliyun
+              test -x /usr/local/bin/kubectl
+              test -x /usr/local/bin/alpha-harness
+              test -x /opt/monday/deployment/aliyun/research/scripts/campaign-cycle-controller.sh
+              test -r /opt/monday/deployment/aliyun/research/k8s/campaign-cycle-controller-job.example.yaml
+            '
+          docker run --rm --entrypoint /usr/local/bin/alpha-harness \
+            monday-campaign-cycle-controller-smoke:local \
+            --version | grep -Fqx "alpha-harness $GITHUB_SHA"
+          docker run --rm --entrypoint /usr/local/bin/aliyun \
+            monday-campaign-cycle-controller-smoke:local version
+          docker run --rm --entrypoint /usr/local/bin/kubectl \
+            monday-campaign-cycle-controller-smoke:local version --client=true
 
   rust-format:
     name: Rust formatting

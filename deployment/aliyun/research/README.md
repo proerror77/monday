@@ -74,7 +74,9 @@ Recommended first production shape:
   `workload=backtest`, scales from zero to four nodes, and returns to zero after
   jobs finish.
 - One backtest Pod per worker; each Pod processes a batch of parameters.
-- A prebuilt image from `rust_hft/deployment/docker/Dockerfile.research`.
+- A prebuilt runner image from `rust_hft/deployment/docker/Dockerfile.research`.
+- A separate ACK controller image from
+  `deployment/aliyun/research/Dockerfile.campaign-cycle-controller`.
 
 The existing AWS/EKS manifests under `rust_hft/deployment/k8s` are not inputs to
 this deployment.
@@ -485,7 +487,8 @@ selection artifact; it never reselects Ridge/CART/Burn by score during learn.
 Thus a selected candidate with fills and `capacity_breached=true` is
 `overtrade_capacity`, even when an unselected zero-trade candidate has a higher
 score. `no_trades_after_costs` admits only the registered prediction-identity mapping;
-`overtrade_capacity` admits only the registered hysteretic cost-aware mapping.
+`overtrade_capacity` and `positive_ic_negative_net` admit only the registered
+hysteretic cost-aware mapping.
 The feature set, evaluator, fees, validation, budgets, holdout, and model kinds
 remain frozen. The LLM supplies only the falsifiable hypothesis text and cannot
 change the pinned policy revision, Kubernetes, risk, or execution authority.
@@ -509,6 +512,11 @@ stdout for review. It does not wait for the Campaign Job, enter
 `approve` performs the same bounded preparation for one learned child
 generation and prints a fresh ACK Job handoff. Applying either printed Job is a
 separate operator action; the controller does not apply it.
+
+The ACR publication workflow publishes `campaign-cycle-controller` alongside
+`research-runner` from the same authenticated research binary artifact. Pin the
+controller Job to that image's digest and verify its
+`org.opencontainers.image.revision` label before applying the Job.
 
 The signer remains a separate trust boundary and receives the frozen signing
 plan. The controller never logs signed URLs. Its mode-0700 work directory is
@@ -575,12 +583,67 @@ readback mode on macOS exits non-zero before creating a partial destination or
 any `round-*-results.zip`. `start`, `status`, and `approve` therefore remain
 local control-plane operations only. The ACK Job uses the namespace-scoped
 ServiceAccount and Role in
-`k8s/campaign-cycle-controller-rbac.example.yaml`: exact Job read/watch, Pod
-read/list for the Job-owned Pod, and deletion of one exact `*-inputs` Secret.
+`k8s/campaign-cycle-controller-rbac.example.yaml`: exact Job read/watch, exact
+Job-owned Pod read, and deletion of one exact `*-inputs` Secret.
 It has no create/patch authority, cluster-wide authority, exchange credential,
 order, risk-limit, or runtime-resume access. After a negative generation, the
 ACK Job stops at `approval_handoff`; a workstation may inspect `status` and
 explicitly approve the next bounded generation.
+
+### Campaign acceptance and memory regression
+
+Keep source delivery, image publication, materialization, and learning lineage
+as separate evidence. The 2026-09-04 31-hour run at source
+`1f108dcf160cdc84d2339a2d437d2610fd3abafe` is the baseline: the handoff records
+308/308 segments with no duplicates or reordering, successful ACK Jobs/Pods,
+and independent image/result readback. Its `cex-campaign-result-v8` object is
+`cex-campaign-fbe0758949d0d9fd8f9372d2408ef693`, SHA-256
+`3c625bfe355f3a0d166804f23d0130c8549daa1e0618fa603779c14346a23140`, with
+`campaign_no_candidate`. The result checksum and the persisted
+`max_follow_ups=0` input were rechecked during the 2026-09-05 handoff. This proves
+the bounded research evidence inner loop; it does not prove a cloud learning
+follow-up, seven-day coverage, generalization, or profitability.
+
+The original reducer was OOM-killed at 12 GiB while starting PIT feature rows.
+It retained all seven verified series of full depth events while accumulating
+trades and feature rows. PR #1097 consumes those series in their original order,
+releasing each full event payload after replay. A prior 28 GiB run succeeded,
+but its peak was not measured; 28 GiB is not an established memory requirement.
+PR #1098 supplies the separate controller image, its handoff template, and CI
+and publication probes using the same verified binary artifact as the runner.
+Its image smoke exposed a template-permission defect: `COPY --chmod=0644`
+created the destination `k8s` directory without search permission. The image
+explicitly sets that directory to `0755` while retaining `0644` on the YAML;
+the non-root template-readability probe is required in both CI and publication.
+Passing these probes establishes packaging, not a completed ACK learning loop.
+
+Run the remaining acceptance stages serially:
+
+1. Publish the merged source's `research-runner` and `campaign-cycle-controller`.
+   Independently read both immutable digests and OCI revision labels; require
+   both revisions to equal the selected source SHA and verify `linux/amd64`.
+2. Reuse the exact frozen 31-hour inventory in a new output namespace with the
+   reducer limited to 12 GiB and `backoffLimit=0`. Record its Job/Pod/imageID,
+   limit, terminal status, OOM events, and observed memory peak (including the
+   measurement method). Require 308/308 ordered, unique segments and independent
+   output checksum readback. A sampled memory maximum is only a lower bound on
+   the true peak. A successful Job at 12 GiB proves that run fits the limit.
+3. Verify the campaign-root PVC and exact-generation SA/Role/RoleBinding before
+   applying the controller handoff. Record the actual worker capacity; Job
+   `parallelism` does not create nodes or guarantee effective concurrency.
+4. Start one cycle with `--max-follow-ups 1`. After the parent finishes, let ACK
+   read back its result and publish the learn report. At `approval_handoff`,
+   inspect the parent-result SHA, directive SHA, policy revision, and child plan
+   before `approve` signs and dispatches the single child. Read back the child
+   Job/Pod/imageID, terminal result and all lineage hashes. A typed
+   `no_improvement` ends the cycle; it is not proof that a child ran.
+
+Stop on failed provenance, incomplete materialization, OOM, failed immutable
+readback, or a conflicting writer. Keep all generations serial and pre-holdout;
+do not open sealed holdout or enable Paper/Shadow/Live. Do not change models,
+fees, Gate, risk, or paused execution. PIT and canonical replay currently
+verify/replay the same inventory separately; eliminating that repeated work is
+a later optimization, not part of the memory-lifetime fix.
 
 Wrap the final request with `attempt_id` and the exact digest-pinned `image` in
 the private submission file, then submit it directly:
@@ -600,9 +663,9 @@ exchange account file, API key, or order/execution entrypoint. Each round
 records `results/mission-admission.json`, which binds the current request SHA
 and the round's Mission SHA alongside the campaign and round IDs.
 
-One Campaign maps to multiple rounds. The canonical v4 factor plan and every
-bounded policy follow-up retain all 8 snapshot L2 terminals and 20 candidate
-slots. The request derives the total trial limit from the exact plan
+One Campaign maps to multiple rounds. The canonical factor plan and every
+bounded policy follow-up retain all 9 L2/aggregate-trade terminals and 22
+candidate slots. The request derives the total trial limit from the exact plan
 and round count. Both use the six-hour protocol
 `7200 + 3*(3600+1) + 5 + 3600 = 21608`, and the `$1000 / Top5 5%` capacity
 screen. A v4 Campaign counts its governed factor attempts plus the three

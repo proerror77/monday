@@ -231,6 +231,10 @@ for path in "${paths[@]}"; do
       select_research_image_jobs
       continue
       ;;
+    deployment/aliyun/research/Dockerfile.campaign-cycle-controller)
+      select_research_image_jobs
+      continue
+      ;;
     rust_hft/.dockerignore)
       select_job ci/deployment-artifacts
       select_job ci/polymarket-evidence-compiler-image
