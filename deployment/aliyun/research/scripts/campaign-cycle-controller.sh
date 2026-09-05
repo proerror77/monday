@@ -82,10 +82,96 @@ validate_controller_state() {
   ' "$controller_state" >/dev/null || die "controller state is invalid: $controller_state"
 }
 
+sha256_file() {
+  if command -v shasum >/dev/null; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    sha256sum "$1" | awk '{print $1}'
+  fi
+}
+
+# Persist the first complete learn report before publishing anything. A resumed
+# campaign-learn may return different execution diagnostics for the same plan.
+validate_learning_checkpoint() {
+  local dir="$1" expected_request="$2" expected_result="$3"
+  local checkpoint="$dir/learning-checkpoint.json"
+  local report_sha outcome plan_sha=""
+  [[ -s "$checkpoint" && -s "$dir/learn-report.json" ]] || return 1
+  report_sha="$(sha256_file "$dir/learn-report.json")" || return 1
+  outcome="$(jq -er '.outcome' "$dir/learn-report.json")" || return 1
+  case "$outcome" in
+    follow_up)
+      [[ -s "$dir/next-research-plan.json" ]] || return 1
+      plan_sha="$(sha256_file "$dir/next-research-plan.json")" || return 1
+      ;;
+    no_improvement) [[ ! -e "$dir/next-research-plan.json" ]] || return 1 ;;
+    *) return 1 ;;
+  esac
+  jq -e --arg request "$expected_request" --arg result "$expected_result" \
+    --arg report "$report_sha" --arg plan "$plan_sha" --arg outcome "$outcome" '
+    .schema_version == "monday.campaign_learning_checkpoint.v1"
+    and .request_sha256 == $request and .campaign_result_sha256 == $result
+    and .learn_report_sha256 == $report and .research_plan_file_sha256 == $plan
+    and .outcome == $outcome
+  ' "$checkpoint" >/dev/null
+}
+
+validate_generation_completion() {
+  local dir="$1" expected_generation="$2"
+  local checkpoint="$dir/generation-complete"
+  local report_sha expected_request expected_result learning_sha="" learned_outcome="" learn_report_sha=""
+  local campaign_root max_follow_ups
+  [[ -s "$checkpoint" && -s "$dir/generation-report.json" \
+    && -s "$dir/finalize-report.json" && -s "$dir/campaign-result.json" ]] || return 1
+  campaign_root="$(jq -er '.campaign_root' "$dir/../controller-inputs.json")" || return 1
+  max_follow_ups="$(jq -er '.max_follow_ups' "$dir/../controller-inputs.json")" || return 1
+  report_sha="$(sha256_file "$dir/generation-report.json")" || return 1
+  expected_request="$(jq -er '.request_sha256' "$dir/finalize-report.json")" || return 1
+  expected_result="$(sha256_file "$dir/campaign-result.json")" || return 1
+  if [[ -e "$dir/learning-checkpoint.json" ]]; then
+    validate_learning_checkpoint "$dir" "$expected_request" "$expected_result" || return 1
+    learning_sha="$(sha256_file "$dir/learning-checkpoint.json")" || return 1
+    learned_outcome="$(jq -er '.outcome' "$dir/learning-checkpoint.json")" || return 1
+    learn_report_sha="$(sha256_file "$dir/learn-report.json")" || return 1
+    cmp -s "$dir/learn-report.json" "$dir/learn-report-readback.json" || return 1
+    if [[ "$(jq -er '.outcome' "$dir/learning-checkpoint.json")" == follow_up ]]; then
+      cmp -s "$dir/next-research-plan.json" "$dir/next-research-plan-readback.json" || return 1
+    fi
+  fi
+  jq -e --slurpfile report "$dir/generation-report.json" \
+    --argjson generation "$expected_generation" --arg report_sha "$report_sha" \
+    --arg request "$expected_request" --arg result "$expected_result" \
+    --arg learning "$learning_sha" --arg learned_outcome "$learned_outcome" \
+    --arg learn_report_sha "$learn_report_sha" --arg campaign_root "$campaign_root" \
+    --argjson max_follow_ups "$max_follow_ups" '
+    .schema_version == "monday.campaign_generation_completion.v1"
+    and .generation == $generation and $report[0].generation == $generation
+    and .generation_report_sha256 == $report_sha
+    and .learning_checkpoint_sha256 == $learning
+    and $report[0].request_sha256 == $request
+    and $report[0].campaign_result_sha256 == $result
+    and (.campaign_pod_name | type == "string" and length > 0)
+    and (if .outcome == "follow_up" then
+      $learned_outcome == "follow_up" and .cycle_result == null
+    elif .outcome == "complete" then
+      if $learned_outcome == "no_improvement" then
+        .cycle_result == ($report[0] + {
+          termination_reason:"no_improvement",learning_outcome:"no_improvement",
+          learn_report_url:($campaign_root + "/campaign-id=" + $report[0].campaign_id + "/learning/generation=" + ($generation | tostring) + "/learn-report.json"),
+          learn_report_sha256:$learn_report_sha
+        })
+      elif $learning == "" and $report[0].termination_reason != "campaign_no_candidate" then
+        .cycle_result == $report[0]
+      elif $learning == "" and $generation == $max_follow_ups then
+        .cycle_result == ($report[0] + {bounded_loop_exhausted:true})
+      else false end
+    else false end)
+  ' "$checkpoint" >/dev/null
+}
+
 cycle_status() {
   local status_dir="$1"
   local status_state="$status_dir/controller-inputs.json"
-  local status_result="$status_dir/cycle-result.json"
   local generation_dir candidate
   local generation=-1
   local checkpoint_status="incomplete"
@@ -98,25 +184,6 @@ cycle_status() {
   [[ -d "$status_dir" ]] || die "work directory does not exist: $status_dir"
   [[ -s "$status_state" ]] || die "controller state is missing: $status_state"
   validate_controller_state "$status_state"
-
-  if [[ -s "$status_result" ]]; then
-    jq -e '.generation | type == "number"' "$status_result" >/dev/null \
-      || die "cycle result is invalid: $status_result"
-    jq -n --slurpfile inputs "$status_state" --slurpfile result "$status_result" '{
-      schema_version:"monday.campaign_cycle_status.v1",
-      checkpoint_status:"complete",
-      generation:$result[0].generation,
-      next_stage:null,
-      campaign_inputs_sha256:$inputs[0].campaign_inputs_sha256,
-      source_revision:$inputs[0].source_revision,
-      image:$inputs[0].image,
-      campaign_id:($result[0].campaign_id // null),
-      request_sha256:($result[0].request_sha256 // null),
-      job_name:($result[0].job_name // null),
-      termination_reason:($result[0].termination_reason // null)
-    }'
-    return
-  fi
 
   for generation_dir in "$status_dir"/generation-*; do
     [[ -d "$generation_dir" ]] || continue
@@ -137,7 +204,15 @@ cycle_status() {
     checkpoint_status="terminal_failure"
     next_stage=""
   elif [[ -e "$generation_dir/generation-complete" ]]; then
-    next_stage="next_generation"
+    validate_generation_completion "$generation_dir" "$generation" \
+      || die "saved Campaign completion checkpoint is invalid or unsupported"
+    if [[ "$(jq -er '.outcome' "$generation_dir/generation-complete")" == complete ]]; then
+      checkpoint_status="complete"
+      next_stage=""
+      termination_reason="$(jq -er '.cycle_result.termination_reason' "$generation_dir/generation-complete")"
+    else
+      next_stage="next_generation"
+    fi
   elif [[ -e "$generation_dir/result-readback-complete" ]]; then
     if [[ -s "$generation_dir/campaign-result.json" ]]; then
       termination_reason="$(jq -r '.termination_reason // empty' "$generation_dir/campaign-result.json")"
@@ -311,7 +386,8 @@ cleanup_sensitive_files() {
   for generation_dir in "$work_dir"/generation-*; do
     [[ -d "$generation_dir" ]] || continue
     rm -f -- "$generation_dir/signed-request.json"
-    if [[ -e "$generation_dir/generation-complete" || ! -e "$generation_dir/finalized" ]]; then
+    if [[ -e "$generation_dir/terminal-failure" || ! -e "$generation_dir/finalized" ]] \
+      || validate_generation_completion "$generation_dir" "${generation_dir##*/generation-}"; then
       rm -f -- "$generation_dir/request.json" "$generation_dir/submission.json"
     elif [[ -e "$generation_dir/dispatched" ]]; then
       rm -f -- "$generation_dir/submission.json"
@@ -322,12 +398,31 @@ trap cleanup_sensitive_files EXIT
 trap 'exit 130' HUP INT TERM
 trap 'status=$?; trap - ERR; die "command failed at line $LINENO with exit $status"' ERR
 
-sha256_file() {
-  if command -v shasum >/dev/null; then
-    shasum -a 256 "$1" | awk '{print $1}'
-  else
-    sha256sum "$1" | awk '{print $1}'
+commit_generation_completion() {
+  local outcome="$1" cycle_result="${2:-null}" learning_sha=""
+  if [[ -e "$generation_dir/learning-checkpoint.json" ]]; then
+    learning_sha="$(sha256_file "$generation_dir/learning-checkpoint.json")"
   fi
+  jq -n --argjson generation "$generation" --arg outcome "$outcome" \
+    --arg pod "$campaign_pod_name" --argjson cycle_result "$cycle_result" \
+    --arg report "$(sha256_file "$generation_dir/generation-report.json")" \
+    --arg learning "$learning_sha" '{
+      schema_version:"monday.campaign_generation_completion.v1",
+      generation:$generation,outcome:$outcome,campaign_pod_name:$pod,
+      generation_report_sha256:$report,learning_checkpoint_sha256:$learning,
+      cycle_result:$cycle_result
+    }' >"$generation_dir/generation-complete.partial"
+  mv -f -- "$generation_dir/generation-complete.partial" "$generation_dir/generation-complete"
+  validate_generation_completion "$generation_dir" "$generation" \
+    || die "Campaign completion checkpoint is invalid"
+}
+
+publish_cycle_checkpoint() {
+  local dir="$1"
+  # The generation completion is authoritative; this summary can be rebuilt
+  # after interruption between committing the generation and writing the cache.
+  jq '.cycle_result' "$dir/generation-complete" >"$work_dir/cycle-result.json.partial"
+  mv -f -- "$work_dir/cycle-result.json.partial" "$work_dir/cycle-result.json"
 }
 
 oss_readback() {
@@ -448,6 +543,13 @@ if [[ "$mode" != "ack-readback" ]]; then
 fi
 
 if [[ -s "$work_dir/cycle-result.json" ]]; then
+  completed_generation="$(jq -er '.generation | select(type == "number" and . >= 0 and floor == .)' "$work_dir/cycle-result.json")"
+  completed_dir="$work_dir/generation-$completed_generation"
+  validate_generation_completion "$completed_dir" "$completed_generation" \
+    || die "saved Campaign completion checkpoint is invalid or unsupported"
+  [[ "$(jq -er '.outcome' "$completed_dir/generation-complete")" == complete ]] \
+    || die "cycle result does not belong to a terminal generation"
+  publish_cycle_checkpoint "$completed_dir"
   log_event cycle_checkpoint_reused "result=cycle-result.json"
   jq . "$work_dir/cycle-result.json"
   exit 0
@@ -471,9 +573,23 @@ while ((generation <= max_follow_ups)); do
   [[ ! -e "$generation_dir/terminal-failure" ]] \
     || die "Campaign generation $generation already reached a terminal failure"
   if [[ -e "$generation_dir/generation-complete" ]]; then
+    validate_generation_completion "$generation_dir" "$generation" \
+      || die "saved Campaign completion checkpoint is invalid or unsupported"
     log_event generation_checkpoint_reused "generation=$generation"
+    if [[ "$(jq -er '.outcome' "$generation_dir/generation-complete")" == complete ]]; then
+      publish_cycle_checkpoint "$generation_dir"
+      jq . "$work_dir/cycle-result.json"
+      exit 0
+    fi
     research_plan="$generation_dir/next-research-plan.json"
     [[ -s "$research_plan" ]] || die "completed generation is missing its follow-up plan"
+    if [[ "$mode" == ack-readback \
+      && "$(jq -er '.campaign_pod_name' "$generation_dir/generation-complete")" == "$campaign_pod_name" ]]; then
+      controller_stage="approval_handoff"
+      log_event stage_checkpoint_reused "generation=$generation" "stage=approval_handoff"
+      cycle_status "$work_dir"
+      exit 0
+    fi
     generation=$((generation + 1))
     continue
   fi
@@ -603,8 +719,8 @@ while ((generation <= max_follow_ups)); do
         "pod/$campaign_pod_name" -o json | jq '{items:[.]}' >"$pod_status" || true
       "$kubectl_cli" "${kubectl_readback_args[@]}" delete \
         secret "$job_name-inputs" --ignore-not-found=true >/dev/null
-      rm -f -- "$request"
       : >"$generation_dir/terminal-failure"
+      rm -f -- "$request"
       die "Campaign Job failed: $job_name"
     fi
     [[ "$job_complete" == true ]] \
@@ -620,8 +736,8 @@ while ((generation <= max_follow_ups)); do
     image_identity="$(jq -er '.image_identity' "$request")"
     if ! verify_kubernetes_provenance \
       "$job_status" "$pod_status" "$job_name" "$request_sha256" "$image_identity"; then
-      rm -f -- "$request"
       : >"$generation_dir/terminal-failure"
+      rm -f -- "$request"
       die "Campaign Pod or image provenance does not match the submitted request"
     fi
     : >"$generation_dir/provenance-readback-complete"
@@ -781,8 +897,8 @@ while ((generation <= max_follow_ups)); do
     >"$generation_dir/generation-report.json"
 
   if [[ "$termination_reason" != "campaign_no_candidate" ]]; then
-    cp "$generation_dir/generation-report.json" "$work_dir/cycle-result.json"
-    : >"$generation_dir/generation-complete"
+    commit_generation_completion complete "$(cat "$generation_dir/generation-report.json")"
+    publish_cycle_checkpoint "$generation_dir"
     rm -f -- "$request"
     controller_stage="complete"
     log_event cycle_completed \
@@ -794,9 +910,8 @@ while ((generation <= max_follow_ups)); do
     exit 0
   fi
   if ((generation == max_follow_ups)); then
-    jq '. + {bounded_loop_exhausted:true}' "$generation_dir/generation-report.json" \
-      >"$work_dir/cycle-result.json"
-    : >"$generation_dir/generation-complete"
+    commit_generation_completion complete "$(jq '. + {bounded_loop_exhausted:true}' "$generation_dir/generation-report.json")"
+    publish_cycle_checkpoint "$generation_dir"
     rm -f -- "$request"
     controller_stage="complete"
     log_event cycle_completed \
@@ -815,13 +930,34 @@ while ((generation <= max_follow_ups)); do
     "stage=campaign_learning" \
     "parent_campaign_id=$campaign_id" \
     "parent_result_sha256=$result_sha256"
-  "$alpha_harness" mission campaign-learn \
-    --request "$request" \
-    --result "$result" \
-    --result-sha256 "$result_sha256" \
-    --max-tokens "$max_tokens" \
-    --output "$research_plan" >"$generation_dir/learn-report.json.partial"
-  mv -f -- "$generation_dir/learn-report.json.partial" "$generation_dir/learn-report.json"
+  learning_checkpoint="$generation_dir/learning-checkpoint.json"
+  if [[ ! -e "$learning_checkpoint" ]]; then
+    "$alpha_harness" mission campaign-learn \
+      --request "$request" \
+      --result "$result" \
+      --result-sha256 "$result_sha256" \
+      --max-tokens "$max_tokens" \
+      --output "$research_plan" >"$generation_dir/learn-report.json.partial"
+    mv -f -- "$generation_dir/learn-report.json.partial" "$generation_dir/learn-report.json"
+    learning_outcome="$(jq -er '.outcome' "$generation_dir/learn-report.json")"
+    research_plan_file_sha256=""
+    if [[ "$learning_outcome" == follow_up ]]; then
+      [[ -s "$research_plan" ]] || die "Campaign learning did not produce a child research plan"
+      research_plan_file_sha256="$(sha256_file "$research_plan")"
+    fi
+    jq -n --arg request "$request_sha256" --arg result "$result_sha256" \
+      --arg report "$(sha256_file "$generation_dir/learn-report.json")" \
+      --arg plan "$research_plan_file_sha256" --arg outcome "$learning_outcome" '{
+        schema_version:"monday.campaign_learning_checkpoint.v1",
+        request_sha256:$request,campaign_result_sha256:$result,
+        learn_report_sha256:$report,research_plan_file_sha256:$plan,outcome:$outcome
+      }' >"$learning_checkpoint.partial"
+    mv -f -- "$learning_checkpoint.partial" "$learning_checkpoint"
+  else
+    log_event stage_checkpoint_reused "generation=$generation" "stage=campaign_learning"
+  fi
+  validate_learning_checkpoint "$generation_dir" "$request_sha256" "$result_sha256" \
+    || die "saved Campaign learning checkpoint is invalid"
   [[ -s "$generation_dir/learn-report.json" ]] \
     || die "Campaign learning did not produce a learn report"
   learning_outcome="$(jq -er '.outcome' "$generation_dir/learn-report.json")"
@@ -845,13 +981,13 @@ while ((generation <= max_follow_ups)); do
     "failure_class=$(jq -er '.failure_class' "$generation_dir/learn-report.json")" \
     "outcome=$learning_outcome" \
     "learn_report_sha256=$(sha256_file "$generation_dir/learn-report.json")"
-  rm -f -- "$request"
   if [[ "$learning_outcome" == "no_improvement" ]]; then
-    jq --arg learn_report_url "$learn_report_url" \
+    commit_generation_completion complete "$(jq --arg learn_report_url "$learn_report_url" \
       --arg learn_report_sha256 "$(sha256_file "$generation_dir/learn-report.json")" \
       '. + {termination_reason:"no_improvement",learning_outcome:"no_improvement",learn_report_url:$learn_report_url,learn_report_sha256:$learn_report_sha256}' \
-      "$generation_dir/generation-report.json" >"$work_dir/cycle-result.json"
-    : >"$generation_dir/generation-complete"
+      "$generation_dir/generation-report.json")"
+    publish_cycle_checkpoint "$generation_dir"
+    rm -f -- "$request"
     controller_stage="complete"
     log_event cycle_completed \
       "generation=$generation" \
@@ -861,7 +997,8 @@ while ((generation <= max_follow_ups)); do
     jq . "$work_dir/cycle-result.json"
     exit 0
   fi
-  : >"$generation_dir/generation-complete"
+  commit_generation_completion follow_up
+  rm -f -- "$request"
   if [[ "$mode" == "ack-readback" ]]; then
     controller_stage="approval_handoff"
     log_event stage_completed \

@@ -8,6 +8,10 @@ trap 'rm -rf -- "$root" "$mac_work_dir"' EXIT
 bin="$root/bin"
 start_dir="$root/start"
 export FAKE_STATE="$root/state"
+export FAKE_REAL_RM
+FAKE_REAL_RM="$(command -v rm)"
+export FAKE_REAL_MV
+FAKE_REAL_MV="$(command -v mv)"
 mkdir "$bin" "$start_dir" "$start_dir/input" "$FAKE_STATE"
 touch "$start_dir/campaign-inputs.json"
 
@@ -126,13 +130,24 @@ case "$1 $2" in
     ;;
   "mission campaign-learn")
     output="$(value_after --output "$@")"
+    increment "$FAKE_STATE/learn-count"
     if [[ "${FAKE_LEARN_OUTCOME:-}" == "no_improvement" ]]; then
       rm -f -- "$output"
       jq -n '{failure_class:"overtrade_capacity",outcome:"no_improvement",evidence_signature:{schema_version:"cex-campaign-research-evidence-signature-v1",feature_fields_sha256:("7" * 64),factor_signatures_sha256:("8" * 64)}}'
       exit 0
     fi
-    printf '{"schema_version":"cex-campaign-research-plan-v2"}\n' >"$output"
-    jq -n '{failure_class:"no_trades_after_costs",outcome:"follow_up",evidence_signature:{schema_version:"cex-campaign-research-evidence-signature-v1",feature_fields_sha256:("7" * 64),factor_signatures_sha256:("8" * 64)},learning_directive_sha256:("9" * 64),search_policy_revision_id:("cex-search-policy-" + ("1" * 64)),research_plan_sha256:("e" * 64)}'
+    reused_existing=false
+    if [[ -e "$output" ]]; then
+      reused_existing=true
+    else
+      printf '{"schema_version":"cex-campaign-research-plan-v2"}\n' >"$output"
+      increment "$FAKE_STATE/plan-count"
+    fi
+    if [[ "${FAKE_FAIL_AFTER_PLAN:-0}" == 1 && ! -e "$FAKE_STATE/plan-failed-once" ]]; then
+      : >"$FAKE_STATE/plan-failed-once"
+      exit 75
+    fi
+    jq -n --argjson reused_existing "$reused_existing" '{failure_class:"no_trades_after_costs",outcome:"follow_up",reused_existing:$reused_existing,evidence_signature:{schema_version:"cex-campaign-research-evidence-signature-v1",feature_fields_sha256:("7" * 64),factor_signatures_sha256:("8" * 64)},learning_directive_sha256:("9" * 64),search_policy_revision_id:("cex-search-policy-" + ("1" * 64)),research_plan_sha256:("e" * 64)}'
     ;;
   *)
     echo "unexpected alpha-harness invocation: $*" >&2
@@ -222,9 +237,17 @@ if [[ "$source_object" != oss://* ]]; then
   object_key="$(sha_text "$destination")"
   [[ ! -e "$FAKE_STATE/oss-objects/$object_key" ]] || exit 1
   cp "$source_object" "$FAKE_STATE/oss-objects/$object_key"
+  if [[ "${FAKE_LOSE_PUT_RESPONSE:-0}" == 1 && ! -e "$FAKE_STATE/put-response-lost" ]]; then
+    : >"$FAKE_STATE/put-response-lost"
+    exit 75
+  fi
   exit 0
 fi
 if [[ "$source_object" == *"/learning/"* ]]; then
+  if [[ "${FAKE_FAIL_LEARN_READBACK:-0}" == 1 && "$source_object" == */learn-report.json && ! -e "$FAKE_STATE/learn-readback-failed" ]]; then
+    : >"$FAKE_STATE/learn-readback-failed"
+    exit 75
+  fi
   object_key="$(sha_text "$source_object")"
   cp "$FAKE_STATE/oss-objects/$object_key" "$destination"
   exit 0
@@ -302,6 +325,37 @@ else
 fi
 EOF
 
+cat >"$bin/rm" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+"$FAKE_REAL_RM" "$@"
+if [[ "${FAKE_CRASH_AFTER_REQUEST_REMOVE:-0}" == 1 && ! -e "$FAKE_STATE/cleanup-crashed" ]]; then
+  for argument in "$@"; do
+    if [[ "$argument" == */generation-0/request.json && -s "${argument%/*}/learn-report-readback.json" ]]; then
+      : >"$FAKE_STATE/cleanup-crashed"
+      kill -KILL "$PPID"
+      exit 137
+    fi
+  done
+fi
+EOF
+
+cat >"$bin/mv" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+destination="${!#}"
+if [[ "${FAKE_FAIL_CYCLE_SUMMARY:-0}" == 1 && "$destination" == */cycle-result.json && ! -e "$FAKE_STATE/summary-failed-once" ]]; then
+  : >"$FAKE_STATE/summary-failed-once"
+  exit 75
+fi
+"$FAKE_REAL_MV" "$@"
+if [[ "${FAKE_CRASH_AFTER_COMPLETION_COMMIT:-0}" == 1 && "$destination" == */generation-complete && ! -e "$FAKE_STATE/completion-crashed" ]]; then
+  : >"$FAKE_STATE/completion-crashed"
+  kill -KILL "$PPID"
+  exit 137
+fi
+EOF
+
 cat >"$bin/uname" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -309,7 +363,7 @@ set -euo pipefail
 printf '%s\n' "${FAKE_UNAME:-Linux}"
 EOF
 
-chmod +x "$bin/alpha-harness" "$bin/signer" "$bin/kubectl" "$bin/aliyun" "$bin/uname"
+chmod +x "$bin/alpha-harness" "$bin/signer" "$bin/kubectl" "$bin/aliyun" "$bin/uname" "$bin/rm" "$bin/mv"
 export PATH="$bin:$PATH"
 
 controller="$(cd "$(dirname "$0")" && pwd)/scripts/campaign-cycle-controller.sh"
@@ -429,6 +483,12 @@ grep -Fq 'kind: Job' "$root/approve.stdout"
 grep -Fq 'event=stage_completed generation=1 stage=ack_handoff' "$root/approve.stderr"
 test "$(wc -l <"$FAKE_STATE/ossutil-calls" | tr -d ' ')" == "$oss_calls_before_approve"
 
+# A retried parent readback must not start reading the now-dispatched child.
+"$controller" "${ack_g0_args[@]}" >"$root/parent-retry.out" 2>"$root/parent-retry.err"
+test "$(wc -l <"$FAKE_STATE/ossutil-calls" | tr -d ' ')" == "$oss_calls_before_approve"
+test "$(<"$FAKE_STATE/dispatch-count")" == 2
+grep -Fq 'stage=approval_handoff' "$root/parent-retry.err"
+
 if "$controller" "${ack_g1_args[@]}" >"$root/second.stdout" 2>"$root/second.stderr"; then
   echo "controller accepted a mismatched learning-directive digest" >&2
   exit 1
@@ -513,4 +573,134 @@ test ! -d "$no_improvement_ack/generation-1"
 test ! -e "$no_improvement_ack/generation-0/next-research-plan.json"
 test -s "$no_improvement_ack/generation-0/learn-report-readback.json"
 
+recovery_case() (
+  local label="$1" fault="$2" outcome="${3:-follow_up}"
+  local case_root="$root/recovery-$label"
+  local case_work="$case_root/cycle"
+  local request_dir="$case_work/generation-0"
+  local initial_args=("${controller_args[@]}")
+  export FAKE_STATE="$case_root/state"
+  mkdir -p "$FAKE_STATE"
+  : >"$FAKE_STATE/result-failed-once"
+  initial_args[20]="$case_work"
+  [[ "$outcome" != bounded ]] || initial_args[26]=0
+  (cd "$start_dir" && "$controller" "${initial_args[@]}") >"$case_root/start.out" 2>"$case_root/start.err"
+  local readback_args=("${ack_g0_args[@]}")
+  readback_args[10]="$case_work"
+  local injected_fault="$fault"
+  if [[ "$fault" == TAMPER_* ]]; then
+    injected_fault=FAKE_FAIL_LEARN_READBACK
+  fi
+  if [[ "$fault" == TAMPER_COMPLETION || "$fault" == TAMPER_EMPTY_COMPLETION ]]; then
+    injected_fault=FAKE_CRASH_AFTER_COMPLETION_COMMIT
+  fi
+
+  if [[ "$fault" == FAKE_LOSE_PUT_RESPONSE ]]; then
+    env "$injected_fault=1" FAKE_LEARN_OUTCOME="$outcome" "$controller" "${readback_args[@]}" >"$case_root/first.out" 2>"$case_root/first.err"
+  else
+    if env "$injected_fault=1" FAKE_LEARN_OUTCOME="$outcome" "$controller" "${readback_args[@]}" >"$case_root/first.out" 2>"$case_root/first.err"; then
+      echo "recovery fault did not interrupt controller: $label" >&2
+      return 1
+    fi
+  fi
+  if [[ "$fault" == TAMPER_* ]]; then
+    local expected_error
+    if [[ "$fault" == TAMPER_COMPLETION ]]; then
+      jq '.cycle_result.termination_reason = "campaign_finalized"' "$request_dir/generation-complete" >"$case_root/tampered-completion"
+      cp "$case_root/tampered-completion" "$request_dir/generation-complete"
+      expected_error='saved Campaign completion checkpoint is invalid or unsupported'
+    elif [[ "$fault" == TAMPER_EMPTY_COMPLETION ]]; then
+      : >"$request_dir/generation-complete"
+      expected_error='saved Campaign completion checkpoint is invalid or unsupported'
+    elif [[ "$fault" == TAMPER_LEARN_REPORT ]]; then
+      printf '\n' >>"$request_dir/learn-report.json"
+      expected_error='saved Campaign learning checkpoint is invalid'
+    else
+      local objects=("$FAKE_STATE/oss-objects/"*)
+      test "${#objects[@]}" == 1
+      printf '\n' >>"${objects[0]}"
+      expected_error='published learn artifact readback SHA256 mismatch'
+    fi
+    if "$controller" "${readback_args[@]}" >"$case_root/rejected.out" 2>"$case_root/rejected.err"; then
+      echo "controller accepted corrupted learning evidence: $label" >&2
+      return 1
+    fi
+    grep -Fq "$expected_error" "$case_root/rejected.err"
+    test "$(<"$FAKE_STATE/learn-count")" == 1
+    test "$(<"$FAKE_STATE/dispatch-count")" == 1
+    test -s "$request_dir/request.json"
+    if [[ "$fault" != TAMPER_COMPLETION && "$fault" != TAMPER_EMPTY_COMPLETION ]]; then
+      test ! -e "$request_dir/generation-complete"
+    else
+      if "$controller" status --work-dir "$case_work" >"$case_root/status.out" 2>"$case_root/status.err"; then
+        echo "status accepted an invalid completion: $label" >&2
+        return 1
+      fi
+      grep -Fq "$expected_error" "$case_root/status.err"
+    fi
+    printf 'campaign recovery %s: PASS\n' "$label"
+    return
+  fi
+  if [[ "$fault" == FAKE_FAIL_CYCLE_SUMMARY || "$fault" == FAKE_CRASH_AFTER_COMPLETION_COMMIT ]]; then
+    test -s "$request_dir/generation-complete"
+    if [[ "$outcome" != follow_up ]]; then
+      test ! -e "$case_work/cycle-result.json"
+      local expected_termination=no_improvement
+      [[ "$outcome" != bounded ]] || expected_termination=campaign_no_candidate
+      jq -e --arg termination "$expected_termination" '.checkpoint_status == "complete" and .termination_reason == $termination' \
+        < <("$controller" status --work-dir "$case_work") >/dev/null
+    fi
+  fi
+  if ! FAKE_LEARN_OUTCOME="$outcome" "$controller" "${readback_args[@]}" >"$case_root/resumed.out" 2>"$case_root/resumed.err"; then
+    echo "controller failed to recover: $label" >&2
+    cat "$case_root/resumed.err" >&2
+    return 1
+  fi
+  test "$(<"$FAKE_STATE/dispatch-count")" == 1
+  test "$(<"$FAKE_STATE/signer-count")" == 1
+  test ! -d "$case_work/generation-1"
+  test ! -e "$request_dir/request.json"
+  if [[ "$outcome" != bounded ]]; then
+    cmp "$request_dir/learn-report.json" "$request_dir/learn-report-readback.json"
+  fi
+  if [[ "$outcome" == follow_up ]]; then
+    test "$(<"$FAKE_STATE/plan-count")" == 1
+    cmp "$request_dir/next-research-plan.json" "$request_dir/next-research-plan-readback.json"
+    jq -e '.next_stage == "next_generation"' < <("$controller" status --work-dir "$case_work") >/dev/null
+  elif [[ "$outcome" == no_improvement ]]; then
+    jq -e '.termination_reason == "no_improvement"' "$case_work/cycle-result.json" >/dev/null
+  else
+    jq -e '.termination_reason == "campaign_no_candidate" and .bounded_loop_exhausted == true' "$case_work/cycle-result.json" >/dev/null
+    test ! -e "$FAKE_STATE/learn-count"
+    test ! -e "$request_dir/learning-checkpoint.json"
+  fi
+  if [[ "$fault" == FAKE_FAIL_AFTER_PLAN ]]; then
+    test "$(<"$FAKE_STATE/learn-count")" == 2
+  elif [[ "$outcome" != bounded ]]; then
+    test "$(<"$FAKE_STATE/learn-count")" == 1
+  fi
+  printf 'campaign recovery %s: PASS\n' "$label"
+)
+
+selected_recovery=false
+for scenario in \
+  'report-readback FAKE_FAIL_LEARN_READBACK' \
+  'plan-written FAKE_FAIL_AFTER_PLAN' \
+  'lost-put-response FAKE_LOSE_PUT_RESPONSE' \
+  'follow-up-cleanup FAKE_CRASH_AFTER_REQUEST_REMOVE' \
+  'terminal-cleanup FAKE_CRASH_AFTER_REQUEST_REMOVE no_improvement' \
+  'follow-up-commit FAKE_CRASH_AFTER_COMPLETION_COMMIT' \
+  'terminal-commit FAKE_CRASH_AFTER_COMPLETION_COMMIT no_improvement' \
+  'cycle-summary FAKE_FAIL_CYCLE_SUMMARY no_improvement' \
+  'bounded-commit FAKE_CRASH_AFTER_COMPLETION_COMMIT bounded' \
+  'changed-local-report TAMPER_LEARN_REPORT' \
+  'changed-remote-report TAMPER_REMOTE_REPORT' \
+  'changed-completion TAMPER_COMPLETION no_improvement' \
+  'empty-completion TAMPER_EMPTY_COMPLETION no_improvement'; do
+  read -r -a scenario_args <<<"$scenario"
+  [[ -z "${CAMPAIGN_RECOVERY_SCENARIO:-}" || "$CAMPAIGN_RECOVERY_SCENARIO" == "${scenario_args[0]}" ]] || continue
+  selected_recovery=true
+  recovery_case "${scenario_args[@]}"
+done
+[[ "$selected_recovery" == true ]]
 echo "campaign cycle controller test: PASS"
