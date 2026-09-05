@@ -487,7 +487,8 @@ selection artifact; it never reselects Ridge/CART/Burn by score during learn.
 Thus a selected candidate with fills and `capacity_breached=true` is
 `overtrade_capacity`, even when an unselected zero-trade candidate has a higher
 score. `no_trades_after_costs` admits only the registered prediction-identity mapping;
-`overtrade_capacity` admits only the registered hysteretic cost-aware mapping.
+`overtrade_capacity` and `positive_ic_negative_net` admit only the registered
+hysteretic cost-aware mapping.
 The feature set, evaluator, fees, validation, budgets, holdout, and model kinds
 remain frozen. The LLM supplies only the falsifiable hypothesis text and cannot
 change the pinned policy revision, Kubernetes, risk, or execution authority.
@@ -658,9 +659,9 @@ exchange account file, API key, or order/execution entrypoint. Each round
 records `results/mission-admission.json`, which binds the current request SHA
 and the round's Mission SHA alongside the campaign and round IDs.
 
-One Campaign maps to multiple rounds. The canonical v4 factor plan and every
-bounded policy follow-up retain all 8 snapshot L2 terminals and 20 candidate
-slots. The request derives the total trial limit from the exact plan
+One Campaign maps to multiple rounds. The canonical factor plan and every
+bounded policy follow-up retain all 9 L2/aggregate-trade terminals and 22
+candidate slots. The request derives the total trial limit from the exact plan
 and round count. Both use the six-hour protocol
 `7200 + 3*(3600+1) + 5 + 3600 = 21608`, and the `$1000 / Top5 5%` capacity
 screen. A v4 Campaign counts its governed factor attempts plus the three
