@@ -89,6 +89,7 @@ grep -Fq 'aliyun_sha256=9f7c993bd1b16c530f219bc1976bf78057879db4b1bae857b2952676
 grep -Fq 'kubectl_sha256=fd31c7d7129260e608f6faf92d5984c3267ad0b5ead3bced2fe125686e286ad6' "$controller_dockerfile"
 grep -Fqx 'COPY --chmod=0755 rust_hft/research-bin/alpha-harness /usr/local/bin/alpha-harness' "$controller_dockerfile"
 grep -Fqx 'COPY --chmod=0755 deployment/aliyun/research/scripts/campaign-cycle-controller.sh \' "$controller_dockerfile"
+grep -Fqx 'COPY --chmod=0644 deployment/aliyun/research/k8s/campaign-cycle-controller-job.example.yaml \' "$controller_dockerfile"
 grep -Fqx 'USER research' "$controller_dockerfile"
 grep -Fqx 'ENTRYPOINT ["/usr/bin/tini", "--", "/bin/bash", "/opt/monday/deployment/aliyun/research/scripts/campaign-cycle-controller.sh"]' "$controller_dockerfile"
 grep -Fqx '          image: crpi-ygobwehhof7qs9m3-vpc.ap-northeast-1.personal.cr.aliyuncs.com/wildcard0923/campaign-cycle-controller@sha256:REPLACE_WITH_IMMUTABLE_DIGEST' "$controller_job"

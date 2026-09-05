@@ -521,6 +521,7 @@ jobs:
             test -x /usr/local/bin/kubectl
             test -x /usr/local/bin/alpha-harness
             test -x /opt/monday/deployment/aliyun/research/scripts/campaign-cycle-controller.sh
+            test -r /opt/monday/deployment/aliyun/research/k8s/campaign-cycle-controller-job.example.yaml
           '
           docker run --rm --entrypoint /usr/local/bin/alpha-harness "$IMAGE" \
             --version | grep -Fqx "alpha-harness $SOURCE_REVISION"

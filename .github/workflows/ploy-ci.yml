@@ -303,7 +303,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=prediction-research-image
 
       - name: Build the Campaign cycle controller image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: deployment/aliyun/research/Dockerfile.campaign-cycle-controller
@@ -343,6 +343,7 @@ jobs:
               test -x /usr/local/bin/kubectl
               test -x /usr/local/bin/alpha-harness
               test -x /opt/monday/deployment/aliyun/research/scripts/campaign-cycle-controller.sh
+              test -r /opt/monday/deployment/aliyun/research/k8s/campaign-cycle-controller-job.example.yaml
             '
           docker run --rm --entrypoint /usr/local/bin/alpha-harness \
             monday-campaign-cycle-controller-smoke:local \
