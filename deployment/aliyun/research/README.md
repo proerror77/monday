@@ -590,6 +590,49 @@ order, risk-limit, or runtime-resume access. After a negative generation, the
 ACK Job stops at `approval_handoff`; a workstation may inspect `status` and
 explicitly approve the next bounded generation.
 
+### Recovery checkpoints
+
+The controller commits a `learning-checkpoint.json` before publishing a learn
+artifact. It binds the finalized request and parent result SHA to the exact
+learn-report and next-plan file hashes. Retries validate and reuse those bytes;
+they do not rerun the learner after that checkpoint. A learner interrupted
+after writing its plan but before completing its report may be called again to
+recover the existing plan. Execution diagnostics such as `reused_existing`
+therefore cannot change an already checkpointed, published report.
+
+`generation-complete` is a versioned JSON completion record, not an empty
+marker. It binds the generation report, learning checkpoint and exact approved
+Pod name, and carries either an approval handoff or the complete cycle result.
+The controller validates this record before deleting request/submission files.
+The local `cycle-result.json` summary is derived from that record and can be
+rebuilt if interruption occurs before the summary is written. `status`
+validates completion evidence instead of trusting the summary cache. Repeating
+an ACK readback for a completed parent returns its handoff without reading or
+starting an already-dispatched child. Signing and dispatching the next
+generation still require a separate workstation approval.
+
+| Checkpoint | Recovery action |
+| --- | --- |
+| Plan exists; no learning checkpoint | Revalidate/reuse the plan through `campaign-learn`, then commit the first complete report |
+| Learning checkpoint exists | Verify request/result binding and file hashes; retry immutable publication/readback using identical bytes |
+| Follow-up completion exists | Validate committed evidence, finish sensitive-file cleanup, and return the approval handoff for that Pod |
+| Terminal completion exists | Validate evidence, reconstruct the cycle summary if needed, and finish cleanup |
+| Corrupt or unsupported checkpoint | Stop without overwriting evidence or deleting the request needed for inspection |
+
+Empty completion markers from older controllers are not accepted by this
+format. Keep existing completed research evidence unchanged; use a fresh cycle
+for new acceptance, and require a separately reviewed migration before resuming
+an older checkpoint. Never reinterpret an empty marker as a verified commit.
+
+The existing controller contract test covers learning/report interruption,
+lost PUT responses, interruption after completion commit and request removal,
+summary-write failure, bounded/no-improvement stops, late parent retries, and
+local/remote evidence corruption. These tests prove process-interruption
+recovery against the test filesystem and fake external ports. They do not
+establish storage durability under node power loss, atomic rename on OSS CSI,
+or multi-writer fencing. The persistent storage and single-owner contract must
+be verified separately before a continuously running controller takes over.
+
 ### Campaign acceptance and memory regression
 
 Keep source delivery, image publication, materialization, and learning lineage
