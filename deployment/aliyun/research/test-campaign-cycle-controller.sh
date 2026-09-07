@@ -573,6 +573,15 @@ test ! -d "$no_improvement_ack/generation-1"
 test ! -e "$no_improvement_ack/generation-0/next-research-plan.json"
 test -s "$no_improvement_ack/generation-0/learn-report-readback.json"
 
+# Optional export of actual controller output for Rust wire-contract fixtures.
+if [[ -n "${CAMPAIGN_CHECKPOINT_FIXTURE_DIR:-}" ]]; then
+  mkdir -p "$CAMPAIGN_CHECKPOINT_FIXTURE_DIR"
+  cp "$root/campaign-root/cycle/generation-0/learning-checkpoint.json" "$CAMPAIGN_CHECKPOINT_FIXTURE_DIR/learning-follow-up.json"
+  cp "$root/campaign-root/cycle/generation-0/generation-complete" "$CAMPAIGN_CHECKPOINT_FIXTURE_DIR/completion-follow-up.json"
+  cp "$no_improvement_ack/generation-0/learning-checkpoint.json" "$CAMPAIGN_CHECKPOINT_FIXTURE_DIR/learning-no-improvement.json"
+  cp "$no_improvement_ack/generation-0/generation-complete" "$CAMPAIGN_CHECKPOINT_FIXTURE_DIR/completion-no-improvement.json"
+fi
+
 recovery_case() (
   local label="$1" fault="$2" outcome="${3:-follow_up}"
   local case_root="$root/recovery-$label"
