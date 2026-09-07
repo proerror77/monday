@@ -20,8 +20,8 @@ use sha2::{Digest, Sha256};
 use crate::engines::solve;
 
 const BPS: f64 = 10_000.0;
-const CEX_SUPERVISED_CANDIDATE_SCHEMA_V1: &str = "cex-supervised-model-candidate-v1";
-const CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V1: &str = "cex-supervised-decision-policy-v1";
+const CEX_SUPERVISED_CANDIDATE_SCHEMA_V2: &str = "cex-supervised-model-candidate-v2";
+const CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V2: &str = "cex-supervised-decision-policy-v2";
 const CEX_BURN_HIDDEN_DIM: usize = 8;
 const CEX_BURN_EPOCHS: usize = 8;
 const CEX_BURN_LEARNING_RATE: f64 = 1e-3;
@@ -64,35 +64,35 @@ pub enum CexSupervisedSizingRuleV1 {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct CexSupervisedDecisionPolicyV1 {
+pub struct CexSupervisedDecisionPolicyV2 {
     pub schema_version: String,
     pub round_trip_cost_multiplier: f64,
     pub sizing_rule: CexSupervisedSizingRuleV1,
     pub max_abs_position: f64,
 }
 
-impl CexSupervisedDecisionPolicyV1 {
-    pub fn controlled_v1() -> Self {
+impl CexSupervisedDecisionPolicyV2 {
+    pub fn controlled_v2() -> Self {
         Self {
-            schema_version: CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V1.to_string(),
+            schema_version: CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V2.to_string(),
             round_trip_cost_multiplier: 2.0,
             sizing_rule: CexSupervisedSizingRuleV1::ExcessExpectedReturnOverRoundTripCost,
             max_abs_position: 1.0,
         }
     }
 
-    pub fn prediction_identity_v1() -> Self {
+    pub fn prediction_identity_v2() -> Self {
         Self {
-            schema_version: CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V1.to_string(),
+            schema_version: CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V2.to_string(),
             round_trip_cost_multiplier: 0.0,
             sizing_rule: CexSupervisedSizingRuleV1::PredictionIdentity,
             max_abs_position: 1.0,
         }
     }
 
-    pub fn hysteretic_cost_aware_v1() -> Self {
+    pub fn hysteretic_cost_aware_v2() -> Self {
         Self {
-            schema_version: CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V1.to_string(),
+            schema_version: CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V2.to_string(),
             round_trip_cost_multiplier: 2.0,
             sizing_rule: CexSupervisedSizingRuleV1::HystereticExcessExpectedReturnOverRoundTripCost,
             max_abs_position: 1.0,
@@ -109,7 +109,7 @@ impl CexSupervisedDecisionPolicyV1 {
                 self.round_trip_cost_multiplier.to_bits() == 0.0_f64.to_bits()
             }
         };
-        if self.schema_version != CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V1
+        if self.schema_version != CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V2
             || !admitted
             || self.max_abs_position.to_bits() != 1.0_f64.to_bits()
         {
@@ -126,7 +126,7 @@ impl CexSupervisedDecisionPolicyV1 {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct CexSupervisedModelCandidateV1 {
+pub struct CexSupervisedModelCandidateV2 {
     pub schema_version: String,
     pub artifact_id: String,
     pub mission_id: String,
@@ -136,15 +136,16 @@ pub struct CexSupervisedModelCandidateV1 {
     pub research_dataset: CexResearchContentRefV1,
     pub walk_forward_partition: CexResearchContentRefV1,
     pub evaluation_policy: CexResearchContentRefV1,
-    pub decision_policy: CexSupervisedDecisionPolicyV1,
+    pub decision_policy: CexSupervisedDecisionPolicyV2,
     pub predictions_sha256: String,
     pub target_positions_sha256: String,
+    pub return_accounting: crate::formula_evaluator::ReturnAccountingBasis,
     pub evaluation: alpha_domain::CandidateEvaluation,
     pub deployment_authority: bool,
     pub order_submission_authority: bool,
 }
 
-impl CexSupervisedModelCandidateV1 {
+impl CexSupervisedModelCandidateV2 {
     fn finalize(mut self) -> Result<Self, String> {
         self.artifact_id = self.expected_artifact_id()?;
         self.validate()?;
@@ -168,7 +169,9 @@ impl CexSupervisedModelCandidateV1 {
         self.evaluation
             .validate()
             .map_err(|error| error.to_string())?;
-        if self.schema_version != CEX_SUPERVISED_CANDIDATE_SCHEMA_V1
+        if self.return_accounting
+            != crate::formula_evaluator::ReturnAccountingBasis::ObservedMidPrice
+            || self.schema_version != CEX_SUPERVISED_CANDIDATE_SCHEMA_V2
             || self.artifact_id != self.expected_artifact_id()?
             || self.mission_id.trim().is_empty()
             || self.factor_bank_revision_id.trim().is_empty()
@@ -201,14 +204,14 @@ impl CexSupervisedModelCandidateV1 {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct CexSupervisedModelEvaluationV1 {
-    pub candidate: CexSupervisedModelCandidateV1,
+pub struct CexSupervisedModelEvaluationV2 {
+    pub candidate: CexSupervisedModelCandidateV2,
     pub predictions: Vec<f64>,
     pub target_positions: Vec<f64>,
     pub report: PositionEvaluationReport,
 }
 
-impl CexSupervisedModelEvaluationV1 {
+impl CexSupervisedModelEvaluationV2 {
     pub fn validate(&self) -> Result<(), String> {
         self.candidate.validate()?;
         if self.candidate.predictions_sha256
@@ -216,6 +219,7 @@ impl CexSupervisedModelEvaluationV1 {
             || self.candidate.target_positions_sha256
                 != canonical_json_hash(&self.target_positions).map_err(|error| error.to_string())?
             || self.candidate.evaluation != self.report.evaluation
+            || self.report.return_accounting != self.candidate.return_accounting
             || self.predictions.len() != self.target_positions.len()
             || self.report.ledger.iter().any(|point| {
                 point.row_index >= self.predictions.len()
@@ -468,8 +472,8 @@ pub fn evaluate_cex_supervised_model(
     context: &EngineContext<'_>,
     factor_bank: &CexFactorBankRevisionV2,
     artifact: &CexBaselineArtifactV1,
-    decision_policy: &CexSupervisedDecisionPolicyV1,
-) -> Result<CexSupervisedModelEvaluationV1, String> {
+    decision_policy: &CexSupervisedDecisionPolicyV2,
+) -> Result<CexSupervisedModelEvaluationV2, String> {
     verify_cex_baseline_artifact(context, factor_bank, artifact)?;
     decision_policy.validate()?;
     let mut predictions = vec![0.0; context.rows().len()];
@@ -496,8 +500,8 @@ pub fn evaluate_cex_supervised_model(
         context.protocol(),
     )?;
     let model_sha256 = canonical_json_hash(artifact).map_err(|error| error.to_string())?;
-    let candidate = CexSupervisedModelCandidateV1 {
-        schema_version: CEX_SUPERVISED_CANDIDATE_SCHEMA_V1.to_string(),
+    let candidate = CexSupervisedModelCandidateV2 {
+        schema_version: CEX_SUPERVISED_CANDIDATE_SCHEMA_V2.to_string(),
         artifact_id: String::new(),
         mission_id: artifact.mission_id.clone(),
         model_artifact: CexResearchContentRefV1 {
@@ -513,12 +517,13 @@ pub fn evaluate_cex_supervised_model(
         predictions_sha256: canonical_json_hash(&predictions).map_err(|error| error.to_string())?,
         target_positions_sha256: canonical_json_hash(&target_positions)
             .map_err(|error| error.to_string())?,
+        return_accounting: report.return_accounting,
         evaluation: report.evaluation.clone(),
         deployment_authority: false,
         order_submission_authority: false,
     }
     .finalize()?;
-    let evaluation = CexSupervisedModelEvaluationV1 {
+    let evaluation = CexSupervisedModelEvaluationV2 {
         candidate,
         predictions,
         target_positions,
@@ -531,7 +536,7 @@ pub fn evaluate_cex_supervised_model(
 fn supervised_target_positions(
     context: &EngineContext<'_>,
     predictions: &[f64],
-    policy: &CexSupervisedDecisionPolicyV1,
+    policy: &CexSupervisedDecisionPolicyV2,
 ) -> Result<Vec<f64>, String> {
     policy.validate()?;
     if predictions.len() != context.rows().len() {
@@ -551,7 +556,13 @@ fn supervised_target_positions(
             if !prediction.is_finite() {
                 return Err("supervised model prediction is not finite".to_string());
             }
-            let position = match policy.sizing_rule {
+            let terminal = index + 1 == fold.validation.end
+                || context.rows()[index + 1].series_id != row.series_id;
+            let position =
+                if terminal {
+                    0.0
+                } else {
+                    match policy.sizing_rule {
                 CexSupervisedSizingRuleV1::ExcessExpectedReturnOverRoundTripCost => {
                     cost_aware_target_position(prediction, row, &context.protocol().costs, policy)?
                 }
@@ -567,7 +578,8 @@ fn supervised_target_positions(
                         policy,
                     )?
                 }
-            };
+            }
+                };
             positions[index] = position;
             previous_position = position;
         }
@@ -579,7 +591,7 @@ fn cost_aware_target_position(
     prediction: f64,
     row: &crate::evaluation::ResearchRow,
     costs: &alpha_domain::EvaluationCostsV1,
-    policy: &CexSupervisedDecisionPolicyV1,
+    policy: &CexSupervisedDecisionPolicyV2,
 ) -> Result<f64, String> {
     policy.validate()?;
     if !prediction.is_finite() {
@@ -619,7 +631,7 @@ fn hysteretic_cost_aware_target_position(
     previous_position: f64,
     row: &crate::evaluation::ResearchRow,
     costs: &alpha_domain::EvaluationCostsV1,
-    policy: &CexSupervisedDecisionPolicyV1,
+    policy: &CexSupervisedDecisionPolicyV2,
 ) -> Result<f64, String> {
     let proposed = cost_aware_target_position(prediction, row, costs, policy)?;
     if previous_position.abs() <= f64::EPSILON || prediction.signum() != previous_position.signum()
@@ -920,9 +932,7 @@ fn fit_burn_fold(fit: CexBurnFoldFit<'_>) -> Result<(CexBaselineModelV1, Vec<f64
     let mut training_rows = Vec::with_capacity(fold.train.end.saturating_sub(fold.train.start));
     for index in fold.train.clone() {
         let observed_at_ms = timestamp_ms(rows[index].available_time)?;
-        let label_available_at_ms = observed_at_ms
-            .checked_add(horizon_ms)
-            .ok_or_else(|| format!("Burn MLP row {index} label clock overflowed"))?;
+        let label_available_at_ms = timestamp_ms(rows[index].label_available_time)?;
         let feature_row = features[index]
             .iter()
             .map(|value| {
@@ -951,17 +961,19 @@ fn fit_burn_fold(fit: CexBurnFoldFit<'_>) -> Result<(CexBaselineModelV1, Vec<f64
         ));
     }
     let first_observed = training_rows[0].observed_at_ms.get();
-    let last_observed = training_rows
-        .last()
-        .ok_or_else(|| format!("Burn MLP fold {fold_index} lost its training rows"))?
-        .observed_at_ms
-        .get();
-    let cutoff_ms = last_observed
-        .checked_add(horizon_ms)
-        .ok_or_else(|| format!("Burn MLP fold {fold_index} cutoff overflowed"))?;
-    let next_split_start_ms = cutoff_ms
-        .checked_add(horizon_ms)
-        .ok_or_else(|| format!("Burn MLP fold {fold_index} embargo overflowed"))?;
+    let cutoff_ms = training_rows
+        .iter()
+        .map(|row| row.label_available_at_ms.get())
+        .max()
+        .ok_or_else(|| format!("Burn MLP fold {fold_index} lost its training rows"))?;
+    let next_split_start_ms = timestamp_ms(rows[fold.validation.start].available_time)?;
+    // The generic trainer's embargo is the actual gap to the next split,
+    // not the campaign's post-validation embargo row range.
+    let embargo_ms = next_split_start_ms
+        .checked_sub(cutoff_ms)
+        .and_then(|gap| u64::try_from(gap).ok())
+        .filter(|gap| *gap > 0)
+        .ok_or("Burn MLP training labels are not available before validation")?;
     let ordered_features = factor_ids
         .iter()
         .map(|factor_id| {
@@ -1008,11 +1020,8 @@ fn fit_burn_fold(fit: CexBurnFoldFit<'_>) -> Result<(CexBaselineModelV1, Vec<f64
                 .map_err(|_| "Burn MLP label horizon overflowed".to_string())?,
         )
         .map_err(|error| format!("Burn MLP purge is invalid: {error}"))?,
-        PositiveDurationMs::new(
-            u64::try_from(horizon_ms)
-                .map_err(|_| "Burn MLP label horizon overflowed".to_string())?,
-        )
-        .map_err(|error| format!("Burn MLP embargo is invalid: {error}"))?,
+        PositiveDurationMs::new(embargo_ms)
+            .map_err(|error| format!("Burn MLP embargo is invalid: {error}"))?,
     )
     .map_err(|error| format!("Burn MLP split failed: {error}"))?;
     let request = TrainingRequest::new(
@@ -1557,6 +1566,7 @@ mod tests {
         let row = crate::evaluation::ResearchRow {
             series_id: 1,
             available_time: Utc::now(),
+            label_available_time: Utc::now() + chrono::Duration::seconds(1),
             signal: 0.0,
             features: std::collections::BTreeMap::from([("spread_bps".to_string(), 2.0)]),
             label: 0.0,
@@ -1576,7 +1586,7 @@ mod tests {
             capacity_depth_levels: 0,
             max_book_depth_fraction: 0.0,
         };
-        let policy = CexSupervisedDecisionPolicyV1::controlled_v1();
+        let policy = CexSupervisedDecisionPolicyV2::controlled_v2();
 
         assert_eq!(
             cost_aware_target_position(0.0009, &row, &costs, &policy).unwrap(),
@@ -1593,6 +1603,7 @@ mod tests {
         let row = crate::evaluation::ResearchRow {
             series_id: 1,
             available_time: Utc::now(),
+            label_available_time: Utc::now() + chrono::Duration::seconds(1),
             signal: 0.0,
             features: std::collections::BTreeMap::from([("spread_bps".to_string(), 2.0)]),
             label: 0.0,
@@ -1612,9 +1623,9 @@ mod tests {
             capacity_depth_levels: 0,
             max_book_depth_fraction: 0.0,
         };
-        let controlled = CexSupervisedDecisionPolicyV1::controlled_v1();
-        let identity = CexSupervisedDecisionPolicyV1::prediction_identity_v1();
-        let hysteretic = CexSupervisedDecisionPolicyV1::hysteretic_cost_aware_v1();
+        let controlled = CexSupervisedDecisionPolicyV2::controlled_v2();
+        let identity = CexSupervisedDecisionPolicyV2::prediction_identity_v2();
+        let hysteretic = CexSupervisedDecisionPolicyV2::hysteretic_cost_aware_v2();
 
         assert_eq!(
             cost_aware_target_position(0.0009, &row, &costs, &controlled).unwrap(),
@@ -1649,6 +1660,9 @@ mod tests {
             .map(|index| ResearchRow {
                 series_id: 1,
                 available_time: chrono::DateTime::<Utc>::from_timestamp(index as i64, 0).unwrap(),
+                label_available_time: chrono::DateTime::<Utc>::from_timestamp(index as i64, 0)
+                    .unwrap()
+                    + chrono::Duration::seconds(1),
                 signal: 0.0,
                 features: std::collections::BTreeMap::new(),
                 label: (index as f64 - 10.0) / 1_000.0,
@@ -1706,6 +1720,19 @@ mod tests {
         }
         let (mutated_model, _) = fit(&mutated).unwrap();
         assert_eq!(left_model, mutated_model);
+
+        // Actual validation time and actual label maturity must drive the split.
+        // Neither may be replaced by a convenient synthetic horizon offset.
+        let mut delayed = rows.clone();
+        delayed[11].label_available_time = delayed[13].available_time;
+        assert!(fit(&delayed)
+            .unwrap_err()
+            .contains("not available before validation"));
+        let mut early_validation = rows.clone();
+        early_validation[13].available_time = rows[12].available_time;
+        assert!(fit(&early_validation)
+            .unwrap_err()
+            .contains("not available before validation"));
         assert!(matches!(
             left_model,
             CexBaselineModelV1::BurnMlp { row_count: 12, .. }

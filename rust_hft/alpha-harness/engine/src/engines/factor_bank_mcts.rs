@@ -2102,6 +2102,7 @@ mod tests {
             ResearchRow {
                 series_id: 1,
                 available_time: chrono::Utc::now(),
+                label_available_time: chrono::Utc::now() + chrono::Duration::seconds(1),
                 signal: 0.0,
                 features: BTreeMap::from([("book_imbalance".to_string(), 1.0)]),
                 label: 0.0,
@@ -2113,6 +2114,7 @@ mod tests {
             ResearchRow {
                 series_id: 1,
                 available_time: chrono::Utc::now(),
+                label_available_time: chrono::Utc::now() + chrono::Duration::seconds(1),
                 signal: 0.0,
                 features: BTreeMap::from([("book_imbalance".to_string(), 3.0)]),
                 label: 0.0,
@@ -2124,6 +2126,7 @@ mod tests {
             ResearchRow {
                 series_id: 2,
                 available_time: chrono::Utc::now(),
+                label_available_time: chrono::Utc::now() + chrono::Duration::seconds(1),
                 signal: 0.0,
                 features: BTreeMap::from([("book_imbalance".to_string(), 10.0)]),
                 label: 0.0,
@@ -2135,6 +2138,7 @@ mod tests {
             ResearchRow {
                 series_id: 2,
                 available_time: chrono::Utc::now(),
+                label_available_time: chrono::Utc::now() + chrono::Duration::seconds(1),
                 signal: 0.0,
                 features: BTreeMap::from([("book_imbalance".to_string(), 13.0)]),
                 label: 0.0,

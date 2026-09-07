@@ -1626,7 +1626,7 @@ mod tests {
     fn sealed_revision_id_is_bound_to_evaluator_version() {
         assert_eq!(
             sealed_evaluation_revision_id("candidate-1", SEALED_HOLDOUT_EVALUATOR_VERSION),
-            "sealed-evaluation:sealed-holdout-v4:candidate-1"
+            "sealed-evaluation:sealed-holdout-v5:candidate-1"
         );
     }
 
@@ -1638,6 +1638,9 @@ mod tests {
             .map(|index| ResearchRow {
                 series_id: 1,
                 available_time: start + Duration::seconds(index),
+                label_available_time: start
+                    + Duration::seconds(index)
+                    + chrono::Duration::seconds(1),
                 signal: if index % 2 == 0 { 1.0 } else { -1.0 },
                 features: BTreeMap::new(),
                 label: if index % 2 == 0 { 0.01 } else { -0.01 },
@@ -1931,6 +1934,9 @@ mod tests {
             .map(|index| ResearchRow {
                 series_id: 1,
                 available_time: start + Duration::seconds(index),
+                label_available_time: start
+                    + Duration::seconds(index)
+                    + chrono::Duration::seconds(1),
                 signal: if index % 2 == 0 { 1.0 } else { -1.0 },
                 features: BTreeMap::new(),
                 label: if index % 2 == 0 { 0.01 } else { -0.01 },

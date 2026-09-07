@@ -26,7 +26,7 @@ use alpha_domain::{
     canonical_json_hash, factor_ast_source_features, CandidateEvaluation, CexBaselineFailureCodeV1,
     CexBaselineGateV1, CexFactorBankRevisionV2, CexFactorRejectionCodeV1, CEX_GP_POLICY_SCHEMA_V4,
 };
-use alpha_engine::{baselines::CexSupervisedModelCandidateV1, engines::CexFactorBankMctsResultV1};
+use alpha_engine::{baselines::CexSupervisedModelCandidateV2, engines::CexFactorBankMctsResultV1};
 use anyhow::{bail, Context};
 use hft_backtest::config::verify_canonical_replay_artifact_streaming;
 use reqwest::{blocking::Client, redirect::Policy, StatusCode};
@@ -1567,10 +1567,10 @@ fn extract_bundle(bundle: &Path, destination: &Path) -> anyhow::Result<()> {
 }
 
 struct SupervisedRoundEvidence {
-    ridge: CexSupervisedModelCandidateV1,
-    cart: CexSupervisedModelCandidateV1,
-    burn: CexSupervisedModelCandidateV1,
-    selected: CexSupervisedModelCandidateV1,
+    ridge: CexSupervisedModelCandidateV2,
+    cart: CexSupervisedModelCandidateV2,
+    burn: CexSupervisedModelCandidateV2,
+    selected: CexSupervisedModelCandidateV2,
     replay: Option<CexEventReplayReceiptV1>,
 }
 
@@ -1598,13 +1598,13 @@ fn load_supervised_round_evidence(
     let ridge_baseline = ridge_baseline.context("supervised ML is missing its Ridge baseline")?;
     let cart_baseline = cart_baseline.context("supervised ML is missing its CART baseline")?;
     let burn_baseline = burn_baseline.context("supervised ML is missing its Burn MLP baseline")?;
-    let ridge: CexSupervisedModelCandidateV1 = serde_json::from_slice(&std::fs::read(
+    let ridge: CexSupervisedModelCandidateV2 = serde_json::from_slice(&std::fs::read(
         results.join("ridge-supervised-candidate.json"),
     )?)?;
-    let cart: CexSupervisedModelCandidateV1 = serde_json::from_slice(&std::fs::read(
+    let cart: CexSupervisedModelCandidateV2 = serde_json::from_slice(&std::fs::read(
         results.join("cart-supervised-candidate.json"),
     )?)?;
-    let burn: CexSupervisedModelCandidateV1 = serde_json::from_slice(&std::fs::read(
+    let burn: CexSupervisedModelCandidateV2 = serde_json::from_slice(&std::fs::read(
         results.join("burn_mlp-supervised-candidate.json"),
     )?)?;
     validate_supervised_candidate_binding(&ridge, mission, factor_bank, ridge_baseline)?;
@@ -4325,11 +4325,31 @@ mod tests {
     }
 
     #[test]
-    fn execute_rejects_label_only_edge_after_event_replay() {
+    fn execute_rejects_label_only_edge_before_event_replay() {
         let fixture = campaign_e2e_fixture("campaign-e2e-positive", false, false, false);
         let request = load_request(&fixture.args.request).unwrap().request;
         execute(fixture.args).unwrap();
+        let mut recovered_burn = false;
+        for round in &request.rounds {
+            let recovered = recover_round_report(&fixture.work_dir, &request, round);
+            let burn: CexSupervisedModelCandidateV2 = serde_json::from_slice(
+                &std::fs::read(fixture.work_dir.join(format!(
+                    "mission/{}/execute/results/burn_mlp-supervised-candidate.json",
+                    round.round_id
+                )))
+                .unwrap(),
+            )
+            .unwrap();
+            recovered_burn |=
+                recovered.supervised_candidate_id.as_deref() == Some(burn.artifact_id.as_str());
+            assert!(recovered.supervised_candidate_id.is_some());
+            assert!(recovered.supervised_replay_receipt_id.is_none());
+        }
 
+        assert!(
+            recovered_burn,
+            "negative-result recovery must exercise the Burn winner"
+        );
         let work_dir = fixture.work_dir;
         assert!(work_dir.join("shared-inputs/features.jsonl").exists());
         assert!(work_dir.join("shared-inputs/materialization.json").exists());
@@ -4363,7 +4383,7 @@ mod tests {
             assert!(results.join("supervised-model-selection.json").exists());
             assert!(results.join("burn-mlp-baseline.json").exists());
             assert!(results.join("burn_mlp-supervised-candidate.json").exists());
-            assert!(results
+            assert!(!results
                 .join("supervised-event-replay-receipt.json")
                 .exists());
             assert!(!results.join("factor-subset-mcts-result.json").exists());
@@ -4371,11 +4391,9 @@ mod tests {
         }
         assert_eq!(result["termination_reason"], "campaign_no_candidate");
         assert!(result["rounds"].as_array().unwrap().iter().all(|round| {
-            round["termination_reason"] == "supervised_replay_gate_failed"
-                && round["supervised_replay_gate_passed"] == false
-                && round["feedback"]["supervised_replay"]["mean_net_return"]
-                    .as_f64()
-                    .is_some_and(|value| value < 0.0)
+            round["termination_reason"] == "no_passing_supervised_model"
+                && round["supervised_replay_gate_passed"].is_null()
+                && round["feedback"]["supervised_replay"].is_null()
         }));
         assert!(result["selected_round_id"].is_null());
         assert!(result["finalization"].is_null());
@@ -4530,7 +4548,7 @@ mod tests {
 
     #[test]
     fn collect_round_ledger_rejects_supervised_replay_report_drift() {
-        let fixture = campaign_e2e_fixture("campaign-ledger-no-selection", false, false, false);
+        let fixture = campaign_e2e_fixture("campaign-ledger-no-selection", false, false, true);
         execute(fixture.args.clone()).unwrap();
 
         let request = load_request(&fixture.args.request).unwrap().request;
@@ -4539,7 +4557,7 @@ mod tests {
             .work_dir
             .join(format!("mission/{}/execute", round.round_id));
         let mut report = recover_round_report(&fixture.work_dir, &request, &round);
-        report.supervised_replay_gate_passed = Some(true);
+        report.supervised_replay_gate_passed = Some(false);
         let error = collect_round_ledger(&execute_dir, &round, &report).unwrap_err();
         assert!(error
             .to_string()
@@ -4548,7 +4566,7 @@ mod tests {
 
     #[test]
     fn collect_round_ledger_rejects_missing_supervised_replay() {
-        let fixture = campaign_e2e_fixture("campaign-ledger-missing-result", false, false, false);
+        let fixture = campaign_e2e_fixture("campaign-ledger-missing-result", false, false, true);
         execute(fixture.args.clone()).unwrap();
 
         let request = load_request(&fixture.args.request).unwrap().request;
@@ -4990,7 +5008,7 @@ mod tests {
         preexisting_claim: bool,
         replay_tracks_features: bool,
     ) -> CampaignE2eFixture {
-        let render_fixture = mission_render::tests::Fixture::new(21_608);
+        let render_fixture = mission_render::tests::Fixture::new(21_625);
         let mut rows = mission_render::tests::read_feature_rows(&render_fixture.feature_path);
         if zero_labels {
             for row in &mut rows {

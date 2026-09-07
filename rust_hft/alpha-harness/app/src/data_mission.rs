@@ -868,8 +868,8 @@ pub fn load_research_rows(
         }
         rows.push(ResearchRow {
             series_id: 1,
-            // The forward label is only observable when the next bar is available.
-            available_time: trace[index + 1].available_time,
+            available_time: trace[index].available_time,
+            label_available_time: trace[index + 1].available_time,
             signal,
             features: std::collections::BTreeMap::from([
                 ("open".to_string(), trace[index].open),
@@ -919,8 +919,8 @@ fn load_feature_research_rows(
             }
             Ok(ResearchRow {
                 series_id: row.series_id,
-                // Training labels cannot enter the research row before their availability time.
-                available_time: row.label_available_time,
+                available_time: row.feature_available_time,
+                label_available_time: row.label_available_time,
                 signal: 0.0,
                 features: row.features,
                 label: row.label,
@@ -1494,7 +1494,8 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(loaded[0].available_time, rows[0].label_available_time);
+        assert_eq!(loaded[0].available_time, rows[0].feature_available_time);
+        assert_eq!(loaded[0].label_available_time, rows[0].label_available_time);
         assert_eq!(loaded[0].series_id, 1);
         assert_eq!(
             feature_available_times(&manifest).unwrap(),
@@ -1901,7 +1902,8 @@ mod tests {
         let (directory, manifest, trace) = trace_fixture();
         let rows = load_research_rows(&manifest, 1.0, 0.0, 0.5).unwrap();
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].available_time, trace[2].available_time);
+        assert_eq!(rows[0].available_time, trace[1].available_time);
+        assert_eq!(rows[0].label_available_time, trace[2].available_time);
         assert!(rows
             .windows(2)
             .all(|window| window[0].available_time < window[1].available_time));

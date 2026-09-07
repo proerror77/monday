@@ -166,6 +166,7 @@ mod tests {
         let row = ResearchRow {
             series_id: 1,
             available_time: Utc::now(),
+            label_available_time: Utc::now() + chrono::Duration::seconds(1),
             signal: 0.0,
             features: BTreeMap::from([
                 ("ask_log_size.t0.l0".to_string(), 4.0),
@@ -196,6 +197,9 @@ mod tests {
                 ResearchRow {
                     series_id: 1,
                     available_time: start + Duration::seconds(index),
+                    label_available_time: start
+                        + Duration::seconds(index)
+                        + chrono::Duration::seconds(1),
                     signal: 0.0,
                     features: BTreeMap::from([
                         ("ask_log_size.t0.l0".to_string(), 0.0),
