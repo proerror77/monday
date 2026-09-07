@@ -1459,7 +1459,7 @@ mod tests {
             use chrono::{TimeDelta, Utc};
             use ed25519_dalek::SigningKey;
             use std::collections::BTreeSet;
-            let inputs = crate::mission_render::tests::Fixture::new(21_608);
+            let inputs = crate::mission_render::tests::Fixture::canonical();
             let mut submission = valid_submission();
             submission.request = crate::mission_campaign::request_for_materialization_for_tests(
                 &inputs.materialization_path,

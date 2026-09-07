@@ -5008,7 +5008,7 @@ mod tests {
         preexisting_claim: bool,
         replay_tracks_features: bool,
     ) -> CampaignE2eFixture {
-        let render_fixture = mission_render::tests::Fixture::new(21_625);
+        let render_fixture = mission_render::tests::Fixture::canonical();
         let mut rows = mission_render::tests::read_feature_rows(&render_fixture.feature_path);
         if zero_labels {
             for row in &mut rows {

@@ -1365,6 +1365,10 @@ pub(crate) mod tests {
     }
 
     impl Fixture {
+        pub(crate) fn canonical() -> Self {
+            Self::new(MIN_ROWS)
+        }
+
         pub(crate) fn new(rows: usize) -> Self {
             Self::with_optional_feature_source(rows, None)
         }
