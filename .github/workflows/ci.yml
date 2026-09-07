@@ -252,6 +252,7 @@ jobs:
             args+=(-p "$package")
           done
           cargo test "${args[@]}" --locked
+          cargo clippy "${args[@]}" --all-targets --locked --no-deps -- -D warnings
 
       - name: Verify signed runtime handoff
         if: needs.scope.outputs.handoff == 'true'

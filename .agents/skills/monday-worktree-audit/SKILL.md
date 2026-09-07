@@ -15,7 +15,7 @@ Produce a read-only inventory. Classification is not deletion authorization.
 4. For every dirty entry, report changed and untracked paths without modifying them.
 5. For any cleanup candidate, additionally read its ownership record, exact `HEAD`, upstream/push state, open or closed PR state, merge state, and active-session use.
    Lock-file existence is not lock ownership; record a lock as active only with `flock` or holder evidence.
-6. Classify worktrees exactly once, using the preflight report as authoritative:
+6. Classify worktrees exactly once. For a repository-wide audit, use the preflight report as authoritative. For named paths, use Git's registration/prunable marker and each path's status directly; do not expand to a repository-wide report:
    - `registered-clean`: registered, clean, and not Git-prunable; this does not prove an active owner or session;
    - `dirty`: tracked or untracked changes exist;
    - `prunable`: Git itself marks the administrative worktree record prunable.

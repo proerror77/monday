@@ -202,7 +202,7 @@ assert_security_jobs "$tmp_dir/root-node.out" 'security/sast-semgrep,security/se
 assert_security_jobs "$tmp_dir/unknown-nested.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
 assert_security_jobs "$tmp_dir/lob-control.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
 assert_security_jobs "$tmp_dir/rust-shell-script.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
-assert_security_jobs "$tmp_dir/rust-deploy-collector.out" "$all_security_jobs"
+assert_security_jobs "$tmp_dir/rust-deploy-collector.out" "${all_security_jobs/,security\/clippy-strict/}"
 assert_security_jobs "$tmp_dir/trading-dockerfile-push.out" 'security/sast-semgrep,security/secret-presence,security/container-scan,security/secret-detection'
 trading_develop="$tmp_dir/trading-dockerfile-develop.out"
 GITHUB_REF=refs/heads/develop "$selector" --event push \
@@ -308,13 +308,13 @@ grep -Fq 'uses: mozilla-actions/sccache-action@v0.0.10' <<<"$fast_lane_block"
 
 # Suite placement is pinned both ways: fast-only work stays out of the heavy
 # job, and each suite's required home is asserted positively.
-! grep -Fq 'cargo fmt --check' <<<"$rust_job_block"
-! grep -Fq 'shellcheck' <<<"$rust_job_block"
-! grep -Fq 'test-rust-lob-control-plane.sh' <<<"$rust_job_block"
-! grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$fast_gates_block"
-! grep -Fq 'test-rust-lob-control-plane.sh' <<<"$fast_gates_block"
-! grep -Fq 'test-rust-lob-recovery-queue.sh' <<<"$fast_gates_block"
-! grep -Fq 'shellcheck' <<<"$fast_gates_block"
+if grep -Fq 'cargo fmt --check' <<<"$rust_job_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
+if grep -Fq 'shellcheck' <<<"$rust_job_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
+if grep -Fq 'test-rust-lob-control-plane.sh' <<<"$rust_job_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
+if grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$fast_gates_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
+if grep -Fq 'test-rust-lob-control-plane.sh' <<<"$fast_gates_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
+if grep -Fq 'test-rust-lob-recovery-queue.sh' <<<"$fast_gates_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
+if grep -Fq 'shellcheck' <<<"$fast_gates_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
 grep -Fq 'test-rust-lob-control-plane.sh' <<<"$scope_job_block"
 grep -Fq 'test-rust-lob-recovery-queue.sh' <<<"$scope_job_block"
 [[ $scope_job_block != *test-polymarket-raw-ops-control-plane.sh* ]]
@@ -333,7 +333,7 @@ recorder_block=$(job_block market_recorder_contract)
 [ -n "$recorder_block" ]
 grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$recorder_block"
 grep -Fq "contains(needs.scope.outputs.jobs, ',ci/market-recorder-contract,')" <<<"$recorder_block"
-! grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$rust_job_block"
+if grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$rust_job_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
 grep -Fqx "        if: always() && needs.scope.outputs.toolchain == 'true'" "$ci_workflow"
 
 ploy_workflow="$script_dir/../workflows/ploy-ci.yml"
@@ -392,9 +392,9 @@ metadata_case color example Audit '' 'interface: {brand_color: red}' fail
 # cache, rustc/sccache-versioned rust-cache keys, continue-on-error fallback) in
 # EVERY ploy-ci job that compiles Rust on the runner, and the homegrown
 # actions/cache sccache block must stay removed.
-! grep -Fq 'sccache --zero-stats' "$ploy_workflow"
-! grep -Fq 'cargo install sccache' "$ploy_workflow"
-! grep -Fq 'path: ~/.cache/sccache' "$ploy_workflow"
+if grep -Fq 'sccache --zero-stats' "$ploy_workflow"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
+if grep -Fq 'cargo install sccache' "$ploy_workflow"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
+if grep -Fq 'path: ~/.cache/sccache' "$ploy_workflow"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
 ploy_job_block() {
   awk -v job="^  $1:" '$0 ~ job {found=1; next} /^  [a-z0-9-]+:/ {found=0} found' "$ploy_workflow"
 }
@@ -415,11 +415,11 @@ for ploy_rust_job in \
   grep -Fq "if: steps.sccache.outcome == 'failure'" <<<"$ploy_block"
   grep -Fq 'steps.cache-info.outputs.rust' <<<"$ploy_block"
   grep -Fq 'steps.cache-info.outputs.sccache' <<<"$ploy_block"
-  ! grep -Fq -- '}}-${{ github.sha }}' <<<"$ploy_block"
+  if grep -Fq -- '}}-${{ github.sha }}' <<<"$ploy_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
 done
 research_image_block=$(ploy_job_block research-image-binaries)
 grep -Fqx '    timeout-minutes: 45' <<<"$research_image_block"
-! grep -Fq 'SCCACHE_GHA_RW_MODE' <<<"$research_image_block"
+if grep -Fq 'SCCACHE_GHA_RW_MODE' <<<"$research_image_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
 
 deletion_repo="$tmp_dir/deletion-repo"
 mkdir -p "$deletion_repo/rust_hft/tools/collector/src"
@@ -523,23 +523,24 @@ security_gate_line=$(grep -nF '      - name: Require selected security jobs to p
 
 docker_publish_workflow="$script_dir/../workflows/docker-publish.yml"
 expected_docker_publish_triggers=$(printf '%s\n' \
-  '  push:' \
+  '  workflow_run:' \
+  '    workflows: ["Monorepo CI", "Prediction Markets CI", "Security & Quality (ENABLED)"]' \
+  '    types: [completed]' \
   '    branches: [main]' \
+  '  push:' \
   '    tags:' \
   "      - 'v*'" \
-  '    paths:' \
-  '      - "rust_hft/**"' \
-  '      - ".github/workflows/docker-publish.yml"' \
   '  workflow_dispatch:')
 assert_docker_publish_triggers() {
   local trigger_block
-  trigger_block=$(sed -n '/^  push:$/,/^  workflow_dispatch:$/p' "$1")
-  [[ $trigger_block == "$expected_docker_publish_triggers" ]]
+  trigger_block=$(sed -n '/^  workflow_run:$/,/^  workflow_dispatch:$/p' "$1")
+  [[ $trigger_block == "$expected_docker_publish_triggers" ]] || return 1
+  grep -Fqx '            git diff --quiet "${SOURCE_SHA}^" "$SOURCE_SHA" -- rust_hft/ .github/workflows/docker-publish.yml || changed=$?' "$1"
 }
 assert_docker_publish_triggers "$docker_publish_workflow"
 
 docker_publish_counterexample="$tmp_dir/docker-publish-extra-path.yml"
-awk '1; $0 == "      - \".github/workflows/docker-publish.yml\"" { print "      - \"docs/**\"" }' \
+sed 's@-- rust_hft/ .github/workflows/docker-publish.yml@-- rust_hft/ docs/ .github/workflows/docker-publish.yml@' \
   "$docker_publish_workflow" >"$docker_publish_counterexample"
 if assert_docker_publish_triggers "$docker_publish_counterexample"; then
   echo 'Docker Publish trigger contract accepted an unrelated path' >&2
@@ -564,3 +565,18 @@ if assert_listing_monitor_triggers "$listing_monitor_counterexample"; then
 fi
 
 printf 'rust CI scope selector tests passed\n'
+
+# Prediction-only work does not compile the unrelated CEX research/runtime lint
+# profiles. Scheduled audits and unknown root changes retain full coverage.
+for name in prediction-lock evaluator; do
+  assert_flag "$tmp_dir/$name.out" clippy_loop false
+  assert_flag "$tmp_dir/$name.out" clippy_handoff false
+  if grep -q '^security_jobs=.*security/clippy-strict' "$tmp_dir/$name.out"; then
+    echo 'prediction-only change selected unrelated root Clippy' >&2; exit 1
+  fi
+done
+assert_flag "$security_schedule" clippy_loop true
+assert_flag "$security_schedule" clippy_handoff true
+assert_flag "$live" clippy_loop false
+assert_flag "$live" clippy_handoff true
+assert_flag "$collector" clippy_loop true

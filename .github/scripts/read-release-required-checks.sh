@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-input=${1:?usage: read-acr-required-checks.sh CHECK_RUNS_JSON [OUTPUT]}
+input=${1:?usage: read-release-required-checks.sh CHECK_RUNS_JSON [OUTPUT]}
 output=${2:-/dev/stdout}
 checks_json=$(cat "$input")
 
