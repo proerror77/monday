@@ -41,5 +41,5 @@ A production Gate failure blocks cutover only. It never blocks or downgrades Cod
 
 ## Output
 
-Return one row per requested state with: `State | Result | Exact identity | Direct evidence | Blocker/next check`.
+For multiple requested states, return one row per state with: `State | Result | Exact identity | Direct evidence | Blocker/next check`. For a single state, a concise paragraph containing the same evidence is sufficient.
 End with the earliest incomplete state within the requested scope, or explicitly state that all requested states passed. Unrequested later states are not blockers.

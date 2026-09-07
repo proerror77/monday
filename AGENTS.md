@@ -14,12 +14,28 @@
   campaign-execute`. Direct `mission execute`, `mission run`, and `loop run`
   are diagnostic implementation surfaces, never alternate completion paths.
 - Follow the nearest nested `AGENTS.md`.
+- Within system and developer constraints, explicit user instructions take
+  precedence over repository and skill guidance. Apply skills only to the
+  requested task; their workflows do not grant additional authority.
 
 ## Working rules
 
 - Follow the user's goal and scope. Work autonomously on clear, reversible tasks;
   preserve unrelated changes and ask before destructive, irreversible, or
   genuinely ambiguous actions.
+- Carry action requests through the authorized outcome. Reuse authorization
+  already given in the conversation; do not ask again merely because a skill
+  describes an approval step. Resolve routine choices from available evidence.
+  Ask when missing information materially changes scope or external behavior,
+  and continue independent authorized work while awaiting the answer.
+- Treat corrections and progress questions as steering the active task. Answer
+  briefly and continue unless the user cancels or replaces the objective. After
+  interruption or compaction, recover completed work and pending operations
+  before resuming; do not restart or duplicate them.
+- Before requesting a necessary approval, complete the authorized preparation
+  so the user can review the concrete action. If a rule blocks progress, cite its
+  file and exact instruction, explain its applicability, and distinguish the
+  requirement from your interpretation. Preserve production authorization gates.
 - Solve the problem directly. Use a skill, issue, specification, branch, or
   worktree only when it reduces uncertainty, coordinates durable work, or
   isolates concurrent writes; never create one merely to satisfy a workflow.
@@ -110,3 +126,15 @@
   Run `cargo metadata --locked --no-deps` only after workspace-graph changes.
 - For instruction, workflow, or shell changes, run `git diff --check` plus the
   closest contract test. Report unrelated or unavailable checks separately.
+- For low-impact instruction edits, use existing contract checks and review the
+  rules against concrete task scenarios; do not add tests that merely assert
+  wording. After relevant checks pass, repeat or broaden only for new changes,
+  failures, or an unresolved risk.
+
+## Communication
+
+- Lead with the result in concise Chinese unless the user requests another
+  language. Use plain paragraphs; use lists or tables when they aid comparison.
+- Report what changed, the checks and results, and material limitations. Separate
+  verified facts from inference and unknowns; avoid boilerplate summaries and
+  repeating unchanged progress.
