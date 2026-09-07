@@ -104,6 +104,7 @@ fn research_event_value(
         "component": component,
         "event": event,
         "details": details,
+        "memory": hft_collector::research_memory::observe_research_memory(),
     })
 }
 
@@ -3941,6 +3942,9 @@ pub(crate) mod tests {
             event["details"]["mission_id"],
             serde_json::json!("mission-1")
         );
+        assert!(event["memory"].is_object());
+        assert!(event["memory"].get("process_peak_rss_bytes").is_some());
+        assert!(event["memory"].get("cgroup_memory_limit").is_some());
         assert!(event["timestamp"]
             .as_str()
             .is_some_and(|value| !value.is_empty()));

@@ -828,3 +828,57 @@ tag's push until the first has finished, at which point the absence probe fails
 closed. Personal Edition has no immutable-image-tag setting, so this publisher
 lock and its exact digest record are the CI-path protection; registry writer
 access remains a separate ACR-owner boundary.
+
+
+### Memory evidence for a bounded research run
+
+The slicer, PIT materializer, replay-Parquet materializer and alpha-harness add a
+`memory` object to their existing `monday.research_event.v1` phase events. This is
+read-only observation; it changes neither research results nor resource limits.
+
+- `process_rss_bytes`: current process RSS from Linux `/proc/self/status`.
+- `process_peak_rss_bytes`: process-lifetime high-water mark, in bytes; available
+  on Linux and macOS. It is not a new peak reset for each phase, and excludes
+  separate child processes.
+- `cgroup_memory_current_bytes` and `cgroup_memory_peak_bytes`: kernel counters
+  for the process's verified membership cgroup and descendants, including charged
+  cache. The resolver supports v1, v2 and mount subtrees and checks `cgroup.procs`
+  before reporting a cgroup. These counters are not interchangeable with RSS.
+- `cgroup_memory_limit`: the membership cgroup's configured limit, represented as
+  `{ "kind": "bytes", "bytes": ... }` or `{ "kind": "unlimited" }`. This is not
+  machine RAM or the effective minimum of all ancestor limits.
+- Missing, unsupported or unreadable metrics remain `null`, never fabricated
+  zeroes. No cgroup paths, environment variables or credentials are emitted.
+
+Retain phase logs with the input/image identities, Job/Pod resource limits and
+terminal status. Compare successive lifetime high-water marks to locate where
+memory increased; do not label each observed maximum a phase-isolated peak.
+A successful run's final observations help establish the measured budget. A
+SIGKILL/OOM can prevent the final log: use Pod OOM evidence and do not invent a
+peak that was never read. Linux counter semantics are documented in the
+[kernel cgroup guide](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html).
+
+For capacity planning, keep data preparation, model fitting and event replay
+separate. Canonical event replay visits Parquet rows incrementally; the current
+raw-tape verification/PIT path still accumulates decoded segments and verified
+replay surfaces, while model preparation retains research rows and factor
+matrices. A small dense feature matrix therefore does not establish the peak
+of the complete run. A `12Gi` Job limit is an admission/configuration value, not
+proof that the frozen 31-hour inventory fits. Measure that exact input/version
+before choosing 16/32 GiB workers; preserve the approved limit during the test.
+
+
+The present renderer uses 7,200 initial training rows, three 3,600-row validation
+folds, five purge rows, one embargo row, and a final 3,600-row holdout. At 1 Hz,
+that is three hours of validation; a 31-hour input inventory is not 31 hours of
+independent OOS evidence. Factor/model selection reuses walk-forward feedback,
+so the existing `search_visible_validation` label remains necessary.
+
+Open accounting gap: the fast evaluator currently accumulates `position * label`
+on every validation row. With 1 Hz observations and five-second forward labels,
+those horizon returns overlap. That curve is not a verified one-step trading P&L
+ledger. Canonical L2 replay instead marks the previous position between observed
+prices and charges position changes. Reconcile these return conventions before
+using fast-backtest equity or Sharpe for profitability claims; memory capacity
+does not resolve this evaluation issue. The memory-observation change leaves the
+existing evaluator and its thresholds intact.
