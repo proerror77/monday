@@ -129,6 +129,7 @@ case "$1 $2" in
     printf '{"submitted":true}\n'
     ;;
   "mission campaign-learn")
+    [[ " $* " != *" --max-tokens "* ]]
     output="$(value_after --output "$@")"
     increment "$FAKE_STATE/learn-count"
     if [[ "${FAKE_LEARN_OUTCOME:-}" == "no_improvement" ]]; then
@@ -411,6 +412,7 @@ fi
 test "$(jq -r '.campaign_inputs' "$mac_work_dir/controller-inputs.json")" \
   = "$start_dir/campaign-inputs.json"
 test "$(jq -r '.input_root' "$mac_work_dir/controller-inputs.json")" = "$start_dir/input"
+test "$(jq 'has("max_tokens")' "$mac_work_dir/controller-inputs.json")" = false
 test -s "$mac_work_dir/generation-0/request.json"
 test "$(<"$FAKE_STATE/signer-count")" == 1
 test "$(<"$FAKE_STATE/dispatch-count")" == 1
@@ -420,6 +422,10 @@ grep -Fq "name: campaign-cycle-${request_sha256:0:16}" "$root/start.stdout"
 grep -Fq 'research.monday/campaign-id: campaign-g0' "$root/start.stdout"
 grep -Fq 'campaign-cycle-controller@sha256:REPLACE_WITH_IMMUTABLE_DIGEST' "$root/start.stdout"
 grep -Fq "/campaign-root/cycles/${mac_work_dir##*/}" "$root/start.stdout"
+if grep -Fq 'REPLACE_RESEARCH_LEARNING_SECRET' "$root/start.stdout"; then
+  echo "controller handoff still requires LLM credentials" >&2
+  exit 1
+fi
 grep -Fq 'event=stage_completed generation=0 stage=ack_handoff' "$root/start.stderr"
 test ! -e "$FAKE_STATE/ossutil-calls"
 test -z "$(find "$mac_work_dir" -name '*results.zip' -print -quit)"
@@ -452,6 +458,10 @@ test -z "$(find "$mac_work_dir" -name '*results.zip' -print -quit)"
 
 mkdir -p "$root/campaign-root"
 cp -R "$mac_work_dir" "$root/campaign-root/cycle"
+# Existing checkpoints retain the obsolete token budget as audit history.
+legacy_state="$root/campaign-root/cycle/controller-inputs.json"
+jq '. + {max_tokens:300}' "$legacy_state" >"$root/legacy-controller-inputs.json"
+cp "$root/legacy-controller-inputs.json" "$legacy_state"
 mv "$start_dir/campaign-inputs.json" "$root/campaign-inputs.offline"
 mv "$start_dir/input" "$root/input.offline"
 
@@ -474,12 +484,23 @@ mv "$root/campaign-inputs.offline" "$start_dir/campaign-inputs.json"
 mv "$root/input.offline" "$start_dir/input"
 
 oss_calls_before_approve="$(wc -l <"$FAKE_STATE/ossutil-calls" | tr -d ' ')"
+# Removing the token budget must not weaken the immutable input binding.
+printf 'changed input' >"$start_dir/campaign-inputs.json"
+if FAKE_UNAME=Darwin "$controller" "${approve_args[@]}" \
+  >"$root/drift.stdout" 2>"$root/drift.stderr"; then
+  echo "controller accepted changed inputs in a legacy checkpoint" >&2
+  exit 1
+fi
+grep -Fq 'existing work directory belongs to different controller inputs' "$root/drift.stderr"
+test "$(<"$FAKE_STATE/dispatch-count")" == 1
+: >"$start_dir/campaign-inputs.json"
 if ! FAKE_UNAME=Darwin "$controller" "${approve_args[@]}" \
   >"$root/approve.stdout" 2>"$root/approve.stderr"; then
   cat "$root/approve.stderr" >&2
   exit 1
 fi
 grep -Fq 'kind: Job' "$root/approve.stdout"
+cmp -s "$legacy_state" "$root/legacy-controller-inputs.json"
 grep -Fq 'event=stage_completed generation=1 stage=ack_handoff' "$root/approve.stderr"
 test "$(wc -l <"$FAKE_STATE/ossutil-calls" | tr -d ' ')" == "$oss_calls_before_approve"
 

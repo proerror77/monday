@@ -6,7 +6,7 @@ product or execution authority.
 
 ## Authority boundary
 
-- Follow the repository-root `CLAUDE.md` and `docs/architecture/PREDICTION_MARKETS.md`.
+- Follow the repository-root `AGENTS.md` and `docs/architecture/PREDICTION_MARKETS.md`.
 - Monday `rust_hft` is the only production authority for risk, OMS, reconciliation, cancellation, and order execution.
 - Prediction-market research, frontend, sidecar, and control-plane code may not bypass that authority.
 - Keep live trading disabled unless a separate reviewed task explicitly rebuilds and approves the required Monday gates.
@@ -16,7 +16,10 @@ product or execution authority.
 - Run Rust commands from `rust_hft/prediction-markets`; the nested Cargo workspace is a transitional build seam pinned by `rust-toolchain.toml`.
 - Run frontend commands with `npm --prefix ploy-frontend`; run sidecar checks with `cargo test -p ploy-agent-sidecar`.
 - Do not create new `ploy-*` crates, a `products/ploy` tree, or another venue execution path. Put new capabilities in the canonical Monday module named in `docs/architecture/PREDICTION_MARKETS.md`.
-- Use current GitHub issue and PR metadata for durable non-trivial work; `tasks/todo.md` is a historical migration checklist, not an authority.
+- When work is tracked in an issue or PR, use its current GitHub metadata;
+  `tasks/todo.md` is a historical migration checklist, not an authority. Follow
+  the root delivery scope: complexity alone does not require creating an issue,
+  publishing a PR, or waiting for CI during a local fix.
 - Use `apply_patch` for manual edits, preserve unrelated changes, and verify affected behavior and contracts. Run the PLOY CI lane when requested or required by the delivery contract.
 - Do not run a local PostgreSQL instance. Database-backed validation belongs in GitHub Actions.
 

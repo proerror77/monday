@@ -1,47 +1,13 @@
-# GitHub Operations Rule
+# GitHub Operations
 
-Standard patterns for GitHub CLI operations across all commands.
+Use the root [delivery authority](../../AGENTS.md#delivery-authority) and
+[issue lifecycle](../../docs/agents/issue-tracker.md). Use structured `--json`
+readback and `--body-file` for multiline publication. Execute the requested
+operation directly and handle its actual result.
 
-## Authentication
-
-**Don't pre-check authentication.** Just run the command and handle failure:
-
-```bash
-gh {command} || echo "❌ GitHub CLI failed. Run: gh auth login"
-```
-
-## Common Operations
-
-### Get Issue Details
-```bash
-gh issue view {number} --json state,title,labels,body
-```
-
-### Create Issue
-```bash
-gh issue create --title "{title}" --body-file {file} --label "{labels}"
-```
-
-### Update Issue
-```bash
-gh issue edit {number} --add-label "{label}" --add-assignee @me
-```
-
-### Add Comment
-```bash
-gh issue comment {number} --body-file {file}
-```
-
-## Error Handling
-
-If any gh command fails:
-1. Show clear error: "❌ GitHub operation failed: {command}"
-2. Suggest fix: "Run: gh auth login" or check issue number
-3. Don't retry automatically
-
-## Important Notes
-
-- Trust that gh CLI is installed and authenticated
-- Use --json for structured output when parsing
-- Keep operations atomic - one gh command per action
-- Don't check rate limits preemptively
+Classify failures before retrying: authentication/permission errors require the
+missing access; rate limits and transient service/network failures allow bounded
+backoff; conflicts require fresh identity/state readback. After an uncertain
+write, look for the created object before repeating it. Reuse stable identity to
+avoid duplicate issues, comments, or PRs. Stop repeated unchanged failures under
+the task's wait policy; report the real error, not a generic login instruction.
