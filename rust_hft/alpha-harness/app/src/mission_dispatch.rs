@@ -122,7 +122,7 @@ pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
             &job_name,
             job_uid,
         )?;
-        let release_patch_json = serde_json::to_string(&release_job_patch())?;
+        let release_patch_json = serde_json::to_string(&release_job_patch(&job)?)?;
         cleanup_state.release_patch_sent = true;
         let release_output = kubectl_with_input(
             &kubectl,
@@ -132,7 +132,7 @@ pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
                 "patch",
                 "job",
                 &job_name,
-                "--type=merge",
+                "--type=json",
                 "--patch",
                 &release_patch_json,
                 "-o",
@@ -373,12 +373,23 @@ fn secret_with_owner(secret: &Value, job_name: &str, job_uid: &str) -> anyhow::R
     Ok(owned)
 }
 
-fn release_job_patch() -> Value {
-    json!({
-        "spec": {
-            "suspend": false,
-        }
-    })
+fn release_job_patch(job: &Value) -> anyhow::Result<Value> {
+    let uid = job["metadata"]["uid"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .context("CEX Campaign Job release requires its verified UID")?;
+    let version = job["metadata"]["resourceVersion"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .context("CEX Campaign Job release requires its verified resourceVersion")?;
+    // Preconditions and release are one API mutation. A post-release UID check
+    // alone is too late if the name has been reused since identity readback.
+    // Treat resourceVersion as opaque and preserve its original bytes.
+    Ok(json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": version },
+        { "op": "replace", "path": "/spec/suspend", "value": false }
+    ]))
 }
 
 fn validate_job_readback(
@@ -940,9 +951,73 @@ mod tests {
         .is_err());
     }
 
+    // Model only the merge/test/replace operations used at this API boundary.
+    // Apply to a copy: RFC 6902 failure must not persist partial changes.
+    fn apply_release_patch(job: &mut Value, patch: &Value) -> anyhow::Result<()> {
+        let mut updated = job.clone();
+        if let Some(operations) = patch.as_array() {
+            for operation in operations {
+                let path = operation["path"].as_str().context("patch path")?;
+                let target = updated.pointer_mut(path).context("patch target")?;
+                match operation["op"].as_str() {
+                    Some("test") if *target == operation["value"] => (),
+                    Some("replace") => *target = operation["value"].clone(),
+                    _ => bail!("patch precondition failed"),
+                }
+            }
+        } else {
+            updated["spec"]["suspend"] = patch["spec"]["suspend"].clone();
+        }
+        *job = updated;
+        Ok(())
+    }
+
     #[test]
-    fn release_patch_clears_job_suspend() {
-        assert_eq!(release_job_patch()["spec"]["suspend"], false);
+    fn release_patch_preserves_replaced_or_changed_job() {
+        let observed =
+            json!({"metadata":{"uid":"original", "resourceVersion":"17"}, "spec":{"suspend":true}});
+        let patch = release_job_patch(&observed).unwrap();
+        let mut unchanged = observed.clone();
+        apply_release_patch(&mut unchanged, &patch).unwrap();
+        assert_eq!(unchanged["spec"]["suspend"], false);
+        for (field, value) in [("uid", "replacement"), ("resourceVersion", "18")] {
+            let mut changed = observed.clone();
+            changed["metadata"][field] = value.into();
+            let before = changed.clone();
+            assert!(
+                apply_release_patch(&mut changed, &patch).is_err(),
+                "released changed {field}"
+            );
+            assert_eq!(changed, before);
+        }
+    }
+
+    #[test]
+    fn release_requires_observed_identity_and_allows_verified_retransmission() {
+        let observed = json!({"metadata":{"uid":"original", "resourceVersion":"opaque-version"}, "spec":{"suspend":false}});
+        for field in ["uid", "resourceVersion"] {
+            for invalid in [Value::Null, json!(""), json!(" "), json!(17)] {
+                let mut missing = observed.clone();
+                missing["metadata"][field] = invalid;
+                assert!(release_job_patch(&missing).is_err());
+            }
+        }
+        let mut already_released = observed.clone();
+        apply_release_patch(
+            &mut already_released,
+            &release_job_patch(&observed).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(already_released, observed);
+        let state = CleanupState {
+            job: SubmissionObjectState::Created,
+            secret: SubmissionObjectState::Created,
+            release_patch_sent: true,
+        };
+        // A failed precondition or lost response must retain objects for fresh
+        // identity readback/adoption, rather than delete by a potentially stale name.
+        assert!(!state.should_cleanup_job());
+        assert!(!state.should_cleanup_secret());
     }
 
     #[test]
