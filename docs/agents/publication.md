@@ -22,8 +22,12 @@ Version-tag publication requires the tagged commit to belong to main history and
 the same exact-source checks. The explicit ACR source-test target remains a
 non-production diagnostic exception with its existing identity restrictions.
 
-Publishing may wait a bounded time for main checks; failure, cancellation,
-missing evidence at the deadline, or source drift fails closed. Reconcile those
+Automatic GHCR publication is awakened by completion of any required CI workflow.
+Pending evidence defers publication; the remaining workflow's completion checks
+it again, so long-running valid CI does not exhaust a publisher's wait window.
+The admitted SHA binds the build checkout and OCI revision. Manual/tag publication
+may wait a bounded time; failure, cancellation, missing evidence at its deadline,
+or source drift fails closed. Reconcile those
 conditions before an authorized retry. CI and publication remain separate labels.
 
 ## Rule ownership

@@ -6,6 +6,8 @@ policy=${2:?missing source policy}
 [[ $source_sha =~ ^[0-9a-f]{40}$ ]] || { echo 'invalid release source SHA' >&2; exit 1; }
 [[ $policy == current-main || $policy == main-history ]] || { echo 'invalid release source policy' >&2; exit 1; }
 : "${GITHUB_REPOSITORY:?missing repository}"
+defer_pending=${RELEASE_DEFER_PENDING:-false}
+[[ $defer_pending == true || $defer_pending == false ]] || { echo 'invalid defer policy' >&2; exit 1; }
 timeout=${RELEASE_CHECK_TIMEOUT_SECONDS:-900}
 [[ $timeout =~ ^[0-9]+$ ]] || { echo 'invalid release timeout' >&2; exit 1; }
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -33,6 +35,10 @@ while :; do
     esac
   done
   [[ $pending == true ]] || { printf 'release admission passed: %s\n' "$source_sha"; exit 0; }
+  if [[ $defer_pending == true ]]; then
+    echo 'release deferred until the remaining CI workflows complete' >&2
+    exit 75
+  fi
   [[ $SECONDS -lt $deadline ]] || { echo 'release checks did not succeed before deadline' >&2; exit 1; }
   sleep 30
 done

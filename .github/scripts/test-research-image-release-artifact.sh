@@ -227,6 +227,16 @@ fi
 if run_release_admission success "$other_sha" main-history diverged >"$tmp_dir/release-error" 2>&1; then
   echo 'release admitted a tag outside main history' >&2; exit 1
 fi
+# An automatic check-completion event must defer pending evidence rather than
+# fail a valid source because the other workflows take longer than its timeout.
+status=0
+RELEASE_DEFER_PENDING=true run_release_admission pending "$main_sha" current-main >"$tmp_dir/release-error" 2>&1 || status=$?
+[[ $status == 75 ]] || { echo "expected deferred admission, got $status" >&2; exit 1; }
+RELEASE_DEFER_PENDING=true run_release_admission success "$main_sha" current-main >/dev/null
+status=0
+RELEASE_DEFER_PENDING=true run_release_admission failure "$main_sha" current-main >"$tmp_dir/release-error" 2>&1 || status=$?
+[[ $status == 1 ]] || { echo 'terminal failure was incorrectly deferred' >&2; exit 1; }
+
 for workflow in docker-publish release-rust; do
   path="$script_dir/../workflows/$workflow.yml"
   grep -Fq '    needs: release-admission' "$path"
@@ -234,4 +244,19 @@ for workflow in docker-publish release-rust; do
   grep -Fq '.github/scripts/wait-release-required-checks.sh "$SOURCE_SHA" "$policy"' "$path"
   grep -Fq '      checks: read' "$path"
 done
+# Check the workflow graph, not just the admission helper: every required
+# workflow completion can wake publication, and only its admitted SHA is built.
+ruby -ryaml - "$script_dir/../workflows/docker-publish.yml" <<'RUBY'
+w = YAML.safe_load(File.read(ARGV[0]))
+triggers = w['on'] || w[true]
+raise 'missing completion wakeups' unless triggers.fetch('workflow_run').fetch('workflows').sort == ['Monorepo CI', 'Prediction Markets CI', 'Security & Quality (ENABLED)'].sort
+raise 'main publication still races CI on push' if triggers.fetch('push').key?('branches')
+jobs = w.fetch('jobs')
+build = jobs.fetch('build-and-push')
+raise 'build does not require admission' unless build.fetch('if').include?("outputs.admitted == 'true'")
+checkout = build.fetch('steps').find { |step| step['name'] == 'Checkout admitted source' }
+raise 'build source is not bound' unless checkout.fetch('with').fetch('ref').include?('outputs.source_sha')
+metadata = build.fetch('steps').find { |step| step['id'] == 'meta' }
+raise 'OCI revision is not bound' unless metadata.fetch('with').fetch('labels').include?('outputs.source_sha')
+RUBY
 printf 'shared release admission tests passed\n'

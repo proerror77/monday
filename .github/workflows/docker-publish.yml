@@ -1,14 +1,18 @@
 name: Docker Publish (GHCR)
 
 on:
-  push:
+  workflow_run:
+    workflows: ["Monorepo CI", "Prediction Markets CI", "Security & Quality (ENABLED)"]
+    types: [completed]
     branches: [main]
+  push:
     tags:
       - 'v*'
-    paths:
-      - "rust_hft/**"
-      - ".github/workflows/docker-publish.yml"
   workflow_dispatch:
+
+concurrency:
+  group: ghcr-${{ github.event.workflow_run.head_sha || github.sha }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -19,6 +23,10 @@ env:
 
 jobs:
   release-admission:
+    if: github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main')
+    outputs:
+      admitted: ${{ steps.admission.outputs.admitted }}
+      source_sha: ${{ steps.admission.outputs.source_sha }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -26,11 +34,16 @@ jobs:
     steps:
       - name: Checkout release source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 2
       - name: Verify exact-source release admission
+        id: admission
         env:
           GH_TOKEN: ${{ github.token }}
-          SOURCE_SHA: ${{ github.sha }}
-          SOURCE_REF: ${{ github.ref }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          SOURCE_REF: ${{ github.event_name == 'workflow_run' && 'refs/heads/main' || github.ref }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           policy=current-main
           if [[ "$SOURCE_REF" == refs/tags/v* ]]; then
@@ -39,9 +52,36 @@ jobs:
             echo 'release must use main or a version tag' >&2
             exit 1
           fi
-          .github/scripts/wait-release-required-checks.sh "$SOURCE_SHA" "$policy"
+          if [[ "$EVENT_NAME" == workflow_run ]]; then
+            main_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
+            if [[ "$SOURCE_SHA" != "$main_sha" ]]; then
+              echo 'admitted=false' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            # main accepts squash PR merges: inspect that source commit's full
+            # change, retaining the previous publisher's path scope.
+            changed=0
+            git diff --quiet "${SOURCE_SHA}^" "$SOURCE_SHA" -- rust_hft/ .github/workflows/docker-publish.yml || changed=$?
+            if [[ $changed == 0 ]]; then
+              echo 'admitted=false' >> "$GITHUB_OUTPUT"
+              exit 0
+            elif [[ $changed != 1 ]]; then
+              exit "$changed"
+            fi
+            export RELEASE_DEFER_PENDING=true
+          fi
+          status=0
+          .github/scripts/wait-release-required-checks.sh "$SOURCE_SHA" "$policy" || status=$?
+          if [[ $status == 75 ]]; then
+            echo 'admitted=false' >> "$GITHUB_OUTPUT"
+          elif [[ $status == 0 ]]; then
+            printf 'admitted=true\nsource_sha=%s\n' "$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          else
+            exit "$status"
+          fi
   build-and-push:
     needs: release-admission
+    if: needs.release-admission.outputs.admitted == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -52,8 +92,10 @@ jobs:
             file: rust_hft/docker/Dockerfile
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout admitted source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.release-admission.outputs.source_sha }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -72,12 +114,15 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
+          context: ${{ github.event_name == 'workflow_run' && 'git' || 'workflow' }}
           images: |
             ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.name }}
           tags: |
-            type=ref,event=branch
+            type=raw,value=main,enable=${{ github.event_name == 'workflow_run' || github.ref == 'refs/heads/main' }}
             type=ref,event=tag
             type=sha
+          labels: |
+            org.opencontainers.image.revision=${{ needs.release-admission.outputs.source_sha }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
