@@ -24,6 +24,8 @@ jobs:
     outputs:
       jobs: ${{ steps.scope.outputs.security_jobs }}
       selection_complete: ${{ steps.scope.outputs.selection_complete }}
+      clippy_loop: ${{ steps.scope.outputs.clippy_loop }}
+      clippy_handoff: ${{ steps.scope.outputs.clippy_handoff }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -49,6 +51,8 @@ jobs:
     timeout-minutes: 5
     outputs:
       jobs: ${{ steps.scope.outputs.jobs }}
+      clippy_loop: ${{ steps.scope.outputs.clippy_loop }}
+      clippy_handoff: ${{ steps.scope.outputs.clippy_handoff }}
     steps:
       - name: Resolve selector result
         id: scope
@@ -56,11 +60,16 @@ jobs:
           SELECTOR_RESULT: ${{ needs.security-selector.result }}
           SELECTED_SECURITY_JOBS: ${{ needs.security-selector.outputs.jobs }}
           SELECTED_COMPLETE: ${{ needs.security-selector.outputs.selection_complete }}
+          CLIPPY_LOOP: ${{ needs.security-selector.outputs.clippy_loop }}
+          CLIPPY_HANDOFF: ${{ needs.security-selector.outputs.clippy_handoff }}
         run: |
           if [[ "$SELECTOR_RESULT" == success && "$SELECTED_COMPLETE" == true ]] &&
-             [[ "$SELECTED_SECURITY_JOBS" =~ ^,[a-z0-9/-]*(,[a-z0-9/-]+)*,$ ]]; then
+             [[ "$SELECTED_SECURITY_JOBS" =~ ^,[a-z0-9/-]*(,[a-z0-9/-]+)*,$ ]] &&
+             [[ "$CLIPPY_LOOP,$CLIPPY_HANDOFF" =~ ^(true|false),(true|false)$ ]]; then
             printf 'jobs=%s\n' "$SELECTED_SECURITY_JOBS"
+            printf 'clippy_loop=%s\nclippy_handoff=%s\n' "$CLIPPY_LOOP" "$CLIPPY_HANDOFF"
           else
+            printf '%s\n' 'clippy_loop=true' 'clippy_handoff=true'
             printf '%s\n' 'jobs=,security/sast-semgrep,security/cargo-audit,security/secret-presence,security/license-check,security/clippy-strict,security/cargo-machete,security/secret-detection,'
           fi >> "$GITHUB_OUTPUT"
 
@@ -217,7 +226,8 @@ jobs:
           workspaces: rust_hft
           shared-key: strict-alpha-research-ml-v1
 
-      - name: Run Clippy (strict)
+      - name: Run research Clippy (strict)
+        if: needs.security-scope.outputs.clippy_loop == 'true'
         run: |
           cargo clippy \
             -p alpha-domain \
@@ -234,6 +244,9 @@ jobs:
             -D clippy::correctness \
             -D clippy::suspicious
 
+      - name: Run runtime handoff Clippy (strict)
+        if: needs.security-scope.outputs.clippy_handoff == 'true'
+        run: |
           cargo clippy \
             -p hft-live \
             --no-default-features \

@@ -121,7 +121,7 @@ jobs:
             evidence="$RUNNER_TEMP/acr-required-checks.env"
             gh api --paginate --slurp \
               "repos/$GITHUB_REPOSITORY/commits/$admission_sha/check-runs?filter=latest&per_page=100" > "$checks_json"
-            .github/scripts/read-acr-required-checks.sh "$checks_json" "$evidence"
+            .github/scripts/read-release-required-checks.sh "$checks_json" "$evidence"
             monorepo_conclusion=$(sed -n 's/^monorepo_conclusion=//p' "$evidence")
             prediction_conclusion=$(sed -n 's/^prediction_conclusion=//p' "$evidence")
             security_conclusion=$(sed -n 's/^security_conclusion=//p' "$evidence")

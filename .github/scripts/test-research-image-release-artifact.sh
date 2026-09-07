@@ -3,7 +3,7 @@ set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 selector="$script_dir/select-acr-publish-source.sh"
-check_reader="$script_dir/read-acr-required-checks.sh"
+check_reader="$script_dir/read-release-required-checks.sh"
 artifact="$script_dir/research-image-release-artifact.sh"
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
@@ -183,3 +183,55 @@ printf 'changed lock\n' >>"$repo/Cargo.lock"
 assert_rejected lock-mismatch
 
 printf 'research image release artifact tests passed\n'
+
+# Exercise the shared GHCR/tag admission against authenticated API-shaped ports.
+mkdir -p "$tmp_dir/api-bin"
+cat > "$tmp_dir/api-bin/gh" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+endpoint=
+for argument in "$@"; do [[ $argument != repos/* ]] || endpoint=$argument; done
+case "$endpoint" in
+  */git/ref/heads/main) printf '%s\n' "${FAKE_MAIN_SHA}" ;;
+  */compare/*) printf '%s\n' "${FAKE_RELATIONSHIP:-ahead}" ;;
+  */check-runs\?*)
+    [[ $endpoint == *"/commits/$EXPECTED_RELEASE_SHA/check-runs?"* ]] || exit 9
+    jq -n --arg state "$FAKE_RELEASE_STATE" '
+      [{check_runs:(["Monorepo CI gate","Prediction Markets CI gate","Security Summary Report"]
+      | to_entries | map({id:(.key+1),name:.value,status:(if $state == "pending" then "in_progress" else "completed" end),
+        conclusion:(if $state == "failure" then "failure" else "success" end),
+        app:{id:(if $state == "wrong-app" then 1 else 15368 end),slug:"github-actions"}}))}]
+      | if $state == "missing" then [] else . end'
+    ;;
+  *) exit 8 ;;
+esac
+MOCK
+chmod +x "$tmp_dir/api-bin/gh"
+release_admission="$script_dir/wait-release-required-checks.sh"
+run_release_admission() {
+  PATH="$tmp_dir/api-bin:$PATH" GITHUB_REPOSITORY=example/repo \
+    RELEASE_CHECK_TIMEOUT_SECONDS=0 FAKE_RELEASE_STATE="$1" FAKE_MAIN_SHA="$2" \
+    EXPECTED_RELEASE_SHA="$main_sha" FAKE_RELATIONSHIP="${4:-ahead}" \
+    "$release_admission" "$main_sha" "$3"
+}
+run_release_admission success "$main_sha" current-main >/dev/null
+run_release_admission success "$other_sha" main-history >/dev/null
+for failure in failure pending missing wrong-app; do
+  if run_release_admission "$failure" "$main_sha" current-main >"$tmp_dir/release-error" 2>&1; then
+    echo "release admitted $failure evidence" >&2; exit 1
+  fi
+done
+if run_release_admission success "$other_sha" current-main >"$tmp_dir/release-error" 2>&1; then
+  echo 'release admitted stale main' >&2; exit 1
+fi
+if run_release_admission success "$other_sha" main-history diverged >"$tmp_dir/release-error" 2>&1; then
+  echo 'release admitted a tag outside main history' >&2; exit 1
+fi
+for workflow in docker-publish release-rust; do
+  path="$script_dir/../workflows/$workflow.yml"
+  grep -Fq '    needs: release-admission' "$path"
+  # shellcheck disable=SC2016
+  grep -Fq '.github/scripts/wait-release-required-checks.sh "$SOURCE_SHA" "$policy"' "$path"
+  grep -Fq '      checks: read' "$path"
+done
+printf 'shared release admission tests passed\n'

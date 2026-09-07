@@ -13,25 +13,34 @@
   campaign-finalize` -> `mission dispatch submit` -> generated `mission
   campaign-execute`. Direct `mission execute`, `mission run`, and `loop run`
   are diagnostic implementation surfaces, never alternate completion paths.
-- Follow the nearest nested `AGENTS.md`.
+- Research, acquisition, training, evaluation, and runtime production code is
+  Rust-only; do not add Python/PyTorch/libtorch production bindings.
+- Dataset, candidate, evaluation, approval, policy, feedback, and deployment
+  evidence is content-addressed or append-only. Keep private signing keys and
+  LLM credentials out of DuckDB and logs.
+- Preserve point-in-time availability and sealed-holdout isolation. Verify
+  content hashes before consuming datasets.
+- Research must not import execution adapters or broadcast transactions.
+  Live-small stays disabled until every order path enforces envelope order-size
+  and slippage limits.
+- Follow the nearest nested `AGENTS.md`; module files contain only local differences.
+  `CLAUDE.md` files are entrypoints to these shared rules, not another authority.
 - Within system and developer constraints, explicit user instructions take
   precedence over repository and skill guidance. Apply skills only to the
   requested task; their workflows do not grant additional authority.
+
+- Venues share Monday's market-data and execution seams. Existing `ploy-*` names
+  are migration debt; do not create a separate product or another order/risk path.
 
 ## Working rules
 
 - Follow the user's goal and scope. Work autonomously on clear, reversible tasks;
   preserve unrelated changes and ask before destructive, irreversible, or
   genuinely ambiguous actions.
-- Carry action requests through the authorized outcome. Reuse authorization
-  already given in the conversation; do not ask again merely because a skill
-  describes an approval step. Resolve routine choices from available evidence.
-  Ask when missing information materially changes scope or external behavior,
-  and continue independent authorized work while awaiting the answer.
-- Treat corrections and progress questions as steering the active task. Answer
-  briefly and continue unless the user cancels or replaces the objective. After
-  interruption or compaction, recover completed work and pending operations
-  before resuming; do not restart or duplicate them.
+- Complete the authorized outcome using existing conversation context and
+  evidence. Reuse prior authorization; ask only for material scope or behavior
+  ambiguity. Answer progress questions and continue. After interruptions, recover
+  completed work and pending operations before resuming without duplication.
 - Before requesting a necessary approval, complete the authorized preparation
   so the user can review the concrete action. If a rule blocks progress, cite its
   file and exact instruction, explain its applicability, and distinguish the
@@ -51,26 +60,34 @@
   shims or fallbacks; preserve applied migrations and audit history as read-only
   records.
 
-## Default delivery loop
+## Delivery authority
 
-- Start from the terminal state the user requested. A request to fix, optimize,
-  review, test, or merge authorizes only the corresponding development and Git
-  states; it does not authorize artifact publication, a production Gate,
-  cutover, deployment, collector mutation, or runtime mutation.
-- The default development loop is `Code -> focused validation`. Extend it only
-  through the explicitly requested Git state: publish a PR and stop when a PR is
-  requested; verify exact-head CI and stop when CI is requested; merge only when
-  merge is explicitly requested and exact-head required checks pass. A production
-  Gate protects only a separately authorized collector or runtime transition.
-  It is not a prerequisite for development, CI, merge, or artifact publication;
-  a failed Gate blocks only its cutover.
-- Cross a collector or runtime boundary only on explicit production authorization.
-  Follow the applicable transition contract: `release -> one Gate -> cutover ->
-  Runtime -> independent Readback`. Do not insert repeated Gates, ad hoc evidence
-  stages, or unrelated investigations. Re-run a failed stage only after its cause
-  or relevant input changed and state the new hypothesis.
-- A control-plane code fix follows the same development loop. Keep Governance
-  changes separate from the production transition they protect.
+- Determine the highest delivery state authorized for this task from the whole
+  conversation, including an explicitly accepted plan and later corrections.
+  Complete that outcome. An intermediate PR or CI result does not end a larger
+  authorized task. Reuse authorization while scope and target stay the same.
+- A local fix defaults to code plus focused validation. A request to publish a
+  PR ends at the PR only when that is the highest authorized state. Merge requires
+  explicit authorization, which may already be part of the accepted plan; do not
+  request it again for each planned PR. Ambiguous "publish" does not silently
+  authorize production deployment. Clarify a missing delivery boundary once,
+  after preparing the concrete action, and continue independent work meanwhile.
+- Before an authorized merge, verify the current PR head, required checks,
+  resolved review conversations, and current base compatibility. Read the actual
+  repository protection settings; CI green alone is not merge permission. Use
+  the configured merge method and preserve branches/worktrees.
+- The configured automatic artifact workflows are standing repository automation:
+  an authorized merge can trigger publication after release admission. This is a
+  known merge effect, not a separate per-run human approval. Artifact publication
+  does not authorize deployment, collector changes, or runtime actuation. Read
+  [publication policy](docs/agents/publication.md) when changing or operating a
+  publishing workflow; manual publication must be within the task's authority.
+- Collector/runtime transitions require explicit production authorization and
+  the applicable contract: release -> one Gate -> cutover -> runtime -> independent
+  readback. A production Gate protects that transition, not development, CI,
+  merge, or artifact publication. Record one controller, exact target/candidate/
+  rollback identities, stop rules, automatic cleanup, and terminal evidence.
+  Repeat a failed attempt only after its cause or relevant input changed.
 
 ## Evidence and safety
 
@@ -82,10 +99,6 @@
   direct evidence. For uncommitted local Code, identify the base SHA and reviewed
   working-tree changes, including relevant untracked files; do not imply that
   they are committed or published.
-- Select development and control-plane checks by affected behavior and regression
-  risk. Start with targeted checks, normally within 15 minutes, and broaden when
-  cross-module contracts or new evidence require it. Run the full Gate once,
-  immediately before a candidate crosses the collector or runtime boundary it protects.
 - Keep each change independently testable and rollbackable. Do not mix Research,
   Governance, and Runtime.
 - Never replace missing real data with fixtures, fabricate completeness, weaken a
@@ -96,17 +109,17 @@
   result is requested, verify its terminal result and output, not just submission.
 - Remote build or validation tasks must use `monday-remote-build`; never place a
   workspace, toolchain, Cargo cache, or target directory on an `ack-system` node.
-- Runtime, deployment, and collector cutovers require one named controller,
-  exact target and rollback identities, stop rules, automatic cleanup, and direct
-  readback.
 
 ## Scope and ownership
 
 - One active contract has one writer. Use the current checkout for isolated local
-  changes when ownership and dirty state are known; use a recorded worktree for
-  concurrent, published, or multi-session work.
-- Re-read branch, `HEAD`, status, and PR head before publishing or merging. Stop
-  on movement or overlap. Do not delete branches or worktrees without explicit
+  changes when ownership and dirty state are known; use a dedicated worktree for
+  concurrent, published, or multi-session work. For that worktree, record contract,
+  owner, path, branch, base SHA, allowed files, and dependencies in the private
+  `git rev-parse --git-path agent-worktree.yml` location. The managed preflight
+  checks this record; it is not a prerequisite for ordinary local edits.
+- Re-read branch, `HEAD`, status, and PR head before publishing or merging. Pause
+  only the affected writes on movement or overlap; continue independent work. Do not delete branches or worktrees without explicit
   authorization and safety checks.
 - After a requested merge, synchronize the originating checkout when it can be
   done without overwriting other work. Preserve unrelated changes and report any
@@ -119,10 +132,13 @@
 
 ## Focused validation
 
-- Run checks that can disprove the changed behavior and cover affected contracts,
-  followed by the owning crate or workflow check. Broaden to cross-crate or full
-  workspace validation when justified by the change or failures, not by habit.
-- From `rust_hft/`, use `cargo test -p <changed-crate> --locked` and scoped Clippy.
+- Start with the smallest check that can disprove the changed behavior, normally
+  within 15 minutes. Expand to the owning crate/workflow or cross-crate checks
+  when the changed contracts, regression risk, failures, or requested terminal
+  state require them. A crate test is not mandatory solely because a file changed.
+- Use `cargo test -p <crate> --locked <filter>` and scoped Clippy from the owning
+  workspace as appropriate. Reuse build caches; a clean build is only for proven
+  cache corruption or explicitly requested clean-room validation.
   Run `cargo metadata --locked --no-deps` only after workspace-graph changes.
 - For instruction, workflow, or shell changes, run `git diff --check` plus the
   closest contract test. Report unrelated or unavailable checks separately.

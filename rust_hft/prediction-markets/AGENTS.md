@@ -6,7 +6,7 @@ product or execution authority.
 
 ## Authority boundary
 
-- Follow the repository-root `CLAUDE.md` and `docs/architecture/PREDICTION_MARKETS.md`.
+- Follow the repository-root `AGENTS.md` and `docs/architecture/PREDICTION_MARKETS.md`.
 - Monday `rust_hft` is the only production authority for risk, OMS, reconciliation, cancellation, and order execution.
 - Prediction-market research, frontend, sidecar, and control-plane code may not bypass that authority.
 - Keep live trading disabled unless a separate reviewed task explicitly rebuilds and approves the required Monday gates.

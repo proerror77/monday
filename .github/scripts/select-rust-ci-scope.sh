@@ -32,6 +32,8 @@ jobs=
 security_jobs=
 research_image_relevant=false
 owning_packages=
+clippy_loop=false
+clippy_handoff=false
 
 select_job() {
   local job=$1
@@ -44,6 +46,8 @@ select_security_job() {
 }
 
 select_all_security_jobs() {
+  clippy_loop=true
+  clippy_handoff=true
   select_security_job security/sast-semgrep
   select_security_job security/cargo-audit
   select_security_job security/secret-presence
@@ -54,6 +58,8 @@ select_all_security_jobs() {
 }
 
 select_security_scope() {
+  [[ $loop == true ]] && clippy_loop=true
+  [[ $handoff == true ]] && clippy_handoff=true
   local scan_repository=false rust_relevant=false container_relevant=false
 
   if [[ $event == schedule || $event == workflow_dispatch ]]; then
@@ -86,7 +92,9 @@ select_security_scope() {
   [[ $scan_repository == true ]] && select_security_job security/secret-presence
   if [[ $rust_relevant == true ]]; then
     select_security_job security/license-check
-    select_security_job security/clippy-strict
+    if [[ $clippy_loop == true || $clippy_handoff == true ]]; then
+      select_security_job security/clippy-strict
+    fi
     select_security_job security/cargo-machete
   fi
   if [[ $event == push && ${GITHUB_REF:-} == refs/heads/main && \
@@ -170,6 +178,8 @@ emit() {
     "jobs=,$jobs," \
     "security_jobs=,$security_jobs," \
     "owning_packages=,$owning_packages," \
+    "clippy_loop=$clippy_loop" \
+    "clippy_handoff=$clippy_handoff" \
     "loop=$loop" \
     "handoff=$handoff" \
     "json=$json" \
@@ -221,7 +231,9 @@ for path in "${paths[@]}"; do
       select_all_ploy_jobs
       continue
       ;;
-    .github/workflows/acr-publish.yml|.github/scripts/test-acr-publish-workflow.sh)
+    .github/workflows/acr-publish.yml|.github/scripts/test-acr-publish-workflow.sh|\
+    .github/scripts/read-release-required-checks.sh|.github/scripts/wait-release-required-checks.sh|\
+    .github/scripts/test-research-image-release-artifact.sh)
       [[ $event == pull_request ]] && select_job ploy/commit-hygiene
       select_job ploy/workflow-lint
       research_image_relevant=true

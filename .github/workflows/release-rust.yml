@@ -24,7 +24,30 @@ env:
   RELEASE_PACKAGES: hft-live hft-paper hft-all-in-one hft-replay hft-backtest hft-collector
 
 jobs:
+  release-admission:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Verify exact-source release admission
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_REF: ${{ github.ref }}
+        run: |
+          policy=current-main
+          if [[ "$SOURCE_REF" == refs/tags/v* ]]; then
+            policy=main-history
+          elif [[ "$SOURCE_REF" != refs/heads/main ]]; then
+            echo 'release must use main or a version tag' >&2
+            exit 1
+          fi
+          .github/scripts/wait-release-required-checks.sh "$SOURCE_SHA" "$policy"
   build:
+    needs: release-admission
     name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     defaults:

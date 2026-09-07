@@ -14,4 +14,5 @@ None
 
 ## Runtime impact and rollback
 
-<!-- Production impact and rollback, or None. -->
+<!-- State runtime impact and rollback, or None. Mention any automatic artifact
+publication caused by the merge; this is not deployment authority. -->
