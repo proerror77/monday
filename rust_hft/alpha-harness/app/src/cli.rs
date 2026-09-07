@@ -132,11 +132,16 @@ enum PredictionDispatchCommand {
 
 #[derive(Debug, Subcommand)]
 enum MissionDispatchCommand {
+    Inspect(MissionDispatchInspectArgs),
     Submit(MissionDispatchSubmitArgs),
+    Settle(MissionDispatchSubmitArgs),
 }
 
 #[derive(Debug, Clone, Args)]
 pub struct MissionDispatchSubmitArgs {
+    /// Operator control file; alternatively MONDAY_CAMPAIGN_CONTROL. Required for dispatch.
+    #[arg(long)]
+    pub control: Option<PathBuf>,
     #[arg(long)]
     pub submission: PathBuf,
     #[arg(long)]
@@ -146,7 +151,22 @@ pub struct MissionDispatchSubmitArgs {
 }
 
 #[derive(Debug, Clone, Args)]
+pub struct MissionDispatchInspectArgs {
+    #[arg(long)]
+    pub submission: PathBuf,
+    #[arg(long)]
+    pub materialization: PathBuf,
+    #[arg(long)]
+    pub controller_image: String,
+    #[arg(long, default_value_t = 0)]
+    pub attempt_ordinal: u32,
+}
+
+#[derive(Debug, Clone, Args)]
 pub struct CampaignExecuteArgs {
+    /// Stop before opening sealed holdout, including for non-ML candidates.
+    #[arg(long)]
+    pub pre_holdout: bool,
     #[arg(long)]
     pub work_dir: PathBuf,
     #[arg(long)]
@@ -776,7 +796,17 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             MissionCommand::CampaignFinalize(args) => mission_campaign::finalize(args),
             MissionCommand::CampaignId(args) => mission_campaign::print_expected_id(args),
             MissionCommand::Dispatch { command } => match command {
-                MissionDispatchCommand::Submit(args) => mission_dispatch::submit(args),
+                MissionDispatchCommand::Submit(args) => {
+                    tokio::task::spawn_blocking(move || mission_dispatch::submit(args))
+                        .await
+                        .context("Campaign dispatch worker failed")?
+                }
+                MissionDispatchCommand::Inspect(args) => mission_dispatch::inspect(args),
+                MissionDispatchCommand::Settle(args) => {
+                    tokio::task::spawn_blocking(move || mission_dispatch::settle(args))
+                        .await
+                        .context("Campaign settlement worker failed")?
+                }
             },
             MissionCommand::Run(args) => mission::run_mission(args, false),
             MissionCommand::Resume(args) => mission::run_mission(args, true),

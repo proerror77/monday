@@ -384,8 +384,6 @@ cleanup_sensitive_files() {
     if [[ -e "$generation_dir/terminal-failure" || ! -e "$generation_dir/finalized" ]] \
       || validate_generation_completion "$generation_dir" "${generation_dir##*/generation-}"; then
       rm -f -- "$generation_dir/request.json" "$generation_dir/submission.json"
-    elif [[ -e "$generation_dir/dispatched" ]]; then
-      rm -f -- "$generation_dir/submission.json"
     fi
   done
 }
@@ -674,7 +672,6 @@ while ((generation <= max_follow_ups)); do
       --namespace "$namespace" >"$dispatch_report.partial"
     mv -f -- "$dispatch_report.partial" "$dispatch_report"
     : >"$generation_dir/dispatched"
-    rm -f -- "$submission"
     log_event stage_completed "generation=$generation" "stage=dispatch" "job_name=$job_name"
   else
     log_event stage_checkpoint_reused "generation=$generation" "stage=dispatch" "job_name=$job_name"
@@ -714,10 +711,8 @@ while ((generation <= max_follow_ups)); do
     if [[ "$job_failed" == true ]]; then
       "$kubectl_cli" "${kubectl_readback_args[@]}" get \
         "pod/$campaign_pod_name" -o json | jq '{items:[.]}' >"$pod_status" || true
-      "$kubectl_cli" "${kubectl_readback_args[@]}" delete \
-        secret "$job_name-inputs" --ignore-not-found=true >/dev/null
       : >"$generation_dir/terminal-failure"
-      rm -f -- "$request"
+      rm -f -- "$request" "$submission"
       die "Campaign Job failed: $job_name"
     fi
     [[ "$job_complete" == true ]] \
@@ -727,14 +722,12 @@ while ((generation <= max_follow_ups)); do
       "pod/$campaign_pod_name" -o json | jq '{items:[.]}' >"$pod_status"; then
       pod_readback_ok=false
     fi
-    "$kubectl_cli" "${kubectl_readback_args[@]}" delete \
-      secret "$job_name-inputs" --ignore-not-found=true >/dev/null
     [[ "$pod_readback_ok" == true ]] || die "Campaign Pod status readback failed: $job_name"
     image_identity="$(jq -er '.image_identity' "$request")"
     if ! verify_kubernetes_provenance \
       "$job_status" "$pod_status" "$job_name" "$request_sha256" "$image_identity"; then
       : >"$generation_dir/terminal-failure"
-      rm -f -- "$request"
+      rm -f -- "$request" "$submission"
       die "Campaign Pod or image provenance does not match the submitted request"
     fi
     : >"$generation_dir/provenance-readback-complete"
@@ -864,6 +857,22 @@ while ((generation <= max_follow_ups)); do
       && "$bundle_sha256" == "$bundle_readback_sha256" ]] \
       || die "saved Campaign round readback is invalid: $round_index"
   done
+  # Keep the finalized request until durable ledger settlement. The Rust seam
+  # independently verifies Job/Pod identity and reconstructs the round evidence;
+  # neither a completed Job nor these shell checkpoint files authorize a child.
+  controller_stage="ledger_settlement"
+  [[ -s "$submission" ]] || die "Campaign settlement requires the original finalized submission"
+  "$alpha_harness" mission dispatch settle \
+    --submission "$submission" \
+    --context "$context" \
+    --namespace "$namespace" >"$generation_dir/settlement-report.json.partial"
+  jq -e --arg request "$request_sha256" --arg result "$result_sha256" \
+    '.status == "settled" and .request_sha256 == $request and .campaign_result_sha256 == $result' \
+    "$generation_dir/settlement-report.json.partial" >/dev/null \
+    || die "Campaign settlement report differs from the independently read-back result"
+  mv -f -- "$generation_dir/settlement-report.json.partial" "$generation_dir/settlement-report.json"
+  log_event stage_completed "generation=$generation" "stage=ledger_settlement" "campaign_id=$campaign_id"
+
   termination_reason="$(jq -er '.termination_reason' "$result")"
   observed_image_id="$(jq -er '.items[0].status.containerStatuses[] | select(.name == "alpha-campaign") | .imageID' "$pod_status")"
   search_policy_revision_id="$(jq -er '.search_policy_revision.revision_id' "$result")"
@@ -896,7 +905,7 @@ while ((generation <= max_follow_ups)); do
   if [[ "$termination_reason" != "campaign_no_candidate" ]]; then
     commit_generation_completion complete "$(cat "$generation_dir/generation-report.json")"
     publish_cycle_checkpoint "$generation_dir"
-    rm -f -- "$request"
+    rm -f -- "$request" "$submission"
     controller_stage="complete"
     log_event cycle_completed \
       "generation=$generation" \
@@ -909,7 +918,7 @@ while ((generation <= max_follow_ups)); do
   if ((generation == max_follow_ups)); then
     commit_generation_completion complete "$(jq '. + {bounded_loop_exhausted:true}' "$generation_dir/generation-report.json")"
     publish_cycle_checkpoint "$generation_dir"
-    rm -f -- "$request"
+    rm -f -- "$request" "$submission"
     controller_stage="complete"
     log_event cycle_completed \
       "generation=$generation" \
@@ -983,7 +992,7 @@ while ((generation <= max_follow_ups)); do
       '. + {termination_reason:"no_improvement",learning_outcome:"no_improvement",learn_report_url:$learn_report_url,learn_report_sha256:$learn_report_sha256}' \
       "$generation_dir/generation-report.json")"
     publish_cycle_checkpoint "$generation_dir"
-    rm -f -- "$request"
+    rm -f -- "$request" "$submission"
     controller_stage="complete"
     log_event cycle_completed \
       "generation=$generation" \
@@ -994,7 +1003,7 @@ while ((generation <= max_follow_ups)); do
     exit 0
   fi
   commit_generation_completion follow_up
-  rm -f -- "$request"
+  rm -f -- "$request" "$submission"
   if [[ "$mode" == "ack-readback" ]]; then
     controller_stage="approval_handoff"
     log_event stage_completed \

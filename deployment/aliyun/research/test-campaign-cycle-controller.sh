@@ -123,12 +123,29 @@ case "$1 $2" in
     ;;
   "mission dispatch")
     submission="$(value_after --submission "$@")"
+    if [[ "$3" == settle ]]; then
+      if [[ "${FAKE_FAIL_SETTLEMENT_ONCE:-0}" == 1 && ! -e "$FAKE_STATE/settlement-failed-once" ]]; then
+        : >"$FAKE_STATE/settlement-failed-once"
+        exit 75
+      fi
+      job_name="$(jq -r '.job_name' "$submission")"
+      if [[ ! -e "$FAKE_STATE/settled-$job_name" ]]; then
+        : >"$FAKE_STATE/settled-$job_name"
+        increment "$FAKE_STATE/settlement-count"
+      fi
+      result_sha256="$(sha_file "${submission%/*}/campaign-result.json")"
+      jq -n --arg request "$(jq -r '.request_sha256' "$submission")" --arg result "$result_sha256" \
+        '{status:"settled",request_sha256:$request,campaign_result_sha256:$result}'
+      exit 0
+    fi
+    [[ "$3" == submit ]]
     jq -r '.request_sha256' "$submission" >"$FAKE_STATE/request-sha256"
     jq -r '.job_name' "$submission" >"$FAKE_STATE/job-name"
     increment "$FAKE_STATE/dispatch-count"
     printf '{"submitted":true}\n'
     ;;
   "mission campaign-learn")
+    [[ -e "$FAKE_STATE/settled-$(<"$FAKE_STATE/job-name")" ]] || { echo "learning before ledger settlement" >&2; exit 1; }
     [[ " $* " != *" --max-tokens "* ]]
     output="$(value_after --output "$@")"
     increment "$FAKE_STATE/learn-count"
@@ -549,7 +566,7 @@ jq -e '
 ' < <("$controller" status --work-dir "$root/campaign-root/cycle") >/dev/null
 test "$(<"$FAKE_STATE/signer-count")" == 2
 test "$(<"$FAKE_STATE/dispatch-count")" == 2
-test "$(wc -l <"$FAKE_STATE/deleted-secrets" | tr -d ' ')" == 2
+test ! -e "$FAKE_STATE/deleted-secrets"
 test "$(grep -c -- '--timeout=7h' "$FAKE_STATE/job-waits")" == 2
 for generation in 0 1; do
   test -e "$root/campaign-root/cycle/generation-$generation/provenance-readback-complete"
@@ -681,6 +698,8 @@ recovery_case() (
   test "$(<"$FAKE_STATE/signer-count")" == 1
   test ! -d "$case_work/generation-1"
   test ! -e "$request_dir/request.json"
+  test ! -e "$request_dir/submission.json"
+  test "$(<"$FAKE_STATE/settlement-count")" == 1
   if [[ "$outcome" != bounded ]]; then
     cmp "$request_dir/learn-report.json" "$request_dir/learn-report-readback.json"
   fi
@@ -705,6 +724,7 @@ recovery_case() (
 
 selected_recovery=false
 for scenario in \
+  'settlement-readback FAKE_FAIL_SETTLEMENT_ONCE' \
   'report-readback FAKE_FAIL_LEARN_READBACK' \
   'plan-written FAKE_FAIL_AFTER_PLAN' \
   'lost-put-response FAKE_LOSE_PUT_RESPONSE' \
