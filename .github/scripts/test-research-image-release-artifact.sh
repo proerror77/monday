@@ -252,6 +252,8 @@ triggers = w['on'] || w[true]
 raise 'missing completion wakeups' unless triggers.fetch('workflow_run').fetch('workflows').sort == ['Monorepo CI', 'Prediction Markets CI', 'Security & Quality (ENABLED)'].sort
 raise 'main publication still races CI on push' if triggers.fetch('push').key?('branches')
 jobs = w.fetch('jobs')
+admission_checkout = jobs.fetch('release-admission').fetch('steps').find { |step| step['uses'].to_s.start_with?('actions/checkout@') }
+raise 'admission executes event-selected code before trust validation' unless admission_checkout.fetch('with').fetch('ref') == 'refs/heads/main'
 build = jobs.fetch('build-and-push')
 raise 'build does not require admission' unless build.fetch('if').include?("outputs.admitted == 'true'")
 checkout = build.fetch('steps').find { |step| step['name'] == 'Checkout admitted source' }

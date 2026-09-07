@@ -35,7 +35,9 @@ jobs:
       - name: Checkout release source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          # Admission code always comes from trusted main, before any source
+          # from the triggering workflow is considered for a privileged build.
+          ref: refs/heads/main
           fetch-depth: 2
       - name: Verify exact-source release admission
         id: admission
