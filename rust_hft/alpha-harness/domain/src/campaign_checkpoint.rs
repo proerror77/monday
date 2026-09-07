@@ -128,6 +128,53 @@ impl CampaignGenerationCompletionV1 {
                 );
                 require_sha(&result.request_sha256)?;
                 require_sha(&result.campaign_result_sha256)?;
+                match result.learning_outcome {
+                    Some(CampaignLearningOutcomeV1::FollowUp) => {
+                        anyhow::bail!("follow-up learning cannot terminate a generation");
+                    }
+                    Some(CampaignLearningOutcomeV1::NoImprovement) => {
+                        require_sha(&self.learning_checkpoint_sha256)?;
+                        anyhow::ensure!(
+                            result.termination_reason == "no_improvement",
+                            "learning termination reason mismatch"
+                        );
+                        anyhow::ensure!(
+                            result.bounded_loop_exhausted.is_none(),
+                            "learned completion cannot also exhaust the generation bound"
+                        );
+                        anyhow::ensure!(
+                            result
+                                .learn_report_url
+                                .as_ref()
+                                .is_some_and(|url| !url.trim().is_empty()),
+                            "learned completion lacks its report location"
+                        );
+                        require_sha(result.learn_report_sha256.as_deref().unwrap_or(""))?;
+                    }
+                    None => {
+                        anyhow::ensure!(
+                            self.learning_checkpoint_sha256.is_empty()
+                                && result.learn_report_url.is_none()
+                                && result.learn_report_sha256.is_none(),
+                            "unlearned completion contains learning evidence"
+                        );
+                        anyhow::ensure!(
+                            result.termination_reason != "no_improvement",
+                            "no-improvement completion lacks learning evidence"
+                        );
+                        if result.termination_reason == "campaign_no_candidate" {
+                            anyhow::ensure!(
+                                result.bounded_loop_exhausted == Some(true),
+                                "negative unlearned completion must exhaust the generation bound"
+                            );
+                        } else {
+                            anyhow::ensure!(
+                                result.bounded_loop_exhausted.is_none(),
+                                "nonnegative completion cannot exhaust the generation bound"
+                            );
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -186,6 +233,128 @@ mod tests {
             assert_eq!(
                 completion.learning_checkpoint_sha256,
                 hex::encode(Sha256::digest(learn_json.as_bytes()))
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_learning_fields_form_coherent_variants() {
+        let learned: serde_json::Value = serde_json::from_str(COMPLETE[1]).unwrap();
+        let mut ordinary = learned.clone();
+        ordinary["learning_checkpoint_sha256"] = "".into();
+        let result = ordinary["cycle_result"].as_object_mut().unwrap();
+        for key in [
+            "learning_outcome",
+            "learn_report_url",
+            "learn_report_sha256",
+        ] {
+            result.remove(key);
+        }
+        result.insert("termination_reason".into(), "campaign_finalized".into());
+        let mut bounded = ordinary.clone();
+        bounded["cycle_result"]["termination_reason"] = "campaign_no_candidate".into();
+        bounded["cycle_result"]["bounded_loop_exhausted"] = true.into();
+        for valid in [&learned, &ordinary, &bounded] {
+            serde_json::from_value::<CampaignGenerationCompletionV1>(valid.clone())
+                .unwrap()
+                .validate()
+                .unwrap();
+        }
+        let cases = [
+            (
+                &learned,
+                "/learning_checkpoint_sha256",
+                serde_json::json!(""),
+            ),
+            (
+                &learned,
+                "/cycle_result/learning_outcome",
+                serde_json::json!("follow_up"),
+            ),
+            (
+                &learned,
+                "/cycle_result/learn_report_url",
+                serde_json::Value::Null,
+            ),
+            (
+                &learned,
+                "/cycle_result/learn_report_url",
+                serde_json::json!(" "),
+            ),
+            (
+                &learned,
+                "/cycle_result/learn_report_sha256",
+                serde_json::Value::Null,
+            ),
+            (
+                &learned,
+                "/cycle_result/learn_report_sha256",
+                serde_json::json!("bad"),
+            ),
+            (
+                &learned,
+                "/cycle_result/termination_reason",
+                serde_json::json!("campaign_finalized"),
+            ),
+            (
+                &learned,
+                "/cycle_result/learning_outcome",
+                serde_json::Value::Null,
+            ),
+            (
+                &ordinary,
+                "/learning_checkpoint_sha256",
+                serde_json::json!("a".repeat(64)),
+            ),
+            (
+                &ordinary,
+                "/cycle_result/termination_reason",
+                serde_json::json!("no_improvement"),
+            ),
+            (
+                &ordinary,
+                "/cycle_result/termination_reason",
+                serde_json::json!("campaign_no_candidate"),
+            ),
+            (
+                &bounded,
+                "/cycle_result/bounded_loop_exhausted",
+                serde_json::json!(false),
+            ),
+            (
+                &bounded,
+                "/cycle_result/termination_reason",
+                serde_json::json!("campaign_finalized"),
+            ),
+        ];
+        for (source, path, value) in cases {
+            let mut invalid = source.clone();
+            *invalid.pointer_mut(path).unwrap() = value;
+            let checkpoint: CampaignGenerationCompletionV1 =
+                serde_json::from_value(invalid).unwrap();
+            assert!(
+                checkpoint.validate().is_err(),
+                "accepted invalid {path}: {checkpoint:?}"
+            );
+        }
+        for source in [&learned, &ordinary] {
+            let mut invalid = source.clone();
+            invalid["cycle_result"]["bounded_loop_exhausted"] = true.into();
+            assert!(
+                serde_json::from_value::<CampaignGenerationCompletionV1>(invalid)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+        }
+        for field in ["learn_report_url", "learn_report_sha256"] {
+            let mut invalid = ordinary.clone();
+            invalid["cycle_result"][field] = learned["cycle_result"][field].clone();
+            assert!(
+                serde_json::from_value::<CampaignGenerationCompletionV1>(invalid)
+                    .unwrap()
+                    .validate()
+                    .is_err()
             );
         }
     }
