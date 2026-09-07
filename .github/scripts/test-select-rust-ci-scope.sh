@@ -523,23 +523,24 @@ security_gate_line=$(grep -nF '      - name: Require selected security jobs to p
 
 docker_publish_workflow="$script_dir/../workflows/docker-publish.yml"
 expected_docker_publish_triggers=$(printf '%s\n' \
-  '  push:' \
+  '  workflow_run:' \
+  '    workflows: ["Monorepo CI", "Prediction Markets CI", "Security & Quality (ENABLED)"]' \
+  '    types: [completed]' \
   '    branches: [main]' \
+  '  push:' \
   '    tags:' \
   "      - 'v*'" \
-  '    paths:' \
-  '      - "rust_hft/**"' \
-  '      - ".github/workflows/docker-publish.yml"' \
   '  workflow_dispatch:')
 assert_docker_publish_triggers() {
   local trigger_block
-  trigger_block=$(sed -n '/^  push:$/,/^  workflow_dispatch:$/p' "$1")
-  [[ $trigger_block == "$expected_docker_publish_triggers" ]]
+  trigger_block=$(sed -n '/^  workflow_run:$/,/^  workflow_dispatch:$/p' "$1")
+  [[ $trigger_block == "$expected_docker_publish_triggers" ]] || return 1
+  grep -Fqx '            git diff --quiet "${SOURCE_SHA}^" "$SOURCE_SHA" -- rust_hft/ .github/workflows/docker-publish.yml || changed=$?' "$1"
 }
 assert_docker_publish_triggers "$docker_publish_workflow"
 
 docker_publish_counterexample="$tmp_dir/docker-publish-extra-path.yml"
-awk '1; $0 == "      - \".github/workflows/docker-publish.yml\"" { print "      - \"docs/**\"" }' \
+sed 's@-- rust_hft/ .github/workflows/docker-publish.yml@-- rust_hft/ docs/ .github/workflows/docker-publish.yml@' \
   "$docker_publish_workflow" >"$docker_publish_counterexample"
 if assert_docker_publish_triggers "$docker_publish_counterexample"; then
   echo 'Docker Publish trigger contract accepted an unrelated path' >&2
