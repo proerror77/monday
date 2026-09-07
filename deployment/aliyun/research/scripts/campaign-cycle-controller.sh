@@ -25,7 +25,7 @@ Usage: campaign-cycle-controller.sh [start] \
   --image IMAGE@sha256:DIGEST --campaign-root HTTPS_URL \
   --signer EXECUTABLE --work-dir DIR --seed N --seed N \
   [--context NAME] [--namespace NAME] [--max-follow-ups 3] \
-  [--max-tokens 300] [--job-timeout 7h]
+  [--job-timeout 7h]
 
        campaign-cycle-controller.sh approve \
   --work-dir DIR --signer EXECUTABLE \
@@ -75,7 +75,6 @@ validate_controller_state() {
     and (.context | type == "string")
     and (.namespace | type == "string")
     and (.max_follow_ups | type == "number")
-    and (.max_tokens | type == "number")
     and (.job_timeout | type == "string")
     and (.seeds | type == "array" and length >= 2)
     and all(.seeds[]; type == "number")
@@ -270,7 +269,6 @@ kubectl_cli="kubectl"
 context="monday-research-apne1"
 namespace="monday-research"
 max_follow_ups=3
-max_tokens=300
 job_timeout="7h"
 campaign_inputs=""
 input_root=""
@@ -321,7 +319,6 @@ while (($#)); do
     --context) [[ "$mode" == "start" ]] || die "$mode loads --context from controller state"; context="$2"; shift 2 ;;
     --namespace) [[ "$mode" == "start" ]] || die "$mode loads --namespace from controller state"; namespace="$2"; shift 2 ;;
     --max-follow-ups) [[ "$mode" == "start" ]] || die "$mode loads --max-follow-ups from controller state"; max_follow_ups="$2"; shift 2 ;;
-    --max-tokens) [[ "$mode" == "start" ]] || die "$mode loads --max-tokens from controller state"; max_tokens="$2"; shift 2 ;;
     --job-timeout) [[ "$mode" == "start" ]] || die "$mode loads --job-timeout from controller state"; job_timeout="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
@@ -342,7 +339,6 @@ if [[ "$mode" == "approve" || "$mode" == "ack-readback" ]]; then
   context="$(jq -er '.context' "$state")"
   namespace="$(jq -er '.namespace' "$state")"
   max_follow_ups="$(jq -er '.max_follow_ups' "$state")"
-  max_tokens="$(jq -er '.max_tokens' "$state")"
   job_timeout="$(jq -er '.job_timeout' "$state")"
   while IFS= read -r seed; do
     seeds+=("$seed")
@@ -360,7 +356,6 @@ else
 fi
 ((${#seeds[@]} >= 2)) || die "at least two --seed values are required"
 [[ "$max_follow_ups" =~ ^[0-3]$ ]] || die "--max-follow-ups must be between 0 and 3"
-[[ "$max_tokens" =~ ^[1-9][0-9]*$ ]] || die "--max-tokens must be positive"
 [[ ! -e "$work_dir" || -d "$work_dir" ]] || die "--work-dir must be a directory"
 if [[ "$mode" != "ack-readback" ]]; then
   campaign_inputs_dir="$(cd "$(dirname "$campaign_inputs")" && pwd -P)" \
@@ -514,13 +509,15 @@ else
     --arg context "$context" \
     --arg namespace "$namespace" \
     --argjson max_follow_ups "$max_follow_ups" \
-    --argjson max_tokens "$max_tokens" \
     --arg job_timeout "$job_timeout" \
     --argjson seeds "$seeds_json" \
-    '{campaign_inputs:$campaign_inputs,campaign_inputs_sha256:$campaign_inputs_sha256,input_root:$input_root,source_revision:$source_revision,image:$image,campaign_root:$campaign_root,context:$context,namespace:$namespace,max_follow_ups:$max_follow_ups,max_tokens:$max_tokens,job_timeout:$job_timeout,seeds:$seeds}' \
+    '{campaign_inputs:$campaign_inputs,campaign_inputs_sha256:$campaign_inputs_sha256,input_root:$input_root,source_revision:$source_revision,image:$image,campaign_root:$campaign_root,context:$context,namespace:$namespace,max_follow_ups:$max_follow_ups,job_timeout:$job_timeout,seeds:$seeds}' \
     >"$state_tmp"
   if [[ -e "$state" ]]; then
-    cmp -s "$state_tmp" "$state" || die "existing work directory belongs to different controller inputs"
+    # Preserve historical checkpoints; only the retired token budget is irrelevant.
+    jq -e -s 'length == 2 and (.[0] == (.[1] | del(.max_tokens)))' \
+      "$state_tmp" "$state" >/dev/null \
+      || die "existing work directory belongs to different controller inputs"
     rm -f -- "$state_tmp"
   else
     mv -- "$state_tmp" "$state"
@@ -936,7 +933,6 @@ while ((generation <= max_follow_ups)); do
       --request "$request" \
       --result "$result" \
       --result-sha256 "$result_sha256" \
-      --max-tokens "$max_tokens" \
       --output "$research_plan" >"$generation_dir/learn-report.json.partial"
     mv -f -- "$generation_dir/learn-report.json.partial" "$generation_dir/learn-report.json"
     learning_outcome="$(jq -er '.outcome' "$generation_dir/learn-report.json")"
