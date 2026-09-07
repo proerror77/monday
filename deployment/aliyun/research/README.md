@@ -227,7 +227,7 @@ field is a process event, not a completion claim. The event stream covers:
   OOS metrics, predictions/positions/ledger identities, and final equity;
 - event replay assumptions, fill/cost metrics, capacity/risk gates, and the
   selected model or explicit skip reason;
-- result publication/readback, Campaign rounds, termination, and bounded LLM
+- result publication/readback, Campaign rounds, termination, and bounded policy
   follow-up-plan identity.
 
 The final JSON receipts and immutable SHA readbacks remain authoritative. Logs
@@ -490,18 +490,22 @@ score. `no_trades_after_costs` admits only the registered prediction-identity ma
 `overtrade_capacity` and `positive_ic_negative_net` admit only the registered
 hysteretic cost-aware mapping.
 The feature set, evaluator, fees, validation, budgets, holdout, and model kinds
-remain frozen. The LLM supplies only the falsifiable hypothesis text and cannot
-change the pinned policy revision, Kubernetes, risk, or execution authority.
-Each follow-up records its parent's feature-fields and actual factor-signature
-digest. If a child produces the same evidence signature, `campaign-learn`
+remain frozen. `campaign-learn` derives the falsifiable hypothesis text from
+the classified failure; the only executable change is the registered,
+parent-bound position-policy revision.
+Each follow-up records its parent's input, policy, feature, factor, and evaluation
+feedback identities. If the inputs, features, factors, and evaluation feedback
+are unchanged, `campaign-learn`
 returns typed `no_improvement`; the controller publishes that report and ends
 the cycle immediately, regardless of unused `max-follow-ups`. The output is
 create-once, limited to three follow-up generations, and its
 content hash changes the child Campaign identity. The Campaign execution Job
-still receives no LLM credentials. Only the separate ACK controller Job may
-receive the research-learning Secret used by `campaign-learn`; the existing
-dispatcher is still the only path that creates the next suspended execution
-Job.
+and ACK controller Job receive no LLM credentials. The existing dispatcher is
+still the only path that creates the next suspended execution Job.
+
+`--max-tokens` is no longer accepted. Existing controller checkpoints keep their
+historical `max_tokens` field unchanged; resumption ignores only this retired
+field and still rejects changes to every other input, including the input hash.
 
 `scripts/campaign-cycle-controller.sh` separates the local control plane from
 ACK data-plane readback. A workstation may run only `start`, `status`, or
