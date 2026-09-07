@@ -5,11 +5,14 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 gate="$script_dir/agent-worktree-preflight.sh"
 
 primary=$(git worktree list --porcelain | awk '$1 == "worktree" && !found { print substr($0, 10); found=1 }')
-if (cd "$primary" && "$gate" check) >/dev/null 2>&1; then
+if (cd "$primary" && "$gate" check-managed) >/dev/null 2>&1; then
   echo 'primary checkout unexpectedly passed preflight' >&2
   exit 1
 fi
 
+# Invoking the helper without selecting a managed-writer check never rejects
+# an otherwise legitimate primary checkout.
+(cd "$primary" && "$gate") | grep -q '^usage:'
 report=$($gate report)
 grep -Eq 'state=(registered-clean|dirty|prunable)' <<<"$report"
 grep -Eq 'checkout=(branch|detached)' <<<"$report"
@@ -23,18 +26,18 @@ git -C "$fixture" config user.email test@example.invalid
 git -C "$fixture" config user.name test
 git -C "$fixture" commit -q --allow-empty -m initial
 base=$(git -C "$fixture" rev-parse HEAD)
-managed="$fixture/.worktrees/codex/fixture"
-git -C "$fixture" worktree add -q -b codex/fixture "$managed" HEAD
+managed="$fixture/workspaces/owned"
+git -C "$fixture" worktree add -q -b reviewed-branch "$managed" HEAD
 record=$(git -C "$managed" rev-parse --git-path agent-worktree.yml)
 printf '%s\n' \
   'contract: test' \
   'owner: test' \
   "worktree: $managed" \
-  'branch: codex/fixture' \
+  'branch: reviewed-branch' \
   "base_sha: $base" \
   'allowed_files: test' \
   'dependency: none' >"$record"
-output=$(cd "$managed" && "$gate" check)
+output=$(cd "$managed" && "$gate" check-managed)
 grep -qx 'verdict=ok' <<<"$output"
 git -C "$fixture" worktree add -q --detach "$fixture/detached" HEAD
 fixture_report=$(cd "$fixture" && "$gate" report)

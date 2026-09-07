@@ -46,7 +46,9 @@ for modifying research or collector code.
 
 ## Safety boundaries
 
-- Never fabricate missing history or completeness. Mark unreconstructable data `missing` and state the excluded window.
+- Never fabricate missing history or completeness. Mark verified absent or
+  unreconstructable data `missing` and state the excluded window. When access
+  prevents determining whether data exists, use `unknown` instead.
 - Never use research authority to start collectors, alter deployment, submit orders, change risk limits, or enable Paper/Shadow/Live.
 - Do not treat collector deployment, snapshot construction, evaluation, and publication as one rollout unit.
 - Do not expose credentials or secret material; record only authenticated status and immutable public identities.

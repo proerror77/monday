@@ -10,14 +10,13 @@ value() {
   sed -n "s/^$1: *[\"']\{0,1\}\(.*[^\"']\)[\"']\{0,1\}$/\1/p" "$2" | head -1
 }
 
-check() {
+check_managed() {
   local root primary branch record recorded_root recorded_branch base
   root=$(git rev-parse --show-toplevel) || fail not_a_git_worktree
   primary=$(git worktree list --porcelain | awk '$1 == "worktree" && !found { print substr($0, 10); found=1 }')
   [[ "$root" != "$primary" ]] || fail primary_checkout
-  [[ "$root" == "$primary/.worktrees/codex/"* ]] || fail unmanaged_worktree
   branch=$(git branch --show-current)
-  [[ "$branch" == codex/* ]] || fail unmanaged_branch
+  [[ -n "$branch" ]] || fail detached_writer
   record=$(git rev-parse --git-path agent-worktree.yml)
   [[ -f "$record" ]] || fail missing_ownership_record
   for key in contract owner worktree branch base_sha allowed_files dependency; do
@@ -60,8 +59,11 @@ report() {
   fi
 }
 
-case "${1:-check}" in
-  check) check ;;
+# Strict ownership validation is opt-in for a managed writer. Ordinary local
+# editing uses the task's ownership assessment, not a mandatory worktree gate.
+case "${1:-help}" in
+  check-managed) check_managed ;;
   report) report ;;
-  *) echo "usage: $0 [check|report]" >&2; exit 2 ;;
+  help|--help|-h) echo "usage: $0 check-managed|report (managed writer validation or read-only inventory)" ;;
+  *) echo "usage: $0 check-managed|report" >&2; exit 2 ;;
 esac

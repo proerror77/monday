@@ -187,8 +187,6 @@ pub struct CampaignLearnArgs {
     pub result: PathBuf,
     #[arg(long)]
     pub result_sha256: String,
-    #[arg(long, default_value_t = 500)]
-    pub max_tokens: u64,
     #[arg(long)]
     pub output: PathBuf,
 }
@@ -1127,8 +1125,11 @@ mod tests {
 
     #[test]
     fn parses_mission_campaign_learn() {
-        let args = "alpha-harness mission campaign-learn --request campaign.json --result campaign-result.json --result-sha256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --max-tokens 300 --output next-plan.json";
+        let args = "alpha-harness mission campaign-learn --request campaign.json --result campaign-result.json --result-sha256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --output next-plan.json";
         assert!(Cli::try_parse_from(args.split_whitespace()).is_ok());
+
+        let obsolete = "alpha-harness mission campaign-learn --request campaign.json --result campaign-result.json --result-sha256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --max-tokens 300 --output next-plan.json";
+        assert!(Cli::try_parse_from(obsolete.split_whitespace()).is_err());
     }
 
     #[test]
