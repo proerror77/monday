@@ -30,4 +30,4 @@ Quotes-only 模式（只連行情、不下單）
 常見問題
 - 陳舊事件（stale）
   - 原因：交易所時間戳以毫秒（ms）提供，系統採用微秒（μs）。
-  - 解法：在相應 adapter 內將 `ms` 轉換為 `μs`（×1000）。目前 Binance/Bybit/Bitget/Asterdex/Hyperliquid 已對齊。
+  - 解法：在相應 adapter 內將 `ms` 轉換為 `μs`（×1000）。目前 Binance/Bybit/Bitget/Asterdex 已對齊。

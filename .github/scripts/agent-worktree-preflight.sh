@@ -33,17 +33,20 @@ check() {
 }
 
 report() {
-  local path= branch= prunable= line state
+  local path='' branch='' head='' prunable='' line state checkout
   while IFS= read -r line || [[ -n "$line" ]]; do
     if [[ -z "$line" ]]; then
       [[ -n "$path" ]] || continue
       if [[ "$prunable" == true ]]; then state=prunable
       elif [[ -n $(git -C "$path" status --porcelain) ]]; then state=dirty
       else state=registered-clean; fi
-      printf 'worktree=%s\tbranch=%s\tstate=%s\n' "$path" "$branch" "$state"
-      path= branch= prunable=
+      if [[ -n "$branch" ]]; then checkout=branch; else checkout=detached; fi
+      printf 'worktree=%s\tbranch=%s\thead=%s\tcheckout=%s\tstate=%s\n' \
+        "$path" "$branch" "$head" "$checkout" "$state"
+      path='' branch='' head='' prunable=''
     elif [[ "$line" == worktree\ * ]]; then path=${line#worktree }
     elif [[ "$line" == branch\ * ]]; then branch=${line#branch refs/heads/}
+    elif [[ "$line" == HEAD\ * ]]; then head=${line#HEAD }
     elif [[ "$line" == prunable* ]]; then prunable=true
     fi
   done < <(git worktree list --porcelain)
@@ -51,7 +54,9 @@ report() {
     if [[ "$prunable" == true ]]; then state=prunable
     elif [[ -n $(git -C "$path" status --porcelain) ]]; then state=dirty
     else state=registered-clean; fi
-    printf 'worktree=%s\tbranch=%s\tstate=%s\n' "$path" "$branch" "$state"
+    if [[ -n "$branch" ]]; then checkout=branch; else checkout=detached; fi
+    printf 'worktree=%s\tbranch=%s\thead=%s\tcheckout=%s\tstate=%s\n' \
+      "$path" "$branch" "$head" "$checkout" "$state"
   fi
 }
 

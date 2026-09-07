@@ -22,20 +22,8 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 rust_decimal = { workspace = true }
 simd-json = { workspace = true }
 
-[features]
-default = []
-live = []
-paper = []
-metrics = []
-legacy-sdk = []
-
 [dev-dependencies]
 tracing-subscriber = "0.3"
 
 [lib]
 name = "execution_adapter_bitget"
-
-[[example]]
-name = "s2_execution_demo"
-path = "examples/s2_execution_demo.rs"
-required-features = ["legacy-sdk"]

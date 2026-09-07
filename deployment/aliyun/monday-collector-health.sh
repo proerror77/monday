@@ -4,9 +4,10 @@
 # public-data collector host (monday-trade-data-26, Aliyun Tokyo ap-northeast-1).
 #
 # Guards against a silent recurrence of the 2026-08-05/06 disk-full incident in
-# which every governed collector stopped, uploads failed, and delay-gate trips
-# accumulated while the only on-host monitor (polymarket-market-tape-upload-
-# watchdog.sh) self-healed without ever alerting a human.
+# which every governed collector stopped and uploads failed while the only
+# on-host monitor (polymarket-market-tape-upload-watchdog.sh) self-healed
+# without ever alerting a human. Reconnect evidence comes from the collector's
+# typed health counters; this monitor does not scan the journal.
 #
 # Health contract: hard gates, each a breach that fails closed into the
 # monitor-collector-host workflow issue, plus the raw-ops Gate containment
@@ -45,6 +46,8 @@
 #      must be active (waiting) whenever their collector service is active; a
 #      stopped timer with a running collector silently strands rotated tapes
 #      until the disk fills.
+#   7. /data must be mounted; otherwise healthy-looking spool paths may be
+#      writing to the root filesystem instead of the governed data volume.
 # The raw-ops Gate template has no [Install] section, so systemd reports it as
 # static. Static is healthy only when no Gate instance, running lock, or
 # residual EnvironmentFile remains on the host. State-persistence failures
@@ -52,8 +55,7 @@
 # state.
 #
 # Everything else is a WARNING: unit/timer active+enabled state, systemd
-# Result, restart-rate deltas, health.json freshness/gaps, journald delay-gate
-# trips, fee snapshot journal failures, and the /data mount.
+# Result, restart-rate deltas, and health.json freshness/sequence counters.
 # Warnings are reported in the JSON warnings array (and as warning: lines in
 # text mode) but never block ok:true.
 #
@@ -74,7 +76,8 @@
 #                                /var/lib/monday-collector-health)
 #   MONDAY_COLLECTOR_HEALTH_TEST_MODE=1 and
 #   MONDAY_COLLECTOR_HEALTH_TEST_ROOT  are reserved for the contract test
-#                                      fixture under /tmp.
+#                                      fixture under /tmp. Test mode may also
+#   MONDAY_COLLECTOR_HEALTH_TEST_HFT_GID override the expected collector gid.
 set -u
 
 TAG=monday-collector-health
@@ -87,19 +90,13 @@ HEALTH_SILENCE_SECONDS=300
 DISK_WARN_PERCENT=25
 DISK_CRIT_PERCENT=15
 RESTART_MAX_DELTA=1
-# journalctl --since value; must be a timestamp journalctl can parse
-# ("15min" is rejected with "Failed to parse timestamp" and would read as a
-# permanent journald-query warning).
-DELAY_GATE_WINDOW='15 min ago'
-FEE_FAILURE_WINDOW='10 min ago'
-
 # Gate 2: last_success_at freshness per lane, set just above the lane's upload
 # cadence:
-# - LOB segments rotate every SEGMENT_SECONDS (default 3600s) and the
-#   in-process upload loop runs every 300s, so a healthy lane uploads at least
-#   once per rotation; allow two full rotations.
+# - LOB production segments rotate every 300s and the in-process upload loop
+#   also runs every 300s; allow two rotation/upload opportunities.
 # - fee snapshots publish every 60s and binance-fee-upload.timer retries every
-#   60s (mirrors the FEE_FAILURE_WINDOW='10 min ago' journal window).
+#   60s; fee delivery is hard-gated by upload-status.json and the oneshot
+#   Result observed below.
 # - usdm-reference runs on a 5-minute upload timer over hourly reference
 #   batches.
 # - both polymarket lanes rotate tapes hourly
@@ -109,7 +106,7 @@ FEE_FAILURE_WINDOW='10 min ago'
 #   allow two full rotations, same as LOB.
 # - bybit options segments finalize on the hour and the upload timer sweeps
 #   them at :23, so 90 minutes covers one full finalize+sweep cycle.
-LOB_SUCCESS_MAX_AGE=7200
+LOB_SUCCESS_MAX_AGE=600
 FEE_SUCCESS_MAX_AGE=600
 REF_SUCCESS_MAX_AGE=1200
 POLY_SUCCESS_MAX_AGE=7200
@@ -121,8 +118,8 @@ RECOVERY_QUEUE_READY_MAX_AGE=1800
 RECOVERY_QUEUE_RUNNING_MAX_AGE=7200
 
 # Gate 3: pending backlog bounds per lane (count limit, oldest-artifact age).
-LOB_PENDING_MAX=4
-LOB_PENDING_MAX_AGE=10800
+LOB_PENDING_MAX=2
+LOB_PENDING_MAX_AGE=900
 FEE_PENDING_MAX=120
 FEE_PENDING_MAX_AGE=7200
 REF_PENDING_MAX=24
@@ -212,6 +209,9 @@ health_json='{}'
 uploads_json='{}'
 recovery_queue_json='{}'
 recovery_queue_root_ok=1
+recovery_root_owner_uid=0
+recovery_hft_owner_uid=''
+recovery_hft_group_gid=''
 delay_gate_json='{}'
 disk_json='{}'
 mount_json='{}'
@@ -255,9 +255,65 @@ read_prior() {
   fi
 }
 
+preserve_sequence_prior() {
+  # Invalid or missing health observations must never erase the last valid
+  # session/counter baseline when write_state atomically replaces the file.
+  if [ "$DRY_RUN" -eq 0 ] && [ -n "${prior_session:-}" ] \
+    && [ -n "${prior_total:-}" ]; then
+    sequence_gap_previous_total_json=$prior_total
+    state_lines="$state_lines sequence_gap_session|$label=$prior_session sequence_gap_total|$label=$prior_total"
+  fi
+}
+
 file_mtime() {
   # Portable mtime: GNU stat on the host, BSD stat under the macOS test stubs.
   stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
+}
+
+file_uid() {
+  # Portable owner uid: GNU stat on the host, BSD stat under the macOS tests.
+  stat -c %u "$1" 2>/dev/null || stat -f %u "$1" 2>/dev/null
+}
+
+file_gid() {
+  # Portable owner gid: GNU stat on the host, BSD stat under the macOS tests.
+  stat -c %g "$1" 2>/dev/null || stat -f %g "$1" 2>/dev/null
+}
+
+file_group_world_not_writable() {
+  mode=$(stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null) || return 1
+  case "$mode" in
+    [0-7][0-7][0-7] | [0-7][0-7][0-7][0-7]) ;;
+    *) return 1 ;;
+  esac
+  case "$mode" in
+    *[2367]? | *[2367]) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+owned_directory_not_writable() {
+  [ -d "$1" ] && [ ! -L "$1" ] \
+    && [ "$(file_uid "$1")" = "$2" ] \
+    && file_group_world_not_writable "$1"
+}
+
+owned_regular_file_not_writable() {
+  [ -f "$1" ] && [ ! -L "$1" ] \
+    && [ "$(file_uid "$1")" = "$2" ] \
+    && file_group_world_not_writable "$1"
+}
+
+owned_collector_traversable_directory() {
+  [ -d "$1" ] && [ ! -L "$1" ] \
+    && [ "$(file_uid "$1")" = "$2" ] \
+    && [ "$(file_gid "$1")" = "$3" ] \
+    && file_group_world_not_writable "$1" \
+    && mode=$(stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null) \
+    && case "$mode" in
+      [0-7][1357][0-7] | [0-7][0-7][1357][0-7]) true ;;
+      *) false ;;
+    esac
 }
 
 unit_is_active() {
@@ -272,6 +328,12 @@ unit_result() {
 unit_nrestarts() {
   systemctl show -p NRestarts --value "$1" 2>/dev/null || true
 }
+unit_substate() {
+  systemctl show -p SubState --value "$1" 2>/dev/null || true
+}
+unit_timer_next() {
+  systemctl show -p NextElapseUSecMonotonic --value "$1" 2>/dev/null || true
+}
 
 check_mount() {
   data_mounted=0
@@ -283,7 +345,7 @@ check_mount() {
     data_mounted=1
   fi
   if [ "$data_mounted" -eq 0 ]; then
-    record_warning "mount: /data is not mounted"
+    record_breach "mount: /data is not mounted"
   fi
   mount_json=$(jq -n --argjson m "$(bool_json "$data_mounted")" '{data_mounted: $m}')
 }
@@ -374,6 +436,36 @@ check_timer() {
     '{active: ($a == "active"), enabled: ($e == "enabled")}')
   units_json=$(jq -n --argjson base "$units_json" --arg k "$unit" --argjson v "$obj" \
     '$base + {($k): $v}')
+}
+
+check_scheduled_timer() {
+  unit=$1
+  label=$2
+  backing_service=${3:-}
+  check_timer "$unit" "$label"
+  substate=$(unit_substate "$unit")
+  next_elapse=$(unit_timer_next "$unit")
+  case "$substate" in
+    waiting)
+      if [ -z "$next_elapse" ] || [ "$next_elapse" = "n/a" ] \
+          || [ "$next_elapse" = "infinity" ]; then
+        service_state=
+        [ -z "$backing_service" ] || service_state=$(unit_is_active "$backing_service")
+        case "$service_state" in
+          active | activating | deactivating) ;;
+          *) record_breach "$label: waiting timer has no finite next elapse" ;;
+        esac
+      fi
+      ;;
+    running) ;;
+    *) record_breach "$label: timer not waiting or running (SubState='$substate')" ;;
+  esac
+  obj=$(jq -n --argjson base "$units_json" --arg k "$unit" \
+    --arg s "$substate" --arg n "$next_elapse" \
+    '$base | .[$k] += {substate: $s,
+      scheduled: ($n != "" and $n != "n/a" and $n != "infinity"),
+      next_elapse_monotonic: $n}')
+  units_json=$obj
 }
 
 check_upload_timer_backed() {
@@ -538,40 +630,148 @@ check_raw_ops_gate() {
 }
 
 check_binance_health() {
-  # health.json at /data/monday/spool/binance-lob/<market>/: freshness and
-  # sequence gaps are soft signals (warnings); the hard LOB gates run on
-  # upload-status.json and the pending segment backlog.
+  # health.json at /data/monday/spool/binance-lob/<market>/: freshness and the
+  # collector's typed, session-scoped sequence-gap counter are soft signals
+  # (warnings). The hard LOB gates run on upload-status.json and the pending
+  # segment backlog. sequence_gap_total is cumulative only within session_id;
+  # a new session or a counter regression establishes a new baseline instead
+  # of fabricating a delta. Malformed counters retain the last valid baseline.
   label=$1
   spool_dir=$2
   health_file="$spool_dir/health.json"
   age=0
   gaps=0
+  sequence_gap_total_json=null
+  sequence_gap_delta_json=null
+  sequence_gap_previous_total_json=null
+  sequence_gap_session_json=null
+  sequence_gap_observed=0
+  sequence_gap_baseline=missing
   hwarn=false
   hstatus=unknown
+  prior_session=''
+  prior_total=''
+  if [ "$DRY_RUN" -eq 0 ]; then
+    prior_session=$(read_prior "sequence_gap_session|$label")
+    prior_total=$(read_prior "sequence_gap_total|$label")
+    case "$prior_total" in
+      '' | *[!0-9]*) prior_total='' ;;
+    esac
+  fi
   if [ ! -f "$health_file" ] || [ -L "$health_file" ]; then
     record_warning "$label: health.json missing or a symbolic link ($health_file)"
+    sequence_gap_baseline=missing
+    preserve_sequence_prior
     age=999999
   elif ! updated_ns=$(jq -r '.updated_at_ns // 0' "$health_file" 2>/dev/null); then
     record_warning "$label: health.json unparseable ($health_file)"
+    sequence_gap_baseline=malformed
+    preserve_sequence_prior
     age=999999
   else
     gaps=$(jq -r '.sequence_gaps // 0' "$health_file" 2>/dev/null || printf '0')
     hwarn=$(jq -r '.disk_warning // false' "$health_file" 2>/dev/null || printf 'false')
     hstatus=$(jq -r '.status // "unknown"' "$health_file" 2>/dev/null || printf 'unknown')
     case "$gaps" in (*[!0-9]*|'') gaps=0 ;; esac
-    case "$updated_ns" in (*[!0-9]*|'') updated_ns=0 ;; esac
+    if [ "$gaps" -gt 0 ]; then
+      record_warning "$label: sequence_gaps=$gaps"
+    fi
+    updated_ns_valid=1
+    case "$updated_ns" in
+      (*[!0-9]*|'') updated_ns=0; updated_ns_valid=0 ;;
+    esac
     updated_sec=$((updated_ns / 1000000000))
     age=$((NOW_SEC - updated_sec))
     [ "$age" -lt 0 ] && age=0
     if [ "$age" -gt "$HEALTH_SILENCE_SECONDS" ]; then
       record_warning "$label: health.json stale (age ${age}s > ${HEALTH_SILENCE_SECONDS}s)"
     fi
-    if [ "$gaps" -gt 0 ]; then
-      record_warning "$label: sequence_gaps=$gaps"
+
+    # A session id is deliberately constrained to the collector's opaque,
+    # single-token identity format before it can enter the line-oriented state
+    # file. The counter must be a non-negative integer JSON number; strings,
+    # fractions, negatives, and missing fields are malformed rather than zero.
+    session_id=$(jq -r '
+      if (.session_id? | type) == "string" and (.session_id | length) > 0
+        then .session_id else empty end' "$health_file" 2>/dev/null || true)
+    sequence_gap_total=$(jq -r '
+      if (.sequence_gap_total? | type) == "number"
+        and (.sequence_gap_total | floor) == .sequence_gap_total
+        and .sequence_gap_total >= 0
+        then (.sequence_gap_total | tostring) else empty end' \
+      "$health_file" 2>/dev/null || true)
+    session_valid=0
+    case "$session_id" in
+      '' | *[!A-Za-z0-9._:-]*) ;;
+      *) session_valid=1 ;;
+    esac
+    total_valid=0
+    case "$sequence_gap_total" in
+      '' | *[!0-9]*) ;;
+      *) total_valid=1 ;;
+    esac
+
+    if [ "$session_valid" -eq 1 ]; then
+      sequence_gap_session_json=$(jq -Rn --arg s "$session_id" '$s')
+    fi
+    if [ "$total_valid" -eq 1 ]; then
+      sequence_gap_total_json=$sequence_gap_total
+    fi
+
+    if [ "$updated_ns_valid" -eq 0 ]; then
+      record_warning "$label: health.json updated_at_ns malformed"
+      sequence_gap_baseline=malformed
+      preserve_sequence_prior
+    elif [ "$session_valid" -eq 1 ] && [ "$total_valid" -eq 1 ]; then
+      sequence_gap_observed=1
+      if [ "$DRY_RUN" -eq 1 ]; then
+        sequence_gap_baseline=dry_run
+      elif [ -z "$prior_session" ] || [ -z "$prior_total" ]; then
+        sequence_gap_baseline=baseline
+        sequence_gap_previous_total_json=null
+      else
+        sequence_gap_previous_total_json=$prior_total
+        if [ "$session_id" != "$prior_session" ]; then
+          sequence_gap_baseline=session_changed
+          record_warning "$label: sequence_gap session changed ($prior_session -> $session_id); baseline reset at total=$sequence_gap_total"
+        elif [ "$sequence_gap_total" -gt "$prior_total" ]; then
+          sequence_gap_delta=$((sequence_gap_total - prior_total))
+          sequence_gap_delta_json=$sequence_gap_delta
+          sequence_gap_baseline=increased
+          record_warning "$label: sequence_gap_total increased $prior_total -> $sequence_gap_total (delta=$sequence_gap_delta)"
+        elif [ "$sequence_gap_total" -lt "$prior_total" ]; then
+          sequence_gap_baseline=regressed
+          record_warning "$label: sequence_gap_total regressed $prior_total -> $sequence_gap_total; baseline reset"
+        else
+          sequence_gap_baseline=stable
+          sequence_gap_delta_json=0
+        fi
+      fi
+      if [ "$DRY_RUN" -eq 0 ]; then
+        state_lines="$state_lines sequence_gap_session|$label=$session_id sequence_gap_total|$label=$sequence_gap_total"
+      fi
+    else
+      record_warning "$label: health.json sequence counter malformed (session_id/sequence_gap_total)"
+      sequence_gap_baseline=malformed
+      # Preserve the prior valid baseline instead of replacing it with a
+      # fabricated zero. This lets the next valid poll still detect a delta.
+      preserve_sequence_prior
     fi
   fi
-  hobj=$(jq -n --argjson age "$age" --argjson gaps "$gaps" --arg hw "$hwarn" --arg s "$hstatus" \
-    '{age_seconds: $age, sequence_gaps: $gaps, disk_warning: ($hw == "true"), status: $s}')
+  hobj=$(jq -n --argjson age "$age" --argjson gaps "$gaps" \
+    --argjson total "$sequence_gap_total_json" \
+    --argjson delta "$sequence_gap_delta_json" \
+    --argjson previous "$sequence_gap_previous_total_json" \
+    --argjson session "$sequence_gap_session_json" \
+    --arg baseline "$sequence_gap_baseline" \
+    --argjson observed "$sequence_gap_observed" \
+    --arg hw "$hwarn" --arg s "$hstatus" \
+    '{age_seconds: $age, sequence_gaps: $gaps,
+      sequence_gap_total: $total, sequence_gap_delta: $delta,
+      sequence_gap_previous_total: $previous, session_id: $session,
+      sequence_gap_observed: ($observed == 1),
+      sequence_gap_baseline: $baseline,
+      disk_warning: ($hw == "true"), status: $s}')
   health_json=$(jq -n --argjson base "$health_json" --arg k "$label" --argjson v "$hobj" \
     '$base + {($k): $v}')
 }
@@ -598,6 +798,71 @@ queue_oldest_age() {
   fi
 }
 
+recovery_job_receipt_valid() {
+  entry=$1
+  market=$2
+  name=${entry##*/}
+  job_id=${3:-${name%.*}}
+  receipt="$entry/job.json"
+  owned_directory_not_writable "$entry" "$recovery_hft_owner_uid" \
+    && owned_regular_file_not_writable "$receipt" "$recovery_root_owner_uid" \
+    && jq -e \
+      --arg schema monday.rust_lob_recovery_queue.v1 \
+      --arg market "$market" \
+      --arg job_id "$job_id" \
+      --arg canonical_spool "$SPOOL_ROOT/binance-lob/$market" \
+      --arg recovery_unit "binance-lob-archiver-recovery@$market.service" \
+      '.schema == $schema
+        and .market == $market
+        and .job_id == $job_id
+        and .canonical_spool == $canonical_spool
+        and .recovery_unit == $recovery_unit
+        and (.queued_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+        and (.release_sha256 | test("^[a-f0-9]{64}$"))
+        and (.deployment_bundle_sha256 | test("^[a-f0-9]{64}$"))
+        and (.deployment_source_revision | test("^[a-f0-9]{40,64}$"))
+        and (.env_sha256 | test("^[a-f0-9]{64}$"))
+        and .release_env == "recovery.env"' \
+      "$receipt" >/dev/null 2>&1
+}
+
+recovery_isolation_marker_valid() {
+  marker=$1
+  market=$2
+  queue_dir=$3
+  owned_regular_file_not_writable "$marker" "$recovery_root_owner_uid" || return 1
+  job_id=$(jq -er '.job_id | select(type == "string")' "$marker" 2>/dev/null) || return 1
+  receipt_sha256=$(jq -er '.receipt_sha256 | select(type == "string")' "$marker" 2>/dev/null) || return 1
+  printf '%s\n' "$job_id" \
+    | grep -Eq "^[0-9]{8}T[0-9]{6}Z-${market}-[a-f0-9]{12}-[0-9]+$" \
+    || return 1
+  printf '%s\n' "$receipt_sha256" | grep -Eq '^[a-f0-9]{64}$' || return 1
+  canonical_spool="$SPOOL_ROOT/binance-lob/$market"
+  ready_dir="$queue_dir/$job_id.ready"
+  jq -e \
+    --arg schema monday.rust_lob_recovery_isolation.v1 \
+    --arg job_id "$job_id" \
+    --arg market "$market" \
+    --arg canonical_spool "$canonical_spool" \
+    --arg ready_dir "$ready_dir" \
+    --arg receipt_sha256 "$receipt_sha256" \
+    '.schema == $schema
+      and .job_id == $job_id
+      and .market == $market
+      and .canonical_spool == $canonical_spool
+      and .ready_dir == $ready_dir
+      and .receipt_sha256 == $receipt_sha256' \
+    "$marker" >/dev/null 2>&1 || return 1
+  if [ -e "$ready_dir" ] || [ -L "$ready_dir" ]; then
+    receipt_dir=$ready_dir
+  else
+    receipt_dir=$canonical_spool
+  fi
+  recovery_job_receipt_valid "$receipt_dir" "$market" "$job_id" || return 1
+  actual_receipt_sha256=$(sha256sum "$receipt_dir/job.json" 2>/dev/null | awk '{print $1}')
+  [ "$actual_receipt_sha256" = "$receipt_sha256" ]
+}
+
 check_recovery_queue_market() {
   market=$1
   queue_dir="$RECOVERY_QUEUE_ROOT/$market"
@@ -605,29 +870,61 @@ check_recovery_queue_market() {
   ready_scan_failed=0
   running_scan_failed=0
   failed_scan_failed=0
+  malformed_scan_failed=0
+  legacy_scan_failed=0
   ready_entries=""
   running_entries=""
   failed_entries=""
+  status_entries=""
+  legacy_entries=""
   ready_count=0
   running_count=0
   failed_count=0
+  malformed_count=0
+  legacy_unreceipted_count=0
+  isolation_active=0
+  isolation_valid=0
+  isolation_age=null
   ready_oldest_age=null
   running_oldest_age=null
   failed_oldest_age=null
 
   if [ "$recovery_queue_root_ok" -eq 1 ] && { [ -e "$queue_dir" ] || [ -L "$queue_dir" ]; }; then
-    if [ ! -d "$queue_dir" ] || [ -L "$queue_dir" ] || [ ! -r "$queue_dir" ] || [ ! -x "$queue_dir" ]; then
+    if ! owned_collector_traversable_directory "$queue_dir" "$recovery_root_owner_uid" "$recovery_hft_group_gid" \
+      || [ ! -r "$queue_dir" ] || [ ! -x "$queue_dir" ]; then
       record_breach "$label: recovery queue root is not an inspectable directory ($queue_dir)"
     else
+      isolation_marker="$queue_dir/isolation.json"
+      if [ -e "$isolation_marker" ] || [ -L "$isolation_marker" ]; then
+        isolation_active=1
+        marker_mtime=$(file_mtime "$isolation_marker")
+        case "$marker_mtime" in
+          *[!0-9]* | '') ;;
+          *)
+            isolation_age=$((NOW_SEC - marker_mtime))
+            [ "$isolation_age" -lt 0 ] && isolation_age=0
+            ;;
+        esac
+        if recovery_isolation_marker_valid "$isolation_marker" "$market" "$queue_dir"; then
+          isolation_valid=1
+          record_breach "$label: unfinished isolation transaction present (age ${isolation_age}s)"
+        else
+          record_breach "$label: malformed isolation transaction present (age ${isolation_age}s)"
+        fi
+      fi
       ready_entries=$(find "$queue_dir" -mindepth 1 -maxdepth 1 -type d -name '*.ready' -print 2>/dev/null) \
         || ready_scan_failed=1
       running_entries=$(find "$queue_dir" -mindepth 1 -maxdepth 1 -type d -name '*.running' -print 2>/dev/null) \
         || running_scan_failed=1
       failed_entries=$(find "$queue_dir" -mindepth 1 -maxdepth 1 -type d -name '*.failed' -print 2>/dev/null) \
         || failed_scan_failed=1
+      status_entries=$(find "$queue_dir" -mindepth 1 -maxdepth 1 \
+        \( -name '*.ready' -o -name '*.running' -o -name '*.failed' \) -print 2>/dev/null) \
+        || malformed_scan_failed=1
       if [ "${ready_scan_failed:-0}" -eq 1 ] \
         || [ "${running_scan_failed:-0}" -eq 1 ] \
-        || [ "${failed_scan_failed:-0}" -eq 1 ]; then
+        || [ "${failed_scan_failed:-0}" -eq 1 ] \
+        || [ "${malformed_scan_failed:-0}" -eq 1 ]; then
         record_breach "$label: recovery queue scan failed ($queue_dir)"
       else
         ready_count=$(queue_entry_count "$ready_entries")
@@ -639,10 +936,37 @@ check_recovery_queue_market() {
         running_oldest_age=$queue_oldest_age_result
         queue_oldest_age "$failed_entries"
         failed_oldest_age=$queue_oldest_age_result
+        for entry in $status_entries; do
+          if ! recovery_job_receipt_valid "$entry" "$market"; then
+            malformed_count=$((malformed_count + 1))
+          fi
+        done
+      fi
+
+      legacy_dir="$queue_dir/legacy-unreceipted"
+      if [ -e "$legacy_dir" ] || [ -L "$legacy_dir" ]; then
+        if ! owned_directory_not_writable "$legacy_dir" "$recovery_root_owner_uid" \
+          || [ ! -r "$legacy_dir" ] || [ ! -x "$legacy_dir" ]; then
+          record_breach "$label: legacy-unreceipted is not an inspectable root-owned directory ($legacy_dir)"
+        else
+          legacy_entries=$(find "$legacy_dir" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null) \
+            || legacy_scan_failed=1
+          if [ "${legacy_scan_failed:-0}" -eq 1 ]; then
+            record_breach "$label: legacy-unreceipted scan failed ($legacy_dir)"
+          else
+            legacy_unreceipted_count=$(queue_entry_count "$legacy_entries")
+          fi
+        fi
       fi
     fi
   fi
 
+  if [ "$malformed_count" -gt 0 ]; then
+    record_breach "$label: malformed recovery job receipt(s) present ($malformed_count)"
+  fi
+  if [ "$legacy_unreceipted_count" -gt 0 ]; then
+    record_breach "$label: legacy unreceipted recovery job(s) present ($legacy_unreceipted_count)"
+  fi
   if [ "$failed_count" -gt 0 ]; then
     record_breach "$label: failed recovery job(s) present ($failed_count)"
   fi
@@ -660,9 +984,17 @@ check_recovery_queue_market() {
     --argjson ua "$running_oldest_age" \
     --argjson fc "$failed_count" \
     --argjson fa "$failed_oldest_age" \
+    --argjson mc "$malformed_count" \
+    --argjson lc "$legacy_unreceipted_count" \
+    --argjson ia "$isolation_active" \
+    --argjson iv "$isolation_valid" \
+    --argjson ig "$isolation_age" \
     '{ready_count: $rc, ready_oldest_age_seconds: $ra,
       running_count: $uc, running_oldest_age_seconds: $ua,
-      failed_count: $fc, failed_oldest_age_seconds: $fa}')
+      failed_count: $fc, failed_oldest_age_seconds: $fa,
+      malformed_count: $mc, legacy_unreceipted_count: $lc,
+      isolation_active: ($ia == 1), isolation_valid: ($iv == 1),
+      isolation_age_seconds: $ig}')
   recovery_queue_json=$(jq -n --argjson base "$recovery_queue_json" --arg k "$market" --argjson v "$qobj" \
     '$base + {($k): $v}')
 }
@@ -670,7 +1002,17 @@ check_recovery_queue_market() {
 check_recovery_queue_root() {
   recovery_queue_root_ok=1
   if [ -e "$RECOVERY_QUEUE_ROOT" ] || [ -L "$RECOVERY_QUEUE_ROOT" ]; then
-    if [ ! -d "$RECOVERY_QUEUE_ROOT" ] || [ -L "$RECOVERY_QUEUE_ROOT" ] \
+    if [ "${MONDAY_COLLECTOR_HEALTH_TEST_MODE:-0}" = 1 ]; then
+      recovery_root_owner_uid=$(id -u)
+      recovery_hft_owner_uid=$recovery_root_owner_uid
+      recovery_hft_group_gid=${MONDAY_COLLECTOR_HEALTH_TEST_HFT_GID:-$(id -g)}
+    elif ! recovery_hft_owner_uid=$(id -u hftcollector 2>/dev/null) \
+      || ! recovery_hft_group_gid=$(id -g hftcollector 2>/dev/null); then
+      recovery_queue_root_ok=0
+      record_breach "binance-lob-recovery: hftcollector owner identity is unavailable"
+      return
+    fi
+    if ! owned_collector_traversable_directory "$RECOVERY_QUEUE_ROOT" "$recovery_root_owner_uid" "$recovery_hft_group_gid" \
       || [ ! -r "$RECOVERY_QUEUE_ROOT" ] || [ ! -x "$RECOVERY_QUEUE_ROOT" ]; then
       recovery_queue_root_ok=0
       record_breach "binance-lob-recovery: recovery queue root is not an inspectable directory ($RECOVERY_QUEUE_ROOT)"
@@ -908,40 +1250,18 @@ check_upload_lane() {
   emit_lane_json "$uobj"
 }
 
-check_delay_gate() {
-  # Journald delay-gate trips (the fail-closed reconnect path) in the last 15m,
-  # observed as warnings. Capture journalctl's own exit status separately: a
-  # successful no-match query is trips=0, while a failed query means the
-  # delay-gate evidence could not be inspected.
-  unit=$1
-  label=$2
-  journal_out=$(journalctl -u "$unit" --since "$DELAY_GATE_WINDOW" --no-pager 2>/dev/null)
-  journal_rc=$?
-  trips=$(printf '%s\n' "$journal_out" \
-    | grep -c 'source-to-receive delay exceeds the governed limit' || true)
-  case "$trips" in (*[!0-9]*|'') trips=0 ;; esac
-  if [ "$journal_rc" -ne 0 ]; then
-    record_warning "$label: journald query failed (exit $journal_rc)"
-  elif [ "$trips" -gt 0 ]; then
-    record_warning "$label: $trips delay-gate trip(s) in last 15 minutes"
-  fi
-  dobj=$(jq -n --argjson t "$trips" '{trips_15m: $t}')
-  delay_gate_json=$(jq -n --argjson base "$delay_gate_json" --arg k "$unit" --argjson v "$dobj" \
-    '$base + {($k): $v}')
-}
-
-check_recent_snapshot_failures() {
-  unit=$1
-  label=$2
-  journal_out=$(journalctl -u "$unit" --since "$FEE_FAILURE_WINDOW" --no-pager 2>/dev/null)
-  journal_rc=$?
-  failures=$(printf '%s\n' "$journal_out" | grep -c 'Failed with result' || true)
-  case "$failures" in (*[!0-9]*|'') failures=0 ;; esac
-  if [ "$journal_rc" -ne 0 ]; then
-    record_warning "$label: snapshot failure journal query failed (exit $journal_rc)"
-  elif [ "$failures" -gt 0 ]; then
-    record_warning "$label: $failures recent snapshot failure(s)"
-  fi
+mark_delay_gate_replaced() {
+  # Keep the historical delay_gate projection for consumers that still parse
+  # it, but make the replacement explicit. The typed health counters are the
+  # sole source for sequence-gap/reconnect evidence; no journal scan occurs.
+  for unit in "$ARCHIVER_SPOT" "$ARCHIVER_USDM"; do
+    dobj=$(jq -n \
+      '{trips_15m: null, observed: false,
+        skipped_reason: "replaced_by_health_sequence_counters",
+        replacement: "checks.health"}')
+    delay_gate_json=$(jq -n --argjson base "$delay_gate_json" --arg k "$unit" \
+      --argjson v "$dobj" '$base + {($k): $v}')
+  done
 }
 
 write_state() {
@@ -980,13 +1300,13 @@ check_timer "$RECOVERY_USDM_TIMER" "binance-lob-archiver-recovery@usdm.timer" "$
 check_service "$REFERENCE_COLLECTOR" "binance-usdm-reference-collector"
 check_service "$BYBIT_ARCHIVER" "bybit-options-archiver"
 
-check_timer "$POLY_MARKET_UPLOAD_TIMER" "polymarket-market-tape-upload.timer"
+check_scheduled_timer "$POLY_MARKET_UPLOAD_TIMER" "polymarket-market-tape-upload.timer" "$POLY_MARKET_UPLOAD_SERVICE"
 check_oneshot_result "$POLY_MARKET_UPLOAD_SERVICE" "polymarket-market-tape-upload.service"
-check_timer "$POLY_REF_UPLOAD_TIMER" "polymarket-reference-upload.timer"
+check_scheduled_timer "$POLY_REF_UPLOAD_TIMER" "polymarket-reference-upload.timer" "$POLY_REF_UPLOAD_SERVICE"
 check_oneshot_result "$POLY_REF_UPLOAD_SERVICE" "polymarket-reference-upload.service"
 check_upload_timer_backed "$POLY_MARKET_COLLECTOR" "$POLY_MARKET_UPLOAD_TIMER" "polymarket-market-tape-upload.timer"
 check_upload_timer_backed "$POLY_REF_COLLECTOR" "$POLY_REF_UPLOAD_TIMER" "polymarket-reference-upload.timer"
-check_timer "$WATCHDOG_TIMER" "polymarket-market-tape-upload-watchdog.timer"
+check_scheduled_timer "$WATCHDOG_TIMER" "polymarket-market-tape-upload-watchdog.timer"
 check_oneshot_result "$WATCHDOG_SERVICE" "polymarket-market-tape-upload-watchdog.service"
 check_timer "$BYBIT_UPLOAD_TIMER" "bybit-options-upload.timer"
 check_oneshot_result "$BYBIT_UPLOAD_SERVICE" "bybit-options-upload.service"
@@ -998,13 +1318,12 @@ check_timer "$FEE_USDM_TIMER" "binance-fee-snapshot-usdm.timer"
 check_oneshot_result "$FEE_USDM_SERVICE" "binance-fee-snapshot-usdm.service"
 check_timer "$FEE_UPLOAD_TIMER" "binance-fee-upload.timer"
 check_oneshot_result "$FEE_UPLOAD_SERVICE" "binance-fee-upload.service"
-check_recent_snapshot_failures "$FEE_SPOT_SERVICE" "binance-fee-snapshot-spot.service"
-check_recent_snapshot_failures "$FEE_USDM_SERVICE" "binance-fee-snapshot-usdm.service"
 
 check_raw_ops_gate "$POLY_RAW_OPS_GATE" "polymarket-raw-ops-gate"
 
 check_binance_health "binance-lob-archiver-production@spot" "$SPOOL_ROOT/binance-lob/spot"
 check_binance_health "binance-lob-archiver-production@usdm" "$SPOOL_ROOT/binance-lob/usdm"
+mark_delay_gate_replaced
 check_recovery_queue_root
 check_recovery_queue_market spot
 check_recovery_queue_market usdm
@@ -1023,9 +1342,6 @@ check_upload_lane "polymarket-reference-upload" "$SPOOL_ROOT/polymarket-referenc
   0 "$POLY_SUCCESS_MAX_AGE" "$POLY_PENDING_MAX" "$POLY_PENDING_MAX_AGE" tapes "$POLY_PENDING_STALE_MAX_AGE"
 check_upload_lane "binance-fee-upload" "$SPOOL_ROOT/binance-fee" \
   1 "$FEE_SUCCESS_MAX_AGE" "$FEE_PENDING_MAX" "$FEE_PENDING_MAX_AGE" lake
-
-check_delay_gate "$ARCHIVER_SPOT" "binance-lob-archiver-production@spot"
-check_delay_gate "$ARCHIVER_USDM" "binance-lob-archiver-production@usdm"
 
 write_state
 

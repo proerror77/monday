@@ -7,7 +7,6 @@ description = "歷史回放應用 - 用於回測和驗證"
 [dependencies]
 # 核心依賴
 runtime = { package = "hft-runtime", path = "../../market-core/runtime" }
-testing = { package = "hft-testing", path = "../../infra-services/testing" }
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export LC_ALL=C
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
+ROOT=$(readlink -f "$(mktemp -d)")
+fixture_root=$ROOT
+trap 'chmod -R u+w "$ROOT" 2>/dev/null || true; rm -rf "$ROOT"' EXIT
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/host-rust-lob-controller-release.sh"
+ROOT=$fixture_root
+
+source_dir="$ROOT/source"
+mkdir -p "$source_dir"
+assets=()
+while IFS= read -r asset; do
+  assets+=("$asset")
+  cp "$SCRIPT_DIR/$asset" "$source_dir/$asset"
+done < <({ monday_runtime_assets; monday_controller_assets; } | sort -u)
+
+payload="$ROOT/payload"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$payload"
+chmod 0755 "$payload"
+payload_sha=$(monday_sha256_file "$payload")
+runtime_sha=$(monday_rust_lob_runtime_contract_sha256 "$source_dir")
+bundle="$ROOT/deployment.tar"
+COPYFILE_DISABLE=1 tar -C "$source_dir" -cf "$bundle" "${assets[@]}"
+bundle_sha=$(monday_sha256_file "$bundle")
+manifest="$ROOT/release.json"
+jq -cS -n --arg uri oss://bucket/payload --arg sha "$payload_sha" \
+  --arg runtime "$runtime_sha" --arg source "$(printf 'a%.0s' {1..40})" \
+  --arg bundle oss://bucket/controller --arg bundle_sha "$bundle_sha" \
+  '{schema:"monday.rust_lob_controller_release.v2",control_plane_version:2,
+    topology:"stable",artifact_uri:$uri,artifact_sha256:$sha,
+    runtime_contract_sha256:$runtime,deployment_source_revision:$source,
+    deployment_bundle_uri:$bundle,deployment_bundle_sha256:$bundle_sha}' >"$manifest"
+
+publish_controller_release "$payload" "$bundle" "$manifest" "$ROOT" \
+  >/dev/null
+controller_sha=$(monday_sha256_file "$manifest")
+controller="$ROOT/opt/monday/releases/binance-lob-controller/$controller_sha"
+[[ -d $controller && -L $controller/binance-lob-archiver ]]
+monday_verify_controller_release "$ROOT" "$controller_sha"
+# The aggregate slice filename contains literal backslashes.  Its sidecar row
+# must stay raw (no GNU leading escape marker) and remain checkable by the
+# host checksum utility.
+slice_asset='system-binance\x2dlob\x2darchiver\x2dproduction.slice'
+slice_record=$(grep -F "deployment/$slice_asset" "$controller/deployment.sha256")
+slice_digest=$(monday_sha256_file "$controller/deployment/$slice_asset")
+[[ -n $slice_record && ${slice_record:0:1} != "\\" ]]
+[[ $slice_record == "$slice_digest  deployment/$slice_asset" ]]
+(cd "$controller" && sha256sum --check --strict deployment.sha256 >/dev/null)
+publish_controller_release "$payload" "$bundle" "$manifest" "$ROOT" \
+  | grep -Fq 'already published'
+[[ ! -e "$ROOT/opt/monday/releases/binance-lob-controller/active" ]]
+
+# A tampered aggregate row must fail closed, then the original sidecar must
+# continue to verify after restoration.
+checksum_backup="$ROOT/deployment.sha256.valid"
+checksum_file="$controller/deployment.sha256"
+cp -p "$checksum_file" "$checksum_backup"
+chmod u+w "$checksum_file"
+slice_line_number=$(grep -nF "deployment/$slice_asset" "$checksum_file" | cut -d: -f1)
+awk -v target_line="$slice_line_number" \
+  'NR == target_line { print $0 "tampered"; next } { print }' \
+  "$checksum_file" >"$ROOT/deployment.sha256.tampered"
+cat "$ROOT/deployment.sha256.tampered" >"$checksum_file"
+rm -f "$ROOT/deployment.sha256.tampered"
+if monday_verify_controller_release "$ROOT" "$controller_sha" >/dev/null 2>&1; then
+  printf 'controller verification accepted a tampered aggregate checksum\n' >&2
+  exit 1
+fi
+cp -p "$checksum_backup" "$checksum_file"
+chmod 0444 "$checksum_file"
+monday_verify_controller_release "$ROOT" "$controller_sha"
+
+if jq '.control_plane_version = 1' "$manifest" >"$ROOT/v1.json"; then
+  if publish_controller_release "$payload" "$bundle" "$ROOT/v1.json" "$ROOT" \
+    >/dev/null 2>&1; then
+    printf 'accepted a V1 controller manifest\n' >&2
+    exit 1
+  fi
+fi
+
+duplicate_bundle="$ROOT/duplicate.tar"
+cp "$bundle" "$duplicate_bundle"
+COPYFILE_DISABLE=1 tar -C "$source_dir" -rf "$duplicate_bundle" "${assets[0]}"
+duplicate_sha=$(monday_sha256_file "$duplicate_bundle")
+jq --arg sha "$duplicate_sha" '.deployment_bundle_sha256 = $sha' "$manifest" >"$ROOT/duplicate.json"
+if publish_controller_release "$payload" "$duplicate_bundle" "$ROOT/duplicate.json" "$ROOT" \
+  >/dev/null 2>&1; then
+  printf 'accepted a duplicate-member deployment archive\n' >&2
+  exit 1
+fi
+
+printf 'unexpected controller payload\n' >"$source_dir/unexpected.txt"
+extra_bundle="$ROOT/extra.tar"
+cp "$bundle" "$extra_bundle"
+COPYFILE_DISABLE=1 tar -C "$source_dir" -rf "$extra_bundle" unexpected.txt
+extra_sha=$(monday_sha256_file "$extra_bundle")
+jq --arg sha "$extra_sha" '.deployment_bundle_sha256 = $sha' "$manifest" >"$ROOT/extra.json"
+if publish_controller_release "$payload" "$extra_bundle" "$ROOT/extra.json" "$ROOT" \
+  >/dev/null 2>&1; then
+  printf 'accepted an unexpected deployment archive member\n' >&2
+  exit 1
+fi
+
+# Release transfers the fixed publisher through the digest-checked OSS bundle,
+# not inline in Cloud Assistant. Keep the Base64 command below the 16 KiB
+# RunCommand limit so a future change cannot reintroduce oversized content.
+release_script="$SCRIPT_DIR/publish-rust-lob-pair-release.sh"
+for forbidden in fixed_publisher_b64 fixed_lib_b64; do
+  if grep -Fq "$forbidden" "$release_script"; then
+    printf 'release command still inlines %s\n' "$forbidden" >&2
+    exit 1
+  fi
+done
+release_line() {
+  awk -v first="$1" -v second="$2" -v third="${3:-}" \
+    'index($0, first) && index($0, second) && (third == "" || index($0, third)) { print NR; exit }' \
+    "$release_script"
+}
+bundle_check_line=$(release_line "\$bundle_sha" 'deployment.tar' 'sha256sum --check --strict')
+extract_publisher_line=$(release_line 'tar -xOf' 'host-rust-lob-controller-release.sh')
+extract_lib_line=$(release_line 'tar -xOf' 'rust-lob-control-plane-lib.sh')
+publisher_check_line=$(release_line 'fixed-publisher.sh' 'sha256sum --check --strict')
+lib_check_line=$(release_line 'rust-lob-control-plane-lib.sh' 'sha256sum --check --strict')
+execute_line=$(release_line 'bash' 'fixed-publisher.sh' 'payload')
+[[ $bundle_check_line =~ ^[0-9]+$ && $extract_publisher_line =~ ^[0-9]+$ \
+  && $extract_lib_line =~ ^[0-9]+$ && $publisher_check_line =~ ^[0-9]+$ \
+  && $lib_check_line =~ ^[0-9]+$ && $execute_line =~ ^[0-9]+$ ]] \
+  || { printf 'release command transport/check sequence is incomplete\n' >&2; exit 1; }
+(( bundle_check_line < extract_publisher_line \
+  && extract_publisher_line < extract_lib_line \
+  && extract_lib_line < publisher_check_line \
+  && extract_lib_line < lib_check_line \
+  && publisher_check_line < execute_line \
+  && lib_check_line < execute_line ))
+
+# The release script deliberately refuses a dirty checkout. Build a minimal
+# clean fixture repository so this test exercises its real identity guard.
+command_repo="$ROOT/release-command-repo"
+mkdir -p "$command_repo/deployment/aliyun"
+while IFS= read -r asset; do
+  cp -p "$SCRIPT_DIR/$asset" "$command_repo/deployment/aliyun/$asset"
+done < <({ monday_runtime_assets; monday_controller_assets; } | sort -u)
+cp -p "$release_script" "$command_repo/deployment/aliyun/publish-rust-lob-pair-release.sh"
+git -C "$command_repo" init -q
+git -C "$command_repo" config user.name monday-test
+git -C "$command_repo" config user.email monday-test@example.invalid
+git -C "$command_repo" add deployment/aliyun
+git -C "$command_repo" commit -qm 'release command fixture'
+source_revision=$(git -C "$command_repo" rev-parse HEAD)
+dry_run=$(MONDAY_CONTROL_PLANE_DRY_RUN=1 MONDAY_CONTROL_PLANE_TEST=1 \
+  "$command_repo/deployment/aliyun/publish-rust-lob-pair-release.sh" \
+  --instance i-fixture --artifact-uri oss://bucket/payload \
+  --artifact-sha256 "$(printf 'd%.0s' {1..64})" --source-revision "$source_revision")
+jq -e '.operation == "release" and (.command_bytes | type == "number" and . <= 16384)' \
+  <<<"$dry_run" >/dev/null
+
+printf 'controller V2 release contract passed\n'

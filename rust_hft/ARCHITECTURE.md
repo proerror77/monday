@@ -67,7 +67,7 @@ The research crates do not depend on execution adapters and expose no order, can
 
 Monday is one trading system. Venue variation lives behind the market-data and
 execution interfaces, with one Adapter per exchange. The existing Binance,
-Polymarket, OKX, Hyperliquid, and other Adapters share the same runtime-owned
+Polymarket, OKX, and other Adapters share the same runtime-owned
 risk, OMS, reconciliation, cancellation, and execution authority.
 
 Prediction markets are a market-family module at `prediction-markets`, not a

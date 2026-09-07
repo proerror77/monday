@@ -1,24 +1,26 @@
 ---
 name: monday-delivery-status
-description: Report Monday source-delivery truth as separate Code, CI, merge, release, runtime, and readback states with exact live identities. Use for "现在卡在哪里", "是否完成", "能否上线", PR/CI, release, deployment, or shipped claims. For evidence inside a research run, use monday-research-evidence-audit instead.
+description: Verify requested Monday Code, PR/CI, release, or deployment states with direct evidence. Excludes brief implementation progress and evidence inside research runs.
 ---
 
 # Monday Delivery Status
 
-Produce a read-only status report. Never infer a later state from an earlier one.
+Produce a read-only report of the states the user asked to verify.
+The states are evidence labels, not required implementation steps. Never infer a
+later state from an earlier one.
 
 ## Workflow
 
-1. Identify the requested branch, PR, release, service, and environment. If the user names only a local change, start from the current branch and `HEAD`.
-2. Read local branch, `HEAD`, worktree status, and upstream without changing files.
-3. Refresh live GitHub evidence. Read the PR head SHA, merge state, required checks, reviews, target branch, and latest relevant workflow or release artifact.
-4. Read deployment and runtime state only when the target and access path are known. Record the deployed image/SHA, configuration identity, health, and named controller if present.
-5. Read the final external artifact or service independently. Verify that its immutable identity and configuration match `Runtime`; otherwise mark `Runtime` or `Readback` `unknown`. A publish command or healthy process is not readback.
-6. Mark each state `passed`, `failed`, `pending`, `blocked`, or `unknown`. Use `unknown` when direct evidence is unavailable.
+1. Identify the requested states and the relevant branch, PR, release, service, or environment. Inspect another state only when its evidence is necessary to prove a requested claim; do not audit every earlier state automatically.
+2. Read local branch, `HEAD`, worktree status, and upstream when local Code is in scope or needed to identify the target. A named PR's CI can be verified from its current GitHub head and required checks without a local worktree audit.
+3. Refresh GitHub only for the requested claim or its necessary identity dependencies.
+4. Read deployment and runtime only when Runtime or Readback is requested and the target and access path are known.
+5. Read the external artifact or service independently only for requested Readback. Verify that its immutable identity and configuration match Runtime.
+6. Mark requested states as `passed`, `failed`, `pending`, `blocked`, or `unknown`. Cite necessary dependency evidence without turning unrequested states into additional completion requirements.
 
 ## State contract
 
-- **Code**: exact commit exists and focused local validation passed; any failed focused check makes this state `failed`.
+- **Code**: the implementation is identified and relevant local validation passed. For committed work, record the exact SHA; for uncommitted work, record the base SHA and reviewed diff, including relevant untracked file contents. Never label working-tree changes as committed or published. A failed relevant check makes this state `failed`; unavailable required validation makes it `unknown`.
 - **CI**: required checks for that exact PR head finished successfully.
 - **Merge**: GitHub reports the exact head merged into the intended base.
 - **Release**: an artifact or image exists and its immutable identity matches the merged commit.
@@ -31,11 +33,13 @@ A production Gate failure blocks cutover only. It never blocks or downgrades Cod
 
 ## Stop conditions
 
-- Stop mutation entirely; this Skill never reruns CI, merges, deploys, restarts, or changes configuration.
-- Stop and report `blocked` if branch or PR head moves during the audit.
+- Audit actions are read-only; never mutate merely to improve the reported state.
+- If implementation is already active, answer a brief progress question from current task evidence and continue the implementation without invoking this audit.
+- Do not carry this audit workflow into a later implementation turn.
+- Stop and report `blocked` if the audited branch, PR head, or in-scope working-tree contents move during the audit.
 - Report authentication, network, or permission gaps as `unknown`; do not reuse stale screenshots or old green runs.
 
 ## Output
 
-Return one row per state with: `State | Result | Exact identity | Direct evidence | Blocker/next check`.
-End with one sentence naming the earliest incomplete state; that is the current blocker.
+Return one row per requested state with: `State | Result | Exact identity | Direct evidence | Blocker/next check`.
+End with the earliest incomplete state within the requested scope, or explicitly state that all requested states passed. Unrequested later states are not blockers.

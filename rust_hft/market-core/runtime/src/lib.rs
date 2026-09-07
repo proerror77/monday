@@ -122,6 +122,7 @@ risk:
 
     #[cfg(feature = "full_runtime_test")]
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_system_runtime_full_lifecycle() {
         // 完整的 from_yaml -> build -> start -> stop 流程測試
         // 運行方式：cargo test -p hft-runtime --features full_runtime_test
@@ -170,7 +171,10 @@ risk:
 
         // 測試系統狀態
         let account_view = system.get_account_view().await;
-        assert!(account_view.cash_balance >= 0.0, "Account view 應該有效");
+        assert!(
+            account_view.cash_balance >= rust_decimal::Decimal::ZERO,
+            "Account view 應該有效"
+        );
 
         // 測試 stop
         let stop_result = system.stop().await;

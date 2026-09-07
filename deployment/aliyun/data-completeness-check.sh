@@ -28,8 +28,8 @@
 #     (~8.4k objects/day) and is checked for hour presence only.
 # expected_hours/present_hours/missing_partitions count expected hours only;
 # latest_landed_hour/lag_seconds also consider the in-flight current hour.
-# Any missing partition, triplet violation, or OSS listing failure is a
-# breach: the check fails closed and exits nonzero.
+# Any missing expected partition, triplet violation in an expected hour, or
+# OSS listing failure is a breach: the check fails closed and exits nonzero.
 #
 # The script is READ-ONLY toward OSS and the host: it only lists prefixes. It
 # emits one JSON report (or a human ok:/breach: summary) and runs from the
@@ -49,7 +49,7 @@
 #   COMPLETENESS_GRACE_HOURS_{SPOT,USDM,BYBIT,POLYMARKET,REFERENCE}
 #                                 per-dataset grace override
 #   COMPLETENESS_START_EPOCH_USDM
-#                                 optional UTC epoch when the LOB-only USD-M
+#                                 optional UTC epoch when the combined USD-M
 #                                 dataset became authoritative; when omitted,
 #                                 the first landed hour in the window is used
 #                                 as a fail-closed activation boundary
@@ -338,6 +338,18 @@ check_dataset() {
     fi
   done <"$HOURS_FILE"
 
+  # Triplet publication is intentionally non-atomic across data, manifest and
+  # _SUCCESS.  Ignore incomplete objects in current/in-grace hours, just as we
+  # ignore missing partitions there; only settled expected hours may breach.
+  eligible_violations_file="$TMP_DIR/$label.eligible-violations"
+  awk -v now="$NOW_SEC" -v grace="$grace" -v start="$start_epoch" '
+    NR == FNR { hour[$2 SUBSEP $3] = $1; next }
+    {
+      h = hour[$2 SUBSEP $3]
+      if (h != "" && h >= start && h + 3600 + grace * 3600 <= now) print
+    }
+  ' "$HOURS_FILE" "$violations_file" >"$eligible_violations_file"
+  mv "$eligible_violations_file" "$violations_file"
   violation_count=$(wc -l <"$violations_file" | tr -d ' ')
 
   if [ -n "$missing" ]; then
@@ -391,7 +403,7 @@ check_dataset binance-spot \
   'lake/raw/venue=binance/market=spot/dataset=spot_all/shard=all/' \
   triplet "$GRACE_SPOT" ""
 check_dataset binance-usdm \
-  'lake/raw/venue=binance/market=usdm/dataset=usdm_perpetual_top100_lob/shard=all/' \
+  'lake/raw/venue=binance/market=usdm/dataset=usdm_perpetual_top100_lob_trade/shard=all/' \
   triplet "$GRACE_USDM" "$START_EPOCH_USDM"
 check_dataset bybit-options \
   'lake/raw/venue=bybit/market=option/dataset=options_quotes/' \

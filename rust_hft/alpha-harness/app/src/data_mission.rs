@@ -11,9 +11,9 @@ use hft_research_manifest::{
     CexReplayDatasetManifestV1, CexReplayDatasetManifestV2, CexReplayDatasetManifestV3,
     CexReplayDatasetManifestV4, CexReplayDatasetManifestV5, CexReplaySeriesV1, CexReplaySnapshotV1,
     CexReplaySnapshotV2, CexReplaySnapshotV3, CexReplaySnapshotV4, CexReplaySnapshotV5,
-    CEX_REPLAY_DATASET_KIND, CEX_REPLAY_DATASET_SCHEMA_V1, CEX_REPLAY_DATASET_SCHEMA_V2,
-    CEX_REPLAY_DATASET_SCHEMA_V3, CEX_REPLAY_DATASET_SCHEMA_V4, CEX_REPLAY_DATASET_SCHEMA_V5,
-    CEX_REPLAY_SNAPSHOT_SCHEMA_V3, CEX_REPLAY_SNAPSHOT_SCHEMA_V4,
+    CEX_MODALITY_AGGREGATE_TRADE, CEX_REPLAY_DATASET_KIND, CEX_REPLAY_DATASET_SCHEMA_V1,
+    CEX_REPLAY_DATASET_SCHEMA_V2, CEX_REPLAY_DATASET_SCHEMA_V3, CEX_REPLAY_DATASET_SCHEMA_V4,
+    CEX_REPLAY_DATASET_SCHEMA_V5, CEX_REPLAY_SNAPSHOT_SCHEMA_V3, CEX_REPLAY_SNAPSHOT_SCHEMA_V4,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -131,7 +131,13 @@ pub(crate) fn validate_cex_replay_features(
     {
         bail!("feature time bounds do not match the CEX replay snapshot");
     }
-    let expected_modalities = BTreeSet::from([DataModality::Lob, DataModality::TradeTick]);
+    let mut expected_modalities = BTreeSet::from([DataModality::Lob]);
+    if snapshot
+        .required_modalities
+        .contains(CEX_MODALITY_AGGREGATE_TRADE)
+    {
+        expected_modalities.insert(DataModality::TradeTick);
+    }
     if features.modalities != expected_modalities {
         bail!("feature modalities do not match the CEX replay snapshot");
     }
@@ -1535,7 +1541,7 @@ mod tests {
                         "binance-usdm-lob".to_string(),
                         source_revision.clone(),
                     )]),
-                    modalities: BTreeSet::from([DataModality::Lob, DataModality::TradeTick]),
+                    modalities: BTreeSet::from([DataModality::Lob]),
                     features: BTreeMap::from([
                         ("ask_depth_top5".to_string(), 10.0 + index as f64),
                         ("bid_depth_top5".to_string(), 9.0 + index as f64),
@@ -1580,8 +1586,7 @@ mod tests {
             symbol: "BTCUSDT".to_string(),
             replay_clock: hft_research_manifest::CEX_REPLAY_CLOCK_RECEIVED_AT_NS.to_string(),
             required_modalities: BTreeSet::from([
-                hft_research_manifest::CEX_MODALITY_LOB.to_string(),
-                hft_research_manifest::CEX_MODALITY_AGGREGATE_TRADE.to_string(),
+                hft_research_manifest::CEX_MODALITY_LOB.to_string()
             ]),
             source_segments: vec![hft_research_manifest::CexReplaySegmentIdentity {
                 content_sha256: source_content_sha256,

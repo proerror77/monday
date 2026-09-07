@@ -8,7 +8,7 @@ const POLICY_TARGET: &str = "x86_64-unknown-linux-gnu";
 const POLICY_GRAPH_SCHEMA: &str = "prediction-policy-dependencies.v5";
 const POLICY_GRAPH_FILE: &str = "prediction-policy-dependencies.linux.txt";
 const CANONICAL_POLICY_DEPENDENCY_HASH_FILE: &str = "prediction-policy-dependencies.linux.sha256";
-const POLICY_INPUTS: [(&str, &str); 12] = [
+const POLICY_INPUTS: [(&str, &str); 11] = [
     ("Cargo.lock", "Cargo.lock"),
     ("Cargo.toml", "Cargo.toml"),
     (
@@ -34,10 +34,6 @@ const POLICY_INPUTS: [(&str, &str); 12] = [
     (
         "../market-core/core/Cargo.toml",
         "../market-core/core/Cargo.toml",
-    ),
-    (
-        "../market-core/instrument/Cargo.toml",
-        "../market-core/instrument/Cargo.toml",
     ),
     (
         "../market-core/integration/Cargo.toml",

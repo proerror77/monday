@@ -8,7 +8,6 @@ description = "事前風控：額度/速率/冷卻/時間窗/陳舊度/滑點"
 serde = { workspace = true }
 hft-core = { package = "hft-core", path = "../../market-core/core" }
 ports = { package = "hft-ports", path = "../../market-core/ports" }
-instrument = { package = "hft-instrument", path = "../../market-core/instrument" }
 rust_decimal = { workspace = true }
 tracing = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }

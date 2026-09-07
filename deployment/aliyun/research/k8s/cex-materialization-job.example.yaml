@@ -17,8 +17,11 @@ metadata:
     research.monday/output-write: unique-prefix-plus-readback
 spec:
   suspend: true
+  completionMode: NonIndexed
+  completions: 1
+  parallelism: 1
   backoffLimit: 0
-  activeDeadlineSeconds: 3600
+  activeDeadlineSeconds: 7200
   ttlSecondsAfterFinished: 86400
   template:
     metadata:
@@ -54,13 +57,15 @@ spec:
             - --raw-root
             - /lake/raw
             - --reference-root
-            - /lake/reference
+            - /reference/lake/raw
             - --output-root
             - /lake/output
             - --work-dir
             - /work
             - --binary-dir
             - /usr/local/bin
+            - --role
+            - all
           resources:
             requests:
               cpu: "3500m"
@@ -85,7 +90,7 @@ spec:
               mountPath: /lake/raw
               readOnly: true
             - name: reference
-              mountPath: /lake/reference
+              mountPath: /reference/lake/raw
               readOnly: true
             - name: output
               mountPath: /lake/output

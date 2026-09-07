@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 
 const MAX_SUBMISSION_BYTES: u64 = 1024 * 1024;
-const ACTIVE_DEADLINE_SECONDS: u64 = 3600;
+const ACTIVE_DEADLINE_SECONDS: u64 = 21_608;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -849,6 +849,7 @@ mod tests {
 
         assert_eq!(job["spec"]["suspend"], true);
         assert_eq!(job["spec"]["backoffLimit"], 0);
+        assert_eq!(job["spec"]["activeDeadlineSeconds"], 21_608);
         assert_eq!(
             job["spec"]["template"]["spec"]["automountServiceAccountToken"],
             false

@@ -75,7 +75,7 @@ fn execute_mission_inner(
     resume: bool,
     governed_gp: Option<(&CexGpPolicyV1, &str)>,
 ) -> anyhow::Result<MissionRunReport> {
-    validate_live_mission_args(args)?;
+    validate_mission_args(args, governed_gp.is_some())?;
     let mut store = AlphaStore::open(&args.db)?;
     let mission = store.get_mission(&args.mission_id)?;
     match (resume, &mission.status) {
@@ -120,7 +120,12 @@ fn execute_mission_inner(
         )?;
         bail!(CEX_FACTOR_BANK_MCTS_OPERATOR_ERROR);
     }
-    let evaluator = FormulaEvaluator::for_mission(&mission).map_err(anyhow::Error::msg)?;
+    let evaluator = if let Some((gp_policy, _)) = governed_gp {
+        FormulaEvaluator::for_governed_mission(&mission, gp_policy)
+    } else {
+        FormulaEvaluator::for_mission(&mission)
+    }
+    .map_err(anyhow::Error::msg)?;
     let proposal_engine = build_engine(args, &dataset, &mission, governed_gp)?;
     let mut kernel = AutoResearchKernel::new(&mut store, proposal_engine, evaluator);
     let outcome = kernel.run(
@@ -383,7 +388,6 @@ fn build_engine(
     mission: &ResearchMission,
     governed_gp: Option<(&CexGpPolicyV1, &str)>,
 ) -> anyhow::Result<Box<dyn ProposalEngine>> {
-    validate_live_mission_args(args)?;
     let fields = args
         .feature_fields
         .iter()
@@ -401,7 +405,9 @@ fn build_engine(
         );
     }
     let fields = fields.into_iter().collect::<Vec<_>>();
-    validate_live_feature_fields(&fields)?;
+    if governed_gp.is_none() {
+        validate_live_feature_fields(&fields)?;
+    }
     let primary = fields[0].clone();
     let engine: Box<dyn ProposalEngine> = match args.engine {
         EngineChoice::Gp => match governed_gp {
@@ -460,6 +466,10 @@ pub(crate) fn validate_live_formula_engine(engine: EngineChoice) -> anyhow::Resu
 }
 
 pub(crate) fn validate_live_mission_args(args: &RunMissionArgs) -> anyhow::Result<()> {
+    validate_mission_args(args, false)
+}
+
+fn validate_mission_args(args: &RunMissionArgs, governed_research: bool) -> anyhow::Result<()> {
     validate_live_formula_engine(args.engine)?;
     if args.feature_fields.is_empty()
         || args
@@ -469,7 +479,11 @@ pub(crate) fn validate_live_mission_args(args: &RunMissionArgs) -> anyhow::Resul
     {
         bail!("mission feature fields are required");
     }
-    validate_live_feature_fields(&args.feature_fields)
+    if governed_research {
+        Ok(())
+    } else {
+        validate_live_feature_fields(&args.feature_fields)
+    }
 }
 
 pub(crate) fn validate_live_feature_fields(fields: &[String]) -> anyhow::Result<()> {
@@ -523,6 +537,18 @@ mod tests {
             error.to_string(),
             "feature fields span live event domains: snapshot and bar"
         );
+    }
+
+    #[test]
+    fn live_feature_fields_reject_campaign_only_trade_flow() {
+        let error = validate_live_feature_fields(&[
+            alpha_domain::CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD.to_string(),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("aggregate_trade_flow_imbalance is not live executable"));
     }
 
     #[test]

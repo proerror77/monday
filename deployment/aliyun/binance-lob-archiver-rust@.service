@@ -18,6 +18,7 @@ ExecStart=/opt/monday/bin/binance-lob-archiver-shadow
 Restart=always
 RestartSec=5
 RuntimeMaxSec=21600
+KillMode=mixed
 TimeoutStopSec=600
 NoNewPrivileges=true
 PrivateTmp=true

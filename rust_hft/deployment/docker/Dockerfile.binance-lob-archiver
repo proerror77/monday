@@ -21,6 +21,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --no-default-features \
     -p hft-collector \
     --bin binance-lob-archiver \
+    --bin binance-usdm-account-archiver \
     --bin binance-usdm-reference-collector \
     --bin binance-usdm-reference-artifact-verifier \
     --bin binance-usdm-reference-upload \
@@ -30,6 +31,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --bin bybit-options-archiver \
     && install -D -m 0755 /work/target/release/binance-lob-archiver \
        /out/bin/binance-lob-archiver \
+    && install -D -m 0755 /work/target/release/binance-usdm-account-archiver \
+       /out/bin/binance-usdm-account-archiver \
     && install -D -m 0755 /work/target/release/polymarket-raw-ops \
        /out/bin/polymarket-raw-ops \
     && install -D -m 0755 /work/target/release/bybit-options-archiver \
@@ -77,6 +80,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && chown -R hftcollector:hftcollector /data/monday
 
 COPY --from=builder /out/bin/binance-lob-archiver /usr/local/bin/binance-lob-archiver
+COPY --from=builder /out/bin/binance-usdm-account-archiver /usr/local/bin/binance-usdm-account-archiver
 COPY --from=builder /out/bin/polymarket-raw-ops /usr/local/bin/polymarket-raw-ops
 COPY --from=builder /out/bin/bybit-options-archiver /usr/local/bin/bybit-options-archiver
 COPY --from=builder /out/bin/binance-usdm-reference-collector /usr/local/bin/binance-usdm-reference-collector

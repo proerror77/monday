@@ -4,8 +4,6 @@ on:
   workflow_dispatch:
   push:
     branches: [main, develop]
-    paths-ignore:
-      - "rust_hft/prediction-markets/**"
   pull_request:
     branches: [main, develop]
 
@@ -24,6 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       jobs: ${{ steps.scope.outputs.jobs }}
+      owning_packages: ${{ steps.scope.outputs.owning_packages }}
       loop: ${{ steps.scope.outputs.loop }}
       handoff: ${{ steps.scope.outputs.handoff }}
       json: ${{ steps.scope.outputs.json }}
@@ -58,6 +57,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       jobs: ${{ steps.scope.outputs.jobs }}
+      owning_packages: ${{ steps.scope.outputs.owning_packages }}
       loop: ${{ steps.scope.outputs.loop }}
       handoff: ${{ steps.scope.outputs.handoff }}
       json: ${{ steps.scope.outputs.json }}
@@ -72,6 +72,7 @@ jobs:
         env:
           SELECTOR_RESULT: ${{ needs.selector.result }}
           SELECTED_JOBS: ${{ needs.selector.outputs.jobs }}
+          SELECTED_OWNING_PACKAGES: ${{ needs.selector.outputs.owning_packages }}
           SELECTED_LOOP: ${{ needs.selector.outputs.loop }}
           SELECTED_HANDOFF: ${{ needs.selector.outputs.handoff }}
           SELECTED_JSON: ${{ needs.selector.outputs.json }}
@@ -84,9 +85,11 @@ jobs:
         run: |
           if [[ "$SELECTOR_RESULT" == success && "$SELECTED_COMPLETE" == true ]] &&
              [[ "$SELECTED_JOBS" =~ ^,[a-z0-9/-]*(,[a-z0-9/-]+)*,$ ]] &&
+             [[ "$SELECTED_OWNING_PACKAGES" =~ ^,[A-Za-z0-9_-]*(,[A-Za-z0-9_-]+)*,$ ]] &&
              [[ "$SELECTED_LOOP,$SELECTED_HANDOFF,$SELECTED_JSON,$SELECTED_ONDO,$SELECTED_COLLECTOR,$SELECTED_CONTROL,$SELECTED_FOCUSED,$SELECTED_TOOLCHAIN" =~ ^(true|false)(,(true|false)){7}$ ]]; then
             printf '%s\n' \
               "jobs=$SELECTED_JOBS" \
+              "owning_packages=$SELECTED_OWNING_PACKAGES" \
               "loop=$SELECTED_LOOP" \
               "handoff=$SELECTED_HANDOFF" \
               "json=$SELECTED_JSON" \
@@ -97,7 +100,8 @@ jobs:
               "toolchain=$SELECTED_TOOLCHAIN"
           else
             printf '%s\n' \
-              'jobs=,ci/rust,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,' \
+              'jobs=,ci/rust-shell-scripts,ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,' \
+              'owning_packages=,,' \
               'loop=true' \
               'handoff=true' \
               'json=true' \
@@ -107,6 +111,67 @@ jobs:
               'focused=true' \
               'toolchain=true'
           fi >> "$GITHUB_OUTPUT"
+
+      - name: Checkout collector controls
+        if: steps.scope.outputs.control == 'true'
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install shellcheck
+        if: steps.scope.outputs.control == 'true'
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Verify Campaign controller recovery
+        if: steps.scope.outputs.control == 'true'
+        run: |
+          bash -n deployment/aliyun/research/scripts/campaign-cycle-controller.sh \
+            deployment/aliyun/research/test-campaign-cycle-controller.sh
+          shellcheck -e SC2154 \
+            deployment/aliyun/research/scripts/campaign-cycle-controller.sh \
+            deployment/aliyun/research/test-campaign-cycle-controller.sh
+          deployment/aliyun/research/test-campaign-cycle-controller.sh
+
+      - name: Verify collector release shell contracts
+        if: steps.scope.outputs.control == 'true'
+        working-directory: rust_hft
+        run: |
+          for script in ../deployment/aliyun/*.sh; do
+            bash -n "$script"
+          done
+          shellcheck ../deployment/aliyun/*.sh
+          ../deployment/aliyun/test-polymarket-market-tape-upload-contract.sh
+          ../deployment/aliyun/test-polymarket-reference-upload-contract.sh
+          ../deployment/aliyun/test-monday-collector-health.sh
+          ../deployment/aliyun/test-rust-lob-control-plane.sh
+          ../deployment/aliyun/test-rust-lob-controller-release.sh
+          ../deployment/aliyun/test-rust-lob-recovery-queue.sh
+          ../deployment/aliyun/test-rust-lob-restore.sh
+          ../deployment/aliyun/test-polymarket-raw-ops-stage.sh
+          ../deployment/aliyun/test-trading-ecs-host-contract.sh
+          ../deployment/aliyun/test-binance-fee-release-contract.sh
+          ../deployment/aliyun/test-binance-usdm-account-release-contract.sh
+          ../deployment/aliyun/test-binance-fee-cutover.sh
+
+      - name: Summarize check plan
+        env:
+          SELECTED_JOBS: ${{ steps.scope.outputs.jobs }}
+          SELECTED_OWNING_PACKAGES: ${{ steps.scope.outputs.owning_packages }}
+          SELECTED_CONTROL: ${{ steps.scope.outputs.control }}
+        run: |
+          printf '### CI check plan\n\n- Jobs: %s\n- Direct Rust package tests: %s\n- Collector control contract: %s\n' \
+            "$SELECTED_JOBS" "$SELECTED_OWNING_PACKAGES" "$SELECTED_CONTROL" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  rust_shell_scripts:
+    name: Rust shell scripts
+    needs: scope
+    if: ${{ contains(needs.scope.outputs.jobs, ',ci/rust-shell-scripts,') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Check shell syntax
+        run: find rust_hft/scripts -type f -name '*.sh' -exec bash -n {} \;
 
   rust:
     name: Rust Workspace
@@ -174,6 +239,20 @@ jobs:
         if: needs.scope.outputs.loop == 'true'
         run: cargo test -p alpha-domain -p alpha-store -p alpha-engine -p alpha-onnx-evaluator -p alpha-harness -p hft-harnessctl -p hft-research-ml --locked
 
+      - name: Test directly changed Rust packages
+        if: needs.scope.outputs.owning_packages != ',,'
+        env:
+          OWNING_PACKAGES: ${{ needs.scope.outputs.owning_packages }}
+        run: |
+          package_list=${OWNING_PACKAGES#,}
+          package_list=${package_list%,}
+          IFS=',' read -ra packages <<<"$package_list"
+          args=()
+          for package in "${packages[@]}"; do
+            args+=(-p "$package")
+          done
+          cargo test "${args[@]}" --locked
+
       - name: Verify signed runtime handoff
         if: needs.scope.outputs.handoff == 'true'
         run: |
@@ -210,7 +289,6 @@ jobs:
         if: needs.scope.outputs.control == 'true'
         run: |
           ../deployment/aliyun/test-polymarket-raw-ops-control-plane.sh
-          ../deployment/aliyun/test-polymarket-market-tape-upload-contract.sh
           cargo test -p hft-collector --lib systemd_reference_resource_envelope_is_pinned --locked
 
       - name: Build focused packages
@@ -243,7 +321,7 @@ jobs:
   rust_fast_gates:
     name: Rust Fast Gates
     needs: scope
-    if: ${{ contains(needs.scope.outputs.jobs, ',ci/rust,') }}
+    if: ${{ contains(needs.scope.outputs.jobs, ',ci/rust,') || contains(needs.scope.outputs.jobs, ',ci/rust-shell-scripts,') }}
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
@@ -388,16 +466,6 @@ jobs:
             --allow-match-regex "${legacy_runtime_reference_allowlist}" \
             "${inline_command_pathspecs[@]}"
 
-          rust_template_pathspecs=(
-            ':(glob)rust_hft/.specify/templates/*.md'
-            ':(glob)rust_hft/.specify/templates/**/*.md'
-          )
-          reject_python_text \
-            "Python scaffolding in active Rust templates" \
-            'actions/setup-pyth[o]n@|astral-sh/setup-u[v]@|(^|[^[:alnum:]_])(python([0-9]+([.][0-9]+)?)?|pip([0-9]+)?|pipx|pytest|poetry|pdm|rye|conda|mamba|hatch|tox|virtualenv|pyproject[.]toml|requirements[^/[:space:]]*[.]txt|setup[.]py|[^/[:space:]`"]+[.]py)([^[:alnum:]_]|$)|(^|[;&|()/[:space:]])uv[[:space:]]+(run|sync|pip|venv|python)([[:space:]]|$)' \
-            --ignore-case \
-            "${rust_template_pathspecs[@]}"
-
           if git grep -n -E '(name = "(burn-tch|tch|torch-sys|pyo3[^"]*|cpython|rust-cpython|python3-sys|rustpython[^"]*)"|^[[:space:]]*(burn-tch|tch|torch-sys|pyo3([-_][A-Za-z0-9_-]+)?|cpython|rust-cpython|python3-sys|rustpython([-_][A-Za-z0-9_-]+)?)[[:space:]]*=)' -- \
             ':(glob)**/Cargo.toml' ':(glob)**/Cargo.lock'; then
             echo "PyTorch/libtorch and Python-runtime Rust bindings are forbidden" >&2
@@ -422,29 +490,10 @@ jobs:
           cargo fmt --check --package hft-harnessctl
           cargo fmt --check --package hft-research-ml
 
-      - name: Install shellcheck
-        if: needs.scope.outputs.control == 'true'
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
-
-      - name: Verify collector release shell contracts
-        if: needs.scope.outputs.control == 'true'
-        working-directory: rust_hft
-        run: |
-          for script in ../deployment/aliyun/*.sh; do
-            bash -n "$script"
-          done
-          shellcheck ../deployment/aliyun/*.sh
-          ../deployment/aliyun/test-rust-lob-control-plane.sh
-          ../deployment/aliyun/test-rust-lob-release-adoption.sh
-          ../deployment/aliyun/test-rust-lob-restore.sh
-          ../deployment/aliyun/test-polymarket-raw-ops-stage.sh
-          ../deployment/aliyun/test-trading-ecs-host-contract.sh
-          ../deployment/aliyun/test-binance-fee-release-contract.sh
-
   market_recorder_contract:
     name: Market Recorder Release Contract
     needs: scope
-    if: needs.scope.outputs.control == 'true'
+    if: ${{ contains(needs.scope.outputs.jobs, ',ci/market-recorder-contract,') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -653,6 +702,7 @@ jobs:
     needs:
       - selector
       - scope
+      - rust_shell_scripts
       - rust
       - rust_fast_gates
       - market_recorder_contract

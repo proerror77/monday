@@ -9,7 +9,6 @@ hft-core = { package = "hft-core", path = "../../market-core/core" }
 hft-infer-onnx = { path = "../infer-onnx" }
 ports = { package = "hft-ports", path = "../../market-core/ports" }
 serde = { workspace = true }
-tracing = "0.1"
 rust_decimal = { workspace = true }
 
 [dev-dependencies]

@@ -8,11 +8,7 @@ description = "LOB Flow driven adaptive grid strategy for crypto venues"
 hft-core = { package = "hft-core", path = "../../../market-core/core" }
 ports = { package = "hft-ports", path = "../../../market-core/ports" }
 serde = { workspace = true }
-serde_json = { workspace = true }
 tracing = { workspace = true }
-rust_decimal = { workspace = true }
-chrono = { workspace = true }
 
 [lib]
 name = "strategy_lob_flow_grid"
-

@@ -1,2185 +1,3192 @@
 #!/usr/bin/env bash
-# Dynamically sourced production functions consume fixture globals and mocks.
-# shellcheck disable=SC1090,SC2016,SC2034,SC2154,SC2317,SC2329
-set -euo pipefail
+set -Eeuo pipefail
+export LC_ALL=C
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
-CUTOVER="$SCRIPT_DIR/host-rust-lob-cutover.sh"
-RESTORE="$SCRIPT_DIR/host-rust-lob-restore.sh"
-GATE="$SCRIPT_DIR/host-rust-lob-shadow-gate.sh"
-SOAK="$SCRIPT_DIR/host-rust-lob-shadow-soak.sh"
-INSTALL_RELEASE="$SCRIPT_DIR/deploy-rust-lob-release.sh"
-SHADOW_UNIT="$SCRIPT_DIR/binance-lob-archiver-rust@.service"
-INVOKE="$SCRIPT_DIR/invoke-rust-lob-operation.sh"
-COLLECTOR_DOCKERFILE="$SCRIPT_DIR/../../rust_hft/deployment/docker/Dockerfile.binance-lob-archiver"
-ARTIFACT_VERIFIER="$SCRIPT_DIR/../../rust_hft/data-pipelines/core/src/binance_market_tape_artifact.rs"
-COLLECTOR="$SCRIPT_DIR/../../rust_hft/tools/collector/src/bin/binance-lob-archiver.rs"
-LOB_ARCHIVER="$SCRIPT_DIR/../../rust_hft/tools/collector/src/lob_archiver.rs"
-ACR_WORKFLOW="$SCRIPT_DIR/../../.github/workflows/acr-publish.yml"
-POLICY="$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq"
-RUNTIME_POLICY="$SCRIPT_DIR/rust-lob-runtime-health-policy.jq"
-SHADOW_USDM_ENV="$SCRIPT_DIR/binance-lob-archiver-rust-usdm.env"
-PRODUCTION_SPOT_ENV="$SCRIPT_DIR/binance-lob-archiver-production-spot.env"
-PRODUCTION_USDM_ENV="$SCRIPT_DIR/binance-lob-archiver-production-usdm.env"
-LIB="$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
-# shellcheck disable=SC1090,SC1091
-. "$LIB"
-"$SCRIPT_DIR/test-rust-lob-shadow-soak.sh"
+export MONDAY_CONTROL_PLANE_FIXTURE_SENTINEL=monday-v2-fixture
+ROOT=$(readlink -f "$(mktemp -d)")
+fixture_root=$ROOT
+trap 'chmod -R u+w "$ROOT" 2>/dev/null || true; rm -rf "$ROOT"' EXIT
+trap 'status=$?; printf "ERR status=%s line=%s command=%s\n" "$status" "$LINENO" "$BASH_COMMAND" >&2' ERR
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/host-rust-lob-controller-release.sh"
+ROOT=$fixture_root
 
-required_memory=11559501824
-[[ $(monday_shadow_memory_admission \
-  "$required_memory" 1073741824 10485760000 0) == "$required_memory" ]] || {
-  printf 'shadow gate memory admission rejected exact headroom\n' >&2
+# Resource Envelope V2 is a single immutable runtime contract: the production
+# template and its aggregate slice carry the pair cap, while each sequential
+# shadow phase has its own smaller envelope.  Keep these assertions before any
+# fixture publication so an old eight-asset/v1 contract fails immediately.
+production_slice_asset='system-binance\x2dlob\x2darchiver\x2dproduction.slice'
+[[ -f "$SCRIPT_DIR/$production_slice_asset" ]] || {
+  printf 'Resource Envelope V2 slice asset is missing\n' >&2
   exit 1
 }
-if monday_shadow_memory_admission \
-  "$((required_memory - 1))" 1073741824 10485760000 0 >/dev/null; then
-  printf 'shadow gate memory admission accepted one byte below the requirement\n' >&2
-  exit 1
-fi
-if monday_shadow_memory_admission 1 1 invalid 0 >/dev/null 2>&1; then
-  printf 'shadow gate memory admission accepted an invalid phase limit\n' >&2
-  exit 1
-fi
-if monday_shadow_memory_admission 999999999999999999999999999999 \
-  1 1 0 >/dev/null 2>&1; then
-  printf 'shadow gate memory admission accepted an overflowing host value\n' >&2
-  exit 1
-fi
-if monday_shadow_memory_admission 1 1 9223372036854775808 \
-  0 >/dev/null 2>&1; then
-  printf 'shadow gate memory admission accepted an overflowing component\n' >&2
-  exit 1
-fi
-if monday_shadow_memory_admission 1 9223372036854775807 \
-  1 >/dev/null 2>&1; then
-  printf 'shadow gate memory admission accepted an overflowing sum\n' >&2
-  exit 1
-fi
-if monday_shadow_memory_admission 1 0 0 >/dev/null 2>&1; then
-  printf 'shadow gate memory admission accepted a zero requirement\n' >&2
-  exit 1
-fi
-calibrated_gate_bytes=4429185024
-[[ $(monday_shadow_memory_admission \
-  "$calibrated_gate_bytes" 1073741824 3355443200) == "$calibrated_gate_bytes" ]] || {
-  printf 'calibrated sequential gate does not fit its upload-drain budget\n' >&2
+[[ $(monday_sha256_file "$SCRIPT_DIR/$production_slice_asset") =~ ^[a-f0-9]{64}$ ]] || {
+  printf 'Resource Envelope V2 slice digest is not a canonical SHA-256\n' >&2
   exit 1
 }
-calibrated_soft_headroom_bytes=1048576
-[[ $(monday_shadow_memory_admission \
-  "$((calibrated_gate_bytes + calibrated_soft_headroom_bytes))" \
-  1073741824 3355443200 "$calibrated_soft_headroom_bytes") \
-  == "$((calibrated_gate_bytes + calibrated_soft_headroom_bytes))" ]] || {
-  printf 'calibrated sequential gate does not reserve production growth to MemoryHigh\n' >&2
+[[ $(monday_runtime_assets | wc -l | tr -d '[:space:]') == 9 ]] || {
+  printf 'Resource Envelope V2 must publish exactly nine runtime assets\n' >&2
+  exit 1
+}
+if grep -Fqx 'Slice=system-binance\x2dlob\x2darchiver\x2dproduction.slice' \
+  "$SCRIPT_DIR/binance-lob-archiver-production@.service"; then
+  printf 'production template must rely on the automatic aggregate slice\n' >&2
+  exit 1
+fi
+grep -Fqx 'MemoryHigh=3072M' "$SCRIPT_DIR/$production_slice_asset" || {
+  printf 'production slice MemoryHigh is not 3072M\n' >&2
+  exit 1
+}
+grep -Fqx 'MemoryMax=3584M' "$SCRIPT_DIR/$production_slice_asset" || {
+  printf 'production slice MemoryMax is not 3584M\n' >&2
+  exit 1
+}
+gate_cleanup_trap_line=$(grep -nF 'trap cleanup EXIT;' "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" | head -n1 | cut -d: -f1)
+gate_slice_create_line=$(grep -nF "printf '[Slice]\\nMemoryHigh=1280M" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" | head -n1 | cut -d: -f1)
+[[ $gate_cleanup_trap_line =~ ^[0-9]+$ && $gate_slice_create_line =~ ^[0-9]+$ \
+  && $gate_cleanup_trap_line -lt $gate_slice_create_line ]] || {
+  printf 'Gate cleanup trap must precede run-scoped slice creation\n' >&2
+  exit 1
+}
+gate_protect_line=$(grep -nF "chmod 0440 \"\$gate_json\" \"\$run_json\" \"\$passed_marker_tmp\"" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" | head -n1 | cut -d: -f1)
+gate_marker_line=$(grep -nF "mv -f -- \"\$passed_marker_tmp\" \"\$passed_marker\"" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" | head -n1 | cut -d: -f1)
+gate_close_dir_line=$(grep -nF "chmod 0550 \"\$evidence_dir\"" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" | head -n1 | cut -d: -f1)
+gate_publish_dir_line=$(grep -nF "mv -- \"\$evidence_dir\" \"\$final_evidence_dir\"" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" | head -n1 | cut -d: -f1)
+[[ $gate_protect_line =~ ^[0-9]+$ && $gate_marker_line =~ ^[0-9]+$ \
+  && $gate_close_dir_line =~ ^[0-9]+$ && $gate_publish_dir_line =~ ^[0-9]+$ \
+  && $gate_protect_line -lt $gate_marker_line \
+  && $gate_marker_line -lt $gate_close_dir_line \
+  && $gate_close_dir_line -lt $gate_publish_dir_line ]] || {
+  printf 'Gate evidence is not fully protected before atomic directory publication\n' >&2
   exit 1
 }
 
-for command in awk base64 cmp cut grep install jq mktemp sed seq sha256sum sort tail; do
-  command -v "$command" >/dev/null 2>&1 || {
-    printf 'missing test dependency: %s\n' "$command" >&2
-    exit 2
-  }
+# Recovery authority must cross a durability barrier before active=C1, and
+# Gate-bearing success evidence must be durable before that authority is
+# removed.  Readback alone proves bytes, not power-loss ordering.
+cutover_script="$SCRIPT_DIR/host-rust-lob-cutover.sh"
+restore_script="$SCRIPT_DIR/host-rust-lob-restore.sh"
+for unmask_script in "$SCRIPT_DIR/rust-lob-control-plane-lib.sh" "$cutover_script" "$restore_script"; do
+  while IFS= read -r unmask_line; do
+    [[ $unmask_line == *'systemctl unmask --runtime '* ]] || {
+      printf 'runtime mask is cleared without --runtime: %s\n' "$unmask_script" >&2
+      exit 1
+    }
+  done < <(grep -F 'systemctl unmask ' "$unmask_script")
 done
-
-grep -Fq '.trade_summary_contract == "binance.aggregate_trade_summary.v1"' "$GATE"
-grep -Fq 'verify_adjacent_segments' "$GATE"
-grep -Fq 'run_strict_verifier_pair' "$GATE"
-grep -Fq 'run_strict_verifier' "$GATE"
-grep -Fq 'verify_aggregate_trade_continuity' "$GATE"
-grep -Fq -- '--verify-segment' "$GATE"
-grep -Fq -- '--segment-content-sha256' "$GATE"
-grep -Fq -- '--segment-manifest-sha256' "$GATE"
-grep -Fq -- '--require-lob-continuity' "$GATE"
-grep -Fq -- '--verify-aggregate-trade-continuity' "$GATE"
-grep -Fq 'verify_raw_trade_continuity' "$GATE"
-grep -Fq -- '--verify-raw-trade-continuity' "$GATE"
-grep -Fq 'BinanceRawTradeContinuityVerifier' "$COLLECTOR"
-grep -Fq 'verify_raw_trade_continuity "${strict_verifier_segments[@]}"' "$GATE"
-grep -Fq 'strict_raw_trade_continuity_readback' "$GATE"
-grep -Fq 'raw_trade_segments' "$GATE"
-grep -Fq 'book_ticker_count' "$GATE"
-grep -Fq 'force_order_count' "$GATE"
-grep -Fq 'tape_schema' "$GATE"
-grep -Fq 'USD-M LOB stream family contract' "$GATE"
-grep -Fq 'usdm_perpetual_top100_lob' "$CUTOVER"
-grep -Fq 'usdm_perpetual_top100_lob_rust_shadow' "$GATE"
-book_ticker_validator=$(sed -n \
-  '/^[[:space:]]*def valid_book_ticker:/,/;[[:space:]]*$/p' "$GATE")
-spot_book_ticker='{"received_at_ns":1,"frame":{"data":{"u":1,"s":"CATIUSDT","b":"0.1","B":"2","a":"0.2","A":"3"}}}'
-usdm_book_ticker='{"received_at_ns":1,"frame":{"data":{"e":"bookTicker","E":2,"T":1,"u":1,"s":"BTCUSDT","b":"0.1","B":"2","a":"0.2","A":"3"}}}'
-jq -en --arg market spot --argjson row "$spot_book_ticker" \
-  "$book_ticker_validator \$row | valid_book_ticker" >/dev/null
-jq -en --arg market usdm --argjson row "$usdm_book_ticker" \
-  "$book_ticker_validator \$row | valid_book_ticker" >/dev/null
-if jq -en --arg market usdm --argjson row "$spot_book_ticker" \
-  "$book_ticker_validator \$row | valid_book_ticker" >/dev/null; then
-  printf 'shadow gate accepted spot bookTicker shape for USD-M\n' >&2
+cutover_intent_flush_line=$(grep -nF "could not durably flush cutover recovery intent" "$cutover_script" | cut -d: -f1)
+cutover_intent_commit_line=$(grep -nF "could not durably commit cutover recovery intent" "$cutover_script" | cut -d: -f1)
+cutover_active_line=$(grep -nF "monday_atomic_symlink \"\$target_release\" \"\$active_link\"" "$cutover_script" | cut -d: -f1)
+cutover_active_sync_line=$(grep -nF "could not durably commit active controller switch" "$cutover_script" | cut -d: -f1)
+cutover_active_crash_line=$(grep -nF 'MONDAY_CUTOVER_HARD_CRASH_AFTER_ACTIVE:-' "$cutover_script" | cut -d: -f1)
+cutover_transition_flush_line=$(grep -nF "could not durably flush transition receipt" "$cutover_script" | cut -d: -f1)
+cutover_transition_commit_line=$(grep -nF "could not durably commit transition digest" "$cutover_script" | cut -d: -f1)
+cutover_transition_crash_line=$(grep -nF 'MONDAY_CUTOVER_HARD_CRASH_AFTER_TRANSITION_RECEIPT' "$cutover_script" | cut -d: -f1)
+cutover_intent_clear_line=$(grep -nF "could not clear committed cutover recovery intent" "$cutover_script" | tail -n1 | cut -d: -f1)
+restore_receipt_flush_line=$(grep -nF "could not durably flush restore receipt'" "$restore_script" | cut -d: -f1)
+restore_receipt_commit_line=$(grep -nF "could not durably commit restore receipt digest" "$restore_script" | cut -d: -f1)
+restore_receipt_crash_line=$(grep -nF 'MONDAY_RESTORE_HARD_CRASH_AFTER_RECEIPT' "$restore_script" | cut -d: -f1)
+restore_intent_clear_line=$(grep -nF "could not clear committed restore recovery intent" "$restore_script" | tail -n1 | cut -d: -f1)
+[[ $cutover_intent_flush_line =~ ^[0-9]+$ && $cutover_intent_commit_line =~ ^[0-9]+$ \
+  && $cutover_active_line =~ ^[0-9]+$ && $cutover_active_sync_line =~ ^[0-9]+$ && $cutover_active_crash_line =~ ^[0-9]+$ \
+  && $cutover_transition_flush_line =~ ^[0-9]+$ && $cutover_transition_commit_line =~ ^[0-9]+$ && $cutover_transition_crash_line =~ ^[0-9]+$ \
+  && $cutover_intent_clear_line =~ ^[0-9]+$ && $restore_receipt_flush_line =~ ^[0-9]+$ \
+  && $restore_receipt_commit_line =~ ^[0-9]+$ && $restore_receipt_crash_line =~ ^[0-9]+$ && $restore_intent_clear_line =~ ^[0-9]+$ \
+  && $cutover_intent_flush_line -lt $cutover_intent_commit_line \
+  && $cutover_intent_commit_line -lt $cutover_active_line \
+  && $cutover_active_line -lt $cutover_active_sync_line \
+  && $cutover_active_sync_line -lt $cutover_active_crash_line \
+  && $cutover_transition_flush_line -lt $cutover_transition_commit_line \
+  && $cutover_transition_commit_line -lt $cutover_transition_crash_line \
+  && $cutover_transition_crash_line -lt $cutover_intent_clear_line \
+  && $restore_receipt_flush_line -lt $restore_receipt_commit_line \
+  && $restore_receipt_commit_line -lt $restore_receipt_crash_line \
+  && $restore_receipt_crash_line -lt $restore_intent_clear_line ]] || {
+  printf 'cutover/restore evidence can cross a power-loss boundary before its authority is durable\n' >&2
+  exit 1
+}
+cutover_cleanup_source=$(sed -n '/^cleanup() {$/,/^}$/p' "$cutover_script")
+if grep -Fq "rm -f -- \"\$recovery_intent\"" <<<"$cutover_cleanup_source"; then
+  printf 'failed cutover cleanup can clear durable recovery authority\n' >&2
   exit 1
 fi
-if jq -en --arg market spot --argjson row "$usdm_book_ticker" \
-  "$book_ticker_validator \$row | valid_book_ticker" >/dev/null; then
-  printf 'shadow gate accepted USD-M bookTicker shape for spot\n' >&2
-  exit 1
-fi
-grep -Fq 'full_stream_coverage_verified' "$GATE"
-grep -Fq 'or (.full_stream_coverage_verified == true))' "$RUNTIME_POLICY"
-grep -Fq '"full_stream_coverage_verified"' "$LOB_ARCHIVER"
-grep -Fq -- '--unit="$strict_verifier_unit"' "$GATE"
-grep -Fq -- '--property=KillMode=control-group' "$GATE"
-grep -Fq 'MemoryHigh=2560M' "$GATE"
-grep -Fq 'MemoryMax=3072M' "$GATE"
-grep -Fq 'OOMScoreAdjust=500' "$GATE"
-grep -Fq 'verify_oss_round_trips "$market" >"$round_trips_path"' "$GATE"
-if grep -Fq 'round_trips=$(verify_oss_round_trips "$market")' "$GATE"; then
-  printf 'shadow gate still runs OSS verification in a command-substitution subshell\n' >&2
-  exit 1
-fi
-grep -Fq 'pub fn verify_binance_market_tape_for_strict_gate' "$ARTIFACT_VERIFIER"
-grep -Fq 'verify_binance_market_tape_for_strict_gate(sealed)?' "$COLLECTOR"
-if grep -Fq '"$candidate_binary" "${strict_verifier_args[@]}"' "$GATE"; then
-  printf 'shadow gate still gives every segment to one unbounded strict verifier\n' >&2
-  exit 1
-fi
-grep -Fq '.lob_continuity.contract == "binance.lob_continuity.v1"' "$GATE"
-grep -Fq 'jq -e --arg session_id "${observed_session[$market]}"' "$GATE"
-grep -Fq -- '--slurpfile manifest "$manifest_path"' "$GATE"
-if grep -Fq -- '--argjson lob_continuity' "$GATE"; then
-  printf 'shadow gate passes the full-catalog LOB summary through argv\n' >&2
-  exit 1
-fi
-grep -Fq 'manifest changed between discovery and readback' "$GATE"
-grep -Fq 'has_replay_safe_checkpoint' "$GATE"
-grep -Fq 'unsafe_candidates' "$GATE"
-grep -Fq 'monday_validate_replay_safe_manifest_order' "$GATE"
-grep -Fq 'fewer than two replay-safe complete OSS manifests' "$GATE"
-grep -Fq 'replay-unsafe manifest before a later replay-safe manifest' "$LIB"
-grep -Fq 'install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$segment_dir"' "$GATE"
-grep -Fq 'manifest_sha256:$manifest_sha256' "$GATE"
-grep -Fq 'readonly REQUIRED_DURATION_SECONDS=240' "$GATE"
-grep -Fq 'readonly HEALTH_SETTLE_SECONDS=240' "$GATE"
-grep -Fq 'Production gates wait up to 240 seconds for health' "$GATE"
-grep -Fq 'USD-M shadow and production WS_SHARD_SIZE differ' "$GATE"
-grep -Fq 'require_env_value "$file" WS_SHARD_SIZE 25' "$CUTOVER"
-grep -Fq 'readonly GATE_SEGMENT_SECONDS=120' "$GATE"
-grep -Fq 'readonly RUN_SPOOL_ROOT=/data/monday/spool/binance-lob-rust-shadow/runs' "$GATE"
-shadow_usdm_symbols=$(sed -n 's/^SYMBOLS=//p' "$SHADOW_USDM_ENV")
-production_usdm_symbols=$(sed -n 's/^SYMBOLS=//p' "$PRODUCTION_USDM_ENV")
-[[ $shadow_usdm_symbols == "$production_usdm_symbols" ]] || {
-  printf 'shadow and production USD-M symbol lists differ\n' >&2
+grep -Fqx 'MemoryHigh=1792M' "$SCRIPT_DIR/binance-lob-archiver-rust@.service" || {
+  printf 'shadow MemoryHigh is not 1792M\n' >&2
   exit 1
 }
-IFS=, read -r -a usdm_symbols <<<"$shadow_usdm_symbols"
-[[ ${#usdm_symbols[@]} -eq 100 ]] || {
-  printf 'USD-M catalog is not exactly 100 symbols\n' >&2
+grep -Fqx 'MemoryMax=2048M' "$SCRIPT_DIR/binance-lob-archiver-rust@.service" || {
+  printf 'shadow MemoryMax is not 2048M\n' >&2
   exit 1
 }
-[[ $(printf '%s\n' "${usdm_symbols[@]}" | sort -u | wc -l) -eq 100 ]] || {
-  printf 'USD-M catalog contains duplicate symbols\n' >&2
-  exit 1
-}
-[[ $(sed -n 's/^WS_SHARD_SIZE=//p' "$SHADOW_USDM_ENV") == 25
-  && $(sed -n 's/^WS_SHARD_SIZE=//p' "$PRODUCTION_USDM_ENV") == 25 ]] || {
-  printf 'USD-M websocket shards must contain exactly 25 symbols\n' >&2
-  exit 1
-}
-cutover_symbol_validator=$(sed -n '/^is_usdm_top100()/,/^}/p' "$CUTOVER")
-eval "$cutover_symbol_validator"
-is_usdm_top100 "$shadow_usdm_symbols"
-if is_usdm_top100 ALL; then
-  printf 'cutover accepted SYMBOLS=ALL as the candidate USD-M scope\n' >&2
-  exit 1
-fi
-grep -Fq 'min_symbols[usdm]=100' "$GATE"
-grep -Fq 'and .markets.usdm.symbol_count == 100' "$POLICY"
-grep -Fq '"$CANDIDATE_STARTED_NS" 100' "$CUTOVER"
-grep -Fq '"$OLD_USDM_MINIMUM_SYMBOLS"' "$CUTOVER"
-startup_body=$(sed -n '/^async fn main()/,/^fn recover_parts_only()/p' "$COLLECTOR")
-if grep -Fq 'recover_parts(&config.segment_config())' <<<"$startup_body"; then
-  printf 'normal collector startup may not recover interrupted parts\n' >&2
-  exit 1
-fi
-grep -Fq 'ensure_startup_spool_ready(&spool_dir)?' <<<"$startup_body"
-grep -Fxq 'ExecStartPre=+/opt/monday/bin/monday-rust-lob-recovery-queue isolate %i' \
-  "$SCRIPT_DIR/binance-lob-archiver-production@.service"
-grep -Fxq 'ExecStart=/opt/monday/bin/monday-rust-lob-recovery-queue drain %i' \
-  "$SCRIPT_DIR/binance-lob-archiver-recovery@.service"
-grep -Fxq 'Unit=binance-lob-archiver-recovery@%i.service' \
-  "$SCRIPT_DIR/binance-lob-archiver-recovery@.timer"
-grep -Fq 'host-rust-lob-recovery-queue.sh' "$INSTALL_RELEASE"
-queue_root_line=$(grep -n 'install -d -m 0750 -o root -g hftcollector "$RECOVERY_QUEUE_ROOT"' \
-  "$CUTOVER" | cut -d: -f1)
-candidate_start_line=$(grep -n '^STEP=start-candidate-production$' "$CUTOVER" | cut -d: -f1)
-[[ -n $queue_root_line && -n $candidate_start_line \
-  && $queue_root_line -lt $candidate_start_line ]] || {
-  printf 'cutover does not create the recovery queue root before entering the systemd sandbox\n' >&2
-  exit 1
-}
-grep -Fq '"$RECOVERY_EVIDENCE_ROOT"' "$CUTOVER"
-drain_body=$(sed -n '/^run_candidate_drain()/,/^}/p' "$CUTOVER")
-incomplete_body=$(sed -n '/^has_incomplete_segment_artifacts()/,/^}/p' "$CUTOVER")
-for suffix in '*.jsonl.part' '*.zst.tmp' '*.part.corrupt'; do
-  grep -Fq -- "-name '$suffix'" <<<"$incomplete_body" || {
-    printf 'cutover does not detect interrupted %s artifacts\n' "$suffix" >&2
-    exit 1
-  }
-done
-backup_line=$(grep -n -- 'RECOVERY_BACKUP_DIR=' <<<"$drain_body" | cut -d: -f1 || true)
-isolate_line=$(grep -n -- 'monday-rust-lob-recovery-queue isolate "$market"' <<<"$drain_body" | cut -d: -f1 || true)
-upload_line=$(grep -n -- '--upload-only' <<<"$drain_body" | cut -d: -f1 || true)
-[[ -z ${backup_line:-} && -n $isolate_line && -n $upload_line \
-  && $isolate_line -lt $upload_line ]] || {
-  printf 'cutover does not detach interrupted spools before upload-only drain\n' >&2
-  exit 1
-}
-recover_body=$(sed -n '/^fn recover_parts_only()/,/^fn stream_types_for_market/p' "$COLLECTOR")
-grep -Fq '/opt/monday/bin/monday-rust-lob-recovery-queue isolate "$market"' "$CUTOVER"
-grep -Fq 'spool_lock.owner()' <<<"$recover_body"
-grep -Fq 'validated_nonempty_recovery_parts' <<<"$recover_body"
-grep -Fq 'validated_recovery_temporaries' <<<"$recover_body"
-backup_line=$(grep -n 'backup_recovery_inputs' <<<"$recover_body" | head -1 | cut -d: -f1)
-drop_line=$(grep -n 'drop_recovery_privileges' <<<"$recover_body" | head -1 | cut -d: -f1)
-catalog_line=$(grep -n 'prepare_recovery_batches' <<<"$recover_body" | head -1 | cut -d: -f1)
-remove_temporary_line=$(grep -n 'remove_recovery_temporaries' <<<"$recover_body" | head -1 | cut -d: -f1)
-recover_line=$(grep -n 'recover_recovery_batches' <<<"$recover_body" | head -1 | cut -d: -f1)
-[[ -n $backup_line && -n $drop_line && -n $catalog_line \
-  && -n $remove_temporary_line && -n $recover_line \
-  && $backup_line -lt $drop_line && $drop_line -lt $catalog_line \
-  && $catalog_line -lt $remove_temporary_line && $remove_temporary_line -lt $recover_line ]] || {
-  printf 'recovery evidence, catalog validation, temporary removal, and recompression are out of order\n' >&2
-  exit 1
-}
-grep -Fq 'production unit retained a MainPID after stop' "$CUTOVER"
-grep -Fq 'run_candidate_drain "$OLD_DEPLOYMENT"' "$CUTOVER"
-grep -Fq 'SPOOL_ENV_DEPLOYMENT="$OLD_DEPLOYMENT"' "$CUTOVER"
-grep -Fq 'SPOOL_ENV_DEPLOYMENT="$CANDIDATE_DEPLOYMENT"' "$CUTOVER"
-grep -Fq 'run_candidate_drain "$SPOOL_ENV_DEPLOYMENT"' "$CUTOVER"
-grep -Fq '$DRAIN_ATTEMPTED -eq 1 && $DRAIN_MAY_HAVE_MUTATED -eq 0' "$CUTOVER"
-recovery_stage_line=$(grep -n '^STEP=stage-candidate-recovery-assets$' "$CUTOVER" | cut -d: -f1)
-old_drain_line=$(grep -n '^  STEP=drain-old-production-with-candidate$' "$CUTOVER" | cut -d: -f1)
-candidate_env_install_line=$(grep -n '^STEP=install-candidate-production-assets$' "$CUTOVER" | cut -d: -f1)
-[[ -n $recovery_stage_line && -n $old_drain_line && -n $candidate_env_install_line \
-  && $recovery_stage_line -lt $old_drain_line \
-  && $old_drain_line -lt $candidate_env_install_line ]] || {
-  printf 'cutover replaces the old production env before draining its spool\n' >&2
-  exit 1
-}
-grep -Fq 'spool_dir[$market]=$(run_spool_dir "$candidate_sha" "$gate_run_id" "$market")' "$GATE"
-grep -Fq 'install -d -m 0755 -o root -g root' "$GATE"
-grep -Fq '"$RUN_SPOOL_ROOT" "$RUN_SPOOL_ROOT/$candidate_sha"' "$GATE"
-grep -Fq '"$run_spool_path" "${spool_dir[spot]}" "${spool_dir[usdm]}"' "$GATE"
-grep -Fq 'printf '\''SEGMENT_SECONDS=%s\n'\'' "$GATE_SEGMENT_SECONDS"' "$GATE"
-[[ $(grep -Fc 'run_candidate_drain "$market"' "$GATE") -eq 1 ]] || {
-  printf 'shadow gate drains a fixed or pre-existing spool before the run\n' >&2
-  exit 1
-}
-if grep -Fq 'monday-rust-lob-shadow-gate.lock' "$CUTOVER" "$RESTORE"; then
-  printf 'cutover or restore still acquires the duplicate shadow-gate lock\n' >&2
-  exit 1
-fi
-grep -Fq 'monday-rust-lob-release.lock' "$CUTOVER"
-grep -Fq 'monday-rust-lob-release.lock' "$RESTORE"
-grep -Fq 'readonly MAX_HEALTH_SILENCE_SECONDS=120' "$GATE"
-grep -Fq 'MONDAY_TEST_HEALTH_SETTLE_SECONDS' "$GATE"
-grep -Fq 'short health settles require a test-only gate' "$GATE"
-grep -Fq 'test health settle duration is too large' "$GATE"
-grep -Fq 'MONDAY_TEST_HEALTH_SETTLE_SECONDS < HEALTH_SETTLE_SECONDS' "$GATE"
-grep -Fq 'health_settle_seconds=$HEALTH_SETTLE_SECONDS' "$GATE"
-grep -Fq 'settle_deadline=$(( $(monotonic_seconds) + health_settle_seconds ))' "$GATE"
-grep -Fq 'max_age_seconds=$((gate_seconds + health_settle_seconds + 3600))' "$GATE"
-[[ $(grep -Fc -- '--argjson health_settle_seconds "$health_settle_seconds"' "$GATE") -eq 2 ]] || {
-  printf 'run and final gate evidence do not both record the effective health settle duration\n' >&2
-  exit 1
-}
-[[ $(grep -Fc 'health_settle_seconds:$health_settle_seconds' "$GATE") -eq 2 ]] || {
-  printf 'run and final gate evidence do not both expose the effective health settle duration\n' >&2
-  exit 1
-}
-grep -Fq 'and .all_symbols_bridged == true' "$GATE"
-grep -Fq 'and .bridged_count == .symbol_count' "$GATE"
-grep -Fq 'and .snapshot_only_symbols == []' "$GATE"
-grep -Fq 'and .stream_coverage_verified_count == .symbol_count' "$GATE"
-grep -Fq 'and .all_stream_coverage_verified == true' "$GATE"
-grep -Fq 'then (.symbols | keys | sort) == ($symbols_config | split(",") | sort)' "$GATE"
-grep -Fq 'then (.symbols | keys | sort) == ($symbols_config | split(",") | sort)' "$SOAK"
-grep -Fq 'configured_catalog_sha256:$configured_catalog_sha256' "$GATE"
-grep -Fq 'candidate shadow gate USD-M symbols differ from the deployment bundle' "$CUTOVER"
-grep -Fq 'candidate shadow gate USD-M symbols differ from the deployment bundle' "$RESTORE"
-grep -Fq 'or (.diff_count == 0' "$GATE"
-grep -Fq 'and .first_update_id == null' "$GATE"
-grep -Fq 'and .last_update_id == null' "$GATE"
-grep -Fq 'market_observation_started_ns[$market]=$(date +%s%N)' "$GATE"
-grep -Fq '((end_ns <= market_observation_started_ns[$market])) && continue' "$GATE"
-grep -Fq 'shadow segments did not rotate after health settled' "$GATE"
-grep -Fq 'end_received_at_ns > $gate.markets.spot.observation_started_ns' "$POLICY"
-grep -Fq 'end_received_at_ns > $gate.markets.usdm.observation_started_ns' "$POLICY"
-[[ $(grep -Fc 'end_received_at_ns > $gate.observation_started_ns' "$POLICY") -eq 0 ]] || {
-  printf 'gate policy does not bind both market tapes across observation start\n' >&2
-  exit 1
-}
-if grep -Fq '((start_ns < gate_started_ns)) && continue' "$GATE"; then
-  printf 'manifest discovery still admits health-settle warmup segments\n' >&2
-  exit 1
-fi
-if grep -Fq '((start_ns < market_observation_started_ns[$market])) && continue' "$GATE"; then
-  printf 'manifest discovery still drops the segment overlapping observation start\n' >&2
-  exit 1
-fi
-grep -Fq 'market_gate_started_ns[$market]=$(date +%s%N)' "$GATE"
-grep -Fq 'all(.[].lob_reconnect_boundary; . == false)' "$GATE"
-grep -Fq 'ARG SOURCE_REVISION' "$COLLECTOR_DOCKERFILE"
-grep -Fq 'MONDAY_SOURCE_REVISION="$SOURCE_REVISION" cargo' "$COLLECTOR_DOCKERFILE"
-grep -Fq 'SOURCE_REVISION=${{ needs.selector.outputs.source_sha }}' "$ACR_WORKFLOW"
-grep -Fq "grep -Fqx 'binance-lob-archiver \${{ needs.selector.outputs.source_sha }}'" "$ACR_WORKFLOW"
-grep -Fxq 'MemoryHigh=1792M' "$SHADOW_UNIT"
-grep -Fxq 'MemoryMax=2048M' "$SHADOW_UNIT"
-grep -Fxq 'OOMScoreAdjust=500' "$SHADOW_UNIT"
-grep -Fq 'systemctl_value "$market" DropInPaths' "$GATE"
-grep -Fq 'systemctl_value "$market" MemoryHigh' "$GATE"
-grep -Fq 'memory_max_bytes[$market] == 2147483648' "$GATE"
-grep -Fq 'readonly HOST_MEMORY_RESERVE_BYTES=1073741824' "$GATE"
-grep -Fq 'readonly MIN_HOST_MEMORY_RESERVE_BYTES=536870912' "$GATE"
-grep -Fq 'readonly STRICT_VERIFIER_MEMORY_MAX_BYTES=3221225472' "$GATE"
-grep -Fq 'readonly UPLOAD_DRAIN_MEMORY_MAX_BYTES=3355443200' "$GATE"
-grep -Fq 'monday_shadow_memory_admission' "$GATE"
-grep -Fq 'host_memory_available_bytes_at_preflight' "$GATE"
-grep -Fq 'host_swap_total_bytes' "$GATE"
-grep -Fq 'shadow_phase_memory_bytes' "$GATE"
-grep -Fq 'production_memory_headroom_bytes' "$GATE"
-grep -Fq 'production_memory_soft_headroom_bytes' "$GATE"
-grep -Fq 'production_memory_reserve_burst_bytes' "$GATE"
-grep -Fq 'minimum_host_memory_reserve_bytes' "$GATE"
-grep -Fq 'host_memory_required_bytes' "$GATE"
-grep -Fq 'host_memory_shortfall_bytes' "$GATE"
-grep -Fq 'host_memory_headroom_ok' "$GATE"
-grep -Fq 'systemctl_value "$market" OOMScoreAdjust' "$GATE"
-memory_admission_call=$(sed -n \
-  '/^if host_memory_required_bytes=$(monday_shadow_memory_admission \\/,/^  "$shadow_phase_memory_bytes" "$production_memory_soft_headroom_bytes"); then$/p' \
-  "$GATE")
-[[ -n $memory_admission_call \
-  && $memory_admission_call == *production_memory_soft_headroom_bytes* \
-  && $memory_admission_call != *'"$production_memory_headroom_bytes"'* \
-  && $memory_admission_call != *production_memory_reserve_burst_bytes* ]] || {
-  printf 'shadow gate double-reserves production cgroup slack\n' >&2
-  exit 1
-}
-production_burst_guard=$(sed -n \
-  '/^((production_memory_reserve_burst_bytes \\/,/^  || die "production memory burst leaves less than the minimum host reserve:/p' \
-  "$GATE")
-[[ -n $production_burst_guard \
-  && $production_burst_guard == *'HOST_MEMORY_RESERVE_BYTES - MIN_HOST_MEMORY_RESERVE_BYTES'* ]] || {
-  printf 'shadow gate does not preserve the minimum host reserve during production bursts\n' >&2
-  exit 1
-}
-memory_guard_line=$(grep -nF 'insufficient host memory headroom for sequential shadow gate' \
-  "$GATE" | cut -d: -f1)
-shadow_start_line=$(grep -nF 'systemctl start "${unit[$market]}"' \
-  "$GATE" | cut -d: -f1)
-[[ -n $memory_guard_line && -n $shadow_start_line \
-  && $memory_guard_line -lt $shadow_start_line ]] || {
-  printf 'shadow gate memory guard does not run before sequential shadow phases\n' >&2
-  exit 1
-}
-if grep -Fq 'systemctl start "${unit[spot]}" "${unit[usdm]}"' "$GATE"; then
-  printf 'shadow gate still starts Spot and USD-M concurrently\n' >&2
-  exit 1
-fi
-grep -Fq 'readonly -a markets=(spot usdm)' "$GATE"
-grep -Fq 'run_market_gate_phase "$market"' "$GATE"
-grep -Fq 'for other in "${markets[@]}"; do' "$GATE"
-grep -Fq 'shadow service is active before the $market phase' "$GATE"
-if grep -Fq 'binance-lob-archiver-rust-usdm-memory.conf' "$INSTALL_RELEASE" "$GATE"; then
-  printf 'shadow memory contract still depends on a persistent USD-M drop-in\n' >&2
-  exit 1
-fi
-
-required_duration_seconds=$(sed -n 's/^readonly REQUIRED_DURATION_SECONDS=//p' "$GATE")
-[[ $required_duration_seconds =~ ^[1-9][0-9]*$ ]] || {
-  printf 'gate has no positive REQUIRED_DURATION_SECONDS\n' >&2
-  exit 1
-}
-gate_segment_seconds=$(sed -n 's/^readonly GATE_SEGMENT_SECONDS=//p' "$GATE")
-[[ $gate_segment_seconds =~ ^[1-9][0-9]*$ ]] || {
-  printf 'gate has no positive GATE_SEGMENT_SECONDS\n' >&2
-  exit 1
-}
-(( required_duration_seconds >= 2 * gate_segment_seconds )) || {
-  printf 'formal Gate cannot produce two run-scoped segments (obs %ss, segment %ss)\n' \
-    "$required_duration_seconds" "$gate_segment_seconds" >&2
-  exit 1
-}
-for shadow_env in \
-  "$SCRIPT_DIR/binance-lob-archiver-rust-spot.env" \
-  "$SCRIPT_DIR/binance-lob-archiver-rust-usdm.env"; do
-  segment_seconds=$(sed -n 's/^SEGMENT_SECONDS=//p' "$shadow_env")
-  [[ $segment_seconds =~ ^[1-9][0-9]*$ ]] || {
-    printf 'shadow env has no positive SEGMENT_SECONDS: %s\n' "$shadow_env" >&2
-    exit 1
-  }
-  ((segment_seconds == 300)) || {
-    printf 'committed stability cadence changed unexpectedly: %s (%ss)\n' \
-      "$shadow_env" "$segment_seconds" >&2
-    exit 1
-  }
-done
-shadow_spot_snapshot_producers=$(sed -n 's/^SNAPSHOT_PRODUCERS=//p' \
+evidence_timeout_seconds=$(sed -n 's/^readonly EVIDENCE_TIMEOUT_SECONDS=//p' \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh")
+gate_segment_seconds=$(sed -n 's/^readonly GATE_SEGMENT_SECONDS=//p' \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh")
+health_settle_seconds=$(sed -n 's/^readonly HEALTH_SETTLE_SECONDS=//p' \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh")
+shadow_runtime_max_seconds=$(sed -n 's/^readonly SHADOW_RUNTIME_MAX_SECONDS=//p' \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh")
+shadow_stop_timeout_seconds=$(sed -n 's/^readonly SHADOW_STOP_TIMEOUT_SECONDS=//p' \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh")
+upload_drain_timeout_seconds=$(sed -n 's/^readonly UPLOAD_DRAIN_TIMEOUT_SECONDS=//p' \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh")
+transient_work_timeout_seconds=$(sed -n 's/^readonly TRANSIENT_WORK_TIMEOUT_SECONDS=//p' \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh")
+spot_segment_seconds=$(sed -n 's/^SEGMENT_SECONDS=//p' \
   "$SCRIPT_DIR/binance-lob-archiver-rust-spot.env")
-production_spot_snapshot_producers=$(sed -n 's/^SNAPSHOT_PRODUCERS=//p' \
+usdm_segment_seconds=$(sed -n 's/^SEGMENT_SECONDS=//p' \
+  "$SCRIPT_DIR/binance-lob-archiver-rust-usdm.env")
+production_spot_segment_seconds=$(sed -n 's/^SEGMENT_SECONDS=//p' \
   "$SCRIPT_DIR/binance-lob-archiver-production-spot.env")
-[[ $shadow_spot_snapshot_producers == 16 \
-  && $production_spot_snapshot_producers == "$shadow_spot_snapshot_producers" ]] || {
-  printf 'Spot shadow and production must pin SNAPSHOT_PRODUCERS=16\n' >&2
+production_usdm_segment_seconds=$(sed -n 's/^SEGMENT_SECONDS=//p' \
+  "$SCRIPT_DIR/binance-lob-archiver-production-usdm.env")
+[[ $evidence_timeout_seconds == 600 \
+  && $gate_segment_seconds == 120 && $health_settle_seconds == 240 \
+  && $shadow_runtime_max_seconds == 900 && $shadow_stop_timeout_seconds == 60 \
+  && $upload_drain_timeout_seconds == 300 && $transient_work_timeout_seconds == 300 \
+  && $spot_segment_seconds =~ ^[1-9][0-9]*$ \
+  && $spot_segment_seconds == "$usdm_segment_seconds" \
+  && $production_spot_segment_seconds == 300 \
+  && $production_spot_segment_seconds == "$production_usdm_segment_seconds" ]] || {
+  printf 'Fast Gate bounds or the 300-second production cadence drifted\n' >&2
   exit 1
 }
-grep -Fq 'Spot shadow SNAPSHOT_PRODUCERS must be 16' "$GATE"
-grep -Fq 'Spot shadow and production SNAPSHOT_PRODUCERS differ' "$GATE"
+gate_observation_source=$(sed -n '/^run_market_gate_phase()/,/^}/p' \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh")
+grep -Fq "observation_started_ns=\$(monotonic_nanoseconds)" <<<"$gate_observation_source"
+sampled_line=$(grep -Fn "observation_sampled_ns=\$(monotonic_nanoseconds)" \
+  <<<"$gate_observation_source" | cut -d: -f1)
+deadline_line=$(grep -Fn 'if (( observation_sampled_ns >= observation_deadline_ns )); then' \
+  <<<"$gate_observation_source" | cut -d: -f1)
+validation_line=$(grep -Fn "validate_observation_sample \"\$market\" \"\$observation_health_snapshot\"" \
+  <<<"$gate_observation_source" | cut -d: -f1)
+evidence_line=$(grep -Fn "if clean_segment_ready \"\$market\" \"\$observation_segment_snapshot\"; then" \
+  <<<"$gate_observation_source" | cut -d: -f1)
+health_snapshot_line=$(grep -Fn "cp -- \"\$live_health\" \"\$observation_health_snapshot.tmp\"" \
+  <<<"$gate_observation_source" | cut -d: -f1)
+health_check_line=$(grep -Fn "if health_ok \"\$market\" \"\$observation_health_snapshot\"" \
+  <<<"$gate_observation_source" | cut -d: -f1)
+(( evidence_line < health_snapshot_line && health_snapshot_line < sampled_line \
+  && sampled_line < deadline_line && deadline_line < validation_line \
+  && validation_line < health_check_line ))
+grep -Fq "observation_finished_ns=\$observation_sampled_ns" \
+  <<<"$gate_observation_source"
+grep -Fq "write_run_json || die 'could not commit deadline failure run evidence'" \
+  <<<"$gate_observation_source"
 
-tmp_dir=$(mktemp -d)
-trap 'rm -rf "$tmp_dir"' EXIT
-
-active_segment_body=$(sed -n '/^active_segment_start_ns()/,/^}/p' "$GATE")
-eval "$active_segment_body"
-active_segment_fixture="$tmp_dir/active-segment"
-mkdir -p "$active_segment_fixture"
-touch "$active_segment_fixture/part-100.jsonl.part" \
-  "$active_segment_fixture/part-200.jsonl.part"
-ln -s part-200.jsonl.part "$active_segment_fixture/part-300.jsonl.part"
-[[ $(active_segment_start_ns "$active_segment_fixture") == 200 ]] || {
-  printf 'active segment discovery did not select the newest direct part\n' >&2
+# Resource Envelope V2 reserves the production slice's unallocated aggregate
+# cap from parent memory.stat anon.  File cache and memory.current remain audit
+# fields and must not reduce the required budget a second time.
+admission_available_bytes=6442450944
+admission_reserve_bytes=1073741824
+admission_phase_max_bytes=1610612736
+admission_parent_anon_bytes=317067264
+admission_slice_max_bytes=3758096384
+admission_required_bytes=$((admission_reserve_bytes + admission_phase_max_bytes + admission_slice_max_bytes - admission_parent_anon_bytes))
+[[ $(monday_shadow_memory_admission \
+  "$admission_available_bytes" "$admission_reserve_bytes" "$admission_phase_max_bytes" \
+  "$admission_parent_anon_bytes" "$admission_slice_max_bytes") \
+  == "$admission_required_bytes" ]] || {
+  printf 'sequential memory admission rejected the available host headroom\n' >&2
   exit 1
 }
-
-strict_verifier_body="$tmp_dir/strict-verifier.sh"
-sed -n '/^stop_strict_verifier()/,/^}/p;/^run_strict_verifier()/,/^}/p;/^run_strict_verifier_pair()/,/^}/p;/^verify_adjacent_segments()/,/^}/p;/^verify_aggregate_trade_continuity()/,/^}/p;/^verify_raw_trade_continuity()/,/^}/p' \
-  "$GATE" >"$strict_verifier_body"
-run_strict_verifier_fixture() (
-  local -a verifier_units=()
-  local -a verifier_invocations=()
-  strict_verifier_unit=
-  strict_verifier_counter=0
-  candidate_binary=candidate_binary
-  die() { printf '%s\n' "$*" >&2; exit 1; }
-  systemd-run() {
-    verifier_units+=("$*")
-    while (($#)); do
-      if [[ $1 == -- ]]; then
-        shift
-        break
-      fi
-      shift
-    done
-    "$@"
-  }
-  candidate_binary() {
-    verifier_invocations+=("$*")
-  }
-  # shellcheck disable=SC1090
-  . "$strict_verifier_body"
-  verify_adjacent_segments \
-    first.zst first-content first-manifest \
-    second.zst second-content second-manifest \
-    third.zst third-content third-manifest
-  verify_aggregate_trade_continuity \
-    first.zst first-content first-manifest \
-    second.zst second-content second-manifest \
-    third.zst third-content third-manifest
-  verify_raw_trade_continuity \
-    first.zst first-content first-manifest \
-    second.zst second-content second-manifest \
-    third.zst third-content third-manifest
-  [[ ${#verifier_invocations[@]} -eq 4 ]] || {
-    printf 'strict verifier did not run adjacent pairs plus one continuity pass per trade family\n' >&2
-    exit 1
-  }
-  [[ ${verifier_invocations[0]} == \
-    '--require-lob-continuity --verify-segment first.zst --segment-content-sha256 first-content --segment-manifest-sha256 first-manifest --verify-segment second.zst --segment-content-sha256 second-content --segment-manifest-sha256 second-manifest' ]]
-  [[ ${verifier_invocations[1]} == \
-    '--require-lob-continuity --verify-segment second.zst --segment-content-sha256 second-content --segment-manifest-sha256 second-manifest --verify-segment third.zst --segment-content-sha256 third-content --segment-manifest-sha256 third-manifest' ]]
-  [[ ${verifier_invocations[2]} == \
-    '--verify-aggregate-trade-continuity --verify-segment first.zst --segment-content-sha256 first-content --segment-manifest-sha256 first-manifest --verify-segment second.zst --segment-content-sha256 second-content --segment-manifest-sha256 second-manifest --verify-segment third.zst --segment-content-sha256 third-content --segment-manifest-sha256 third-manifest' ]] || {
-    printf 'aggregate continuity verifier lost segment trust-anchor flags\n' >&2
-    exit 1
-  }
-  [[ ${verifier_invocations[3]} == \
-    '--verify-raw-trade-continuity --verify-segment first.zst --segment-content-sha256 first-content --segment-manifest-sha256 first-manifest --verify-segment second.zst --segment-content-sha256 second-content --segment-manifest-sha256 second-manifest --verify-segment third.zst --segment-content-sha256 third-content --segment-manifest-sha256 third-manifest' ]] || {
-    printf 'raw-trade continuity verifier lost segment trust-anchor flags\n' >&2
-    exit 1
-  }
-  [[ ${#verifier_units[@]} -eq 4 ]] || {
-    printf 'strict verifier did not isolate every verification pass\n' >&2
-    exit 1
-  }
-  for verifier_unit in "${verifier_units[@]}"; do
-    [[ $verifier_unit == *'--property=OOMScoreAdjust=500'* ]] || exit 1
-    [[ $verifier_unit == *'--property=MemoryHigh=2560M'* ]] || exit 1
-    [[ $verifier_unit == *'--property=MemoryMax=3072M'* ]] || exit 1
-  done
-)
-run_strict_verifier_fixture
-
-run_strict_verifier_failure_fixture() (
-  local -a stopped_units=()
-  strict_verifier_unit=
-  strict_verifier_counter=0
-  candidate_binary=candidate_binary
-  systemd-run() {
-    while (($#)); do
-      if [[ $1 == -- ]]; then
-        shift
-        break
-      fi
-      shift
-    done
-    "$@"
-    return 17
-  }
-  systemctl() {
-    [[ $1 == stop ]] || exit 1
-    stopped_units+=("$2")
-  }
-  candidate_binary() { :; }
-  # shellcheck disable=SC1090
-  . "$strict_verifier_body"
-  if run_strict_verifier_pair \
-    --verify-segment first.zst \
-    --segment-content-sha256 first-content \
-    --segment-manifest-sha256 first-manifest; then
-    printf 'failed strict verifier fixture unexpectedly passed\n' >&2
-    exit 1
-  fi
-  [[ ${#stopped_units[@]} -eq 1 ]] || {
-    printf 'failed strict verifier did not stop its transient unit\n' >&2
-    exit 1
-  }
-  [[ ${stopped_units[0]} == monday-rust-strict-verifier-*.service ]] || {
-    printf 'failed strict verifier stopped the wrong unit: %s\n' "${stopped_units[0]}" >&2
-    exit 1
-  }
-)
-run_strict_verifier_failure_fixture
-
-upload_drain_body="$tmp_dir/upload-drain.sh"
-sed -n '/^stop_upload_drain()/,/^}/p;/^run_candidate_drain()/,/^}/p' \
-  "$GATE" >"$upload_drain_body"
-run_upload_drain_fixture() (
-  local -a invocations=()
-  declare -A spool_dir oss_bucket oss_endpoint oss_region aliyun_profile oss_copy_timeout
-  upload_drain_unit=
-  upload_drain_counter=0
-  SERVICE_USER=hftcollector
-  SERVICE_HOME=/var/lib/hft-collector
-  SAFE_PATH=/usr/bin:/bin
-  candidate_binary=/candidate/binance-lob-archiver
-  spool_dir[spot]=/spool/spot
-  oss_bucket[spot]=bucket
-  oss_endpoint[spot]=endpoint
-  oss_region[spot]=region
-  aliyun_profile[spot]=profile
-  oss_copy_timeout[spot]=60
-  systemd-run() { invocations+=("$*"); }
-  assert_spool_drained() { [[ $1 == spot ]]; }
-  # shellcheck disable=SC1090
-  . "$upload_drain_body"
-  run_candidate_drain spot
-  [[ ${#invocations[@]} -eq 1 ]] || exit 1
-  [[ ${invocations[0]} == *'--property=CPUQuota=80%'* ]] || exit 1
-  [[ ${invocations[0]} == *'--property=MemoryHigh=2500M'* ]] || exit 1
-  [[ ${invocations[0]} == *'--property=MemoryMax=3200M'* ]] || exit 1
-  [[ ${invocations[0]} == *'/candidate/binance-lob-archiver --upload-only'* ]] || exit 1
-  [[ -z $upload_drain_unit ]]
-)
-run_upload_drain_fixture
-
-health_settle_body="$tmp_dir/resolve-health-settle.sh"
-sed -n '/^resolve_health_settle_seconds()/,/^}/p' "$GATE" >"$health_settle_body"
-resolve_health_settle() (
-  HEALTH_SETTLE_SECONDS=240
-  gate_seconds=$1
-  test_only=$2
-  MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=$3
-  MONDAY_TEST_HEALTH_SETTLE_SECONDS=$4
-  die() { printf '%s\n' "$*" >&2; exit 1; }
-  # shellcheck disable=SC1090
-  . "$health_settle_body"
-  resolve_health_settle_seconds
-  printf '%s\n' "$health_settle_seconds"
-)
-[[ $(resolve_health_settle 120 true 1 60) == 60 ]] || {
-  printf 'authorized short health settle was not applied\n' >&2
+[[ $(monday_shadow_memory_admission \
+  "$admission_required_bytes" "$admission_reserve_bytes" "$admission_phase_max_bytes" \
+  "$admission_parent_anon_bytes" "$admission_slice_max_bytes") \
+  == "$admission_required_bytes" ]] || {
+  printf 'sequential memory admission rejected exact phase plus reserve\n' >&2
   exit 1
 }
-[[ $(resolve_health_settle 120 true 1 '') == 240 ]] || {
-  printf 'test-only gate without an override did not keep the formal settle\n' >&2
+if monday_shadow_memory_admission "$((admission_required_bytes - 1))" \
+  "$admission_reserve_bytes" "$admission_phase_max_bytes" \
+  "$admission_parent_anon_bytes" "$admission_slice_max_bytes" >/dev/null 2>&1; then
+  printf 'sequential memory admission accepted one byte below phase plus reserve\n' >&2
   exit 1
-}
-for fixture in \
-  '240 false 1 60' \
-  '120 true 0 60' \
-  '120 true 1 invalid' \
-  '120 true 1 240' \
-  '120 true 1 241' \
-  "120 true 1 $(printf '9%.0s' {1..100})"; do
-  read -r fixture_gate fixture_test fixture_auth fixture_value <<<"$fixture"
-  if resolve_health_settle "$fixture_gate" "$fixture_test" "$fixture_auth" \
-    "$fixture_value" >/dev/null 2>&1; then
-    printf 'invalid short health settle fixture was accepted: %s\n' "$fixture" >&2
-    exit 1
-  fi
-done
-
-safe_candidates="$tmp_dir/safe-candidates.tsv"
-unsafe_candidates="$tmp_dir/unsafe-candidates.tsv"
-printf '100\t200\tsafe-1\n200\t300\tsafe-2\n' >"$safe_candidates"
-printf '300\t360\tunsafe-tail\n' >"$unsafe_candidates"
-monday_validate_replay_safe_manifest_order test "$safe_candidates" "$unsafe_candidates"
-
-printf '100\t200\tsafe-1\n300\t400\tsafe-2\n' >"$safe_candidates"
-printf '200\t300\tunsafe-middle\n' >"$unsafe_candidates"
-if monday_validate_replay_safe_manifest_order test "$safe_candidates" "$unsafe_candidates" \
-  2>/dev/null; then
-  printf 'replay-unsafe middle manifest was accepted\n' >&2
+fi
+if monday_shadow_memory_admission "$admission_available_bytes" \
+  "$admission_reserve_bytes" "$admission_phase_max_bytes" \
+  "$((admission_slice_max_bytes + 1))" "$admission_slice_max_bytes" >/dev/null 2>&1; then
+  printf 'sequential memory admission accepted anon greater than slice limit\n' >&2
+  exit 1
+fi
+if monday_shadow_memory_admission "$admission_available_bytes" \
+  "$admission_reserve_bytes" "$admission_phase_max_bytes" \
+  "$admission_parent_anon_bytes" >/dev/null 2>&1; then
+  printf 'sequential memory admission accepted legacy three-argument shape\n' >&2
+  exit 1
+fi
+if monday_shadow_memory_admission "$admission_available_bytes" \
+  "$admission_reserve_bytes" "$admission_phase_max_bytes" \
+  "$admission_parent_anon_bytes" "$admission_slice_max_bytes" 1 >/dev/null 2>&1; then
+  printf 'sequential memory admission accepted legacy six-argument shape\n' >&2
+  exit 1
+fi
+if monday_shadow_memory_admission 0 1 9223372036854775807 0 9223372036854775807 >/dev/null 2>&1; then
+  printf 'sequential memory admission accepted an overflowing reserve plus phase\n' >&2
   exit 1
 fi
 
-printf '100\t200\tsafe-1\n' >"$safe_candidates"
-printf '150\t250\tunsafe-overlap\n' >"$unsafe_candidates"
-if monday_validate_replay_safe_manifest_order test "$safe_candidates" "$unsafe_candidates" \
-  2>/dev/null; then
-  printf 'replay-unsafe overlapping manifest was accepted\n' >&2
+# Production cgroup snapshots are validated independently of a host systemd
+# daemon.  The same fixture exercises the exact slice/parent/child topology,
+# active-child set, limits, and process identities used by the Gate.
+production_snapshot="$ROOT/production-snapshot.json"
+production_exe_sha=$(printf 'a%.0s' {1..64})
+jq -n --arg exe "$production_exe_sha" '
+  {slice:"system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice",
+   parent_control_group:"/system.slice/system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice",parent_cgroup_procs:[],
+   active_child_control_groups:["/system.slice/system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice/binance-lob-archiver-production@spot.service",
+     "/system.slice/system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice/binance-lob-archiver-production@usdm.service"],
+   children:{spot:{market:"spot",slice:"system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice",
+       control_group:"/system.slice/system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice/binance-lob-archiver-production@spot.service",
+       main_pid:101,process_exe_sha256:$exe,n_restarts:8,active:true,
+       systemd_memory_max_bytes:2684354560,memory_max_bytes:2684354560},
+     usdm:{market:"usdm",slice:"system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice",
+       control_group:"/system.slice/system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice/binance-lob-archiver-production@usdm.service",
+       main_pid:102,process_exe_sha256:$exe,n_restarts:8,active:true,
+       systemd_memory_max_bytes:2684354560,memory_max_bytes:2684354560}},
+   production_envelope_state:"signed",
+   production_slice_memory_high_bytes:3221225472,production_slice_memory_max_bytes:3758096384,
+   systemd_production_slice_memory_high_bytes:3221225472,systemd_production_slice_memory_max_bytes:3758096384,
+   target_production_slice_memory_high_bytes:3221225472,target_production_slice_memory_max_bytes:3758096384,
+   parent_memory_current_bytes:1101067264,parent_memory_peak_bytes:5100000000,
+   parent_memory_anon_bytes:317067264,parent_memory_file_bytes:784000000,
+   parent_memory_stat:{anon:317067264,file:784000000},
+   child_memory_max_sum_bytes:5368709120,parent_memory_events:{high:0,oom:0,oom_kill:0}}
+' >"$production_snapshot"
+monday_validate_lob_production_snapshot "$production_snapshot"
+production_identity=$(monday_lob_production_snapshot_identity "$production_snapshot")
+direct_production_snapshot="$ROOT/direct-production-snapshot.json"
+jq '.production_envelope_state = "legacy-unlimited"
+  | .production_slice_memory_high_bytes = null
+  | .production_slice_memory_max_bytes = null
+  | .systemd_production_slice_memory_high_bytes = null
+  | .systemd_production_slice_memory_max_bytes = null' \
+  "$production_snapshot" >"$direct_production_snapshot"
+monday_validate_lob_production_snapshot "$direct_production_snapshot" direct
+if monday_validate_lob_production_snapshot "$direct_production_snapshot" stable; then
+  printf 'stable production snapshot validation accepted a legacy unlimited envelope\n' >&2
   exit 1
 fi
 
-printf '100\t200\tsafe-1\n' >"$safe_candidates"
-printf '200\t300\tunsafe-tail\n' >"$unsafe_candidates"
-monday_validate_replay_safe_manifest_order test "$safe_candidates" "$unsafe_candidates"
-safe_manifest_count=$(wc -l <"$safe_candidates" | tr -d ' ')
-((safe_manifest_count < 2)) || {
-  printf 'trailing replay-unsafe fixture incorrectly counted as a second safe manifest\n' >&2
-  exit 1
-}
-
-last_updated_ns=1
-last_advance_mono=0
-max_gap=0
-health_sample_increments=0
-for current_mono in $(seq 30 30 3600); do
-  current_updated_ns=$((current_mono * 1000000000))
-  read -r last_updated_ns last_advance_mono max_gap sample_increment < <(
-    monday_observe_health_freshness \
-      "$last_updated_ns" "$last_advance_mono" "$max_gap" \
-      "$current_updated_ns" "$current_mono" 120
-  )
-  health_sample_increments=$((health_sample_increments + sample_increment))
-done
-((health_sample_increments == 120 && max_gap <= 120)) || {
-  printf 'fresh one-hour health sequence did not pass the monotonic observer\n' >&2
-  exit 1
-}
-read -r jitter_updated_ns jitter_advance_mono jitter_max_gap jitter_increment < <(
-  monday_observe_health_freshness 1 0 0 2 91 120
-)
-[[ $jitter_updated_ns == 2 && $jitter_advance_mono == 91 \
-  && $jitter_max_gap == 91 && $jitter_increment == 1 ]] || {
-  printf 'monotonic observer rejected an advancing 91-second jitter sample\n' >&2
-  exit 1
-}
-if monday_observe_health_freshness \
-  "$jitter_updated_ns" "$jitter_advance_mono" "$jitter_max_gap" \
-  "$jitter_updated_ns" "$((jitter_advance_mono + 121))" 120 >/dev/null; then
-  printf 'monotonic observer accepted a 121-second health freeze\n' >&2
-  exit 1
-fi
-
-artifact=$(printf 'a%.0s' {1..64})
-bundle=$(printf 'b%.0s' {1..64})
-source_revision=$(printf 'c%.0s' {1..40})
-catalog=$(printf 'd%.0s' {1..64})
-gate_run_id=20260820T000000Z-1
-run_spool="/data/monday/spool/binance-lob-rust-shadow/runs/$artifact/$gate_run_id"
-usdm_symbols_config=$(sed -n 's/^SYMBOLS=//p' "$SHADOW_USDM_ENV")
-usdm_catalog=$(jq -cn --arg symbols "$usdm_symbols_config" \
-  '$symbols | split(",") | sort' | sha256sum | awk '{print $1}')
-
-market_json=$(jq -cn \
-  --arg catalog "$catalog" \
-  '{observation_started_ns:150,
-    symbol_count:1200,snapshot_ready_count:1200,bridged_count:1200,
-    stream_coverage_verified_count:1200,all_stream_coverage_verified:true,sequence_gaps:0,
-    upload_failure_count:0,health_samples:121,max_health_silence_seconds:30,
-    symbols_config:"ALL",catalog_sha256:$catalog,configured_catalog_sha256:$catalog,
-    session_id:"session-1",oss_roundtrips:2,
-    tape_schema:"binance.market_tape.v2",
-    stream_types:["aggTrade","bookTicker","depth@100ms","trade"],
-    agg_trade_segments:2,agg_trade_count:2,
-    raw_trade_segments:2,raw_trade_count:2,book_ticker_count:2,
-    strict_trade_summary_readback:true,
-    strict_lob_continuity_readback:true,
-    strict_raw_trade_continuity_readback:true,
-    full_stream_coverage_verified:true,
-    lob_reconnect_boundaries:0,
-    min_lob_source_latency_ms:0,max_lob_source_latency_ms:0,
-    min_lob_bid_levels:1,min_lob_ask_levels:1,
-    max_segment_gap_ns:0,
-    oss_roundtrip_evidence:[
-      {success_uri:"oss://bucket/part-1.jsonl.zst._SUCCESS",sha256:$catalog,manifest_sha256:$catalog,
-       gap_from_previous_ns:0,start_received_at_ns:100,end_received_at_ns:200,agg_trade_count:1,
-       raw_trade_count:1,book_ticker_count:1,
-       lob_capture_session_id:"session-1",lob_reconnect_boundary:false,lob_sequence_gaps:0,
-       lob_source_time_rollbacks:0,lob_declared_symbol_count:1200,lob_covered_symbol_count:1200,
-       stream_coverage_verified_count:1200,all_stream_coverage_verified:true,
-       lob_min_source_latency_ms:0,lob_max_source_latency_ms:0,
-       lob_min_bid_levels:1,lob_min_ask_levels:1},
-      {success_uri:"oss://bucket/part-2.jsonl.zst._SUCCESS",sha256:$catalog,manifest_sha256:$catalog,
-       gap_from_previous_ns:0,start_received_at_ns:200,end_received_at_ns:300,agg_trade_count:1,
-       raw_trade_count:1,book_ticker_count:1,
-       lob_capture_session_id:"session-1",lob_reconnect_boundary:false,lob_sequence_gaps:0,
-       lob_source_time_rollbacks:0,lob_declared_symbol_count:1200,lob_covered_symbol_count:1200,
-       stream_coverage_verified_count:1200,all_stream_coverage_verified:true,
-       lob_min_source_latency_ms:0,lob_max_source_latency_ms:0,
-       lob_min_bid_levels:1,lob_min_ask_levels:1}
-    ]}')
-usdm_market=$(jq -c --arg symbols_config "$usdm_symbols_config" \
-  --arg catalog_sha256 "$usdm_catalog" '
-  .symbol_count = 100
-  | .snapshot_ready_count = 100
-  | .bridged_count = 100
-  | .stream_coverage_verified_count = 100
-  | .symbols_config = $symbols_config
-  | .catalog_sha256 = $catalog_sha256
-  | .configured_catalog_sha256 = $catalog_sha256
-    | .stream_types = ["depth@100ms"]
-    | .agg_trade_segments = 0
-    | .agg_trade_count = 0
-    | .raw_trade_segments = 0
-    | .raw_trade_count = 0
-    | .book_ticker_count = 0
-    | .strict_trade_summary_readback = false
-    | .strict_raw_trade_continuity_readback = false
-    | .force_order_count = 0
-    | .oss_roundtrip_evidence |= map(
-      .lob_declared_symbol_count = 100 | .lob_covered_symbol_count = 100
-      | .stream_coverage_verified_count = 100
-      | .agg_trade_count = 0 | .raw_trade_count = 0
-      | .book_ticker_count = 0 | .force_order_count = 0)' \
-  <<<"$market_json")
-jq -n \
-  --arg artifact "$artifact" \
-  --arg bundle "$bundle" \
-  --arg source "$source_revision" \
-  --arg run_id "$gate_run_id" \
-  --arg run_spool "$run_spool" \
-  --argjson market "$market_json" \
-  --argjson usdm_market "$usdm_market" \
-  '{schema:"monday.rust_lob_shadow_gate.v3",candidate_sha256:$artifact,
-    deployment_bundle_sha256:$bundle,deployment_source_revision:$source,
-    run_id:$run_id,run_spool:$run_spool,
-    required_duration_seconds:240,requested_duration_seconds:240,
-    health_settle_seconds:240,segment_seconds:120,test_only:false,
-    observation_started_ns:150,
-    passed:true,production_eligible:true,checks_passed:true,duration_seconds:240,
-    markets:{spot:$market,usdm:$usdm_market}}' \
-  >"$tmp_dir/gate.json"
-
-jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/gate.json" >/dev/null
-
-jq 'del(.observation_started_ns)' \
-  "$tmp_dir/gate.json" >"$tmp_dir/missing-observation-boundary.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/missing-observation-boundary.json" >/dev/null; then
-  printf 'gate policy accepted evidence without an observation boundary\n' >&2
-  exit 1
-fi
-jq 'del(.markets.spot.observation_started_ns)' \
-  "$tmp_dir/gate.json" >"$tmp_dir/missing-market-observation-boundary.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/missing-market-observation-boundary.json" >/dev/null; then
-  printf 'gate policy accepted Spot evidence without its observation boundary\n' >&2
-  exit 1
-fi
-jq 'del(.markets.usdm.observation_started_ns)' \
-  "$tmp_dir/gate.json" >"$tmp_dir/missing-usdm-observation-boundary.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/missing-usdm-observation-boundary.json" >/dev/null; then
-  printf 'gate policy accepted USD-M evidence without its observation boundary\n' >&2
-  exit 1
-fi
-jq '.markets.spot.observation_started_ns = 99' \
-  "$tmp_dir/gate.json" >"$tmp_dir/late-evidence-start.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/late-evidence-start.json" >/dev/null; then
-  printf 'gate policy accepted evidence that starts after observation\n' >&2
-  exit 1
-fi
-jq '.markets.usdm.observation_started_ns = 200' \
-  "$tmp_dir/gate.json" >"$tmp_dir/early-evidence-end.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/early-evidence-end.json" >/dev/null; then
-  printf 'gate policy accepted evidence ending before observation\n' >&2
-  exit 1
-fi
-
-jq '.markets.usdm.stream_types = ["aggTrade","bookTicker","depth@100ms","forceOrder","trade"]' \
-  "$tmp_dir/gate.json" >"$tmp_dir/usdm-legacy-stream-contract.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/usdm-legacy-stream-contract.json" >/dev/null; then
-  printf 'gate policy accepted the legacy USD-M full-tape stream contract\n' >&2
-  exit 1
-fi
-jq '.markets.usdm.book_ticker_count = 1
-    | .markets.usdm.oss_roundtrip_evidence |= map(.book_ticker_count = 1)' \
-  "$tmp_dir/gate.json" >"$tmp_dir/usdm-book-ticker-rows.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/usdm-book-ticker-rows.json" >/dev/null; then
-  printf 'gate policy accepted USD-M evidence with bookTicker rows\n' >&2
-  exit 1
-fi
-
-jq '.markets.usdm.symbol_count = 101
-    | .markets.usdm.snapshot_ready_count = 101
-    | .markets.usdm.bridged_count = 101
-    | .markets.usdm.stream_coverage_verified_count = 101' \
-  "$tmp_dir/gate.json" >"$tmp_dir/usdm-101-symbols.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/usdm-101-symbols.json" >/dev/null; then
-  printf 'gate policy accepted 101 USD-M symbols\n' >&2
-  exit 1
-fi
-
-jq '.markets.usdm.symbols_config = "ALL"' \
-  "$tmp_dir/gate.json" >"$tmp_dir/usdm-all-symbols.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/usdm-all-symbols.json" >/dev/null; then
-  printf 'gate policy accepted SYMBOLS=ALL for USD-M\n' >&2
-  exit 1
-fi
-
-jq '.markets.usdm.configured_catalog_sha256 =
-      "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"' \
-  "$tmp_dir/gate.json" >"$tmp_dir/usdm-catalog-mismatch.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/usdm-catalog-mismatch.json" >/dev/null; then
-  printf 'gate policy accepted a USD-M configured/runtime catalog mismatch\n' >&2
-  exit 1
-fi
-
-jq '.run_spool = "/data/monday/spool/binance-lob-rust-shadow/spot"' \
-  "$tmp_dir/gate.json" >"$tmp_dir/fixed-spool-gate.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/fixed-spool-gate.json" >/dev/null; then
-  printf 'gate policy accepted a fixed shared shadow spool\n' >&2
-  exit 1
-fi
-
-v1_market=$(jq -c '
-  del(.stream_types, .raw_trade_segments, .raw_trade_count, .book_ticker_count,
-      .force_order_count, .strict_raw_trade_continuity_readback)
-  | .tape_schema = "binance.market_tape.v1"
-  | .full_stream_coverage_verified = null
-  | .oss_roundtrip_evidence |= map(
-      del(.raw_trade_count, .book_ticker_count, .force_order_count))' \
-  <<<"$market_json")
-v1_usdm_market=$(jq -c --arg symbols_config "$usdm_symbols_config" '
-  .symbol_count = 100
-  | .snapshot_ready_count = 100
-  | .bridged_count = 100
-  | .stream_coverage_verified_count = 100
-  | .symbols_config = $symbols_config
-  | .stream_types = ["depth@100ms"]
-  | .agg_trade_segments = 0
-  | .agg_trade_count = 0
-  | .raw_trade_segments = 0
-  | .raw_trade_count = 0
-  | .book_ticker_count = 0
-  | .strict_trade_summary_readback = false
-  | .strict_raw_trade_continuity_readback = false
-  | .force_order_count = 0
-  | .oss_roundtrip_evidence |= map(
-      .lob_declared_symbol_count = 100 | .lob_covered_symbol_count = 100
-      | .stream_coverage_verified_count = 100
-      | .agg_trade_count = 0 | .raw_trade_count = 0
-      | .book_ticker_count = 0 | .force_order_count = 0)' \
-  <<<"$v1_market")
-jq -n \
-  --arg artifact "$artifact" \
-  --arg bundle "$bundle" \
-  --arg source "$source_revision" \
-  --arg run_id "$gate_run_id" \
-  --arg run_spool "$run_spool" \
-  --argjson market "$v1_market" \
-  --argjson usdm_market "$v1_usdm_market" \
-  '{schema:"monday.rust_lob_shadow_gate.v3",candidate_sha256:$artifact,
-    deployment_bundle_sha256:$bundle,deployment_source_revision:$source,
-    run_id:$run_id,run_spool:$run_spool,
-    required_duration_seconds:240,requested_duration_seconds:240,
-    health_settle_seconds:240,segment_seconds:120,test_only:false,
-    observation_started_ns:150,
-    passed:true,production_eligible:true,checks_passed:true,duration_seconds:240,
-    markets:{spot:$market,usdm:$usdm_market}}' \
-  >"$tmp_dir/gate-v1.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/gate-v1.json" >/dev/null; then
-  printf 'gate policy accepted a v1 USD-M candidate outside the LOB-first contract\n' >&2
-  exit 1
-fi
-
-jq '.markets.spot.raw_trade_count = 1' \
-  "$tmp_dir/gate-v1.json" >"$tmp_dir/v1-with-raw-trades.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/v1-with-raw-trades.json" >/dev/null; then
-  printf 'gate policy accepted v2 family evidence on a v1 tape candidate\n' >&2
-  exit 1
-fi
-
-jq 'del(.markets.spot.tape_schema)' \
-  "$tmp_dir/gate.json" >"$tmp_dir/missing-tape-schema.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/missing-tape-schema.json" >/dev/null; then
-  printf 'gate policy accepted evidence without a tape schema\n' >&2
-  exit 1
-fi
-
-jq '.markets.spot.stream_types = ["aggTrade","depth@100ms"]' \
-  "$tmp_dir/gate.json" >"$tmp_dir/legacy-stream-types.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/legacy-stream-types.json" >/dev/null; then
-  printf 'gate policy accepted a v2 candidate declaring legacy stream types\n' >&2
-  exit 1
-fi
-
-jq '.markets.spot.raw_trade_segments = 1' \
-  "$tmp_dir/gate.json" >"$tmp_dir/non-continuous-raw-trades.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/non-continuous-raw-trades.json" >/dev/null; then
-  printf 'gate policy accepted raw trades from fewer than two segments\n' >&2
-  exit 1
-fi
-
-jq '.markets.spot.raw_trade_count = 0' \
-  "$tmp_dir/gate.json" >"$tmp_dir/zero-raw-trades.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/zero-raw-trades.json" >/dev/null; then
-  printf 'gate policy accepted zero raw trades\n' >&2
-  exit 1
-fi
-
-jq '.markets.spot.book_ticker_count = 0' \
-  "$tmp_dir/gate.json" >"$tmp_dir/zero-book-tickers.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/zero-book-tickers.json" >/dev/null; then
-  printf 'gate policy accepted zero book tickers\n' >&2
-  exit 1
-fi
-
-jq 'del(.markets.spot.strict_raw_trade_continuity_readback)' \
-  "$tmp_dir/gate.json" >"$tmp_dir/missing-strict-raw-trade-readback.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/missing-strict-raw-trade-readback.json" >/dev/null; then
-  printf 'gate policy accepted evidence without strict raw-trade continuity readback\n' >&2
-  exit 1
-fi
-
-jq 'del(.markets.usdm.force_order_count)' \
-  "$tmp_dir/gate.json" >"$tmp_dir/missing-force-order-count.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/missing-force-order-count.json" >/dev/null; then
-  printf 'gate policy accepted USD-M evidence without a force-order count\n' >&2
-  exit 1
-fi
-
-jq '.markets.spot.force_order_count = 1' \
-  "$tmp_dir/gate.json" >"$tmp_dir/spot-force-orders.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/spot-force-orders.json" >/dev/null; then
-  printf 'gate policy accepted force-order evidence on a spot candidate\n' >&2
-  exit 1
-fi
-
-jq '.markets.spot.full_stream_coverage_verified = false' \
-  "$tmp_dir/gate.json" >"$tmp_dir/unverified-full-stream-coverage.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/unverified-full-stream-coverage.json" >/dev/null; then
-  printf 'gate policy accepted unverified full stream coverage\n' >&2
-  exit 1
-fi
-
-jq '.markets.spot.all_stream_coverage_verified = false' \
-  "$tmp_dir/gate.json" >"$tmp_dir/unverified-stream-coverage.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/unverified-stream-coverage.json" >/dev/null; then
-  printf 'gate policy accepted unverified market stream coverage\n' >&2
-  exit 1
-fi
-
-jq '.markets.spot.oss_roundtrip_evidence[0].stream_coverage_verified_count = 1199' \
-  "$tmp_dir/gate.json" >"$tmp_dir/incomplete-segment-stream-coverage.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/incomplete-segment-stream-coverage.json" >/dev/null; then
-  printf 'gate policy accepted incomplete segment stream coverage\n' >&2
-  exit 1
-fi
-
-jq '.markets.spot.lob_reconnect_boundaries = 1
-    | .markets.spot.oss_roundtrip_evidence[0].lob_reconnect_boundary = true' \
-  "$tmp_dir/gate.json" >"$tmp_dir/pre-observation-reconnect.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/pre-observation-reconnect.json" >/dev/null; then
-  printf 'gate policy accepted a pre-observation reconnect boundary\n' >&2
-  exit 1
-fi
-
-wrong_bundle=$(printf 'e%.0s' {1..64})
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$wrong_bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/gate.json" >/dev/null; then
-  printf 'gate policy accepted evidence from a different deployment bundle\n' >&2
-  exit 1
-fi
-
-jq '.markets.spot.oss_roundtrip_evidence[1].lob_capture_session_id = "session-2"' \
-  "$tmp_dir/gate.json" >"$tmp_dir/mixed-lob-session.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/mixed-lob-session.json" >/dev/null; then
-  printf 'gate policy accepted LOB evidence across a reconnect boundary\n' >&2
-  exit 1
-fi
-
-jq '.markets.spot.oss_roundtrip_evidence[1] |=
-      (.start_received_at_ns = 90000000300
-       | .end_received_at_ns = 90000000400
-       | .gap_from_previous_ns = 90000000100)
-    | .markets.spot.max_segment_gap_ns = 90000000100' \
-  "$tmp_dir/gate.json" >"$tmp_dir/excessive-segment-gap.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/excessive-segment-gap.json" >/dev/null; then
-  printf 'gate policy accepted a segment gap over the continuity bound\n' >&2
-  exit 1
-fi
-
-jq 'del(.markets.spot.oss_roundtrip_evidence[0].manifest_sha256)' \
-  "$tmp_dir/gate.json" >"$tmp_dir/missing-manifest-anchor.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/missing-manifest-anchor.json" >/dev/null; then
-  printf 'gate policy accepted evidence without a manifest SHA anchor\n' >&2
-  exit 1
-fi
-
-jq '.markets.usdm.oss_roundtrip_evidence[1].start_received_at_ns = 199' \
-  "$tmp_dir/gate.json" >"$tmp_dir/overlapping-agg-trades.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/overlapping-agg-trades.json" >/dev/null; then
-  printf 'gate policy accepted overlapping aggregate-trade segments\n' >&2
-  exit 1
-fi
-
-wrong_artifact=$(printf 'f%.0s' {1..64})
-if jq -e \
-  --arg candidate_sha256 "$wrong_artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/gate.json" >/dev/null; then
-  printf 'gate policy accepted evidence from a different binary artifact\n' >&2
-  exit 1
-fi
-
-wrong_source=$(printf '9%.0s' {1..40})
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$wrong_source" \
-  -f "$POLICY" "$tmp_dir/gate.json" >/dev/null; then
-  printf 'gate policy accepted evidence from a different source revision\n' >&2
-  exit 1
-fi
-
-jq '.markets.spot.health_samples = 1' "$tmp_dir/gate.json" >"$tmp_dir/short-sampling.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/short-sampling.json" >/dev/null; then
-  printf 'gate policy accepted insufficient continuous health samples\n' >&2
-  exit 1
-fi
-
-for market in spot usdm; do
-  jq --arg market "$market" \
-    '.markets[$market].max_health_silence_seconds = 91' \
-    "$tmp_dir/gate.json" >"$tmp_dir/rotation-jitter-health-$market.json"
-  jq -e \
-    --arg candidate_sha256 "$artifact" \
-    --arg deployment_bundle_sha256 "$bundle" \
-    --arg deployment_source_revision "$source_revision" \
-    -f "$POLICY" "$tmp_dir/rotation-jitter-health-$market.json" >/dev/null || {
-    printf 'gate policy rejected a 91-second %s rotation jitter gap\n' "$market" >&2
-    exit 1
-  }
-
-  jq --arg market "$market" \
-    '.markets[$market].max_health_silence_seconds = 121' \
-    "$tmp_dir/gate.json" >"$tmp_dir/stale-health-$market.json"
-  if jq -e \
-    --arg candidate_sha256 "$artifact" \
-    --arg deployment_bundle_sha256 "$bundle" \
-    --arg deployment_source_revision "$source_revision" \
-    -f "$POLICY" "$tmp_dir/stale-health-$market.json" >/dev/null; then
-    printf 'gate policy accepted a %s health freshness gap over 120 seconds\n' "$market" >&2
-    exit 1
-  fi
-done
-
-jq '.markets.spot.agg_trade_count = 0' \
-  "$tmp_dir/gate.json" >"$tmp_dir/zero-agg-trades.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/zero-agg-trades.json" >/dev/null; then
-  printf 'gate policy accepted zero aggregate trades\n' >&2
-  exit 1
-fi
-
-jq 'del(.markets.spot.strict_trade_summary_readback)' \
-  "$tmp_dir/gate.json" >"$tmp_dir/missing-strict-trade-summary-readback.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/missing-strict-trade-summary-readback.json" >/dev/null; then
-  printf 'gate policy accepted evidence without strict trade-summary readback\n' >&2
-  exit 1
-fi
-
-jq 'del(.markets.spot.oss_roundtrip_evidence[0].success_uri)' \
-  "$tmp_dir/gate.json" >"$tmp_dir/missing-success-marker.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/missing-success-marker.json" >/dev/null; then
-  printf 'gate policy accepted aggregate-trade evidence without a success marker\n' >&2
-  exit 1
-fi
-
-jq '.markets.usdm.agg_trade_segments = 1' \
-  "$tmp_dir/gate.json" >"$tmp_dir/non-continuous-agg-trades.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/non-continuous-agg-trades.json" >/dev/null; then
-  printf 'gate policy accepted aggregate trades from fewer than two segments\n' >&2
-  exit 1
-fi
-
-jq -n '{market:"spot",dataset:"spot_all",status:"synced",sequence_gaps:0,symbol_count:1200,
-  snapshot_ready_count:1200,bridged_count:1200,stream_coverage_verified_count:1200,
-  snapshot_only_symbols:[],all_symbols_bridged:true,all_stream_coverage_verified:true,
-  full_stream_coverage_verified:true,
-  pending_upload_segments:0,queue_saturated:false,
-  disk_warning:false,upload_warning:false,updated_at_ns:200,session_id:"new-session"}' \
-  >"$tmp_dir/runtime-health.json"
-runtime_policy_accepts() {
-  local health=$1 old_session=$2 minimum_updated_ns=$3
-  local expected_market=${4:-spot} expected_dataset=${5:-spot_all}
-  local minimum_symbols=${6:-1000}
-  jq -e \
-    --arg expected_market "$expected_market" \
-    --arg expected_dataset "$expected_dataset" \
-    --arg old_session "$old_session" \
-    --argjson minimum_symbols "$minimum_symbols" \
-    --argjson minimum_updated_ns "$minimum_updated_ns" \
-    -f "$RUNTIME_POLICY" "$health" >/dev/null
-}
-runtime_policy_accepts "$tmp_dir/runtime-health.json" old-session 100
-if runtime_policy_accepts "$tmp_dir/runtime-health.json" old-session 200; then
-  printf 'runtime policy accepted health that was not newer than restart\n' >&2
-  exit 1
-fi
-if runtime_policy_accepts "$tmp_dir/runtime-health.json" new-session 100; then
-  printf 'runtime policy accepted a stale session\n' >&2
-  exit 1
-fi
-jq '.all_stream_coverage_verified = false' \
-  "$tmp_dir/runtime-health.json" >"$tmp_dir/unverified-runtime-stream-coverage.json"
-if runtime_policy_accepts "$tmp_dir/unverified-runtime-stream-coverage.json" old-session 100; then
-  printf 'runtime policy accepted unverified stream coverage\n' >&2
-  exit 1
-fi
-jq '.stream_coverage_verified_count = 1199' \
-  "$tmp_dir/runtime-health.json" >"$tmp_dir/incomplete-runtime-stream-coverage.json"
-if runtime_policy_accepts "$tmp_dir/incomplete-runtime-stream-coverage.json" old-session 100; then
-  printf 'runtime policy accepted incomplete stream coverage\n' >&2
-  exit 1
-fi
-jq '.full_stream_coverage_verified = false' \
-  "$tmp_dir/runtime-health.json" >"$tmp_dir/unverified-full-runtime-coverage.json"
-if runtime_policy_accepts "$tmp_dir/unverified-full-runtime-coverage.json" old-session 100; then
-  printf 'runtime policy accepted unverified full stream coverage\n' >&2
-  exit 1
-fi
-jq 'del(.full_stream_coverage_verified)' \
-  "$tmp_dir/runtime-health.json" >"$tmp_dir/v1-runtime-coverage.json"
-runtime_policy_accepts "$tmp_dir/v1-runtime-coverage.json" old-session 100 || {
-  printf 'runtime policy rejected a v1 collector without the full coverage field\n' >&2
-  exit 1
-}
-jq '.market = "usdm"
-    | .dataset = "usdm_perpetual_all"
-    | .symbol_count = 100
-    | .snapshot_ready_count = 100
-    | .bridged_count = 100
-    | .stream_coverage_verified_count = 100' \
-  "$tmp_dir/runtime-health.json" >"$tmp_dir/usdm-runtime-health.json"
-runtime_policy_accepts "$tmp_dir/usdm-runtime-health.json" old-session 100 \
-  usdm usdm_perpetual_all 100
-jq '.symbol_count = 101
-    | .snapshot_ready_count = 101
-    | .bridged_count = 101
-    | .stream_coverage_verified_count = 101' \
-  "$tmp_dir/usdm-runtime-health.json" >"$tmp_dir/usdm-101-runtime-health.json"
-if runtime_policy_accepts "$tmp_dir/usdm-101-runtime-health.json" old-session 100 \
-  usdm usdm_perpetual_all 100; then
-  printf 'runtime policy accepted 101 USD-M symbols\n' >&2
-  exit 1
-fi
-for field in symbol_count snapshot_ready_count bridged_count stream_coverage_verified_count; do
-  jq --arg field "$field" '.[$field] = "1200"' \
-    "$tmp_dir/runtime-health.json" >"$tmp_dir/quoted-count.json"
-  if runtime_policy_accepts "$tmp_dir/quoted-count.json" old-session 100; then
-    printf 'runtime policy accepted quoted %s\n' "$field" >&2
-    exit 1
-  fi
-  jq --arg field "$field" '.[$field] = 1200.5' \
-    "$tmp_dir/runtime-health.json" >"$tmp_dir/fractional-count.json"
-  if runtime_policy_accepts "$tmp_dir/fractional-count.json" old-session 100; then
-    printf 'runtime policy accepted fractional %s\n' "$field" >&2
-    exit 1
-  fi
-done
-jq '.market = "usdm"' "$tmp_dir/runtime-health.json" >"$tmp_dir/cross-market.json"
-if runtime_policy_accepts "$tmp_dir/cross-market.json" old-session 100; then
-  printf 'runtime policy accepted a cross-market health payload\n' >&2
-  exit 1
-fi
-jq '.dataset = "usdm_perpetual_all"' \
-  "$tmp_dir/runtime-health.json" >"$tmp_dir/cross-dataset.json"
-if runtime_policy_accepts "$tmp_dir/cross-dataset.json" old-session 100; then
-  printf 'runtime policy accepted a cross-dataset health payload\n' >&2
-  exit 1
-fi
-
-rollback_body="$tmp_dir/rollback.sh"
-sed -n '/^rollback_after_failure()/,/^}/p' "$CUTOVER" >"$rollback_body"
-production_predicate_body="$tmp_dir/production-is-fail-closed.sh"
-sed -n '/^production_is_fail_closed()/,/^}/p' "$CUTOVER" \
-  >"$production_predicate_body"
-partial_predicate_body="$tmp_dir/partial-spot-is-restored.sh"
-sed -n '/^partial_spot_runtime_is_restored()/,/^}/p' "$CUTOVER" \
-  >"$partial_predicate_body"
-release_match_body="$tmp_dir/unit-matches-release.sh"
-sed -n '/^unit_matches_release()/,/^}/p' "$CUTOVER" >"$release_match_body"
-run_release_match_fixture() (
-  local current_restarts=$1 expected_restarts=$2
-  local current_invocation=11111111111111111111111111111111
-  systemctl() {
-    case "$1:$2:${3:-}:${4:-}" in
-      is-active:--quiet:production-spot:) return 0 ;;
-      is-enabled:--quiet:production-spot:) return 0 ;;
-      show:production-spot:--property=NRestarts:--value) printf '%s\n' "$current_restarts" ;;
-      show:production-spot:--property=InvocationID:--value) printf '%s\n' "$current_invocation" ;;
-      show:production-spot:--property=MainPID:--value) printf '123\n' ;;
-      *) return 1 ;;
-    esac
-  }
-  readlink() { [[ $1 == -f && $2 == /proc/123/exe ]] && printf '/old-binary\n'; }
-  # shellcheck disable=SC1090
-  . "$release_match_body"
-  if [[ $expected_restarts == default ]]; then
-    unit_matches_release production-spot /old-binary true
+# Runtime-boundary verification reads unordered KEY=VALUE output from
+# systemctl and requires the permanent aggregate slice plus both direct child
+# units.  This small stub keeps the helper covered without mutating a host.
+# Invoked indirectly by the sourced helper.
+# shellcheck disable=SC2317,SC2329
+systemctl() {
+  local action=${1:-} unit=${2:-}
+  [[ $action == show ]] || return 1
+  if [[ $unit == 'system-binance\x2dlob\x2darchiver\x2dproduction.slice' ]]; then
+    printf '%s\n' \
+      'ControlGroup=/system.slice/system-binance\x2dlob\x2darchiver\x2dproduction.slice' \
+      'MemoryMax=3758096384' 'MemoryHigh=3221225472'
+  elif [[ $unit == 'binance-lob-archiver-production@spot.service' ]]; then
+    printf '%s\n' \
+      'MemoryMax=2684354560' \
+      'ControlGroup=/system.slice/system-binance\x2dlob\x2darchiver\x2dproduction.slice/binance-lob-archiver-production@spot.service' \
+      'Slice=system-binance\x2dlob\x2darchiver\x2dproduction.slice'
+  elif [[ $unit == 'binance-lob-archiver-production@usdm.service' ]]; then
+    printf '%s\n' \
+      'Slice=system-binance\x2dlob\x2darchiver\x2dproduction.slice' \
+      'ControlGroup=/system.slice/system-binance\x2dlob\x2darchiver\x2dproduction.slice/binance-lob-archiver-production@usdm.service' \
+      'MemoryMax=2684354560'
   else
-    unit_matches_release production-spot /old-binary true \
-      "$expected_restarts" "$current_invocation"
-  fi
-)
-run_release_match_fixture 0 default
-run_release_match_fixture 1 1
-if run_release_match_fixture 1 default; then
-  printf 'release matcher weakened the default zero-restart contract\n' >&2
-  exit 1
-fi
-if run_release_match_fixture 2 1; then
-  printf 'release matcher accepted a changed restart baseline\n' >&2
-  exit 1
-fi
-spot_wait_body="$tmp_dir/wait-for-spot-release-health.sh"
-sed -n '/^wait_for_spot_release_health()/,/^}/p' "$CUTOVER" >"$spot_wait_body"
-run_spot_wait_fixture() (
-  PRODUCTION_UNITS=(production-spot production-usdm)
-  HEALTH_TIMEOUT_SECONDS=20
-  SECONDS=0
-  health_checks=0
-  systemctl() { [[ $1 == is-active && ${!#} == production-spot ]]; }
-  health_ready_for_release() {
-    health_checks=$((health_checks + 1))
-    ((health_checks >= 3))
-  }
-  unit_matches_release() { return 0; }
-  sleep() { SECONDS=$((SECONDS + $1)); }
-  # shellcheck disable=SC1090
-  . "$spot_wait_body"
-  wait_for_spot_release_health old-binary old-session 123
-  printf '%s\n' "$health_checks"
-)
-[[ $(run_spot_wait_fixture) == 3 ]]
-start_line=$(grep -n 'systemctl start "${PRODUCTION_UNITS\[@\]}"' "$rollback_body" | tail -1 | cut -d: -f1)
-clear_line=$(grep -n 'clear_health_before_restart' "$rollback_body" | cut -d: -f1)
-health_line=$(grep -n 'wait_for_release_health' "$rollback_body" | cut -d: -f1)
-enable_line=$(grep -n 'systemctl enable "${PRODUCTION_UNITS\[@\]}"' "$rollback_body" | cut -d: -f1)
-((clear_line < start_line && start_line < health_line && health_line < enable_line)) || {
-  printf 'rollback no longer follows clear stale health -> start -> verify -> enable\n' >&2
-  exit 1
-}
-grep -Fq 'runtime_matches_release "$OLD_BINARY" true' "$rollback_body"
-grep -Fq '"$rollback_started_ns"' "$rollback_body"
-grep -Fq 'previous-release-health-unverified-disabled' "$rollback_body"
-grep -Fq 'previous-release-restored-contained' "$rollback_body"
-grep -Fq 'systemctl mask --runtime "${TRANSITION_MASK_UNITS[@]}"' "$rollback_body"
-grep -Fq 'ROLLBACK_RESULT=new-host-containment-failed' "$rollback_body"
-grep -Fq 'restore_allowlisted_production_dropins' "$rollback_body"
-grep -Fq 'binance-lob-archiver@spot.service' "$CUTOVER"
-grep -Fq 'binance-lob-archiver@usdm.service' "$CUTOVER"
-grep -Fq 'contained-upgrade' "$CUTOVER"
-grep -Fq 'capture_existing_production_identity contained-upgrade' "$CUTOVER"
-grep -Fq 'partial-contained-spot-live' "$CUTOVER"
-grep -Fq 'capture_existing_production_identity partial-contained-spot-live' "$CUTOVER"
-grep -Fq 'partial_spot_runtime_is_restored' "$CUTOVER"
-grep -Fq 'wait_for_spot_release_health' "$CUTOVER"
-grep -Fq 'previous-spot-restored-usdm-contained' "$CUTOVER"
-grep -Fq "fail 'new host must not retain a production USD-M drop-in'" "$CUTOVER"
-grep -Fq 'binance-lob-archiver-production@usdm.service.d/10-memory.conf' "$CUTOVER"
-grep -Fq 'legacy collector unit must be disabled before cutover' "$CUTOVER"
-grep -Fq 'production unit remained enabled after disable' "$CUTOVER"
-grep -Fq 'candidate production service retained an unexpected systemd drop-in' "$CUTOVER"
-grep -Fq 'validate_existing_production_dropins' "$CUTOVER"
-grep -Fq 'remove_allowlisted_production_dropins_for_candidate' "$CUTOVER"
-
-atomic_helpers_body="$tmp_dir/atomic-cutover-helpers.sh"
-{
-  sed -n '/^atomic_install()/,/^}/p' "$CUTOVER"
-  sed -n '/^atomic_symlink()/,/^}/p' "$CUTOVER"
-} >"$atomic_helpers_body"
-atomic_helpers_root="$tmp_dir/atomic-cutover-helpers"
-mkdir -p "$atomic_helpers_root"
-printf 'old bytes\n' >"$atomic_helpers_root/source"
-printf 'new bytes\n' >"$atomic_helpers_root/target"
-run_atomic_helpers_success_fixture() (
-  mv() { command mv -f "$2" "$3"; }
-  # shellcheck disable=SC1090
-  . "$atomic_helpers_body"
-  atomic_install 0640 "$atomic_helpers_root/source" "$atomic_helpers_root/installed"
-  cmp -s "$atomic_helpers_root/source" "$atomic_helpers_root/installed"
-  atomic_symlink "$atomic_helpers_root/target" "$atomic_helpers_root/current"
-  [[ $(readlink -f "$atomic_helpers_root/current") \
-    == "$(readlink -f "$atomic_helpers_root/target")" ]]
-)
-run_atomic_helpers_fail_closed_fixture() (
-  mv() { return 0; }
-  # shellcheck disable=SC1090
-  . "$atomic_helpers_body"
-  printf 'stale bytes\n' >"$atomic_helpers_root/stale-installed"
-  if atomic_install 0640 \
-    "$atomic_helpers_root/source" "$atomic_helpers_root/stale-installed"; then
-    printf 'atomic install accepted unread-back bytes\n' >&2
-    exit 1
-  fi
-  printf 'wrong target\n' >"$atomic_helpers_root/wrong-target"
-  ln -s "$atomic_helpers_root/wrong-target" "$atomic_helpers_root/stale-current"
-  if atomic_symlink "$atomic_helpers_root/target" "$atomic_helpers_root/stale-current"; then
-    printf 'atomic symlink accepted an unread-back target\n' >&2
-    exit 1
-  fi
-)
-run_atomic_helpers_success_fixture
-run_atomic_helpers_fail_closed_fixture
-
-host_state_dispatch=$(sed -n '/^if (( active_count == 2/,/^fi$/p' "$CUTOVER")
-grep -Fq 'OLD_MODE=new-host' <<<"$host_state_dispatch"
-grep -Fq '(( PRODUCTION_USDM_MEMORY_DROPIN_PRESENT == 0 ))' <<<"$host_state_dispatch"
-grep -Fq $'capture_existing_production_identity contained-upgrade\n  DRAIN_REQUIRED=1' \
-  <<<"$host_state_dispatch"
-grep -Fq 'capture_existing_production_identity partial-contained-spot-live' \
-  <<<"$host_state_dispatch"
-grep -Fq '$spot_active_state == active && $spot_enabled_state == enabled' \
-  <<<"$host_state_dispatch"
-grep -Fq '$usdm_enabled_state == masked || $usdm_enabled_state == masked-runtime' \
-  <<<"$host_state_dispatch"
-grep -Fq '$spot_upload_enabled_state == static' <<<"$host_state_dispatch"
-grep -Fq '$spot_upload_enabled_state == masked-runtime' <<<"$host_state_dispatch"
-grep -Fq '$usdm_upload_enabled_state == masked' <<<"$host_state_dispatch"
-grep -Fq '$usdm_upload_enabled_state == static' <<<"$host_state_dispatch"
-grep -Fq 'previous_spot_restarts' "$CUTOVER"
-grep -Fq 'previous_spot_invocation_id' "$CUTOVER"
-host_state_dispatch_file="$tmp_dir/host-state-dispatch.sh"
-printf '%s\n' "$host_state_dispatch" >"$host_state_dispatch_file"
-run_partial_host_state_fixture() (
-  local usdm_enabled_state=$1 usdm_main_pid=${2:-0}
-  local spot_upload_enabled_state=${3:-masked-runtime}
-  local initial_usdm_upload_enabled_state=${4:-masked-runtime}
-  local fixed_now_ns=2000000000000
-  PRODUCTION_UNITS=(production-spot production-usdm)
-  UPLOAD_UNITS=(upload-spot upload-usdm)
-  PRODUCTION_LINK="$tmp_dir/partial-production-$usdm_enabled_state-$usdm_main_pid-$spot_upload_enabled_state-$initial_usdm_upload_enabled_state"
-  ln -s "$tmp_dir/old-production-binary" "$PRODUCTION_LINK"
-  active_count=1
-  enabled_count=1
-  spot_active_state=active
-  spot_enabled_state=enabled
-  usdm_active_state=inactive
-  usdm_upload_enabled_state=$initial_usdm_upload_enabled_state
-  MASK_USDM_UPLOAD_FOR_TRANSITION=0
-  HEALTH_TIMEOUT_SECONDS=300
-  PRODUCTION_USDM_MEMORY_DROPIN_PRESENT=0
-  DRAIN_REQUIRED=0
-  OLD_MODE=
-  OLD_BINARY=
-  systemctl_value() {
-    case "$1:$2" in
-      production-usdm:SubState) printf 'dead\n' ;;
-      production-usdm:MainPID) printf '%s\n' "$usdm_main_pid" ;;
-      *) return 1 ;;
-    esac
-  }
-  capture_existing_production_identity() {
-    OLD_MODE=$1
-    OLD_BINARY="$tmp_dir/old-production-binary"
-    OLD_SPOT_RESTARTS=1
-    OLD_SPOT_INVOCATION_ID=11111111111111111111111111111111
-  }
-  unit_matches_release() {
-    [[ $1 == production-spot && $2 == "$OLD_BINARY" && $3 == true \
-      && $4 == 1 && $5 == "$OLD_SPOT_INVOCATION_ID" ]]
-  }
-  date() { [[ $1 == +%s%N ]] && printf '%s\n' "$fixed_now_ns"; }
-  health_ready_for_release() {
-    [[ $1 == spot && $2 == 1000 && -z $3 \
-      && $4 == $((fixed_now_ns - HEALTH_TIMEOUT_SECONDS * 1000000000)) ]]
-  }
-  require_empty_segment_spool() { return 1; }
-  fail() { printf '%s\n' "$*" >&2; exit 1; }
-  if ! . "$host_state_dispatch_file"; then
     return 1
   fi
-  printf '%s %s %s\n' \
-    "$OLD_MODE" "$DRAIN_REQUIRED" "$MASK_USDM_UPLOAD_FOR_TRANSITION"
-)
-[[ $(run_partial_host_state_fixture masked-runtime) \
-  == 'partial-contained-spot-live 1 0' ]]
-[[ $(run_partial_host_state_fixture masked-runtime 0 masked-runtime static) \
-  == 'partial-contained-spot-live 1 1' ]]
-
-transition_mask_body="$tmp_dir/transition-mask-usdm-uploader.sh"
-sed -n '/^if (( MASK_USDM_UPLOAD_FOR_TRANSITION )); then$/,/^fi$/p' \
-  "$CUTOVER" >"$transition_mask_body"
-run_transition_mask_fixture() (
-  local readback=$1
-  MASK_USDM_UPLOAD_FOR_TRANSITION=1
-  UPLOAD_UNITS=(upload-spot upload-usdm)
-  STEP=
-  systemctl() {
-    if [[ $1 == mask && $2 == --runtime && $3 == upload-usdm ]]; then
-      return 0
-    fi
-    if [[ $1 == is-enabled && $2 == upload-usdm ]]; then
-      printf '%s\n' "$readback"
-      return 1
-    fi
-    return 1
-  }
-  fail() { exit 1; }
-  # shellcheck disable=SC1090
-  . "$transition_mask_body"
-  [[ $STEP == contain-usdm-uploader ]]
-)
-run_transition_mask_fixture masked-runtime
-if run_transition_mask_fixture static; then
-  printf 'transition accepted an unmasked USD-M uploader readback\n' >&2
-  exit 1
-fi
-transition_started_line=$(grep -n '^TRANSITION_STARTED=1$' "$CUTOVER" | cut -d: -f1)
-transition_mask_line=$(grep -n '^if (( MASK_USDM_UPLOAD_FOR_TRANSITION )); then$' \
-  "$CUTOVER" | cut -d: -f1)
-(( transition_started_line < transition_mask_line )) || {
-  printf 'USD-M uploader mask moved before the governed transition\n' >&2
-  exit 1
 }
-if run_partial_host_state_fixture disabled >"$tmp_dir/partial-disabled.out" 2>&1; then
-  printf 'partial classifier accepted disabled instead of masked USD-M\n' >&2
-  exit 1
-fi
-grep -Fq 'ambiguous production state' "$tmp_dir/partial-disabled.out"
-if run_partial_host_state_fixture masked-runtime 1 \
-  >"$tmp_dir/partial-main-pid.out" 2>&1; then
-  printf 'partial classifier accepted a live USD-M MainPID\n' >&2
-  exit 1
-fi
-grep -Fq 'contained USD-M production is not inactive/dead with MainPID=0' \
-  "$tmp_dir/partial-main-pid.out"
-if run_partial_host_state_fixture masked-runtime 0 masked \
-  >"$tmp_dir/partial-persistent-spot-upload-mask.out" 2>&1; then
-  printf 'partial classifier accepted a persistently masked Spot uploader\n' >&2
-  exit 1
-fi
-grep -Fq 'ambiguous production state' \
-  "$tmp_dir/partial-persistent-spot-upload-mask.out"
-
-new_host_dropin_guard="$tmp_dir/new-host-dropin-guard.sh"
-sed -n '/^  (( PRODUCTION_USDM_MEMORY_DROPIN_PRESENT == 0 )) \\/,+1p' "$CUTOVER" \
-  | sed 's/^  //' >"$new_host_dropin_guard"
-run_new_host_dropin_guard() (
-  PRODUCTION_USDM_MEMORY_DROPIN_PRESENT=$1
-  fail() { printf '%s\n' "$*" >&2; return 1; }
-  # shellcheck disable=SC1090
-  . "$new_host_dropin_guard"
-)
-run_new_host_dropin_guard 0
-if run_new_host_dropin_guard 1 >"$tmp_dir/new-host-dropin.out" 2>&1; then
-  printf 'new-host classification accepted a production drop-in\n' >&2
-  exit 1
-fi
-grep -Fq 'new host must not retain a production USD-M drop-in' \
-  "$tmp_dir/new-host-dropin.out"
-
-drain_dispatch_body="$tmp_dir/drain-dispatch.sh"
-sed -n \
-  '/^if \[\[ \$OLD_MODE == upgrade || \$OLD_MODE == contained-upgrade/,/^fi$/p' \
-  "$CUTOVER" >"$drain_dispatch_body"
-run_drain_dispatch_fixture() (
-  local calls=$1
-  OLD_MODE=$2
-  OLD_DEPLOYMENT=old-deployment
-  DRAIN_REQUIRED=1
-  DRAIN_ATTEMPTED=0
-  DRAIN_MAY_HAVE_MUTATED=0
-  run_candidate_drain() { printf 'drain %s\n' "$1" >>"$calls"; }
-  require_empty_segment_spool() { printf 'require-empty\n' >>"$calls"; }
-  fail() { return 1; }
-  # shellcheck disable=SC1090
-  . "$drain_dispatch_body"
-)
-contained_drain_calls="$tmp_dir/contained-drain.calls"
-partial_drain_calls="$tmp_dir/partial-drain.calls"
-new_host_drain_calls="$tmp_dir/new-host-drain.calls"
-run_drain_dispatch_fixture "$contained_drain_calls" contained-upgrade
-run_drain_dispatch_fixture "$partial_drain_calls" partial-contained-spot-live
-run_drain_dispatch_fixture "$new_host_drain_calls" new-host
-grep -Fxq 'drain old-deployment' "$contained_drain_calls"
-grep -Fxq 'drain old-deployment' "$partial_drain_calls"
-if grep -Fq 'require-empty' "$contained_drain_calls"; then
-  printf 'contained upgrade used the new-host spool invariant\n' >&2
-  exit 1
-fi
-grep -Fxq 'require-empty' "$new_host_drain_calls"
-if grep -Fq 'drain ' "$new_host_drain_calls"; then
-  printf 'new-host cutover tried to drain an old deployment\n' >&2
-  exit 1
-fi
-
-grep -Fq 'release_staging=$(mktemp -d "$release_root/.${artifact_sha256}.new.XXXXXX")' \
-  "$INSTALL_RELEASE"
-grep -Fq 'COPYFILE_DISABLE=1 tar -C "$SCRIPT_DIR" -cf "$BUNDLE_PATH" "${assets[@]}"' \
-  "$INSTALL_RELEASE"
-shadow_spool_install=$(sed -n \
-  '/^install -d -m 0750 -o hftcollector -g hftcollector \\/,/^  \/data\/monday\/spool\/binance-lob-rust-shadow\/usdm$/p' \
-  "$INSTALL_RELEASE")
-grep -Fxq "  /data/monday/spool/binance-lob-rust-shadow \\" <<<"$shadow_spool_install"
-grep -Fq 'install -d -m 0755 /opt/monday/releases' "$INSTALL_RELEASE"
-grep -Fq 'chmod 0755 "$release_staging"' "$INSTALL_RELEASE"
-grep -Fq 'release directory must be traversable with mode 0755' "$INSTALL_RELEASE"
-grep -Fq 'runuser -u hftcollector -- "$release_binary" --self-test' "$INSTALL_RELEASE"
-grep -Fq 'existing release identity does not match requested artifact, bundle, and source' \
-  "$INSTALL_RELEASE"
-grep -Fq 'existing release deployment differs from the requested bundle' "$INSTALL_RELEASE"
-grep -Fq 'bundle_evidence_dir="$binary_evidence_dir/$deployment_bundle_sha256"' "$GATE"
-grep -Fq 'evidence_dir="$runs_dir/$gate_run_id"' "$GATE"
-grep -Fq 'an immutable production-eligible gate already exists' "$GATE"
-grep -Fq 'for candidate_unit in "${candidate_units[@]}"; do' "$GATE"
-grep -Fq 'systemctl reset-failed "$candidate_unit" >/dev/null 2>&1 || true' "$GATE"
-if grep -Fq 'rm -f "$gate_json"' "$GATE"; then
-  printf 'shadow gate still deletes immutable gate evidence\n' >&2
-  exit 1
-fi
-grep -Fq 'gate_markers=("$GATE_BUNDLE_DIR"/runs/*/PASSED.sha256)' "$CUTOVER"
-grep -Fq 'rollback-deployment.sha256' "$CUTOVER"
-grep -Fq 'ROLLBACK_DEPLOYMENT_MANIFEST_SHA256' "$rollback_body"
-grep -Fq 'installed production asset drifted from the active immutable release' "$CUTOVER"
-grep -Fq 'cmp -s -- "$source" "$installed_source"' "$CUTOVER"
-grep -Fq 'mkdir -m 0750 -- "$EVIDENCE_DIR"' "$CUTOVER"
-grep -Fq 'mkdir -m 0750 -- "$evidence_dir"' "$GATE"
-grep -Fq '\( -type f -o -type l \)' "$GATE"
-grep -Fxq 'TimeoutStartSec=0' "$SCRIPT_DIR/binance-lob-archiver-upload@.service"
-grep -Fxq 'TimeoutStartSec=0' "$SCRIPT_DIR/binance-lob-archiver-rust-upload@.service"
-
-candidate_start_body="$tmp_dir/candidate-start.sh"
-sed -n '/^STEP=clear-stale-candidate-health/,/^STEP=write-cutover-evidence/p' \
-  "$CUTOVER" >"$candidate_start_body"
-candidate_clear_line=$(grep -n '^clear_health_before_restart' "$candidate_start_body" | cut -d: -f1)
-candidate_timestamp_line=$(grep -n '^CANDIDATE_STARTED_NS=' "$candidate_start_body" | cut -d: -f1)
-candidate_start_line=$(grep -n 'systemctl start "${PRODUCTION_UNITS\[@\]}"' \
-  "$candidate_start_body" | cut -d: -f1)
-candidate_health_line=$(grep -n '^wait_for_release_health' "$candidate_start_body" | cut -d: -f1)
-candidate_enable_line=$(grep -n 'systemctl enable "${PRODUCTION_UNITS\[@\]}"' \
-  "$candidate_start_body" | cut -d: -f1)
-((candidate_clear_line < candidate_timestamp_line \
-  && candidate_timestamp_line < candidate_start_line \
-  && candidate_start_line < candidate_health_line \
-  && candidate_health_line < candidate_enable_line)) || {
-  printf 'candidate no longer follows clear stale health -> timestamp -> start -> verify -> enable\n' >&2
-  exit 1
-}
-grep -Fq '"$CANDIDATE_STARTED_NS"' "$candidate_start_body"
-
-dropin_body="$tmp_dir/production-dropins.sh"
-{
-  sed -n '/^systemctl_value()/,/^}/p' "$CUTOVER"
-  sed -n '/^validate_memory_only_dropin()/,/^}/p' "$CUTOVER"
-  sed -n '/^capture_allowlisted_production_usdm_dropin()/,/^}/p' "$CUTOVER"
-  sed -n '/^validate_existing_production_dropins()/,/^}/p' "$CUTOVER"
-  sed -n '/^remove_allowlisted_production_dropins_for_candidate()/,/^}/p' "$CUTOVER"
-  sed -n '/^restore_allowlisted_production_dropins()/,/^}/p' "$CUTOVER"
-} >"$dropin_body"
-
-dropin_root="$tmp_dir/dropin-fixture"
-dropin_path="$dropin_root/etc/systemd/system/binance-lob-archiver-production@usdm.service.d/10-memory.conf"
-install -d -m 0755 "$dropin_root/etc/systemd/system/binance-lob-archiver-production@usdm.service.d"
-cat >"$dropin_path" <<'EOF'
-[Service]
-MemoryHigh=4096M
-MemoryMax=5120M
-EOF
-
-run_dropin_roundtrip_fixture() (
-  local spot_dropins=${1:-}
-  local usdm_dropins=${2:-$dropin_path}
-  EVIDENCE_DIR="$dropin_root/evidence"
-  PRODUCTION_UNITS=(production-spot production-usdm)
-  PRODUCTION_USDM_MEMORY_DROPIN="$dropin_path"
-  PRODUCTION_USDM_MEMORY_DROPIN_PRESENT=0
-  PRODUCTION_USDM_MEMORY_DROPIN_BACKUP=
-  PRODUCTION_USDM_MEMORY_DROPIN_MANIFEST=
-  PRODUCTION_USDM_MEMORY_DROPIN_SHA256=
-  rm -rf "$EVIDENCE_DIR"
-  install -d -m 0755 "$EVIDENCE_DIR"
-  fail() { printf '%s\n' "$*" >&2; exit 1; }
-  secure_regular_file() { [[ -f $1 && ! -L $1 ]]; }
-  secure_directory() { [[ -d $1 && ! -L $1 ]]; }
-  atomic_install() { install -m "$1" "$2" "$3"; }
-  systemctl() {
-    if [[ $1 == show && $3 == --property=DropInPaths && $4 == --value ]]; then
-      case "$2" in
-        production-spot) printf '%s\n' "$spot_dropins" ;;
-        production-usdm) printf '%s\n' "$usdm_dropins" ;;
-      esac
-      return 0
-    fi
-    return 1
-  }
-  # shellcheck disable=SC1090
-  . "$dropin_body"
-  validate_existing_production_dropins
-  remove_allowlisted_production_dropins_for_candidate
-  [[ ! -e $PRODUCTION_USDM_MEMORY_DROPIN && ! -L $PRODUCTION_USDM_MEMORY_DROPIN ]]
-  restore_allowlisted_production_dropins
-  cmp -s "$PRODUCTION_USDM_MEMORY_DROPIN_BACKUP" "$PRODUCTION_USDM_MEMORY_DROPIN"
-)
-
-run_dropin_roundtrip_fixture
-cat >"$dropin_path" <<'EOF'
-[Service]
-MemoryHigh=4096M
-MemoryMax=5120M
-ExecStart=/bin/false
-EOF
-if run_dropin_roundtrip_fixture >"$tmp_dir/dropin-invalid.out" 2>&1; then
-  printf 'production drop-in fixture accepted a non-memory directive\n' >&2
-  exit 1
-fi
-grep -Fq 'must contain only [Service], MemoryHigh, and MemoryMax' \
-  "$tmp_dir/dropin-invalid.out"
-cat >"$dropin_path" <<'EOF'
-[Service]
-MemoryHigh=4096M
-MemoryMax=5120M
-EOF
-if run_dropin_roundtrip_fixture /tmp/spot-memory.conf >"$tmp_dir/dropin-spot.out" 2>&1; then
-  printf 'production drop-in fixture accepted a spot drop-in\n' >&2
-  exit 1
-fi
-grep -Fq 'spot production service has an unexpected systemd drop-in' \
-  "$tmp_dir/dropin-spot.out"
-
-# Execute the rollback snapshot logic against isolated fixture roots. This catches
-# content drift and manifest-tamper regressions that static contract greps miss.
-installed_root="$tmp_dir/installed"
-release_deployment="$tmp_dir/old-release/deployment"
-stage_body="$tmp_dir/stage-existing-deployment.sh"
-mkdir -p "$installed_root/systemd" "$installed_root/monday" "$release_deployment"
-sed -n '/^stage_existing_deployment_for_rollback()/,/^}/p' "$CUTOVER" \
-  | sed \
-      -e "s#/etc/systemd/system#$installed_root/systemd#g" \
-      -e "s#/etc/monday#$installed_root/monday#g" \
-  >"$stage_body"
-deployment_assets=(
-  binance-lob-archiver-production@.service
-  binance-lob-archiver-upload@.service
-  binance-lob-archiver-production-spot.env
-  binance-lob-archiver-production-usdm.env
-)
-for asset in "${deployment_assets[@]}"; do
-  case "$asset" in
-    *.service) installed="$installed_root/systemd/$asset" ;;
-    *.env) installed="$installed_root/monday/$asset" ;;
+monday_rust_lob_verify_systemd_production_slice "$ROOT"
+unset -f systemctl
+mutated_snapshot="$ROOT/production-snapshot-mutated.json"
+for mutation in extra-child non-direct wrong-limit identity; do
+  case "$mutation" in
+    extra-child)
+      jq '.active_child_control_groups += ["/system.slice/foreign.service"]' "$production_snapshot" >"$mutated_snapshot" ;;
+    non-direct)
+      jq '.children.spot.control_group = "/other.slice/binance-lob-archiver-production@spot.service"' \
+        "$production_snapshot" >"$mutated_snapshot" ;;
+    wrong-limit)
+      jq '.children.usdm.memory_max_bytes = 2147483648 | .child_memory_max_sum_bytes = 4831838208' \
+        "$production_snapshot" >"$mutated_snapshot" ;;
+    identity)
+      jq '.children.spot.main_pid = 99999 | .children.spot.n_restarts = 99' \
+        "$production_snapshot" >"$mutated_snapshot" ;;
   esac
-  printf 'fixture:%s\n' "$asset" >"$release_deployment/$asset"
-  install -m 0644 "$release_deployment/$asset" "$installed"
+  if [[ $mutation == identity ]]; then
+    monday_validate_lob_production_snapshot "$mutated_snapshot"
+    mutated_identity=$(monday_lob_production_snapshot_identity "$mutated_snapshot")
+    [[ $mutated_identity == "$production_identity" ]] || {
+      printf 'production snapshot identity changed after PID/restart-only drift\n' >&2
+      exit 1
+    }
+  elif monday_validate_lob_production_snapshot "$mutated_snapshot"; then
+    printf 'production snapshot validator accepted %s mutation\n' "$mutation" >&2
+    exit 1
+  fi
 done
 
-run_stage_fixture() (
-  BASE_DEPLOYMENT_ASSETS=("${deployment_assets[@]}")
-  RECOVERY_DEPLOYMENT_ASSETS=()
-  OLD_DEPLOYMENT="$release_deployment"
-  EVIDENCE_DIR=$1
-  ROLLBACK_DEPLOYMENT_MANIFEST_SHA256=
-  fail() { printf '%s\n' "$*" >&2; exit 1; }
-  validate_deployment() { return 0; }
-  secure_regular_file() { [[ -f $1 && ! -L $1 ]]; }
-  atomic_install() { install -m "$1" "$2" "$3"; }
-  # shellcheck disable=SC1090
-  . "$stage_body"
-  stage_existing_deployment_for_rollback
-)
-
-snapshot_evidence="$tmp_dir/snapshot-evidence"
-mkdir -p "$snapshot_evidence"
-run_stage_fixture "$snapshot_evidence"
-(
-  cd "$snapshot_evidence/rollback-deployment"
-  sha256sum --check --strict "$snapshot_evidence/rollback-deployment.sha256" >/dev/null
-)
-printf 'tampered\n' >> \
-  "$snapshot_evidence/rollback-deployment/binance-lob-archiver-production@.service"
-if (
-  cd "$snapshot_evidence/rollback-deployment"
-  sha256sum --check --strict "$snapshot_evidence/rollback-deployment.sha256" >/dev/null 2>&1
-); then
-  printf 'rollback manifest accepted a tampered snapshot\n' >&2
+# PID and restart counters are volatile audit fields, not stable identity.
+# Executable and cgroup changes remain identity drift even when the snapshot
+# is otherwise structurally valid.
+identity_exe_snapshot="$ROOT/production-snapshot-identity-exe.json"
+identity_exe_sha=$(printf 'b%.0s' {1..64})
+jq --arg exe "$identity_exe_sha" \
+  '.children.spot.process_exe_sha256 = $exe' "$production_snapshot" \
+  >"$identity_exe_snapshot"
+[[ $(monday_lob_production_snapshot_identity "$identity_exe_snapshot") != "$production_identity" ]] || {
+  printf 'production snapshot identity ignored executable drift\n' >&2
   exit 1
-fi
-
-printf 'drifted\n' >>"$installed_root/monday/binance-lob-archiver-production-spot.env"
-drift_evidence="$tmp_dir/drift-evidence"
-mkdir -p "$drift_evidence"
-if run_stage_fixture "$drift_evidence" >"$tmp_dir/drift.out" 2>&1; then
-  printf 'rollback snapshot accepted installed configuration drift\n' >&2
-  exit 1
-fi
-grep -Fq 'installed production asset drifted from the active immutable release' \
-  "$tmp_dir/drift.out"
-
-run_contained_upgrade_rollback_fixture() (
-  local expect_contained=${1:-1}
-  local pending_drain=${2:-0}
-  local mode=${3:-contained-upgrade}
-  local old_recovery_timers_enabled=${4:-0}
-  local active_recovery_timer=${5:-}
-  local enabled_recovery_timer=${6:-}
-  local active_recovery_unit=${7:-}
-  local spot_upload_unmasked=0
-  local calls="$tmp_dir/contained-rollback.calls"
-  PRODUCTION_UNITS=(production-spot production-usdm)
-  UPLOAD_UNITS=(upload-spot upload-usdm)
-  RECOVERY_TIMERS=(recovery-spot recovery-usdm)
-  RECOVERY_UNITS=(recovery-spot-service recovery-usdm-service)
-  LEGACY_UNITS=(legacy-spot legacy-usdm)
-  TRANSITION_MASK_UNITS=("${PRODUCTION_UNITS[@]}" "${UPLOAD_UNITS[@]}" "${LEGACY_UNITS[@]}")
-  CANONICAL_SPOOL="$tmp_dir/rollback-spool"
-  CANDIDATE_BINARY="$tmp_dir/candidate-binary"
-  PRODUCTION_LINK="$tmp_dir/contained-production-link"
-  OLD_MODE=$mode
-  OLD_DEPLOYMENT="$tmp_dir/contained-old-deployment"
-  OLD_BINARY="$tmp_dir/contained-old-binary"
-  ROLLBACK_DEPLOYMENT_MANIFEST_SHA256=fixture
-  ROLLBACK_RESULT=
-  EVIDENCE_DIR="$tmp_dir/contained-evidence"
-  DRAIN_REQUIRED=$pending_drain
-  DRAIN_ATTEMPTED=0
-  DRAIN_MAY_HAVE_MUTATED=0
-  OLD_RECOVERY_TIMERS_ENABLED=$old_recovery_timers_enabled
-  OLD_SESSION_SPOT=old-spot-session
-  SPOOL_ENV_DEPLOYMENT=$OLD_DEPLOYMENT
-  mkdir -p "$CANONICAL_SPOOL" "$OLD_DEPLOYMENT" "$EVIDENCE_DIR" \
-    "$(dirname "$PRODUCTION_LINK")"
-  : >"$calls"
-  systemctl() {
-    printf '%s %s\n' "$1" "${*:2}" >>"$calls"
-    case "$1" in
-      is-active)
-        [[ ${!#} == "$active_recovery_timer" || ${!#} == "$active_recovery_unit" ]]
-        ;;
-      is-enabled)
-        if [[ ${!#} == upload-spot && $spot_upload_unmasked -eq 1 ]]; then
-          printf 'static\n'
-          return 1
-        fi
-        if [[ ${2:-} == --quiet ]]; then
-          [[ ${!#} == "$enabled_recovery_timer" ]]
-          return
-        fi
-        if [[ ${!#} == "$enabled_recovery_timer" ]]; then
-          printf 'enabled\n'
-          return 0
-        fi
-        if (( expect_contained )); then
-          printf 'masked-runtime\n'
-        else
-          printf 'disabled\n'
-        fi
-        return 1
-        ;;
-      show)
-        if [[ $* == *'--property=MainPID'* ]]; then
-          printf '0\n'
-        fi
-        ;;
-      unmask)
-        if [[ ${!#} == upload-spot ]]; then
-          spot_upload_unmasked=1
-        fi
-        ;;
-      mask) (( expect_contained )) ;;
-      *) return 0 ;;
-    esac
-  }
-  sha256sum() { return 0; }
-  copy_health_evidence() { return 0; }
-  clear_health_before_restart() { return 0; }
-  health_ready_for_release() { return 0; }
-  wait_for_spot_release_health() { return 0; }
-  unit_matches_release() { return 0; }
-  run_candidate_drain() { printf 'drain %s\n' "$1" >>"$calls"; return 1; }
-  install_deployment() { printf 'install %s\n' "$1" >>"$calls"; return 0; }
-  atomic_symlink() { printf 'symlink %s %s\n' "$1" "$2" >>"$calls"; return 0; }
-  restore_allowlisted_production_dropins() { printf 'restore-dropin\n' >>"$calls"; return 0; }
-  # shellcheck disable=SC1090
-  . "$production_predicate_body"
-  # shellcheck disable=SC1090
-  . "$partial_predicate_body"
-  # shellcheck disable=SC1090
-  . "$rollback_body"
-  rollback_after_failure
-  if (( expect_contained )) \
-    && [[ -z $active_recovery_timer && -z $enabled_recovery_timer \
-      && -z $active_recovery_unit ]]; then
-    grep -Fq "install $OLD_DEPLOYMENT" "$calls"
-    grep -Fq "symlink $OLD_BINARY $PRODUCTION_LINK" "$calls"
-    grep -Fq 'restore-dropin' "$calls"
-    grep -Eq '^daemon-reload( |$)' "$calls"
-  elif grep -Eq '^(install|symlink|restore-dropin|daemon-reload)( |$)' "$calls"; then
-    printf 'uncontained rollback tried to restore the previous release\n' >&2
-    exit 1
-  fi
-  if [[ $mode == partial-contained-spot-live ]]; then
-    grep -Fxq 'start production-spot' "$calls"
-    grep -Fxq 'enable production-spot' "$calls"
-    grep -Fxq 'unmask --runtime production-spot' "$calls"
-    grep -Fxq 'unmask --runtime upload-spot' "$calls"
-    if grep -Eq '^(start|enable|unmask) .*(production-usdm|upload-usdm)' "$calls"; then
-      printf 'partial rollback tried to start, enable, or unmask old USD-M\n' >&2
-      exit 1
-    fi
-  elif grep -Eq '^(start|enable|unmask) ' "$calls"; then
-    printf 'contained rollback tried to restart or unmask the previous release\n' >&2
-    exit 1
-  fi
-  if [[ $mode == contained-upgrade ]] && grep -Fq 'drain ' "$calls"; then
-    printf 'contained rollback retried a failed canonical spool drain\n' >&2
-    exit 1
-  fi
-  if [[ $mode == upgrade && $pending_drain == 1 ]] \
-    && ! grep -Fq "drain $OLD_DEPLOYMENT" "$calls"; then
-    printf 'upgrade rollback did not attempt its required canonical spool drain\n' >&2
-    exit 1
-  fi
-  printf '%s\n' "$ROLLBACK_RESULT"
-)
-
-[[ $(run_contained_upgrade_rollback_fixture) == previous-release-restored-contained ]]
-[[ $(run_contained_upgrade_rollback_fixture 0) \
-  == production-stop-or-disable-containment-failed ]]
-[[ $(run_contained_upgrade_rollback_fixture 1 1) == previous-release-restored-contained ]]
-[[ $(run_contained_upgrade_rollback_fixture 1 0 contained-upgrade 2) \
-  == previous-release-restored-contained ]]
-[[ $(run_contained_upgrade_rollback_fixture 1 0 contained-upgrade 0 recovery-spot) \
-  == production-stop-or-disable-containment-failed ]]
-[[ $(run_contained_upgrade_rollback_fixture 1 0 contained-upgrade 0 '' recovery-spot) \
-  == production-stop-or-disable-containment-failed ]]
-[[ $(run_contained_upgrade_rollback_fixture \
-  1 0 contained-upgrade 0 '' '' recovery-spot-service) \
-  == production-stop-or-disable-containment-failed ]]
-[[ $(run_contained_upgrade_rollback_fixture 1 1 upgrade) \
-  == previous-release-restored-disabled ]]
-[[ $(run_contained_upgrade_rollback_fixture 1 0 partial-contained-spot-live) \
-  == previous-spot-restored-usdm-contained ]]
-[[ $(run_contained_upgrade_rollback_fixture 1 0 partial-contained-spot-live 2) \
-  == previous-spot-restored-usdm-contained ]]
-
-run_new_host_rollback_fixture() (
-  local active_unit=${1:-} unit
-  PRODUCTION_UNITS=(production-spot production-usdm)
-  UPLOAD_UNITS=(upload-spot upload-usdm)
-  RECOVERY_TIMERS=(recovery-spot recovery-usdm)
-  RECOVERY_UNITS=(recovery-spot-service recovery-usdm-service)
-  LEGACY_UNITS=(legacy-spot legacy-usdm)
-  TRANSITION_MASK_UNITS=("${PRODUCTION_UNITS[@]}" "${UPLOAD_UNITS[@]}" "${LEGACY_UNITS[@]}")
-  CANONICAL_SPOOL="$tmp_dir/nonexistent-spool"
-  CANDIDATE_DEPLOYMENT="$tmp_dir/candidate-deployment"
-  CANDIDATE_BINARY="$tmp_dir/candidate-binary"
-  PRODUCTION_LINK="$tmp_dir/nonexistent-production-link"
-  OLD_MODE=new-host
-  ROLLBACK_RESULT=
-  DRAIN_REQUIRED=0
-  DRAIN_ATTEMPTED=0
-  DRAIN_MAY_HAVE_MUTATED=0
-  OLD_RECOVERY_TIMERS_ENABLED=0
-  SPOOL_ENV_DEPLOYMENT=
-  systemctl() {
-    case "$1" in
-      is-active)
-        unit=${!#}
-        [[ -n $active_unit && $unit == "$active_unit" ]]
-        ;;
-      is-enabled)
-        unit=${!#}
-        if [[ ${2:-} == --quiet ]]; then
-          return 1
-        fi
-        printf 'masked-runtime\n'
-        return 1
-        ;;
-      *) return 0 ;;
-    esac
-  }
-  copy_health_evidence() { return 0; }
-  run_candidate_drain() { return 0; }
-  # shellcheck disable=SC1090
-  . "$production_predicate_body"
-  # shellcheck disable=SC1090
-  . "$rollback_body"
-  rollback_after_failure
-  printf '%s\n' "$ROLLBACK_RESULT"
-)
-
-[[ $(run_new_host_rollback_fixture) == new-host-disabled ]]
-[[ $(run_new_host_rollback_fixture legacy-spot) \
-  == production-stop-or-disable-containment-failed ]]
-[[ $(run_new_host_rollback_fixture upload-usdm) \
-  == production-stop-or-disable-containment-failed ]]
-[[ $(run_new_host_rollback_fixture recovery-spot-service) \
-  == production-stop-or-disable-containment-failed ]]
-
-mock_bin="$tmp_dir/bin"
-mock_state="$tmp_dir/mock-state"
-mkdir -p "$mock_bin" "$mock_state"
-cat >"$mock_bin/aliyun" <<'MOCK_ALIYUN'
-#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\n' "$*" >>"$MOCK_STATE_DIR/calls.log"
-case "${1:-} ${2:-}" in
-  'ecs RunCommand')
-    printf '{"InvokeId":"mock-invoke"}\n'
-    ;;
-  'ecs DescribeInvocationResults')
-    if [[ ${MOCK_TRANSIENT_ONCE:-0} == 1 && ! -f $MOCK_STATE_DIR/transient-seen ]]; then
-      : >"$MOCK_STATE_DIR/transient-seen"
-      exit 1
-    elif [[ -f $MOCK_STATE_DIR/stopped && ${MOCK_IGNORE_STOP:-0} != 1 ]]; then
-      status=Stopped
-      exit_code=-1
-    else
-      status=${MOCK_STATUS:-Success}
-      exit_code=${MOCK_EXIT_CODE:-0}
-    fi
-    printf '{"Invocation":{"InvocationStatus":"%s","ExitCode":"%s"}}\n' \
-      "$status" "$exit_code"
-    ;;
-  'ecs StopInvocation')
-    : >"$MOCK_STATE_DIR/stopped"
-    printf '{}\n'
-    ;;
-  *)
-    printf 'unexpected aliyun call: %s\n' "$*" >&2
-    exit 2
-    ;;
-esac
-MOCK_ALIYUN
-cat >"$mock_bin/sleep" <<'MOCK_SLEEP'
-#!/usr/bin/env bash
-exit 0
-MOCK_SLEEP
-chmod +x "$mock_bin/aliyun" "$mock_bin/sleep"
-
-common_env=(
-  PATH="$mock_bin:$PATH"
-  MOCK_STATE_DIR="$mock_state"
-  ACTION=gate
-  INSTANCE_ID=i-test123
-  ARTIFACT_SHA256="$artifact"
-  MONDAY_ALLOW_SHORT_OPERATION_TEST=1
-  MONDAY_OPERATION_TEST_POLLS=2
-  MONDAY_OPERATION_TEST_CANCEL_POLLS=2
-)
-
-run_commands_before=$(grep -c 'ecs RunCommand' "$mock_state/calls.log" 2>/dev/null || true)
-if env \
-  PATH="$mock_bin:$PATH" \
-  MOCK_STATE_DIR="$mock_state" \
-  ACTION=cutover \
-  INSTANCE_ID=i-test123 \
-  ARTIFACT_SHA256="$artifact" \
-  MONDAY_OPERATION_TEST_POLLS=invalid \
-  "$INVOKE" >"$tmp_dir/preflight.out" 2>&1; then
-  printf 'operation wrapper accepted unauthorized test polling parameters\n' >&2
-  exit 1
-fi
-run_commands_after=$(grep -c 'ecs RunCommand' "$mock_state/calls.log" 2>/dev/null || true)
-[[ $run_commands_after == "$run_commands_before" ]] || {
-  printf 'operation wrapper launched a remote command before validating test parameters\n' >&2
+}
+identity_cgroup_snapshot="$ROOT/production-snapshot-identity-cgroup.json"
+jq '.children.spot.control_group += "-changed"' "$production_snapshot" \
+  >"$identity_cgroup_snapshot"
+[[ $(monday_lob_production_snapshot_identity "$identity_cgroup_snapshot") != "$production_identity" ]] || {
+  printf 'production snapshot identity ignored cgroup drift\n' >&2
   exit 1
 }
 
-env "${common_env[@]}" MOCK_STATUS=Success MOCK_EXIT_CODE=0 "$INVOKE" \
-  >"$tmp_dir/success.out"
-grep -Fq 'gate completed successfully: mock-invoke' "$tmp_dir/success.out"
-
-rm -f "$mock_state/stopped" "$mock_state/transient-seen"
-env "${common_env[@]}" MOCK_TRANSIENT_ONCE=1 MOCK_STATUS=Success MOCK_EXIT_CODE=0 \
-  "$INVOKE" >"$tmp_dir/transient.out"
-grep -Fq 'gate completed successfully: mock-invoke' "$tmp_dir/transient.out"
-
-rm -f "$mock_state/stopped"
-if env "${common_env[@]}" MOCK_STATUS=PartialFailed MOCK_EXIT_CODE=1 "$INVOKE" \
-  >"$tmp_dir/failed.out" 2>&1; then
-  printf 'operation wrapper accepted PartialFailed\n' >&2
+jq '.parent_cgroup_procs=[4242]' "$production_snapshot" >"$mutated_snapshot"
+if monday_validate_lob_production_snapshot "$mutated_snapshot"; then
+  printf 'production snapshot validator accepted a non-empty parent cgroup\n' >&2
   exit 1
 fi
 
-rm -f "$mock_state/stopped"
-if env "${common_env[@]}" MOCK_STATUS=Running MOCK_EXIT_CODE=0 "$INVOKE" \
-  >"$tmp_dir/timeout.out" 2>&1; then
-  printf 'operation wrapper accepted a locally timed-out invocation\n' >&2
+assets=()
+source_dir="$ROOT/source"
+mkdir -p "$source_dir"
+while IFS= read -r asset; do
+  assets+=("$asset")
+  cp "$SCRIPT_DIR/$asset" "$source_dir/$asset"
+done < <({ monday_runtime_assets; monday_controller_assets; } | sort -u)
+
+publish_fixture() {
+  local payload=$1 manifest=$2
+  local payload_sha runtime_sha bundle bundle_sha
+  printf '#!/usr/bin/env bash\n# %s\nexit 0\n' "$payload" >"$payload"
+  chmod 0755 "$payload"
+  payload_sha=$(monday_sha256_file "$payload")
+  runtime_sha=$(monday_rust_lob_runtime_contract_sha256 "$source_dir")
+  bundle="$payload.tar"
+  COPYFILE_DISABLE=1 tar -C "$source_dir" -cf "$bundle" "${assets[@]}"
+  bundle_sha=$(monday_sha256_file "$bundle")
+  jq -cS -n --arg uri oss://bucket/payload --arg sha "$payload_sha" \
+    --arg runtime "$runtime_sha" --arg source "$(printf 'a%.0s' {1..40})" \
+    --arg bundle oss://bucket/controller --arg bundle_sha "$bundle_sha" \
+    '{schema:"monday.rust_lob_controller_release.v2",control_plane_version:2,
+      topology:"stable",artifact_uri:$uri,artifact_sha256:$sha,
+      runtime_contract_sha256:$runtime,deployment_source_revision:$source,
+      deployment_bundle_uri:$bundle,deployment_bundle_sha256:$bundle_sha}' >"$manifest"
+  publish_controller_release "$payload" "$bundle" "$manifest" "$ROOT" >/dev/null
+  rm -f "$bundle"
+  printf '%s\n' "$payload_sha"
+}
+
+mkdir -p "$ROOT/opt/monday/bin"
+p0="$ROOT/p0"; m0="$ROOT/m0.json"
+p0_sha=$(publish_fixture "$p0" "$m0")
+mkdir -p "$ROOT/etc/systemd/system" "$ROOT/etc/monday"
+for asset in "$production_slice_asset" binance-lob-archiver-production@.service binance-lob-archiver-upload@.service; do
+  cp "$ROOT/opt/monday/releases/binance-lob-controller/$(monday_sha256_file "$m0")/deployment/$asset" \
+    "$ROOT/etc/systemd/system/$asset"
+done
+for asset in binance-lob-archiver-production-spot.env binance-lob-archiver-production-usdm.env; do
+  cp "$ROOT/opt/monday/releases/binance-lob-controller/$(monday_sha256_file "$m0")/deployment/$asset" \
+    "$ROOT/etc/monday/$asset"
+done
+# Bootstrap independently verifies all nine runtime unit/env bytes (the
+# production and shadow lanes) before establishing stable projections.
+for asset in binance-lob-archiver-rust@.service binance-lob-archiver-rust-upload@.service; do
+  cp "$ROOT/opt/monday/releases/binance-lob-controller/$(monday_sha256_file "$m0")/deployment/$asset" \
+    "$ROOT/etc/systemd/system/$asset"
+done
+for asset in binance-lob-archiver-rust-spot.env binance-lob-archiver-rust-usdm.env; do
+  cp "$ROOT/opt/monday/releases/binance-lob-controller/$(monday_sha256_file "$m0")/deployment/$asset" \
+    "$ROOT/etc/monday/$asset"
+done
+# The fixture starts from the historical eight-asset runtime.  The candidate
+# release carries the ninth signed aggregate-slice asset, but the legacy live
+# topology deliberately does not; this is the only direct R0 -> R2 delta.
+rm -f -- "$ROOT/etc/systemd/system/$production_slice_asset"
+# Production upload-status is a sentinel: every shadow Gate/drain must leave
+# the governed production spool untouched.
+production_spool_root="$ROOT/data/monday/spool/binance-lob"
+mkdir -p "$production_spool_root/spot" "$production_spool_root/usdm"
+printf 'production-sentinel-spot\n' >"$production_spool_root/spot/upload-status.json"
+printf 'production-sentinel-usdm\n' >"$production_spool_root/usdm/upload-status.json"
+mkdir -p "$ROOT/run/lock"
+: >"$ROOT/run/lock/monday-rust-lob-control-plane.lock"
+production_spot_status_sha=$(monday_sha256_file "$production_spool_root/spot/upload-status.json")
+production_usdm_status_sha=$(monday_sha256_file "$production_spool_root/usdm/upload-status.json")
+printf '\n# controller revision two fixture\n' >>"$source_dir/host-rust-lob-readback.sh"
+p1="$ROOT/p1"; m1="$ROOT/m1.json"
+p1_sha=$(publish_fixture "$p1" "$m1")
+c0=$(monday_sha256_file "$m0")
+c1=$(monday_sha256_file "$m1")
+
+# The real bootstrap starts from the immutable controller identity created by
+# the pre-V2 apply path.  It is read-only evidence: no v1 control byte is
+# sourced or executed during the V2 Gate/cutover.
+legacy_root="$ROOT/opt/monday/releases/binance-lob-controller"
+legacy_work="$ROOT/legacy-controller"
+mkdir -p "$legacy_work/deployment"
+legacy_artifact_uri=oss://bucket/payload
+legacy_bundle_uri=oss://bucket/legacy-controller
+legacy_source=$(printf '9%.0s' {1..40})
+legacy_bundle_sha=$(monday_sha256_file "$p0")
+legacy_runtime_sha=$(monday_rust_lob_runtime_contract_sha256_v1 "$source_dir")
+candidate_runtime_sha=$(monday_manifest_field "$m0" runtime_contract_sha256)
+[[ $legacy_runtime_sha != "$candidate_runtime_sha" ]] || {
+  printf 'typed runtime migration fixture did not produce distinct R0/R2 identities\n' >&2
+  exit 1
+}
+jq -cS -n --arg artifact_uri "$legacy_artifact_uri" --arg artifact_sha "$p0_sha" \
+  --arg runtime "$legacy_runtime_sha" \
+  --arg source "$legacy_source" --arg bundle "$legacy_bundle_uri" --arg bundle_sha "$legacy_bundle_sha" \
+  '{schema:("monday.rust_lob_controller_release." + "v1"),artifact_uri:$artifact_uri,
+    artifact_sha256:$artifact_sha,runtime_contract_sha256:$runtime,
+    deployment_source_revision:$source,deployment_bundle_uri:$bundle,
+    deployment_bundle_sha256:$bundle_sha}' >"$legacy_work/release.json"
+legacy_c0=$(monday_sha256_file "$legacy_work/release.json")
+for asset in host-rust-lob-recovery-queue.sh monday-collector-health.sh; do
+  cp -p -- "$source_dir/$asset" "$legacy_work/deployment/$asset"
+  # Deliberately make the legacy C0 helper bytes differ from the V2 C1
+  # projection.  A crash after active=C1 must therefore replace these regular
+  # legacy files from the verified active controller, rather than silently
+  # accepting whichever bytes happened to be left on disk.
+  printf '\n# legacy C0 helper projection fixture\n' >>"$legacy_work/deployment/$asset"
+done
+mkdir -p "$legacy_root/$legacy_c0/deployment"
+cp -p -- "$legacy_work/release.json" "$legacy_root/$legacy_c0/release.json"
+cp -p -- "$legacy_work/deployment/"* "$legacy_root/$legacy_c0/deployment/"
+(cd "$legacy_root/$legacy_c0" && sha256sum release.json >release.json.sha256 && sha256sum deployment/* >deployment.sha256)
+ln -s "$legacy_root/$legacy_c0" "$legacy_root/active"
+cp -p -- "$legacy_work/deployment/host-rust-lob-recovery-queue.sh" \
+  "$ROOT/opt/monday/bin/monday-rust-lob-recovery-queue"
+cp -p -- "$legacy_work/deployment/monday-collector-health.sh" \
+  "$ROOT/opt/monday/bin/monday-collector-health.sh"
+
+# Bootstrap uses an explicit direct before topology.  The live legacy P0/R0
+# stays frozen until Cutover while the candidate may carry a new P1/R1.
+legacy_production_projection="../releases/binance-lob-archiver/$p0_sha/binance-lob-archiver"
+ln -s "$legacy_production_projection" "$ROOT/opt/monday/bin/binance-lob-archiver"
+# Live runtime digesting is read-only: even with a nonexistent TMPDIR, the
+# canonical v1 asset order and digest must match the fixture's recorded R0.
+runtime_tmpdir_guard="$ROOT/nonexistent-runtime-tmp"
+live_runtime_without_tmp=$(TMPDIR="$runtime_tmpdir_guard" \
+  monday_rust_lob_live_runtime_contract_sha256_v1 "$ROOT")
+[[ $live_runtime_without_tmp == "$legacy_runtime_sha" && ! -e $runtime_tmpdir_guard ]] || {
+  printf 'live runtime digest helper changed identity or created TMPDIR\n' >&2
+  exit 1
+}
+legacy_production_service="$ROOT/etc/systemd/system/binance-lob-archiver-production@.service"
+cp -p -- "$legacy_production_service" "$legacy_production_service.before-delta"
+chmod u+w "$legacy_production_service"
+printf '\n# illegal legacy runtime delta fixture\n' >>"$legacy_production_service"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
+  --from-controller direct --candidate-controller "$c0" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'Gate accepted an illegal legacy runtime delta\n' >&2
   exit 1
 fi
-grep -Fq 'ecs StopInvocation' "$mock_state/calls.log"
-grep -Fq 'invocation reached terminal state after cancellation: Stopped' "$tmp_dir/timeout.out"
-
-rm -f "$mock_state/stopped"
-if env "${common_env[@]}" MOCK_STATUS=Running MOCK_IGNORE_STOP=1 "$INVOKE" \
-  >"$tmp_dir/unconfirmed.out" 2>&1; then
-  printf 'operation wrapper accepted an unconfirmed cancellation\n' >&2
+mv -f -- "$legacy_production_service.before-delta" "$legacy_production_service"
+# A read-only host preflight must validate the same C/from/P/R and installed
+# production bytes as the formal Gate, then emit advisory JSON without creating
+# or truncating the existing lock, run spool, evidence, worker slice, lease,
+# shadow, or systemd unit.
+preflight_residue_before=$(find "$ROOT/data/monday/spool/binance-lob-rust-shadow" \
+  "$ROOT/data/monday/evidence/shadow-gates" "$ROOT/run/monday/rust-lob-gate" \
+  "$ROOT/run/systemd/system" -mindepth 1 -print 2>/dev/null | LC_ALL=C sort || true)
+preflight_lock_path="$ROOT/run/lock/monday-rust-lob-control-plane.lock"
+preflight_lock_sha=$(monday_sha256_file "$preflight_lock_path")
+preflight_tmpdir_guard="$ROOT/nonexistent-preflight-tmp"
+rm -rf -- "$preflight_tmpdir_guard"
+rm -f -- "$ROOT/run/gate-fixture.calls"
+subminute_env="$source_dir/binance-lob-archiver-rust-spot.env"
+cp -p -- "$subminute_env" "$subminute_env.before-test"
+sed 's/^SEGMENT_SECONDS=.*/SEGMENT_SECONDS=59/' "$subminute_env.before-test" >"$subminute_env"
+subminute_manifest="$ROOT/subminute-manifest.json"
+publish_fixture "$p0" "$subminute_manifest" >/dev/null
+subminute_controller=$(monday_sha256_file "$subminute_manifest")
+mv -f -- "$subminute_env.before-test" "$subminute_env"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$subminute_controller" --preflight-only --root "$ROOT" \
+  >"$ROOT/run/preflight-subminute-segment.out" 2>&1; then
+  printf 'read-only preflight accepted a sub-minute segment cadence\n' >&2
   exit 1
 fi
-grep -Fq 'invocation did not confirm cancellation' "$tmp_dir/unconfirmed.out"
+grep -Fq 'spot shadow SEGMENT_SECONDS is below the collector minimum' \
+  "$ROOT/run/preflight-subminute-segment.out" || {
+  cat "$ROOT/run/preflight-subminute-segment.out" >&2
+  exit 1
+}
+preflight_output=$(TMPDIR="$preflight_tmpdir_guard" MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --preflight-only --root "$ROOT")
+jq -e --arg runtime "$candidate_runtime_sha" \
+  '.schema == "monday.rust_lob_shadow_gate_preflight.v1"
+   and .operation == "gate" and .preflight_only == true
+   and .authoritative == false and .production_changed == false
+   and .authorizes_gate == false and .authorizes_cutover == false
+   and .candidate_runtime_contract_sha256 == $runtime
+   and .production_cgroup_snapshot.production_envelope_state == "legacy-unlimited"
+   and .production_cgroup_snapshot.production_slice_memory_high_bytes == null
+   and .production_cgroup_snapshot.production_slice_memory_max_bytes == null
+   and .production_cgroup_snapshot.target_production_slice_memory_high_bytes == 3221225472
+   and .production_cgroup_snapshot.target_production_slice_memory_max_bytes == 3758096384
+   and (.io_full_psi_windows | length == 1)
+   and .io_full_psi_windows[0].phase == "preflight"
+   and .io_full_psi_windows[0].veto == false
+   and (.checks.controller and .checks.from_controller and .checks.payload
+     and .checks.runtime_contract and .checks.installed_bytes
+     and .checks.production_cgroup and .checks.psi_sampler)' \
+  <<<"$preflight_output" >/dev/null
+# A direct v1 -> V2 migration must be able to Gate a new payload while the
+# immutable legacy payload keeps running until Cutover.
+[[ $p0_sha != "$p1_sha" ]]
+if ! payload_delta_preflight=$(TMPDIR="$preflight_tmpdir_guard" \
+  MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c1" --preflight-only --root "$ROOT" 2>&1); then
+  printf '%s\n' "$payload_delta_preflight" >&2
+  printf 'read-only preflight rejected a direct payload transition\n' >&2
+  exit 1
+fi
+jq -e --arg from "$legacy_c0" --arg before "$p0_sha" --arg candidate "$p1_sha" \
+  '.from_controller_sha256 == $from
+   and .candidate_payload_sha256 == $candidate
+   and all(.production_cgroup_snapshot.children[];
+     .process_exe_sha256 == $before)
+   and .production_changed == false' <<<"$payload_delta_preflight" >/dev/null
+[[ ! -e "$preflight_tmpdir_guard" ]] || {
+  printf 'read-only preflight created a temporary directory\n' >&2
+  exit 1
+}
+preflight_residue_after=$(find "$ROOT/data/monday/spool/binance-lob-rust-shadow" \
+  "$ROOT/data/monday/evidence/shadow-gates" "$ROOT/run/monday/rust-lob-gate" \
+  "$ROOT/run/systemd/system" -mindepth 1 -print 2>/dev/null | LC_ALL=C sort || true)
+[[ $preflight_residue_after == "$preflight_residue_before" ]] || {
+  printf 'read-only preflight left run-scoped residue\n' >&2
+  exit 1
+}
+[[ $(monday_sha256_file "$preflight_lock_path") == "$preflight_lock_sha" ]] || {
+  printf 'read-only preflight changed the existing lock file\n' >&2
+  exit 1
+}
+[[ ! -s "$ROOT/run/gate-fixture.calls" ]] || {
+  printf 'read-only preflight invoked a mutating systemd action\n' >&2
+  exit 1
+}
+# The read-only preflight must reject the same invalid live production cgroup
+# topology as the formal Gate.
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_EXTRA_CHILD=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --preflight-only --root "$ROOT" \
+  >"$ROOT/run/preflight-extra-cgroup-child.err" 2>&1; then
+  printf 'read-only preflight accepted an extra active production cgroup child\n' >&2
+  exit 1
+fi
+grep -Fq 'production cgroup snapshot is invalid' \
+  "$ROOT/run/preflight-extra-cgroup-child.err" || {
+  cat "$ROOT/run/preflight-extra-cgroup-child.err" >&2
+  exit 1
+}
+rm -rf -- "$ROOT/sys/fs/cgroup/system.slice/$production_slice_asset/foreign.service"
+# A direct v1 -> V2 Gate must not require C1's runtime bytes to be installed
+# before Cutover. Bind the live eight-asset topology to a distinct immutable
+# C0 runtime, then prove the 300-second C1 still passes read-only preflight.
+runtime_delta_envs=(
+  "$ROOT/etc/monday/binance-lob-archiver-production-spot.env"
+  "$ROOT/etc/monday/binance-lob-archiver-production-usdm.env"
+  "$ROOT/etc/monday/binance-lob-archiver-rust-spot.env"
+  "$ROOT/etc/monday/binance-lob-archiver-rust-usdm.env"
+)
+write_legacy_runtime_delta() {
+  local source=$1 target=$2
+  case ${target##*/} in
+    binance-lob-archiver-production-spot.env)
+      sed -e 's/^SEGMENT_SECONDS=.*/SEGMENT_SECONDS=3600/' \
+        -e 's|^SPOOL_DIR=.*|SPOOL_DIR=/data/monday/spool/binance-lob-v1/spot|' "$source" >"$target" ;;
+    binance-lob-archiver-production-usdm.env)
+      sed -e 's/^SEGMENT_SECONDS=.*/SEGMENT_SECONDS=3600/' \
+        -e 's|^SPOOL_DIR=.*|SPOOL_DIR=/data/monday/spool/binance-lob-v1/usdm|' "$source" >"$target" ;;
+    *) sed 's/^SEGMENT_SECONDS=.*/SEGMENT_SECONDS=3600/' "$source" >"$target" ;;
+  esac
+}
+for runtime_env in "${runtime_delta_envs[@]}"; do
+  cp -p -- "$runtime_env" "$runtime_env.before-direct-delta"
+  chmod u+w "$runtime_env"
+  write_legacy_runtime_delta "$runtime_env.before-direct-delta" "$runtime_env"
+done
+legacy_delta_runtime=$(monday_rust_lob_live_runtime_contract_sha256_v1 "$ROOT")
+[[ $legacy_delta_runtime != "$candidate_runtime_sha" ]]
+legacy_delta_manifest="$ROOT/legacy-runtime-delta.json"
+jq --arg runtime "$legacy_delta_runtime" --arg source "$(printf '7%.0s' {1..40})" \
+  '.runtime_contract_sha256 = $runtime | .deployment_source_revision = $source' \
+  "$legacy_work/release.json" >"$legacy_delta_manifest"
+legacy_delta_c0=$(monday_sha256_file "$legacy_delta_manifest")
+mkdir -p "$legacy_root/$legacy_delta_c0/deployment"
+cp -p -- "$legacy_delta_manifest" "$legacy_root/$legacy_delta_c0/release.json"
+(cd "$legacy_root/$legacy_delta_c0" && sha256sum release.json >release.json.sha256)
+rm -f -- "$legacy_root/active"
+ln -s "$legacy_root/$legacy_delta_c0" "$legacy_root/active"
+runtime_delta_preflight=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --preflight-only --root "$ROOT")
+jq -e --arg from "$legacy_delta_c0" --arg candidate "$c0" \
+  --arg runtime "$candidate_runtime_sha" \
+  '.from_controller_sha256 == $from
+   and .candidate_controller_sha256 == $candidate
+   and .candidate_runtime_contract_sha256 == $runtime
+   and .checks.installed_bytes == true
+   and .production_changed == false' <<<"$runtime_delta_preflight" >/dev/null
+rm -f -- "$legacy_root/active"
+ln -s "$legacy_root/$legacy_c0" "$legacy_root/active"
+for runtime_env in "${runtime_delta_envs[@]}"; do
+  mv -f -- "$runtime_env.before-direct-delta" "$runtime_env"
+done
+[[ $(monday_rust_lob_live_runtime_contract_sha256_v1 "$ROOT") == "$legacy_runtime_sha" ]]
+# An unresolved lease left by the retired controller still blocks this Gate.
+legacy_lease="$ROOT/run/monday/rust-lob-gate/bootstrap-slice-lease-20260829T000000Z-1.json"
+mkdir -p "${legacy_lease%/*}"
+printf '{}\n' >"$legacy_lease"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --preflight-only --root "$ROOT" \
+  >"$ROOT/run/preflight-legacy-lease.err" 2>&1; then
+  printf 'read-only preflight accepted unresolved legacy lease state\n' >&2
+  exit 1
+fi
+grep -Fq 'unresolved legacy production-envelope lease blocks Gate' \
+  "$ROOT/run/preflight-legacy-lease.err" || {
+  cat "$ROOT/run/preflight-legacy-lease.err" >&2
+  exit 1
+}
+# A terminal marker alone is not audit evidence.  The complete run-scoped
+# record must validate before it can stop blocking a new Gate.
+jq -cn '{schema:"monday.rust_lob_bootstrap_slice_lease.v1",applied:true,restored:true}' \
+  >"$legacy_lease"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --preflight-only --root "$ROOT" \
+  >"$ROOT/run/preflight-incomplete-terminal-lease.err" 2>&1; then
+  printf 'read-only preflight accepted an incomplete terminal legacy lease\n' >&2
+  exit 1
+fi
+grep -Fq 'unresolved legacy production-envelope lease blocks Gate' \
+  "$ROOT/run/preflight-incomplete-terminal-lease.err" || {
+  cat "$ROOT/run/preflight-incomplete-terminal-lease.err" >&2
+  exit 1
+}
+legacy_run=20260829T000000Z-1
+legacy_gate_script="$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/host-rust-lob-shadow-gate.sh"
+legacy_recovery_service="monday-rust-lob-gate-${legacy_run}-lease-recovery.service"
+legacy_recovery_timer="monday-rust-lob-gate-${legacy_run}-lease-recovery.timer"
+jq -cn --arg run "$legacy_run" --arg slice "$production_slice_asset" \
+  --arg controller "$c0" --arg gate_script "$legacy_gate_script" \
+  --arg gate_script_sha "$(monday_sha256_file "$legacy_gate_script")" \
+  --arg recovery_service "$legacy_recovery_service" \
+  --arg recovery_timer "$legacy_recovery_timer" \
+  '{schema:"monday.rust_lob_bootstrap_slice_lease.v1",run_id:$run,slice:$slice,
+    mode:"temporary-bootstrap",before_memory_high:"infinity",before_memory_max:"infinity",
+    before_parent_control_group:("/system.slice/" + $slice),
+    before_parent_memory_current_bytes:0,before_parent_memory_anon_bytes:0,
+    requested_memory_high:"3072M",requested_memory_max:"3584M",
+    candidate_controller_sha256:$controller,gate_script:$gate_script,
+    gate_script_sha256:$gate_script_sha,gate_pid:1,gate_starttime:1,
+    recovery_service:$recovery_service,recovery_timer:$recovery_timer,
+    applied:true,restored:true}' >"$legacy_lease"
+if ! MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --preflight-only --root "$ROOT" \
+  >"$ROOT/run/preflight-terminal-v1-lease.json" 2>&1; then
+  cat "$ROOT/run/preflight-terminal-v1-lease.json" >&2
+  exit 1
+fi
+jq -c --arg timer monday-collector-health.timer --arg service monday-collector-health.service '
+  .schema = "monday.rust_lob_bootstrap_slice_lease.v2"
+  | .bootstrap_monitor_containment = {
+      required:true,timer:$timer,service:$service,
+      before_timer:{unit:$timer,load_state:"loaded",active_state:"active",sub_state:"waiting",unit_file_state:"enabled"},
+      before_service:{unit:$service,load_state:"loaded",active_state:"inactive",sub_state:"dead",unit_file_state:"static"},
+      pause_applied:true,timer_restored:true,service_was_noninactive:false,service_quiesced:true
+    }
+' "$legacy_lease" >"${legacy_lease}.tmp"
+mv -f -- "${legacy_lease}.tmp" "$legacy_lease"
+if ! MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --preflight-only --root "$ROOT" \
+  >"$ROOT/run/preflight-terminal-v2-lease.json" 2>&1; then
+  cat "$ROOT/run/preflight-terminal-v2-lease.json" >&2
+  exit 1
+fi
+rm -f -- "$legacy_lease"
+# An absent lock is a fail-closed preflight error and must not be recreated.
+mv -f -- "$preflight_lock_path" "$preflight_lock_path.missing"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --preflight-only --root "$ROOT" \
+  >/dev/null 2>"$ROOT/run/preflight-lock-missing.err"; then
+  printf 'read-only preflight recreated a missing lock file\n' >&2
+  exit 1
+fi
+[[ ! -e "$preflight_lock_path" && -e "$preflight_lock_path.missing" ]] || {
+  printf 'missing-lock preflight changed lock path state\n' >&2
+  exit 1
+}
+mv -f -- "$preflight_lock_path.missing" "$preflight_lock_path"
+preflight_residue_after=$(find "$ROOT/data/monday/spool/binance-lob-rust-shadow" \
+  "$ROOT/data/monday/evidence/shadow-gates" "$ROOT/run/monday/rust-lob-gate" \
+  "$ROOT/run/systemd/system" -mindepth 1 -print 2>/dev/null | LC_ALL=C sort || true)
+[[ $preflight_residue_after == "$preflight_residue_before" ]] || {
+  printf 'missing-lock preflight left run-scoped residue\n' >&2
+  exit 1
+}
+# Fixture lock contention is deterministic because macOS has no flock binary;
+# production uses the real flock command on the same read-only descriptor.
+rm -f -- "$ROOT/run/gate-fixture.calls"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_LOCK_BUSY=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --preflight-only --root "$ROOT" \
+  >/dev/null 2>"$ROOT/run/preflight-lock-busy.err"; then
+  printf 'read-only preflight ignored lock contention\n' >&2
+  exit 1
+fi
+[[ $(monday_sha256_file "$preflight_lock_path") == "$preflight_lock_sha" ]] || {
+  printf 'lock-contention preflight changed the existing lock file\n' >&2
+  exit 1
+}
+[[ ! -s "$ROOT/run/gate-fixture.calls" ]] || {
+  printf 'lock-contention preflight invoked a mutating systemd action\n' >&2
+  exit 1
+}
+# A failed identity check must fail before any write as well.  Point production
+# at bytes that differ from immutable legacy C0, then restore the exact link.
+preflight_residue_before=$preflight_residue_after
+direct_production="$ROOT/opt/monday/bin/binance-lob-archiver"
+direct_production_before=$(readlink -- "$direct_production")
+rm -f -- "$direct_production"
+ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p1_sha/binance-lob-archiver" \
+  "$direct_production"
+identity_preflight_succeeded=false
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c1" --preflight-only --root "$ROOT" \
+  >"$ROOT/run/preflight-failure.err" 2>&1; then
+  identity_preflight_succeeded=true
+fi
+rm -f -- "$direct_production"
+ln -s "$direct_production_before" "$direct_production"
+if [[ $identity_preflight_succeeded == true ]]; then
+  printf 'read-only preflight accepted production bytes outside legacy C0\n' >&2
+  exit 1
+fi
+grep -Fq 'direct bootstrap requires an immutable v1 active controller' \
+  "$ROOT/run/preflight-failure.err"
+preflight_residue_after=$(find "$ROOT/data/monday/spool/binance-lob-rust-shadow" \
+  "$ROOT/data/monday/evidence/shadow-gates" "$ROOT/run/monday/rust-lob-gate" \
+  "$ROOT/run/systemd/system" -mindepth 1 -print 2>/dev/null | LC_ALL=C sort || true)
+[[ $preflight_residue_after == "$preflight_residue_before" ]] || {
+  printf 'failed read-only preflight left run-scoped residue\n' >&2
+  exit 1
+}
 
-printf 'Rust collector control-plane contracts passed\n'
+# A different candidate payload and runtime must remain recoverable through the
+# direct Cutover boundary.  Reinstall the distinct legacy cadence and bind it to
+# its immutable C0 before producing the Gate used by this crash transition.
+for runtime_env in "${runtime_delta_envs[@]}"; do
+  cp -p -- "$runtime_env" "$runtime_env.before-payload-delta"
+  chmod u+w "$runtime_env"
+  write_legacy_runtime_delta "$runtime_env.before-payload-delta" "$runtime_env"
+done
+rm -f -- "$legacy_root/active"
+ln -s "$legacy_root/$legacy_delta_c0" "$legacy_root/active"
+[[ $(monday_rust_lob_live_runtime_contract_sha256_v1 "$ROOT") == "$legacy_delta_runtime" ]]
+# SIGKILL after the recovery intent but before active=C1 must leave C0/P0/R0
+# frozen and permit one identical retry.  The retry is then killed immediately
+# after active=C1; Restore must converge that authorized intermediate state to
+# C1/P1/R1 without guessing another Gate, payload, or runtime.
+if ! payload_delta_gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  bash -c '
+    root=$1; shift
+    mkdir -p "$root/proc/$$"
+    printf "1 fixture S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 4242\\n" >"$root/proc/$$/stat"
+    printf "%s\\n" "$$" >"$root/run/payload-delta-gate.pid"
+    exec "$@"
+  ' _ "$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
+  --from-controller direct --candidate-controller "$c1" --root "$ROOT" 2>&1); then
+  printf '%s\n' "$payload_delta_gate_output" >&2
+  printf 'formal Gate rejected a direct payload transition\n' >&2
+  exit 1
+fi
+payload_delta_gate_pid=$(cat "$ROOT/run/payload-delta-gate.pid")
+rm -rf -- "$ROOT/proc/$payload_delta_gate_pid" "$ROOT/run/payload-delta-gate.pid"
+payload_delta_gate=$(printf '%s\n' "$payload_delta_gate_output" | sed -n 's/^V2 Gate receipt: //p')
+payload_delta_gate_sha=$(printf '%s\n' "$payload_delta_gate_output" | sed -n 's/^SHA-256: //p')
+monday_validate_v2_gate "$payload_delta_gate" direct "$c1" "$payload_delta_gate_sha"
+rm -f -- "$ROOT/run/cutover-fixture.calls"
+payload_delta_recovery="$ROOT/data/monday/evidence/cutovers/$c1/recovery.json"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
+  MONDAY_CUTOVER_FIXTURE_LEGACY_ACTIVE=1 MONDAY_CUTOVER_HARD_CRASH_AFTER_RECOVERY_INTENT=1 \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-cutover.sh" \
+  --from direct --to "$c1" --gate-receipt "$payload_delta_gate" \
+  --gate-sha256 "$payload_delta_gate_sha" --root "$ROOT" \
+  >"$ROOT/run/payload-delta-precommit.err" 2>&1; then
+  printf 'pre-commit direct payload transition unexpectedly survived SIGKILL\n' >&2
+  exit 1
+fi
+[[ $(monday_active_controller_sha "$ROOT") == "$legacy_delta_c0" ]]
+[[ $(readlink -- "$direct_production") == "$direct_production_before" ]]
+[[ $(monday_rust_lob_live_runtime_contract_sha256_v1 "$ROOT") == "$legacy_delta_runtime" ]]
+if [[ ! -f $payload_delta_recovery || -L $payload_delta_recovery ]]; then
+  printf 'pre-commit hard crash did not preserve its recovery intent\n' >&2
+  exit 1
+fi
+payload_delta_recovery_sha=$(monday_sha256_file "$payload_delta_recovery")
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
+  MONDAY_CUTOVER_FIXTURE_LEGACY_ACTIVE=1 MONDAY_CUTOVER_HARD_CRASH_AFTER_ACTIVE=1 \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-cutover.sh" \
+  --from direct --to "$c1" --gate-receipt "$payload_delta_gate" \
+  --gate-sha256 "$payload_delta_gate_sha" --root "$ROOT" \
+  >"$ROOT/run/payload-delta-cutover.err" 2>&1; then
+  printf 'hard-crash direct payload transition unexpectedly survived SIGKILL\n' >&2
+  exit 1
+fi
+[[ $(monday_active_controller_sha "$ROOT") == "$c1" ]]
+[[ $(readlink -- "$direct_production") == "$direct_production_before" ]]
+[[ $(monday_rust_lob_live_runtime_contract_sha256_v1 "$ROOT") == "$legacy_delta_runtime" ]]
+if [[ ! -f $payload_delta_recovery || -L $payload_delta_recovery ]]; then
+  cat "$ROOT/run/payload-delta-cutover.err" >&2
+  printf 'hard-crash cutover did not preserve its recovery intent\n' >&2
+  exit 1
+fi
+[[ $(monday_sha256_file "$payload_delta_recovery") == "$payload_delta_recovery_sha" ]]
+payload_delta_restore_receipt="$ROOT/data/monday/evidence/restores/$c1/restore.json"
+payload_delta_restore_marker="$payload_delta_restore_receipt.sha256"
+payload_delta_restore_stop="$ROOT/run/payload-delta-restore-health.stop"
+write_payload_delta_restore_health() {
+  local session_prefix=$1 observed market symbols dataset
+  while [[ ! -e "$ROOT/run/restore-fixture-start-spot" ]]; do
+    [[ -e $payload_delta_restore_stop ]] && return 0
+    sleep 0.05
+  done
+  while [[ ! -e $payload_delta_restore_stop ]]; do
+    observed=$(date +%s%N)
+    for market in spot usdm; do
+      symbols=1000; dataset=spot_all
+      [[ $market == usdm ]] && symbols=100 && dataset=usdm_perpetual_top100_lob_trade
+      jq -cn --arg market "$market" --arg dataset "$dataset" \
+        --arg session "$session_prefix-$market" --argjson symbols "$symbols" \
+        --argjson observed "$observed" '
+          {market:$market,dataset:$dataset,status:"synced",sequence_gaps:0,
+           symbol_count:$symbols,snapshot_ready_count:$symbols,bridged_count:$symbols,
+           stream_coverage_verified_count:$symbols,snapshot_only_symbols:[],
+           all_symbols_bridged:true,all_stream_coverage_verified:true,
+           full_stream_coverage_verified:true,pending_upload_segments:0,
+           queue_saturated:false,disk_warning:false,upload_warning:false,
+           session_id:$session,updated_at_ns:$observed}
+        ' >"$production_spool_root/$market/health.json.tmp"
+      mv -f -- "$production_spool_root/$market/health.json.tmp" \
+        "$production_spool_root/$market/health.json"
+    done
+    sleep 0.05
+  done
+}
+payload_delta_restore_pid_before=5151
+mkdir -p "$ROOT/proc/$payload_delta_restore_pid_before"
+ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p1_sha/binance-lob-archiver" \
+  "$ROOT/proc/$payload_delta_restore_pid_before/exe"
+rm -f -- "$payload_delta_restore_stop" "$ROOT/run/restore-fixture-start-spot" \
+  "$ROOT/run/restore-fixture-start-usdm" "$production_spool_root/spot/health.json" \
+  "$production_spool_root/usdm/health.json"
+(write_payload_delta_restore_health restore-reboot-before) &
+payload_delta_restore_writer=$!
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_RESTORE_FIXTURE_SYSTEMD=1 \
+  MONDAY_RESTORE_FIXTURE_PID="$payload_delta_restore_pid_before" \
+  MONDAY_RESTORE_HEALTH_TIMEOUT_SECONDS=3 MONDAY_RESTORE_FAIL_AFTER_RECEIPT=1 \
+  MONDAY_RESTORE_HARD_CRASH_AFTER_DIGEST_CLEANUP=1 \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-restore.sh" \
+  --controller "$c1" --root "$ROOT" >"$ROOT/run/payload-delta-restore.err" 2>&1; then
+  printf 'post-receipt cleanup unexpectedly survived SIGKILL\n' >&2
+  exit 1
+fi
+: >"$payload_delta_restore_stop"
+wait "$payload_delta_restore_writer"
+[[ -f $payload_delta_recovery && ! -L $payload_delta_recovery ]]
+[[ -f $payload_delta_restore_receipt && ! -L $payload_delta_restore_receipt ]]
+[[ ! -e $payload_delta_restore_marker && ! -L $payload_delta_restore_marker ]]
+jq -e --arg gate "$payload_delta_gate" --arg gate_sha "$payload_delta_gate_sha" '
+  .transition_receipt == null
+  and .gate_receipt == $gate and .gate_sha256 == $gate_sha
+' "$payload_delta_restore_receipt" >/dev/null
+payload_delta_restore_receipt_before=$(monday_sha256_file "$payload_delta_restore_receipt")
+payload_delta_restore_pid_after=5152
+mkdir -p "$ROOT/proc/$payload_delta_restore_pid_after"
+ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p1_sha/binance-lob-archiver" \
+  "$ROOT/proc/$payload_delta_restore_pid_after/exe"
+rm -f -- "$payload_delta_restore_stop" "$ROOT/run/restore-fixture-start-spot" \
+  "$ROOT/run/restore-fixture-start-usdm"
+(write_payload_delta_restore_health restore-reboot-after) &
+payload_delta_restore_writer=$!
+if ! payload_delta_restore_output=$(MONDAY_CONTROL_PLANE_TEST=1 \
+  MONDAY_RESTORE_FIXTURE_SYSTEMD=1 MONDAY_RESTORE_FIXTURE_PID="$payload_delta_restore_pid_after" \
+  MONDAY_RESTORE_HEALTH_TIMEOUT_SECONDS=3 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c1" --root "$ROOT" 2>&1); then
+  : >"$payload_delta_restore_stop"
+  wait "$payload_delta_restore_writer"
+  printf '%s\n' "$payload_delta_restore_output" >&2
+  printf 'Restore rejected post-receipt recovery after a host reboot\n' >&2
+  exit 1
+fi
+: >"$payload_delta_restore_stop"
+wait "$payload_delta_restore_writer"
+grep -Fq 'Pair restore recovery complete' <<<"$payload_delta_restore_output"
+[[ $(monday_sha256_file "$payload_delta_restore_receipt") == "$payload_delta_restore_receipt_before" ]]
+[[ -f $payload_delta_restore_marker && ! -L $payload_delta_restore_marker ]]
+payload_delta_restore_sha=$(awk '$2 == "restore.json" { count++; value=$1 } END { if (count != 1) exit 1; print value }' \
+  "$payload_delta_restore_marker")
+[[ $(monday_sha256_file "$payload_delta_restore_receipt") == "$payload_delta_restore_sha" ]]
+jq -e --argjson old_pid "$payload_delta_restore_pid_before" \
+  '.process_identity.spot.main_pid == $old_pid and .process_identity.usdm.main_pid == $old_pid' \
+  "$payload_delta_restore_receipt" >/dev/null
+jq -e '.session_id == "restore-reboot-after-spot"' \
+  "$production_spool_root/spot/health.json" >/dev/null
+[[ $(readlink -- "$direct_production") == \
+  "$ROOT/opt/monday/releases/binance-lob-controller/active/binance-lob-archiver" ]]
+[[ $(readlink -f -- "$direct_production") == \
+  "$ROOT/opt/monday/releases/binance-lob-archiver/$p1_sha/binance-lob-archiver" ]]
+for asset in $(monday_runtime_assets); do
+  target=$(monday_runtime_asset_target "$ROOT" "$asset")
+  [[ -L $target && $(readlink -- "$target") == \
+    "$ROOT/opt/monday/releases/binance-lob-controller/active/deployment/$asset" ]]
+done
+[[ $(monday_rust_lob_live_runtime_contract_sha256 "$ROOT") == "$candidate_runtime_sha" ]]
+[[ ! -e $payload_delta_recovery ]]
+jq -e --arg gate "$payload_delta_gate" --arg gate_sha "$payload_delta_gate_sha" '
+  .transition_receipt == null
+  and .gate_receipt == $gate and .gate_sha256 == $gate_sha
+' "$payload_delta_restore_receipt" >/dev/null
+# The completed recovery is immediately idempotent even though its immutable
+# receipt records the pre-reboot process.  The read-only check accepts the
+# independently verified replacement process/session and performs no writes.
+payload_delta_restore_calls="$ROOT/run/restore-fixture.calls"
+payload_delta_restore_calls_sha=$(monday_sha256_file "$payload_delta_restore_calls")
+payload_delta_restore_readonly=$(MONDAY_CONTROL_PLANE_TEST=1 \
+  MONDAY_RESTORE_FIXTURE_SYSTEMD=1 MONDAY_RESTORE_FIXTURE_PID="$payload_delta_restore_pid_after" \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-restore.sh" \
+  --controller "$c1" --root "$ROOT")
+grep -Fq 'Pair restore already complete (read-only)' <<<"$payload_delta_restore_readonly"
+[[ $(monday_sha256_file "$payload_delta_restore_calls") == "$payload_delta_restore_calls_sha" ]]
+[[ $(monday_sha256_file "$payload_delta_restore_receipt") == "$payload_delta_restore_receipt_before" ]]
+[[ $(monday_sha256_file "$payload_delta_restore_receipt") == "$payload_delta_restore_sha" ]]
+# A second reboot must not reuse the previous boot's healthy file before the
+# current PID publishes.  Once a new sample crosses the current process start
+# lower bound, the same immutable receipt is read-only idempotent again.
+payload_delta_restore_pid_second_reboot=5153
+mkdir -p "$ROOT/proc/$payload_delta_restore_pid_second_reboot"
+ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p1_sha/binance-lob-archiver" \
+  "$ROOT/proc/$payload_delta_restore_pid_second_reboot/exe"
+payload_delta_second_reboot_started_ns=$(date +%s%N)
+payload_delta_previous_health_ns=$(jq -er '.updated_at_ns' \
+  "$production_spool_root/spot/health.json")
+(( payload_delta_previous_health_ns < payload_delta_second_reboot_started_ns ))
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_RESTORE_FIXTURE_SYSTEMD=1 \
+  MONDAY_RESTORE_FIXTURE_PID="$payload_delta_restore_pid_second_reboot" \
+  MONDAY_RESTORE_FIXTURE_PROCESS_STARTED_NS="$payload_delta_second_reboot_started_ns" \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-restore.sh" \
+  --controller "$c1" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'read-only Restore accepted health from the previous boot\n' >&2
+  exit 1
+fi
+[[ $(monday_sha256_file "$payload_delta_restore_calls") == "$payload_delta_restore_calls_sha" ]]
+rm -f -- "$payload_delta_restore_stop"
+(write_payload_delta_restore_health restore-second-reboot) &
+payload_delta_restore_writer=$!
+for _ in {1..60}; do
+  [[ $(jq -r '.session_id // empty' "$production_spool_root/spot/health.json" 2>/dev/null) \
+    == restore-second-reboot-spot ]] && break
+  sleep 0.05
+done
+[[ $(jq -r '.session_id // empty' "$production_spool_root/spot/health.json") \
+  == restore-second-reboot-spot ]]
+payload_delta_second_readonly=$(MONDAY_CONTROL_PLANE_TEST=1 \
+  MONDAY_RESTORE_FIXTURE_SYSTEMD=1 \
+  MONDAY_RESTORE_FIXTURE_PID="$payload_delta_restore_pid_second_reboot" \
+  MONDAY_RESTORE_FIXTURE_PROCESS_STARTED_NS="$payload_delta_second_reboot_started_ns" \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-restore.sh" \
+  --controller "$c1" --root "$ROOT")
+: >"$payload_delta_restore_stop"
+wait "$payload_delta_restore_writer"
+grep -Fq 'Pair restore already complete (read-only)' <<<"$payload_delta_second_readonly"
+[[ $(monday_sha256_file "$payload_delta_restore_calls") == "$payload_delta_restore_calls_sha" ]]
+[[ $(monday_sha256_file "$payload_delta_restore_receipt") == "$payload_delta_restore_receipt_before" ]]
+
+# Reset the same immutable C0/P0/R0, then fail only after transition.json and
+# its digest have both passed readback.  Cleanup must preserve that committed
+# authority and active C1 instead of rolling back after recovery deletion starts.
+rm -rf -- "$ROOT/data/monday/evidence/restores/$c1"
+rm -f -- "$ROOT/opt/monday/releases/binance-lob-controller/active"
+ln -s "$legacy_root/$legacy_delta_c0" "$ROOT/opt/monday/releases/binance-lob-controller/active"
+rm -f -- "$direct_production"
+ln -s "$direct_production_before" "$direct_production"
+rm -f -- "$(monday_runtime_asset_target "$ROOT" "$production_slice_asset")"
+while IFS= read -r asset; do
+  [[ $asset == "$production_slice_asset" ]] && continue
+  target=$(monday_runtime_asset_target "$ROOT" "$asset")
+  rm -f -- "$target"
+  cp -p -- "$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/$asset" "$target"
+done < <(monday_runtime_assets)
+for runtime_env in "${runtime_delta_envs[@]}"; do
+  chmod u+w "$runtime_env"
+  write_legacy_runtime_delta "$runtime_env.before-payload-delta" "$runtime_env"
+done
+while IFS= read -r asset; do
+  target=$(monday_controller_projection_target "$ROOT" "$asset")
+  rm -f -- "$target"
+  cp -p -- "$legacy_root/$legacy_c0/deployment/$asset" "$target"
+done < <(monday_controller_projection_assets)
+[[ $(monday_rust_lob_live_runtime_contract_sha256_v1 "$ROOT") == "$legacy_delta_runtime" ]]
+
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
+  MONDAY_CUTOVER_FIXTURE_LEGACY_ACTIVE=1 MONDAY_CUTOVER_FAIL_AFTER_TRANSITION_COMMIT=1 \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-cutover.sh" \
+  --from direct --to "$c1" --gate-receipt "$payload_delta_gate" \
+  --gate-sha256 "$payload_delta_gate_sha" --root "$ROOT" \
+  >"$ROOT/run/payload-delta-transition.err" 2>&1; then
+  printf 'post-commit direct payload transition unexpectedly succeeded\n' >&2
+  exit 1
+fi
+payload_delta_transition="$ROOT/data/monday/evidence/cutovers/$c1/transition.json"
+payload_delta_transition_marker="$payload_delta_transition.sha256"
+[[ -f $payload_delta_transition && ! -L $payload_delta_transition ]]
+[[ -f $payload_delta_transition_marker && ! -L $payload_delta_transition_marker ]]
+[[ -f $payload_delta_recovery && ! -L $payload_delta_recovery ]]
+payload_delta_transition_sha=$(awk '$2 == "transition.json" { count++; value=$1 } END { if (count != 1) exit 1; print value }' \
+  "$payload_delta_transition_marker")
+[[ $(monday_sha256_file "$payload_delta_transition") == "$payload_delta_transition_sha" ]]
+monday_validate_v2_transition "$ROOT" "$payload_delta_transition" direct "$c1" \
+  "$payload_delta_gate" "$payload_delta_gate_sha"
+[[ $(monday_active_controller_sha "$ROOT") == "$c1" ]]
+[[ $(monday_rust_lob_live_runtime_contract_sha256 "$ROOT") == "$candidate_runtime_sha" ]]
+# Model the narrower receipt-before-digest power-loss point.  The same durable
+# intent must let Restore reconstruct the exact digest before clearing itself.
+rm -f -- "$payload_delta_transition_marker"
+MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c1" --root "$ROOT" >/dev/null
+[[ ! -e $payload_delta_recovery ]]
+[[ -f $payload_delta_transition_marker && ! -L $payload_delta_transition_marker ]]
+[[ $(awk '$2 == "transition.json" { count++; value=$1 } END { if (count != 1) exit 1; print value }' \
+  "$payload_delta_transition_marker") == "$payload_delta_transition_sha" ]]
+payload_delta_restore_receipt="$ROOT/data/monday/evidence/restores/$c1/restore.json"
+jq -e --arg transition "$payload_delta_transition" \
+  --arg gate "$payload_delta_gate" --arg gate_sha "$payload_delta_gate_sha" '
+    .transition_receipt == $transition
+    and .gate_receipt == $gate and .gate_sha256 == $gate_sha
+  ' "$payload_delta_restore_receipt" >/dev/null
+
+# Return to the immutable legacy pair so the remaining direct-bootstrap
+# rejection and ordinary success cases keep their original starting state.
+rm -rf -- "$ROOT/data/monday/evidence/restores/$c1"
+rm -rf -- "$ROOT/data/monday/evidence/cutovers/$c1"
+rm -f -- "$ROOT/opt/monday/releases/binance-lob-controller/active"
+ln -s "$legacy_root/$legacy_c0" "$ROOT/opt/monday/releases/binance-lob-controller/active"
+rm -f -- "$direct_production"
+ln -s "$direct_production_before" "$direct_production"
+rm -f -- "$(monday_runtime_asset_target "$ROOT" "$production_slice_asset")"
+while IFS= read -r asset; do
+  [[ $asset == "$production_slice_asset" ]] && continue
+  target=$(monday_runtime_asset_target "$ROOT" "$asset")
+  rm -f -- "$target"
+  cp -p -- "$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/$asset" "$target"
+done < <(monday_runtime_assets)
+while IFS= read -r asset; do
+  target=$(monday_controller_projection_target "$ROOT" "$asset")
+  rm -f -- "$target"
+  cp -p -- "$legacy_root/$legacy_c0/deployment/$asset" "$target"
+done < <(monday_controller_projection_assets)
+for runtime_env in "${runtime_delta_envs[@]}"; do
+  rm -f -- "$runtime_env.before-payload-delta"
+done
+rm -rf -- "$(dirname -- "$payload_delta_gate")"
+rm -f -- "$ROOT/run/cutover-fixture.calls"
+
+# (d) A resource monitor breach must return to its caller so EXIT cleanup can
+# remove every run-scoped writer path without changing production.
+resource_breach_active_before=$(monday_active_controller_sha "$ROOT")
+resource_breach_payload_before=$(readlink -- "$ROOT/opt/monday/bin/binance-lob-archiver")
+rm -f -- "$ROOT/run/gate-fixture.calls"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_RESOURCE_BREACH=1 \
+  MONDAY_GATE_FIXTURE_RECORD_CALLS=1 MONDAY_ROOT="$ROOT" \
+  bash -c '
+    root=$1; shift
+    mkdir -p "$root/proc/$$"
+    printf "1 fixture S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 4242\\n" >"$root/proc/$$/stat"
+    printf "%s\\n" "$$" >"$root/run/resource-breach-gate.pid"
+    exec "$@"
+  ' _ "$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --root "$ROOT" \
+  >"$ROOT/run/resource-breach.err" 2>&1; then
+  printf 'Gate accepted an injected direct-bootstrap resource monitor breach\n' >&2
+  exit 1
+fi
+resource_breach_gate_pid=$(cat "$ROOT/run/resource-breach-gate.pid")
+rm -rf -- "$ROOT/proc/$resource_breach_gate_pid" "$ROOT/run/resource-breach-gate.pid"
+grep -Fqx 'resource monitor breached during preflight: fixture-resource-breach' "$ROOT/run/resource-breach.err"
+if grep -Fq 'run-scoped Gate cleanup was incomplete' "$ROOT/run/resource-breach.err"; then
+  printf 'primary resource breach was misreported as cleanup incomplete\n' >&2
+  exit 1
+fi
+resource_breach_run=$(find "$ROOT/data/monday/evidence/shadow-gates/$c0/$candidate_runtime_sha/runs" \
+  -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | LC_ALL=C sort | tail -n1)
+resource_breach_run=${resource_breach_run##*/}
+resource_breach_slice="mondayrustlobgate${resource_breach_run//[^0-9]/}.slice"
+resource_breach_diagnostic="$ROOT/data/monday/evidence/shadow-gates/$c0/$candidate_runtime_sha/runs/$resource_breach_run/resource-monitor-failure.json"
+jq -e '.schema == "monday.rust_lob_shadow_gate_resource_breach.v1"
+  and .authoritative == false and .phase == "preflight"
+  and .cause == "fixture-resource-breach"
+  and (.elapsed_us | type == "number") and (.delta_us | type == "number")
+  and (.ratio | type == "number") and (.consecutive_hits | type == "number")
+  and .cleanup_failed == false' "$resource_breach_diagnostic" >/dev/null
+[[ ! -e "$ROOT/run/monday/rust-lob-gate/$resource_breach_run" ]]
+[[ ! -e "$ROOT/data/monday/spool/binance-lob-rust-shadow/gate/$resource_breach_run" ]]
+[[ ! -e "$ROOT/run/systemd/system/$resource_breach_slice" ]]
+if find "$ROOT/data/monday/evidence/shadow-gates/$c0" -type f \
+  \( -name gate.json -o -name PASSED.sha256 \) -print -quit 2>/dev/null | grep -q .; then
+  printf 'resource monitor breach left an authoritative Gate receipt\n' >&2
+  exit 1
+fi
+[[ $(monday_active_controller_sha "$ROOT") == "$resource_breach_active_before" ]]
+[[ $(readlink -- "$ROOT/opt/monday/bin/binance-lob-archiver") == "$resource_breach_payload_before" ]]
+[[ $(monday_sha256_file "$production_spool_root/spot/upload-status.json") == "$production_spot_status_sha" ]]
+[[ $(monday_sha256_file "$production_spool_root/usdm/upload-status.json") == "$production_usdm_status_sha" ]]
+
+# (e) A teardown error remains distinct from a primary resource breach and is
+# reported as cleanup incomplete.  This fixture only fails the monitor stop
+# operation.
+rm -f -- "$ROOT/run/gate-fixture.calls"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_RESOURCE_STOP_FAILURE=1 \
+  MONDAY_GATE_FIXTURE_RECORD_CALLS=1 MONDAY_ROOT="$ROOT" \
+  bash -c '
+    root=$1; shift
+    mkdir -p "$root/proc/$$"
+    printf "1 fixture S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 4242\\n" >"$root/proc/$$/stat"
+    exec "$@"
+  ' _ "$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --root "$ROOT" >"$ROOT/run/resource-stop-failure.err" 2>&1; then
+  printf 'Gate accepted an injected resource monitor teardown failure\n' >&2
+  exit 1
+fi
+grep -Fq 'run-scoped Gate cleanup was incomplete' "$ROOT/run/resource-stop-failure.err"
+if grep -Fq 'resource monitor breached during' "$ROOT/run/resource-stop-failure.err"; then
+  printf 'teardown failure was misreported as a primary resource breach\n' >&2
+  exit 1
+fi
+
+gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  bash -c '
+    root=$1; shift
+    mkdir -p "$root/proc/$$"
+    printf "1 fixture S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 4242\\n" >"$root/proc/$$/stat"
+    printf "%s\\n" "$$" >"$root/run/direct-gate.pid"
+    exec "$@"
+  ' _ "$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
+  --from-controller direct --candidate-controller "$c0" --root "$ROOT")
+direct_gate_pid=$(cat "$ROOT/run/direct-gate.pid")
+rm -rf -- "$ROOT/proc/$direct_gate_pid" "$ROOT/run/direct-gate.pid"
+gate=$(printf '%s\n' "$gate_output" | sed -n 's/^V2 Gate receipt: //p')
+gate_sha=$(printf '%s\n' "$gate_output" | sed -n 's/^SHA-256: //p')
+[[ -f $gate && $gate_sha == "$(monday_sha256_file "$gate")" ]]
+monday_validate_v2_gate "$gate" direct "$c0" "$gate_sha"
+jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$gate" >/dev/null
+jq -e '
+  .schema == "monday.rust_lob_shadow_gate.v8"
+  and .source_mode == "direct"
+  and .production_memory.production_envelope_state == "legacy-unlimited"
+  and .production_memory.production_slice_memory_high_bytes == null
+  and .production_memory.production_slice_memory_max_bytes == null
+  and .production_memory.systemd_production_slice_memory_high_bytes == null
+  and .production_memory.systemd_production_slice_memory_max_bytes == null
+  and .production_memory.target_production_slice_memory_high_bytes == 3221225472
+  and .production_memory.target_production_slice_memory_max_bytes == 3758096384
+  and all(.resource_admission[];
+    .production_slice_memory_max_bytes == null
+    and .target_production_slice_memory_max_bytes == 3758096384
+    and .production_memory_growth_bytes
+      == (3758096384 - .production_parent_memory_anon_bytes))' "$gate" >/dev/null
+jq -e --argjson evidence_timeout "$evidence_timeout_seconds" \
+  --argjson segment "$gate_segment_seconds" \
+  '.evidence_timeout_seconds == $evidence_timeout and .segment_seconds == $segment
+   and (.io_full_psi_windows | length == 9)
+   and all(.io_full_psi_windows[]; .veto == false)
+   and all(.markets[]; . as $market
+     | .observed_runtime_seconds >= 0 and .observed_runtime_seconds <= $evidence_timeout
+     and .observation_started_at_ns <= .observed_at_ns
+     and .segment_count == 1 and .oss_triplet_count == 1
+     and all(.segments[]; .start_received_at_ns >= $market.observation_started_at_ns)
+     and all(.triplets[]; .start_received_at_ns >= $market.observation_started_at_ns))' \
+  "$gate" >/dev/null
+run_json="$(dirname -- "$gate")/run.json"
+jq -e --argjson segment "$gate_segment_seconds" \
+  --argjson evidence_timeout "$evidence_timeout_seconds" \
+  '.segment_seconds == $segment
+   and .test_only == true
+   and .evidence_timeout_seconds == $evidence_timeout
+   and .formal_evidence_timeout_seconds == $evidence_timeout
+   and all(.markets[];
+     .observation_started_at_ns >= 0
+     and .observation_finished_monotonic_ns >= .observation_started_monotonic_ns
+     and (.observation_finished_monotonic_ns - .observation_started_monotonic_ns)
+       >= (.observed_runtime_seconds * 1000000000)
+     and (.observation_finished_monotonic_ns - .observation_started_monotonic_ns)
+       < ((.observed_runtime_seconds + 1) * 1000000000))' \
+  "$run_json" >/dev/null
+jq -e --slurpfile gate "$gate" '
+  .markets as $run_markets
+  | all(["spot", "usdm"][]; . as $market
+    | $run_markets[$market].observation_started_at_ns
+      == $gate[0].markets[$market].observation_started_at_ns)' \
+  "$run_json" >/dev/null
+# A reconnect-boundary segment is skipped, but one later clean segment can
+# still satisfy the evidence-driven Gate.
+reconnect_gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 \
+  MONDAY_GATE_FIXTURE_RECONNECT_BOUNDARY=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --root "$ROOT")
+reconnect_gate=$(printf '%s\n' "$reconnect_gate_output" | sed -n 's/^V2 Gate receipt: //p')
+reconnect_gate_sha=$(printf '%s\n' "$reconnect_gate_output" | sed -n 's/^SHA-256: //p')
+monday_validate_v2_gate "$reconnect_gate" direct "$c0" "$reconnect_gate_sha"
+jq -e 'all(.markets[];
+  .segment_count == 1 and .oss_triplet_count == 1
+  and (.segments | length == 1) and (.triplets | length == 1))' \
+  "$reconnect_gate" >/dev/null
+
+# An unsafe segment is skipped.  One later clean segment proves that the
+# collector recovered without turning earlier audit evidence into a veto.
+recovered_gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 \
+  MONDAY_GATE_FIXTURE_UNSAFE_THEN_CLEAN=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --root "$ROOT")
+recovered_gate=$(printf '%s\n' "$recovered_gate_output" | sed -n 's/^V2 Gate receipt: //p')
+recovered_gate_sha=$(printf '%s\n' "$recovered_gate_output" | sed -n 's/^SHA-256: //p')
+monday_validate_v2_gate "$recovered_gate" direct "$c0" "$recovered_gate_sha"
+jq -e 'all(.markets[]; . as $market
+  | .segment_count == 1 and .oss_triplet_count == 1
+  and .segments[0].start_received_at_ns > $market.observation_started_at_ns
+  and .triplets[0].start_received_at_ns == .segments[0].start_received_at_ns)' \
+  "$recovered_gate" >/dev/null
+
+# Only conflicting evidence emitted by this Gate run remains a veto; unrelated
+# historical OSS manifests are outside the collector-candidate contract.
+overlap_failure_output="$ROOT/run/overlapping-unsafe.err"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_OVERLAPPING_UNSAFE=1 \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
+  --from-controller direct --candidate-controller "$c0" --root "$ROOT" \
+  >"$overlap_failure_output" 2>&1; then
+  printf 'Gate accepted an unsafe local segment overlapping its clean segment\n' >&2
+  exit 1
+fi
+grep -Fq 'replay-unsafe local segment overlaps selected clean segment' \
+  "$overlap_failure_output"
+
+# Clean files sealed before observation starts are audit input only.  The local
+# selector and OSS readback must both choose the later clean segment.
+preobservation_gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 \
+  MONDAY_GATE_FIXTURE_PREOBSERVATION_SEGMENTS=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --root "$ROOT")
+preobservation_gate=$(printf '%s\n' "$preobservation_gate_output" | sed -n 's/^V2 Gate receipt: //p')
+preobservation_gate_sha=$(printf '%s\n' "$preobservation_gate_output" | sed -n 's/^SHA-256: //p')
+monday_validate_v2_gate "$preobservation_gate" direct "$c0" "$preobservation_gate_sha"
+jq -e 'all(.markets[]; . as $market
+  | all(.segments[]; .start_received_at_ns >= $market.observation_started_at_ns)
+  and all(.triplets[]; .start_received_at_ns >= $market.observation_started_at_ns))' \
+  "$preobservation_gate" >/dev/null
+
+# Evidence snapshotted inside the window may finish validation after the
+# deadline.  The snapshot cutoff remains the receipt cutoff.
+cross_deadline_gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 \
+  MONDAY_GATE_FIXTURE_CROSS_EVIDENCE_DEADLINE=1 \
+  MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=1 MONDAY_GATE_TEST_SECONDS=1 \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
+  --from-controller direct --candidate-controller "$c0" --root "$ROOT")
+cross_deadline_gate=$(printf '%s\n' "$cross_deadline_gate_output" \
+  | sed -n 's/^V2 Gate receipt: //p')
+cross_deadline_gate_sha=$(printf '%s\n' "$cross_deadline_gate_output" \
+  | sed -n 's/^SHA-256: //p')
+cross_deadline_run="$(dirname -- "$cross_deadline_gate")/run.json"
+monday_validate_v2_gate "$cross_deadline_gate" direct "$c0" "$cross_deadline_gate_sha"
+jq -e '
+  .evidence_timeout_seconds == 1
+  and all(.markets[];
+    .observed_runtime_seconds >= 0 and .observed_runtime_seconds <= 1
+    and .observation_finished_monotonic_ns >= .observation_started_monotonic_ns)' \
+  "$cross_deadline_run" >/dev/null
+
+validate_deadline_segments() {
+  jq -e '
+    .schema == "monday.rust_lob_shadow_gate_deadline_segments.v2"
+    and (.segments | length) == 1
+    and all(.segments[];
+      .manifest.has_replay_safe_checkpoint == true
+      and .manifest.lob_continuity.sequence_gaps == 0
+      and .manifest.lob_continuity.reconnect_boundary == false
+      and .manifest.sha256 == .data_sha256
+      and .success_marker == .data_sha256
+      and .data_size_bytes > 0
+      and (.manifest_sha256 | test("^[a-f0-9]{64}$"))
+      and (.success_sha256 | test("^[a-f0-9]{64}$")))' "$1" >/dev/null
+}
+
+# A segment sealed while the readiness scan is running cannot move the cutoff
+# backwards.  Persist the partial window before failing so non-authoritative
+# run evidence is still truthful.
+deadline_failure_output="$ROOT/run/evidence-deadline-failure.err"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_POST_SAMPLE_EVIDENCE=1 \
+  MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=1 MONDAY_GATE_TEST_SECONDS=1 \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
+  --from-controller direct --candidate-controller "$c0" --root "$ROOT" \
+  >"$deadline_failure_output" 2>&1; then
+  printf 'Gate started a new observation sample after the evidence deadline\n' >&2
+  exit 1
+fi
+grep -Fq 'did not produce an eligible evidence sample before the evidence deadline' \
+  "$deadline_failure_output"
+deadline_run_json=$(find "$ROOT/data/monday/evidence/shadow-gates/$c0" \
+  -type f -name run.json -print | while IFS= read -r candidate; do
+    if jq -e '.evidence_timeout_seconds == 1
+      and .markets.spot != null and .markets.usdm == null' \
+      "$candidate" >/dev/null; then
+      printf '%s\n' "$candidate"
+    fi
+  done)
+[[ $(printf '%s\n' "$deadline_run_json" | awk 'NF { count++ } END { print count + 0 }') == 1 ]]
+jq -e '
+  .markets.spot.observed_runtime_seconds >= .evidence_timeout_seconds
+  and .markets.spot.observation_finished_monotonic_ns
+    >= .markets.spot.observation_started_monotonic_ns
+  and .markets.usdm == null' "$deadline_run_json" >/dev/null
+deadline_failure_json="$(dirname -- "$deadline_run_json")/deadline-failure.json"
+deadline_health_json="$(dirname -- "$deadline_run_json")/deadline-health.json"
+deadline_segments_json="$(dirname -- "$deadline_run_json")/deadline-segments.json"
+[[ -f $deadline_failure_json && -f $deadline_health_json && -f $deadline_segments_json ]]
+jq -e --arg controller "$c0" \
+  --arg health_sha "$(monday_sha256_file "$deadline_health_json")" \
+  --arg segments_sha "$(monday_sha256_file "$deadline_segments_json")" '
+  .schema == "monday.rust_lob_shadow_gate_deadline_failure.v2"
+  and .authoritative == false and .cause == "evidence_deadline"
+  and .market == "spot" and .candidate_controller_sha256 == $controller
+  and .health_eligible == true and .segment_ready == true
+  and .segment_readiness_code == 0
+  and .observation.sample_started_monotonic_ns < .observation.deadline_monotonic_ns
+  and .observation.sampled_monotonic_ns >= .observation.deadline_monotonic_ns
+  and .observation.failure_detected_monotonic_ns == .observation.sampled_monotonic_ns
+  and .health_snapshot == {file:"deadline-health.json",sha256:$health_sha}
+  and .segment_snapshot == {file:"deadline-segments.json",sha256:$segments_sha}' \
+  "$deadline_failure_json" >/dev/null
+jq -e '.status == "synced"' "$deadline_health_json" >/dev/null
+validate_deadline_segments "$deadline_segments_json"
+[[ ! -e $(dirname -- "$deadline_run_json")/gate.json \
+  && ! -e $(dirname -- "$deadline_run_json")/PASSED.sha256 ]]
+
+# Health eligibility is frozen at the same cutoff.  A live health file that
+# becomes synced only after the deadline cannot authorize the Gate.
+health_deadline_failure_output="$ROOT/run/health-deadline-failure.err"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_POST_SAMPLE_HEALTH=1 \
+  MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=1 MONDAY_GATE_TEST_SECONDS=2 \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
+  --from-controller direct --candidate-controller "$c0" --root "$ROOT" \
+  >"$health_deadline_failure_output" 2>&1; then
+  printf 'Gate accepted health that became eligible after the evidence deadline\n' >&2
+  exit 1
+fi
+grep -Fq 'did not produce an eligible evidence sample before the evidence deadline' \
+  "$health_deadline_failure_output"
+health_deadline_run_json=$(find "$ROOT/data/monday/evidence/shadow-gates/$c0" \
+  -type f -name run.json -print | while IFS= read -r candidate; do
+    if jq -e '.evidence_timeout_seconds == 2
+      and .markets.spot != null and .markets.usdm == null' \
+      "$candidate" >/dev/null; then
+      printf '%s\n' "$candidate"
+    fi
+  done)
+[[ $(printf '%s\n' "$health_deadline_run_json" \
+  | awk 'NF { count++ } END { print count + 0 }') == 1 ]]
+jq -e '
+  .markets.spot.observed_runtime_seconds >= .evidence_timeout_seconds
+  and .markets.spot.observation_finished_monotonic_ns
+    >= .markets.spot.observation_started_monotonic_ns
+  and .markets.usdm == null' "$health_deadline_run_json" >/dev/null
+health_deadline_failure_json="$(dirname -- "$health_deadline_run_json")/deadline-failure.json"
+health_deadline_health_json="$(dirname -- "$health_deadline_run_json")/deadline-health.json"
+health_deadline_segments_json="$(dirname -- "$health_deadline_run_json")/deadline-segments.json"
+[[ -f $health_deadline_failure_json && -f $health_deadline_health_json \
+  && -f $health_deadline_segments_json ]]
+jq -e --arg controller "$c0" \
+  --arg health_sha "$(monday_sha256_file "$health_deadline_health_json")" \
+  --arg segments_sha "$(monday_sha256_file "$health_deadline_segments_json")" '
+  .schema == "monday.rust_lob_shadow_gate_deadline_failure.v2"
+  and .authoritative == false and .cause == "evidence_deadline"
+  and .market == "spot" and .candidate_controller_sha256 == $controller
+  and .health_eligible == false and .segment_ready == true
+  and .segment_readiness_code == 0
+  and .observation.sample_started_monotonic_ns <= .observation.sampled_monotonic_ns
+  and .observation.sampled_monotonic_ns < .observation.deadline_monotonic_ns
+  and .observation.failure_detected_monotonic_ns >= .observation.deadline_monotonic_ns
+  and .health_snapshot == {file:"deadline-health.json",sha256:$health_sha}
+  and .segment_snapshot == {file:"deadline-segments.json",sha256:$segments_sha}' \
+  "$health_deadline_failure_json" >/dev/null
+jq -e '.status == "syncing"' "$health_deadline_health_json" >/dev/null
+validate_deadline_segments "$health_deadline_segments_json"
+[[ ! -e $(dirname -- "$health_deadline_run_json")/gate.json \
+  && ! -e $(dirname -- "$health_deadline_run_json")/PASSED.sha256 ]]
+
+# Candidate and production cgroup memory.events are part of the same Gate
+# evidence.  An OOM counter increment in the run-scoped worker slice must
+# fail the Gate before any receipt or marker can be authorized.
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_GATE_OOM=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --root "$ROOT" \
+  >"$ROOT/run/gate-oom.err" 2>&1; then
+  printf 'Gate accepted a run-scoped worker OOM counter increment\n' >&2
+  exit 1
+fi
+grep -Fq 'run-scoped Gate worker slice memory.events recorded an OOM during Gate' \
+  "$ROOT/run/gate-oom.err" || {
+  cat "$ROOT/run/gate-oom.err" >&2
+  exit 1
+}
+# A fixture receipt must not become production evidence by editing its mode.
+# Keep the accompanying run.json's provenance unchanged while moving its canonical
+# run paths and provide the marker a real cutover would require; the
+# authoritative wrapper still rejects the fixture provenance.
+tampered_run_id=20240101T000000Z-1
+tampered_dir="$(dirname -- "$(dirname -- "$gate")")/$tampered_run_id"
+tampered_spool="$ROOT/data/monday/spool/binance-lob-rust-shadow/gate/$tampered_run_id"
+tampered_unit_root="$ROOT/run/monday/rust-lob-gate/$tampered_run_id"
+mkdir -p "$tampered_dir"
+jq --arg run "$tampered_run_id" --arg spool "$tampered_spool" \
+  '.run_id = $run | .run_spool = $spool' "$run_json" >"$tampered_dir/run.json"
+jq --arg run "$tampered_run_id" --arg spool "$tampered_spool" \
+  --arg unit_root "$tampered_unit_root" \
+  '.run_id = $run
+   | .run_spool = $spool
+   | .shadow_staging.spool_root = $spool
+   | .shadow_staging.run_unit_root = $unit_root
+   | .markets.spot.spool_dir = ($spool + "/spot")
+   | .markets.usdm.spool_dir = ($spool + "/usdm")
+   | .test_only = false | .production_eligible = true' \
+  "$gate" >"$tampered_dir/gate.json"
+tampered_gate="$tampered_dir/gate.json"
+tampered_sha=$(monday_sha256_file "$tampered_gate")
+tampered_run_sha=$(monday_sha256_file "$tampered_dir/run.json")
+printf '%s  gate.json\n%s  run.json\n' "$tampered_sha" "$tampered_run_sha" \
+  >"$tampered_dir/PASSED.sha256"
+chmod 0440 "$tampered_gate" "$tampered_dir/run.json" "$tampered_dir/PASSED.sha256"
+chmod 0550 "$tampered_dir"
+(cd "$tampered_dir" && sha256sum --check --strict PASSED.sha256 >/dev/null)
+monday_validate_v2_gate "$tampered_gate" direct "$c0" "$tampered_sha"
+if monday_validate_v2_gate_authoritative "$ROOT" "$tampered_gate" direct "$c0" "$tampered_sha"; then
+  printf 'authoritative Gate validation accepted a promoted fixture receipt\n' >&2
+  exit 1
+fi
+# A terminal-looking receipt without its adjacent run.json/marker is audit
+# residue only.  It must not permanently block a fresh Gate for the candidate.
+incomplete_prior_dir="$ROOT/data/monday/evidence/shadow-gates/$c0/$candidate_runtime_sha/runs/20240101T000000Z-2"
+mkdir -p "$incomplete_prior_dir"
+jq '.test_only = false | .production_eligible = true' \
+  "$gate" >"$incomplete_prior_dir/gate.json"
+incomplete_prior_gate="$incomplete_prior_dir/gate.json"
+incomplete_prior_sha=$(monday_sha256_file "$incomplete_prior_gate")
+if monday_validate_v2_gate_authoritative "$ROOT" "$incomplete_prior_gate" direct "$c0" \
+  "$incomplete_prior_sha"; then
+  printf 'authoritative Gate validation accepted an incomplete terminalization\n' >&2
+  exit 1
+fi
+next_gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --root "$ROOT")
+next_gate=$(printf '%s\n' "$next_gate_output" | sed -n 's/^V2 Gate receipt: //p')
+next_gate_sha=$(printf '%s\n' "$next_gate_output" | sed -n 's/^SHA-256: //p')
+[[ -f $next_gate && $next_gate_sha == "$(monday_sha256_file "$next_gate")" ]] || {
+  printf 'incomplete prior Gate receipt blocked a fresh candidate run\n' >&2
+  exit 1
+}
+jq -e '.shadow_staging.aggregate_slice.cgroup
+  == ("/" + .shadow_staging.aggregate_slice.name)' "$gate" >/dev/null
+oss_source=$(sed -n '/^run_oss()/,/^verify_oss_roundtrips()/p' \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh")
+grep -Fq 'systemd-run --quiet --pipe --wait --collect' <<<"$oss_source"
+grep -Fq -- "--slice=\"\$GATE_WORKER_SLICE\"" <<<"$oss_source"
+grep -Fq -- '--property=MemoryMax=512M' <<<"$oss_source"
+jq -e 'all(.resource_admission[];
+  .required_bytes == (.phase_memory_max_bytes + .host_memory_reserve_bytes + .production_memory_growth_bytes)
+  and .production_memory_growth_bytes == (.target_production_slice_memory_max_bytes - .production_parent_memory_anon_bytes)
+  and .host_memory_reserve_bytes == 1073741824
+  and .host_memory_available_bytes >= .required_bytes
+  and (has("production_memory_growth_headroom_bytes") | not))' "$gate" >/dev/null
+low_end_available="$ROOT/low-end-available.json"
+jq '(.resource_admission[0].current_memory_available_bytes = (.resource_admission[0].required_bytes - 1))' \
+  "$gate" >"$low_end_available"
+low_end_available_sha=$(monday_sha256_file "$low_end_available")
+monday_validate_v2_gate "$low_end_available" direct "$c0" "$low_end_available_sha"
+jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$low_end_available" >/dev/null
+tampered="$ROOT/tampered-memory-admission.json"
+jq '(.resource_admission[0].required_bytes) -= 1' "$gate" >"$tampered"
+tampered_sha=$(monday_sha256_file "$tampered")
+if monday_validate_v2_gate "$tampered" direct "$c0" "$tampered_sha"; then
+  printf 'Gate validator accepted a phase requirement below phase max plus reserve\n' >&2
+  exit 1
+fi
+if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$tampered" >/dev/null 2>&1; then
+  printf 'Gate policy accepted a phase requirement below phase max plus reserve\n' >&2
+  exit 1
+fi
+tampered="$ROOT/tampered-segment-identity.json"
+tampered_data_sha=$(printf 'f%.0s' {1..64})
+jq --arg sha "$tampered_data_sha" '
+    .markets.spot.triplets[0].data_sha256 = $sha
+    | .markets.spot.triplets[0].success_content = ($sha + "\n")' \
+  "$gate" >"$tampered"
+tampered_sha=$(monday_sha256_file "$tampered")
+if monday_validate_v2_gate "$tampered" direct "$c0" "$tampered_sha"; then
+  printf 'Gate validator accepted mismatched local and OSS segment identity\n' >&2
+  exit 1
+fi
+if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$tampered" >/dev/null 2>&1; then
+  printf 'Gate policy accepted mismatched local and OSS segment identity\n' >&2
+  exit 1
+fi
+tampered="$ROOT/tampered-observation-cutoff.json"
+jq '.markets.spot.observation_started_at_ns = .markets.spot.segments[0].end_received_at_ns' \
+  "$gate" >"$tampered"
+tampered_sha=$(monday_sha256_file "$tampered")
+if monday_validate_v2_gate "$tampered" direct "$c0" "$tampered_sha"; then
+  printf 'Gate validator accepted pre-observation segment evidence\n' >&2
+  exit 1
+fi
+if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$tampered" >/dev/null 2>&1; then
+  printf 'Gate policy accepted pre-observation segment evidence\n' >&2
+  exit 1
+fi
+tampered="$ROOT/tampered-production-memory.json"
+jq '.production_memory.children.spot.memory_max_bytes = 2147483648
+    | .production_memory.children.spot.systemd_memory_max_bytes = 2147483648
+    | .production_memory.child_memory_max_sum_bytes = 4831838208' "$gate" >"$tampered"
+tampered_sha=$(monday_sha256_file "$tampered")
+if monday_validate_v2_gate "$tampered" direct "$c0" "$tampered_sha"; then
+  printf 'Gate validator accepted tampered production cgroup memory limits\n' >&2
+  exit 1
+fi
+if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$tampered" >/dev/null 2>&1; then
+  printf 'Gate policy accepted tampered production cgroup memory limits\n' >&2
+  exit 1
+fi
+# Production-shaped path construction reaches spool preparation without
+# opening a market socket.  The fixture still uses an isolated root, while
+# exercising the unconditional run-scoped path branch.
+path_only_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_PATH_ONLY=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c0" --root "$ROOT")
+grep -Fq "V2 Gate spool preparation: $ROOT/data/monday/spool/binance-lob-rust-shadow/gate/" \
+  <<<"$path_only_output"
+jq -e --arg from "$legacy_c0" \
+  '.source_mode == "direct" and .from_controller_sha256 == $from
+   and .transition.before == $from and .transition.topology == "direct-bootstrap"' \
+  "$gate" >/dev/null
+
+# Gate's production lane is static evidence, not a process start.  The shared
+# verifier must reject a candidate unit or market environment that would alter
+# the governed production identity even though the Gate itself runs shadow.
+production_verify_dir="$ROOT/production-runtime-verify"
+mkdir -p "$production_verify_dir"
+for asset in \
+  binance-lob-archiver-production@.service binance-lob-archiver-upload@.service \
+  binance-lob-archiver-production-spot.env binance-lob-archiver-production-usdm.env; do
+  cp -p -- "$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/$asset" \
+    "$production_verify_dir/$asset"
+done
+sed -i.bak 's/^User=hftcollector$/User=untrusted/' \
+  "$production_verify_dir/binance-lob-archiver-production@.service"
+rm -f -- "$production_verify_dir/binance-lob-archiver-production@.service.bak"
+if monday_verify_production_runtime_assets "$ROOT" "$production_verify_dir" "$p0_sha"; then
+  printf 'production runtime verifier accepted an untrusted unit user\n' >&2
+  exit 1
+fi
+chmod u+w "$production_verify_dir/binance-lob-archiver-production@.service"
+rm -f -- "$production_verify_dir/binance-lob-archiver-production@.service"
+cp -p -- "$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/binance-lob-archiver-production@.service" \
+  "$production_verify_dir/binance-lob-archiver-production@.service"
+chmod u+w "$production_verify_dir/binance-lob-archiver-production-spot.env"
+sed -i.bak 's/^OSS_ENDPOINT=.*/OSS_ENDPOINT=foreign.endpoint.example/' \
+  "$production_verify_dir/binance-lob-archiver-production-spot.env"
+rm -f -- "$production_verify_dir/binance-lob-archiver-production-spot.env.bak"
+if monday_verify_production_runtime_assets "$ROOT" "$production_verify_dir" "$p0_sha"; then
+  printf 'production runtime verifier accepted a foreign market endpoint\n' >&2
+  exit 1
+fi
+chmod u+w "$production_verify_dir/binance-lob-archiver-production-spot.env"
+cp -p -- "$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/binance-lob-archiver-production-spot.env" \
+  "$production_verify_dir/binance-lob-archiver-production-spot.env"
+chmod u+w "$production_verify_dir/binance-lob-archiver-production@.service"
+printf '\nExecStartPost=/bin/true\n' >>"$production_verify_dir/binance-lob-archiver-production@.service"
+if monday_verify_production_runtime_assets "$ROOT" "$production_verify_dir" "$p0_sha"; then
+  printf 'production runtime verifier accepted an unallowlisted ExecStartPost\n' >&2
+  exit 1
+fi
+cp -p -- "$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/binance-lob-archiver-production@.service" \
+  "$production_verify_dir/binance-lob-archiver-production@.service"
+chmod u+w "$production_verify_dir/binance-lob-archiver-production@.service"
+printf 'ExecStart=/opt/monday/bin/binance-lob-archiver\n' >>"$production_verify_dir/binance-lob-archiver-production@.service"
+if monday_verify_production_runtime_assets "$ROOT" "$production_verify_dir" "$p0_sha"; then
+  printf 'production runtime verifier accepted a duplicate ExecStart\n' >&2
+  exit 1
+fi
+cp -p -- "$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/binance-lob-archiver-production@.service" \
+  "$production_verify_dir/binance-lob-archiver-production@.service"
+chmod u+w "$production_verify_dir/binance-lob-archiver-production-spot.env"
+printf 'UNTRUSTED_RUNTIME_FLAG=1\n' >>"$production_verify_dir/binance-lob-archiver-production-spot.env"
+if monday_verify_production_runtime_assets "$ROOT" "$production_verify_dir" "$p0_sha"; then
+  printf 'production runtime verifier accepted an unknown environment key\n' >&2
+  exit 1
+fi
+
+# Failed bootstrap cleanup must durably restore the raw C0/P0/R0 topology and
+# remove partial evidence before active rolls back.  A hard stop immediately
+# after that last rollback therefore leaves a complete C0 that accepts the one
+# identical retry, not a mixed topology that requires guessed recovery.
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FAIL_AFTER_ACTIVE=1 \
+  MONDAY_CUTOVER_HARD_CRASH_AFTER_ACTIVE_ROLLBACK=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from direct --to "$c0" \
+  --gate-receipt "$gate" --gate-sha256 "$gate_sha" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'post-rollback hard-crash cutover unexpectedly survived SIGKILL\n' >&2
+  exit 1
+fi
+[[ $(monday_active_controller_sha "$ROOT") == "$legacy_c0" ]]
+legacy_hard_crash_recovery="$ROOT/data/monday/evidence/cutovers/$c0/recovery.json"
+if [[ ! -f $legacy_hard_crash_recovery || -L $legacy_hard_crash_recovery ]]; then
+  printf 'same-payload hard crash did not preserve its recovery intent\n' >&2
+  exit 1
+fi
+if [[ ! -L $ROOT/opt/monday/bin/binance-lob-archiver ]]; then
+  printf 'same-payload hard crash removed the direct production projection\n' >&2
+  exit 1
+fi
+for asset in binance-lob-archiver-rust-spot.env binance-lob-archiver-rust-usdm.env; do
+  [[ -f "$(monday_runtime_asset_target "$ROOT" "$asset")" && ! -L "$(monday_runtime_asset_target "$ROOT" "$asset")" ]]
+done
+for asset in host-rust-lob-recovery-queue.sh monday-collector-health.sh; do
+  target=$(monday_controller_projection_target "$ROOT" "$asset")
+  active_asset="$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/$asset"
+  [[ -f $target && ! -L $target ]]
+  [[ $(monday_sha256_file "$target") != "$(monday_sha256_file "$active_asset")" ]]
+done
+refreshed_gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  bash -c '
+    root=$1; shift
+    mkdir -p "$root/proc/$$"
+    printf "1 fixture S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 4242\\n" >"$root/proc/$$/stat"
+    printf "%s\\n" "$$" >"$root/run/refreshed-direct-gate.pid"
+    exec "$@"
+  ' _ "$ROOT" "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
+  --from-controller direct --candidate-controller "$c0" --root "$ROOT")
+refreshed_direct_gate_pid=$(cat "$ROOT/run/refreshed-direct-gate.pid")
+rm -rf -- "$ROOT/proc/$refreshed_direct_gate_pid" "$ROOT/run/refreshed-direct-gate.pid"
+refreshed_gate=$(printf '%s\n' "$refreshed_gate_output" | sed -n 's/^V2 Gate receipt: //p')
+refreshed_gate_sha=$(printf '%s\n' "$refreshed_gate_output" | sed -n 's/^SHA-256: //p')
+[[ $refreshed_gate != "$gate" && $refreshed_gate_sha != "$gate_sha" ]]
+monday_validate_v2_gate_authoritative "$ROOT" "$refreshed_gate" direct "$c0" "$refreshed_gate_sha"
+hard_crash_retry_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from direct --to "$c0" \
+  --gate-receipt "$refreshed_gate" --gate-sha256 "$refreshed_gate_sha" --root "$ROOT")
+grep -Fq 'Pair cutover complete' <<<"$hard_crash_retry_output"
+[[ $(monday_active_controller_sha "$ROOT") == "$c0" ]]
+[[ ! -e $legacy_hard_crash_recovery && ! -L $legacy_hard_crash_recovery ]]
+rm -rf -- "$ROOT/data/monday/evidence/cutovers/$c0"
+rm -f -- "$ROOT/opt/monday/releases/binance-lob-controller/active"
+ln -s "$legacy_root/$legacy_c0" "$ROOT/opt/monday/releases/binance-lob-controller/active"
+rm -f -- "$ROOT/opt/monday/bin/binance-lob-archiver"
+ln -s "$direct_production_before" "$ROOT/opt/monday/bin/binance-lob-archiver"
+rm -f -- "$(monday_runtime_asset_target "$ROOT" "$production_slice_asset")"
+while IFS= read -r asset; do
+  [[ $asset == "$production_slice_asset" ]] && continue
+  target=$(monday_runtime_asset_target "$ROOT" "$asset")
+  rm -f -- "$target"
+  cp -p -- "$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/$asset" "$target"
+done < <(monday_runtime_assets)
+while IFS= read -r asset; do
+  target=$(monday_controller_projection_target "$ROOT" "$asset")
+  rm -f -- "$target"
+  cp -p -- "$legacy_root/$legacy_c0/deployment/$asset" "$target"
+done < <(monday_controller_projection_assets)
+
+# A distinct legacy controller carrying the same P/R is still not the Gate's
+# authorized before identity.  Cutover must resolve the active legacy C0 and
+# reject the receipt, then the original direct topology is restored.
+legacy_alt_work="$ROOT/legacy-controller-alt"
+mkdir -p "$legacy_alt_work/deployment"
+jq --arg source "$(printf '8%.0s' {1..40})" --arg uri oss://bucket/legacy-controller-alt \
+  '.deployment_source_revision = $source | .deployment_bundle_uri = $uri' \
+  "$legacy_work/release.json" >"$legacy_alt_work/release.json"
+legacy_alt_c0=$(monday_sha256_file "$legacy_alt_work/release.json")
+for asset in host-rust-lob-recovery-queue.sh monday-collector-health.sh; do
+  cp -p -- "$legacy_work/deployment/$asset" "$legacy_alt_work/deployment/$asset"
+done
+mkdir -p "$legacy_root/$legacy_alt_c0/deployment"
+cp -p -- "$legacy_alt_work/release.json" "$legacy_root/$legacy_alt_c0/release.json"
+cp -p -- "$legacy_alt_work/deployment/"* "$legacy_root/$legacy_alt_c0/deployment/"
+(cd "$legacy_root/$legacy_alt_c0" && sha256sum release.json >release.json.sha256 && sha256sum deployment/* >deployment.sha256)
+rm -f -- "$legacy_root/active"
+ln -s "$legacy_root/$legacy_alt_c0" "$legacy_root/active"
+rm -f -- "$ROOT/opt/monday/bin/binance-lob-archiver"
+ln -s "$direct_production_before" "$ROOT/opt/monday/bin/binance-lob-archiver"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from direct --to "$c0" \
+  --gate-receipt "$gate" --gate-sha256 "$gate_sha" --root "$ROOT" \
+  >/dev/null 2>&1; then
+  printf 'cutover accepted a different legacy C0 with the same P/R\n' >&2
+  exit 1
+fi
+rm -f -- "$legacy_root/active"
+ln -s "$legacy_root/$legacy_c0" "$legacy_root/active"
+rm -f -- "$ROOT/opt/monday/bin/binance-lob-archiver"
+ln -s "$direct_production_before" "$ROOT/opt/monday/bin/binance-lob-archiver"
+
+# Bootstrap must independently bind the live R0 bytes.  A missing or drifted
+# shadow runtime asset is rejected before any active/controller projection is
+# changed, even when the Gate receipt itself was produced earlier.
+bootstrap_shadow="$ROOT/etc/monday/binance-lob-archiver-rust-spot.env"
+cp -p -- "$bootstrap_shadow" "$bootstrap_shadow.saved"
+rm -f -- "$bootstrap_shadow"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from direct --to "$c0" \
+  --gate-receipt "$gate" --gate-sha256 "$gate_sha" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'bootstrap accepted a missing shadow runtime asset\n' >&2
+  exit 1
+fi
+mv -f -- "$bootstrap_shadow.saved" "$bootstrap_shadow"
+chmod u+w "$bootstrap_shadow"
+printf 'bootstrap-r0-drift\n' >"$bootstrap_shadow"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from direct --to "$c0" \
+  --gate-receipt "$gate" --gate-sha256 "$gate_sha" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'bootstrap accepted drifted runtime bytes\n' >&2
+  exit 1
+fi
+cp -p -- "$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/binance-lob-archiver-rust-spot.env" \
+  "$bootstrap_shadow"
+
+# A normal direct-bootstrap failure must restore the exact pre-bootstrap writer
+# states from the snapshot, including active legacy units; it must not leave
+# the migration partially contained.
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
+  MONDAY_CUTOVER_FIXTURE_LEGACY_ACTIVE=1 MONDAY_CUTOVER_FAIL_AFTER_TRANSITION_EVIDENCE_COMMIT=1 \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from direct --to "$c0" \
+  --gate-receipt "$gate" --gate-sha256 "$gate_sha" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'fault-injected direct bootstrap unexpectedly succeeded\n' >&2
+  exit 1
+fi
+if [[ $(readlink -- "$direct_production") != "$direct_production_before" ]]; then
+  printf 'failed direct bootstrap did not preserve the raw production projection\n' >&2
+  exit 1
+fi
+direct_failure_recovery="$ROOT/data/monday/evidence/cutovers/$c0/recovery.json"
+direct_failure_transition="$ROOT/data/monday/evidence/cutovers/$c0/transition.json"
+if [[ ! -f $direct_failure_recovery || -L $direct_failure_recovery ]]; then
+  printf 'failed direct bootstrap cleared its recovery authority\n' >&2
+  exit 1
+fi
+[[ ! -e $direct_failure_transition && ! -L $direct_failure_transition \
+  && ! -e $direct_failure_transition.sha256 && ! -L $direct_failure_transition.sha256 ]]
+direct_failure_calls="$ROOT/run/cutover-fixture.calls"
+for unit in \
+  binance-lob-archiver@spot.service binance-lob-archiver@usdm.service \
+  binance-lob-archiver-upload@spot.service binance-lob-archiver-upload@usdm.service; do
+  grep -Fq "mask $unit" "$direct_failure_calls"
+  grep -Fq "start $unit" "$direct_failure_calls"
+done
+rm -f -- "$ROOT/run/cutover-fixture.calls"
+
+bootstrap_cutover_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
+  MONDAY_CUTOVER_FIXTURE_LEGACY_ACTIVE=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from direct --to "$c0" \
+  --gate-receipt "$gate" --gate-sha256 "$gate_sha" --root "$ROOT")
+[[ ! -e $direct_failure_recovery && ! -L $direct_failure_recovery ]]
+bootstrap_transition=$(printf '%s\n' "$bootstrap_cutover_output" | sed -n 's/^Transition receipt: //p')
+bootstrap_transition_sha=$(printf '%s\n' "$bootstrap_cutover_output" | sed -n 's/^SHA-256: //p')
+[[ $(monday_active_controller_sha "$ROOT") == "$c0" ]]
+[[ $(readlink -- "$ROOT/opt/monday/bin/binance-lob-archiver") == \
+  "$ROOT/opt/monday/releases/binance-lob-controller/active/binance-lob-archiver" ]]
+[[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == \
+  "$ROOT/opt/monday/releases/binance-lob-archiver/$p0_sha/binance-lob-archiver" ]]
+[[ $(monday_sha256_file "$bootstrap_transition") == "$bootstrap_transition_sha" ]]
+monday_validate_v2_transition "$ROOT" "$bootstrap_transition" direct "$c0" "$gate" "$gate_sha"
+bootstrap_calls="$ROOT/run/cutover-fixture.calls"
+for unit in \
+  binance-lob-archiver@spot.service binance-lob-archiver@usdm.service \
+  binance-lob-archiver-upload@spot.service binance-lob-archiver-upload@usdm.service; do
+  grep -Fqx "stop $unit" "$bootstrap_calls"
+  grep -Fqx "disable $unit" "$bootstrap_calls"
+  grep -Fqx "mask $unit" "$bootstrap_calls"
+  if grep -Fq "start $unit" "$bootstrap_calls"; then
+    printf 'direct bootstrap resumed a legacy writer: %s\n' "$unit" >&2
+    exit 1
+  fi
+done
+mkdir -p "$ROOT/fixture-upload-status-empty"
+MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  MONDAY_UPLOAD_STATUS_ROOT="$ROOT/fixture-upload-status-empty" \
+  "$SCRIPT_DIR/host-rust-lob-readback.sh" --controller "$c0" \
+  --transition-receipt "$bootstrap_transition" --receipt-sha256 "$bootstrap_transition_sha" \
+  --root "$ROOT" >/dev/null
+while IFS= read -r asset; do
+  target=$(monday_runtime_asset_target "$ROOT" "$asset")
+  [[ -L $target && $(readlink -- "$target") == \
+    "$ROOT/opt/monday/releases/binance-lob-controller/active/deployment/$asset" ]]
+done < <(monday_runtime_assets)
+
+# Fresh resource admission must be checked immediately before a phase.  If
+# MemAvailable falls before the Shadow admission, the Gate must reject before
+# systemctl start and leave no candidate writer running.
+rm -f -- "$ROOT/run/gate-fixture.calls"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_FRESH_ADMISSION_FAIL=1 \
+  MONDAY_GATE_FIXTURE_RECORD_CALLS=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c0" \
+  --candidate-controller "$c1" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'Gate accepted a phase after fresh memory admission failed\n' >&2
+  exit 1
+fi
+if [[ -f $ROOT/run/gate-fixture.calls ]] && grep -Eq \
+  '^start monday-rust-lob-gate-.*-(spot|usdm)\\.service$' "$ROOT/run/gate-fixture.calls"; then
+  printf 'Shadow writer started after fresh memory admission failed\n' >&2
+  exit 1
+fi
+
+# A production MainPID that is not present in its reported child cgroup is a
+# mixed identity and must fail before any candidate writer starts.
+rm -f -- "$ROOT/run/gate-fixture.calls"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_PID_MISMATCH=1 \
+  MONDAY_GATE_FIXTURE_RECORD_CALLS=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c0" \
+  --candidate-controller "$c1" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'Gate accepted a MainPID outside its production child cgroup\n' >&2
+  exit 1
+fi
+if [[ -f $ROOT/run/gate-fixture.calls ]] && grep -Eq \
+  '^start monday-rust-lob-gate-.*-(spot|usdm)\\.service$' "$ROOT/run/gate-fixture.calls"; then
+  printf 'Shadow writer started after production MainPID membership failed\n' >&2
+  exit 1
+fi
+
+# The asynchronous monitor is a synchronous guard in TEST_ONLY.  A changed
+# production executable identity writes the breach marker and blocks the first
+# phase, so no candidate writer or receipt can be produced.
+rm -f -- "$ROOT/run/gate-fixture.calls"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_IDENTITY_DRIFT=1 \
+  MONDAY_GATE_FIXTURE_RECORD_CALLS=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c0" \
+  --candidate-controller "$c1" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'Gate accepted production identity drift in its monitor guard\n' >&2
+  exit 1
+fi
+if [[ -f $ROOT/run/gate-fixture.calls ]] && grep -Eq \
+  '^start monday-rust-lob-gate-.*-(spot|usdm)\\.service$' "$ROOT/run/gate-fixture.calls"; then
+  printf 'Shadow writer started after production identity drift\n' >&2
+  exit 1
+fi
+
+# A V2 active controller paired with a direct production binary is a mixed
+# topology, not a second bootstrap mode.  Gate must reject it before reading
+# any candidate control bytes, then the stable projection is restored.
+mixed_production_target=$(readlink -- "$ROOT/opt/monday/bin/binance-lob-archiver")
+rm -f -- "$ROOT/opt/monday/bin/binance-lob-archiver"
+ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p0_sha/binance-lob-archiver" \
+  "$ROOT/opt/monday/bin/binance-lob-archiver"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c1" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'Gate accepted a mixed V2-active/direct-production topology\n' >&2
+  exit 1
+fi
+rm -f -- "$ROOT/opt/monday/bin/binance-lob-archiver"
+ln -s "$mixed_production_target" "$ROOT/opt/monday/bin/binance-lob-archiver"
+
+# Simulate the production unit's ExecStartPre identity boundary.  The real
+# helper is not invoked in an isolated fixture, but the exact stable
+# projection, executable bit, resolved bytes, and active-controller target
+# are checked through the same fixed path systemd calls.
+simulate_recovery_execstartpre() {
+  local asset target expected
+  while IFS= read -r asset; do
+    target=$(monday_controller_projection_target "$ROOT" "$asset")
+    expected="$ROOT/opt/monday/releases/binance-lob-controller/active/deployment/$asset"
+    bash -c 'set -eu
+      entry=$1
+      expected=$2
+      test -L "$entry"
+      test -x "$entry"
+      test "$(readlink -- "$entry")" = "$expected"
+      resolved=$(readlink -f -- "$entry")
+      test -f "$resolved" && test ! -L "$resolved"
+      cmp -s "$resolved" "$expected"' _ "$target" "$expected" \
+      || return 1
+  done < <(monday_controller_projection_assets)
+}
+simulate_recovery_execstartpre
+recovery_projection=$(monday_controller_projection_target "$ROOT" host-rust-lob-recovery-queue.sh)
+recovery_projection_target=$(readlink -- "$recovery_projection")
+rm -f -- "$recovery_projection"
+printf 'tampered-recovery-helper\n' >"$recovery_projection"
+if simulate_recovery_execstartpre; then
+  printf 'ExecStartPre simulation accepted a non-projected recovery helper\n' >&2
+  exit 1
+fi
+rm -f -- "$recovery_projection"
+ln -s "$recovery_projection_target" "$recovery_projection"
+simulate_recovery_execstartpre
+
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
+  --from-controller direct --candidate-controller "$c0" --root "$ROOT" \
+  >/dev/null 2>&1; then
+  printf 'Gate accepted a second receipt for the same controller\n' >&2
+  exit 1
+fi
+
+# Identity tampering is rejected by the receipt hash and transition identity.
+tampered="$ROOT/tampered.json"
+jq '.transition.after = ("f" * 64)' "$gate" >"$tampered"
+tampered_sha=$(monday_sha256_file "$tampered")
+if monday_validate_v2_gate "$tampered" direct "$c0" "$tampered_sha"; then
+  printf 'Gate validator accepted a tampered transition\n' >&2
+  exit 1
+fi
+tampered="$ROOT/tampered-policy.json"
+jq '.checks.oss_triplets = false' "$gate" >"$tampered"
+if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$tampered" >/dev/null 2>&1; then
+  printf 'Gate policy accepted a failed OSS check\n' >&2
+  exit 1
+fi
+
+# A hand-written v5-shaped summary is not authoritative: the validator and
+# policy must require the per-market triplet evidence rather than trusting the
+# advertised counts.
+fake="$ROOT/fake-v5.json"
+jq '.markets.spot.triplets = [] | .markets.usdm.triplets = []' "$gate" >"$fake"
+fake_sha=$(monday_sha256_file "$fake")
+if monday_validate_v2_gate "$fake" direct "$c0" "$fake_sha"; then
+  printf 'Gate validator accepted a summary-only v5 receipt\n' >&2
+  exit 1
+fi
+if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$fake" >/dev/null 2>&1; then
+  printf 'Gate policy accepted a summary-only v5 receipt\n' >&2
+  exit 1
+fi
+
+# Control-byte evidence is keyed to the exact controller asset set; a
+# same-sized map with an unexpected asset must not authorize a transition.
+fake="$ROOT/fake-control-assets.json"
+jq '.candidate_control_bytes.assets = {unexpected: ("0" * 64)}' "$gate" >"$fake"
+fake_sha=$(monday_sha256_file "$fake")
+if monday_validate_v2_gate "$fake" direct "$c0" "$fake_sha"; then
+  printf 'Gate validator accepted an unexpected control asset map\n' >&2
+  exit 1
+fi
+if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$fake" >/dev/null 2>&1; then
+  printf 'Gate policy accepted an unexpected control asset map\n' >&2
+  exit 1
+fi
+
+# A V2 before pair must be active and its payload may change.  Bootstrap has
+# already established the permanent stable projections for every runtime
+# asset; the test must not write through those links into immutable C0.
+declare -A shadow_before_sha
+for asset in \
+  binance-lob-archiver-rust@.service binance-lob-archiver-rust-upload@.service \
+  binance-lob-archiver-rust-spot.env binance-lob-archiver-rust-usdm.env; do
+  if [[ $asset == *.service ]]; then target="$ROOT/etc/systemd/system/$asset"; else target="$ROOT/etc/monday/$asset"; fi
+  [[ -L $target && $(readlink -- "$target") == "$ROOT/opt/monday/releases/binance-lob-controller/active/deployment/$asset" ]]
+  shadow_before_sha[$asset]=$(monday_sha256_file "$(readlink -f -- "$target")")
+done
+# The before runtime must contain all four shadow assets and each one must
+# resolve to the active controller projection.  Missing or drifted bytes are
+# rejected before a Gate can stage a candidate.
+missing_shadow="$ROOT/etc/monday/binance-lob-archiver-rust-spot.env"
+rm -f -- "$missing_shadow"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c0" \
+  --candidate-controller "$c1" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'Gate accepted a missing shadow runtime asset\n' >&2
+  exit 1
+fi
+ln -s "$ROOT/opt/monday/releases/binance-lob-controller/active/deployment/binance-lob-archiver-rust-spot.env" \
+  "$missing_shadow"
+drift_shadow="$ROOT/etc/monday/binance-lob-archiver-rust-usdm.env"
+rm -f -- "$drift_shadow"
+printf 'drifted-runtime-byte\n' >"$drift_shadow"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c0" \
+  --candidate-controller "$c1" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'Gate accepted drifted shadow runtime bytes\n' >&2
+  exit 1
+fi
+rm -f -- "$drift_shadow"
+ln -s "$ROOT/opt/monday/releases/binance-lob-controller/active/deployment/binance-lob-archiver-rust-usdm.env" \
+  "$drift_shadow"
+ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p0_sha/binance-lob-archiver" \
+  "$ROOT/opt/monday/bin/binance-lob-archiver-shadow"
+shadow_before_target=$(readlink -- "$ROOT/opt/monday/bin/binance-lob-archiver-shadow")
+gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" \
+  --from-controller "$c0" --candidate-controller "$c1" --root "$ROOT")
+gate=$(printf '%s\n' "$gate_output" | sed -n 's/^V2 Gate receipt: //p')
+gate_sha=$(printf '%s\n' "$gate_output" | sed -n 's/^SHA-256: //p')
+monday_validate_v2_gate "$gate" "$c0" "$c1" "$gate_sha"
+jq -e '.source_mode == "stable"' "$gate" >/dev/null
+# URI identity is part of the v5 policy, not just the downloader.  Moving a
+# complete same-session triplet below an extra path component must fail both
+# validators before it can become transition evidence.
+fake="$ROOT/fake-extra-triplet.json"
+jq '.markets.spot.triplets[0]
+    |= (.data_uri |= sub("/shard=all/"; "/shard=all/extra/")
+      | .manifest_uri |= sub("/shard=all/"; "/shard=all/extra/")
+      | .success_uri |= sub("/shard=all/"; "/shard=all/extra/"))' \
+  "$gate" >"$fake"
+fake_sha=$(monday_sha256_file "$fake")
+if monday_validate_v2_gate "$fake" "$c0" "$c1" "$fake_sha"; then
+  printf 'Gate validator accepted an extra nested triplet path\n' >&2
+  exit 1
+fi
+if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$fake" >/dev/null 2>&1; then
+  printf 'Gate policy accepted an extra nested triplet path\n' >&2
+  exit 1
+fi
+# The standalone v5 policy and the shell validator must agree on Gregorian
+# calendar validity, including leap years, rather than accepting date-shaped
+# but impossible partitions.
+rewrite_triplet_partition_date() {
+  local source=$1 target=$2 date_value=$3
+  jq --arg date "$date_value" '
+    .markets.spot.triplets[0]
+    |= (.object_prefix |= sub("/date=[0-9]{4}-[0-9]{2}-[0-9]{2}/hour="; ("/date=" + $date + "/hour="))
+      | .data_uri |= sub("/date=[0-9]{4}-[0-9]{2}-[0-9]{2}/hour="; ("/date=" + $date + "/hour="))
+      | .manifest_uri |= sub("/date=[0-9]{4}-[0-9]{2}-[0-9]{2}/hour="; ("/date=" + $date + "/hour="))
+      | .success_uri |= sub("/date=[0-9]{4}-[0-9]{2}-[0-9]{2}/hour="; ("/date=" + $date + "/hour=")))
+  ' "$source" >"$target"
+}
+fake="$ROOT/fake-impossible-date.json"
+rewrite_triplet_partition_date "$gate" "$fake" 2026-02-29
+fake_sha=$(monday_sha256_file "$fake")
+if monday_validate_v2_gate "$fake" "$c0" "$c1" "$fake_sha"; then
+  printf 'Gate validator accepted an impossible Gregorian date\n' >&2
+  exit 1
+fi
+if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$fake" >/dev/null 2>&1; then
+  printf 'Gate policy accepted an impossible Gregorian date\n' >&2
+  exit 1
+fi
+fake="$ROOT/fake-leap-date.json"
+rewrite_triplet_partition_date "$gate" "$fake" 2024-02-29
+fake_sha=$(monday_sha256_file "$fake")
+monday_validate_v2_gate "$fake" "$c0" "$c1" "$fake_sha"
+jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$fake" >/dev/null
+for asset in "${!shadow_before_sha[@]}"; do
+  if [[ $asset == *.service ]]; then target="$ROOT/etc/systemd/system/$asset"; else target="$ROOT/etc/monday/$asset"; fi
+  [[ $(monday_sha256_file "$(readlink -f -- "$target")") == "${shadow_before_sha[$asset]}" ]] || {
+    printf 'Gate did not restore shadow asset %s\n' "$asset" >&2
+    exit 1
+  }
+done
+[[ $(readlink -- "$ROOT/opt/monday/bin/binance-lob-archiver-shadow") == "$shadow_before_target" ]]
+
+# Cutover validates only the signed aggregate-slice configuration before any
+# lane is unmasked.  A configured-limit failure must therefore leave the
+# production start boundary untouched.
+rm -f -- "$ROOT/run/cutover-fixture.calls"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
+  MONDAY_CUTOVER_FIXTURE_BAD_CONFIG=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from "$c0" --to "$c1" \
+  --gate-receipt "$gate" --gate-sha256 "$gate_sha" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'cutover accepted an invalid signed production slice configuration\n' >&2
+  exit 1
+fi
+config_line=$(grep -n -m1 '^verify-config ' "$ROOT/run/cutover-fixture.calls" | cut -d: -f1 || true)
+unmask_line=$(grep -n -m1 '^unmask ' "$ROOT/run/cutover-fixture.calls" | cut -d: -f1 || true)
+if [[ -z $config_line || ( -n $unmask_line && $unmask_line -lt $config_line ) ]]; then
+  printf 'cutover unmasked production lanes before configured slice validation\n' >&2
+  exit 1
+fi
+
+# Once configured limits pass, the full two-child verifier runs after starts;
+# a child membership mismatch must be observed only at that post-start point.
+rm -f -- "$ROOT/run/cutover-fixture.calls"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
+  MONDAY_CUTOVER_FIXTURE_BAD_MEMBERSHIP=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from "$c0" --to "$c1" \
+  --gate-receipt "$gate" --gate-sha256 "$gate_sha" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'cutover accepted a live production child membership mismatch\n' >&2
+  exit 1
+fi
+if [[ ! -f $ROOT/run/cutover-fixture.calls ]] || \
+  [[ $(grep -Ec '^start binance-lob-archiver-production@(spot|usdm)\.service$' \
+    "$ROOT/run/cutover-fixture.calls") -ne 2 ]]; then
+  printf 'cutover did not reach the post-start membership verifier\n' >&2
+  exit 1
+fi
+
+fixture_process_pid=4242
+mkdir -p "$ROOT/proc/$fixture_process_pid"
+ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p1_sha/binance-lob-archiver" \
+  "$ROOT/proc/$fixture_process_pid/exe"
+write_cutover_fixture_health() {
+  local started elapsed observed_at_ns
+  started=$(date +%s)
+  mkdir -p "$production_spool_root/spot" "$production_spool_root/usdm"
+  while [[ ! -e "$ROOT/run/cutover-fixture-health.stop" ]]; do
+    elapsed=$(( $(date +%s) - started ))
+    (( elapsed >= 1 )) || { sleep 0.1; continue; }
+    observed_at_ns=$(date +%s%N)
+    jq -cn --argjson observed "$observed_at_ns" \
+      '{market:"spot",dataset:"spot_all",status:"synced",sequence_gaps:0,symbol_count:1000,snapshot_ready_count:1000,bridged_count:1000,stream_coverage_verified_count:1000,snapshot_only_symbols:[],all_symbols_bridged:true,all_stream_coverage_verified:true,full_stream_coverage_verified:true,pending_upload_segments:0,queue_saturated:false,disk_warning:false,upload_warning:false,session_id:"cutover-fixture-spot",updated_at_ns:$observed}' \
+      >"$production_spool_root/spot/health.json.tmp"
+    mv -f -- "$production_spool_root/spot/health.json.tmp" "$production_spool_root/spot/health.json"
+    if [[ ${FIXTURE_SPOT_FLIP:-0} == 1 ]]; then
+      if [[ ! -e "$ROOT/run/cutover-fixture-spot-observed" ]]; then
+        sleep 0.1
+        continue
+      fi
+      : >"$ROOT/run/cutover-fixture-spot-flip"
+    elif (( elapsed < 3 )); then
+      sleep 0.1
+      continue
+    fi
+    jq -cn --argjson observed "$observed_at_ns" \
+      '{market:"usdm",dataset:"usdm_perpetual_top100_lob_trade",status:"synced",sequence_gaps:0,symbol_count:100,snapshot_ready_count:100,bridged_count:100,stream_coverage_verified_count:100,snapshot_only_symbols:[],all_symbols_bridged:true,all_stream_coverage_verified:true,full_stream_coverage_verified:true,pending_upload_segments:0,queue_saturated:false,disk_warning:false,upload_warning:false,session_id:"cutover-fixture-usdm",updated_at_ns:$observed}' \
+      >"$production_spool_root/usdm/health.json.tmp"
+    mv -f -- "$production_spool_root/usdm/health.json.tmp" "$production_spool_root/usdm/health.json"
+    (( elapsed < 15 )) || break
+    sleep 0.1
+  done
+}
+rm -f -- "$ROOT/run/cutover-fixture-health.stop" "$ROOT/run/cutover-fixture-spot-flip" \
+  "$ROOT/run/cutover-fixture-spot-observed" \
+  "$production_spool_root/spot/health.json" "$production_spool_root/usdm/health.json"
+(
+  write_cutover_fixture_health
+) &
+fixture_health_writer=$!
+cutover_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
+  MONDAY_CUTOVER_FIXTURE_VERIFY_PROCESS=1 MONDAY_CUTOVER_FIXTURE_PID="$fixture_process_pid" \
+  MONDAY_CUTOVER_HEALTH_TIMEOUT_SECONDS=5 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from "$c0" --to "$c1" \
+  --gate-receipt "$gate" --gate-sha256 "$gate_sha" --root "$ROOT")
+ : >"$ROOT/run/cutover-fixture-health.stop"
+wait "$fixture_health_writer"
+transition=$(printf '%s\n' "$cutover_output" | sed -n 's/^Transition receipt: //p')
+transition_sha=$(printf '%s\n' "$cutover_output" | sed -n 's/^SHA-256: //p')
+[[ $(monday_active_controller_sha "$ROOT") == "$c1" ]]
+[[ $(readlink -- "$ROOT/opt/monday/bin/binance-lob-archiver") == \
+  "$ROOT/opt/monday/releases/binance-lob-controller/active/binance-lob-archiver" ]]
+[[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == \
+  "$ROOT/opt/monday/releases/binance-lob-archiver/$p1_sha/binance-lob-archiver" ]]
+[[ $(monday_sha256_file "$transition") == "$transition_sha" ]]
+monday_validate_v2_transition "$ROOT" "$transition" "$c0" "$c1" "$gate" "$gate_sha"
+jq -e --argjson pid "$fixture_process_pid" \
+  '.production_process | .spot.main_pid == $pid and .usdm.main_pid == $pid
+   and .spot.process_exe_sha256 == .usdm.process_exe_sha256
+   and .spot.n_restarts == 0 and .usdm.n_restarts == 0
+   and (.spot.session_id | length) > 0 and (.usdm.session_id | length) > 0' \
+  "$transition" >/dev/null
+
+# A fault after the active-pair rename restores both identities under the lock.
+printf '\n# controller revision three fixture\n' >>"$source_dir/host-rust-lob-readback.sh"
+p2="$ROOT/p2"; m2="$ROOT/m2.json"
+p2_sha=$(publish_fixture "$p2" "$m2")
+c2=$(monday_sha256_file "$m2")
+active_before_failure=$(monday_active_controller_sha "$ROOT")
+production_before_failure=$(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver")
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_FAIL_RESTART=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c1" \
+  --candidate-controller "$c2" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'fault-injected Gate unexpectedly succeeded\n' >&2
+  exit 1
+fi
+[[ $(monday_active_controller_sha "$ROOT") == "$active_before_failure" ]]
+[[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == "$production_before_failure" ]]
+for asset in "${!shadow_before_sha[@]}"; do
+  if [[ $asset == *.service ]]; then target="$ROOT/etc/systemd/system/$asset"; else target="$ROOT/etc/monday/$asset"; fi
+  [[ $(monday_sha256_file "$(readlink -f -- "$target")") == "${shadow_before_sha[$asset]}" ]] || {
+    printf 'failed Gate did not restore shadow asset %s\n' "$asset" >&2
+    exit 1
+  }
+done
+if find "$ROOT/data/monday/evidence/shadow-gates/$c2" -name PASSED.sha256 -print -quit | grep -q .; then
+  printf 'failed Gate left a PASSED marker\n' >&2
+  exit 1
+fi
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_TAMPER_OSS=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c1" \
+  --candidate-controller "$c2" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'OSS-tampered Gate unexpectedly succeeded\n' >&2
+  exit 1
+fi
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_TAMPER_OSS_MANIFEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c1" \
+  --candidate-controller "$c2" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'OSS-manifest-tampered Gate unexpectedly succeeded\n' >&2
+  exit 1
+fi
+[[ $(monday_active_controller_sha "$ROOT") == "$active_before_failure" ]]
+[[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == "$production_before_failure" ]]
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --resource-preflight "$c2" >/dev/null 2>&1; then
+  printf 'Gate exposed a public preflight action\n' >&2
+  exit 1
+fi
+gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c1" \
+  --candidate-controller "$c2" --root "$ROOT")
+gate2=$(printf '%s\n' "$gate_output" | sed -n 's/^V2 Gate receipt: //p')
+gate2_sha=$(printf '%s\n' "$gate_output" | sed -n 's/^SHA-256: //p')
+
+# Spot is ready before USD-M, but its process identity changes while the
+# second lane is catching up.  The final paired re-read must reject this
+# partial-ready transition and leave the previous pair active.
+flip_fixture_pid=4244; flip_fixture_pid_after=4245
+mkdir -p "$ROOT/proc/$flip_fixture_pid" "$ROOT/proc/$flip_fixture_pid_after"
+ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p2_sha/binance-lob-archiver" \
+  "$ROOT/proc/$flip_fixture_pid/exe"
+ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p2_sha/binance-lob-archiver" \
+  "$ROOT/proc/$flip_fixture_pid_after/exe"
+rm -f -- "$ROOT/run/cutover-fixture-health.stop" "$ROOT/run/cutover-fixture-spot-flip" \
+  "$ROOT/run/cutover-fixture-spot-observed" \
+  "$production_spool_root/spot/health.json" "$production_spool_root/usdm/health.json"
+(
+  FIXTURE_SPOT_FLIP=1 write_cutover_fixture_health
+) &
+flip_health_writer=$!
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
+  MONDAY_CUTOVER_FIXTURE_VERIFY_PROCESS=1 MONDAY_CUTOVER_FIXTURE_PID="$flip_fixture_pid" \
+  MONDAY_CUTOVER_FIXTURE_SPOT_FLIP_PID="$flip_fixture_pid_after" \
+  MONDAY_CUTOVER_HEALTH_TIMEOUT_SECONDS=5 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from "$c1" --to "$c2" \
+  --gate-receipt "$gate2" --gate-sha256 "$gate2_sha" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'cutover accepted a Spot identity change while USD-M was becoming ready\n' >&2
+  exit 1
+fi
+: >"$ROOT/run/cutover-fixture-health.stop"
+wait "$flip_health_writer"
+[[ $(monday_active_controller_sha "$ROOT") == "$c1" ]]
+[[ ! -e "$ROOT/data/monday/evidence/cutovers/$c2/transition.json" ]]
+
+# Cutover must reject a candidate whose process restart counter changes while
+# waiting for the first fresh health publication.  This exercises the same
+# post-start identity check as production, but remains a bounded fixture.
+restart_fixture_pid=4243
+mkdir -p "$ROOT/proc/$restart_fixture_pid"
+ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p2_sha/binance-lob-archiver" \
+  "$ROOT/proc/$restart_fixture_pid/exe"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
+  MONDAY_CUTOVER_FIXTURE_VERIFY_PROCESS=1 MONDAY_CUTOVER_FIXTURE_PID="$restart_fixture_pid" \
+  MONDAY_CUTOVER_FIXTURE_RESTARTS=1 MONDAY_CUTOVER_HEALTH_TIMEOUT_SECONDS=2 \
+  MONDAY_ROOT="$ROOT" "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from "$c1" --to "$c2" \
+  --gate-receipt "$gate2" --gate-sha256 "$gate2_sha" --root "$ROOT" \
+  >/dev/null 2>&1; then
+  printf 'cutover accepted a changed process restart counter\n' >&2
+  exit 1
+fi
+[[ $(monday_active_controller_sha "$ROOT") == "$c1" ]]
+[[ ! -e "$ROOT/data/monday/evidence/cutovers/$c2/transition.json" ]]
+
+# A candidate Spot lane may start before the USD-M lane fails.  The rollback
+# must restore the complete before pair (including both stable projections),
+# then restart both old lanes; no candidate process or transition receipt may
+# remain.  The once-only fixture lets the old USD-M lane recover successfully.
+partial_receipt="$ROOT/data/monday/evidence/cutovers/$c2/transition.json"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
+  MONDAY_CUTOVER_FIXTURE_FAIL_USDM_ONCE=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from "$c1" --to "$c2" \
+  --gate-receipt "$gate2" --gate-sha256 "$gate2_sha" --root "$ROOT" \
+  >/dev/null 2>&1; then
+  printf 'partial-start cutover unexpectedly succeeded\n' >&2
+  exit 1
+fi
+[[ $(monday_active_controller_sha "$ROOT") == "$c1" ]]
+[[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == \
+  "$ROOT/opt/monday/releases/binance-lob-archiver/$p1_sha/binance-lob-archiver" ]]
+[[ ! -e $partial_receipt && ! -L $partial_receipt ]]
+partial_calls="$ROOT/run/cutover-fixture.calls"
+for unit in binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service; do
+  grep -Fq "mask $unit" "$partial_calls"
+done
+partial_process_root="$ROOT/run/cutover-fixture.processes"
+for process in "$partial_process_root"/*; do
+  [[ -e $process ]] || continue
+  [[ $(cat "$process") == "$c1" ]] || {
+    printf 'partial-start rollback left a candidate process: %s\n' "$process" >&2
+    exit 1
+  }
+done
+
+# If the old USD-M lane also fails during rollback, both lanes must remain
+# stopped/masked rather than being reported as recovered with a partial pair.
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
+  MONDAY_CUTOVER_FIXTURE_FAIL_USDM=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from "$c1" --to "$c2" \
+  --gate-receipt "$gate2" --gate-sha256 "$gate2_sha" --root "$ROOT" \
+  >/dev/null 2>&1; then
+  printf 'partial-start rollback-failure fixture unexpectedly succeeded\n' >&2
+  exit 1
+fi
+[[ $(monday_active_controller_sha "$ROOT") == "$c1" ]]
+for unit in binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service; do
+  grep -Fq "mask $unit" "$partial_calls"
+done
+for unit in \
+  binance-lob-archiver@spot.service binance-lob-archiver@usdm.service \
+  binance-lob-archiver-upload@spot.service binance-lob-archiver-upload@usdm.service \
+  binance-lob-archiver-rust@spot.service binance-lob-archiver-rust@usdm.service \
+  binance-lob-archiver-rust-upload@spot.service binance-lob-archiver-rust-upload@usdm.service; do
+  grep -Fq "mask $unit" "$partial_calls"
+done
+if compgen -G "$partial_process_root/*" >/dev/null; then
+  printf 'contained partial-start rollback left a process marker\n' >&2
+  exit 1
+fi
+[[ ! -e $partial_receipt && ! -L $partial_receipt ]]
+
+active_before_stage=$(monday_active_controller_sha "$ROOT")
+production_before_stage=$(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver")
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" MONDAY_CUTOVER_FAIL_AFTER_ASSET_STAGE=1 \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from "$c1" --to "$c2" \
+  --gate-receipt "$gate2" --gate-sha256 "$gate2_sha" --root "$ROOT" \
+  >/dev/null 2>&1; then
+  printf 'fault-injected asset-stage cutover unexpectedly succeeded\n' >&2
+  exit 1
+fi
+[[ $(monday_active_controller_sha "$ROOT") == "$active_before_stage" ]]
+[[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == "$production_before_stage" ]]
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" MONDAY_CUTOVER_FAIL_AFTER_ACTIVE=1 \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from "$c1" --to "$c2" \
+  --gate-receipt "$gate2" --gate-sha256 "$gate2_sha" --root "$ROOT" \
+  >/dev/null 2>&1; then
+  printf 'fault-injected cutover unexpectedly succeeded\n' >&2
+  exit 1
+fi
+[[ $(monday_active_controller_sha "$ROOT") == "$c1" ]]
+[[ $(readlink -- "$ROOT/opt/monday/bin/binance-lob-archiver") == \
+  "$ROOT/opt/monday/releases/binance-lob-controller/active/binance-lob-archiver" ]]
+[[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == \
+  "$ROOT/opt/monday/releases/binance-lob-archiver/$p1_sha/binance-lob-archiver" ]]
+
+cutover_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from "$c1" --to "$c2" \
+  --gate-receipt "$gate2" --gate-sha256 "$gate2_sha" --root "$ROOT")
+transition2=$(printf '%s\n' "$cutover_output" | sed -n 's/^Transition receipt: //p')
+transition2_sha=$(printf '%s\n' "$cutover_output" | sed -n 's/^SHA-256: //p')
+transition2_marker="$transition2.sha256"
+mv -- "$transition2_marker" "$transition2_marker.held"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c2" --root "$ROOT" \
+  >/dev/null 2>&1; then
+  printf 'restore accepted transition evidence without its durable digest\n' >&2
+  exit 1
+fi
+mv -- "$transition2_marker.held" "$transition2_marker"
+rm "$ROOT/opt/monday/bin/binance-lob-archiver"
+MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c2" --root "$ROOT" >/dev/null
+[[ $(monday_active_controller_sha "$ROOT") == "$c2" ]]
+[[ $(readlink -- "$ROOT/opt/monday/bin/binance-lob-archiver") == \
+  "$ROOT/opt/monday/releases/binance-lob-controller/active/binance-lob-archiver" ]]
+[[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == \
+  "$ROOT/opt/monday/releases/binance-lob-archiver/$p2_sha/binance-lob-archiver" ]]
+[[ $(monday_sha256_file "$transition2") == "$transition2_sha" ]]
+MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  MONDAY_UPLOAD_STATUS_ROOT="$ROOT/fixture-upload-status-empty" \
+  "$SCRIPT_DIR/host-rust-lob-readback.sh" --controller "$c2" \
+  --transition-receipt "$transition2" --receipt-sha256 "$transition2_sha" \
+  --root "$ROOT" >/dev/null
+
+# Restore's health and process checks are exercised with one bounded fixture
+# writer.  The writer waits for the fixture systemd start marker, so every
+# accepted sample is fresh relative to restore_started_ns; invalid policy
+# states are rejected without waiting for the production timeout.
+restore_fixture_pid=5252
+mkdir -p "$ROOT/proc/$restore_fixture_pid"
+rm -f -- "$ROOT/proc/$restore_fixture_pid/exe"
+ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p2_sha/binance-lob-archiver" \
+  "$ROOT/proc/$restore_fixture_pid/exe"
+write_restore_fixture_health() {
+  local mode=$1 observed status gaps ready symbols market dataset
+  while [[ ! -e "$ROOT/run/restore-fixture-start-spot" ]]; do
+    [[ -e "$ROOT/run/restore-fixture-health.stop" ]] && return 0
+    sleep 0.05
+  done
+  while [[ ! -e "$ROOT/run/restore-fixture-health.stop" ]]; do
+    observed=$(date +%s%N)
+    for market in spot usdm; do
+      symbols=1000; dataset=spot_all
+      [[ $market == usdm ]] && symbols=100 && dataset=usdm_perpetual_top100_lob_trade
+      status=synced; gaps=0; ready=$symbols
+      case $mode in
+        unsynced) status=starting ;;
+        gaps) gaps=1 ;;
+        nonready) ready=0 ;;
+        success) : ;;
+        *) return 2 ;;
+      esac
+      jq -cn --arg market "$market" --arg dataset "$dataset" --arg status "$status" \
+        --arg session "restore-fixture-${mode}-${market}" --argjson symbols "$symbols" \
+        --argjson ready "$ready" --argjson gaps "$gaps" --argjson observed "$observed" \
+        '{market:$market,dataset:$dataset,status:$status,sequence_gaps:$gaps,symbol_count:$symbols,
+          snapshot_ready_count:$ready,bridged_count:$symbols,stream_coverage_verified_count:$symbols,
+          snapshot_only_symbols:[],all_symbols_bridged:true,all_stream_coverage_verified:true,
+          full_stream_coverage_verified:true,pending_upload_segments:0,queue_saturated:false,
+          disk_warning:false,upload_warning:false,session_id:$session,updated_at_ns:$observed}' \
+        >"$production_spool_root/$market/health.json.tmp"
+      mv -f -- "$production_spool_root/$market/health.json.tmp" \
+        "$production_spool_root/$market/health.json"
+    done
+    sleep 0.05
+  done
+}
+run_restore_health_fixture() {
+  local mode=$1 receipt="$ROOT/data/monday/evidence/restores/$c2/restore.json"
+  rm -f -- "$receipt" "$receipt.sha256" \
+    "$production_spool_root/spot/health.json" "$production_spool_root/usdm/health.json" \
+    "$ROOT/run/restore-fixture-health.stop" "$ROOT/run/restore-fixture-start-spot" \
+    "$ROOT/run/restore-fixture-start-usdm"
+  (write_restore_fixture_health "$mode") &
+  local writer=$!
+  if [[ $mode == success ]]; then
+    MONDAY_CONTROL_PLANE_TEST=1 MONDAY_RESTORE_FIXTURE_SYSTEMD=1 \
+      MONDAY_RESTORE_FIXTURE_PID="$restore_fixture_pid" \
+      MONDAY_RESTORE_HEALTH_TIMEOUT_SECONDS=2 MONDAY_ROOT="$ROOT" \
+      "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c2" --root "$ROOT" >/dev/null
+  else
+    if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_RESTORE_FIXTURE_SYSTEMD=1 \
+      MONDAY_RESTORE_FIXTURE_PID="$restore_fixture_pid" \
+      MONDAY_RESTORE_HEALTH_TIMEOUT_SECONDS=2 MONDAY_ROOT="$ROOT" \
+      "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c2" --root "$ROOT" \
+      >/dev/null 2>&1; then
+      printf 'restore accepted invalid health state: %s\n' "$mode" >&2
+      exit 1
+    fi
+  fi
+  : >"$ROOT/run/restore-fixture-health.stop"
+  wait "$writer"
+  [[ $mode != success || -f $receipt ]] || {
+    printf 'restore success fixture did not emit a receipt\n' >&2
+    exit 1
+  }
+}
+run_restore_health_fixture unsynced
+run_restore_health_fixture gaps
+run_restore_health_fixture nonready
+
+# A production ExecStartPre drift is a preflight failure.  It must not be
+# overwritten from an unrelated source, and the failure cleanup still masks
+# every writer.  Restore the exact active-C projection afterwards.
+restore_service_projection="$ROOT/etc/systemd/system/binance-lob-archiver-production@.service"
+restore_service_source=$(readlink -f -- "$restore_service_projection")
+rm -f -- "$restore_service_projection"
+cp -p -- "$restore_service_source" "$restore_service_projection"
+chmod u+w "$restore_service_projection"
+printf 'ExecStartPre=/opt/monday/bin/untrusted-helper\n' >>"$restore_service_projection"
+rm -f -- "$ROOT/data/monday/evidence/restores/$c2/restore.json" \
+  "$ROOT/data/monday/evidence/restores/$c2/restore.json.sha256" \
+  "$ROOT/run/restore-fixture.calls"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_RESTORE_FIXTURE_SYSTEMD=1 \
+  MONDAY_RESTORE_FIXTURE_PID="$restore_fixture_pid" MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c2" --root "$ROOT" \
+  >/dev/null 2>&1; then
+  printf 'restore accepted drifted ExecStartPre projection\n' >&2
+  exit 1
+fi
+restore_calls="$ROOT/run/restore-fixture.calls"
+for unit in \
+  binance-lob-archiver@spot.service binance-lob-archiver@usdm.service \
+  binance-lob-archiver-upload@spot.service binance-lob-archiver-upload@usdm.service \
+  binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service; do
+  grep -Fq "mask $unit" "$restore_calls"
+done
+rm -f -- "$restore_service_projection"
+ln -s "$ROOT/opt/monday/releases/binance-lob-controller/active/deployment/binance-lob-archiver-production@.service" \
+  "$restore_service_projection"
+
+# Restore uses the same two-stage systemd proof as Cutover: signed aggregate
+# configuration before unmask, then exact child membership after both starts.
+for restore_failure in config membership; do
+  rm -f -- "$ROOT/data/monday/evidence/restores/$c2/restore.json" \
+    "$ROOT/data/monday/evidence/restores/$c2/restore.json.sha256" \
+    "$ROOT/run/restore-fixture.calls"
+  restore_env=(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_RESTORE_FIXTURE_SYSTEMD=1 \
+    MONDAY_RESTORE_FIXTURE_PID="$restore_fixture_pid" MONDAY_ROOT="$ROOT")
+  if [[ $restore_failure == config ]]; then
+    restore_env+=(MONDAY_RESTORE_FIXTURE_BAD_CONFIG=1)
+  else
+    restore_env+=(MONDAY_RESTORE_FIXTURE_BAD_MEMBERSHIP=1)
+  fi
+  if env "${restore_env[@]}" "$SCRIPT_DIR/host-rust-lob-restore.sh" \
+    --controller "$c2" --root "$ROOT" >/dev/null 2>&1; then
+    printf 'restore accepted an invalid production slice %s state\n' "$restore_failure" >&2
+    exit 1
+  fi
+  restore_config_line=$(grep -n -m1 '^verify-config ' "$ROOT/run/restore-fixture.calls" | cut -d: -f1 || true)
+  restore_unmask_line=$(grep -n -m1 '^unmask ' "$ROOT/run/restore-fixture.calls" | cut -d: -f1 || true)
+  [[ -n $restore_config_line && ( -z $restore_unmask_line || $restore_unmask_line -gt $restore_config_line ) ]] || {
+    printf 'restore crossed the production start boundary before slice configuration validation\n' >&2
+    exit 1
+  }
+  if [[ $restore_failure == membership ]]; then
+    [[ $(grep -Ec '^start binance-lob-archiver-production@(spot|usdm)\.service$' \
+      "$ROOT/run/restore-fixture.calls") -eq 2 ]] || {
+      printf 'restore did not reach post-start membership validation\n' >&2
+      exit 1
+    }
+  fi
+done
+run_restore_health_fixture success
+grep -Fq 'enable binance-lob-archiver-production@spot.service' "$restore_calls"
+grep -Fq 'enable binance-lob-archiver-production@usdm.service' "$restore_calls"
+
+# Merely finding restore evidence must not suppress containment before the
+# active immutable pair is proven.  Break active with a valid receipt present,
+# then require fail-closed cleanup to mask every canonical writer.
+restore_active="$ROOT/opt/monday/releases/binance-lob-controller/active"
+restore_active_target=$(readlink -- "$restore_active")
+rm -f -- "$restore_calls" "$restore_active"
+ln -s "$ROOT/opt/monday/releases/binance-lob-controller/missing" "$restore_active"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_RESTORE_FIXTURE_SYSTEMD=1 \
+  MONDAY_RESTORE_FIXTURE_PID="$restore_fixture_pid" MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c2" --root "$ROOT" \
+  >/dev/null 2>&1; then
+  printf 'restore evidence suppressed containment for an invalid active pair\n' >&2
+  exit 1
+fi
+for unit in \
+  binance-lob-archiver@spot.service binance-lob-archiver@usdm.service \
+  binance-lob-archiver-upload@spot.service binance-lob-archiver-upload@usdm.service \
+  binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service; do
+  grep -Fq "mask $unit" "$restore_calls"
+done
+rm -f -- "$restore_active"
+ln -s "$restore_active_target" "$restore_active"
+
+# A repeated successful restore is a read-only idempotency check.  It must
+# verify the live pair/timers/health contract without issuing any systemd
+# containment or projection mutation; a drifted projection fails closed and
+# likewise leaves the call log untouched.
+restore_calls_sha=$(monday_sha256_file "$restore_calls")
+MONDAY_CONTROL_PLANE_TEST=1 MONDAY_RESTORE_FIXTURE_SYSTEMD=1 \
+  MONDAY_RESTORE_FIXTURE_PID="$restore_fixture_pid" MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c2" --root "$ROOT" >/dev/null
+[[ $(monday_sha256_file "$restore_calls") == "$restore_calls_sha" ]]
+restore_projection_target=$(readlink -- "$ROOT/opt/monday/bin/monday-rust-lob-recovery-queue")
+rm -f -- "$ROOT/opt/monday/bin/monday-rust-lob-recovery-queue"
+printf 'idempotency-drift\n' >"$ROOT/opt/monday/bin/monday-rust-lob-recovery-queue"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_RESTORE_FIXTURE_SYSTEMD=1 \
+  MONDAY_RESTORE_FIXTURE_PID="$restore_fixture_pid" MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c2" --root "$ROOT" \
+  >/dev/null 2>&1; then
+  printf 'restore idempotency accepted a drifted controller projection\n' >&2
+  exit 1
+fi
+[[ $(monday_sha256_file "$restore_calls") == "$restore_calls_sha" ]]
+rm -f -- "$ROOT/opt/monday/bin/monday-rust-lob-recovery-queue"
+ln -s "$restore_projection_target" "$ROOT/opt/monday/bin/monday-rust-lob-recovery-queue"
+
+# Readback reuses the active-C health policy before and after the independent
+# OSS phase.  A fixture systemd view supplies process/unit identity while the
+# restored health files exercise the positive path and three fail-closed
+# policy negatives, including a disabled production unit.
+readback_fixture_pid=5353
+mkdir -p "$ROOT/proc/$readback_fixture_pid"
+rm -f -- "$ROOT/proc/$readback_fixture_pid/exe"
+ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p2_sha/binance-lob-archiver" \
+  "$ROOT/proc/$readback_fixture_pid/exe"
+readback_out="$ROOT/data/monday/evidence/readbacks/$c2"
+run_readback_fixture() {
+  local mode=$1
+  rm -rf -- "$readback_out" "$readback_out.sha256"
+  case $mode in
+    success) : ;;
+    unsynced)
+      jq '.status = "starting"' "$production_spool_root/spot/health.json" \
+        >"$production_spool_root/spot/health.json.tmp"
+      mv -f -- "$production_spool_root/spot/health.json.tmp" "$production_spool_root/spot/health.json"
+      jq '.status = "starting"' "$production_spool_root/usdm/health.json" \
+        >"$production_spool_root/usdm/health.json.tmp"
+      mv -f -- "$production_spool_root/usdm/health.json.tmp" "$production_spool_root/usdm/health.json" ;;
+    gaps)
+      jq '.sequence_gaps = 1' "$production_spool_root/spot/health.json" \
+        >"$production_spool_root/spot/health.json.tmp"
+      mv -f -- "$production_spool_root/spot/health.json.tmp" "$production_spool_root/spot/health.json"
+      jq '.sequence_gaps = 1' "$production_spool_root/usdm/health.json" \
+        >"$production_spool_root/usdm/health.json.tmp"
+      mv -f -- "$production_spool_root/usdm/health.json.tmp" "$production_spool_root/usdm/health.json" ;;
+    nonready)
+      jq '.snapshot_ready_count = 0' "$production_spool_root/spot/health.json" \
+        >"$production_spool_root/spot/health.json.tmp"
+      mv -f -- "$production_spool_root/spot/health.json.tmp" "$production_spool_root/spot/health.json"
+      jq '.snapshot_ready_count = 0' "$production_spool_root/usdm/health.json" \
+        >"$production_spool_root/usdm/health.json.tmp"
+      mv -f -- "$production_spool_root/usdm/health.json.tmp" "$production_spool_root/usdm/health.json" ;;
+    disabled) : ;;
+    *) return 2 ;;
+  esac
+  if [[ $mode == disabled ]]; then
+    if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_READBACK_FIXTURE_SYSTEMD=1 \
+      MONDAY_READBACK_FIXTURE_UNIT_FILE_STATE=disabled MONDAY_READBACK_FIXTURE_PID="$readback_fixture_pid" \
+      MONDAY_UPLOAD_STATUS_ROOT="$ROOT/fixture-upload-status-empty" MONDAY_ROOT="$ROOT" \
+      "$SCRIPT_DIR/host-rust-lob-readback.sh" --controller "$c2" \
+      --transition-receipt "$transition2" --receipt-sha256 "$transition2_sha" --root "$ROOT" \
+      >/dev/null 2>&1; then
+      printf 'readback accepted a disabled production unit\n' >&2
+      exit 1
+    fi
+  elif [[ $mode == success ]]; then
+    MONDAY_CONTROL_PLANE_TEST=1 MONDAY_READBACK_FIXTURE_SYSTEMD=1 \
+      MONDAY_READBACK_FIXTURE_PID="$readback_fixture_pid" \
+      MONDAY_UPLOAD_STATUS_ROOT="$ROOT/fixture-upload-status-empty" MONDAY_ROOT="$ROOT" \
+      "$SCRIPT_DIR/host-rust-lob-readback.sh" --controller "$c2" \
+      --transition-receipt "$transition2" --receipt-sha256 "$transition2_sha" --root "$ROOT" \
+      >/dev/null
+    jq -e '.result == "success" and .unit_file_state_verified == true
+      and .health_policy_verified == true
+      and .process_identity.spot.unit_file_state == "enabled"
+      and .process_identity.usdm.unit_file_state == "enabled"' "$readback_out" >/dev/null
+    grep -Fq '  local observed_active market' "$SCRIPT_DIR/host-rust-lob-readback.sh" || {
+      printf 'readback stability check leaks its market loop variable\n' >&2
+      exit 1
+    }
+  else
+    if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_READBACK_FIXTURE_SYSTEMD=1 \
+      MONDAY_READBACK_FIXTURE_PID="$readback_fixture_pid" \
+      MONDAY_UPLOAD_STATUS_ROOT="$ROOT/fixture-upload-status-empty" MONDAY_ROOT="$ROOT" \
+      "$SCRIPT_DIR/host-rust-lob-readback.sh" --controller "$c2" \
+      --transition-receipt "$transition2" --receipt-sha256 "$transition2_sha" --root "$ROOT" \
+      >/dev/null 2>&1; then
+      printf 'readback accepted invalid health state: %s\n' "$mode" >&2
+      exit 1
+    fi
+  fi
+}
+run_readback_fixture success
+run_readback_fixture unsynced
+run_readback_fixture gaps
+run_readback_fixture nonready
+run_readback_fixture disabled
+
+# Health liveness is independent from stable process identity: a newer
+# observed_at is accepted while a backwards/stalled sample is rejected.
+health_freshness=$(monday_observe_health_freshness 100 10 0 200 11 120)
+read -r health_updated health_mono health_gap health_increment <<<"$health_freshness"
+[[ $health_updated == 200 && $health_mono == 11 && $health_gap == 1 && $health_increment == 1 ]]
+if monday_observe_health_freshness 200 11 0 199 12 120 >/dev/null 2>&1; then
+  printf 'health readback accepted a regressed observed_at\n' >&2
+  exit 1
+fi
+
+# A SIGKILL after a run-scoped Gate start cannot run the EXIT trap.  The
+# bounded unit/spool must remain isolated, with all governed /etc and global
+# shadow projections byte-for-byte unchanged; the next serialized Gate owns
+# stale-run cleanup and can recover without touching production.
+printf '\n# controller revision four fixture\n' >>"$source_dir/host-rust-lob-readback.sh"
+p3="$ROOT/p3"; m3="$ROOT/m3.json"
+publish_fixture "$p3" "$m3" >/dev/null
+c3=$(monday_sha256_file "$m3")
+shadow_link_before_sigkill=$(readlink -- "$ROOT/opt/monday/bin/binance-lob-archiver-shadow")
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_GATE_FIXTURE_SIGKILL=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c2" \
+  --candidate-controller "$c3" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'SIGKILL Gate fixture unexpectedly survived\n' >&2
+  exit 1
+fi
+for asset in "${!shadow_before_sha[@]}"; do
+  if [[ $asset == *.service ]]; then target="$ROOT/etc/systemd/system/$asset"; else target="$ROOT/etc/monday/$asset"; fi
+  [[ $(monday_sha256_file "$(readlink -f -- "$target")") == "${shadow_before_sha[$asset]}" ]] || {
+    printf 'SIGKILL Gate changed governed shadow asset %s\n' "$asset" >&2
+    exit 1
+  }
+done
+[[ $(readlink -- "$ROOT/opt/monday/bin/binance-lob-archiver-shadow") == "$shadow_link_before_sigkill" ]]
+stale_gate_dir=$(find "$ROOT/run/monday/rust-lob-gate" -mindepth 1 -maxdepth 1 -type d -print -quit)
+[[ -n $stale_gate_dir && -f "$stale_gate_dir/monday-rust-lob-gate-$(basename -- "$stale_gate_dir")-spot.service" ]]
+stale_upload_unit="$stale_gate_dir/monday-rust-lob-gate-$(basename -- "$stale_gate_dir")-spot-upload.service"
+[[ -f $stale_upload_unit ]]
+grep -Fqx 'Restart=no' "$stale_gate_dir/monday-rust-lob-gate-$(basename -- "$stale_gate_dir")-spot.service"
+grep -Fqx 'RuntimeMaxSec=900' "$stale_gate_dir/monday-rust-lob-gate-$(basename -- "$stale_gate_dir")-spot.service"
+grep -Fqx 'TimeoutStopSec=60' "$stale_gate_dir/monday-rust-lob-gate-$(basename -- "$stale_gate_dir")-spot.service"
+grep -Fqx 'Restart=no' "$stale_upload_unit"
+grep -Fqx 'RuntimeMaxSec=300' "$stale_upload_unit"
+grep -Fqx 'TimeoutStartSec=300' "$stale_upload_unit"
+stale_run=$(basename -- "$stale_gate_dir")
+[[ -d "$ROOT/data/monday/spool/binance-lob-rust-shadow/gate/$stale_run" ]]
+stale_search_unit="$ROOT/run/systemd/system/monday-rust-lob-gate-${stale_run}-spot.service"
+[[ -f "$stale_search_unit" && ! -L "$stale_search_unit" ]]
+gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c2" \
+  --candidate-controller "$c3" --root "$ROOT")
+gate3=$(printf '%s\n' "$gate_output" | sed -n 's/^V2 Gate receipt: //p')
+gate3_sha=$(printf '%s\n' "$gate_output" | sed -n 's/^SHA-256: //p')
+monday_validate_v2_gate "$gate3" "$c2" "$c3" "$gate3_sha"
+[[ ! -e "$stale_gate_dir" && ! -e "$ROOT/data/monday/spool/binance-lob-rust-shadow/gate/$stale_run" ]]
+
+# A Type=simple shadow may briefly report systemd's executor PID before the
+# collector process has exec'd.  Startup identity verification waits for two
+# consecutive candidate-PID/executable observations instead of failing on
+# that transient; a continuously foreign executable remains fail-closed.
+printf '\n# controller revision five fixture\n' >>"$source_dir/host-rust-lob-readback.sh"
+p4="$ROOT/p4"; m4="$ROOT/m4.json"
+publish_fixture "$p4" "$m4" >/dev/null
+c4=$(monday_sha256_file "$m4")
+identity_active_before=$(monday_active_controller_sha "$ROOT")
+identity_payload_before=$(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver")
+identity_gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 \
+  MONDAY_GATE_FIXTURE_SHADOW_IDENTITY_SEQUENCE=wrong,correct \
+  MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=1 MONDAY_GATE_TEST_SECONDS=1 \
+  MONDAY_TEST_HEALTH_SETTLE_SECONDS=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c2" \
+  --candidate-controller "$c4" --root "$ROOT")
+identity_gate=$(printf '%s\n' "$identity_gate_output" | sed -n 's/^V2 Gate receipt: //p')
+identity_gate_sha=$(printf '%s\n' "$identity_gate_output" | sed -n 's/^SHA-256: //p')
+[[ -f $identity_gate && $identity_gate_sha == "$(monday_sha256_file "$identity_gate")" ]]
+monday_validate_v2_gate "$identity_gate" "$c2" "$c4" "$identity_gate_sha"
+[[ $(monday_active_controller_sha "$ROOT") == "$identity_active_before" ]]
+[[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == "$identity_payload_before" ]]
+
+printf '\n# controller revision six fixture\n' >>"$source_dir/host-rust-lob-readback.sh"
+p5="$ROOT/p5"; m5="$ROOT/m5.json"
+publish_fixture "$p5" "$m5" >/dev/null
+c5=$(monday_sha256_file "$m5")
+identity_failure_output="$ROOT/startup-identity-failure.txt"
+if MONDAY_CONTROL_PLANE_TEST=1 \
+  MONDAY_GATE_FIXTURE_SHADOW_IDENTITY_SEQUENCE=wrong \
+  MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=1 MONDAY_GATE_TEST_SECONDS=1 \
+  MONDAY_TEST_HEALTH_SETTLE_SECONDS=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c2" \
+  --candidate-controller "$c5" --root "$ROOT" >"$identity_failure_output" 2>&1; then
+  printf 'Gate accepted a continuously foreign startup executable\n' >&2
+  exit 1
+fi
+grep -Fq 'startup identity timed out' "$identity_failure_output" || {
+  printf 'startup identity timeout was not reported\n' >&2
+  exit 1
+}
+[[ $(monday_active_controller_sha "$ROOT") == "$identity_active_before" ]]
+[[ $(readlink -f -- "$ROOT/opt/monday/bin/binance-lob-archiver") == "$identity_payload_before" ]]
+if find "$ROOT/data/monday/evidence/shadow-gates/$c5" -type f \
+  \( -name gate.json -o -name PASSED.sha256 \) -print -quit 2>/dev/null | grep -q .; then
+  printf 'failed startup identity Gate left an authoritative receipt\n' >&2
+  exit 1
+fi
+
+# The governed shadow source unit has one optional soak EnvironmentFile and no
+# other extension points.  Unknown commands or additional EnvironmentFiles
+# must be rejected before the candidate can render a run-scoped unit.
+shadow_unit_source="$source_dir/binance-lob-archiver-rust@.service"
+shadow_unit_saved="$ROOT/binance-lob-archiver-rust@.service.saved"
+cp -p -- "$shadow_unit_source" "$shadow_unit_saved"
+for mutation in execstartpost environmentfile; do
+  cp -p -- "$shadow_unit_saved" "$shadow_unit_source"
+  chmod u+w "$shadow_unit_source"
+  case "$mutation" in
+    execstartpost) printf 'ExecStartPost=/bin/true\n' >>"$shadow_unit_source" ;;
+    environmentfile) printf 'EnvironmentFile=/run/monday/foreign.env\n' >>"$shadow_unit_source" ;;
+  esac
+  bad_payload="$ROOT/p-bad-shadow-$mutation"; bad_manifest="$ROOT/m-bad-shadow-$mutation.json"
+  publish_fixture "$bad_payload" "$bad_manifest" >/dev/null
+  bad_controller=$(monday_sha256_file "$bad_manifest")
+  if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+    "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c3" \
+    --candidate-controller "$bad_controller" --root "$ROOT" >/dev/null 2>&1; then
+    printf 'Gate accepted an unallowlisted shadow %s directive\n' "$mutation" >&2
+    exit 1
+  fi
+done
+cp -p -- "$shadow_unit_saved" "$shadow_unit_source"
+
+# The upload drain is a separately rendered transient unit, so it must reject
+# the same unallowlisted control directives before any candidate writer starts.
+shadow_upload_source="$source_dir/binance-lob-archiver-rust-upload@.service"
+shadow_upload_saved="$ROOT/binance-lob-archiver-rust-upload@.service.saved"
+cp -p -- "$shadow_upload_source" "$shadow_upload_saved"
+printf 'ExecStartPost=/bin/true\n' >>"$shadow_upload_source"
+bad_payload="$ROOT/p-bad-shadow-upload"; bad_manifest="$ROOT/m-bad-shadow-upload.json"
+publish_fixture "$bad_payload" "$bad_manifest" >/dev/null
+bad_controller=$(monday_sha256_file "$bad_manifest")
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c2" \
+  --candidate-controller "$bad_controller" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'Gate accepted an unallowlisted shadow upload directive\n' >&2
+  exit 1
+fi
+cp -p -- "$shadow_upload_saved" "$shadow_upload_source"
+
+# Candidate shadow identity is fixed by the Gate contract.  Each foreign
+# spool/endpoint/profile/shard mutation must be rejected before any writer is
+# started or any global shadow projection is touched.
+shadow_env_source="$source_dir/binance-lob-archiver-rust-spot.env"
+shadow_env_saved="$ROOT/binance-lob-archiver-rust-spot.env.saved"
+cp -p -- "$shadow_env_source" "$shadow_env_saved"
+for mutation in spool endpoint profile shard; do
+  rm -f -- "$shadow_env_source"
+  cp -p -- "$shadow_env_saved" "$shadow_env_source"
+  case "$mutation" in
+    spool) sed -i.bak 's|^SPOOL_DIR=.*$|SPOOL_DIR=/data/monday/spool/binance-lob/spot|' "$shadow_env_source" ;;
+    endpoint) sed -i.bak 's|^OSS_ENDPOINT=.*$|OSS_ENDPOINT=foreign.endpoint.example|' "$shadow_env_source" ;;
+    profile) sed -i.bak 's|^ALIYUN_PROFILE=.*$|ALIYUN_PROFILE=foreign-profile|' "$shadow_env_source" ;;
+    shard) sed -i.bak 's|^SHARD_ID=.*$|SHARD_ID=foreign-shard|' "$shadow_env_source" ;;
+  esac
+  rm -f -- "$shadow_env_source.bak"
+  bad_payload="$ROOT/p-bad-$mutation"; bad_manifest="$ROOT/m-bad-$mutation.json"
+  publish_fixture "$bad_payload" "$bad_manifest" >/dev/null
+  bad_controller=$(monday_sha256_file "$bad_manifest")
+  if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+    "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$c2" \
+    --candidate-controller "$bad_controller" --root "$ROOT" >/dev/null 2>&1; then
+    printf 'Gate accepted foreign shadow %s identity\n' "$mutation" >&2
+    exit 1
+  fi
+done
+rm -f -- "$shadow_env_source"
+cp -p -- "$shadow_env_saved" "$shadow_env_source"
+
+# If the second production lane fails during restore, both lanes must be
+# contained and the failed attempt must not emit a success receipt.
+restore_evidence="$ROOT/data/monday/evidence/restores/$c2"
+rm -f -- "$restore_evidence/restore.json" "$restore_evidence/restore.json.sha256"
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_RESTORE_FIXTURE_SYSTEMD=1 \
+  MONDAY_RESTORE_FIXTURE_FAIL_USDM=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c2" --root "$ROOT" >/dev/null 2>&1; then
+  printf 'restore second-lane fault unexpectedly succeeded\n' >&2
+  exit 1
+fi
+restore_calls="$ROOT/run/restore-fixture.calls"
+for unit in binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service; do
+  grep -Fq "stop $unit" "$restore_calls"
+  grep -Fq "disable $unit" "$restore_calls"
+  grep -Fq "mask $unit" "$restore_calls"
+done
+for unit in \
+  binance-lob-archiver@spot.service binance-lob-archiver@usdm.service \
+  binance-lob-archiver-upload@spot.service binance-lob-archiver-upload@usdm.service; do
+  grep -Fq "stop $unit" "$restore_calls"
+  grep -Fq "disable $unit" "$restore_calls"
+  grep -Fq "mask $unit" "$restore_calls"
+done
+[[ ! -e $restore_evidence/restore.json && ! -e $restore_evidence/restore.json.sha256 ]]
+[[ $(monday_active_controller_sha "$ROOT") == "$c2" ]]
+
+# Shared OSS triplet readback rejects stale status, foreign prefixes, missing
+# objects, and a marker whose digest is internally consistent but whose bytes
+# are not the canonical data SHA plus one newline.
+triplet_root="$ROOT/triplet-fixture"; mkdir -p "$triplet_root"
+triplet_data="$triplet_root/part-1.jsonl.zst"
+printf 'fixture-data\n' >"$triplet_data"
+triplet_data_sha=$(monday_sha256_file "$triplet_data")
+triplet_manifest="$triplet_root/part-1.jsonl.zst.manifest.json"
+jq -cn --arg sha "$triplet_data_sha" \
+  '{schema:"binance.market_tape.v2",market:"spot",dataset:"spot_all",shard_id:"all",file:"part-1.jsonl.zst",sha256:$sha,session_id:"fixture-session",catalog_sha256:"fixture-catalog",received_at:"2026-08-27T00:00:00Z"}' \
+  >"$triplet_manifest"
+triplet_success="$triplet_root/part-1.jsonl.zst._SUCCESS"
+printf '%s\n' "$triplet_data_sha" >"$triplet_success"
+triplet_success_sha=$(monday_sha256_file "$triplet_success")
+triplet_status="$triplet_root/upload-status.json"
+triplet_prefix='lake/raw/venue=binance/market=spot/dataset=spot_all/shard=all'
+triplet_object_prefix="$triplet_prefix/date=2026-08-28/hour=05"
+triplet_uri="oss://bucket/$triplet_object_prefix/part-1.jsonl.zst"
+triplet_now_ns=$(( $(date +%s%N) - 120000000000 ))
+triplet_now=$(monday_epoch_ns_rfc3339 "$triplet_now_ns")
+triplet_boundary_ns=$(((triplet_now_ns - 3600000000000) / 300000000000 * 300000000000))
+triplet_start_ns=$((triplet_boundary_ns + 4000000))
+triplet_end_ns=$((triplet_boundary_ns + 300000000000 + 2000000))
+jq --argjson start "$triplet_start_ns" --argjson end "$triplet_end_ns" \
+  '.start_received_at_ns=$start | .end_received_at_ns=$end' \
+  "$triplet_manifest" >"$triplet_manifest.tmp"
+mv -f -- "$triplet_manifest.tmp" "$triplet_manifest"
+triplet_manifest_sha=$(monday_sha256_file "$triplet_manifest")
+jq -cn --arg now "$triplet_now" --arg uri "$triplet_uri" --arg prefix "$triplet_object_prefix" \
+  --arg data "$triplet_data_sha" --arg manifest "$triplet_manifest_sha" --arg success "$triplet_success_sha" \
+  --argjson start "$triplet_start_ns" --argjson end "$triplet_end_ns" \
+  '{last_success_at:$now,last_error:null,last_error_at:null,failure_count:0,discovery_failed:false,pending_batches:0,failed_batches:[],last_uploaded_triplet:{data_uri:$uri,object_prefix:$prefix,data_sha256:$data,manifest_sha256:$manifest,success_sha256:$success,uploaded_at:$now,start_received_at_ns:$start,end_received_at_ns:$end}}' \
+  >"$triplet_status"
+copy_triplet_fixture() {
+  local uri=$1 target=$2 object
+  object=${uri##*/}
+  [[ ${TRIPLET_FIXTURE_MISSING:-0} != 1 ]] || return 1
+  cp -p -- "$triplet_root/$object" "$target"
+}
+triplet_tmp="$ROOT/triplet-readback-tmp"
+triplet_readback=$(monday_verify_upload_triplet_readback "$triplet_status" spot spot_all bucket "$triplet_prefix" \
+  "$triplet_tmp" "$triplet_now" copy_triplet_fixture fixture-session 0)
+[[ $(jq -r '.data_sha256' <<<"$triplet_readback") == "$triplet_data_sha" ]]
+production_readback=$(monday_verify_upload_triplet_readback "$triplet_status" spot spot_all bucket "$triplet_prefix" \
+  "$triplet_tmp" "$triplet_now" copy_triplet_fixture fixture-session "$triplet_start_ns")
+[[ $(jq -r '.end_received_at_ns - .start_received_at_ns < 300000000000' <<<"$production_readback") == true ]]
+cp -p -- "$triplet_manifest" "$triplet_manifest.full-cadence"
+partial_end_ns=$((triplet_start_ns + 1000000000))
+jq --argjson end "$partial_end_ns" '.end_received_at_ns=$end' \
+  "$triplet_manifest.full-cadence" >"$triplet_manifest"
+partial_manifest_sha=$(monday_sha256_file "$triplet_manifest")
+jq --arg sha "$partial_manifest_sha" --argjson end "$partial_end_ns" \
+  '.last_uploaded_triplet.manifest_sha256=$sha | .last_uploaded_triplet.end_received_at_ns=$end' \
+  "$triplet_status" >"$triplet_status.partial-cadence"
+if monday_verify_upload_triplet_readback "$triplet_status.partial-cadence" spot spot_all bucket "$triplet_prefix" \
+  "$triplet_tmp" "$triplet_now" copy_triplet_fixture fixture-session "$triplet_start_ns" >/dev/null 2>&1; then
+  printf 'production triplet readback accepted a partial 300-second segment\n' >&2
+  exit 1
+fi
+late_start_ns=$((triplet_boundary_ns + 2000000000))
+jq --argjson start "$late_start_ns" '.start_received_at_ns=$start' \
+  "$triplet_manifest.full-cadence" >"$triplet_manifest"
+late_manifest_sha=$(monday_sha256_file "$triplet_manifest")
+jq --arg sha "$late_manifest_sha" --argjson start "$late_start_ns" \
+  '.last_uploaded_triplet.manifest_sha256=$sha | .last_uploaded_triplet.start_received_at_ns=$start' \
+  "$triplet_status" >"$triplet_status.late-start"
+if monday_verify_upload_triplet_readback "$triplet_status.late-start" spot spot_all bucket "$triplet_prefix" \
+  "$triplet_tmp" "$triplet_now" copy_triplet_fixture fixture-session "$triplet_start_ns" >/dev/null 2>&1; then
+  printf 'production triplet readback accepted a segment that started late\n' >&2
+  exit 1
+fi
+mv -f -- "$triplet_manifest.full-cadence" "$triplet_manifest"
+# A historical capture may predate the recovery job; only the upload commit
+# must be newer than its cutoff.
+historical_readback=$(monday_verify_upload_triplet_readback "$triplet_status" spot spot_all bucket "$triplet_prefix" \
+  "$triplet_tmp" "$triplet_now" copy_triplet_fixture fixture-session 0)
+[[ $(jq -r '.session_id' <<<"$historical_readback") == fixture-session ]]
+# failure_count is a cumulative audit counter.  A healthy retry can carry a
+# non-zero historical count, while current error or pending fields still fail.
+retry_status="$triplet_root/upload-status.retry.json"
+jq '.failure_count = 7' "$triplet_status" >"$retry_status"
+retry_readback=$(monday_verify_upload_triplet_readback "$retry_status" spot spot_all bucket "$triplet_prefix" \
+  "$triplet_tmp" "$triplet_now" copy_triplet_fixture fixture-session 0)
+[[ $(jq -r '.failure_count' <<<"$retry_readback") == 7 ]]
+if jq '.failure_count = -1' "$retry_status" >"$retry_status.negative" \
+  && monday_verify_upload_triplet_readback "$retry_status.negative" spot spot_all bucket "$triplet_prefix" \
+      "$triplet_tmp" "$triplet_now" copy_triplet_fixture fixture-session 0 >/dev/null 2>&1; then
+  printf 'triplet readback accepted a negative cumulative failure_count\n' >&2
+  exit 1
+fi
+for retry_mutation in last_error pending_batches; do
+  case "$retry_mutation" in
+    last_error) jq '.last_error = "retry failed"' "$retry_status" >"$retry_status.$retry_mutation" ;;
+    pending_batches) jq '.pending_batches = 1' "$retry_status" >"$retry_status.$retry_mutation" ;;
+  esac
+  if monday_verify_upload_triplet_readback "$retry_status.$retry_mutation" spot spot_all bucket "$triplet_prefix" \
+      "$triplet_tmp" "$triplet_now" copy_triplet_fixture fixture-session 0 >/dev/null 2>&1; then
+    printf 'triplet readback accepted retry status with current %s\n' "$retry_mutation" >&2
+    exit 1
+  fi
+done
+if monday_verify_upload_triplet_readback "$triplet_status" spot spot_all bucket "$triplet_prefix" \
+    "$triplet_tmp" "$triplet_now" copy_triplet_fixture fixture-session "$triplet_now_ns" >/dev/null 2>&1; then
+  printf 'triplet readback ignored the minimum capture cutoff\n' >&2
+  exit 1
+fi
+
+bad_prefixes=(
+  "$triplet_prefix/date=2026-02-29/hour=05"
+  "$triplet_prefix/date=2026-08-28/hour=24"
+  "$triplet_prefix/date=2026-08-28/hour=05/extra"
+  "$triplet_prefix/date=2026-08-28//hour=05"
+  "$triplet_prefix/date=2026-08-28/hour=05%2Fforeign"
+  "$triplet_prefix/date=2026-08-28/hour=05/../foreign"
+  "$triplet_prefix/date=2026-08-28/hour=05/./foreign"
+)
+bad_prefixes+=("$(printf '%s\\evil' "$triplet_object_prefix")")
+for bad_prefix in "${bad_prefixes[@]}"; do
+  if jq --arg prefix "$bad_prefix" '.last_uploaded_triplet.object_prefix=$prefix' "$triplet_status" \
+      >"$triplet_status.bad-prefix" \
+    && monday_verify_upload_triplet_readback "$triplet_status.bad-prefix" spot spot_all bucket "$triplet_prefix" \
+      "$triplet_tmp" "$triplet_now" copy_triplet_fixture "" 0 >/dev/null 2>&1; then
+    printf 'triplet readback accepted malformed object prefix: %s\n' "$bad_prefix" >&2
+    exit 1
+  fi
+done
+bad_data_uri="oss://bucket/$triplet_object_prefix/../part-1.jsonl.zst"
+if jq --arg uri "$bad_data_uri" '.last_uploaded_triplet.data_uri=$uri' "$triplet_status" \
+    >"$triplet_status.bad-uri" \
+  && monday_verify_upload_triplet_readback "$triplet_status.bad-uri" spot spot_all bucket "$triplet_prefix" \
+    "$triplet_tmp" "$triplet_now" copy_triplet_fixture "" 0 >/dev/null 2>&1; then
+  printf 'triplet readback accepted a traversing data URI\n' >&2
+  exit 1
+fi
+if monday_verify_upload_triplet_readback "$triplet_status" spot spot_all bucket "$triplet_prefix" \
+    "$triplet_tmp" "$triplet_now" copy_triplet_fixture changed-session >/dev/null 2>&1; then
+  printf 'triplet readback accepted a mismatched current health session\n' >&2
+  exit 1
+fi
+if jq '.last_success_at = "2000-01-01T00:00:00Z"' "$triplet_status" >"$triplet_status.stale" \
+  && monday_verify_upload_triplet_readback "$triplet_status.stale" spot spot_all bucket "$triplet_prefix" \
+    "$triplet_tmp" "$triplet_now" copy_triplet_fixture >/dev/null 2>&1; then
+  printf 'triplet readback accepted stale last_success_at\n' >&2
+  exit 1
+fi
+if jq '.last_success_at = "2999-01-01T00:00:00Z"' "$triplet_status" >"$triplet_status.future" \
+  && monday_verify_upload_triplet_readback "$triplet_status.future" spot spot_all bucket "$triplet_prefix" \
+    "$triplet_tmp" "$triplet_now" copy_triplet_fixture >/dev/null 2>&1; then
+  printf 'triplet readback accepted future last_success_at\n' >&2
+  exit 1
+fi
+if jq '.last_uploaded_triplet.uploaded_at = "2999-01-01T00:00:00Z"' "$triplet_status" >"$triplet_status.future-triplet" \
+  && monday_verify_upload_triplet_readback "$triplet_status.future-triplet" spot spot_all bucket "$triplet_prefix" \
+    "$triplet_tmp" "$triplet_now" copy_triplet_fixture >/dev/null 2>&1; then
+  printf 'triplet readback accepted future triplet timestamp\n' >&2
+  exit 1
+fi
+cp -p -- "$triplet_manifest" "$triplet_manifest.valid"
+cp -p -- "$triplet_status" "$triplet_status.valid"
+future_manifest_end_ns=$(( $(date +%s%N) + 3600000000000 ))
+jq --argjson end "$future_manifest_end_ns" \
+  '.end_received_at_ns=$end' "$triplet_manifest.valid" >"$triplet_manifest"
+future_manifest_sha=$(monday_sha256_file "$triplet_manifest")
+jq --arg sha "$future_manifest_sha" --argjson end "$future_manifest_end_ns" \
+  '.last_uploaded_triplet.manifest_sha256=$sha | .last_uploaded_triplet.end_received_at_ns=$end' \
+  "$triplet_status.valid" >"$triplet_status.future-manifest"
+if monday_verify_upload_triplet_readback "$triplet_status.future-manifest" spot spot_all bucket "$triplet_prefix" \
+    "$triplet_tmp" "$triplet_now" copy_triplet_fixture >/dev/null 2>&1; then
+  printf 'triplet readback accepted a future manifest boundary\n' >&2
+  exit 1
+fi
+cp -p -- "$triplet_manifest.valid" "$triplet_manifest"
+cp -p -- "$triplet_status.valid" "$triplet_status"
+if jq '.last_uploaded_triplet.data_uri |= sub("oss://bucket"; "oss://foreign")' "$triplet_status" \
+  >"$triplet_status.foreign" \
+  && monday_verify_upload_triplet_readback "$triplet_status.foreign" spot spot_all bucket "$triplet_prefix" \
+    "$triplet_tmp" "$triplet_now" copy_triplet_fixture >/dev/null 2>&1; then
+  printf 'triplet readback accepted a foreign bucket\n' >&2
+  exit 1
+fi
+if jq '.last_uploaded_triplet.object_prefix = "foreign/prefix"' "$triplet_status" \
+  >"$triplet_status.foreign-prefix" \
+  && monday_verify_upload_triplet_readback "$triplet_status.foreign-prefix" spot spot_all bucket "$triplet_prefix" \
+    "$triplet_tmp" "$triplet_now" copy_triplet_fixture >/dev/null 2>&1; then
+  printf 'triplet readback accepted a foreign object prefix\n' >&2
+  exit 1
+fi
+if jq '.last_error = "status drift"' "$triplet_status" >"$triplet_status.drift" \
+  && monday_verify_upload_triplet_readback "$triplet_status.drift" spot spot_all bucket "$triplet_prefix" \
+    "$triplet_tmp" "$triplet_now" copy_triplet_fixture >/dev/null 2>&1; then
+  printf 'triplet readback accepted upload-status drift\n' >&2
+  exit 1
+fi
+printf 'not-the-data-sha\n' >"$triplet_success"
+wrong_success_sha=$(monday_sha256_file "$triplet_success")
+jq --arg sha "$wrong_success_sha" \
+  '.last_uploaded_triplet.success_sha256 = $sha' "$triplet_status" >"$triplet_status.bad-success"
+if monday_verify_upload_triplet_readback "$triplet_status.bad-success" spot spot_all bucket "$triplet_prefix" \
+  "$triplet_tmp" "$triplet_now" copy_triplet_fixture >/dev/null 2>&1; then
+  printf 'triplet readback accepted non-canonical success bytes\n' >&2
+  exit 1
+fi
+printf '%s\n' "$triplet_data_sha" >"$triplet_success"
+TRIPLET_FIXTURE_MISSING=1
+if monday_verify_upload_triplet_readback "$triplet_status" spot spot_all bucket "$triplet_prefix" \
+    "$triplet_tmp" "$triplet_now" copy_triplet_fixture >/dev/null 2>&1; then
+  printf 'triplet readback accepted a missing OSS object\n' >&2
+  exit 1
+fi
+
+# The local operator is the only Cloud Assistant entry point. Its dry run must
+# carry an exact controller path and never expose a second routing mode.
+operator="$SCRIPT_DIR/rust-lob-control-plane.sh"
+grep -Fq 'timeout_seconds=300' "$operator" || {
+  printf 'LOB Gate preflight operator timeout is not capped at 300 seconds\n' >&2
+  exit 1
+}
+candidate=$(printf 'b%.0s' {1..64})
+operator_json=$(MONDAY_CONTROL_PLANE_DRY_RUN=1 "$operator" gate \
+  --instance i-fixture --from-controller "$c1" \
+  --candidate-controller "$candidate")
+jq -e --arg controller "$candidate" \
+  '.operation == "gate" and .controller == $controller
+   and (.command | contains(("/opt/monday/releases/binance-lob-controller/" + $controller)))
+   and (.command | contains("timeout --signal=TERM --kill-after=240s 2100s"))
+   and (.command | contains("--preflight-only") | not)
+   and .preflight_only == false and .timeout_seconds == 2400
+   and .host_timeout_seconds == 2100 and .host_kill_after_seconds == 240
+   and (.host_timeout_seconds + .host_kill_after_seconds < .timeout_seconds)
+   and .production_changed == false' <<<"$operator_json" >/dev/null
+operator_preflight_json=$(MONDAY_CONTROL_PLANE_DRY_RUN=1 "$operator" gate \
+  --instance i-fixture --from-controller "$c1" \
+  --candidate-controller "$candidate" --preflight-only)
+jq -e --arg controller "$candidate" \
+  '.operation == "gate" and .controller == $controller
+   and .preflight_only == true and .timeout_seconds == 300
+   and .host_timeout_seconds == 0 and .host_kill_after_seconds == 0
+   and .production_changed == false
+   and (.command | contains(("/opt/monday/releases/binance-lob-controller/" + $controller)))
+   and (.command | contains("--preflight-only"))' \
+  <<<"$operator_preflight_json" >/dev/null
+if MONDAY_CONTROL_PLANE_DRY_RUN=1 "$operator" cutover \
+  --instance i-fixture --from direct --to "$candidate" \
+  --gate-receipt /data/gate.json --gate-sha256 "$candidate" --preflight-only \
+  >/dev/null 2>&1; then
+  printf 'operator accepted --preflight-only for a non-Gate operation\n' >&2
+  exit 1
+fi
+if MONDAY_CONTROL_PLANE_DRY_RUN=1 "$operator" unknown >/dev/null 2>&1; then
+  printf 'operator accepted an unknown operation\n' >&2
+  exit 1
+fi
+for path in \
+  "$operator" "$SCRIPT_DIR/publish-rust-lob-pair-release.sh" \
+  "$SCRIPT_DIR/host-rust-lob-controller-release.sh" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" "$SCRIPT_DIR/host-rust-lob-cutover.sh" \
+  "$SCRIPT_DIR/host-rust-lob-restore.sh" "$SCRIPT_DIR/host-rust-lob-readback.sh" \
+  "$SCRIPT_DIR/rust-lob-control-plane-lib.sh"; do
+  for forbidden in \
+    "$(printf '%s%s' controller- apply)" \
+    "$(printf '%s%s' adopt- production)" \
+    "$(printf '%s%s' invoke-rust-lob- operation)" \
+    "$(printf '%s%s' deploy-rust-lob- release)" \
+    "$(printf '%s%s' controller_release. v1)" \
+    "$(printf '%s%s' shadow_gate. v4)"; do
+    if grep -Fq "$forbidden" "$path"; then
+      printf 'obsolete control-plane routing remains in %s\n' "$path" >&2
+      exit 1
+    fi
+  done
+done
+
+# Production-root dry coverage: the real root must join to /opt and /data
+# exactly (never //opt or //data), while every host action rejects test mode
+# against /.  This exercises each direct path before any filesystem read.
+[[ $(monday_root_join / opt/monday) == /opt/monday ]]
+[[ $(monday_root_join / data/monday) == /data/monday ]]
+[[ $(monday_sha256_file "$production_spool_root/spot/upload-status.json") == "$production_spot_status_sha" ]]
+[[ $(monday_sha256_file "$production_spool_root/usdm/upload-status.json") == "$production_usdm_status_sha" ]]
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT=/ \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller direct \
+  --candidate-controller "$c1" --root / >/dev/null 2>&1; then
+  printf 'Gate accepted an unsafe production root in test mode\n' >&2
+  exit 1
+fi
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT=/ \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from direct --to "$c1" \
+  --gate-receipt /data/gate.json --gate-sha256 "$(printf '%064d' 0)" --root / >/dev/null 2>&1; then
+  printf 'Cutover accepted an unsafe production root in test mode\n' >&2
+  exit 1
+fi
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT=/ \
+  "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$c1" --root / >/dev/null 2>&1; then
+  printf 'Restore accepted an unsafe production root in test mode\n' >&2
+  exit 1
+fi
+if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT=/ \
+  "$SCRIPT_DIR/host-rust-lob-readback.sh" --controller "$c1" \
+  --transition-receipt /data/transition.json --receipt-sha256 "$(printf '%064d' 0)" --root / >/dev/null 2>&1; then
+  printf 'Readback accepted an unsafe production root in test mode\n' >&2
+  exit 1
+fi
+
+printf 'V2 Gate contract passed\n'

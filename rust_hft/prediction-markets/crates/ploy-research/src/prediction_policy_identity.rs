@@ -62,7 +62,6 @@ mod tests {
             "crates/ploy-market-data/Cargo.toml",
             "../data-pipelines/core/Cargo.toml",
             "../market-core/core/Cargo.toml",
-            "../market-core/instrument/Cargo.toml",
             "../market-core/integration/Cargo.toml",
             "../market-core/ports/Cargo.toml",
             "../market-core/snapshot/Cargo.toml",

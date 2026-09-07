@@ -6,7 +6,6 @@ description = "Shared instrument and venue catalog primitives"
 
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
-serde_yaml = { version = "0.9" }
 hft-core = { package = "hft-core", path = "../../market-core/core" }
 thiserror = { workspace = true }
 

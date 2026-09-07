@@ -8,6 +8,8 @@ dockerignore="$script_dir/../../.dockerignore"
 ploy_workflow="$script_dir/../workflows/ploy-ci.yml"
 ci_workflow="$script_dir/../workflows/ci.yml"
 dockerfile="$script_dir/../../rust_hft/deployment/docker/Dockerfile.research"
+controller_dockerfile="$script_dir/../../deployment/aliyun/research/Dockerfile.campaign-cycle-controller"
+controller_job="$script_dir/../../deployment/aliyun/research/k8s/campaign-cycle-controller-job.example.yaml"
 source_test_dockerfile="$script_dir/../../rust_hft/deployment/docker/Dockerfile.source-test"
 source_test_entrypoint="$script_dir/../../rust_hft/deployment/docker/source-test-entrypoint.sh"
 source_test_job="$script_dir/../../deployment/aliyun/research/k8s/source-test-job.example.yaml"
@@ -19,29 +21,59 @@ mode_restore_block=$(sed -n \
   '/^      - name: Restore research runner binary modes$/,/^      - name: Verify research runner binary artifact$/p' \
   "$workflow")
 source_command_block=$(sed -n \
-  '/^          \.github\/scripts\/select-acr-publish-source\.sh \\/,/^            --current-run-id /p' \
+  '/^          \.github\/scripts\/select-acr-publish-source\.sh \\/,/^            --security-conclusion /p' \
   "$workflow")
 acr_publish_block=$(sed -n \
   '/^      - name: Build and push$/,/^      - name: Record immutable image$/p' \
   "$workflow")
+ci_push_block=$(sed -n '/^  push:$/,/^  pull_request:$/p' "$ci_workflow")
+ploy_push_block=$(sed -n '/^  push:$/,/^  workflow_dispatch:$/p' "$ploy_workflow")
 
-grep -Fqx '            [{repository:"research-runner",file:"rust_hft/deployment/docker/Dockerfile.research",target:"prebuilt"},' "$workflow"
+grep -Fqx '            [{repository:"research-runner",context:"rust_hft",file:"rust_hft/deployment/docker/Dockerfile.research",target:"prebuilt",research_artifact:true},' "$workflow"
+grep -Fqx '             {repository:"campaign-cycle-controller",context:".",file:"deployment/aliyun/research/Dockerfile.campaign-cycle-controller",target:"prebuilt",research_artifact:true},' "$workflow"
+grep -Fqx '                or ($target == "research-runner" and .repository == "campaign-cycle-controller")' "$workflow"
 grep -Fqx '  workflow_run:' "$workflow"
 grep -Fqx '    workflows: ["Prediction Markets CI"]' "$workflow"
 grep -Fqx '    branches: [main]' "$workflow"
-grep -Fqx "        description: Image target to publish (polymarket-raw-ops uses binance-lob-archiver's full collector bundle)" "$workflow"
+grep -Fqx '        description: Image target (research-runner also publishes its paired Campaign controller)' "$workflow"
 grep -Fqx '          - polymarket-raw-ops' "$workflow"
 grep -Fqx '          - research-source-test' "$workflow"
 grep -Fqx '  actions: read' "$workflow"
+grep -Fqx '  checks: read' "$workflow"
 grep -Fqx 'concurrency:' "$workflow"
 grep -Fqx '  group: acr-publish-${{ github.ref }}' "$workflow"
 grep -Fqx '  cancel-in-progress: false' "$workflow"
+if grep -Eq '^    paths(-ignore)?:' <<<"$ci_push_block$ploy_push_block"; then
+  printf 'required CI workflow can skip a main SHA by path\n' >&2
+  exit 1
+fi
 grep -Fqx '      rebuild_research_runner:' "$workflow"
 grep -Fqx '      source_test_source_sha:' "$workflow"
 grep -Fqx '          jobs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID/jobs" \' "$workflow"
 grep -Fqx '          BINARIES_CONCLUSION: ${{ steps.source-jobs.outputs.binaries_conclusion }}' "$workflow"
 grep -Fqx '          SMOKE_CONCLUSION: ${{ steps.source-jobs.outputs.smoke_conclusion }}' "$workflow"
+grep -Fqx '      - name: Read authenticated release admission' "$workflow"
+grep -Fqx '            main_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '\''.object.sha'\'')' "$workflow"
+grep -Fqx '            gh api --paginate --slurp \' "$workflow"
+grep -Fqx '              "repos/$GITHUB_REPOSITORY/commits/$admission_sha/check-runs?filter=latest&per_page=100" > "$checks_json"' "$workflow"
+grep -Fqx '            .github/scripts/read-acr-required-checks.sh "$checks_json" "$evidence"' "$workflow"
+grep -Fqx '          deadline=$((SECONDS + 900))' "$workflow"
 grep -Fqx '          .github/scripts/select-acr-publish-source.sh \' "$workflow"
+grep -Fqx '          CURRENT_REF: ${{ github.ref }}' "$workflow"
+grep -Fqx '          MAIN_SHA: ${{ steps.admission.outputs.main_sha }}' "$workflow"
+grep -Fqx '          MONOREPO_CONCLUSION: ${{ steps.admission.outputs.monorepo_conclusion }}' "$workflow"
+grep -Fqx '          PREDICTION_CONCLUSION: ${{ steps.admission.outputs.prediction_conclusion }}' "$workflow"
+grep -Fqx '          SECURITY_CONCLUSION: ${{ steps.admission.outputs.security_conclusion }}' "$workflow"
+grep -Fqx '            --current-ref "$CURRENT_REF" \' "$workflow"
+grep -Fqx '            --main-sha "$MAIN_SHA" \' "$workflow"
+grep -Fqx '            --monorepo-conclusion "$MONOREPO_CONCLUSION" \' "$workflow"
+grep -Fqx '            --prediction-conclusion "$PREDICTION_CONCLUSION" \' "$workflow"
+grep -Fqx '            --security-conclusion "$SECURITY_CONCLUSION"' "$workflow"
+grep -Fqx '      - name: Revalidate current main before publication' "$workflow"
+grep -Fqx '          current_main=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '\''.object.sha'\'')' "$workflow"
+grep -Fqx '          test "$SOURCE_REVISION" = "$current_main"' "$workflow"
+test "$(grep -n '^      - name: Revalidate current main before publication$' "$workflow" | cut -d: -f1)" \
+  -lt "$(grep -n '^      - name: Build and push$' "$workflow" | cut -d: -f1)"
 if grep -Fq '${{' <<<"$source_command_block"; then
   printf 'source selector interpolates workflow context directly into shell\n' >&2
   exit 1
@@ -51,19 +83,40 @@ grep -Fqx "    if: needs.selector.outputs.research_mode == 'rebuild'" "$workflow
 grep -Fqx "    if: always() && needs.selector.result == 'success' && needs.selector.outputs.publish_target != 'none' && needs.selector.outputs.publish_target != 'research-source-test'" "$workflow"
 grep -Fqx '    container: rust:1.91-bookworm' "$workflow"
 grep -Fqx 'FROM debian:bookworm-slim AS runtime-base' "$dockerfile"
+grep -Fqx 'ARG ALIYUN_CLI_VERSION=3.4.6' "$controller_dockerfile"
+grep -Fqx 'ARG KUBECTL_VERSION=v1.35.3' "$controller_dockerfile"
+grep -Fq 'aliyun_sha256=9f7c993bd1b16c530f219bc1976bf78057879db4b1bae857b2952676eb7466f6' "$controller_dockerfile"
+grep -Fq 'kubectl_sha256=fd31c7d7129260e608f6faf92d5984c3267ad0b5ead3bced2fe125686e286ad6' "$controller_dockerfile"
+grep -Fqx 'COPY --chmod=0755 rust_hft/research-bin/alpha-harness /usr/local/bin/alpha-harness' "$controller_dockerfile"
+grep -Fqx 'COPY --chmod=0755 deployment/aliyun/research/scripts/campaign-cycle-controller.sh \' "$controller_dockerfile"
+grep -Fqx 'COPY --chmod=0644 deployment/aliyun/research/k8s/campaign-cycle-controller-job.example.yaml \' "$controller_dockerfile"
+grep -Fqx 'RUN chmod 0755 /opt/monday/deployment/aliyun/research/k8s' "$controller_dockerfile"
+grep -Fqx 'USER research' "$controller_dockerfile"
+grep -Fqx 'ENTRYPOINT ["/usr/bin/tini", "--", "/bin/bash", "/opt/monday/deployment/aliyun/research/scripts/campaign-cycle-controller.sh"]' "$controller_dockerfile"
+grep -Fqx '          image: crpi-ygobwehhof7qs9m3-vpc.ap-northeast-1.personal.cr.aliyuncs.com/wildcard0923/campaign-cycle-controller@sha256:REPLACE_WITH_IMMUTABLE_DIGEST' "$controller_job"
+if grep -Eq '^[[:space:]]+command:' "$controller_job"; then
+  printf 'ACK controller Job bypasses the image entrypoint\n' >&2
+  exit 1
+fi
+grep -Fqx '      - name: Build the Campaign cycle controller image' "$ploy_workflow"
+grep -Fqx '          file: deployment/aliyun/research/Dockerfile.campaign-cycle-controller' "$ploy_workflow"
+grep -Fqx '          tags: monday-campaign-cycle-controller-smoke:local' "$ploy_workflow"
 grep -Fqx '    needs: [selector, research-runner-binaries]' "$workflow"
 grep -Fqx '      - name: Download research runner binaries' "$workflow"
+test "$(grep -Fxc '        if: matrix.research_artifact' "$workflow")" -eq 4
 grep -Fqx '          name: research-image-release-${{ needs.selector.outputs.source_sha }}' "$workflow"
 grep -Fqx '          run-id: ${{ needs.selector.outputs.artifact_run_id }}' "$workflow"
 grep -Fqx '          github-token: ${{ github.token }}' "$workflow"
 grep -Fqx '      - name: Restore research runner binary modes' "$workflow"
 grep -Fqx '          target: ${{ matrix.target }}' "$workflow"
+grep -Fqx '          context: ${{ matrix.context }}' "$workflow"
 grep -Fqx '          ../.github/scripts/research-image-release-artifact.sh create research-release \' "$workflow"
 grep -Fqx '          .github/scripts/research-image-release-artifact.sh verify research-release \' "$workflow"
 grep -Fqx '            "${{ needs.selector.outputs.source_sha }}" \' "$workflow"
 grep -Fqx '            "${{ needs.selector.outputs.artifact_run_id }}" rust_hft' "$workflow"
 grep -Fqx '            SOURCE_REVISION=${{ needs.selector.outputs.source_sha }}' "$workflow"
 grep -Fqx '            org.opencontainers.image.revision=${{ needs.selector.outputs.source_sha }}' "$workflow"
+grep -Fqx '      - name: Verify Campaign cycle controller image' "$workflow"
 grep -Fq '          provenance: false' <<<"$acr_publish_block"
 grep -Fq '          sbom: false' <<<"$acr_publish_block"
 grep -Fqx '  publish-source-test:' "$workflow"

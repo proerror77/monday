@@ -171,9 +171,7 @@ step2_build_compatible() {
     log_step "步骤 2/6: 编译兼容版本 (无CPU特性优化)..."
     echo "$(date): 开始编译项目" >> "$RESULTS_DIR/test_timeline.log"
     
-    log_info "清理之前的构建..."
-    cargo clean > "$RESULTS_DIR/build.log" 2>&1
-    
+    : > "$RESULTS_DIR/build.log"
     log_info "编译兼容版本 (使用标准Release优化)..."
     
     # 根据架构选择编译参数

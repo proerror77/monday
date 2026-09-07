@@ -30,7 +30,11 @@ conflicting controller, or every attempt to use `/tmp` as a fallback.
 
 ## Task contract
 
-Create exactly one task root and keep all mutable build state inside it:
+Create exactly one task root and keep all mutable build state inside it.
+
+This disposable isolation contract is an exception to general build-cache reuse.
+Do not redirect writable caches or toolchains into shared locations to satisfy
+that general preference.
 
 ```bash
 task_root=$(mktemp -d "/work/monday-builds/${contract}.XXXXXX")

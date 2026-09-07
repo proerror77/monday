@@ -32,6 +32,14 @@ readonly LEGACY_RUNTIME_STABILITY_REQUIRED=true
 # budget plus 120 attempts) AND the upload time of the largest observed
 # segment (~150s for a 109MiB multipart object on this endpoint).
 readonly REAL_MARKET_PREFLIGHT_BUDGET_SECONDS=1200
+# Gate admission requires a closed market tape before creating the supervised
+# invocation. Keep only a short race window here in case the production
+# uploader removes that tape between admission and the inode-pinning step.
+readonly REAL_MARKET_SEGMENT_WAIT_BUDGET_SECONDS=5
+# The outer worker includes fixed startup and evidence-flush headroom.
+readonly REAL_MARKET_PREFLIGHT_TOTAL_BUDGET_SECONDS=$((
+  REAL_MARKET_SEGMENT_WAIT_BUDGET_SECONDS \
+  + REAL_MARKET_PREFLIGHT_BUDGET_SECONDS + 60))
 # Tick-level segments (7.7-18GB) make a full-file preflight scan exceed the
 # budget. The scan is therefore bounded: a deterministic head/tail window
 # validates the segment and quote presence (issue #586). The window caps scanned
@@ -63,6 +71,11 @@ readonly LEGACY_EXEC='/usr/bin/python3 /opt/monday/bin/polymarket_reference_coll
 readonly RUST_PRODUCTION_EXEC='/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200'
 readonly RUST_ACTIVE_BINARY=/opt/monday/bin/polymarket-raw-ops
 readonly CONTROL_DIR=/opt/monday/control/polymarket-raw-ops
+readonly WATCHDOG_BINARY=/opt/monday/bin/polymarket-market-tape-upload-watchdog.sh
+readonly WATCHDOG_SERVICE=polymarket-market-tape-upload-watchdog.service
+readonly WATCHDOG_TIMER=polymarket-market-tape-upload-watchdog.timer
+readonly WATCHDOG_SERVICE_PATH=/etc/systemd/system/$WATCHDOG_SERVICE
+readonly WATCHDOG_TIMER_PATH=/etc/systemd/system/$WATCHDOG_TIMER
 readonly LEGACY_FRAGMENT=/etc/systemd/system/polymarket-reference-collector.service
 readonly SHADOW_FRAGMENT=/etc/systemd/system/polymarket-reference-collector-shadow@.service
 readonly LEGACY_SPOOL=/data/monday/spool/polymarket-reference
@@ -82,6 +95,22 @@ readonly SERVICE_TEMPLATE="$SCRIPT_DIR/polymarket-reference-collector-shadow@.se
 readonly GATE_POLICY="$SCRIPT_DIR/polymarket-shadow-gate-policy.jq"
 readonly LEGACY_HEALTH_POLICY="$SCRIPT_DIR/polymarket-legacy-health-policy.jq"
 readonly RUST_HEALTH_POLICY="$SCRIPT_DIR/polymarket-rust-health-policy.jq"
+readonly -a BASELINE_UNIT_ASSETS=(
+  polymarket-reference-collector.service
+  polymarket-reference-upload.service
+  polymarket-reference-upload.timer
+  polymarket-market-tape-upload.service
+  polymarket-market-tape-upload.timer
+)
+readonly -a UNIT_ASSETS=(
+  polymarket-reference-collector.service
+  polymarket-reference-upload.service
+  polymarket-reference-upload.timer
+  polymarket-market-tape-upload.service
+  polymarket-market-tape-upload.timer
+  polymarket-market-tape-upload-watchdog.service
+  polymarket-market-tape-upload-watchdog.timer
+)
 readonly -a BUNDLE_ASSETS=(
   polymarket-raw-ops-gate-control.sh
   polymarket-raw-ops-gate@.service
@@ -96,6 +125,9 @@ readonly -a BUNDLE_ASSETS=(
   polymarket-reference-upload.timer
   polymarket-market-tape-upload.service
   polymarket-market-tape-upload.timer
+  polymarket-market-tape-upload-watchdog.sh
+  polymarket-market-tape-upload-watchdog.service
+  polymarket-market-tape-upload-watchdog.timer
 )
 
 die() {
@@ -762,14 +794,13 @@ verify_contained_recovery_baseline() {
 verify_cutover_target_preflight() {
   local baseline_mode=$1 active_binary=$2 control_dir=$3 release_manifest_name=$4
   local file_verifier=$5 unit fragment expected_fragment drop_ins asset assets
+  local watchdog_present=0 path
   [[ $baseline_mode == legacy_python || $baseline_mode == rust_release \
     || $baseline_mode == rust_bootstrap ]] || return 1
   [[ $baseline_mode != legacy_python || ( ! -e $active_binary && ! -L $active_binary ) ]] \
     || return 1
   secure_root_chain_or_absent "$control_dir" || return 1
-  for unit in polymarket-reference-collector.service \
-    polymarket-reference-upload.service polymarket-reference-upload.timer \
-    polymarket-market-tape-upload.service polymarket-market-tape-upload.timer; do
+  for unit in "${BASELINE_UNIT_ASSETS[@]}"; do
     expected_fragment="/etc/systemd/system/$unit"
     fragment=$(systemctl show --property=FragmentPath --value "$unit") || return 1
     [[ $fragment == "$expected_fragment" ]] || return 1
@@ -777,6 +808,23 @@ verify_cutover_target_preflight() {
     drop_ins=$(systemctl show --property=DropInPaths --value "$unit") || return 1
     [[ -z $drop_ins ]] || return 1
   done
+  for path in "$WATCHDOG_BINARY" "$WATCHDOG_SERVICE_PATH" "$WATCHDOG_TIMER_PATH"; do
+    [[ ! -e $path && ! -L $path ]] || ((watchdog_present += 1))
+  done
+  if ((watchdog_present != 0)); then
+    ((watchdog_present == 3)) || return 1
+    "$file_verifier" "$WATCHDOG_BINARY" || return 1
+    [[ -x $WATCHDOG_BINARY ]] || return 1
+    for unit in "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER"; do
+      expected_fragment=$WATCHDOG_SERVICE_PATH
+      [[ $unit == "$WATCHDOG_TIMER" ]] && expected_fragment=$WATCHDOG_TIMER_PATH
+      fragment=$(systemctl show --property=FragmentPath --value "$unit") || return 1
+      [[ $fragment == "$expected_fragment" ]] || return 1
+      "$file_verifier" "$expected_fragment" || return 1
+      drop_ins=$(systemctl show --property=DropInPaths --value "$unit") || return 1
+      [[ -z $drop_ins ]] || return 1
+    done
+  fi
   if [[ -e $control_dir || -L $control_dir ]]; then
     direct_directory "$control_dir" && secure_root_chain "$control_dir" || return 1
     assets=$(release_control_assets "$control_dir") || return 1
@@ -840,6 +888,8 @@ fresh_legacy_health_observation() {
   [[ -f $health && ! -L $health ]] || return 1
   # Payload timestamps describe the cycle; mtime and identity prove its
   # completed atomic publication. Retry only snapshots that overlap rename.
+  # Keep ctime in the trust tuple so mode/link metadata changes force a rehash.
+  # A production unlink changes it once; the next pass reuses this retained link.
   for _ in 1 2 3; do
     before=$(stat -c '%d:%i:%s:%Y:%Z' "$health") || return 1
     snapshot=$(jq -cS . "$health") || return 1
@@ -949,12 +999,13 @@ oss_config_sha256() {
 }
 
 load_oss_config_snapshot() {
-  oss_bucket=$(env_value OSS_BUCKET)
-  oss_endpoint=$(env_value OSS_ENDPOINT)
-  oss_region=$(env_value OSS_REGION)
-  aliyun_profile=$(env_value ALIYUN_PROFILE)
-  zstd_timeout_seconds=$(env_value ZSTD_TIMEOUT_SECONDS)
-  oss_copy_timeout_seconds=$(env_value OSS_COPY_TIMEOUT_SECONDS)
+  local upload_env=${1:-$UPLOAD_ENV}
+  oss_bucket=$(env_value OSS_BUCKET "$upload_env")
+  oss_endpoint=$(env_value OSS_ENDPOINT "$upload_env")
+  oss_region=$(env_value OSS_REGION "$upload_env")
+  aliyun_profile=$(env_value ALIYUN_PROFILE "$upload_env")
+  zstd_timeout_seconds=$(env_value ZSTD_TIMEOUT_SECONDS "$upload_env")
+  oss_copy_timeout_seconds=$(env_value OSS_COPY_TIMEOUT_SECONDS "$upload_env")
   # Development policy: upload timeout values remain bound into OSS configuration evidence.
   [[ $zstd_timeout_seconds =~ ^[1-9][0-9]*$ \
     && $oss_copy_timeout_seconds =~ ^[1-9][0-9]*$ ]] \
@@ -967,12 +1018,13 @@ load_oss_config_snapshot() {
     "ZSTD_TIMEOUT_SECONDS=$zstd_timeout_seconds" \
     "OSS_COPY_TIMEOUT_SECONDS=$oss_copy_timeout_seconds" \
     | sha256sum | awk '{print $1}')
-  [[ $(oss_config_sha256) == "$oss_config_sha" ]] \
+  oss_config_file=$upload_env
+  [[ $(oss_config_sha256 "$oss_config_file") == "$oss_config_sha" ]] \
     || die 'OSS configuration changed while it was being snapshotted'
 }
 
 verify_current_oss_config() {
-  [[ $(oss_config_sha256) == "$oss_config_sha" ]] \
+  [[ $(oss_config_sha256 "${oss_config_file:-$UPLOAD_ENV}") == "$oss_config_sha" ]] \
     || die 'OSS configuration changed during the shadow gate'
 }
 
@@ -1021,6 +1073,7 @@ download_and_verify_oss_triplet() {
   local prefix relative path_sha data_name
   local data manifest success superseded_uri superseded_listing manifest_json
   local expected_bytes expected_sha source_bytes canonical segment_complete
+  local start_recorded_at end_recorded_at
   prefix="oss://$oss_bucket/lake/raw/venue=polymarket/dataset=$expected_dataset/"
   [[ $uri == "$prefix"* ]] || return 1
   relative=${uri#"$prefix"}
@@ -1054,6 +1107,8 @@ download_and_verify_oss_triplet() {
       and (.bytes | type == "number" and floor == . and . > 0)
       and (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))
       and (.source_bytes | type == "number" and floor == . and . > 0)
+      and (.start_recorded_at | type == "string" and length > 0)
+      and (.end_recorded_at | type == "string" and length > 0)
       and (.canonical | type == "boolean")
       and (.segment_complete | type == "boolean")
       and .source_session_closed == true and .sequence_gaps == 0)' \
@@ -1061,6 +1116,8 @@ download_and_verify_oss_triplet() {
   expected_bytes=$(jq -er '.bytes' <<<"$manifest_json") || return 1
   expected_sha=$(jq -er '.sha256' <<<"$manifest_json") || return 1
   source_bytes=$(jq -er '.source_bytes' <<<"$manifest_json") || return 1
+  start_recorded_at=$(jq -er '.start_recorded_at' <<<"$manifest_json") || return 1
+  end_recorded_at=$(jq -er '.end_recorded_at' <<<"$manifest_json") || return 1
   canonical=$(jq -r '.canonical' <<<"$manifest_json") || return 1
   segment_complete=$(jq -r '.segment_complete' <<<"$manifest_json") || return 1
   [[ $canonical == "$segment_complete" ]] || return 1
@@ -1073,38 +1130,30 @@ download_and_verify_oss_triplet() {
     --arg file "$data_name" --arg sha256 "$expected_sha" \
     --arg manifest_sha256 "$(sha256sum "$manifest" | awk '{print $1}')" \
     --arg success_sha256 "$expected_sha" \
+    --arg start_recorded_at "$start_recorded_at" \
+    --arg end_recorded_at "$end_recorded_at" \
     --argjson bytes "$expected_bytes" --argjson source_bytes "$source_bytes" \
     --argjson canonical "$canonical" --argjson segment_complete "$segment_complete" \
     '{uri:$uri,dataset:$dataset,file:$file,bytes:$bytes,sha256:$sha256,
       source_bytes:$source_bytes,manifest_sha256:$manifest_sha256,
       success_sha256:$success_sha256,canonical:$canonical,
-      segment_complete:$segment_complete}'
+      segment_complete:$segment_complete,start_recorded_at:$start_recorded_at,
+      end_recorded_at:$end_recorded_at}'
 }
 
-real_market_segment_preflight() {
-  local source_spool=$1 spool=$2 download_root=$3 evidence=$4 before after path name
-  local stable=false source_path source_name source_file source_tmp source_segment
-  local source_stamp source_uuid candidate_stamp candidate_uuid
-  local preflight_dataset started_at completed_at candidate_exit candidate_summary
-  local terminal_status upload_summary
-  local source_quote_records source_recorded_hours source_content_sha256 source_bytes
-  local source_identity source_mtime
-  local copied_sha256 uploaded_content_sha256 uploaded_canonical
-  local uploaded_uri uploaded_triplet uploaded_name preflight_tmp preflight_json
-  local candidate_stdout_tmp candidate_stdout candidate_stderr_tmp candidate_stderr
-  local preflight_deadline
-  preflight_deadline=$((SECONDS + REAL_MARKET_PREFLIGHT_BUDGET_SECONDS))
-  secure_collector_directory "$source_spool" || return 1
-  source_path=
-  source_name=
-  source_stamp=
-  source_uuid=
+latest_real_market_segment() {
+  local source_spool=$1 path name source_path='' source_name=''
+  local source_stamp='' source_uuid='' candidate_stamp candidate_uuid
   for path in "$source_spool"/market-updates.*.ndjson; do
     name=${path##*/}
     [[ $name =~ ^market-updates\.([0-9]{8}T[0-9]{6}([0-9]{6})?)(\.([[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}))?\.ndjson$ ]] \
       || continue
     candidate_stamp=${BASH_REMATCH[1]}
     candidate_uuid=${BASH_REMATCH[4]:-}
+    date -u -d \
+      "${candidate_stamp:0:4}-${candidate_stamp:4:2}-${candidate_stamp:6:2}T${candidate_stamp:9:2}:${candidate_stamp:11:2}:${candidate_stamp:13:2}Z" \
+      +%Y%m%dT%H%M%S 2>/dev/null \
+      | grep -Fqx -- "${candidate_stamp:0:15}" || continue
     if [[ -z $source_name || $candidate_stamp > "$source_stamp" \
       || ( $candidate_stamp == "$source_stamp" \
         && -n $candidate_uuid && -z $source_uuid ) ]]; then
@@ -1114,33 +1163,142 @@ real_market_segment_preflight() {
       source_uuid=$candidate_uuid
     fi
   done
-  if [[ -z $source_path || ! -f $source_path || -L $source_path ]]; then
-    printf 'real market preflight found no eligible closed market segment\n' >&2
+  [[ -n $source_path && -f $source_path && ! -L $source_path ]] || return 1
+  printf '%s\n' "$source_path"
+}
+
+real_market_segment_preflight() {
+  local source_spool=$1 spool=$2 download_root=$3 evidence=$4 before after
+  local pinned=false stable=false source_path source_name source_file source_tmp source_segment
+  local preflight_dataset started_at completed_at candidate_exit candidate_summary
+  local terminal_status upload_summary
+  local source_quote_records source_recorded_hours source_content_sha256 source_bytes
+  local source_identity source_mtime source_path_identity source_mode_owner
+  local source_segment_hint candidate_exit_json
+  local uploaded_content_sha256 uploaded_canonical
+  local uploaded_uri uploaded_triplet uploaded_name preflight_tmp preflight_json
+  local candidate_stdout_tmp candidate_stdout candidate_stderr_tmp candidate_stderr
+  local segment_wait_deadline preflight_deadline
+  segment_wait_deadline=$((SECONDS + REAL_MARKET_SEGMENT_WAIT_BUDGET_SECONDS))
+  secure_collector_directory "$source_spool" || return 1
+  started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  preflight_json="$evidence/real-market-preflight.json"
+  preflight_tmp="$evidence/.real-market-preflight.json.tmp"
+  candidate_stdout="$evidence/real-market-uploader.json"
+  candidate_stderr="$evidence/real-market-uploader.stderr"
+  source_path=
+  source_name=
+  source_segment_hint=$(jq -cn --arg path "$source_path" --arg file "$source_name" \
+    '{path:$path,file:$file}')
+  write_preflight_failure() {
+    local reason=$1
+    local candidate_exit_value=${2:-null}
+    local segment_json=${3:-$source_segment_hint}
+    completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    if [[ $candidate_exit_value == null ]]; then
+      candidate_exit_json=null
+    else
+      candidate_exit_json=$candidate_exit_value
+    fi
+    jq -n --arg started_at "$started_at" --arg completed_at "$completed_at" \
+      --arg candidate_sha256 "$candidate_sha" \
+      --arg deployment_source_revision "$source_revision" \
+      --arg deployment_bundle_sha256 "$deployment_bundle_sha" \
+      --arg release_manifest_sha256 "$release_manifest_sha" \
+      --arg control_archive_sha256 "$control_archive_sha" \
+      --arg oss_config_sha256 "$oss_config_sha" \
+      --arg dataset "${preflight_dataset:-}" \
+      --arg failure_reason "$reason" \
+      --argjson source_segment "$segment_json" \
+      --argjson candidate_exit_code "$candidate_exit_json" \
+      '{schema:"monday.polymarket_real_market_preflight.v2",status:"failed",
+        started_at:$started_at,completed_at:$completed_at,
+        candidate_sha256:$candidate_sha256,
+        deployment_source_revision:$deployment_source_revision,
+        deployment_bundle_sha256:$deployment_bundle_sha256,
+        release_manifest_sha256:$release_manifest_sha256,
+        control_archive_sha256:$control_archive_sha256,
+        oss_config_sha256:$oss_config_sha256,
+        dataset:(if $dataset == "" then null else $dataset end),
+        source_segment:$source_segment,
+        failure_reason:$failure_reason,
+        candidate_exit_code:$candidate_exit_code}' >"$preflight_tmp"
+    mv "$preflight_tmp" "$preflight_json"
+    sync "$preflight_json"
+  }
+  while ((SECONDS < segment_wait_deadline)); do
+    if source_path=$(latest_real_market_segment "$source_spool"); then
+      source_name=${source_path##*/}
+      source_file="$spool/$source_name"
+      source_tmp="$spool/.${source_name}.preflight.$$"
+      [[ ! -e $source_file && ! -L $source_file \
+        && ! -e $source_tmp && ! -L $source_tmp ]] || {
+        source_segment_hint=$(jq -cn --arg path "$source_path" --arg file "$source_name" \
+          '{path:$path,file:$file}')
+        write_preflight_failure 'shadow spool already contains the preflight target path'
+        return 1
+      }
+      # Pin the exact inode before inspecting it. If the production uploader
+      # wins the unlink race, rescan until the same bounded preflight deadline.
+      if run_before_deadline "$segment_wait_deadline" \
+        ln "$source_path" "$source_tmp"; then
+        pinned=true
+        break
+      fi
+      if [[ -e $source_path || -L $source_path \
+        || -e $source_tmp || -L $source_tmp ]]; then
+        source_segment_hint=$(jq -cn --arg path "$source_path" --arg file "$source_name" \
+          '{path:$path,file:$file}')
+        write_preflight_failure 'could not hardlink the production segment into the shadow spool'
+        return 1
+      fi
+    fi
+    run_before_deadline "$segment_wait_deadline" sleep 1 || break
+  done
+  if [[ $pinned != true ]]; then
+    printf 'real market preflight found no eligible closed market segment within %s seconds\n' \
+      "$REAL_MARKET_SEGMENT_WAIT_BUDGET_SECONDS" >&2
     return 1
   fi
-  source_file="$spool/$source_name"
-  source_tmp="$source_file.tmp"
+  preflight_deadline=$((SECONDS + REAL_MARKET_PREFLIGHT_BUDGET_SECONDS))
+  source_segment_hint=$(jq -cn --arg path "$source_path" --arg file "$source_name" \
+    '{path:$path,file:$file}')
   for _ in 1 2 3; do
     before=$(run_before_deadline "$preflight_deadline" \
-      stat -c '%d:%i:%s:%Y:%Z' "$source_path") || return 1
-    run_before_deadline "$preflight_deadline" cp -- "$source_path" "$source_tmp" \
-      || return 1
+      stat -c '%d:%i:%s:%Y:%Z' "$source_tmp") || return 1
     source_content_sha256=$(run_before_deadline "$preflight_deadline" \
-      sha256sum "$source_path" | awk '{print $1}') \
-      || return 1
-    copied_sha256=$(run_before_deadline "$preflight_deadline" \
       sha256sum "$source_tmp" | awk '{print $1}') || return 1
     after=$(run_before_deadline "$preflight_deadline" \
-      stat -c '%d:%i:%s:%Y:%Z' "$source_path") || return 1
-    if [[ $before == "$after" && $source_content_sha256 == "$copied_sha256" ]]; then
+      stat -c '%d:%i:%s:%Y:%Z' "$source_tmp") || return 1
+    if [[ $before == "$after" ]]; then
       stable=true
       break
     fi
   done
-  [[ $stable == true ]] || return 1
+  [[ $stable == true ]] || {
+    write_preflight_failure 'linked production segment did not remain inode-stable while hashing'
+    return 1
+  }
+  source_mode_owner=$(run_before_deadline "$preflight_deadline" \
+    stat -c '%U:%G:%a' "$source_tmp") || return 1
+  [[ $source_mode_owner == hftcollector:hftcollector:640 ]] || {
+    write_preflight_failure "linked production segment ownership or mode is untrusted ($source_mode_owner)"
+    return 1
+  }
+  if [[ -e $source_path || -L $source_path ]]; then
+    [[ -f $source_path && ! -L $source_path ]] || {
+      write_preflight_failure 'production segment path became indirect or non-regular after linking'
+      return 1
+    }
+    source_path_identity=$(run_before_deadline "$preflight_deadline" \
+      stat -c '%d:%i:%s:%Y:%Z' "$source_path") || return 1
+    [[ $source_path_identity == "$after" ]] || {
+      write_preflight_failure 'production segment path was replaced by a different inode after linking'
+      return 1
+    }
+  fi
   preflight_dataset="crypto_expiry_preflight_${candidate_sha:0:12}_${run_id,,}"
   [[ $preflight_dataset =~ ^[a-z0-9_-]+$ ]] || return 1
-  started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   # Bounded scan (issue #586): count quotes only in a bounded head window so the
   # preflight cost does not scale with tick volume. The input-side head caps the
   # scanned records at PREFLIGHT_SCAN_WINDOW_RECORDS; jq reads the full window
@@ -1167,17 +1325,15 @@ real_market_segment_preflight() {
   source_bytes=$(run_before_deadline "$preflight_deadline" \
     stat -c %s "$source_tmp") || return 1
   source_identity=$(run_before_deadline "$preflight_deadline" \
-    stat -c '%d:%i' "$source_path") || return 1
+    stat -c '%d:%i' "$source_tmp") || return 1
   source_mtime=$(run_before_deadline "$preflight_deadline" \
-    stat -c %Y "$source_path") || return 1
+    stat -c %Y "$source_tmp") || return 1
   source_segment=$(jq -cn --arg path "$source_path" --arg file "$source_name" \
     --arg sha256 "$source_content_sha256" --arg identity "$source_identity" \
     --argjson bytes "$source_bytes" --argjson modified_at_unix "$source_mtime" \
     '{path:$path,file:$file,bytes:$bytes,sha256:$sha256,
       file_identity:$identity,modified_at_unix:$modified_at_unix}') || return 1
   mv "$source_tmp" "$source_file"
-  chown hftcollector:hftcollector "$source_file"
-  chmod 0640 "$source_file"
   sync "$source_file"
 
   candidate_stdout_tmp="$evidence/.real-market-uploader.json.tmp"
@@ -1198,8 +1354,6 @@ real_market_segment_preflight() {
   fi
   mv "$candidate_stdout_tmp" "$candidate_stdout"
   mv "$candidate_stderr_tmp" "$candidate_stderr"
-  preflight_json="$evidence/real-market-preflight.json"
-  preflight_tmp="$evidence/.real-market-preflight.json.tmp"
   candidate_summary=
   terminal_status=
   upload_summary=
@@ -1327,7 +1481,7 @@ run_budgeted_real_market_preflight() {
       printf 'legacy baseline identity changed before real preflight\n' >&2
       return 1
     }
-    legacy_runtime_budget_required=$((REAL_MARKET_PREFLIGHT_BUDGET_SECONDS \
+    legacy_runtime_budget_required=$((REAL_MARKET_PREFLIGHT_TOTAL_BUDGET_SECONDS \
       + gate_seconds \
       + PARITY_CUTOFF_LAG_SECONDS \
       + zstd_timeout_seconds + oss_copy_timeout_seconds \
@@ -1348,7 +1502,8 @@ run_budgeted_real_market_preflight() {
       return 1
     }
   fi
-  preflight_output=$(timeout --signal=KILL "$REAL_MARKET_PREFLIGHT_BUDGET_SECONDS" env \
+  preflight_output=$(timeout --signal=KILL \
+    "$REAL_MARKET_PREFLIGHT_TOTAL_BUDGET_SECONDS" env \
     "candidate_sha=$candidate_sha" "run_id=$run_id" \
     "release_binary=$release_binary" "oss_bucket=$oss_bucket" \
     "oss_endpoint=$oss_endpoint" "oss_region=$oss_region" \
@@ -1678,11 +1833,55 @@ adjudicate_trade_parity() {
   '
 }
 
+if [[ ${1:-} == --oss-triplet-readback-worker ]]; then
+  [[ ${EUID} -eq 0 && $# -eq 6 ]] || exit 2
+  for command in aliyun awk date grep jq mkdir readlink sed seq sha256sum sleep stat \
+    timeout tr wc; do
+    command -v "$command" >/dev/null 2>&1 || die "missing readback command: $command"
+  done
+  readback_upload_env=$2
+  readback_oss_config_sha=$3
+  readback_uri=$4
+  readback_dataset=$5
+  readback_target=$6
+  readback_parent=${readback_target%/*}
+  readback_leaf=${readback_target##*/}
+  [[ $readback_upload_env == /* \
+    && $readback_oss_config_sha =~ ^[a-f0-9]{64}$ \
+    && $readback_dataset =~ ^[a-z0-9_-]+$ \
+    && $readback_parent =~ ^/run/monday/polymarket-readback\.[A-Za-z0-9]{6}$ \
+    && ( $readback_leaf == reference || $readback_leaf == market ) \
+    && ! -e $readback_target && ! -L $readback_target ]] \
+    || die 'OSS triplet readback arguments are invalid'
+  secure_root_chain "${readback_upload_env%/*}" \
+    || die 'readback OSS configuration parent is not trusted'
+  secure_control_file "$readback_upload_env"
+  secure_root_chain "$readback_parent" \
+    || die 'readback target parent is not trusted'
+  load_oss_config_snapshot "$readback_upload_env"
+  [[ $oss_config_sha == "$readback_oss_config_sha" ]] \
+    || die 'readback OSS configuration differs from the cutover evidence'
+  download_and_verify_oss_triplet "$readback_uri" "$readback_dataset" \
+    "$readback_target" "$((SECONDS + 600))" \
+    || die 'production OSS triplet readback failed'
+  exit
+fi
+
 if [[ ${1:-} == --real-market-preflight-worker ]]; then
   [[ ${EUID} -eq 0 && $# -eq 5 ]] || exit 2
   real_market_segment_preflight "$2" "$3" "$4" "$5" || exit
   printf '%s\n' "$real_market_preflight_json"
   exit
+fi
+
+if [[ ${1:-} == --real-market-segment-ready ]]; then
+  [[ ${EUID} -eq 0 && $# -eq 2 ]] || exit 2
+  if ! secure_collector_directory "$2" \
+    || ! latest_real_market_segment "$2" >/dev/null; then
+    printf 'no eligible closed market segment is ready for Gate admission\n' >&2
+    exit 1
+  fi
+  exit 0
 fi
 
 [[ ${EUID} -eq 0 ]] || die 'must run as root'
@@ -2102,6 +2301,11 @@ while :; do
     verify_baseline_identity \
       || die 'baseline collector identity changed during gate and is not an admissible supervised crash restart'
   fi
+  # Crash-restart adjudication may wait for both systemd settlement and
+  # journal visibility. Health and settle-boundary decisions must use the
+  # time after that bounded wait, not the loop-entry sample.
+  now_uptime=$SECONDS
+  elapsed=$((now_uptime - start_uptime))
   if baseline_health_requires_continuous_freshness "$baseline_mode"; then
     legacy_health="$LEGACY_SPOOL/health.json"
     [[ -f $legacy_health && ! -L $legacy_health ]] \
@@ -2260,6 +2464,30 @@ while :; do
     fi
   fi
 
+  # Re-sample after the checks above before deciding whether to sleep again.
+  # Using the loop-entry sample here can add a whole extra sample period when
+  # the body crosses the observation deadline.
+  now_uptime=$SECONDS
+  elapsed=$((now_uptime - start_uptime))
+  if baseline_health_requires_continuous_freshness "$baseline_mode"; then
+    legacy_health_result=$(legacy_health_transition \
+      "$legacy_health_state" "$legacy_api_error_started_at" \
+      "$now_uptime" "$MAX_HEALTH_SILENCE_SECONDS")
+    legacy_health_decision=${legacy_health_result%%:*}
+    legacy_api_error_started_at=${legacy_health_result#*:}
+    case "$legacy_health_decision" in
+      advance|wait)
+        ;;
+      expired)
+        die "$baseline_label API errors did not recover within the health budget"
+        ;;
+      *)
+        die "$baseline_label health is not fail-closed clean during shadow"
+        ;;
+    esac
+    ((now_uptime - last_legacy_health_change <= MAX_HEALTH_SILENCE_SECONDS)) \
+      || die "$baseline_label health stopped advancing during shadow"
+  fi
   if ((elapsed >= gate_seconds)) \
     && ! baseline_health_requires_continuous_freshness "$baseline_mode" \
     && [[ $LEGACY_HEALTH_COMPLETION_REQUIRED == true ]] \

@@ -8,6 +8,8 @@ fixtures="$script_dir/fixtures/rust-ci-scope"
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
 
+bash "$script_dir/test-agent-worktree-preflight.sh"
+
 run_case() {
   local name=$1 event=$2 changed=$3 ref=
   local output="$tmp_dir/$name.out"
@@ -24,11 +26,25 @@ printf '%s\n' .github/workflows/security.yml >"$tmp_dir/unknown-workflow.txt"
 printf '%s\n' .github/workflows/security-enabled.yml >"$tmp_dir/security-workflow.txt"
 printf '%s\n' .github/ISSUE_TEMPLATE/engineering-change.yml >"$tmp_dir/governance-template.txt"
 printf '%s\n' docs/agents/issue-tracker.md >"$tmp_dir/governance-doc.txt"
+printf '%s\n' .agents/skills/monday-research-evidence-audit/SKILL.md >"$tmp_dir/skill.txt"
+printf '%s\n' .agents/skills/monday-delivery-status/agents/openai.yaml >"$tmp_dir/skill-ui.txt"
+printf '%s\n' AGENTS.md rust_hft/tools/collector/AGENTS.md >"$tmp_dir/agent-instructions.txt"
+printf '%s\n' rust_hft/CLAUDE.md rust_hft/tools/collector/src/polymarket/reference.rs \
+  >"$tmp_dir/agent-instructions-with-code.txt"
 printf '%s\n' Makefile >"$tmp_dir/unknown-root.txt"
 printf '%s\n' config/risk.toml >"$tmp_dir/unknown-nested.txt"
+printf '%s\n' deployment/aliyun/host-rust-lob-cutover.sh >"$tmp_dir/lob-control.txt"
+printf '%s\n' deployment/aliyun/polymarket-market-recorder-deploy.sh >"$tmp_dir/market-recorder-control.txt"
+printf '%s\n' deployment/aliyun/polymarket-market-tape.service >"$tmp_dir/market-recorder-unit.txt"
+printf '%s\n' deployment/aliyun/bybit-options-archiver.service >"$tmp_dir/unowned-unit.txt"
 printf '%s\n' rust_hft/deployment/docker/Dockerfile.trading >"$tmp_dir/trading-dockerfile.txt"
 printf '%s\n' rust_hft/docs/README.md >"$tmp_dir/rust-docs.txt"
 printf '%s\n' rust_hft/research-core/README.md >"$tmp_dir/package-readme.txt"
+printf '%s\n' rust_hft/scripts/clickhouse/run_bitget_dedup.sh >"$tmp_dir/rust-shell-script.txt"
+printf '%s\n' rust_hft/scripts/deploy-ecs-tools-collector.sh >"$tmp_dir/rust-deploy-collector.txt"
+printf '%s\n' \
+  .github/scripts/agent-worktree-preflight.sh \
+  .github/scripts/test-agent-worktree-preflight.sh >"$tmp_dir/preflight-only.txt"
 
 assert_flag() {
   local output=$1 flag=$2 expected=$3
@@ -55,6 +71,21 @@ assert_jobs() {
   }
 }
 
+assert_owning_packages() {
+  local output=$1 expected=$2 actual
+  actual=$(sed -n 's/^owning_packages=//p' "$output")
+  [[ $actual == ,*, ]] || {
+    printf '%s: owning_packages output must use exact comma-delimited membership: %s\n' "$output" "$actual" >&2
+    exit 1
+  }
+  actual=${actual#,}
+  actual=${actual%,}
+  [[ $actual == "$expected" ]] || {
+    printf '%s: expected owning_packages=%s, got owning_packages=%s\n' "$output" "$expected" "$actual" >&2
+    exit 1
+  }
+}
+
 assert_security_jobs() {
   local output=$1 expected=$2 actual
   actual=$(sed -n 's/^security_jobs=//p' "$output")
@@ -72,31 +103,44 @@ assert_security_jobs() {
 
 job_cases=(
   'collector|pull_request|collector.txt|ci/rust,ci/polymarket-evidence-compiler-image'
-  'pinned-aliyun|pull_request|pinned-aliyun.txt|ploy/integration-regressions,ci/rust'
-  'pinned-aliyun-push|push|pinned-aliyun.txt|ploy/integration-regressions,ci/rust'
-  'future-aliyun-pin|pull_request|future-aliyun-pin.txt|ploy/integration-regressions,ci/rust'
-  'future-aliyun-markdown-pin|pull_request|future-aliyun-markdown-pin.txt|ploy/integration-regressions,ci/rust'
+  'pinned-aliyun|pull_request|pinned-aliyun.txt|ci/market-recorder-contract,ploy/integration-regressions,ci/rust,ploy/safety-scans'
+  'pinned-aliyun-push|push|pinned-aliyun.txt|ci/market-recorder-contract,ploy/integration-regressions,ci/rust,ploy/safety-scans'
+  'future-aliyun-pin|pull_request|future-aliyun-pin.txt|ploy/safety-scans'
+  'future-aliyun-markdown-pin|pull_request|future-aliyun-markdown-pin.txt|'
+  'lob-control|pull_request|lob-control.txt|ploy/safety-scans'
+  'market-recorder-control|pull_request|market-recorder-control.txt|ci/market-recorder-contract,ploy/safety-scans'
+  'market-recorder-unit|pull_request|market-recorder-unit.txt|ci/market-recorder-contract,ploy/integration-regressions,ci/rust,ploy/safety-scans'
+  'unowned-unit|pull_request|unowned-unit.txt|ploy/safety-scans'
   'evaluator|pull_request|evaluator.txt|ploy/commit-hygiene,ploy/rust-format,ploy/safety-scans,ploy/rust-research-heavy'
   'shared-prediction|pull_request|shared-prediction.txt|ploy/commit-hygiene,ploy/rust-format,ploy/safety-scans,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
   'prediction-lock|pull_request|prediction-lock.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
   'research-dockerfile|pull_request|research-dockerfile.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans'
-  'unknown-docker|pull_request|unknown-docker.txt|ci/rust,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
+  'campaign-controller-dockerfile|pull_request|campaign-controller-dockerfile.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans'
+  'unknown-docker|pull_request|unknown-docker.txt|ci/rust-shell-scripts,ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
   'prediction-workflow|pull_request|prediction-workflow.txt|ploy/commit-hygiene,ploy/workflow-lint,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
   'root-node|pull_request|root-node.txt|ci/node-install'
   'security-workflow|pull_request|security-workflow.txt|ploy/commit-hygiene,ploy/workflow-lint'
   'security-workflow-push|push|security-workflow.txt|ploy/workflow-lint'
   'governance-template|pull_request|governance-template.txt|ploy/commit-hygiene,ploy/workflow-lint'
   'governance-doc|pull_request|governance-doc.txt|ploy/commit-hygiene,ploy/workflow-lint'
-  'unknown-workflow|pull_request|unknown-workflow.txt|ci/rust,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/workflow-lint,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
-  'unknown-root|pull_request|unknown-root.txt|ci/rust,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
+  'skill|pull_request|skill.txt|ploy/commit-hygiene,ploy/workflow-lint'
+  'skill-push|push|skill.txt|ploy/workflow-lint'
+  'skill-ui|pull_request|skill-ui.txt|ploy/commit-hygiene,ploy/workflow-lint'
+  'agent-instructions|pull_request|agent-instructions.txt|ploy/commit-hygiene'
+  'agent-instructions-with-code|pull_request|agent-instructions-with-code.txt|ploy/commit-hygiene,ci/rust,ci/polymarket-evidence-compiler-image'
+  'preflight-only|pull_request|preflight-only.txt|ploy/commit-hygiene'
+  'unknown-workflow|pull_request|unknown-workflow.txt|ci/rust-shell-scripts,ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/workflow-lint,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
+  'unknown-root|pull_request|unknown-root.txt|ci/rust-shell-scripts,ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
   'unknown-nested|pull_request|unknown-nested.txt|'
   'rust-docs|pull_request|rust-docs.txt|'
   'package-readme|pull_request|package-readme.txt|'
+  'rust-shell-script|pull_request|rust-shell-script.txt|ci/rust-shell-scripts'
+  'rust-deploy-collector|pull_request|rust-deploy-collector.txt|ci/rust-shell-scripts,ci/rust,ci/polymarket-evidence-compiler-image,ploy/safety-scans'
   'docs|pull_request|docs.txt|'
   'unknown-prediction|pull_request|unknown-prediction.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
   'mixed-prediction|pull_request|mixed-prediction.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans,ploy/rust-format,ploy/rust-research-heavy'
   'frontend|pull_request|frontend.txt|ploy/commit-hygiene,ploy/safety-scans,ploy/frontend'
-  'backtest|pull_request|backtest.txt|ploy/research-image-binaries'
+  'backtest|pull_request|backtest.txt|ploy/research-image-binaries,ci/rust|hft-backtest'
   'live-push|push|live.txt|ci/rust,ci/deployment-artifacts'
   'trading-dockerfile-push|push|trading-dockerfile.txt|ci/deployment-artifacts'
   'research-deployment-push|push|research-deployment.txt|ci/deployment-artifacts,ploy/research-image-binaries,ploy/research-image-smoke'
@@ -104,11 +148,51 @@ job_cases=(
   'full|push|collector.txt|ci/rust,ci/polymarket-evidence-compiler-image,ploy/research-image-binaries,ploy/research-image-smoke'
 )
 for job_case in "${job_cases[@]}"; do
-  IFS='|' read -r name event fixture expected <<<"$job_case"
+  IFS='|' read -r name event fixture expected expected_owning <<<"$job_case"
   output=$(run_case "$name" "$event" "$fixture")
   assert_jobs "$output" "$expected"
+  assert_owning_packages "$output" "${expected_owning:-}"
   assert_flag "$output" selection_complete true
 done
+
+printf '%s\n' \
+  .github/scripts/agent-worktree-preflight.sh \
+  rust_hft/tools/future-rust-tool/src/lib.rs >"$tmp_dir/preflight-and-rust.txt"
+preflight_and_rust=$(run_case preflight-and-rust pull_request preflight-and-rust.txt)
+assert_jobs "$preflight_and_rust" 'ploy/commit-hygiene,ci/rust'
+assert_owning_packages "$preflight_and_rust" 'future-rust-tool'
+assert_flag "$preflight_and_rust" toolchain true
+
+owning_package_cases=(
+  'hft-binance-md|rust_hft/apps/binance-md/src/main.rs'
+  'hft-replay|rust_hft/apps/replay/src/main.rs'
+  'ws-connection-test|rust_hft/tools/ws_test/src/main.rs'
+  'listing-monitor|rust_hft/tools/listing-monitor/src/main.rs'
+  'future-rust-tool|rust_hft/tools/future-rust-tool/src/lib.rs'
+)
+for owning_case in "${owning_package_cases[@]}"; do
+  IFS='|' read -r package path <<<"$owning_case"
+  fixture="owning-$package.txt"
+  printf '%s\n' "$path" >"$tmp_dir/$fixture"
+  output=$(run_case "owning-$package" pull_request "$fixture")
+  assert_jobs "$output" 'ci/rust'
+  assert_owning_packages "$output" "$package"
+  assert_flag "$output" toolchain true
+done
+
+printf '%s\n' \
+  rust_hft/tools/collector/src/polymarket/reference.rs \
+  rust_hft/tools/future-rust-tool/src/lib.rs >"$tmp_dir/known-and-future.txt"
+known_and_future=$(run_case known-and-future pull_request known-and-future.txt)
+assert_jobs "$known_and_future" 'ci/rust,ci/polymarket-evidence-compiler-image'
+assert_owning_packages "$known_and_future" 'future-rust-tool'
+
+printf '%s\n' rust_hft/apps/live/src/lib.rs rust_hft/apps/paper/src/main.rs \
+  >"$tmp_dir/same-suite.txt"
+same_suite=$(run_case same-suite pull_request same-suite.txt)
+assert_jobs "$same_suite" 'ci/rust,ci/deployment-artifacts'
+assert_owning_packages "$same_suite" ''
+assert_flag "$same_suite" focused true
 
 all_security_jobs='security/sast-semgrep,security/cargo-audit,security/secret-presence,security/license-check,security/clippy-strict,security/cargo-machete,security/secret-detection'
 assert_security_jobs "$tmp_dir/docs.out" 'security/secret-detection'
@@ -116,6 +200,9 @@ assert_security_jobs "$tmp_dir/security-workflow.out" "$all_security_jobs"
 assert_security_jobs "$tmp_dir/security-workflow-push.out" "$all_security_jobs,security/container-scan"
 assert_security_jobs "$tmp_dir/root-node.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
 assert_security_jobs "$tmp_dir/unknown-nested.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
+assert_security_jobs "$tmp_dir/lob-control.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
+assert_security_jobs "$tmp_dir/rust-shell-script.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
+assert_security_jobs "$tmp_dir/rust-deploy-collector.out" "$all_security_jobs"
 assert_security_jobs "$tmp_dir/trading-dockerfile-push.out" 'security/sast-semgrep,security/secret-presence,security/container-scan,security/secret-detection'
 trading_develop="$tmp_dir/trading-dockerfile-develop.out"
 GITHUB_REF=refs/heads/develop "$selector" --event push \
@@ -143,12 +230,16 @@ collector="$tmp_dir/collector.out"
 for flag in loop collector control toolchain; do assert_flag "$collector" "$flag" true; done
 for flag in handoff json ondo focused; do assert_flag "$collector" "$flag" false; done
 
+rust_deploy_collector="$tmp_dir/rust-deploy-collector.out"
+for flag in collector control toolchain; do assert_flag "$rust_deploy_collector" "$flag" true; done
+for flag in loop handoff json ondo focused; do assert_flag "$rust_deploy_collector" "$flag" false; done
+
 live=$(run_case live pull_request live.txt)
 for flag in handoff json ondo focused toolchain; do assert_flag "$live" "$flag" true; done
 for flag in loop collector control; do assert_flag "$live" "$flag" false; done
 
 control=$(run_case control pull_request control.txt)
-assert_jobs "$control" 'ploy/integration-regressions,ci/rust'
+assert_jobs "$control" 'ploy/integration-regressions,ci/rust,ploy/safety-scans'
 for flag in control toolchain; do assert_flag "$control" "$flag" true; done
 for flag in loop handoff json ondo collector focused; do assert_flag "$control" "$flag" false; done
 
@@ -168,8 +259,11 @@ grep -Fqx '    needs: selector' "$ci_workflow"
 grep -Fqx "$always_condition" "$ci_workflow"
 grep -Fqx "          if [[ \"\$SELECTOR_RESULT\" == success && \"\$SELECTED_COMPLETE\" == true ]] &&" "$ci_workflow"
 grep -Fqx "             [[ \"\$SELECTED_JOBS\" =~ ^,[a-z0-9/-]*(,[a-z0-9/-]+)*,\$ ]] &&" "$ci_workflow"
-grep -Fq "'jobs=,ci/rust,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,'" "$ci_workflow"
+grep -Fq "'jobs=,ci/rust-shell-scripts,ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,'" "$ci_workflow"
 grep -Fq "contains(needs.scope.outputs.jobs, ',ci/rust,')" "$ci_workflow"
+[[ $(grep -Fxc '      owning_packages: ${{ steps.scope.outputs.owning_packages }}' "$ci_workflow") -eq 2 ]]
+grep -Fqx '      - name: Summarize check plan' "$ci_workflow"
+grep -Fq -- '- Collector control contract: %s' "$ci_workflow"
 grep -Fqx '      CARGO_PROFILE_DEV_DEBUG: "0"' "$ci_workflow"
 grep -Fqx '      CARGO_PROFILE_TEST_DEBUG: "0"' "$ci_workflow"
 grep -Fqx '  rust_fast_gates:' "$ci_workflow"
@@ -184,16 +278,23 @@ job_block() {
   awk -v job="^  $1:" '$0 ~ job {found=1; next} /^  [a-z_]+:/ {found=0} found' "$ci_workflow"
 }
 rust_job_block=$(job_block rust)
+rust_shell_scripts_block=$(job_block rust_shell_scripts)
 fast_gates_block=$(job_block rust_fast_gates)
+scope_job_block=$(job_block scope)
 [ -n "$rust_job_block" ]
+[ -n "$rust_shell_scripts_block" ]
 [ -n "$fast_gates_block" ]
+[ -n "$scope_job_block" ]
 
-# rust_fast_gates must carry the same scope condition as the heavy rust job,
-# checked inside its own block (a file-wide substring match would pass even
-# if the condition were deleted from the fast job and gate enforcement
-# silently bypassed).
-grep -Fq "if: \${{ contains(needs.scope.outputs.jobs, ',ci/rust,') }}" <<<"$fast_gates_block"
+# rust_fast_gates must preserve repository policy checks for both compiled
+# Rust changes and lightweight Rust shell changes.
+grep -Fq "if: \${{ contains(needs.scope.outputs.jobs, ',ci/rust,') || contains(needs.scope.outputs.jobs, ',ci/rust-shell-scripts,') }}" <<<"$fast_gates_block"
 grep -Fq "if: \${{ contains(needs.scope.outputs.jobs, ',ci/rust,') }}" <<<"$rust_job_block"
+grep -Fq "if: \${{ contains(needs.scope.outputs.jobs, ',ci/rust-shell-scripts,') }}" <<<"$rust_shell_scripts_block"
+grep -Fq "uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1" <<<"$rust_shell_scripts_block"
+grep -Fq "find rust_hft/scripts -type f -name '*.sh' -exec bash -n {} \\;" <<<"$rust_shell_scripts_block"
+grep -Fq 'Enforce Rust-only research and runtime source' <<<"$fast_gates_block"
+grep -Fq 'Python runtime or package-manager command' <<<"$fast_gates_block"
 
 # sccache must be wired into EACH of the two heavy jobs (per-job presence,
 # not a file-wide count).
@@ -211,17 +312,27 @@ grep -Fq 'uses: mozilla-actions/sccache-action@v0.0.10' <<<"$fast_lane_block"
 ! grep -Fq 'shellcheck' <<<"$rust_job_block"
 ! grep -Fq 'test-rust-lob-control-plane.sh' <<<"$rust_job_block"
 ! grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$fast_gates_block"
-grep -Fq 'test-rust-lob-control-plane.sh' <<<"$fast_gates_block"
-grep -Fq 'shellcheck' <<<"$fast_gates_block"
+! grep -Fq 'test-rust-lob-control-plane.sh' <<<"$fast_gates_block"
+! grep -Fq 'test-rust-lob-recovery-queue.sh' <<<"$fast_gates_block"
+! grep -Fq 'shellcheck' <<<"$fast_gates_block"
+grep -Fq 'test-rust-lob-control-plane.sh' <<<"$scope_job_block"
+grep -Fq 'test-rust-lob-recovery-queue.sh' <<<"$scope_job_block"
+[[ $scope_job_block != *test-polymarket-raw-ops-control-plane.sh* ]]
+grep -Fq 'test-monday-collector-health.sh' <<<"$scope_job_block"
+grep -Fq 'shellcheck' <<<"$scope_job_block"
 grep -Fq 'cargo fmt --check' <<<"$fast_gates_block"
 grep -Fq 'test-polymarket-raw-ops-control-plane.sh' <<<"$rust_job_block"
+grep -Fqx '      - name: Test directly changed Rust packages' "$ci_workflow"
+grep -Fq 'cargo test "${args[@]}" --locked' <<<"$rust_job_block"
 
 # The market-recorder release contract runs as its own parallel job (#568).
 ci_gate_block=$(job_block ci-gate)
 grep -Fqx '      - market_recorder_contract' <<<"$ci_gate_block"
+grep -Fqx '      - rust_shell_scripts' <<<"$ci_gate_block"
 recorder_block=$(job_block market_recorder_contract)
 [ -n "$recorder_block" ]
 grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$recorder_block"
+grep -Fq "contains(needs.scope.outputs.jobs, ',ci/market-recorder-contract,')" <<<"$recorder_block"
 ! grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$rust_job_block"
 grep -Fqx "        if: always() && needs.scope.outputs.toolchain == 'true'" "$ci_workflow"
 
@@ -229,7 +340,11 @@ ploy_workflow="$script_dir/../workflows/ploy-ci.yml"
 grep -Fqx "  group: prediction-markets-\${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}" "$ploy_workflow"
 grep -Fqx "  cancel-in-progress: \${{ github.ref != 'refs/heads/main' }}" "$ploy_workflow"
 [[ $(grep -Fxc '    branches: [main, develop]' "$ploy_workflow") -eq 2 ]]
-grep -Fqx '      - "deployment/aliyun/**"' "$ploy_workflow"
+if sed -n '/^  push:$/,/^  workflow_dispatch:$/p' "$ploy_workflow" \
+  | grep -Eq '^    paths(-ignore)?:'; then
+  echo 'Prediction Markets CI can skip a main SHA by path' >&2
+  exit 1
+fi
 grep -Fqx '    needs: image-smoke-selector' "$ploy_workflow"
 grep -Fqx "$always_condition" "$ploy_workflow"
 grep -Fqx '        working-directory: .' "$ploy_workflow"
@@ -244,6 +359,35 @@ grep -Fqx "            mapfile -d '' workflow_files < <(" "$ploy_workflow"
 grep -Fq -- '--diff-filter=ACMR -z' "$ploy_workflow"
 grep -Fqx '          if ((${#workflow_files[@]} == 0)); then' "$ploy_workflow"
 grep -Fqx '          "${HOME}/go/bin/actionlint" -color "${workflow_files[@]}"' "$ploy_workflow"
+# Exercise the actual CI validator with valid and invalid metadata.
+sed -n "/^          ruby -ryaml <<'RUBY'$/,/^          RUBY$/p" "$ploy_workflow" \
+  | sed 's/^          //' >"$tmp_dir/validate-skills.sh"
+test -s "$tmp_dir/validate-skills.sh"
+metadata_case() {
+  local label=$1 name=$2 description=$3 extra=$4 ui=$5 expected=$6 result=0
+  local root="$tmp_dir/metadata-$label"
+  local skill="$root/.agents/skills/$name"
+  mkdir -p "$skill/agents"
+  printf '%s\n' '---' "name: $name" "description: $description" "$extra" '---' 'Body' >"$skill/SKILL.md"
+  printf '%s\n' "$ui" >"$skill/agents/openai.yaml"
+  (cd "$root" && bash "$tmp_dir/validate-skills.sh") >"$root/result" 2>&1 || result=$?
+  if [[ $expected == pass && $result != 0 || $expected == fail && $result == 0 ]]; then
+    printf 'metadata case %s: expected %s, exit %s\n' "$label" "$expected" "$result" >&2
+    cat "$root/result" >&2
+    exit 1
+  fi
+}
+metadata_case valid example Audit '' 'interface: {display_name: Example}' pass
+metadata_case optional-interface example Audit '' 'interface: {}' pass
+metadata_case underscore invalid_skill Audit '' 'interface: {}' fail
+metadata_case long-name "$(printf '%065d' 0)" Audit '' 'interface: {}' fail
+metadata_case angle-bracket example '"<audit>"' '' 'interface: {}' fail
+metadata_case unknown-key example Audit 'unsupported: true' 'interface: {}' fail
+metadata_case interface-type example Audit '' 'interface: broken' fail
+metadata_case field-type example Audit '' 'interface: {display_name: 42}' fail
+metadata_case short-description example Audit '' 'interface: {short_description: tiny}' fail
+metadata_case prompt example Audit '' 'interface: {default_prompt: Audit this}' fail
+metadata_case color example Audit '' 'interface: {brand_color: red}' fail
 # sccache must use the #559/#566 pattern (sccache-action + per-job local
 # cache, rustc/sccache-versioned rust-cache keys, continue-on-error fallback) in
 # EVERY ploy-ci job that compiles Rust on the runner, and the homegrown

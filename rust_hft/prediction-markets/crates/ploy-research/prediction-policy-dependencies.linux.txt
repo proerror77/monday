@@ -1,7 +1,7 @@
 prediction-policy-dependencies.v5
 target=x86_64-unknown-linux-gnu
 profile=default,db
-input:Cargo.lock=sha256:b0cdff1d582f5810b61d9f6bdf996d43c19e0ea8b252ca482448ef7bf4c4d35c
+input:Cargo.lock=sha256:31894ddfaad0195fe6ac0ac01b5ba7633fac7d3a8ce73fbc03137dd41f327b3a
 input:Cargo.toml=sha256:104f7b7a41e62d573b42da227e6fae379c2cfbe70bccf4b65b921a9c1281048f
 input:crates/ploy-research/Cargo.toml=sha256:cfc1572e1364f0e9712a81b2d7d5e6e786541b080862ee6729199ca4524b5541
 input:crates/ploy-feed-loaders/Cargo.toml=sha256:abf8f1b8adec93b1ad84a66294cb58eb65f9cbca33c701cc81c7635eb9b35e2c
@@ -9,9 +9,8 @@ input:crates/ploy-market-contracts/Cargo.toml=sha256:e086ddc8f162ff0abcabe832b1b
 input:crates/ploy-market-data/Cargo.toml=sha256:4f3c213c3d8283de4672b7c2de6f9c9c30d12db11bb8460495f5ebf09225b2bd
 input:../data-pipelines/core/Cargo.toml=sha256:4d4bb79a5456edf8f1922303ee98191401d08a360f60858681c12be2e0795b27
 input:../market-core/core/Cargo.toml=sha256:1871023d225485d0585cf929928690f83d0b5dc1f52eb6e5e578948843872769
-input:../market-core/instrument/Cargo.toml=sha256:057cf9cfb1f029a124ec63f4c85c595897aec468d7ab0861f8246b589eb758eb
-input:../market-core/integration/Cargo.toml=sha256:114e2bd764147c21c5d2b3f9c1da82a05329c790935bf0f8edac2b2547d46600
-input:../market-core/ports/Cargo.toml=sha256:c660d206267c93f0a846e001264b74a7fc9647cca75a32adc2273bff22a88b6b
+input:../market-core/integration/Cargo.toml=sha256:f54494420bc70e3e7465267411a9f055165061f68dbb00bb31391565a1ab0142
+input:../market-core/ports/Cargo.toml=sha256:5c60ccfd504fa8c50989d8c310392c1cdb7e6fc5f0b29c8053850dc8bd2d3adb
 input:../market-core/snapshot/Cargo.toml=sha256:05034b38335e1641ec9c5de9d5b9570738fc552d299ff82295141aff9819b56c
 package:allocator-api2@0.2.21|source=registry+https://github.com/rust-lang/crates.io-index|checksum=683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923|features=alloc
 package:anyhow@1.0.103|source=registry+https://github.com/rust-lang/crates.io-index|checksum=2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3|features=default,std
@@ -64,7 +63,6 @@ package:hashlink@0.10.0|source=registry+https://github.com/rust-lang/crates.io-i
 package:hex@0.4.3|source=registry+https://github.com/rust-lang/crates.io-index|checksum=7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70|features=alloc,default,std
 package:hft-core@0.1.0|source=path|checksum=none|features=default
 package:hft-data@0.1.0|source=path|checksum=none|features=default
-package:hft-instrument@0.1.0|source=path|checksum=none|features=default
 package:hft-integration@0.1.0|source=path|checksum=none|features=default
 package:hft-ports@0.1.0|source=path|checksum=none|features=default
 package:hft-search-kernel@0.1.0|source=path|checksum=none|features=

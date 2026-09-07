@@ -14,6 +14,7 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::writer::{SerializedFileWriter, SerializedRowGroupWriter};
 use parquet::schema::parser::parse_message_type;
 use serde::Serialize;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs::{self, File};
@@ -154,8 +155,50 @@ struct ReplayPayload {
     asks: Vec<[String; 2]>,
 }
 
+fn log_event(event: &str, details: Value) {
+    eprintln!(
+        "{}",
+        json!({
+            "schema_version": "monday.research_event.v1",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "component": "binance-replay-parquet-materializer",
+            "event": event,
+            "details": details,
+        })
+    );
+}
+
 fn main() -> Result<()> {
-    let published = materialize(&Args::parse())?;
+    let args = Args::parse();
+    log_event(
+        "replay_materialization_started",
+        json!({
+            "mission_id": &args.mission_id,
+            "market": args.market.as_str(),
+            "symbol": &args.symbol,
+            "segment_count": args.segment.len(),
+        }),
+    );
+    let published = materialize(&args).inspect_err(|_| {
+        log_event(
+            "replay_materialization_failed",
+            json!({"reason_code": "materialization_failed"}),
+        );
+    })?;
+    log_event(
+        "replay_materialization_completed",
+        json!({
+            "mission_id": &published.manifest.mission_id,
+            "market": &published.manifest.market,
+            "symbol": &published.manifest.symbol,
+            "rows": published.manifest.rows,
+            "source_revision": &published.manifest.source_revision,
+            "artifact_sha256": &published.manifest.artifact_sha256,
+            "manifest_sha256": &published.manifest_sha256,
+            "first_event_time_us": published.manifest.first_event_time_us,
+            "last_event_time_us": published.manifest.last_event_time_us,
+        }),
+    );
     serde_json::to_writer_pretty(std::io::stdout().lock(), &published)?;
     println!();
     Ok(())
@@ -168,7 +211,22 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         bail!("mission id and symbol are required");
     }
 
+    log_event(
+        "replay_segment_verification_started",
+        json!({"mission_id": mission_id, "segment_count": args.segment.len()}),
+    );
     let verified = verify_segments(args)?;
+    log_event(
+        "replay_segment_verification_completed",
+        json!({
+            "mission_id": mission_id,
+            "verified_series": verified.len(),
+            "verified_segments": verified
+                .iter()
+                .map(|series| series.verified().segments().len())
+                .sum::<usize>(),
+        }),
+    );
     if verified
         .iter()
         .flat_map(|series| series.verified().segments().iter())
@@ -215,6 +273,16 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
     let artifact_name = format!("{artifact_sha256}.parquet");
     let artifact_path = artifact_dir.join(&artifact_name);
     publish_temp_immutable(&temporary_artifact, &artifact_path, &artifact_sha256)?;
+    log_event(
+        "replay_artifact_published",
+        json!({
+            "mission_id": mission_id,
+            "artifact_sha256": &artifact_sha256,
+            "rows": coverage.rows,
+            "sequence_start": coverage.sequence_start,
+            "sequence_end": coverage.sequence_end,
+        }),
+    );
 
     let source_revision =
         governed_source_revision(source_segments.iter().map(|source| source.sha256.as_str()));
@@ -264,11 +332,12 @@ fn verify_segments(args: &Args) -> Result<Vec<VerifiedBinanceMarketTapeSeries>> 
 
     let mut content_sha256s = BTreeSet::new();
     let mut sealed = Vec::with_capacity(count);
-    for ((input_path, content_sha256), manifest_sha256) in args
+    for (index, ((input_path, content_sha256), manifest_sha256)) in args
         .segment
         .iter()
         .zip(&args.segment_content_sha256)
         .zip(&args.segment_manifest_sha256)
+        .enumerate()
     {
         let path = fs::canonicalize(input_path)
             .with_context(|| format!("cannot resolve segment path {}", input_path.display()))?;
@@ -282,6 +351,15 @@ fn verify_segments(args: &Args) -> Result<Vec<VerifiedBinanceMarketTapeSeries>> 
         };
         let trust = BinanceMarketTapeTrustAnchor::from_lower_hex(content_sha256, manifest_sha256)?;
         sealed.push(seal_binance_market_tape_triplet(&triplet, &trust)?);
+        log_event(
+            "replay_segment_verified",
+            json!({
+                "current": index + 1,
+                "total": count,
+                "content_sha256": content_sha256,
+                "manifest_sha256": manifest_sha256,
+            }),
+        );
     }
     verify_binance_market_tape_series_with_required_lob_continuity(sealed)
 }
@@ -327,7 +405,16 @@ fn write_parquet(file: File, series: &[CanonicalSeriesReplay<'_>]) -> Result<Can
     let mut sequence_end = None;
     let mut emitted_rows = 0_usize;
 
-    for replay_series in series {
+    for (series_index, replay_series) in series.iter().enumerate() {
+        log_event(
+            "replay_series_started",
+            json!({
+                "current": series_index + 1,
+                "total": series.len(),
+                "session_id": replay_series.session_id,
+                "source_events": replay_series.events.len(),
+            }),
+        );
         if !matches!(
             replay_series
                 .events
@@ -371,8 +458,21 @@ fn write_parquet(file: File, series: &[CanonicalSeriesReplay<'_>]) -> Result<Can
             if row_buffer.len() == ROW_GROUP_ROWS {
                 write_parquet_row_group(&mut writer, &row_buffer)?;
                 row_buffer.clear();
+                log_event(
+                    "replay_row_progress",
+                    json!({"rows": emitted_rows, "row_group_rows": ROW_GROUP_ROWS}),
+                );
             }
         }
+        log_event(
+            "replay_series_completed",
+            json!({
+                "current": series_index + 1,
+                "total": series.len(),
+                "session_id": replay_series.session_id,
+                "emitted_rows": emitted_rows,
+            }),
+        );
     }
 
     if emitted_rows == 0 {

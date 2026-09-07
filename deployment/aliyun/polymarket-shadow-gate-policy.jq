@@ -173,7 +173,11 @@ and ((.real_market_preflight.started_at | utc_iso8601_unix)
   <= (.real_market_preflight.completed_at | utc_iso8601_unix))
 and ((.real_market_preflight.completed_at | utc_iso8601_unix)
   <= (.started_at | utc_iso8601_unix))
-and (.duration_seconds | positive_integer and . >= 3600 and . <= 3601)
+# The controller samples every 30 seconds. Its final identity check may also
+# spend 30 seconds waiting for systemd settlement and 30 seconds for bounded
+# crash-journal evidence, so admit that bounded 90-second tail plus one second
+# of integer-clock rounding while still rejecting an unbounded overrun.
+and (.duration_seconds | positive_integer and . >= 3600 and . <= 3691)
 and (.started_at | utc_iso8601_unix | type == "number")
 and (.parity_window_started_at_unix | positive_integer)
 and (.parity_window_ended_at_unix | positive_integer)

@@ -285,6 +285,11 @@ fn slice_report(output: &Output) -> Value {
         "slicer stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("\"schema_version\":\"monday.research_event.v1\""));
+    assert!(stderr.contains("\"event\":\"slicing_started\""));
+    assert!(stderr.contains("\"event\":\"slice_published\""));
+    assert!(stderr.contains("\"event\":\"slicing_completed\""));
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
@@ -352,6 +357,9 @@ fn cli_partitions_a_segment_into_budget_compliant_slices_that_materialize() {
         "materializer stderr: {}",
         String::from_utf8_lossy(&materialized.stderr)
     );
+    let materializer_stderr = String::from_utf8_lossy(&materialized.stderr);
+    assert!(materializer_stderr.contains("\"event\":\"replay_materialization_started\""));
+    assert!(materializer_stderr.contains("\"event\":\"replay_materialization_completed\""));
     let published: Value = serde_json::from_slice(&materialized.stdout).unwrap();
     let manifest = &published["manifest"];
     assert_eq!(manifest["symbol"], json!("ETHUSDT"));
@@ -465,6 +473,8 @@ fn cli_rejects_a_tampered_segment() {
 
     let output = fixture.slice(&fixture.directory.join("slices"), &[]);
     assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("\"event\":\"slicing_failed\""));
 }
 
 #[test]

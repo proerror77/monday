@@ -74,7 +74,9 @@ Recommended first production shape:
   `workload=backtest`, scales from zero to four nodes, and returns to zero after
   jobs finish.
 - One backtest Pod per worker; each Pod processes a batch of parameters.
-- A prebuilt image from `rust_hft/deployment/docker/Dockerfile.research`.
+- A prebuilt runner image from `rust_hft/deployment/docker/Dockerfile.research`.
+- A separate ACK controller image from
+  `deployment/aliyun/research/Dockerfile.campaign-cycle-controller`.
 
 The existing AWS/EKS manifests under `rust_hft/deployment/k8s` are not inputs to
 this deployment.
@@ -181,15 +183,25 @@ entrypoint for one frozen CEX run identity. It does not enumerate OSS, mutate
 old YAML, or compile Rust in-cluster. The Job:
 
 - mounts a read-only raw OSS CSI PVC at `/lake/raw`;
-- mounts a read-only reference OSS CSI PVC at `/lake/reference`;
+- mounts a read-only reference OSS CSI PVC at `/reference/lake/raw`, preserving
+  the canonical `lake/raw/venue=binance_usdm/dataset=reference/...` partition
+  suffix required by the read-only artifact verifier;
 - mounts one stable-lane output OSS CSI PVC at `/lake/output`;
 - loads one frozen inventory file and the repo-owned entrypoint script from
   ConfigMaps;
+- stops after the bounded two-hour production materialization deadline;
 - verifies every declared data and manifest against their frozen SHA-256 values,
   and checks that each `_SUCCESS` marker exists and its content equals the
   frozen data SHA-256;
 - slices only the requested symbol with `binance-market-tape-slicer`;
+- may split that slicing across a native Indexed Job (`--role slice`) and a
+  single-writer reducer (`--role reduce`) that checks every segment is present
+  exactly once and in inventory order before PIT/replay/publish;
 - runs `lob-pit-materializer` and `binance-replay-parquet-materializer`;
+- emits `monday.research_event.v1` process events to stderr while retaining the
+  JSON state/receipt files: shell orchestration uses logfmt and Rust workers use
+  one-line JSON (raw verification, slicing, and PIT segment verification every
+  10 objects; reference verification every 50; row processing every 100,000);
 - re-hashes the four produced Campaign inputs on the mounted output prefix; and
 - writes `receipts/campaign-inputs.json` plus a small receipt.
 
@@ -201,6 +213,27 @@ single source of truth for run-specific object identity:
 
 - `OUTPUT_PREFIX` selects the run-scoped subdirectory under the fixed mounted
   lane root `research/cex-materialization`.
+
+### Research process logs
+
+Follow a running Job with `kubectl logs -f job/JOB_NAME --timestamps`. Every
+line carrying `schema_version=monday.research_event.v1` or the equivalent JSON
+field is a process event, not a completion claim. The event stream covers:
+
+- frozen run/Mission/Campaign identity and input SHA-256 values;
+- raw/reference verification, slicing, PIT feature materialization, and replay
+  Parquet publication with bounded counters;
+- factor hypothesis/formula/verdict, Factor Bank admission, Ridge/CART training,
+  OOS metrics, predictions/positions/ledger identities, and final equity;
+- event replay assumptions, fill/cost metrics, capacity/risk gates, and the
+  selected model or explicit skip reason;
+- result publication/readback, Campaign rounds, termination, and bounded LLM
+  follow-up-plan identity.
+
+The final JSON receipts and immutable SHA readbacks remain authoritative. Logs
+must never contain labels, sealed-holdout contents, raw rows, credentials, or
+signed URLs; a successful log line without its matching receipt/readback is not
+research completion.
 
 The output volume template is
 `k8s/cex-materialization-output-volume.example.yaml`. Keep its PV `path` as a
@@ -238,6 +271,37 @@ kubectl apply -f deployment/aliyun/research/k8s/cex-materialization-job.example.
 kubectl -n monday-research patch job REPLACE_MATERIALIZATION_JOB_NAME \
   --type merge -p '{"spec":{"suspend":false}}'
 ```
+
+`k8s/cex-materialization-job.example.yaml` remains the single-Pod `--role all`
+path and is the `parallelism=1` benchmark. To slice in parallel, use the
+Indexed Job example plus a later reducer; do not introduce Argo or Kubeflow:
+
+```bash
+kubectl apply -f deployment/aliyun/research/k8s/cex-materialization-slice-job.example.yaml
+kubectl -n monday-research patch job REPLACE_MATERIALIZATION_SLICE_JOB_NAME \
+  --type merge -p '{"spec":{"suspend":false}}'
+# After every indexed completion succeeds, submit the reducer.
+kubectl apply -f deployment/aliyun/research/k8s/cex-materialization-reduce-job.example.yaml
+kubectl -n monday-research patch job REPLACE_MATERIALIZATION_REDUCE_JOB_NAME \
+  --type merge -p '{"spec":{"suspend":false}}'
+```
+
+Keep `backoffLimit: 0`. A failed shard or reducer is not retried automatically.
+Campaign execution stays a single Pod; this change only parallelizes
+materialization slicing. Final PIT, replay, receipt publication, and sealed
+holdout remain single-writer.
+
+The Indexed example keeps `completions: 8` as the shard split and starts at
+`parallelism: 1`. The recommended ACK `workload=backtest` pool scales to four
+4-vCPU nodes, and each slice Pod requests 3500m CPU, so time parallelism 1,
+then 2, then 4 on that pool. Parallelism 8 needs the worker-pool maximum raised
+first; pending Pods are not an 8-way result. Inputs and shard outputs share the
+OSS CSI volume; if the bottleneck is OSS I/O, more Pods can be slower.
+Historical CPU/I/O for completed Pods is not retained, so the first cloud run
+is a benchmark, not a claim that CPU was previously wasted. The slice Job reads
+`JOB_COMPLETION_INDEX` from the downward API; Kubernetes args do not expand
+`$(JOB_COMPLETION_INDEX)`. Slice Pods do not mount or require the reference
+PVC.
 
 The Job template starts suspended. Read back the rendered inventory, output PV/PVC
 identities, and mounted lane root first, then unsuspend explicitly.
@@ -373,13 +437,16 @@ input GET + SHA admission
   -> campaign-result.json PUT + GET/SHA readback
 ```
 
-The request schema is `cex-campaign-request-v3`. It separately binds the exact
+The request schema is `cex-campaign-request-v5`. It separately binds the exact
 executor Git revision and image digest plus the input receipt SHA-256, producer
-Git revision, and producer image digest. It also binds the
+Git revision, producer image digest, and validated research-plan content. It also binds the
 feature/materialization/replay objects and SHA-256 values, expected holdout ID,
 campaign-wide `declared_total_trials`, and at least two `rounds`. Each round
 carries a unique `round_id`, a unique seed, and Mission/result PUT and readback
-URLs. It also carries the global
+URLs. Every round also carries one fail-closed identity tuple: the 31-hour data
+fingerprint, the digest-pinned research image, and the exact Git source SHA.
+Changing any member changes the Campaign identity, and a result whose round
+tuple differs from its request is rejected. The request also carries the global
 `holdout-id-sha256=<SHA256(HOLDOUT_ID)>/sealed-holdout-claim.json` URLs and one
 Campaign-result object. All URLs are HTTPS signed URLs for exact objects; PUT
 signatures must cover `Content-Type` and `x-oss-forbid-overwrite:true`.
@@ -394,6 +461,232 @@ input objects and output root are bound:
 alpha-harness mission campaign-id \
   --request /private/path/campaign-request.json
 ```
+
+The first freeze uses the built-in canonical research plan. After an immutable
+`campaign-result.json` ends with `campaign_no_candidate`, a trusted external
+control-plane process may create one parent-bound follow-up plan:
+
+```bash
+alpha-harness mission campaign-learn \
+  --request /private/path/campaign-request.json \
+  --result /private/path/campaign-result.json \
+  --result-sha256 REPLACE_EXACT_RESULT_SHA256 \
+  --output /private/path/next-research-plan.json
+
+alpha-harness mission campaign-freeze \
+  ... \
+  --research-plan /private/path/next-research-plan.json
+```
+
+The Campaign result schema is `cex-campaign-result-v8`. It carries bounded,
+structured continuous-factor screening, Ridge/CART OOS metrics, selected-model
+identity, cost-aware L2 replay feedback, the deterministic failure class, and
+the exact learning-directive/search-policy revision lineage for each round.
+Failure classification reads the selected model evaluation recorded by the
+selection artifact; it never reselects Ridge/CART/Burn by score during learn.
+Thus a selected candidate with fills and `capacity_breached=true` is
+`overtrade_capacity`, even when an unselected zero-trade candidate has a higher
+score. `no_trades_after_costs` admits only the registered prediction-identity mapping;
+`overtrade_capacity` and `positive_ic_negative_net` admit only the registered
+hysteretic cost-aware mapping.
+The feature set, evaluator, fees, validation, budgets, holdout, and model kinds
+remain frozen. The LLM supplies only the falsifiable hypothesis text and cannot
+change the pinned policy revision, Kubernetes, risk, or execution authority.
+Each follow-up records its parent's feature-fields and actual factor-signature
+digest. If a child produces the same evidence signature, `campaign-learn`
+returns typed `no_improvement`; the controller publishes that report and ends
+the cycle immediately, regardless of unused `max-follow-ups`. The output is
+create-once, limited to three follow-up generations, and its
+content hash changes the child Campaign identity. The Campaign execution Job
+still receives no LLM credentials. Only the separate ACK controller Job may
+receive the research-learning Secret used by `campaign-learn`; the existing
+dispatcher is still the only path that creates the next suspended execution
+Job.
+
+`scripts/campaign-cycle-controller.sh` separates the local control plane from
+ACK data-plane readback. A workstation may run only `start`, `status`, or
+`approve`. `start` freezes, signs, finalizes, and dispatches one approved
+generation, then prints `k8s/campaign-cycle-controller-job.example.yaml` to
+stdout for review. It does not wait for the Campaign Job, enter
+`oss_result_readback`, run `campaign-learn`, or copy any `results.zip` object.
+`approve` performs the same bounded preparation for one learned child
+generation and prints a fresh ACK Job handoff. Applying either printed Job is a
+separate operator action; the controller does not apply it.
+
+The ACR publication workflow publishes `campaign-cycle-controller` alongside
+`research-runner` from the same authenticated research binary artifact. Pin the
+controller Job to that image's digest and verify its
+`org.opencontainers.image.revision` label before applying the Job.
+
+The signer remains a separate trust boundary and receives the frozen signing
+plan. The controller never logs signed URLs. Its mode-0700 work directory is
+input-bound and resumable across these explicit handoffs. Signed
+request/submission files are removed once that generation is processed. Keep
+the control checkpoint on the campaign-root-backed volume used by the ACK Job,
+not below laptop `/tmp/monday-cex-e2e*`. For example:
+
+```bash
+deployment/aliyun/research/scripts/campaign-cycle-controller.sh start \
+  --campaign-inputs /campaign-root/inputs/campaign-inputs.json \
+  --input-root /campaign-root/inputs \
+  --source-revision REPLACE_EXACT_GIT_SHA \
+  --image registry/research-runner@sha256:REPLACE_DIGEST \
+  --campaign-root https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/campaigns \
+  --signer /private/bin/monday-campaign-oss-signer \
+  --work-dir /campaign-root/cycles/REPLACE_RUN_ID \
+  --seed 7 --seed 11
+```
+
+The first start persists every non-secret cycle input in the private work
+directory. Inspect that exact cycle, or approve a child after the ACK readback
+Job has written its bounded learning plan, without reconstructing those
+arguments:
+
+```bash
+deployment/aliyun/research/scripts/campaign-cycle-controller.sh status \
+  --work-dir /campaign-root/cycles/REPLACE_RUN_ID
+
+deployment/aliyun/research/scripts/campaign-cycle-controller.sh approve \
+  --work-dir /campaign-root/cycles/REPLACE_RUN_ID \
+  --signer /private/bin/monday-campaign-oss-signer
+```
+
+`status` reports the local checkpoint and next controller stage; it does not
+claim live Kubernetes state. `approve` revalidates the persisted input binding
+before it signs or dispatches the next Campaign identity. The signer must be
+supplied again so a restarted controller cannot cross that trust boundary
+implicitly.
+
+The printed ACK Job runs `ack-readback` from
+`/campaign-root/cycles/REPLACE_CYCLE_ID`. Its campaign-root PVC must be bound to
+the Tokyo internal OSS campaign prefix, following the retained OSS CSI pattern
+in `k8s/cex-materialization-output-volume.example.yaml`; it must not point to a
+laptop path. Do not reuse `k8s/alpha-mission-job.example.yaml`: that Job remains
+the tokenless `campaign-execute` shape, while the controller Job has a distinct
+image and narrow readback ServiceAccount. On ACK, the controller waits for the
+already-approved Campaign Job, reads the exact Job and Pod provenance, deletes
+only that Job's exact `<job-name>-inputs` Secret, and performs every OSS GET with
+`oss-ap-northeast-1-internal.aliyuncs.com`. It verifies the Campaign result,
+each Mission, and each `results.zip` SHA-256 before running `campaign-learn`.
+The operator replaces `REPLACE_CAMPAIGN_POD_NAME` after that Pod exists; RBAC
+then permits `get` only for that exact Pod, not namespace-wide Pod listing.
+The controller writes the create-once learn report and, only for `follow_up`,
+the next research plan beneath the Campaign root in OSS, then reads each back
+through `oss-ap-northeast-1-internal.aliyuncs.com` and checks SHA-256. The
+downloaded evidence and learn artifacts remain on the campaign-root OSS volume.
+The Pod's research-only RAM identity must be limited to GET on that Campaign
+prefix and create-only PUT on its `learning/` prefix; do not mount exchange or
+trading credentials. These artifacts are never copied to Mac `/tmp`.
+
+Darwin is fail-closed inside `oss_readback`: any attempt to run the ACK
+readback mode on macOS exits non-zero before creating a partial destination or
+any `round-*-results.zip`. `start`, `status`, and `approve` therefore remain
+local control-plane operations only. The ACK Job uses the namespace-scoped
+ServiceAccount and Role in
+`k8s/campaign-cycle-controller-rbac.example.yaml`: exact Job read/watch, exact
+Job-owned Pod read, and deletion of one exact `*-inputs` Secret.
+It has no create/patch authority, cluster-wide authority, exchange credential,
+order, risk-limit, or runtime-resume access. After a negative generation, the
+ACK Job stops at `approval_handoff`; a workstation may inspect `status` and
+explicitly approve the next bounded generation.
+
+### Recovery checkpoints
+
+The controller commits a `learning-checkpoint.json` before publishing a learn
+artifact. It binds the finalized request and parent result SHA to the exact
+learn-report and next-plan file hashes. Retries validate and reuse those bytes;
+they do not rerun the learner after that checkpoint. A learner interrupted
+after writing its plan but before completing its report may be called again to
+recover the existing plan. Execution diagnostics such as `reused_existing`
+therefore cannot change an already checkpointed, published report.
+
+`generation-complete` is a versioned JSON completion record, not an empty
+marker. It binds the generation report, learning checkpoint and exact approved
+Pod name, and carries either an approval handoff or the complete cycle result.
+The controller validates this record before deleting request/submission files.
+The local `cycle-result.json` summary is derived from that record and can be
+rebuilt if interruption occurs before the summary is written. `status`
+validates completion evidence instead of trusting the summary cache. Repeating
+an ACK readback for a completed parent returns its handoff without reading or
+starting an already-dispatched child. Signing and dispatching the next
+generation still require a separate workstation approval.
+
+| Checkpoint | Recovery action |
+| --- | --- |
+| Plan exists; no learning checkpoint | Revalidate/reuse the plan through `campaign-learn`, then commit the first complete report |
+| Learning checkpoint exists | Verify request/result binding and file hashes; retry immutable publication/readback using identical bytes |
+| Follow-up completion exists | Validate committed evidence, finish sensitive-file cleanup, and return the approval handoff for that Pod |
+| Terminal completion exists | Validate evidence, reconstruct the cycle summary if needed, and finish cleanup |
+| Corrupt or unsupported checkpoint | Stop without overwriting evidence or deleting the request needed for inspection |
+
+Empty completion markers from older controllers are not accepted by this
+format. Keep existing completed research evidence unchanged; use a fresh cycle
+for new acceptance, and require a separately reviewed migration before resuming
+an older checkpoint. Never reinterpret an empty marker as a verified commit.
+
+The existing controller contract test covers learning/report interruption,
+lost PUT responses, interruption after completion commit and request removal,
+summary-write failure, bounded/no-improvement stops, late parent retries, and
+local/remote evidence corruption. These tests prove process-interruption
+recovery against the test filesystem and fake external ports. They do not
+establish storage durability under node power loss, atomic rename on OSS CSI,
+or multi-writer fencing. The persistent storage and single-owner contract must
+be verified separately before a continuously running controller takes over.
+
+### Campaign acceptance and memory regression
+
+Keep source delivery, image publication, materialization, and learning lineage
+as separate evidence. The 2026-09-04 31-hour run at source
+`1f108dcf160cdc84d2339a2d437d2610fd3abafe` is the baseline: the handoff records
+308/308 segments with no duplicates or reordering, successful ACK Jobs/Pods,
+and independent image/result readback. Its `cex-campaign-result-v8` object is
+`cex-campaign-fbe0758949d0d9fd8f9372d2408ef693`, SHA-256
+`3c625bfe355f3a0d166804f23d0130c8549daa1e0618fa603779c14346a23140`, with
+`campaign_no_candidate`. The result checksum and the persisted
+`max_follow_ups=0` input were rechecked during the 2026-09-05 handoff. This proves
+the bounded research evidence inner loop; it does not prove a cloud learning
+follow-up, seven-day coverage, generalization, or profitability.
+
+The original reducer was OOM-killed at 12 GiB while starting PIT feature rows.
+It retained all seven verified series of full depth events while accumulating
+trades and feature rows. PR #1097 consumes those series in their original order,
+releasing each full event payload after replay. A prior 28 GiB run succeeded,
+but its peak was not measured; 28 GiB is not an established memory requirement.
+PR #1098 supplies the separate controller image, its handoff template, and CI
+and publication probes using the same verified binary artifact as the runner.
+Its image smoke exposed a template-permission defect: `COPY --chmod=0644`
+created the destination `k8s` directory without search permission. The image
+explicitly sets that directory to `0755` while retaining `0644` on the YAML;
+the non-root template-readability probe is required in both CI and publication.
+Passing these probes establishes packaging, not a completed ACK learning loop.
+
+Run the remaining acceptance stages serially:
+
+1. Publish the merged source's `research-runner` and `campaign-cycle-controller`.
+   Independently read both immutable digests and OCI revision labels; require
+   both revisions to equal the selected source SHA and verify `linux/amd64`.
+2. Reuse the exact frozen 31-hour inventory in a new output namespace with the
+   reducer limited to 12 GiB and `backoffLimit=0`. Record its Job/Pod/imageID,
+   limit, terminal status, OOM events, and observed memory peak (including the
+   measurement method). Require 308/308 ordered, unique segments and independent
+   output checksum readback. A sampled memory maximum is only a lower bound on
+   the true peak. A successful Job at 12 GiB proves that run fits the limit.
+3. Verify the campaign-root PVC and exact-generation SA/Role/RoleBinding before
+   applying the controller handoff. Record the actual worker capacity; Job
+   `parallelism` does not create nodes or guarantee effective concurrency.
+4. Start one cycle with `--max-follow-ups 1`. After the parent finishes, let ACK
+   read back its result and publish the learn report. At `approval_handoff`,
+   inspect the parent-result SHA, directive SHA, policy revision, and child plan
+   before `approve` signs and dispatches the single child. Read back the child
+   Job/Pod/imageID, terminal result and all lineage hashes. A typed
+   `no_improvement` ends the cycle; it is not proof that a child ran.
+
+Stop on failed provenance, incomplete materialization, OOM, failed immutable
+readback, or a conflicting writer. Keep all generations serial and pre-holdout;
+do not open sealed holdout or enable Paper/Shadow/Live. Do not change models,
+fees, Gate, risk, or paused execution. PIT and canonical replay currently
+verify/replay the same inventory separately; eliminating that repeated work is
+a later optimization, not part of the memory-lifetime fix.
 
 Wrap the final request with `attempt_id` and the exact digest-pinned `image` in
 the private submission file, then submit it directly:
@@ -413,14 +706,19 @@ exchange account file, API key, or order/execution entrypoint. Each round
 records `results/mission-admission.json`, which binds the current request SHA
 and the round's Mission SHA alongside the campaign and round IDs.
 
-One Campaign maps to multiple rounds. The fixed v4 factor plan uses 8 snapshot
-L2 terminals, 16 atomic candidates, 32 trials per round, the six-hour protocol
+One Campaign maps to multiple rounds. The canonical factor plan and every
+bounded policy follow-up retain all 9 L2/aggregate-trade terminals and 22
+candidate slots. The request derives the total trial limit from the exact plan
+and round count. Both use the six-hour protocol
 `7200 + 3*(3600+1) + 5 + 3600 = 21608`, and the `$1000 / Top5 5%` capacity
-screen. GP and subset MCTS already provide the bounded search iterations. A
-negative Campaign produces no holdout claim. A selected round may finalize once
-against the global holdout claim, but there is no second holdout winner and no
-second finalization pass. A claim without a complete sealed receipt/result is
-terminal and inconclusive, not retry authority.
+screen. A v4 Campaign counts its governed factor attempts plus the three
+supervised models (Ridge, CART, Burn MLP);
+it does not run subset MCTS. A negative Campaign produces no holdout claim and
+feeds its typed model/replay failures to the bounded external learning step. A
+selected v4 round remains pre-holdout and has no deployment or order authority.
+The legacy formula lane alone may finalize once against the global holdout
+claim; a claim without a complete sealed receipt/result is terminal and
+inconclusive, not retry authority.
 
 Job completion alone is not research completion. Require the exact image ID,
 terminal Job/Pod state, Mission readback SHA, result readback SHA, and Campaign

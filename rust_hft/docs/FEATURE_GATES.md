@@ -78,17 +78,6 @@ cargo run -p hft-replay --features "mock,clickhouse"
   - Gauges：`hft_engine_*`（cycle_count、exec_events_processed、orders_* 当前快照）
 - 文档即代码：新增特性务必在本文件补充说明与示例
 
-## 新增：Lighter DEX（行情）
-
-- 适配器特性：`adapter-lighter-data`（公有 WS 行情 `/stream`）
-- 便捷聚合：`lighter` 仅包含行情（执行集成需接入官方 signer 库，后续提供）
-
-示例：
-
-```bash
-cargo run -p hft-paper --features "lighter"
-```
-
 ## 后续计划（提案）
 
 - 添加 `profile-live`、`profile-paper`、`profile-replay` 三个场景特性，封装稳定组合，进一步简化特性矩阵

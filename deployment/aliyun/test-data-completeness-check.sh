@@ -42,7 +42,7 @@ BUCKET=monday-lob-apne1-1045353359
 FAKE_SHA=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 
 P_SPOT='lake/raw/venue=binance/market=spot/dataset=spot_all/shard=all'
-P_USDM='lake/raw/venue=binance/market=usdm/dataset=usdm_perpetual_top100_lob/shard=all'
+P_USDM='lake/raw/venue=binance/market=usdm/dataset=usdm_perpetual_top100_lob_trade/shard=all'
 P_BYBIT='lake/raw/venue=bybit/market=option/dataset=options_quotes'
 P_POLY='lake/raw/venue=polymarket/dataset=crypto_expiry'
 P_REF='lake/raw/venue=binance_usdm/dataset=reference'
@@ -222,6 +222,18 @@ expect 'complete lake: reference listed with -d (batch-partitioned)' \
   "$(grep -q 'dataset=reference.* -d ' "$call_log" && echo 0 || echo 1)"
 expect 'complete lake: reference not listed recursively' \
   "$(! grep -q 'dataset=reference.*--recursive' "$call_log" && echo 0 || echo 1)"
+
+# --- scenario: in-flight triplets stay inside the hour grace ----------------
+reset_env
+reset_lake
+make_complete_lake
+make_triplet "$P_SPOT" 2026-08-15 10 "segment-current.jsonl.zst"
+rm "$fake_oss/$P_SPOT/date=2026-08-15/hour=10/segment-current.jsonl.zst._SUCCESS"
+rm "$fake_oss/$P_SPOT/date=2026-08-15/hour=09/segment-2026-08-15-09.jsonl.zst.manifest.json"
+run_check --json
+expect 'in-flight triplets: exit 0' "$(rc_is 0 && echo 0 || echo 1)"
+expect 'in-flight triplets: current and in-grace violations excluded' \
+  "$(json_query '.datasets["binance-spot"].triplet_violations == []' && echo 0 || echo 1)"
 
 # --- scenario: missing hour partition ---------------------------------------
 reset_env

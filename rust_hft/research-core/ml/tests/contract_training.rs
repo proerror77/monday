@@ -145,6 +145,34 @@ fn independent_training_runs_have_the_same_semantic_digests() {
 }
 
 #[test]
+fn concurrent_training_runs_share_one_backend_without_digest_drift() {
+    let rows_artifact = std::sync::Arc::new(serde_json::to_vec(&training_rows()).unwrap());
+    let (_, _, sealed) = sealed_request(rows_artifact.as_slice());
+    let sealed = std::sync::Arc::new(sealed);
+    let joins = (0..8)
+        .map(|_| {
+            let rows_artifact = rows_artifact.clone();
+            let sealed = sealed.clone();
+            std::thread::spawn(move || {
+                let trained =
+                    train_contract_model(rows_artifact.as_slice(), sealed.as_ref()).unwrap();
+                (
+                    trained.diagnostics().semantic_model_sha256.clone(),
+                    trained.predict(&[0.25]).unwrap().to_bits(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = joins
+        .into_iter()
+        .map(|join| join.join().expect("training thread"))
+        .collect::<Vec<_>>();
+    for result in &results[1..] {
+        assert_eq!(result, &results[0]);
+    }
+}
+
+#[test]
 fn fit_diagnostics_have_no_promotion_capability() {
     let rows_artifact = serde_json::to_vec(&training_rows()).unwrap();
     let (_, _, sealed) = sealed_request(&rows_artifact);

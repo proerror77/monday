@@ -1,16 +1,16 @@
 //! Validation and fail-closed OSS upload for closed Polymarket raw tapes.
 
 use crate::lob_archiver::{command_status_with_timeout, sha256_file, write_success_marker};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, NaiveDateTime, TimeDelta, Utc};
 use polymarket_tape_contract::{
-    complete_market_tape_manifest_shape, tape_seal_path, PolymarketTapeSeal, TapeFileIdentity,
-    POLYMARKET_TAPE_SEAL_SCHEMA,
+    POLYMARKET_TAPE_SEAL_SCHEMA, PolymarketTapeSeal, TapeFileIdentity,
+    complete_market_tape_manifest_shape, tape_seal_path,
 };
 use rand::random;
 use rust_decimal::Decimal;
 use serde::Serialize;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
@@ -19,10 +19,10 @@ use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 pub(crate) const TRADE_COMPLETION_KIND: &str = "polymarket_trade_collection_complete";
 pub(crate) const TRADE_COMPLETION_BASIS: &str =
@@ -2751,6 +2751,9 @@ fn ensure_upload_staging_root(path: &Path) -> Result<()> {
 // Tails longer than this window are indistinguishable from mid-tape
 // corruption and refuse repair instead.
 const TORN_TAIL_REPAIR_WINDOW_BYTES: u64 = 1024 * 1024;
+const EMPTY_TAPE_QUARANTINE_DIR: &str = "quarantined-empty-tapes";
+const EMPTY_TAPE_QUARANTINE_LOG: &str = "quarantined-empty-tapes.log";
+static EMPTY_TAPE_AUDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn complete_line_count(file: &File) -> Result<usize> {
     let mut reader = BufReader::new(file);
@@ -2790,6 +2793,52 @@ fn audit_torn_tail_repair(
     file.write_all(b"\n")?;
     file.sync_all()?;
     Ok(())
+}
+
+fn quarantine_empty_tape(source: &Path) -> Result<Option<PathBuf>> {
+    let identity = regular_identity(source)?;
+    if identity.bytes != 0 {
+        return Ok(None);
+    }
+    let spool_dir = source
+        .parent()
+        .ok_or_else(|| anyhow!("source has no parent"))?;
+    let quarantine_root = spool_dir.join(EMPTY_TAPE_QUARANTINE_DIR);
+    ensure_upload_staging_root(&quarantine_root)?;
+    let name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("tape file name is not UTF-8"))?;
+    let quarantine = loop {
+        let candidate = quarantine_root.join(format!("{name}.empty.{:016x}", random::<u64>()));
+        if !candidate.exists() {
+            break candidate;
+        }
+    };
+    ensure_identity(source, identity)?;
+    fs::rename(source, &quarantine)?;
+    File::open(&quarantine_root)?.sync_all()?;
+    File::open(spool_dir)?.sync_all()?;
+    let record = json!({
+        "quarantined_at": utc_now(),
+        "source": name,
+        "quarantine": quarantine.file_name().and_then(|value| value.to_str()),
+        "bytes": identity.bytes,
+        "reason": "empty_closed_tape",
+    });
+    eprintln!("Polymarket empty closed tape quarantined: {record}");
+    let _audit_guard = EMPTY_TAPE_AUDIT_LOCK
+        .lock()
+        .map_err(|_| anyhow!("empty tape quarantine audit lock poisoned"))?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(spool_dir.join(EMPTY_TAPE_QUARANTINE_LOG))?;
+    serde_json::to_writer(&mut file, &record)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    File::open(spool_dir)?.sync_all()?;
+    Ok(Some(quarantine))
 }
 
 /// Truncate the unterminated final record of a closed tape, returning the
@@ -2838,6 +2887,9 @@ fn repair_torn_tail(source: &Path) -> Result<Option<u64>> {
 
 fn archive_source(source: &Path, config: &UploadConfig) -> Result<Vec<UploadedSegment>> {
     let _archive_activity = ArchiveActivity::enter();
+    if let Some(quarantine) = quarantine_empty_tape(source)? {
+        bail!("empty closed tape quarantined at {}", quarantine.display());
+    }
     // Only rotated (closed) tapes reach this path via discover_rotated_tapes;
     // the active tape keeps its in-progress tail untouched.
     repair_torn_tail(source)?;
@@ -2935,6 +2987,33 @@ pub(crate) fn read_status(path: &Path) -> Result<Map<String, Value>> {
     }
 }
 
+fn read_polymarket_status(path: &Path) -> Result<Map<String, Value>> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Map::new()),
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            let value: Value = serde_json::from_slice(&fs::read(path)?)
+                .with_context(|| format!("upload status {} is not valid JSON", path.display()))?;
+            let status = value
+                .as_object()
+                .cloned()
+                .ok_or_else(|| anyhow!("upload status {} must be a JSON object", path.display()))?;
+            upload_status_failure_count(&status)?;
+            Ok(status)
+        }
+        Ok(_) => bail!("upload status must be a regular non-symlink file"),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn upload_status_failure_count(status: &Map<String, Value>) -> Result<u64> {
+    match status.get("failure_count") {
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| anyhow!("upload status failure_count must be a nonnegative integer")),
+        None => Ok(0),
+    }
+}
+
 /// Upload all closed tapes, continuing past bad segments while returning failure.
 pub fn upload_pending(config: &UploadConfig) -> Result<UploadSummary> {
     upload_pending_with(config, archive_source)
@@ -2955,53 +3034,124 @@ where
 {
     config.validate()?;
     ensure_canonical_directory(&config.spool_dir)?;
-    let mut status = read_status(&config.spool_dir.join("upload-status.json"))?;
+    let mut status = read_polymarket_status(&config.spool_dir.join("upload-status.json"))?;
+    let prior_failure_count = upload_status_failure_count(&status)?;
     let archive = Arc::new(archive);
-    let semaphore = Arc::new(Semaphore::new(config.max_concurrent_uploads));
     let mut failures = Vec::new();
     let mut uploaded_segments = 0_usize;
     let mut canonical_uploaded_segments = 0_usize;
     // Fail closed before any zstd/ossutil child or staging temp file exists.
     if !record_low_disk_failures(config, &mut failures)? {
         let sources = discover_rotated_tapes(&config.spool_dir)?;
-        let mut tasks = Vec::with_capacity(sources.len());
+        let mut tasks = JoinSet::new();
         for source in sources {
-            let permit = semaphore.clone().acquire_owned().await?;
             let archive = archive.clone();
-            let config = config.clone();
+            let task_config = config.clone();
             let task_source = source.clone();
-            let task = tokio::task::spawn_blocking(move || {
-                let result = archive(&task_source, &config);
-                drop(permit);
-                result
+            tasks.spawn_blocking(move || {
+                let result = archive(&task_source, &task_config);
+                (task_source, result)
             });
-            tasks.push((source, task));
-        }
-
-        for (source, task) in tasks {
-            match task.await {
-                Ok(result) => record_upload_result(
-                    &source,
+            if tasks.len() >= config.max_concurrent_uploads {
+                let (task_source, result) = wait_for_async_upload(&mut tasks).await?;
+                record_upload_result(
+                    &task_source,
                     result,
                     &mut status,
                     &mut failures,
                     &mut uploaded_segments,
                     &mut canonical_uploaded_segments,
-                ),
-                Err(error) => failures.push(json!({
-                    "source": source.file_name().and_then(|name| name.to_str()),
-                    "error": format!("async upload task failed: {error}"),
-                })),
+                );
+                if let Err(error) = write_upload_status(
+                    &config.spool_dir,
+                    &mut status,
+                    prior_failure_count,
+                    &failures,
+                    uploaded_segments,
+                    canonical_uploaded_segments,
+                ) {
+                    drain_async_uploads(
+                        &mut tasks,
+                        &mut status,
+                        &mut failures,
+                        &mut uploaded_segments,
+                        &mut canonical_uploaded_segments,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            }
+        }
+
+        while !tasks.is_empty() {
+            let (task_source, result) = wait_for_async_upload(&mut tasks).await?;
+            record_upload_result(
+                &task_source,
+                result,
+                &mut status,
+                &mut failures,
+                &mut uploaded_segments,
+                &mut canonical_uploaded_segments,
+            );
+            if let Err(error) = write_upload_status(
+                &config.spool_dir,
+                &mut status,
+                prior_failure_count,
+                &failures,
+                uploaded_segments,
+                canonical_uploaded_segments,
+            ) {
+                drain_async_uploads(
+                    &mut tasks,
+                    &mut status,
+                    &mut failures,
+                    &mut uploaded_segments,
+                    &mut canonical_uploaded_segments,
+                )
+                .await?;
+                return Err(error);
             }
         }
     }
     finalize_upload_status(
         &config.spool_dir,
         status,
+        prior_failure_count,
         failures,
         uploaded_segments,
         canonical_uploaded_segments,
     )
+}
+
+async fn wait_for_async_upload(
+    tasks: &mut JoinSet<(PathBuf, Result<Vec<UploadedSegment>>)>,
+) -> Result<(PathBuf, Result<Vec<UploadedSegment>>)> {
+    tasks
+        .join_next()
+        .await
+        .ok_or_else(|| anyhow!("async upload task set unexpectedly empty"))?
+        .map_err(|error| anyhow!("async upload task failed: {error}"))
+}
+
+async fn drain_async_uploads(
+    tasks: &mut JoinSet<(PathBuf, Result<Vec<UploadedSegment>>)>,
+    status: &mut Map<String, Value>,
+    failures: &mut Vec<Value>,
+    uploaded_segments: &mut usize,
+    canonical_uploaded_segments: &mut usize,
+) -> Result<()> {
+    while !tasks.is_empty() {
+        let (source, result) = wait_for_async_upload(tasks).await?;
+        record_upload_result(
+            &source,
+            result,
+            status,
+            failures,
+            uploaded_segments,
+            canonical_uploaded_segments,
+        );
+    }
+    Ok(())
 }
 
 fn record_upload_result(
@@ -3045,40 +3195,18 @@ fn record_upload_result(
 fn finalize_upload_status(
     spool_dir: &Path,
     mut status: Map<String, Value>,
+    prior_failure_count: u64,
     failures: Vec<Value>,
     uploaded_segments: usize,
     canonical_uploaded_segments: usize,
 ) -> Result<UploadSummary> {
-    let now = utc_now();
-    let pending = discover_rotated_tapes(spool_dir)?.len();
-    status.insert("updated_at".to_owned(), json!(now));
-    status.insert("uploaded_segments".to_owned(), json!(uploaded_segments));
-    status.insert(
-        "canonical_uploaded_segments".to_owned(),
-        json!(canonical_uploaded_segments),
-    );
-    status.insert("pending_segments".to_owned(), json!(pending));
-    status.insert("failed_segments".to_owned(), Value::Array(failures.clone()));
-    status.insert("failure_count".to_owned(), json!(failures.len()));
-    status.insert(
-        "last_error_at".to_owned(),
-        if failures.is_empty() {
-            Value::Null
-        } else {
-            json!(utc_now())
-        },
-    );
-    status.insert(
-        "last_error".to_owned(),
-        failures
-            .last()
-            .and_then(|failure| failure.get("error"))
-            .cloned()
-            .unwrap_or(Value::Null),
-    );
-    atomic_json(
-        &spool_dir.join("upload-status.json"),
-        &Value::Object(status),
+    write_upload_status(
+        spool_dir,
+        &mut status,
+        prior_failure_count,
+        &failures,
+        uploaded_segments,
+        canonical_uploaded_segments,
     )?;
     if failures.is_empty() {
         Ok(UploadSummary {
@@ -3099,7 +3227,8 @@ where
 {
     config.validate()?;
     ensure_canonical_directory(&config.spool_dir)?;
-    let mut status = read_status(&config.spool_dir.join("upload-status.json"))?;
+    let mut status = read_polymarket_status(&config.spool_dir.join("upload-status.json"))?;
+    let prior_failure_count = upload_status_failure_count(&status)?;
     let mut failures = Vec::new();
     let mut uploaded_segments = 0_usize;
     let mut canonical_uploaded_segments = 0_usize;
@@ -3120,9 +3249,59 @@ where
     finalize_upload_status(
         &config.spool_dir,
         status,
+        prior_failure_count,
         failures,
         uploaded_segments,
         canonical_uploaded_segments,
+    )
+}
+
+fn write_upload_status(
+    spool_dir: &Path,
+    status: &mut Map<String, Value>,
+    prior_failure_count: u64,
+    failures: &[Value],
+    uploaded_segments: usize,
+    canonical_uploaded_segments: usize,
+) -> Result<()> {
+    let now = utc_now();
+    status.insert("updated_at".to_owned(), json!(now));
+    status.insert("uploaded_segments".to_owned(), json!(uploaded_segments));
+    status.insert(
+        "canonical_uploaded_segments".to_owned(),
+        json!(canonical_uploaded_segments),
+    );
+    status.insert(
+        "pending_segments".to_owned(),
+        json!(discover_rotated_tapes(spool_dir)?.len()),
+    );
+    status.insert(
+        "failed_segments".to_owned(),
+        Value::Array(failures.to_vec()),
+    );
+    status.insert(
+        "failure_count".to_owned(),
+        json!(prior_failure_count.saturating_add(failures.len() as u64)),
+    );
+    status.insert(
+        "last_error_at".to_owned(),
+        if failures.is_empty() {
+            Value::Null
+        } else {
+            json!(utc_now())
+        },
+    );
+    status.insert(
+        "last_error".to_owned(),
+        failures
+            .last()
+            .and_then(|failure| failure.get("error"))
+            .cloned()
+            .unwrap_or(Value::Null),
+    );
+    atomic_json(
+        &spool_dir.join("upload-status.json"),
+        &Value::Object(status.clone()),
     )
 }
 
@@ -3131,6 +3310,7 @@ mod tests {
     use super::*;
     use polymarket_tape_contract::MarketTapeManifestBuilder;
     use serde_json::json;
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::fs::symlink;
     use std::process::ExitStatus;
 
@@ -3480,9 +3660,7 @@ mod tests {
 
         let root = TestDir::new();
         let root_path = root.path().to_path_buf();
-        let fixture = root
-            .path()
-            .join("market-updates.20260715T020000.ndjson");
+        let fixture = root.path().join("market-updates.20260715T020000.ndjson");
         let validation_time = DateTime::parse_from_rfc3339("2026-07-15T01:59:59Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -3610,17 +3788,21 @@ mod tests {
         let root = TestDir::new();
         let mut config = config(root.path());
         config.max_concurrent_uploads = 0;
-        assert!(config
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("max concurrent uploads must be between 1 and 4"));
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("max concurrent uploads must be between 1 and 4")
+        );
         config.max_concurrent_uploads = MAX_CONCURRENT_UPLOADS + 1;
-        assert!(config
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("max concurrent uploads must be between 1 and 4"));
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("max concurrent uploads must be between 1 and 4")
+        );
     }
 
     #[test]
@@ -3694,18 +3876,22 @@ mod tests {
         let root = TestDir::new();
         let mut config = config(root.path());
         config.oss_parallel = 0;
-        assert!(config
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("oss parallel must be at least 1"));
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("oss parallel must be at least 1")
+        );
         config.oss_parallel = 8;
         config.oss_part_size = " ".to_owned();
-        assert!(config
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("oss part size must be non-empty"));
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("oss part size must be non-empty")
+        );
     }
 
     #[test]
@@ -3838,9 +4024,11 @@ mod tests {
         );
 
         let error = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("collection_result does not match incomplete"));
+        assert!(
+            error
+                .to_string()
+                .contains("collection_result does not match incomplete")
+        );
     }
 
     #[test]
@@ -4064,9 +4252,11 @@ mod tests {
 
         let error = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("quote collection failure requires explicit status"));
+        assert!(
+            error
+                .to_string()
+                .contains("quote collection failure requires explicit status")
+        );
     }
 
     #[test]
@@ -4090,9 +4280,11 @@ mod tests {
 
         let error = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("unsupported quote collection error_kind"));
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported quote collection error_kind")
+        );
     }
 
     #[test]
@@ -4116,9 +4308,11 @@ mod tests {
 
         let error = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("invalid quote collection http_status"));
+        assert!(
+            error
+                .to_string()
+                .contains("invalid quote collection http_status")
+        );
     }
 
     #[test]
@@ -4188,9 +4382,11 @@ mod tests {
 
         let error = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("quote source time moved backwards by 60000ms"));
+        assert!(
+            error
+                .to_string()
+                .contains("quote source time moved backwards by 60000ms")
+        );
     }
 
     #[test]
@@ -4673,33 +4869,41 @@ mod tests {
         let mut rows = sample_rows();
         rows[1]["sequence"] = json!(2);
         let gap = write_tape(root.path(), "market-updates.20260715T010000.ndjson", &rows);
-        assert!(scan_tape(&gap, "crypto_expiry", 1, 1_000)
-            .unwrap_err()
-            .to_string()
-            .contains("sequence gap"));
+        assert!(
+            scan_tape(&gap, "crypto_expiry", 1, 1_000)
+                .unwrap_err()
+                .to_string()
+                .contains("sequence gap")
+        );
 
         let incomplete = root.path().join("market-updates.20260715T020000.ndjson");
         fs::write(&incomplete, b"{\"sequence\":0").unwrap();
-        assert!(scan_tape(&incomplete, "crypto_expiry", 1, 1_000)
-            .unwrap_err()
-            .to_string()
-            .contains("incomplete record"));
+        assert!(
+            scan_tape(&incomplete, "crypto_expiry", 1, 1_000)
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete record")
+        );
 
         let mut rows = sample_rows();
         rows[1]["update"]["bid"] = json!("not-a-number");
         let numeric = write_tape(root.path(), "market-updates.20260715T030000.ndjson", &rows);
-        assert!(scan_tape(&numeric, "crypto_expiry", 1, 1_000)
-            .unwrap_err()
-            .to_string()
-            .contains("bid must be numeric"));
+        assert!(
+            scan_tape(&numeric, "crypto_expiry", 1, 1_000)
+                .unwrap_err()
+                .to_string()
+                .contains("bid must be numeric")
+        );
 
         let mut rows = sample_rows();
         rows[1]["update"]["bid_levels"][0]["size"] = Value::Null;
         let depth = write_tape(root.path(), "market-updates.20260715T040000.ndjson", &rows);
-        assert!(scan_tape(&depth, "crypto_expiry", 1, 1_000)
-            .unwrap_err()
-            .to_string()
-            .contains("requires price and size"));
+        assert!(
+            scan_tape(&depth, "crypto_expiry", 1, 1_000)
+                .unwrap_err()
+                .to_string()
+                .contains("requires price and size")
+        );
     }
 
     fn write_torn_tape(root: &Path, name: &str, rows: &[Value], tail: &[u8]) -> PathBuf {
@@ -4722,19 +4926,18 @@ mod tests {
         let torn_bytes = fs::metadata(&tape).unwrap().len();
         // The pre-repair failure mode from #919: the scan rejects the closed
         // segment and the segment stalls the upload queue on every pass.
-        assert!(scan_tape(&tape, "crypto_expiry", 1, 1_000)
-            .unwrap_err()
-            .to_string()
-            .contains("incomplete record"));
+        assert!(
+            scan_tape(&tape, "crypto_expiry", 1, 1_000)
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete record")
+        );
 
         let truncated = repair_torn_tail(&tape)
             .unwrap()
             .expect("torn tail must be repaired");
 
-        assert_eq!(
-            truncated,
-            torn_bytes - fs::metadata(&tape).unwrap().len()
-        );
+        assert_eq!(truncated, torn_bytes - fs::metadata(&tape).unwrap().len());
         scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap();
         let audit: Value = serde_json::from_str(
             fs::read_to_string(root.path().join("repaired-tape-tails.log"))
@@ -4745,10 +4948,7 @@ mod tests {
         assert_eq!(audit["source"], "market-updates.20260715T010000.ndjson");
         assert_eq!(audit["line_number"], 4);
         assert_eq!(audit["truncated_bytes"], truncated);
-        assert_eq!(
-            audit["kept_bytes"],
-            fs::metadata(&tape).unwrap().len()
-        );
+        assert_eq!(audit["kept_bytes"], fs::metadata(&tape).unwrap().len());
         assert!(audit["repaired_at"].as_str().is_some());
     }
 
@@ -4782,10 +4982,12 @@ mod tests {
 
         repair_torn_tail(&tape).unwrap();
 
-        assert!(scan_tape(&tape, "crypto_expiry", 1, 1_000)
-            .unwrap_err()
-            .to_string()
-            .contains("bid must be numeric"));
+        assert!(
+            scan_tape(&tape, "crypto_expiry", 1, 1_000)
+                .unwrap_err()
+                .to_string()
+                .contains("bid must be numeric")
+        );
     }
 
     #[test]
@@ -4831,10 +5033,12 @@ mod tests {
         assert_eq!(manifest["event_context_complete"], false);
         assert_eq!(manifest["canonical"], false);
         assert_eq!(manifest["segment_complete"], false);
-        assert!(manifest["replay_scope"]
-            .as_str()
-            .unwrap()
-            .contains("requires_prior_event_context"));
+        assert!(
+            manifest["replay_scope"]
+                .as_str()
+                .unwrap()
+                .contains("requires_prior_event_context")
+        );
 
         let reference = vec![
             record(0, "2026-07-15T03:00:00Z", valid_market_metadata_update()),
@@ -4862,10 +5066,12 @@ mod tests {
                 &format!("market-updates.20260715T{stamp}.ndjson"),
                 &invalid,
             );
-            assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-                .unwrap_err()
-                .to_string()
-                .contains("size must be positive"));
+            assert!(
+                scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("size must be positive")
+            );
         }
     }
 
@@ -4880,10 +5086,12 @@ mod tests {
             &[record(0, "2026-07-15T03:00:00Z", update)],
         );
 
-        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-            .unwrap_err()
-            .to_string()
-            .contains("market_metadata market_id does not match raw market"));
+        assert!(
+            scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("market_metadata market_id does not match raw market")
+        );
     }
 
     #[test]
@@ -4897,10 +5105,12 @@ mod tests {
             &[record(0, "2026-07-15T03:00:00Z", update)],
         );
 
-        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-            .unwrap_err()
-            .to_string()
-            .contains("market_metadata symbol is unsupported or contradicts raw market"));
+        assert!(
+            scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("market_metadata symbol is unsupported or contradicts raw market")
+        );
     }
 
     #[test]
@@ -4914,10 +5124,12 @@ mod tests {
             &[record(0, "2026-07-15T03:00:00Z", update)],
         );
 
-        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-            .unwrap_err()
-            .to_string()
-            .contains("market_metadata window is unsupported or contradicts raw market"));
+        assert!(
+            scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("market_metadata window is unsupported or contradicts raw market")
+        );
     }
 
     #[test]
@@ -4931,10 +5143,12 @@ mod tests {
             &[record(0, "2026-07-15T03:00:00Z", update)],
         );
 
-        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-            .unwrap_err()
-            .to_string()
-            .contains("market_metadata raw market requires two unique clobTokenIds"));
+        assert!(
+            scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("market_metadata raw market requires two unique clobTokenIds")
+        );
     }
 
     #[test]
@@ -4948,10 +5162,12 @@ mod tests {
             &[record(0, "2026-07-15T03:00:00Z", update)],
         );
 
-        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-            .unwrap_err()
-            .to_string()
-            .contains("market_metadata raw market requires two unique outcomes"));
+        assert!(
+            scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("market_metadata raw market requires two unique outcomes")
+        );
     }
 
     #[test]
@@ -4965,10 +5181,12 @@ mod tests {
             &[record(0, "2026-07-15T03:00:00Z", update)],
         );
 
-        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-            .unwrap_err()
-            .to_string()
-            .contains("market_metadata.market must be an object"));
+        assert!(
+            scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("market_metadata.market must be an object")
+        );
     }
 
     #[test]
@@ -4982,10 +5200,12 @@ mod tests {
             &[record(0, "2026-07-15T03:06:00Z", update)],
         );
 
-        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-            .unwrap_err()
-            .to_string()
-            .contains("market_settlement raw market must be closed"));
+        assert!(
+            scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("market_settlement raw market must be closed")
+        );
     }
 
     #[test]
@@ -4999,10 +5219,12 @@ mod tests {
             &[record(0, "2026-07-15T03:06:00Z", update)],
         );
 
-        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-            .unwrap_err()
-            .to_string()
-            .contains("market_settlement winning_token_id does not match raw market"));
+        assert!(
+            scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("market_settlement winning_token_id does not match raw market")
+        );
     }
 
     #[test]
@@ -5022,10 +5244,12 @@ mod tests {
                 &format!("market-updates.20260715T03000{index}.ndjson"),
                 &[record(0, "2026-07-15T03:06:00Z", update)],
             );
-            assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-                .unwrap_err()
-                .to_string()
-                .contains(expected));
+            assert!(
+                scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected)
+            );
         }
     }
 
@@ -5043,10 +5267,12 @@ mod tests {
                 &format!("market-updates.20260715T03001{index}.ndjson"),
                 &[record(0, "2026-07-15T03:06:00Z", update)],
             );
-            assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-                .unwrap_err()
-                .to_string()
-                .contains(expected));
+            assert!(
+                scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected)
+            );
         }
     }
 
@@ -5149,10 +5375,12 @@ mod tests {
             &[record(0, "2026-07-15T03:10:00Z", update)],
         );
 
-        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-            .unwrap_err()
-            .to_string()
-            .contains("record_id does not match raw trade"));
+        assert!(
+            scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("record_id does not match raw trade")
+        );
     }
 
     #[test]
@@ -5166,10 +5394,12 @@ mod tests {
             &[record(0, "2026-07-15T03:10:00Z", update)],
         );
 
-        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-            .unwrap_err()
-            .to_string()
-            .contains("record_id_version must be v2"));
+        assert!(
+            scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("record_id_version must be v2")
+        );
     }
 
     #[test]
@@ -5202,10 +5432,12 @@ mod tests {
             &[record(0, "2026-07-15T03:10:00Z", update)],
         );
 
-        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-            .unwrap_err()
-            .to_string()
-            .contains("polymarket_trade.trade must be an object"));
+        assert!(
+            scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("polymarket_trade.trade must be an object")
+        );
     }
 
     #[test]
@@ -5219,10 +5451,12 @@ mod tests {
             &[record(0, "2026-07-15T03:10:00Z", update)],
         );
 
-        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-            .unwrap_err()
-            .to_string()
-            .contains("raw trade requires proxyWallet"));
+        assert!(
+            scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("raw trade requires proxyWallet")
+        );
     }
 
     #[test]
@@ -6102,11 +6336,13 @@ mod tests {
         let root = TestDir::new();
         let mut config = config(root.path());
         config.low_disk_floor_bytes = Some(0);
-        assert!(config
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("low disk floor must be nonzero"));
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("low disk floor must be nonzero")
+        );
     }
 
     #[test]
@@ -6132,9 +6368,11 @@ mod tests {
                 .unwrap();
         assert_eq!(status["failure_count"], 1);
         assert_eq!(status["failed_segments"].as_array().unwrap().len(), 1);
-        assert!(status["failed_segments"][0]["error"]
-            .to_string()
-            .contains("readback failed"));
+        assert!(
+            status["failed_segments"][0]["error"]
+                .to_string()
+                .contains("readback failed")
+        );
         assert!(status["last_error"].to_string().contains("readback failed"));
     }
 
@@ -6152,10 +6390,12 @@ mod tests {
         let root = TestDir::new();
         write_tape(root.path(), "market-updates.ndjson", &sample_rows());
         write_tape(root.path(), "market-updates.backup.ndjson", &sample_rows());
-        assert!(discover_rotated_tapes(root.path())
-            .unwrap_err()
-            .to_string()
-            .contains("invalid rotated tape name"));
+        assert!(
+            discover_rotated_tapes(root.path())
+                .unwrap_err()
+                .to_string()
+                .contains("invalid rotated tape name")
+        );
         fs::remove_file(root.path().join("market-updates.backup.ndjson")).unwrap();
         let valid = write_tape(
             root.path(),
@@ -6200,10 +6440,12 @@ mod tests {
             actual.join("child").join("..").join("child"),
         ] {
             let upload_config = config(&spool_dir);
-            assert!(upload_pending(&upload_config)
-                .unwrap_err()
-                .to_string()
-                .contains("directory"));
+            assert!(
+                upload_pending(&upload_config)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("directory")
+            );
         }
     }
 
@@ -6245,6 +6487,134 @@ mod tests {
         );
     }
 
+    #[test]
+    fn empty_closed_segment_is_quarantined_and_audited() {
+        let root = TestDir::new();
+        let tape = root.path().join("market-updates.20260715T010000.ndjson");
+        File::create(&tape).unwrap().sync_all().unwrap();
+
+        let quarantine = quarantine_empty_tape(&tape)
+            .unwrap()
+            .expect("empty tape must be quarantined");
+
+        assert!(!tape.exists());
+        assert!(quarantine.exists());
+        let audit: Value = serde_json::from_str(
+            fs::read_to_string(root.path().join(EMPTY_TAPE_QUARANTINE_LOG))
+                .unwrap()
+                .trim(),
+        )
+        .unwrap();
+        assert_eq!(audit["source"], "market-updates.20260715T010000.ndjson");
+        assert_eq!(audit["reason"], "empty_closed_tape");
+        assert_eq!(audit["bytes"], 0);
+        assert_eq!(
+            audit["quarantine"],
+            quarantine
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn upload_pending_reports_empty_quarantine_only_once() {
+        let root = TestDir::new();
+        let tape = root.path().join("market-updates.20260715T010000.ndjson");
+        File::create(&tape).unwrap().sync_all().unwrap();
+        let config = config(root.path());
+
+        let error = upload_pending(&config).unwrap_err();
+
+        assert!(error.to_string().contains("failed"));
+        assert!(!tape.exists());
+        let status: Value =
+            serde_json::from_slice(&fs::read(root.path().join("upload-status.json")).unwrap())
+                .unwrap();
+        assert_eq!(status["pending_segments"], 0);
+        assert_eq!(status["failure_count"], 1);
+        assert!(
+            status["last_error"]
+                .as_str()
+                .unwrap()
+                .contains("empty closed tape quarantined")
+        );
+
+        let retry = upload_pending(&config).unwrap();
+
+        assert_eq!(
+            retry,
+            UploadSummary {
+                uploaded_segments: 0,
+                canonical_uploaded_segments: 0,
+            }
+        );
+        let recovered: Value =
+            serde_json::from_slice(&fs::read(root.path().join("upload-status.json")).unwrap())
+                .unwrap();
+        assert_eq!(recovered["failure_count"], 1);
+        assert!(recovered["last_error"].is_null());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_empty_quarantines_are_audited_while_healthy_tapes_continue() {
+        let root = TestDir::new();
+        for name in [
+            "market-updates.20260715T010000.ndjson",
+            "market-updates.20260715T020000.ndjson",
+        ] {
+            File::create(root.path().join(name))
+                .unwrap()
+                .sync_all()
+                .unwrap();
+        }
+        let healthy = root.path().join("market-updates.20260715T030000.ndjson");
+        fs::write(&healthy, b"closed").unwrap();
+        let config = config(root.path());
+        let archive: fn(&Path, &UploadConfig) -> Result<Vec<UploadedSegment>> =
+            |source, _config| {
+                if let Some(quarantine) = quarantine_empty_tape(source)? {
+                    bail!("empty closed tape quarantined at {}", quarantine.display());
+                }
+                fs::remove_file(source)?;
+                Ok(vec![UploadedSegment {
+                    object: format!("oss://bucket/{}", source.display()),
+                    canonical_complete: true,
+                }])
+            };
+
+        upload_pending_async_with(&config, archive)
+            .await
+            .unwrap_err();
+
+        let audits: Vec<Value> = fs::read_to_string(root.path().join(EMPTY_TAPE_QUARANTINE_LOG))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(audits.len(), 2);
+        assert!(
+            audits
+                .iter()
+                .all(|audit| audit["reason"] == "empty_closed_tape")
+        );
+        let status: Value =
+            serde_json::from_slice(&fs::read(root.path().join("upload-status.json")).unwrap())
+                .unwrap();
+        assert_eq!(status["failure_count"], 2);
+        assert_eq!(status["pending_segments"], 0);
+        assert_eq!(status["uploaded_segments"], 1);
+        assert!(!healthy.exists());
+
+        let retry = upload_pending_async_with(&config, archive).await.unwrap();
+        assert_eq!(retry.uploaded_segments, 0);
+        let recovered: Value =
+            serde_json::from_slice(&fs::read(root.path().join("upload-status.json")).unwrap())
+                .unwrap();
+        assert_eq!(recovered["failure_count"], 2);
+        assert!(recovered["last_error"].is_null());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn async_uploads_closed_sources_concurrently_with_bound() {
         let root = TestDir::new();
@@ -6282,6 +6652,242 @@ mod tests {
             serde_json::from_slice(&fs::read(root.path().join("upload-status.json")).unwrap())
                 .unwrap();
         assert_eq!(status["pending_segments"], 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_checkpoint_persists_first_success_before_blocked_second_source() {
+        let root = TestDir::new();
+        let first = root.path().join("market-updates.20260715T010000.ndjson");
+        let second = root.path().join("market-updates.20260715T020000.ndjson");
+        let second_started = root.path().join("second.started");
+        let release_second = root.path().join("second.release");
+        fs::write(&first, b"closed").unwrap();
+        fs::write(&second, b"closed").unwrap();
+        let mut config = config(root.path());
+        config.max_concurrent_uploads = 1;
+        let archive = {
+            let first = first.clone();
+            let second = second.clone();
+            let second_started = second_started.clone();
+            let release_second = release_second.clone();
+            move |source: &Path, _config: &UploadConfig| -> Result<Vec<UploadedSegment>> {
+                if source == first {
+                    fs::remove_file(source)?;
+                    return Ok(vec![UploadedSegment {
+                        object: "oss://bucket/first".to_owned(),
+                        canonical_complete: true,
+                    }]);
+                }
+                assert_eq!(source, second);
+                fs::write(&second_started, b"started")?;
+                while !release_second.exists() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                fs::remove_file(source)?;
+                Ok(vec![UploadedSegment {
+                    object: "oss://bucket/second".to_owned(),
+                    canonical_complete: true,
+                }])
+            }
+        };
+
+        let task = tokio::spawn({
+            let config = config.clone();
+            async move { upload_pending_async_with(&config, archive).await }
+        });
+
+        let checkpoint = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if second_started.exists() {
+                    let status: Value = serde_json::from_slice(
+                        &fs::read(root.path().join("upload-status.json")).unwrap(),
+                    )
+                    .unwrap();
+                    if status["uploaded_segments"] == 1
+                        && status["canonical_uploaded_segments"] == 1
+                        && status["pending_segments"] == 1
+                        && status["last_uploaded_object"] == "oss://bucket/first"
+                    {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        fs::write(&release_second, b"release").unwrap();
+        checkpoint.unwrap();
+
+        let summary = task.await.unwrap().unwrap();
+        assert_eq!(summary.uploaded_segments, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_checkpoint_uses_completion_order_under_concurrency() {
+        let root = TestDir::new();
+        let first = root.path().join("market-updates.20260715T010000.ndjson");
+        let second = root.path().join("market-updates.20260715T020000.ndjson");
+        fs::write(&first, b"closed").unwrap();
+        fs::write(&second, b"closed").unwrap();
+        let config = config(root.path());
+        let release_first = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let second_done = Arc::new(AtomicUsize::new(0));
+        let archive = {
+            let first = first.clone();
+            let second = second.clone();
+            let release_first = release_first.clone();
+            let second_done = second_done.clone();
+            move |source: &Path, _config: &UploadConfig| -> Result<Vec<UploadedSegment>> {
+                if source == first {
+                    let (ready, condvar) = &*release_first;
+                    let mut released = ready.lock().unwrap();
+                    while !*released {
+                        released = condvar.wait(released).unwrap();
+                    }
+                } else {
+                    assert_eq!(source, second);
+                    fs::remove_file(source)?;
+                    second_done.store(1, Ordering::SeqCst);
+                    return Ok(vec![UploadedSegment {
+                        object: "oss://bucket/second".to_owned(),
+                        canonical_complete: true,
+                    }]);
+                }
+                fs::remove_file(source)?;
+                Ok(vec![UploadedSegment {
+                    object: "oss://bucket/first".to_owned(),
+                    canonical_complete: true,
+                }])
+            }
+        };
+
+        let task = tokio::spawn({
+            let config = config.clone();
+            async move { upload_pending_async_with(&config, archive).await }
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if second_done.load(Ordering::SeqCst) == 1 {
+                    let status = fs::read(root.path().join("upload-status.json"))
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+                    if let Some(status) = status {
+                        if status["uploaded_segments"] == 1
+                            && status["pending_segments"] == 1
+                            && status["last_uploaded_object"] == "oss://bucket/second"
+                        {
+                            break;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        {
+            let (ready, condvar) = &*release_first;
+            *ready.lock().unwrap() = true;
+            condvar.notify_one();
+        }
+
+        let summary = task.await.unwrap().unwrap();
+        assert_eq!(summary.uploaded_segments, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_checkpoint_write_failure_drains_inflight_uploads() {
+        let root = TestDir::new();
+        let first = root.path().join("market-updates.20260715T010000.ndjson");
+        let second = root.path().join("market-updates.20260715T020000.ndjson");
+        fs::write(&first, b"closed").unwrap();
+        fs::write(&second, b"closed").unwrap();
+        let config = config(root.path());
+        let archive = {
+            let first = first.clone();
+            let second = second.clone();
+            let spool_dir = root.path().to_path_buf();
+            move |source: &Path, _config: &UploadConfig| -> Result<Vec<UploadedSegment>> {
+                if source == first {
+                    fs::set_permissions(&spool_dir, fs::Permissions::from_mode(0o555)).unwrap();
+                    fs::remove_file(source)?;
+                    return Ok(vec![UploadedSegment {
+                        object: "oss://bucket/first".to_owned(),
+                        canonical_complete: true,
+                    }]);
+                }
+                assert_eq!(source, second);
+                std::thread::sleep(Duration::from_millis(150));
+                fs::set_permissions(&spool_dir, fs::Permissions::from_mode(0o755)).unwrap();
+                fs::remove_file(source)?;
+                Ok(vec![UploadedSegment {
+                    object: "oss://bucket/second".to_owned(),
+                    canonical_complete: true,
+                }])
+            }
+        };
+
+        let started = std::time::Instant::now();
+        let error = upload_pending_async_with(&config, archive)
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            error.to_string().contains("Permission denied")
+                || error.to_string().contains("permission denied"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "write failure should wait for the in-flight upload to finish before returning"
+        );
+        assert!(
+            !second.exists(),
+            "in-flight upload must finish before the write error returns"
+        );
+    }
+
+    #[test]
+    fn upload_status_must_be_valid_object_with_numeric_failure_count_before_archive() {
+        let root = TestDir::new();
+        let source = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &sample_rows(),
+        );
+
+        for (payload, expected) in [
+            (b"{not json}".as_slice(), "not valid JSON"),
+            (b"[]".as_slice(), "must be a JSON object"),
+            (
+                br#"{"failure_count":"bad"}"#.as_slice(),
+                "failure_count must be a nonnegative integer",
+            ),
+        ] {
+            fs::write(root.path().join("upload-status.json"), payload).unwrap();
+            let called = Arc::new(AtomicUsize::new(0));
+            let archive_called = called.clone();
+
+            let error = upload_pending_with(&config(root.path()), move |_source, _config| {
+                archive_called.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![UploadedSegment {
+                    object: "oss://bucket/unreachable".to_owned(),
+                    canonical_complete: true,
+                }])
+            })
+            .unwrap_err();
+
+            assert_eq!(called.load(Ordering::SeqCst), 0);
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected}, got {error:#}"
+            );
+            assert!(source.exists(), "invalid status must fail before archive");
+        }
     }
 
     #[test]

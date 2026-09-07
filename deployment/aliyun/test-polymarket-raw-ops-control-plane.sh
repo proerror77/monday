@@ -16,6 +16,8 @@ readonly GATE="$SCRIPT_DIR/polymarket-raw-ops-shadow-gate.sh"
 readonly GATE_CONTROL="$SCRIPT_DIR/polymarket-raw-ops-gate-control.sh"
 readonly GATE_UNIT="$SCRIPT_DIR/polymarket-raw-ops-gate@.service"
 readonly CUTOVER="$SCRIPT_DIR/polymarket-raw-ops-cutover.sh"
+readonly WATCHDOG="$SCRIPT_DIR/polymarket-market-tape-upload-watchdog.sh"
+readonly WATCHDOG_TIMER_FILE="$SCRIPT_DIR/polymarket-market-tape-upload-watchdog.timer"
 readonly WORKFLOW="$SCRIPT_DIR/../../.github/workflows/acr-publish.yml"
 readonly CI_WORKFLOW="$SCRIPT_DIR/../../.github/workflows/ci.yml"
 readonly README="$SCRIPT_DIR/README.md"
@@ -61,7 +63,20 @@ join_shell_continuations() {
   }' "$1"
 }
 
-shellcheck "$GATE" "$GATE_CONTROL" "$CUTOVER" "$0"
+shellcheck "$GATE" "$GATE_CONTROL" "$CUTOVER" "$WATCHDOG" "$0"
+grep -Fxq 'OnActiveSec=2min' "$WATCHDOG_TIMER_FILE"
+if grep -Fq 'OnBootSec=' "$WATCHDOG_TIMER_FILE"; then
+  printf 'watchdog timer must schedule from each activation, not only from boot\n' >&2
+  exit 1
+fi
+grep -Fq 'sudo systemctl restart polymarket-market-tape-upload-watchdog.timer' "$README"
+grep -Fq -- '--property=NextElapseUSecMonotonic' "$README"
+if grep -Fq 'release-preflight' "$GATE_CONTROL" \
+  || grep -Fq 'preflight-hold' "$GATE_CONTROL" \
+  || grep -Fq 'WATCHDOG_SUPPRESS_FILE' "$GATE_CONTROL"; then
+  printf 'gate-control retained preflight uploader state beyond origin/main\n' >&2
+  exit 1
+fi
 for unit_line in \
   'Type=exec' 'Restart=no' 'KillMode=control-group' 'RuntimeMaxSec=18000' \
   'TimeoutStopSec=120' \
@@ -86,11 +101,64 @@ if ! awk '
   printf 'unmanaged Gate can reach preflight or shadow startup\n' >&2
   exit 1
 fi
+if ! awk '
+  /^  \[\[ \$segment_ready == true \]\] \|\| require_real_market_segment_ready$/ {ready=NR}
+  /^  write_runtime_request "\$candidate_path"/ {request=NR}
+  /^  if ! systemctl start "\$unit"/ {start=NR}
+  END {exit !(ready && ready < request && request < start)}
+' "$GATE_CONTROL"; then
+  printf 'Gate does not require a ready closed market segment before invocation creation\n' >&2
+  exit 1
+fi
 grep -Fq 'pass_ready_marker="$evidence_dir/.PASSED.sha256.ready"' "$GATE"
 if grep -Fq 'marker="$evidence_dir/PASSED.sha256"' "$GATE"; then
   printf 'running Gate publishes the official pass marker before finalization\n' >&2
   exit 1
 fi
+grep -Fq 'readonly WATCHDOG_SUPPRESS_FILE=/run/monday/polymarket-upload-watchdog.suppress' "$CUTOVER"
+grep -Fq 'readonly WATCHDOG_SCRIPT_ASSET=polymarket-market-tape-upload-watchdog.sh' "$CUTOVER"
+grep -Fq 'readonly WATCHDOG_BINARY=/opt/monday/bin/polymarket-market-tape-upload-watchdog.sh' "$CUTOVER"
+grep -Fq 'readonly WATCHDOG_SERVICE=polymarket-market-tape-upload-watchdog.service' "$CUTOVER"
+grep -Fq 'readonly WATCHDOG_TIMER=polymarket-market-tape-upload-watchdog.timer' "$CUTOVER"
+grep -Fq 'admit_watchdog_suppress "$watchdog_suppress_owner"' "$CUTOVER"
+grep -Fq 'atomic_install 0755 "$SCRIPT_DIR/$WATCHDOG_SCRIPT_ASSET" "$WATCHDOG_BINARY"' \
+  "$CUTOVER"
+grep -Fq 'verify_watchdog_runtime' "$CUTOVER"
+grep -Fq 'install -m "$mode" "$WATCHDOG_BINARY" "$rollback_dir/bin/$WATCHDOG_SCRIPT_ASSET"' \
+  "$CUTOVER"
+grep -Fq 'atomic_install "$mode" "$rollback_dir/bin/$WATCHDOG_SCRIPT_ASSET" "$WATCHDOG_BINARY"' \
+  "$CUTOVER"
+grep -Fq 'systemctl stop "$WATCHDOG_TIMER" "$WATCHDOG_SERVICE"' "$CUTOVER"
+grep -Fq 'unit_enabled "$WATCHDOG_TIMER"' "$CUTOVER"
+grep -Fq 'watchdog timer became active before the unsuppressed probe' "$CUTOVER"
+grep -Fq 'systemctl restart "$WATCHDOG_TIMER"' "$CUTOVER"
+grep -Fq 'verify_watchdog_probe "$watchdog_probe_journal"' "$CUTOVER"
+grep -Fq 'watchdog_probe:{invocation_id:$watchdog_probe_invocation_id,' "$CUTOVER"
+watchdog_admit_line=$(grep -nF 'admit_watchdog_suppress "$watchdog_suppress_owner"' "$CUTOVER" | cut -d: -f1)
+transition_start_line=$(grep -nF 'transition_started=true' "$CUTOVER" | head -1 | cut -d: -f1)
+watchdog_success_remove_line=$(grep -nF 'remove_watchdog_suppress "$watchdog_suppress_owner"' "$CUTOVER" | tail -1 | cut -d: -f1)
+watchdog_timer_inactive_guard_line=$(grep -nF 'watchdog timer became active before the unsuppressed probe' \
+  "$CUTOVER" | cut -d: -f1)
+watchdog_absent_line=$(grep -nF '[[ ! -e $WATCHDOG_SUPPRESS_FILE && ! -L $WATCHDOG_SUPPRESS_FILE ]]' \
+  "$CUTOVER" | tail -1 | cut -d: -f1)
+watchdog_probe_line=$(grep -nF 'verify_watchdog_probe "$watchdog_probe_journal"' "$CUTOVER" \
+  | cut -d: -f1)
+watchdog_timer_restart_line=$(grep -nF 'systemctl restart "$WATCHDOG_TIMER"' "$CUTOVER" \
+  | tail -1 | cut -d: -f1)
+cutover_marker_line=$(grep -nF 'success_marker="$evidence_dir/PASSED.sha256"' "$CUTOVER" \
+  | cut -d: -f1)
+cutover_success_line=$(grep -nF 'cutover_succeeded=true' "$CUTOVER" | cut -d: -f1)
+((watchdog_admit_line < transition_start_line \
+  && watchdog_timer_inactive_guard_line < watchdog_success_remove_line \
+  && watchdog_success_remove_line < watchdog_absent_line \
+  && watchdog_absent_line < watchdog_probe_line \
+  && watchdog_probe_line < watchdog_timer_restart_line \
+  && watchdog_timer_restart_line < cutover_marker_line \
+  && watchdog_probe_line < cutover_marker_line \
+  && cutover_marker_line < cutover_success_line)) || {
+  printf 'cutover watchdog suppression/probe ordering is not fail-closed\n' >&2
+  exit 1
+}
 
 supervisor_tmp=$(mktemp -d)
 trap 'rm -rf "$supervisor_tmp"' EXIT
@@ -130,6 +198,9 @@ cat >"$supervisor_control_dir/${GATE##*/}" <<'EOF'
 set -euo pipefail
 printf '%s|%s|%s\n' "$*" "${INVOCATION_ID:-}" \
   "${MONDAY_POLYMARKET_GATE_INVOCATION_ID:-}" >>"$FAKE_GATE_CALLS"
+if [[ ${1:-} == --real-market-segment-ready ]]; then
+  exit "${FAKE_REAL_MARKET_READY_EXIT:-0}"
+fi
 exit "${FAKE_GATE_EXIT:-0}"
 EOF
 chmod 0755 "$supervisor_control" \
@@ -514,8 +585,34 @@ supervisor_recovery_gate_invocation=$(printf '9%.0s' {1..32})
 set_supervisor_state invocation "$supervisor_recovery_gate_invocation"
 set_supervisor_state active inactive
 set_supervisor_state baseline-active inactive
+supervisor_recovery_request_file="$supervisor_root/run/monday/polymarket-raw-ops-gates/$supervisor_candidate_sha.request.json"
+supervisor_recovery_env_file="$supervisor_root/run/monday/polymarket-raw-ops-gates/$supervisor_candidate_sha.env"
+supervisor_recovery_starts_before=$(grep -Fxc "start $supervisor_unit" \
+  "$supervisor_calls" || true)
+if env "${gate_control_env[@]}" INVOCATION_ID= FAKE_REAL_MARKET_READY_EXIT=1 \
+  "$supervisor_control" recover "$supervisor_candidate" \
+  "$supervisor_candidate_sha" "$supervisor_source" "$supervisor_probe" \
+  >/dev/null 2>&1; then
+  printf 'recovery without a ready market segment unexpectedly passed\n' >&2
+  exit 1
+fi
+[[ $(grep -Fxc "start $supervisor_unit" "$supervisor_calls" || true) \
+    -eq $supervisor_recovery_starts_before \
+  && ! -e $supervisor_recovery_request_file \
+  && ! -e $supervisor_recovery_env_file ]]
+if admission_records_matching '.result == "admitted"' | grep -q .; then
+  printf 'segment refusal published a false recovery admission\n' >&2
+  exit 1
+fi
+[[ $(admission_records_matching \
+  '.result == "refused" and (.refusal_reason | test("no eligible closed market segment"))' \
+  | grep -c .) -eq 1 ]]
+supervisor_recovery_ready_before=$(grep -Fc -- \
+  '--real-market-segment-ready ' "$supervisor_gate_calls" || true)
 gate_control recover "$supervisor_candidate" "$supervisor_candidate_sha" \
   "$supervisor_source" "$supervisor_probe" >"$supervisor_tmp/recover-start.json"
+[[ $(grep -Fc -- '--real-market-segment-ready ' "$supervisor_gate_calls") \
+  -eq $((supervisor_recovery_ready_before + 1)) ]]
 jq -e --arg invocation "$supervisor_recovery_gate_invocation" '
   .phase == "running" and .systemd_invocation_id == $invocation
 ' "$supervisor_tmp/recover-start.json" >/dev/null
@@ -887,6 +984,23 @@ if ! (
 fi
 
 supervisor_env_file="$supervisor_root/run/monday/polymarket-raw-ops-gates/$supervisor_candidate_sha.env"
+supervisor_request_file="$supervisor_root/run/monday/polymarket-raw-ops-gates/$supervisor_candidate_sha.request.json"
+supervisor_starts_before_segment_admission=$(grep -Fxc "start $supervisor_unit" \
+  "$supervisor_calls" || true)
+if env "${gate_control_env[@]}" INVOCATION_ID= FAKE_REAL_MARKET_READY_EXIT=1 \
+  "$supervisor_control" start "$supervisor_candidate" \
+  "$supervisor_candidate_sha" "$supervisor_source" >/dev/null 2>&1; then
+  printf 'Gate start without a ready market segment unexpectedly passed\n' >&2
+  exit 1
+fi
+[[ $(grep -Fxc "start $supervisor_unit" "$supervisor_calls" || true) \
+    -eq $supervisor_starts_before_segment_admission \
+  && ! -e $supervisor_request_file \
+  && ! -e $supervisor_env_file ]]
+supervisor_market_spool="$(cd -- "$supervisor_root" && pwd -P)/data/monday/spool/polymarket"
+grep -Fqx -- \
+  "--real-market-segment-ready $supervisor_market_spool||" \
+  "$supervisor_gate_calls"
 set_supervisor_state active inactive
 if env "${gate_control_env[@]}" FAKE_START_REJECT=1 \
   "$supervisor_control" start "$supervisor_candidate" \
@@ -1114,25 +1228,146 @@ tmp_dir=$(mktemp -d)
 tmp_dir=$(cd -- "$tmp_dir" && pwd -P)
 trap 'rm -rf "$tmp_dir"' EXIT
 
+watchdog_bin="$tmp_dir/watchdog-bin"
+watchdog_start_log="$tmp_dir/watchdog-start.log"
+mkdir "$watchdog_bin"
+cat >"$watchdog_bin/systemctl" <<'EOF'
+#!/bin/sh
+case $1 in
+  is-enabled)
+    case $2 in
+      polymarket-market-tape-upload.timer) printf '%s\n' enabled ;;
+      polymarket-reference-upload.timer) printf '%s\n' disabled; exit 1 ;;
+      *) printf '%s\n' not-found; exit 1 ;;
+    esac
+    ;;
+  is-active) printf '%s\n' inactive; exit 3 ;;
+  show)
+    case $3 in
+      SubState) printf '%s\n' waiting ;;
+      NextElapseUSecMonotonic) printf '%s\n' 123456789 ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  start) printf '%s\n' "$*" >>"$WATCHDOG_START_LOG" ;;
+  *) exit 2 ;;
+esac
+EOF
+cat >"$watchdog_bin/logger" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+cat >"$watchdog_bin/df" <<'EOF'
+#!/bin/sh
+printf '%s\n' 'Filesystem 1024-blocks Used Available Capacity Mounted on'
+printf '%s\n' '/dev/test 10485760 0 10485760 0% /data'
+EOF
+chmod +x "$watchdog_bin/systemctl" "$watchdog_bin/logger" "$watchdog_bin/df"
+WATCHDOG_START_LOG="$watchdog_start_log" \
+  PATH="$watchdog_bin:$PATH" "$WATCHDOG"
+if [[ $(wc -l <"$watchdog_start_log") -ne 1 ]] \
+  || ! grep -Fxq 'start polymarket-market-tape-upload.timer' "$watchdog_start_log"; then
+  printf 'watchdog did not respect the disabled reference-lane containment\n' >&2
+  exit 1
+fi
+
+: >"$watchdog_start_log"
+cat >"$watchdog_bin/systemctl" <<'EOF'
+#!/bin/sh
+case $1 in
+  is-enabled)
+    printf '%s\n' enabled
+    ;;
+  is-active)
+    printf '%s\n' active
+    ;;
+  show)
+    case $3 in
+      SubState) printf '%s\n' elapsed ;;
+      NextElapseUSecMonotonic) printf '%s\n' infinity ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  restart) printf '%s\n' "$*" >>"$WATCHDOG_START_LOG" ;;
+  *) exit 2 ;;
+esac
+EOF
+chmod +x "$watchdog_bin/systemctl"
+WATCHDOG_START_LOG="$watchdog_start_log" \
+  PATH="$watchdog_bin:$PATH" "$WATCHDOG"
+if [[ $(wc -l <"$watchdog_start_log") -ne 2 ]] \
+  || ! grep -Fxq 'restart polymarket-market-tape-upload.timer' "$watchdog_start_log" \
+  || ! grep -Fxq 'restart polymarket-reference-upload.timer' "$watchdog_start_log"; then
+  printf 'watchdog did not rearm elapsed upload timers with an infinite next elapse\n' >&2
+  exit 1
+fi
+
+: >"$watchdog_start_log"
+cat >"$watchdog_bin/systemctl" <<'EOF'
+#!/bin/sh
+case $1 in
+  is-enabled) printf '%s\n' enabled ;;
+  is-active) printf '%s\n' active ;;
+  show)
+    case $3 in
+      SubState) printf '%s\n' waiting ;;
+      NextElapseUSecMonotonic) printf '%s\n' infinity ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  *) exit 2 ;;
+esac
+EOF
+chmod +x "$watchdog_bin/systemctl"
+WATCHDOG_START_LOG="$watchdog_start_log" \
+  PATH="$watchdog_bin:$PATH" "$WATCHDOG"
+if [[ -s $watchdog_start_log ]]; then
+  printf 'watchdog restarted an OnUnitInactiveSec timer while its oneshot service was running\n' >&2
+  exit 1
+fi
+
 # A production Gate must exercise the candidate against a real closed segment,
 # not a compatible fixture manufactured by the Gate itself.
 preflight_verifier="$tmp_dir/real-market-preflight.sh"
-sed -n \
-  -e '/^readonly REAL_MARKET_PREFLIGHT_BUDGET_SECONDS=/p' \
-  -e '/^readonly PREFLIGHT_SCAN_WINDOW_RECORDS=/p' \
-  -e '/^remaining_seconds_before_deadline() {$/,/^}$/p' \
-  -e '/^run_before_deadline() {$/,/^}$/p' \
-  -e '/^oss_download_with_retry() {$/,/^}$/p' "$GATE" \
-  >"$preflight_verifier"
-sed -n '/^download_and_verify_oss_triplet() {$/,/^}$/p' "$GATE" \
-  >>"$preflight_verifier"
-sed -n '/^real_market_segment_preflight() {$/,/^}$/p' "$GATE" \
-  >>"$preflight_verifier"
+{
+  sed -n \
+    -e '/^readonly REAL_MARKET_PREFLIGHT_BUDGET_SECONDS=/p' \
+    -e '/^readonly REAL_MARKET_SEGMENT_WAIT_BUDGET_SECONDS=/p' \
+    -e '/^readonly REAL_MARKET_PREFLIGHT_TOTAL_BUDGET_SECONDS=/,/))$/p' \
+    -e '/^readonly PREFLIGHT_SCAN_WINDOW_RECORDS=/p' \
+    -e '/^remaining_seconds_before_deadline() {$/,/^}$/p' \
+    -e '/^run_before_deadline() {$/,/^}$/p' \
+    -e '/^oss_download_with_retry() {$/,/^}$/p' "$GATE"
+  sed -n '/^latest_real_market_segment() {$/,/^}$/p' "$GATE"
+  sed -n '/^download_and_verify_oss_triplet() {$/,/^}$/p' "$GATE"
+  sed -n '/^real_market_segment_preflight() {$/,/^}$/p' "$GATE"
+} >"$preflight_verifier"
 # shellcheck source=/dev/null
 source "$preflight_verifier"
-if ! declare -F download_and_verify_oss_triplet >/dev/null \
+if ! declare -F latest_real_market_segment >/dev/null \
+  || ! declare -F download_and_verify_oss_triplet >/dev/null \
   || ! declare -F real_market_segment_preflight >/dev/null; then
   printf 'Gate does not expose the real market-segment preflight helpers\n' >&2
+  exit 1
+fi
+grep -Fq 'ln "$source_path" "$source_tmp"' "$GATE" || {
+  printf 'real-segment preflight no longer hardlinks the production segment into the shadow spool\n' >&2
+  exit 1
+}
+if grep -Fq 'cp -- "$source_path" "$source_tmp"' "$GATE"; then
+  printf 'real-segment preflight fell back to byte-copying the production segment\n' >&2
+  exit 1
+fi
+grep -Fq "stat -c '%d:%i:%s:%Y:%Z' \"\$source_tmp\"" "$GATE" || {
+  printf 'real-segment preflight no longer records full linked inode identity during hash stability\n' >&2
+  exit 1
+}
+grep -Fq "stat -c '%d:%i:%s:%Y:%Z' \"\$source_path\"" "$GATE" || {
+  printf 'real-segment preflight no longer records full production-path identity after linking\n' >&2
+  exit 1
+}
+if grep -Fq 'rm -f -- "$source_tmp"' "$GATE"; then
+  printf 'real-segment preflight still discards the retained link between hash retries\n' >&2
   exit 1
 fi
 secure_collector_directory() {
@@ -1143,6 +1378,21 @@ preflight_root="$tmp_dir/real-market-preflight"
 remote_root="$preflight_root/remote"
 fake_bin="$preflight_root/bin"
 mkdir -p "$remote_root" "$fake_bin"
+calendar_case="$preflight_root/calendar-case"
+calendar_valid="$calendar_case/market-updates.20260101T000000000000.ndjson"
+calendar_invalid="$calendar_case/market-updates.20990231T000000000000.ndjson"
+mkdir "$calendar_case"
+printf 'valid\n' >"$calendar_valid"
+printf 'invalid\n' >"$calendar_invalid"
+[[ $(latest_real_market_segment "$calendar_case") == "$calendar_valid" ]] || {
+  printf 'real-segment admission preferred an impossible calendar timestamp\n' >&2
+  exit 1
+}
+rm "$calendar_valid"
+if latest_real_market_segment "$calendar_case" >/dev/null; then
+  printf 'real-segment admission accepted an impossible calendar timestamp\n' >&2
+  exit 1
+fi
 
 make_remote_triplet() {
   local source=$1 uri=$2 dataset=$3 remote_data remote_manifest
@@ -1159,7 +1409,9 @@ make_remote_triplet() {
     --argjson source_bytes "$source_bytes" \
     '{venue:"polymarket",dataset:$dataset,file:$file,bytes:$bytes,
       sha256:$sha,source_bytes:$source_bytes,canonical:true,
-      segment_complete:true,source_session_closed:true,sequence_gaps:0}' \
+      segment_complete:true,source_session_closed:true,sequence_gaps:0,
+      start_recorded_at:"2026-01-01T00:00:00Z",
+      end_recorded_at:"2026-01-01T00:59:59Z"}' \
     >"$remote_manifest"
   printf '%s\n' "$data_sha" >"${remote_data}._SUCCESS"
 }
@@ -1204,18 +1456,80 @@ exit 0
 EOF
 chmod +x "$fake_bin/chown"
 
+cat >"$fake_bin/ln" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ -n ${LN_COUNT_FILE:-} ]]; then
+  count=0
+  [[ ! -f $LN_COUNT_FILE ]] || count=$(<"$LN_COUNT_FILE")
+  printf '%s\n' "$((count + 1))" >"$LN_COUNT_FILE"
+fi
+if [[ -n ${UNLINK_SOURCE_BEFORE_LINK:-} \
+  && ${1:-} == "$UNLINK_SOURCE_BEFORE_LINK" \
+  && ! -e ${UNLINK_SOURCE_BEFORE_LINK_ONCE:-} ]]; then
+  : >"$UNLINK_SOURCE_BEFORE_LINK_ONCE"
+  rm -f -- "$1"
+fi
+/bin/ln "$@"
+if [[ -n ${UNSTABLE_STAT_PATH_FILE:-} ]]; then
+  printf '%s\n' "${2:-}" >"$UNSTABLE_STAT_PATH_FILE"
+fi
+if [[ -n ${LINKED_SOURCE_PATH_FILE:-} ]]; then
+  printf '%s\n' "${2:-}" >"$LINKED_SOURCE_PATH_FILE"
+fi
+if [[ -n ${UNLINK_SOURCE_AFTER_LINK:-} && ${1:-} == "$UNLINK_SOURCE_AFTER_LINK" ]]; then
+  rm -f -- "$1"
+fi
+if [[ -n ${REPLACE_SOURCE_AFTER_LINK:-} && ${1:-} == "$REPLACE_SOURCE_AFTER_LINK" ]]; then
+  rm -f -- "$1"
+  cp "$REPLACE_SOURCE_WITH" "$1"
+fi
+EOF
+chmod +x "$fake_bin/ln"
+
 preflight_stat=$(command -v gstat || command -v stat)
 cat >"$fake_bin/stat" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 last=${!#}
-if [[ -n ${UNSTABLE_STAT_PATH:-} && $last == "$UNSTABLE_STAT_PATH" \
+unstable_path=${UNSTABLE_STAT_PATH:-}
+if [[ -n ${UNSTABLE_STAT_PATH_FILE:-} && -f $UNSTABLE_STAT_PATH_FILE ]]; then
+  unstable_path=$(<"$UNSTABLE_STAT_PATH_FILE")
+fi
+linked_path=
+if [[ -n ${LINKED_SOURCE_PATH_FILE:-} && -f $LINKED_SOURCE_PATH_FILE ]]; then
+  linked_path=$(<"$LINKED_SOURCE_PATH_FILE")
+fi
+ctime_race_path=
+if [[ -n ${CTIME_RACE_PATH_FILE:-} && -f $CTIME_RACE_PATH_FILE ]]; then
+  ctime_race_path=$(<"$CTIME_RACE_PATH_FILE")
+fi
+if [[ -n $unstable_path && $last == "$unstable_path" \
   && ${1:-} == -c && ${2:-} == '%d:%i:%s:%Y:%Z' ]]; then
   count=0
   [[ ! -f $UNSTABLE_STAT_COUNTER ]] || count=$(<"$UNSTABLE_STAT_COUNTER")
   count=$((count + 1))
   printf '%s\n' "$count" >"$UNSTABLE_STAT_COUNTER"
   printf '%s:%s\n' "$("$PREFLIGHT_STAT" "$@")" "$count"
+  exit 0
+fi
+if [[ -n $ctime_race_path && $last == "$ctime_race_path" \
+  && ${1:-} == -c && ${2:-} == '%d:%i:%s:%Y:%Z' ]]; then
+  count=0
+  [[ ! -f $CTIME_RACE_COUNTER ]] || count=$(<"$CTIME_RACE_COUNTER")
+  count=$((count + 1))
+  printf '%s\n' "$count" >"$CTIME_RACE_COUNTER"
+  value=$("$PREFLIGHT_STAT" "$@")
+  if (( count <= 2 )); then
+    printf '%s:%s\n' "$value" "$count"
+  else
+    printf '%s\n' "$value"
+  fi
+  exit 0
+fi
+if [[ -n $linked_path && $last == "$linked_path" \
+  && ${1:-} == -c && ${2:-} == '%U:%G:%a' ]]; then
+  printf '%s\n' "${LINKED_SOURCE_MODE_OWNER:-hftcollector:hftcollector:640}"
   exit 0
 fi
 exec "$PREFLIGHT_STAT" "$@"
@@ -1310,6 +1624,7 @@ cp "$remote_root/${template_uri#oss://bucket/}"* "$unrelated_template_dir/"
 
 original_path=$PATH
 export PATH="$fake_bin:$PATH"
+export LINKED_SOURCE_PATH_FILE="$preflight_root/linked-path"
 export FAKE_OSS_ROOT="$remote_root"
 export FAKE_CANDIDATE_TEMPLATE="$matching_template_dir"
 export PREFLIGHT_STAT="$preflight_stat"
@@ -1425,16 +1740,61 @@ fi
 unset FAKE_CANONICAL_COUNT
 release_binary="$VERIFY"
 
+prelink_race_case="$preflight_root/prelink-race-case"
+mkdir -p "$prelink_race_case/source" "$prelink_race_case/spool" \
+  "$prelink_race_case/download" "$prelink_race_case/evidence"
+prelink_race_source="$prelink_race_case/source/market-updates.20260101T041500000000.ndjson"
+prelink_race_replacement="$prelink_race_case/source/market-updates.20260101T041600000000.ndjson"
+cp "$compatible" "$prelink_race_source"
+export UNLINK_SOURCE_BEFORE_LINK="$prelink_race_source"
+export UNLINK_SOURCE_BEFORE_LINK_ONCE="$prelink_race_case/unlinked"
+sleep() {
+  cp "$compatible" "$prelink_race_replacement"
+}
+real_market_segment_preflight "$prelink_race_case/source" \
+  "$prelink_race_case/spool" "$prelink_race_case/download" \
+  "$prelink_race_case/evidence" || {
+  printf 'real-segment preflight did not rescan after a pre-link uploader race\n' >&2
+  exit 1
+}
+unset -f sleep
+unset UNLINK_SOURCE_BEFORE_LINK UNLINK_SOURCE_BEFORE_LINK_ONCE
+jq -e '.status == "passed"
+  and .source_segment.file == "market-updates.20260101T041600000000.ndjson"' \
+  "$prelink_race_case/evidence/real-market-preflight.json" >/dev/null
+
+delayed_case="$preflight_root/delayed-case"
+mkdir -p "$delayed_case/source" "$delayed_case/spool" "$delayed_case/download" \
+  "$delayed_case/evidence"
+delayed_source="$delayed_case/source/market-updates.20260101T042000000000.ndjson"
+sleep() {
+  cp "$compatible" "$delayed_source"
+}
+real_market_segment_preflight "$delayed_case/source" "$delayed_case/spool" \
+  "$delayed_case/download" "$delayed_case/evidence" || {
+  printf 'real-segment preflight did not wait for and pin a newly closed segment\n' >&2
+  exit 1
+}
+unset -f sleep
+jq -e '.status == "passed"
+  and .source_segment.file == "market-updates.20260101T042000000000.ndjson"' \
+  "$delayed_case/evidence/real-market-preflight.json" >/dev/null
+
 empty_case="$preflight_root/empty-case"
 mkdir -p "$empty_case/source" "$empty_case/spool" "$empty_case/download" \
   "$empty_case/evidence"
 empty_stderr="$empty_case/evidence/preflight.stderr"
+sleep() {
+  SECONDS=$segment_wait_deadline
+}
 if real_market_segment_preflight "$empty_case/source" "$empty_case/spool" \
   "$empty_case/download" "$empty_case/evidence" 2>"$empty_stderr"; then
   printf 'real-segment preflight accepted an empty production spool\n' >&2
   exit 1
 fi
-grep -Fxq 'real market preflight found no eligible closed market segment' \
+unset -f sleep
+grep -Fxq \
+  "real market preflight found no eligible closed market segment within ${REAL_MARKET_SEGMENT_WAIT_BUDGET_SECONDS} seconds" \
   "$empty_stderr" || {
   printf 'empty production spool has no exact fail-closed reason\n' >&2
   exit 1
@@ -1480,14 +1840,14 @@ mkdir -p "$unstable_case/source" "$unstable_case/spool" \
   "$unstable_case/download" "$unstable_case/evidence"
 unstable_source="$unstable_case/source/market-updates.20260101T060000000000.ndjson"
 cp "$compatible" "$unstable_source"
-export UNSTABLE_STAT_PATH="$unstable_source"
 export UNSTABLE_STAT_COUNTER="$unstable_case/stat-counter"
+export UNSTABLE_STAT_PATH_FILE="$unstable_case/stat-path"
 if real_market_segment_preflight "$unstable_case/source" "$unstable_case/spool" \
   "$unstable_case/download" "$unstable_case/evidence"; then
   printf 'real-segment preflight accepted an unstable production segment\n' >&2
   exit 1
 fi
-unset UNSTABLE_STAT_PATH UNSTABLE_STAT_COUNTER
+unset UNSTABLE_STAT_PATH UNSTABLE_STAT_COUNTER UNSTABLE_STAT_PATH_FILE
 
 good_case="$preflight_root/good-case"
 mkdir -p "$good_case/source" "$good_case/spool" "$good_case/download" \
@@ -1522,6 +1882,80 @@ jq -e '.status == "passed"
   and .upload_summary.canonical_uploaded_segments == 0' \
   --arg source "$good_uuid" \
   "$good_case/evidence/real-market-preflight.json" >/dev/null
+
+unlink_race_case="$preflight_root/unlink-race-case"
+mkdir -p "$unlink_race_case/source" "$unlink_race_case/spool" \
+  "$unlink_race_case/download" "$unlink_race_case/evidence"
+unlink_race_source="$unlink_race_case/source/market-updates.20260101T021000000000.ndjson"
+cp "$compatible" "$unlink_race_source"
+export LN_COUNT_FILE="$unlink_race_case/ln-count"
+export CTIME_RACE_PATH_FILE="$unlink_race_case/linked-path"
+export CTIME_RACE_COUNTER="$unlink_race_case/ctime-count"
+export UNLINK_SOURCE_AFTER_LINK="$unlink_race_source"
+real_market_segment_preflight "$unlink_race_case/source" "$unlink_race_case/spool" \
+  "$unlink_race_case/download" "$unlink_race_case/evidence" || {
+  printf 'real-segment preflight lost the hardlinked segment after the production uploader unlink race\n' >&2
+  exit 1
+}
+unset UNLINK_SOURCE_AFTER_LINK LN_COUNT_FILE CTIME_RACE_PATH_FILE CTIME_RACE_COUNTER
+[[ ! -e $unlink_race_source ]] || {
+  printf 'real-segment preflight did not delete the production path during the unlink race injection\n' >&2
+  exit 1
+}
+[[ $(<"$unlink_race_case/ln-count") == 1 ]] || {
+  printf 'real-segment preflight recreated the retained link instead of reusing it after unlink-induced ctime drift\n' >&2
+  exit 1
+}
+jq -e '.status == "passed"
+  and .source_segment.file == "market-updates.20260101T021000000000.ndjson"
+  and .source_segment.sha256 == .source_content_sha256
+  and .uploaded_content_sha256 == .source_content_sha256
+  and .upload_summary.uploaded_segments == 1' \
+  "$unlink_race_case/evidence/real-market-preflight.json" >/dev/null || {
+  printf 'real-segment preflight did not preserve content parity after the production path was removed\n' >&2
+  exit 1
+}
+
+bad_mode_case="$preflight_root/bad-mode-case"
+mkdir -p "$bad_mode_case/source" "$bad_mode_case/spool" \
+  "$bad_mode_case/download" "$bad_mode_case/evidence"
+cp "$compatible" \
+  "$bad_mode_case/source/market-updates.20260101T021500000000.ndjson"
+export LINKED_SOURCE_MODE_OWNER='root:wheel:600'
+if real_market_segment_preflight "$bad_mode_case/source" "$bad_mode_case/spool" \
+  "$bad_mode_case/download" "$bad_mode_case/evidence"; then
+  printf 'real-segment preflight accepted a linked segment with the wrong owner or mode\n' >&2
+  exit 1
+fi
+jq -e '.status == "failed"
+  and (.failure_reason | contains("ownership or mode is untrusted"))' \
+  "$bad_mode_case/evidence/real-market-preflight.json" >/dev/null || {
+  printf 'real-segment preflight did not publish failed evidence for a linked segment with the wrong owner or mode\n' >&2
+  exit 1
+}
+unset LINKED_SOURCE_MODE_OWNER
+
+replaced_source_case="$preflight_root/replaced-source-case"
+mkdir -p "$replaced_source_case/source" "$replaced_source_case/spool" \
+  "$replaced_source_case/download" "$replaced_source_case/evidence"
+replaced_source="$replaced_source_case/source/market-updates.20260101T021700000000.ndjson"
+replacement_payload="$replaced_source_case/replacement.ndjson"
+cp "$compatible" "$replaced_source"
+cp "$noncanonical" "$replacement_payload"
+export REPLACE_SOURCE_AFTER_LINK="$replaced_source"
+export REPLACE_SOURCE_WITH="$replacement_payload"
+if real_market_segment_preflight "$replaced_source_case/source" "$replaced_source_case/spool" \
+  "$replaced_source_case/download" "$replaced_source_case/evidence"; then
+  printf 'real-segment preflight accepted a production path replaced by a different inode after linking\n' >&2
+  exit 1
+fi
+jq -e '.status == "failed"
+  and .failure_reason == "production segment path was replaced by a different inode after linking"' \
+  "$replaced_source_case/evidence/real-market-preflight.json" >/dev/null || {
+  printf 'real-segment preflight did not publish failed evidence when the production path was replaced after linking\n' >&2
+  exit 1
+}
+unset REPLACE_SOURCE_AFTER_LINK REPLACE_SOURCE_WITH
 
 # Counterexample (issue #586): a tick-level segment much larger than the scan
 # window must not make the bounded SCAN exceed its budget. The upload path
@@ -2534,8 +2968,29 @@ cutover_transition_line=$(grep -n '^transition_started=true$' "$CUTOVER" \
 (
   baseline_mode=legacy_python
   active_binary="$tmp_dir/active-polymarket-raw-ops"
+  WATCHDOG_BINARY="$tmp_dir/polymarket-market-tape-upload-watchdog.sh"
+  WATCHDOG_SERVICE=polymarket-market-tape-upload-watchdog.service
+  WATCHDOG_TIMER=polymarket-market-tape-upload-watchdog.timer
+  WATCHDOG_SERVICE_PATH="$tmp_dir/$WATCHDOG_SERVICE"
+  WATCHDOG_TIMER_PATH="$tmp_dir/$WATCHDOG_TIMER"
   control_dir="$tmp_dir/global-control"
   release_manifest_name=polymarket-raw-ops-release.json
+  readonly -a BASELINE_UNIT_ASSETS=(
+    polymarket-reference-collector.service
+    polymarket-reference-upload.service
+    polymarket-reference-upload.timer
+    polymarket-market-tape-upload.service
+    polymarket-market-tape-upload.timer
+  )
+  readonly -a UNIT_ASSETS=(
+    polymarket-reference-collector.service
+    polymarket-reference-upload.service
+    polymarket-reference-upload.timer
+    polymarket-market-tape-upload.service
+    polymarket-market-tape-upload.timer
+    polymarket-market-tape-upload-watchdog.service
+    polymarket-market-tape-upload-watchdog.timer
+  )
   readonly -a BUNDLE_ASSETS=(
     polymarket-raw-ops-shadow-gate.sh
     polymarket-raw-ops-cutover.sh
@@ -2555,6 +3010,10 @@ cutover_transition_line=$(grep -n '^transition_started=true$' "$CUTOVER" \
       --property=FragmentPath)
         if [[ $4 == "$fragment_drift_unit" ]]; then
           printf '/run/systemd/transient/%s\n' "$4"
+        elif [[ $4 == "$WATCHDOG_SERVICE" ]]; then
+          printf '%s\n' "$WATCHDOG_SERVICE_PATH"
+        elif [[ $4 == "$WATCHDOG_TIMER" ]]; then
+          printf '%s\n' "$WATCHDOG_TIMER_PATH"
         else
           printf '/etc/systemd/system/%s\n' "$4"
         fi
@@ -2581,6 +3040,32 @@ cutover_transition_line=$(grep -n '^transition_started=true$' "$CUTOVER" \
     printf 'cutover target preflight rejected clean legacy state\n' >&2
     exit 1
   }
+
+  : >"$WATCHDOG_BINARY"
+  chmod 0755 "$WATCHDOG_BINARY"
+  if verify_cutover_target_preflight \
+    "$baseline_mode" "$active_binary" "$control_dir" "$release_manifest_name" \
+    secure_test_file; then
+    printf 'cutover target preflight accepted a partial watchdog baseline\n' >&2
+    exit 1
+  fi
+  : >"$WATCHDOG_SERVICE_PATH"
+  : >"$WATCHDOG_TIMER_PATH"
+  verify_cutover_target_preflight \
+    "$baseline_mode" "$active_binary" "$control_dir" "$release_manifest_name" \
+    secure_test_file || {
+    printf 'cutover target preflight rejected a complete watchdog baseline\n' >&2
+    exit 1
+  }
+
+  chmod 0644 "$WATCHDOG_BINARY"
+  if verify_cutover_target_preflight \
+    "$baseline_mode" "$active_binary" "$control_dir" "$release_manifest_name" \
+    secure_test_file; then
+    printf 'cutover target preflight accepted a non-executable watchdog\n' >&2
+    exit 1
+  fi
+  chmod 0755 "$WATCHDOG_BINARY"
 
   unsafe_control_parent=true
   if verify_cutover_target_preflight \
@@ -2636,9 +3121,7 @@ cutover_transition_line=$(grep -n '^transition_started=true$' "$CUTOVER" \
   fi
   insecure_unit_file=
 
-  for drop_in_unit in polymarket-reference-collector.service \
-    polymarket-reference-upload.service polymarket-reference-upload.timer \
-    polymarket-market-tape-upload.service polymarket-market-tape-upload.timer; do
+  for drop_in_unit in "${UNIT_ASSETS[@]}"; do
     if verify_cutover_target_preflight \
       "$baseline_mode" "$active_binary" "$control_dir" "$release_manifest_name" \
       secure_test_file; then
@@ -3162,7 +3645,7 @@ fi
 # The marker must be a unique, exact checksum of cutover.json and a rerun must
 # fail closed rather than replacing existing evidence.
 cutover_marker_publisher="$tmp_dir/publish-cutover-marker.sh"
-sed -n '/^success_marker="\$evidence_dir\/PASSED.sha256"$/,/^sync -f "\$evidence_dir"$/p' \
+sed -n '/^success_marker="\$evidence_dir\/PASSED.sha256"$/,/^cutover_succeeded=true$/p' \
   "$CUTOVER" >"$cutover_marker_publisher"
 [[ -s $cutover_marker_publisher ]] || {
   printf 'cutover success-marker publisher is missing\n' >&2
@@ -3288,6 +3771,11 @@ exercise_manual_lineage() (
   secure_root_chain() { [[ -d $1 && ! -L $1 ]]; }
   secure_release_directory() { [[ -d $1 && ! -L $1 ]]; }
   secure_regular_file() { [[ -f $1 && ! -L $1 ]]; }
+  WATCHDOG_SUPPRESS_FILE="$evidence/polymarket-upload-watchdog.suppress"
+  remove_watchdog_suppress() {
+    [[ -e $WATCHDOG_SUPPRESS_FILE || -L $WATCHDOG_SUPPRESS_FILE ]] || return 0
+    rm -f -- "$WATCHDOG_SUPPRESS_FILE"
+  }
   prepare_rollback_evidence() { printf 'prepare\n' >>"$mutation_log"; }
   restore_legacy() { printf 'restore\n' >>"$mutation_log"; }
   finalize_rollback_evidence() { printf 'finalize\n' >>"$mutation_log"; }
@@ -3355,6 +3843,11 @@ exercise_manual_bootstrap_lineage() (
   secure_root_chain() { [[ -d $1 && ! -L $1 ]]; }
   secure_release_directory() { [[ -d $1 && ! -L $1 ]]; }
   secure_regular_file() { [[ -f $1 && ! -L $1 ]]; }
+  WATCHDOG_SUPPRESS_FILE="$evidence/polymarket-upload-watchdog.suppress"
+  remove_watchdog_suppress() {
+    [[ -e $WATCHDOG_SUPPRESS_FILE || -L $WATCHDOG_SUPPRESS_FILE ]] || return 0
+    rm -f -- "$WATCHDOG_SUPPRESS_FILE"
+  }
   stat() {
     [[ ${1:-} == -c && ${2:-} == %a && ${3:-} == -- && ${4:-} == "$ACTIVE_BINARY" ]] \
       || return 1
@@ -3423,22 +3916,34 @@ sed -n '/^snapshot_legacy() {$/,/^}$/p' "$CUTOVER" >"$snapshot_legacy_contract"
 }
 exercise_bootstrap_snapshot() (
   set -euo pipefail
-  local case_name=$1 copy_drift=${2:-false} root rollback systemd_fixture candidate_sha baseline_sha
+  local case_name=$1 copy_drift=${2:-false} watchdog_present=${3:-true}
+  local root rollback systemd_fixture candidate_sha baseline_sha
   root="$tmp_dir/bootstrap-snapshot-$case_name"
   rollback="$root/rollback"
   systemd_fixture="$root/systemd"
   mkdir -p "$systemd_fixture" "$root/bin"
-  UNIT_ASSETS=(
+  BASELINE_UNIT_ASSETS=(
     polymarket-reference-collector.service
     polymarket-reference-upload.service
     polymarket-reference-upload.timer
     polymarket-market-tape-upload.service
     polymarket-market-tape-upload.timer
   )
+  UNIT_ASSETS=(
+    "${BASELINE_UNIT_ASSETS[@]}"
+    polymarket-market-tape-upload-watchdog.service
+    polymarket-market-tape-upload-watchdog.timer
+  )
   COLLECTOR_UNIT=polymarket-reference-collector.service
   REFERENCE_UPLOAD_TIMER=polymarket-reference-upload.timer
   MARKET_UPLOAD_TIMER=polymarket-market-tape-upload.timer
-  for asset in "${UNIT_ASSETS[@]}"; do
+  WATCHDOG_SCRIPT_ASSET=polymarket-market-tape-upload-watchdog.sh
+  WATCHDOG_BINARY="$root/bin/$WATCHDOG_SCRIPT_ASSET"
+  WATCHDOG_SERVICE=polymarket-market-tape-upload-watchdog.service
+  WATCHDOG_TIMER=polymarket-market-tape-upload-watchdog.timer
+  WATCHDOG_SERVICE_PATH="$systemd_fixture/$WATCHDOG_SERVICE"
+  WATCHDOG_TIMER_PATH="$systemd_fixture/$WATCHDOG_TIMER"
+  for asset in "${BASELINE_UNIT_ASSETS[@]}"; do
     printf 'unit=%s\n' "$asset" >"$systemd_fixture/$asset"
   done
   UPLOAD_ENV="$root/upload.env"
@@ -3446,6 +3951,12 @@ exercise_bootstrap_snapshot() (
   ACTIVE_BINARY="$root/bin/polymarket-raw-ops"
   printf 'bootstrap-original\n' >"$ACTIVE_BINARY"
   chmod 0755 "$ACTIVE_BINARY"
+  if [[ $watchdog_present == true ]]; then
+    printf 'unit=%s\n' "$WATCHDOG_SERVICE" >"$WATCHDOG_SERVICE_PATH"
+    printf 'unit=%s\n' "$WATCHDOG_TIMER" >"$WATCHDOG_TIMER_PATH"
+    printf 'watchdog\n' >"$WATCHDOG_BINARY"
+    chmod 0755 "$WATCHDOG_BINARY"
+  fi
   CONTROL_DIR="$root/absent-control"
   candidate_sha=$(printf 'c%.0s' {1..64})
   baseline_sha=$(sha256sum "$ACTIVE_BINARY" | awk '{print $1}')
@@ -3488,9 +3999,12 @@ exercise_bootstrap_snapshot() (
     command sync >/dev/null 2>&1 || die 'filesystem sync failed before snapshot digest check'
     (cd "$rollback" && sha256sum --check --strict manifest.sha256 >/dev/null)
     jq -e '.control_dir_present == false' "$rollback/state.json" >/dev/null
+    jq -e --argjson present "$watchdog_present" \
+      '.watchdog_present == $present' "$rollback/state.json" >/dev/null
   )
 )
 exercise_bootstrap_snapshot absent-control
+exercise_bootstrap_snapshot absent-control-and-watchdog false false
 if exercise_bootstrap_snapshot copied-binary-drift true; then
   printf 'bootstrap snapshot accepted a binary changed during copy\n' >&2
   exit 1
@@ -3502,15 +4016,95 @@ sed -n '/^on_exit() {$/,/^}$/p' "$CUTOVER" >"$cutover_failure_cleanup"
   printf 'cutover automatic failure cleanup is missing\n' >&2
   exit 1
 }
+watchdog_suppress_contract="$tmp_dir/cutover-watchdog-suppress.sh"
+sed -n \
+  -e '/^write_watchdog_suppress() {$/,/^}$/p' \
+  -e '/^remove_watchdog_suppress() {$/,/^}$/p' \
+  -e '/^admit_watchdog_suppress() {$/,/^}$/p' \
+  "$CUTOVER" >"$watchdog_suppress_contract"
+[[ -s $watchdog_suppress_contract ]] || {
+  printf 'cutover watchdog suppression contract is missing\n' >&2
+  exit 1
+}
+exercise_cutover_watchdog_suppress() (
+  set -euo pipefail
+  local root=$1 service_state=$2 owner=$3 present=${4:-true}
+  secure_regular_file() { [[ -f $1 && ! -L $1 ]]; }
+  install() { command install "$@"; }
+  die() {
+    printf 'watchdog suppression failed: %s\n' "$*" >&2
+    exit 1
+  }
+  # shellcheck source=/dev/null
+  source "$watchdog_suppress_contract"
+  WATCHDOG_SUPPRESS_FILE="$root/polymarket-upload-watchdog.suppress"
+  WATCHDOG_SERVICE=polymarket-market-tape-upload-watchdog.service
+  WATCHDOG_SERVICE_PATH="$root/$WATCHDOG_SERVICE"
+  [[ $present == false ]] || : >"$WATCHDOG_SERVICE_PATH"
+  systemctl() {
+    [[ $1 == show && $2 == --property=ActiveState && $3 == --value \
+      && $4 == "$WATCHDOG_SERVICE" ]] || return 1
+    printf '%s\n' "$service_state"
+  }
+  admit_watchdog_suppress "$owner"
+)
+watchdog_foreign_dir="$tmp_dir/cutover-watchdog-foreign"
+mkdir "$watchdog_foreign_dir"
+printf '%s\n' '{"schema":"monday.polymarket_cutover_watchdog_suppress.v1","owner":"foreign","observed_at":"2026-08-24T00:00:00Z"}' \
+  >"$watchdog_foreign_dir/polymarket-upload-watchdog.suppress"
+if exercise_cutover_watchdog_suppress "$watchdog_foreign_dir" inactive ours >/dev/null 2>&1; then
+  printf 'cutover admitted a foreign watchdog suppression marker\n' >&2
+  exit 1
+fi
+[[ $(<"$watchdog_foreign_dir/polymarket-upload-watchdog.suppress") \
+  == '{"schema":"monday.polymarket_cutover_watchdog_suppress.v1","owner":"foreign","observed_at":"2026-08-24T00:00:00Z"}' ]] || {
+  printf 'cutover modified a foreign watchdog suppression marker\n' >&2
+  exit 1
+}
+watchdog_active_dir="$tmp_dir/cutover-watchdog-active"
+mkdir "$watchdog_active_dir"
+if exercise_cutover_watchdog_suppress "$watchdog_active_dir" active ours >/dev/null 2>&1; then
+  printf 'cutover admitted an already-running watchdog service\n' >&2
+  exit 1
+fi
+[[ ! -e $watchdog_active_dir/polymarket-upload-watchdog.suppress ]] || {
+  printf 'cutover left its owned watchdog suppression marker after an active-service refusal\n' >&2
+  exit 1
+}
+watchdog_inactive_dir="$tmp_dir/cutover-watchdog-inactive"
+mkdir "$watchdog_inactive_dir"
+exercise_cutover_watchdog_suppress "$watchdog_inactive_dir" inactive ours >/dev/null
+[[ -f $watchdog_inactive_dir/polymarket-upload-watchdog.suppress ]] || {
+  printf 'cutover did not persist its owned watchdog suppression marker\n' >&2
+  exit 1
+}
+watchdog_absent_dir="$tmp_dir/cutover-watchdog-absent"
+mkdir "$watchdog_absent_dir"
+exercise_cutover_watchdog_suppress "$watchdog_absent_dir" absent ours false >/dev/null
+[[ -f $watchdog_absent_dir/polymarket-upload-watchdog.suppress ]] || {
+  printf 'cutover did not admit an absent watchdog baseline\n' >&2
+  exit 1
+}
+
 exercise_failed_cutover_cleanup() (
   set +e
   evidence_dir=$1
   restore_result=$2
   cutover_succeeded=false
   transition_started=true
+  watchdog_suppressed=true
+  watchdog_suppress_owner=ours
+  WATCHDOG_SUPPRESS_FILE="$evidence_dir/polymarket-upload-watchdog.suppress"
+  write_watchdog_suppress() {
+    [[ $1 == "$watchdog_suppress_owner" ]] || return 92
+    [[ -e $WATCHDOG_SUPPRESS_FILE ]] || printf '%s\n' \
+      '{"schema":"monday.polymarket_cutover_watchdog_suppress.v1","owner":"ours"}' \
+      >"$WATCHDOG_SUPPRESS_FILE"
+  }
   restore_legacy() {
     [[ ! -e $evidence_dir/PASSED.sha256 \
-      && -f $evidence_dir/PASSED.rollback-pending.sha256 ]] || return 90
+      && -f $evidence_dir/PASSED.rollback-pending.sha256 \
+      && -f $WATCHDOG_SUPPRESS_FILE ]] || return 90
     printf '%s\n' pending >"$evidence_dir/restore-observed-pending"
     return "$restore_result"
   }
@@ -3519,6 +4113,10 @@ exercise_failed_cutover_cleanup() (
   }
   secure_root_chain() {
     [[ -d $1 && ! -L $1 ]]
+  }
+  remove_watchdog_suppress() {
+    [[ $1 == "$watchdog_suppress_owner" ]] || return 91
+    rm -f -- "$evidence_dir/polymarket-upload-watchdog.suppress"
   }
   die() {
     printf 'rollback evidence transition failed: %s\n' "$*" >&2
@@ -3541,6 +4139,8 @@ automatic_failure_dir="$tmp_dir/cutover-automatic-failure"
 mkdir "$automatic_failure_dir"
 printf '%s\n' '{"schema":"monday.polymarket_cutover.v1"}' \
   >"$automatic_failure_dir/cutover.json"
+printf '%s\n' '{"schema":"monday.polymarket_cutover_watchdog_suppress.v1","owner":"ours","observed_at":"2026-08-24T00:00:00Z"}' \
+  >"$automatic_failure_dir/polymarket-upload-watchdog.suppress"
 publish_cutover_marker "$automatic_failure_dir"
 set +e
 exercise_failed_cutover_cleanup "$automatic_failure_dir" 0 >/dev/null 2>&1
@@ -3551,7 +4151,8 @@ set -e
   && ! -e $automatic_failure_dir/PASSED.rollback-pending.sha256 \
   && -f $automatic_failure_dir/cutover.json \
   && -f $automatic_failure_dir/PASSED.invalid.sha256 \
-  && -f $automatic_failure_dir/restore-observed-pending ]] || {
+  && -f $automatic_failure_dir/restore-observed-pending \
+  && ! -e $automatic_failure_dir/polymarket-upload-watchdog.suppress ]] || {
   printf 'automatic rollback left success-looking cutover evidence\n' >&2
   exit 1
 }
@@ -3564,6 +4165,8 @@ automatic_restore_failure_dir="$tmp_dir/cutover-automatic-restore-failure"
 mkdir "$automatic_restore_failure_dir"
 printf '%s\n' '{"schema":"monday.polymarket_cutover.v1"}' \
   >"$automatic_restore_failure_dir/cutover.json"
+printf '%s\n' '{"schema":"monday.polymarket_cutover_watchdog_suppress.v1","owner":"ours","observed_at":"2026-08-24T00:00:00Z"}' \
+  >"$automatic_restore_failure_dir/polymarket-upload-watchdog.suppress"
 publish_cutover_marker "$automatic_restore_failure_dir"
 set +e
 exercise_failed_cutover_cleanup "$automatic_restore_failure_dir" 1 >/dev/null 2>&1
@@ -3574,7 +4177,8 @@ set -e
   && -f $automatic_restore_failure_dir/PASSED.rollback-pending.sha256 \
   && -f $automatic_restore_failure_dir/cutover.json \
   && ! -e $automatic_restore_failure_dir/PASSED.invalid.sha256 \
-  && -f $automatic_restore_failure_dir/restore-observed-pending ]] || {
+  && -f $automatic_restore_failure_dir/restore-observed-pending \
+  && -f $automatic_restore_failure_dir/polymarket-upload-watchdog.suppress ]] || {
   printf 'failed automatic restore left ambiguous cutover evidence\n' >&2
   exit 1
 }
@@ -3628,6 +4232,17 @@ exercise_manual_rollback() (
   secure_root_chain() {
     [[ -d $1 && ! -L $1 ]]
   }
+  WATCHDOG_SUPPRESS_FILE="$rollback_evidence/polymarket-upload-watchdog.suppress"
+  rollback_candidate=$(printf 'a%.0s' {1..64})
+  remove_watchdog_suppress() {
+    local owner expected
+    owner=$1
+    [[ -e $WATCHDOG_SUPPRESS_FILE || -L $WATCHDOG_SUPPRESS_FILE ]] || return 0
+    [[ -f $WATCHDOG_SUPPRESS_FILE && ! -L $WATCHDOG_SUPPRESS_FILE ]] || return 92
+    expected=$(jq -er '.owner' "$WATCHDOG_SUPPRESS_FILE") || return 93
+    [[ $expected == "$owner" ]] || return 94
+    rm -f -- "$WATCHDOG_SUPPRESS_FILE"
+  }
   die() {
     printf 'manual rollback evidence transition failed: %s\n' "$*" >&2
     exit 1
@@ -3648,6 +4263,8 @@ mkdir "$manual_failure_dir"
 printf '%s\n' '{"schema":"monday.polymarket_cutover.v1"}' \
   >"$manual_failure_dir/cutover.json"
 publish_cutover_marker "$manual_failure_dir"
+printf '%s\n' '{"schema":"monday.polymarket_cutover_watchdog_suppress.v1","owner":"cutover:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:manual-rollback-failure","observed_at":"2026-08-24T00:00:00Z"}' \
+  >"$manual_failure_dir/polymarket-upload-watchdog.suppress"
 set +e
 exercise_manual_rollback "$manual_failure_dir" 1 >/dev/null 2>&1
 manual_failure_status=$?
@@ -3657,6 +4274,7 @@ set -e
   && -f $manual_failure_dir/PASSED.rollback-pending.sha256 \
   && -f $manual_failure_dir/cutover.json \
   && -f $manual_failure_dir/restore-observed-pending \
+  && -f $manual_failure_dir/polymarket-upload-watchdog.suppress \
   && ! -e $manual_failure_dir/PASSED.rolled-back.sha256 \
   && ! -e $manual_failure_dir/cutover.rolled-back.json ]] || {
   printf 'failed manual restoration did not leave rollback-pending evidence\n' >&2
@@ -3675,6 +4293,7 @@ set -e
   && ! -e $manual_failure_dir/PASSED.sha256 \
   && ! -e $manual_failure_dir/PASSED.rollback-pending.sha256 \
   && -f $manual_failure_dir/cutover.json \
+  && ! -e $manual_failure_dir/polymarket-upload-watchdog.suppress \
   && -f $manual_failure_dir/PASSED.rolled-back.sha256 \
   && ! -e $manual_failure_dir/cutover.rolled-back.json ]] || {
   printf 'successful manual rollback retained success-looking evidence\n' >&2
@@ -3684,6 +4303,24 @@ set -e
   cd "$manual_failure_dir"
   sha256sum --check --strict PASSED.rolled-back.sha256 >/dev/null
 )
+
+manual_foreign_marker_dir="$tmp_dir/manual-rollback-foreign-marker"
+mkdir "$manual_foreign_marker_dir"
+printf '%s\n' '{"schema":"monday.polymarket_cutover.v1"}' \
+  >"$manual_foreign_marker_dir/cutover.json"
+publish_cutover_marker "$manual_foreign_marker_dir"
+printf '%s\n' '{"schema":"monday.polymarket_cutover_watchdog_suppress.v1","owner":"foreign","observed_at":"2026-08-24T00:00:00Z"}' \
+  >"$manual_foreign_marker_dir/polymarket-upload-watchdog.suppress"
+set +e
+exercise_manual_rollback "$manual_foreign_marker_dir" 0 >/dev/null 2>&1
+manual_foreign_marker_status=$?
+set -e
+[[ $manual_foreign_marker_status -ne 0 \
+  && -f $manual_foreign_marker_dir/polymarket-upload-watchdog.suppress \
+  && -f $manual_foreign_marker_dir/PASSED.rolled-back.sha256 ]] || {
+  printf 'manual rollback did not fail closed on a foreign watchdog suppression marker\n' >&2
+  exit 1
+}
 
 restore_legacy_contract="$tmp_dir/restore-legacy-contract.sh"
 sed -n '/^restore_legacy() (/,/^)/p' "$CUTOVER" >"$restore_legacy_contract"
@@ -3709,8 +4346,15 @@ exercise_absent_control_dir_restore() (
   REFERENCE_UPLOAD_TIMER=reference-upload.timer
   MARKET_UPLOAD_UNIT=market-upload.service
   MARKET_UPLOAD_TIMER=market-upload.timer
-  UNIT_ASSETS=("$COLLECTOR_UNIT" "$REFERENCE_UPLOAD_UNIT" "$REFERENCE_UPLOAD_TIMER"
-    "$MARKET_UPLOAD_UNIT" "$MARKET_UPLOAD_TIMER")
+  WATCHDOG_SCRIPT_ASSET=polymarket-market-tape-upload-watchdog.sh
+  WATCHDOG_BINARY=$evidence_dir/watchdog
+  WATCHDOG_SERVICE=watchdog.service
+  WATCHDOG_TIMER=watchdog.timer
+  WATCHDOG_SERVICE_PATH=$evidence_dir/$WATCHDOG_SERVICE
+  WATCHDOG_TIMER_PATH=$evidence_dir/$WATCHDOG_TIMER
+  BASELINE_UNIT_ASSETS=("$COLLECTOR_UNIT" "$REFERENCE_UPLOAD_UNIT" \
+    "$REFERENCE_UPLOAD_TIMER" "$MARKET_UPLOAD_UNIT" "$MARKET_UPLOAD_TIMER")
+  UNIT_ASSETS=("${BASELINE_UNIT_ASSETS[@]}" "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER")
   BUNDLE_ASSETS=(candidate-control)
   PYTHON_ASSETS=(legacy-collector.py legacy-uploader.py)
   mkdir -p "$rollback_dir/control" "$CONTROL_DIR"
@@ -3719,11 +4363,14 @@ exercise_absent_control_dir_restore() (
   printf 'candidate control\n' >"$CONTROL_DIR/candidate-control"
   printf 'candidate manifest\n' \
     >"$CONTROL_DIR/${RELEASE_MANIFEST##*/}"
+  printf 'candidate watchdog\n' >"$WATCHDOG_BINARY"
+  printf 'candidate watchdog service\n' >"$WATCHDOG_SERVICE_PATH"
+  printf 'candidate watchdog timer\n' >"$WATCHDOG_TIMER_PATH"
   [[ $extra_control == false ]] || printf 'unexpected\n' >"$CONTROL_DIR/unexpected"
   jq -n --argjson units "$(printf '%s\n' "${UNIT_ASSETS[@]}" \
       | jq -Rn '[inputs] | map({key:.,value:"0644"}) | from_entries')" '
       {baseline_mode:"legacy_python",control_dir_present:false,
-       unit_modes:$units,upload_env_mode:"0640"}' \
+       unit_modes:$units,upload_env_mode:"0640",watchdog_present:false}' \
     >"$rollback_dir/state.json"
   (
     cd "$rollback_dir"
@@ -3749,7 +4396,10 @@ exercise_absent_control_dir_restore "$absent_control_restore_dir"
 absent_control_restore_status=$?
 set -e
 [[ $absent_control_restore_status -ne 0 \
-  && ! -e $absent_control_restore_dir/global-control ]] || {
+  && ! -e $absent_control_restore_dir/global-control \
+  && ! -e $absent_control_restore_dir/watchdog \
+  && ! -e $absent_control_restore_dir/watchdog.service \
+  && ! -e $absent_control_restore_dir/watchdog.timer ]] || {
   printf 'legacy rollback retained an absent control-directory snapshot\n' >&2
   exit 1
 }
@@ -3760,7 +4410,10 @@ exercise_absent_control_dir_restore "$unexpected_control_restore_dir" true
 unexpected_control_restore_status=$?
 set -e
 [[ $unexpected_control_restore_status -eq 66 \
-  && -f $unexpected_control_restore_dir/global-control/unexpected ]] || {
+  && -f $unexpected_control_restore_dir/global-control/unexpected \
+  && ! -e $unexpected_control_restore_dir/watchdog \
+  && ! -e $unexpected_control_restore_dir/watchdog.service \
+  && ! -e $unexpected_control_restore_dir/watchdog.timer ]] || {
   printf 'legacy rollback removed or accepted an unexpected control entry\n' >&2
   exit 1
 }
@@ -5119,9 +5772,19 @@ if ! jq -e -f "$POLICY" "$tmp_dir/long.json" >/dev/null; then
   printf 'gate policy rejected one second of elapsed-time rounding\n' >&2
   exit 1
 fi
-jq '.duration_seconds = 3602' "$tmp_dir/gate.json" >"$tmp_dir/too-long.json"
+jq '.duration_seconds = 3602' "$tmp_dir/gate.json" >"$tmp_dir/body-overrun.json"
+if ! jq -e -f "$POLICY" "$tmp_dir/body-overrun.json" >/dev/null; then
+  printf 'gate policy rejected bounded final-sample work\n' >&2
+  exit 1
+fi
+jq '.duration_seconds = 3691' "$tmp_dir/gate.json" >"$tmp_dir/sample-tail.json"
+if ! jq -e -f "$POLICY" "$tmp_dir/sample-tail.json" >/dev/null; then
+  printf 'gate policy rejected bounded sample and restart-adjudication tail work\n' >&2
+  exit 1
+fi
+jq '.duration_seconds = 3692' "$tmp_dir/gate.json" >"$tmp_dir/too-long.json"
 if jq -e -f "$POLICY" "$tmp_dir/too-long.json" >/dev/null; then
-  printf 'gate policy accepted more than one second of elapsed-time rounding\n' >&2
+  printf 'gate policy accepted more than the bounded observation tail\n' >&2
   exit 1
 fi
 jq '.started_at = "1970-01-01T00:01:41Z"' \
@@ -5718,6 +6381,8 @@ grep -Fq 'upload timeout values remain bound into OSS configuration evidence' "$
   # shellcheck source=/dev/null
   source "$legacy_runtime_budget_contract"
   [[ $REAL_MARKET_PREFLIGHT_BUDGET_SECONDS -eq 1200 \
+    && $REAL_MARKET_SEGMENT_WAIT_BUDGET_SECONDS -eq 5 \
+    && $REAL_MARKET_PREFLIGHT_TOTAL_BUDGET_SECONDS -eq 1265 \
     && $LEGACY_RUNTIME_STABILITY_REQUIRED == true \
     && $LEGACY_RUNTIME_MAX_SECONDS -eq 21600 \
     && $LEGACY_RUNTIME_RESERVE_SECONDS -eq 60 \
@@ -5735,12 +6400,12 @@ grep -Fq 'upload timeout values remain bound into OSS configuration evidence' "$
   monotonic_uptime_seconds() { printf '20906\n'; }
   zstd_timeout_seconds=3600
   oss_copy_timeout_seconds=1800
-  required=$((REAL_MARKET_PREFLIGHT_BUDGET_SECONDS \
+  required=$((REAL_MARKET_PREFLIGHT_TOTAL_BUDGET_SECONDS \
     + MINIMUM_GATE_SECONDS \
     + PARITY_CUTOFF_LAG_SECONDS \
     + zstd_timeout_seconds + oss_copy_timeout_seconds \
     + LEGACY_RUNTIME_RESERVE_SECONDS))
-  [[ $required -eq 10320 ]] || {
+  [[ $required -eq 10385 ]] || {
     printf 'Gate runtime budget does not cover bounded post-gate uploads\n' >&2
     exit 1
   }
@@ -5817,7 +6482,7 @@ grep -Fq 'upload timeout values remain bound into OSS configuration evidence' "$
     printf 'Gate did not bind legacy identity around real preflight\n' >&2
     exit 1
   }
-  [[ $(<"$timeout_log") == '--signal=KILL 1200 env '* ]] || {
+  [[ $(<"$timeout_log") == '--signal=KILL 1265 env '* ]] || {
     printf 'Gate real preflight does not have an exact hard deadline\n' >&2
     exit 1
   }
@@ -5834,6 +6499,11 @@ grep -Fq 'run_before_deadline() {' "$preflight_deadline_contract" || {
 grep -Fq 'preflight_deadline=$((SECONDS + REAL_MARKET_PREFLIGHT_BUDGET_SECONDS))' \
   "$GATE" || {
   printf 'Gate real preflight has no overall deadline\n' >&2
+  exit 1
+}
+grep -Fq 'segment_wait_deadline=$((SECONDS + REAL_MARKET_SEGMENT_WAIT_BUDGET_SECONDS))' \
+  "$GATE" || {
+  printf 'Gate real-segment race window has no deadline\n' >&2
   exit 1
 }
 grep -Fq 'run_before_deadline "$preflight_deadline" runuser' "$GATE" || {
@@ -6340,7 +7010,7 @@ grep -Fq '"$now_uptime" "$MAX_HEALTH_SILENCE_SECONDS")' "$GATE"
 grep -Fq 'legacy_health_decision=${legacy_health_result%%:*}' "$GATE"
 grep -Fq 'legacy_api_error_started_at=${legacy_health_result#*:}' "$GATE"
 legacy_transition_line=$(grep -nF \
-  'legacy_health_result=$(legacy_health_transition' "$GATE" | cut -d: -f1)
+  'legacy_health_result=$(legacy_health_transition' "$GATE" | head -n 1 | cut -d: -f1)
 health_settle_line=$(grep -nF \
   '  if ((elapsed >= HEALTH_SETTLE_SECONDS)); then' "$GATE" | cut -d: -f1)
 if ((legacy_transition_line >= health_settle_line)); then
@@ -6352,6 +7022,36 @@ grep -Fq 'observation_deadline=$gate_seconds' "$GATE"
 grep -Fq '&& ((observation_deadline < HEALTH_SETTLE_SECONDS)); then' "$GATE"
 grep -Fq 'observation_deadline=$HEALTH_SETTLE_SECONDS' "$GATE"
 grep -Fq '((elapsed < observation_deadline)) || break' "$GATE"
+awk '
+  /^common_cutoff=$/ { observation_armed = 1 }
+  observation_armed && /^while :; do$/ { in_observation = 1; next }
+  in_observation && /^  elapsed=\$\(\(now_uptime - start_uptime\)\)$/ {
+    elapsed_samples++
+    if (elapsed_samples == 2) resample_line = NR
+    if (elapsed_samples == 3) final_resample_line = NR
+  }
+  in_observation && /^  if baseline_health_requires_continuous_freshness / {
+    health_checks++
+    if (health_checks == 1) health_sample_line = NR
+    if (health_checks == 2) final_health_line = NR
+  }
+  in_observation && /^  if \(\(elapsed >= gate_seconds\)\)/ {
+    completion_line = NR
+  }
+  in_observation && /^  \(\(elapsed < observation_deadline\)\) \|\| break$/ {
+    deadline_line = NR
+  }
+  in_observation && /^done$/ {
+    exit !(elapsed_samples == 3 && health_checks == 2 &&
+      resample_line < health_sample_line &&
+      final_resample_line < final_health_line &&
+      final_health_line < completion_line &&
+      completion_line < deadline_line)
+  }
+' "$GATE" || {
+  printf 'Gate observation loop does not re-sample elapsed time before completion and sleep decisions\n' >&2
+  exit 1
+}
 grep -Fq 'if ((elapsed >= HEALTH_SETTLE_SECONDS)); then' "$GATE"
 if grep -Fq 'if ((elapsed >= HEALTH_SETTLE_SECONDS)) || [[ $test_only == true ]]; then' "$GATE"; then
   printf 'short shadow gate bypasses the initial health settle window\n' >&2
@@ -6658,8 +7358,10 @@ if grep -Fq 'verify_fresh_legacy_runtime' "$cutover_legacy_rollback"; then
   printf 'legacy rollback still waits for a full-cycle health publication\n' >&2
   exit 1
 fi
-legacy_drain_line=$(grep -n '^[[:space:]]*verify_oneshot_success "$REFERENCE_UPLOAD_UNIT"' "$CUTOVER" \
-  | head -1 | cut -d: -f1)
+if grep -Fq 'verify_oneshot_success "$REFERENCE_UPLOAD_UNIT"' "$cutover_legacy_promotion"; then
+  printf 'cutover still synchronously drains the baseline reference uploader before stop\n' >&2
+  exit 1
+fi
 legacy_cursor_line=$(grep -n '^[[:space:]]*legacy_stop_cursor=$(journal_cursor "$COLLECTOR_UNIT")' \
   "$CUTOVER" | cut -d: -f1)
 legacy_final_runtime_line=$(grep -n \
@@ -6727,12 +7429,61 @@ run_reset_case inactive 2 true success 1
 run_reset_case failed 0 false failure 1
 run_reset_case active 0 true failure 0
 
+saved_unit_state_contract="$tmp_dir/saved-unit-state-contract.sh"
+sed -n '/^verify_saved_unit_state() {$/,/^}$/p' "$CUTOVER" >"$saved_unit_state_contract"
+[[ -s $saved_unit_state_contract ]] || {
+  printf 'saved unit-state verifier is missing\n' >&2
+  exit 1
+}
+exercise_saved_unit_state() (
+  set -euo pipefail
+  local enabled_json=$1 active_json=$2 enabled_now=$3 active_now=$4
+  COLLECTOR_UNIT=collector.service
+  REFERENCE_UPLOAD_TIMER=reference-upload.timer
+  MARKET_UPLOAD_TIMER=market-upload.timer
+  WATCHDOG_TIMER=watchdog.timer
+  unit_enabled() { [[ $2 == true ]] && return 0 || return 1; }
+  unit_active() { [[ $2 == true ]] && return 0 || return 1; }
+  # shellcheck source=/dev/null
+  source "$saved_unit_state_contract"
+  unit_enabled() {
+    case "$1" in
+      collector.service) [[ $enabled_now == true ]] ;;
+      reference-upload.timer|market-upload.timer|watchdog.timer) [[ $enabled_now == true ]] ;;
+      *) return 1 ;;
+    esac
+  }
+  unit_active() {
+    case "$1" in
+      collector.service) [[ $active_now == true ]] ;;
+      reference-upload.timer|market-upload.timer|watchdog.timer) [[ $active_now == true ]] ;;
+      *) return 1 ;;
+    esac
+  }
+  state_json="$tmp_dir/saved-unit-state.json"
+  jq -n --arg enabled "$enabled_json" --arg active "$active_json" '
+    {watchdog_present:true,units:{
+      "collector.service":{enabled:($enabled|fromjson),active:($active|fromjson)},
+      "reference-upload.timer":{enabled:($enabled|fromjson),active:($active|fromjson)},
+      "market-upload.timer":{enabled:($enabled|fromjson),active:($active|fromjson)},
+      "watchdog.timer":{enabled:($enabled|fromjson),active:($active|fromjson)}
+    }}' >"$state_json"
+  verify_saved_unit_state "$state_json"
+)
+exercise_saved_unit_state false false false false || {
+  printf 'saved unit-state verifier rejected disabled/inactive rollback state\n' >&2
+  exit 1
+}
+if exercise_saved_unit_state null false false false >/dev/null 2>&1; then
+  printf 'saved unit-state verifier accepted a non-boolean enabled value\n' >&2
+  exit 1
+fi
+
 cutover_reset_line=$(grep -n '^reset_failed_unit_if_needed "$COLLECTOR_UNIT"$' "$CUTOVER" \
   | cut -d: -f1)
 cutover_restart_line=$(grep -n '^systemctl restart "$COLLECTOR_UNIT"$' "$CUTOVER" \
   | cut -d: -f1)
-((legacy_drain_line < legacy_cursor_line \
-  && legacy_cursor_line < legacy_final_oss_line \
+((legacy_cursor_line < legacy_final_oss_line \
   && legacy_final_oss_line < legacy_final_runtime_line \
   && legacy_final_runtime_line < cutover_stop_line \
   && cutover_stop_line < legacy_journal_guard_line \
@@ -6821,15 +7572,37 @@ cutover_final_upload_line=$(grep -n '^verify_upload_units "$pinned_upload_env"' 
 cutover_final_oss_line=$(grep -n \
   'pinned OSS configuration changed before cutover completion' "$CUTOVER" \
   | cut -d: -f1)
+cutover_watchdog_remove_line=$(grep -n \
+  '^remove_watchdog_suppress "$watchdog_suppress_owner"$' "$CUTOVER" \
+  | tail -1 | cut -d: -f1)
+cutover_watchdog_absent_line=$(grep -nF \
+  "[[ ! -e \$WATCHDOG_SUPPRESS_FILE && ! -L \$WATCHDOG_SUPPRESS_FILE ]] \\" "$CUTOVER" \
+  | tail -1 | cut -d: -f1)
+cutover_watchdog_probe_line=$(grep -n '^verify_watchdog_probe "\$watchdog_probe_journal"' \
+  "$CUTOVER" | cut -d: -f1)
+cutover_watchdog_probe_sync_line=$(grep -n '^sync "\$watchdog_probe_journal"$' "$CUTOVER" \
+  | cut -d: -f1)
+cutover_watchdog_timer_restart_line=$(grep -n '^systemctl restart "\$WATCHDOG_TIMER"$' \
+  "$CUTOVER" | tail -1 | cut -d: -f1)
 cutover_marker_hash_line=$(grep -n '^  sha256sum cutover.json >' "$CUTOVER" | cut -d: -f1)
 cutover_marker_move_line=$(grep -n '^mv -Tf "$success_marker_tmp" "$success_marker"$' \
   "$CUTOVER" | cut -d: -f1)
-cutover_marker_sync_line=$(grep -n '^sync "$success_marker"$' "$CUTOVER" | cut -d: -f1)
+cutover_marker_sync_line=$(grep -n '^sync "$success_marker"$' "$CUTOVER" \
+  | head -1 | cut -d: -f1)
 cutover_marker_dir_sync_line=$(grep -n '^sync -f "$evidence_dir"$' "$CUTOVER" \
+  | tail -1 | cut -d: -f1)
+cutover_marker_touch_line=$(grep -n '^touch -m -- "$success_marker"$' "$CUTOVER" \
+  | cut -d: -f1)
+cutover_marker_final_sync_line=$(grep -n '^sync "$success_marker"$' "$CUTOVER" \
   | tail -1 | cut -d: -f1)
 cutover_success_line=$(grep -n '^cutover_succeeded=true$' "$CUTOVER" | cut -d: -f1)
 cutover_trap_off_line=$(grep -n '^trap - EXIT$' "$CUTOVER" | tail -1 | cut -d: -f1)
-((cutover_sync_line < cutover_rollback_sync_line \
+((cutover_watchdog_remove_line < cutover_watchdog_absent_line \
+  && cutover_watchdog_absent_line < cutover_watchdog_probe_line \
+  && cutover_watchdog_probe_line < cutover_watchdog_probe_sync_line \
+  && cutover_watchdog_probe_sync_line < cutover_watchdog_timer_restart_line \
+  && cutover_watchdog_timer_restart_line < cutover_sync_line \
+  && cutover_sync_line < cutover_rollback_sync_line \
   && cutover_rollback_sync_line < cutover_release_sync_line \
   && cutover_release_sync_line < cutover_final_runtime_line \
   && cutover_final_runtime_line < cutover_final_upload_line \
@@ -6838,7 +7611,9 @@ cutover_trap_off_line=$(grep -n '^trap - EXIT$' "$CUTOVER" | tail -1 | cut -d: -
   && cutover_marker_hash_line < cutover_marker_move_line \
   && cutover_marker_move_line < cutover_marker_sync_line \
   && cutover_marker_sync_line < cutover_marker_dir_sync_line \
-  && cutover_marker_dir_sync_line < cutover_success_line \
+  && cutover_marker_dir_sync_line < cutover_marker_touch_line \
+  && cutover_marker_touch_line < cutover_marker_final_sync_line \
+  && cutover_marker_final_sync_line < cutover_success_line \
   && cutover_success_line < cutover_trap_off_line)) || {
   printf 'cutover publishes success before final verification or durable marker sync\n' >&2
   exit 1
@@ -6852,21 +7627,36 @@ cutover_trap_off_line=$(grep -n '^trap - EXIT$' "$CUTOVER" | tail -1 | cut -d: -
   printf 'cutover still requires terminal success for the complete market backlog\n' >&2
   exit 1
 }
+[[ $(grep -c '^systemctl start "$REFERENCE_UPLOAD_UNIT"$' "$CUTOVER") -eq 0 ]] || {
+  printf 'cutover still synchronously drains the complete reference backlog\n' >&2
+  exit 1
+}
+[[ $(grep -c '^verify_oneshot_success "$REFERENCE_UPLOAD_UNIT"' "$CUTOVER") -eq 0 ]] || {
+  printf 'cutover still requires terminal success for the complete reference backlog\n' >&2
+  exit 1
+}
+grep -Fq 'systemctl start --no-block "$REFERENCE_UPLOAD_UNIT"' "$CUTOVER"
+grep -Fq \
+  'verify_deferred_upload "$REFERENCE_UPLOAD_UNIT" "$candidate_binary"' "$CUTOVER"
 grep -Fq 'systemctl start --no-block "$MARKET_UPLOAD_UNIT"' "$CUTOVER"
 grep -Fq \
-  'verify_deferred_market_upload "$candidate_binary" "$market_upload_invocation_before"' \
+  'verify_deferred_upload "$MARKET_UPLOAD_UNIT" "$candidate_binary"' \
   "$CUTOVER"
+grep -Fq 'reset_failed_unit_if_needed "$REFERENCE_UPLOAD_UNIT"' "$CUTOVER"
 grep -Fq 'reset_failed_unit_if_needed "$MARKET_UPLOAD_UNIT"' "$CUTOVER"
-[[ $(grep -c 'systemctl is-failed --quiet "$MARKET_UPLOAD_UNIT"' "$CUTOVER") -ge 3 ]]
+[[ $(grep -c 'systemctl is-failed --quiet "$MARKET_UPLOAD_UNIT"' "$CUTOVER") -ge 2 ]]
+[[ $(grep -c 'systemctl is-failed --quiet "$REFERENCE_UPLOAD_UNIT"' "$CUTOVER") -ge 2 ]]
 grep -Fq 'unit_active "$REFERENCE_UPLOAD_TIMER"' "$CUTOVER"
 grep -Fq 'unit_active "$MARKET_UPLOAD_TIMER"' "$CUTOVER"
 grep -Fq 'market_upload_gate_verified:true' "$CUTOVER"
+grep -Fq 'reference_upload_terminal_success_required:false' "$CUTOVER"
+grep -Fq 'reference_backlog_deferred_to_timer:true' "$CUTOVER"
 grep -Fq 'market_upload_terminal_success_required:false' "$CUTOVER"
 grep -Fq 'market_backlog_deferred_to_timer:true' "$CUTOVER"
 
 deferred_upload_functions="$tmp_dir/deferred-upload-functions.sh"
 awk '
-  /^verify_oneshot_success\(\) \{$/ || /^verify_deferred_market_upload\(\) \{$/ {
+  /^verify_oneshot_success\(\) \{$/ || /^verify_deferred_upload\(\) \{$/ {
     copy=1
   }
   copy {print}
@@ -6881,7 +7671,7 @@ run_deferred_upload_case() (
   local pid_state="$tmp_dir/deferred-upload-pid-$test_case"
   local exe_state="$tmp_dir/deferred-upload-exe-$test_case"
   local preexec_state="$tmp_dir/deferred-upload-preexec-$test_case"
-  MARKET_UPLOAD_UNIT=polymarket-market-tape-upload.service
+  local unit=polymarket-market-tape-upload.service
   systemctl() {
     if [[ $1 == is-failed ]]; then
       [[ $test_case == failed ]]
@@ -6943,7 +7733,7 @@ run_deferred_upload_case() (
   }
   sleep() { : >"$tmp_dir/deferred-upload-slept-$test_case"; }
   source "$deferred_upload_functions"
-  verify_deferred_market_upload "$expected_binary" "$previous_invocation"
+  verify_deferred_upload "$unit" "$expected_binary" "$previous_invocation"
 )
 
 for rejected_case in stale failed inactive-failed mismatched-exe active-mismatched-exe; do
@@ -6964,6 +7754,99 @@ for retry_case in pid-delayed exe-delayed preexec-delayed; do
     exit 1
   fi
 done
+
+watchdog_probe_functions="$tmp_dir/watchdog-probe-functions.sh"
+sed -n '/^verify_watchdog_probe() {$/,/^}$/p' "$CUTOVER" >"$watchdog_probe_functions"
+[[ -s $watchdog_probe_functions ]] || {
+  printf 'cutover watchdog probe helper is missing\n' >&2
+  exit 1
+}
+run_watchdog_probe_case() (
+  local test_case=$1
+  local root="$tmp_dir/watchdog-probe-$test_case"
+  local probe_status=0
+  probe_previous_invocation=11111111111111111111111111111111
+  probe_new_invocation=22222222222222222222222222222222
+  probe_wrong_invocation=33333333333333333333333333333333
+  mkdir -p "$root"
+  WATCHDOG_SUPPRESS_FILE="$root/polymarket-upload-watchdog.suppress"
+  WATCHDOG_SERVICE=polymarket-market-tape-upload-watchdog.service
+  reset_failed_unit_if_needed() { [[ $1 == "$WATCHDOG_SERVICE" ]]; }
+  systemctl() {
+    case "$1" in
+      is-failed) return 1 ;;
+      start) : >"$root/started"; return 0 ;;
+      --sync) return 0 ;;
+      show)
+        case "$2" in
+          --property=InvocationID)
+            [[ -e $root/started ]] \
+              && printf '%s\n' "$probe_new_invocation" \
+              || printf '%s\n' "$probe_previous_invocation"
+            ;;
+          --property=ActiveState) printf '%s\n' inactive ;;
+          --property=Result) printf '%s\n' success ;;
+          --property=ExecMainStatus) printf '%s\n' 0 ;;
+          *) return 1 ;;
+        esac
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  journalctl() {
+    if [[ $1 == --sync ]]; then
+      return 0
+    fi
+    case "$test_case" in
+      empty-journal) ;;
+      mixed-invocation)
+        printf '%s\n' \
+          '{"_SYSTEMD_INVOCATION_ID":"'"$probe_new_invocation"'","MESSAGE":"market_pending_rotated_tapes=1 reference_pending_rotated_tapes=0"}' \
+          '{"_SYSTEMD_INVOCATION_ID":"'"$probe_wrong_invocation"'","MESSAGE":"market_pending_rotated_tapes=2 reference_pending_rotated_tapes=0"}'
+        ;;
+      missing-stats)
+        printf '%s\n' \
+          '{"_SYSTEMD_INVOCATION_ID":"'"$probe_new_invocation"'","MESSAGE":"watchdog probe without stats"}'
+        ;;
+      suppressed-message)
+        printf '%s\n' \
+          '{"_SYSTEMD_INVOCATION_ID":"'"$probe_new_invocation"'","MESSAGE":"suppressed: /run/monday/polymarket-upload-watchdog.suppress present; skipping all remediation"}'
+        ;;
+      *)
+        printf '%s\n' \
+          '{"_SYSTEMD_INVOCATION_ID":"'"$probe_new_invocation"'","MESSAGE":"market_pending_rotated_tapes=1 reference_pending_rotated_tapes=0 data_free_gb=10"}' \
+          '{"_SYSTEMD_INVOCATION_ID":"'"$probe_new_invocation"'","MESSAGE":"watchdog probe complete"}'
+        ;;
+    esac
+  }
+  sleep() { :; }
+  if [[ $test_case == suppressed ]]; then
+    printf '%s\n' '{"schema":"monday.polymarket_cutover_watchdog_suppress.v1"}' \
+      >"$WATCHDOG_SUPPRESS_FILE"
+  fi
+  # shellcheck source=/dev/null
+  source "$watchdog_probe_functions"
+  verify_watchdog_probe "$root/watchdog-probe.journal" || probe_status=$?
+  if [[ $test_case != success ]]; then
+    ((probe_status == 0))
+    return
+  fi
+  ((probe_status == 0))
+  [[ $WATCHDOG_PROBE_INVOCATION_ID == "$probe_new_invocation" \
+    && $WATCHDOG_PROBE_ACTIVE_STATE == inactive \
+    && $WATCHDOG_PROBE_RESULT == success \
+    && $WATCHDOG_PROBE_STATUS == 0 \
+    && -s $root/watchdog-probe.journal \
+    && $WATCHDOG_PROBE_JOURNAL_SHA256 \
+      == $(sha256sum "$root/watchdog-probe.journal" | awk '{print $1}') ]]
+)
+for rejected_case in suppressed empty-journal mixed-invocation missing-stats suppressed-message; do
+  if run_watchdog_probe_case "$rejected_case"; then
+    printf 'watchdog probe helper accepted counterexample: %s\n' "$rejected_case" >&2
+    exit 1
+  fi
+done
+run_watchdog_probe_case success
 
 snapshot_nullglob_line=$(grep -n '^    shopt -s nullglob$' "$CUTOVER" | cut -d: -f1)
 snapshot_manifest_line=$(grep -n \
@@ -7086,6 +7969,46 @@ cutover_assets=$(extract_bundle_assets "$CUTOVER")
   printf 'ACR artifact and release-control bundle asset lists differ\n' >&2
   exit 1
 }
+for watchdog_asset in \
+  polymarket-market-tape-upload-watchdog.sh \
+  polymarket-market-tape-upload-watchdog.service \
+  polymarket-market-tape-upload-watchdog.timer; do
+  grep -Fxq "$watchdog_asset" <<<"$workflow_assets" || {
+    printf 'Polymarket release bundle omits %s\n' "$watchdog_asset" >&2
+    exit 1
+  }
+done
+extract_array_assets() {
+  local array_name=$1 file=$2
+  sed -n \
+    "/^[[:space:]]*readonly -a $array_name=(\$/,/^[[:space:]]*)\$/p" "$file" \
+    | sed '1d;$d;s/^[[:space:]]*//'
+}
+gate_unit_assets=$(extract_array_assets UNIT_ASSETS "$GATE")
+cutover_unit_assets=$(extract_array_assets UNIT_ASSETS "$CUTOVER")
+[[ -n $gate_unit_assets && $gate_unit_assets == "$cutover_unit_assets" ]] || {
+  printf 'Gate and cutover governed unit lists differ\n' >&2
+  exit 1
+}
+for watchdog_unit in polymarket-market-tape-upload-watchdog.service \
+  polymarket-market-tape-upload-watchdog.timer; do
+  grep -Fxq "$watchdog_unit" <<<"$cutover_unit_assets" || {
+    printf 'Polymarket governed unit list omits %s\n' "$watchdog_unit" >&2
+    exit 1
+  }
+done
+gate_baseline_unit_assets=$(extract_array_assets BASELINE_UNIT_ASSETS "$GATE")
+cutover_baseline_unit_assets=$(extract_array_assets BASELINE_UNIT_ASSETS "$CUTOVER")
+[[ -n $gate_baseline_unit_assets \
+  && $gate_baseline_unit_assets == "$cutover_baseline_unit_assets" ]] || {
+  printf 'Gate and cutover baseline unit lists differ\n' >&2
+  exit 1
+}
+if grep -Fq 'polymarket-market-tape-upload-watchdog.' \
+  <<<"$cutover_baseline_unit_assets"; then
+  printf 'First governed rollout incorrectly requires watchdog baseline assets\n' >&2
+  exit 1
+fi
 grep -Fq '@${{ steps.build.outputs.digest }}' "$WORKFLOW"
 if grep -F 'IMAGE:' "$WORKFLOW" | grep -Fq ':${{ github.sha }}'; then
   printf 'workflow still extracts the collector from a mutable SHA tag\n' >&2
@@ -7149,11 +8072,11 @@ join_shell_continuations "$CUTOVER" >"$cutover_joined"
 }
 [[ $(grep -c \
   '^[[:space:]]*verify_upload_units "\$pinned_upload_env" "\$REFERENCE_UPLOAD_EXEC" "\$MARKET_UPLOAD_EXEC" ' \
-  "$cutover_joined") -eq 5 ]] || {
+  "$cutover_joined") -eq 6 ]] || {
   printf 'cutover no longer verifies promoted upload units against candidate identity\n' >&2
   exit 1
 }
-[[ $(grep -c '^[[:space:]]*verify_upload_units "' "$cutover_joined") -eq 7 ]] || {
+[[ $(grep -c '^[[:space:]]*verify_upload_units "' "$cutover_joined") -eq 8 ]] || {
   printf 'unexpected verify_upload_units call count in cutover\n' >&2
   exit 1
 }
@@ -7322,6 +8245,280 @@ run_upload_units_case promoted "$candidate_reference_exec" "$candidate_market_ex
   printf 'promoted upload units rejected against candidate identity\n' >&2
   exit 1
 }
+
+# Post-cutover readback must bind the exact runtime before it downloads both
+# production OSS triplets, and it must never mutate systemd or the cutover evidence.
+readback_contract="$tmp_dir/readback-contract.sh"
+sed -n \
+  -e '/^verify_named_marker() {$/,/^}$/p' \
+  -e '/^production_upload_status() {$/,/^}$/p' \
+  -e '/^post_cutover_oss_triplet() {$/,/^}$/p' \
+  -e '/^cleanup_readback_download_root() {$/,/^}$/p' \
+  -e '/^verify_post_cutover_runtime() {$/,/^}$/p' \
+  -e '/^readback_cutover() {$/,/^}$/p' \
+  "$CUTOVER" >"$readback_contract"
+for helper in verify_named_marker production_upload_status post_cutover_oss_triplet \
+  cleanup_readback_download_root verify_post_cutover_runtime readback_cutover; do
+  grep -Fq "$helper() {" "$readback_contract" || {
+    printf 'post-cutover readback helper is missing: %s\n' "$helper" >&2
+    exit 1
+  }
+done
+grep -Fq \
+  '"$worker" --oss-triplet-readback-worker "$upload_env"' "$readback_contract"
+if grep -Eq 'systemctl (start|stop|restart|enable|disable|mask|unmask|reset-failed)' \
+  "$readback_contract"; then
+  printf 'post-cutover readback can mutate systemd state\n' >&2
+  exit 1
+fi
+grep -Fq 'polymarket-raw-ops-cutover.sh readback <cutover-evidence-directory>' \
+  "$CUTOVER"
+readback_dispatch_line=$(grep -n '^if \[\[ \$mode == readback \]\]; then$' "$CUTOVER" \
+  | cut -d: -f1)
+common_release_lock_line=$(grep -n '^exec 9>"\$LOCK_FILE"$' "$CUTOVER" \
+  | tail -1 | cut -d: -f1)
+((readback_dispatch_line < common_release_lock_line)) || {
+  printf 'post-cutover readback holds the mutation lock during OSS downloads\n' >&2
+  exit 1
+}
+health_poly_success_max_age=$(sed -n \
+  's/^POLY_SUCCESS_MAX_AGE=\([0-9][0-9]*\)$/\1/p' \
+  "$SCRIPT_DIR/monday-collector-health.sh")
+cutover_poly_success_max_age=$(sed -n \
+  's/^readonly POLY_SUCCESS_MAX_AGE_SECONDS=\([0-9][0-9]*\)$/\1/p' "$CUTOVER")
+[[ -n $health_poly_success_max_age \
+  && $cutover_poly_success_max_age == "$health_poly_success_max_age" ]] || {
+  printf 'post-cutover upload freshness differs from collector health\n' >&2
+  exit 1
+}
+
+run_readback_case() (
+  set -euo pipefail
+  local test_case=$1 root="$tmp_dir/readback-$1"
+  local candidate_sha source_revision bundle_sha manifest_sha archive_sha oss_sha
+  local evidence candidate_binary pinned_upload_env worker output status
+  local spool_dataset spool dataset runtime_checks=0
+  mkdir -p "$root"
+  candidate_sha=$(printf 'a%.0s' {1..64})
+  source_revision=$(printf 'b%.0s' {1..40})
+  bundle_sha=$(printf 'c%.0s' {1..64})
+  manifest_sha=$(printf 'd%.0s' {1..64})
+  archive_sha=$(printf 'e%.0s' {1..64})
+  oss_sha=$(printf 'f%.0s' {1..64})
+  EVIDENCE_ROOT="$root/evidence"
+  RELEASE_ROOT="$root/releases"
+  CONTROL_DIR="$root/control"
+  LOCK_FILE="$root/release.lock"
+  POLY_SUCCESS_MAX_AGE_SECONDS=$cutover_poly_success_max_age
+  RELEASE_MANIFEST="$CONTROL_DIR/polymarket-raw-ops-release.json"
+  REFERENCE_SPOOL="$root/reference"
+  MARKET_SPOOL="$root/market"
+  COLLECTOR_UNIT=polymarket-reference-collector.service
+  REFERENCE_UPLOAD_UNIT=polymarket-reference-upload.service
+  REFERENCE_UPLOAD_TIMER=polymarket-reference-upload.timer
+  MARKET_UPLOAD_UNIT=polymarket-market-tape-upload.service
+  MARKET_UPLOAD_TIMER=polymarket-market-tape-upload.timer
+  WATCHDOG_SUPPRESS_FILE="$root/watchdog.suppress"
+  REFERENCE_UPLOAD_EXEC=reference-upload
+  MARKET_UPLOAD_EXEC=market-upload
+  mkdir -p "$EVIDENCE_ROOT/run" "$RELEASE_ROOT/$candidate_sha" \
+    "$CONTROL_DIR" "$REFERENCE_SPOOL" "$MARKET_SPOOL"
+  evidence="$EVIDENCE_ROOT/run"
+  candidate_binary="$RELEASE_ROOT/$candidate_sha/polymarket-raw-ops"
+  pinned_upload_env="$RELEASE_ROOT/$candidate_sha/polymarket-upload-env-$oss_sha.env"
+  worker="$CONTROL_DIR/polymarket-raw-ops-shadow-gate.sh"
+  printf '#!/bin/sh\nexit 0\n' >"$candidate_binary"
+  chmod +x "$candidate_binary"
+  printf 'pinned\n' >"$pinned_upload_env"
+  printf 'release\n' >"$RELEASE_MANIFEST"
+  cat >"$worker" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$READBACK_WORKER_LOG"
+printf 'worker:%s\n' "$5" >>"$READBACK_EVENT_LOG"
+[[ ${READBACK_WORKER_FAIL:-false} != true ]] || exit 1
+mkdir "$6"
+jq -cn --arg uri "$4" --arg dataset "$5" \
+  --arg start_recorded_at "${READBACK_START_AT:-2026-08-26T00:01:00Z}" \
+  '{uri:$uri,dataset:$dataset,file:"market-updates.test.ndjson.zst",bytes:10,
+    sha256:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    source_bytes:20,
+    manifest_sha256:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    success_sha256:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    canonical:true,segment_complete:true,
+    start_recorded_at:$start_recorded_at,
+    end_recorded_at:"2026-08-26T00:02:00Z"}'
+if [[ ${READBACK_STATUS_DRIFT:-false} == true && $5 == crypto_expiry ]]; then
+  jq '.pending_segments = 1' "$READBACK_STATUS_DRIFT_PATH" \
+    >"$READBACK_STATUS_DRIFT_PATH.tmp"
+  mv "$READBACK_STATUS_DRIFT_PATH.tmp" "$READBACK_STATUS_DRIFT_PATH"
+elif [[ ${READBACK_STATUS_ADVANCE:-false} == true && $5 == crypto_expiry ]]; then
+  jq '.last_uploaded_object |= sub("market-updates.test"; "market-updates.next")' \
+    "$READBACK_STATUS_DRIFT_PATH" >"$READBACK_STATUS_DRIFT_PATH.tmp"
+  mv "$READBACK_STATUS_DRIFT_PATH.tmp" "$READBACK_STATUS_DRIFT_PATH"
+fi
+SH
+  chmod +x "$worker"
+  jq -n --arg candidate "$candidate_sha" --arg source "$source_revision" \
+    --arg bundle "$bundle_sha" --arg manifest "$manifest_sha" \
+    --arg archive "$archive_sha" --arg oss "$oss_sha" \
+    --arg invocation "$(printf '1%.0s' {1..32})" '
+    {schema:"monday.polymarket_cutover.v1",candidate_sha256:$candidate,
+      deployment_source_revision:$source,deployment_bundle_sha256:$bundle,
+      release_manifest_sha256:$manifest,control_archive_sha256:$archive,
+      oss_config_sha256:$oss,completed_at:"2026-08-26T00:00:00Z",
+      collector:{main_pid:42,restarts:0,invocation_id:$invocation},
+      post_start_identity_verified:true,upload_services_verified:true,
+      upload_timers_verified:true,watchdog_verified:true}' >"$evidence/cutover.json"
+  (cd "$evidence" && sha256sum cutover.json >PASSED.sha256)
+  for spool_dataset in \
+    "$REFERENCE_SPOOL|crypto_expiry_reference" "$MARKET_SPOOL|crypto_expiry"; do
+    spool=${spool_dataset%%|*}
+    dataset=${spool_dataset#*|}
+    jq -n --arg dataset "$dataset" '
+      {updated_at:"2026-08-26T00:03:00Z",
+        last_success_at:"2026-08-26T00:02:00Z",
+        last_uploaded_object:("oss://bucket/lake/raw/venue=polymarket/dataset="
+          + $dataset + "/date=2026-08-26/hour=00/market-updates.test.ndjson.zst"),
+        pending_segments:0,failed_segments:[],last_error:null}' \
+      >"$spool/upload-status.json"
+  done
+  : >"$root/systemctl.log"
+  : >"$root/worker.log"
+  : >"$root/event.log"
+  export READBACK_WORKER_LOG="$root/worker.log"
+  export READBACK_EVENT_LOG="$root/event.log"
+  [[ $test_case != oss-triplet-failure ]] || export READBACK_WORKER_FAIL=true
+  [[ $test_case != same-second-segment ]] \
+    || export READBACK_START_AT=2026-08-26T00:00:50Z
+  if [[ $test_case == upload-status-drift ]]; then
+    export READBACK_STATUS_DRIFT=true
+    export READBACK_STATUS_DRIFT_PATH="$MARKET_SPOOL/upload-status.json"
+  elif [[ $test_case == upload-status-advanced ]]; then
+    export READBACK_STATUS_ADVANCE=true
+    export READBACK_STATUS_DRIFT_PATH="$MARKET_SPOOL/upload-status.json"
+  fi
+  # shellcheck source=/dev/null
+  source "$readback_contract"
+  die() { printf 'readback rejected: %s\n' "$*" >&2; exit 1; }
+  mountpoint() { [[ $test_case != data-unmounted ]]; }
+  secure_root_chain() { return 0; }
+  secure_collector_directory() { return 0; }
+  secure_regular_file() { [[ -f $1 && ! -L $1 ]]; }
+  secure_release_directory() { [[ -d $1 && ! -L $1 ]]; }
+  verify_release_binding() { return 0; }
+  verify_control_release() { return 0; }
+  verify_rust_runtime() {
+    runtime_checks=$((runtime_checks + 1))
+    [[ $test_case != runtime-mismatch \
+      && ! ( $test_case == post-download-drift && $runtime_checks -ge 2 ) ]]
+  }
+  verify_upload_units() { return 0; }
+  verify_watchdog_runtime() { return 0; }
+  unit_enabled() { return 0; }
+  unit_active() { return 0; }
+  oss_config_sha256() { printf '%s\n' "$oss_sha"; }
+  flock() {
+    printf 'flock:%s\n' "$*" >>"$root/event.log"
+    return 0
+  }
+  stat() {
+    [[ $1 == -c && $2 == %Y && $3 == -- \
+      && $4 == "$evidence/PASSED.sha256" ]] || return 2
+    printf '1050\n'
+  }
+  systemctl() {
+    printf '%s\n' "$*" >>"$root/systemctl.log"
+    [[ $1 == is-failed && $2 == --quiet ]] || return 99
+    return 1
+  }
+  date() {
+    if [[ ${1:-} == -u && ${2:-} == -d ]]; then
+      case "$3" in
+        2026-08-26T00:00:00Z) printf '1000\n' ;;
+        2026-08-26T00:00:50Z) printf '1050\n' ;;
+        2026-08-26T00:01:00Z) printf '1100\n' ;;
+        2026-08-26T00:02:00Z) printf '1200\n' ;;
+        2026-08-26T00:03:00Z) printf '1300\n' ;;
+        *) return 1 ;;
+      esac
+    elif [[ ${1:-} == -u && ${2:-} == +%s ]]; then
+      [[ $test_case != stale-upload-success ]] \
+        && printf '2000\n' || printf '9001\n'
+    elif [[ ${1:-} == -u && ${2:-} == +%Y-%m-%dT%H:%M:%SZ ]]; then
+      printf '2026-08-26T00:10:00Z\n'
+    else
+      return 1
+    fi
+  }
+  readlink() {
+    local path=${!#}
+    [[ $path != "$0" ]] \
+      && printf '%s\n' "$path" \
+      || printf '%s\n' "$CONTROL_DIR/polymarket-raw-ops-cutover.sh"
+  }
+  mktemp() {
+    [[ $1 == -d ]]
+    mkdir "$root/downloads"
+    printf '%s\n' "$root/downloads"
+  }
+  cleanup_readback_download_root() {
+    [[ -z ${READBACK_DOWNLOAD_ROOT:-} ]] || rm -rf -- "$READBACK_DOWNLOAD_ROOT"
+    READBACK_DOWNLOAD_ROOT=
+  }
+  set +e
+  output=$(readback_cutover "$evidence" 2>"$root/stderr")
+  status=$?
+  set -e
+  case "$test_case" in
+    success)
+      ((status == 0))
+      jq -e --arg candidate "$candidate_sha" '
+        .schema == "monday.polymarket_post_cutover_readback.v1"
+        and .result == "active_complete" and .candidate_sha256 == $candidate
+        and .collector.main_pid == 42 and .collector.restarts == 0
+        and .reference.oss_triplet.canonical == true
+        and .market.oss_triplet.segment_complete == true
+        and .runtime_identity_verified == true
+        and .oss_triplets_verified == true
+      ' <<<"$output" >/dev/null
+      [[ $(wc -l <"$root/worker.log") -eq 2 ]]
+      [[ $(<"$root/event.log") == $'flock:-n 9\nflock:-u 9\nworker:crypto_expiry_reference\nworker:crypto_expiry\nflock:-n 9' ]]
+      [[ $(wc -l <"$root/systemctl.log") -eq 4 ]]
+      if grep -Ev '^is-failed --quiet (polymarket-reference-upload|polymarket-market-tape-upload)\.service$' \
+        "$root/systemctl.log" | grep -q .; then
+        return 1
+      fi
+      ;;
+    data-unmounted|runtime-mismatch)
+      ((status != 0))
+      [[ ! -s $root/worker.log && ! -s $root/systemctl.log ]]
+      ;;
+    stale-upload-success)
+      ((status != 0))
+      [[ ! -s $root/worker.log ]]
+      [[ $(wc -l <"$root/systemctl.log") -eq 2 ]]
+      ;;
+    post-download-drift|upload-status-drift|upload-status-advanced)
+      ((status != 0))
+      [[ $(wc -l <"$root/worker.log") -eq 2 ]]
+      ;;
+    oss-triplet-failure|same-second-segment)
+      ((status != 0))
+      [[ $(wc -l <"$root/worker.log") -eq 1 ]]
+      ;;
+    *) return 2 ;;
+  esac
+)
+
+for readback_case in success data-unmounted runtime-mismatch stale-upload-success \
+  oss-triplet-failure same-second-segment post-download-drift upload-status-drift \
+  upload-status-advanced; do
+  run_readback_case "$readback_case" || {
+    printf 'post-cutover readback case failed: %s\n' "$readback_case" >&2
+    exit 1
+  }
+done
 
 legacy_test_reference_allowlist=$(sed -n \
   "s/^[[:space:]]*legacy_runtime_reference_allowlist='\(.*\)'$/\1/p" "$CI_WORKFLOW")

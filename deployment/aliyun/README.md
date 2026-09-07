@@ -87,9 +87,11 @@ logs one journal INFO line (tag `polymarket-upload-watchdog`) with, for each of
 the market (`/data/monday/spool/polymarket`) and reference
 (`/data/monday/spool/polymarket-reference`) spools, the pending rotated-tape
 count and the oldest rotated-tape age, plus `/data` free gigabytes. For each
-lane independently: if the upload timer (`polymarket-market-tape-upload.timer`
-or `polymarket-reference-upload.timer`) is not active, the watchdog starts it
-and logs a WARNING with the previous state; if the upload service is inactive
+lane independently: if an enabled upload timer
+(`polymarket-market-tape-upload.timer` or `polymarket-reference-upload.timer`)
+is not active, the watchdog starts it and logs a WARNING with the previous
+state. A disabled or masked timer is administrative containment, so the
+watchdog logs it and leaves that lane untouched. If the upload service is inactive
 while a rotated tape is older than 90 minutes, it starts the service with
 `--no-block` and logs why. A failed start is logged as an ERROR naming the
 lane, the remaining lane is still checked, and the run exits nonzero at the
@@ -102,14 +104,10 @@ Governed cutovers stop both upload timers and services on purpose, so the
 watchdog honors the runtime suppression file
 `/run/monday/polymarket-upload-watchdog.suppress`: while it exists, every run
 logs one `suppressed` INFO line and performs no remediation on either lane.
-The file lives under `/run` and never survives a reboot. Any controller that
-stops the upload timers MUST create the file before stopping them and remove
-it immediately after the cutover concludes:
-
-```bash
-sudo install -D /dev/null /run/monday/polymarket-upload-watchdog.suppress
-sudo rm -f /run/monday/polymarket-upload-watchdog.suppress
-```
+The file lives under `/run` and never survives a reboot. The raw-ops cutover
+controller writes an owner-bound JSON marker before stopping either timer and
+removes only its own marker after a successful cutover or rollback. Operators
+must not create or remove this file by hand.
 
 Install and enable it alongside the upload units. This is a governed runtime
 change with one named controller:
@@ -135,13 +133,17 @@ sudo install -m 0644 deployment/aliyun/polymarket-market-tape-upload-watchdog.se
   deployment/aliyun/polymarket-market-tape-upload-watchdog.timer \
   /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now polymarket-market-tape-upload-watchdog.timer
+sudo systemctl enable polymarket-market-tape-upload-watchdog.timer
+sudo systemctl restart polymarket-market-tape-upload-watchdog.timer
+sudo systemctl start polymarket-market-tape-upload-watchdog.service
 ```
 
 Post-install readback (required before the change is considered live):
 
 ```bash
-systemctl is-active polymarket-market-tape-upload-watchdog.timer
+systemctl show polymarket-market-tape-upload-watchdog.timer \
+  --property=ActiveState --property=SubState \
+  --property=NextElapseUSecMonotonic
 journalctl -t polymarket-upload-watchdog -n 5
 ```
 
@@ -163,7 +165,7 @@ tape files or `upload-status.json`. It emits one JSON snapshot (or a human
 to journald tag `monday-collector-health`. Run with `--json` for machine output
 and `--dry-run` to avoid reading or writing the persistent delta state.
 
-The monitor has six hard gates. Each is a breach: it fails closed into
+The monitor has seven hard gates. Each is a breach: it fails closed into
 the `monitor-collector-host` workflow issue and blocks `ok:true`.
 
 | Hard gate | Breach condition |
@@ -174,6 +176,7 @@ the `monitor-collector-host` workflow issue and blocks `ok:true`.
 | 4. Upload failures | `last_error_at`/`last_error` present, or a `failure_count` increase since the previous poll (prior counts live under `/var/lib/monday-collector-health`) |
 | 5. `/data` disk | free <= 15% (used >= 85%) via `df -Pk /data` — the 2026-08-17/18 incidents reached 100% twice, so the critical watermark pages a human instead of only warning |
 | 6. Polymarket upload timers | `polymarket-market-tape-upload.timer` or `polymarket-reference-upload.timer` not active (waiting) while its collector service (`polymarket-market-tape.service` / `polymarket-reference-collector.service`) is active — a stopped timer with a running collector silently strands rotated tapes until the disk fills |
+| 7. Polymarket upload watchdog | `polymarket-market-tape-upload-watchdog.timer` is neither `waiting` nor briefly `running`, or a waiting timer has no finite monotonic next elapse — systemd can otherwise report an enabled, active but elapsed timer that will never run again |
 
 The raw-ops Gate template has no `[Install]` section, so `static` is the
 healthy installed state only when no Gate instance is active, the control lock
@@ -188,7 +191,7 @@ Every other check is a warning — reported in the JSON `warnings` array and as
 | --- | --- |
 | `/data` disk | free <= 25% (warn) via `df -Pk /data`; free <= 15% is hard gate 5 above |
 | Governed services | `binance-lob-archiver-production@spot/usdm`, `binance-usdm-reference-collector`, `bybit-options-archiver` active AND enabled AND `Result==success`, plus a restart-rate delta > 1 since the last poll |
-| Upload lane units | upload/watchdog/fee timers active AND enabled; their oneshot services' last `Result==success` |
+| Upload lane units | upload/fee timers active AND enabled; their oneshot services' last `Result==success` |
 | `health.json` | missing/unparseable, wall-clock age of `updated_at_ns` > 300s, or `sequence_gaps` > 0 (spot + usdm spools) |
 | Delay-gate trips | > 0 journald `source-to-receive delay exceeds the governed limit` lines per Binance unit in the last 15 minutes |
 | Fee snapshot failures | > 0 `Failed with result` journald lines per fee snapshot unit in the last 10 minutes |
@@ -198,6 +201,9 @@ The persistent-service check deliberately does not warn on `NRestarts > 0`:
 both Binance archivers restart every six hours by design
 (`RuntimeMaxSec=21600`). Crash loops are detected through `Result != success`
 or an `NRestarts` delta greater than one between consecutive five-minute polls.
+Production startup is bounded at 120 seconds. Five failed starts inside the
+two-hour `StartLimitIntervalSec` stop automatic retries instead of allowing a
+slow `ExecStartPre` to roll out of the rate-limit window and loop indefinitely.
 
 Test/override environment for fixtures and containers:
 `MONDAY_COLLECTOR_SPOOL_ROOT` (default `/data/monday/spool`) and
@@ -250,7 +256,8 @@ the mount check is to detect and alert when `/data` is missing.
 `deployment/aliyun/data-completeness-check.sh` (#882) is a POSIX `sh`,
 read-only OSS reconciliation: it compares EXPECTED vs ACTUAL hour partitions
 in the `lake/raw/` lake for every production dataset and fails closed (exit 1)
-on any missing partition, triplet violation, or OSS listing failure. It guards
+on any missing expected partition, triplet violation in an expected hour, or
+OSS listing failure. It guards
 against silent hour-level holes like the 2026-08-14 audit findings (a ~36-hour
 USD-M gap, scattered Bybit single-hour losses, Polymarket data stopping ~12
 hours before the reported outage).
@@ -260,7 +267,7 @@ Governed datasets and their completeness rules:
 | Dataset | Lake prefix | Rule |
 | --- | --- | --- |
 | `binance-spot` | `venue=binance/market=spot/dataset=spot_all/shard=all/` | hour present; each `*.jsonl.zst` carries `.manifest.json` + `._SUCCESS` |
-| `binance-usdm` | `venue=binance/market=usdm/dataset=usdm_perpetual_top100_lob/shard=all/` | same triplet |
+| `binance-usdm` | `venue=binance/market=usdm/dataset=usdm_perpetual_top100_lob_trade/shard=all/` | same triplet |
 | `bybit-options` | `venue=bybit/market=option/dataset=options_quotes/` | hour present; each `*.ndjson.zst` carries its `.zst`-stripped `.manifest.json` (no `_SUCCESS` by design) |
 | `polymarket-crypto-expiry` | `venue=polymarket/dataset=crypto_expiry/` | hour present; triplet |
 | `binance-usdm-reference` | `venue=binance_usdm/dataset=reference/` | hour presence only (batch-partitioned, listed with `-d`) |
@@ -381,7 +388,7 @@ webhook.
 `.github/workflows/monitor-collector-host.yml` runs every 15 minutes. It
 refreshes `origin/main`, invokes `/opt/monday/bin/monday-collector-health.sh
 --json` on the host through Cloud Assistant (the same RunShellScript/Base64
-invoke pattern as `invoke-rust-lob-operation.sh`), decodes the JSON, and when
+invoke pattern as `rust-lob-control-plane.sh`), decodes the JSON, and when
 `ok:false` opens or appends a single `needs-triage` GitHub issue (deduped by
 open-issue search) following the `docs/agents/issue-tracker.md` lifecycle. It
 also opens an issue when the invocation itself cannot return a snapshot.
@@ -555,13 +562,28 @@ gate_terminal=$(sudo "$gate_control" status "$candidate_sha" "$gate_invocation")
 jq -e '.terminal_state == "passed"' <<<"$gate_terminal" >/dev/null
 gate_receipt="/data/monday/evidence/polymarket-gate-jobs/$candidate_sha/$gate_invocation/receipt.json"
 pinned_control_dir="/opt/monday/releases/polymarket-raw-ops/$candidate_sha/control"
-sudo "$pinned_control_dir/polymarket-raw-ops-cutover.sh" \
-  cutover "$candidate_sha" "$gate_receipt"
+cutover_json=$(sudo "$pinned_control_dir/polymarket-raw-ops-cutover.sh" \
+  cutover "$candidate_sha" "$gate_receipt")
+
+# Run once both production lanes have published a fully post-cutover segment.
+# This is a one-shot readback; it never waits for the next hourly rotation.
+cutover_dir=${cutover_json%/*}
+readback=$(sudo /opt/monday/control/polymarket-raw-ops/polymarket-raw-ops-cutover.sh \
+  readback "$cutover_dir")
+jq -e '.result == "active_complete" and .runtime_identity_verified == true
+  and .oss_triplets_verified == true' <<<"$readback" >/dev/null
 ```
 
 Staging does not replace active global controls or production units. The Gate pins
 the verified controls under the immutable candidate release; only a successful
-cutover may install them globally.
+cutover may install them globally. Readback uses the installed controller, requires
+the exact cutover PID and invocation to remain active with zero restarts, and
+downloads both production `data`/`manifest`/`_SUCCESS` triplets into bounded
+`/run` scratch space. It fails until both upload queues are empty and each
+manifest starts after the success marker publication second. The slow OSS downloads
+do not hold the release lock, so rollback remains available; the final runtime and
+upload-status snapshots are revalidated under the lock. Archive the JSON output
+separately from the immutable cutover directory.
 
 The Rust shadow unit must complete its configured observation window and publish
 fresh fail-closed health before the reference collector is promoted. Evidence binds
@@ -886,14 +908,10 @@ empty enumeration, or a run-manifest publish failure fails the run.
 ## Rust-only collector release workflow
 
 The Binance collector deployment lane is Rust-only. The legacy Python collector,
-its systemd unit, and its deployment tests are removed. A release now has three
-separate operations:
-
-1. install a digest-pinned candidate without touching production;
-2. validate sealed-triplet evidence, then run the candidate-specific correctness
-   Shadow (`--correctness`, fixed 300 seconds after the 900-second bootstrap);
-3. only after correctness passes, run the default 1,800-second stability Shadow;
-4. cut over only by consuming the formal Gate's immutable evidence.
+its systemd unit, and its deployment tests are removed. A release has one path:
+install a digest-pinned candidate without touching production, optionally sample
+host and resource admission, run the formal Gate once, then cut over only by
+consuming that Gate's immutable evidence.
 
 All host operations go through Alibaba Cloud Assistant from the local Alibaba
 Cloud CLI. The scripts reject regions other than Tokyo
@@ -908,42 +926,43 @@ macOS `target/release` binary. The ACR collector image is a durable container
 publication, but the current bare ECS collector consumes the separately pinned
 OSS binary.
 
-Run the committed installer from a clean checkout at `SOURCE_REVISION`:
+Run the single operator from a clean checkout at `SOURCE_REVISION`:
 
 ```bash
 set -euo pipefail
-INSTANCE_ID=i-REPLACE \
-ARTIFACT_OSS_URI=oss://monday-lob-apne1-1045353359/releases/binance-lob-archiver/REPLACE/binance-lob-archiver \
-ARTIFACT_SHA256=REPLACE_WITH_64_HEX_DIGEST \
-SOURCE_REVISION=REPLACE_WITH_GIT_SHA \
-./deployment/aliyun/deploy-rust-lob-release.sh
+./deployment/aliyun/rust-lob-control-plane.sh release \
+  --instance i-REPLACE \
+  --uri oss://monday-lob-apne1-1045353359/releases/binance-lob-archiver/REPLACE/binance-lob-archiver \
+  --payload REPLACE_WITH_64_HEX_DIGEST \
+  --source REPLACE_WITH_GIT_SHA
 ```
 
-The installer verifies that `SOURCE_REVISION` is the clean current `HEAD`,
-uploads a digest-addressed deployment bundle, waits for Cloud Assistant, verifies
-both OSS objects on the host, runs the binary self-test, and requires the
-`--upload-only` capability. It installs only the isolated shadow unit/env files
-and the shadow symlink. Production unit/env files remain staged under:
+The operator verifies that `SOURCE_REVISION` is the clean current `HEAD`,
+publishes a digest-addressed ControllerRelease, and leaves production unchanged.
+The release binds the payload (`P`), runtime contract (`R`), deployment bundle
+(`B`), and source revision (`S`) into `C = sha256(canonical release.json)`. The
+host installs the immutable payload and controller directories; only a later
+pair cutover may change production. Payload binaries remain staged under:
 
 ```text
 /opt/monday/releases/binance-lob-archiver/<artifact-sha256>/deployment/
 ```
 
-Candidate installation refuses an unmounted `/data`, an active shadow, a digest
-mismatch, or a concurrent release operation. It does not start any service and
-does not overwrite production configuration or the production symlink. A
-pre-existing artifact directory is reusable only when its binary, deployment
-assets, artifact URI, bundle digest, bundle URI, and source revision all match
-exactly; otherwise installation fails instead of rewriting historical release
-evidence. First installation is assembled in a sibling directory and renamed
-into place only after all identity checks pass.
+Publication refuses dirty source, mismatched bytes, and rewrites of an existing
+identity. It does not start, stop, or restart any service, alter `controller/active`,
+touch the data spool, or run a Gate. The controller release is stored under:
 
-For a script/policy-only change that does not rebuild the binary, run the
-installer with `BUNDLE_ONLY=1`. It keeps the artifact identity and verifies the
-installed binary SHA, archives the prior `release.json` as
-`release.json.prev.<sha256>`, and atomically replaces `deployment/` plus the
-`deployment_bundle_*` fields and `deployment_source_revision` of `release.json`.
-The binary is never replaced in this mode.
+```text
+/opt/monday/releases/binance-lob-controller/<controller-release-manifest-sha256>/
+```
+
+The release root also contains a deterministic payload projection to the exact
+digest-addressed binary. `controller/active` is the sole runtime identity link;
+installed files are derived cache and must match the active controller bytes.
+
+The same operator invokes all later transitions. It validates exact controller
+digests and delegates business checks to the host script shipped by that
+controller; it never stores a second state machine or chooses a fallback path.
 
 The committed shadow environments use `SYMBOLS=ALL` for Spot and the same
 frozen 100-symbol USD-M production allowlist for Futures. Both keep five-minute
@@ -952,87 +971,146 @@ segments, isolated spools, and isolated OSS datasets:
 | Market | Shadow spool | Shadow dataset |
 | --- | --- | --- |
 | Spot | `/data/monday/spool/binance-lob-rust-shadow/spot` | `spot_all_rust_shadow` |
-| USD-M | `/data/monday/spool/binance-lob-rust-shadow/usdm` | `usdm_perpetual_top100_lob_rust_shadow` |
+| USD-M | `/data/monday/spool/binance-lob-rust-shadow/usdm` | `usdm_perpetual_top100_lob_trade_rust_shadow` |
 
 The dataset and shard identifiers remain the canonical lane names; every
 manifest's explicit symbol list and catalog digest are the authority for its
 actual membership.
 
-The sealed-triplet preflight binds candidate source/bundle/build identity and
-independently verifies one or more latest Spot and USD-M data/manifest/`_SUCCESS`
-triplets with the strict continuity verifiers. It does not claim to replay raw
-frames; the preflight is a candidate/format check, while cross-segment
-continuity and the required two new post-observation triplets per market remain
-correctness-mode evidence:
-the merged exact-frame parser E2E remains the parser evidence. The controller
-must supply the reviewed corpus receipt's expected replay identity as the
-preflight's third argument; the preflight never generates that trust anchor
-from the corpus it is about to verify. Correctness mode uses only its run-scoped
-`SEGMENT_SECONDS=90` override (two complete 90-second post-bootstrap segments
-fit inside the fixed 300-second observation); committed environments remain at
-300 seconds. Stability remains the responsibility of the long soak; the formal
-Gate uses a run-scoped 120-second segment override.
+The formal Gate below is the only candidate correctness and stability lane. The
+merged exact-frame parser E2E remains the parser evidence.
 
 Each session proves the exact expected subscription set on every WebSocket
-shard with `LIST_SUBSCRIPTIONS` before it requests snapshots. A
-`binance.market_tape.v2` candidate declares its per-symbol stream-type list
-(`depth@100ms`, `aggTrade`, `trade`, `bookTicker`, plus USD-M-only
-`forceOrder`) in the manifest and every `session_start` row, and coverage is
-verified against that declared list. A `binance.market_tape.v1` candidate
-keeps the legacy depth-plus-`aggTrade` pair and never carries the new
-families, so the same gate can still gate a v1 binary during the transition.
+shard with `LIST_SUBSCRIPTIONS` before it requests snapshots. Only a
+`binance.market_tape.v2` candidate is eligible for the V2 Gate; it declares its
+dataset-specific per-symbol stream-type list in the manifest and every
+`session_start` row. Spot keeps the full public tape, while the USD-M combined
+dataset declares `depth@100ms` and `aggTrade`; coverage is verified against that
+declared list. Historical `binance.market_tape.v1`
+evidence remains readable for audit only; it cannot authorize a new V2 release,
+Gate, or cutover.
 Every segment also retains the sorted stream list returned for each shard in a
 SHA-bound `stream_coverage` row, so canonical readback can recompute the exact
 catalog (symbols x declared stream types for v2, symbols x 2 for v1) instead
 of trusting a boolean alone. The resulting checkpoints, health, and manifests
 carry the derived coverage summary; health also publishes an explicit
 `full_stream_coverage_verified` decision so deploy policies can pin
-full-family coverage without weakening the depth-only readiness fields (a v1
-collector never publishes the field, and its absence stays acceptable so a
-rollback to a v1 binary remains possible during the transition). A
+full-family coverage without weakening the depth-only readiness fields. A
 symbol that receives no depth or trade event during
 a segment is complete only when it has an unchanged two-sided snapshot-backed
 checkpoint and verified stream coverage; the collector never invents a diff or
-trade for a static symbol. Every segment must still contain at least one real
-`agg_trade` for its market dataset, and a v2 segment must additionally carry
-`raw_trade` and `book_ticker` events for the same scope.
+trade for a static symbol. Every combined USD-M segment must contain real
+`agg_trade` evidence, while Spot retains its stricter aggregate-trade,
+raw-trade, and book-ticker checks.
 
 ### 2. Run the short production-catalog gate
 
-Start the gate through the same CLI wrapper:
+Before the formal Gate, run one read-only preflight for the exact pair. The
+controller release is the only source of the Gate script, helper, and policy;
+the candidate supplies only the payload and runtime assets. A bootstrap uses
+`direct` only when the active controller is immutable v1 and the running
+payload is byte-identical to `P0`:
 
 ```bash
 set -euo pipefail
-ACTION=gate \
-INSTANCE_ID=i-REPLACE \
-ARTIFACT_SHA256=REPLACE_WITH_64_HEX_DIGEST \
-./deployment/aliyun/invoke-rust-lob-operation.sh
+./deployment/aliyun/rust-lob-control-plane.sh gate \
+  --instance i-REPLACE \
+  --from-controller REPLACE_WITH_ACTIVE_CONTROLLER_SHA_OR_direct \
+  --candidate-controller REPLACE_WITH_CANDIDATE_CONTROLLER_SHA \
+  --preflight-only
 ```
+
+Preflight emits non-authoritative JSON after validating `C0/C1`, `P1`, `R1`,
+`B1`, `S1`, installed production bytes, and the live production systemd/cgroup
+topology and executable identity. It creates no Gate evidence and authorizes
+neither Gate nor Cutover. Then run the formal Gate once:
+
+```bash
+set -euo pipefail
+./deployment/aliyun/rust-lob-control-plane.sh gate \
+  --instance i-REPLACE \
+  --from-controller REPLACE_WITH_ACTIVE_CONTROLLER_SHA \
+  --candidate-controller REPLACE_WITH_CANDIDATE_CONTROLLER_SHA
+```
+
+The Gate has no compatibility routing. Historical receipts remain readable for
+audit but cannot authorize a new transition. Failed Gate attempts block only the
+candidate cutover; they never rewrite a release or production state.
+
+The command executes the Gate bytes from the candidate controller directory and
+binds the receipt to `C1`, `P1`, `R1`, `B1`, and `S1`. It proves the current pair,
+candidate process, market health, and Spot/USD-M OSS evidence before writing one
+immutable schema-v8 receipt. A receipt from another controller or payload is
+not reusable.
 
 The host gate owns only the runtime transition. A failed Gate blocks cutover,
 not Code, CI, Merge, or immutable Release publication. It verifies the candidate,
 Spot `SYMBOLS=ALL`, and the exact frozen 100-symbol USD-M production allowlist,
 then creates a fresh spool under
-`/data/monday/spool/binance-lob-rust-shadow/runs/<artifact>/<run-id>/`, starts
+`/data/monday/spool/binance-lob-rust-shadow/gate/<run-id>/`, starts
 each market sequentially with `SEGMENT_SECONDS=120`, waits at most 240 seconds for initial
-configured-catalog health, freezes both session IDs and catalog digests, and then uses
-monotonic time to observe at least 240 seconds. It never drains or recovers an
+configured-catalog health, freezes both session IDs and catalog digests, and then
+finishes as soon as one clean segment that starts after that freeze exists. Each market has a
+600-second evidence deadline; elapsed monotonic time is recorded, not used as a
+minimum observation duration. It never drains or recovers an
 older Shadow run. Any incomplete files left by a failed run remain confined to
-that run's spool and cannot block the next Gate; files already uploaded and
-cleaned retain their OSS triplet evidence instead of a duplicate local copy.
-The Shadow unit uses a 1792MiB high watermark and 2048MiB hard limit per market.
+that run's spool and cannot block the next Gate. During each market observation,
+the Shadow uploader retains locally the triplets it has already verified from OSS
+so the Gate cannot miss valid evidence between polls. The existing bounded drain
+then re-verifies those identical OSS objects and removes the local copies.
+The Gate's 120-second run-scoped cadence does not alter the signed production
+environment; production cadence is verified independently after cutover.
+After Cutover, the production lanes share the signed aggregate slice
+`system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice` with a 3072MiB
+high watermark and 3584MiB hard limit; each production child remains bounded
+at 2048MiB/2560MiB. Gate Shadow workers use a run-scoped aggregate slice and
+per-market 1280MiB high watermark/1536MiB hard limit; the source Shadow unit
+template remains at 1792MiB/2048MiB and is narrowed by that run-scoped parent
+slice when rendered.
 Five immutable passed Tokyo gates measured Spot at no more than 664,735,744 bytes
 and the former 570-symbol USD-M scope at no more than 1,789,218,816 bytes; the
-current USD-M Gate covers only the frozen Top 100. Strict readback is separately
-capped at 2560MiB/3072MiB and carries the same non-production OOM preference as
-the Shadow collectors. Candidate upload drain is capped at 2500MiB/3200MiB, so
-the largest sequential Gate phase is 3200MiB, plus the existing 1GiB host
-reserve. Active production usage is already reflected in `MemAvailable`; its
-growth to `MemoryHigh` is budgeted explicitly. The 1GiB reserve covers at most
-512MiB of additional production growth from `MemoryHigh` to `MemoryMax` and
-must leave at least 512MiB for the host. All three production-growth values are
-recorded as evidence. An over-limit candidate fails the Gate instead of
-increasing the host size or weakening the reserve.
+current USD-M Gate covers only the frozen Top 100. Strict readback uses the
+same 1280MiB/1536MiB worker envelope and candidate upload drain uses a
+384MiB/512MiB envelope. Before the Gate and before every actual phase, it reads
+`MemAvailable` together with the production template's automatically assigned
+`Slice` and cgroup. Spot and USD-M must share one slice; the parent control
+group is `/system.slice/<Slice>` and their two cgroups must be direct children
+of it. The parent `cgroup.procs` must be empty, the active child set must be
+exactly those two services, and both systemd `MemoryMax` and child `memory.max`
+must be exactly 2,560MiB. A stable V2 Gate also requires the active signed
+aggregate limits. The one direct v1-to-V2 bootstrap instead records the legacy
+aggregate as `legacy-unlimited`; it never changes that live slice. The snapshot records parent
+`memory.current`, `memory.peak`, `memory.stat` (`anon` and `file`), and
+`memory.events`, plus PID/executable hash and `NRestarts`; PID and restart
+changes alone are audit-only, while a five-second monitor fails closed on any
+membership, limit, or executable identity drift. A temporarily invalid
+snapshot gets a bounded 120-second grace before the monitor fails closed.
+Paired reads use the
+conservative `MemAvailable`/`anon` values for admission; current, file, peak,
+and events remain audit evidence. The required bytes are exactly:
+
+```text
+host reserve (1GiB) + phase memory budget +
+(candidate production slice MemoryMax - parent memory.stat anon)
+```
+
+Active production usage is already reflected in `MemAvailable`; no static
+two-lane growth reservation is added a second time. Each phase re-checks the
+resource admission immediately before its first start or external call. The
+Gate receipt stores the exact per-phase current/sum/growth/reserve/limit/required
+values and the production cgroup snapshot; `MemoryPeak` is audit-only, while
+`memory.events` must show no new `oom` or `oom_kill` counter. An over-limit or
+malformed phase fails closed instead of increasing the host size or weakening
+the reserve.
+The direct bootstrap Gate records the unlimited legacy slice and the signed
+candidate limit separately. Cutover installs the signed slice, clears any
+legacy runtime override, and verifies it before either candidate lane starts;
+restore and readback re-check the permanent slice and both child memberships
+before claiming a successful pair.
+`io_full_psi_windows` records one advisory PSI snapshot for each of the nine
+resource phases. PSI never authorizes or denies a Gate and cannot terminate a
+candidate; memory reserve, OOM counters, and exact identity remain the
+fail-closed controls.
 The Gate fails unless all of these are true for the entire candidate run:
 
 - both units stay active with `NRestarts=0`;
@@ -1046,56 +1124,51 @@ The Gate fails unless all of these are true for the entire candidate run:
 - CPU accounting and peak memory stay inside the systemd limits;
 - after stop, the candidate's `--upload-only` drain leaves no partial,
   temporary, corrupt, compressed, success-marker, or cleanup-marker artifact;
-- for each market, at least two manifests opened after this isolated candidate
-  run starts are downloaded from OSS with their data object and
-  reproduce the manifest SHA-256; each manifest contains real aggregate trades,
-  complete checkpoint coverage, and either sequence-checked diffs or explicit
-  static-symbol evidence derived from the verified subscription set.
+- for each market, exactly two new adjacent replay-safe manifests from the
+  isolated candidate run are downloaded from OSS with their data objects and
+  reproduce the local interval and SHA-256; a reconnect-boundary segment is
+  skipped, while two later clean segments may qualify. Each selected manifest
+  contains real aggregate trades, complete checkpoint coverage, and either
+  sequence-checked diffs or explicit static-symbol evidence derived from the
+  verified subscription set.
 
 A successful production gate writes:
 
 ```text
-/data/monday/evidence/shadow-gates/<artifact-sha256>/<deployment-bundle-sha256>/runs/<run-id>/run.json
-/data/monday/evidence/shadow-gates/<artifact-sha256>/<deployment-bundle-sha256>/runs/<run-id>/gate.json
-/data/monday/evidence/shadow-gates/<artifact-sha256>/<deployment-bundle-sha256>/runs/<run-id>/PASSED.sha256
+/data/monday/evidence/shadow-gates/<controller-release-sha256>/<runtime-contract-sha256>/runs/<run-id>/run.json
+/data/monday/evidence/shadow-gates/<controller-release-sha256>/<runtime-contract-sha256>/runs/<run-id>/gate.json
+/data/monday/evidence/shadow-gates/<controller-release-sha256>/<runtime-contract-sha256>/runs/<run-id>/PASSED.sha256
 ```
 
 Every invocation gets a new append-only run directory; prior gate evidence is
-never deleted or replaced. The marker hashes exactly that run's `gate.json`.
-Evidence also binds the clean source revision and deployment-bundle SHA-256, so
-unit or env changes cannot consume an older gate for the same binary. A second
-production gate for an identity that already has a passing run is refused, and
-cutover requires exactly one immutable passing run. A short test override is
-available only for script testing; it writes `passed=false` and never creates
-`PASSED.sha256`, so it cannot authorize cutover.
-
-For a one-time upgrade from the pre-release layout, where the running Rust
-binary is still a regular file instead of a digest-addressed symlink, use
-`host-rust-lob-adopt-production-release.sh` through Cloud Assistant before the
-cutover. Pin both the running binary digest and the already gated candidate
-digest. The helper never starts, stops, restarts, enables, or disables a unit.
-It verifies fresh configured-catalog production health and stable PIDs/restart counts,
-copies the byte-identical running binary and current rollback assets into an
-adopted release, installs an inactive/non-installable rollback-compatibility
-upload unit, atomically replaces the regular path with the identical release
-symlink, and writes immutable adoption evidence. Any failure restores the
-original regular binary and the upload unit's original absent state. This helper
-is intentionally not part of the candidate deployment bundle, so using it does
-not mutate or invalidate an already completed shadow gate. It is not a general
-manual-symlink escape hatch and refuses partial, drifted, unhealthy, or already
-modern release layouts.
+never deleted or replaced. The marker hashes exactly that run's `gate.json` and
+`run.json`.
+Evidence binds the binary, the controller release digest, and the content hash
+of the nine production/Shadow unit, slice, and environment files. It records the clean
+source revision and full deployment-bundle SHA-256 separately, so a
+controller-only fix cannot reuse a prior v6 receipt; it must name the new
+controller digest in a fresh Gate. Unit or environment changes likewise require
+a fresh Gate. A second production
+gate for an identity that already has a passing run is refused, and cutover
+requires exactly one immutable passing run. The formal operator has a 40-minute
+outer timeout; the host Gate receives TERM at 35 minutes and has four minutes
+for bounded stop and cleanup. A short override is available only for script
+testing; it writes `test_only=true`, `production_eligible=false`, and never
+creates `PASSED.sha256`, so it cannot authorize cutover.
 
 ### 3. Cut over or roll back
 
-After the production gate succeeds, invoke the cutover with the same immutable
-artifact digest:
+After the production Gate succeeds, consume its exact receipt with the same
+controller pair:
 
 ```bash
 set -euo pipefail
-ACTION=cutover \
-INSTANCE_ID=i-REPLACE \
-ARTIFACT_SHA256=REPLACE_WITH_64_HEX_DIGEST \
-./deployment/aliyun/invoke-rust-lob-operation.sh
+./deployment/aliyun/rust-lob-control-plane.sh cutover \
+  --instance i-REPLACE \
+  --from REPLACE_WITH_ACTIVE_CONTROLLER_SHA_OR_direct \
+  --to REPLACE_WITH_CANDIDATE_CONTROLLER_SHA \
+  --gate-receipt /data/monday/evidence/shadow-gates/REPLACE/gate.json \
+  --gate-sha256 REPLACE_WITH_GATE_SHA
 ```
 
 The host cutover revalidates the binary, release metadata, staged deployment
@@ -1122,7 +1195,10 @@ removed after the backup is durable. The candidate drops to the collector owner
 recorded on the spool lock before removing that temporary or changing and
 finalizing any segment. It then
 performs streaming `--recover-parts-only` and runs
-`--upload-only` with bounded OSS readback. Recovery never performs live symbol
+`--upload-only` with bounded OSS readback. The direct cutover drain runs in a
+named transient systemd unit with `CPUQuota=80%`, `MemoryHigh=384M`,
+`MemoryMax=512M`, `OOMScoreAdjust=500`, and control-group cleanup; cancellation
+or failure stops that exact unit before rollback. Recovery never performs live symbol
 discovery and does not depend on the old production binary supporting either
 command. Rollback resumes a partial drain with the deployment environment that
 owns the interrupted spool; an unproven recovery keeps production masked instead
@@ -1147,8 +1223,8 @@ delivered. The two production instances are each bounded at `CPUQuota=80%` and
 `MemoryMax=2560M`; the globally serialized recovery worker is bounded at
 `CPUQuota=25%` and `MemoryMax=768M`, keeping configured collector work below the
 2-vCPU/8-GiB host boundary without increasing the ECS size. A persistent
-pre-start failure is capped at five attempts per five minutes instead of
-restarting every five seconds forever.
+pre-start failure is bounded to 120 seconds per start and capped at five
+attempts per two hours instead of restarting forever.
 
 A new host is accepted
 only when the canonical spool contains no segment artifact. The script then
@@ -1171,68 +1247,62 @@ runtime disabled and masked. If a safe restore cannot be proved, both production
 units remain disabled and masked. Cutover evidence is written under
 `/data/monday/evidence/cutovers/`.
 
-Rollback uses the same `ACTION=cutover` operation with a previously installed,
-previously gated artifact digest. There is no Python fallback and no manual
-symlink shortcut.
+Rollback uses the same pair cutover operation with an explicitly named previous
+controller and its own immutable Gate receipt. There is no alternate dispatcher
+or manual symlink shortcut.
 
-### 4. Restore a stopped, already-gated production release
+### 4. Restore the exact active pair after an interrupted transition
 
-If an already-gated, already-cutover release was later stopped and disabled (for
-example, during a disk-full incident), `ACTION=cutover` still cannot bring it
-back: the cutover path accepts a contained `active=0 enabled=2` emergency-stop
-state so it can transition to a new candidate, but it does not resume an already
-disabled production runtime. `host-rust-lob-restore.sh` closes that gap. It is
-fail-closed: it never rewrites the production symlink and never touches the
-digest-addressed release or its deployment assets, so the restored runtime is
-byte-identical to the cutover artifact.
+Use `restore` with the exact active controller digest when a host may have
+stopped during bootstrap or cutover. Restore is anchored only in the immutable
+`ControllerRelease C(P,R)` selected by the active link: it never discovers a
+candidate, guesses a previous release, or scans unrelated Gate directories.
+This distinction matters after a power loss: if the active link was committed
+before a transition receipt was written, active `C` alone is sufficient for
+recovery and no Gate receipt is required. If the deterministic receipt exists at
+`/data/monday/evidence/cutovers/<controller>/transition.json`, restore validates
+only the Gate path and digest named there; a production receipt must also carry
+the eligible `PASSED.sha256` marker. A missing receipt is therefore not an
+implicit Gate/PASSED failure, while a present but mismatched receipt is a hard
+failure.
 
-Invoke it with the immutable artifact digest that is already on disk and already
-gated:
+Invoke it with the exact active controller digest:
 
 ```bash
 set -euo pipefail
-ACTION=restore \
-INSTANCE_ID=i-REPLACE \
-ARTIFACT_SHA256=REPLACE_WITH_64_HEX_DIGEST \
-./deployment/aliyun/invoke-rust-lob-operation.sh
+./deployment/aliyun/rust-lob-control-plane.sh restore \
+  --instance i-REPLACE \
+  --controller REPLACE_WITH_ACTIVE_CONTROLLER_SHA
 ```
 
-Before starting anything the host restore requires all of the following:
+Before any unit or projection mutation, the host restore verifies the active
+controller manifest and payload digest, the active production runtime contract,
+all nine runtime assets (including the aggregate production slice), both controller
+helper projections, and the canonical
+production environment/spool paths. Every installed projection must either be
+an exact active-C symlink or contain byte-for-byte active-C content; a missing
+projection may be repaired from active `C`, but foreign, indirect, or drifted
+content is refused. The production unit's recovery `ExecStartPre`, sandbox and
+resource policy, and the exact active health-policy file are part of this
+verification. The stable production link must resolve to the active payload (or
+be absent/identical and safely repairable); it is never overwritten with an
+unrelated target.
 
-1. `sha256($PRODUCTION_LINK)` matches `ARTIFACT_SHA256` and the link resolves to
-   `$RELEASE_ROOT/<sha256>/binance-lob-archiver`.
-2. Exactly one immutable passed shadow gate exists for that
-   `<sha256>/<deployment_bundle_sha256>` and it still satisfies the gate policy.
-3. No production unit is active (a running restore is refused, never preempted).
-4. The production symlink exists (a missing symlink is refused, never recreated).
-5. The canonical spool path is a direct directory tree under `/data` (no symlink
-   escapes) and the spot/usdm subdirectories exist.
-6. The installed production unit already declares
-   `ExecStartPre=+/opt/monday/bin/monday-rust-lob-recovery-queue isolate %i`, so
-   any residual `.jsonl.part`/`.zst.tmp`/`.part.corrupt` is detached into
-   `/data/monday/spool/binance-lob-recovery/<market>/<job>.ready` before the
-   collector starts.
-7. The installed production unit/env files match the gated deployment bundle
-   `cmp`-for-`cmp` and the production unit still declares `RuntimeMaxSec=21600`.
+Restore then snapshots writer state and stops, disables, and runtime-masks the
+complete allowlist of legacy, shadow, upload, and V2 production writers under
+the control-plane lock. It daemon-reloads, repairs only exact active-C
+projections, starts and enables both V2 production lanes, and waits for fresh
+per-lane health from a new session bound to each sample. Success requires the active health policy,
+zero sequence gaps, expected non-zero catalog/readiness, canonical spool,
+stable `MainPID`/executable digest, zero `NRestarts`, and a final paired
+Spot/USD-M re-read. The immutable restore receipt records the controller,
+payload/runtime/policy digests, process and health evidence, production runtime
+projection hashes, and proof that every legacy writer remains contained.
 
-The restore then clears stale health, starts the production units while disabled,
-waits for fresh configured-catalog health written after the restart with a new session
-and zero restarts, verifies each `/proc/<pid>/exe` still resolves to the
-candidate release, enables production for reboot, and re-verifies health. A
-unique recovery evidence directory is created under
-`/data/monday/evidence/recoveries/<ts>-<sha:0:12>-<pid>/` and holds the previous
-and post-restart health snapshots, a copy of the gated `gate.json` +
-`PASSED.sha256`, and immutable `recovery.json` + `verification.json`.
-Restore success proves the live acquisition runtime only. Detached queue
-completion remains a separate delivery state reported by collector health and
-its per-job result evidence.
-
-If the restored units never reach verified health, the host restore performs a
-fail-closed rollback: it disables and stops production, applies the runtime
-transition mask to the production, upload, and legacy units, verifies the host
-is fail-closed, preserves rollback health evidence, and records
-`recovery.json` with `result: failed` and `rollback_result`. A failed restore
-never leaves production active, enabled, or unmasked.
+Any preflight, start, health, identity, policy, or paired re-read failure is
+fail-closed: the restore stops, disables, and runtime-masks **all** allowlisted
+writers and writes no success receipt. Restore never resumes a legacy writer;
+only the exact V2 production pair may be enabled after the complete verification.
 
 ### Upload cleanup and failure rules
 

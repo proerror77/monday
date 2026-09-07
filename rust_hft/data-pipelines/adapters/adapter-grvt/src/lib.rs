@@ -316,8 +316,7 @@ impl MarketStream for GrvtMarketStream {
             };
 
             // 訂閱一個或多個 stream
-            let mut req_id: u64 = 1;
-            for sname in &streams {
+            for (req_id, sname) in (1_u64..).zip(&streams) {
                 let selectors = build_selectors(sname);
                 let subscribe = serde_json::json!({
                     "jsonrpc": "2.0",
@@ -325,7 +324,6 @@ impl MarketStream for GrvtMarketStream {
                     "params": { "stream": sname, "selectors": selectors },
                     "id": req_id,
                 });
-                req_id += 1;
                 if let Err(e) = socket
                     .send(Message::Text(subscribe.to_string().into()))
                     .await

@@ -649,51 +649,6 @@ impl VenueSpec {
         }
     }
 
-    pub fn hyperliquid_spot() -> Self {
-        // 占位默认规格，后续可依据官方文档细化
-        Self {
-            name: "HYPERLIQUID".to_string(),
-            tick_size: Price::from_f64(0.01).unwrap(),
-            lot_size: Quantity::from_f64(0.0001).unwrap(),
-            min_qty: Quantity::from_f64(0.0001).unwrap(),
-            max_quantity: Some(Quantity::from_f64(1_000_000.0).unwrap()),
-            min_notional: rust_decimal::Decimal::from(5),
-            maker_fee_bps: None,
-            taker_fee_bps: None,
-            rate_limit: None,
-        }
-    }
-
-    pub fn backpack_spot() -> Self {
-        // Backpack 官方最小步进依 symbol 不同，可透过市場 API 覆寫
-        Self {
-            name: "BACKPACK".to_string(),
-            tick_size: Price::from_f64(0.01).unwrap(),
-            lot_size: Quantity::from_f64(0.0001).unwrap(),
-            min_qty: Quantity::from_f64(0.0001).unwrap(),
-            max_quantity: Some(Quantity::from_f64(1_000_000.0).unwrap()),
-            min_notional: rust_decimal::Decimal::from(5),
-            maker_fee_bps: Some(rust_decimal::Decimal::new(10, 4)),
-            taker_fee_bps: Some(rust_decimal::Decimal::new(10, 4)),
-            rate_limit: Some(600),
-        }
-    }
-
-    pub fn lighter_spot() -> Self {
-        // 參照公開資訊設置保守預設，後續可依據 lighter 規則更新
-        Self {
-            name: "LIGHTER".to_string(),
-            tick_size: Price::from_f64(0.01).unwrap(),
-            lot_size: Quantity::from_f64(0.0001).unwrap(),
-            min_qty: Quantity::from_f64(0.0001).unwrap(),
-            max_quantity: Some(Quantity::from_f64(1_000_000.0).unwrap()),
-            min_notional: rust_decimal::Decimal::from(5),
-            maker_fee_bps: None,
-            taker_fee_bps: None,
-            rate_limit: None,
-        }
-    }
-
     pub fn grvt_perp() -> Self {
         // GRVT 預設合約規格（暫以保守數值，實際可依 instrument API 覆寫）
         Self {
@@ -733,9 +688,6 @@ impl VenueSpec {
         specs.insert(VenueId::BITGET, Self::bitget_spot());
         specs.insert(VenueId::BYBIT, Self::bybit_spot());
         specs.insert(VenueId::OKX, Self::okx_spot());
-        specs.insert(hft_core::VenueId::HYPERLIQUID, Self::hyperliquid_spot());
-        specs.insert(hft_core::VenueId::BACKPACK, Self::backpack_spot());
-        specs.insert(hft_core::VenueId::LIGHTER, Self::lighter_spot());
         specs.insert(hft_core::VenueId::GRVT, Self::grvt_perp());
         specs.insert(hft_core::VenueId::POLYMARKET, Self::polymarket_outcome());
         specs

@@ -44,6 +44,9 @@ const BUILD_SOURCE_REVISION: &str = match option_env!("MONDAY_SOURCE_REVISION") 
     None => "unbound-source-revision",
 };
 const USDM_TOP100_LOB_DATASET: &str = "usdm_perpetual_top100_lob";
+const USDM_TOP100_LOB_TRADE_DATASET: &str = "usdm_perpetual_top100_lob_trade";
+const USDM_TOP100_LOB_TRADE_SHADOW_DATASET: &str =
+    "usdm_perpetual_top100_lob_trade_rust_shadow";
 
 #[derive(Debug, Parser)]
 #[command(name = "binance-lob-archiver", version = BUILD_SOURCE_REVISION)]
@@ -398,9 +401,11 @@ impl Config {
         if catalog.symbols.is_empty() {
             anyhow::bail!("SYMBOLS must not be empty");
         }
+        let dataset = env_string("DATASET", &format!("{}_all", market.as_str()));
+        validate_dataset_contract(market, &dataset, &catalog.symbols)?;
         Ok(Self {
             market,
-            dataset: env_string("DATASET", &format!("{}_all", market.as_str())),
+            dataset,
             shard_id: env_string("SHARD_ID", "all"),
             symbols: catalog.symbols,
             security_token_symbols: catalog.security_token_symbols,
@@ -513,6 +518,31 @@ impl Config {
                                     "wss://data-stream.binance.vision/stream?streams={book_tickers}"
                                 ),
                                 streams: book_ticker_streams,
+                            },
+                        ]
+                    }
+                    Market::Usdm if is_usdm_top100_lob_trade_dataset(&self.dataset) => {
+                        let aggregate_trade_streams = symbols
+                            .iter()
+                            .map(|symbol| format!("{}@aggTrade", symbol.to_ascii_lowercase()))
+                            .collect::<BTreeSet<_>>();
+                        let aggregate_trades = aggregate_trade_streams
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("/");
+                        vec![
+                            StreamShard {
+                                url: format!(
+                                    "wss://fstream.binance.com/public/stream?streams={depth}"
+                                ),
+                                streams: depth_streams,
+                            },
+                            StreamShard {
+                                url: format!(
+                                    "wss://fstream.binance.com/market/stream?streams={aggregate_trades}"
+                                ),
+                                streams: aggregate_trade_streams,
                             },
                         ]
                     }
@@ -1593,14 +1623,40 @@ fn stream_types_for_market(market: Market) -> Vec<String> {
             "trade".to_owned(),
             "bookTicker".to_owned(),
         ],
-        // USD-M Top100 is intentionally depth-only; historical Top100 tapes
-        // that also carried bookTicker remain readable via recovery.
+        // The original USD-M Top100 dataset remains depth-only; combined
+        // datasets declare their additional streams explicitly below.
         Market::Usdm => vec!["depth@100ms".to_owned()],
     }
 }
 
+fn validate_dataset_contract(
+    market: Market,
+    dataset: &str,
+    symbols: &[String],
+) -> anyhow::Result<()> {
+    if !is_usdm_top100_lob_trade_dataset(dataset) {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        market == Market::Usdm,
+        "{dataset} requires MARKET=usdm"
+    );
+    anyhow::ensure!(
+        symbols.len() == 100 && symbols.iter().collect::<BTreeSet<_>>().len() == 100,
+        "{dataset} requires exactly 100 unique symbols"
+    );
+    Ok(())
+}
+
 fn is_legacy_usdm_dataset(dataset: &str) -> bool {
     matches!(dataset, "usdm_all" | "usdm_perpetual_all")
+}
+
+fn is_usdm_top100_lob_trade_dataset(dataset: &str) -> bool {
+    matches!(
+        dataset,
+        USDM_TOP100_LOB_TRADE_DATASET | USDM_TOP100_LOB_TRADE_SHADOW_DATASET
+    )
 }
 
 fn is_usdm_top100_depth_only_stream_types(stream_types: &[String]) -> bool {
@@ -1612,7 +1668,9 @@ fn historical_usdm_top100_stream_types() -> Vec<String> {
 }
 
 fn stream_types_for_dataset(market: Market, dataset: &str) -> Vec<String> {
-    if market == Market::Usdm && is_legacy_usdm_dataset(dataset) {
+    if market == Market::Usdm && is_usdm_top100_lob_trade_dataset(dataset) {
+        vec!["depth@100ms".to_owned(), "aggTrade".to_owned()]
+    } else if market == Market::Usdm && is_legacy_usdm_dataset(dataset) {
         vec![
             "depth@100ms".to_owned(),
             "aggTrade".to_owned(),
@@ -1632,6 +1690,9 @@ fn stream_types_for_recovery(market: Market, dataset: &str) -> anyhow::Result<Ve
         // it must consume a residual full-tape USD-M part.  Keep that
         // recorded five-family contract distinct from the new LOB identity.
         (Market::Usdm, dataset) if is_legacy_usdm_dataset(dataset) => {
+            Ok(stream_types_for_dataset(Market::Usdm, dataset))
+        }
+        (Market::Usdm, dataset) if is_usdm_top100_lob_trade_dataset(dataset) => {
             Ok(stream_types_for_dataset(Market::Usdm, dataset))
         }
         (Market::Usdm, USDM_TOP100_LOB_DATASET) => Ok(stream_types_for_market(Market::Usdm)),
@@ -2093,6 +2154,7 @@ async fn run_session(
             stream_connected_tx.clone(),
             session_stop_rx.clone(),
             stall_timeout,
+            config.stall_timeout,
             SUBSCRIPTION_PROOF_TIMEOUT,
             watchdog.clone(),
             producer_id,
@@ -3727,6 +3789,7 @@ async fn receive_url(
     stream_connected: broadcast::Sender<Vec<String>>,
     mut shutdown: watch::Receiver<bool>,
     stall_timeout: Duration,
+    reconnect_frame_timeout: Duration,
     subscription_proof_timeout: Duration,
     watchdog: ProcessWatchdog,
     producer_id: usize,
@@ -3858,6 +3921,8 @@ async fn receive_url(
             continue;
         }
 
+        let reconnecting = coverage_announced;
+        let mut reconnect_confirmed = !reconnecting;
         let mut subscription_proof_deadline =
             tokio::time::Instant::now() + subscription_proof_timeout;
         let mut proof_failure = None;
@@ -3925,11 +3990,10 @@ async fn receive_url(
             // Complete-message delivery from Tungstenite in userspace; not kernel or NIC RX.
             let received_at_ns = now_ns()?;
             if let Message::Text(text) = message {
-                watchdog.mark_data_for(producer_id);
                 let frame: Value = serde_json::from_str(&text)?;
                 if frame.get("id").and_then(Value::as_u64) == Some(SUBSCRIPTION_PROOF_ID) {
                     let listed = validate_subscription_listing(&frame, &shard.streams)?;
-                    if coverage_announced {
+                    if reconnecting && !proof_events.is_empty() {
                         if let Some(exit) = send_stream_event(
                             &sender,
                             Event::StreamReconnected {
@@ -3941,7 +4005,8 @@ async fn receive_url(
                         {
                             return Ok(exit);
                         }
-                    } else {
+                        reconnect_confirmed = true;
+                    } else if !coverage_announced {
                         // Fan the connection notification out to every snapshot
                         // producer; a dropped receiver is not a producer failure.
                         let _ = stream_connected.send(listed);
@@ -3959,10 +4024,13 @@ async fn receive_url(
                             }
                         }
                     }
-                    reconnect_backoff = 1;
+                    if reconnect_confirmed {
+                        reconnect_backoff = 1;
+                    }
                     break;
                 }
                 let event = event_from_frame_for_shard(frame, received_at_ns, producer_id)?;
+                watchdog.mark_data_for(producer_id);
                 if coverage_announced {
                     if proof_events.len() >= proof_buffer_budget {
                         anyhow::bail!(
@@ -4024,7 +4092,10 @@ async fn receive_url(
 
         // Only verified exact stream coverage unlocks snapshot requests. Market
         // events received while waiting for the proof were already buffered above.
+        let mut reconnect_frame_deadline = (!reconnect_confirmed)
+            .then(|| tokio::time::Instant::now() + reconnect_frame_timeout);
         let reason = loop {
+            let pause_epoch = last_pause_epoch;
             if let Some(exit) = acknowledge_rotation_pause(
                 producer_id,
                 &sender,
@@ -4037,6 +4108,10 @@ async fn receive_url(
             {
                 return Ok(exit);
             }
+            if last_pause_epoch > pause_epoch && reconnect_frame_deadline.is_some() {
+                reconnect_frame_deadline =
+                    Some(tokio::time::Instant::now() + reconnect_frame_timeout);
+            }
             let message = tokio::select! {
                 biased;
                 changed = shutdown.changed() => {
@@ -4048,27 +4123,55 @@ async fn receive_url(
                     changed.context("segment rotation controller stopped before producer pause")?;
                     continue;
                 }
-                message = tokio::time::timeout(stall_timeout, websocket.next()) => match message {
+                message = async {
+                    match reconnect_frame_deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline, websocket.next()).await,
+                        None => tokio::time::timeout(stall_timeout, websocket.next()).await,
+                    }
+                } => match message {
                     Ok(Some(Ok(message))) => message,
                     Ok(Some(Err(error))) => break format!("websocket receive failed: {error}"),
                     Ok(None) => break "websocket closed".into(),
+                    Err(_) if reconnect_frame_deadline.is_some() => break format!(
+                        "websocket shard produced no market frame for {}s after subscription proof",
+                        reconnect_frame_timeout.as_secs()
+                    ),
                     Err(_) => break format!("websocket shard stalled for {}s", stall_timeout.as_secs()),
                 }
             };
             // Complete-message delivery from Tungstenite in userspace; not kernel or NIC RX.
             let received_at_ns = now_ns()?;
             if let Message::Text(text) = message {
-                watchdog.mark_data_for(producer_id);
                 let event = event_from_frame_for_shard(
                     serde_json::from_str(&text)?,
                     received_at_ns,
                     producer_id,
                 )?;
+                watchdog.mark_data_for(producer_id);
+                let confirmed_reconnect = !reconnect_confirmed;
+                if confirmed_reconnect {
+                    if let Some(exit) = send_stream_event(
+                        &sender,
+                        Event::StreamReconnected {
+                            streams: streams.clone(),
+                        },
+                        &mut shutdown,
+                    )
+                    .await?
+                    {
+                        return Ok(exit);
+                    }
+                    reconnect_confirmed = true;
+                    reconnect_frame_deadline = None;
+                }
                 watchdog.record_queue_health(QueueHealth::from_sender(&sender));
                 match send_or_shutdown(&sender, event, &mut shutdown).await? {
                     SendOutcome::Sent => {
                         watchdog.mark_enqueued_for(producer_id);
                         watchdog.record_queue_health(QueueHealth::from_sender(&sender));
+                        if confirmed_reconnect {
+                            reconnect_backoff = 1;
+                        }
                     }
                     SendOutcome::Shutdown(event) => return Ok(TaskExit::Stopped(Some(event))),
                 }
@@ -4906,13 +5009,21 @@ fn apply_upload_failure(status: &mut UploadStatus, error: &anyhow::Error) {
 }
 
 async fn upload_pending(config: &UploadConfig) -> anyhow::Result<LobUploadOutcome> {
+    let retain_uploaded_triplets = env_parse("MONDAY_RETAIN_UPLOADED_TRIPLETS", false)?;
     let config = config.clone();
-    tokio::task::spawn_blocking(move || upload_pending_blocking_with(&config, &mut run_oss_checked))
-        .await?
+    tokio::task::spawn_blocking(move || {
+        upload_pending_blocking_with(
+            &config,
+            retain_uploaded_triplets,
+            &mut run_oss_checked,
+        )
+    })
+    .await?
 }
 
 fn upload_pending_blocking_with<F>(
     config: &UploadConfig,
+    retain_uploaded_triplets: bool,
     runner: &mut F,
 ) -> anyhow::Result<LobUploadOutcome>
 where
@@ -4924,7 +5035,7 @@ where
     }
     let mut outcome = LobUploadOutcome::default();
     for manifest in files_with_suffix(&config.spool_dir, ".manifest.json")? {
-        match upload_one_with(config, &manifest, runner) {
+        match upload_one_with(config, &manifest, retain_uploaded_triplets, runner) {
             Ok(segment) => {
                 if segment.retried {
                     outcome.retried += 1;
@@ -5328,6 +5439,7 @@ where
 fn upload_one_with<F>(
     config: &UploadConfig,
     manifest: &Path,
+    retain_uploaded_triplet: bool,
     runner: &mut F,
 ) -> anyhow::Result<UploadedSegment>
 where
@@ -5372,8 +5484,10 @@ where
         Ok(())
     };
     let retried = upload_segment_triplet_with(config, &prefix, &members, verify, runner)?;
-    let marker = write_uploaded_cleanup_marker(&data, manifest, &success)?;
-    cleanup_uploaded_marker(&marker)?;
+    if !retain_uploaded_triplet {
+        let marker = write_uploaded_cleanup_marker(&data, manifest, &success)?;
+        cleanup_uploaded_marker(&marker)?;
+    }
     Ok(UploadedSegment {
         retried,
         object: format!(
@@ -5720,6 +5834,18 @@ mod tests {
         assert_eq!(
             stream_types_for_recovery(Market::Usdm, "usdm_perpetual_top100_lob").unwrap(),
             vec!["depth@100ms".to_owned()]
+        );
+        assert_eq!(
+            stream_types_for_recovery(Market::Usdm, USDM_TOP100_LOB_TRADE_DATASET).unwrap(),
+            vec!["depth@100ms".to_owned(), "aggTrade".to_owned()]
+        );
+        assert_eq!(
+            stream_types_for_recovery(
+                Market::Usdm,
+                USDM_TOP100_LOB_TRADE_SHADOW_DATASET,
+            )
+            .unwrap(),
+            vec!["depth@100ms".to_owned(), "aggTrade".to_owned()]
         );
         assert!(stream_types_for_recovery(Market::Usdm, "unexpected").is_err());
     }
@@ -6643,7 +6769,7 @@ mod tests {
         let mut fake = FakeOss::default();
 
         let segment =
-            upload_one_with(&dirs.config(), &fixture.manifest, &mut |command, timeout| {
+            upload_one_with(&dirs.config(), &fixture.manifest, false, &mut |command, timeout| {
                 fake.run(&dirs.bucket, command, timeout)
             })
             .unwrap();
@@ -6675,6 +6801,43 @@ mod tests {
     }
 
     #[test]
+    fn verified_readback_can_be_retained_until_a_later_drain() {
+        let dirs = UploadTestDir::new();
+        let fixture = dirs.write_segment("1700000000000000000", b"segment-bytes");
+        let mut fake = FakeOss::default();
+
+        let uploaded = upload_one_with(
+            &dirs.config(),
+            &fixture.manifest,
+            true,
+            &mut |command, timeout| fake.run(&dirs.bucket, command, timeout),
+        )
+        .unwrap();
+
+        assert!(!uploaded.retried);
+        assert_eq!(fake.uploads, 3);
+        fixture.assert_local_retained();
+        assert!(files_with_suffix(&dirs.spool, UPLOADED_CLEANUP_SUFFIX)
+            .unwrap()
+            .is_empty());
+
+        let drained = upload_one_with(
+            &dirs.config(),
+            &fixture.manifest,
+            false,
+            &mut |command, timeout| fake.run(&dirs.bucket, command, timeout),
+        )
+        .unwrap();
+
+        assert!(drained.retried);
+        assert_eq!(fake.uploads, 3);
+        fixture.assert_local_removed();
+        assert!(files_with_suffix(&dirs.spool, UPLOADED_CLEANUP_SUFFIX)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn corrupted_readback_retains_the_local_triplet() {
         let dirs = UploadTestDir::new();
         let fixture = dirs.write_segment("1700000000000000000", b"segment-bytes");
@@ -6683,7 +6846,7 @@ mod tests {
             corrupt_segment: Some("1700000000000000000".into()),
         };
 
-        let error = upload_one_with(&dirs.config(), &fixture.manifest, &mut |command, timeout| {
+        let error = upload_one_with(&dirs.config(), &fixture.manifest, false, &mut |command, timeout| {
             fake.run(&dirs.bucket, command, timeout)
         })
         .unwrap_err();
@@ -6702,7 +6865,7 @@ mod tests {
         fixture.seed_remote(&dirs.bucket, b"different-remote-bytes");
         let mut fake = FakeOss::default();
 
-        let error = upload_one_with(&dirs.config(), &fixture.manifest, &mut |command, timeout| {
+        let error = upload_one_with(&dirs.config(), &fixture.manifest, false, &mut |command, timeout| {
             fake.run(&dirs.bucket, command, timeout)
         })
         .unwrap_err();
@@ -6725,7 +6888,7 @@ mod tests {
         let mut fake = FakeOss::default();
 
         let segment =
-            upload_one_with(&dirs.config(), &fixture.manifest, &mut |command, timeout| {
+            upload_one_with(&dirs.config(), &fixture.manifest, false, &mut |command, timeout| {
                 fake.run(&dirs.bucket, command, timeout)
             })
             .unwrap();
@@ -6747,7 +6910,7 @@ mod tests {
             corrupt_segment: Some("1700000000000000001".into()),
         };
 
-        let outcome = upload_pending_blocking_with(&config, &mut |command, timeout| {
+        let outcome = upload_pending_blocking_with(&config, false, &mut |command, timeout| {
             fake.run(&bucket, command, timeout)
         })
         .unwrap();
@@ -7168,6 +7331,75 @@ mod tests {
     }
 
     #[test]
+    fn combined_usdm_dataset_subscribes_depth_and_aggregate_trades_only() {
+        let mut config = test_config("http://unused".into());
+        config.market = Market::Usdm;
+        config.dataset = USDM_TOP100_LOB_TRADE_DATASET.into();
+        config.symbols = (0..100).map(|index| format!("S{index:03}USDT")).collect();
+        config.ws_shard_size = 25;
+
+        assert_eq!(config.stream_types(), ["depth@100ms", "aggTrade"]);
+        let shards = config.stream_shards();
+        assert_eq!(shards.len(), 8);
+        assert_eq!(
+            shards.iter().map(|shard| shard.streams.len()).sum::<usize>(),
+            200
+        );
+        assert_eq!(
+            shards
+                .iter()
+                .filter(|shard| shard
+                    .streams
+                    .iter()
+                    .all(|stream| stream.ends_with("@depth@100ms")))
+                .count(),
+            4
+        );
+        assert_eq!(
+            shards
+                .iter()
+                .filter(|shard| shard
+                    .streams
+                    .iter()
+                    .all(|stream| stream.ends_with("@aggTrade")))
+                .count(),
+            4
+        );
+        assert!(shards.iter().all(|shard| shard.streams.iter().all(|stream| {
+            stream.ends_with("@depth@100ms") || stream.ends_with("@aggTrade")
+        })));
+    }
+
+    #[test]
+    fn combined_usdm_dataset_requires_a_unique_frozen_top100_catalog() {
+        let symbols = (0..100)
+            .map(|index| format!("S{index:03}USDT"))
+            .collect::<Vec<_>>();
+        validate_dataset_contract(Market::Usdm, USDM_TOP100_LOB_TRADE_DATASET, &symbols)
+            .unwrap();
+        assert!(validate_dataset_contract(
+            Market::Spot,
+            USDM_TOP100_LOB_TRADE_DATASET,
+            &symbols
+        )
+        .is_err());
+        assert!(validate_dataset_contract(
+            Market::Usdm,
+            USDM_TOP100_LOB_TRADE_DATASET,
+            &symbols[..99]
+        )
+        .is_err());
+        let mut duplicate = symbols;
+        duplicate[99] = duplicate[0].clone();
+        assert!(validate_dataset_contract(
+            Market::Usdm,
+            USDM_TOP100_LOB_TRADE_DATASET,
+            &duplicate
+        )
+        .is_err());
+    }
+
+    #[test]
     fn usdm_lob_segment_can_seed_without_aggregate_trades() {
         let root = tempfile::Builder::new()
             .prefix("monday-usdm-lob-seed-test-")
@@ -7387,6 +7619,7 @@ mod tests {
                 stream_connected,
                 shutdown,
                 Duration::from_secs(1),
+                Duration::from_secs(1),
                 Duration::from_millis(50),
                 ProcessWatchdog::new_state(),
                 0,
@@ -7455,6 +7688,7 @@ mod tests {
             sender,
             stream_connected,
             shutdown,
+            Duration::from_secs(1),
             Duration::from_secs(1),
             Duration::from_secs(1),
             ProcessWatchdog::new_state(),
@@ -7590,6 +7824,7 @@ mod tests {
             stream_connected,
             shutdown,
             Duration::from_secs(1),
+            Duration::from_secs(1),
             Duration::from_millis(50),
             ProcessWatchdog::new_state(),
             0,
@@ -7632,6 +7867,324 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconnect_proof_without_market_data_keeps_shard_recovering() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let event_time_ms = now_ns().unwrap() / 1_000_000;
+        let (accepted_tx, mut accepted_rx) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            for connection in 0..4 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let request = websocket.next().await.unwrap().unwrap();
+                assert!(request.to_text().unwrap().contains("LIST_SUBSCRIPTIONS"));
+                accepted_tx
+                    .send((connection, Instant::now()))
+                    .unwrap();
+                websocket
+                    .send(Message::Text(
+                        json!({
+                            "id": SUBSCRIPTION_PROOF_ID,
+                            "result": ["btcusdt@aggTrade"]
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                if connection == 0 || connection == 2 {
+                    websocket
+                        .send(Message::Text(
+                            json!({
+                                "stream": "btcusdt@aggTrade",
+                                "data": {
+                                    "e": "aggTrade",
+                                    "E": event_time_ms,
+                                    "s": "BTCUSDT",
+                                    "a": connection + 1,
+                                    "f": connection + 1,
+                                    "l": connection + 1,
+                                    "p": "100",
+                                    "q": "1",
+                                    "T": event_time_ms,
+                                    "m": false
+                                }
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    websocket.close(None).await.unwrap();
+                } else {
+                    let _ = websocket.next().await;
+                }
+            }
+        });
+        let (sender, mut receiver) = mpsc::channel(16);
+        let (stream_connected, _) = broadcast::channel(1);
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let (_pause_tx, pause_rx) = watch::channel(0_u64);
+        let (_resume_tx, resume_rx) = watch::channel(0_u64);
+        let shard = StreamShard {
+            url: format!("ws://{address}"),
+            streams: BTreeSet::from(["btcusdt@aggTrade".to_owned()]),
+        };
+        let diagnostics = Arc::new(ProducerDiagnostics::new(std::slice::from_ref(&shard)));
+        let watchdog = ProcessWatchdog::new_with_diagnostics(diagnostics.clone());
+        let task = tokio::spawn(receive_url(
+            shard,
+            sender,
+            stream_connected,
+            shutdown,
+            SPARSE_STREAM_STALL_TIMEOUT,
+            Duration::from_millis(50),
+            Duration::from_secs(1),
+            watchdog,
+            0,
+            pause_rx,
+            resume_rx,
+        ));
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::AggregateTrade { .. })
+        ));
+        let received_after_first_frame = diagnostics.producers.read().unwrap()[0]
+            .last_received_ms
+            .load(Ordering::Relaxed);
+        let enqueued_after_first_frame = diagnostics.producers.read().unwrap()[0]
+            .last_enqueued_ms
+            .load(Ordering::Relaxed);
+        assert_ne!(received_after_first_frame, UNKNOWN_ELAPSED_MS);
+        assert_ne!(enqueued_after_first_frame, UNKNOWN_ELAPSED_MS);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::StreamDisconnected { .. })
+        ));
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .unwrap()
+            {
+                Some(Event::StreamDisconnected { .. }) => break,
+                Some(Event::StreamReconnected { .. }) => {
+                    panic!("subscription proof alone declared the shard reconnected")
+                }
+                Some(_) => {}
+                None => panic!("stream task exited while reconnecting the quiet shard"),
+            }
+        }
+        assert_eq!(
+            diagnostics.producers.read().unwrap()[0]
+                .last_received_ms
+                .load(Ordering::Relaxed),
+            received_after_first_frame,
+            "subscription proof refreshed the market-data watchdog"
+        );
+        assert_eq!(
+            diagnostics.producers.read().unwrap()[0]
+                .last_enqueued_ms
+                .load(Ordering::Relaxed),
+            enqueued_after_first_frame,
+            "subscription proof entered the archive queue"
+        );
+
+        let (first_connection, _) = accepted_rx.recv().await.unwrap();
+        let (second_connection, second_connected_at) = accepted_rx.recv().await.unwrap();
+        let (third_connection, third_connected_at) = accepted_rx.recv().await.unwrap();
+        assert_eq!((first_connection, second_connection, third_connection), (0, 1, 2));
+        assert!(
+            third_connected_at.duration_since(second_connected_at) >= Duration::from_millis(1800),
+            "quiet subscription proof reset reconnect backoff"
+        );
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::StreamReconnected { .. })
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::AggregateTrade { .. })
+        ));
+        {
+            let producers = diagnostics.producers.read().unwrap();
+            let producer = &producers[0];
+            assert!(
+                producer.last_received_ms.load(Ordering::Relaxed) > received_after_first_frame
+            );
+            assert!(
+                producer.last_enqueued_ms.load(Ordering::Relaxed) > enqueued_after_first_frame
+            );
+        }
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::StreamDisconnected { .. })
+        ));
+        let (fourth_connection, fourth_connected_at) = accepted_rx.recv().await.unwrap();
+        assert_eq!(fourth_connection, 3);
+        assert!(
+            fourth_connected_at.duration_since(third_connected_at) < Duration::from_millis(1800),
+            "first market frame did not reset reconnect backoff"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        assert!(matches!(
+            task.await.unwrap().unwrap(),
+            TaskExit::Stopped(None)
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconnect_market_frame_deadline_restarts_after_rotation_pause() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let event_time_ms = now_ns().unwrap() / 1_000_000;
+        let (proof_processed_tx, proof_processed_rx) = tokio::sync::oneshot::channel();
+        let (send_market_tx, send_market_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut proof_processed_tx = Some(proof_processed_tx);
+            let mut send_market_rx = Some(send_market_rx);
+            for connection in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let request = websocket.next().await.unwrap().unwrap();
+                assert!(request.to_text().unwrap().contains("LIST_SUBSCRIPTIONS"));
+                websocket
+                    .send(Message::Text(
+                        json!({
+                            "id": SUBSCRIPTION_PROOF_ID,
+                            "result": ["btcusdt@aggTrade"]
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                if connection == 1 {
+                    websocket
+                        .send(Message::Ping(Vec::new().into()))
+                        .await
+                        .unwrap();
+                    loop {
+                        if matches!(websocket.next().await.unwrap().unwrap(), Message::Pong(_)) {
+                            break;
+                        }
+                    }
+                    proof_processed_tx.take().unwrap().send(()).unwrap();
+                    send_market_rx.take().unwrap().await.unwrap();
+                }
+                websocket
+                    .send(Message::Text(
+                        json!({
+                            "stream": "btcusdt@aggTrade",
+                            "data": {
+                                "e": "aggTrade",
+                                "E": event_time_ms,
+                                "s": "BTCUSDT",
+                                "a": connection + 1,
+                                "f": connection + 1,
+                                "l": connection + 1,
+                                "p": "100",
+                                "q": "1",
+                                "T": event_time_ms,
+                                "m": false
+                            }
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                if connection == 0 {
+                    websocket.close(None).await.unwrap();
+                } else {
+                    let _ = websocket.next().await;
+                }
+            }
+        });
+        let (sender, mut receiver) = mpsc::channel(8);
+        let (stream_connected, _) = broadcast::channel(1);
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let (pause_tx, pause_rx) = watch::channel(0_u64);
+        let (resume_tx, resume_rx) = watch::channel(0_u64);
+        let task = tokio::spawn(receive_url(
+            StreamShard {
+                url: format!("ws://{address}"),
+                streams: BTreeSet::from(["btcusdt@aggTrade".to_owned()]),
+            },
+            sender,
+            stream_connected,
+            shutdown,
+            SPARSE_STREAM_STALL_TIMEOUT,
+            Duration::from_millis(200),
+            Duration::from_secs(1),
+            ProcessWatchdog::new_state(),
+            0,
+            pause_rx,
+            resume_rx,
+        ));
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::AggregateTrade { .. })
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::StreamDisconnected { .. })
+        ));
+        proof_processed_rx.await.unwrap();
+        pause_tx.send(1).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::RotationBarrier {
+                producer_id: 0,
+                epoch: 1
+            })
+        ));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(receiver.try_recv().is_err());
+        resume_tx.send(1).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        send_market_tx.send(()).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::StreamReconnected { .. })
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::AggregateTrade { .. })
+        ));
+
+        shutdown_tx.send(true).unwrap();
+        assert!(matches!(
+            task.await.unwrap().unwrap(),
+            TaskExit::Stopped(None)
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn pause_during_websocket_connect_acknowledges_rotation() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -7654,6 +8207,7 @@ mod tests {
             sender,
             stream_connected,
             shutdown,
+            Duration::from_secs(1),
             Duration::from_secs(1),
             Duration::from_secs(1),
             ProcessWatchdog::new_state(),
@@ -7707,6 +8261,7 @@ mod tests {
             sender,
             stream_connected,
             shutdown,
+            Duration::from_secs(1),
             Duration::from_secs(1),
             Duration::from_secs(20),
             ProcessWatchdog::new_state(),
@@ -7819,6 +8374,7 @@ mod tests {
             sender,
             stream_connected,
             shutdown,
+            Duration::from_secs(1),
             Duration::from_secs(1),
             Duration::from_secs(20),
             ProcessWatchdog::new_state(),
@@ -7933,6 +8489,7 @@ mod tests {
             sender,
             stream_connected,
             shutdown,
+            Duration::from_secs(1),
             Duration::from_secs(1),
             Duration::from_millis(400),
             ProcessWatchdog::new_state(),
@@ -8289,7 +8846,7 @@ mod tests {
             .contains("raw-trade data is incomplete"));
 
         let mut fake = FakeOss::default();
-        let outcome = upload_pending_blocking_with(&dirs.config(), &mut |command, timeout| {
+        let outcome = upload_pending_blocking_with(&dirs.config(), false, &mut |command, timeout| {
             fake.run(&dirs.bucket, command, timeout)
         })
         .unwrap();
@@ -8821,7 +9378,7 @@ mod tests {
         verify_binance_market_tape_for_strict_gate(vec![sealed]).unwrap();
 
         let mut fake = FakeOss::default();
-        let outcome = upload_pending_blocking_with(&dirs.config(), &mut |command, timeout| {
+        let outcome = upload_pending_blocking_with(&dirs.config(), false, &mut |command, timeout| {
             fake.run(&dirs.bucket, command, timeout)
         })
         .unwrap();
@@ -9091,7 +9648,7 @@ mod tests {
         verify_binance_market_tape_for_strict_gate(vec![sealed]).unwrap();
 
         let mut fake = FakeOss::default();
-        let outcome = upload_pending_blocking_with(&dirs.config(), &mut |command, timeout| {
+        let outcome = upload_pending_blocking_with(&dirs.config(), false, &mut |command, timeout| {
             fake.run(&dirs.bucket, command, timeout)
         })
         .unwrap();

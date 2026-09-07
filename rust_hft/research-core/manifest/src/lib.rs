@@ -538,8 +538,8 @@ impl CexReplaySnapshotV4 {
     }
 }
 
-/// Current L2-only USD-M research snapshot. PIT rules stay bound to the snapshot identity;
-/// derivatives reference stays out of the contract because the dataset is limited to L2 and trades.
+/// Current L2 USD-M research snapshot. PIT rules stay bound to the snapshot identity;
+/// aggregate trades are optional because the production Top-100 tape is LOB-only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CexReplaySnapshotV5 {
@@ -573,10 +573,15 @@ impl CexReplaySnapshotV5 {
                 "L2-only replay snapshot supports USD-M only",
             ));
         }
-        let required = BTreeSet::from([
-            CEX_MODALITY_LOB.to_string(),
-            CEX_MODALITY_AGGREGATE_TRADE.to_string(),
-        ]);
+        let lob_only = BTreeSet::from([CEX_MODALITY_LOB.to_string()]);
+        let required = if self.required_modalities == lob_only {
+            lob_only
+        } else {
+            BTreeSet::from([
+                CEX_MODALITY_LOB.to_string(),
+                CEX_MODALITY_AGGREGATE_TRADE.to_string(),
+            ])
+        };
         validate_snapshot_core(
             &self.schema_version,
             CEX_REPLAY_SNAPSHOT_SCHEMA_V5,
@@ -1677,6 +1682,26 @@ mod tests {
 
         manifest.validate().unwrap();
         assert_eq!(manifest.snapshot_sha256, snapshot.sha256());
+    }
+
+    #[test]
+    fn lob_only_snapshot_v5_and_dataset_validate_without_aggregate_trades() {
+        let mut snapshot = cex_snapshot_v5();
+        snapshot.required_modalities = BTreeSet::from([CEX_MODALITY_LOB.to_string()]);
+
+        snapshot.validate().unwrap();
+        CexReplayDatasetManifestV5::new("dataset-feature-sha", snapshot).unwrap();
+    }
+
+    #[test]
+    fn l2_snapshot_v5_rejects_aggregate_trades_without_lob() {
+        let mut snapshot = cex_snapshot_v5();
+        snapshot.required_modalities = BTreeSet::from([CEX_MODALITY_AGGREGATE_TRADE.to_string()]);
+
+        assert_eq!(
+            snapshot.validate().unwrap_err(),
+            ManifestError::InvalidCexReplaySnapshot("required modalities do not match the schema")
+        );
     }
 
     #[test]

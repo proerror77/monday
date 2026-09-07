@@ -151,6 +151,15 @@ fn validate_runtime_config(config: &SystemConfig) -> Result<(), LoaderError> {
         );
     }
     for venue in &config.venues {
+        if matches!(
+            &venue.venue_type,
+            VenueType::Hyperliquid | VenueType::Lighter | VenueType::Backpack
+        ) {
+            errors.push(format!(
+                "venue '{}' uses retired runtime adapter {:?}",
+                venue.name, venue.venue_type
+            ));
+        }
         if let Some(mode) = venue.execution_mode.as_deref() {
             if !mode.eq_ignore_ascii_case("paper")
                 && !mode.eq_ignore_ascii_case("live")
@@ -1435,6 +1444,18 @@ strategies: []
         let error = load_config_from_str(&live).expect_err("missing signature_type");
 
         assert!(error.to_string().contains("signature_type"));
+    }
+
+    #[test]
+    fn retired_runtime_venues_are_rejected() {
+        let base = include_str!("../../../../config/dev/polymarket_quotes_only.yaml.example")
+            .replace("${POLYMARKET_TOKEN_ID}", "123456789");
+
+        for venue in ["Hyperliquid", "Lighter", "Backpack"] {
+            let content = base.replace("venue_type: Polymarket", &format!("venue_type: {venue}"));
+            let error = load_config_from_str(&content).expect_err("retired runtime venue");
+            assert!(error.to_string().contains("retired runtime adapter"));
+        }
     }
 
     #[test]

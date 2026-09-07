@@ -12,11 +12,12 @@
 #   4. failure_count not growing, last_error empty (all lanes)
 #   5. /data disk: free <= 25% warns, free <= 15% (used >= 85%) breaches
 #   6. polymarket upload timers must be active while their collector is active
+#   7. /data must be mounted
 # plus the raw-ops Gate containment contract (static template with no active
 # instance, running lock, or residual environment) and state-persistence
 # failures. Everything else (units, timers, restarts,
-# health.json, delay-gate journal, disk warning band, mount, fee snapshot
-# journal) is a warning: reported, never blocking ok:true.
+# health.json sequence counters and disk warning band are warnings: reported,
+# never blocking ok:true. journalctl must not be called by this monitor.
 #
 # Usage: ./test-monday-collector-health.sh
 set -euo pipefail
@@ -33,6 +34,8 @@ mkdir -p "$stub_dir" "$spool_root" "$state_dir"
 scenario="$test_root/scenario.tsv"
 out_file="$test_root/out"
 err_file="$test_root/err"
+journal_calls_file="$test_root/journal.calls"
+flock_calls_file="$test_root/flock.calls"
 
 DF_TOTAL=196000000   # KiB, ~187 GiB (matches the ~196G host disk)
 DF_AVAIL_HEALTHY=117600000   # 60% free
@@ -73,6 +76,8 @@ json_query() {
 }
 
 run_health() {
+  : > "$journal_calls_file"
+  : > "$flock_calls_file"
   set +e
   env \
     STUB_SCENARIO="$scenario" \
@@ -82,6 +87,8 @@ run_health() {
     STUB_JOURNAL_TRIPS="${STUB_JOURNAL_TRIPS:-0}" \
     STUB_JOURNAL_FEE_FAILURES="${STUB_JOURNAL_FEE_FAILURES:-0}" \
     STUB_JOURNAL_FAIL="${STUB_JOURNAL_FAIL:-0}" \
+    STUB_JOURNAL_CALLS_FILE="$journal_calls_file" \
+    STUB_FLOCK_CALLS_FILE="$flock_calls_file" \
     STUB_FLOCK_HELD="${STUB_FLOCK_HELD:-0}" \
     STUB_FLOCK_ERROR="${STUB_FLOCK_ERROR:-0}" \
     STUB_LOCK_APPEAR="${STUB_LOCK_APPEAR:-0}" \
@@ -90,6 +97,7 @@ run_health() {
     MONDAY_COLLECTOR_STATE_DIR="${MONDAY_COLLECTOR_STATE_DIR:-$state_dir}" \
     MONDAY_COLLECTOR_HEALTH_TEST_MODE=1 \
     MONDAY_COLLECTOR_HEALTH_TEST_ROOT="$test_root" \
+    MONDAY_COLLECTOR_HEALTH_TEST_HFT_GID="${STUB_HFT_GID:-$(id -g)}" \
     PATH="$stub_dir:$PATH" \
     "$health_script" "$@" >"$out_file" 2>"$err_file"
   rc=$?
@@ -109,6 +117,7 @@ reset_env() {
   STUB_FLOCK_HELD=0
   STUB_FLOCK_ERROR=0
   STUB_LOCK_APPEAR=0
+  STUB_HFT_GID=$(id -g)
   unset MONDAY_COLLECTOR_STATE_DIR
 }
 
@@ -159,19 +168,27 @@ touch_age() {
 }
 
 write_health() {
-  # $1 market (spot|usdm), $2 age_seconds, $3 gaps, $4 disk_warning, $5 status
+# $1 market (spot|usdm), $2 age_seconds, $3 current sequence_gaps, $4 disk_warning,
+  # $5 status, $6 session_id (optional), $7 sequence_gap_total (optional).
   market=$1
   age=$2
   gaps=$3
   dw=$4
   status=$5
+  session=${6:-"fixture-$market"}
+  total=${7:-$gaps}
+  case "$total" in
+    '' | *[!0-9]*) total_json=$(jq -Rn --arg value "$total" '$value') ;;
+    *) total_json=$total ;;
+  esac
+  session_json=$(jq -Rn --arg value "$session" '$value')
   now_ns=$(( $(date +%s) * 1000000000 ))
   updated_ns=$(( now_ns - age * 1000000000 ))
   # Drop any symlink left by the health-symlink scenario first: cat > would
   # follow the link and write through it, leaving the symlink in place.
   rm -f "$spool_root/binance-lob/$market/health.json"
   cat > "$spool_root/binance-lob/$market/health.json" <<EOF
-{"updated_at_ns": $updated_ns, "sequence_gaps": $gaps, "disk_warning": $dw, "status": "$status", "market": "$market"}
+{"updated_at_ns": $updated_ns, "sequence_gaps": $gaps, "sequence_gap_total": $total_json, "session_id": $session_json, "disk_warning": $dw, "status": "$status", "market": "$market"}
 EOF
 }
 
@@ -201,6 +218,68 @@ write_upload_ms() {
   cat > "$1" <<EOF
 {"last_success_at": $success_ms, "last_error_at": $2, "last_error": $3, "failure_count": $4}
 EOF
+}
+
+make_recovery_queue_root() {
+  mkdir -p "$spool_root/binance-lob-recovery"
+  chgrp "$(id -g)" "$spool_root/binance-lob-recovery"
+  chmod 0750 "$spool_root/binance-lob-recovery"
+}
+
+make_recovery_queue() {
+  make_recovery_queue_root
+  mkdir -p "$spool_root/binance-lob-recovery/$1"
+  chgrp "$(id -g)" "$spool_root/binance-lob-recovery/$1"
+  chmod 0750 "$spool_root/binance-lob-recovery/$1"
+}
+
+write_recovery_job() {
+  # $1 market, $2 job id, $3 state (ready|running|failed)
+  market=$1
+  job_id=$2
+  state=$3
+  job_dir="$spool_root/binance-lob-recovery/$market/$job_id.$state"
+  hash64=$(printf '%064d' 0)
+  source_revision=$(printf '%040d' 0)
+  make_recovery_queue "$market"
+  mkdir -p "$job_dir"
+  jq -n \
+    --arg schema monday.rust_lob_recovery_queue.v1 \
+    --arg market "$market" \
+    --arg job_id "$job_id" \
+    --arg queued_at 2026-08-26T00:00:00Z \
+    --arg canonical_spool "$spool_root/binance-lob/$market" \
+    --arg recovery_unit "binance-lob-archiver-recovery@$market.service" \
+    --arg release_sha256 "$hash64" \
+    --arg deployment_bundle_sha256 "$hash64" \
+    --arg deployment_source_revision "$source_revision" \
+    --arg env_sha256 "$hash64" \
+    '{schema:$schema,market:$market,job_id:$job_id,queued_at:$queued_at,
+      canonical_spool:$canonical_spool,recovery_unit:$recovery_unit,
+      release_sha256:$release_sha256,
+      deployment_bundle_sha256:$deployment_bundle_sha256,
+      deployment_source_revision:$deployment_source_revision,
+      env_sha256:$env_sha256,release_env:"recovery.env"}' \
+    >"$job_dir/job.json"
+}
+
+write_isolation_marker() {
+  # $1 market, $2 job id; the matching ready receipt must already exist.
+  market=$1
+  job_id=$2
+  queue_dir="$spool_root/binance-lob-recovery/$market"
+  ready_dir="$queue_dir/$job_id.ready"
+  receipt_sha256=$(sha256sum "$ready_dir/job.json" | awk '{print $1}')
+  jq -n \
+    --arg schema monday.rust_lob_recovery_isolation.v1 \
+    --arg job_id "$job_id" \
+    --arg market "$market" \
+    --arg canonical_spool "$spool_root/binance-lob/$market" \
+    --arg ready_dir "$ready_dir" \
+    --arg receipt_sha256 "$receipt_sha256" \
+    '{schema:$schema,job_id:$job_id,market:$market,
+      canonical_spool:$canonical_spool,ready_dir:$ready_dir,
+      receipt_sha256:$receipt_sha256}' >"$queue_dir/isolation.json"
 }
 
 healthy_fixtures() {
@@ -274,7 +353,7 @@ for a in "$@"; do
     unit="$a"
   fi
   case "$a" in
-    Result|NRestarts|ActiveState|SubState) prop="$a" ;;
+    Result|NRestarts|ActiveState|SubState|NextElapseUSecMonotonic) prop="$a" ;;
   esac
   prev="$a"
 done
@@ -287,23 +366,35 @@ if [ -z "$unit" ]; then
 fi
 [ -n "$unit" ] || exit 1
 line=$(awk -F'\t' -v u="$unit" '$1 == u { print; exit }' "$SCENARIO" 2>/dev/null || true)
-active="inactive"; enabled="disabled"; result="success"; nrestarts="0"
+active="inactive"; enabled="disabled"; result="success"; nrestarts="0"; substate=""; next_elapse=""
 if [ -n "$line" ]; then
   active=$(printf '%s\n' "$line" | awk -F'\t' '{print $2}')
   enabled=$(printf '%s\n' "$line" | awk -F'\t' '{print $3}')
   result=$(printf '%s\n' "$line" | awk -F'\t' '{print $4}')
   nrestarts=$(printf '%s\n' "$line" | awk -F'\t' '{print $5}')
+  substate=$(printf '%s\n' "$line" | awk -F'\t' '{print $6}')
+  next_elapse=$(printf '%s\n' "$line" | awk -F'\t' '{print $7}')
 fi
 [ "$active" != "-" ] || active="inactive"
 [ "$enabled" != "-" ] || enabled="disabled"
 [ "$result" != "-" ] || result="success"
 [ "$nrestarts" != "-" ] || nrestarts="0"
+if [ "${unit##*.}" = "timer" ]; then
+  [ -n "$substate" ] || substate="waiting"
+  [ -n "$next_elapse" ] || next_elapse="123456789"
+else
+  [ -n "$substate" ] || substate="dead"
+fi
+[ "$substate" != "-" ] || substate=""
+[ "$next_elapse" != "-" ] || next_elapse=""
 case "$1" in
   is-active) printf '%s\n' "$active" ;;
   is-enabled) printf '%s\n' "$enabled" ;;
   show)
     case "$prop" in
       NRestarts) printf '%s\n' "$nrestarts" ;;
+      SubState) printf '%s\n' "$substate" ;;
+      NextElapseUSecMonotonic) printf '%s\n' "$next_elapse" ;;
       *) printf '%s\n' "$result" ;;
     esac
     ;;
@@ -323,22 +414,11 @@ EOF
 
 cat > "$stub_dir/journalctl" <<'EOF'
 #!/bin/sh
-if [ "${STUB_JOURNAL_FAIL:-0}" = "1" ]; then
-  printf 'journalctl: cannot access the journal\n' >&2
-  exit 1
+if [ -n "${STUB_JOURNAL_CALLS_FILE:-}" ]; then
+  printf '%s\n' "$*" >> "$STUB_JOURNAL_CALLS_FILE"
 fi
-i=0
-count="${STUB_JOURNAL_TRIPS:-0}"
-while [ "$i" -lt "$count" ]; do
-  printf 'err: binance: source-to-receive delay exceeds the governed limit\n'
-  i=$((i + 1))
-done
-i=0
-count="${STUB_JOURNAL_FEE_FAILURES:-0}"
-while [ "$i" -lt "$count" ]; do
-  printf 'systemd: binance-fee-snapshot-spot.service: Failed with result exit-code\n'
-  i=$((i + 1))
-done
+printf 'journalctl must not be called by collector-health\n' >&2
+exit 99
 EOF
 
 cat > "$stub_dir/mountpoint" <<'EOF'
@@ -348,6 +428,13 @@ EOF
 
 cat > "$stub_dir/flock" <<'EOF'
 #!/bin/sh
+if [ -n "${STUB_FLOCK_CALLS_FILE:-}" ]; then
+  printf '%s\n' "$*" >> "$STUB_FLOCK_CALLS_FILE"
+fi
+case "$*" in
+  '-s -n 9' | '-n 9') ;;
+  *) exit 2 ;;
+esac
 if [ "${STUB_FLOCK_ERROR:-0}" = "1" ]; then
   exit 2
 fi
@@ -377,6 +464,8 @@ expect "healthy: no warning lines" "$(grep_not_out '^warning:'; echo $?)"
 expect "healthy: state file written" "$(if [ -f "$state_dir/state.json" ]; then echo 0; else echo 1; fi)"
 expect "healthy: state records nrestarts" "$(grep -q '^nrestarts|binance-lob-archiver-production@spot.service=4$' "$state_dir/state.json"; echo $?)"
 expect "healthy: state records failure_count" "$(grep -q '^failure_count|polymarket-market-tape-upload=0$' "$state_dir/state.json"; echo $?)"
+expect "healthy: state records sequence session" "$(grep -q '^sequence_gap_session|binance-lob-archiver-production@spot=fixture-spot$' "$state_dir/state.json"; echo $?)"
+expect "healthy: state records sequence total" "$(grep -q '^sequence_gap_total|binance-lob-archiver-production@spot=0$' "$state_dir/state.json"; echo $?)"
 
 # ---------------------------------------------------------------------------
 # 2. Gate 1: missing upload-status.json on a mandated lane is a breach
@@ -442,7 +531,7 @@ reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
-write_upload "$spool_root/binance-lob/spot/upload-status.json" null null 0 7300
+write_upload "$spool_root/binance-lob/spot/upload-status.json" null null 0 700
 run_health
 expect "gate2 lob stale: exit 1" "$(rc_is 1; echo $?)"
 expect "gate2 lob stale: breach message" "$(grep_out 'binance-lob-archiver-production@spot: last upload success stale'; echo $?)"
@@ -533,12 +622,12 @@ reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
-for i in 1 2 3 4 5; do
+for i in 1 2 3; do
   : > "$spool_root/binance-lob/spot/segment-$i.manifest.json"
 done
 run_health
 expect "gate3 lob count: exit 1" "$(rc_is 1; echo $?)"
-expect "gate3 lob count: breach message" "$(grep_out 'binance-lob-archiver-production@spot: pending upload backlog 5 over limit 4'; echo $?)"
+expect "gate3 lob count: breach message" "$(grep_out 'binance-lob-archiver-production@spot: pending upload backlog 3 over limit 2'; echo $?)"
 
 reset_env
 reset_state
@@ -561,10 +650,10 @@ reset_state
 healthy_scenario
 healthy_fixtures
 : > "$spool_root/binance-lob/spot/old.manifest.json"
-touch -t 202001010000 "$spool_root/binance-lob/spot/old.manifest.json"
+touch_age "$spool_root/binance-lob/spot/old.manifest.json" 901
 run_health
 expect "gate3 lob age: exit 1" "$(rc_is 1; echo $?)"
-expect "gate3 lob age: breach message" "$(grep_out 'binance-lob-archiver-production@spot: oldest pending upload backlog age'; echo $?)"
+expect "gate3 lob age: breach message" "$(grep_out 'binance-lob-archiver-production@spot: oldest pending upload backlog age .* over 900s'; echo $?)"
 
 reset_env
 reset_state
@@ -729,6 +818,51 @@ reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
+rewrite_scenario 's|^polymarket-market-tape-upload-watchdog.timer\tactive\tenabled\t-\t-$|polymarket-market-tape-upload-watchdog.timer\tactive\tenabled\t-\t-\telapsed\t123456789|'
+run_health
+expect "timer elapsed: exit 1" "$(rc_is 1; echo $?)"
+expect "timer elapsed: breach message" "$(grep_out "^breach: polymarket-market-tape-upload-watchdog.timer: timer not waiting or running (SubState='elapsed')"; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+rewrite_scenario 's|^polymarket-market-tape-upload-watchdog.timer\tactive\tenabled\t-\t-$|polymarket-market-tape-upload-watchdog.timer\tactive\tenabled\t-\t-\twaiting\t-|'
+run_health
+expect "timer missing next elapse: exit 1" "$(rc_is 1; echo $?)"
+expect "timer missing next elapse: breach message" "$(grep_out '^breach: polymarket-market-tape-upload-watchdog.timer: waiting timer has no finite next elapse'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+rewrite_scenario 's|^polymarket-market-tape-upload-watchdog.timer\tactive\tenabled\t-\t-$|polymarket-market-tape-upload-watchdog.timer\tactive\tenabled\t-\t-\trunning\tinfinity|'
+run_health
+expect "timer running: exit 0" "$(rc_is 0; echo $?)"
+expect "timer running: no watchdog breach" "$(grep_not_out '^breach: polymarket-market-tape-upload-watchdog.timer:'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+rewrite_scenario 's|^polymarket-market-tape-upload.timer\tactive\tenabled\t-\t-$|polymarket-market-tape-upload.timer\tactive\tenabled\t-\t-\telapsed\tinfinity|'
+run_health
+expect "market upload timer elapsed: exit 1" "$(rc_is 1; echo $?)"
+expect "market upload timer elapsed: breach message" "$(grep_out "^breach: polymarket-market-tape-upload.timer: timer not waiting or running (SubState='elapsed')"; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+rewrite_scenario 's|^polymarket-reference-upload.timer\tactive\tenabled\t-\t-$|polymarket-reference-upload.timer\tactive\tenabled\t-\t-\twaiting\tinfinity|'
+run_health
+expect "reference upload timer infinite next: exit 1" "$(rc_is 1; echo $?)"
+expect "reference upload timer infinite next: breach message" "$(grep_out '^breach: polymarket-reference-upload.timer: waiting timer has no finite next elapse'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
 rewrite_scenario 's|^binance-lob-archiver-recovery@spot.timer	active	enabled|binance-lob-archiver-recovery@spot.timer	inactive	disabled|'
 run_health
 expect "recovery timer down: exit 1" "$(rc_is 1; echo $?)"
@@ -768,7 +902,9 @@ expect "restart delta: exit 0" "$(rc_is 0; echo $?)"
 expect "restart delta: warning message" "$(grep_out '^warning: .*restart rate high'; echo $?)"
 
 # ---------------------------------------------------------------------------
-# 15. Demoted: health.json stale/gap/missing/symlink are warnings
+# 15. Demoted: health freshness and typed sequence counters are warnings.
+#     The counter is cumulative within one session and compared against the
+#     prior poll from the existing state file.
 # ---------------------------------------------------------------------------
 reset_env
 reset_state
@@ -783,19 +919,106 @@ reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
-write_health usdm 45 5 false synced
+write_health usdm 45 5 false synced session-usdm 5
 run_health
 expect "health gap: exit 0" "$(rc_is 0; echo $?)"
-expect "health gap: warning message" "$(grep_out '^warning: .*sequence_gaps=5'; echo $?)"
+expect "health gap current counter: warning message" "$(grep_out '^warning: .*sequence_gaps=5'; echo $?)"
 
 reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
-rm -f "$spool_root/binance-lob/spot/health.json"
+write_health usdm 45 2 false synced mismatch-session 5
+run_health --json
+expect "health gap fields differ: exit 0" "$(rc_is 0; echo $?)"
+expect "health gap fields differ: preserve current sequence_gaps" "$(json_query '.checks.health["binance-lob-archiver-production@usdm"].sequence_gaps == 2 and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_total == 5 and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_baseline == "baseline"'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+write_health usdm 45 0 false synced session-usdm 2
 run_health
+write_health usdm 45 0 false synced session-usdm 5
+run_health --json
+expect "health gap increase: exit 0" "$(rc_is 0; echo $?)"
+expect "health gap increase: delta warning" "$(grep_out 'sequence_gap_total increased 2 -> 5 (delta=3)'; echo $?)"
+expect "health gap increase: typed delta" "$(json_query '.checks.health["binance-lob-archiver-production@usdm"].sequence_gap_delta == 3 and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_baseline == "increased" and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_observed == true'; echo $?)"
+
+write_health usdm 45 0 false synced session-usdm 5
+run_health --json
+expect "health gap stable: exit 0" "$(rc_is 0; echo $?)"
+expect "health gap stable: no repeated warning" "$(grep_not_out 'sequence_gap_total increased'; echo $?)"
+expect "health gap stable: zero delta" "$(json_query '.checks.health["binance-lob-archiver-production@usdm"].sequence_gap_delta == 0 and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_baseline == "stable"'; echo $?)"
+
+write_health usdm 45 0 false synced session-usdm-next 1
+run_health --json
+expect "health session change: exit 0" "$(rc_is 0; echo $?)"
+expect "health session change: warning and baseline reset" "$(grep_out 'sequence_gap session changed (session-usdm -> session-usdm-next); baseline reset at total=1'; echo $?)"
+expect "health session change: typed status" "$(json_query '.checks.health["binance-lob-archiver-production@usdm"].sequence_gap_baseline == "session_changed" and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_observed == true and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_delta == null'; echo $?)"
+
+write_health usdm 45 0 false synced session-usdm-next 0
+run_health --json
+expect "health gap regression: exit 0" "$(rc_is 0; echo $?)"
+expect "health gap regression: warning" "$(grep_out 'sequence_gap_total regressed 1 -> 0'; echo $?)"
+expect "health gap regression: typed status" "$(json_query '.checks.health["binance-lob-archiver-production@usdm"].sequence_gap_baseline == "regressed" and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_observed == true'; echo $?)"
+write_health usdm 45 0 false synced session-usdm-next 1
+run_health --json
+expect "health gap post-regression: exit 0" "$(rc_is 0; echo $?)"
+expect "health gap post-regression: delta warning" "$(json_query '.warnings | any(contains("sequence_gap_total increased 0 -> 1 (delta=1)"))'; echo $?)"
+expect "health gap post-regression: rebaseline applied" "$(json_query '.checks.health["binance-lob-archiver-production@usdm"].sequence_gap_baseline == "increased" and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_delta == 1'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+write_health usdm 45 0 false synced session-preserved 4
+run_health
+write_health usdm 45 0 false synced session-preserved oops
+run_health --json
+expect "health malformed total: exit 0" "$(rc_is 0; echo $?)"
+expect "health malformed total: warning" "$(grep_out 'sequence counter malformed'; echo $?)"
+expect "health malformed total: typed null and prior retained" "$(json_query '.checks.health["binance-lob-archiver-production@usdm"].sequence_gap_total == null and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_previous_total == 4 and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_baseline == "malformed" and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_observed == false'; echo $?)"
+expect "health malformed total: state retained" "$(grep -q '^sequence_gap_total|binance-lob-archiver-production@usdm=4$' "$state_dir/state.json"; echo $?)"
+
+write_health usdm 45 0 false synced session-preserved 7
+jq 'del(.sequence_gap_total)' "$spool_root/binance-lob/usdm/health.json" > "$spool_root/binance-lob/usdm/health.json.tmp" \
+  && mv "$spool_root/binance-lob/usdm/health.json.tmp" "$spool_root/binance-lob/usdm/health.json"
+run_health --json
+expect "health missing total: typed null and prior retained" "$(json_query '.checks.health["binance-lob-archiver-production@usdm"].sequence_gap_total == null and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_previous_total == 4 and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_baseline == "malformed" and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_observed == false'; echo $?)"
+
+write_health usdm 45 0 false synced malformed-session 6
+jq '.session_id = 12345' "$spool_root/binance-lob/usdm/health.json" > "$spool_root/binance-lob/usdm/health.json.tmp" \
+  && mv "$spool_root/binance-lob/usdm/health.json.tmp" "$spool_root/binance-lob/usdm/health.json"
+run_health --json
+expect "health malformed session: exit 0" "$(rc_is 0; echo $?)"
+expect "health malformed session: typed total and prior retained" "$(json_query '.checks.health["binance-lob-archiver-production@usdm"].sequence_gap_total == 6 and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_previous_total == 4 and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_baseline == "malformed" and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_observed == false'; echo $?)"
+
+write_health usdm 45 0 false synced session-preserved 9
+run_health --dry-run --json
+expect "health dry-run: exit 0" "$(rc_is 0; echo $?)"
+expect "health dry-run: no counter comparison" "$(grep_not_out 'sequence_gap_total increased'; echo $?)"
+expect "health dry-run: typed status" "$(json_query '.checks.health["binance-lob-archiver-production@usdm"].sequence_gap_baseline == "dry_run" and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_observed == true and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_delta == null'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+write_health spot 45 0 false synced preserved-session 4
+run_health
+rm -f "$spool_root/binance-lob/spot/health.json"
+run_health --json
 expect "health missing: exit 0" "$(rc_is 0; echo $?)"
-expect "health missing: warning message" "$(grep_out '^warning: .*health.json missing'; echo $?)"
+expect "health missing: warning message" "$(json_query '.warnings | any(contains("health.json missing"))'; echo $?)"
+expect "health missing: prior retained" "$(json_query '.checks.health["binance-lob-archiver-production@spot"].sequence_gap_observed == false and .checks.health["binance-lob-archiver-production@spot"].sequence_gap_baseline == "missing" and .checks.health["binance-lob-archiver-production@spot"].sequence_gap_previous_total == 4'; echo $?)"
+expect "health missing: state retained" "$(grep -q '^sequence_gap_total|binance-lob-archiver-production@spot=4$' "$state_dir/state.json"; echo $?)"
+
+write_health spot 45 0 false synced preserved-session 5
+jq '.updated_at_ns = {invalid: true}' "$spool_root/binance-lob/spot/health.json" > "$spool_root/binance-lob/spot/health.json.tmp" \
+  && mv "$spool_root/binance-lob/spot/health.json.tmp" "$spool_root/binance-lob/spot/health.json"
+run_health --json
+expect "health invalid timestamp: exit 0" "$(rc_is 0; echo $?)"
+expect "health invalid timestamp: prior retained" "$(json_query '.checks.health["binance-lob-archiver-production@spot"].sequence_gap_observed == false and .checks.health["binance-lob-archiver-production@spot"].sequence_gap_baseline == "malformed" and .checks.health["binance-lob-archiver-production@spot"].sequence_gap_previous_total == 4'; echo $?)"
 
 reset_env
 reset_state
@@ -808,38 +1031,32 @@ expect "health symlink: exit 0" "$(rc_is 0; echo $?)"
 expect "health symlink: warning message" "$(grep_out '^warning: .*health.json missing or a symbolic link'; echo $?)"
 
 # ---------------------------------------------------------------------------
-# 16. Demoted: delay-gate trips / journald failure / fee snapshot failures are
-#     warnings
+# 16. Journal scans are removed. The compatibility delay_gate projection is
+#     explicit, and fee health remains covered by oneshot Result + upload status.
 # ---------------------------------------------------------------------------
 reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
-STUB_JOURNAL_TRIPS=2
-run_health
-expect "delay gate: exit 0" "$(rc_is 0; echo $?)"
-expect "delay gate: warning message" "$(grep_out '^warning: .*delay-gate trip'; echo $?)"
-
-reset_env
-reset_state
-healthy_scenario
-healthy_fixtures
-STUB_JOURNAL_FAIL=1
-run_health
-expect "journald fail: exit 0" "$(rc_is 0; echo $?)"
-expect "journald fail: warning message" "$(grep_out '^warning: .*journald query failed'; echo $?)"
-
-reset_env
-reset_state
-healthy_scenario
-healthy_fixtures
-STUB_JOURNAL_FEE_FAILURES=1
-run_health
-expect "fee snapshot failure: exit 0" "$(rc_is 0; echo $?)"
-expect "fee snapshot failure: warning message" "$(grep_out '^warning: .*recent snapshot failure'; echo $?)"
+run_health --json
+expect "typed health replacement: exit 0" "$(rc_is 0; echo $?)"
+expect "typed health replacement: delay gate compatibility" "$(json_query '
+  .checks.delay_gate["binance-lob-archiver-production@spot.service"].trips_15m == null
+  and .checks.delay_gate["binance-lob-archiver-production@spot.service"].observed == false
+  and .checks.delay_gate["binance-lob-archiver-production@spot.service"].skipped_reason == "replaced_by_health_sequence_counters"
+  and .checks.delay_gate["binance-lob-archiver-production@spot.service"].replacement == "checks.health"
+'; echo $?)"
+expect "typed health replacement: journalctl zero calls" "$(if [ ! -s "$journal_calls_file" ]; then echo 0; else echo 1; fi)"
+expect "fee oneshot and upload evidence: clean" "$(json_query '.checks.units["binance-fee-snapshot-spot.service"].result == "success" and .checks.units["binance-fee-upload.service"].result == "success" and .checks.uploads["binance-fee-upload"].failure_count == 0'; echo $?)"
+awk -F '\t' 'BEGIN { OFS = "\t" } $1 == "binance-fee-snapshot-spot.service" { $4 = "exit-code" } { print }' \
+  "$scenario" > "$scenario.$$" && mv "$scenario.$$" "$scenario"
+run_health --json
+expect "fee oneshot failure remains a warning" "$(rc_is 0; echo $?)"
+expect "fee oneshot failure is observed without journal" "$(json_query '.warnings | any(contains("binance-fee-snapshot-spot.service: last systemd Result"))'; echo $?)"
+expect "fee oneshot failure: journalctl zero calls" "$(if [ ! -s "$journal_calls_file" ]; then echo 0; else echo 1; fi)"
 
 # ---------------------------------------------------------------------------
-# 17. Demoted: /data unmounted is a warning
+# 17. /data unmounted is a breach
 # ---------------------------------------------------------------------------
 reset_env
 reset_state
@@ -847,8 +1064,8 @@ healthy_scenario
 healthy_fixtures
 STUB_MOUNTED=0
 run_health
-expect "mount: exit 0" "$(rc_is 0; echo $?)"
-expect "mount: warning message" "$(grep_out '^warning: mount: /data is not mounted'; echo $?)"
+expect "mount: exit 1" "$(rc_is 1; echo $?)"
+expect "mount: breach message" "$(grep_out '^breach: mount: /data is not mounted'; echo $?)"
 
 # ---------------------------------------------------------------------------
 # 18. State persistence failure stays a breach (gate 4 delta evidence)
@@ -1009,8 +1226,16 @@ expect "json healthy: parses and shape valid" "$(json_query '
   and (.checks.uploads["binance-lob-archiver-production@spot"].pending_count | type) == "number"
   and .checks.uploads["binance-fee-upload"].last_error == "null"
   and (.checks.uploads["bybit-options-upload"].last_success_age_seconds | type) == "number"
-  and (.checks.delay_gate["binance-lob-archiver-production@spot.service"].trips_15m | type) == "number"
+  and .checks.delay_gate["binance-lob-archiver-production@spot.service"].trips_15m == null
+  and .checks.delay_gate["binance-lob-archiver-production@spot.service"].observed == false
+  and .checks.delay_gate["binance-lob-archiver-production@spot.service"].skipped_reason == "replaced_by_health_sequence_counters"
+  and .checks.delay_gate["binance-lob-archiver-production@spot.service"].replacement == "checks.health"
+  and .checks.health["binance-lob-archiver-production@spot"].sequence_gap_total == 0
+  and .checks.health["binance-lob-archiver-production@spot"].sequence_gap_baseline == "baseline"
+  and .checks.health["binance-lob-archiver-production@spot"].sequence_gap_observed == true
+  and .checks.health["binance-lob-archiver-production@spot"].session_id == "fixture-spot"
 '; echo $?)"
+expect "json healthy: journalctl zero calls" "$(if [ ! -s "$journal_calls_file" ]; then echo 0; else echo 1; fi)"
 
 # ---------------------------------------------------------------------------
 # 21. JSON output shape (warnings do not block ok:true)
@@ -1020,7 +1245,7 @@ reset_state
 healthy_scenario
 healthy_fixtures
 STUB_DF_AVAIL_KIB=$DF_AVAIL_WARN
-STUB_JOURNAL_TRIPS=1
+write_health usdm 45 1 false synced warning-session 1
 run_health --json
 expect "json warnings: exit 0" "$(rc_is 0; echo $?)"
 expect "json warnings: ok:true with warnings" "$(json_query '
@@ -1028,8 +1253,21 @@ expect "json warnings: ok:true with warnings" "$(json_query '
   and (.breaches | length) == 0
   and (.warnings | length) >= 2
   and (.warnings | any(contains("at or below warning")))
-  and (.warnings | any(contains("delay-gate trip")))
+  and (.warnings | any(contains("sequence_gaps=1")))
 '; echo $?)"
+
+# ---------------------------------------------------------------------------
+# 21b. Journal command is a hard-fail stub and must never be reached.
+# ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+run_health --json
+journal_call_count=$(wc -l < "$journal_calls_file" | tr -d ' ')
+expect "journal replacement: exit 0" "$(rc_is 0; echo $?)"
+expect "journal replacement: zero journal calls" "$(if [ "$journal_call_count" = 0 ]; then echo 0; else echo 1; fi)"
+expect "journal replacement: no journald coordination schema" "$(json_query 'has("checks") and (.checks | has("journald_coordination") | not)'; echo $?)"
 
 # ---------------------------------------------------------------------------
 # 22. JSON output shape (breaching)
@@ -1158,30 +1396,35 @@ expect "recovery queue empty: json zero counts" "$(json_query '
   .checks.recovery_queue.spot.ready_count == 0 and
   .checks.recovery_queue.spot.running_count == 0 and
   .checks.recovery_queue.spot.failed_count == 0 and
+  .checks.recovery_queue.spot.malformed_count == 0 and
+  .checks.recovery_queue.spot.legacy_unreceipted_count == 0 and
   .checks.recovery_queue.usdm.ready_count == 0 and
   .checks.recovery_queue.usdm.running_count == 0 and
-  .checks.recovery_queue.usdm.failed_count == 0
+  .checks.recovery_queue.usdm.failed_count == 0 and
+  .checks.recovery_queue.usdm.malformed_count == 0 and
+  .checks.recovery_queue.usdm.legacy_unreceipted_count == 0
 '; echo $?)"
 
 reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
-mkdir -p "$spool_root/binance-lob-recovery/spot/job.ready"
+write_recovery_job spot job ready
 touch_age "$spool_root/binance-lob-recovery/spot/job.ready" 60
 run_health --json
 expect "recovery queue ready fresh: exit 0" "$(rc_is 0; echo $?)"
 expect "recovery queue ready fresh: json count" "$(json_query '
   .checks.recovery_queue.spot.ready_count == 1 and
   (.checks.recovery_queue.spot.ready_oldest_age_seconds >= 0) and
-  .checks.recovery_queue.spot.failed_count == 0
+  .checks.recovery_queue.spot.failed_count == 0 and
+  .checks.recovery_queue.spot.malformed_count == 0
 '; echo $?)"
 
 reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
-mkdir -p "$spool_root/binance-lob-recovery/spot/job.ready"
+write_recovery_job spot job ready
 touch_age "$spool_root/binance-lob-recovery/spot/job.ready" 1900
 run_health
 expect "recovery queue ready stale: exit 1" "$(rc_is 1; echo $?)"
@@ -1191,7 +1434,7 @@ reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
-mkdir -p "$spool_root/binance-lob-recovery/usdm/job.running"
+write_recovery_job usdm job running
 touch_age "$spool_root/binance-lob-recovery/usdm/job.running" 7300
 run_health
 expect "recovery queue running stale: exit 1" "$(rc_is 1; echo $?)"
@@ -1201,7 +1444,7 @@ reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
-mkdir -p "$spool_root/binance-lob-recovery/usdm/job.failed"
+write_recovery_job usdm job failed
 touch_age "$spool_root/binance-lob-recovery/usdm/job.failed" 30
 run_health
 expect "recovery queue failed present: exit 1" "$(rc_is 1; echo $?)"
@@ -1211,7 +1454,175 @@ reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
-mkdir -p "$spool_root/binance-lob-recovery"
+make_recovery_queue spot
+mkdir -p "$spool_root/binance-lob-recovery/spot/missing.ready"
+run_health --json
+expect "recovery queue missing receipt: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue missing receipt: malformed count" "$(json_query '
+  .checks.recovery_queue.spot.ready_count == 1 and
+  .checks.recovery_queue.spot.malformed_count == 1
+'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+write_recovery_job usdm mismatch ready
+jq '.canonical_spool = "/wrong"' \
+  "$spool_root/binance-lob-recovery/usdm/mismatch.ready/job.json" \
+  >"$spool_root/binance-lob-recovery/usdm/mismatch.ready/job.json.tmp"
+mv "$spool_root/binance-lob-recovery/usdm/mismatch.ready/job.json.tmp" \
+  "$spool_root/binance-lob-recovery/usdm/mismatch.ready/job.json"
+run_health --json
+expect "recovery queue mismatched receipt: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue mismatched receipt: malformed count" "$(json_query '
+  .checks.recovery_queue.usdm.ready_count == 1 and
+  .checks.recovery_queue.usdm.malformed_count == 1
+'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+write_recovery_job spot missing-hash ready
+jq 'del(.release_sha256)' \
+  "$spool_root/binance-lob-recovery/spot/missing-hash.ready/job.json" \
+  >"$spool_root/binance-lob-recovery/spot/missing-hash.ready/job.json.tmp"
+mv "$spool_root/binance-lob-recovery/spot/missing-hash.ready/job.json.tmp" \
+  "$spool_root/binance-lob-recovery/spot/missing-hash.ready/job.json"
+run_health --json
+expect "recovery queue missing hash receipt: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue missing hash receipt: malformed count" "$(json_query '
+  .checks.recovery_queue.spot.ready_count == 1 and
+  .checks.recovery_queue.spot.malformed_count == 1
+'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+isolation_job=20260826T000001Z-spot-000000000000-1
+write_recovery_job spot "$isolation_job" ready
+write_isolation_marker spot "$isolation_job"
+run_health --json
+expect "recovery queue active isolation: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue active isolation: bound marker" "$(json_query '
+  .checks.recovery_queue.spot.isolation_active == true and
+  .checks.recovery_queue.spot.isolation_valid == true and
+  (.checks.recovery_queue.spot.isolation_age_seconds | type) == "number"
+'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+isolation_job=20260826T000001Z-usdm-000000000000-2
+write_recovery_job usdm "$isolation_job" ready
+write_isolation_marker usdm "$isolation_job"
+jq '.receipt_sha256 = ("f" * 64)' \
+  "$spool_root/binance-lob-recovery/usdm/isolation.json" \
+  >"$spool_root/binance-lob-recovery/usdm/isolation.json.tmp"
+mv "$spool_root/binance-lob-recovery/usdm/isolation.json.tmp" \
+  "$spool_root/binance-lob-recovery/usdm/isolation.json"
+run_health --json
+expect "recovery queue drifted isolation: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue drifted isolation: malformed marker" "$(json_query '
+  .checks.recovery_queue.usdm.isolation_active == true and
+  .checks.recovery_queue.usdm.isolation_valid == false
+'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+make_recovery_queue spot
+mkdir -p "$spool_root/binance-lob-recovery/spot/legacy-unreceipted/legacy-job"
+run_health --json
+expect "recovery queue legacy containment: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue legacy containment: count" "$(json_query '
+  .checks.recovery_queue.spot.legacy_unreceipted_count == 1
+'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+make_recovery_queue spot
+mkdir -p "$spool_root/binance-lob-recovery/spot/legacy-unreceipted"
+chmod 0770 "$spool_root/binance-lob-recovery/spot/legacy-unreceipted"
+run_health
+expect "recovery queue writable legacy containment: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue writable legacy containment: breach" "$(grep_out '^breach: binance-lob-recovery\[spot\]: legacy-unreceipted is not an inspectable root-owned directory'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+make_recovery_queue_root
+chmod 0770 "$spool_root/binance-lob-recovery"
+run_health
+expect "recovery queue writable root: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue writable root: breach" "$(grep_out '^breach: binance-lob-recovery: recovery queue root is not an inspectable directory'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+make_recovery_queue spot
+chmod 0770 "$spool_root/binance-lob-recovery/spot"
+run_health
+expect "recovery queue writable market: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue writable market: breach" "$(grep_out '^breach: binance-lob-recovery\[spot\]: recovery queue root is not an inspectable directory'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+make_recovery_queue spot
+chmod 0740 "$spool_root/binance-lob-recovery/spot"
+run_health
+expect "recovery queue untraversable market: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue untraversable market: breach" "$(grep_out '^breach: binance-lob-recovery\[spot\]: recovery queue root is not an inspectable directory'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+STUB_HFT_GID=99999
+make_recovery_queue_root
+run_health
+expect "recovery queue wrong collector group: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue wrong collector group: breach" "$(grep_out '^breach: binance-lob-recovery: recovery queue root is not an inspectable directory'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+write_recovery_job spot writable-dir ready
+chmod 0770 "$spool_root/binance-lob-recovery/spot/writable-dir.ready"
+run_health --json
+expect "recovery queue writable job dir: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue writable job dir: malformed" "$(json_query '
+  .checks.recovery_queue.spot.malformed_count == 1
+'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+write_recovery_job spot writable-receipt ready
+chmod 0660 "$spool_root/binance-lob-recovery/spot/writable-receipt.ready/job.json"
+run_health --json
+expect "recovery queue writable receipt: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue writable receipt: malformed" "$(json_query '
+  .checks.recovery_queue.spot.malformed_count == 1
+'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+make_recovery_queue_root
 ln -s "$spool_root/binance-lob/spot" "$spool_root/binance-lob-recovery/spot"
 run_health
 expect "recovery queue scan failure: exit 1" "$(rc_is 1; echo $?)"

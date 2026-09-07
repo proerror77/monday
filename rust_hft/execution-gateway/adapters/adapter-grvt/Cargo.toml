@@ -6,17 +6,13 @@ edition = "2021"
 [dependencies]
 hft-core = { package = "hft-core", path = "../../../market-core/core" }
 ports = { package = "hft-ports", path = "../../../market-core/ports" }
-integration = { package = "hft-integration", path = "../../../market-core/integration" }
 async-trait = "0.1"
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 tracing = { workspace = true }
-futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 simd-json = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls-tls", "cookies"] }
-tokio-tungstenite = { workspace = true }
-url = "2.5"
 tokio-stream = { version = "0.1", features = ["sync"] }
 
 [lib]
