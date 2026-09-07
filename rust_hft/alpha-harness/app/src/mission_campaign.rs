@@ -6,7 +6,7 @@ use crate::{
     data_mission, mission_dispatch,
     mission_render::{
         allowed_research_feature_fields, render_cex_bundle, CexCampaignFailureClassV1,
-        CexCampaignLearningDirectiveV1, CexCampaignLlmProvenanceV1, CexCampaignPositionPolicyV1,
+        CexCampaignLearningDirectiveV1, CexCampaignPositionPolicyV1,
         CexCampaignResearchEvidenceSignatureV2, CexCampaignResearchParentV1,
         CexCampaignResearchPlanV1, CexCampaignSearchPolicyRevisionV1, MAX_RESEARCH_PLAN_GENERATION,
     },
@@ -26,7 +26,6 @@ use alpha_domain::{
     canonical_json_hash, factor_ast_source_features, CandidateEvaluation, CexBaselineFailureCodeV1,
     CexBaselineGateV1, CexFactorBankRevisionV2, CexFactorRejectionCodeV1, CEX_GP_POLICY_SCHEMA_V4,
 };
-use alpha_engine::llm::{HypothesisArtifact, LlmConfig, OpenAiCompatibleClient};
 use alpha_engine::{baselines::CexSupervisedModelCandidateV1, engines::CexFactorBankMctsResultV1};
 use anyhow::{bail, Context};
 use hft_backtest::config::verify_canonical_replay_artifact_streaming;
@@ -522,7 +521,6 @@ pub fn learn(args: CampaignLearnArgs) -> anyhow::Result<()> {
             "learning_directive_sha256": learning_directive.content_hash()?,
             "search_policy_revision_id": &search_policy_revision.revision_id,
             "round_feedback": result.rounds.iter().map(round_log_summary).collect::<Vec<_>>(),
-            "max_tokens": args.max_tokens,
         }),
     );
 
@@ -557,31 +555,15 @@ pub fn learn(args: CampaignLearnArgs) -> anyhow::Result<()> {
         return print_json(&report);
     }
 
-    if args.max_tokens == 0 {
-        bail!("Campaign learning max_tokens must be positive");
-    }
     if loaded.request.research_plan.generation >= MAX_RESEARCH_PLAN_GENERATION {
         bail!("Campaign learning exhausted the bounded follow-up generations");
     }
-    let client = OpenAiCompatibleClient::new(LlmConfig::from_env().map_err(anyhow::Error::msg)?)
-        .map_err(anyhow::Error::msg)?;
-    let prompt = campaign_learning_prompt(
-        &loaded,
-        &result,
-        &result_sha256,
-        &learning_directive,
-        &search_policy_revision,
-    );
-    let artifact = client
-        .generate_hypothesis_bounded(&prompt, args.max_tokens)
-        .map_err(anyhow::Error::msg)?;
-    let plan = follow_up_plan_from_artifact(
+    let plan = follow_up_plan(
         &loaded,
         &result_sha256,
         learning_directive,
         search_policy_revision,
         evidence_signature.clone(),
-        artifact,
     )?;
     write_research_plan_create_once(&args.output, &plan)?;
     let report = campaign_learn_report(
@@ -743,53 +725,24 @@ fn next_campaign_policy_revision(
     Ok((revision, directive))
 }
 
-fn campaign_learning_prompt(
-    loaded: &LoadedRequest,
-    result: &CampaignResultV1,
-    result_sha256: &str,
-    learning_directive: &CexCampaignLearningDirectiveV1,
-    search_policy_revision: &CexCampaignSearchPolicyRevisionV1,
-) -> String {
-    let evidence = serde_json::json!({
-        "parent_campaign_id": loaded.request.campaign_id,
-        "parent_request_sha256": loaded.sha256,
-        "parent_campaign_result_sha256": result_sha256,
-        "termination_reason": result.termination_reason,
-        "learning_directive": learning_directive,
-        "search_policy_revision": search_policy_revision,
-        "current_research_plan": {
-            "objective": loaded.request.research_plan.objective,
-            "hypothesis": loaded.request.research_plan.hypothesis,
-            "focus_field": loaded.request.research_plan.focus_field,
-            "feature_fields": loaded.request.research_plan.feature_fields,
-        },
-        "rounds": result.rounds.iter().map(|round| serde_json::json!({
-            "round_id": round.round_id,
-            "termination_reason": round.termination_reason,
-            "consumed_trials": round.consumed_trials,
-            "feedback": round.feedback,
-        })).collect::<Vec<_>>(),
-    });
-    format!(
-        "Propose one falsifiable follow-up hypothesis for a bounded Binance USD-M BTCUSDT 1s/h5/top5 research Campaign. Keep field exactly {:?}, set operator to identity, and set window to null. The deterministic controller has already classified the failure and pinned exactly one registered position-policy revision; you cannot change that revision, the feature set, data, fees, validation thresholds, budgets, holdout, model kinds, Kubernetes, runtime, risk, or execution authority. Return only the governed hypothesis artifact. Negative Campaign evidence: {evidence}",
-        loaded.request.research_plan.focus_field,
-    )
-}
-
-fn follow_up_plan_from_artifact(
+fn follow_up_plan(
     loaded: &LoadedRequest,
     result_sha256: &str,
     learning_directive: CexCampaignLearningDirectiveV1,
     search_policy_revision: CexCampaignSearchPolicyRevisionV1,
     parent_evidence_signature: CexCampaignResearchEvidenceSignatureV2,
-    artifact: HypothesisArtifact,
 ) -> anyhow::Result<CexCampaignResearchPlanV1> {
-    if artifact.field != loaded.request.research_plan.focus_field
-        || artifact.operator != "identity"
-        || artifact.window.is_some()
-    {
-        bail!("LLM proposed a change outside the pinned Campaign learning directive");
-    }
+    let hypothesis = match learning_directive.failure_class {
+        CexCampaignFailureClassV1::NoTradesAfterCosts => {
+            "The registered prediction-identity position policy will restore non-zero replay trades after costs for the unchanged factor set"
+        }
+        CexCampaignFailureClassV1::OvertradeCapacity => {
+            "The registered hysteretic cost-aware position policy will reduce replay turnover and capacity breaches for the unchanged factor set"
+        }
+        CexCampaignFailureClassV1::PositiveIcNegativeNet => {
+            "The registered hysteretic cost-aware position policy will improve replay net returns by reducing turnover costs for the unchanged predictive factor set"
+        }
+    };
     let mut attempted_search_policy_revision_ids = loaded
         .request
         .research_plan
@@ -803,7 +756,7 @@ fn follow_up_plan_from_artifact(
             "Evaluate {:?} policy follow-up after {}",
             learning_directive.failure_class, loaded.request.campaign_id
         ),
-        hypothesis: artifact.hypothesis,
+        hypothesis: hypothesis.to_string(),
         focus_field: loaded.request.research_plan.focus_field.clone(),
         feature_fields: loaded.request.research_plan.feature_fields.clone(),
         search_policy_revision,
@@ -815,14 +768,7 @@ fn follow_up_plan_from_artifact(
             campaign_result_sha256: result_sha256.to_string(),
         }),
         learning_directive: Some(learning_directive),
-        llm: Some(CexCampaignLlmProvenanceV1 {
-            provider: artifact.provider,
-            model: artifact.model,
-            prompt_sha256: artifact.prompt_hash,
-            prompt_tokens: artifact.token_usage.prompt_tokens,
-            completion_tokens: artifact.token_usage.completion_tokens,
-            total_tokens: artifact.token_usage.total_tokens,
-        }),
+        llm: None,
     };
     plan.validate()?;
     Ok(plan)
@@ -3245,38 +3191,12 @@ mod tests {
         let (search_policy_revision, learning_directive) =
             next_campaign_policy_revision(&loaded, &result_sha256, failure_class).unwrap();
 
-        let prompt = campaign_learning_prompt(
-            &loaded,
-            &result,
-            &result_sha256,
-            &learning_directive,
-            &search_policy_revision,
-        );
-        assert!(!prompt.contains(&loaded.request.feature_url));
-        assert!(prompt.contains("evaluation_failed"));
-        assert!(prompt.contains("baseline_failure_codes"));
-        assert!(prompt.contains("overtrade_capacity"));
-        let artifact = HypothesisArtifact {
-            hypothesis: "The registered identity mapping restores evaluable positions".to_string(),
-            field: loaded.request.research_plan.focus_field.clone(),
-            operator: "identity".to_string(),
-            window: None,
-            provider: "test".to_string(),
-            model: "test".to_string(),
-            prompt_hash: "8".repeat(64),
-            token_usage: alpha_engine::llm::TokenUsage {
-                prompt_tokens: 10,
-                completion_tokens: 5,
-                total_tokens: 15,
-            },
-        };
-        let plan = follow_up_plan_from_artifact(
+        let plan = follow_up_plan(
             &loaded,
             &result_sha256,
             learning_directive.clone(),
             search_policy_revision.clone(),
             campaign_research_evidence_signature(&loaded.request, &result).unwrap(),
-            artifact.clone(),
         )
         .unwrap();
         validate_existing_follow_up_plan(
@@ -3296,6 +3216,11 @@ mod tests {
             CexCampaignPositionPolicyV1::HystereticCostAware
         );
         assert_eq!(plan.learning_directive, Some(learning_directive.clone()));
+        assert_eq!(
+            plan.hypothesis,
+            "The registered hysteretic cost-aware position policy will reduce replay turnover and capacity breaches for the unchanged factor set"
+        );
+        assert!(plan.llm.is_none());
         assert_eq!(plan.focus_field, loaded.request.research_plan.focus_field);
         assert_eq!(
             plan.feature_fields,
@@ -3320,18 +3245,21 @@ mod tests {
         assert_eq!(load_research_plan(&output).unwrap(), plan);
         assert!(write_research_plan_create_once(&output, &plan).is_err());
 
-        let mut invalid = artifact;
-        invalid.operator = "delta".to_string();
-        invalid.window = Some(5);
-        assert!(follow_up_plan_from_artifact(
-            &loaded,
-            &result_sha256,
-            learning_directive,
-            search_policy_revision,
-            campaign_research_evidence_signature(&loaded.request, &result).unwrap(),
-            invalid,
-        )
-        .is_err());
+        let request_path = root.path().join("request.json");
+        let result_path = root.path().join("result.json");
+        std::fs::write(&request_path, serialize_request(&loaded.request).unwrap()).unwrap();
+        data_mission::write_json_atomic(&result_path, &result).unwrap();
+        let args = CampaignLearnArgs {
+            request: request_path,
+            result_sha256: crate::mission_runner::sha256_file(&result_path).unwrap(),
+            result: result_path,
+            output: root.path().join("learned-plan.json"),
+        };
+        learn(args.clone()).unwrap();
+        let first = std::fs::read(&args.output).unwrap();
+        assert!(load_research_plan(&args.output).unwrap().llm.is_none());
+        learn(args.clone()).unwrap();
+        assert_eq!(std::fs::read(&args.output).unwrap(), first);
     }
 
     #[test]
@@ -3373,6 +3301,20 @@ mod tests {
         );
         assert_eq!(directive.failure_class, failure_class);
         assert_eq!(directive.search_policy_revision_id, revision.revision_id);
+        let plan = follow_up_plan(
+            &loaded,
+            &result_sha256,
+            directive,
+            revision,
+            campaign_research_evidence_signature(&loaded.request, &result).unwrap(),
+        )
+        .unwrap();
+        assert!(plan.llm.is_none());
+        assert!(plan.hypothesis.contains("improve replay net returns"));
+        assert_eq!(
+            plan.search_policy_revision.position_policy,
+            CexCampaignPositionPolicyV1::HystereticCostAware
+        );
     }
 
     #[test]

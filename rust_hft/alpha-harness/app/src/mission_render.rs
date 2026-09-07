@@ -407,7 +407,7 @@ impl CexCampaignResearchPlanV1 {
                     && self.parent_evidence_signature.is_none()
                     && self.search_policy_revision
                         == CexCampaignSearchPolicyRevisionV1::canonical() => {}
-            (Some(parent), Some(directive), Some(llm)) => {
+            (Some(parent), Some(directive), llm) => {
                 if self.generation == 0 || self.generation > MAX_RESEARCH_PLAN_GENERATION {
                     bail!("CEX Campaign follow-up generation is outside the bounded loop");
                 }
@@ -450,28 +450,29 @@ impl CexCampaignResearchPlanV1 {
                 {
                     bail!("CEX Campaign learning directive does not bind its policy revision");
                 }
-                for (label, value) in [
-                    ("LLM provider", llm.provider.as_str()),
-                    ("LLM model", llm.model.as_str()),
-                ] {
-                    if value.trim().is_empty()
-                        || value.len() > 256
-                        || value.chars().any(char::is_control)
+                if let Some(llm) = llm {
+                    for (label, value) in [
+                        ("LLM provider", llm.provider.as_str()),
+                        ("LLM model", llm.model.as_str()),
+                    ] {
+                        if value.trim().is_empty()
+                            || value.len() > 256
+                            || value.chars().any(char::is_control)
+                        {
+                            bail!("CEX Campaign research plan {label} is invalid");
+                        }
+                    }
+                    if normalized_sha256("LLM prompt", &llm.prompt_sha256)? != llm.prompt_sha256
+                        || llm.prompt_tokens == 0
+                        || llm.completion_tokens == 0
+                        || llm.total_tokens
+                            != llm.prompt_tokens.saturating_add(llm.completion_tokens)
                     {
-                        bail!("CEX Campaign research plan {label} is invalid");
+                        bail!("CEX Campaign research plan LLM provenance is invalid");
                     }
                 }
-                if normalized_sha256("LLM prompt", &llm.prompt_sha256)? != llm.prompt_sha256
-                    || llm.prompt_tokens == 0
-                    || llm.completion_tokens == 0
-                    || llm.total_tokens != llm.prompt_tokens.saturating_add(llm.completion_tokens)
-                {
-                    bail!("CEX Campaign research plan LLM provenance is invalid");
-                }
             }
-            _ => bail!(
-                "CEX Campaign follow-up requires parent, learning directive, and LLM provenance"
-            ),
+            _ => bail!("CEX Campaign follow-up requires parent and learning directive"),
         }
         Ok(())
     }
@@ -1051,6 +1052,21 @@ pub(crate) mod tests {
         assert_eq!(
             rendered.mission.spec.policies.supervised_decision.id,
             plan.search_policy_revision.revision_id
+        );
+
+        let mut deterministic_plan = plan.clone();
+        deterministic_plan.llm = None;
+        let deterministic = render_cex_bundle(
+            &fixture.feature_path,
+            &fixture.materialization_path,
+            &deterministic_plan,
+            7,
+            deterministic_plan.max_candidates().unwrap() * 2,
+        )
+        .unwrap();
+        assert_eq!(
+            deterministic.mission.spec.policies.supervised_decision,
+            rendered.mission.spec.policies.supervised_decision
         );
 
         let mut invalid = plan.clone();

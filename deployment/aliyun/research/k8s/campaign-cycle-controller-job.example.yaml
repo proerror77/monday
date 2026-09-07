@@ -62,11 +62,6 @@ spec:
             - aliyun
             - --kubectl
             - kubectl
-          envFrom:
-            # Research-only LLM configuration for campaign-learn. Never point
-            # this at an exchange, trading, execution, or runtime Secret.
-            - secretRef:
-                name: REPLACE_RESEARCH_LEARNING_SECRET
           resources:
             requests:
               cpu: "500m"
