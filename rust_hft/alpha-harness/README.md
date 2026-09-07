@@ -287,6 +287,43 @@ cargo run -p alpha-harness -- deployment sign \
 
 The deployment signing key file contains exactly 32 bytes as hex and is never stored in DuckDB or passed to the runtime. Live-small signing requires a persisted `human_live_small` approval whose `scope_hash` matches venue, instruments, and live-small intent. Runtime-owned `policy.json` must independently carry the referenced approval id, class, promotion subject, scope hash, signer, validity window, and revocation state; an envelope signer cannot self-assert an approval id. The runtime still refuses live-small activation until universal order/slippage enforcement and real-venue reconciliation/reduce-only acceptance tests pass.
 
+Approval creation preserves the original payload and content hash. Revocation
+appends a `monday.approval_revocation.v1` record bound to that original hash;
+it never updates the original approval row. `get_approval` returns the effective
+view with revocation applied, including for eligibility checks.
+`get_approval_evidence` is for inspecting original evidence, not authorizing an
+operation. Identical revocation replay is idempotent; conflicting revocations,
+invalid authenticity tags and missing evidence after a recorded revocation fail
+closed. Existing legacy rows that already contain revocation metadata remain
+read-only historical snapshots; the migration does not invent their lost
+pre-revocation bytes. An authenticated exported revocation can be replayed after
+its exact original approval to reconstruct the effective view.
+
+The new Campaign grant contract records both search and selection view hashes
+and their feedback visibility. Its initial version explicitly uses the shared,
+search/learning-visible walk-forward view and labels its evidence
+`search_visible_validation`; it cannot claim independently isolated selection.
+Generation ceilings are signed grant fields, while budgets, available policies
+and verified executor capabilities may stop a cycle earlier. These contracts
+are not a substitute for the cumulative ledger below; dispatch admission
+consults the ledger, never the grant alone.
+
+Cumulative admission lives in the `alpha-store` Campaign family ledger
+(`campaign_ledger`). Every family has one authenticated head and an append-only,
+hash-linked chain of `monday.campaign_ledger_receipt.v1` receipts: root
+registration (signed grant plus its approval bytes), attempt reservation,
+terminal settlement, and approval revocation. Reservations charge declared
+trials, Job seconds and LLM tokens before any external operation; a settlement
+with unknown consumption after a failed Job keeps the full reservation charged
+and is never read as zero. Revoking a `campaign_root` approval appends the
+revocation receipt to its family chain in the same DuckDB transaction as the
+revocation evidence, so neither can exist without the other. Receipts publish to
+create-once sequence keys, and dispatch admission requires an independent
+readback acknowledgement for every earlier receipt. A family snapshot replays
+into a fresh store only under the original integrity key; publication
+acknowledgements are never inferred from a backup. No live dispatch is wired to
+this ledger.
+
 Native contract models are trained by `hft-research-ml` with Burn. The trainer
 requires point-in-time rows, an exact feature order, a content-addressed dataset
 manifest, a fixed split identifier, purge/embargo metadata, and a deterministic

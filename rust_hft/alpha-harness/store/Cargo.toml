@@ -12,6 +12,7 @@ alpha-domain = { path = "../domain" }
 governance = { package = "hft-governance-contracts", path = "../../governance-contracts" }
 chrono = { workspace = true, features = ["serde"] }
 duckdb = { version = "1.10504.0", features = ["bundled"] }
+ed25519-dalek = { workspace = true }
 getrandom = "0.3"
 hex = { workspace = true }
 hmac = "0.12"
@@ -21,6 +22,5 @@ sha2 = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-ed25519-dalek = { workspace = true }
 hft-research-manifest = { path = "../../research-core/manifest" }
 hft-factor-dsl = { path = "../../research-core/factor-dsl" }
