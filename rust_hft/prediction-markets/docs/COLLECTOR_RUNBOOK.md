@@ -17,9 +17,9 @@ assets inside `rust_hft/prediction-markets`; they are not current remote-host de
 Focused validation:
 
 ```bash
-cargo +1.91 check --locked -p ploy-market-data --no-default-features --lib
-cargo +1.91 check --locked -p ploy-feed-loaders --lib
-cargo +1.91 test --locked -p ploy-market-data
+cargo +1.98.1 check --locked -p ploy-market-data --no-default-features --lib
+cargo +1.98.1 check --locked -p ploy-feed-loaders --lib
+cargo +1.98.1 test --locked -p ploy-market-data
 ```
 
 Database-backed, hosted-artifact, and heavy research lanes run through the root

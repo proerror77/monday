@@ -210,7 +210,7 @@ jobs:
     needs: selector
     if: needs.selector.outputs.research_mode == 'rebuild'
     runs-on: ubuntu-latest
-    container: rust:1.91-bookworm
+    container: rust:1.98-bookworm
     defaults:
       run:
         working-directory: rust_hft

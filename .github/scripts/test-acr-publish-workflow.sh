@@ -81,7 +81,7 @@ fi
 grep -Fqx '  research-runner-binaries:' "$workflow"
 grep -Fqx "    if: needs.selector.outputs.research_mode == 'rebuild'" "$workflow"
 grep -Fqx "    if: always() && needs.selector.result == 'success' && needs.selector.outputs.publish_target != 'none' && needs.selector.outputs.publish_target != 'research-source-test'" "$workflow"
-grep -Fqx '    container: rust:1.91-bookworm' "$workflow"
+grep -Fqx '    container: rust:1.98-bookworm' "$workflow"
 grep -Fqx 'FROM debian:bookworm-slim AS runtime-base' "$dockerfile"
 grep -Fqx 'ARG ALIYUN_CLI_VERSION=3.4.6' "$controller_dockerfile"
 grep -Fqx 'ARG KUBECTL_VERSION=v1.35.3' "$controller_dockerfile"
@@ -171,7 +171,7 @@ if grep -Fq 'research-source-test:${{ needs.selector.outputs.source_sha }}' <<<"
   exit 1
 fi
 
-grep -Fqx 'FROM rust:1.91-bookworm@sha256:c1e5f19e773b7878c3f7a805dd00a495e747acbdc76fb2337a4ebf0418896b33 AS source-test' "$source_test_dockerfile"
+grep -Fqx 'FROM rust:1.98-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 AS source-test' "$source_test_dockerfile"
 grep -Fq 'groupadd --gid 1000 research' "$source_test_dockerfile"
 grep -Fqx '    && useradd --create-home --uid 1000 --gid 1000 research' "$source_test_dockerfile"
 grep -Fqx 'COPY --chown=research:research source/rust_hft/ /work/' "$source_test_dockerfile"

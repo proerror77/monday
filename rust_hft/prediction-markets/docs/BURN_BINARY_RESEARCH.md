@@ -50,8 +50,8 @@ is no public arbitrary numeric-row inference entry point.
 Run from `rust_hft/prediction-markets`:
 
 ```bash
-cargo +1.91 test --locked -p ploy-research --features ml --lib
-cargo +1.91 clippy --locked -p ploy-research --features ml --all-targets --no-deps
+cargo +1.98.1 test --locked -p ploy-research --features ml --lib
+cargo +1.98.1 clippy --locked -p ploy-research --features ml --all-targets --no-deps
 ```
 
 The second command is the reproducible repository-baseline Clippy check. This

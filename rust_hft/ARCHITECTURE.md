@@ -100,7 +100,7 @@ Continuous-contract and event-settlement research keep different evaluator
 implementations because their labels and evidence differ, while sharing Monday's
 governance and runtime interfaces.
 
-The nested Rust 1.91 workspace under `prediction-markets` is a transitional build
+The nested Rust 1.98.1 workspace under `prediction-markets` is a transitional build
 seam for the imported PLOY code. Existing `ploy-*` names remain compatibility
 identifiers only; new core capabilities must be placed in the canonical Monday
 module that owns them. See `../docs/architecture/PREDICTION_MARKETS.md` and

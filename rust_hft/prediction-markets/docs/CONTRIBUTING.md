@@ -15,16 +15,16 @@ boundaries.
 
 ## Development setup
 
-Use the toolchains pinned by this workspace: Rust `1.91` and Node `22`. Run commands
+Use the toolchains pinned by this workspace: Rust `1.98.1` and Node `22`. Run commands
 from `rust_hft/prediction-markets`.
 
 Start with focused checks:
 
 ```bash
-cargo +1.91 metadata --locked --no-deps --format-version 1
-cargo +1.91 fmt --all -- --check
-cargo +1.91 test --locked -p ploy-connectivity -p ploy-daemon-host
-cargo +1.91 check --locked -p new-ploy-runner --features full
+cargo +1.98.1 metadata --locked --no-deps --format-version 1
+cargo +1.98.1 fmt --all -- --check
+cargo +1.98.1 test --locked -p ploy-connectivity -p ploy-daemon-host
+cargo +1.98.1 check --locked -p new-ploy-runner --features full
 ```
 
 Frontend and Rust sidecar examples:
@@ -35,8 +35,8 @@ npm --prefix ploy-frontend run contracts:check
 npm --prefix ploy-frontend run lint
 npm --prefix ploy-frontend run build
 
-cargo +1.91 test --locked -p ploy-agent-sidecar
-cargo +1.91 clippy --locked -p ploy-agent-sidecar --all-targets --no-deps -- -D warnings
+cargo +1.98.1 test --locked -p ploy-agent-sidecar
+cargo +1.98.1 clippy --locked -p ploy-agent-sidecar --all-targets --no-deps -- -D warnings
 ```
 
 Do not start a local PostgreSQL service for routine validation. Database-backed
