@@ -21,7 +21,12 @@
   Apply it within the assigned goal, existing budgets, and explicit exclusions.
   It does not authorize unrelated actions or bypass signed grants, approval
   revocations, holdout isolation, trading gates, or other technical controls.
-- Follow the nearest nested `AGENTS.md`.
+- Research, acquisition, training, evaluation, and runtime production code is
+  Rust-only. Venues share Monday's market-data, order, and risk seams.
+- Research cannot import execution adapters or broadcast transactions. Live-small
+  requires enforced envelope order-size and slippage limits on every order path.
+- Follow the nearest nested `AGENTS.md` for local technical differences;
+  `CLAUDE.md` points to these shared rules rather than defining another authority.
 - Within system and developer constraints, explicit user instructions take
   precedence over repository and skill guidance. Apply skills only to the
   requested task; their workflows do not grant additional authority.
@@ -66,6 +71,9 @@
   the current PR head's required checks and repository protection to pass. Before
   publishing, bind the artifact to the verified source and read back its identity.
   These are execution checks, not additional requests for user permission.
+- Automatic artifact publication is an expected effect of an authorized merge.
+  When operating or changing publishing workflows, use
+  [publication policy](docs/agents/publication.md) and reuse the task's authority.
 - When the task requires a collector or runtime transition, follow its applicable
   contract: `release -> one Gate -> cutover -> Runtime -> independent Readback`.
   A failed Gate blocks its cutover, not independent development or publication.
@@ -78,6 +86,10 @@
 
 ## Evidence and safety
 
+- Keep dataset, candidate, evaluation, approval, policy, feedback, and deployment
+  evidence content-addressed or append-only. Verify input hashes and preserve
+  point-in-time availability. Keep private signing keys and LLM credentials out
+  of DuckDB and logs.
 - Keep Code, CI, merge, release, runtime, and readback as separate evidence labels,
   not a mandatory promotion checklist. Back claims with exact identities and
   direct evidence. For uncommitted local Code, identify the base SHA and reviewed
@@ -98,7 +110,9 @@
 
 - One active contract has one writer. Use the current checkout for isolated local
   changes when ownership and dirty state are known; use a recorded worktree for
-  concurrent, published, or multi-session work.
+  concurrent, published, or multi-session work. Record contract, owner, path,
+  branch, base SHA, allowed files, and dependencies in the private
+  `git rev-parse --git-path agent-worktree.yml` location used by managed preflight.
 - Before publishing or merging, refresh branch, `HEAD`, status, PR head, and
   relevant live identities. Reconcile task-owned movement; pause only work that
   overlaps another writer. Preserve dirty, active, or unique branches/worktrees;
@@ -114,11 +128,14 @@
 
 ## Focused validation
 
-- Start with checks that can disprove the changed behavior, normally within
-  15 minutes, then the owning crate or workflow check. Broaden only for affected
-  cross-module contracts, new failures, or an identified unresolved risk.
-- From `rust_hft/`, use `cargo test -p <changed-crate> --locked` and scoped Clippy.
-  Run `cargo metadata --locked --no-deps` only after workspace-graph changes.
+- Start with a check that can disprove the changed behavior, normally within
+  15 minutes. Expand to owning-crate/workflow or cross-module checks when the
+  affected contract, regression risk, failure, or requested outcome requires it.
+  A changed file alone does not require a full crate or workspace test run.
+- From the owning workspace, use `cargo test -p <crate> --locked <filter>` and
+  scoped Clippy as appropriate. Reuse build caches; reserve clean builds for
+  proven cache corruption or requested clean-room validation. Run
+  `cargo metadata --locked --no-deps` only after workspace-graph changes.
 - For instruction, workflow, or shell changes, run `git diff --check` plus the
   closest contract test. Report unrelated or unavailable checks separately.
 - For low-impact instruction edits, use existing contract checks and review
