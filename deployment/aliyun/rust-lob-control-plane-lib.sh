@@ -1503,11 +1503,10 @@ monday_validate_v2_gate() {
     --argjson shadow_asset_keys "$shadow_asset_keys" '
       def expected_phase_memory_max:
         if . == "preflight"
-          or . == "strict-verifier-spot"
-          or . == "strict-verifier-usdm" then
+          or . == "shadow-spot" or . == "shadow-usdm" then
           1610612736
-        elif . == "shadow-spot" or . == "shadow-usdm" then
-          1610612736
+        elif . == "strict-verifier-spot" or . == "strict-verifier-usdm" then
+          805306368
         elif . == "upload-drain-spot" or . == "upload-drain-usdm"
           or . == "oss-readback-spot" or . == "oss-readback-usdm" then
           536870912

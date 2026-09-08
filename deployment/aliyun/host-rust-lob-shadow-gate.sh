@@ -15,7 +15,8 @@ readonly MAX_HEALTH_SILENCE_SECONDS=120
 readonly HOST_MEMORY_RESERVE_BYTES=1073741824
 readonly TARGET_PRODUCTION_SLICE_MEMORY_HIGH_BYTES=3221225472
 readonly TARGET_PRODUCTION_SLICE_MEMORY_MAX_BYTES=3758096384
-readonly STRICT_VERIFIER_MEMORY_MAX_BYTES=1610612736
+readonly STRICT_VERIFIER_MEMORY_HIGH_BYTES=671088640
+readonly STRICT_VERIFIER_MEMORY_MAX_BYTES=805306368
 readonly UPLOAD_DRAIN_MEMORY_MAX_BYTES=536870912
 readonly SHADOW_IDENTITY_WAIT_SECONDS=15
 readonly SHADOW_IDENTITY_TEST_ATTEMPTS=8
@@ -1165,8 +1166,14 @@ record_resource() {
   available_after=$(meminfo_bytes MemAvailable) || die 'MemAvailable became unavailable during Gate'
   host_memory_available=$available_before
   (( available_after < host_memory_available )) && host_memory_available=$available_after
-  required=$(monday_shadow_memory_admission "$host_memory_available" "$HOST_MEMORY_RESERVE_BYTES" "$phase_max" \
-    "$production_parent_anon" "$production_target_slice_memory_max") || die "insufficient memory for $phase"
+  if ! required=$(monday_shadow_memory_admission "$host_memory_available" "$HOST_MEMORY_RESERVE_BYTES" "$phase_max" \
+    "$production_parent_anon" "$production_target_slice_memory_max"); then
+    printf 'event=memory-admission-failed phase=%s available_before_bytes=%s available_after_bytes=%s available_bytes=%s required_bytes=%s phase_memory_max_bytes=%s host_memory_reserve_bytes=%s production_parent_memory_anon_bytes=%s target_production_slice_memory_max_bytes=%s production_memory_growth_bytes=%s\n' \
+      "$phase" "$available_before" "$available_after" "$host_memory_available" "${required:-unavailable}" \
+      "$phase_max" "$HOST_MEMORY_RESERVE_BYTES" "$production_parent_anon" \
+      "$production_target_slice_memory_max" "$production_growth" >&2
+    die "insufficient memory for $phase"
+  fi
   resource_phase_required[$phase]=$required
   resource_phase_limit[$phase]=$phase_max
   resource_phase_parent_current[$phase]=$production_parent_current
@@ -1846,7 +1853,7 @@ if [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_PATH_ONLY:-0} == 1 ]]; then
   exit 0
 fi
 
-resource_monitor_start preflight "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; \
+resource_monitor_start preflight "$GATE_WORKER_MEMORY_MAX_BYTES"; \
   resource_monitor_stop_or_die preflight; write_run_json
 if [[ $TEST_ONLY == true && ${MONDAY_GATE_FIXTURE_RESOURCE_MONITOR_ONLY:-0} == 1 ]]; then
   exit 0
@@ -2017,7 +2024,7 @@ run_strict_verifier() {
   systemd-run --quiet --wait --collect \
     --unit="${GATE_UNIT_PREFIX}${run_id}-strict-${strict_unit_seq}.service" \
     --slice="$GATE_WORKER_SLICE" \
-    --property=MemoryMax=1536M --property=MemoryHigh=1280M \
+    --property=MemoryMax="$STRICT_VERIFIER_MEMORY_MAX_BYTES" --property=MemoryHigh="$STRICT_VERIFIER_MEMORY_HIGH_BYTES" \
     --property=OOMScoreAdjust=500 --property=Restart=no --property=RuntimeMaxSec="$TRANSIENT_WORK_TIMEOUT_SECONDS" \
     --uid="$SERVICE_USER" -- "$candidate_binary" "$@"
 }
@@ -2305,7 +2312,7 @@ verify_segments() {
 }
 run_market_gate_phase() {
   local market=$1 settle observation_deadline_ns observation_failure_ns observation_finished_ns observation_health_snapshot observation_sample_started_ns observation_sampled_ns observation_segment_snapshot observation_started_ns pid started_ns readiness live_health
-  resource_monitor_start "shadow-$market" "$STRICT_VERIFIER_MEMORY_MAX_BYTES"; fixture_seed_market "$market"; systemctl reset-failed "${unit[$market]}" >/dev/null 2>&1 || true
+  resource_monitor_start "shadow-$market" "$GATE_WORKER_MEMORY_MAX_BYTES"; fixture_seed_market "$market"; systemctl reset-failed "${unit[$market]}" >/dev/null 2>&1 || true
   started_ns=$(date +%s%N); market_gate_started_ns[$market]=$started_ns
   systemctl start "${unit[$market]}"; pid=$(shadow_identity_wait "$market"); phase_pid["$market"]=$pid; phase_exe_sha["$market"]=$candidate_payload
   if [[ $TEST_ONLY == true && ( ${MONDAY_GATE_FIXTURE_SIGKILL:-0} == 1 || ${MONDAY_GATE_HARD_CRASH_AFTER_SHADOW_START:-0} == 1 ) && $market == spot ]]; then
