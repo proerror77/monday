@@ -133,11 +133,24 @@ enum PredictionDispatchCommand {
 
 #[derive(Debug, Subcommand)]
 enum MissionDispatchCommand {
+    CloseFamily(CampaignCloseFamilyArgs),
     Inspect(MissionDispatchInspectArgs),
     Submit(MissionDispatchSubmitArgs),
     Settle(MissionDispatchSubmitArgs),
     ControllerHandoff(CampaignControllerHandoffArgs),
     PrepareController(CampaignControllerPrepareArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CampaignCloseFamilyArgs {
+    #[arg(long)]
+    pub ledger: PathBuf,
+    #[arg(long)]
+    pub signed_grant: PathBuf,
+    #[arg(long)]
+    pub trusted_keys: PathBuf,
+    #[arg(long)]
+    pub approval_id: String,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -894,6 +907,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                         .context("Campaign dispatch worker failed")?
                 }
                 MissionDispatchCommand::Inspect(args) => mission_dispatch::inspect(args),
+                MissionDispatchCommand::CloseFamily(args) => {
+                    mission_dispatch::final_authority::close_family(args)
+                }
                 MissionDispatchCommand::ControllerHandoff(args) => {
                     mission_dispatch::controller::render(args)
                 }
@@ -1387,6 +1403,21 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
 
     #[test]
     fn parses_mission_and_data_control_plane_commands() {
+        assert!(Cli::try_parse_from([
+            "alpha-harness",
+            "mission",
+            "dispatch",
+            "close-family",
+            "--ledger",
+            "/ledger/alpha.duckdb",
+            "--signed-grant",
+            "/authority/final.json",
+            "--trusted-keys",
+            "/authority/keys.json",
+            "--approval-id",
+            "final-approval",
+        ])
+        .is_ok());
         assert!(Cli::try_parse_from([
             "alpha-harness", "data", "freeze-inventory",
             "--raw-root", "/archive/raw", "--reference-root", "/archive/reference",

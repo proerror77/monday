@@ -1,4 +1,5 @@
 mod admission;
+pub(crate) mod final_authority;
 pub(crate) mod controller;
 mod terminal;
 

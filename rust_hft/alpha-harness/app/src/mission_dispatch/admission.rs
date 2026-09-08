@@ -563,8 +563,16 @@ fn verify(
     signed: &SignedCampaignRootGrantV1,
     path: &Path,
 ) -> anyhow::Result<VerifiedCampaignRootGrant> {
+    Ok(verify_campaign_root_grant(
+        signed,
+        &read_trusted_keys(path)?,
+        Utc::now(),
+    )?)
+}
+
+pub(super) fn read_trusted_keys(path: &Path) -> anyhow::Result<BTreeMap<String, VerifyingKey>> {
     let encoded: BTreeMap<String, String> = read_json(path)?;
-    let keys = encoded
+    encoded
         .into_iter()
         .map(|(id, hex_key)| {
             let bytes: [u8; 32] = hex::decode(hex_key)?
@@ -572,8 +580,7 @@ fn verify(
                 .map_err(|_| anyhow::anyhow!("Campaign verifying key must contain 32 bytes"))?;
             Ok((id, VerifyingKey::from_bytes(&bytes)?))
         })
-        .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
-    Ok(verify_campaign_root_grant(signed, &keys, Utc::now())?)
+        .collect()
 }
 
 fn read_bounded(path: &Path, max: u64) -> anyhow::Result<Vec<u8>> {
@@ -587,7 +594,7 @@ fn read_bounded(path: &Path, max: u64) -> anyhow::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn read_json<T: DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
+pub(super) fn read_json<T: DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
     serde_json::from_slice(&read_bounded(path, MAX_CONTROL_BYTES)?)
         .context("decode Campaign control input")
 }
