@@ -2029,12 +2029,17 @@ mod tests {
 
     #[tokio::test]
     async fn simulated_execution_reads_the_builders_canonical_book() {
-        let runtime = SystemBuilder::new(SystemConfig::default())
+        let mut config = SystemConfig::default();
+        // A wiring test tolerates scheduler jitter; production age gates are unchanged.
+        config.engine.stale_us = 1_000_000;
+        let runtime = SystemBuilder::new(config)
             .register_simulated_execution_client(VenueId::MOCK)
             .build();
         let mut clients = {
             let mut engine = runtime.engine.lock().await;
             let now = hft_core::now_micros();
+            // Reproduce scheduling delay before ingestion under the parallel suite.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             engine
                 .create_event_ingester_pair()
                 .lock()
