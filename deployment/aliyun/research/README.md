@@ -431,10 +431,10 @@ input GET + SHA admission
   -> create-once Mission PUT + GET/SHA readback
   -> search-only execution per round
   -> create-once result PUT + GET/SHA readback
-  -> deterministic pre-holdout winner
-  -> exactly one finalization + global holdout claim
-  -> results.zip PUT + GET/SHA readback
+  -> deterministic pre-holdout winner or no candidate
   -> campaign-result.json PUT + GET/SHA readback
+  -> independent Job/Pod and round-artifact readback
+  -> authenticated family-ledger settlement before any child dispatch
 ```
 
 The request schema is `cex-campaign-request-v5`. It separately binds the exact
@@ -568,8 +568,7 @@ in `k8s/cex-materialization-output-volume.example.yaml`; it must not point to a
 laptop path. Do not reuse `k8s/alpha-mission-job.example.yaml`: that Job remains
 the tokenless `campaign-execute` shape, while the controller Job has a distinct
 image and narrow readback ServiceAccount. On ACK, the controller waits for the
-already-approved Campaign Job, reads the exact Job and Pod provenance, deletes
-only that Job's exact `<job-name>-inputs` Secret, and performs every OSS GET with
+already-approved Campaign Job, reads the exact Job and Pod provenance, and performs every OSS GET with
 `oss-ap-northeast-1-internal.aliyuncs.com`. It verifies the Campaign result,
 each Mission, and each `results.zip` SHA-256 before running `campaign-learn`.
 The operator replaces `REPLACE_CAMPAIGN_POD_NAME` after that Pod exists; RBAC
@@ -692,12 +691,84 @@ fees, Gate, risk, or paused execution. PIT and canonical replay currently
 verify/replay the same inventory separately; eliminating that repeated work is
 a later optimization, not part of the memory-lifetime fix.
 
+### Root-budget admission and terminal settlement
+
+The finalized submission is execution input, not root authority. Dispatch requires
+an operator-owned control file through `--control` or `MONDAY_CAMPAIGN_CONTROL`;
+omitting it fails before any Kubernetes operation. The shell cycle controller
+inherits the same environment variable for both submission and settlement.
+
+Use `mission dispatch inspect` to derive the execution binding and charges from
+the finalized request, the SHA-verified materialization metadata, and the actual
+Job template. Inspection does not approve a root, reserve budget, or start a Job:
+
+```bash
+alpha-harness mission dispatch inspect \
+  --submission /private/path/campaign-submission.json \
+  --materialization /private/path/materialization.json \
+  --controller-image registry.example/controller@sha256:REPLACE_CONTROLLER_DIGEST \
+  --attempt-ordinal 0
+```
+
+The output identifies the existing search-visible walk-forward view. It does not
+claim an independent selection dataset. The controller image is operator
+configuration from the paired image-release receipt; inspection checks its pin
+and the dispatcher's compiled source revision, not a live controller Pod imageID.
+That Pod/image/volume identity still needs deployment readback before cloud use.
+
+The root issuer signs a `SignedCampaignRootGrantV1` using the existing
+`sign_campaign_root_grant` contract. Before dispatch, record its corresponding
+`campaign_root` approval with `alpha-harness approval record --db ... --record ...`.
+The approval must bind the exact root ID, grant SHA, family ID, signer and validity
+window. The control file contains paths and public verification material, never a
+private signing key. All relative paths resolve against the control file itself:
+
+```json
+{
+  "schema_version": "monday.campaign_dispatch_control.v1",
+  "ledger_path": "ledger.duckdb",
+  "signed_root_grant_path": "root-grant.json",
+  "trusted_keys_path": "root-public-keys.json",
+  "materialization_path": "materialization.json",
+  "approval_id": "REPLACE_APPROVAL_ID",
+  "controller_image": "registry.example/controller@sha256:REPLACE_CONTROLLER_DIGEST",
+  "attempt_ordinal": 0,
+  "receipt_access": {
+    "research/campaign-ledger/family-id=REPLACE_FAMILY_ID/sequence=00000000000000000001/receipt.json": {
+      "put_url": "REPLACE_EXACT_SEQUENCE_SIGNED_PUT_URL",
+      "readback_url": "REPLACE_EXACT_SEQUENCE_SIGNED_GET_URL"
+    }
+  }
+}
+```
+
+`root-public-keys.json` maps trusted key IDs to hex-encoded 32-byte Ed25519 public
+keys. The logical trust-file path is reread before each external operation, so
+replacing a projected-file symlink cannot keep an old key set active. Relative
+paths are anchored to the supplied control-file location; the ledger and immutable
+inputs are resolved to physical paths. Supply access for the complete existing family chain and the upcoming
+root/reservation/dispatch-claim/Job-binding/settlement receipts, not only the first
+example entry. Each PUT must sign `Content-Type: application/json` and
+`x-oss-forbid-overwrite:true`; PUT and GET must name the same canonical sequence
+key in the request's Tokyo-internal result bucket. A conflicting object or wrong
+readback bytes stops dispatch. A missing access entry retains the reservation and
+reports the exact missing object key; it does not permit an unrecorded fallback.
+
+The active ledger and its integrity key belong to one owner on stable block
+storage. Do not put live DuckDB/WAL on the campaign-output OSS CSI mount or copy
+an active database between a laptop and ACK. The existing shell handoff template
+is not sufficient to deploy this owner: prepare the separate block volume,
+operator control-file mount, identity and ownership contract first. This code
+uses DuckDB process exclusion plus approval/family transaction guards; it does
+not implement Kubernetes Lease fencing or automatic cancellation of running Jobs.
+
 Wrap the final request with `attempt_id` and the exact digest-pinned `image` in
-the private submission file, then submit it directly:
+the private submission file, then submit through the canonical seam:
 
 ```bash
 alpha-harness mission dispatch submit \
   --submission /private/path/campaign-submission.json \
+  --control /private/path/campaign-control.json \
   --context monday-research-apne1 \
   --namespace monday-research
 ```
@@ -715,8 +786,51 @@ resourceVersion. A replacement or intervening update fails before unsuspending;
 the submitter retains objects after a release attempt, including an uncertain
 response. Reconcile their identity and retry the same submission through the
 canonical submitter. Do not bypass a conflict with a manual unsuspend or a new
-attempt ID. These object conditions do not replace root authorization, budget
-admission, or controller writer fencing.
+attempt ID. Each external operation also rechecks the published reservation and
+current authority under the local approval/family guards. The release check leaves
+30 seconds of validity headroom for the bounded Kubernetes request. All generated
+Jobs pass `--pre-holdout`, including the non-ML selection path.
+
+Before the first create, a durable claim binds the context, namespace, Job name
+and full execution-template hash to one reserved operation. Retransmission may
+adopt only the bound Job UID; it never creates another Job after deletion. If the
+process dies in the durable-claim/create gap, an absent Job is an uncertain
+attempt requiring evidence-backed reconciliation, not permission to recreate or
+refund it. This intentionally preserves the budget in an unobservable state.
+
+After a successful terminal Job, settle the same submission:
+
+```bash
+alpha-harness mission dispatch settle \
+  --submission /private/path/campaign-submission.json \
+  --control /private/path/campaign-control.json \
+  --context monday-research-apne1 \
+  --namespace monday-research
+```
+
+Settlement independently reads the exact Job and its single successful Pod,
+checks the bound UID, request and image, then reads the Campaign result and each
+round's Mission/result bundle. It reconstructs factor/model/replay evidence and
+trial counts using the existing readers. Summary counts alone, a failed Job,
+missing artifacts, a mismatched winner, or sealed-holdout artifacts cannot settle
+a successful pre-holdout result. Failed/unknown attempts remain fully charged
+pending separate infrastructure reconciliation.
+
+The authenticated terminal receipt binds the Job/Pod and Campaign result SHA;
+`no_candidate` can then authorize a matching child within the same root budget.
+Settlement remains possible after expiry or trust-key rotation using registered
+historical authority, which cannot start another Job. If receipt publication
+fails after the local commit, retry reuses those exact committed bytes without
+requiring a TTL-deleted Job to appear again. A child cannot be released until its
+parent terminal receipt and its own reservation have been independently read back.
+
+The shell controller settles before learning and retains the private submission
+until generation completion so an interrupted settlement can resume. It no longer
+deletes Secrets by name during provenance checks. Completed Jobs retain their
+existing TTL and UID-based Secret owner reference for Kubernetes garbage
+collection; ambiguous/suspended attempts remain for owner reconciliation. New
+dispatch receipt variants are append-only. An older binary cannot read them; do
+not roll a live ledger back with an older writer or discard receipts to recover.
 
 One Campaign maps to multiple rounds. The canonical factor plan and every
 bounded policy follow-up retain all 9 L2/aggregate-trade terminals and 22

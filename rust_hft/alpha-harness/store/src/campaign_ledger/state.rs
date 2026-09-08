@@ -14,6 +14,8 @@ pub(super) struct Attempt {
     pub reservation: CampaignAttemptReservationV1,
     pub sequence: u64,
     pub settlement: Option<CampaignAttemptSettlementV1>,
+    pub dispatch: Option<CampaignDispatchClaimV1>,
+    pub terminal_pod_uid: Option<String>,
 }
 
 #[derive(Default)]
@@ -223,8 +225,91 @@ impl State {
                         reservation: reservation.clone(),
                         sequence: receipt.sequence,
                         settlement: None,
+                        dispatch: None,
+                        terminal_pod_uid: None,
                     },
                 );
+            }
+            CampaignLedgerEventV1::DispatchClaimed {
+                operation_id,
+                target,
+            } => {
+                target.validate()?;
+                let attempt = self
+                    .attempts
+                    .get_mut(operation_id)
+                    .ok_or_else(|| err("dispatch has no reservation"))?;
+                if attempt.dispatch.is_some() || attempt.settlement.is_some() {
+                    return Err(err("attempt already dispatched or settled"));
+                }
+                let root = self
+                    .roots
+                    .get(&attempt.reservation.root_grant_sha256)
+                    .ok_or_else(|| err("dispatch has no root"))?;
+                root.grant
+                    .validate_attempt_scope(&attempt.reservation, receipt.recorded_at)
+                    .map_err(err)?;
+                if root
+                    .revoked_at
+                    .is_some_and(|when| receipt.recorded_at >= when)
+                {
+                    return Err(err("dispatch root is revoked"));
+                }
+                attempt.dispatch = Some(CampaignDispatchClaimV1 {
+                    target: target.clone(),
+                    job_uid: None,
+                    sequence: receipt.sequence,
+                });
+            }
+            CampaignLedgerEventV1::DispatchJobBound {
+                operation_id,
+                job_uid,
+            } => {
+                super::dispatch::validate_job_uid(job_uid)?;
+                let attempt = self
+                    .attempts
+                    .get_mut(operation_id)
+                    .ok_or_else(|| err("Job binding has no reservation"))?;
+                if attempt.settlement.is_some() {
+                    return Err(err("Job binding attempt is settled"));
+                }
+                let dispatch = attempt
+                    .dispatch
+                    .as_mut()
+                    .ok_or_else(|| err("Job binding has no dispatch claim"))?;
+                if dispatch.job_uid.is_some() {
+                    return Err(err("dispatch Job is already bound"));
+                }
+                dispatch.job_uid = Some(job_uid.clone());
+                dispatch.sequence = receipt.sequence;
+            }
+            CampaignLedgerEventV1::DispatchSettled { evidence } => {
+                let attempt = self
+                    .attempts
+                    .get_mut(&evidence.settlement.operation_id)
+                    .ok_or_else(|| err("dispatch settlement has no reservation"))?;
+                evidence
+                    .settlement
+                    .validate_against(&attempt.reservation)
+                    .map_err(err)?;
+                super::dispatch::validate_job_uid(&evidence.job_uid)?;
+                super::dispatch::validate_job_uid(&evidence.pod_uid)?;
+                let dispatch = attempt
+                    .dispatch
+                    .as_ref()
+                    .ok_or_else(|| err("dispatch settlement has no claim"))?;
+                if dispatch.job_uid.as_deref() != Some(evidence.job_uid.as_str())
+                    || attempt.settlement.is_some()
+                    || !matches!(
+                        evidence.settlement.outcome,
+                        CampaignAttemptOutcomeV1::NoCandidate
+                            | CampaignAttemptOutcomeV1::SelectedPreHoldout
+                    )
+                {
+                    return Err(err("dispatch terminal identity or outcome is invalid"));
+                }
+                attempt.settlement = Some(evidence.settlement.clone());
+                attempt.terminal_pod_uid = Some(evidence.pod_uid.clone());
             }
             CampaignLedgerEventV1::AttemptSettled { settlement } => {
                 let attempt = self

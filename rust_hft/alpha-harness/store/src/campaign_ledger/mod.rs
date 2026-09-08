@@ -4,7 +4,13 @@
 //! concurrent writers conflict rather than spending the same remaining budget.
 //! This is local ledger serialization, not Kubernetes writer fencing.
 
+mod dispatch;
 mod state;
+
+pub use dispatch::{
+    CampaignDispatchClaimV1, CampaignDispatchRecord, CampaignDispatchSettlementV1,
+    CampaignDispatchTargetV1,
+};
 
 use super::approval_revocations::{
     insert_revocation_evidence, read_effective_approval, read_revocation_evidence,
@@ -40,8 +46,19 @@ pub enum CampaignLedgerEventV1 {
     AttemptReserved {
         reservation: CampaignAttemptReservationV1,
     },
+    DispatchClaimed {
+        operation_id: String,
+        target: CampaignDispatchTargetV1,
+    },
+    DispatchJobBound {
+        operation_id: String,
+        job_uid: String,
+    },
     AttemptSettled {
         settlement: CampaignAttemptSettlementV1,
+    },
+    DispatchSettled {
+        evidence: CampaignDispatchSettlementV1,
     },
     ApprovalRevoked {
         revocation: ApprovalRevocationV1,
@@ -55,8 +72,15 @@ impl CampaignLedgerEventV1 {
                 format!("campaign-root:{}", signed.grant.root_id)
             }
             Self::AttemptReserved { reservation } => reservation.operation_id().map_err(err)?,
+            Self::DispatchClaimed { operation_id, .. } => {
+                format!("campaign-dispatch:{operation_id}")
+            }
+            Self::DispatchJobBound { operation_id, .. } => format!("campaign-job:{operation_id}"),
             Self::AttemptSettled { settlement } => {
                 format!("campaign-settlement:{}", settlement.operation_id)
+            }
+            Self::DispatchSettled { evidence } => {
+                format!("campaign-settlement:{}", evidence.settlement.operation_id)
             }
             Self::ApprovalRevoked { revocation } => {
                 format!("campaign-revocation:{}", revocation.approval_id)
@@ -514,22 +538,18 @@ impl AlphaStore {
         verified
             .validate_attempt_scope(reservation, at)
             .map_err(err)?;
-        let (state, _) = load(
-            &self.connection,
-            &self.integrity_key,
-            &reservation.family_id,
-        )?;
+        let tx = self.connection.transaction().map_err(database_error)?;
+        let (state, _) = load(&tx, &self.integrity_key, &reservation.family_id)?;
         let root = state
             .roots
             .get(verified.content_sha256())
             .ok_or_else(|| err("root is not registered"))?;
-        if !self
-            .get_approval(&root.approval.approval_id)?
+        serialize_approval_mutation(&tx, &root.approval.approval_id)?;
+        if !read_effective_approval(&tx, &self.integrity_key, &root.approval.approval_id)?
             .is_active_at(at)
         {
             return Err(err("root approval is not active"));
         }
-        let tx = self.connection.transaction().map_err(database_error)?;
         let receipt = append(
             &tx,
             &self.integrity_key,
@@ -724,52 +744,15 @@ impl AlphaStore {
         operation_id: &str,
         at: DateTime<Utc>,
     ) -> Result<CampaignAttemptReservationV1, StoreError> {
-        let (state, history) = load(&self.connection, &self.integrity_key, family)?;
-        let a = state
-            .attempts
-            .get(operation_id)
-            .ok_or_else(|| err("missing reservation"))?;
-        verified
-            .validate_attempt_scope(&a.reservation, at)
-            .map_err(err)?;
-        let root = state
-            .roots
-            .get(verified.content_sha256())
-            .ok_or_else(|| err("missing root"))?;
-        if root.revoked_at.is_some_and(|when| at >= when)
-            || a.settlement.is_some()
-            || !self
-                .get_approval(&root.approval.approval_id)?
-                .is_active_at(at)
-        {
-            return Err(err("attempt is settled or root is inactive"));
-        }
-        if let Some(when) = root.revoked_at {
-            let duration = chrono::TimeDelta::try_seconds(
-                i64::try_from(a.reservation.reserved_job_seconds).map_err(err)?,
-            )
-            .ok_or_else(|| err("deadline overflow"))?;
-            if at.checked_add_signed(duration).is_none_or(|end| end > when) {
-                return Err(err("Job exceeds scheduled revocation"));
-            }
-        }
-        for receipt in history
-            .iter()
-            .take(usize::try_from(a.sequence).map_err(err)?)
-        {
-            let (hash, auth): (String, String) = self.connection.query_row("SELECT object_sha256, auth_tag FROM campaign_receipt_publications WHERE family_id = ? AND sequence = ?", params![family, sql_sequence(receipt.receipt.sequence)?], |r| Ok((r.get(0)?, r.get(1)?))).map_err(database_error)?;
-            if hash != receipt.object_sha256()? {
-                return Err(StoreError::ContentHashMismatch);
-            }
-            verify_authentication_tag(
-                &self.integrity_key,
-                PUBLICATION_DOMAIN,
-                &receipt.object_key(),
-                &publication_json(receipt)?,
-                &auth,
-            )?;
-        }
-        Ok(a.reservation.clone())
+        dispatch::checked_reservation(
+            &self.connection,
+            &self.integrity_key,
+            verified,
+            family,
+            operation_id,
+            at,
+            true,
+        )
     }
 }
 
@@ -987,13 +970,469 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn reservation_conflicts_with_inflight_approval_revocation() {
+        let (mut store, verified) = registered();
+        let reservation = reservation(&verified, 0, 40);
+        let mut other = store.connection.try_clone().unwrap();
+        let tx = other.transaction().unwrap();
+        serialize_approval_mutation(&tx, APPROVAL).unwrap();
+        assert!(
+            store
+                .reserve_campaign_attempt(&verified, &reservation, t0())
+                .is_err(),
+            "reservation must not commit while revocation owns the approval guard"
+        );
+        tx.rollback().unwrap();
+        assert_eq!(store.campaign_family_usage(FAMILY).unwrap().job_attempts, 0);
+        store
+            .reserve_campaign_attempt(&verified, &reservation, t0())
+            .unwrap();
+    }
+
+    fn acknowledge_all(store: &mut AlphaStore) {
+        for receipt in store.campaign_family_receipts(FAMILY).unwrap() {
+            store
+                .acknowledge_campaign_receipt_readback(
+                    FAMILY,
+                    receipt.receipt.sequence,
+                    &receipt.object_key(),
+                    &receipt.object_sha256().unwrap(),
+                )
+                .unwrap();
+        }
+    }
+
+    fn dispatch_target() -> CampaignDispatchTargetV1 {
+        CampaignDispatchTargetV1 {
+            context: "research-context".into(),
+            namespace: "monday-research".into(),
+            job_name: "campaign-job".into(),
+            manifest_sha256: "a".repeat(64),
+        }
+    }
+
+    fn claimed() -> (
+        AlphaStore,
+        VerifiedCampaignRootGrant,
+        CampaignAttemptReservationV1,
+    ) {
+        let (mut store, verified) = registered();
+        let attempt = reservation(&verified, 0, 40);
+        store
+            .reserve_campaign_attempt(&verified, &attempt, t0())
+            .unwrap();
+        acknowledge_all(&mut store);
+        let (_, first) = store
+            .claim_campaign_dispatch(&verified, &attempt, &dispatch_target(), t0())
+            .unwrap();
+        assert!(first);
+        acknowledge_all(&mut store);
+        (store, verified, attempt)
+    }
+
+    #[test]
+    fn dispatch_claim_and_job_uid_survive_replay_without_a_second_create_or_charge() {
+        let (mut store, verified, attempt) = claimed();
+        store
+            .bind_campaign_dispatch_job(&verified, &attempt, &dispatch_target(), "job-uid-1", t0())
+            .unwrap();
+        acknowledge_all(&mut store);
+        let expected = store.campaign_family_snapshot(FAMILY).unwrap();
+        let mut restored = AlphaStore::open_in_memory().unwrap();
+        // Same integrity key represents restoring this owner's durable backup.
+        restored.integrity_key = store.integrity_key;
+        restored.import_campaign_family_snapshot(&expected).unwrap();
+        acknowledge_all(&mut restored);
+        let (claim, first) = restored
+            .claim_campaign_dispatch(&verified, &attempt, &dispatch_target(), minutes(1))
+            .unwrap();
+        assert!(
+            !first,
+            "a restored claim must only adopt, never create again"
+        );
+        assert_eq!(claim.job_uid.as_deref(), Some("job-uid-1"));
+        assert_eq!(
+            restored.campaign_family_usage(FAMILY).unwrap().job_attempts,
+            1
+        );
+        assert_eq!(restored.campaign_family_snapshot(FAMILY).unwrap(), expected);
+        let mut changed = dispatch_target();
+        for field in ["context", "namespace", "job_name", "manifest"] {
+            match field {
+                "context" => changed.context = "other".into(),
+                "namespace" => changed.namespace = "other".into(),
+                "job_name" => changed.job_name = "other".into(),
+                _ => changed.manifest_sha256 = "b".repeat(64),
+            }
+            assert!(restored
+                .claim_campaign_dispatch(&verified, &attempt, &changed, minutes(1))
+                .is_err());
+            changed = dispatch_target();
+        }
+        assert!(restored
+            .bind_campaign_dispatch_job(
+                &verified,
+                &attempt,
+                &dispatch_target(),
+                "replacement",
+                minutes(1)
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn dispatch_guard_requires_claim_and_binding_receipts_and_exact_reserved_request() {
+        let (mut store, verified, attempt) = claimed();
+        store
+            .bind_campaign_dispatch_job(&verified, &attempt, &dispatch_target(), "job-uid-1", t0())
+            .unwrap();
+        let mut called = false;
+        let result: Result<(), StoreError> = store.with_campaign_dispatch_admission(
+            &verified,
+            &attempt,
+            &dispatch_target(),
+            Some("job-uid-1"),
+            t0,
+            || {
+                called = true;
+                Ok(())
+            },
+        );
+        assert!(
+            result.is_err(),
+            "unpublished Job binding must block release"
+        );
+        assert!(!called);
+        acknowledge_all(&mut store);
+        let mut changed = attempt.clone();
+        changed.request_sha256 = "f".repeat(64);
+        let result: Result<(), StoreError> = store.with_campaign_dispatch_admission(
+            &verified,
+            &changed,
+            &dispatch_target(),
+            Some("job-uid-1"),
+            t0,
+            || {
+                called = true;
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(!called);
+        let result: Result<(), StoreError> = store.with_campaign_dispatch_admission(
+            &verified,
+            &attempt,
+            &dispatch_target(),
+            Some("replacement"),
+            t0,
+            || {
+                called = true;
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(!called);
+        let result: Result<(), StoreError> = store.with_campaign_dispatch_admission(
+            &verified,
+            &attempt,
+            &dispatch_target(),
+            Some("job-uid-1"),
+            t0,
+            || {
+                called = true;
+                Ok(())
+            },
+        );
+        result.unwrap();
+        assert!(called);
+    }
+
+    #[test]
+    fn dispatch_guard_serializes_revocation_and_settlement_before_the_external_action() {
+        let (mut store, verified, attempt) = claimed();
+        let mut other = store.connection.try_clone().unwrap();
+        for guard in ["approval", "family"] {
+            let tx = other.transaction().unwrap();
+            if guard == "approval" {
+                serialize_approval_mutation(&tx, APPROVAL).unwrap();
+            } else {
+                tx.execute(
+                    "UPDATE campaign_family_heads SET sequence = sequence WHERE family_id = ?",
+                    params![FAMILY],
+                )
+                .unwrap();
+            }
+            let mut called = false;
+            let result: Result<(), StoreError> = store.with_campaign_dispatch_admission(
+                &verified,
+                &attempt,
+                &dispatch_target(),
+                None,
+                t0,
+                || {
+                    called = true;
+                    Ok(())
+                },
+            );
+            assert!(result.is_err(), "must conflict with the {guard} writer");
+            assert!(!called);
+            tx.rollback().unwrap();
+        }
+        let result: Result<(), StoreError> = store.with_campaign_dispatch_admission(
+            &verified,
+            &attempt,
+            &dispatch_target(),
+            None,
+            t0,
+            || {
+                let tx = other.transaction().unwrap();
+                assert!(serialize_approval_mutation(&tx, APPROVAL).is_err());
+                tx.rollback().unwrap();
+                let tx = other.transaction().unwrap();
+                assert!(tx
+                    .execute(
+                        "UPDATE campaign_family_heads SET sequence = sequence WHERE family_id = ?",
+                        params![FAMILY]
+                    )
+                    .is_err());
+                tx.rollback().unwrap();
+                Ok(())
+            },
+        );
+        result.unwrap();
+    }
+
+    #[test]
+    fn dispatch_guard_rechecks_deadline_revocation_and_settlement_and_preserves_uncertain_budget() {
+        let (mut store, verified, attempt) = claimed();
+        let mut called = false;
+        let result: Result<(), StoreError> = store.with_campaign_dispatch_admission(
+            &verified,
+            &attempt,
+            &dispatch_target(),
+            None,
+            || minutes(601),
+            || {
+                called = true;
+                Ok(())
+            },
+        );
+        assert!(
+            result.is_err(),
+            "full Job deadline must still fit in the grant"
+        );
+        assert!(!called);
+        let result: Result<(), StoreError> = store.with_campaign_dispatch_admission(
+            &verified,
+            &attempt,
+            &dispatch_target(),
+            None,
+            t0,
+            || Err(err("network response was lost")),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            store.campaign_family_usage(FAMILY).unwrap().pending_trials,
+            40
+        );
+        assert!(
+            !store
+                .claim_campaign_dispatch(&verified, &attempt, &dispatch_target(), minutes(1))
+                .unwrap()
+                .1
+        );
+        store
+            .revoke_approval(APPROVAL, "operator", "cancel", minutes(1))
+            .unwrap();
+        let result: Result<(), StoreError> = store.with_campaign_dispatch_admission(
+            &verified,
+            &attempt,
+            &dispatch_target(),
+            None,
+            || minutes(1),
+            || {
+                called = true;
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(!called);
+        let (mut store, verified, attempt) = claimed();
+        store
+            .settle_campaign_attempt(
+                FAMILY,
+                &settlement(&attempt, CampaignAttemptOutcomeV1::Failed, None),
+                minutes(1),
+            )
+            .unwrap();
+        let result: Result<(), StoreError> = store.with_campaign_dispatch_admission(
+            &verified,
+            &attempt,
+            &dispatch_target(),
+            None,
+            || minutes(1),
+            || {
+                called = true;
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(!called);
+        assert_eq!(
+            store
+                .campaign_family_usage(FAMILY)
+                .unwrap()
+                .uncertain_trials,
+            40
+        );
+    }
+
+    #[test]
+    fn dispatch_terminal_receipt_survives_revocation_replay_and_retransmission() {
+        let (mut store, verified, attempt) = claimed();
+        store
+            .bind_campaign_dispatch_job(&verified, &attempt, &dispatch_target(), "job-uid-1", t0())
+            .unwrap();
+        acknowledge_all(&mut store);
+        let evidence = CampaignDispatchSettlementV1 {
+            job_uid: "job-uid-1".into(),
+            pod_uid: "pod-uid-1".into(),
+            settlement: settlement(&attempt, CampaignAttemptOutcomeV1::NoCandidate, Some(31)),
+        };
+        let mut changed = evidence.clone();
+        changed.job_uid = "replacement".into();
+        assert!(store
+            .settle_campaign_dispatch(&attempt, &changed, minutes(1))
+            .is_err());
+        store
+            .revoke_approval(APPROVAL, "operator", "cancel", minutes(1))
+            .unwrap();
+        // Expired/revoked authority cannot dispatch, but cannot prevent honest
+        // accounting of an already executed Job after its terminal readback.
+        let receipt = store
+            .settle_campaign_dispatch(&attempt, &evidence, minutes(800))
+            .unwrap();
+        let record = store
+            .campaign_dispatch_record(FAMILY, &attempt.operation_id().unwrap())
+            .unwrap();
+        assert_eq!(record.terminal_pod_uid.as_deref(), Some("pod-uid-1"));
+        assert_eq!(
+            record.settlement.as_ref().unwrap().evidence_sha256,
+            evidence.settlement.evidence_sha256
+        );
+        assert_eq!(
+            store.campaign_family_usage(FAMILY).unwrap().consumed_trials,
+            31
+        );
+        assert_eq!(
+            store
+                .settle_campaign_dispatch(&attempt, &evidence, minutes(801))
+                .unwrap(),
+            receipt
+        );
+        changed = evidence.clone();
+        changed.settlement.consumed_trials = Some(30);
+        assert!(store
+            .settle_campaign_dispatch(&attempt, &changed, minutes(801))
+            .is_err());
+        let snapshot = store.campaign_family_snapshot(FAMILY).unwrap();
+        let mut restored = AlphaStore::open_in_memory().unwrap();
+        restored.integrity_key = store.integrity_key;
+        restored.import_campaign_family_snapshot(&snapshot).unwrap();
+        assert_eq!(
+            restored
+                .campaign_dispatch_record(FAMILY, &attempt.operation_id().unwrap())
+                .unwrap()
+                .terminal_pod_uid,
+            Some("pod-uid-1".into())
+        );
+    }
+
+    #[test]
+    fn dispatch_settlement_binds_child_admission_to_the_actual_parent_and_published_chain() {
+        let mut approved = grant("root-1");
+        let child_policy = format!("cex-search-policy-{}", "7".repeat(64));
+        approved
+            .allowed_policy_revision_ids
+            .insert(child_policy.clone());
+        let verified = verify(approved);
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        store
+            .record_approval(&approval(&verified, APPROVAL))
+            .unwrap();
+        store
+            .register_campaign_root(&verified, APPROVAL, t0())
+            .unwrap();
+        let parent = reservation(&verified, 0, 40);
+        store
+            .reserve_campaign_attempt(&verified, &parent, t0())
+            .unwrap();
+        acknowledge_all(&mut store);
+        store
+            .claim_campaign_dispatch(&verified, &parent, &dispatch_target(), t0())
+            .unwrap();
+        acknowledge_all(&mut store);
+        store
+            .bind_campaign_dispatch_job(&verified, &parent, &dispatch_target(), "job-uid-1", t0())
+            .unwrap();
+        acknowledge_all(&mut store);
+        let terminal = CampaignDispatchSettlementV1 {
+            job_uid: "job-uid-1".into(),
+            pod_uid: "pod-uid-1".into(),
+            settlement: settlement(&parent, CampaignAttemptOutcomeV1::NoCandidate, Some(31)),
+        };
+        store
+            .settle_campaign_dispatch(&parent, &terminal, minutes(1))
+            .unwrap();
+        let mut child = parent.clone();
+        child.generation = 1;
+        child.campaign_id = "child".into();
+        child.policy_revision_id = child_policy;
+        child.request_sha256 = "9".repeat(64);
+        child.parent_result_sha256 = Some("a".repeat(64));
+        assert!(store
+            .reserve_campaign_attempt(&verified, &child, minutes(2))
+            .is_err());
+        child.parent_result_sha256 = Some(terminal.settlement.evidence_sha256.clone());
+        store
+            .reserve_campaign_attempt(&verified, &child, minutes(2))
+            .unwrap();
+        assert!(store.check_campaign_dispatch_admission(&verified, FAMILY, &child.operation_id().unwrap(), minutes(2)).is_err(),
+            "parent terminal and child reservation receipts must be read back before child execution");
+        acknowledge_all(&mut store);
+        assert_eq!(
+            store
+                .check_campaign_dispatch_admission(
+                    &verified,
+                    FAMILY,
+                    &child.operation_id().unwrap(),
+                    minutes(2)
+                )
+                .unwrap(),
+            child
+        );
+        let usage = store.campaign_family_usage(FAMILY).unwrap();
+        assert_eq!(
+            (
+                usage.consumed_trials,
+                usage.pending_trials,
+                usage.job_attempts
+            ),
+            (31, 40, 2)
+        );
+    }
+
     fn kinds(receipts: &[AuthenticatedCampaignReceiptV1]) -> Vec<&'static str> {
         receipts
             .iter()
             .map(|r| match r.receipt.event {
                 CampaignLedgerEventV1::RootRegistered { .. } => "root_registered",
                 CampaignLedgerEventV1::AttemptReserved { .. } => "attempt_reserved",
+                CampaignLedgerEventV1::DispatchClaimed { .. } => "dispatch_claimed",
+                CampaignLedgerEventV1::DispatchJobBound { .. } => "dispatch_job_bound",
                 CampaignLedgerEventV1::AttemptSettled { .. } => "attempt_settled",
+                CampaignLedgerEventV1::DispatchSettled { .. } => "dispatch_settled",
                 CampaignLedgerEventV1::ApprovalRevoked { .. } => "approval_revoked",
             })
             .collect()
