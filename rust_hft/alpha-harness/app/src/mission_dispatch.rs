@@ -1,5 +1,8 @@
+mod admission;
+mod terminal;
+
 use crate::{
-    cli::{print_json, MissionDispatchSubmitArgs},
+    cli::{print_json, MissionDispatchInspectArgs, MissionDispatchSubmitArgs},
     data_mission,
     mission_campaign::{serialize_request, validate_request, CampaignRequest},
     mission_runner::normalized_sha256,
@@ -52,27 +55,20 @@ enum SubmissionObjectState {
     Adopted,
 }
 
-impl SubmissionObjectState {
-    fn should_cleanup(self) -> bool {
-        matches!(self, Self::Created)
-    }
+pub fn inspect(args: MissionDispatchInspectArgs) -> anyhow::Result<()> {
+    let validated = validate_submission(load_submission(&args.submission)?)?;
+    let manifest = render_manifest(&validated, "monday-research")?;
+    print_json(&admission::inspect_binding(
+        &validated,
+        &manifest,
+        &args.materialization,
+        &args.controller_image,
+        args.attempt_ordinal,
+    )?)
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct CleanupState {
-    job: SubmissionObjectState,
-    secret: SubmissionObjectState,
-    release_patch_sent: bool,
-}
-
-impl CleanupState {
-    fn should_cleanup_job(self) -> bool {
-        !self.release_patch_sent && self.job.should_cleanup()
-    }
-
-    fn should_cleanup_secret(self) -> bool {
-        !self.release_patch_sent && self.secret.should_cleanup()
-    }
+pub fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
+    terminal::settle(args)
 }
 
 pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
@@ -84,36 +80,82 @@ pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
     let campaign_id = validated.submission.request.campaign_id.clone();
     let request_sha256 = validated.request_sha256.clone();
     let request_json = validated.request_json.clone();
-    let manifest = render_manifest(validated, &args.namespace)?;
+    let manifest = render_manifest(&validated, &args.namespace)?;
+    let control = args
+        .control
+        .or_else(|| std::env::var_os("MONDAY_CAMPAIGN_CONTROL").map(Into::into))
+        .context("Campaign dispatch requires --control or MONDAY_CAMPAIGN_CONTROL")?;
+    let mut admission = admission::Admission::open(
+        &control,
+        &validated,
+        &manifest,
+        &args.context,
+        &args.namespace,
+    )?;
+    admission.prepare()?;
+    admission.publish_receipts()?;
+    let (claim, first_create) = admission.claim()?;
+    admission.publish_receipts()?;
     let kubectl = kubectl_binary();
-    let mut cleanup_state = CleanupState::default();
+    let mut job_state = SubmissionObjectState::Unknown;
+    let mut secret_state = SubmissionObjectState::Unknown;
 
     let result = (|| -> anyhow::Result<()> {
         let expected_job = &manifest["items"][1];
-        let job = create_or_adopt_job(
-            &kubectl,
-            &args.context,
-            &args.namespace,
-            expected_job,
-            &job_name,
-            &request_sha256,
-            &mut cleanup_state.job,
-        )?;
+        let job = admission.guarded(claim.job_uid.as_deref(), || {
+            resolve_dispatch_job(
+                &claim,
+                first_create,
+                expected_job,
+                &request_sha256,
+                || {
+                    create_or_adopt_job(
+                        &kubectl,
+                        &args.context,
+                        &args.namespace,
+                        expected_job,
+                        &job_name,
+                        &request_sha256,
+                        &mut job_state,
+                    )
+                },
+                || {
+                    kubectl_json(
+                        &kubectl,
+                        &args.context,
+                        &args.namespace,
+                        [
+                            "--request-timeout=30s",
+                            "get",
+                            "job",
+                            &job_name,
+                            "-o",
+                            "json",
+                        ],
+                        "read back claimed Campaign Job",
+                    )
+                },
+            )
+        })?;
         let job_uid = job["metadata"]["uid"]
             .as_str()
             .context("CEX Campaign Job readback is missing its UID")?;
+        admission.bind_job(job_uid)?;
+        admission.publish_receipts()?;
         let secret = secret_with_owner(&manifest["items"][0], &job_name, job_uid)?;
-        let secret = create_or_adopt_secret(
-            &kubectl,
-            &args.context,
-            &args.namespace,
-            &secret,
-            &secret_name,
-            &request_json,
-            &job_name,
-            job_uid,
-            &mut cleanup_state.secret,
-        )?;
+        let secret = admission.guarded(Some(job_uid), || {
+            create_or_adopt_secret(
+                &kubectl,
+                &args.context,
+                &args.namespace,
+                &secret,
+                &secret_name,
+                &request_json,
+                &job_name,
+                job_uid,
+                &mut secret_state,
+            )
+        })?;
         validate_secret_readback(
             &secret,
             &secret_name,
@@ -123,23 +165,25 @@ pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
             job_uid,
         )?;
         let release_patch_json = serde_json::to_string(&release_job_patch(&job)?)?;
-        cleanup_state.release_patch_sent = true;
-        let release_output = kubectl_with_input(
-            &kubectl,
-            &args.context,
-            &args.namespace,
-            [
-                "patch",
-                "job",
-                &job_name,
-                "--type=json",
-                "--patch",
-                &release_patch_json,
-                "-o",
-                "json",
-            ],
-            &[],
-        )?;
+        let release_output = admission.guarded(Some(job_uid), || {
+            kubectl_with_input(
+                &kubectl,
+                &args.context,
+                &args.namespace,
+                [
+                    "--request-timeout=30s",
+                    "patch",
+                    "job",
+                    &job_name,
+                    "--type=json",
+                    "--patch",
+                    &release_patch_json,
+                    "-o",
+                    "json",
+                ],
+                &[],
+            )
+        })?;
         let released_job = serde_json::from_slice(&ensure_kubectl_success(
             release_output,
             "release CEX Campaign Job after identity verification",
@@ -158,30 +202,59 @@ pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
         Ok(())
     })();
     if let Err(error) = result {
-        let cleanup = delete_created_campaign_objects(
-            &kubectl,
-            &args.context,
-            &args.namespace,
-            &job_name,
-            &secret_name,
-            cleanup_state,
-        );
-        return match cleanup {
-            Ok(()) => Err(error),
-            Err(cleanup_error) => Err(error.context(format!(
-                "incomplete submission retained for reconciliation: {cleanup_error:#}"
-            ))),
-        };
+        return Err(error.context("Campaign dispatch claim and budget retained for reconciliation; no automatic recreation or refund"));
     }
 
-    print_json(&json!({
+    let report = json!({
         "status": "submitted",
         "context": args.context,
         "namespace": args.namespace,
         "campaign_id": campaign_id,
         "request_sha256": request_sha256,
         "job_name": job_name,
-    }))
+        "operation_id": admission.reservation.operation_id()?,
+        "reserved_trials": admission.reservation.declared_trials,
+        "execution_scope": "pre_holdout",
+    });
+    crate::mission_runner::research_event(
+        "alpha-harness",
+        "campaign_dispatch_submitted",
+        report.clone(),
+    );
+    print_json(&report)
+}
+
+fn resolve_dispatch_job(
+    claim: &alpha_store::campaign_ledger::CampaignDispatchClaimV1,
+    first_create: bool,
+    expected_job: &Value,
+    request_sha256: &str,
+    create: impl FnOnce() -> anyhow::Result<Value>,
+    get: impl FnOnce() -> anyhow::Result<Value>,
+) -> anyhow::Result<Value> {
+    let job = if first_create {
+        create()?
+    } else {
+        get().context(
+            "claimed Campaign Job is unavailable; retain the reservation, never recreate",
+        )?
+    };
+    let mut observed_state = SubmissionObjectState::Unknown;
+    adopt_existing_job(
+        &job,
+        expected_job,
+        &claim.target.job_name,
+        request_sha256,
+        &mut observed_state,
+    )?;
+    if let Some(uid) = &claim.job_uid {
+        if job["metadata"]["uid"] != *uid {
+            bail!("claimed Campaign Job UID changed");
+        }
+    } else if job["spec"]["suspend"] != true {
+        bail!("unbound Campaign Job is already running");
+    }
+    Ok(job)
 }
 
 fn create_or_adopt_job(
@@ -198,7 +271,7 @@ fn create_or_adopt_job(
         kubectl,
         context,
         namespace,
-        ["create", "-f", "-"],
+        ["--request-timeout=30s", "create", "-f", "-"],
         &job_body,
     )
     .and_then(|output| {
@@ -220,7 +293,14 @@ fn create_or_adopt_job(
                 kubectl,
                 context,
                 namespace,
-                ["get", "job", job_name, "-o", "json"],
+                [
+                    "--request-timeout=30s",
+                    "get",
+                    "job",
+                    job_name,
+                    "-o",
+                    "json",
+                ],
                 "read back immutable CEX Campaign Job",
             )
             .context("read back conflicting immutable CEX Campaign Job")?;
@@ -250,7 +330,7 @@ fn create_or_adopt_secret(
         kubectl,
         context,
         namespace,
-        ["create", "-f", "-"],
+        ["--request-timeout=30s", "create", "-f", "-"],
         &secret_body,
     )
     .and_then(|output| {
@@ -315,7 +395,14 @@ fn read_back_secret(
         kubectl,
         context,
         namespace,
-        ["get", "secret", secret_name, "-o", "json"],
+        [
+            "--request-timeout=30s",
+            "get",
+            "secret",
+            secret_name,
+            "-o",
+            "json",
+        ],
         "read back immutable CEX Campaign input Secret",
     )?;
     let request_sha256 = hex::encode(Sha256::digest(request_json.as_bytes()));
@@ -342,7 +429,14 @@ fn read_back_job(
         kubectl,
         context,
         namespace,
-        ["get", "job", job_name, "-o", "json"],
+        [
+            "--request-timeout=30s",
+            "get",
+            "job",
+            job_name,
+            "-o",
+            "json",
+        ],
         "read back immutable CEX Campaign Job",
     )?;
     validate_job_readback(&job, expected_job, job_name, request_sha256, true)?;
@@ -430,6 +524,8 @@ fn job_execution_projection(job: &Value) -> Value {
         .collect::<Vec<_>>();
     json!({
         "spec": {
+            "parallelism": job["spec"]["parallelism"].clone(),
+            "completions": job["spec"]["completions"].clone(),
             "backoffLimit": job["spec"]["backoffLimit"].clone(),
             "activeDeadlineSeconds": job["spec"]["activeDeadlineSeconds"].clone(),
             "ttlSecondsAfterFinished": job["spec"]["ttlSecondsAfterFinished"].clone(),
@@ -536,47 +632,6 @@ fn decode_base64(value: &str) -> anyhow::Result<Vec<u8>> {
     Ok(decoded)
 }
 
-fn delete_campaign_secret(
-    kubectl: &std::path::Path,
-    context: &str,
-    namespace: &str,
-    secret_name: &str,
-) -> anyhow::Result<()> {
-    let output = kubectl_with_input(
-        kubectl,
-        context,
-        namespace,
-        ["delete", "secret", secret_name, "--ignore-not-found=true"],
-        &[],
-    )?;
-    ensure_kubectl_success(output, "clean up incomplete CEX Campaign input Secret")?;
-    Ok(())
-}
-
-fn delete_created_campaign_objects(
-    kubectl: &std::path::Path,
-    context: &str,
-    namespace: &str,
-    job_name: &str,
-    secret_name: &str,
-    cleanup_state: CleanupState,
-) -> anyhow::Result<()> {
-    if cleanup_state.should_cleanup_job() {
-        let output = kubectl_with_input(
-            kubectl,
-            context,
-            namespace,
-            ["delete", "job", job_name, "--ignore-not-found=true"],
-            &[],
-        )?;
-        ensure_kubectl_success(output, "clean up incomplete CEX Campaign submission")?;
-    }
-    if cleanup_state.should_cleanup_secret() {
-        delete_campaign_secret(kubectl, context, namespace, secret_name)?;
-    }
-    Ok(())
-}
-
 fn load_submission(path: &std::path::Path) -> anyhow::Result<MissionDispatchSubmission> {
     let mut file = std::fs::File::open(path)
         .with_context(|| format!("open mission dispatch submission {}", path.display()))?;
@@ -641,7 +696,7 @@ pub(crate) fn write_submission(
     })
 }
 
-fn render_manifest(validated: ValidatedSubmission, namespace: &str) -> anyhow::Result<Value> {
+fn render_manifest(validated: &ValidatedSubmission, namespace: &str) -> anyhow::Result<Value> {
     validate_dns_label("namespace", namespace)?;
     let attempt_id = validated.submission.attempt_id.clone();
     let campaign_id = validated.submission.request.campaign_id.clone();
@@ -692,6 +747,8 @@ fn render_manifest(validated: ValidatedSubmission, namespace: &str) -> anyhow::R
                 },
                 "spec": {
                     "suspend": true,
+                    "parallelism": 1,
+                    "completions": 1,
                     "backoffLimit": 0,
                     "activeDeadlineSeconds": ACTIVE_DEADLINE_SECONDS,
                     "ttlSecondsAfterFinished": 86400,
@@ -717,6 +774,7 @@ fn render_manifest(validated: ValidatedSubmission, namespace: &str) -> anyhow::R
                                 "args": [
                                     "mission",
                                     "campaign-execute",
+                                    "--pre-holdout",
                                     "--work-dir", "/work",
                                     "--campaign-id", &campaign_id,
                                     "--image-identity", &validated.image_digest,
@@ -855,10 +913,12 @@ mod tests {
     #[test]
     fn render_job_disables_service_account_token() {
         let rendered =
-            render_manifest(validate_submission(valid_submission()).unwrap(), "monday").unwrap();
+            render_manifest(&validate_submission(valid_submission()).unwrap(), "monday").unwrap();
         let job = &rendered["items"][1];
 
         assert_eq!(job["spec"]["suspend"], true);
+        assert_eq!(job["spec"]["parallelism"], 1);
+        assert_eq!(job["spec"]["completions"], 1);
         assert_eq!(job["spec"]["backoffLimit"], 0);
         assert_eq!(job["spec"]["activeDeadlineSeconds"], 21_608);
         assert_eq!(
@@ -882,7 +942,7 @@ mod tests {
     #[test]
     fn campaign_secret_creation_inlines_job_owner_reference() {
         let rendered =
-            render_manifest(validate_submission(valid_submission()).unwrap(), "monday").unwrap();
+            render_manifest(&validate_submission(valid_submission()).unwrap(), "monday").unwrap();
         let secret =
             secret_with_owner(&rendered["items"][0], "alpha-campaign-test", "job-uid").unwrap();
 
@@ -1009,21 +1069,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(already_released, observed);
-        let state = CleanupState {
-            job: SubmissionObjectState::Created,
-            secret: SubmissionObjectState::Created,
-            release_patch_sent: true,
-        };
-        // A failed precondition or lost response must retain objects for fresh
-        // identity readback/adoption, rather than delete by a potentially stale name.
-        assert!(!state.should_cleanup_job());
-        assert!(!state.should_cleanup_secret());
     }
 
     #[test]
     fn job_readback_requires_expected_suspend_state() {
         let expected_job =
-            render_manifest(validate_submission(valid_submission()).unwrap(), "monday").unwrap();
+            render_manifest(&validate_submission(valid_submission()).unwrap(), "monday").unwrap();
         let job = json!({
             "metadata": {
                 "name": expected_job["items"][1]["metadata"]["name"].clone(),
@@ -1031,6 +1082,8 @@ mod tests {
             },
             "spec": {
                 "suspend": true,
+                "parallelism": 1,
+                "completions": 1,
                 "backoffLimit": 0,
                 "activeDeadlineSeconds": ACTIVE_DEADLINE_SECONDS,
                 "ttlSecondsAfterFinished": 86400,
@@ -1068,7 +1121,7 @@ mod tests {
     #[test]
     fn job_readback_rejects_execution_template_drift() {
         let expected_job =
-            render_manifest(validate_submission(valid_submission()).unwrap(), "monday").unwrap();
+            render_manifest(&validate_submission(valid_submission()).unwrap(), "monday").unwrap();
         let mut job = expected_job["items"][1].clone();
         job["metadata"]["annotations"]["research.monday/request-sha256"] = json!("request-sha");
         job["spec"]["template"]["spec"]["containers"][0]["env"] =
@@ -1099,6 +1152,25 @@ mod tests {
             true
         )
         .is_err());
+        for field in ["parallelism", "completions"] {
+            let mut multiplied_job = expected_job["items"][1].clone();
+            multiplied_job["metadata"]["annotations"]["research.monday/request-sha256"] =
+                json!("request-sha");
+            multiplied_job["spec"][field] = json!(2);
+            assert!(
+                validate_job_readback(
+                    &multiplied_job,
+                    &expected_job["items"][1],
+                    expected_job["items"][1]["metadata"]["name"]
+                        .as_str()
+                        .unwrap(),
+                    "request-sha",
+                    true
+                )
+                .is_err(),
+                "accepted multiplied Job {field}"
+            );
+        }
     }
 
     #[test]
@@ -1127,28 +1199,9 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_only_targets_created_objects() {
-        assert!(!SubmissionObjectState::Unknown.should_cleanup());
-        assert!(!SubmissionObjectState::Adopted.should_cleanup());
-        assert!(SubmissionObjectState::Created.should_cleanup());
-    }
-
-    #[test]
-    fn release_phase_disables_cleanup_even_for_created_objects() {
-        let cleanup_state = CleanupState {
-            job: SubmissionObjectState::Created,
-            secret: SubmissionObjectState::Created,
-            release_patch_sent: true,
-        };
-
-        assert!(!cleanup_state.should_cleanup_job());
-        assert!(!cleanup_state.should_cleanup_secret());
-    }
-
-    #[test]
-    fn released_and_mismatched_jobs_do_not_become_cleanup_targets() {
+    fn only_matching_jobs_are_adopted() {
         let expected_job =
-            render_manifest(validate_submission(valid_submission()).unwrap(), "monday").unwrap();
+            render_manifest(&validate_submission(valid_submission()).unwrap(), "monday").unwrap();
         let job_name = expected_job["items"][1]["metadata"]["name"]
             .as_str()
             .unwrap();
@@ -1167,7 +1220,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(adopted_state, SubmissionObjectState::Adopted);
-        assert!(!adopted_state.should_cleanup());
 
         let mut mismatched_state = SubmissionObjectState::Unknown;
         let mut mismatched_job = expected_job["items"][1].clone();
@@ -1182,7 +1234,6 @@ mod tests {
         )
         .is_err());
         assert_eq!(mismatched_state, SubmissionObjectState::Unknown);
-        assert!(!mismatched_state.should_cleanup());
 
         let mut mismatched_released_state = SubmissionObjectState::Unknown;
         let mut mismatched_released_job = expected_job["items"][1].clone();
@@ -1198,13 +1249,12 @@ mod tests {
         )
         .is_err());
         assert_eq!(mismatched_released_state, SubmissionObjectState::Unknown);
-        assert!(!mismatched_released_state.should_cleanup());
     }
 
     #[test]
     fn released_exact_job_is_adoptable_for_retry() {
         let expected_job =
-            render_manifest(validate_submission(valid_submission()).unwrap(), "monday").unwrap();
+            render_manifest(&validate_submission(valid_submission()).unwrap(), "monday").unwrap();
         let job_name = expected_job["items"][1]["metadata"]["name"]
             .as_str()
             .unwrap();
@@ -1225,11 +1275,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(released_state, SubmissionObjectState::Adopted);
-        assert!(!released_state.should_cleanup());
     }
 
     #[test]
-    fn matching_secret_conflict_is_adoptable_without_cleanup() {
+    fn matching_secret_conflict_is_adoptable() {
         let request_sha256 = hex::encode(Sha256::digest(br#"{}"#));
         let secret = json!({
             "metadata": {
@@ -1255,9 +1304,594 @@ mod tests {
             "job-uid",
         )
         .unwrap();
+    }
 
-        let adopted_state = SubmissionObjectState::Adopted;
-        assert!(!adopted_state.should_cleanup());
+    #[test]
+    fn claimed_job_retry_never_recreates_a_missing_or_replaced_job() {
+        use alpha_store::campaign_ledger::{CampaignDispatchClaimV1, CampaignDispatchTargetV1};
+        let validated = validate_submission(valid_submission()).unwrap();
+        let manifest = render_manifest(&validated, "monday-research").unwrap();
+        let mut job = manifest["items"][1].clone();
+        job["metadata"]["uid"] = json!("original");
+        job["metadata"]["resourceVersion"] = json!("1");
+        let mut claim = CampaignDispatchClaimV1 {
+            target: CampaignDispatchTargetV1 {
+                context: "context".into(),
+                namespace: "monday-research".into(),
+                job_name: validated.job_name.clone(),
+                manifest_sha256: "a".repeat(64),
+            },
+            job_uid: Some("original".into()),
+            sequence: 4,
+        };
+        let mut created = false;
+        assert!(resolve_dispatch_job(
+            &claim,
+            false,
+            &manifest["items"][1],
+            &validated.request_sha256,
+            || {
+                created = true;
+                Ok(job.clone())
+            },
+            || anyhow::bail!("NotFound")
+        )
+        .is_err());
+        assert!(!created);
+        let mut replacement = job.clone();
+        replacement["metadata"]["uid"] = json!("replacement");
+        assert!(resolve_dispatch_job(
+            &claim,
+            false,
+            &manifest["items"][1],
+            &validated.request_sha256,
+            || {
+                created = true;
+                Ok(job.clone())
+            },
+            || Ok(replacement)
+        )
+        .is_err());
+        assert!(!created);
+        resolve_dispatch_job(
+            &claim,
+            false,
+            &manifest["items"][1],
+            &validated.request_sha256,
+            || {
+                created = true;
+                Ok(job.clone())
+            },
+            || Ok(job.clone()),
+        )
+        .unwrap();
+        assert!(!created);
+        claim.job_uid = None;
+        let mut running = job.clone();
+        running["spec"]["suspend"] = json!(false);
+        assert!(
+            resolve_dispatch_job(
+                &claim,
+                true,
+                &manifest["items"][1],
+                &validated.request_sha256,
+                || Ok(running),
+                || anyhow::bail!("must not read fallback")
+            )
+            .is_err(),
+            "a first claim cannot adopt an already-running unbound Job"
+        );
+        resolve_dispatch_job(
+            &claim,
+            true,
+            &manifest["items"][1],
+            &validated.request_sha256,
+            || {
+                created = true;
+                Ok(job.clone())
+            },
+            || anyhow::bail!("must not read fallback"),
+        )
+        .unwrap();
+        assert!(created);
+    }
+
+    #[test]
+    fn terminal_provenance_requires_the_bound_successful_job_pod_and_execution() {
+        let validated = validate_submission(valid_submission()).unwrap();
+        let manifest = render_manifest(&validated, "monday-research").unwrap();
+        let expected_job = &manifest["items"][1];
+        let mut job = expected_job.clone();
+        job["metadata"]["uid"] = json!("bound-job");
+        job["spec"]["suspend"] = json!(false);
+        job["status"] = json!({"succeeded":1,"conditions":[{"type":"Complete","status":"True"}]});
+        let pod = json!({
+            "metadata":{"uid":"pod-1","annotations":expected_job["spec"]["template"]["metadata"]["annotations"],
+                "ownerReferences":[{"kind":"Job","name":validated.job_name,"uid":"bound-job"}]},
+            "spec":expected_job["spec"]["template"]["spec"],
+            "status":{"phase":"Succeeded","containerStatuses":[{"name":"alpha-campaign",
+                "imageID":validated.submission.image,"restartCount":0,"state":{"terminated":{"exitCode":0}}}]},
+        });
+        assert_eq!(
+            terminal::validate_terminal_provenance(expected_job, &job, &pod, "bound-job").unwrap(),
+            ("bound-job".into(), "pod-1".into())
+        );
+        for pointer in ["/metadata/uid", "/status/succeeded"] {
+            let mut changed = job.clone();
+            *changed.pointer_mut(pointer).unwrap() = json!("different");
+            assert!(terminal::validate_terminal_provenance(
+                expected_job,
+                &changed,
+                &pod,
+                "bound-job"
+            )
+            .is_err());
+        }
+        for pointer in [
+            "/metadata/ownerReferences/0/uid",
+            "/status/containerStatuses/0/imageID",
+            "/status/containerStatuses/0/restartCount",
+            "/status/containerStatuses/0/state/terminated/exitCode",
+            "/spec/containers/0/args",
+            "/status/phase",
+        ] {
+            let mut changed = pod.clone();
+            *changed.pointer_mut(pointer).unwrap() = json!("different");
+            assert!(
+                terminal::validate_terminal_provenance(expected_job, &job, &changed, "bound-job")
+                    .is_err(),
+                "accepted changed {pointer}"
+            );
+        }
+    }
+
+    struct AdmissionFixture {
+        inputs: crate::mission_render::tests::Fixture,
+        control: std::path::PathBuf,
+        validated: ValidatedSubmission,
+        manifest: Value,
+    }
+
+    impl AdmissionFixture {
+        fn new() -> Self {
+            use alpha_domain::campaign_control::*;
+            use alpha_store::{AlphaStore, ApprovalRecord};
+            use chrono::{TimeDelta, Utc};
+            use ed25519_dalek::SigningKey;
+            use std::collections::BTreeSet;
+            let inputs = crate::mission_render::tests::Fixture::new(21_608);
+            let mut submission = valid_submission();
+            submission.request = crate::mission_campaign::request_for_materialization_for_tests(
+                &inputs.materialization_path,
+            );
+            let validated = validate_submission(submission).unwrap();
+            let manifest = render_manifest(&validated, "monday-research").unwrap();
+            let controller_image = format!("registry/controller@sha256:{}", "e".repeat(64));
+            let inspection = serde_json::to_value(
+                admission::inspect_binding(
+                    &validated,
+                    &manifest,
+                    &inputs.materialization_path,
+                    &controller_image,
+                    0,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let now = Utc::now();
+            let grant = CampaignRootGrantV1 {
+                schema_version: ROOT_GRANT_SCHEMA.into(),
+                root_id: "dispatch-root".into(),
+                family: CampaignFamilyPolicyV1 {
+                    family_id: "dispatch-study".into(),
+                    definition_sha256: "a".repeat(64),
+                    max_trials: 1000,
+                },
+                execution_scope: CampaignExecutionScope::PreHoldout,
+                execution: serde_json::from_value(inspection["execution"].clone()).unwrap(),
+                allowed_policy_revision_ids: BTreeSet::from([inspection["policy_revision_id"]
+                    .as_str()
+                    .unwrap()
+                    .into()]),
+                max_follow_ups: 1,
+                budget: CampaignRootBudgetV1 {
+                    max_trials: 1000,
+                    max_job_attempts: 2,
+                    max_job_seconds: 100_000,
+                    max_llm_tokens: 0,
+                },
+                valid_from: now - TimeDelta::minutes(1),
+                expires_at: now + TimeDelta::hours(24),
+            };
+            let signing_key = SigningKey::from_bytes(&[19; 32]);
+            let signed = sign_campaign_root_grant(grant, "operator".into(), &signing_key).unwrap();
+            let root = inputs._root.path();
+            std::fs::write(
+                root.join("grant.json"),
+                serde_json::to_vec(&signed).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                root.join("keys.json"),
+                serde_json::to_vec(
+                    &json!({ "operator": hex::encode(signing_key.verifying_key().as_bytes()) }),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let approval = ApprovalRecord {
+                approval_id: "dispatch-approval".into(),
+                approval_class: "campaign_root".into(),
+                subject_id: signed.grant.root_id.clone(),
+                payload: json!({"grant_sha256": signed.content_sha256, "family_id": signed.grant.family.family_id}),
+                signer_id: Some("operator".into()),
+                valid_from: Some(signed.grant.valid_from),
+                expires_at: Some(signed.grant.expires_at),
+                revoked_at: None,
+                revoked_by: None,
+                revocation_reason: None,
+                created_at: signed.grant.valid_from,
+            };
+            let mut store = AlphaStore::open(root.join("ledger.duckdb")).unwrap();
+            store.record_approval(&approval).unwrap();
+            drop(store);
+            let origin =
+                reqwest::Url::parse(&validated.submission.request.campaign_result_readback_url)
+                    .unwrap()
+                    .origin()
+                    .ascii_serialization();
+            let access = (1..=12).map(|sequence| {
+                let key = format!("research/campaign-ledger/family-id=dispatch-study/sequence={sequence:020}/receipt.json");
+                let url = format!("{origin}/{key}?signature=fixture-only");
+                (key, json!({"put_url": url, "readback_url": url}))
+            }).collect::<serde_json::Map<String, Value>>();
+            let control = root.join("control.json");
+            std::fs::write(&control, serde_json::to_vec(&json!({
+                "schema_version": "monday.campaign_dispatch_control.v1",
+                "ledger_path": "ledger.duckdb", "signed_root_grant_path": "grant.json",
+                "trusted_keys_path": "keys.json", "materialization_path": "materialization.json",
+                "approval_id": "dispatch-approval", "controller_image": controller_image,
+                "attempt_ordinal": 0, "receipt_access": access,
+            })).unwrap()).unwrap();
+            Self {
+                inputs,
+                control,
+                validated,
+                manifest,
+            }
+        }
+
+        fn open(&self) -> admission::Admission {
+            admission::Admission::open(
+                &self.control,
+                &self.validated,
+                &self.manifest,
+                "research-context",
+                "monday-research",
+            )
+            .unwrap()
+        }
+
+        fn usage(&self) -> alpha_store::campaign_ledger::CampaignBudgetUsageV1 {
+            alpha_store::AlphaStore::open(self.inputs._root.path().join("ledger.duckdb"))
+                .unwrap()
+                .campaign_family_usage("dispatch-study")
+                .unwrap()
+        }
+    }
+
+    #[test]
+    fn dispatch_inspection_uses_the_same_supported_materialization_scope_as_the_renderer() {
+        let fixture = AdmissionFixture::new();
+        let mut metadata: Value =
+            serde_json::from_slice(&std::fs::read(&fixture.inputs.materialization_path).unwrap())
+                .unwrap();
+        metadata["label_horizon_buckets"] = json!(6);
+        metadata["snapshot"]["label_horizon_buckets"] = json!(6);
+        let snapshot: hft_research_manifest::CexReplaySnapshotV5 =
+            serde_json::from_value(metadata["snapshot"].clone()).unwrap();
+        metadata["snapshot_sha256"] = json!(snapshot.sha256());
+        std::fs::write(
+            &fixture.inputs.materialization_path,
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        let mut submission = valid_submission();
+        submission.request = crate::mission_campaign::request_for_materialization_for_tests(
+            &fixture.inputs.materialization_path,
+        );
+        let validated = validate_submission(submission).unwrap();
+        let manifest = render_manifest(&validated, "monday-research").unwrap();
+        let error = admission::inspect_binding(
+            &validated,
+            &manifest,
+            &fixture.inputs.materialization_path,
+            &format!("registry/controller@sha256:{}", "e".repeat(64)),
+            0,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("approved Binance USD-M BTCUSDT"));
+    }
+
+    #[test]
+    fn dispatch_reserves_real_request_once_and_requires_independent_receipt_bytes_before_actions() {
+        let fixture = AdmissionFixture::new();
+        let mut gate = fixture.open();
+        gate.prepare().unwrap();
+        assert_eq!(
+            gate.reservation.declared_trials,
+            fixture.validated.submission.request.declared_total_trials as u64
+        );
+        assert_eq!(gate.reservation.execution.job_memory_mib, 12 * 1024);
+        assert_eq!(gate.reservation.execution.job_cpu_millis, 3500);
+        assert_eq!(
+            gate.reservation.reserved_job_seconds,
+            ACTIVE_DEADLINE_SECONDS
+        );
+        assert_eq!(gate.reservation.reserved_llm_tokens, 0);
+        assert_eq!(
+            gate.reservation
+                .execution
+                .evaluation_views
+                .search_view_sha256,
+            gate.reservation
+                .execution
+                .evaluation_views
+                .selection_view_sha256
+        );
+        assert!(
+            gate.claim().is_err(),
+            "reservation without archived receipts must not create a Job"
+        );
+        assert!(gate
+            .publish_receipts_with(|_, bytes| {
+                let mut corrupted = bytes.to_vec();
+                corrupted.push(b' ');
+                Ok(corrupted)
+            })
+            .is_err());
+        assert!(gate.claim().is_err());
+        gate.publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
+        let (_, first) = gate.claim().unwrap();
+        assert!(first);
+        let mut called = false;
+        assert!(gate
+            .guarded(None, || {
+                called = true;
+                Ok(())
+            })
+            .is_err());
+        assert!(
+            !called,
+            "dispatch claim itself must be independently archived"
+        );
+        gate.publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
+        gate.guarded(None, || {
+            called = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(called);
+        gate.bind_job("job-uid-1").unwrap();
+        gate.publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
+        drop(gate);
+        let before = fixture.usage();
+        let mut gate = fixture.open();
+        gate.prepare().unwrap();
+        gate.publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
+        let (claim, first) = gate.claim().unwrap();
+        assert!(!first, "reopen must never permit a second create");
+        assert_eq!(claim.job_uid.as_deref(), Some("job-uid-1"));
+        gate.guarded(Some("job-uid-1"), || Ok(())).unwrap();
+        drop(gate);
+        assert_eq!(fixture.usage(), before);
+    }
+
+    #[test]
+    fn dispatch_rejects_execution_drift_renamed_jobs_and_revoked_trust_without_spending_again() {
+        let fixture = AdmissionFixture::new();
+        let mut gate = fixture.open();
+        gate.prepare().unwrap();
+        gate.publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
+        gate.claim().unwrap();
+        gate.publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
+        drop(gate);
+        let before = fixture.usage();
+        let mut changed = fixture.manifest.clone();
+        changed["items"][1]["spec"]["template"]["spec"]["containers"][0]["resources"]["limits"]
+            ["memory"] = json!("24Gi");
+        assert!(admission::Admission::open(
+            &fixture.control,
+            &fixture.validated,
+            &changed,
+            "research-context",
+            "monday-research"
+        )
+        .is_err());
+        let mut changed = fixture.manifest.clone();
+        changed["items"][1]["spec"]["template"]["spec"]["containers"][0]["args"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|arg| arg != "--pre-holdout");
+        assert!(admission::Admission::open(
+            &fixture.control,
+            &fixture.validated,
+            &changed,
+            "research-context",
+            "monday-research"
+        )
+        .is_err());
+        let mut renamed = valid_submission();
+        renamed.request = fixture.validated.submission.request.clone();
+        renamed.attempt_id = "another-job-name".into();
+        let renamed = validate_submission(renamed).unwrap();
+        let manifest = render_manifest(&renamed, "monday-research").unwrap();
+        let mut gate = admission::Admission::open(
+            &fixture.control,
+            &renamed,
+            &manifest,
+            "research-context",
+            "monday-research",
+        )
+        .unwrap();
+        gate.prepare().unwrap();
+        assert!(
+            gate.claim().is_err(),
+            "a second name must not bypass the original dispatch claim"
+        );
+        drop(gate);
+        assert_eq!(fixture.usage(), before);
+        let keys_path = fixture.inputs._root.path().join("keys.json");
+        #[cfg(unix)]
+        let original_keys = std::fs::read(&keys_path).unwrap();
+        let mut gate = fixture.open();
+        std::fs::write(&keys_path, b"{}").unwrap();
+        let mut called = false;
+        assert!(gate
+            .guarded(None, || {
+                called = true;
+                Ok(())
+            })
+            .is_err());
+        assert!(!called, "release must reread the current trusted key set");
+        drop(gate);
+        #[cfg(unix)]
+        {
+            // Projected Kubernetes files and operator key rotations can replace
+            // a symlink while leaving the old key file available for audit.
+            let old_keys = fixture.inputs._root.path().join("keys-old.json");
+            let new_keys = fixture.inputs._root.path().join("keys-new.json");
+            std::fs::write(&old_keys, original_keys).unwrap();
+            std::fs::write(&new_keys, b"{}").unwrap();
+            std::fs::remove_file(&keys_path).unwrap();
+            std::os::unix::fs::symlink(&old_keys, &keys_path).unwrap();
+            let mut gate = fixture.open();
+            std::fs::remove_file(&keys_path).unwrap();
+            std::os::unix::fs::symlink(&new_keys, &keys_path).unwrap();
+            let mut called = false;
+            assert!(
+                gate.guarded(None, || {
+                    called = true;
+                    Ok(())
+                })
+                .is_err(),
+                "a rotated trust symlink must not retain the old signing authority"
+            );
+            assert!(!called);
+        }
+    }
+
+    #[test]
+    fn dispatched_terminal_accounting_uses_registered_authority_after_trust_rotation() {
+        use alpha_domain::campaign_control::{
+            CampaignAttemptOutcomeV1, CampaignAttemptSettlementV1,
+        };
+        use alpha_store::campaign_ledger::CampaignDispatchSettlementV1;
+        let fixture = AdmissionFixture::new();
+        let mut gate = fixture.open();
+        gate.prepare().unwrap();
+        gate.publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
+        gate.claim().unwrap();
+        gate.publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
+        gate.bind_job("job-uid-1").unwrap();
+        gate.publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
+        let attempt = gate.reservation.clone();
+        drop(gate);
+        std::fs::remove_file(fixture.inputs._root.path().join("keys.json")).unwrap();
+        assert!(admission::Admission::open(
+            &fixture.control,
+            &fixture.validated,
+            &fixture.manifest,
+            "research-context",
+            "monday-research"
+        )
+        .is_err());
+        let mut gate = admission::Admission::open_for_settlement(
+            &fixture.control,
+            &fixture.validated,
+            &fixture.manifest,
+            "research-context",
+            "monday-research",
+        )
+        .unwrap();
+        gate.settle(&CampaignDispatchSettlementV1 {
+            job_uid: "job-uid-1".into(),
+            pod_uid: "pod-uid-1".into(),
+            settlement: CampaignAttemptSettlementV1 {
+                operation_id: attempt.operation_id().unwrap(),
+                reservation_sha256: attempt.content_hash().unwrap(),
+                evidence_sha256: "b".repeat(64),
+                outcome: CampaignAttemptOutcomeV1::NoCandidate,
+                consumed_trials: Some(20),
+            },
+        })
+        .unwrap();
+        assert!(gate
+            .publish_receipts_with(|_, _| anyhow::bail!("lost PUT response"))
+            .is_err());
+        drop(gate);
+        let mut gate = admission::Admission::open_for_settlement(
+            &fixture.control,
+            &fixture.validated,
+            &fixture.manifest,
+            "research-context",
+            "monday-research",
+        )
+        .unwrap();
+        gate.publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
+        assert_eq!(
+            gate.record().unwrap().terminal_pod_uid,
+            Some("pod-uid-1".into())
+        );
+        drop(gate);
+        assert_eq!(fixture.usage().consumed_trials, 20);
+        assert_eq!(fixture.usage().job_attempts, 1);
+    }
+
+    #[test]
+    fn dispatch_receipt_transport_failure_and_wrong_object_do_not_acknowledge_or_start() {
+        let fixture = AdmissionFixture::new();
+        let mut gate = fixture.open();
+        gate.prepare().unwrap();
+        assert!(gate
+            .publish_receipts_with(|_, _| anyhow::bail!("lost readback response"))
+            .is_err());
+        assert!(gate.claim().is_err());
+        drop(gate);
+        let mut control: Value =
+            serde_json::from_slice(&std::fs::read(&fixture.control).unwrap()).unwrap();
+        let first = control["receipt_access"]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+            .next()
+            .unwrap();
+        first["readback_url"] =
+            json!("https://other.oss-ap-northeast-1-internal.aliyuncs.com/receipt.json");
+        std::fs::write(&fixture.control, serde_json::to_vec(&control).unwrap()).unwrap();
+        let mut gate = fixture.open();
+        let mut transferred = false;
+        assert!(gate
+            .publish_receipts_with(|_, bytes| {
+                transferred = true;
+                Ok(bytes.to_vec())
+            })
+            .is_err());
+        assert!(
+            !transferred,
+            "foreign bucket/key must fail before any transport"
+        );
+        assert!(gate.claim().is_err());
     }
 
     fn valid_submission() -> MissionDispatchSubmission {

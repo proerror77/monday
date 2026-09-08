@@ -79,9 +79,15 @@ alpha-harness mission campaign-id --request campaign-request.json
 
 alpha-harness mission dispatch submit \
   --submission campaign-submission.json \
+  --control /private/path/campaign-control.json \
   --context monday-research-apne1 \
   --namespace monday-research
 ```
+
+The required control file (or `MONDAY_CAMPAIGN_CONTROL`) binds the signed root,
+trusted keys, local ledger, materialization and receipt access. Prepare it using
+[the root-budget admission contract](../../deployment/aliyun/research/README.md#root-budget-admission-and-terminal-settlement)
+before submission.
 
 `campaign-execute` is the generated Job's internal entrypoint, not a manual
 operator step. The older Mission and LoopRun mutation commands remain hidden,

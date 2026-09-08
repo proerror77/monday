@@ -790,7 +790,7 @@ fn import_feature_manifest(
         .with_context(|| format!("import feature dataset from {}", input.display()))
 }
 
-fn approved_validation(
+pub(crate) fn approved_validation(
     materialization: &crate::mission_runner::Materialization,
 ) -> anyhow::Result<ValidationArgs> {
     Ok(ValidationArgs {
@@ -814,7 +814,7 @@ fn approved_validation(
     })
 }
 
-fn approved_evaluation_protocol(
+pub(crate) fn approved_evaluation_protocol(
     materialization: &crate::mission_runner::Materialization,
 ) -> anyhow::Result<EvaluationProtocolV1> {
     EvaluationProtocolV1::new(
@@ -845,10 +845,8 @@ fn approved_evaluation_protocol(
     .map_err(anyhow::Error::new)
 }
 
-fn ensure_materialization_scope(
+pub(crate) fn validate_render_materialization_scope(
     materialization: &crate::mission_runner::Materialization,
-    manifest: &FeatureDatasetManifest,
-    feature_sha256: &str,
 ) -> anyhow::Result<()> {
     if materialization.market != "usdm"
         || materialization.symbol != "BTCUSDT"
@@ -858,7 +856,19 @@ fn ensure_materialization_scope(
     {
         bail!("only the approved Binance USD-M BTCUSDT 1s/h5/top5 materialization can render this Mission");
     }
-    if materialization.rows < MIN_ROWS || manifest.rows < MIN_ROWS {
+    if materialization.rows < MIN_ROWS {
+        bail!("approved Mission render requires at least {MIN_ROWS} point-in-time rows");
+    }
+    Ok(())
+}
+
+fn ensure_materialization_scope(
+    materialization: &crate::mission_runner::Materialization,
+    manifest: &FeatureDatasetManifest,
+    feature_sha256: &str,
+) -> anyhow::Result<()> {
+    validate_render_materialization_scope(materialization)?;
+    if manifest.rows < MIN_ROWS {
         bail!("approved Mission render requires at least {MIN_ROWS} point-in-time rows");
     }
     if materialization.rows != manifest.rows {

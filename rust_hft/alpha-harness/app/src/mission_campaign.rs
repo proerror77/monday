@@ -1116,7 +1116,7 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
     );
     let finalization = match (&selected_round, &selected_mission, &selected_execute_dir) {
         (Some(selected_round), Some(selected_mission), Some(selected_execute_dir))
-            if selected_round.supervised_candidate_id.is_none() =>
+            if !args.pre_holdout && selected_round.supervised_candidate_id.is_none() =>
         {
             let finalization_dir = mission_dir.join("finalization");
             let report = finalize_existing_search_round(
@@ -2129,7 +2129,167 @@ fn validate_existing_follow_up_plan(
     Ok(())
 }
 
-fn validate_negative_campaign_result(
+/// Reconstructs every round from independently read-back immutable artifacts.
+/// This validates evidence only: it does not train, replay, open holdout or promote.
+pub(crate) fn readback_pre_holdout_terminal(
+    client: &Client,
+    request: &CampaignRequest,
+    request_sha256: &str,
+    evaluation_protocol_sha256: &str,
+) -> anyhow::Result<(
+    alpha_domain::campaign_control::CampaignAttemptOutcomeV1,
+    u64,
+    String,
+)> {
+    use alpha_domain::campaign_control::CampaignAttemptOutcomeV1;
+    let root = tempfile::tempdir()?;
+    let result_path = root.path().join("campaign-result.json");
+    let (_, result_sha256) = fetch_to_file(
+        client,
+        &request.campaign_result_readback_url,
+        &result_path,
+        MAX_CAMPAIGN_RESULT_BYTES,
+    )
+    .map_err(terminal_readback_error)?;
+    let result = load_campaign_result(&result_path)?;
+    let loaded = LoadedRequest {
+        request: request.clone(),
+        sha256: request_sha256.into(),
+    };
+    validate_campaign_result_identity(&loaded, &result, &result_sha256)?;
+    if result.finalization.is_some() || result.rounds.len() != request.rounds.len() {
+        bail!("dispatch settlement requires complete pre-holdout rounds");
+    }
+    let mut consumed = 0usize;
+    let mut selected: Option<&CampaignMissionLedgerV1> = None;
+    for (index, (round, expected)) in request.rounds.iter().zip(&result.rounds).enumerate() {
+        if round.round_id != expected.round_id
+            || round.seed != expected.seed
+            || round.identity != expected.identity
+        {
+            bail!("terminal Campaign round identity differs from the request");
+        }
+        let dir = root.path().join(format!("round-{index}"));
+        std::fs::create_dir_all(&dir)?;
+        let mission_path = dir.join("mission.json");
+        fetch_verified(
+            client,
+            "terminal Mission",
+            &round.mission_readback_url,
+            &mission_path,
+            &expected.mission_sha256,
+            MAX_REQUEST_BYTES,
+        )
+        .map_err(terminal_readback_error)?;
+        let mission: alpha_domain::CexResearchMissionArtifactV1 =
+            serde_json::from_slice(&std::fs::read(&mission_path)?)?;
+        mission.validate()?;
+        if mission.semantic_id()? != expected.mission_id
+            || mission.spec.inputs.feature.content_sha256 != request.feature_sha256
+            || mission.spec.inputs.materialization.content_sha256 != request.materialization_sha256
+            || mission.spec.evaluation_protocol.content_hash()? != evaluation_protocol_sha256
+            || mission.spec.feature_fields != request.research_plan.feature_fields
+            || mission.spec.search.seed != round.seed
+            || mission.spec.search.multiple_testing_trials != request.declared_total_trials
+            || mission.spec.policies.supervised_decision.id
+                != request.research_plan.search_policy_revision.revision_id
+            || mission.spec.holdout.holdout_id != request.holdout_id
+            || mission.spec.holdout.state != alpha_domain::CexResearchHoldoutStateV1::Unopened
+        {
+            bail!("terminal Mission does not bind the reserved data, policy, trials and evaluation protocol");
+        }
+        let bundle_path = dir.join("result.zip");
+        let binding = ExecutionBinding::Campaign {
+            campaign_id: request.campaign_id.clone(),
+            round_id: round.round_id.clone(),
+            request_sha256: request_sha256.into(),
+        };
+        let report = recover_execution_report_from_published_result(
+            client,
+            &round.result_readback_url,
+            &bundle_path,
+            &expected.mission_id,
+            &expected.mission_sha256,
+            &binding,
+        )
+        .map_err(terminal_readback_error)?
+        .context("terminal round bundle is absent")?;
+        if report.bundle_sha256 != expected.result_bundle_sha256
+            || report.bundle_sha256 != expected.result_readback_bundle_sha256
+        {
+            bail!("terminal round bundle SHA256 differs from the Campaign result");
+        }
+        let extracted = dir.join("extracted");
+        extract_bundle(&bundle_path, &extracted)?;
+        for artifact in [
+            "sealed-holdout-claim.json",
+            "sealed-holdout-claim-readback.json",
+            "sealed-holdout-receipt.json",
+            "sealed-evaluations.jsonl",
+            "strategy-bundle.json",
+            "promotion-record.json",
+            "finalization-report.json",
+        ] {
+            if extracted.join("results").join(artifact).try_exists()? {
+                bail!("pre-holdout settlement rejects terminal artifact {artifact}");
+            }
+        }
+        let observed = collect_round_ledger(&extracted, round, &report)?;
+        if observed != *expected
+            || observed.sealed_receipt_id.is_some()
+            || observed.sealed_passed.is_some()
+            || observed.strategy_bundle_id.is_some()
+            || observed.promotion_id.is_some()
+        {
+            bail!("terminal round evidence differs from its reconstructed pre-holdout artifacts");
+        }
+        consumed = consumed
+            .checked_add(observed.consumed_trials)
+            .context("terminal trial count overflow")?;
+        if observed
+            .supervised_replay_gate_passed
+            .or(observed.replay_gate_passed)
+            == Some(true)
+            && observed.selected_score.is_some()
+            && selected.is_none_or(|best| compare_round_selection(expected, best).is_gt())
+        {
+            selected = Some(expected);
+        }
+    }
+    if consumed != result.consumed_trials || consumed > request.declared_total_trials {
+        bail!("terminal Campaign trial total differs from reconstructed rounds");
+    }
+    let outcome = if let Some(selected) = selected {
+        if result.termination_reason != "campaign_selected_pre_holdout"
+            || result.selected_round_id.as_deref() != Some(selected.round_id.as_str())
+            || result.selected_candidate_id != selected.selected_candidate_id
+            || result.selected_candidate_content_hash != selected.selected_candidate_content_hash
+        {
+            bail!("terminal Campaign selection differs from its deterministic pre-holdout winner");
+        }
+        CampaignAttemptOutcomeV1::SelectedPreHoldout
+    } else {
+        validate_negative_campaign_result(&loaded, &result, &result_sha256)?;
+        CampaignAttemptOutcomeV1::NoCandidate
+    };
+    Ok((outcome, u64::try_from(consumed)?, result_sha256))
+}
+
+fn terminal_readback_error(error: anyhow::Error) -> anyhow::Error {
+    if let Some(network) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
+    {
+        anyhow::anyhow!(
+            "terminal artifact network readback failed (HTTP {:?})",
+            network.status()
+        )
+    } else {
+        error.context("terminal artifact readback")
+    }
+}
+
+fn validate_campaign_result_identity(
     loaded: &LoadedRequest,
     result: &CampaignResultV1,
     result_sha256: &str,
@@ -2164,6 +2324,15 @@ fn validate_negative_campaign_result(
         bail!("Campaign result learning lineage does not match the parent request");
     }
     normalized_sha256("parent Campaign result", result_sha256)?;
+    Ok(())
+}
+
+fn validate_negative_campaign_result(
+    loaded: &LoadedRequest,
+    result: &CampaignResultV1,
+    result_sha256: &str,
+) -> anyhow::Result<()> {
+    validate_campaign_result_identity(loaded, result, result_sha256)?;
     if result.termination_reason != "campaign_no_candidate"
         || result.selected_round_id.is_some()
         || result.selected_candidate_id.is_some()
@@ -2353,6 +2522,37 @@ pub(crate) fn serialize_request(request: &CampaignRequest) -> anyhow::Result<Vec
 #[cfg(test)]
 pub(crate) fn valid_request_for_tests() -> CampaignRequest {
     tests::valid_request_for_other_modules()
+}
+
+#[cfg(test)]
+pub(crate) fn request_for_materialization_for_tests(path: &Path) -> CampaignRequest {
+    let base = valid_request_for_tests();
+    let materialization =
+        crate::mission_runner::decode_materialization(&std::fs::read(path).unwrap()).unwrap();
+    build_request_from_parts(
+        &base.feature_url,
+        &materialization.artifact_sha256,
+        &base.materialization_url,
+        &crate::mission_runner::sha256_file(path).unwrap(),
+        &base.replay_artifact_url,
+        &base.replay_artifact_sha256,
+        &base.replay_manifest_url,
+        &base.replay_manifest_sha256,
+        &base.campaign_inputs_sha256,
+        &base.producer_source_revision,
+        &base.producer_image_identity,
+        &base.research_plan,
+        BUILD_SOURCE_REVISION,
+        &base.image_identity,
+        &campaign_output_root(
+            &canonical_tokyo_oss_internal_object("test result", &base.campaign_result_readback_url)
+                .unwrap(),
+        )
+        .unwrap(),
+        &base.holdout_id,
+        &[7, 11],
+    )
+    .unwrap()
 }
 
 pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> {
@@ -3088,7 +3288,6 @@ fn validate_local_test_request(request: &CampaignRequest) -> anyhow::Result<()> 
 mod tests {
     use super::*;
     use crate::mission_render;
-    use alpha_domain::CexResearchMissionArtifactV1;
     use parquet::{
         data_type::{ByteArray, ByteArrayType, Int64Type},
         file::{
@@ -4186,7 +4385,7 @@ mod tests {
     #[test]
     fn execute_keeps_profitable_ml_replay_without_legacy_finalization() {
         let fixture = campaign_e2e_fixture("campaign-e2e-ml-positive", false, false, true);
-        execute(fixture.args).unwrap();
+        execute(fixture.args.clone()).unwrap();
 
         let result: serde_json::Value = serde_json::from_slice(
             &std::fs::read(fixture.work_dir.join("campaign-result.json")).unwrap(),
@@ -4203,6 +4402,30 @@ mod tests {
             .is_some_and(|id| id.starts_with("cex-supervised-model-candidate-")));
         assert!(result["finalization"].is_null());
         assert!(!fixture.global_claim_path.exists());
+        let loaded = load_request(&fixture.args.request).unwrap();
+        let materialization = crate::mission_runner::decode_materialization(
+            &std::fs::read(&fixture._render_fixture.materialization_path).unwrap(),
+        )
+        .unwrap();
+        let protocol = crate::mission_render::approved_evaluation_protocol(&materialization)
+            .unwrap()
+            .content_hash()
+            .unwrap();
+        let client = Client::builder().redirect(Policy::none()).build().unwrap();
+        let (outcome, trials, hash) =
+            readback_pre_holdout_terminal(&client, &loaded.request, &loaded.sha256, &protocol)
+                .unwrap();
+        assert_eq!(
+            outcome,
+            alpha_domain::campaign_control::CampaignAttemptOutcomeV1::SelectedPreHoldout
+        );
+        assert_eq!(trials, result["consumed_trials"].as_u64().unwrap());
+        assert_eq!(
+            hash,
+            crate::mission_runner::sha256_file(&fixture.work_dir.join("campaign-result.json"))
+                .unwrap()
+        );
+
         assert!(result["rounds"].as_array().unwrap().iter().all(|round| {
             round["termination_reason"] == "supervised_pre_holdout_candidate_kept"
                 && round["supervised_replay_gate_passed"] == true
@@ -4226,7 +4449,7 @@ mod tests {
     #[test]
     fn execute_negative_campaign_creates_no_claim() {
         let fixture = campaign_e2e_fixture("campaign-e2e-negative", true, false, false);
-        execute(fixture.args).unwrap();
+        execute(fixture.args.clone()).unwrap();
 
         let result: serde_json::Value = serde_json::from_slice(
             &std::fs::read(fixture.work_dir.join("campaign-result.json")).unwrap(),
@@ -4238,6 +4461,71 @@ mod tests {
         }));
         assert!(result["finalization"].is_null());
         assert!(!fixture.global_claim_path.exists());
+        let loaded = load_request(&fixture.args.request).unwrap();
+        let materialization = crate::mission_runner::decode_materialization(
+            &std::fs::read(&fixture._render_fixture.materialization_path).unwrap(),
+        )
+        .unwrap();
+        let protocol = crate::mission_render::approved_evaluation_protocol(&materialization)
+            .unwrap()
+            .content_hash()
+            .unwrap();
+        let client = Client::builder().redirect(Policy::none()).build().unwrap();
+        let (outcome, trials, hash) =
+            readback_pre_holdout_terminal(&client, &loaded.request, &loaded.sha256, &protocol)
+                .unwrap();
+        assert_eq!(
+            outcome,
+            alpha_domain::campaign_control::CampaignAttemptOutcomeV1::NoCandidate
+        );
+        assert_eq!(trials, result["consumed_trials"].as_u64().unwrap());
+        assert_eq!(
+            hash,
+            crate::mission_runner::sha256_file(&fixture.work_dir.join("campaign-result.json"))
+                .unwrap()
+        );
+        let result_path = Path::new(&loaded.request.campaign_result_readback_url);
+        let original = std::fs::read(result_path).unwrap();
+        let mut changed: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        changed["rounds"][0]["consumed_trials"] =
+            serde_json::json!(changed["rounds"][0]["consumed_trials"].as_u64().unwrap() + 1);
+        changed["consumed_trials"] =
+            serde_json::json!(changed["consumed_trials"].as_u64().unwrap() + 1);
+        std::fs::write(result_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert!(
+            readback_pre_holdout_terminal(&client, &loaded.request, &loaded.sha256, &protocol)
+                .is_err(),
+            "self-consistent summary counts cannot replace round artifact evidence"
+        );
+        std::fs::write(result_path, &original).unwrap();
+        let bundle_path = Path::new(&loaded.request.rounds[0].result_readback_url);
+        let original_bundle = std::fs::read(bundle_path).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(bundle_path)
+            .unwrap();
+        let mut archive = zip::ZipWriter::new_append(file).unwrap();
+        archive
+            .start_file(
+                "results/sealed-holdout-receipt.json",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive.write_all(b"{}").unwrap();
+        archive.finish().unwrap();
+        let changed_hash = crate::mission_runner::sha256_file(bundle_path).unwrap();
+        let mut changed: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        changed["rounds"][0]["result_bundle_sha256"] = serde_json::json!(changed_hash);
+        changed["rounds"][0]["result_readback_bundle_sha256"] = serde_json::json!(changed_hash);
+        std::fs::write(result_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert!(
+            readback_pre_holdout_terminal(&client, &loaded.request, &loaded.sha256, &protocol)
+                .is_err(),
+            "a standalone sealed receipt cannot be hidden by omitting the finalization report"
+        );
+        std::fs::write(bundle_path, original_bundle).unwrap();
+        std::fs::write(result_path, original).unwrap();
     }
 
     #[test]
@@ -4360,7 +4648,7 @@ mod tests {
             "mission/{}/admission/mission-readback.json",
             round.round_id
         ));
-        let mission: CexResearchMissionArtifactV1 =
+        let mission: alpha_domain::CexResearchMissionArtifactV1 =
             serde_json::from_slice(&std::fs::read(&mission_readback).unwrap()).unwrap();
         let mission_id = mission.semantic_id().unwrap();
         let mission_sha256 = crate::mission_runner::sha256_file(&mission_readback).unwrap();
@@ -4798,6 +5086,7 @@ mod tests {
             replay_artifact_path,
             replay_manifest_path,
             args: CampaignExecuteArgs {
+                pre_holdout: true,
                 work_dir: work_dir.clone(),
                 campaign_id: request.campaign_id.clone(),
                 image_identity: request.image_identity.clone(),
