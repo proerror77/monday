@@ -1239,6 +1239,75 @@ impl HarnessManifest {
     }
 }
 
+/// Canonical pinned OCI identity shared by inventory producers and dispatch.
+pub fn canonical_image_digest(image: &str) -> Result<String, &'static str> {
+    if image != image.trim() || image.chars().any(char::is_control) {
+        return Err("mission image must not contain surrounding whitespace or control characters");
+    }
+    let (repository, digest) = image
+        .split_once('@')
+        .ok_or("mission image must be pinned by @sha256 digest")?;
+    if digest.is_empty() || digest.contains('@') {
+        return Err("mission image must be pinned by a canonical @sha256 digest");
+    }
+    let digest = digest
+        .strip_prefix("sha256:")
+        .ok_or("mission image must be pinned by @sha256 digest")?;
+    validate_image_repository(repository)?;
+    let digest = digest.trim().to_ascii_lowercase();
+    if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("mission image SHA256 is invalid");
+    }
+    Ok(digest)
+}
+
+fn validate_image_repository(repository: &str) -> Result<(), &'static str> {
+    if repository.is_empty()
+        || repository.starts_with('/')
+        || repository.ends_with('/')
+        || repository.contains("//")
+        || repository.chars().any(char::is_whitespace)
+        || repository.chars().any(|ch| ch.is_ascii_uppercase())
+    {
+        return Err("mission image repository must be a canonical OCI reference");
+    }
+    let segments = repository.split('/').collect::<Vec<_>>();
+    if segments.iter().any(|segment| segment.is_empty()) {
+        return Err("mission image repository must be a canonical OCI reference");
+    }
+    let host_prefix = segments.len() > 1
+        && (segments[0].contains('.') || segments[0].contains(':') || segments[0] == "localhost");
+    if host_prefix && !segments[0].chars().all(is_registry_host_char) {
+        return Err("mission image repository must be a canonical OCI reference");
+    }
+    let name_segments = if host_prefix {
+        &segments[1..]
+    } else {
+        &segments[..]
+    };
+    if name_segments.is_empty()
+        || name_segments
+            .iter()
+            .any(|segment| !is_repository_segment(segment))
+    {
+        return Err("mission image repository must be a canonical OCI reference");
+    }
+    Ok(())
+}
+
+fn is_registry_host_char(ch: char) -> bool {
+    ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | ':' | '-')
+}
+
+fn is_repository_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && !segment.starts_with(['.', '-', '_'])
+        && !segment.ends_with(['.', '-', '_'])
+        && segment.chars().all(|ch| {
+            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-')
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

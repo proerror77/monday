@@ -1127,6 +1127,40 @@ pub fn default_manifest_path(manifest: &DatasetManifest) -> std::path::PathBuf {
         .join(format!("{}.manifest.json", manifest.manifest_id))
 }
 
+/// Prepare immutable input selection for the existing materialization entrypoint.
+pub fn freeze_research_inventory(args: crate::cli::FreezeInventoryArgs) -> anyhow::Result<()> {
+    let request = hft_collector::research_inventory::InventoryRequest {
+        raw_root: args.raw_root,
+        reference_root: args.reference_root,
+        start_received_at_ns: args.start_received_at_ns,
+        end_received_at_ns: args.end_received_at_ns,
+        symbol: args.symbol,
+        source_revision: crate::cli::BUILD_SOURCE_REVISION.to_string(),
+        image_ref: args.image_ref,
+        mission_id: args.mission_id,
+        output_prefix: args.output_prefix,
+        bucket_ms: args.bucket_ms,
+        label_horizon_buckets: args.label_horizon_buckets,
+        top_depth: args.top_depth,
+        max_scan_entries: args.max_scan_entries,
+        max_inputs: args.max_inputs,
+        max_input_bytes: args.max_input_bytes,
+    };
+    let inventory = hft_collector::research_inventory::freeze_inventory(&request)?;
+    let mut output = temporary_output_file(&args.output, ".frozen-inventory-")?;
+    output
+        .as_file_mut()
+        .write_all(inventory.inventory_env.as_bytes())?;
+    output.as_file().sync_all()?;
+    output
+        .persist_noclobber(&args.output)
+        .map_err(|error| error.error)?;
+    if crate::mission_runner::sha256_file(&args.output)? != inventory.inventory_sha256 {
+        bail!("frozen inventory output readback differs");
+    }
+    crate::cli::print_json(&serde_json::json!({"output":args.output,"inventory":inventory}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

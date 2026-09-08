@@ -12,12 +12,15 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use data::binance_market_tape::{
-    market_tape_schema, AggregateTrade, AggregateTradeSummaryBuilder,
-    LobContinuitySummaryBuilder, AGGREGATE_TRADE_SUMMARY_CONTRACT, MARKET_TAPE_SCHEMA_V2,
+    AggregateTrade, AggregateTradeSummaryBuilder, LobContinuitySummaryBuilder,
+    MARKET_TAPE_SCHEMA_V2,
 };
 use data::binance_market_tape_artifact::{
     seal_binance_market_tape_triplet, verify_binance_market_tape_for_strict_gate,
     BinanceMarketTapeTriplet, BinanceMarketTapeTrustAnchor,
+};
+use hft_collector::research_inventory::{
+    declared_symbols, manifest_is_usdm_lob_only, validate_source_manifest,
 };
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -37,9 +40,6 @@ const MAX_SLICE_ROWS: u64 = 10_000_000;
 const MAX_SOURCE_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 const SESSION_ROW_SLACK_BYTES: u64 = 4 * 1024;
 const COMPRESSION_LEVEL: i32 = 3;
-const USDM_LOB_DATASET: &str = "usdm_perpetual_top100_lob";
-const USDM_LOB_DEPTH_ONLY_STREAM_TYPES: [&str; 1] = ["depth@100ms"];
-const USDM_LOB_HISTORICAL_STREAM_TYPES: [&str; 2] = ["depth@100ms", "bookTicker"];
 
 #[derive(Debug, Parser)]
 #[command(
@@ -198,8 +198,8 @@ fn slice_segment(args: &Args) -> Result<SliceReport> {
     let declared = declared_order.iter().cloned().collect::<BTreeSet<_>>();
     let selected = selected_symbols(args.symbols.as_deref(), &declared)?;
 
-    let expected_content_sha256 = required_string(&source_manifest, "sha256", "source manifest")?
-        .to_string();
+    let expected_content_sha256 =
+        required_string(&source_manifest, "sha256", "source manifest")?.to_string();
     let success_bytes = fs::read(&success_path)
         .with_context(|| format!("cannot read success marker {}", success_path.display()))?;
     if success_bytes != format!("{expected_content_sha256}\n").as_bytes() {
@@ -273,8 +273,7 @@ fn slice_segment(args: &Args) -> Result<SliceReport> {
     // slice stays a self-contained segment under the unchanged verifier.
     for build in &mut builds {
         let slice_symbols = build.symbols.iter().cloned().collect::<BTreeSet<_>>();
-        let coverage =
-            rewrite_stream_coverage(&scan.coverage, &source_manifest, &slice_symbols)?;
+        let coverage = rewrite_stream_coverage(&scan.coverage, &source_manifest, &slice_symbols)?;
         let coverage_shards = coverage
             .get("shards")
             .and_then(Value::as_array)
@@ -336,10 +335,7 @@ fn read_source_manifest(path: &Path, data_name: &str) -> Result<(Map<String, Val
     let bytes = fs::read(path)
         .with_context(|| format!("cannot read source manifest {}", path.display()))?;
     if bytes.is_empty() || bytes.len() as u64 > MAX_SOURCE_MANIFEST_BYTES {
-        bail!(
-            "source manifest is not a bounded file: {}",
-            path.display()
-        );
+        bail!("source manifest is not a bounded file: {}", path.display());
     }
     if bytes.last() != Some(&b'\n')
         || bytes[..bytes.len() - 1].contains(&b'\n')
@@ -356,136 +352,6 @@ fn read_source_manifest(path: &Path, data_name: &str) -> Result<(Map<String, Val
         bail!("source manifest file field does not match the segment name");
     }
     Ok((manifest, bytes))
-}
-
-fn declared_symbols(manifest: &Map<String, Value>) -> Result<Vec<String>> {
-    let symbols = manifest
-        .get("symbols")
-        .and_then(Value::as_array)
-        .context("source manifest is missing symbols")?;
-    let declared = symbols
-        .iter()
-        .map(|symbol| {
-            symbol
-                .as_str()
-                .map(str::to_string)
-                .context("source manifest declares a non-string symbol")
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if declared.is_empty()
-        || declared.iter().collect::<BTreeSet<_>>().len() != declared.len()
-        || declared
-            .iter()
-            .any(|symbol| symbol.is_empty() || symbol != &symbol.to_ascii_uppercase())
-    {
-        bail!("source manifest symbols must be non-empty, unique, and uppercase");
-    }
-    Ok(declared)
-}
-
-fn validate_source_manifest(manifest: &Map<String, Value>) -> Result<()> {
-    let schema = required_string(manifest, "schema", "source manifest")?;
-    if !market_tape_schema(schema) {
-        bail!("source manifest schema is not a binance market tape: {schema}");
-    }
-    if schema == MARKET_TAPE_SCHEMA_V2 {
-        let stream_types = manifest
-            .get("stream_types")
-            .and_then(Value::as_array)
-            .context("v2 source manifest is missing stream_types")?;
-        let valid = !stream_types.is_empty()
-            && stream_types
-                .iter()
-                .all(|value| value.as_str().is_some_and(|kind| !kind.is_empty()))
-            && stream_types
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<BTreeSet<_>>()
-                .len()
-                == stream_types.len();
-        if !valid {
-            bail!("v2 source manifest stream types are malformed");
-        }
-    }
-    let requires_trade_contract = !manifest_is_usdm_lob_only(manifest);
-    if requires_trade_contract
-        && manifest
-            .get("trade_summary_contract")
-            .and_then(Value::as_str)
-            != Some(AGGREGATE_TRADE_SUMMARY_CONTRACT)
-    {
-        bail!("source segment is missing the aggregate-trade summary contract");
-    }
-    if !requires_trade_contract
-        && [
-            "trade_representation",
-            "price_surface_derivation",
-            "trade_summary_contract",
-            "trade_summaries",
-        ]
-        .iter()
-        .any(|field| manifest.contains_key(*field))
-    {
-        bail!("USD-M LOB-only source carries trade-summary metadata");
-    }
-    let flags_ok = manifest
-        .get("has_replay_safe_checkpoint")
-        .and_then(Value::as_bool)
-        == Some(true)
-        && manifest.get("all_symbols_bridged").and_then(Value::as_bool) == Some(true)
-        && manifest
-            .get("all_stream_coverage_verified")
-            .and_then(Value::as_bool)
-            == Some(true)
-        && manifest.get("venue_depth_complete").and_then(Value::as_bool) == Some(false);
-    if !flags_ok {
-        bail!("source segment is not a fully replayable market-tape segment");
-    }
-    for field in ["snapshot_only_symbols", "raw_trade_incomplete_symbols"] {
-        // Both fields default to an empty scope when the collector omits them.
-        let empty = manifest
-            .get(field)
-            .and_then(Value::as_array)
-            .is_none_or(Vec::is_empty);
-        if !empty {
-            bail!("source manifest field {field} must be an empty array");
-        }
-    }
-    for field in ["dataset", "shard_id", "date", "hour"] {
-        required_string(manifest, field, "source manifest")?;
-    }
-    if manifest.get("snapshot_limit").and_then(Value::as_u64) == Some(0) {
-        bail!("source manifest snapshot limit must be nonzero");
-    }
-    Ok(())
-}
-
-fn manifest_is_usdm_lob_only(manifest: &Map<String, Value>) -> bool {
-    manifest.get("market").and_then(Value::as_str) == Some("usdm")
-        && manifest.get("dataset").and_then(Value::as_str) == Some(USDM_LOB_DATASET)
-        && manifest
-            .get("schema")
-            .and_then(Value::as_str)
-            == Some(MARKET_TAPE_SCHEMA_V2)
-        && manifest
-            .get("stream_types")
-            .and_then(Value::as_array)
-            .is_some_and(|stream_types| {
-                let declared = stream_types
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<BTreeSet<_>>();
-                declared
-                    == USDM_LOB_DEPTH_ONLY_STREAM_TYPES
-                        .iter()
-                        .copied()
-                        .collect::<BTreeSet<_>>()
-                    || declared
-                        == USDM_LOB_HISTORICAL_STREAM_TYPES
-                            .iter()
-                            .copied()
-                            .collect::<BTreeSet<_>>()
-            })
 }
 
 fn selected_symbols(raw: Option<&str>, declared: &BTreeSet<String>) -> Result<Vec<String>> {
@@ -565,8 +431,7 @@ fn scan_segment(segment: &Path, manifest_bytes: &[u8]) -> Result<SourceScan> {
                 }
             }
             RowAttribution::Symbol(symbol) => {
-                *scan.symbol_bytes.entry(symbol.clone()).or_insert(0) +=
-                    line.len() as u64 + 1;
+                *scan.symbol_bytes.entry(symbol.clone()).or_insert(0) += line.len() as u64 + 1;
                 scan.observed_symbols.insert(symbol);
             }
         }
@@ -658,7 +523,11 @@ fn attribute_row(raw: &Map<String, Value>) -> Result<RowAttribution> {
         "snapshot" | "checkpoint" | "stale_raw_trade" | "stale_book_ticker" => {
             Ok(RowAttribution::Symbol(row_symbol(raw)?))
         }
-        "diff" | "agg_trade" | "raw_trade" | "raw_trade_zero_price" | "book_ticker"
+        "diff"
+        | "agg_trade"
+        | "raw_trade"
+        | "raw_trade_zero_price"
+        | "book_ticker"
         | "force_order" => Ok(RowAttribution::Symbol(frame_symbol(raw)?)),
         _ => bail!("market-tape event {event_type} cannot be sliced"),
     }
@@ -772,16 +641,12 @@ fn rewrite_session_start(
     );
     // Keep the declared shard count aligned with the rewritten coverage
     // evidence: the verifier cross-checks the two when both are present.
-    rewritten.insert(
-        "websocket_shards".to_string(),
-        Value::from(coverage_shards),
-    );
+    rewritten.insert("websocket_shards".to_string(), Value::from(coverage_shards));
     Ok(rewritten)
 }
 
 fn emit_row(build: &mut SliceBuild, raw: &Map<String, Value>, line: Option<&[u8]>) -> Result<()> {
-    let event_type = required_string(raw, "type", "market-tape row")?
-        .to_string();
+    let event_type = required_string(raw, "type", "market-tape row")?.to_string();
     let received_at_ns = raw
         .get("received_at_ns")
         .and_then(Value::as_u64)
@@ -852,9 +717,7 @@ fn plan_slices(
                 "symbol {symbol} alone carries {bytes} decompressed bytes and cannot fit one slice below the seal bound"
             );
         }
-        let target = plans
-            .iter_mut()
-            .find(|plan| plan.1 + bytes <= budget);
+        let target = plans.iter_mut().find(|plan| plan.1 + bytes <= budget);
         match target {
             Some(plan) => {
                 plan.0.push(symbol);
@@ -968,12 +831,10 @@ fn publish_slice(
         manifest: staged_manifest.clone(),
         success: staged_success.clone(),
     };
-    let trust =
-        BinanceMarketTapeTrustAnchor::from_lower_hex(&content_sha256, &manifest_sha256)?;
+    let trust = BinanceMarketTapeTrustAnchor::from_lower_hex(&content_sha256, &manifest_sha256)?;
     let sealed = seal_binance_market_tape_triplet(&triplet, &trust)?;
-    verify_binance_market_tape_for_strict_gate(vec![sealed]).with_context(|| {
-        format!("slice {data_name} failed the strict market-tape gate")
-    })?;
+    verify_binance_market_tape_for_strict_gate(vec![sealed])
+        .with_context(|| format!("slice {data_name} failed the strict market-tape gate"))?;
 
     publish_temp_immutable(&staged_data, &data_path, &content_sha256)?;
     publish_temp_immutable(&staged_manifest, &manifest_path, &manifest_sha256)?;
@@ -1056,7 +917,10 @@ fn slice_manifest(
         Value::Array(vec![]),
     );
     manifest.insert("all_symbols_bridged".to_string(), Value::from(true));
-    manifest.insert("all_stream_coverage_verified".to_string(), Value::from(true));
+    manifest.insert(
+        "all_stream_coverage_verified".to_string(),
+        Value::from(true),
+    );
     manifest.insert("has_replay_safe_checkpoint".to_string(), Value::from(true));
     manifest.insert(
         "start_received_at_ns".to_string(),
@@ -1092,8 +956,8 @@ fn slice_manifest(
 }
 
 fn compress_file(source: &Path, target: &Path) -> Result<()> {
-    let input = File::open(source)
-        .with_context(|| format!("cannot reopen slice {}", source.display()))?;
+    let input =
+        File::open(source).with_context(|| format!("cannot reopen slice {}", source.display()))?;
     let output = File::create(target)
         .with_context(|| format!("cannot create compressed slice {}", target.display()))?;
     let mut encoder = zstd::stream::write::Encoder::new(output, COMPRESSION_LEVEL)
@@ -1105,18 +969,10 @@ fn compress_file(source: &Path, target: &Path) -> Result<()> {
 }
 
 fn canonical_output_dir(path: &Path) -> Result<PathBuf> {
-    fs::create_dir_all(path).with_context(|| {
-        format!(
-            "cannot create slice output directory {}",
-            path.display()
-        )
-    })?;
-    fs::canonicalize(path).with_context(|| {
-        format!(
-            "cannot resolve slice output directory {}",
-            path.display()
-        )
-    })
+    fs::create_dir_all(path)
+        .with_context(|| format!("cannot create slice output directory {}", path.display()))?;
+    fs::canonicalize(path)
+        .with_context(|| format!("cannot resolve slice output directory {}", path.display()))
 }
 
 fn write_staged(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -1156,7 +1012,9 @@ fn publish_temp_immutable(temporary: &Path, path: &Path, expected_sha256: &str) 
 }
 
 fn temporary_file(path: &Path) -> Result<(PathBuf, File)> {
-    let parent = path.parent().context("slice path has no parent directory")?;
+    let parent = path
+        .parent()
+        .context("slice path has no parent directory")?;
     let file_name = file_name(path)?;
     let temporary = tempfile::Builder::new()
         .prefix(&format!(".{file_name}."))
@@ -1177,7 +1035,9 @@ fn sync_file(path: &Path) -> Result<()> {
 }
 
 fn sync_parent_directory(path: &Path) -> Result<()> {
-    let parent = path.parent().context("slice path has no parent directory")?;
+    let parent = path
+        .parent()
+        .context("slice path has no parent directory")?;
     File::open(parent)
         .with_context(|| format!("cannot open slice directory {}", parent.display()))?
         .sync_all()

@@ -1249,7 +1249,20 @@ fn quarantine_recovery_part(
 }
 
 pub fn files_with_suffix(root: &Path, suffix: &str) -> anyhow::Result<Vec<PathBuf>> {
-    fn visit(path: &Path, suffix: &str, files: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+    files_with_suffix_bounded(root, suffix, usize::MAX)
+}
+
+pub fn files_with_suffix_bounded(
+    root: &Path,
+    suffix: &str,
+    max_entries: usize,
+) -> anyhow::Result<Vec<PathBuf>> {
+    fn visit(
+        path: &Path,
+        suffix: &str,
+        files: &mut Vec<PathBuf>,
+        remaining: &mut usize,
+    ) -> anyhow::Result<()> {
         let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1262,6 +1275,9 @@ pub fn files_with_suffix(root: &Path, suffix: &str) -> anyhow::Result<Vec<PathBu
             anyhow::bail!("spool scan root is not a directory: {}", path.display());
         }
         for entry in fs::read_dir(path)? {
+            *remaining = remaining
+                .checked_sub(1)
+                .context("spool scan entry budget exceeded")?;
             let entry = entry?;
             let path = entry.path();
             let file_type = entry.file_type()?;
@@ -1269,7 +1285,7 @@ pub fn files_with_suffix(root: &Path, suffix: &str) -> anyhow::Result<Vec<PathBu
                 anyhow::bail!("refusing symlink while scanning spool: {}", path.display());
             }
             if file_type.is_dir() {
-                visit(&path, suffix, files)?;
+                visit(&path, suffix, files, remaining)?;
             } else if file_type.is_file() && path.to_string_lossy().ends_with(suffix) {
                 files.push(path);
             } else if !file_type.is_file() {
@@ -1282,7 +1298,8 @@ pub fn files_with_suffix(root: &Path, suffix: &str) -> anyhow::Result<Vec<PathBu
         Ok(())
     }
     let mut files = Vec::new();
-    visit(root, suffix, &mut files)?;
+    let mut remaining = max_entries;
+    visit(root, suffix, &mut files, &mut remaining)?;
     files.sort();
     Ok(files)
 }
