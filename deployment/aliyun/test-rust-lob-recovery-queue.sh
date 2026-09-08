@@ -224,15 +224,19 @@ secure_release_identity() {
   RELEASE_SOURCE_REVISION=$(jq -r '.deployment_source_revision' "$CONTROLLER_RELEASE_ROOT/$fixture_active_c/release.json")
 }
 fixture_transition="$DATA_ROOT/monday/evidence/cutovers/$fixture_new_c/transition.json"
-mkdir -p "${fixture_transition%/*}"
+fixture_resume_gate="$DATA_ROOT/monday/evidence/shadow-gates/$fixture_new_c/$fixture_runtime/runs/20260908T000000Z-1/gate.json"
+mkdir -p "${fixture_transition%/*}" "${fixture_resume_gate%/*}"
+jq -cn '{test_only:false,production_eligible:true}' >"$fixture_resume_gate"
+fixture_resume_gate_sha=$(sha256sum "$fixture_resume_gate" | awk '{print $1}')
 jq -cn --arg from "$fixture_old_c" --arg to "$fixture_new_c" \
+  --arg gate "$fixture_resume_gate" --arg gate_sha "$fixture_resume_gate_sha" \
   '{from_controller_sha256:$from,controller_sha256:$to,from_source_mode:"stable",
-    production_eligible:true,test_only:false,result:"success",gate_receipt:"fixture-gate",
-    gate_sha256:"fixture-gate-sha"}' >"$fixture_transition"
+    production_eligible:true,test_only:false,result:"success",gate_receipt:$gate,
+    gate_sha256:$gate_sha}' >"$fixture_transition"
 fixture_transition_sha=$(sha256sum "$fixture_transition" | awk '{print $1}')
 monday_validate_v2_transition() {
   [[ "$1" == "$ROOT_PREFIX" && "$2" == "$fixture_transition" && "$3" == "$fixture_old_c" \
-    && "$4" == "$fixture_new_c" && "$5" == fixture-gate && "$6" == fixture-gate-sha ]] \
+    && "$4" == "$fixture_new_c" && "$5" == "$fixture_resume_gate" && "$6" == "$fixture_resume_gate_sha" ]] \
     && jq -e --arg controller "$fixture_new_c" '.controller_sha256 == $controller' "$2" >/dev/null
 }
 
@@ -372,6 +376,25 @@ expect_rejected wrong-job-hash fixture_resume
 RESUME_JOB_SHA256=$good_job_sha
 RESUME_TRANSITION_SHA256=$(printf '%064d' 998)
 expect_rejected wrong-transition-hash fixture_resume
+RESUME_TRANSITION_SHA256=$fixture_transition_sha
+cp "$fixture_resume_gate" "$fixture/formal-resume-gate.json"
+cp "$fixture_transition" "$fixture/formal-resume-transition.json"
+formal_resume_gate_sha=$fixture_resume_gate_sha
+formal_resume_transition_sha=$fixture_transition_sha
+# Only the Gate's mode changes; update both referenced hashes so rejection is
+# specifically the production/fixture boundary, not a stale digest mismatch.
+jq '.test_only=true | .production_eligible=false' "$fixture/formal-resume-gate.json" >"$fixture_resume_gate"
+fixture_resume_gate_sha=$(sha256sum "$fixture_resume_gate" | awk '{print $1}')
+jq --arg gate_sha "$fixture_resume_gate_sha" '.gate_sha256=$gate_sha' \
+  "$fixture/formal-resume-transition.json" >"$fixture_transition"
+fixture_transition_sha=$(sha256sum "$fixture_transition" | awk '{print $1}')
+RESUME_TRANSITION_SHA256=$fixture_transition_sha
+expect_rejected fixture-gate-in-production-transition fixture_resume
+grep -Fq 'resume requires a production-eligible Gate' "$fixture/rejected.log"
+cp "$fixture/formal-resume-gate.json" "$fixture_resume_gate"
+cp "$fixture/formal-resume-transition.json" "$fixture_transition"
+fixture_resume_gate_sha=$formal_resume_gate_sha
+fixture_transition_sha=$formal_resume_transition_sha
 RESUME_TRANSITION_SHA256=$fixture_transition_sha
 printf '\n' >>"$fixture_job_dir/recovery.env"
 expect_rejected changed-original-env fixture_resume

@@ -2147,10 +2147,13 @@ monday_validate_v2_transition() {
   gate_from=$(jq -er '.from_controller_sha256' "$gate") || return 1
   gate_production_runtime=$(jq -ce '.production_runtime' "$gate") || return 1
   controller_projection_keys=$(monday_controller_projection_assets | jq -Rsc 'split("\n") | map(select(length > 0)) | sort') || return 1
+  # Capture the receipt's mode before inspecting nested objects.  A scheduler
+  # object's fields cannot turn production checks into fixture exceptions.
   jq -e --arg from "$from" --arg to "$to" --arg gate "$gate" --arg gate_sha "$gate_sha" \
     --arg gate_from "$gate_from" --arg payload "$gate_payload" --arg runtime "$gate_runtime" \
     --argjson controller_projection_keys "$controller_projection_keys" \
     --argjson pair_asset_keys "$pair_asset_keys" '
+    .test_only as $test_only |
     .schema == "monday.rust_lob_pair_transition.v2"
     and .control_plane_version == 2
     and .operation == "cutover"
@@ -2167,15 +2170,15 @@ monday_validate_v2_transition() {
     and .gate_receipt == $gate
     and .gate_sha256 == $gate_sha
     and (.test_only | type == "boolean")
-    and (if .test_only then .production_eligible == false else .production_eligible == true end)
+    and (if $test_only then .production_eligible == false else .production_eligible == true end)
     and (.production_runtime | type == "object")
     and (.production_process | type == "object")
     and (.recovery_schedulers | type == "object"
-      and (if .test_only then true else (keys | sort) == ["spot", "usdm"] end)
-      and (if .test_only then true else all(.[];
+      and (if $test_only then true else (keys | sort) == ["spot", "usdm"] end)
+      and (if $test_only then true else all(.[];
         .active == true and .enabled == true
         and (.unit | type == "string" and test("^binance-lob-archiver-recovery@(spot|usdm)\\.timer$"))) end))
-    and (if .test_only then
+    and (if $test_only then
       (.production_process == {} or
        ((.production_process | keys | sort) == ["spot", "usdm"]
         and all(.production_process[];

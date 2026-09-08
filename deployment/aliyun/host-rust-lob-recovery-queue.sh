@@ -869,6 +869,9 @@ validate_resume_authority() {
     and .test_only == false and .result == "success"' \
     "$RESUME_TRANSITION_RECEIPT" >/dev/null \
     || fail 'resume requires a committed production controller transition'
+  secure_regular_file "$gate" 0
+  jq -e '.test_only == false and .production_eligible == true' "$gate" >/dev/null \
+    || fail 'resume requires a production-eligible Gate, not a fixture Gate'
   monday_validate_v2_transition "$ROOT_PREFIX" "$RESUME_TRANSITION_RECEIPT" \
     "$transition_from" "$RESUME_CONTROLLER" "$gate" "$gate_sha" \
     || fail 'resume target transition failed the authoritative Gate-chain validation'
