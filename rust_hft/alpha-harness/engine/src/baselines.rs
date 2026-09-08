@@ -937,8 +937,8 @@ fn fit_burn_fold(fit: CexBurnFoldFit<'_>) -> Result<(CexBaselineModelV1, Vec<f64
         .checked_mul(2)
         .and_then(|rows| rows.checked_sub(1))
         .ok_or("Burn MLP training gap overflowed")?;
-    let extra_purge_rows = required_gap_rows
-        .saturating_sub(fold.validation.start.saturating_sub(fold.train.end));
+    let extra_purge_rows =
+        required_gap_rows.saturating_sub(fold.validation.start.saturating_sub(fold.train.end));
     let training_end = fold.train.end.saturating_sub(extra_purge_rows);
     let mut training_rows = Vec::with_capacity(training_end.saturating_sub(fold.train.start));
     for index in fold.train.start..training_end {
