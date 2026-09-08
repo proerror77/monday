@@ -6,7 +6,10 @@
 
 mod state;
 
-use super::approval_revocations::{insert_revocation_evidence, ApprovalRevocationV1};
+use super::approval_revocations::{
+    insert_revocation_evidence, read_effective_approval, read_revocation_evidence,
+    serialize_approval_mutation, ApprovalRevocationV1,
+};
 use super::{
     append_journal, authentication_tag, database_error, decode_authenticated, encoded,
     read_json_row_with_hash, verify_authentication_tag, AlphaStore, ApprovalRecord, StoreError,
@@ -462,19 +465,26 @@ impl AlphaStore {
         at: DateTime<Utc>,
     ) -> Result<AuthenticatedCampaignReceiptV1, StoreError> {
         verified.validate_active_at(at).map_err(err)?;
-        let (approval, hash) = self.get_approval_evidence(approval_id)?;
-        if !self.get_approval(approval_id)?.is_active_at(at) {
+        let tx = self.connection.transaction().map_err(database_error)?;
+        // Share the revocation writer's guard before reading the approval snapshot.
+        // A losing writer retries the entire operation with a fresh transaction.
+        serialize_approval_mutation(&tx, approval_id)?;
+        let (approval, hash) = read_json_row_with_hash(
+            &tx,
+            "SELECT payload_json, content_hash FROM approvals WHERE approval_id = ?",
+            approval_id,
+        )?;
+        if !read_effective_approval(&tx, &self.integrity_key, approval_id)?.is_active_at(at) {
             return Err(err("root approval is not active"));
         }
         validate_approval(&approval, &hash, verified, at)?;
-        let revocation = self.get_approval_revocation(approval_id)?;
+        let revocation = read_revocation_evidence(&tx, &self.integrity_key, approval_id)?;
         let event = CampaignLedgerEventV1::RootRegistered {
             signed: Box::new(verified.signed_grant().clone()),
             verifying_key_hex: hex::encode(verified.verifying_key().as_bytes()),
             approval,
             approval_content_sha256: hash,
         };
-        let tx = self.connection.transaction().map_err(database_error)?;
         let receipt = append(
             &tx,
             &self.integrity_key,
@@ -948,6 +958,33 @@ mod tests {
             .register_campaign_root(&verified, APPROVAL, t0())
             .unwrap();
         (store, verified)
+    }
+
+    #[test]
+    fn root_registration_conflicts_with_inflight_approval_revocation() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        let verified = verify(grant("root-1"));
+        store
+            .record_approval(&approval(&verified, APPROVAL))
+            .unwrap();
+        let mut other = store.connection.try_clone().unwrap();
+        // Establish the shared guard before either writer starts its transaction.
+        let tx = other.transaction().unwrap();
+        super::super::approval_revocations::serialize_approval_mutation(&tx, APPROVAL).unwrap();
+        tx.commit().unwrap();
+        let tx = other.transaction().unwrap();
+        super::super::approval_revocations::serialize_approval_mutation(&tx, APPROVAL).unwrap();
+        assert!(
+            store
+                .register_campaign_root(&verified, APPROVAL, t0())
+                .is_err(),
+            "registration must not commit while revocation owns the approval guard"
+        );
+        tx.rollback().unwrap();
+        assert!(store.campaign_family_receipts(FAMILY).unwrap().is_empty());
+        store
+            .register_campaign_root(&verified, APPROVAL, t0())
+            .unwrap();
     }
 
     fn kinds(receipts: &[AuthenticatedCampaignReceiptV1]) -> Vec<&'static str> {
