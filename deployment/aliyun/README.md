@@ -1069,9 +1069,14 @@ template remains at 1792MiB/2048MiB and is narrowed by that run-scoped parent
 slice when rendered.
 Five immutable passed Tokyo gates measured Spot at no more than 664,735,744 bytes
 and the former 570-symbol USD-M scope at no more than 1,789,218,816 bytes; the
-current USD-M Gate covers only the frozen Top 100. Strict readback uses the
-same 1280MiB/1536MiB worker envelope and candidate upload drain uses a
-384MiB/512MiB envelope. Before the Gate and before every actual phase, it reads
+current USD-M Gate covers only the frozen Top 100. After each Shadow has stopped
+and is confirmed inactive, its LOB, aggregate-trade and raw-trade strict
+verifiers run sequentially with a 640MiB high watermark and 768MiB hard limit.
+The strict phase's admission budget and actual systemd worker limit use the
+same byte constant. Preflight and Shadow capture continue to reserve 1536MiB;
+the shared Gate slice remains at 1280MiB/1536MiB. Candidate upload drain and
+OSS readback retain their 384MiB/512MiB envelopes. Before the Gate and before
+every actual phase, it reads
 `MemAvailable` together with the production template's automatically assigned
 `Slice` and cgroup. Spot and USD-M must share one slice; the parent control
 group is `/system.slice/<Slice>` and their two cgroups must be direct children
@@ -1101,7 +1106,10 @@ Gate receipt stores the exact per-phase current/sum/growth/reserve/limit/require
 values and the production cgroup snapshot; `MemoryPeak` is audit-only, while
 `memory.events` must show no new `oom` or `oom_kill` counter. An over-limit or
 malformed phase fails closed instead of increasing the host size or weakening
-the reserve.
+the reserve. A failed admission writes its two available-memory samples,
+conservative available value, computed requirement, phase limit, host reserve,
+production anonymous usage and production growth budget to stderr before
+exiting; it does not create a passed resource sample.
 The direct bootstrap Gate records the unlimited legacy slice and the signed
 candidate limit separately. Cutover installs the signed slice, clears any
 legacy runtime override, and verifies it before either candidate lane starts;

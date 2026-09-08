@@ -182,6 +182,130 @@ grep -Fq "observation_finished_ns=\$observation_sampled_ns" \
 grep -Fq "write_run_json || die 'could not commit deadline failure run evidence'" \
   <<<"$gate_observation_source"
 
+# Strict worker launch must enforce the same smaller budget its phase admits.
+# Run the real production function with only systemd-run replaced: the fixture
+# early return cannot prove the properties passed to an actual worker.
+# shellcheck disable=SC2034 # Variables are consumed by the dynamically loaded production function.
+(
+  strict_gate_source="$SCRIPT_DIR/host-rust-lob-shadow-gate.sh"
+  strict_verifier_source=$(sed -n '/^run_strict_verifier() {$/,/^}$/p' "$strict_gate_source")
+  [[ -n $strict_verifier_source ]]
+  eval "$strict_verifier_source"
+  STRICT_VERIFIER_MEMORY_MAX_BYTES=$(sed -n 's/^readonly STRICT_VERIFIER_MEMORY_MAX_BYTES=//p' "$strict_gate_source")
+  STRICT_VERIFIER_MEMORY_HIGH_BYTES=$(sed -n 's/^readonly STRICT_VERIFIER_MEMORY_HIGH_BYTES=//p' "$strict_gate_source")
+  TRANSIENT_WORK_TIMEOUT_SECONDS=$transient_work_timeout_seconds
+  TEST_ONLY=false
+  strict_unit_seq=0
+  run_id=20260908T000000Z-1
+  GATE_UNIT_PREFIX=monday-rust-lob-gate-
+  GATE_WORKER_SLICE=mondaylobgate20260908T000000Z1.slice
+  SERVICE_USER=hftcollector
+  candidate_binary="$ROOT/strict-launch-candidate"
+  strict_segment="$ROOT/strict-launch-segment.jsonl.zst"
+  declare -a strict_invocation=()
+  # shellcheck disable=SC2317,SC2329 # Invoked by the extracted production function.
+  systemd-run() { strict_invocation=("$@"); }
+  for strict_mode in --require-lob-continuity --verify-aggregate-trade-continuity --verify-raw-trade-continuity; do
+    strict_invocation=()
+    run_strict_verifier "$strict_mode" --verify-segment "$strict_segment"
+    strict_max='' strict_high='' strict_slice='' strict_unit=''
+    strict_max_count=0 strict_high_count=0 strict_slice_count=0
+    for strict_argument in "${strict_invocation[@]}"; do
+      case "$strict_argument" in
+        --property=MemoryMax=*) strict_max=${strict_argument#--property=MemoryMax=}; strict_max_count=$((strict_max_count + 1)) ;;
+        --property=MemoryHigh=*) strict_high=${strict_argument#--property=MemoryHigh=}; strict_high_count=$((strict_high_count + 1)) ;;
+        --slice=*) strict_slice=${strict_argument#--slice=}; strict_slice_count=$((strict_slice_count + 1)) ;;
+        --unit=*) strict_unit=${strict_argument#--unit=} ;;
+      esac
+    done
+    [[ $strict_max == 805306368 && $strict_high == 671088640 \
+      && $strict_max == "$STRICT_VERIFIER_MEMORY_MAX_BYTES" \
+      && $strict_high == "$STRICT_VERIFIER_MEMORY_HIGH_BYTES" \
+      && $strict_max_count == 1 && $strict_high_count == 1 && $strict_slice_count == 1 \
+      && $strict_slice == "$GATE_WORKER_SLICE" \
+      && $strict_unit == "${GATE_UNIT_PREFIX}${run_id}-strict-${strict_unit_seq}.service" ]] || {
+      printf 'strict worker %s budget/slice mismatch: MemoryMax=%s MemoryHigh=%s slice=%s\n' \
+        "$strict_mode" "$strict_max" "$strict_high" "$strict_slice" >&2
+      exit 1
+    }
+    (( strict_high <= strict_max ))
+    strict_tail=$(( ${#strict_invocation[@]} - 5 ))
+    [[ ${strict_invocation[$strict_tail]} == -- \
+      && ${strict_invocation[$((strict_tail + 1))]} == "$candidate_binary" \
+      && ${strict_invocation[$((strict_tail + 2))]} == "$strict_mode" \
+      && ${strict_invocation[$((strict_tail + 3))]} == --verify-segment \
+      && ${strict_invocation[$((strict_tail + 4))]} == "$strict_segment" ]]
+  done
+  [[ $strict_unit_seq == 3 ]]
+)
+
+# Failed admission must retain the actual before/after samples and budget inputs
+# in diagnostics, without turning a below-budget host into a permitted phase.
+# shellcheck disable=SC2034 # Variables are consumed by the dynamically loaded production function.
+(
+  admission_gate_source="$SCRIPT_DIR/host-rust-lob-shadow-gate.sh"
+  admission_record_source=$(sed -n '/^record_resource() {$/,/^}$/p' "$admission_gate_source")
+  admission_die_source=$(sed -n '/^die() {.*}$/p' "$admission_gate_source")
+  [[ -n $admission_record_source && -n $admission_die_source ]]
+  eval "$admission_record_source"
+  eval "$admission_die_source"
+  HOST_MEMORY_RESERVE_BYTES=1073741824
+  diagnostic_phase_max=805306368
+  diagnostic_parent_anon=268435456
+  diagnostic_target_max=3758096384
+  diagnostic_growth=$((diagnostic_target_max - diagnostic_parent_anon))
+  diagnostic_required=$((diagnostic_phase_max + HOST_MEMORY_RESERVE_BYTES + diagnostic_growth))
+  # shellcheck disable=SC2317,SC2329 # Invoked by the extracted production function.
+  meminfo_bytes() {
+    [[ $1 == MemAvailable ]] || return 1
+    printf '%s\n' "$diagnostic_available_sample"
+  }
+  # shellcheck disable=SC2317,SC2329 # Invoked by the extracted production function.
+  refresh_production_snapshot() {
+    diagnostic_available_sample=$diagnostic_available_after
+    production_parent_anon=$diagnostic_parent_anon
+    production_target_slice_memory_max=$diagnostic_target_max
+    production_growth=$diagnostic_growth
+  }
+  for diagnostic_low_sample in before after; do
+    diagnostic_available_before=$((diagnostic_required + 1))
+    diagnostic_available_after=$((diagnostic_required - 1))
+    if [[ $diagnostic_low_sample == before ]]; then
+      diagnostic_available_before=$((diagnostic_required - 1))
+      diagnostic_available_after=$((diagnostic_required + 1))
+    fi
+    diagnostic_available_sample=$diagnostic_available_before
+    diagnostic_log="$ROOT/admission-failure-$diagnostic_low_sample.log"
+    if (record_resource strict-verifier-spot "$diagnostic_phase_max") >"$diagnostic_log" 2>&1; then
+      printf 'phase admission accepted insufficient %s-refresh memory\n' "$diagnostic_low_sample" >&2
+      exit 1
+    fi
+    diagnostic_line=$(grep '^event=memory-admission-failed ' "$diagnostic_log") || {
+      cat "$diagnostic_log" >&2
+      printf 'failed phase admission omitted its numeric diagnostic\n' >&2
+      exit 1
+    }
+    for diagnostic_field in \
+      event=memory-admission-failed phase=strict-verifier-spot \
+      "available_before_bytes=$diagnostic_available_before" \
+      "available_after_bytes=$diagnostic_available_after" \
+      "available_bytes=$((diagnostic_required - 1))" \
+      "required_bytes=$diagnostic_required" \
+      "phase_memory_max_bytes=$diagnostic_phase_max" \
+      "host_memory_reserve_bytes=$HOST_MEMORY_RESERVE_BYTES" \
+      "production_parent_memory_anon_bytes=$diagnostic_parent_anon" \
+      "target_production_slice_memory_max_bytes=$diagnostic_target_max" \
+      "production_memory_growth_bytes=$diagnostic_growth"; do
+      [[ " $diagnostic_line " == *" $diagnostic_field "* ]] || {
+        printf 'failed phase admission diagnostic omitted actual %s: %s\n' \
+          "$diagnostic_field" "$diagnostic_line" >&2
+        exit 1
+      }
+    done
+    grep -Fq 'shadow gate failed: insufficient memory for strict-verifier-spot' "$diagnostic_log"
+  done
+)
+
 # Resource Envelope V2 reserves the production slice's unallocated aggregate
 # cap from parent memory.stat anon.  File cache and memory.current remain audit
 # fields and must not reduce the required budget a second time.
@@ -1540,9 +1664,20 @@ oss_source=$(sed -n '/^run_oss()/,/^verify_oss_roundtrips()/p' \
 grep -Fq 'systemd-run --quiet --pipe --wait --collect' <<<"$oss_source"
 grep -Fq -- "--slice=\"\$GATE_WORKER_SLICE\"" <<<"$oss_source"
 grep -Fq -- '--property=MemoryMax=512M' <<<"$oss_source"
-jq -e 'all(.resource_admission[];
+jq -e '
+  {preflight:1610612736,"shadow-spot":1610612736,"shadow-usdm":1610612736,
+   "strict-verifier-spot":805306368,"strict-verifier-usdm":805306368,
+   "upload-drain-spot":536870912,"upload-drain-usdm":536870912,
+   "oss-readback-spot":536870912,"oss-readback-usdm":536870912} as $expected
+  | (.resource_admission | length) == 9
+  and ([.resource_admission[].phase] | sort) == ($expected | keys | sort)
+  and all(.resource_admission[]; .phase_memory_max_bytes == $expected[.phase])
+  and .shadow_staging.aggregate_slice.memory_high_bytes == 1342177280
+  and .shadow_staging.aggregate_slice.memory_max_bytes == 1610612736
+  and all(.resource_admission[];
   .required_bytes == (.phase_memory_max_bytes + .host_memory_reserve_bytes + .production_memory_growth_bytes)
   and .production_memory_growth_bytes == (.target_production_slice_memory_max_bytes - .production_parent_memory_anon_bytes)
+  and .target_production_slice_memory_max_bytes == 3758096384
   and .host_memory_reserve_bytes == 1073741824
   and .host_memory_available_bytes >= .required_bytes
   and (has("production_memory_growth_headroom_bytes") | not))' "$gate" >/dev/null
@@ -1563,6 +1698,27 @@ if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$tampered" >/dev/null 
   printf 'Gate policy accepted a phase requirement below phase max plus reserve\n' >&2
   exit 1
 fi
+for strict_phase in strict-verifier-spot strict-verifier-usdm; do
+  for strict_tampered_max in 805306367 1610612736; do
+    tampered="$ROOT/tampered-$strict_phase-$strict_tampered_max.json"
+    jq --arg phase "$strict_phase" --argjson maximum "$strict_tampered_max" '
+      (.resource_admission[] | select(.phase == $phase)) |=
+        (.phase_memory_max_bytes = $maximum
+         | .required_bytes = ($maximum + .host_memory_reserve_bytes + .production_memory_growth_bytes))' \
+      "$gate" >"$tampered"
+    tampered_sha=$(monday_sha256_file "$tampered")
+    if monday_validate_v2_gate "$tampered" direct "$c0" "$tampered_sha"; then
+      printf 'Gate validator accepted %s memory maximum %s despite a consistent requirement\n' \
+        "$strict_phase" "$strict_tampered_max" >&2
+      exit 1
+    fi
+    if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$tampered" >/dev/null 2>&1; then
+      printf 'Gate policy accepted %s memory maximum %s despite a consistent requirement\n' \
+        "$strict_phase" "$strict_tampered_max" >&2
+      exit 1
+    fi
+  done
+done
 tampered="$ROOT/tampered-segment-identity.json"
 tampered_data_sha=$(printf 'f%.0s' {1..64})
 jq --arg sha "$tampered_data_sha" '
