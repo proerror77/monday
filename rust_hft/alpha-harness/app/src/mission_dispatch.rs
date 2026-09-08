@@ -1,6 +1,6 @@
 mod admission;
-pub(crate) mod final_authority;
 pub(crate) mod controller;
+pub(crate) mod final_authority;
 mod terminal;
 
 use crate::{
