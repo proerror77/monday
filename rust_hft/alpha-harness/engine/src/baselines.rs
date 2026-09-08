@@ -929,8 +929,19 @@ fn fit_burn_fold(fit: CexBurnFoldFit<'_>) -> Result<(CexBaselineModelV1, Vec<f64
     if horizon_ms <= 0 {
         return Err("Burn MLP label horizon must be positive".to_string());
     }
-    let mut training_rows = Vec::with_capacity(fold.train.end.saturating_sub(fold.train.start));
-    for index in fold.train.clone() {
+    // Burn requires a full horizon after the last training label matures.
+    // A protocol may purge only one horizon, so reserve the remaining rows
+    // inside its training range instead of inventing a later validation time.
+    let required_gap_rows = horizon
+        .horizon_buckets
+        .checked_mul(2)
+        .and_then(|rows| rows.checked_sub(1))
+        .ok_or("Burn MLP training gap overflowed")?;
+    let extra_purge_rows = required_gap_rows
+        .saturating_sub(fold.validation.start.saturating_sub(fold.train.end));
+    let training_end = fold.train.end.saturating_sub(extra_purge_rows);
+    let mut training_rows = Vec::with_capacity(training_end.saturating_sub(fold.train.start));
+    for index in fold.train.start..training_end {
         let observed_at_ms = timestamp_ms(rows[index].available_time)?;
         let label_available_at_ms = timestamp_ms(rows[index].label_available_time)?;
         let feature_row = features[index]
@@ -1737,5 +1748,45 @@ mod tests {
             left_model,
             CexBaselineModelV1::BurnMlp { row_count: 12, .. }
         ));
+
+        let mut multi_step_rows = rows.clone();
+        for row in &mut multi_step_rows {
+            row.label_available_time = row.available_time + chrono::Duration::seconds(5);
+        }
+        let multi_step_fold = WalkForwardFold {
+            train: 0..12,
+            purge: 12..17,
+            validation: 17..20,
+            embargo: 20..20,
+        };
+        let multi_step_horizon = EvaluationLabelSpecV1 {
+            horizon_buckets: 5,
+            observation_frequency_millis: 1_000,
+        };
+        let fit_multi_step = |rows: &[ResearchRow]| {
+            fit_burn_fold(CexBurnFoldFit {
+                rows,
+                features: &features,
+                fold: &multi_step_fold,
+                fold_index: 1,
+                mission_id: "cex-mission-burn",
+                identity,
+                factor_ids: &factor_ids,
+                horizon: &multi_step_horizon,
+                evaluation_policy_sha256: &evaluation_sha,
+                dataset_sha256: &dataset_sha,
+            })
+        };
+        let (multi_model, predictions) = fit_multi_step(&multi_step_rows).unwrap();
+        assert_eq!(predictions.len(), 3);
+        assert!(matches!(
+            multi_model,
+            CexBaselineModelV1::BurnMlp { row_count: 8, .. }
+        ));
+        // These labels fall inside Burn's extra embargo and must not be fitted.
+        for row in &mut multi_step_rows[8..12] {
+            row.label = 9.9;
+        }
+        assert_eq!(fit_multi_step(&multi_step_rows).unwrap().0, multi_model);
     }
 }
