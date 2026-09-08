@@ -16,6 +16,7 @@ pub mod sharding;
 pub mod system_builder;
 
 // Re-export main types for convenient access
+#[cfg(feature = "infra-ipc")]
 pub use ipc_handler::*;
 pub use portfolio_manager::*;
 pub use risk_manager_factory::*;

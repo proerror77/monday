@@ -326,7 +326,7 @@ fn verify_input(
         .to_str()
         .context("inventory path must be UTF-8")?
         .to_string();
-    if !safe_value(&relative) {
+    if !safe_value(&relative) || relative.contains("..") {
         bail!("inventory path cannot be represented safely in frozen.env");
     }
     Ok(FrozenInput {
@@ -346,6 +346,12 @@ pub fn freeze_inventory(request: &InventoryRequest) -> Result<FrozenInventory> {
             .context("inventory wall clock is out of range")?,
     )?;
     if request.end_received_at_ns > now
+        || request.output_prefix.contains("..")
+        || request.output_prefix == "research/cex-materialization"
+        || request
+            .output_prefix
+            .starts_with("research/cex-materialization/")
+        || hft_research_manifest::canonical_image_digest(&request.image_ref).is_err()
         || Path::new(&request.output_prefix)
             .components()
             .any(|component| !matches!(component, std::path::Component::Normal(_)))
@@ -396,7 +402,13 @@ pub fn freeze_inventory(request: &InventoryRequest) -> Result<FrozenInventory> {
     let mut raw = Vec::new();
     for path in raw_manifests {
         let (manifest, sha) = read_manifest(&raw_root, &path)?;
-        if manifest.get("market").and_then(Value::as_str) != Some("usdm") {
+        if manifest.get("market").and_then(Value::as_str) != Some("usdm")
+            || manifest.get("venue").and_then(Value::as_str) != Some("binance")
+            || !manifest
+                .get("schema")
+                .and_then(Value::as_str)
+                .is_some_and(market_tape_schema)
+        {
             continue;
         }
         if !declared_symbols(&manifest)?.contains(&request.symbol) {
@@ -411,9 +423,6 @@ pub fn freeze_inventory(request: &InventoryRequest) -> Result<FrozenInventory> {
             bail!("inventory raw interval is reversed");
         }
         validate_source_manifest(&manifest)?;
-        if manifest.get("venue").and_then(Value::as_str) != Some("binance") {
-            bail!("inventory source venue differs");
-        }
         if raw.len() >= request.max_inputs {
             bail!("inventory input count budget exceeded");
         }
@@ -444,6 +453,17 @@ pub fn freeze_inventory(request: &InventoryRequest) -> Result<FrozenInventory> {
         .map(|input| input.end_received_at_ns)
         .max()
         .unwrap();
+    // Reference batches close a coverage interval; the last usable batch can
+    // arrive after the final raw event and its label horizon. Discovery remains
+    // bounded by the PIT cadence cap, byte/count budgets and the current clock.
+    let reference_tail = request
+        .bucket_ms
+        .checked_mul(request.label_horizon_buckets)
+        .and_then(|millis| millis.checked_mul(1_000_000))
+        .and_then(|horizon| last.checked_add(horizon))
+        .and_then(|end| end.checked_add(hft_research_manifest::CEX_DERIVATIVES_MAX_GAP_NS))
+        .context("inventory reference tail overflows the supported clock")?
+        .min(now);
     let mut references = Vec::new();
     for path in reference_manifests {
         let (manifest, sha) = read_manifest(&reference_root, &path)?;
@@ -454,12 +474,9 @@ pub fn freeze_inventory(request: &InventoryRequest) -> Result<FrozenInventory> {
         }
         let observed = uint(&manifest, "observed_at_ns")?;
         if observed < first.saturating_sub(hft_research_manifest::CEX_DERIVATIVES_MAX_GAP_NS)
-            || observed > last
+            || observed > reference_tail
         {
             continue;
-        }
-        if raw.len() + references.len() >= request.max_inputs {
-            bail!("inventory input count budget exceeded");
         }
         let input = verify_input(
             &reference_root,
@@ -491,7 +508,10 @@ pub fn freeze_inventory(request: &InventoryRequest) -> Result<FrozenInventory> {
             .iter()
             .any(|contract| contract.symbol == request.symbol)
         {
-            bail!("reference batch does not cover the selected symbol");
+            continue;
+        }
+        if raw.len() + references.len() >= request.max_inputs {
+            bail!("inventory input count budget exceeded");
         }
         references.push(input);
     }
@@ -665,6 +685,129 @@ mod tests {
                 max_input_bytes: 1_000_000,
             },
         )
+    }
+
+    fn extra_reference(request: &InventoryRequest, symbol: &str, offset_ns: u64) {
+        let path = files_with_suffix_bounded(&request.reference_root, ".manifest.json", 100)
+            .unwrap()
+            .remove(0);
+        let (manifest, hash) = read_manifest(&request.reference_root, &path).unwrap();
+        let data_path = path.with_file_name(manifest["file"].as_str().unwrap());
+        let sha = manifest["sha256"].as_str().unwrap().to_string();
+        let artifact = PublishedReferenceArtifact {
+            data_path: data_path.clone(),
+            manifest_path: path,
+            success_path: data_path.with_file_name(format!(
+                "{}._SUCCESS",
+                data_path.file_name().unwrap().to_str().unwrap()
+            )),
+            data_sha256: sha.clone(),
+            manifest_sha256: hash.clone(),
+        };
+        let original =
+            verify_reference_artifact_read_only_current_batch(&artifact, &sha, &hash).unwrap();
+        let mut contracts = original.contracts().to_vec();
+        let mut marks = original.mark_index_funding().to_vec();
+        let mut interest = original.open_interest().to_vec();
+        for row in &mut contracts {
+            row.symbol = symbol.into();
+            row.pair = symbol.into();
+            row.source_time_ms += offset_ns / 1_000_000;
+            row.source_clock_received_at_ns += offset_ns;
+            row.received_at_ns += offset_ns;
+        }
+        for row in &mut marks {
+            row.symbol = symbol.into();
+            row.source_time_ms += offset_ns / 1_000_000;
+            row.received_at_ns += offset_ns;
+            row.next_funding_time_ms += offset_ns / 1_000_000;
+        }
+        for row in &mut interest {
+            row.symbol = symbol.into();
+            row.source_time_ms += offset_ns / 1_000_000;
+            row.received_at_ns += offset_ns;
+        }
+        let batch = CompleteReferenceBatch::new(contracts, marks, interest).unwrap();
+        publish_reference_batch(
+            &ReferenceArtifactConfig {
+                output_root: request.reference_root.clone(),
+                observed_at_ns: RECEIVED_NS + 100 + offset_ns,
+                max_staleness_ms: 1000,
+            },
+            OFFICIAL_USDM_SOURCE_ORIGIN,
+            &batch,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn freeze_keeps_reference_tail_for_label_availability() {
+        let (_directory, request) = fixture();
+        extra_reference(&request, "BTCUSDT", 6_000_000_000);
+        extra_reference(&request, "BTCUSDT", 100_000_000_000);
+        let frozen = freeze_inventory(&request).unwrap();
+        assert_eq!(
+            frozen.references.len(),
+            2,
+            "a batch after the raw tail must cover the last label horizon"
+        );
+        assert!(
+            frozen.references.last().unwrap().end_received_at_ns
+                > frozen.raw.last().unwrap().end_received_at_ns + 5_000_000_000
+        );
+    }
+
+    #[test]
+    fn freeze_skips_unrelated_reference_symbols() {
+        let (_directory, mut request) = fixture();
+        extra_reference(&request, "ETHUSDT", 500);
+        request.max_inputs = 2;
+        let frozen = freeze_inventory(&request).unwrap();
+        assert_eq!(frozen.raw.len(), 1);
+        assert_eq!(frozen.references.len(), 1);
+        let original = files_with_suffix_bounded(&request.reference_root, ".manifest.json", 100)
+            .unwrap()
+            .remove(0);
+        fs::remove_dir_all(original.parent().unwrap()).unwrap();
+        assert!(freeze_inventory(&request)
+            .unwrap_err()
+            .to_string()
+            .contains("no eligible reference"));
+    }
+
+    #[test]
+    fn freeze_skips_non_tape_manifests_before_symbol_parsing() {
+        let (_directory, request) = fixture();
+        fs::write(request.raw_root.join("account.manifest.json"), serde_json::to_vec(&json!({"schema": "binance.usdm_account.v1", "market": "usdm", "venue": "binance", "dataset": "account"})).unwrap()).unwrap();
+        assert_eq!(freeze_inventory(&request).unwrap().raw.len(), 1);
+    }
+
+    #[test]
+    fn freeze_rejects_output_prefixes_rejected_by_consumers() {
+        let (_directory, request) = fixture();
+        for prefix in [
+            "study..v2/run",
+            "research/cex-materialization",
+            "research/cex-materialization/run",
+        ] {
+            let mut changed = request.clone();
+            changed.output_prefix = prefix.into();
+            assert!(freeze_inventory(&changed).is_err(), "{prefix}");
+        }
+    }
+
+    #[test]
+    fn freeze_rejects_noncanonical_consumer_image_references() {
+        let (_directory, request) = fixture();
+        for image in [
+            format!("repo@sha256:extra@sha256:{}", "b".repeat(64)),
+            format!("Registry/runner@sha256:{}", "b".repeat(64)),
+            format!("repo//runner@sha256:{}", "b".repeat(64)),
+        ] {
+            let mut changed = request.clone();
+            changed.image_ref = image.clone();
+            assert!(freeze_inventory(&changed).is_err(), "{image}");
+        }
     }
 
     #[test]
