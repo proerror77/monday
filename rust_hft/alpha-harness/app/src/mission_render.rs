@@ -40,8 +40,13 @@ const PURGE_ROWS: usize = 10;
 // Keep the last validation label strictly before the sealed holdout.
 const EMBARGO_ROWS: usize = 5;
 const HOLDOUT_ROWS: usize = 3_600;
-const MIN_ROWS: usize =
-    INITIAL_TRAIN_ROWS + FOLD_COUNT * (VALIDATION_ROWS + EMBARGO_ROWS) + PURGE_ROWS + HOLDOUT_ROWS;
+const SELECTION_ROWS: usize = 3_600;
+const MIN_ROWS: usize = INITIAL_TRAIN_ROWS
+    + FOLD_COUNT * (VALIDATION_ROWS + EMBARGO_ROWS)
+    + PURGE_ROWS
+    + SELECTION_ROWS
+    + 2 * PURGE_ROWS
+    + HOLDOUT_ROWS;
 const MAX_EXPANSIONS: u64 = 256;
 const GP_POLICY_ID: &str = "binance-btcusdt-usdm-1s-h5-top5-factor-plan-v5-gp-policy";
 const BASELINE_POLICY_ID: &str = "binance-btcusdt-usdm-1s-h5-top5-baseline-policy";
@@ -803,6 +808,7 @@ pub(crate) fn approved_validation(
         purge_rows: PURGE_ROWS,
         embargo_rows: EMBARGO_ROWS,
         sealed_holdout_rows: HOLDOUT_ROWS,
+        independent_selection_rows: Some(SELECTION_ROWS),
         fee_bps: 2.0,
         rebate_bps: 0.0,
         funding_bps: 0.0,
@@ -845,6 +851,7 @@ pub(crate) fn approved_evaluation_protocol(
             observation_frequency_millis: materialization.bucket_ms,
         },
     )
+    .and_then(|protocol| protocol.with_independent_selection(SELECTION_ROWS))
     .map_err(anyhow::Error::new)
 }
 
@@ -928,7 +935,19 @@ pub(crate) mod tests {
         )
         .unwrap();
         let mission = rendered.mission;
-        assert_eq!(MIN_ROWS, 21_625);
+        assert_eq!(MIN_ROWS, 25_245);
+        let partitions = mission
+            .spec
+            .evaluation_protocol
+            .row_partitions(MIN_ROWS)
+            .unwrap();
+        assert_eq!(partitions.search.end, 18_025);
+        assert_eq!(partitions.selection, Some(18_035..21_635));
+        assert_eq!(partitions.sealed_holdout, 21_645..25_245);
+        let reconstructed = ValidationArgs::from_protocol(&mission.spec.evaluation_protocol)
+            .evaluation_protocol(&mission.spec.evaluation_protocol.labels)
+            .unwrap();
+        assert_eq!(reconstructed, mission.spec.evaluation_protocol);
         assert_eq!(mission.spec.search.budget.max_candidates, 22);
         assert_eq!(
             mission.spec.search.planned_gp_and_subset_trials().unwrap(),
@@ -1406,7 +1425,11 @@ pub(crate) mod tests {
             .unwrap();
             let source_end_ns =
                 u64::try_from(ingestion_time.timestamp_nanos_opt().unwrap()).unwrap();
-            let instrument_rules_evidence = (0..256).map(indexed_cex_triplet).collect::<Vec<_>>();
+            // Synthetic fixture coverage scales with the requested observation window.
+            let reference_observations = rows.len().div_ceil(90) + 2;
+            let instrument_rules_evidence = (0..reference_observations)
+                .map(indexed_cex_triplet)
+                .collect::<Vec<_>>();
             let snapshot = hft_research_manifest::CexReplaySnapshotV5 {
                 schema_version: hft_research_manifest::CEX_REPLAY_SNAPSHOT_SCHEMA_V5.to_string(),
                 venue: "binance".to_string(),
@@ -1448,7 +1471,7 @@ pub(crate) mod tests {
                         evidence: instrument_rules_evidence,
                         first_available_at: first_event_time - ChronoDuration::seconds(1),
                         last_available_at: last_event_time + ChronoDuration::seconds(5),
-                        observations: 256,
+                        observations: reference_observations as u64,
                         max_gap_ns: hft_research_manifest::CEX_DERIVATIVES_MAX_GAP_NS,
                     },
                 }],

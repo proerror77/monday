@@ -55,6 +55,21 @@ Historical `burn_mlp` records containing only diagnostics remain readable audit
 evidence and are rejected by current execution/refit verification. Parameter
 export provides no holdout, promotion, deployment or order authority.
 
+Canonical CEX Campaigns now bind `evaluation-protocol-v2`: three search folds,
+a separate 3,600-row selection window and a 3,600-row sealed holdout. Both
+selection boundaries include the protocol's purge interval. The exact range
+calculation is shared by dispatch signing and dataset readers; search and
+proposal contexts stop before the first purge. Search labels must become
+available before selection starts, and selection labels before holdout starts.
+The minimum input is 25,245 one-second rows. V1 audit payloads retain their
+original encoding and shared-validation meaning.
+
+The signed feedback label `independent_selection_withheld` means the separate
+window is reserved, not that it has been evaluated. Pre-holdout Campaigns still
+emit search-visible metrics only. Root grants still cannot open holdout or
+perform final selection; final candidate freezing, family closure and separately
+authorized final evaluation must precede using this reserved window.
+
 Prediction training additionally accepts only an immutable
 `VerifiedBinarySnapshot` handle. The loader verifies the snapshot's evaluator
 artifacts against a caller-supplied trusted `snapshot_contract_hash`; no public

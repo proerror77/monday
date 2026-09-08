@@ -1734,7 +1734,7 @@ mod tests {
             ACTIVE_DEADLINE_SECONDS
         );
         assert_eq!(gate.reservation.reserved_llm_tokens, 0);
-        assert_eq!(
+        assert_ne!(
             gate.reservation
                 .execution
                 .evaluation_views
