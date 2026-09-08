@@ -56,7 +56,7 @@ RELEASE_ENV_FILE="$fixture/recovery.env"
 printf '%s\n' 'ALIYUN_PROFILE=ecs-role' 'OSS_ENDPOINT=oss-ap-northeast-1-internal.aliyuncs.com' \
   'OSS_REGION=ap-northeast-1' >"$RELEASE_ENV_FILE"
 SAFE_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-# shellcheck disable=SC2329 # Called by the real sourced copy_active_oss function.
+# shellcheck disable=SC2317,SC2329 # Called by the real sourced copy_active_oss function.
 runuser() {
   [[ "$1 $2 $3 $4 $5" == '--user hftcollector -- env -i' ]] || return 1
   shift 5
@@ -68,11 +68,12 @@ runuser() {
   printf 'binary\000fixture\377\n'
 }
 mkdir -m 0700 "$fixture/private"
+# shellcheck disable=SC2218 # Imported above; a later scenario replaces this function.
 copy_active_oss oss://fixture/data "$fixture/private/data"
 printf 'binary\000fixture\377\n' >"$fixture/expected"
 cmp "$fixture/expected" "$fixture/private/data"
 [[ $(stat -c %a "$fixture/private") == 700 ]]
-# shellcheck disable=SC2329 # Injected failure consumed by copy_active_oss.
+# shellcheck disable=SC2317,SC2329 # Injected failure consumed by copy_active_oss.
 runuser() { return 1; }
 if copy_active_oss oss://fixture/data "$fixture/private/failed"; then
   printf 'recovery accepted a failed OSS download\n' >&2
@@ -244,7 +245,7 @@ monday_validate_v2_transition() {
 # The Gate itself is assumed independently verified here; all transition shape,
 # identity and embedded-evidence checks still execute their production code.
 (
-  # shellcheck disable=SC2329 # Called by the real transition validator below.
+  # shellcheck disable=SC2317,SC2329 # Called by the real transition validator below.
   monday_validate_v2_gate_authoritative() {
     [[ "$1" == "$ROOT_PREFIX" && "$2" == "$fixture/validator-gate.json" \
       && "$3" == "$fixture_old_c" && "$4" == "$fixture_new_c" \
