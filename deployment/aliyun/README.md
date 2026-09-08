@@ -1210,9 +1210,12 @@ so cutover readback reports the recovered manifest's gaps and readiness as-is.
 Normal production restart does not perform this recovery inline. Its privileged
 pre-start step only locks and atomically moves the affected market spool to a
 root-owned recovery queue, recreates an empty canonical spool, and lets live
-acquisition start. A separate timer drains one market at a time with the exact
-binary digest and a private copy of the release env stored with the queue job;
-later bundle-only publication cannot change that recovery input. The previous
+acquisition start. A separate timer drains one market at a time. The original
+job receipt pins its payload, controller, runtime contract and private release
+environment; ordinary drain requires all of them to match the active immutable
+controller. A controller mismatch produces `.stale` evidence and remains a
+collector-health breach. Publishing a controller cannot silently retarget a job.
+The previous
 `upload-status.json` is copied into the replacement spool without advancing its
 timestamp, so the existing health policy revalidates the last delivery readback
 while the new hourly segment is still open. Failed or interrupted jobs stay
@@ -1225,6 +1228,56 @@ delivered. The two production instances are each bounded at `CPUQuota=80%` and
 2-vCPU/8-GiB host boundary without increasing the ECS size. A persistent
 pre-start failure is bounded to 120 seconds per start and capped at five
 attempts per two hours instead of restarting forever.
+
+After an authorized controller repair has completed release, Gate, cutover and
+independent transition readback, an operator may explicitly adopt one detached
+job through the active controller's existing recovery entrypoint:
+
+```bash
+/opt/monday/bin/monday-rust-lob-recovery-queue resume spot \
+  --job-id "$job_id" \
+  --job-sha256 "$original_job_receipt_sha256" \
+  --from-controller "$original_controller_sha256" \
+  --controller "$active_controller_sha256" \
+  --transition-receipt "/data/monday/evidence/cutovers/$active_controller_sha256/transition.json" \
+  --transition-sha256 "$transition_receipt_sha256" \
+  --request-id incident-738-repair-1
+```
+
+This operation verifies both immutable controller releases, the original job and
+environment hashes, and the committed target transition's authoritative Gate
+chain. Payload, runtime-contract and environment hashes must remain identical;
+this contract cannot migrate data to a different binary, dataset or runtime
+configuration. It accepts only the explicitly named `.ready`, `.running`,
+`.failed` or `.stale` job, under the market queue, global drain and spool locks.
+It creates a canonical request and adoption receipt under
+`/data/monday/evidence/recoveries/lob-queue/<job>/attempts/<request-sha>/`, preserves
+snapshots and hashes of previous metadata, commits the resume pointer, and
+requeues the original spool without rewriting `job.json`, `recovery.env`, any
+original backup, or any previous result. Actual recovery remains in
+`binance-lob-archiver-recovery@spot.service`, with its existing resource limits;
+the resume command only prepares and starts that service.
+
+Each attempt has its own durable `started.json`, `recovery-input` and immutable
+`result.json`. Incomplete parts are recovered using the existing Rust payload;
+already sealed files proceed to upload. When only metadata remains after an
+interrupted upload, the controller verifies the existing upload status and
+independently reads and hashes the OSS data, manifest and `_SUCCESS` without
+re-running recovery or inventing a new upload timestamp. For an adopted job,
+the upload cutoff is the original receipt's `queued_at`; an upload predating
+that queue receipt still fails. Historical capture timestamps remain historical,
+and recovery does not change any manifest's sequence-gap or readiness verdict.
+
+Replaying the exact request is idempotent, including a crash between adoption
+commit and requeue, or between result commit and archival rename. Success moves
+the spool to that attempt's `spool.done`; the result distinguishes the original
+controller identity from the controller that executed the attempt. A committed
+failure is never overwritten or automatically retried. After its cause is
+corrected, a new explicit request ID records a separate attempt and preserves
+the previous evidence. A successful attempt must finish its own archival
+transaction before another request can be considered. Verify each original job
+hash, adoption, passed attempt result, archived spool and independent OSS
+readback; queue counts alone are not delivery evidence.
 
 A new host is accepted
 only when the canonical spool contains no segment artifact. The script then

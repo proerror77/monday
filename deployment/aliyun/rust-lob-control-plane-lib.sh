@@ -2231,11 +2231,11 @@ monday_validate_v2_transition() {
       and all(.[];
         (.target | type == "string" and test("^/opt/monday/releases/binance-lob-controller/active/deployment/[A-Za-z0-9._-]+$"))
         and (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))))' \
-    "$receipt" >/dev/null
+    "$receipt" >/dev/null || return 1
   jq -e --argjson expected "$gate_evidence" \
-    '.gate_evidence == $expected' "$receipt" >/dev/null
+    '.gate_evidence == $expected' "$receipt" >/dev/null || return 1
   jq -e --argjson expected "$gate_production_runtime" \
-    '.production_runtime == $expected' "$receipt" >/dev/null
+    '.production_runtime == $expected' "$receipt" >/dev/null || return 1
   local completed_at completed_at_ns parsed_completed_at now_ns
   completed_at=$(jq -er '.completed_at' "$receipt") || return 1
   completed_at_ns=$(jq -er '.completed_at_ns' "$receipt") || return 1
