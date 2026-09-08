@@ -42,21 +42,21 @@ use std::{
 const CONTROL_SCHEMA: &str = "monday.campaign_dispatch_control.v1";
 const MAX_CONTROL_BYTES: u64 = 1024 * 1024;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct DispatchControl {
-    schema_version: String,
-    ledger_path: PathBuf,
-    signed_root_grant_path: PathBuf,
-    trusted_keys_path: PathBuf,
-    materialization_path: PathBuf,
-    approval_id: String,
-    controller_image: String,
-    attempt_ordinal: u32,
-    receipt_access: BTreeMap<String, ReceiptAccess>,
+pub(super) struct DispatchControl {
+    pub(super) schema_version: String,
+    pub(super) ledger_path: PathBuf,
+    pub(super) signed_root_grant_path: PathBuf,
+    pub(super) trusted_keys_path: PathBuf,
+    pub(super) materialization_path: PathBuf,
+    pub(super) approval_id: String,
+    pub(super) controller_image: String,
+    pub(super) attempt_ordinal: u32,
+    pub(super) receipt_access: BTreeMap<String, ReceiptAccess>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ReceiptAccess {
     put_url: String,
@@ -65,7 +65,7 @@ pub(super) struct ReceiptAccess {
 
 #[derive(Debug, Serialize)]
 pub(super) struct DispatchInspection {
-    execution: CampaignExecutionBindingV1,
+    pub(super) execution: CampaignExecutionBindingV1,
     campaign_id: String,
     generation: u8,
     parent_result_sha256: Option<String>,
@@ -258,40 +258,7 @@ impl Admission {
         namespace: &str,
         purpose: Purpose,
     ) -> anyhow::Result<Self> {
-        // Preserve the operator's logical trust locator, including projected
-        // file/directory symlinks. Freezing a symlink target would retain an old
-        // key set after rotation. Immutable inputs and the database are resolved
-        // physically below; all relative paths are anchored once, never to a
-        // later working directory.
-        let path = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            std::env::current_dir()
-                .context("resolve Campaign control directory")?
-                .join(path)
-        };
-        let base = path
-            .parent()
-            .context("Campaign control file has no parent")?;
-        let mut control: DispatchControl = read_json(&path)?;
-        if control.schema_version != CONTROL_SCHEMA {
-            bail!("unsupported Campaign dispatch control schema");
-        }
-        for location in [
-            &mut control.ledger_path,
-            &mut control.signed_root_grant_path,
-            &mut control.materialization_path,
-        ] {
-            if location.is_relative() {
-                *location = base.join(&*location);
-            }
-            *location = location
-                .canonicalize()
-                .context("resolve existing Campaign control input")?;
-        }
-        if control.trusted_keys_path.is_relative() {
-            control.trusted_keys_path = base.join(&control.trusted_keys_path);
-        }
+        let control = read_control(path)?;
         let signed: SignedCampaignRootGrantV1 = read_json(&control.signed_root_grant_path)?;
         let inspection = inspect_binding(
             validated,
@@ -545,6 +512,39 @@ pub(super) fn publish_and_readback(
         .take(u64::try_from(bytes.len())? + 1)
         .read_to_end(&mut observed)?;
     Ok(observed)
+}
+
+pub(super) fn read_control(path: &Path) -> anyhow::Result<DispatchControl> {
+    // Trust paths remain logical so projected-key rotation is visible. Immutable
+    // input/ledger paths are physical and all relative paths are control-relative.
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let base = path
+        .parent()
+        .context("Campaign control file has no parent")?;
+    let mut control: DispatchControl = read_json(&path)?;
+    if control.schema_version != CONTROL_SCHEMA {
+        bail!("unsupported Campaign dispatch control schema");
+    }
+    for location in [
+        &mut control.ledger_path,
+        &mut control.signed_root_grant_path,
+        &mut control.materialization_path,
+    ] {
+        if location.is_relative() {
+            *location = base.join(&*location);
+        }
+        *location = location
+            .canonicalize()
+            .context("resolve existing Campaign control input")?;
+    }
+    if control.trusted_keys_path.is_relative() {
+        control.trusted_keys_path = base.join(&control.trusted_keys_path);
+    }
+    Ok(control)
 }
 
 fn verify(

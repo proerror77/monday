@@ -42,12 +42,18 @@ spec:
         runAsUser: 1000
         runAsGroup: 1000
         fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
       containers:
         - name: campaign-cycle-controller
           image: crpi-ygobwehhof7qs9m3-vpc.ap-northeast-1.personal.cr.aliyuncs.com/wildcard0923/campaign-cycle-controller@sha256:REPLACE_WITH_IMMUTABLE_DIGEST
           imagePullPolicy: IfNotPresent
+          env:
+            - name: MONDAY_CAMPAIGN_CONTROL
+              value: /authority/control.json
+            - name: KUBECONFIG
+              value: /tmp/monday-campaign-kubeconfig.json
           args:
             - ack-readback
             - --work-dir
@@ -81,9 +87,50 @@ spec:
               mountPath: /campaign-root
             - name: tmp
               mountPath: /tmp
+            - name: authority
+              mountPath: /authority
+              readOnly: true
+            - name: trusted-keys
+              mountPath: /trusted-keys
+              readOnly: true
+      initContainers:
+        - name: prepare-controller
+          image: crpi-ygobwehhof7qs9m3-vpc.ap-northeast-1.personal.cr.aliyuncs.com/wildcard0923/campaign-cycle-controller@sha256:REPLACE_WITH_IMMUTABLE_DIGEST
+          command:
+            - /usr/local/bin/alpha-harness
+            - mission
+            - dispatch
+            - prepare-controller
+            - --control
+            - /authority/control.json
+            - --context
+            - REPLACE_KUBE_CONTEXT
+            - --namespace
+            - monday-research
+            - --kubeconfig-out
+            - /tmp/monday-campaign-kubeconfig.json
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: campaign-root, mountPath: /campaign-root}
+            - {name: authority, mountPath: /authority, readOnly: true}
+            - {name: trusted-keys, mountPath: /trusted-keys, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
       volumes:
         - name: campaign-root
           persistentVolumeClaim:
             claimName: REPLACE_CAMPAIGN_ROOT_PVC
         - name: tmp
           emptyDir: {}
+        - name: authority
+          secret:
+            secretName: REPLACE_CONTROLLER_AUTHORITY_SECRET
+            defaultMode: 0440
+        - name: trusted-keys
+          configMap:
+            name: REPLACE_TRUSTED_KEYS_CONFIGMAP
