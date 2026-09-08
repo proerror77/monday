@@ -739,9 +739,9 @@ mod tests {
 
         fn dataset(mutate_holdout: bool) -> PreparedDataset {
             let start = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
-            let rows = (0..4)
+            let rows = (0..5)
                 .map(|index| {
-                    let signal = if mutate_holdout && index == 3 {
+                    let signal = if mutate_holdout && index == 4 {
                         -1_000.0
                     } else {
                         index as f64
@@ -749,6 +749,9 @@ mod tests {
                     ResearchRow {
                         series_id: 1,
                         available_time: start + Duration::seconds(index),
+                        label_available_time: start
+                            + Duration::seconds(index)
+                            + chrono::Duration::seconds(1),
                         signal,
                         features: BTreeMap::new(),
                         label: signal,
@@ -767,7 +770,7 @@ mod tests {
                         validation_rows: 1,
                         fold_count: 1,
                         purge_rows: 1,
-                        embargo_rows: 0,
+                        embargo_rows: 1,
                         sealed_holdout_rows: 1,
                     },
                     EvaluationCostsV1 {

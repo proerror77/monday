@@ -1068,7 +1068,11 @@ mod tests {
                 };
                 ResearchRow {
                     series_id: 1,
-                    available_time: start + Duration::seconds(index),
+                    available_time: start
+                        + Duration::milliseconds(index * observation_frequency_millis as i64),
+                    label_available_time: start
+                        + Duration::milliseconds(index * observation_frequency_millis as i64)
+                        + chrono::Duration::milliseconds(observation_frequency_millis as i64),
                     signal: direction * index as f64,
                     features: std::collections::BTreeMap::new(),
                     label: direction * index as f64 * 0.01,
@@ -1119,6 +1123,9 @@ mod tests {
                 ResearchRow {
                     series_id: 1,
                     available_time: start + Duration::seconds(index),
+                    label_available_time: start
+                        + Duration::seconds(index)
+                        + chrono::Duration::seconds(1),
                     signal,
                     features: std::collections::BTreeMap::from([(
                         "book_imbalance".to_string(),

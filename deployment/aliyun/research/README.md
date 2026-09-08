@@ -836,7 +836,7 @@ One Campaign maps to multiple rounds. The canonical factor plan and every
 bounded policy follow-up retain all 9 L2/aggregate-trade terminals and 22
 candidate slots. The request derives the total trial limit from the exact plan
 and round count. Both use the six-hour protocol
-`7200 + 3*(3600+1) + 5 + 3600 = 21608`, and the `$1000 / Top5 5%` capacity
+`7200 + 3*(3600+5) + 10 + 3600 = 21625`, and the `$1000 / Top5 5%` capacity
 screen. A v4 Campaign counts its governed factor attempts plus the three
 supervised models (Ridge, CART, Burn MLP);
 it does not run subset MCTS. A negative Campaign produces no holdout claim and
@@ -895,7 +895,7 @@ claim object as the durable once-only guard.
 Treat Kubernetes completion as transport evidence only. Read `bundle_sha256`
 from the Job's final JSON log, download the immutable result object, verify that
 SHA-256 and `unzip -t`. For a continuous Mission, confirm every walk-forward
-record reports `purged-walk-forward-v4`; a complete result may legitimately
+record reports `purged-walk-forward-v5`; a complete result may legitimately
 contain zero sealed evaluations when no candidate passes. For a prediction
 Mission, confirm `artifacts/execution-evidence.json` reports lane
 `prediction_market`, the submitted mission and snapshot SHA-256 values, and the
@@ -991,16 +991,18 @@ before choosing 16/32 GiB workers; preserve the approved limit during the test.
 
 
 The present renderer uses 7,200 initial training rows, three 3,600-row validation
-folds, five purge rows, one embargo row, and a final 3,600-row holdout. At 1 Hz,
+folds, ten purge rows, five embargo rows, and a final 3,600-row holdout. At 1 Hz,
 that is three hours of validation; a 31-hour input inventory is not 31 hours of
 independent OOS evidence. Factor/model selection reuses walk-forward feedback,
 so the existing `search_visible_validation` label remains necessary.
 
-Open accounting gap: the fast evaluator currently accumulates `position * label`
-on every validation row. With 1 Hz observations and five-second forward labels,
-those horizon returns overlap. That curve is not a verified one-step trading P&L
-ledger. Canonical L2 replay instead marks the previous position between observed
-prices and charges position changes. Reconcile these return conventions before
-using fast-backtest equity or Sharpe for profitability claims; memory capacity
-does not resolve this evaluation issue. The memory-observation change leaves the
-existing evaluator and its thresholds intact.
+The corrected fast evaluator uses the previous position and successive observed
+prices for trading returns; five-second labels remain supervised prediction
+targets. It closes each validation window and series at the last observed mark,
+including costs, and rejects validation labels that reach the sealed holdout.
+Deterministic accounting tests reconcile its ledger with canonical L2 cashflows.
+Older label-based equity and Sharpe remain historical evidence, not corrected
+trading results. Real-data re-evaluation and independent out-of-sample evidence
+are still required before profitability claims. See the
+[accounting contract](../../../rust_hft/alpha-harness/README.md#prediction-clocks-and-return-accounting).
+Memory observation does not change costs or admission thresholds.

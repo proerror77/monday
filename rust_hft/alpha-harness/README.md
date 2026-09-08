@@ -34,6 +34,37 @@ Low-level Mission and LoopRun commands
 remain diagnostics and implementation surfaces; they are not alternate evidence
 paths around this contract.
 
+## Prediction clocks and return accounting
+
+`ResearchRow.available_time` is the feature/decision clock;
+`label_available_time` is the actual future label availability. Training rejects
+labels that are not available strictly before validation. Validation labels must
+also mature strictly before the sealed holdout starts. Burn receives these actual
+clocks and the actual next split boundary. The canonical 1 Hz, five-second-label
+Campaign uses ten purge rows and five embargo rows (minimum 21,625 rows).
+
+Five-second forward returns remain prediction targets for training and IC. They
+are never added to the trading equity every second. With observed `mid_price`
+(or OHLC `close`), gross return at row t is the previous target position times
+`price[t] / price[t-1] - 1`. Changes in position incur transaction costs; funding
+applies to the position held over the interval. Each validation window and each
+series starts flat and closes at its last observed mark, including closing costs.
+No price from the next window or sealed holdout is used for that settlement.
+Returns-only input is admitted only for one-step labels and is explicitly marked
+as `one_step_label`; CEX supervised candidates require `observed_mid_price`.
+
+Supervised candidates and decision policies are v2 and bind the accounting basis
+and flattened position vector. The evaluator versions are walk-forward/sealed v5,
+CEX baseline v2, and ONNX v4. Older results remain historical evidence; they must
+not be reinterpreted as results from the corrected accounting. The same CEX
+position vector still requires canonical L2 replay, whose execution assumptions
+remain authoritative. A deterministic regression reconciles net cashflows,
+turnover, and drawdown across the fast evaluator and L2 engine.
+
+These checks establish accounting and temporal contracts. Search-visible
+walk-forward scores and a pre-holdout replay do not establish independent
+out-of-sample profitability; the supervised lane still stops pre-holdout.
+
 ## Local Data Diagnostics
 
 ```bash
@@ -135,7 +166,7 @@ before Mission admission. `operational.submitted_at` is retained for audit but
 does not alter the semantic Mission identity. The fixed v4 factor plan uses 8
 snapshot L2 terminals, 16 atomic plus 4 named continuous candidates, the
 six-hour
-protocol `7200 + 3*(3600+1) + 5 + 3600 = 21608`, and the $1000 / Top5 5%
+protocol `7200 + 3*(3600+5) + 10 + 3600 = 21625`, and the $1000 / Top5 5%
 capacity screen. A non-empty Factor Bank trains deterministic Ridge, shallow
 CART, and one Burn ndarray MLP on the same purged folds. Only validation-fold predictions become cost-aware
 fractional positions; training, purge, embargo, and sealed-holdout rows remain

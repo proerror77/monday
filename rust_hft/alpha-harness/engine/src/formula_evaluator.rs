@@ -41,10 +41,19 @@ pub struct PositionEvaluationPoint {
     pub equity: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReturnAccountingBasis {
+    ObservedMidPrice,
+    ObservedClosePrice,
+    OneStepLabel,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PositionEvaluationReport {
     pub evaluation: CandidateEvaluation,
+    pub return_accounting: ReturnAccountingBasis,
     pub ledger: Vec<PositionEvaluationPoint>,
 }
 
@@ -71,6 +80,7 @@ impl PredictiveGateResult {
         target_positions: &[f64],
         range: std::ops::Range<usize>,
         costs: &EvaluationCostsV1,
+        mark_field: Option<&str>,
     ) -> (Vec<PositionReturnPoint>, usize, f64, Option<f64>) {
         let mut previous_position = 0.0;
         let mut trade_count = 0;
@@ -89,7 +99,15 @@ impl PredictiveGateResult {
                 if index == range_start || rows[index - 1].series_id != rows[index].series_id {
                     previous_position = 0.0;
                 }
-                let position = target_positions[index];
+                let series_end =
+                    index + 1 == range_end || rows[index + 1].series_id != rows[index].series_id;
+                // A terminal mark liquidates; it must not open a new position
+                // whose holding interval is outside this evaluated window.
+                let position = if mark_field.is_some() && series_end {
+                    0.0
+                } else {
+                    target_positions[index]
+                };
                 let position_change = position - previous_position;
                 let turnover = position_change.abs();
                 total_turnover += turnover;
@@ -97,7 +115,17 @@ impl PredictiveGateResult {
                     trade_count += 1;
                 }
                 let row = &rows[index];
-                let gross_return = position * row.label;
+                let gross_return = if let Some(field) = mark_field {
+                    if index == range_start || rows[index - 1].series_id != row.series_id {
+                        0.0
+                    } else {
+                        previous_position
+                            * (row.features[field] / rows[index - 1].features[field] - 1.0)
+                    }
+                } else {
+                    // A returns-only dataset is valid only for a one-step label.
+                    position * row.label
+                };
                 let mut transaction_cost_value = transaction_cost(
                     row,
                     turnover,
@@ -106,11 +134,14 @@ impl PredictiveGateResult {
                     &capacity_features,
                     &mut max_book_depth_fraction,
                 );
-                let funding_cost = row.funding_bps.max(0.0) * position.abs() / BPS;
-                let series_end =
-                    index + 1 == range_end || rows[index + 1].series_id != row.series_id;
+                let funded_position = if mark_field.is_some() {
+                    previous_position
+                } else {
+                    position
+                };
+                let funding_cost = row.funding_bps.max(0.0) * funded_position.abs() / BPS;
                 previous_position = position;
-                if series_end && position.abs() > f64::EPSILON {
+                if mark_field.is_none() && series_end && position.abs() > f64::EPSILON {
                     total_turnover += position.abs();
                     trade_count += 1;
                     transaction_cost_value += transaction_cost(
@@ -272,7 +303,7 @@ impl FormulaEvaluator {
         self.evaluate_ranges(rows, signals, ranges, evaluator_version, protocol)
     }
 
-    pub(crate) fn evaluate_predictions_and_positions(
+    pub fn evaluate_predictions_and_positions(
         &self,
         rows: &[ResearchRow],
         predictions: &[f64],
@@ -343,6 +374,8 @@ impl FormulaEvaluator {
         protocol: &EvaluationProtocolV1,
     ) -> Result<PositionEvaluationReport, String> {
         protocol.validate().map_err(|error| error.to_string())?;
+        crate::evaluation::validate_row_clocks(rows, protocol)
+            .map_err(|error| error.to_string())?;
         if predictions.len() != rows.len() || target_positions.len() != rows.len() {
             return Err("prediction or target-position length does not match dataset".to_string());
         }
@@ -397,6 +430,23 @@ impl FormulaEvaluator {
             return Err("decision policy produced an invalid target position".to_string());
         }
 
+        let mark_field = ["mid_price", "close"]
+            .into_iter()
+            .find(|field| rows.iter().any(|row| row.features.contains_key(*field)));
+        if let Some(field) = mark_field {
+            if rows.iter().any(|row| {
+                row.features
+                    .get(field)
+                    .is_none_or(|price| !price.is_finite() || *price <= 0.0)
+            }) {
+                return Err(
+                    "price-mark accounting requires a positive finite price on every row".into(),
+                );
+            }
+        } else if protocol.labels.horizon_buckets != 1 {
+            return Err("multi-step prediction labels cannot be used as one-step trading returns; price marks are required".into());
+        }
+
         let ranges = ranges.into_iter().collect::<Vec<_>>();
         if ranges.is_empty() {
             return Err("evaluation has no folds".to_string());
@@ -415,6 +465,9 @@ impl FormulaEvaluator {
         {
             return Err("evaluation ranges do not match the evaluation protocol".to_string());
         }
+        if ranges.windows(2).any(|pair| pair[0].end > pair[1].start) {
+            return Err("evaluation windows overlap or are out of chronological order".into());
+        }
         for range in &ranges {
             if range.len() < self.config.min_validation_rows || range.end > rows.len() {
                 return Err("evaluation range is too short or out of bounds".to_string());
@@ -430,7 +483,13 @@ impl FormulaEvaluator {
         let mut equity = 1.0_f64;
         for (fold_index, range) in ranges.into_iter().enumerate() {
             let (points, trade_count, total_turnover, max_book_depth_fraction) = predictive_stage
-                .target_positions_to_net_returns(rows, target_positions, range, &protocol.costs);
+                .target_positions_to_net_returns(
+                    rows,
+                    target_positions,
+                    range,
+                    &protocol.costs,
+                    mark_field,
+                );
             let returns = points
                 .iter()
                 .map(|point| point.net_return)
@@ -559,7 +618,15 @@ impl FormulaEvaluator {
         evaluation
             .validate_reason()
             .map_err(|reason| format!("evaluation evidence is inconsistent: {reason}"))?;
-        Ok(PositionEvaluationReport { evaluation, ledger })
+        Ok(PositionEvaluationReport {
+            evaluation,
+            return_accounting: match mark_field {
+                Some("mid_price") => ReturnAccountingBasis::ObservedMidPrice,
+                Some("close") => ReturnAccountingBasis::ObservedClosePrice,
+                _ => ReturnAccountingBasis::OneStepLabel,
+            },
+            ledger,
+        })
     }
 }
 
@@ -988,7 +1055,7 @@ mod tests {
             .map(signal_position)
             .collect::<Vec<_>>();
         let (points, trades, turnover, capacity) =
-            gate.target_positions_to_net_returns(rows, &positions, range, costs);
+            gate.target_positions_to_net_returns(rows, &positions, range, costs, None);
         (
             points.into_iter().map(|point| point.net_return).collect(),
             trades,
@@ -1014,6 +1081,9 @@ mod tests {
             .map(|index| ResearchRow {
                 series_id: 1,
                 available_time: start + Duration::minutes(index as i64),
+                label_available_time: start
+                    + Duration::minutes(index as i64)
+                    + chrono::Duration::minutes(1),
                 signal: if index % 2 == 0 { 1.0 } else { -1.0 },
                 features: std::collections::BTreeMap::from([(
                     "book_imbalance".to_string(),
@@ -1059,6 +1129,148 @@ mod tests {
 
     fn dataset(fee_bps: f64) -> PreparedDataset {
         prepare_dataset(rows(fee_bps), &protocol(fee_bps, 3)).unwrap()
+    }
+
+    #[test]
+    fn five_step_prediction_labels_are_not_accumulated_as_trading_returns() {
+        let mut rows = rows(0.0);
+        for (index, row) in rows.iter_mut().enumerate() {
+            row.features
+                .insert("mid_price".into(), 100.0 * 1.001_f64.powi(index as i32));
+            row.label = 1.001_f64.powi(5) - 1.0;
+            row.label_available_time = row.available_time + Duration::minutes(5);
+        }
+        let mut protocol = protocol(0.0, 1);
+        protocol.labels.horizon_buckets = 5;
+        protocol.walk_forward.purge_rows = 5;
+        let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
+        let predictions = vec![0.01; rows.len()];
+        let positions = vec![0.5; rows.len()];
+        let report = evaluator
+            .evaluate_predictions_and_positions(
+                &rows,
+                &predictions,
+                &positions,
+                std::iter::once(200..264),
+                CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION,
+                &protocol,
+            )
+            .unwrap();
+        // 64 marks have 63 held intervals. The last mark closes the position.
+        let gross = report
+            .ledger
+            .iter()
+            .map(|point| point.gross_return)
+            .sum::<f64>();
+        assert!(
+            (gross - 63.0 * 0.5 * 0.001).abs() < 1e-12,
+            "five-step labels must not be booked at every one-step mark: {gross}"
+        );
+        assert_eq!(report.ledger.last().unwrap().target_position, 0.0);
+        let mut altered = rows.clone();
+        for row in &mut altered {
+            row.label *= 10.0;
+        }
+        let changed = evaluator
+            .evaluate_predictions_and_positions(
+                &altered,
+                &predictions,
+                &positions,
+                std::iter::once(200..264),
+                CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION,
+                &protocol,
+            )
+            .unwrap();
+        assert_eq!(
+            report.ledger, changed.ledger,
+            "labels influence predictive metrics, not the trading ledger"
+        );
+        for row in &mut altered[264..] {
+            row.features.insert("mid_price".into(), 1.0);
+        }
+        let outside_changed = evaluator
+            .evaluate_predictions_and_positions(
+                &altered,
+                &predictions,
+                &positions,
+                std::iter::once(200..264),
+                CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION,
+                &protocol,
+            )
+            .unwrap();
+        assert_eq!(report.ledger, outside_changed.ledger);
+
+        // A new series cannot realize the price jump between independent tapes.
+        for row in &mut altered[232..264] {
+            row.series_id = 2;
+            *row.features.get_mut("mid_price").unwrap() *= 10.0;
+        }
+        let split = evaluator
+            .evaluate_predictions_and_positions(
+                &altered,
+                &predictions,
+                &positions,
+                std::iter::once(200..264),
+                CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION,
+                &protocol,
+            )
+            .unwrap();
+        assert_eq!(split.ledger[31].target_position, 0.0);
+        assert_eq!(split.ledger[32].gross_return, 0.0);
+        let gross: f64 = split.ledger.iter().map(|point| point.gross_return).sum();
+        assert!((gross - 62.0 * 0.5 * 0.001).abs() < 1e-12);
+    }
+
+    #[test]
+    fn multi_step_accounting_requires_valid_marks_and_disjoint_windows() {
+        let mut input = rows(0.0);
+        let mut protocol = protocol(0.0, 1);
+        protocol.labels.horizon_buckets = 5;
+        protocol.walk_forward.purge_rows = 5;
+        for row in &mut input {
+            row.label_available_time = row.available_time + Duration::minutes(5);
+        }
+        let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
+        let predictions = vec![0.01; input.len()];
+        let positions = vec![0.5; input.len()];
+        assert!(evaluator
+            .evaluate_predictions_and_positions(
+                &input,
+                &predictions,
+                &positions,
+                std::iter::once(200..264),
+                CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION,
+                &protocol
+            )
+            .unwrap_err()
+            .contains("price marks"));
+        for row in &mut input {
+            row.features.insert("mid_price".into(), 100.0);
+        }
+        input[200].features.insert("mid_price".into(), -1.0);
+        assert!(evaluator
+            .evaluate_predictions_and_positions(
+                &input,
+                &predictions,
+                &positions,
+                std::iter::once(200..264),
+                CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION,
+                &protocol
+            )
+            .is_err());
+        input[200].features.insert("mid_price".into(), 100.0);
+        protocol.walk_forward.fold_count = 2;
+        assert!(evaluator
+            .evaluate_predictions_and_positions(
+                &input,
+                &predictions,
+                &positions,
+                [200..264, 240..304],
+                CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION,
+                &protocol
+            )
+            .unwrap_err()
+            .contains("overlap"));
     }
 
     #[test]
@@ -1309,6 +1521,7 @@ mod tests {
             ResearchRow {
                 series_id: 1,
                 available_time: start,
+                label_available_time: start + chrono::Duration::minutes(1),
                 signal: 0.0,
                 features: std::collections::BTreeMap::from([("book_imbalance".to_string(), 1.0)]),
                 label: 0.0,
@@ -1320,6 +1533,7 @@ mod tests {
             ResearchRow {
                 series_id: 1,
                 available_time: start + Duration::minutes(1),
+                label_available_time: start + Duration::minutes(1) + chrono::Duration::minutes(1),
                 signal: 0.0,
                 features: std::collections::BTreeMap::from([("book_imbalance".to_string(), 3.0)]),
                 label: 0.0,
@@ -1331,6 +1545,7 @@ mod tests {
             ResearchRow {
                 series_id: 2,
                 available_time: start + Duration::minutes(10),
+                label_available_time: start + Duration::minutes(10) + chrono::Duration::minutes(1),
                 signal: 0.0,
                 features: std::collections::BTreeMap::from([("book_imbalance".to_string(), 10.0)]),
                 label: 0.0,
@@ -1342,6 +1557,7 @@ mod tests {
             ResearchRow {
                 series_id: 2,
                 available_time: start + Duration::minutes(11),
+                label_available_time: start + Duration::minutes(11) + chrono::Duration::minutes(1),
                 signal: 0.0,
                 features: std::collections::BTreeMap::from([("book_imbalance".to_string(), 13.0)]),
                 label: 0.0,
@@ -1388,6 +1604,7 @@ mod tests {
             ResearchRow {
                 series_id: 1,
                 available_time: start,
+                label_available_time: start + chrono::Duration::minutes(1),
                 signal: 1.0,
                 features: std::collections::BTreeMap::from([("spread_bps".to_string(), 0.0)]),
                 label: 0.0,
@@ -1399,6 +1616,7 @@ mod tests {
             ResearchRow {
                 series_id: 1,
                 available_time: start + Duration::minutes(1),
+                label_available_time: start + Duration::minutes(1) + chrono::Duration::minutes(1),
                 signal: 1.0,
                 features: std::collections::BTreeMap::from([("spread_bps".to_string(), 0.0)]),
                 label: 0.0,
@@ -1410,6 +1628,7 @@ mod tests {
             ResearchRow {
                 series_id: 2,
                 available_time: start + Duration::minutes(10),
+                label_available_time: start + Duration::minutes(10) + chrono::Duration::minutes(1),
                 signal: 1.0,
                 features: std::collections::BTreeMap::from([("spread_bps".to_string(), 0.0)]),
                 label: 0.0,

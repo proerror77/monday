@@ -20,8 +20,8 @@ use alpha_domain::{
 use alpha_engine::{
     baselines::{
         evaluate_cex_baselines, evaluate_cex_supervised_model, CexBurnFitIdentity,
-        CexSupervisedDecisionPolicyV1, CexSupervisedModelCandidateV1,
-        CexSupervisedModelEvaluationV1,
+        CexSupervisedDecisionPolicyV2, CexSupervisedModelCandidateV2,
+        CexSupervisedModelEvaluationV2,
     },
     engines::{
         CexCombinationResearchArtifactV1, CexFactorBankMcts, CexFactorBankMctsCheckpointV1,
@@ -175,15 +175,15 @@ fn bound_gp_policy(mission: &CexResearchMissionArtifactV1) -> anyhow::Result<Cex
 
 fn bound_supervised_decision_policy(
     mission: &CexResearchMissionArtifactV1,
-) -> anyhow::Result<CexSupervisedDecisionPolicyV1> {
+) -> anyhow::Result<CexSupervisedDecisionPolicyV2> {
     let binding = &mission.spec.policies.supervised_decision;
     if !binding.id.starts_with("cex-search-policy-") {
         bail!("CEX supervised decision policy has an invalid revision identity");
     }
     for policy in [
-        CexSupervisedDecisionPolicyV1::controlled_v1(),
-        CexSupervisedDecisionPolicyV1::prediction_identity_v1(),
-        CexSupervisedDecisionPolicyV1::hysteretic_cost_aware_v1(),
+        CexSupervisedDecisionPolicyV2::controlled_v2(),
+        CexSupervisedDecisionPolicyV2::prediction_identity_v2(),
+        CexSupervisedDecisionPolicyV2::hysteretic_cost_aware_v2(),
     ] {
         if policy.content_hash().map_err(anyhow::Error::msg)? == binding.content_sha256 {
             return Ok(policy);
@@ -2000,8 +2000,8 @@ fn run_cex_supervised_model_research(
     factor_bank: &CexFactorBankRevisionV2,
     context: &EngineContext<'_>,
     baselines: &alpha_engine::baselines::CexBaselineRun,
-    decision_policy: &CexSupervisedDecisionPolicyV1,
-) -> anyhow::Result<Option<CexSupervisedModelEvaluationV1>> {
+    decision_policy: &CexSupervisedDecisionPolicyV2,
+) -> anyhow::Result<Option<CexSupervisedModelEvaluationV2>> {
     let (Some(ridge), Some(cart), Some(burn)) =
         (&baselines.ridge, &baselines.cart, &baselines.burn)
     else {
@@ -2108,10 +2108,10 @@ fn run_cex_supervised_model_research(
 }
 
 fn select_supervised_model(
-    ridge: CexSupervisedModelEvaluationV1,
-    cart: CexSupervisedModelEvaluationV1,
-    burn: CexSupervisedModelEvaluationV1,
-) -> CexSupervisedModelEvaluationV1 {
+    ridge: CexSupervisedModelEvaluationV2,
+    cart: CexSupervisedModelEvaluationV2,
+    burn: CexSupervisedModelEvaluationV2,
+) -> CexSupervisedModelEvaluationV2 {
     let mut selected = ridge;
     if supervised_model_ranks_ahead(&cart, &selected) {
         selected = cart;
@@ -2123,8 +2123,8 @@ fn select_supervised_model(
 }
 
 fn supervised_model_ranks_ahead(
-    left: &CexSupervisedModelEvaluationV1,
-    right: &CexSupervisedModelEvaluationV1,
+    left: &CexSupervisedModelEvaluationV2,
+    right: &CexSupervisedModelEvaluationV2,
 ) -> bool {
     match left
         .candidate
@@ -2312,7 +2312,7 @@ fn run_cex_supervised_event_replay(
     materialization_sha256: &str,
     context: &EngineContext<'_>,
     feature_decision_clocks: &[data_mission::FeatureDecisionClock],
-    evaluation: &CexSupervisedModelEvaluationV1,
+    evaluation: &CexSupervisedModelEvaluationV2,
     baseline_policy: &CexBaselinePolicyV1,
     policy: &CexEventReplayPolicyV1,
     replay_artifact_path: &Path,
@@ -2391,6 +2391,7 @@ fn run_cex_target_position_replay(
         .zip(context.rows())
         .any(|(clock, row)| {
             clock.series_id != row.series_id
+                || clock.feature_available_time != row.available_time
                 || clock.series_close_time < clock.feature_available_time
         })
     {
@@ -3316,22 +3317,35 @@ pub(crate) fn recover_execution_report_from_published_result(
         let cart_baseline: CexBaselineArtifactV1 =
             read_bundle_json(&mut archive, "results/cart-baseline.json", 4 * 1024 * 1024)?
                 .context("published supervised selection has no CART baseline")?;
+        let burn_baseline: CexBaselineArtifactV1 = read_bundle_json(
+            &mut archive,
+            "results/burn-mlp-baseline.json",
+            4 * 1024 * 1024,
+        )?
+        .context("published supervised selection has no Burn MLP baseline")?;
         ridge_baseline.validate_binding(&control_mission, &baseline_policy, &factor_bank)?;
         cart_baseline.validate_binding(&control_mission, &baseline_policy, &factor_bank)?;
-        let ridge_candidate: Option<CexSupervisedModelCandidateV1> = read_bundle_json(
+        burn_baseline.validate_binding(&control_mission, &baseline_policy, &factor_bank)?;
+        let ridge_candidate: Option<CexSupervisedModelCandidateV2> = read_bundle_json(
             &mut archive,
             "results/ridge-supervised-candidate.json",
             4 * 1024 * 1024,
         )?;
-        let cart_candidate: Option<CexSupervisedModelCandidateV1> = read_bundle_json(
+        let cart_candidate: Option<CexSupervisedModelCandidateV2> = read_bundle_json(
             &mut archive,
             "results/cart-supervised-candidate.json",
+            4 * 1024 * 1024,
+        )?;
+        let burn_candidate: Option<CexSupervisedModelCandidateV2> = read_bundle_json(
+            &mut archive,
+            "results/burn_mlp-supervised-candidate.json",
             4 * 1024 * 1024,
         )?;
         let mut selected_candidate = None;
         for (candidate, baseline) in [
             (ridge_candidate, &ridge_baseline),
             (cart_candidate, &cart_baseline),
+            (burn_candidate, &burn_baseline),
         ] {
             let candidate = candidate
                 .context("published supervised selection is missing a model candidate artifact")?;
@@ -3534,7 +3548,7 @@ fn validate_replay_strategy_binding(
 pub(crate) fn validate_supervised_replay_binding(
     replay: &CexEventReplayReceiptV1,
     selection: &CexSupervisedModelSelectionV1,
-    candidate: &CexSupervisedModelCandidateV1,
+    candidate: &CexSupervisedModelCandidateV2,
     mission: &CexResearchMissionArtifactV1,
     mission_id: &str,
 ) -> anyhow::Result<()> {
@@ -3564,7 +3578,7 @@ pub(crate) fn validate_supervised_replay_binding(
 }
 
 pub(crate) fn validate_supervised_candidate_binding(
-    candidate: &CexSupervisedModelCandidateV1,
+    candidate: &CexSupervisedModelCandidateV2,
     mission: &CexResearchMissionArtifactV1,
     factor_bank: &CexFactorBankRevisionV2,
     baseline: &CexBaselineArtifactV1,
@@ -3926,6 +3940,129 @@ pub(crate) mod tests {
     use ed25519_dalek::SigningKey;
 
     #[test]
+    fn five_second_forecast_backtest_reconciles_with_one_step_l2_cashflows() {
+        use alpha_domain::{EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1};
+        use alpha_engine::evaluation::ResearchRow;
+        let prices = (0..64).map(|i| 100.0 + i as f64 * 0.1).collect::<Vec<_>>();
+        let rows = prices
+            .iter()
+            .enumerate()
+            .map(|(i, price)| {
+                let time = chrono::DateTime::<Utc>::from_timestamp(i as i64 + 1, 0).unwrap();
+                ResearchRow {
+                    series_id: 1,
+                    available_time: time,
+                    label_available_time: time + ChronoDuration::seconds(5),
+                    signal: 0.0,
+                    features: BTreeMap::from([
+                        ("mid_price".into(), *price),
+                        (
+                            "spread_bps".into(),
+                            ((price + 0.01) - (price - 0.01)) / price * 10_000.0,
+                        ),
+                    ]),
+                    label: 0.005,
+                    fee_bps: 2.0,
+                    funding_bps: 0.2,
+                    pit_funding: false,
+                    latency_bps: 0.5,
+                }
+            })
+            .collect::<Vec<_>>();
+        let costs = EvaluationCostsV1 {
+            fee_bps: 2.0,
+            rebate_bps: 0.0,
+            funding_bps: 0.2,
+            latency_bps: 0.5,
+            slippage_bps: 0.25,
+            cross_spread: true,
+            position_notional_usd: 0.0,
+            capacity_depth_levels: 0,
+            max_book_depth_fraction: 0.0,
+        };
+        let protocol = EvaluationProtocolV1::new(
+            EvaluationWalkForwardV1 {
+                initial_train_rows: 1,
+                validation_rows: 64,
+                fold_count: 1,
+                purge_rows: 5,
+                embargo_rows: 5,
+                sealed_holdout_rows: 64,
+            },
+            costs.clone(),
+            EvaluationLabelSpecV1 {
+                horizon_buckets: 5,
+                observation_frequency_millis: 1000,
+            },
+        )
+        .unwrap();
+        let predictions = vec![0.005; 64];
+        let positions = (0..64)
+            .map(|i| if i < 20 { 0.3 } else { -0.4 })
+            .collect::<Vec<_>>();
+        let report = FormulaEvaluator::new(FormulaEvaluatorConfig::default())
+            .unwrap()
+            .evaluate_predictions_and_positions(
+                &rows,
+                &predictions,
+                &positions,
+                std::iter::once(0..64),
+                alpha_domain::CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION,
+                &protocol,
+            )
+            .unwrap();
+        let mut tape = Vec::new();
+        for (i, price) in prices.iter().enumerate() {
+            let mut bids = vec![];
+            let mut asks = vec![];
+            if i > 0 {
+                bids.push(serde_json::json!([prices[i - 1] - 0.01, 0]));
+                asks.push(serde_json::json!([prices[i - 1] + 0.01, 0]));
+            }
+            bids.push(serde_json::json!([price - 0.01, 10]));
+            asks.push(serde_json::json!([price + 0.01, 10]));
+            serde_json::to_writer(&mut tape, &serde_json::json!({
+                "timestamp": rows[i].available_time.timestamp_micros(), "sequence": i + 1,
+                "event": if i == 0 { "snapshot" } else { "l2_update" }, "bids": bids, "asks": asks,
+            })).unwrap();
+            tape.push(b'\n');
+        }
+        let decisions = report
+            .ledger
+            .iter()
+            .map(|point| TargetPositionDecision {
+                timestamp_us: point.available_time.timestamp_micros(),
+                target_position: point.target_position,
+            })
+            .collect::<Vec<_>>();
+        let replay = hft_backtest::engine::replay_target_positions(
+            &tape,
+            &decisions,
+            &TargetPositionReplayConfig {
+                max_depth_levels: 1,
+                max_decision_delay_us: 1,
+                position_notional_usd: 0.0,
+                fee_bps: costs.fee_bps,
+                rebate_bps: costs.rebate_bps,
+                funding_bps: costs.funding_bps,
+                latency_bps: costs.latency_bps,
+                additional_slippage_bps: costs.slippage_bps,
+                cross_spread: true,
+                capacity_depth_levels: 0,
+                trade_tape_declared: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(decisions.last().unwrap().target_position, 0.0);
+        assert!(
+            (report.evaluation.metrics.cumulative_net_return - replay.cumulative_net_return).abs()
+                < 1e-12
+        );
+        assert!((report.evaluation.metrics.total_turnover - replay.total_turnover).abs() < 1e-12);
+        assert!((report.evaluation.metrics.max_drawdown - replay.max_drawdown).abs() < 1e-12);
+    }
+
+    #[test]
     fn research_event_has_stable_structured_contract() {
         let event = research_event_value(
             "alpha-harness",
@@ -4262,7 +4399,13 @@ pub(crate) mod tests {
         rewrite_features(&mut fixture, |row| {
             let direction = row.label.signum();
             row.features.insert("book_imbalance".to_string(), direction);
-            row.label = direction * 0.001;
+            row.features
+                .insert("mid_price".into(), 60_000.0 - direction * 60.0);
+            row.label = if direction > 0.0 {
+                60_060.0 / 59_940.0 - 1.0
+            } else {
+                59_940.0 / 60_060.0 - 1.0
+            };
         });
         let mut manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&fixture.replay_manifest_path).unwrap()).unwrap();
@@ -4671,7 +4814,13 @@ pub(crate) mod tests {
             rewrite_features(&mut fixture, |row| {
                 let direction = row.label.signum();
                 row.features.insert("book_imbalance".to_string(), direction);
-                row.label = direction * 0.001;
+                row.features
+                    .insert("mid_price".into(), 60_000.0 - direction * 60.0);
+                row.label = if direction > 0.0 {
+                    60_060.0 / 59_940.0 - 1.0
+                } else {
+                    59_940.0 / 60_060.0 - 1.0
+                };
             });
 
             let error = execute(fixture.args.clone()).unwrap_err();
@@ -4739,7 +4888,13 @@ pub(crate) mod tests {
         rewrite_features(&mut fixture, |row| {
             let direction = row.label.signum();
             row.features.insert("book_imbalance".to_string(), direction);
-            row.label = direction * 0.001;
+            row.features
+                .insert("mid_price".into(), 60_000.0 - direction * 60.0);
+            row.label = if direction > 0.0 {
+                60_060.0 / 59_940.0 - 1.0
+            } else {
+                59_940.0 / 60_060.0 - 1.0
+            };
         });
         execute(fixture.args.clone()).unwrap();
         let results = fixture.args.work_dir.join("results");
@@ -4810,7 +4965,13 @@ pub(crate) mod tests {
         rewrite_features(&mut fixture, |row| {
             let direction = row.label.signum();
             row.features.insert("book_imbalance".to_string(), direction);
-            row.label = direction * 0.001;
+            row.features
+                .insert("mid_price".into(), 60_000.0 - direction * 60.0);
+            row.label = if direction > 0.0 {
+                60_060.0 / 59_940.0 - 1.0
+            } else {
+                59_940.0 / 60_060.0 - 1.0
+            };
         });
         resign_mission(&mut fixture);
 
@@ -4861,7 +5022,13 @@ pub(crate) mod tests {
         rewrite_features(&mut fixture, |row| {
             let direction = row.label.signum();
             row.features.insert("book_imbalance".to_string(), direction);
-            row.label = direction * 0.001;
+            row.features
+                .insert("mid_price".into(), 60_000.0 - direction * 60.0);
+            row.label = if direction > 0.0 {
+                60_060.0 / 59_940.0 - 1.0
+            } else {
+                59_940.0 / 60_060.0 - 1.0
+            };
         });
 
         execute(fixture.args.clone()).unwrap();
@@ -5420,7 +5587,13 @@ pub(crate) mod tests {
         rewrite_features(&mut fixture, |row| {
             let direction = row.label.signum();
             row.features.insert("book_imbalance".to_string(), direction);
-            row.label = direction * 0.001;
+            row.features
+                .insert("mid_price".into(), 60_000.0 - direction * 60.0);
+            row.label = if direction > 0.0 {
+                60_060.0 / 59_940.0 - 1.0
+            } else {
+                59_940.0 / 60_060.0 - 1.0
+            };
         });
         std::fs::write(&fixture.args.holdout_claim_put_url, b"already-claimed").unwrap();
 
@@ -5468,10 +5641,13 @@ pub(crate) mod tests {
         rewrite_features_indexed(&mut fixture, |index, row| {
             let direction = if index % 2 == 0 { 1.0 } else { -1.0 };
             row.features.insert("book_imbalance".to_string(), direction);
-            row.label = if index < 130 {
-                direction * 0.001
+            let price_direction = if index < 130 { direction } else { -direction };
+            row.features
+                .insert("mid_price".into(), 60_000.0 - price_direction * 60.0);
+            row.label = if price_direction > 0.0 {
+                60_060.0 / 59_940.0 - 1.0
             } else {
-                -direction * 0.001
+                59_940.0 / 60_060.0 - 1.0
             };
         });
 
@@ -5524,7 +5700,13 @@ pub(crate) mod tests {
         rewrite_features(&mut fixture, |row| {
             let direction = row.label.signum();
             row.features.insert("book_imbalance".to_string(), direction);
-            row.label = direction * 0.001;
+            row.features
+                .insert("mid_price".into(), 60_000.0 - direction * 60.0);
+            row.label = if direction > 0.0 {
+                60_060.0 / 59_940.0 - 1.0
+            } else {
+                59_940.0 / 60_060.0 - 1.0
+            };
         });
         execute(fixture.args.clone()).unwrap();
 
@@ -5842,7 +6024,13 @@ pub(crate) mod tests {
             row.features.insert("spread_bps".to_string(), direction);
             row.features
                 .insert("mid_price".to_string(), direction * 0.25);
-            row.label = direction * 0.001;
+            row.features
+                .insert("mid_price".into(), 60_000.0 - direction * 60.0);
+            row.label = if direction > 0.0 {
+                60_060.0 / 59_940.0 - 1.0
+            } else {
+                59_940.0 / 60_060.0 - 1.0
+            };
         });
 
         execute(fixture.args.clone()).unwrap();
@@ -5948,7 +6136,13 @@ pub(crate) mod tests {
         rewrite_features(&mut fixture, |row| {
             let direction = row.label.signum();
             row.features.insert("book_imbalance".to_string(), direction);
-            row.label = direction * 0.001;
+            row.features
+                .insert("mid_price".into(), 60_000.0 - direction * 60.0);
+            row.label = if direction > 0.0 {
+                60_060.0 / 59_940.0 - 1.0
+            } else {
+                59_940.0 / 60_060.0 - 1.0
+            };
         });
 
         execute(fixture.args.clone()).unwrap();
@@ -6021,7 +6215,13 @@ pub(crate) mod tests {
         rewrite_features(&mut fixture, |row| {
             let direction = row.label.signum();
             row.features.insert("book_imbalance".to_string(), direction);
-            row.label = direction * 0.001;
+            row.features
+                .insert("mid_price".into(), 60_000.0 - direction * 60.0);
+            row.label = if direction > 0.0 {
+                60_060.0 / 59_940.0 - 1.0
+            } else {
+                59_940.0 / 60_060.0 - 1.0
+            };
         });
         execute(fixture.args.clone()).unwrap();
 
@@ -6208,7 +6408,13 @@ pub(crate) mod tests {
         rewrite_features(&mut fixture, |row| {
             let direction = row.label.signum();
             row.features.insert("book_imbalance".to_string(), direction);
-            row.label = direction * 0.001;
+            row.features
+                .insert("mid_price".into(), 60_000.0 - direction * 60.0);
+            row.label = if direction > 0.0 {
+                60_060.0 / 59_940.0 - 1.0
+            } else {
+                59_940.0 / 60_060.0 - 1.0
+            };
         });
         execute(fixture.args.clone()).unwrap();
 
@@ -6394,7 +6600,13 @@ pub(crate) mod tests {
         rewrite_features(&mut fixture, |row| {
             let direction = row.label.signum();
             row.features.insert("book_imbalance".to_string(), direction);
-            row.label = direction * 0.001;
+            row.features
+                .insert("mid_price".into(), 60_000.0 - direction * 60.0);
+            row.label = if direction > 0.0 {
+                60_060.0 / 59_940.0 - 1.0
+            } else {
+                59_940.0 / 60_060.0 - 1.0
+            };
         });
         rebind_mission_inputs(&mut fixture);
 
@@ -6972,7 +7184,13 @@ pub(crate) mod tests {
         rewrite_features(&mut fixture, |row| {
             let direction = row.label.signum();
             row.features.insert("book_imbalance".to_string(), direction);
-            row.label = direction * 0.001;
+            row.features
+                .insert("mid_price".into(), 60_000.0 - direction * 60.0);
+            row.label = if direction > 0.0 {
+                60_060.0 / 59_940.0 - 1.0
+            } else {
+                59_940.0 / 60_060.0 - 1.0
+            };
         });
         fixture
     }
@@ -7411,7 +7629,7 @@ message binance_replay {
         )
         .unwrap();
         let baseline_policy = CexBaselinePolicyV1::controlled_v1("baseline-policy-1").unwrap();
-        let supervised_decision_policy = CexSupervisedDecisionPolicyV1::controlled_v1();
+        let supervised_decision_policy = CexSupervisedDecisionPolicyV2::controlled_v2();
         let weight_policy =
             CexEqualAbsoluteWeightPolicyV1::controlled_v1("weight-policy-1").unwrap();
         let replay_policy = CexEventReplayPolicyV1::controlled_v1(
@@ -7824,7 +8042,13 @@ message binance_replay {
         rewrite_features(&mut fixture, |row| {
             let direction = row.label.signum();
             row.features.insert("book_imbalance".to_string(), direction);
-            row.label = direction * 0.001;
+            row.features
+                .insert("mid_price".into(), 60_000.0 - direction * 60.0);
+            row.label = if direction > 0.0 {
+                60_060.0 / 59_940.0 - 1.0
+            } else {
+                59_940.0 / 60_060.0 - 1.0
+            };
         });
         execute(fixture.args.clone()).unwrap();
 

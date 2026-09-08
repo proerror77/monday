@@ -18,11 +18,11 @@ use thiserror::Error;
 pub const MAX_ONNX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_ONNX_TENSOR_ELEMENTS: usize = 4 * 1024 * 1024;
 pub const MAX_CEX_FACTOR_BANK_MCTS_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
-pub const SEALED_HOLDOUT_EVALUATOR_VERSION: &str = "sealed-holdout-v4";
-pub const WALK_FORWARD_EVALUATOR_VERSION: &str = "purged-walk-forward-v4";
-pub const CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION: &str = "cex-baseline-purged-walk-forward-v1";
-pub const ONNX_WALK_FORWARD_EVALUATOR_VERSION: &str = "onnx-purged-walk-forward-v3";
-pub const ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION: &str = "onnx-sealed-holdout-v3";
+pub const SEALED_HOLDOUT_EVALUATOR_VERSION: &str = "sealed-holdout-v5";
+pub const WALK_FORWARD_EVALUATOR_VERSION: &str = "purged-walk-forward-v5";
+pub const CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION: &str = "cex-baseline-purged-walk-forward-v2";
+pub const ONNX_WALK_FORWARD_EVALUATOR_VERSION: &str = "onnx-purged-walk-forward-v4";
+pub const ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION: &str = "onnx-sealed-holdout-v4";
 pub const LOB_ONNX_PREPROCESSING_VERSION: &str = "lob-relative-price-log-size-v1";
 pub const EVALUATION_PROTOCOL_VERSION_V1: &str = "evaluation-protocol-v1";
 pub const CEX_MCTS_RESEARCH_RECEIPT_VERSION_V1: &str = "cex-mcts-research-receipt-v1";
@@ -7287,15 +7287,15 @@ mod tests {
 
     #[test]
     fn evaluator_versions_identify_predictive_evidence() {
-        assert_eq!(WALK_FORWARD_EVALUATOR_VERSION, "purged-walk-forward-v4");
-        assert_eq!(SEALED_HOLDOUT_EVALUATOR_VERSION, "sealed-holdout-v4");
+        assert_eq!(WALK_FORWARD_EVALUATOR_VERSION, "purged-walk-forward-v5");
+        assert_eq!(SEALED_HOLDOUT_EVALUATOR_VERSION, "sealed-holdout-v5");
         assert_eq!(
             ONNX_WALK_FORWARD_EVALUATOR_VERSION,
-            "onnx-purged-walk-forward-v3"
+            "onnx-purged-walk-forward-v4"
         );
         assert_eq!(
             ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION,
-            "onnx-sealed-holdout-v3"
+            "onnx-sealed-holdout-v4"
         );
     }
 

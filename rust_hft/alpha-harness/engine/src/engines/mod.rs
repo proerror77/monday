@@ -27,10 +27,11 @@ fn test_dataset() -> crate::evaluation::PreparedDataset {
     use chrono::{Duration, Utc};
 
     let start = Utc::now();
-    let rows = (0..4)
+    let rows = (0..5)
         .map(|index| ResearchRow {
             series_id: 1,
             available_time: start + Duration::seconds(index),
+            label_available_time: start + Duration::seconds(index) + chrono::Duration::seconds(1),
             signal: index as f64,
             features: std::collections::BTreeMap::new(),
             label: index as f64,
@@ -48,7 +49,7 @@ fn test_dataset() -> crate::evaluation::PreparedDataset {
                 validation_rows: 1,
                 fold_count: 1,
                 purge_rows: 1,
-                embargo_rows: 0,
+                embargo_rows: 1,
                 sealed_holdout_rows: 1,
             },
             EvaluationCostsV1 {

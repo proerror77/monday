@@ -24,6 +24,12 @@ pub enum EvaluationError {
         "capacity checks require positive mid_price and matching top-N bid/ask depth features"
     )]
     InvalidCapacityFeature,
+    #[error("prediction label is available before its declared horizon")]
+    InvalidLabelAvailability,
+    #[error("training label is not available before the validation window")]
+    TrainingLabelUnavailable,
+    #[error("validation label reaches the sealed holdout observation window")]
+    ValidationLabelReachesHoldout,
     #[error("dataset costs do not match the bound evaluation protocol")]
     ProtocolMismatch,
 }
@@ -31,7 +37,10 @@ pub enum EvaluationError {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResearchRow {
     pub series_id: u64,
+    /// Clock at which the feature observation can be used for a decision.
     pub available_time: DateTime<Utc>,
+    /// Actual availability of the supervised label, not a second observation clock.
+    pub label_available_time: DateTime<Utc>,
     pub signal: f64,
     #[serde(default)]
     pub features: BTreeMap<String, f64>,
@@ -172,6 +181,32 @@ impl PreparedDataset {
     }
 }
 
+pub(crate) fn validate_row_clocks(
+    rows: &[ResearchRow],
+    protocol: &EvaluationProtocolV1,
+) -> Result<(), EvaluationError> {
+    if rows
+        .windows(2)
+        .any(|pair| pair[0].available_time >= pair[1].available_time)
+    {
+        return Err(EvaluationError::NonMonotonicAvailability);
+    }
+    let duration = u64::try_from(protocol.labels.horizon_buckets)
+        .ok()
+        .and_then(|count| count.checked_mul(protocol.labels.observation_frequency_millis))
+        .and_then(|value| i64::try_from(value).ok())
+        .and_then(chrono::TimeDelta::try_milliseconds)
+        .ok_or(EvaluationError::InvalidLabelAvailability)?;
+    if rows.iter().any(|row| {
+        row.available_time
+            .checked_add_signed(duration)
+            .is_none_or(|earliest| row.label_available_time < earliest)
+    }) {
+        return Err(EvaluationError::InvalidLabelAvailability);
+    }
+    Ok(())
+}
+
 pub fn prepare_dataset(
     rows: Vec<ResearchRow>,
     protocol: &EvaluationProtocolV1,
@@ -253,12 +288,7 @@ pub fn prepare_dataset(
     }
     let mut registered_features = vec!["signal".to_string()];
     registered_features.extend(feature_names);
-    if rows
-        .windows(2)
-        .any(|window| window[0].available_time >= window[1].available_time)
-    {
-        return Err(EvaluationError::NonMonotonicAvailability);
-    }
+    validate_row_clocks(&rows, protocol)?;
     if rows.len() <= config.sealed_holdout_rows {
         return Err(EvaluationError::InsufficientRows);
     }
@@ -286,6 +316,18 @@ pub fn prepare_dataset(
             .ok_or(EvaluationError::InsufficientRows)?;
         if embargo_end > holdout_start {
             return Err(EvaluationError::InsufficientRows);
+        }
+        if rows[..train_end]
+            .iter()
+            .any(|row| row.label_available_time >= rows[validation_start].available_time)
+        {
+            return Err(EvaluationError::TrainingLabelUnavailable);
+        }
+        if rows[validation_start..validation_end]
+            .iter()
+            .any(|row| row.label_available_time >= rows[holdout_start].available_time)
+        {
+            return Err(EvaluationError::ValidationLabelReachesHoldout);
         }
         folds.push(WalkForwardFold {
             train: 0..train_end,
@@ -342,6 +384,9 @@ mod tests {
             .map(|index| ResearchRow {
                 series_id: 1,
                 available_time: start + Duration::seconds(index as i64),
+                label_available_time: start
+                    + Duration::seconds(index as i64)
+                    + chrono::Duration::seconds(1),
                 signal: index as f64,
                 features: BTreeMap::new(),
                 label: index as f64 * 0.01,
@@ -380,6 +425,40 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn delayed_training_labels_cannot_enter_a_validation_window() {
+        let mut input = rows(500);
+        let config = protocol();
+        let prepared = prepare_dataset(input.clone(), &config).unwrap();
+        let fold = &prepared.engine_context().folds()[0];
+        input[fold.train.end - 1].label_available_time =
+            input[fold.validation.start].available_time;
+        assert!(matches!(
+            prepare_dataset(input, &config),
+            Err(EvaluationError::TrainingLabelUnavailable)
+        ));
+        let mut input = rows(500);
+        input[0].label_available_time = input[0].available_time;
+        assert!(matches!(
+            prepare_dataset(input, &config),
+            Err(EvaluationError::InvalidLabelAvailability)
+        ));
+    }
+
+    #[test]
+    fn validation_labels_cannot_read_into_sealed_holdout() {
+        let mut input = rows(50);
+        let config = protocol();
+        let prepared = prepare_dataset(input.clone(), &config).unwrap();
+        let last_validation = prepared.plan().folds.last().unwrap().validation.end - 1;
+        input[last_validation].label_available_time =
+            input[prepared.plan().sealed_holdout.start].available_time;
+        assert!(matches!(
+            prepare_dataset(input, &config),
+            Err(EvaluationError::ValidationLabelReachesHoldout)
+        ));
     }
 
     #[test]

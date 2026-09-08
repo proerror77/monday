@@ -17,7 +17,7 @@ use alpha_domain::{
     EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1, SearchBudget,
     CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD, CEX_RESEARCH_MISSION_SCHEMA_V1,
 };
-use alpha_engine::baselines::CexSupervisedDecisionPolicyV1;
+use alpha_engine::baselines::CexSupervisedDecisionPolicyV2;
 use anyhow::{bail, Context};
 use hft_collector::{import_feature_dataset, FeatureDatasetManifest};
 use hft_research_manifest::CexReplayDatasetManifestV5;
@@ -34,8 +34,11 @@ pub(crate) const MAX_RESEARCH_PLAN_GENERATION: u8 = 3;
 const INITIAL_TRAIN_ROWS: usize = 7_200;
 const VALIDATION_ROWS: usize = 3_600;
 const FOLD_COUNT: usize = 3;
-const PURGE_ROWS: usize = 5;
-const EMBARGO_ROWS: usize = 1;
+// Labels mature five seconds after observation. Leave another full horizon
+// before validation so the bound trainer's purge/embargo contract is real.
+const PURGE_ROWS: usize = 10;
+// Keep the last validation label strictly before the sealed holdout.
+const EMBARGO_ROWS: usize = 5;
 const HOLDOUT_ROWS: usize = 3_600;
 const MIN_ROWS: usize =
     INITIAL_TRAIN_ROWS + FOLD_COUNT * (VALIDATION_ROWS + EMBARGO_ROWS) + PURGE_ROWS + HOLDOUT_ROWS;
@@ -83,11 +86,11 @@ pub(crate) enum CexCampaignPositionPolicyV1 {
 }
 
 impl CexCampaignPositionPolicyV1 {
-    pub(crate) fn decision_policy(self) -> CexSupervisedDecisionPolicyV1 {
+    pub(crate) fn decision_policy(self) -> CexSupervisedDecisionPolicyV2 {
         match self {
-            Self::CostAware => CexSupervisedDecisionPolicyV1::controlled_v1(),
-            Self::PredictionIdentity => CexSupervisedDecisionPolicyV1::prediction_identity_v1(),
-            Self::HystereticCostAware => CexSupervisedDecisionPolicyV1::hysteretic_cost_aware_v1(),
+            Self::CostAware => CexSupervisedDecisionPolicyV2::controlled_v2(),
+            Self::PredictionIdentity => CexSupervisedDecisionPolicyV2::prediction_identity_v2(),
+            Self::HystereticCostAware => CexSupervisedDecisionPolicyV2::hysteretic_cost_aware_v2(),
         }
     }
 }
@@ -925,7 +928,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let mission = rendered.mission;
-        assert_eq!(MIN_ROWS, 21_608);
+        assert_eq!(MIN_ROWS, 21_625);
         assert_eq!(mission.spec.search.budget.max_candidates, 22);
         assert_eq!(
             mission.spec.search.planned_gp_and_subset_trials().unwrap(),
@@ -1362,6 +1365,10 @@ pub(crate) mod tests {
     }
 
     impl Fixture {
+        pub(crate) fn canonical() -> Self {
+            Self::new(MIN_ROWS)
+        }
+
         pub(crate) fn new(rows: usize) -> Self {
             Self::with_optional_feature_source(rows, None)
         }
