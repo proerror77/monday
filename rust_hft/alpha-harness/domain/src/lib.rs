@@ -2674,83 +2674,9 @@ impl CexBaselinePolicyV1 {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CexBaselineModelKindV1 {
-    Ridge,
-    ShallowCart,
-    BurnMlp,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "model_kind", rename_all = "snake_case")]
-pub enum CexBaselineModelV1 {
-    Ridge {
-        intercept: f64,
-        means: Vec<f64>,
-        scales: Vec<f64>,
-        coefficients: Vec<f64>,
-    },
-    ShallowCart {
-        root: CexBaselineCartNodeV1,
-    },
-    /// Historical diagnostic-only representation, retained for audit decoding.
-    BurnMlp {
-        request_semantic_sha256: String,
-        semantic_model_sha256: String,
-        config_sha256: String,
-        trainer_version: String,
-        symbol: String,
-        venue: String,
-        row_count: usize,
-        seed: u64,
-        hidden_dim: usize,
-        epochs: usize,
-        learning_rate: f64,
-        min_rows: usize,
-    },
-    /// Executable fitted parameters bound to the original training tensor digest.
-    BurnMlpPortable {
-        request_semantic_sha256: String,
-        semantic_model_sha256: String,
-        config_sha256: String,
-        trainer_version: String,
-        symbol: String,
-        venue: String,
-        row_count: usize,
-        seed: u64,
-        hidden_dim: usize,
-        epochs: usize,
-        learning_rate: f64,
-        min_rows: usize,
-        parameters: hft_research_manifest::model::PortableMlpV1,
-    },
-}
-
-impl CexBaselineModelV1 {
-    pub fn kind(&self) -> CexBaselineModelKindV1 {
-        match self {
-            Self::Ridge { .. } => CexBaselineModelKindV1::Ridge,
-            Self::ShallowCart { .. } => CexBaselineModelKindV1::ShallowCart,
-            Self::BurnMlp { .. } | Self::BurnMlpPortable { .. } => CexBaselineModelKindV1::BurnMlp,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "node_kind", rename_all = "snake_case")]
-pub enum CexBaselineCartNodeV1 {
-    Leaf {
-        value: f64,
-        sample_count: usize,
-    },
-    Split {
-        feature_index: usize,
-        threshold: f64,
-        left: Box<Self>,
-        right: Box<Self>,
-    },
-}
+pub use hft_research_manifest::model::{
+    CexBaselineCartNodeV1, CexBaselineModelKindV1, CexBaselineModelV1,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
