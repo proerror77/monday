@@ -167,6 +167,7 @@ fn log_event(event: &str, details: Value) {
             "component": "lob-pit-materializer",
             "event": event,
             "details": details,
+            "memory": hft_collector::research_memory::observe_research_memory(),
         })
     );
 }

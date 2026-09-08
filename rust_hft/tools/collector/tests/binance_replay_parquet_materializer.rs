@@ -202,6 +202,18 @@ fn cli_materializes_a_verified_triplet_into_a_content_addressed_parquet_partitio
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("\"schema_version\":\"monday.research_event.v1\""));
+    let event: Value = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|value| value["schema_version"] == "monday.research_event.v1")
+        .unwrap();
+    assert!(event["memory"].is_object());
+    assert!(event["memory"].get("process_peak_rss_bytes").is_some());
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    assert!(event["memory"]["process_peak_rss_bytes"]
+        .as_u64()
+        .is_some_and(|bytes| bytes > 0));
+
     assert!(stderr.contains("\"event\":\"replay_materialization_started\""));
     assert!(stderr.contains("\"event\":\"replay_materialization_completed\""));
     let published: Value = serde_json::from_slice(&output.stdout).unwrap();
