@@ -834,6 +834,47 @@ impl TrainedContractModel {
             .ok_or_else(|| ContractTrainingError::Artifact("empty model output".to_string()))
     }
 
+    pub fn export_parameters(
+        &self,
+    ) -> Result<hft_research_manifest::model::PortableMlpV1, ContractTrainingError> {
+        use hft_research_manifest::model::{PortableMlpV1, PORTABLE_MLP_SCHEMA_V1};
+        fn values<const D: usize>(
+            tensor: Tensor<CpuBackend, D>,
+        ) -> Result<Vec<f32>, ContractTrainingError> {
+            tensor
+                .into_data()
+                .into_vec::<f32>()
+                .map_err(|error| ContractTrainingError::Artifact(format!("{error:?}")))
+        }
+        let _backend_guard = lock_ndarray_backend()?;
+        let hidden_bias = self.model.hidden.bias.as_ref().ok_or_else(|| {
+            ContractTrainingError::InternalConsistency("hidden bias is missing".into())
+        })?;
+        let output_bias = self.model.output.bias.as_ref().ok_or_else(|| {
+            ContractTrainingError::InternalConsistency("output bias is missing".into())
+        })?;
+        let parameters = PortableMlpV1 {
+            schema_version: PORTABLE_MLP_SCHEMA_V1.into(),
+            input_dim: self.request.config.input_dim,
+            hidden_dim: self.request.config.hidden_dim,
+            hidden_weight: values(self.model.hidden.weight.val())?,
+            hidden_bias: values(hidden_bias.val())?,
+            output_weight: values(self.model.output.weight.val())?,
+            output_bias: values(output_bias.val())?.first().copied().ok_or_else(|| {
+                ContractTrainingError::InternalConsistency("output bias is empty".into())
+            })?,
+        };
+        let observed = parameters
+            .semantic_sha256()
+            .map_err(ContractTrainingError::Artifact)?;
+        if observed != self.diagnostics.semantic_model_sha256.as_str() {
+            return Err(ContractTrainingError::InternalConsistency(
+                "exported parameter digest differs from trained model".into(),
+            ));
+        }
+        Ok(parameters)
+    }
+
     pub fn save_bundle(
         &self,
         output_dir: impl AsRef<Path>,

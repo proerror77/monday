@@ -130,6 +130,29 @@ fn independent_training_runs_have_the_same_semantic_digests() {
     let first = train_contract_model(&rows_artifact, &sealed).unwrap();
     let second = train_contract_model(&rows_artifact, &sealed).unwrap();
 
+    let portable = first.export_parameters().unwrap();
+    let restored: hft_research_manifest::model::PortableMlpV1 =
+        serde_json::from_slice(&serde_json::to_vec(&portable).unwrap()).unwrap();
+    assert_eq!(
+        restored.semantic_sha256().unwrap(),
+        first.diagnostics().semantic_model_sha256.as_str()
+    );
+    for feature in [-10.0_f32, -1.0, 0.0, 0.25, 1.0, 10.0] {
+        let original = first.predict(&[feature]).unwrap();
+        let prediction = restored.predict(&[feature]).unwrap();
+        assert!((original - prediction).abs() <= 1e-5 * original.abs().max(1.0));
+        assert_eq!(
+            prediction.to_bits(),
+            portable.predict(&[feature]).unwrap().to_bits()
+        );
+    }
+    let mut tampered = restored;
+    tampered.hidden_weight[0] += 1.0;
+    assert_ne!(
+        tampered.semantic_sha256().unwrap(),
+        portable.semantic_sha256().unwrap()
+    );
+
     assert_eq!(
         first.diagnostics().semantic_model_sha256,
         second.diagnostics().semantic_model_sha256
