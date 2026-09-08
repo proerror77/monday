@@ -1284,6 +1284,11 @@ impl ExecutionClient for BybitExecutionClient {
     }
 
     async fn place_order_envelope(&mut self, envelope: &OrderIntentEnvelope) -> HftResult<OrderId> {
+        envelope
+            .validate_cex_pre_execution(hft_core::now_micros(), None)
+            .map_err(|reason| {
+                HftError::Execution(format!("execution envelope rejected: {reason:?}"))
+            })?;
         self.next_client_order_id = Some(envelope.client_order_id.clone());
         self.place_order(envelope.intent.clone()).await
     }
@@ -2435,6 +2440,34 @@ mod tests {
             client.place_order_envelope(&envelope).await.unwrap(),
             OrderId("bybit-link-42".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn signed_slippage_rejects_missing_reference_before_adapter_entry() {
+        let mut client = BybitExecutionClient::new(make_test_config(ExecutionMode::Paper)).unwrap();
+        let lifecycle = OrderIntentLifecycle {
+            max_slippage_bps: Some(25),
+            ..Default::default()
+        };
+        let envelope = OrderIntentEnvelope::new(
+            OrderIntent::crypto_spot(
+                Symbol::new("BTCUSDT"),
+                Side::Buy,
+                Quantity::from_f64(0.001).unwrap(),
+                OrderType::Limit,
+                Some(Price::from_f64(100.0).unwrap()),
+                TimeInForce::IOC,
+                "bounded".to_string(),
+                Some(hft_core::VenueId::BYBIT),
+            ),
+            lifecycle,
+        );
+        assert!(client
+            .place_order_envelope(&envelope)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("MissingSlippageReference"));
     }
 
     #[tokio::test]

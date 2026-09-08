@@ -27,6 +27,31 @@ struct QueuedMarketEvent {
     event: TrackedMarketEvent,
 }
 
+fn stamp_local_receive(event: &mut MarketEvent, received_at_unix_us: Option<u64>) {
+    let timestamps = match event {
+        MarketEvent::Snapshot(value) => &mut value.timestamps,
+        MarketEvent::Update(value) => &mut value.timestamps,
+        MarketEvent::Quote(value) => &mut value.timestamps,
+        MarketEvent::Trade(value) => &mut value.timestamps,
+        MarketEvent::Bar(value) => &mut value.timestamps,
+        _ => return,
+    };
+    timestamps.local_receive = received_at_unix_us.map(hft_core::LocalReceiveTimestamp::new);
+}
+
+fn convert_received_message(
+    message: BybitWsMsg,
+    last_update_ids: &mut HashMap<String, u64>,
+    fast_bbo_enabled: bool,
+    received_at_unix_us: Option<u64>,
+) -> HftResult<Vec<MarketEvent>> {
+    let mut events = convert_message_with_fast_bbo(message, last_update_ids, fast_bbo_enabled)?;
+    for event in &mut events {
+        stamp_local_receive(event, received_at_unix_us);
+    }
+    Ok(events)
+}
+
 #[derive(Debug, Clone)]
 struct StreamInvalidation {
     generation: u64,
@@ -478,10 +503,11 @@ impl MarketStream for BybitMarketStream {
                                         };
                                         match parse_bytes::<BybitWsMsg>(&mut bytes).and_then(
                                             |message| {
-                                                convert_message_with_fast_bbo(
+                                                convert_received_message(
                                                     message,
                                                     &mut last_update_ids,
                                                     fast_bbo_enabled,
+                                                    metrics.received_at_unix_us,
                                                 )
                                             },
                                         ) {
@@ -872,6 +898,53 @@ mod tests {
         .unwrap();
         let events = convert_message(delta, &mut last_update_ids).unwrap();
         assert!(matches!(events.as_slice(), [MarketEvent::Update(_)]));
+    }
+
+    #[test]
+    fn received_frames_preserve_wall_receipt_on_all_normalized_market_events() {
+        let frames = [
+            r#"{"topic":"orderbook.50.BTCUSDT","type":"snapshot","ts":1000,"data":{"s":"BTCUSDT","b":[["100","2"]],"a":[["101","3"]],"u":10,"seq":20,"cts":999}}"#,
+            r#"{"topic":"orderbook.50.BTCUSDT","type":"delta","ts":1001,"data":{"s":"BTCUSDT","b":[["100","4"]],"a":[],"u":11,"seq":21,"cts":1000}}"#,
+            r#"{"topic":"orderbook.1.BTCUSDT","type":"snapshot","ts":1001,"data":{"s":"BTCUSDT","b":[["100","2"]],"a":[["101","3"]],"u":12,"seq":22,"cts":1000}}"#,
+            r#"{"topic":"publicTrade.BTCUSDT","type":"snapshot","ts":1000,"data":[{"T":1000,"s":"BTCUSDT","S":"Buy","v":"0.25","p":"100.5","i":"trade-1"}]}"#,
+        ];
+        let mut ids = HashMap::new();
+        for frame in frames {
+            let baseline = convert_message_with_fast_bbo(
+                serde_json::from_str(frame).unwrap(),
+                &mut ids.clone(),
+                true,
+            )
+            .unwrap();
+            let received = convert_received_message(
+                serde_json::from_str(frame).unwrap(),
+                &mut ids,
+                true,
+                Some(1_001_777),
+            )
+            .unwrap();
+            assert_eq!(received.len(), 1);
+            assert_eq!(
+                received[0].ordering_timestamp_us(),
+                baseline[0].ordering_timestamp_us()
+            );
+            assert_eq!(
+                received[0]
+                    .timestamps()
+                    .unwrap()
+                    .local_receive
+                    .map(|time| time.as_micros()),
+                Some(1_001_777)
+            );
+        }
+        let unavailable = convert_received_message(
+            serde_json::from_str(frames[0]).unwrap(),
+            &mut HashMap::new(),
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(unavailable[0].timestamps().unwrap().local_receive, None);
     }
 
     #[test]

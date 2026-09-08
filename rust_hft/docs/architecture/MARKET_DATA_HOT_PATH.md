@@ -79,6 +79,26 @@ Do not run repeated deep snapshot recovery as the latency lane.
   exchange batching interval is not misclassified as 20 ms of local processing delay.
 - Market orders without an executable venue quote fail closed before risk review.
 - Every surviving intent still passes account/position/order-rate risk and the lifecycle gate.
+- Signed quantity, notional, latency and slippage ceilings are intersected with stricter
+  upstream limits, including the post-risk strategy hot path. Risk cannot loosen the signed cap.
+- Price protection uses the executable side (ask for buys, bid for sells) of the canonical
+  instrument/venue book. The reference retains its actual local receive timestamp; publishing
+  a snapshot does not renew the quote. Missing, future, stale or mismatched references fail closed.
+- The engine rebuilds references before risk review. The execution worker reloads the same
+  existing market snapshot reader immediately before adapter entry, checking both the original
+  decision reference and the current quote. Caller serialization cannot inject a trusted quote.
+- Decision-book sequences are bound to their own venue and symbol. Cross-venue legs validate
+  the source book independently of the target executable quote; unrelated sequence domains
+  are never compared. Missing or reset source books fail closed.
+- The trusted execution adapter declares its price-protection protocol. Ordinary CEX adapters
+  use the canonical book checks; prediction adapters retain their authenticated venue-quote
+  checks. Runtime derives this routing from adapter capabilities, never from order fields.
+  The common lifecycle gate still checks expiry and size for both protocols.
+- Under canonical CEX price protection, only a positive exchange-enforced limit price is supported.
+  A market order with a populated price field is still unprotected and is rejected; the system
+  does not silently change its order type. Limits within the exact adverse-price boundary pass,
+  while better prices are allowed. This bounds order price, not queue position, fill probability
+  or the market impact of an eventual fill. LiveSmall remains disabled.
 - Order submission is never blindly retried. HTTP 418/429 and Bybit rate-limit codes are known
   rejections; an accepted but undecodable response latches intake for client-order-ID reconciliation.
 
@@ -93,3 +113,36 @@ checksum or continuity guarantee. This adapter fails closed for every locally ob
 parse, queue, and ordering fault. Proving that the exchange did not silently omit a delta requires a
 second independent feed (or eligible MMWS/Gateway SBE access) and cross-feed book verification; a
 single retail WebSocket cannot make that stronger claim.
+
+### Paper/Shadow displayed-book execution
+
+The in-process `SimulatedExecutionClient` receives the same canonical `MarketView`
+reader from `SystemBuilder` as the execution worker. An unbound reader, missing
+local-receive clock, crossed/empty book, future timestamp, or quote older than one
+second prevents order acceptance. No market order uses a caller-provided price as
+its fill price.
+
+The model applies a 50 ms minimum arrival delay and samples the current book every
+5 ms. It executes marketable quantity in price order, constrained by limit price
+and displayed quantities. GTC remainders rest; IOC remainders cancel; FOK cancels
+without consuming liquidity if the full remaining quantity is unavailable. Paper
+orders are processed in local submission order; amendments reset their arrival
+delay and priority. This local ordering does not estimate an exchange queue.
+
+All orders in one simulated client share a remaining-depth budget. Republishing
+an unchanged level, including under a new book sequence, does not replenish it.
+Only an observed quantity increase adds available quantity; quantity decreases
+can reduce availability. A level that disappears and is later observed again
+starts a new displayed level. Sequence or receive-clock regression cannot refresh
+the budget. This is a conservative model of displayed taker liquidity, not measured
+market impact or proof of real strategy capacity. Passive fills, hidden liquidity,
+exchange queue position and stochastic network latency remain unmodeled. These
+assumptions do not change replay capability receipts or enable live execution.
+
+Partial fills update cumulative quantity and weighted fill price. An amendment's
+quantity means the new total, so already filled quantity is subtracted once.
+Cancel and matching operations share one state lock. Event capacity is reserved
+for the entire state transition before orders or depth are changed. On insufficient
+capacity the matcher stops with unhealthy delivery; it does not commit an
+unreported fill. Disconnect joins the stopped matcher, and dropping the client
+aborts its owned task.

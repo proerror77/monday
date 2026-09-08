@@ -221,6 +221,7 @@ pub struct SystemBuilder {
     config: SystemConfig,
     event_consumers: Vec<EventConsumer>,
     execution_clients: Vec<Box<dyn ExecutionClient>>,
+    simulated_market_bindings: Vec<simulated_execution::MarketBinding>,
     strategies: Vec<Box<dyn Strategy>>,
     risk_managers: Vec<Box<dyn RiskManager>>,
     // 僅登記市場流規劃，實際橋接在 Runtime::start() 內進行
@@ -241,6 +242,7 @@ impl SystemBuilder {
             config,
             event_consumers: Vec::new(),
             execution_clients: Vec::new(),
+            simulated_market_bindings: Vec::new(),
             strategies: Vec::new(),
             risk_managers: Vec::new(),
             market_stream_plans: Vec::new(),
@@ -319,6 +321,7 @@ impl SystemBuilder {
     /// Register the in-process paper execution adapter used by bounded Paper/Shadow runs.
     pub fn register_simulated_execution_client(mut self, venue: VenueId) -> Self {
         let client = simulated_execution::SimulatedExecutionClient::new(venue);
+        self.simulated_market_bindings.push(client.market_binding());
         self = self.register_execution_client_with_venue(client, venue);
         self
     }
@@ -650,6 +653,12 @@ impl SystemBuilder {
             engine.register_event_consumer(consumer);
         }
 
+        for binding in self.simulated_market_bindings {
+            assert!(
+                binding.set(engine.market_reader()).is_ok(),
+                "paper market reader is bound once"
+            );
+        }
         for client in self.execution_clients {
             engine.register_execution_client_boxed(client);
         }
@@ -1007,16 +1016,42 @@ impl SystemRuntime {
             let (engine_queues, mut worker_queues) = create_execution_queues(queue_config);
 
             // 获取执行客户端从引擎移出，设置队列
-            let (execution_clients, engine_notify) = {
+            let (execution_clients, engine_notify, market_reader) = {
                 let mut eng = self.engine.lock().await;
                 let notify = eng.get_wakeup_notify();
                 eng.set_execution_queues(engine_queues);
                 let clients = eng.take_execution_clients();
-                (clients, notify)
+                let mut price_protection = std::collections::HashMap::new();
+                for (index, client) in clients.iter().enumerate() {
+                    let venue = self
+                        .execution_client_venues
+                        .get(index)
+                        .copied()
+                        .or_else(|| {
+                            self.config
+                                .venues
+                                .get(index)
+                                .and_then(|venue| hft_core::VenueId::from_str(&venue.name))
+                        });
+                    if let Some(venue) = venue {
+                        if price_protection
+                            .insert(venue, client.price_protection())
+                            .is_some_and(|previous| previous != client.price_protection())
+                        {
+                            return Err(HftError::Config(
+                                "ambiguous price-protection protocols for one venue".into(),
+                            )
+                            .into());
+                        }
+                    }
+                }
+                eng.set_execution_price_protection(price_protection);
+                (clients, notify, eng.market_reader())
             };
 
             // 为执行队列设置引擎唤醒通知器
             worker_queues.set_engine_notify(engine_notify);
+            worker_queues.set_market_reader(market_reader);
 
             // 🔥 Phase 1.5: 启动执行 worker - 支持路由器配置
             let worker_config = ExecutionWorkerConfig {
@@ -1988,9 +2023,75 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn simulated_execution_reads_the_builders_canonical_book() {
+        let runtime = SystemBuilder::new(SystemConfig::default())
+            .register_simulated_execution_client(VenueId::MOCK)
+            .build();
+        let mut clients = {
+            let mut engine = runtime.engine.lock().await;
+            let now = hft_core::now_micros();
+            engine
+                .create_event_ingester_pair()
+                .lock()
+                .unwrap()
+                .ingest(MarketEvent::Snapshot(MarketSnapshot {
+                    symbol: Symbol::new("BTCUSDT"),
+                    timestamp: now,
+                    bids: vec![BookLevel::new_unchecked(99.0, 10.0)],
+                    asks: vec![BookLevel::new_unchecked(101.0, 10.0)],
+                    sequence: 1,
+                    source_venue: Some(VenueId::MOCK),
+                    timestamps: MarketDataTimestamps::local_only(LocalReceiveTimestamp::new(now)),
+                }))
+                .unwrap();
+            engine.tick().unwrap();
+            engine.take_execution_clients()
+        };
+        clients[0].connect().await.unwrap();
+        let mut stream = clients[0].execution_stream().await.unwrap();
+        let order_id = clients[0]
+            .place_order(ports::OrderIntent::crypto_spot(
+                Symbol::new("BTCUSDT"),
+                Side::Buy,
+                Quantity(Decimal::ONE),
+                OrderType::Market,
+                None,
+                TimeInForce::IOC,
+                "paper-book-test".into(),
+                Some(VenueId::MOCK),
+            ))
+            .await
+            .unwrap();
+        let fill = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            use futures::StreamExt;
+            while let Some(event) = stream.next().await {
+                if let ExecutionEvent::Fill {
+                    order_id: filled,
+                    price,
+                    quantity,
+                    ..
+                } = event.unwrap()
+                {
+                    assert_eq!(filled, order_id);
+                    return (price, quantity);
+                }
+            }
+            panic!("paper event stream ended before a fill");
+        })
+        .await
+        .unwrap();
+        assert_eq!(fill, (Price(Decimal::from(101)), Quantity(Decimal::ONE)));
+        clients[0].disconnect().await.unwrap();
+    }
+
     #[test]
     fn builder_writes_verified_execution_limits_into_engine() {
         let mut config = SystemConfig::default();
+        config.engine.queue_capacity = 16;
+        config.engine.top_n = 5;
+        config.engine.stale_us = 1_000_000;
+        config.engine.intent_max_latency_us = 1_000_000;
         config.engine.intent_max_slippage_bps = Some(25);
         config.engine.intent_max_order_notional = Some(Decimal::from(50));
         config.engine.intent_max_order_quantity = Some(Decimal::new(5, 1));
@@ -2016,6 +2117,28 @@ mod tests {
         ));
 
         intent.quantity = Quantity::from_f64(0.4).unwrap();
+        assert!(
+            engine.submit_order_intent(intent.clone()).is_err(),
+            "a smaller order still needs a trusted quote"
+        );
+        let now = hft_core::now_micros();
+        let ingester = engine.create_event_ingester_pair();
+        ingester
+            .lock()
+            .unwrap()
+            .ingest(MarketEvent::Snapshot(MarketSnapshot {
+                symbol: Symbol::new("BTCUSDT"),
+                timestamp: now,
+                bids: vec![BookLevel::new_unchecked(99.9, 10.0)],
+                asks: vec![BookLevel::new_unchecked(100.0, 10.0)],
+                sequence: 1,
+                source_venue: Some(VenueId::MOCK),
+                timestamps: hft_core::MarketDataTimestamps::local_only(
+                    hft_core::LocalReceiveTimestamp::new(now),
+                ),
+            }))
+            .unwrap();
+        engine.tick().unwrap();
         engine
             .submit_order_intent(intent)
             .expect("order below configured notional limit");

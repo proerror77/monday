@@ -449,7 +449,7 @@ impl OrderIntentLifecycle {
 
     pub fn is_stale_for_book_seq(&self, latest_book_seq: u64) -> bool {
         self.source_book_seq
-            .is_some_and(|source_seq| latest_book_seq > source_seq)
+            .is_some_and(|source_seq| latest_book_seq != source_seq)
     }
 
     pub fn latency_us_at(&self, now: Timestamp) -> u64 {
@@ -487,7 +487,7 @@ impl OrderIntentLifecycle {
         if let (Some(source_book_seq), Some(latest_book_seq)) =
             (self.source_book_seq, latest_book_seq)
         {
-            if latest_book_seq > source_book_seq {
+            if latest_book_seq != source_book_seq {
                 return Err(OrderIntentRejectReason::SourceBookStale {
                     source_book_seq,
                     latest_book_seq,
@@ -511,6 +511,26 @@ impl OrderIntentLifecycle {
     }
 }
 
+/// Runtime-owned executable-side quote. A serialized intent cannot supply trusted market data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionPriceReference {
+    pub venue: VenueId,
+    pub symbol: Symbol,
+    pub side: Side,
+    pub price: Price,
+    pub book_sequence: u64,
+    pub received_at: LocalReceiveTimestamp,
+}
+
+/// Selected by the trusted execution adapter, never by an order or serialized caller.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExecutionPriceProtection {
+    #[default]
+    CanonicalBook,
+    /// The adapter obtains and enforces its own authenticated executable-quote protocol.
+    VenueQuote,
+}
+
 /// 帶生命週期的下單意圖。這是策略輸出和風控/執行邊界之間的兼容 envelope，
 /// 不改動既有 Strategy trait。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -524,6 +544,12 @@ pub struct OrderIntentEnvelope {
     /// identities before adapter entry; `None` is retained only for historical decoding.
     #[serde(default)]
     pub account_id: Option<AccountId>,
+    /// Rebuilt from the canonical market reader at runtime, never deserialized from a caller.
+    #[serde(skip)]
+    pub price_reference: Option<ExecutionPriceReference>,
+    /// Venue/instrument identity of the decision book; distinct from the execution leg's book.
+    #[serde(skip)]
+    pub source_book_identity: Option<VenueSymbol>,
 }
 
 impl OrderIntentEnvelope {
@@ -535,6 +561,8 @@ impl OrderIntentEnvelope {
             lifecycle,
             client_order_id,
             account_id: None,
+            price_reference: None,
+            source_book_identity: None,
         }
     }
 
@@ -569,6 +597,90 @@ impl OrderIntentEnvelope {
         self.lifecycle
             .validate_pre_execution(now, latest_book_seq)?;
         self.validate_order_limits()
+    }
+
+    pub fn validate_cex_pre_execution(
+        &self,
+        now: Timestamp,
+        latest_book_seq: Option<u64>,
+    ) -> Result<(), OrderIntentRejectReason> {
+        self.validate_pre_execution(now, latest_book_seq)?;
+        self.validate_slippage_reference(now, self.price_reference.as_ref())
+    }
+
+    /// Bound the venue-enforced limit against a fresh, instrument-bound executable quote.
+    /// This is pre-trade price protection, not a claim about fill probability or market impact.
+    pub fn validate_slippage_reference(
+        &self,
+        now: Timestamp,
+        reference: Option<&ExecutionPriceReference>,
+    ) -> Result<(), OrderIntentRejectReason> {
+        let Some(max_slippage_bps) = self.lifecycle.max_slippage_bps else {
+            return Ok(());
+        };
+        if !(1..=10_000).contains(&max_slippage_bps) {
+            return Err(OrderIntentRejectReason::InvalidMaxSlippage { max_slippage_bps });
+        }
+        let reference = reference.ok_or(OrderIntentRejectReason::MissingSlippageReference)?;
+        if self.intent.target_venue != Some(reference.venue)
+            || self.intent.symbol != reference.symbol
+            || self.intent.side != reference.side
+            || reference.price.0 <= rust_decimal::Decimal::ZERO
+        {
+            return Err(OrderIntentRejectReason::SlippageReferenceMismatch);
+        }
+        let lifetime = self.lifecycle.max_latency_us.or_else(|| {
+            (self.lifecycle.valid_until != Timestamp::MAX)
+                .then(|| {
+                    self.lifecycle
+                        .valid_until
+                        .checked_sub(self.lifecycle.created_ts)
+                })
+                .flatten()
+        });
+        let max_age_us = lifetime
+            .filter(|age| *age > 0)
+            .ok_or(OrderIntentRejectReason::MissingSlippageReferenceLifetime)?;
+        let received_at = reference.received_at.as_micros();
+        if received_at == 0
+            || now
+                .checked_sub(received_at)
+                .is_none_or(|age| age > max_age_us)
+        {
+            return Err(OrderIntentRejectReason::SlippageReferenceExpired {
+                now,
+                received_at,
+                max_age_us,
+            });
+        }
+        // A market order's price field is not an exchange-enforced limit. Never silently
+        // convert its type or accept an unprotected order under a signed price ceiling.
+        let limit = self
+            .intent
+            .price
+            .filter(|price| {
+                self.intent.order_type == OrderType::Limit && price.0 > rust_decimal::Decimal::ZERO
+            })
+            .ok_or(OrderIntentRejectReason::SlippageUnprotectedOrder)?;
+        let adverse = match self.intent.side {
+            Side::Buy => limit.0.checked_sub(reference.price.0),
+            Side::Sell => reference.price.0.checked_sub(limit.0),
+        }
+        .and_then(|difference| difference.checked_mul(rust_decimal::Decimal::from(10_000)))
+        .ok_or(OrderIntentRejectReason::SlippageUnprotectedOrder)?;
+        let allowed = reference
+            .price
+            .0
+            .checked_mul(rust_decimal::Decimal::from(max_slippage_bps))
+            .ok_or(OrderIntentRejectReason::SlippageUnprotectedOrder)?;
+        if adverse > allowed {
+            return Err(OrderIntentRejectReason::MaxSlippageExceeded {
+                max_slippage_bps,
+                reference_price: reference.price,
+                order_price: limit,
+            });
+        }
+        Ok(())
     }
 
     fn validate_order_limits(&self) -> Result<(), OrderIntentRejectReason> {
@@ -612,6 +724,24 @@ impl OrderIntentEnvelope {
 /// OrderIntent envelope 被風控或執行前置 gate 拒絕的原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderIntentRejectReason {
+    InvalidMaxSlippage {
+        max_slippage_bps: i32,
+    },
+    MissingSlippageReference,
+    SourceBookUnavailable,
+    SlippageReferenceMismatch,
+    MissingSlippageReferenceLifetime,
+    SlippageReferenceExpired {
+        now: Timestamp,
+        received_at: Timestamp,
+        max_age_us: u64,
+    },
+    SlippageUnprotectedOrder,
+    MaxSlippageExceeded {
+        max_slippage_bps: i32,
+        reference_price: Price,
+        order_price: Price,
+    },
     Expired {
         now: Timestamp,
         valid_until: Timestamp,
@@ -848,6 +978,14 @@ mod tests {
                 latest_book_seq: 43,
             })
         );
+        assert_eq!(
+            lifecycle.validate_pre_execution(1_100, Some(1)),
+            Err(OrderIntentRejectReason::SourceBookStale {
+                source_book_seq: 42,
+                latest_book_seq: 1,
+            }),
+            "a reset or regressed book sequence is not the original decision book"
+        );
     }
 
     #[test]
@@ -957,5 +1095,132 @@ mod tests {
                 max_order_notional: rust_decimal::Decimal::from(100),
             })
         );
+    }
+
+    #[test]
+    fn signed_slippage_ceiling_rejects_missing_reference_before_execution() {
+        let mut lifecycle = lifecycle(1_000, 2_000);
+        lifecycle.max_slippage_bps = Some(25);
+        let envelope = OrderIntentEnvelope::new(
+            OrderIntent::crypto_spot(
+                Symbol::new("BTCUSDT"),
+                Side::Buy,
+                Quantity(rust_decimal::Decimal::ONE),
+                OrderType::Limit,
+                Some(Price(rust_decimal::Decimal::from(100))),
+                TimeInForce::IOC,
+                "slippage-bounded".to_string(),
+                Some(VenueId::BINANCE_SPOT),
+            ),
+            lifecycle,
+        );
+
+        assert_eq!(
+            envelope.validate_cex_pre_execution(1_100, None),
+            Err(OrderIntentRejectReason::MissingSlippageReference)
+        );
+    }
+
+    fn slippage_envelope(side: Side, price: rust_decimal::Decimal) -> OrderIntentEnvelope {
+        let mut lifecycle = lifecycle(1_000, 2_000);
+        lifecycle.max_slippage_bps = Some(25);
+        let mut envelope = OrderIntentEnvelope::new(
+            OrderIntent::crypto_spot(
+                Symbol::new("BTCUSDT"),
+                side,
+                Quantity(rust_decimal::Decimal::ONE),
+                OrderType::Limit,
+                Some(Price(price)),
+                TimeInForce::IOC,
+                "bounded".to_string(),
+                Some(VenueId::BINANCE_SPOT),
+            ),
+            lifecycle,
+        );
+        envelope.price_reference = Some(ExecutionPriceReference {
+            venue: VenueId::BINANCE_SPOT,
+            symbol: Symbol::new("BTCUSDT"),
+            side,
+            price: Price(rust_decimal::Decimal::from(100)),
+            book_sequence: 7,
+            received_at: LocalReceiveTimestamp::new(1_000),
+        });
+        envelope
+    }
+
+    #[test]
+    fn signed_slippage_ceiling_is_directional_and_includes_exact_boundary() {
+        use rust_decimal::Decimal;
+        for (side, allowed, rejected, favourable) in [
+            (
+                Side::Buy,
+                Decimal::new(10_025, 2),
+                Decimal::new(100_251, 3),
+                Decimal::from(99),
+            ),
+            (
+                Side::Sell,
+                Decimal::new(9_975, 2),
+                Decimal::new(99_749, 3),
+                Decimal::from(101),
+            ),
+        ] {
+            assert_eq!(
+                slippage_envelope(side, allowed).validate_cex_pre_execution(1_100, None),
+                Ok(())
+            );
+            assert_eq!(
+                slippage_envelope(side, favourable).validate_cex_pre_execution(1_100, None),
+                Ok(())
+            );
+            assert!(matches!(
+                slippage_envelope(side, rejected).validate_cex_pre_execution(1_100, None),
+                Err(OrderIntentRejectReason::MaxSlippageExceeded { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn signed_slippage_rejects_stale_future_and_mismatched_quotes() {
+        let valid = slippage_envelope(Side::Buy, rust_decimal::Decimal::from(100));
+        for received_at in [1, 1_101] {
+            let mut envelope = valid.clone();
+            envelope.price_reference.as_mut().unwrap().received_at =
+                LocalReceiveTimestamp::new(received_at);
+            assert!(matches!(
+                envelope.validate_cex_pre_execution(1_100, None),
+                Err(OrderIntentRejectReason::SlippageReferenceExpired { .. })
+            ));
+        }
+        let mut wrong_symbol = valid.clone();
+        wrong_symbol.price_reference.as_mut().unwrap().symbol = Symbol::new("ETHUSDT");
+        let mut wrong_side = valid.clone();
+        wrong_side.price_reference.as_mut().unwrap().side = Side::Sell;
+        let mut wrong_venue = valid.clone();
+        wrong_venue.intent.target_venue = Some(VenueId::MOCK);
+        for envelope in [wrong_symbol, wrong_side, wrong_venue] {
+            assert_eq!(
+                envelope.validate_cex_pre_execution(1_100, None),
+                Err(OrderIntentRejectReason::SlippageReferenceMismatch)
+            );
+        }
+    }
+
+    #[test]
+    fn signed_slippage_does_not_treat_market_price_field_as_price_protection() {
+        let mut envelope = slippage_envelope(Side::Buy, rust_decimal::Decimal::from(100));
+        envelope.intent.order_type = OrderType::Market;
+        assert_eq!(
+            envelope.validate_cex_pre_execution(1_100, None),
+            Err(OrderIntentRejectReason::SlippageUnprotectedOrder)
+        );
+        envelope.intent.order_type = OrderType::Limit;
+        envelope.lifecycle.valid_until = Timestamp::MAX;
+        assert_eq!(
+            envelope.validate_cex_pre_execution(1_100, None),
+            Err(OrderIntentRejectReason::MissingSlippageReferenceLifetime)
+        );
+        envelope.lifecycle.max_latency_us = Some(200);
+        assert_eq!(envelope.validate_cex_pre_execution(1_100, None), Ok(()));
     }
 }

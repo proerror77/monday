@@ -938,6 +938,11 @@ impl ExecutionClient for BinanceExecutionClient {
     }
 
     async fn place_order_envelope(&mut self, envelope: &OrderIntentEnvelope) -> HftResult<OrderId> {
+        envelope
+            .validate_cex_pre_execution(hft_core::now_micros(), None)
+            .map_err(|reason| {
+                hft_core::HftError::Execution(format!("execution envelope rejected: {reason:?}"))
+            })?;
         self.next_client_order_id = Some(envelope.client_order_id.clone());
         self.place_order(envelope.intent.clone()).await
     }
@@ -946,6 +951,11 @@ impl ExecutionClient for BinanceExecutionClient {
         &mut self,
         envelope: &OrderIntentEnvelope,
     ) -> ExecutionSubmissionAttempt {
+        if let Err(reason) = envelope.validate_cex_pre_execution(hft_core::now_micros(), None) {
+            return ExecutionSubmissionAttempt::without_transport_timing(Err(
+                hft_core::HftError::Execution(format!("execution envelope rejected: {reason:?}")),
+            ));
+        }
         self.next_client_order_id = Some(envelope.client_order_id.clone());
         let outcome = self.place_order(envelope.intent.clone()).await;
         let Some((write_started, write_returned, response_received)) =
@@ -1374,6 +1384,41 @@ impl ExecutionClient for BinanceExecutionClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn signed_slippage_is_checked_before_both_adapter_entrypoints() {
+        let mut client = BinanceExecutionClient::new(make_test_config(ExecutionMode::Paper));
+        let lifecycle = ports::OrderIntentLifecycle {
+            max_slippage_bps: Some(25),
+            ..Default::default()
+        };
+        let envelope = OrderIntentEnvelope::new(
+            OrderIntent::crypto_spot(
+                Symbol::new("BTCUSDT"),
+                Side::Buy,
+                Quantity::from_f64(0.001).unwrap(),
+                OrderType::Limit,
+                Some(Price::from_f64(100.0).unwrap()),
+                TimeInForce::IOC,
+                "bounded".to_string(),
+                Some(hft_core::VenueId::BINANCE_SPOT),
+            ),
+            lifecycle,
+        );
+        assert!(client
+            .place_order_envelope(&envelope)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("MissingSlippageReference"));
+        assert!(client
+            .place_order_envelope_traced(&envelope)
+            .await
+            .outcome
+            .unwrap_err()
+            .to_string()
+            .contains("MissingSlippageReference"));
+    }
     use hft_core::{OrderType, Side, Symbol, TimeInForce};
     use integration::signing::BinanceCredentials;
     use ports::{ExecutionClient, OrderIntent};

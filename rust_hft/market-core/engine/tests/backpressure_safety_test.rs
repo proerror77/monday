@@ -24,6 +24,107 @@ fn test_intent() -> OrderIntent {
 }
 
 #[test]
+fn queued_price_protection_reloads_market_identity_and_freshness() {
+    use engine::aggregation::{MarketView, TopNSnapshot};
+    use hft_core::{LocalReceiveTimestamp, Price, VenueId, VenueSymbol};
+    use std::sync::Arc;
+    let market = |ask: f64, sequence: u64, received_at: u64| {
+        let mut book = TopNSnapshot::new(Symbol::new("BTCUSDT"), 5);
+        book.update_from_snapshot(&ports::MarketSnapshot {
+            symbol: Symbol::new("BTCUSDT"),
+            timestamp: 1_000,
+            bids: vec![ports::BookLevel::new_unchecked(ask - 0.01, 10.0)],
+            asks: vec![ports::BookLevel::new_unchecked(ask, 10.0)],
+            sequence,
+            source_venue: Some(VenueId::MOCK),
+            timestamps: hft_core::MarketDataTimestamps::local_only(LocalReceiveTimestamp::new(
+                received_at,
+            )),
+        });
+        MarketView {
+            orderbooks: [(
+                VenueSymbol::new(VenueId::MOCK, Symbol::new("BTCUSDT")),
+                Arc::new(book),
+            )]
+            .into_iter()
+            .collect(),
+            arbitrage_opportunities: Vec::new(),
+            timestamp: 1_000,
+            version: sequence,
+        }
+    };
+    let snapshots = snapshot::SnapshotContainer::new(market(100.0, 7, 1_000));
+    let (mut sender, mut worker) = create_execution_queues(ExecutionQueueConfig::default());
+    let mut intent = test_intent();
+    intent.order_type = OrderType::Limit;
+    intent.price = Some(Price::from_f64(100.1).unwrap());
+    intent.target_venue = Some(VenueId::MOCK);
+    let mut life = OrderIntentLifecycle::new(1_000, 2_000);
+    life.max_slippage_bps = Some(25);
+    let mut envelope = OrderIntentEnvelope::new(intent, life);
+    envelope.price_reference = snapshots.load().execution_price_reference(&envelope.intent);
+    sender.send_lifecycle_intent(envelope, 1_100).unwrap();
+    let envelope = worker.receive_envelopes().pop().unwrap();
+    assert_eq!(
+        worker.validate_current_market_reference(&envelope, 1_100),
+        Err(OrderIntentRejectReason::MissingSlippageReference)
+    );
+    worker.set_market_reader(snapshots.reader());
+    assert_eq!(
+        worker.validate_current_market_reference(&envelope, 1_100),
+        Ok(())
+    );
+    snapshots.store(Arc::new(market(99.0, 8, 1_100)));
+    assert!(matches!(
+        worker.validate_current_market_reference(&envelope, 1_150),
+        Err(OrderIntentRejectReason::MaxSlippageExceeded { .. })
+    ));
+    snapshots.store(Arc::new(market(100.0, 8, 1)));
+    assert!(matches!(
+        worker.validate_current_market_reference(&envelope, 1_150),
+        Err(OrderIntentRejectReason::SlippageReferenceExpired { .. })
+    ));
+    let serialized = serde_json::to_vec(&envelope).unwrap();
+    let restored: OrderIntentEnvelope = serde_json::from_slice(&serialized).unwrap();
+    assert!(
+        restored.price_reference.is_none(),
+        "wire data is never a trusted market reference"
+    );
+    let mut cross_venue = envelope.clone();
+    cross_venue.lifecycle.source_book_seq = Some(42);
+    let source = VenueSymbol::new(VenueId::BINANCE, Symbol::new("BTCUSDT"));
+    cross_venue.source_book_identity = Some(source.clone());
+    let mut view = market(100.0, 7, 1_000);
+    let mut source_book = view.orderbooks.values().next().unwrap().as_ref().clone();
+    source_book.sequence = 42;
+    view.orderbooks
+        .insert(source.clone(), Arc::new(source_book.clone()));
+    snapshots.store(Arc::new(view.clone()));
+    assert_eq!(
+        worker.validate_current_market_reference(&cross_venue, 1_150),
+        Ok(()),
+        "source venue 42 and target venue 7 are independent sequence domains"
+    );
+    source_book.sequence = 43;
+    view.orderbooks
+        .insert(source.clone(), Arc::new(source_book));
+    snapshots.store(Arc::new(view.clone()));
+    assert!(matches!(
+        worker.validate_current_market_reference(&cross_venue, 1_150),
+        Err(OrderIntentRejectReason::SourceBookStale {
+            source_book_seq: 42,
+            latest_book_seq: 43
+        })
+    ));
+    view.orderbooks.remove(&source);
+    snapshots.store(Arc::new(view));
+    assert_eq!(
+        worker.validate_current_market_reference(&cross_venue, 1_150),
+        Err(OrderIntentRejectReason::SourceBookUnavailable)
+    );
+}
+
+#[test]
 fn test_default_backpressure_policy_is_safe() {
     let config = IngestionConfig::default();
 
