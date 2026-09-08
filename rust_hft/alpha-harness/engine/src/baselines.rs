@@ -337,7 +337,12 @@ pub fn verify_cex_baseline_artifact(
                 }
                 predict_fold_cart(&tree, &features, &validation)?
             }
-            CexBaselineModelV1::BurnMlp { symbol, venue, .. } => {
+            CexBaselineModelV1::BurnMlp { .. } => {
+                return Err(
+                    "historical Burn MLP diagnostics do not contain executable parameters".into(),
+                );
+            }
+            CexBaselineModelV1::BurnMlpPortable { symbol, venue, .. } => {
                 let (refit_model, predictions) = fit_burn_fold(CexBurnFoldFit {
                     rows: context.rows(),
                     features: &features,
@@ -1049,6 +1054,9 @@ fn fit_burn_fold(fit: CexBurnFoldFit<'_>) -> Result<(CexBaselineModelV1, Vec<f64
         .map_err(|error| format!("Burn MLP training request failed to seal: {error}"))?;
     let trained = train_contract_model(&rows_artifact, &sealed)
         .map_err(|error| format!("Burn MLP training failed: {error}"))?;
+    let parameters = trained
+        .export_parameters()
+        .map_err(|error| format!("Burn MLP parameters failed to export: {error}"))?;
     let mut predictions =
         Vec::with_capacity(fold.validation.end.saturating_sub(fold.validation.start));
     for index in fold.validation.clone() {
@@ -1064,9 +1072,16 @@ fn fit_burn_fold(fit: CexBurnFoldFit<'_>) -> Result<(CexBaselineModelV1, Vec<f64
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let prediction = trained
+        let backend_prediction = trained
             .predict(&feature_row)
             .map_err(|error| format!("Burn MLP validation row {index} failed: {error}"))?;
+        let prediction = parameters.predict(&feature_row)?;
+        let tolerance = 1e-5_f32 * backend_prediction.abs().max(1.0);
+        if (prediction - backend_prediction).abs() > tolerance {
+            return Err(format!(
+                "Burn MLP portable inference differs at validation row {index}"
+            ));
+        }
         if !prediction.is_finite() {
             return Err(format!(
                 "Burn MLP validation row {index} produced a non-finite prediction"
@@ -1076,7 +1091,8 @@ fn fit_burn_fold(fit: CexBurnFoldFit<'_>) -> Result<(CexBaselineModelV1, Vec<f64
     }
     let diagnostics = trained.diagnostics();
     Ok((
-        CexBaselineModelV1::BurnMlp {
+        CexBaselineModelV1::BurnMlpPortable {
+            parameters,
             request_semantic_sha256: diagnostics.request_semantic_sha256.as_str().to_string(),
             semantic_model_sha256: diagnostics.semantic_model_sha256.as_str().to_string(),
             config_sha256: diagnostics.config_sha256.as_str().to_string(),
@@ -1724,6 +1740,30 @@ mod tests {
         assert_eq!(left_model, right_model);
         assert_eq!(left_predictions, right_predictions);
         assert_eq!(left_predictions.len(), 3);
+        let reloaded: CexBaselineModelV1 =
+            serde_json::from_slice(&serde_json::to_vec(&left_model).unwrap()).unwrap();
+        let CexBaselineModelV1::BurnMlpPortable {
+            parameters,
+            semantic_model_sha256,
+            ..
+        } = &reloaded
+        else {
+            panic!("training must retain executable parameters");
+        };
+        assert_eq!(
+            parameters.semantic_sha256().unwrap(),
+            *semantic_model_sha256
+        );
+        for (row, expected) in (13..16).zip(&left_predictions) {
+            let features = features[row]
+                .iter()
+                .map(|value| *value as f32)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                normalize_zero(f64::from(parameters.predict(&features).unwrap())).to_bits(),
+                expected.to_bits()
+            );
+        }
 
         let mut mutated = rows.clone();
         for row in &mut mutated[13..16] {
@@ -1746,7 +1786,7 @@ mod tests {
             .contains("not available before validation"));
         assert!(matches!(
             left_model,
-            CexBaselineModelV1::BurnMlp { row_count: 12, .. }
+            CexBaselineModelV1::BurnMlpPortable { row_count: 12, .. }
         ));
 
         let mut multi_step_rows = rows.clone();
@@ -1781,7 +1821,7 @@ mod tests {
         assert_eq!(predictions.len(), 3);
         assert!(matches!(
             multi_model,
-            CexBaselineModelV1::BurnMlp { row_count: 8, .. }
+            CexBaselineModelV1::BurnMlpPortable { row_count: 8, .. }
         ));
         // These labels fall inside Burn's extra embargo and must not be fitted.
         for row in &mut multi_step_rows[8..12] {

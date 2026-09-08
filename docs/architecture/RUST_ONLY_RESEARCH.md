@@ -39,6 +39,22 @@ split, seed, training configuration, metrics, model checksum, framework version,
 and research-only scope. Loaders verify the manifest and checksum before reading
 weights. Existing bundles are never overwritten.
 
+Campaign Burn baselines retain a `burn_mlp_portable` model in every fitted fold.
+Its versioned `PortableMlpV1` payload contains both layer weights and biases in
+row-major tensor order, bounded to one million parameters. The exported tensor
+digest must equal the trainer's existing semantic model digest. Deserialization,
+shape validation, finite-value checks and the training-identity binding precede
+inference.
+
+New fold predictions use the portable scalar f32 evaluator. The Campaign fitter
+compares these predictions with the fitted Burn backend at a relative tolerance of 1e-5
+and an absolute floor of 1e-5; reloading the portable payload reproduces the
+recorded predictions exactly. This makes evaluator arithmetic part of the frozen
+model, while the original Burnpack training bundle remains separately available.
+Historical `burn_mlp` records containing only diagnostics remain readable audit
+evidence and are rejected by current execution/refit verification. Parameter
+export provides no holdout, promotion, deployment or order authority.
+
 Prediction training additionally accepts only an immutable
 `VerifiedBinarySnapshot` handle. The loader verifies the snapshot's evaluator
 artifacts against a caller-supplied trusted `snapshot_contract_hash`; no public

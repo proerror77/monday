@@ -2670,6 +2670,7 @@ pub enum CexBaselineModelV1 {
     ShallowCart {
         root: CexBaselineCartNodeV1,
     },
+    /// Historical diagnostic-only representation, retained for audit decoding.
     BurnMlp {
         request_semantic_sha256: String,
         semantic_model_sha256: String,
@@ -2684,6 +2685,22 @@ pub enum CexBaselineModelV1 {
         learning_rate: f64,
         min_rows: usize,
     },
+    /// Executable fitted parameters bound to the original training tensor digest.
+    BurnMlpPortable {
+        request_semantic_sha256: String,
+        semantic_model_sha256: String,
+        config_sha256: String,
+        trainer_version: String,
+        symbol: String,
+        venue: String,
+        row_count: usize,
+        seed: u64,
+        hidden_dim: usize,
+        epochs: usize,
+        learning_rate: f64,
+        min_rows: usize,
+        parameters: hft_research_manifest::model::PortableMlpV1,
+    },
 }
 
 impl CexBaselineModelV1 {
@@ -2691,7 +2708,7 @@ impl CexBaselineModelV1 {
         match self {
             Self::Ridge { .. } => CexBaselineModelKindV1::Ridge,
             Self::ShallowCart { .. } => CexBaselineModelKindV1::ShallowCart,
-            Self::BurnMlp { .. } => CexBaselineModelKindV1::BurnMlp,
+            Self::BurnMlp { .. } | Self::BurnMlpPortable { .. } => CexBaselineModelKindV1::BurnMlp,
         }
     }
 }
@@ -3094,6 +3111,20 @@ fn model_validate(
             learning_rate,
             min_rows,
             ..
+        }
+        | CexBaselineModelV1::BurnMlpPortable {
+            request_semantic_sha256,
+            semantic_model_sha256,
+            config_sha256,
+            trainer_version,
+            symbol,
+            venue,
+            row_count,
+            hidden_dim,
+            epochs,
+            learning_rate,
+            min_rows,
+            ..
         } if valid_content_sha256(request_semantic_sha256)
             && valid_content_sha256(semantic_model_sha256)
             && valid_content_sha256(config_sha256)
@@ -3110,6 +3141,21 @@ fn model_validate(
             && *row_count >= *min_rows
             && arity > 0 =>
         {
+            if let CexBaselineModelV1::BurnMlpPortable { parameters, .. } = model {
+                parameters.validate().map_err(|_| {
+                    DomainError::InvalidCexBaseline("portable MLP parameters are invalid")
+                })?;
+                if parameters.input_dim != arity
+                    || parameters.hidden_dim != *hidden_dim
+                    || parameters.semantic_sha256().map_err(|_| {
+                        DomainError::InvalidCexBaseline("portable MLP digest is invalid")
+                    })? != *semantic_model_sha256
+                {
+                    return Err(DomainError::InvalidCexBaseline(
+                        "portable MLP parameters differ from training identity",
+                    ));
+                }
+            }
             Ok(())
         }
         _ => Err(DomainError::InvalidCexBaseline("fitted model is invalid")),

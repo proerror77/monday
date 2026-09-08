@@ -1,5 +1,7 @@
 //! Manifest contracts for reproducible research, evaluation, promotion, and live rollout.
 
+pub mod model;
+
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
