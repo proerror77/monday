@@ -1012,6 +1012,31 @@ impl SystemRuntime {
                 let notify = eng.get_wakeup_notify();
                 eng.set_execution_queues(engine_queues);
                 let clients = eng.take_execution_clients();
+                let mut price_protection = std::collections::HashMap::new();
+                for (index, client) in clients.iter().enumerate() {
+                    let venue = self
+                        .execution_client_venues
+                        .get(index)
+                        .copied()
+                        .or_else(|| {
+                            self.config
+                                .venues
+                                .get(index)
+                                .and_then(|venue| hft_core::VenueId::from_str(&venue.name))
+                        });
+                    if let Some(venue) = venue {
+                        if price_protection
+                            .insert(venue, client.price_protection())
+                            .is_some_and(|previous| previous != client.price_protection())
+                        {
+                            return Err(HftError::Config(
+                                "ambiguous price-protection protocols for one venue".into(),
+                            )
+                            .into());
+                        }
+                    }
+                }
+                eng.set_execution_price_protection(price_protection);
                 (clients, notify, eng.market_reader())
             };
 

@@ -522,6 +522,15 @@ pub struct ExecutionPriceReference {
     pub received_at: LocalReceiveTimestamp,
 }
 
+/// Selected by the trusted execution adapter, never by an order or serialized caller.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExecutionPriceProtection {
+    #[default]
+    CanonicalBook,
+    /// The adapter obtains and enforces its own authenticated executable-quote protocol.
+    VenueQuote,
+}
+
 /// 帶生命週期的下單意圖。這是策略輸出和風控/執行邊界之間的兼容 envelope，
 /// 不改動既有 Strategy trait。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -538,6 +547,9 @@ pub struct OrderIntentEnvelope {
     /// Rebuilt from the canonical market reader at runtime, never deserialized from a caller.
     #[serde(skip)]
     pub price_reference: Option<ExecutionPriceReference>,
+    /// Venue/instrument identity of the decision book; distinct from the execution leg's book.
+    #[serde(skip)]
+    pub source_book_identity: Option<VenueSymbol>,
 }
 
 impl OrderIntentEnvelope {
@@ -550,6 +562,7 @@ impl OrderIntentEnvelope {
             client_order_id,
             account_id: None,
             price_reference: None,
+            source_book_identity: None,
         }
     }
 
@@ -573,8 +586,7 @@ impl OrderIntentEnvelope {
         latest_book_seq: Option<u64>,
     ) -> Result<(), OrderIntentRejectReason> {
         self.lifecycle.validate_pre_risk(now, latest_book_seq)?;
-        self.validate_order_limits()?;
-        self.validate_slippage_reference(now, self.price_reference.as_ref())
+        self.validate_order_limits()
     }
 
     pub fn validate_pre_execution(
@@ -584,7 +596,15 @@ impl OrderIntentEnvelope {
     ) -> Result<(), OrderIntentRejectReason> {
         self.lifecycle
             .validate_pre_execution(now, latest_book_seq)?;
-        self.validate_order_limits()?;
+        self.validate_order_limits()
+    }
+
+    pub fn validate_cex_pre_execution(
+        &self,
+        now: Timestamp,
+        latest_book_seq: Option<u64>,
+    ) -> Result<(), OrderIntentRejectReason> {
+        self.validate_pre_execution(now, latest_book_seq)?;
         self.validate_slippage_reference(now, self.price_reference.as_ref())
     }
 
@@ -708,6 +728,7 @@ pub enum OrderIntentRejectReason {
         max_slippage_bps: i32,
     },
     MissingSlippageReference,
+    SourceBookUnavailable,
     SlippageReferenceMismatch,
     MissingSlippageReferenceLifetime,
     SlippageReferenceExpired {
@@ -1095,7 +1116,7 @@ mod tests {
         );
 
         assert_eq!(
-            envelope.validate_pre_execution(1_100, None),
+            envelope.validate_cex_pre_execution(1_100, None),
             Err(OrderIntentRejectReason::MissingSlippageReference)
         );
     }
@@ -1145,15 +1166,15 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                slippage_envelope(side, allowed).validate_pre_risk(1_100, None),
+                slippage_envelope(side, allowed).validate_cex_pre_execution(1_100, None),
                 Ok(())
             );
             assert_eq!(
-                slippage_envelope(side, favourable).validate_pre_execution(1_100, None),
+                slippage_envelope(side, favourable).validate_cex_pre_execution(1_100, None),
                 Ok(())
             );
             assert!(matches!(
-                slippage_envelope(side, rejected).validate_pre_execution(1_100, None),
+                slippage_envelope(side, rejected).validate_cex_pre_execution(1_100, None),
                 Err(OrderIntentRejectReason::MaxSlippageExceeded { .. })
             ));
         }
@@ -1167,7 +1188,7 @@ mod tests {
             envelope.price_reference.as_mut().unwrap().received_at =
                 LocalReceiveTimestamp::new(received_at);
             assert!(matches!(
-                envelope.validate_pre_execution(1_100, None),
+                envelope.validate_cex_pre_execution(1_100, None),
                 Err(OrderIntentRejectReason::SlippageReferenceExpired { .. })
             ));
         }
@@ -1179,7 +1200,7 @@ mod tests {
         wrong_venue.intent.target_venue = Some(VenueId::MOCK);
         for envelope in [wrong_symbol, wrong_side, wrong_venue] {
             assert_eq!(
-                envelope.validate_pre_execution(1_100, None),
+                envelope.validate_cex_pre_execution(1_100, None),
                 Err(OrderIntentRejectReason::SlippageReferenceMismatch)
             );
         }
@@ -1190,16 +1211,16 @@ mod tests {
         let mut envelope = slippage_envelope(Side::Buy, rust_decimal::Decimal::from(100));
         envelope.intent.order_type = OrderType::Market;
         assert_eq!(
-            envelope.validate_pre_execution(1_100, None),
+            envelope.validate_cex_pre_execution(1_100, None),
             Err(OrderIntentRejectReason::SlippageUnprotectedOrder)
         );
         envelope.intent.order_type = OrderType::Limit;
         envelope.lifecycle.valid_until = Timestamp::MAX;
         assert_eq!(
-            envelope.validate_pre_execution(1_100, None),
+            envelope.validate_cex_pre_execution(1_100, None),
             Err(OrderIntentRejectReason::MissingSlippageReferenceLifetime)
         );
         envelope.lifecycle.max_latency_us = Some(200);
-        assert_eq!(envelope.validate_pre_execution(1_100, None), Ok(()));
+        assert_eq!(envelope.validate_cex_pre_execution(1_100, None), Ok(()));
     }
 }

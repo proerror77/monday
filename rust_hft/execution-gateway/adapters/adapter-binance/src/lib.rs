@@ -939,7 +939,7 @@ impl ExecutionClient for BinanceExecutionClient {
 
     async fn place_order_envelope(&mut self, envelope: &OrderIntentEnvelope) -> HftResult<OrderId> {
         envelope
-            .validate_pre_execution(hft_core::now_micros(), None)
+            .validate_cex_pre_execution(hft_core::now_micros(), None)
             .map_err(|reason| {
                 hft_core::HftError::Execution(format!("execution envelope rejected: {reason:?}"))
             })?;
@@ -951,7 +951,7 @@ impl ExecutionClient for BinanceExecutionClient {
         &mut self,
         envelope: &OrderIntentEnvelope,
     ) -> ExecutionSubmissionAttempt {
-        if let Err(reason) = envelope.validate_pre_execution(hft_core::now_micros(), None) {
+        if let Err(reason) = envelope.validate_cex_pre_execution(hft_core::now_micros(), None) {
             return ExecutionSubmissionAttempt::without_transport_timing(Err(
                 hft_core::HftError::Execution(format!("execution envelope rejected: {reason:?}")),
             ));

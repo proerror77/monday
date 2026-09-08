@@ -264,6 +264,7 @@ pub struct Engine {
     venue_specs: HashMap<VenueId, VenueSpec>,
     /// 註冊的執行客戶端
     execution_clients: Vec<Box<dyn ExecutionClient>>,
+    execution_price_protection: HashMap<VenueId, ports::ExecutionPriceProtection>,
     /// 執行回報流（與 execution_clients 對應）
     #[allow(dead_code)]
     execution_streams: Vec<BoxStream<ExecutionEvent>>,
@@ -354,6 +355,7 @@ impl Engine {
             risk_manager: None,
             venue_specs: VenueSpec::build_default_venue_specs(),
             execution_clients: Vec::new(),
+            execution_price_protection: HashMap::new(),
             execution_streams: Vec::new(),
             order_manager: None,
             portfolio_manager: None,
@@ -459,6 +461,21 @@ impl Engine {
                     .map_or(configured, |existing| existing.min(configured)),
             );
         }
+    }
+
+    /// Runtime supplies this registry from trusted adapter capabilities, not strategy input.
+    pub fn set_execution_price_protection(
+        &mut self,
+        modes: HashMap<VenueId, ports::ExecutionPriceProtection>,
+    ) {
+        self.execution_price_protection = modes;
+    }
+
+    fn price_protection_for(&self, intent: &ports::OrderIntent) -> ports::ExecutionPriceProtection {
+        intent
+            .target_venue
+            .and_then(|venue| self.execution_price_protection.get(&venue).copied())
+            .unwrap_or_default()
     }
 
     /// 设置执行队列系统（Runtime 设置）
@@ -1029,8 +1046,14 @@ impl Engine {
         if let Some(account_id) = account_id {
             envelope = envelope.with_account_id(account_id);
         }
+        let price_protection = self.price_protection_for(&envelope.intent);
         if let Some(queues) = &mut self.execution_queues {
-            match queues.send_lifecycle_intent(envelope, now) {
+            match queues.send_lifecycle_intent_with_price_protection(
+                envelope,
+                now,
+                None,
+                price_protection,
+            ) {
                 Ok(()) => {
                     debug!("成功提交訂單意圖到執行隊列");
                     Ok(())
@@ -1072,8 +1095,23 @@ impl Engine {
             .market_snapshots
             .load()
             .execution_price_reference(&envelope.intent);
+        let price_protection = self.price_protection_for(&envelope.intent);
+        if price_protection == ports::ExecutionPriceProtection::CanonicalBook
+            && envelope.source_book_identity.is_none()
+            && envelope.lifecycle.source_book_seq.is_some()
+        {
+            envelope.source_book_identity = envelope
+                .intent
+                .target_venue
+                .map(|venue| VenueSymbol::new(venue, envelope.intent.symbol.clone()));
+        }
         if let Some(queues) = &mut self.execution_queues {
-            match queues.send_lifecycle_intent_with_book_seq(envelope, now, latest_book_seq) {
+            match queues.send_lifecycle_intent_with_price_protection(
+                envelope,
+                now,
+                latest_book_seq,
+                price_protection,
+            ) {
                 Ok(()) => {
                     debug!("成功提交帶生命週期的訂單意圖到執行隊列");
                     Ok(())
@@ -1845,7 +1883,17 @@ impl Engine {
 
             // 通過風控審核（如果有配置風控管理器）
             intents_work_buf.retain(|envelope| {
-                if let Err(reason) = envelope.validate_pre_risk(now_micros(), None) {
+                let now = now_micros();
+                let validation = envelope.validate_pre_risk(now, None).and_then(|()| {
+                    if self.price_protection_for(&envelope.intent)
+                        == ports::ExecutionPriceProtection::CanonicalBook
+                    {
+                        envelope.validate_slippage_reference(now, envelope.price_reference.as_ref())
+                    } else {
+                        Ok(())
+                    }
+                });
+                if let Err(reason) = validation {
                     warn!(?reason, "execution envelope rejected before risk review");
                     false
                 } else {
@@ -1913,6 +1961,7 @@ impl Engine {
             for envelope in &mut intents_to_send {
                 self.apply_intent_execution_limits(&mut envelope.lifecycle);
             }
+            let price_protection_modes = &self.execution_price_protection;
             if let Some(queues) = &mut self.execution_queues {
                 let mut dropped = 0usize;
                 for mut envelope in intents_to_send.drain(..) {
@@ -1924,16 +1973,36 @@ impl Engine {
                             Some(ports::MarketEvent::Quote(quote)) => Some(quote.sequence),
                             _ => None,
                         });
+                    envelope.source_book_identity = l2_book
+                        .map(|book| VenueSymbol::new(book.venue, book.symbol.clone()))
+                        .or_else(|| match event {
+                            Some(ports::MarketEvent::Snapshot(book)) => book
+                                .source_venue
+                                .map(|venue| VenueSymbol::new(venue, book.symbol.clone())),
+                            Some(ports::MarketEvent::Update(book)) => book
+                                .source_venue
+                                .map(|venue| VenueSymbol::new(venue, book.symbol.clone())),
+                            Some(ports::MarketEvent::Quote(book)) => book
+                                .source_venue
+                                .map(|venue| VenueSymbol::new(venue, book.symbol.clone())),
+                            _ => None,
+                        });
                     envelope.lifecycle.timing.risk_completed_mono_us = risk_completed_mono_us;
                     envelope.lifecycle.timing.source_market_receive_wall_us = capture_boundary
                         .is_receive_latency_cohort()
                         .then_some(received_at);
                     envelope.lifecycle.timing.source_market_capture_boundary = capture_boundary;
+                    let price_protection = envelope
+                        .intent
+                        .target_venue
+                        .and_then(|venue| price_protection_modes.get(&venue).copied())
+                        .unwrap_or_default();
                     if queues
-                        .send_lifecycle_intent_with_book_seq(
+                        .send_lifecycle_intent_with_price_protection(
                             envelope,
                             now_micros(),
                             latest_book_seq,
+                            price_protection,
                         )
                         .is_err()
                     {
@@ -3427,6 +3496,59 @@ mod tests {
             .submit_order_intent_envelope(envelope, now, None)
             .is_err());
         assert!(worker_queues.receive_envelopes().is_empty());
+    }
+
+    #[test]
+    fn adapter_owned_quote_protocol_retains_lifecycle_limits_without_cex_reference() {
+        let mut engine = Engine::new(EngineConfig::default());
+        let (engine_queues, mut worker_queues) =
+            create_execution_queues(ExecutionQueueConfig::default());
+        engine.set_execution_queues(engine_queues);
+        engine
+            .set_intent_execution_limits(Some(25), None, None)
+            .unwrap();
+        let intent = ports::OrderIntent::prediction_market(
+            Symbol::new("prediction-token"),
+            Side::Buy,
+            Quantity::from_f64(1.0).unwrap(),
+            OrderType::Limit,
+            Some(Price::from_f64(0.5).unwrap()),
+            hft_core::TimeInForce::IOC,
+            "prediction".into(),
+            VenueId::POLYMARKET,
+        );
+        assert!(
+            engine.submit_order_intent(intent.clone()).is_err(),
+            "unknown protocols default to canonical price protection"
+        );
+        engine.set_execution_price_protection(HashMap::from([(
+            VenueId::POLYMARKET,
+            ports::ExecutionPriceProtection::VenueQuote,
+        )]));
+        engine.submit_order_intent(intent).unwrap();
+        let envelope = worker_queues.receive_envelopes().pop().unwrap();
+        assert!(envelope.price_reference.is_none());
+        assert_eq!(
+            worker_queues.validate_execution_market_reference(
+                &envelope,
+                envelope.lifecycle.created_ts,
+                ports::ExecutionPriceProtection::VenueQuote
+            ),
+            Ok(())
+        );
+        assert!(matches!(
+            worker_queues.validate_execution_market_reference(
+                &envelope,
+                envelope.lifecycle.valid_until,
+                ports::ExecutionPriceProtection::VenueQuote
+            ),
+            Err(ports::OrderIntentRejectReason::Expired { .. })
+        ));
+        assert_eq!(
+            worker_queues
+                .validate_current_market_reference(&envelope, envelope.lifecycle.created_ts),
+            Err(ports::OrderIntentRejectReason::MissingSlippageReference)
+        );
     }
 
     #[test]

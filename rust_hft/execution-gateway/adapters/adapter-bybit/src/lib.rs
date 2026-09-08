@@ -1285,7 +1285,7 @@ impl ExecutionClient for BybitExecutionClient {
 
     async fn place_order_envelope(&mut self, envelope: &OrderIntentEnvelope) -> HftResult<OrderId> {
         envelope
-            .validate_pre_execution(hft_core::now_micros(), None)
+            .validate_cex_pre_execution(hft_core::now_micros(), None)
             .map_err(|reason| {
                 HftError::Execution(format!("execution envelope rejected: {reason:?}"))
             })?;

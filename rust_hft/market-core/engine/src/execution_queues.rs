@@ -7,7 +7,10 @@
 
 use crate::dataflow::ring_buffer::{spsc_ring_buffer, SpscConsumer, SpscProducer};
 use hft_core::{AccountId, Timestamp};
-use ports::{ExecutionEvent, OrderIntent, OrderIntentEnvelope, OrderIntentRejectReason};
+use ports::{
+    ExecutionEvent, ExecutionPriceProtection, OrderIntent, OrderIntentEnvelope,
+    OrderIntentRejectReason,
+};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Notify};
 use tracing::{debug, warn};
@@ -191,7 +194,30 @@ impl EngineQueues {
         now: Timestamp,
         latest_book_seq: Option<u64>,
     ) -> Result<(), LifecycleIntentSubmitError> {
-        match envelope.validate_pre_execution(now, latest_book_seq) {
+        self.send_lifecycle_intent_with_price_protection(
+            envelope,
+            now,
+            latest_book_seq,
+            ExecutionPriceProtection::CanonicalBook,
+        )
+    }
+
+    pub fn send_lifecycle_intent_with_price_protection(
+        &mut self,
+        envelope: OrderIntentEnvelope,
+        now: Timestamp,
+        latest_book_seq: Option<u64>,
+        price_protection: ExecutionPriceProtection,
+    ) -> Result<(), LifecycleIntentSubmitError> {
+        let validation = match price_protection {
+            ExecutionPriceProtection::CanonicalBook => {
+                envelope.validate_cex_pre_execution(now, latest_book_seq)
+            }
+            ExecutionPriceProtection::VenueQuote => {
+                envelope.validate_pre_execution(now, latest_book_seq)
+            }
+        };
+        match validation {
             Ok(()) => self.send_envelope(envelope).map_err(|envelope| {
                 LifecycleIntentSubmitError::QueueFull {
                     envelope: Box::new(envelope),
@@ -203,7 +229,8 @@ impl EngineQueues {
                     OrderIntentRejectReason::Expired { .. } => {
                         self.stats.intent_expired_count += 1;
                     }
-                    OrderIntentRejectReason::SourceBookStale { .. } => {
+                    OrderIntentRejectReason::SourceBookStale { .. }
+                    | OrderIntentRejectReason::SourceBookUnavailable => {
                         self.stats.intent_stale_count += 1;
                     }
                     OrderIntentRejectReason::MaxLatencyExceeded { .. } => {
@@ -311,15 +338,44 @@ impl WorkerQueues {
         envelope: &OrderIntentEnvelope,
         now: Timestamp,
     ) -> Result<(), OrderIntentRejectReason> {
-        if envelope.lifecycle.max_slippage_bps.is_none() {
-            return envelope.validate_pre_execution(now, None);
+        self.validate_execution_market_reference(
+            envelope,
+            now,
+            ExecutionPriceProtection::CanonicalBook,
+        )
+    }
+
+    pub fn validate_execution_market_reference(
+        &self,
+        envelope: &OrderIntentEnvelope,
+        now: Timestamp,
+        price_protection: ExecutionPriceProtection,
+    ) -> Result<(), OrderIntentRejectReason> {
+        let market = self.market_reader.as_ref().map(|reader| reader.load());
+        if price_protection == ExecutionPriceProtection::CanonicalBook
+            && envelope.lifecycle.source_book_seq.is_some()
+            && envelope.source_book_identity.is_none()
+        {
+            return Err(OrderIntentRejectReason::SourceBookUnavailable);
         }
-        let reference = self
-            .market_reader
+        let source_sequence = match &envelope.source_book_identity {
+            Some(identity) => Some(
+                market
+                    .as_ref()
+                    .and_then(|view| view.get_orderbook(identity))
+                    .ok_or(OrderIntentRejectReason::SourceBookUnavailable)?
+                    .sequence,
+            ),
+            None => None,
+        };
+        envelope.validate_pre_execution(now, source_sequence)?;
+        if price_protection == ExecutionPriceProtection::VenueQuote {
+            return Ok(());
+        }
+        envelope.validate_slippage_reference(now, envelope.price_reference.as_ref())?;
+        let reference = market
             .as_ref()
-            .and_then(|reader| reader.load().execution_price_reference(&envelope.intent));
-        envelope
-            .validate_pre_execution(now, reference.as_ref().map(|quote| quote.book_sequence))?;
+            .and_then(|view| view.execution_price_reference(&envelope.intent));
         envelope.validate_slippage_reference(now, reference.as_ref())
     }
 

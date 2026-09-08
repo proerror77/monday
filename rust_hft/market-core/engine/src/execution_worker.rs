@@ -969,10 +969,11 @@ impl ExecutionWorker {
                 }
                 Some(account_id)
             };
-            if let Err(reason) = self
-                .queues
-                .validate_current_market_reference(&envelope, now_micros())
-            {
+            if let Err(reason) = self.queues.validate_execution_market_reference(
+                &envelope,
+                now_micros(),
+                self.execution_clients[client_idx].price_protection(),
+            ) {
                 self.reject_intent(
                     &envelope.client_order_id,
                     format!("final market price protection rejected intent: {reason:?}"),

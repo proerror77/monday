@@ -90,6 +90,38 @@ fn queued_price_protection_reloads_market_identity_and_freshness() {
         restored.price_reference.is_none(),
         "wire data is never a trusted market reference"
     );
+    let mut cross_venue = envelope.clone();
+    cross_venue.lifecycle.source_book_seq = Some(42);
+    let source = VenueSymbol::new(VenueId::BINANCE, Symbol::new("BTCUSDT"));
+    cross_venue.source_book_identity = Some(source.clone());
+    let mut view = market(100.0, 7, 1_000);
+    let mut source_book = view.orderbooks.values().next().unwrap().as_ref().clone();
+    source_book.sequence = 42;
+    view.orderbooks
+        .insert(source.clone(), Arc::new(source_book.clone()));
+    snapshots.store(Arc::new(view.clone()));
+    assert_eq!(
+        worker.validate_current_market_reference(&cross_venue, 1_150),
+        Ok(()),
+        "source venue 42 and target venue 7 are independent sequence domains"
+    );
+    source_book.sequence = 43;
+    view.orderbooks
+        .insert(source.clone(), Arc::new(source_book));
+    snapshots.store(Arc::new(view.clone()));
+    assert!(matches!(
+        worker.validate_current_market_reference(&cross_venue, 1_150),
+        Err(OrderIntentRejectReason::SourceBookStale {
+            source_book_seq: 42,
+            latest_book_seq: 43
+        })
+    ));
+    view.orderbooks.remove(&source);
+    snapshots.store(Arc::new(view));
+    assert_eq!(
+        worker.validate_current_market_reference(&cross_venue, 1_150),
+        Err(OrderIntentRejectReason::SourceBookUnavailable)
+    );
 }
 
 #[test]
