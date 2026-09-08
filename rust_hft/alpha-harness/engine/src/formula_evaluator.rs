@@ -41,13 +41,7 @@ pub struct PositionEvaluationPoint {
     pub equity: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReturnAccountingBasis {
-    ObservedMidPrice,
-    ObservedClosePrice,
-    OneStepLabel,
-}
+pub use alpha_domain::ReturnAccountingBasis;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -455,9 +449,19 @@ impl FormulaEvaluator {
             evaluator_version,
             SEALED_HOLDOUT_EVALUATOR_VERSION | alpha_domain::ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION
         );
-        if (sealed
-            && (ranges.len() != 1 || ranges[0].len() != protocol.walk_forward.sealed_holdout_rows))
+        let independent_selection = evaluator_version
+            == alpha_domain::frozen_model::INDEPENDENT_SELECTION_EVALUATOR_VERSION;
+        if (independent_selection
+            && (ranges.len() != 1
+                || protocol
+                    .selection
+                    .as_ref()
+                    .is_none_or(|selection| ranges[0].len() != selection.rows)))
+            || (sealed
+                && (ranges.len() != 1
+                    || ranges[0].len() != protocol.walk_forward.sealed_holdout_rows))
             || (!sealed
+                && !independent_selection
                 && (ranges.len() != protocol.walk_forward.fold_count
                     || ranges
                         .iter()

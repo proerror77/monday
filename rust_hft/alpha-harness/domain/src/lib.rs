@@ -3,6 +3,7 @@
 pub mod campaign_control;
 pub mod campaign_finalization;
 mod evaluation_partition;
+pub mod frozen_model;
 pub use evaluation_partition::{EvaluationRowPartitionsV1, EvaluationSelectionV1};
 pub mod runtime_latency_evidence;
 
@@ -1228,6 +1229,14 @@ pub struct EvaluationMetrics {
     pub folds: Vec<FoldEvaluationMetrics>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReturnAccountingBasis {
+    ObservedMidPrice,
+    ObservedClosePrice,
+    OneStepLabel,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CandidateEvaluation {
     pub passed: bool,
@@ -1436,6 +1445,14 @@ impl CandidateEvaluation {
                             .ok_or("walk-forward row count overflowed")?,
                         protocol.walk_forward.validation_rows,
                     ),
+                    frozen_model::INDEPENDENT_SELECTION_EVALUATOR_VERSION => {
+                        let rows = protocol
+                            .selection
+                            .as_ref()
+                            .ok_or("selection evaluation requires a reserved window")?
+                            .rows;
+                        (1, rows, rows)
+                    }
                     SEALED_HOLDOUT_EVALUATOR_VERSION | ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION => (
                         1,
                         protocol.walk_forward.sealed_holdout_rows,
@@ -1479,6 +1496,7 @@ impl CandidateEvaluation {
                 | SEALED_HOLDOUT_EVALUATOR_VERSION
                 | ONNX_WALK_FORWARD_EVALUATOR_VERSION
                 | ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION
+                | frozen_model::INDEPENDENT_SELECTION_EVALUATOR_VERSION
         ) {
             let config = self
                 .formula_config()
@@ -3651,6 +3669,7 @@ pub enum EngineKind {
     LlmProposer,
     OfflineReinforcementLearning,
     ManualSeed,
+    FinalEvaluation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4495,7 +4514,7 @@ pub struct CexFourStageStrategyCandidateV1 {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct CexFourStageRuntimeContractV1 {
+pub struct CexRuntimeContractV1 {
     pub zero_epsilon: f64,
     pub observation_frequency_millis: u64,
     pub tick_size: String,
@@ -4584,11 +4603,11 @@ impl CexFourStageStrategyCandidateV1 {
         Ok(())
     }
 
-    pub fn runtime_contract(&self) -> Result<CexFourStageRuntimeContractV1, DomainError> {
+    pub fn runtime_contract(&self) -> Result<CexRuntimeContractV1, DomainError> {
         self.validate()?;
         let strategy: CexFourStageStrategyV1 = serde_json::from_str(&self.strategy_artifact_json)
             .map_err(|_| DomainError::InvalidStrategyBundle)?;
-        Ok(CexFourStageRuntimeContractV1 {
+        Ok(CexRuntimeContractV1 {
             zero_epsilon: strategy.sizing.zero_epsilon,
             observation_frequency_millis: strategy.execution.horizon.observation_frequency_millis,
             tick_size: self.instrument_rules.tick_size.clone(),
@@ -4828,6 +4847,23 @@ impl CexSealedHoldoutClaimV1 {
         Ok(claim)
     }
 
+    pub fn from_model_precommit(
+        precommit: &frozen_model::ModelFinalPrecommitV1,
+    ) -> Result<Self, DomainError> {
+        precommit.validate()?;
+        let claim = Self {
+            schema_version: CEX_SEALED_HOLDOUT_CLAIM_SCHEMA_V1.into(),
+            claim_id: format!("cex-sealed-holdout-claim:{}", precommit.mission_id),
+            mission_id: precommit.mission_id.clone(),
+            precommit: precommit.content_reference()?,
+            candidate: precommit.final_candidate.clone(),
+            evaluation_protocol: precommit.evaluation_protocol.clone(),
+            holdout_id: precommit.holdout_id.clone(),
+        };
+        claim.validate()?;
+        Ok(claim)
+    }
+
     pub fn validate(&self) -> Result<(), DomainError> {
         self.precommit.validate()?;
         self.candidate.validate()?;
@@ -4851,6 +4887,7 @@ pub enum CandidateArtifact {
     Formula(FactorAst),
     OnnxModel(OnnxModelCandidate),
     CexFourStage(CexFourStageStrategyCandidateV1),
+    FrozenModel(Box<frozen_model::FrozenModelStrategyV1>),
     Program(serde_json::Value),
     ModelConfig(serde_json::Value),
     ModelArtifact(ArtifactRef),
@@ -4875,6 +4912,12 @@ impl CandidateArtifact {
                     model: model.clone(),
                 })
             }
+            Self::FrozenModel(strategy) => {
+                strategy.validate()?;
+                Ok(StrategyBundleArtifact::FrozenModel {
+                    strategy: strategy.clone(),
+                })
+            }
             Self::CexFourStage(strategy) => {
                 strategy.validate()?;
                 Ok(StrategyBundleArtifact::CexFourStage {
@@ -4893,6 +4936,9 @@ impl CandidateArtifact {
 /// Runtime-loadable artifact schema produced by governed promotion.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum StrategyBundleArtifact {
+    FrozenModel {
+        strategy: Box<frozen_model::FrozenModelStrategyV1>,
+    },
     Formula {
         ast: FactorAst,
     },
@@ -4916,6 +4962,7 @@ impl StrategyBundleArtifact {
                 }),
             Self::Onnx { model } => model.validate(),
             Self::CexFourStage { strategy } => strategy.validate(),
+            Self::FrozenModel { strategy } => strategy.validate(),
         }
     }
 
@@ -4926,6 +4973,7 @@ impl StrategyBundleArtifact {
                 .map_err(|_| DomainError::InvalidStrategyBundle),
             Self::Onnx { model } => model.validate(),
             Self::CexFourStage { strategy } => strategy.validate(),
+            Self::FrozenModel { strategy } => strategy.validate(),
         }
     }
 }
@@ -7279,6 +7327,14 @@ mod tests {
                 .unwrap()
                 .multiple_testing_trials,
             100
+        );
+
+        let final_policy = frozen_model::final_evaluator_config(&mission, 4).unwrap();
+        assert_eq!(final_policy.multiple_testing_trials, 100);
+        let larger_final = frozen_model::final_evaluator_config(&mission, 128).unwrap();
+        assert_eq!(larger_final.multiple_testing_trials, 128);
+        assert!(
+            larger_final.adjusted_score(10.0).unwrap() < final_policy.adjusted_score(10.0).unwrap()
         );
 
         mission.validator_spec = serde_json::json!({"multiple_testing_trials": 1});

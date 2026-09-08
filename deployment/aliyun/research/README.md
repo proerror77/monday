@@ -437,6 +437,10 @@ input GET + SHA admission
   -> authenticated family-ledger settlement before any child dispatch
 ```
 
+This is the pre-holdout Campaign path. Final evaluation starts only after a
+complete family has been closed under its separate final-evaluation authority;
+the operation and its control file are described below.
+
 The request schema is `cex-campaign-request-v5`. It separately binds the exact
 executor Git revision and image digest plus the input receipt SHA-256, producer
 Git revision, producer image digest, and validated research-plan content. It also binds the
@@ -931,6 +935,149 @@ collection; ambiguous/suspended attempts remain for owner reconciliation. New
 dispatch receipt variants are append-only. An older binary cannot read them; do
 not roll a live ledger back with an older writer or discard receipts to recover.
 
+#### Final evaluation of a closed family
+
+Final evaluation uses a separately signed
+`monday.campaign_final_evaluation_grant.v1` and its active
+`campaign_final_evaluation` approval. Close the existing family ledger first;
+`close-family` verifies the exact settled ledger head, execution/evaluation
+views, and complete selected-result set, then records a permanent
+`family_closed_for_final_evaluation` receipt. Every attempt must have canonical
+terminal identity and known consumption; entries in `selected_results` must be
+the family attempts settled as `SelectedPreHoldout`. Closing does not read the
+selection or sealed-holdout rows, create a Job, or start evaluation:
+
+```bash
+alpha-harness mission dispatch close-family \
+  --ledger /campaign-root/ledger.duckdb \
+  --signed-grant /private/final-grant.json \
+  --trusted-keys /private/final-public-keys.json \
+  --approval-id REPLACE_FINAL_APPROVAL_ID
+```
+
+The final dispatch control is
+`monday.campaign_final_dispatch_control.v1`. Its paths are relative to the
+control file when written relatively, and its source map must preserve the
+original submission files:
+
+```json
+{
+  "schema_version": "monday.campaign_final_dispatch_control.v1",
+  "ledger_path": "ledger.duckdb",
+  "signed_final_grant_path": "final-grant.json",
+  "trusted_keys_path": "final-public-keys.json",
+  "materialization_path": "materialization.json",
+  "controller_image": "registry.example/controller@sha256:REPLACE_CONTROLLER_DIGEST",
+  "source_submissions": {
+    "campaign-attempt-<64-hex-operation-digest>": "source-submissions/<original-submission>.json"
+  },
+  "receipt_access": {
+    "research/campaign-ledger/family-id=<family-id>/sequence=00000000000000000001/receipt.json": {
+      "put_url": "REPLACE_EXACT_SIGNED_PUT_URL",
+      "readback_url": "REPLACE_EXACT_SIGNED_GET_URL"
+    }
+  }
+}
+```
+
+`source_submissions` must cover every key in the grant's complete
+`selected_results` map. `receipt_access` must cover the complete existing
+family receipt chain and the final dispatch/settlement receipts; a missing
+entry retains the reservation and fails closed. The approval ID is already
+ledger state and is not another control-file authority field. Keep signed URL
+values as short-lived placeholders in checked-in examples; never commit real
+credentials or signed query strings.
+
+Use the final control to freeze the existing materialization and source
+identities. This command accepts no seed or research plan, validates local
+feature/materialization/replay artifacts, and does not read the reserved
+selection or sealed-holdout rows:
+
+```bash
+alpha-harness mission campaign-freeze \
+  --final-evaluation-control /private/final-control.json \
+  --campaign-inputs /campaign-root/inputs/campaign-inputs.json \
+  --input-root /campaign-root/inputs \
+  --source-revision REPLACE_EXACT_GIT_SHA \
+  --image registry.example/research-runner@sha256:REPLACE_RUNNER_DIGEST \
+  --campaign-root https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/final-evaluation/REPLACE_FINAL_RUN_ID \
+  --output /private/final-freeze.json
+```
+
+The freeze output includes the signing plan. When GET signatures are renewed,
+update only the independent `read_urls` map (and the final result/bundle
+access URLs) while preserving each query-free object key and every historical
+request in `sources`. `campaign-finalize` canonicalizes those access URLs and
+therefore accepts a presign refresh without rewriting the settled source
+request or Campaign identity:
+
+```bash
+alpha-harness mission campaign-finalize \
+  --freeze /private/final-freeze.json \
+  --signed-request /private/final-request-with-signed-urls.json \
+  --attempt-id final-evaluation-REPLACE_ATTEMPT \
+  --image registry.example/research-runner@sha256:REPLACE_RUNNER_DIGEST \
+  --request-out /private/final-request.json \
+  --submission-out /private/final-submission.json
+```
+
+The submission has `purpose: final_evaluation`. The existing dispatcher detects
+that purpose and keeps the same native channel for inspection, Job creation,
+immutable input Secret, durable claim, UID binding, and release:
+
+```bash
+alpha-harness mission dispatch inspect \
+  --submission /private/final-submission.json \
+  --control /private/final-control.json \
+  --materialization /campaign-root/inputs/materialization.json \
+  --controller-image registry.example/controller@sha256:REPLACE_CONTROLLER_DIGEST \
+  --attempt-ordinal 0
+
+alpha-harness mission dispatch submit \
+  --submission /private/final-submission.json \
+  --control /private/final-control.json \
+  --context monday-research-apne1 \
+  --namespace monday-research
+```
+
+The generated worker command is
+`mission campaign-execute --final-evaluation` with the grant's trusted keys;
+it is not the `--pre-holdout` root shape. The worker verifies every source
+terminal result, freezes the already fitted candidate weights without
+retraining, evaluates each candidate on the independent selection window, and
+then runs the separate event replay. Only a replay-qualified candidate may
+write the final precommit and create the one global holdout claim. The claim is
+create-once at the family-wide holdout object. If claim publication, readback,
+or evaluation fails after that boundary, the final attempt is terminal and no
+holdout retry is permitted.
+
+After the Job reaches a terminal state, settle the same submission through the
+same dispatcher:
+
+```bash
+alpha-harness mission dispatch settle \
+  --submission /private/final-submission.json \
+  --control /private/final-control.json \
+  --context monday-research-apne1 \
+  --namespace monday-research
+```
+
+Settlement independently checks the Job/Pod UID, final result and bundle
+readbacks, then records the final terminal outcome and measured Job
+consumption. The native result shapes are `no_selection_candidate` (no claim),
+`replay_rejected` (no claim), `holdout_rejected` (claim and sealed receipt,
+without promotion), and `promotion_ready` (claim, sealed receipt, bundle, and
+promotion lineage). An infrastructure `failed` terminal requires independent
+evidence and still consumes the one final dispatch; it cannot mint another
+holdout attempt. `mission dispatch controller-handoff` remains the root
+pre-holdout readback contract and is not a final-evaluation controller.
+
+The current evidence boundary is native worker positive/negative local
+integration fixtures plus ledger/dispatch checks for family closure,
+single-use claim, UID binding, terminal settlement, revocation, and restore.
+There is no real ACK/OSS cloud final-evaluation run, image deployment, or
+runtime cutover result established by these checks.
+
 One Campaign maps to multiple rounds. The canonical factor plan and every
 bounded policy follow-up retain all 9 L2/aggregate-trade terminals and 22
 candidate slots. The request derives the total trial limit from the exact plan
@@ -941,9 +1088,11 @@ supervised models (Ridge, CART, Burn MLP);
 it does not run subset MCTS. A negative Campaign produces no holdout claim and
 feeds its typed model/replay failures to the bounded external learning step. A
 selected v4 round remains pre-holdout and has no deployment or order authority.
-The legacy formula lane alone may finalize once against the global holdout
-claim; a claim without a complete sealed receipt/result is terminal and
-inconclusive, not retry authority.
+The final-evaluation lane applies to the selected native supervised winners
+(Ridge, CART, or Burn MLP) from the closed family. It freezes their fitted
+weights, performs independent selection and replay, and then consumes one
+global holdout claim; a claim without a complete sealed receipt/result is
+terminal and inconclusive, not retry authority.
 
 Job completion alone is not research completion. Require the exact image ID,
 terminal Job/Pod state, Mission readback SHA, result readback SHA, and Campaign

@@ -360,18 +360,6 @@ pub(super) fn checked_reservation(
         .dispatch
         .as_ref()
         .map_or(a.sequence, |dispatch| dispatch.sequence);
-    for receipt in history.iter().take(usize::try_from(through).map_err(err)?) {
-        let (hash, auth): (String, String) = conn.query_row("SELECT object_sha256, auth_tag FROM campaign_receipt_publications WHERE family_id = ? AND sequence = ?", params![family, sql_sequence(receipt.receipt.sequence)?], |r| Ok((r.get(0)?, r.get(1)?))).map_err(database_error)?;
-        if hash != receipt.object_sha256()? {
-            return Err(StoreError::ContentHashMismatch);
-        }
-        verify_authentication_tag(
-            key,
-            PUBLICATION_DOMAIN,
-            &receipt.object_key(),
-            &publication_json(receipt)?,
-            &auth,
-        )?;
-    }
+    require_published_receipts(conn, key, family, &history, through)?;
     Ok(a.reservation.clone())
 }

@@ -350,6 +350,121 @@ fn accepted_paper_shadow_handoff_reaches_both_runtime_adapters() {
 
 #[test]
 #[cfg(all(feature = "formula-strategy", feature = "binance"))]
+fn signed_frozen_model_bundle_loads_native_parameters_and_preserves_limits() {
+    use alpha_domain::{
+        canonical_json_hash, frozen_model::*, CandidateArtifact, StrategyBundleArtifact,
+    };
+    let now = Utc::now();
+    let key = SigningKey::from_bytes(&[7_u8; 32]);
+    let mut bundle = cex_four_stage_bundle();
+    let StrategyBundleArtifact::CexFourStage { strategy } = &bundle.artifact else {
+        unreachable!()
+    };
+    let source: serde_json::Value = serde_json::from_str(&strategy.strategy_artifact_json).unwrap();
+    let protocol: alpha_domain::EvaluationProtocolV1 = serde_json::from_value(
+        source
+            .pointer("/walk_forward_evidence/selected/evaluation/evaluation_protocol")
+            .unwrap()
+            .clone(),
+    )
+    .unwrap();
+    let mut protocol = protocol.with_independent_selection(30).unwrap();
+    protocol.costs.cross_spread = true;
+    let source_ref = serde_json::json!({"id": "test-source", "content_sha256": "a".repeat(64)});
+    let frozen: FrozenSupervisedCandidateV1 = serde_json::from_value(serde_json::json!({
+        "schema_version": FROZEN_SUPERVISED_CANDIDATE_SCHEMA, "artifact_id": "",
+        "source_candidate": source_ref, "source_model": source_ref, "source_factor_bank": source_ref, "source_fold": source_ref, "research_dataset": source_ref,
+        "evaluation_protocol_sha256": protocol.content_hash().unwrap(),
+        "evaluator_config": source.pointer("/walk_forward_evidence/selected/evaluation/evaluator_config").unwrap(),
+        "program": {"schema_version": "monday.frozen_factor_model.v1", "venue": "binance", "market": "usdm", "symbol": "BTCUSDT",
+            "observation_frequency_millis": protocol.labels.observation_frequency_millis, "label_horizon_buckets": protocol.labels.horizon_buckets,
+            "factors": [{"ast": {"Terminal": {"Field": "book_imbalance"}}, "negative": false}],
+            "model": {"model_kind": "ridge", "intercept": 0.0, "means": [0.0], "scales": [1.0], "coefficients": [1.0]},
+            "decision_policy": {"schema_version": "cex-supervised-decision-policy-v2", "round_trip_cost_multiplier": 0.0, "sizing_rule": "prediction_identity", "max_abs_position": 1.0},
+            "base_costs": frozen_decision_costs(&protocol), "cross_spread": protocol.costs.cross_spread}
+    })).unwrap();
+    let model = FrozenModelStrategyV1 {
+        schema_version: "monday.frozen_model_strategy.v1".into(),
+        mission_id: strategy.mission_id.clone(),
+        precommit_id: strategy.precommit_id.clone(),
+        frozen: frozen.finalize().unwrap(),
+        evaluation_protocol: protocol.clone(),
+        instrument_rules: strategy.instrument_rules.clone(),
+    };
+    bundle.candidate_content_hash =
+        canonical_json_hash(&CandidateArtifact::FrozenModel(Box::new(model.clone()))).unwrap();
+    bundle.artifact = StrategyBundleArtifact::FrozenModel {
+        strategy: Box::new(model),
+    };
+    bundle.evaluation_protocol_hash = protocol.content_hash().unwrap();
+    bundle.bundle_hash = bundle.calculated_hash().unwrap();
+    bundle.validate().unwrap();
+    let directory = directory("frozen-model-handoff");
+    let mut config = configured_runtime();
+    config.venues[0].inst_type = Some("usdm".into());
+    config.venues[0].rest = Some("https://fapi.binance.com".into());
+    config.venues[0].ws_public = Some("wss://fstream.binance.com/ws".into());
+    let mut grant = bind_bundle(
+        envelope(
+            now,
+            "frozen-model",
+            "nonce-frozen-model",
+            AllowedIntentType::StartPaper,
+            ApprovalClass::Paper,
+        ),
+        &bundle,
+    );
+    grant.allowed_intent_types[0] = AllowedIntentType::LoadModel;
+    let signed = sign_envelope(grant, "key-1", &key).unwrap();
+    let request = {
+        let bundle_path = directory.join("bundle.json");
+        let mut adapter = SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path);
+        intake(
+            &signed,
+            &trusted(&key),
+            &policy(&signed.envelope),
+            now,
+            &directory,
+            &mut adapter,
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        request.artifact,
+        hft_live::deployment_envelope::ActivationArtifact::FrozenModel
+    );
+    assert_eq!(request.market.as_deref(), Some("usdm"));
+    assert_eq!(request.max_notional, 500.0);
+    let runtime::StrategyParams::FrozenModel {
+        program,
+        max_order_notional,
+        execution_contract,
+    } = &config.strategies[0].params
+    else {
+        panic!("native model parameters missing")
+    };
+    assert_eq!(program.factors.len(), 1);
+    assert_eq!(*max_order_notional, rust_decimal::Decimal::from(500));
+    assert_eq!(execution_contract.venue, hft_core::VenueId::BINANCE);
+    assert!(execution_contract.cross_spread);
+    assert!(config.venues[0].simulate_execution);
+    assert_eq!(
+        config.engine.intent_max_order_notional,
+        Some(rust_decimal::Decimal::from(500))
+    );
+    let runtime = runtime::SystemBuilder::new(config)
+        .auto_register_adapters_strict()
+        .unwrap()
+        .build();
+    assert_eq!(
+        runtime.engine.try_lock().unwrap().strategy_instance_ids(),
+        vec![format!("{}:BTCUSDT", bundle.bundle_id)]
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[cfg(all(feature = "formula-strategy", feature = "binance"))]
 fn four_stage_cex_bundle_uses_formula_runtime_only_for_its_signed_scope() {
     let now = Utc::now();
     let key = SigningKey::from_bytes(&[7_u8; 32]);

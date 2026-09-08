@@ -1,6 +1,7 @@
 mod admission;
-pub(crate) mod final_authority;
 pub(crate) mod controller;
+pub(crate) mod final_admission;
+pub(crate) mod final_authority;
 mod terminal;
 
 use crate::{
@@ -58,6 +59,9 @@ enum SubmissionObjectState {
 }
 
 pub fn inspect(args: MissionDispatchInspectArgs) -> anyhow::Result<()> {
+    if final_admission::is_final_submission(&args.submission)? {
+        return final_admission::inspect(args);
+    }
     let validated = validate_submission(load_submission(&args.submission)?)?;
     let manifest = render_manifest(&validated, "monday-research")?;
     print_json(&admission::inspect_binding(
@@ -70,10 +74,16 @@ pub fn inspect(args: MissionDispatchInspectArgs) -> anyhow::Result<()> {
 }
 
 pub fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
+    if final_admission::is_final_submission(&args.submission)? {
+        return final_admission::settle(args);
+    }
     terminal::settle(args)
 }
 
 pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
+    if final_admission::is_final_submission(&args.submission)? {
+        return final_admission::submit(args);
+    }
     validate_cluster_target(&args.context, &args.namespace)?;
     let submission = load_submission(&args.submission)?;
     let validated = validate_submission(submission)?;
@@ -85,6 +95,7 @@ pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
     let manifest = render_manifest(&validated, &args.namespace)?;
     let control = args
         .control
+        .clone()
         .or_else(|| std::env::var_os("MONDAY_CAMPAIGN_CONTROL").map(Into::into))
         .context("Campaign dispatch requires --control or MONDAY_CAMPAIGN_CONTROL")?;
     let mut admission = admission::Admission::open(
@@ -94,6 +105,95 @@ pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
         &args.context,
         &args.namespace,
     )?;
+    submit_rendered_job(
+        &args,
+        RenderedDispatch {
+            job_name: job_name.clone(),
+            secret_name,
+            request_sha256: request_sha256.clone(),
+            request_json,
+            manifest,
+        },
+        &mut admission,
+    )?;
+
+    let report = json!({
+        "status": "submitted",
+        "context": args.context,
+        "namespace": args.namespace,
+        "campaign_id": campaign_id,
+        "request_sha256": request_sha256,
+        "job_name": job_name,
+        "operation_id": admission.reservation.operation_id()?,
+        "reserved_trials": admission.reservation.declared_trials,
+        "execution_scope": "pre_holdout",
+    });
+    crate::mission_runner::research_event(
+        "alpha-harness",
+        "campaign_dispatch_submitted",
+        report.clone(),
+    );
+    print_json(&report)
+}
+
+pub(super) trait DispatchAdmission {
+    fn prepare(&mut self) -> anyhow::Result<()>;
+    fn publish_receipts(&mut self) -> anyhow::Result<()>;
+    fn claim(
+        &mut self,
+    ) -> anyhow::Result<(alpha_store::campaign_ledger::CampaignDispatchClaimV1, bool)>;
+    fn bind_job(&mut self, uid: &str) -> anyhow::Result<()>;
+    fn guarded<T>(
+        &mut self,
+        uid: Option<&str>,
+        action: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T>;
+}
+
+impl DispatchAdmission for admission::Admission {
+    fn prepare(&mut self) -> anyhow::Result<()> {
+        admission::Admission::prepare(self)
+    }
+    fn publish_receipts(&mut self) -> anyhow::Result<()> {
+        admission::Admission::publish_receipts(self)
+    }
+    fn claim(
+        &mut self,
+    ) -> anyhow::Result<(alpha_store::campaign_ledger::CampaignDispatchClaimV1, bool)> {
+        admission::Admission::claim(self)
+    }
+    fn bind_job(&mut self, uid: &str) -> anyhow::Result<()> {
+        admission::Admission::bind_job(self, uid)
+    }
+    fn guarded<T>(
+        &mut self,
+        uid: Option<&str>,
+        action: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        admission::Admission::guarded(self, uid, action)
+    }
+}
+
+pub(super) struct RenderedDispatch {
+    pub job_name: String,
+    pub secret_name: String,
+    pub request_sha256: String,
+    pub request_json: String,
+    pub manifest: Value,
+}
+
+fn submit_rendered_job<A: DispatchAdmission>(
+    args: &MissionDispatchSubmitArgs,
+    rendered: RenderedDispatch,
+    admission: &mut A,
+) -> anyhow::Result<()> {
+    let RenderedDispatch {
+        job_name,
+        secret_name,
+        request_sha256,
+        request_json,
+        manifest,
+    } = rendered;
     admission.prepare()?;
     admission.publish_receipts()?;
     let (claim, first_create) = admission.claim()?;
@@ -166,6 +266,7 @@ pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
             &job_name,
             job_uid,
         )?;
+        validate_complete_secret_payload(&secret, &manifest["items"][0])?;
         let release_patch_json = serde_json::to_string(&release_job_patch(&job)?)?;
         let release_output = admission.guarded(Some(job_uid), || {
             kubectl_with_input(
@@ -207,23 +308,7 @@ pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
         return Err(error.context("Campaign dispatch claim and budget retained for reconciliation; no automatic recreation or refund"));
     }
 
-    let report = json!({
-        "status": "submitted",
-        "context": args.context,
-        "namespace": args.namespace,
-        "campaign_id": campaign_id,
-        "request_sha256": request_sha256,
-        "job_name": job_name,
-        "operation_id": admission.reservation.operation_id()?,
-        "reserved_trials": admission.reservation.declared_trials,
-        "execution_scope": "pre_holdout",
-    });
-    crate::mission_runner::research_event(
-        "alpha-harness",
-        "campaign_dispatch_submitted",
-        report.clone(),
-    );
-    print_json(&report)
+    Ok(())
 }
 
 fn resolve_dispatch_job(
@@ -594,6 +679,32 @@ fn validate_secret_readback(
     Ok(())
 }
 
+fn validate_complete_secret_payload(observed: &Value, expected: &Value) -> anyhow::Result<()> {
+    let expected = expected["stringData"]
+        .as_object()
+        .context("expected input Secret lacks stringData")?;
+    let observed = observed["data"]
+        .as_object()
+        .context("input Secret lacks data")?;
+    if expected.len() != observed.len() {
+        bail!("input Secret has unexpected payload keys");
+    }
+    for (name, value) in expected {
+        let bytes = value
+            .as_str()
+            .context("expected Secret input is not a string")?
+            .as_bytes();
+        let readback = observed
+            .get(name)
+            .and_then(Value::as_str)
+            .context("input Secret key missing")?;
+        if decode_base64(readback)? != bytes {
+            bail!("input Secret payload differs for {name}");
+        }
+    }
+    Ok(())
+}
+
 fn decode_base64(value: &str) -> anyhow::Result<Vec<u8>> {
     if value.is_empty() || !value.len().is_multiple_of(4) {
         bail!("CEX Campaign input Secret campaign.json is not valid base64");
@@ -647,8 +758,15 @@ fn load_submission(path: &std::path::Path) -> anyhow::Result<MissionDispatchSubm
 fn validate_submission(
     submission: MissionDispatchSubmission,
 ) -> anyhow::Result<ValidatedSubmission> {
+    validate_submission_with_request_check(submission, validate_request)
+}
+
+fn validate_submission_with_request_check(
+    submission: MissionDispatchSubmission,
+    check: impl FnOnce(&CampaignRequest) -> anyhow::Result<()>,
+) -> anyhow::Result<ValidatedSubmission> {
     validate_dns_label("attempt id", &submission.attempt_id)?;
-    validate_request(&submission.request)?;
+    check(&submission.request)?;
     let image_digest = image_digest(&submission.image)?;
     if submission.request.image_identity != image_digest {
         bail!("campaign request image identity must match the pinned Job image digest");
@@ -698,10 +816,62 @@ pub(crate) fn write_submission(
     })
 }
 
+struct DispatchManifestInput<'a> {
+    attempt_id: &'a str,
+    campaign_id: &'a str,
+    job_name: &'a str,
+    secret_name: &'a str,
+    image: &'a str,
+    image_digest: &'a str,
+    request_sha256: &'a str,
+    request_json: &'a str,
+    submission_identity_sha256: &'a str,
+    args: Vec<String>,
+    active_deadline_seconds: u64,
+    trusted_keys_json: Option<&'a str>,
+}
+
 fn render_manifest(validated: &ValidatedSubmission, namespace: &str) -> anyhow::Result<Value> {
+    render_campaign_manifest(
+        DispatchManifestInput {
+            attempt_id: &validated.submission.attempt_id,
+            campaign_id: &validated.submission.request.campaign_id,
+            job_name: &validated.job_name,
+            secret_name: &validated.secret_name,
+            image: &validated.submission.image,
+            image_digest: &validated.image_digest,
+            request_sha256: &validated.request_sha256,
+            request_json: &validated.request_json,
+            submission_identity_sha256: &validated.submission_identity_sha256,
+            trusted_keys_json: None,
+            active_deadline_seconds: ACTIVE_DEADLINE_SECONDS,
+            args: vec![
+                "mission".into(),
+                "campaign-execute".into(),
+                "--pre-holdout".into(),
+                "--work-dir".into(),
+                "/work".into(),
+                "--campaign-id".into(),
+                validated.submission.request.campaign_id.clone(),
+                "--image-identity".into(),
+                validated.image_digest.clone(),
+                "--request".into(),
+                "/inputs/campaign.json".into(),
+                "--request-sha256".into(),
+                validated.request_sha256.clone(),
+            ],
+        },
+        namespace,
+    )
+}
+
+fn render_campaign_manifest(
+    input: DispatchManifestInput<'_>,
+    namespace: &str,
+) -> anyhow::Result<Value> {
     validate_dns_label("namespace", namespace)?;
-    let attempt_id = validated.submission.attempt_id.clone();
-    let campaign_id = validated.submission.request.campaign_id.clone();
+    let attempt_id = input.attempt_id;
+    let campaign_id = input.campaign_id;
     let labels = json!({
         "app.kubernetes.io/name": "monday-alpha-campaign",
         "app.kubernetes.io/part-of": "monday",
@@ -710,12 +880,12 @@ fn render_manifest(validated: &ValidatedSubmission, namespace: &str) -> anyhow::
     let annotations = json!({
         "research.monday/attempt-id": &attempt_id,
         "research.monday/campaign-id": &campaign_id,
-        "research.monday/request-sha256": &validated.request_sha256,
-        "research.monday/submission-identity-sha256": &validated.submission_identity_sha256,
-        "research.monday/image-digest": &validated.image_digest,
+        "research.monday/request-sha256": &input.request_sha256,
+        "research.monday/submission-identity-sha256": &input.submission_identity_sha256,
+        "research.monday/image-digest": &input.image_digest,
         "research.monday/lane": "cex_research_campaign",
     });
-    Ok(json!({
+    let mut manifest = json!({
         "apiVersion": "v1",
         "kind": "List",
         "items": [
@@ -723,26 +893,26 @@ fn render_manifest(validated: &ValidatedSubmission, namespace: &str) -> anyhow::
                 "apiVersion": "v1",
                 "kind": "Secret",
                 "metadata": {
-                    "name": validated.secret_name,
+                    "name": input.secret_name,
                     "namespace": namespace,
                     "labels": labels,
                     "annotations": {
                         "research.monday/attempt-id": &attempt_id,
                         "research.monday/campaign-id": &campaign_id,
-                        "research.monday/request-sha256": &validated.request_sha256,
+                        "research.monday/request-sha256": &input.request_sha256,
                     }
                 },
                 "type": "Opaque",
                 "immutable": true,
                 "stringData": {
-                    "campaign.json": validated.request_json,
+                    "campaign.json": input.request_json,
                 },
             },
             {
                 "apiVersion": "batch/v1",
                 "kind": "Job",
                 "metadata": {
-                    "name": validated.job_name,
+                    "name": input.job_name,
                     "namespace": namespace,
                     "labels": labels,
                     "annotations": annotations,
@@ -752,7 +922,7 @@ fn render_manifest(validated: &ValidatedSubmission, namespace: &str) -> anyhow::
                     "parallelism": 1,
                     "completions": 1,
                     "backoffLimit": 0,
-                    "activeDeadlineSeconds": ACTIVE_DEADLINE_SECONDS,
+                    "activeDeadlineSeconds": input.active_deadline_seconds,
                     "ttlSecondsAfterFinished": 86400,
                     "template": {
                         "metadata": { "labels": labels, "annotations": annotations },
@@ -770,19 +940,10 @@ fn render_manifest(validated: &ValidatedSubmission, namespace: &str) -> anyhow::
                             },
                             "containers": [{
                                 "name": "alpha-campaign",
-                                "image": validated.submission.image,
+                                "image": input.image,
                                 "imagePullPolicy": "IfNotPresent",
                                 "command": ["/usr/local/bin/alpha-harness"],
-                                "args": [
-                                    "mission",
-                                    "campaign-execute",
-                                    "--pre-holdout",
-                                    "--work-dir", "/work",
-                                    "--campaign-id", &campaign_id,
-                                    "--image-identity", &validated.image_digest,
-                                    "--request", "/inputs/campaign.json",
-                                    "--request-sha256", &validated.request_sha256
-                                ],
+                                "args": input.args,
                                 "resources": {
                                     "requests": { "cpu": "3500m", "memory": "8Gi" },
                                     "limits": { "cpu": "3500m", "memory": "12Gi" }
@@ -804,7 +965,7 @@ fn render_manifest(validated: &ValidatedSubmission, namespace: &str) -> anyhow::
                                 {
                                     "name": "inputs",
                                     "secret": {
-                                        "secretName": validated.secret_name,
+                                        "secretName": input.secret_name,
                                         "items": [{ "key": "campaign.json", "path": "campaign.json" }]
                                     }
                                 }
@@ -814,7 +975,15 @@ fn render_manifest(validated: &ValidatedSubmission, namespace: &str) -> anyhow::
                 }
             }
         ]
-    }))
+    });
+    if let Some(keys) = input.trusted_keys_json {
+        manifest["items"][0]["stringData"]["final-trusted-keys.json"] = Value::String(keys.into());
+        manifest["items"][1]["spec"]["template"]["spec"]["volumes"][2]["secret"]["items"]
+            .as_array_mut()
+            .expect("input items")
+            .push(json!({"key":"final-trusted-keys.json","path":"final-trusted-keys.json"}));
+    }
+    Ok(manifest)
 }
 
 pub(crate) fn image_digest(image: &str) -> anyhow::Result<String> {
@@ -931,6 +1100,25 @@ mod tests {
             job["spec"]["template"]["spec"]["containers"][0]["args"][1],
             "campaign-execute"
         );
+    }
+
+    #[test]
+    fn final_secret_readback_binds_every_input_including_trust_keys() {
+        let expected = json!({"stringData":{"campaign.json":"{}","final-trusted-keys.json":"{}"}});
+        let observed = json!({"data":{"campaign.json":"e30=","final-trusted-keys.json":"e30="}});
+        validate_complete_secret_payload(&observed, &expected).unwrap();
+        let mut changed = observed.clone();
+        changed["data"]["final-trusted-keys.json"] = json!("bm8=");
+        assert!(validate_complete_secret_payload(&changed, &expected).is_err());
+        changed = observed.clone();
+        changed["data"]["extra"] = json!("e30=");
+        assert!(validate_complete_secret_payload(&changed, &expected).is_err());
+        changed = observed;
+        changed["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("final-trusted-keys.json");
+        assert!(validate_complete_secret_payload(&changed, &expected).is_err());
     }
 
     #[test]

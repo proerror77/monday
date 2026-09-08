@@ -23,6 +23,8 @@ pub(super) struct FinalClosure {
     pub approval: ApprovalRecord,
     pub approval_hash: String,
     pub revoked_at: Option<DateTime<Utc>>,
+    pub dispatch: Option<CampaignFinalDispatchClaimV1>,
+    pub settlement: Option<CampaignFinalDispatchSettlementV1>,
 }
 
 #[derive(Default)]
@@ -345,6 +347,98 @@ impl State {
                 }
                 attempt.settlement = Some(settlement.clone());
             }
+            CampaignLedgerEventV1::FinalDispatchClaimed {
+                request_sha256,
+                target,
+            } => {
+                final_dispatch::validate_digest(request_sha256)?;
+                target.validate()?;
+                let closure = self
+                    .final_closure
+                    .as_mut()
+                    .ok_or_else(|| err("family is not closed"))?;
+                closure
+                    .grant
+                    .validate_job_deadline_at(receipt.recorded_at)
+                    .map_err(err)?;
+                if closure.dispatch.is_some()
+                    || closure.settlement.is_some()
+                    || closure
+                        .revoked_at
+                        .is_some_and(|when| receipt.recorded_at >= when)
+                {
+                    return Err(err("final evaluation already claimed or revoked"));
+                }
+                closure.dispatch = Some(CampaignFinalDispatchClaimV1 {
+                    request_sha256: request_sha256.clone(),
+                    dispatch: CampaignDispatchClaimV1 {
+                        target: target.clone(),
+                        job_uid: None,
+                        sequence: receipt.sequence,
+                    },
+                    claimed_at: receipt.recorded_at,
+                });
+            }
+            CampaignLedgerEventV1::FinalDispatchJobBound { job_uid } => {
+                dispatch::validate_job_uid(job_uid)?;
+                let closure = self
+                    .final_closure
+                    .as_mut()
+                    .ok_or_else(|| err("family is not closed"))?;
+                closure
+                    .grant
+                    .validate_job_deadline_at(receipt.recorded_at)
+                    .map_err(err)?;
+                if closure.settlement.is_some()
+                    || closure
+                        .revoked_at
+                        .is_some_and(|when| receipt.recorded_at >= when)
+                {
+                    return Err(err("final evaluation settled or revoked"));
+                }
+                let claim = closure
+                    .dispatch
+                    .as_mut()
+                    .ok_or_else(|| err("missing final dispatch claim"))?;
+                if claim.dispatch.job_uid.is_some() {
+                    return Err(err("final Job already bound"));
+                }
+                claim.dispatch.job_uid = Some(job_uid.clone());
+                claim.dispatch.sequence = receipt.sequence;
+            }
+            CampaignLedgerEventV1::FinalDispatchSettled { evidence } => {
+                final_dispatch::validate_digest(&evidence.request_sha256)?;
+                final_dispatch::validate_digest(&evidence.result_sha256)?;
+                dispatch::validate_job_uid(&evidence.job_uid)?;
+                dispatch::validate_job_uid(&evidence.pod_uid)?;
+                let closure = self
+                    .final_closure
+                    .as_mut()
+                    .ok_or_else(|| err("family is not closed"))?;
+                let claim = closure
+                    .dispatch
+                    .as_ref()
+                    .ok_or_else(|| err("missing final dispatch claim"))?;
+                let grant = closure.grant.grant();
+                if closure.settlement.is_some()
+                    || claim.request_sha256 != evidence.request_sha256
+                    || claim.dispatch.job_uid.as_deref() != Some(&evidence.job_uid)
+                    || receipt.recorded_at < claim.claimed_at
+                    || evidence
+                        .candidates_evaluated
+                        .is_some_and(|count| count > grant.max_candidates)
+                    || (evidence.outcome != CampaignFinalOutcomeV1::Failed
+                        && (evidence.candidates_evaluated.is_none_or(|count| {
+                            count == 0
+                                && evidence.outcome != CampaignFinalOutcomeV1::NoSelectionCandidate
+                        }) || evidence
+                            .consumed_job_seconds
+                            .is_none_or(|seconds| seconds > grant.max_job_seconds)))
+                {
+                    return Err(err("invalid final terminal identity, budget or outcome"));
+                }
+                closure.settlement = Some(evidence.clone());
+            }
             CampaignLedgerEventV1::FamilyClosedForFinalEvaluation {
                 signed,
                 verifying_key_hex,
@@ -409,6 +503,8 @@ impl State {
                     approval: approval.clone(),
                     approval_hash: approval_content_sha256.clone(),
                     revoked_at: None,
+                    dispatch: None,
+                    settlement: None,
                 });
             }
             CampaignLedgerEventV1::ApprovalRevoked { revocation } => {
