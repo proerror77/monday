@@ -745,8 +745,13 @@ window and containing the exact symbol. It reuses the slicer's manifest eligibil
 rules and hashes each selected data/manifest/`_SUCCESS` triplet. Published reference
 batches covering the symbol are verified with the existing reference verifier;
 the selection includes a potential seed up to the existing 90-second derivative
-gap bound before the first selected raw segment. Scan-entry, input-count and total
-source-byte limits fail closed. Missing markers, bad hashes, unreplayable selected
+gap bound before the first selected raw segment, and tail observations through
+the last raw event plus the label horizon and the same 90-second bound (never
+beyond the current clock). Unrelated archive schemas and valid reference batches
+without the target symbol are excluded. Scan-entry and verified-byte budgets
+still bound discovery; input-count limits count selected artifacts. The freezer
+and dispatcher share pinned-image validation, and paths must satisfy the
+materialization entrypoint constraints. These limits fail closed. Missing markers, bad hashes, unreplayable selected
 segments, unsafe paths and empty raw/reference selections produce no inventory.
 
 The new private output is never overwritten and its SHA-256 is read back before
