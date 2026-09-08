@@ -7591,6 +7591,7 @@ message binance_replay {
             purge_rows: 5,
             embargo_rows: 1,
             sealed_holdout_rows: 30,
+            independent_selection_rows: None,
             fee_bps: 2.0,
             rebate_bps: 0.0,
             funding_bps: 0.0,

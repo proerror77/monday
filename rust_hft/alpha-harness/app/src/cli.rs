@@ -453,6 +453,9 @@ pub struct ValidationArgs {
     pub embargo_rows: usize,
     #[arg(long, default_value_t = 64)]
     pub sealed_holdout_rows: usize,
+    /// Reserve a separate selection window, withheld from search and learning.
+    #[arg(long)]
+    pub independent_selection_rows: Option<usize>,
     #[arg(long, default_value_t = 2.0)]
     pub fee_bps: f64,
     #[arg(long, default_value_t = 0.0)]
@@ -491,6 +494,7 @@ impl ValidationArgs {
             purge_rows: protocol.walk_forward.purge_rows,
             embargo_rows: protocol.walk_forward.embargo_rows,
             sealed_holdout_rows: protocol.walk_forward.sealed_holdout_rows,
+            independent_selection_rows: protocol.selection.as_ref().map(|selection| selection.rows),
             fee_bps: protocol.costs.fee_bps,
             rebate_bps: protocol.costs.rebate_bps,
             funding_bps: protocol.costs.funding_bps,
@@ -514,7 +518,7 @@ impl ValidationArgs {
         {
             return Err(alpha_domain::DomainError::InvalidEvaluationProtocol);
         }
-        EvaluationProtocolV1::new(
+        let protocol = EvaluationProtocolV1::new(
             EvaluationWalkForwardV1 {
                 initial_train_rows: self.initial_train_rows,
                 validation_rows: self.validation_rows,
@@ -535,7 +539,11 @@ impl ValidationArgs {
                 max_book_depth_fraction: self.max_book_depth_fraction,
             },
             labels.clone(),
-        )
+        )?;
+        match self.independent_selection_rows {
+            Some(rows) => protocol.with_independent_selection(rows),
+            None => Ok(protocol),
+        }
     }
 }
 
@@ -1340,6 +1348,7 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             purge_rows: 5,
             embargo_rows: 1,
             sealed_holdout_rows: 64,
+            independent_selection_rows: None,
             fee_bps: 1.0,
             rebate_bps: 0.25,
             funding_bps: 0.0,

@@ -1,6 +1,8 @@
 //! Trust-boundary contracts for bounded Loop Engineer research and runtime deployment.
 
 pub mod campaign_control;
+mod evaluation_partition;
+pub use evaluation_partition::{EvaluationRowPartitionsV1, EvaluationSelectionV1};
 pub mod runtime_latency_evidence;
 
 use chrono::{DateTime, Utc};
@@ -25,6 +27,7 @@ pub const ONNX_WALK_FORWARD_EVALUATOR_VERSION: &str = "onnx-purged-walk-forward-
 pub const ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION: &str = "onnx-sealed-holdout-v4";
 pub const LOB_ONNX_PREPROCESSING_VERSION: &str = "lob-relative-price-log-size-v1";
 pub const EVALUATION_PROTOCOL_VERSION_V1: &str = "evaluation-protocol-v1";
+pub const EVALUATION_PROTOCOL_VERSION_V2: &str = "evaluation-protocol-v2";
 pub const CEX_MCTS_RESEARCH_RECEIPT_VERSION_V1: &str = "cex-mcts-research-receipt-v1";
 pub const CEX_RESEARCH_MISSION_SCHEMA_V1: &str = "cex-research-mission-v1";
 pub const CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD: &str =
@@ -182,6 +185,9 @@ pub struct EvaluationProtocolV1 {
     pub costs: EvaluationCostsV1,
     pub labels: EvaluationLabelSpecV1,
     pub metrics: EvaluationMetricDefinitionsV1,
+    /// V1 audit payloads omit this field; V2 reserves an independent selection window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<EvaluationSelectionV1>,
 }
 
 impl EvaluationProtocolV1 {
@@ -196,6 +202,7 @@ impl EvaluationProtocolV1 {
             costs,
             labels,
             metrics: EvaluationMetricDefinitionsV1::default(),
+            selection: None,
         };
         protocol.validate()?;
         Ok(protocol)
@@ -220,7 +227,23 @@ impl EvaluationProtocolV1 {
             && self.costs.max_book_depth_fraction.is_finite()
             && self.costs.max_book_depth_fraction > 0.0
             && self.costs.max_book_depth_fraction <= 1.0;
-        if self.version != EVALUATION_PROTOCOL_VERSION_V1
+        let version_valid = match (&*self.version, &self.selection) {
+            (EVALUATION_PROTOCOL_VERSION_V1, None) => true,
+            (EVALUATION_PROTOCOL_VERSION_V2, Some(selection)) => {
+                selection.rows > 0
+                    && schedule_end
+                        .and_then(|end| end.checked_add(selection.rows))
+                        .and_then(|end| {
+                            self.walk_forward
+                                .purge_rows
+                                .checked_mul(2)
+                                .and_then(|purge| end.checked_add(purge))
+                        })
+                        .is_some()
+            }
+            _ => false,
+        };
+        if !version_valid
             || self.walk_forward.initial_train_rows == 0
             || self.walk_forward.validation_rows == 0
             || self.walk_forward.fold_count == 0
@@ -6771,6 +6794,33 @@ mod tests {
         let mut unknown_field = serde_json::to_value(changed).unwrap();
         unknown_field["unversioned_override"] = serde_json::json!(true);
         assert!(serde_json::from_value::<EvaluationProtocolV1>(unknown_field).is_err());
+    }
+
+    #[test]
+    fn evaluation_partition_version_preserves_audit_hash_and_binds_selection() {
+        let old = evaluation_protocol();
+        let bytes = serde_json::to_vec(&old).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("selection"));
+        let decoded: EvaluationProtocolV1 = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(old.content_hash().unwrap(), decoded.content_hash().unwrap());
+        let selected = old.clone().with_independent_selection(30).unwrap();
+        assert_ne!(
+            old.content_hash().unwrap(),
+            selected.content_hash().unwrap()
+        );
+        assert_eq!(
+            serde_json::from_slice::<EvaluationProtocolV1>(&serde_json::to_vec(&selected).unwrap())
+                .unwrap(),
+            selected
+        );
+        let mut mismatch = selected.clone();
+        mismatch.version = EVALUATION_PROTOCOL_VERSION_V1.into();
+        assert!(mismatch.validate().is_err());
+        mismatch = selected;
+        mismatch.selection = None;
+        assert!(mismatch.validate().is_err());
+        assert!(old.clone().with_independent_selection(0).is_err());
+        assert!(old.with_independent_selection(usize::MAX).is_err());
     }
 
     #[test]

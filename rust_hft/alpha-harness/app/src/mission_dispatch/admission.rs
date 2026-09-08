@@ -126,15 +126,27 @@ pub(super) fn inspect_binding(
     )?;
     let protocol = approved_evaluation_protocol(&materialization)?;
     let protocol_sha256 = protocol.content_hash()?;
-    // This identifies the existing walk-forward view, not an independent
-    // selection dataset. Changing its materialization or split changes the hash.
-    let view_sha256 = canonical_json_hash(&serde_json::json!({
-        "schema_version": "monday.campaign_search_visible_view.v1",
-        "materialization_sha256": request.materialization_sha256,
-        "feature_sha256": request.feature_sha256,
-        "snapshot_sha256": materialization.snapshot.sha256(),
-        "walk_forward": protocol.walk_forward,
-    }))?;
+    // The same partition function is used by PreparedDataset readers. Bind the
+    // complete protocol, exact data identity and source, not just two view labels.
+    let partitions = protocol.row_partitions(materialization.rows)?;
+    let selection = partitions
+        .selection
+        .as_ref()
+        .context("canonical Campaign requires a withheld independent selection window")?;
+    let view_hash = |purpose: &str, range: &std::ops::Range<usize>| {
+        canonical_json_hash(&serde_json::json!({
+            "schema_version": "monday.campaign_evaluation_view.v2",
+            "purpose": purpose,
+            "materialization_sha256": request.materialization_sha256,
+            "feature_sha256": request.feature_sha256,
+            "snapshot_sha256": materialization.snapshot.sha256(),
+            "evaluation_protocol_sha256": protocol_sha256,
+            "source_revision": request.build_source_revision,
+            "rows": range,
+        }))
+    };
+    let search_view_sha256 = view_hash("search_and_learning", &partitions.search)?;
+    let selection_view_sha256 = view_hash("independent_selection_withheld", selection)?;
     let job = &manifest["items"][1];
     let container = &job["spec"]["template"]["spec"]["containers"][0];
     if !container["args"]
@@ -157,9 +169,9 @@ pub(super) fn inspect_binding(
         campaign_inputs_sha256: request.campaign_inputs_sha256.clone(),
         evaluation_protocol_sha256: protocol_sha256,
         evaluation_views: CampaignEvaluationViewsV1 {
-            search_view_sha256: view_sha256.clone(),
-            selection_view_sha256: view_sha256,
-            selection_feedback: CampaignSelectionFeedbackV1::SearchAndLearningVisibleWalkForward,
+            search_view_sha256,
+            selection_view_sha256,
+            selection_feedback: CampaignSelectionFeedbackV1::IndependentSelectionWithheld,
         },
         source_revision: request.build_source_revision.clone(),
         runner_image: container["image"]

@@ -30,6 +30,10 @@ pub enum EvaluationError {
     TrainingLabelUnavailable,
     #[error("validation label reaches the sealed holdout observation window")]
     ValidationLabelReachesHoldout,
+    #[error("search label reaches the independent selection observation window")]
+    SearchLabelReachesSelection,
+    #[error("selection label reaches the sealed holdout observation window")]
+    SelectionLabelReachesHoldout,
     #[error("dataset costs do not match the bound evaluation protocol")]
     ProtocolMismatch,
 }
@@ -132,11 +136,12 @@ pub struct PreparedDataset {
     feature_names: Vec<String>,
     plan: WalkForwardPlan,
     protocol: EvaluationProtocolV1,
+    partitions: alpha_domain::EvaluationRowPartitionsV1,
 }
 
 impl PreparedDataset {
     pub fn proposal_context(&self) -> ProposalContext<'_> {
-        let research_rows = &self.rows[..self.plan.sealed_holdout.start];
+        let research_rows = &self.rows[self.partitions.search.clone()];
         ProposalContext {
             row_count: research_rows.len(),
             fold_count: self.plan.folds.len(),
@@ -162,7 +167,7 @@ impl PreparedDataset {
 
     pub fn engine_context(&self) -> EngineContext<'_> {
         EngineContext {
-            rows: &self.rows[..self.plan.sealed_holdout.start],
+            rows: &self.rows[self.partitions.search.clone()],
             folds: &self.plan.folds,
             protocol: &self.protocol,
         }
@@ -292,7 +297,24 @@ pub fn prepare_dataset(
     if rows.len() <= config.sealed_holdout_rows {
         return Err(EvaluationError::InsufficientRows);
     }
-    let holdout_start = rows.len() - config.sealed_holdout_rows;
+    let partitions = protocol
+        .row_partitions(rows.len())
+        .map_err(|_| EvaluationError::InsufficientRows)?;
+    let holdout_start = partitions.sealed_holdout.start;
+    if let Some(selection) = &partitions.selection {
+        if rows[partitions.search.clone()]
+            .iter()
+            .any(|row| row.label_available_time >= rows[selection.start].available_time)
+        {
+            return Err(EvaluationError::SearchLabelReachesSelection);
+        }
+        if rows[selection.clone()]
+            .iter()
+            .any(|row| row.label_available_time >= rows[holdout_start].available_time)
+        {
+            return Err(EvaluationError::SelectionLabelReachesHoldout);
+        }
+    }
     let fold_step = config
         .validation_rows
         .checked_add(config.embargo_rows)
@@ -314,7 +336,7 @@ pub fn prepare_dataset(
         let embargo_end = validation_end
             .checked_add(config.embargo_rows)
             .ok_or(EvaluationError::InsufficientRows)?;
-        if embargo_end > holdout_start {
+        if embargo_end > partitions.search.end {
             return Err(EvaluationError::InsufficientRows);
         }
         if rows[..train_end]
@@ -344,6 +366,7 @@ pub fn prepare_dataset(
             sealed_holdout: holdout_start..holdout_start + config.sealed_holdout_rows,
         },
         protocol: protocol.clone(),
+        partitions,
     })
 }
 
@@ -425,6 +448,57 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn independent_selection_is_inaccessible_to_search_and_proposals() {
+        let protocol = protocol().with_independent_selection(7).unwrap();
+        let partitions = protocol.row_partitions(61).unwrap();
+        assert_eq!(partitions.search, 0..40);
+        assert_eq!(partitions.selection, Some(42..49));
+        assert_eq!(partitions.sealed_holdout, 51..61);
+        let original = prepare_dataset(rows(61), &protocol).unwrap();
+        // Preserve clocks, then poison every withheld signal and label.
+        let mut changed_rows = original.rows.clone();
+        for row in &mut changed_rows[40..] {
+            row.signal = 987654.0;
+            row.label = -987654.0;
+        }
+        let changed = prepare_dataset(changed_rows, &protocol).unwrap();
+        assert_eq!(original.engine_context().rows().len(), 40);
+        assert_eq!(
+            original.engine_context().rows(),
+            changed.engine_context().rows()
+        );
+        assert_eq!(original.proposal_context().row_count(), 40);
+        assert_eq!(
+            original.proposal_context().latest_signal(),
+            changed.proposal_context().latest_signal()
+        );
+        assert_eq!(original.engine_context().folds().len(), 3);
+    }
+
+    #[test]
+    fn independent_selection_rejects_overlap_delayed_labels_and_insufficient_rows() {
+        let protocol = protocol().with_independent_selection(7).unwrap();
+        assert!(matches!(
+            prepare_dataset(rows(60), &protocol),
+            Err(EvaluationError::InsufficientRows)
+        ));
+        let mut input = rows(61);
+        input[39].label_available_time = input[42].available_time;
+        assert!(matches!(
+            prepare_dataset(input, &protocol),
+            Err(EvaluationError::SearchLabelReachesSelection)
+        ));
+        let mut input = rows(61);
+        input[48].label_available_time = input[51].available_time;
+        assert!(matches!(
+            prepare_dataset(input, &protocol),
+            Err(EvaluationError::SelectionLabelReachesHoldout)
+        ));
+        let prepared = prepare_dataset(rows(61), &protocol).unwrap();
+        assert_eq!(evaluate_sealed_holdout(&prepared, |rows| rows.len()), 10);
     }
 
     #[test]

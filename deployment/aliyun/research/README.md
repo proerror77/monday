@@ -934,8 +934,8 @@ not roll a live ledger back with an older writer or discard receipts to recover.
 One Campaign maps to multiple rounds. The canonical factor plan and every
 bounded policy follow-up retain all 9 L2/aggregate-trade terminals and 22
 candidate slots. The request derives the total trial limit from the exact plan
-and round count. Both use the six-hour protocol
-`7200 + 3*(3600+5) + 10 + 3600 = 21625`, and the `$1000 / Top5 5%` capacity
+and round count. Both use the independently partitioned protocol
+`7200 + 3*(3600+5) + 10 + 3600 + 2*10 + 3600 = 25245`, and the `$1000 / Top5 5%` capacity
 screen. A v4 Campaign counts its governed factor attempts plus the three
 supervised models (Ridge, CART, Burn MLP);
 it does not run subset MCTS. A negative Campaign produces no holdout claim and

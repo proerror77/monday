@@ -59,10 +59,11 @@ pub struct CampaignRootBudgetV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CampaignSelectionFeedbackV1 {
-    /// Current walk-forward feedback is consumed by both search and learning.
-    /// Independent selection is deliberately not representable until its
-    /// evaluator/reader isolation is implemented and verified.
+    /// Historical V1 evidence: search and learning shared the walk-forward view.
     SearchAndLearningVisibleWalkForward,
+    /// A separate window is reserved and inaccessible to search/proposal readers.
+    /// This does not assert that final selection has been evaluated or authorized.
+    IndependentSelectionWithheld,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,16 +78,32 @@ impl CampaignEvaluationViewsV1 {
     pub fn validate(&self) -> Result<()> {
         digest(&self.search_view_sha256, 64)?;
         digest(&self.selection_view_sha256, 64)?;
-        if self.search_view_sha256 != self.selection_view_sha256 {
-            return Err(CampaignControlError::Invalid(
-                "v1 selection must declare the shared walk-forward view",
-            ));
+        let shared = self.search_view_sha256 == self.selection_view_sha256;
+        match self.selection_feedback {
+            CampaignSelectionFeedbackV1::SearchAndLearningVisibleWalkForward if !shared => {
+                return Err(CampaignControlError::Invalid(
+                    "v1 selection must declare the shared walk-forward view",
+                ))
+            }
+            CampaignSelectionFeedbackV1::IndependentSelectionWithheld if shared => {
+                return Err(CampaignControlError::Invalid(
+                    "independent selection must bind a separate view",
+                ))
+            }
+            _ => {}
         }
         Ok(())
     }
 
     pub fn evidence_label(&self) -> &'static str {
-        "search_visible_validation"
+        match self.selection_feedback {
+            CampaignSelectionFeedbackV1::SearchAndLearningVisibleWalkForward => {
+                "search_visible_validation"
+            }
+            CampaignSelectionFeedbackV1::IndependentSelectionWithheld => {
+                "independent_selection_withheld"
+            }
+        }
     }
 }
 
@@ -656,6 +673,29 @@ mod tests {
         let mut changed = grant.grant().clone();
         changed.budget.max_trials = changed.family.max_trials + 1;
         assert!(changed.validate().is_err());
+    }
+
+    #[test]
+    fn independent_selection_exposure_requires_distinct_signed_views() {
+        let (mut grant, key, now) = fixture();
+        grant.execution.evaluation_views.selection_feedback =
+            CampaignSelectionFeedbackV1::IndependentSelectionWithheld;
+        assert!(grant.validate().is_err());
+        grant.execution.evaluation_views.selection_view_sha256 = "c".repeat(64);
+        let mut signed = sign_campaign_root_grant(grant, "operator".into(), &key).unwrap();
+        let keys = BTreeMap::from([("operator".into(), key.verifying_key())]);
+        assert!(verify_campaign_root_grant(&signed, &keys, now).is_ok());
+        assert_eq!(
+            signed.grant.execution.evaluation_views.evidence_label(),
+            "independent_selection_withheld"
+        );
+        signed
+            .grant
+            .execution
+            .evaluation_views
+            .selection_view_sha256 = "d".repeat(64);
+        signed.content_sha256 = signed.grant.content_hash().unwrap();
+        assert!(verify_campaign_root_grant(&signed, &keys, now).is_err());
     }
 
     #[test]
