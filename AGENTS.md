@@ -61,16 +61,17 @@
 
 ## Default delivery loop
 
-- Infer the required terminal state from the assigned outcome and conversation.
-  For implementation and completion requests, carry the work through the delivery
-  stages needed to achieve that outcome under the standing authorization. A local
-  commit or green test is not a stopping point when merge, publication, a bounded
-  research run, or readback is still needed. Honor explicit analysis-only,
-  local-only, draft-only, or other narrower stopping instructions.
-- Validate the changed behavior and review the actual diff. Before merging, require
-  the current PR head's required checks and repository protection to pass. Before
-  publishing, bind the artifact to the verified source and read back its identity.
-  These are execution checks, not additional requests for user permission.
+- Without a different delivery context, an implementation request defaults to
+  `Code -> focused validation -> review -> PR/CI -> merge`. An assigned publication,
+  research, or production outcome continues through the corresponding publication,
+  run/cutover, and readback stages under the standing authorization. Use the target
+  and budget established by that task; clarify an unresolved target or scope once.
+  Honor explicit analysis-only, local-only, draft-only, or narrower stopping points.
+- Review the actual diff. Before merging, require current-head checks, resolved
+  blocking review conversations, verified base compatibility, and the repository's
+  configured protection and merge method. Before publishing, bind the artifact to
+  the verified source and read back its identity. These are execution checks, not
+  additional requests for user permission.
 - Automatic artifact publication is an expected effect of an authorized merge.
   When operating or changing publishing workflows, use
   [publication policy](docs/agents/publication.md) and reuse the task's authority.
@@ -78,8 +79,10 @@
   contract: `release -> one Gate -> cutover -> Runtime -> independent Readback`.
   A failed Gate blocks its cutover, not independent development or publication.
   Re-run a failed stage only after its cause or relevant input changes, and state
-  the new hypothesis. Keep one controller, exact target/rollback identities,
-  stop rules, and task-owned cleanup for each transition.
+  the new hypothesis. Keep one controller, exact target/rollback identities and
+  stop rules. Re-read the live target and rollback identities immediately before
+  cutover; drift pauses that write until reconciled. Arm automatic failure/exit
+  cleanup before the first mutation, scoped to resources owned by the transition.
 - Keep Governance changes separate from the production transitions they protect.
   Use the canonical Campaign seam for research, preserve the granted resource and
   trial limits, and verify terminal results even when the outcome is negative.
