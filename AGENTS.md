@@ -13,44 +13,43 @@
   campaign-finalize` -> `mission dispatch submit` -> generated `mission
   campaign-execute`. Direct `mission execute`, `mission run`, and `loop run`
   are diagnostic implementation surfaces, never alternate completion paths.
+- The user grants standing authorization to complete assigned Monday tasks,
+  including necessary code changes, validation, PR/CI, merge, artifact and image
+  publication, bounded research runs, deployment/cutover, task-owned cleanup,
+  and independent readback. Reuse this authorization across turns and sessions;
+  do not request confirmation again merely because work reaches another stage.
+  Apply it within the assigned goal, existing budgets, and explicit exclusions.
+  It does not authorize unrelated actions or bypass signed grants, approval
+  revocations, holdout isolation, trading gates, or other technical controls.
 - Research, acquisition, training, evaluation, and runtime production code is
-  Rust-only; do not add Python/PyTorch/libtorch production bindings.
-- Dataset, candidate, evaluation, approval, policy, feedback, and deployment
-  evidence is content-addressed or append-only. Keep private signing keys and
-  LLM credentials out of DuckDB and logs.
-- Preserve point-in-time availability and sealed-holdout isolation. Verify
-  content hashes before consuming datasets.
-- Research must not import execution adapters or broadcast transactions.
-  Live-small stays disabled until every order path enforces envelope order-size
-  and slippage limits.
-- Follow the nearest nested `AGENTS.md`; module files contain only local differences.
-  `CLAUDE.md` files are entrypoints to these shared rules, not another authority.
+  Rust-only. Venues share Monday's market-data, order, and risk seams.
+- Research cannot import execution adapters or broadcast transactions. Live-small
+  requires enforced envelope order-size and slippage limits on every order path.
+- Follow the nearest nested `AGENTS.md` for local technical differences;
+  `CLAUDE.md` points to these shared rules rather than defining another authority.
 - Within system and developer constraints, explicit user instructions take
   precedence over repository and skill guidance. Apply skills only to the
   requested task; their workflows do not grant additional authority.
 
-- Venues share Monday's market-data and execution seams. Existing `ploy-*` names
-  are migration debt; do not create a separate product or another order/risk path.
-
 ## Working rules
 
-- Follow the user's goal and scope. Work autonomously on clear, reversible tasks;
-  preserve unrelated changes and ask before destructive, irreversible, or
-  genuinely ambiguous actions.
-- Complete the authorized outcome using existing conversation context and
-  evidence. Reuse prior authorization; ask only for material scope or behavior
-  ambiguity. Answer progress questions and continue. After interruptions, recover
-  completed work and pending operations before resuming without duplication.
-- Before requesting a necessary approval, complete the authorized preparation
-  so the user can review the concrete action. If a rule blocks progress, cite its
-  file and exact instruction, explain its applicability, and distinguish the
-  requirement from your interpretation. Preserve production authorization gates.
+- Follow the user's goal and scope autonomously under the standing authorization.
+  Preserve unrelated changes. Ask only when a material scope choice is unresolved,
+  an action exceeds that authorization, or a required external authority is absent;
+  continue independent work while awaiting the answer.
+- Use conversation context to resolve routine choices and state material
+  assumptions. Treat follow-up questions as steering the active task; answer and
+  continue unless the user changes the goal. After interruption, resume from
+  completed work and pending operations rather than restarting.
+- If a concrete blocker requires user input, first complete independent
+  preparation and present one reviewable decision. Cite any blocking instruction
+  and explain why existing authorization does not cover it; distinguish the
+  written requirement from your interpretation.
 - Solve the problem directly. Use a skill, issue, specification, branch, or
   worktree only when it reduces uncertainty, coordinates durable work, or
   isolates concurrent writes; never create one merely to satisfy a workflow.
-- For a defect, prove the root cause with an observable check, fix the
-  shared cause, and rerun that check. Do not patch symptoms or repeat an unchanged
-  experiment under a new task or issue.
+- For a defect, reproduce the cause with an observable check, fix the shared
+  cause, and verify the repaired behavior using the focused validation rules.
 - Deliver the complete authorized outcome with correct behavior, coherent
   architecture, and long-term maintainability. Choose the implementation on
   those merits, not line count or diff size. Cross-module fixes, refactors, and
@@ -60,40 +59,40 @@
   shims or fallbacks; preserve applied migrations and audit history as read-only
   records.
 
-## Delivery authority
+## Default delivery loop
 
-- Determine the highest delivery state authorized for this task from the whole
-  conversation, including an explicitly accepted plan and later corrections.
-  Complete that outcome. An intermediate PR or CI result does not end a larger
-  authorized task. Reuse authorization while scope and target stay the same.
-- A local fix defaults to code plus focused validation. A request to publish a
-  PR ends at the PR only when that is the highest authorized state. Merge requires
-  explicit authorization, which may already be part of the accepted plan; do not
-  request it again for each planned PR. Ambiguous "publish" does not silently
-  authorize production deployment. Clarify a missing delivery boundary once,
-  after preparing the concrete action, and continue independent work meanwhile.
-- Before an authorized merge, verify the current PR head, required checks,
-  resolved review conversations, and current base compatibility. Read the actual
-  repository protection settings; CI green alone is not merge permission. Use
-  the configured merge method and preserve branches/worktrees.
-- The configured automatic artifact workflows are standing repository automation:
-  an authorized merge can trigger publication after release admission. This is a
-  known merge effect, not a separate per-run human approval. Artifact publication
-  does not authorize deployment, collector changes, or runtime actuation. Read
-  [publication policy](docs/agents/publication.md) when changing or operating a
-  publishing workflow; manual publication must be within the task's authority.
-- Collector/runtime transitions require explicit production authorization and
-  the applicable contract: release -> one Gate -> cutover -> runtime -> independent
-  readback. A production Gate protects that transition, not development, CI,
-  merge, or artifact publication. Record one controller, exact target/candidate/
-  rollback identities, stop rules, automatic cleanup, and terminal evidence.
-  Repeat a failed attempt only after its cause or relevant input changed.
+- Without a different delivery context, an implementation request defaults to
+  `Code -> focused validation -> review -> PR/CI -> merge`. An assigned publication,
+  research, or production outcome continues through the corresponding publication,
+  run/cutover, and readback stages under the standing authorization. Use the target
+  and budget established by that task; clarify an unresolved target or scope once.
+  Honor explicit analysis-only, local-only, draft-only, or narrower stopping points.
+- Review the actual diff. Before merging, require current-head checks, resolved
+  blocking review conversations, verified base compatibility, and the repository's
+  configured protection and merge method. Before publishing, bind the artifact to
+  the verified source and read back its identity. These are execution checks, not
+  additional requests for user permission.
+- Automatic artifact publication is an expected effect of an authorized merge.
+  When operating or changing publishing workflows, use
+  [publication policy](docs/agents/publication.md) and reuse the task's authority.
+- When the task requires a collector or runtime transition, follow its applicable
+  contract: `release -> one Gate -> cutover -> Runtime -> independent Readback`.
+  A failed Gate blocks its cutover, not independent development or publication.
+  Re-run a failed stage only after its cause or relevant input changes, and state
+  the new hypothesis. Keep one controller, exact target/rollback identities and
+  stop rules. Re-read the live target and rollback identities immediately before
+  cutover; drift pauses that write until reconciled. Arm automatic failure/exit
+  cleanup before the first mutation, scoped to resources owned by the transition.
+- Keep Governance changes separate from the production transitions they protect.
+  Use the canonical Campaign seam for research, preserve the granted resource and
+  trial limits, and verify terminal results even when the outcome is negative.
 
 ## Evidence and safety
 
-- Refresh only the source of truth that can affect the next decision. Recheck
-  branch and live identities before publishing or mutating runtime; local state
-  and old green runs are not current truth.
+- Keep dataset, candidate, evaluation, approval, policy, feedback, and deployment
+  evidence content-addressed or append-only. Verify input hashes and preserve
+  point-in-time availability. Keep private signing keys and LLM credentials out
+  of DuckDB and logs.
 - Keep Code, CI, merge, release, runtime, and readback as separate evidence labels,
   not a mandatory promotion checklist. Back claims with exact identities and
   direct evidence. For uncommitted local Code, identify the base SHA and reviewed
@@ -113,14 +112,14 @@
 ## Scope and ownership
 
 - One active contract has one writer. Use the current checkout for isolated local
-  changes when ownership and dirty state are known; use a dedicated worktree for
-  concurrent, published, or multi-session work. For that worktree, record contract,
-  owner, path, branch, base SHA, allowed files, and dependencies in the private
-  `git rev-parse --git-path agent-worktree.yml` location. The managed preflight
-  checks this record; it is not a prerequisite for ordinary local edits.
-- Re-read branch, `HEAD`, status, and PR head before publishing or merging. Pause
-  only the affected writes on movement or overlap; continue independent work. Do not delete branches or worktrees without explicit
-  authorization and safety checks.
+  changes when ownership and dirty state are known; use a recorded worktree for
+  concurrent, published, or multi-session work. Record contract, owner, path,
+  branch, base SHA, allowed files, and dependencies in the private
+  `git rev-parse --git-path agent-worktree.yml` location used by managed preflight.
+- Before publishing or merging, refresh branch, `HEAD`, status, PR head, and
+  relevant live identities. Reconcile task-owned movement; pause only work that
+  overlaps another writer. Preserve dirty, active, or unique branches/worktrees;
+  retire task-owned ones only after ownership and recovery checks.
 - After a requested merge, synchronize the originating checkout when it can be
   done without overwriting other work. Preserve unrelated changes and report any
   checkout that could not be synchronized; do not silently update other sessions' worktrees.
@@ -132,20 +131,35 @@
 
 ## Focused validation
 
-- Start with the smallest check that can disprove the changed behavior, normally
-  within 15 minutes. Expand to the owning crate/workflow or cross-crate checks
-  when the changed contracts, regression risk, failures, or requested terminal
-  state require them. A crate test is not mandatory solely because a file changed.
-- Use `cargo test -p <crate> --locked <filter>` and scoped Clippy from the owning
-  workspace as appropriate. Reuse build caches; a clean build is only for proven
-  cache corruption or explicitly requested clean-room validation.
-  Run `cargo metadata --locked --no-deps` only after workspace-graph changes.
+- Start with a check that can disprove the changed behavior, normally within
+  15 minutes. Expand to owning-crate/workflow or cross-module checks when the
+  affected contract, regression risk, failure, or requested outcome requires it.
+  A changed file alone does not require a full crate or workspace test run.
+- From the owning workspace, use `cargo test -p <crate> --locked <filter>` and
+  scoped Clippy as appropriate. Reuse build caches; reserve clean builds for
+  proven cache corruption or requested clean-room validation. Run
+  `cargo metadata --locked --no-deps` only after workspace-graph changes.
 - For instruction, workflow, or shell changes, run `git diff --check` plus the
   closest contract test. Report unrelated or unavailable checks separately.
-- For low-impact instruction edits, use existing contract checks and review the
-  rules against concrete task scenarios; do not add tests that merely assert
-  wording. After relevant checks pass, repeat or broaden only for new changes,
-  failures, or an unresolved risk.
+- For low-impact instruction edits, use existing contract checks and review
+  concrete task scenarios. Add tests for behavior or credible regressions, not
+  assertions that mirror implementation or wording.
+
+## Progress and retry limits
+
+- Keep a compact task checkpoint: required outcome, current stage, input/source
+  identity, completed checks, pending operation IDs, and the next unresolved step.
+  Reuse passing evidence while its relevant inputs are unchanged. A repeat check
+  needs a changed input, an observed failure, a specific risk, or a required CI gate.
+- For asynchronous work, prefer the service's wait primitive or returned cursor;
+  otherwise use bounded backoff. Wait for the required terminal state or deadline
+  using the same operation ID. A queued or running job is not a failed attempt.
+- After three identical failures with unchanged inputs, stop that retry path,
+  identify its cause or missing prerequisite, and continue independent work.
+  Resume only when the cause or a relevant input changes. A new task, issue,
+  worktree, or attempt name does not reset an unchanged failure.
+- Once the required outcome and readback pass, finish. Avoid another review,
+  cleanup, planning, or validation cycle without a newly identified requirement.
 
 ## Communication
 
