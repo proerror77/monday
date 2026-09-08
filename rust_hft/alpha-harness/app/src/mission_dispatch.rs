@@ -1,4 +1,5 @@
 mod admission;
+pub(crate) mod controller;
 mod terminal;
 
 use crate::{
@@ -1611,6 +1612,171 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("approved Binance USD-M BTCUSDT"));
+    }
+
+    #[test]
+    fn controller_handoff_binds_existing_volume_authority_and_read_only_cluster_access() {
+        let fixture = AdmissionFixture::new();
+        let root = fixture.inputs._root.path();
+        let work_dir = root.join("cycles/study");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        std::fs::write(work_dir.join("controller-inputs.json"), serde_json::to_vec(&json!({
+            "context":"monday-research-apne1", "namespace":"monday-research",
+            "source_revision":fixture.validated.submission.request.build_source_revision,
+            "image":fixture.validated.submission.image,
+            "campaign_inputs_sha256":fixture.validated.submission.request.campaign_inputs_sha256,
+        })).unwrap()).unwrap();
+        let generation = work_dir.join(format!(
+            "generation-{}",
+            fixture
+                .validated
+                .submission
+                .request
+                .research_plan
+                .generation
+        ));
+        std::fs::create_dir_all(&generation).unwrap();
+        std::fs::write(generation.join("finalize-report.json"), serde_json::to_vec(&json!({
+            "request_sha256":fixture.validated.request_sha256, "job_name":fixture.validated.job_name,
+        })).unwrap()).unwrap();
+        for marker in ["finalized", "dispatched"] {
+            std::fs::write(generation.join(marker), b"").unwrap();
+        }
+        std::fs::write(
+            generation.join("submission.json"),
+            serde_json::to_vec(&fixture.validated.submission).unwrap(),
+        )
+        .unwrap();
+        let args = crate::cli::CampaignControllerHandoffArgs {
+            submission: root.join("submission.json"),
+            control: fixture.control.clone(),
+            volume_root: root.to_path_buf(),
+            work_dir,
+            pvc: "study-ledger".into(),
+            service_account: "approved-oss-operator".into(),
+            trusted_keys_configmap: "operator-trusted-keys".into(),
+            campaign_pod: "worker-pod".into(),
+            context: "monday-research-apne1".into(),
+            namespace: "monday-research".into(),
+            output: root.join("handoff.json"),
+        };
+        std::fs::write(
+            &args.submission,
+            serde_json::to_vec(&fixture.validated.submission).unwrap(),
+        )
+        .unwrap();
+        controller::render(args.clone()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&args.output)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        let value: Value = serde_json::from_slice(&std::fs::read(&args.output).unwrap()).unwrap();
+        let items = value["items"].as_array().unwrap();
+        let secret = items.iter().find(|x| x["kind"] == "Secret").unwrap();
+        let control: Value =
+            serde_json::from_str(secret["stringData"]["control.json"].as_str().unwrap()).unwrap();
+        assert_eq!(control["ledger_path"], "/campaign-root/ledger.duckdb");
+        assert_eq!(
+            control["materialization_path"],
+            "/campaign-root/materialization.json"
+        );
+        assert_eq!(
+            control["trusted_keys_path"],
+            "/trusted-keys/root-public-keys.json"
+        );
+        let job = items.iter().find(|x| x["kind"] == "Job").unwrap();
+        assert!(
+            secret["stringData"].get("root-public-keys.json").is_none(),
+            "trusted keys must not be frozen into per-attempt authority"
+        );
+        let pod = &job["spec"]["template"]["spec"];
+        assert_eq!(pod["serviceAccountName"], args.service_account);
+        assert_eq!(
+            pod["securityContext"]["fsGroupChangePolicy"],
+            "OnRootMismatch"
+        );
+        assert_eq!(
+            pod["containers"][0]["env"][0]["value"],
+            "/authority/control.json"
+        );
+        assert!(pod["initContainers"][0]["command"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x == "prepare-controller"));
+        let role = items.iter().find(|x| x["kind"] == "Role").unwrap();
+        assert!(role["rules"].as_array().unwrap().iter().all(|x| x["verbs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|v| ["get", "watch", "list"].iter().any(|allowed| v == allowed))));
+        assert!(
+            controller::render(args.clone()).is_err(),
+            "private output cannot be overwritten"
+        );
+        assert_eq!(
+            fixture.usage().job_attempts,
+            0,
+            "rendering does not reserve a trial or Job"
+        );
+        let mut wrong_context = args.clone();
+        wrong_context.context = "other-cluster".into();
+        assert!(controller::render_value(&wrong_context, &fixture.validated).is_err());
+        std::fs::remove_file(generation.join("dispatched")).unwrap();
+        assert!(controller::render_value(&args, &fixture.validated)
+            .unwrap_err()
+            .to_string()
+            .contains("finalized and dispatched"));
+        std::fs::write(generation.join("dispatched"), b"").unwrap();
+        let mut escaping = args;
+        escaping.volume_root = escaping.work_dir.clone();
+        assert!(controller::render_value(&escaping, &fixture.validated).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn controller_preparation_only_restricts_the_owned_integrity_key() {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+        let fixture = AdmissionFixture::new();
+        let ledger = fixture.inputs._root.path().join("ledger.duckdb");
+        let key = fixture
+            .inputs
+            ._root
+            .path()
+            .join("ledger.duckdb.integrity-key");
+        let bytes = std::fs::read(&key).unwrap();
+        let uid = std::fs::metadata(&key).unwrap().uid();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o660)).unwrap();
+        assert!(controller::restrict_integrity_key(&ledger, uid + 1).is_err());
+        assert_eq!(
+            std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+            0o660
+        );
+        controller::restrict_integrity_key(&ledger, uid).unwrap();
+        assert_eq!(
+            std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read(&key).unwrap(), bytes);
+        let linked_ledger = fixture.inputs._root.path().join("linked.duckdb");
+        symlink(
+            &key,
+            fixture
+                .inputs
+                ._root
+                .path()
+                .join("linked.duckdb.integrity-key"),
+        )
+        .unwrap();
+        assert!(controller::restrict_integrity_key(&linked_ledger, uid).is_err());
     }
 
     #[test]

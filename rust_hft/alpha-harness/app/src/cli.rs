@@ -135,6 +135,50 @@ enum MissionDispatchCommand {
     Inspect(MissionDispatchInspectArgs),
     Submit(MissionDispatchSubmitArgs),
     Settle(MissionDispatchSubmitArgs),
+    ControllerHandoff(CampaignControllerHandoffArgs),
+    PrepareController(CampaignControllerPrepareArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CampaignControllerHandoffArgs {
+    #[arg(long)]
+    pub submission: PathBuf,
+    #[arg(long)]
+    pub control: PathBuf,
+    /// Existing block-volume root containing the ledger, inputs and cycle checkpoints.
+    #[arg(long)]
+    pub volume_root: PathBuf,
+    #[arg(long)]
+    pub work_dir: PathBuf,
+    #[arg(long)]
+    pub pvc: String,
+    /// Existing operator service identity, including its separately configured OSS authority.
+    #[arg(long)]
+    pub service_account: String,
+    /// Existing runtime-owned public-key ConfigMap; projection stays live across key rotation.
+    #[arg(long)]
+    pub trusted_keys_configmap: String,
+    #[arg(long)]
+    pub campaign_pod: String,
+    #[arg(long)]
+    pub context: String,
+    #[arg(long)]
+    pub namespace: String,
+    /// A new private JSON file; signed access URLs are never printed to stdout.
+    #[arg(long)]
+    pub output: PathBuf,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CampaignControllerPrepareArgs {
+    #[arg(long)]
+    pub control: PathBuf,
+    #[arg(long)]
+    pub context: String,
+    #[arg(long)]
+    pub namespace: String,
+    #[arg(long)]
+    pub kubeconfig_out: PathBuf,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -802,6 +846,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                         .context("Campaign dispatch worker failed")?
                 }
                 MissionDispatchCommand::Inspect(args) => mission_dispatch::inspect(args),
+                MissionDispatchCommand::ControllerHandoff(args) => {
+                    mission_dispatch::controller::render(args)
+                }
+                MissionDispatchCommand::PrepareController(args) => {
+                    mission_dispatch::controller::prepare(args)
+                }
                 MissionDispatchCommand::Settle(args) => {
                     tokio::task::spawn_blocking(move || mission_dispatch::settle(args))
                         .await
@@ -1283,6 +1333,50 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
 
     #[test]
     fn parses_mission_and_data_control_plane_commands() {
+        assert!(Cli::try_parse_from([
+            "alpha-harness",
+            "mission",
+            "dispatch",
+            "controller-handoff",
+            "--submission",
+            "submission.json",
+            "--control",
+            "control.json",
+            "--volume-root",
+            "/campaign-root",
+            "--work-dir",
+            "/campaign-root/cycles/study",
+            "--pvc",
+            "study-ledger",
+            "--service-account",
+            "approved-operator",
+            "--trusted-keys-configmap",
+            "approved-public-keys",
+            "--campaign-pod",
+            "worker-pod",
+            "--context",
+            "monday-research-apne1",
+            "--namespace",
+            "monday-research",
+            "--output",
+            "private-handoff.json",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "alpha-harness",
+            "mission",
+            "dispatch",
+            "prepare-controller",
+            "--control",
+            "/authority/control.json",
+            "--context",
+            "monday-research-apne1",
+            "--namespace",
+            "monday-research",
+            "--kubeconfig-out",
+            "/tmp/monday-campaign-kubeconfig.json",
+        ])
+        .is_ok());
         assert!(Cli::try_parse_from([
             "alpha-harness",
             "mission",
