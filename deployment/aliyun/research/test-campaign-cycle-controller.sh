@@ -641,6 +641,12 @@ recovery_case() (
       return 1
     fi
   fi
+  if [[ "$fault" == FAKE_FAIL_SETTLEMENT_ONCE ]]; then
+    test -e "$request_dir/result-readback-complete"
+    test ! -s "$request_dir/settlement-report.json"
+    jq -e '.checkpoint_status == "incomplete" and .next_stage == "ledger_settlement"' \
+      < <("$controller" status --work-dir "$case_work") >/dev/null
+  fi
   if [[ "$fault" == TAMPER_* ]]; then
     local expected_error
     if [[ "$fault" == TAMPER_COMPLETION ]]; then

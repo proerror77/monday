@@ -524,6 +524,8 @@ fn job_execution_projection(job: &Value) -> Value {
         .collect::<Vec<_>>();
     json!({
         "spec": {
+            "parallelism": job["spec"]["parallelism"].clone(),
+            "completions": job["spec"]["completions"].clone(),
             "backoffLimit": job["spec"]["backoffLimit"].clone(),
             "activeDeadlineSeconds": job["spec"]["activeDeadlineSeconds"].clone(),
             "ttlSecondsAfterFinished": job["spec"]["ttlSecondsAfterFinished"].clone(),
@@ -745,6 +747,8 @@ fn render_manifest(validated: &ValidatedSubmission, namespace: &str) -> anyhow::
                 },
                 "spec": {
                     "suspend": true,
+                    "parallelism": 1,
+                    "completions": 1,
                     "backoffLimit": 0,
                     "activeDeadlineSeconds": ACTIVE_DEADLINE_SECONDS,
                     "ttlSecondsAfterFinished": 86400,
@@ -913,6 +917,8 @@ mod tests {
         let job = &rendered["items"][1];
 
         assert_eq!(job["spec"]["suspend"], true);
+        assert_eq!(job["spec"]["parallelism"], 1);
+        assert_eq!(job["spec"]["completions"], 1);
         assert_eq!(job["spec"]["backoffLimit"], 0);
         assert_eq!(job["spec"]["activeDeadlineSeconds"], 21_608);
         assert_eq!(
@@ -1076,6 +1082,8 @@ mod tests {
             },
             "spec": {
                 "suspend": true,
+                "parallelism": 1,
+                "completions": 1,
                 "backoffLimit": 0,
                 "activeDeadlineSeconds": ACTIVE_DEADLINE_SECONDS,
                 "ttlSecondsAfterFinished": 86400,
@@ -1144,6 +1152,25 @@ mod tests {
             true
         )
         .is_err());
+        for field in ["parallelism", "completions"] {
+            let mut multiplied_job = expected_job["items"][1].clone();
+            multiplied_job["metadata"]["annotations"]["research.monday/request-sha256"] =
+                json!("request-sha");
+            multiplied_job["spec"][field] = json!(2);
+            assert!(
+                validate_job_readback(
+                    &multiplied_job,
+                    &expected_job["items"][1],
+                    expected_job["items"][1]["metadata"]["name"]
+                        .as_str()
+                        .unwrap(),
+                    "request-sha",
+                    true
+                )
+                .is_err(),
+                "accepted multiplied Job {field}"
+            );
+        }
     }
 
     #[test]

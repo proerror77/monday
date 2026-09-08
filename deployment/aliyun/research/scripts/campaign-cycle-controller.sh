@@ -216,7 +216,10 @@ cycle_status() {
     if [[ -s "$generation_dir/campaign-result.json" ]]; then
       termination_reason="$(jq -r '.termination_reason // empty' "$generation_dir/campaign-result.json")"
     fi
-    if [[ "$termination_reason" == "campaign_no_candidate" ]]; then
+    if [[ ! -s "$generation_dir/settlement-report.json" ]] \
+      || ! jq -e '.status == "settled"' "$generation_dir/settlement-report.json" >/dev/null 2>&1; then
+      next_stage="ledger_settlement"
+    elif [[ "$termination_reason" == "campaign_no_candidate" ]]; then
       next_stage="campaign_learning"
     else
       next_stage="finalize_cycle"
@@ -389,7 +392,11 @@ cleanup_sensitive_files() {
 }
 trap cleanup_sensitive_files EXIT
 trap 'exit 130' HUP INT TERM
-trap 'status=$?; trap - ERR; die "command failed at line $LINENO with exit $status"' ERR
+on_controller_error() {
+  trap - ERR
+  die "command failed at line $2 with exit $1"
+}
+trap 'on_controller_error "$?" "$LINENO"' ERR
 
 commit_generation_completion() {
   local outcome="$1" cycle_result="${2:-null}" learning_sha=""
