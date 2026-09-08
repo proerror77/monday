@@ -221,6 +221,7 @@ pub struct SystemBuilder {
     config: SystemConfig,
     event_consumers: Vec<EventConsumer>,
     execution_clients: Vec<Box<dyn ExecutionClient>>,
+    simulated_market_bindings: Vec<simulated_execution::MarketBinding>,
     strategies: Vec<Box<dyn Strategy>>,
     risk_managers: Vec<Box<dyn RiskManager>>,
     // 僅登記市場流規劃，實際橋接在 Runtime::start() 內進行
@@ -241,6 +242,7 @@ impl SystemBuilder {
             config,
             event_consumers: Vec::new(),
             execution_clients: Vec::new(),
+            simulated_market_bindings: Vec::new(),
             strategies: Vec::new(),
             risk_managers: Vec::new(),
             market_stream_plans: Vec::new(),
@@ -319,6 +321,7 @@ impl SystemBuilder {
     /// Register the in-process paper execution adapter used by bounded Paper/Shadow runs.
     pub fn register_simulated_execution_client(mut self, venue: VenueId) -> Self {
         let client = simulated_execution::SimulatedExecutionClient::new(venue);
+        self.simulated_market_bindings.push(client.market_binding());
         self = self.register_execution_client_with_venue(client, venue);
         self
     }
@@ -650,6 +653,12 @@ impl SystemBuilder {
             engine.register_event_consumer(consumer);
         }
 
+        for binding in self.simulated_market_bindings {
+            assert!(
+                binding.set(engine.market_reader()).is_ok(),
+                "paper market reader is bound once"
+            );
+        }
         for client in self.execution_clients {
             engine.register_execution_client_boxed(client);
         }
@@ -2012,6 +2021,68 @@ mod tests {
             runtime.engine.try_lock().unwrap().trading_mode(),
             engine::TradingMode::Paused
         );
+    }
+
+    #[tokio::test]
+    async fn simulated_execution_reads_the_builders_canonical_book() {
+        let runtime = SystemBuilder::new(SystemConfig::default())
+            .register_simulated_execution_client(VenueId::MOCK)
+            .build();
+        let mut clients = {
+            let mut engine = runtime.engine.lock().await;
+            let now = hft_core::now_micros();
+            engine
+                .create_event_ingester_pair()
+                .lock()
+                .unwrap()
+                .ingest(MarketEvent::Snapshot(MarketSnapshot {
+                    symbol: Symbol::new("BTCUSDT"),
+                    timestamp: now,
+                    bids: vec![BookLevel::new_unchecked(99.0, 10.0)],
+                    asks: vec![BookLevel::new_unchecked(101.0, 10.0)],
+                    sequence: 1,
+                    source_venue: Some(VenueId::MOCK),
+                    timestamps: MarketDataTimestamps::local_only(LocalReceiveTimestamp::new(now)),
+                }))
+                .unwrap();
+            engine.tick().unwrap();
+            engine.take_execution_clients()
+        };
+        clients[0].connect().await.unwrap();
+        let mut stream = clients[0].execution_stream().await.unwrap();
+        let order_id = clients[0]
+            .place_order(ports::OrderIntent::crypto_spot(
+                Symbol::new("BTCUSDT"),
+                Side::Buy,
+                Quantity(Decimal::ONE),
+                OrderType::Market,
+                None,
+                TimeInForce::IOC,
+                "paper-book-test".into(),
+                Some(VenueId::MOCK),
+            ))
+            .await
+            .unwrap();
+        let fill = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            use futures::StreamExt;
+            while let Some(event) = stream.next().await {
+                if let ExecutionEvent::Fill {
+                    order_id: filled,
+                    price,
+                    quantity,
+                    ..
+                } = event.unwrap()
+                {
+                    assert_eq!(filled, order_id);
+                    return (price, quantity);
+                }
+            }
+            panic!("paper event stream ended before a fill");
+        })
+        .await
+        .unwrap();
+        assert_eq!(fill, (Price(Decimal::from(101)), Quantity(Decimal::ONE)));
+        clients[0].disconnect().await.unwrap();
     }
 
     #[test]
