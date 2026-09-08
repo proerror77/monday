@@ -178,6 +178,15 @@ fn match_orders(
     instant: Instant,
     now: u64,
 ) -> HftResult<()> {
+    // Observe every tracked symbol even during the arrival delay or between
+    // orders, so disappearance/reappearance is not mistaken for unchanged depth.
+    for (symbol, budget) in &mut state.books {
+        if let Some(book) = view.get_orderbook(&VenueSymbol::new(venue, symbol.clone())) {
+            budget.observe(book, now);
+        } else {
+            budget.clear_levels();
+        }
+    }
     let mut order_ids: Vec<_> = state
         .orders
         .iter()
@@ -478,6 +487,7 @@ mod tests {
         let symbol = Symbol::new("BTCUSDT");
         let mut book = engine::aggregation::TopNSnapshot::new(symbol.clone(), 5);
         book.sequence = sequence;
+        book.generation = 1;
         book.local_receive = Some(hft_core::LocalReceiveTimestamp::new(received_at));
         book.bid_prices.push(Price(Decimal::from(99)).into());
         book.bid_quantities.push(Quantity(Decimal::from(10)).into());
@@ -743,6 +753,109 @@ mod tests {
             client.list_open_orders().await.unwrap()[0].order_id,
             waiting
         );
+    }
+
+    #[tokio::test]
+    async fn simulated_review_new_generation_can_restart_its_sequence() {
+        let mut client = SimulatedExecutionClient::new(VenueId::MOCK);
+        client.fill_delay_ms = 5_000;
+        bind_book(&client);
+        let mut intent = test_intent();
+        intent.order_type = OrderType::Limit;
+        intent.time_in_force = TimeInForce::GTC;
+        intent.price = Some(Price(Decimal::from(101)));
+        intent.quantity = Quantity(Decimal::from(2));
+        client.place_order(intent.clone()).await.unwrap();
+        events(&client).await;
+        tick(&client, &book_view(2, 100, hft_core::now_micros()))
+            .await
+            .unwrap();
+        events(&client).await;
+        client.place_order(intent).await.unwrap();
+        events(&client).await;
+        let mut reconnected = book_view(2, 1, hft_core::now_micros());
+        Arc::make_mut(reconnected.orderbooks.values_mut().next().unwrap()).generation = 2;
+        tick(&client, &reconnected).await.unwrap();
+        let filled: Decimal = events(&client)
+            .await
+            .into_iter()
+            .filter_map(|event| match event {
+                ExecutionEvent::Fill { quantity, .. } => Some(quantity.0),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(filled, Decimal::from(2));
+    }
+
+    #[tokio::test]
+    async fn simulated_review_depth_decrease_reduces_unspent_liquidity() {
+        let mut client = SimulatedExecutionClient::new(VenueId::MOCK);
+        client.fill_delay_ms = 5_000;
+        bind_book(&client);
+        let mut intent = test_intent();
+        intent.order_type = OrderType::Limit;
+        intent.time_in_force = TimeInForce::GTC;
+        intent.price = Some(Price(Decimal::from(101)));
+        intent.quantity = Quantity(Decimal::from(4));
+        client.place_order(intent.clone()).await.unwrap();
+        events(&client).await;
+        tick(&client, &book_view(10, 1, hft_core::now_micros()))
+            .await
+            .unwrap();
+        events(&client).await;
+        intent.quantity = Quantity(Decimal::from(6));
+        client.place_order(intent).await.unwrap();
+        events(&client).await;
+        tick(&client, &book_view(8, 2, hft_core::now_micros()))
+            .await
+            .unwrap();
+        let filled: Decimal = events(&client)
+            .await
+            .into_iter()
+            .filter_map(|event| match event {
+                ExecutionEvent::Fill { quantity, .. } => Some(quantity.0),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(filled, Decimal::from(4));
+    }
+
+    #[tokio::test]
+    async fn simulated_review_tracks_level_removal_while_no_order_is_eligible() {
+        let mut client = SimulatedExecutionClient::new(VenueId::MOCK);
+        client.fill_delay_ms = 5_000;
+        bind_book(&client);
+        let mut intent = test_intent();
+        intent.order_type = OrderType::Limit;
+        intent.time_in_force = TimeInForce::GTC;
+        intent.price = Some(Price(Decimal::from(101)));
+        intent.quantity = Quantity(Decimal::from(2));
+        client.place_order(intent.clone()).await.unwrap();
+        events(&client).await;
+        tick(&client, &book_view(2, 1, hft_core::now_micros()))
+            .await
+            .unwrap();
+        events(&client).await;
+        assert!(client.list_open_orders().await.unwrap().is_empty());
+        let mut removed = book_view(2, 2, hft_core::now_micros());
+        let book = Arc::make_mut(removed.orderbooks.values_mut().next().unwrap());
+        book.ask_prices.remove(0);
+        book.ask_quantities.remove(0);
+        tick(&client, &removed).await.unwrap();
+        client.place_order(intent).await.unwrap();
+        events(&client).await;
+        tick(&client, &book_view(2, 3, hft_core::now_micros()))
+            .await
+            .unwrap();
+        let filled: Decimal = events(&client)
+            .await
+            .into_iter()
+            .filter_map(|event| match event {
+                ExecutionEvent::Fill { quantity, .. } => Some(quantity.0),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(filled, Decimal::from(2));
     }
 
     #[tokio::test]
