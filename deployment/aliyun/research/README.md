@@ -836,7 +836,7 @@ One Campaign maps to multiple rounds. The canonical factor plan and every
 bounded policy follow-up retain all 9 L2/aggregate-trade terminals and 22
 candidate slots. The request derives the total trial limit from the exact plan
 and round count. Both use the six-hour protocol
-`7200 + 3*(3600+1) + 5 + 3600 = 21608`, and the `$1000 / Top5 5%` capacity
+`7200 + 3*(3600+5) + 10 + 3600 = 21625`, and the `$1000 / Top5 5%` capacity
 screen. A v4 Campaign counts its governed factor attempts plus the three
 supervised models (Ridge, CART, Burn MLP);
 it does not run subset MCTS. A negative Campaign produces no holdout claim and
@@ -895,7 +895,7 @@ claim object as the durable once-only guard.
 Treat Kubernetes completion as transport evidence only. Read `bundle_sha256`
 from the Job's final JSON log, download the immutable result object, verify that
 SHA-256 and `unzip -t`. For a continuous Mission, confirm every walk-forward
-record reports `purged-walk-forward-v4`; a complete result may legitimately
+record reports `purged-walk-forward-v5`; a complete result may legitimately
 contain zero sealed evaluations when no candidate passes. For a prediction
 Mission, confirm `artifacts/execution-evidence.json` reports lane
 `prediction_market`, the submitted mission and snapshot SHA-256 values, and the
