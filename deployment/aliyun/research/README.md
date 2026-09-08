@@ -710,6 +710,14 @@ exchange account file, API key, or order/execution entrypoint. Each round
 records `results/mission-admission.json`, which binds the current request SHA
 and the round's Mission SHA alongside the campaign and round IDs.
 
+Release uses one conditional JSON Patch bound to the verified Job UID and
+resourceVersion. A replacement or intervening update fails before unsuspending;
+the submitter retains objects after a release attempt, including an uncertain
+response. Reconcile their identity and retry the same submission through the
+canonical submitter. Do not bypass a conflict with a manual unsuspend or a new
+attempt ID. These object conditions do not replace root authorization, budget
+admission, or controller writer fencing.
+
 One Campaign maps to multiple rounds. The canonical factor plan and every
 bounded policy follow-up retain all 9 L2/aggregate-trade terminals and 22
 candidate slots. The request derives the total trial limit from the exact plan
