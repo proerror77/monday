@@ -1781,10 +1781,12 @@ mod tests {
         open_orders: Vec<OpenOrder>,
     }
 
+    #[cfg(feature = "infra-ipc")]
     struct CountingExecutionClient {
         placements: Arc<AtomicUsize>,
     }
 
+    #[cfg(feature = "infra-ipc")]
     #[async_trait]
     impl ExecutionClient for CountingExecutionClient {
         async fn place_order(
@@ -1833,10 +1835,12 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "infra-ipc")]
     struct OrderOnMarketEvent {
         emitted: bool,
     }
 
+    #[cfg(feature = "infra-ipc")]
     impl Strategy for OrderOnMarketEvent {
         fn on_market_event(
             &mut self,
