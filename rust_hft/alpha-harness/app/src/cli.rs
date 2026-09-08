@@ -111,6 +111,7 @@ enum DataCommand {
     Sources,
     Acquire(AcquireDataArgs),
     ImportFeatures(ImportFeatureDataArgs),
+    FreezeInventory(FreezeInventoryArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -701,6 +702,45 @@ pub struct FeedbackLogArgs {
     pub trusted_keys: PathBuf,
 }
 
+#[derive(Debug, Clone, Args)]
+pub struct FreezeInventoryArgs {
+    /// Read-only root of sealed raw collector triplets.
+    #[arg(long)]
+    pub raw_root: PathBuf,
+    /// Read-only root of published USD-M reference triplets.
+    #[arg(long)]
+    pub reference_root: PathBuf,
+    #[arg(long)]
+    pub start_received_at_ns: u64,
+    #[arg(long)]
+    pub end_received_at_ns: u64,
+    #[arg(long)]
+    pub symbol: String,
+    /// Paired research runner digest; source revision comes from this binary.
+    #[arg(long)]
+    pub image_ref: String,
+    #[arg(long)]
+    pub mission_id: String,
+    #[arg(long)]
+    pub output_prefix: String,
+    #[arg(long)]
+    pub bucket_ms: u64,
+    #[arg(long)]
+    pub label_horizon_buckets: u64,
+    #[arg(long)]
+    pub top_depth: usize,
+    #[arg(long, default_value_t = 100_000)]
+    pub max_scan_entries: usize,
+    #[arg(long, default_value_t = 8192)]
+    pub max_inputs: usize,
+    /// Explicit maximum total source bytes to verify; no source payload is copied.
+    #[arg(long)]
+    pub max_input_bytes: u64,
+    /// New private frozen.env file; an existing inventory is never overwritten.
+    #[arg(long)]
+    pub output: PathBuf,
+}
+
 #[derive(Debug, Args)]
 struct AcquireDataArgs {
     #[arg(long)]
@@ -872,6 +912,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         },
         Command::Data { command } => match command {
             DataCommand::Sources => print_json(&source_catalog()),
+            DataCommand::FreezeInventory(args) => {
+                tokio::task::spawn_blocking(move || data_mission::freeze_research_inventory(args))
+                    .await
+                    .context("inventory freezer worker failed")?
+            }
             DataCommand::Acquire(args) => {
                 let mut store = AlphaStore::open(&args.db)?;
                 let data_mission = DataAcquisitionMission {
@@ -1333,6 +1378,15 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
 
     #[test]
     fn parses_mission_and_data_control_plane_commands() {
+        assert!(Cli::try_parse_from([
+            "alpha-harness", "data", "freeze-inventory",
+            "--raw-root", "/archive/raw", "--reference-root", "/archive/reference",
+            "--start-received-at-ns", "1700000000000000000", "--end-received-at-ns", "1700000060000000000",
+            "--symbol", "BTCUSDT", "--image-ref", "registry/runner@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--mission-id", "data-test", "--output-prefix", "runs/test", "--bucket-ms", "1000",
+            "--label-horizon-buckets", "5", "--top-depth", "5", "--max-input-bytes", "1000000",
+            "--output", "frozen.env",
+        ]).is_ok());
         assert!(Cli::try_parse_from([
             "alpha-harness",
             "mission",

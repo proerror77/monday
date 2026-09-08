@@ -717,6 +717,48 @@ configuration from the paired image-release receipt; inspection checks its pin
 and the dispatcher's compiled source revision, not a live controller Pod imageID.
 That Pod/image/volume identity still needs deployment readback before cloud use.
 
+#### Discover and freeze existing collector inputs
+
+`alpha-harness data freeze-inventory` prepares the existing materialization
+entrypoint's `frozen.env` from read-only collector archive roots. Supply an
+explicit settled receive-time window, symbol, paired runner image digest,
+materialization policy, output prefix and source-byte budget:
+
+```bash
+alpha-harness data freeze-inventory \
+  --raw-root /archive/raw --reference-root /archive/usdm-reference \
+  --start-received-at-ns 1788739200000000000 \
+  --end-received-at-ns 1788825600000000000 \
+  --symbol BTCUSDT --image-ref "$APPROVED_RESEARCH_IMAGE" \
+  --mission-id data-btcusdt-study --output-prefix study/materialization \
+  --bucket-ms 1000 --label-horizon-buckets 5 --top-depth 5 \
+  --max-input-bytes 20000000000 --output /private/frozen.env
+```
+
+The source revision is compiled into the native binary. The provided image digest
+must come from the matching release receipt; discovery does not certify that
+image or start a Job. Archive roots may be read-only mirrors or mounted archive
+views. The command neither downloads source payloads nor changes the collectors.
+
+The freezer selects whole, sealed USD-M segments contained in the requested
+window and containing the exact symbol. It reuses the slicer's manifest eligibility
+rules and hashes each selected data/manifest/`_SUCCESS` triplet. Published reference
+batches covering the symbol are verified with the existing reference verifier;
+the selection includes a potential seed up to the existing 90-second derivative
+gap bound before the first selected raw segment. Scan-entry, input-count and total
+source-byte limits fail closed. Missing markers, bad hashes, unreplayable selected
+segments, unsafe paths and empty raw/reference selections produce no inventory.
+
+The new private output is never overwritten and its SHA-256 is read back before
+success. Identical inputs and policies yield identical bytes; the run ID also
+binds policy and output-prefix changes. Pass this file to the existing
+`cex-materialization-entrypoint.sh --inventory ...` flow. Its slice, PIT,
+continuity, funding/fee and final manifest checks remain required. A frozen
+inventory is input selection and byte-integrity evidence, **not** an assertion
+that the requested time window is complete or already admitted to research.
+Automatic scheduling and Campaign execution still use their existing signed
+root budgets and controller contracts.
+
 #### Native controller handoff
 
 Use the source-matched native renderer to package an existing finalized generation
