@@ -113,3 +113,39 @@ checksum or continuity guarantee. This adapter fails closed for every locally ob
 parse, queue, and ordering fault. Proving that the exchange did not silently omit a delta requires a
 second independent feed (or eligible MMWS/Gateway SBE access) and cross-feed book verification; a
 single retail WebSocket cannot make that stronger claim.
+
+### Paper/Shadow displayed-book execution
+
+The in-process `SimulatedExecutionClient` receives the same canonical `MarketView`
+reader from `SystemBuilder` as the execution worker. An unbound reader, missing
+local-receive clock, crossed/empty book, future timestamp, or quote older than one
+second prevents order acceptance. No market order uses a caller-provided price as
+its fill price.
+
+The model applies a 50 ms minimum arrival delay and samples the current book every
+5 ms. It executes marketable quantity in price order, constrained by limit price
+and displayed quantities. GTC remainders rest; IOC remainders cancel; FOK cancels
+without consuming liquidity if the full remaining quantity is unavailable. Paper
+orders are processed in local submission order; amendments reset their arrival
+delay and priority. This local ordering does not estimate an exchange queue.
+
+All orders in one simulated client share a remaining-depth budget. Republishing
+an unchanged level, including under a new book sequence, does not replenish it.
+The matcher refreshes every tracked symbol on each tick, including between orders
+and during arrival delays. Positive and negative displayed-quantity deltas adjust
+the unspent budget, clamped between zero and the current displayed quantity. A
+level that disappears and is later observed again starts a new displayed level.
+Canonical book generations survive ordinary full snapshots and updates; a new
+generation after invalidation resets the budget even if its sequence restarts.
+Sequence or receive-clock regression within one generation cannot refresh it. This is a conservative model of displayed taker liquidity, not measured
+market impact or proof of real strategy capacity. Passive fills, hidden liquidity,
+exchange queue position and stochastic network latency remain unmodeled. These
+assumptions do not change replay capability receipts or enable live execution.
+
+Partial fills update cumulative quantity and weighted fill price. An amendment's
+quantity means the new total, so already filled quantity is subtracted once.
+Cancel and matching operations share one state lock. Event capacity is reserved
+for the entire state transition before orders or depth are changed. On insufficient
+capacity the matcher stops with unhealthy delivery; it does not commit an
+unreported fill. Disconnect joins the stopped matcher, and dropping the client
+aborts its owned task.

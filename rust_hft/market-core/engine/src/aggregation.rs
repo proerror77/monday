@@ -20,6 +20,9 @@ pub struct TopNSnapshot {
     /// Actual local receipt of the book/BBO used for this snapshot, not publication time.
     pub local_receive: Option<LocalReceiveTimestamp>,
     pub sequence: u64,
+    /// Canonical reconstruction identity, stable across ordinary updates and
+    /// snapshots. Zero is reserved for standalone, unbound snapshots.
+    pub generation: u64,
 
     // SoA 定点存储: 提升 SIMD/缓存性能，避免 Decimal 开销
     pub bid_prices: SmallVec<[FixedPrice; INLINE_BOOK_LEVELS]>,
@@ -36,6 +39,7 @@ impl TopNSnapshot {
             timestamp: 0,
             local_receive: None,
             sequence: 0,
+            generation: 0,
             bid_prices: SmallVec::with_capacity(top_n),
             bid_quantities: SmallVec::with_capacity(top_n),
             ask_prices: SmallVec::with_capacity(top_n),
@@ -190,17 +194,19 @@ struct CanonicalDepthBook {
     timestamp: Timestamp,
     local_receive: Option<LocalReceiveTimestamp>,
     sequence: u64,
+    generation: u64,
     bids: BTreeMap<FixedPrice, FixedQuantity>,
     asks: BTreeMap<FixedPrice, FixedQuantity>,
 }
 
 impl CanonicalDepthBook {
-    fn from_snapshot(snapshot: &MarketSnapshot) -> Self {
+    fn from_snapshot(snapshot: &MarketSnapshot, generation: u64) -> Self {
         let mut book = Self {
             symbol: snapshot.symbol.clone(),
             timestamp: snapshot.timestamp,
             local_receive: snapshot.timestamps.local_receive,
             sequence: snapshot.sequence,
+            generation,
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
         };
@@ -241,6 +247,7 @@ impl CanonicalDepthBook {
         snapshot.timestamp = self.timestamp;
         snapshot.local_receive = self.local_receive;
         snapshot.sequence = self.sequence;
+        snapshot.generation = self.generation;
         for (&price, &quantity) in self.bids.iter().rev().take(levels) {
             snapshot.bid_prices.push(price);
             snapshot.bid_quantities.push(quantity);
@@ -542,6 +549,7 @@ pub struct AggregationEngine {
     pub top_n: usize,
     /// Full sequence-validated books used to reconstruct published Top-N after level deletion.
     canonical_books: FxHashMap<VenueSymbol, CanonicalDepthBook>,
+    last_book_generation: u64,
     /// Faster BBO feed overlaid on the latest depth image. It never mutates canonical L2.
     quote_overlays: FxHashMap<VenueSymbol, TopOfBook>,
     /// 不可变共享订单簿（per-venue）：只在有变更时替换 Arc
@@ -566,6 +574,7 @@ impl AggregationEngine {
         Self {
             top_n: 10, // 預設 Top-10
             canonical_books: FxHashMap::with_capacity_and_hasher(64, Default::default()),
+            last_book_generation: 0,
             quote_overlays: FxHashMap::with_capacity_and_hasher(64, Default::default()),
             orderbooks: FxHashMap::with_capacity_and_hasher(64, Default::default()),
             bar_builders: FxHashMap::with_capacity_and_hasher(128, Default::default()),
@@ -580,6 +589,7 @@ impl AggregationEngine {
         Self {
             top_n,
             canonical_books: FxHashMap::with_capacity_and_hasher(64, Default::default()),
+            last_book_generation: 0,
             quote_overlays: FxHashMap::with_capacity_and_hasher(64, Default::default()),
             orderbooks: FxHashMap::with_capacity_and_hasher(64, Default::default()),
             bar_builders: FxHashMap::with_capacity_and_hasher(128, Default::default()),
@@ -607,7 +617,20 @@ impl AggregationEngine {
                 // 替换为新的 Arc（需要 source_venue 才能寫入 per-venue 訂單簿）
                 if let Some(venue) = source_venue {
                     let key = VenueSymbol::new(venue, symbol.clone());
-                    let canonical = CanonicalDepthBook::from_snapshot(&snapshot);
+                    let generation = if let Some(book) = self.canonical_books.get(&key) {
+                        book.generation
+                    } else if let Some(next) = self.last_book_generation.checked_add(1) {
+                        self.last_book_generation = next;
+                        next
+                    } else {
+                        output_events.push(MarketEvent::Disconnect {
+                            reason: "canonical book generation exhausted".into(),
+                            source_venue: Some(venue),
+                            symbol: Some(symbol),
+                        });
+                        return;
+                    };
+                    let canonical = CanonicalDepthBook::from_snapshot(&snapshot, generation);
                     let quote = self.quote_overlays.get(&key).cloned();
                     let top_n = quote.as_ref().map_or_else(
                         || canonical.top_n(self.top_n),
