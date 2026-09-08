@@ -562,9 +562,9 @@ supplied again so a restarted controller cannot cross that trust boundary
 implicitly.
 
 The printed ACK Job runs `ack-readback` from
-`/campaign-root/cycles/REPLACE_CYCLE_ID`. Its campaign-root PVC must be bound to
-the Tokyo internal OSS campaign prefix, following the retained OSS CSI pattern
-in `k8s/cex-materialization-output-volume.example.yaml`; it must not point to a
+`/campaign-root/cycles/REPLACE_CYCLE_ID`. Its campaign-root PVC must use block storage for the active DuckDB ledger and
+cycle checkpoints. OSS holds immutable published evidence; the OSS CSI example
+is not suitable for the active ledger. The mounted state must not point to a
 laptop path. Do not reuse `k8s/alpha-mission-job.example.yaml`: that Job remains
 the tokenless `campaign-execute` shape, while the controller Job has a distinct
 image and narrow readback ServiceAccount. On ACK, the controller waits for the
@@ -572,11 +572,12 @@ already-approved Campaign Job, reads the exact Job and Pod provenance, and perfo
 `oss-ap-northeast-1-internal.aliyuncs.com`. It verifies the Campaign result,
 each Mission, and each `results.zip` SHA-256 before running `campaign-learn`.
 The operator replaces `REPLACE_CAMPAIGN_POD_NAME` after that Pod exists; RBAC
-then permits `get` only for that exact Pod, not namespace-wide Pod listing.
+permits `get` for that exact Pod and `list` for the native unique-owner check.
 The controller writes the create-once learn report and, only for `follow_up`,
 the next research plan beneath the Campaign root in OSS, then reads each back
 through `oss-ap-northeast-1-internal.aliyuncs.com` and checks SHA-256. The
-downloaded evidence and learn artifacts remain on the campaign-root OSS volume.
+downloaded evidence, the active ledger and learn artifacts remain on the
+campaign-root block volume; immutable copies are published to OSS.
 The Pod's research-only RAM identity must be limited to GET on that Campaign
 prefix and create-only PUT on its `learning/` prefix; do not mount exchange or
 trading credentials. These artifacts are never copied to Mac `/tmp`.
@@ -587,7 +588,7 @@ any `round-*-results.zip`. `start`, `status`, and `approve` therefore remain
 local control-plane operations only. The ACK Job uses the namespace-scoped
 ServiceAccount and Role in
 `k8s/campaign-cycle-controller-rbac.example.yaml`: exact Job read/watch, exact
-Job-owned Pod read, and deletion of one exact `*-inputs` Secret.
+Job-owned Pod read, and Pod list for the native unique-owner check.
 It has no create/patch authority, cluster-wide authority, exchange credential,
 order, risk-limit, or runtime-resume access. After a negative generation, the
 ACK Job stops at `approval_handoff`; a workstation may inspect `status` and
@@ -716,7 +717,63 @@ configuration from the paired image-release receipt; inspection checks its pin
 and the dispatcher's compiled source revision, not a live controller Pod imageID.
 That Pod/image/volume identity still needs deployment readback before cloud use.
 
-The root issuer signs a `SignedCampaignRootGrantV1` using the existing
+#### Native controller handoff
+
+Use the source-matched native renderer to package an existing finalized generation
+for ACK readback. It writes a new private JSON manifest containing the authority
+Secret, a read-only Role/RoleBinding, and the controller Job; it does not apply
+resources, create an approval, reserve an attempt, or copy volume contents.
+
+```bash
+alpha-harness mission dispatch controller-handoff \
+  --submission /campaign-root/cycles/study/generation-0/submission.json \
+  --control /private/control.json \
+  --volume-root /campaign-root \
+  --work-dir /campaign-root/cycles/study \
+  --pvc approved-campaign-ledger \
+  --service-account approved-campaign-operator \
+  --trusted-keys-configmap approved-campaign-public-keys \
+  --campaign-pod EXACT_WORKER_POD \
+  --context monday-research-apne1 --namespace monday-research \
+  --output /private/controller-handoff.json
+```
+
+The existing cycle state must already use paths valid under the mounted
+`/campaign-root`. Rendering binds its context, namespace, source, image, input
+hash and finalized request, and rejects ledger/materialization paths outside the
+declared block-volume root. It normalizes the control-file paths for the Pod;
+it does not rewrite immutable cycle evidence or silently migrate arbitrary local
+checkpoints. The paired controller image must include these native commands.
+
+The service account and its OSS service identity are preconfigured operator
+authority. Kubernetes token projection is not OSS authorization. Public verifying
+keys come from the separately managed ConfigMap's `root-public-keys.json`, never
+from the per-attempt immutable Secret, so projected-key rotation remains visible.
+The authority Secret contains only control access and the signed root, never the
+issuer's private key. Treat the generated file as sensitive because it contains
+short-lived signed object URLs.
+
+An init container calls `mission dispatch prepare-controller`. It verifies the
+regular 32-byte integrity key is owned by UID 1000, restores mode 0600 through the
+verified file handle, and creates the named in-cluster kubeconfig using `tokenFile`
+rather than copying the service-account token. `fsGroupChangePolicy=OnRootMismatch`
+avoids repeatedly widening existing file modes on the block volume. Symlinks,
+ownership mismatch and changed file identity fail closed. The ledger is not
+opened or recreated by preparation.
+
+Native settlement needs exact Job get/watch, exact Pod get, and Pod list to
+establish the unique owned Pod. No Job mutation or Secret deletion is granted.
+The operator records resource UIDs and removes the per-handoff Secret/Role/binding
+only after terminal readback; it preserves shared service identities, trusted-key
+configuration and the ledger volume until its verified export is retained.
+
+`attempt_ordinal` counts retries **within a generation**. A new child generation
+starts at ordinal 0; it is not assigned ordinal 1 merely because its generation
+is 1. The family ledger independently enforces total attempts and trial budgets.
+
+#### Control file
+
+The root issuer uses the existing
 `sign_campaign_root_grant` contract. Before dispatch, record its corresponding
 `campaign_root` approval with `alpha-harness approval record --db ... --record ...`.
 The approval must bind the exact root ID, grant SHA, family ID, signer and validity

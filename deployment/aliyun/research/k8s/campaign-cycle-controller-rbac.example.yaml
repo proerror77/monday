@@ -1,7 +1,7 @@
 # Namespace-scoped readback authority for one approved Campaign generation.
 # Replace all resourceNames for every approved generation. Kubernetes RBAC
-# cannot suffix-match Secret names, so do not replace the exact `-inputs` name
-# with a wildcard or grant namespace-wide Secret deletion.
+# cannot restrict a Pod list to one label; native settlement requires that list
+# to verify the unique Job-owned Pod. No Secret or Job mutation is granted.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -24,9 +24,8 @@ rules:
     resourceNames: ["REPLACE_CAMPAIGN_POD_NAME"]
     verbs: ["get"]
   - apiGroups: [""]
-    resources: ["secrets"]
-    resourceNames: ["REPLACE_CAMPAIGN_JOB_NAME-inputs"]
-    verbs: ["delete"]
+    resources: ["pods"]
+    verbs: ["list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
