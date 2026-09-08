@@ -102,6 +102,7 @@ fn log_event(event: &str, details: Value) {
             "component": "binance-market-tape-slicer",
             "event": event,
             "details": details,
+            "memory": hft_collector::research_memory::observe_research_memory(),
         })
     );
 }
