@@ -295,14 +295,12 @@ async fn receive_latency_cohort_excludes_non_receive_boundaries() {
         .await
         .expect("adapter publish accepted");
     engine.tick().expect("adapter publish tick");
-    assert!(engine
+    assert!(!engine
         .get_latency_stats()
-        .get(&LatencyStage::Ingestion)
-        .is_none());
-    assert!(engine
+        .contains_key(&LatencyStage::Ingestion));
+    assert!(!engine
         .get_latency_stats()
-        .get(&LatencyStage::EndToEnd)
-        .is_none());
+        .contains_key(&LatencyStage::EndToEnd));
 
     ingester
         .ingest_tracked_lossless(TrackedMarketEvent::from_snapshot_completion(
@@ -319,14 +317,12 @@ async fn receive_latency_cohort_excludes_non_receive_boundaries() {
         .await
         .expect("snapshot accepted");
     engine.tick().expect("snapshot tick");
-    assert!(engine
+    assert!(!engine
         .get_latency_stats()
-        .get(&LatencyStage::Ingestion)
-        .is_none());
-    assert!(engine
+        .contains_key(&LatencyStage::Ingestion));
+    assert!(!engine
         .get_latency_stats()
-        .get(&LatencyStage::EndToEnd)
-        .is_none());
+        .contains_key(&LatencyStage::EndToEnd));
 
     let mut tracker = LatencyTracker::from_userspace_websocket_message_delivery(monotonic_micros());
     tracker.record_stage_with_offset(LatencyStage::WsReceive, 0);
@@ -508,6 +504,7 @@ fn realtime_quote_overlays_bbo_without_destroying_deeper_l2() {
     });
 
     let symbol = Symbol::new("BTCUSDT");
+    let snapshot_receive = hft_core::LocalReceiveTimestamp::new(now_micros());
     ingester
         .lock()
         .expect("ingester lock")
@@ -518,10 +515,20 @@ fn realtime_quote_overlays_bbo_without_destroying_deeper_l2() {
             asks: vec![level(102.0, 1.0), level(103.0, 2.0), level(104.0, 3.0)],
             sequence: 100,
             source_venue: Some(VenueId::BINANCE),
-            timestamps: Default::default(),
+            timestamps: hft_core::MarketDataTimestamps::local_only(snapshot_receive),
         }))
         .expect("snapshot accepted");
     engine.tick().expect("snapshot tick");
+
+    assert_eq!(
+        engine
+            .get_market_view()
+            .get_orderbook(&VenueSymbol::new(VenueId::BINANCE, symbol.clone()))
+            .unwrap()
+            .local_receive,
+        Some(snapshot_receive),
+    );
+    let quote_receive = hft_core::LocalReceiveTimestamp::new(now_micros());
 
     ingester
         .lock()
@@ -533,7 +540,7 @@ fn realtime_quote_overlays_bbo_without_destroying_deeper_l2() {
             bid: level(100.0, 5.0),
             ask: level(103.0, 6.0),
             source_venue: Some(VenueId::BINANCE),
-            timestamps: Default::default(),
+            timestamps: hft_core::MarketDataTimestamps::local_only(quote_receive),
         }))
         .expect("quote accepted");
     let tick = engine.tick().expect("quote tick");
@@ -544,6 +551,11 @@ fn realtime_quote_overlays_bbo_without_destroying_deeper_l2() {
     let view = engine.get_market_view();
     let book = view.get_orderbook(&key).expect("Binance book exists");
     assert_eq!(book.sequence, 105);
+    assert_eq!(
+        book.local_receive,
+        Some(quote_receive),
+        "BBO reference keeps receipt time rather than snapshot publication time"
+    );
     assert_eq!(
         book.bid_prices.as_slice(),
         &[
@@ -1156,8 +1168,10 @@ fn intent_from_an_older_event_in_the_same_batch_is_rejected() {
 
 #[test]
 fn market_consumers_rotate_without_exceeding_the_global_tick_budget() {
-    let mut config = EngineConfig::default();
-    config.max_events_per_cycle = 1;
+    let mut config = EngineConfig {
+        max_events_per_cycle: 1,
+        ..EngineConfig::default()
+    };
     config.ingestion.stale_threshold_us = 1_000_000;
     let mut engine = Engine::new(config);
     let first = engine.create_event_ingester_pair();

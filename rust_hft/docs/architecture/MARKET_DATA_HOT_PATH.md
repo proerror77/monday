@@ -79,6 +79,19 @@ Do not run repeated deep snapshot recovery as the latency lane.
   exchange batching interval is not misclassified as 20 ms of local processing delay.
 - Market orders without an executable venue quote fail closed before risk review.
 - Every surviving intent still passes account/position/order-rate risk and the lifecycle gate.
+- Signed quantity, notional, latency and slippage ceilings are intersected with stricter
+  upstream limits, including the post-risk strategy hot path. Risk cannot loosen the signed cap.
+- Price protection uses the executable side (ask for buys, bid for sells) of the canonical
+  instrument/venue book. The reference retains its actual local receive timestamp; publishing
+  a snapshot does not renew the quote. Missing, future, stale or mismatched references fail closed.
+- The engine rebuilds references before risk review. The execution worker reloads the same
+  existing market snapshot reader immediately before adapter entry, checking both the original
+  decision reference and the current quote. Caller serialization cannot inject a trusted quote.
+- Under a signed slippage cap, only a positive exchange-enforced limit price is supported.
+  A market order with a populated price field is still unprotected and is rejected; the system
+  does not silently change its order type. Limits within the exact adverse-price boundary pass,
+  while better prices are allowed. This bounds order price, not queue position, fill probability
+  or the market impact of an eventual fill. LiveSmall remains disabled.
 - Order submission is never blindly retried. HTTP 418/429 and Bybit rate-limit codes are known
   rejections; an accepted but undecodable response latches intake for client-order-ID reconciliation.
 

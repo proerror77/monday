@@ -61,6 +61,7 @@ pub struct WorkerQueues {
     event_space_notify: Arc<Notify>,
     applied_stream_rx: mpsc::UnboundedReceiver<u64>,
     applied_stream_notify: Arc<Notify>,
+    market_reader: Option<Arc<dyn snapshot::SnapshotReader<crate::aggregation::MarketView>>>,
 }
 
 /// 队列统计
@@ -78,6 +79,7 @@ pub struct QueueStats {
     pub intent_max_latency_count: u64,
     pub intent_order_notional_count: u64,
     pub intent_order_quantity_count: u64,
+    pub intent_slippage_count: u64,
 }
 
 /// 帶生命週期 envelope 的意圖提交失敗原因。
@@ -122,6 +124,7 @@ pub fn create_execution_queues(config: ExecutionQueueConfig) -> (EngineQueues, W
         event_space_notify,
         applied_stream_rx,
         applied_stream_notify,
+        market_reader: None,
     };
 
     (engine_queues, worker_queues)
@@ -215,6 +218,15 @@ impl EngineQueues {
                     | OrderIntentRejectReason::MaxOrderQuantityExceeded { .. } => {
                         self.stats.intent_order_quantity_count += 1;
                     }
+                    OrderIntentRejectReason::InvalidMaxSlippage { .. }
+                    | OrderIntentRejectReason::MissingSlippageReference
+                    | OrderIntentRejectReason::SlippageReferenceMismatch
+                    | OrderIntentRejectReason::MissingSlippageReferenceLifetime
+                    | OrderIntentRejectReason::SlippageReferenceExpired { .. }
+                    | OrderIntentRejectReason::SlippageUnprotectedOrder
+                    | OrderIntentRejectReason::MaxSlippageExceeded { .. } => {
+                        self.stats.intent_slippage_count += 1;
+                    }
                 }
                 Err(LifecycleIntentSubmitError::LifecycleRejected {
                     envelope: Box::new(envelope),
@@ -285,6 +297,32 @@ impl EngineQueues {
 }
 
 impl WorkerQueues {
+    pub fn set_market_reader(
+        &mut self,
+        reader: Arc<dyn snapshot::SnapshotReader<crate::aggregation::MarketView>>,
+    ) {
+        self.market_reader = Some(reader);
+    }
+
+    /// Reload the existing canonical snapshot immediately before adapter entry. Never trust
+    /// only a quote that travelled with an intent through an asynchronous execution queue.
+    pub fn validate_current_market_reference(
+        &self,
+        envelope: &OrderIntentEnvelope,
+        now: Timestamp,
+    ) -> Result<(), OrderIntentRejectReason> {
+        if envelope.lifecycle.max_slippage_bps.is_none() {
+            return envelope.validate_pre_execution(now, None);
+        }
+        let reference = self
+            .market_reader
+            .as_ref()
+            .and_then(|reader| reader.load().execution_price_reference(&envelope.intent));
+        envelope
+            .validate_pre_execution(now, reference.as_ref().map(|quote| quote.book_sequence))?;
+        envelope.validate_slippage_reference(now, reference.as_ref())
+    }
+
     /// 设置引擎唤醒通知器
     pub fn set_engine_notify(&mut self, notify: Arc<Notify>) {
         self.engine_notify = Some(notify);

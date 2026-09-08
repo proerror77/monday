@@ -78,6 +78,11 @@ pub trait ExecutionClient: Send + Sync {
 
     /// Idempotent live-order boundary. Adapters should forward `client_order_id` to the venue.
     async fn place_order_envelope(&mut self, envelope: &OrderIntentEnvelope) -> HftResult<OrderId> {
+        envelope
+            .validate_pre_execution(hft_core::now_micros(), None)
+            .map_err(|reason| {
+                HftError::Execution(format!("execution envelope rejected: {reason:?}"))
+            })?;
         self.place_order(envelope.intent.clone()).await
     }
 
@@ -798,6 +803,7 @@ pub trait RiskManager: Send + Sync {
                 lifecycle,
                 client_order_id,
                 account_id,
+                price_reference,
             } = envelope;
             let reviewed =
                 self.review_with_venue_specs(vec![intent], &projected_account, venue_specs);
@@ -825,6 +831,7 @@ pub trait RiskManager: Send + Sync {
                     lifecycle,
                     client_order_id: client_order_id.clone(),
                     account_id: account_id.clone(),
+                    price_reference: price_reference.clone(),
                 });
             }
         }

@@ -24,6 +24,75 @@ fn test_intent() -> OrderIntent {
 }
 
 #[test]
+fn queued_price_protection_reloads_market_identity_and_freshness() {
+    use engine::aggregation::{MarketView, TopNSnapshot};
+    use hft_core::{LocalReceiveTimestamp, Price, VenueId, VenueSymbol};
+    use std::sync::Arc;
+    let market = |ask: f64, sequence: u64, received_at: u64| {
+        let mut book = TopNSnapshot::new(Symbol::new("BTCUSDT"), 5);
+        book.update_from_snapshot(&ports::MarketSnapshot {
+            symbol: Symbol::new("BTCUSDT"),
+            timestamp: 1_000,
+            bids: vec![ports::BookLevel::new_unchecked(ask - 0.01, 10.0)],
+            asks: vec![ports::BookLevel::new_unchecked(ask, 10.0)],
+            sequence,
+            source_venue: Some(VenueId::MOCK),
+            timestamps: hft_core::MarketDataTimestamps::local_only(LocalReceiveTimestamp::new(
+                received_at,
+            )),
+        });
+        MarketView {
+            orderbooks: [(
+                VenueSymbol::new(VenueId::MOCK, Symbol::new("BTCUSDT")),
+                Arc::new(book),
+            )]
+            .into_iter()
+            .collect(),
+            arbitrage_opportunities: Vec::new(),
+            timestamp: 1_000,
+            version: sequence,
+        }
+    };
+    let snapshots = snapshot::SnapshotContainer::new(market(100.0, 7, 1_000));
+    let (mut sender, mut worker) = create_execution_queues(ExecutionQueueConfig::default());
+    let mut intent = test_intent();
+    intent.order_type = OrderType::Limit;
+    intent.price = Some(Price::from_f64(100.1).unwrap());
+    intent.target_venue = Some(VenueId::MOCK);
+    let mut life = OrderIntentLifecycle::new(1_000, 2_000);
+    life.max_slippage_bps = Some(25);
+    let mut envelope = OrderIntentEnvelope::new(intent, life);
+    envelope.price_reference = snapshots.load().execution_price_reference(&envelope.intent);
+    sender.send_lifecycle_intent(envelope, 1_100).unwrap();
+    let envelope = worker.receive_envelopes().pop().unwrap();
+    assert_eq!(
+        worker.validate_current_market_reference(&envelope, 1_100),
+        Err(OrderIntentRejectReason::MissingSlippageReference)
+    );
+    worker.set_market_reader(snapshots.reader());
+    assert_eq!(
+        worker.validate_current_market_reference(&envelope, 1_100),
+        Ok(())
+    );
+    snapshots.store(Arc::new(market(99.0, 8, 1_100)));
+    assert!(matches!(
+        worker.validate_current_market_reference(&envelope, 1_150),
+        Err(OrderIntentRejectReason::MaxSlippageExceeded { .. })
+    ));
+    snapshots.store(Arc::new(market(100.0, 8, 1)));
+    assert!(matches!(
+        worker.validate_current_market_reference(&envelope, 1_150),
+        Err(OrderIntentRejectReason::SlippageReferenceExpired { .. })
+    ));
+    let serialized = serde_json::to_vec(&envelope).unwrap();
+    let restored: OrderIntentEnvelope = serde_json::from_slice(&serialized).unwrap();
+    assert!(
+        restored.price_reference.is_none(),
+        "wire data is never a trusted market reference"
+    );
+}
+
+#[test]
 fn test_default_backpressure_policy_is_safe() {
     let config = IngestionConfig::default();
 

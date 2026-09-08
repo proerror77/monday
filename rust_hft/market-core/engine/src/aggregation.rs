@@ -17,6 +17,8 @@ const INLINE_BOOK_LEVELS: usize = 16;
 pub struct TopNSnapshot {
     pub symbol: Symbol,
     pub timestamp: Timestamp,
+    /// Actual local receipt of the book/BBO used for this snapshot, not publication time.
+    pub local_receive: Option<LocalReceiveTimestamp>,
     pub sequence: u64,
 
     // SoA 定点存储: 提升 SIMD/缓存性能，避免 Decimal 开销
@@ -32,6 +34,7 @@ impl TopNSnapshot {
         Self {
             symbol,
             timestamp: 0,
+            local_receive: None,
             sequence: 0,
             bid_prices: SmallVec::with_capacity(top_n),
             bid_quantities: SmallVec::with_capacity(top_n),
@@ -43,6 +46,7 @@ impl TopNSnapshot {
 
     pub fn update_from_snapshot(&mut self, snapshot: &MarketSnapshot) {
         self.timestamp = snapshot.timestamp;
+        self.local_receive = snapshot.timestamps.local_receive;
         self.sequence = snapshot.sequence;
 
         // 清空並重新填充
@@ -66,6 +70,7 @@ impl TopNSnapshot {
 
     pub fn apply_update(&mut self, update: &BookUpdate) {
         self.timestamp = update.timestamp;
+        self.local_receive = update.timestamps.local_receive;
         self.sequence = update.sequence;
         for level in &update.bids {
             Self::apply_level(
@@ -183,6 +188,7 @@ impl TopNSnapshot {
 struct CanonicalDepthBook {
     symbol: Symbol,
     timestamp: Timestamp,
+    local_receive: Option<LocalReceiveTimestamp>,
     sequence: u64,
     bids: BTreeMap<FixedPrice, FixedQuantity>,
     asks: BTreeMap<FixedPrice, FixedQuantity>,
@@ -193,6 +199,7 @@ impl CanonicalDepthBook {
         let mut book = Self {
             symbol: snapshot.symbol.clone(),
             timestamp: snapshot.timestamp,
+            local_receive: snapshot.timestamps.local_receive,
             sequence: snapshot.sequence,
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
@@ -208,6 +215,7 @@ impl CanonicalDepthBook {
 
     fn apply_update(&mut self, update: &BookUpdate) {
         self.timestamp = update.timestamp;
+        self.local_receive = update.timestamps.local_receive;
         self.sequence = update.sequence;
         for level in &update.bids {
             Self::apply_level(&mut self.bids, level);
@@ -231,6 +239,7 @@ impl CanonicalDepthBook {
     fn top_n(&self, levels: usize) -> TopNSnapshot {
         let mut snapshot = TopNSnapshot::new(self.symbol.clone(), levels);
         snapshot.timestamp = self.timestamp;
+        snapshot.local_receive = self.local_receive;
         snapshot.sequence = self.sequence;
         for (&price, &quantity) in self.bids.iter().rev().take(levels) {
             snapshot.bid_prices.push(price);
@@ -248,6 +257,7 @@ impl CanonicalDepthBook {
     fn top_n_with_quote(&self, levels: usize, quote: &TopOfBook) -> TopNSnapshot {
         let mut snapshot = TopNSnapshot::new(self.symbol.clone(), levels);
         snapshot.timestamp = quote.timestamp;
+        snapshot.local_receive = quote.timestamps.local_receive;
         snapshot.sequence = quote.sequence;
 
         let bid_price = FixedPrice::from(quote.bid.price);
@@ -1043,6 +1053,41 @@ pub struct MarketView {
 }
 
 impl MarketView {
+    pub fn execution_price_reference(
+        &self,
+        intent: &OrderIntent,
+    ) -> Option<ExecutionPriceReference> {
+        let venue = intent.target_venue?;
+        let book = self.get_orderbook(&VenueSymbol::new(venue, intent.symbol.clone()))?;
+        let bid = book.bid_prices.first().copied().map(Price::from)?;
+        let ask = book.ask_prices.first().copied().map(Price::from)?;
+        if bid.0 <= Decimal::ZERO
+            || ask.0 <= Decimal::ZERO
+            || bid.0 > ask.0
+            || book
+                .bid_quantities
+                .first()
+                .is_none_or(|quantity| *quantity <= FixedQuantity::ZERO)
+            || book
+                .ask_quantities
+                .first()
+                .is_none_or(|quantity| *quantity <= FixedQuantity::ZERO)
+        {
+            return None;
+        }
+        Some(ExecutionPriceReference {
+            venue,
+            symbol: intent.symbol.clone(),
+            side: intent.side,
+            price: match intent.side {
+                Side::Buy => ask,
+                Side::Sell => bid,
+            },
+            book_sequence: book.sequence,
+            received_at: book.local_receive?,
+        })
+    }
+
     /// 獲取指定交易對的訂單簿
     pub fn get_orderbook(&self, key: &VenueSymbol) -> Option<&TopNSnapshot> {
         self.orderbooks.get(key).map(|arc| arc.as_ref())
