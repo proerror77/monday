@@ -13,6 +13,7 @@
 #   5. /data disk: free <= 25% warns, free <= 15% (used >= 85%) breaches
 #   6. polymarket upload timers must be active while their collector is active
 #   7. /data must be mounted
+#   8. recovery receipts valid, ready/running ages bounded, no failed/stale jobs
 # plus the raw-ops Gate containment contract (static template with no active
 # instance, running lock, or residual environment) and state-persistence
 # failures. Everything else (units, timers, restarts,
@@ -234,7 +235,7 @@ make_recovery_queue() {
 }
 
 write_recovery_job() {
-  # $1 market, $2 job id, $3 state (ready|running|failed)
+  # $1 market, $2 job id, $3 state (ready|running|failed|stale)
   market=$1
   job_id=$2
   state=$3
@@ -1383,8 +1384,8 @@ expect "gate2 poly stale lane bound: exit 1" "$(rc_is 1; echo $?)"
 expect "gate2 poly stale lane bound: breach message" "$(grep_out '^breach: polymarket-market-tape-upload: last upload success stale'; echo $?)"
 
 # ---------------------------------------------------------------------------
-# 15. Recovery queue: empty queue is healthy, stale ready/running and any
-#     failed queue entry breach fail-closed.
+# 15. Recovery queue: empty queue is healthy, aged ready/running and any
+#     failed or stale queue entry breach fail-closed.
 # ---------------------------------------------------------------------------
 reset_env
 reset_state
@@ -1396,11 +1397,15 @@ expect "recovery queue empty: json zero counts" "$(json_query '
   .checks.recovery_queue.spot.ready_count == 0 and
   .checks.recovery_queue.spot.running_count == 0 and
   .checks.recovery_queue.spot.failed_count == 0 and
+  .checks.recovery_queue.spot.stale_count == 0 and
+  .checks.recovery_queue.spot.stale_oldest_age_seconds == null and
   .checks.recovery_queue.spot.malformed_count == 0 and
   .checks.recovery_queue.spot.legacy_unreceipted_count == 0 and
   .checks.recovery_queue.usdm.ready_count == 0 and
   .checks.recovery_queue.usdm.running_count == 0 and
   .checks.recovery_queue.usdm.failed_count == 0 and
+  .checks.recovery_queue.usdm.stale_count == 0 and
+  .checks.recovery_queue.usdm.stale_oldest_age_seconds == null and
   .checks.recovery_queue.usdm.malformed_count == 0 and
   .checks.recovery_queue.usdm.legacy_unreceipted_count == 0
 '; echo $?)"
@@ -1449,6 +1454,72 @@ touch_age "$spool_root/binance-lob-recovery/usdm/job.failed" 30
 run_health
 expect "recovery queue failed present: exit 1" "$(rc_is 1; echo $?)"
 expect "recovery queue failed present: breach" "$(grep_out '^breach: binance-lob-recovery\[usdm\]: failed recovery job(s) present'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+write_recovery_job spot job stale
+touch_age "$spool_root/binance-lob-recovery/spot/job.stale" 30
+run_health --json
+expect "recovery queue fresh stale present: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue fresh stale present: unconditional breach" "$(json_query '
+  .ok == false and
+  (.breaches | index("binance-lob-recovery[spot]: stale recovery job(s) present (1)")) != null
+'; echo $?)"
+expect "recovery queue fresh stale present: count and age" "$(json_query '
+  .checks.recovery_queue.spot.stale_count == 1 and
+  .checks.recovery_queue.spot.stale_oldest_age_seconds >= 30 and
+  .checks.recovery_queue.spot.malformed_count == 0
+'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+write_recovery_job usdm oldest stale
+touch_age "$spool_root/binance-lob-recovery/usdm/oldest.stale" 3600
+write_recovery_job usdm newest stale
+touch_age "$spool_root/binance-lob-recovery/usdm/newest.stale" 30
+run_health --json
+expect "recovery queue multiple stale: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue multiple stale: oldest age and count" "$(json_query '
+  .checks.recovery_queue.usdm.stale_count == 2 and
+  .checks.recovery_queue.usdm.stale_oldest_age_seconds >= 3600 and
+  .checks.recovery_queue.usdm.stale_oldest_age_seconds < 3660 and
+  .checks.recovery_queue.usdm.malformed_count == 0
+'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+write_recovery_job spot missing-hash stale
+jq 'del(.release_sha256)' \
+  "$spool_root/binance-lob-recovery/spot/missing-hash.stale/job.json" \
+  >"$spool_root/binance-lob-recovery/spot/missing-hash.stale/job.json.tmp"
+mv "$spool_root/binance-lob-recovery/spot/missing-hash.stale/job.json.tmp" \
+  "$spool_root/binance-lob-recovery/spot/missing-hash.stale/job.json"
+run_health --json
+expect "recovery queue malformed stale receipt: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue malformed stale receipt: strict validation" "$(json_query '
+  .checks.recovery_queue.spot.stale_count == 1 and
+  .checks.recovery_queue.spot.malformed_count == 1 and
+  (.breaches | index("binance-lob-recovery[spot]: malformed recovery job receipt(s) present (1)")) != null
+'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+make_recovery_queue spot
+ln -s "$spool_root/binance-lob/spot" "$spool_root/binance-lob-recovery/spot/symlink.stale"
+run_health --json
+expect "recovery queue stale symlink: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery queue stale symlink: malformed entry" "$(json_query '
+  .checks.recovery_queue.spot.stale_count == 0 and
+  .checks.recovery_queue.spot.malformed_count == 1
+'; echo $?)"
 
 reset_env
 reset_state

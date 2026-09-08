@@ -48,6 +48,9 @@
 #      until the disk fills.
 #   7. /data must be mounted; otherwise healthy-looking spool paths may be
 #      writing to the root filesystem instead of the governed data volume.
+#   8. Recovery jobs need valid receipts, bounded ready/running ages, and no
+#      failed or stale entries. A stale job remains undelivered regardless of
+#      when the controller moved it out of the runnable queue.
 # The raw-ops Gate template has no [Install] section, so systemd reports it as
 # static. Static is healthy only when no Gate instance, running lock, or
 # residual EnvironmentFile remains on the host. State-persistence failures
@@ -870,16 +873,19 @@ check_recovery_queue_market() {
   ready_scan_failed=0
   running_scan_failed=0
   failed_scan_failed=0
+  stale_scan_failed=0
   malformed_scan_failed=0
   legacy_scan_failed=0
   ready_entries=""
   running_entries=""
   failed_entries=""
+  stale_entries=""
   status_entries=""
   legacy_entries=""
   ready_count=0
   running_count=0
   failed_count=0
+  stale_count=0
   malformed_count=0
   legacy_unreceipted_count=0
   isolation_active=0
@@ -888,6 +894,7 @@ check_recovery_queue_market() {
   ready_oldest_age=null
   running_oldest_age=null
   failed_oldest_age=null
+  stale_oldest_age=null
 
   if [ "$recovery_queue_root_ok" -eq 1 ] && { [ -e "$queue_dir" ] || [ -L "$queue_dir" ]; }; then
     if ! owned_collector_traversable_directory "$queue_dir" "$recovery_root_owner_uid" "$recovery_hft_group_gid" \
@@ -918,24 +925,30 @@ check_recovery_queue_market() {
         || running_scan_failed=1
       failed_entries=$(find "$queue_dir" -mindepth 1 -maxdepth 1 -type d -name '*.failed' -print 2>/dev/null) \
         || failed_scan_failed=1
+      stale_entries=$(find "$queue_dir" -mindepth 1 -maxdepth 1 -type d -name '*.stale' -print 2>/dev/null) \
+        || stale_scan_failed=1
       status_entries=$(find "$queue_dir" -mindepth 1 -maxdepth 1 \
-        \( -name '*.ready' -o -name '*.running' -o -name '*.failed' \) -print 2>/dev/null) \
+        \( -name '*.ready' -o -name '*.running' -o -name '*.failed' -o -name '*.stale' \) -print 2>/dev/null) \
         || malformed_scan_failed=1
       if [ "${ready_scan_failed:-0}" -eq 1 ] \
         || [ "${running_scan_failed:-0}" -eq 1 ] \
         || [ "${failed_scan_failed:-0}" -eq 1 ] \
+        || [ "${stale_scan_failed:-0}" -eq 1 ] \
         || [ "${malformed_scan_failed:-0}" -eq 1 ]; then
         record_breach "$label: recovery queue scan failed ($queue_dir)"
       else
         ready_count=$(queue_entry_count "$ready_entries")
         running_count=$(queue_entry_count "$running_entries")
         failed_count=$(queue_entry_count "$failed_entries")
+        stale_count=$(queue_entry_count "$stale_entries")
         queue_oldest_age "$ready_entries"
         ready_oldest_age=$queue_oldest_age_result
         queue_oldest_age "$running_entries"
         running_oldest_age=$queue_oldest_age_result
         queue_oldest_age "$failed_entries"
         failed_oldest_age=$queue_oldest_age_result
+        queue_oldest_age "$stale_entries"
+        stale_oldest_age=$queue_oldest_age_result
         for entry in $status_entries; do
           if ! recovery_job_receipt_valid "$entry" "$market"; then
             malformed_count=$((malformed_count + 1))
@@ -970,6 +983,9 @@ check_recovery_queue_market() {
   if [ "$failed_count" -gt 0 ]; then
     record_breach "$label: failed recovery job(s) present ($failed_count)"
   fi
+  if [ "$stale_count" -gt 0 ]; then
+    record_breach "$label: stale recovery job(s) present ($stale_count)"
+  fi
   if [ "$ready_oldest_age" != null ] && [ "$ready_oldest_age" -gt "$RECOVERY_QUEUE_READY_MAX_AGE" ]; then
     record_breach "$label: oldest ready recovery job age ${ready_oldest_age}s over ${RECOVERY_QUEUE_READY_MAX_AGE}s"
   fi
@@ -984,6 +1000,8 @@ check_recovery_queue_market() {
     --argjson ua "$running_oldest_age" \
     --argjson fc "$failed_count" \
     --argjson fa "$failed_oldest_age" \
+    --argjson sc "$stale_count" \
+    --argjson sa "$stale_oldest_age" \
     --argjson mc "$malformed_count" \
     --argjson lc "$legacy_unreceipted_count" \
     --argjson ia "$isolation_active" \
@@ -992,6 +1010,7 @@ check_recovery_queue_market() {
     '{ready_count: $rc, ready_oldest_age_seconds: $ra,
       running_count: $uc, running_oldest_age_seconds: $ua,
       failed_count: $fc, failed_oldest_age_seconds: $fa,
+      stale_count: $sc, stale_oldest_age_seconds: $sa,
       malformed_count: $mc, legacy_unreceipted_count: $lc,
       isolation_active: ($ia == 1), isolation_valid: ($iv == 1),
       isolation_age_seconds: $ig}')

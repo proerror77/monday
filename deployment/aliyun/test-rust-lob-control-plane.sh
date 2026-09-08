@@ -1073,6 +1073,21 @@ payload_delta_transition_sha=$(awk '$2 == "transition.json" { count++; value=$1 
 [[ $(monday_sha256_file "$payload_delta_transition") == "$payload_delta_transition_sha" ]]
 monday_validate_v2_transition "$ROOT" "$payload_delta_transition" direct "$c1" \
   "$payload_delta_gate" "$payload_delta_gate_sha"
+# Scheduler requirements follow the transition's top-level test_only flag.
+# A test-only transition without scheduler observations is still valid.
+(
+  scheduler_scope_dir=$(mktemp -d "$ROOT/run/transition-scheduler-scope.XXXXXX")
+  trap 'rm -rf -- "$scheduler_scope_dir"' EXIT
+  jq '.test_only = true | .production_eligible = false | .recovery_schedulers = {}' \
+    "$payload_delta_transition" >"$scheduler_scope_dir/test-only-empty.json"
+  if ! monday_validate_v2_transition "$ROOT" "$scheduler_scope_dir/test-only-empty.json" direct "$c1" \
+    "$payload_delta_gate" "$payload_delta_gate_sha"; then
+    printf 'test-only transition rejected empty recovery scheduler observations\n' >&2
+    exit 1
+  fi
+
+)
+[[ $(monday_sha256_file "$payload_delta_transition") == "$payload_delta_transition_sha" ]]
 [[ $(monday_active_controller_sha "$ROOT") == "$c1" ]]
 [[ $(monday_rust_lob_live_runtime_contract_sha256 "$ROOT") == "$candidate_runtime_sha" ]]
 # Model the narrower receipt-before-digest power-loss point.  The same durable
@@ -2203,6 +2218,39 @@ jq -e --argjson pid "$fixture_process_pid" \
    and .spot.n_restarts == 0 and .usdm.n_restarts == 0
    and (.spot.session_id | length) > 0 and (.usdm.session_id | length) > 0' \
   "$transition" >/dev/null
+
+# This VERIFY_PROCESS fixture populated both process and scheduler observations.
+# Derive validation-only cases from its passed receipt: first accept a complete
+# production-shaped baseline, then change only recovery_schedulers so unrelated
+# missing process evidence cannot make either negative test pass accidentally.
+(
+  scheduler_scope_dir=$(mktemp -d "$ROOT/run/transition-scheduler-scope.XXXXXX")
+  trap 'rm -rf -- "$scheduler_scope_dir"' EXIT
+  # Neither the original transition nor its test-only Gate is changed or
+  # republished, and the captured production_process observations stay intact.
+  jq '.test_only = false | .production_eligible = true' \
+    "$transition" >"$scheduler_scope_dir/production-shape.json"
+  if ! monday_validate_v2_transition "$ROOT" "$scheduler_scope_dir/production-shape.json" "$c0" "$c1" \
+    "$gate" "$gate_sha"; then
+    printf 'production-shaped scheduler regression baseline is invalid\n' >&2
+    exit 1
+  fi
+  for scheduler_case in empty nested-test-only; do
+    if [[ $scheduler_case == empty ]]; then
+      scheduler_fields='{}'
+    else
+      scheduler_fields='{"test_only":true}'
+    fi
+    jq --argjson schedulers "$scheduler_fields" '.recovery_schedulers = $schedulers' \
+      "$scheduler_scope_dir/production-shape.json" >"$scheduler_scope_dir/$scheduler_case.json"
+    if monday_validate_v2_transition "$ROOT" "$scheduler_scope_dir/$scheduler_case.json" "$c0" "$c1" \
+      "$gate" "$gate_sha"; then
+      printf 'production transition accepted %s recovery schedulers\n' "$scheduler_case" >&2
+      exit 1
+    fi
+  done
+)
+[[ $(monday_sha256_file "$transition") == "$transition_sha" ]]
 
 # A fault after the active-pair rename restores both identities under the lock.
 printf '\n# controller revision three fixture\n' >>"$source_dir/host-rust-lob-readback.sh"
