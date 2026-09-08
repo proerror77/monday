@@ -12,6 +12,7 @@ pub(super) const MAX_BOOK_AGE_US: u64 = 1_000_000;
 #[derive(Clone, Default)]
 pub(super) struct BookBudget {
     sequence: u64,
+    generation: u64,
     received_at: u64,
     bids: BTreeMap<Decimal, Level>,
     asks: BTreeMap<Decimal, Level>,
@@ -45,7 +46,8 @@ pub(super) fn valid_book(book: &TopNSnapshot, now: u64) -> bool {
                     }
                 })
         };
-    received > 0
+    book.generation > 0
+        && received > 0
         && received <= now
         && now - received <= MAX_BOOK_AGE_US
         && valid_side(&book.bid_prices, &book.bid_quantities, true)
@@ -55,7 +57,16 @@ pub(super) fn valid_book(book: &TopNSnapshot, now: u64) -> bool {
 
 impl BookBudget {
     pub(super) fn observe(&mut self, book: &TopNSnapshot, now: u64) -> bool {
-        if !valid_book(book, now) || book.sequence < self.sequence {
+        if !valid_book(book, now) || book.generation < self.generation {
+            return false;
+        }
+        if book.generation > self.generation {
+            *self = Self {
+                generation: book.generation,
+                ..Self::default()
+            };
+        }
+        if book.sequence < self.sequence {
             return false;
         }
         let received = book.local_receive.unwrap().as_micros();
@@ -74,10 +85,10 @@ impl BookBudget {
                     let price = Price::from(*price).0;
                     let observed = Quantity::from(*quantity).0;
                     let remaining = previous.get(&price).map_or(observed, |level| {
-                        // Only an observed increase replenishes virtual liquidity.
-                        // A decrease may be other participants; never undo our consumption.
-                        level.remaining.min(observed)
-                            + (observed - level.observed).max(Decimal::ZERO)
+                        // Apply external additions and removals to the counterfactual
+                        // remainder without forgetting our own virtual consumption.
+                        (level.remaining + (observed - level.observed))
+                            .clamp(Decimal::ZERO, observed)
                     });
                     (
                         price,
@@ -92,6 +103,11 @@ impl BookBudget {
         self.bids = refresh(&self.bids, &book.bid_prices, &book.bid_quantities);
         self.asks = refresh(&self.asks, &book.ask_prices, &book.ask_quantities);
         true
+    }
+
+    pub(super) fn clear_levels(&mut self) {
+        self.bids.clear();
+        self.asks.clear();
     }
 
     pub(super) fn fills(&mut self, order: &OpenOrder) -> Vec<(Price, Quantity)> {

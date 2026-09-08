@@ -1027,34 +1027,73 @@ fn venue_disconnect_invalidates_stale_books_until_a_fresh_snapshot() {
     let ingester = engine.create_event_ingester_pair();
     let symbol = Symbol::new("BTCUSDT");
     let key = VenueSymbol::new(VenueId::BYBIT, symbol.clone());
-    ingester
-        .lock()
-        .expect("ingester lock")
-        .ingest(MarketEvent::Snapshot(MarketSnapshot {
-            symbol,
+    let snapshot = |sequence| {
+        MarketEvent::Snapshot(MarketSnapshot {
+            symbol: symbol.clone(),
             timestamp: now_micros(),
             bids: vec![level(100.0, 1.0)],
             asks: vec![level(101.0, 1.0)],
-            sequence: 1,
+            sequence,
             source_venue: Some(VenueId::BYBIT),
             timestamps: Default::default(),
-        }))
-        .expect("snapshot accepted");
-    engine.tick().expect("snapshot tick");
-    assert!(engine.get_market_view().get_orderbook(&key).is_some());
-
-    ingester
-        .lock()
-        .expect("ingester lock")
-        .ingest(MarketEvent::Disconnect {
-            reason: "test disconnect".to_string(),
-            source_venue: Some(VenueId::BYBIT),
-            symbol: None,
         })
-        .expect("disconnect accepted");
-    engine.tick().expect("disconnect tick");
-
+    };
+    let disconnect = || MarketEvent::Disconnect {
+        reason: "test disconnect".into(),
+        source_venue: Some(VenueId::BYBIT),
+        symbol: None,
+    };
+    ingester.lock().unwrap().ingest(snapshot(100)).unwrap();
+    engine.tick().unwrap();
+    let first_generation = engine
+        .get_market_view()
+        .get_orderbook(&key)
+        .unwrap()
+        .generation;
+    assert!(first_generation > 0);
+    ingester.lock().unwrap().ingest(snapshot(101)).unwrap();
+    engine.tick().unwrap();
+    assert_eq!(
+        engine
+            .get_market_view()
+            .get_orderbook(&key)
+            .unwrap()
+            .generation,
+        first_generation,
+        "ordinary full snapshots cannot replenish consumed Paper depth"
+    );
+    ingester.lock().unwrap().ingest(disconnect()).unwrap();
+    engine.tick().unwrap();
     assert!(engine.get_market_view().get_orderbook(&key).is_none());
+    ingester.lock().unwrap().ingest(snapshot(1)).unwrap();
+    engine.tick().unwrap();
+    let second_generation = engine
+        .get_market_view()
+        .get_orderbook(&key)
+        .unwrap()
+        .generation;
+    assert!(second_generation > first_generation);
+    assert_eq!(
+        engine
+            .get_market_view()
+            .get_orderbook(&key)
+            .unwrap()
+            .sequence,
+        1
+    );
+    // A polling reader can miss the empty intermediate view. Generation still
+    // distinguishes the replacement even when both events drain in one tick.
+    ingester.lock().unwrap().ingest(disconnect()).unwrap();
+    ingester.lock().unwrap().ingest(snapshot(1)).unwrap();
+    engine.tick().unwrap();
+    assert!(
+        engine
+            .get_market_view()
+            .get_orderbook(&key)
+            .unwrap()
+            .generation
+            > second_generation
+    );
 }
 
 #[test]

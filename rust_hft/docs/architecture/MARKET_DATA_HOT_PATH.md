@@ -131,10 +131,13 @@ delay and priority. This local ordering does not estimate an exchange queue.
 
 All orders in one simulated client share a remaining-depth budget. Republishing
 an unchanged level, including under a new book sequence, does not replenish it.
-Only an observed quantity increase adds available quantity; quantity decreases
-can reduce availability. A level that disappears and is later observed again
-starts a new displayed level. Sequence or receive-clock regression cannot refresh
-the budget. This is a conservative model of displayed taker liquidity, not measured
+The matcher refreshes every tracked symbol on each tick, including between orders
+and during arrival delays. Positive and negative displayed-quantity deltas adjust
+the unspent budget, clamped between zero and the current displayed quantity. A
+level that disappears and is later observed again starts a new displayed level.
+Canonical book generations survive ordinary full snapshots and updates; a new
+generation after invalidation resets the budget even if its sequence restarts.
+Sequence or receive-clock regression within one generation cannot refresh it. This is a conservative model of displayed taker liquidity, not measured
 market impact or proof of real strategy capacity. Passive fills, hidden liquidity,
 exchange queue position and stochastic network latency remain unmodeled. These
 assumptions do not change replay capability receipts or enable live execution.
