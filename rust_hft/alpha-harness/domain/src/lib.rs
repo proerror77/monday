@@ -1,6 +1,7 @@
 //! Trust-boundary contracts for bounded Loop Engineer research and runtime deployment.
 
 pub mod campaign_control;
+pub mod campaign_finalization;
 mod evaluation_partition;
 pub use evaluation_partition::{EvaluationRowPartitionsV1, EvaluationSelectionV1};
 pub mod runtime_latency_evidence;

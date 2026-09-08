@@ -436,7 +436,7 @@ fn signing_message(hash: &str) -> String {
     format!("{ROOT_GRANT_SCHEMA}:{hash}")
 }
 
-fn digest(value: &str, length: usize) -> Result<()> {
+pub(super) fn digest(value: &str, length: usize) -> Result<()> {
     if value.len() != length
         || !value
             .bytes()
@@ -449,7 +449,7 @@ fn digest(value: &str, length: usize) -> Result<()> {
     Ok(())
 }
 
-fn identifier(value: &str) -> Result<()> {
+pub(super) fn identifier(value: &str) -> Result<()> {
     if value.is_empty()
         || value.len() > 256
         || !value

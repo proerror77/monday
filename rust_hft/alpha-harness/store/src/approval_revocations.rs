@@ -232,7 +232,7 @@ impl AlphaStore {
         let tx = self.connection.transaction().map_err(database_error)?;
         serialize_approval_mutation(&tx, &event.approval_id)?;
         insert_revocation_evidence(&tx, &self.integrity_key, event)?;
-        super::campaign_ledger::append_registered_root_revocation(
+        super::campaign_ledger::append_registered_campaign_revocation(
             &tx,
             &self.integrity_key,
             &approval,

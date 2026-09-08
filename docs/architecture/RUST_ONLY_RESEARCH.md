@@ -67,8 +67,26 @@ original encoding and shared-validation meaning.
 The signed feedback label `independent_selection_withheld` means the separate
 window is reserved, not that it has been evaluated. Pre-holdout Campaigns still
 emit search-visible metrics only. Root grants still cannot open holdout or
-perform final selection; final candidate freezing, family closure and separately
-authorized final evaluation must precede using this reserved window.
+perform final selection; final candidate freezing and separately authorized final
+evaluation must precede using this reserved window.
+
+`mission dispatch close-family` accepts a separate signed
+`monday.campaign_final_evaluation_grant.v1` and its active
+`campaign_final_evaluation` approval. It compares the exact family ledger tail,
+view/source binding and complete selected-result set. Every source attempt must
+have canonical terminal identity and known consumption. The resulting
+`family_closed_for_final_evaluation` receipt permanently blocks new roots,
+reservations and search dispatches in that family. Restoring its authenticated
+snapshot preserves closure and later approval revocations; revocation never
+reopens search.
+
+The final grant binds at most 128 candidates, an explicit Job time budget and
+pinned runner/controller resources. This command closes the existing local
+ledger only: it returns its receipt and pending publication count without
+opening selection/holdout data or creating a Job. Independent receipt readback,
+a single-use final dispatch claim and the final model evaluator are required
+before the later canonical final-evaluation stage can run. An older binary that
+cannot decode the closure receipt must not be used to resume that ledger.
 
 Prediction training additionally accepts only an immutable
 `VerifiedBinarySnapshot` handle. The loader verifies the snapshot's evaluator

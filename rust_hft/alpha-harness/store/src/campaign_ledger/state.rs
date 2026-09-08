@@ -18,11 +18,19 @@ pub(super) struct Attempt {
     pub terminal_pod_uid: Option<String>,
 }
 
+pub(super) struct FinalClosure {
+    pub grant: VerifiedCampaignFinalEvaluationGrant,
+    pub approval: ApprovalRecord,
+    pub approval_hash: String,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Default)]
 pub(super) struct State {
     pub family: Option<CampaignFamilyPolicyV1>,
     pub roots: BTreeMap<String, Root>,
     pub attempts: BTreeMap<String, Attempt>,
+    pub final_closure: Option<FinalClosure>,
 }
 
 impl State {
@@ -57,6 +65,19 @@ impl State {
     }
 
     pub fn apply(&mut self, receipt: &CampaignLedgerReceiptV1) -> Result<(), StoreError> {
+        if self.final_closure.is_some()
+            && matches!(
+                &receipt.event,
+                CampaignLedgerEventV1::RootRegistered { .. }
+                    | CampaignLedgerEventV1::AttemptReserved { .. }
+                    | CampaignLedgerEventV1::DispatchClaimed { .. }
+                    | CampaignLedgerEventV1::DispatchJobBound { .. }
+            )
+        {
+            return Err(err(
+                "family search is permanently closed for final evaluation",
+            ));
+        }
         match &receipt.event {
             CampaignLedgerEventV1::RootRegistered {
                 signed,
@@ -324,12 +345,90 @@ impl State {
                 }
                 attempt.settlement = Some(settlement.clone());
             }
+            CampaignLedgerEventV1::FamilyClosedForFinalEvaluation {
+                signed,
+                verifying_key_hex,
+                approval,
+                approval_content_sha256,
+            } => {
+                let bytes: [u8; 32] = hex::decode(verifying_key_hex)
+                    .map_err(err)?
+                    .try_into()
+                    .map_err(|_| err("invalid historical final verification key"))?;
+                let key = VerifyingKey::from_bytes(&bytes).map_err(err)?;
+                let verified = verify_campaign_final_evaluation_grant(
+                    signed,
+                    &BTreeMap::from([(signed.key_id.clone(), key)]),
+                    receipt.recorded_at,
+                )
+                .map_err(err)?;
+                verified
+                    .validate_job_deadline_at(receipt.recorded_at)
+                    .map_err(err)?;
+                validate_final_approval(
+                    approval,
+                    approval_content_sha256,
+                    &verified,
+                    receipt.recorded_at,
+                )?;
+                let grant = verified.grant();
+                if self.final_closure.is_some()
+                    || receipt.family_id != grant.family_id
+                    || receipt.previous_receipt_sha256.as_deref() != Some(&grant.family_head_sha256)
+                    || self.family.as_ref().is_none_or(|family| {
+                        family.definition_sha256 != grant.family_definition_sha256
+                    })
+                    || self.attempts.is_empty()
+                    || self
+                        .roots
+                        .values()
+                        .any(|root| root.grant.grant().execution != grant.execution)
+                {
+                    return Err(err("final evaluation family, view or ledger head mismatch"));
+                }
+                let mut selected = BTreeMap::new();
+                for (operation, attempt) in &self.attempts {
+                    let settlement = attempt
+                        .settlement
+                        .as_ref()
+                        .ok_or_else(|| err("family has unresolved attempts"))?;
+                    if settlement.consumed_trials.is_none() || attempt.terminal_pod_uid.is_none() {
+                        return Err(err("family lacks canonical terminal consumption evidence"));
+                    }
+                    if settlement.outcome == CampaignAttemptOutcomeV1::SelectedPreHoldout {
+                        selected.insert(operation.clone(), settlement.evidence_sha256.clone());
+                    }
+                }
+                if selected != grant.selected_results {
+                    return Err(err(
+                        "final result set differs from the complete settled family",
+                    ));
+                }
+                self.final_closure = Some(FinalClosure {
+                    grant: verified,
+                    approval: approval.clone(),
+                    approval_hash: approval_content_sha256.clone(),
+                    revoked_at: None,
+                });
+            }
             CampaignLedgerEventV1::ApprovalRevoked { revocation } => {
+                if let Some(closure) = self
+                    .final_closure
+                    .as_mut()
+                    .filter(|closure| closure.approval.approval_id == revocation.approval_id)
+                {
+                    revocation.apply_to(closure.approval.clone(), &closure.approval_hash)?;
+                    if closure.revoked_at.is_some() {
+                        return Err(err("final approval already revoked"));
+                    }
+                    closure.revoked_at = Some(revocation.revoked_at);
+                    return Ok(());
+                }
                 let root = self
                     .roots
                     .values_mut()
                     .find(|r| r.approval.approval_id == revocation.approval_id)
-                    .ok_or_else(|| err("revocation has no registered root"))?;
+                    .ok_or_else(|| err("revocation has no registered Campaign approval"))?;
                 revocation.apply_to(root.approval.clone(), &root.approval_hash)?;
                 if root.revoked_at.is_some() {
                     return Err(err("root already revoked"));

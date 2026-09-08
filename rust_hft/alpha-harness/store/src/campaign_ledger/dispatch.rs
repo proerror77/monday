@@ -322,6 +322,11 @@ pub(super) fn checked_reservation(
     require_publication: bool,
 ) -> Result<CampaignAttemptReservationV1, StoreError> {
     let (state, history) = load(conn, key, family)?;
+    if state.final_closure.is_some() {
+        return Err(err(
+            "family search is permanently closed for final evaluation",
+        ));
+    }
     let a = state
         .attempts
         .get(operation_id)
