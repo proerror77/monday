@@ -969,6 +969,18 @@ impl ExecutionWorker {
                 }
                 Some(account_id)
             };
+            if let Err(reason) = self.queues.validate_execution_market_reference(
+                &envelope,
+                now_micros(),
+                self.execution_clients[client_idx].price_protection(),
+            ) {
+                self.reject_intent(
+                    &envelope.client_order_id,
+                    format!("final market price protection rejected intent: {reason:?}"),
+                )
+                .await;
+                continue;
+            }
             let trace_id = OrderId(envelope.client_order_id.clone());
             self.execution_timelines.insert(
                 trace_id.clone(),
@@ -4211,6 +4223,53 @@ mod tests {
             ] if account_id == &expected
                 && reason == "simulated execution target venue does not match selected client"
         ));
+    }
+
+    #[tokio::test]
+    async fn changed_market_reference_rejects_before_adapter_submission() {
+        let state = Arc::new(StdMutex::new(MockExecutionState {
+            simulated: true,
+            ..Default::default()
+        }));
+        let client = MockExecutionClient {
+            state: Arc::clone(&state),
+            place_error: false,
+            list_error: false,
+            cancel_error: false,
+        };
+        let (_, mut queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let now = now_micros();
+        let snapshots =
+            snapshot::SnapshotContainer::new(crate::tests::execution_test_market(now, 100.0));
+        queues.set_market_reader(snapshots.reader());
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            queues,
+            vec![Box::new(client)],
+            rx,
+        );
+        worker.venue_to_client.insert(VenueId::MOCK, 0);
+        let mut intent = create_test_intent("BTCUSDT");
+        intent.target_venue = Some(VenueId::MOCK);
+        intent.price = Some(Price(rust_decimal::Decimal::new(1001, 1)));
+        intent.order_type = OrderType::Limit;
+        let mut life = ports::OrderIntentLifecycle::new(now, now + 1_000_000);
+        life.max_slippage_bps = Some(25);
+        let mut envelope = OrderIntentEnvelope::new(intent, life);
+        envelope.price_reference = snapshots.load().execution_price_reference(&envelope.intent);
+        assert!(envelope.validate_pre_execution(now, None).is_ok());
+        snapshots.store(Arc::new(crate::tests::execution_test_market(now, 99.0)));
+        worker
+            .process_order_intents(&mut vec![envelope.clone()])
+            .await;
+        assert!(state.lock().unwrap().placed.is_empty());
+        assert_eq!(worker.stats.orders_failed, 1);
+        snapshots.store(Arc::new(crate::tests::execution_test_market(now, 100.0)));
+        worker.process_order_intents(&mut vec![envelope]).await;
+        assert_eq!(state.lock().unwrap().placed.len(), 1);
+        assert_eq!(worker.stats.orders_placed, 1);
     }
 
     #[tokio::test]

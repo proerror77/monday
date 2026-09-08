@@ -261,6 +261,10 @@ impl BinancePredictionExecutionClient {
 
 #[async_trait]
 impl ExecutionClient for BinancePredictionExecutionClient {
+    fn price_protection(&self) -> ports::ExecutionPriceProtection {
+        ports::ExecutionPriceProtection::VenueQuote
+    }
+
     async fn place_order(&mut self, intent: OrderIntent) -> HftResult<OrderId> {
         Self::validate_intent(&intent)?;
         if self.config.mode == ExecutionMode::Live {

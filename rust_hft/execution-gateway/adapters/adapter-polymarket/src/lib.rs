@@ -3875,6 +3875,10 @@ impl PolymarketExecutionClient {
 
 #[async_trait]
 impl ExecutionClient for PolymarketExecutionClient {
+    fn price_protection(&self) -> ports::ExecutionPriceProtection {
+        ports::ExecutionPriceProtection::VenueQuote
+    }
+
     async fn place_order(&mut self, intent: OrderIntent) -> HftResult<OrderId> {
         let envelope = OrderIntentEnvelope::new(intent, Default::default());
         self.place_order_envelope(&envelope).await

@@ -7,7 +7,10 @@
 
 use crate::dataflow::ring_buffer::{spsc_ring_buffer, SpscConsumer, SpscProducer};
 use hft_core::{AccountId, Timestamp};
-use ports::{ExecutionEvent, OrderIntent, OrderIntentEnvelope, OrderIntentRejectReason};
+use ports::{
+    ExecutionEvent, ExecutionPriceProtection, OrderIntent, OrderIntentEnvelope,
+    OrderIntentRejectReason,
+};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Notify};
 use tracing::{debug, warn};
@@ -61,6 +64,7 @@ pub struct WorkerQueues {
     event_space_notify: Arc<Notify>,
     applied_stream_rx: mpsc::UnboundedReceiver<u64>,
     applied_stream_notify: Arc<Notify>,
+    market_reader: Option<Arc<dyn snapshot::SnapshotReader<crate::aggregation::MarketView>>>,
 }
 
 /// 队列统计
@@ -78,6 +82,7 @@ pub struct QueueStats {
     pub intent_max_latency_count: u64,
     pub intent_order_notional_count: u64,
     pub intent_order_quantity_count: u64,
+    pub intent_slippage_count: u64,
 }
 
 /// 帶生命週期 envelope 的意圖提交失敗原因。
@@ -122,6 +127,7 @@ pub fn create_execution_queues(config: ExecutionQueueConfig) -> (EngineQueues, W
         event_space_notify,
         applied_stream_rx,
         applied_stream_notify,
+        market_reader: None,
     };
 
     (engine_queues, worker_queues)
@@ -188,7 +194,30 @@ impl EngineQueues {
         now: Timestamp,
         latest_book_seq: Option<u64>,
     ) -> Result<(), LifecycleIntentSubmitError> {
-        match envelope.validate_pre_execution(now, latest_book_seq) {
+        self.send_lifecycle_intent_with_price_protection(
+            envelope,
+            now,
+            latest_book_seq,
+            ExecutionPriceProtection::CanonicalBook,
+        )
+    }
+
+    pub fn send_lifecycle_intent_with_price_protection(
+        &mut self,
+        envelope: OrderIntentEnvelope,
+        now: Timestamp,
+        latest_book_seq: Option<u64>,
+        price_protection: ExecutionPriceProtection,
+    ) -> Result<(), LifecycleIntentSubmitError> {
+        let validation = match price_protection {
+            ExecutionPriceProtection::CanonicalBook => {
+                envelope.validate_cex_pre_execution(now, latest_book_seq)
+            }
+            ExecutionPriceProtection::VenueQuote => {
+                envelope.validate_pre_execution(now, latest_book_seq)
+            }
+        };
+        match validation {
             Ok(()) => self.send_envelope(envelope).map_err(|envelope| {
                 LifecycleIntentSubmitError::QueueFull {
                     envelope: Box::new(envelope),
@@ -200,7 +229,8 @@ impl EngineQueues {
                     OrderIntentRejectReason::Expired { .. } => {
                         self.stats.intent_expired_count += 1;
                     }
-                    OrderIntentRejectReason::SourceBookStale { .. } => {
+                    OrderIntentRejectReason::SourceBookStale { .. }
+                    | OrderIntentRejectReason::SourceBookUnavailable => {
                         self.stats.intent_stale_count += 1;
                     }
                     OrderIntentRejectReason::MaxLatencyExceeded { .. } => {
@@ -214,6 +244,15 @@ impl EngineQueues {
                     OrderIntentRejectReason::InvalidMaxOrderQuantity { .. }
                     | OrderIntentRejectReason::MaxOrderQuantityExceeded { .. } => {
                         self.stats.intent_order_quantity_count += 1;
+                    }
+                    OrderIntentRejectReason::InvalidMaxSlippage { .. }
+                    | OrderIntentRejectReason::MissingSlippageReference
+                    | OrderIntentRejectReason::SlippageReferenceMismatch
+                    | OrderIntentRejectReason::MissingSlippageReferenceLifetime
+                    | OrderIntentRejectReason::SlippageReferenceExpired { .. }
+                    | OrderIntentRejectReason::SlippageUnprotectedOrder
+                    | OrderIntentRejectReason::MaxSlippageExceeded { .. } => {
+                        self.stats.intent_slippage_count += 1;
                     }
                 }
                 Err(LifecycleIntentSubmitError::LifecycleRejected {
@@ -285,6 +324,61 @@ impl EngineQueues {
 }
 
 impl WorkerQueues {
+    pub fn set_market_reader(
+        &mut self,
+        reader: Arc<dyn snapshot::SnapshotReader<crate::aggregation::MarketView>>,
+    ) {
+        self.market_reader = Some(reader);
+    }
+
+    /// Reload the existing canonical snapshot immediately before adapter entry. Never trust
+    /// only a quote that travelled with an intent through an asynchronous execution queue.
+    pub fn validate_current_market_reference(
+        &self,
+        envelope: &OrderIntentEnvelope,
+        now: Timestamp,
+    ) -> Result<(), OrderIntentRejectReason> {
+        self.validate_execution_market_reference(
+            envelope,
+            now,
+            ExecutionPriceProtection::CanonicalBook,
+        )
+    }
+
+    pub fn validate_execution_market_reference(
+        &self,
+        envelope: &OrderIntentEnvelope,
+        now: Timestamp,
+        price_protection: ExecutionPriceProtection,
+    ) -> Result<(), OrderIntentRejectReason> {
+        let market = self.market_reader.as_ref().map(|reader| reader.load());
+        if price_protection == ExecutionPriceProtection::CanonicalBook
+            && envelope.lifecycle.source_book_seq.is_some()
+            && envelope.source_book_identity.is_none()
+        {
+            return Err(OrderIntentRejectReason::SourceBookUnavailable);
+        }
+        let source_sequence = match &envelope.source_book_identity {
+            Some(identity) => Some(
+                market
+                    .as_ref()
+                    .and_then(|view| view.get_orderbook(identity))
+                    .ok_or(OrderIntentRejectReason::SourceBookUnavailable)?
+                    .sequence,
+            ),
+            None => None,
+        };
+        envelope.validate_pre_execution(now, source_sequence)?;
+        if price_protection == ExecutionPriceProtection::VenueQuote {
+            return Ok(());
+        }
+        envelope.validate_slippage_reference(now, envelope.price_reference.as_ref())?;
+        let reference = market
+            .as_ref()
+            .and_then(|view| view.execution_price_reference(&envelope.intent));
+        envelope.validate_slippage_reference(now, reference.as_ref())
+    }
+
     /// 设置引擎唤醒通知器
     pub fn set_engine_notify(&mut self, notify: Arc<Notify>) {
         self.engine_notify = Some(notify);

@@ -79,6 +79,26 @@ Do not run repeated deep snapshot recovery as the latency lane.
   exchange batching interval is not misclassified as 20 ms of local processing delay.
 - Market orders without an executable venue quote fail closed before risk review.
 - Every surviving intent still passes account/position/order-rate risk and the lifecycle gate.
+- Signed quantity, notional, latency and slippage ceilings are intersected with stricter
+  upstream limits, including the post-risk strategy hot path. Risk cannot loosen the signed cap.
+- Price protection uses the executable side (ask for buys, bid for sells) of the canonical
+  instrument/venue book. The reference retains its actual local receive timestamp; publishing
+  a snapshot does not renew the quote. Missing, future, stale or mismatched references fail closed.
+- The engine rebuilds references before risk review. The execution worker reloads the same
+  existing market snapshot reader immediately before adapter entry, checking both the original
+  decision reference and the current quote. Caller serialization cannot inject a trusted quote.
+- Decision-book sequences are bound to their own venue and symbol. Cross-venue legs validate
+  the source book independently of the target executable quote; unrelated sequence domains
+  are never compared. Missing or reset source books fail closed.
+- The trusted execution adapter declares its price-protection protocol. Ordinary CEX adapters
+  use the canonical book checks; prediction adapters retain their authenticated venue-quote
+  checks. Runtime derives this routing from adapter capabilities, never from order fields.
+  The common lifecycle gate still checks expiry and size for both protocols.
+- Under canonical CEX price protection, only a positive exchange-enforced limit price is supported.
+  A market order with a populated price field is still unprotected and is rejected; the system
+  does not silently change its order type. Limits within the exact adverse-price boundary pass,
+  while better prices are allowed. This bounds order price, not queue position, fill probability
+  or the market impact of an eventual fill. LiveSmall remains disabled.
 - Order submission is never blindly retried. HTTP 418/429 and Bybit rate-limit codes are known
   rejections; an accepted but undecodable response latches intake for client-order-ID reconciliation.
 
