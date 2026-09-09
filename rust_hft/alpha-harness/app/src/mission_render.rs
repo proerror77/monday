@@ -1455,6 +1455,7 @@ pub(crate) mod tests {
     fn feature_subset_delta_renders_v5_mission_and_parameterized_baseline() {
         let fixture = Fixture::new(MIN_ROWS);
         let canonical = CexCampaignResearchPlanV1::canonical();
+        assert_eq!(canonical.allowed_search_policy_revisions.len(), 15);
         let subset_revision = CexCampaignSearchPolicyRevisionV1::bounded_allowlist()
             .into_iter()
             .find(|revision| {
@@ -1561,6 +1562,52 @@ pub(crate) mod tests {
             .unwrap()
             .content_hash()
             .unwrap()
+        );
+
+        let mut request = crate::mission_campaign::valid_request_for_tests();
+        request.research_plan = plan;
+        crate::mission_campaign::validate_terminal_mission_revision_binding(
+            &rendered.mission,
+            &request,
+        )
+        .unwrap();
+        let mut forged = rendered.mission.clone();
+        let forged_delta = {
+            let delta = forged.spec.research_delta.as_mut().unwrap();
+            delta.windows = vec![5, 40];
+            delta.clone()
+        };
+        let forged_gp = CexGpPolicyV1::controlled_dynamic_v5(
+            forged.spec.policies.gp.id.clone(),
+            forged.spec.feature_fields.clone(),
+            forged_delta.operators.clone(),
+            forged_delta.windows.clone(),
+            forged.spec.search.seed,
+            &forged.spec.search.budget,
+        )
+        .unwrap();
+        forged.spec.policies.gp.content_sha256 = forged_gp.content_hash().unwrap();
+        forged.validate().unwrap();
+        assert!(
+            crate::mission_campaign::validate_terminal_mission_revision_binding(&forged, &request,)
+                .is_err()
+        );
+        let mut forged_decision = rendered.mission.clone();
+        forged_decision
+            .spec
+            .policies
+            .supervised_decision
+            .content_sha256 = CexCampaignPositionPolicyV1::CostAware
+            .decision_policy()
+            .content_hash()
+            .unwrap();
+        forged_decision.validate().unwrap();
+        assert!(
+            crate::mission_campaign::validate_terminal_mission_revision_binding(
+                &forged_decision,
+                &request,
+            )
+            .is_err()
         );
     }
 

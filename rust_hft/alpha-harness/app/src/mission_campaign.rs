@@ -16,7 +16,7 @@ use crate::{
         publish_immutable_file, recover_execution_report_from_published_result, research_event,
         valid_git_revision, validate_cex_holdout_id, validate_supervised_candidate_binding,
         validate_supervised_replay_binding, CexEventReplayReceiptV1, CexSupervisedModelSelectionV1,
-        ExecutionBinding, MAX_RESULT_BUNDLE_BYTES,
+        ExecutionBinding, CEX_SUPERVISED_MODEL_NAMES, MAX_RESULT_BUNDLE_BYTES,
     },
     prediction_dispatch::{
         canonical_tokyo_oss_internal_object, cex_campaign_round_root,
@@ -58,10 +58,22 @@ fn declared_total_trials_for_rounds(
     research_plan: &CexCampaignResearchPlanV1,
     round_count: usize,
 ) -> anyhow::Result<usize> {
-    research_plan
-        .max_candidates()?
-        .checked_mul(2)
-        .and_then(|count| count.checked_mul(round_count))
+    let gp_trials = research_plan.max_candidates()?;
+    let per_round = if research_plan
+        .search_policy_revision
+        .research_delta
+        .is_some()
+    {
+        gp_trials
+            .checked_add(CEX_SUPERVISED_MODEL_NAMES.len())
+            .context("campaign supervised model trial bound overflowed")?
+    } else {
+        gp_trials
+            .checked_mul(2)
+            .context("campaign legacy trial bound overflowed")?
+    };
+    per_round
+        .checked_mul(round_count)
         .context("campaign declared_total_trials overflowed")
 }
 
@@ -2155,30 +2167,73 @@ fn load_round_subset_result(results: &Path) -> anyhow::Result<Option<CexFactorBa
     Ok(Some(serde_json::from_slice(&std::fs::read(subset_path)?)?))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SupervisedModelAttemptLedgerV1 {
+    schema_version: String,
+    attempts: Vec<SupervisedModelAttemptEntryV1>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SupervisedModelAttemptEntryV1 {
+    model: String,
+    outcome: String,
+}
+
 fn persisted_supervised_model_attempt_count(results: &Path) -> anyhow::Result<Option<usize>> {
     let attempts_path = results.join("supervised-model-attempts.json");
     if attempts_path.try_exists()? {
-        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(attempts_path)?)?;
-        if value["schema_version"] != "cex-supervised-model-attempts-v1" {
+        let ledger: SupervisedModelAttemptLedgerV1 =
+            serde_json::from_slice(&std::fs::read(attempts_path)?)?;
+        if ledger.schema_version != "cex-supervised-model-attempts-v1" {
             bail!("supervised model attempt ledger schema is invalid");
         }
-        let attempts = value["attempts"]
-            .as_array()
-            .context("supervised model attempt ledger has no attempts")?;
+        let expected_models = CEX_SUPERVISED_MODEL_NAMES
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        if ledger.attempts.len() != expected_models.len() {
+            bail!("supervised model attempt ledger model count is invalid");
+        }
         let mut models = std::collections::BTreeSet::new();
-        for attempt in attempts {
-            let model = attempt["model"]
-                .as_str()
-                .filter(|model| !model.trim().is_empty())
-                .context("supervised model attempt has no model")?;
-            let outcome = attempt["outcome"]
-                .as_str()
-                .context("supervised model attempt has no outcome")?;
-            if !matches!(outcome, "admitted" | "started" | "completed" | "failed")
+        for attempt in &ledger.attempts {
+            let model = attempt.model.as_str();
+            let outcome = attempt.outcome.as_str();
+            if model.trim().is_empty()
+                || !expected_models.contains(model)
+                || !matches!(outcome, "admitted" | "started" | "completed" | "failed")
                 || !models.insert(model)
             {
                 bail!("supervised model attempt ledger is invalid");
             }
+            let backtest = results.join(format!("{model}-supervised-backtest.json"));
+            let candidate = results.join(format!("{model}-supervised-candidate.json"));
+            let has_backtest = backtest.try_exists()?;
+            let has_candidate = candidate.try_exists()?;
+            match outcome {
+                "completed" if has_backtest && has_candidate => {}
+                "completed" => {
+                    bail!("completed supervised model attempt is missing its artifacts")
+                }
+                _ if has_backtest || has_candidate => {
+                    bail!("non-completed supervised model attempt has model artifacts")
+                }
+                _ => {}
+            }
+        }
+        if models != expected_models {
+            bail!("supervised model attempt ledger model set is incomplete");
+        }
+        if results
+            .join("supervised-model-selection.json")
+            .try_exists()?
+            && ledger
+                .attempts
+                .iter()
+                .any(|attempt| attempt.outcome != "completed")
+        {
+            bail!("supervised model selection has incomplete model attempts");
         }
         return Ok(Some(models.len()));
     }
@@ -2289,6 +2344,48 @@ fn write_research_plan_create_once(
     Ok(())
 }
 
+pub(crate) fn validate_terminal_mission_revision_binding(
+    mission: &alpha_domain::CexResearchMissionArtifactV1,
+    request: &CampaignRequest,
+) -> anyhow::Result<()> {
+    let expected = &request.research_plan.search_policy_revision;
+    match (
+        expected.research_delta.as_ref(),
+        mission.spec.research_delta.as_ref(),
+    ) {
+        (None, None) => {}
+        (Some(expected_delta), Some(observed_delta)) if expected_delta == observed_delta => {
+            let rebuilt = CexCampaignSearchPolicyRevisionV1::new_typed(
+                None,
+                expected.position_policy,
+                CexCampaignResearchDeltaV1 {
+                    feature_fields: expected_delta.feature_fields.clone(),
+                    operators: expected_delta.operators.clone(),
+                    windows: expected_delta.windows.clone(),
+                    ridge_l2: expected_delta.ridge_l2,
+                    cart_max_depth: expected_delta.cart_max_depth,
+                    cart_min_leaf: expected_delta.cart_min_leaf,
+                },
+            )?;
+            if rebuilt.revision_id != expected.revision_id {
+                bail!("terminal Mission delta does not recompute the approved revision ID");
+            }
+        }
+        _ => bail!("terminal Mission research delta differs from the approved revision"),
+    }
+    let expected_decision_hash = expected
+        .position_policy
+        .decision_policy()
+        .content_hash()
+        .map_err(anyhow::Error::msg)?;
+    if mission.spec.policies.supervised_decision.id != expected.revision_id
+        || mission.spec.policies.supervised_decision.content_sha256 != expected_decision_hash
+    {
+        bail!("terminal Mission decision policy revision differs from the approved revision");
+    }
+    Ok(())
+}
+
 fn validate_existing_follow_up_plan(
     plan: &CexCampaignResearchPlanV1,
     loaded: &LoadedRequest,
@@ -2324,8 +2421,13 @@ fn validate_existing_follow_up_plan(
     {
         bail!("existing research plan does not match the parent Campaign evidence");
     }
+    let expected_feature_fields = expected_revision
+        .research_delta
+        .as_ref()
+        .map(|delta| delta.feature_fields.clone())
+        .unwrap_or_else(|| loaded.request.research_plan.feature_fields.clone());
     if plan.focus_field != loaded.request.research_plan.focus_field
-        || plan.feature_fields != loaded.request.research_plan.feature_fields
+        || plan.feature_fields != expected_feature_fields
     {
         bail!("existing research plan changed fields outside the learning directive");
     }
@@ -2407,6 +2509,7 @@ pub(crate) fn readback_pre_holdout_terminal_into(
         let mission: alpha_domain::CexResearchMissionArtifactV1 =
             serde_json::from_slice(&std::fs::read(&mission_path)?)?;
         mission.validate()?;
+        validate_terminal_mission_revision_binding(&mission, request)?;
         if mission.semantic_id()? != expected.mission_id
             || mission.spec.inputs.feature.content_sha256 != request.feature_sha256
             || mission.spec.inputs.materialization.content_sha256 != request.materialization_sha256
@@ -2414,8 +2517,6 @@ pub(crate) fn readback_pre_holdout_terminal_into(
             || mission.spec.feature_fields != request.research_plan.feature_fields
             || mission.spec.search.seed != round.seed
             || mission.spec.search.multiple_testing_trials != request.declared_total_trials
-            || mission.spec.policies.supervised_decision.id
-                != request.research_plan.search_policy_revision.revision_id
             || mission.spec.holdout.holdout_id != request.holdout_id
             || mission.spec.holdout.state != alpha_domain::CexResearchHoldoutStateV1::Unopened
         {
@@ -3752,6 +3853,76 @@ mod tests {
     }
 
     #[test]
+    fn typed_trial_reservation_includes_the_supervised_model_upper_bound() {
+        let mut loaded = loaded_request_for_learning();
+        let parent_revision_id = loaded
+            .request
+            .research_plan
+            .search_policy_revision
+            .revision_id
+            .clone();
+        let revision = CexCampaignSearchPolicyRevisionV1::new_typed(
+            Some(parent_revision_id.clone()),
+            CexCampaignPositionPolicyV1::HystereticCostAware,
+            CexCampaignResearchDeltaV1 {
+                feature_fields: vec!["book_imbalance_top5".to_string()],
+                operators: vec![hft_factor_dsl::FactorOperator::ZScore],
+                windows: vec![20],
+                ridge_l2: 1.0e-6,
+                cart_max_depth: 3,
+                cart_min_leaf: 5,
+            },
+        )
+        .unwrap();
+        let declared_revision = CexCampaignSearchPolicyRevisionV1::new_typed(
+            None,
+            revision.position_policy,
+            CexCampaignResearchDeltaV1 {
+                feature_fields: revision
+                    .research_delta
+                    .as_ref()
+                    .unwrap()
+                    .feature_fields
+                    .clone(),
+                operators: revision.research_delta.as_ref().unwrap().operators.clone(),
+                windows: revision.research_delta.as_ref().unwrap().windows.clone(),
+                ridge_l2: revision.research_delta.as_ref().unwrap().ridge_l2,
+                cart_max_depth: revision.research_delta.as_ref().unwrap().cart_max_depth,
+                cart_min_leaf: revision.research_delta.as_ref().unwrap().cart_min_leaf,
+            },
+        )
+        .unwrap();
+        loaded.request.research_plan.allowed_search_policy_revisions = vec![
+            CexCampaignSearchPolicyRevisionV1::canonical(),
+            declared_revision,
+        ];
+        let result = negative_campaign_result(&loaded);
+        let result_sha256 = "9".repeat(64);
+        let parent = CexCampaignResearchParentV1 {
+            campaign_id: loaded.request.campaign_id.clone(),
+            request_sha256: loaded.sha256.clone(),
+            campaign_result_sha256: result_sha256.clone(),
+        };
+        let directive = CexCampaignLearningDirectiveV1::new(
+            &parent,
+            CexCampaignFailureClassV1::OvertradeCapacity,
+            parent_revision_id,
+            revision.revision_id.clone(),
+        )
+        .unwrap();
+        let plan = follow_up_plan(
+            &loaded,
+            &result_sha256,
+            directive,
+            revision,
+            campaign_research_evidence_signature(&loaded.request, &result).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(plan.max_candidates().unwrap(), 1);
+        assert_eq!(declared_total_trials_for_rounds(&plan, 2).unwrap(), 8);
+    }
+
+    #[test]
     fn no_trades_rejects_when_all_prediction_identity_deltas_are_exhausted() {
         let mut loaded = loaded_request_for_learning();
         let identity_ids = loaded
@@ -3843,6 +4014,15 @@ mod tests {
             .iter()
             .any(|field| field == &plan.focus_field));
         plan.validate().unwrap();
+        validate_existing_follow_up_plan(
+            &plan,
+            &loaded,
+            &result_sha256,
+            plan.learning_directive.as_ref().unwrap(),
+            &plan.search_policy_revision,
+            plan.parent_evidence_signature.as_ref().unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -4077,6 +4257,37 @@ mod tests {
             persisted_supervised_model_attempt_count(root.path()).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn model_attempt_ledger_rejects_fake_or_incomplete_model_sets() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("supervised-model-attempts.json"),
+            serde_json::json!({
+                "schema_version": "cex-supervised-model-attempts-v1",
+                "attempts": [{"model": "x", "outcome": "admitted"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(persisted_supervised_model_attempt_count(root.path()).is_err());
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("supervised-model-attempts.json"),
+            serde_json::json!({
+                "schema_version": "cex-supervised-model-attempts-v1",
+                "attempts": [
+                    {"model": "ridge", "outcome": "completed"},
+                    {"model": "cart", "outcome": "completed"},
+                    {"model": "burn_mlp", "outcome": "completed"}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(persisted_supervised_model_attempt_count(root.path()).is_err());
     }
 
     #[test]

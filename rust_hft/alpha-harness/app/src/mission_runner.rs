@@ -93,6 +93,7 @@ const CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V2: &str = "cex-event-replay-receipt-v2";
 const CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V3: &str = "cex-event-replay-receipt-v3";
 const CEX_SUPERVISED_MODEL_SELECTION_SCHEMA_VERSION: &str = "cex-supervised-model-selection-v1";
 const CEX_SUPERVISED_MODEL_ATTEMPTS_SCHEMA_VERSION: &str = "cex-supervised-model-attempts-v1";
+pub(crate) const CEX_SUPERVISED_MODEL_NAMES: [&str; 3] = ["ridge", "cart", "burn_mlp"];
 // ponytail: fixed batching bounds checkpoint I/O; make it configurable only if recovery data requires it.
 const MCTS_CHECKPOINT_INTERVAL: u64 = 256;
 
@@ -2173,20 +2174,10 @@ fn run_cex_supervised_model_research(
             "walk_forward_folds": context.folds().len(),
         }),
     );
-    let mut attempts = [
-        CexSupervisedModelAttemptV1 {
-            model: "ridge".to_string(),
-            outcome: "admitted".to_string(),
-        },
-        CexSupervisedModelAttemptV1 {
-            model: "cart".to_string(),
-            outcome: "admitted".to_string(),
-        },
-        CexSupervisedModelAttemptV1 {
-            model: "burn_mlp".to_string(),
-            outcome: "admitted".to_string(),
-        },
-    ];
+    let mut attempts = CEX_SUPERVISED_MODEL_NAMES.map(|model| CexSupervisedModelAttemptV1 {
+        model: model.to_string(),
+        outcome: "admitted".to_string(),
+    });
     persist_supervised_model_attempts(results_dir, &attempts)?;
     let ridge = run_supervised_model_attempt(results_dir, &mut attempts, "ridge", || {
         evaluate_cex_supervised_model(context, factor_bank, ridge, decision_policy)
