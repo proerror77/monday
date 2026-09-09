@@ -16,14 +16,23 @@ pub enum ReferenceKind {
     OpenInterest,
 }
 
+/// Market discriminator for reference clocks. Metadata for the same symbol is
+/// independent across Spot and USD-M and must never share a monotonicity key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ReferenceMarket {
+    Spot,
+    Usdm,
+}
+
 #[derive(Debug, Default)]
 pub struct ReferenceClockValidator {
-    clocks: BTreeMap<(ReferenceKind, String), (u64, u64)>,
+    clocks: BTreeMap<(ReferenceMarket, ReferenceKind, String), (u64, u64)>,
 }
 
 impl ReferenceClockValidator {
     pub fn observe(
         &mut self,
+        market: ReferenceMarket,
         kind: ReferenceKind,
         symbol: &str,
         source_time_ms: u64,
@@ -37,7 +46,7 @@ impl ReferenceClockValidator {
                 validate_receive_clock(source_time_ms, received_at_ns)?
             }
         }
-        let key = (kind, symbol.to_owned());
+        let key = (market, kind, symbol.to_owned());
         if self
             .clocks
             .get(&key)
@@ -155,4 +164,43 @@ fn required_filter_decimal_with_zero_policy(
         bail!("exchangeInfo {filter_type} {field} must be {requirement}");
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reference_clock_monotonicity_is_scoped_by_market() {
+        let mut clocks = ReferenceClockValidator::default();
+        clocks
+            .observe(
+                ReferenceMarket::Spot,
+                ReferenceKind::Metadata,
+                "BTCUSDT",
+                1_700_000_000_000,
+                1_700_000_000_100_000_000,
+            )
+            .unwrap();
+        // A separate USD-M stream may begin at an earlier source clock for
+        // the same symbol without regressing the Spot stream.
+        clocks
+            .observe(
+                ReferenceMarket::Usdm,
+                ReferenceKind::Metadata,
+                "BTCUSDT",
+                1_699_999_999_999,
+                1_700_000_000_100_000_000,
+            )
+            .unwrap();
+        assert!(clocks
+            .observe(
+                ReferenceMarket::Spot,
+                ReferenceKind::Metadata,
+                "BTCUSDT",
+                1_699_999_999_999,
+                1_700_000_000_101_000_000,
+            )
+            .is_err());
+    }
 }

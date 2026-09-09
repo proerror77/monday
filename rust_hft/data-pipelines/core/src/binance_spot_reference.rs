@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use crate::binance_reference_common::{
     required_decimal, required_filter_decimal, required_filter_decimal_allow_zero, required_string,
-    required_u64, validate_receive_clock, ReferenceClockValidator, ReferenceKind,
+    required_u64, validate_receive_clock, ReferenceClockValidator, ReferenceKind, ReferenceMarket,
 };
 
 pub const REFERENCE_SCHEMA: &str = "binance.spot_reference.v1";
@@ -247,13 +247,16 @@ pub fn active_spot_instrument_rules(
     for raw in symbols {
         let symbol = required_string(raw, "symbol", EXCHANGE_INFO_ENDPOINT)?.to_ascii_uppercase();
         validate_spot_symbol(&symbol)?;
+        let requested = requested_symbols.is_some_and(|symbols| symbols.contains(&symbol));
+        if requested_symbols.is_some() && !requested {
+            continue;
+        }
         let status = required_string(raw, "status", EXCHANGE_INFO_ENDPOINT)?;
         let spot_allowed = raw
             .get("isSpotTradingAllowed")
             .and_then(Value::as_bool)
             .context("Spot exchangeInfo has invalid isSpotTradingAllowed")?;
         let has_spot_permission = permission_sets_include_spot(raw)?;
-        let requested = requested_symbols.is_some_and(|symbols| symbols.contains(&symbol));
         if status != "TRADING" || !spot_allowed || !has_spot_permission {
             if requested {
                 bail!("requested Spot symbol is not active and Spot-enabled: {symbol}");
@@ -317,6 +320,7 @@ pub fn observe_reference_clocks(
 ) -> Result<()> {
     for rule in rules {
         clocks.observe(
+            ReferenceMarket::Spot,
             ReferenceKind::Metadata,
             &rule.symbol,
             rule.source_time_ms,
@@ -331,19 +335,37 @@ fn permission_sets_include_spot(raw: &Value) -> Result<bool> {
         let groups = permission_sets
             .as_array()
             .context("Spot exchangeInfo permissionSets must be an array")?;
-        return Ok(groups.iter().any(|group| {
-            group.as_array().is_some_and(|permissions| {
-                permissions.iter().any(|permission| permission == "SPOT")
-            })
-        }));
+        let mut has_spot = false;
+        for group in groups {
+            let permissions = group
+                .as_array()
+                .context("Spot exchangeInfo permissionSets group must be an array")?;
+            for permission in permissions {
+                let permission = permission
+                    .as_str()
+                    .context("Spot exchangeInfo permission must be a string")?;
+                has_spot |= permission == "SPOT";
+            }
+        }
+        return Ok(has_spot);
     }
     if let Some(permissions) = raw.get("permissions") {
         let permissions = permissions
             .as_array()
             .context("Spot exchangeInfo permissions must be an array")?;
-        return Ok(permissions.iter().any(|permission| permission == "SPOT"));
+        return permissions
+            .iter()
+            .map(|permission| {
+                permission
+                    .as_str()
+                    .context("Spot exchangeInfo permission must be a string")
+            })
+            .try_fold(false, |has_spot, permission| {
+                let permission = permission?;
+                Ok(has_spot || permission == "SPOT")
+            });
     }
-    Ok(true)
+    bail!("Spot exchangeInfo is missing permissionSets or permissions")
 }
 
 fn optional_quantity_filter(raw: &Value, filter_type: &str) -> Result<Option<SpotQuantityFilter>> {
@@ -478,6 +500,98 @@ mod tests {
                 {"filterType":"MIN_NOTIONAL","minNotional":"5","applyToMarket":true,"avgPriceMins":5}
             ]
         })
+    }
+
+    #[test]
+    fn requested_symbols_are_a_strict_output_whitelist() {
+        let exchange_info = json!({
+            "symbols": [symbol("BTCUSDT"), symbol("ETHUSDT")]
+        });
+        let requested = BTreeSet::from(["BTCUSDT".to_owned()]);
+
+        let rules = active_spot_instrument_rules(
+            &exchange_info,
+            SOURCE_MS,
+            CLOCK_RECEIVED_NS,
+            EXCHANGE_RECEIVED_NS,
+            Some(&requested),
+        )
+        .unwrap();
+
+        assert_eq!(
+            rules
+                .iter()
+                .map(|rule| rule.symbol.as_str())
+                .collect::<Vec<_>>(),
+            ["BTCUSDT"]
+        );
+    }
+
+    #[test]
+    fn missing_or_malformed_spot_permissions_fail_closed() {
+        let mut missing = symbol("BTCUSDT");
+        missing.as_object_mut().unwrap().remove("permissionSets");
+        assert!(active_spot_instrument_rules(
+            &json!({"symbols": [missing]}),
+            SOURCE_MS,
+            CLOCK_RECEIVED_NS,
+            EXCHANGE_RECEIVED_NS,
+            None,
+        )
+        .is_err());
+
+        let mut malformed_group = symbol("BTCUSDT");
+        malformed_group["permissionSets"] = json!(["SPOT"]);
+        assert!(active_spot_instrument_rules(
+            &json!({"symbols": [malformed_group]}),
+            SOURCE_MS,
+            CLOCK_RECEIVED_NS,
+            EXCHANGE_RECEIVED_NS,
+            None,
+        )
+        .is_err());
+
+        let mut malformed_permission = symbol("BTCUSDT");
+        malformed_permission["permissionSets"] = json!([["SPOT", 1]]);
+        assert!(active_spot_instrument_rules(
+            &json!({"symbols": [malformed_permission]}),
+            SOURCE_MS,
+            CLOCK_RECEIVED_NS,
+            EXCHANGE_RECEIVED_NS,
+            None,
+        )
+        .is_err());
+
+        let mut alternate = symbol("BTCUSDT");
+        alternate.as_object_mut().unwrap().remove("permissionSets");
+        alternate["permissions"] = json!(["SPOT"]);
+        assert_eq!(
+            active_spot_instrument_rules(
+                &json!({"symbols": [alternate]}),
+                SOURCE_MS,
+                CLOCK_RECEIVED_NS,
+                EXCHANGE_RECEIVED_NS,
+                None,
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+
+        let mut malformed_alternate = symbol("BTCUSDT");
+        malformed_alternate
+            .as_object_mut()
+            .unwrap()
+            .remove("permissionSets");
+        malformed_alternate["permissions"] = json!(["SPOT", 1]);
+        assert!(active_spot_instrument_rules(
+            &json!({"symbols": [malformed_alternate]}),
+            SOURCE_MS,
+            CLOCK_RECEIVED_NS,
+            EXCHANGE_RECEIVED_NS,
+            None,
+        )
+        .is_err());
     }
 
     fn exchange_info() -> Value {

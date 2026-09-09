@@ -13,6 +13,7 @@ use data::binance_spot_reference::{
     EXCHANGE_INFO_ENDPOINT, OFFICIAL_SOURCE_ORIGIN, SERVER_TIME_ENDPOINT,
 };
 use std::collections::BTreeSet;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use crate::binance_usdm_reference_collector::{HttpReferenceSource, TimedJson};
 
@@ -112,9 +113,42 @@ pub async fn collect_and_publish_spot_reference(
     clocks: &mut ReferenceClockValidator,
     artifact_config: &SpotReferenceArtifactConfig,
 ) -> anyhow::Result<PublishedSpotReferenceArtifact> {
-    let collected = collect_spot_reference(source, requested_symbols, clocks).await?;
-    let artifact = publish_spot_reference(
+    collect_and_publish_spot_reference_with_clock(
+        source,
+        requested_symbols,
+        clocks,
         artifact_config,
+        current_receive_clock_ns,
+    )
+    .await
+}
+
+/// Collect public Spot metadata and capture the publication clock after all
+/// network responses have arrived. The clock provider is injectable so tests
+/// can prove receive ordering without fabricating a future timestamp in the
+/// production path.
+pub async fn collect_and_publish_spot_reference_with_clock<F>(
+    source: &dyn SpotReferenceSource,
+    requested_symbols: Option<&BTreeSet<String>>,
+    clocks: &mut ReferenceClockValidator,
+    artifact_config: &SpotReferenceArtifactConfig,
+    clock: F,
+) -> anyhow::Result<PublishedSpotReferenceArtifact>
+where
+    F: FnOnce() -> anyhow::Result<u64>,
+{
+    let collected = collect_spot_reference(source, requested_symbols, clocks).await?;
+    let observed_at_ns = clock()?;
+    if observed_at_ns < collected.exchange_info_received_at_ns() {
+        anyhow::bail!("Spot publication clock precedes exchangeInfo receipt");
+    }
+    let publication_config = SpotReferenceArtifactConfig {
+        output_root: artifact_config.output_root.clone(),
+        observed_at_ns,
+        max_staleness_ms: artifact_config.max_staleness_ms,
+    };
+    let artifact = publish_spot_reference(
+        &publication_config,
         collected.source_origin(),
         collected.source_clock_received_at_ns(),
         collected.exchange_info_received_at_ns(),
@@ -122,6 +156,12 @@ pub async fn collect_and_publish_spot_reference(
     )?;
     verify_spot_reference_artifact(&artifact, &artifact.data_sha256, &artifact.manifest_sha256)?;
     Ok(artifact)
+}
+
+fn current_receive_clock_ns() -> anyhow::Result<u64> {
+    Ok(u64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+    )?)
 }
 
 #[cfg(test)]
@@ -212,15 +252,19 @@ mod tests {
     #[tokio::test]
     async fn collect_and_publish_seals_a_public_spot_triplet() {
         let temp = tempdir().unwrap();
-        let artifact = collect_and_publish_spot_reference(
+        let artifact = collect_and_publish_spot_reference_with_clock(
             &source(),
             None,
             &mut ReferenceClockValidator::default(),
             &SpotReferenceArtifactConfig {
                 output_root: fs::canonicalize(temp.path()).unwrap(),
-                observed_at_ns: EXCHANGE_RECEIVED_NS + 100_000_000,
+                // This caller value is intentionally before the exchangeInfo
+                // receipt. The collection wrapper must use its post-collection
+                // clock provider instead of publishing with this stale value.
+                observed_at_ns: CLOCK_RECEIVED_NS,
                 max_staleness_ms: 1_000,
             },
+            || Ok(EXCHANGE_RECEIVED_NS + 100_000_000),
         )
         .await
         .unwrap();
@@ -239,6 +283,26 @@ mod tests {
             .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn collection_rejects_a_publication_clock_before_the_last_response() {
+        let temp = tempdir().unwrap();
+        let error = collect_and_publish_spot_reference_with_clock(
+            &source(),
+            None,
+            &mut ReferenceClockValidator::default(),
+            &SpotReferenceArtifactConfig {
+                output_root: fs::canonicalize(temp.path()).unwrap(),
+                observed_at_ns: CLOCK_RECEIVED_NS,
+                max_staleness_ms: 1_000,
+            },
+            || Ok(CLOCK_RECEIVED_NS),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("precedes exchangeInfo receipt"));
     }
 
     #[tokio::test]

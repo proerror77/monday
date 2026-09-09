@@ -2,8 +2,8 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use data::binance_usdm_reference::{
     active_perpetual_contracts, mark_index_funding_observations, open_interest_observation,
-    CompleteReferenceBatch, ReferenceClockValidator, ReferenceKind, EXCHANGE_INFO_ENDPOINT,
-    OPEN_INTEREST_ENDPOINT, PREMIUM_INDEX_ENDPOINT, SERVER_TIME_ENDPOINT,
+    CompleteReferenceBatch, ReferenceClockValidator, ReferenceKind, ReferenceMarket,
+    EXCHANGE_INFO_ENDPOINT, OPEN_INTEREST_ENDPOINT, PREMIUM_INDEX_ENDPOINT, SERVER_TIME_ENDPOINT,
 };
 use futures::{stream, StreamExt, TryStreamExt};
 use serde_json::Value;
@@ -251,6 +251,7 @@ async fn collect_complete_reference_batch_once(
     let batch = CompleteReferenceBatch::new(contracts, marks, open_interest)?;
     for row in batch.contracts() {
         clocks.observe(
+            ReferenceMarket::Usdm,
             ReferenceKind::Metadata,
             &row.symbol,
             row.source_time_ms,
@@ -259,6 +260,7 @@ async fn collect_complete_reference_batch_once(
     }
     for row in batch.mark_index_funding() {
         clocks.observe(
+            ReferenceMarket::Usdm,
             ReferenceKind::MarkIndexFunding,
             &row.symbol,
             row.source_time_ms,
@@ -267,6 +269,7 @@ async fn collect_complete_reference_batch_once(
     }
     for row in batch.open_interest() {
         clocks.observe(
+            ReferenceMarket::Usdm,
             ReferenceKind::OpenInterest,
             &row.symbol,
             row.source_time_ms,

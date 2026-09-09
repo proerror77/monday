@@ -4,7 +4,7 @@ use crate::binance_usdm_reference_artifact::{read_bound_file, rename_noreplace, 
 use crate::polymarket_upload::ensure_canonical_directory;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
-use data::binance_reference_common::validate_receive_clock;
+use data::binance_reference_common::validate_source_clock_not_future;
 use data::binance_spot_reference::{
     SpotInstrumentRules, SpotReferenceBatch, EXCHANGE_INFO_ENDPOINT, OFFICIAL_SOURCE_ORIGIN,
     REFERENCE_SCHEMA, SERVER_TIME_ENDPOINT,
@@ -265,7 +265,10 @@ fn coverage(
 ) -> Result<SpotCoverage> {
     let observed_at_ms = observed_at_ns / 1_000_000;
     for rule in batch.rules() {
-        validate_receive_clock(rule.source_time_ms, observed_at_ns)?;
+        // Publication may happen later than the strict source->response
+        // receive bound. Keep the configured staleness policy separate from
+        // the future-direction check used for the publication clock.
+        validate_source_clock_not_future(rule.source_time_ms, observed_at_ns)?;
     }
     let stale_metadata = batch
         .rules()
@@ -309,6 +312,10 @@ fn validate_manifest(
         || source_times.0 != source_times.1
         || manifest.source_clock_received_at_ns != received_times.0
         || manifest.exchange_info_received_at_ns != received_times.1
+        || batch.rules().iter().any(|rule| {
+            rule.source_clock_received_at_ns != manifest.source_clock_received_at_ns
+                || rule.received_at_ns != manifest.exchange_info_received_at_ns
+        })
         || manifest.observed_at_ns == 0
         || manifest.max_staleness_ms > 300_000
         || received_times.0 > received_times.1
@@ -599,6 +606,57 @@ mod tests {
             CLOCK_RECEIVED_NS,
             EXCHANGE_RECEIVED_NS,
             &batch(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn publication_staleness_policy_is_independent_of_strict_receive_delay() {
+        let temp = tempdir().unwrap();
+        let mut publication = config(fs::canonicalize(temp.path()).unwrap());
+        publication.observed_at_ns = EXCHANGE_RECEIVED_NS + 31_000_000_000;
+        publication.max_staleness_ms = 60_000;
+
+        publish_spot_reference(
+            &publication,
+            OFFICIAL_SOURCE_ORIGIN,
+            CLOCK_RECEIVED_NS,
+            EXCHANGE_RECEIVED_NS,
+            &batch(),
+        )
+        .unwrap();
+
+        let mut too_old = publication;
+        too_old.observed_at_ns = EXCHANGE_RECEIVED_NS + 61_000_000_000;
+        assert!(publish_spot_reference(
+            &too_old,
+            OFFICIAL_SOURCE_ORIGIN,
+            CLOCK_RECEIVED_NS,
+            EXCHANGE_RECEIVED_NS,
+            &batch(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn publication_rejects_mixed_per_row_receive_clocks() {
+        let temp = tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let first = batch();
+        let mut second_rule = first.rules()[0].clone();
+        second_rule.symbol = "ETHUSDT".to_owned();
+        second_rule.base_asset = "ETH".to_owned();
+        second_rule.received_at_ns += 1;
+        let mixed = SpotReferenceBatch::new(vec![first.rules()[0].clone(), second_rule]).unwrap();
+        let mut publication = config(root);
+        publication.max_staleness_ms = 10_000;
+
+        assert!(publish_spot_reference(
+            &publication,
+            OFFICIAL_SOURCE_ORIGIN,
+            CLOCK_RECEIVED_NS,
+            EXCHANGE_RECEIVED_NS + 1,
+            &mixed,
         )
         .is_err());
     }

@@ -12,7 +12,9 @@ use crate::binance_reference_common::{
     required_decimal, required_filter_decimal, required_string, required_u64,
     validate_receive_clock, validate_source_clock_not_future, validate_symbol,
 };
-pub use crate::binance_reference_common::{ReferenceClockValidator, ReferenceKind};
+pub use crate::binance_reference_common::{
+    ReferenceClockValidator, ReferenceKind, ReferenceMarket,
+};
 
 pub const REFERENCE_SCHEMA: &str = "binance.usdm_reference.v3";
 pub const EXCHANGE_INFO_ENDPOINT: &str = "/fapi/v1/exchangeInfo";
@@ -690,6 +692,7 @@ mod tests {
         let mut clocks = ReferenceClockValidator::default();
         clocks
             .observe(
+                ReferenceMarket::Usdm,
                 ReferenceKind::OpenInterest,
                 "BTCUSDT",
                 SOURCE_MS + 1,
@@ -698,6 +701,7 @@ mod tests {
             .unwrap();
         assert!(clocks
             .observe(
+                ReferenceMarket::Usdm,
                 ReferenceKind::OpenInterest,
                 "BTCUSDT",
                 SOURCE_MS,
