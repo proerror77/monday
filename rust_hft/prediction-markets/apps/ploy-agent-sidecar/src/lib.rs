@@ -1722,7 +1722,7 @@ mod tests {
         );
 
         let mut wrong_task = make_request(
-            "production-writer-evidence-wrong-task",
+            "production-writer-evidence-wrong-horizon",
             refs_value.clone(),
             "diagnostic",
             "completion_signal = \"required\"\nrequires_full_depth_clob = true\nrequires_operator_approval = true",
@@ -1738,17 +1738,17 @@ mod tests {
         sidecar
             .run_cycle()
             .expect("reject task mismatch before model");
-        let records = fs::read_to_string(&store.runs_path).expect("task mismatch records");
+        let records = fs::read_to_string(&store.runs_path).expect("horizon mismatch records");
         let wrong_task_record = records
             .lines()
             .map(|line| serde_json::from_str::<AgentRunRecord>(line).unwrap())
-            .find(|record| record.run_id == "production-writer-evidence-wrong-task")
+            .find(|record| record.run_id == "production-writer-evidence-wrong-horizon")
             .unwrap();
         assert_eq!(wrong_task_record.status, "failed");
         assert!(wrong_task_record
             .failure_reason
             .as_deref()
-            .is_some_and(|reason| reason.contains("verified Mission task")));
+            .is_some_and(|reason| reason.contains("prediction evidence horizon")));
         assert_eq!(
             fs::read_to_string(mock_path.with_extension("calls"))
                 .unwrap()

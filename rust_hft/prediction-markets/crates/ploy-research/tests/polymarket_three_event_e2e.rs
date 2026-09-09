@@ -978,6 +978,61 @@ fn verify_sidecar_evidence_handoff(
     let mut side_mismatch = refs.clone();
     side_mismatch.reports[1].report_kind = "full_depth_execution_down".to_string();
     assert!(verify_prediction_evidence(&side_mismatch).is_err());
+
+    let malformed_settlement = |name: &str, mutate: &dyn Fn(&mut Value)| {
+        let source = root.join(&refs.reports[0].artifact.path);
+        let mut value: Value = serde_json::from_slice(&fs::read(source).unwrap()).unwrap();
+        mutate(&mut value);
+        let path = root.join("sidecar-evidence-reports").join(name);
+        let digest = publish_json(&path, &value);
+        let mut malformed = refs.clone();
+        malformed.reports[0].artifact.path = path
+            .strip_prefix(root)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        malformed.reports[0].artifact.artifact_sha256 = digest.clone();
+        malformed.reports[0].report_sha256 = digest;
+        assert!(verify_prediction_evidence(&malformed).is_err());
+    };
+    malformed_settlement("negative-settlement-n-string.json", &|value| {
+        value["settlement_probability"]["baselines"] = json!([{
+            "model": "q_naive_50_50",
+            "n": "garbage",
+            "avg_predicted_q": 0.5,
+            "actual_win_rate": 0.5,
+            "brier_score": 0.1,
+            "log_loss": 0.1,
+            "expected_calibration_error": 0.1,
+            "avg_edge": 0.0,
+            "edge_bucket_monotonic_non_decreasing": true,
+            "top_edge_count": 0
+        }]);
+    });
+    malformed_settlement("negative-settlement-q-string.json", &|value| {
+        value["settlement_probability"]["baselines"] = json!([{
+            "model": "q_naive_50_50",
+            "n": 1,
+            "avg_predicted_q": "garbage",
+            "actual_win_rate": 0.5,
+            "brier_score": 0.1,
+            "log_loss": 0.1,
+            "expected_calibration_error": 0.1,
+            "avg_edge": 0.0,
+            "edge_bucket_monotonic_non_decreasing": true,
+            "top_edge_count": 0
+        }]);
+    });
+    malformed_settlement("negative-settlement-pass-string.json", &|value| {
+        value["settlement_probability"]["anti_overfit"] = json!([{
+            "model": "q_naive_50_50",
+            "test": "anti_overfit",
+            "n": 1,
+            "observed_edge_win_rank_ic": 0.0,
+            "perturbed_edge_win_rank_ic": 0.0,
+            "pass": "false"
+        }]);
+    });
     refs
 }
 

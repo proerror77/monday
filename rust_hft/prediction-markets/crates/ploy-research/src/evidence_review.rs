@@ -904,24 +904,148 @@ struct SettlementBaselineReportPayload {
     snapshot_contract_hash: String,
     settlement_probability: SettlementProbabilityPayload,
     settlement_probability_walk_forward: SettlementWalkForwardPayload,
-    settlement_verdict_walk_forward: SettlementWalkForwardPayload,
+    settlement_verdict_walk_forward: SettlementVerdictWalkForwardPayload,
     promotion_gate: SettlementPromotionGatePayload,
 }
 
 #[derive(Debug, Deserialize)]
 struct SettlementProbabilityPayload {
-    baselines: Vec<Value>,
-    calibration: Vec<Value>,
-    edge_buckets: Vec<Value>,
-    anti_overfit: Vec<Value>,
-    symbol_holdouts: Vec<Value>,
-    ablations: Vec<Value>,
+    baselines: Vec<SettlementBaselineRowWire>,
+    calibration: Vec<SettlementCalibrationRowWire>,
+    edge_buckets: Vec<SettlementEdgeBucketRowWire>,
+    anti_overfit: Vec<SettlementAntiOverfitRowWire>,
+    symbol_holdouts: Vec<SettlementSymbolHoldoutRowWire>,
+    ablations: Vec<SettlementAblationRowWire>,
 }
 
 #[derive(Debug, Deserialize)]
 struct SettlementWalkForwardPayload {
-    windows: Vec<Value>,
-    aggregates: Vec<Value>,
+    windows: Vec<SettlementWalkForwardWindowWire>,
+    aggregates: Vec<SettlementWalkForwardAggregateWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SettlementVerdictWalkForwardPayload {
+    windows: Vec<SettlementVerdictWindowWire>,
+    aggregates: Vec<SettlementVerdictAggregateWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SettlementBaselineRowWire {
+    model: String,
+    n: usize,
+    avg_predicted_q: Option<f64>,
+    actual_win_rate: Option<f64>,
+    brier_score: Option<f64>,
+    log_loss: Option<f64>,
+    expected_calibration_error: Option<f64>,
+    avg_edge: Option<f64>,
+    edge_bucket_monotonic_non_decreasing: bool,
+    top_edge_count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct SettlementCalibrationRowWire {
+    model: String,
+    q_bucket: String,
+    count: usize,
+    avg_predicted_q: Option<f64>,
+    actual_win_rate: Option<f64>,
+    calibration_error: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SettlementEdgeBucketRowWire {
+    model: String,
+    edge_bucket: String,
+    count: usize,
+    avg_edge: Option<f64>,
+    avg_predicted_q: Option<f64>,
+    actual_win_rate: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SettlementAntiOverfitRowWire {
+    model: String,
+    test: String,
+    n: usize,
+    observed_edge_win_rank_ic: Option<f64>,
+    perturbed_edge_win_rank_ic: Option<f64>,
+    pass: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SettlementSymbolHoldoutRowWire {
+    model: String,
+    symbol: String,
+    n: usize,
+    edge_win_rank_ic: Option<f64>,
+    pass: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SettlementAblationRowWire {
+    model: String,
+    reference_model: String,
+    n: usize,
+    delta_brier_score: Option<f64>,
+    delta_log_loss: Option<f64>,
+    delta_expected_calibration_error: Option<f64>,
+    improves_error: bool,
+    improves_top_edge_pnl: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SettlementWalkForwardWindowWire {
+    window_index: usize,
+    model: String,
+    train_start: DateTime<Utc>,
+    train_end: DateTime<Utc>,
+    test_start: DateTime<Utc>,
+    test_end: DateTime<Utc>,
+    train_n: usize,
+    test_n: usize,
+    train_brier_score: Option<f64>,
+    test_brier_score: Option<f64>,
+    train_log_loss: Option<f64>,
+    test_log_loss: Option<f64>,
+    train_expected_calibration_error: Option<f64>,
+    test_expected_calibration_error: Option<f64>,
+    test_edge_bucket_monotonic_non_decreasing: bool,
+    pass: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SettlementWalkForwardAggregateWire {
+    model: String,
+    windows: usize,
+    positive_window_ratio: Option<f64>,
+    pass_window_ratio: Option<f64>,
+    avg_test_brier_score: Option<f64>,
+    avg_test_log_loss: Option<f64>,
+    avg_test_expected_calibration_error: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SettlementVerdictWindowWire {
+    window_index: usize,
+    model: String,
+    test_n: usize,
+    test_brier_score: Option<f64>,
+    test_log_loss: Option<f64>,
+    test_expected_calibration_error: Option<f64>,
+    pass: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SettlementVerdictAggregateWire {
+    model: String,
+    windows: usize,
+    oos_rows: usize,
+    pass_window_ratio: Option<f64>,
+    avg_test_brier_score: Option<f64>,
+    avg_test_log_loss: Option<f64>,
+    avg_test_expected_calibration_error: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -967,6 +1091,318 @@ struct FullDepthExecutionRowPayload {
     side: String,
     stake_usd: f64,
     entry_fillable: bool,
+}
+
+fn validate_optional_finite(
+    value: Option<f64>,
+    field: &str,
+    minimum: Option<f64>,
+    maximum: Option<f64>,
+) -> Result<(), String> {
+    if let Some(value) = value {
+        if !value.is_finite()
+            || minimum.is_some_and(|minimum| value < minimum)
+            || maximum.is_some_and(|maximum| value > maximum)
+        {
+            return Err(format!(
+                "typed settlement report field {field} is out of range"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_nonempty_text(value: &str, field: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("typed settlement report field {field} is empty"));
+    }
+    Ok(())
+}
+
+fn validate_settlement_probability_rows(
+    report: &SettlementProbabilityPayload,
+) -> Result<(), String> {
+    for row in &report.baselines {
+        validate_nonempty_text(&row.model, "baseline.model")?;
+        if row.n == 0 || row.top_edge_count > row.n {
+            return Err("typed baseline counts are invalid".into());
+        }
+        validate_optional_finite(
+            row.avg_predicted_q,
+            "baseline.avg_predicted_q",
+            Some(0.0),
+            Some(1.0),
+        )?;
+        validate_optional_finite(
+            row.actual_win_rate,
+            "baseline.actual_win_rate",
+            Some(0.0),
+            Some(1.0),
+        )?;
+        validate_optional_finite(row.brier_score, "baseline.brier_score", Some(0.0), None)?;
+        validate_optional_finite(row.log_loss, "baseline.log_loss", Some(0.0), None)?;
+        validate_optional_finite(
+            row.expected_calibration_error,
+            "baseline.expected_calibration_error",
+            Some(0.0),
+            Some(1.0),
+        )?;
+        validate_optional_finite(row.avg_edge, "baseline.avg_edge", None, None)?;
+        let _ = row.edge_bucket_monotonic_non_decreasing;
+    }
+    for row in &report.calibration {
+        validate_nonempty_text(&row.model, "calibration.model")?;
+        validate_nonempty_text(&row.q_bucket, "calibration.q_bucket")?;
+        if row.count == 0 {
+            return Err("typed calibration count must be positive".into());
+        }
+        validate_optional_finite(
+            row.avg_predicted_q,
+            "calibration.avg_predicted_q",
+            Some(0.0),
+            Some(1.0),
+        )?;
+        validate_optional_finite(
+            row.actual_win_rate,
+            "calibration.actual_win_rate",
+            Some(0.0),
+            Some(1.0),
+        )?;
+        validate_optional_finite(
+            row.calibration_error,
+            "calibration.calibration_error",
+            Some(0.0),
+            Some(1.0),
+        )?;
+    }
+    for row in &report.edge_buckets {
+        validate_nonempty_text(&row.model, "edge_bucket.model")?;
+        validate_nonempty_text(&row.edge_bucket, "edge_bucket.edge_bucket")?;
+        if row.count == 0 {
+            return Err("typed edge-bucket count must be positive".into());
+        }
+        validate_optional_finite(row.avg_edge, "edge_bucket.avg_edge", None, None)?;
+        validate_optional_finite(
+            row.avg_predicted_q,
+            "edge_bucket.avg_predicted_q",
+            Some(0.0),
+            Some(1.0),
+        )?;
+        validate_optional_finite(
+            row.actual_win_rate,
+            "edge_bucket.actual_win_rate",
+            Some(0.0),
+            Some(1.0),
+        )?;
+    }
+    for row in &report.anti_overfit {
+        validate_nonempty_text(&row.model, "anti_overfit.model")?;
+        validate_nonempty_text(&row.test, "anti_overfit.test")?;
+        if row.n == 0 {
+            return Err("typed anti-overfit count must be positive".into());
+        }
+        validate_optional_finite(
+            row.observed_edge_win_rank_ic,
+            "anti_overfit.observed_edge_win_rank_ic",
+            Some(-1.0),
+            Some(1.0),
+        )?;
+        validate_optional_finite(
+            row.perturbed_edge_win_rank_ic,
+            "anti_overfit.perturbed_edge_win_rank_ic",
+            Some(-1.0),
+            Some(1.0),
+        )?;
+        let _ = row.pass;
+    }
+    for row in &report.symbol_holdouts {
+        validate_nonempty_text(&row.model, "symbol_holdout.model")?;
+        validate_nonempty_text(&row.symbol, "symbol_holdout.symbol")?;
+        if row.n == 0 {
+            return Err("typed symbol-holdout count must be positive".into());
+        }
+        validate_optional_finite(
+            row.edge_win_rank_ic,
+            "symbol_holdout.edge_win_rank_ic",
+            Some(-1.0),
+            Some(1.0),
+        )?;
+        let _ = row.pass;
+    }
+    for row in &report.ablations {
+        validate_nonempty_text(&row.model, "ablation.model")?;
+        validate_nonempty_text(&row.reference_model, "ablation.reference_model")?;
+        if row.n == 0 {
+            return Err("typed ablation count must be positive".into());
+        }
+        validate_optional_finite(
+            row.delta_brier_score,
+            "ablation.delta_brier_score",
+            None,
+            None,
+        )?;
+        validate_optional_finite(row.delta_log_loss, "ablation.delta_log_loss", None, None)?;
+        validate_optional_finite(
+            row.delta_expected_calibration_error,
+            "ablation.delta_expected_calibration_error",
+            None,
+            None,
+        )?;
+        let _ = (row.improves_error, row.improves_top_edge_pnl);
+    }
+    Ok(())
+}
+
+fn validate_settlement_walk_forward_rows(
+    report: &SettlementWalkForwardPayload,
+) -> Result<(), String> {
+    for row in &report.windows {
+        validate_nonempty_text(&row.model, "walk_forward.model")?;
+        if row.train_n == 0
+            || row.test_n == 0
+            || row.train_start >= row.train_end
+            || row.test_start >= row.test_end
+        {
+            return Err("typed walk-forward window has invalid counts or time bounds".into());
+        }
+        validate_optional_finite(
+            row.train_brier_score,
+            "walk_forward.train_brier_score",
+            Some(0.0),
+            None,
+        )?;
+        validate_optional_finite(
+            row.test_brier_score,
+            "walk_forward.test_brier_score",
+            Some(0.0),
+            None,
+        )?;
+        validate_optional_finite(
+            row.train_log_loss,
+            "walk_forward.train_log_loss",
+            Some(0.0),
+            None,
+        )?;
+        validate_optional_finite(
+            row.test_log_loss,
+            "walk_forward.test_log_loss",
+            Some(0.0),
+            None,
+        )?;
+        validate_optional_finite(
+            row.train_expected_calibration_error,
+            "walk_forward.train_expected_calibration_error",
+            Some(0.0),
+            Some(1.0),
+        )?;
+        validate_optional_finite(
+            row.test_expected_calibration_error,
+            "walk_forward.test_expected_calibration_error",
+            Some(0.0),
+            Some(1.0),
+        )?;
+        let _ = (
+            row.window_index,
+            row.test_edge_bucket_monotonic_non_decreasing,
+            row.pass,
+        );
+    }
+    for row in &report.aggregates {
+        validate_nonempty_text(&row.model, "walk_forward_aggregate.model")?;
+        if row.windows == 0 {
+            return Err("typed walk-forward aggregate must have windows".into());
+        }
+        validate_optional_finite(
+            row.positive_window_ratio,
+            "walk_forward_aggregate.positive_window_ratio",
+            Some(0.0),
+            Some(1.0),
+        )?;
+        validate_optional_finite(
+            row.pass_window_ratio,
+            "walk_forward_aggregate.pass_window_ratio",
+            Some(0.0),
+            Some(1.0),
+        )?;
+        validate_optional_finite(
+            row.avg_test_brier_score,
+            "walk_forward_aggregate.avg_test_brier_score",
+            Some(0.0),
+            None,
+        )?;
+        validate_optional_finite(
+            row.avg_test_log_loss,
+            "walk_forward_aggregate.avg_test_log_loss",
+            Some(0.0),
+            None,
+        )?;
+        validate_optional_finite(
+            row.avg_test_expected_calibration_error,
+            "walk_forward_aggregate.avg_test_expected_calibration_error",
+            Some(0.0),
+            Some(1.0),
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_settlement_verdict_rows(
+    report: &SettlementVerdictWalkForwardPayload,
+) -> Result<(), String> {
+    for row in &report.windows {
+        validate_nonempty_text(&row.model, "verdict_walk_forward.model")?;
+        validate_optional_finite(
+            row.test_brier_score,
+            "verdict_walk_forward.test_brier_score",
+            Some(0.0),
+            None,
+        )?;
+        validate_optional_finite(
+            row.test_log_loss,
+            "verdict_walk_forward.test_log_loss",
+            Some(0.0),
+            None,
+        )?;
+        validate_optional_finite(
+            row.test_expected_calibration_error,
+            "verdict_walk_forward.test_expected_calibration_error",
+            Some(0.0),
+            Some(1.0),
+        )?;
+        let _ = (row.window_index, row.test_n, row.pass);
+    }
+    for row in &report.aggregates {
+        validate_nonempty_text(&row.model, "verdict_aggregate.model")?;
+        if row.windows == 0 {
+            return Err("typed verdict aggregate must have windows".into());
+        }
+        validate_optional_finite(
+            row.pass_window_ratio,
+            "verdict_aggregate.pass_window_ratio",
+            Some(0.0),
+            Some(1.0),
+        )?;
+        validate_optional_finite(
+            row.avg_test_brier_score,
+            "verdict_aggregate.avg_test_brier_score",
+            Some(0.0),
+            None,
+        )?;
+        validate_optional_finite(
+            row.avg_test_log_loss,
+            "verdict_aggregate.avg_test_log_loss",
+            Some(0.0),
+            None,
+        )?;
+        validate_optional_finite(
+            row.avg_test_expected_calibration_error,
+            "verdict_aggregate.avg_test_expected_calibration_error",
+            Some(0.0),
+            Some(1.0),
+        )?;
+        let _ = row.oos_rows;
+    }
+    Ok(())
 }
 
 fn require_settlement_baseline_report(
@@ -1021,127 +1457,9 @@ fn require_settlement_baseline_report(
         options.min_event_complete_rows,
         options.global_full_depth_entry_fill_rate,
     );
-    for (name, rows) in [
-        ("baselines", &report.settlement_probability.baselines),
-        ("calibration", &report.settlement_probability.calibration),
-        ("edge_buckets", &report.settlement_probability.edge_buckets),
-        ("anti_overfit", &report.settlement_probability.anti_overfit),
-        (
-            "symbol_holdouts",
-            &report.settlement_probability.symbol_holdouts,
-        ),
-        ("ablations", &report.settlement_probability.ablations),
-        (
-            "walk_forward_windows",
-            &report.settlement_probability_walk_forward.windows,
-        ),
-        (
-            "walk_forward_aggregates",
-            &report.settlement_probability_walk_forward.aggregates,
-        ),
-        (
-            "verdict_walk_forward_windows",
-            &report.settlement_verdict_walk_forward.windows,
-        ),
-        (
-            "verdict_walk_forward_aggregates",
-            &report.settlement_verdict_walk_forward.aggregates,
-        ),
-    ] {
-        if rows.iter().any(|row| !row.is_object()) {
-            return Err(format!(
-                "typed settlement baseline report {name} contains a non-object row"
-            ));
-        }
-    }
-    for (name, rows, fields) in [
-        (
-            "baselines",
-            &report.settlement_probability.baselines,
-            &["model", "n", "avg_predicted_q", "actual_win_rate"][..],
-        ),
-        (
-            "calibration",
-            &report.settlement_probability.calibration,
-            &[
-                "model",
-                "q_bucket",
-                "count",
-                "avg_predicted_q",
-                "actual_win_rate",
-            ][..],
-        ),
-        (
-            "edge_buckets",
-            &report.settlement_probability.edge_buckets,
-            &["model", "edge_bucket", "count", "avg_edge"][..],
-        ),
-        (
-            "anti_overfit",
-            &report.settlement_probability.anti_overfit,
-            &["model", "test", "n", "pass"][..],
-        ),
-        (
-            "symbol_holdouts",
-            &report.settlement_probability.symbol_holdouts,
-            &["model", "symbol", "n", "pass"][..],
-        ),
-        (
-            "ablations",
-            &report.settlement_probability.ablations,
-            &["model", "reference_model", "n", "improves_error"][..],
-        ),
-        (
-            "walk_forward_windows",
-            &report.settlement_probability_walk_forward.windows,
-            &[
-                "window_index",
-                "model",
-                "train_start",
-                "train_end",
-                "test_start",
-                "test_end",
-                "pass",
-            ][..],
-        ),
-        (
-            "walk_forward_aggregates",
-            &report.settlement_probability_walk_forward.aggregates,
-            &["model", "windows", "pass_window_ratio"][..],
-        ),
-        (
-            "verdict_walk_forward_windows",
-            &report.settlement_verdict_walk_forward.windows,
-            &[
-                "window_index",
-                "model",
-                "test_n",
-                "test_brier_score",
-                "pass",
-            ][..],
-        ),
-        (
-            "verdict_walk_forward_aggregates",
-            &report.settlement_verdict_walk_forward.aggregates,
-            &["model", "windows", "oos_rows", "pass_window_ratio"][..],
-        ),
-    ] {
-        for row in rows {
-            let Some(object) = row.as_object() else {
-                return Err(format!(
-                    "typed settlement baseline report {name} contains a non-object row"
-                ));
-            };
-            if fields
-                .iter()
-                .any(|field| object.get(*field).is_none_or(Value::is_null))
-            {
-                return Err(format!(
-                    "typed settlement baseline report {name} contains an incomplete row"
-                ));
-            }
-        }
-    }
+    validate_settlement_probability_rows(&report.settlement_probability)?;
+    validate_settlement_walk_forward_rows(&report.settlement_probability_walk_forward)?;
+    validate_settlement_verdict_rows(&report.settlement_verdict_walk_forward)?;
     let required_gates = BTreeSet::from([
         "data_quality",
         "deribit_vol_surface",

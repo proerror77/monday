@@ -166,18 +166,18 @@ pub fn validate_verified_evidence_scope(
             evidence.event_horizon_secs()
         ));
     }
-    if scope.task != evidence.task() {
-        return Err(format!(
-            "prediction evidence task {} does not match verified Mission task {}",
-            scope.task,
-            evidence.task()
-        ));
-    }
     if scope.prediction_horizon_secs != evidence.prediction_horizon_secs() {
         return Err(format!(
             "prediction evidence horizon {:?} does not match verified Mission horizon {:?}",
             scope.prediction_horizon_secs,
             evidence.prediction_horizon_secs()
+        ));
+    }
+    if scope.task != evidence.task() {
+        return Err(format!(
+            "prediction evidence task {} does not match verified Mission task {}",
+            scope.task,
+            evidence.task()
         ));
     }
     Ok(())
