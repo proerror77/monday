@@ -1882,6 +1882,30 @@ mod tests {
             references[0].end_received_at_ns,
             RECEIVED_NS + 1_000_000_000
         );
+        assert_eq!(
+            references[1].start_received_at_ns,
+            RECEIVED_NS + 8_000_000_000
+        );
+        assert_eq!(
+            references[1].end_received_at_ns,
+            RECEIVED_NS + 8_000_000_000
+        );
+
+        let mut remaining_bytes = request.max_input_bytes;
+        let mut cache = BTreeMap::new();
+        let rejected = references_for_window(
+            &request,
+            RECEIVED_NS,
+            RECEIVED_NS + 3_000_000_000,
+            &candidates,
+            &mut remaining_bytes,
+            &mut cache,
+        )
+        .unwrap();
+        assert!(
+            rejected.is_none(),
+            "a manifest observed clock at required_through cannot replace a late rule receive clock"
+        );
     }
 
     #[test]

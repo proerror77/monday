@@ -989,9 +989,27 @@ fn spot_submission_quantity(
     step = common_quantity_step(step, Decimal::new(1, rules.base_asset_precision as u32))?;
     let requested = Decimal::from_f64_retain(requested_quantity)
         .context("Spot requested quantity is not representable")?;
-    let requested = requested.round_dp(rules.base_asset_precision as u32);
-    let units = (requested / step).floor();
-    (units * step)
+    let units = requested
+        .checked_div(step)
+        .context("Spot requested quantity division overflow")?;
+    // `from_f64_retain` keeps the binary tail (for example, 0.3 / 0.1 is
+    // just below 3). Snap only that tail-sized error to an exact grid; a real
+    // sub-step request such as 0.009 / 0.01 must still floor to zero.
+    let nearest_units = units.round();
+    let distance_from_grid = units
+        .checked_sub(nearest_units)
+        .context("Spot quantity grid distance overflow")?
+        .abs();
+    let magnitude = units.abs().max(Decimal::ONE);
+    let f64_epsilon = Decimal::from_f64_retain(f64::EPSILON)
+        .context("Spot quantity epsilon is not representable")?;
+    let snap_tolerance = f64_epsilon.checked_mul(magnitude);
+    let units = snap_tolerance
+        .filter(|tolerance| distance_from_grid <= *tolerance)
+        .map_or_else(|| units.floor(), |_| nearest_units);
+    units
+        .checked_mul(step)
+        .context("Spot submitted quantity multiplication overflow")?
         .to_f64()
         .context("Spot submitted quantity is not representable")
 }
@@ -2858,6 +2876,19 @@ mod tests {
         let quantity = spot_submission_quantity(&rules, 0.3).unwrap();
 
         assert!((quantity - 0.3).abs() < 1e-12);
+    }
+
+    #[test]
+    fn spot_submission_quantity_does_not_round_up_before_flooring() {
+        let mut rules = spot_replay_rules();
+        rules.lot_size_filter.step_size = "0.01".to_string();
+        rules.market_lot_size_filter.as_mut().unwrap().step_size = "0.01".to_string();
+
+        let below_one_step = spot_submission_quantity(&rules, 0.009).unwrap();
+        let one_step = spot_submission_quantity(&rules, 0.01).unwrap();
+
+        assert!(below_one_step.abs() < 1e-12);
+        assert!((one_step - 0.01).abs() < 1e-12);
     }
 
     #[test]
