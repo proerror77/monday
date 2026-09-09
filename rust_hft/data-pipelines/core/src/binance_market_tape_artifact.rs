@@ -2011,7 +2011,7 @@ mod tests {
                     .map(move |stream_type| format!("{symbol}@{stream_type}"))
             })
             .collect::<Vec<_>>();
-        let second_shard = streams.split_off((streams.len() + 1) / 2);
+        let second_shard = streams.split_off(streams.len().div_ceil(2));
         let mut shards = vec![streams];
         if !second_shard.is_empty() {
             shards.push(second_shard);
