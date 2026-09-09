@@ -271,7 +271,14 @@ DECLARE
   end_day date := current_date + ${DERIBIT_PARTITION_LOOKAHEAD_DAYS};
   partition_name text;
 BEGIN
-  IF to_regclass('public.deribit_iv_ticks') IS NOT NULL THEN
+  IF EXISTS (
+    SELECT 1
+    FROM pg_class parent
+    JOIN pg_namespace ns ON ns.oid = parent.relnamespace
+    WHERE ns.nspname = 'public'
+      AND parent.relname = 'deribit_iv_ticks'
+      AND parent.relkind = 'p'
+  ) THEN
     WHILE partition_day <= end_day LOOP
       partition_name := format('deribit_iv_ticks_new_%s', to_char(partition_day, 'YYYYMMDD'));
       BEGIN

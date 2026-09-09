@@ -1,0 +1,20 @@
+[package]
+name = "hft-data-adapter-deribit-reference"
+version = "0.1.0"
+edition = "2021"
+description = "Deribit public option reference transport"
+
+[dependencies]
+anyhow = "1"
+data = { package = "hft-data", path = "../../core" }
+hft-core = { package = "hft-core", path = "../../../market-core/core" }
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+url = "2"
+
+[lib]
+name = "adapter_deribit_reference"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

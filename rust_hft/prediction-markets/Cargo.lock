@@ -4201,6 +4201,7 @@ name = "hft-data"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "futures",
  "hex",
  "hft-core",
@@ -4235,6 +4236,19 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "url",
+]
+
+[[package]]
+name = "hft-data-adapter-deribit-reference"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hft-core",
+ "hft-data",
+ "reqwest 0.12.28",
+ "serde_json",
+ "thiserror 2.0.18",
  "url",
 ]
 
@@ -5901,6 +5915,7 @@ dependencies = [
  "futures",
  "hft-data",
  "hft-data-adapter-binance",
+ "hft-data-adapter-deribit-reference",
  "hft-data-adapter-polymarket",
  "hft-data-adapter-predict-fun",
  "libc",
