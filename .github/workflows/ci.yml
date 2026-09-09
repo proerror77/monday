@@ -118,7 +118,7 @@ jobs:
 
       - name: Install shellcheck
         if: steps.scope.outputs.control == 'true'
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
+        run: bash "$GITHUB_WORKSPACE/.github/workflows/install-ubuntu-packages.sh" shellcheck
 
       - name: Verify Campaign controller recovery
         if: steps.scope.outputs.control == 'true'
@@ -202,7 +202,7 @@ jobs:
 
       - name: Install Linux build tools
         if: needs.scope.outputs.toolchain == 'true'
-        run: sudo apt-get update && sudo apt-get install -y clang mold protobuf-compiler
+        run: bash "$GITHUB_WORKSPACE/.github/workflows/install-ubuntu-packages.sh" clang mold protobuf-compiler
 
       - name: Setup sccache
         if: needs.scope.outputs.toolchain == 'true'
@@ -597,7 +597,7 @@ jobs:
           components: rustfmt
 
       - name: Install Linux build tools
-        run: sudo apt-get update && sudo apt-get install -y clang mold protobuf-compiler
+        run: bash "$GITHUB_WORKSPACE/.github/workflows/install-ubuntu-packages.sh" clang mold protobuf-compiler
 
       - name: Setup sccache
         id: sccache

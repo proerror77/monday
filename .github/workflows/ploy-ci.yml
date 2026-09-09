@@ -643,9 +643,7 @@ jobs:
           components: clippy, rustfmt
 
       - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libssl-dev libpq-dev clang lld
+        run: bash "$GITHUB_WORKSPACE/.github/workflows/install-ubuntu-packages.sh" pkg-config libssl-dev libpq-dev clang lld
 
       - name: Setup sccache
         id: sccache
@@ -749,9 +747,7 @@ jobs:
           toolchain: 1.91
 
       - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libssl-dev clang lld
+        run: bash "$GITHUB_WORKSPACE/.github/workflows/install-ubuntu-packages.sh" pkg-config libssl-dev clang lld
 
       - name: Setup sccache
         id: sccache
@@ -819,9 +815,7 @@ jobs:
           toolchain: 1.91
 
       - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libssl-dev clang lld
+        run: bash "$GITHUB_WORKSPACE/.github/workflows/install-ubuntu-packages.sh" pkg-config libssl-dev clang lld
 
       - name: Setup sccache
         id: sccache
@@ -907,9 +901,7 @@ jobs:
           toolchain: 1.91
 
       - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libssl-dev clang lld
+        run: bash "$GITHUB_WORKSPACE/.github/workflows/install-ubuntu-packages.sh" pkg-config libssl-dev clang lld
 
       - name: Setup sccache
         id: sccache
@@ -989,9 +981,7 @@ jobs:
           components: clippy
 
       - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libssl-dev libpq-dev clang lld
+        run: bash "$GITHUB_WORKSPACE/.github/workflows/install-ubuntu-packages.sh" pkg-config libssl-dev libpq-dev clang lld
 
       - name: Setup sccache
         id: sccache
@@ -1197,9 +1187,7 @@ jobs:
           toolchain: 1.91
 
       - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libssl-dev libpq-dev clang lld
+        run: bash "$GITHUB_WORKSPACE/.github/workflows/install-ubuntu-packages.sh" pkg-config libssl-dev libpq-dev clang lld
 
       - name: Setup sccache
         id: sccache
