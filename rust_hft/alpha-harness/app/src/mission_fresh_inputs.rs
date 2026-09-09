@@ -1114,7 +1114,7 @@ fn terminate_materializer(child: &mut Child) {
     {
         let process_group = format!("-{}", child.id());
         let _ = Command::new("/bin/kill")
-            .args(["-KILL", &process_group])
+            .args(["-KILL", "--", &process_group])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
