@@ -121,6 +121,8 @@ pub struct PredictionEvidenceRefs {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VerifiedPredictionEvidenceReceipt {
     schema_version: String,
+    product: String,
+    event_horizon_secs: u32,
     mission_id: String,
     mission_sha256: String,
     task: String,
@@ -153,6 +155,14 @@ impl VerifiedPredictionEvidenceReceipt {
 
     pub fn task(&self) -> &str {
         &self.task
+    }
+
+    pub fn product(&self) -> &str {
+        &self.product
+    }
+
+    pub fn event_horizon_secs(&self) -> u32 {
+        self.event_horizon_secs
     }
 
     pub fn prediction_horizon_secs(&self) -> Option<u32> {
@@ -189,8 +199,10 @@ impl VerifiedPredictionEvidenceReceipt {
 
     pub fn prompt_summary(&self) -> String {
         format!(
-            "verified_prediction_evidence schema={} mission={} task={} side={} horizon={} snapshot={} reports={} data_audit={} full_depth={} executable_replay={} realtime_runtime={}",
+            "verified_prediction_evidence schema={} product={} event_horizon_secs={} mission={} task={} side={} horizon={} snapshot={} reports={} data_audit={} full_depth={} executable_replay={} realtime_runtime={}",
             self.schema_version,
+            self.product,
+            self.event_horizon_secs,
             self.mission_sha256,
             self.task,
             self.side.as_deref().unwrap_or("none"),
@@ -245,6 +257,8 @@ pub fn verify_prediction_evidence(
     };
     Ok(VerifiedPredictionEvidenceReceipt {
         schema_version: VERIFIED_EVIDENCE_SCHEMA.to_string(),
+        product: product_name(&mission.product.symbol).to_string(),
+        event_horizon_secs: mission.product.event_horizon_secs,
         mission_id: mission.mission_id.clone(),
         mission_sha256: mission_hash(mission)?,
         task: task.to_string(),
@@ -994,6 +1008,12 @@ fn require_settlement_baseline_report(
     if options.data_audit_status.as_deref().is_none() {
         return Err("typed settlement baseline report is missing data-audit gate status".into());
     }
+    if options
+        .global_full_depth_entry_fill_rate
+        .is_some_and(|rate| !rate.is_finite())
+    {
+        return Err("typed settlement baseline report has a non-finite global fill rate".into());
+    }
     let _event_complete_counts = (
         options.event_complete_events,
         options.event_complete_rows,
@@ -1034,6 +1054,94 @@ fn require_settlement_baseline_report(
             ));
         }
     }
+    for (name, rows, fields) in [
+        (
+            "baselines",
+            &report.settlement_probability.baselines,
+            &["model", "n", "avg_predicted_q", "actual_win_rate"][..],
+        ),
+        (
+            "calibration",
+            &report.settlement_probability.calibration,
+            &[
+                "model",
+                "q_bucket",
+                "count",
+                "avg_predicted_q",
+                "actual_win_rate",
+            ][..],
+        ),
+        (
+            "edge_buckets",
+            &report.settlement_probability.edge_buckets,
+            &["model", "edge_bucket", "count", "avg_edge"][..],
+        ),
+        (
+            "anti_overfit",
+            &report.settlement_probability.anti_overfit,
+            &["model", "test", "n", "pass"][..],
+        ),
+        (
+            "symbol_holdouts",
+            &report.settlement_probability.symbol_holdouts,
+            &["model", "symbol", "n", "pass"][..],
+        ),
+        (
+            "ablations",
+            &report.settlement_probability.ablations,
+            &["model", "reference_model", "n", "improves_error"][..],
+        ),
+        (
+            "walk_forward_windows",
+            &report.settlement_probability_walk_forward.windows,
+            &[
+                "window_index",
+                "model",
+                "train_start",
+                "train_end",
+                "test_start",
+                "test_end",
+                "pass",
+            ][..],
+        ),
+        (
+            "walk_forward_aggregates",
+            &report.settlement_probability_walk_forward.aggregates,
+            &["model", "windows", "pass_window_ratio"][..],
+        ),
+        (
+            "verdict_walk_forward_windows",
+            &report.settlement_verdict_walk_forward.windows,
+            &[
+                "window_index",
+                "model",
+                "test_n",
+                "test_brier_score",
+                "pass",
+            ][..],
+        ),
+        (
+            "verdict_walk_forward_aggregates",
+            &report.settlement_verdict_walk_forward.aggregates,
+            &["model", "windows", "oos_rows", "pass_window_ratio"][..],
+        ),
+    ] {
+        for row in rows {
+            let Some(object) = row.as_object() else {
+                return Err(format!(
+                    "typed settlement baseline report {name} contains a non-object row"
+                ));
+            };
+            if fields
+                .iter()
+                .any(|field| object.get(*field).is_none_or(Value::is_null))
+            {
+                return Err(format!(
+                    "typed settlement baseline report {name} contains an incomplete row"
+                ));
+            }
+        }
+    }
     let required_gates = BTreeSet::from([
         "data_quality",
         "deribit_vol_surface",
@@ -1065,6 +1173,28 @@ fn require_settlement_baseline_report(
     }
     if actual_gates != required_gates {
         return Err("typed settlement baseline report is missing required promotion gates".into());
+    }
+    let expected_ready = report
+        .promotion_gate
+        .gates
+        .iter()
+        .filter(|gate| gate.gate != "recorded_replay_parity")
+        .all(|gate| gate.passed);
+    if report.promotion_gate.ready_for_dry_run_handoff != expected_ready {
+        return Err(
+            "typed settlement baseline report promotion readiness disagrees with its gates".into(),
+        );
+    }
+    if report
+        .promotion_gate
+        .gates
+        .iter()
+        .find(|gate| gate.gate == "recorded_replay_parity")
+        .is_some_and(|gate| gate.passed != options.replay_parity_ready)
+    {
+        return Err(
+            "typed settlement baseline report replay-parity gate disagrees with its options".into(),
+        );
     }
     // Keep the field typed and consumed even when all gate outcomes are false:
     // a failed evaluator artifact is still a valid report only if it carries
@@ -1101,12 +1231,21 @@ fn require_full_depth_report(
             "full-depth {side} report is incomplete or side-mismatched"
         ));
     }
-    let expected = snapshot
-        .observations
-        .iter()
-        .map(|row| row.event_id.clone())
-        .collect::<BTreeSet<_>>();
-    if expected.is_empty() {
+    let snapshot_events = snapshot.observations.iter().fold(
+        BTreeMap::<String, (String, String, BTreeSet<DateTime<Utc>>)>::new(),
+        |mut events, row| {
+            let entry = events.entry(row.event_id.clone()).or_insert_with(|| {
+                (
+                    row.up_token_id.clone(),
+                    row.down_token_id.clone(),
+                    BTreeSet::new(),
+                )
+            });
+            entry.2.insert(row.tick_ts);
+            events
+        },
+    );
+    if snapshot_events.is_empty() {
         return Err("full-depth report cannot bind to an empty snapshot".to_string());
     }
     for profile in ["observed", "conservative"] {
@@ -1139,12 +1278,14 @@ fn require_full_depth_report(
                     "full-depth {side} {profile} row is not a substantive canonical event row"
                 ));
             }
-            if !expected.contains(&row.market_id) {
+            let Some((up_token_id, down_token_id, valid_ticks)) =
+                snapshot_events.get(&row.market_id)
+            else {
                 return Err(format!(
                     "full-depth {side} {profile} row {} is outside the verified snapshot",
                     row.market_id
                 ));
-            }
+            };
             if !snapshot
                 .manifest
                 .symbols
@@ -1156,13 +1297,27 @@ fn require_full_depth_report(
                     row.market_id
                 ));
             }
+            let (expected_token_id, expected_opposite_token_id) = if side == "up" {
+                (up_token_id, down_token_id)
+            } else {
+                (down_token_id, up_token_id)
+            };
+            if &row.token_id != expected_token_id
+                || &row.opposite_token_id != expected_opposite_token_id
+                || !valid_ticks.contains(&row.tick_ts)
+            {
+                return Err(format!(
+                    "full-depth {side} {profile} row {} is not bound to its snapshot tokens/time",
+                    row.market_id
+                ));
+            }
             let _ = (row.tick_ts, row.entry_fillable);
             seen.insert(row.market_id);
         }
-        if seen != expected {
+        if seen != snapshot_events.keys().cloned().collect() {
             return Err(format!(
                 "full-depth {side} {profile} rows do not cover the verified snapshot exactly: expected={:?} seen={:?}",
-                expected,
+                snapshot_events.keys().collect::<BTreeSet<_>>(),
                 seen
             ));
         }
@@ -1207,6 +1362,12 @@ fn task_name(task: &PredictionTaskKind) -> &'static str {
     }
 }
 
+fn product_name(product: &crate::prediction_mission_v3::PredictionProductSymbol) -> &'static str {
+    match product {
+        crate::prediction_mission_v3::PredictionProductSymbol::Btc => "BTC",
+    }
+}
+
 fn normalize_sha256(value: &str) -> Result<String, String> {
     let value = value.strip_prefix("sha256:").unwrap_or(value);
     if value.len() != 64
@@ -1246,5 +1407,52 @@ mod tests {
         .expect("namespace");
         assert_eq!(root, PathBuf::from("/tmp/evidence/research-trial"));
         assert_eq!(path, "mcts-v4/experiment-manifests/manifest.json");
+    }
+
+    #[test]
+    fn skeletal_settlement_report_is_rejected_before_evidence_capability() {
+        let mission: PredictionResearchMissionV3 = serde_json::from_value(serde_json::json!({
+            "schema_version": "prediction_research_mission.v4",
+            "mission_id": "settlement-skeletal-test",
+            "product": { "symbol": "BTC", "event_horizon_secs": 300 },
+            "task": { "kind": "settlement_probability" },
+            "run_mode": "research_trial",
+            "authority_profile": "polymarket_chainlink_baseline",
+            "required_capabilities": ["polymarket_chainlink"],
+            "cohort_manifest_id": format!("sha256:{}", "1".repeat(64)),
+            "partition_digest": format!("sha256:{}", "2".repeat(64)),
+            "causal_projection_policy_id": format!("sha256:{}", "3".repeat(64)),
+            "snapshot_contract_id": format!("sha256:{}", "4".repeat(64)),
+            "snapshot_hash": "5".repeat(16),
+            "search_policy_snapshot_id": format!("sha256:{}", "6".repeat(64)),
+            "search_budget": { "max_candidates": 1, "max_seconds": 30 }
+        }))
+        .expect("test Mission");
+        let skeletal = serde_json::json!({
+            "schema_version": "monday.polymarket.settlement_baseline.v1",
+            "non_finite_floats": "null",
+            "mission_id": mission.mission_id,
+            "search_policy_snapshot_id": mission.search_policy_snapshot_id,
+            "snapshot_hash": mission.snapshot_hash,
+            "snapshot_contract_hash": mission.snapshot_contract_id,
+            "settlement_probability": {
+                "baselines": [{}],
+                "calibration": [],
+                "edge_buckets": [],
+                "anti_overfit": [],
+                "symbol_holdouts": [],
+                "ablations": []
+            },
+            "settlement_probability_walk_forward": { "windows": [], "aggregates": [] },
+            "settlement_verdict_walk_forward": { "windows": [], "aggregates": [] },
+            "promotion_gate": {
+                "options": {},
+                "ready_for_dry_run_handoff": false,
+                "gates": []
+            }
+        });
+        let error = require_settlement_baseline_report(&skeletal, &mission)
+            .expect_err("skeletal evaluator report must be rejected");
+        assert!(error.contains("parse typed settlement baseline report"));
     }
 }

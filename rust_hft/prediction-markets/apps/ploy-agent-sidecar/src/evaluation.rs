@@ -138,16 +138,32 @@ pub fn validate_verified_evidence_scope(
         .as_ref()
         .ok_or_else(|| "prediction_scope is required before model execution".to_string())?;
     let product = scope.product.trim().to_ascii_uppercase();
+    let expected_symbol = if product.ends_with("USDT") {
+        product.clone()
+    } else {
+        format!("{product}USDT")
+    };
     let symbol_matches = request.symbols.len() == 1
-        && request.symbols[0].trim().to_ascii_uppercase().as_str()
-            == match product.as_str() {
-                "BTC" => "BTCUSDT",
-                other => other,
-            };
+        && request.symbols[0]
+            .trim()
+            .eq_ignore_ascii_case(expected_symbol.as_str());
     if !symbol_matches {
         return Err(format!(
             "prediction evidence scope product {} does not match the single queued symbol",
             scope.product
+        ));
+    }
+    if product != evidence.product() {
+        return Err(format!(
+            "prediction evidence scope product {} does not match verified Mission product {}",
+            scope.product,
+            evidence.product()
+        ));
+    }
+    if evidence.event_horizon_secs() != 300 {
+        return Err(format!(
+            "verified Mission event horizon {} is unsupported",
+            evidence.event_horizon_secs()
         ));
     }
     if scope.task != evidence.task() {

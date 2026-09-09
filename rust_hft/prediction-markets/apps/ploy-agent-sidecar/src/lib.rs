@@ -1528,6 +1528,35 @@ mod tests {
         assert!(error.contains("under the configured local root"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn queued_evidence_root_symlink_cannot_escape_configured_local_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("create temp root");
+        let dir = temp.path().to_path_buf();
+        let allowed = dir.join("allowed");
+        let outside = dir.join("outside");
+        let link = allowed.join("link");
+        fs::create_dir_all(&allowed).expect("allowed root");
+        fs::create_dir_all(outside.join("job")).expect("outside root");
+        symlink(&outside, &link).expect("symlink outside root");
+        let digest = |byte: char| format!("sha256:{}", byte.to_string().repeat(64));
+        let refs: ploy_research::PredictionEvidenceRefs = serde_json::from_value(json!({
+            "artifact_root": link.join("job"),
+            "mission": {"path":"mission.json","artifact_sha256":digest('a'),"mission_sha256":digest('b')},
+            "catalog_partition": {"path":"catalog.json","artifact_sha256":digest('c'),"payload_sha256":digest('d'),"cohort_manifest_id":digest('e'),"partition_digest":digest('f'),"policy_snapshot_id":digest('1')},
+            "snapshot": {"path":"snapshot","snapshot_hash":"2".repeat(16),"snapshot_contract_hash":digest('2')},
+            "result_bundle": {"path":"result.json","artifact_sha256":digest('3'),"receipt_sha256":digest('4')},
+            "reports": [],
+            "terminal_receipt": {"path":"result.json","artifact_sha256":digest('3'),"terminal_receipt_sha256":digest('4')}
+        }))
+        .expect("refs");
+        let error = verify_queued_prediction_evidence(&refs, &allowed)
+            .expect_err("symlinked root must be rejected");
+        assert!(error.contains("under the configured local root"));
+    }
+
     #[test]
     #[ignore = "requires the production evidence handoff gate"]
     fn production_writer_evidence_queue_reaches_terminal() {
@@ -1644,6 +1673,112 @@ mod tests {
             1
         );
         sidecar.run_cycle().expect("idempotent empty queue");
+        assert_eq!(
+            fs::read_to_string(mock_path.with_extension("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
+        let mut wrong_product = make_request(
+            "production-writer-evidence-wrong-product",
+            refs_value.clone(),
+            "diagnostic",
+            "completion_signal = \"required\"\nrequires_full_depth_clob = true\nrequires_operator_approval = true",
+        );
+        wrong_product.request.symbols = vec!["ETHUSDT".to_string()];
+        wrong_product
+            .request
+            .prediction_scope
+            .as_mut()
+            .expect("prediction scope")
+            .product = "ETH".to_string();
+        append_jsonl_sync(&store.requests_path, &wrong_product).expect("queue product mismatch");
+        sidecar
+            .run_cycle()
+            .expect("reject product mismatch before model");
+        let records = fs::read_to_string(&store.runs_path).expect("product mismatch records");
+        let wrong_product_record = records
+            .lines()
+            .map(|line| serde_json::from_str::<AgentRunRecord>(line).unwrap())
+            .find(|record| record.run_id == "production-writer-evidence-wrong-product")
+            .unwrap();
+        assert_eq!(wrong_product_record.status, "failed");
+        assert!(
+            wrong_product_record
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("verified Mission product")),
+            "{:?}",
+            wrong_product_record.failure_reason
+        );
+        assert_eq!(
+            fs::read_to_string(mock_path.with_extension("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
+        let mut wrong_task = make_request(
+            "production-writer-evidence-wrong-task",
+            refs_value.clone(),
+            "diagnostic",
+            "completion_signal = \"required\"\nrequires_full_depth_clob = true\nrequires_operator_approval = true",
+        );
+        let wrong_task_scope = wrong_task
+            .request
+            .prediction_scope
+            .as_mut()
+            .expect("prediction scope");
+        wrong_task_scope.task = "up_execution".to_string();
+        wrong_task_scope.prediction_horizon_secs = Some(10);
+        append_jsonl_sync(&store.requests_path, &wrong_task).expect("queue task mismatch");
+        sidecar
+            .run_cycle()
+            .expect("reject task mismatch before model");
+        let records = fs::read_to_string(&store.runs_path).expect("task mismatch records");
+        let wrong_task_record = records
+            .lines()
+            .map(|line| serde_json::from_str::<AgentRunRecord>(line).unwrap())
+            .find(|record| record.run_id == "production-writer-evidence-wrong-task")
+            .unwrap();
+        assert_eq!(wrong_task_record.status, "failed");
+        assert!(wrong_task_record
+            .failure_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("verified Mission task")));
+        assert_eq!(
+            fs::read_to_string(mock_path.with_extension("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
+        let offline_candidate = make_request(
+            "production-writer-evidence-offline-candidate",
+            refs_value.clone(),
+            "dry_run_candidate",
+            "completion_signal = \"required\"\nrequires_full_depth_clob = true\nrequires_operator_approval = true",
+        );
+        append_jsonl_sync(&store.requests_path, &offline_candidate)
+            .expect("queue offline candidate");
+        sidecar
+            .run_cycle()
+            .expect("reject offline candidate before model");
+        let records = fs::read_to_string(&store.runs_path).expect("offline candidate records");
+        let offline_record = records
+            .lines()
+            .map(|line| serde_json::from_str::<AgentRunRecord>(line).unwrap())
+            .find(|record| record.run_id == "production-writer-evidence-offline-candidate")
+            .unwrap();
+        assert_eq!(offline_record.status, "failed");
+        assert!(offline_record
+            .failure_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("live control-plane context unavailable")));
         assert_eq!(
             fs::read_to_string(mock_path.with_extension("calls"))
                 .unwrap()
