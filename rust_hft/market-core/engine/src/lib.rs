@@ -610,9 +610,23 @@ impl Engine {
                 exchange_only: snapshot
                     .clients
                     .iter()
-                    .filter_map(|client| client.open_orders.as_ref().ok())
-                    .flatten()
-                    .map(|order| order.order_id.clone())
+                    .flat_map(|client| {
+                        let standard = client
+                            .open_orders
+                            .as_ref()
+                            .ok()
+                            .into_iter()
+                            .flatten()
+                            .map(|order| order.order_id.clone());
+                        let cancellable = client
+                            .cancellable_orders
+                            .as_ref()
+                            .ok()
+                            .into_iter()
+                            .flatten()
+                            .map(|order| order.order_id.clone());
+                        standard.chain(cancellable)
+                    })
                     .collect(),
                 ..Default::default()
             };
@@ -646,6 +660,13 @@ impl Engine {
                 } else {
                     identity_conflicts.push(exchange_order.order_id.clone());
                 }
+            }
+            if let Ok(cancellable_orders) = &client.cancellable_orders {
+                identity_conflicts.extend(
+                    cancellable_orders
+                        .iter()
+                        .map(|order| order.order_id.clone()),
+                );
             }
         }
 

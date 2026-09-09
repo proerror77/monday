@@ -4,6 +4,133 @@ use super::{SystemBuilder, VenueConfig, VenueType};
 use tracing::{info, warn};
 
 #[cfg(feature = "adapter-binance-data")]
+const BINANCE_USDM_REST_LIVE: &str = "https://fapi.binance.com";
+#[cfg(feature = "adapter-binance-data")]
+const BINANCE_USDM_WS_LIVE: &str = "wss://fstream.binance.com/private/ws";
+#[cfg(feature = "adapter-binance-data")]
+const BINANCE_USDM_REST_TESTNET: &str = "https://demo-fapi.binance.com";
+#[cfg(feature = "adapter-binance-data")]
+const BINANCE_USDM_WS_TESTNET: &str = "wss://demo-fstream.binance.com/private/ws";
+
+#[cfg(feature = "adapter-binance-data")]
+fn is_known_binance_spot_rest_endpoint(url: &str) -> bool {
+    matches!(
+        url.trim_end_matches('/'),
+        "https://api.binance.com"
+            | "https://api1.binance.com"
+            | "https://api2.binance.com"
+            | "https://api3.binance.com"
+            | "https://api4.binance.com"
+            | "https://data-api.binance.vision"
+    )
+}
+
+#[cfg(feature = "adapter-binance-data")]
+fn is_known_binance_spot_ws_endpoint(url: &str) -> bool {
+    matches!(
+        url.trim_end_matches('/'),
+        "wss://data-stream.binance.vision/ws"
+            | "wss://stream.binance.com:9443/ws"
+            | "wss://stream.binance.com:9443/stream"
+            | "wss://stream.binance.com/ws"
+            | "wss://stream.binance.com"
+    )
+}
+
+#[cfg(feature = "adapter-binance-data")]
+fn is_binance_usdm_live_rest_endpoint(url: &str) -> bool {
+    url.trim_end_matches('/') == BINANCE_USDM_REST_LIVE
+}
+
+#[cfg(feature = "adapter-binance-data")]
+fn is_binance_usdm_testnet_rest_endpoint(url: &str) -> bool {
+    url.trim_end_matches('/') == BINANCE_USDM_REST_TESTNET
+}
+
+#[cfg(feature = "adapter-binance-data")]
+fn is_binance_usdm_live_ws_endpoint(url: &str) -> bool {
+    url.trim_end_matches('/') == BINANCE_USDM_WS_LIVE
+}
+
+#[cfg(feature = "adapter-binance-data")]
+fn is_binance_usdm_testnet_ws_endpoint(url: &str) -> bool {
+    url.trim_end_matches('/') == BINANCE_USDM_WS_TESTNET
+}
+
+#[cfg(feature = "adapter-binance-data")]
+fn configured_binance_usdm_endpoint(
+    configured: Option<&str>,
+    testnet: bool,
+    rest: bool,
+) -> Result<String, String> {
+    let configured = configured.map(str::trim).filter(|value| !value.is_empty());
+    if rest {
+        if testnet {
+            if configured.is_none() || configured.is_some_and(is_known_binance_spot_rest_endpoint) {
+                return Ok(BINANCE_USDM_REST_TESTNET.to_string());
+            }
+            if configured.is_some_and(is_binance_usdm_live_rest_endpoint) {
+                return Err(format!(
+                    "Binance USD-M Testnet cannot use the production REST endpoint {BINANCE_USDM_REST_LIVE}"
+                ));
+            }
+            if configured.is_some_and(is_binance_usdm_testnet_rest_endpoint) {
+                return Ok(BINANCE_USDM_REST_TESTNET.to_string());
+            }
+            if let Some(value) = configured {
+                return Ok(value.to_string());
+            }
+        } else {
+            if configured.is_none()
+                || configured.is_some_and(is_known_binance_spot_rest_endpoint)
+                || configured.is_some_and(is_binance_usdm_live_rest_endpoint)
+            {
+                return Ok(BINANCE_USDM_REST_LIVE.to_string());
+            }
+            if configured.is_some_and(is_binance_usdm_testnet_rest_endpoint) {
+                return Err(format!(
+                    "Binance USD-M Live cannot use the Testnet REST endpoint {BINANCE_USDM_REST_TESTNET}"
+                ));
+            }
+            if let Some(value) = configured {
+                return Ok(value.to_string());
+            }
+        }
+    } else if testnet {
+        if configured.is_none() || configured.is_some_and(is_known_binance_spot_ws_endpoint) {
+            return Ok(BINANCE_USDM_WS_TESTNET.to_string());
+        }
+        if configured.is_some_and(is_binance_usdm_live_ws_endpoint) {
+            return Err(format!(
+                "Binance USD-M Testnet cannot use the production private stream endpoint {BINANCE_USDM_WS_LIVE}"
+            ));
+        }
+        if configured.is_some_and(is_binance_usdm_testnet_ws_endpoint) {
+            return Ok(BINANCE_USDM_WS_TESTNET.to_string());
+        }
+        if let Some(value) = configured {
+            return Ok(value.to_string());
+        }
+    } else {
+        if configured.is_none()
+            || configured.is_some_and(is_known_binance_spot_ws_endpoint)
+            || configured.is_some_and(is_binance_usdm_live_ws_endpoint)
+        {
+            return Ok(BINANCE_USDM_WS_LIVE.to_string());
+        }
+        if configured.is_some_and(is_binance_usdm_testnet_ws_endpoint) {
+            return Err(format!(
+                "Binance USD-M Live cannot use the Testnet private stream endpoint {BINANCE_USDM_WS_TESTNET}"
+            ));
+        }
+        if let Some(value) = configured {
+            return Ok(value.to_string());
+        }
+    }
+    unreachable!("configured Binance USD-M endpoint branch must return")
+}
+
+#[cfg(feature = "adapter-binance-data")]
 fn validate_binance_usdm_execution_config(
     execution_config: Option<&serde_yaml::Value>,
 ) -> Result<(), String> {
@@ -355,19 +482,36 @@ impl SystemBuilder {
                     warn!(%error, "Binance USD-M execution_config is unsupported; execution client not registered");
                     return self;
                 }
+                let testnet = exec_mode == binance_exec::ExecutionMode::Testnet;
+                let rest_base_url = match configured_binance_usdm_endpoint(
+                    venue.rest.as_deref(),
+                    testnet,
+                    true,
+                ) {
+                    Ok(endpoint) => endpoint,
+                    Err(error) => {
+                        warn!(%error, "Binance USD-M REST endpoint is incompatible with execution mode; execution client not registered");
+                        return self;
+                    }
+                };
+                let ws_base_url = match configured_binance_usdm_endpoint(
+                    venue.ws_private.as_deref(),
+                    testnet,
+                    false,
+                ) {
+                    Ok(endpoint) => endpoint,
+                    Err(error) => {
+                        warn!(%error, "Binance USD-M private stream endpoint is incompatible with execution mode; execution client not registered");
+                        return self;
+                    }
+                };
                 let cfg = binance_exec::BinanceUsdMExecutionConfig {
                     credentials: integration::signing::BinanceCredentials::new(
                         venue.api_key.clone().unwrap_or_default(),
                         venue.secret.clone().unwrap_or_default(),
                     ),
-                    rest_base_url: venue
-                        .rest
-                        .clone()
-                        .unwrap_or_else(|| "https://fapi.binance.com".to_string()),
-                    ws_base_url: venue
-                        .ws_private
-                        .clone()
-                        .unwrap_or_else(|| "wss://fstream.binance.com/private/ws".to_string()),
+                    rest_base_url,
+                    ws_base_url,
                     timeout_ms: 5000,
                     mode: exec_mode,
                     account_capability: hft_core::AccountCapability::default(),
@@ -698,6 +842,42 @@ mod tests {
     use super::super::{SystemConfig, VenueCapabilities};
     use super::*;
     use shared_instrument::InstrumentId;
+
+    #[cfg(feature = "adapter-binance-data")]
+    #[test]
+    fn binance_usdm_endpoint_selection_is_mode_bound_and_catalog_aware() {
+        assert_eq!(
+            configured_binance_usdm_endpoint(None, true, true).unwrap(),
+            BINANCE_USDM_REST_TESTNET
+        );
+        assert_eq!(
+            configured_binance_usdm_endpoint(Some("https://api.binance.com"), true, true).unwrap(),
+            BINANCE_USDM_REST_TESTNET
+        );
+        assert!(
+            configured_binance_usdm_endpoint(Some(BINANCE_USDM_REST_LIVE), true, true).is_err()
+        );
+        assert_eq!(
+            configured_binance_usdm_endpoint(
+                Some("wss://stream.binance.com:9443/stream"),
+                true,
+                false
+            )
+            .unwrap(),
+            BINANCE_USDM_WS_TESTNET
+        );
+        assert_eq!(
+            configured_binance_usdm_endpoint(None, false, false).unwrap(),
+            BINANCE_USDM_WS_LIVE
+        );
+        assert!(
+            configured_binance_usdm_endpoint(Some(BINANCE_USDM_WS_TESTNET), false, false).is_err()
+        );
+        assert_eq!(
+            configured_binance_usdm_endpoint(Some("http://127.0.0.1:18080"), true, true).unwrap(),
+            "http://127.0.0.1:18080"
+        );
+    }
 
     #[cfg(all(
         feature = "adapter-binance-data",

@@ -796,6 +796,15 @@ fn execution_account_inspection(
                         updated_at: order.updated_at,
                     }
                 }),
+                cancellable_orders: map_required_snapshot(client.cancellable_orders, |order| {
+                    infra_ipc::ExecutionCancellableOrder {
+                        order_id: order.order_id.0,
+                        client_order_id: order.client_order_id,
+                        symbol: order.symbol,
+                        order_type: order.order_type,
+                        algo_id: order.algo_id,
+                    }
+                }),
                 balances: map_optional_snapshot(client.balances, |balance| {
                     infra_ipc::ExecutionBalance {
                         asset: balance.asset,
@@ -897,7 +906,7 @@ fn authoritative_open_order_symbol(
         .clients
         .iter()
         .flat_map(|client| {
-            client
+            let standard = client
                 .open_orders
                 .as_ref()
                 .ok()
@@ -910,7 +919,22 @@ fn authoritative_open_order_symbol(
                         client.venue,
                         client.account_id.clone(),
                     )
-                })
+                });
+            let cancellable = client
+                .cancellable_orders
+                .as_ref()
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter(|order| order.order_id == *order_id)
+                .map(|order| {
+                    (
+                        order.symbol.clone(),
+                        client.venue,
+                        client.account_id.clone(),
+                    )
+                });
+            standard.chain(cancellable)
         })
         .collect::<Vec<_>>();
     match matches.as_slice() {

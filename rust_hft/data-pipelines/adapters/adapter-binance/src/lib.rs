@@ -301,6 +301,7 @@ impl BinanceMarketStream {
 
     pub fn with_usdm(mut self) -> Self {
         self.rest_client = self.rest_client.with_usdm();
+        self.ws_base_url = websocket::usdm_endpoint_for(&self.ws_base_url);
         self.usdm = true;
         self.source_venue = hft_core::VenueId::BINANCE_FUTURES;
         self
@@ -994,6 +995,14 @@ mod tests {
             stream.rest_client.endpoint_paths(),
             ("/fapi/v1/depth", "/fapi/v1/ping")
         );
+    }
+
+    #[test]
+    fn usdm_mode_replaces_the_schema_catalog_spot_stream_endpoint() {
+        let stream = BinanceMarketStream::new()
+            .with_ws_base_url("wss://stream.binance.com:9443/ws")
+            .with_usdm();
+        assert_eq!(stream.ws_base_url, websocket::WS_USDM_BASE_URL);
     }
 
     #[tokio::test]

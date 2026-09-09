@@ -3,8 +3,9 @@
 //! This module is deliberately separate from the Spot adapter.  Binance exposes the two
 //! products through different REST paths and different private-stream payloads; sharing a
 //! client instance would make it possible to submit a perpetual intent to the Spot endpoint.
-//! The adapter only supports the one-way/BOTH account mode and the standard MARKET/LIMIT order
-//! surface represented by Monday's `OrderIntent`.
+//! The adapter only submits the one-way/BOTH account mode and standard MARKET/LIMIT intents
+//! represented by Monday's `OrderIntent`.  Venue conditional/algo orders are read back through
+//! the typed cancellation-reference surface so reconciliation never misclassifies them.
 
 use async_trait::async_trait;
 use execution::{
@@ -20,8 +21,8 @@ use integration::{
     signing::{BinanceCredentials, BinanceSigner},
 };
 use ports::{
-    AccountBalance, AssetInventoryCapability, BoxStream, ExecutionClient, ExecutionEvent,
-    ExecutionSubmissionAttempt, OpenOrder, OrderIntentEnvelope, OrderStatus,
+    AccountBalance, AssetInventoryCapability, BoxStream, CancellableOrderRef, ExecutionClient,
+    ExecutionEvent, ExecutionSubmissionAttempt, OpenOrder, OrderIntentEnvelope, OrderStatus,
     Position as PortPosition, PrivateOrderEventKind,
 };
 use rust_decimal::Decimal;
@@ -42,6 +43,8 @@ const REST_LISTEN_KEY_PATH: &str = "/fapi/v1/listenKey";
 const REST_ACCOUNT_PATH: &str = "/fapi/v3/account";
 const REST_ORDER_PATH: &str = "/fapi/v1/order";
 const REST_OPEN_ORDERS_PATH: &str = "/fapi/v1/openOrders";
+const REST_OPEN_ALGO_ORDERS_PATH: &str = "/fapi/v1/openAlgoOrders";
+const REST_ALGO_ORDER_PATH: &str = "/fapi/v1/algoOrder";
 const USER_STREAM_KEEPALIVE: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_RECV_WINDOW: &str = "5000";
 
@@ -62,6 +65,11 @@ pub struct BinanceUsdMExecutionConfig {
 struct UsdMOrderRecord {
     symbol: String,
     client_order_id: String,
+    order_type: String,
+    native_id: String,
+    canonical_order_id: String,
+    algo_id: Option<u64>,
+    is_algo: bool,
 }
 
 pub struct BinanceUsdMExecutionClient {
@@ -81,6 +89,7 @@ pub struct BinanceUsdMExecutionClient {
     next_client_order_id: Option<String>,
     next_reduce_only: Option<bool>,
     shutdown_tx: Option<watch::Sender<bool>>,
+    private_event_receiver: std::sync::Mutex<Option<broadcast::Receiver<ExecutionEvent>>>,
 }
 
 fn uses_exchange_api(mode: ExecutionMode) -> bool {
@@ -120,6 +129,22 @@ fn timestamp_us(milliseconds: u64, context: &str) -> HftResult<u64> {
             "Binance USD-M {context} timestamp overflows microseconds"
         ))
     })
+}
+
+fn canonical_standard_order_id(symbol: &str, native_id: impl std::fmt::Display) -> OrderId {
+    OrderId(format!("BNUSDM:standard:{symbol}:{native_id}"))
+}
+
+fn canonical_algo_order_id(symbol: &str, native_id: impl std::fmt::Display) -> OrderId {
+    OrderId(format!("BNUSDM:algo:{symbol}:{native_id}"))
+}
+
+fn parse_native_standard_order_id(order_id: &OrderId, symbol: &str) -> Option<String> {
+    order_id
+        .0
+        .strip_prefix(&format!("BNUSDM:standard:{symbol}:"))
+        .filter(|native_id| !native_id.is_empty())
+        .map(str::to_owned)
 }
 
 fn parse_decimal(value: &str, field: &str) -> HftResult<Decimal> {
@@ -244,18 +269,15 @@ fn emit_reconciliation(tx: &broadcast::Sender<ExecutionEvent>, reason: impl Into
 }
 
 fn parse_order_identity(order: &serde_json::Map<String, Value>) -> Option<OrderId> {
+    let symbol = order
+        .get("s")
+        .and_then(Value::as_str)
+        .filter(|symbol| !symbol.is_empty() && symbol.trim() == *symbol)?;
     order
         .get("i")
         .and_then(Value::as_u64)
         .filter(|order_id| *order_id > 0)
-        .map(|order_id| OrderId(order_id.to_string()))
-        .or_else(|| {
-            order
-                .get("c")
-                .and_then(Value::as_str)
-                .filter(|client_order_id| !client_order_id.is_empty())
-                .map(|client_order_id| OrderId(client_order_id.to_string()))
-        })
+        .map(|order_id| canonical_standard_order_id(symbol, order_id))
 }
 
 fn parse_order_report_events(
@@ -533,7 +555,10 @@ async fn run_private_stream(
                             "listenKeyExpired" => Err(HftError::Execution(
                                 "Binance USD-M private listenKey expired".to_string(),
                             )),
-                            "MARGIN_CALL" | "ACCOUNT_CONFIG_UPDATE" => Err(HftError::Execution(
+                            "MARGIN_CALL"
+                            | "ACCOUNT_CONFIG_UPDATE"
+                            | "ALGO_UPDATE"
+                            | "CONDITIONAL_ORDER_TRIGGER_REJECT" => Err(HftError::Execution(
                                 format!("Binance USD-M private event {event_type} requires reconciliation"),
                             )),
                             _ => Ok(Vec::new()),
@@ -609,10 +634,12 @@ async fn run_private_stream(
 #[allow(dead_code)]
 struct BinanceUsdMOrder {
     symbol: String,
-    #[serde(rename = "orderId")]
+    #[serde(default, rename = "orderId")]
     order_id: u64,
-    #[serde(rename = "clientOrderId")]
+    #[serde(default, rename = "clientOrderId")]
     client_order_id: String,
+    #[serde(default, rename = "algoId")]
+    algo_id: Option<u64>,
     price: String,
     #[serde(rename = "origQty")]
     orig_qty: String,
@@ -624,6 +651,116 @@ struct BinanceUsdMOrder {
     update_time: u64,
     side: String,
     r#type: String,
+}
+
+#[derive(Debug)]
+enum UsdMOpenOrderReadback {
+    Standard {
+        order: OpenOrder,
+        record: UsdMOrderRecord,
+    },
+    Conditional(UsdMOrderRecord),
+}
+
+fn is_conditional_order_type(order_type: &str) -> bool {
+    matches!(
+        order_type,
+        "STOP" | "STOP_MARKET" | "TAKE_PROFIT" | "TAKE_PROFIT_MARKET" | "TRAILING_STOP_MARKET"
+    )
+}
+
+fn is_algo_order_type(order_type: &str) -> bool {
+    is_conditional_order_type(order_type) || matches!(order_type, "LIMIT" | "MARKET")
+}
+
+fn parse_usdm_order_readback(order: BinanceUsdMOrder) -> HftResult<UsdMOpenOrderReadback> {
+    if order.symbol.trim() != order.symbol || order.symbol.is_empty() {
+        return Err(HftError::Parse(
+            "Binance USD-M open order has an invalid symbol".to_string(),
+        ));
+    }
+    if order.client_order_id.is_empty() && order.order_id == 0 {
+        return Err(HftError::Parse(
+            "Binance USD-M open order omitted both order identity fields".to_string(),
+        ));
+    }
+    if !order.client_order_id.is_empty() {
+        validate_client_order_id(&order.client_order_id)?;
+    }
+    if is_conditional_order_type(&order.r#type) {
+        let client_order_id = if order.client_order_id.is_empty() {
+            order.order_id.to_string()
+        } else {
+            order.client_order_id
+        };
+        let native_id = order
+            .algo_id
+            .map(|algo_id| algo_id.to_string())
+            .filter(|value| value != "0")
+            .or_else(|| (order.order_id > 0).then(|| order.order_id.to_string()))
+            .unwrap_or_else(|| client_order_id.clone());
+        let canonical_order_id = canonical_algo_order_id(&order.symbol, &native_id);
+        return Ok(UsdMOpenOrderReadback::Conditional(UsdMOrderRecord {
+            symbol: order.symbol,
+            client_order_id,
+            order_type: order.r#type,
+            native_id,
+            canonical_order_id: canonical_order_id.0,
+            algo_id: order.algo_id,
+            is_algo: true,
+        }));
+    }
+    let symbol = order.symbol.clone();
+    let client_order_id = order.client_order_id.clone();
+    let native_id = order.order_id.to_string();
+    let canonical_order_id = canonical_standard_order_id(&symbol, order.order_id);
+    let parsed = parse_usdm_open_order(order)?;
+    Ok(UsdMOpenOrderReadback::Standard {
+        order: parsed,
+        record: UsdMOrderRecord {
+            symbol,
+            client_order_id,
+            order_type: "STANDARD".to_string(),
+            native_id,
+            canonical_order_id: canonical_order_id.0,
+            algo_id: None,
+            is_algo: false,
+        },
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceUsdMAlgoOrder {
+    #[serde(rename = "algoId")]
+    algo_id: u64,
+    #[serde(rename = "clientAlgoId")]
+    client_algo_id: String,
+    #[serde(rename = "orderType")]
+    order_type: String,
+    symbol: String,
+}
+
+fn parse_usdm_algo_order_record(order: BinanceUsdMAlgoOrder) -> HftResult<UsdMOrderRecord> {
+    if order.algo_id == 0
+        || order.symbol.is_empty()
+        || order.symbol.trim() != order.symbol
+        || !is_algo_order_type(&order.order_type)
+    {
+        return Err(HftError::Parse(
+            "Binance USD-M algo order has an invalid identity, symbol, or order type".to_string(),
+        ));
+    }
+    validate_client_order_id(&order.client_algo_id)?;
+    let canonical_order_id = canonical_algo_order_id(&order.symbol, order.algo_id);
+    Ok(UsdMOrderRecord {
+        symbol: order.symbol,
+        client_order_id: order.client_algo_id,
+        order_type: order.order_type,
+        native_id: order.algo_id.to_string(),
+        canonical_order_id: canonical_order_id.0,
+        algo_id: Some(order.algo_id),
+        is_algo: true,
+    })
 }
 
 fn parse_usdm_open_order(order: BinanceUsdMOrder) -> HftResult<OpenOrder> {
@@ -693,7 +830,7 @@ fn parse_usdm_open_order(order: BinanceUsdMOrder) -> HftResult<OpenOrder> {
         )));
     }
     Ok(OpenOrder {
-        order_id: OrderId(order.order_id.to_string()),
+        order_id: canonical_standard_order_id(&order.symbol, order.order_id),
         client_order_id: Some(order.client_order_id),
         symbol: Symbol::from(order.symbol),
         side,
@@ -738,7 +875,7 @@ fn parse_usdm_place_response(
         ));
     }
     let _ = timestamp_us(placed.update_time, "place response")?;
-    Ok(OrderId(placed.order_id.to_string()))
+    Ok(canonical_standard_order_id(&placed.symbol, placed.order_id))
 }
 
 #[derive(Debug, Deserialize)]
@@ -750,19 +887,72 @@ struct BinanceUsdMCancelResponse {
     client_order_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct BinanceUsdMCancelAlgoResponse {
+    #[serde(default, rename = "algoId")]
+    algo_id: Option<u64>,
+    #[serde(default, rename = "clientAlgoId")]
+    client_algo_id: Option<String>,
+    #[serde(default)]
+    symbol: Option<String>,
+}
+
 fn validate_usdm_cancel_response(
     canceled: &BinanceUsdMCancelResponse,
     requested_order_id: &OrderId,
-    expected_symbol: &str,
+    record: &UsdMOrderRecord,
 ) -> HftResult<()> {
-    let identity_matches = if requested_order_id.0.parse::<u64>().is_ok() {
-        canceled.order_id.to_string() == requested_order_id.0
-    } else {
-        canceled.client_order_id == requested_order_id.0
-    };
-    if canceled.symbol != expected_symbol || !identity_matches || canceled.order_id == 0 {
+    let canonical_identity = canonical_standard_order_id(&canceled.symbol, canceled.order_id);
+    let identity_matches = record.canonical_order_id == requested_order_id.0
+        && canonical_identity.0 == requested_order_id.0;
+    if canceled.symbol != record.symbol
+        || canceled.client_order_id != record.client_order_id
+        || !identity_matches
+        || canceled.order_id == 0
+    {
         return Err(HftError::Execution(
             "Binance USD-M cancel response did not match the requested order".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_usdm_cancel_algo_response(
+    canceled: &BinanceUsdMCancelAlgoResponse,
+    requested_order_id: &OrderId,
+    record: &UsdMOrderRecord,
+) -> HftResult<()> {
+    if requested_order_id.0 != record.canonical_order_id {
+        return Err(HftError::Execution(
+            "Binance USD-M algo cancel request identity did not match the canonical order"
+                .to_string(),
+        ));
+    }
+    let mut saw_identity = false;
+    if let Some(algo_id) = canceled.algo_id {
+        saw_identity = true;
+        if record.algo_id != Some(algo_id) {
+            return Err(HftError::Execution(
+                "Binance USD-M algo cancel response had a mismatched algoId".to_string(),
+            ));
+        }
+    }
+    if let Some(client_id) = canceled.client_algo_id.as_deref() {
+        saw_identity = true;
+        if client_id != record.client_order_id {
+            return Err(HftError::Execution(
+                "Binance USD-M algo cancel response had a mismatched clientAlgoId".to_string(),
+            ));
+        }
+    }
+    if !saw_identity
+        || canceled
+            .symbol
+            .as_deref()
+            .is_some_and(|symbol| symbol != record.symbol.as_str())
+    {
+        return Err(HftError::Execution(
+            "Binance USD-M algo cancel response did not match the requested order".to_string(),
         ));
     }
     Ok(())
@@ -786,7 +976,7 @@ struct BinanceUsdMPosition {
     position_amt: String,
     #[serde(rename = "entryPrice")]
     entry_price: String,
-    #[serde(rename = "unRealizedProfit")]
+    #[serde(rename = "unrealizedProfit", alias = "unRealizedProfit")]
     unrealized_profit: String,
     #[serde(rename = "positionSide")]
     position_side: String,
@@ -899,7 +1089,7 @@ fn parse_usdm_positions(account: BinanceUsdMAccountResponse) -> HftResult<Vec<Po
                     ))))
                 }
             };
-            let unrealized_pnl = match parse_decimal(&position.unrealized_profit, "unRealizedProfit") {
+            let unrealized_pnl = match parse_decimal(&position.unrealized_profit, "unrealizedProfit") {
                 Ok(value) => value,
                 Err(error) => return Some(Err(error)),
             };
@@ -935,6 +1125,7 @@ impl BinanceUsdMExecutionClient {
             next_client_order_id: None,
             next_reduce_only: None,
             shutdown_tx: None,
+            private_event_receiver: std::sync::Mutex::new(None),
         }
     }
 
@@ -1079,13 +1270,15 @@ impl BinanceUsdMExecutionClient {
         Ok(id)
     }
 
-    fn remember_order(&self, order_id: &OrderId, record: UsdMOrderRecord) {
+    fn remember_order(&self, order_id: &OrderId, mut record: UsdMOrderRecord) -> HftResult<()> {
         let mut records = self
             .order_records
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        records.insert(order_id.0.clone(), record.clone());
-        records.insert(record.client_order_id.clone(), record);
+        record.canonical_order_id = order_id.0.clone();
+        records.retain(|_, existing| existing.canonical_order_id != order_id.0);
+        records.insert(order_id.0.clone(), record);
+        Ok(())
     }
 
     fn order_record(&self, order_id: &OrderId) -> Option<UsdMOrderRecord> {
@@ -1101,10 +1294,7 @@ impl BinanceUsdMExecutionClient {
             .order_records
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(record) = records.remove(&order_id.0) {
-            records.remove(&record.client_order_id);
-            records.retain(|_, value| value.client_order_id != record.client_order_id);
-        }
+        records.remove(&order_id.0);
     }
 
     fn signed_query(&self, mut params: HashMap<String, String>) -> HftResult<String> {
@@ -1205,8 +1395,22 @@ impl ExecutionClient for BinanceUsdMExecutionClient {
             UsdMOrderRecord {
                 symbol: intent.symbol.as_str().to_string(),
                 client_order_id,
+                order_type: match intent.order_type {
+                    hft_core::OrderType::Market => "MARKET",
+                    hft_core::OrderType::Limit => "LIMIT",
+                }
+                .to_string(),
+                native_id: parse_native_standard_order_id(&order_id, intent.symbol.as_str())
+                    .ok_or_else(|| {
+                        HftError::Execution(
+                            "Binance USD-M canonical order identity is malformed".to_string(),
+                        )
+                    })?,
+                canonical_order_id: order_id.0.clone(),
+                algo_id: None,
+                is_algo: false,
             },
-        );
+        )?;
         Ok(order_id)
     }
 
@@ -1256,12 +1460,18 @@ impl ExecutionClient for BinanceUsdMExecutionClient {
             ("symbol".to_string(), record.symbol.clone()),
             ("recvWindow".to_string(), DEFAULT_RECV_WINDOW.to_string()),
         ]);
-        if order_id.0.parse::<u64>().is_ok() {
-            params.insert("orderId".to_string(), order_id.0.clone());
+        let path_prefix = if record.is_algo {
+            if let Some(algo_id) = record.algo_id {
+                params.insert("algoId".to_string(), algo_id.to_string());
+            } else {
+                params.insert("clientAlgoId".to_string(), record.client_order_id.clone());
+            }
+            REST_ALGO_ORDER_PATH
         } else {
-            params.insert("origClientOrderId".to_string(), order_id.0.clone());
-        }
-        let path = format!("{REST_ORDER_PATH}?{}", self.signed_query(params)?);
+            params.insert("orderId".to_string(), record.native_id.clone());
+            REST_ORDER_PATH
+        };
+        let path = format!("{path_prefix}?{}", self.signed_query(params)?);
         let signer = self.signer("cancel_order")?;
         let http = self.snapshot_http()?;
         let response = http
@@ -1276,11 +1486,19 @@ impl ExecutionClient for BinanceUsdMExecutionClient {
         if !response.status().is_success() {
             return Err(response_error(response, "cancel_order").await);
         }
-        let canceled: BinanceUsdMCancelResponse =
-            HttpClient::parse_json(response).await.map_err(|error| {
-                HftError::Serialization(format!("Binance USD-M cancel_order: {error}"))
-            })?;
-        validate_usdm_cancel_response(&canceled, order_id, &record.symbol)?;
+        if record.is_algo {
+            let canceled: BinanceUsdMCancelAlgoResponse =
+                HttpClient::parse_json(response).await.map_err(|error| {
+                    HftError::Serialization(format!("Binance USD-M algo cancel_order: {error}"))
+                })?;
+            validate_usdm_cancel_algo_response(&canceled, order_id, &record)?;
+        } else {
+            let canceled: BinanceUsdMCancelResponse =
+                HttpClient::parse_json(response).await.map_err(|error| {
+                    HftError::Serialization(format!("Binance USD-M cancel_order: {error}"))
+                })?;
+            validate_usdm_cancel_response(&canceled, order_id, &record)?;
+        }
         self.forget_order(order_id);
         if let Some(tx) = &self.event_tx {
             let _ = tx.send(ExecutionEvent::OrderCanceled {
@@ -1314,7 +1532,12 @@ impl ExecutionClient for BinanceUsdMExecutionClient {
 
     async fn execution_stream(&self) -> HftResult<BoxStream<ExecutionEvent>> {
         if let Some(tx) = &self.event_tx {
-            let receiver = tx.subscribe();
+            let receiver = self
+                .private_event_receiver
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .unwrap_or_else(|| tx.subscribe());
             let stream = tokio_stream::wrappers::BroadcastStream::new(receiver).filter_map(
                 |result| async move {
                     match result {
@@ -1369,22 +1592,58 @@ impl ExecutionClient for BinanceUsdMExecutionClient {
         let orders: Vec<BinanceUsdMOrder> = self
             .signed_json(reqwest::Method::GET, &path, "list_open_orders")
             .await?;
-        let parsed = orders
-            .into_iter()
-            .map(parse_usdm_open_order)
-            .collect::<HftResult<Vec<_>>>()?;
-        for order in &parsed {
-            if let Some(client_order_id) = order.client_order_id.clone() {
-                self.remember_order(
-                    &order.order_id,
-                    UsdMOrderRecord {
-                        symbol: order.symbol.as_str().to_string(),
-                        client_order_id,
-                    },
-                );
+        let mut parsed = Vec::new();
+        for order in orders {
+            match parse_usdm_order_readback(order)? {
+                UsdMOpenOrderReadback::Standard { order, record } => {
+                    self.remember_order(&order.order_id, record)?;
+                    parsed.push(order);
+                }
+                UsdMOpenOrderReadback::Conditional(record) => {
+                    let identity = OrderId(record.canonical_order_id.clone());
+                    self.remember_order(&identity, record)?;
+                }
             }
         }
         Ok(parsed)
+    }
+
+    async fn list_cancellable_orders(&self) -> HftResult<Vec<CancellableOrderRef>> {
+        self.require_private_access("list_cancellable_orders")?;
+        let params = HashMap::from([("recvWindow".to_string(), DEFAULT_RECV_WINDOW.to_string())]);
+        let path = format!(
+            "{REST_OPEN_ALGO_ORDERS_PATH}?{}",
+            self.signed_query(params)?
+        );
+        let algo_orders: Vec<BinanceUsdMAlgoOrder> = self
+            .signed_json(reqwest::Method::GET, &path, "list_cancellable_orders")
+            .await?;
+        for algo_order in algo_orders {
+            let record = parse_usdm_algo_order_record(algo_order)?;
+            let identity = OrderId(record.canonical_order_id.clone());
+            self.remember_order(&identity, record)?;
+        }
+
+        let mut seen = HashSet::new();
+        let records = self
+            .order_records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(records
+            .values()
+            .filter(|record| record.is_algo)
+            .filter_map(|record| {
+                let order_id = OrderId(record.canonical_order_id.clone());
+                seen.insert(order_id.0.clone())
+                    .then(|| CancellableOrderRef {
+                        order_id,
+                        client_order_id: Some(record.client_order_id.clone()),
+                        symbol: Symbol::from(record.symbol.clone()),
+                        order_type: record.order_type.clone(),
+                        algo_id: record.algo_id,
+                    })
+            })
+            .collect())
     }
 
     async fn connect(&mut self) -> HftResult<()> {
@@ -1428,8 +1687,12 @@ impl ExecutionClient for BinanceUsdMExecutionClient {
             });
         }
         self.resilient_executor = Some(Arc::new(executor));
-        let (event_tx, _) = broadcast::channel(1000);
+        let (event_tx, event_rx) = broadcast::channel(1000);
         self.event_tx = Some(event_tx.clone());
+        *self
+            .private_event_receiver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(event_rx);
         self.ensure_http()?;
 
         if uses_exchange_api(self.mode) {
@@ -1468,6 +1731,10 @@ impl ExecutionClient for BinanceUsdMExecutionClient {
             .store(false, Ordering::Release);
         self.listen_key = None;
         self.event_tx = None;
+        self.private_event_receiver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         self.connected = false;
         Ok(())
     }
@@ -1528,6 +1795,7 @@ mod tests {
             symbol: "BTCUSDT".to_string(),
             order_id: 42,
             client_order_id: "client-42".to_string(),
+            algo_id: None,
             price: "50000".to_string(),
             orig_qty: "1".to_string(),
             executed_qty: "0.25".to_string(),
@@ -1566,7 +1834,10 @@ mod tests {
     #[test]
     fn usd_m_open_order_preserves_numeric_and_client_identity() {
         let order = parse_usdm_open_order(valid_order()).unwrap();
-        assert_eq!(order.order_id, OrderId("42".to_string()));
+        assert_eq!(
+            order.order_id,
+            OrderId("BNUSDM:standard:BTCUSDT:42".to_string())
+        );
         assert_eq!(order.client_order_id.as_deref(), Some("client-42"));
         assert_eq!(order.filled_quantity, Quantity::from_f64(0.25).unwrap());
         assert_eq!(order.remaining_quantity, Quantity::from_f64(0.75).unwrap());
@@ -1580,8 +1851,8 @@ mod tests {
             "o":{"s":"BTCUSDT","c":"client-42","i":42,"x":"TRADE","X":"PARTIALLY_FILLED","l":"0.25","L":"50000","z":"0.25","ap":"50000","t":7,"n":"0.01","N":"USDT"}
         });
         let events = parse_order_report_events(&partial, 99).unwrap();
-        assert!(events.iter().any(|event| matches!(event, ExecutionEvent::Fill { order_id, fill_id, .. } if order_id == &OrderId("42".into()) && fill_id == "BNUSDMFILL-42-7")));
-        assert!(events.iter().any(|event| matches!(event, ExecutionEvent::FeeCharged { order_id, amount, fill_id, .. } if order_id == &OrderId("42".into()) && *amount == Decimal::new(1, 2) && fill_id == "BNUSDMFILL-42-7")));
+        assert!(events.iter().any(|event| matches!(event, ExecutionEvent::Fill { order_id, fill_id, .. } if order_id == &OrderId("BNUSDM:standard:BTCUSDT:42".into()) && fill_id == "BNUSDMFILL-BNUSDM:standard:BTCUSDT:42-7")));
+        assert!(events.iter().any(|event| matches!(event, ExecutionEvent::FeeCharged { order_id, amount, fill_id, .. } if order_id == &OrderId("BNUSDM:standard:BTCUSDT:42".into()) && *amount == Decimal::new(1, 2) && fill_id == "BNUSDMFILL-BNUSDM:standard:BTCUSDT:42-7")));
         assert!(!events
             .iter()
             .any(|event| matches!(event, ExecutionEvent::OrderCompleted { .. })));
@@ -1591,7 +1862,7 @@ mod tests {
             "o":{"s":"BTCUSDT","c":"client-42","i":42,"x":"TRADE","X":"FILLED","l":"0.75","L":"50100","z":"1","ap":"50075","t":8}
         });
         let events = parse_order_report_events(&filled, 100).unwrap();
-        assert!(events.iter().any(|event| matches!(event, ExecutionEvent::OrderCompleted { order_id, final_price, total_filled, .. } if order_id == &OrderId("42".into()) && *final_price == Price::from_f64(50075.0).unwrap() && *total_filled == Quantity::from_f64(1.0).unwrap())));
+        assert!(events.iter().any(|event| matches!(event, ExecutionEvent::OrderCompleted { order_id, final_price, total_filled, .. } if order_id == &OrderId("BNUSDM:standard:BTCUSDT:42".into()) && *final_price == Price::from_f64(50075.0).unwrap() && *total_filled == Quantity::from_f64(1.0).unwrap())));
     }
 
     #[test]
@@ -1601,14 +1872,14 @@ mod tests {
             "o":{"s":"BTCUSDT","c":"client-42","i":42,"x":"CANCELED","X":"CANCELED"}
         });
         let events = parse_order_report_events(&canceled, 1).unwrap();
-        assert!(events.iter().any(|event| matches!(event, ExecutionEvent::OrderCanceled { order_id, .. } if order_id == &OrderId("42".into()))));
+        assert!(events.iter().any(|event| matches!(event, ExecutionEvent::OrderCanceled { order_id, .. } if order_id == &OrderId("BNUSDM:standard:BTCUSDT:42".into()))));
 
         let rejected = serde_json::json!({
             "e":"ORDER_TRADE_UPDATE", "E":1000,
             "o":{"s":"BTCUSDT","c":"client-42","i":42,"x":"NEW","X":"REJECTED","r":"MARGIN_NOT_SUFFICIENT"}
         });
         let events = parse_order_report_events(&rejected, 1).unwrap();
-        assert!(events.iter().any(|event| matches!(event, ExecutionEvent::OrderReject { order_id, reason, .. } if order_id == &OrderId("42".into()) && reason == "MARGIN_NOT_SUFFICIENT")));
+        assert!(events.iter().any(|event| matches!(event, ExecutionEvent::OrderReject { order_id, reason, .. } if order_id == &OrderId("BNUSDM:standard:BTCUSDT:42".into()) && reason == "MARGIN_NOT_SUFFICIENT")));
     }
 
     #[tokio::test]
@@ -1637,7 +1908,10 @@ mod tests {
             OrderIntentEnvelope::new(perp_intent(), lifecycle).with_client_order_id("client-usdm");
 
         let order_id = client.place_order_envelope(&envelope).await.unwrap();
-        assert_eq!(order_id, OrderId("9001".to_string()));
+        assert_eq!(
+            order_id,
+            OrderId("BNUSDM:standard:BTCUSDT:9001".to_string())
+        );
         client.cancel_order(&order_id).await.unwrap();
         let requests = server.await.unwrap();
 
@@ -1670,13 +1944,16 @@ mod tests {
         let orders = client.list_open_orders().await.unwrap();
         let requests = server.await.unwrap();
         assert_eq!(orders.len(), 1);
-        assert_eq!(orders[0].order_id, OrderId("9001".to_string()));
+        assert_eq!(
+            orders[0].order_id,
+            OrderId("BNUSDM:standard:BTCUSDT:9001".to_string())
+        );
         assert_eq!(orders[0].client_order_id.as_deref(), Some("client-usdm"));
         assert!(requests[0].starts_with("GET /fapi/v1/openOrders?"));
     }
 
     #[tokio::test]
-    async fn usd_m_open_order_readback_seeds_symbol_for_client_id_cancellation() {
+    async fn usd_m_open_order_readback_seeds_symbol_for_canonical_cancellation() {
         let (base_url, server) = rest_server(vec![
             (
                 "200 OK",
@@ -1695,12 +1972,121 @@ mod tests {
         let mut client = BinanceUsdMExecutionClient::new(cfg);
 
         let orders = client.list_open_orders().await.unwrap();
-        let client_order_id = OrderId(orders[0].client_order_id.clone().unwrap());
-        client.cancel_order(&client_order_id).await.unwrap();
+        let order_id = orders[0].order_id.clone();
+        client.cancel_order(&order_id).await.unwrap();
         let requests = server.await.unwrap();
         assert_eq!(requests.len(), 2);
         assert!(requests[1].starts_with("DELETE /fapi/v1/order?"));
-        assert!(requests[1].contains("origClientOrderId=client-usdm"));
+        assert!(requests[1].contains("orderId=9001"));
+    }
+
+    #[tokio::test]
+    async fn usd_m_same_native_order_id_is_namespaced_by_symbol_for_cache_and_cancel() {
+        let (base_url, server) = rest_server(vec![
+            (
+                "200 OK",
+                r#"[{"symbol":"BTCUSDT","orderId":42,"clientOrderId":"btc-42","price":"50000","origQty":"1","executedQty":"0","status":"NEW","time":1,"updateTime":2,"side":"BUY","type":"LIMIT"}]"#.to_string(),
+            ),
+            (
+                "200 OK",
+                r#"[{"symbol":"ETHUSDT","orderId":42,"clientOrderId":"eth-42","price":"3000","origQty":"1","executedQty":"0","status":"NEW","time":1,"updateTime":2,"side":"BUY","type":"LIMIT"}]"#.to_string(),
+            ),
+            (
+                "200 OK",
+                r#"{"symbol":"BTCUSDT","orderId":42,"clientOrderId":"btc-42"}"#.to_string(),
+            ),
+            (
+                "200 OK",
+                r#"{"symbol":"ETHUSDT","orderId":42,"clientOrderId":"eth-42"}"#.to_string(),
+            ),
+        ])
+        .await;
+        let mut cfg = config(ExecutionMode::Testnet);
+        cfg.credentials =
+            BinanceCredentials::new("test-key".to_string(), "test-secret".to_string());
+        cfg.rest_base_url = base_url;
+        let mut client = BinanceUsdMExecutionClient::new(cfg);
+
+        let btc = client.list_open_orders().await.unwrap()[0].order_id.clone();
+        let eth = client.list_open_orders().await.unwrap()[0].order_id.clone();
+        assert_eq!(btc, OrderId("BNUSDM:standard:BTCUSDT:42".to_string()));
+        assert_eq!(eth, OrderId("BNUSDM:standard:ETHUSDT:42".to_string()));
+        let btc_events = parse_order_report_events(
+            &serde_json::json!({
+                "e":"ORDER_TRADE_UPDATE", "E":1000,
+                "o":{"s":"BTCUSDT","c":"btc-42","i":42,"x":"CANCELED","X":"CANCELED"}
+            }),
+            1,
+        )
+        .unwrap();
+        let eth_events = parse_order_report_events(
+            &serde_json::json!({
+                "e":"ORDER_TRADE_UPDATE", "E":1000,
+                "o":{"s":"ETHUSDT","c":"eth-42","i":42,"x":"CANCELED","X":"CANCELED"}
+            }),
+            1,
+        )
+        .unwrap();
+        assert!(btc_events.iter().any(|event| matches!(
+            event,
+            ExecutionEvent::OrderCanceled { order_id, .. }
+                if order_id == &btc
+        )));
+        assert!(eth_events.iter().any(|event| matches!(
+            event,
+            ExecutionEvent::OrderCanceled { order_id, .. }
+                if order_id == &eth
+        )));
+        client.cancel_order(&btc).await.unwrap();
+        client.cancel_order(&eth).await.unwrap();
+
+        let requests = server.await.unwrap();
+        assert!(requests[2].contains("symbol=BTCUSDT"));
+        assert!(requests[3].contains("symbol=ETHUSDT"));
+        assert!(requests[2].contains("orderId=42"));
+        assert!(requests[3].contains("orderId=42"));
+    }
+
+    #[tokio::test]
+    async fn usd_m_client_id_metadata_can_repeat_when_canonical_id_is_distinct() {
+        let (base_url, server) = rest_server(vec![
+            (
+                "200 OK",
+                r#"[{"symbol":"BTCUSDT","orderId":42,"clientOrderId":"same-id","price":"50000","origQty":"1","executedQty":"0","status":"NEW","time":1,"updateTime":2,"side":"BUY","type":"LIMIT"}]"#.to_string(),
+            ),
+            (
+                "200 OK",
+                r#"[{"symbol":"ETHUSDT","orderId":42,"clientOrderId":"same-id","price":"3000","origQty":"1","executedQty":"0","status":"NEW","time":1,"updateTime":2,"side":"BUY","type":"LIMIT"}]"#.to_string(),
+            ),
+            (
+                "200 OK",
+                r#"{"symbol":"BTCUSDT","orderId":42,"clientOrderId":"same-id"}"#.to_string(),
+            ),
+            (
+                "200 OK",
+                r#"{"symbol":"ETHUSDT","orderId":42,"clientOrderId":"same-id"}"#.to_string(),
+            ),
+        ])
+        .await;
+        let mut cfg = config(ExecutionMode::Testnet);
+        cfg.credentials =
+            BinanceCredentials::new("test-key".to_string(), "test-secret".to_string());
+        cfg.rest_base_url = base_url;
+        let mut client = BinanceUsdMExecutionClient::new(cfg);
+        let btc = client.list_open_orders().await.unwrap()[0].order_id.clone();
+        let eth = client.list_open_orders().await.unwrap()[0].order_id.clone();
+        assert_eq!(btc, OrderId("BNUSDM:standard:BTCUSDT:42".to_string()));
+        assert_eq!(eth, OrderId("BNUSDM:standard:ETHUSDT:42".to_string()));
+        assert!(matches!(
+            client.cancel_order(&OrderId("same-id".to_string())).await,
+            Err(HftError::OrderNotFound(_))
+        ));
+        client.cancel_order(&btc).await.unwrap();
+        client.cancel_order(&eth).await.unwrap();
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[2].contains("symbol=BTCUSDT"));
+        assert!(requests[3].contains("symbol=ETHUSDT"));
     }
 
     #[tokio::test]
@@ -1751,11 +2137,11 @@ mod tests {
         let (base_url, server) = rest_server(vec![
             (
                 "200 OK",
-                r#"{"assets":[{"asset":"USDT","walletBalance":"100","availableBalance":"90"}],"positions":[{"symbol":"BTCUSDT","positionAmt":"0.01","entryPrice":"50000","unRealizedProfit":"-2.5","positionSide":"BOTH"}]}"#.to_string(),
+                r#"{"assets":[{"asset":"USDT","walletBalance":"100","availableBalance":"90"}],"positions":[{"symbol":"BTCUSDT","positionAmt":"0.01","entryPrice":"50000","unrealizedProfit":"-2.5","positionSide":"BOTH"}]}"#.to_string(),
             ),
             (
                 "200 OK",
-                r#"{"assets":[{"asset":"USDT","walletBalance":"100","availableBalance":"90"}],"positions":[{"symbol":"BTCUSDT","positionAmt":"0.01","entryPrice":"50000","unRealizedProfit":"-2.5","positionSide":"BOTH"}]}"#.to_string(),
+                r#"{"assets":[{"asset":"USDT","walletBalance":"100","availableBalance":"90"}],"positions":[{"symbol":"BTCUSDT","positionAmt":"0.01","entryPrice":"50000","unrealizedProfit":"-2.5","positionSide":"BOTH"}]}"#.to_string(),
             ),
         ])
         .await;
@@ -1800,10 +2186,49 @@ mod tests {
             order_id: 1,
             client_order_id: "expected".to_string(),
         };
+        let cancel_record = UsdMOrderRecord {
+            symbol: "BTCUSDT".to_string(),
+            client_order_id: "expected".to_string(),
+            order_type: "STANDARD".to_string(),
+            native_id: "1".to_string(),
+            canonical_order_id: "BNUSDM:standard:BTCUSDT:1".to_string(),
+            algo_id: None,
+            is_algo: false,
+        };
         assert!(matches!(
-            validate_usdm_cancel_response(&cancel, &OrderId("1".to_string()), "BTCUSDT"),
+            validate_usdm_cancel_response(
+                &cancel,
+                &OrderId("BNUSDM:standard:BTCUSDT:1".to_string()),
+                &cancel_record
+            ),
             Err(HftError::Execution(message)) if message.contains("cancel response")
         ));
+    }
+
+    #[test]
+    fn usd_m_algo_cancel_response_requires_all_returned_identity_fields_to_match() {
+        let record = UsdMOrderRecord {
+            symbol: "BTCUSDT".to_string(),
+            client_order_id: "algo-42".to_string(),
+            order_type: "STOP_MARKET".to_string(),
+            native_id: "42".to_string(),
+            canonical_order_id: "BNUSDM:algo:BTCUSDT:42".to_string(),
+            algo_id: Some(42),
+            is_algo: true,
+        };
+        let requested = OrderId(record.canonical_order_id.clone());
+        let wrong_algo = BinanceUsdMCancelAlgoResponse {
+            algo_id: Some(43),
+            client_algo_id: Some("algo-42".to_string()),
+            symbol: Some("BTCUSDT".to_string()),
+        };
+        assert!(validate_usdm_cancel_algo_response(&wrong_algo, &requested, &record).is_err());
+        let wrong_client = BinanceUsdMCancelAlgoResponse {
+            algo_id: Some(42),
+            client_algo_id: Some("algo-43".to_string()),
+            symbol: Some("BTCUSDT".to_string()),
+        };
+        assert!(validate_usdm_cancel_algo_response(&wrong_client, &requested, &record).is_err());
     }
 
     #[test]
@@ -2040,5 +2465,81 @@ mod tests {
         let client = BinanceUsdMExecutionClient::new(config(ExecutionMode::Paper));
         let mut stream = client.execution_stream().await.unwrap();
         assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn usd_m_private_stream_retains_reports_before_execution_stream_subscription() {
+        let mut client = BinanceUsdMExecutionClient::new(config(ExecutionMode::Testnet));
+        let (tx, rx) = broadcast::channel(8);
+        client.event_tx = Some(tx.clone());
+        *client
+            .private_event_receiver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rx);
+        tx.send(ExecutionEvent::ConnectionStatus {
+            connected: true,
+            timestamp: 1,
+        })
+        .unwrap();
+
+        let mut stream = client.execution_stream().await.unwrap();
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            ExecutionEvent::ConnectionStatus {
+                connected: true,
+                timestamp: 1
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn usd_m_algo_orders_are_read_back_and_cancelled_via_algo_endpoint() {
+        let (base_url, server) = rest_server(vec![
+            (
+                "200 OK",
+                r#"[{"symbol":"BTCUSDT","orderId":9002,"clientOrderId":"same-id","price":"50000","origQty":"1","executedQty":"0","status":"NEW","time":1,"updateTime":2,"side":"SELL","type":"LIMIT"}]"#.to_string(),
+            ),
+            (
+                "200 OK",
+                r#"[{"algoId":9002,"clientAlgoId":"same-id","orderType":"STOP_MARKET","symbol":"BTCUSDT"}]"#.to_string(),
+            ),
+            (
+                "200 OK",
+                r#"{"symbol":"BTCUSDT","orderId":9002,"clientOrderId":"same-id"}"#.to_string(),
+            ),
+            (
+                "200 OK",
+                r#"{"algoId":9002,"clientAlgoId":"same-id","symbol":"BTCUSDT","code":"200"}"#.to_string(),
+            ),
+        ])
+        .await;
+        let mut cfg = config(ExecutionMode::Testnet);
+        cfg.credentials =
+            BinanceCredentials::new("test-key".to_string(), "test-secret".to_string());
+        cfg.rest_base_url = base_url;
+        let mut client = BinanceUsdMExecutionClient::new(cfg);
+
+        let open_orders = client.list_open_orders().await.unwrap();
+        assert_eq!(open_orders.len(), 1);
+        assert_eq!(
+            open_orders[0].order_id,
+            OrderId("BNUSDM:standard:BTCUSDT:9002".to_string())
+        );
+        let cancellable = client.list_cancellable_orders().await.unwrap();
+        assert_eq!(cancellable.len(), 1);
+        assert_eq!(
+            cancellable[0].order_id,
+            OrderId("BNUSDM:algo:BTCUSDT:9002".to_string())
+        );
+        assert_eq!(cancellable[0].order_type, "STOP_MARKET");
+        client.cancel_order(&open_orders[0].order_id).await.unwrap();
+        client.cancel_order(&cancellable[0].order_id).await.unwrap();
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[1].starts_with("GET /fapi/v1/openAlgoOrders?"));
+        assert!(requests[2].starts_with("DELETE /fapi/v1/order?"));
+        assert!(requests[3].starts_with("DELETE /fapi/v1/algoOrder?"));
+        assert!(requests[3].contains("algoId=9002"));
     }
 }

@@ -16,8 +16,8 @@ use hft_core::{
 use hft_core::{Symbol, VenueId};
 use ports::{
     AccountBalance, AccountExecutionAdmission, AccountExecutionEnvironment, AccountReadbackState,
-    AssetInventoryCapability, AssetInventoryRecord, ExecutionClient, ExecutionEvent,
-    ExecutionRouter, OpenOrder, OrderIntent, OrderIntentEnvelope,
+    AssetInventoryCapability, AssetInventoryRecord, CancellableOrderRef, ExecutionClient,
+    ExecutionEvent, ExecutionRouter, OpenOrder, OrderIntent, OrderIntentEnvelope,
 };
 use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet};
@@ -2292,6 +2292,7 @@ pub struct ClientReconcileSnapshot {
     /// Opaque, runtime-owned account admission evidence. This is never supplied by an adapter.
     pub account_admission: Option<AccountExecutionAdmission>,
     pub open_orders: Result<Vec<OpenOrder>, HftError>,
+    pub cancellable_orders: Result<Vec<CancellableOrderRef>, HftError>,
     pub balances: Option<Result<Vec<AccountBalance>, HftError>>,
     pub positions: Option<Result<Vec<ports::Position>, HftError>>,
     pub recent_fills: Option<Result<Vec<ports::AccountFill>, HftError>>,
@@ -2310,6 +2311,7 @@ impl Default for ClientReconcileSnapshot {
             account_environment: None,
             account_admission: None,
             open_orders: Ok(Vec::new()),
+            cancellable_orders: Ok(Vec::new()),
             balances: None,
             positions: None,
             recent_fills: None,
@@ -2337,6 +2339,7 @@ impl WorkerReconcileSnapshot {
         !self.clients.is_empty()
             && self.clients.iter().all(|client| {
                 client.open_orders.is_ok()
+                    && client.cancellable_orders.is_ok()
                     && client
                         .balances
                         .as_ref()
@@ -2623,14 +2626,22 @@ impl ExecutionWorker {
         }
         let mut reconciled = FxHashMap::default();
         for client in &snapshot.clients {
-            let (Some(account_id), Ok(open_orders)) = (&client.account_id, &client.open_orders)
-            else {
+            let (Some(account_id), Ok(open_orders), Ok(cancellable_orders)) = (
+                &client.account_id,
+                &client.open_orders,
+                &client.cancellable_orders,
+            ) else {
                 continue;
             };
-            reconciled
+            let ids = reconciled
                 .entry(account_id.clone())
-                .or_insert_with(HashSet::new)
-                .extend(open_orders.iter().map(|order| order.order_id.clone()));
+                .or_insert_with(HashSet::new);
+            ids.extend(open_orders.iter().map(|order| order.order_id.clone()));
+            ids.extend(
+                cancellable_orders
+                    .iter()
+                    .map(|order| order.order_id.clone()),
+            );
         }
         self.reconciled_open_order_ids = reconciled;
     }
@@ -2649,6 +2660,15 @@ impl ExecutionWorker {
             let Ok(exchange_orders) = &client.open_orders else {
                 return false;
             };
+            let Ok(cancellable_orders) = &client.cancellable_orders else {
+                return false;
+            };
+            if !cancellable_orders.is_empty() {
+                // Conditional/algo orders are intentionally exposed as typed cancellation
+                // references.  They must be explicitly cancelled before private-stream recovery
+                // can claim a standard OMS snapshot is reconciled.
+                return false;
+            }
             let local_orders = self
                 .tracked_orders
                 .iter()
@@ -2703,6 +2723,7 @@ impl ExecutionWorker {
                 .cloned();
             let client = &mut self.execution_clients[idx];
             let open_orders = client.list_open_orders().await;
+            let cancellable_orders = client.list_cancellable_orders().await;
             #[cfg(feature = "metrics")]
             {
                 infra_metrics::MetricsRegistry::global().inc_reconcile_runs();
@@ -2758,6 +2779,7 @@ impl ExecutionWorker {
                 account_environment,
                 account_admission,
                 open_orders,
+                cancellable_orders,
                 balances,
                 positions,
                 recent_fills,

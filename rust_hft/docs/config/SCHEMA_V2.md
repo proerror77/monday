@@ -71,7 +71,7 @@ venues:
       account_type: usdm
 ```
 
-Runtime 会把该配置的市场商品规范化为 `BINANCE_FUTURES`/`Perp`，并使用 Binance USD-M 的 `fapi` REST 与 futures WebSocket endpoint。账户模式只支持单向/BOTH；Hedge mode 会在注册前拒绝。Paper 运行必须通过 `simulate_execution: true` 使用现有的 canonical simulated execution matcher，直接构造 USD-M adapter 的 Paper client 不提供模拟成交。
+Runtime 会把该配置的市场商品规范化为 `BINANCE_FUTURES`/`Perp`。Testnet 默认使用 Binance 官方 `https://demo-fapi.binance.com` REST 与 `wss://demo-fstream.binance.com/private/ws/<listenKey>` 私有流；Live 默认使用 `https://fapi.binance.com` 与 `wss://fstream.binance.com/private/ws/<listenKey>`。Schema v2 venue catalog 的 Spot endpoint 只作为可识别的 catalog 默认值，会按 USD-M 市场替换；显式自定义 endpoint 会保留，Testnet/Live 不能交叉使用 Binance 生产与测试 endpoint。账户模式只支持单向/BOTH；Hedge mode 会在注册前拒绝。Paper 运行必须通过 `simulate_execution: true` 使用现有的 canonical simulated execution matcher，直接构造 USD-M adapter 的 Paper client 不提供模拟成交。
 
 同一 symbol 的 USD-M 与其他市场不能共用 symbol-only Portfolio ledger；配置和运行时都会 fail-closed。当前验证范围是本地 Rust tests/Clippy，Live 保持关闭，未包含真实 Binance/Testnet acceptance。
 

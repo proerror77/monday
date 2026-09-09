@@ -195,6 +195,8 @@ pub struct ExecutionAccountSnapshot {
     pub account_id: Option<String>,
     pub asset_inventory_capability: Option<ExecutionAssetInventoryCapability>,
     pub open_orders: AuthoritativeSnapshot<Vec<ExecutionOpenOrder>>,
+    /// Venue-native conditional/algo identities that the control plane can cancel.
+    pub cancellable_orders: AuthoritativeSnapshot<Vec<ExecutionCancellableOrder>>,
     pub balances: AuthoritativeSnapshot<Vec<ExecutionBalance>>,
     pub asset_inventory: AuthoritativeSnapshot<Vec<ExecutionAssetInventory>>,
     pub positions: AuthoritativeSnapshot<Vec<ExecutionPosition>>,
@@ -224,6 +226,15 @@ pub struct ExecutionOpenOrder {
     pub status: String,
     pub created_at: u64,
     pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionCancellableOrder {
+    pub order_id: String,
+    pub client_order_id: Option<String>,
+    pub symbol: Symbol,
+    pub order_type: String,
+    pub algo_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
