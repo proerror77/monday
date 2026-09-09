@@ -770,6 +770,14 @@ impl CexReplaySnapshotV5 {
                 if rules.symbol != self.symbol {
                     return Err(invalid("full Spot instrument rules symbol does not match"));
                 }
+                if self.instrument_rules.tick_size != rules.price_filter.tick_size
+                    || self.instrument_rules.step_size != rules.lot_size_filter.step_size
+                    || self.instrument_rules.min_notional != rules.notional_filter.min_notional
+                {
+                    return Err(invalid(
+                        "generic Spot instrument rules do not match full Spot instrument rules",
+                    ));
+                }
             }
             "usdm" if self.spot_instrument_rules.is_some() => {
                 return Err(invalid("USD-M snapshot contains Spot instrument rules"));
@@ -1977,6 +1985,14 @@ mod tests {
         });
 
         snapshot.validate().unwrap();
+
+        snapshot.instrument_rules.tick_size = "0.2".to_string();
+        assert_eq!(
+            snapshot.validate().unwrap_err(),
+            ManifestError::InvalidCexReplaySnapshot(
+                "generic Spot instrument rules do not match full Spot instrument rules"
+            )
+        );
     }
 
     #[test]

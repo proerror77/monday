@@ -662,6 +662,7 @@ impl CexEventReplayReceiptV1 {
                 .and_then(|value| value.as_object_mut())
             {
                 config.remove("order_latency_us");
+                config.remove("market");
             }
             if let Some(metrics) = value
                 .get_mut("metrics")
@@ -706,6 +707,7 @@ fn replay_config_content_hash(
     let mut value = serde_json::to_value(config)?;
     if let Some(object) = value.as_object_mut() {
         object.remove("order_latency_us");
+        object.remove("market");
     }
     Ok(canonical_json_hash(&value)?)
 }
@@ -4996,8 +4998,10 @@ pub(crate) mod tests {
         object
             .get_mut("replay_config")
             .and_then(serde_json::Value::as_object_mut)
-            .unwrap()
-            .remove("order_latency_us");
+            .map(|config| {
+                config.remove("order_latency_us");
+                config.remove("market");
+            });
         let metrics = object
             .get_mut("metrics")
             .and_then(serde_json::Value::as_object_mut)

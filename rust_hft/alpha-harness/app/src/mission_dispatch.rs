@@ -1808,7 +1808,9 @@ mod tests {
             0,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("approved Binance USD-M BTCUSDT"));
+        assert!(error
+            .to_string()
+            .contains("approved Binance Spot or USD-M BTCUSDT"));
     }
 
     #[test]

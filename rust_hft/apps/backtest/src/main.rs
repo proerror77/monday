@@ -69,7 +69,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     info!("載入事件：{}", cfg.data.path);
-    let mut engine = BacktestEngine::new(cfg.clone());
+    let mut engine = BacktestEngine::new(cfg.clone())?;
     let result = engine.run()?;
     info!(
         "回測完成：交易筆數={}，總損益={:.4}",

@@ -4802,6 +4802,7 @@ dependencies = [
  "itertools 0.12.1",
  "ordered-float 3.9.2",
  "parquet",
+ "rust_decimal",
  "serde",
  "serde_json",
  "serde_yaml",

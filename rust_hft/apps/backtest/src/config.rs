@@ -248,6 +248,9 @@ impl BacktestConfig {
         {
             bail!("Spot initial inventory exceeds the configured inventory limit");
         }
+        if market == Market::Spot && self.execution.initial_inventory > 0.0 {
+            bail!("Spot initial inventory requires an explicit cost basis and is unsupported");
+        }
         if !self.execution.max_fill_ratio.is_finite()
             || !(0.0..=1.0).contains(&self.execution.max_fill_ratio)
             || self.execution.max_fill_ratio == 0.0
@@ -1330,6 +1333,18 @@ mod tests {
             .replace("slippage_limit_ticks: 3.0", "slippage_limit_ticks: -1.0");
         let config = BacktestConfig::from_yaml_str(&yaml, "negative risk slippage").unwrap();
         assert!(config.validate_execution_model().is_err());
+    }
+
+    #[test]
+    fn spot_initial_inventory_requires_an_explicit_cost_basis() {
+        let mut config =
+            BacktestConfig::from_file(resolve_path("config/backtest/default.yaml")).unwrap();
+        config.data.market = "spot".to_string();
+        config.execution.initial_inventory = 0.01;
+        config.risk.inventory_limit = 1.0;
+
+        let error = config.validate_execution_model().unwrap_err();
+        assert!(error.to_string().contains("explicit cost basis"));
     }
 
     #[test]

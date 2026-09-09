@@ -75,7 +75,7 @@ pub fn run(options: SweepOptions<'_>) -> anyhow::Result<()> {
         }
 
         info!("載入事件：{}", cfg.data.path);
-        let mut engine = BacktestEngine::new(cfg.clone());
+        let mut engine = BacktestEngine::new(cfg.clone())?;
         let result = engine.run()?;
         write_outputs(
             &cfg.output,

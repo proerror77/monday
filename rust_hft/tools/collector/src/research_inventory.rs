@@ -898,8 +898,10 @@ fn references_for_window(
     }
     let earliest = references.first().unwrap().start_received_at_ns;
     let latest = references.last().unwrap().end_received_at_ns;
-    let gap = hft_research_manifest::CEX_DERIVATIVES_MAX_GAP_NS;
-    if earliest > window_start.saturating_add(gap) || latest < window_end.saturating_sub(gap) {
+    let required_through = window_end
+        .checked_add(horizon_ns)
+        .context("fresh reference required coverage overflows")?;
+    if earliest > window_start || latest < required_through {
         return Ok(None);
     }
     Ok(Some(references))
@@ -1724,6 +1726,7 @@ mod tests {
     #[test]
     fn latest_selection_uses_metadata_time_and_skips_unsealed_tail() {
         let (_directory, request) = fixture();
+        extra_reference(&request, "BTCUSDT", 5_000_010_000);
         extra_raw(
             &request,
             "z-part-2",
@@ -1769,6 +1772,7 @@ mod tests {
     #[test]
     fn latest_selection_allows_one_sealed_segment_to_cover_the_window() {
         let (_directory, request) = fixture();
+        extra_reference(&request, "BTCUSDT", 5_000_010_000);
         let selection = select_fresh_window(&FreshWindowRequest {
             raw_root: request.raw_root.clone(),
             reference_root: request.reference_root.clone(),
@@ -1799,6 +1803,7 @@ mod tests {
     #[test]
     fn latest_selection_uses_manifest_span_without_fabricating_event_continuity() {
         let (_directory, request) = fixture();
+        extra_reference(&request, "BTCUSDT", 5_000_010_000);
         extra_raw(&request, "gapped", RECEIVED_NS + 2_000, RECEIVED_NS + 3_000);
         let selection = select_fresh_window(&FreshWindowRequest {
             raw_root: request.raw_root.clone(),
@@ -1830,6 +1835,7 @@ mod tests {
     #[test]
     fn latest_selection_falls_back_to_an_older_window_when_newer_refs_are_missing() {
         let (_directory, request) = fixture();
+        extra_reference(&request, "BTCUSDT", 5_000_010_000);
         let newer_start = RECEIVED_NS + 200_000_000_000;
         extra_raw(
             &request,

@@ -1,10 +1,13 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{BufReader, Cursor};
 use std::mem;
+use std::str::FromStr;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use itertools::Itertools;
 use ordered_float::OrderedFloat;
+use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
@@ -460,7 +463,15 @@ impl<'a> TargetPositionReplay<'a> {
         if self.config.market == "spot" && target_inventory < -f64::EPSILON {
             anyhow::bail!("Spot target-position replay cannot create a short inventory");
         }
-        let requested_quantity = (target_inventory - self.inventory).abs();
+        let raw_requested_quantity = (target_inventory - self.inventory).abs();
+        let requested_quantity = if self.config.market == "spot" {
+            let rules = self
+                .spot_instrument_rules
+                .context("validated Spot instrument rules are unavailable")?;
+            spot_submission_quantity(rules, raw_requested_quantity)?
+        } else {
+            raw_requested_quantity
+        };
         let side = (target_inventory - self.inventory > f64::EPSILON)
             .then_some(Side::Buy)
             .or_else(|| (target_inventory - self.inventory < -f64::EPSILON).then_some(Side::Sell));
@@ -912,6 +923,69 @@ fn spot_quantity_matches(
         && (step <= 0.0 || aligned_to_step(quantity, step))
 }
 
+fn decimal_gcd(mut left: i128, mut right: i128) -> i128 {
+    left = left.abs();
+    right = right.abs();
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
+}
+
+fn common_quantity_step(left: Decimal, right: Decimal) -> Result<Decimal> {
+    let scale = left.scale().max(right.scale());
+    let left_scale = 10_i128
+        .checked_pow(scale - left.scale())
+        .context("Spot quantity step scale overflow")?;
+    let right_scale = 10_i128
+        .checked_pow(scale - right.scale())
+        .context("Spot quantity step scale overflow")?;
+    let left_units = left.mantissa().abs().saturating_mul(left_scale);
+    let right_units = right.mantissa().abs().saturating_mul(right_scale);
+    let gcd = decimal_gcd(left_units, right_units);
+    if gcd == 0 {
+        return Ok(left);
+    }
+    let lcm = left_units
+        .checked_div(gcd)
+        .and_then(|value| value.checked_mul(right_units))
+        .context("Spot quantity step least common multiple overflow")?;
+    Ok(Decimal::from_i128_with_scale(lcm, scale))
+}
+
+fn spot_submission_quantity(
+    rules: &CexSpotInstrumentRulesV1,
+    requested_quantity: f64,
+) -> Result<f64> {
+    if !requested_quantity.is_finite() || requested_quantity <= 0.0 {
+        return Ok(0.0);
+    }
+    let mut step = Decimal::from_str(&rules.lot_size_filter.step_size)
+        .context("Spot LOT_SIZE step is invalid")?;
+    if step <= Decimal::ZERO {
+        bail!("Spot LOT_SIZE step must be positive");
+    }
+    if let Some(market_filter) = &rules.market_lot_size_filter {
+        let market_step = Decimal::from_str(&market_filter.step_size)
+            .context("Spot MARKET_LOT_SIZE step is invalid")?;
+        if market_step > Decimal::ZERO {
+            step = common_quantity_step(step, market_step)?;
+        }
+    }
+    if rules.base_asset_precision > 28 {
+        bail!("Spot base-asset precision exceeds Decimal capacity");
+    }
+    step = common_quantity_step(step, Decimal::new(1, rules.base_asset_precision as u32))?;
+    let requested = Decimal::from_f64_retain(requested_quantity)
+        .context("Spot requested quantity is not representable")?;
+    let units = (requested / step).floor();
+    (units * step)
+        .to_f64()
+        .context("Spot submitted quantity is not representable")
+}
+
 fn aligned_to_step(value: f64, step: f64) -> bool {
     if !value.is_finite() || !step.is_finite() || step <= 0.0 {
         return false;
@@ -934,18 +1008,14 @@ pub struct BacktestEngine {
 }
 
 impl BacktestEngine {
-    pub fn new(cfg: BacktestConfig) -> Self {
+    pub fn new(cfg: BacktestConfig) -> Result<Self> {
         let max_levels = cfg.data.max_depth_levels;
         let tick_size = cfg.data.tick_size.max(1e-6);
         let strategy = cfg.strategy.clone();
         let execution_cfg = cfg.execution.clone();
         let risk_cfg = cfg.risk.clone();
-        let market = cfg
-            .data
-            .market
-            .parse()
-            .expect("BacktestConfig market must be validated before execution");
-        Self {
+        let market = cfg.data.market.parse().map_err(anyhow::Error::msg)?;
+        Ok(Self {
             cfg,
             order_book: OrderBook::new(max_levels),
             displayed_budget: BookBudget::default(),
@@ -956,7 +1026,7 @@ impl BacktestEngine {
             execution: ExecutionManager::new(execution_cfg, risk_cfg, tick_size, market),
             stats: BacktestStats::default(),
             last_ts: None,
-        }
+        })
     }
 
     pub fn run(&mut self) -> Result<BacktestResult> {
@@ -2539,6 +2609,13 @@ mod tests {
     }
 
     #[test]
+    fn backtest_engine_rejects_unknown_market_without_panicking() {
+        let mut config = test_config();
+        config.data.market = "typo-market".to_string();
+        assert!(BacktestEngine::new(config).is_err());
+    }
+
+    #[test]
     fn spot_target_position_replay_keeps_cash_nonnegative_across_multiple_fills() {
         let tape = concat!(
             "{\"timestamp\":1000000,\"sequence\":1,\"event\":\"snapshot\",\"bids\":[[99,10]],\"asks\":[[101,3],[102,3],[103,3]]}\n",
@@ -2744,6 +2821,22 @@ mod tests {
         assert!(error
             .to_string()
             .contains("average-price evidence is unsupported"));
+    }
+
+    #[test]
+    fn spot_submission_quantity_is_floored_to_common_step_and_precision() {
+        let mut rules = spot_replay_rules();
+        rules.lot_size_filter.step_size = "0.001".to_string();
+        rules.market_lot_size_filter.as_mut().unwrap().step_size = "0.002".to_string();
+
+        let quantity = spot_submission_quantity(&rules, 0.0055).unwrap();
+
+        assert!((quantity - 0.004).abs() < 1e-12);
+        assert!(spot_quantity_matches(&rules.lot_size_filter, quantity));
+        assert!(spot_quantity_matches(
+            rules.market_lot_size_filter.as_ref().unwrap(),
+            quantity
+        ));
     }
 
     #[test]
@@ -3360,7 +3453,7 @@ mod tests {
 
     #[test]
     fn backtest_replays_in_memory_l2_events() {
-        let mut engine = BacktestEngine::new(test_config());
+        let mut engine = BacktestEngine::new(test_config()).unwrap();
         let stream = vec![
             Ok(EventEnvelope {
                 ts: 1_000_000,
@@ -3418,7 +3511,7 @@ mod tests {
         config.execution.base_qty = 2.0;
         config.execution.max_position = 2.0;
         config.risk.inventory_limit = 2.0;
-        let mut engine = BacktestEngine::new(config);
+        let mut engine = BacktestEngine::new(config).unwrap();
         let stream = vec![
             Ok(EventEnvelope {
                 ts: 1_000_000,
@@ -3465,7 +3558,7 @@ mod tests {
         config.execution.base_qty = 2.0;
         config.execution.max_position = 2.0;
         config.risk.inventory_limit = 0.0;
-        let mut engine = BacktestEngine::new(config);
+        let mut engine = BacktestEngine::new(config).unwrap();
         let stream = vec![
             Ok(EventEnvelope {
                 ts: 1_000_000,
@@ -3516,7 +3609,7 @@ mod tests {
         config.data.tick_size = 0.1;
         config.execution.max_fill_ratio = 1.0;
         config.risk.slippage_limit_ticks = 1.0;
-        let mut engine = BacktestEngine::new(config);
+        let mut engine = BacktestEngine::new(config).unwrap();
         engine.order_book.apply_snapshot(
             1,
             &[
