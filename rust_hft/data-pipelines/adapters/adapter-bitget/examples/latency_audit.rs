@@ -425,9 +425,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         eprintln!("receiver stopped: {err}");
     }
 
-    let mut stats = engine.join().map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::Other, "latency audit engine panicked")
-    })?;
+    let mut stats = engine
+        .join()
+        .map_err(|_| std::io::Error::other("latency audit engine panicked"))?;
     stop.store(true, Ordering::Relaxed);
     let dropped_count = dropped.load(Ordering::Relaxed);
     if let Some(path) = &args.json_out {
