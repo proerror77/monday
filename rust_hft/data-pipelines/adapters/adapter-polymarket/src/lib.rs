@@ -1670,10 +1670,10 @@ mod tests {
 
     #[test]
     fn crossed_failure_capture_is_bounded_and_create_once() {
-        let path = std::fs::canonicalize(std::env::temp_dir())
-            .unwrap()
-            .join(format!("polymarket-capture-{}", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let temp_dir = tempfile::tempdir().expect("create isolated capture directory");
+        let parent =
+            std::fs::canonicalize(temp_dir.path()).expect("canonicalize capture directory");
+        let path = parent.join("crossed-frame");
         let error = HftError::Parse("Polymarket book is crossed".to_string());
         capture_crossed_failure(Some(&path), b"crossed-frame", &error);
         assert_eq!(std::fs::read(&path).unwrap(), b"crossed-frame");
@@ -1689,7 +1689,6 @@ mod tests {
                 .kind(),
             std::io::ErrorKind::InvalidData
         );
-        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]

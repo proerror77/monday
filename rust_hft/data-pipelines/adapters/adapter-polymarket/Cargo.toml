@@ -21,3 +21,6 @@ url = "2"
 
 [lib]
 name = "adapter_polymarket_data"
+
+[dev-dependencies]
+tempfile = "3"
