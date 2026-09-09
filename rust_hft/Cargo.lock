@@ -5743,6 +5743,7 @@ dependencies = [
  "hft-core",
  "hft-factor-dsl",
  "hft-ports",
+ "hft-research-manifest",
  "rust_decimal",
  "thiserror 2.0.18",
 ]

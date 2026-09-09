@@ -63,6 +63,25 @@ flowchart TB
 
 The research crates do not depend on execution adapters and expose no order, cancel, wallet, or transaction command.
 
+### Frozen supervised inference
+
+`research-core/manifest` owns the fitted Ridge, CART and portable Burn MLP
+representations and their deterministic prediction and decision-policy arithmetic.
+The research engine uses these same implementations; historical Burn diagnostics
+without parameters remain readable audit records and cannot execute.
+`research-core/factor-dsl::model_program` binds exact ordered factor ASTs,
+orientation, fitted weights, observation clock, instrument and costs. Unsupported
+runtime features and invalid parameters fail validation instead of producing
+substitute inputs.
+
+The `FrozenModel` runtime configuration uses the existing Formula strategy actor,
+clock, causal history, position sizing, intent and risk paths. Its model magnitude
+sets a fraction of the configured maximum notional; disconnects reset history and
+hysteresis. The execution contract must match the frozen instrument, venue,
+cadence and spread policy. This factory capability alone is not a promotion or
+deployment authorization: canonical candidate freezing, independent selection,
+sealed holdout and signed bundle intake must separately establish that authority.
+
 ## Multi-Venue And Market-Family Modules
 
 Monday is one trading system. Venue variation lives behind the market-data and

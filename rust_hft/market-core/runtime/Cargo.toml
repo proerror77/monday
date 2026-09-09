@@ -78,6 +78,7 @@ sysinfo = "0.30"
 secrecy = { version = "0.10", optional = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tempfile = "3.10"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 serial_test = "3.5"

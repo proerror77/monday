@@ -605,12 +605,18 @@ impl SystemBuilder {
             engine.pause_trading();
         }
         for strategy in &self.config.strategies {
-            if let StrategyParams::Formula {
-                execution_contract: Some(contract),
-                ..
-            } = &strategy.params
-            {
-                engine.add_venue_spec(contract.venue, contract.venue_spec.clone());
+            match &strategy.params {
+                StrategyParams::Formula {
+                    execution_contract: Some(contract),
+                    ..
+                }
+                | StrategyParams::FrozenModel {
+                    execution_contract: contract,
+                    ..
+                } => {
+                    engine.add_venue_spec(contract.venue, contract.venue_spec.clone());
+                }
+                _ => {}
             }
         }
 
@@ -1971,6 +1977,70 @@ mod tests {
             },
             risk_limits: StrategyRiskLimits::default(),
         }
+    }
+
+    #[cfg(feature = "strategy-formula")]
+    #[test]
+    fn frozen_model_factory_uses_the_native_clocked_strategy_actor() {
+        let program = serde_json::from_value(serde_json::json!({
+            "schema_version": "monday.frozen_factor_model.v1",
+            "venue": "bitget", "market": "usdm", "symbol": "BTCUSDT",
+            "observation_frequency_millis": 1000, "label_horizon_buckets": 5,
+            "factors": [{"ast": hft_factor_dsl::FactorAst::Terminal(
+                hft_factor_dsl::FactorTerminal::Field("book_imbalance".into())), "negative": false}],
+            "model": {"model_kind": "ridge", "intercept": 0.0, "means": [0.0], "scales": [1.0], "coefficients": [1.0]},
+            "decision_policy": {"schema_version": "cex-supervised-decision-policy-v2", "round_trip_cost_multiplier": 0.0,
+                "sizing_rule": "prediction_identity", "max_abs_position": 1.0},
+            "base_costs": {"one_way_cost_bps": 2.5, "funding_bps": 0.0}, "cross_spread": false,
+        })).unwrap();
+        let config = StrategyConfig {
+            name: "frozen-model-test".into(),
+            strategy_type: StrategyType::FrozenModel,
+            symbols: vec![Symbol::new("BTCUSDT")],
+            risk_limits: StrategyRiskLimits::default(),
+            params: StrategyParams::FrozenModel {
+                program: Box::new(program),
+                max_order_notional: Decimal::from(50),
+                execution_contract: FormulaExecutionContract {
+                    venue: VenueId::BITGET,
+                    cross_spread: false,
+                    venue_spec: ports::VenueSpec {
+                        name: "BITGET".into(),
+                        tick_size: Price(Decimal::ONE),
+                        lot_size: Quantity(Decimal::new(1, 2)),
+                        min_qty: Quantity(Decimal::new(1, 2)),
+                        min_notional: Decimal::from(5),
+                        max_quantity: None,
+                        maker_fee_bps: None,
+                        taker_fee_bps: None,
+                        rate_limit: None,
+                    },
+                },
+            },
+        };
+        let mut strategies =
+            super::strategy_factory::create_strategy_instances_from_config(&config).unwrap();
+        assert_eq!(strategies.len(), 1);
+        let account = ports::AccountView::default();
+        assert!(strategies[0]
+            .on_market_event(
+                &MarketEvent::Snapshot(MarketSnapshot {
+                    symbol: Symbol::new("BTCUSDT"),
+                    timestamp: 1_000_000,
+                    bids: vec![BookLevel::new_unchecked(99.0, 3.0)],
+                    asks: vec![BookLevel::new_unchecked(101.0, 1.0)],
+                    sequence: 1,
+                    source_venue: Some(VenueId::BITGET),
+                    timestamps: Default::default(),
+                }),
+                &account
+            )
+            .is_empty());
+        assert_eq!(strategies[0].clock_interval_micros(), Some(1_000_000));
+        let orders = strategies[0].on_clock(1_000_000, &account);
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].quantity.0, Decimal::new(25, 2));
+        assert_eq!(orders[0].product_type, hft_core::ProductType::Perp);
     }
 
     #[test]
