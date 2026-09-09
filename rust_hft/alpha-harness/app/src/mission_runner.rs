@@ -4995,13 +4995,13 @@ pub(crate) mod tests {
         ] {
             object.remove(field);
         }
-        object
+        if let Some(config) = object
             .get_mut("replay_config")
             .and_then(serde_json::Value::as_object_mut)
-            .map(|config| {
-                config.remove("order_latency_us");
-                config.remove("market");
-            });
+        {
+            config.remove("order_latency_us");
+            config.remove("market");
+        }
         let metrics = object
             .get_mut("metrics")
             .and_then(serde_json::Value::as_object_mut)
