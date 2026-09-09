@@ -1028,7 +1028,21 @@ jobs:
           cargo check --locked -p ploy-research --features db --bin monday-prediction-evaluator
           cargo test --locked -p ploy-market-data --features audit --lib --examples
           cargo test --locked -p ploy-research --features db --bin monday-prediction-snapshot
-          cargo test --locked -p ploy-research --features db --test polymarket_three_event_e2e
+          handoff_root="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/prediction-evidence-handoff.XXXXXX")"
+          cleanup_handoff() {
+            find "$handoff_root" -depth -type f -delete
+            find "$handoff_root" -depth -type d -empty -delete
+          }
+          trap cleanup_handoff EXIT
+          export PLOY_TEST_EVIDENCE_HANDOFF="$handoff_root"
+          cargo test --locked -p ploy-research --features db --test polymarket_three_event_e2e \
+            producer_snapshot_smoke_and_three_task_receipts_share_one_partition -- --exact --nocapture
+          test -s "$handoff_root/refs.json"
+          CODEX_CLI_BIN="$handoff_root/mock-codex" CODEX_CLI_TIMEOUT_SECS=10 \
+            cargo test --locked -p ploy-agent-sidecar --lib \
+            tests::production_writer_evidence_queue_reaches_terminal \
+            -- --exact --ignored --test-threads=1 --nocapture
+          test -s "$handoff_root/consumer-proof.json"
 
       - name: Install SQLx CLI
         run: |

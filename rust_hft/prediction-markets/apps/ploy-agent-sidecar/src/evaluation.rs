@@ -3,6 +3,7 @@ use ploy_operator_contracts::{
     agent_run_contract_value, validate_agent_run_contract, validate_agent_run_create_request,
     AgentRunCreateRequest, AgentToolCallRecord,
 };
+use ploy_research::VerifiedPredictionEvidenceReceipt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -45,15 +46,34 @@ pub fn validate_admission(
         ));
     }
     let undeployed = [
-        "requires_data_audit",
         "requires_grok_decision",
-        "requires_executable_replay",
-        "requires_full_depth_clob",
         "requires_runtime_parity",
+        "requires_realtime_runtime",
+        "requires_realtime_evidence",
     ]
     .into_iter()
     .filter(|key| contract_enabled(&request.run_contract, key))
     .collect::<Vec<_>>();
+    let evidence_required = [
+        "requires_data_audit",
+        "requires_executable_replay",
+        "requires_full_depth_clob",
+    ]
+    .into_iter()
+    .filter(|key| contract_enabled(&request.run_contract, key))
+    .collect::<Vec<_>>();
+    if request.prediction_evidence.is_none()
+        && (!evidence_required.is_empty() || request.target_evidence == "executable_replay")
+    {
+        return Some(format!(
+            "typed prediction evidence refs are required before model execution: {}",
+            if evidence_required.is_empty() {
+                "target_evidence=executable_replay".to_string()
+            } else {
+                evidence_required.join(", ")
+            }
+        ));
+    }
     if !undeployed.is_empty() || request.strategy_profile.contains("grok_builder") {
         let mut unavailable = undeployed;
         if request.strategy_profile.contains("grok_builder") {
@@ -81,11 +101,22 @@ pub struct ContractEvaluation {
     pub checks: Vec<ContractCheck>,
 }
 
-pub fn evaluate_agent_run_contract(
+#[cfg(test)]
+fn evaluate_agent_run_contract(
     request: Option<&Value>,
     tool_calls: &[AgentToolCallRecord],
     completion: Option<&AgentTaskCompletion>,
     failure_reason: Option<&str>,
+) -> Option<ContractEvaluation> {
+    evaluate_agent_run_contract_with_evidence(request, tool_calls, completion, failure_reason, None)
+}
+
+pub fn evaluate_agent_run_contract_with_evidence(
+    request: Option<&Value>,
+    tool_calls: &[AgentToolCallRecord],
+    completion: Option<&AgentTaskCompletion>,
+    failure_reason: Option<&str>,
+    evidence: Option<&VerifiedPredictionEvidenceReceipt>,
 ) -> Option<ContractEvaluation> {
     let run_contract = request?
         .get("run_contract")?
@@ -106,19 +137,9 @@ pub fn evaluate_agent_run_contract(
     }
     checks.push(completion_check(completion));
     if contract_enabled(run_contract, "requires_data_audit") {
-        checks.push(required_tool_check(
-            "data_audit",
-            tool_calls,
-            &[
-                &["parent__get_system_status"],
-                &["parent__get_trading_state"],
-                &["parent__list_deployments"],
-                &[
-                    "parent__polymarket_market_snapshot",
-                    "mcp__polymarket__market_snapshot",
-                ],
-            ],
-        ));
+        checks.push(required_evidence_check("data_audit", evidence, |receipt| {
+            receipt.data_audit()
+        }));
     }
     if contract_enabled(run_contract, "requires_grok_decision") {
         checks.push(grok_decision_check(completion));
@@ -136,34 +157,33 @@ pub fn evaluate_agent_run_contract(
         ));
     }
     if contract_enabled(run_contract, "requires_executable_replay") {
-        checks.push(required_tool_check(
+        checks.push(required_evidence_check(
             "executable_replay",
-            tool_calls,
-            &[&[
-                "mcp__research__replay_deployment",
-                "mcp__research__run_backtest",
-            ]],
+            evidence,
+            |receipt| receipt.executable_replay(),
         ));
     }
     if contract_enabled(run_contract, "requires_full_depth_clob") {
-        checks.push(required_tool_check(
+        checks.push(required_evidence_check(
             "full_depth_clob",
-            tool_calls,
-            &[&[
-                "parent__polymarket_full_depth_clob",
-                "mcp__polymarket__get_order_book",
-                "mcp__polymarket__market_snapshot",
-            ]],
+            evidence,
+            |receipt| receipt.full_depth(),
         ));
     }
     if contract_enabled(run_contract, "requires_runtime_parity") {
-        checks.push(required_tool_check(
+        checks.push(required_evidence_check(
             "runtime_parity",
-            tool_calls,
-            &[
-                &["mcp__research__compare_configs"],
-                &["mcp__research__check_oversight"],
-            ],
+            evidence,
+            |receipt| receipt.runtime_parity(),
+        ));
+    }
+    if contract_enabled(run_contract, "requires_realtime_runtime")
+        || contract_enabled(run_contract, "requires_realtime_evidence")
+    {
+        checks.push(required_evidence_check(
+            "realtime_runtime",
+            evidence,
+            |receipt| receipt.realtime_runtime(),
         ));
     }
     if contract_enabled(run_contract, "requires_operator_approval") {
@@ -299,7 +319,7 @@ fn required_tool_check(
         .filter(|group| {
             !group.iter().any(|tool_name| {
                 tool_calls.iter().any(|call| {
-                    call.name.contains(tool_name)
+                    call.name == *tool_name
                         && matches!(call.status.as_str(), "called" | "success" | "completed")
                 })
             })
@@ -314,6 +334,30 @@ fn required_tool_check(
             "needs_retry",
             &format!("missing one of: {}", missing.join("; ")),
         )
+    }
+}
+
+fn required_evidence_check(
+    name: &str,
+    evidence: Option<&VerifiedPredictionEvidenceReceipt>,
+    predicate: impl FnOnce(&VerifiedPredictionEvidenceReceipt) -> bool,
+) -> ContractCheck {
+    match evidence {
+        Some(receipt) if predicate(receipt) => check(
+            name,
+            "passed",
+            "canonical typed prediction evidence receipt was independently verified",
+        ),
+        Some(_) => check(
+            name,
+            "blocked",
+            "verified prediction evidence does not contain the required capability",
+        ),
+        None => check(
+            name,
+            "blocked",
+            "canonical typed prediction evidence receipt is missing",
+        ),
     }
 }
 
@@ -363,6 +407,7 @@ mod tests {
             budget_usd: 0.25,
             run_packet: "packet".to_string(),
             run_contract: "completion_signal = \"required\"".to_string(),
+            prediction_evidence: None,
         }
     }
 
@@ -405,7 +450,7 @@ mod tests {
             None,
         )
         .expect("evaluation");
-        assert_eq!(needs_retry.status, "needs_retry");
+        assert_eq!(needs_retry.status, "blocked");
 
         let blocked = evaluate_agent_run_contract(
             Some(&request),
@@ -485,7 +530,7 @@ mod tests {
             None,
         )
         .expect("evaluation");
-        assert_eq!(evaluation.status, "needs_retry");
+        assert_eq!(evaluation.status, "blocked");
         assert!(evaluation
             .checks
             .iter()
@@ -494,5 +539,60 @@ mod tests {
             .checks
             .iter()
             .any(|check| check.name == "full_depth_clob"));
+    }
+
+    #[test]
+    fn tool_name_substrings_cannot_authorize_prediction_evidence() {
+        let evaluation = evaluate_agent_run_contract(
+            Some(&json!({
+                "run_contract": "completion_signal = \"required\"\nrequires_data_audit = true"
+            })),
+            &[AgentToolCallRecord {
+                name: "prefix_parent__get_system_status_fake_evidence".to_string(),
+                status: "completed".to_string(),
+            }],
+            None,
+            None,
+        )
+        .expect("evaluation");
+        assert_eq!(evaluation.status, "blocked");
+        assert!(evaluation
+            .checks
+            .iter()
+            .any(|check| check.name == "data_audit" && check.status == "blocked"));
+    }
+
+    #[test]
+    fn runtime_parity_remains_blocked_without_a_runtime_receipt() {
+        let evaluation = evaluate_agent_run_contract_with_evidence(
+            Some(&json!({
+                "run_contract": "completion_signal = \"required\"\nrequires_runtime_parity = true"
+            })),
+            &[],
+            None,
+            None,
+            None,
+        )
+        .expect("evaluation");
+        assert_eq!(evaluation.status, "blocked");
+        assert!(evaluation
+            .checks
+            .iter()
+            .any(|check| check.name == "runtime_parity" && check.status == "blocked"));
+    }
+
+    #[test]
+    fn executable_replay_requires_typed_refs_before_model_execution() {
+        let mut request = request();
+        request.target_evidence = "executable_replay".to_string();
+        let reason = validate_admission(
+            &request,
+            AdmissionLimits {
+                max_turns: 30,
+                max_budget_usd: 1.0,
+            },
+        )
+        .expect("missing typed evidence refs");
+        assert!(reason.contains("typed prediction evidence refs"));
     }
 }

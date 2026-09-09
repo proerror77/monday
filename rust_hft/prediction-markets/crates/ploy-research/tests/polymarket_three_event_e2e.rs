@@ -13,6 +13,12 @@ use ploy_market_data::polymarket_evidence::{
     PolymarketCatalogReceiptState, PolymarketCatalogVerifier, PolymarketEvidenceTriplet,
     PolymarketEvidenceTrustAnchor, PolymarketReadyEventCatalog, PolymarketResearchTask,
 };
+use ploy_research::evidence_review::{
+    verify_prediction_evidence, PredictionEvidenceArtifactRef,
+    PredictionEvidenceCatalogPartitionRef, PredictionEvidenceMissionRef, PredictionEvidenceRefs,
+    PredictionEvidenceReportRef, PredictionEvidenceResultBundleRef, PredictionEvidenceSnapshotRef,
+    PredictionEvidenceTerminalReceiptRef,
+};
 use ploy_research::prediction_loop::{
     current_prediction_policy_snapshot_id, PredictionSearchBudget,
 };
@@ -29,7 +35,8 @@ use ploy_research::prediction_mission_v3::{
     PREDICTION_MISSION_V3_SCHEMA_VERSION,
 };
 use ploy_research::research_snapshot::{
-    admit_cached_authenticated_research_snapshot, ResearchSnapshotInputArtifact,
+    admit_cached_authenticated_research_snapshot, load_research_snapshot,
+    ResearchSnapshotInputArtifact,
 };
 use ploy_research::{
     admit_extracted_authenticated_research_snapshot, authenticate_ready_event_cohort,
@@ -59,7 +66,25 @@ struct EventFixture {
 
 #[test]
 fn producer_snapshot_smoke_and_three_task_receipts_share_one_partition() {
-    let temp = tempfile::tempdir().expect("create fixture root");
+    let handoff_parent = std::env::var_os("PLOY_TEST_EVIDENCE_HANDOFF").map(PathBuf::from);
+    if let Some(parent) = handoff_parent.as_ref() {
+        assert!(
+            parent.is_absolute(),
+            "evidence handoff parent must be absolute"
+        );
+        assert!(
+            parent.is_dir(),
+            "evidence handoff parent must already exist"
+        );
+        assert!(
+            !parent.join("refs.json").exists(),
+            "evidence handoff refs.json must not pre-exist"
+        );
+    }
+    let temp = handoff_parent
+        .as_ref()
+        .map(|parent| tempfile::tempdir_in(parent).expect("create retained fixture root"))
+        .unwrap_or_else(|| tempfile::tempdir().expect("create fixture root"));
     let root = fs::canonicalize(temp.path()).expect("canonical fixture root");
     let first: DateTime<Utc> = "2026-07-17T05:30:00Z".parse().unwrap();
     let events = [
@@ -268,12 +293,44 @@ fn producer_snapshot_smoke_and_three_task_receipts_share_one_partition() {
         manifest_ref.artifact_sha256(),
     );
 
+    let evidence_refs = verify_sidecar_evidence_handoff(
+        &root,
+        &partition_ref,
+        &snapshot,
+        &manifest_ref,
+        &receipt_refs[0],
+        &events,
+    );
+
     let snapshot_manifest = snapshot.snapshot_dir().join("manifest.json");
+    let original_snapshot_manifest = fs::read(&snapshot_manifest).unwrap();
+    let original_snapshot_mode = fs::metadata(&snapshot_manifest)
+        .unwrap()
+        .permissions()
+        .mode();
     fs::set_permissions(&snapshot_manifest, fs::Permissions::from_mode(0o644)).unwrap();
     fs::write(&snapshot_manifest, b"{}\n").unwrap();
     let rejection = admit_cached_authenticated_research_snapshot(&cohort, &request)
         .expect_err("mutated snapshot cache must fail closed");
     assert_eq!(rejection.code(), "corrupt_cached_snapshot");
+    fs::write(&snapshot_manifest, original_snapshot_manifest).unwrap();
+    fs::set_permissions(
+        &snapshot_manifest,
+        fs::Permissions::from_mode(original_snapshot_mode),
+    )
+    .unwrap();
+    verify_prediction_evidence(&evidence_refs).expect("restored snapshot evidence remains valid");
+
+    if let Some(parent) = handoff_parent {
+        let retained = temp.keep();
+        let retained = fs::canonicalize(retained).expect("canonical retained fixture");
+        assert_eq!(retained, root);
+        fs::write(
+            parent.join("refs.json"),
+            serde_json::to_vec_pretty(&evidence_refs).unwrap(),
+        )
+        .unwrap();
+    }
 }
 
 fn event_fixture(root: &Path, suffix: &str, start: DateTime<Utc>) -> EventFixture {
@@ -731,6 +788,197 @@ fn assert_pipeline_smoke_completed(root: &Path, snapshot: &AuthenticatedResearch
         .and_then(|name| name.to_str())
         .unwrap()
         .ends_with(digest));
+}
+
+fn verify_sidecar_evidence_handoff(
+    root: &Path,
+    partition_ref: &ploy_research::CatalogPartitionArtifactRef,
+    snapshot: &AuthenticatedResearchSnapshot,
+    result_manifest_ref: &ploy_research::prediction_mcts_authenticated::AuthenticatedPredictionExperimentManifestRef,
+    terminal_receipt_ref: &AuthenticatedPredictionResultReceiptRef,
+    events: &[EventFixture; 3],
+) -> PredictionEvidenceRefs {
+    let loaded = load_research_snapshot(snapshot.snapshot_dir()).expect("snapshot readback");
+    let settlement_mission = mission(
+        snapshot,
+        PredictionTaskKind::SettlementProbability,
+        PredictionRunMode::ResearchTrial,
+    );
+    let mission_path = root.join("sidecar-evidence-mission.json");
+    let mission_bytes = serde_json::to_vec_pretty(&settlement_mission).unwrap();
+    fs::write(&mission_path, &mission_bytes).unwrap();
+
+    let report_dir = root.join("sidecar-evidence-reports");
+    let evaluator = Command::new(env!("CARGO_BIN_EXE_monday-prediction-evaluator"))
+        .arg("--start-ts")
+        .arg(loaded.manifest.start.to_rfc3339())
+        .arg("--end-ts")
+        .arg(loaded.manifest.end.to_rfc3339())
+        .arg("--symbols")
+        .arg("BTCUSDT")
+        .arg("--snapshot-dir")
+        .arg(snapshot.snapshot_dir())
+        .arg("--report-output-dir")
+        .arg(&report_dir)
+        .arg("--mission-id")
+        .arg(&settlement_mission.mission_id)
+        .arg("--expected-search-policy-snapshot-id")
+        .arg(current_prediction_policy_snapshot_id())
+        .arg("--event-window-secs")
+        .arg("300")
+        .arg("--time-cohort-boundary-ms")
+        .arg(
+            snapshot
+                .partition_view()
+                .common_time_boundary_ms()
+                .to_string(),
+        )
+        .arg("--lob-sample-secs")
+        .arg(loaded.manifest.lob_sample_secs.to_string())
+        .arg("--pm-book-sample-secs")
+        .arg(loaded.manifest.pm_book_sample_secs.unwrap_or(1).to_string())
+        .arg("--observation-sample-secs")
+        .arg(loaded.manifest.observation_sample_secs.to_string())
+        .arg("--min-observations")
+        .arg("1")
+        .arg("--report-suite")
+        .arg("core")
+        .arg("--polymarket-chainlink-baseline")
+        .output()
+        .expect("run production evaluator for sidecar evidence");
+    assert!(
+        evaluator.status.success(),
+        "evaluator report writer failed: {}",
+        String::from_utf8_lossy(&evaluator.stderr)
+    );
+
+    let report = |prefix: &str, kind: &str| {
+        let path = fs::read_dir(&report_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(prefix) && name.ends_with(".json"))
+            })
+            .unwrap_or_else(|| panic!("missing production report {prefix}"));
+        let digest = digest_file(&path);
+        PredictionEvidenceReportRef {
+            artifact: PredictionEvidenceArtifactRef {
+                path: path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                artifact_sha256: digest.clone(),
+            },
+            report_sha256: digest,
+            report_kind: kind.to_string(),
+        }
+    };
+    let report_refs = vec![
+        report("settlement-baseline-", "settlement_baseline"),
+        report("full-depth-execution-up-", "full_depth_execution_up"),
+        report("full-depth-execution-down-", "full_depth_execution_down"),
+    ];
+    let mission_ref = PredictionEvidenceMissionRef {
+        artifact: PredictionEvidenceArtifactRef {
+            path: mission_path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            artifact_sha256: sha256(&mission_bytes),
+        },
+        mission_sha256: ploy_research::prediction_mission_v3::prediction_mission_v3_sha256(
+            &settlement_mission,
+        )
+        .unwrap(),
+    };
+    let catalog_ref = PredictionEvidenceCatalogPartitionRef {
+        artifact: PredictionEvidenceArtifactRef {
+            path: partition_ref.path().to_string(),
+            artifact_sha256: partition_ref.artifact_sha256().to_string(),
+        },
+        payload_sha256: partition_ref.payload_sha256().to_string(),
+        cohort_manifest_id: snapshot.cohort_manifest_id().to_string(),
+        partition_digest: snapshot.partition_digest().to_string(),
+        policy_snapshot_id: snapshot.causal_projection_policy_id().to_string(),
+    };
+    let snapshot_ref = PredictionEvidenceSnapshotRef {
+        path: snapshot
+            .snapshot_dir()
+            .strip_prefix(root)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+        snapshot_hash: snapshot.snapshot_hash().to_string(),
+        snapshot_contract_hash: snapshot.snapshot_contract_id().to_string(),
+    };
+    let result_bundle_ref = PredictionEvidenceResultBundleRef {
+        artifact: PredictionEvidenceArtifactRef {
+            path: Path::new("research-trial")
+                .join(result_manifest_ref.path())
+                .to_string_lossy()
+                .into_owned(),
+            artifact_sha256: result_manifest_ref.artifact_sha256().to_string(),
+        },
+        receipt_sha256: None,
+        manifest_sha256: Some(result_manifest_ref.manifest_sha256().to_string()),
+    };
+    let terminal_ref = PredictionEvidenceTerminalReceiptRef {
+        artifact: PredictionEvidenceArtifactRef {
+            path: Path::new("research-trial")
+                .join(terminal_receipt_ref.path())
+                .to_string_lossy()
+                .into_owned(),
+            artifact_sha256: terminal_receipt_ref.artifact_sha256().to_string(),
+        },
+        terminal_receipt_sha256: terminal_receipt_ref.receipt_sha256().to_string(),
+    };
+    let refs = PredictionEvidenceRefs {
+        artifact_root: root.display().to_string(),
+        mission: mission_ref,
+        catalog_partition: catalog_ref,
+        snapshot: snapshot_ref,
+        result_bundle: result_bundle_ref,
+        reports: report_refs,
+        terminal_receipt: terminal_ref,
+    };
+    let verified = verify_prediction_evidence(&refs).expect("production writer evidence verifies");
+    assert_eq!(verified.mission_id(), settlement_mission.mission_id);
+    assert_eq!(verified.snapshot_hash(), snapshot.snapshot_hash());
+    assert!(!verified.executable_replay());
+    assert_eq!(verified.report_count(), 3);
+    assert_eq!(events.len(), 3);
+    let digest = |byte: char| format!("sha256:{}", byte.to_string().repeat(64));
+
+    let mut byte_mismatch = refs.clone();
+    byte_mismatch.mission.artifact.artifact_sha256 = digest('9');
+    assert!(verify_prediction_evidence(&byte_mismatch).is_err());
+
+    let mut policy_mismatch = refs.clone();
+    policy_mismatch.catalog_partition.policy_snapshot_id = digest('8');
+    assert!(verify_prediction_evidence(&policy_mismatch).is_err());
+
+    let mut partial_catalog = refs.clone();
+    partial_catalog.catalog_partition.payload_sha256 = digest('7');
+    assert!(verify_prediction_evidence(&partial_catalog).is_err());
+
+    let mut missing_terminal = refs.clone();
+    missing_terminal.terminal_receipt.artifact.path = "missing-terminal.json".to_string();
+    assert!(verify_prediction_evidence(&missing_terminal).is_err());
+
+    let mut only_full_depth = refs.clone();
+    only_full_depth
+        .reports
+        .retain(|report| report.report_kind.starts_with("full_depth_execution_"));
+    assert!(verify_prediction_evidence(&only_full_depth).is_err());
+
+    let mut side_mismatch = refs.clone();
+    side_mismatch.reports[1].report_kind = "full_depth_execution_down".to_string();
+    assert!(verify_prediction_evidence(&side_mismatch).is_err());
+    refs
 }
 
 fn metric_event_count(metrics: &AuthenticatedTaskMetrics) -> usize {

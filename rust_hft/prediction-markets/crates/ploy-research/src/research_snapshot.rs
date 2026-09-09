@@ -166,6 +166,22 @@ pub struct ResearchSnapshot {
     pub pm_book_snapshots: Vec<ResearchPmBookSnapshot>,
 }
 
+impl ResearchSnapshot {
+    pub fn snapshot_hash(&self) -> &str {
+        self.manifest
+            .snapshot_hash
+            .as_deref()
+            .expect("loaded research snapshot has a verified snapshot_hash")
+    }
+
+    pub fn snapshot_contract_hash(&self) -> &str {
+        self.manifest
+            .snapshot_contract_hash
+            .as_deref()
+            .expect("loaded research snapshot has a verified snapshot_contract_hash")
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ResearchSnapshotRequest<'a> {
     pub symbols: &'a [String],

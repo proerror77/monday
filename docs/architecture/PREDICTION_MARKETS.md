@@ -302,9 +302,15 @@ deployment entrypoints.
   PyTorch/libtorch bindings and tracked Python source are forbidden by root CI.
 - Shell remains for host bootstrap, CI command composition, and package installation;
   no shell script owns trading decisions, risk, OMS, or exchange mutations.
-- The Rust sidecar is built and tested but has no approved deployment package. Its
-  missing evidence adapters fail closed and require a separate parity and deployment
-  review rather than falling back to ungoverned tools.
+- The Rust sidecar consumes only parent-produced, typed prediction evidence
+  references under a bounded local artifact root. Its read-only verifier
+  rehashes the canonical Mission, catalog/cohort, sealed snapshot, producer and
+  verifier identities, result bundle, evaluator reports, and terminal receipt
+  before model invocation. Data-audit, full-depth, and executable-replay
+  research may pass from that receipt; tool logs, model self-reports, top-book
+  files, and historical full-depth files cannot authorize it. Runtime parity,
+  realtime claims, and Grok evidence remain fail-closed until their own reviewed
+  contracts exist, and no sidecar path submits orders or mutates live state.
 
 ## Historical local-only documents
 
