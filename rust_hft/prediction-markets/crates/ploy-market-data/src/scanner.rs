@@ -25,7 +25,7 @@ use crate::discovery::crypto::DiscoveredCryptoMarket;
 use crate::discovery::crypto::{discover_crypto_catalog_markets, discover_crypto_markets};
 use crate::discovery::sports::discover_sports_markets;
 use crate::discovery::upsert_market_catalog;
-use crate::feeds::spawn_clob_ws_quote_feed_until;
+use crate::feeds::spawn_polymarket_market_stream_until;
 use crate::gamma_keyset::fetch_markets;
 use crate::reference_prices::{new_reference_price_registry, ReferencePriceRegistry};
 
@@ -171,7 +171,7 @@ pub fn spawn_market_scanner(
 
             match fetch_markets(&request, CRYPTO_DISCOVERY_MAX_MARKETS).await {
                 Ok(markets) => {
-                    let mut new_tokens: Vec<U256> = Vec::new();
+                    let mut new_tokens: Vec<String> = Vec::new();
                     let mut quote_stop_at: Option<DateTime<Utc>> = None;
                     let discovered =
                         discover_crypto_markets(&markets, &symbols, &reference_prices, now).await;
@@ -187,30 +187,30 @@ pub fn spawn_market_scanner(
                             continue;
                         }
 
-                        let Some(up_asset_id) = parse_token_id(&market.up_token) else {
+                        if parse_token_id(&market.up_token).is_none() {
                             warn!(
                                 market_id = %market.descriptor.market_id,
                                 token_id = %market.up_token,
                                 "Skipping discovered market with invalid up token id"
                             );
                             continue;
-                        };
-                        let Some(down_asset_id) = parse_token_id(&market.down_token) else {
+                        }
+                        if parse_token_id(&market.down_token).is_none() {
                             warn!(
                                 market_id = %market.descriptor.market_id,
                                 token_id = %market.down_token,
                                 "Skipping discovered market with invalid down token id"
                             );
                             continue;
-                        };
+                        }
 
                         if subscribed_tokens.insert(market.up_token.clone()) {
-                            new_tokens.push(up_asset_id);
+                            new_tokens.push(market.up_token.clone());
                             quote_stop_at =
                                 extend_quote_feed_stop_at(quote_stop_at, market.end_time);
                         }
                         if subscribed_tokens.insert(market.down_token.clone()) {
-                            new_tokens.push(down_asset_id);
+                            new_tokens.push(market.down_token.clone());
                             quote_stop_at =
                                 extend_quote_feed_stop_at(quote_stop_at, market.end_time);
                         }
@@ -246,7 +246,7 @@ pub fn spawn_market_scanner(
                             total_tracked = tracked.len(),
                             "Discovered new markets, subscribing to quotes",
                         );
-                        quote_handles.push(spawn_clob_ws_quote_feed_until(
+                        quote_handles.push(spawn_polymarket_market_stream_until(
                             tx.clone(),
                             new_tokens,
                             quote_stop_at,
@@ -426,7 +426,7 @@ async fn recover_pending_open_positions(
         "Startup recovery: re-injecting pending open positions into scanner"
     );
 
-    let mut new_tokens: Vec<U256> = Vec::new();
+    let mut new_tokens: Vec<String> = Vec::new();
     let mut seen_events: HashSet<String> = HashSet::new();
     let recovery_stop_at = rows
         .iter()
@@ -447,18 +447,18 @@ async fn recover_pending_open_positions(
             }
         };
 
-        let Some(up_asset_id) = parse_token_id(&up_token) else {
+        if parse_token_id(&up_token).is_none() {
             continue;
-        };
-        let Some(down_asset_id) = parse_token_id(&down_token) else {
+        }
+        if parse_token_id(&down_token).is_none() {
             continue;
-        };
+        }
 
         if subscribed_tokens.insert(up_token.clone()) {
-            new_tokens.push(up_asset_id);
+            new_tokens.push(up_token.clone());
         }
         if subscribed_tokens.insert(down_token.clone()) {
-            new_tokens.push(down_asset_id);
+            new_tokens.push(down_token.clone());
         }
 
         tracked.insert(
@@ -494,7 +494,7 @@ async fn recover_pending_open_positions(
             tokens = new_tokens.len(),
             "Recovery: subscribing to quote feeds for pending positions"
         );
-        quote_handles.push(spawn_clob_ws_quote_feed_until(
+        quote_handles.push(spawn_polymarket_market_stream_until(
             tx.clone(),
             new_tokens,
             recovery_stop_at,

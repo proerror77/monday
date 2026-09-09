@@ -4216,6 +4216,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "hft-data-adapter-polymarket"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "hft-core",
+ "hft-ports",
+ "polymarket_client_sdk_v2",
+ "rust_decimal",
+ "rustls",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tokio-tungstenite 0.26.2",
+ "url",
+]
+
+[[package]]
 name = "hft-integration"
 version = "0.1.0"
 dependencies = [
@@ -5828,6 +5846,7 @@ dependencies = [
  "chrono",
  "crc32fast",
  "futures",
+ "hft-data-adapter-polymarket",
  "libc",
  "ploy-market-contracts",
  "polymarket_client_sdk_v2",

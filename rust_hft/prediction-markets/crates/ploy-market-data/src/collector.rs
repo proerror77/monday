@@ -12,11 +12,13 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
+use adapter_polymarket_data::{
+    BookLevel, MarketEvent, MarketSnapshot, MarketStream, PolymarketBook, PolymarketMarketStream,
+    Symbol,
+};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use ploy_market_contracts::normalize_token_id;
-use polymarket_client_sdk::clob::ws::types::response::OrderBookLevel;
-use polymarket_client_sdk::clob::ws::{BookUpdate, Client as ClobWsClient};
 use polymarket_client_sdk::gamma::types::request::MarketByIdRequest;
 use polymarket_client_sdk::gamma::Client as GammaClient;
 use polymarket_client_sdk::rtds::{Client as RtdsClient, Subscription};
@@ -113,7 +115,7 @@ struct PersistResult {
 struct BookPersistJob {
     timeframe: String,
     meta: TokenMetadata,
-    book: BookUpdate,
+    book: MarketSnapshot,
     token_id: String,
     best_bid: Option<Decimal>,
     best_ask: Option<Decimal>,
@@ -149,7 +151,6 @@ enum OfficialMarketSettlementStatus {
     Unknown,
 }
 
-pub(crate) const POLYMARKET_CLOB_WS_ENDPOINT: &str = "wss://ws-subscriptions-clob.polymarket.com";
 const POLYMARKET_RTDS_WS_ENDPOINT: &str = "wss://ws-live-data.polymarket.com";
 const HEALTH_CHECK_INTERVAL_SECS: u64 = 5;
 const DEFAULT_PERSIST_QUEUE_CAPACITY: usize = 4_096;
@@ -183,21 +184,22 @@ where
         .min_by(|left, right| left.0.cmp(&right.0))
 }
 
-fn persisted_orderbook_levels(levels: &[OrderBookLevel]) -> Vec<PersistedOrderBookLevel> {
+fn persisted_orderbook_levels(levels: &[BookLevel]) -> Vec<PersistedOrderBookLevel> {
     levels
         .iter()
         .map(|level| PersistedOrderBookLevel {
             price: level.price.to_string(),
-            size: level.size.to_string(),
+            size: level.quantity.to_string(),
         })
         .collect::<Vec<_>>()
 }
 
-fn orderbook_levels_json(levels: &[OrderBookLevel]) -> Json<Vec<PersistedOrderBookLevel>> {
+fn orderbook_levels_json(levels: &[BookLevel]) -> Json<Vec<PersistedOrderBookLevel>> {
     Json(persisted_orderbook_levels(levels))
 }
 
-fn serialize_orderbook_levels(levels: &[OrderBookLevel]) -> String {
+#[cfg(test)]
+fn serialize_orderbook_levels(levels: &[BookLevel]) -> String {
     let levels = persisted_orderbook_levels(levels);
     serde_json::to_string(&levels).expect("serializing persisted orderbook levels cannot fail")
 }
@@ -355,14 +357,17 @@ fn snapshot_context_json(meta: &TokenMetadata, timeframe: &str) -> Json<Snapshot
     Json(snapshot_context_value(meta, timeframe))
 }
 
+#[cfg(test)]
 fn snapshot_context(meta: &TokenMetadata, timeframe: &str) -> String {
     let context = snapshot_context_value(meta, timeframe);
 
     serde_json::to_string(&context).expect("serializing snapshot context cannot fail")
 }
 
-fn book_timestamp(timestamp_ms: i64) -> Option<DateTime<Utc>> {
-    DateTime::from_timestamp_millis(timestamp_ms)
+fn book_timestamp(timestamp_us: u64) -> Option<DateTime<Utc>> {
+    i64::try_from(timestamp_us)
+        .ok()
+        .and_then(DateTime::from_timestamp_micros)
 }
 
 fn should_persist_snapshot(
@@ -497,40 +502,26 @@ impl QuoteCollector {
                 continue;
             }
 
-            // Convert token IDs to U256
-            let asset_ids: Vec<polymarket_client_sdk::types::U256> =
-                token_ids.iter().filter_map(|id| id.parse().ok()).collect();
-
-            if asset_ids.is_empty() {
-                warn!("No valid U256 token IDs found");
-                sleep(StdDuration::from_secs(self.config.refresh_interval_secs)).await;
-                continue;
-            }
-
-            info!(tokens = asset_ids.len(), "Subscribing to orderbook updates");
-            let active_asset_count = asset_ids.len();
-
-            // Create WebSocket client and subscribe
-            let client = ClobWsClient::new(
-                POLYMARKET_CLOB_WS_ENDPOINT,
-                collector_market_data_ws_config(),
-            )
-            .expect("collector WebSocket config should be valid");
-            let stream = match client.subscribe_orderbook(asset_ids) {
-                Ok(s) => s,
-                Err(e) => {
-                    error!(error = %e, "Failed to subscribe to orderbook");
+            info!(
+                tokens = token_ids.len(),
+                "Subscribing to canonical Polymarket market stream"
+            );
+            let active_asset_count = token_ids.len();
+            let adapter = PolymarketMarketStream::new();
+            let symbols = token_ids.iter().map(Symbol::new).collect::<Vec<_>>();
+            let mut stream = match adapter.subscribe(symbols).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    error!(error = %error, "Failed to subscribe to canonical Polymarket market stream");
                     sleep(StdDuration::from_secs(5)).await;
                     continue;
                 }
             };
-
-            let mut stream = Box::pin(stream);
             let mut health_tick =
                 tokio::time::interval(StdDuration::from_secs(HEALTH_CHECK_INTERVAL_SECS));
             health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-            info!("WebSocket connected, listening for quotes...");
+            info!("Canonical Polymarket market stream connected, listening for quotes...");
 
             // Listen for quotes until refresh interval
             let refresh_deadline = tokio::time::Instant::now()
@@ -538,6 +529,7 @@ impl QuoteCollector {
             let mut last_snapshot_by_token: HashMap<String, DateTime<Utc>> = HashMap::new();
             let mut last_quote_refresh_by_token: HashMap<String, DateTime<Utc>> = HashMap::new();
             let mut latest_quote_by_token: HashMap<String, BookPersistJob> = HashMap::new();
+            let mut books_by_token: HashMap<String, PolymarketBook> = HashMap::new();
 
             loop {
                 tokio::select! {
@@ -555,107 +547,121 @@ impl QuoteCollector {
                     }
                     result = stream.next() => {
                         match result {
-                            Some(Ok(book)) => {
-                                let token_id = book.asset_id.to_string();
-
-                                // Log first few messages for debugging
-                                {
-                                    let s = self.stats.read().await;
-                                    if s.books_received < 10 {
-                                        info!(
-                                            token = %token_id,
-                                            bids = book.bids.len(),
-                                            asks = book.asks.len(),
-                                            "Received orderbook update"
-                                        );
-                                    }
-                                }
-
-                                // Check if we're tracking this token
-                                let is_tracked = {
-                                    let sub = self.subscribed_tokens.read().await;
-                                    sub.contains(&token_id)
-                                };
-
-                                if !is_tracked {
-                                    continue;
-                                }
-
-                                {
-                                    let mut s = self.stats.write().await;
-                                    s.books_received += 1;
-                                    s.last_book_at = Some(Utc::now());
-                                }
-
-                                // Select the actual best tradeable levels, not just the first
-                                // non-placeholder level returned by the SDK. Preserve size so
-                                // LOB-aware replay can model executable top-of-book liquidity.
-                                let real_bid = best_tradeable_bid_level(
-                                    book.bids.iter().map(|bid| (bid.price, bid.size)),
-                                );
-                                let real_ask = best_tradeable_ask_level(
-                                    book.asks.iter().map(|ask| (ask.price, ask.size)),
-                                );
-
-                                let (best_bid, bid_size) = real_bid
-                                    .map(|(price, size)| (Some(price), Some(size)))
-                                    .unwrap_or((None, None));
-                                let (best_ask, ask_size) = real_ask
-                                    .map(|(price, size)| (Some(price), Some(size)))
-                                    .unwrap_or((None, None));
-
-                                // Get metadata
-                                let meta = {
-                                    let m = self.token_metadata.read().await;
-                                    m.get(&token_id).cloned()
-                                };
-
-                                if let Some(meta) = meta {
-                                    let include_snapshot = should_persist_snapshot(
-                                        &mut last_snapshot_by_token,
-                                        &token_id,
-                                        Utc::now(),
-                                        self.config.snapshot_sample_ms,
-                                    );
-                                    let job = BookPersistJob {
-                                        timeframe: self.config.timeframe.clone(),
-                                        meta,
-                                        book,
-                                        token_id: token_id.clone(),
-                                        best_bid,
-                                        best_ask,
-                                        bid_size,
-                                        ask_size,
-                                        include_snapshot,
+                            Some(Ok(event)) => match &event {
+                                MarketEvent::Snapshot(_) | MarketEvent::Update(_) => {
+                                    let token_id = match &event {
+                                        MarketEvent::Snapshot(snapshot) => snapshot.symbol.as_str().to_string(),
+                                        MarketEvent::Update(update) => update.symbol.as_str().to_string(),
+                                        _ => unreachable!("event was matched as a book event"),
+                                    };
+                                    let book = books_by_token.entry(token_id.clone()).or_default();
+                                    let snapshot = match book.apply(&event) {
+                                        Ok(Some(snapshot)) => snapshot,
+                                        Ok(None) => continue,
+                                        Err(error) => {
+                                            warn!(token = %token_id, error = %error, "Canonical Polymarket book projection rejected event");
+                                            books_by_token.clear();
+                                            latest_quote_by_token.clear();
+                                            last_snapshot_by_token.clear();
+                                            last_quote_refresh_by_token.clear();
+                                            continue;
+                                        }
                                     };
 
-                                    match persist_tx.try_send(job.clone()) {
-                                        Ok(()) => {
-                                            let mut cached_job = job;
-                                            cached_job.include_snapshot = false;
-                                            latest_quote_by_token.insert(token_id.clone(), cached_job);
-                                            last_quote_refresh_by_token.insert(token_id.clone(), Utc::now());
-                                        }
-                                        Err(TrySendError::Full(_job)) => {
-                                            self.note_dropped_book(&token_id).await;
-                                        }
-                                        Err(TrySendError::Closed(_job)) => {
-                                            return Err(Box::new(io::Error::new(
-                                                io::ErrorKind::BrokenPipe,
-                                                "quote collector persistence queue closed",
-                                            )));
-                                        }
+                                    {
+                                        let mut s = self.stats.write().await;
+                                        s.books_received += 1;
+                                        s.last_book_at = Some(Utc::now());
                                     }
-                                } else {
-                                    warn!(token = %token_id, "Received quote for unknown token");
+
+                                    let real_bid = best_tradeable_bid_level(
+                                        snapshot.bids.iter().map(|level| (level.price.0, level.quantity.0)),
+                                    );
+                                    let real_ask = best_tradeable_ask_level(
+                                        snapshot.asks.iter().map(|level| (level.price.0, level.quantity.0)),
+                                    );
+                                    let (best_bid, bid_size) = real_bid
+                                        .map(|(price, size)| (Some(price), Some(size)))
+                                        .unwrap_or((None, None));
+                                    let (best_ask, ask_size) = real_ask
+                                        .map(|(price, size)| (Some(price), Some(size)))
+                                        .unwrap_or((None, None));
+
+                                    let meta = {
+                                        let m = self.token_metadata.read().await;
+                                        m.get(&token_id).cloned()
+                                    };
+                                    if let Some(meta) = meta {
+                                        let include_snapshot = should_persist_snapshot(
+                                            &mut last_snapshot_by_token,
+                                            &token_id,
+                                            Utc::now(),
+                                            self.config.snapshot_sample_ms,
+                                        );
+                                        let job = BookPersistJob {
+                                            timeframe: self.config.timeframe.clone(),
+                                            meta,
+                                            book: snapshot,
+                                            token_id: token_id.clone(),
+                                            best_bid,
+                                            best_ask,
+                                            bid_size,
+                                            ask_size,
+                                            include_snapshot,
+                                        };
+
+                                        match persist_tx.try_send(job.clone()) {
+                                            Ok(()) => {
+                                                let mut cached_job = job;
+                                                cached_job.include_snapshot = false;
+                                                latest_quote_by_token.insert(token_id.clone(), cached_job);
+                                                last_quote_refresh_by_token.insert(token_id.clone(), Utc::now());
+                                            }
+                                            Err(TrySendError::Full(_job)) => {
+                                                self.note_dropped_book(&token_id).await;
+                                            }
+                                            Err(TrySendError::Closed(_job)) => {
+                                                return Err(Box::new(io::Error::new(
+                                                    io::ErrorKind::BrokenPipe,
+                                                    "quote collector persistence queue closed",
+                                                )));
+                                            }
+                                        }
+                                    } else {
+                                        warn!(token = %token_id, "Received quote for unknown token");
+                                    }
                                 }
-                            }
-                            Some(Err(e)) => {
-                                warn!(error = %e, "WebSocket stream error");
-                                break;
+                                MarketEvent::Disconnect { symbol, .. } => match symbol {
+                                    Some(symbol) => {
+                                        let token_id = symbol.as_str();
+                                        books_by_token.remove(token_id);
+                                        latest_quote_by_token.remove(token_id);
+                                        last_snapshot_by_token.remove(token_id);
+                                        last_quote_refresh_by_token.remove(token_id);
+                                        info!(token = %token_id, "Canonical Polymarket token book invalidated; waiting for a fresh snapshot");
+                                    }
+                                    None => {
+                                        books_by_token.clear();
+                                        latest_quote_by_token.clear();
+                                        last_snapshot_by_token.clear();
+                                        last_quote_refresh_by_token.clear();
+                                        info!("Canonical Polymarket market stream disconnected; waiting for fresh snapshots");
+                                    }
+                                },
+                                MarketEvent::Trade(_) => {}
+                                MarketEvent::Quote(_)
+                                | MarketEvent::Bar(_)
+                                | MarketEvent::Arbitrage(_) => {}
+                            },
+                            Some(Err(error)) => {
+                                books_by_token.clear();
+                                latest_quote_by_token.clear();
+                                last_snapshot_by_token.clear();
+                                last_quote_refresh_by_token.clear();
+                                warn!(error = %error, "Canonical Polymarket market stream error; waiting for a fresh snapshot");
                             }
                             None => {
-                                warn!("WebSocket stream ended, reconnecting...");
+                                warn!("Canonical Polymarket market stream ended, reconnecting...");
                                 break;
                             }
                         }
@@ -1362,11 +1368,13 @@ async fn persist_book_updates(
         snapshot_insert.push_values(snapshot_jobs, |mut row, job| {
             row.push_bind("Crypto")
                 .push_bind(job.token_id.clone())
-                .push_bind(job.book.market.to_string())
+                .push_bind(Option::<String>::None)
                 .push_bind(orderbook_levels_json(&job.book.bids))
                 .push_bind(orderbook_levels_json(&job.book.asks))
                 .push_bind(book_timestamp(job.book.timestamp))
-                .push_bind(job.book.hash.clone())
+                .push_bind(Option::<String>::None)
+                // Keep the established trusted source label; the implementation
+                // behind this sink is now the canonical adapter.
                 .push_bind("polymarket_ws_collector")
                 .push_bind(snapshot_context_json(&job.meta, &job.timeframe))
                 .push_bind(received_at);
@@ -1429,9 +1437,9 @@ mod tests {
         best_tradeable_ask_level, best_tradeable_bid_level, book_timestamp, bridge_sdk_json,
         collector_market_data_ws_config, latest_seen_at, parse_official_market_settlements,
         serialize_orderbook_levels, should_persist_snapshot, should_refresh_cached_quote,
-        snapshot_context, CollectorConfig, OfficialMarketSettlementPayload, OrderBookLevel,
-        TokenMetadata,
+        snapshot_context, CollectorConfig, OfficialMarketSettlementPayload, TokenMetadata,
     };
+    use adapter_polymarket_data::BookLevel;
     use chrono::{TimeZone, Utc};
     use rust_decimal_macros::dec;
     use std::collections::HashMap;
@@ -1504,14 +1512,14 @@ mod tests {
     #[test]
     fn serialize_orderbook_levels_preserves_price_and_size_strings() {
         let levels = vec![
-            OrderBookLevel::builder()
-                .price(dec!(0.45))
-                .size(dec!(12.5))
-                .build(),
-            OrderBookLevel::builder()
-                .price(dec!(0.44))
-                .size(dec!(8))
-                .build(),
+            BookLevel {
+                price: adapter_polymarket_data::Price(dec!(0.45)),
+                quantity: adapter_polymarket_data::Quantity(dec!(12.5)),
+            },
+            BookLevel {
+                price: adapter_polymarket_data::Price(dec!(0.44)),
+                quantity: adapter_polymarket_data::Quantity(dec!(8)),
+            },
         ];
 
         assert_eq!(
@@ -1536,8 +1544,8 @@ mod tests {
     }
 
     #[test]
-    fn book_timestamp_converts_millis_to_utc_datetime() {
-        let timestamp = book_timestamp(1_712_205_600_123).unwrap();
+    fn book_timestamp_converts_micros_to_utc_datetime() {
+        let timestamp = book_timestamp(1_712_205_600_123_000).unwrap();
         assert_eq!(timestamp.to_rfc3339(), "2024-04-04T04:40:00.123+00:00");
     }
 
