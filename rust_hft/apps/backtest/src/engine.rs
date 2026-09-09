@@ -6,7 +6,12 @@ use anyhow::{Context, Result};
 use itertools::Itertools;
 use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
+
+use hft_core::{
+    BookBudget, DisplayedBookLevel, DisplayedBookSnapshot, OrderType, Price, Quantity, Side,
+};
 
 use crate::config::{
     BacktestConfig, BacktestInputEvidence, ExecutionConfig, RiskConfig, StrategyConfig,
@@ -17,7 +22,10 @@ const MICROS_IN_SECOND: f64 = 1_000_000.0;
 const BPS: f64 = 10_000.0;
 
 pub const TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION: &str =
+    "hft-backtest-target-position-replay-v3";
+pub const LEGACY_TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION: &str =
     "hft-backtest-target-position-replay-v2";
+pub const TARGET_POSITION_REPLAY_TRACE_SCHEMA_VERSION: &str = "hft-target-position-replay-trace-v1";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -31,12 +39,19 @@ pub struct TargetPositionDecision {
 pub struct TargetPositionReplayConfig {
     pub max_depth_levels: usize,
     pub max_decision_delay_us: u64,
+    /// Deterministic decision-to-order arrival latency.  The next observed
+    /// book at or after `decision_timestamp_us + order_latency_us` is the
+    /// only book eligible for this IOC attempt.
+    #[serde(default)]
+    pub order_latency_us: u64,
     pub position_notional_usd: f64,
     pub fee_bps: f64,
     pub rebate_bps: f64,
     pub funding_bps: f64,
     pub latency_bps: f64,
     pub additional_slippage_bps: f64,
+    /// This replay is IOC taker execution against displayed levels.  A
+    /// passive or mid-queue model is not available, so `false` is rejected.
     pub cross_spread: bool,
     pub capacity_depth_levels: usize,
     pub trade_tape_declared: bool,
@@ -59,12 +74,85 @@ pub struct TargetPositionReplayMetrics {
     pub min_ask_depth_levels: usize,
     pub max_ask_depth_levels: usize,
     pub total_turnover: f64,
+    /// Requested target turnover retained for policy comparison.
+    #[serde(default)]
+    pub requested_turnover: f64,
+    /// Executed turnover measured from filled notional / configured notional.
+    #[serde(default)]
+    pub executed_turnover: f64,
     pub mean_net_return: f64,
     pub cumulative_net_return: f64,
     pub max_drawdown: f64,
     pub net_sharpe: f64,
     pub max_abs_position: f64,
     pub max_same_side_depth_fraction: Option<f64>,
+    #[serde(default)]
+    pub order_count: usize,
+    #[serde(default)]
+    pub filled_order_count: usize,
+    #[serde(default)]
+    pub partial_order_count: usize,
+    #[serde(default)]
+    pub canceled_order_count: usize,
+    #[serde(default)]
+    pub fill_count: usize,
+    #[serde(default)]
+    pub max_residual_quantity: f64,
+    #[serde(default)]
+    pub displayed_depth_unavailable: bool,
+    #[serde(default)]
+    pub final_cash: f64,
+    #[serde(default)]
+    pub final_inventory: f64,
+    #[serde(default)]
+    pub total_fees: f64,
+    #[serde(default)]
+    pub total_funding_cost: f64,
+    #[serde(default)]
+    pub total_execution_cost: f64,
+    #[serde(default)]
+    pub trace_event_count: usize,
+    #[serde(default)]
+    pub trace_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetPositionReplayFill {
+    pub price: f64,
+    pub quantity: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetPositionReplayTraceEvent {
+    pub schema_version: String,
+    pub decision_index: usize,
+    pub decision_timestamp_us: i64,
+    pub order_timestamp_us: i64,
+    pub arrival_timestamp_us: i64,
+    pub time_in_force: String,
+    pub target_position: f64,
+    pub side: Option<Side>,
+    pub order_type: Option<OrderType>,
+    pub requested_quantity: f64,
+    pub filled_quantity: f64,
+    pub residual_quantity: f64,
+    pub vwap: Option<f64>,
+    pub fees: f64,
+    pub funding_cost: f64,
+    pub execution_cost: f64,
+    pub cash_after: f64,
+    pub inventory_after: f64,
+    pub status: String,
+    pub fills: Vec<TargetPositionReplayFill>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TargetPositionReplayOutput {
+    pub metrics: TargetPositionReplayMetrics,
+    pub trace_bytes: Vec<u8>,
+    pub trace_sha256: String,
 }
 
 pub fn replay_target_positions(
@@ -80,11 +168,26 @@ pub fn replay_target_positions(
     replay.finish()
 }
 
+pub fn replay_target_positions_with_trace(
+    event_bytes: &[u8],
+    decisions: &[TargetPositionDecision],
+    config: &TargetPositionReplayConfig,
+) -> Result<TargetPositionReplayOutput> {
+    let mut replay = TargetPositionReplay::new(decisions, config)?;
+    let stream = EventStream::new(BufReader::new(Cursor::new(event_bytes)), None, None, true);
+    for event in stream {
+        replay.observe(&event?)?;
+    }
+    replay.finish_with_trace()
+}
+
 pub(crate) struct TargetPositionReplay<'a> {
     decisions: &'a [TargetPositionDecision],
     config: &'a TargetPositionReplayConfig,
     book: OrderBook,
+    displayed_budget: BookBudget,
     seeded: bool,
+    book_generation: u64,
     decision_index: usize,
     event_count: usize,
     snapshot_events: usize,
@@ -98,11 +201,27 @@ pub(crate) struct TargetPositionReplay<'a> {
     max_bid_depth_levels: usize,
     min_ask_depth_levels: usize,
     max_ask_depth_levels: usize,
-    position: f64,
+    inventory: f64,
+    cash: f64,
+    initial_cash: f64,
     marked_mid: Option<f64>,
     total_turnover: f64,
+    requested_turnover: f64,
+    executed_turnover: f64,
     max_same_side_depth_fraction: Option<f64>,
     returns: Vec<f64>,
+    order_count: usize,
+    filled_order_count: usize,
+    partial_order_count: usize,
+    canceled_order_count: usize,
+    fill_count: usize,
+    max_residual_quantity: f64,
+    displayed_depth_unavailable: bool,
+    max_abs_inventory_ratio: f64,
+    total_fees: f64,
+    total_funding_cost: f64,
+    total_execution_cost: f64,
+    trace: Vec<u8>,
 }
 
 impl<'a> TargetPositionReplay<'a> {
@@ -115,7 +234,9 @@ impl<'a> TargetPositionReplay<'a> {
             decisions,
             config,
             book: OrderBook::new(config.max_depth_levels),
+            displayed_budget: BookBudget::default(),
             seeded: false,
+            book_generation: 0,
             decision_index: 0,
             event_count: 0,
             snapshot_events: 0,
@@ -129,11 +250,27 @@ impl<'a> TargetPositionReplay<'a> {
             max_bid_depth_levels: 0,
             min_ask_depth_levels: usize::MAX,
             max_ask_depth_levels: 0,
-            position: 0.0,
+            inventory: 0.0,
+            cash: config.position_notional_usd,
+            initial_cash: config.position_notional_usd,
             marked_mid: None,
             total_turnover: 0.0,
+            requested_turnover: 0.0,
+            executed_turnover: 0.0,
             max_same_side_depth_fraction: config.capacity_depth_levels.gt(&0).then_some(0.0),
             returns: Vec::with_capacity(decisions.len()),
+            order_count: 0,
+            filled_order_count: 0,
+            partial_order_count: 0,
+            canceled_order_count: 0,
+            fill_count: 0,
+            max_residual_quantity: 0.0,
+            displayed_depth_unavailable: false,
+            max_abs_inventory_ratio: 0.0,
+            total_fees: 0.0,
+            total_funding_cost: 0.0,
+            total_execution_cost: 0.0,
+            trace: Vec::with_capacity(decisions.len() * 256),
         })
     }
 
@@ -144,103 +281,272 @@ impl<'a> TargetPositionReplay<'a> {
             .ok_or_else(|| anyhow::anyhow!("target-position replay event count overflow"))?;
         self.first_event_time_us.get_or_insert(event.ts);
         self.last_event_time_us = Some(event.ts);
-        match &event.payload {
+        let sequence = event
+            .sequence
+            .context("target-position replay event is missing sequence")?;
+        if event.ts <= 0 {
+            anyhow::bail!("target-position replay event timestamp must be positive");
+        }
+        let book_observed = match &event.payload {
             EventPayload::Snapshot { bids, asks } => {
                 if self.seeded {
                     self.observe_series_boundary(event.ts)?;
                     self.marked_mid = None;
                 }
+                self.book_generation = self.book_generation.checked_add(1).ok_or_else(|| {
+                    anyhow::anyhow!("target-position replay book generation overflow")
+                })?;
                 self.book.apply_snapshot(event.ts, bids, asks);
+                let snapshot = self.book.displayed_snapshot(
+                    sequence,
+                    self.book_generation,
+                    u64::try_from(event.ts)?,
+                );
+                if !self
+                    .displayed_budget
+                    .observe(&snapshot, u64::try_from(event.ts)?)
+                {
+                    anyhow::bail!("target-position replay received an invalid or stale snapshot");
+                }
                 self.seeded = true;
                 self.snapshot_events += 1;
+                true
             }
             EventPayload::L2Update { bids, asks } => {
                 if !self.seeded {
                     anyhow::bail!("target-position replay received an L2 update before a snapshot");
                 }
                 self.book.apply_delta(event.ts, bids, asks);
+                let snapshot = self.book.displayed_snapshot(
+                    sequence,
+                    self.book_generation,
+                    u64::try_from(event.ts)?,
+                );
+                if !self
+                    .displayed_budget
+                    .observe(&snapshot, u64::try_from(event.ts)?)
+                {
+                    anyhow::bail!("target-position replay received an invalid or stale L2 book");
+                }
                 self.l2_update_events += 1;
+                true
             }
             EventPayload::Trade { .. } => {
                 if !self.config.trade_tape_declared {
                     anyhow::bail!("target-position replay tape contains undeclared trade events");
                 }
                 self.trade_events += 1;
+                false
             }
-        }
-        if self.seeded {
+        };
+        if self.seeded && book_observed {
             let (bid_levels, ask_levels) = self.book.depth_level_counts();
             self.min_bid_depth_levels = self.min_bid_depth_levels.min(bid_levels);
             self.max_bid_depth_levels = self.max_bid_depth_levels.max(bid_levels);
             self.min_ask_depth_levels = self.min_ask_depth_levels.min(ask_levels);
             self.max_ask_depth_levels = self.max_ask_depth_levels.max(ask_levels);
-            if let Some(mid) = self.book.mid_price() {
-                while self.decision_index < self.decisions.len()
-                    && self.decisions[self.decision_index].timestamp_us <= event.ts
-                {
-                    let decision = &self.decisions[self.decision_index];
-                    let delay = u64::try_from(event.ts - decision.timestamp_us).map_err(|_| {
-                        anyhow::anyhow!("target-position replay decision clock reversed")
-                    })?;
-                    if delay > self.config.max_decision_delay_us {
-                        anyhow::bail!("target-position replay decision exceeded its maximum delay");
-                    }
-                    self.max_decision_delay_us = self.max_decision_delay_us.max(delay);
-                    let change = decision.target_position - self.position;
-                    let turnover = change.abs();
-                    if turnover > f64::EPSILON {
-                        self.position_changes += 1;
-                        if let Some(max_fraction) = &mut self.max_same_side_depth_fraction {
-                            let depth_notional = self
-                                .book
-                                .same_side_depth(change, self.config.capacity_depth_levels)
-                                .ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "target-position replay has no same-side depth for a position change"
-                                    )
-                                })?
-                                * mid;
-                            if depth_notional <= 0.0 {
-                                anyhow::bail!(
-                                    "target-position replay has non-positive same-side depth"
-                                );
-                            }
-                            *max_fraction = (*max_fraction)
-                                .max(self.config.position_notional_usd * turnover / depth_notional);
-                        }
-                    }
-                    self.total_turnover += turnover;
-                    let gross_return = self
-                        .marked_mid
-                        .map(|previous_mid| self.position * (mid / previous_mid - 1.0))
-                        .unwrap_or(0.0);
-                    let spread_cost_bps = if self.config.cross_spread {
-                        self.book.spread_bps().ok_or_else(|| {
-                            anyhow::anyhow!("target-position replay has no spread")
-                        })? / 2.0
-                    } else {
-                        0.0
-                    };
-                    let transaction_cost = turnover
-                        * (self.config.fee_bps - self.config.rebate_bps
-                            + self.config.latency_bps
-                            + self.config.additional_slippage_bps
-                            + spread_cost_bps)
-                        / BPS;
-                    let funding_cost = self.position.abs() * self.config.funding_bps / BPS;
-                    self.returns
-                        .push(gross_return - transaction_cost - funding_cost);
-                    self.marked_mid = Some(mid);
-                    self.position = decision.target_position;
-                    self.decision_index += 1;
-                }
-            }
+            self.process_due_decisions(event.ts)?;
         }
         Ok(())
     }
 
+    fn process_due_decisions(&mut self, arrival_ts_us: i64) -> Result<()> {
+        let mid = self
+            .displayed_budget
+            .mid_price()
+            .and_then(|price| price.to_f64())
+            .context("target-position replay has no valid mid price")?;
+        if !mid.is_finite() || mid <= 0.0 {
+            anyhow::bail!("target-position replay has a non-positive mid price");
+        }
+        let book_fresh = self
+            .displayed_budget
+            .is_fresh(u64::try_from(arrival_ts_us)?);
+        let order_latency_us = i64::try_from(self.config.order_latency_us)
+            .context("target-position replay order latency exceeds i64")?;
+        while self.decision_index < self.decisions.len() {
+            let decision = self.decisions[self.decision_index].clone();
+            let eligible_at = decision
+                .timestamp_us
+                .checked_add(order_latency_us)
+                .context("target-position replay order arrival overflows")?;
+            if eligible_at > arrival_ts_us {
+                break;
+            }
+            let delay = u64::try_from(arrival_ts_us - decision.timestamp_us)
+                .map_err(|_| anyhow::anyhow!("target-position replay decision clock reversed"))?;
+            if delay > self.config.max_decision_delay_us {
+                anyhow::bail!("target-position replay decision exceeded its maximum delay");
+            }
+            self.max_decision_delay_us = self.max_decision_delay_us.max(delay);
+            self.apply_decision(&decision, arrival_ts_us, mid, book_fresh)?;
+            self.decision_index += 1;
+        }
+        Ok(())
+    }
+
+    fn apply_decision(
+        &mut self,
+        decision: &TargetPositionDecision,
+        arrival_ts_us: i64,
+        mid: f64,
+        book_fresh: bool,
+    ) -> Result<()> {
+        let equity_before = self.cash + self.inventory * self.marked_mid.unwrap_or(mid);
+        let funding_cost = self.inventory.abs() * mid * self.config.funding_bps / BPS;
+        self.cash -= funding_cost;
+        self.total_funding_cost += funding_cost;
+        let target_inventory = decision.target_position * self.config.position_notional_usd / mid;
+        let requested_quantity = (target_inventory - self.inventory).abs();
+        let side = (target_inventory - self.inventory > f64::EPSILON)
+            .then_some(Side::Buy)
+            .or_else(|| (target_inventory - self.inventory < -f64::EPSILON).then_some(Side::Sell));
+        let mut fills_for_trace = Vec::new();
+        let mut filled_quantity = 0.0;
+        let mut fill_notional = 0.0;
+        let mut fees = 0.0;
+        let mut status = "no_order".to_string();
+
+        if let Some(side) = side {
+            self.position_changes += 1;
+            self.order_count += 1;
+            if let Some(max_fraction) = &mut self.max_same_side_depth_fraction {
+                let depth = self
+                    .displayed_budget
+                    .same_side_depth(side, self.config.capacity_depth_levels)
+                    .and_then(|quantity| quantity.to_f64())
+                    .filter(|depth| *depth > 0.0);
+                if let Some(depth) = depth {
+                    let depth_notional = depth * mid;
+                    if depth_notional > 0.0 {
+                        *max_fraction =
+                            (*max_fraction).max(requested_quantity * mid / depth_notional);
+                    }
+                } else {
+                    self.displayed_depth_unavailable = true;
+                }
+            }
+            let fills = if book_fresh {
+                self.displayed_budget.fills(
+                    side,
+                    OrderType::Market,
+                    None,
+                    Quantity::from_f64(requested_quantity).map_err(|_| {
+                        anyhow::anyhow!(
+                            "target-position replay requested quantity is not representable"
+                        )
+                    })?,
+                )
+            } else {
+                self.displayed_depth_unavailable = true;
+                Vec::new()
+            };
+            self.fill_count += fills.len();
+            for fill in fills {
+                let price = fill
+                    .price
+                    .to_f64()
+                    .context("target-position replay fill price is not representable")?;
+                let quantity = fill
+                    .quantity
+                    .to_f64()
+                    .context("target-position replay fill quantity is not representable")?;
+                filled_quantity += quantity;
+                fill_notional += price * quantity;
+                fills_for_trace.push(TargetPositionReplayFill { price, quantity });
+                match side {
+                    Side::Buy => {
+                        self.cash -= price * quantity;
+                        self.inventory += quantity;
+                    }
+                    Side::Sell => {
+                        self.cash += price * quantity;
+                        self.inventory -= quantity;
+                    }
+                }
+            }
+            if self.inventory.abs() <= f64::EPSILON {
+                self.inventory = 0.0;
+            }
+            let residual_quantity = (requested_quantity - filled_quantity).max(0.0);
+            let residual_quantity = if residual_quantity <= f64::EPSILON {
+                0.0
+            } else {
+                residual_quantity
+            };
+            self.max_residual_quantity = self.max_residual_quantity.max(residual_quantity);
+            if !book_fresh {
+                self.canceled_order_count += 1;
+                status = "cancelled_stale_book".to_string();
+            } else if filled_quantity <= f64::EPSILON {
+                self.canceled_order_count += 1;
+                status = "cancelled_no_liquidity".to_string();
+            } else if residual_quantity > f64::EPSILON {
+                self.partial_order_count += 1;
+                self.canceled_order_count += 1;
+                status = "partial_fill_cancelled".to_string();
+            } else {
+                self.filled_order_count += 1;
+                status = "filled".to_string();
+            }
+            fees = fill_notional * (self.config.fee_bps - self.config.rebate_bps) / BPS;
+            let declared_execution_cost = fill_notional
+                * (self.config.latency_bps + self.config.additional_slippage_bps)
+                / BPS;
+            self.cash -= fees + declared_execution_cost;
+            self.total_fees += fees;
+            self.total_execution_cost += declared_execution_cost;
+        }
+
+        let equity_after = self.cash + self.inventory * mid;
+        self.max_abs_inventory_ratio = self
+            .max_abs_inventory_ratio
+            .max(self.inventory.abs() * mid / self.initial_cash);
+        self.returns
+            .push((equity_after - equity_before) / self.initial_cash);
+        self.requested_turnover += requested_quantity * mid / self.config.position_notional_usd;
+        self.executed_turnover += fill_notional / self.config.position_notional_usd;
+        self.total_turnover = self.executed_turnover;
+        self.marked_mid = Some(mid);
+        let residual_quantity = (target_inventory - self.inventory).abs();
+        let residual_quantity = if residual_quantity <= f64::EPSILON {
+            0.0
+        } else {
+            residual_quantity
+        };
+        self.max_residual_quantity = self.max_residual_quantity.max(residual_quantity);
+        let vwap = (filled_quantity > f64::EPSILON).then_some(fill_notional / filled_quantity);
+        let trace_event = TargetPositionReplayTraceEvent {
+            schema_version: TARGET_POSITION_REPLAY_TRACE_SCHEMA_VERSION.to_string(),
+            decision_index: self.decision_index,
+            decision_timestamp_us: decision.timestamp_us,
+            order_timestamp_us: decision.timestamp_us,
+            arrival_timestamp_us: arrival_ts_us,
+            time_in_force: "IOC".to_string(),
+            target_position: decision.target_position,
+            side,
+            order_type: side.map(|_| OrderType::Market),
+            requested_quantity,
+            filled_quantity,
+            residual_quantity,
+            vwap,
+            fees,
+            funding_cost,
+            execution_cost: fill_notional
+                * (self.config.latency_bps + self.config.additional_slippage_bps)
+                / BPS,
+            cash_after: self.cash,
+            inventory_after: self.inventory,
+            status,
+            fills: fills_for_trace,
+        };
+        serde_json::to_writer(&mut self.trace, &trace_event)?;
+        self.trace.push(b'\n');
+        Ok(())
+    }
+
     fn observe_series_boundary(&self, snapshot_ts: i64) -> Result<()> {
-        if self.position.abs() > f64::EPSILON {
+        if self.inventory.abs() > f64::EPSILON {
             anyhow::bail!("target-position replay received a new snapshot before flattening");
         }
         if self
@@ -256,11 +562,15 @@ impl<'a> TargetPositionReplay<'a> {
     }
 
     pub(crate) fn finish(self) -> Result<TargetPositionReplayMetrics> {
+        Ok(self.finish_with_trace()?.metrics)
+    }
+
+    pub(crate) fn finish_with_trace(self) -> Result<TargetPositionReplayOutput> {
         if self.decision_index != self.decisions.len() {
             anyhow::bail!("target-position replay tape ended before all decisions");
         }
-        if self.position.abs() > f64::EPSILON {
-            anyhow::bail!("target-position replay tape ended before flattening");
+        if self.inventory.abs() > f64::EPSILON {
+            anyhow::bail!("target-position replay tape ended before flattening actual inventory");
         }
         if self.config.trade_tape_declared && self.trade_events == 0 {
             anyhow::bail!("target-position replay manifest declares trades but none were replayed");
@@ -294,7 +604,8 @@ impl<'a> TargetPositionReplay<'a> {
                 max_drawdown = max_drawdown.max((peak - equity) / peak);
             }
         }
-        Ok(TargetPositionReplayMetrics {
+        let trace_sha256 = hex::encode(Sha256::digest(&self.trace));
+        let metrics = TargetPositionReplayMetrics {
             event_count: self.event_count,
             snapshot_events: self.snapshot_events,
             l2_update_events: self.l2_update_events,
@@ -309,16 +620,33 @@ impl<'a> TargetPositionReplay<'a> {
             min_ask_depth_levels: self.min_ask_depth_levels,
             max_ask_depth_levels: self.max_ask_depth_levels,
             total_turnover: self.total_turnover,
+            requested_turnover: self.requested_turnover,
+            executed_turnover: self.executed_turnover,
             mean_net_return,
             cumulative_net_return,
             max_drawdown,
             net_sharpe,
-            max_abs_position: self
-                .decisions
-                .iter()
-                .map(|decision| decision.target_position.abs())
-                .fold(0.0, f64::max),
+            max_abs_position: self.max_abs_inventory_ratio,
             max_same_side_depth_fraction: self.max_same_side_depth_fraction,
+            order_count: self.order_count,
+            filled_order_count: self.filled_order_count,
+            partial_order_count: self.partial_order_count,
+            canceled_order_count: self.canceled_order_count,
+            fill_count: self.fill_count,
+            max_residual_quantity: self.max_residual_quantity,
+            displayed_depth_unavailable: self.displayed_depth_unavailable,
+            final_cash: self.cash,
+            final_inventory: self.inventory,
+            total_fees: self.total_fees,
+            total_funding_cost: self.total_funding_cost,
+            total_execution_cost: self.total_execution_cost,
+            trace_event_count: self.decisions.len(),
+            trace_sha256: trace_sha256.clone(),
+        };
+        Ok(TargetPositionReplayOutput {
+            metrics,
+            trace_bytes: self.trace,
+            trace_sha256,
         })
     }
 }
@@ -335,9 +663,6 @@ fn validate_target_replay_inputs(
         config.latency_bps,
         config.additional_slippage_bps,
     ];
-    let capacity_disabled =
-        config.position_notional_usd == 0.0 && config.capacity_depth_levels == 0;
-    let capacity_enabled = config.position_notional_usd > 0.0 && config.capacity_depth_levels > 0;
     if decisions.is_empty()
         || decisions
             .windows(2)
@@ -347,11 +672,18 @@ fn validate_target_replay_inputs(
         })
         || config.max_depth_levels == 0
         || config.max_decision_delay_us == 0
+        || config.order_latency_us > config.max_decision_delay_us
         || costs.iter().any(|value| !value.is_finite() || *value < 0.0)
-        || !(capacity_disabled || capacity_enabled)
+        || !config.position_notional_usd.is_finite()
+        || config.position_notional_usd <= 0.0
         || config.capacity_depth_levels > config.max_depth_levels
     {
         anyhow::bail!("target-position replay inputs are invalid");
+    }
+    if !config.cross_spread {
+        anyhow::bail!(
+            "target-position replay requires cross_spread=true; passive or mid-queue execution is unsupported"
+        );
     }
     Ok(())
 }
@@ -359,6 +691,9 @@ fn validate_target_replay_inputs(
 pub struct BacktestEngine {
     cfg: BacktestConfig,
     order_book: OrderBook,
+    displayed_budget: BookBudget,
+    book_generation: u64,
+    next_sequence: u64,
     liquidity: LiquidityMap,
     flow: FlowTracker,
     execution: ExecutionManager,
@@ -376,6 +711,9 @@ impl BacktestEngine {
         Self {
             cfg,
             order_book: OrderBook::new(max_levels),
+            displayed_budget: BookBudget::default(),
+            book_generation: 0,
+            next_sequence: 0,
             liquidity: LiquidityMap::new(strategy, tick_size, max_levels),
             flow: FlowTracker::new(),
             execution: ExecutionManager::new(execution_cfg, risk_cfg, tick_size),
@@ -408,7 +746,10 @@ impl BacktestEngine {
 
         // 平倉殘餘持倉
         if self.execution.has_position() {
-            if let Some((fill_qty, fill_price)) = self.execution.executable_exit(&self.order_book) {
+            if let Some((fill_qty, fill_price)) = self
+                .execution
+                .executable_exit_from_budget(&mut self.displayed_budget)
+            {
                 let ts = self
                     .last_ts
                     .map(|t| t as f64 / MICROS_IN_SECOND)
@@ -432,6 +773,7 @@ impl BacktestEngine {
         match &event.payload {
             EventPayload::Snapshot { bids, asks } => {
                 let ofi = self.order_book.apply_snapshot(event.ts, bids, asks);
+                self.observe_displayed_book(event, true)?;
                 self.liquidity.update(
                     event.ts,
                     &self.order_book.snapshot(self.cfg.data.max_depth_levels),
@@ -441,6 +783,7 @@ impl BacktestEngine {
             }
             EventPayload::L2Update { bids, asks } => {
                 let ofi = self.order_book.apply_delta(event.ts, bids, asks);
+                self.observe_displayed_book(event, false)?;
                 self.liquidity.update(
                     event.ts,
                     &self.order_book.snapshot(self.cfg.data.max_depth_levels),
@@ -458,6 +801,70 @@ impl BacktestEngine {
             }
         }
         Ok(())
+    }
+
+    fn observe_displayed_book(&mut self, event: &EventEnvelope, snapshot: bool) -> Result<()> {
+        let sequence = event
+            .sequence
+            .unwrap_or_else(|| self.next_sequence.saturating_add(1));
+        self.next_sequence = self.next_sequence.max(sequence);
+        if snapshot {
+            self.book_generation = self
+                .book_generation
+                .checked_add(1)
+                .context("backtest book generation overflow")?;
+        } else if self.book_generation == 0 {
+            self.displayed_budget.clear_levels();
+            return Ok(());
+        }
+        let received_at_us =
+            u64::try_from(event.ts).context("backtest event timestamp is invalid")?;
+        let displayed =
+            self.order_book
+                .displayed_snapshot(sequence, self.book_generation, received_at_us);
+        if !self.displayed_budget.observe(&displayed, received_at_us) {
+            // The feature book remains available for signal diagnostics, but
+            // execution loses its budget until a fresh valid observation.
+            self.displayed_budget.clear_levels();
+        }
+        Ok(())
+    }
+
+    fn executable_entry_from_budget(
+        &self,
+        side: PositionSide,
+        requested_qty: f64,
+    ) -> Option<(f64, f64, BookBudget)> {
+        let mut trial_budget = self.displayed_budget.clone();
+        let (book_side, worst) = match side {
+            PositionSide::Long => {
+                let best = trial_budget.best_ask()?.0.to_f64()?;
+                let worst = Price::from_f64(
+                    best + self.cfg.execution.max_slippage_ticks * self.cfg.data.tick_size,
+                )
+                .ok()?;
+                (Side::Buy, worst)
+            }
+            PositionSide::Short => {
+                let best = trial_budget.best_bid()?.0.to_f64()?;
+                let worst = Price::from_f64(
+                    best - self.cfg.execution.max_slippage_ticks * self.cfg.data.tick_size,
+                )
+                .ok()?;
+                (Side::Sell, worst)
+            }
+        };
+        let fills = trial_budget.fills_with_price_bound_and_participation(
+            book_side,
+            OrderType::Market,
+            None,
+            Quantity::from_f64(requested_qty).ok()?,
+            Some(worst),
+            Quantity::from_f64(self.cfg.execution.max_fill_ratio.clamp(0.0, 1.0))
+                .ok()?
+                .0,
+        );
+        aggregate_displayed_fills(&fills).map(|(qty, price)| (qty, price, trial_budget))
     }
 
     fn evaluate_signals(&mut self, ts: i64) -> Result<()> {
@@ -508,14 +915,11 @@ impl BacktestEngine {
                         self.cfg.execution.base_qty,
                     )
                 };
-                if let Some((qty, entry_price)) = self.order_book.executable_entry(
-                    PositionSide::Short,
-                    requested_qty,
-                    self.cfg.execution.max_fill_ratio,
-                    self.cfg.execution.max_slippage_ticks,
-                    self.cfg.data.tick_size,
-                ) {
+                if let Some((qty, entry_price, trial_budget)) =
+                    self.executable_entry_from_budget(PositionSide::Short, requested_qty)
+                {
                     if self.execution.can_enter(qty) {
+                        self.displayed_budget = trial_budget;
                         self.execution.enter_short(
                             ts_sec,
                             entry_price,
@@ -550,14 +954,11 @@ impl BacktestEngine {
                         self.cfg.execution.base_qty,
                     )
                 };
-                if let Some((qty, entry_price)) = self.order_book.executable_entry(
-                    PositionSide::Long,
-                    requested_qty,
-                    self.cfg.execution.max_fill_ratio,
-                    self.cfg.execution.max_slippage_ticks,
-                    self.cfg.data.tick_size,
-                ) {
+                if let Some((qty, entry_price, trial_budget)) =
+                    self.executable_entry_from_budget(PositionSide::Long, requested_qty)
+                {
                     if self.execution.can_enter(qty) {
+                        self.displayed_budget = trial_budget;
                         self.execution.enter_long(
                             ts_sec,
                             entry_price,
@@ -576,7 +977,7 @@ impl BacktestEngine {
             mid,
             ofi,
             cvd_delta,
-            &self.order_book,
+            &mut self.displayed_budget,
             &mut self.stats,
         );
 
@@ -695,27 +1096,45 @@ impl OrderBook {
         }
     }
 
-    fn spread_bps(&self) -> Option<f64> {
-        let (bid, _) = self.best_bid()?;
-        let (ask, _) = self.best_ask()?;
-        let mid = self.mid_price()?;
-        (mid > 0.0).then_some((ask - bid) / mid * BPS)
-    }
-
     fn depth_level_counts(&self) -> (usize, usize) {
         (self.bids.len(), self.asks.len())
     }
 
-    fn same_side_depth(&self, position_change: f64, levels: usize) -> Option<f64> {
-        if position_change > 0.0 {
-            Some(self.asks.values().take(levels).copied().sum())
-        } else if position_change < 0.0 {
-            Some(self.bids.values().rev().take(levels).copied().sum())
-        } else {
-            None
-        }
+    fn displayed_snapshot(
+        &self,
+        sequence: u64,
+        generation: u64,
+        received_at_us: u64,
+    ) -> DisplayedBookSnapshot {
+        DisplayedBookSnapshot::new(
+            sequence,
+            generation,
+            received_at_us,
+            self.bids
+                .iter()
+                .rev()
+                .take(self.max_levels)
+                .map(|(price, quantity)| {
+                    DisplayedBookLevel::new(
+                        Price::from_f64(price.into_inner()).unwrap_or(Price::zero()),
+                        Quantity::from_f64(*quantity).unwrap_or(Quantity::zero()),
+                    )
+                })
+                .collect(),
+            self.asks
+                .iter()
+                .take(self.max_levels)
+                .map(|(price, quantity)| {
+                    DisplayedBookLevel::new(
+                        Price::from_f64(price.into_inner()).unwrap_or(Price::zero()),
+                        Quantity::from_f64(*quantity).unwrap_or(Quantity::zero()),
+                    )
+                })
+                .collect(),
+        )
     }
 
+    #[cfg(test)]
     fn executable_exit(
         &self,
         position_side: PositionSide,
@@ -724,9 +1143,9 @@ impl OrderBook {
         max_slippage_ticks: f64,
         tick_size: f64,
     ) -> Option<(f64, f64)> {
-        let participation = max_fill_ratio.clamp(0.0, 1.0);
         if requested_qty <= 0.0
-            || participation <= 0.0
+            || !max_fill_ratio.is_finite()
+            || max_fill_ratio <= 0.0
             || !max_slippage_ticks.is_finite()
             || max_slippage_ticks < 0.0
             || !tick_size.is_finite()
@@ -734,57 +1153,36 @@ impl OrderBook {
         {
             return None;
         }
-        let (levels, worst_price): (Box<dyn Iterator<Item = (f64, f64)> + '_>, f64) =
-            match position_side {
-                PositionSide::Long => {
-                    let best = self.best_bid()?.0;
-                    (
-                        Box::new(
-                            self.bids
-                                .iter()
-                                .rev()
-                                .map(|(price, qty)| (price.into_inner(), *qty)),
-                        ),
-                        best - max_slippage_ticks * tick_size,
-                    )
-                }
-                PositionSide::Short => {
-                    let best = self.best_ask()?.0;
-                    (
-                        Box::new(
-                            self.asks
-                                .iter()
-                                .map(|(price, qty)| (price.into_inner(), *qty)),
-                        ),
-                        best + max_slippage_ticks * tick_size,
-                    )
-                }
-            };
-        let mut remaining = requested_qty;
-        let mut filled = 0.0;
-        let mut notional = 0.0;
-        for (price, displayed_qty) in levels {
-            let outside_slippage = match position_side {
-                PositionSide::Long => price < worst_price - 1e-12,
-                PositionSide::Short => price > worst_price + 1e-12,
-            };
-            if outside_slippage {
-                break;
-            }
-            let level_fill = remaining.min(displayed_qty.max(0.0) * participation);
-            if level_fill <= 0.0 {
-                continue;
-            }
-            filled += level_fill;
-            notional += level_fill * price;
-            remaining -= level_fill;
-            if remaining <= 1e-12 {
-                break;
-            }
+        let order_side = match position_side {
+            PositionSide::Long => Side::Sell,
+            PositionSide::Short => Side::Buy,
+        };
+        let best = match order_side {
+            Side::Sell => self.best_bid()?.0,
+            Side::Buy => self.best_ask()?.0,
+        };
+        let best_f64 = best;
+        let bound = match order_side {
+            Side::Sell => Price::from_f64(best_f64 - max_slippage_ticks * tick_size).ok()?,
+            Side::Buy => Price::from_f64(best_f64 + max_slippage_ticks * tick_size).ok()?,
+        };
+        let mut budget = BookBudget::default();
+        if !budget.observe(&self.displayed_snapshot(1, 1, 1), 1) {
+            return None;
         }
-        (filled > 0.0).then_some((filled, notional / filled))
+        let participation = Quantity::from_f64(max_fill_ratio.clamp(0.0, 1.0)).ok()?.0;
+        let fills = budget.fills_with_price_bound_and_participation(
+            order_side,
+            OrderType::Market,
+            None,
+            Quantity::from_f64(requested_qty).ok()?,
+            Some(bound),
+            participation,
+        );
+        aggregate_displayed_fills(&fills)
     }
 
+    #[cfg(test)]
     fn executable_entry(
         &self,
         position_side: PositionSide,
@@ -793,63 +1191,42 @@ impl OrderBook {
         max_slippage_ticks: f64,
         tick_size: f64,
     ) -> Option<(f64, f64)> {
-        let participation = max_fill_ratio.clamp(0.0, 1.0);
         if requested_qty <= 0.0
-            || participation <= 0.0
+            || !max_fill_ratio.is_finite()
+            || max_fill_ratio <= 0.0
+            || !max_slippage_ticks.is_finite()
             || max_slippage_ticks < 0.0
+            || !tick_size.is_finite()
             || tick_size <= 0.0
         {
             return None;
         }
-        let (levels, worst_price): (Box<dyn Iterator<Item = (f64, f64)> + '_>, f64) =
-            match position_side {
-                PositionSide::Long => {
-                    let best = self.best_ask()?.0;
-                    (
-                        Box::new(
-                            self.asks
-                                .iter()
-                                .map(|(price, qty)| (price.into_inner(), *qty)),
-                        ),
-                        best + max_slippage_ticks * tick_size,
-                    )
-                }
-                PositionSide::Short => {
-                    let best = self.best_bid()?.0;
-                    (
-                        Box::new(
-                            self.bids
-                                .iter()
-                                .rev()
-                                .map(|(price, qty)| (price.into_inner(), *qty)),
-                        ),
-                        best - max_slippage_ticks * tick_size,
-                    )
-                }
-            };
-        let mut remaining = requested_qty;
-        let mut filled = 0.0;
-        let mut notional = 0.0;
-        for (price, displayed_qty) in levels {
-            let outside_slippage = match position_side {
-                PositionSide::Long => price > worst_price + 1e-12,
-                PositionSide::Short => price < worst_price - 1e-12,
-            };
-            if outside_slippage {
-                break;
-            }
-            let level_fill = remaining.min(displayed_qty.max(0.0) * participation);
-            if level_fill <= 0.0 {
-                continue;
-            }
-            filled += level_fill;
-            notional += level_fill * price;
-            remaining -= level_fill;
-            if remaining <= 1e-12 {
-                break;
-            }
+        let order_side = match position_side {
+            PositionSide::Long => Side::Buy,
+            PositionSide::Short => Side::Sell,
+        };
+        let best = match order_side {
+            Side::Buy => self.best_ask()?.0,
+            Side::Sell => self.best_bid()?.0,
+        };
+        let bound = match order_side {
+            Side::Buy => Price::from_f64(best + max_slippage_ticks * tick_size).ok()?,
+            Side::Sell => Price::from_f64(best - max_slippage_ticks * tick_size).ok()?,
+        };
+        let mut budget = BookBudget::default();
+        if !budget.observe(&self.displayed_snapshot(1, 1, 1), 1) {
+            return None;
         }
-        (filled > 0.0).then_some((filled, notional / filled))
+        let participation = Quantity::from_f64(max_fill_ratio.clamp(0.0, 1.0)).ok()?.0;
+        let fills = budget.fills_with_price_bound_and_participation(
+            order_side,
+            OrderType::Market,
+            None,
+            Quantity::from_f64(requested_qty).ok()?,
+            Some(bound),
+            participation,
+        );
+        aggregate_displayed_fills(&fills)
     }
 
     fn snapshot(&self, max_levels: usize) -> DepthSnapshot {
@@ -890,6 +1267,18 @@ impl OrderBook {
 struct DepthSnapshot {
     bids: Vec<Level>,
     asks: Vec<Level>,
+}
+
+fn aggregate_displayed_fills(fills: &[hft_core::DisplayedFill]) -> Option<(f64, f64)> {
+    let mut quantity = 0.0;
+    let mut notional = 0.0;
+    for fill in fills {
+        let price = fill.price.to_f64()?;
+        let fill_quantity = fill.quantity.to_f64()?;
+        quantity += fill_quantity;
+        notional += price * fill_quantity;
+    }
+    (quantity > 0.0).then_some((quantity, notional / quantity))
 }
 
 // ----- Liquidity Map -----
@@ -1358,6 +1747,7 @@ impl ExecutionManager {
         self.cap_qty(base_qty * ratio, depth)
     }
 
+    #[cfg(test)]
     fn executable_exit(&self, order_book: &OrderBook) -> Option<(f64, f64)> {
         order_book.executable_exit(
             self.position.side?,
@@ -1366,6 +1756,34 @@ impl ExecutionManager {
             self.risk.slippage_limit_ticks,
             self.tick_size,
         )
+    }
+
+    fn executable_exit_from_budget(&self, budget: &mut BookBudget) -> Option<(f64, f64)> {
+        let position_side = self.position.side?;
+        let order_side = match position_side {
+            PositionSide::Long => Side::Sell,
+            PositionSide::Short => Side::Buy,
+        };
+        let best = match order_side {
+            Side::Sell => budget.best_bid()?.0.to_f64()?,
+            Side::Buy => budget.best_ask()?.0.to_f64()?,
+        };
+        let slippage = self.risk.slippage_limit_ticks * self.tick_size;
+        let bound = match order_side {
+            Side::Sell => Price::from_f64(best - slippage).ok()?,
+            Side::Buy => Price::from_f64(best + slippage).ok()?,
+        };
+        let fills = budget.fills_with_price_bound_and_participation(
+            order_side,
+            OrderType::Market,
+            None,
+            Quantity::from_f64(self.position.qty).ok()?,
+            Some(bound),
+            Quantity::from_f64(self.cfg.max_fill_ratio.clamp(0.0, 1.0))
+                .ok()?
+                .0,
+        );
+        aggregate_displayed_fills(&fills)
     }
 
     fn enter_short(
@@ -1447,7 +1865,7 @@ impl ExecutionManager {
         mid: f64,
         ofi: f64,
         cvd_delta: f64,
-        order_book: &OrderBook,
+        displayed_budget: &mut BookBudget,
         stats: &mut BacktestStats,
     ) {
         if self.position.side.is_none() {
@@ -1506,7 +1924,8 @@ impl ExecutionManager {
         };
 
         if let Some(reason) = reason {
-            if let Some((fill_qty, fill_price)) = self.executable_exit(order_book) {
+            if let Some((fill_qty, fill_price)) = self.executable_exit_from_budget(displayed_budget)
+            {
                 self.exit_position(ts, fill_price, fill_qty, reason, stats);
             }
         }
@@ -1731,13 +2150,14 @@ mod tests {
         let config = TargetPositionReplayConfig {
             max_depth_levels: 1,
             max_decision_delay_us: 1_000_000,
-            position_notional_usd: 0.0,
+            order_latency_us: 0,
+            position_notional_usd: 100.0,
             fee_bps: 2.0,
             rebate_bps: 0.0,
             funding_bps: 0.0,
             latency_bps: 0.5,
             additional_slippage_bps: 0.25,
-            cross_spread: false,
+            cross_spread: true,
             capacity_depth_levels: 0,
             trade_tape_declared: false,
         };
@@ -1759,6 +2179,352 @@ mod tests {
                 .to_string()
                 .contains("before a snapshot")
         );
+    }
+
+    #[test]
+    fn target_position_replay_models_latency_ioc_partial_fills_and_trace_hash() {
+        let tape = concat!(
+            "{\"timestamp\":1000000,\"sequence\":1,\"event\":\"snapshot\",\"bids\":[[99,1]],\"asks\":[[101,1]]}\n",
+            "{\"timestamp\":2000000,\"sequence\":2,\"event\":\"l2_update\",\"bids\":[[99,1]],\"asks\":[[101,1]]}\n",
+            "{\"timestamp\":3000000,\"sequence\":3,\"event\":\"l2_update\",\"bids\":[[99,0],[89,1]],\"asks\":[[101,0],[91,1]]}\n",
+            "{\"timestamp\":5000000,\"sequence\":4,\"event\":\"l2_update\",\"bids\":[[89,1]],\"asks\":[[91,1]]}\n",
+        );
+        let decisions = [
+            TargetPositionDecision {
+                timestamp_us: 1_000_000,
+                target_position: 1.0,
+            },
+            TargetPositionDecision {
+                timestamp_us: 3_000_000,
+                target_position: 0.0,
+            },
+        ];
+        let mut config = TargetPositionReplayConfig {
+            max_depth_levels: 1,
+            max_decision_delay_us: 2_000_000,
+            order_latency_us: 2_000_000,
+            position_notional_usd: 90.0,
+            fee_bps: 10.0,
+            rebate_bps: 0.0,
+            funding_bps: 0.0,
+            latency_bps: 0.0,
+            additional_slippage_bps: 0.0,
+            cross_spread: true,
+            capacity_depth_levels: 0,
+            trade_tape_declared: false,
+        };
+        let delayed = replay_target_positions_with_trace(tape.as_bytes(), &decisions, &config)
+            .expect("delayed IOC replay");
+        let delayed_events = tape_trace_events(&delayed.trace_bytes);
+        assert_eq!(delayed_events[0].arrival_timestamp_us, 3_000_000);
+        assert_eq!(delayed_events[0].vwap, Some(91.0));
+        assert_eq!(delayed_events[1].arrival_timestamp_us, 5_000_000);
+        assert_eq!(delayed.metrics.final_inventory, 0.0);
+        assert_eq!(delayed.metrics.partial_order_count, 0);
+        assert_eq!(delayed.metrics.canceled_order_count, 0);
+        assert_eq!(delayed.metrics.trace_sha256, delayed.trace_sha256);
+
+        config.order_latency_us = 0;
+        let immediate = replay_target_positions_with_trace(tape.as_bytes(), &decisions, &config)
+            .expect("immediate IOC replay");
+        let immediate_events = tape_trace_events(&immediate.trace_bytes);
+        assert_eq!(immediate_events[0].arrival_timestamp_us, 1_000_000);
+        assert_eq!(immediate_events[0].vwap, Some(101.0));
+        assert_ne!(delayed.trace_sha256, immediate.trace_sha256);
+    }
+
+    #[test]
+    fn target_position_replay_waits_for_a_book_after_trade_arrival() {
+        let tape = concat!(
+            "{\"timestamp\":1000000,\"sequence\":1,\"event\":\"snapshot\",\"bids\":[[99,10]],\"asks\":[[101,10]]}\n",
+            "{\"timestamp\":5000000,\"sequence\":2,\"event\":\"trade\",\"side\":\"buy\",\"price\":101,\"quantity\":1}\n",
+            "{\"timestamp\":6000000,\"sequence\":3,\"event\":\"l2_update\",\"bids\":[[99,10]],\"asks\":[[101,0],[111,10]]}\n",
+            "{\"timestamp\":7000000,\"sequence\":4,\"event\":\"l2_update\",\"bids\":[[99,10]],\"asks\":[[111,10]]}\n",
+        );
+        let decisions = [
+            TargetPositionDecision {
+                timestamp_us: 4_900_000,
+                target_position: 1.0,
+            },
+            TargetPositionDecision {
+                timestamp_us: 6_500_000,
+                target_position: 0.0,
+            },
+        ];
+        let config = TargetPositionReplayConfig {
+            max_depth_levels: 1,
+            max_decision_delay_us: 2_000_000,
+            order_latency_us: 0,
+            position_notional_usd: 105.0,
+            fee_bps: 0.0,
+            rebate_bps: 0.0,
+            funding_bps: 0.0,
+            latency_bps: 0.0,
+            additional_slippage_bps: 0.0,
+            cross_spread: true,
+            capacity_depth_levels: 0,
+            trade_tape_declared: true,
+        };
+
+        let output = replay_target_positions_with_trace(tape.as_bytes(), &decisions, &config)
+            .expect("stale trade replay");
+        let events = tape_trace_events(&output.trace_bytes);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].arrival_timestamp_us, 6_000_000);
+        assert_eq!(events[0].status, "filled");
+        assert_eq!(events[0].vwap, Some(111.0));
+        assert_eq!(events[1].arrival_timestamp_us, 7_000_000);
+        assert_eq!(events[1].status, "filled");
+        assert_eq!(output.metrics.fill_count, 2);
+        assert_eq!(output.metrics.canceled_order_count, 0);
+        assert!(!output.metrics.displayed_depth_unavailable);
+        assert_eq!(output.metrics.final_inventory, 0.0);
+    }
+
+    #[test]
+    fn target_position_replay_missing_book_after_trade_is_fail_closed() {
+        let tape = concat!(
+            "{\"timestamp\":1000000,\"sequence\":1,\"event\":\"snapshot\",\"bids\":[[99,10]],\"asks\":[[101,10]]}\n",
+            "{\"timestamp\":5000000,\"sequence\":2,\"event\":\"trade\",\"side\":\"buy\",\"price\":101,\"quantity\":1}\n",
+        );
+        let decisions = [TargetPositionDecision {
+            timestamp_us: 4_900_000,
+            target_position: 1.0,
+        }];
+        let config = TargetPositionReplayConfig {
+            max_depth_levels: 1,
+            max_decision_delay_us: 1_000_000,
+            order_latency_us: 0,
+            position_notional_usd: 100.0,
+            fee_bps: 0.0,
+            rebate_bps: 0.0,
+            funding_bps: 0.0,
+            latency_bps: 0.0,
+            additional_slippage_bps: 0.0,
+            cross_spread: true,
+            capacity_depth_levels: 0,
+            trade_tape_declared: true,
+        };
+
+        let error = replay_target_positions(tape.as_bytes(), &decisions, &config).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("tape ended before all decisions"));
+    }
+
+    #[test]
+    fn target_position_replay_uses_actual_depth_vwap_and_explicit_residual_cancel() {
+        let tape = concat!(
+            "{\"timestamp\":1000000,\"sequence\":1,\"event\":\"snapshot\",\"bids\":[[99,1]],\"asks\":[[101,1]]}\n",
+            "{\"timestamp\":2000000,\"sequence\":2,\"event\":\"l2_update\",\"bids\":[[99,1]],\"asks\":[[101,1]]}\n",
+            "{\"timestamp\":3000000,\"sequence\":3,\"event\":\"l2_update\",\"bids\":[[99,1]],\"asks\":[[101,1]]}\n",
+        );
+        let decisions = [
+            TargetPositionDecision {
+                timestamp_us: 1_000_000,
+                target_position: 1.0,
+            },
+            TargetPositionDecision {
+                timestamp_us: 2_000_000,
+                target_position: 0.0,
+            },
+        ];
+        let config = TargetPositionReplayConfig {
+            max_depth_levels: 1,
+            max_decision_delay_us: 1_000_000,
+            order_latency_us: 0,
+            position_notional_usd: 150.0,
+            fee_bps: 10.0,
+            rebate_bps: 0.0,
+            funding_bps: 0.0,
+            latency_bps: 0.0,
+            additional_slippage_bps: 0.0,
+            cross_spread: true,
+            capacity_depth_levels: 0,
+            trade_tape_declared: false,
+        };
+        let output = replay_target_positions_with_trace(tape.as_bytes(), &decisions, &config)
+            .expect("partial IOC replay");
+        let events = tape_trace_events(&output.trace_bytes);
+        assert_eq!(events[0].status, "partial_fill_cancelled");
+        assert_eq!(events[0].filled_quantity, 1.0);
+        assert!((events[0].residual_quantity - (150.0 / 100.0 - 1.0)).abs() < 1e-12);
+        assert_eq!(events[0].vwap, Some(101.0));
+        assert_eq!(events[1].status, "filled");
+        assert_eq!(output.metrics.partial_order_count, 1);
+        assert_eq!(output.metrics.canceled_order_count, 1);
+        assert_eq!(output.metrics.fill_count, 2);
+        assert_eq!(output.metrics.final_inventory, 0.0);
+        assert!((output.metrics.final_cash - 147.8).abs() < 1e-12);
+        assert!((output.metrics.total_fees - 0.2).abs() < 1e-12);
+        assert!((output.metrics.total_turnover - (101.0 + 99.0) / 150.0).abs() < 1e-12);
+        assert!((output.metrics.requested_turnover - (1.0 + 2.0 / 3.0)).abs() < 1e-12);
+        assert_eq!(
+            output.metrics.final_inventory,
+            events.last().unwrap().inventory_after
+        );
+    }
+
+    #[test]
+    fn target_position_replay_reversal_and_flatten_use_actual_inventory() {
+        let tape = concat!(
+            "{\"timestamp\":1000000,\"sequence\":1,\"event\":\"snapshot\",\"bids\":[[99,5]],\"asks\":[[101,5]]}\n",
+            "{\"timestamp\":2000000,\"sequence\":2,\"event\":\"l2_update\",\"bids\":[[99,5]],\"asks\":[[101,5]]}\n",
+            "{\"timestamp\":3000000,\"sequence\":3,\"event\":\"l2_update\",\"bids\":[[99,5]],\"asks\":[[101,5]]}\n",
+        );
+        let decisions = [
+            TargetPositionDecision {
+                timestamp_us: 1_000_000,
+                target_position: 1.0,
+            },
+            TargetPositionDecision {
+                timestamp_us: 2_000_000,
+                target_position: -1.0,
+            },
+            TargetPositionDecision {
+                timestamp_us: 3_000_000,
+                target_position: 0.0,
+            },
+        ];
+        let config = TargetPositionReplayConfig {
+            max_depth_levels: 1,
+            max_decision_delay_us: 1_000_000,
+            order_latency_us: 0,
+            position_notional_usd: 100.0,
+            fee_bps: 0.0,
+            rebate_bps: 0.0,
+            funding_bps: 0.0,
+            latency_bps: 0.0,
+            additional_slippage_bps: 0.0,
+            cross_spread: true,
+            capacity_depth_levels: 0,
+            trade_tape_declared: false,
+        };
+        let output = replay_target_positions_with_trace(tape.as_bytes(), &decisions, &config)
+            .expect("reversal replay");
+        let events = tape_trace_events(&output.trace_bytes);
+        assert_eq!(
+            events.iter().map(|event| event.side).collect::<Vec<_>>(),
+            vec![Some(Side::Buy), Some(Side::Sell), Some(Side::Buy),]
+        );
+        assert_eq!(events[0].filled_quantity, 1.0);
+        assert_eq!(events[1].filled_quantity, 2.0);
+        assert_eq!(events[2].filled_quantity, 1.0);
+        assert_eq!(output.metrics.final_inventory, 0.0);
+    }
+
+    #[test]
+    fn target_position_replay_capacity_exhaustion_is_a_cancelled_ioc() {
+        let tape = concat!(
+            "{\"timestamp\":1000000,\"sequence\":1,\"event\":\"snapshot\",\"bids\":[[99,1]],\"asks\":[[101,1]]}\n",
+            "{\"timestamp\":2000000,\"sequence\":2,\"event\":\"l2_update\",\"bids\":[[99,1]],\"asks\":[[101,1]]}\n",
+            "{\"timestamp\":3000000,\"sequence\":3,\"event\":\"l2_update\",\"bids\":[[99,1]],\"asks\":[[101,1]]}\n",
+        );
+        let decisions = [
+            TargetPositionDecision {
+                timestamp_us: 1_000_000,
+                target_position: 0.5,
+            },
+            TargetPositionDecision {
+                timestamp_us: 2_000_000,
+                target_position: 1.0,
+            },
+            TargetPositionDecision {
+                timestamp_us: 3_000_000,
+                target_position: 0.0,
+            },
+        ];
+        let config = TargetPositionReplayConfig {
+            max_depth_levels: 1,
+            max_decision_delay_us: 1_000_000,
+            order_latency_us: 0,
+            position_notional_usd: 200.0,
+            fee_bps: 0.0,
+            rebate_bps: 0.0,
+            funding_bps: 0.0,
+            latency_bps: 0.0,
+            additional_slippage_bps: 0.0,
+            cross_spread: true,
+            capacity_depth_levels: 1,
+            trade_tape_declared: false,
+        };
+        let output = replay_target_positions_with_trace(tape.as_bytes(), &decisions, &config)
+            .expect("capacity exhaustion replay");
+        let events = tape_trace_events(&output.trace_bytes);
+        assert_eq!(events[0].status, "filled");
+        assert_eq!(events[1].status, "cancelled_no_liquidity");
+        assert_eq!(events[2].status, "filled");
+        assert!(output.metrics.displayed_depth_unavailable);
+        assert_eq!(output.metrics.canceled_order_count, 1);
+        assert_eq!(output.metrics.final_inventory, 0.0);
+    }
+
+    #[test]
+    fn target_position_replay_requires_positive_notional() {
+        let config = TargetPositionReplayConfig {
+            max_depth_levels: 1,
+            max_decision_delay_us: 1,
+            order_latency_us: 0,
+            position_notional_usd: 0.0,
+            fee_bps: 0.0,
+            rebate_bps: 0.0,
+            funding_bps: 0.0,
+            latency_bps: 0.0,
+            additional_slippage_bps: 0.0,
+            cross_spread: true,
+            capacity_depth_levels: 0,
+            trade_tape_declared: false,
+        };
+        let decisions = [TargetPositionDecision {
+            timestamp_us: 1,
+            target_position: 0.0,
+        }];
+        assert!(replay_target_positions(
+            b"{\"timestamp\":1,\"sequence\":1,\"event\":\"snapshot\",\"bids\":[[99,1]],\"asks\":[[101,1]]}\n",
+            &decisions,
+            &config,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn target_position_replay_rejects_unsupported_non_crossing_execution() {
+        let config = TargetPositionReplayConfig {
+            max_depth_levels: 1,
+            max_decision_delay_us: 1,
+            order_latency_us: 0,
+            position_notional_usd: 100.0,
+            fee_bps: 0.0,
+            rebate_bps: 0.0,
+            funding_bps: 0.0,
+            latency_bps: 0.0,
+            additional_slippage_bps: 0.0,
+            cross_spread: false,
+            capacity_depth_levels: 0,
+            trade_tape_declared: false,
+        };
+        let decisions = [TargetPositionDecision {
+            timestamp_us: 1,
+            target_position: 0.0,
+        }];
+
+        let error = replay_target_positions(
+            b"{\"timestamp\":1,\"sequence\":1,\"event\":\"snapshot\",\"bids\":[[99,1]],\"asks\":[[101,1]]}\n",
+            &decisions,
+            &config,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("requires cross_spread=true"));
+    }
+
+    fn tape_trace_events(bytes: &[u8]) -> Vec<TargetPositionReplayTraceEvent> {
+        bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).expect("trace event"))
+            .collect()
     }
 
     #[test]
@@ -1785,22 +2551,24 @@ mod tests {
         let config = TargetPositionReplayConfig {
             max_depth_levels: 1,
             max_decision_delay_us: 1,
-            position_notional_usd: 0.0,
+            order_latency_us: 0,
+            position_notional_usd: 100.0,
             fee_bps: 0.0,
             rebate_bps: 0.0,
             funding_bps: 10.0,
             latency_bps: 0.0,
             additional_slippage_bps: 0.0,
-            cross_spread: false,
+            cross_spread: true,
             capacity_depth_levels: 0,
             trade_tape_declared: false,
         };
 
         let metrics = replay_target_positions(tape.as_bytes(), &decisions, &config).unwrap();
-        let expected_gain = 0.1 - 0.001;
-        let expected_loss = 100.0 / 110.0 - 1.0 - 0.001;
-        assert!((metrics.cumulative_net_return - (expected_gain + expected_loss)).abs() < 1e-12);
-        assert!((metrics.max_drawdown - (-expected_loss / (1.0 + expected_gain))).abs() < 1e-12);
+        assert!(metrics.cumulative_net_return < 0.0);
+        assert!(metrics.total_fees.abs() < 1e-12);
+        assert_eq!(metrics.final_inventory, 0.0);
+        assert_eq!(metrics.order_count, 3);
+        assert_eq!(metrics.filled_order_count, 3);
     }
 
     #[test]
@@ -1816,13 +2584,14 @@ mod tests {
         let config = TargetPositionReplayConfig {
             max_depth_levels: 1,
             max_decision_delay_us: 1_000_000,
-            position_notional_usd: 0.0,
+            order_latency_us: 0,
+            position_notional_usd: 100.0,
             fee_bps: 0.0,
             rebate_bps: 0.0,
             funding_bps: 0.0,
             latency_bps: 0.0,
             additional_slippage_bps: 0.0,
-            cross_spread: false,
+            cross_spread: true,
             capacity_depth_levels: 0,
             trade_tape_declared: false,
         };
@@ -1855,13 +2624,14 @@ mod tests {
         let config = TargetPositionReplayConfig {
             max_depth_levels: 1,
             max_decision_delay_us: 10_000_000,
-            position_notional_usd: 0.0,
+            order_latency_us: 0,
+            position_notional_usd: 100.0,
             fee_bps: 0.0,
             rebate_bps: 0.0,
             funding_bps: 0.0,
             latency_bps: 0.0,
             additional_slippage_bps: 0.0,
-            cross_spread: false,
+            cross_spread: true,
             capacity_depth_levels: 0,
             trade_tape_declared: false,
         };
@@ -1901,27 +2671,28 @@ mod tests {
         let config = TargetPositionReplayConfig {
             max_depth_levels: 1,
             max_decision_delay_us: 1_000_000,
-            position_notional_usd: 0.0,
+            order_latency_us: 0,
+            position_notional_usd: 100.0,
             fee_bps: 0.0,
             rebate_bps: 0.0,
             funding_bps: 0.0,
             latency_bps: 0.0,
             additional_slippage_bps: 0.0,
-            cross_spread: false,
+            cross_spread: true,
             capacity_depth_levels: 0,
             trade_tape_declared: false,
         };
 
         let metrics = replay_target_positions(tape.as_bytes(), &decisions, &config).unwrap();
-
-        assert!((metrics.cumulative_net_return - (0.1 + (100.0 / 90.0 - 1.0))).abs() < 1e-12);
+        assert!((metrics.cumulative_net_return - 0.16888888888888887).abs() < 1e-12);
+        assert_eq!(metrics.final_inventory, 0.0);
     }
 
     #[test]
     fn target_position_replay_requires_a_flat_finish() {
         let tape = concat!(
             "{\"timestamp\":1000000,\"sequence\":1,\"event\":\"snapshot\",\"bids\":[[99,10]],\"asks\":[[101,10]]}\n",
-            "{\"timestamp\":2000000,\"sequence\":2,\"event\":\"l2_update\",\"bids\":[[109,10]],\"asks\":[[111,10]]}\n",
+            "{\"timestamp\":2000000,\"sequence\":2,\"event\":\"l2_update\",\"bids\":[[99,0],[109,10]],\"asks\":[[101,0],[111,10]]}\n",
         );
         let decisions = [TargetPositionDecision {
             timestamp_us: 1_000_000,
@@ -1930,19 +2701,22 @@ mod tests {
         let config = TargetPositionReplayConfig {
             max_depth_levels: 1,
             max_decision_delay_us: 1_000_000,
-            position_notional_usd: 0.0,
+            order_latency_us: 0,
+            position_notional_usd: 100.0,
             fee_bps: 0.0,
             rebate_bps: 0.0,
             funding_bps: 0.0,
             latency_bps: 0.0,
             additional_slippage_bps: 0.0,
-            cross_spread: false,
+            cross_spread: true,
             capacity_depth_levels: 0,
             trade_tape_declared: false,
         };
 
         let error = replay_target_positions(tape.as_bytes(), &decisions, &config).unwrap_err();
-        assert!(error.to_string().contains("ended before flattening"));
+        assert!(error
+            .to_string()
+            .contains("ended before flattening actual inventory"));
     }
 
     #[test]
@@ -2044,6 +2818,60 @@ mod tests {
     }
 
     #[test]
+    fn risk_rejection_does_not_consume_entry_liquidity() {
+        let mut config = test_config();
+        config.data.tick_size = 0.1;
+        config.strategy.volume_factor = 0.0;
+        config.strategy.ofi_threshold = 1.0;
+        config.execution.base_qty = 2.0;
+        config.execution.max_position = 2.0;
+        config.risk.inventory_limit = 0.0;
+        let mut engine = BacktestEngine::new(config);
+        let stream = vec![
+            Ok(EventEnvelope {
+                ts: 1_000_000,
+                sequence: None,
+                payload: EventPayload::Snapshot {
+                    bids: vec![Level {
+                        price: 100.0,
+                        quantity: 10.0,
+                    }],
+                    asks: vec![Level {
+                        price: 100.2,
+                        quantity: 10.0,
+                    }],
+                },
+            }),
+            Ok(EventEnvelope {
+                ts: 2_000_000,
+                sequence: None,
+                payload: EventPayload::Snapshot {
+                    bids: vec![Level {
+                        price: 99.6,
+                        quantity: 1.0,
+                    }],
+                    asks: vec![Level {
+                        price: 99.8,
+                        quantity: 10.0,
+                    }],
+                },
+            }),
+        ];
+
+        let result = engine.run_with_stream(stream.into_iter()).unwrap();
+
+        assert!(result.trades.is_empty());
+        assert_eq!(engine.execution.position.side, None);
+        assert_eq!(
+            engine
+                .displayed_budget
+                .best_ask()
+                .and_then(|(_, quantity)| quantity.to_f64()),
+            Some(10.0)
+        );
+    }
+
+    #[test]
     fn session_end_exit_respects_risk_slippage_ceiling() {
         let mut config = test_config();
         config.data.tick_size = 0.1;
@@ -2067,6 +2895,11 @@ mod tests {
                 quantity: 10.0,
             }],
         );
+        engine.book_generation = 1;
+        engine.next_sequence = 1;
+        assert!(engine
+            .displayed_budget
+            .observe(&engine.order_book.displayed_snapshot(1, 1, 1), 1,));
         engine
             .execution
             .enter_long(1.0, 100.1, 2.0, 100.0, 10.0, &mut engine.stats);

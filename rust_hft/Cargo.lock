@@ -4796,6 +4796,7 @@ dependencies = [
  "clap",
  "csv",
  "hex",
+ "hft-core",
  "hft-data",
  "itertools 0.12.1",
  "ordered-float 3.9.2",
