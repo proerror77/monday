@@ -5,7 +5,7 @@ use crate::{
 };
 use alpha_domain::{
     CandidateArtifact, CexGpPolicyV1, EngineKind, CEX_GP_POLICY_SCHEMA_V2, CEX_GP_POLICY_SCHEMA_V3,
-    CEX_GP_POLICY_SCHEMA_V4,
+    CEX_GP_POLICY_SCHEMA_V4, CEX_GP_POLICY_SCHEMA_V5,
 };
 use hft_factor_dsl::{FactorAst, FactorOperator, FactorTerminal};
 use std::collections::BTreeSet;
@@ -170,6 +170,7 @@ impl GeneticProgrammingEngine {
             CEX_GP_POLICY_SCHEMA_V2 => self.atomic_dynamic_template(template_index)?,
             CEX_GP_POLICY_SCHEMA_V3 => self.dynamic_v3_template(template_index)?,
             CEX_GP_POLICY_SCHEMA_V4 => self.dynamic_v4_template(template_index)?,
+            CEX_GP_POLICY_SCHEMA_V5 => self.parameterized_v5_template(template_index)?,
             _ => None,
         };
         if let Some(candidate) = candidate {
@@ -225,11 +226,12 @@ impl ProposalEngine for GeneticProgrammingEngine {
         }
         if let Some(ast) = self.governed_template(iteration_index)? {
             self.seen.insert(ast.to_string());
-            let hypothesis = if self
-                .governed_policy
-                .as_ref()
-                .is_some_and(|policy| policy.schema_version == CEX_GP_POLICY_SCHEMA_V4)
-            {
+            let hypothesis = if self.governed_policy.as_ref().is_some_and(|policy| {
+                matches!(
+                    policy.schema_version.as_str(),
+                    CEX_GP_POLICY_SCHEMA_V4 | CEX_GP_POLICY_SCHEMA_V5
+                )
+            }) {
                 "fixed causal normalization over one registered factor field"
             } else {
                 "fixed causal normalization and entry threshold over one registered factor field"
@@ -371,6 +373,64 @@ impl GeneticProgrammingEngine {
         };
         Ok(Some(candidate))
     }
+
+    fn parameterized_v5_template(
+        &self,
+        template_index: usize,
+    ) -> Result<Option<FactorAst>, String> {
+        let Some(policy) = &self.governed_policy else {
+            return Ok(None);
+        };
+        let has_zscore = policy.operators.contains(&FactorOperator::ZScore);
+        let has_delta = policy.operators.contains(&FactorOperator::Delta);
+        let has_two_windows = policy.windows.len() >= 2;
+        let atomic_zscore = if has_zscore { self.fields.len() } else { 0 };
+        if template_index < atomic_zscore {
+            return standardized_field_with_window(
+                &self.fields[template_index],
+                policy.windows.last().copied().unwrap_or(20),
+            )
+            .map(Some);
+        }
+        let delta_index = template_index.saturating_sub(atomic_zscore);
+        let atomic_delta = if has_zscore && has_delta && has_two_windows {
+            self.fields.len()
+        } else {
+            0
+        };
+        if delta_index < atomic_delta {
+            return standardized_delta_with_windows(
+                &self.fields[delta_index],
+                policy.windows[0],
+                policy.windows[1],
+            )
+            .map(Some);
+        }
+        let binary_index = delta_index.saturating_sub(atomic_delta);
+        let binary_operators = [
+            FactorOperator::Add,
+            FactorOperator::Sub,
+            FactorOperator::Mul,
+        ]
+        .into_iter()
+        .filter(|operator| policy.operators.contains(operator))
+        .collect::<Vec<_>>();
+        let Some(operator) = binary_operators.get(binary_index).cloned() else {
+            return Ok(None);
+        };
+        if self.fields.len() < 2 {
+            return Ok(None);
+        }
+        FactorAst::call(
+            operator,
+            vec![
+                field_terminal(&self.fields[0]),
+                field_terminal(&self.fields[1]),
+            ],
+        )
+        .map(Some)
+        .map_err(|error| error.to_string())
+    }
 }
 
 fn constant(value: &str) -> FactorAst {
@@ -382,23 +442,35 @@ fn field_terminal(field: &str) -> FactorAst {
 }
 
 fn standardized_field(field: &str) -> Result<FactorAst, String> {
+    standardized_field_with_window(field, 20)
+}
+
+fn standardized_field_with_window(field: &str, window: usize) -> Result<FactorAst, String> {
     FactorAst::call(
         FactorOperator::ZScore,
-        vec![field_terminal(field), constant("20")],
+        vec![field_terminal(field), constant(&window.to_string())],
     )
     .map_err(|error| error.to_string())
 }
 
 fn standardized_delta(field: &str) -> Result<FactorAst, String> {
+    standardized_delta_with_windows(field, 5, 20)
+}
+
+fn standardized_delta_with_windows(
+    field: &str,
+    delta_window: usize,
+    zscore_window: usize,
+) -> Result<FactorAst, String> {
     FactorAst::call(
         FactorOperator::ZScore,
         vec![
             FactorAst::call(
                 FactorOperator::Delta,
-                vec![field_terminal(field), constant("5")],
+                vec![field_terminal(field), constant(&delta_window.to_string())],
             )
             .map_err(|error| error.to_string())?,
-            constant("20"),
+            constant(&zscore_window.to_string()),
         ],
     )
     .map_err(|error| error.to_string())
@@ -885,6 +957,38 @@ mod tests {
         ];
 
         assert_eq!(&templates[16..], expected_named.as_slice());
+    }
+
+    #[test]
+    fn governed_gp_v5_uses_only_declared_fields_operators_and_windows() {
+        let fields = vec!["ask_depth_top5".to_string(), "bid_depth_top5".to_string()];
+        let operators = vec![
+            FactorOperator::Add,
+            FactorOperator::Delta,
+            FactorOperator::Sub,
+            FactorOperator::ZScore,
+        ];
+        let budget = governed_budget(6);
+        let policy = CexGpPolicyV1::controlled_dynamic_v5(
+            "policy-v5",
+            fields.clone(),
+            operators,
+            vec![5, 40],
+            7,
+            &budget,
+        )
+        .unwrap();
+        let templates = governed_templates(policy, 6);
+        for artifact in templates {
+            let CandidateArtifact::Formula(ast) = artifact else {
+                unreachable!();
+            };
+            let rendered = ast.to_string();
+            assert!(rendered.contains("ask_depth_top5") || rendered.contains("bid_depth_top5"));
+            assert!(!rendered.contains("weighted_book_imbalance_top5"));
+            assert!(!rendered.contains(", 20)"));
+            assert!(!rendered.contains(" * "));
+        }
     }
 
     #[test]

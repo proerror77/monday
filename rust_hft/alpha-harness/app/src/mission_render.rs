@@ -8,18 +8,20 @@ use crate::{
 };
 use alpha_domain::{
     canonical_json_hash, CexBaselinePolicyV1, CexEqualAbsoluteWeightPolicyV1,
-    CexEventReplayPolicyV1, CexGpPolicyV1, CexResearchContentRefV1, CexResearchEvidenceKindV1,
-    CexResearchEvidenceRefV1, CexResearchFalsificationTestV1, CexResearchHoldoutStateV1,
-    CexResearchHoldoutV1, CexResearchHypothesisTargetV1, CexResearchHypothesisV1,
-    CexResearchInputBindingsV1, CexResearchInstrumentV1, CexResearchMarketV1,
-    CexResearchMissionArtifactV1, CexResearchMissionSpecV1, CexResearchOperationalMetadataV1,
-    CexResearchPolicyBindingsV1, CexResearchSearchPlanV1, CexResearchVenueV1, EvaluationCostsV1,
-    EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1, SearchBudget,
-    CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD, CEX_RESEARCH_MISSION_SCHEMA_V1,
+    CexEventReplayPolicyV1, CexGpPolicyV1, CexResearchContentRefV1, CexResearchDeltaConfigV1,
+    CexResearchEvidenceKindV1, CexResearchEvidenceRefV1, CexResearchFalsificationTestV1,
+    CexResearchHoldoutStateV1, CexResearchHoldoutV1, CexResearchHypothesisTargetV1,
+    CexResearchHypothesisV1, CexResearchInputBindingsV1, CexResearchInstrumentV1,
+    CexResearchMarketV1, CexResearchMissionArtifactV1, CexResearchMissionSpecV1,
+    CexResearchOperationalMetadataV1, CexResearchPolicyBindingsV1, CexResearchSearchPlanV1,
+    CexResearchVenueV1, EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1,
+    EvaluationWalkForwardV1, SearchBudget, CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD,
+    CEX_RESEARCH_MISSION_SCHEMA_V1,
 };
 use alpha_engine::baselines::CexSupervisedDecisionPolicyV2;
 use anyhow::{bail, Context};
 use hft_collector::{import_feature_dataset, FeatureDatasetManifest};
+use hft_factor_dsl::FactorOperator;
 use hft_research_manifest::CexReplayDatasetManifestV5;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, path::Path};
@@ -28,6 +30,7 @@ const STABLE_VERSION: &str = "binance-btcusdt-usdm-1s-h5-top5-factor-plan-v5";
 const STABLE_HYPOTHESIS_ID: &str = "l2-microstructure-factor-plan-v5";
 const RESEARCH_PLAN_SCHEMA_V2: &str = "cex-campaign-research-plan-v2";
 const SEARCH_POLICY_REVISION_SCHEMA_V1: &str = "cex-campaign-search-policy-revision-v1";
+const SEARCH_POLICY_REVISION_SCHEMA_V2: &str = "cex-campaign-search-policy-revision-v2";
 const LEARNING_DIRECTIVE_SCHEMA_V1: &str = "cex-campaign-learning-directive-v1";
 const RESEARCH_EVIDENCE_SIGNATURE_SCHEMA_V2: &str = "cex-campaign-research-evidence-signature-v2";
 pub(crate) const MAX_RESEARCH_PLAN_GENERATION: u8 = 3;
@@ -67,11 +70,6 @@ const FEATURE_FIELDS: [&str; 9] = [
     "vwap_center_deviation_top5_bps",
     "weighted_book_imbalance_top5",
 ];
-const REQUIRED_NAMED_TEMPLATE_FIELDS: [&str; 3] = [
-    "book_imbalance",
-    "spread_bps",
-    "weighted_book_imbalance_top5",
-];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -100,7 +98,95 @@ impl CexCampaignPositionPolicyV1 {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CexCampaignResearchDeltaV1 {
+    pub(crate) feature_fields: Vec<String>,
+    pub(crate) operators: Vec<FactorOperator>,
+    pub(crate) windows: Vec<usize>,
+    pub(crate) ridge_l2: f64,
+    pub(crate) cart_max_depth: usize,
+    pub(crate) cart_min_leaf: usize,
+}
+
+impl CexCampaignResearchDeltaV1 {
+    pub(crate) fn canonical() -> Self {
+        Self {
+            feature_fields: FEATURE_FIELDS.into_iter().map(str::to_string).collect(),
+            operators: vec![
+                FactorOperator::Add,
+                FactorOperator::Delta,
+                FactorOperator::Mul,
+                FactorOperator::Sub,
+                FactorOperator::ZScore,
+            ],
+            windows: vec![5, 20],
+            ridge_l2: 1.0e-6,
+            cart_max_depth: 3,
+            cart_min_leaf: 5,
+        }
+    }
+
+    pub(crate) fn bounded_variants() -> Vec<Self> {
+        let canonical = Self::canonical();
+        vec![
+            Self {
+                feature_fields: canonical
+                    .feature_fields
+                    .iter()
+                    .filter(|field| *field != "ask_depth_top5" && *field != "bid_depth_top5")
+                    .cloned()
+                    .collect(),
+                ..canonical.clone()
+            },
+            Self {
+                operators: vec![
+                    FactorOperator::Add,
+                    FactorOperator::Delta,
+                    FactorOperator::Sub,
+                    FactorOperator::ZScore,
+                ],
+                ..canonical.clone()
+            },
+            Self {
+                windows: vec![5, 40],
+                ..canonical.clone()
+            },
+            Self {
+                ridge_l2: 1.0e-4,
+                ..canonical.clone()
+            },
+            Self {
+                cart_max_depth: 2,
+                ..canonical.clone()
+            },
+            Self {
+                cart_min_leaf: 10,
+                ..canonical
+            },
+        ]
+    }
+
+    pub(crate) fn gp_template_count(&self) -> anyhow::Result<usize> {
+        self.clone()
+            .into_domain()
+            .gp_template_count()
+            .map_err(anyhow::Error::msg)
+    }
+
+    fn into_domain(self) -> CexResearchDeltaConfigV1 {
+        CexResearchDeltaConfigV1 {
+            feature_fields: self.feature_fields,
+            operators: self.operators,
+            windows: self.windows,
+            ridge_l2: self.ridge_l2,
+            cart_max_depth: self.cart_max_depth,
+            cart_min_leaf: self.cart_min_leaf,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CexCampaignSearchPolicyRevisionV1 {
     pub(crate) schema_version: String,
@@ -108,38 +194,66 @@ pub(crate) struct CexCampaignSearchPolicyRevisionV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) parent_revision_id: Option<String>,
     pub(crate) position_policy: CexCampaignPositionPolicyV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) research_delta: Option<CexResearchDeltaConfigV1>,
 }
 
 impl CexCampaignSearchPolicyRevisionV1 {
     pub(crate) fn canonical() -> Self {
-        Self::new(None, CexCampaignPositionPolicyV1::CostAware)
-            .expect("canonical CEX Campaign search policy is valid")
+        Self {
+            schema_version: SEARCH_POLICY_REVISION_SCHEMA_V1.to_string(),
+            revision_id: String::new(),
+            parent_revision_id: None,
+            position_policy: CexCampaignPositionPolicyV1::CostAware,
+            research_delta: None,
+        }
+        .with_revision_id()
+        .expect("canonical CEX Campaign search policy is valid")
     }
 
-    pub(crate) fn new(
+    pub(crate) fn new_typed(
         parent_revision_id: Option<String>,
         position_policy: CexCampaignPositionPolicyV1,
+        research_delta: CexCampaignResearchDeltaV1,
     ) -> anyhow::Result<Self> {
-        let mut revision = Self {
-            schema_version: SEARCH_POLICY_REVISION_SCHEMA_V1.to_string(),
+        let revision = Self {
+            schema_version: SEARCH_POLICY_REVISION_SCHEMA_V2.to_string(),
             revision_id: String::new(),
             parent_revision_id,
             position_policy,
+            research_delta: Some(research_delta.into_domain()),
         };
-        revision.revision_id = revision.expected_revision_id()?;
-        revision.validate()?;
-        Ok(revision)
+        revision.with_revision_id()
+    }
+
+    fn with_revision_id(mut self) -> anyhow::Result<Self> {
+        self.revision_id = self.expected_revision_id()?;
+        self.validate()?;
+        Ok(self)
     }
 
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
-        if self.schema_version != SEARCH_POLICY_REVISION_SCHEMA_V1
-            || self.revision_id != self.expected_revision_id()?
+        if !matches!(
+            self.schema_version.as_str(),
+            SEARCH_POLICY_REVISION_SCHEMA_V1 | SEARCH_POLICY_REVISION_SCHEMA_V2
+        ) || self.revision_id != self.expected_revision_id()?
             || self
                 .parent_revision_id
                 .as_ref()
                 .is_some_and(|parent| parent.trim().is_empty() || parent == &self.revision_id)
         {
             bail!("CEX Campaign search policy revision is invalid");
+        }
+        if self.schema_version == SEARCH_POLICY_REVISION_SCHEMA_V1 && self.research_delta.is_some()
+        {
+            bail!("legacy CEX Campaign search policy cannot carry a research delta");
+        }
+        if self.schema_version == SEARCH_POLICY_REVISION_SCHEMA_V2 {
+            let delta = self
+                .research_delta
+                .as_ref()
+                .context("typed CEX Campaign search policy is missing its research delta")?;
+            delta.validate().map_err(anyhow::Error::msg)?;
         }
         self.position_policy
             .decision_policy()
@@ -148,15 +262,57 @@ impl CexCampaignSearchPolicyRevisionV1 {
     }
 
     fn expected_revision_id(&self) -> anyhow::Result<String> {
-        let semantic = serde_json::json!({
-            "schema_version": self.schema_version,
-            "parent_revision_id": self.parent_revision_id,
-            "position_policy": self.position_policy,
-        });
+        let semantic = if self.schema_version == SEARCH_POLICY_REVISION_SCHEMA_V2 {
+            serde_json::json!({
+                "schema_version": self.schema_version,
+                "position_policy": self.position_policy,
+                "research_delta": self.research_delta,
+            })
+        } else {
+            serde_json::json!({
+                "schema_version": self.schema_version,
+                "parent_revision_id": self.parent_revision_id,
+                "position_policy": self.position_policy,
+            })
+        };
         Ok(format!(
             "cex-search-policy-{}",
             canonical_json_hash(&semantic)?
         ))
+    }
+
+    fn same_declared_configuration(&self, other: &Self) -> bool {
+        self.schema_version == other.schema_version
+            && self.revision_id == other.revision_id
+            && self.position_policy == other.position_policy
+            && self.research_delta == other.research_delta
+    }
+
+    pub(crate) fn bounded_allowlist() -> Vec<Self> {
+        let canonical = Self::canonical();
+        let defaults = CexCampaignResearchDeltaV1::canonical();
+        let mut revisions = vec![canonical];
+        for position_policy in [
+            CexCampaignPositionPolicyV1::PredictionIdentity,
+            CexCampaignPositionPolicyV1::HystereticCostAware,
+        ] {
+            revisions.push(
+                Self::new_typed(None, position_policy, defaults.clone())
+                    .expect("bounded typed policy is valid"),
+            );
+        }
+        for delta in CexCampaignResearchDeltaV1::bounded_variants() {
+            for position_policy in [
+                CexCampaignPositionPolicyV1::PredictionIdentity,
+                CexCampaignPositionPolicyV1::HystereticCostAware,
+            ] {
+                revisions.push(
+                    Self::new_typed(None, position_policy, delta.clone())
+                        .expect("bounded typed policy is valid"),
+                );
+            }
+        }
+        revisions
     }
 }
 
@@ -236,7 +392,7 @@ impl CexCampaignLearningDirectiveV1 {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CexCampaignResearchPlanV1 {
     pub(crate) schema_version: String,
@@ -247,6 +403,7 @@ pub(crate) struct CexCampaignResearchPlanV1 {
     pub(crate) feature_fields: Vec<String>,
     pub(crate) search_policy_revision: CexCampaignSearchPolicyRevisionV1,
     pub(crate) attempted_search_policy_revision_ids: Vec<String>,
+    pub(crate) allowed_search_policy_revisions: Vec<CexCampaignSearchPolicyRevisionV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) parent_evidence_signature: Option<CexCampaignResearchEvidenceSignatureV2>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -342,6 +499,7 @@ impl CexCampaignResearchPlanV1 {
             focus_field: "book_imbalance_top5".to_string(),
             feature_fields: FEATURE_FIELDS.into_iter().map(str::to_string).collect(),
             attempted_search_policy_revision_ids: vec![search_policy_revision.revision_id.clone()],
+            allowed_search_policy_revisions: CexCampaignSearchPolicyRevisionV1::bounded_allowlist(),
             parent_evidence_signature: None,
             search_policy_revision,
             parent: None,
@@ -359,6 +517,35 @@ impl CexCampaignResearchPlanV1 {
             .attempted_search_policy_revision_ids
             .iter()
             .collect::<BTreeSet<_>>();
+        let allowed_revisions = self
+            .allowed_search_policy_revisions
+            .iter()
+            .map(|revision| revision.revision_id.as_str())
+            .collect::<BTreeSet<_>>();
+        if self.allowed_search_policy_revisions.is_empty()
+            || self
+                .allowed_search_policy_revisions
+                .iter()
+                .any(|revision| revision.validate().is_err())
+            || self
+                .allowed_search_policy_revisions
+                .iter()
+                .skip(1)
+                .any(|revision| revision.research_delta.is_none())
+            || allowed_revisions.len() != self.allowed_search_policy_revisions.len()
+            || self
+                .allowed_search_policy_revisions
+                .first()
+                .map(|revision| revision.revision_id.as_str())
+                != Some(
+                    CexCampaignSearchPolicyRevisionV1::canonical()
+                        .revision_id
+                        .as_str(),
+                )
+            || !allowed_revisions.contains(self.search_policy_revision.revision_id.as_str())
+        {
+            bail!("CEX Campaign research plan policy allowlist is invalid");
+        }
         if self.attempted_search_policy_revision_ids.len() != usize::from(self.generation) + 1
             || attempted.len() != self.attempted_search_policy_revision_ids.len()
             || self.attempted_search_policy_revision_ids.first()
@@ -369,6 +556,10 @@ impl CexCampaignResearchPlanV1 {
                 .attempted_search_policy_revision_ids
                 .iter()
                 .any(|revision_id| !revision_id.starts_with("cex-search-policy-"))
+            || self
+                .attempted_search_policy_revision_ids
+                .iter()
+                .any(|revision_id| !allowed_revisions.contains(revision_id.as_str()))
             || self
                 .search_policy_revision
                 .parent_revision_id
@@ -403,9 +594,13 @@ impl CexCampaignResearchPlanV1 {
                 .feature_fields
                 .iter()
                 .any(|field| field == &self.focus_field)
-            || REQUIRED_NAMED_TEMPLATE_FIELDS
-                .iter()
-                .any(|required| !self.feature_fields.iter().any(|field| field == required))
+            || self
+                .search_policy_revision
+                .research_delta
+                .as_ref()
+                .is_some_and(|delta| {
+                    delta.feature_fields != self.feature_fields || delta.validate().is_err()
+                })
         {
             bail!("CEX Campaign research plan feature fields are invalid");
         }
@@ -455,6 +650,15 @@ impl CexCampaignResearchPlanV1 {
                     || self.search_policy_revision.parent_revision_id.as_deref()
                         != Some(directive.rollback_policy_revision_id.as_str())
                     || self.search_policy_revision.position_policy != expected_position_policy
+                    || self
+                        .allowed_search_policy_revisions
+                        .iter()
+                        .find(|revision| {
+                            revision.revision_id == self.search_policy_revision.revision_id
+                        })
+                        .is_none_or(|revision| {
+                            !revision.same_declared_configuration(&self.search_policy_revision)
+                        })
                 {
                     bail!("CEX Campaign learning directive does not bind its policy revision");
                 }
@@ -492,11 +696,29 @@ impl CexCampaignResearchPlanV1 {
 
     pub(crate) fn max_candidates(&self) -> anyhow::Result<usize> {
         self.validate()?;
-        self.feature_fields
-            .len()
-            .checked_mul(2)
-            .and_then(|count| count.checked_add(4))
-            .context("CEX Campaign research plan candidate budget overflowed")
+        self.search_policy_revision
+            .research_delta
+            .as_ref()
+            .map_or_else(
+                || {
+                    self.feature_fields
+                        .len()
+                        .checked_mul(2)
+                        .and_then(|count| count.checked_add(4))
+                        .context("CEX Campaign research plan candidate budget overflowed")
+                },
+                |delta| {
+                    CexCampaignResearchDeltaV1 {
+                        feature_fields: delta.feature_fields.clone(),
+                        operators: delta.operators.clone(),
+                        windows: delta.windows.clone(),
+                        ridge_l2: delta.ridge_l2,
+                        cart_max_depth: delta.cart_max_depth,
+                        cart_min_leaf: delta.cart_min_leaf,
+                    }
+                    .gp_template_count()
+                },
+            )
     }
 }
 
@@ -614,14 +836,38 @@ pub(crate) fn render_cex_bundle(
         max_new_iterations: research_plan.max_candidates()?,
         multiple_testing_trials,
     };
-    let gp_policy = CexGpPolicyV1::controlled_dynamic_v4(
-        gp_policy_id,
-        research_plan.feature_fields.clone(),
-        search.seed,
-        &search.budget,
-    )?;
+    let gp_policy = if let Some(delta) = &research_plan.search_policy_revision.research_delta {
+        CexGpPolicyV1::controlled_dynamic_v5(
+            gp_policy_id,
+            delta.feature_fields.clone(),
+            delta.operators.clone(),
+            delta.windows.clone(),
+            search.seed,
+            &search.budget,
+        )?
+    } else {
+        CexGpPolicyV1::controlled_dynamic_v4(
+            gp_policy_id,
+            research_plan.feature_fields.clone(),
+            search.seed,
+            &search.budget,
+        )?
+    };
     let gp_policy_content_sha256 = gp_policy.content_hash()?;
-    let baseline_policy = CexBaselinePolicyV1::controlled_v1(BASELINE_POLICY_ID)?;
+    let baseline_policy = research_plan
+        .search_policy_revision
+        .research_delta
+        .as_ref()
+        .map(|delta| {
+            CexBaselinePolicyV1::controlled_v2(
+                BASELINE_POLICY_ID,
+                delta.ridge_l2,
+                delta.cart_max_depth,
+                delta.cart_min_leaf,
+            )
+        })
+        .transpose()?
+        .unwrap_or(CexBaselinePolicyV1::controlled_v1(BASELINE_POLICY_ID)?);
     let supervised_decision_policy = research_plan
         .search_policy_revision
         .position_policy
@@ -666,10 +912,21 @@ pub(crate) fn render_cex_bundle(
                     },
                 },
                 required_feature_families: research_plan.feature_fields.clone(),
-                required_template_families: vec![
-                    "atomic_l2_microstructure".to_string(),
-                    "named_composite_l2_microstructure".to_string(),
-                ],
+                required_template_families: if research_plan
+                    .search_policy_revision
+                    .research_delta
+                    .is_some()
+                {
+                    vec![
+                        "parameterized_gp_atomic".to_string(),
+                        "parameterized_gp_binary".to_string(),
+                    ]
+                } else {
+                    vec![
+                        "atomic_l2_microstructure".to_string(),
+                        "named_composite_l2_microstructure".to_string(),
+                    ]
+                },
                 falsification_tests: vec![
                     CexResearchFalsificationTestV1 {
                         test_id: "purged-predictive-gate".to_string(),
@@ -762,6 +1019,10 @@ pub(crate) fn render_cex_bundle(
                 holdout_id: None,
             }],
             feature_fields: research_plan.feature_fields.clone(),
+            research_delta: research_plan
+                .search_policy_revision
+                .research_delta
+                .clone(),
             search,
             evaluation_protocol,
             holdout: CexResearchHoldoutV1 {
@@ -1022,9 +1283,10 @@ pub(crate) mod tests {
             request_sha256: "2".repeat(64),
             campaign_result_sha256: "3".repeat(64),
         };
-        let search_policy_revision = CexCampaignSearchPolicyRevisionV1::new(
+        let search_policy_revision = CexCampaignSearchPolicyRevisionV1::new_typed(
             Some(canonical.search_policy_revision.revision_id.clone()),
             CexCampaignPositionPolicyV1::PredictionIdentity,
+            CexCampaignResearchDeltaV1::canonical(),
         )
         .unwrap();
         let learning_directive = CexCampaignLearningDirectiveV1::new(
@@ -1047,6 +1309,7 @@ pub(crate) mod tests {
                 canonical.search_policy_revision.revision_id.clone(),
                 learning_directive.search_policy_revision_id.clone(),
             ],
+            allowed_search_policy_revisions: canonical.allowed_search_policy_revisions,
             parent_evidence_signature: Some(
                 CexCampaignResearchEvidenceSignatureV2::new(
                     "5".repeat(64),
@@ -1079,7 +1342,22 @@ pub(crate) mod tests {
 
         assert_eq!(rendered.mission.spec.objective, plan.objective);
         assert_eq!(rendered.mission.spec.feature_fields, plan.feature_fields);
-        assert_eq!(rendered.mission.spec.search.budget.max_candidates, 22);
+        assert_eq!(
+            rendered.mission.spec.search.budget.max_candidates,
+            CexCampaignResearchDeltaV1::canonical()
+                .gp_template_count()
+                .unwrap()
+        );
+        assert_eq!(
+            rendered
+                .mission
+                .spec
+                .research_delta
+                .as_ref()
+                .unwrap()
+                .cart_max_depth,
+            3
+        );
         assert_ne!(rendered.mission.spec.policies.gp.id, GP_POLICY_ID);
         assert_eq!(
             rendered.mission.spec.policies.supervised_decision.id,
@@ -1108,6 +1386,229 @@ pub(crate) mod tests {
         let mut exhausted = plan;
         exhausted.generation = MAX_RESEARCH_PLAN_GENERATION + 1;
         assert!(exhausted.validate().is_err());
+    }
+
+    #[test]
+    fn typed_revision_hash_binds_every_delta_dimension_but_not_parent() {
+        let delta = CexCampaignResearchDeltaV1::canonical();
+        let first = CexCampaignSearchPolicyRevisionV1::new_typed(
+            None,
+            CexCampaignPositionPolicyV1::HystereticCostAware,
+            delta.clone(),
+        )
+        .unwrap();
+        let child = CexCampaignSearchPolicyRevisionV1::new_typed(
+            Some(CexCampaignSearchPolicyRevisionV1::canonical().revision_id),
+            CexCampaignPositionPolicyV1::HystereticCostAware,
+            delta.clone(),
+        )
+        .unwrap();
+        assert_eq!(first.revision_id, child.revision_id);
+
+        for changed in [
+            CexCampaignResearchDeltaV1 {
+                feature_fields: delta
+                    .feature_fields
+                    .iter()
+                    .filter(|field| *field != "ask_depth_top5")
+                    .cloned()
+                    .collect(),
+                ..delta.clone()
+            },
+            CexCampaignResearchDeltaV1 {
+                operators: vec![
+                    FactorOperator::Add,
+                    FactorOperator::Delta,
+                    FactorOperator::Sub,
+                    FactorOperator::ZScore,
+                ],
+                ..delta.clone()
+            },
+            CexCampaignResearchDeltaV1 {
+                windows: vec![5, 40],
+                ..delta.clone()
+            },
+            CexCampaignResearchDeltaV1 {
+                ridge_l2: 1.0e-4,
+                ..delta.clone()
+            },
+            CexCampaignResearchDeltaV1 {
+                cart_max_depth: 2,
+                ..delta.clone()
+            },
+            CexCampaignResearchDeltaV1 {
+                cart_min_leaf: 10,
+                ..delta.clone()
+            },
+        ] {
+            let revision = CexCampaignSearchPolicyRevisionV1::new_typed(
+                None,
+                CexCampaignPositionPolicyV1::HystereticCostAware,
+                changed,
+            )
+            .unwrap();
+            assert_ne!(revision.revision_id, first.revision_id);
+        }
+    }
+
+    #[test]
+    fn feature_subset_delta_renders_v5_mission_and_parameterized_baseline() {
+        let fixture = Fixture::new(MIN_ROWS);
+        let canonical = CexCampaignResearchPlanV1::canonical();
+        assert_eq!(canonical.allowed_search_policy_revisions.len(), 15);
+        let subset_revision = CexCampaignSearchPolicyRevisionV1::bounded_allowlist()
+            .into_iter()
+            .find(|revision| {
+                revision.position_policy == CexCampaignPositionPolicyV1::HystereticCostAware
+                    && revision
+                        .research_delta
+                        .as_ref()
+                        .is_some_and(|delta| delta.feature_fields.len() < 9)
+            })
+            .unwrap();
+        let subset = subset_revision.research_delta.clone().unwrap();
+        let parent = CexCampaignResearchParentV1 {
+            campaign_id: format!("cex-campaign-{}", "1".repeat(32)),
+            request_sha256: "2".repeat(64),
+            campaign_result_sha256: "3".repeat(64),
+        };
+        let revision = CexCampaignSearchPolicyRevisionV1::new_typed(
+            Some(canonical.search_policy_revision.revision_id.clone()),
+            CexCampaignPositionPolicyV1::HystereticCostAware,
+            CexCampaignResearchDeltaV1 {
+                feature_fields: subset.feature_fields.clone(),
+                operators: subset.operators.clone(),
+                windows: subset.windows.clone(),
+                ridge_l2: subset.ridge_l2,
+                cart_max_depth: subset.cart_max_depth,
+                cart_min_leaf: subset.cart_min_leaf,
+            },
+        )
+        .unwrap();
+        let directive = CexCampaignLearningDirectiveV1::new(
+            &parent,
+            CexCampaignFailureClassV1::OvertradeCapacity,
+            canonical.search_policy_revision.revision_id.clone(),
+            revision.revision_id.clone(),
+        )
+        .unwrap();
+        let plan = CexCampaignResearchPlanV1 {
+            schema_version: RESEARCH_PLAN_SCHEMA_V2.to_string(),
+            generation: 1,
+            objective: "Test a declared feature subset".to_string(),
+            hypothesis: "The subset remains evaluable under the same costs".to_string(),
+            focus_field: canonical.focus_field.clone(),
+            feature_fields: subset.feature_fields.clone(),
+            search_policy_revision: revision.clone(),
+            attempted_search_policy_revision_ids: vec![
+                canonical.search_policy_revision.revision_id.clone(),
+                revision.revision_id.clone(),
+            ],
+            allowed_search_policy_revisions: canonical.allowed_search_policy_revisions.clone(),
+            parent_evidence_signature: Some(
+                CexCampaignResearchEvidenceSignatureV2::new(
+                    "5".repeat(64),
+                    canonical.search_policy_revision.revision_id.clone(),
+                    "7".repeat(64),
+                    "8".repeat(64),
+                    "9".repeat(64),
+                )
+                .unwrap(),
+            ),
+            parent: Some(parent),
+            learning_directive: Some(directive),
+            llm: None,
+        };
+        plan.validate().unwrap();
+        let rendered = render_cex_bundle(
+            &fixture.feature_path,
+            &fixture.materialization_path,
+            &plan,
+            7,
+            plan.max_candidates().unwrap() * 2,
+        )
+        .unwrap();
+        assert_eq!(rendered.mission.spec.feature_fields, subset.feature_fields);
+        assert_eq!(
+            rendered.mission.spec.research_delta.as_ref().unwrap(),
+            &subset
+        );
+        assert_eq!(
+            rendered.mission.spec.policies.gp.content_sha256,
+            CexGpPolicyV1::controlled_dynamic_v5(
+                rendered.mission.spec.policies.gp.id.clone(),
+                rendered.mission.spec.feature_fields.clone(),
+                subset.operators,
+                subset.windows,
+                rendered.mission.spec.search.seed,
+                &rendered.mission.spec.search.budget,
+            )
+            .unwrap()
+            .content_hash()
+            .unwrap()
+        );
+        assert_eq!(
+            rendered.mission.spec.search.budget.max_candidates,
+            plan.max_candidates().unwrap()
+        );
+        assert_eq!(
+            rendered.mission.spec.policies.baseline.content_sha256,
+            CexBaselinePolicyV1::controlled_v2(
+                rendered.mission.spec.policies.baseline.id.clone(),
+                subset.ridge_l2,
+                subset.cart_max_depth,
+                subset.cart_min_leaf,
+            )
+            .unwrap()
+            .content_hash()
+            .unwrap()
+        );
+
+        let mut request = crate::mission_campaign::valid_request_for_tests();
+        request.research_plan = plan;
+        crate::mission_campaign::validate_terminal_mission_revision_binding(
+            &rendered.mission,
+            &request,
+        )
+        .unwrap();
+        let mut forged = rendered.mission.clone();
+        let forged_delta = {
+            let delta = forged.spec.research_delta.as_mut().unwrap();
+            delta.windows = vec![5, 40];
+            delta.clone()
+        };
+        let forged_gp = CexGpPolicyV1::controlled_dynamic_v5(
+            forged.spec.policies.gp.id.clone(),
+            forged.spec.feature_fields.clone(),
+            forged_delta.operators.clone(),
+            forged_delta.windows.clone(),
+            forged.spec.search.seed,
+            &forged.spec.search.budget,
+        )
+        .unwrap();
+        forged.spec.policies.gp.content_sha256 = forged_gp.content_hash().unwrap();
+        forged.validate().unwrap();
+        assert!(
+            crate::mission_campaign::validate_terminal_mission_revision_binding(&forged, &request,)
+                .is_err()
+        );
+        let mut forged_decision = rendered.mission.clone();
+        forged_decision
+            .spec
+            .policies
+            .supervised_decision
+            .content_sha256 = CexCampaignPositionPolicyV1::CostAware
+            .decision_policy()
+            .content_hash()
+            .unwrap();
+        forged_decision.validate().unwrap();
+        assert!(
+            crate::mission_campaign::validate_terminal_mission_revision_binding(
+                &forged_decision,
+                &request,
+            )
+            .is_err()
+        );
     }
 
     #[test]

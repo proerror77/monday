@@ -38,6 +38,7 @@ pub const CEX_GP_POLICY_SCHEMA_V1: &str = "cex-gp-policy-v1";
 pub const CEX_GP_POLICY_SCHEMA_V2: &str = "cex-gp-policy-v2";
 pub const CEX_GP_POLICY_SCHEMA_V3: &str = "cex-gp-policy-v3";
 pub const CEX_GP_POLICY_SCHEMA_V4: &str = "cex-gp-policy-v4";
+pub const CEX_GP_POLICY_SCHEMA_V5: &str = "cex-gp-policy-v5";
 pub const CEX_FACTOR_BANK_SCHEMA_V1: &str = "cex-factor-bank-v1";
 pub const CEX_FACTOR_BANK_SCHEMA_V2: &str = "cex-factor-bank-v2";
 pub const CEX_FACTOR_BANK_SCHEMA_V3: &str = "cex-factor-bank-v3";
@@ -686,6 +687,101 @@ pub enum CexResearchHoldoutStateV1 {
     Unopened,
 }
 
+/// A bounded, research-only configuration carried by a typed Campaign delta.
+/// It deliberately excludes budgets, evaluation costs, data labels, and
+/// holdout identity; those remain owned by the frozen Mission contract.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexResearchDeltaConfigV1 {
+    pub feature_fields: Vec<String>,
+    pub operators: Vec<FactorOperator>,
+    pub windows: Vec<usize>,
+    pub ridge_l2: f64,
+    pub cart_max_depth: usize,
+    pub cart_min_leaf: usize,
+}
+
+impl CexResearchDeltaConfigV1 {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.feature_fields.is_empty()
+            || self
+                .feature_fields
+                .iter()
+                .any(|field| field.trim().is_empty())
+            || self
+                .feature_fields
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || self.operators.is_empty()
+            || self.operators.windows(2).any(|pair| pair[0] == pair[1])
+            || self
+                .operators
+                .windows(2)
+                .any(|pair| format!("{:?}", pair[0]) >= format!("{:?}", pair[1]))
+            || self.windows.is_empty()
+            || self.windows.windows(2).any(|pair| pair[0] >= pair[1])
+            || self
+                .windows
+                .iter()
+                .any(|window| ![5, 10, 20, 40, 60].contains(window))
+            || !self.ridge_l2.is_finite()
+            || !(1.0e-8..=1.0e-2).contains(&self.ridge_l2)
+            || !(1..=8).contains(&self.cart_max_depth)
+            || !(1..=128).contains(&self.cart_min_leaf)
+        {
+            return Err(DomainError::InvalidCexResearchMission(
+                "typed research delta is outside the bounded grammar",
+            ));
+        }
+        if self.operators.iter().any(|operator| {
+            !matches!(
+                operator,
+                FactorOperator::Add
+                    | FactorOperator::Sub
+                    | FactorOperator::Mul
+                    | FactorOperator::ZScore
+                    | FactorOperator::Delta
+            )
+        }) || !self.operators.contains(&FactorOperator::ZScore)
+        {
+            return Err(DomainError::InvalidCexResearchMission(
+                "typed research delta uses an unadmitted GP operator",
+            ));
+        }
+        if self.operators.contains(&FactorOperator::Delta) && self.windows.len() < 2 {
+            return Err(DomainError::InvalidCexResearchMission(
+                "typed research delta requires two windows for Delta templates",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn gp_template_count(&self) -> Result<usize, DomainError> {
+        self.validate()?;
+        let atomic = self.feature_fields.len()
+            * (usize::from(self.operators.contains(&FactorOperator::ZScore))
+                + usize::from(
+                    self.operators.contains(&FactorOperator::Delta) && self.windows.len() >= 2,
+                ));
+        let binary = if self.feature_fields.len() >= 2 {
+            self.operators
+                .iter()
+                .filter(|operator| {
+                    matches!(
+                        operator,
+                        FactorOperator::Add | FactorOperator::Sub | FactorOperator::Mul
+                    )
+                })
+                .count()
+        } else {
+            0
+        };
+        atomic.checked_add(binary).filter(|count| *count > 0).ok_or(
+            DomainError::InvalidCexResearchMission("typed research delta has no GP templates"),
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CexResearchMissionSpecV1 {
@@ -698,6 +794,8 @@ pub struct CexResearchMissionSpecV1 {
     pub policies: CexResearchPolicyBindingsV1,
     pub evidence: Vec<CexResearchEvidenceRefV1>,
     pub feature_fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub research_delta: Option<CexResearchDeltaConfigV1>,
     pub search: CexResearchSearchPlanV1,
     pub evaluation_protocol: EvaluationProtocolV1,
     pub holdout: CexResearchHoldoutV1,
@@ -753,6 +851,33 @@ impl CexResearchMissionSpecV1 {
         CexEqualAbsoluteWeightPolicyV1::controlled_v1(self.policies.weight.id.clone())?
             .validate_binding(&self.policies.weight)?;
         self.search.budget.validate()?;
+        let parameterized_delta = if let Some(delta) = &self.research_delta {
+            delta.validate()?;
+            if self.feature_fields != delta.feature_fields {
+                return Err(DomainError::InvalidCexResearchMission(
+                    "typed research delta feature fields drifted from the Mission",
+                ));
+            }
+            let gp = CexGpPolicyV1::controlled_dynamic_v5(
+                self.policies.gp.id.clone(),
+                delta.feature_fields.clone(),
+                delta.operators.clone(),
+                delta.windows.clone(),
+                self.search.seed,
+                &self.search.budget,
+            )?;
+            gp.validate_binding(&self.policies.gp)?;
+            let baseline = CexBaselinePolicyV1::controlled_v2(
+                self.policies.baseline.id.clone(),
+                delta.ridge_l2,
+                delta.cart_max_depth,
+                delta.cart_min_leaf,
+            )?;
+            baseline.validate_binding(&self.policies.baseline)?;
+            Some(gp)
+        } else {
+            None
+        };
         let named_template_policy = [
             CexGpPolicyV1::controlled_dynamic_v3(
                 self.policies.gp.id.clone(),
@@ -771,7 +896,8 @@ impl CexResearchMissionSpecV1 {
         .any(|policy| {
             policy.is_ok_and(|policy| policy.validate_binding(&self.policies.gp).is_ok())
         });
-        if named_template_policy
+        if parameterized_delta.is_none()
+            && named_template_policy
             && self.search.max_new_iterations != self.search.budget.max_candidates
         {
             return Err(DomainError::InvalidCexResearchMission(
@@ -801,6 +927,11 @@ impl CexResearchMissionSpecV1 {
             || !non_empty_unique(&self.feature_fields)
             || self.hypotheses.is_empty()
             || self.evidence.is_empty()
+            || parameterized_delta.as_ref().is_some_and(|policy| {
+                self.search.max_new_iterations != self.search.budget.max_candidates
+                    || policy.governed_template_count().unwrap_or(0)
+                        != self.search.budget.max_candidates
+            })
         {
             return Err(DomainError::InvalidCexResearchMission(
                 "mission policies or research plan are inconsistent",
@@ -1861,6 +1992,40 @@ impl CexGpPolicyV1 {
         )
     }
 
+    pub fn controlled_dynamic_v5(
+        policy_id: impl Into<String>,
+        mut admitted_fields: Vec<String>,
+        mut operators: Vec<FactorOperator>,
+        mut windows: Vec<usize>,
+        seed: u64,
+        budget: &SearchBudget,
+    ) -> Result<Self, DomainError> {
+        Self::normalize_admitted_fields(&mut admitted_fields);
+        operators.sort_by_key(|operator| format!("{operator:?}"));
+        operators.dedup();
+        windows.sort_unstable();
+        windows.dedup();
+        let mut constants = vec!["-1".to_string(), "0".to_string(), "1".to_string()];
+        constants.extend(windows.iter().map(ToString::to_string));
+        constants.sort();
+        constants.dedup();
+        let policy = Self {
+            schema_version: CEX_GP_POLICY_SCHEMA_V5.to_string(),
+            policy_id: policy_id.into(),
+            admitted_fields,
+            operators,
+            windows,
+            constants,
+            max_ast_depth: 4,
+            max_ast_nodes: 31,
+            population_limit: 32,
+            seed,
+            budget: budget.clone(),
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
     pub fn validate(&self) -> Result<(), DomainError> {
         let governed_v1 = self.schema_version == CEX_GP_POLICY_SCHEMA_V1
             && self.operators
@@ -1901,7 +2066,40 @@ impl CexGpPolicyV1 {
             && self.windows == [5, 20]
             && self.constants == ["-1", "5", "20"]
             && self.max_ast_depth == 4;
-        if !(governed_v1 || governed_thresholded_dynamic || governed_continuous_dynamic)
+        let governed_parameterized_dynamic = self.schema_version == CEX_GP_POLICY_SCHEMA_V5
+            && self.max_ast_depth == 4
+            && self.max_ast_nodes == 31
+            && self.population_limit == 32
+            && self.operators.iter().all(|operator| {
+                matches!(
+                    operator,
+                    FactorOperator::Add
+                        | FactorOperator::Sub
+                        | FactorOperator::Mul
+                        | FactorOperator::ZScore
+                        | FactorOperator::Delta
+                )
+            })
+            && self.operators.contains(&FactorOperator::ZScore)
+            && self.windows.windows(2).all(|pair| pair[0] < pair[1])
+            && self
+                .windows
+                .iter()
+                .all(|window| [5, 10, 20, 40, 60].contains(window))
+            && self.constants == {
+                let mut constants = vec!["-1".to_string(), "0".to_string(), "1".to_string()];
+                constants.extend(self.windows.iter().map(ToString::to_string));
+                constants.sort();
+                constants.dedup();
+                constants
+            }
+            && self
+                .governed_template_count()
+                .is_ok_and(|count| self.budget.max_candidates == count);
+        if !(governed_v1
+            || governed_thresholded_dynamic
+            || governed_continuous_dynamic
+            || governed_parameterized_dynamic)
             || self.policy_id.trim().is_empty()
             || self.admitted_fields.is_empty()
             || self
@@ -1967,6 +2165,15 @@ impl CexGpPolicyV1 {
                 },
             ));
         }
+        if self.schema_version == CEX_GP_POLICY_SCHEMA_V5
+            && (self.admitted_fields.is_empty()
+                || self.windows.is_empty()
+                || (self.operators.contains(&FactorOperator::Delta) && self.windows.len() < 2))
+        {
+            return Err(DomainError::InvalidCexGpPolicy(
+                "parameterized GP requires fields, windows, and a complete rolling grammar",
+            ));
+        }
         let mut event_domain = None;
         for field in &self.admitted_fields {
             let capability = validate_cex_research_formula(&FactorAst::Terminal(
@@ -1980,6 +2187,45 @@ impl CexGpPolicyV1 {
             event_domain = Some(capability.event_domain);
         }
         Ok(())
+    }
+
+    pub fn governed_template_count(&self) -> Result<usize, DomainError> {
+        if self.schema_version == CEX_GP_POLICY_SCHEMA_V5 {
+            let atomic = self.admitted_fields.len()
+                * (usize::from(self.operators.contains(&FactorOperator::ZScore))
+                    + usize::from(
+                        self.operators.contains(&FactorOperator::Delta) && self.windows.len() >= 2,
+                    ));
+            let binary = if self.admitted_fields.len() >= 2 {
+                self.operators
+                    .iter()
+                    .filter(|operator| {
+                        matches!(
+                            operator,
+                            FactorOperator::Add | FactorOperator::Sub | FactorOperator::Mul
+                        )
+                    })
+                    .count()
+            } else {
+                0
+            };
+            atomic.checked_add(binary).filter(|count| *count > 0).ok_or(
+                DomainError::InvalidCexGpPolicy("parameterized GP has no governed templates"),
+            )
+        } else if matches!(
+            self.schema_version.as_str(),
+            CEX_GP_POLICY_SCHEMA_V3 | CEX_GP_POLICY_SCHEMA_V4
+        ) {
+            self.admitted_fields
+                .len()
+                .checked_mul(2)
+                .and_then(|count| count.checked_add(4))
+                .ok_or(DomainError::InvalidCexGpPolicy(
+                    "governed GP template count overflowed",
+                ))
+        } else {
+            Ok(self.budget.max_candidates)
+        }
     }
 
     pub fn content_hash(&self) -> Result<String, DomainError> {
@@ -2626,6 +2872,7 @@ pub fn factor_ast_source_features(ast: &FactorAst) -> Vec<String> {
 }
 
 pub const CEX_BASELINE_POLICY_SCHEMA_V1: &str = "cex-baseline-policy-v1";
+pub const CEX_BASELINE_POLICY_SCHEMA_V2: &str = "cex-baseline-policy-v2";
 pub const CEX_BASELINE_ARTIFACT_SCHEMA_V1: &str = "cex-baseline-artifact-v1";
 pub const CEX_BASELINE_GATE_SCHEMA_V1: &str = "cex-baseline-gate-v1";
 
@@ -2662,12 +2909,37 @@ impl CexBaselinePolicyV1 {
         Ok(policy)
     }
 
+    pub fn controlled_v2(
+        policy_id: impl Into<String>,
+        ridge_l2: f64,
+        cart_max_depth: usize,
+        cart_min_leaf: usize,
+    ) -> Result<Self, DomainError> {
+        let policy = Self {
+            schema_version: CEX_BASELINE_POLICY_SCHEMA_V2.to_string(),
+            policy_id: policy_id.into(),
+            ridge_l2,
+            cart_max_depth,
+            cart_min_leaf,
+            cart_tie_break: CexBaselineTieBreakV1::LossThenFeatureThenThreshold,
+            evaluator_config: FormulaEvaluatorConfig::for_trials(2)?,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
     pub fn validate(&self) -> Result<(), DomainError> {
-        if self.schema_version != CEX_BASELINE_POLICY_SCHEMA_V1
+        let canonical = self.schema_version == CEX_BASELINE_POLICY_SCHEMA_V1
+            && self.ridge_l2.to_bits() == 1.0e-6_f64.to_bits()
+            && self.cart_max_depth == 3
+            && self.cart_min_leaf == 5;
+        let parameterized = self.schema_version == CEX_BASELINE_POLICY_SCHEMA_V2
+            && self.ridge_l2.is_finite()
+            && (1.0e-8..=1.0e-2).contains(&self.ridge_l2)
+            && (1..=8).contains(&self.cart_max_depth)
+            && (1..=128).contains(&self.cart_min_leaf);
+        if !(canonical || parameterized)
             || self.policy_id.trim().is_empty()
-            || self.ridge_l2.to_bits() != 1.0e-6_f64.to_bits()
-            || self.cart_max_depth != 3
-            || self.cart_min_leaf != 5
             || self.cart_tie_break != CexBaselineTieBreakV1::LossThenFeatureThenThreshold
             || self.evaluator_config != FormulaEvaluatorConfig::for_trials(2)?
         {
@@ -5601,6 +5873,7 @@ mod tests {
                     holdout_id: None,
                 }],
                 feature_fields: vec!["book_imbalance".to_string(), "spread_bps".to_string()],
+                research_delta: None,
                 search,
                 evaluation_protocol,
                 holdout: CexResearchHoldoutV1 {

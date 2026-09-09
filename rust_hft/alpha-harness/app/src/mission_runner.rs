@@ -15,7 +15,8 @@ use alpha_domain::{
     EvaluationCostsV1, FormulaEvaluatorConfig, IterationVerdict, MissionCompletionPolicy,
     MissionStatus, PromotionRecord, ResearchIteration, ResearchMission, SearchBudgetUsage,
     StrategyBundle, ValidatorMode, CEX_FINAL_PRECOMMIT_SCHEMA_V1, CEX_GP_POLICY_SCHEMA_V4,
-    MAX_CEX_FACTOR_BANK_MCTS_CHECKPOINT_BYTES, SEALED_HOLDOUT_EVALUATOR_VERSION,
+    CEX_GP_POLICY_SCHEMA_V5, MAX_CEX_FACTOR_BANK_MCTS_CHECKPOINT_BYTES,
+    SEALED_HOLDOUT_EVALUATOR_VERSION,
 };
 use alpha_engine::{
     baselines::{
@@ -91,6 +92,8 @@ const CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V1: &str = "cex-event-replay-receipt-v1";
 const CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V2: &str = "cex-event-replay-receipt-v2";
 const CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V3: &str = "cex-event-replay-receipt-v3";
 const CEX_SUPERVISED_MODEL_SELECTION_SCHEMA_VERSION: &str = "cex-supervised-model-selection-v1";
+const CEX_SUPERVISED_MODEL_ATTEMPTS_SCHEMA_VERSION: &str = "cex-supervised-model-attempts-v1";
+pub(crate) const CEX_SUPERVISED_MODEL_NAMES: [&str; 3] = ["ridge", "cart", "burn_mlp"];
 // ponytail: fixed batching bounds checkpoint I/O; make it configurable only if recovery data requires it.
 const MCTS_CHECKPOINT_INTERVAL: u64 = 256;
 
@@ -157,6 +160,22 @@ fn bound_gp_policy(mission: &CexResearchMissionArtifactV1) -> anyhow::Result<Cex
             return Ok(named_templates);
         }
     }
+    if let Some(delta) = mission.spec.research_delta.as_ref() {
+        let parameterized = CexGpPolicyV1::controlled_dynamic_v5(
+            binding.id.clone(),
+            delta.feature_fields.clone(),
+            delta.operators.clone(),
+            delta.windows.clone(),
+            mission.spec.search.seed,
+            &mission.spec.search.budget,
+        )?;
+        if parameterized.validate_binding(binding).is_err()
+            || mission.spec.search.max_new_iterations != mission.spec.search.budget.max_candidates
+        {
+            return Err(dynamic_binding.unwrap_err().into());
+        }
+        return Ok(parameterized);
+    }
     let Ok(continuous_templates) = CexGpPolicyV1::controlled_dynamic_v4(
         binding.id.clone(),
         mission.spec.feature_fields.clone(),
@@ -172,6 +191,33 @@ fn bound_gp_policy(mission: &CexResearchMissionArtifactV1) -> anyhow::Result<Cex
         bail!("named-template GP requires max_new_iterations to equal max_candidates");
     }
     Ok(continuous_templates)
+}
+
+fn bound_baseline_policy(
+    mission: &CexResearchMissionArtifactV1,
+) -> anyhow::Result<CexBaselinePolicyV1> {
+    let binding = &mission.spec.policies.baseline;
+    let policy = if let Some(delta) = &mission.spec.research_delta {
+        CexBaselinePolicyV1::controlled_v2(
+            binding.id.clone(),
+            delta.ridge_l2,
+            delta.cart_max_depth,
+            delta.cart_min_leaf,
+        )?
+    } else {
+        CexBaselinePolicyV1::controlled_v1(binding.id.clone())?
+    };
+    policy
+        .validate_binding(binding)
+        .map_err(anyhow::Error::msg)?;
+    Ok(policy)
+}
+
+fn is_supervised_gp_policy(policy: &CexGpPolicyV1) -> bool {
+    matches!(
+        policy.schema_version.as_str(),
+        CEX_GP_POLICY_SCHEMA_V4 | CEX_GP_POLICY_SCHEMA_V5
+    )
 }
 
 fn bound_supervised_decision_policy(
@@ -342,6 +388,59 @@ impl CexSupervisedModelSelectionV1 {
             bail!("CEX supervised model selection is invalid");
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CexSupervisedModelAttemptV1 {
+    model: String,
+    outcome: String,
+}
+
+fn persist_supervised_model_attempts(
+    results_dir: &Path,
+    attempts: &[CexSupervisedModelAttemptV1],
+) -> anyhow::Result<()> {
+    data_mission::write_json_atomic(
+        &results_dir.join("supervised-model-attempts.json"),
+        &serde_json::json!({
+            "schema_version": CEX_SUPERVISED_MODEL_ATTEMPTS_SCHEMA_VERSION,
+            "attempts": attempts,
+        }),
+    )
+}
+
+fn update_supervised_model_attempt(
+    results_dir: &Path,
+    attempts: &mut [CexSupervisedModelAttemptV1],
+    model: &str,
+    outcome: &str,
+) -> anyhow::Result<()> {
+    let attempt = attempts
+        .iter_mut()
+        .find(|attempt| attempt.model == model)
+        .with_context(|| format!("missing supervised model attempt {model}"))?;
+    attempt.outcome = outcome.to_string();
+    persist_supervised_model_attempts(results_dir, attempts)
+}
+
+fn run_supervised_model_attempt(
+    results_dir: &Path,
+    attempts: &mut [CexSupervisedModelAttemptV1],
+    model: &str,
+    evaluate: impl FnOnce() -> anyhow::Result<CexSupervisedModelEvaluationV2>,
+) -> anyhow::Result<CexSupervisedModelEvaluationV2> {
+    update_supervised_model_attempt(results_dir, attempts, model, "started")?;
+    match evaluate() {
+        Ok(evaluation) => {
+            update_supervised_model_attempt(results_dir, attempts, model, "completed")?;
+            Ok(evaluation)
+        }
+        Err(error) => {
+            update_supervised_model_attempt(results_dir, attempts, model, "failed")?;
+            Err(error)
+        }
     }
 }
 
@@ -644,12 +743,10 @@ pub(crate) fn execute_report(
         mission::validate_live_feature_fields(&control_mission.spec.feature_fields)?;
     }
     let gp_policy = bound_gp_policy(&control_mission)?;
-    let supervised_ml = gp_policy.schema_version == CEX_GP_POLICY_SCHEMA_V4;
+    let supervised_ml = is_supervised_gp_policy(&gp_policy);
     let supervised_decision_policy = bound_supervised_decision_policy(&control_mission)?;
     data_mission::write_json_atomic(&results_dir.join("gp-policy.json"), &gp_policy)?;
-    let baseline_policy =
-        CexBaselinePolicyV1::controlled_v1(control_mission.spec.policies.baseline.id.clone())?;
-    baseline_policy.validate_binding(&control_mission.spec.policies.baseline)?;
+    let baseline_policy = bound_baseline_policy(&control_mission)?;
     data_mission::write_json_atomic(&results_dir.join("baseline-policy.json"), &baseline_policy)?;
     let weight_policy = CexEqualAbsoluteWeightPolicyV1::controlled_v1(
         control_mission.spec.policies.weight.id.clone(),
@@ -2077,12 +2174,23 @@ fn run_cex_supervised_model_research(
             "walk_forward_folds": context.folds().len(),
         }),
     );
-    let ridge = evaluate_cex_supervised_model(context, factor_bank, ridge, decision_policy)
-        .map_err(|error| anyhow::anyhow!("ridge supervised evaluation failed: {error}"))?;
-    let cart = evaluate_cex_supervised_model(context, factor_bank, cart, decision_policy)
-        .map_err(|error| anyhow::anyhow!("shallow CART supervised evaluation failed: {error}"))?;
-    let burn = evaluate_cex_supervised_model(context, factor_bank, burn, decision_policy)
-        .map_err(|error| anyhow::anyhow!("Burn MLP supervised evaluation failed: {error}"))?;
+    let mut attempts = CEX_SUPERVISED_MODEL_NAMES.map(|model| CexSupervisedModelAttemptV1 {
+        model: model.to_string(),
+        outcome: "admitted".to_string(),
+    });
+    persist_supervised_model_attempts(results_dir, &attempts)?;
+    let ridge = run_supervised_model_attempt(results_dir, &mut attempts, "ridge", || {
+        evaluate_cex_supervised_model(context, factor_bank, ridge, decision_policy)
+            .map_err(|error| anyhow::anyhow!("ridge supervised evaluation failed: {error}"))
+    })?;
+    let cart = run_supervised_model_attempt(results_dir, &mut attempts, "cart", || {
+        evaluate_cex_supervised_model(context, factor_bank, cart, decision_policy)
+            .map_err(|error| anyhow::anyhow!("shallow CART supervised evaluation failed: {error}"))
+    })?;
+    let burn = run_supervised_model_attempt(results_dir, &mut attempts, "burn_mlp", || {
+        evaluate_cex_supervised_model(context, factor_bank, burn, decision_policy)
+            .map_err(|error| anyhow::anyhow!("Burn MLP supervised evaluation failed: {error}"))
+    })?;
     for (name, evaluation) in [("ridge", &ridge), ("cart", &cart), ("burn_mlp", &burn)] {
         evaluation.validate().map_err(anyhow::Error::msg)?;
         store.put_registry_revision(&RegistryRevision {
@@ -3447,8 +3555,7 @@ pub(crate) fn recover_execution_report_from_published_result(
     if control_mission.semantic_id()? != expected_mission_id {
         bail!("published result bundle Mission artifact does not match the Campaign Mission");
     }
-    let supervised_ml =
-        bound_gp_policy(&control_mission)?.schema_version == CEX_GP_POLICY_SCHEMA_V4;
+    let supervised_ml = is_supervised_gp_policy(&bound_gp_policy(&control_mission)?);
 
     let replay_receipt: Option<CexEventReplayReceiptV1> = read_bundle_json(
         &mut archive,
@@ -7940,6 +8047,7 @@ message binance_replay {
                     holdout_id: None,
                 }],
                 feature_fields,
+                research_delta: None,
                 search,
                 evaluation_protocol,
                 holdout: CexResearchHoldoutV1 {
@@ -8407,6 +8515,53 @@ message binance_replay {
             fixture.mission.spec.policies.gp.content_sha256 = expected.content_hash().unwrap();
             assert_eq!(bound_gp_policy(&fixture.mission).unwrap(), expected);
         }
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn bound_gp_policy_restores_parameterized_delta_grammar() {
+        let mut fixture = fixture("parameterized-v5-gp-policy-binding");
+        let fields = vec!["ask_depth_top5".to_string(), "bid_depth_top5".to_string()];
+        let delta = alpha_domain::CexResearchDeltaConfigV1 {
+            feature_fields: fields.clone(),
+            operators: vec![
+                hft_factor_dsl::FactorOperator::Add,
+                hft_factor_dsl::FactorOperator::Delta,
+                hft_factor_dsl::FactorOperator::Sub,
+                hft_factor_dsl::FactorOperator::ZScore,
+            ],
+            windows: vec![5, 40],
+            ridge_l2: 1.0e-4,
+            cart_max_depth: 2,
+            cart_min_leaf: 10,
+        };
+        fixture.mission.spec.feature_fields = fields.clone();
+        fixture.mission.spec.research_delta = Some(delta.clone());
+        fixture.mission.spec.search.budget.max_candidates = 6;
+        fixture.mission.spec.search.max_new_iterations = 6;
+        let expected = CexGpPolicyV1::controlled_dynamic_v5(
+            fixture.mission.spec.policies.gp.id.clone(),
+            fields,
+            delta.operators,
+            delta.windows,
+            fixture.mission.spec.search.seed,
+            &fixture.mission.spec.search.budget,
+        )
+        .unwrap();
+        fixture.mission.spec.policies.gp.content_sha256 = expected.content_hash().unwrap();
+
+        assert_eq!(bound_gp_policy(&fixture.mission).unwrap(), expected);
+        let baseline = CexBaselinePolicyV1::controlled_v2(
+            fixture.mission.spec.policies.baseline.id.clone(),
+            1.0e-4,
+            2,
+            10,
+        )
+        .unwrap();
+        fixture.mission.spec.policies.baseline.content_sha256 = baseline.content_hash().unwrap();
+        assert_eq!(bound_baseline_policy(&fixture.mission).unwrap(), baseline);
+        fixture.mission.spec.search.max_new_iterations = 5;
+        assert!(bound_gp_policy(&fixture.mission).is_err());
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
