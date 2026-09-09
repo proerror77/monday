@@ -129,6 +129,44 @@ pub fn validate_verified_evidence_requirements(
     Ok(())
 }
 
+pub fn validate_verified_evidence_scope(
+    request: &AgentRunCreateRequest,
+    evidence: &VerifiedPredictionEvidenceReceipt,
+) -> Result<(), String> {
+    let scope = request
+        .prediction_scope
+        .as_ref()
+        .ok_or_else(|| "prediction_scope is required before model execution".to_string())?;
+    let product = scope.product.trim().to_ascii_uppercase();
+    let symbol_matches = request.symbols.len() == 1
+        && request.symbols[0].trim().to_ascii_uppercase().as_str()
+            == match product.as_str() {
+                "BTC" => "BTCUSDT",
+                other => other,
+            };
+    if !symbol_matches {
+        return Err(format!(
+            "prediction evidence scope product {} does not match the single queued symbol",
+            scope.product
+        ));
+    }
+    if scope.task != evidence.task() {
+        return Err(format!(
+            "prediction evidence task {} does not match verified Mission task {}",
+            scope.task,
+            evidence.task()
+        ));
+    }
+    if scope.prediction_horizon_secs != evidence.prediction_horizon_secs() {
+        return Err(format!(
+            "prediction evidence horizon {:?} does not match verified Mission horizon {:?}",
+            scope.prediction_horizon_secs,
+            evidence.prediction_horizon_secs()
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContractCheck {
     pub name: String,
@@ -452,6 +490,7 @@ mod tests {
             budget_usd: 0.25,
             run_packet: "packet".to_string(),
             run_contract: "completion_signal = \"required\"".to_string(),
+            prediction_scope: None,
             prediction_evidence: None,
         }
     }

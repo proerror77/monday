@@ -9,8 +9,8 @@ use engines::{
 };
 use evaluation::{
     array_len, evaluate_agent_run_contract_with_evidence, evaluate_structured_output,
-    validate_admission, validate_verified_evidence_requirements, AdmissionLimits,
-    ContractEvaluation,
+    validate_admission, validate_verified_evidence_requirements, validate_verified_evidence_scope,
+    AdmissionLimits, ContractEvaluation,
 };
 use ploy_control_client::ControlPlaneClient;
 use ploy_operator_contracts::{
@@ -232,6 +232,8 @@ impl Sidecar {
                     })?;
                 validate_verified_evidence_requirements(&queued.request, &receipt)
                     .map_err(SidecarError::Message)?;
+                validate_verified_evidence_scope(&queued.request, &receipt)
+                    .map_err(SidecarError::Message)?;
                 evidence_prompt = format!(
                     "{}\n\nVerified evidence summary (parent-produced, read-only): {}",
                     queued.request.run_packet,
@@ -240,7 +242,7 @@ impl Sidecar {
                 verified_evidence = Some(receipt);
             }
             if let Some(reason) = runtime_failure.as_ref() {
-                if verified_evidence.is_none() {
+                if verified_evidence.is_none() || !offline_research_allowed(&queued.request) {
                     return Err(SidecarError::Message(reason.clone()));
                 }
             }
@@ -656,6 +658,7 @@ fn summarize_request(request: Option<&Value>) -> Value {
         "autonomy_mode": request.get("autonomy_mode"),
         "target_evidence": request.get("target_evidence"),
         "symbols": request.get("symbols"),
+        "prediction_scope": request.get("prediction_scope"),
         "max_turns": request.get("max_turns"),
         "budget_usd": request.get("budget_usd"),
         "queue_attempt": request.get("queue_attempt"),
@@ -1141,24 +1144,8 @@ fn verify_queued_prediction_evidence(
             .map_err(|error| format!("resolve configured prediction evidence root: {error}"))?
             .join(allowed_root)
     };
-    if allowed_root
-        .components()
-        .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
-    {
-        return Err("configured prediction evidence root must be normalized".to_string());
-    }
-    let requested_root = PathBuf::from(&refs.artifact_root);
-    if !requested_root.is_absolute()
-        || requested_root
-            .components()
-            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
-        || !requested_root.starts_with(&allowed_root)
-    {
-        return Err(format!(
-            "prediction evidence artifact_root must remain under the configured local root {}",
-            allowed_root.display()
-        ));
-    }
+    let allowed_root = fs::canonicalize(&allowed_root)
+        .map_err(|error| format!("canonicalize configured prediction evidence root: {error}"))?;
     let allowed_metadata = std::fs::symlink_metadata(&allowed_root)
         .map_err(|error| format!("inspect configured prediction evidence root: {error}"))?;
     if !allowed_metadata.is_dir() || allowed_metadata.file_type().is_symlink() {
@@ -1166,7 +1153,34 @@ fn verify_queued_prediction_evidence(
             "configured prediction evidence root must be a non-symlink directory".to_string(),
         );
     }
+    let requested_root = PathBuf::from(&refs.artifact_root);
+    if !requested_root.is_absolute()
+        || requested_root
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+    {
+        return Err(format!(
+            "prediction evidence artifact_root must remain under the configured local root {}",
+            allowed_root.display()
+        ));
+    }
+    let requested_root = fs::canonicalize(&requested_root)
+        .map_err(|error| format!("canonicalize prediction evidence artifact_root: {error}"))?;
+    if !requested_root.starts_with(&allowed_root) {
+        return Err(format!(
+            "prediction evidence artifact_root must remain under the configured local root {}",
+            allowed_root.display()
+        ));
+    }
     verify_prediction_evidence(refs)
+}
+
+fn offline_research_allowed(request: &ploy_operator_contracts::AgentRunCreateRequest) -> bool {
+    request.autonomy_mode == "research_until_blocked"
+        && matches!(
+            request.target_evidence.as_str(),
+            "diagnostic" | "factor_attribution"
+        )
 }
 
 fn control_plane_addr_from_url(raw: &str) -> Result<String> {
@@ -1562,6 +1576,7 @@ mod tests {
                     "budget_usd":1.0,
                     "run_packet":"Review the parent-produced prediction evidence.",
                     "run_contract":run_contract,
+                    "prediction_scope":{"product":"BTC","task":"settlement_probability"},
                     "prediction_evidence": refs
                 }))
                 .expect("queue request"),
@@ -1767,6 +1782,7 @@ mod tests {
                     budget_usd: 1.0,
                     run_packet: "packet".to_string(),
                     run_contract: "completion_signal = \"required\"".to_string(),
+                    prediction_scope: None,
                     prediction_evidence: None,
                 },
                 attempt: None,

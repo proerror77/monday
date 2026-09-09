@@ -10,6 +10,7 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
+use chrono::{DateTime, Utc};
 use ploy_market_data::diagnostics::PredictionMarketDataAuditReport;
 use ploy_market_data::polymarket_evidence::PolymarketCatalogReceiptState;
 use serde::{Deserialize, Serialize};
@@ -28,7 +29,7 @@ use crate::prediction_mission_v3::{
     PredictionResearchMissionV3, PredictionTaskKind,
 };
 use crate::research_snapshot::{
-    authenticate_ready_event_cohort, load_research_snapshot, ResearchSnapshot,
+    admit_authenticated_snapshot_for_evidence, authenticate_ready_event_cohort, ResearchSnapshot,
     ResearchSnapshotManifest,
 };
 use crate::{read_catalog_partition_artifact, CatalogPartitionArtifactRef};
@@ -148,6 +149,14 @@ pub struct VerifiedPredictionEvidenceReceipt {
 impl VerifiedPredictionEvidenceReceipt {
     pub fn mission_id(&self) -> &str {
         &self.mission_id
+    }
+
+    pub fn task(&self) -> &str {
+        &self.task
+    }
+
+    pub fn prediction_horizon_secs(&self) -> Option<u32> {
+        self.prediction_horizon_secs
     }
 
     pub fn snapshot_hash(&self) -> &str {
@@ -287,8 +296,12 @@ fn verify_inputs(root: &Path, refs: &PredictionEvidenceRefs) -> Result<VerifiedI
 
     let snapshot_dir = resolve_relative(root, &refs.snapshot.path)?;
     validate_snapshot_dir(root, &snapshot_dir)?;
-    let snapshot = load_research_snapshot(&snapshot_dir)
-        .map_err(|error| format!("read verified prediction snapshot: {error:#}"))?;
+    let snapshot = admit_authenticated_snapshot_for_evidence(
+        &snapshot_dir,
+        &cohort,
+        &refs.snapshot.snapshot_contract_hash,
+        &refs.snapshot.snapshot_hash,
+    )?;
     let snapshot_hash = snapshot
         .manifest
         .snapshot_hash
@@ -793,32 +806,21 @@ fn read_reports(
                         "prediction snapshot does not carry an ok data-audit status".to_string()
                     );
                 }
-                if let Some(expected_uri) = snapshot.manifest.data_audit_report.as_deref() {
-                    if let Some(expected_hash) = expected_uri.rsplit('/').next() {
-                        if expected_hash.len() == 64
-                            && normalize_sha256(expected_hash)? != normalize_sha256(&digest)?
-                        {
-                            return Err(
-                                "prediction data audit bytes do not match snapshot audit hash"
-                                    .to_string(),
-                            );
-                        }
-                    }
-                }
+                require_data_audit_binding(snapshot, &digest)?;
                 data_audit = true;
             }
             "settlement_baseline" => {
                 verify_report_identity(&value, mission)?;
-                require_report_schema(&value, "monday.polymarket.settlement_baseline.v1")?;
+                require_settlement_baseline_report(&value, mission)?;
             }
             "full_depth_execution_up" => {
                 verify_report_identity(&value, mission)?;
-                require_full_depth_report(&value, "up")?;
+                require_full_depth_report(&value, "up", snapshot)?;
                 full_depth = true;
             }
             "full_depth_execution_down" => {
                 verify_report_identity(&value, mission)?;
-                require_full_depth_report(&value, "down")?;
+                require_full_depth_report(&value, "down", snapshot)?;
                 full_depth = true;
             }
             kind => return Err(format!("unsupported prediction report kind {kind}")),
@@ -848,6 +850,235 @@ fn verify_report_identity(
     Ok(())
 }
 
+fn require_data_audit_binding(
+    snapshot: &ResearchSnapshot,
+    report_digest: &str,
+) -> Result<(), String> {
+    let uri = snapshot
+        .manifest
+        .data_audit_report
+        .as_deref()
+        .ok_or_else(|| "prediction snapshot is missing its canonical data-audit URI".to_string())?;
+    let prefix = match snapshot.manifest.source_kind.as_str() {
+        "verified_immutable_artifacts" => "verified+audit://sha256/",
+        "verified_polymarket_chainlink_baseline" => {
+            "verified+polymarket-chainlink-baseline-audit://sha256/"
+        }
+        other => {
+            return Err(format!(
+                "prediction snapshot source kind {other} has no canonical data-audit URI"
+            ))
+        }
+    };
+    let expected = uri
+        .strip_prefix(prefix)
+        .filter(|value| !value.contains('/') && !value.contains(':'))
+        .ok_or_else(|| "prediction snapshot data-audit URI is not canonical".to_string())?;
+    if normalize_sha256(expected)? != normalize_sha256(report_digest)? {
+        return Err("prediction data audit bytes do not match snapshot audit hash".to_string());
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct SettlementBaselineReportPayload {
+    schema_version: String,
+    non_finite_floats: String,
+    mission_id: String,
+    search_policy_snapshot_id: String,
+    snapshot_hash: String,
+    snapshot_contract_hash: String,
+    settlement_probability: SettlementProbabilityPayload,
+    settlement_probability_walk_forward: SettlementWalkForwardPayload,
+    settlement_verdict_walk_forward: SettlementWalkForwardPayload,
+    promotion_gate: SettlementPromotionGatePayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct SettlementProbabilityPayload {
+    baselines: Vec<Value>,
+    calibration: Vec<Value>,
+    edge_buckets: Vec<Value>,
+    anti_overfit: Vec<Value>,
+    symbol_holdouts: Vec<Value>,
+    ablations: Vec<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SettlementWalkForwardPayload {
+    windows: Vec<Value>,
+    aggregates: Vec<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SettlementPromotionGatePayload {
+    options: SettlementPromotionGateOptionsPayload,
+    ready_for_dry_run_handoff: bool,
+    gates: Vec<SettlementPromotionGateRowPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SettlementPromotionGateOptionsPayload {
+    stake_usd: f64,
+    min_entry_fill_rate: f64,
+    max_expected_calibration_error: f64,
+    min_positive_window_ratio: f64,
+    require_deribit: bool,
+    include_deribit: bool,
+    data_audit_status: Option<String>,
+    data_quality_mode: String,
+    event_complete_events: usize,
+    event_complete_rows: usize,
+    min_event_complete_events: usize,
+    min_event_complete_rows: usize,
+    global_full_depth_entry_fill_rate: Option<f64>,
+    replay_parity_ready: bool,
+    replay_parity_evidence: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SettlementPromotionGateRowPayload {
+    gate: String,
+    passed: bool,
+    evidence: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FullDepthExecutionRowPayload {
+    market_id: String,
+    symbol: String,
+    tick_ts: DateTime<Utc>,
+    token_id: String,
+    opposite_token_id: String,
+    side: String,
+    stake_usd: f64,
+    entry_fillable: bool,
+}
+
+fn require_settlement_baseline_report(
+    value: &Value,
+    mission: &PredictionResearchMissionV3,
+) -> Result<(), String> {
+    require_report_schema(value, "monday.polymarket.settlement_baseline.v1")?;
+    let report: SettlementBaselineReportPayload = serde_json::from_value(value.clone())
+        .map_err(|error| format!("parse typed settlement baseline report: {error}"))?;
+    if report.schema_version != "monday.polymarket.settlement_baseline.v1"
+        || report.non_finite_floats != "null"
+        || report.mission_id != mission.mission_id
+        || report.snapshot_hash != mission.snapshot_hash
+        || report.snapshot_contract_hash != mission.snapshot_contract_id
+        || report.search_policy_snapshot_id != mission.search_policy_snapshot_id
+    {
+        return Err("typed settlement baseline report identity is incomplete or mismatched".into());
+    }
+    if report.promotion_gate.gates.is_empty() {
+        return Err(
+            "typed settlement baseline report is missing its promotion-gate payload".into(),
+        );
+    }
+    let options = &report.promotion_gate.options;
+    if !options.stake_usd.is_finite()
+        || options.stake_usd <= 0.0
+        || !options.min_entry_fill_rate.is_finite()
+        || !options.max_expected_calibration_error.is_finite()
+        || !options.min_positive_window_ratio.is_finite()
+        || !matches!(
+            options.data_quality_mode.as_str(),
+            "strict_continuous" | "event_complete"
+        )
+        || (options.require_deribit && !options.include_deribit)
+        || (options.replay_parity_ready && options.replay_parity_evidence.is_none())
+    {
+        return Err("typed settlement baseline report has invalid promotion-gate options".into());
+    }
+    if options.data_audit_status.as_deref().is_none() {
+        return Err("typed settlement baseline report is missing data-audit gate status".into());
+    }
+    let _event_complete_counts = (
+        options.event_complete_events,
+        options.event_complete_rows,
+        options.min_event_complete_events,
+        options.min_event_complete_rows,
+        options.global_full_depth_entry_fill_rate,
+    );
+    for (name, rows) in [
+        ("baselines", &report.settlement_probability.baselines),
+        ("calibration", &report.settlement_probability.calibration),
+        ("edge_buckets", &report.settlement_probability.edge_buckets),
+        ("anti_overfit", &report.settlement_probability.anti_overfit),
+        (
+            "symbol_holdouts",
+            &report.settlement_probability.symbol_holdouts,
+        ),
+        ("ablations", &report.settlement_probability.ablations),
+        (
+            "walk_forward_windows",
+            &report.settlement_probability_walk_forward.windows,
+        ),
+        (
+            "walk_forward_aggregates",
+            &report.settlement_probability_walk_forward.aggregates,
+        ),
+        (
+            "verdict_walk_forward_windows",
+            &report.settlement_verdict_walk_forward.windows,
+        ),
+        (
+            "verdict_walk_forward_aggregates",
+            &report.settlement_verdict_walk_forward.aggregates,
+        ),
+    ] {
+        if rows.iter().any(|row| !row.is_object()) {
+            return Err(format!(
+                "typed settlement baseline report {name} contains a non-object row"
+            ));
+        }
+    }
+    let required_gates = BTreeSet::from([
+        "data_quality",
+        "deribit_vol_surface",
+        "full_depth_entry_capacity",
+        "conservative_entry_capacity",
+        "global_full_depth_entry_fillability",
+        "probability_calibration",
+        "full_depth_settlement_edge",
+        "conservative_settlement_edge",
+        "anti_overfit_diagnostics",
+        "symbol_holdout",
+        "walk_forward_oos",
+        "recorded_replay_parity",
+    ]);
+    let mut actual_gates = BTreeSet::new();
+    for gate in &report.promotion_gate.gates {
+        if gate.gate.trim().is_empty() || gate.evidence.trim().is_empty() {
+            return Err("typed settlement baseline report contains an incomplete gate".into());
+        }
+        if !actual_gates.insert(gate.gate.as_str()) {
+            return Err("typed settlement baseline report contains duplicate gates".into());
+        }
+        if !required_gates.contains(gate.gate.as_str()) {
+            return Err(format!(
+                "typed settlement baseline report contains unsupported gate {}",
+                gate.gate
+            ));
+        }
+    }
+    if actual_gates != required_gates {
+        return Err("typed settlement baseline report is missing required promotion gates".into());
+    }
+    // Keep the field typed and consumed even when all gate outcomes are false:
+    // a failed evaluator artifact is still a valid report only if it carries
+    // every canonical gate row and its evidence.
+    let _ready_for_dry_run_handoff = report.promotion_gate.ready_for_dry_run_handoff;
+    let _passed_gate_count = report
+        .promotion_gate
+        .gates
+        .iter()
+        .filter(|gate| gate.passed)
+        .count();
+    Ok(())
+}
+
 fn require_report_schema(value: &Value, expected: &str) -> Result<(), String> {
     if value.get("schema_version").and_then(Value::as_str) != Some(expected) {
         return Err(format!("prediction report schema must be {expected}"));
@@ -855,24 +1086,86 @@ fn require_report_schema(value: &Value, expected: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn require_full_depth_report(value: &Value, side: &str) -> Result<(), String> {
+fn require_full_depth_report(
+    value: &Value,
+    side: &str,
+    snapshot: &ResearchSnapshot,
+) -> Result<(), String> {
     require_report_schema(value, "monday.polymarket.full_depth_execution.v2")?;
     if !value
         .get("side")
         .and_then(Value::as_str)
         .is_some_and(|value| value.eq_ignore_ascii_case(side))
-        || value
-            .pointer("/observed/rows")
-            .and_then(Value::as_array)
-            .is_none()
-        || value
-            .pointer("/conservative/rows")
-            .and_then(Value::as_array)
-            .is_none()
     {
         return Err(format!(
             "full-depth {side} report is incomplete or side-mismatched"
         ));
+    }
+    let expected = snapshot
+        .observations
+        .iter()
+        .map(|row| row.event_id.clone())
+        .collect::<BTreeSet<_>>();
+    if expected.is_empty() {
+        return Err("full-depth report cannot bind to an empty snapshot".to_string());
+    }
+    for profile in ["observed", "conservative"] {
+        let rows = value
+            .pointer(&format!("/{profile}/rows"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("full-depth {side} report is missing {profile} rows"))?;
+        if rows.is_empty() {
+            return Err(format!(
+                "full-depth {side} report has no substantive {profile} rows"
+            ));
+        }
+        let typed_rows: Vec<FullDepthExecutionRowPayload> =
+            serde_json::from_value(Value::Array(rows.clone())).map_err(|error| {
+                format!("full-depth {side} {profile} rows are not canonical event rows: {error}")
+            })?;
+        let mut seen = BTreeSet::new();
+        for row in typed_rows {
+            if row.market_id.trim().is_empty()
+                || row.symbol.trim().is_empty()
+                || row.token_id.trim().is_empty()
+                || row.opposite_token_id.trim().is_empty()
+                || !row.side.eq_ignore_ascii_case(side)
+                || !row.stake_usd.is_finite()
+                || row.stake_usd <= 0.0
+                || row.tick_ts < snapshot.manifest.start
+                || row.tick_ts >= snapshot.manifest.end
+            {
+                return Err(format!(
+                    "full-depth {side} {profile} row is not a substantive canonical event row"
+                ));
+            }
+            if !expected.contains(&row.market_id) {
+                return Err(format!(
+                    "full-depth {side} {profile} row {} is outside the verified snapshot",
+                    row.market_id
+                ));
+            }
+            if !snapshot
+                .manifest
+                .symbols
+                .iter()
+                .any(|expected_symbol| expected_symbol == &row.symbol)
+            {
+                return Err(format!(
+                    "full-depth {side} {profile} row {} has an unexpected symbol",
+                    row.market_id
+                ));
+            }
+            let _ = (row.tick_ts, row.entry_fillable);
+            seen.insert(row.market_id);
+        }
+        if seen != expected {
+            return Err(format!(
+                "full-depth {side} {profile} rows do not cover the verified snapshot exactly: expected={:?} seen={:?}",
+                expected,
+                seen
+            ));
+        }
     }
     Ok(())
 }

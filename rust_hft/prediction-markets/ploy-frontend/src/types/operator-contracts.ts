@@ -139,6 +139,22 @@ export interface AgentToolCallRecord { name: string; status: string; }
 
 export interface AgentRunRecord { cycle_kind: string; deployment_count: number; evaluation?: JsonValue; failure_reason?: string | null; finished_at?: string | null; model: string; operator_recommendations: number; output_summary?: JsonValue; oversight_alerts: number; oversight_playbook_count: number; oversight_signal_count: number; platform_status?: string | null; research_reports: number; run_id: string; runtime_context?: JsonValue; session_id?: string | null; started_at: string; status: string; tool_calls: AgentToolCallRecord[]; total_cost_usd?: number | null; }
 
-export interface AgentRunCreateRequest { autonomy_mode: string; budget_usd: number; max_turns: number; objective: string; run_contract: string; run_packet: string; strategy_profile: string; symbols: string[]; target_evidence: string; }
+export interface AgentPredictionEvidenceScope { prediction_horizon_secs?: number | null; product: string; task: string; }
+
+export interface PredictionEvidenceCatalogPartitionRef { artifact_sha256: string; cohort_manifest_id: string; partition_digest: string; path: string; payload_sha256: string; policy_snapshot_id: string; }
+
+export interface PredictionEvidenceMissionRef { artifact_sha256: string; mission_sha256: string; path: string; }
+
+export interface PredictionEvidenceRefs { artifact_root: string; catalog_partition: PredictionEvidenceCatalogPartitionRef; mission: PredictionEvidenceMissionRef; reports?: PredictionEvidenceReportRef[]; result_bundle: PredictionEvidenceResultBundleRef; snapshot: PredictionEvidenceSnapshotRef; terminal_receipt: PredictionEvidenceTerminalReceiptRef; }
+
+export interface PredictionEvidenceReportRef { artifact_sha256: string; path: string; report_kind: string; report_sha256: string; }
+
+export interface PredictionEvidenceResultBundleRef { artifact_sha256: string; manifest_sha256?: string | null; path: string; receipt_sha256?: string | null; }
+
+export interface PredictionEvidenceSnapshotRef { path: string; snapshot_contract_hash: string; snapshot_hash: string; }
+
+export interface PredictionEvidenceTerminalReceiptRef { artifact_sha256: string; path: string; terminal_receipt_sha256: string; }
+
+export interface AgentRunCreateRequest { autonomy_mode: string; budget_usd: number; max_turns: number; objective: string; prediction_evidence?: PredictionEvidenceRefs | null; prediction_scope?: AgentPredictionEvidenceScope | null; run_contract: string; run_packet: string; strategy_profile: string; symbols: string[]; target_evidence: string; }
 
 export interface AgentRunCreateResponse { message: string; run_id: string; status: string; }

@@ -39,6 +39,16 @@
         }
       ]
     },
+    "prediction_scope": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/AgentPredictionEvidenceScope"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "run_contract": {
       "type": "string"
     },
@@ -59,6 +69,29 @@
     }
   },
   "definitions": {
+    "AgentPredictionEvidenceScope": {
+      "type": "object",
+      "required": [
+        "product",
+        "task"
+      ],
+      "properties": {
+        "prediction_horizon_secs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "product": {
+          "type": "string"
+        },
+        "task": {
+          "type": "string"
+        }
+      }
+    },
     "PredictionEvidenceCatalogPartitionRef": {
       "description": "A bounded, parent-produced reference to immutable prediction research evidence. The sidecar treats these values as locators only; ploy-research re-reads and re-hashes every referenced byte before a model is invoked.",
       "type": "object",

@@ -539,6 +539,7 @@ mod tests {
                 budget_usd: 1.0,
                 run_packet: "packet".to_string(),
                 run_contract: "completion_signal = \"required\"".to_string(),
+                prediction_scope: None,
                 prediction_evidence: None,
             },
             attempt: None,

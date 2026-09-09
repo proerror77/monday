@@ -263,6 +263,14 @@ pub struct PredictionEvidenceRefs {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentPredictionEvidenceScope {
+    pub product: String,
+    pub task: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prediction_horizon_secs: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentRunCreateRequest {
     pub objective: String,
     pub strategy_profile: String,
@@ -273,6 +281,8 @@ pub struct AgentRunCreateRequest {
     pub budget_usd: f64,
     pub run_packet: String,
     pub run_contract: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prediction_scope: Option<AgentPredictionEvidenceScope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prediction_evidence: Option<PredictionEvidenceRefs>,
 }
@@ -378,6 +388,29 @@ pub fn validate_agent_run_create_request(request: &AgentRunCreateRequest) -> Res
         ));
     }
     if let Some(evidence) = request.prediction_evidence.as_ref() {
+        let scope = request.prediction_scope.as_ref().ok_or_else(|| {
+            "prediction_scope is required when prediction_evidence is present".to_string()
+        })?;
+        if scope.product.trim().is_empty() || scope.product.len() > 128 {
+            return Err(
+                "prediction_scope.product must be non-empty and at most 128 bytes".to_string(),
+            );
+        }
+        if !matches!(
+            scope.task.as_str(),
+            "settlement_probability" | "up_execution" | "down_execution"
+        ) {
+            return Err("prediction_scope.task is not supported".to_string());
+        }
+        match (scope.task.as_str(), scope.prediction_horizon_secs) {
+            ("settlement_probability", None)
+            | ("up_execution" | "down_execution", Some(5 | 10 | 15 | 30)) => {}
+            _ => {
+                return Err(
+                    "prediction_scope task and prediction_horizon_secs do not match".to_string(),
+                )
+            }
+        }
         if evidence.reports.len() > AGENT_PREDICTION_EVIDENCE_REPORTS_MAX {
             return Err(format!(
                 "prediction_evidence may contain at most {AGENT_PREDICTION_EVIDENCE_REPORTS_MAX} reports"
@@ -545,6 +578,7 @@ mod agent_run_request_tests {
             budget_usd: 0.25,
             run_packet: "packet".to_string(),
             run_contract: "completion_signal = \"required\"".to_string(),
+            prediction_scope: None,
             prediction_evidence: None,
         }
     }
