@@ -178,6 +178,98 @@ pub struct AgentRunRecord {
     pub evaluation: Option<serde_json::Value>,
 }
 
+/// A bounded, parent-produced reference to immutable prediction research
+/// evidence. The sidecar treats these values as locators only; ploy-research
+/// re-reads and re-hashes every referenced byte before a model is invoked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PredictionEvidenceArtifactRef {
+    pub path: String,
+    pub artifact_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PredictionEvidenceMissionRef {
+    #[serde(flatten)]
+    pub artifact: PredictionEvidenceArtifactRef,
+    pub mission_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PredictionEvidenceCatalogPartitionRef {
+    #[serde(flatten)]
+    pub artifact: PredictionEvidenceArtifactRef,
+    pub payload_sha256: String,
+    pub cohort_manifest_id: String,
+    pub partition_digest: String,
+    pub policy_snapshot_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PredictionEvidenceSnapshotRef {
+    /// A snapshot is a sealed directory. `path` is relative to `artifact_root`.
+    pub path: String,
+    pub snapshot_hash: String,
+    pub snapshot_contract_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PredictionEvidenceResultBundleRef {
+    #[serde(flatten)]
+    pub artifact: PredictionEvidenceArtifactRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PredictionEvidenceReportRef {
+    #[serde(flatten)]
+    pub artifact: PredictionEvidenceArtifactRef,
+    pub report_sha256: String,
+    pub report_kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PredictionEvidenceTerminalReceiptRef {
+    #[serde(flatten)]
+    pub artifact: PredictionEvidenceArtifactRef,
+    #[serde(alias = "receipt_sha256")]
+    pub terminal_receipt_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PredictionEvidenceRefs {
+    /// Must be a local directory controlled by the parent evidence producer.
+    pub artifact_root: String,
+    pub mission: PredictionEvidenceMissionRef,
+    #[serde(alias = "cohort", alias = "producer_verifier")]
+    pub catalog_partition: PredictionEvidenceCatalogPartitionRef,
+    pub snapshot: PredictionEvidenceSnapshotRef,
+    #[serde(alias = "result")]
+    pub result_bundle: PredictionEvidenceResultBundleRef,
+    #[serde(default, alias = "report_refs")]
+    pub reports: Vec<PredictionEvidenceReportRef>,
+    #[serde(alias = "terminal")]
+    pub terminal_receipt: PredictionEvidenceTerminalReceiptRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentPredictionEvidenceScope {
+    pub product: String,
+    pub task: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prediction_horizon_secs: Option<u32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentRunCreateRequest {
     pub objective: String,
@@ -189,6 +281,10 @@ pub struct AgentRunCreateRequest {
     pub budget_usd: f64,
     pub run_packet: String,
     pub run_contract: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prediction_scope: Option<AgentPredictionEvidenceScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prediction_evidence: Option<PredictionEvidenceRefs>,
 }
 
 pub const AGENT_OBJECTIVE_MAX_BYTES: usize = 4 * 1024;
@@ -196,6 +292,8 @@ pub const AGENT_RUN_PACKET_MAX_BYTES: usize = 64 * 1024;
 pub const AGENT_RUN_CONTRACT_MAX_BYTES: usize = 32 * 1024;
 pub const AGENT_RUN_TOTAL_TEXT_MAX_BYTES: usize = 96 * 1024;
 pub const AGENT_SYMBOLS_MAX: usize = 32;
+pub const AGENT_PREDICTION_EVIDENCE_MAX_BYTES: usize = 32 * 1024;
+pub const AGENT_PREDICTION_EVIDENCE_REPORTS_MAX: usize = 16;
 
 pub fn agent_run_contract_value<'a>(
     contract: &'a str,
@@ -228,6 +326,8 @@ pub fn validate_agent_run_contract(contract: &str) -> Result<(), String> {
         "requires_full_depth_clob",
         "requires_runtime_parity",
         "requires_operator_approval",
+        "requires_realtime_runtime",
+        "requires_realtime_evidence",
     ] {
         if let Some(value) = agent_run_contract_value(contract, key)? {
             if !matches!(value, "true" | "false") {
@@ -287,6 +387,57 @@ pub fn validate_agent_run_create_request(request: &AgentRunCreateRequest) -> Res
             "run_contract must be at most {AGENT_RUN_CONTRACT_MAX_BYTES} bytes"
         ));
     }
+    if let Some(evidence) = request.prediction_evidence.as_ref() {
+        let scope = request.prediction_scope.as_ref().ok_or_else(|| {
+            "prediction_scope is required when prediction_evidence is present".to_string()
+        })?;
+        if scope.product.trim().is_empty() || scope.product.len() > 128 {
+            return Err(
+                "prediction_scope.product must be non-empty and at most 128 bytes".to_string(),
+            );
+        }
+        if !matches!(
+            scope.task.as_str(),
+            "settlement_probability" | "up_execution" | "down_execution"
+        ) {
+            return Err("prediction_scope.task is not supported".to_string());
+        }
+        match (scope.task.as_str(), scope.prediction_horizon_secs) {
+            ("settlement_probability", None)
+            | ("up_execution" | "down_execution", Some(5 | 10 | 15 | 30)) => {}
+            _ => {
+                return Err(
+                    "prediction_scope task and prediction_horizon_secs do not match".to_string(),
+                )
+            }
+        }
+        if evidence.reports.len() > AGENT_PREDICTION_EVIDENCE_REPORTS_MAX {
+            return Err(format!(
+                "prediction_evidence may contain at most {AGENT_PREDICTION_EVIDENCE_REPORTS_MAX} reports"
+            ));
+        }
+        let evidence_bytes = serde_json::to_vec(evidence)
+            .map_err(|error| format!("prediction_evidence cannot be serialized: {error}"))?;
+        if evidence_bytes.len() > AGENT_PREDICTION_EVIDENCE_MAX_BYTES {
+            return Err(format!(
+                "prediction_evidence must be at most {AGENT_PREDICTION_EVIDENCE_MAX_BYTES} bytes"
+            ));
+        }
+        if evidence.artifact_root.trim().is_empty()
+            || evidence.artifact_root.len() > 1_024
+            || evidence.mission.artifact.path.len() > 1_024
+            || evidence.snapshot.path.len() > 1_024
+            || evidence.catalog_partition.artifact.path.len() > 1_024
+            || evidence.result_bundle.artifact.path.len() > 1_024
+            || evidence.terminal_receipt.artifact.path.len() > 1_024
+            || evidence
+                .reports
+                .iter()
+                .any(|report| report.artifact.path.len() > 1_024)
+        {
+            return Err("prediction_evidence contains an empty or oversized path".to_string());
+        }
+    }
     validate_agent_run_contract(&request.run_contract)?;
     let total_text_bytes = request
         .objective
@@ -296,6 +447,13 @@ pub fn validate_agent_run_create_request(request: &AgentRunCreateRequest) -> Res
         .saturating_add(request.target_evidence.len())
         .saturating_add(request.run_packet.len())
         .saturating_add(request.run_contract.len())
+        .saturating_add(
+            request
+                .prediction_evidence
+                .as_ref()
+                .and_then(|evidence| serde_json::to_vec(evidence).ok())
+                .map_or(0, |value| value.len()),
+        )
         .saturating_add(request.symbols.iter().map(String::len).sum::<usize>());
     if total_text_bytes > AGENT_RUN_TOTAL_TEXT_MAX_BYTES {
         return Err(format!(
@@ -420,6 +578,8 @@ mod agent_run_request_tests {
             budget_usd: 0.25,
             run_packet: "packet".to_string(),
             run_contract: "completion_signal = \"required\"".to_string(),
+            prediction_scope: None,
+            prediction_evidence: None,
         }
     }
 

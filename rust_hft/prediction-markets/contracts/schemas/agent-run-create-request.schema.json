@@ -29,6 +29,26 @@
     "objective": {
       "type": "string"
     },
+    "prediction_evidence": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/PredictionEvidenceRefs"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "prediction_scope": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/AgentPredictionEvidenceScope"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "run_contract": {
       "type": "string"
     },
@@ -46,6 +66,221 @@
     },
     "target_evidence": {
       "type": "string"
+    }
+  },
+  "definitions": {
+    "AgentPredictionEvidenceScope": {
+      "type": "object",
+      "required": [
+        "product",
+        "task"
+      ],
+      "properties": {
+        "prediction_horizon_secs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "product": {
+          "type": "string"
+        },
+        "task": {
+          "type": "string"
+        }
+      }
+    },
+    "PredictionEvidenceCatalogPartitionRef": {
+      "description": "A bounded, parent-produced reference to immutable prediction research evidence. The sidecar treats these values as locators only; ploy-research re-reads and re-hashes every referenced byte before a model is invoked.",
+      "type": "object",
+      "required": [
+        "artifact_sha256",
+        "cohort_manifest_id",
+        "partition_digest",
+        "path",
+        "payload_sha256",
+        "policy_snapshot_id"
+      ],
+      "properties": {
+        "artifact_sha256": {
+          "type": "string"
+        },
+        "cohort_manifest_id": {
+          "type": "string"
+        },
+        "partition_digest": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "payload_sha256": {
+          "type": "string"
+        },
+        "policy_snapshot_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PredictionEvidenceMissionRef": {
+      "description": "A bounded, parent-produced reference to immutable prediction research evidence. The sidecar treats these values as locators only; ploy-research re-reads and re-hashes every referenced byte before a model is invoked.",
+      "type": "object",
+      "required": [
+        "artifact_sha256",
+        "mission_sha256",
+        "path"
+      ],
+      "properties": {
+        "artifact_sha256": {
+          "type": "string"
+        },
+        "mission_sha256": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PredictionEvidenceRefs": {
+      "type": "object",
+      "required": [
+        "artifact_root",
+        "catalog_partition",
+        "mission",
+        "result_bundle",
+        "snapshot",
+        "terminal_receipt"
+      ],
+      "properties": {
+        "artifact_root": {
+          "description": "Must be a local directory controlled by the parent evidence producer.",
+          "type": "string"
+        },
+        "catalog_partition": {
+          "$ref": "#/definitions/PredictionEvidenceCatalogPartitionRef"
+        },
+        "mission": {
+          "$ref": "#/definitions/PredictionEvidenceMissionRef"
+        },
+        "reports": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/PredictionEvidenceReportRef"
+          }
+        },
+        "result_bundle": {
+          "$ref": "#/definitions/PredictionEvidenceResultBundleRef"
+        },
+        "snapshot": {
+          "$ref": "#/definitions/PredictionEvidenceSnapshotRef"
+        },
+        "terminal_receipt": {
+          "$ref": "#/definitions/PredictionEvidenceTerminalReceiptRef"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PredictionEvidenceReportRef": {
+      "description": "A bounded, parent-produced reference to immutable prediction research evidence. The sidecar treats these values as locators only; ploy-research re-reads and re-hashes every referenced byte before a model is invoked.",
+      "type": "object",
+      "required": [
+        "artifact_sha256",
+        "path",
+        "report_kind",
+        "report_sha256"
+      ],
+      "properties": {
+        "artifact_sha256": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "report_kind": {
+          "type": "string"
+        },
+        "report_sha256": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PredictionEvidenceResultBundleRef": {
+      "description": "A bounded, parent-produced reference to immutable prediction research evidence. The sidecar treats these values as locators only; ploy-research re-reads and re-hashes every referenced byte before a model is invoked.",
+      "type": "object",
+      "required": [
+        "artifact_sha256",
+        "path"
+      ],
+      "properties": {
+        "artifact_sha256": {
+          "type": "string"
+        },
+        "manifest_sha256": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "receipt_sha256": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "PredictionEvidenceSnapshotRef": {
+      "type": "object",
+      "required": [
+        "path",
+        "snapshot_contract_hash",
+        "snapshot_hash"
+      ],
+      "properties": {
+        "path": {
+          "description": "A snapshot is a sealed directory. `path` is relative to `artifact_root`.",
+          "type": "string"
+        },
+        "snapshot_contract_hash": {
+          "type": "string"
+        },
+        "snapshot_hash": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PredictionEvidenceTerminalReceiptRef": {
+      "description": "A bounded, parent-produced reference to immutable prediction research evidence. The sidecar treats these values as locators only; ploy-research re-reads and re-hashes every referenced byte before a model is invoked.",
+      "type": "object",
+      "required": [
+        "artifact_sha256",
+        "path",
+        "terminal_receipt_sha256"
+      ],
+      "properties": {
+        "artifact_sha256": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "terminal_receipt_sha256": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

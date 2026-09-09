@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "db")]
 use std::process::Command;
@@ -166,6 +166,22 @@ pub struct ResearchSnapshot {
     pub pm_book_snapshots: Vec<ResearchPmBookSnapshot>,
 }
 
+impl ResearchSnapshot {
+    pub fn snapshot_hash(&self) -> &str {
+        self.manifest
+            .snapshot_hash
+            .as_deref()
+            .expect("loaded research snapshot has a verified snapshot_hash")
+    }
+
+    pub fn snapshot_contract_hash(&self) -> &str {
+        self.manifest
+            .snapshot_contract_hash
+            .as_deref()
+            .expect("loaded research snapshot has a verified snapshot_contract_hash")
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ResearchSnapshotRequest<'a> {
     pub symbols: &'a [String],
@@ -184,6 +200,7 @@ const AUTHENTICATED_COHORT_MANIFEST_SCHEMA_VERSION: &str = "authenticated_ready_
 const AUTHENTICATED_SNAPSHOT_SYMBOL: &str = "BTCUSDT";
 const AUTHENTICATED_SNAPSHOT_WINDOW_SECS: i64 = 300;
 const SEALED_SNAPSHOT_CACHE_MARKER: &str = ".authenticated-research-snapshot.sealed";
+const MAX_RESEARCH_SNAPSHOT_ARTIFACT_BYTES: u64 = 128 * 1024 * 1024;
 const AUTHENTICATED_COHORT_ARTIFACT: &str = "authenticated_ready_event_cohort";
 const AUTHENTICATED_PARTITION_ARTIFACT: &str = "event_cohort_partition";
 const AUTHENTICATED_PARTITION_VIEW_ARTIFACT: &str = "event_cohort_partition_view";
@@ -815,6 +832,73 @@ pub fn admit_extracted_authenticated_research_snapshot(
         source_kind: snapshot.manifest.source_kind,
         snapshot_dir: snapshot_dir.to_path_buf(),
     })
+}
+
+/// Re-admit an on-disk snapshot through the same sealed authenticated boundary
+/// used by the producer before a sibling verifier grants prediction evidence.
+/// This is intentionally crate-private: callers receive the verified snapshot
+/// only after the cohort, input identities, seal, source kind, coverage, time
+/// windows, and paired books have all been checked again.
+pub(crate) fn admit_authenticated_snapshot_for_evidence(
+    snapshot_dir: &Path,
+    cohort: &AuthenticatedReadyEventCohort,
+    expected_snapshot_contract_id: &str,
+    expected_snapshot_hash: &str,
+) -> Result<ResearchSnapshot, String> {
+    let snapshot = load_research_snapshot(snapshot_dir)
+        .map_err(|error| format!("read authenticated prediction snapshot: {error:#}"))?;
+    verify_sealed_snapshot_cache(snapshot_dir, &snapshot)
+        .map_err(|error| format!("verify authenticated prediction snapshot seal: {error:#}"))?;
+    if !snapshot.manifest.immutable_input
+        || snapshot.manifest.source_kind != POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND
+        || snapshot.manifest.snapshot_contract_hash.as_deref()
+            != Some(expected_snapshot_contract_id)
+        || snapshot.manifest.snapshot_hash.as_deref() != Some(expected_snapshot_hash)
+    {
+        return Err("prediction snapshot is not the expected sealed authenticated baseline".into());
+    }
+
+    let identity = |name: &str, path: &str| -> Result<String, String> {
+        let matches = snapshot
+            .manifest
+            .input_artifacts
+            .iter()
+            .filter(|artifact| artifact.name == name && artifact.path == path)
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(format!(
+                "authenticated prediction snapshot requires exactly one {name} identity"
+            ));
+        }
+        let value = matches[0]
+            .content_hash
+            .as_deref()
+            .ok_or_else(|| format!("authenticated prediction snapshot {name} lacks a digest"))?;
+        crate::prediction_loop::validate_sha256_id(value, name)?;
+        Ok(value.to_string())
+    };
+    let request = AuthenticatedSnapshotMaterializationRequest {
+        cache_root: snapshot_dir
+            .parent()
+            .ok_or_else(|| "authenticated prediction snapshot has no cache root".to_string())?
+            .to_path_buf(),
+        compiler_source_identity: identity(
+            AUTHENTICATED_COMPILER_SOURCE_ARTIFACT,
+            "authenticated://compiler-source",
+        )?,
+        compiler_image_identity: identity(
+            AUTHENTICATED_COMPILER_IMAGE_ARTIFACT,
+            "authenticated://compiler-image",
+        )?,
+        build_input_identity: identity(
+            AUTHENTICATED_BUILD_INPUT_ARTIFACT,
+            "authenticated://build-input",
+        )?,
+    };
+    validate_authenticated_snapshot(&snapshot, cohort, &request, true).map_err(|rejection| {
+        format!("authenticated prediction snapshot rejected: {rejection:?}")
+    })?;
+    Ok(snapshot)
 }
 
 fn admit_cached_authenticated_snapshot_at(
@@ -2299,10 +2383,7 @@ pub fn load_research_snapshot(snapshot_dir: impl AsRef<Path>) -> Result<Research
     let artifact_bytes = load_snapshot_artifact_bytes_with(
         &manifest,
         manifest.snapshot_contract_hash.is_some(),
-        |artifact| {
-            fs::read(snapshot_dir.join(artifact))
-                .with_context(|| format!("read snapshot artifact {artifact}"))
-        },
+        |artifact| read_bounded_snapshot_artifact(&snapshot_dir.join(artifact), artifact),
     )?;
     if let Some(recorded_contract_hash) = manifest.snapshot_contract_hash.as_deref() {
         let contract_hex = recorded_contract_hash
@@ -2353,6 +2434,32 @@ pub fn load_research_snapshot(snapshot_dir: impl AsRef<Path>) -> Result<Research
         deribit_snapshots,
         pm_book_snapshots,
     })
+}
+
+fn read_bounded_snapshot_artifact(path: &Path, artifact: &str) -> Result<Vec<u8>> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("inspect snapshot artifact {artifact}"))?;
+    ensure!(
+        metadata.is_file(),
+        "snapshot artifact {artifact} is not a regular file"
+    );
+    ensure!(
+        metadata.len() <= MAX_RESEARCH_SNAPSHOT_ARTIFACT_BYTES,
+        "snapshot artifact {artifact} exceeds {} bytes",
+        MAX_RESEARCH_SNAPSHOT_ARTIFACT_BYTES
+    );
+    let mut bytes = Vec::with_capacity(metadata.len().min(64 * 1024) as usize);
+    File::open(path)
+        .with_context(|| format!("open snapshot artifact {artifact}"))?
+        .take(MAX_RESEARCH_SNAPSHOT_ARTIFACT_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read snapshot artifact {artifact}"))?;
+    ensure!(
+        bytes.len() as u64 <= MAX_RESEARCH_SNAPSHOT_ARTIFACT_BYTES,
+        "snapshot artifact {artifact} exceeds {} bytes",
+        MAX_RESEARCH_SNAPSHOT_ARTIFACT_BYTES
+    );
+    Ok(bytes)
 }
 
 pub fn write_research_snapshot(

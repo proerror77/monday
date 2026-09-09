@@ -9,6 +9,7 @@ pub mod dataset;
 pub mod deribit;
 mod event_cohort_partition;
 pub mod event_ml;
+pub mod evidence_review;
 pub mod factors;
 pub mod factors_new;
 pub mod factors_v2;
@@ -68,6 +69,9 @@ pub use event_ml::{
     WalkForwardGate, WalkForwardGateStatus, WalkForwardMetric, WalkForwardReadiness,
     WalkForwardReport, WalkForwardWindow, WorkflowPhase, EVENT_ML_ARCHITECTURE_VERSION,
     EVENT_ML_STRATEGY_HANDOFF_VERSION, WALK_FORWARD_REPORT_VERSION,
+};
+pub use evidence_review::{
+    verify_prediction_evidence, PredictionEvidenceRefs, VerifiedPredictionEvidenceReceipt,
 };
 pub use factors::{
     aggregate_factor_metrics, build_event_summaries, build_factor_observations,

@@ -94,7 +94,8 @@ grep -Fqx 'RUN chmod 0755 /opt/monday/deployment/aliyun/research/k8s' "$controll
 grep -Fqx 'USER research' "$controller_dockerfile"
 grep -Fqx 'ENTRYPOINT ["/usr/bin/tini", "--", "/bin/bash", "/opt/monday/deployment/aliyun/research/scripts/campaign-cycle-controller.sh"]' "$controller_dockerfile"
 grep -Fqx '          image: crpi-ygobwehhof7qs9m3-vpc.ap-northeast-1.personal.cr.aliyuncs.com/wildcard0923/campaign-cycle-controller@sha256:REPLACE_WITH_IMMUTABLE_DIGEST' "$controller_job"
-if grep -Eq '^[[:space:]]+command:' "$controller_job"; then
+controller_container_block=$(sed -n '/^      containers:$/,/^      initContainers:$/p' "$controller_job")
+if grep -Eq '^[[:space:]]+command:' <<<"$controller_container_block"; then
   printf 'ACK controller Job bypasses the image entrypoint\n' >&2
   exit 1
 fi

@@ -5723,6 +5723,7 @@ dependencies = [
  "libc",
  "ploy-control-client",
  "ploy-operator-contracts",
+ "ploy-research",
  "reqwest 0.13.4",
  "serde",
  "serde_json",

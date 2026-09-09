@@ -8,18 +8,20 @@ use engines::{
     query_grok_builder_context, query_grok_strategy_completion,
 };
 use evaluation::{
-    array_len, evaluate_agent_run_contract, evaluate_structured_output, validate_admission,
+    array_len, evaluate_agent_run_contract_with_evidence, evaluate_structured_output,
+    validate_admission, validate_verified_evidence_requirements, validate_verified_evidence_scope,
     AdmissionLimits, ContractEvaluation,
 };
 use ploy_control_client::ControlPlaneClient;
 use ploy_operator_contracts::{
     AgentRunRecord, AgentToolCallRecord, DeploymentSummary, SystemStatus, TradingStateSnapshot,
 };
+use ploy_research::{verify_prediction_evidence, VerifiedPredictionEvidenceReceipt};
 use queue::{append_jsonl_sync, append_text_sync, write_text_sync, QueueStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs::{self, File};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
@@ -65,6 +67,7 @@ pub struct SidecarConfig {
     pub max_retries: u32,
     pub admission: AdmissionLimits,
     pub runtime_root: PathBuf,
+    pub evidence_root: PathBuf,
 }
 
 impl SidecarConfig {
@@ -102,6 +105,12 @@ impl SidecarConfig {
                     .to_string(),
             ));
         }
+        let runtime_root = nonempty_env("PLOY_RUNTIME_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("run/platform"));
+        let evidence_root = nonempty_env("PLOY_PREDICTION_EVIDENCE_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| runtime_root.join("prediction-evidence"));
         Ok(Self {
             engine,
             poll_interval: Duration::from_secs(poll_seconds),
@@ -109,9 +118,8 @@ impl SidecarConfig {
             dry_run: env_bool("SIDECAR_DRY_RUN", true),
             max_retries: env_u64("SIDECAR_AGENT_RUN_MAX_RETRIES", 1).min(u32::MAX as u64) as u32,
             admission: AdmissionLimits::from_env(),
-            runtime_root: nonempty_env("PLOY_RUNTIME_ROOT")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("run/platform")),
+            runtime_root,
+            evidence_root,
         })
     }
 }
@@ -135,18 +143,12 @@ impl Sidecar {
         client.control_plane_addr = control_plane_addr()?;
         let store = QueueStore::from_env(&config.runtime_root)?;
         let worker_lease = store.acquire_worker_lease()?;
-        let sidecar = Self {
+        Ok(Self {
             config,
             store,
             client,
             _worker_lease: worker_lease,
-        };
-        if let Some(reason) = sidecar.runtime_context().failure_reason {
-            return Err(SidecarError::Message(format!(
-                "control-plane startup preflight failed: {reason}"
-            )));
-        }
-        Ok(sidecar)
+        })
     }
 
     pub fn run_cycle(&mut self) -> Result<()> {
@@ -211,20 +213,45 @@ impl Sidecar {
         let mut failure_reason = None;
         let mut focused_results = Vec::new();
         let mut grok_context = None;
+        let mut verified_evidence: Option<VerifiedPredictionEvidenceReceipt> = None;
+        let mut evidence_prompt = queued.request.run_packet.clone();
 
         let execution = (|| -> Result<()> {
-            if let Some(reason) = runtime_failure.as_ref() {
-                return Err(SidecarError::Message(reason.clone()));
-            }
             if let Some(reason) = validate_admission(&queued.request, self.config.admission) {
                 return Err(SidecarError::Message(reason));
+            }
+            if let Some(refs) = queued.request.prediction_evidence.as_ref() {
+                let verifier_refs: ploy_research::PredictionEvidenceRefs =
+                    serde_json::from_value(serde_json::to_value(refs)?).map_err(|error| {
+                        SidecarError::Message(format!("prediction evidence DTO rejected: {error}"))
+                    })?;
+                let receipt =
+                    verify_queued_prediction_evidence(&verifier_refs, &self.config.evidence_root)
+                        .map_err(|reason| {
+                        SidecarError::Message(format!("prediction evidence rejected: {reason}"))
+                    })?;
+                validate_verified_evidence_requirements(&queued.request, &receipt)
+                    .map_err(SidecarError::Message)?;
+                validate_verified_evidence_scope(&queued.request, &receipt)
+                    .map_err(SidecarError::Message)?;
+                evidence_prompt = format!(
+                    "{}\n\nVerified evidence summary (parent-produced, read-only): {}",
+                    queued.request.run_packet,
+                    receipt.prompt_summary()
+                );
+                verified_evidence = Some(receipt);
+            }
+            if let Some(reason) = runtime_failure.as_ref() {
+                if verified_evidence.is_none() || !offline_research_allowed(&queued.request) {
+                    return Err(SidecarError::Message(reason.clone()));
+                }
             }
 
             if queued.request.strategy_profile.contains("grok_builder") {
                 consume_turn(&mut turns_remaining)?;
                 match query_grok_builder_context(
                     &queued.request.objective,
-                    &queued.request.run_packet,
+                    &evidence_prompt,
                     &queued.request.run_contract,
                 ) {
                     Ok(context) => {
@@ -256,8 +283,13 @@ impl Sidecar {
 
             for profile in select_profiles(queued, &harness_context) {
                 consume_turn(&mut turns_remaining)?;
-                let result =
-                    self.run_focused_subagent(profile, queued, &runtime.wire, &harness_context);
+                let result = self.run_focused_subagent(
+                    profile,
+                    queued,
+                    &runtime.wire,
+                    &harness_context,
+                    &evidence_prompt,
+                );
                 tool_calls.push(AgentToolCallRecord {
                     name: format!("subagent__{profile}"),
                     status: result.status.clone(),
@@ -270,7 +302,7 @@ impl Sidecar {
             if self.config.engine == "grok" {
                 let (result, context) = query_grok_strategy_completion(
                     &queued.request.objective,
-                    &queued.request.run_packet,
+                    &evidence_prompt,
                     &queued.request.run_contract,
                     &runtime.wire,
                     &harness_context,
@@ -286,7 +318,7 @@ impl Sidecar {
                 let focused_json = serde_json::to_value(&focused_results)?;
                 let (result, codex) = query_codex_strategy_completion(
                     &queued.request.objective,
-                    &queued.request.run_packet,
+                    &evidence_prompt,
                     &queued.request.run_contract,
                     &runtime.wire,
                     &harness_context,
@@ -343,6 +375,7 @@ impl Sidecar {
             completion,
             request: Some(request),
             harness_subagents: Some(subagents),
+            evidence: verified_evidence,
         }))
     }
 
@@ -352,6 +385,7 @@ impl Sidecar {
         queued: &QueuedAgentRunRequest,
         runtime_context: &Value,
         harness_context: &str,
+        evidence_packet: &str,
     ) -> FocusedResult {
         let prompt = if profile == "grok-evidence" {
             format!(
@@ -364,6 +398,7 @@ impl Sidecar {
                 queued.request.objective, queued.request.run_contract
             )
         };
+        let prompt = format!("{prompt}\n\nParent evidence packet summary:\n{evidence_packet}");
         match query_codex_focused_subagent(profile, &prompt, runtime_context, harness_context) {
             Ok((completion, codex)) => {
                 let mut tool_calls = vec![AgentToolCallRecord {
@@ -430,6 +465,7 @@ impl Sidecar {
             completion: None,
             request: None,
             harness_subagents: None,
+            evidence: None,
         }))
     }
 
@@ -622,6 +658,7 @@ fn summarize_request(request: Option<&Value>) -> Value {
         "autonomy_mode": request.get("autonomy_mode"),
         "target_evidence": request.get("target_evidence"),
         "symbols": request.get("symbols"),
+        "prediction_scope": request.get("prediction_scope"),
         "max_turns": request.get("max_turns"),
         "budget_usd": request.get("budget_usd"),
         "queue_attempt": request.get("queue_attempt"),
@@ -671,14 +708,16 @@ struct RunRecordParams {
     completion: Option<AgentTaskCompletion>,
     request: Option<Value>,
     harness_subagents: Option<Value>,
+    evidence: Option<VerifiedPredictionEvidenceReceipt>,
 }
 
 fn build_run_record(params: RunRecordParams) -> AgentRunRecord {
-    let contract_evaluation = evaluate_agent_run_contract(
+    let contract_evaluation = evaluate_agent_run_contract_with_evidence(
         params.request.as_ref(),
         &params.tool_calls,
         params.completion.as_ref(),
         params.failure_reason.as_deref(),
+        params.evidence.as_ref(),
     );
     let structured_evaluation = params
         .structured_output
@@ -706,10 +745,12 @@ fn build_run_record(params: RunRecordParams) -> AgentRunRecord {
     let output_summary = if params.structured_output.is_some()
         || params.completion.is_some()
         || contract_evaluation.is_some()
+        || params.evidence.is_some()
         || params.harness_subagents.is_some()
     {
         Some(json!({
             "contract_evaluation": contract_evaluation,
+            "verified_prediction_evidence": params.evidence,
             "task_completion": params.completion,
             "research_report_summaries": summarize_output_items(
                 params.structured_output.as_ref(),
@@ -1092,6 +1133,56 @@ fn control_plane_addr() -> Result<String> {
     control_plane_addr_from_url(&raw)
 }
 
+fn verify_queued_prediction_evidence(
+    refs: &ploy_research::PredictionEvidenceRefs,
+    allowed_root: &Path,
+) -> std::result::Result<VerifiedPredictionEvidenceReceipt, String> {
+    let allowed_root = if allowed_root.is_absolute() {
+        allowed_root.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("resolve configured prediction evidence root: {error}"))?
+            .join(allowed_root)
+    };
+    let allowed_root = fs::canonicalize(&allowed_root)
+        .map_err(|error| format!("canonicalize configured prediction evidence root: {error}"))?;
+    let allowed_metadata = std::fs::symlink_metadata(&allowed_root)
+        .map_err(|error| format!("inspect configured prediction evidence root: {error}"))?;
+    if !allowed_metadata.is_dir() || allowed_metadata.file_type().is_symlink() {
+        return Err(
+            "configured prediction evidence root must be a non-symlink directory".to_string(),
+        );
+    }
+    let requested_root = PathBuf::from(&refs.artifact_root);
+    if !requested_root.is_absolute()
+        || requested_root
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+    {
+        return Err(format!(
+            "prediction evidence artifact_root must remain under the configured local root {}",
+            allowed_root.display()
+        ));
+    }
+    let requested_root = fs::canonicalize(&requested_root)
+        .map_err(|error| format!("canonicalize prediction evidence artifact_root: {error}"))?;
+    if !requested_root.starts_with(&allowed_root) {
+        return Err(format!(
+            "prediction evidence artifact_root must remain under the configured local root {}",
+            allowed_root.display()
+        ));
+    }
+    verify_prediction_evidence(refs)
+}
+
+fn offline_research_allowed(request: &ploy_operator_contracts::AgentRunCreateRequest) -> bool {
+    request.autonomy_mode == "research_until_blocked"
+        && matches!(
+            request.target_evidence.as_str(),
+            "diagnostic" | "factor_attribution"
+        )
+}
+
 fn control_plane_addr_from_url(raw: &str) -> Result<String> {
     let address = raw.strip_prefix("http://").ok_or_else(|| {
         SidecarError::Message("PLOY_API_URL must be an http:// control-plane URL".to_string())
@@ -1331,6 +1422,7 @@ mod tests {
                 "queue_attempt": 1,
             })),
             harness_subagents: None,
+            evidence: None,
         });
         assert_eq!(record.status, "needs_retry");
         assert!(record
@@ -1413,9 +1505,402 @@ mod tests {
     }
 
     #[test]
+    fn queued_evidence_root_cannot_escape_configured_local_root() {
+        let temp = tempfile::tempdir().expect("create temp root");
+        let dir = temp.path().to_path_buf();
+        let allowed = dir.join("allowed");
+        let outside = dir.join("outside");
+        fs::create_dir_all(&allowed).expect("allowed root");
+        fs::create_dir_all(&outside).expect("outside root");
+        let digest = |byte: char| format!("sha256:{}", byte.to_string().repeat(64));
+        let mut refs: ploy_research::PredictionEvidenceRefs = serde_json::from_value(json!({
+            "artifact_root": outside,
+            "mission": {"path":"mission.json","artifact_sha256":digest('a'),"mission_sha256":digest('b')},
+            "catalog_partition": {"path":"catalog.json","artifact_sha256":digest('c'),"payload_sha256":digest('d'),"cohort_manifest_id":digest('e'),"partition_digest":digest('f'),"policy_snapshot_id":digest('1')},
+            "snapshot": {"path":"snapshot","snapshot_hash":"2".repeat(16),"snapshot_contract_hash":digest('2')},
+            "result_bundle": {"path":"result.json","artifact_sha256":digest('3'),"receipt_sha256":digest('4')},
+            "reports": [],
+            "terminal_receipt": {"path":"result.json","artifact_sha256":digest('3'),"terminal_receipt_sha256":digest('4')}
+        }))
+        .expect("refs");
+        refs.artifact_root = outside.display().to_string();
+        let error = verify_queued_prediction_evidence(&refs, &allowed).expect_err("root escape");
+        assert!(error.contains("under the configured local root"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn queued_evidence_root_symlink_cannot_escape_configured_local_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("create temp root");
+        let dir = temp.path().to_path_buf();
+        let allowed = dir.join("allowed");
+        let outside = dir.join("outside");
+        let link = allowed.join("link");
+        fs::create_dir_all(&allowed).expect("allowed root");
+        fs::create_dir_all(outside.join("job")).expect("outside root");
+        symlink(&outside, &link).expect("symlink outside root");
+        let digest = |byte: char| format!("sha256:{}", byte.to_string().repeat(64));
+        let refs: ploy_research::PredictionEvidenceRefs = serde_json::from_value(json!({
+            "artifact_root": link.join("job"),
+            "mission": {"path":"mission.json","artifact_sha256":digest('a'),"mission_sha256":digest('b')},
+            "catalog_partition": {"path":"catalog.json","artifact_sha256":digest('c'),"payload_sha256":digest('d'),"cohort_manifest_id":digest('e'),"partition_digest":digest('f'),"policy_snapshot_id":digest('1')},
+            "snapshot": {"path":"snapshot","snapshot_hash":"2".repeat(16),"snapshot_contract_hash":digest('2')},
+            "result_bundle": {"path":"result.json","artifact_sha256":digest('3'),"receipt_sha256":digest('4')},
+            "reports": [],
+            "terminal_receipt": {"path":"result.json","artifact_sha256":digest('3'),"terminal_receipt_sha256":digest('4')}
+        }))
+        .expect("refs");
+        let error = verify_queued_prediction_evidence(&refs, &allowed)
+            .expect_err("symlinked root must be rejected");
+        assert!(error.contains("under the configured local root"));
+    }
+
+    #[test]
+    #[ignore = "requires the production evidence handoff gate"]
+    fn production_writer_evidence_queue_reaches_terminal() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let handoff_parent = std::env::var_os("PLOY_TEST_EVIDENCE_HANDOFF")
+            .map(PathBuf::from)
+            .expect("PLOY_TEST_EVIDENCE_HANDOFF is required");
+        let refs_path = handoff_parent.join("refs.json");
+        let refs_value: ploy_operator_contracts::diagnostics::PredictionEvidenceRefs =
+            serde_json::from_slice(&fs::read(&refs_path).expect("production refs"))
+                .expect("typed production refs");
+        let verifier_refs: ploy_research::PredictionEvidenceRefs =
+            serde_json::from_value(serde_json::to_value(&refs_value).expect("serialize refs"))
+                .expect("verifier refs");
+        let expected = verify_prediction_evidence(&verifier_refs).expect("production evidence");
+
+        let mock_path = handoff_parent.join("mock-codex");
+        assert_eq!(
+            std::env::var_os("CODEX_CLI_BIN").map(PathBuf::from),
+            Some(mock_path.clone()),
+            "CI must provide the handoff mock path"
+        );
+        let mock = "#!/bin/sh\nset -eu\nout=\nwhile [ \"$#\" -gt 0 ]; do case \"$1\" in --output-last-message) out=$2; shift 2;; *) shift;; esac; done\ntest -n \"$out\"\n/bin/cat > \"$0.prompt\"\nprintf 'called\\n' >> \"$0.calls\"\n/bin/cat > \"$out\" <<'JSON'\n{\"status\":\"success\",\"summary\":\"Reviewed parent evidence\",\"decision\":\"pass\",\"grok_decision\":\"not_queried\",\"evidence\":[],\"blockers\":[],\"next_action\":\"Preserve research evidence\"}\nJSON\nprintf '%s\\n' '{\"type\":\"turn.completed\"}'\n";
+        fs::write(&mock_path, mock).expect("write mock Codex");
+        #[cfg(unix)]
+        fs::set_permissions(&mock_path, fs::Permissions::from_mode(0o700)).expect("chmod mock");
+
+        let queue_dir = tempfile::tempdir().expect("queue temp");
+        let store = QueueStore::for_dir(queue_dir.path());
+        let make_request = |run_id: &str,
+                            refs: ploy_operator_contracts::diagnostics::PredictionEvidenceRefs,
+                            target_evidence: &str,
+                            run_contract: &str| {
+            QueuedAgentRunRequest {
+                run_id: run_id.to_string(),
+                created_at: Utc::now().to_rfc3339(),
+                request: serde_json::from_value(json!({
+                    "objective":"Review the parent-produced prediction evidence",
+                    "strategy_profile":"prediction_evidence_review",
+                    "autonomy_mode":"research_until_blocked",
+                    "target_evidence":target_evidence,
+                    "symbols":["BTCUSDT"],
+                    "max_turns":3,
+                    "budget_usd":1.0,
+                    "run_packet":"Review the parent-produced prediction evidence.",
+                    "run_contract":run_contract,
+                    "prediction_scope":{"product":"BTC","task":"settlement_probability"},
+                    "prediction_evidence": refs
+                }))
+                .expect("queue request"),
+                attempt: None,
+                last_retry_reason: None,
+                last_retried_at: None,
+            }
+        };
+        append_jsonl_sync(
+            &store.requests_path,
+            &make_request(
+                "production-writer-evidence",
+                refs_value.clone(),
+                "diagnostic",
+                "completion_signal = \"required\"\nrequires_full_depth_clob = true\nrequires_operator_approval = true",
+            ),
+        )
+        .expect("queue production evidence request");
+        let mut client = ControlPlaneClient::from_runtime_root(queue_dir.path().join("platform"));
+        client.control_plane_addr = "127.0.0.1:1".to_string();
+        let mut sidecar = Sidecar {
+            config: SidecarConfig {
+                engine: "codex".to_string(),
+                poll_interval: Duration::from_secs(1),
+                scan_enabled: false,
+                dry_run: true,
+                max_retries: 1,
+                admission: AdmissionLimits {
+                    max_turns: 30,
+                    max_budget_usd: 1.0,
+                },
+                runtime_root: queue_dir.path().join("platform"),
+                evidence_root: PathBuf::from(&refs_value.artifact_root),
+            },
+            store: store.clone(),
+            client,
+            _worker_lease: store.acquire_worker_lease().expect("worker lease"),
+        };
+        sidecar.run_cycle().expect("run production evidence queue");
+        assert!(!store.requests_path.exists());
+        assert!(!store.in_progress_path.exists());
+        let records = fs::read_to_string(&store.runs_path).expect("terminal run record");
+        let record: AgentRunRecord =
+            serde_json::from_str(records.lines().next().unwrap()).expect("parse terminal record");
+        assert_eq!(record.status, "succeeded");
+        assert!(record.finished_at.is_some() && record.failure_reason.is_none());
+        assert!(record
+            .tool_calls
+            .iter()
+            .any(|call| call.name == "codex_cli__exec"));
+        let output = record.output_summary.as_ref().expect("output summary");
+        assert_eq!(output["contract_evaluation"]["status"], "passed");
+        assert_eq!(
+            output["verified_prediction_evidence"],
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert!(fs::read_to_string(mock_path.with_extension("prompt"))
+            .unwrap()
+            .contains(&expected.prompt_summary()));
+        assert_eq!(
+            fs::read_to_string(mock_path.with_extension("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        sidecar.run_cycle().expect("idempotent empty queue");
+        assert_eq!(
+            fs::read_to_string(mock_path.with_extension("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
+        let mut wrong_product = make_request(
+            "production-writer-evidence-wrong-product",
+            refs_value.clone(),
+            "diagnostic",
+            "completion_signal = \"required\"\nrequires_full_depth_clob = true\nrequires_operator_approval = true",
+        );
+        wrong_product.request.symbols = vec!["ETHUSDT".to_string()];
+        wrong_product
+            .request
+            .prediction_scope
+            .as_mut()
+            .expect("prediction scope")
+            .product = "ETH".to_string();
+        append_jsonl_sync(&store.requests_path, &wrong_product).expect("queue product mismatch");
+        sidecar
+            .run_cycle()
+            .expect("reject product mismatch before model");
+        let records = fs::read_to_string(&store.runs_path).expect("product mismatch records");
+        let wrong_product_record = records
+            .lines()
+            .map(|line| serde_json::from_str::<AgentRunRecord>(line).unwrap())
+            .find(|record| record.run_id == "production-writer-evidence-wrong-product")
+            .unwrap();
+        assert_eq!(wrong_product_record.status, "failed");
+        assert!(
+            wrong_product_record
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("verified Mission product")),
+            "{:?}",
+            wrong_product_record.failure_reason
+        );
+        assert_eq!(
+            fs::read_to_string(mock_path.with_extension("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
+        let mut wrong_task = make_request(
+            "production-writer-evidence-wrong-horizon",
+            refs_value.clone(),
+            "diagnostic",
+            "completion_signal = \"required\"\nrequires_full_depth_clob = true\nrequires_operator_approval = true",
+        );
+        let wrong_task_scope = wrong_task
+            .request
+            .prediction_scope
+            .as_mut()
+            .expect("prediction scope");
+        wrong_task_scope.task = "up_execution".to_string();
+        wrong_task_scope.prediction_horizon_secs = Some(10);
+        append_jsonl_sync(&store.requests_path, &wrong_task).expect("queue task mismatch");
+        sidecar
+            .run_cycle()
+            .expect("reject task mismatch before model");
+        let records = fs::read_to_string(&store.runs_path).expect("horizon mismatch records");
+        let wrong_task_record = records
+            .lines()
+            .map(|line| serde_json::from_str::<AgentRunRecord>(line).unwrap())
+            .find(|record| record.run_id == "production-writer-evidence-wrong-horizon")
+            .unwrap();
+        assert_eq!(wrong_task_record.status, "failed");
+        assert!(wrong_task_record
+            .failure_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("prediction evidence horizon")));
+        assert_eq!(
+            fs::read_to_string(mock_path.with_extension("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
+        let offline_candidate = make_request(
+            "production-writer-evidence-offline-candidate",
+            refs_value.clone(),
+            "dry_run_candidate",
+            "completion_signal = \"required\"\nrequires_full_depth_clob = true\nrequires_operator_approval = true",
+        );
+        append_jsonl_sync(&store.requests_path, &offline_candidate)
+            .expect("queue offline candidate");
+        sidecar
+            .run_cycle()
+            .expect("reject offline candidate before model");
+        let records = fs::read_to_string(&store.runs_path).expect("offline candidate records");
+        let offline_record = records
+            .lines()
+            .map(|line| serde_json::from_str::<AgentRunRecord>(line).unwrap())
+            .find(|record| record.run_id == "production-writer-evidence-offline-candidate")
+            .unwrap();
+        assert_eq!(offline_record.status, "failed");
+        assert!(offline_record
+            .failure_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("live control-plane context unavailable")));
+        assert_eq!(
+            fs::read_to_string(mock_path.with_extension("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
+        let mut bad_refs = refs_value.clone();
+        append_jsonl_sync(
+            &store.requests_path,
+            &make_request(
+                "production-writer-evidence-target-executable",
+                refs_value.clone(),
+                "executable_replay",
+                "completion_signal = \"required\"\nrequires_full_depth_clob = true\nrequires_operator_approval = true",
+            ),
+        )
+        .expect("queue target capability request");
+        sidecar
+            .run_cycle()
+            .expect("reject target capability before model");
+        let records = fs::read_to_string(&store.runs_path).expect("target capability records");
+        let target_record = records
+            .lines()
+            .map(|line| serde_json::from_str::<AgentRunRecord>(line).unwrap())
+            .find(|record| record.run_id == "production-writer-evidence-target-executable")
+            .unwrap();
+        assert_eq!(target_record.status, "failed");
+        assert!(target_record
+            .failure_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("executable_replay")));
+        assert_eq!(
+            fs::read_to_string(mock_path.with_extension("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
+        append_jsonl_sync(
+            &store.requests_path,
+            &make_request(
+                "production-writer-evidence-missing-audit",
+                refs_value.clone(),
+                "diagnostic",
+                "completion_signal = \"required\"\nrequires_data_audit = true\nrequires_full_depth_clob = true\nrequires_operator_approval = true",
+            ),
+        )
+        .expect("queue data audit capability request");
+        sidecar
+            .run_cycle()
+            .expect("reject missing audit before model");
+        let records = fs::read_to_string(&store.runs_path).expect("audit capability records");
+        let audit_record = records
+            .lines()
+            .map(|line| serde_json::from_str::<AgentRunRecord>(line).unwrap())
+            .find(|record| record.run_id == "production-writer-evidence-missing-audit")
+            .unwrap();
+        assert_eq!(audit_record.status, "failed");
+        assert!(audit_record
+            .failure_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("data_audit")));
+        assert_eq!(
+            fs::read_to_string(mock_path.with_extension("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
+        bad_refs.terminal_receipt.artifact.path = "missing-terminal.json".to_string();
+        append_jsonl_sync(
+            &store.requests_path,
+            &make_request(
+                "production-writer-evidence-bad-terminal",
+                bad_refs,
+                "diagnostic",
+                "completion_signal = \"required\"\nrequires_full_depth_clob = true\nrequires_operator_approval = true",
+            ),
+        )
+        .expect("queue bad terminal request");
+        sidecar
+            .run_cycle()
+            .expect("reject bad terminal before model");
+        let records = fs::read_to_string(&store.runs_path).expect("terminal records");
+        let bad_record = records
+            .lines()
+            .map(|line| serde_json::from_str::<AgentRunRecord>(line).unwrap())
+            .find(|record| record.run_id == "production-writer-evidence-bad-terminal")
+            .unwrap();
+        assert_eq!(bad_record.status, "failed");
+        assert!(bad_record
+            .failure_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("prediction evidence rejected")));
+        assert_eq!(
+            fs::read_to_string(mock_path.with_extension("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        verify_prediction_evidence(&verifier_refs).expect("original refs remain valid");
+        fs::write(
+            handoff_parent.join("consumer-proof.json"),
+            json!({
+                "run_id": record.run_id,
+                "status": record.status,
+                "snapshot_hash": expected.snapshot_hash()
+            })
+            .to_string(),
+        )
+        .expect("consumer proof");
+    }
+
+    #[test]
     fn run_cycle_consumes_claimed_request_and_records_terminal_result() {
-        let dir = std::env::temp_dir().join(format!("ploy-sidecar-cycle-{}", Uuid::new_v4()));
-        fs::create_dir_all(&dir).expect("create temp directory");
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let dir = temp.path().to_path_buf();
         let store = QueueStore::for_dir(&dir);
         append_jsonl_sync(
             &store.requests_path,
@@ -1432,6 +1917,8 @@ mod tests {
                     budget_usd: 1.0,
                     run_packet: "packet".to_string(),
                     run_contract: "completion_signal = \"required\"".to_string(),
+                    prediction_scope: None,
+                    prediction_evidence: None,
                 },
                 attempt: None,
                 last_retry_reason: None,
@@ -1453,6 +1940,7 @@ mod tests {
                     max_budget_usd: 1.0,
                 },
                 runtime_root: dir.join("platform"),
+                evidence_root: dir.join("evidence"),
             },
             store: store.clone(),
             client,
@@ -1476,6 +1964,5 @@ mod tests {
             .tool_calls
             .iter()
             .any(|call| call.name.contains("codex") || call.name.contains("xai")));
-        fs::remove_dir_all(dir).expect("remove temp directory");
     }
 }
