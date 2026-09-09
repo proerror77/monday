@@ -76,11 +76,7 @@ pub struct CampaignStudyBudgetV1 {
 
 impl CampaignStudyBudgetV1 {
     fn validate(&self) -> Result<()> {
-        if self.max_trials == 0
-            || self.max_job_attempts == 0
-            || self.max_job_seconds == 0
-            || self.max_llm_tokens == 0
-        {
+        if self.max_trials == 0 || self.max_job_attempts == 0 || self.max_job_seconds == 0 {
             return Err(CampaignControlError::Invalid("study budget"));
         }
         Ok(())

@@ -146,6 +146,11 @@ struct StudyAttempt {
     settlement: Option<CampaignAttemptSettlementV1>,
 }
 
+struct FamilyHistoryCache {
+    history: Vec<AuthenticatedCampaignReceiptV1>,
+    hashes: BTreeSet<String>,
+}
+
 #[derive(Default)]
 struct StudyState {
     grant: Option<VerifiedCampaignStudyGrant>,
@@ -573,6 +578,7 @@ fn study_load(
         .map_err(database_error)?;
     let mut state = StudyState::default();
     let mut receipts = Vec::new();
+    let mut family_histories = BTreeMap::new();
     for row in rows {
         let (sequence, semantic, json, hash, auth) = row.map_err(database_error)?;
         let receipt: CampaignStudyLedgerReceiptV1 =
@@ -596,7 +602,7 @@ fn study_load(
             return Err(err("study receipt identity, sequence or chain mismatch"));
         }
         state.apply(&receipt)?;
-        validate_family_receipt_link(conn, key, &receipt.event)?;
+        validate_family_receipt_link(conn, key, &receipt.event, &mut family_histories)?;
         receipts.push(AuthenticatedCampaignStudyReceiptV1 {
             receipt,
             content_sha256: hash,
@@ -613,7 +619,7 @@ fn study_load(
         return Err(err("study head does not match receipt history"));
     }
     if state.grant.is_some() {
-        validate_study_family_bindings(conn, key, &state)?;
+        validate_study_family_bindings(conn, key, &state, &mut family_histories)?;
         Ok((Some(state), receipts))
     } else {
         Ok((None, receipts))
@@ -624,6 +630,7 @@ fn validate_family_receipt_link(
     conn: &Connection,
     key: &[u8; 32],
     event: &CampaignStudyLedgerEventV1,
+    family_histories: &mut BTreeMap<String, FamilyHistoryCache>,
 ) -> Result<(), StoreError> {
     let (family_id, family_receipt_sha256) = match event {
         CampaignStudyLedgerEventV1::AttemptReserved {
@@ -638,10 +645,19 @@ fn validate_family_receipt_link(
         } => (family_id, family_receipt_sha256),
         _ => return Ok(()),
     };
-    let (_, history) = super::load(conn, key, family_id)?;
-    if !history
-        .iter()
-        .any(|receipt| receipt.content_sha256 == *family_receipt_sha256)
+    if !family_histories.contains_key(family_id) {
+        let (_, history) = super::load(conn, key, family_id)?;
+        let hashes = history
+            .iter()
+            .map(|receipt| receipt.content_sha256.clone())
+            .collect();
+        family_histories.insert(family_id.clone(), FamilyHistoryCache { history, hashes });
+    }
+    if !family_histories
+        .get(family_id)
+        .expect("family history cache entry was inserted")
+        .hashes
+        .contains(family_receipt_sha256)
     {
         return Err(err("study receipt is not linked to a family receipt"));
     }
@@ -1473,12 +1489,27 @@ fn validate_study_family_bindings(
     conn: &Connection,
     key: &[u8; 32],
     state: &StudyState,
+    family_histories: &mut BTreeMap<String, FamilyHistoryCache>,
 ) -> Result<(), StoreError> {
     let grant = state.grant()?.grant();
     for member in &grant.members {
-        let (_, family_history) = super::load(conn, key, &member.family_id)?;
+        if !family_histories.contains_key(&member.family_id) {
+            let (_, history) = super::load(conn, key, &member.family_id)?;
+            let hashes = history
+                .iter()
+                .map(|receipt| receipt.content_sha256.clone())
+                .collect();
+            family_histories.insert(
+                member.family_id.clone(),
+                FamilyHistoryCache { history, hashes },
+            );
+        }
+        let family_history = &family_histories
+            .get(&member.family_id)
+            .expect("family history cache entry was inserted")
+            .history;
         let Some((study_id, study_grant_sha256, bound_member)) =
-            family_study_binding_from_receipts(&member.family_id, &family_history)?
+            family_study_binding_from_receipts(&member.family_id, family_history)?
         else {
             return Err(err("study member family binding is missing"));
         };
@@ -1493,6 +1524,16 @@ fn validate_study_family_bindings(
 }
 
 impl AlphaStore {
+    pub fn campaign_study_id_for_family(
+        &self,
+        family_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        Ok(
+            read_member_projection(&self.connection, &self.integrity_key, family_id)?
+                .map(|(study_id, _, _)| study_id),
+        )
+    }
+
     /// Register one signed finite study against already registered root grants.
     /// The study head and every member family head are serialized in this same
     /// transaction as the registration receipt and immutable projections.
@@ -1579,7 +1620,15 @@ impl AlphaStore {
             {
                 return Err(err("study member family is not registered"));
             }
-            let (state, _) = super::load(&tx, &self.integrity_key, &member.family_id)?;
+            let (state, family_history) = super::load(&tx, &self.integrity_key, &member.family_id)?;
+            if family_history
+                .last()
+                .is_some_and(|receipt| receipt.receipt.recorded_at > at)
+            {
+                return Err(err(
+                    "study registration time precedes a member family receipt",
+                ));
+            }
             let root = state
                 .roots
                 .get(&member.root_grant_sha256)
@@ -1602,10 +1651,6 @@ impl AlphaStore {
         // before recording the Study head.  A family snapshot then carries
         // enough identity to reject a family-only restore in an empty DB.
         for member in &verified.grant().members {
-            let (_, family_history) = super::load(&tx, &self.integrity_key, &member.family_id)?;
-            let binding_at = family_history
-                .last()
-                .map_or(at, |receipt| receipt.receipt.recorded_at.max(at));
             super::append(
                 &tx,
                 &self.integrity_key,
@@ -1615,7 +1660,7 @@ impl AlphaStore {
                     study_grant_sha256: verified.content_sha256().into(),
                     member: member.clone(),
                 },
-                binding_at,
+                at,
             )?;
             let head = tx
                 .query_row(
@@ -2213,12 +2258,21 @@ mod tests {
         roots: &[&VerifiedCampaignRootGrant],
         max_trials: u64,
     ) -> VerifiedCampaignStudyGrant {
+        register_study_at(store, roots, max_trials, t0())
+    }
+
+    fn register_study_at(
+        store: &mut AlphaStore,
+        roots: &[&VerifiedCampaignRootGrant],
+        max_trials: u64,
+        at: DateTime<Utc>,
+    ) -> VerifiedCampaignStudyGrant {
         let verified = verify_study(study_grant(roots, max_trials));
         store
             .record_approval(&study_approval(&verified, "study-approval"))
             .unwrap();
         store
-            .register_campaign_study(&verified, "study-approval", t0())
+            .register_campaign_study(&verified, "study-approval", at)
             .unwrap();
         verified
     }
@@ -2296,6 +2350,32 @@ mod tests {
                 .unwrap(),
             before
         );
+    }
+
+    #[test]
+    fn study_zero_llm_budget_allows_zero_token_reservation_only() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        let root = verify_root(root("root-zero-llm", "family-zero-llm", '3'));
+        register_root(&mut store, &root, "zero-llm-root-approval");
+        let mut grant = study_grant(&[&root], 10);
+        grant.budget.max_llm_tokens = 0;
+        let study = verify_study(grant);
+        store
+            .record_approval(&study_approval(&study, "zero-llm-study-approval"))
+            .unwrap();
+        store
+            .register_campaign_study(&study, "zero-llm-study-approval", t0())
+            .unwrap();
+
+        let mut zero_tokens = reservation(&root, 0, 1);
+        zero_tokens.reserved_llm_tokens = 0;
+        store
+            .reserve_campaign_attempt(&root, &zero_tokens, at(1))
+            .unwrap();
+        let positive_tokens = reservation(&root, 1, 1);
+        assert!(store
+            .reserve_campaign_attempt(&root, &positive_tokens, at(2))
+            .is_err());
     }
 
     #[test]
@@ -2391,7 +2471,25 @@ mod tests {
                 at(2),
             )
             .unwrap();
-        let study = register_study(&mut store, &[&consumed_root], 10);
+        let study = verify_study(study_grant(&[&consumed_root], 10));
+        store
+            .record_approval(&study_approval(&study, "study-approval"))
+            .unwrap();
+        let before_registration = store
+            .campaign_family_snapshot(&consumed_root.grant().family.family_id)
+            .unwrap();
+        assert!(store
+            .register_campaign_study(&study, "study-approval", t0())
+            .is_err());
+        assert_eq!(
+            store
+                .campaign_family_snapshot(&consumed_root.grant().family.family_id)
+                .unwrap(),
+            before_registration
+        );
+        store
+            .register_campaign_study(&study, "study-approval", at(2))
+            .unwrap();
         assert_eq!(
             store
                 .campaign_study_usage(&study.grant().study_id)
