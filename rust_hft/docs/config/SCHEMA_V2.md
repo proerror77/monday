@@ -54,6 +54,27 @@ risk:
 - `venue catalog`：建議同步維護 `config/venues.yaml`，提供 endpoint 與能力旗標，可透過環境變數 `HFT_VENUE_CATALOG` 指定自訂路徑，後續 loader 會自動合併。
 - `auto_cancel_exchange_only`：僅保留舊配置解析相容性；設為 `true` 會在啟動驗證時失敗。交換端孤兒單必須由可比對 OMS 的 runtime 控制面處理。
 
+### Binance USD-M
+
+USD-M 必須在 Schema v2 中声明为 Binance venue，并显式选择 execution market；直接填写 `BINANCE_FUTURES` 会在 loader 阶段拒绝，避免降级为 Mock：
+
+```yaml
+venues:
+  - name: binance-usdm
+    venue_type: BINANCE
+    execution_mode: Testnet   # 当前 Live 仍关闭
+    symbol_catalog: [BTCUSDT@BINANCE]
+    execution_config:
+      market: usdm
+      account_mode: BOTH
+      position_mode: BOTH
+      account_type: usdm
+```
+
+Runtime 会把该配置的市场商品规范化为 `BINANCE_FUTURES`/`Perp`。Testnet 默认使用 Binance 官方 `https://demo-fapi.binance.com` REST 与 `wss://demo-fstream.binance.com/private/ws/<listenKey>` 私有流；Live 默认使用 `https://fapi.binance.com` 与 `wss://fstream.binance.com/private/ws/<listenKey>`。Schema v2 venue catalog 的 Spot endpoint 只作为可识别的 catalog 默认值，会按 USD-M 市场替换；显式自定义 endpoint 会保留，Testnet/Live 不能交叉使用 Binance 生产与测试 endpoint。账户模式只支持单向/BOTH；Hedge mode 会在注册前拒绝。Paper 运行必须通过 `simulate_execution: true` 使用现有的 canonical simulated execution matcher，直接构造 USD-M adapter 的 Paper client 不提供模拟成交。
+
+同一 symbol 的 USD-M 与其他市场不能共用 symbol-only Portfolio ledger；配置和运行时都会 fail-closed。当前验证范围是本地 Rust tests/Clippy，Live 保持关闭，未包含真实 Binance/Testnet acceptance。
+
 更多範例可參考 `shared/config/examples/system_v2.yaml`。
 
 > 📁 **Instrument Catalog**：範例位於 `config/instruments.yaml`，同時提供 venue 端點、功能旗標與商品精度資訊。

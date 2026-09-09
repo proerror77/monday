@@ -59,6 +59,7 @@ impl MessageConverter {
         symbol: Symbol,
         snapshot: DepthSnapshot,
         timestamp: Timestamp,
+        source_venue: VenueId,
     ) -> HftResult<MarketSnapshot> {
         let bids = Self::convert_price_levels(&snapshot.bids)?;
         let asks = Self::convert_price_levels(&snapshot.asks)?;
@@ -69,13 +70,16 @@ impl MessageConverter {
             bids,
             asks,
             sequence: snapshot.last_update_id,
-            source_venue: Some(VenueId::BINANCE),
+            source_venue: Some(source_venue),
             timestamps: MarketDataTimestamps::default(),
         })
     }
 
     /// 轉換深度更新
-    pub fn convert_depth_update(update: DepthUpdate) -> HftResult<BookUpdate> {
+    pub fn convert_depth_update(
+        update: DepthUpdate,
+        source_venue: VenueId,
+    ) -> HftResult<BookUpdate> {
         let symbol = Symbol::from(update.symbol);
         let bids = Self::convert_price_levels(&update.bids)?;
         let asks = Self::convert_price_levels(&update.asks)?;
@@ -83,7 +87,7 @@ impl MessageConverter {
 
         Ok(BookUpdate {
             symbol,
-            source_venue: Some(VenueId::BINANCE),
+            source_venue: Some(source_venue),
             // Binance 提供毫秒時間戳，統一轉換為微秒
             timestamp: exchange_event_time_us,
             bids,
@@ -100,7 +104,7 @@ impl MessageConverter {
     }
 
     /// 轉換交易事件
-    pub fn convert_trade_event(trade: TradeEvent) -> HftResult<Trade> {
+    pub fn convert_trade_event(trade: TradeEvent, source_venue: VenueId) -> HftResult<Trade> {
         let symbol = Symbol::from(trade.symbol);
         let price = Self::parse_price(&trade.price)?;
         let quantity = Self::parse_quantity(&trade.quantity)?;
@@ -124,7 +128,7 @@ impl MessageConverter {
             quantity,
             side,
             trade_id: trade.trade_id.to_string(),
-            source_venue: Some(VenueId::BINANCE),
+            source_venue: Some(source_venue),
             timestamps: MarketDataTimestamps {
                 exchange_event: Some(ExchangeEventTimestamp::new(exchange_event_time_us)),
                 exchange_trade: Some(ExchangeTradeTimestamp::new(exchange_trade_time_us)),
@@ -134,7 +138,10 @@ impl MessageConverter {
     }
 
     /// 轉換 K 線事件
-    pub fn convert_kline_event(kline_event: KlineEvent) -> HftResult<AggregatedBar> {
+    pub fn convert_kline_event(
+        kline_event: KlineEvent,
+        source_venue: VenueId,
+    ) -> HftResult<AggregatedBar> {
         let symbol = Symbol::from(kline_event.symbol);
         let exchange_event_time_us = Self::millis_to_micros(kline_event.event_time, "kline event")?;
         let kline = &kline_event.kline;
@@ -160,7 +167,7 @@ impl MessageConverter {
             close,
             volume,
             trade_count: kline.trade_count,
-            source_venue: Some(VenueId::BINANCE),
+            source_venue: Some(source_venue),
             timestamps: MarketDataTimestamps {
                 exchange_event: Some(ExchangeEventTimestamp::new(exchange_event_time_us)),
                 exchange_trade: None,
@@ -225,24 +232,31 @@ impl MessageConverter {
     }
 
     /// 檢測並解析流消息
-    pub fn parse_stream_message(text: &str) -> HftResult<Option<MarketEvent>> {
+    pub fn parse_stream_message(
+        text: &str,
+        source_venue: VenueId,
+    ) -> HftResult<Option<MarketEvent>> {
         // 首先嘗試解析為流消息
         if let Ok(stream_msg) = Self::parse_json::<StreamMessage>(text) {
-            return Self::process_stream_data(&stream_msg.stream, &stream_msg.data);
+            return Self::process_stream_data(&stream_msg.stream, &stream_msg.data, source_venue);
         }
 
         // 然後嘗試直接解析為各種事件類型
-        Self::parse_direct_message(text)
+        Self::parse_direct_message(text, source_venue)
     }
 
     /// Parse the combined-stream envelope directly from the mutable WebSocket frame buffer.
-    pub fn parse_stream_message_bytes(bytes: &mut [u8]) -> HftResult<Option<MarketEvent>> {
-        Self::parse_stream_message_bytes_with_metadata(bytes)
+    pub fn parse_stream_message_bytes(
+        bytes: &mut [u8],
+        source_venue: VenueId,
+    ) -> HftResult<Option<MarketEvent>> {
+        Self::parse_stream_message_bytes_with_metadata(bytes, source_venue)
             .map(|parsed| parsed.map(|parsed| parsed.event))
     }
 
     pub(crate) fn parse_stream_message_bytes_with_metadata(
         bytes: &mut [u8],
+        source_venue: VenueId,
     ) -> HftResult<Option<ParsedMarketEvent>> {
         const BOOK_TICKER_MARKER: &[u8] = b"@bookTicker";
         if bytes
@@ -251,7 +265,7 @@ impl MessageConverter {
         {
             let envelope: BookTickerStreamMessage = serde_json::from_slice(bytes)
                 .map_err(|error| HftError::Serialization(error.to_string()))?;
-            return Self::convert_book_ticker_event(envelope.data)
+            return Self::convert_book_ticker_event(envelope.data, source_venue)
                 .map(MarketEvent::Quote)
                 .map(|event| ParsedMarketEvent {
                     event,
@@ -263,7 +277,7 @@ impl MessageConverter {
         if stream_msg.stream.contains("@depth") {
             if let Ok(update) = Self::parse_value::<DepthUpdate>(stream_msg.data.clone()) {
                 let previous_update_id = update.previous_final_update_id;
-                return Self::convert_depth_stream_event(&stream_msg.stream, update)
+                return Self::convert_depth_stream_event(&stream_msg.stream, update, source_venue)
                     .map(|event| ParsedMarketEvent {
                         event,
                         previous_update_id,
@@ -271,7 +285,7 @@ impl MessageConverter {
                     .map(Some);
             }
         }
-        Self::process_stream_data(&stream_msg.stream, &stream_msg.data).map(|event| {
+        Self::process_stream_data(&stream_msg.stream, &stream_msg.data, source_venue).map(|event| {
             event.map(|event| ParsedMarketEvent {
                 event,
                 previous_update_id: None,
@@ -282,14 +296,18 @@ impl MessageConverter {
     /// 處理流數據
     ///
     /// 使用統一的 Value 類型（根據 json-simd feature 自動切換）
-    fn process_stream_data(stream: &str, data: &Value) -> HftResult<Option<MarketEvent>> {
+    fn process_stream_data(
+        stream: &str,
+        data: &Value,
+        source_venue: VenueId,
+    ) -> HftResult<Option<MarketEvent>> {
         if stream == "!serverShutdown" {
             return Err(HftError::Network(
                 "Binance announced WebSocket server shutdown; reconnect immediately".to_string(),
             ));
         } else if stream.contains("@depth") {
             if let Ok(update) = Self::parse_value::<DepthUpdate>(data.clone()) {
-                return Self::convert_depth_stream_event(stream, update).map(Some);
+                return Self::convert_depth_stream_event(stream, update, source_venue).map(Some);
             }
             if let Ok(snapshot) = Self::parse_value::<DepthSnapshot>(data.clone()) {
                 let symbol = stream
@@ -300,23 +318,28 @@ impl MessageConverter {
                         HftError::Parse("Binance depth stream has no symbol".to_string())
                     })?
                     .to_ascii_uppercase();
-                return Self::convert_depth_snapshot(Symbol::from(symbol), snapshot, now_micros())
-                    .map(MarketEvent::Snapshot)
-                    .map(Some);
+                return Self::convert_depth_snapshot(
+                    Symbol::from(symbol),
+                    snapshot,
+                    now_micros(),
+                    source_venue,
+                )
+                .map(MarketEvent::Snapshot)
+                .map(Some);
             }
         } else if stream.contains("@trade") {
             if let Ok(trade) = Self::parse_value::<TradeEvent>(data.clone()) {
-                let trade_event = Self::convert_trade_event(trade)?;
+                let trade_event = Self::convert_trade_event(trade, source_venue)?;
                 return Ok(Some(MarketEvent::Trade(trade_event)));
             }
         } else if stream.contains("bookTicker") {
             if let Ok(bt) = Self::parse_value::<BookTickerEvent>(data.clone()) {
-                let quote = Self::convert_book_ticker_event(bt)?;
+                let quote = Self::convert_book_ticker_event(bt, source_venue)?;
                 return Ok(Some(MarketEvent::Quote(quote)));
             }
         } else if stream.contains("@kline") {
             if let Ok(kline) = Self::parse_value::<KlineEvent>(data.clone()) {
-                let bar_event = Self::convert_kline_event(kline)?;
+                let bar_event = Self::convert_kline_event(kline, source_venue)?;
                 return Ok(Some(MarketEvent::Bar(bar_event)));
             }
         }
@@ -326,28 +349,28 @@ impl MessageConverter {
     }
 
     /// 解析直接消息
-    fn parse_direct_message(text: &str) -> HftResult<Option<MarketEvent>> {
+    fn parse_direct_message(text: &str, source_venue: VenueId) -> HftResult<Option<MarketEvent>> {
         // 嘗試解析為深度更新
         if let Ok(update) = Self::parse_json::<DepthUpdate>(text) {
-            let book_update = Self::convert_depth_update(update)?;
+            let book_update = Self::convert_depth_update(update, source_venue)?;
             return Ok(Some(MarketEvent::Update(book_update)));
         }
 
         // 嘗試解析為交易事件
         if let Ok(trade) = Self::parse_json::<TradeEvent>(text) {
-            let trade_event = Self::convert_trade_event(trade)?;
+            let trade_event = Self::convert_trade_event(trade, source_venue)?;
             return Ok(Some(MarketEvent::Trade(trade_event)));
         }
 
         // 嘗試解析為 bookTicker
         if let Ok(bt) = Self::parse_json::<BookTickerEvent>(text) {
-            let quote = Self::convert_book_ticker_event(bt)?;
+            let quote = Self::convert_book_ticker_event(bt, source_venue)?;
             return Ok(Some(MarketEvent::Quote(quote)));
         }
 
         // 嘗試解析為 K 線事件
         if let Ok(kline) = Self::parse_json::<KlineEvent>(text) {
-            let bar_event = Self::convert_kline_event(kline)?;
+            let bar_event = Self::convert_kline_event(kline, source_venue)?;
             return Ok(Some(MarketEvent::Bar(bar_event)));
         }
 
@@ -384,7 +407,10 @@ impl MessageConverter {
         Ok(level)
     }
 
-    pub fn convert_book_ticker_event(bt: BookTickerEvent) -> HftResult<TopOfBook> {
+    pub fn convert_book_ticker_event(
+        bt: BookTickerEvent,
+        source_venue: VenueId,
+    ) -> HftResult<TopOfBook> {
         let symbol = Symbol::from(bt.symbol);
         let bid = Self::convert_book_ticker_level("bid", bt.best_bid_price, bt.best_bid_qty)?;
         let ask = Self::convert_book_ticker_level("ask", bt.best_ask_price, bt.best_ask_qty)?;
@@ -401,13 +427,17 @@ impl MessageConverter {
             sequence: bt.update_id,
             bid,
             ask,
-            source_venue: Some(VenueId::BINANCE),
+            source_venue: Some(source_venue),
             timestamps: MarketDataTimestamps::default(),
         })
     }
 
-    fn convert_depth_stream_event(stream: &str, update: DepthUpdate) -> HftResult<MarketEvent> {
-        let update = Self::convert_depth_update(update)?;
+    fn convert_depth_stream_event(
+        stream: &str,
+        update: DepthUpdate,
+        source_venue: VenueId,
+    ) -> HftResult<MarketEvent> {
+        let update = Self::convert_depth_update(update, source_venue)?;
         if stream
             .split('@')
             .any(|channel| matches!(channel, "depth5" | "depth10" | "depth20"))
@@ -429,6 +459,8 @@ impl MessageConverter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SPOT_VENUE: VenueId = VenueId::BINANCE;
 
     #[test]
     fn test_parse_price() {
@@ -462,7 +494,7 @@ mod tests {
             asks: vec![["45100.00".to_string(), "0.2".to_string()]],
         };
 
-        let book_update = MessageConverter::convert_depth_update(update).unwrap();
+        let book_update = MessageConverter::convert_depth_update(update, SPOT_VENUE).unwrap();
         assert_eq!(book_update.symbol.to_string(), "BTCUSDT");
         assert_eq!(book_update.sequence, 101);
         assert_eq!(book_update.first_sequence, Some(100));
@@ -486,7 +518,7 @@ mod tests {
             is_buyer_maker: false,
         };
 
-        let trade_event = MessageConverter::convert_trade_event(trade).unwrap();
+        let trade_event = MessageConverter::convert_trade_event(trade, SPOT_VENUE).unwrap();
         assert_eq!(trade_event.symbol.to_string(), "BTCUSDT");
         assert_eq!(trade_event.side, Side::Buy); // is_buyer_maker=false 表示買方吃單
         assert_eq!(trade_event.trade_id, "12345");
@@ -507,7 +539,7 @@ mod tests {
             asks: vec![],
         };
 
-        assert!(MessageConverter::convert_depth_update(update).is_err());
+        assert!(MessageConverter::convert_depth_update(update, SPOT_VENUE).is_err());
     }
 
     #[test]
@@ -521,7 +553,7 @@ mod tests {
             }
         }"#;
 
-        let event = MessageConverter::parse_stream_message(message)
+        let event = MessageConverter::parse_stream_message(message, SPOT_VENUE)
             .unwrap()
             .expect("trade event");
         assert!(matches!(event, MarketEvent::Trade(_)));
@@ -539,9 +571,10 @@ mod tests {
         }"#;
 
         let mut bytes = message.as_bytes().to_vec();
-        let parsed = MessageConverter::parse_stream_message_bytes_with_metadata(&mut bytes)
-            .unwrap()
-            .expect("partial depth event");
+        let parsed =
+            MessageConverter::parse_stream_message_bytes_with_metadata(&mut bytes, SPOT_VENUE)
+                .unwrap()
+                .expect("partial depth event");
         assert_eq!(parsed.previous_update_id, Some(99));
         assert!(matches!(parsed.event, MarketEvent::Snapshot(_)));
     }
@@ -556,7 +589,7 @@ mod tests {
             }
         }"#;
 
-        let event = MessageConverter::parse_stream_message(message)
+        let event = MessageConverter::parse_stream_message(message, SPOT_VENUE)
             .unwrap()
             .expect("trade event");
         assert!(matches!(event, MarketEvent::Trade(_)));
@@ -566,7 +599,7 @@ mod tests {
     fn test_parse_wrapped_stream_message_from_mutable_bytes() {
         let mut message = br#"{"stream":"btcusdt@depth","data":{"e":"depthUpdate","E":123456789,"s":"BTCUSDT","U":100,"u":101,"b":[["45000.00","0.1"]],"a":[["45100.00","0.2"]]}}"#.to_vec();
 
-        let event = MessageConverter::parse_stream_message_bytes(&mut message)
+        let event = MessageConverter::parse_stream_message_bytes(&mut message, SPOT_VENUE)
             .unwrap()
             .expect("depth event");
         assert!(matches!(event, MarketEvent::Update(_)));
@@ -576,7 +609,7 @@ mod tests {
     fn partial_depth_stream_is_a_ws_only_snapshot() {
         let mut message = br#"{"stream":"btcusdt@depth20@100ms","data":{"lastUpdateId":101,"bids":[["45000.00","0.1"]],"asks":[["45100.00","0.2"]]}}"#.to_vec();
 
-        let event = MessageConverter::parse_stream_message_bytes(&mut message)
+        let event = MessageConverter::parse_stream_message_bytes(&mut message, SPOT_VENUE)
             .unwrap()
             .expect("depth snapshot");
         let MarketEvent::Snapshot(snapshot) = event else {
@@ -591,7 +624,7 @@ mod tests {
     fn book_ticker_is_a_sequence_tagged_quote_not_an_l2_delta() {
         let mut message = br#"{"stream":"btcusdt@bookTicker","data":{"u":400900217,"s":"BTCUSDT","b":"25.35190000","B":"31.21000000","a":"25.36520000","A":"40.66000000"}}"#.to_vec();
 
-        let event = MessageConverter::parse_stream_message_bytes(&mut message)
+        let event = MessageConverter::parse_stream_message_bytes(&mut message, SPOT_VENUE)
             .unwrap()
             .expect("book ticker quote");
         let MarketEvent::Quote(quote) = event else {
@@ -615,7 +648,7 @@ mod tests {
         };
 
         assert!(matches!(
-            MessageConverter::convert_book_ticker_event(ticker),
+            MessageConverter::convert_book_ticker_event(ticker, SPOT_VENUE),
             Err(HftError::Parse(message)) if message.contains("bookTicker bid")
         ));
     }
@@ -626,7 +659,8 @@ mod tests {
             br#"{"stream":"!serverShutdown","data":{"e":"serverShutdown","E":1770123456789}}"#
                 .to_vec();
 
-        let error = MessageConverter::parse_stream_message_bytes(&mut message).unwrap_err();
+        let error =
+            MessageConverter::parse_stream_message_bytes(&mut message, SPOT_VENUE).unwrap_err();
         assert!(matches!(error, HftError::Network(message) if message.contains("server shutdown")));
     }
 }

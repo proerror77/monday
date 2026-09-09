@@ -144,6 +144,15 @@ pub trait ExecutionClient: Send + Sync {
     /// 獲取未結訂單列表 (用於對賬)
     async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>>;
 
+    /// Enumerate venue-native open-order identities that the control plane can cancel.
+    ///
+    /// Standard orders are normally covered by `list_open_orders`; adapters with a separate
+    /// conditional/algo order surface override this method so reconciliation cannot report a
+    /// protected order as an empty or complete standard snapshot.
+    async fn list_cancellable_orders(&self) -> HftResult<Vec<CancellableOrderRef>> {
+        Ok(Vec::new())
+    }
+
     /// 獲取帳戶餘額 (用於餘額同步)
     async fn get_balance(&self) -> HftResult<Vec<AccountBalance>> {
         Err(HftError::Config(

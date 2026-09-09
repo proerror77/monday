@@ -13,6 +13,9 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use data_adapter_binance::MessageConverter;
+use hft_core::VenueId;
+
+const SPOT_VENUE: VenueId = VenueId::BINANCE;
 
 /// 真實的 Binance 深度更新消息樣本
 const DEPTH_UPDATE_JSON: &str = r#"{
@@ -87,7 +90,8 @@ fn bench_parse_depth_update(c: &mut Criterion) {
 
     group.bench_function("parse", |b| {
         b.iter(|| {
-            let result = MessageConverter::parse_stream_message(black_box(DEPTH_UPDATE_JSON));
+            let result =
+                MessageConverter::parse_stream_message(black_box(DEPTH_UPDATE_JSON), SPOT_VENUE);
             black_box(result)
         })
     });
@@ -102,7 +106,8 @@ fn bench_parse_trade_event(c: &mut Criterion) {
 
     group.bench_function("parse", |b| {
         b.iter(|| {
-            let result = MessageConverter::parse_stream_message(black_box(TRADE_EVENT_JSON));
+            let result =
+                MessageConverter::parse_stream_message(black_box(TRADE_EVENT_JSON), SPOT_VENUE);
             black_box(result)
         })
     });
@@ -117,7 +122,8 @@ fn bench_parse_kline_event(c: &mut Criterion) {
 
     group.bench_function("parse", |b| {
         b.iter(|| {
-            let result = MessageConverter::parse_stream_message(black_box(KLINE_EVENT_JSON));
+            let result =
+                MessageConverter::parse_stream_message(black_box(KLINE_EVENT_JSON), SPOT_VENUE);
             black_box(result)
         })
     });
@@ -136,7 +142,7 @@ fn bench_parse_mixed_batch(c: &mut Criterion) {
     group.bench_function("parse_all", |b| {
         b.iter(|| {
             for msg in &messages {
-                let result = MessageConverter::parse_stream_message(black_box(msg));
+                let result = MessageConverter::parse_stream_message(black_box(msg), SPOT_VENUE);
                 let _ = black_box(result);
             }
         })
@@ -153,7 +159,8 @@ fn bench_parse_realtime_book_ticker(c: &mut Criterion) {
         b.iter_batched_ref(
             || BOOK_TICKER_COMBINED_JSON.to_vec(),
             |frame| {
-                let result = MessageConverter::parse_stream_message_bytes(black_box(frame));
+                let result =
+                    MessageConverter::parse_stream_message_bytes(black_box(frame), SPOT_VENUE);
                 let _ = black_box(result);
             },
             BatchSize::SmallInput,

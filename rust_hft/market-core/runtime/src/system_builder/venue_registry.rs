@@ -47,7 +47,7 @@ impl SystemBuilder {
                 let mut parts = id.split('@');
                 let symbol = Symbol::new(parts.next()?);
                 let venue = VenueId::from_str(parts.next()?)?;
-                Some(instrument_for_venue(symbol, venue, None))
+                Some(instrument_for_venue(symbol, venue))
             })
             .collect()
     }
@@ -65,28 +65,44 @@ impl SystemBuilder {
             );
             return self;
         }
-        let venue_id = to_venue_id(&venue.venue_type);
+        let venue_id = match super::venue_config_to_market_venue_id(venue) {
+            Ok(venue_id) => venue_id,
+            Err(error) => {
+                tracing::warn!(
+                    venue = %venue.name,
+                    %error,
+                    "Binance market identity is invalid; market stream plan omitted"
+                );
+                return self;
+            }
+        };
+        let explicit_usdm = venue_id == VenueId::BINANCE_FUTURES;
 
         let base_instruments: Vec<InstrumentSpec> = if !venue.symbol_catalog.is_empty() {
             venue
                 .symbol_catalog
                 .iter()
                 .filter_map(|instrument_id| {
-                    instrument_id.split().map(|(symbol, venue_id)| {
-                        instrument_for_venue(symbol, venue_id, venue.inst_type.as_deref())
-                    })
+                    let (symbol, catalog_venue_id) = instrument_id.split()?;
+                    let instrument_venue =
+                        if matches!(catalog_venue_id, VenueId::BINANCE | VenueId::BINANCE_SPOT)
+                            && explicit_usdm
+                        {
+                            VenueId::BINANCE_FUTURES
+                        } else if catalog_venue_id == VenueId::BINANCE_FUTURES && !explicit_usdm {
+                            return None;
+                        } else if catalog_venue_id == VenueId::BINANCE_SPOT {
+                            VenueId::BINANCE
+                        } else {
+                            catalog_venue_id
+                        };
+                    Some(instrument_for_venue(symbol, instrument_venue))
                 })
                 .collect()
         } else {
             instruments
                 .iter()
-                .map(|instrument| {
-                    instrument_for_venue(
-                        instrument.symbol.clone(),
-                        venue_id,
-                        venue.inst_type.as_deref(),
-                    )
-                })
+                .map(|instrument| instrument_for_venue(instrument.symbol.clone(), venue_id))
                 .collect()
         };
 
@@ -131,9 +147,9 @@ impl SystemBuilder {
     }
 }
 
-fn instrument_for_venue(symbol: Symbol, venue: VenueId, inst_type: Option<&str>) -> InstrumentSpec {
+fn instrument_for_venue(symbol: Symbol, venue: VenueId) -> InstrumentSpec {
     match venue {
-        VenueId::BINANCE if inst_type.is_some_and(|market| market.eq_ignore_ascii_case("usdm")) => {
+        VenueId::BINANCE_FUTURES => {
             let mut instrument = InstrumentSpec::crypto_spot(symbol, venue);
             instrument.product_type = hft_core::ProductType::Perp;
             instrument
@@ -145,24 +161,6 @@ fn instrument_for_venue(symbol: Symbol, venue: VenueId, inst_type: Option<&str>)
         VenueId::POLYMARKET => InstrumentSpec::polymarket_outcome(symbol),
         VenueId::BINANCE_PREDICTION => InstrumentSpec::prediction_market_outcome(symbol),
         _ => InstrumentSpec::crypto_spot(symbol, venue),
-    }
-}
-
-fn to_venue_id(venue_type: &VenueType) -> VenueId {
-    match venue_type {
-        VenueType::Binance => VenueId::BINANCE,
-        VenueType::BinancePrediction => VenueId::BINANCE_PREDICTION,
-        VenueType::Bitget => VenueId::BITGET,
-        VenueType::Bybit => VenueId::BYBIT,
-        VenueType::Hyperliquid => VenueId::HYPERLIQUID,
-        VenueType::Grvt => VenueId::GRVT,
-        VenueType::Backpack => VenueId::BACKPACK,
-        VenueType::Asterdex => VenueId::ASTERDEX,
-        VenueType::Lighter => VenueId::LIGHTER,
-        VenueType::OndoPerps => VenueId::ONDO_PERPS,
-        VenueType::Polymarket => VenueId::POLYMARKET,
-        VenueType::Mock => VenueId::MOCK,
-        VenueType::Okx => VenueId::OKX,
     }
 }
 
@@ -218,6 +216,9 @@ mod tests {
         assert_eq!(builder.market_stream_plans.len(), 1);
         let (venue, _name, instruments) = &builder.market_stream_plans[0];
         assert_eq!(*venue, VenueType::Binance);
+        assert!(instruments
+            .iter()
+            .all(|instrument| instrument.venue == VenueId::BINANCE_FUTURES));
         let collected: Vec<_> = instruments
             .iter()
             .map(|instrument| instrument.symbol.as_str())
@@ -226,6 +227,70 @@ mod tests {
         assert!(instruments
             .iter()
             .all(|instrument| instrument.product_type == hft_core::ProductType::Perp));
+    }
+
+    #[test]
+    fn explicit_usdm_execution_market_uses_binance_futures_instrument_identity() {
+        let mut config = SystemConfig::default();
+        config.venues.push(VenueConfig {
+            name: "binance-usdm".into(),
+            account_id: None,
+            venue_type: VenueType::Binance,
+            ws_public: None,
+            ws_private: None,
+            rest: None,
+            api_key: None,
+            secret: None,
+            passphrase: None,
+            execution_mode: Some("Paper".into()),
+            capabilities: VenueCapabilities::default(),
+            inst_type: Some("usdm".into()),
+            simulate_execution: false,
+            symbol_catalog: vec![InstrumentId::new("BTCUSDT@BINANCE")],
+            data_config: None,
+            execution_config: Some(serde_yaml::from_str("market: usdm").unwrap()),
+            secret_ref_api_key: None,
+            secret_ref_secret: None,
+            secret_ref_passphrase: None,
+        });
+
+        let builder = SystemBuilder::new(config).register_market_streams_from_config();
+        let instruments = &builder.market_stream_plans[0].2;
+
+        assert_eq!(instruments[0].venue, VenueId::BINANCE_FUTURES);
+        assert_eq!(instruments[0].product_type, hft_core::ProductType::Perp);
+    }
+
+    #[test]
+    fn execution_market_alone_selects_usdm_market_data_identity() {
+        let mut config = SystemConfig::default();
+        config.venues.push(VenueConfig {
+            name: "binance-usdm".into(),
+            account_id: None,
+            venue_type: VenueType::Binance,
+            ws_public: None,
+            ws_private: None,
+            rest: None,
+            api_key: None,
+            secret: None,
+            passphrase: None,
+            execution_mode: Some("Paper".into()),
+            capabilities: VenueCapabilities::default(),
+            inst_type: None,
+            simulate_execution: false,
+            symbol_catalog: vec![InstrumentId::new("BTCUSDT@BINANCE")],
+            data_config: None,
+            execution_config: Some(serde_yaml::from_str("market: usdm").unwrap()),
+            secret_ref_api_key: None,
+            secret_ref_secret: None,
+            secret_ref_passphrase: None,
+        });
+
+        let builder = SystemBuilder::new(config).register_market_streams_from_config();
+        let instruments = &builder.market_stream_plans[0].2;
+
+        assert_eq!(instruments[0].venue, VenueId::BINANCE_FUTURES);
+        assert_eq!(instruments[0].product_type, hft_core::ProductType::Perp);
     }
 
     #[test]

@@ -9,6 +9,28 @@ use integration::ws::{WsClient, WsClientConfig};
 use tracing::info;
 
 pub const WS_BASE_URL: &str = "wss://data-stream.binance.vision/ws";
+pub const WS_USDM_BASE_URL: &str = "wss://fstream.binance.com/ws";
+const WS_SPOT_CATALOG_URL: &str = "wss://stream.binance.com:9443/ws";
+const WS_SPOT_CATALOG_STREAM_URL: &str = "wss://stream.binance.com:9443/stream";
+
+pub(crate) fn is_known_spot_endpoint(url: &str) -> bool {
+    matches!(
+        url.trim_end_matches('/'),
+        WS_BASE_URL
+            | WS_SPOT_CATALOG_URL
+            | WS_SPOT_CATALOG_STREAM_URL
+            | "wss://stream.binance.com/ws"
+            | "wss://stream.binance.com"
+    )
+}
+
+pub(crate) fn usdm_endpoint_for(url: &str) -> String {
+    if is_known_spot_endpoint(url) {
+        WS_USDM_BASE_URL.to_string()
+    } else {
+        url.to_string()
+    }
+}
 
 pub(crate) fn uses_partial_depth_stream() -> bool {
     let mode = std::env::var("COLLECTOR_DEPTH_MODE")
@@ -71,6 +93,7 @@ impl BinanceWebSocket {
     }
 
     pub fn with_usdm(mut self) -> Self {
+        self.ws_base_url = usdm_endpoint_for(&self.ws_base_url);
         self.usdm = true;
         self
     }
@@ -255,6 +278,36 @@ mod tests {
         assert_eq!(
             url,
             "wss://stream.binance.com:9443/stream?streams=btcusdt@depth/btcusdt@trade"
+        );
+    }
+
+    #[test]
+    fn usdm_uses_futures_stream_endpoint_by_default() {
+        let ws = BinanceWebSocket::new().with_usdm();
+        let url = ws.build_connection_url(&["btcusdt@depth20@100ms".to_string()]);
+        assert_eq!(
+            url,
+            "wss://fstream.binance.com/stream?streams=btcusdt@depth20@100ms"
+        );
+    }
+
+    #[test]
+    fn usdm_preserves_explicit_stream_endpoint_override() {
+        let ws = BinanceWebSocket::with_base_url("ws://localhost:18081/ws").with_usdm();
+        let url = ws.build_connection_url(&["btcusdt@depth20@100ms".to_string()]);
+        assert_eq!(
+            url,
+            "ws://localhost:18081/stream?streams=btcusdt@depth20@100ms"
+        );
+    }
+
+    #[test]
+    fn usdm_replaces_the_schema_catalog_spot_endpoint() {
+        let ws = BinanceWebSocket::with_base_url(WS_SPOT_CATALOG_URL).with_usdm();
+        let url = ws.build_connection_url(&["btcusdt@depth20@100ms".to_string()]);
+        assert_eq!(
+            url,
+            "wss://fstream.binance.com/stream?streams=btcusdt@depth20@100ms"
         );
     }
 }
