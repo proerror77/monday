@@ -21,14 +21,26 @@ die() {
 usage() {
   cat <<'EOF'
 Usage: campaign-cycle-controller.sh [start] \
-  --campaign-inputs FILE --input-root DIR --source-revision SHA \
+  (--campaign-inputs FILE --input-root DIR | --fresh-inputs \
+   --fresh-raw-root DIR --fresh-reference-root DIR \
+   --fresh-symbol SYMBOL --fresh-image-ref IMAGE@sha256:DIGEST \
+   --fresh-mission-id ID --fresh-output-root DIR \
+   --fresh-output-prefix PREFIX --fresh-materializer FILE \
+   --fresh-bucket-ms N --fresh-label-horizon-buckets N --fresh-top-depth N \
+   (--fresh-start-received-at-ns N --fresh-end-received-at-ns N \
+    | --fresh-duration-ns N [--fresh-cutoff-received-at-ns N] --fresh-max-candidates N) \
+   --fresh-max-inputs N --fresh-max-input-bytes N \
+   --fresh-max-scan-entries N --fresh-materializer-timeout-seconds N \
+   --fresh-max-materializer-output-bytes N) \
+  --source-revision SHA \
   --image IMAGE@sha256:DIGEST --campaign-root HTTPS_URL \
-  --signer EXECUTABLE --work-dir DIR --seed N --seed N \
+  [--control CONTROL_JSON] [--signer EXECUTABLE] \
+  --work-dir DIR --seed N --seed N \
   [--context NAME] [--namespace NAME] [--max-follow-ups 3] \
   [--job-timeout 7h]
 
        campaign-cycle-controller.sh approve \
-  --work-dir DIR --signer EXECUTABLE \
+  --work-dir DIR --signer EXECUTABLE [--control CONTROL_JSON] \
   [--alpha-harness EXECUTABLE] [--aliyun EXECUTABLE] [--kubectl EXECUTABLE]
 
        campaign-cycle-controller.sh ack-readback \
@@ -78,6 +90,8 @@ validate_controller_state() {
     and (.job_timeout | type == "string")
     and (.seeds | type == "array" and length >= 2)
     and all(.seeds[]; type == "number")
+    and ((.input_mode // "receipt") == "receipt"
+      or ((.input_mode == "fresh") and (.fresh | type == "object")))
   ' "$controller_state" >/dev/null || die "controller state is invalid: $controller_state"
 }
 
@@ -279,10 +293,38 @@ source_revision=""
 image=""
 campaign_root=""
 signer=""
+control=""
 campaign_pod_name=""
 work_dir=""
 seeds=()
 mode="start"
+fresh_mode=false
+fresh_raw_root=""
+fresh_reference_root=""
+fresh_start_received_at_ns=""
+fresh_end_received_at_ns=""
+fresh_symbol=""
+fresh_image_ref=""
+fresh_mission_id=""
+fresh_output_root=""
+fresh_output_prefix=""
+fresh_bucket_ms=""
+fresh_label_horizon_buckets=""
+fresh_top_depth=""
+fresh_duration_ns=""
+fresh_cutoff_received_at_ns=""
+fresh_max_candidates=""
+fresh_materializer=""
+fresh_binary_dir=""
+fresh_max_scan_entries=""
+fresh_max_inputs=""
+fresh_max_input_bytes=""
+fresh_materializer_timeout_seconds=""
+fresh_max_materializer_output_bytes=""
+fresh_inventory_out=""
+fresh_request_out=""
+fresh_materializer_work_dir=""
+fresh_report_out=""
 
 case "${1:-}" in
   start|approve|ack-readback|status)
@@ -311,11 +353,39 @@ while (($#)); do
     --aliyun) aliyun_cli="$2"; shift 2 ;;
     --kubectl) kubectl_cli="$2"; shift 2 ;;
     --campaign-inputs) [[ "$mode" == "start" ]] || die "$mode loads --campaign-inputs from controller state"; campaign_inputs="$2"; shift 2 ;;
+    --fresh-inputs) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_mode=true; shift ;;
+    --fresh-raw-root) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_raw_root="$2"; shift 2 ;;
+    --fresh-reference-root) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_reference_root="$2"; shift 2 ;;
+    --fresh-start-received-at-ns|--fresh-window-start-ns) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_start_received_at_ns="$2"; shift 2 ;;
+    --fresh-end-received-at-ns|--fresh-window-end-ns) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_end_received_at_ns="$2"; shift 2 ;;
+    --fresh-symbol) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_symbol="$2"; shift 2 ;;
+    --fresh-image-ref|--fresh-producer-image) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_image_ref="$2"; shift 2 ;;
+    --fresh-mission-id) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_mission_id="$2"; shift 2 ;;
+    --fresh-output-root) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_output_root="$2"; shift 2 ;;
+    --fresh-output-prefix) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_output_prefix="$2"; shift 2 ;;
+    --fresh-bucket-ms) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_bucket_ms="$2"; shift 2 ;;
+    --fresh-label-horizon-buckets) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_label_horizon_buckets="$2"; shift 2 ;;
+    --fresh-top-depth) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_top_depth="$2"; shift 2 ;;
+    --fresh-duration-ns) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_duration_ns="$2"; shift 2 ;;
+    --fresh-cutoff-received-at-ns|--fresh-cutoff-ns) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_cutoff_received_at_ns="$2"; shift 2 ;;
+    --fresh-max-candidates) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_max_candidates="$2"; shift 2 ;;
+    --fresh-materializer) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_materializer="$2"; shift 2 ;;
+    --fresh-binary-dir) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_binary_dir="$2"; shift 2 ;;
+    --fresh-max-scan-entries) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_max_scan_entries="$2"; shift 2 ;;
+    --fresh-max-inputs) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_max_inputs="$2"; shift 2 ;;
+    --fresh-max-input-bytes) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_max_input_bytes="$2"; shift 2 ;;
+    --fresh-materializer-timeout-seconds) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_materializer_timeout_seconds="$2"; shift 2 ;;
+    --fresh-max-materializer-output-bytes) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_max_materializer_output_bytes="$2"; shift 2 ;;
+    --fresh-inventory-out) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_inventory_out="$2"; shift 2 ;;
+    --fresh-request-out) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_request_out="$2"; shift 2 ;;
+    --fresh-materializer-work-dir) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_materializer_work_dir="$2"; shift 2 ;;
+    --fresh-report-out) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_report_out="$2"; shift 2 ;;
     --input-root) [[ "$mode" == "start" ]] || die "$mode loads --input-root from controller state"; input_root="$2"; shift 2 ;;
     --source-revision) [[ "$mode" == "start" ]] || die "$mode loads --source-revision from controller state"; source_revision="$2"; shift 2 ;;
     --image) [[ "$mode" == "start" ]] || die "$mode loads --image from controller state"; image="$2"; shift 2 ;;
     --campaign-root) [[ "$mode" == "start" ]] || die "$mode loads --campaign-root from controller state"; campaign_root="$2"; shift 2 ;;
     --signer) signer="$2"; shift 2 ;;
+    --control) control="$2"; shift 2 ;;
     --campaign-pod-name) [[ "$mode" == "ack-readback" ]] || die "--campaign-pod-name is ACK-only"; campaign_pod_name="$2"; shift 2 ;;
     --work-dir) work_dir="$2"; shift 2 ;;
     --seed) [[ "$mode" == "start" ]] || die "$mode loads --seed from controller state"; seeds+=("$2"); shift 2 ;;
@@ -343,16 +413,68 @@ if [[ "$mode" == "approve" || "$mode" == "ack-readback" ]]; then
   namespace="$(jq -er '.namespace' "$state")"
   max_follow_ups="$(jq -er '.max_follow_ups' "$state")"
   job_timeout="$(jq -er '.job_timeout' "$state")"
+  if [[ "$(jq -r '.input_mode // "receipt"' "$state")" == "fresh" ]]; then
+    fresh_mode=true
+  fi
+  if [[ -z "$control" ]]; then
+    control="$(jq -r '.control // empty' "$state")"
+  fi
   while IFS= read -r seed; do
     seeds+=("$seed")
   done < <(jq -er '.seeds[]' "$state")
+fi
+
+if [[ "$mode" == "start" ]]; then
+  if [[ "$fresh_mode" == true ]]; then
+    [[ -z "$campaign_inputs" ]] || die "--fresh-inputs conflicts with --campaign-inputs"
+    [[ -z "$input_root" ]] || die "--fresh-inputs conflicts with --input-root"
+    [[ -n "$fresh_raw_root" ]] || die "--fresh-raw-root is required with --fresh-inputs"
+    [[ -n "$fresh_reference_root" ]] || die "--fresh-reference-root is required with --fresh-inputs"
+    if [[ -n "$fresh_start_received_at_ns" || -n "$fresh_end_received_at_ns" ]]; then
+      [[ -n "$fresh_start_received_at_ns" && -n "$fresh_end_received_at_ns" ]] \
+        || die "both fresh explicit window bounds are required"
+      [[ -z "$fresh_duration_ns$fresh_cutoff_received_at_ns$fresh_max_candidates" ]] \
+        || die "fresh explicit and latest window modes are mutually exclusive"
+    else
+      [[ -n "$fresh_duration_ns" ]] || die "--fresh-duration-ns is required with --fresh-inputs latest mode"
+      [[ -n "$fresh_max_candidates" ]] || die "--fresh-max-candidates is required with --fresh-inputs latest mode"
+    fi
+    [[ -n "$fresh_symbol" ]] || die "--fresh-symbol is required with --fresh-inputs"
+    [[ -n "$fresh_image_ref" ]] || die "--fresh-image-ref is required with --fresh-inputs"
+    [[ -n "$fresh_mission_id" ]] || die "--fresh-mission-id is required with --fresh-inputs"
+    [[ -n "$fresh_output_root" ]] || die "--fresh-output-root is required with --fresh-inputs"
+    [[ -n "$fresh_output_prefix" ]] || die "--fresh-output-prefix is required with --fresh-inputs"
+    [[ -n "$fresh_bucket_ms" ]] || die "--fresh-bucket-ms is required with --fresh-inputs"
+    [[ -n "$fresh_label_horizon_buckets" ]] || die "--fresh-label-horizon-buckets is required with --fresh-inputs"
+    [[ -n "$fresh_top_depth" ]] || die "--fresh-top-depth is required with --fresh-inputs"
+    [[ -n "$fresh_materializer" ]] || die "--fresh-materializer is required with --fresh-inputs"
+    [[ -n "$fresh_max_scan_entries" ]] || die "--fresh-max-scan-entries is required with --fresh-inputs"
+    [[ -n "$fresh_max_inputs" ]] || die "--fresh-max-inputs is required with --fresh-inputs"
+    [[ -n "$fresh_max_input_bytes" ]] || die "--fresh-max-input-bytes is required with --fresh-inputs"
+    [[ -n "$fresh_materializer_timeout_seconds" ]] || die "--fresh-materializer-timeout-seconds is required with --fresh-inputs"
+    [[ -n "$fresh_max_materializer_output_bytes" ]] || die "--fresh-max-materializer-output-bytes is required with --fresh-inputs"
+    [[ -n "$fresh_inventory_out" ]] || fresh_inventory_out="$work_dir/fresh-inputs/frozen.env"
+    [[ -n "$fresh_request_out" ]] || fresh_request_out="$fresh_output_root/.fresh-inputs/$fresh_output_prefix/request.json"
+    [[ -n "$fresh_materializer_work_dir" ]] || fresh_materializer_work_dir="$work_dir/fresh-inputs/materializer"
+    [[ -n "$fresh_report_out" ]] || fresh_report_out="$work_dir/fresh-inputs/preparation.json"
+    fresh_output_root="$(cd "$fresh_output_root" && pwd -P)" \
+      || die "fresh output root does not exist: $fresh_output_root"
+    input_root="$fresh_output_root/$fresh_output_prefix"
+    campaign_inputs="$input_root/receipts/campaign-inputs.json"
+  else
+    [[ -z "$fresh_raw_root$fresh_reference_root$fresh_start_received_at_ns$fresh_end_received_at_ns$fresh_duration_ns$fresh_cutoff_received_at_ns$fresh_max_candidates$fresh_symbol$fresh_image_ref$fresh_mission_id$fresh_output_root$fresh_output_prefix$fresh_bucket_ms$fresh_label_horizon_buckets$fresh_top_depth$fresh_materializer$fresh_binary_dir$fresh_max_scan_entries$fresh_max_inputs$fresh_max_input_bytes$fresh_materializer_timeout_seconds$fresh_max_materializer_output_bytes$fresh_inventory_out$fresh_request_out$fresh_materializer_work_dir$fresh_report_out" ]] \
+      || die "fresh input arguments require --fresh-inputs"
+    [[ -n "$campaign_inputs" ]] || die "--campaign-inputs is required when --fresh-inputs is absent"
+  fi
 fi
 
 for required in campaign_inputs input_root source_revision image campaign_root work_dir; do
   [[ -n "${!required}" ]] || die "--${required//_/-} is required"
 done
 if [[ "$mode" != "ack-readback" ]]; then
-  [[ -n "$signer" ]] || die "--signer is required"
+  if [[ -z "$signer" && !("$mode" == "start" && "$fresh_mode" == true) ]]; then
+    die "--signer is required"
+  fi
 else
   [[ "$campaign_pod_name" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]] \
     || die "--campaign-pod-name must be an exact Kubernetes Pod name"
@@ -361,18 +483,24 @@ fi
 [[ "$max_follow_ups" =~ ^[0-3]$ ]] || die "--max-follow-ups must be between 0 and 3"
 [[ ! -e "$work_dir" || -d "$work_dir" ]] || die "--work-dir must be a directory"
 if [[ "$mode" != "ack-readback" ]]; then
-  campaign_inputs_dir="$(cd "$(dirname "$campaign_inputs")" && pwd -P)" \
-    || die "campaign inputs directory does not exist: $(dirname "$campaign_inputs")"
-  campaign_inputs="$campaign_inputs_dir/$(basename "$campaign_inputs")"
-  [[ -f "$campaign_inputs" ]] || die "campaign inputs file does not exist: $campaign_inputs"
-  input_root="$(cd "$input_root" && pwd -P)" || die "input root does not exist: $input_root"
-  [[ -x "$signer" ]] || die "signer is not executable: $signer"
+  if [[ "$fresh_mode" != true ]]; then
+    campaign_inputs_dir="$(cd "$(dirname "$campaign_inputs")" && pwd -P)" \
+      || die "campaign inputs directory does not exist: $(dirname "$campaign_inputs")"
+    campaign_inputs="$campaign_inputs_dir/$(basename "$campaign_inputs")"
+    [[ -f "$campaign_inputs" ]] || die "campaign inputs file does not exist: $campaign_inputs"
+    input_root="$(cd "$input_root" && pwd -P)" || die "input root does not exist: $input_root"
+  fi
+  if [[ -n "$signer" ]]; then
+    [[ -x "$signer" ]] || die "signer is not executable: $signer"
+  fi
 fi
 command -v "$alpha_harness" >/dev/null || die "alpha-harness executable not found"
-command -v "$aliyun_cli" >/dev/null || die "aliyun executable not found"
-command -v "$kubectl_cli" >/dev/null || die "kubectl executable not found"
 command -v jq >/dev/null || die "jq is required"
 command -v cmp >/dev/null || die "cmp is required"
+if [[ !("$mode" == "start" && "$fresh_mode" == true && -z "$signer") ]]; then
+  command -v "$aliyun_cli" >/dev/null || die "aliyun executable not found"
+  command -v "$kubectl_cli" >/dev/null || die "kubectl executable not found"
+fi
 
 umask 077
 mkdir -p "$work_dir"
@@ -497,6 +625,89 @@ verify_kubernetes_provenance() {
   ' "$pod_status" >/dev/null
 }
 
+if [[ "$mode" == "start" && "$fresh_mode" == true ]]; then
+  controller_stage="fresh_inputs"
+  fresh_preparation_dir="$work_dir/fresh-inputs"
+  mkdir -p "$fresh_preparation_dir"
+  fresh_preparation_stdout="$fresh_preparation_dir/preparation.stdout"
+  fresh_prepare_args=(
+    mission prepare-fresh-inputs
+    --raw-root "$fresh_raw_root"
+    --reference-root "$fresh_reference_root"
+    --symbol "$fresh_symbol"
+    --image-ref "$fresh_image_ref"
+    --mission-id "$fresh_mission_id"
+    --output-prefix "$fresh_output_prefix"
+    --bucket-ms "$fresh_bucket_ms"
+    --label-horizon-buckets "$fresh_label_horizon_buckets"
+    --top-depth "$fresh_top_depth"
+    --max-scan-entries "$fresh_max_scan_entries"
+    --max-inputs "$fresh_max_inputs"
+    --max-input-bytes "$fresh_max_input_bytes"
+    --inventory-out "$fresh_inventory_out"
+    --request-out "$fresh_request_out"
+    --campaign-inputs-out "$campaign_inputs"
+    --output-root "$fresh_output_root"
+    --materializer "$fresh_materializer"
+    --materializer-work-dir "$fresh_materializer_work_dir"
+    --materializer-timeout-seconds "$fresh_materializer_timeout_seconds"
+    --max-materializer-output-bytes "$fresh_max_materializer_output_bytes"
+    --report-out "$fresh_report_out"
+  )
+  if [[ -n "$fresh_start_received_at_ns" ]]; then
+    fresh_prepare_args+=(--start-received-at-ns "$fresh_start_received_at_ns")
+    fresh_prepare_args+=(--end-received-at-ns "$fresh_end_received_at_ns")
+  else
+    fresh_prepare_args+=(--duration-ns "$fresh_duration_ns")
+    fresh_prepare_args+=(--max-candidates "$fresh_max_candidates")
+    if [[ -n "$fresh_cutoff_received_at_ns" ]]; then
+      fresh_prepare_args+=(--cutoff-received-at-ns "$fresh_cutoff_received_at_ns")
+    fi
+  fi
+  if [[ -n "$fresh_binary_dir" ]]; then
+    fresh_prepare_args+=(--binary-dir "$fresh_binary_dir")
+  fi
+  log_event stage_started "stage=fresh_inputs" \
+    "selection_mode=$(if [[ -n "$fresh_start_received_at_ns" ]]; then printf explicit; else printf latest; fi)" \
+    "window_start_received_at_ns=$fresh_start_received_at_ns" \
+    "window_end_received_at_ns=$fresh_end_received_at_ns" \
+    "output_prefix=$fresh_output_prefix"
+  "$alpha_harness" "${fresh_prepare_args[@]}" >"$fresh_preparation_stdout"
+  [[ -s "$fresh_report_out" && -s "$campaign_inputs" ]] \
+    || die "fresh input preparation did not produce complete evidence"
+  fresh_report_campaign_inputs="$(jq -er '.campaign_inputs_path' "$fresh_report_out")"
+  fresh_report_input_root="$(jq -er '.input_root' "$fresh_report_out")"
+  fresh_report_request="$(jq -er '.request_path' "$fresh_report_out")"
+  fresh_report_request_sha256="$(jq -er '.request_sha256' "$fresh_report_out")"
+  [[ "$fresh_report_campaign_inputs" == "$campaign_inputs" ]] \
+    || die "fresh preparation campaign inputs path drifted"
+  [[ "$fresh_report_input_root" == "$input_root" ]] \
+    || die "fresh preparation input root drifted"
+  [[ "$fresh_report_request" == "$fresh_request_out" ]] \
+    || die "fresh preparation request path drifted"
+  [[ "$(sha256_file "$fresh_request_out")" == "$fresh_report_request_sha256" ]] \
+    || die "fresh preparation request SHA256 readback differs"
+  jq -e \
+    --arg source_revision "$source_revision" \
+    --arg symbol "$fresh_symbol" \
+    --arg mission_id "$fresh_mission_id" \
+    --arg output_prefix "$fresh_output_prefix" \
+    '.schema_version == "monday.cex_fresh_inputs_preparation.v1"
+     and .status == "ready"
+     and .source_revision == $source_revision
+     and .symbol == $symbol
+     and .mission_id == $mission_id
+     and .run_root == .input_root
+     and .output_prefix == $output_prefix' \
+    "$fresh_report_out" >/dev/null \
+    || die "fresh input preparation identity is incomplete or drifted"
+  log_event stage_completed \
+    "stage=fresh_inputs" \
+    "campaign_inputs_sha256=$(sha256_file "$campaign_inputs")" \
+    "inventory_sha256=$(jq -er '.inventory_sha256' "$fresh_report_out")" \
+    "input_fingerprint_sha256=$(jq -er '.input_fingerprint_sha256' "$fresh_report_out")"
+fi
+
 state="$work_dir/controller-inputs.json"
 if [[ "$mode" == "ack-readback" ]]; then
   campaign_inputs_sha256="$(jq -er '.campaign_inputs_sha256' "$state")"
@@ -504,6 +715,58 @@ else
   campaign_inputs_sha256="$(sha256_file "$campaign_inputs")"
   seeds_json="$(printf '%s\n' "${seeds[@]}" | jq -R 'tonumber' | jq -s '.')"
   state_tmp="$state.partial.$$"
+  fresh_state_json=null
+  input_mode=receipt
+  if [[ "$fresh_mode" == true ]]; then
+    input_mode=fresh
+    if [[ "$mode" == "start" ]]; then
+      fresh_state_json="$(jq -n \
+        --arg raw_root "$fresh_raw_root" \
+        --arg reference_root "$fresh_reference_root" \
+        --arg start_received_at_ns "$fresh_start_received_at_ns" \
+        --arg end_received_at_ns "$fresh_end_received_at_ns" \
+        --arg symbol "$fresh_symbol" \
+        --arg image_ref "$fresh_image_ref" \
+        --arg mission_id "$fresh_mission_id" \
+        --arg output_root "$fresh_output_root" \
+        --arg output_prefix "$fresh_output_prefix" \
+        --arg bucket_ms "$fresh_bucket_ms" \
+        --arg label_horizon_buckets "$fresh_label_horizon_buckets" \
+        --arg top_depth "$fresh_top_depth" \
+        --arg duration_ns "$fresh_duration_ns" \
+        --arg cutoff_received_at_ns "$fresh_cutoff_received_at_ns" \
+        --arg max_candidates "$fresh_max_candidates" \
+        --arg materializer "$fresh_materializer" \
+        --arg binary_dir "$fresh_binary_dir" \
+        --arg max_scan_entries "$fresh_max_scan_entries" \
+        --arg max_inputs "$fresh_max_inputs" \
+        --arg max_input_bytes "$fresh_max_input_bytes" \
+        --arg materializer_timeout_seconds "$fresh_materializer_timeout_seconds" \
+        --arg max_materializer_output_bytes "$fresh_max_materializer_output_bytes" \
+        --arg inventory_out "$fresh_inventory_out" \
+        --arg request_out "$fresh_request_out" \
+        --arg materializer_work_dir "$fresh_materializer_work_dir" \
+        --arg preparation_report "$fresh_report_out" \
+        '{
+          raw_root:$raw_root,reference_root:$reference_root,
+          start_received_at_ns:$start_received_at_ns,end_received_at_ns:$end_received_at_ns,
+          symbol:$symbol,image_ref:$image_ref,mission_id:$mission_id,
+          output_root:$output_root,output_prefix:$output_prefix,
+          bucket_ms:$bucket_ms,label_horizon_buckets:$label_horizon_buckets,top_depth:$top_depth,
+          duration_ns:$duration_ns,cutoff_received_at_ns:$cutoff_received_at_ns,
+          max_candidates:$max_candidates,
+          materializer:$materializer,binary_dir:$binary_dir,
+          max_scan_entries:$max_scan_entries,max_inputs:$max_inputs,max_input_bytes:$max_input_bytes,
+          materializer_timeout_seconds:$materializer_timeout_seconds,
+          max_materializer_output_bytes:$max_materializer_output_bytes,
+          inventory_out:$inventory_out,request_out:$request_out,
+          materializer_work_dir:$materializer_work_dir,
+          preparation_report:$preparation_report
+        }')"
+    else
+      fresh_state_json="$(jq -c '.fresh' "$state")"
+    fi
+  fi
   jq -n \
     --arg campaign_inputs "$campaign_inputs" \
     --arg campaign_inputs_sha256 "$campaign_inputs_sha256" \
@@ -513,14 +776,19 @@ else
     --arg campaign_root "$campaign_root" \
     --arg context "$context" \
     --arg namespace "$namespace" \
+    --arg control "$control" \
+    --arg input_mode "$input_mode" \
+    --argjson fresh "$fresh_state_json" \
     --argjson max_follow_ups "$max_follow_ups" \
     --arg job_timeout "$job_timeout" \
     --argjson seeds "$seeds_json" \
-    '{campaign_inputs:$campaign_inputs,campaign_inputs_sha256:$campaign_inputs_sha256,input_root:$input_root,source_revision:$source_revision,image:$image,campaign_root:$campaign_root,context:$context,namespace:$namespace,max_follow_ups:$max_follow_ups,job_timeout:$job_timeout,seeds:$seeds}' \
+    '{campaign_inputs:$campaign_inputs,campaign_inputs_sha256:$campaign_inputs_sha256,input_root:$input_root,source_revision:$source_revision,image:$image,campaign_root:$campaign_root,context:$context,namespace:$namespace,max_follow_ups:$max_follow_ups,job_timeout:$job_timeout,seeds:$seeds}
+     + (if $input_mode == "fresh" then {input_mode:"fresh",fresh:$fresh,control:(if $control == "" then null else $control end)}
+        elif $control == "" then {} else {control:$control} end)' \
     >"$state_tmp"
   if [[ -e "$state" ]]; then
     # Preserve historical checkpoints; only the retired token budget is irrelevant.
-    jq -e -s 'length == 2 and (.[0] == (.[1] | del(.max_tokens)))' \
+    jq -e -s 'length == 2 and ((.[0] | del(.control)) == (.[1] | del(.max_tokens,.control)))' \
       "$state_tmp" "$state" >/dev/null \
       || die "existing work directory belongs to different controller inputs"
     rm -f -- "$state_tmp"
@@ -529,6 +797,36 @@ else
   fi
 fi
 state_tmp=""
+if [[ "$mode" == "start" && "$fresh_mode" == true && -z "$signer" ]]; then
+  needs_authority="$work_dir/needs-authority.json"
+  jq -n \
+    --arg campaign_inputs "$campaign_inputs" \
+    --arg campaign_inputs_sha256 "$campaign_inputs_sha256" \
+    --arg request "$fresh_request_out" \
+    --arg request_sha256 "$(jq -er '.request_sha256' "$fresh_report_out")" \
+    --arg preparation_report "$fresh_report_out" \
+    --arg input_root "$input_root" \
+    '{
+      schema_version:"monday.campaign_cycle_needs_authority.v1",
+      status:"needs_authority",
+      reason:"signer_missing",
+      campaign_inputs:$campaign_inputs,
+      campaign_inputs_sha256:$campaign_inputs_sha256,
+      request:$request,
+      request_sha256:$request_sha256,
+      input_root:$input_root,
+      preparation_report:$preparation_report,
+      preparation_preserved:true,
+      resume_ready:true
+    }' >"$needs_authority"
+  log_event needs_authority \
+    "stage=fresh_inputs" \
+    "reason=signer_missing" \
+    "campaign_inputs_sha256=$campaign_inputs_sha256" \
+    "artifact=$needs_authority"
+  jq . "$needs_authority"
+  exit 0
+fi
 log_event cycle_started \
   "mode=$mode" \
   "campaign_inputs_sha256=$campaign_inputs_sha256" \
@@ -673,7 +971,46 @@ while ((generation <= max_follow_ups)); do
     controller_stage="dispatch"
     log_event stage_started "generation=$generation" "stage=dispatch" "job_name=$job_name"
     [[ -s "$submission" ]] || die "finalized Campaign is missing its resumable submission"
+    controller_control="$(printenv MONDAY_CAMPAIGN_CONTROL 2>/dev/null || true)"
+    dispatch_control="$control"
+    [[ -n "$dispatch_control" ]] || dispatch_control="$controller_control"
+    if [[ "$fresh_mode" == true && ( -z "$dispatch_control" || ! -f "$dispatch_control" ) ]]; then
+      needs_authority="$generation_dir/needs-authority.json"
+      jq -n \
+        --arg campaign_id "$campaign_id" \
+        --arg request_sha256 "$request_sha256" \
+        --arg request "$request" \
+        --arg submission "$submission" \
+        --arg campaign_inputs_sha256 "$campaign_inputs_sha256" \
+        --arg dispatch_control "$dispatch_control" \
+        '{
+          schema_version:"monday.campaign_cycle_needs_authority.v1",
+          status:"needs_authority",
+          reason:"dispatch_control_missing",
+          campaign_id:$campaign_id,
+          request_sha256:$request_sha256,
+          campaign_inputs_sha256:$campaign_inputs_sha256,
+          control:$dispatch_control,
+          request:$request,
+          submission:$submission,
+          sign_finalize_dispatch_preserved:true
+        }' >"$needs_authority"
+      log_event needs_authority \
+        "generation=$generation" \
+        "stage=dispatch" \
+        "reason=dispatch_control_missing" \
+        "campaign_id=$campaign_id" \
+        "request_sha256=$request_sha256" \
+        "artifact=$needs_authority"
+      jq . "$needs_authority"
+      exit 0
+    fi
+    dispatch_control_args=()
+    if [[ -n "$control" ]]; then
+      dispatch_control_args=(--control "$control")
+    fi
     "$alpha_harness" mission dispatch submit \
+      "${dispatch_control_args[@]}" \
       --submission "$submission" \
       --context "$context" \
       --namespace "$namespace" >"$dispatch_report.partial"

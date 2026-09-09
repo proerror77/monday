@@ -565,6 +565,62 @@ before it signs or dispatches the next Campaign identity. The signer must be
 supplied again so a restarted controller cannot cross that trust boundary
 implicitly.
 
+For a new archive window, start can prepare the input identity through the
+same controller checkpoint instead of accepting a pre-existing receipt. The
+fresh path requires either an explicit receive-time window or a bounded latest
+request (`duration`, optional persisted cutoff, and candidate budget), plus a
+symbol, output prefix, input count/byte limits, and materializer
+timeout/output limits:
+
+    deployment/aliyun/research/scripts/campaign-cycle-controller.sh start \
+      --fresh-inputs \
+      --fresh-raw-root /archive/raw \
+      --fresh-reference-root /archive/usdm-reference \
+      --fresh-start-received-at-ns 1788739200000000000 \
+      --fresh-end-received-at-ns 1788825600000000000 \
+      --fresh-symbol BTCUSDT \
+      --fresh-image-ref registry/research-runner@sha256:REPLACE_PRODUCER_DIGEST \
+      --fresh-mission-id fresh-btcusdt-study \
+      --fresh-output-root /campaign-root/inputs \
+      --fresh-output-prefix fresh-btcusdt-study \
+      --fresh-bucket-ms 1000 --fresh-label-horizon-buckets 5 --fresh-top-depth 5 \
+      --fresh-materializer /usr/local/bin/cex-materialization-entrypoint.sh \
+      --fresh-max-scan-entries 100000 --fresh-max-inputs 8192 \
+      --fresh-max-input-bytes 20000000000 \
+      --fresh-materializer-timeout-seconds 7200 \
+      --fresh-max-materializer-output-bytes 16777216 \
+      --source-revision REPLACE_EXACT_GIT_SHA \
+      --image registry/research-runner@sha256:REPLACE_EXECUTOR_DIGEST \
+      --campaign-root https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/campaigns \
+      --work-dir /campaign-root/cycles/fresh-btcusdt-study \
+      --seed 7 --seed 11
+
+The latest form replaces the two explicit bounds with
+`--fresh-duration-ns N --fresh-max-candidates N` and may add
+`--fresh-cutoff-received-at-ns N`. The first request persists the resolved
+cutoff in its create-once request identity; a restart reuses that cutoff. The
+selected raw inputs are complete sealed segments, so the preparation report
+records their actual manifest span, which can be longer than the requested
+minimum duration. The materializer still owns checkpoint, stream, sequence,
+and PIT admission; the selection receipt keeps
+`materialized_pit_admitted: false` until that stage succeeds.
+
+The native mission prepare-fresh-inputs step calls the existing collector
+freezer and materializer, then verifies the create-once inventory, campaign
+request identity, campaign receipt, materialization receipt, and local
+feature/materialization/replay hashes. The request identity binds the archive
+roots, receive-time window, output paths, producer image, and all preparation
+limits. A completed preparation is reused on restart, so later archive
+appends cannot change the frozen snapshot or rematerialize it. If a signer is
+not supplied, the controller emits needs_authority with the preparation
+identity and stops before signing or dispatch. Supplying the signer and
+matching dispatch control through approve resumes the original
+freeze -> finalize -> dispatch path. Dispatch still verifies the new
+campaign_inputs_sha256 against the externally supplied signed root grant,
+trusted keys, approval, ledger, resources, and receipt access; an older root
+cannot be reused for the new window. This path remains pre-holdout and does
+not create final-evaluation or holdout authority.
+
 The printed ACK Job runs `ack-readback` from
 `/campaign-root/cycles/REPLACE_CYCLE_ID`. Its campaign-root PVC must use block storage for the active DuckDB ledger and
 cycle checkpoints. OSS holds immutable published evidence; the OSS CSI example

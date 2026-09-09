@@ -1,6 +1,7 @@
 use crate::{
     data_mission, governance, loop_control, mission, mission_campaign, mission_dispatch,
-    mission_runner, prediction_dispatch, prediction_runner, prediction_snapshot,
+    mission_fresh_inputs, mission_runner, prediction_dispatch, prediction_runner,
+    prediction_snapshot,
 };
 use alpha_domain::{
     EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1,
@@ -84,6 +85,7 @@ enum MissionCommand {
     CampaignLearn(CampaignLearnArgs),
     CampaignFinalize(CampaignFinalizeArgs),
     CampaignId(CampaignIdArgs),
+    PrepareFreshInputs(PrepareFreshInputsArgs),
     Dispatch {
         #[command(subcommand)]
         command: MissionDispatchCommand,
@@ -297,6 +299,83 @@ pub struct CampaignFinalizeArgs {
 pub struct CampaignIdArgs {
     #[arg(long)]
     pub request: PathBuf,
+}
+
+/// Freeze a bounded archive window, run the existing CEX materializer, and
+/// verify its immutable local receipt before the canonical Campaign freeze.
+#[derive(Debug, Clone, Args)]
+pub struct PrepareFreshInputsArgs {
+    /// Read-only root of sealed raw collector triplets.
+    #[arg(long)]
+    pub raw_root: PathBuf,
+    /// Read-only root of published USD-M reference triplets.
+    #[arg(long)]
+    pub reference_root: PathBuf,
+    #[arg(long)]
+    pub start_received_at_ns: Option<u64>,
+    #[arg(long)]
+    pub end_received_at_ns: Option<u64>,
+    /// Latest-window duration in nanoseconds. Mutually exclusive with an explicit window.
+    #[arg(long)]
+    pub duration_ns: Option<u64>,
+    /// Latest-window receive-time cutoff. When omitted, the first request resolves and persists now.
+    #[arg(long)]
+    pub cutoff_received_at_ns: Option<u64>,
+    /// Maximum number of latest-window candidates to inspect.
+    #[arg(long)]
+    pub max_candidates: Option<usize>,
+    #[arg(long)]
+    pub symbol: String,
+    /// Producer image digest recorded in the frozen inventory.
+    #[arg(long)]
+    pub image_ref: String,
+    #[arg(long)]
+    pub mission_id: String,
+    #[arg(long)]
+    pub output_prefix: String,
+    #[arg(long)]
+    pub bucket_ms: u64,
+    #[arg(long)]
+    pub label_horizon_buckets: u64,
+    #[arg(long)]
+    pub top_depth: usize,
+    #[arg(long, default_value_t = 100_000)]
+    pub max_scan_entries: usize,
+    /// Maximum number of frozen raw and reference inputs.
+    #[arg(long)]
+    pub max_inputs: usize,
+    /// Maximum total source bytes verified by the collector freezer.
+    #[arg(long)]
+    pub max_input_bytes: u64,
+    /// Create-once frozen.env output retained as the preparation identity.
+    #[arg(long)]
+    pub inventory_out: PathBuf,
+    /// Mandatory create-once preparation request binding the fresh window and limits.
+    #[arg(long)]
+    pub request_out: PathBuf,
+    /// Create-once campaign-inputs.json output produced by the existing materializer.
+    #[arg(long)]
+    pub campaign_inputs_out: PathBuf,
+    /// Parent of the materializer run-specific output prefix.
+    #[arg(long)]
+    pub output_root: PathBuf,
+    /// Existing cex-materialization-entrypoint.sh.
+    #[arg(long)]
+    pub materializer: PathBuf,
+    /// Private work directory for the existing materializer.
+    #[arg(long)]
+    pub materializer_work_dir: PathBuf,
+    #[arg(long)]
+    pub binary_dir: Option<PathBuf>,
+    /// Upper bound for the materializer process lifetime.
+    #[arg(long, default_value_t = 7_200)]
+    pub materializer_timeout_seconds: u64,
+    /// Upper bound for captured materializer stdout and stderr combined.
+    #[arg(long, default_value_t = 16 * 1024 * 1024)]
+    pub max_materializer_output_bytes: u64,
+    /// Optional create-once preparation report path.
+    #[arg(long)]
+    pub report_out: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -908,6 +987,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             MissionCommand::CampaignFinalize(args) => mission_campaign::finalize(args),
             MissionCommand::CampaignId(args) => mission_campaign::print_expected_id(args),
+            MissionCommand::PrepareFreshInputs(args) => {
+                tokio::task::spawn_blocking(move || mission_fresh_inputs::prepare(args))
+                    .await
+                    .context("fresh Campaign input preparation worker failed")?
+            }
             MissionCommand::Dispatch { command } => match command {
                 MissionDispatchCommand::Submit(args) => {
                     tokio::task::spawn_blocking(move || mission_dispatch::submit(args))
@@ -1091,6 +1175,7 @@ mod tests {
             "campaign-finalize",
             "campaign-id",
             "campaign-execute",
+            "prepare-fresh-inputs",
             "dispatch",
         ] {
             assert!(listed(command), "{command} must stay on the Campaign path");
@@ -1322,6 +1407,80 @@ mod tests {
     #[test]
     fn parses_mission_campaign_id() {
         let args = "alpha-harness mission campaign-id --request campaign.json";
+        assert!(Cli::try_parse_from(args.split_whitespace()).is_ok());
+    }
+
+    #[test]
+    fn parses_bounded_fresh_input_preparation() {
+        let args = [
+            "alpha-harness",
+            "mission",
+            "prepare-fresh-inputs",
+            "--raw-root",
+            "/archive/raw",
+            "--reference-root",
+            "/archive/reference",
+            "--start-received-at-ns",
+            "1700000000000000000",
+            "--end-received-at-ns",
+            "1700000060000000000",
+            "--symbol",
+            "BTCUSDT",
+            "--image-ref",
+            "registry/research@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--mission-id",
+            "fresh-window",
+            "--output-prefix",
+            "campaigns/fresh-window",
+            "--bucket-ms",
+            "1000",
+            "--label-horizon-buckets",
+            "5",
+            "--top-depth",
+            "5",
+            "--max-inputs",
+            "64",
+            "--max-input-bytes",
+            "1000000",
+            "--inventory-out",
+            "/work/frozen.env",
+            "--request-out",
+            "/output/.fresh-inputs/campaigns/fresh-window/request.json",
+            "--campaign-inputs-out",
+            "/output/campaigns/fresh-window/receipts/campaign-inputs.json",
+            "--output-root",
+            "/output",
+            "--materializer",
+            "/usr/local/bin/cex-materialization-entrypoint.sh",
+            "--materializer-work-dir",
+            "/work/materializer",
+        ];
+        assert!(Cli::try_parse_from(args).is_ok());
+    }
+
+    #[test]
+    fn parses_latest_bounded_fresh_input_preparation() {
+        let args = "alpha-harness mission prepare-fresh-inputs \
+            --raw-root /archive/raw \
+            --reference-root /archive/reference \
+            --duration-ns 3600000000000 \
+            --cutoff-received-at-ns 1700000060000000000 \
+            --max-candidates 8 \
+            --symbol BTCUSDT \
+            --image-ref registry/research@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            --mission-id fresh-window \
+            --output-prefix campaigns/fresh-window \
+            --bucket-ms 1000 \
+            --label-horizon-buckets 5 \
+            --top-depth 5 \
+            --max-inputs 64 \
+            --max-input-bytes 1000000 \
+            --inventory-out /work/frozen.env \
+            --request-out /output/.fresh-inputs/campaigns/fresh-window/request.json \
+            --campaign-inputs-out /output/campaigns/fresh-window/receipts/campaign-inputs.json \
+            --output-root /output \
+            --materializer /usr/local/bin/cex-materialization-entrypoint.sh \
+            --materializer-work-dir /work/materializer";
         assert!(Cli::try_parse_from(args.split_whitespace()).is_ok());
     }
 

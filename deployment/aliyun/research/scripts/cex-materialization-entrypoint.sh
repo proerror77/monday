@@ -114,6 +114,15 @@ json_string_field() {
   printf '%s\n' "$matches" | sed -n '1p'
 }
 
+json_number_field() {
+  field=$1
+  file=$2
+  matches=$(sed -n "s/^[[:space:]]*\"$field\":[[:space:]]*\([0-9][0-9]*\)[,]*/\1/p" "$file")
+  count=$(printf '%s\n' "$matches" | sed '/^$/d' | wc -l | tr -d ' ')
+  [ "$count" -eq 1 ] || die "expected exactly one numeric $field field in $file, observed $count"
+  printf '%s\n' "$matches" | sed -n '1p'
+}
+
 canonical_relpath() {
   case "$1" in
     ''|/*|*'..'*)
@@ -325,6 +334,8 @@ bucket_ms=
 label_horizon_buckets=
 top_depth=
 output_prefix=
+window_start_received_at_ns=
+window_end_received_at_ns=
 
 INVENTORY=
 RAW_ROOT=
@@ -415,6 +426,8 @@ bucket_ms=$(inventory_get BUCKET_MS)
 label_horizon_buckets=$(inventory_get LABEL_HORIZON_BUCKETS)
 top_depth=$(inventory_get TOP_DEPTH)
 output_prefix=$(inventory_get OUTPUT_PREFIX)
+window_start_received_at_ns=$(inventory_get WINDOW_START_RECEIVED_AT_NS)
+window_end_received_at_ns=$(inventory_get WINDOW_END_RECEIVED_AT_NS)
 raw_segment_count=$(inventory_get RAW_SEGMENT_COUNT)
 reference_count=$(inventory_get REFERENCE_COUNT)
 reference_count=${reference_count:-0}
@@ -451,6 +464,17 @@ case "$reference_count" in
     die "REFERENCE_COUNT must be a non-negative integer"
     ;;
 esac
+if [ -n "$window_start_received_at_ns$window_end_received_at_ns" ]; then
+  case "$window_start_received_at_ns$window_end_received_at_ns" in
+    *[!0-9]*)
+      die "WINDOW_START_RECEIVED_AT_NS and WINDOW_END_RECEIVED_AT_NS must be numeric"
+      ;;
+  esac
+  [ -n "$window_start_received_at_ns" ] && [ -n "$window_end_received_at_ns" ] \
+    || die "fresh inventory window bounds must be provided together"
+  [ "$window_start_received_at_ns" -lt "$window_end_received_at_ns" ] \
+    || die "fresh inventory window start must be before its end"
+fi
 case "$bucket_ms$label_horizon_buckets$top_depth" in
   *[!0-9]*)
     die "BUCKET_MS, LABEL_HORIZON_BUCKETS, and TOP_DEPTH must be numeric"
@@ -540,7 +564,7 @@ fi
   fi
 }
 
-log "schema_version=monday.research_event.v1 component=cex-materialization event=run_start run_id=$run_id mission_id=$mission_id market=$market symbol=$symbol bucket_ms=$bucket_ms label_horizon_buckets=$label_horizon_buckets top_depth=$top_depth raw_segments=$raw_segment_count references=$reference_count source_revision=$source_revision image_ref=$image_ref inventory_sha256=$inventory_sha256 dry_run=$DRY_RUN role=$ROLE shard_index=${SHARD_INDEX:-none} shard_count=${SHARD_COUNT:-none}"
+log "schema_version=monday.research_event.v1 component=cex-materialization event=run_start run_id=$run_id mission_id=$mission_id market=$market symbol=$symbol bucket_ms=$bucket_ms label_horizon_buckets=$label_horizon_buckets top_depth=$top_depth output_window_start=${window_start_received_at_ns:-none} output_window_end=${window_end_received_at_ns:-none} raw_segments=$raw_segment_count references=$reference_count source_revision=$source_revision image_ref=$image_ref inventory_sha256=$inventory_sha256 dry_run=$DRY_RUN role=$ROLE shard_index=${SHARD_INDEX:-none} shard_count=${SHARD_COUNT:-none}"
 
 verify_raw_range() {
   verify_start=$1
@@ -559,6 +583,15 @@ verify_raw_range() {
     [ -n "$manifest_sha" ] || die "RAW_SEGMENT_${i}_MANIFEST_SHA256 is required"
     verified=$(verify_triplet "raw segment $i" "$RAW_ROOT" "$rel" "$sha" "$manifest_sha")
     data=$(printf '%s' "$verified" | awk -F'|' '{print $1}')
+    manifest=$(printf '%s' "$verified" | awk -F'|' '{print $2}')
+    if [ -n "$window_start_received_at_ns" ]; then
+      segment_start=$(json_number_field start_received_at_ns "$manifest")
+      segment_end=$(json_number_field end_received_at_ns "$manifest")
+      [ "$segment_start" -ge "$window_start_received_at_ns" ] \
+        || die "raw segment $i begins before the selected materialization window"
+      [ "$segment_end" -le "$window_end_received_at_ns" ] \
+        || die "raw segment $i ends after the selected materialization window"
+    fi
     printf '%s\n' "$data" >"$STATE_ROOT/raw-segment-$i.path"
     printf '%s\n' "$sha" >"$STATE_ROOT/raw-segment-$i.sha256"
     printf '%s\n' "$manifest_sha" >"$STATE_ROOT/raw-segment-$i.manifest-sha256"

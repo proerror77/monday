@@ -13,7 +13,7 @@ use data::binance_market_tape::{
 use serde::Serialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::{
     fs::{self, File, OpenOptions},
@@ -24,6 +24,56 @@ use std::{
 const USDM_LOB_DATASET: &str = "usdm_perpetual_top100_lob";
 const USDM_LOB_DEPTH_ONLY_STREAM_TYPES: [&str; 1] = ["depth@100ms"];
 const USDM_LOB_HISTORICAL_STREAM_TYPES: [&str; 2] = ["depth@100ms", "bookTicker"];
+pub const FRESH_WINDOW_SELECTION_SCHEMA: &str = "monday.cex_fresh_window_selection.v1";
+const MAX_LATEST_DURATION_NS: u64 = 31 * 24 * 60 * 60 * 1_000_000_000;
+const MAX_LATEST_CANDIDATES: usize = 256;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum FreshWindowMode {
+    Explicit {
+        start_received_at_ns: u64,
+        end_received_at_ns: u64,
+    },
+    Latest {
+        duration_ns: u64,
+        cutoff_received_at_ns: u64,
+        max_candidates: usize,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct FreshWindowRequest {
+    pub raw_root: PathBuf,
+    pub reference_root: PathBuf,
+    pub mode: FreshWindowMode,
+    pub symbol: String,
+    pub source_revision: String,
+    pub image_ref: String,
+    pub mission_id: String,
+    pub output_prefix: String,
+    pub bucket_ms: u64,
+    pub label_horizon_buckets: u64,
+    pub top_depth: usize,
+    pub max_scan_entries: usize,
+    pub max_inputs: usize,
+    pub max_input_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FreshWindowSelection {
+    pub schema_version: String,
+    pub mode: FreshWindowMode,
+    pub selected_start_received_at_ns: u64,
+    pub selected_end_received_at_ns: u64,
+    pub raw: Vec<FrozenInput>,
+    pub references: Vec<FrozenInput>,
+    pub verified_bytes: u64,
+    pub input_fingerprint_sha256: String,
+    pub inventory_eligible: bool,
+    pub materialized_pit_admitted: bool,
+}
 
 pub fn declared_symbols(manifest: &Map<String, Value>) -> Result<Vec<String>> {
     let symbols = manifest
@@ -183,7 +233,7 @@ pub struct InventoryRequest {
     pub max_input_bytes: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct FrozenInput {
     pub relative_path: String,
     pub content_sha256: String,
@@ -337,6 +387,593 @@ fn verify_input(
         start_received_at_ns: start,
         end_received_at_ns: end,
     })
+}
+
+#[derive(Debug, Clone)]
+struct RawWindowCandidate {
+    path: PathBuf,
+    manifest: Map<String, Value>,
+    manifest_sha256: String,
+    contract_key: String,
+    start_received_at_ns: u64,
+    end_received_at_ns: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ReferenceWindowCandidate {
+    path: PathBuf,
+    manifest: Map<String, Value>,
+    manifest_sha256: String,
+    observed_at_ns: u64,
+}
+
+fn raw_contract_key(manifest: &Map<String, Value>) -> Result<String> {
+    let schema = required_string(manifest, "schema", "source manifest")?;
+    let dataset = required_string(manifest, "dataset", "source manifest")?;
+    let shard_id = required_string(manifest, "shard_id", "source manifest")?;
+    let mut symbols = declared_symbols(manifest)?;
+    symbols.sort();
+    let mut stream_types = manifest
+        .get("stream_types")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    stream_types.sort();
+    Ok(serde_json::to_string(&(
+        schema,
+        dataset,
+        shard_id,
+        symbols,
+        stream_types,
+    ))?)
+}
+
+fn validate_fresh_window_request(request: &FreshWindowRequest) -> Result<u64> {
+    let now = u64::try_from(
+        chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .context("fresh window wall clock is out of range")?,
+    )?;
+    let raw_metadata = fs::symlink_metadata(&request.raw_root)?;
+    let reference_metadata = fs::symlink_metadata(&request.reference_root)?;
+    if raw_metadata.file_type().is_symlink()
+        || reference_metadata.file_type().is_symlink()
+        || !raw_metadata.is_dir()
+        || !reference_metadata.is_dir()
+        || request.symbol.is_empty()
+        || !request
+            .symbol
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        || request.source_revision.len() != 40
+        || !request
+            .source_revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || hft_research_manifest::canonical_image_digest(&request.image_ref).is_err()
+        || !request
+            .image_ref
+            .rsplit_once("@sha256:")
+            .is_some_and(|(name, sha)| !name.is_empty() && digest(sha))
+        || !safe_value(&request.image_ref)
+        || !safe_value(&request.mission_id)
+        || !safe_value(&request.output_prefix)
+        || !request
+            .mission_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+        || request.max_scan_entries == 0
+        || request.max_scan_entries > 100_000
+        || request.max_inputs == 0
+        || request.max_inputs > 8192
+        || request.max_input_bytes == 0
+        || request.bucket_ms == 0
+        || request.label_horizon_buckets == 0
+        || request.top_depth == 0
+        || request.output_prefix.contains("..")
+        || Path::new(&request.output_prefix)
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!("invalid fresh window request or budget");
+    }
+    match request.mode {
+        FreshWindowMode::Explicit {
+            start_received_at_ns,
+            end_received_at_ns,
+        } => {
+            if start_received_at_ns >= end_received_at_ns || end_received_at_ns > now {
+                bail!("explicit fresh window is outside the current clock");
+            }
+        }
+        FreshWindowMode::Latest {
+            duration_ns,
+            cutoff_received_at_ns,
+            max_candidates,
+        } => {
+            if duration_ns == 0
+                || duration_ns > MAX_LATEST_DURATION_NS
+                || cutoff_received_at_ns > now
+                || max_candidates == 0
+                || max_candidates > MAX_LATEST_CANDIDATES
+            {
+                bail!("latest fresh window is outside its bounds");
+            }
+        }
+    }
+    Ok(now)
+}
+
+fn scan_raw_window_candidates(
+    request: &FreshWindowRequest,
+    cutoff_received_at_ns: u64,
+) -> Result<Vec<RawWindowCandidate>> {
+    let manifests = files_with_suffix_bounded(
+        &request.raw_root,
+        ".manifest.json",
+        request.max_scan_entries,
+    )?;
+    let mut candidates = Vec::new();
+    for path in manifests {
+        let (manifest, manifest_sha256) = read_manifest(&request.raw_root, &path)?;
+        if manifest.get("market").and_then(Value::as_str) != Some("usdm")
+            || manifest.get("venue").and_then(Value::as_str) != Some("binance")
+            || !manifest
+                .get("schema")
+                .and_then(Value::as_str)
+                .is_some_and(market_tape_schema)
+        {
+            continue;
+        }
+        if !declared_symbols(&manifest)?.contains(&request.symbol) {
+            continue;
+        }
+        let start_received_at_ns = uint(&manifest, "start_received_at_ns")?;
+        let end_received_at_ns = uint(&manifest, "end_received_at_ns")?;
+        if start_received_at_ns > end_received_at_ns {
+            bail!("fresh raw candidate interval is reversed");
+        }
+        if end_received_at_ns > cutoff_received_at_ns {
+            continue;
+        }
+        validate_source_manifest(&manifest)?;
+        let data_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".manifest.json"))
+            .context("fresh raw manifest name is invalid")?;
+        let success = path.with_file_name(format!("{data_name}._SUCCESS"));
+        if !success.try_exists()? {
+            continue;
+        }
+        let contract_key = raw_contract_key(&manifest)?;
+        candidates.push(RawWindowCandidate {
+            path,
+            manifest,
+            manifest_sha256,
+            contract_key,
+            start_received_at_ns,
+            end_received_at_ns,
+        });
+    }
+    candidates.sort_by(|left, right| {
+        (
+            left.end_received_at_ns,
+            left.start_received_at_ns,
+            &left.path,
+        )
+            .cmp(&(
+                right.end_received_at_ns,
+                right.start_received_at_ns,
+                &right.path,
+            ))
+    });
+    Ok(candidates)
+}
+
+fn choose_latest_raw_windows(
+    candidates: &[RawWindowCandidate],
+    duration_ns: u64,
+    max_candidates: usize,
+) -> Result<Vec<(u64, u64, Vec<RawWindowCandidate>)>> {
+    if max_candidates == 0 {
+        bail!("latest fresh window candidate budget is zero");
+    }
+
+    // A manifest's start/end are the first/last received event clocks, not a
+    // promised wall-clock lease. A candidate therefore qualifies by its
+    // observed span; cross-segment checkpoint, stream, and sequence continuity
+    // remains the materializer's final authority.
+    let mut by_contract = BTreeMap::<String, Vec<RawWindowCandidate>>::new();
+    for candidate in candidates {
+        by_contract
+            .entry(candidate.contract_key.clone())
+            .or_default()
+            .push(candidate.clone());
+    }
+
+    let mut windows = Vec::new();
+    for mut ordered in by_contract.into_values() {
+        ordered.sort_by(|left, right| {
+            (
+                left.start_received_at_ns,
+                left.end_received_at_ns,
+                &left.path,
+            )
+                .cmp(&(
+                    right.start_received_at_ns,
+                    right.end_received_at_ns,
+                    &right.path,
+                ))
+        });
+        let mut ends = ordered
+            .iter()
+            .map(|candidate| candidate.end_received_at_ns)
+            .collect::<Vec<_>>();
+        ends.sort_unstable_by(|left, right| right.cmp(left));
+        ends.dedup();
+        for window_end in ends {
+            let window_start = window_end
+                .checked_sub(duration_ns)
+                .context("latest fresh window duration exceeds its clock")?;
+            let mut selected = ordered
+                .iter()
+                .filter(|candidate| {
+                    candidate.start_received_at_ns < window_end
+                        && candidate.end_received_at_ns > window_start
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if selected.is_empty() {
+                continue;
+            }
+            selected.sort_by(|left, right| {
+                (
+                    left.start_received_at_ns,
+                    left.end_received_at_ns,
+                    &left.path,
+                )
+                    .cmp(&(
+                        right.start_received_at_ns,
+                        right.end_received_at_ns,
+                        &right.path,
+                    ))
+            });
+            let observed_start = selected
+                .iter()
+                .map(|candidate| candidate.start_received_at_ns)
+                .min()
+                .context("latest fresh candidate set is empty")?;
+            let observed_end = selected
+                .iter()
+                .map(|candidate| candidate.end_received_at_ns)
+                .max()
+                .context("latest fresh candidate set is empty")?;
+            if observed_start <= window_start && observed_end >= window_end {
+                windows.push((window_start, window_end, selected));
+            }
+        }
+    }
+    windows.sort_by(|left, right| {
+        (right.1, right.0, &right.2[0].path).cmp(&(left.1, left.0, &left.2[0].path))
+    });
+    windows.truncate(max_candidates);
+    Ok(windows)
+}
+
+fn scan_reference_window_candidates(
+    request: &FreshWindowRequest,
+) -> Result<Vec<ReferenceWindowCandidate>> {
+    let manifests = files_with_suffix_bounded(
+        &request.reference_root,
+        ".manifest.json",
+        request.max_scan_entries,
+    )?;
+    let mut candidates = Vec::new();
+    for path in manifests {
+        let (manifest, manifest_sha256) = read_manifest(&request.reference_root, &path)?;
+        if manifest.get("venue").and_then(Value::as_str) != Some("binance_usdm")
+            || manifest.get("dataset").and_then(Value::as_str) != Some("reference")
+        {
+            continue;
+        }
+        let observed = uint(&manifest, "observed_at_ns")?;
+        let data_name = manifest
+            .get("file")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .context("fresh reference manifest file is missing")?;
+        let success = path.with_file_name(format!("{data_name}._SUCCESS"));
+        if !success.try_exists()? {
+            continue;
+        }
+        candidates.push(ReferenceWindowCandidate {
+            path,
+            manifest,
+            manifest_sha256,
+            observed_at_ns: observed,
+        });
+    }
+    candidates.sort_by(|left, right| {
+        (left.observed_at_ns, &left.path).cmp(&(right.observed_at_ns, &right.path))
+    });
+    Ok(candidates)
+}
+
+fn verify_reference_window_candidate(
+    request: &FreshWindowRequest,
+    candidate: &ReferenceWindowCandidate,
+    remaining_bytes: &mut u64,
+    cache: &mut BTreeMap<PathBuf, Option<FrozenInput>>,
+) -> Result<Option<FrozenInput>> {
+    if let Some(cached) = cache.get(&candidate.path) {
+        return Ok(cached.clone());
+    }
+    let input = verify_input(
+        &request.reference_root,
+        &candidate.path,
+        &candidate.manifest,
+        candidate.manifest_sha256.clone(),
+        candidate.observed_at_ns,
+        candidate.observed_at_ns,
+        remaining_bytes,
+    )?;
+    let data_path = request.reference_root.join(&input.relative_path);
+    let data_name = data_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("fresh reference data name is not UTF-8")?;
+    let artifact = PublishedReferenceArtifact {
+        data_path: data_path.clone(),
+        manifest_path: candidate.path.clone(),
+        success_path: data_path.with_file_name(format!("{data_name}._SUCCESS")),
+        data_sha256: input.content_sha256.clone(),
+        manifest_sha256: input.manifest_sha256.clone(),
+    };
+    let batch = verify_reference_artifact_read_only_current_batch(
+        &artifact,
+        &input.content_sha256,
+        &input.manifest_sha256,
+    )?;
+    let selected = batch
+        .contracts()
+        .iter()
+        .any(|contract| contract.symbol == request.symbol)
+        .then_some(input);
+    cache.insert(candidate.path.clone(), selected.clone());
+    Ok(selected)
+}
+
+fn references_for_window(
+    request: &FreshWindowRequest,
+    window_start: u64,
+    window_end: u64,
+    candidates: &[ReferenceWindowCandidate],
+    remaining_bytes: &mut u64,
+    cache: &mut BTreeMap<PathBuf, Option<FrozenInput>>,
+) -> Result<Option<Vec<FrozenInput>>> {
+    let horizon_ns = request
+        .bucket_ms
+        .checked_mul(request.label_horizon_buckets)
+        .and_then(|millis| millis.checked_mul(1_000_000))
+        .context("fresh reference horizon overflows")?;
+    let reference_tail = window_end
+        .checked_add(horizon_ns)
+        .and_then(|end| end.checked_add(hft_research_manifest::CEX_DERIVATIVES_MAX_GAP_NS))
+        .context("fresh reference tail overflows")?;
+    let reference_start =
+        window_start.saturating_sub(hft_research_manifest::CEX_DERIVATIVES_MAX_GAP_NS);
+    let mut references = Vec::new();
+    for candidate in candidates {
+        if candidate.observed_at_ns < reference_start || candidate.observed_at_ns > reference_tail {
+            continue;
+        }
+        if let Some(input) =
+            verify_reference_window_candidate(request, candidate, remaining_bytes, cache)?
+        {
+            references.push(input);
+        }
+    }
+    references.sort_by(|left, right| {
+        (left.start_received_at_ns, &left.relative_path)
+            .cmp(&(right.start_received_at_ns, &right.relative_path))
+    });
+    if references.is_empty() {
+        return Ok(None);
+    }
+    let earliest = references.first().unwrap().start_received_at_ns;
+    let latest = references.last().unwrap().end_received_at_ns;
+    let gap = hft_research_manifest::CEX_DERIVATIVES_MAX_GAP_NS;
+    if earliest > window_start.saturating_add(gap) || latest < window_end.saturating_sub(gap) {
+        return Ok(None);
+    }
+    Ok(Some(references))
+}
+
+pub fn select_fresh_window(request: &FreshWindowRequest) -> Result<FreshWindowSelection> {
+    let now = validate_fresh_window_request(request)?;
+    match request.mode {
+        FreshWindowMode::Explicit {
+            start_received_at_ns,
+            end_received_at_ns,
+        } => {
+            let frozen = freeze_inventory(&InventoryRequest {
+                raw_root: request.raw_root.clone(),
+                reference_root: request.reference_root.clone(),
+                start_received_at_ns,
+                end_received_at_ns,
+                symbol: request.symbol.clone(),
+                source_revision: request.source_revision.clone(),
+                image_ref: request.image_ref.clone(),
+                mission_id: request.mission_id.clone(),
+                output_prefix: request.output_prefix.clone(),
+                bucket_ms: request.bucket_ms,
+                label_horizon_buckets: request.label_horizon_buckets,
+                top_depth: request.top_depth,
+                max_scan_entries: request.max_scan_entries,
+                max_inputs: request.max_inputs,
+                max_input_bytes: request.max_input_bytes,
+            })?;
+            return Ok(FreshWindowSelection {
+                schema_version: FRESH_WINDOW_SELECTION_SCHEMA.to_string(),
+                mode: request.mode.clone(),
+                selected_start_received_at_ns: start_received_at_ns,
+                selected_end_received_at_ns: end_received_at_ns,
+                raw: frozen.raw,
+                references: frozen.references,
+                verified_bytes: frozen.verified_bytes,
+                input_fingerprint_sha256: frozen.input_fingerprint_sha256,
+                inventory_eligible: true,
+                materialized_pit_admitted: false,
+            });
+        }
+        FreshWindowMode::Latest {
+            duration_ns,
+            cutoff_received_at_ns,
+            max_candidates,
+        } => {
+            if cutoff_received_at_ns > now {
+                bail!("latest fresh window cutoff is in the future");
+            }
+            let candidates = scan_raw_window_candidates(request, cutoff_received_at_ns)?;
+            let windows = choose_latest_raw_windows(&candidates, duration_ns, max_candidates)?;
+            if windows.is_empty() {
+                bail!("no complete latest fresh window covers the requested duration");
+            }
+            let reference_candidates = scan_reference_window_candidates(request)?;
+            let mut remaining_bytes = request.max_input_bytes;
+            let mut reference_cache = BTreeMap::new();
+            for (_requested_start, _requested_end, selected_candidates) in windows {
+                let observed_start = selected_candidates
+                    .iter()
+                    .map(|candidate| candidate.start_received_at_ns)
+                    .min()
+                    .context("latest fresh candidate set is empty")?;
+                let observed_end = selected_candidates
+                    .iter()
+                    .map(|candidate| candidate.end_received_at_ns)
+                    .max()
+                    .context("latest fresh candidate set is empty")?;
+                let Some(references) = references_for_window(
+                    request,
+                    observed_start,
+                    observed_end,
+                    &reference_candidates,
+                    &mut remaining_bytes,
+                    &mut reference_cache,
+                )?
+                else {
+                    // A newer raw interval can be sealed yet lack the
+                    // point-in-time reference tail. Keep searching the
+                    // already-scanned candidates for the newest eligible
+                    // interval; corrupt selected triplets still fail closed.
+                    continue;
+                };
+                if selected_candidates.len() + references.len() > request.max_inputs {
+                    continue;
+                }
+                let mut raw = Vec::with_capacity(selected_candidates.len());
+                for candidate in selected_candidates {
+                    raw.push(verify_input(
+                        &request.raw_root,
+                        &candidate.path,
+                        &candidate.manifest,
+                        candidate.manifest_sha256,
+                        candidate.start_received_at_ns,
+                        candidate.end_received_at_ns,
+                        &mut remaining_bytes,
+                    )?);
+                }
+                let verified_bytes = request.max_input_bytes - remaining_bytes;
+                let input_fingerprint_sha256 =
+                    selection_fingerprint_from_inputs(&raw, &references)?;
+                return Ok(FreshWindowSelection {
+                    schema_version: FRESH_WINDOW_SELECTION_SCHEMA.to_string(),
+                    mode: request.mode.clone(),
+                    selected_start_received_at_ns: observed_start,
+                    selected_end_received_at_ns: observed_end,
+                    raw,
+                    references,
+                    verified_bytes,
+                    input_fingerprint_sha256,
+                    inventory_eligible: true,
+                    materialized_pit_admitted: false,
+                });
+            }
+            bail!("no latest fresh window has eligible reference coverage")
+        }
+    }
+}
+
+pub fn freeze_inventory_from_selection(
+    request: &InventoryRequest,
+    selection: &FreshWindowSelection,
+) -> Result<FrozenInventory> {
+    if selection.schema_version != FRESH_WINDOW_SELECTION_SCHEMA
+        || !selection.inventory_eligible
+        || selection.materialized_pit_admitted
+        || selection.raw.is_empty()
+        || selection.references.is_empty()
+        || request.start_received_at_ns != selection.selected_start_received_at_ns
+        || request.end_received_at_ns != selection.selected_end_received_at_ns
+    {
+        bail!("fresh window selection is invalid for inventory materialization");
+    }
+    let total = selection
+        .raw
+        .len()
+        .checked_add(selection.references.len())
+        .context("fresh window selection input count overflowed")?;
+    if total > request.max_inputs {
+        bail!("fresh window selection input count budget exceeded");
+    }
+    let verified_bytes = selection
+        .raw
+        .iter()
+        .chain(&selection.references)
+        .try_fold(0_u64, |total, input| total.checked_add(input.bytes))
+        .context("fresh window selection byte count overflowed")?;
+    if verified_bytes != selection.verified_bytes || verified_bytes > request.max_input_bytes {
+        bail!("fresh window selection input byte budget exceeded");
+    }
+    if selection_fingerprint_from_inputs(&selection.raw, &selection.references)?
+        != selection.input_fingerprint_sha256
+    {
+        bail!("fresh window selection fingerprint differs from its inputs");
+    }
+    for input in selection.raw.iter().chain(&selection.references) {
+        if input.relative_path.is_empty()
+            || Path::new(&input.relative_path).is_absolute()
+            || Path::new(&input.relative_path)
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            || input.bytes == 0
+            || input.start_received_at_ns > input.end_received_at_ns
+            || !digest(&input.content_sha256)
+            || !digest(&input.manifest_sha256)
+        {
+            bail!("fresh window selection contains an invalid input identity");
+        }
+    }
+    if selection.raw.iter().any(|input| {
+        input.start_received_at_ns < request.start_received_at_ns
+            || input.end_received_at_ns > request.end_received_at_ns
+    }) {
+        bail!("fresh window selection raw input exceeds its selected window");
+    }
+    build_frozen_inventory(
+        request,
+        selection.raw.clone(),
+        selection.references.clone(),
+        selection.verified_bytes,
+        selection.input_fingerprint_sha256.clone(),
+    )
 }
 
 pub fn freeze_inventory(request: &InventoryRequest) -> Result<FrozenInventory> {
@@ -522,9 +1159,23 @@ pub fn freeze_inventory(request: &InventoryRequest) -> Result<FrozenInventory> {
     if references.is_empty() {
         bail!("no eligible reference seed for the selected USD-M input");
     }
+    let fingerprint = selection_fingerprint_from_inputs(&raw, &references)?;
+    build_frozen_inventory(
+        request,
+        raw,
+        references,
+        request.max_input_bytes - remaining_bytes,
+        fingerprint,
+    )
+}
+
+fn selection_fingerprint_from_inputs(
+    raw: &[FrozenInput],
+    references: &[FrozenInput],
+) -> Result<String> {
     let identities: Vec<_> = raw
         .iter()
-        .chain(&references)
+        .chain(references)
         .map(|input| {
             (
                 &input.relative_path,
@@ -542,8 +1193,22 @@ pub fn freeze_inventory(request: &InventoryRequest) -> Result<FrozenInventory> {
     {
         bail!("duplicate source content in frozen inventory");
     }
-    let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&identities)?));
-    let mut env = format!("SOURCE_REVISION={}\nIMAGE_REF={}\nMISSION_ID={}\nMARKET=usdm\nSYMBOL={}\nBUCKET_MS={}\nLABEL_HORIZON_BUCKETS={}\nTOP_DEPTH={}\nOUTPUT_PREFIX={}\nRAW_SEGMENT_COUNT={}\n", request.source_revision, request.image_ref, request.mission_id, request.symbol, request.bucket_ms, request.label_horizon_buckets, request.top_depth, request.output_prefix, raw.len());
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(
+        &identities,
+    )?)))
+}
+
+fn build_frozen_inventory(
+    request: &InventoryRequest,
+    raw: Vec<FrozenInput>,
+    references: Vec<FrozenInput>,
+    verified_bytes: u64,
+    fingerprint: String,
+) -> Result<FrozenInventory> {
+    if raw.is_empty() || references.is_empty() {
+        bail!("frozen inventory requires raw and reference inputs");
+    }
+    let mut env = format!("SOURCE_REVISION={}\nIMAGE_REF={}\nMISSION_ID={}\nMARKET=usdm\nSYMBOL={}\nBUCKET_MS={}\nLABEL_HORIZON_BUCKETS={}\nTOP_DEPTH={}\nOUTPUT_PREFIX={}\nWINDOW_START_RECEIVED_AT_NS={}\nWINDOW_END_RECEIVED_AT_NS={}\nRAW_SEGMENT_COUNT={}\n", request.source_revision, request.image_ref, request.mission_id, request.symbol, request.bucket_ms, request.label_horizon_buckets, request.top_depth, request.output_prefix, request.start_received_at_ns, request.end_received_at_ns, raw.len());
     for (prefix, inputs) in [("RAW_SEGMENT", &raw), ("REFERENCE", &references)] {
         if prefix == "REFERENCE" {
             env.push_str(&format!("REFERENCE_COUNT={}\n", inputs.len()));
@@ -561,7 +1226,7 @@ pub fn freeze_inventory(request: &InventoryRequest) -> Result<FrozenInventory> {
         input_fingerprint_sha256: fingerprint,
         raw,
         references,
-        verified_bytes: request.max_input_bytes - remaining_bytes,
+        verified_bytes,
         requires_pit_admission: true,
         inventory_env: env,
     })
@@ -740,6 +1405,45 @@ mod tests {
         .unwrap();
     }
 
+    fn extra_raw(request: &InventoryRequest, name: &str, start: u64, end: u64) {
+        let data = format!("raw segment {name} {start} {end}").into_bytes();
+        let data_sha = hex::encode(Sha256::digest(&data));
+        let data_name = format!("{name}.jsonl.zst");
+        let data_path = request.raw_root.join(&data_name);
+        fs::write(&data_path, &data).unwrap();
+        fs::write(
+            request.raw_root.join(format!("{data_name}._SUCCESS")),
+            format!("{data_sha}\n"),
+        )
+        .unwrap();
+        let manifest = json!({
+            "schema": MARKET_TAPE_SCHEMA_V2,
+            "venue": "binance",
+            "market": "usdm",
+            "dataset": USDM_LOB_DATASET,
+            "shard_id": "test",
+            "date": "2023-11-14",
+            "hour": "22",
+            "symbols": ["BTCUSDT"],
+            "stream_types": ["depth@100ms"],
+            "has_replay_safe_checkpoint": true,
+            "all_symbols_bridged": true,
+            "all_stream_coverage_verified": true,
+            "venue_depth_complete": false,
+            "snapshot_limit": 100,
+            "start_received_at_ns": start,
+            "end_received_at_ns": end,
+            "file": data_name,
+            "bytes": data.len(),
+            "sha256": data_sha,
+        });
+        fs::write(
+            request.raw_root.join(format!("{data_name}.manifest.json")),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn freeze_keeps_reference_tail_for_label_availability() {
         let (_directory, request) = fixture();
@@ -838,6 +1542,166 @@ mod tests {
             first.input_fingerprint_sha256
         );
         assert_ne!(changed.inventory_sha256, first.inventory_sha256);
+    }
+
+    #[test]
+    fn latest_selection_uses_metadata_time_and_skips_unsealed_tail() {
+        let (_directory, request) = fixture();
+        extra_raw(
+            &request,
+            "z-part-2",
+            RECEIVED_NS + 1_000,
+            RECEIVED_NS + 2_000,
+        );
+        extra_raw(
+            &request,
+            "a-part-3",
+            RECEIVED_NS + 2_000,
+            RECEIVED_NS + 3_000,
+        );
+        let unsealed = request.raw_root.join("a-part-3.jsonl.zst._SUCCESS");
+        fs::remove_file(unsealed).unwrap();
+        let selection = select_fresh_window(&FreshWindowRequest {
+            raw_root: request.raw_root.clone(),
+            reference_root: request.reference_root.clone(),
+            mode: FreshWindowMode::Latest {
+                duration_ns: 1_500,
+                cutoff_received_at_ns: RECEIVED_NS + 3_000,
+                max_candidates: 4,
+            },
+            symbol: request.symbol.clone(),
+            source_revision: request.source_revision.clone(),
+            image_ref: request.image_ref.clone(),
+            mission_id: request.mission_id.clone(),
+            output_prefix: request.output_prefix.clone(),
+            bucket_ms: request.bucket_ms,
+            label_horizon_buckets: request.label_horizon_buckets,
+            top_depth: request.top_depth,
+            max_scan_entries: request.max_scan_entries,
+            max_inputs: request.max_inputs,
+            max_input_bytes: request.max_input_bytes,
+        })
+        .unwrap();
+        assert_eq!(selection.selected_end_received_at_ns, RECEIVED_NS + 2_000);
+        assert_eq!(selection.raw.len(), 2);
+        assert!(selection.inventory_eligible);
+        assert!(!selection.materialized_pit_admitted);
+    }
+
+    #[test]
+    fn latest_selection_allows_one_sealed_segment_to_cover_the_window() {
+        let (_directory, request) = fixture();
+        let selection = select_fresh_window(&FreshWindowRequest {
+            raw_root: request.raw_root.clone(),
+            reference_root: request.reference_root.clone(),
+            mode: FreshWindowMode::Latest {
+                duration_ns: 500,
+                cutoff_received_at_ns: RECEIVED_NS + 1_000,
+                max_candidates: 4,
+            },
+            symbol: request.symbol.clone(),
+            source_revision: request.source_revision.clone(),
+            image_ref: request.image_ref.clone(),
+            mission_id: request.mission_id.clone(),
+            output_prefix: request.output_prefix.clone(),
+            bucket_ms: request.bucket_ms,
+            label_horizon_buckets: request.label_horizon_buckets,
+            top_depth: request.top_depth,
+            max_scan_entries: request.max_scan_entries,
+            max_inputs: request.max_inputs,
+            max_input_bytes: request.max_input_bytes,
+        })
+        .unwrap();
+        assert_eq!(selection.raw.len(), 1);
+        assert_eq!(selection.selected_start_received_at_ns, RECEIVED_NS + 200);
+        assert_eq!(selection.selected_end_received_at_ns, RECEIVED_NS + 1_000);
+    }
+
+    #[test]
+    fn latest_selection_uses_manifest_span_without_fabricating_event_continuity() {
+        let (_directory, request) = fixture();
+        extra_raw(&request, "gapped", RECEIVED_NS + 2_000, RECEIVED_NS + 3_000);
+        let selection = select_fresh_window(&FreshWindowRequest {
+            raw_root: request.raw_root.clone(),
+            reference_root: request.reference_root.clone(),
+            mode: FreshWindowMode::Latest {
+                duration_ns: 2_500,
+                cutoff_received_at_ns: RECEIVED_NS + 3_000,
+                max_candidates: 4,
+            },
+            symbol: request.symbol.clone(),
+            source_revision: request.source_revision.clone(),
+            image_ref: request.image_ref.clone(),
+            mission_id: request.mission_id.clone(),
+            output_prefix: request.output_prefix.clone(),
+            bucket_ms: request.bucket_ms,
+            label_horizon_buckets: request.label_horizon_buckets,
+            top_depth: request.top_depth,
+            max_scan_entries: request.max_scan_entries,
+            max_inputs: request.max_inputs,
+            max_input_bytes: request.max_input_bytes,
+        })
+        .unwrap();
+        assert_eq!(selection.raw.len(), 2);
+        assert_eq!(selection.selected_start_received_at_ns, RECEIVED_NS + 200);
+        assert_eq!(selection.selected_end_received_at_ns, RECEIVED_NS + 3_000);
+    }
+
+    #[test]
+    fn latest_selection_falls_back_to_an_older_window_when_newer_refs_are_missing() {
+        let (_directory, request) = fixture();
+        let newer_start = RECEIVED_NS + 200_000_000_000;
+        extra_raw(&request, "newer", newer_start, newer_start + 3_000);
+        let selection = select_fresh_window(&FreshWindowRequest {
+            raw_root: request.raw_root.clone(),
+            reference_root: request.reference_root.clone(),
+            mode: FreshWindowMode::Latest {
+                duration_ns: 500,
+                cutoff_received_at_ns: newer_start + 3_000,
+                max_candidates: 8,
+            },
+            symbol: request.symbol.clone(),
+            source_revision: request.source_revision.clone(),
+            image_ref: request.image_ref.clone(),
+            mission_id: request.mission_id.clone(),
+            output_prefix: request.output_prefix.clone(),
+            bucket_ms: request.bucket_ms,
+            label_horizon_buckets: request.label_horizon_buckets,
+            top_depth: request.top_depth,
+            max_scan_entries: request.max_scan_entries,
+            max_inputs: request.max_inputs,
+            max_input_bytes: request.max_input_bytes,
+        })
+        .unwrap();
+        assert_eq!(selection.selected_end_received_at_ns, RECEIVED_NS + 1_000);
+        assert_eq!(selection.raw.len(), 1);
+    }
+
+    #[test]
+    fn latest_selection_rejects_incomplete_duration_and_budget() {
+        let (_directory, request) = fixture();
+        let latest = |duration_ns, max_input_bytes| FreshWindowRequest {
+            raw_root: request.raw_root.clone(),
+            reference_root: request.reference_root.clone(),
+            mode: FreshWindowMode::Latest {
+                duration_ns,
+                cutoff_received_at_ns: RECEIVED_NS + 2_000,
+                max_candidates: 4,
+            },
+            symbol: request.symbol.clone(),
+            source_revision: request.source_revision.clone(),
+            image_ref: request.image_ref.clone(),
+            mission_id: request.mission_id.clone(),
+            output_prefix: request.output_prefix.clone(),
+            bucket_ms: request.bucket_ms,
+            label_horizon_buckets: request.label_horizon_buckets,
+            top_depth: request.top_depth,
+            max_scan_entries: request.max_scan_entries,
+            max_inputs: request.max_inputs,
+            max_input_bytes,
+        };
+        assert!(select_fresh_window(&latest(2_000, 1_000_000)).is_err());
+        assert!(select_fresh_window(&latest(1, 1)).is_err());
     }
 
     #[test]

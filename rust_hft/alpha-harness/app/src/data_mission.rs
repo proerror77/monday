@@ -1128,17 +1128,19 @@ pub fn default_manifest_path(manifest: &DatasetManifest) -> std::path::PathBuf {
 }
 
 /// Prepare immutable input selection for the existing materialization entrypoint.
-pub fn freeze_research_inventory(args: crate::cli::FreezeInventoryArgs) -> anyhow::Result<()> {
+pub(crate) fn freeze_research_inventory_request(
+    args: &crate::cli::FreezeInventoryArgs,
+) -> anyhow::Result<hft_collector::research_inventory::FrozenInventory> {
     let request = hft_collector::research_inventory::InventoryRequest {
-        raw_root: args.raw_root,
-        reference_root: args.reference_root,
+        raw_root: args.raw_root.clone(),
+        reference_root: args.reference_root.clone(),
         start_received_at_ns: args.start_received_at_ns,
         end_received_at_ns: args.end_received_at_ns,
-        symbol: args.symbol,
+        symbol: args.symbol.clone(),
         source_revision: crate::cli::BUILD_SOURCE_REVISION.to_string(),
-        image_ref: args.image_ref,
-        mission_id: args.mission_id,
-        output_prefix: args.output_prefix,
+        image_ref: args.image_ref.clone(),
+        mission_id: args.mission_id.clone(),
+        output_prefix: args.output_prefix.clone(),
         bucket_ms: args.bucket_ms,
         label_horizon_buckets: args.label_horizon_buckets,
         top_depth: args.top_depth,
@@ -1146,7 +1148,12 @@ pub fn freeze_research_inventory(args: crate::cli::FreezeInventoryArgs) -> anyho
         max_inputs: args.max_inputs,
         max_input_bytes: args.max_input_bytes,
     };
-    let inventory = hft_collector::research_inventory::freeze_inventory(&request)?;
+    hft_collector::research_inventory::freeze_inventory(&request)
+}
+
+/// Prepare immutable input selection for the existing materialization entrypoint.
+pub fn freeze_research_inventory(args: crate::cli::FreezeInventoryArgs) -> anyhow::Result<()> {
+    let inventory = freeze_research_inventory_request(&args)?;
     let mut output = temporary_output_file(&args.output, ".frozen-inventory-")?;
     output
         .as_file_mut()

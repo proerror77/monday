@@ -48,6 +48,54 @@ increment() {
 }
 
 case "$1 $2" in
+  "mission prepare-fresh-inputs")
+    report="$(value_after --report-out "$@")"
+    campaign_inputs="$(value_after --campaign-inputs-out "$@")"
+    output_root="$(value_after --output-root "$@")"
+    output_prefix="$(value_after --output-prefix "$@")"
+    symbol="$(value_after --symbol "$@")"
+    mission_id="$(value_after --mission-id "$@")"
+    request_out="$(value_after --request-out "$@")"
+    mkdir -p "$(dirname "$campaign_inputs")" "$(dirname "$report")"
+    mkdir -p "$(dirname "$request_out")"
+    if [[ ! -e "$report" ]]; then
+      increment "$FAKE_STATE/fresh-preparation-count"
+    fi
+    printf '{}\n' >"$campaign_inputs"
+    inventory_out="$(value_after --inventory-out "$@")"
+    printf 'RUN_ID=inventory-fresh\n' >"$inventory_out"
+    printf '{}\n' >"$request_out"
+    campaign_inputs_sha256="$(sha_file "$campaign_inputs")"
+    run_root="$output_root/$output_prefix"
+    jq -n \
+      --arg source_revision "$FAKE_SOURCE_REVISION" \
+      --arg image_ref "$(value_after --image-ref "$@")" \
+      --arg symbol "$symbol" \
+      --arg mission_id "$mission_id" \
+      --arg output_prefix "$output_prefix" \
+      --arg run_root "$run_root" \
+      --arg campaign_inputs "$campaign_inputs" \
+      --arg request_path "$request_out" \
+      --arg request_sha256 "$(sha_file "$request_out")" \
+      --arg inventory_sha256 "$(sha_file "$inventory_out")" \
+      --arg campaign_inputs_sha256 "$campaign_inputs_sha256" \
+      '{
+        schema_version:"monday.cex_fresh_inputs_preparation.v1",
+        status:"ready",source_revision:$source_revision,image_ref:$image_ref,
+        symbol:$symbol,mission_id:$mission_id,
+        start_received_at_ns:1,end_received_at_ns:2,
+        max_inputs:4,max_input_bytes:1000000,
+        input_root:$run_root,run_root:$run_root,output_prefix:$output_prefix,
+        inventory_path:"inventory.env",request_path:$request_path,
+        request_sha256:$request_sha256,campaign_inputs_path:$campaign_inputs,
+        inventory_sha256:$inventory_sha256,input_fingerprint_sha256:("b" * 64),
+        campaign_inputs_sha256:$campaign_inputs_sha256,
+        materialization_receipt_sha256:("c" * 64),
+        feature_sha256:("d" * 64),materialization_sha256:("e" * 64),
+        replay_artifact_sha256:("f" * 64),replay_manifest_sha256:("0" * 64)
+      }' >"$report"
+    printf '{"status":"ready","reused_existing":true}\n'
+    ;;
   "mission campaign-freeze")
     output="$(value_after --output "$@")"
     generation=0
@@ -382,6 +430,7 @@ printf '%s\n' "${FAKE_UNAME:-Linux}"
 EOF
 
 chmod +x "$bin/alpha-harness" "$bin/signer" "$bin/kubectl" "$bin/aliyun" "$bin/uname" "$bin/rm" "$bin/mv"
+printf '{}\n' >"$bin/control"
 export PATH="$bin:$PATH"
 
 controller="$(cd "$(dirname "$0")" && pwd)/scripts/campaign-cycle-controller.sh"
@@ -750,4 +799,195 @@ for scenario in \
   recovery_case "${scenario_args[@]}"
 done
 [[ "$selected_recovery" == true ]]
+
+fresh_case_root="$root/fresh-inputs"
+fresh_cycle="$fresh_case_root/cycle"
+fresh_output="$fresh_case_root/output"
+mkdir -p "$fresh_case_root/raw" "$fresh_case_root/reference" "$fresh_output"
+export FAKE_SOURCE_REVISION="$source_revision"
+fresh_args=(
+  start
+  --alpha-harness "$bin/alpha-harness"
+  --aliyun "$bin/aliyun"
+  --kubectl "$bin/kubectl"
+  --fresh-inputs
+  --fresh-raw-root "$fresh_case_root/raw"
+  --fresh-reference-root "$fresh_case_root/reference"
+  --fresh-start-received-at-ns 1700000000000000000
+  --fresh-end-received-at-ns 1700000060000000000
+  --fresh-symbol BTCUSDT
+  --fresh-image-ref "registry.example/research@sha256:$image_digest"
+  --fresh-mission-id fresh-window
+  --fresh-output-root "$fresh_output"
+  --fresh-output-prefix campaign-inputs/fresh-window
+  --fresh-bucket-ms 1000
+  --fresh-label-horizon-buckets 5
+  --fresh-top-depth 5
+  --fresh-materializer "$bin/signer"
+  --fresh-max-scan-entries 100
+  --fresh-max-inputs 4
+  --fresh-max-input-bytes 1000000
+  --fresh-materializer-timeout-seconds 10
+  --fresh-max-materializer-output-bytes 1024
+  --source-revision "$source_revision"
+  --image "registry.example/research@sha256:$image_digest"
+  --campaign-root https://bucket.oss-ap-northeast-1-internal.aliyuncs.com/research/campaigns
+  --work-dir "$fresh_cycle"
+  --seed 7 --seed 11
+  --max-follow-ups 1
+)
+fresh_dispatch_before="$(<"$FAKE_STATE/dispatch-count")"
+if ! FAKE_UNAME=Darwin "$controller" "${fresh_args[@]}" \
+  >"$root/fresh-needs-authority.stdout" 2>"$root/fresh-needs-authority.stderr"; then
+  cat "$root/fresh-needs-authority.stderr" >&2
+  exit 1
+fi
+jq -e '
+  .status == "needs_authority"
+  and .reason == "signer_missing"
+  and .resume_ready == true
+' "$fresh_cycle/needs-authority.json" >/dev/null
+test "$(<"$FAKE_STATE/fresh-preparation-count")" == 1
+test "$(<"$FAKE_STATE/dispatch-count")" == "$fresh_dispatch_before"
+test ! -e "$fresh_cycle/generation-0"
+grep -Fq 'event=needs_authority stage=fresh_inputs reason=signer_missing' \
+  "$root/fresh-needs-authority.stderr"
+
+if ! FAKE_UNAME=Darwin "$controller" "${fresh_args[@]}" \
+  >"$root/fresh-restart.stdout" 2>"$root/fresh-restart.stderr"; then
+  cat "$root/fresh-restart.stderr" >&2
+  exit 1
+fi
+test "$(<"$FAKE_STATE/fresh-preparation-count")" == 1
+test "$(<"$FAKE_STATE/dispatch-count")" == "$fresh_dispatch_before"
+
+if ! FAKE_UNAME=Darwin "$controller" approve \
+  --alpha-harness "$bin/alpha-harness" \
+  --aliyun "$bin/aliyun" \
+  --kubectl "$bin/kubectl" \
+  --signer "$bin/signer" \
+  --control "$bin/control" \
+  --work-dir "$fresh_cycle" \
+  >"$root/fresh-approve.stdout" 2>"$root/fresh-approve.stderr"; then
+  cat "$root/fresh-approve.stderr" >&2
+  exit 1
+fi
+test "$(<"$FAKE_STATE/fresh-preparation-count")" == 1
+test "$(<"$FAKE_STATE/dispatch-count")" == "$((fresh_dispatch_before + 1))"
+grep -Fq 'event=stage_completed generation=0 stage=ack_handoff' "$root/fresh-approve.stderr"
+
+fresh_latest_case_root="$root/fresh-latest-inputs"
+fresh_latest_cycle="$fresh_latest_case_root/cycle"
+fresh_latest_output="$fresh_latest_case_root/output"
+mkdir -p "$fresh_latest_case_root/raw" "$fresh_latest_case_root/reference" "$fresh_latest_output"
+fresh_latest_args=(
+  start
+  --alpha-harness "$bin/alpha-harness"
+  --aliyun "$bin/aliyun"
+  --kubectl "$bin/kubectl"
+  --fresh-inputs
+  --fresh-raw-root "$fresh_latest_case_root/raw"
+  --fresh-reference-root "$fresh_latest_case_root/reference"
+  --fresh-duration-ns 5000
+  --fresh-cutoff-received-at-ns 1700000060000000000
+  --fresh-max-candidates 8
+  --fresh-symbol BTCUSDT
+  --fresh-image-ref "registry.example/research@sha256:$image_digest"
+  --fresh-mission-id fresh-latest-window
+  --fresh-output-root "$fresh_latest_output"
+  --fresh-output-prefix campaign-inputs/fresh-latest-window
+  --fresh-bucket-ms 1000
+  --fresh-label-horizon-buckets 5
+  --fresh-top-depth 5
+  --fresh-materializer "$bin/signer"
+  --fresh-max-scan-entries 100
+  --fresh-max-inputs 4
+  --fresh-max-input-bytes 1000000
+  --fresh-materializer-timeout-seconds 10
+  --fresh-max-materializer-output-bytes 1024
+  --source-revision "$source_revision"
+  --image "registry.example/research@sha256:$image_digest"
+  --campaign-root https://bucket.oss-ap-northeast-1-internal.aliyuncs.com/research/campaigns
+  --work-dir "$fresh_latest_cycle"
+  --seed 7 --seed 11
+  --max-follow-ups 1
+)
+latest_dispatch_before="$(<"$FAKE_STATE/dispatch-count")"
+if ! FAKE_UNAME=Darwin "$controller" "${fresh_latest_args[@]}" \
+  >"$root/fresh-latest-needs-authority.stdout" 2>"$root/fresh-latest-needs-authority.stderr"; then
+  cat "$root/fresh-latest-needs-authority.stderr" >&2
+  exit 1
+fi
+jq -e \
+  '.input_mode == "fresh"
+   and .fresh.duration_ns == "5000"
+   and .fresh.cutoff_received_at_ns == "1700000060000000000"
+   and .fresh.max_candidates == "8"' \
+  "$fresh_latest_cycle/controller-inputs.json" >/dev/null
+test "$(<"$FAKE_STATE/dispatch-count")" == "$latest_dispatch_before"
+test "$(<"$FAKE_STATE/fresh-preparation-count")" == 2
+
+fresh_control_cycle="$fresh_case_root/control-cycle"
+fresh_control_output="$fresh_case_root/control-output"
+mkdir -p "$fresh_case_root/control-raw" "$fresh_case_root/control-reference" "$fresh_control_output"
+fresh_control_args=(
+  start
+  --alpha-harness "$bin/alpha-harness"
+  --aliyun "$bin/aliyun"
+  --kubectl "$bin/kubectl"
+  --fresh-inputs
+  --fresh-raw-root "$fresh_case_root/control-raw"
+  --fresh-reference-root "$fresh_case_root/control-reference"
+  --fresh-start-received-at-ns 1700000000000000000
+  --fresh-end-received-at-ns 1700000060000000000
+  --fresh-symbol BTCUSDT
+  --fresh-image-ref "registry.example/research@sha256:$image_digest"
+  --fresh-mission-id fresh-control-window
+  --fresh-output-root "$fresh_control_output"
+  --fresh-output-prefix campaign-inputs/fresh-control-window
+  --fresh-bucket-ms 1000
+  --fresh-label-horizon-buckets 5
+  --fresh-top-depth 5
+  --fresh-materializer "$bin/signer"
+  --fresh-max-scan-entries 100
+  --fresh-max-inputs 4
+  --fresh-max-input-bytes 1000000
+  --fresh-materializer-timeout-seconds 10
+  --fresh-max-materializer-output-bytes 1024
+  --source-revision "$source_revision"
+  --image "registry.example/research@sha256:$image_digest"
+  --campaign-root https://bucket.oss-ap-northeast-1-internal.aliyuncs.com/research/campaigns
+  --signer "$bin/signer"
+  --work-dir "$fresh_control_cycle"
+  --seed 7 --seed 11
+  --max-follow-ups 1
+)
+control_dispatch_before="$(<"$FAKE_STATE/dispatch-count")"
+if ! FAKE_UNAME=Darwin "$controller" "${fresh_control_args[@]}" \
+  >"$root/fresh-control-needs-authority.stdout" 2>"$root/fresh-control-needs-authority.stderr"; then
+  cat "$root/fresh-control-needs-authority.stderr" >&2
+  exit 1
+fi
+jq -e '
+  .status == "needs_authority"
+  and .reason == "dispatch_control_missing"
+  and .sign_finalize_dispatch_preserved == true
+' "$fresh_control_cycle/generation-0/needs-authority.json" >/dev/null
+test -s "$fresh_control_cycle/generation-0/request.json"
+test -s "$fresh_control_cycle/generation-0/submission.json"
+test "$(<"$FAKE_STATE/dispatch-count")" == "$control_dispatch_before"
+
+if ! FAKE_UNAME=Darwin "$controller" approve \
+  --alpha-harness "$bin/alpha-harness" \
+  --aliyun "$bin/aliyun" \
+  --kubectl "$bin/kubectl" \
+  --signer "$bin/signer" \
+  --control "$bin/control" \
+  --work-dir "$fresh_control_cycle" \
+  >"$root/fresh-control-approve.stdout" 2>"$root/fresh-control-approve.stderr"; then
+  cat "$root/fresh-control-approve.stderr" >&2
+  exit 1
+fi
+test "$(<"$FAKE_STATE/dispatch-count")" == "$((control_dispatch_before + 1))"
+printf 'campaign fresh-input preparation: PASS\n'
 echo "campaign cycle controller test: PASS"

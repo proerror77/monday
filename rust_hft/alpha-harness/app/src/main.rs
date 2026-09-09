@@ -5,6 +5,7 @@ mod loop_control;
 mod mission;
 mod mission_campaign;
 mod mission_dispatch;
+mod mission_fresh_inputs;
 mod mission_render;
 mod mission_runner;
 mod prediction_dispatch;
