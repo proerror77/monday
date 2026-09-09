@@ -3,6 +3,7 @@
 //! - 穩定介面依賴最小化
 
 pub mod book_features;
+pub mod displayed_liquidity;
 pub mod error;
 pub mod fixed_point;
 pub mod latency;
@@ -13,6 +14,9 @@ pub mod unified_timestamp;
 // 對外穩定導出
 pub use book_features::{
     top5_book_features, top5_quantity_features, Top5BookFeatures, Top5QuantityFeatures, TOP5_DEPTH,
+};
+pub use displayed_liquidity::{
+    BookBudget, DisplayedBookLevel, DisplayedBookSnapshot, DisplayedFill, MAX_DISPLAYED_BOOK_AGE_US,
 };
 pub use error::{HftError, HftResult};
 pub use fixed_point::{FixedBps, FixedPrice, FixedQuantity};

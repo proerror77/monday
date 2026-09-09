@@ -14,9 +14,9 @@ use alpha_domain::{
     CexResearchHoldoutStateV1, CexResearchMissionArtifactV1, CexSealedHoldoutClaimV1, EngineKind,
     EvaluationCostsV1, FormulaEvaluatorConfig, IterationVerdict, MissionCompletionPolicy,
     MissionStatus, PromotionRecord, ResearchIteration, ResearchMission, SearchBudgetUsage,
-    StrategyBundle, ValidatorMode, CEX_FINAL_PRECOMMIT_SCHEMA_V1, CEX_GP_POLICY_SCHEMA_V4,
-    CEX_GP_POLICY_SCHEMA_V5, MAX_CEX_FACTOR_BANK_MCTS_CHECKPOINT_BYTES,
-    SEALED_HOLDOUT_EVALUATOR_VERSION,
+    StrategyBundle, ValidatorMode, CEX_EVENT_REPLAY_POLICY_SCHEMA_V2,
+    CEX_FINAL_PRECOMMIT_SCHEMA_V1, CEX_GP_POLICY_SCHEMA_V4, CEX_GP_POLICY_SCHEMA_V5,
+    MAX_CEX_FACTOR_BANK_MCTS_CHECKPOINT_BYTES, SEALED_HOLDOUT_EVALUATOR_VERSION,
 };
 use alpha_engine::{
     baselines::{
@@ -37,11 +37,12 @@ use anyhow::{bail, Context};
 use chrono::Utc;
 use hft_backtest::{
     config::{
-        verify_and_replay_canonical_target_positions, CanonicalReplayEvidence,
+        verify_and_replay_canonical_target_positions_with_trace, CanonicalReplayEvidence,
         CanonicalSourceSegmentEvidence,
     },
     engine::{
         TargetPositionDecision, TargetPositionReplayConfig, TargetPositionReplayMetrics,
+        TargetPositionReplayTraceEvent, LEGACY_TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION,
         TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION,
     },
 };
@@ -62,7 +63,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs::File,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -91,6 +92,7 @@ const MCTS_CHECKPOINT_ARTIFACT_SCHEMA_VERSION: &str =
 const CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V1: &str = "cex-event-replay-receipt-v1";
 const CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V2: &str = "cex-event-replay-receipt-v2";
 const CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V3: &str = "cex-event-replay-receipt-v3";
+const CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V4: &str = "cex-event-replay-receipt-v4";
 const CEX_SUPERVISED_MODEL_SELECTION_SCHEMA_VERSION: &str = "cex-supervised-model-selection-v1";
 const CEX_SUPERVISED_MODEL_ATTEMPTS_SCHEMA_VERSION: &str = "cex-supervised-model-attempts-v1";
 pub(crate) const CEX_SUPERVISED_MODEL_NAMES: [&str; 3] = ["ridge", "cart", "burn_mlp"];
@@ -466,6 +468,25 @@ pub(crate) struct CexEventReplayReceiptV1 {
     pub(crate) metrics: TargetPositionReplayMetrics,
     capabilities: CexReplayCapabilitiesV1,
     capabilities_sha256: String,
+    /// V4 binds the deterministic event-level accounting trace.  Historical
+    /// V1-V3 receipts omit this field and remain readable as historical
+    /// evidence only.
+    #[serde(default)]
+    trace_artifact: Option<CexResearchContentRefV1>,
+    #[serde(default)]
+    trace_artifact_path: String,
+    #[serde(default)]
+    accounting_trace_event_count: usize,
+    #[serde(default)]
+    final_cash: f64,
+    #[serde(default)]
+    final_inventory: f64,
+    #[serde(default)]
+    total_fees: f64,
+    #[serde(default)]
+    total_funding_cost: f64,
+    #[serde(default)]
+    total_execution_cost: f64,
     pub(crate) gate: CexReplayGateV1,
     holdout_id: String,
     holdout_state: CexResearchHoldoutStateV1,
@@ -504,15 +525,76 @@ impl CexEventReplayReceiptV1 {
             ) | (
                 CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V3,
                 "independent_selection_frozen_model"
+            ) | (
+                CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V4,
+                "pre_holdout_research_rows"
+            ) | (
+                CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V4,
+                "walk_forward_oos_with_flat_training_gaps"
+            ) | (
+                CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V4,
+                "independent_selection_frozen_model"
             )
         );
+        let current_schema = self.schema_version == CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V4;
+        let legacy_schema = matches!(
+            self.schema_version.as_str(),
+            CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V1
+                | CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V2
+                | CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V3
+        );
+        let expected_engine_version = if current_schema {
+            TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION
+        } else {
+            LEGACY_TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION
+        };
+        let source_revision_valid = if current_schema {
+            self.implementation_source_revision == BUILD_SOURCE_REVISION
+                && valid_git_revision(BUILD_SOURCE_REVISION)
+        } else {
+            valid_git_revision(&self.implementation_source_revision)
+        };
+        let current_trace_valid = if current_schema {
+            self.replay_config.position_notional_usd.is_finite()
+                && self.replay_config.position_notional_usd > 0.0
+                && self.capabilities.partial_fills
+                && self.trace_artifact.as_ref().is_some_and(|reference| {
+                    reference.validate().is_ok()
+                        && reference.id
+                            == format!("cex-event-replay-trace-{}", self.metrics.trace_sha256)
+                })
+                && !self.trace_artifact_path.is_empty()
+                && self.accounting_trace_event_count == self.metrics.trace_event_count
+                && self.metrics.trace_event_count == self.metrics.decision_count
+                && self
+                    .trace_artifact
+                    .as_ref()
+                    .is_some_and(|reference| reference.content_sha256 == self.metrics.trace_sha256)
+                && self.final_cash.is_finite()
+                && self.final_inventory.is_finite()
+                && self.total_fees.is_finite()
+                && self.total_funding_cost.is_finite()
+                && self.total_execution_cost.is_finite()
+                && self.final_inventory.abs() <= f64::EPSILON
+                && (self.final_cash - self.metrics.final_cash).abs() <= f64::EPSILON
+                && (self.final_inventory - self.metrics.final_inventory).abs() <= f64::EPSILON
+                && (self.total_fees - self.metrics.total_fees).abs() <= f64::EPSILON
+                && (self.total_funding_cost - self.metrics.total_funding_cost).abs() <= f64::EPSILON
+                && (self.total_execution_cost - self.metrics.total_execution_cost).abs()
+                    <= f64::EPSILON
+        } else {
+            self.trace_artifact.is_none()
+                && self.trace_artifact_path.is_empty()
+                && self.accounting_trace_event_count == 0
+        };
         if !valid_scope
+            || (!current_schema && !legacy_schema)
             || self.receipt_id != self.expected_receipt_id()?
             || self.mission_id.trim().is_empty()
-            || self.replay_config_sha256 != canonical_json_hash(&self.replay_config)?
-            || self.implementation_source_revision != BUILD_SOURCE_REVISION
-            || !valid_git_revision(BUILD_SOURCE_REVISION)
-            || self.replay_engine_version != TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION
+            || self.replay_config_sha256
+                != replay_config_content_hash(&self.replay_config, legacy_schema)?
+            || !source_revision_valid
+            || self.replay_engine_version != expected_engine_version
             || self.metrics.decision_count == 0
             || self.capabilities_sha256 != canonical_json_hash(&self.capabilities)?
             || self.capabilities.clock_semantics != "recorded_userspace_receive_time_us"
@@ -525,7 +607,7 @@ impl CexEventReplayReceiptV1 {
             || self.metrics.trade_events != 0
             || self.replay_config.trade_tape_declared
             || self.capabilities.queue_position
-            || self.capabilities.partial_fills
+            || (legacy_schema && self.capabilities.partial_fills)
             || self.capabilities.market_impact
             || self.capabilities.true_capacity
             || self.gate.passed != self.gate.failures.is_empty()
@@ -533,6 +615,7 @@ impl CexEventReplayReceiptV1 {
             || self.holdout_state != CexResearchHoldoutStateV1::Unopened
             || self.deployment_authority
             || self.order_submission_authority
+            || !current_trace_valid
         {
             bail!("CEX event replay receipt is invalid");
         }
@@ -543,11 +626,77 @@ impl CexEventReplayReceiptV1 {
     fn expected_receipt_id(&self) -> anyhow::Result<String> {
         let mut semantic = self.clone();
         semantic.receipt_id.clear();
+        let mut value = serde_json::to_value(&semantic)?;
+        if matches!(
+            semantic.schema_version.as_str(),
+            CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V1
+                | CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V2
+                | CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V3
+        ) {
+            if let Some(object) = value.as_object_mut() {
+                for field in [
+                    "trace_artifact",
+                    "trace_artifact_path",
+                    "accounting_trace_event_count",
+                    "final_cash",
+                    "final_inventory",
+                    "total_fees",
+                    "total_funding_cost",
+                    "total_execution_cost",
+                ] {
+                    object.remove(field);
+                }
+            }
+            if let Some(config) = value
+                .get_mut("replay_config")
+                .and_then(|value| value.as_object_mut())
+            {
+                config.remove("order_latency_us");
+            }
+            if let Some(metrics) = value
+                .get_mut("metrics")
+                .and_then(|value| value.as_object_mut())
+            {
+                for field in [
+                    "requested_turnover",
+                    "executed_turnover",
+                    "order_count",
+                    "filled_order_count",
+                    "partial_order_count",
+                    "canceled_order_count",
+                    "fill_count",
+                    "max_residual_quantity",
+                    "displayed_depth_unavailable",
+                    "final_cash",
+                    "final_inventory",
+                    "total_fees",
+                    "total_funding_cost",
+                    "trace_event_count",
+                    "trace_sha256",
+                ] {
+                    metrics.remove(field);
+                }
+            }
+        }
         Ok(format!(
             "cex-event-replay-receipt-{}",
-            canonical_json_hash(&semantic)?
+            canonical_json_hash(&value)?
         ))
     }
+}
+
+fn replay_config_content_hash(
+    config: &TargetPositionReplayConfig,
+    legacy: bool,
+) -> anyhow::Result<String> {
+    if !legacy {
+        return Ok(canonical_json_hash(config)?);
+    }
+    let mut value = serde_json::to_value(config)?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("order_latency_us");
+    }
+    Ok(canonical_json_hash(&value)?)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -817,7 +966,7 @@ pub(crate) fn execute_report(
         &materialization_sha256,
         &feature_sha256,
     )?;
-    let replay_policy = CexEventReplayPolicyV1::controlled_v1(
+    let replay_policy = CexEventReplayPolicyV1::controlled_v2(
         control_mission.spec.policies.replay.id.clone(),
         materialization.top_depth,
         control_mission
@@ -1970,6 +2119,22 @@ fn content_reference(
     })
 }
 
+fn replay_trace_artifact_path(receipt_name: &str) -> String {
+    let stem = Path::new(receipt_name)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("cex-event-replay-receipt");
+    format!("{stem}-trace.ndjson")
+}
+
+fn write_trace_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    data_mission::ensure_output_path_is_not_symlink(path, "replay trace")?;
+    let mut temporary = data_mission::temporary_output_file(path, ".monday-replay-trace-")?;
+    temporary.as_file_mut().write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    data_mission::persist_output_file(temporary, path, "replay trace")
+}
+
 fn registry_content_reference(
     id: &str,
     artifact: &impl Serialize,
@@ -2659,6 +2824,9 @@ fn run_cex_target_position_replay(
     replay_manifest_path: &Path,
     replay_manifest_sha256: &str,
 ) -> anyhow::Result<CexEventReplayReceiptV1> {
+    if policy.schema_version != CEX_EVENT_REPLAY_POLICY_SCHEMA_V2 || !policy.require_partial_fills {
+        bail!("current CEX event replay requires the V2 partial-fill policy");
+    }
     policy.validate_binding(&mission.spec.policies.replay)?;
     if mission.spec.inputs.materialization.content_sha256 != materialization_sha256 {
         bail!("CEX replay materialization identity drifted");
@@ -2696,6 +2864,10 @@ fn run_cex_target_position_replay(
         .max_decision_delay_millis
         .checked_mul(1_000)
         .context("CEX replay decision delay overflow")?;
+    let order_latency_us = policy
+        .order_latency_millis
+        .checked_mul(1_000)
+        .context("CEX replay order latency overflow")?;
     let replay_end_time = last_decision_time
         .checked_add(i64::try_from(max_decision_delay_us)?)
         .context("CEX replay end time overflow")?;
@@ -2707,6 +2879,7 @@ fn run_cex_target_position_replay(
     let replay_config = TargetPositionReplayConfig {
         max_depth_levels,
         max_decision_delay_us,
+        order_latency_us,
         position_notional_usd: candidate.position_notional_usd,
         fee_bps: candidate.costs.fee_bps,
         rebate_bps: candidate.costs.rebate_bps,
@@ -2733,13 +2906,13 @@ fn run_cex_target_position_replay(
             "replay_config": &replay_config,
             "limitations": {
                 "queue_position": false,
-                "partial_fills": false,
+                "partial_fills": true,
                 "market_impact": false,
                 "true_capacity": false,
             },
         }),
     );
-    let (replay_evidence, metrics) = verify_and_replay_canonical_target_positions(
+    let (replay_evidence, replay_output) = verify_and_replay_canonical_target_positions_with_trace(
         replay_artifact_path,
         replay_manifest_path,
         replay_artifact_sha256,
@@ -2749,6 +2922,16 @@ fn run_cex_target_position_replay(
         &decisions,
         &replay_config,
     )?;
+    let trace_artifact_path = replay_trace_artifact_path(receipt_name);
+    write_trace_atomic(
+        &results_dir.join(&trace_artifact_path),
+        &replay_output.trace_bytes,
+    )?;
+    let trace_artifact = CexResearchContentRefV1 {
+        id: format!("cex-event-replay-trace-{}", replay_output.trace_sha256),
+        content_sha256: replay_output.trace_sha256.clone(),
+    };
+    let metrics = replay_output.metrics.clone();
     validate_replay_materialization_binding(
         &replay_evidence,
         mission,
@@ -2765,7 +2948,7 @@ fn run_cex_target_position_replay(
         max_ask_depth_levels: metrics.max_ask_depth_levels,
         trade_tape_available: metrics.trade_events > 0,
         queue_position: false,
-        partial_fills: false,
+        partial_fills: true,
         market_impact: false,
         true_capacity: false,
     };
@@ -2790,7 +2973,7 @@ fn run_cex_target_position_replay(
     if policy.require_trade_tape && !capabilities.trade_tape_available {
         failures.push("the frozen replay policy requires an unavailable trade tape".to_string());
     }
-    if metrics.max_abs_position > candidate.max_abs_position {
+    if metrics.max_abs_position > candidate.max_abs_position + 1e-12 {
         failures.push("replay position exceeds the frozen Risk stage".to_string());
     }
     if metrics.max_drawdown > candidate.max_drawdown {
@@ -2808,6 +2991,9 @@ fn run_cex_target_position_replay(
     {
         failures.push("supervised replay score is below the frozen research minimum".to_string());
     }
+    if metrics.displayed_depth_unavailable {
+        failures.push("displayed depth was unavailable for at least one IOC order".to_string());
+    }
     if candidate.position_notional_usd > 0.0
         && metrics
             .max_same_side_depth_fraction
@@ -2820,13 +3006,7 @@ fn run_cex_target_position_replay(
         failures,
     };
     let receipt = CexEventReplayReceiptV1 {
-        schema_version: match candidate.decision_scope {
-            "pre_holdout_research_rows" => CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V1,
-            "walk_forward_oos_with_flat_training_gaps" => CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V2,
-            "independent_selection_frozen_model" => CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V3,
-            _ => bail!("unsupported CEX replay decision scope"),
-        }
-        .to_string(),
+        schema_version: CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V4.to_string(),
         receipt_id: String::new(),
         mission_id: mission_id.to_string(),
         strategy: candidate.reference,
@@ -2851,6 +3031,14 @@ fn run_cex_target_position_replay(
         metrics,
         capabilities,
         capabilities_sha256: String::new(),
+        trace_artifact: Some(trace_artifact),
+        trace_artifact_path,
+        accounting_trace_event_count: replay_output.metrics.trace_event_count,
+        final_cash: replay_output.metrics.final_cash,
+        final_inventory: replay_output.metrics.final_inventory,
+        total_fees: replay_output.metrics.total_fees,
+        total_funding_cost: replay_output.metrics.total_funding_cost,
+        total_execution_cost: replay_output.metrics.total_execution_cost,
         gate,
         holdout_id: mission.spec.holdout.holdout_id.clone(),
         holdout_state: mission.spec.holdout.state,
@@ -3563,6 +3751,9 @@ pub(crate) fn recover_execution_report_from_published_result(
         512 * 1024,
     )?;
     if let Some(receipt) = &replay_receipt {
+        validate_replay_trace_readback(&mut archive, receipt)?;
+    }
+    if let Some(receipt) = &replay_receipt {
         if supervised_ml {
             bail!("published supervised ML result contains a legacy formula replay receipt");
         }
@@ -3592,6 +3783,9 @@ pub(crate) fn recover_execution_report_from_published_result(
         "results/supervised-event-replay-receipt.json",
         512 * 1024,
     )?;
+    if let Some(receipt) = &supervised_replay_receipt {
+        validate_replay_trace_readback(&mut archive, receipt)?;
+    }
     if !supervised_ml && (supervised_selection.is_some() || supervised_replay_receipt.is_some()) {
         bail!("published legacy result contains supervised ML artifacts");
     }
@@ -3829,7 +4023,7 @@ fn validate_replay_strategy_binding(
     mission: &CexResearchMissionArtifactV1,
     mission_id: &str,
 ) -> anyhow::Result<()> {
-    replay.validate()?;
+    validate_current_replay_receipt(replay, mission)?;
     strategy.validate().map_err(anyhow::Error::msg)?;
     if replay.mission_id != mission_id
         || strategy.mission_id != mission_id
@@ -3852,7 +4046,7 @@ pub(crate) fn validate_supervised_replay_binding(
     mission: &CexResearchMissionArtifactV1,
     mission_id: &str,
 ) -> anyhow::Result<()> {
-    replay.validate()?;
+    validate_current_replay_receipt(replay, mission)?;
     selection.validate()?;
     candidate.validate().map_err(anyhow::Error::msg)?;
     let evaluator_config = candidate.evaluation.formula_config()?;
@@ -3873,6 +4067,24 @@ pub(crate) fn validate_supervised_replay_binding(
         || (replay.gate.passed && !replay_profitability_passed)
     {
         bail!("CEX supervised replay does not bind the selected model and Mission inputs");
+    }
+    Ok(())
+}
+
+/// Validate a replay receipt at a current Mission finalization/admission
+/// boundary.  `CexEventReplayReceiptV1::validate` intentionally remains broad
+/// so historical V1-V3 receipts can be decoded and audited, but those records
+/// cannot satisfy a current V2 replay policy.
+fn validate_current_replay_receipt(
+    replay: &CexEventReplayReceiptV1,
+    mission: &CexResearchMissionArtifactV1,
+) -> anyhow::Result<()> {
+    replay.validate()?;
+    if replay.schema_version != CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V4 {
+        bail!("current CEX finalization requires a V4 replay receipt");
+    }
+    if replay.replay_policy != mission.spec.policies.replay {
+        bail!("CEX replay receipt does not bind the exact current replay policy");
     }
     Ok(())
 }
@@ -3910,6 +4122,10 @@ fn validate_recovered_finalization(
     expected_mission_id: &str,
 ) -> anyhow::Result<()> {
     ensure_promotable_cex_costs(&control_mission.spec.evaluation_protocol.costs)?;
+    if let Some(replay) = replay_receipt {
+        validate_current_replay_receipt(replay, control_mission)?;
+        validate_replay_trace_readback(archive, replay)?;
+    }
     if !replay_receipt.is_some_and(|receipt| receipt.gate.passed) {
         bail!("published result bundle finalization lacks a passing replay receipt");
     }
@@ -4087,6 +4303,184 @@ fn read_bundle_json<T: for<'de> Deserialize<'de>>(
     Ok(Some(serde_json::from_slice(&bytes).with_context(|| {
         format!("parse bundle JSON entry {name}")
     })?))
+}
+
+fn read_bundle_bytes(
+    archive: &mut ZipArchive<File>,
+    name: &str,
+    max_bytes: u64,
+) -> anyhow::Result<Vec<u8>> {
+    let mut file = archive
+        .by_name(name)
+        .with_context(|| format!("open bundle entry {name}"))?;
+    if file.size() > max_bytes {
+        bail!("bundle entry exceeds the allowed size: {name}");
+    }
+    let mut bytes = Vec::with_capacity(file.size() as usize);
+    std::io::copy(&mut file.by_ref().take(max_bytes + 1), &mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        bail!("bundle entry exceeds the allowed size: {name}");
+    }
+    Ok(bytes)
+}
+
+fn validate_replay_trace_readback(
+    archive: &mut ZipArchive<File>,
+    receipt: &CexEventReplayReceiptV1,
+) -> anyhow::Result<()> {
+    receipt.validate()?;
+    if receipt.schema_version != CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V4 {
+        return Ok(());
+    }
+    let relative = Path::new(&receipt.trace_artifact_path);
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        bail!("CEX replay trace path is invalid");
+    }
+    let entry = format!("results/{}", relative.to_string_lossy().replace('\\', "/"));
+    let bytes = read_bundle_bytes(archive, &entry, MAX_RESULT_BUNDLE_BYTES)?;
+    let digest = hex::encode(Sha256::digest(&bytes));
+    let trace_reference = receipt
+        .trace_artifact
+        .as_ref()
+        .context("CEX replay receipt is missing its trace reference")?;
+    if digest != trace_reference.content_sha256
+        || digest != receipt.metrics.trace_sha256
+        || receipt.accounting_trace_event_count != receipt.metrics.trace_event_count
+    {
+        bail!("CEX replay trace hash or accounting identity does not match its receipt");
+    }
+    let mut count = 0_usize;
+    let mut last = None;
+    let mut expected_cash = receipt.replay_config.position_notional_usd;
+    let mut expected_inventory = 0.0_f64;
+    let mut total_fees = 0.0_f64;
+    let mut total_funding_cost = 0.0_f64;
+    let mut total_execution_cost = 0.0_f64;
+    let mut executed_notional = 0.0_f64;
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let event: TargetPositionReplayTraceEvent =
+            serde_json::from_slice(line).context("CEX replay trace contains invalid JSON")?;
+        if event.schema_version != hft_backtest::engine::TARGET_POSITION_REPLAY_TRACE_SCHEMA_VERSION
+            || event.decision_index != count
+            || event.time_in_force != "IOC"
+            || event.order_timestamp_us != event.decision_timestamp_us
+            || event.arrival_timestamp_us < event.order_timestamp_us
+            || !event.requested_quantity.is_finite()
+            || !event.filled_quantity.is_finite()
+            || !event.residual_quantity.is_finite()
+            || event.requested_quantity < 0.0
+            || event.filled_quantity < 0.0
+            || event.residual_quantity < 0.0
+            || event.filled_quantity - event.requested_quantity > 1e-9
+        {
+            bail!("CEX replay trace decision ordering drifted");
+        }
+        let mut fill_quantity = 0.0;
+        let mut fill_notional = 0.0;
+        for fill in &event.fills {
+            if !fill.price.is_finite()
+                || fill.price <= 0.0
+                || !fill.quantity.is_finite()
+                || fill.quantity <= 0.0
+            {
+                bail!("CEX replay trace contains an invalid fill");
+            }
+            fill_quantity += fill.quantity;
+            fill_notional += fill.price * fill.quantity;
+        }
+        if !fill_quantity.is_finite()
+            || !fill_notional.is_finite()
+            || !(executed_notional + fill_notional).is_finite()
+        {
+            bail!("CEX replay trace contains non-finite fill accounting");
+        }
+        executed_notional += fill_notional;
+        if (fill_quantity - event.filled_quantity).abs() > 1e-9
+            || (event.filled_quantity > f64::EPSILON
+                && event
+                    .vwap
+                    .is_none_or(|vwap| (vwap - fill_notional / fill_quantity).abs() > 1e-9))
+            || (event.filled_quantity <= f64::EPSILON && event.vwap.is_some())
+            || !event.fees.is_finite()
+            || !event.funding_cost.is_finite()
+            || !event.execution_cost.is_finite()
+            || !event.cash_after.is_finite()
+            || !event.inventory_after.is_finite()
+        {
+            bail!("CEX replay trace fill or accounting fields are inconsistent");
+        }
+        total_fees += event.fees;
+        total_funding_cost += event.funding_cost;
+        total_execution_cost += event.execution_cost;
+        expected_cash -= event.funding_cost + event.fees + event.execution_cost;
+        if let Some(side) = event.side {
+            match serde_json::to_value(side)?.as_str() {
+                Some("Buy") => {
+                    expected_cash -= fill_notional;
+                    expected_inventory += fill_quantity;
+                }
+                Some("Sell") => {
+                    expected_cash += fill_notional;
+                    expected_inventory -= fill_quantity;
+                }
+                _ => bail!("CEX replay trace contains an unknown order side"),
+            }
+        } else if !event.fills.is_empty() || event.filled_quantity > f64::EPSILON {
+            bail!("CEX replay trace has fills without an order side");
+        }
+        if (expected_cash - event.cash_after).abs() > 1e-8
+            || (expected_inventory - event.inventory_after).abs() > 1e-8
+        {
+            bail!("CEX replay trace cash or inventory sequence is inconsistent");
+        }
+        count = count
+            .checked_add(1)
+            .context("CEX replay trace event count overflow")?;
+        last = Some(event);
+    }
+    let last = last.context("CEX replay trace is empty")?;
+    let initial_cash = receipt.replay_config.position_notional_usd;
+    let cumulative_from_cash = (receipt.final_cash - initial_cash) / initial_cash;
+    let mean_from_cash = cumulative_from_cash / receipt.metrics.decision_count as f64;
+    let executed_turnover_from_trace = executed_notional / initial_cash;
+    let accounting_close = |actual: f64, expected: f64| {
+        actual.is_finite()
+            && expected.is_finite()
+            && (actual - expected).abs() <= 1e-8 * (1.0 + actual.abs().max(expected.abs()))
+    };
+    if count != receipt.metrics.trace_event_count
+        || count != receipt.metrics.decision_count
+        || (last.cash_after - receipt.final_cash).abs() > f64::EPSILON
+        || (last.inventory_after - receipt.final_inventory).abs() > f64::EPSILON
+        || receipt.final_inventory.abs() > f64::EPSILON
+        || (expected_cash - receipt.final_cash).abs() > 1e-8
+        || (expected_inventory - receipt.final_inventory).abs() > 1e-8
+        || (total_fees - receipt.total_fees).abs() > 1e-8
+        || (total_funding_cost - receipt.total_funding_cost).abs() > 1e-8
+        || (total_execution_cost - receipt.total_execution_cost).abs() > 1e-8
+        || !accounting_close(receipt.metrics.cumulative_net_return, cumulative_from_cash)
+        || !accounting_close(receipt.metrics.mean_net_return, mean_from_cash)
+        || !accounting_close(
+            receipt.metrics.executed_turnover,
+            executed_turnover_from_trace,
+        )
+        || !accounting_close(receipt.metrics.total_turnover, executed_turnover_from_trace)
+        || (receipt.final_cash - receipt.metrics.final_cash).abs() > f64::EPSILON
+        || (receipt.final_inventory - receipt.metrics.final_inventory).abs() > f64::EPSILON
+        || (receipt.total_fees - receipt.metrics.total_fees).abs() > f64::EPSILON
+        || (receipt.total_funding_cost - receipt.metrics.total_funding_cost).abs() > f64::EPSILON
+    {
+        bail!("CEX replay trace accounting readback does not match its receipt");
+    }
+    Ok(())
 }
 
 pub(crate) fn create_bundle<'a>(
@@ -4345,7 +4739,8 @@ pub(crate) mod tests {
             &TargetPositionReplayConfig {
                 max_depth_levels: 1,
                 max_decision_delay_us: 1,
-                position_notional_usd: 0.0,
+                order_latency_us: 0,
+                position_notional_usd: 100.0,
                 fee_bps: costs.fee_bps,
                 rebate_bps: costs.rebate_bps,
                 funding_bps: costs.funding_bps,
@@ -4358,12 +4753,175 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(decisions.last().unwrap().target_position, 0.0);
+        // The fast evaluator remains a policy/target-position accounting
+        // reference.  Event replay now measures actual fills, spread crossing,
+        // residual cancels, and cash/inventory, so only requested turnover is
+        // expected to reconcile exactly.
         assert!(
-            (report.evaluation.metrics.cumulative_net_return - replay.cumulative_net_return).abs()
-                < 1e-12
+            (report.evaluation.metrics.total_turnover - replay.requested_turnover).abs() < 0.05
         );
-        assert!((report.evaluation.metrics.total_turnover - replay.total_turnover).abs() < 1e-12);
-        assert!((report.evaluation.metrics.max_drawdown - replay.max_drawdown).abs() < 1e-12);
+        assert!(replay.executed_turnover > 0.0);
+        assert!(replay.cumulative_net_return.is_finite());
+        assert_eq!(replay.final_inventory, 0.0);
+        assert_eq!(replay.trace_event_count, decisions.len());
+    }
+
+    #[test]
+    fn historical_v1_replay_receipt_keeps_its_old_nested_hash_semantics() {
+        let replay_config = TargetPositionReplayConfig {
+            max_depth_levels: 1,
+            max_decision_delay_us: 1_000,
+            order_latency_us: 0,
+            position_notional_usd: 100.0,
+            fee_bps: 2.0,
+            rebate_bps: 0.0,
+            funding_bps: 0.0,
+            latency_bps: 0.5,
+            additional_slippage_bps: 0.0,
+            cross_spread: false,
+            capacity_depth_levels: 0,
+            trade_tape_declared: false,
+        };
+        let metrics = TargetPositionReplayMetrics {
+            event_count: 2,
+            snapshot_events: 1,
+            l2_update_events: 1,
+            trade_events: 0,
+            decision_count: 1,
+            position_changes: 1,
+            first_event_time_us: 1,
+            last_event_time_us: 2,
+            max_decision_delay_us: 0,
+            min_bid_depth_levels: 1,
+            max_bid_depth_levels: 1,
+            min_ask_depth_levels: 1,
+            max_ask_depth_levels: 1,
+            total_turnover: 1.0,
+            mean_net_return: 0.0,
+            cumulative_net_return: 0.0,
+            max_drawdown: 0.0,
+            net_sharpe: 0.0,
+            max_abs_position: 1.0,
+            max_same_side_depth_fraction: None,
+            requested_turnover: 0.0,
+            executed_turnover: 0.0,
+            order_count: 0,
+            filled_order_count: 0,
+            partial_order_count: 0,
+            canceled_order_count: 0,
+            fill_count: 0,
+            max_residual_quantity: 0.0,
+            displayed_depth_unavailable: false,
+            final_cash: 0.0,
+            final_inventory: 0.0,
+            total_fees: 0.0,
+            total_funding_cost: 0.0,
+            total_execution_cost: 0.0,
+            trace_event_count: 0,
+            trace_sha256: String::new(),
+        };
+        let reference = |id: &str, byte: char| CexResearchContentRefV1 {
+            id: id.to_string(),
+            content_sha256: byte.to_string().repeat(64),
+        };
+        let mut receipt = CexEventReplayReceiptV1 {
+            schema_version: CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V1.to_string(),
+            receipt_id: String::new(),
+            mission_id: "cex-mission-historical".to_string(),
+            strategy: reference("strategy", 'a'),
+            dataset: reference("dataset", 'b'),
+            materialization: reference("materialization", 'c'),
+            tape_artifact: reference("tape", 'd'),
+            tape_manifest: reference("manifest", 'e'),
+            source: reference("source", 'f'),
+            replay_policy: reference("replay-policy", '1'),
+            replay_config_sha256: replay_config_content_hash(&replay_config, true).unwrap(),
+            replay_config,
+            decision_sha256: "2".repeat(64),
+            decision_scope: "pre_holdout_research_rows".to_string(),
+            implementation_source_revision: "3".repeat(40),
+            replay_engine_version: LEGACY_TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION.to_string(),
+            metrics,
+            capabilities: CexReplayCapabilitiesV1 {
+                clock_semantics: "recorded_userspace_receive_time_us".to_string(),
+                modalities: vec!["lob".to_string()],
+                min_bid_depth_levels: 1,
+                max_bid_depth_levels: 1,
+                min_ask_depth_levels: 1,
+                max_ask_depth_levels: 1,
+                trade_tape_available: false,
+                queue_position: false,
+                partial_fills: false,
+                market_impact: false,
+                true_capacity: false,
+            },
+            capabilities_sha256: String::new(),
+            trace_artifact: None,
+            trace_artifact_path: String::new(),
+            accounting_trace_event_count: 0,
+            final_cash: 0.0,
+            final_inventory: 0.0,
+            total_fees: 0.0,
+            total_funding_cost: 0.0,
+            total_execution_cost: 0.0,
+            gate: CexReplayGateV1 {
+                passed: true,
+                failures: vec![],
+            },
+            holdout_id: "holdout".to_string(),
+            holdout_state: CexResearchHoldoutStateV1::Unopened,
+            deployment_authority: false,
+            order_submission_authority: false,
+        };
+        receipt.capabilities_sha256 = canonical_json_hash(&receipt.capabilities).unwrap();
+        receipt.receipt_id = receipt.expected_receipt_id().unwrap();
+        receipt.validate().unwrap();
+        let mut historical = serde_json::to_value(&receipt).unwrap();
+        let object = historical.as_object_mut().unwrap();
+        for field in [
+            "trace_artifact",
+            "trace_artifact_path",
+            "accounting_trace_event_count",
+            "final_cash",
+            "final_inventory",
+            "total_fees",
+            "total_funding_cost",
+            "total_execution_cost",
+        ] {
+            object.remove(field);
+        }
+        object
+            .get_mut("replay_config")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .remove("order_latency_us");
+        let metrics = object
+            .get_mut("metrics")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        for field in [
+            "requested_turnover",
+            "executed_turnover",
+            "order_count",
+            "filled_order_count",
+            "partial_order_count",
+            "canceled_order_count",
+            "fill_count",
+            "max_residual_quantity",
+            "displayed_depth_unavailable",
+            "final_cash",
+            "final_inventory",
+            "total_fees",
+            "total_funding_cost",
+            "total_execution_cost",
+            "trace_event_count",
+            "trace_sha256",
+        ] {
+            metrics.remove(field);
+        }
+        let bytes = serde_json::to_vec(&historical).unwrap();
+        let decoded: CexEventReplayReceiptV1 = serde_json::from_slice(&bytes).unwrap();
+        decoded.validate().unwrap();
     }
 
     #[test]
@@ -5505,10 +6063,10 @@ pub(crate) mod tests {
         replay_receipt.validate().unwrap();
         assert_eq!(
             replay_receipt.schema_version,
-            CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V1
+            CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V4
         );
         assert!(replay_receipt.gate.passed);
-        assert_eq!(replay_receipt.metrics.max_decision_delay_us, 100);
+        assert_eq!(replay_receipt.metrics.max_decision_delay_us, 1_000_100);
         assert_eq!(
             replay_receipt.implementation_source_revision,
             BUILD_SOURCE_REVISION
@@ -5521,7 +6079,7 @@ pub(crate) mod tests {
         assert_eq!(replay_receipt.capabilities.modalities, vec!["lob"]);
         assert!(!replay_receipt.capabilities.trade_tape_available);
         assert!(!replay_receipt.capabilities.queue_position);
-        assert!(!replay_receipt.capabilities.partial_fills);
+        assert!(replay_receipt.capabilities.partial_fills);
         assert!(!replay_receipt.capabilities.market_impact);
         assert!(!replay_receipt.capabilities.true_capacity);
         assert_eq!(
@@ -7103,8 +7661,11 @@ pub(crate) mod tests {
         assert_eq!(evidence["partial_fills_modeled"], false);
         assert_eq!(evidence["market_impact_modeled"], false);
         assert_eq!(evidence["capacity_modeled"], false);
-        assert_eq!(evidence["capacity_gate_enabled"], false);
-        assert_eq!(evidence["capacity_gate_model"], "disabled");
+        assert_eq!(evidence["capacity_gate_enabled"], true);
+        assert_eq!(
+            evidence["capacity_gate_model"],
+            "same_side_top_n_depth_fraction"
+        );
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
@@ -7117,6 +7678,18 @@ pub(crate) mod tests {
             .evaluation_protocol
             .costs
             .position_notional_usd = 10_000.0;
+        fixture
+            .mission
+            .spec
+            .evaluation_protocol
+            .costs
+            .capacity_depth_levels = 0;
+        fixture
+            .mission
+            .spec
+            .evaluation_protocol
+            .costs
+            .max_book_depth_fraction = 0.0;
         write_mission(&mut fixture);
 
         let error = execute(fixture.args.clone()).unwrap_err();
@@ -7273,6 +7846,77 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn finalization_rejects_a_historical_replay_receipt_for_the_current_v2_policy() {
+        let mut fixture = finalizing_fixture("finalize-historical-replay-receipt");
+        let binding = campaign_binding_fixture(&mut fixture);
+        execute_report(fixture.args.clone(), binding).unwrap();
+
+        let results_dir = fixture.args.work_dir.join("results");
+        let current: CexEventReplayReceiptV1 = serde_json::from_slice(
+            &std::fs::read(results_dir.join("cex-event-replay-receipt.json")).unwrap(),
+        )
+        .unwrap();
+        let historical = historical_v3_replay_receipt(&current);
+        std::fs::write(
+            results_dir.join("cex-event-replay-receipt.json"),
+            serde_json::to_vec_pretty(&historical).unwrap(),
+        )
+        .unwrap();
+
+        let error = finalize_existing_search_round(
+            &fixture.args.work_dir,
+            &fixture.root.join("finalization"),
+            &fixture.args.holdout_claim_put_url,
+            &fixture.args.holdout_claim_readback_url,
+            &fixture.mission,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("current CEX finalization requires a V4 replay receipt"));
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn recovery_rejects_a_current_replay_receipt_with_a_drifted_policy_hash() {
+        let mut fixture = finalizing_fixture("recover-drifted-replay-policy");
+        let binding = campaign_binding_fixture(&mut fixture);
+        execute_report(fixture.args.clone(), binding.clone()).unwrap();
+
+        let results_dir = fixture.args.work_dir.join("results");
+        let current: CexEventReplayReceiptV1 = serde_json::from_slice(
+            &std::fs::read(results_dir.join("cex-event-replay-receipt.json")).unwrap(),
+        )
+        .unwrap();
+        let mut drifted = current.clone();
+        drifted.replay_policy.content_sha256 = "f".repeat(64);
+        drifted.receipt_id = drifted.expected_receipt_id().unwrap();
+        drifted.validate().unwrap();
+        rewrite_bundle_entry_bytes(
+            &fixture.result_path,
+            "results/cex-event-replay-receipt.json",
+            serde_json::to_vec_pretty(&drifted).unwrap(),
+        );
+
+        let client = Client::builder().redirect(Policy::none()).build().unwrap();
+        let error = recover_execution_report_from_published_result(
+            &client,
+            fixture.args.result_readback_url.as_str(),
+            &fixture.root.join("recovered-drifted-policy.zip"),
+            &fixture.args.mission_id,
+            &fixture.args.mission_sha256,
+            &binding,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("CEX replay receipt does not bind the exact current replay policy"));
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
     fn recover_execution_report_accepts_a_renewed_campaign_request_sha() {
         let mut fixture = fixture("recover-campaign-binding-mismatch");
         let binding = campaign_binding_fixture(&mut fixture);
@@ -7299,6 +7943,31 @@ pub(crate) mod tests {
         assert_eq!(recovered.round_id, original.round_id);
         assert_eq!(recovered.request_sha256, original.request_sha256);
         std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    fn historical_v3_replay_receipt(current: &CexEventReplayReceiptV1) -> CexEventReplayReceiptV1 {
+        let mut historical = current.clone();
+        historical.schema_version = CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V3.to_string();
+        historical.decision_scope = "independent_selection_frozen_model".to_string();
+        historical.implementation_source_revision = "3".repeat(40);
+        historical.replay_engine_version =
+            LEGACY_TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION.to_string();
+        historical.replay_config.order_latency_us = 0;
+        historical.replay_config_sha256 =
+            replay_config_content_hash(&historical.replay_config, true).unwrap();
+        historical.capabilities.partial_fills = false;
+        historical.capabilities_sha256 = canonical_json_hash(&historical.capabilities).unwrap();
+        historical.trace_artifact = None;
+        historical.trace_artifact_path.clear();
+        historical.accounting_trace_event_count = 0;
+        historical.final_cash = 0.0;
+        historical.final_inventory = 0.0;
+        historical.total_fees = 0.0;
+        historical.total_funding_cost = 0.0;
+        historical.total_execution_cost = 0.0;
+        historical.receipt_id = historical.expected_receipt_id().unwrap();
+        historical.validate().unwrap();
+        historical
     }
 
     #[test]
@@ -7333,6 +8002,32 @@ pub(crate) mod tests {
         assert!(error
             .to_string()
             .contains("promotable CEX candidates require fee_bps >= 2 and rebate_bps == 0"));
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn replay_trace_readback_rejects_profitability_metrics_inconsistent_with_cash() {
+        let fixture = finalizing_fixture("replay-accounting-readback");
+        execute_report(fixture.args.clone(), ExecutionBinding::Direct).unwrap();
+        let mut archive = ZipArchive::new(File::open(&fixture.result_path).unwrap()).unwrap();
+        let mut receipt: CexEventReplayReceiptV1 = read_bundle_json(
+            &mut archive,
+            "results/cex-event-replay-receipt.json",
+            512 * 1024,
+        )
+        .unwrap()
+        .unwrap();
+        receipt.metrics.cumulative_net_return += 0.25;
+        receipt.metrics.mean_net_return =
+            receipt.metrics.cumulative_net_return / receipt.metrics.decision_count as f64;
+        receipt.receipt_id = receipt.expected_receipt_id().unwrap();
+        receipt.validate().unwrap();
+
+        let error = validate_replay_trace_readback(&mut archive, &receipt).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("CEX replay trace accounting readback does not match its receipt"));
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
@@ -7902,9 +8597,9 @@ message binance_replay {
             latency_bps: 0.5,
             slippage_bps: 0.0,
             cross_spread: false,
-            position_notional_usd: 0.0,
-            capacity_depth_levels: 0,
-            max_book_depth_fraction: 0.0,
+            position_notional_usd: 100.0,
+            capacity_depth_levels: 5,
+            max_book_depth_fraction: 1.0,
             label_horizon_buckets: 5,
             observation_frequency_millis: 1_000,
         };
@@ -7937,7 +8632,7 @@ message binance_replay {
         let supervised_decision_policy = CexSupervisedDecisionPolicyV2::controlled_v2();
         let weight_policy =
             CexEqualAbsoluteWeightPolicyV1::controlled_v1("weight-policy-1").unwrap();
-        let replay_policy = CexEventReplayPolicyV1::controlled_v1(
+        let replay_policy = CexEventReplayPolicyV1::controlled_v2(
             "replay-policy-1",
             5,
             evaluation_protocol.labels.observation_frequency_millis,
@@ -8420,7 +9115,7 @@ message binance_replay {
             &std::fs::read(results_dir.join("combination-walk-forward.json")).unwrap(),
         )
         .unwrap();
-        let replay_policy = CexEventReplayPolicyV1::controlled_v1(
+        let replay_policy = CexEventReplayPolicyV1::controlled_v2(
             fixture.mission.spec.policies.replay.id.clone(),
             fixture.materialization["top_depth"].as_u64().unwrap() as usize,
             fixture
@@ -8684,7 +9379,7 @@ message binance_replay {
             fixture.mission.spec.policies.weight.content_sha256 =
                 weight_policy.content_hash().unwrap();
         }
-        if let Ok(replay_policy) = CexEventReplayPolicyV1::controlled_v1(
+        if let Ok(replay_policy) = CexEventReplayPolicyV1::controlled_v2(
             fixture.mission.spec.policies.replay.id.clone(),
             fixture.materialization["top_depth"]
                 .as_u64()

@@ -423,6 +423,7 @@ impl CexResearchPolicyBindingsV1 {
 
 pub const CEX_EQUAL_ABSOLUTE_WEIGHT_POLICY_SCHEMA_V1: &str = "cex-equal-absolute-weight-policy-v1";
 pub const CEX_EVENT_REPLAY_POLICY_SCHEMA_V1: &str = "cex-event-replay-policy-v1";
+pub const CEX_EVENT_REPLAY_POLICY_SCHEMA_V2: &str = "cex-event-replay-policy-v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -488,12 +489,21 @@ pub struct CexEventReplayPolicyV1 {
     pub min_decisions: usize,
     pub required_depth_levels: usize,
     pub max_decision_delay_millis: u64,
+    /// Current V2 policy declares the deterministic decision-to-order latency
+    /// separately from its maximum allowed decision delay.  V1 historical
+    /// policies serialize this as zero.
+    #[serde(default)]
+    pub order_latency_millis: u64,
     pub require_trade_tape: bool,
     pub require_queue_position: bool,
     pub require_partial_fills: bool,
     pub require_market_impact: bool,
     pub require_true_capacity: bool,
 }
+
+/// Alias for callers that want the current wire-version name while the
+/// surrounding Mission bindings remain V1-compatible historical records.
+pub type CexEventReplayPolicyV2 = CexEventReplayPolicyV1;
 
 impl CexEventReplayPolicyV1 {
     pub fn controlled_v1(
@@ -510,6 +520,7 @@ impl CexEventReplayPolicyV1 {
             min_decisions: 1,
             required_depth_levels,
             max_decision_delay_millis: observation_frequency_millis,
+            order_latency_millis: 0,
             require_trade_tape: false,
             require_queue_position: false,
             require_partial_fills: false,
@@ -520,8 +531,52 @@ impl CexEventReplayPolicyV1 {
         Ok(policy)
     }
 
+    /// Current replay policy.  V2 explicitly requires the displayed-depth
+    /// partial-fill model; queue position, market impact, and true capacity
+    /// remain unsupported and are required to stay disabled.
+    pub fn controlled_v2(
+        policy_id: impl Into<String>,
+        required_depth_levels: usize,
+        observation_frequency_millis: u64,
+    ) -> Result<Self, DomainError> {
+        let order_latency_millis = observation_frequency_millis
+            .checked_div(10)
+            .unwrap_or(0)
+            .max(1);
+        let max_decision_delay_millis = observation_frequency_millis
+            .checked_add(order_latency_millis)
+            .ok_or(DomainError::InvalidCexResearchMission(
+                "event replay delay overflows",
+            ))?;
+        let policy = Self {
+            schema_version: CEX_EVENT_REPLAY_POLICY_SCHEMA_V2.to_string(),
+            policy_id: policy_id.into(),
+            clock_semantics: "recorded_userspace_receive_time_us".to_string(),
+            min_book_events: 2,
+            min_l2_updates: 1,
+            min_decisions: 1,
+            required_depth_levels,
+            max_decision_delay_millis,
+            order_latency_millis,
+            require_trade_tape: false,
+            require_queue_position: false,
+            require_partial_fills: true,
+            require_market_impact: false,
+            require_true_capacity: false,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
     pub fn validate(&self) -> Result<(), DomainError> {
-        if self.schema_version != CEX_EVENT_REPLAY_POLICY_SCHEMA_V1
+        let legacy_v1 = self.schema_version == CEX_EVENT_REPLAY_POLICY_SCHEMA_V1
+            && !self.require_partial_fills
+            && self.order_latency_millis == 0;
+        let current_v2 = self.schema_version == CEX_EVENT_REPLAY_POLICY_SCHEMA_V2
+            && self.require_partial_fills
+            && self.order_latency_millis > 0
+            && self.order_latency_millis <= self.max_decision_delay_millis;
+        if !(legacy_v1 || current_v2)
             || self.policy_id.trim().is_empty()
             || self.clock_semantics != "recorded_userspace_receive_time_us"
             || self.min_book_events < 2
@@ -530,7 +585,7 @@ impl CexEventReplayPolicyV1 {
             || self.required_depth_levels == 0
             || self.max_decision_delay_millis == 0
             || self.require_queue_position
-            || self.require_partial_fills
+            || (legacy_v1 && self.require_partial_fills)
             || self.require_market_impact
             || self.require_true_capacity
         {
@@ -543,7 +598,17 @@ impl CexEventReplayPolicyV1 {
 
     pub fn content_hash(&self) -> Result<String, DomainError> {
         self.validate()?;
-        canonical_json_hash(self)
+        if self.schema_version == CEX_EVENT_REPLAY_POLICY_SCHEMA_V1 {
+            let mut value = serde_json::to_value(self).map_err(|_| {
+                DomainError::InvalidCexResearchMission("event replay policy cannot be encoded")
+            })?;
+            if let Some(object) = value.as_object_mut() {
+                object.remove("order_latency_millis");
+            }
+            canonical_json_hash(&value)
+        } else {
+            canonical_json_hash(self)
+        }
     }
 
     pub fn validate_binding(&self, binding: &CexResearchContentRefV1) -> Result<(), DomainError> {

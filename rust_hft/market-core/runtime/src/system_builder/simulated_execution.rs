@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use engine::aggregation::MarketView;
 use futures::StreamExt;
 use hft_core::{
-    HftError, OrderId, OrderType, Price, Quantity, Symbol, TimeInForce, Timestamp, VenueId,
-    VenueSymbol,
+    BookBudget, HftError, OrderId, OrderType, Price, Quantity, Symbol, TimeInForce, Timestamp,
+    VenueId, VenueSymbol,
 };
 use ports::{
     BoxStream, ConnectionHealth, ExecutionClient, ExecutionEvent, HftResult, OpenOrder,
@@ -28,7 +28,7 @@ use tokio::{
 };
 use tokio_stream::wrappers::ReceiverStream;
 
-use book_matching::{valid_book, BookBudget};
+use book_matching::{displayed_snapshot, valid_book};
 
 const DEFAULT_FILL_DELAY_MS: u64 = 50;
 const DEFAULT_EVENT_QUEUE_CAPACITY: usize = 4096;
@@ -182,7 +182,11 @@ fn match_orders(
     // orders, so disappearance/reappearance is not mistaken for unchanged depth.
     for (symbol, budget) in &mut state.books {
         if let Some(book) = view.get_orderbook(&VenueSymbol::new(venue, symbol.clone())) {
-            budget.observe(book, now);
+            if let Some(snapshot) = displayed_snapshot(book) {
+                budget.observe(&snapshot, now);
+            } else {
+                budget.clear_levels();
+            }
         } else {
             budget.clear_levels();
         }
@@ -202,10 +206,20 @@ fn match_orders(
         let mut budget = state.books.get(&symbol).cloned().unwrap_or_default();
         let observed = view
             .get_orderbook(&VenueSymbol::new(venue, symbol.clone()))
-            .is_some_and(|book| budget.observe(book, now));
+            .and_then(displayed_snapshot)
+            .is_some_and(|snapshot| budget.observe(&snapshot, now));
         let original_budget = budget.clone();
         let mut fills = if observed {
-            budget.fills(&pending.order)
+            budget
+                .fills(
+                    pending.order.side,
+                    pending.order.order_type,
+                    pending.order.price,
+                    pending.order.remaining_quantity,
+                )
+                .into_iter()
+                .map(|fill| (fill.price, fill.quantity))
+                .collect()
         } else {
             Vec::new()
         };
@@ -567,6 +581,22 @@ mod tests {
         assert!(client.list_open_orders().await.unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn simulated_market_order_rejects_a_malformed_displayed_book() {
+        let mut client = SimulatedExecutionClient::new(VenueId::MOCK);
+        let mut malformed = book_view(2, 1, hft_core::now_micros());
+        let book = Arc::make_mut(malformed.orderbooks.values_mut().next().unwrap());
+        book.bid_quantities.pop();
+        assert!(client
+            .market_binding()
+            .set(Arc::new(snapshot::ArcSwapPublisher::new(malformed)))
+            .is_ok());
+        client.connected.store(true, Ordering::Release);
+
+        assert!(client.place_order(test_intent()).await.is_err());
+        assert!(client.list_open_orders().await.unwrap().is_empty());
+    }
+
     #[test]
     fn simulated_execution_is_marked_non_external() {
         let client = SimulatedExecutionClient::new(VenueId::MOCK);
@@ -615,7 +645,7 @@ mod tests {
         bind_book(&client);
         let mut intent = test_intent();
         intent.quantity = Quantity(Decimal::from(5));
-        intent.price = None;
+        intent.price = Some(Price(Decimal::from(100)));
         client.place_order(intent).await.unwrap();
         events(&client).await;
         tick(&client, &book_view(2, 1, hft_core::now_micros()))
@@ -643,6 +673,31 @@ mod tests {
             Some(ExecutionEvent::OrderCanceled { .. })
         ));
         assert!(client.list_open_orders().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_displayed_book_does_not_fill_an_existing_paper_order() {
+        let mut client = SimulatedExecutionClient::new(VenueId::MOCK);
+        client.fill_delay_ms = 5_000;
+        bind_book(&client);
+        let mut intent = test_intent();
+        intent.order_type = OrderType::Limit;
+        intent.time_in_force = TimeInForce::GTC;
+        intent.price = Some(Price(Decimal::from(101)));
+        intent.quantity = Quantity(Decimal::from(1));
+        let order_id = client.place_order(intent).await.unwrap();
+        events(&client).await;
+
+        let mut malformed = book_view(2, 2, hft_core::now_micros());
+        let book = Arc::make_mut(malformed.orderbooks.values_mut().next().unwrap());
+        book.ask_quantities.pop();
+        tick(&client, &malformed).await.unwrap();
+
+        assert!(events(&client).await.is_empty());
+        let open_orders = client.list_open_orders().await.unwrap();
+        assert_eq!(open_orders.len(), 1);
+        assert_eq!(open_orders[0].order_id, order_id);
+        assert_eq!(open_orders[0].filled_quantity.0, Decimal::ZERO);
     }
 
     #[tokio::test]

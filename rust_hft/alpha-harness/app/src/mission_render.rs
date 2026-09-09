@@ -873,7 +873,7 @@ pub(crate) fn render_cex_bundle(
         .position_policy
         .decision_policy();
     let weight_policy = CexEqualAbsoluteWeightPolicyV1::controlled_v1(WEIGHT_POLICY_ID)?;
-    let replay_policy = CexEventReplayPolicyV1::controlled_v1(
+    let replay_policy = CexEventReplayPolicyV1::controlled_v2(
         REPLAY_POLICY_ID,
         materialization.top_depth,
         materialization.bucket_ms,
