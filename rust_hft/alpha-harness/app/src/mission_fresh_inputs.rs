@@ -221,43 +221,79 @@ pub fn prepare(args: PrepareFreshInputsArgs) -> anyhow::Result<()> {
         &expected_selection,
     )?;
 
-    let complete = args.campaign_inputs_out.is_file();
     let run_exists = run_root.try_exists()?;
-    if complete {
-        let request_sha256 = ensure_preparation_request(&args.request_out, &request, false)?;
-        let (selection, selection_sha256) = read_selection(&expected_selection, &request, &args)?;
-        let inventory = inventory_from_selection(&args, &selection)?;
-        verify_inventory_matches(&args.inventory_out, &inventory)?;
-        let verified = verify_materialized_outputs(&args, &run_root, &args.inventory_out)?;
-        let fingerprint = input_fingerprint(&args, &request_sha256, &verified.inventory_sha256)?;
-        if fingerprint != selection.input_fingerprint_sha256 {
-            bail!("selected fresh window fingerprint differs from frozen inventory");
-        }
-        let report = preparation_report(
-            &args,
-            &run_root,
-            &verified,
-            &fingerprint,
-            &request_sha256,
-            &selection,
-            &selection_sha256,
-        )?;
-        write_report_create_once(args.report_out.as_deref(), &report)?;
-        return print_json(&PreparationOutput {
-            report,
-            reused_existing: true,
-        });
+    if run_exists && !args.request_out.is_file() {
+        bail!("fresh preparation request identity is missing for an existing output prefix");
     }
-    if run_exists {
-        if !args.request_out.is_file() {
-            bail!("fresh preparation request identity is missing for an existing output prefix");
-        }
-        bail!(
-            "fresh materializer output prefix is present without a complete campaign-inputs receipt: {}",
-            run_root.display()
-        );
+    if run_exists && !expected_selection.is_file() {
+        bail!("fresh window selection identity is missing for an existing output prefix");
     }
-    let request_sha256 = ensure_preparation_request(&args.request_out, &request, true)?;
+    let request_sha256 = ensure_preparation_request(&args.request_out, &request, !run_exists)?;
+    let mut partial_owner_verified = false;
+    if args.campaign_inputs_out.is_file() {
+        let complete_result = (|| -> anyhow::Result<PreparationOutput> {
+            let (selection, selection_sha256) =
+                read_selection(&expected_selection, &request, &args)?;
+            let inventory = inventory_from_selection(&args, &selection)?;
+            verify_inventory_matches(&args.inventory_out, &inventory)?;
+            let verified = verify_materialized_outputs(&args, &run_root, &args.inventory_out)?;
+            let fingerprint =
+                input_fingerprint(&args, &request_sha256, &verified.inventory_sha256)?;
+            if fingerprint != selection.input_fingerprint_sha256 {
+                bail!("selected fresh window fingerprint differs from frozen inventory");
+            }
+            let report = preparation_report(
+                &args,
+                &run_root,
+                &verified,
+                &fingerprint,
+                &request_sha256,
+                &selection,
+                &selection_sha256,
+            )?;
+            write_report_create_once(args.report_out.as_deref(), &report)?;
+            Ok(PreparationOutput {
+                report,
+                reused_existing: true,
+            })
+        })();
+        match complete_result {
+            Ok(output) => return print_json(&output),
+            Err(full_error) => {
+                verify_partial_materialized_outputs(
+                    &args,
+                    &run_root,
+                    &args.campaign_inputs_out,
+                )
+                .with_context(|| {
+                    format!(
+                        "complete fresh output failed verification and cannot be safely resumed: {full_error}"
+                    )
+                })?;
+                partial_owner_verified = true;
+            }
+        }
+    }
+    if run_exists && !partial_owner_verified {
+        let staged_owner = args
+            .materializer_work_dir
+            .join("staged-output/receipts/campaign-inputs.json");
+        if args.campaign_inputs_out.is_file() {
+            verify_partial_materialized_outputs(&args, &run_root, &args.campaign_inputs_out)?;
+        } else if staged_owner.is_file() {
+            verify_partial_materialized_outputs(
+                &args,
+                &args.materializer_work_dir.join("staged-output"),
+                &staged_owner,
+            )?;
+            verify_partial_materialized_outputs(&args, &run_root, &staged_owner)?;
+        } else {
+            bail!(
+                "existing fresh materializer output has no verifiable preparation owner: {}",
+                run_root.display()
+            );
+        }
+    }
 
     let (selection, selection_sha256) = if expected_selection.is_file() {
         read_selection(&expected_selection, &request, &args)?
@@ -1184,6 +1220,65 @@ fn verify_materialized_outputs(
         replay_artifact_sha256,
         replay_manifest_sha256,
     })
+}
+
+/// Validate the owner/hash evidence that makes a partial materializer output
+/// safe to resume. Missing known files are allowed because the entrypoint may
+/// have been interrupted between two create-once publishes; existing files,
+/// receipts, and inventory are never overwritten or silently accepted when
+/// their identity differs.
+fn verify_partial_materialized_outputs(
+    args: &PrepareFreshInputsArgs,
+    run_root: &Path,
+    owner_receipt_path: &Path,
+) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(run_root).with_context(|| {
+        format!(
+            "fresh materializer run root is missing: {}",
+            run_root.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "fresh materializer run root must be a real directory: {}",
+            run_root.display()
+        );
+    }
+    let owner: CampaignInputsReceipt = read_json_bounded(owner_receipt_path)?;
+    validate_campaign_receipt(args, run_root, &owner)?;
+    let owner_sha256 = sha256_file(owner_receipt_path)?;
+    for item in [
+        &owner.feature,
+        &owner.materialization,
+        &owner.replay_artifact,
+        &owner.replay_manifest,
+    ] {
+        let path = run_root.join(&item.relative_path);
+        if path.try_exists()? {
+            verify_item(run_root, item, "partial Campaign output", MAX_INPUT_BYTES)?;
+        }
+    }
+    let inventory = run_root.join("receipts/frozen-inventory.env");
+    if inventory.try_exists()? {
+        ensure_regular_file(&inventory, "partial frozen inventory")?;
+        let expected = sha256_file(&args.inventory_out)?;
+        if sha256_file(&inventory)? != expected {
+            bail!("partial frozen inventory SHA256 differs from the requested inventory");
+        }
+    }
+    let materialization_path = run_root.join("receipts/materialization-receipt.json");
+    if materialization_path.try_exists()? {
+        let materialization: MaterializationReceipt = read_json_bounded(&materialization_path)?;
+        if materialization.schema_version != MATERIALIZATION_RECEIPT_SCHEMA
+            || materialization.run_id != owner.run_id
+            || materialization.source_revision != BUILD_SOURCE_REVISION
+            || materialization.image_ref != args.image_ref
+            || materialization.campaign_inputs_sha256 != owner_sha256
+        {
+            bail!("partial materialization receipt identity differs from its owner receipt");
+        }
+    }
+    Ok(())
 }
 
 fn validate_campaign_receipt(

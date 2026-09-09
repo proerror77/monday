@@ -13,7 +13,7 @@ use data::binance_market_tape::{
 use serde::Serialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::{
     fs::{self, File, OpenOptions},
@@ -582,30 +582,48 @@ fn scan_raw_window_candidates(
     Ok(candidates)
 }
 
+#[derive(Debug)]
+struct RawWindowChoices {
+    windows: Vec<(u64, u64, Vec<usize>)>,
+    evaluated_endpoints: usize,
+}
+
 fn choose_latest_raw_windows(
     candidates: &[RawWindowCandidate],
     duration_ns: u64,
     max_candidates: usize,
-) -> Result<Vec<(u64, u64, Vec<RawWindowCandidate>)>> {
+    max_inputs: usize,
+) -> Result<RawWindowChoices> {
     if max_candidates == 0 {
         bail!("latest fresh window candidate budget is zero");
+    }
+    if max_inputs == 0 {
+        bail!("latest fresh window input budget is zero");
     }
 
     // A manifest's start/end are the first/last received event clocks, not a
     // promised wall-clock lease. A candidate therefore qualifies by its
     // observed span; cross-segment checkpoint, stream, and sequence continuity
     // remains the materializer's final authority.
-    let mut by_contract = BTreeMap::<String, Vec<RawWindowCandidate>>::new();
-    for candidate in candidates {
+    let mut by_contract = BTreeMap::<String, Vec<usize>>::new();
+    for (index, candidate) in candidates.iter().enumerate() {
         by_contract
             .entry(candidate.contract_key.clone())
             .or_default()
-            .push(candidate.clone());
+            .push(index);
     }
 
-    let mut windows = Vec::new();
+    #[derive(Debug)]
+    struct EndpointCursor {
+        ordered: Vec<usize>,
+        endpoints: Vec<usize>,
+    }
+
+    let mut cursors = Vec::with_capacity(by_contract.len());
     for mut ordered in by_contract.into_values() {
         ordered.sort_by(|left, right| {
+            let left = &candidates[*left];
+            let right = &candidates[*right];
             (
                 left.start_received_at_ns,
                 left.end_received_at_ns,
@@ -617,59 +635,103 @@ fn choose_latest_raw_windows(
                     &right.path,
                 ))
         });
-        let mut ends = ordered
-            .iter()
-            .map(|candidate| candidate.end_received_at_ns)
-            .collect::<Vec<_>>();
-        ends.sort_unstable_by(|left, right| right.cmp(left));
-        ends.dedup();
-        for window_end in ends {
-            let window_start = window_end
-                .checked_sub(duration_ns)
-                .context("latest fresh window duration exceeds its clock")?;
-            let mut selected = ordered
-                .iter()
-                .filter(|candidate| {
-                    candidate.start_received_at_ns < window_end
-                        && candidate.end_received_at_ns > window_start
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            if selected.is_empty() {
-                continue;
-            }
-            selected.sort_by(|left, right| {
-                (
-                    left.start_received_at_ns,
+        // Keep only endpoint indices, rather than cloning full manifests. The
+        // endpoint stream is later merged globally, so no contract can make
+        // construction exceed the explicit total candidate budget.
+        let mut endpoints = ordered.clone();
+        endpoints.sort_by(|left, right| {
+            let left = &candidates[*left];
+            let right = &candidates[*right];
+            (
+                right.end_received_at_ns,
+                right.start_received_at_ns,
+                &right.path,
+            )
+                .cmp(&(
                     left.end_received_at_ns,
+                    left.start_received_at_ns,
                     &left.path,
-                )
-                    .cmp(&(
-                        right.start_received_at_ns,
-                        right.end_received_at_ns,
-                        &right.path,
-                    ))
-            });
-            let observed_start = selected
-                .iter()
-                .map(|candidate| candidate.start_received_at_ns)
-                .min()
-                .context("latest fresh candidate set is empty")?;
-            let observed_end = selected
-                .iter()
-                .map(|candidate| candidate.end_received_at_ns)
-                .max()
-                .context("latest fresh candidate set is empty")?;
-            if observed_start <= window_start && observed_end >= window_end {
-                windows.push((window_start, window_end, selected));
-            }
+                ))
+        });
+        endpoints.dedup_by(|left, right| {
+            candidates[*left].end_received_at_ns == candidates[*right].end_received_at_ns
+        });
+        cursors.push(EndpointCursor { ordered, endpoints });
+    }
+
+    // K-way merge the newest endpoint from each contract. Only the newest
+    // global `max_candidates` endpoints can be returned or sent to reference
+    // fallback; older endpoints are never expanded into temporary windows.
+    let mut heap = BinaryHeap::new();
+    for (cursor_index, cursor) in cursors.iter().enumerate() {
+        if let Some(&endpoint) = cursor.endpoints.first() {
+            let candidate = &candidates[endpoint];
+            heap.push((
+                candidate.end_received_at_ns,
+                candidate.start_received_at_ns,
+                endpoint,
+                cursor_index,
+                0_usize,
+            ));
         }
     }
-    windows.sort_by(|left, right| {
-        (right.1, right.0, &right.2[0].path).cmp(&(left.1, left.0, &left.2[0].path))
-    });
-    windows.truncate(max_candidates);
-    Ok(windows)
+    let mut windows: Vec<(u64, u64, Vec<usize>)> = Vec::with_capacity(max_candidates);
+    let mut evaluated_endpoints = 0;
+    while evaluated_endpoints < max_candidates {
+        let Some((_end, _start, endpoint, cursor_index, endpoint_position)) = heap.pop() else {
+            break;
+        };
+        evaluated_endpoints += 1;
+        let ordered = &cursors[cursor_index].ordered;
+        let window_end = candidates[endpoint].end_received_at_ns;
+        let window_start = window_end
+            .checked_sub(duration_ns)
+            .context("latest fresh window duration exceeds its clock")?;
+        let mut selected = Vec::with_capacity(max_inputs.min(ordered.len()));
+        let mut observed_start = u64::MAX;
+        let mut observed_end = 0;
+        for index in ordered {
+            let candidate = &candidates[*index];
+            if candidate.start_received_at_ns < window_end
+                && candidate.end_received_at_ns > window_start
+            {
+                // A window with too many raw inputs cannot pass the final
+                // request count budget. Stop collecting it immediately so
+                // a large archive cannot allocate a giant overlap vector.
+                if selected.len() == max_inputs {
+                    selected.clear();
+                    break;
+                }
+                observed_start = observed_start.min(candidate.start_received_at_ns);
+                observed_end = observed_end.max(candidate.end_received_at_ns);
+                selected.push(*index);
+            }
+        }
+        if !selected.is_empty() && observed_start <= window_start && observed_end >= window_end {
+            windows.push((window_start, window_end, selected));
+            windows.sort_by(|left, right| {
+                let left_path = left.2.first().map(|index| &candidates[*index].path);
+                let right_path = right.2.first().map(|index| &candidates[*index].path);
+                (right.1, right.0, right_path).cmp(&(left.1, left.0, left_path))
+            });
+            windows.truncate(max_candidates);
+        }
+        let next_position = endpoint_position + 1;
+        if let Some(&next_endpoint) = cursors[cursor_index].endpoints.get(next_position) {
+            let next_candidate = &candidates[next_endpoint];
+            heap.push((
+                next_candidate.end_received_at_ns,
+                next_candidate.start_received_at_ns,
+                next_endpoint,
+                cursor_index,
+                next_position,
+            ));
+        }
+    }
+    Ok(RawWindowChoices {
+        windows,
+        evaluated_endpoints,
+    })
 }
 
 fn scan_reference_window_candidates(
@@ -848,14 +910,27 @@ pub fn select_fresh_window(request: &FreshWindowRequest) -> Result<FreshWindowSe
                 bail!("latest fresh window cutoff is in the future");
             }
             let candidates = scan_raw_window_candidates(request, cutoff_received_at_ns)?;
-            let windows = choose_latest_raw_windows(&candidates, duration_ns, max_candidates)?;
+            let choices = choose_latest_raw_windows(
+                &candidates,
+                duration_ns,
+                max_candidates,
+                request.max_inputs,
+            )?;
+            let RawWindowChoices {
+                windows,
+                evaluated_endpoints: _evaluated_endpoints,
+            } = choices;
             if windows.is_empty() {
                 bail!("no complete latest fresh window covers the requested duration");
             }
             let reference_candidates = scan_reference_window_candidates(request)?;
             let mut remaining_bytes = request.max_input_bytes;
             let mut reference_cache = BTreeMap::new();
-            for (_requested_start, _requested_end, selected_candidates) in windows {
+            for (_requested_start, _requested_end, selected_indices) in windows {
+                let selected_candidates = selected_indices
+                    .into_iter()
+                    .map(|index| candidates[index].clone())
+                    .collect::<Vec<_>>();
                 let observed_start = selected_candidates
                     .iter()
                     .map(|candidate| candidate.start_received_at_ns)
@@ -1728,6 +1803,38 @@ mod tests {
         };
         assert!(select_fresh_window(&latest(2_000, 1_000_000)).is_err());
         assert!(select_fresh_window(&latest(1, 1)).is_err());
+    }
+
+    #[test]
+    fn latest_window_construction_is_bounded_for_a_large_archive() {
+        let candidates = (0..10_000)
+            .map(|index| {
+                let start = 1_700_000_000_000_000_000 + index * 1_000;
+                RawWindowCandidate {
+                    path: PathBuf::from(format!("segment-{index:05}.manifest.json")),
+                    manifest: Map::new(),
+                    manifest_sha256: "a".repeat(64),
+                    contract_key: "one-contract".into(),
+                    start_received_at_ns: start,
+                    end_received_at_ns: start + 500,
+                }
+            })
+            .collect::<Vec<_>>();
+        let choices = choose_latest_raw_windows(&candidates, 100, 5, 4).unwrap();
+
+        // The constructor only evaluates the latest bounded endpoints and
+        // retains at most the requested number of bounded index descriptors;
+        // it never materializes every end x overlap combination.
+        assert_eq!(choices.evaluated_endpoints, 5);
+        assert_eq!(choices.windows.len(), 5);
+        assert!(choices
+            .windows
+            .iter()
+            .all(|(_, _, selected)| selected.len() <= 4));
+        assert!(choices
+            .windows
+            .windows(2)
+            .all(|pair| pair[0].1 >= pair[1].1));
     }
 
     #[test]

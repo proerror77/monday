@@ -269,18 +269,121 @@ grep -q '"output_object_base_url": "https://monday-lob-apne1-1045353359.oss-ap-n
 grep -q '"relative_path": "artifacts/materialization/feature-test.jsonl"' "$RUN_ROOT/receipts/campaign-inputs.json"
 grep -q '"object_url": "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/cex-materialization/test-run-1/artifacts/materialization/feature-test.jsonl"' "$RUN_ROOT/receipts/campaign-inputs.json"
 
-if sh "$ENTRYPOINT" \
+if ! sh "$ENTRYPOINT" \
   --inventory "$ROOT/inventory.env" \
   --raw-root "$RAW_ROOT" \
   --reference-root "$REF_ROOT" \
   --output-root "$OUT_ROOT" \
   --work-dir "$WORK_ROOT-second" \
   --binary-dir "$BIN_DIR" >/dev/null 2>"$ROOT/replay.err"; then
-  printf 'expected duplicate prefix preflight to fail\n' >&2
+  printf 'same-owner prefix recovery unexpectedly failed\n' >&2
   exit 1
 fi
-grep -q 'output prefix already exists' "$ROOT/replay.err"
-grep -q 'schema_version=monday.research_event.v1 component=cex-materialization event=run_failed' "$ROOT/replay.err"
+grep -q 'artifact_publish_reused' "$ROOT/replay.err"
+
+# A publish can be interrupted after any of the seven evidence files. The
+# staged owner receipt and per-file hashes make each same-request retry resume
+# the missing suffix without deleting unknown output or selecting a new prefix.
+for fail_after in 1 2 3 4 5 6 7; do
+  recovery_root="$ROOT/recovery-$fail_after"
+  recovery_output="$recovery_root/output"
+  recovery_work="$recovery_root/work"
+  mkdir -p "$recovery_output" "$recovery_work"
+  sed \
+    -e "s/RUN_ID=test-run-1/RUN_ID=recovery-$fail_after/" \
+    -e "s/OUTPUT_PREFIX=test-run-1/OUTPUT_PREFIX=recovery-$fail_after/" \
+    "$ROOT/inventory.env" >"$recovery_root/inventory.env"
+  if CEX_MATERIALIZATION_FAIL_AFTER_PUBLISH="$fail_after" sh "$ENTRYPOINT" \
+    --inventory "$recovery_root/inventory.env" \
+    --raw-root "$RAW_ROOT" \
+    --reference-root "$REF_ROOT" \
+    --output-root "$recovery_output" \
+    --work-dir "$recovery_work" \
+    --binary-dir "$BIN_DIR" >/dev/null 2>"$recovery_root/first.err"; then
+    printf 'expected publish interruption after %s\n' "$fail_after" >&2
+    exit 1
+  fi
+  if ! sh "$ENTRYPOINT" \
+    --inventory "$recovery_root/inventory.env" \
+    --raw-root "$RAW_ROOT" \
+    --reference-root "$REF_ROOT" \
+    --output-root "$recovery_output" \
+    --work-dir "$recovery_work" \
+    --binary-dir "$BIN_DIR" >/dev/null 2>"$recovery_root/retry.err"; then
+    cat "$recovery_root/retry.err" >&2
+    exit 1
+  fi
+  recovery_run_root="$recovery_output/recovery-$fail_after"
+  for evidence in \
+    receipts/campaign-inputs.json \
+    receipts/materialization-receipt.json \
+    receipts/frozen-inventory.env \
+    artifacts/materialization/feature-test.jsonl \
+    artifacts/replay/replay-test.parquet \
+    artifacts/replay/replay-test.canonical-manifest.json; do
+    [ -f "$recovery_run_root/$evidence" ] || {
+      printf 'recovery after %s did not publish %s\n' "$fail_after" "$evidence" >&2
+      exit 1
+    }
+  done
+  recovery_report=$(find "$recovery_run_root/artifacts/materialization" -maxdepth 1 -type f -name '*.materialization.json')
+  [ -n "$recovery_report" ] || {
+    printf 'recovery after %s did not publish materialization report\n' "$fail_after" >&2
+    exit 1
+  }
+done
+
+# A same-request retry with a changed published file is rejected before the
+# materializer is invoked; the mismatched evidence remains for investigation.
+tamper_root="$ROOT/recovery-tamper"
+mkdir -p "$tamper_root/output" "$tamper_root/work"
+sed \
+  -e 's/RUN_ID=test-run-1/RUN_ID=recovery-tamper/' \
+  -e 's/OUTPUT_PREFIX=test-run-1/OUTPUT_PREFIX=recovery-tamper/' \
+  "$ROOT/inventory.env" >"$tamper_root/inventory.env"
+if CEX_MATERIALIZATION_FAIL_AFTER_PUBLISH=1 sh "$ENTRYPOINT" \
+  --inventory "$tamper_root/inventory.env" \
+  --raw-root "$RAW_ROOT" \
+  --reference-root "$REF_ROOT" \
+  --output-root "$tamper_root/output" \
+  --work-dir "$tamper_root/work" \
+  --binary-dir "$BIN_DIR" >/dev/null 2>"$tamper_root/first.err"; then
+  printf 'expected tamper fixture interruption to fail\n' >&2
+  exit 1
+fi
+tamper_file="$tamper_root/output/recovery-tamper/artifacts/materialization/feature-test.jsonl"
+printf 'tampered\n' >"$tamper_file"
+if sh "$ENTRYPOINT" \
+  --inventory "$tamper_root/inventory.env" \
+  --raw-root "$RAW_ROOT" \
+  --reference-root "$REF_ROOT" \
+  --output-root "$tamper_root/output" \
+  --work-dir "$tamper_root/work" \
+  --binary-dir "$BIN_DIR" >/dev/null 2>"$tamper_root/retry.err"; then
+  printf 'expected tampered recovery to fail\n' >&2
+  exit 1
+fi
+grep -q 'recovery artifact SHA differs' "$tamper_root/retry.err"
+
+# A receipt from another run cannot claim an existing prefix. This fails
+# before creating a staged work directory or running any materializer.
+foreign_root="$ROOT/foreign"
+mkdir -p "$foreign_root/output/test-run-1/receipts"
+sed \
+  -e 's/"run_id": "test-run-1"/"run_id": "foreign-run"/' \
+  "$RUN_ROOT/receipts/campaign-inputs.json" >"$foreign_root/output/test-run-1/receipts/campaign-inputs.json"
+cp "$ROOT/inventory.env" "$foreign_root/inventory.env"
+if sh "$ENTRYPOINT" \
+  --inventory "$foreign_root/inventory.env" \
+  --raw-root "$RAW_ROOT" \
+  --reference-root "$REF_ROOT" \
+  --output-root "$foreign_root/output" \
+  --work-dir "$foreign_root/work" \
+  --binary-dir "$BIN_DIR" >/dev/null 2>"$foreign_root/retry.err"; then
+  printf 'expected foreign recovery owner to fail\n' >&2
+  exit 1
+fi
+grep -q 'recovery owner receipt run_id differs' "$foreign_root/retry.err"
 
 SHARD_ROOT=$(mktemp -d)
 trap 'rm -rf "$ROOT" "$SHARD_ROOT"' EXIT
@@ -411,7 +514,7 @@ four_shard_shas=$(run_prefixed_shards test-run-4shard 4)
 [ "$two_shard_shas" = "$one_shard_shas" ]
 [ "$two_shard_shas" = "$four_shard_shas" ]
 
-if JOB_COMPLETION_INDEX= run_role slice "$SHARD_ROOT/work-no-index" --shard-count 2 >/dev/null 2>"$SHARD_ROOT/no-index.err"; then
+if JOB_COMPLETION_INDEX='' run_role slice "$SHARD_ROOT/work-no-index" --shard-count 2 >/dev/null 2>"$SHARD_ROOT/no-index.err"; then
   printf 'expected missing shard-index to fail\n' >&2
   exit 1
 fi

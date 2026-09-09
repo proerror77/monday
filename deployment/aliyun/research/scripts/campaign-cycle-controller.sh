@@ -103,6 +103,96 @@ sha256_file() {
   fi
 }
 
+build_fresh_controller_contract() {
+  seeds_json=$(printf '%s\n' "${seeds[@]}" | jq -R 'tonumber' | jq -s '.')
+  fresh_state_json=$(jq -n \
+    --arg raw_root "$fresh_raw_root" \
+    --arg reference_root "$fresh_reference_root" \
+    --arg start_received_at_ns "$fresh_start_received_at_ns" \
+    --arg end_received_at_ns "$fresh_end_received_at_ns" \
+    --arg symbol "$fresh_symbol" \
+    --arg image_ref "$fresh_image_ref" \
+    --arg mission_id "$fresh_mission_id" \
+    --arg output_root "$fresh_output_root" \
+    --arg output_prefix "$fresh_output_prefix" \
+    --arg bucket_ms "$fresh_bucket_ms" \
+    --arg label_horizon_buckets "$fresh_label_horizon_buckets" \
+    --arg top_depth "$fresh_top_depth" \
+    --arg duration_ns "$fresh_duration_ns" \
+    --arg cutoff_received_at_ns "$fresh_cutoff_received_at_ns" \
+    --arg max_candidates "$fresh_max_candidates" \
+    --arg materializer "$fresh_materializer" \
+    --arg binary_dir "$fresh_binary_dir" \
+    --arg max_scan_entries "$fresh_max_scan_entries" \
+    --arg max_inputs "$fresh_max_inputs" \
+    --arg max_input_bytes "$fresh_max_input_bytes" \
+    --arg materializer_timeout_seconds "$fresh_materializer_timeout_seconds" \
+    --arg max_materializer_output_bytes "$fresh_max_materializer_output_bytes" \
+    --arg inventory_out "$fresh_inventory_out" \
+    --arg request_out "$fresh_request_out" \
+    --arg materializer_work_dir "$fresh_materializer_work_dir" \
+    --arg preparation_report "$fresh_report_out" \
+    '{
+      raw_root:$raw_root,reference_root:$reference_root,
+      start_received_at_ns:$start_received_at_ns,end_received_at_ns:$end_received_at_ns,
+      symbol:$symbol,image_ref:$image_ref,mission_id:$mission_id,
+      output_root:$output_root,output_prefix:$output_prefix,
+      bucket_ms:$bucket_ms,label_horizon_buckets:$label_horizon_buckets,top_depth:$top_depth,
+      duration_ns:$duration_ns,cutoff_received_at_ns:$cutoff_received_at_ns,
+      max_candidates:$max_candidates,
+      materializer:$materializer,binary_dir:$binary_dir,
+      max_scan_entries:$max_scan_entries,max_inputs:$max_inputs,max_input_bytes:$max_input_bytes,
+      materializer_timeout_seconds:$materializer_timeout_seconds,
+      max_materializer_output_bytes:$max_materializer_output_bytes,
+      inventory_out:$inventory_out,request_out:$request_out,
+      materializer_work_dir:$materializer_work_dir,
+      preparation_report:$preparation_report
+    }')
+}
+
+validate_fresh_controller_owner() {
+  [[ "$mode" == "start" && "$fresh_mode" == true ]] || return 0
+  state="$work_dir/controller-inputs.json"
+  build_fresh_controller_contract
+  if [[ -e "$state" ]]; then
+    [[ ! -L "$state" ]] || die "existing controller state is a symbolic link: $state"
+    [[ -s "$state" ]] || die "existing controller state is empty: $state"
+    validate_controller_state "$state"
+    jq -e \
+      --arg campaign_inputs "$campaign_inputs" \
+      --arg input_root "$input_root" \
+      --arg source_revision "$source_revision" \
+      --arg image "$image" \
+      --arg campaign_root "$campaign_root" \
+      --arg context "$context" \
+      --arg namespace "$namespace" \
+      --arg job_timeout "$job_timeout" \
+      --argjson max_follow_ups "$max_follow_ups" \
+      --argjson seeds "$seeds_json" \
+      --argjson fresh "$fresh_state_json" \
+      '.input_mode == "fresh"
+       and .campaign_inputs == $campaign_inputs
+       and .input_root == $input_root
+       and .source_revision == $source_revision
+       and .image == $image
+       and .campaign_root == $campaign_root
+       and .context == $context
+       and .namespace == $namespace
+       and .max_follow_ups == $max_follow_ups
+       and .job_timeout == $job_timeout
+       and .seeds == $seeds
+       and .fresh == $fresh' \
+      "$state" >/dev/null \
+      || die "existing work directory belongs to different fresh controller inputs"
+    [[ ! -L "$campaign_inputs" && -s "$campaign_inputs" ]] \
+      || die "existing fresh campaign inputs are missing or a symbolic link"
+    existing_campaign_inputs_sha256="$(jq -er '.campaign_inputs_sha256' "$state")" \
+      || die "existing fresh controller state has no campaign inputs SHA256"
+    [[ "$(sha256_file "$campaign_inputs")" == "$existing_campaign_inputs_sha256" ]] \
+      || die "existing fresh campaign inputs changed after controller state was recorded"
+  fi
+}
+
 # Persist the first complete learn report before publishing anything. A resumed
 # campaign-learn may return different execution diagnostics for the same plan.
 validate_learning_checkpoint() {
@@ -502,6 +592,11 @@ if [[ ! ("$mode" == "start" && "$fresh_mode" == true && -z "$signer") ]]; then
   command -v "$kubectl_cli" >/dev/null || die "kubectl executable not found"
 fi
 
+# Fresh preparation can publish to an external output prefix. Verify an
+# existing controller state before creating the work directory, logging a
+# preparation stage, or invoking that materializer.
+validate_fresh_controller_owner
+
 umask 077
 mkdir -p "$work_dir"
 chmod 700 "$work_dir"
@@ -720,49 +815,7 @@ else
   if [[ "$fresh_mode" == true ]]; then
     input_mode=fresh
     if [[ "$mode" == "start" ]]; then
-      fresh_state_json="$(jq -n \
-        --arg raw_root "$fresh_raw_root" \
-        --arg reference_root "$fresh_reference_root" \
-        --arg start_received_at_ns "$fresh_start_received_at_ns" \
-        --arg end_received_at_ns "$fresh_end_received_at_ns" \
-        --arg symbol "$fresh_symbol" \
-        --arg image_ref "$fresh_image_ref" \
-        --arg mission_id "$fresh_mission_id" \
-        --arg output_root "$fresh_output_root" \
-        --arg output_prefix "$fresh_output_prefix" \
-        --arg bucket_ms "$fresh_bucket_ms" \
-        --arg label_horizon_buckets "$fresh_label_horizon_buckets" \
-        --arg top_depth "$fresh_top_depth" \
-        --arg duration_ns "$fresh_duration_ns" \
-        --arg cutoff_received_at_ns "$fresh_cutoff_received_at_ns" \
-        --arg max_candidates "$fresh_max_candidates" \
-        --arg materializer "$fresh_materializer" \
-        --arg binary_dir "$fresh_binary_dir" \
-        --arg max_scan_entries "$fresh_max_scan_entries" \
-        --arg max_inputs "$fresh_max_inputs" \
-        --arg max_input_bytes "$fresh_max_input_bytes" \
-        --arg materializer_timeout_seconds "$fresh_materializer_timeout_seconds" \
-        --arg max_materializer_output_bytes "$fresh_max_materializer_output_bytes" \
-        --arg inventory_out "$fresh_inventory_out" \
-        --arg request_out "$fresh_request_out" \
-        --arg materializer_work_dir "$fresh_materializer_work_dir" \
-        --arg preparation_report "$fresh_report_out" \
-        '{
-          raw_root:$raw_root,reference_root:$reference_root,
-          start_received_at_ns:$start_received_at_ns,end_received_at_ns:$end_received_at_ns,
-          symbol:$symbol,image_ref:$image_ref,mission_id:$mission_id,
-          output_root:$output_root,output_prefix:$output_prefix,
-          bucket_ms:$bucket_ms,label_horizon_buckets:$label_horizon_buckets,top_depth:$top_depth,
-          duration_ns:$duration_ns,cutoff_received_at_ns:$cutoff_received_at_ns,
-          max_candidates:$max_candidates,
-          materializer:$materializer,binary_dir:$binary_dir,
-          max_scan_entries:$max_scan_entries,max_inputs:$max_inputs,max_input_bytes:$max_input_bytes,
-          materializer_timeout_seconds:$materializer_timeout_seconds,
-          max_materializer_output_bytes:$max_materializer_output_bytes,
-          inventory_out:$inventory_out,request_out:$request_out,
-          materializer_work_dir:$materializer_work_dir,
-          preparation_report:$preparation_report
-        }')"
+      build_fresh_controller_contract
     else
       fresh_state_json="$(jq -c '.fresh' "$state")"
     fi

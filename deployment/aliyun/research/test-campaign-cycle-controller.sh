@@ -861,6 +861,26 @@ fi
 test "$(<"$FAKE_STATE/fresh-preparation-count")" == 1
 test "$(<"$FAKE_STATE/dispatch-count")" == "$fresh_dispatch_before"
 
+# A changed fresh contract is rejected before preparation can write the
+# output prefix or invoke the materializer. This exercises the preflight
+# ownership check against the already persisted controller state.
+mismatched_fresh_args=("${fresh_args[@]}")
+for ((mismatch_index = 0; mismatch_index < ${#mismatched_fresh_args[@]}; mismatch_index++)); do
+  if [[ "${mismatched_fresh_args[mismatch_index]}" == "--fresh-output-prefix" ]]; then
+    mismatched_fresh_args[mismatch_index + 1]="campaign-inputs/changed-window"
+    break
+  fi
+done
+fresh_prepare_before_mismatch="$(<"$FAKE_STATE/fresh-preparation-count")"
+if FAKE_UNAME=Darwin "$controller" "${mismatched_fresh_args[@]}" \
+  >"$root/fresh-mismatch.stdout" 2>"$root/fresh-mismatch.stderr"; then
+  cat "$root/fresh-mismatch.stderr" >&2
+  exit 1
+fi
+test "$(<"$FAKE_STATE/fresh-preparation-count")" == "$fresh_prepare_before_mismatch"
+test ! -e "$fresh_output/campaign-inputs/changed-window"
+grep -Fq 'different fresh controller inputs' "$root/fresh-mismatch.stderr"
+
 if ! FAKE_UNAME=Darwin "$controller" approve \
   --alpha-harness "$bin/alpha-harness" \
   --aliyun "$bin/aliyun" \

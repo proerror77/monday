@@ -123,6 +123,16 @@ json_number_field() {
   printf '%s\n' "$matches" | sed -n '1p'
 }
 
+json_string_field_at() {
+  field=$1
+  index=$2
+  file=$3
+  matches=$(sed -n "s/^[[:space:]]*\"$field\":[[:space:]]*\"\\([^\"]*\\)\"[,]*/\1/p" "$file")
+  count=$(printf '%s\n' "$matches" | sed '/^$/d' | wc -l | tr -d ' ')
+  [ "$count" -ge "$index" ] || die "expected string $field field $index in $file, observed $count"
+  printf '%s\n' "$matches" | sed -n "${index}p"
+}
+
 canonical_relpath() {
   case "$1" in
     ''|/*|*'..'*)
@@ -154,7 +164,142 @@ object_url_for() {
 }
 
 ensure_unique_prefix() {
-  [ ! -e "$RUN_ROOT" ] || die "output prefix already exists: $RUN_ROOT"
+  [ ! -e "$RUN_ROOT" ] && return 0
+  [ "$ROLE" = all ] || die "output prefix already exists for a non-resumable role: $RUN_ROOT"
+  if [ -L "$RUN_ROOT" ] || [ ! -d "$RUN_ROOT" ]; then
+    die "existing output prefix is not a real directory: $RUN_ROOT"
+  fi
+  if [ -f "$RUN_ROOT/receipts/campaign-inputs.json" ]; then
+    verify_recovery_owner "$RUN_ROOT/receipts/campaign-inputs.json" "$RUN_ROOT" 1
+  elif [ -f "$LOCAL_RECEIPT_DIR/campaign-inputs.json" ]; then
+    # A crash before the campaign-inputs receipt reached the final prefix is
+    # recoverable only when the same work directory still owns the staged
+    # receipt. No prefix or work directory is guessed or silently replaced.
+    verify_recovery_owner "$LOCAL_RECEIPT_DIR/campaign-inputs.json" "$LOCAL_RUN_ROOT" 1
+    verify_recovery_owner "$LOCAL_RECEIPT_DIR/campaign-inputs.json" "$RUN_ROOT" 0
+  else
+    die "existing output prefix has no verifiable owner receipt: $RUN_ROOT"
+  fi
+}
+
+verify_recovery_owner() {
+  recovery_receipt=$1
+  recovery_root=$2
+  recovery_require_inventory=${3:-0}
+  for recovery_dir in \
+    "$recovery_root" \
+    "$recovery_root/artifacts" \
+    "$recovery_root/artifacts/materialization" \
+    "$recovery_root/artifacts/replay" \
+    "$recovery_root/receipts"; do
+    [ ! -L "$recovery_dir" ] || die "recovery directory is a symbolic link: $recovery_dir"
+  done
+  [ -f "$recovery_receipt" ] || die "recovery owner receipt is missing: $recovery_receipt"
+  [ ! -L "$recovery_receipt" ] || die "recovery owner receipt is a symbolic link: $recovery_receipt"
+  [ "$(json_string_field schema_version "$recovery_receipt")" = "monday.cex_campaign_inputs.v1" ] \
+    || die "recovery owner receipt schema is not Campaign inputs: $recovery_receipt"
+  [ "$(json_string_field run_id "$recovery_receipt")" = "$run_id" ] \
+    || die "recovery owner receipt run_id differs: $recovery_receipt"
+  [ "$(json_string_field source_revision "$recovery_receipt")" = "$source_revision" ] \
+    || die "recovery owner receipt source revision differs: $recovery_receipt"
+  [ "$(json_string_field image_ref "$recovery_receipt")" = "$image_ref" ] \
+    || die "recovery owner receipt image differs: $recovery_receipt"
+  [ "$(json_string_field mission_id "$recovery_receipt")" = "$mission_id" ] \
+    || die "recovery owner receipt mission differs: $recovery_receipt"
+  [ "$(json_string_field market "$recovery_receipt")" = "$market" ] \
+    || die "recovery owner receipt market differs: $recovery_receipt"
+  [ "$(json_string_field symbol "$recovery_receipt")" = "$symbol" ] \
+    || die "recovery owner receipt symbol differs: $recovery_receipt"
+  [ "$(json_string_field output_prefix "$recovery_receipt")" = "$output_prefix" ] \
+    || die "recovery owner receipt output prefix differs: $recovery_receipt"
+  recovery_campaign_sha=$(sha256_file "$recovery_receipt")
+  recovery_index=1
+  while [ "$recovery_index" -le 4 ]; do
+    recovery_rel=$(json_string_field_at relative_path "$recovery_index" "$recovery_receipt")
+    recovery_sha=$(json_string_field_at sha256 "$recovery_index" "$recovery_receipt")
+    canonical_relpath "$recovery_rel" || die "recovery owner path is unsafe: $recovery_rel"
+    recovery_path=$recovery_root/$recovery_rel
+    if [ -e "$recovery_path" ]; then
+      [ ! -L "$recovery_path" ] || die "recovery artifact is a symbolic link: $recovery_path"
+      [ -f "$recovery_path" ] || die "recovery artifact is not a regular file: $recovery_path"
+      [ "$(sha256_file "$recovery_path")" = "$recovery_sha" ] \
+        || die "recovery artifact SHA differs: $recovery_path"
+    fi
+    recovery_index=$((recovery_index + 1))
+  done
+  recovery_inventory=$recovery_root/receipts/frozen-inventory.env
+  if [ -f "$recovery_inventory" ]; then
+    [ ! -L "$recovery_inventory" ] || die "recovery inventory is a symbolic link: $recovery_inventory"
+    [ "$(sha256_file "$recovery_inventory")" = "$inventory_sha256" ] \
+      || die "recovery inventory SHA differs: $recovery_inventory"
+  elif [ "$recovery_require_inventory" -eq 1 ]; then
+    die "recovery inventory is missing: $recovery_inventory"
+  fi
+  recovery_materialization=$recovery_root/receipts/materialization-receipt.json
+  if [ -e "$recovery_materialization" ]; then
+    [ ! -L "$recovery_materialization" ] || die "recovery materialization receipt is a symbolic link: $recovery_materialization"
+    [ -f "$recovery_materialization" ] || die "recovery materialization receipt is not a regular file: $recovery_materialization"
+    [ "$(json_string_field schema_version "$recovery_materialization")" = "monday.cex_materialization_receipt.v1" ] \
+      || die "recovery materialization receipt schema differs: $recovery_materialization"
+    [ "$(json_string_field run_id "$recovery_materialization")" = "$run_id" ] \
+      || die "recovery materialization receipt run_id differs: $recovery_materialization"
+    [ "$(json_string_field source_revision "$recovery_materialization")" = "$source_revision" ] \
+      || die "recovery materialization receipt source revision differs: $recovery_materialization"
+    [ "$(json_string_field image_ref "$recovery_materialization")" = "$image_ref" ] \
+      || die "recovery materialization receipt image differs: $recovery_materialization"
+    [ "$(json_string_field inventory_sha256 "$recovery_materialization")" = "$inventory_sha256" ] \
+      || die "recovery materialization receipt inventory differs: $recovery_materialization"
+    [ "$(json_string_field campaign_inputs_sha256 "$recovery_materialization")" = "$recovery_campaign_sha" ] \
+      || die "recovery materialization receipt campaign inputs differs: $recovery_materialization"
+  fi
+}
+
+verify_recovery_stage() {
+  verify_recovery_owner "$LOCAL_RECEIPT_DIR/campaign-inputs.json" "$LOCAL_RUN_ROOT" 1
+  [ -f "$LOCAL_RECEIPT_DIR/materialization-receipt.json" ] \
+    || die "staged recovery materialization receipt is missing: $LOCAL_RECEIPT_DIR/materialization-receipt.json"
+  recovery_index=1
+  while [ "$recovery_index" -le 4 ]; do
+    recovery_rel=$(json_string_field_at relative_path "$recovery_index" "$LOCAL_RECEIPT_DIR/campaign-inputs.json")
+    recovery_sha=$(json_string_field_at sha256 "$recovery_index" "$LOCAL_RECEIPT_DIR/campaign-inputs.json")
+    recovery_path=$LOCAL_RUN_ROOT/$recovery_rel
+    [ -f "$recovery_path" ] || die "staged recovery artifact is missing: $recovery_path"
+    [ "$(sha256_file "$recovery_path")" = "$recovery_sha" ] \
+      || die "staged recovery artifact SHA differs: $recovery_path"
+    recovery_index=$((recovery_index + 1))
+  done
+}
+
+load_recovery_publish_state() {
+  recovery_receipt="$LOCAL_RECEIPT_DIR/campaign-inputs.json"
+  recovery_materialization_receipt="$LOCAL_RECEIPT_DIR/materialization-receipt.json"
+  campaign_inputs_sha=$(sha256_file "$recovery_receipt")
+  materialization_receipt_sha=$(sha256_file "$recovery_materialization_receipt")
+  recovery_index=1
+  recovery_feature_rel=$(json_string_field_at relative_path "$recovery_index" "$recovery_receipt")
+  recovery_feature_sha=$(json_string_field_at sha256 "$recovery_index" "$recovery_receipt")
+  recovery_index=$((recovery_index + 1))
+  recovery_materialization_rel=$(json_string_field_at relative_path "$recovery_index" "$recovery_receipt")
+  recovery_materialization_sha=$(json_string_field_at sha256 "$recovery_index" "$recovery_receipt")
+  recovery_index=$((recovery_index + 1))
+  recovery_replay_rel=$(json_string_field_at relative_path "$recovery_index" "$recovery_receipt")
+  recovery_replay_sha=$(json_string_field_at sha256 "$recovery_index" "$recovery_receipt")
+  recovery_index=$((recovery_index + 1))
+  recovery_manifest_rel=$(json_string_field_at relative_path "$recovery_index" "$recovery_receipt")
+  recovery_manifest_sha=$(json_string_field_at sha256 "$recovery_index" "$recovery_receipt")
+  feature_path=$LOCAL_RUN_ROOT/$recovery_feature_rel
+  feature_sha=$recovery_feature_sha
+  materialization_path=$LOCAL_RUN_ROOT/$recovery_materialization_rel
+  materialization_sha=$recovery_materialization_sha
+  replay_artifact_path=$LOCAL_RUN_ROOT/$recovery_replay_rel
+  replay_artifact_sha=$recovery_replay_sha
+  replay_manifest_path=$LOCAL_RUN_ROOT/$recovery_manifest_rel
+  replay_manifest_sha=$recovery_manifest_sha
+  feature_publish_path=$RUN_ROOT/$recovery_feature_rel
+  materialization_publish_path=$RUN_ROOT/$recovery_materialization_rel
+  replay_artifact_publish_path=$RUN_ROOT/$recovery_replay_rel
+  replay_manifest_publish_path=$RUN_ROOT/$recovery_manifest_rel
+  inventory_copy_sha=$inventory_sha256
 }
 
 ensure_unique_shard() {
@@ -239,7 +384,14 @@ publish_verified_file() {
   log "schema_version=monday.research_event.v1 component=cex-materialization event=artifact_publish_start run_id=$run_id stage=publish artifact=$publish_label sha256=$publish_expected_sha"
   [ -f "$publish_source" ] || die "$publish_label source is missing: $publish_source"
   [ "$(sha256_file "$publish_source")" = "$publish_expected_sha" ] || die "$publish_label source SHA mismatch"
-  [ ! -e "$publish_destination" ] || die "$publish_label destination already exists: $publish_destination"
+  if [ -e "$publish_destination" ]; then
+    [ ! -L "$publish_destination" ] || die "$publish_label destination is a symbolic link: $publish_destination"
+    [ -f "$publish_destination" ] || die "$publish_label destination is not a regular file: $publish_destination"
+    [ "$(sha256_file "$publish_destination")" = "$publish_expected_sha" ] \
+      || die "$publish_label existing destination SHA differs: $publish_destination"
+    log "schema_version=monday.research_event.v1 component=cex-materialization event=artifact_publish_reused run_id=$run_id stage=publish artifact=$publish_label sha256=$publish_expected_sha"
+    return 0
+  fi
   [ ! -e "$publish_temporary" ] || die "$publish_label temporary destination already exists: $publish_temporary"
   if ! cp "$publish_source" "$publish_temporary"; then
     rm -f "$publish_temporary"
@@ -256,6 +408,10 @@ publish_verified_file() {
   [ -f "$publish_destination" ] || die "$publish_label was not published: $publish_destination"
   [ "$(sha256_file "$publish_destination")" = "$publish_expected_sha" ] || die "$publish_label published readback SHA mismatch"
   log "schema_version=monday.research_event.v1 component=cex-materialization event=artifact_publish_complete run_id=$run_id stage=publish artifact=$publish_label sha256=$publish_expected_sha"
+  publish_count=$((publish_count + 1))
+  if [ "$fail_after_publish" -gt 0 ] && [ "$publish_count" -ge "$fail_after_publish" ]; then
+    die "test interruption after publish point $publish_count"
+  fi
 }
 
 rewrite_materialization_artifact_path() {
@@ -305,7 +461,6 @@ verify_triplet() {
   [ "$observed_sha" = "$expected_sha" ] || die "$label data SHA mismatch: expected $expected_sha observed $observed_sha"
   observed_manifest_sha=$(sha256_file "$manifest")
   [ "$observed_manifest_sha" = "$expected_manifest_sha" ] || die "$label manifest SHA mismatch: expected $expected_manifest_sha observed $observed_manifest_sha"
-  expected_success=$(printf '%s\n' "$expected_sha")
   observed_success=$(cat "$success")
   [ "$observed_success" = "$expected_sha" ] || die "$label success marker content mismatch"
   success_sha=$(sha256_file "$success")
@@ -347,6 +502,8 @@ DRY_RUN=0
 ROLE=all
 SHARD_INDEX=
 SHARD_COUNT=
+publish_count=0
+fail_after_publish=${CEX_MATERIALIZATION_FAIL_AFTER_PUBLISH:-0}
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -395,6 +552,10 @@ while [ $# -gt 0 ]; do
       ;;
   esac
 done
+
+case "$fail_after_publish" in
+  ''|*[!0-9]*) die "CEX_MATERIALIZATION_FAIL_AFTER_PUBLISH must be a non-negative integer" ;;
+esac
 
 [ -n "$INVENTORY" ] || usage
 [ -n "$RAW_ROOT" ] || usage
@@ -537,7 +698,6 @@ if [ "$ROLE" = "slice" ]; then
   SHARD_RECEIPT_PATH=$SHARD_DIR/receipt.json
 fi
 
-mkdir -p "$SLICE_ROOT" "$STATE_ROOT"
 case "$ROLE" in
   all)
     ensure_unique_prefix
@@ -550,11 +710,22 @@ case "$ROLE" in
     ;;
 esac
 
-if [ "$DRY_RUN" -ne 1 ] && [ "$ROLE" != "slice" ]; then
-  mkdir -p "$LOCAL_MATERIALIZATION_DIR" "$LOCAL_REPLAY_DIR" "$LOCAL_RECEIPT_DIR"
+resume_publish=0
+if [ "$ROLE" = all ] && [ -e "$RUN_ROOT" ] && [ -f "$LOCAL_RECEIPT_DIR/campaign-inputs.json" ]; then
+  verify_recovery_stage
+  resume_publish=1
 fi
 
-[ "$DRY_RUN" -eq 1 ] || {
+if [ "$resume_publish" -eq 1 ]; then
+  load_recovery_publish_state
+else
+  mkdir -p "$SLICE_ROOT" "$STATE_ROOT"
+
+  if [ "$DRY_RUN" -ne 1 ] && [ "$ROLE" != "slice" ]; then
+  mkdir -p "$LOCAL_MATERIALIZATION_DIR" "$LOCAL_REPLAY_DIR" "$LOCAL_RECEIPT_DIR"
+  fi
+
+  [ "$DRY_RUN" -eq 1 ] || {
   if [ "$ROLE" != "reduce" ]; then
     [ -x "$SLICER_BIN" ] || die "slicer binary is not executable: $SLICER_BIN"
   fi
@@ -562,9 +733,9 @@ fi
     [ -x "$PIT_BIN" ] || die "materializer binary is not executable: $PIT_BIN"
     [ -x "$REPLAY_BIN" ] || die "replay binary is not executable: $REPLAY_BIN"
   fi
-}
+  }
 
-log "schema_version=monday.research_event.v1 component=cex-materialization event=run_start run_id=$run_id mission_id=$mission_id market=$market symbol=$symbol bucket_ms=$bucket_ms label_horizon_buckets=$label_horizon_buckets top_depth=$top_depth output_window_start=${window_start_received_at_ns:-none} output_window_end=${window_end_received_at_ns:-none} raw_segments=$raw_segment_count references=$reference_count source_revision=$source_revision image_ref=$image_ref inventory_sha256=$inventory_sha256 dry_run=$DRY_RUN role=$ROLE shard_index=${SHARD_INDEX:-none} shard_count=${SHARD_COUNT:-none}"
+  log "schema_version=monday.research_event.v1 component=cex-materialization event=run_start run_id=$run_id mission_id=$mission_id market=$market symbol=$symbol bucket_ms=$bucket_ms label_horizon_buckets=$label_horizon_buckets top_depth=$top_depth output_window_start=${window_start_received_at_ns:-none} output_window_end=${window_end_received_at_ns:-none} raw_segments=$raw_segment_count references=$reference_count source_revision=$source_revision image_ref=$image_ref inventory_sha256=$inventory_sha256 dry_run=$DRY_RUN role=$ROLE shard_index=${SHARD_INDEX:-none} shard_count=${SHARD_COUNT:-none}"
 
 verify_raw_range() {
   verify_start=$1
@@ -946,6 +1117,7 @@ campaign_inputs_sha=$(sha256_file "$LOCAL_RECEIPT_DIR/campaign-inputs.json")
 
 materialization_receipt_sha=$(sha256_file "$LOCAL_RECEIPT_DIR/materialization-receipt.json")
 stage_event stage_complete receipt_build 1 1 "campaign_inputs_sha256=$campaign_inputs_sha materialization_receipt_sha256=$materialization_receipt_sha"
+fi
 stage_event stage_start publish 0 1
 mkdir -p "$MATERIALIZATION_DIR" "$REPLAY_DIR" "$RECEIPT_DIR"
 publish_verified_file feature_artifact "$feature_path" "$feature_publish_path" "$feature_sha"
