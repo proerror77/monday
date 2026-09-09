@@ -89,6 +89,7 @@ const MCTS_CHECKPOINT_ARTIFACT_SCHEMA_VERSION: &str =
     "cex-factor-bank-subset-mcts-checkpoint-artifact-v1";
 const CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V1: &str = "cex-event-replay-receipt-v1";
 const CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V2: &str = "cex-event-replay-receipt-v2";
+const CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V3: &str = "cex-event-replay-receipt-v3";
 const CEX_SUPERVISED_MODEL_SELECTION_SCHEMA_VERSION: &str = "cex-supervised-model-selection-v1";
 // ponytail: fixed batching bounds checkpoint I/O; make it configurable only if recovery data requires it.
 const MCTS_CHECKPOINT_INTERVAL: u64 = 256;
@@ -401,6 +402,9 @@ impl CexEventReplayReceiptV1 {
             ) | (
                 CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V2,
                 "walk_forward_oos_with_flat_training_gaps"
+            ) | (
+                CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V3,
+                "independent_selection_frozen_model"
             )
         );
         if !valid_scope
@@ -1591,8 +1595,64 @@ fn finalize_cex_candidate(
     data_mission::write_json_atomic(&results_dir.join("final-precommit.json"), &precommit)?;
 
     let claim = CexSealedHoldoutClaimV1::from_precommit(&precommit)?;
+    let sealed_revision = open_cex_holdout(
+        store,
+        results_dir,
+        client,
+        &claim,
+        holdout_claim_put_url,
+        holdout_claim_readback_url,
+        || {
+            evaluator
+                .evaluate_sealed(&proposal, dataset)
+                .map_err(anyhow::Error::msg)
+        },
+    )?;
+    data_mission::write_json_atomic(
+        &results_dir.join("sealed-holdout-receipt.json"),
+        &sealed_revision,
+    )?;
+    let sealed_value = sealed_revision
+        .payload
+        .get("evaluation")
+        .cloned()
+        .context("sealed holdout receipt has no evaluation")?;
+    let sealed: CandidateEvaluation = serde_json::from_value(sealed_value.clone())?;
+    sealed.validate()?;
+
+    let (strategy_bundle_id, promotion_id) = promote_sealed_candidate(
+        store,
+        results_dir,
+        &lineage.mission,
+        &candidate,
+        &candidate_id,
+        &candidate_hash,
+        &control_mission.spec.policies.evaluation.content_sha256,
+        &sealed_revision,
+    )?;
+    let report = CexFinalizationReportV1 {
+        schema_version: "cex-finalization-report-v1".to_string(),
+        precommit_id: precommit.precommit_id,
+        sealed_receipt_id: sealed_revision.revision_id,
+        sealed_passed: sealed.passed,
+        strategy_bundle_id,
+        promotion_id,
+    };
+    data_mission::write_json_atomic(&results_dir.join("finalization-report.json"), &report)?;
+    Ok(report)
+}
+
+pub(crate) fn open_cex_holdout(
+    store: &mut AlphaStore,
+    results_dir: &Path,
+    client: &Client,
+    claim: &CexSealedHoldoutClaimV1,
+    holdout_claim_put_url: &str,
+    holdout_claim_readback_url: &str,
+    evaluate: impl FnOnce() -> anyhow::Result<CandidateEvaluation>,
+) -> anyhow::Result<RegistryRevision> {
     let claim_path = results_dir.join("sealed-holdout-claim.json");
-    data_mission::write_json_atomic(&claim_path, &claim)?;
+    data_mission::write_json_atomic(&claim_path, claim)?;
     let claim_sha256 = sha256_file(&claim_path)?;
     // This create-once write is the at-most-once boundary. If it succeeds but
     // local claim or evaluation fails, the Mission is terminal and inconclusive.
@@ -1612,19 +1672,26 @@ fn finalize_cex_candidate(
     if claim_readback_sha256 != claim_sha256 {
         bail!("published CEX sealed holdout claim readback SHA256 mismatch");
     }
-    let sealed_revision = match store.claim_cex_sealed_holdout(&claim, Utc::now())? {
-        Some(existing) => existing,
+    match store.claim_cex_sealed_holdout(claim, Utc::now())? {
+        Some(existing) => Ok(existing),
         None => {
-            let sealed = evaluator
-                .evaluate_sealed(&proposal, dataset)
-                .map_err(anyhow::Error::msg)?;
-            store.put_cex_sealed_evaluation(&claim, &sealed, Utc::now())?
+            let sealed = evaluate()?;
+            Ok(store.put_cex_sealed_evaluation(claim, &sealed, Utc::now())?)
         }
-    };
-    data_mission::write_json_atomic(
-        &results_dir.join("sealed-holdout-receipt.json"),
-        &sealed_revision,
-    )?;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn promote_sealed_candidate(
+    store: &mut AlphaStore,
+    results_dir: &Path,
+    mission: &alpha_domain::ResearchMission,
+    candidate: &CandidateArtifact,
+    candidate_id: &str,
+    candidate_hash: &str,
+    evaluation_protocol_hash: &str,
+    sealed_revision: &RegistryRevision,
+) -> anyhow::Result<(Option<String>, Option<String>)> {
     let sealed_value = sealed_revision
         .payload
         .get("evaluation")
@@ -1632,8 +1699,7 @@ fn finalize_cex_candidate(
         .context("sealed holdout receipt has no evaluation")?;
     let sealed: CandidateEvaluation = serde_json::from_value(sealed_value.clone())?;
     sealed.validate()?;
-
-    let (strategy_bundle_id, promotion_id) = if sealed.passed {
+    let result = if sealed.passed {
         let evaluator_config_hash = canonical_json_hash(
             sealed_value
                 .get("evaluator_config")
@@ -1658,16 +1724,11 @@ fn finalize_cex_candidate(
             .unwrap_or_else(Utc::now);
         let bundle = StrategyBundle::new(
             bundle_id.clone(),
-            candidate_id.clone(),
-            candidate_hash.clone(),
-            lineage.mission.dataset_manifest_id.clone(),
+            candidate_id.to_string(),
+            candidate_hash.to_string(),
+            mission.dataset_manifest_id.clone(),
             sealed.evaluator_version.clone(),
-            control_mission
-                .spec
-                .policies
-                .evaluation
-                .content_sha256
-                .clone(),
+            evaluation_protocol_hash.to_string(),
             evaluator_config_hash.clone(),
             evaluation_metrics_hash.clone(),
             sealed_evaluation_hash.clone(),
@@ -1676,17 +1737,12 @@ fn finalize_cex_candidate(
         )?;
         let promotion = PromotionRecord {
             promotion_id: promotion_id.clone(),
-            mission_id: mission_id.to_string(),
-            candidate_id: candidate_id.clone(),
-            candidate_content_hash: candidate_hash,
-            dataset_manifest_id: lineage.mission.dataset_manifest_id.clone(),
+            mission_id: mission.mission_id.clone(),
+            candidate_id: candidate_id.to_string(),
+            candidate_content_hash: candidate_hash.to_string(),
+            dataset_manifest_id: mission.dataset_manifest_id.clone(),
             evaluator_version: sealed.evaluator_version.clone(),
-            evaluation_protocol_hash: control_mission
-                .spec
-                .policies
-                .evaluation
-                .content_sha256
-                .clone(),
+            evaluation_protocol_hash: evaluation_protocol_hash.to_string(),
             evaluator_config_hash,
             evaluation_metrics_hash,
             sealed_evaluation_id: sealed_revision.revision_id.clone(),
@@ -1718,16 +1774,7 @@ fn finalize_cex_candidate(
         }
         (None, None)
     };
-    let report = CexFinalizationReportV1 {
-        schema_version: "cex-finalization-report-v1".to_string(),
-        precommit_id: precommit.precommit_id,
-        sealed_receipt_id: sealed_revision.revision_id,
-        sealed_passed: sealed.passed,
-        strategy_bundle_id,
-        promotion_id,
-    };
-    data_mission::write_json_atomic(&results_dir.join("finalization-report.json"), &report)?;
-    Ok(report)
+    Ok(result)
 }
 
 pub(crate) fn finalize_existing_search_round(
@@ -2279,7 +2326,11 @@ fn run_cex_event_replay(
         mission,
         materialization,
         materialization_sha256,
-        context,
+        &context
+            .rows()
+            .iter()
+            .map(|row| (row.series_id, row.available_time))
+            .collect::<Vec<_>>(),
         feature_decision_clocks,
         CexReplayCandidateInput {
             reference: content_reference(&strategy.artifact_id, strategy)?,
@@ -2334,7 +2385,11 @@ fn run_cex_supervised_event_replay(
         mission,
         materialization,
         materialization_sha256,
-        context,
+        &context
+            .rows()
+            .iter()
+            .map(|row| (row.series_id, row.available_time))
+            .collect::<Vec<_>>(),
         feature_decision_clocks,
         CexReplayCandidateInput {
             reference: content_reference(&evaluation.candidate.artifact_id, &evaluation.candidate)?,
@@ -2359,6 +2414,127 @@ fn run_cex_supervised_event_replay(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn run_frozen_model_event_replay(
+    results_dir: &Path,
+    mission: &CexResearchMissionArtifactV1,
+    materialization: &Materialization,
+    materialization_sha256: &str,
+    all_clocks: &[data_mission::FeatureDecisionClock],
+    frozen: &alpha_domain::frozen_model::FrozenSupervisedCandidateV1,
+    report: &alpha_engine::formula_evaluator::PositionEvaluationReport,
+    policy: &CexEventReplayPolicyV1,
+    replay_artifact_path: &Path,
+    replay_artifact_sha256: &str,
+    replay_manifest_path: &Path,
+    replay_manifest_sha256: &str,
+) -> anyhow::Result<CexEventReplayReceiptV1> {
+    frozen
+        .validate_against_protocol(&mission.spec.evaluation_protocol)
+        .map_err(anyhow::Error::msg)?;
+    report.evaluation.validate()?;
+    if report.evaluation.evaluator_version
+        != alpha_domain::frozen_model::INDEPENDENT_SELECTION_EVALUATOR_VERSION
+        || report.evaluation.protocol_binding()?.1 != frozen.evaluation_protocol_sha256
+        || all_clocks.len() != materialization.rows
+    {
+        bail!("frozen replay does not bind independent selection");
+    }
+    let partitions = mission
+        .spec
+        .evaluation_protocol
+        .row_partitions(all_clocks.len())?;
+    let selection = partitions
+        .selection
+        .context("frozen replay requires independent selection")?;
+    let clocks = frozen_selection_replay_clocks(
+        all_clocks,
+        selection,
+        partitions.sealed_holdout.start,
+        frozen.program.observation_frequency_millis,
+        policy.max_decision_delay_millis,
+    )?;
+    let observations = report
+        .ledger
+        .iter()
+        .map(|row| (row.series_id, row.available_time))
+        .collect::<Vec<_>>();
+    let costs = mission.spec.evaluation_protocol.costs.clone();
+    run_cex_target_position_replay(
+        results_dir,
+        "frozen-model-event-replay-receipt.json",
+        &mission.semantic_id()?,
+        mission,
+        materialization,
+        materialization_sha256,
+        &observations,
+        &clocks,
+        CexReplayCandidateInput {
+            reference: content_reference(&frozen.artifact_id, frozen)?,
+            positions: report
+                .ledger
+                .iter()
+                .map(|row| row.target_position)
+                .collect(),
+            max_abs_position: frozen.program.decision_policy.max_abs_position,
+            max_drawdown: frozen.evaluator_config.max_drawdown,
+            position_notional_usd: costs.position_notional_usd,
+            capacity_depth_levels: costs.capacity_depth_levels,
+            max_book_depth_fraction: costs.max_book_depth_fraction,
+            decision_scope: "independent_selection_frozen_model",
+            research_decision_count: report.ledger.len(),
+            minimum_mean_net_return: Some(frozen.evaluator_config.min_fold_mean_return),
+            minimum_net_sharpe: Some(frozen.evaluator_config.min_aggregate_score),
+            costs,
+        },
+        policy,
+        replay_artifact_path,
+        replay_artifact_sha256,
+        replay_manifest_path,
+        replay_manifest_sha256,
+    )
+}
+
+fn frozen_selection_replay_clocks(
+    all: &[data_mission::FeatureDecisionClock],
+    selection: std::ops::Range<usize>,
+    holdout_start: usize,
+    frequency_millis: u64,
+    max_delay_millis: u64,
+) -> anyhow::Result<Vec<data_mission::FeatureDecisionClock>> {
+    let mut clocks = all
+        .get(selection.clone())
+        .filter(|rows| !rows.is_empty())
+        .context("selection replay clock range is invalid")?
+        .to_vec();
+    let holdout = all
+        .get(holdout_start)
+        .context("holdout clock is missing")?
+        .feature_available_time;
+    let interval = chrono::TimeDelta::try_milliseconds(i64::try_from(frequency_millis)?)
+        .context("selection clock overflow")?;
+    let delay = chrono::TimeDelta::try_milliseconds(i64::try_from(max_delay_millis)?)
+        .context("selection replay delay overflow")?;
+    let end = clocks
+        .last()
+        .unwrap()
+        .feature_available_time
+        .checked_add_signed(interval)
+        .context("selection end overflow")?;
+    if selection.end > holdout_start
+        || frequency_millis == 0
+        || end
+            .checked_add_signed(delay)
+            .is_none_or(|time| time >= holdout)
+    {
+        bail!("selection replay tail reaches the sealed holdout");
+    }
+    for clock in &mut clocks {
+        clock.series_close_time = clock.series_close_time.min(end);
+    }
+    Ok(clocks)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_cex_target_position_replay(
     results_dir: &Path,
     receipt_name: &str,
@@ -2366,7 +2542,7 @@ fn run_cex_target_position_replay(
     mission: &CexResearchMissionArtifactV1,
     materialization: &Materialization,
     materialization_sha256: &str,
-    context: &EngineContext<'_>,
+    observations: &[(u64, chrono::DateTime<Utc>)],
     feature_decision_clocks: &[data_mission::FeatureDecisionClock],
     candidate: CexReplayCandidateInput,
     policy: &CexEventReplayPolicyV1,
@@ -2380,7 +2556,8 @@ fn run_cex_target_position_replay(
         bail!("CEX replay materialization identity drifted");
     }
     candidate.reference.validate()?;
-    if feature_decision_clocks.len() != candidate.positions.len()
+    if observations.len() != candidate.positions.len()
+        || feature_decision_clocks.len() != candidate.positions.len()
         || candidate.research_decision_count == 0
         || candidate.research_decision_count > candidate.positions.len()
     {
@@ -2388,10 +2565,10 @@ fn run_cex_target_position_replay(
     }
     if feature_decision_clocks
         .iter()
-        .zip(context.rows())
+        .zip(observations)
         .any(|(clock, row)| {
-            clock.series_id != row.series_id
-                || clock.feature_available_time != row.available_time
+            clock.series_id != row.0
+                || clock.feature_available_time != row.1
                 || clock.series_close_time < clock.feature_available_time
         })
     {
@@ -2538,6 +2715,7 @@ fn run_cex_target_position_replay(
         schema_version: match candidate.decision_scope {
             "pre_holdout_research_rows" => CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V1,
             "walk_forward_oos_with_flat_training_gaps" => CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V2,
+            "independent_selection_frozen_model" => CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V3,
             _ => bail!("unsupported CEX replay decision scope"),
         }
         .to_string(),
@@ -2933,12 +3111,17 @@ fn normalized_local_object(value: &str) -> anyhow::Result<String> {
 
 pub(crate) fn ensure_holdout_claim_absent(client: &Client, source: &str) -> anyhow::Result<()> {
     let exists = if source.starts_with("http://") || source.starts_with("https://") {
-        let response = client.get(source).send()?;
+        let response = client
+            .get(source)
+            .send()
+            .map_err(reqwest::Error::without_url)?;
         match response.status() {
             StatusCode::NOT_FOUND => false,
             status if status.is_success() => true,
             _ => {
-                response.error_for_status()?;
+                response
+                    .error_for_status()
+                    .map_err(reqwest::Error::without_url)?;
                 unreachable!()
             }
         }
@@ -3005,7 +3188,7 @@ fn validate_result_readback_binding(
     Ok(())
 }
 
-fn validate_mission_materialization_binding(
+pub(crate) fn validate_mission_materialization_binding(
     mission: &CexResearchMissionArtifactV1,
     materialization: &Materialization,
     materialization_sha256: &str,
@@ -3041,7 +3224,7 @@ fn validate_mission_materialization_binding(
     Ok(())
 }
 
-fn validate_mission_dataset_binding(
+pub(crate) fn validate_mission_dataset_binding(
     mission: &CexResearchMissionArtifactV1,
     features: &hft_collector::FeatureDatasetManifest,
     dataset: &CexReplayDatasetManifestV5,
@@ -3190,7 +3373,12 @@ pub(crate) fn fetch_to_file(
 ) -> anyhow::Result<(u64, String)> {
     let mut reader: Box<dyn Read> =
         if source.starts_with("http://") || source.starts_with("https://") {
-            let response = client.get(source).send()?.error_for_status()?;
+            let response = client
+                .get(source)
+                .send()
+                .map_err(reqwest::Error::without_url)?
+                .error_for_status()
+                .map_err(reqwest::Error::without_url)?;
             if response
                 .content_length()
                 .is_some_and(|length| length > max_bytes)
@@ -3455,11 +3643,16 @@ fn fetch_optional_to_file(
     max_bytes: u64,
 ) -> anyhow::Result<Option<(u64, String)>> {
     if source.starts_with("http://") || source.starts_with("https://") {
-        let response = client.get(source).send()?;
+        let response = client
+            .get(source)
+            .send()
+            .map_err(reqwest::Error::without_url)?;
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        let response = response.error_for_status()?;
+        let response = response
+            .error_for_status()
+            .map_err(reqwest::Error::without_url)?;
         if response
             .content_length()
             .is_some_and(|length| length > max_bytes)
@@ -3801,7 +3994,9 @@ pub(crate) fn create_bundle<'a>(
     files.sort();
     let temporary = data_mission::temporary_output_file(bundle, ".monday-bundle-")?;
     let mut archive = ZipWriter::new(temporary.reopen()?);
-    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    let options = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .unix_permissions(0o600);
     for path in files {
         let name = path
             .strip_prefix(work_dir)
@@ -3867,8 +4062,10 @@ pub(crate) fn publish_immutable_file(
             .header(CONTENT_TYPE, HeaderValue::from_static(content_type))
             .header("x-oss-forbid-overwrite", "true")
             .body(File::open(source)?)
-            .send()?
-            .error_for_status()?;
+            .send()
+            .map_err(reqwest::Error::without_url)?
+            .error_for_status()
+            .map_err(reqwest::Error::without_url)?;
         return Ok(());
     }
     let path = Path::new(destination.strip_prefix("file://").unwrap_or(destination));
@@ -7985,6 +8182,26 @@ message binance_replay {
             .to_string()
             .contains("historical V5 materialization is read-only"));
         std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn frozen_selection_replay_closes_inside_its_window() {
+        let start = Utc::now();
+        let clocks = (0..20)
+            .map(|index| data_mission::FeatureDecisionClock {
+                series_id: 1,
+                feature_available_time: start + chrono::TimeDelta::seconds(index),
+                series_close_time: start + chrono::TimeDelta::seconds(100),
+            })
+            .collect::<Vec<_>>();
+        let selected = frozen_selection_replay_clocks(&clocks, 4..8, 15, 1000, 2000).unwrap();
+        let (decisions, _) = canonical_target_position_decisions(&selected, vec![0.5; 4]).unwrap();
+        assert_eq!(
+            decisions.last().unwrap().timestamp_us,
+            (start + chrono::TimeDelta::seconds(8)).timestamp_micros()
+        );
+        assert!(frozen_selection_replay_clocks(&clocks, 4..8, 10, 1000, 2000).is_err());
+        assert!(frozen_selection_replay_clocks(&clocks, 4..16, 15, 1000, 0).is_err());
     }
 
     #[test]

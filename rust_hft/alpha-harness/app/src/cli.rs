@@ -211,6 +211,8 @@ pub struct MissionDispatchSubmitArgs {
 #[derive(Debug, Clone, Args)]
 pub struct MissionDispatchInspectArgs {
     #[arg(long)]
+    pub control: Option<PathBuf>,
+    #[arg(long)]
     pub submission: PathBuf,
     #[arg(long)]
     pub materialization: PathBuf,
@@ -222,6 +224,10 @@ pub struct MissionDispatchInspectArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct CampaignExecuteArgs {
+    #[arg(long, requires = "final_trusted_keys", conflicts_with = "pre_holdout")]
+    pub final_evaluation: bool,
+    #[arg(long, requires = "final_evaluation")]
+    pub final_trusted_keys: Option<PathBuf>,
     /// Stop before opening sealed holdout, including for non-ML candidates.
     #[arg(long)]
     pub pre_holdout: bool,
@@ -239,6 +245,8 @@ pub struct CampaignExecuteArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct CampaignFreezeArgs {
+    #[arg(long, conflicts_with_all = ["seeds", "research_plan"])]
+    pub final_evaluation_control: Option<PathBuf>,
     #[arg(long)]
     pub campaign_inputs: PathBuf,
     #[arg(long)]
@@ -249,7 +257,7 @@ pub struct CampaignFreezeArgs {
     pub image: String,
     #[arg(long)]
     pub campaign_root: String,
-    #[arg(long = "seed", required = true)]
+    #[arg(long = "seed", required_unless_present = "final_evaluation_control")]
     pub seeds: Vec<u64>,
     #[arg(long)]
     pub research_plan: Option<PathBuf>,
@@ -1264,12 +1272,36 @@ mod tests {
     fn parses_mission_campaign_execute() {
         let args = "alpha-harness mission campaign-execute --work-dir work --campaign-id cex-campaign-1234567890abcdef1234567890abcdef --image-identity aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --request campaign.json --request-sha256 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         assert!(Cli::try_parse_from(args.split_whitespace()).is_ok());
+        for suffix in [
+            " --final-evaluation",
+            " --final-trusted-keys keys.json",
+            " --final-evaluation --final-trusted-keys keys.json --pre-holdout",
+        ] {
+            assert!(Cli::try_parse_from(format!("{args}{suffix}").split_whitespace()).is_err());
+        }
+        assert!(Cli::try_parse_from(
+            format!("{args} --final-evaluation --final-trusted-keys keys.json").split_whitespace()
+        )
+        .is_ok());
     }
 
     #[test]
     fn parses_mission_campaign_freeze() {
         let args = "alpha-harness mission campaign-freeze --campaign-inputs campaign-inputs.json --input-root /mounted/run --source-revision aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --image registry/research-runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --campaign-root https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/campaigns --seed 7 --seed 11 --output freeze.json";
         assert!(Cli::try_parse_from(args.split_whitespace()).is_ok());
+        let final_args = args.replace(
+            "--seed 7 --seed 11",
+            "--final-evaluation-control final-control.json",
+        );
+        assert!(Cli::try_parse_from(final_args.split_whitespace()).is_ok());
+        for suffix in [" --seed 7", " --research-plan plan.json"] {
+            assert!(
+                Cli::try_parse_from(format!("{final_args}{suffix}").split_whitespace()).is_err()
+            );
+        }
+        assert!(
+            Cli::try_parse_from(args.replace("--seed 7 --seed 11", "").split_whitespace()).is_err()
+        );
     }
 
     #[test]

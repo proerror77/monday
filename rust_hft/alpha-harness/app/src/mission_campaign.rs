@@ -1,3 +1,4 @@
+pub(crate) mod final_evaluation;
 use crate::{
     cli::{
         print_json, CampaignExecuteArgs, CampaignFinalizeArgs, CampaignFreezeArgs, CampaignIdArgs,
@@ -401,6 +402,9 @@ struct LoadedRequest {
 }
 
 pub fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
+    if args.final_evaluation {
+        return final_evaluation::execute(args);
+    }
     let loaded = load_request(&args.request)?;
     if loaded.sha256 != normalized_sha256("campaign request", &args.request_sha256)? {
         bail!("campaign request SHA256 mismatch");
@@ -439,6 +443,9 @@ pub fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
 }
 
 pub fn freeze(args: CampaignFreezeArgs) -> anyhow::Result<()> {
+    if args.final_evaluation_control.is_some() {
+        return final_evaluation::freeze(args);
+    }
     let (request, campaign_inputs_sha256) = freeze_request(&args)?;
     let plan = FrozenCampaignPlan {
         schema_version: CAMPAIGN_FREEZE_SCHEMA_V1.to_string(),
@@ -802,6 +809,9 @@ fn campaign_learn_report(
 }
 
 pub fn finalize(args: CampaignFinalizeArgs) -> anyhow::Result<()> {
+    if final_evaluation::is_final_freeze(&args.freeze)? {
+        return final_evaluation::finalize(args);
+    }
     let plan = load_freeze_plan(&args.freeze)?;
     validate_request(&plan.canonical_request)?;
     if expected_campaign_id(&plan.canonical_request)? != plan.canonical_request.campaign_id {
@@ -841,12 +851,12 @@ pub fn finalize(args: CampaignFinalizeArgs) -> anyhow::Result<()> {
 }
 
 #[cfg(not(test))]
-fn validate_request_for_execute(request: &CampaignRequest) -> anyhow::Result<()> {
+pub(crate) fn validate_request_for_execute(request: &CampaignRequest) -> anyhow::Result<()> {
     validate_request(request)
 }
 
 #[cfg(test)]
-fn validate_request_for_execute(request: &CampaignRequest) -> anyhow::Result<()> {
+pub(crate) fn validate_request_for_execute(request: &CampaignRequest) -> anyhow::Result<()> {
     validate_request(request).or_else(|_| validate_local_test_request(request))
 }
 
@@ -1266,7 +1276,28 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
     }))
 }
 
-fn freeze_request(args: &CampaignFreezeArgs) -> anyhow::Result<(CampaignRequest, String)> {
+struct ValidatedCampaignInputSet {
+    receipt: CampaignInputsReceipt,
+    campaign_inputs_sha256: String,
+    build_source_revision: String,
+    campaign_root: String,
+    image_identity: String,
+    producer_image_identity: String,
+    feature_path: PathBuf,
+    materialization_path: PathBuf,
+    feature_url: String,
+    materialization_url: String,
+    replay_artifact_url: String,
+    replay_manifest_url: String,
+    feature_sha256: String,
+    materialization_sha256: String,
+    replay_artifact_sha256: String,
+    replay_manifest_sha256: String,
+}
+
+fn validated_campaign_inputs(
+    args: &CampaignFreezeArgs,
+) -> anyhow::Result<ValidatedCampaignInputSet> {
     let (receipt, campaign_inputs_sha256) = load_campaign_inputs_receipt(&args.campaign_inputs)?;
     validate_campaign_inputs_receipt(&receipt)?;
     let build_source_revision =
@@ -1320,6 +1351,45 @@ fn freeze_request(args: &CampaignFreezeArgs) -> anyhow::Result<(CampaignRequest,
         None,
         None,
     )?;
+    Ok(ValidatedCampaignInputSet {
+        receipt,
+        campaign_inputs_sha256,
+        build_source_revision,
+        campaign_root,
+        image_identity,
+        producer_image_identity,
+        feature_path,
+        materialization_path,
+        feature_url,
+        materialization_url,
+        replay_artifact_url,
+        replay_manifest_url,
+        feature_sha256,
+        materialization_sha256,
+        replay_artifact_sha256,
+        replay_manifest_sha256,
+    })
+}
+
+fn freeze_request(args: &CampaignFreezeArgs) -> anyhow::Result<(CampaignRequest, String)> {
+    let ValidatedCampaignInputSet {
+        receipt,
+        campaign_inputs_sha256,
+        build_source_revision,
+        campaign_root,
+        image_identity,
+        producer_image_identity,
+        feature_path,
+        materialization_path,
+        feature_url,
+        materialization_url,
+        replay_artifact_url,
+        replay_manifest_url,
+        feature_sha256,
+        materialization_sha256,
+        replay_artifact_sha256,
+        replay_manifest_sha256,
+    } = validated_campaign_inputs(args)?;
     let research_plan = args
         .research_plan
         .as_deref()
@@ -1530,12 +1600,20 @@ fn normalized_source_revision(label: &str, source_revision: &str) -> anyhow::Res
 }
 
 fn extract_bundle(bundle: &Path, destination: &Path) -> anyhow::Result<()> {
+    extract_bundle_with_file_limit(bundle, destination, MAX_RESULT_BUNDLE_FILES)
+}
+
+fn extract_bundle_with_file_limit(
+    bundle: &Path,
+    destination: &Path,
+    max_files: usize,
+) -> anyhow::Result<()> {
     if destination.try_exists()? {
         return Ok(());
     }
     std::fs::create_dir_all(destination)?;
     let mut archive = ZipArchive::new(File::open(bundle)?)?;
-    if archive.len() > MAX_RESULT_BUNDLE_FILES {
+    if archive.len() > max_files {
         bail!("published result bundle contains too many entries");
     }
     let mut extracted_bytes = 0_u64;
@@ -1553,7 +1631,16 @@ fn extract_bundle(bundle: &Path, destination: &Path) -> anyhow::Result<()> {
         if let Some(parent) = output.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut file = File::create(&output)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&output)
+            .context("published bundle has a duplicate file or unsafe destination")?;
         let remaining = MAX_RESULT_BUNDLE_BYTES
             .checked_sub(extracted_bytes)
             .context("published result bundle exceeds its extracted-size limit")?;
@@ -2141,9 +2228,29 @@ pub(crate) fn readback_pre_holdout_terminal(
     u64,
     String,
 )> {
-    use alpha_domain::campaign_control::CampaignAttemptOutcomeV1;
     let root = tempfile::tempdir()?;
-    let result_path = root.path().join("campaign-result.json");
+    readback_pre_holdout_terminal_into(
+        client,
+        request,
+        request_sha256,
+        evaluation_protocol_sha256,
+        root.path(),
+    )
+}
+
+pub(crate) fn readback_pre_holdout_terminal_into(
+    client: &Client,
+    request: &CampaignRequest,
+    request_sha256: &str,
+    evaluation_protocol_sha256: &str,
+    root: &Path,
+) -> anyhow::Result<(
+    alpha_domain::campaign_control::CampaignAttemptOutcomeV1,
+    u64,
+    String,
+)> {
+    use alpha_domain::campaign_control::CampaignAttemptOutcomeV1;
+    let result_path = root.join("campaign-result.json");
     let (_, result_sha256) = fetch_to_file(
         client,
         &request.campaign_result_readback_url,
@@ -2169,7 +2276,7 @@ pub(crate) fn readback_pre_holdout_terminal(
         {
             bail!("terminal Campaign round identity differs from the request");
         }
-        let dir = root.path().join(format!("round-{index}"));
+        let dir = root.join(format!("round-{index}"));
         std::fs::create_dir_all(&dir)?;
         let mission_path = dir.join("mission.json");
         fetch_verified(
@@ -4039,6 +4146,7 @@ mod tests {
         let output = root.path().join("freeze.json");
 
         freeze(CampaignFreezeArgs {
+            final_evaluation_control: None,
             campaign_inputs: receipt_path.clone(),
             input_root: input_root.clone(),
             source_revision: BUILD_SOURCE_REVISION.to_string(),
@@ -4088,6 +4196,7 @@ mod tests {
             .contains("source_revision must be an exact git revision"));
 
         let invalid_executor = freeze_request(&CampaignFreezeArgs {
+            final_evaluation_control: None,
             campaign_inputs: receipt_path.clone(),
             input_root: input_root.clone(),
             source_revision: BUILD_SOURCE_REVISION.to_string(),
@@ -4112,6 +4221,7 @@ mod tests {
             crate::mission_runner::sha256_file(&replay_manifest_path).unwrap();
         data_mission::write_json_atomic(&receipt_path, &invalid_replay_receipt).unwrap();
         let invalid_replay = freeze_request(&CampaignFreezeArgs {
+            final_evaluation_control: None,
             campaign_inputs: receipt_path.clone(),
             input_root: input_root.clone(),
             source_revision: BUILD_SOURCE_REVISION.to_string(),
@@ -4127,6 +4237,7 @@ mod tests {
             .any(|cause| cause.to_string().contains("artifact")));
 
         let invalid_source = freeze_request(&CampaignFreezeArgs {
+            final_evaluation_control: None,
             campaign_inputs: receipt_path.clone(),
             input_root: input_root.clone(),
             source_revision: "c".repeat(40),
@@ -4462,6 +4573,191 @@ mod tests {
             assert!(!results.join("cex-event-replay-receipt.json").exists());
             assert!(!results.join("finalization-report.json").exists());
         }
+
+        assert_final_worker_outcome(
+            &fixture,
+            loaded,
+            hash,
+            &client,
+            alpha_store::campaign_ledger::CampaignFinalOutcomeV1::PromotionReady,
+        );
+    }
+
+    fn assert_final_worker_outcome(
+        fixture: &CampaignE2eFixture,
+        loaded: LoadedRequest,
+        hash: String,
+        client: &Client,
+        expected: alpha_store::campaign_ledger::CampaignFinalOutcomeV1,
+    ) {
+        // Exercise the final worker with local transport and independent signed
+        // authority, after removing the original execution checkout artifacts.
+        // The controller's close/claim/revocation protocol has separate ledger tests.
+        use alpha_domain::campaign_finalization::{
+            sign_campaign_final_evaluation_grant, CampaignFinalEvaluationGrantV1,
+            FINAL_EVALUATION_GRANT_SCHEMA,
+        };
+        let final_key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let image = format!(
+            "registry/research-runner@sha256:{}",
+            loaded.request.image_identity
+        );
+        let controller_image = format!("registry/controller@sha256:{}", "2".repeat(64));
+        let execution = crate::mission_dispatch::final_admission::source_execution_binding(
+            &loaded.request,
+            &fixture._render_fixture.materialization_path,
+            &image,
+            &controller_image,
+        )
+        .unwrap();
+        let operation = format!("campaign-attempt-{}", "a".repeat(64));
+        let now = chrono::Utc::now();
+        let signed = sign_campaign_final_evaluation_grant(
+            CampaignFinalEvaluationGrantV1 {
+                schema_version: FINAL_EVALUATION_GRANT_SCHEMA.into(),
+                grant_id: "final-e2e-grant".into(),
+                family_id: "final-e2e-family".into(),
+                family_definition_sha256: "c".repeat(64),
+                family_head_sha256: "d".repeat(64),
+                execution,
+                selected_results: std::collections::BTreeMap::from([(operation.clone(), hash)]),
+                max_candidates: 4,
+                max_job_seconds: 3600,
+                valid_from: now - chrono::TimeDelta::minutes(1),
+                expires_at: now + chrono::TimeDelta::hours(2),
+            },
+            "final-key".into(),
+            &final_key,
+        )
+        .unwrap();
+        let final_request = final_evaluation::FinalRequest::new(
+            signed,
+            std::collections::BTreeMap::from([(operation, loaded.request)]),
+            fixture
+                ._root
+                .path()
+                .join("final-published")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .unwrap();
+        let final_request_path = fixture._root.path().join("final-request.json");
+        data_mission::write_json_atomic(&final_request_path, &final_request).unwrap();
+        let final_sha = crate::mission_runner::sha256_file(&final_request_path).unwrap();
+        let keys = fixture._root.path().join("final-keys.json");
+        data_mission::write_json_atomic(
+            &keys,
+            &std::collections::BTreeMap::from([(
+                "final-key",
+                hex::encode(final_key.verifying_key().as_bytes()),
+            )]),
+        )
+        .unwrap();
+        let final_work = fixture._root.path().join("final-work");
+        std::fs::remove_dir_all(fixture.work_dir.join("mission")).unwrap();
+        let final_args = CampaignExecuteArgs {
+            final_evaluation: true,
+            final_trusted_keys: Some(keys.clone()),
+            pre_holdout: false,
+            work_dir: final_work.clone(),
+            campaign_id: final_request.campaign_id.clone(),
+            image_identity: final_request.image_identity.clone(),
+            request: final_request_path,
+            request_sha256: final_sha.clone(),
+        };
+        if let Err(error) = execute(final_args.clone()) {
+            let selection = std::fs::read_to_string(
+                final_work
+                    .join(&final_request.campaign_id)
+                    .join("results/independent-selection.json"),
+            )
+            .unwrap_or_default();
+            panic!("final worker failed: {error:#}; selection: {selection}");
+        }
+        let final_result: final_evaluation::FinalResult = serde_json::from_slice(
+            &std::fs::read(
+                final_work
+                    .join(&final_request.campaign_id)
+                    .join("final-result.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            final_result.outcome,
+            expected,
+            "{}",
+            std::fs::read_to_string(
+                final_work
+                    .join(&final_request.campaign_id)
+                    .join("results/independent-selection.json")
+            )
+            .unwrap()
+        );
+        assert!(fixture.global_claim_path.is_file());
+        if expected == alpha_store::campaign_ledger::CampaignFinalOutcomeV1::PromotionReady {
+            let bundle: alpha_domain::StrategyBundle = serde_json::from_slice(
+                &std::fs::read(
+                    final_work
+                        .join(&final_request.campaign_id)
+                        .join("results/strategy-bundle.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let alpha_domain::StrategyBundleArtifact::FrozenModel { strategy } = bundle.artifact
+            else {
+                panic!("expected native model bundle")
+            };
+            assert_eq!(
+                strategy.frozen.evaluator_config.multiple_testing_trials,
+                final_request.first_source().unwrap().declared_total_trials
+            );
+            assert_ne!(
+                strategy.frozen.evaluator_config.multiple_testing_trials, 2,
+                "benchmark comparison is not the final trial family"
+            );
+        } else {
+            assert!(final_result.strategy_bundle.is_none());
+            assert!(final_result.promotion.is_none());
+        }
+        let grant = crate::mission_dispatch::final_admission::verify_worker_grant(
+            &final_request.grant,
+            &keys,
+        )
+        .unwrap();
+        let (readback, _) =
+            final_evaluation::readback_terminal(client, &final_request, &final_sha, &grant)
+                .unwrap();
+        assert_eq!(readback, final_result);
+        assert!(execute(final_args)
+            .unwrap_err()
+            .to_string()
+            .contains("already exists"));
+    }
+
+    #[test]
+    fn final_model_rejected_holdout_keeps_claim_without_promotion() {
+        let fixture = campaign_e2e_fixture_with_rejected_holdout(
+            "campaign-final-negative",
+            false,
+            false,
+            true,
+            true,
+        );
+        execute(fixture.args.clone()).unwrap();
+        let loaded = load_request(&fixture.args.request).unwrap();
+        let hash =
+            crate::mission_runner::sha256_file(&fixture.work_dir.join("campaign-result.json"))
+                .unwrap();
+        let client = Client::builder().redirect(Policy::none()).build().unwrap();
+        assert_final_worker_outcome(
+            &fixture,
+            loaded,
+            hash,
+            &client,
+            alpha_store::campaign_ledger::CampaignFinalOutcomeV1::HoldoutRejected,
+        );
     }
 
     #[test]
@@ -5008,6 +5304,22 @@ mod tests {
         preexisting_claim: bool,
         replay_tracks_features: bool,
     ) -> CampaignE2eFixture {
+        campaign_e2e_fixture_with_rejected_holdout(
+            name,
+            zero_labels,
+            preexisting_claim,
+            replay_tracks_features,
+            false,
+        )
+    }
+
+    fn campaign_e2e_fixture_with_rejected_holdout(
+        name: &str,
+        zero_labels: bool,
+        preexisting_claim: bool,
+        replay_tracks_features: bool,
+        rejected_holdout: bool,
+    ) -> CampaignE2eFixture {
         let render_fixture = mission_render::tests::Fixture::canonical();
         let mut rows = mission_render::tests::read_feature_rows(&render_fixture.feature_path);
         if zero_labels {
@@ -5058,6 +5370,20 @@ mod tests {
                 }
             }
         }
+        if rejected_holdout {
+            let materialization = crate::mission_runner::decode_materialization(
+                &std::fs::read(&render_fixture.materialization_path).unwrap(),
+            )
+            .unwrap();
+            let count = mission_render::approved_evaluation_protocol(&materialization)
+                .unwrap()
+                .walk_forward
+                .sealed_holdout_rows;
+            let start = rows.len() - count;
+            for row in &mut rows[start..] {
+                row.label = -row.label;
+            }
+        }
         mission_render::tests::rewrite_feature_rows(&render_fixture.feature_path, &rows);
         rebind_materialization_feature_artifact(
             &render_fixture.materialization_path,
@@ -5104,6 +5430,8 @@ mod tests {
             replay_artifact_path,
             replay_manifest_path,
             args: CampaignExecuteArgs {
+                final_evaluation: false,
+                final_trusted_keys: None,
                 pre_holdout: true,
                 work_dir: work_dir.clone(),
                 campaign_id: request.campaign_id.clone(),

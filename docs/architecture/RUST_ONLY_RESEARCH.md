@@ -88,6 +88,101 @@ a single-use final dispatch claim and the final model evaluator are required
 before the later canonical final-evaluation stage can run. An older binary that
 cannot decode the closure receipt must not be used to resume that ledger.
 
+## Final evaluation boundary
+
+Final evaluation is a second authorization on an already closed family. The
+signed `monday.campaign_final_evaluation_grant.v1` binds the exact family
+definition and ledger head, the complete `selected_results` map, the shared
+execution/evaluation views, a maximum of 128 candidates, and one Job deadline.
+`mission dispatch close-family` verifies that every family attempt has a
+canonical terminal identity and known consumption, records the active
+`campaign_final_evaluation` approval, and emits the
+`family_closed_for_final_evaluation` receipt. Closure permanently rejects new
+roots, reservations, and search dispatches in that family; it does not start a
+Job or evaluate a row.
+
+The final dispatch control is a separate, versioned document. Its
+`monday.campaign_final_dispatch_control.v1` shape is:
+
+```json
+{
+  "schema_version": "monday.campaign_final_dispatch_control.v1",
+  "ledger_path": "ledger.duckdb",
+  "signed_final_grant_path": "final-grant.json",
+  "trusted_keys_path": "final-public-keys.json",
+  "materialization_path": "materialization.json",
+  "controller_image": "registry.example/controller@sha256:REPLACE_CONTROLLER_DIGEST",
+  "source_submissions": {
+    "campaign-attempt-<64-hex-operation-digest>": "source-submissions/<original-submission>.json"
+  },
+  "receipt_access": {
+    "research/campaign-ledger/family-id=<family-id>/sequence=<sequence>/receipt.json": {
+      "put_url": "REPLACE_EXACT_SIGNED_PUT_URL",
+      "readback_url": "REPLACE_EXACT_SIGNED_GET_URL"
+    }
+  }
+}
+```
+
+Paths resolve relative to the control file; the ledger, grant, materialization,
+and every original source submission must already exist. `source_submissions`
+is keyed by the same operation IDs as the grant's complete `selected_results`,
+and `receipt_access` must cover the whole family receipt chain plus final
+dispatch/settlement receipts. The approval ID is ledger state, not another
+authority field in this control file. Signed URL values are short-lived access
+capabilities and remain placeholders in examples; they must not be committed.
+
+The canonical operation remains one native channel:
+
+```text
+campaign-freeze --final-evaluation-control
+  -> campaign-finalize
+  -> mission dispatch submit
+  -> generated mission campaign-execute --final-evaluation
+  -> mission dispatch settle
+```
+
+`campaign-freeze --final-evaluation-control` validates the existing closed
+family and the frozen feature/materialization/replay identities. It accepts no
+seed or research plan, does not read the reserved selection or sealed holdout
+rows, and does not create a Job. `campaign-finalize` checks the signed request
+against the freeze plan and writes a `purpose: final_evaluation` submission.
+The existing `mission dispatch submit` and `mission dispatch settle` commands
+detect that purpose and reuse the ordinary receipt publication, immutable
+Secret, Job identity, UID binding, and terminal-readback machinery. No final
+controller or alternate dispatch path is introduced.
+
+The final request preserves each historical source request in `sources`.
+When GET signatures expire, refresh only the independent `read_urls` map (and
+the corresponding final output access URLs) while retaining the same
+query-free object keys. Canonical validation then permits access renewal but
+rejects any rewrite of the source request bytes, source set, grant, or Campaign
+identity.
+
+The worker freezes the already fitted winner's actual model weights and checks
+their native prediction origin; it does not retrain or refit. It evaluates each
+frozen candidate on the independent selection window, selects at most one, and
+then runs the separate event replay. Only a replay-qualified candidate can
+write the final precommit and publish the one global holdout claim. The claim
+is create-once at the family-wide holdout object, so a claim/write/evaluation
+failure consumes the final attempt and cannot be retried against the holdout.
+
+The final result has explicit terminal shapes: `no_selection_candidate` and
+`replay_rejected` carry no holdout claim; `holdout_rejected` carries the
+precommit and sealed receipt without promotion; `promotion_ready` carries the
+sealed receipt, strategy bundle, and promotion lineage. `Failed` is reserved
+for independently evidenced infrastructure terminalization. `dispatch settle`
+records the terminal result, Job/Pod identity, result digest, and measured
+consumption; a failed or uncertain final attempt never mints another holdout
+claim.
+
+Current evidence is limited to native worker positive/negative local
+integration fixtures and ledger/dispatch checks for closure, single-use claim,
+UID binding, terminal settlement, revocation, and restore. It is not evidence
+of a real ACK/OSS cloud final-evaluation run, image deployment, or runtime
+cutover. The root `mission dispatch controller-handoff` contract remains
+pre-holdout readback only.
+
 Prediction training additionally accepts only an immutable
 `VerifiedBinarySnapshot` handle. The loader verifies the snapshot's evaluator
 artifacts against a caller-supplied trusted `snapshot_contract_hash`; no public

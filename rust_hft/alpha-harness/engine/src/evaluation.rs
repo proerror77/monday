@@ -370,6 +370,19 @@ pub fn prepare_dataset(
     })
 }
 
+/// Final evaluation has a separate entrypoint. Search/proposal contexts never
+/// acquire this view; its caller must hold the durable final dispatch authority.
+pub(crate) fn independent_selection_rows(
+    dataset: &PreparedDataset,
+) -> Result<&[ResearchRow], String> {
+    let range = dataset
+        .partitions
+        .selection
+        .as_ref()
+        .ok_or("independent selection was not reserved")?;
+    Ok(&dataset.rows[range.clone()])
+}
+
 pub fn evaluate_sealed_holdout<T>(
     dataset: &PreparedDataset,
     evaluator: impl FnOnce(&[ResearchRow]) -> T,
@@ -519,6 +532,108 @@ mod tests {
             prepare_dataset(input, &config),
             Err(EvaluationError::InvalidLabelAvailability)
         ));
+    }
+
+    #[test]
+    fn frozen_selection_uses_only_its_reserved_rows_and_holdout_is_separate() {
+        use alpha_domain::{frozen_model::*, CexResearchContentRefV1, FormulaEvaluatorConfig};
+        use hft_factor_dsl::{model_program::*, FactorAst, FactorTerminal};
+        use hft_research_manifest::model::{
+            CexBaselineModelV1, CexDecisionCostsV1, CexSupervisedDecisionPolicyV2,
+        };
+        let protocol = protocol().with_independent_selection(7).unwrap();
+        let mut input = rows(61);
+        for (index, row) in input.iter_mut().enumerate() {
+            row.features.insert(
+                "book_imbalance".into(),
+                if index % 2 == 0 { 0.5 } else { -0.5 },
+            );
+            row.features
+                .insert("mid_price".into(), 100.0 + index as f64 * 0.1);
+        }
+        let reference = CexResearchContentRefV1 {
+            id: "test-source".into(),
+            content_sha256: "a".repeat(64),
+        };
+        let candidate = FrozenSupervisedCandidateV1 {
+            schema_version: FROZEN_SUPERVISED_CANDIDATE_SCHEMA.into(),
+            artifact_id: String::new(),
+            source_candidate: reference.clone(),
+            source_model: reference.clone(),
+            source_factor_bank: reference.clone(),
+            source_fold: reference.clone(),
+            research_dataset: reference,
+            evaluation_protocol_sha256: protocol.content_hash().unwrap(),
+            evaluator_config: FormulaEvaluatorConfig {
+                min_validation_rows: 2,
+                min_trades: 1,
+                ..FormulaEvaluatorConfig::default()
+            },
+            program: FrozenFactorModelV1 {
+                schema_version: FROZEN_FACTOR_MODEL_SCHEMA_V1.into(),
+                venue: "binance".into(),
+                market: "usdm".into(),
+                symbol: "BTCUSDT".into(),
+                observation_frequency_millis: 1000,
+                label_horizon_buckets: 1,
+                factors: vec![FrozenModelFactorV1 {
+                    ast: FactorAst::Terminal(FactorTerminal::Field("book_imbalance".into())),
+                    negative: false,
+                }],
+                model: CexBaselineModelV1::Ridge {
+                    intercept: 0.0,
+                    means: vec![0.0],
+                    scales: vec![1.0],
+                    coefficients: vec![1.0],
+                },
+                decision_policy: CexSupervisedDecisionPolicyV2::prediction_identity_v2(),
+                base_costs: CexDecisionCostsV1 {
+                    one_way_cost_bps: 1.2,
+                    funding_bps: 0.1,
+                },
+                cross_spread: false,
+            },
+        }
+        .finalize()
+        .unwrap();
+        let prepared = prepare_dataset(input.clone(), &protocol).unwrap();
+        let selection =
+            crate::final_models::evaluate_frozen_selection(&candidate, &prepared).unwrap();
+        let holdout = crate::final_models::evaluate_frozen_holdout(&candidate, &prepared).unwrap();
+        assert_eq!(selection.evaluation.metrics.row_count, 7);
+        assert_eq!(holdout.evaluation.metrics.row_count, 10);
+        assert_eq!(
+            selection.evaluation.evaluator_version,
+            INDEPENDENT_SELECTION_EVALUATOR_VERSION
+        );
+        let range = protocol
+            .row_partitions(input.len())
+            .unwrap()
+            .selection
+            .unwrap();
+        assert_eq!(
+            selection.ledger.first().unwrap().available_time,
+            input[range.start].available_time
+        );
+        assert_eq!(selection.ledger.last().unwrap().target_position, 0.0);
+        for row in &mut input[prepared.plan().sealed_holdout.clone()] {
+            row.features.insert("book_imbalance".into(), -0.75);
+            row.features.insert("mid_price".into(), 999.0);
+            row.label = -100.0;
+        }
+        let poisoned = prepare_dataset(input, &protocol).unwrap();
+        assert_eq!(
+            crate::final_models::evaluate_frozen_selection(&candidate, &poisoned).unwrap(),
+            selection
+        );
+        assert_ne!(
+            crate::final_models::evaluate_frozen_holdout(&candidate, &poisoned).unwrap(),
+            holdout
+        );
+        let mut wrong_clock = candidate.clone();
+        wrong_clock.program.observation_frequency_millis = 2000;
+        wrong_clock = wrong_clock.finalize().unwrap();
+        assert!(crate::final_models::evaluate_frozen_selection(&wrong_clock, &prepared).is_err());
     }
 
     #[test]
