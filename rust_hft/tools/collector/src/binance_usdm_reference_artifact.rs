@@ -798,7 +798,7 @@ impl Drop for StagingDir {
     }
 }
 
-fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -816,7 +816,7 @@ fn path_c_string(path: &Path) -> Result<CString> {
 }
 
 #[cfg(target_os = "linux")]
-fn rename_noreplace(source: &Path, target: &Path) -> Result<()> {
+pub(crate) fn rename_noreplace(source: &Path, target: &Path) -> Result<()> {
     let source = path_c_string(source)?;
     let target = path_c_string(target)?;
     // SAFETY: both C strings are NUL-terminated and live for the call.
@@ -836,7 +836,7 @@ fn rename_noreplace(source: &Path, target: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn rename_noreplace(source: &Path, target: &Path) -> Result<()> {
+pub(crate) fn rename_noreplace(source: &Path, target: &Path) -> Result<()> {
     let source = path_c_string(source)?;
     let target = path_c_string(target)?;
     // SAFETY: both C strings are NUL-terminated and live for the call.
@@ -856,11 +856,11 @@ fn rename_noreplace(source: &Path, target: &Path) -> Result<()> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn rename_noreplace(_source: &Path, _target: &Path) -> Result<()> {
+pub(crate) fn rename_noreplace(_source: &Path, _target: &Path) -> Result<()> {
     bail!("atomic no-clobber rename is unsupported on this platform")
 }
 
-fn read_bound_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
+pub(crate) fn read_bound_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
     if !path.is_absolute() {
         bail!("reference artifact path must be absolute");
     }

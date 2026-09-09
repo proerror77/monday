@@ -1,14 +1,18 @@
 //! Fail-closed normalization for official Binance USD-M reference observations.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::str::FromStr;
 
 use anyhow::{bail, Context, Result};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::binance_market_tape::{MAX_SOURCE_DELAY_MS, MAX_SOURCE_LEAD_MS};
+use crate::binance_market_tape::MAX_SOURCE_LEAD_MS;
+use crate::binance_reference_common::{
+    required_decimal, required_filter_decimal, required_string, required_u64,
+    validate_receive_clock, validate_source_clock_not_future, validate_symbol,
+};
+pub use crate::binance_reference_common::{ReferenceClockValidator, ReferenceKind};
 
 pub const REFERENCE_SCHEMA: &str = "binance.usdm_reference.v3";
 pub const EXCHANGE_INFO_ENDPOINT: &str = "/fapi/v1/exchangeInfo";
@@ -234,49 +238,6 @@ fn validate_open_interest(row: &OpenInterestObservation) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ReferenceKind {
-    Metadata,
-    MarkIndexFunding,
-    OpenInterest,
-}
-
-#[derive(Debug, Default)]
-pub struct ReferenceClockValidator {
-    clocks: BTreeMap<(ReferenceKind, String), (u64, u64)>,
-}
-
-impl ReferenceClockValidator {
-    pub fn observe(
-        &mut self,
-        kind: ReferenceKind,
-        symbol: &str,
-        source_time_ms: u64,
-        received_at_ns: u64,
-    ) -> Result<()> {
-        match kind {
-            ReferenceKind::OpenInterest => {
-                validate_source_clock_not_future(source_time_ms, received_at_ns)?
-            }
-            ReferenceKind::Metadata | ReferenceKind::MarkIndexFunding => {
-                validate_receive_clock(source_time_ms, received_at_ns)?
-            }
-        }
-        let key = (kind, symbol.to_owned());
-        if self
-            .clocks
-            .get(&key)
-            .is_some_and(|(last_source, last_received)| {
-                source_time_ms < *last_source || received_at_ns < *last_received
-            })
-        {
-            bail!("USD-M reference source time regressed");
-        }
-        self.clocks.insert(key, (source_time_ms, received_at_ns));
-        Ok(())
-    }
-}
-
 pub fn active_perpetual_contracts(
     exchange_info: &Value,
     source_time_ms: u64,
@@ -449,92 +410,6 @@ fn stale_count(
         }
     }
     Ok(stale)
-}
-
-fn validate_receive_clock(source_time_ms: u64, received_at_ns: u64) -> Result<()> {
-    let received_at_ms = received_at_ns / 1_000_000;
-    if source_time_ms > received_at_ms.saturating_add(MAX_SOURCE_LEAD_MS) {
-        bail!("USD-M reference source clock leads received clock");
-    }
-    if received_at_ms > source_time_ms.saturating_add(MAX_SOURCE_DELAY_MS) {
-        bail!("USD-M reference source clock is stale at receipt");
-    }
-    Ok(())
-}
-
-// The openInterest `time` field is the exchange's last-change timestamp for
-// that instrument, not a per-request clock: quiet instruments legitimately
-// lag minutes behind receipt (measured 97 of 569 active perpetuals beyond 25
-// seconds, worst ~10 minutes, on 2026-08-08). Only the lead direction (a
-// source timestamp from the future) stays fail-closed for open interest; the
-// lag direction is reported through ReferenceCoverage::stale_open_interest.
-fn validate_source_clock_not_future(source_time_ms: u64, received_at_ns: u64) -> Result<()> {
-    let received_at_ms = received_at_ns / 1_000_000;
-    if source_time_ms > received_at_ms.saturating_add(MAX_SOURCE_LEAD_MS) {
-        bail!("USD-M reference source clock leads received clock");
-    }
-    Ok(())
-}
-
-fn validate_symbol(symbol: &str) -> Result<()> {
-    if symbol.is_empty()
-        || symbol.chars().count() > 32
-        || !symbol.chars().all(|ch| {
-            ch.is_ascii_uppercase()
-                || ch.is_ascii_digit()
-                || ch == '_'
-                || is_cjk_unified_ideograph(ch)
-        })
-    {
-        bail!("invalid USD-M symbol identity");
-    }
-    Ok(())
-}
-
-// Binance lists perpetual contracts whose symbol carries a CJK base-asset
-// name (for example 币安人生USDT); the fail-closed identity gate must accept
-// exactly those ideographs without widening to arbitrary Unicode.
-fn is_cjk_unified_ideograph(ch: char) -> bool {
-    ('\u{3400}'..='\u{4DBF}').contains(&ch) || ('\u{4E00}'..='\u{9FFF}').contains(&ch)
-}
-
-fn required_string<'a>(raw: &'a Value, field: &str, endpoint: &str) -> Result<&'a str> {
-    raw.get(field)
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .with_context(|| format!("{endpoint} response has invalid {field}"))
-}
-
-fn required_u64(raw: &Value, field: &str, endpoint: &str) -> Result<u64> {
-    raw.get(field)
-        .and_then(Value::as_u64)
-        .with_context(|| format!("{endpoint} response has invalid {field}"))
-}
-
-fn required_decimal(raw: &Value, field: &str, endpoint: &str) -> Result<Decimal> {
-    Decimal::from_str(required_string(raw, field, endpoint)?)
-        .with_context(|| format!("{endpoint} response has invalid decimal {field}"))
-}
-
-fn required_filter_decimal(raw: &Value, filter_type: &str, field: &str) -> Result<Decimal> {
-    let filters = raw
-        .get("filters")
-        .and_then(Value::as_array)
-        .context("exchangeInfo filters must be an array")?;
-    let mut matches = filters
-        .iter()
-        .filter(|filter| filter.get("filterType").and_then(Value::as_str) == Some(filter_type));
-    let filter = matches
-        .next()
-        .with_context(|| format!("exchangeInfo is missing {filter_type}"))?;
-    if matches.next().is_some() {
-        bail!("exchangeInfo has duplicate {filter_type}");
-    }
-    let value = required_decimal(filter, field, "exchangeInfo")?;
-    if value <= Decimal::ZERO {
-        bail!("exchangeInfo {filter_type} {field} must be positive");
-    }
-    Ok(value)
 }
 
 #[cfg(test)]

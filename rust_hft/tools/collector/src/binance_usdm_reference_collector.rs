@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
 pub const OFFICIAL_USDM_SOURCE_ORIGIN: &str = "https://fapi.binance.com";
+pub const OFFICIAL_SPOT_SOURCE_ORIGIN: &str = "https://api.binance.com";
 
 #[derive(Debug, Clone)]
 pub struct TimedJson {
@@ -30,7 +31,7 @@ impl fmt::Display for RateLimited {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "USD-M reference endpoint {} returned HTTP 429 Too Many Requests",
+            "Binance reference endpoint {} returned HTTP 429 Too Many Requests",
             self.endpoint
         )
     }
@@ -50,16 +51,23 @@ pub trait ReferenceSource: Sync {
 #[derive(Debug, Clone)]
 pub struct HttpReferenceSource {
     client: reqwest::Client,
+    source_origin: String,
 }
 
 impl HttpReferenceSource {
     pub fn new(source_origin: &str, timeout: Duration) -> Result<Self> {
-        if source_origin.trim_end_matches('/') != OFFICIAL_USDM_SOURCE_ORIGIN {
-            bail!("USD-M reference source must be the official Binance origin");
+        let origin = source_origin.trim_end_matches('/');
+        let expected_host = match origin {
+            OFFICIAL_USDM_SOURCE_ORIGIN => "fapi.binance.com",
+            OFFICIAL_SPOT_SOURCE_ORIGIN => "api.binance.com",
+            _ => bail!("Binance reference source must be an official Binance origin"),
+        };
+        if origin != source_origin && source_origin != format!("{origin}/") {
+            bail!("Binance reference source must not include a path");
         }
-        let parsed = reqwest::Url::parse(source_origin).context("invalid USD-M REST origin")?;
+        let parsed = reqwest::Url::parse(source_origin).context("invalid Binance REST origin")?;
         if parsed.scheme() != "https"
-            || parsed.host_str() != Some("fapi.binance.com")
+            || parsed.host_str() != Some(expected_host)
             || parsed.port().is_some()
             || !parsed.username().is_empty()
             || parsed.password().is_some()
@@ -67,23 +75,32 @@ impl HttpReferenceSource {
             || parsed.query().is_some()
             || parsed.fragment().is_some()
         {
-            bail!("USD-M reference source must not include credentials, port, path, or query");
+            bail!("Binance reference source must not include credentials, port, path, or query");
         }
         Ok(Self {
             client: reqwest::Client::builder()
                 .timeout(timeout)
                 .build()
-                .context("build USD-M reference HTTP client")?,
+                .context("build Binance reference HTTP client")?,
+            source_origin: origin.to_owned(),
         })
     }
 
     async fn get(&self, endpoint: &str, symbol: Option<&str>) -> Result<TimedJson> {
         self.get_url(
-            &format!("{OFFICIAL_USDM_SOURCE_ORIGIN}{endpoint}"),
+            &format!("{}{endpoint}", self.source_origin),
             endpoint,
             symbol,
         )
         .await
+    }
+
+    pub async fn get_public(&self, endpoint: &str) -> Result<TimedJson> {
+        self.get(endpoint, None).await
+    }
+
+    pub fn source_origin(&self) -> &str {
+        &self.source_origin
     }
 
     async fn get_url(&self, url: &str, endpoint: &str, symbol: Option<&str>) -> Result<TimedJson> {
@@ -94,7 +111,7 @@ impl HttpReferenceSource {
         let response = request
             .send()
             .await
-            .context("USD-M reference request failed")?;
+            .context("Binance reference request failed")?;
         let status = response.status();
         let retry_after_seconds = response
             .headers()
@@ -106,7 +123,7 @@ impl HttpReferenceSource {
         let bytes = response
             .bytes()
             .await
-            .context("USD-M reference response body failed")?;
+            .context("Binance reference response body failed")?;
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Err(RateLimited {
                 endpoint: endpoint.to_owned(),
@@ -116,10 +133,10 @@ impl HttpReferenceSource {
         }
         let received_at_ns = now_ns()?;
         if !status.is_success() {
-            bail!("USD-M reference endpoint {endpoint} returned HTTP {status}");
+            bail!("Binance reference endpoint {endpoint} returned HTTP {status}");
         }
         let value = serde_json::from_slice(&bytes).with_context(|| {
-            format!("USD-M reference endpoint {endpoint} returned invalid JSON")
+            format!("Binance reference endpoint {endpoint} returned invalid JSON")
         })?;
         Ok(TimedJson {
             value,
@@ -131,7 +148,7 @@ impl HttpReferenceSource {
 #[async_trait]
 impl ReferenceSource for HttpReferenceSource {
     fn source_origin(&self) -> &str {
-        OFFICIAL_USDM_SOURCE_ORIGIN
+        &self.source_origin
     }
 
     async fn server_time(&self) -> Result<TimedJson> {
@@ -480,6 +497,7 @@ mod tests {
                 .timeout(Duration::from_secs(1))
                 .build()
                 .unwrap(),
+            source_origin: OFFICIAL_USDM_SOURCE_ORIGIN.to_owned(),
         };
 
         let error = source
