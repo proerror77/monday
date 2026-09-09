@@ -867,7 +867,13 @@ impl AggregationEngine {
                         BarBuilder::new(trade.symbol.clone(), interval_ms, interval_start)
                     });
 
-                    builder.add_trade(&trade);
+                    // Binance raw `@trade` and aggregate `@aggTrade` may be
+                    // subscribed together for separate consumers. Aggregate
+                    // prints carry the same fills and must not double-count
+                    // the shared OHLCV builder.
+                    if trade.aggregate.is_none() {
+                        builder.add_trade(&trade);
+                    }
 
                     if builder.is_complete(trade.timestamp) {
                         if let Some(bar) = builder.build() {
@@ -1082,6 +1088,55 @@ pub struct MarketView {
     pub timestamp: Timestamp,
     /// 快照版本号，用于变更检测
     pub version: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AggregationEngine;
+    use hft_core::{MarketDataTimestamps, Price, Quantity, Side, Symbol, VenueId};
+    use ports::{AggregateTradeMetadata, MarketEvent, Trade};
+
+    #[test]
+    fn aggregate_trade_does_not_double_count_raw_trade_in_bars() {
+        let mut engine = AggregationEngine::new();
+        let raw = Trade {
+            symbol: Symbol::new("BTCUSDT"),
+            timestamp: 1_000_000,
+            price: Price::from_f64(100.0).unwrap(),
+            quantity: Quantity::from_f64(2.0).unwrap(),
+            side: Side::Buy,
+            trade_id: "10".to_string(),
+            source_venue: Some(VenueId::BINANCE),
+            timestamps: MarketDataTimestamps::default(),
+            aggregate: None,
+        };
+        let aggregate = Trade {
+            symbol: raw.symbol.clone(),
+            timestamp: raw.timestamp,
+            price: raw.price,
+            quantity: raw.quantity,
+            side: raw.side,
+            trade_id: "20".to_string(),
+            source_venue: raw.source_venue,
+            timestamps: raw.timestamps,
+            aggregate: Some(AggregateTradeMetadata {
+                aggregate_trade_id: 20,
+                first_trade_id: 10,
+                last_trade_id: 11,
+                is_buyer_maker: false,
+            }),
+        };
+        let mut output = Vec::new();
+        engine.process_market_event_into(MarketEvent::Trade(raw), &mut output);
+        engine.process_market_event_into(MarketEvent::Trade(aggregate), &mut output);
+
+        let builder = engine
+            .bar_builders
+            .get(&(Symbol::new("BTCUSDT"), 60_000))
+            .expect("raw trade initializes the bar");
+        assert_eq!(builder.volume, Quantity::from_f64(2.0).unwrap());
+        assert_eq!(builder.trade_count, 1);
+    }
 }
 
 impl MarketView {

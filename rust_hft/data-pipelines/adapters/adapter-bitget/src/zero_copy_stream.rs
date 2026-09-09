@@ -263,6 +263,7 @@ impl ZeroCopyBitgetStream {
             trade_id,
             source_venue: Some(VenueId::BITGET),
             timestamps: Default::default(),
+            aggregate: None,
         })
     }
 }
@@ -469,6 +470,7 @@ impl MessageHandler for ZeroCopyMessageHandler {
                                 trade_id,
                                 source_venue: Some(VenueId::BITGET),
                                 timestamps: Default::default(),
+                                aggregate: None,
                             });
                             self.send_event(event);
                         }

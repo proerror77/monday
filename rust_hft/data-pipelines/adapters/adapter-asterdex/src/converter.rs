@@ -76,6 +76,7 @@ impl MessageConverter {
             trade_id: trade.trade_id.to_string(),
             source_venue: Some(VenueId::ASTERDEX),
             timestamps: Default::default(),
+            aggregate: None,
         })
     }
 

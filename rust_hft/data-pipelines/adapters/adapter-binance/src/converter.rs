@@ -135,6 +135,7 @@ impl MessageConverter {
                 exchange_trade: Some(ExchangeTradeTimestamp::new(exchange_trade_time_us)),
                 local_receive: None,
             },
+            aggregate: None,
         })
     }
 
@@ -174,6 +175,67 @@ impl MessageConverter {
                 exchange_trade: None,
                 local_receive: None,
             },
+        })
+    }
+
+    /// Convert Binance `@aggTrade` without collapsing its aggregate range into
+    /// the ordinary raw trade ID. The caller may attach local receive time to
+    /// the returned canonical event at the tracked adapter boundary.
+    pub fn convert_aggregate_trade_event(
+        trade: AggregateTradeEvent,
+        source_venue: VenueId,
+    ) -> HftResult<Trade> {
+        if !trade._event_type.eq_ignore_ascii_case("aggTrade") {
+            return Err(HftError::Parse(
+                "Binance aggregate trade has the wrong event type".to_string(),
+            ));
+        }
+        if trade.aggregate_trade_id == 0
+            || trade.first_trade_id == 0
+            || trade.last_trade_id == 0
+            || trade.first_trade_id > trade.last_trade_id
+        {
+            return Err(HftError::Parse(
+                "Binance aggregate trade IDs are invalid".to_string(),
+            ));
+        }
+        let symbol = Symbol::from(trade.symbol);
+        let price = Self::parse_price(&trade.price)?;
+        let quantity = Self::parse_quantity(&trade.quantity)?;
+        if price <= Price::zero() || quantity <= Quantity::zero() {
+            return Err(HftError::Parse(
+                "Binance aggregate trade price and quantity must be positive".to_string(),
+            ));
+        }
+        let exchange_event_time_us = Self::millis_to_micros(trade.event_time, "E")?;
+        let exchange_trade_time_us = Self::millis_to_micros(trade.trade_time, "T")?;
+        let side = if trade.is_buyer_maker {
+            Side::Sell
+        } else {
+            Side::Buy
+        };
+
+        Ok(Trade {
+            symbol,
+            timestamp: exchange_trade_time_us,
+            price,
+            quantity,
+            side,
+            // Keep the canonical trade_id stable for generic consumers while
+            // exposing the full aggregate identity in typed metadata.
+            trade_id: trade.aggregate_trade_id.to_string(),
+            source_venue: Some(source_venue),
+            timestamps: MarketDataTimestamps {
+                exchange_event: Some(ExchangeEventTimestamp::new(exchange_event_time_us)),
+                exchange_trade: Some(ExchangeTradeTimestamp::new(exchange_trade_time_us)),
+                local_receive: None,
+            },
+            aggregate: Some(AggregateTradeMetadata {
+                aggregate_trade_id: trade.aggregate_trade_id,
+                first_trade_id: trade.first_trade_id,
+                last_trade_id: trade.last_trade_id,
+                is_buyer_maker: trade.is_buyer_maker,
+            }),
         })
     }
 
@@ -328,6 +390,11 @@ impl MessageConverter {
                 .map(MarketEvent::Snapshot)
                 .map(Some);
             }
+        } else if stream.contains("@aggTrade") {
+            if let Ok(trade) = Self::parse_value::<AggregateTradeEvent>(data.clone()) {
+                let trade_event = Self::convert_aggregate_trade_event(trade, source_venue)?;
+                return Ok(Some(MarketEvent::Trade(trade_event)));
+            }
         } else if stream.contains("@trade") {
             if let Ok(trade) = Self::parse_value::<TradeEvent>(data.clone()) {
                 let trade_event = Self::convert_trade_event(trade, source_venue)?;
@@ -355,6 +422,11 @@ impl MessageConverter {
         if let Ok(update) = Self::parse_json::<DepthUpdate>(text) {
             let book_update = Self::convert_depth_update(update, source_venue)?;
             return Ok(Some(MarketEvent::Update(book_update)));
+        }
+
+        if let Ok(trade) = Self::parse_json::<AggregateTradeEvent>(text) {
+            let trade_event = Self::convert_aggregate_trade_event(trade, source_venue)?;
+            return Ok(Some(MarketEvent::Trade(trade_event)));
         }
 
         // 嘗試解析為交易事件
@@ -526,6 +598,69 @@ mod tests {
         assert_eq!(trade_event.trade_id, "12345");
         // ms → μs 轉換
         assert_eq!(trade_event.timestamp, 123456789 * 1000);
+        assert!(trade_event.aggregate.is_none());
+    }
+
+    #[test]
+    fn aggregate_trade_preserves_exchange_range_and_timestamps() {
+        let message = r#"{
+            "stream":"btcusdt@aggTrade",
+            "data":{
+                "e":"aggTrade","E":123456790,"s":"BTCUSDT","a":987,
+                "p":"45000.00","q":"0.1","f":12340,"l":12345,
+                "T":123456789,"m":true
+            }
+        }"#;
+        let MarketEvent::Trade(trade) = MessageConverter::parse_stream_message(message, SPOT_VENUE)
+            .unwrap()
+            .expect("aggregate trade event")
+        else {
+            panic!("expected canonical trade event");
+        };
+        assert_eq!(trade.side, Side::Sell);
+        assert_eq!(trade.trade_id, "987");
+        assert_eq!(
+            trade.aggregate.as_ref().map(|meta| meta.aggregate_trade_id),
+            Some(987)
+        );
+        assert_eq!(
+            trade
+                .aggregate
+                .as_ref()
+                .map(|meta| (meta.first_trade_id, meta.last_trade_id)),
+            Some((12340, 12345))
+        );
+        assert_eq!(
+            trade
+                .timestamps
+                .exchange_event
+                .map(|timestamp| timestamp.as_micros()),
+            Some(123456790 * 1000)
+        );
+        assert_eq!(
+            trade
+                .timestamps
+                .exchange_trade
+                .map(|timestamp| timestamp.as_micros()),
+            Some(123456789 * 1000)
+        );
+    }
+
+    #[test]
+    fn aggregate_trade_rejects_invalid_id_range() {
+        let trade = AggregateTradeEvent {
+            _event_type: "aggTrade".to_string(),
+            event_time: 1,
+            symbol: "BTCUSDT".to_string(),
+            aggregate_trade_id: 7,
+            price: "100".to_string(),
+            quantity: "1".to_string(),
+            first_trade_id: 9,
+            last_trade_id: 8,
+            trade_time: 1,
+            is_buyer_maker: false,
+        };
+        assert!(MessageConverter::convert_aggregate_trade_event(trade, SPOT_VENUE).is_err());
     }
 
     #[test]

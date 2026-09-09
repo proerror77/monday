@@ -981,6 +981,9 @@ pub async fn load_research_lob_snapshots_sampled(
                 asks
             FROM binance_lob_ticks
             WHERE symbol = buckets.symbol
+              AND market_type = 'spot'
+              AND venue = 'binance'
+              AND depth_mode IS NOT NULL
               AND event_time >= buckets.bucket_start
               AND event_time < buckets.bucket_start + ($4::text || ' seconds')::interval
               AND received_at <= $3
@@ -2873,6 +2876,9 @@ mod tests {
             .0;
 
         assert!(query.contains("event_time >= buckets.bucket_start"));
+        assert!(query.contains("market_type = 'spot'"));
+        assert!(query.contains("venue = 'binance'"));
+        assert!(query.contains("depth_mode IS NOT NULL"));
         assert!(query.contains("received_at <= $3"));
         assert!(query.contains("received_at >= event_time"));
         assert!(query.contains("received_at - event_time <= ($5::text || ' seconds')::interval"));
@@ -3797,6 +3803,8 @@ mod tests {
                 symbol: "BTCUSDT".to_string(),
                 source_ts: received_at,
                 received_at: decision,
+                venue: None,
+                market_type: None,
                 sequence_id: None,
             },
             BinanceSourceClock {
@@ -3804,6 +3812,8 @@ mod tests {
                 symbol: "BTCUSDT".to_string(),
                 source_ts: source,
                 received_at,
+                venue: None,
+                market_type: None,
                 sequence_id: Some(7),
             },
         ];

@@ -692,6 +692,7 @@ fn parse_trade_obj(obj: &serde_json::Value, symbol: &Symbol) -> Option<MarketEve
         trade_id,
         source_venue: Some(VenueId::GRVT),
         timestamps: Default::default(),
+        aggregate: None,
     };
     Some(MarketEvent::Trade(trade))
 }

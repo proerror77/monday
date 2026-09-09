@@ -309,7 +309,11 @@ impl EventIngester {
         tracker.record_stage(LatencyStage::Ingestion);
 
         // 創建帶追蹤的事件（零拷貝：移動事件所有權）
-        let tracked_event = TrackedMarketEvent { event, tracker };
+        let tracked_event = TrackedMarketEvent {
+            event,
+            tracker,
+            previous_sequence: None,
+        };
 
         // 嘗試發送，應用背壓策略
         match self.producer.send(tracked_event) {
@@ -401,8 +405,12 @@ impl EventIngester {
         tracker.capture_boundary = hft_core::LatencyCaptureBoundary::AdapterPublish;
         tracker.record_stage_with_offset(LatencyStage::WsReceive, 0);
         tracker.record_stage_with_offset(LatencyStage::Parsing, 0);
-        self.ingest_tracked_lossless(TrackedMarketEvent { event, tracker })
-            .await
+        self.ingest_tracked_lossless(TrackedMarketEvent {
+            event,
+            tracker,
+            previous_sequence: None,
+        })
+        .await
     }
 
     /// Lossless ingestion for adapters that already measured frame receive and parse boundaries.
@@ -982,6 +990,7 @@ mod tests {
                 provider_identity: None,
             }),
             tracker,
+            previous_sequence: None,
         };
 
         ingester.ingest_tracked_lossless(tracked).await.unwrap();

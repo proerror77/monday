@@ -171,7 +171,11 @@ impl UltraEventIngester {
         tracker.record_stage_with_offset(hft_core::LatencyStage::Parsing, 0);
         tracker.record_stage(hft_core::LatencyStage::Ingestion);
 
-        let tracked_event = TrackedMarketEvent { event, tracker };
+        let tracked_event = TrackedMarketEvent {
+            event,
+            tracker,
+            previous_sequence: None,
+        };
 
         // 4. 無條件寫入 (~3-5ns)
         // SAFETY: 調用者保證不滿（通過 is_full() 預檢查）
@@ -219,6 +223,7 @@ impl UltraEventIngester {
             let tracked_event = TrackedMarketEvent {
                 event, // ✅ 零拷貝移動
                 tracker,
+                previous_sequence: None,
             };
 
             // 無條件寫入
@@ -263,7 +268,11 @@ impl UltraEventIngester {
         tracker.record_stage_with_offset(hft_core::LatencyStage::Parsing, 0);
         tracker.record_stage(hft_core::LatencyStage::Ingestion);
 
-        let tracked_event = TrackedMarketEvent { event, tracker };
+        let tracked_event = TrackedMarketEvent {
+            event,
+            tracker,
+            previous_sequence: None,
+        };
 
         // 5. 安全寫入（已預檢查容量）
         unsafe {

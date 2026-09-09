@@ -19,6 +19,12 @@ pub struct BinanceSourceClock {
     pub symbol: String,
     pub source_ts: DateTime<Utc>,
     pub received_at: DateTime<Utc>,
+    /// Explicit canonical venue identity for new rows. `None` preserves the
+    /// unknown status of legacy symbol-only captures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub venue: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sequence_id: Option<u64>,
 }
@@ -45,6 +51,10 @@ pub struct HistoricalLoadOptions {
     pub spot_sample_secs: u32,
     /// Reject captured CEX rows whose arrival lags exchange time by more than N seconds.
     pub max_source_delay_secs: u32,
+    /// Select exactly one Binance market family when loading canonical
+    /// continuous data. A symbol-only replay cannot safely combine Spot and
+    /// USD-M rows because the legacy `MarketUpdate` variants have no venue key.
+    pub binance_market_type: String,
 }
 
 impl Default for HistoricalLoadOptions {
@@ -58,6 +68,7 @@ impl Default for HistoricalLoadOptions {
             lob_sample_secs: 30,
             spot_sample_secs: 1,
             max_source_delay_secs: 30,
+            binance_market_type: "spot".to_string(),
         }
     }
 }

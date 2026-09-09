@@ -2,6 +2,7 @@
 //!
 //! WebSocket frames are exposed with receive metrics for the market-data path.
 
+use crate::BinanceTradeStreams;
 use adapters_common::ws_helpers::constants;
 use bytes::Bytes;
 use hft_core::{HftError, HftResult, Symbol};
@@ -63,6 +64,8 @@ pub struct BinanceWebSocket {
     symbols: Vec<Symbol>,
     ws_base_url: String,
     usdm: bool,
+    trade_streams: BinanceTradeStreams,
+    depth_levels: Option<usize>,
 }
 
 impl Default for BinanceWebSocket {
@@ -89,12 +92,24 @@ impl BinanceWebSocket {
             symbols: Vec::new(),
             ws_base_url: url_string,
             usdm: false,
+            trade_streams: BinanceTradeStreams::default(),
+            depth_levels: None,
         }
     }
 
     pub fn with_usdm(mut self) -> Self {
         self.ws_base_url = usdm_endpoint_for(&self.ws_base_url);
         self.usdm = true;
+        self
+    }
+
+    pub fn with_trade_streams(mut self, trade_streams: BinanceTradeStreams) -> Self {
+        self.trade_streams = trade_streams;
+        self
+    }
+
+    pub fn with_depth_levels(mut self, depth_levels: Option<usize>) -> Self {
+        self.depth_levels = depth_levels;
         self
     }
 
@@ -138,16 +153,23 @@ impl BinanceWebSocket {
         // BINANCE_USE_LIMITED=true -> 使用 depth{levels}@{freq}
         // 否則使用 diff depth（symbol@depth）
         let use_limited = uses_partial_depth_stream();
-        let levels: usize = std::env::var("COLLECTOR_DEPTH_LEVELS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .or_else(|| {
-                std::env::var("BINANCE_DEPTH_LEVELS")
-                    .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
-            })
-            .filter(|levels| matches!(*levels, 5 | 10 | 20))
-            .unwrap_or(20);
+        let levels: usize = self.depth_levels.unwrap_or_else(|| {
+            std::env::var("COLLECTOR_DEPTH_LEVELS")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .or_else(|| {
+                    std::env::var("BINANCE_DEPTH_LEVELS")
+                        .ok()
+                        .and_then(|s| s.parse::<usize>().ok())
+                })
+                .filter(|levels| matches!(*levels, 5 | 10 | 20))
+                .unwrap_or(20)
+        });
+        if !matches!(levels, 5 | 10 | 20) {
+            return Err(HftError::Config(format!(
+                "unsupported Binance partial depth {levels}; use 5, 10, or 20"
+            )));
+        }
         let freq = if use_limited {
             let configured_freq = std::env::var("COLLECTOR_DEPTH_FREQ")
                 .or_else(|_| std::env::var("BINANCE_DEPTH_FREQ"))
@@ -190,8 +212,19 @@ impl BinanceWebSocket {
                 streams.push(format!("{}@depth@100ms", symbol_lower));
             }
 
-            // 實時交易
-            streams.push(format!("{}@trade", symbol_lower));
+            match self.trade_streams {
+                BinanceTradeStreams::None => {}
+                BinanceTradeStreams::Raw => {
+                    streams.push(format!("{}@trade", symbol_lower));
+                }
+                BinanceTradeStreams::Aggregate => {
+                    streams.push(format!("{}@aggTrade", symbol_lower));
+                }
+                BinanceTradeStreams::Both => {
+                    streams.push(format!("{}@trade", symbol_lower));
+                    streams.push(format!("{}@aggTrade", symbol_lower));
+                }
+            }
 
             // Kline is derived from real-time trades in the engine; keep the duplicate feed opt-in.
             if sub_kline {
@@ -253,13 +286,39 @@ mod tests {
 
         let streams = ws.build_stream_names(&symbols).unwrap();
 
-        assert_eq!(streams.len(), 6); // 每個品種 3 個流
+        assert_eq!(streams.len(), 6); // 每個品種 3 個流（默认 raw trade）
         assert!(streams.contains(&"btcusdt@depth20@100ms".to_string()));
         assert!(streams.contains(&"btcusdt@trade".to_string()));
         assert!(streams.contains(&"btcusdt@bookTicker".to_string()));
         assert!(streams.contains(&"ethusdt@depth20@100ms".to_string()));
         assert!(streams.contains(&"ethusdt@trade".to_string()));
         assert!(streams.contains(&"ethusdt@bookTicker".to_string()));
+    }
+
+    #[test]
+    fn aggregate_trade_subscription_is_explicit_and_distinct() {
+        let ws = BinanceWebSocket::new().with_trade_streams(BinanceTradeStreams::Aggregate);
+        let streams = ws.build_stream_names(&[Symbol::new("BTCUSDT")]).unwrap();
+        assert_eq!(streams.len(), 3);
+        assert!(streams.contains(&"btcusdt@aggTrade".to_string()));
+        assert!(!streams.contains(&"btcusdt@trade".to_string()));
+
+        let both = BinanceWebSocket::new().with_trade_streams(BinanceTradeStreams::Both);
+        let streams = both.build_stream_names(&[Symbol::new("BTCUSDT")]).unwrap();
+        assert!(streams.contains(&"btcusdt@aggTrade".to_string()));
+        assert!(streams.contains(&"btcusdt@trade".to_string()));
+
+        let none = BinanceWebSocket::new().with_trade_streams(BinanceTradeStreams::None);
+        let streams = none.build_stream_names(&[Symbol::new("BTCUSDT")]).unwrap();
+        assert!(!streams.iter().any(|stream| stream.contains("trade")));
+    }
+
+    #[test]
+    fn explicit_depth_level_configuration_is_reflected_in_the_subscription() {
+        let ws = BinanceWebSocket::new().with_depth_levels(Some(5));
+        let streams = ws.build_stream_names(&[Symbol::new("BTCUSDT")]).unwrap();
+        assert!(streams.contains(&"btcusdt@depth5@100ms".to_string()));
+        assert!(!streams.contains(&"btcusdt@depth20@100ms".to_string()));
     }
 
     #[test]

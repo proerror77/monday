@@ -4216,6 +4216,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "hft-data-adapter-binance"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "futures",
+ "hft-core",
+ "hft-data-adapters-common",
+ "hft-integration",
+ "hft-ports",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "hft-data-adapter-polymarket"
 version = "0.1.0"
 dependencies = [
@@ -4231,6 +4252,16 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite 0.26.2",
  "url",
+]
+
+[[package]]
+name = "hft-data-adapters-common"
+version = "0.1.0"
+dependencies = [
+ "hft-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -5846,6 +5877,7 @@ dependencies = [
  "chrono",
  "crc32fast",
  "futures",
+ "hft-data-adapter-binance",
  "hft-data-adapter-polymarket",
  "libc",
  "ploy-market-contracts",
@@ -8707,6 +8739,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
+ "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",

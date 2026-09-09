@@ -37,6 +37,14 @@ const POLYMARKET_RTDS_WS_ENDPOINT: &str = "wss://ws-live-data.polymarket.com";
 const NEAR_DEPTH_PCT_RANGE: f64 = 0.001;
 const DB_POLYMARKET_SETTLEMENT_RETRY_LOOKBACK_SECS: i64 = 30 * 60;
 
+fn binance_identity_for_market_type(market_type: &str) -> Option<(&'static str, &'static str)> {
+    match market_type.trim().to_ascii_lowercase().as_str() {
+        "spot" => Some(("spot", "binance")),
+        "usd_m" => Some(("usd_m", "binance_futures")),
+        _ => None,
+    }
+}
+
 fn rtds_market_data_ws_config() -> PolymarketWsConfig {
     let mut config = PolymarketWsConfig::default();
     // These feeds only need resilient market-data delivery. A wider heartbeat
@@ -93,8 +101,15 @@ pub fn spawn_spot_feed(
             match result {
                 Ok(crypto_price) => {
                     // Convert Unix millis to DateTime<Utc>
-                    let ts = DateTime::from_timestamp_millis(crypto_price.timestamp)
-                        .unwrap_or_else(Utc::now);
+                    let Some(ts) = DateTime::from_timestamp_millis(crypto_price.timestamp) else {
+                        warn!(
+                            symbol = %crypto_price.symbol,
+                            timestamp = crypto_price.timestamp,
+                            "Skipping Binance RTDS tick with an invalid source timestamp"
+                        );
+                        continue;
+                    };
+                    let received_at = Utc::now();
 
                     let symbol_upper = crypto_price.symbol.to_uppercase();
 
@@ -109,7 +124,7 @@ pub fn spawn_spot_feed(
                             value: crypto_price.value,
                             full_accuracy_value: None,
                             source_timestamp: ts,
-                            received_at: Utc::now(),
+                            received_at,
                             is_carried_forward: false,
                         },
                     )
@@ -150,8 +165,14 @@ pub fn spawn_spot_feed(
                                 let last = last_persisted.get(&symbol_upper).copied();
                                 if last.map_or(true, |l| ts_sec > l) {
                                     last_persisted.insert(symbol_upper.clone(), ts_sec);
-                                    persist_spot_price(db, &symbol_upper, crypto_price.value, ts)
-                                        .await;
+                                    persist_spot_price(
+                                        db,
+                                        &symbol_upper,
+                                        crypto_price.value,
+                                        ts,
+                                        received_at,
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -185,6 +206,28 @@ pub fn spawn_db_spot_feed(
     symbols: Vec<String>,
     pool: PgPool,
 ) -> JoinHandle<()> {
+    spawn_db_spot_feed_for_market(tx, symbols, pool, "spot")
+}
+
+/// DB spot-price feed for an explicit Binance market family. Legacy rows with
+/// unknown identity remain audit-only and are never admitted to this feed.
+pub fn spawn_db_spot_feed_for_market(
+    tx: Arc<broadcast::Sender<MarketUpdate>>,
+    symbols: Vec<String>,
+    pool: PgPool,
+    market_type: impl Into<String>,
+) -> JoinHandle<()> {
+    let market_type = market_type.into();
+    let Some((canonical_market_type, venue)) = binance_identity_for_market_type(&market_type)
+    else {
+        warn!(
+            market_type,
+            "Unsupported Binance market type for DB spot feed"
+        );
+        return tokio::spawn(async {});
+    };
+    let market_type = canonical_market_type.to_string();
+    let venue = venue.to_string();
     tokio::spawn(async move {
         let symbols_upper: Vec<String> = symbols.iter().map(|s| s.to_uppercase()).collect();
         let mut last_ts: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
@@ -203,10 +246,16 @@ pub fn spawn_db_spot_feed(
                     FROM binance_price_ticks
                     WHERE symbol = ANY($1)
                       AND trade_time > NOW() - INTERVAL '30 seconds'
+                      AND trade_id IS NOT NULL
+                      AND event_time IS NOT NULL
+                      AND market_type = $2
+                      AND venue = $3
                     ORDER BY symbol, trade_time DESC
                     "#,
                 )
                 .bind(&symbols_upper)
+                .bind(&market_type)
+                .bind(&venue)
                 .fetch_all(&pool)
                 .await
                 {
@@ -250,6 +299,26 @@ pub fn spawn_db_aggtrade_feed(
     symbols: Vec<String>,
     pool: PgPool,
 ) -> JoinHandle<()> {
+    spawn_db_aggtrade_feed_for_market(tx, symbols, pool, "spot")
+}
+
+pub fn spawn_db_aggtrade_feed_for_market(
+    tx: Arc<broadcast::Sender<MarketUpdate>>,
+    symbols: Vec<String>,
+    pool: PgPool,
+    market_type: impl Into<String>,
+) -> JoinHandle<()> {
+    let market_type = market_type.into();
+    let Some((canonical_market_type, venue)) = binance_identity_for_market_type(&market_type)
+    else {
+        warn!(
+            market_type,
+            "Unsupported Binance market type for DB aggTrade feed"
+        );
+        return tokio::spawn(async {});
+    };
+    let market_type = canonical_market_type.to_string();
+    let venue = venue.to_string();
     tokio::spawn(async move {
         let symbols_upper: Vec<String> = symbols.iter().map(|s| s.to_uppercase()).collect();
         let mut last_seen: HashMap<String, (chrono::DateTime<chrono::Utc>, i64)> = HashMap::new();
@@ -273,10 +342,17 @@ pub fn spawn_db_aggtrade_feed(
                 FROM binance_agg_trade_ticks
                 WHERE symbol = ANY($1)
                   AND trade_time > NOW() - INTERVAL '30 seconds'
+                  AND event_time IS NOT NULL
+                  AND first_trade_id IS NOT NULL
+                  AND last_trade_id IS NOT NULL
+                  AND market_type = $2
+                  AND venue = $3
                 ORDER BY trade_time ASC, agg_trade_id ASC
                 "#,
             )
             .bind(&symbols_upper)
+            .bind(&market_type)
+            .bind(&venue)
             .fetch_all(&pool)
             .await
             {
@@ -334,6 +410,26 @@ pub fn spawn_db_l2_feed(
     symbols: Vec<String>,
     pool: PgPool,
 ) -> JoinHandle<()> {
+    spawn_db_l2_feed_for_market(tx, symbols, pool, "spot")
+}
+
+pub fn spawn_db_l2_feed_for_market(
+    tx: Arc<broadcast::Sender<MarketUpdate>>,
+    symbols: Vec<String>,
+    pool: PgPool,
+    market_type: impl Into<String>,
+) -> JoinHandle<()> {
+    let market_type = market_type.into();
+    let Some((canonical_market_type, venue)) = binance_identity_for_market_type(&market_type)
+    else {
+        warn!(
+            market_type,
+            "Unsupported Binance market type for DB L2 feed"
+        );
+        return tokio::spawn(async {});
+    };
+    let market_type = canonical_market_type.to_string();
+    let venue = venue.to_string();
     tokio::spawn(async move {
         let symbols_upper: Vec<String> = symbols.iter().map(|s| s.to_uppercase()).collect();
         let mut last_seen: HashMap<String, (chrono::DateTime<chrono::Utc>, i64)> = HashMap::new();
@@ -363,11 +459,17 @@ pub fn spawn_db_l2_feed(
                            event_time
                     FROM binance_lob_ticks
                     WHERE symbol = ANY($1)
+                      AND event_time IS NOT NULL
+                      AND depth_mode IS NOT NULL
                       AND event_time > NOW() - INTERVAL '30 seconds'
+                      AND market_type = $2
+                      AND venue = $3
                     ORDER BY event_time ASC, update_id ASC
                     "#,
             )
             .bind(&symbols_upper)
+            .bind(&market_type)
+            .bind(&venue)
             .fetch_all(&pool)
             .await
             {
@@ -1487,17 +1589,20 @@ async fn persist_spot_price(
     symbol: &str,
     price: Decimal,
     trade_time: DateTime<Utc>,
+    received_at: DateTime<Utc>,
 ) {
     let result = sqlx::query(
         r#"
-        INSERT INTO binance_price_ticks (symbol, price, trade_time, received_at)
-        VALUES ($1, $2, $3, NOW())
+        INSERT INTO binance_price_ticks
+            (symbol, price, trade_time, received_at)
+        VALUES ($1, $2, $3, $4)
         ON CONFLICT DO NOTHING
         "#,
     )
     .bind(symbol)
     .bind(price)
     .bind(trade_time)
+    .bind(received_at)
     .execute(pool)
     .await;
 

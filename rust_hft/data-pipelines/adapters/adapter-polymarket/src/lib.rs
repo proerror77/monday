@@ -1015,6 +1015,7 @@ fn convert_message(
                 ),
                 source_venue: Some(VenueId::POLYMARKET),
                 timestamps: Default::default(),
+                aggregate: None,
             })])
         }
         _ => Ok(Vec::new()),
