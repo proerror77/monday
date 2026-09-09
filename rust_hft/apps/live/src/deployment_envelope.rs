@@ -527,9 +527,7 @@ fn cex_execution_contract(
         ("binance", "spot") => hft_core::VenueId::BINANCE_SPOT,
         ("binance", "usdm") => hft_core::VenueId::BINANCE_FUTURES,
         _ => {
-            return Err(
-                "frozen CEX model has no governed runtime venue for its market".to_string(),
-            )
+            return Err("frozen CEX model has no governed runtime venue for its market".to_string())
         }
     };
     venue.simulate_execution = true;

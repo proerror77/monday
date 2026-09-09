@@ -445,10 +445,7 @@ fn signed_frozen_model_bundle_loads_native_parameters_and_preserves_limits() {
     };
     assert_eq!(program.factors.len(), 1);
     assert_eq!(*max_order_notional, rust_decimal::Decimal::from(500));
-    assert_eq!(
-        execution_contract.venue,
-        hft_core::VenueId::BINANCE_FUTURES
-    );
+    assert_eq!(execution_contract.venue, hft_core::VenueId::BINANCE_FUTURES);
     assert!(execution_contract.cross_spread);
     assert!(config.venues[0].simulate_execution);
     assert_eq!(
@@ -558,10 +555,7 @@ fn four_stage_cex_bundle_uses_formula_runtime_only_for_its_signed_scope() {
     let execution_contract = execution_contract
         .as_ref()
         .expect("four-stage bundle must preserve its sealed execution contract");
-    assert_eq!(
-        execution_contract.venue,
-        hft_core::VenueId::BINANCE_FUTURES
-    );
+    assert_eq!(execution_contract.venue, hft_core::VenueId::BINANCE_FUTURES);
     assert_eq!(
         execution_contract.venue_spec.tick_size.0,
         rust_decimal::Decimal::new(1, 1)
