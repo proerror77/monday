@@ -7,7 +7,7 @@ use crate::{
     data_mission, mission_dispatch,
     mission_render::{
         allowed_research_feature_fields, render_cex_bundle, CexCampaignFailureClassV1,
-        CexCampaignLearningDirectiveV1, CexCampaignPositionPolicyV1,
+        CexCampaignLearningDirectiveV1, CexCampaignPositionPolicyV1, CexCampaignResearchDeltaV1,
         CexCampaignResearchEvidenceSignatureV2, CexCampaignResearchParentV1,
         CexCampaignResearchPlanV1, CexCampaignSearchPolicyRevisionV1, MAX_RESEARCH_PLAN_GENERATION,
     },
@@ -25,7 +25,7 @@ use crate::{
 };
 use alpha_domain::{
     canonical_json_hash, factor_ast_source_features, CandidateEvaluation, CexBaselineFailureCodeV1,
-    CexBaselineGateV1, CexFactorBankRevisionV2, CexFactorRejectionCodeV1, CEX_GP_POLICY_SCHEMA_V4,
+    CexBaselineGateV1, CexFactorBankRevisionV2, CexFactorRejectionCodeV1,
 };
 use alpha_engine::{baselines::CexSupervisedModelCandidateV2, engines::CexFactorBankMctsResultV1};
 use anyhow::{bail, Context};
@@ -65,7 +65,7 @@ fn declared_total_trials_for_rounds(
         .context("campaign declared_total_trials overflowed")
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CampaignRequest {
     pub(crate) schema_version: String,
@@ -240,6 +240,8 @@ struct CampaignReplayFeedbackV1 {
 #[serde(deny_unknown_fields)]
 struct CampaignRoundFeedbackV1 {
     factor_attempts: usize,
+    #[serde(default)]
+    model_attempts: Option<usize>,
     accepted_factors: usize,
     factors: Vec<CampaignFactorFeedbackV1>,
     baseline_gate_passed: bool,
@@ -304,6 +306,7 @@ fn round_log_summary(round: &CampaignMissionLedgerV1) -> serde_json::Value {
         "consumed_trials": round.consumed_trials,
         "termination_reason": &round.termination_reason,
         "factor_attempts": round.feedback.factor_attempts,
+        "model_attempts": round.feedback.model_attempts,
         "accepted_factors": round.feedback.accepted_factors,
         "baseline_gate_passed": round.feedback.baseline_gate_passed,
         "baseline_failure_codes": &round.feedback.baseline_failure_codes,
@@ -687,7 +690,7 @@ fn next_campaign_policy_revision(
     CexCampaignSearchPolicyRevisionV1,
     CexCampaignLearningDirectiveV1,
 )> {
-    let position_policy = match failure_class {
+    let preferred_position_policy = match failure_class {
         CexCampaignFailureClassV1::NoTradesAfterCosts => {
             CexCampaignPositionPolicyV1::PredictionIdentity
         }
@@ -699,24 +702,45 @@ fn next_campaign_policy_revision(
         }
     };
     let current = &loaded.request.research_plan.search_policy_revision;
-    if current.position_policy == position_policy {
-        bail!("Campaign learning has no untried policy for the repeated failure class");
-    }
-    let rollback_policy_revision_id = current
-        .parent_revision_id
-        .clone()
-        .unwrap_or_else(|| current.revision_id.clone());
-    let revision = CexCampaignSearchPolicyRevisionV1::new(
-        Some(rollback_policy_revision_id.clone()),
-        position_policy,
-    )?;
-    if loaded
+    let attempted = loaded
         .request
         .research_plan
         .attempted_search_policy_revision_ids
-        .contains(&revision.revision_id)
-    {
-        bail!("Campaign learning has no untried policy for the repeated failure class");
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let candidate = loaded
+        .request
+        .research_plan
+        .allowed_search_policy_revisions
+        .iter()
+        .filter(|revision| !attempted.contains(&revision.revision_id))
+        .min_by_key(|revision| {
+            (
+                usize::from(revision.position_policy != preferred_position_policy),
+                usize::from(revision.research_delta.is_none()),
+                revision.revision_id.clone(),
+            )
+        })
+        .context("Campaign learning has no untried declared research delta")?;
+    let rollback_policy_revision_id = current.revision_id.clone();
+    let delta = candidate
+        .research_delta
+        .as_ref()
+        .context("declared follow-up revision is missing its typed delta")?;
+    let revision = CexCampaignSearchPolicyRevisionV1::new_typed(
+        Some(rollback_policy_revision_id.clone()),
+        candidate.position_policy,
+        CexCampaignResearchDeltaV1 {
+            feature_fields: delta.feature_fields.clone(),
+            operators: delta.operators.clone(),
+            windows: delta.windows.clone(),
+            ridge_l2: delta.ridge_l2,
+            cart_max_depth: delta.cart_max_depth,
+            cart_min_leaf: delta.cart_min_leaf,
+        },
+    )?;
+    if revision.revision_id != candidate.revision_id {
+        bail!("Campaign learning candidate revision identity drifted");
     }
     let parent = CexCampaignResearchParentV1 {
         campaign_id: loaded.request.campaign_id.clone(),
@@ -739,15 +763,36 @@ fn follow_up_plan(
     search_policy_revision: CexCampaignSearchPolicyRevisionV1,
     parent_evidence_signature: CexCampaignResearchEvidenceSignatureV2,
 ) -> anyhow::Result<CexCampaignResearchPlanV1> {
+    let delta_scope = search_policy_revision
+        .research_delta
+        .as_ref()
+        .map(|delta| {
+            format!(
+                "the declared bounded delta (features {:?}, operators {:?}, windows {:?}, Ridge ridge_l2 {}, CART max_depth {}, CART min_leaf {})",
+                delta.feature_fields,
+                delta.operators,
+                delta.windows,
+                delta.ridge_l2,
+                delta.cart_max_depth,
+                delta.cart_min_leaf,
+            )
+        })
+        .unwrap_or_else(|| "the registered position policy".to_string());
     let hypothesis = match learning_directive.failure_class {
         CexCampaignFailureClassV1::NoTradesAfterCosts => {
-            "The registered prediction-identity position policy will restore non-zero replay trades after costs for the unchanged factor set"
+            format!(
+                "The {delta_scope} with prediction-identity positioning will restore non-zero replay trades after costs while fees, labels, partitions, and holdout remain fixed"
+            )
         }
         CexCampaignFailureClassV1::OvertradeCapacity => {
-            "The registered hysteretic cost-aware position policy will reduce replay turnover and capacity breaches for the unchanged factor set"
+            format!(
+                "The {delta_scope} with hysteretic cost-aware positioning will reduce replay turnover and capacity breaches while fees, labels, partitions, and holdout remain fixed"
+            )
         }
         CexCampaignFailureClassV1::PositiveIcNegativeNet => {
-            "The registered hysteretic cost-aware position policy will improve replay net returns by reducing turnover costs for the unchanged predictive factor set"
+            format!(
+                "The {delta_scope} with hysteretic cost-aware positioning will improve replay net returns by reducing turnover costs while fees, labels, partitions, and holdout remain fixed"
+            )
         }
     };
     let mut attempted_search_policy_revision_ids = loaded
@@ -756,18 +801,34 @@ fn follow_up_plan(
         .attempted_search_policy_revision_ids
         .clone();
     attempted_search_policy_revision_ids.push(search_policy_revision.revision_id.clone());
+    let feature_fields = search_policy_revision
+        .research_delta
+        .as_ref()
+        .map(|delta| delta.feature_fields.clone())
+        .unwrap_or_else(|| loaded.request.research_plan.feature_fields.clone());
+    if !feature_fields
+        .iter()
+        .any(|field| field == &loaded.request.research_plan.focus_field)
+    {
+        bail!("declared follow-up feature subset removed the focus field");
+    }
     let plan = CexCampaignResearchPlanV1 {
         schema_version: "cex-campaign-research-plan-v2".to_string(),
         generation: loaded.request.research_plan.generation + 1,
         objective: format!(
-            "Evaluate {:?} policy follow-up after {}",
+            "Evaluate {:?} bounded research delta follow-up after {}",
             learning_directive.failure_class, loaded.request.campaign_id
         ),
-        hypothesis: hypothesis.to_string(),
+        hypothesis,
         focus_field: loaded.request.research_plan.focus_field.clone(),
-        feature_fields: loaded.request.research_plan.feature_fields.clone(),
+        feature_fields,
         search_policy_revision,
         attempted_search_policy_revision_ids,
+        allowed_search_policy_revisions: loaded
+            .request
+            .research_plan
+            .allowed_search_policy_revisions
+            .clone(),
         parent_evidence_signature: Some(parent_evidence_signature),
         parent: Some(CexCampaignResearchParentV1 {
             campaign_id: loaded.request.campaign_id.clone(),
@@ -1783,8 +1844,10 @@ fn collect_round_ledger(
         )
     };
     let burn = if factor_bank.entries.is_empty()
-        || factor_bank.gp_policy.schema_version != CEX_GP_POLICY_SCHEMA_V4
-    {
+        || !matches!(
+            factor_bank.gp_policy.schema_version.as_str(),
+            alpha_domain::CEX_GP_POLICY_SCHEMA_V4 | alpha_domain::CEX_GP_POLICY_SCHEMA_V5
+        ) {
         None
     } else {
         Some(
@@ -1805,7 +1868,10 @@ fn collect_round_ledger(
             cart.as_ref(),
         )
         .map_err(anyhow::Error::msg)?;
-    let supervised_ml = factor_bank.gp_policy.schema_version == CEX_GP_POLICY_SCHEMA_V4;
+    let supervised_ml = matches!(
+        factor_bank.gp_policy.schema_version.as_str(),
+        alpha_domain::CEX_GP_POLICY_SCHEMA_V4 | alpha_domain::CEX_GP_POLICY_SCHEMA_V5
+    );
     let supervised = if supervised_ml {
         load_supervised_round_evidence(
             &results,
@@ -1825,8 +1891,16 @@ fn collect_round_ledger(
         }
         None
     };
+    let model_attempts = persisted_supervised_model_attempt_count(&results)?;
+    if supervised_ml
+        && !factor_bank.entries.is_empty()
+        && model_attempts.is_none_or(|attempts| attempts == 0)
+    {
+        bail!("supervised ML round has no persisted model attempts");
+    }
     let feedback = CampaignRoundFeedbackV1 {
         factor_attempts: factor_bank.attempts.len(),
+        model_attempts,
         accepted_factors: factor_bank.entries.len(),
         factors: factor_bank
             .attempts
@@ -1876,15 +1950,22 @@ fn collect_round_ledger(
     };
     let strategy_path = results.join("combination-walk-forward.json");
     let subset_result = load_round_subset_result(&results)?;
-    let consumed_trials = factor_bank.attempts.len()
-        + if supervised_ml && !factor_bank.entries.is_empty() {
-            3
-        } else {
-            subset_result
-                .as_ref()
-                .map(|result| result.candidates_evaluated)
-                .unwrap_or(0)
-        };
+    let model_attempt_count = model_attempts.unwrap_or(0);
+    let consumed_trials = factor_bank
+        .attempts
+        .len()
+        .checked_add(model_attempt_count)
+        .and_then(|count| {
+            count.checked_add(if supervised_ml {
+                0
+            } else {
+                subset_result
+                    .as_ref()
+                    .map(|result| result.candidates_evaluated)
+                    .unwrap_or(0)
+            })
+        })
+        .context("Campaign round trial count overflowed")?;
     let strategy_exists = strategy_path.try_exists()?;
     let (
         termination_reason,
@@ -2071,6 +2152,36 @@ fn load_round_subset_result(results: &Path) -> anyhow::Result<Option<CexFactorBa
     Ok(Some(serde_json::from_slice(&std::fs::read(subset_path)?)?))
 }
 
+fn persisted_supervised_model_attempt_count(results: &Path) -> anyhow::Result<Option<usize>> {
+    let attempts_path = results.join("supervised-model-attempts.json");
+    if attempts_path.try_exists()? {
+        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(attempts_path)?)?;
+        if value["schema_version"] != "cex-supervised-model-attempts-v1" {
+            bail!("supervised model attempt ledger schema is invalid");
+        }
+        let attempts = value["attempts"]
+            .as_array()
+            .context("supervised model attempt ledger has no attempts")?;
+        let mut models = std::collections::BTreeSet::new();
+        for attempt in attempts {
+            let model = attempt["model"]
+                .as_str()
+                .filter(|model| !model.trim().is_empty())
+                .context("supervised model attempt has no model")?;
+            let outcome = attempt["outcome"]
+                .as_str()
+                .context("supervised model attempt has no outcome")?;
+            if !matches!(outcome, "admitted" | "started" | "completed" | "failed")
+                || !models.insert(model)
+            {
+                bail!("supervised model attempt ledger is invalid");
+            }
+        }
+        return Ok(Some(models.len()));
+    }
+    Ok(None)
+}
+
 fn compare_round_selection(
     left: &CampaignMissionLedgerV1,
     right: &CampaignMissionLedgerV1,
@@ -2195,6 +2306,8 @@ fn validate_existing_follow_up_plan(
         || plan.learning_directive.as_ref() != Some(expected_directive)
         || plan.parent_evidence_signature.as_ref() != Some(expected_evidence_signature)
         || &plan.search_policy_revision != expected_revision
+        || plan.allowed_search_policy_revisions
+            != loaded.request.research_plan.allowed_search_policy_revisions
         || plan
             .attempted_search_policy_revision_ids
             .strip_suffix(std::slice::from_ref(&expected_revision.revision_id))
@@ -2571,6 +2684,12 @@ fn validate_campaign_round_feedback(
     };
     if !supervised_match {
         bail!("Campaign result supervised ML feedback is invalid");
+    }
+    if feedback
+        .model_attempts
+        .is_some_and(|attempts| attempts == 0)
+    {
+        bail!("Campaign result model attempt count is zero");
     }
     Ok(())
 }
@@ -3516,16 +3635,21 @@ mod tests {
         .unwrap();
         assert_eq!(plan.generation, 1);
         assert_eq!(plan.parent.as_ref().unwrap().request_sha256, loaded.sha256);
-        assert_eq!(plan.max_candidates().unwrap(), 22);
+        assert_eq!(
+            plan.max_candidates().unwrap(),
+            CexCampaignResearchDeltaV1::canonical()
+                .gp_template_count()
+                .unwrap()
+        );
         assert_eq!(
             plan.search_policy_revision.position_policy,
             CexCampaignPositionPolicyV1::HystereticCostAware
         );
         assert_eq!(plan.learning_directive, Some(learning_directive.clone()));
-        assert_eq!(
-            plan.hypothesis,
-            "The registered hysteretic cost-aware position policy will reduce replay turnover and capacity breaches for the unchanged factor set"
-        );
+        assert!(plan.hypothesis.contains("declared bounded delta"));
+        assert!(plan
+            .hypothesis
+            .contains("fees, labels, partitions, and holdout remain fixed"));
         assert!(plan.llm.is_none());
         assert_eq!(plan.focus_field, loaded.request.research_plan.focus_field);
         assert_eq!(
@@ -3588,6 +3712,53 @@ mod tests {
     }
 
     #[test]
+    fn declared_feature_subset_flows_into_the_parent_bound_child_plan() {
+        let mut loaded = loaded_request_for_learning();
+        let allowlist = CexCampaignSearchPolicyRevisionV1::bounded_allowlist();
+        let subset = allowlist
+            .iter()
+            .find(|revision| {
+                revision.position_policy == CexCampaignPositionPolicyV1::HystereticCostAware
+                    && revision
+                        .research_delta
+                        .as_ref()
+                        .is_some_and(|delta| delta.feature_fields.len() < 9)
+            })
+            .cloned()
+            .unwrap();
+        loaded.request.research_plan.allowed_search_policy_revisions = vec![
+            CexCampaignSearchPolicyRevisionV1::canonical(),
+            subset.clone(),
+        ];
+        let result = negative_campaign_result(&loaded);
+        let result_sha256 = "9".repeat(64);
+        let (revision, directive) = next_campaign_policy_revision(
+            &loaded,
+            &result_sha256,
+            CexCampaignFailureClassV1::OvertradeCapacity,
+        )
+        .unwrap();
+        assert_eq!(revision.revision_id, subset.revision_id);
+        let plan = follow_up_plan(
+            &loaded,
+            &result_sha256,
+            directive,
+            revision,
+            campaign_research_evidence_signature(&loaded.request, &result).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.feature_fields,
+            subset.research_delta.unwrap().feature_fields
+        );
+        assert!(plan
+            .feature_fields
+            .iter()
+            .any(|field| field == &plan.focus_field));
+        plan.validate().unwrap();
+    }
+
+    #[test]
     fn positive_ic_negative_net_creates_a_hysteretic_directive() {
         let loaded = loaded_request_for_learning();
         let result_sha256 = "9".repeat(64);
@@ -3647,9 +3818,10 @@ mod tests {
             .revision_id
             .clone();
         loaded.request.research_plan.search_policy_revision =
-            CexCampaignSearchPolicyRevisionV1::new(
+            CexCampaignSearchPolicyRevisionV1::new_typed(
                 Some(parent_revision_id),
                 CexCampaignPositionPolicyV1::HystereticCostAware,
+                CexCampaignResearchDeltaV1::canonical(),
             )
             .unwrap();
         let child_signature =
@@ -3700,7 +3872,7 @@ mod tests {
     }
 
     #[test]
-    fn campaign_learning_stops_when_the_failure_policy_was_already_tried() {
+    fn campaign_learning_continues_after_position_policy_was_already_tried() {
         let mut loaded = loaded_request_for_learning();
         let canonical_revision_id = loaded
             .request
@@ -3708,14 +3880,16 @@ mod tests {
             .search_policy_revision
             .revision_id
             .clone();
-        let hysteretic = CexCampaignSearchPolicyRevisionV1::new(
+        let hysteretic = CexCampaignSearchPolicyRevisionV1::new_typed(
             Some(canonical_revision_id.clone()),
             CexCampaignPositionPolicyV1::HystereticCostAware,
+            CexCampaignResearchDeltaV1::canonical(),
         )
         .unwrap();
-        let identity = CexCampaignSearchPolicyRevisionV1::new(
+        let identity = CexCampaignSearchPolicyRevisionV1::new_typed(
             Some(canonical_revision_id.clone()),
             CexCampaignPositionPolicyV1::PredictionIdentity,
+            CexCampaignResearchDeltaV1::canonical(),
         )
         .unwrap();
         loaded.request.research_plan.search_policy_revision = identity.clone();
@@ -3733,19 +3907,19 @@ mod tests {
             &"9".repeat(64),
             CexCampaignFailureClassV1::NoTradesAfterCosts,
         )
-        .is_err());
+        .is_ok());
         assert!(next_campaign_policy_revision(
             &loaded,
             &"9".repeat(64),
             CexCampaignFailureClassV1::OvertradeCapacity,
         )
-        .is_err());
+        .is_ok());
         assert!(next_campaign_policy_revision(
             &loaded,
             &"9".repeat(64),
             CexCampaignFailureClassV1::PositiveIcNegativeNet,
         )
-        .is_err());
+        .is_ok());
     }
 
     #[test]
@@ -3783,6 +3957,39 @@ mod tests {
         validate_campaign_round_feedback(&feedback, 1).unwrap();
         feedback.accepted_factors = 0;
         assert!(validate_campaign_round_feedback(&feedback, 1).is_err());
+    }
+
+    #[test]
+    fn model_attempt_ledger_counts_failed_and_unmaterialized_models() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("supervised-model-attempts.json"),
+            serde_json::json!({
+                "schema_version": "cex-supervised-model-attempts-v1",
+                "attempts": [
+                    {"model": "ridge", "outcome": "failed"},
+                    {"model": "cart", "outcome": "admitted"},
+                    {"model": "burn_mlp", "outcome": "started"}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            persisted_supervised_model_attempt_count(root.path()).unwrap(),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn missing_model_attempt_ledger_does_not_infer_from_success_artifacts() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("ridge-supervised-candidate.json"), b"{}").unwrap();
+        assert_eq!(
+            persisted_supervised_model_attempt_count(root.path()).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -4484,9 +4691,21 @@ mod tests {
             declared_total_trials_for_rounds(&request.research_plan, 2).unwrap();
         assert_eq!(result["rounds"].as_array().unwrap().len(), 2);
         assert_eq!(result["declared_total_trials"], declared_total_trials);
+        let observed_consumed_trials: usize = result["rounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|round| {
+                round["feedback"]["factor_attempts"]
+                    .as_u64()
+                    .unwrap()
+                    .saturating_add(round["feedback"]["model_attempts"].as_u64().unwrap())
+            })
+            .map(|value| usize::try_from(value).unwrap())
+            .sum();
         assert_eq!(
             result["consumed_trials"],
-            (request.research_plan.max_candidates().unwrap() + 3) * 2
+            serde_json::json!(observed_consumed_trials)
         );
         for round in ["r1", "r2"] {
             let results = work_dir.join(format!("mission/{round}/execute/results"));
@@ -5226,6 +5445,7 @@ mod tests {
                     termination_reason: "no_passing_supervised_model".to_string(),
                     feedback: CampaignRoundFeedbackV1 {
                         factor_attempts,
+                        model_attempts: Some(3),
                         accepted_factors: 1,
                         factors: (0..factor_attempts)
                             .map(|index| CampaignFactorFeedbackV1 {

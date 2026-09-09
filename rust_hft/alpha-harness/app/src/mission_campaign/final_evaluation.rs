@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(crate) const REQUEST_SCHEMA: &str = "monday.campaign_final_request.v1";
 const FREEZE_SCHEMA: &str = "monday.campaign_final_freeze.v1";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FinalRequest {
     pub schema_version: String,

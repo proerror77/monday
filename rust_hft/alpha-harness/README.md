@@ -149,6 +149,28 @@ no claim is made; its typed factor/model/replay failures can seed a bounded
 follow-up. Only the legacy formula lane retains one finalization against the
 global holdout claim.
 
+Typed Campaign follow-ups carry a finite, root-declared allowlist of complete
+research deltas. A delta may select a subset of the admitted feature fields,
+choose the bounded GP operator set and rolling windows, and set the existing
+Ridge `ridge_l2` or CART `max_depth`/`min_leaf` parameters. The existing
+position policies remain the only decision mappings; fees, evaluation labels,
+walk-forward partitions, thresholds, data identities, and the sealed holdout
+are outside the delta. Each revision ID hashes every mutable delta field and
+the position policy, while its parent revision is lineage only. Dispatch still
+admits a child only when that full revision ID is in the signed root grant's
+allowlist.
+
+The parameterized GP lane uses a versioned v5 policy. Its template enumerator
+is shared by the typed budget and the runner, so generated ASTs can reference
+only the declared fields, operators, and windows. The runner restores the
+content-bound baseline parameters from the Mission; it does not reconstruct a
+canonical baseline. Actual GP and subset evidence plus the explicit supervised
+model attempt ledger, including failed attempts, are counted in the round
+ledger and in existing Campaign admission settlement. A repeated input
+signature reuses the existing child plan; an already attempted revision cannot
+be retried by changing its parent, and remaining declared deltas continue to be
+considered after one position-policy option is exhausted.
+
 The direct `mission execute` and checkpoint-resume surfaces remain diagnostic.
 They are not the cloud Campaign production path.
 
