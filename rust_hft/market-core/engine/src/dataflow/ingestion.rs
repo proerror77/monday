@@ -730,6 +730,8 @@ mod tests {
             sequence: 1,
             source_venue: None,
             timestamps: Default::default(),
+
+            provider_identity: None,
         };
 
         // 攝取事件
@@ -764,6 +766,8 @@ mod tests {
             sequence: 1,
             source_venue: None,
             timestamps: Default::default(),
+
+            provider_identity: None,
         };
 
         // 應該被拒絕但不返回錯誤
@@ -806,6 +810,8 @@ mod tests {
                 sequence: 1,
                 source_venue: None,
                 timestamps,
+
+                provider_identity: None,
             })
         };
         let (mut ingester, _consumer) = EventIngester::new(IngestionConfig::default());
@@ -858,6 +864,8 @@ mod tests {
                 exchange_trade: None,
                 local_receive: Some(LocalReceiveTimestamp::new(1_000)),
             },
+
+            provider_identity: None,
         });
 
         ingester.ingest(event).unwrap();
@@ -884,6 +892,8 @@ mod tests {
                 sequence,
                 source_venue: None,
                 timestamps: Default::default(),
+
+                provider_identity: None,
             })
         };
         for sequence in 1..=3 {
@@ -933,6 +943,8 @@ mod tests {
                 sequence: 1,
                 source_venue: None,
                 timestamps: Default::default(),
+
+                provider_identity: None,
             }))
             .await
             .unwrap();
@@ -966,6 +978,8 @@ mod tests {
                 sequence: 1,
                 source_venue: None,
                 timestamps: Default::default(),
+
+                provider_identity: None,
             }),
             tracker,
         };

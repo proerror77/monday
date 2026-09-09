@@ -1,12 +1,12 @@
 prediction-policy-dependencies.v5
 target=x86_64-unknown-linux-gnu
 profile=default,db
-input:Cargo.lock=sha256:39e0f7bceb62a9671faf3be9be773e1844def1ac3c444ff0fa908fdf055bce7f
+input:Cargo.lock=sha256:f96171ac2fc649e9774e7f9a18d1210afedf33b82184000b14605559e3234f03
 input:Cargo.toml=sha256:104f7b7a41e62d573b42da227e6fae379c2cfbe70bccf4b65b921a9c1281048f
 input:crates/ploy-research/Cargo.toml=sha256:cfc1572e1364f0e9712a81b2d7d5e6e786541b080862ee6729199ca4524b5541
 input:crates/ploy-feed-loaders/Cargo.toml=sha256:abf8f1b8adec93b1ad84a66294cb58eb65f9cbca33c701cc81c7635eb9b35e2c
 input:crates/ploy-market-contracts/Cargo.toml=sha256:e086ddc8f162ff0abcabe832b1b61549f0daf7e98a78ab96f5512c596c3dc7f0
-input:crates/ploy-market-data/Cargo.toml=sha256:4f3c213c3d8283de4672b7c2de6f9c9c30d12db11bb8460495f5ebf09225b2bd
+input:crates/ploy-market-data/Cargo.toml=sha256:9b085d64757b3bc3ce1d5494b2bab2d1776e640f3a6339031c47154e707d4f62
 input:../data-pipelines/core/Cargo.toml=sha256:4d4bb79a5456edf8f1922303ee98191401d08a360f60858681c12be2e0795b27
 input:../market-core/core/Cargo.toml=sha256:1871023d225485d0585cf929928690f83d0b5dc1f52eb6e5e578948843872769
 input:../market-core/integration/Cargo.toml=sha256:f54494420bc70e3e7465267411a9f055165061f68dbb00bb31391565a1ab0142
@@ -135,8 +135,8 @@ package:signal-hook-registry@1.4.8|source=registry+https://github.com/rust-lang/
 package:slab@0.4.12|source=registry+https://github.com/rust-lang/crates.io-index|checksum=0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5|features=std
 package:smallvec@1.15.2|source=registry+https://github.com/rust-lang/crates.io-index|checksum=8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90|features=const_generics,const_new,serde
 package:socket2@0.6.5|source=registry+https://github.com/rust-lang/crates.io-index|checksum=c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4|features=all
-package:sqlx-core@0.8.6|source=registry+https://github.com/rust-lang/crates.io-index|checksum=ee6798b1838b6a0f69c007c133b8df5866302197e404e8b6ee8ed3e3a5e68dc6|features=_rt-tokio,_tls-rustls,_tls-rustls-ring-webpki,any,chrono,crc,default,json,migrate,offline,rust_decimal,rustls,serde,serde_json,sha2,tokio,tokio-stream,webpki-roots
-package:sqlx-postgres@0.8.6|source=registry+https://github.com/rust-lang/crates.io-index|checksum=db58fcd5a53cf07c184b154801ff91347e4c30d17a3562a635ff028ad5deda46|features=any,chrono,json,migrate,rust_decimal
+package:sqlx-core@0.8.6|source=git+https://github.com/proerror77/sqlx-security-695?rev=6690e9870298d7b65042538f4c1e943ed3e318ec#6690e9870298d7b65042538f4c1e943ed3e318ec|checksum=none|features=_rt-tokio,_tls-rustls,_tls-rustls-ring-webpki,any,chrono,crc,default,json,migrate,offline,rust_decimal,rustls,serde,serde_json,sha2,tokio,tokio-stream,webpki-roots
+package:sqlx-postgres@0.8.6|source=git+https://github.com/proerror77/sqlx-security-695?rev=6690e9870298d7b65042538f4c1e943ed3e318ec#6690e9870298d7b65042538f4c1e943ed3e318ec|checksum=none|features=any,chrono,json,migrate,offline,rust_decimal
 package:sqlx@0.8.6|source=git+https://github.com/proerror77/sqlx-security-695?rev=6690e9870298d7b65042538f4c1e943ed3e318ec#6690e9870298d7b65042538f4c1e943ed3e318ec|checksum=none|features=_rt-tokio,any,chrono,default,derive,json,macros,migrate,postgres,runtime-tokio,runtime-tokio-rustls,rust_decimal,sqlx-macros,sqlx-postgres,tls-rustls-ring,tls-rustls-ring-webpki
 package:stable_deref_trait@1.2.1|source=registry+https://github.com/rust-lang/crates.io-index|checksum=6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596|features=
 package:stringprep@0.1.5|source=registry+https://github.com/rust-lang/crates.io-index|checksum=7b4df3d392d81bd458a8a621b8bffbd2302a12ffe288a9d931670948749463b1|features=

@@ -285,6 +285,8 @@ async fn receive_latency_cohort_excludes_non_receive_boundaries() {
         sequence: 1,
         source_venue: Some(VenueId::BINANCE),
         timestamps: Default::default(),
+
+        provider_identity: None,
     }));
     assert_eq!(
         adapter_publish.tracker.capture_boundary,
@@ -312,6 +314,8 @@ async fn receive_latency_cohort_excludes_non_receive_boundaries() {
                 sequence: 2,
                 source_venue: Some(VenueId::BINANCE),
                 timestamps: Default::default(),
+
+                provider_identity: None,
             }),
         ))
         .await
@@ -419,6 +423,8 @@ fn live_delta_updates_market_view_and_runs_strategy() {
             sequence: 100,
             source_venue: Some(VenueId::BINANCE),
             timestamps: Default::default(),
+
+            provider_identity: None,
         }))
         .expect("snapshot accepted");
     let first = engine.tick().expect("snapshot tick");
@@ -516,6 +522,8 @@ fn realtime_quote_overlays_bbo_without_destroying_deeper_l2() {
             sequence: 100,
             source_venue: Some(VenueId::BINANCE),
             timestamps: hft_core::MarketDataTimestamps::local_only(snapshot_receive),
+
+            provider_identity: None,
         }))
         .expect("snapshot accepted");
     engine.tick().expect("snapshot tick");
@@ -609,6 +617,8 @@ fn only_bucketed_strategies_exclude_a_newer_quote_overlay() {
             sequence: 20,
             source_venue: Some(VenueId::BINANCE),
             timestamps: Default::default(),
+
+            provider_identity: None,
         }))
         .expect("snapshot accepted");
     engine.tick().expect("snapshot tick");
@@ -678,6 +688,8 @@ fn realtime_quote_drives_production_imbalance_strategy_with_quote_sequence() {
             sequence: 20,
             source_venue: Some(VenueId::BINANCE),
             timestamps: Default::default(),
+
+            provider_identity: None,
         }))
         .expect("snapshot accepted");
     engine.tick().expect("snapshot tick");
@@ -725,6 +737,8 @@ fn crossed_realtime_quote_invalidates_the_venue_book() {
             sequence: 1,
             source_venue: Some(VenueId::BINANCE),
             timestamps: Default::default(),
+
+            provider_identity: None,
         }))
         .expect("snapshot accepted");
     engine.tick().expect("snapshot tick");
@@ -779,6 +793,8 @@ fn rebuilt_lob_delta_drives_production_imbalance_strategy() {
             sequence: 10,
             source_venue: Some(VenueId::BINANCE),
             timestamps: Default::default(),
+
+            provider_identity: None,
         }))
         .expect("snapshot accepted");
     engine.tick().expect("snapshot tick");
@@ -844,6 +860,8 @@ fn cross_venue_delta_recomputes_and_publishes_arbitrage_opportunity() {
                 sequence,
                 source_venue: Some(venue),
                 timestamps: Default::default(),
+
+                provider_identity: None,
             }))
             .expect("snapshot accepted");
         engine.tick().expect("snapshot tick");
@@ -896,6 +914,8 @@ fn deleting_top_level_refills_published_top_n_from_canonical_depth() {
             sequence: 1,
             source_venue: Some(VenueId::BINANCE),
             timestamps: Default::default(),
+
+            provider_identity: None,
         }))
         .expect("snapshot accepted");
     engine.tick().expect("snapshot tick");
@@ -948,6 +968,8 @@ fn batched_deltas_keep_the_lob_state_from_their_own_sequence() {
             sequence: 1,
             source_venue: Some(VenueId::BINANCE),
             timestamps: Default::default(),
+
+            provider_identity: None,
         }))
         .expect("snapshot accepted");
     engine.tick().expect("snapshot tick");
@@ -1003,6 +1025,8 @@ fn market_order_is_priced_from_event_lob_before_risk_review() {
             sequence: 1,
             source_venue: Some(VenueId::BINANCE),
             timestamps: Default::default(),
+
+            provider_identity: None,
         }))
         .expect("snapshot accepted");
     engine.tick().expect("snapshot tick");
@@ -1036,12 +1060,15 @@ fn venue_disconnect_invalidates_stale_books_until_a_fresh_snapshot() {
             sequence,
             source_venue: Some(VenueId::BYBIT),
             timestamps: Default::default(),
+
+            provider_identity: None,
         })
     };
     let disconnect = || MarketEvent::Disconnect {
         reason: "test disconnect".into(),
         source_venue: Some(VenueId::BYBIT),
         symbol: None,
+        connection_started_at: None,
     };
     ingester.lock().unwrap().ingest(snapshot(100)).unwrap();
     engine.tick().unwrap();
@@ -1148,6 +1175,8 @@ fn strategy_order_reaches_worker_with_lifecycle_and_idempotency_key() {
             sequence: 700,
             source_venue: Some(VenueId::BINANCE),
             timestamps: Default::default(),
+
+            provider_identity: None,
         }))
         .expect("snapshot accepted");
     engine.tick().expect("strategy tick");
@@ -1183,6 +1212,8 @@ fn intent_from_an_older_event_in_the_same_batch_is_rejected() {
             sequence: 700,
             source_venue: Some(VenueId::BINANCE),
             timestamps: Default::default(),
+
+            provider_identity: None,
         }))
         .expect("snapshot accepted");
     ingester
@@ -1225,6 +1256,8 @@ fn market_consumers_rotate_without_exceeding_the_global_tick_budget() {
             sequence,
             source_venue: Some(VenueId::BINANCE),
             timestamps: Default::default(),
+
+            provider_identity: None,
         })
     };
     first

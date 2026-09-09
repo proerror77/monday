@@ -127,6 +127,8 @@ fn bench_hotpath_latency() {
                 sequence: i as u64,
                 source_venue: Some(venue),
                 timestamps: Default::default(),
+
+                provider_identity: None,
             };
             guard.ingest(MarketEvent::Snapshot(snap)).unwrap();
         }
@@ -278,6 +280,8 @@ fn bench_multi_venue_latency() {
                 sequence: i as u64,
                 source_venue: Some(venue),
                 timestamps: Default::default(),
+
+                provider_identity: None,
             };
             guard.ingest(MarketEvent::Snapshot(snap)).unwrap();
         }

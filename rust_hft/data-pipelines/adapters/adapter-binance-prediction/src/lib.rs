@@ -200,6 +200,8 @@ fn snapshot_from_levels(
         sequence,
         source_venue: Some(VenueId::BINANCE_PREDICTION),
         timestamps: Default::default(),
+
+        provider_identity: None,
     })
 }
 

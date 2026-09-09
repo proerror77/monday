@@ -12,6 +12,7 @@ default = []
 audit = ["dep:sqlx"]
 live = [
     "audit",
+    "dep:adapter-polymarket-data",
     "dep:crc32fast",
     "dep:futures",
     "dep:polymarket-client-sdk",
@@ -21,6 +22,7 @@ live = [
 ]
 
 [dependencies]
+adapter-polymarket-data = { package = "hft-data-adapter-polymarket", path = "../../../data-pipelines/adapters/adapter-polymarket", optional = true }
 anyhow = "1"
 chrono.workspace = true
 crc32fast = { version = "1", optional = true }

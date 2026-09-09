@@ -259,6 +259,8 @@ fn orderbook_data_ref_to_snapshot(
         sequence: 0,
         source_venue: Some(VenueId::BITGET),
         timestamps: Default::default(),
+
+        provider_identity: None,
     })
 }
 
@@ -519,6 +521,8 @@ impl BitgetMarketStream {
             sequence: 0, // Bitget 不提供序列號，使用時間戳
             source_venue: Some(VenueId::BITGET),
             timestamps: Default::default(),
+
+            provider_identity: None,
         })
     }
 
@@ -664,6 +668,7 @@ impl MarketStream for BitgetMarketStream {
                         reason: format!("WebSocket error: {}", e),
                         source_venue: Some(hft_core::VenueId::BITGET),
                         symbol: None,
+                        connection_started_at: None,
                     })
                     .is_err()
                 {
@@ -855,6 +860,7 @@ impl MessageHandler for BitgetMessageHandler {
             reason: "Connection lost".to_string(),
             source_venue: Some(hft_core::VenueId::BITGET),
             symbol: None,
+            connection_started_at: None,
         });
         Ok(())
     }
@@ -1371,6 +1377,8 @@ impl BitgetMessageHandler {
             sequence: 0,
             source_venue: Some(VenueId::BITGET),
             timestamps: Default::default(),
+
+            provider_identity: None,
         })
     }
 
@@ -1576,6 +1584,8 @@ impl OrderBookState {
             sequence: 0,
             source_venue: Some(VenueId::BITGET),
             timestamps: Default::default(),
+
+            provider_identity: None,
         })
     }
 }

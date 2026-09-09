@@ -59,6 +59,7 @@ fn bench_boxed_strategy_dispatch(c: &mut Criterion) {
         reason: "benchmark".to_string(),
         source_venue: None,
         symbol: None,
+        connection_started_at: None,
     };
     let account = AccountView::default();
 

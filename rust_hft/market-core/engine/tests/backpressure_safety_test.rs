@@ -40,6 +40,8 @@ fn queued_price_protection_reloads_market_identity_and_freshness() {
             timestamps: hft_core::MarketDataTimestamps::local_only(LocalReceiveTimestamp::new(
                 received_at,
             )),
+
+            provider_identity: None,
         });
         MarketView {
             orderbooks: [(

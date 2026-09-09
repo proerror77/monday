@@ -360,6 +360,8 @@ impl MarketStream for E2EMockAdapter {
                             BookLevel::new_unchecked(base_price + 1.0, 0.2),
                         ],
                         sequence: count,
+
+                        provider_identity: None,
                     };
                     yield Ok(MarketEvent::Snapshot(snapshot));
                 }

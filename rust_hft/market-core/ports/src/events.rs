@@ -31,6 +31,16 @@ impl BookLevel {
     }
 }
 
+/// Provider identity attached to a full orderbook image when the venue exposes
+/// one. The fields remain optional on the generic snapshot because many CEX
+/// feeds do not provide a provider-level market or book hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderBookIdentity {
+    pub market: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub book_hash: Option<String>,
+}
+
 /// 市場快照事件
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketSnapshot {
@@ -45,6 +55,9 @@ pub struct MarketSnapshot {
     pub source_venue: Option<VenueId>,
     #[serde(default)]
     pub timestamps: MarketDataTimestamps,
+    /// Raw provider market/hash identity for this complete book image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_identity: Option<ProviderBookIdentity>,
 }
 
 /// 訂單簿增量更新
@@ -138,6 +151,10 @@ pub enum MarketEvent {
         source_venue: Option<VenueId>,
         #[serde(default)]
         symbol: Option<Symbol>,
+        /// Wall-clock start of the connection/reconnect attempt associated
+        /// with this invalidation, when the adapter can prove it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connection_started_at: Option<Timestamp>,
     },
 }
 

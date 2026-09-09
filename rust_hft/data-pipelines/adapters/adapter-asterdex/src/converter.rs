@@ -50,6 +50,8 @@ impl MessageConverter {
             sequence: snapshot.last_update_id,
             source_venue: Some(VenueId::ASTERDEX),
             timestamps: Default::default(),
+
+            provider_identity: None,
         })
     }
 

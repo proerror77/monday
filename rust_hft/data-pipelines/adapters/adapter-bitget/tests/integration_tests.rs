@@ -147,7 +147,7 @@ mod bitget_adapter_tests {
                             let mut q = queue.lock().await;
                             while !q.is_empty() {
                                 let msg = q.remove(0);
-                                if let Err(_) = ws.send(msg).await {
+                                if ws.send(msg).await.is_err() {
                                     break;
                                 }
                             }
@@ -156,7 +156,7 @@ mod bitget_adapter_tests {
 
                         // 發送心跳
                         if last_heartbeat.elapsed() >= heartbeat_interval {
-                            if let Err(_) = ws.send(Message::Ping(vec![].into())).await {
+                            if ws.send(Message::Ping(vec![].into())).await.is_err() {
                                 break;
                             }
                             last_heartbeat = Instant::now();
@@ -403,7 +403,7 @@ mod bitget_adapter_tests {
         // 收集事件（快照 + 更新）
         let events = collect_events(stream.as_mut(), 2, Duration::from_secs(5)).await?;
 
-        assert!(events.len() >= 1, "Should receive at least snapshot");
+        assert!(!events.is_empty(), "Should receive at least snapshot");
 
         // 驗證第一個是快照
         if let MarketEvent::Snapshot(snapshot) = &events[0] {

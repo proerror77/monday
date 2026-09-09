@@ -190,6 +190,8 @@ impl MockMultiVenueGenerator {
                     BookLevel::new_unchecked(self.binance_price + 1.0, 0.2),
                 ],
                 sequence: self.sequence,
+
+                provider_identity: None,
             },
             // Bitget 快照
             MarketSnapshot {
@@ -204,6 +206,8 @@ impl MockMultiVenueGenerator {
                     BookLevel::new_unchecked(self.bitget_price + 1.0, 0.2),
                 ],
                 sequence: self.sequence,
+
+                provider_identity: None,
             },
         ]
     }

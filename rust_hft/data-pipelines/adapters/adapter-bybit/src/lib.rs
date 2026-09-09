@@ -102,6 +102,7 @@ fn multiplex_market_events(
                         reason: invalidation.reason,
                         source_venue: Some(VenueId::BYBIT),
                         symbol: None,
+                        connection_started_at: None,
                     }));
                     if let Some(error) = invalidation.error {
                         yield Err(error);
@@ -304,6 +305,8 @@ fn convert_message_with_fast_bbo(
                 sequence: cross_sequence,
                 source_venue: Some(VenueId::BYBIT),
                 timestamps: Default::default(),
+
+                provider_identity: None,
             })])
         } else {
             Ok(vec![MarketEvent::Update(BookUpdate {

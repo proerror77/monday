@@ -64,6 +64,7 @@ impl MockMarketDataGenerator {
             bids,
             asks,
             sequence: self.sequence,
+            provider_identity: None,
         }
     }
 
@@ -295,6 +296,7 @@ impl MarketStream for MockEventAdapter {
                 reason: "Mock adapter test".to_string(),
                 source_venue: None,
                 symbol: None,
+                connection_started_at: None,
             });
         };
 

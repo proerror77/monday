@@ -72,6 +72,7 @@ impl MessageConverter {
             sequence: snapshot.last_update_id,
             source_venue: Some(source_venue),
             timestamps: MarketDataTimestamps::default(),
+            provider_identity: None,
         })
     }
 
@@ -450,6 +451,7 @@ impl MessageConverter {
                 sequence: update.sequence,
                 source_venue: update.source_venue,
                 timestamps: update.timestamps,
+                provider_identity: None,
             }));
         }
         Ok(MarketEvent::Update(update))

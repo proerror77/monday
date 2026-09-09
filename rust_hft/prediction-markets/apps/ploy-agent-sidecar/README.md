@@ -25,6 +25,13 @@ alone never authorize a gate. Data-audit, full-depth, and executable-replay
 research can pass from a verified receipt; Grok, runtime-parity, and realtime
 runtime claims remain fail-closed until their separate evidence contracts land.
 
+Queued requests that include `prediction_evidence` must also provide a complete
+`prediction_scope` with `product`, `task`, and `prediction_horizon_secs`. The
+scope must match the verified Mission and the request's selected symbol set.
+When the verified evidence is unavailable, the only offline exception is a
+`research_until_blocked` request whose target evidence is `diagnostic` or
+`factor_attribution`; every other evidence-bearing request remains blocked.
+
 ## Run
 
 From `rust_hft/prediction-markets`:

@@ -1009,6 +1009,8 @@ mod tests {
             sequence: 1,
             source_venue: Some(VenueId::ASTERDEX),
             timestamps: Default::default(),
+
+            provider_identity: None,
         };
 
         strategy.handle_snapshot(&snapshot.bids, &snapshot.asks, snapshot.timestamp);
@@ -1020,8 +1022,10 @@ mod tests {
     #[test]
     fn delta_updates_price_levels_and_removes_zero_quantity() {
         let symbol = Symbol::new("BTCUSDT");
-        let mut config = LobFlowGridConfig::default();
-        config.top_levels = 3;
+        let config = LobFlowGridConfig {
+            top_levels: 3,
+            ..Default::default()
+        };
         let mut strategy = LobFlowGridStrategy::new(symbol, config);
         strategy.handle_snapshot(
             &[create_level(100.0, 2.0), create_level(99.0, 1.0)],
@@ -1042,9 +1046,11 @@ mod tests {
     #[test]
     fn production_context_consumes_canonical_rebuilt_book() {
         let symbol = Symbol::new("BTCUSDT");
-        let mut config = LobFlowGridConfig::default();
-        config.venue = VenueId::BINANCE;
-        config.top_levels = 2;
+        let config = LobFlowGridConfig {
+            venue: VenueId::BINANCE,
+            top_levels: 2,
+            ..Default::default()
+        };
         let mut strategy = LobFlowGridStrategy::new(symbol.clone(), config);
         let bid_prices = [FixedPrice::from_f64(100.5), FixedPrice::from_f64(100.0)];
         let bid_quantities = [FixedQuantity::from_f64(5.0), FixedQuantity::from_f64(2.0)];
