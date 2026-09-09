@@ -308,9 +308,12 @@ pub struct PrepareFreshInputsArgs {
     /// Read-only root of sealed raw collector triplets.
     #[arg(long)]
     pub raw_root: PathBuf,
-    /// Read-only root of published USD-M reference triplets.
+    /// Read-only root of published Binance Spot or USD-M reference triplets.
     #[arg(long)]
     pub reference_root: PathBuf,
+    /// Binance market whose raw and reference identities are frozen together.
+    #[arg(long)]
+    pub market: String,
     #[arg(long)]
     pub start_received_at_ns: Option<u64>,
     #[arg(long)]
@@ -815,9 +818,12 @@ pub struct FreezeInventoryArgs {
     /// Read-only root of sealed raw collector triplets.
     #[arg(long)]
     pub raw_root: PathBuf,
-    /// Read-only root of published USD-M reference triplets.
+    /// Read-only root of published Binance Spot or USD-M reference triplets.
     #[arg(long)]
     pub reference_root: PathBuf,
+    /// Binance market whose raw and reference identities are frozen together.
+    #[arg(long)]
+    pub market: String,
     #[arg(long)]
     pub start_received_at_ns: u64,
     #[arg(long)]
@@ -1420,6 +1426,8 @@ mod tests {
             "/archive/raw",
             "--reference-root",
             "/archive/reference",
+            "--market",
+            "usdm",
             "--start-received-at-ns",
             "1700000000000000000",
             "--end-received-at-ns",
@@ -1463,6 +1471,7 @@ mod tests {
         let args = "alpha-harness mission prepare-fresh-inputs \
             --raw-root /archive/raw \
             --reference-root /archive/reference \
+            --market usdm \
             --duration-ns 3600000000000 \
             --cutoff-received-at-ns 1700000060000000000 \
             --max-candidates 8 \
@@ -1612,6 +1621,7 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
         assert!(Cli::try_parse_from([
             "alpha-harness", "data", "freeze-inventory",
             "--raw-root", "/archive/raw", "--reference-root", "/archive/reference",
+            "--market", "usdm",
             "--start-received-at-ns", "1700000000000000000", "--end-received-at-ns", "1700000060000000000",
             "--symbol", "BTCUSDT", "--image-ref", "registry/runner@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "--mission-id", "data-test", "--output-prefix", "runs/test", "--bucket-ms", "1000",

@@ -604,10 +604,10 @@ case "$source_revision" in
     ;;
 esac
 case "$market" in
-  usdm)
+  usdm|spot)
     ;;
   *)
-    die "MARKET must be usdm"
+    die "MARKET must be spot or usdm"
     ;;
 esac
 case "$symbol" in
@@ -763,6 +763,8 @@ verify_raw_range() {
       [ "$segment_end" -le "$window_end_received_at_ns" ] \
         || die "raw segment $i ends after the selected materialization window"
     fi
+    raw_market=$(json_string_field market "$manifest")
+    [ "$raw_market" = "$market" ] || die "raw segment $i market differs from frozen inventory"
     printf '%s\n' "$data" >"$STATE_ROOT/raw-segment-$i.path"
     printf '%s\n' "$sha" >"$STATE_ROOT/raw-segment-$i.sha256"
     printf '%s\n' "$manifest_sha" >"$STATE_ROOT/raw-segment-$i.manifest-sha256"
@@ -797,6 +799,11 @@ if [ "$ROLE" != "slice" ]; then
     [ -n "$manifest_sha" ] || die "REFERENCE_${i}_MANIFEST_SHA256 is required"
     verified=$(verify_triplet "reference batch $i" "$REFERENCE_ROOT" "$rel" "$sha" "$manifest_sha")
     data=$(printf '%s' "$verified" | awk -F'|' '{print $1}')
+    reference_venue=$(json_string_field venue "$(printf '%s' "$verified" | awk -F'|' '{print $2}')")
+    case "$market:$reference_venue" in
+      spot:binance_spot|usdm:binance_usdm) ;;
+      *) die "reference batch $i venue does not match frozen market" ;;
+    esac
     printf '%s\n' "$data" >"$STATE_ROOT/reference-$i.path"
     printf '%s\n' "$sha" >"$STATE_ROOT/reference-$i.sha256"
     printf '%s\n' "$manifest_sha" >"$STATE_ROOT/reference-$i.manifest-sha256"

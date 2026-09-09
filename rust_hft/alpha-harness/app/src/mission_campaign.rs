@@ -2375,7 +2375,7 @@ pub(crate) fn validate_terminal_mission_revision_binding(
     }
     let expected_decision_hash = expected
         .position_policy
-        .decision_policy()
+        .decision_policy_for_market(mission.spec.instrument.market.clone())
         .content_hash()
         .map_err(anyhow::Error::msg)?;
     if mission.spec.policies.supervised_decision.id != expected.revision_id

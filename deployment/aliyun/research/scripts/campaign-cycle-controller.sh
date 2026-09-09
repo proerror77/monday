@@ -22,7 +22,7 @@ usage() {
   cat <<'EOF'
 Usage: campaign-cycle-controller.sh [start] \
   (--campaign-inputs FILE --input-root DIR | --fresh-inputs \
-   --fresh-raw-root DIR --fresh-reference-root DIR \
+   --fresh-market spot|usdm --fresh-raw-root DIR --fresh-reference-root DIR \
    --fresh-symbol SYMBOL --fresh-image-ref IMAGE@sha256:DIGEST \
    --fresh-mission-id ID --fresh-output-root DIR \
    --fresh-output-prefix PREFIX --fresh-materializer FILE \
@@ -91,7 +91,7 @@ validate_controller_state() {
     and (.seeds | type == "array" and length >= 2)
     and all(.seeds[]; type == "number")
     and ((.input_mode // "receipt") == "receipt"
-      or ((.input_mode == "fresh") and (.fresh | type == "object")))
+      or ((.input_mode == "fresh") and (.fresh | type == "object" and (.market | type == "string"))))
   ' "$controller_state" >/dev/null || die "controller state is invalid: $controller_state"
 }
 
@@ -108,6 +108,7 @@ build_fresh_controller_contract() {
   fresh_state_json=$(jq -n \
     --arg raw_root "$fresh_raw_root" \
     --arg reference_root "$fresh_reference_root" \
+    --arg market "$fresh_market" \
     --arg start_received_at_ns "$fresh_start_received_at_ns" \
     --arg end_received_at_ns "$fresh_end_received_at_ns" \
     --arg symbol "$fresh_symbol" \
@@ -133,7 +134,7 @@ build_fresh_controller_contract() {
     --arg materializer_work_dir "$fresh_materializer_work_dir" \
     --arg preparation_report "$fresh_report_out" \
     '{
-      raw_root:$raw_root,reference_root:$reference_root,
+      raw_root:$raw_root,reference_root:$reference_root,market:$market,
       start_received_at_ns:$start_received_at_ns,end_received_at_ns:$end_received_at_ns,
       symbol:$symbol,image_ref:$image_ref,mission_id:$mission_id,
       output_root:$output_root,output_prefix:$output_prefix,
@@ -391,6 +392,7 @@ mode="start"
 fresh_mode=false
 fresh_raw_root=""
 fresh_reference_root=""
+fresh_market=""
 fresh_start_received_at_ns=""
 fresh_end_received_at_ns=""
 fresh_symbol=""
@@ -446,6 +448,7 @@ while (($#)); do
     --fresh-inputs) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_mode=true; shift ;;
     --fresh-raw-root) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_raw_root="$2"; shift 2 ;;
     --fresh-reference-root) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_reference_root="$2"; shift 2 ;;
+    --fresh-market) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_market="$2"; shift 2 ;;
     --fresh-start-received-at-ns|--fresh-window-start-ns) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_start_received_at_ns="$2"; shift 2 ;;
     --fresh-end-received-at-ns|--fresh-window-end-ns) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_end_received_at_ns="$2"; shift 2 ;;
     --fresh-symbol) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_symbol="$2"; shift 2 ;;
@@ -520,6 +523,10 @@ if [[ "$mode" == "start" ]]; then
     [[ -z "$input_root" ]] || die "--fresh-inputs conflicts with --input-root"
     [[ -n "$fresh_raw_root" ]] || die "--fresh-raw-root is required with --fresh-inputs"
     [[ -n "$fresh_reference_root" ]] || die "--fresh-reference-root is required with --fresh-inputs"
+    case "$fresh_market" in
+      spot|usdm) ;;
+      *) die "--fresh-market must be spot or usdm with --fresh-inputs" ;;
+    esac
     if [[ -n "$fresh_start_received_at_ns" || -n "$fresh_end_received_at_ns" ]]; then
       [[ -n "$fresh_start_received_at_ns" && -n "$fresh_end_received_at_ns" ]] \
         || die "both fresh explicit window bounds are required"
@@ -552,7 +559,7 @@ if [[ "$mode" == "start" ]]; then
     input_root="$fresh_output_root/$fresh_output_prefix"
     campaign_inputs="$input_root/receipts/campaign-inputs.json"
   else
-    [[ -z "$fresh_raw_root$fresh_reference_root$fresh_start_received_at_ns$fresh_end_received_at_ns$fresh_duration_ns$fresh_cutoff_received_at_ns$fresh_max_candidates$fresh_symbol$fresh_image_ref$fresh_mission_id$fresh_output_root$fresh_output_prefix$fresh_bucket_ms$fresh_label_horizon_buckets$fresh_top_depth$fresh_materializer$fresh_binary_dir$fresh_max_scan_entries$fresh_max_inputs$fresh_max_input_bytes$fresh_materializer_timeout_seconds$fresh_max_materializer_output_bytes$fresh_inventory_out$fresh_request_out$fresh_materializer_work_dir$fresh_report_out" ]] \
+    [[ -z "$fresh_raw_root$fresh_reference_root$fresh_market$fresh_start_received_at_ns$fresh_end_received_at_ns$fresh_duration_ns$fresh_cutoff_received_at_ns$fresh_max_candidates$fresh_symbol$fresh_image_ref$fresh_mission_id$fresh_output_root$fresh_output_prefix$fresh_bucket_ms$fresh_label_horizon_buckets$fresh_top_depth$fresh_materializer$fresh_binary_dir$fresh_max_scan_entries$fresh_max_inputs$fresh_max_input_bytes$fresh_materializer_timeout_seconds$fresh_max_materializer_output_bytes$fresh_inventory_out$fresh_request_out$fresh_materializer_work_dir$fresh_report_out" ]] \
       || die "fresh input arguments require --fresh-inputs"
     [[ -n "$campaign_inputs" ]] || die "--campaign-inputs is required when --fresh-inputs is absent"
   fi
@@ -729,6 +736,7 @@ if [[ "$mode" == "start" && "$fresh_mode" == true ]]; then
     mission prepare-fresh-inputs
     --raw-root "$fresh_raw_root"
     --reference-root "$fresh_reference_root"
+    --market "$fresh_market"
     --symbol "$fresh_symbol"
     --image-ref "$fresh_image_ref"
     --mission-id "$fresh_mission_id"

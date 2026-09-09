@@ -10,6 +10,10 @@ use data::binance_market_tape_artifact::{
     BinanceMarketTapeTriplet, BinanceMarketTapeTrustAnchor, ReplayedBinanceBookEvent,
     VerifiedBinanceMarketTapeSeries,
 };
+use data::binance_spot_reference::SpotInstrumentRules;
+use hft_collector::binance_spot_reference_artifact::{
+    verify_spot_reference_artifact, PublishedSpotReferenceArtifact,
+};
 use hft_collector::binance_usdm_reference_artifact::{
     verify_reference_artifact_read_only_current_batch, PublishedReferenceArtifact,
 };
@@ -17,7 +21,8 @@ use hft_collector::{DataModality, PointInTimeFeatureRow};
 use hft_core::{top5_book_features, TOP5_DEPTH};
 use hft_research_manifest::{
     CexArtifactTripletV2, CexInstrumentRulesV2, CexPitSeriesEvidenceV2, CexReplaySegmentIdentity,
-    CexReplaySeriesV1, CexReplaySnapshotV5, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V7,
+    CexReplaySeriesV1, CexReplaySnapshotV5, CexSpotInstrumentRulesV1, CexSpotNotionalFilterV1,
+    CexSpotPriceFilterV1, CexSpotQuantityFilterV1, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V7,
     CEX_DERIVATIVES_MAX_GAP_NS, CEX_FEATURE_AVAILABILITY_POLICY, CEX_MODALITY_AGGREGATE_TRADE,
     CEX_MODALITY_LOB, CEX_REPLAY_CLOCK_RECEIVED_AT_NS, CEX_REPLAY_SNAPSHOT_SCHEMA_V5,
 };
@@ -140,6 +145,10 @@ struct MaterializationReport {
     last_event_time: DateTime<Utc>,
     artifact_path: PathBuf,
     artifact_sha256: String,
+    /// Full public Spot rules are retained in the materialization report so
+    /// downstream fill validation does not collapse MARKET_LOT_SIZE or max
+    /// notional semantics into the generic three-field projection.
+    spot_instrument_rules: Option<SpotInstrumentRules>,
     snapshot: CexReplaySnapshotV5,
     snapshot_sha256: String,
     created_at: DateTime<Utc>,
@@ -348,9 +357,6 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
     if args.bucket_ms == 0 || args.label_horizon_buckets == 0 || args.top_depth == 0 {
         bail!("bucket, label horizon, and top depth must be positive");
     }
-    if args.market != Market::Usdm {
-        bail!("credential-free canonical materialization currently supports USD-M only");
-    }
     log_event(
         "segment_verification_started",
         json!({"segment_count": args.segment.len()}),
@@ -501,7 +507,7 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
             "label_available_through": label_available_through,
         }),
     );
-    let (instrument_rules, series) = bind_usdm_reference(
+    let (instrument_rules, series, spot_instrument_rules) = bind_reference(
         args,
         &symbol,
         &rows,
@@ -550,6 +556,9 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         top_depth: args.top_depth,
         instrument_rules,
         series,
+        spot_instrument_rules: spot_instrument_rules
+            .as_ref()
+            .map(manifest_spot_instrument_rules),
     };
     snapshot.validate().map_err(anyhow::Error::new)?;
     log_event(
@@ -580,6 +589,7 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         last_event_time,
         artifact_path,
         artifact_sha256,
+        spot_instrument_rules,
         snapshot,
         snapshot_sha256,
         created_at,
@@ -700,13 +710,263 @@ fn republish_verified_file(source: &Path, target: &Path, expected_sha256: &str) 
     publish_immutable(target, &bytes)
 }
 
+fn bind_reference(
+    args: &Args,
+    symbol: &str,
+    rows: &[PointInTimeFeatureRow],
+    first_event_time: DateTime<Utc>,
+    label_available_through: DateTime<Utc>,
+) -> Result<(
+    CexInstrumentRulesV2,
+    Vec<CexReplaySeriesV1>,
+    Option<SpotInstrumentRules>,
+)> {
+    match args.market {
+        Market::Usdm => bind_usdm_reference(
+            args,
+            symbol,
+            rows,
+            first_event_time,
+            label_available_through,
+        ),
+        Market::Spot => bind_spot_reference(
+            args,
+            symbol,
+            rows,
+            first_event_time,
+            label_available_through,
+        ),
+    }
+}
+
+fn validate_spot_fill_rules(rule: &SpotInstrumentRules) -> Result<()> {
+    rule.validate()?;
+    if rule.price_filter.tick_size <= Decimal::ZERO
+        || rule.lot_size_filter.step_size <= Decimal::ZERO
+        || rule.lot_size_filter.min_quantity <= Decimal::ZERO
+        || rule.lot_size_filter.max_quantity <= Decimal::ZERO
+    {
+        bail!(
+            "Spot symbol {symbol} has disabled price or LOT_SIZE execution bounds",
+            symbol = rule.symbol
+        );
+    }
+    // MARKET_LOT_SIZE is optional and may contain disabled zero components;
+    // preserve those semantics while rejecting any malformed enabled bound.
+    if let Some(filter) = &rule.market_lot_size_filter {
+        if filter.max_quantity > Decimal::ZERO && filter.min_quantity > filter.max_quantity {
+            bail!(
+                "Spot symbol {} has invalid MARKET_LOT_SIZE bounds",
+                rule.symbol
+            );
+        }
+    }
+    if rule
+        .notional_filter
+        .max_notional
+        .is_some_and(|max| max <= Decimal::ZERO || max < rule.notional_filter.min_notional)
+    {
+        bail!("Spot symbol {} has invalid max notional", rule.symbol);
+    }
+    Ok(())
+}
+
+fn manifest_spot_instrument_rules(rule: &SpotInstrumentRules) -> CexSpotInstrumentRulesV1 {
+    let quantity_filter =
+        |filter: &data::binance_spot_reference::SpotQuantityFilter| CexSpotQuantityFilterV1 {
+            min_quantity: filter.min_quantity.to_string(),
+            max_quantity: filter.max_quantity.to_string(),
+            step_size: filter.step_size.to_string(),
+        };
+    CexSpotInstrumentRulesV1 {
+        schema: rule.schema.clone(),
+        venue: rule.venue.clone(),
+        market: rule.market.clone(),
+        symbol: rule.symbol.clone(),
+        base_asset: rule.base_asset.clone(),
+        quote_asset: rule.quote_asset.clone(),
+        status: rule.status.clone(),
+        is_spot_trading_allowed: rule.is_spot_trading_allowed,
+        base_asset_precision: rule.base_asset_precision,
+        quote_asset_precision: rule.quote_asset_precision,
+        price_filter: CexSpotPriceFilterV1 {
+            min_price: rule.price_filter.min_price.to_string(),
+            max_price: rule.price_filter.max_price.to_string(),
+            tick_size: rule.price_filter.tick_size.to_string(),
+        },
+        lot_size_filter: quantity_filter(&rule.lot_size_filter),
+        market_lot_size_filter: rule.market_lot_size_filter.as_ref().map(quantity_filter),
+        notional_filter: CexSpotNotionalFilterV1 {
+            filter_type: rule.notional_filter.filter_type.clone(),
+            min_notional: rule.notional_filter.min_notional.to_string(),
+            max_notional: rule
+                .notional_filter
+                .max_notional
+                .map(|value| value.to_string()),
+            apply_min_to_market: rule.notional_filter.apply_min_to_market,
+            apply_max_to_market: rule.notional_filter.apply_max_to_market,
+            avg_price_mins: rule.notional_filter.avg_price_mins,
+        },
+        source_time_ms: rule.source_time_ms,
+        source_clock_received_at_ns: rule.source_clock_received_at_ns,
+        received_at_ns: rule.received_at_ns,
+        source_endpoint: rule.source_endpoint.clone(),
+        source_clock_endpoint: rule.source_clock_endpoint.clone(),
+    }
+}
+
+fn spot_rule_identity(rule: &SpotInstrumentRules) -> Result<String> {
+    Ok(serde_json::to_string(&(
+        &rule.schema,
+        &rule.venue,
+        &rule.market,
+        &rule.symbol,
+        &rule.base_asset,
+        &rule.quote_asset,
+        &rule.status,
+        rule.is_spot_trading_allowed,
+        rule.base_asset_precision,
+        rule.quote_asset_precision,
+        &rule.price_filter,
+        &rule.lot_size_filter,
+        &rule.market_lot_size_filter,
+        &rule.notional_filter,
+        &rule.source_endpoint,
+        &rule.source_clock_endpoint,
+    ))?)
+}
+
+fn bind_spot_reference(
+    args: &Args,
+    symbol: &str,
+    rows: &[PointInTimeFeatureRow],
+    first_event_time: DateTime<Utc>,
+    label_available_through: DateTime<Utc>,
+) -> Result<(
+    CexInstrumentRulesV2,
+    Vec<CexReplaySeriesV1>,
+    Option<SpotInstrumentRules>,
+)> {
+    let count = args.reference_data.len();
+    if count == 0
+        || args.reference_data_sha256.len() != count
+        || args.reference_manifest_sha256.len() != count
+    {
+        bail!("Spot reference data and digest arguments must have equal nonzero lengths");
+    }
+    let mut identity = None;
+    let mut generic_rules = None;
+    let mut full_rule = None;
+    let mut rule_times = Vec::with_capacity(count);
+    let mut evidence = Vec::with_capacity(count);
+    let mut observations = Vec::with_capacity(count);
+    for (index, ((data_path, data_sha256), manifest_sha256)) in args
+        .reference_data
+        .iter()
+        .zip(&args.reference_data_sha256)
+        .zip(&args.reference_manifest_sha256)
+        .enumerate()
+    {
+        let published = PublishedSpotReferenceArtifact {
+            data_path: data_path.clone(),
+            manifest_path: sibling(data_path, ".manifest.json")?,
+            success_path: sibling(data_path, "._SUCCESS")?,
+            data_sha256: data_sha256.clone(),
+            manifest_sha256: manifest_sha256.clone(),
+        };
+        let batch = verify_spot_reference_artifact(&published, data_sha256, manifest_sha256)?;
+        let rule = batch
+            .rules()
+            .iter()
+            .find(|rule| rule.symbol == symbol)
+            .with_context(|| format!("Spot reference artifact has no active contract {symbol}"))?;
+        validate_spot_fill_rules(rule)?;
+        full_rule = Some(rule.clone());
+        let current_identity = spot_rule_identity(rule)?;
+        if identity
+            .as_ref()
+            .is_some_and(|existing| existing != &current_identity)
+        {
+            bail!("Spot instrument rules changed inside the requested PIT window");
+        }
+        identity = Some(current_identity);
+        let candidate = (
+            rule.price_filter.tick_size,
+            rule.lot_size_filter.step_size,
+            rule.notional_filter.min_notional,
+        );
+        if generic_rules.is_some_and(|existing| existing != candidate) {
+            bail!("Spot generic instrument rules changed inside the requested PIT window");
+        }
+        generic_rules = Some(candidate);
+        republish_evidence_triplet(
+            &args.artifact_dir,
+            "reference",
+            &published.data_path,
+            &published.manifest_path,
+            &published.success_path,
+            &published.data_sha256,
+            &published.manifest_sha256,
+        )?;
+        let triplet = CexArtifactTripletV2 {
+            data_sha256: published.data_sha256.clone(),
+            manifest_sha256: published.manifest_sha256.clone(),
+            success_sha256: published.data_sha256.clone(),
+        };
+        let available_at = datetime_ns(rule.received_at_ns)?;
+        rule_times.push(available_at);
+        push_unique_observation(&mut observations, available_at, &triplet);
+        push_unique_triplet(&mut evidence, &triplet);
+        if (index + 1).is_multiple_of(50) || index + 1 == count {
+            log_event(
+                "spot_reference_binding_progress",
+                json!({
+                    "completed_references": index + 1,
+                    "total_references": count,
+                    "data_sha256": data_sha256,
+                    "manifest_sha256": manifest_sha256,
+                    "available_at": available_at,
+                }),
+            );
+        }
+    }
+    rule_times.sort_unstable();
+    observations.sort_by_key(|observation| observation.available_at);
+    let (tick_size, step_size, min_notional) =
+        generic_rules.context("Spot generic instrument rules are missing")?;
+    let instrument_rules = CexInstrumentRulesV2 {
+        tick_size: tick_size.to_string(),
+        step_size: step_size.to_string(),
+        min_notional: min_notional.to_string(),
+        available_at: *rule_times.first().context("Spot rules evidence is empty")?,
+        valid_through: *rule_times.last().expect("Spot rules evidence is non-empty"),
+        evidence,
+    };
+    if instrument_rules.available_at > first_event_time
+        || instrument_rules.valid_through < label_available_through
+    {
+        bail!("PIT Spot instrument-rule coverage does not span the replay window");
+    }
+    let series = replay_series_coverages(
+        rows,
+        &observations,
+        args.label_horizon_buckets,
+        args.bucket_ms,
+    )?;
+    Ok((instrument_rules, series, full_rule))
+}
+
 fn bind_usdm_reference(
     args: &Args,
     symbol: &str,
     rows: &[PointInTimeFeatureRow],
     first_event_time: DateTime<Utc>,
     label_available_through: DateTime<Utc>,
-) -> Result<(CexInstrumentRulesV2, Vec<CexReplaySeriesV1>)> {
+) -> Result<(
+    CexInstrumentRulesV2,
+    Vec<CexReplaySeriesV1>,
+    Option<SpotInstrumentRules>,
+)> {
     let count = args.reference_data.len();
     if count == 0
         || args.reference_data_sha256.len() != count
@@ -802,7 +1062,7 @@ fn bind_usdm_reference(
         args.label_horizon_buckets,
         args.bucket_ms,
     )?;
-    Ok((instrument_rules, series))
+    Ok((instrument_rules, series, None))
 }
 
 fn reference_artifact_triplet(
@@ -1334,10 +1594,17 @@ mod tests {
         AggregateTrade, AggregateTradeSummaryBuilder, LobContinuitySummaryBuilder,
         AGGREGATE_TRADE_SUMMARY_CONTRACT, MARKET_TAPE_SCHEMA_V2,
     };
+    use data::binance_spot_reference::{
+        SpotInstrumentRules, SpotNotionalFilter, SpotPriceFilter, SpotQuantityFilter,
+        SpotReferenceBatch,
+    };
     use data::binance_usdm_reference::{
         ActivePerpetualContract, CompleteReferenceBatch, MarkIndexFundingObservation,
         OpenInterestObservation, EXCHANGE_INFO_ENDPOINT, OPEN_INTEREST_ENDPOINT,
         PREMIUM_INDEX_ENDPOINT, REFERENCE_SCHEMA, SERVER_TIME_ENDPOINT,
+    };
+    use hft_collector::binance_spot_reference_artifact::{
+        publish_spot_reference, PublishedSpotReferenceArtifact, SpotReferenceArtifactConfig,
     };
     use hft_collector::binance_usdm_reference_artifact::{
         publish_reference_batch, ReferenceArtifactConfig,
@@ -1588,6 +1855,51 @@ mod tests {
         .unwrap()
     }
 
+    fn spot_reference_batch(milliseconds: u64) -> SpotReferenceBatch {
+        let received_at_ns = event_ns(milliseconds);
+        SpotReferenceBatch::new(vec![SpotInstrumentRules {
+            schema: data::binance_spot_reference::REFERENCE_SCHEMA.to_owned(),
+            venue: "binance".to_owned(),
+            market: "spot".to_owned(),
+            symbol: "BTCUSDT".to_owned(),
+            base_asset: "BTC".to_owned(),
+            quote_asset: "USDT".to_owned(),
+            status: "TRADING".to_owned(),
+            is_spot_trading_allowed: true,
+            base_asset_precision: 8,
+            quote_asset_precision: 8,
+            price_filter: SpotPriceFilter {
+                min_price: Decimal::new(1, 1),
+                max_price: Decimal::from(1_000_000),
+                tick_size: Decimal::new(1, 1),
+            },
+            lot_size_filter: SpotQuantityFilter {
+                min_quantity: Decimal::new(1, 3),
+                max_quantity: Decimal::from(9_000),
+                step_size: Decimal::new(1, 3),
+            },
+            market_lot_size_filter: Some(SpotQuantityFilter {
+                min_quantity: Decimal::ZERO,
+                max_quantity: Decimal::from(9_000),
+                step_size: Decimal::ZERO,
+            }),
+            notional_filter: SpotNotionalFilter {
+                filter_type: "MIN_NOTIONAL".to_owned(),
+                min_notional: Decimal::from(5),
+                max_notional: None,
+                apply_min_to_market: true,
+                apply_max_to_market: None,
+                avg_price_mins: 5,
+            },
+            source_time_ms: received_at_ns / 1_000_000,
+            source_clock_received_at_ns: received_at_ns,
+            received_at_ns,
+            source_endpoint: data::binance_spot_reference::EXCHANGE_INFO_ENDPOINT.to_owned(),
+            source_clock_endpoint: data::binance_spot_reference::SERVER_TIME_ENDPOINT.to_owned(),
+        }])
+        .unwrap()
+    }
+
     fn rewrite_reference_manifest_v1(published: &mut PublishedReferenceArtifact) {
         let data = std::fs::read(&published.data_path).unwrap();
         let mut manifest: serde_json::Value =
@@ -1643,6 +1955,7 @@ mod tests {
         content_sha256: String,
         manifest_sha256: String,
         references: Vec<PublishedReferenceArtifact>,
+        spot_references: Vec<PublishedSpotReferenceArtifact>,
     }
 
     impl Fixture {
@@ -1743,27 +2056,51 @@ mod tests {
             let success = sibling(&data, "._SUCCESS").unwrap();
             std::fs::write(&success, format!("{content_sha256}\n")).unwrap();
             let reference_root = directory.join("reference");
-            let references = match market {
-                Market::Spot => Vec::new(),
-                Market::Usdm => [
-                    (0, 3_000, 1, 123_455),
-                    (2_500, 4_000, 2, 123_460),
-                    (6_000, 9_000, 3, 123_465),
-                ]
-                .into_iter()
-                .map(|(milliseconds, next_funding_ms, funding, oi)| {
-                    publish_reference_batch(
-                        &ReferenceArtifactConfig {
-                            output_root: reference_root.clone(),
-                            observed_at_ns: event_ns(milliseconds),
-                            max_staleness_ms: 1_000,
-                        },
-                        OFFICIAL_USDM_SOURCE_ORIGIN,
-                        &reference_batch(milliseconds, next_funding_ms, funding, oi),
-                    )
-                    .unwrap()
-                })
-                .collect(),
+            let (references, spot_references) = match market {
+                Market::Spot => {
+                    let spot_references = [0, 2_500, 6_000]
+                        .into_iter()
+                        .map(|milliseconds| {
+                            let batch = spot_reference_batch(milliseconds);
+                            let received_at_ns = batch.rules()[0].received_at_ns;
+                            publish_spot_reference(
+                                &SpotReferenceArtifactConfig {
+                                    output_root: reference_root.clone(),
+                                    observed_at_ns: event_ns(milliseconds),
+                                    max_staleness_ms: 1_000,
+                                },
+                                hft_collector::binance_spot_reference_collector::OFFICIAL_SPOT_SOURCE_ORIGIN,
+                                received_at_ns,
+                                received_at_ns,
+                                &batch,
+                            )
+                            .unwrap()
+                        })
+                        .collect();
+                    (Vec::new(), spot_references)
+                }
+                Market::Usdm => (
+                    [
+                        (0, 3_000, 1, 123_455),
+                        (2_500, 4_000, 2, 123_460),
+                        (6_000, 9_000, 3, 123_465),
+                    ]
+                    .into_iter()
+                    .map(|(milliseconds, next_funding_ms, funding, oi)| {
+                        publish_reference_batch(
+                            &ReferenceArtifactConfig {
+                                output_root: reference_root.clone(),
+                                observed_at_ns: event_ns(milliseconds),
+                                max_staleness_ms: 1_000,
+                            },
+                            OFFICIAL_USDM_SOURCE_ORIGIN,
+                            &reference_batch(milliseconds, next_funding_ms, funding, oi),
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+                    Vec::new(),
+                ),
             };
 
             Self {
@@ -1775,6 +2112,7 @@ mod tests {
                 content_sha256,
                 manifest_sha256,
                 references,
+                spot_references,
             }
         }
 
@@ -1786,8 +2124,18 @@ mod tests {
                 segment: vec![self.data.clone()],
                 segment_content_sha256: vec![self.content_sha256.clone()], segment_manifest_sha256: vec![self.manifest_sha256.clone()],
                 artifact_dir: self.directory.join("artifacts"),
-                reference_data: self.references.iter().map(|reference| reference.data_path.clone()).collect(),
-                reference_data_sha256: self.references.iter().map(|reference| reference.data_sha256.clone()).collect(), reference_manifest_sha256: self.references.iter().map(|reference| reference.manifest_sha256.clone()).collect(),
+                reference_data: match self.market {
+                    Market::Spot => self.spot_references.iter().map(|reference| reference.data_path.clone()).collect(),
+                    Market::Usdm => self.references.iter().map(|reference| reference.data_path.clone()).collect(),
+                },
+                reference_data_sha256: match self.market {
+                    Market::Spot => self.spot_references.iter().map(|reference| reference.data_sha256.clone()).collect(),
+                    Market::Usdm => self.references.iter().map(|reference| reference.data_sha256.clone()).collect(),
+                },
+                reference_manifest_sha256: match self.market {
+                    Market::Spot => self.spot_references.iter().map(|reference| reference.manifest_sha256.clone()).collect(),
+                    Market::Usdm => self.references.iter().map(|reference| reference.manifest_sha256.clone()).collect(),
+                },
             }
         }
     }
@@ -1926,13 +2274,42 @@ mod tests {
     }
 
     #[test]
-    fn rejects_spot_until_public_instrument_rules_are_bound() {
+    fn materializes_spot_with_public_instrument_rules() {
         let fixture = Fixture::new(Market::Spot, &valid_rows("spot"));
 
-        let error = materialize(&fixture.args()).unwrap_err().to_string();
+        let published = materialize(&fixture.args()).unwrap();
 
-        assert!(error.contains("currently supports USD-M only"));
-        assert!(!fixture.directory.join("artifacts").exists());
+        assert_eq!(published.report.market, "spot");
+        assert_eq!(published.report.snapshot.instrument_type, "spot");
+        assert_eq!(published.report.snapshot.instrument_rules.tick_size, "0.1");
+        let full_rules = published
+            .report
+            .snapshot
+            .spot_instrument_rules
+            .as_ref()
+            .expect("Spot snapshot must carry full exchangeInfo rules");
+        assert_eq!(full_rules.lot_size_filter.step_size, "0.001");
+        assert_eq!(
+            full_rules
+                .market_lot_size_filter
+                .as_ref()
+                .expect("fixture includes MARKET_LOT_SIZE")
+                .step_size,
+            "0"
+        );
+        assert_eq!(full_rules.notional_filter.avg_price_mins, 5);
+        assert_eq!(
+            published.report.snapshot.sha256(),
+            published.report.snapshot_sha256
+        );
+        assert_eq!(
+            published.report.snapshot.required_modalities,
+            BTreeSet::from([
+                CEX_MODALITY_LOB.to_string(),
+                CEX_MODALITY_AGGREGATE_TRADE.to_string(),
+            ])
+        );
+        assert!(!published.report.snapshot.series.is_empty());
     }
 
     #[test]

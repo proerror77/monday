@@ -4798,6 +4798,7 @@ dependencies = [
  "hex",
  "hft-core",
  "hft-data",
+ "hft-research-manifest",
  "itertools 0.12.1",
  "ordered-float 3.9.2",
  "parquet",

@@ -1,4 +1,6 @@
 use data::binance_lob_replay::source_revision;
+use hft_backtest::config::verify_and_replay_canonical_target_positions_with_trace_and_spot_rules;
+use hft_backtest::engine::{TargetPositionDecision, TargetPositionReplayConfig};
 use parquet::basic::Compression;
 use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
@@ -79,10 +81,87 @@ fn cli_replays_local_canonical_parquet_without_raw_sources_and_records_evidence(
     let manifest_bytes = serde_json::to_vec_pretty(&manifest_value).unwrap();
     fs::write(&manifest, &manifest_bytes).unwrap();
     let manifest_sha = sha256(&manifest_bytes);
+    let decisions = vec![
+        TargetPositionDecision {
+            timestamp_us: 100,
+            target_position: 0.0,
+        },
+        TargetPositionDecision {
+            timestamp_us: 200,
+            target_position: 0.0,
+        },
+    ];
+    let spot_config = TargetPositionReplayConfig {
+        market: "spot".to_string(),
+        max_depth_levels: 1,
+        max_decision_delay_us: 1_000,
+        order_latency_us: 0,
+        position_notional_usd: 100.0,
+        fee_bps: 0.0,
+        rebate_bps: 0.0,
+        funding_bps: 0.0,
+        latency_bps: 0.0,
+        additional_slippage_bps: 0.0,
+        cross_spread: true,
+        capacity_depth_levels: 0,
+        trade_tape_declared: false,
+    };
+    let valid_rules = spot_rules("BTCUSDT");
+    let (evidence, output) =
+        verify_and_replay_canonical_target_positions_with_trace_and_spot_rules(
+            &canonical_artifact,
+            &manifest,
+            &artifact_sha,
+            &manifest_sha,
+            None,
+            None,
+            &decisions,
+            &spot_config,
+            Some(&valid_rules),
+        )
+        .unwrap();
+    assert_eq!(evidence.market, "spot");
+    assert_eq!(output.metrics.final_inventory, 0.0);
+
+    let mut usdm_config = spot_config.clone();
+    usdm_config.market = "usdm".to_string();
+    let error = verify_and_replay_canonical_target_positions_with_trace_and_spot_rules(
+        &canonical_artifact,
+        &manifest,
+        &artifact_sha,
+        &manifest_sha,
+        None,
+        None,
+        &decisions,
+        &usdm_config,
+        None,
+    )
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("does not match replay artifact market"));
+
+    let wrong_rules = spot_rules("ETHUSDT");
+    let error = verify_and_replay_canonical_target_positions_with_trace_and_spot_rules(
+        &canonical_artifact,
+        &manifest,
+        &artifact_sha,
+        &manifest_sha,
+        None,
+        None,
+        &decisions,
+        &spot_config,
+        Some(&wrong_rules),
+    )
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("does not match canonical replay symbol"));
+
     let output_dir = directory.path().join("output");
     let config = directory.path().join("backtest.yaml");
     let config_yaml = format!(
-        "data:\n  path: {}\n  format: parquet\n  manifest_path: {}\n  manifest_sha256: {}\n  require_sequence: true\n  start_ts: 200\nstrategy:\n  volume_factor: 0\n  cvd_threshold: 0\nexecution: {{}}\nrisk: {{}}\noutput:\n  metrics_json: backtest_metrics.json\n",
+        "data:\n  path: {}\n  market: spot\n  format: parquet\n  manifest_path: {}\n  manifest_sha256: {}\n  require_sequence: true\n  start_ts: 200\nstrategy:\n  volume_factor: 0\n  cvd_threshold: 0\nexecution: {{}}\nrisk: {{}}\noutput:\n  metrics_json: backtest_metrics.json\n",
         canonical_artifact.display(),
         manifest.display(),
         manifest_sha
@@ -199,4 +278,43 @@ fn sha256_file(path: &Path) -> String {
 
 fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+fn spot_rules(symbol: &str) -> hft_research_manifest::CexSpotInstrumentRulesV1 {
+    hft_research_manifest::CexSpotInstrumentRulesV1 {
+        schema: "binance.spot_reference.v1".to_string(),
+        venue: "binance".to_string(),
+        market: "spot".to_string(),
+        symbol: symbol.to_string(),
+        base_asset: "BTC".to_string(),
+        quote_asset: "USDT".to_string(),
+        status: "TRADING".to_string(),
+        is_spot_trading_allowed: true,
+        base_asset_precision: 8,
+        quote_asset_precision: 8,
+        price_filter: hft_research_manifest::CexSpotPriceFilterV1 {
+            min_price: "0".to_string(),
+            max_price: "0".to_string(),
+            tick_size: "0.1".to_string(),
+        },
+        lot_size_filter: hft_research_manifest::CexSpotQuantityFilterV1 {
+            min_quantity: "0.001".to_string(),
+            max_quantity: "100".to_string(),
+            step_size: "0.001".to_string(),
+        },
+        market_lot_size_filter: None,
+        notional_filter: hft_research_manifest::CexSpotNotionalFilterV1 {
+            filter_type: "MIN_NOTIONAL".to_string(),
+            min_notional: "5".to_string(),
+            max_notional: None,
+            apply_min_to_market: false,
+            apply_max_to_market: None,
+            avg_price_mins: 5,
+        },
+        source_time_ms: 1,
+        source_clock_received_at_ns: 1_000_000,
+        received_at_ns: 1_000_000,
+        source_endpoint: "/api/v3/exchangeInfo".to_string(),
+        source_clock_endpoint: "/api/v3/time".to_string(),
+    }
 }

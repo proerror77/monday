@@ -134,6 +134,148 @@ pub struct CexInstrumentRulesV2 {
     pub evidence: Vec<CexArtifactTripletV2>,
 }
 
+/// Full public Binance Spot exchangeInfo rules bound to a PIT replay.
+///
+/// The generic `CexInstrumentRulesV2` projection remains useful for common
+/// research metadata, but Spot market-order replay also needs the distinct
+/// MARKET_LOT_SIZE and NOTIONAL application flags.  Decimal values stay as
+/// canonical strings so this contract preserves the source precision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexSpotPriceFilterV1 {
+    pub min_price: String,
+    pub max_price: String,
+    pub tick_size: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexSpotQuantityFilterV1 {
+    pub min_quantity: String,
+    pub max_quantity: String,
+    pub step_size: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexSpotNotionalFilterV1 {
+    pub filter_type: String,
+    pub min_notional: String,
+    pub max_notional: Option<String>,
+    pub apply_min_to_market: bool,
+    pub apply_max_to_market: Option<bool>,
+    pub avg_price_mins: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexSpotInstrumentRulesV1 {
+    pub schema: String,
+    pub venue: String,
+    pub market: String,
+    pub symbol: String,
+    pub base_asset: String,
+    pub quote_asset: String,
+    pub status: String,
+    pub is_spot_trading_allowed: bool,
+    pub base_asset_precision: u64,
+    pub quote_asset_precision: u64,
+    pub price_filter: CexSpotPriceFilterV1,
+    pub lot_size_filter: CexSpotQuantityFilterV1,
+    pub market_lot_size_filter: Option<CexSpotQuantityFilterV1>,
+    pub notional_filter: CexSpotNotionalFilterV1,
+    pub source_time_ms: u64,
+    pub source_clock_received_at_ns: u64,
+    pub received_at_ns: u64,
+    pub source_endpoint: String,
+    pub source_clock_endpoint: String,
+}
+
+impl CexSpotInstrumentRulesV1 {
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        let invalid = ManifestError::InvalidCexReplaySnapshot;
+        let valid_asset = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 32
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        };
+        let valid_quantity_filter = |filter: &CexSpotQuantityFilterV1, allow_disabled: bool| {
+            let min = filter.min_quantity.parse::<Decimal>().ok();
+            let max = filter.max_quantity.parse::<Decimal>().ok();
+            let step = filter.step_size.parse::<Decimal>().ok();
+            min.is_some_and(|value| value >= Decimal::ZERO)
+                && max.is_some_and(|value| value >= Decimal::ZERO)
+                && step.is_some_and(|value| value >= Decimal::ZERO)
+                && (allow_disabled
+                    || (min != Some(Decimal::ZERO)
+                        && max != Some(Decimal::ZERO)
+                        && step != Some(Decimal::ZERO)))
+                && !(min.is_some_and(|value| value > Decimal::ZERO)
+                    && max.is_some_and(|value| value > Decimal::ZERO)
+                    && min > max)
+        };
+        let price_min = self.price_filter.min_price.parse::<Decimal>().ok();
+        let price_max = self.price_filter.max_price.parse::<Decimal>().ok();
+        let price_tick = self.price_filter.tick_size.parse::<Decimal>().ok();
+        let notional_min = self.notional_filter.min_notional.parse::<Decimal>().ok();
+        let notional_max_result = self
+            .notional_filter
+            .max_notional
+            .as_deref()
+            .map(str::parse::<Decimal>)
+            .transpose();
+        let notional_max = notional_max_result.as_ref().ok().and_then(|value| *value);
+        let notional_shape = match self.notional_filter.filter_type.as_str() {
+            "MIN_NOTIONAL" => {
+                self.notional_filter.max_notional.is_none()
+                    && self.notional_filter.apply_max_to_market.is_none()
+            }
+            "NOTIONAL" => {
+                self.notional_filter.max_notional.is_some()
+                    && self.notional_filter.apply_max_to_market.is_some()
+            }
+            _ => false,
+        };
+        if self.schema != "binance.spot_reference.v1"
+            || self.venue != "binance"
+            || self.market != "spot"
+            || !valid_cex_symbol(&self.symbol)
+            || !valid_asset(&self.base_asset)
+            || !valid_asset(&self.quote_asset)
+            || self.status != "TRADING"
+            || !self.is_spot_trading_allowed
+            || price_min.is_none_or(|value| value < Decimal::ZERO)
+            || price_max.is_none_or(|value| value < Decimal::ZERO)
+            || price_tick.is_none_or(|value| value < Decimal::ZERO)
+            || (price_min.is_some_and(|value| value > Decimal::ZERO)
+                && price_max.is_some_and(|value| value > Decimal::ZERO)
+                && price_max < price_min)
+            || !valid_quantity_filter(&self.lot_size_filter, false)
+            || self
+                .market_lot_size_filter
+                .as_ref()
+                .is_some_and(|filter| !valid_quantity_filter(filter, true))
+            || !notional_shape
+            || !notional_min.is_some_and(|value| value > Decimal::ZERO)
+            || notional_max_result.is_err()
+            || notional_max.is_some_and(|value| {
+                value <= Decimal::ZERO || notional_min.is_some_and(|minimum| value < minimum)
+            })
+            || self.source_time_ms == 0
+            || self.source_clock_received_at_ns == 0
+            || self.received_at_ns == 0
+            || self.source_clock_received_at_ns > self.received_at_ns
+            || self.source_endpoint != "/api/v3/exchangeInfo"
+            || self.source_clock_endpoint != "/api/v3/time"
+        {
+            return Err(invalid("full Spot instrument rules are invalid"));
+        }
+        Ok(())
+    }
+}
+
 impl CexInstrumentRulesV2 {
     pub fn validate(&self) -> Result<(), ManifestError> {
         if !positive_decimal(&self.tick_size)
@@ -540,8 +682,11 @@ impl CexReplaySnapshotV4 {
     }
 }
 
-/// Current L2 USD-M research snapshot. PIT rules stay bound to the snapshot identity;
-/// aggregate trades are optional because the production Top-100 tape is LOB-only.
+/// Current Binance CEX research snapshot. PIT rules stay bound to the snapshot
+/// identity; aggregate trades are optional because the production Top-100 tape
+/// is LOB-only. Spot uses this same evidence shape while explicitly excluding
+/// derivatives-only funding and open-interest modalities. Spot snapshots also
+/// carry the complete exchangeInfo rule set used by market-order replay.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CexReplaySnapshotV5 {
@@ -560,6 +705,10 @@ pub struct CexReplaySnapshotV5 {
     pub label_horizon_buckets: usize,
     pub top_depth: usize,
     pub instrument_rules: CexInstrumentRulesV2,
+    /// Full Spot exchangeInfo rules are required for Spot replay. USD-M
+    /// snapshots must leave this absent because the profile is Spot-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spot_instrument_rules: Option<CexSpotInstrumentRulesV1>,
     pub series: Vec<CexReplaySeriesV1>,
 }
 
@@ -568,11 +717,6 @@ impl CexReplaySnapshotV5 {
         if !valid_cex_symbol(&self.symbol) {
             return Err(ManifestError::InvalidCexReplaySnapshot(
                 "symbol is not canonical",
-            ));
-        }
-        if self.instrument_type != "usdm" {
-            return Err(ManifestError::InvalidCexReplaySnapshot(
-                "L2-only replay snapshot supports USD-M only",
             ));
         }
         let lob_only = BTreeSet::from([CEX_MODALITY_LOB.to_string()]);
@@ -615,6 +759,22 @@ impl CexReplaySnapshotV5 {
             || self.instrument_rules.valid_through < label_available_through
         {
             return Err(invalid("PIT instrument rules evidence is invalid"));
+        }
+        match self.instrument_type.as_str() {
+            "spot" => {
+                let rules = self
+                    .spot_instrument_rules
+                    .as_ref()
+                    .ok_or_else(|| invalid("full Spot instrument rules are missing"))?;
+                rules.validate()?;
+                if rules.symbol != self.symbol {
+                    return Err(invalid("full Spot instrument rules symbol does not match"));
+                }
+            }
+            "usdm" if self.spot_instrument_rules.is_some() => {
+                return Err(invalid("USD-M snapshot contains Spot instrument rules"));
+            }
+            _ => {}
         }
         if self.series.is_empty() {
             return Err(invalid("series coverage is invalid"));
@@ -1443,6 +1603,7 @@ mod tests {
                     .with_timezone(&Utc),
                 evidence: vec![triplet('c'), triplet('d'), triplet('e'), triplet('f')],
             },
+            spot_instrument_rules: None,
             series: vec![
                 CexReplaySeriesV1 {
                     series_id: 1,
@@ -1753,6 +1914,81 @@ mod tests {
 
         manifest.validate().unwrap();
         assert_eq!(manifest.snapshot_sha256, snapshot.sha256());
+    }
+
+    #[test]
+    fn usd_m_v5_hash_is_stable_when_decoding_pre_spot_rules_records() {
+        let snapshot = cex_snapshot_v5();
+        let mut legacy_value = serde_json::to_value(&snapshot).unwrap();
+        assert!(legacy_value
+            .as_object_mut()
+            .unwrap()
+            .remove("spot_instrument_rules")
+            .is_none());
+        let decoded: CexReplaySnapshotV5 = serde_json::from_value(legacy_value).unwrap();
+
+        assert_eq!(snapshot.sha256(), decoded.sha256());
+        assert!(serde_json::to_value(&decoded)
+            .unwrap()
+            .get("spot_instrument_rules")
+            .is_none());
+    }
+
+    #[test]
+    fn spot_snapshot_v5_accepts_lob_only_without_derivatives_modalities() {
+        let mut snapshot = cex_snapshot_v5();
+        snapshot.instrument_type = "spot".to_string();
+        snapshot.required_modalities = BTreeSet::from([CEX_MODALITY_LOB.to_string()]);
+        snapshot.spot_instrument_rules = Some(CexSpotInstrumentRulesV1 {
+            schema: "binance.spot_reference.v1".to_string(),
+            venue: "binance".to_string(),
+            market: "spot".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            base_asset: "BTC".to_string(),
+            quote_asset: "USDT".to_string(),
+            status: "TRADING".to_string(),
+            is_spot_trading_allowed: true,
+            base_asset_precision: 8,
+            quote_asset_precision: 8,
+            price_filter: CexSpotPriceFilterV1 {
+                min_price: "0".to_string(),
+                max_price: "0".to_string(),
+                tick_size: "0.1".to_string(),
+            },
+            lot_size_filter: CexSpotQuantityFilterV1 {
+                min_quantity: "0.001".to_string(),
+                max_quantity: "100".to_string(),
+                step_size: "0.001".to_string(),
+            },
+            market_lot_size_filter: None,
+            notional_filter: CexSpotNotionalFilterV1 {
+                filter_type: "MIN_NOTIONAL".to_string(),
+                min_notional: "5".to_string(),
+                max_notional: None,
+                apply_min_to_market: true,
+                apply_max_to_market: None,
+                avg_price_mins: 0,
+            },
+            source_time_ms: 1,
+            source_clock_received_at_ns: 1_000_000,
+            received_at_ns: 1_000_000,
+            source_endpoint: "/api/v3/exchangeInfo".to_string(),
+            source_clock_endpoint: "/api/v3/time".to_string(),
+        });
+
+        snapshot.validate().unwrap();
+    }
+
+    #[test]
+    fn spot_snapshot_v5_rejects_missing_full_instrument_rules() {
+        let mut snapshot = cex_snapshot_v5();
+        snapshot.instrument_type = "spot".to_string();
+        snapshot.required_modalities = BTreeSet::from([CEX_MODALITY_LOB.to_string()]);
+
+        assert_eq!(
+            snapshot.validate().unwrap_err(),
+            ManifestError::InvalidCexReplaySnapshot("full Spot instrument rules are missing")
+        );
     }
 
     #[test]

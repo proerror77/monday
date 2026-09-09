@@ -19,6 +19,7 @@ hex = { workspace = true }
 hft_core = { package = "hft-core", path = "../../market-core/core" }
 parquet = { version = "59.1", default-features = false, features = ["zstd"] }
 data = { package = "hft-data", path = "../../data-pipelines/core" }
+hft-research-manifest = { path = "../../research-core/manifest" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 

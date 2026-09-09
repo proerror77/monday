@@ -1375,6 +1375,7 @@ mod tests {
         let controlled = CexSupervisedDecisionPolicyV2::controlled_v2();
         let identity = CexSupervisedDecisionPolicyV2::prediction_identity_v2();
         let hysteretic = CexSupervisedDecisionPolicyV2::hysteretic_cost_aware_v2();
+        let spot_identity = identity.clone().with_long_only(true);
 
         assert_eq!(
             cost_aware_target_position(0.0009, &row, &costs, &controlled).unwrap(),
@@ -1382,6 +1383,23 @@ mod tests {
         );
         assert_eq!(
             0.0009_f64.clamp(-identity.max_abs_position, identity.max_abs_position),
+            0.0009
+        );
+        assert_eq!(
+            cost_aware_target_position(-0.002, &row, &costs, &spot_identity).unwrap(),
+            0.0
+        );
+        assert_eq!(
+            spot_identity
+                .target_position(
+                    0.0009,
+                    0.0,
+                    CexDecisionCostsV1 {
+                        one_way_cost_bps: 0.0,
+                        funding_bps: 0.0,
+                    }
+                )
+                .unwrap(),
             0.0009
         );
         let entered = cost_aware_target_position(0.002, &row, &costs, &hysteretic).unwrap();
