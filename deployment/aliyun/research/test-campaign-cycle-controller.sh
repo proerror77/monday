@@ -169,6 +169,19 @@ case "$1 $2" in
       --arg job_name "$job_name" \
       '{campaign_id:$campaign_id,request_sha256:$request_sha256,job_name:$job_name}'
     ;;
+  "mission campaign-study-propose")
+    output="$(value_after --output "$@")"
+    plan_output="$(value_after --research-plan-output "$@")"
+    if [[ "${FAKE_STUDY_PROPOSAL_STATUS:-ready}" == needs_authority ]]; then
+      jq -n --arg reason "${FAKE_STUDY_PROPOSAL_REASON:-target_family_is_not_a_predeclared_study_member}" \
+        '{schema_version:"monday.campaign_study_proposal_report.v1",status:"needs_authority",reason:$reason}'
+    else
+      printf '{"study_proposal":true}\n' >"$output"
+      printf '{"schema_version":"cex-campaign-research-plan-v2"}\n' >"$plan_output"
+      jq -n --arg proposal "$output" --arg plan "$plan_output" \
+        '{schema_version:"monday.campaign_study_proposal_report.v1",status:"ready",proposal_path:$proposal,research_plan_path:$plan}'
+    fi
+    ;;
   "mission dispatch")
     submission="$(value_after --submission "$@")"
     if [[ "$3" == settle ]]; then
@@ -1013,4 +1026,90 @@ if ! FAKE_UNAME=Darwin "$controller" approve \
 fi
 test "$(<"$FAKE_STATE/dispatch-count")" == "$((control_dispatch_before + 1))"
 printf 'campaign fresh-input preparation: PASS\n'
+
+study_case_root="$root/study-handoff"
+study_cycle="$study_case_root/cycle"
+study_target_inputs="$fresh_control_output/campaign-inputs/study-target/receipts/campaign-inputs.json"
+study_target_materialization="$fresh_control_output/campaign-inputs/study-target/materialization.json"
+study_target_control="$study_case_root/target-control.json"
+study_horizon="$study_case_root/target-horizon.json"
+mkdir -p "$study_case_root" "$fresh_control_output/campaign-inputs/study-target/receipts"
+jq -n '{labels:{horizon_buckets:5,observation_frequency_millis:1000}}' >"$study_horizon"
+jq -n --arg inputs "$study_target_inputs" --arg materialization "$study_target_materialization" \
+  '{campaign_inputs_path:$inputs,materialization_path:$materialization}' >"$study_target_control"
+study_args=("${fresh_control_args[@]}")
+for ((study_index = 0; study_index < ${#study_args[@]}; study_index++)); do
+  if [[ "${study_args[study_index]}" == --work-dir ]]; then
+    study_args[study_index + 1]="$study_cycle"
+  fi
+done
+study_args+=(
+  --control "$bin/control"
+  --study-id study-test
+  --study-target-family-id target-family
+  --study-target-horizon "$study_horizon"
+  --study-target-start-received-at-ns 1700000000000000000
+  --study-target-end-received-at-ns 1700000060000000000
+  --study-target-mission-id study-target
+  --study-target-output-root "$fresh_control_output"
+  --study-target-output-prefix campaign-inputs/study-target
+  --study-target-bucket-ms 1000
+  --study-target-top-depth 5
+  --study-target-control "$study_target_control"
+)
+FAKE_STUDY_PROPOSAL_STATUS=needs_authority FAKE_STUDY_PROPOSAL_REASON=first_gap "$controller" "${study_args[@]}" \
+  >"$root/study-start.stdout" 2>"$root/study-start.stderr"
+study_ack_args=(
+  ack-readback --alpha-harness "$bin/alpha-harness" --aliyun "$bin/aliyun" --kubectl "$bin/kubectl"
+  --campaign-pod-name pod-g0 --work-dir "$study_cycle"
+)
+if ! FAKE_STUDY_PROPOSAL_STATUS=needs_authority "$controller" "${study_ack_args[@]}" \
+  >"$root/study-needs.stdout" 2>"$root/study-needs.stderr"; then
+  cat "$root/study-needs.stderr" >&2
+  exit 1
+fi
+jq -e '.status == "needs_authority" and (.reason | startswith("study_"))' \
+  "$study_cycle/generation-0/needs-authority.json" >/dev/null
+test ! -e "$study_cycle/generation-0/generation-complete"
+
+# Explicit authority resume retries the cached report even with unchanged
+# input/control paths and preserves the prior report evidence.
+study_resume_ack_args=("${study_ack_args[@]}" --study-retry-authority)
+if ! FAKE_STUDY_PROPOSAL_STATUS=needs_authority FAKE_STUDY_PROPOSAL_REASON=second_gap "$controller" "${study_resume_ack_args[@]}" \
+  >"$root/study-resumed.stdout" 2>"$root/study-resumed.stderr"; then
+  cat "$root/study-resumed.stderr" >&2
+  exit 1
+fi
+archive_count="$(find "$study_cycle/generation-0/study" -name 'proposal-report.needs-authority.*.json' | wc -l | tr -d ' ')"
+test "$archive_count" -eq 1
+if ! FAKE_STUDY_PROPOSAL_STATUS=ready "$controller" "${study_resume_ack_args[@]}" \
+  >"$root/study-authorized.stdout" 2>"$root/study-authorized.stderr"; then
+  cat "$root/study-authorized.stderr" >&2
+  exit 1
+fi
+if [[ ! -s "$study_cycle/generation-0/study-handoff.json" ]]; then
+  cat "$root/study-authorized.stderr" >&2
+  cat "$root/study-authorized.stdout" >&2
+  exit 1
+fi
+jq -e '.outcome == "study_handoff" and .study_handoff_sha256 != ""' \
+  "$study_cycle/generation-0/generation-complete" >/dev/null
+journal_count="$(find "$study_cycle/generation-0/study" -name 'proposal-report.needs-authority.*.json' | wc -l | tr -d ' ')"
+test "$journal_count" -eq 2
+study_approve_args=("${approve_args[@]}")
+for ((study_index = 0; study_index < ${#study_approve_args[@]}; study_index++)); do
+  if [[ "${study_approve_args[study_index]}" == --work-dir ]]; then
+    study_approve_args[study_index + 1]="$study_cycle"
+  fi
+done
+"$controller" "${study_approve_args[@]}" \
+  >"$root/study-approve.stdout" 2>"$root/study-approve.stderr"
+test -s "$study_cycle/generation-1/request.json"
+study_ack_g1_args=(
+  ack-readback --alpha-harness "$bin/alpha-harness" --aliyun "$bin/aliyun" --kubectl "$bin/kubectl"
+  --campaign-pod-name pod-g1 --work-dir "$study_cycle"
+)
+"$controller" "${study_ack_g1_args[@]}" >"$root/study-ack-g1.stdout" 2>"$root/study-ack-g1.stderr"
+test -s "$study_cycle/cycle-result.json"
+printf 'campaign Study handoff recovery: PASS\n'
 echo "campaign cycle controller test: PASS"

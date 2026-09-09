@@ -2,6 +2,7 @@
 
 pub mod campaign_control;
 pub mod campaign_finalization;
+pub mod campaign_horizon;
 pub mod campaign_study;
 mod evaluation_partition;
 pub mod frozen_model;

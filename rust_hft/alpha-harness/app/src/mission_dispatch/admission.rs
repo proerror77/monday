@@ -5,7 +5,8 @@ use super::{image_digest, ValidatedSubmission};
 use crate::{
     cli::BUILD_SOURCE_REVISION,
     mission_render::{
-        approved_evaluation_protocol, approved_validation, validate_render_materialization_scope,
+        approved_evaluation_protocol_for_horizon, approved_validation,
+        validate_render_materialization_scope_for_horizon,
     },
     mission_runner::{decode_materialization, validate_materialization, MAX_MATERIALIZATION_BYTES},
     prediction_dispatch::canonical_tokyo_oss_internal_object,
@@ -21,7 +22,8 @@ use alpha_domain::{
 use alpha_store::{
     campaign_ledger::{
         CampaignDispatchClaimV1, CampaignDispatchRecord, CampaignDispatchSettlementV1,
-        CampaignDispatchTargetV1,
+        CampaignDispatchTargetV1, CampaignLedgerEventV1, CampaignStudyLedgerEventV1,
+        CampaignStudySnapshotV1,
     },
     AlphaStore,
 };
@@ -30,7 +32,7 @@ use chrono::Utc;
 use ed25519_dalek::VerifyingKey;
 use reqwest::blocking::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
@@ -50,6 +52,8 @@ pub(super) struct DispatchControl {
     pub(super) signed_root_grant_path: PathBuf,
     pub(super) trusted_keys_path: PathBuf,
     pub(super) materialization_path: PathBuf,
+    #[serde(default)]
+    pub(super) campaign_inputs_path: Option<PathBuf>,
     pub(super) approval_id: String,
     pub(super) controller_image: String,
     pub(super) attempt_ordinal: u32,
@@ -78,7 +82,10 @@ pub(super) struct DispatchInspection {
 }
 
 impl DispatchInspection {
-    fn reservation(&self, grant: &VerifiedCampaignRootGrant) -> CampaignAttemptReservationV1 {
+    pub(super) fn reservation(
+        &self,
+        grant: &VerifiedCampaignRootGrant,
+    ) -> CampaignAttemptReservationV1 {
         self.reservation_for(grant.content_sha256(), &grant.grant().family.family_id)
     }
 
@@ -99,6 +106,14 @@ impl DispatchInspection {
             reserved_llm_tokens: self.reserved_llm_tokens,
         }
     }
+
+    pub(super) fn historical_reservation_for(
+        &self,
+        grant_sha256: &str,
+        family_id: &str,
+    ) -> CampaignAttemptReservationV1 {
+        self.reservation_for(grant_sha256, family_id)
+    }
 }
 
 pub(super) fn inspect_binding(
@@ -118,13 +133,19 @@ pub(super) fn inspect_binding(
         bail!("dispatch materialization SHA256 differs from the execution request");
     }
     let materialization = decode_materialization(&bytes)?;
-    validate_render_materialization_scope(&materialization)?;
+    validate_render_materialization_scope_for_horizon(
+        &materialization,
+        request.research_plan.label_horizon.as_ref(),
+    )?;
     validate_materialization(
         &materialization,
         &request.feature_sha256,
         &approved_validation(&materialization)?,
     )?;
-    let protocol = approved_evaluation_protocol(&materialization)?;
+    let protocol = approved_evaluation_protocol_for_horizon(
+        &materialization,
+        request.research_plan.label_horizon.as_ref(),
+    )?;
     let protocol_sha256 = protocol.content_hash()?;
     // The same partition function is used by PreparedDataset readers. Bind the
     // complete protocol, exact data identity and source, not just two view labels.
@@ -185,6 +206,22 @@ pub(super) fn inspect_binding(
             .context("Job memory overflow")?,
     };
     execution.validate()?;
+    if let Some(proposal) = request.study_proposal.as_ref() {
+        proposal.validate().map_err(anyhow::Error::msg)?;
+        if proposal.target_execution != execution {
+            bail!("next-family proposal execution binding differs from the rendered Job");
+        }
+        if proposal.target_horizon.labels.horizon_buckets
+            != materialization.label_horizon_buckets
+            || proposal.target_horizon.labels.observation_frequency_millis
+                != materialization.bucket_ms
+            || proposal.target_window.mission_id != materialization.mission_id
+            || proposal.target_window.bucket_ms != materialization.bucket_ms
+            || proposal.target_window.top_depth != materialization.top_depth
+        {
+            bail!("next-family proposal horizon or materialization identity differs");
+        }
+    }
     Ok(DispatchInspection {
         execution,
         campaign_id: request.campaign_id.clone(),
@@ -297,6 +334,17 @@ impl Admission {
             }
         };
         let reservation = inspection.reservation(&verified);
+        if let Some(proposal) = validated.submission.request.study_proposal.as_ref() {
+            validate_study_member_binding(
+                &store,
+                &signed,
+                &verified,
+                &inspection.execution,
+                &control.campaign_inputs_path,
+                &control.materialization_path,
+                proposal,
+            )?;
+        }
         if purpose == Purpose::Dispatch {
             verified.validate_attempt_scope(&reservation, Utc::now())?;
         }
@@ -478,6 +526,243 @@ impl Admission {
     }
 }
 
+fn validate_study_member_binding(
+    store: &AlphaStore,
+    signed_root: &SignedCampaignRootGrantV1,
+    verified_root: &VerifiedCampaignRootGrant,
+    execution: &CampaignExecutionBindingV1,
+    campaign_inputs_path: &Option<PathBuf>,
+    materialization_path: &Path,
+    proposal: &alpha_domain::campaign_horizon::CampaignNextFamilyProposalV1,
+) -> anyhow::Result<()> {
+    if proposal.target_family_id != verified_root.grant().family.family_id
+        || proposal.target_root_grant_sha256 != signed_root.content_sha256
+        || proposal.target_execution != *execution
+    {
+        bail!("next-family proposal does not bind the authenticated root execution");
+    }
+    let mapped_study = store
+        .campaign_study_id_for_family(&verified_root.grant().family.family_id)?
+        .context("next-family proposal root has no authenticated Study mapping")?;
+    if mapped_study != proposal.study_id {
+        bail!("next-family proposal Study mapping differs from the ledger");
+    }
+    let signed_study = store
+        .campaign_study_grant(&proposal.study_id)?
+        .context("next-family proposal Study grant is missing from the ledger")?;
+    if signed_study.content_sha256 != proposal.study_grant_sha256 {
+        bail!("next-family proposal Study grant hash differs from the ledger");
+    }
+    let member = signed_study
+        .grant
+        .members
+        .iter()
+        .find(|member| member.family_id == proposal.target_family_id)
+        .context("next-family proposal target is not a Study member")?;
+    if member.root_grant_sha256 != signed_root.content_sha256
+        || member.content_hash().map_err(anyhow::Error::msg)? != proposal.target_member_sha256
+        || member.execution != proposal.target_execution
+        || member.label_horizon_sha256 != proposal.target_horizon_sha256
+    {
+        bail!("next-family proposal Study member binding differs from the ledger");
+    }
+    validate_study_target_window(campaign_inputs_path, materialization_path, proposal)?;
+    validate_parent_settlement_binding(store, &signed_study, proposal)?;
+    Ok(())
+}
+
+fn validate_study_target_window(
+    campaign_inputs_path: &Option<PathBuf>,
+    materialization_path: &Path,
+    proposal: &alpha_domain::campaign_horizon::CampaignNextFamilyProposalV1,
+) -> anyhow::Result<()> {
+    let campaign_inputs_path = campaign_inputs_path
+        .as_deref()
+        .context("next-family proposal requires an authenticated campaign-inputs receipt path")?;
+    let input_bytes = read_bounded(campaign_inputs_path, MAX_CONTROL_BYTES)?;
+    if hex::encode(Sha256::digest(&input_bytes))
+        != proposal.target_execution.campaign_inputs_sha256
+    {
+        bail!("next-family proposal campaign-inputs receipt hash differs from the Study member");
+    }
+    let receipt: Value = serde_json::from_slice(&input_bytes)
+        .context("decode next-family campaign-inputs receipt")?;
+    if receipt["mission_id"] != proposal.target_window.mission_id
+        || receipt["output_prefix"]
+            .as_str()
+            .is_none_or(|prefix| prefix.trim_matches('/') != proposal.target_window.output_prefix)
+    {
+        bail!("next-family proposal target window differs from the campaign-inputs receipt");
+    }
+    let materialization_bytes = read_bounded(materialization_path, MAX_MATERIALIZATION_BYTES)?;
+    let materialization: Value = serde_json::from_slice(&materialization_bytes)
+        .context("decode next-family materialization")?;
+    if materialization["mission_id"] != proposal.target_window.mission_id
+        || materialization["bucket_ms"] != proposal.target_window.bucket_ms
+        || materialization["top_depth"] != proposal.target_window.top_depth
+        || materialization["label_horizon_buckets"]
+            != proposal.target_horizon.labels.horizon_buckets
+    {
+        bail!("next-family proposal target window differs from the materialization");
+    }
+    let segments = materialization["source_segments"]
+        .as_array()
+        .context("next-family materialization source segments are missing")?;
+    let start = segments
+        .iter()
+        .filter_map(|segment| segment["start_received_at_ns"].as_u64())
+        .min()
+        .context("next-family materialization start is missing")?;
+    let end = segments
+        .iter()
+        .filter_map(|segment| segment["end_received_at_ns"].as_u64())
+        .max()
+        .context("next-family materialization end is missing")?;
+    if start != proposal.target_window.start_received_at_ns
+        || end != proposal.target_window.end_received_at_ns
+    {
+        bail!("next-family proposal target window differs from source segments");
+    }
+    Ok(())
+}
+
+pub(super) fn validate_parent_settlement_binding(
+    store: &AlphaStore,
+    signed_study: &alpha_domain::campaign_study::SignedCampaignStudyGrantV1,
+    proposal: &alpha_domain::campaign_horizon::CampaignNextFamilyProposalV1,
+) -> anyhow::Result<()> {
+    let parent = &proposal.parent;
+    let family_receipt_sha256 = store
+        .campaign_family_receipts(&parent.family_id)?
+        .into_iter()
+        .find_map(|receipt| match &receipt.receipt.event {
+            CampaignLedgerEventV1::DispatchSettled { evidence }
+                if evidence.settlement.evidence_sha256 == parent.campaign_result_sha256 =>
+            {
+                Some((receipt.content_sha256, evidence.clone()))
+            }
+            _ => None,
+        })
+        .context("next-family proposal parent settlement is absent from the family ledger")?;
+    let (family_receipt_sha256, evidence) = family_receipt_sha256;
+    let operation_id = evidence.settlement.operation_id.clone();
+    let record = store.campaign_dispatch_record(&parent.family_id, &operation_id)?;
+    let parent_member = signed_study
+        .grant
+        .members
+        .iter()
+        .find(|member| member.family_id == parent.family_id)
+        .context("parent family is not a member of the authenticated Study")?;
+    if record.root.signed_grant().content_sha256 != parent.root_grant_sha256
+        || record.root.grant().family.family_id != parent.family_id
+        || !parent_member.matches_root(
+            record.root.grant(),
+            &record.root.signed_grant().content_sha256,
+        )
+        || record.reservation.campaign_id != parent.campaign_id
+        || record.reservation.root_grant_sha256 != parent.root_grant_sha256
+        || record.reservation.request_sha256 != parent.request_sha256
+        || record.settlement.as_ref() != Some(&evidence.settlement)
+        || record.claim.job_uid.as_deref() != Some(parent.terminal_job_uid.as_str())
+        || record.terminal_pod_uid.as_deref() != Some(parent.terminal_pod_uid.as_str())
+        || family_receipt_sha256 != parent.family_settlement_receipt_sha256
+    {
+        bail!("next-family proposal parent settlement does not match the authenticated dispatch ledger");
+    }
+    let snapshot = store.campaign_study_snapshot(&proposal.study_id)?;
+    if study_prefix_identity(&snapshot, &parent.study_settlement_receipt_sha256)?
+            != parent.study_snapshot_sha256
+        || !snapshot.receipts.iter().any(|receipt| {
+            receipt.content_sha256 == parent.study_settlement_receipt_sha256
+                && matches!(
+                    &receipt.receipt.event,
+                    CampaignStudyLedgerEventV1::AttemptSettled {
+                        family_id,
+                        settlement,
+                        family_receipt_sha256,
+                    } if family_id == &parent.family_id
+                        && settlement == &evidence.settlement
+                        && family_receipt_sha256 == &parent.family_settlement_receipt_sha256
+                )
+        })
+    {
+        bail!("next-family proposal parent settlement does not match the authenticated Study ledger");
+    }
+    Ok(())
+}
+
+/// Hash the immutable Study prefix through the parent's settlement receipt.
+/// Later target-family receipts remain append-only evidence and do not change
+/// the historical parent identity.
+pub(super) fn study_prefix_identity(
+    snapshot: &CampaignStudySnapshotV1,
+    settlement_receipt_sha256: &str,
+) -> anyhow::Result<String> {
+    let end = snapshot
+        .receipts
+        .iter()
+        .position(|receipt| receipt.content_sha256 == settlement_receipt_sha256)
+        .context("parent Study settlement receipt is absent from the current Study ledger")?;
+    let prefix = &snapshot.receipts[..=end];
+    let mut linked_heads: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for receipt in prefix {
+        match &receipt.receipt.event {
+            CampaignStudyLedgerEventV1::StudyRegistered { member_heads, .. } => {
+                for (family_id, head) in member_heads {
+                    linked_heads
+                        .entry(family_id.clone())
+                        .or_default()
+                        .push(head.last_receipt_sha256.clone());
+                }
+            }
+            CampaignStudyLedgerEventV1::AttemptReserved {
+                family_id,
+                family_receipt_sha256,
+                ..
+            }
+            | CampaignStudyLedgerEventV1::AttemptSettled {
+                family_id,
+                family_receipt_sha256,
+                ..
+            } => {
+                linked_heads
+                    .entry(family_id.clone())
+                    .or_default()
+                    .push(family_receipt_sha256.clone());
+            }
+            CampaignStudyLedgerEventV1::ApprovalRevoked { .. } => {}
+        }
+    }
+    let mut member_heads = BTreeMap::new();
+    for family in &snapshot.member_snapshots {
+        let linked = linked_heads
+            .get(&family.family_id)
+            .context("parent Study prefix omits a member head")?;
+        let head = family
+            .receipts
+            .iter()
+            .filter(|receipt| linked.iter().any(|hash| hash == &receipt.content_sha256))
+            .max_by_key(|receipt| receipt.receipt.sequence)
+            .context("parent Study prefix omits a family receipt head")?;
+        member_heads.insert(
+            family.family_id.clone(),
+            json!({
+                "sequence": head.receipt.sequence,
+                "last_receipt_sha256": head.content_sha256,
+                "auth_tag": head.auth_tag,
+            }),
+        );
+    }
+    Ok(canonical_json_hash(&json!({
+        "schema_version": "monday.campaign_study_prefix.v1",
+        "study_id": snapshot.study_id,
+        "sequence": end + 1,
+        "last_receipt_sha256": settlement_receipt_sha256,
+        "receipts": prefix,
+        "member_heads": member_heads,
+    }))?)
+}
+
 pub(super) fn publish_family_receipts_with(
     store: &mut AlphaStore,
     family: &str,
@@ -622,6 +907,14 @@ pub(super) fn read_control(path: &Path) -> anyhow::Result<DispatchControl> {
     if control.trusted_keys_path.is_relative() {
         control.trusted_keys_path = base.join(&control.trusted_keys_path);
     }
+    if let Some(campaign_inputs_path) = &mut control.campaign_inputs_path {
+        if campaign_inputs_path.is_relative() {
+            *campaign_inputs_path = base.join(&*campaign_inputs_path);
+        }
+        *campaign_inputs_path = campaign_inputs_path
+            .canonicalize()
+            .context("resolve existing Campaign inputs receipt")?;
+    }
     Ok(control)
 }
 
@@ -649,7 +942,7 @@ pub(super) fn read_trusted_keys(path: &Path) -> anyhow::Result<BTreeMap<String, 
         .collect()
 }
 
-fn read_bounded(path: &Path, max: u64) -> anyhow::Result<Vec<u8>> {
+pub(super) fn read_bounded(path: &Path, max: u64) -> anyhow::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     std::fs::File::open(path)?
         .take(max + 1)

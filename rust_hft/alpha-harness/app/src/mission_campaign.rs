@@ -2,7 +2,7 @@ pub(crate) mod final_evaluation;
 use crate::{
     cli::{
         print_json, CampaignExecuteArgs, CampaignFinalizeArgs, CampaignFreezeArgs, CampaignIdArgs,
-        CampaignLearnArgs, ExecuteMissionArgs, BUILD_SOURCE_REVISION,
+        CampaignLearnArgs, CampaignStudyProposeArgs, ExecuteMissionArgs, BUILD_SOURCE_REVISION,
     },
     data_mission, mission_dispatch,
     mission_render::{
@@ -12,7 +12,8 @@ use crate::{
         CexCampaignResearchPlanV1, CexCampaignSearchPolicyRevisionV1, MAX_RESEARCH_PLAN_GENERATION,
     },
     mission_runner::{
-        execute_report, fetch_to_file, finalize_existing_search_round, normalized_sha256,
+        decode_materialization, execute_report, fetch_to_file, finalize_existing_search_round,
+        normalized_sha256,
         publish_immutable_file, recover_execution_report_from_published_result, research_event,
         valid_git_revision, validate_cex_holdout_id, validate_supervised_candidate_binding,
         validate_supervised_replay_binding, CexEventReplayReceiptV1, CexSupervisedModelSelectionV1,
@@ -24,6 +25,10 @@ use crate::{
     },
 };
 use alpha_domain::{
+    campaign_horizon::{
+        CampaignLabelHorizonV1, CampaignNextFamilyInputWindowV1, CampaignNextFamilyParentV1,
+        CampaignNextFamilyProposalV1,
+    },
     canonical_json_hash, factor_ast_source_features, CandidateEvaluation, CexBaselineFailureCodeV1,
     CexBaselineGateV1, CexFactorBankRevisionV2, CexFactorRejectionCodeV1,
 };
@@ -88,6 +93,8 @@ pub(crate) struct CampaignRequest {
     pub(crate) producer_source_revision: String,
     pub(crate) producer_image_identity: String,
     pub(crate) research_plan: CexCampaignResearchPlanV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) study_proposal: Option<CampaignNextFamilyProposalV1>,
     pub(crate) feature_url: String,
     pub(crate) feature_sha256: String,
     pub(crate) materialization_url: String,
@@ -403,6 +410,21 @@ struct CampaignLearnReport {
     reused_existing: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct CampaignStudyProposalReport {
+    schema_version: String,
+    status: String,
+    reason: Option<String>,
+    study_id: String,
+    parent: CampaignNextFamilyParentV1,
+    target_family_id: Option<String>,
+    proposal_sha256: Option<String>,
+    research_plan_sha256: Option<String>,
+    proposal_path: String,
+    research_plan_path: String,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum CampaignLearnOutcomeV1 {
@@ -607,6 +629,291 @@ pub fn learn(args: CampaignLearnArgs) -> anyhow::Result<()> {
         }),
     );
     print_json(&report)
+}
+
+pub fn propose_next_family(args: CampaignStudyProposeArgs) -> anyhow::Result<()> {
+    let authenticated = mission_dispatch::read_authenticated_campaign_parent(
+        &args.parent_control,
+        &args.parent_submission,
+        &args.parent_result,
+        &args.parent_settlement,
+        &args.study_id,
+        &args.parent_namespace,
+    )?;
+    let parent = authenticated.parent;
+    let loaded = LoadedRequest {
+        request: authenticated.request,
+        sha256: parent.request_sha256.clone(),
+    };
+    let result = load_campaign_result(&args.parent_result)?;
+    validate_negative_campaign_result(&loaded, &result, &parent.campaign_result_sha256)?;
+
+    let needs_authority = |reason: &str, target_family_id: Option<String>| {
+        let report = CampaignStudyProposalReport {
+            schema_version: "monday.campaign_study_proposal_report.v1".into(),
+            status: "needs_authority".into(),
+            reason: Some(reason.into()),
+            study_id: args.study_id.clone(),
+            parent: parent.clone(),
+            target_family_id,
+            proposal_sha256: None,
+            research_plan_sha256: None,
+            proposal_path: args.output.display().to_string(),
+            research_plan_path: args.research_plan_output.display().to_string(),
+        };
+        write_json_create_once(&args.output.with_extension("report.json"), &report)?;
+        print_json(&report)
+    };
+
+    let Some(target_family_id) = args
+        .target_family_id
+        .as_deref()
+        .filter(|family| !family.trim().is_empty())
+    else {
+        return needs_authority("target_family_member_missing", None);
+    };
+    if target_family_id == parent.family_id {
+        return needs_authority(
+            "target_family_must_differ_from_parent",
+            Some(target_family_id.into()),
+        );
+    }
+    let Some(member) = authenticated
+        .study_grant
+        .grant
+        .members
+        .iter()
+        .find(|member| member.family_id == target_family_id)
+    else {
+        return needs_authority(
+            "target_family_is_not_a_predeclared_study_member",
+            Some(target_family_id.into()),
+        );
+    };
+    let Some(horizon_path) = args.target_horizon.as_deref() else {
+        return needs_authority(
+            "target_label_horizon_missing",
+            Some(target_family_id.into()),
+        );
+    };
+    let horizon = load_label_horizon(horizon_path)?;
+    let horizon_sha256 = horizon.content_hash().map_err(anyhow::Error::msg)?;
+    if horizon_sha256 != member.label_horizon_sha256 {
+        return needs_authority(
+            "target_label_horizon_is_not_predeclared",
+            Some(target_family_id.into()),
+        );
+    }
+    let Some(start_received_at_ns) = args.target_start_received_at_ns else {
+        return needs_authority(
+            "target_explicit_window_missing",
+            Some(target_family_id.into()),
+        );
+    };
+    let Some(end_received_at_ns) = args.target_end_received_at_ns else {
+        return needs_authority(
+            "target_explicit_window_missing",
+            Some(target_family_id.into()),
+        );
+    };
+    let Some(target_mission_id) = args.target_mission_id.as_deref() else {
+        return needs_authority(
+            "target_materialization_identity_missing",
+            Some(target_family_id.into()),
+        );
+    };
+    let Some(target_output_prefix) = args.target_output_prefix.as_deref() else {
+        return needs_authority(
+            "target_materialization_identity_missing",
+            Some(target_family_id.into()),
+        );
+    };
+    let Some(target_bucket_ms) = args.target_bucket_ms else {
+        return needs_authority(
+            "target_materialization_identity_missing",
+            Some(target_family_id.into()),
+        );
+    };
+    let target_window = CampaignNextFamilyInputWindowV1 {
+        mission_id: target_mission_id.into(),
+        output_prefix: target_output_prefix.into(),
+        start_received_at_ns,
+        end_received_at_ns,
+        bucket_ms: target_bucket_ms,
+        top_depth: args.target_top_depth,
+    };
+    if target_window
+        .validate()
+        .map_err(anyhow::Error::msg)
+        .is_err()
+        || target_window.bucket_ms != horizon.labels.observation_frequency_millis
+        || target_window.bucket_ms != 1_000
+        || target_window.top_depth != 5
+    {
+        return needs_authority(
+            "target_materialization_window_is_invalid",
+            Some(target_family_id.into()),
+        );
+    }
+    if member.execution.source_revision != BUILD_SOURCE_REVISION
+        || member.execution.campaign_inputs_sha256.is_empty()
+    {
+        return needs_authority(
+            "target_study_member_execution_is_not_current",
+            Some(target_family_id.into()),
+        );
+    }
+    let failure_class = classify_campaign_failure(&result)?;
+    let evidence_signature = campaign_research_evidence_signature(&loaded.request, &result)?;
+    let (search_policy_revision, learning_directive) =
+        next_campaign_policy_revision(&loaded, &parent.campaign_result_sha256, failure_class)?;
+    let mut plan = follow_up_plan(
+        &loaded,
+        &parent.campaign_result_sha256,
+        learning_directive,
+        search_policy_revision,
+        evidence_signature,
+    )?;
+    plan.label_horizon = Some(horizon.clone());
+    plan.validate()?;
+    if let Err(error) = validate_next_family_materialization(
+        &args,
+        member,
+        &target_window,
+        &plan,
+    ) {
+        return needs_authority(
+            &format!("target_materialization_invalid:{error}"),
+            Some(target_family_id.into()),
+        );
+    }
+    let target_research_plan_sha256 = plan.content_hash()?;
+    let target_member_sha256 = member.content_hash().map_err(anyhow::Error::msg)?;
+    let proposal = CampaignNextFamilyProposalV1 {
+        schema_version: alpha_domain::campaign_horizon::CAMPAIGN_NEXT_FAMILY_PROPOSAL_SCHEMA_V1
+            .into(),
+        study_id: args.study_id.clone(),
+        study_grant_sha256: authenticated.study_grant.content_sha256.clone(),
+        parent,
+        target_family_id: target_family_id.into(),
+        target_root_grant_sha256: member.root_grant_sha256.clone(),
+        target_member_sha256,
+        target_execution: member.execution.clone(),
+        target_horizon: horizon,
+        target_horizon_sha256: horizon_sha256,
+        target_window,
+        target_research_plan_sha256: target_research_plan_sha256.clone(),
+    };
+    proposal.validate().map_err(anyhow::Error::msg)?;
+    let proposal_sha256 = proposal.content_hash().map_err(anyhow::Error::msg)?;
+    write_research_plan_create_once(&args.research_plan_output, &plan)?;
+    let report = CampaignStudyProposalReport {
+        schema_version: "monday.campaign_study_proposal_report.v1".into(),
+        status: "ready".into(),
+        reason: None,
+        study_id: args.study_id,
+        parent: proposal.parent.clone(),
+        target_family_id: Some(proposal.target_family_id.clone()),
+        proposal_sha256: Some(proposal_sha256.clone()),
+        research_plan_sha256: Some(target_research_plan_sha256),
+        proposal_path: args.output.display().to_string(),
+        research_plan_path: args.research_plan_output.display().to_string(),
+    };
+    write_json_create_once(&args.output, &proposal)?;
+    write_json_create_once(&args.output.with_extension("report.json"), &report)?;
+    print_json(&report)
+}
+
+fn load_label_horizon(path: &Path) -> anyhow::Result<CampaignLabelHorizonV1> {
+    let mut file = File::open(path)
+        .with_context(|| format!("open typed Campaign label horizon {}", path.display()))?;
+    if file.metadata()?.len() > MAX_REQUEST_BYTES {
+        bail!("typed Campaign label horizon exceeds {MAX_REQUEST_BYTES} bytes");
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let horizon: CampaignLabelHorizonV1 = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse typed Campaign label horizon {}", path.display()))?;
+    horizon.validate().map_err(anyhow::Error::msg)?;
+    Ok(horizon)
+}
+
+fn validate_next_family_materialization(
+    args: &CampaignStudyProposeArgs,
+    member: &alpha_domain::campaign_study::CampaignStudyMemberV1,
+    target_window: &CampaignNextFamilyInputWindowV1,
+    plan: &CexCampaignResearchPlanV1,
+) -> anyhow::Result<()> {
+    let campaign_inputs_path = args
+        .target_campaign_inputs
+        .as_deref()
+        .context("target campaign-inputs receipt is required")?;
+    let input_root = args
+        .target_input_root
+        .as_deref()
+        .context("target input root is required")?;
+    let (receipt, receipt_sha256) = load_campaign_inputs_receipt(campaign_inputs_path)?;
+    validate_campaign_inputs_receipt(&receipt)?;
+    if receipt_sha256 != member.execution.campaign_inputs_sha256 {
+        bail!("target campaign-inputs receipt hash is not predeclared by the Study member");
+    }
+    if receipt.mission_id != target_window.mission_id
+        || receipt.output_prefix.trim_matches('/') != target_window.output_prefix
+    {
+        bail!("target input receipt identity differs from the selected Study window");
+    }
+    let feature_path = input_root.join(&receipt.feature.relative_path);
+    let materialization_path = input_root.join(&receipt.materialization.relative_path);
+    verify_local_receipt_item("target feature", &feature_path, &receipt.feature.sha256)?;
+    verify_local_receipt_item(
+        "target materialization",
+        &materialization_path,
+        &receipt.materialization.sha256,
+    )?;
+    let materialization_bytes = std::fs::read(&materialization_path)?;
+    let materialization = decode_materialization(&materialization_bytes)?;
+    if materialization.mission_id != target_window.mission_id
+        || materialization.bucket_ms != target_window.bucket_ms
+        || materialization.top_depth != target_window.top_depth
+        || materialization.label_horizon_buckets
+            != plan
+                .label_horizon
+                .as_ref()
+                .context("target plan is missing its typed label horizon")?
+                .labels
+                .horizon_buckets
+    {
+        bail!("target materialization does not match the selected Study horizon");
+    }
+    let metadata: serde_json::Value = serde_json::from_slice(&materialization_bytes)?;
+    let segments = metadata["source_segments"]
+        .as_array()
+        .context("target materialization source segments are missing")?;
+    let start = segments
+        .iter()
+        .filter_map(|segment| segment["start_received_at_ns"].as_u64())
+        .min()
+        .context("target materialization has no source start")?;
+    let end = segments
+        .iter()
+        .filter_map(|segment| segment["end_received_at_ns"].as_u64())
+        .max()
+        .context("target materialization has no source end")?;
+    if start != target_window.start_received_at_ns || end != target_window.end_received_at_ns {
+        bail!("target materialization source window differs from the selected Study window");
+    }
+    let declared_trials = declared_total_trials_for_rounds(plan, 2)?;
+    let rendered = render_cex_bundle(
+        &feature_path,
+        &materialization_path,
+        plan,
+        args.target_seed,
+        declared_trials,
+    )?;
+    if rendered.mission.spec.evaluation_protocol.content_hash()? != member.execution.evaluation_protocol_sha256 {
+        bail!("target materialization evaluation protocol is not predeclared by the Study member");
+    }
+    Ok(())
 }
 
 fn campaign_has_no_improvement(
@@ -837,6 +1144,7 @@ fn follow_up_plan(
         hypothesis,
         focus_field: loaded.request.research_plan.focus_field.clone(),
         feature_fields,
+        label_horizon: loaded.request.research_plan.label_horizon.clone(),
         search_policy_revision,
         attempted_search_policy_revision_ids,
         allowed_search_policy_revisions: loaded
@@ -1472,6 +1780,12 @@ fn freeze_request(args: &CampaignFreezeArgs) -> anyhow::Result<(CampaignRequest,
         .map(load_research_plan)
         .transpose()?
         .unwrap_or_else(CexCampaignResearchPlanV1::canonical);
+    let study_proposal = args
+        .study_proposal
+        .as_deref()
+        .map(load_study_proposal)
+        .transpose()?;
+    validate_study_proposal_for_plan(study_proposal.as_ref(), &research_plan)?;
     let declared_total_trials = declared_total_trials_for_rounds(&research_plan, args.seeds.len())?;
     let probe_seed = *args
         .seeds
@@ -1503,6 +1817,7 @@ fn freeze_request(args: &CampaignFreezeArgs) -> anyhow::Result<(CampaignRequest,
             &campaign_root,
             &rendered.mission.spec.holdout.holdout_id,
             &args.seeds,
+            study_proposal.as_ref(),
         )?,
         campaign_inputs_sha256,
     ))
@@ -2326,22 +2641,76 @@ fn load_research_plan(path: &Path) -> anyhow::Result<CexCampaignResearchPlanV1> 
     Ok(plan)
 }
 
+fn load_study_proposal(path: &Path) -> anyhow::Result<CampaignNextFamilyProposalV1> {
+    let mut file = File::open(path)
+        .with_context(|| format!("open next-family Campaign proposal {}", path.display()))?;
+    if file.metadata()?.len() > MAX_REQUEST_BYTES {
+        bail!("next-family Campaign proposal exceeds {MAX_REQUEST_BYTES} bytes");
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let proposal: CampaignNextFamilyProposalV1 = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse next-family Campaign proposal {}", path.display()))?;
+    proposal.validate().map_err(anyhow::Error::msg)?;
+    Ok(proposal)
+}
+
+fn validate_study_proposal_for_plan(
+    proposal: Option<&CampaignNextFamilyProposalV1>,
+    plan: &CexCampaignResearchPlanV1,
+) -> anyhow::Result<()> {
+    let Some(proposal) = proposal else {
+        return Ok(());
+    };
+    proposal.validate().map_err(anyhow::Error::msg)?;
+    let plan_sha256 = plan.content_hash()?;
+    if proposal.target_research_plan_sha256 != plan_sha256 {
+        bail!("next-family proposal research plan hash differs from the frozen plan");
+    }
+    if plan.label_horizon.as_ref() != Some(&proposal.target_horizon) {
+        bail!("next-family proposal horizon differs from the frozen research plan");
+    }
+    Ok(())
+}
+
 fn write_research_plan_create_once(
     path: &Path,
     plan: &CexCampaignResearchPlanV1,
 ) -> anyhow::Result<()> {
     plan.validate()?;
+    write_json_create_once(path, plan)
+}
+
+fn write_json_create_once<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec_pretty(value)?;
+    if path.try_exists()? {
+        let existing = std::fs::read(path)
+            .with_context(|| format!("read existing create-once JSON {}", path.display()))?;
+        if existing == bytes {
+            return Ok(());
+        }
+        bail!("existing create-once JSON differs: {}", path.display());
+    }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    serde_json::to_writer_pretty(temporary.as_file_mut(), plan)?;
+    temporary.as_file_mut().write_all(&bytes)?;
     temporary.as_file_mut().flush()?;
     temporary.as_file().sync_all()?;
-    temporary
-        .persist_noclobber(path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("create CEX Campaign research plan {}", path.display()))?;
-    Ok(())
+    match temporary.persist_noclobber(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = std::fs::read(path)?;
+            if existing == bytes {
+                Ok(())
+            } else {
+                bail!("existing create-once JSON differs: {}", path.display())
+            }
+        }
+        Err(error) => {
+            Err(error.error).with_context(|| format!("create create-once JSON {}", path.display()))
+        }
+    }
 }
 
 pub(crate) fn validate_terminal_mission_revision_binding(
@@ -2881,6 +3250,7 @@ pub(crate) fn request_for_materialization_for_tests(path: &Path) -> CampaignRequ
         .unwrap(),
         &base.holdout_id,
         &[7, 11],
+        None,
     )
     .unwrap()
 }
@@ -2890,6 +3260,15 @@ pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> 
         bail!("campaign request schema_version must be {CAMPAIGN_REQUEST_SCHEMA_V5}");
     }
     request.research_plan.validate()?;
+    validate_study_proposal_for_plan(
+        request.study_proposal.as_ref(),
+        &request.research_plan,
+    )?;
+    if let Some(proposal) = &request.study_proposal {
+        if proposal.target_execution.campaign_inputs_sha256 != request.campaign_inputs_sha256 {
+            bail!("next-family proposal input identity differs from the Campaign request");
+        }
+    }
     validate_campaign_id(&request.campaign_id)?;
     if request.image_identity
         != normalized_sha256("campaign image identity", &request.image_identity)?
@@ -3064,6 +3443,7 @@ fn build_request_from_parts(
     campaign_root: &str,
     holdout_id: &str,
     seeds: &[u64],
+    study_proposal: Option<&CampaignNextFamilyProposalV1>,
 ) -> anyhow::Result<CampaignRequest> {
     research_plan.validate()?;
     let data_fingerprint_sha256 = campaign_data_fingerprint_sha256(
@@ -3083,6 +3463,7 @@ fn build_request_from_parts(
         producer_source_revision: producer_source_revision.to_string(),
         producer_image_identity: producer_image_identity.to_string(),
         research_plan: research_plan.clone(),
+        study_proposal: study_proposal.cloned(),
         feature_url: feature_url.to_string(),
         feature_sha256: feature_sha256.to_string(),
         materialization_url: materialization_url.to_string(),
@@ -3155,7 +3536,7 @@ fn build_request_from_parts(
     Ok(request)
 }
 
-fn campaign_data_fingerprint_sha256(
+pub(crate) fn campaign_data_fingerprint_sha256(
     campaign_inputs_sha256: &str,
     producer_source_revision: &str,
     feature_sha256: &str,
@@ -4550,6 +4931,7 @@ mod tests {
             "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/campaigns",
             "cex-holdout-test",
             &[7, 11],
+            None,
         )
         .unwrap();
 
@@ -4659,6 +5041,7 @@ mod tests {
             campaign_root: format!("{TEST_ROOT}/campaigns"),
             seeds: vec![7, 11],
             research_plan: None,
+            study_proposal: None,
             output: output.clone(),
         })
         .unwrap();
@@ -4709,6 +5092,7 @@ mod tests {
             campaign_root: format!("{TEST_ROOT}/campaigns"),
             seeds: vec![7, 11],
             research_plan: None,
+            study_proposal: None,
             output: root.path().join("invalid-freeze.json"),
         })
         .unwrap_err();
@@ -4734,6 +5118,7 @@ mod tests {
             campaign_root: format!("{TEST_ROOT}/campaigns"),
             seeds: vec![7, 11],
             research_plan: None,
+            study_proposal: None,
             output: root.path().join("invalid-replay-freeze.json"),
         })
         .unwrap_err();
@@ -4750,6 +5135,7 @@ mod tests {
             campaign_root: format!("{TEST_ROOT}/campaigns"),
             seeds: vec![7, 11],
             research_plan: None,
+            study_proposal: None,
             output: root.path().join("invalid-source-freeze.json"),
         })
         .unwrap_err();
@@ -5561,6 +5947,7 @@ mod tests {
             producer_source_revision: "b".repeat(40),
             producer_image_identity: "e".repeat(64),
             research_plan: research_plan.clone(),
+            study_proposal: None,
             feature_url: format!("{TEST_ROOT}/features.jsonl"),
             feature_sha256: "1".repeat(64),
             materialization_url: format!("{TEST_ROOT}/materialization.json"),
@@ -6028,6 +6415,7 @@ mod tests {
             producer_source_revision: BUILD_SOURCE_REVISION.to_string(),
             producer_image_identity: "e".repeat(64),
             research_plan: research_plan.clone(),
+            study_proposal: None,
             feature_url: feature_path.to_string_lossy().into_owned(),
             feature_sha256,
             materialization_url: materialization_path.to_string_lossy().into_owned(),
