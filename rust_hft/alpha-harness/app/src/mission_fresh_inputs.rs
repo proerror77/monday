@@ -603,7 +603,7 @@ fn inventory_from_selection(
         max_inputs: args.max_inputs,
         max_input_bytes: args.max_input_bytes,
     };
-    Ok(freeze_inventory_from_selection(&request, selection)?)
+    freeze_inventory_from_selection(&request, selection)
 }
 
 fn read_selection(

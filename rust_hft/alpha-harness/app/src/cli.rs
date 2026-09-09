@@ -85,7 +85,7 @@ enum MissionCommand {
     CampaignLearn(CampaignLearnArgs),
     CampaignFinalize(CampaignFinalizeArgs),
     CampaignId(CampaignIdArgs),
-    PrepareFreshInputs(PrepareFreshInputsArgs),
+    PrepareFreshInputs(Box<PrepareFreshInputsArgs>),
     Dispatch {
         #[command(subcommand)]
         command: MissionDispatchCommand,
@@ -988,7 +988,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             MissionCommand::CampaignFinalize(args) => mission_campaign::finalize(args),
             MissionCommand::CampaignId(args) => mission_campaign::print_expected_id(args),
             MissionCommand::PrepareFreshInputs(args) => {
-                tokio::task::spawn_blocking(move || mission_fresh_inputs::prepare(args))
+                tokio::task::spawn_blocking(move || mission_fresh_inputs::prepare(*args))
                     .await
                     .context("fresh Campaign input preparation worker failed")?
             }

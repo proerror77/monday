@@ -825,7 +825,7 @@ pub fn select_fresh_window(request: &FreshWindowRequest) -> Result<FreshWindowSe
                 max_inputs: request.max_inputs,
                 max_input_bytes: request.max_input_bytes,
             })?;
-            return Ok(FreshWindowSelection {
+            Ok(FreshWindowSelection {
                 schema_version: FRESH_WINDOW_SELECTION_SCHEMA.to_string(),
                 mode: request.mode.clone(),
                 selected_start_received_at_ns: start_received_at_ns,
@@ -837,7 +837,7 @@ pub fn select_fresh_window(request: &FreshWindowRequest) -> Result<FreshWindowSe
                 input_fingerprint_sha256: frozen.input_fingerprint_sha256,
                 inventory_eligible: true,
                 materialized_pit_admitted: false,
-            });
+            })
         }
         FreshWindowMode::Latest {
             duration_ns,

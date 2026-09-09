@@ -666,12 +666,12 @@ recovery_case() (
   local case_work="$case_root/cycle"
   local request_dir="$case_work/generation-0"
   local initial_args=("${controller_args[@]}")
-  export FAKE_STATE="$case_root/state"
-  mkdir -p "$FAKE_STATE"
-  : >"$FAKE_STATE/result-failed-once"
+  local fake_state="$case_root/state"
+  mkdir -p "$fake_state"
+  : >"$fake_state/result-failed-once"
   initial_args[20]="$case_work"
   [[ "$outcome" != bounded ]] || initial_args[26]=0
-  (cd "$start_dir" && "$controller" "${initial_args[@]}") >"$case_root/start.out" 2>"$case_root/start.err"
+  (cd "$start_dir" && FAKE_STATE="$fake_state" "$controller" "${initial_args[@]}") >"$case_root/start.out" 2>"$case_root/start.err"
   local readback_args=("${ack_g0_args[@]}")
   readback_args[10]="$case_work"
   local injected_fault="$fault"
@@ -683,9 +683,9 @@ recovery_case() (
   fi
 
   if [[ "$fault" == FAKE_LOSE_PUT_RESPONSE ]]; then
-    env "$injected_fault=1" FAKE_LEARN_OUTCOME="$outcome" "$controller" "${readback_args[@]}" >"$case_root/first.out" 2>"$case_root/first.err"
+    FAKE_STATE="$fake_state" env "$injected_fault=1" FAKE_LEARN_OUTCOME="$outcome" "$controller" "${readback_args[@]}" >"$case_root/first.out" 2>"$case_root/first.err"
   else
-    if env "$injected_fault=1" FAKE_LEARN_OUTCOME="$outcome" "$controller" "${readback_args[@]}" >"$case_root/first.out" 2>"$case_root/first.err"; then
+    if FAKE_STATE="$fake_state" env "$injected_fault=1" FAKE_LEARN_OUTCOME="$outcome" "$controller" "${readback_args[@]}" >"$case_root/first.out" 2>"$case_root/first.err"; then
       echo "recovery fault did not interrupt controller: $label" >&2
       return 1
     fi
@@ -694,7 +694,7 @@ recovery_case() (
     test -e "$request_dir/result-readback-complete"
     test ! -s "$request_dir/settlement-report.json"
     jq -e '.checkpoint_status == "incomplete" and .next_stage == "ledger_settlement"' \
-      < <("$controller" status --work-dir "$case_work") >/dev/null
+      < <(FAKE_STATE="$fake_state" "$controller" status --work-dir "$case_work") >/dev/null
   fi
   if [[ "$fault" == TAMPER_* ]]; then
     local expected_error
@@ -709,23 +709,23 @@ recovery_case() (
       printf '\n' >>"$request_dir/learn-report.json"
       expected_error='saved Campaign learning checkpoint is invalid'
     else
-      local objects=("$FAKE_STATE/oss-objects/"*)
+      local objects=("$fake_state/oss-objects/"*)
       test "${#objects[@]}" == 1
       printf '\n' >>"${objects[0]}"
       expected_error='published learn artifact readback SHA256 mismatch'
     fi
-    if "$controller" "${readback_args[@]}" >"$case_root/rejected.out" 2>"$case_root/rejected.err"; then
+    if FAKE_STATE="$fake_state" "$controller" "${readback_args[@]}" >"$case_root/rejected.out" 2>"$case_root/rejected.err"; then
       echo "controller accepted corrupted learning evidence: $label" >&2
       return 1
     fi
     grep -Fq "$expected_error" "$case_root/rejected.err"
-    test "$(<"$FAKE_STATE/learn-count")" == 1
-    test "$(<"$FAKE_STATE/dispatch-count")" == 1
+    test "$(<"$fake_state/learn-count")" == 1
+    test "$(<"$fake_state/dispatch-count")" == 1
     test -s "$request_dir/request.json"
     if [[ "$fault" != TAMPER_COMPLETION && "$fault" != TAMPER_EMPTY_COMPLETION ]]; then
       test ! -e "$request_dir/generation-complete"
     else
-      if "$controller" status --work-dir "$case_work" >"$case_root/status.out" 2>"$case_root/status.err"; then
+      if FAKE_STATE="$fake_state" "$controller" status --work-dir "$case_work" >"$case_root/status.out" 2>"$case_root/status.err"; then
         echo "status accepted an invalid completion: $label" >&2
         return 1
       fi
@@ -741,38 +741,38 @@ recovery_case() (
       local expected_termination=no_improvement
       [[ "$outcome" != bounded ]] || expected_termination=campaign_no_candidate
       jq -e --arg termination "$expected_termination" '.checkpoint_status == "complete" and .termination_reason == $termination' \
-        < <("$controller" status --work-dir "$case_work") >/dev/null
+        < <(FAKE_STATE="$fake_state" "$controller" status --work-dir "$case_work") >/dev/null
     fi
   fi
-  if ! FAKE_LEARN_OUTCOME="$outcome" "$controller" "${readback_args[@]}" >"$case_root/resumed.out" 2>"$case_root/resumed.err"; then
+  if ! FAKE_STATE="$fake_state" FAKE_LEARN_OUTCOME="$outcome" "$controller" "${readback_args[@]}" >"$case_root/resumed.out" 2>"$case_root/resumed.err"; then
     echo "controller failed to recover: $label" >&2
     cat "$case_root/resumed.err" >&2
     return 1
   fi
-  test "$(<"$FAKE_STATE/dispatch-count")" == 1
-  test "$(<"$FAKE_STATE/signer-count")" == 1
+  test "$(<"$fake_state/dispatch-count")" == 1
+  test "$(<"$fake_state/signer-count")" == 1
   test ! -d "$case_work/generation-1"
   test ! -e "$request_dir/request.json"
   test ! -e "$request_dir/submission.json"
-  test "$(<"$FAKE_STATE/settlement-count")" == 1
+  test "$(<"$fake_state/settlement-count")" == 1
   if [[ "$outcome" != bounded ]]; then
     cmp "$request_dir/learn-report.json" "$request_dir/learn-report-readback.json"
   fi
   if [[ "$outcome" == follow_up ]]; then
-    test "$(<"$FAKE_STATE/plan-count")" == 1
+    test "$(<"$fake_state/plan-count")" == 1
     cmp "$request_dir/next-research-plan.json" "$request_dir/next-research-plan-readback.json"
-    jq -e '.next_stage == "next_generation"' < <("$controller" status --work-dir "$case_work") >/dev/null
+    jq -e '.next_stage == "next_generation"' < <(FAKE_STATE="$fake_state" "$controller" status --work-dir "$case_work") >/dev/null
   elif [[ "$outcome" == no_improvement ]]; then
     jq -e '.termination_reason == "no_improvement"' "$case_work/cycle-result.json" >/dev/null
   else
     jq -e '.termination_reason == "campaign_no_candidate" and .bounded_loop_exhausted == true' "$case_work/cycle-result.json" >/dev/null
-    test ! -e "$FAKE_STATE/learn-count"
+    test ! -e "$fake_state/learn-count"
     test ! -e "$request_dir/learning-checkpoint.json"
   fi
   if [[ "$fault" == FAKE_FAIL_AFTER_PLAN ]]; then
-    test "$(<"$FAKE_STATE/learn-count")" == 2
+    test "$(<"$fake_state/learn-count")" == 2
   elif [[ "$outcome" != bounded ]]; then
-    test "$(<"$FAKE_STATE/learn-count")" == 1
+    test "$(<"$fake_state/learn-count")" == 1
   fi
   printf 'campaign recovery %s: PASS\n' "$label"
 )

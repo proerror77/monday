@@ -472,7 +472,7 @@ for required in campaign_inputs input_root source_revision image campaign_root w
   [[ -n "${!required}" ]] || die "--${required//_/-} is required"
 done
 if [[ "$mode" != "ack-readback" ]]; then
-  if [[ -z "$signer" && !("$mode" == "start" && "$fresh_mode" == true) ]]; then
+  if [[ -z "$signer" && ! ("$mode" == "start" && "$fresh_mode" == true) ]]; then
     die "--signer is required"
   fi
 else
@@ -497,7 +497,7 @@ fi
 command -v "$alpha_harness" >/dev/null || die "alpha-harness executable not found"
 command -v jq >/dev/null || die "jq is required"
 command -v cmp >/dev/null || die "cmp is required"
-if [[ !("$mode" == "start" && "$fresh_mode" == true && -z "$signer") ]]; then
+if [[ ! ("$mode" == "start" && "$fresh_mode" == true && -z "$signer") ]]; then
   command -v "$aliyun_cli" >/dev/null || die "aliyun executable not found"
   command -v "$kubectl_cli" >/dev/null || die "kubectl executable not found"
 fi
