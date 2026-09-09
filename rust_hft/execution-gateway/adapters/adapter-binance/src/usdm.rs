@@ -715,8 +715,8 @@ struct BinanceUsdMPlaceResponse {
     order_id: u64,
     #[serde(rename = "clientOrderId")]
     client_order_id: String,
-    #[serde(rename = "transactTime")]
-    transact_time: u64,
+    #[serde(rename = "updateTime")]
+    update_time: u64,
 }
 
 fn parse_usdm_place_response(
@@ -732,12 +732,12 @@ fn parse_usdm_place_response(
             "Binance USD-M place response did not match the submitted order identity".to_string(),
         ));
     }
-    if placed.transact_time == 0 {
+    if placed.update_time == 0 {
         return Err(HftError::Parse(
-            "Binance USD-M place response has a zero transactTime".to_string(),
+            "Binance USD-M place response has a zero updateTime".to_string(),
         ));
     }
-    let _ = timestamp_us(placed.transact_time, "place response")?;
+    let _ = timestamp_us(placed.update_time, "place response")?;
     Ok(OrderId(placed.order_id.to_string()))
 }
 
@@ -788,7 +788,7 @@ struct BinanceUsdMPosition {
     entry_price: String,
     #[serde(rename = "unRealizedProfit")]
     unrealized_profit: String,
-    #[serde(default, rename = "positionSide")]
+    #[serde(rename = "positionSide")]
     position_side: String,
 }
 
@@ -796,7 +796,6 @@ struct BinanceUsdMPosition {
 struct BinanceUsdMAccountResponse {
     #[serde(default)]
     assets: Vec<BinanceUsdMBalance>,
-    #[serde(default)]
     positions: Vec<BinanceUsdMPosition>,
 }
 
@@ -878,7 +877,7 @@ fn parse_usdm_positions(account: BinanceUsdMAccountResponse) -> HftResult<Vec<Po
                     position.symbol
                 ))));
             }
-            if !position.position_side.is_empty() && position.position_side != "BOTH" {
+            if position.position_side != "BOTH" {
                 return Some(Err(HftError::Config(
                     "Binance USD-M hedge-mode positions are unsupported; configure one-way/BOTH mode"
                         .to_string(),
@@ -1617,7 +1616,7 @@ mod tests {
         let (base_url, server) = rest_server(vec![
             (
                 "200 OK",
-                r#"{"symbol":"BTCUSDT","orderId":9001,"clientOrderId":"client-usdm","transactTime":123}"#.to_string(),
+                r#"{"symbol":"BTCUSDT","orderId":9001,"clientOrderId":"client-usdm","updateTime":123}"#.to_string(),
             ),
             (
                 "200 OK",
@@ -1706,12 +1705,11 @@ mod tests {
 
     #[tokio::test]
     async fn usd_m_unknown_submission_response_is_rejected_without_a_retry() {
-        let (base_url, server) = rest_server(vec![
-            (
-                "200 OK",
-                r#"{"symbol":"ETHUSDT","orderId":9001,"clientOrderId":"client-usdm","transactTime":123}"#.to_string(),
-            ),
-        ])
+        let (base_url, server) = rest_server(vec![(
+            "200 OK",
+            r#"{"symbol":"ETHUSDT","orderId":9001,"clientOrderId":"client-usdm","updateTime":123}"#
+                .to_string(),
+        )])
         .await;
         let mut cfg = config(ExecutionMode::Testnet);
         cfg.credentials =
@@ -1791,7 +1789,7 @@ mod tests {
             symbol: "BTCUSDT".to_string(),
             order_id: 1,
             client_order_id: "different".to_string(),
-            transact_time: 1,
+            update_time: 1,
         };
         assert!(matches!(
             parse_usdm_place_response(place, "BTCUSDT", "expected"),
@@ -1806,6 +1804,27 @@ mod tests {
             validate_usdm_cancel_response(&cancel, &OrderId("1".to_string()), "BTCUSDT"),
             Err(HftError::Execution(message)) if message.contains("cancel response")
         ));
+    }
+
+    #[test]
+    fn usd_m_place_response_requires_nonzero_update_time() {
+        let zero = BinanceUsdMPlaceResponse {
+            symbol: "BTCUSDT".to_string(),
+            order_id: 1,
+            client_order_id: "expected".to_string(),
+            update_time: 0,
+        };
+        assert!(matches!(
+            parse_usdm_place_response(zero, "BTCUSDT", "expected"),
+            Err(HftError::Parse(message)) if message.contains("updateTime")
+        ));
+
+        let missing = serde_json::json!({
+            "symbol": "BTCUSDT",
+            "orderId": 1,
+            "clientOrderId": "expected"
+        });
+        assert!(serde_json::from_value::<BinanceUsdMPlaceResponse>(missing).is_err());
     }
 
     #[test]
@@ -1971,6 +1990,49 @@ mod tests {
         assert!(
             matches!(parse_usdm_positions(account), Err(HftError::Config(message)) if message.contains("hedge-mode"))
         );
+    }
+
+    #[test]
+    fn usd_m_account_response_distinguishes_missing_positions_from_empty_positions() {
+        let missing = serde_json::json!({
+            "assets": []
+        });
+        assert!(serde_json::from_value::<BinanceUsdMAccountResponse>(missing).is_err());
+
+        let empty = serde_json::json!({
+            "assets": [],
+            "positions": []
+        });
+        assert!(serde_json::from_value::<BinanceUsdMAccountResponse>(empty).is_ok());
+    }
+
+    #[test]
+    fn usd_m_position_response_requires_position_side() {
+        let missing = serde_json::json!({
+            "assets": [],
+            "positions": [{
+                "symbol": "BTCUSDT",
+                "positionAmt": "1",
+                "entryPrice": "50000",
+                "unRealizedProfit": "0"
+            }]
+        });
+        assert!(serde_json::from_value::<BinanceUsdMAccountResponse>(missing).is_err());
+
+        let empty = BinanceUsdMAccountResponse {
+            assets: vec![],
+            positions: vec![BinanceUsdMPosition {
+                symbol: "BTCUSDT".to_string(),
+                position_amt: "1".to_string(),
+                entry_price: "50000".to_string(),
+                unrealized_profit: "0".to_string(),
+                position_side: String::new(),
+            }],
+        };
+        assert!(matches!(
+            parse_usdm_positions(empty),
+            Err(HftError::Config(message)) if message.contains("hedge-mode")
+        ));
     }
 
     #[tokio::test]
