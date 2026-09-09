@@ -15,12 +15,12 @@ pub use deployments::{
 };
 pub use diagnostics::{
     agent_run_contract_value, compute_oversight_report, validate_agent_run_contract,
-    validate_agent_run_create_request, AgentRunCreateRequest, AgentRunCreateResponse,
-    AgentRunRecord, AgentToolCallRecord, DeploymentDiagnosticsMetrics, DeploymentDiagnosticsReport,
-    DiagnosticsEvidence, DiagnosticsFinding, OversightRecommendedAction, OversightReport,
-    OversightSignal, OversightSnapshotEvent, PlatformDiagnosticsReport, ProposalActionKind,
-    ProposalCreateRequest, ProposalDecisionRequest, ProposalSnapshotEvent, ProposalStatus,
-    SafetyProposal,
+    validate_agent_run_create_request, AgentPredictionEvidenceScope, AgentRunCreateRequest,
+    AgentRunCreateResponse, AgentRunRecord, AgentToolCallRecord, DeploymentDiagnosticsMetrics,
+    DeploymentDiagnosticsReport, DiagnosticsEvidence, DiagnosticsFinding,
+    OversightRecommendedAction, OversightReport, OversightSignal, OversightSnapshotEvent,
+    PlatformDiagnosticsReport, ProposalActionKind, ProposalCreateRequest, ProposalDecisionRequest,
+    ProposalSnapshotEvent, ProposalStatus, SafetyProposal,
 };
 pub use errors::ControlPlaneErrorResponse;
 pub use events::{

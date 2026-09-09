@@ -14,12 +14,16 @@ receives an explicit environment allowlist rather than PLOY, database, xAI, or
 cloud credentials. It has no order, intent, deployment-control, or file-edit
 tool path.
 
-This repository does not currently bundle the Rust evidence adapters named by
-`requires_data_audit`, `requires_grok_decision`, `requires_executable_replay`,
-`requires_full_depth_clob`, or `requires_runtime_parity`. Such requests are
-recorded as terminal, fail-closed runs before a model call. Restoring those
-capabilities requires a release-pinned Rust parent adapter; user-global MCP
-configuration is never loaded.
+Prediction research requests may carry `prediction_evidence` in the queued
+request. The parent supplies a bounded local `artifact_root` plus typed
+Mission, catalog/cohort, sealed snapshot, result-bundle, report, and terminal
+receipt references. `ploy-research::evidence_review` re-reads exact bytes and
+revalidates the canonical Mission, producer/verifier catalog, UP/DOWN token
+identity, policy, snapshot, evaluator reports, and terminal result before any
+model call. Tool names, model self-reports, top-book files, and full-depth files
+alone never authorize a gate. Data-audit, full-depth, and executable-replay
+research can pass from a verified receipt; Grok, runtime-parity, and realtime
+runtime claims remain fail-closed until their separate evidence contracts land.
 
 ## Run
 
@@ -32,10 +36,12 @@ cargo run -p ploy-agent-sidecar
 ```
 
 Both processes must receive the same non-empty `PLOY_SIDECAR_AUTH_TOKEN`. The
-worker performs strict live reads of system status, deployments, and trading
-state at startup and before every model run. Missing credentials, HTTP 401, or
-an unavailable control plane fail closed before any model invocation; the worker
-never silently substitutes an on-disk snapshot.
+worker reads system status, deployments, and trading state before model runs
+that declare a runtime requirement. A pure research request with a verified
+local evidence root can complete while the compatibility daemon is offline;
+runtime-parity and realtime requests still fail closed when their live evidence
+is unavailable. The worker never substitutes an on-disk runtime snapshot for a
+runtime receipt.
 
 There is intentionally no approved deployment package or systemd unit for this
 worker yet. The nested PLOY deployment workflows are historical material, not
@@ -59,6 +65,7 @@ Malformed complete lines remain fail-closed and require operator recovery.
 | `PLOY_API_URL` | `http://localhost:8081` | Loopback-only PLOY control-plane address; remote HTTP is rejected |
 | `PLOY_SIDECAR_AUTH_TOKEN` | required | Dedicated read-only sidecar credential shared with `new-ployd`; admin/operator credentials are ignored |
 | `PLOY_RUNTIME_ROOT` | `run/platform` | Root used to derive the sibling queue and run-record directory; never used as a live-context fallback |
+| `PLOY_PREDICTION_EVIDENCE_ROOT` | `<PLOY_RUNTIME_ROOT>/prediction-evidence` | Local evidence root allowlist; queued `artifact_root` values must remain under this non-symlink directory |
 | `PLOY_AGENT_RUNS_FILE` | `<PLOY_RUNTIME_ROOT parent>/sidecar/agent-runs.jsonl` | Shared run history consumed by `GET /api/agent/runs` |
 | `PLOY_AGENT_RUN_REQUESTS_FILE` | sibling `agent-run-requests.jsonl` | Optional assertion only; startup rejects a value that differs from the daemon-derived path |
 | `PLOY_AGENT_RUN_IN_PROGRESS_FILE` | sibling `agent-run-requests.in-progress.jsonl` | Crash-recovery claim |

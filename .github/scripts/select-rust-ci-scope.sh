@@ -592,7 +592,7 @@ select_job_if_affected ploy/rust-runner-lean ploy-strategy-bundles ploy-market-d
 select_job_if_affected ploy/rust-runner-full new-ploy-runner ploy-backtest ploy-runner-host \
   ploy-strategy-runtime ploy-strategy-bundles ploy-connectivity
 select_job_if_affected ploy/rust-market-data ploy-market-data
-select_job_if_affected ploy/rust-research-heavy ploy-feed-loaders ploy-research ploy-market-data
+select_job_if_affected ploy/rust-research-heavy ploy-feed-loaders ploy-research ploy-market-data ploy-agent-sidecar
 select_job_if_affected ploy/frontend ploy-operator-contracts
 select_job_if_affected ploy/integration-regressions ploy
 

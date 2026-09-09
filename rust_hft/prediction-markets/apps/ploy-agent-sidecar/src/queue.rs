@@ -463,6 +463,7 @@ fn derived_path(key: &str, expected: PathBuf) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ploy_operator_contracts::diagnostics::PredictionEvidenceRefs;
     use std::cell::Cell;
     use uuid::Uuid;
 
@@ -538,11 +539,64 @@ mod tests {
                 budget_usd: 1.0,
                 run_packet: "packet".to_string(),
                 run_contract: "completion_signal = \"required\"".to_string(),
+                prediction_scope: None,
+                prediction_evidence: None,
             },
             attempt: None,
             last_retry_reason: None,
             last_retried_at: None,
         }
+    }
+
+    #[test]
+    fn queued_request_roundtrip_preserves_typed_prediction_evidence_refs() {
+        let dir = temp_dir("typed-prediction-evidence");
+        let store = QueueStore::for_dir(&dir);
+        let digest = |byte: char| format!("sha256:{}", byte.to_string().repeat(64));
+        let refs: PredictionEvidenceRefs = serde_json::from_value(serde_json::json!({
+            "artifact_root": dir.display().to_string(),
+            "mission": {
+                "path": "mission.json",
+                "artifact_sha256": digest('a'),
+                "mission_sha256": digest('b')
+            },
+            "catalog_partition": {
+                "path": "cohort/catalog-partition.json",
+                "artifact_sha256": digest('c'),
+                "payload_sha256": digest('d'),
+                "cohort_manifest_id": digest('e'),
+                "partition_digest": digest('f'),
+                "policy_snapshot_id": digest('1')
+            },
+            "snapshot": {
+                "path": "snapshot",
+                "snapshot_hash": "2".repeat(16),
+                "snapshot_contract_hash": digest('2')
+            },
+            "result_bundle": {
+                "path": "result.json",
+                "artifact_sha256": digest('3'),
+                "receipt_sha256": digest('4')
+            },
+            "reports": [],
+            "terminal_receipt": {
+                "path": "result.json",
+                "artifact_sha256": digest('3'),
+                "terminal_receipt_sha256": digest('4')
+            }
+        }))
+        .expect("typed evidence refs");
+        let mut request = queued("run-typed-evidence");
+        request.request.prediction_evidence = Some(refs);
+        append_jsonl_sync(&store.requests_path, &request).expect("append typed request");
+        let mut batch = store.claim().expect("claim").expect("batch");
+        assert_eq!(batch.requests.len(), 1);
+        let decoded = batch.requests.pop().expect("typed request");
+        let evidence = decoded.request.prediction_evidence.expect("evidence refs");
+        assert_eq!(evidence.snapshot.path, "snapshot");
+        assert_eq!(evidence.mission.mission_sha256, digest('b'));
+        batch.acknowledge().expect("acknowledge");
+        fs::remove_dir_all(dir).expect("remove temp");
     }
 
     #[test]
