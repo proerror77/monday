@@ -455,38 +455,53 @@ impl Admission {
         } else {
             self.record()?;
         }
-        let receipts = self
-            .store
-            .campaign_family_receipts(&self.reservation.family_id)?;
-        for receipt in receipts {
-            let key = receipt.object_key();
-            let access = self.control.receipt_access.get(&key).with_context(|| {
-                format!("missing signed receipt access for {key}; reservation is retained")
-            })?;
-            validate_receipt_access(access, &self.receipt_origin, &key)?;
-            let bytes = receipt.publication_bytes()?;
-            let observed =
-                transfer(access, &bytes).with_context(|| format!("Campaign receipt {key}"))?;
-            if observed != bytes {
-                bail!("immutable receipt readback differs from the local authenticated bytes");
-            }
-            self.store.acknowledge_campaign_receipt_readback(
-                &self.reservation.family_id,
-                receipt.receipt.sequence,
-                &key,
-                &hex::encode(Sha256::digest(&observed)),
-            )?;
-            crate::mission_runner::research_event(
-                "alpha-harness",
-                "campaign_ledger_receipt_readback_completed",
-                serde_json::json!({
-                    "family_id": self.reservation.family_id, "sequence": receipt.receipt.sequence,
-                    "object_sha256": receipt.object_sha256()?,
-                }),
-            );
-        }
+        publish_family_receipts_with(
+            &mut self.store,
+            &self.reservation.family_id,
+            &self.receipt_origin,
+            &self.control.receipt_access,
+            &mut transfer,
+        )?;
         Ok(())
     }
+}
+
+pub(super) fn publish_family_receipts_with(
+    store: &mut AlphaStore,
+    family: &str,
+    origin: &str,
+    access_map: &BTreeMap<String, ReceiptAccess>,
+    mut transfer: impl FnMut(&ReceiptAccess, &[u8]) -> anyhow::Result<Vec<u8>>,
+) -> anyhow::Result<()> {
+    let receipts = store.campaign_family_receipts(family)?;
+    for receipt in receipts {
+        let key = receipt.object_key();
+        let access = access_map.get(&key).with_context(|| {
+            format!("missing signed receipt access for {key}; reservation is retained")
+        })?;
+        validate_receipt_access(access, origin, &key)?;
+        let bytes = receipt.publication_bytes()?;
+        let observed =
+            transfer(access, &bytes).with_context(|| format!("Campaign receipt {key}"))?;
+        if observed != bytes {
+            bail!("immutable receipt readback differs from the local authenticated bytes");
+        }
+        store.acknowledge_campaign_receipt_readback(
+            family,
+            receipt.receipt.sequence,
+            &key,
+            &hex::encode(Sha256::digest(&observed)),
+        )?;
+        crate::mission_runner::research_event(
+            "alpha-harness",
+            "campaign_ledger_receipt_readback_completed",
+            serde_json::json!({
+                "family_id": family, "sequence": receipt.receipt.sequence,
+                "object_sha256": receipt.object_sha256()?,
+            }),
+        );
+    }
+    Ok(())
 }
 
 fn validate_receipt_access(access: &ReceiptAccess, origin: &str, key: &str) -> anyhow::Result<()> {

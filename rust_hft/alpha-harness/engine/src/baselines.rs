@@ -19,7 +19,6 @@ use sha2::{Digest, Sha256};
 
 use crate::engines::solve;
 
-const CEX_SUPERVISED_CANDIDATE_SCHEMA_V2: &str = "cex-supervised-model-candidate-v2";
 const CEX_BURN_HIDDEN_DIM: usize = 8;
 const CEX_BURN_EPOCHS: usize = 8;
 const CEX_BURN_LEARNING_RATE: f64 = 1e-3;
@@ -56,83 +55,8 @@ pub use hft_research_manifest::model::{
     CexDecisionCostsV1, CexSupervisedDecisionPolicyV2, CexSupervisedSizingRuleV1,
 };
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CexSupervisedModelCandidateV2 {
-    pub schema_version: String,
-    pub artifact_id: String,
-    pub mission_id: String,
-    pub model_artifact: CexResearchContentRefV1,
-    pub model_kind: CexBaselineModelKindV1,
-    pub factor_bank_revision_id: String,
-    pub research_dataset: CexResearchContentRefV1,
-    pub walk_forward_partition: CexResearchContentRefV1,
-    pub evaluation_policy: CexResearchContentRefV1,
-    pub decision_policy: CexSupervisedDecisionPolicyV2,
-    pub predictions_sha256: String,
-    pub target_positions_sha256: String,
-    pub return_accounting: crate::formula_evaluator::ReturnAccountingBasis,
-    pub evaluation: alpha_domain::CandidateEvaluation,
-    pub deployment_authority: bool,
-    pub order_submission_authority: bool,
-}
-
-impl CexSupervisedModelCandidateV2 {
-    fn finalize(mut self) -> Result<Self, String> {
-        self.artifact_id = self.expected_artifact_id()?;
-        self.validate()?;
-        Ok(self)
-    }
-
-    pub fn validate(&self) -> Result<(), String> {
-        self.model_artifact
-            .validate()
-            .map_err(|error| error.to_string())?;
-        self.research_dataset
-            .validate()
-            .map_err(|error| error.to_string())?;
-        self.walk_forward_partition
-            .validate()
-            .map_err(|error| error.to_string())?;
-        self.evaluation_policy
-            .validate()
-            .map_err(|error| error.to_string())?;
-        self.decision_policy.validate()?;
-        self.evaluation
-            .validate()
-            .map_err(|error| error.to_string())?;
-        if self.return_accounting
-            != crate::formula_evaluator::ReturnAccountingBasis::ObservedMidPrice
-            || self.schema_version != CEX_SUPERVISED_CANDIDATE_SCHEMA_V2
-            || self.artifact_id != self.expected_artifact_id()?
-            || self.mission_id.trim().is_empty()
-            || self.factor_bank_revision_id.trim().is_empty()
-            || !is_sha256(&self.predictions_sha256)
-            || !is_sha256(&self.target_positions_sha256)
-            || self.deployment_authority
-            || self.order_submission_authority
-            || self.evaluation.evaluator_version != CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION
-            || self
-                .evaluation
-                .protocol_binding()
-                .map_err(|error| error.to_string())?
-                .1
-                != self.evaluation_policy.content_sha256
-        {
-            return Err("CEX supervised model candidate is invalid".to_string());
-        }
-        Ok(())
-    }
-
-    fn expected_artifact_id(&self) -> Result<String, String> {
-        let mut semantic = self.clone();
-        semantic.artifact_id.clear();
-        Ok(format!(
-            "cex-supervised-model-candidate-{}",
-            canonical_json_hash(&semantic).map_err(|error| error.to_string())?
-        ))
-    }
-}
+pub use alpha_domain::frozen_model::CexSupervisedModelCandidateV2;
+use alpha_domain::frozen_model::CEX_SUPERVISED_CANDIDATE_SCHEMA_V2;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -164,13 +88,6 @@ impl CexSupervisedModelEvaluationV2 {
         }
         Ok(())
     }
-}
-
-fn is_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 pub fn verify_cex_baseline_artifact(

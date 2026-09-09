@@ -33,50 +33,19 @@ pub(super) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
     )?;
     let record = admission.record()?;
     if record.settlement.is_none() {
-        let kubectl = kubectl_binary();
-        let job = kubectl_json(
-            &kubectl,
-            &args.context,
-            &args.namespace,
-            [
-                "--request-timeout=30s",
-                "get",
-                "job",
-                &validated.job_name,
-                "-o",
-                "json",
-            ],
-            "read back terminal Campaign Job",
-        )?;
-        let selector = format!("job-name={}", validated.job_name);
-        let pods = kubectl_json(
-            &kubectl,
-            &args.context,
-            &args.namespace,
-            [
-                "--request-timeout=30s",
-                "get",
-                "pods",
-                "-l",
-                &selector,
-                "-o",
-                "json",
-            ],
-            "read back terminal Campaign Pod",
-        )?;
-        let items = pods["items"]
-            .as_array()
-            .context("terminal Pod list is missing items")?;
-        if items.len() != 1 {
-            bail!("Campaign settlement requires exactly one execution Pod; keep uncertain attempts charged");
-        }
         let bound_uid = record
             .claim
             .job_uid
             .as_deref()
             .context("Campaign Job has no durable UID binding")?;
-        let (job_uid, pod_uid) =
-            validate_terminal_provenance(&manifest["items"][1], &job, &items[0], bound_uid)?;
+        let readback = read_terminal_job(
+            &args.context,
+            &args.namespace,
+            &manifest["items"][1],
+            &validated.job_name,
+            bound_uid,
+        )?;
+        let (job_uid, pod_uid) = (readback.job_uid, readback.pod_uid);
         let client = Client::builder()
             .timeout(Duration::from_secs(120))
             .redirect(reqwest::redirect::Policy::none())
@@ -125,6 +94,65 @@ pub(super) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
         report.clone(),
     );
     print_json(&report)
+}
+
+pub(super) struct TerminalJobReadback {
+    pub job_uid: String,
+    pub pod_uid: String,
+    pub pod: Value,
+}
+
+pub(super) fn read_terminal_job(
+    context: &str,
+    namespace: &str,
+    expected_job: &Value,
+    job_name: &str,
+    bound_uid: &str,
+) -> anyhow::Result<TerminalJobReadback> {
+    let kubectl = kubectl_binary();
+    let job = kubectl_json(
+        &kubectl,
+        context,
+        namespace,
+        [
+            "--request-timeout=30s",
+            "get",
+            "job",
+            job_name,
+            "-o",
+            "json",
+        ],
+        "read back terminal Campaign Job",
+    )?;
+    let selector = format!("job-name={}", job_name);
+    let pods = kubectl_json(
+        &kubectl,
+        context,
+        namespace,
+        [
+            "--request-timeout=30s",
+            "get",
+            "pods",
+            "-l",
+            &selector,
+            "-o",
+            "json",
+        ],
+        "read back terminal Campaign Pod",
+    )?;
+    let items = pods["items"]
+        .as_array()
+        .context("terminal Pod list is missing items")?;
+    if items.len() != 1 {
+        bail!("Campaign settlement requires exactly one execution Pod; keep uncertain attempts charged");
+    }
+    let (job_uid, pod_uid) =
+        validate_terminal_provenance(expected_job, &job, &items[0], bound_uid)?;
+    Ok(TerminalJobReadback {
+        job_uid,
+        pod_uid,
+        pod: items[0].clone(),
+    })
 }
 
 pub(super) fn validate_terminal_provenance(

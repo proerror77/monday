@@ -3,6 +3,7 @@
 pub mod baselines;
 pub mod engines;
 pub mod evaluation;
+pub mod final_models;
 pub mod formula_evaluator;
 #[cfg(feature = "kernel")]
 pub mod learning;

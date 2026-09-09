@@ -1075,7 +1075,9 @@ fn expected_strategy_id(activation: &ActivationRequest, symbol: &str) -> Option<
         return None;
     }
     Some(match activation.artifact {
-        ActivationArtifact::Formula => format!("{}:{symbol}", activation.bundle_id),
+        ActivationArtifact::Formula | ActivationArtifact::FrozenModel => {
+            format!("{}:{symbol}", activation.bundle_id)
+        }
         ActivationArtifact::Onnx => activation.bundle_id.clone(),
     })
 }
@@ -1089,7 +1091,7 @@ fn strategy_targets(
     let mut targets = BTreeMap::new();
 
     match activation.artifact {
-        ActivationArtifact::Formula => {
+        ActivationArtifact::Formula | ActivationArtifact::FrozenModel => {
             let risk_capital = decimal_min(max_notional, max_symbol_exposure);
             for symbol in &activation.instruments {
                 let strategy_id = format!("{}:{symbol}", activation.bundle_id);

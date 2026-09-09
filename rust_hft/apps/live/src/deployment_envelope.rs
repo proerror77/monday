@@ -54,6 +54,7 @@ pub enum ActivationMode {
 pub enum ActivationArtifact {
     Formula,
     Onnx,
+    FrozenModel,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -208,6 +209,9 @@ impl RuntimeActivationAdapter for SystemConfigActivationAdapter<'_> {
             StrategyBundleArtifact::CexFourStage { strategy } => {
                 Some(strategy.market.as_str().to_string())
             }
+            StrategyBundleArtifact::FrozenModel { strategy } => {
+                Some(strategy.frozen.program.market.clone())
+            }
             _ => None,
         };
         *self.config = proposed;
@@ -239,17 +243,11 @@ fn validate_instrument_catalog(
 }
 
 fn require_supported_cex_execution(costs: &EvaluationCostsV1) -> Result<(), String> {
-    if costs.cross_spread {
-        return Err(
-            "four-stage CEX Paper/Shadow does not support cross-spread execution".to_string(),
-        );
-    }
+    // Paper uses canonical opposite-side depth for crossing orders.
     // ponytail: non-zero funding needs a point-in-time runtime funding feed; admit it only after
     // that feed can debit every research bucket deterministically.
     if costs.funding_bps != 0.0 {
-        return Err(
-            "four-stage CEX Paper/Shadow does not support non-zero funding costs".to_string(),
-        );
+        return Err("CEX Paper/Shadow does not support non-zero funding costs".to_string());
     }
     Ok(())
 }
@@ -296,6 +294,14 @@ fn apply_strategy_bundle(
                 .runtime_contract()
                 .map_err(|error| error.to_string())?,
         ),
+        (
+            ActivationArtifact::Onnx | ActivationArtifact::FrozenModel,
+            StrategyBundleArtifact::FrozenModel { strategy },
+        ) => Some(
+            strategy
+                .runtime_contract()
+                .map_err(|error| error.to_string())?,
+        ),
         _ => None,
     };
     if let Some(contract) = cex_contract.as_ref() {
@@ -327,83 +333,23 @@ fn apply_strategy_bundle(
                 match artifact {
                     StrategyBundleArtifact::Formula { ast } => (ast, false, 0.0, None, None),
                     StrategyBundleArtifact::CexFourStage { strategy } => {
-                        let [instrument] = request.instruments.as_slice() else {
-                            return Err(
-                                "four-stage CEX deployment requires exactly one instrument"
-                                    .to_string(),
-                            );
-                        };
-                        let venue = config
-                            .venues
-                            .iter_mut()
-                            .find(|venue| {
-                                venue.name.eq_ignore_ascii_case(&request.venue)
-                                    && venue.account_id.as_deref().unwrap_or(&venue.name)
-                                        == request.account_id
-                            })
-                            .ok_or_else(|| {
-                                "four-stage CEX deployment has no exact runtime venue/account"
-                                    .to_string()
-                            })?;
-                        if !request.venue.eq_ignore_ascii_case(strategy.venue.as_str())
-                            || instrument != &strategy.symbol
-                            || venue.inst_type.as_deref().is_none_or(|market| {
-                                !market.eq_ignore_ascii_case(strategy.market.as_str())
-                            })
-                        {
-                            return Err(
-                                "four-stage CEX bundle does not match the runtime venue, market, or instrument"
-                                    .to_string(),
-                            );
-                        }
-                        if strategy.market.as_str() != "usdm"
-                            || !matches!(venue.venue_type, runtime::VenueType::Binance)
-                            || venue.rest.as_deref() != Some("https://fapi.binance.com")
-                            || venue.ws_public.as_deref() != Some("wss://fstream.binance.com/ws")
-                        {
-                            return Err(
-                                "four-stage CEX Paper/Shadow requires Binance USD-M with canonical fapi and fstream endpoints"
-                                    .to_string(),
-                            );
-                        }
-                        venue.simulate_execution = true;
                         let contract = cex_contract
                             .as_ref()
-                            .expect("CEX Formula artifact has a validated runtime contract");
-                        let tick_size = contract
-                            .tick_size
-                            .parse::<rust_decimal::Decimal>()
-                            .map_err(|_| "sealed CEX tick size is invalid".to_string())?;
-                        let step_size = contract
-                            .step_size
-                            .parse::<rust_decimal::Decimal>()
-                            .map_err(|_| "sealed CEX step size is invalid".to_string())?;
-                        let min_notional = contract
-                            .min_notional
-                            .parse::<rust_decimal::Decimal>()
-                            .map_err(|_| {
-                            "sealed CEX minimum notional is invalid".to_string()
-                        })?;
+                            .expect("validated CEX runtime contract");
+                        let execution_contract = cex_execution_contract(
+                            config,
+                            request,
+                            strategy.venue.as_str(),
+                            strategy.market.as_str(),
+                            &strategy.symbol,
+                            contract,
+                        )?;
                         (
                             &strategy.executable_formula,
                             true,
                             contract.zero_epsilon,
                             Some(contract.observation_frequency_millis),
-                            Some(runtime::FormulaExecutionContract {
-                                venue: hft_core::VenueId::BINANCE,
-                                venue_spec: ports::VenueSpec {
-                                    name: "BINANCE".to_string(),
-                                    tick_size: hft_core::Price(tick_size),
-                                    lot_size: hft_core::Quantity(step_size),
-                                    min_qty: hft_core::Quantity(step_size),
-                                    max_quantity: None,
-                                    min_notional,
-                                    maker_fee_bps: None,
-                                    taker_fee_bps: None,
-                                    rate_limit: None,
-                                },
-                                cross_spread: contract.costs.cross_spread,
-                            }),
+                            Some(execution_contract),
                         )
                     }
                     _ => {
@@ -431,6 +377,43 @@ fn apply_strategy_bundle(
                         execution_contract,
                     },
                     risk_limits,
+                },
+                ids,
+            )
+        }
+        (
+            ActivationArtifact::Onnx | ActivationArtifact::FrozenModel,
+            StrategyBundleArtifact::FrozenModel { strategy },
+        ) => {
+            let contract = cex_contract
+                .as_ref()
+                .expect("validated frozen runtime contract");
+            let program = &strategy.frozen.program;
+            let execution_contract = cex_execution_contract(
+                config,
+                request,
+                &program.venue,
+                &program.market,
+                &program.symbol,
+                contract,
+            )?;
+            // LoadModel selects the concrete, verified model format here.
+            request.artifact = ActivationArtifact::FrozenModel;
+            let ids = symbols
+                .iter()
+                .map(|symbol| format!("{strategy_name}:{}", symbol.as_str()))
+                .collect();
+            (
+                runtime::StrategyConfig {
+                    name: strategy_name.clone(),
+                    strategy_type: runtime::StrategyType::FrozenModel,
+                    symbols,
+                    risk_limits,
+                    params: runtime::StrategyParams::FrozenModel {
+                        program: Box::new(program.clone()),
+                        max_order_notional: total_notional,
+                        execution_contract,
+                    },
                 },
                 ids,
             )
@@ -492,6 +475,89 @@ fn apply_strategy_bundle(
     }
     config.strategies = vec![strategy];
     Ok(())
+}
+
+fn cex_execution_contract(
+    config: &mut runtime::SystemConfig,
+    request: &ActivationRequest,
+    expected_venue: &str,
+    expected_market: &str,
+    expected_symbol: &str,
+    contract: &alpha_domain::CexRuntimeContractV1,
+) -> Result<runtime::FormulaExecutionContract, String> {
+    let [instrument] = request.instruments.as_slice() else {
+        return Err("four-stage CEX deployment requires exactly one instrument".to_string());
+    };
+    let venue = config
+        .venues
+        .iter_mut()
+        .find(|venue| {
+            venue.name.eq_ignore_ascii_case(&request.venue)
+                && venue.account_id.as_deref().unwrap_or(&venue.name) == request.account_id
+        })
+        .ok_or_else(|| {
+            "four-stage CEX deployment has no exact runtime venue/account".to_string()
+        })?;
+    if !request.venue.eq_ignore_ascii_case(expected_venue)
+        || instrument != expected_symbol
+        || venue
+            .inst_type
+            .as_deref()
+            .is_none_or(|market| !market.eq_ignore_ascii_case(expected_market))
+    {
+        return Err(
+            "four-stage CEX bundle does not match the runtime venue, market, or instrument"
+                .to_string(),
+        );
+    }
+    if expected_market != "usdm"
+        || !matches!(venue.venue_type, runtime::VenueType::Binance)
+        || venue.rest.as_deref() != Some("https://fapi.binance.com")
+        || venue.ws_public.as_deref() != Some("wss://fstream.binance.com/ws")
+    {
+        return Err(
+                                "four-stage CEX Paper/Shadow requires Binance USD-M with canonical fapi and fstream endpoints"
+                                    .to_string(),
+                            );
+    }
+    let target_venue = match (
+        expected_venue.to_ascii_lowercase().as_str(),
+        expected_market.to_ascii_lowercase().as_str(),
+    ) {
+        ("binance", "spot") => hft_core::VenueId::BINANCE_SPOT,
+        ("binance", "usdm") => hft_core::VenueId::BINANCE_FUTURES,
+        _ => {
+            return Err("frozen CEX model has no governed runtime venue for its market".to_string())
+        }
+    };
+    venue.simulate_execution = true;
+    let tick_size = contract
+        .tick_size
+        .parse::<rust_decimal::Decimal>()
+        .map_err(|_| "sealed CEX tick size is invalid".to_string())?;
+    let step_size = contract
+        .step_size
+        .parse::<rust_decimal::Decimal>()
+        .map_err(|_| "sealed CEX step size is invalid".to_string())?;
+    let min_notional = contract
+        .min_notional
+        .parse::<rust_decimal::Decimal>()
+        .map_err(|_| "sealed CEX minimum notional is invalid".to_string())?;
+    Ok(runtime::FormulaExecutionContract {
+        venue: target_venue,
+        venue_spec: ports::VenueSpec {
+            name: target_venue.as_str().into(),
+            tick_size: hft_core::Price(tick_size),
+            lot_size: hft_core::Quantity(step_size),
+            min_qty: hft_core::Quantity(step_size),
+            max_quantity: None,
+            min_notional,
+            maker_fee_bps: None,
+            taker_fee_bps: None,
+            rate_limit: None,
+        },
+        cross_spread: contract.costs.cross_spread,
+    })
 }
 
 fn positive_decimal(name: &str, value: f64) -> Result<rust_decimal::Decimal, String> {

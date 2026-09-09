@@ -5,6 +5,11 @@
 //! This is local ledger serialization, not Kubernetes writer fencing.
 
 mod dispatch;
+mod final_dispatch;
+pub use final_dispatch::{
+    CampaignFinalDispatchClaimV1, CampaignFinalDispatchRecord, CampaignFinalDispatchSettlementV1,
+    CampaignFinalOutcomeV1,
+};
 mod state;
 
 pub use dispatch::{
@@ -68,6 +73,16 @@ pub enum CampaignLedgerEventV1 {
     ApprovalRevoked {
         revocation: ApprovalRevocationV1,
     },
+    FinalDispatchClaimed {
+        request_sha256: String,
+        target: CampaignDispatchTargetV1,
+    },
+    FinalDispatchJobBound {
+        job_uid: String,
+    },
+    FinalDispatchSettled {
+        evidence: CampaignFinalDispatchSettlementV1,
+    },
     FamilyClosedForFinalEvaluation {
         signed: Box<SignedCampaignFinalEvaluationGrantV1>,
         verifying_key_hex: String,
@@ -96,6 +111,9 @@ impl CampaignLedgerEventV1 {
             Self::ApprovalRevoked { revocation } => {
                 format!("campaign-revocation:{}", revocation.approval_id)
             }
+            Self::FinalDispatchClaimed { .. } => "campaign-final-dispatch".into(),
+            Self::FinalDispatchJobBound { .. } => "campaign-final-job".into(),
+            Self::FinalDispatchSettled { .. } => "campaign-final-settlement".into(),
             Self::FamilyClosedForFinalEvaluation { signed, .. } => {
                 format!("campaign-family-closed:{}", signed.grant.family_id)
             }
@@ -918,6 +936,29 @@ pub(crate) fn append_registered_campaign_revocation(
     Ok(())
 }
 
+fn require_published_receipts(
+    conn: &Connection,
+    key: &[u8; 32],
+    family: &str,
+    history: &[AuthenticatedCampaignReceiptV1],
+    through: u64,
+) -> Result<(), StoreError> {
+    for receipt in history.iter().take(usize::try_from(through).map_err(err)?) {
+        let (hash, auth): (String, String) = conn.query_row("SELECT object_sha256, auth_tag FROM campaign_receipt_publications WHERE family_id = ? AND sequence = ?", params![family, sql_sequence(receipt.receipt.sequence)?], |r| Ok((r.get(0)?, r.get(1)?))).map_err(database_error)?;
+        if hash != receipt.object_sha256()? {
+            return Err(StoreError::ContentHashMismatch);
+        }
+        verify_authentication_tag(
+            key,
+            PUBLICATION_DOMAIN,
+            &receipt.object_key(),
+            &publication_json(receipt)?,
+            &auth,
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1653,6 +1694,165 @@ mod tests {
         verified
     }
 
+    fn closed_final_family() -> (AlphaStore, VerifiedCampaignFinalEvaluationGrant) {
+        let (mut store, root, attempt) = final_family_base();
+        settle_final_source(&mut store, &attempt);
+        let definition = final_definition(&store, &root, &attempt);
+        let grant = approve_final(&mut store, definition);
+        store
+            .close_campaign_family_for_final_evaluation(&grant, "final-approval", minutes(2))
+            .unwrap();
+        (store, grant)
+    }
+
+    #[test]
+    fn final_dispatch_is_single_use_published_and_restore_safe() {
+        let (mut store, grant) = closed_final_family();
+        let request = "a".repeat(64);
+        let target = dispatch_target();
+        assert!(store
+            .claim_campaign_final_dispatch(&grant, &request, &target, minutes(3))
+            .is_err());
+        acknowledge_all(&mut store);
+        let (claim, first) = store
+            .claim_campaign_final_dispatch(&grant, &request, &target, minutes(3))
+            .unwrap();
+        assert!(first);
+        assert_eq!(claim.claimed_at, minutes(3));
+        assert!(store
+            .bind_campaign_final_dispatch_job(&grant, &request, &target, "final-job", minutes(4))
+            .is_err());
+        acknowledge_all(&mut store);
+        let (same, first) = store
+            .claim_campaign_final_dispatch(&grant, &request, &target, minutes(4))
+            .unwrap();
+        assert!(!first);
+        assert_eq!(same, claim);
+        assert!(store
+            .claim_campaign_final_dispatch(&grant, &"b".repeat(64), &target, minutes(4))
+            .is_err());
+        store
+            .bind_campaign_final_dispatch_job(&grant, &request, &target, "final-job", minutes(4))
+            .unwrap();
+        let mut called = false;
+        let result: Result<(), StoreError> = store.with_campaign_final_dispatch_admission(
+            &grant,
+            &request,
+            &target,
+            Some("final-job"),
+            || minutes(5),
+            || {
+                called = true;
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(!called);
+        acknowledge_all(&mut store);
+        let snapshot = store.campaign_family_snapshot(FAMILY).unwrap();
+        let mut restored = AlphaStore::open_in_memory().unwrap();
+        restored.integrity_key = store.integrity_key;
+        restored.import_campaign_family_snapshot(&snapshot).unwrap();
+        acknowledge_all(&mut restored);
+        assert!(
+            !restored
+                .claim_campaign_final_dispatch(&grant, &request, &target, minutes(5))
+                .unwrap()
+                .1
+        );
+        assert!(restored
+            .bind_campaign_final_dispatch_job(&grant, &request, &target, "another-job", minutes(5))
+            .is_err());
+        let result: Result<(), StoreError> = restored.with_campaign_final_dispatch_admission(
+            &grant,
+            &request,
+            &target,
+            Some("final-job"),
+            || minutes(5),
+            || Ok(()),
+        );
+        result.unwrap();
+        assert!(
+            restored
+                .claim_campaign_final_dispatch(&grant, &request, &target, minutes(63))
+                .is_err(),
+            "claim deadline cannot be extended by adoption"
+        );
+    }
+
+    #[test]
+    fn final_dispatch_revocation_and_terminal_evidence_preserve_one_attempt() {
+        let (mut store, grant) = closed_final_family();
+        let request = "a".repeat(64);
+        let target = dispatch_target();
+        acknowledge_all(&mut store);
+        store
+            .claim_campaign_final_dispatch(&grant, &request, &target, minutes(3))
+            .unwrap();
+        acknowledge_all(&mut store);
+        store
+            .bind_campaign_final_dispatch_job(&grant, &request, &target, "final-job", minutes(4))
+            .unwrap();
+        acknowledge_all(&mut store);
+        store
+            .revoke_approval("final-approval", "operator", "stop", minutes(5))
+            .unwrap();
+        acknowledge_all(&mut store);
+        let mut called = false;
+        let result: Result<(), StoreError> = store.with_campaign_final_dispatch_admission(
+            &grant,
+            &request,
+            &target,
+            Some("final-job"),
+            || minutes(6),
+            || {
+                called = true;
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(!called);
+        let mut evidence = CampaignFinalDispatchSettlementV1 {
+            request_sha256: request.clone(),
+            job_uid: "wrong-job".into(),
+            pod_uid: "final-pod".into(),
+            result_sha256: "d".repeat(64),
+            outcome: CampaignFinalOutcomeV1::PromotionReady,
+            candidates_evaluated: None,
+            consumed_job_seconds: None,
+        };
+        assert!(store
+            .settle_campaign_final_dispatch(FAMILY, &evidence, minutes(7))
+            .is_err());
+        evidence.job_uid = "final-job".into();
+        assert!(
+            store
+                .settle_campaign_final_dispatch(FAMILY, &evidence, minutes(7))
+                .is_err(),
+            "successful final result cannot omit accounting"
+        );
+        evidence.outcome = CampaignFinalOutcomeV1::Failed;
+        let receipt = store
+            .settle_campaign_final_dispatch(FAMILY, &evidence, minutes(7))
+            .unwrap();
+        assert_eq!(
+            store
+                .settle_campaign_final_dispatch(FAMILY, &evidence, minutes(8))
+                .unwrap(),
+            receipt
+        );
+        assert!(store
+            .claim_campaign_final_dispatch(&grant, &request, &target, minutes(8))
+            .is_err());
+        let record = store.campaign_final_dispatch_record(FAMILY).unwrap();
+        assert_eq!(record.settlement, Some(evidence));
+        assert_eq!(
+            record.grant.grant().max_job_seconds,
+            3600,
+            "uncertain failure preserves full reservation"
+        );
+    }
+
     #[test]
     fn final_family_closure_is_permanent_idempotent_and_survives_restore() {
         let (mut store, root, attempt) = final_family_base();
@@ -1916,6 +2116,9 @@ mod tests {
                 CampaignLedgerEventV1::AttemptSettled { .. } => "attempt_settled",
                 CampaignLedgerEventV1::DispatchSettled { .. } => "dispatch_settled",
                 CampaignLedgerEventV1::ApprovalRevoked { .. } => "approval_revoked",
+                CampaignLedgerEventV1::FinalDispatchClaimed { .. } => "final_dispatch_claimed",
+                CampaignLedgerEventV1::FinalDispatchJobBound { .. } => "final_dispatch_job_bound",
+                CampaignLedgerEventV1::FinalDispatchSettled { .. } => "final_dispatch_settled",
                 CampaignLedgerEventV1::FamilyClosedForFinalEvaluation { .. } => {
                     "family_closed_for_final_evaluation"
                 }
