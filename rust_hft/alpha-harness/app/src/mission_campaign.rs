@@ -713,7 +713,10 @@ fn next_campaign_policy_revision(
         .research_plan
         .allowed_search_policy_revisions
         .iter()
-        .filter(|revision| !attempted.contains(&revision.revision_id))
+        .filter(|revision| {
+            revision.position_policy == preferred_position_policy
+                && !attempted.contains(&revision.revision_id)
+        })
         .min_by_key(|revision| {
             (
                 usize::from(revision.position_policy != preferred_position_policy),
@@ -3690,6 +3693,90 @@ mod tests {
         assert!(load_research_plan(&args.output).unwrap().llm.is_none());
         learn(args.clone()).unwrap();
         assert_eq!(std::fs::read(&args.output).unwrap(), first);
+    }
+
+    #[test]
+    fn repeated_no_trades_keeps_prediction_identity_across_generations() {
+        let loaded = loaded_request_for_learning();
+        let result = negative_campaign_result(&loaded);
+        let result_sha256 = "9".repeat(64);
+        let evidence = campaign_research_evidence_signature(&loaded.request, &result).unwrap();
+        let (first_revision, first_directive) = next_campaign_policy_revision(
+            &loaded,
+            &result_sha256,
+            CexCampaignFailureClassV1::NoTradesAfterCosts,
+        )
+        .unwrap();
+        assert_eq!(
+            first_revision.position_policy,
+            CexCampaignPositionPolicyV1::PredictionIdentity
+        );
+        let first_plan = follow_up_plan(
+            &loaded,
+            &result_sha256,
+            first_directive,
+            first_revision,
+            evidence.clone(),
+        )
+        .unwrap();
+        let mut second_parent = LoadedRequest {
+            request: loaded.request.clone(),
+            sha256: loaded.sha256.clone(),
+        };
+        second_parent.request.research_plan = first_plan;
+
+        let (second_revision, second_directive) = next_campaign_policy_revision(
+            &second_parent,
+            &result_sha256,
+            CexCampaignFailureClassV1::NoTradesAfterCosts,
+        )
+        .unwrap();
+        assert_eq!(
+            second_revision.position_policy,
+            CexCampaignPositionPolicyV1::PredictionIdentity
+        );
+        let second_plan = follow_up_plan(
+            &second_parent,
+            &result_sha256,
+            second_directive,
+            second_revision,
+            evidence,
+        )
+        .unwrap();
+        assert_eq!(second_plan.generation, 2);
+        assert_eq!(
+            second_plan.search_policy_revision.position_policy,
+            CexCampaignPositionPolicyV1::PredictionIdentity
+        );
+        second_plan.validate().unwrap();
+    }
+
+    #[test]
+    fn no_trades_rejects_when_all_prediction_identity_deltas_are_exhausted() {
+        let mut loaded = loaded_request_for_learning();
+        let identity_ids = loaded
+            .request
+            .research_plan
+            .allowed_search_policy_revisions
+            .iter()
+            .filter(|revision| {
+                revision.position_policy == CexCampaignPositionPolicyV1::PredictionIdentity
+            })
+            .map(|revision| revision.revision_id.clone())
+            .collect::<Vec<_>>();
+        loaded
+            .request
+            .research_plan
+            .attempted_search_policy_revision_ids =
+            std::iter::once(CexCampaignSearchPolicyRevisionV1::canonical().revision_id)
+                .chain(identity_ids)
+                .collect();
+        assert!(next_campaign_policy_revision(
+            &loaded,
+            &"9".repeat(64),
+            CexCampaignFailureClassV1::NoTradesAfterCosts,
+        )
+        .is_err());
     }
 
     #[test]

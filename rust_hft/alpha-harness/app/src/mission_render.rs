@@ -302,14 +302,15 @@ impl CexCampaignSearchPolicyRevisionV1 {
             );
         }
         for delta in CexCampaignResearchDeltaV1::bounded_variants() {
-            revisions.push(
-                Self::new_typed(
-                    None,
-                    CexCampaignPositionPolicyV1::HystereticCostAware,
-                    delta,
-                )
-                .expect("bounded typed policy is valid"),
-            );
+            for position_policy in [
+                CexCampaignPositionPolicyV1::PredictionIdentity,
+                CexCampaignPositionPolicyV1::HystereticCostAware,
+            ] {
+                revisions.push(
+                    Self::new_typed(None, position_policy, delta.clone())
+                        .expect("bounded typed policy is valid"),
+                );
+            }
         }
         revisions
     }
