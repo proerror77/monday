@@ -520,6 +520,18 @@ fn cex_execution_contract(
                                     .to_string(),
                             );
     }
+    let target_venue = match (
+        expected_venue.to_ascii_lowercase().as_str(),
+        expected_market.to_ascii_lowercase().as_str(),
+    ) {
+        ("binance", "spot") => hft_core::VenueId::BINANCE_SPOT,
+        ("binance", "usdm") => hft_core::VenueId::BINANCE_FUTURES,
+        _ => {
+            return Err(
+                "frozen CEX model has no governed runtime venue for its market".to_string(),
+            )
+        }
+    };
     venue.simulate_execution = true;
     let tick_size = contract
         .tick_size
@@ -534,9 +546,9 @@ fn cex_execution_contract(
         .parse::<rust_decimal::Decimal>()
         .map_err(|_| "sealed CEX minimum notional is invalid".to_string())?;
     Ok(runtime::FormulaExecutionContract {
-        venue: hft_core::VenueId::BINANCE,
+        venue: target_venue,
         venue_spec: ports::VenueSpec {
-            name: "BINANCE".into(),
+            name: target_venue.as_str().into(),
             tick_size: hft_core::Price(tick_size),
             lot_size: hft_core::Quantity(step_size),
             min_qty: hft_core::Quantity(step_size),

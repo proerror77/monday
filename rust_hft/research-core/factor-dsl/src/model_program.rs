@@ -150,8 +150,17 @@ impl FrozenFactorModelV1 {
         if self.cross_spread {
             costs.one_way_cost_bps += spread_bps / 2.0;
         }
-        self.decision_policy
-            .target_position(prediction, previous, costs)
+        let target = self
+            .decision_policy
+            .target_position(prediction, previous, costs)?;
+        // Spot accounts cannot hold a short position. Keep the shared model
+        // target semantics signed for derivatives while making a bearish spot
+        // prediction close existing inventory instead of opening a short.
+        Ok(if self.market == "spot" {
+            target.max(0.0)
+        } else {
+            target
+        })
     }
 }
 
@@ -209,6 +218,9 @@ mod tests {
         assert!(model.predict_from_history(1, |_, _| Some(1.0)).is_err());
         assert!(model.predict_from_history(3, |_, _| None).is_err());
         assert_eq!(model.target_position(-0.5, 0.0, 2.0).unwrap(), -0.5);
+        let mut spot = model.clone();
+        spot.market = "spot".into();
+        assert_eq!(spot.target_position(-0.5, 0.5, 2.0).unwrap(), 0.0);
         let mut unsupported = model.clone();
         unsupported.factors[0].ast = FactorAst::Terminal(FactorTerminal::Field(
             "aggregate_trade_flow_imbalance".into(),

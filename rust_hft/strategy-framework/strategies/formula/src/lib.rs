@@ -88,6 +88,7 @@ pub struct FormulaStrategy {
     evaluation_interval_micros: Option<u64>,
     bucket_sample: Option<BucketSample>,
     next_bucket_micros: Option<u64>,
+    last_consumed_observed_at: Option<u64>,
     pending_target: Option<PendingTarget>,
     target_position: Option<Decimal>,
     last_signal: Option<f64>,
@@ -148,13 +149,13 @@ impl FormulaStrategy {
                 let capability = model
                     .validate()
                     .map_err(FormulaStrategyError::InvalidModelProgram)?;
+                let model_venue = frozen_model_target_venue(model)
+                    .ok_or(FormulaStrategyError::InvalidExecutionContract)?;
                 if !config.target_position
                     || config.signal_threshold != 0.0
                     || config.evaluation_interval_millis != Some(model.observation_frequency_millis)
                     || config.symbol.as_str() != model.symbol
-                    || !config
-                        .target_venue
-                        .is_some_and(|venue| venue.as_str().eq_ignore_ascii_case(&model.venue))
+                    || config.target_venue != Some(model_venue)
                     || config.venue_spec.is_none()
                     || config.cross_spread != Some(model.cross_spread)
                 {
@@ -181,6 +182,7 @@ impl FormulaStrategy {
             evaluation_interval_micros,
             bucket_sample: None,
             next_bucket_micros: None,
+            last_consumed_observed_at: None,
             pending_target: None,
             target_position: None,
             last_signal: None,
@@ -219,6 +221,7 @@ impl FormulaStrategy {
         self.signal_initialized = false;
         self.bucket_sample = None;
         self.next_bucket_micros = None;
+        self.last_consumed_observed_at = None;
         self.pending_target = None;
         self.target_position = None;
         self.last_signal = None;
@@ -282,9 +285,12 @@ impl FormulaStrategy {
             return;
         };
         if self
-            .bucket_sample
-            .as_ref()
-            .is_some_and(|sample| timestamp < sample.observed_at)
+            .last_consumed_observed_at
+            .is_some_and(|last| timestamp <= last)
+            || self
+                .bucket_sample
+                .as_ref()
+                .is_some_and(|sample| timestamp < sample.observed_at)
         {
             return;
         }
@@ -320,7 +326,24 @@ impl FormulaStrategy {
             return None;
         }
         self.next_bucket_micros = Some(expected.saturating_add(interval));
-        let mut decision = self.bucket_sample.clone()?;
+        let sample = self.bucket_sample.as_ref()?;
+        // A point-in-time sample may be received slightly before the bucket
+        // boundary, but a sample from before the preceding boundary is stale.
+        // Keep a future-dated sample for the next clock rather than trading on
+        // data that could not have existed at this boundary.
+        if sample.observed_at > timestamp {
+            return None;
+        }
+        if sample.observed_at < expected.saturating_sub(interval)
+            || self
+                .last_consumed_observed_at
+                .is_some_and(|last| sample.observed_at <= last)
+        {
+            self.bucket_sample = None;
+            return None;
+        }
+        let mut decision = self.bucket_sample.take()?;
+        self.last_consumed_observed_at = Some(decision.observed_at);
         decision.bucket = timestamp / interval;
         Some(decision)
     }
@@ -413,7 +436,18 @@ impl FormulaStrategy {
                     || self
                         .last_signal
                         .is_some_and(|last| last.to_bits() == signal.to_bits()));
-            if !same_signal {
+            if self.config.cross_spread == Some(false) {
+                if let Some(pending) = self.pending_target {
+                    if current != pending.target_position {
+                        // This intent is a GTC target order. Without an
+                        // execution or cancellation readback, emitting a new
+                        // delta would stack orders against the still-live
+                        // original order.
+                        return Vec::new();
+                    }
+                    self.pending_target = None;
+                }
+            } else if !same_signal {
                 self.pending_target = None;
             }
             let target = if same_signal {
@@ -456,7 +490,7 @@ impl FormulaStrategy {
             self.signal_initialized = true;
             self.target_position = Some(target);
             self.last_signal = Some(signal);
-            if same_signal {
+            if same_signal && self.config.cross_spread != Some(false) {
                 if let Some(pending) = self.pending_target {
                     if current == pending.target_position {
                         self.pending_target = None;
@@ -594,6 +628,14 @@ impl FormulaStrategy {
 enum EventDomain {
     Snapshot,
     Bar,
+}
+
+fn frozen_model_target_venue(model: &FrozenFactorModelV1) -> Option<hft_core::VenueId> {
+    match (model.venue.as_str(), model.market.as_str()) {
+        ("binance", "spot") => Some(hft_core::VenueId::BINANCE_SPOT),
+        ("binance", "usdm") => Some(hft_core::VenueId::BINANCE_FUTURES),
+        _ => hft_core::VenueId::from_str(&model.venue),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1256,7 +1298,7 @@ mod tests {
     }
 
     #[test]
-    fn frozen_model_sizes_fractional_targets_and_updates_same_side_predictions() {
+    fn frozen_model_sizes_fractional_targets_without_stacking_gtc_orders() {
         for (market, product) in [("usdm", ProductType::Perp), ("spot", ProductType::Spot)] {
             let mut strategy = FormulaStrategy::new(frozen_model_config(market)).unwrap();
             let account = AccountView::default();
@@ -1276,13 +1318,39 @@ mod tests {
                 &account,
                 2_000_000,
             );
-            assert_eq!(
-                second.len(),
-                1,
-                "same direction must not freeze a changing model magnitude"
+            assert!(
+                second.is_empty(),
+                "a live GTC target must be reconciled before a new magnitude is emitted"
             );
-            assert_eq!(second[0].quantity.0, Decimal::new(37, 2));
         }
+    }
+
+    #[test]
+    fn frozen_spot_model_bearish_target_flattens_inventory_without_shorting() {
+        let mut strategy = FormulaStrategy::new(frozen_model_config("spot")).unwrap();
+        let mut account = AccountView::default();
+        account.positions.insert(
+            Symbol::from("BTCUSDT"),
+            ports::Position {
+                symbol: Symbol::from("BTCUSDT"),
+                quantity: Quantity(Decimal::new(25, 2)),
+                avg_price: Price(Decimal::from(99)),
+                unrealized_pnl: Decimal::ZERO,
+                realized_pnl: Decimal::ZERO,
+            },
+        );
+
+        let orders = target_intents(
+            &mut strategy,
+            &snapshot_at(1, 3, 1_000_000),
+            &account,
+            1_000_000,
+        );
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].side, Side::Sell);
+        assert_eq!(orders[0].quantity, Quantity(Decimal::new(25, 2)));
+        assert_eq!(orders[0].product_type, ProductType::Spot);
     }
 
     #[test]
@@ -1347,6 +1415,35 @@ mod tests {
             }
             assert!(FormulaStrategy::new(config).is_err(), "{field}");
         }
+    }
+
+    #[test]
+    fn frozen_model_resolves_binance_market_to_dedicated_venue() {
+        for (market, expected) in [
+            ("spot", VenueId::BINANCE_SPOT),
+            ("usdm", VenueId::BINANCE_FUTURES),
+        ] {
+            let mut config = frozen_model_config(market);
+            let FormulaProgram::FrozenModel(model) = &mut config.program else {
+                unreachable!()
+            };
+            model.venue = "binance".into();
+            config.target_venue = Some(expected);
+            config.venue_spec.as_mut().unwrap().name = expected.as_str().into();
+            assert!(FormulaStrategy::new(config).is_ok(), "{market}");
+        }
+
+        let mut mismatched = frozen_model_config("usdm");
+        let FormulaProgram::FrozenModel(model) = &mut mismatched.program else {
+            unreachable!()
+        };
+        model.venue = "binance".into();
+        mismatched.target_venue = Some(VenueId::BINANCE);
+        mismatched.venue_spec.as_mut().unwrap().name = "BINANCE".into();
+        assert!(matches!(
+            FormulaStrategy::new(mismatched),
+            Err(FormulaStrategyError::InvalidExecutionContract)
+        ));
     }
 
     #[test]
@@ -1947,7 +2044,7 @@ mod tests {
     }
 
     #[test]
-    fn target_position_reuses_the_last_book_on_each_clock_bucket() {
+    fn target_position_requires_a_fresh_book_for_each_clock_bucket() {
         let mut target = config(field("book_imbalance"));
         target.max_order_notional = Decimal::from(50);
         target.signal_threshold = f64::EPSILON;
@@ -1961,6 +2058,9 @@ mod tests {
             .is_empty());
         assert_eq!(strategy.on_clock(1_000_000, &account).len(), 1);
         assert!(strategy.on_clock(2_000_000, &account).is_empty());
+        assert!(strategy
+            .on_market_event(&snapshot_at(1, 3, 2_100_000), &account)
+            .is_empty());
         assert_eq!(strategy.on_clock(3_000_000, &account).len(), 1);
     }
 

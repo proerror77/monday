@@ -212,11 +212,34 @@ impl CexBaselineModelV1 {
             } => validate_ridge(*intercept, means, scales, coefficients, features),
             Self::ShallowCart { root } => root.validate_inference(features),
             Self::BurnMlpPortable {
-                parameters,
+                request_semantic_sha256,
                 semantic_model_sha256,
+                config_sha256,
+                trainer_version,
+                symbol,
+                venue,
+                row_count,
                 hidden_dim,
+                epochs,
+                learning_rate,
+                min_rows,
+                parameters,
                 ..
             } => {
+                validate_burn_training_metadata(
+                    request_semantic_sha256,
+                    semantic_model_sha256,
+                    config_sha256,
+                    trainer_version,
+                    symbol,
+                    venue,
+                    *row_count,
+                    *hidden_dim,
+                    *epochs,
+                    *learning_rate,
+                    *min_rows,
+                    features,
+                )?;
                 parameters.validate()?;
                 if parameters.input_dim != features
                     || parameters.hidden_dim != *hidden_dim
@@ -251,6 +274,42 @@ impl CexBaselineModelV1 {
             Self::BurnMlp { .. } => Err("historical Burn diagnostics are not executable".into()),
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_burn_training_metadata(
+    request_semantic_sha256: &str,
+    semantic_model_sha256: &str,
+    config_sha256: &str,
+    trainer_version: &str,
+    symbol: &str,
+    venue: &str,
+    row_count: usize,
+    hidden_dim: usize,
+    epochs: usize,
+    learning_rate: f64,
+    min_rows: usize,
+    arity: usize,
+) -> Result<(), String> {
+    if !crate::valid_sha256(request_semantic_sha256)
+        || !crate::valid_sha256(semantic_model_sha256)
+        || !crate::valid_sha256(config_sha256)
+        || trainer_version.trim().is_empty()
+        || symbol.trim().is_empty()
+        || symbol.trim() != symbol
+        || venue.trim().is_empty()
+        || venue.trim() != venue
+        || hidden_dim == 0
+        || epochs == 0
+        || !learning_rate.is_finite()
+        || learning_rate <= 0.0
+        || min_rows == 0
+        || row_count < min_rows
+        || arity == 0
+    {
+        return Err("Burn MLP training identity or metadata is invalid".into());
+    }
+    Ok(())
 }
 
 fn validate_ridge(
@@ -615,5 +674,122 @@ mod tests {
         let mut too_large = model;
         too_large.input_dim = usize::MAX;
         assert!(too_large.validate().is_err());
+    }
+
+    fn portable_baseline_for_validation() -> CexBaselineModelV1 {
+        let parameters = PortableMlpV1 {
+            schema_version: PORTABLE_MLP_SCHEMA_V1.into(),
+            input_dim: 1,
+            hidden_dim: 1,
+            hidden_weight: vec![1.0],
+            hidden_bias: vec![0.0],
+            output_weight: vec![1.0],
+            output_bias: 0.0,
+        };
+        let semantic_model_sha256 = parameters.semantic_sha256().unwrap();
+        CexBaselineModelV1::BurnMlpPortable {
+            request_semantic_sha256: "a".repeat(64),
+            semantic_model_sha256,
+            config_sha256: "b".repeat(64),
+            trainer_version: "burn-trainer-v1".into(),
+            symbol: "BTCUSDT".into(),
+            venue: "binance-usdm".into(),
+            row_count: 8,
+            seed: 7,
+            hidden_dim: 1,
+            epochs: 1,
+            learning_rate: 1e-3,
+            min_rows: 8,
+            parameters,
+        }
+    }
+
+    #[test]
+    fn portable_mlp_inference_validates_complete_training_metadata() {
+        let valid = portable_baseline_for_validation();
+        assert!(valid.validate_inference(1).is_ok());
+
+        let assert_invalid = |mut model: CexBaselineModelV1,
+                              mutate: fn(&mut CexBaselineModelV1)| {
+            mutate(&mut model);
+            assert!(model.validate_inference(1).is_err());
+        };
+        assert_invalid(valid.clone(), |model| {
+            let CexBaselineModelV1::BurnMlpPortable {
+                request_semantic_sha256,
+                ..
+            } = model
+            else {
+                unreachable!()
+            };
+            *request_semantic_sha256 = "invalid".into();
+        });
+        assert_invalid(valid.clone(), |model| {
+            let CexBaselineModelV1::BurnMlpPortable {
+                semantic_model_sha256,
+                ..
+            } = model
+            else {
+                unreachable!()
+            };
+            *semantic_model_sha256 = "invalid".into();
+        });
+        assert_invalid(valid.clone(), |model| {
+            let CexBaselineModelV1::BurnMlpPortable { config_sha256, .. } = model else {
+                unreachable!()
+            };
+            *config_sha256 = "invalid".into();
+        });
+        assert_invalid(valid.clone(), |model| {
+            let CexBaselineModelV1::BurnMlpPortable {
+                trainer_version, ..
+            } = model
+            else {
+                unreachable!()
+            };
+            *trainer_version = " ".into();
+        });
+        assert_invalid(valid.clone(), |model| {
+            let CexBaselineModelV1::BurnMlpPortable { symbol, .. } = model else {
+                unreachable!()
+            };
+            *symbol = " BTCUSDT".into();
+        });
+        assert_invalid(valid.clone(), |model| {
+            let CexBaselineModelV1::BurnMlpPortable { venue, .. } = model else {
+                unreachable!()
+            };
+            *venue = "binance-usdm ".into();
+        });
+        assert_invalid(valid.clone(), |model| {
+            let CexBaselineModelV1::BurnMlpPortable { row_count, .. } = model else {
+                unreachable!()
+            };
+            *row_count = 7;
+        });
+        assert_invalid(valid.clone(), |model| {
+            let CexBaselineModelV1::BurnMlpPortable { hidden_dim, .. } = model else {
+                unreachable!()
+            };
+            *hidden_dim = 0;
+        });
+        assert_invalid(valid.clone(), |model| {
+            let CexBaselineModelV1::BurnMlpPortable { epochs, .. } = model else {
+                unreachable!()
+            };
+            *epochs = 0;
+        });
+        assert_invalid(valid.clone(), |model| {
+            let CexBaselineModelV1::BurnMlpPortable { learning_rate, .. } = model else {
+                unreachable!()
+            };
+            *learning_rate = 0.0;
+        });
+        assert_invalid(valid, |model| {
+            let CexBaselineModelV1::BurnMlpPortable { min_rows, .. } = model else {
+                unreachable!()
+            };
+            *min_rows = 0;
+        });
     }
 }

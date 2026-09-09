@@ -1423,7 +1423,7 @@ impl SystemCommandHandler {
         }
 
         // 標記超時者原因
-        for (_oid, entry) in details.iter_mut() {
+        for entry in details.values_mut() {
             if !entry.0 {
                 entry.1 = Some("timeout".to_string());
             }
