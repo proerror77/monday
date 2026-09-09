@@ -211,8 +211,7 @@ pub(super) fn inspect_binding(
         if proposal.target_execution != execution {
             bail!("next-family proposal execution binding differs from the rendered Job");
         }
-        if proposal.target_horizon.labels.horizon_buckets
-            != materialization.label_horizon_buckets
+        if proposal.target_horizon.labels.horizon_buckets != materialization.label_horizon_buckets
             || proposal.target_horizon.labels.observation_frequency_millis
                 != materialization.bucket_ms
             || proposal.target_window.mission_id != materialization.mission_id
@@ -580,8 +579,7 @@ fn validate_study_target_window(
         .as_deref()
         .context("next-family proposal requires an authenticated campaign-inputs receipt path")?;
     let input_bytes = read_bounded(campaign_inputs_path, MAX_CONTROL_BYTES)?;
-    if hex::encode(Sha256::digest(&input_bytes))
-        != proposal.target_execution.campaign_inputs_sha256
+    if hex::encode(Sha256::digest(&input_bytes)) != proposal.target_execution.campaign_inputs_sha256
     {
         bail!("next-family proposal campaign-inputs receipt hash differs from the Study member");
     }
@@ -671,7 +669,7 @@ pub(super) fn validate_parent_settlement_binding(
     }
     let snapshot = store.campaign_study_snapshot(&proposal.study_id)?;
     if study_prefix_identity(&snapshot, &parent.study_settlement_receipt_sha256)?
-            != parent.study_snapshot_sha256
+        != parent.study_snapshot_sha256
         || !snapshot.receipts.iter().any(|receipt| {
             receipt.content_sha256 == parent.study_settlement_receipt_sha256
                 && matches!(
@@ -686,7 +684,9 @@ pub(super) fn validate_parent_settlement_binding(
                 )
         })
     {
-        bail!("next-family proposal parent settlement does not match the authenticated Study ledger");
+        bail!(
+            "next-family proposal parent settlement does not match the authenticated Study ledger"
+        );
     }
     Ok(())
 }

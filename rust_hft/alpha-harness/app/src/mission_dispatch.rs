@@ -193,10 +193,8 @@ pub(crate) fn read_authenticated_campaign_parent(
         signed.grant.expires_at - chrono::TimeDelta::seconds(1),
     )?;
     let store = AlphaStore::open(&control.ledger_path)?;
-    let reservation = inspection.historical_reservation_for(
-        &signed.content_sha256,
-        &signed.grant.family.family_id,
-    );
+    let reservation = inspection
+        .historical_reservation_for(&signed.content_sha256, &signed.grant.family.family_id);
     let operation_id = reservation.operation_id()?;
     let record = store.campaign_dispatch_record(&reservation.family_id, &operation_id)?;
     if record.root.signed_grant() != &signed || record.reservation != reservation {
@@ -1763,10 +1761,9 @@ mod tests {
                 &inputs.materialization_path,
             );
             let old_campaign_id = submission.request.campaign_id.clone();
-            let materialization_metadata: Value = serde_json::from_slice(
-                &std::fs::read(&inputs.materialization_path).unwrap(),
-            )
-            .unwrap();
+            let materialization_metadata: Value =
+                serde_json::from_slice(&std::fs::read(&inputs.materialization_path).unwrap())
+                    .unwrap();
             let campaign_inputs_path = inputs._root.path().join("campaign-inputs.json");
             std::fs::write(
                 &campaign_inputs_path,
@@ -1779,9 +1776,8 @@ mod tests {
             .unwrap();
             submission.request.campaign_inputs_sha256 =
                 crate::mission_runner::sha256_file(&campaign_inputs_path).unwrap();
-            submission.request.research_plan.label_horizon = Some(
-                alpha_domain::campaign_horizon::CampaignLabelHorizonV1::canonical(),
-            );
+            submission.request.research_plan.label_horizon =
+                Some(alpha_domain::campaign_horizon::CampaignLabelHorizonV1::canonical());
             submission.request.campaign_id =
                 crate::mission_campaign::expected_campaign_id(&submission.request).unwrap();
             for round in &mut submission.request.rounds {
@@ -1917,12 +1913,10 @@ mod tests {
             .unwrap();
             std::fs::write(
                 root.join("keys.json"),
-                serde_json::to_vec(
-                    &json!({
-                        "operator": hex::encode(signing_key.verifying_key().as_bytes()),
-                        "target-operator": hex::encode(target_key.verifying_key().as_bytes()),
-                    }),
-                )
+                serde_json::to_vec(&json!({
+                    "operator": hex::encode(signing_key.verifying_key().as_bytes()),
+                    "target-operator": hex::encode(target_key.verifying_key().as_bytes()),
+                }))
                 .unwrap(),
             )
             .unwrap();
@@ -1977,29 +1971,34 @@ mod tests {
                 .register_campaign_root(&verified_target, &target_approval.approval_id, now)
                 .unwrap();
             let study_id = "dispatch-study-budget".to_string();
-            let target_horizon_sha256 = CampaignLabelHorizonV1::canonical()
-                .content_hash()
-                .unwrap();
+            let target_horizon_sha256 = CampaignLabelHorizonV1::canonical().content_hash().unwrap();
             let study_grant = CampaignStudyGrantV1 {
                 schema_version: STUDY_GRANT_SCHEMA.into(),
                 study_id: study_id.clone(),
-                members: vec![CampaignStudyMemberV1 {
-                    family_id: signed.grant.family.family_id.clone(),
-                    root_grant_sha256: signed.content_sha256.clone(),
-                    family_definition_sha256: signed.grant.family.definition_sha256.clone(),
-                    family_max_trials: signed.grant.family.max_trials,
-                    execution_scope: signed.grant.execution_scope.clone(),
-                    execution: signed.grant.execution.clone(),
-                    label_horizon_sha256: target_horizon_sha256.clone(),
-                }, CampaignStudyMemberV1 {
-                    family_id: signed_target.grant.family.family_id.clone(),
-                    root_grant_sha256: signed_target.content_sha256.clone(),
-                    family_definition_sha256: signed_target.grant.family.definition_sha256.clone(),
-                    family_max_trials: signed_target.grant.family.max_trials,
-                    execution_scope: signed_target.grant.execution_scope.clone(),
-                    execution: signed_target.grant.execution.clone(),
-                    label_horizon_sha256: target_horizon_sha256,
-                }],
+                members: vec![
+                    CampaignStudyMemberV1 {
+                        family_id: signed.grant.family.family_id.clone(),
+                        root_grant_sha256: signed.content_sha256.clone(),
+                        family_definition_sha256: signed.grant.family.definition_sha256.clone(),
+                        family_max_trials: signed.grant.family.max_trials,
+                        execution_scope: signed.grant.execution_scope.clone(),
+                        execution: signed.grant.execution.clone(),
+                        label_horizon_sha256: target_horizon_sha256.clone(),
+                    },
+                    CampaignStudyMemberV1 {
+                        family_id: signed_target.grant.family.family_id.clone(),
+                        root_grant_sha256: signed_target.content_sha256.clone(),
+                        family_definition_sha256: signed_target
+                            .grant
+                            .family
+                            .definition_sha256
+                            .clone(),
+                        family_max_trials: signed_target.grant.family.max_trials,
+                        execution_scope: signed_target.grant.execution_scope.clone(),
+                        execution: signed_target.grant.execution.clone(),
+                        label_horizon_sha256: target_horizon_sha256,
+                    },
+                ],
                 budget: CampaignStudyBudgetV1 {
                     max_trials: 1000,
                     max_job_attempts: 2,
@@ -2561,11 +2560,14 @@ mod tests {
         let fixture = AdmissionFixture::new();
         let mut gate = fixture.open();
         gate.prepare().unwrap();
-        gate.publish_receipts_with(|_, bytes| Ok(bytes.to_vec())).unwrap();
+        gate.publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
         gate.claim().unwrap();
-        gate.publish_receipts_with(|_, bytes| Ok(bytes.to_vec())).unwrap();
+        gate.publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
         gate.bind_job("job-uid-1").unwrap();
-        gate.publish_receipts_with(|_, bytes| Ok(bytes.to_vec())).unwrap();
+        gate.publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
         let attempt = gate.reservation.clone();
         drop(gate);
         let mut gate = admission::Admission::open_for_settlement(
@@ -2588,7 +2590,8 @@ mod tests {
             },
         })
         .unwrap();
-        gate.publish_receipts_with(|_, bytes| Ok(bytes.to_vec())).unwrap();
+        gate.publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
         drop(gate);
 
         let control = admission::read_control(&fixture.control).unwrap();
@@ -2671,12 +2674,7 @@ mod tests {
             target_research_plan_sha256: "e".repeat(64),
         };
         assert_ne!(proposal.parent.family_id, proposal.target_family_id);
-        admission::validate_parent_settlement_binding(
-            &store,
-            &signed_study,
-            &proposal,
-        )
-        .unwrap();
+        admission::validate_parent_settlement_binding(&store, &signed_study, &proposal).unwrap();
         let parent_record = store
             .campaign_dispatch_record(&attempt.family_id, &attempt.operation_id().unwrap())
             .unwrap();
@@ -2690,18 +2688,10 @@ mod tests {
         target_attempt.request_sha256 = "c".repeat(64);
         target_attempt.policy_revision_id = format!("cex-search-policy-{}", "f".repeat(64));
         advanced_store
-            .reserve_campaign_attempt(
-                &parent_record.root,
-                &target_attempt,
-                chrono::Utc::now(),
-            )
+            .reserve_campaign_attempt(&parent_record.root, &target_attempt, chrono::Utc::now())
             .unwrap();
-        admission::validate_parent_settlement_binding(
-            &advanced_store,
-            &signed_study,
-            &proposal,
-        )
-        .unwrap();
+        admission::validate_parent_settlement_binding(&advanced_store, &signed_study, &proposal)
+            .unwrap();
         let mut substituted_root = proposal.clone();
         substituted_root.parent.root_grant_sha256 = "a".repeat(64);
         assert!(admission::validate_parent_settlement_binding(
@@ -2723,8 +2713,8 @@ mod tests {
     #[test]
     fn historical_parent_root_auth_accepts_expired_grants_but_rejects_signature_tamper() {
         use alpha_domain::campaign_control::{
-            sign_campaign_root_grant, verify_campaign_root_grant, CampaignFamilyPolicyV1,
-            CampaignRootBudgetV1, CampaignRootGrantV1, CampaignExecutionScope, ROOT_GRANT_SCHEMA,
+            sign_campaign_root_grant, verify_campaign_root_grant, CampaignExecutionScope,
+            CampaignFamilyPolicyV1, CampaignRootBudgetV1, CampaignRootGrantV1, ROOT_GRANT_SCHEMA,
         };
         use chrono::{Duration, Utc};
         use ed25519_dalek::SigningKey;
@@ -2771,10 +2761,8 @@ mod tests {
             expires_at: now - Duration::hours(1),
         };
         let signed = sign_campaign_root_grant(grant, "expired-operator".into(), &key).unwrap();
-        let trusted = std::collections::BTreeMap::from([(
-            "expired-operator".into(),
-            key.verifying_key(),
-        )]);
+        let trusted =
+            std::collections::BTreeMap::from([("expired-operator".into(), key.verifying_key())]);
         assert!(verify_campaign_root_grant(
             &signed,
             &trusted,
@@ -2902,10 +2890,9 @@ mod tests {
             terminal_job_uid: "parent-job".into(),
             terminal_pod_uid: "parent-pod".into(),
         };
-        let materialization: Value = serde_json::from_slice(
-            &std::fs::read(&fixture.inputs.materialization_path).unwrap(),
-        )
-        .unwrap();
+        let materialization: Value =
+            serde_json::from_slice(&std::fs::read(&fixture.inputs.materialization_path).unwrap())
+                .unwrap();
         let segments = materialization["source_segments"].as_array().unwrap();
         let target_window = CampaignNextFamilyInputWindowV1 {
             mission_id: materialization["mission_id"].as_str().unwrap().into(),
@@ -2952,7 +2939,11 @@ mod tests {
         target_control["approval_id"] = json!("dispatch-target-approval");
         target_control["campaign_inputs_path"] = json!("campaign-inputs.json");
         let target_control_path = fixture.inputs._root.path().join("target-control.json");
-        std::fs::write(&target_control_path, serde_json::to_vec(&target_control).unwrap()).unwrap();
+        std::fs::write(
+            &target_control_path,
+            serde_json::to_vec(&target_control).unwrap(),
+        )
+        .unwrap();
 
         let mut target_gate = admission::Admission::open(
             &target_control_path,
@@ -3001,7 +2992,11 @@ mod tests {
             .unwrap();
         drop(target_settlement);
 
-        let tampered_control_path = fixture.inputs._root.path().join("tampered-target-control.json");
+        let tampered_control_path = fixture
+            .inputs
+            ._root
+            .path()
+            .join("tampered-target-control.json");
         let mut tampered_control = target_control.clone();
         tampered_control["campaign_inputs_path"] = json!("tampered-inputs.json");
         std::fs::write(
@@ -3019,8 +3014,13 @@ mod tests {
         .is_err());
 
         let mut tampered_submission = target_validated.submission.clone();
-        tampered_submission.request.study_proposal.as_mut().unwrap().parent.root_grant_sha256 =
-            target_member.root_grant_sha256.clone();
+        tampered_submission
+            .request
+            .study_proposal
+            .as_mut()
+            .unwrap()
+            .parent
+            .root_grant_sha256 = target_member.root_grant_sha256.clone();
         let tampered_validated = validate_submission(tampered_submission).unwrap();
         let tampered_manifest = render_manifest(&tampered_validated, "monday-research").unwrap();
         assert!(admission::Admission::open(

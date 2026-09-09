@@ -13,11 +13,11 @@ use crate::{
     },
     mission_runner::{
         decode_materialization, execute_report, fetch_to_file, finalize_existing_search_round,
-        normalized_sha256,
-        publish_immutable_file, recover_execution_report_from_published_result, research_event,
-        valid_git_revision, validate_cex_holdout_id, validate_supervised_candidate_binding,
-        validate_supervised_replay_binding, CexEventReplayReceiptV1, CexSupervisedModelSelectionV1,
-        ExecutionBinding, CEX_SUPERVISED_MODEL_NAMES, MAX_RESULT_BUNDLE_BYTES,
+        normalized_sha256, publish_immutable_file, recover_execution_report_from_published_result,
+        research_event, valid_git_revision, validate_cex_holdout_id,
+        validate_supervised_candidate_binding, validate_supervised_replay_binding,
+        CexEventReplayReceiptV1, CexSupervisedModelSelectionV1, ExecutionBinding,
+        CEX_SUPERVISED_MODEL_NAMES, MAX_RESULT_BUNDLE_BYTES,
     },
     prediction_dispatch::{
         canonical_tokyo_oss_internal_object, cex_campaign_round_root,
@@ -776,12 +776,7 @@ pub fn propose_next_family(args: CampaignStudyProposeArgs) -> anyhow::Result<()>
     )?;
     plan.label_horizon = Some(horizon.clone());
     plan.validate()?;
-    if let Err(error) = validate_next_family_materialization(
-        &args,
-        member,
-        &target_window,
-        &plan,
-    ) {
+    if let Err(error) = validate_next_family_materialization(&args, member, &target_window, &plan) {
         return needs_authority(
             &format!("target_materialization_invalid:{error}"),
             Some(target_family_id.into()),
@@ -910,7 +905,9 @@ fn validate_next_family_materialization(
         args.target_seed,
         declared_trials,
     )?;
-    if rendered.mission.spec.evaluation_protocol.content_hash()? != member.execution.evaluation_protocol_sha256 {
+    if rendered.mission.spec.evaluation_protocol.content_hash()?
+        != member.execution.evaluation_protocol_sha256
+    {
         bail!("target materialization evaluation protocol is not predeclared by the Study member");
     }
     Ok(())
@@ -3260,10 +3257,7 @@ pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> 
         bail!("campaign request schema_version must be {CAMPAIGN_REQUEST_SCHEMA_V5}");
     }
     request.research_plan.validate()?;
-    validate_study_proposal_for_plan(
-        request.study_proposal.as_ref(),
-        &request.research_plan,
-    )?;
+    validate_study_proposal_for_plan(request.study_proposal.as_ref(), &request.research_plan)?;
     if let Some(proposal) = &request.study_proposal {
         if proposal.target_execution.campaign_inputs_sha256 != request.campaign_inputs_sha256 {
             bail!("next-family proposal input identity differs from the Campaign request");
