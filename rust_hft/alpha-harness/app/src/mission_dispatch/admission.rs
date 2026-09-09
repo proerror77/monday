@@ -462,6 +462,18 @@ impl Admission {
             &self.control.receipt_access,
             &mut transfer,
         )?;
+        if let Some(study_id) = self
+            .store
+            .campaign_study_id_for_family(&self.reservation.family_id)?
+        {
+            publish_study_receipts_with(
+                &mut self.store,
+                &study_id,
+                &self.receipt_origin,
+                &self.control.receipt_access,
+                &mut transfer,
+            )?;
+        }
         Ok(())
     }
 }
@@ -497,6 +509,45 @@ pub(super) fn publish_family_receipts_with(
             "campaign_ledger_receipt_readback_completed",
             serde_json::json!({
                 "family_id": family, "sequence": receipt.receipt.sequence,
+                "object_sha256": receipt.object_sha256()?,
+            }),
+        );
+    }
+    Ok(())
+}
+
+pub(super) fn publish_study_receipts_with(
+    store: &mut AlphaStore,
+    study_id: &str,
+    origin: &str,
+    access_map: &BTreeMap<String, ReceiptAccess>,
+    mut transfer: impl FnMut(&ReceiptAccess, &[u8]) -> anyhow::Result<Vec<u8>>,
+) -> anyhow::Result<()> {
+    let receipts = store.campaign_study_receipts(study_id)?;
+    for receipt in receipts {
+        let key = receipt.object_key();
+        let access = access_map.get(&key).with_context(|| {
+            format!("missing signed Study receipt access for {key}; reservation is retained")
+        })?;
+        validate_receipt_access(access, origin, &key)?;
+        let bytes = receipt.publication_bytes()?;
+        let observed =
+            transfer(access, &bytes).with_context(|| format!("Campaign Study receipt {key}"))?;
+        if observed != bytes {
+            bail!("immutable Study receipt readback differs from the local authenticated bytes");
+        }
+        store.acknowledge_campaign_study_receipt_readback(
+            study_id,
+            receipt.receipt.sequence,
+            &key,
+            &hex::encode(Sha256::digest(&observed)),
+        )?;
+        crate::mission_runner::research_event(
+            "alpha-harness",
+            "campaign_study_receipt_readback_completed",
+            serde_json::json!({
+                "study_id": study_id,
+                "sequence": receipt.receipt.sequence,
                 "object_sha256": receipt.object_sha256()?,
             }),
         );

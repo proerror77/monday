@@ -6,6 +6,7 @@
 
 mod dispatch;
 mod final_dispatch;
+mod study;
 pub use final_dispatch::{
     CampaignFinalDispatchClaimV1, CampaignFinalDispatchRecord, CampaignFinalDispatchSettlementV1,
     CampaignFinalOutcomeV1,
@@ -15,6 +16,10 @@ mod state;
 pub use dispatch::{
     CampaignDispatchClaimV1, CampaignDispatchRecord, CampaignDispatchSettlementV1,
     CampaignDispatchTargetV1,
+};
+pub use study::{
+    AuthenticatedCampaignStudyReceiptV1, CampaignStudyLedgerEventV1, CampaignStudyLedgerReceiptV1,
+    CampaignStudyMemberHeadV1, CampaignStudySnapshotV1,
 };
 
 use super::approval_revocations::{
@@ -29,6 +34,7 @@ use alpha_domain::campaign_control::{
     CampaignAttemptOutcomeV1, CampaignAttemptReservationV1, CampaignAttemptSettlementV1,
     SignedCampaignRootGrantV1, VerifiedCampaignRootGrant,
 };
+use alpha_domain::campaign_study::CampaignStudyMemberV1;
 use chrono::{DateTime, Utc};
 use duckdb::{params, Connection, Transaction};
 use serde::{Deserialize, Serialize};
@@ -52,6 +58,11 @@ pub enum CampaignLedgerEventV1 {
         verifying_key_hex: String,
         approval: ApprovalRecord,
         approval_content_sha256: String,
+    },
+    StudyMemberBound {
+        study_id: String,
+        study_grant_sha256: String,
+        member: CampaignStudyMemberV1,
     },
     AttemptReserved {
         reservation: CampaignAttemptReservationV1,
@@ -96,6 +107,11 @@ impl CampaignLedgerEventV1 {
         Ok(match self {
             Self::RootRegistered { signed, .. } => {
                 format!("campaign-root:{}", signed.grant.root_id)
+            }
+            Self::StudyMemberBound {
+                study_id, member, ..
+            } => {
+                format!("campaign-study-member:{study_id}:{}", member.family_id)
             }
             Self::AttemptReserved { reservation } => reservation.operation_id().map_err(err)?,
             Self::DispatchClaimed { operation_id, .. } => {
@@ -640,6 +656,16 @@ impl AlphaStore {
         }
         validate_approval(&approval, &hash, verified, at)?;
         let revocation = read_revocation_evidence(&tx, &self.integrity_key, approval_id)?;
+        // A family already bound to a finite study cannot acquire an
+        // unlisted root later; that would create a second budget authority.
+        let (family_state, _) = load(&tx, &self.integrity_key, &verified.grant().family.family_id)?;
+        if !family_state.roots.contains_key(verified.content_sha256()) {
+            study::reject_new_root_registration(
+                &tx,
+                &self.integrity_key,
+                &verified.grant().family.family_id,
+            )?;
+        }
         let event = CampaignLedgerEventV1::RootRegistered {
             signed: Box::new(verified.signed_grant().clone()),
             verifying_key_hex: hex::encode(verified.verifying_key().as_bytes()),
@@ -681,12 +707,15 @@ impl AlphaStore {
             .roots
             .get(verified.content_sha256())
             .ok_or_else(|| err("root is not registered"))?;
-        serialize_approval_mutation(&tx, &root.approval.approval_id)?;
+        let approval_id = root.approval.approval_id.clone();
+        serialize_approval_mutation(&tx, &approval_id)?;
         if !read_effective_approval(&tx, &self.integrity_key, &root.approval.approval_id)?
             .is_active_at(at)
         {
             return Err(err("root approval is not active"));
         }
+        let (study_id, _duplicate) =
+            study::prepare_member_reservation(&tx, &self.integrity_key, verified, reservation, at)?;
         let receipt = append(
             &tx,
             &self.integrity_key,
@@ -694,6 +723,14 @@ impl AlphaStore {
             CampaignLedgerEventV1::AttemptReserved {
                 reservation: reservation.clone(),
             },
+            at,
+        )?;
+        study::append_member_reservation(
+            &tx,
+            &self.integrity_key,
+            study_id.as_deref(),
+            reservation,
+            &receipt,
             at,
         )?;
         tx.commit().map_err(database_error)?;
@@ -710,6 +747,12 @@ impl AlphaStore {
         at: DateTime<Utc>,
     ) -> Result<AuthenticatedCampaignReceiptV1, StoreError> {
         let tx = self.connection.transaction().map_err(database_error)?;
+        let study_id = study::lock_member_settlement_guards(&tx, &self.integrity_key, family, at)?;
+        let prepared_study_id =
+            study::prepare_member_settlement(&tx, &self.integrity_key, family, settlement, at)?;
+        if study_id != prepared_study_id {
+            return Err(err("study settlement membership changed"));
+        }
         let receipt = append(
             &tx,
             &self.integrity_key,
@@ -717,6 +760,15 @@ impl AlphaStore {
             CampaignLedgerEventV1::AttemptSettled {
                 settlement: settlement.clone(),
             },
+            at,
+        )?;
+        study::append_member_settlement(
+            &tx,
+            &self.integrity_key,
+            study_id.as_deref(),
+            family,
+            settlement,
+            &receipt,
             at,
         )?;
         tx.commit().map_err(database_error)?;
@@ -774,6 +826,7 @@ impl AlphaStore {
     ) -> Result<(), StoreError> {
         validate_snapshot(snapshot, &self.integrity_key)?;
         let tx = self.connection.transaction().map_err(database_error)?;
+        study::reject_family_only_restore(&tx, &self.integrity_key, snapshot)?;
         let (mut state, old) = load(&tx, &self.integrity_key, &snapshot.family_id)?;
         if old.len() > snapshot.receipts.len() {
             return Err(err("stale snapshot would omit existing history"));
@@ -899,6 +952,10 @@ pub(crate) fn append_registered_campaign_revocation(
     approval: &ApprovalRecord,
     event: &ApprovalRevocationV1,
 ) -> Result<(), StoreError> {
+    if approval.approval_class == "campaign_study" {
+        study::append_registered_study_revocation(conn, key, approval, event)?;
+        return Ok(());
+    }
     if !matches!(
         approval.approval_class.as_str(),
         "campaign_root" | "campaign_final_evaluation"
@@ -2110,6 +2167,7 @@ mod tests {
             .iter()
             .map(|r| match r.receipt.event {
                 CampaignLedgerEventV1::RootRegistered { .. } => "root_registered",
+                CampaignLedgerEventV1::StudyMemberBound { .. } => "study_member_bound",
                 CampaignLedgerEventV1::AttemptReserved { .. } => "attempt_reserved",
                 CampaignLedgerEventV1::DispatchClaimed { .. } => "dispatch_claimed",
                 CampaignLedgerEventV1::DispatchJobBound { .. } => "dispatch_job_bound",

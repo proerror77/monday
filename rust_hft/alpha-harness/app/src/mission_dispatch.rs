@@ -1584,10 +1584,11 @@ mod tests {
     impl AdmissionFixture {
         fn new() -> Self {
             use alpha_domain::campaign_control::*;
+            use alpha_domain::campaign_study::*;
             use alpha_store::{AlphaStore, ApprovalRecord};
             use chrono::{TimeDelta, Utc};
             use ed25519_dalek::SigningKey;
-            use std::collections::BTreeSet;
+            use std::collections::{BTreeMap, BTreeSet};
             let inputs = crate::mission_render::tests::Fixture::canonical();
             let mut submission = valid_submission();
             submission.request = crate::mission_campaign::request_for_materialization_for_tests(
@@ -1663,17 +1664,85 @@ mod tests {
             };
             let mut store = AlphaStore::open(root.join("ledger.duckdb")).unwrap();
             store.record_approval(&approval).unwrap();
+            let verified_root = verify_campaign_root_grant(
+                &signed,
+                &BTreeMap::from([("operator".into(), signing_key.verifying_key())]),
+                now,
+            )
+            .unwrap();
+            store
+                .register_campaign_root(&verified_root, &approval.approval_id, now)
+                .unwrap();
+            let study_id = "dispatch-study-budget".to_string();
+            let study_grant = CampaignStudyGrantV1 {
+                schema_version: STUDY_GRANT_SCHEMA.into(),
+                study_id: study_id.clone(),
+                members: vec![CampaignStudyMemberV1 {
+                    family_id: signed.grant.family.family_id.clone(),
+                    root_grant_sha256: signed.content_sha256.clone(),
+                    family_definition_sha256: signed.grant.family.definition_sha256.clone(),
+                    family_max_trials: signed.grant.family.max_trials,
+                    execution_scope: signed.grant.execution_scope.clone(),
+                    execution: signed.grant.execution.clone(),
+                    label_horizon_sha256: "b".repeat(64),
+                }],
+                budget: CampaignStudyBudgetV1 {
+                    max_trials: 1000,
+                    max_job_attempts: 2,
+                    max_job_seconds: 100_000,
+                    max_llm_tokens: 0,
+                },
+                valid_from: signed.grant.valid_from,
+                expires_at: signed.grant.expires_at,
+            };
+            let study_key = SigningKey::from_bytes(&[23; 32]);
+            let signed_study =
+                sign_campaign_study_grant(study_grant, "study-operator".into(), &study_key)
+                    .unwrap();
+            let verified_study = verify_campaign_study_grant(
+                &signed_study,
+                &BTreeMap::from([("study-operator".into(), study_key.verifying_key())]),
+                now,
+            )
+            .unwrap();
+            let study_approval = ApprovalRecord {
+                approval_id: "dispatch-study-approval".into(),
+                approval_class: "campaign_study".into(),
+                subject_id: study_id.clone(),
+                payload: json!({
+                    "grant_sha256": verified_study.content_sha256(),
+                    "study_id": study_id,
+                }),
+                signer_id: Some("study-operator".into()),
+                valid_from: Some(signed.grant.valid_from),
+                expires_at: Some(signed.grant.expires_at),
+                revoked_at: None,
+                revoked_by: None,
+                revocation_reason: None,
+                created_at: signed.grant.valid_from,
+            };
+            store.record_approval(&study_approval).unwrap();
+            store
+                .register_campaign_study(&verified_study, &study_approval.approval_id, now)
+                .unwrap();
             drop(store);
             let origin =
                 reqwest::Url::parse(&validated.submission.request.campaign_result_readback_url)
                     .unwrap()
                     .origin()
                     .ascii_serialization();
-            let access = (1..=12).map(|sequence| {
+            let mut access = (1..=12).map(|sequence| {
                 let key = format!("research/campaign-ledger/family-id=dispatch-study/sequence={sequence:020}/receipt.json");
                 let url = format!("{origin}/{key}?signature=fixture-only");
                 (key, json!({"put_url": url, "readback_url": url}))
             }).collect::<serde_json::Map<String, Value>>();
+            for sequence in 1..=12 {
+                let key = format!(
+                    "research/campaign-ledger/study-id=dispatch-study-budget/sequence={sequence:020}/receipt.json"
+                );
+                let url = format!("{origin}/{key}?signature=fixture-only");
+                access.insert(key, json!({"put_url": url, "readback_url": url}));
+            }
             let control = root.join("control.json");
             std::fs::write(&control, serde_json::to_vec(&json!({
                 "schema_version": "monday.campaign_dispatch_control.v1",
@@ -1945,8 +2014,13 @@ mod tests {
             })
             .is_err());
         assert!(gate.claim().is_err());
-        gate.publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
-            .unwrap();
+        let mut published_receipt_count = 0;
+        gate.publish_receipts_with(|_, bytes| {
+            published_receipt_count += 1;
+            Ok(bytes.to_vec())
+        })
+        .unwrap();
+        assert_eq!(published_receipt_count, 5);
         let (_, first) = gate.claim().unwrap();
         assert!(first);
         let mut called = false;
@@ -2184,6 +2258,58 @@ mod tests {
         assert!(
             !transferred,
             "foreign bucket/key must fail before any transport"
+        );
+        assert!(gate.claim().is_err());
+    }
+
+    #[test]
+    fn study_receipt_publication_requires_exact_control_mapping() {
+        let fixture = AdmissionFixture::new();
+        let mut gate = fixture.open();
+        gate.prepare().unwrap();
+        let study_key = "research/campaign-ledger/study-id=dispatch-study-budget/sequence=00000000000000000001/receipt.json";
+        let mut control: Value =
+            serde_json::from_slice(&std::fs::read(&fixture.control).unwrap()).unwrap();
+        control["receipt_access"]
+            .as_object_mut()
+            .unwrap()
+            .remove(study_key)
+            .expect("fixture must provide Study registration access");
+        std::fs::write(&fixture.control, serde_json::to_vec(&control).unwrap()).unwrap();
+        drop(gate);
+        let mut gate = fixture.open();
+        let mut transferred = 0;
+        let error = gate
+            .publish_receipts_with(|_, bytes| {
+                transferred += 1;
+                Ok(bytes.to_vec())
+            })
+            .expect_err("missing Study receipt access must retain the reservation");
+        assert!(error.to_string().contains("Study receipt access"));
+        assert_eq!(transferred, 3, "family receipts are published first");
+        assert!(gate.claim().is_err());
+
+        let fixture = AdmissionFixture::new();
+        let mut gate = fixture.open();
+        gate.prepare().unwrap();
+        let mut control: Value =
+            serde_json::from_slice(&std::fs::read(&fixture.control).unwrap()).unwrap();
+        control["receipt_access"][study_key]["readback_url"] =
+            json!("https://other.oss-ap-northeast-1-internal.aliyuncs.com/receipt.json");
+        std::fs::write(&fixture.control, serde_json::to_vec(&control).unwrap()).unwrap();
+        drop(gate);
+        let mut gate = fixture.open();
+        let mut transferred = 0;
+        let error = gate
+            .publish_receipts_with(|_, bytes| {
+                transferred += 1;
+                Ok(bytes.to_vec())
+            })
+            .expect_err("Study receipt URL drift must retain the reservation");
+        assert!(error.to_string().contains("Campaign receipt URL"));
+        assert_eq!(
+            transferred, 3,
+            "foreign Study URL is rejected before transport"
         );
         assert!(gate.claim().is_err());
     }

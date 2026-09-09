@@ -40,6 +40,7 @@ const MIGRATION_002: &str = include_str!("../migrations/002_promotion_bundles.sq
 const MIGRATION_003: &str = include_str!("../migrations/003_loop_runs_and_engine_checkpoints.sql");
 const MIGRATION_004: &str = include_str!("../migrations/004_approval_revocations.sql");
 const MIGRATION_005: &str = include_str!("../migrations/005_campaign_family_ledger.sql");
+const MIGRATION_006: &str = include_str!("../migrations/006_campaign_study_ledger.sql");
 const INTEGRITY_KEY_ENV: &str = "ALPHA_STORE_INTEGRITY_KEY_HEX";
 const INTEGRITY_KEY_BYTES: usize = 32;
 const MISSION_EVALUATION_PROTOCOL_KIND: &str = "mission_evaluation_protocol";
@@ -608,6 +609,9 @@ impl AlphaStore {
             .map_err(database_error)?;
         self.connection
             .execute_batch(MIGRATION_005)
+            .map_err(database_error)?;
+        self.connection
+            .execute_batch(MIGRATION_006)
             .map_err(database_error)
     }
 
