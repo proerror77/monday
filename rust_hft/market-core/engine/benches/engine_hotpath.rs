@@ -46,6 +46,8 @@ fn bench_topn_aggregation(c: &mut Criterion) {
         sequence: 42,
         source_venue: None,
         timestamps: Default::default(),
+
+        provider_identity: None,
     };
 
     c.bench_function("TopN::update_from_snapshot+mid", |b| {
@@ -74,6 +76,7 @@ fn benchmark_snapshot(symbol: &Symbol) -> MarketSnapshot {
         sequence: 1,
         source_venue: Some(VenueId::BINANCE),
         timestamps: Default::default(),
+        provider_identity: None,
     }
 }
 

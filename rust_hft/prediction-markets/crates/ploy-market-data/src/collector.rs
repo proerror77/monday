@@ -1368,11 +1368,21 @@ async fn persist_book_updates(
         snapshot_insert.push_values(snapshot_jobs, |mut row, job| {
             row.push_bind("Crypto")
                 .push_bind(job.token_id.clone())
-                .push_bind(Option::<String>::None)
+                .push_bind(
+                    job.book
+                        .provider_identity
+                        .as_ref()
+                        .map(|identity| identity.market.clone()),
+                )
                 .push_bind(orderbook_levels_json(&job.book.bids))
                 .push_bind(orderbook_levels_json(&job.book.asks))
                 .push_bind(book_timestamp(job.book.timestamp))
-                .push_bind(Option::<String>::None)
+                .push_bind(
+                    job.book
+                        .provider_identity
+                        .as_ref()
+                        .and_then(|identity| identity.book_hash.clone()),
+                )
                 // Keep the established trusted source label; the implementation
                 // behind this sink is now the canonical adapter.
                 .push_bind("polymarket_ws_collector")

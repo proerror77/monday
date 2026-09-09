@@ -125,6 +125,7 @@ fn multiplex_market_events(
                         reason: invalidation.reason,
                         source_venue: Some(source_venue),
                         symbol: None,
+                        connection_started_at: None,
                     }));
                     if let Some(error) = invalidation.error {
                         yield Err(error);
@@ -1199,6 +1200,8 @@ mod tests {
             sequence: 100,
             source_venue: Some(hft_core::VenueId::BINANCE),
             timestamps: Default::default(),
+
+            provider_identity: None,
         }];
         let mut tracker = DepthSequenceTracker::from_snapshots(&snapshots, false);
         let update = |first_sequence, sequence| {
@@ -1237,6 +1240,8 @@ mod tests {
             sequence: 100,
             source_venue: Some(hft_core::VenueId::BINANCE),
             timestamps: Default::default(),
+
+            provider_identity: None,
         }];
         let update = |first_sequence, sequence| {
             MarketEvent::Update(BookUpdate {
@@ -1321,6 +1326,8 @@ mod tests {
                 sequence,
                 source_venue: Some(source_venue),
                 timestamps: Default::default(),
+
+                provider_identity: None,
             }))
         };
         data_tx

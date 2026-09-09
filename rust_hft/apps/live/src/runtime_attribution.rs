@@ -1378,6 +1378,8 @@ mod tests {
                 sequence: 1,
                 source_venue: Some(VenueId::BITGET),
                 timestamps: Default::default(),
+
+                provider_identity: None,
             };
             let mut topn = TopNSnapshot::new(Symbol::new(*symbol), 1);
             topn.update_from_snapshot(&snapshot);

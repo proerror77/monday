@@ -846,6 +846,8 @@ async fn shadow_activation_waits_for_market_then_produces_loop_consumable_eviden
             timestamps: hft_core::MarketDataTimestamps::local_only(
                 hft_core::LocalReceiveTimestamp::new(hft_core::now_micros()),
             ),
+
+            provider_identity: None,
         }))
         .unwrap();
 

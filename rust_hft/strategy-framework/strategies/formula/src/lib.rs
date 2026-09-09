@@ -1220,6 +1220,8 @@ mod tests {
             sequence: 1,
             source_venue: Some(VenueId::BITGET),
             timestamps: Default::default(),
+
+            provider_identity: None,
         })
     }
 
@@ -1388,6 +1390,7 @@ mod tests {
                 reason: "new book generation".into(),
                 source_venue: Some(VenueId::BITGET),
                 symbol: Some(Symbol::from("BTCUSDT")),
+                connection_started_at: None,
             },
             &account,
         );
@@ -1646,6 +1649,8 @@ mod tests {
             sequence: 1,
             source_venue: Some(VenueId::BITGET),
             timestamps: Default::default(),
+
+            provider_identity: None,
         };
         let fixed_bid_prices = bid_prices.map(|value| FixedPrice::from_f64(value as f64));
         let fixed_ask_prices = ask_prices.map(|value| FixedPrice::from_f64(value as f64));
@@ -2211,6 +2216,7 @@ mod tests {
                     reason: "depth generation invalidated".to_string(),
                     source_venue: Some(VenueId::BITGET),
                     symbol: Some(Symbol::from("BTCUSDT")),
+                    connection_started_at: None,
                 },
                 &account,
             )

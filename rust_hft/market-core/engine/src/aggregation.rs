@@ -627,6 +627,7 @@ impl AggregationEngine {
                             reason: "canonical book generation exhausted".into(),
                             source_venue: Some(venue),
                             symbol: Some(symbol),
+                            connection_started_at: None,
                         });
                         return;
                     };
@@ -685,6 +686,7 @@ impl AggregationEngine {
                         reason: format!("book update for {} has no source venue", symbol.as_str()),
                         source_venue: None,
                         symbol: Some(symbol.clone()),
+                        connection_started_at: None,
                     });
                     return;
                 };
@@ -699,6 +701,7 @@ impl AggregationEngine {
                         sequence: update.sequence,
                         source_venue: Some(venue),
                         timestamps: update.timestamps,
+                        provider_identity: None,
                     };
                     self.process_market_event_into(MarketEvent::Snapshot(snapshot), output_events);
                     return;
@@ -713,6 +716,7 @@ impl AggregationEngine {
                         ),
                         source_venue: Some(venue),
                         symbol: Some(symbol.clone()),
+                        connection_started_at: None,
                     });
                     return;
                 };
@@ -743,6 +747,7 @@ impl AggregationEngine {
                         ),
                         source_venue: Some(venue),
                         symbol: Some(symbol.clone()),
+                        connection_started_at: None,
                     });
                     return;
                 }
@@ -791,6 +796,7 @@ impl AggregationEngine {
                         reason: format!("BBO update for {} has no source venue", symbol.as_str()),
                         source_venue: None,
                         symbol: Some(symbol),
+                        connection_started_at: None,
                     });
                     return;
                 };
@@ -811,6 +817,7 @@ impl AggregationEngine {
                         reason: format!("invalid BBO update for {}:{}", venue, symbol.as_str()),
                         source_venue: Some(venue),
                         symbol: Some(symbol),
+                        connection_started_at: None,
                     });
                     return;
                 }
@@ -882,6 +889,7 @@ impl AggregationEngine {
                 reason,
                 source_venue,
                 symbol,
+                connection_started_at,
             } => {
                 let invalidated: Vec<VenueSymbol> = self
                     .orderbooks
@@ -911,6 +919,7 @@ impl AggregationEngine {
                     reason,
                     source_venue,
                     symbol,
+                    connection_started_at,
                 });
             }
 

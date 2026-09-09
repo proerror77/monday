@@ -181,6 +181,8 @@ impl ZeroCopyBitgetStream {
             sequence: 0, // Bitget 暫時沒有序列號
             source_venue: Some(VenueId::BITGET),
             timestamps: Default::default(),
+
+            provider_identity: None,
         })
     }
 
@@ -392,6 +394,8 @@ impl MessageHandler for ZeroCopyMessageHandler {
                         sequence: 0,
                         source_venue: Some(VenueId::BITGET),
                         timestamps: Default::default(),
+
+                        provider_identity: None,
                     };
 
                     let event = MarketEvent::Snapshot(snapshot);
@@ -486,6 +490,7 @@ impl MessageHandler for ZeroCopyMessageHandler {
             reason: "Connection lost".to_string(),
             source_venue: Some(hft_core::VenueId::BITGET),
             symbol: None,
+            connection_started_at: None,
         };
 
         self.send_event(disconnect_event);

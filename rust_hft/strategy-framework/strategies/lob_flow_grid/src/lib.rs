@@ -1009,6 +1009,8 @@ mod tests {
             sequence: 1,
             source_venue: Some(VenueId::ASTERDEX),
             timestamps: Default::default(),
+
+            provider_identity: None,
         };
 
         strategy.handle_snapshot(&snapshot.bids, &snapshot.asks, snapshot.timestamp);

@@ -133,6 +133,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             bids: vec![BookLevel::new_unchecked(binance_price, 0.1)],
             asks: vec![BookLevel::new_unchecked(binance_price + 1.0, 0.1)],
             sequence: i as u64 + 1,
+
+            provider_identity: None,
         };
 
         // Bitget 快照
@@ -142,6 +144,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             bids: vec![BookLevel::new_unchecked(bitget_price, 0.1)],
             asks: vec![BookLevel::new_unchecked(bitget_price + 1.0, 0.1)],
             sequence: i as u64 + 1,
+
+            provider_identity: None,
         };
 
         // 處理兩個快照

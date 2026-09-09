@@ -1001,6 +1001,19 @@ fn publish_failure_once(
     true
 }
 
+fn connection_started_at(event: &MarketEvent) -> Option<DateTime<Utc>> {
+    let MarketEvent::Disconnect {
+        connection_started_at: Some(timestamp),
+        ..
+    } = event
+    else {
+        return None;
+    };
+    i64::try_from(*timestamp)
+        .ok()
+        .and_then(DateTime::from_timestamp_micros)
+}
+
 /// Publish canonical Polymarket CLOB snapshots and post-snapshot deltas into the
 /// legacy MarketUpdate::Quote broadcast contract.
 ///
@@ -1021,7 +1034,7 @@ pub fn spawn_polymarket_market_stream_until(
             if stop_at.is_some_and(|deadline| Utc::now() >= deadline) {
                 return;
             }
-            let request_started_at = Utc::now();
+            let subscription_started_at = Utc::now();
             let adapter = PolymarketMarketStream::new();
             let mut stream = match adapter.subscribe(symbols.clone()).await {
                 Ok(stream) => stream,
@@ -1030,7 +1043,7 @@ pub fn spawn_polymarket_market_stream_until(
                     if !send_quote_collection_failure_and_empty(
                         &tx,
                         &token_ids,
-                        request_started_at,
+                        subscription_started_at,
                         "canonical_subscribe",
                     ) {
                         return;
@@ -1041,6 +1054,7 @@ pub fn spawn_polymarket_market_stream_until(
             };
             let mut books_by_token: HashMap<String, PolymarketBook> = HashMap::new();
             let mut failed_closed = false;
+            let mut active_connection_started_at = subscription_started_at;
             let stop = async {
                 match stop_at {
                     Some(deadline) => {
@@ -1056,7 +1070,11 @@ pub fn spawn_polymarket_market_stream_until(
                 tokio::select! {
                     _ = &mut stop => return,
                     event = stream.next() => match event {
-                        Some(Ok(event)) => match event {
+                        Some(Ok(event)) => {
+                            if let Some(started_at) = connection_started_at(&event) {
+                                active_connection_started_at = started_at;
+                            }
+                            match event {
                             MarketEvent::Snapshot(_) | MarketEvent::Update(_) => {
                                 match canonical_quote_event(&event, &mut books_by_token) {
                                     Ok(Some(update)) => {
@@ -1074,7 +1092,7 @@ pub fn spawn_polymarket_market_stream_until(
                                         if !publish_failure_once(
                                             &tx,
                                             &token_ids,
-                                            request_started_at,
+                                            active_connection_started_at,
                                             "canonical_book",
                                             &mut failed_closed,
                                         ) {
@@ -1090,7 +1108,7 @@ pub fn spawn_polymarket_market_stream_until(
                                     if !send_quote_collection_failure_and_empty(
                                         &tx,
                                         &token_ids,
-                                        request_started_at,
+                                        active_connection_started_at,
                                         "canonical_book",
                                     ) {
                                         return;
@@ -1101,7 +1119,7 @@ pub fn spawn_polymarket_market_stream_until(
                                     if !publish_failure_once(
                                         &tx,
                                         &token_ids,
-                                        request_started_at,
+                                        active_connection_started_at,
                                         "canonical_disconnect",
                                         &mut failed_closed,
                                     ) {
@@ -1113,14 +1131,15 @@ pub fn spawn_polymarket_market_stream_until(
                             MarketEvent::Quote(_)
                             | MarketEvent::Bar(_)
                             | MarketEvent::Arbitrage(_) => {}
-                        },
+                        }
+                    },
                         Some(Err(error)) => {
                             books_by_token.clear();
                             warn!(error = %error, "Canonical Polymarket market stream error");
                             if !publish_failure_once(
                                 &tx,
                                 &token_ids,
-                                request_started_at,
+                                active_connection_started_at,
                                 "canonical_stream_error",
                                 &mut failed_closed,
                             ) {
@@ -1132,7 +1151,7 @@ pub fn spawn_polymarket_market_stream_until(
                             if !publish_failure_once(
                                 &tx,
                                 &token_ids,
-                                request_started_at,
+                                active_connection_started_at,
                                 "canonical_stream_ended",
                                 &mut failed_closed,
                             ) {
@@ -1602,9 +1621,9 @@ fn parse_agg_trade_msg(v: &serde_json::Value) -> Option<AggTradeMsg> {
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_quote_event, db_polymarket_poll_intervals, equity_price_subscription,
-        l2_updates_from_book, mark_db_event_expired_if_resolved, parse_agg_trade_msg,
-        parse_equity_price_payload, rtds_market_data_ws_config,
+        canonical_quote_event, connection_started_at, db_polymarket_poll_intervals,
+        equity_price_subscription, l2_updates_from_book, mark_db_event_expired_if_resolved,
+        parse_agg_trade_msg, parse_equity_price_payload, rtds_market_data_ws_config,
         send_quote_collection_failure_and_empty,
     };
     use adapter_polymarket_data::{
@@ -1654,6 +1673,8 @@ mod tests {
             sequence: 1,
             source_venue: Some(VenueId::POLYMARKET),
             timestamps: Default::default(),
+
+            provider_identity: None,
         });
         let mut books = HashMap::new();
 
@@ -1710,6 +1731,7 @@ mod tests {
                 reason: "test".to_string(),
                 source_venue: Some(VenueId::POLYMARKET),
                 symbol: None,
+                connection_started_at: None,
             },
             &mut books,
         )
@@ -1752,6 +1774,8 @@ mod tests {
                 sequence: 1,
                 source_venue: Some(VenueId::POLYMARKET),
                 timestamps: Default::default(),
+
+                provider_identity: None,
             });
             canonical_quote_event(&event, &mut books)
                 .unwrap()
@@ -1763,6 +1787,7 @@ mod tests {
                 reason: "token BBA mismatch".to_string(),
                 source_venue: Some(VenueId::POLYMARKET),
                 symbol: Some(Symbol::new("123")),
+                connection_started_at: None,
             },
             &mut books,
         )
@@ -1796,6 +1821,21 @@ mod tests {
                 ..
             } if bid_levels.is_empty() && ask_levels.is_empty()
         ));
+    }
+
+    #[test]
+    fn canonical_disconnect_keeps_the_adapter_connection_start_for_failure_evidence() {
+        let started_at = 1_712_205_600_123_000;
+        let event = CanonicalMarketEvent::Disconnect {
+            reason: "reconnect".to_string(),
+            source_venue: Some(VenueId::POLYMARKET),
+            symbol: None,
+            connection_started_at: Some(started_at),
+        };
+        assert_eq!(
+            connection_started_at(&event),
+            chrono::DateTime::from_timestamp_micros(started_at as i64)
+        );
     }
 
     #[test]

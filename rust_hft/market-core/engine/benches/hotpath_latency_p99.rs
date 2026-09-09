@@ -89,6 +89,8 @@ fn quote_to_worker_queue_p99_stays_below_budget() {
                 sequence,
                 source_venue: Some(VenueId::BINANCE),
                 timestamps: Default::default(),
+
+                provider_identity: None,
             }))
             .unwrap();
         engine.tick().unwrap();

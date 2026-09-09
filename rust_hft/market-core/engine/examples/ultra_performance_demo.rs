@@ -81,6 +81,8 @@ fn demo_ultra_ingester() {
         sequence: 1,
         source_venue: None,
         timestamps: Default::default(),
+
+        provider_identity: None,
     };
 
     // 測量 ingest_fast 性能
@@ -139,6 +141,8 @@ fn demo_batch_operations() {
                 sequence: i as u64,
                 source_venue: None,
                 timestamps: Default::default(),
+
+                provider_identity: None,
             })
         })
         .collect();

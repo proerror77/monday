@@ -28,6 +28,7 @@ pub use hft_core::{
 };
 pub use ports::{
     BookLevel, BookUpdate, BoxStream, ConnectionHealth, MarketEvent, MarketSnapshot, MarketStream,
+    ProviderBookIdentity,
 };
 
 pub const DEFAULT_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com";
@@ -136,6 +137,7 @@ pub struct PolymarketBook {
     sequence: u64,
     ready: bool,
     dirty: bool,
+    provider_identity: Option<ProviderBookIdentity>,
 }
 
 impl PolymarketBook {
@@ -182,10 +184,17 @@ impl PolymarketBook {
     fn apply_levels(
         levels: &[BookLevel],
         target: &mut BTreeMap<rust_decimal::Decimal, rust_decimal::Decimal>,
+        allow_deletions: bool,
     ) -> HftResult<()> {
         for level in levels {
             Self::validate_level(level)?;
             if level.quantity.0.is_zero() {
+                if !allow_deletions {
+                    return Err(HftError::Parse(format!(
+                        "Polymarket full snapshot contains a zero-size level price={}",
+                        level.price
+                    )));
+                }
                 target.remove(&level.price.0);
             } else {
                 target.insert(level.price.0, level.quantity.0);
@@ -281,6 +290,7 @@ impl PolymarketBook {
             sequence,
             source_venue,
             timestamps,
+            provider_identity: self.provider_identity.clone(),
         }
     }
 
@@ -295,8 +305,8 @@ impl PolymarketBook {
             MarketEvent::Snapshot(snapshot) => {
                 let mut bids = BTreeMap::new();
                 let mut asks = BTreeMap::new();
-                Self::apply_levels(&snapshot.bids, &mut bids)?;
-                Self::apply_levels(&snapshot.asks, &mut asks)?;
+                Self::apply_levels(&snapshot.bids, &mut bids, false)?;
+                Self::apply_levels(&snapshot.asks, &mut asks, false)?;
                 Self::validate_not_crossed(&bids, &asks)?;
                 self.symbol = Some(snapshot.symbol.clone());
                 self.bids = bids;
@@ -304,6 +314,7 @@ impl PolymarketBook {
                 self.sequence = snapshot.sequence;
                 self.ready = true;
                 self.dirty = false;
+                self.provider_identity = snapshot.provider_identity.clone();
                 Ok(Some(self.snapshot(
                     snapshot.timestamp,
                     snapshot.sequence,
@@ -333,12 +344,18 @@ impl PolymarketBook {
                 }
                 let mut bids = self.bids.clone();
                 let mut asks = self.asks.clone();
-                Self::apply_levels(&update.bids, &mut bids)?;
-                Self::apply_levels(&update.asks, &mut asks)?;
+                Self::apply_levels(&update.bids, &mut bids, true)?;
+                Self::apply_levels(&update.asks, &mut asks, true)?;
                 Self::validate_not_crossed(&bids, &asks)?;
                 self.bids = bids;
                 self.asks = asks;
                 self.sequence = update.sequence;
+                if let Some(identity) = self.provider_identity.as_mut() {
+                    // The provider hash belongs to the preceding full book
+                    // image. A delta changes that image, so never stamp the
+                    // old hash onto a newly projected snapshot.
+                    identity.book_hash = None;
+                }
                 Ok(Some(self.snapshot(
                     update.timestamp,
                     update.sequence,
@@ -402,8 +419,8 @@ impl PolymarketBook {
 
         let mut bids = self.bids.clone();
         let mut asks = self.asks.clone();
-        Self::apply_levels(&update.bids, &mut bids)?;
-        Self::apply_levels(&update.asks, &mut asks)?;
+        Self::apply_levels(&update.bids, &mut bids, true)?;
+        Self::apply_levels(&update.asks, &mut asks, true)?;
         if !Self::reconcile_reported_bba(&mut bids, &mut asks, best_bid, best_ask) {
             self.invalidate();
             return Ok(None);
@@ -412,6 +429,11 @@ impl PolymarketBook {
         self.bids = bids;
         self.asks = asks;
         self.sequence = update.sequence;
+        if let Some(identity) = self.provider_identity.as_mut() {
+            // A price-change batch is a delta; the prior full-book hash no
+            // longer authenticates the resulting depth image.
+            identity.book_hash = None;
+        }
         Ok(Some(self.snapshot(
             update.timestamp,
             update.sequence,
@@ -669,10 +691,18 @@ fn capture_crossed_failure(path: Option<&Path>, payload: &[u8], error: &HftError
 }
 
 fn venue_disconnect(reason: impl Into<String>) -> MarketEvent {
+    venue_disconnect_at(reason, None)
+}
+
+fn venue_disconnect_at(
+    reason: impl Into<String>,
+    connection_started_at: Option<u64>,
+) -> MarketEvent {
     MarketEvent::Disconnect {
         reason: reason.into(),
         source_venue: Some(VenueId::POLYMARKET),
         symbol: None,
+        connection_started_at,
     }
 }
 
@@ -681,7 +711,32 @@ fn token_disconnect(symbol: Symbol, reason: impl Into<String>) -> MarketEvent {
         reason: reason.into(),
         source_venue: Some(VenueId::POLYMARKET),
         symbol: Some(symbol),
+        connection_started_at: None,
     }
+}
+
+fn with_connection_start(event: MarketEvent, connection_started_at: u64) -> MarketEvent {
+    match event {
+        MarketEvent::Disconnect {
+            reason,
+            source_venue,
+            symbol,
+            ..
+        } => MarketEvent::Disconnect {
+            reason,
+            source_venue,
+            symbol,
+            connection_started_at: Some(connection_started_at),
+        },
+        event => event,
+    }
+}
+
+fn reconnect_reason_for_events(events: &[MarketEvent]) -> Option<String> {
+    events
+        .iter()
+        .any(|event| matches!(event, MarketEvent::Disconnect { .. }))
+        .then(|| "a token invalidation requires a venue-wide resync".to_string())
 }
 
 struct PriceChangeBatch {
@@ -712,6 +767,22 @@ fn convert_message(
                 return Ok(Vec::new());
             };
             let timestamp = timestamp_micros(book.timestamp)?;
+            let provider_identity = Some(ProviderBookIdentity {
+                market: book.market.to_string(),
+                book_hash: book.hash.clone(),
+            });
+            let healthy = state
+                .books
+                .get(&token)
+                .is_some_and(|current| current.is_ready() && !current.is_dirty());
+            if healthy
+                && state
+                    .timestamps
+                    .get(&token)
+                    .is_some_and(|last_timestamp| book.timestamp < *last_timestamp)
+            {
+                return Ok(Vec::new());
+            }
             let mut bids = book
                 .bids
                 .into_iter()
@@ -733,6 +804,7 @@ fn convert_message(
                 sequence,
                 source_venue: Some(VenueId::POLYMARKET),
                 timestamps: Default::default(),
+                provider_identity,
             });
             state
                 .books
@@ -747,6 +819,7 @@ fn convert_message(
         WsMessage::PriceChange(change) => {
             let timestamp_ms = change.timestamp;
             let timestamp = timestamp_micros(timestamp_ms)?;
+            let provider_market = change.market.to_string();
             for entry in &change.price_changes {
                 if entry.size.is_none() {
                     return Ok(vec![venue_disconnect(format!(
@@ -755,6 +828,21 @@ fn convert_message(
                     ))]);
                 }
                 validate_price_change(entry)?;
+                let token = entry.asset_id.to_string();
+                let Some(book) = state.books.get(&token) else {
+                    continue;
+                };
+                let Some(identity) = book.provider_identity.as_ref() else {
+                    return Err(HftError::Parse(format!(
+                        "Polymarket delta has no canonical seed market for {token}"
+                    )));
+                };
+                if identity.market != provider_market {
+                    return Err(HftError::Parse(format!(
+                        "Polymarket delta market changed for {token}: expected {}, received {}",
+                        identity.market, provider_market
+                    )));
+                }
             }
 
             let mut batches = Vec::new();
@@ -960,10 +1048,24 @@ impl MarketStream for PolymarketMarketStream {
             };
             let mut book_state = BookState::default();
             while active() {
+                // A long-lived stream may reconnect internally. Capture the
+                // start of each physical connection attempt so downstream
+                // failure evidence never reuses the outer subscription time.
+                let connection_started_at = hft_core::now_micros();
                 let (mut ws, _) = match connect_async(&ws_url).await {
                     Ok(connection) => connection,
                     Err(error) => {
                         if !active() {
+                            return;
+                        }
+                        if tx
+                            .send(Ok(venue_disconnect_at(
+                                format!("Polymarket market WebSocket connect failed: {error}"),
+                                Some(connection_started_at),
+                            )))
+                            .await
+                            .is_err()
+                        {
                             return;
                         }
                         if tx
@@ -984,6 +1086,16 @@ impl MarketStream for PolymarketMarketStream {
                 }
                 if let Err(error) = ws.send(Message::Text(request.clone().into())).await {
                     if !active() {
+                        return;
+                    }
+                    if tx
+                        .send(Ok(venue_disconnect_at(
+                            format!("Polymarket market subscription failed: {error}"),
+                            Some(connection_started_at),
+                        )))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                     if tx
@@ -1036,19 +1148,40 @@ impl MarketStream for PolymarketMarketStream {
                                             }
                                             match convert_message(message, &symbols, &mut book_state) {
                                                 Ok(events) => {
-                                                    let reconnect = events.iter().any(|event| {
-                                                        matches!(event, MarketEvent::Disconnect { .. })
-                                                    });
+                                                    let has_global_disconnect = events.iter().any(
+                                                        |event| {
+                                                            matches!(
+                                                                event,
+                                                                MarketEvent::Disconnect {
+                                                                    symbol: None,
+                                                                    ..
+                                                                }
+                                                            )
+                                                        },
+                                                    );
+                                                    let reconnect_reason = reconnect_reason_for_events(&events);
                                                     for event in events {
                                                         if !active() {
                                                             break 'socket None;
                                                         }
+                                                        let event = if reconnect_reason.is_some() {
+                                                            with_connection_start(
+                                                                event,
+                                                                connection_started_at,
+                                                            )
+                                                        } else {
+                                                            event
+                                                        };
                                                         if tx.send(Ok(event)).await.is_err() {
                                                             return;
                                                         }
                                                     }
-                                                    if reconnect {
-                                                        break 'socket None;
+                                                    if reconnect_reason.is_some() {
+                                                        break 'socket if has_global_disconnect {
+                                                            None
+                                                        } else {
+                                                            reconnect_reason
+                                                        };
                                                     }
                                                 }
                                                 Err(error) => {
@@ -1058,10 +1191,20 @@ impl MarketStream for PolymarketMarketStream {
                                                         &error,
                                                     );
                                                     let reason = format!("invalid market message: {error}");
+                                                    if tx
+                                                        .send(Ok(venue_disconnect_at(
+                                                            reason.clone(),
+                                                            Some(connection_started_at),
+                                                        )))
+                                                        .await
+                                                        .is_err()
+                                                    {
+                                                        return;
+                                                    }
                                                     if tx.send(Err(error)).await.is_err() {
                                                         return;
                                                     }
-                                                    break 'socket Some(reason);
+                                                    break 'socket None;
                                                 }
                                             }
                                         }
@@ -1073,10 +1216,20 @@ impl MarketStream for PolymarketMarketStream {
                                             &error,
                                         );
                                         let reason = format!("invalid market frame: {error}");
+                                        if tx
+                                            .send(Ok(venue_disconnect_at(
+                                                reason.clone(),
+                                                Some(connection_started_at),
+                                            )))
+                                            .await
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
                                         if tx.send(Err(error)).await.is_err() {
                                             return;
                                         }
-                                        break 'socket Some(reason);
+                                        break 'socket None;
                                     }
                                 }
                             }
@@ -1104,9 +1257,10 @@ impl MarketStream for PolymarketMarketStream {
                 if active() {
                     if let Some(reason) = reason {
                         if tx
-                            .send(Ok(venue_disconnect(format!(
-                                "Polymarket market WebSocket disconnected: {reason}"
-                            ))))
+                            .send(Ok(venue_disconnect_at(
+                                format!("Polymarket market WebSocket disconnected: {reason}"),
+                                Some(connection_started_at),
+                            )))
                             .await
                             .is_err()
                         {
@@ -1189,6 +1343,7 @@ mod tests {
             sequence,
             source_venue: Some(VenueId::POLYMARKET),
             timestamps: Default::default(),
+            provider_identity: None,
         })
     }
 
@@ -1240,6 +1395,85 @@ mod tests {
         book.apply(&venue_disconnect("test")).unwrap();
         assert!(!book.is_ready());
         assert!(book.apply(&delta).is_err());
+    }
+
+    #[test]
+    fn full_snapshot_zero_size_is_rejected_without_ready_or_dirty_drift() {
+        let mut book = PolymarketBook::default();
+        let invalid_snapshot = MarketEvent::Snapshot(MarketSnapshot {
+            symbol: Symbol::new("123"),
+            timestamp: 1_000,
+            bids: vec![BookLevel {
+                price: Price(Decimal::new(4, 1)),
+                quantity: Quantity(Decimal::ZERO),
+            }],
+            asks: vec![BookLevel::new(0.6, 3.0).unwrap()],
+            sequence: 1,
+            source_venue: Some(VenueId::POLYMARKET),
+            timestamps: Default::default(),
+            provider_identity: None,
+        });
+        assert!(book.apply(&invalid_snapshot).is_err());
+        assert!(!book.is_ready());
+        assert!(!book.is_dirty());
+
+        book.apply(&canonical_snapshot(1)).unwrap();
+        book.invalidate();
+        assert!(book.is_dirty());
+        assert!(book.apply(&invalid_snapshot).is_err());
+        assert!(!book.is_ready());
+        assert!(book.is_dirty());
+        book.apply(&canonical_snapshot(2)).unwrap();
+        assert!(book.is_ready());
+        assert!(!book.is_dirty());
+    }
+
+    #[test]
+    fn provider_hash_is_cleared_after_a_delta_changes_the_book() {
+        let identity = ProviderBookIdentity {
+            market: "0xmarket".to_string(),
+            book_hash: Some("snapshot-hash".to_string()),
+        };
+        let mut book = PolymarketBook::default();
+        let snapshot = MarketEvent::Snapshot(MarketSnapshot {
+            symbol: Symbol::new("123"),
+            timestamp: 1_000,
+            bids: vec![BookLevel::new(0.4, 2.0).unwrap()],
+            asks: vec![BookLevel::new(0.6, 3.0).unwrap()],
+            sequence: 1,
+            source_venue: Some(VenueId::POLYMARKET),
+            timestamps: Default::default(),
+            provider_identity: Some(identity.clone()),
+        });
+        let projected = book.apply(&snapshot).unwrap().unwrap();
+        assert_eq!(projected.provider_identity, Some(identity.clone()));
+
+        let delta = MarketEvent::Update(BookUpdate {
+            symbol: Symbol::new("123"),
+            timestamp: 1_001_000,
+            bids: vec![BookLevel::new(0.5, 4.0).unwrap()],
+            asks: Vec::new(),
+            first_sequence: None,
+            sequence: 2,
+            is_snapshot: false,
+            source_venue: Some(VenueId::POLYMARKET),
+            timestamps: Default::default(),
+        });
+        let projected = book.apply(&delta).unwrap().unwrap();
+        assert_eq!(
+            projected
+                .provider_identity
+                .as_ref()
+                .map(|value| value.market.as_str()),
+            Some("0xmarket")
+        );
+        assert_eq!(
+            projected
+                .provider_identity
+                .as_ref()
+                .and_then(|value| value.book_hash.as_deref()),
+            None
+        );
     }
 
     #[test]
@@ -1465,6 +1699,105 @@ mod tests {
     }
 
     #[test]
+    fn stale_snapshot_is_ignored_for_a_healthy_token() {
+        let symbols = symbols();
+        let mut state = BookState::default();
+        let initial = parse_one(
+            r#"{"event_type":"book","asset_id":"123","market":"$MARKET","timestamp":"1000","bids":[{"price":"0.4","size":"2"}],"asks":[{"price":"0.6","size":"3"}]}"#,
+        );
+        convert_message(initial, &symbols, &mut state).unwrap();
+        let delta = parse_one(
+            r#"{"event_type":"price_change","market":"$MARKET","timestamp":"2000","price_changes":[{"asset_id":"123","price":"0.5","size":"4","side":"BUY","best_bid":"0.5","best_ask":"0.6"}]}"#,
+        );
+        assert!(matches!(
+            convert_message(delta, &symbols, &mut state)
+                .unwrap()
+                .as_slice(),
+            [MarketEvent::Update(_)]
+        ));
+        let stale = parse_one(
+            r#"{"event_type":"book","asset_id":"123","market":"$MARKET","timestamp":"1500","bids":[{"price":"0.2","size":"99"}],"asks":[{"price":"0.8","size":"99"}]}"#,
+        );
+        assert!(convert_message(stale, &symbols, &mut state)
+            .unwrap()
+            .is_empty());
+        assert_eq!(state.timestamps["123"], 2_000);
+        assert!(state.books["123"].bids.contains_key(&Decimal::new(5, 1)));
+        assert!(state.books["123"].is_ready());
+    }
+
+    #[test]
+    fn same_millisecond_snapshot_with_distinct_depth_replaces_healthy_state() {
+        let symbols = symbols();
+        let mut state = BookState::default();
+        let initial = parse_one(
+            r#"{"event_type":"book","asset_id":"123","market":"$MARKET","timestamp":"1000","bids":[{"price":"0.4","size":"2"}],"asks":[{"price":"0.6","size":"3"}]}"#,
+        );
+        convert_message(initial, &symbols, &mut state).unwrap();
+        let same_time = parse_one(
+            r#"{"event_type":"book","asset_id":"123","market":"$MARKET","timestamp":"1000","bids":[{"price":"0.5","size":"4"}],"asks":[{"price":"0.7","size":"5"}]}"#,
+        );
+        let events = convert_message(same_time, &symbols, &mut state).unwrap();
+        assert!(matches!(events.as_slice(), [MarketEvent::Snapshot(_)]));
+        assert!(state.books["123"].bids.contains_key(&Decimal::new(5, 1)));
+        assert!(!state.books["123"].bids.contains_key(&Decimal::new(4, 1)));
+        assert_eq!(state.sequences["123"], 2);
+        assert_eq!(state.timestamps["123"], 1_000);
+    }
+
+    #[test]
+    fn dirty_token_accepts_a_new_snapshot_seed_and_clears_dirty_state() {
+        let symbols = symbols();
+        let mut state = BookState::default();
+        let initial = parse_one(
+            r#"{"event_type":"book","asset_id":"123","market":"$MARKET","timestamp":"2000","bids":[{"price":"0.4","size":"2"}],"asks":[{"price":"0.6","size":"3"}]}"#,
+        );
+        convert_message(initial, &symbols, &mut state).unwrap();
+        let dirty = parse_one(
+            r#"{"event_type":"price_change","market":"$MARKET","timestamp":"3000","price_changes":[{"asset_id":"123","price":"0.4","size":"0","side":"BUY","best_bid":"0.01","best_ask":"0.6"}]}"#,
+        );
+        assert!(matches!(
+            convert_message(dirty, &symbols, &mut state)
+                .unwrap()
+                .as_slice(),
+            [MarketEvent::Disconnect {
+                symbol: Some(_),
+                ..
+            }]
+        ));
+        assert!(state.books["123"].is_dirty());
+
+        let recovery = parse_one(
+            r#"{"event_type":"book","asset_id":"123","market":"$MARKET","timestamp":"1500","bids":[{"price":"0.3","size":"7"}],"asks":[{"price":"0.7","size":"8"}]}"#,
+        );
+        let events = convert_message(recovery, &symbols, &mut state).unwrap();
+        assert!(matches!(events.as_slice(), [MarketEvent::Snapshot(_)]));
+        assert_eq!(state.timestamps["123"], 1_500);
+        assert!(state.books["123"].is_ready());
+        assert!(!state.books["123"].is_dirty());
+        assert!(state.books["123"].bids.contains_key(&Decimal::new(3, 1)));
+    }
+
+    #[test]
+    fn delta_from_a_different_provider_market_is_rejected_without_mutation() {
+        let symbols = symbols();
+        let mut state = BookState::default();
+        let initial = parse_one(
+            r#"{"event_type":"book","asset_id":"123","market":"$MARKET","timestamp":"1000","bids":[{"price":"0.4","size":"2"}],"asks":[{"price":"0.6","size":"3"}]}"#,
+        );
+        convert_message(initial, &symbols, &mut state).unwrap();
+        let wrong_market = parse_one(
+            r#"{"event_type":"price_change","market":"0x0000000000000000000000000000000000000000000000000000000000000001","timestamp":"2000","price_changes":[{"asset_id":"123","price":"0.5","size":"4","side":"BUY","best_bid":"0.5","best_ask":"0.6"}]}"#,
+        );
+        assert!(convert_message(wrong_market, &symbols, &mut state).is_err());
+        assert_eq!(state.sequences["123"], 1);
+        assert_eq!(state.timestamps["123"], 1_000);
+        assert!(state.books["123"].bids.contains_key(&Decimal::new(4, 1)));
+        assert!(!state.books["123"].bids.contains_key(&Decimal::new(5, 1)));
+        assert!(state.books["123"].is_ready());
+    }
+
+    #[test]
     fn accepts_canonical_long_token_ids_without_lossy_conversion() {
         let token =
             "106585164761922456203746651621390029417453862034640469075081961934906147433548";
@@ -1487,6 +1820,10 @@ mod tests {
                 sequence: state.next_sequence(token),
                 source_venue: Some(VenueId::POLYMARKET),
                 timestamps: Default::default(),
+                provider_identity: Some(ProviderBookIdentity {
+                    market: polymarket_client_sdk::types::B256::ZERO.to_string(),
+                    book_hash: None,
+                }),
             });
             state
                 .books
@@ -1517,7 +1854,7 @@ mod tests {
     fn snapshot_delta_delete_and_reconnect_gate_are_lossless() {
         let mut state = BookState::default();
         let book = parse_one(
-            r#"{"event_type":"book","asset_id":"123","market":"$MARKET","timestamp":"1000","bids":[{"price":"0.4","size":"2"},{"price":"0.5","size":"1"}],"asks":[{"price":"0.7","size":"3"},{"price":"0.6","size":"4"}]}"#,
+            r#"{"event_type":"book","asset_id":"123","market":"$MARKET","timestamp":"1000","hash":"snapshot-hash","bids":[{"price":"0.4","size":"2"},{"price":"0.5","size":"1"}],"asks":[{"price":"0.7","size":"3"},{"price":"0.6","size":"4"}]}"#,
         );
         let events = convert_message(book, &symbols(), &mut state).unwrap();
         let MarketEvent::Snapshot(snapshot) = &events[0] else {
@@ -1526,6 +1863,21 @@ mod tests {
         assert_eq!(snapshot.bids[0].price.0, Decimal::new(5, 1));
         assert_eq!(snapshot.asks[0].price.0, Decimal::new(6, 1));
         assert_eq!(snapshot.source_venue, Some(VenueId::POLYMARKET));
+        let market = polymarket_client_sdk::types::B256::ZERO.to_string();
+        assert_eq!(
+            snapshot
+                .provider_identity
+                .as_ref()
+                .map(|identity| identity.market.as_str()),
+            Some(market.as_str())
+        );
+        assert_eq!(
+            snapshot
+                .provider_identity
+                .as_ref()
+                .and_then(|identity| identity.book_hash.as_deref()),
+            Some("snapshot-hash")
+        );
 
         let delta = parse_one(
             r#"{"event_type":"price_change","market":"$MARKET","timestamp":"1001","price_changes":[{"asset_id":"123","price":"0.5","size":"0","side":"BUY","hash":"h"}]}"#,
@@ -1575,6 +1927,41 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn token_disconnect_in_multi_token_cycle_requires_global_resync() {
+        let symbols = multiple_symbols();
+        let mut state = BookState::default();
+        for token in ["123", "456"] {
+            let snapshot = parse_one(&format!(
+                r#"{{"event_type":"book","asset_id":"{token}","market":"$MARKET","timestamp":"1000","bids":[{{"price":"0.4","size":"2"}}],"asks":[{{"price":"0.6","size":"3"}}]}}"#
+            ));
+            convert_message(snapshot, &symbols, &mut state).unwrap();
+        }
+
+        let batch = parse_one(
+            r#"{"event_type":"price_change","market":"$MARKET","timestamp":"2000","price_changes":[{"asset_id":"123","price":"0.4","size":"0","side":"BUY","best_bid":"0.01","best_ask":"0.6"},{"asset_id":"456","price":"0.5","size":"1","side":"BUY","best_bid":"0.5","best_ask":"0.6"}]}"#,
+        );
+        let events = convert_message(batch, &symbols, &mut state).unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                MarketEvent::Disconnect { symbol: Some(token), .. },
+                MarketEvent::Update(update)
+            ] if token.as_str() == "123" && update.symbol.as_str() == "456"
+        ));
+        let reason = reconnect_reason_for_events(&events).expect("token invalidation reconnect");
+        assert!(matches!(
+            venue_disconnect(reason),
+            MarketEvent::Disconnect {
+                source_venue: Some(VenueId::POLYMARKET),
+                symbol: None,
+                ..
+            }
+        ));
+        state.reset();
+        assert!(state.books.is_empty());
     }
 
     #[test]

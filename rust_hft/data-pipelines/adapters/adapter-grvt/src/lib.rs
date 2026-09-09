@@ -431,6 +431,8 @@ impl MarketStream for GrvtMarketStream {
                                 sequence,
                                 source_venue: Some(VenueId::GRVT),
                                 timestamps: Default::default(),
+
+                                provider_identity: None,
                             };
                             let _ = tx.send(Ok(MarketEvent::Snapshot(snapshot)));
                         } else if stream_name.starts_with("v1.book.d") {
@@ -606,6 +608,7 @@ impl MarketStream for GrvtMarketStream {
                             reason: "WS closed".into(),
                             source_venue: Some(VenueId::GRVT),
                             symbol: None,
+                            connection_started_at: None,
                         }));
                         break;
                     }

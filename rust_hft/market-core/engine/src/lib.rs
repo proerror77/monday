@@ -2865,6 +2865,8 @@ mod tests {
             timestamps: hft_core::MarketDataTimestamps::local_only(
                 hft_core::LocalReceiveTimestamp::new(received_at),
             ),
+
+            provider_identity: None,
         });
         MarketView {
             orderbooks: [(VenueSymbol::new(venue, symbol), Arc::new(book))]
@@ -2935,6 +2937,8 @@ mod tests {
             sequence,
             source_venue: Some(venue),
             timestamps: Default::default(),
+
+            provider_identity: None,
         })
     }
 
@@ -3009,6 +3013,7 @@ mod tests {
                 reason: "USD-M stream reset".to_string(),
                 source_venue: Some(VenueId::BINANCE_FUTURES),
                 symbol: Some(Symbol::new("BTCUSDT")),
+                connection_started_at: None,
             })
             .unwrap();
         engine

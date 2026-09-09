@@ -423,6 +423,8 @@ mod tests {
             sequence: 1,
             source_venue: None,
             timestamps: Default::default(),
+
+            provider_identity: None,
         };
 
         // 安全寫入
@@ -447,6 +449,8 @@ mod tests {
                 local_receive: Some(LocalReceiveTimestamp::new(local_receive)),
                 ..Default::default()
             },
+
+            provider_identity: None,
         });
 
         assert_eq!(tracker_origin_time(&event, now_micros()), local_receive);
@@ -464,6 +468,8 @@ mod tests {
             sequence: 1,
             source_venue: None,
             timestamps: Default::default(),
+
+            provider_identity: None,
         };
 
         // 快速路徑：預檢查容量
@@ -497,6 +503,8 @@ mod tests {
             sequence: 1,
             source_venue: None,
             timestamps: Default::default(),
+
+            provider_identity: None,
         };
 
         // 應該被拒絕
@@ -522,6 +530,8 @@ mod tests {
                     sequence: i,
                     source_venue: None,
                     timestamps: Default::default(),
+
+                    provider_identity: None,
                 })
             })
             .collect();

@@ -415,6 +415,8 @@ mod tests {
             sequence: 1,
             source_venue: Some(VenueId::BINANCE),
             timestamps: Default::default(),
+
+            provider_identity: None,
         };
 
         let venue_snap = VenueSnapshot::from_market_snapshot("BINANCE".to_string(), &snapshot);

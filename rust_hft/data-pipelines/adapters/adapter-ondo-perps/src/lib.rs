@@ -166,6 +166,8 @@ fn parse_message(text: &str) -> HftResult<Vec<MarketSnapshot>> {
                 sequence: 0,
                 source_venue: Some(VenueId::ONDO_PERPS),
                 timestamps: Default::default(),
+
+                provider_identity: None,
             })
         })
         .collect()
@@ -281,6 +283,7 @@ impl MarketStream for OndoPerpsMarketStream {
                         reason: disconnect_reason,
                         source_venue: Some(VenueId::ONDO_PERPS),
                         symbol: None,
+                        connection_started_at: None,
                     }))
                     .await
                     .is_err()

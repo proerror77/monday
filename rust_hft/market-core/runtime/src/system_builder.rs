@@ -2397,6 +2397,8 @@ mod tests {
                     sequence: 1,
                     source_venue: Some(VenueId::BITGET),
                     timestamps: Default::default(),
+
+                    provider_identity: None,
                 }),
                 &account
             )
@@ -2504,6 +2506,8 @@ mod tests {
                     sequence: 1,
                     source_venue: Some(VenueId::MOCK),
                     timestamps: MarketDataTimestamps::local_only(LocalReceiveTimestamp::new(now)),
+
+                    provider_identity: None,
                 }))
                 .unwrap();
             engine.tick().unwrap();
@@ -2597,6 +2601,8 @@ mod tests {
                 timestamps: hft_core::MarketDataTimestamps::local_only(
                     hft_core::LocalReceiveTimestamp::new(now),
                 ),
+
+                provider_identity: None,
             }))
             .unwrap();
         engine.tick().unwrap();
@@ -2715,6 +2721,8 @@ mod tests {
                 sequence: 1,
                 source_venue: Some(VenueId::BINANCE),
                 timestamps: MarketDataTimestamps::default(),
+
+                provider_identity: None,
             }))
             .expect("queue a strategy-producing market event");
 
