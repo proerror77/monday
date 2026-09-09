@@ -1868,7 +1868,7 @@ mod tests {
                 let strategy = FormulaStrategy::new(FormulaStrategyConfig {
                     name: "live-contract".to_string(),
                     symbol: Symbol::from("BTCUSDT"),
-                    ast: ast.clone(),
+                    program: strategy_formula::FormulaProgram::Formula(ast.clone()),
                     max_order_notional: Decimal::ONE,
                     signal_threshold: 0.0,
                     target_position: false,

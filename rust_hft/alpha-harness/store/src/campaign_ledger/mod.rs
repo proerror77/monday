@@ -31,6 +31,11 @@ use state::State;
 
 const SCHEMA: &str = "monday.campaign_ledger_receipt.v1";
 const AUTH_DOMAIN: &str = "campaign-ledger-receipt";
+use alpha_domain::campaign_finalization::{
+    verify_campaign_final_evaluation_grant, SignedCampaignFinalEvaluationGrantV1,
+    VerifiedCampaignFinalEvaluationGrant,
+};
+
 const HEAD_DOMAIN: &str = "campaign-family-head";
 const PUBLICATION_DOMAIN: &str = "campaign-receipt-publication";
 
@@ -63,6 +68,12 @@ pub enum CampaignLedgerEventV1 {
     ApprovalRevoked {
         revocation: ApprovalRevocationV1,
     },
+    FamilyClosedForFinalEvaluation {
+        signed: Box<SignedCampaignFinalEvaluationGrantV1>,
+        verifying_key_hex: String,
+        approval: ApprovalRecord,
+        approval_content_sha256: String,
+    },
 }
 
 impl CampaignLedgerEventV1 {
@@ -84,6 +95,9 @@ impl CampaignLedgerEventV1 {
             }
             Self::ApprovalRevoked { revocation } => {
                 format!("campaign-revocation:{}", revocation.approval_id)
+            }
+            Self::FamilyClosedForFinalEvaluation { signed, .. } => {
+                format!("campaign-family-closed:{}", signed.grant.family_id)
             }
         })
     }
@@ -208,6 +222,39 @@ fn validate_approval(
             .is_none_or(|until| until < grant.expires_at)
     {
         return Err(err("approval does not authorize this root grant"));
+    }
+    Ok(())
+}
+
+fn validate_final_approval(
+    approval: &ApprovalRecord,
+    hash: &str,
+    verified: &VerifiedCampaignFinalEvaluationGrant,
+    at: DateTime<Utc>,
+) -> Result<(), StoreError> {
+    approval.validate()?;
+    let grant = verified.grant();
+    if encoded(approval)?.1 != hash
+        || approval.approval_class != "campaign_final_evaluation"
+        || approval.subject_id != grant.grant_id
+        || !approval.is_active_at(at)
+        || approval.revoked_at.is_some()
+        || approval.signer_id.as_deref() != Some(verified.signed_grant().key_id.as_str())
+        || approval
+            .payload
+            .get("grant_sha256")
+            .and_then(|v| v.as_str())
+            != Some(verified.content_sha256())
+        || approval.payload.get("family_id").and_then(|v| v.as_str())
+            != Some(grant.family_id.as_str())
+        || approval
+            .valid_from
+            .is_none_or(|from| from > grant.valid_from)
+        || approval
+            .expires_at
+            .is_none_or(|until| until < grant.expires_at)
+    {
+        return Err(err("approval does not authorize final evaluation"));
     }
     Ok(())
 }
@@ -448,6 +495,11 @@ fn restore_evidence_projection(
             approval,
             approval_content_sha256,
             ..
+        }
+        | CampaignLedgerEventV1::FamilyClosedForFinalEvaluation {
+            approval,
+            approval_content_sha256,
+            ..
         } => {
             let existing: Result<(ApprovalRecord, String), StoreError> = read_json_row_with_hash(
                 tx,
@@ -482,6 +534,73 @@ fn restore_evidence_projection(
 }
 
 impl AlphaStore {
+    /// Authenticated historical grant readback, not active execution admission.
+    pub fn campaign_final_evaluation_grant(
+        &self,
+        family: &str,
+    ) -> Result<Option<SignedCampaignFinalEvaluationGrantV1>, StoreError> {
+        let (state, _) = load(&self.connection, &self.integrity_key, family)?;
+        Ok(state
+            .final_closure
+            .map(|closure| closure.grant.signed_grant().clone()))
+    }
+
+    /// Closes search against the exact settled family tail. This only appends a
+    /// receipt; it neither opens evaluation data nor submits a final Job.
+    pub fn close_campaign_family_for_final_evaluation(
+        &mut self,
+        verified: &VerifiedCampaignFinalEvaluationGrant,
+        approval_id: &str,
+        at: DateTime<Utc>,
+    ) -> Result<AuthenticatedCampaignReceiptV1, StoreError> {
+        verified.validate_job_deadline_at(at).map_err(err)?;
+        let tx = self.connection.transaction().map_err(database_error)?;
+        serialize_approval_mutation(&tx, approval_id)?;
+        let (approval, hash) = read_json_row_with_hash(
+            &tx,
+            "SELECT payload_json, content_hash FROM approvals WHERE approval_id = ?",
+            approval_id,
+        )?;
+        let effective = read_effective_approval(&tx, &self.integrity_key, approval_id)?;
+        if !effective.is_active_at(at) {
+            return Err(err("final evaluation approval is not active"));
+        }
+        if let Some(when) = effective.revoked_at {
+            let duration = chrono::TimeDelta::try_seconds(
+                i64::try_from(verified.grant().max_job_seconds).map_err(err)?,
+            )
+            .ok_or_else(|| err("final deadline overflow"))?;
+            if at.checked_add_signed(duration).is_none_or(|end| end > when) {
+                return Err(err("final Job exceeds scheduled revocation"));
+            }
+        }
+        validate_final_approval(&approval, &hash, verified, at)?;
+        let revocation = read_revocation_evidence(&tx, &self.integrity_key, approval_id)?;
+        let receipt = append(
+            &tx,
+            &self.integrity_key,
+            &verified.grant().family_id,
+            CampaignLedgerEventV1::FamilyClosedForFinalEvaluation {
+                signed: Box::new(verified.signed_grant().clone()),
+                verifying_key_hex: hex::encode(verified.verifying_key().as_bytes()),
+                approval,
+                approval_content_sha256: hash,
+            },
+            at,
+        )?;
+        if let Some(revocation) = revocation {
+            append(
+                &tx,
+                &self.integrity_key,
+                &verified.grant().family_id,
+                CampaignLedgerEventV1::ApprovalRevoked { revocation },
+                at,
+            )?;
+        }
+        tx.commit().map_err(database_error)?;
+        Ok(receipt)
+    }
+
     pub fn register_campaign_root(
         &mut self,
         verified: &VerifiedCampaignRootGrant,
@@ -756,13 +875,16 @@ impl AlphaStore {
     }
 }
 
-pub(crate) fn append_registered_root_revocation(
+pub(crate) fn append_registered_campaign_revocation(
     conn: &Connection,
     key: &[u8; 32],
     approval: &ApprovalRecord,
     event: &ApprovalRevocationV1,
 ) -> Result<(), StoreError> {
-    if approval.approval_class != "campaign_root" {
+    if !matches!(
+        approval.approval_class.as_str(),
+        "campaign_root" | "campaign_final_evaluation"
+    ) {
         return Ok(());
     }
     let Some(family) = approval.payload.get("family_id").and_then(|v| v.as_str()) else {
@@ -773,6 +895,10 @@ pub(crate) fn append_registered_root_revocation(
         .roots
         .values()
         .any(|root| root.approval.approval_id == approval.approval_id)
+        || state
+            .final_closure
+            .as_ref()
+            .is_some_and(|closure| closure.approval.approval_id == approval.approval_id)
     {
         // The receipt is recorded no earlier than the chain tail so a revocation
         // is never rejected for ordering; the event itself keeps `revoked_at`.
@@ -932,8 +1058,14 @@ mod tests {
     }
 
     fn registered() -> (AlphaStore, VerifiedCampaignRootGrant) {
+        registered_grant(grant("root-1"))
+    }
+
+    fn registered_grant(
+        definition: CampaignRootGrantV1,
+    ) -> (AlphaStore, VerifiedCampaignRootGrant) {
         let mut store = AlphaStore::open_in_memory().unwrap();
-        let verified = verify(grant("root-1"));
+        let verified = verify(definition);
         store
             .record_approval(&approval(&verified, APPROVAL))
             .unwrap();
@@ -1423,6 +1555,356 @@ mod tests {
         );
     }
 
+    fn final_family_base() -> (
+        AlphaStore,
+        VerifiedCampaignRootGrant,
+        CampaignAttemptReservationV1,
+    ) {
+        let mut definition = grant("root-1");
+        definition.execution.evaluation_views.selection_feedback =
+            CampaignSelectionFeedbackV1::IndependentSelectionWithheld;
+        definition.execution.evaluation_views.selection_view_sha256 = "c".repeat(64);
+        let (mut store, root) = registered_grant(definition);
+        let attempt = reservation(&root, 0, 40);
+        store
+            .reserve_campaign_attempt(&root, &attempt, t0())
+            .unwrap();
+        acknowledge_all(&mut store);
+        store
+            .claim_campaign_dispatch(&root, &attempt, &dispatch_target(), t0())
+            .unwrap();
+        acknowledge_all(&mut store);
+        store
+            .bind_campaign_dispatch_job(
+                &root,
+                &attempt,
+                &dispatch_target(),
+                "final-source-job",
+                t0(),
+            )
+            .unwrap();
+        (store, root, attempt)
+    }
+
+    fn settle_final_source(store: &mut AlphaStore, attempt: &CampaignAttemptReservationV1) {
+        store
+            .settle_campaign_dispatch(
+                attempt,
+                &CampaignDispatchSettlementV1 {
+                    job_uid: "final-source-job".into(),
+                    pod_uid: "final-source-pod".into(),
+                    settlement: settlement(
+                        attempt,
+                        CampaignAttemptOutcomeV1::SelectedPreHoldout,
+                        Some(40),
+                    ),
+                },
+                minutes(1),
+            )
+            .unwrap();
+        acknowledge_all(store);
+    }
+
+    fn final_definition(
+        store: &AlphaStore,
+        root: &VerifiedCampaignRootGrant,
+        attempt: &CampaignAttemptReservationV1,
+    ) -> alpha_domain::campaign_finalization::CampaignFinalEvaluationGrantV1 {
+        alpha_domain::campaign_finalization::CampaignFinalEvaluationGrantV1 {
+            schema_version: alpha_domain::campaign_finalization::FINAL_EVALUATION_GRANT_SCHEMA
+                .into(),
+            grant_id: "final-grant-1".into(),
+            family_id: FAMILY.into(),
+            family_definition_sha256: root.grant().family.definition_sha256.clone(),
+            family_head_sha256: store
+                .campaign_family_snapshot(FAMILY)
+                .unwrap()
+                .last_receipt_sha256,
+            execution: root.grant().execution.clone(),
+            selected_results: BTreeMap::from([(attempt.operation_id().unwrap(), "d".repeat(64))]),
+            max_candidates: 3,
+            max_job_seconds: 3600,
+            valid_from: t0(),
+            expires_at: minutes(720),
+        }
+    }
+
+    fn approve_final(
+        store: &mut AlphaStore,
+        definition: alpha_domain::campaign_finalization::CampaignFinalEvaluationGrantV1,
+    ) -> VerifiedCampaignFinalEvaluationGrant {
+        use alpha_domain::campaign_finalization::sign_campaign_final_evaluation_grant;
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let signed =
+            sign_campaign_final_evaluation_grant(definition, "operator".into(), &key).unwrap();
+        let verified = verify_campaign_final_evaluation_grant(
+            &signed,
+            &BTreeMap::from([("operator".into(), key.verifying_key())]),
+            t0(),
+        )
+        .unwrap();
+        store.record_approval(&ApprovalRecord {
+            approval_id: "final-approval".into(), approval_class: "campaign_final_evaluation".into(),
+            subject_id: verified.grant().grant_id.clone(),
+            payload: serde_json::json!({"grant_sha256": verified.content_sha256(), "family_id": FAMILY}),
+            signer_id: Some("operator".into()), valid_from: Some(t0()), expires_at: Some(minutes(720)),
+            revoked_at: None, revoked_by: None, revocation_reason: None, created_at: t0(),
+        }).unwrap();
+        verified
+    }
+
+    #[test]
+    fn final_family_closure_is_permanent_idempotent_and_survives_restore() {
+        let (mut store, root, attempt) = final_family_base();
+        settle_final_source(&mut store, &attempt);
+        let definition = final_definition(&store, &root, &attempt);
+        let final_grant = approve_final(&mut store, definition);
+        let closure = store
+            .close_campaign_family_for_final_evaluation(&final_grant, "final-approval", minutes(2))
+            .unwrap();
+        assert_eq!(
+            store
+                .close_campaign_family_for_final_evaluation(
+                    &final_grant,
+                    "final-approval",
+                    minutes(3)
+                )
+                .unwrap(),
+            closure
+        );
+        assert_eq!(
+            store.pending_campaign_receipts(FAMILY).unwrap(),
+            vec![closure]
+        );
+        assert_eq!(
+            store
+                .campaign_final_evaluation_grant(FAMILY)
+                .unwrap()
+                .as_ref(),
+            Some(final_grant.signed_grant())
+        );
+        acknowledge_all(&mut store);
+        let snapshot = store.campaign_family_snapshot(FAMILY).unwrap();
+        let mut restored = AlphaStore::open_in_memory().unwrap();
+        restored.integrity_key = store.integrity_key;
+        restored.import_campaign_family_snapshot(&snapshot).unwrap();
+        assert_eq!(restored.campaign_family_snapshot(FAMILY).unwrap(), snapshot);
+        assert_eq!(
+            restored.campaign_final_evaluation_grant(FAMILY).unwrap(),
+            store.campaign_final_evaluation_grant(FAMILY).unwrap()
+        );
+        let mut another = root.grant().clone();
+        another.root_id = "root-after-selection".into();
+        let another = verify(another);
+        restored
+            .record_approval(&approval(&another, "later-root-approval"))
+            .unwrap();
+        let error = restored
+            .register_campaign_root(&another, "later-root-approval", minutes(4))
+            .unwrap_err();
+        assert!(error.to_string().contains("permanently closed"));
+        let mut later = attempt.clone();
+        later.attempt_ordinal = 1;
+        let error = restored
+            .reserve_campaign_attempt(&root, &later, minutes(4))
+            .unwrap_err();
+        assert!(error.to_string().contains("permanently closed"));
+        assert!(restored
+            .check_campaign_dispatch_admission(
+                &root,
+                FAMILY,
+                &attempt.operation_id().unwrap(),
+                minutes(4)
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn final_family_closure_rejects_unsettled_uncertain_and_unbound_sources() {
+        for kind in ["pending", "uncertain", "diagnostic"] {
+            let (mut store, root, attempt) = final_family_base();
+            match kind {
+                "uncertain" => {
+                    store
+                        .settle_campaign_attempt(
+                            FAMILY,
+                            &settlement(&attempt, CampaignAttemptOutcomeV1::Failed, None),
+                            minutes(1),
+                        )
+                        .unwrap();
+                }
+                "diagnostic" => {
+                    store
+                        .settle_campaign_attempt(
+                            FAMILY,
+                            &settlement(
+                                &attempt,
+                                CampaignAttemptOutcomeV1::SelectedPreHoldout,
+                                Some(40),
+                            ),
+                            minutes(1),
+                        )
+                        .unwrap();
+                }
+                _ => (),
+            }
+            let definition = final_definition(&store, &root, &attempt);
+            let final_grant = approve_final(&mut store, definition);
+            let before = store.campaign_family_snapshot(FAMILY).unwrap();
+            assert!(
+                store
+                    .close_campaign_family_for_final_evaluation(
+                        &final_grant,
+                        "final-approval",
+                        minutes(2)
+                    )
+                    .is_err(),
+                "{kind}"
+            );
+            assert_eq!(before, store.campaign_family_snapshot(FAMILY).unwrap());
+        }
+    }
+
+    #[test]
+    fn final_family_closure_binds_complete_results_view_and_exact_head() {
+        for field in [
+            "result",
+            "extra_result",
+            "head",
+            "definition",
+            "view",
+            "source",
+        ] {
+            let (mut store, root, attempt) = final_family_base();
+            settle_final_source(&mut store, &attempt);
+            let mut definition = final_definition(&store, &root, &attempt);
+            match field {
+                "result" => {
+                    *definition.selected_results.values_mut().next().unwrap() = "e".repeat(64)
+                }
+                "extra_result" => {
+                    definition.selected_results.insert(
+                        format!("campaign-attempt-{}", "e".repeat(64)),
+                        "f".repeat(64),
+                    );
+                }
+                "head" => definition.family_head_sha256 = "e".repeat(64),
+                "definition" => definition.family_definition_sha256 = "e".repeat(64),
+                "view" => {
+                    definition.execution.evaluation_views.selection_view_sha256 = "e".repeat(64)
+                }
+                _ => definition.execution.source_revision = "e".repeat(40),
+            }
+            let final_grant = approve_final(&mut store, definition);
+            let before = store.campaign_family_snapshot(FAMILY).unwrap();
+            assert!(
+                store
+                    .close_campaign_family_for_final_evaluation(
+                        &final_grant,
+                        "final-approval",
+                        minutes(2)
+                    )
+                    .is_err(),
+                "{field}"
+            );
+            assert_eq!(before, store.campaign_family_snapshot(FAMILY).unwrap());
+        }
+    }
+
+    #[test]
+    fn final_family_closure_replays_revocation_without_reopening_search() {
+        let (mut store, root, attempt) = final_family_base();
+        settle_final_source(&mut store, &attempt);
+        let definition = final_definition(&store, &root, &attempt);
+        let final_grant = approve_final(&mut store, definition);
+        store
+            .close_campaign_family_for_final_evaluation(&final_grant, "final-approval", minutes(2))
+            .unwrap();
+        store
+            .revoke_approval(
+                "final-approval",
+                "operator",
+                "stop final evaluation",
+                minutes(3),
+            )
+            .unwrap();
+        let snapshot = store.campaign_family_snapshot(FAMILY).unwrap();
+        assert!(matches!(
+            snapshot.receipts.last().unwrap().receipt.event,
+            CampaignLedgerEventV1::ApprovalRevoked { .. }
+        ));
+        let mut restored = AlphaStore::open_in_memory().unwrap();
+        restored.integrity_key = store.integrity_key;
+        restored.import_campaign_family_snapshot(&snapshot).unwrap();
+        assert_eq!(restored.campaign_family_snapshot(FAMILY).unwrap(), snapshot);
+        assert!(restored
+            .close_campaign_family_for_final_evaluation(&final_grant, "final-approval", minutes(4))
+            .is_err());
+        assert!(restored
+            .campaign_final_evaluation_grant(FAMILY)
+            .unwrap()
+            .is_some());
+        let mut later = attempt;
+        later.attempt_ordinal = 1;
+        assert!(restored
+            .reserve_campaign_attempt(&root, &later, minutes(4))
+            .unwrap_err()
+            .to_string()
+            .contains("permanently closed"));
+    }
+
+    #[test]
+    fn final_authority_signature_scope_and_scheduled_revocation_are_enforced() {
+        use alpha_domain::campaign_finalization::sign_campaign_final_evaluation_grant;
+        use ed25519_dalek::Signer;
+        let (mut store, root, attempt) = final_family_base();
+        settle_final_source(&mut store, &attempt);
+        let definition = final_definition(&store, &root, &attempt);
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let keys = BTreeMap::from([("operator".into(), key.verifying_key())]);
+        let signed =
+            sign_campaign_final_evaluation_grant(definition.clone(), "operator".into(), &key)
+                .unwrap();
+        assert!(verify_campaign_final_evaluation_grant(&signed, &BTreeMap::new(), t0()).is_err());
+        assert!(verify_campaign_final_evaluation_grant(&signed, &keys, minutes(720)).is_err());
+        let mut changed = signed.clone();
+        changed.grant.max_candidates += 1;
+        changed.content_sha256 = changed.grant.content_hash().unwrap();
+        assert!(verify_campaign_final_evaluation_grant(&changed, &keys, t0()).is_err());
+        changed = signed;
+        changed.signature_hex = hex::encode(
+            key.sign(format!("{ROOT_GRANT_SCHEMA}:{}", changed.content_sha256).as_bytes())
+                .to_bytes(),
+        );
+        assert!(verify_campaign_final_evaluation_grant(&changed, &keys, t0()).is_err());
+        for field in ["shared", "empty", "budget", "deadline"] {
+            let mut changed = definition.clone();
+            match field {
+                "shared" => {
+                    changed.execution.evaluation_views.selection_feedback =
+                        CampaignSelectionFeedbackV1::SearchAndLearningVisibleWalkForward
+                }
+                "empty" => changed.selected_results.clear(),
+                "budget" => changed.max_candidates = 129,
+                _ => changed.max_job_seconds = u64::MAX,
+            }
+            assert!(changed.validate().is_err(), "{field}");
+        }
+        let final_grant = approve_final(&mut store, definition);
+        store
+            .revoke_approval("final-approval", "operator", "scheduled stop", minutes(30))
+            .unwrap();
+        assert!(store
+            .close_campaign_family_for_final_evaluation(&final_grant, "final-approval", minutes(2))
+            .unwrap_err()
+            .to_string()
+            .contains("scheduled revocation"));
+        assert!(store
+            .campaign_final_evaluation_grant(FAMILY)
+            .unwrap()
+            .is_none());
+    }
+
     fn kinds(receipts: &[AuthenticatedCampaignReceiptV1]) -> Vec<&'static str> {
         receipts
             .iter()
@@ -1434,6 +1916,9 @@ mod tests {
                 CampaignLedgerEventV1::AttemptSettled { .. } => "attempt_settled",
                 CampaignLedgerEventV1::DispatchSettled { .. } => "dispatch_settled",
                 CampaignLedgerEventV1::ApprovalRevoked { .. } => "approval_revoked",
+                CampaignLedgerEventV1::FamilyClosedForFinalEvaluation { .. } => {
+                    "family_closed_for_final_evaluation"
+                }
             })
             .collect()
     }

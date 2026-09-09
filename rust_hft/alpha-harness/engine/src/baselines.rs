@@ -19,9 +19,7 @@ use sha2::{Digest, Sha256};
 
 use crate::engines::solve;
 
-const BPS: f64 = 10_000.0;
 const CEX_SUPERVISED_CANDIDATE_SCHEMA_V2: &str = "cex-supervised-model-candidate-v2";
-const CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V2: &str = "cex-supervised-decision-policy-v2";
 const CEX_BURN_HIDDEN_DIM: usize = 8;
 const CEX_BURN_EPOCHS: usize = 8;
 const CEX_BURN_LEARNING_RATE: f64 = 1e-3;
@@ -54,75 +52,9 @@ struct CexBurnFoldFit<'a> {
     dataset_sha256: &'a str,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CexSupervisedSizingRuleV1 {
-    ExcessExpectedReturnOverRoundTripCost,
-    PredictionIdentity,
-    HystereticExcessExpectedReturnOverRoundTripCost,
-}
-
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CexSupervisedDecisionPolicyV2 {
-    pub schema_version: String,
-    pub round_trip_cost_multiplier: f64,
-    pub sizing_rule: CexSupervisedSizingRuleV1,
-    pub max_abs_position: f64,
-}
-
-impl CexSupervisedDecisionPolicyV2 {
-    pub fn controlled_v2() -> Self {
-        Self {
-            schema_version: CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V2.to_string(),
-            round_trip_cost_multiplier: 2.0,
-            sizing_rule: CexSupervisedSizingRuleV1::ExcessExpectedReturnOverRoundTripCost,
-            max_abs_position: 1.0,
-        }
-    }
-
-    pub fn prediction_identity_v2() -> Self {
-        Self {
-            schema_version: CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V2.to_string(),
-            round_trip_cost_multiplier: 0.0,
-            sizing_rule: CexSupervisedSizingRuleV1::PredictionIdentity,
-            max_abs_position: 1.0,
-        }
-    }
-
-    pub fn hysteretic_cost_aware_v2() -> Self {
-        Self {
-            schema_version: CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V2.to_string(),
-            round_trip_cost_multiplier: 2.0,
-            sizing_rule: CexSupervisedSizingRuleV1::HystereticExcessExpectedReturnOverRoundTripCost,
-            max_abs_position: 1.0,
-        }
-    }
-
-    pub fn validate(&self) -> Result<(), String> {
-        let admitted = match self.sizing_rule {
-            CexSupervisedSizingRuleV1::ExcessExpectedReturnOverRoundTripCost
-            | CexSupervisedSizingRuleV1::HystereticExcessExpectedReturnOverRoundTripCost => {
-                self.round_trip_cost_multiplier.to_bits() == 2.0_f64.to_bits()
-            }
-            CexSupervisedSizingRuleV1::PredictionIdentity => {
-                self.round_trip_cost_multiplier.to_bits() == 0.0_f64.to_bits()
-            }
-        };
-        if self.schema_version != CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V2
-            || !admitted
-            || self.max_abs_position.to_bits() != 1.0_f64.to_bits()
-        {
-            return Err("CEX supervised decision policy drifted".to_string());
-        }
-        Ok(())
-    }
-
-    pub fn content_hash(&self) -> Result<String, String> {
-        self.validate()?;
-        canonical_json_hash(self).map_err(|error| error.to_string())
-    }
-}
+pub use hft_research_manifest::model::{
+    CexDecisionCostsV1, CexSupervisedDecisionPolicyV2, CexSupervisedSizingRuleV1,
+};
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -326,9 +258,7 @@ pub fn verify_cex_baseline_artifact(
                     artifact.baseline_policy.cart_min_leaf,
                     &factor_ids,
                 )?;
-                let refit_model = CexBaselineModelV1::ShallowCart {
-                    root: cart_node(tree.clone()),
-                };
+                let refit_model = CexBaselineModelV1::ShallowCart { root: tree.clone() };
                 if refit_model != fold.model {
                     return Err(format!(
                         "baseline fold {} CART model drifted",
@@ -572,7 +502,8 @@ fn supervised_target_positions(
                     cost_aware_target_position(prediction, row, &context.protocol().costs, policy)?
                 }
                 CexSupervisedSizingRuleV1::PredictionIdentity => {
-                    prediction.clamp(-policy.max_abs_position, policy.max_abs_position)
+                    policy.target_position(prediction, previous_position,
+                        CexDecisionCostsV1 { one_way_cost_bps: 0.0, funding_bps: 0.0 })?
                 }
                 CexSupervisedSizingRuleV1::HystereticExcessExpectedReturnOverRoundTripCost => {
                     hysteretic_cost_aware_target_position(
@@ -592,17 +523,11 @@ fn supervised_target_positions(
     Ok(positions)
 }
 
-fn cost_aware_target_position(
-    prediction: f64,
-    row: &crate::evaluation::ResearchRow,
+fn decision_costs(
+    row: &ResearchRow,
     costs: &alpha_domain::EvaluationCostsV1,
-    policy: &CexSupervisedDecisionPolicyV2,
-) -> Result<f64, String> {
-    policy.validate()?;
-    if !prediction.is_finite() {
-        return Err("supervised model prediction is not finite".to_string());
-    }
-    let spread_bps = if costs.cross_spread {
+) -> Result<CexDecisionCostsV1, String> {
+    let half_spread = if costs.cross_spread {
         row.features
             .get("spread_bps")
             .copied()
@@ -612,65 +537,32 @@ fn cost_aware_target_position(
     } else {
         0.0
     };
-    let one_way_cost_bps = row.fee_bps.max(0.0) - costs.rebate_bps
-        + row.latency_bps.max(0.0)
-        + costs.slippage_bps
-        + spread_bps;
-    let minimum_edge = minimum_edge(
-        one_way_cost_bps,
-        row.funding_bps,
-        policy.round_trip_cost_multiplier,
-    );
-    let absolute_prediction = prediction.abs();
-    if absolute_prediction <= minimum_edge || absolute_prediction <= f64::EPSILON {
-        return Ok(0.0);
-    }
-    let magnitude = ((absolute_prediction - minimum_edge)
-        / (absolute_prediction + minimum_edge).max(f64::EPSILON))
-    .clamp(0.0, policy.max_abs_position);
-    Ok(prediction.signum() * magnitude)
+    Ok(CexDecisionCostsV1 {
+        one_way_cost_bps: row.fee_bps.max(0.0) - costs.rebate_bps
+            + row.latency_bps.max(0.0)
+            + costs.slippage_bps
+            + half_spread,
+        funding_bps: row.funding_bps,
+    })
+}
+
+fn cost_aware_target_position(
+    prediction: f64,
+    row: &ResearchRow,
+    costs: &alpha_domain::EvaluationCostsV1,
+    policy: &CexSupervisedDecisionPolicyV2,
+) -> Result<f64, String> {
+    policy.target_position(prediction, 0.0, decision_costs(row, costs)?)
 }
 
 fn hysteretic_cost_aware_target_position(
     prediction: f64,
     previous_position: f64,
-    row: &crate::evaluation::ResearchRow,
+    row: &ResearchRow,
     costs: &alpha_domain::EvaluationCostsV1,
     policy: &CexSupervisedDecisionPolicyV2,
 ) -> Result<f64, String> {
-    let proposed = cost_aware_target_position(prediction, row, costs, policy)?;
-    if previous_position.abs() <= f64::EPSILON || prediction.signum() != previous_position.signum()
-    {
-        return Ok(proposed);
-    }
-    let spread_bps = if costs.cross_spread {
-        row.features
-            .get("spread_bps")
-            .copied()
-            .filter(|value| value.is_finite() && *value >= 0.0)
-            .ok_or_else(|| "cost-aware ML decision requires spread_bps".to_string())?
-            / 2.0
-    } else {
-        0.0
-    };
-    let one_way_cost_bps = row.fee_bps.max(0.0) - costs.rebate_bps
-        + row.latency_bps.max(0.0)
-        + costs.slippage_bps
-        + spread_bps;
-    let exit_edge = minimum_edge(
-        one_way_cost_bps,
-        row.funding_bps,
-        policy.round_trip_cost_multiplier / 2.0,
-    );
-    if prediction.signum() == previous_position.signum() && prediction.abs() > exit_edge {
-        Ok(previous_position)
-    } else {
-        Ok(proposed)
-    }
-}
-
-fn minimum_edge(one_way_cost_bps: f64, funding_bps: f64, multiplier: f64) -> f64 {
-    (multiplier * one_way_cost_bps + funding_bps.max(0.0)).max(0.0) / BPS
+    policy.target_position(prediction, previous_position, decision_costs(row, costs)?)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -837,12 +729,7 @@ fn fit_artifact(
                     &factor_ids,
                 )?;
                 let predictions = predict_fold_cart(&tree, features, &fold.validation)?;
-                (
-                    CexBaselineModelV1::ShallowCart {
-                        root: cart_node(tree),
-                    },
-                    predictions,
-                )
+                (CexBaselineModelV1::ShallowCart { root: tree }, predictions)
             }
             BaselineKind::BurnMlp { identity } => fit_burn_fold(CexBurnFoldFit {
                 rows: context.rows(),
@@ -1179,29 +1066,6 @@ fn predictions_equal(left: &[f64], right: &[f64]) -> bool {
             .all(|(left, right)| left.to_bits() == right.to_bits())
 }
 
-fn cart_node(node: CartNode) -> CexBaselineCartNodeV1 {
-    match node {
-        CartNode::Leaf {
-            value,
-            sample_count,
-        } => CexBaselineCartNodeV1::Leaf {
-            value,
-            sample_count,
-        },
-        CartNode::Split {
-            feature_index,
-            threshold,
-            left,
-            right,
-        } => CexBaselineCartNodeV1::Split {
-            feature_index,
-            threshold,
-            left: Box::new(cart_node(*left)),
-            right: Box::new(cart_node(*right)),
-        },
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RidgeFit {
     pub(crate) intercept: f64,
@@ -1210,19 +1074,7 @@ pub(crate) struct RidgeFit {
     pub(crate) coefficients: Vec<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum CartNode {
-    Leaf {
-        value: f64,
-        sample_count: usize,
-    },
-    Split {
-        feature_index: usize,
-        threshold: f64,
-        left: Box<CartNode>,
-        right: Box<CartNode>,
-    },
-}
+pub(crate) type CartNode = CexBaselineCartNodeV1;
 
 pub(crate) fn fit_ridge(
     features: &[Vec<f64>],
@@ -1318,36 +1170,13 @@ pub(crate) fn fit_ridge(
 }
 
 pub(crate) fn predict_ridge(model: &RidgeFit, features: &[f64]) -> Result<f64, String> {
-    if features.len() != model.means.len()
-        || model.means.len() != model.scales.len()
-        || model.means.len() != model.coefficients.len()
-        || features.iter().any(|value| !value.is_finite())
-        || model
-            .scales
-            .iter()
-            .any(|scale| !scale.is_finite() || *scale <= 0.0)
-        || model
-            .means
-            .iter()
-            .chain(&model.scales)
-            .chain(&model.coefficients)
-            .any(|value| !value.is_finite())
-        || !model.intercept.is_finite()
-    {
-        return Err("invalid Ridge prediction inputs".to_string());
-    }
-    let prediction = model.intercept
-        + features
-            .iter()
-            .zip(&model.means)
-            .zip(&model.scales)
-            .zip(&model.coefficients)
-            .map(|(((value, mean), scale), coefficient)| coefficient * (value - mean) / scale)
-            .sum::<f64>();
-    prediction
-        .is_finite()
-        .then(|| normalize_zero(prediction))
-        .ok_or_else(|| "Ridge prediction is non-finite".to_string())
+    hft_research_manifest::model::predict_standardized_ridge(
+        model.intercept,
+        &model.means,
+        &model.scales,
+        &model.coefficients,
+        features,
+    )
 }
 
 pub(crate) fn fit_cart(
@@ -1505,31 +1334,7 @@ fn sse_from_sums(sum: f64, sum_sq: f64, count: usize) -> f64 {
 }
 
 pub(crate) fn predict_cart(model: &CartNode, features: &[f64]) -> Result<f64, String> {
-    if features.iter().any(|value| !value.is_finite()) {
-        return Err("invalid CART prediction inputs".to_string());
-    }
-    let prediction = match model {
-        CartNode::Leaf { value, .. } => *value,
-        CartNode::Split {
-            feature_index,
-            threshold,
-            left,
-            right,
-        } => {
-            if *feature_index >= features.len() || !threshold.is_finite() {
-                return Err("invalid CART model".to_string());
-            }
-            if features[*feature_index] <= *threshold {
-                predict_cart(left, features)?
-            } else {
-                predict_cart(right, features)?
-            }
-        }
-    };
-    prediction
-        .is_finite()
-        .then(|| normalize_zero(prediction))
-        .ok_or_else(|| "CART prediction is non-finite".to_string())
+    model.predict(features)
 }
 
 fn normalize_zero(value: f64) -> f64 {
@@ -1755,6 +1560,10 @@ mod tests {
             *semantic_model_sha256
         );
         for (row, expected) in (13..16).zip(&left_predictions) {
+            assert_eq!(
+                reloaded.predict(&features[row]).unwrap().to_bits(),
+                expected.to_bits()
+            );
             let features = features[row]
                 .iter()
                 .map(|value| *value as f32)

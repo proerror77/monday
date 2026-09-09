@@ -36,7 +36,7 @@ pub fn create_strategy_instances_from_config(
         StrategyType::MarketMaking => {
             Err(StrategyFactoryError::FeatureDisabled("strategy-market-making").into())
         }
-        StrategyType::Formula => create_formula_strategies(config),
+        StrategyType::Formula | StrategyType::FrozenModel => create_formula_strategies(config),
         StrategyType::Onnx => create_onnx_strategy(config),
     }
 }
@@ -188,20 +188,54 @@ fn create_lob_flow_grid_strategies(
 fn create_formula_strategies(_config: &StrategyConfig) -> HftResult<Vec<Box<dyn StrategyTrait>>> {
     #[cfg(feature = "strategy-formula")]
     {
-        let StrategyParams::Formula {
-            ast,
+        let (
+            program,
             max_order_notional,
             signal_threshold,
             target_position,
             evaluation_interval_millis,
             execution_contract,
-        } = &_config.params
-        else {
-            return Err(StrategyFactoryError::InvalidParams(format!(
-                "Formula strategy has non-Formula params: {}",
-                _config.name
-            ))
-            .into());
+        ) = match (&_config.strategy_type, &_config.params) {
+            (
+                StrategyType::Formula,
+                StrategyParams::Formula {
+                    ast,
+                    max_order_notional,
+                    signal_threshold,
+                    target_position,
+                    evaluation_interval_millis,
+                    execution_contract,
+                },
+            ) => (
+                strategy_formula::FormulaProgram::Formula(ast.clone()),
+                *max_order_notional,
+                *signal_threshold,
+                *target_position,
+                *evaluation_interval_millis,
+                execution_contract.as_ref(),
+            ),
+            (
+                StrategyType::FrozenModel,
+                StrategyParams::FrozenModel {
+                    program,
+                    max_order_notional,
+                    execution_contract,
+                },
+            ) => (
+                strategy_formula::FormulaProgram::FrozenModel(program.clone()),
+                *max_order_notional,
+                0.0,
+                true,
+                Some(program.observation_frequency_millis),
+                Some(execution_contract),
+            ),
+            _ => {
+                return Err(StrategyFactoryError::InvalidParams(format!(
+                    "Factor strategy kind and parameters differ: {}",
+                    _config.name
+                ))
+                .into())
+            }
         };
         _config
             .symbols
@@ -211,11 +245,11 @@ fn create_formula_strategies(_config: &StrategyConfig) -> HftResult<Vec<Box<dyn 
                 strategy_formula::FormulaStrategy::new(strategy_formula::FormulaStrategyConfig {
                     name: instance_id,
                     symbol: symbol.clone(),
-                    ast: ast.clone(),
-                    max_order_notional: *max_order_notional,
-                    signal_threshold: *signal_threshold,
-                    target_position: *target_position,
-                    evaluation_interval_millis: *evaluation_interval_millis,
+                    program: program.clone(),
+                    max_order_notional,
+                    signal_threshold,
+                    target_position,
+                    evaluation_interval_millis,
                     target_venue: execution_contract.as_ref().map(|contract| contract.venue),
                     venue_spec: execution_contract
                         .as_ref()

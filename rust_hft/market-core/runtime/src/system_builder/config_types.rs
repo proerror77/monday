@@ -484,6 +484,7 @@ pub enum StrategyType {
     Arbitrage,
     MarketMaking,
     Formula,
+    FrozenModel,
     Onnx,
     Imbalance,
     LobFlowGrid,
@@ -528,6 +529,11 @@ pub enum StrategyParams {
         evaluation_interval_millis: Option<u64>,
         #[serde(default)]
         execution_contract: Option<FormulaExecutionContract>,
+    },
+    FrozenModel {
+        program: Box<hft_factor_dsl::model_program::FrozenFactorModelV1>,
+        max_order_notional: Decimal,
+        execution_contract: FormulaExecutionContract,
     },
     Onnx {
         model_path: String,

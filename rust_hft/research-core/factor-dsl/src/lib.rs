@@ -1,5 +1,7 @@
 //! Canonical factor DSL and program-factor AST contracts.
 
+pub mod model_program;
+
 use hft_research_manifest::ManifestId;
 use serde::{Deserialize, Serialize};
 use std::fmt;
