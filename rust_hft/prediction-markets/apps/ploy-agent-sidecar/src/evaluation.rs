@@ -87,6 +87,48 @@ pub fn validate_admission(
     None
 }
 
+pub fn requested_evidence_capabilities(request: &AgentRunCreateRequest) -> Vec<&'static str> {
+    let mut capabilities = Vec::new();
+    if request.target_evidence == "executable_replay" {
+        capabilities.push("executable_replay");
+    }
+    for (key, capability) in [
+        ("requires_data_audit", "data_audit"),
+        ("requires_full_depth_clob", "full_depth_clob"),
+        ("requires_executable_replay", "executable_replay"),
+        ("requires_runtime_parity", "runtime_parity"),
+        ("requires_realtime_runtime", "realtime_runtime"),
+        ("requires_realtime_evidence", "realtime_runtime"),
+    ] {
+        if contract_enabled(&request.run_contract, key) && !capabilities.contains(&capability) {
+            capabilities.push(capability);
+        }
+    }
+    capabilities
+}
+
+pub fn validate_verified_evidence_requirements(
+    request: &AgentRunCreateRequest,
+    evidence: &VerifiedPredictionEvidenceReceipt,
+) -> Result<(), String> {
+    for capability in requested_evidence_capabilities(request) {
+        let available = match capability {
+            "data_audit" => evidence.data_audit(),
+            "full_depth_clob" => evidence.full_depth(),
+            "executable_replay" => evidence.executable_replay(),
+            "runtime_parity" => evidence.runtime_parity(),
+            "realtime_runtime" => evidence.realtime_runtime(),
+            _ => false,
+        };
+        if !available {
+            return Err(format!(
+                "verified prediction evidence is missing requested capability {capability}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContractCheck {
     pub name: String,
@@ -118,7 +160,8 @@ pub fn evaluate_agent_run_contract_with_evidence(
     failure_reason: Option<&str>,
     evidence: Option<&VerifiedPredictionEvidenceReceipt>,
 ) -> Option<ContractEvaluation> {
-    let run_contract = request?
+    let request = request?;
+    let run_contract = request
         .get("run_contract")?
         .as_str()
         .filter(|value| !value.trim().is_empty())?;
@@ -136,10 +179,19 @@ pub fn evaluate_agent_run_contract_with_evidence(
         checks.push(check("execution_error", "blocked", reason));
     }
     checks.push(completion_check(completion));
-    if contract_enabled(run_contract, "requires_data_audit") {
-        checks.push(required_evidence_check("data_audit", evidence, |receipt| {
-            receipt.data_audit()
-        }));
+    for capability in requested_evidence_capabilities_from_value(request, run_contract) {
+        checks.push(required_evidence_check(
+            capability,
+            evidence,
+            |receipt| match capability {
+                "data_audit" => receipt.data_audit(),
+                "full_depth_clob" => receipt.full_depth(),
+                "executable_replay" => receipt.executable_replay(),
+                "runtime_parity" => receipt.runtime_parity(),
+                "realtime_runtime" => receipt.realtime_runtime(),
+                _ => false,
+            },
+        ));
     }
     if contract_enabled(run_contract, "requires_grok_decision") {
         checks.push(grok_decision_check(completion));
@@ -154,36 +206,6 @@ pub fn evaluate_agent_run_contract_with_evidence(
                 ],
                 &["WebSearch", "WebFetch"],
             ],
-        ));
-    }
-    if contract_enabled(run_contract, "requires_executable_replay") {
-        checks.push(required_evidence_check(
-            "executable_replay",
-            evidence,
-            |receipt| receipt.executable_replay(),
-        ));
-    }
-    if contract_enabled(run_contract, "requires_full_depth_clob") {
-        checks.push(required_evidence_check(
-            "full_depth_clob",
-            evidence,
-            |receipt| receipt.full_depth(),
-        ));
-    }
-    if contract_enabled(run_contract, "requires_runtime_parity") {
-        checks.push(required_evidence_check(
-            "runtime_parity",
-            evidence,
-            |receipt| receipt.runtime_parity(),
-        ));
-    }
-    if contract_enabled(run_contract, "requires_realtime_runtime")
-        || contract_enabled(run_contract, "requires_realtime_evidence")
-    {
-        checks.push(required_evidence_check(
-            "realtime_runtime",
-            evidence,
-            |receipt| receipt.realtime_runtime(),
         ));
     }
     if contract_enabled(run_contract, "requires_operator_approval") {
@@ -371,6 +393,29 @@ fn check(name: &str, status: &str, detail: &str) -> ContractCheck {
 
 fn contract_enabled(contract: &str, key: &str) -> bool {
     agent_run_contract_value(contract, key).ok().flatten() == Some("true")
+}
+
+fn requested_evidence_capabilities_from_value(
+    request: &Value,
+    contract: &str,
+) -> Vec<&'static str> {
+    let mut capabilities = Vec::new();
+    if request.get("target_evidence").and_then(Value::as_str) == Some("executable_replay") {
+        capabilities.push("executable_replay");
+    }
+    for (key, capability) in [
+        ("requires_data_audit", "data_audit"),
+        ("requires_full_depth_clob", "full_depth_clob"),
+        ("requires_executable_replay", "executable_replay"),
+        ("requires_runtime_parity", "runtime_parity"),
+        ("requires_realtime_runtime", "realtime_runtime"),
+        ("requires_realtime_evidence", "realtime_runtime"),
+    ] {
+        if contract_enabled(contract, key) && !capabilities.contains(&capability) {
+            capabilities.push(capability);
+        }
+    }
+    capabilities
 }
 
 fn lower_cap_u32(key: &str, hard_cap: u32) -> u32 {

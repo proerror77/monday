@@ -9,7 +9,8 @@ use engines::{
 };
 use evaluation::{
     array_len, evaluate_agent_run_contract_with_evidence, evaluate_structured_output,
-    validate_admission, AdmissionLimits, ContractEvaluation,
+    validate_admission, validate_verified_evidence_requirements, AdmissionLimits,
+    ContractEvaluation,
 };
 use ploy_control_client::ControlPlaneClient;
 use ploy_operator_contracts::{
@@ -229,6 +230,8 @@ impl Sidecar {
                         .map_err(|reason| {
                         SidecarError::Message(format!("prediction evidence rejected: {reason}"))
                     })?;
+                validate_verified_evidence_requirements(&queued.request, &receipt)
+                    .map_err(SidecarError::Message)?;
                 evidence_prompt = format!(
                     "{}\n\nVerified evidence summary (parent-produced, read-only): {}",
                     queued.request.run_packet,
@@ -1489,8 +1492,8 @@ mod tests {
 
     #[test]
     fn queued_evidence_root_cannot_escape_configured_local_root() {
-        let dir =
-            std::env::temp_dir().join(format!("ploy-sidecar-evidence-root-{}", Uuid::new_v4()));
+        let temp = tempfile::tempdir().expect("create temp root");
+        let dir = temp.path().to_path_buf();
         let allowed = dir.join("allowed");
         let outside = dir.join("outside");
         fs::create_dir_all(&allowed).expect("allowed root");
@@ -1509,7 +1512,6 @@ mod tests {
         refs.artifact_root = outside.display().to_string();
         let error = verify_queued_prediction_evidence(&refs, &allowed).expect_err("root escape");
         assert!(error.contains("under the configured local root"));
-        fs::remove_dir_all(dir).expect("remove temp root");
     }
 
     #[test]
@@ -1543,21 +1545,23 @@ mod tests {
 
         let queue_dir = tempfile::tempdir().expect("queue temp");
         let store = QueueStore::for_dir(queue_dir.path());
-        let make_request =
-            |run_id: &str, refs: ploy_operator_contracts::diagnostics::PredictionEvidenceRefs| {
-                QueuedAgentRunRequest {
+        let make_request = |run_id: &str,
+                            refs: ploy_operator_contracts::diagnostics::PredictionEvidenceRefs,
+                            target_evidence: &str,
+                            run_contract: &str| {
+            QueuedAgentRunRequest {
                 run_id: run_id.to_string(),
                 created_at: Utc::now().to_rfc3339(),
                 request: serde_json::from_value(json!({
                     "objective":"Review the parent-produced prediction evidence",
                     "strategy_profile":"prediction_evidence_review",
                     "autonomy_mode":"research_until_blocked",
-                    "target_evidence":"diagnostic",
+                    "target_evidence":target_evidence,
                     "symbols":["BTCUSDT"],
                     "max_turns":3,
                     "budget_usd":1.0,
                     "run_packet":"Review the parent-produced prediction evidence.",
-                    "run_contract":"completion_signal = \"required\"\nrequires_full_depth_clob = true\nrequires_operator_approval = true",
+                    "run_contract":run_contract,
                     "prediction_evidence": refs
                 }))
                 .expect("queue request"),
@@ -1565,10 +1569,15 @@ mod tests {
                 last_retry_reason: None,
                 last_retried_at: None,
             }
-            };
+        };
         append_jsonl_sync(
             &store.requests_path,
-            &make_request("production-writer-evidence", refs_value.clone()),
+            &make_request(
+                "production-writer-evidence",
+                refs_value.clone(),
+                "diagnostic",
+                "completion_signal = \"required\"\nrequires_full_depth_clob = true\nrequires_operator_approval = true",
+            ),
         )
         .expect("queue production evidence request");
         let mut client = ControlPlaneClient::from_runtime_root(queue_dir.path().join("platform"));
@@ -1628,11 +1637,80 @@ mod tests {
             1
         );
 
-        let mut bad_refs = refs_value;
+        let mut bad_refs = refs_value.clone();
+        append_jsonl_sync(
+            &store.requests_path,
+            &make_request(
+                "production-writer-evidence-target-executable",
+                refs_value.clone(),
+                "executable_replay",
+                "completion_signal = \"required\"\nrequires_full_depth_clob = true\nrequires_operator_approval = true",
+            ),
+        )
+        .expect("queue target capability request");
+        sidecar
+            .run_cycle()
+            .expect("reject target capability before model");
+        let records = fs::read_to_string(&store.runs_path).expect("target capability records");
+        let target_record = records
+            .lines()
+            .map(|line| serde_json::from_str::<AgentRunRecord>(line).unwrap())
+            .find(|record| record.run_id == "production-writer-evidence-target-executable")
+            .unwrap();
+        assert_eq!(target_record.status, "failed");
+        assert!(target_record
+            .failure_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("executable_replay")));
+        assert_eq!(
+            fs::read_to_string(mock_path.with_extension("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
+        append_jsonl_sync(
+            &store.requests_path,
+            &make_request(
+                "production-writer-evidence-missing-audit",
+                refs_value.clone(),
+                "diagnostic",
+                "completion_signal = \"required\"\nrequires_data_audit = true\nrequires_full_depth_clob = true\nrequires_operator_approval = true",
+            ),
+        )
+        .expect("queue data audit capability request");
+        sidecar
+            .run_cycle()
+            .expect("reject missing audit before model");
+        let records = fs::read_to_string(&store.runs_path).expect("audit capability records");
+        let audit_record = records
+            .lines()
+            .map(|line| serde_json::from_str::<AgentRunRecord>(line).unwrap())
+            .find(|record| record.run_id == "production-writer-evidence-missing-audit")
+            .unwrap();
+        assert_eq!(audit_record.status, "failed");
+        assert!(audit_record
+            .failure_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("data_audit")));
+        assert_eq!(
+            fs::read_to_string(mock_path.with_extension("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
         bad_refs.terminal_receipt.artifact.path = "missing-terminal.json".to_string();
         append_jsonl_sync(
             &store.requests_path,
-            &make_request("production-writer-evidence-bad-terminal", bad_refs),
+            &make_request(
+                "production-writer-evidence-bad-terminal",
+                bad_refs,
+                "diagnostic",
+                "completion_signal = \"required\"\nrequires_full_depth_clob = true\nrequires_operator_approval = true",
+            ),
         )
         .expect("queue bad terminal request");
         sidecar
@@ -1671,8 +1749,8 @@ mod tests {
 
     #[test]
     fn run_cycle_consumes_claimed_request_and_records_terminal_result() {
-        let dir = std::env::temp_dir().join(format!("ploy-sidecar-cycle-{}", Uuid::new_v4()));
-        fs::create_dir_all(&dir).expect("create temp directory");
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let dir = temp.path().to_path_buf();
         let store = QueueStore::for_dir(&dir);
         append_jsonl_sync(
             &store.requests_path,
@@ -1735,6 +1813,5 @@ mod tests {
             .tool_calls
             .iter()
             .any(|call| call.name.contains("codex") || call.name.contains("xai")));
-        fs::remove_dir_all(dir).expect("remove temp directory");
     }
 }
