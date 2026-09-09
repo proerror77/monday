@@ -88,6 +88,34 @@ a single-use final dispatch claim and the final model evaluator are required
 before the later canonical final-evaluation stage can run. An older binary that
 cannot decode the closure receipt must not be used to resume that ledger.
 
+## Shared Campaign study budget
+
+Root V1 grants remain the historical per-family authority. A separate signed
+`monday.campaign_study_grant.v1` can bind a finite set of already registered
+root hashes to one immutable study. Each member records its family definition,
+full execution/input/protocol/view binding, and a canonical label-horizon hash.
+The study grant's issuer is the signed key ID, and its active window and
+`campaign_study` approval are checked at admission; revocation is recorded in
+the append-only study receipt chain.
+
+`AlphaStore` keeps an authenticated study head, receipt chain, and immutable
+family-member projection. A member reservation records the same trial,
+attempt, deadline, and token charges in the study ledger as in its family
+ledger. The study aggregate includes pending and uncertain consumption, so a
+lost or indeterminate Job remains charged. Direct Root V1 reservation,
+dispatch/adoption, and settlement methods consult the study membership inside
+their store transaction; an unlisted root or a family-only restore cannot
+downgrade to the legacy family budget.
+
+Study registration captures existing family usage atomically after locking the
+study and member family heads. Existing pending or uncertain member usage is
+rejected, while completed consumed usage is carried into the shared budget.
+Study snapshots include the authenticated study receipts and every member
+family snapshot, and recovery verifies both study and member heads before
+rebuilding the projections. This budget layer does not evaluate labels, open
+holdout data, or select a new learning horizon; those semantics remain a
+separately reviewed research/materialization change.
+
 ## Final evaluation boundary
 
 Final evaluation is a second authorization on an already closed family. The

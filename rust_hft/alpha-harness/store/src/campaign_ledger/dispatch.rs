@@ -121,6 +121,22 @@ impl AlphaStore {
         {
             return Err(err("terminal evidence differs from the reserved request"));
         }
+        let study_id = study::lock_member_settlement_guards(
+            &tx,
+            &self.integrity_key,
+            &expected.family_id,
+            at,
+        )?;
+        let prepared_study_id = study::prepare_member_settlement(
+            &tx,
+            &self.integrity_key,
+            &expected.family_id,
+            &evidence.settlement,
+            at,
+        )?;
+        if study_id != prepared_study_id {
+            return Err(err("study settlement membership changed"));
+        }
         let receipt = append(
             &tx,
             &self.integrity_key,
@@ -128,6 +144,15 @@ impl AlphaStore {
             CampaignLedgerEventV1::DispatchSettled {
                 evidence: evidence.clone(),
             },
+            at,
+        )?;
+        study::append_member_settlement(
+            &tx,
+            &self.integrity_key,
+            study_id.as_deref(),
+            &expected.family_id,
+            &evidence.settlement,
+            &receipt,
             at,
         )?;
         tx.commit().map_err(database_error)?;
@@ -171,6 +196,7 @@ impl AlphaStore {
         target.validate()?;
         let operation_id = reservation.operation_id().map_err(err)?;
         let tx = self.connection.transaction().map_err(database_error)?;
+        lock_dispatch_guards(&tx, &self.integrity_key, verified, reservation, at)?;
         let observed = checked_reservation(
             &tx,
             &self.integrity_key,
@@ -222,6 +248,7 @@ impl AlphaStore {
         validate_job_uid(job_uid)?;
         let operation_id = reservation.operation_id().map_err(err)?;
         let tx = self.connection.transaction().map_err(database_error)?;
+        lock_dispatch_guards(&tx, &self.integrity_key, verified, reservation, at)?;
         let observed = checked_reservation(
             &tx,
             &self.integrity_key,
@@ -276,23 +303,24 @@ impl AlphaStore {
             .roots
             .get(verified.content_sha256())
             .ok_or_else(|| err("missing root"))?;
-        serialize_approval_mutation(&tx, &root.approval.approval_id)?;
-        let changed = tx
-            .execute(
-                "UPDATE campaign_family_heads SET sequence = sequence WHERE family_id = ?",
-                params![reservation.family_id],
-            )
-            .map_err(database_error)?;
-        if changed != 1 {
-            return Err(err("missing family guard").into());
-        }
+        let approval_id = root.approval.approval_id.clone();
+        serialize_approval_mutation(&tx, &approval_id)?;
+        let admission_at = now();
+        study::lock_campaign_guards(
+            &tx,
+            &self.integrity_key,
+            verified,
+            &reservation.family_id,
+            admission_at,
+            true,
+        )?;
         let observed = checked_reservation(
             &tx,
             &self.integrity_key,
             verified,
             &reservation.family_id,
             &operation_id,
-            now(),
+            admission_at,
             true,
         )?;
         if observed != *reservation {
@@ -353,6 +381,7 @@ pub(super) fn checked_reservation(
             return Err(err("Job exceeds scheduled revocation"));
         }
     }
+    study::check_member_reservation(conn, key, verified, &a.reservation, at, require_publication)?;
     if !require_publication {
         return Ok(a.reservation.clone());
     }
@@ -362,4 +391,22 @@ pub(super) fn checked_reservation(
         .map_or(a.sequence, |dispatch| dispatch.sequence);
     require_published_receipts(conn, key, family, &history, through)?;
     Ok(a.reservation.clone())
+}
+
+fn lock_dispatch_guards(
+    tx: &Transaction<'_>,
+    key: &[u8; 32],
+    verified: &VerifiedCampaignRootGrant,
+    reservation: &CampaignAttemptReservationV1,
+    at: DateTime<Utc>,
+) -> Result<(), StoreError> {
+    let (state, _) = load(tx, key, &reservation.family_id)?;
+    let root = state
+        .roots
+        .get(verified.content_sha256())
+        .ok_or_else(|| err("missing root"))?;
+    let approval_id = root.approval.approval_id.clone();
+    serialize_approval_mutation(tx, &approval_id)?;
+    study::lock_campaign_guards(tx, key, verified, &reservation.family_id, at, true)?;
+    Ok(())
 }

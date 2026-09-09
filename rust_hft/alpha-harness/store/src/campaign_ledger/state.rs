@@ -33,6 +33,7 @@ pub(super) struct State {
     pub roots: BTreeMap<String, Root>,
     pub attempts: BTreeMap<String, Attempt>,
     pub final_closure: Option<FinalClosure>,
+    pub study_member_binding: Option<(String, String, CampaignStudyMemberV1)>,
 }
 
 impl State {
@@ -71,6 +72,7 @@ impl State {
             && matches!(
                 &receipt.event,
                 CampaignLedgerEventV1::RootRegistered { .. }
+                    | CampaignLedgerEventV1::StudyMemberBound { .. }
                     | CampaignLedgerEventV1::AttemptReserved { .. }
                     | CampaignLedgerEventV1::DispatchClaimed { .. }
                     | CampaignLedgerEventV1::DispatchJobBound { .. }
@@ -120,6 +122,9 @@ impl State {
                 {
                     return Err(err("root identity was already registered"));
                 }
+                if self.study_member_binding.is_some() {
+                    return Err(err("study-bound family cannot register another root"));
+                }
                 self.family = Some(grant.family.clone());
                 self.roots.insert(
                     verified.content_sha256().into(),
@@ -130,6 +135,35 @@ impl State {
                         revoked_at: None,
                     },
                 );
+            }
+            CampaignLedgerEventV1::StudyMemberBound {
+                study_id,
+                study_grant_sha256,
+                member,
+            } => {
+                member.validate().map_err(err)?;
+                if !valid_study_id(study_id)
+                    || !valid_digest(study_grant_sha256)
+                    || receipt.family_id != member.family_id
+                {
+                    return Err(err("study member binding identity is invalid"));
+                }
+                let root = self
+                    .roots
+                    .get(&member.root_grant_sha256)
+                    .ok_or_else(|| err("study member root is not registered"))?;
+                if !member.matches_root(root.grant.grant(), root.grant.content_sha256()) {
+                    return Err(err("study member root semantic binding differs"));
+                }
+                let binding = (study_id.clone(), study_grant_sha256.clone(), member.clone());
+                if self
+                    .study_member_binding
+                    .as_ref()
+                    .is_some_and(|existing| existing != &binding)
+                {
+                    return Err(err("family is already assigned to a different study"));
+                }
+                self.study_member_binding = Some(binding);
             }
             CampaignLedgerEventV1::AttemptReserved { reservation } => {
                 let root = self
@@ -534,4 +568,19 @@ impl State {
         }
         Ok(())
     }
+}
+
+fn valid_study_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte))
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
