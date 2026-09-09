@@ -33,11 +33,15 @@ impl SpotReferenceSource for HttpReferenceSource {
     }
 
     async fn server_time(&self) -> anyhow::Result<TimedJson> {
-        self.get_public(SERVER_TIME_ENDPOINT).await
+        self.get_public(SERVER_TIME_ENDPOINT)
+            .await
+            .map_err(anyhow::Error::new)
     }
 
     async fn exchange_info(&self) -> anyhow::Result<TimedJson> {
-        self.get_public(EXCHANGE_INFO_ENDPOINT).await
+        self.get_public(EXCHANGE_INFO_ENDPOINT)
+            .await
+            .map_err(anyhow::Error::new)
     }
 }
 

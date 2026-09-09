@@ -13,6 +13,7 @@ audit = ["dep:sqlx"]
 live = [
     "audit",
     "dep:adapter-binance-data",
+    "dep:data",
     "dep:adapter-polymarket-data",
     "dep:crc32fast",
     "dep:futures",
@@ -24,6 +25,7 @@ live = [
 
 [dependencies]
 adapter-binance-data = { package = "hft-data-adapter-binance", path = "../../../data-pipelines/adapters/adapter-binance", optional = true }
+data = { package = "hft-data", path = "../../../data-pipelines/core", optional = true }
 adapter-polymarket-data = { package = "hft-data-adapter-polymarket", path = "../../../data-pipelines/adapters/adapter-polymarket", optional = true }
 anyhow = "1"
 chrono.workspace = true
@@ -46,6 +48,7 @@ tracing.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 chrono.workspace = true
 rust_decimal_macros.workspace = true
 serde_json.workspace = true

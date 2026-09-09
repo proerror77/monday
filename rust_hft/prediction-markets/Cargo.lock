@@ -4228,9 +4228,11 @@ dependencies = [
  "hft-data-adapters-common",
  "hft-integration",
  "hft-ports",
+ "reqwest 0.12.28",
  "rust_decimal",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "url",
@@ -5874,9 +5876,11 @@ name = "ploy-market-data"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "crc32fast",
  "futures",
+ "hft-data",
  "hft-data-adapter-binance",
  "hft-data-adapter-polymarket",
  "libc",

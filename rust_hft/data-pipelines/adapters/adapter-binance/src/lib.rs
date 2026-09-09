@@ -24,12 +24,21 @@ use tracing::{error, info, warn};
 
 mod converter;
 mod message_types;
+pub mod reference;
 mod rest;
 mod websocket;
 
 // Re-export for benchmarks and external use
 pub use converter::MessageConverter;
 pub use message_types::{AggregateTradeEvent, BookTickerEvent, DepthSnapshot};
+pub use reference::{
+    BinanceReferenceError, HttpReferenceSource, ReferenceResult, ReferenceSource, TimedJson,
+    BASIS_ENDPOINT as REFERENCE_BASIS_ENDPOINT,
+    EXCHANGE_INFO_ENDPOINT as REFERENCE_EXCHANGE_INFO_ENDPOINT, OFFICIAL_SPOT_SOURCE_ORIGIN,
+    OFFICIAL_USDM_SOURCE_ORIGIN, OPEN_INTEREST_ENDPOINT as REFERENCE_OPEN_INTEREST_ENDPOINT,
+    PREMIUM_INDEX_ENDPOINT as REFERENCE_PREMIUM_INDEX_ENDPOINT,
+    SERVER_TIME_ENDPOINT as REFERENCE_SERVER_TIME_ENDPOINT,
+};
 pub use rest::BinanceRestClient;
 pub use websocket::BinanceWebSocket;
 

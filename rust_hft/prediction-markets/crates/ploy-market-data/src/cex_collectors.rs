@@ -5,7 +5,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use adapter_binance_data::{
+    BinanceReferenceError, BinanceWebSocket, HttpReferenceSource, ReferenceSource, Symbol,
+    TimedJson,
+};
 use chrono::{DateTime, TimeZone, Utc};
+use data::binance_usdm_reference::{
+    basis_observation, force_order_observation, mark_index_funding_observations,
+    open_interest_observation, BasisObservation, ForceOrderObservation,
+    MarkIndexFundingObservation, OpenInterestObservation,
+};
 use futures::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
 use serde_json::Value;
@@ -13,8 +22,6 @@ use sqlx::PgPool;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 
-const BINANCE_FUTURES_REST: &str = "https://fapi.binance.com";
-const BINANCE_FUTURES_WS: &str = "wss://fstream.binance.com/stream";
 const OKX_WS: &str = "wss://ws.okx.com:8443/ws/v5/public";
 const BYBIT_WS: &str = "wss://stream.bybit.com/v5/public/spot";
 const COINBASE_WS: &str = "wss://advanced-trade-ws.coinbase.com";
@@ -48,6 +55,20 @@ pub struct NormalizedTick {
     pub exchange_symbol: String,
     pub kind: String,
     pub event_time: DateTime<Utc>,
+    /// Local receipt time. Binance reference rows must carry this explicitly;
+    /// other CEX book adapters fill it at their message-processing boundary.
+    pub received_at: DateTime<Utc>,
+    /// Basis endpoint interval timestamp and local receipt, kept separate from
+    /// the mark/index event clock in `event_time`.
+    pub basis_event_time: Option<DateTime<Utc>>,
+    pub basis_received_at: Option<DateTime<Utc>>,
+    pub basis_reference: Option<BasisObservation>,
+    pub force_order_reference: Option<ForceOrderObservation>,
+    /// Canonical typed reference payload retained beside the original wire
+    /// body so downstream readers do not have to re-parse `raw`.
+    pub typed_reference: Option<Value>,
+    /// Coverage claim attached to a typed reference observation.
+    pub coverage: Option<String>,
     pub update_id: Option<i64>,
     pub sequence_id: Option<i64>,
     pub mark_price: Option<Decimal>,
@@ -76,39 +97,50 @@ pub struct NormalizedTick {
     pub raw: Value,
 }
 
-pub fn normalize_binance_futures(
-    premium: &Value,
-    open_interest: &Value,
-    basis: Option<&Value>,
+pub fn normalize_binance_reference(
+    mark: &MarkIndexFundingObservation,
+    open_interest: &OpenInterestObservation,
+    basis: &BasisObservation,
+    raw: Value,
 ) -> Result<NormalizedTick> {
-    let symbol = required_str(premium, "symbol")?.to_uppercase();
-    if open_interest["symbol"].as_str() != Some(symbol.as_str()) {
-        return Err(invalid("Binance futures symbol mismatch"));
+    if mark.symbol != open_interest.symbol || mark.symbol != basis.symbol {
+        return Err(invalid("Binance reference symbol mismatch"));
     }
-    let event_ms = required_i64(premium, "time")?;
-    let basis_row = basis
-        .and_then(Value::as_array)
-        .and_then(|rows| rows.first());
+    let source_time_ms = mark.source_time_ms;
+    let received_at_ns = mark
+        .received_at_ns
+        .max(open_interest.received_at_ns)
+        .max(basis.received_at_ns);
+    let event_time = ms_to_utc_u64(source_time_ms)?;
+    let received_at = ns_to_utc(received_at_ns)?;
     Ok(NormalizedTick {
         exchange: "binance".to_string(),
         market_type: "perpetual".to_string(),
-        symbol: symbol.clone(),
-        exchange_symbol: symbol,
+        symbol: mark.symbol.clone(),
+        exchange_symbol: mark.symbol.clone(),
         kind: "derivatives_snapshot".to_string(),
-        event_time: ms_to_utc(event_ms)?,
+        event_time,
+        received_at,
+        basis_event_time: Some(ms_to_utc_u64(basis.source_time_ms)?),
+        basis_received_at: Some(ns_to_utc(basis.received_at_ns)?),
+        basis_reference: Some(basis.clone()),
+        force_order_reference: None,
+        typed_reference: Some(serde_json::json!({
+            "mark_index_funding": mark,
+            "open_interest": open_interest,
+            "basis": basis,
+        })),
+        coverage: None,
         update_id: None,
         sequence_id: None,
-        mark_price: decimal_field(premium, "markPrice"),
-        index_price: decimal_field(premium, "indexPrice"),
-        funding_rate: decimal_field(premium, "lastFundingRate"),
-        open_interest: decimal_field(open_interest, "openInterest"),
-        basis: basis_row.and_then(|row| decimal_field(row, "basis")),
-        basis_rate: basis_row.and_then(|row| decimal_field(row, "basisRate")),
-        annualized_basis_rate: basis_row.and_then(|row| decimal_field(row, "annualizedBasisRate")),
-        next_funding_time: premium["nextFundingTime"]
-            .as_i64()
-            .map(ms_to_utc)
-            .transpose()?,
+        mark_price: Some(mark.mark_price),
+        index_price: Some(mark.index_price),
+        funding_rate: Some(mark.last_funding_rate),
+        open_interest: Some(open_interest.open_interest),
+        basis: Some(basis.basis),
+        basis_rate: Some(basis.basis_rate),
+        annualized_basis_rate: basis.annualized_basis_rate,
+        next_funding_time: Some(ms_to_utc_u64(mark.next_funding_time_ms)?),
         side: None,
         price: None,
         quantity: None,
@@ -123,31 +155,32 @@ pub fn normalize_binance_futures(
         bids: None,
         asks: None,
         source: "binance_futures_rest".to_string(),
-        dedupe_key: event_ms.to_string(),
-        raw: serde_json::json!({"premium": premium, "open_interest": open_interest, "basis": basis_row}),
+        dedupe_key: format!(
+            "{}:{}:{}",
+            mark.source_time_ms, basis.source_time_ms, open_interest.source_time_ms
+        ),
+        raw,
     })
 }
 
-pub fn normalize_binance_liquidation(message: &Value) -> Result<NormalizedTick> {
-    let data = message.get("data").unwrap_or(message);
-    let order = data
-        .get("o")
-        .ok_or_else(|| invalid("Binance liquidation missing order"))?;
-    let symbol = required_str(order, "s")?.to_uppercase();
-    let event_ms = order["T"]
-        .as_i64()
-        .or_else(|| data["E"].as_i64())
-        .ok_or_else(|| invalid("Binance liquidation missing event time"))?;
-    let side = required_str(order, "S")?.to_uppercase();
-    let price = decimal_field(order, "ap").or_else(|| decimal_field(order, "p"));
-    let quantity = decimal_field(order, "z").or_else(|| decimal_field(order, "q"));
+pub fn normalize_binance_liquidation(
+    observation: &ForceOrderObservation,
+    raw: Value,
+) -> Result<NormalizedTick> {
     Ok(NormalizedTick {
         exchange: "binance".to_string(),
         market_type: "perpetual".to_string(),
-        symbol: symbol.clone(),
-        exchange_symbol: symbol.clone(),
+        symbol: observation.symbol.clone(),
+        exchange_symbol: observation.symbol.clone(),
         kind: "liquidation".to_string(),
-        event_time: ms_to_utc(event_ms)?,
+        event_time: ms_to_utc_u64(observation.event_time_ms)?,
+        received_at: ns_to_utc(observation.received_at_ns)?,
+        basis_event_time: None,
+        basis_received_at: None,
+        basis_reference: None,
+        force_order_reference: Some(observation.clone()),
+        typed_reference: Some(serde_json::to_value(observation)?),
+        coverage: Some(observation.coverage.clone()),
         update_id: None,
         sequence_id: None,
         mark_price: None,
@@ -158,9 +191,10 @@ pub fn normalize_binance_liquidation(message: &Value) -> Result<NormalizedTick> 
         basis_rate: None,
         annualized_basis_rate: None,
         next_funding_time: None,
-        side: Some(side.clone()),
-        price,
-        quantity,
+        side: Some(observation.side.clone()),
+        price: Some(observation.average_price),
+        // This is the venue-reported cumulative quantity, not a local fill.
+        quantity: Some(observation.cumulative_filled_quantity),
         best_bid: None,
         best_ask: None,
         mid_price: None,
@@ -172,12 +206,8 @@ pub fn normalize_binance_liquidation(message: &Value) -> Result<NormalizedTick> 
         bids: None,
         asks: None,
         source: "binance_force_order_ws".to_string(),
-        dedupe_key: format!(
-            "{symbol}:{event_ms}:{side}:{}:{}",
-            price.unwrap_or_default(),
-            quantity.unwrap_or_default()
-        ),
-        raw: message.clone(),
+        dedupe_key: observation.content_identity(),
+        raw,
     })
 }
 
@@ -185,12 +215,6 @@ fn required_str<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
     value[field]
         .as_str()
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| invalid(format!("missing {field}")))
-}
-
-fn required_i64(value: &Value, field: &str) -> Result<i64> {
-    value[field]
-        .as_i64()
         .ok_or_else(|| invalid(format!("missing {field}")))
 }
 
@@ -211,6 +235,18 @@ fn ms_to_utc(ms: i64) -> Result<DateTime<Utc>> {
     Utc.timestamp_millis_opt(ms)
         .single()
         .ok_or_else(|| invalid(format!("invalid millisecond timestamp {ms}")))
+}
+
+fn ms_to_utc_u64(ms: u64) -> Result<DateTime<Utc>> {
+    let ms = i64::try_from(ms).map_err(|_| invalid(format!("timestamp exceeds i64: {ms}")))?;
+    ms_to_utc(ms)
+}
+
+fn ns_to_utc(ns: u64) -> Result<DateTime<Utc>> {
+    let seconds = i64::try_from(ns / 1_000_000_000)
+        .map_err(|_| invalid(format!("nanosecond timestamp exceeds i64: {ns}")))?;
+    DateTime::from_timestamp(seconds, (ns % 1_000_000_000) as u32)
+        .ok_or_else(|| invalid(format!("invalid nanosecond timestamp {ns}")))
 }
 
 fn parse_time(value: &Value) -> Result<DateTime<Utc>> {
@@ -327,6 +363,13 @@ impl CexBook {
             exchange_symbol: self.exchange_symbol.clone(),
             kind: "lob".to_string(),
             event_time: update.event_time,
+            received_at: Utc::now(),
+            basis_event_time: None,
+            basis_received_at: None,
+            basis_reference: None,
+            force_order_reference: None,
+            typed_reference: None,
+            coverage: None,
             update_id: update.update_id,
             sequence_id: update.sequence_id,
             mark_price: None,
@@ -610,11 +653,24 @@ async fn run_binance_futures(
     poll_secs: u64,
     running: Arc<AtomicBool>,
 ) {
-    let client = reqwest::Client::new();
+    let source = match HttpReferenceSource::official(Duration::from_secs(15)) {
+        Ok(source) => source,
+        Err(error) => {
+            warn!(%error, "failed to build shared Binance reference source");
+            return;
+        }
+    };
     while running.load(Ordering::SeqCst) {
-        for asset in &assets {
-            let symbol = format!("{asset}USDT");
-            match fetch_binance_futures(&client, &symbol).await {
+        let results = match fetch_binance_futures_poll(&source, &assets).await {
+            Ok(results) => results,
+            Err(error) => {
+                warn!(%error, "failed to fetch Binance premium index snapshot");
+                tokio::time::sleep(Duration::from_secs(poll_secs.max(1))).await;
+                continue;
+            }
+        };
+        for (symbol, result) in results {
+            match result {
                 Ok(tick) => {
                     if let Err(error) = persist_tick(&pool, &tick).await {
                         error!(%symbol, %error, "failed to persist Binance futures snapshot");
@@ -627,62 +683,122 @@ async fn run_binance_futures(
     }
 }
 
-async fn fetch_binance_futures(client: &reqwest::Client, symbol: &str) -> Result<NormalizedTick> {
-    async fn get(client: &reqwest::Client, path: &str, query: &[(&str, &str)]) -> Result<Value> {
-        client
-            .get(format!("{BINANCE_FUTURES_REST}{path}"))
-            .query(query)
-            .timeout(Duration::from_secs(15))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await
-            .map_err(CexCollectorError::from)
+/// Fetch one all-market premium snapshot per poll, then select only the
+/// configured symbols while retrieving their symbol-scoped reference rows.
+async fn fetch_binance_futures_poll(
+    source: &dyn ReferenceSource,
+    assets: &[String],
+) -> Result<Vec<(String, Result<NormalizedTick>)>> {
+    if assets.is_empty() {
+        return Ok(Vec::new());
     }
-    let premium = get(client, "/fapi/v1/premiumIndex", &[("symbol", symbol)]).await?;
-    let open_interest = get(client, "/fapi/v1/openInterest", &[("symbol", symbol)]).await?;
-    let basis = get(
-        client,
-        "/futures/data/basis",
-        &[
-            ("pair", symbol),
-            ("contractType", "PERPETUAL"),
-            ("period", "5m"),
-            ("limit", "1"),
-        ],
-    )
-    .await?;
-    normalize_binance_futures(&premium, &open_interest, Some(&basis))
+    let premium = source.premium_index().await.map_err(reference_error)?;
+    let mut results = Vec::with_capacity(assets.len());
+    for asset in assets {
+        let symbol = format!("{asset}USDT");
+        let result = fetch_binance_futures(source, &premium, &symbol).await;
+        results.push((symbol, result));
+    }
+    Ok(results)
 }
 
-async fn run_binance_liquidations(pool: PgPool, assets: Vec<String>, running: Arc<AtomicBool>) {
-    let streams: Vec<String> = assets
+async fn fetch_binance_futures(
+    source: &dyn ReferenceSource,
+    premium: &TimedJson,
+    symbol: &str,
+) -> Result<NormalizedTick> {
+    let open_interest_response = source
+        .open_interest(symbol)
+        .await
+        .map_err(reference_error)?;
+    let basis_response = source.basis(symbol, "5m").await.map_err(reference_error)?;
+    let expected = std::collections::BTreeSet::from([symbol.to_ascii_uppercase()]);
+    let premium_rows = premium
+        .value
+        .as_array()
+        .ok_or_else(|| invalid("Binance premiumIndex response must be an array"))?;
+    let raw_premium = premium_rows
         .iter()
-        .map(|asset| format!("{}usdt@forceOrder", asset.to_lowercase()))
+        .find(|row| {
+            row.get("symbol")
+                .and_then(Value::as_str)
+                .is_some_and(|row_symbol| row_symbol.eq_ignore_ascii_case(symbol))
+        })
+        .cloned()
+        .ok_or_else(|| invalid("Binance premiumIndex returned no requested symbol"))?;
+    let mut marks =
+        mark_index_funding_observations(&premium.value, &expected, premium.received_at_ns)
+            .map_err(|error| invalid(error.to_string()))?;
+    let mark = marks
+        .pop()
+        .ok_or_else(|| invalid("Binance premiumIndex returned no requested symbol"))?;
+    let open_interest = open_interest_observation(
+        &open_interest_response.value,
+        symbol,
+        open_interest_response.received_at_ns,
+    )
+    .map_err(|error| invalid(error.to_string()))?;
+    let basis = basis_observation(
+        &basis_response.value,
+        symbol,
+        "5m",
+        basis_response.received_at_ns,
+    )
+    .map_err(|error| invalid(error.to_string()))?;
+    let raw = serde_json::json!({
+        "premium_index": {
+            "value": raw_premium,
+            "received_at_ns": premium.received_at_ns
+        },
+        "open_interest": {
+            "value": open_interest_response.value,
+            "received_at_ns": open_interest_response.received_at_ns
+        },
+        "basis": {
+            "value": basis_response.value,
+            "received_at_ns": basis_response.received_at_ns
+        }
+    });
+    normalize_binance_reference(&mark, &open_interest, &basis, raw)
+}
+
+/// Capture force-order notifications for the configured symbols. Binance's
+/// per-symbol streams are a bounded observation sample and cannot establish
+/// full-market liquidation coverage or a local execution/fill outcome.
+async fn run_binance_liquidations(pool: PgPool, assets: Vec<String>, running: Arc<AtomicBool>) {
+    let symbols: Vec<Symbol> = assets
+        .iter()
+        .map(|asset| Symbol::new(format!("{asset}USDT")))
         .collect();
     while running.load(Ordering::SeqCst) {
         let result = async {
-            let stream_url = format!("{BINANCE_FUTURES_WS}?streams={}", streams.join("/"));
-            let (socket, _) = connect_async(stream_url).await?;
-            let (mut write, mut read) = socket.split();
+            let mut socket = BinanceWebSocket::new().with_usdm();
+            socket
+                .connect_and_subscribe_force_orders(symbols.clone())
+                .await
+                .map_err(|error| invalid(error.to_string()))?;
             while running.load(Ordering::SeqCst) {
-                let Some(message) = read.next().await else {
+                let Some((bytes, metrics)) = socket
+                    .receive_message_bytes_with_metrics()
+                    .await
+                    .map_err(|error| invalid(error.to_string()))?
+                else {
                     break;
                 };
-                match message? {
-                    Message::Text(text) => {
-                        let raw: Value = serde_json::from_str(&text)?;
-                        if raw.get("result").is_some() {
-                            continue;
-                        }
-                        let tick = normalize_binance_liquidation(&raw)?;
-                        persist_tick(&pool, &tick).await?;
-                    }
-                    Message::Ping(payload) => write.send(Message::Pong(payload)).await?,
-                    Message::Close(_) => break,
-                    _ => {}
+                let received_at_us = metrics.received_at_unix_us.ok_or_else(|| {
+                    invalid("Binance forceOrder frame omitted local receive clock")
+                })?;
+                let received_at_ns = received_at_us
+                    .checked_mul(1_000)
+                    .ok_or_else(|| invalid("Binance forceOrder receive clock overflow"))?;
+                let raw: Value = serde_json::from_slice(&bytes)?;
+                if raw.get("result").is_some() {
+                    continue;
                 }
+                let observation = force_order_observation(&raw, received_at_ns)
+                    .map_err(|error| invalid(error.to_string()))?;
+                let tick = normalize_binance_liquidation(&observation, raw)?;
+                persist_tick(&pool, &tick).await?;
             }
             Ok::<(), CexCollectorError>(())
         }
@@ -692,6 +808,10 @@ async fn run_binance_liquidations(pool: PgPool, assets: Vec<String>, running: Ar
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
+}
+
+fn reference_error(error: BinanceReferenceError) -> CexCollectorError {
+    invalid(error.to_string())
 }
 
 async fn run_book_collector(
@@ -838,6 +958,7 @@ fn heartbeat_message(exchange: &str) -> Option<Message> {
 }
 
 async fn persist_tick(pool: &PgPool, tick: &NormalizedTick) -> Result<()> {
+    let received_at = tick.received_at;
     sqlx::query(
         r#"INSERT INTO cex_public_market_ticks (
             exchange, market_type, symbol, exchange_symbol, kind, event_time,
@@ -845,10 +966,10 @@ async fn persist_tick(pool: &PgPool, tick: &NormalizedTick) -> Result<()> {
             open_interest, basis, basis_rate, annualized_basis_rate,
             next_funding_time, side, price, quantity, best_bid, best_ask,
             mid_price, spread_bps, obi_5, obi_10, bid_volume_5, ask_volume_5,
-            bids, asks, source, dedupe_key, raw
+            bids, asks, source, dedupe_key, raw, typed_reference, coverage, received_at
         ) VALUES (
             $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
-            $17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32
+            $17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35
         ) ON CONFLICT (exchange, kind, exchange_symbol, dedupe_key) DO NOTHING"#,
     )
     .bind(&tick.exchange)
@@ -883,6 +1004,9 @@ async fn persist_tick(pool: &PgPool, tick: &NormalizedTick) -> Result<()> {
     .bind(&tick.source)
     .bind(&tick.dedupe_key)
     .bind(&tick.raw)
+    .bind(&tick.typed_reference)
+    .bind(&tick.coverage)
+    .bind(received_at)
     .execute(pool)
     .await?;
     Ok(())
@@ -890,33 +1014,239 @@ async fn persist_tick(pool: &PgPool, tick: &NormalizedTick) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use adapter_binance_data::{ReferenceResult, TimedJson, OFFICIAL_USDM_SOURCE_ORIGIN};
+    use async_trait::async_trait;
     use rust_decimal_macros::dec;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     use super::*;
 
+    struct CountingReferenceSource {
+        premium_calls: AtomicUsize,
+        requested_symbols: Mutex<Vec<String>>,
+    }
+
+    impl CountingReferenceSource {
+        fn timed_at(value: Value, received_at_ns: u64) -> TimedJson {
+            TimedJson {
+                value,
+                received_at_ns,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ReferenceSource for CountingReferenceSource {
+        fn source_origin(&self) -> &str {
+            OFFICIAL_USDM_SOURCE_ORIGIN
+        }
+
+        async fn server_time(&self) -> ReferenceResult<TimedJson> {
+            Err(BinanceReferenceError::Unsupported {
+                endpoint: "server_time".to_owned(),
+            })
+        }
+
+        async fn exchange_info(&self) -> ReferenceResult<TimedJson> {
+            Err(BinanceReferenceError::Unsupported {
+                endpoint: "exchange_info".to_owned(),
+            })
+        }
+
+        async fn premium_index(&self) -> ReferenceResult<TimedJson> {
+            self.premium_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Self::timed_at(
+                json!([
+                    {"symbol":"BTCUSDT","markPrice":"101","indexPrice":"100","lastFundingRate":"0.0001","interestRate":"0.0001","nextFundingTime":1_700_028_800_000_u64,"time":1_700_000_000_000_u64,"unknownPremiumField":"preserve-me"},
+                    {"symbol":"ETHUSDT","markPrice":"201","indexPrice":"200","lastFundingRate":"0.0001","interestRate":"0.0001","nextFundingTime":1_700_028_800_000_u64,"time":1_700_000_000_000_u64}
+                ]),
+                1_700_000_000_500_000_000,
+            ))
+        }
+
+        async fn basis(&self, pair: &str, _period: &str) -> ReferenceResult<TimedJson> {
+            self.requested_symbols
+                .lock()
+                .unwrap()
+                .push(format!("basis:{pair}"));
+            Ok(Self::timed_at(
+                json!([{
+                    "pair":pair,"contractType":"PERPETUAL","indexPrice":"100","futuresPrice":"101",
+                    "basis":"1","basisRate":"0.01","annualizedBasisRate":"","timestamp":1_700_000_000_000_u64,
+                    "unknownBasisField":"preserve-me"
+                }]),
+                1_700_000_000_520_000_000,
+            ))
+        }
+
+        async fn open_interest(&self, symbol: &str) -> ReferenceResult<TimedJson> {
+            self.requested_symbols
+                .lock()
+                .unwrap()
+                .push(format!("open_interest:{symbol}"));
+            Ok(Self::timed_at(
+                json!({
+                    "symbol":symbol,"openInterest":"12.3","time":1_700_000_000_000_u64,
+                    "unknownOpenInterestField":"preserve-me"
+                }),
+                1_700_000_000_540_000_000,
+            ))
+        }
+    }
+
     #[test]
     fn normalizes_binance_futures_and_liquidation_payloads() {
-        let premium = json!({
+        let premium = json!([{
             "symbol":"BTCUSDT","markPrice":"11793.63104562","indexPrice":"11781.80495970",
-            "lastFundingRate":"0.00038246","nextFundingTime":1597392000000_i64,
-            "time":1597370495002_i64
-        });
+            "lastFundingRate":"0.00038246","interestRate":"0.0001",
+            "nextFundingTime":1597392000000_u64,"time":1597370495002_u64
+        }]);
         let oi = json!({"openInterest":"10659.509","symbol":"BTCUSDT","time":1597370495002_i64});
-        let basis = json!([{"pair":"BTCUSDT","basis":"13.94054945","basisRate":"0.0004",
-            "annualizedBasisRate":"0.035","timestamp":1597370400000_i64}]);
-        let tick = normalize_binance_futures(&premium, &oi, Some(&basis)).unwrap();
+        let basis = json!([{"pair":"BTCUSDT","contractType":"PERPETUAL",
+            "indexPrice":"11781.80495970","futuresPrice":"11795.74550915",
+            "basis":"13.94054945","basisRate":"0.0004","annualizedBasisRate":"0.035",
+            "timestamp":1597370495002_u64}]);
+        let received_at_ns = 1_597_370_495_500_000_000;
+        let expected = std::collections::BTreeSet::from(["BTCUSDT".to_string()]);
+        let mark = mark_index_funding_observations(&premium, &expected, received_at_ns)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let oi = open_interest_observation(&oi, "BTCUSDT", received_at_ns).unwrap();
+        let basis = basis_observation(&basis, "BTCUSDT", "5m", received_at_ns).unwrap();
+        let tick = normalize_binance_reference(
+            &mark,
+            &oi,
+            &basis,
+            json!({"premium_index": premium, "open_interest": oi.clone(), "basis": basis.clone()}),
+        )
+        .unwrap();
         assert_eq!(tick.mark_price, Some(dec!(11793.63104562)));
         assert_eq!(tick.open_interest, Some(dec!(10659.509)));
         assert_eq!(tick.basis_rate, Some(dec!(0.0004)));
+        assert_eq!(tick.annualized_basis_rate, Some(dec!(0.035)));
+        assert_eq!(
+            tick.typed_reference.as_ref().unwrap()["basis"]["period"],
+            "5m"
+        );
+        assert_eq!(
+            tick.received_at.timestamp_millis(),
+            (received_at_ns / 1_000_000) as i64
+        );
+        assert_eq!(
+            tick.basis_event_time.unwrap().timestamp_millis(),
+            1597370495002
+        );
 
-        let liquidation = json!({"stream":"btcusdt@forceOrder","data":{"E":1568014460893_i64,"o":{
-            "s":"BTCUSDT","S":"SELL","q":"0.014","p":"9910","ap":"9910","z":"0.014","T":1568014460893_i64
+        let liquidation = json!({"stream":"btcusdt@forceOrder","data":{"e":"forceOrder","E":1568014460893_i64,"o":{
+            "s":"BTCUSDT","S":"SELL","o":"LIMIT","f":"IOC","q":"0.014","p":"9910",
+            "ap":"9910","X":"FILLED","l":"0.014","z":"0.014","T":1568014460893_i64
         }}});
-        let tick = normalize_binance_liquidation(&liquidation).unwrap();
+        let observation = force_order_observation(&liquidation, 1_568_014_460_900_000_000).unwrap();
+        let tick = normalize_binance_liquidation(&observation, liquidation.clone()).unwrap();
         assert_eq!(tick.kind, "liquidation");
         assert_eq!(tick.side.as_deref(), Some("SELL"));
         assert_eq!(tick.quantity, Some(dec!(0.014)));
+        assert_eq!(
+            tick.force_order_reference.as_ref().unwrap().status,
+            "FILLED"
+        );
+        assert_eq!(
+            tick.coverage.as_deref(),
+            Some("configured_symbols_only_not_full_market")
+        );
+        assert_eq!(
+            tick.typed_reference.as_ref().unwrap()["coverage"],
+            "configured_symbols_only_not_full_market"
+        );
+
+        let mut opposite_side = liquidation.clone();
+        opposite_side["data"]["o"]["S"] = json!("BUY");
+        let opposite_observation =
+            force_order_observation(&opposite_side, 1_568_014_460_900_000_000).unwrap();
+        let opposite_tick =
+            normalize_binance_liquidation(&opposite_observation, opposite_side).unwrap();
+        assert_ne!(tick.dedupe_key, opposite_tick.dedupe_key);
+
+        let replay_observation = force_order_observation(
+            &json!({"stream":"btcusdt@forceOrder","data":{"e":"forceOrder","E":1568014460893_i64,"o":{
+                "s":"BTCUSDT","S":"SELL","o":"LIMIT","f":"IOC","q":"0.014","p":"9910",
+                "ap":"9910","X":"FILLED","l":"0.014","z":"0.014","T":1568014460893_i64
+            }}}),
+            1_568_014_461_000_000_000,
+        )
+        .unwrap();
+        let replay_tick =
+            normalize_binance_liquidation(&replay_observation, json!({"replayed":true})).unwrap();
+        assert_eq!(tick.dedupe_key, replay_tick.dedupe_key);
+    }
+
+    #[tokio::test]
+    async fn futures_poll_fetches_all_market_premium_once_and_selects_requested_symbols() {
+        let source = CountingReferenceSource {
+            premium_calls: AtomicUsize::new(0),
+            requested_symbols: Mutex::new(Vec::new()),
+        };
+        let assets = vec!["BTC".to_owned(), "ETH".to_owned()];
+        let results = fetch_binance_futures_poll(&source, &assets).await.unwrap();
+
+        assert_eq!(source.premium_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, "BTCUSDT");
+        assert_eq!(results[1].0, "ETHUSDT");
+        assert!(results.iter().all(|(_, result)| result.is_ok()));
+        let btc_tick = results[0].1.as_ref().unwrap();
+        assert_eq!(btc_tick.raw["premium_index"]["value"]["symbol"], "BTCUSDT");
+        assert_eq!(
+            btc_tick.raw["premium_index"]["value"]["unknownPremiumField"],
+            "preserve-me"
+        );
+        assert_eq!(
+            btc_tick.raw["open_interest"]["value"]["unknownOpenInterestField"],
+            "preserve-me"
+        );
+        assert_eq!(
+            btc_tick.raw["basis"]["value"][0]["unknownBasisField"],
+            "preserve-me"
+        );
+        assert_eq!(
+            btc_tick.raw["premium_index"]["received_at_ns"],
+            1_700_000_000_500_000_000_u64
+        );
+        assert_eq!(
+            btc_tick.raw["open_interest"]["received_at_ns"],
+            1_700_000_000_540_000_000_u64
+        );
+        assert_eq!(
+            btc_tick.raw["basis"]["received_at_ns"],
+            1_700_000_000_520_000_000_u64
+        );
+        let typed = btc_tick.typed_reference.as_ref().unwrap();
+        assert_eq!(
+            typed["mark_index_funding"]["received_at_ns"],
+            1_700_000_000_500_000_000_u64
+        );
+        assert_eq!(
+            typed["open_interest"]["received_at_ns"],
+            1_700_000_000_540_000_000_u64
+        );
+        assert_eq!(
+            typed["basis"]["received_at_ns"],
+            1_700_000_000_520_000_000_u64
+        );
+        let mut requested = source.requested_symbols.lock().unwrap().clone();
+        requested.sort();
+        assert_eq!(
+            requested,
+            vec![
+                "basis:BTCUSDT".to_owned(),
+                "basis:ETHUSDT".to_owned(),
+                "open_interest:BTCUSDT".to_owned(),
+                "open_interest:ETHUSDT".to_owned()
+            ]
+        );
     }
 
     #[test]
