@@ -2,7 +2,13 @@
 //! - 支援 Paper 模式（模擬 ACK/Fill）與 Live 模式（REST 下單 + 私有 WS 回報）
 //! - 韌性機制：重試、熔斷器、告警通知
 
+mod usdm;
 mod ws_order;
+
+pub use usdm::{
+    BinanceUsdMExecutionClient, BinanceUsdMExecutionConfig, BinanceUsdmExecutionClient,
+    BinanceUsdmExecutionConfig,
+};
 
 use async_trait::async_trait;
 use execution::{

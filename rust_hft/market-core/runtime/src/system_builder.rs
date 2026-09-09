@@ -232,6 +232,9 @@ pub struct SystemBuilder {
     execution_client_venues: Vec<VenueId>,
     // 🔥 Phase 1.x: 跟蹤執行客戶端對應的帳戶（可選）
     execution_client_accounts: Vec<Option<hft_core::AccountId>>,
+    // Registration-time proof that a client was built by the dedicated Binance USD-M branch.
+    // The execution worker consumes this alongside its venue and holdings capability checks.
+    execution_client_is_binance_usdm: Vec<bool>,
     // Runtime-owned external account proofs. Empty is intentionally deny-all at the worker.
     execution_account_admissions: HashMap<hft_core::AccountId, AccountExecutionAdmission>,
 }
@@ -249,6 +252,7 @@ impl SystemBuilder {
             shard_config: None,
             execution_client_venues: Vec::new(),
             execution_client_accounts: Vec::new(),
+            execution_client_is_binance_usdm: Vec::new(),
             execution_account_admissions: HashMap::new(),
         }
     }
@@ -331,6 +335,7 @@ impl SystemBuilder {
         warn!("使用不推薦的 register_execution_client 方法: {}。建議使用 register_execution_client_with_venue",
               std::any::type_name::<E>());
         self.execution_clients.push(Box::new(client));
+        self.execution_client_is_binance_usdm.push(false);
         self
     }
 
@@ -345,10 +350,34 @@ impl SystemBuilder {
 
     /// 註冊執行客戶端並指定對應的交易所與可選帳戶
     pub fn register_execution_client_with_key<E: ExecutionClient + 'static>(
+        self,
+        client: E,
+        venue: VenueId,
+        account: Option<hft_core::AccountId>,
+    ) -> Self {
+        self.register_execution_client_with_key_and_kind(client, venue, account, false)
+    }
+
+    #[cfg(feature = "adapter-binance-execution")]
+    pub(crate) fn register_binance_usdm_execution_client_with_key<E: ExecutionClient + 'static>(
+        self,
+        client: E,
+        account: Option<hft_core::AccountId>,
+    ) -> Self {
+        self.register_execution_client_with_key_and_kind(
+            client,
+            VenueId::BINANCE_FUTURES,
+            account,
+            true,
+        )
+    }
+
+    fn register_execution_client_with_key_and_kind<E: ExecutionClient + 'static>(
         mut self,
         client: E,
         venue: VenueId,
         account: Option<hft_core::AccountId>,
+        is_binance_usdm: bool,
     ) -> Self {
         let client_idx = self.execution_clients.len();
         info!(
@@ -360,6 +389,7 @@ impl SystemBuilder {
         self.execution_clients.push(Box::new(client));
         self.execution_client_venues.push(venue);
         self.execution_client_accounts.push(account);
+        self.execution_client_is_binance_usdm.push(is_binance_usdm);
         self
     }
 
@@ -543,6 +573,12 @@ impl SystemBuilder {
             .engine
             .validate_intent_execution_limits()
             .map_err(HftError::Config)?;
+        validate_shared_portfolio_market_scope(&self.config)?;
+        for venue in &self.config.venues {
+            if venue.venue_type == VenueType::Binance {
+                validate_binance_market_config(venue).map_err(HftError::Config)?;
+            }
+        }
         if self.config.engine.auto_cancel_exchange_only {
             return Err(HftError::Config(
                 "engine.auto_cancel_exchange_only is deprecated and unsupported; use the runtime OMS-aware cancellation control plane"
@@ -728,6 +764,7 @@ impl SystemBuilder {
             market_plans: self.market_stream_plans,
             execution_client_venues: self.execution_client_venues,
             execution_client_accounts: self.execution_client_accounts,
+            execution_client_is_binance_usdm: self.execution_client_is_binance_usdm,
             execution_account_admissions: self.execution_account_admissions,
             portfolio_manager,
             adapter_bridge: None,
@@ -753,6 +790,210 @@ fn venue_type_to_venue_id(venue_type: &VenueType) -> VenueId {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinanceMarketIdentity {
+    Spot,
+    Usdm,
+}
+
+#[cfg(feature = "adapter-binance-data")]
+fn execution_config_value<'a>(
+    execution_config: Option<&'a serde_yaml::Value>,
+    key: &str,
+) -> Option<&'a str> {
+    execution_config?
+        .as_mapping()?
+        .get(serde_yaml::Value::String(key.to_string()))?
+        .as_str()
+}
+
+fn parse_binance_market_selector(
+    value: &str,
+    field: &str,
+) -> Result<BinanceMarketIdentity, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "spot" | "binance" | "binance_spot" | "binance-spot" => Ok(BinanceMarketIdentity::Spot),
+        "usdm" | "usd-m" | "usd_m" | "binance_usdm" | "binance-usdm" => {
+            Ok(BinanceMarketIdentity::Usdm)
+        }
+        _ => Err(format!(
+            "unsupported Binance {field} '{value}'; expected spot or usdm"
+        )),
+    }
+}
+
+fn binance_execution_market(
+    execution_config: Option<&serde_yaml::Value>,
+) -> Result<BinanceMarketIdentity, String> {
+    let Some(config) = execution_config else {
+        return Ok(BinanceMarketIdentity::Spot);
+    };
+    let Some(mapping) = config.as_mapping() else {
+        return Err("Binance execution_config must be a mapping".to_string());
+    };
+
+    let mut selected = None;
+    for field in ["market", "market_type"] {
+        let Some(value) = mapping.get(serde_yaml::Value::String(field.to_string())) else {
+            continue;
+        };
+        let value = value
+            .as_str()
+            .ok_or_else(|| format!("Binance execution_config.{field} must be a string"))?;
+        let market = parse_binance_market_selector(value, field)?;
+        if let Some(previous) = selected {
+            if previous != market {
+                return Err(
+                    "Binance execution_config.market and market_type select different markets"
+                        .to_string(),
+                );
+            }
+        } else {
+            selected = Some(market);
+        }
+    }
+    Ok(selected.unwrap_or(BinanceMarketIdentity::Spot))
+}
+
+fn binance_data_market(venue: &VenueConfig) -> Result<BinanceMarketIdentity, String> {
+    if venue.venue_type != VenueType::Binance {
+        return Ok(BinanceMarketIdentity::Spot);
+    }
+
+    let execution_market = binance_execution_market(venue.execution_config.as_ref())?;
+    let explicit_execution_market = venue
+        .execution_config
+        .as_ref()
+        .and_then(serde_yaml::Value::as_mapping)
+        .is_some_and(|mapping| {
+            mapping.contains_key(serde_yaml::Value::String("market".to_string()))
+                || mapping.contains_key(serde_yaml::Value::String("market_type".to_string()))
+        });
+    let Some(inst_type) = venue.inst_type.as_deref() else {
+        return Ok(execution_market);
+    };
+    let data_market = parse_binance_market_selector(inst_type, "inst_type")?;
+    if explicit_execution_market && execution_market != data_market {
+        return Err(
+            "Binance execution_config market and venue inst_type select different markets"
+                .to_string(),
+        );
+    }
+    Ok(data_market)
+}
+
+fn validate_binance_market_config(venue: &VenueConfig) -> Result<(), String> {
+    if venue.venue_type != VenueType::Binance {
+        return Ok(());
+    }
+    let market = binance_data_market(venue)?;
+    let expected_venue = match market {
+        BinanceMarketIdentity::Spot => VenueId::BINANCE,
+        BinanceMarketIdentity::Usdm => VenueId::BINANCE_FUTURES,
+    };
+    for instrument_id in &venue.symbol_catalog {
+        let Some((_, catalog_venue)) = instrument_id.split() else {
+            continue;
+        };
+        if catalog_venue == VenueId::BINANCE_FUTURES && expected_venue != VenueId::BINANCE_FUTURES {
+            return Err(format!(
+                "Binance catalog instrument {:?} requires USD-M market identity",
+                instrument_id
+            ));
+        }
+        if expected_venue == VenueId::BINANCE_FUTURES
+            && !matches!(
+                catalog_venue,
+                VenueId::BINANCE | VenueId::BINANCE_SPOT | VenueId::BINANCE_FUTURES
+            )
+        {
+            return Err(format!(
+                "Binance USD-M market cannot subscribe to catalog instrument {:?}",
+                instrument_id
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_shared_portfolio_market_scope(config: &SystemConfig) -> HftResult<()> {
+    let mut has_binance_usdm = false;
+    let mut has_other_market = false;
+    for venue in &config.venues {
+        let venue_id = venue_config_to_market_venue_id(venue).map_err(HftError::Config)?;
+        if venue_id == VenueId::BINANCE_FUTURES {
+            has_binance_usdm = true;
+        } else {
+            has_other_market = true;
+        }
+    }
+    if has_binance_usdm && has_other_market {
+        return Err(HftError::Config(
+            "shared portfolio ledger cannot combine Binance USD-M with another market; split the runtime market scope"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn venue_config_to_execution_venue_id(venue: &VenueConfig) -> Result<VenueId, String> {
+    if venue.venue_type == VenueType::Binance
+        && binance_execution_market(venue.execution_config.as_ref())? == BinanceMarketIdentity::Usdm
+    {
+        Ok(VenueId::BINANCE_FUTURES)
+    } else {
+        Ok(venue_type_to_venue_id(&venue.venue_type))
+    }
+}
+
+fn venue_config_to_market_venue_id(venue: &VenueConfig) -> Result<VenueId, String> {
+    if venue.venue_type == VenueType::Binance
+        && binance_data_market(venue)? == BinanceMarketIdentity::Usdm
+    {
+        Ok(VenueId::BINANCE_FUTURES)
+    } else {
+        Ok(venue_type_to_venue_id(&venue.venue_type))
+    }
+}
+
+fn bind_execution_account_environments(
+    config: &SystemConfig,
+    execution_client_accounts: &[Option<hft_core::AccountId>],
+    execution_client_venues: &[VenueId],
+    account_to_client: &HashMap<hft_core::AccountId, usize>,
+) -> HashMap<hft_core::AccountId, AccountExecutionEnvironment> {
+    execution_client_accounts
+        .iter()
+        .enumerate()
+        .filter_map(|(client_idx, account)| {
+            let account = account.as_ref()?;
+            if account_to_client.get(account) != Some(&client_idx) {
+                return None;
+            }
+            let client_venue = *execution_client_venues.get(client_idx)?;
+            let mut matching_venues = config.venues.iter().filter(|venue| {
+                venue.account_id.as_deref() == Some(account.0.as_str())
+                    && venue_config_to_execution_venue_id(venue).ok() == Some(client_venue)
+            });
+            let venue = matching_venues.next()?;
+            if matching_venues.next().is_some() {
+                warn!(account_id = %account.0, "duplicate account environment binding rejected");
+                return None;
+            }
+            let environment = match venue.execution_mode.as_deref() {
+                Some(mode) if mode.eq_ignore_ascii_case("testnet") => {
+                    AccountExecutionEnvironment::Testnet
+                }
+                Some(mode) if mode.eq_ignore_ascii_case("live") => {
+                    AccountExecutionEnvironment::Live
+                }
+                _ => return None,
+            };
+            Some((account.clone(), environment))
+        })
+        .collect()
+}
+
 /// 系統運行時
 pub struct SystemRuntime {
     pub engine: Arc<Mutex<Engine>>,
@@ -773,6 +1014,8 @@ pub struct SystemRuntime {
     execution_client_venues: Vec<VenueId>,
     // 🔥 Phase 1.x: 執行客戶端到帳戶的映射（可選）
     execution_client_accounts: Vec<Option<hft_core::AccountId>>,
+    // Registration-time proof for the dedicated Binance USD-M execution adapter.
+    execution_client_is_binance_usdm: Vec<bool>,
     // Runtime-owned external account proofs; only this map reaches the worker admission gate.
     execution_account_admissions: HashMap<hft_core::AccountId, AccountExecutionAdmission>,
     portfolio_manager: Option<PortfolioManager>,
@@ -809,6 +1052,8 @@ impl SystemRuntime {
         #[allow(unused_variables)] ipc_socket_path: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         info!("啟動系統運行時...");
+        validate_shared_portfolio_market_scope(&self.config)
+            .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?;
         #[cfg(feature = "infra-ipc")]
         let prepared_ipc =
             crate::ipc_handler::prepare_ipc_server(ipc_socket_path).map_err(|error| {
@@ -894,6 +1139,22 @@ impl SystemRuntime {
                             });
                         let mut stream =
                             adapter_binance_data::BinanceMarketStream::with_capabilities(caps);
+                        let use_usdm = if let Some(cfg) = &venue_cfg {
+                            binance_data_market(cfg)
+                                .map(|market| market == BinanceMarketIdentity::Usdm)
+                                .map_err(HftError::Config)?
+                        } else {
+                            instruments.iter().any(|instrument| {
+                                instrument.venue == VenueId::BINANCE_FUTURES
+                                    && instrument.product_type == ProductType::Perp
+                            })
+                        };
+                        let use_tokenized_source = !use_usdm
+                            && !instruments.is_empty()
+                            && instruments.iter().all(|instrument| {
+                                instrument.venue == VenueId::BINANCE_TOKENIZED_SECURITIES
+                                    && instrument.product_type == ProductType::TokenizedSecuritySpot
+                            });
                         if let Some(cfg) = &venue_cfg {
                             if let Some(ws_url) = &cfg.ws_public {
                                 stream = stream.with_ws_base_url(ws_url.clone());
@@ -901,13 +1162,12 @@ impl SystemRuntime {
                             if let Some(rest_url) = &cfg.rest {
                                 stream = stream.with_rest_base_url(rest_url.clone());
                             }
-                            if cfg
-                                .inst_type
-                                .as_deref()
-                                .is_some_and(|market| market.eq_ignore_ascii_case("usdm"))
-                            {
-                                stream = stream.with_usdm();
-                            }
+                        }
+                        if use_usdm {
+                            stream = stream.with_usdm();
+                        } else if use_tokenized_source {
+                            stream =
+                                stream.with_source_venue(VenueId::BINANCE_TOKENIZED_SECURITIES);
                         }
                         let consumer = bridge.bridge_instrument_stream(stream, instruments).await?;
                         self.engine.lock().await.register_event_consumer(consumer);
@@ -1085,41 +1345,12 @@ impl SystemRuntime {
                     (clients.len() == 1).then_some((account, clients[0]))
                 })
                 .collect::<std::collections::HashMap<_, _>>();
-            let account_environments = self
-                .execution_client_accounts
-                .iter()
-                .enumerate()
-                .filter_map(|(client_idx, account)| {
-                    let account = account.as_ref()?;
-                    if account_to_client.get(account) != Some(&client_idx) {
-                        return None;
-                    }
-                    let client_venue = *self.execution_client_venues.get(client_idx)?;
-                    let mut matching_venues = self
-                        .config
-                        .venues
-                        .iter()
-                        .filter(|venue| {
-                            venue.account_id.as_deref() == Some(account.0.as_str())
-                                && venue_type_to_venue_id(&venue.venue_type) == client_venue
-                        });
-                    let venue = matching_venues.next()?;
-                    if matching_venues.next().is_some() {
-                        warn!(account_id = %account.0, "duplicate account environment binding rejected");
-                        return None;
-                    }
-                    let environment = match venue.execution_mode.as_deref() {
-                        Some(mode) if mode.eq_ignore_ascii_case("testnet") => {
-                            AccountExecutionEnvironment::Testnet
-                        }
-                        Some(mode) if mode.eq_ignore_ascii_case("live") => {
-                            AccountExecutionEnvironment::Live
-                        }
-                        _ => return None,
-                    };
-                    Some((account.clone(), environment))
-                })
-                .collect::<std::collections::HashMap<_, _>>();
+            let account_environments = bind_execution_account_environments(
+                &self.config,
+                &self.execution_client_accounts,
+                &self.execution_client_venues,
+                &account_to_client,
+            );
             let account_admissions = self.execution_account_admissions.clone();
             let mut venue_bindings = std::collections::HashMap::<VenueId, Vec<usize>>::new();
             for (client_idx, venue_id) in self.execution_client_venues.iter().enumerate() {
@@ -1134,9 +1365,14 @@ impl SystemRuntime {
                 .collect::<std::collections::HashMap<_, _>>();
             if self.execution_client_venues.is_empty() {
                 for (index, venue_config) in self.config.venues.iter().enumerate() {
-                    if let Some(venue_id) = hft_core::VenueId::from_str(&venue_config.name) {
-                        if index < execution_clients.len() {
+                    if index < execution_clients.len() {
+                        if let Ok(venue_id) = venue_config_to_execution_venue_id(venue_config) {
                             venue_to_client.insert(venue_id, index);
+                        } else {
+                            warn!(
+                                venue = %venue_config.name,
+                                "invalid Binance execution market identity; fallback route omitted"
+                            );
                         }
                     }
                 }
@@ -1151,6 +1387,13 @@ impl SystemRuntime {
                     );
                 }
             }
+
+            let binance_usdm_client_indices = self
+                .execution_client_is_binance_usdm
+                .iter()
+                .enumerate()
+                .filter_map(|(index, is_usdm)| (*is_usdm).then_some(index))
+                .collect::<std::collections::HashSet<_>>();
 
             let (worker_handle, control_tx) = if let Some(router_config) = &self.config.router {
                 // 有路由器配置，創建路由器並使用帶路由器的 worker
@@ -1185,7 +1428,7 @@ impl SystemRuntime {
                     None
                 };
 
-                engine::execution_worker::spawn_execution_worker_with_control_and_router(
+                engine::execution_worker::spawn_execution_worker_with_control_and_router_and_capabilities(
                     worker_config,
                     worker_queues,
                     execution_clients,
@@ -1195,6 +1438,7 @@ impl SystemRuntime {
                     Some(account_to_client.clone()),
                     Some(account_admissions.clone()),
                     Some(account_environments.clone()),
+                    binance_usdm_client_indices.clone(),
                 )
             } else {
                 // 沒有路由器配置，使用預設邏輯
@@ -1221,7 +1465,7 @@ impl SystemRuntime {
                     None
                 };
 
-                engine::execution_worker::spawn_execution_worker_with_control(
+                engine::execution_worker::spawn_execution_worker_with_control_and_capabilities(
                     worker_config,
                     worker_queues,
                     execution_clients,
@@ -1230,6 +1474,7 @@ impl SystemRuntime {
                     Some(account_to_client),
                     Some(account_admissions),
                     Some(account_environments),
+                    binance_usdm_client_indices,
                 )
             };
             self.execution_worker_tasks.push(worker_handle);
@@ -1778,6 +2023,126 @@ mod tests {
     };
     use rust_decimal::Decimal;
     use shared_instrument::InstrumentId;
+
+    #[test]
+    fn explicit_usdm_venue_uses_futures_identity_for_account_binding() {
+        let venue = VenueConfig {
+            name: "binance-usdm".to_string(),
+            account_id: Some("usdm-account".to_string()),
+            venue_type: VenueType::Binance,
+            ws_public: None,
+            ws_private: None,
+            rest: None,
+            api_key: None,
+            secret: None,
+            passphrase: None,
+            execution_mode: Some("Testnet".to_string()),
+            capabilities: VenueCapabilities::default(),
+            inst_type: Some("usdm".to_string()),
+            simulate_execution: false,
+            symbol_catalog: vec![InstrumentId::new("BTCUSDT@BINANCE")],
+            data_config: None,
+            execution_config: Some(serde_yaml::from_str("market: usdm").unwrap()),
+            secret_ref_api_key: None,
+            secret_ref_secret: None,
+            secret_ref_passphrase: None,
+        };
+
+        assert_eq!(
+            venue_config_to_execution_venue_id(&venue).unwrap(),
+            VenueId::BINANCE_FUTURES
+        );
+    }
+
+    #[test]
+    fn conflicting_binance_market_selectors_fail_closed() {
+        let venue = VenueConfig {
+            name: "binance-conflicting-market".to_string(),
+            account_id: None,
+            venue_type: VenueType::Binance,
+            ws_public: None,
+            ws_private: None,
+            rest: None,
+            api_key: None,
+            secret: None,
+            passphrase: None,
+            execution_mode: Some("Paper".to_string()),
+            capabilities: VenueCapabilities::default(),
+            inst_type: Some("spot".to_string()),
+            simulate_execution: true,
+            symbol_catalog: vec![InstrumentId::new("BTCUSDT@BINANCE")],
+            data_config: None,
+            execution_config: Some(
+                serde_yaml::from_str("market: usdm\nmarket_type: usdm").unwrap(),
+            ),
+            secret_ref_api_key: None,
+            secret_ref_secret: None,
+            secret_ref_passphrase: None,
+        };
+        assert!(validate_binance_market_config(&venue)
+            .expect_err("execution and data market selectors must agree")
+            .contains("different markets"));
+
+        let Err(error) = SystemBuilder::new(SystemConfig {
+            quotes_only: true,
+            venues: vec![venue],
+            ..Default::default()
+        })
+        .auto_register_adapters_strict() else {
+            panic!("strict registration must reject conflicting market selectors");
+        };
+        assert!(error.to_string().contains("different markets"));
+    }
+
+    #[test]
+    fn conflicting_binance_market_and_market_type_fail_closed() {
+        let execution_config: serde_yaml::Value =
+            serde_yaml::from_str("market: spot\nmarket_type: usdm").unwrap();
+        let error = binance_execution_market(Some(&execution_config))
+            .expect_err("conflicting execution selectors must be rejected");
+        assert!(error.contains("market and market_type"));
+    }
+
+    #[test]
+    fn usdm_account_environment_binding_matches_the_futures_client_identity() {
+        let account_id = hft_core::AccountId("usdm-account".to_string());
+        let venue = VenueConfig {
+            name: "binance-usdm".to_string(),
+            account_id: Some(account_id.0.clone()),
+            venue_type: VenueType::Binance,
+            ws_public: None,
+            ws_private: None,
+            rest: None,
+            api_key: None,
+            secret: None,
+            passphrase: None,
+            execution_mode: Some("Testnet".to_string()),
+            capabilities: VenueCapabilities::default(),
+            inst_type: Some("usdm".to_string()),
+            simulate_execution: false,
+            symbol_catalog: vec![InstrumentId::new("BTCUSDT@BINANCE")],
+            data_config: None,
+            execution_config: Some(serde_yaml::from_str("market: usdm").unwrap()),
+            secret_ref_api_key: None,
+            secret_ref_secret: None,
+            secret_ref_passphrase: None,
+        };
+        let config = SystemConfig {
+            venues: vec![venue],
+            ..Default::default()
+        };
+        let environments = bind_execution_account_environments(
+            &config,
+            &[Some(account_id.clone())],
+            &[VenueId::BINANCE_FUTURES],
+            &std::collections::HashMap::from([(account_id.clone(), 0)]),
+        );
+
+        assert_eq!(
+            environments.get(&account_id),
+            Some(&AccountExecutionEnvironment::Testnet)
+        );
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
@@ -2095,6 +2460,23 @@ mod tests {
             runtime.engine.try_lock().unwrap().trading_mode(),
             engine::TradingMode::Paused
         );
+    }
+
+    #[test]
+    fn shared_portfolio_rejects_usdm_with_another_market() {
+        let mut usdm = live_venue_config();
+        usdm.name = "binance-usdm".to_string();
+        usdm.inst_type = Some("usdm".to_string());
+        usdm.execution_config = Some(serde_yaml::from_str("market: usdm").unwrap());
+        let config = SystemConfig {
+            venues: vec![live_venue_config(), usdm],
+            ..Default::default()
+        };
+
+        let Err(error) = SystemBuilder::new(config).auto_register_adapters_strict() else {
+            panic!("shared symbol-only portfolio must reject mixed USD-M and other markets");
+        };
+        assert!(error.to_string().contains("shared portfolio ledger"));
     }
 
     #[tokio::test]

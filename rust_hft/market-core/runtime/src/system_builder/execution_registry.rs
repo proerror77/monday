@@ -1,5 +1,187 @@
+#[cfg(feature = "adapter-binance-data")]
+use super::{binance_execution_market, execution_config_value, BinanceMarketIdentity};
 use super::{SystemBuilder, VenueConfig, VenueType};
 use tracing::{info, warn};
+
+#[cfg(feature = "adapter-binance-data")]
+const BINANCE_USDM_REST_LIVE: &str = "https://fapi.binance.com";
+#[cfg(feature = "adapter-binance-data")]
+const BINANCE_USDM_WS_LIVE: &str = "wss://fstream.binance.com/private/ws";
+#[cfg(feature = "adapter-binance-data")]
+const BINANCE_USDM_REST_TESTNET: &str = "https://demo-fapi.binance.com";
+#[cfg(feature = "adapter-binance-data")]
+const BINANCE_USDM_WS_TESTNET: &str = "wss://demo-fstream.binance.com/private/ws";
+
+#[cfg(feature = "adapter-binance-data")]
+fn is_known_binance_spot_rest_endpoint(url: &str) -> bool {
+    matches!(
+        url.trim_end_matches('/'),
+        "https://api.binance.com"
+            | "https://api1.binance.com"
+            | "https://api2.binance.com"
+            | "https://api3.binance.com"
+            | "https://api4.binance.com"
+            | "https://data-api.binance.vision"
+    )
+}
+
+#[cfg(feature = "adapter-binance-data")]
+fn is_known_binance_spot_ws_endpoint(url: &str) -> bool {
+    matches!(
+        url.trim_end_matches('/'),
+        "wss://data-stream.binance.vision/ws"
+            | "wss://stream.binance.com:9443/ws"
+            | "wss://stream.binance.com:9443/stream"
+            | "wss://stream.binance.com/ws"
+            | "wss://stream.binance.com"
+    )
+}
+
+#[cfg(feature = "adapter-binance-data")]
+fn is_binance_usdm_live_rest_endpoint(url: &str) -> bool {
+    url.trim_end_matches('/') == BINANCE_USDM_REST_LIVE
+}
+
+#[cfg(feature = "adapter-binance-data")]
+fn is_binance_usdm_testnet_rest_endpoint(url: &str) -> bool {
+    url.trim_end_matches('/') == BINANCE_USDM_REST_TESTNET
+}
+
+#[cfg(feature = "adapter-binance-data")]
+fn is_binance_usdm_live_ws_endpoint(url: &str) -> bool {
+    url.trim_end_matches('/') == BINANCE_USDM_WS_LIVE
+}
+
+#[cfg(feature = "adapter-binance-data")]
+fn is_binance_usdm_testnet_ws_endpoint(url: &str) -> bool {
+    url.trim_end_matches('/') == BINANCE_USDM_WS_TESTNET
+}
+
+#[cfg(feature = "adapter-binance-data")]
+fn configured_binance_usdm_endpoint(
+    configured: Option<&str>,
+    testnet: bool,
+    rest: bool,
+) -> Result<String, String> {
+    let configured = configured.map(str::trim).filter(|value| !value.is_empty());
+    if rest {
+        if testnet {
+            if configured.is_none() || configured.is_some_and(is_known_binance_spot_rest_endpoint) {
+                return Ok(BINANCE_USDM_REST_TESTNET.to_string());
+            }
+            if configured.is_some_and(is_binance_usdm_live_rest_endpoint) {
+                return Err(format!(
+                    "Binance USD-M Testnet cannot use the production REST endpoint {BINANCE_USDM_REST_LIVE}"
+                ));
+            }
+            if configured.is_some_and(is_binance_usdm_testnet_rest_endpoint) {
+                return Ok(BINANCE_USDM_REST_TESTNET.to_string());
+            }
+            if let Some(value) = configured {
+                return Ok(value.to_string());
+            }
+        } else {
+            if configured.is_none()
+                || configured.is_some_and(is_known_binance_spot_rest_endpoint)
+                || configured.is_some_and(is_binance_usdm_live_rest_endpoint)
+            {
+                return Ok(BINANCE_USDM_REST_LIVE.to_string());
+            }
+            if configured.is_some_and(is_binance_usdm_testnet_rest_endpoint) {
+                return Err(format!(
+                    "Binance USD-M Live cannot use the Testnet REST endpoint {BINANCE_USDM_REST_TESTNET}"
+                ));
+            }
+            if let Some(value) = configured {
+                return Ok(value.to_string());
+            }
+        }
+    } else if testnet {
+        if configured.is_none() || configured.is_some_and(is_known_binance_spot_ws_endpoint) {
+            return Ok(BINANCE_USDM_WS_TESTNET.to_string());
+        }
+        if configured.is_some_and(is_binance_usdm_live_ws_endpoint) {
+            return Err(format!(
+                "Binance USD-M Testnet cannot use the production private stream endpoint {BINANCE_USDM_WS_LIVE}"
+            ));
+        }
+        if configured.is_some_and(is_binance_usdm_testnet_ws_endpoint) {
+            return Ok(BINANCE_USDM_WS_TESTNET.to_string());
+        }
+        if let Some(value) = configured {
+            return Ok(value.to_string());
+        }
+    } else {
+        if configured.is_none()
+            || configured.is_some_and(is_known_binance_spot_ws_endpoint)
+            || configured.is_some_and(is_binance_usdm_live_ws_endpoint)
+        {
+            return Ok(BINANCE_USDM_WS_LIVE.to_string());
+        }
+        if configured.is_some_and(is_binance_usdm_testnet_ws_endpoint) {
+            return Err(format!(
+                "Binance USD-M Live cannot use the Testnet private stream endpoint {BINANCE_USDM_WS_TESTNET}"
+            ));
+        }
+        if let Some(value) = configured {
+            return Ok(value.to_string());
+        }
+    }
+    unreachable!("configured Binance USD-M endpoint branch must return")
+}
+
+#[cfg(feature = "adapter-binance-data")]
+fn validate_binance_usdm_execution_config(
+    execution_config: Option<&serde_yaml::Value>,
+) -> Result<(), String> {
+    let one_way = ["one_way", "one-way", "oneway", "both", "single"];
+    if let Some(account_mode) = execution_config_value(execution_config, "account_mode") {
+        if !one_way
+            .iter()
+            .any(|allowed| account_mode.trim().eq_ignore_ascii_case(allowed))
+        {
+            return Err(format!(
+                "unsupported Binance USD-M account_mode '{account_mode}'; only one-way/BOTH is supported"
+            ));
+        }
+    }
+    if let Some(position_mode) = execution_config_value(execution_config, "position_mode") {
+        if !one_way
+            .iter()
+            .any(|allowed| position_mode.trim().eq_ignore_ascii_case(allowed))
+        {
+            return Err(format!(
+                "unsupported Binance USD-M position_mode '{position_mode}'; only one-way/BOTH is supported"
+            ));
+        }
+    }
+    if let Some(order_mode) = execution_config_value(execution_config, "order_mode") {
+        if !order_mode.trim().eq_ignore_ascii_case("standard") {
+            return Err(format!(
+                "unsupported Binance USD-M order_mode '{order_mode}'; only standard MARKET/LIMIT orders are supported"
+            ));
+        }
+    }
+    if let Some(account_type) = execution_config_value(execution_config, "account_type") {
+        let accepted = [
+            "usdm",
+            "usd-m",
+            "usdⓈ-m",
+            "usdt_futures",
+            "usdt-futures",
+            "usdm_futures",
+        ];
+        if !accepted
+            .iter()
+            .any(|allowed| account_type.trim().eq_ignore_ascii_case(allowed))
+        {
+            return Err(format!(
+                "unsupported Binance USD-M account_type '{account_type}'"
+            ));
+        }
+    }
+    Ok(())
+}
 
 impl SystemBuilder {
     pub(crate) fn register_execution_clients_from_config(mut self) -> Self {
@@ -251,17 +433,97 @@ impl SystemBuilder {
     #[cfg(feature = "adapter-binance-data")]
     pub(crate) fn register_binance_adapters(self, venue: &VenueConfig) -> Self {
         info!("註冊 Binance 適配器");
+        if let Err(error) = super::validate_binance_market_config(venue) {
+            warn!(%error, "Binance market identity is invalid; adapters not registered");
+            return self;
+        }
         if venue.simulate_execution {
-            return self.register_simulated_execution_client(hft_core::VenueId::BINANCE);
+            let market = match binance_execution_market(venue.execution_config.as_ref()) {
+                Ok(market) => market,
+                Err(error) => {
+                    warn!(%error, "Binance execution_config market identity is unsupported; simulated execution client not registered");
+                    return self;
+                }
+            };
+            if market == BinanceMarketIdentity::Usdm {
+                if let Err(error) =
+                    validate_binance_usdm_execution_config(venue.execution_config.as_ref())
+                {
+                    warn!(%error, "Binance USD-M execution_config is unsupported; simulated execution client not registered");
+                    return self;
+                }
+            }
+            let simulated_venue = if market == BinanceMarketIdentity::Usdm {
+                hft_core::VenueId::BINANCE_FUTURES
+            } else {
+                hft_core::VenueId::BINANCE
+            };
+            return self.register_simulated_execution_client(simulated_venue);
         }
         #[cfg(feature = "adapter-binance-execution")]
         {
             use adapter_binance_execution as binance_exec;
+            let market = match binance_execution_market(venue.execution_config.as_ref()) {
+                Ok(market) => market,
+                Err(error) => {
+                    warn!(%error, "Binance execution_config market identity is unsupported; execution client not registered");
+                    return self;
+                }
+            };
             let exec_mode = match venue.execution_mode.as_deref().unwrap_or("Paper") {
                 "Live" => binance_exec::ExecutionMode::Live,
                 "Testnet" => binance_exec::ExecutionMode::Testnet,
                 _ => binance_exec::ExecutionMode::Paper,
             };
+            if market == BinanceMarketIdentity::Usdm {
+                if let Err(error) =
+                    validate_binance_usdm_execution_config(venue.execution_config.as_ref())
+                {
+                    warn!(%error, "Binance USD-M execution_config is unsupported; execution client not registered");
+                    return self;
+                }
+                let testnet = exec_mode == binance_exec::ExecutionMode::Testnet;
+                let rest_base_url = match configured_binance_usdm_endpoint(
+                    venue.rest.as_deref(),
+                    testnet,
+                    true,
+                ) {
+                    Ok(endpoint) => endpoint,
+                    Err(error) => {
+                        warn!(%error, "Binance USD-M REST endpoint is incompatible with execution mode; execution client not registered");
+                        return self;
+                    }
+                };
+                let ws_base_url = match configured_binance_usdm_endpoint(
+                    venue.ws_private.as_deref(),
+                    testnet,
+                    false,
+                ) {
+                    Ok(endpoint) => endpoint,
+                    Err(error) => {
+                        warn!(%error, "Binance USD-M private stream endpoint is incompatible with execution mode; execution client not registered");
+                        return self;
+                    }
+                };
+                let cfg = binance_exec::BinanceUsdMExecutionConfig {
+                    credentials: integration::signing::BinanceCredentials::new(
+                        venue.api_key.clone().unwrap_or_default(),
+                        venue.secret.clone().unwrap_or_default(),
+                    ),
+                    rest_base_url,
+                    ws_base_url,
+                    timeout_ms: 5000,
+                    mode: exec_mode,
+                    account_capability: hft_core::AccountCapability::default(),
+                };
+                let execution_client = binance_exec::BinanceUsdMExecutionClient::new(cfg);
+                let account = venue
+                    .account_id
+                    .as_ref()
+                    .map(|s| hft_core::AccountId(s.clone()));
+                return self
+                    .register_binance_usdm_execution_client_with_key(execution_client, account);
+            }
             let cfg = binance_exec::BinanceExecutionConfig {
                 credentials: integration::signing::BinanceCredentials::new(
                     venue.api_key.clone().unwrap_or_default(),
@@ -580,6 +842,196 @@ mod tests {
     use super::super::{SystemConfig, VenueCapabilities};
     use super::*;
     use shared_instrument::InstrumentId;
+
+    #[cfg(feature = "adapter-binance-data")]
+    #[test]
+    fn binance_usdm_endpoint_selection_is_mode_bound_and_catalog_aware() {
+        assert_eq!(
+            configured_binance_usdm_endpoint(None, true, true).unwrap(),
+            BINANCE_USDM_REST_TESTNET
+        );
+        assert_eq!(
+            configured_binance_usdm_endpoint(Some("https://api.binance.com"), true, true).unwrap(),
+            BINANCE_USDM_REST_TESTNET
+        );
+        assert!(
+            configured_binance_usdm_endpoint(Some(BINANCE_USDM_REST_LIVE), true, true).is_err()
+        );
+        assert_eq!(
+            configured_binance_usdm_endpoint(
+                Some("wss://stream.binance.com:9443/stream"),
+                true,
+                false
+            )
+            .unwrap(),
+            BINANCE_USDM_WS_TESTNET
+        );
+        assert_eq!(
+            configured_binance_usdm_endpoint(None, false, false).unwrap(),
+            BINANCE_USDM_WS_LIVE
+        );
+        assert!(
+            configured_binance_usdm_endpoint(Some(BINANCE_USDM_WS_TESTNET), false, false).is_err()
+        );
+        assert_eq!(
+            configured_binance_usdm_endpoint(Some("http://127.0.0.1:18080"), true, true).unwrap(),
+            "http://127.0.0.1:18080"
+        );
+    }
+
+    #[cfg(all(
+        feature = "adapter-binance-data",
+        feature = "adapter-binance-execution"
+    ))]
+    #[test]
+    fn binance_usdm_routes_to_the_dedicated_futures_execution_client() {
+        let venue = VenueConfig {
+            name: "binance-usdm".to_string(),
+            account_id: Some("usdm-main".to_string()),
+            venue_type: VenueType::Binance,
+            ws_public: None,
+            ws_private: None,
+            rest: None,
+            api_key: None,
+            secret: None,
+            passphrase: None,
+            secret_ref_api_key: None,
+            secret_ref_secret: None,
+            secret_ref_passphrase: None,
+            execution_mode: Some("Paper".to_string()),
+            capabilities: VenueCapabilities::default(),
+            inst_type: Some("usdm".to_string()),
+            simulate_execution: false,
+            symbol_catalog: vec![InstrumentId::new("BTCUSDT@BINANCE")],
+            data_config: None,
+            execution_config: Some(serde_yaml::from_str("market: usdm").unwrap()),
+        };
+        let mut config = SystemConfig::default();
+        config.venues.push(venue);
+
+        let builder = SystemBuilder::new(config).register_execution_clients_from_config();
+
+        assert_eq!(builder.execution_clients.len(), 1);
+        assert_eq!(
+            builder.execution_client_venues,
+            vec![hft_core::VenueId::BINANCE_FUTURES]
+        );
+        assert_eq!(builder.execution_client_is_binance_usdm, vec![true]);
+    }
+
+    #[cfg(all(
+        feature = "adapter-binance-data",
+        feature = "adapter-binance-execution"
+    ))]
+    #[test]
+    fn binance_without_explicit_usdm_execution_config_keeps_spot_routing() {
+        let venue = VenueConfig {
+            name: "binance-spot".to_string(),
+            account_id: None,
+            venue_type: VenueType::Binance,
+            ws_public: None,
+            ws_private: None,
+            rest: None,
+            api_key: None,
+            secret: None,
+            passphrase: None,
+            secret_ref_api_key: None,
+            secret_ref_secret: None,
+            secret_ref_passphrase: None,
+            execution_mode: Some("Paper".to_string()),
+            capabilities: VenueCapabilities::default(),
+            inst_type: Some("usdm".to_string()),
+            simulate_execution: false,
+            symbol_catalog: Vec::new(),
+            data_config: None,
+            execution_config: None,
+        };
+        let mut config = SystemConfig::default();
+        config.venues.push(venue);
+
+        let builder = SystemBuilder::new(config).register_execution_clients_from_config();
+
+        assert_eq!(builder.execution_clients.len(), 1);
+        assert_eq!(
+            builder.execution_client_venues,
+            vec![hft_core::VenueId::BINANCE]
+        );
+        assert_eq!(builder.execution_client_is_binance_usdm, vec![false]);
+    }
+
+    #[cfg(all(
+        feature = "adapter-binance-data",
+        feature = "adapter-binance-execution"
+    ))]
+    #[test]
+    fn binance_usdm_rejects_unsupported_account_mode_before_registration() {
+        let venue = VenueConfig {
+            name: "binance-usdm-hedge".to_string(),
+            account_id: None,
+            venue_type: VenueType::Binance,
+            ws_public: None,
+            ws_private: None,
+            rest: None,
+            api_key: None,
+            secret: None,
+            passphrase: None,
+            secret_ref_api_key: None,
+            secret_ref_secret: None,
+            secret_ref_passphrase: None,
+            execution_mode: Some("Paper".to_string()),
+            capabilities: VenueCapabilities::default(),
+            inst_type: Some("usdm".to_string()),
+            simulate_execution: false,
+            symbol_catalog: Vec::new(),
+            data_config: None,
+            execution_config: Some(
+                serde_yaml::from_str("market: usdm\naccount_mode: hedge").unwrap(),
+            ),
+        };
+        let mut config = SystemConfig::default();
+        config.venues.push(venue);
+
+        let builder = SystemBuilder::new(config).register_execution_clients_from_config();
+
+        assert!(builder.execution_clients.is_empty());
+        assert!(builder.execution_client_venues.is_empty());
+    }
+
+    #[cfg(feature = "adapter-binance-data")]
+    #[test]
+    fn simulated_usdm_uses_the_futures_venue_identity_without_a_live_client_marker() {
+        let venue = VenueConfig {
+            name: "binance-usdm-paper".to_string(),
+            account_id: None,
+            venue_type: VenueType::Binance,
+            ws_public: None,
+            ws_private: None,
+            rest: None,
+            api_key: None,
+            secret: None,
+            passphrase: None,
+            secret_ref_api_key: None,
+            secret_ref_secret: None,
+            secret_ref_passphrase: None,
+            execution_mode: Some("Paper".to_string()),
+            capabilities: VenueCapabilities::default(),
+            inst_type: Some("usdm".to_string()),
+            simulate_execution: true,
+            symbol_catalog: Vec::<InstrumentId>::new(),
+            data_config: None,
+            execution_config: Some(serde_yaml::from_str("market: usdm").unwrap()),
+        };
+        let mut config = SystemConfig::default();
+        config.venues.push(venue);
+
+        let builder = SystemBuilder::new(config).register_execution_clients_from_config();
+
+        assert_eq!(
+            builder.execution_client_venues,
+            vec![hft_core::VenueId::BINANCE_FUTURES]
+        );
+        assert_eq!(builder.execution_client_is_binance_usdm, vec![false]);
+    }
 
     #[cfg(feature = "adapter-binance-prediction-execution")]
     #[test]

@@ -102,6 +102,7 @@ fn multiplex_market_events(
     mut data_rx: mpsc::Receiver<QueuedMarketEvent>,
     mut control_rx: watch::Receiver<Option<StreamInvalidation>>,
     generation: Arc<AtomicU64>,
+    source_venue: hft_core::VenueId,
 ) -> BoxStream<TrackedMarketEvent> {
     Box::pin(async_stream::stream! {
         let mut control_open = true;
@@ -122,7 +123,7 @@ fn multiplex_market_events(
                     }
                     yield Ok(TrackedMarketEvent::new(MarketEvent::Disconnect {
                         reason: invalidation.reason,
-                        source_venue: Some(hft_core::VenueId::BINANCE),
+                        source_venue: Some(source_venue),
                         symbol: None,
                     }));
                     if let Some(error) = invalidation.error {
@@ -248,6 +249,7 @@ pub struct BinanceMarketStream {
     last_heartbeat: Arc<AtomicU64>,
     ws_base_url: String,
     usdm: bool,
+    source_venue: hft_core::VenueId,
 }
 
 impl Default for BinanceMarketStream {
@@ -265,6 +267,7 @@ impl BinanceMarketStream {
             last_heartbeat: Arc::new(AtomicU64::new(0)),
             ws_base_url: websocket::WS_BASE_URL.to_string(),
             usdm: false,
+            source_venue: hft_core::VenueId::BINANCE,
         }
     }
 
@@ -276,6 +279,7 @@ impl BinanceMarketStream {
             last_heartbeat: Arc::new(AtomicU64::new(0)),
             ws_base_url: websocket::WS_BASE_URL.to_string(),
             usdm: false,
+            source_venue: hft_core::VenueId::BINANCE,
         }
     }
 
@@ -286,34 +290,71 @@ impl BinanceMarketStream {
     }
 
     pub fn with_rest_base_url(mut self, url: impl Into<String>) -> Self {
-        self.rest_client = BinanceRestClient::with_base_url(url);
+        let rest_client = BinanceRestClient::with_base_url(url);
+        self.rest_client = if self.usdm {
+            rest_client.with_usdm()
+        } else {
+            rest_client
+        };
         self
     }
 
     pub fn with_usdm(mut self) -> Self {
         self.rest_client = self.rest_client.with_usdm();
+        self.ws_base_url = websocket::usdm_endpoint_for(&self.ws_base_url);
         self.usdm = true;
+        self.source_venue = hft_core::VenueId::BINANCE_FUTURES;
         self
     }
 
+    /// Select the explicit venue identity for Spot-family streams such as B-Stock.
+    /// USD-M must use `with_usdm`, which also selects the futures endpoint/cadence.
+    pub fn with_source_venue(mut self, source_venue: hft_core::VenueId) -> Self {
+        if source_venue == hft_core::VenueId::BINANCE_FUTURES {
+            return self.with_usdm();
+        }
+        self.source_venue = source_venue;
+        self
+    }
+
+    fn source_venue(&self) -> hft_core::VenueId {
+        self.source_venue
+    }
+
     fn validate_instrument_product(&self, instrument: &InstrumentSpec) -> HftResult<()> {
-        match (self.usdm, instrument.product_type) {
-            (false, ProductType::Spot | ProductType::TokenizedSecuritySpot)
-            | (true, ProductType::Perp) => Ok(()),
-            (true, _) => Err(HftError::Network(format!(
-                "Binance USD-M market data requires a perpetual instrument: {}",
-                instrument.symbol
-            ))),
-            (false, ProductType::Futures | ProductType::Perp) => Err(HftError::Network(format!(
+        if self.source_venue == hft_core::VenueId::BINANCE_FUTURES {
+            if instrument.venue != hft_core::VenueId::BINANCE_FUTURES
+                || instrument.product_type != ProductType::Perp
+            {
+                return Err(HftError::Network(format!(
+                    "Binance USD-M market data requires a BINANCE_FUTURES perpetual instrument: {}",
+                    instrument.symbol
+                )));
+            }
+            return Ok(());
+        }
+
+        match (self.source_venue, instrument.venue, instrument.product_type) {
+            (hft_core::VenueId::BINANCE, hft_core::VenueId::BINANCE, ProductType::Spot)
+            | (
+                hft_core::VenueId::BINANCE_TOKENIZED_SECURITIES,
+                hft_core::VenueId::BINANCE_TOKENIZED_SECURITIES,
+                ProductType::TokenizedSecuritySpot,
+            ) => Ok(()),
+            (_, _, ProductType::Futures | ProductType::Perp) => Err(HftError::Network(format!(
                 "Binance derivatives market data must use the USD-M adapter: {}",
                 instrument.symbol
             ))),
-            (false, ProductType::BrokerageEquity) => Err(HftError::Network(format!(
+            (_, _, ProductType::BrokerageEquity) => Err(HftError::Network(format!(
                 "Binance brokerage equities market data must use an equities adapter: {}",
                 instrument.symbol
             ))),
-            (false, ProductType::PredictionMarket) => Err(HftError::Network(format!(
+            (_, _, ProductType::PredictionMarket) => Err(HftError::Network(format!(
                 "Binance prediction markets must use the W3W Prediction REST API: {}",
+                instrument.symbol
+            ))),
+            _ => Err(HftError::Network(format!(
+                "Binance spot market data requires a BINANCE spot instrument: {}",
                 instrument.symbol
             ))),
         }
@@ -367,6 +408,7 @@ impl BinanceMarketStream {
     async fn wait_for_rest_snapshot_budget(
         ws_client: &mut BinanceWebSocket,
         last_snapshot_at: Option<tokio::time::Instant>,
+        source_venue: hft_core::VenueId,
     ) -> HftResult<()> {
         let remaining = Self::rest_snapshot_cooldown_remaining(last_snapshot_at);
         if remaining.is_zero() {
@@ -386,7 +428,7 @@ impl BinanceMarketStream {
                         )
                     })?;
                     // Keep the socket drained, but do not publish an unsynchronized generation.
-                    let _ = Self::parse_tracked_socket_event(bytes, metrics)?;
+                    let _ = Self::parse_tracked_socket_event(bytes, metrics, source_venue)?;
                 }
             }
         }
@@ -402,6 +444,7 @@ impl BinanceMarketStream {
         rest_client: &BinanceRestClient,
         symbols: &[Symbol],
         snapshot_depth: u16,
+        source_venue: hft_core::VenueId,
     ) -> HftResult<Vec<(MarketSnapshot, u64)>> {
         let mut snapshots = Vec::new();
 
@@ -410,8 +453,12 @@ impl BinanceMarketStream {
             let depth = rest_client.get_depth(symbol, Some(snapshot_depth)).await?;
             let timestamp = now_micros();
 
-            let snapshot =
-                MessageConverter::convert_depth_snapshot(symbol.clone(), depth, timestamp)?;
+            let snapshot = MessageConverter::convert_depth_snapshot(
+                symbol.clone(),
+                depth,
+                timestamp,
+                source_venue,
+            )?;
 
             snapshots.push((snapshot, timestamp));
         }
@@ -422,12 +469,14 @@ impl BinanceMarketStream {
     fn parse_tracked_socket_event(
         bytes: bytes::Bytes,
         mut metrics: WsMessageMetrics,
+        source_venue: hft_core::VenueId,
     ) -> HftResult<Option<ParsedTrackedMarketEvent>> {
         let mut bytes = match bytes.try_into_mut() {
             Ok(bytes) => bytes,
             Err(bytes) => BytesMut::from(bytes.as_ref()),
         };
-        let parsed = MessageConverter::parse_stream_message_bytes_with_metadata(&mut bytes)?;
+        let parsed =
+            MessageConverter::parse_stream_message_bytes_with_metadata(&mut bytes, source_venue)?;
         metrics.mark_parsed();
         Ok(parsed.map(|parsed| {
             let mut event = parsed.event;
@@ -475,11 +524,13 @@ impl BinanceMarketStream {
         symbols: &[Symbol],
         buffer_capacity: usize,
         snapshot_depth: u16,
+        source_venue: hft_core::VenueId,
     ) -> HftResult<(
         Vec<(MarketSnapshot, u64)>,
         VecDeque<ParsedTrackedMarketEvent>,
     )> {
-        let snapshot_future = Self::get_initial_snapshots(rest_client, symbols, snapshot_depth);
+        let snapshot_future =
+            Self::get_initial_snapshots(rest_client, symbols, snapshot_depth, source_venue);
         tokio::pin!(snapshot_future);
         let mut buffered_events = VecDeque::with_capacity(buffer_capacity.min(1024));
 
@@ -492,7 +543,9 @@ impl BinanceMarketStream {
                     let (bytes, metrics) = message?.ok_or_else(|| {
                         HftError::Network("Binance WebSocket closed during snapshot sync".to_string())
                     })?;
-                    if let Some(event) = Self::parse_tracked_socket_event(bytes, metrics)? {
+                    if let Some(event) =
+                        Self::parse_tracked_socket_event(bytes, metrics, source_venue)?
+                    {
                         if !matches!(&event.event, MarketEvent::Update(_)) {
                             continue;
                         }
@@ -555,6 +608,7 @@ impl MarketStream for BinanceMarketStream {
         let snapshot_enabled = !uses_ws_snapshot_depth;
         let snapshot_depth = Self::snapshot_depth(self.usdm);
         let usdm = self.usdm;
+        let source_venue = self.source_venue();
         let sync_buffer_capacity = Self::sync_buffer_capacity();
         let auto_reconnect = self.caps.auto_reconnect;
         let is_connected = Arc::clone(&self.is_connected);
@@ -579,6 +633,7 @@ impl MarketStream for BinanceMarketStream {
                                 BinanceMarketStream::wait_for_rest_snapshot_budget(
                                     &mut ws_client,
                                     last_rest_snapshot_at,
+                                    source_venue,
                                 )
                                 .await?;
                                 last_rest_snapshot_at = Some(tokio::time::Instant::now());
@@ -588,6 +643,7 @@ impl MarketStream for BinanceMarketStream {
                                     &symbols,
                                     sync_buffer_capacity,
                                     snapshot_depth,
+                                    source_venue,
                                 )
                                 .await
                             }
@@ -692,7 +748,9 @@ impl MarketStream for BinanceMarketStream {
                                             }
                                             last_heartbeat.store(now_micros(), Ordering::Release);
                                             match BinanceMarketStream::parse_tracked_socket_event(
-                                                bytes, metrics,
+                                                bytes,
+                                                metrics,
+                                                source_venue,
                                             ) {
                                                 Ok(Some(event)) => {
                                                     let forward = match sequence_tracker.as_mut() {
@@ -788,7 +846,12 @@ impl MarketStream for BinanceMarketStream {
             }
         });
 
-        Ok(multiplex_market_events(rx, control_rx, generation))
+        Ok(multiplex_market_events(
+            rx,
+            control_rx,
+            generation,
+            source_venue,
+        ))
     }
 
     async fn subscribe_instruments(
@@ -923,6 +986,25 @@ mod tests {
         assert!(!stream.is_connected.load(Ordering::Acquire));
     }
 
+    #[test]
+    fn usdm_mode_survives_rest_endpoint_override() {
+        let stream = BinanceMarketStream::new()
+            .with_usdm()
+            .with_rest_base_url("https://custom.binance.com");
+        assert_eq!(
+            stream.rest_client.endpoint_paths(),
+            ("/fapi/v1/depth", "/fapi/v1/ping")
+        );
+    }
+
+    #[test]
+    fn usdm_mode_replaces_the_schema_catalog_spot_stream_endpoint() {
+        let stream = BinanceMarketStream::new()
+            .with_ws_base_url("wss://stream.binance.com:9443/ws")
+            .with_usdm();
+        assert_eq!(stream.ws_base_url, websocket::WS_USDM_BASE_URL);
+    }
+
     #[tokio::test]
     async fn test_health_check_initial_state() {
         let stream = BinanceMarketStream::new();
@@ -1009,8 +1091,11 @@ mod tests {
     #[test]
     fn instrument_product_must_match_spot_or_usdm_mode() {
         let spot = InstrumentSpec::crypto_spot(Symbol::new("BTCUSDT"), hft_core::VenueId::BINANCE);
-        let mut perp = spot.clone();
+        let mut perp =
+            InstrumentSpec::crypto_spot(Symbol::new("BTCUSDT"), hft_core::VenueId::BINANCE_FUTURES);
         perp.product_type = ProductType::Perp;
+        let mut spot_on_futures = spot.clone();
+        spot_on_futures.venue = hft_core::VenueId::BINANCE_FUTURES;
 
         let spot_stream = BinanceMarketStream::new();
         assert!(spot_stream.validate_instrument_product(&spot).is_ok());
@@ -1019,6 +1104,67 @@ mod tests {
         let usdm_stream = BinanceMarketStream::new().with_usdm();
         assert!(usdm_stream.validate_instrument_product(&perp).is_ok());
         assert!(usdm_stream.validate_instrument_product(&spot).is_err());
+        assert!(usdm_stream
+            .validate_instrument_product(&spot_on_futures)
+            .is_err());
+    }
+
+    #[test]
+    fn parser_preserves_explicit_source_venue_for_spot_and_usdm() {
+        let futures = hft_core::VenueId::BINANCE_FUTURES;
+        let trade = r#"{
+            "stream":"btcusdt@trade",
+            "data":{"e":"trade","E":123456789,"s":"BTCUSDT","t":12345,
+            "p":"45000.00","q":"0.1","T":123456789,"m":false}
+        }"#;
+        let depth = r#"{
+            "stream":"btcusdt@depth",
+            "data":{"e":"depthUpdate","E":123456789,"s":"BTCUSDT",
+            "U":100,"u":101,"pu":99,"b":[["45000.00","0.1"]],"a":[["45100.00","0.2"]]}
+        }"#;
+        let kline = r#"{
+            "stream":"btcusdt@kline_1m",
+            "data":{"e":"kline","E":123456789,"s":"BTCUSDT","k":{
+            "t":123456000,"T":123459999,"s":"BTCUSDT","i":"1m","f":1,"L":2,
+            "o":"45000.00","c":"45001.00","h":"45002.00","l":"44999.00",
+            "v":"1.0","n":2,"x":false,"q":"45000.00","V":"0.5","Q":"22500.00","B":"0"}}
+        }"#;
+        let quote = br#"{"stream":"btcusdt@bookTicker","data":{"u":7,"s":"BTCUSDT","b":"45000.00","B":"1.0","a":"45001.00","A":"1.0"}}"#;
+        let partial = br#"{"stream":"btcusdt@depth20@100ms","data":{"lastUpdateId":101,"bids":[["45000.00","0.1"]],"asks":[["45100.00","0.2"]]}}"#;
+
+        let source_of = |event: MarketEvent| match event {
+            MarketEvent::Snapshot(snapshot) => snapshot.source_venue,
+            MarketEvent::Update(update) => update.source_venue,
+            MarketEvent::Quote(quote) => quote.source_venue,
+            MarketEvent::Trade(trade) => trade.source_venue,
+            MarketEvent::Bar(bar) => bar.source_venue,
+            MarketEvent::Arbitrage(_) | MarketEvent::Disconnect { .. } => None,
+        };
+        for message in [trade, depth, kline] {
+            assert_eq!(
+                source_of(
+                    MessageConverter::parse_stream_message(message, futures)
+                        .unwrap()
+                        .expect("parsed Binance event")
+                ),
+                Some(futures)
+            );
+        }
+        for message in [quote.as_slice(), partial.as_slice()] {
+            assert_eq!(
+                source_of(
+                    MessageConverter::parse_stream_message_bytes(&mut message.to_vec(), futures)
+                        .unwrap()
+                        .expect("parsed Binance frame")
+                ),
+                Some(futures)
+            );
+        }
+
+        let spot_event = MessageConverter::parse_stream_message(trade, hft_core::VenueId::BINANCE)
+            .unwrap()
+            .expect("parsed Spot event");
+        assert_eq!(source_of(spot_event), Some(hft_core::VenueId::BINANCE));
     }
 
     #[test]
@@ -1165,6 +1311,7 @@ mod tests {
         let generation = Arc::new(AtomicU64::new(1));
         let (data_tx, data_rx) = mpsc::channel(2);
         let (control_tx, control_rx) = watch::channel(None);
+        let source_venue = hft_core::VenueId::BINANCE_FUTURES;
         let snapshot = |sequence| {
             TrackedMarketEvent::new(MarketEvent::Snapshot(MarketSnapshot {
                 symbol: Symbol::new("BTCUSDT"),
@@ -1172,7 +1319,7 @@ mod tests {
                 bids: Vec::new(),
                 asks: Vec::new(),
                 sequence,
-                source_venue: Some(hft_core::VenueId::BINANCE),
+                source_venue: Some(source_venue),
                 timestamps: Default::default(),
             }))
         };
@@ -1192,14 +1339,19 @@ mod tests {
         drop(data_tx);
         drop(control_tx);
 
-        let mut stream = multiplex_market_events(data_rx, control_rx, generation);
-        assert!(matches!(
-            stream.next().await,
-            Some(Ok(TrackedMarketEvent {
-                event: MarketEvent::Disconnect { .. },
-                ..
-            }))
-        ));
+        let mut stream = multiplex_market_events(data_rx, control_rx, generation, source_venue);
+        let Some(Ok(TrackedMarketEvent {
+            event:
+                MarketEvent::Disconnect {
+                    source_venue: disconnect_venue,
+                    ..
+                },
+            ..
+        })) = stream.next().await
+        else {
+            panic!("expected USD-M disconnect after invalidation");
+        };
+        assert_eq!(disconnect_venue, Some(source_venue));
         let Some(Ok(TrackedMarketEvent {
             event: MarketEvent::Snapshot(snapshot),
             ..
@@ -1220,6 +1372,7 @@ mod tests {
         let tracked = BinanceMarketStream::parse_tracked_socket_event(
             message,
             WsMessageMetrics::new(received_at, 0),
+            hft_core::VenueId::BINANCE,
         )
         .unwrap()
         .expect("tracked depth event");
@@ -1242,6 +1395,7 @@ mod tests {
                     received_at_unix_us,
                     0,
                 ),
+                hft_core::VenueId::BINANCE,
             )
             .unwrap()
             .expect("tracked Binance event")

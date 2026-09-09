@@ -248,6 +248,23 @@ pub struct OpenOrder {
     pub updated_at: Timestamp,
 }
 
+/// A read-only authoritative order identity that can be cancelled by the venue adapter.
+///
+/// Some venues expose conditional/algo orders through a separate endpoint and they cannot be
+/// represented by Monday's standard `OrderType` without misclassifying them.  These references
+/// keep the venue-native type and cancellation identity visible to reconciliation/control-plane
+/// callers while leaving order submission semantics unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancellableOrderRef {
+    pub order_id: OrderId,
+    #[serde(default)]
+    pub client_order_id: Option<String>,
+    pub symbol: Symbol,
+    pub order_type: String,
+    #[serde(default)]
+    pub algo_id: Option<u64>,
+}
+
 /// 訂單狀態
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum OrderStatus {

@@ -79,8 +79,10 @@ mod redis_export {
                 match client.get_multiplexed_async_connection().await {
                     Ok(mut conn) => {
                         for (vs, orderbook) in &market_view.orderbooks {
-                            let instrument_key =
-                                InstrumentKey::from_venue_symbol(vs, product_type_for_venue(vs.venue));
+                            let instrument_key = InstrumentKey::from_venue_symbol(
+                                vs,
+                                product_type_for_venue(vs.venue),
+                            );
                             let instrument_key_string = instrument_key.storage_key();
                             let product_type = instrument_key.product_type.as_str();
                             let snapshot_data = serde_json::json!({
@@ -125,6 +127,7 @@ mod redis_export {
     fn product_type_for_venue(venue: hft_core::VenueId) -> ProductType {
         match venue {
             hft_core::VenueId::BINANCE_TOKENIZED_SECURITIES => ProductType::TokenizedSecuritySpot,
+            hft_core::VenueId::BINANCE_FUTURES => ProductType::Perp,
             hft_core::VenueId::ONDO_PERPS => ProductType::Perp,
             _ => ProductType::Spot,
         }
@@ -462,6 +465,7 @@ mod clickhouse_export {
     fn product_type_for_venue(venue: hft_core::VenueId) -> ProductType {
         match venue {
             hft_core::VenueId::BINANCE_TOKENIZED_SECURITIES => ProductType::TokenizedSecuritySpot,
+            hft_core::VenueId::BINANCE_FUTURES => ProductType::Perp,
             hft_core::VenueId::ONDO_PERPS => ProductType::Perp,
             _ => ProductType::Spot,
         }
@@ -617,7 +621,9 @@ mod clickhouse_export {
 
             // 最後刷新剩餘批量
             if !batch.is_empty() {
-                if let Ok(mut inserter) = order_client.insert::<OrderHistoryRow>("hft.order_history") {
+                if let Ok(mut inserter) =
+                    order_client.insert::<OrderHistoryRow>("hft.order_history")
+                {
                     for row in &batch {
                         let _ = inserter.write(row).await;
                     }

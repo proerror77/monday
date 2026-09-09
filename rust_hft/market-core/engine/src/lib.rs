@@ -18,7 +18,7 @@ use dataflow::{EventConsumer, IngestionConfig};
 use execution_queues::EngineQueues;
 use hft_core::{
     monotonic_micros, now_micros, AccountId, HftError, HftResult, LatencyCaptureBoundary,
-    LatencyStage, LatencyTracker, OrderType, Side, Symbol, Timestamp, VenueId, VenueSymbol,
+    LatencyStage, LatencyTracker, OrderType, Price, Side, Symbol, Timestamp, VenueId, VenueSymbol,
 };
 use latency_monitor::{LatencyMonitor, LatencyMonitorConfig};
 use ports::Trade as MarketTrade;
@@ -610,9 +610,23 @@ impl Engine {
                 exchange_only: snapshot
                     .clients
                     .iter()
-                    .filter_map(|client| client.open_orders.as_ref().ok())
-                    .flatten()
-                    .map(|order| order.order_id.clone())
+                    .flat_map(|client| {
+                        let standard = client
+                            .open_orders
+                            .as_ref()
+                            .ok()
+                            .into_iter()
+                            .flatten()
+                            .map(|order| order.order_id.clone());
+                        let cancellable = client
+                            .cancellable_orders
+                            .as_ref()
+                            .ok()
+                            .into_iter()
+                            .flatten()
+                            .map(|order| order.order_id.clone());
+                        standard.chain(cancellable)
+                    })
                     .collect(),
                 ..Default::default()
             };
@@ -646,6 +660,13 @@ impl Engine {
                 } else {
                     identity_conflicts.push(exchange_order.order_id.clone());
                 }
+            }
+            if let Ok(cancellable_orders) = &client.cancellable_orders {
+                identity_conflicts.extend(
+                    cancellable_orders
+                        .iter()
+                        .map(|order| order.order_id.clone()),
+                );
             }
         }
 
@@ -1389,14 +1410,22 @@ impl Engine {
 
         let market_view = self.aggregation_engine.build_market_view();
 
-        // 更新 Portfolio 的市場價格用於 mark-to-market（取任一場所的中間價）
-        let mut market_prices =
-            std::collections::HashMap::with_capacity(market_view.orderbooks.len());
-        for vs in market_view.orderbooks.keys() {
-            if let Some(mid_price) = market_view.get_mid_price_for_venue(vs) {
-                market_prices.insert(vs.symbol.clone(), mid_price);
+        // The portfolio ledger is symbol-only. Refuse to choose one venue's price when the
+        // same symbol is simultaneously present on multiple venues; updating the ledger in
+        // that state would silently mix Spot and USD-M mark-to-market values.
+        let market_prices = if self.portfolio_manager.is_some() {
+            match Self::portfolio_market_prices(&market_view) {
+                Ok(prices) => prices,
+                Err(error) => {
+                    self.stats.snapshot_publish_failed =
+                        self.stats.snapshot_publish_failed.saturating_add(1);
+                    self.set_trading_mode(TradingMode::Paused);
+                    return Err(error);
+                }
             }
-        }
+        } else {
+            HashMap::new()
+        };
         if !market_prices.is_empty() {
             if let Some(pm) = &mut self.portfolio_manager {
                 pm.update_market_prices(&market_prices);
@@ -1423,6 +1452,27 @@ impl Engine {
             result.snapshot_sequence, self.aggregation_engine.snapshot_version
         );
         Ok(())
+    }
+
+    fn portfolio_market_prices(market_view: &MarketView) -> HftResult<HashMap<Symbol, Price>> {
+        let mut venues_by_symbol = HashMap::<Symbol, VenueId>::new();
+        let mut market_prices = HashMap::with_capacity(market_view.orderbooks.len());
+        for venue_symbol in market_view.orderbooks.keys() {
+            if let Some(previous_venue) =
+                venues_by_symbol.insert(venue_symbol.symbol.clone(), venue_symbol.venue)
+            {
+                if previous_venue != venue_symbol.venue {
+                    return Err(HftError::Execution(format!(
+                        "portfolio mark-to-market collision for {} across venues {} and {}",
+                        venue_symbol.symbol, previous_venue, venue_symbol.venue
+                    )));
+                }
+            }
+            if let Some(mid_price) = market_view.get_mid_price_for_venue(venue_symbol) {
+                market_prices.insert(venue_symbol.symbol.clone(), mid_price);
+            }
+        }
+        Ok(market_prices)
     }
 
     /// 發佈帳戶快照
@@ -2802,7 +2852,7 @@ mod tests {
         }
     }
 
-    pub(crate) fn execution_test_market(received_at: u64, ask: f64) -> MarketView {
+    fn execution_test_market_for_venue(received_at: u64, ask: f64, venue: VenueId) -> MarketView {
         let symbol = Symbol::new("BTCUSDT");
         let mut book = aggregation::TopNSnapshot::new(symbol.clone(), 5);
         book.update_from_snapshot(&ports::MarketSnapshot {
@@ -2811,19 +2861,168 @@ mod tests {
             bids: vec![ports::BookLevel::new_unchecked(ask - 0.01, 10.0)],
             asks: vec![ports::BookLevel::new_unchecked(ask, 10.0)],
             sequence: 7,
-            source_venue: Some(VenueId::MOCK),
+            source_venue: Some(venue),
             timestamps: hft_core::MarketDataTimestamps::local_only(
                 hft_core::LocalReceiveTimestamp::new(received_at),
             ),
         });
         MarketView {
-            orderbooks: [(VenueSymbol::new(VenueId::MOCK, symbol), Arc::new(book))]
+            orderbooks: [(VenueSymbol::new(venue, symbol), Arc::new(book))]
                 .into_iter()
                 .collect(),
             arbitrage_opportunities: Vec::new(),
             timestamp: received_at,
             version: 1,
         }
+    }
+
+    pub(crate) fn execution_test_market(received_at: u64, ask: f64) -> MarketView {
+        execution_test_market_for_venue(received_at, ask, VenueId::MOCK)
+    }
+
+    struct RecordingPortfolio {
+        account_snapshot: SnapshotContainer<AccountView>,
+        updates: std::sync::Arc<std::sync::Mutex<Vec<HashMap<Symbol, Price>>>>,
+    }
+
+    impl RecordingPortfolio {
+        fn new(updates: std::sync::Arc<std::sync::Mutex<Vec<HashMap<Symbol, Price>>>>) -> Self {
+            Self {
+                account_snapshot: SnapshotContainer::new(AccountView::default()),
+                updates,
+            }
+        }
+    }
+
+    impl ports::PortfolioManager for RecordingPortfolio {
+        fn register_order(
+            &mut self,
+            _order_id: hft_core::OrderId,
+            _symbol: Symbol,
+            _side: hft_core::Side,
+        ) {
+        }
+
+        fn on_execution_event(&mut self, _event: &ports::ExecutionEvent) {}
+
+        fn reader(&self) -> Arc<dyn snapshot::SnapshotReader<AccountView>> {
+            self.account_snapshot.reader()
+        }
+
+        fn update_market_prices(&mut self, prices: &HashMap<Symbol, Price>) {
+            self.updates.lock().unwrap().push(prices.clone());
+        }
+
+        fn export_state(&self) -> ports::PortfolioState {
+            ports::PortfolioState {
+                account_view: AccountView::default(),
+                order_meta: HashMap::new(),
+                market_prices: HashMap::new(),
+                processed_fill_ids: HashMap::new(),
+                recent_accounting_event_ids: Vec::new(),
+            }
+        }
+
+        fn import_state(&mut self, _state: ports::PortfolioState) {}
+    }
+
+    fn venue_snapshot(venue: VenueId, sequence: u64, bid: f64, ask: f64) -> MarketEvent {
+        MarketEvent::Snapshot(ports::MarketSnapshot {
+            symbol: Symbol::new("BTCUSDT"),
+            timestamp: now_micros(),
+            bids: vec![ports::BookLevel::new_unchecked(bid, 10.0)],
+            asks: vec![ports::BookLevel::new_unchecked(ask, 10.0)],
+            sequence,
+            source_venue: Some(venue),
+            timestamps: Default::default(),
+        })
+    }
+
+    #[test]
+    fn dual_market_execution_references_remain_venue_keyed() {
+        let received_at = now_micros();
+        let spot = execution_test_market_for_venue(received_at, 100.0, VenueId::BINANCE);
+        let futures = execution_test_market_for_venue(received_at, 200.0, VenueId::BINANCE_FUTURES);
+        let market = MarketView {
+            orderbooks: spot
+                .orderbooks
+                .into_iter()
+                .chain(futures.orderbooks)
+                .collect(),
+            arbitrage_opportunities: Vec::new(),
+            timestamp: received_at,
+            version: 1,
+        };
+
+        let mut spot_intent = test_intent();
+        spot_intent.target_venue = Some(VenueId::BINANCE);
+        let mut futures_intent = spot_intent.clone();
+        futures_intent.target_venue = Some(VenueId::BINANCE_FUTURES);
+
+        assert_eq!(
+            market
+                .execution_price_reference(&spot_intent)
+                .expect("Spot reference")
+                .price,
+            Price::from_f64(100.0).unwrap()
+        );
+        assert_eq!(
+            market
+                .execution_price_reference(&futures_intent)
+                .expect("USD-M reference")
+                .price,
+            Price::from_f64(200.0).unwrap()
+        );
+    }
+
+    #[test]
+    fn portfolio_mtm_collision_fails_before_update_and_disconnect_keeps_spot() {
+        let updates = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut engine = Engine::new(EngineConfig::default());
+        engine.set_portfolio_manager(Box::new(RecordingPortfolio::new(updates.clone())));
+        let ingester = engine.create_event_ingester_pair();
+
+        ingester
+            .lock()
+            .unwrap()
+            .ingest(venue_snapshot(VenueId::BINANCE, 1, 99.0, 101.0))
+            .unwrap();
+        engine.tick().expect("Spot snapshot publishes");
+        assert_eq!(updates.lock().unwrap().len(), 1);
+
+        ingester
+            .lock()
+            .unwrap()
+            .ingest(venue_snapshot(VenueId::BINANCE_FUTURES, 1, 199.0, 201.0))
+            .unwrap();
+        let error = engine
+            .tick()
+            .expect_err("same-symbol Spot/USD-M collision must fail closed");
+        assert!(error.to_string().contains("mark-to-market collision"));
+        assert_eq!(engine.trading_mode(), TradingMode::Paused);
+        assert_eq!(updates.lock().unwrap().len(), 1);
+
+        ingester
+            .lock()
+            .unwrap()
+            .ingest(MarketEvent::Disconnect {
+                reason: "USD-M stream reset".to_string(),
+                source_venue: Some(VenueId::BINANCE_FUTURES),
+                symbol: Some(Symbol::new("BTCUSDT")),
+            })
+            .unwrap();
+        engine
+            .tick()
+            .expect("Spot book remains usable after USD-M disconnect");
+        let market = engine.get_market_view();
+        assert!(market
+            .orderbooks
+            .contains_key(&VenueSymbol::new(VenueId::BINANCE, Symbol::new("BTCUSDT"))));
+        assert!(!market.orderbooks.contains_key(&VenueSymbol::new(
+            VenueId::BINANCE_FUTURES,
+            Symbol::new("BTCUSDT")
+        )));
+        assert_eq!(updates.lock().unwrap().len(), 2);
     }
 
     #[test]
