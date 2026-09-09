@@ -4257,6 +4257,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "hft-data-adapter-predict-fun"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "hft-core",
+ "hft-ports",
+ "reqwest 0.12.28",
+ "rust_decimal",
+ "secrecy 0.10.3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "hft-data-adapters-common"
 version = "0.1.0"
 dependencies = [
@@ -5883,13 +5902,13 @@ dependencies = [
  "hft-data",
  "hft-data-adapter-binance",
  "hft-data-adapter-polymarket",
+ "hft-data-adapter-predict-fun",
  "libc",
  "ploy-market-contracts",
  "polymarket_client_sdk_v2",
  "reqwest 0.13.4",
  "rust_decimal",
  "rust_decimal_macros",
- "secrecy 0.8.0",
  "serde",
  "serde_json",
  "sha2",

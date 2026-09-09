@@ -32,6 +32,7 @@ impl VenueId {
     pub const BINANCE_FUTURES: VenueId = VenueId(103);
     pub const BINANCE_BROKERAGE_EQUITIES: VenueId = VenueId(104);
     pub const BINANCE_PREDICTION: VenueId = VenueId(105);
+    pub const PREDICT_FUN: VenueId = VenueId(106);
     pub const MOCK: VenueId = VenueId(99);
 
     pub fn as_str(&self) -> &'static str {
@@ -52,6 +53,7 @@ impl VenueId {
             Self::BINANCE_FUTURES => "BINANCE_FUTURES",
             Self::BINANCE_BROKERAGE_EQUITIES => "BINANCE_BROKERAGE_EQUITIES",
             Self::BINANCE_PREDICTION => "BINANCE_PREDICTION",
+            Self::PREDICT_FUN => "PREDICT_FUN",
             Self::MOCK => "MOCK",
             _ => "UNKNOWN",
         }
@@ -81,6 +83,7 @@ impl VenueId {
             "BINANCE_PREDICTION" | "BINANCE-PREDICTION" | "W3W_PREDICTION" => {
                 Some(Self::BINANCE_PREDICTION)
             }
+            "PREDICT_FUN" | "PREDICT-FUN" => Some(Self::PREDICT_FUN),
             "MOCK" => Some(Self::MOCK),
             _ => None,
         }
@@ -525,6 +528,19 @@ impl InstrumentSpec {
         }
     }
 
+    pub fn predict_fun_outcome(token_id: Symbol) -> Self {
+        Self {
+            symbol: token_id,
+            venue: VenueId::PREDICT_FUN,
+            asset_class: AssetClass::PredictionMarket,
+            product_type: ProductType::PredictionMarket,
+            regulatory_profile: RegulatoryProfile::RestrictedJurisdiction,
+            underlying_symbol: None,
+            issuer: Some("Predict.fun".to_string()),
+            quote_currency: Some("USDT".to_string()),
+        }
+    }
+
     pub fn instrument_key(&self) -> InstrumentKey {
         InstrumentKey::from_spec(self)
     }
@@ -611,6 +627,21 @@ mod instrument_key_tests {
         assert_eq!(
             spec.instrument_key().storage_key(),
             "BINANCE_PREDICTION:PREDICTION_MARKET:112233"
+        );
+    }
+
+    #[test]
+    fn predict_fun_has_explicit_venue_and_product_semantics() {
+        let spec = InstrumentSpec::predict_fun_outcome(Symbol::new("yes-token"));
+
+        assert_eq!(VenueId::from_str("predict-fun"), Some(VenueId::PREDICT_FUN));
+        assert_eq!(spec.venue, VenueId::PREDICT_FUN);
+        assert_eq!(spec.asset_class, AssetClass::PredictionMarket);
+        assert_eq!(spec.product_type, ProductType::PredictionMarket);
+        assert_eq!(spec.quote_currency.as_deref(), Some("USDT"));
+        assert_eq!(
+            spec.instrument_key().storage_key(),
+            "PREDICT_FUN:PREDICTION_MARKET:yes-token"
         );
     }
 }
