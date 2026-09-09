@@ -418,6 +418,13 @@ struct ReferenceWindowCandidate {
     observed_at_ns: u64,
 }
 
+#[derive(Debug, Clone)]
+struct VerifiedReferenceInput {
+    input: FrozenInput,
+    coverage_start_received_at_ns: u64,
+    coverage_end_received_at_ns: u64,
+}
+
 fn raw_contract_key(manifest: &Map<String, Value>) -> Result<String> {
     let schema = required_string(manifest, "schema", "source manifest")?;
     let dataset = required_string(manifest, "dataset", "source manifest")?;
@@ -799,8 +806,8 @@ fn verify_reference_window_candidate(
     request: &FreshWindowRequest,
     candidate: &ReferenceWindowCandidate,
     remaining_bytes: &mut u64,
-    cache: &mut BTreeMap<PathBuf, Option<FrozenInput>>,
-) -> Result<Option<FrozenInput>> {
+    cache: &mut BTreeMap<PathBuf, Option<VerifiedReferenceInput>>,
+) -> Result<Option<VerifiedReferenceInput>> {
     if let Some(cached) = cache.get(&candidate.path) {
         return Ok(cached.clone());
     }
@@ -825,7 +832,7 @@ fn verify_reference_window_candidate(
         data_sha256: input.content_sha256.clone(),
         manifest_sha256: input.manifest_sha256.clone(),
     };
-    let selected = match request.market {
+    let coverage = match request.market {
         Market::Usdm => verify_reference_artifact_read_only_current_batch(
             &artifact,
             &input.content_sha256,
@@ -834,7 +841,7 @@ fn verify_reference_window_candidate(
         .contracts()
         .iter()
         .any(|contract| contract.symbol == request.symbol)
-        .then_some(input),
+        .then_some((input.start_received_at_ns, input.end_received_at_ns)),
         Market::Spot => {
             let spot_artifact =
                 crate::binance_spot_reference_artifact::PublishedSpotReferenceArtifact {
@@ -844,17 +851,25 @@ fn verify_reference_window_candidate(
                     data_sha256: input.content_sha256.clone(),
                     manifest_sha256: input.manifest_sha256.clone(),
                 };
-            crate::binance_spot_reference_artifact::verify_spot_reference_artifact(
+            let batch = crate::binance_spot_reference_artifact::verify_spot_reference_artifact(
                 &spot_artifact,
                 &input.content_sha256,
                 &input.manifest_sha256,
-            )?
-            .rules()
-            .iter()
-            .any(|rule| rule.symbol == request.symbol)
-            .then_some(input)
+            )?;
+            batch
+                .rules()
+                .iter()
+                .find(|rule| rule.symbol == request.symbol)
+                .map(|rule| (rule.received_at_ns, rule.received_at_ns))
         }
     };
+    let selected = coverage.map(
+        |(coverage_start_received_at_ns, coverage_end_received_at_ns)| VerifiedReferenceInput {
+            input,
+            coverage_start_received_at_ns,
+            coverage_end_received_at_ns,
+        },
+    );
     cache.insert(candidate.path.clone(), selected.clone());
     Ok(selected)
 }
@@ -865,7 +880,7 @@ fn references_for_window(
     window_end: u64,
     candidates: &[ReferenceWindowCandidate],
     remaining_bytes: &mut u64,
-    cache: &mut BTreeMap<PathBuf, Option<FrozenInput>>,
+    cache: &mut BTreeMap<PathBuf, Option<VerifiedReferenceInput>>,
 ) -> Result<Option<Vec<FrozenInput>>> {
     let horizon_ns = request
         .bucket_ms
@@ -890,21 +905,32 @@ fn references_for_window(
         }
     }
     references.sort_by(|left, right| {
-        (left.start_received_at_ns, &left.relative_path)
-            .cmp(&(right.start_received_at_ns, &right.relative_path))
+        (
+            left.coverage_start_received_at_ns,
+            &left.input.relative_path,
+        )
+            .cmp(&(
+                right.coverage_start_received_at_ns,
+                &right.input.relative_path,
+            ))
     });
     if references.is_empty() {
         return Ok(None);
     }
-    let earliest = references.first().unwrap().start_received_at_ns;
-    let latest = references.last().unwrap().end_received_at_ns;
+    let earliest = references.first().unwrap().coverage_start_received_at_ns;
+    let latest = references.last().unwrap().coverage_end_received_at_ns;
     let required_through = window_end
         .checked_add(horizon_ns)
         .context("fresh reference required coverage overflows")?;
     if earliest > window_start || latest < required_through {
         return Ok(None);
     }
-    Ok(Some(references))
+    Ok(Some(
+        references
+            .into_iter()
+            .map(|reference| reference.input)
+            .collect(),
+    ))
 }
 
 pub fn select_fresh_window(request: &FreshWindowRequest) -> Result<FreshWindowSelection> {
@@ -1403,10 +1429,20 @@ fn build_frozen_inventory(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::binance_spot_reference_artifact::{
+        publish_spot_reference, SpotReferenceArtifactConfig,
+    };
+    use crate::binance_spot_reference_collector::OFFICIAL_SPOT_SOURCE_ORIGIN;
     use crate::binance_usdm_reference_artifact::{
         publish_reference_batch, ReferenceArtifactConfig,
     };
     use crate::binance_usdm_reference_collector::OFFICIAL_USDM_SOURCE_ORIGIN;
+    use data::binance_spot_reference::{
+        SpotInstrumentRules, SpotNotionalFilter, SpotPriceFilter, SpotQuantityFilter,
+        SpotReferenceBatch, EXCHANGE_INFO_ENDPOINT as SPOT_EXCHANGE_INFO_ENDPOINT,
+        REFERENCE_SCHEMA as SPOT_REFERENCE_SCHEMA,
+        SERVER_TIME_ENDPOINT as SPOT_SERVER_TIME_ENDPOINT,
+    };
     use data::binance_usdm_reference::{
         ActivePerpetualContract, CompleteReferenceBatch, MarkIndexFundingObservation,
         OpenInterestObservation, EXCHANGE_INFO_ENDPOINT, OPEN_INTEREST_ENDPOINT,
@@ -1417,6 +1453,51 @@ mod tests {
 
     const SOURCE_MS: u64 = 1_700_000_000_000;
     const RECEIVED_NS: u64 = 1_700_000_000_500_000_000;
+
+    fn spot_reference_batch(received_at_ns: u64) -> SpotReferenceBatch {
+        let source_time_ms = received_at_ns / 1_000_000 - 1;
+        SpotReferenceBatch::new(vec![SpotInstrumentRules {
+            schema: SPOT_REFERENCE_SCHEMA.into(),
+            venue: "binance".into(),
+            market: "spot".into(),
+            symbol: "BTCUSDT".into(),
+            base_asset: "BTC".into(),
+            quote_asset: "USDT".into(),
+            status: "TRADING".into(),
+            is_spot_trading_allowed: true,
+            base_asset_precision: 8,
+            quote_asset_precision: 8,
+            price_filter: SpotPriceFilter {
+                min_price: Decimal::ZERO,
+                max_price: Decimal::ZERO,
+                tick_size: Decimal::ZERO,
+            },
+            lot_size_filter: SpotQuantityFilter {
+                min_quantity: Decimal::new(1, 3),
+                max_quantity: Decimal::from(100),
+                step_size: Decimal::new(1, 3),
+            },
+            market_lot_size_filter: Some(SpotQuantityFilter {
+                min_quantity: Decimal::ZERO,
+                max_quantity: Decimal::ZERO,
+                step_size: Decimal::ZERO,
+            }),
+            notional_filter: SpotNotionalFilter {
+                filter_type: "MIN_NOTIONAL".into(),
+                min_notional: Decimal::from(5),
+                max_notional: None,
+                apply_min_to_market: false,
+                apply_max_to_market: None,
+                avg_price_mins: 5,
+            },
+            source_time_ms,
+            source_clock_received_at_ns: received_at_ns - 100_000,
+            received_at_ns,
+            source_endpoint: SPOT_EXCHANGE_INFO_ENDPOINT.into(),
+            source_clock_endpoint: SPOT_SERVER_TIME_ENDPOINT.into(),
+        }])
+        .unwrap()
+    }
 
     fn fixture() -> (tempfile::TempDir, InventoryRequest) {
         let directory = tempfile::tempdir().unwrap();
@@ -1522,6 +1603,15 @@ mod tests {
     }
 
     fn extra_reference(request: &InventoryRequest, symbol: &str, offset_ns: u64) {
+        extra_reference_with_offsets(request, symbol, offset_ns, offset_ns);
+    }
+
+    fn extra_reference_with_offsets(
+        request: &InventoryRequest,
+        symbol: &str,
+        rule_offset_ns: u64,
+        observed_offset_ns: u64,
+    ) {
         let path = files_with_suffix_bounded(&request.reference_root, ".manifest.json", 100)
             .unwrap()
             .remove(0);
@@ -1546,26 +1636,26 @@ mod tests {
         for row in &mut contracts {
             row.symbol = symbol.into();
             row.pair = symbol.into();
-            row.source_time_ms += offset_ns / 1_000_000;
-            row.source_clock_received_at_ns += offset_ns;
-            row.received_at_ns += offset_ns;
+            row.source_time_ms += rule_offset_ns / 1_000_000;
+            row.source_clock_received_at_ns += rule_offset_ns;
+            row.received_at_ns += rule_offset_ns;
         }
         for row in &mut marks {
             row.symbol = symbol.into();
-            row.source_time_ms += offset_ns / 1_000_000;
-            row.received_at_ns += offset_ns;
-            row.next_funding_time_ms += offset_ns / 1_000_000;
+            row.source_time_ms += rule_offset_ns / 1_000_000;
+            row.received_at_ns += rule_offset_ns;
+            row.next_funding_time_ms += rule_offset_ns / 1_000_000;
         }
         for row in &mut interest {
             row.symbol = symbol.into();
-            row.source_time_ms += offset_ns / 1_000_000;
-            row.received_at_ns += offset_ns;
+            row.source_time_ms += rule_offset_ns / 1_000_000;
+            row.received_at_ns += rule_offset_ns;
         }
         let batch = CompleteReferenceBatch::new(contracts, marks, interest).unwrap();
         publish_reference_batch(
             &ReferenceArtifactConfig {
                 output_root: request.reference_root.clone(),
-                observed_at_ns: RECEIVED_NS + 100 + offset_ns,
+                observed_at_ns: RECEIVED_NS + 100 + observed_offset_ns,
                 max_staleness_ms: 1000,
             },
             OFFICIAL_USDM_SOURCE_ORIGIN,
@@ -1721,6 +1811,77 @@ mod tests {
         let error = freeze_inventory(&request).unwrap_err().to_string();
 
         assert!(error.contains("Binance spot"));
+    }
+
+    #[test]
+    fn fresh_spot_reference_boundary_uses_verified_rule_receive_clock() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let reference_root = root.join("reference");
+        fs::create_dir_all(&reference_root).unwrap();
+        let references = [
+            (RECEIVED_NS - 1_000_000_000, RECEIVED_NS + 1_000_000_000),
+            (RECEIVED_NS + 7_000_000_000, RECEIVED_NS + 8_000_000_000),
+        ];
+        for (rule_received_at_ns, observed_at_ns) in references {
+            publish_spot_reference(
+                &SpotReferenceArtifactConfig {
+                    output_root: reference_root.clone(),
+                    observed_at_ns,
+                    max_staleness_ms: 3_000,
+                },
+                OFFICIAL_SPOT_SOURCE_ORIGIN,
+                rule_received_at_ns - 100_000,
+                rule_received_at_ns,
+                &spot_reference_batch(rule_received_at_ns),
+            )
+            .unwrap();
+        }
+
+        let request = FreshWindowRequest {
+            raw_root: root.join("raw"),
+            reference_root: reference_root.clone(),
+            mode: FreshWindowMode::Explicit {
+                start_received_at_ns: RECEIVED_NS,
+                end_received_at_ns: RECEIVED_NS + 2_000_000_000,
+            },
+            market: Market::Spot,
+            symbol: "BTCUSDT".into(),
+            source_revision: "a".repeat(40),
+            image_ref: format!("registry/runner@sha256:{}", "b".repeat(64)),
+            mission_id: "data-test".into(),
+            output_prefix: "runs/test".into(),
+            bucket_ms: 1_000,
+            label_horizon_buckets: 5,
+            top_depth: 5,
+            max_scan_entries: 100,
+            max_inputs: 10,
+            max_input_bytes: 1_000_000,
+        };
+        let candidates = scan_reference_window_candidates(&request).unwrap();
+        assert_eq!(candidates.len(), 2);
+        let mut remaining_bytes = request.max_input_bytes;
+        let mut cache = BTreeMap::new();
+        let references = references_for_window(
+            &request,
+            RECEIVED_NS,
+            RECEIVED_NS + 2_000_000_000,
+            &candidates,
+            &mut remaining_bytes,
+            &mut cache,
+        )
+        .unwrap()
+        .expect("the verified rule receive clock covers the label horizon");
+
+        assert_eq!(references.len(), 2);
+        assert_eq!(
+            references[0].start_received_at_ns,
+            RECEIVED_NS + 1_000_000_000
+        );
+        assert_eq!(
+            references[0].end_received_at_ns,
+            RECEIVED_NS + 1_000_000_000
+        );
     }
 
     #[test]

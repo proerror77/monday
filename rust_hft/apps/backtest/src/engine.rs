@@ -942,8 +942,16 @@ fn common_quantity_step(left: Decimal, right: Decimal) -> Result<Decimal> {
     let right_scale = 10_i128
         .checked_pow(scale - right.scale())
         .context("Spot quantity step scale overflow")?;
-    let left_units = left.mantissa().abs().saturating_mul(left_scale);
-    let right_units = right.mantissa().abs().saturating_mul(right_scale);
+    let left_units = left
+        .mantissa()
+        .abs()
+        .checked_mul(left_scale)
+        .context("Spot quantity step integer conversion overflow")?;
+    let right_units = right
+        .mantissa()
+        .abs()
+        .checked_mul(right_scale)
+        .context("Spot quantity step integer conversion overflow")?;
     let gcd = decimal_gcd(left_units, right_units);
     if gcd == 0 {
         return Ok(left);
@@ -952,7 +960,8 @@ fn common_quantity_step(left: Decimal, right: Decimal) -> Result<Decimal> {
         .checked_div(gcd)
         .and_then(|value| value.checked_mul(right_units))
         .context("Spot quantity step least common multiple overflow")?;
-    Ok(Decimal::from_i128_with_scale(lcm, scale))
+    Decimal::try_from_i128_with_scale(lcm, scale)
+        .context("Spot quantity step Decimal conversion overflow")
 }
 
 fn spot_submission_quantity(
@@ -980,6 +989,7 @@ fn spot_submission_quantity(
     step = common_quantity_step(step, Decimal::new(1, rules.base_asset_precision as u32))?;
     let requested = Decimal::from_f64_retain(requested_quantity)
         .context("Spot requested quantity is not representable")?;
+    let requested = requested.round_dp(rules.base_asset_precision as u32);
     let units = (requested / step).floor();
     (units * step)
         .to_f64()
@@ -2837,6 +2847,70 @@ mod tests {
             rules.market_lot_size_filter.as_ref().unwrap(),
             quantity
         ));
+    }
+
+    #[test]
+    fn spot_submission_quantity_rounds_binary_float_before_flooring() {
+        let mut rules = spot_replay_rules();
+        rules.lot_size_filter.step_size = "0.1".to_string();
+        rules.market_lot_size_filter.as_mut().unwrap().step_size = "0.1".to_string();
+
+        let quantity = spot_submission_quantity(&rules, 0.3).unwrap();
+
+        assert!((quantity - 0.3).abs() < 1e-12);
+    }
+
+    #[test]
+    fn spot_buy_then_flatten_preserves_a_decimal_step_quantity() {
+        let tape = concat!(
+            "{\"timestamp\":1000000,\"sequence\":1,\"event\":\"snapshot\",\"bids\":[[99,1]],\"asks\":[[101,1]]}\n",
+            "{\"timestamp\":2000000,\"sequence\":2,\"event\":\"l2_update\",\"bids\":[[99,1]],\"asks\":[[101,1]]}\n",
+        );
+        let decisions = [
+            TargetPositionDecision {
+                timestamp_us: 1_000_000,
+                target_position: 0.3,
+            },
+            TargetPositionDecision {
+                timestamp_us: 2_000_000,
+                target_position: 0.0,
+            },
+        ];
+        let config = TargetPositionReplayConfig {
+            market: "spot".to_string(),
+            max_depth_levels: 1,
+            max_decision_delay_us: 1_000_000,
+            order_latency_us: 0,
+            position_notional_usd: 100.0,
+            fee_bps: 0.0,
+            rebate_bps: 0.0,
+            funding_bps: 0.0,
+            latency_bps: 0.0,
+            additional_slippage_bps: 0.0,
+            cross_spread: true,
+            capacity_depth_levels: 0,
+            trade_tape_declared: false,
+        };
+        let mut rules = spot_replay_rules();
+        rules.lot_size_filter.step_size = "0.1".to_string();
+        rules.market_lot_size_filter.as_mut().unwrap().step_size = "0.1".to_string();
+
+        let output = replay_target_positions_with_trace_and_spot_rules(
+            tape.as_bytes(),
+            &decisions,
+            &config,
+            Some(&rules),
+        )
+        .unwrap();
+        let trace = tape_trace_events(&output.trace_bytes);
+
+        assert_eq!(trace.len(), 2);
+        for event in &trace {
+            assert!((event.requested_quantity - 0.3).abs() < 1e-12);
+            assert!((event.filled_quantity - 0.3).abs() < 1e-12);
+            assert_eq!(event.status, "filled");
+        }
+        assert!(output.metrics.final_inventory.abs() <= 1e-12);
     }
 
     #[test]
