@@ -6,6 +6,7 @@ use serde::de::DeserializeOwned;
 use tracing::{debug, info};
 
 pub const REST_BASE_URL: &str = "https://api.binance.com";
+pub const REST_USDM_BASE_URL: &str = "https://fapi.binance.com";
 
 fn classify_http_error(status: u16, retry_after: Option<&str>, body: &str) -> HftError {
     let retry = retry_after
@@ -55,9 +56,17 @@ impl BinanceRestClient {
     }
 
     pub fn with_usdm(mut self) -> Self {
+        if self.client.cfg.base_url == REST_BASE_URL {
+            self.client.cfg.base_url = REST_USDM_BASE_URL.to_string();
+        }
         self.depth_path = "/fapi/v1/depth";
         self.ping_path = "/fapi/v1/ping";
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn endpoint_paths(&self) -> (&'static str, &'static str) {
+        (self.depth_path, self.ping_path)
     }
 
     /// 獲取訂單簿快照
@@ -150,9 +159,16 @@ mod tests {
 
     #[test]
     fn usdm_uses_futures_rest_paths() {
-        let client = BinanceRestClient::with_base_url("https://fapi.binance.com").with_usdm();
+        let client = BinanceRestClient::new().with_usdm();
         assert_eq!(client.depth_path, "/fapi/v1/depth");
         assert_eq!(client.ping_path, "/fapi/v1/ping");
+        assert_eq!(client.client.cfg.base_url, REST_USDM_BASE_URL);
+    }
+
+    #[test]
+    fn usdm_custom_rest_base_url_is_preserved() {
+        let client = BinanceRestClient::with_base_url("http://localhost:18080").with_usdm();
+        assert_eq!(client.client.cfg.base_url, "http://localhost:18080");
     }
 
     #[tokio::test]

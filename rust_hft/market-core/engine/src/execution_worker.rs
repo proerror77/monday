@@ -235,6 +235,9 @@ pub struct ExecutionWorker {
     router: Option<Box<dyn ExecutionRouter>>,
     /// Venue 到客戶端索引的映射（用於新路由系統）
     venue_to_client: HashMap<VenueId, usize>,
+    /// Registration-time proof for clients constructed by the dedicated Binance USD-M adapter.
+    /// It is checked together with the futures venue identity and position-snapshot capability.
+    binance_usdm_client_indices: HashSet<usize>,
     /// 等待 Ack 的訂單。超時後保持追蹤，直到收到交易所終態。
     pending_acks: FxHashMap<OrderId, PendingAck>,
     execution_timelines: FxHashMap<OrderId, ExecutionTimeline>,
@@ -302,6 +305,50 @@ impl ExecutionWorker {
         })
     }
 
+    fn is_binance_usdm_client(&self, client_idx: usize) -> bool {
+        self.binance_usdm_client_indices.contains(&client_idx)
+            && self.venue_for_client(client_idx) == Some(VenueId::BINANCE_FUTURES)
+            && self
+                .execution_clients
+                .get(client_idx)
+                .is_some_and(|client| {
+                    matches!(
+                        client.asset_inventory_capability(),
+                        AssetInventoryCapability::PositionSnapshotRequired
+                    )
+                })
+    }
+
+    fn validate_client_product_scope(
+        &self,
+        intent: &OrderIntent,
+        client_idx: usize,
+    ) -> Result<(), &'static str> {
+        let client = self
+            .execution_clients
+            .get(client_idx)
+            .ok_or("selected execution client is unavailable")?;
+        if intent.product_type == ProductType::Perp && client.is_simulated_execution() {
+            return Ok(());
+        }
+        if intent.product_type == ProductType::Spot
+            && self.venue_for_client(client_idx) == Some(VenueId::BINANCE_FUTURES)
+        {
+            return Err("Spot intents cannot use the Binance USD-M execution client");
+        }
+        if matches!(
+            intent.product_type,
+            ProductType::Perp | ProductType::Futures
+        ) && self.is_binance_usdm_client(client_idx)
+        {
+            return Ok(());
+        }
+        if intent.product_type != ProductType::Spot {
+            return Err("product requires a venue-specific account admission policy");
+        }
+        Ok(())
+    }
+
     /// Refuse execution unless the runtime client binding and fresh external account proof agree.
     /// Tokenized securities remain outside this generic gate until #700 supplies its own
     /// product/compliance attestation policy.
@@ -342,8 +389,10 @@ impl ExecutionWorker {
         if admission.product_type != intent.product_type {
             return Err("account admission product scope does not match intent");
         }
-        if intent.product_type != hft_core::ProductType::Spot {
-            return Err("product requires a venue-specific account admission policy");
+        if intent.product_type != hft_core::ProductType::Spot
+            && !self.is_binance_usdm_client(client_idx)
+        {
+            return Err("product requires a dedicated Binance USD-M execution client");
         }
         if !admission.ready {
             return Err("account admission is not ready");
@@ -374,7 +423,9 @@ impl ExecutionWorker {
         {
             return Err("account external readback is stale or invalid");
         }
-        if !admission.readback.capability.can_trade_crypto_spot {
+        if intent.product_type == hft_core::ProductType::Spot
+            && !admission.readback.capability.can_trade_crypto_spot
+        {
             return Err("account capability does not permit crypto spot execution");
         }
         if admission.readback.balances.is_empty() {
@@ -495,6 +546,7 @@ impl ExecutionWorker {
             control_rx,
             router: None, // 使用舊的硬編碼邏輯
             venue_to_client: HashMap::new(),
+            binance_usdm_client_indices: HashSet::new(),
             pending_acks: FxHashMap::default(),
             execution_timelines: FxHashMap::default(),
             last_reconcile: Instant::now(),
@@ -543,6 +595,7 @@ impl ExecutionWorker {
             control_rx,
             router: Some(router),
             venue_to_client,
+            binance_usdm_client_indices: HashSet::new(),
             pending_acks: FxHashMap::default(),
             execution_timelines: FxHashMap::default(),
             last_reconcile: Instant::now(),
@@ -907,15 +960,8 @@ impl ExecutionWorker {
                     }
                 },
             };
-            if intent.product_type != hft_core::ProductType::Spot
-                && !(intent.product_type == hft_core::ProductType::Perp
-                    && self.execution_clients[client_idx].is_simulated_execution())
-            {
-                self.reject_intent(
-                    &envelope.client_order_id,
-                    "product requires a venue-specific account admission policy",
-                )
-                .await;
+            if let Err(reason) = self.validate_client_product_scope(intent, client_idx) {
+                self.reject_intent(&envelope.client_order_id, reason).await;
                 continue;
             }
             let account_id = if self.execution_clients[client_idx].is_simulated_execution() {
@@ -2383,9 +2429,39 @@ pub fn spawn_execution_worker_with_control(
     tokio::task::JoinHandle<Result<(), HftError>>,
     mpsc::UnboundedSender<ControlCommand>,
 ) {
+    spawn_execution_worker_with_control_and_capabilities(
+        config,
+        queues,
+        execution_clients,
+        venue_to_client,
+        strategy_to_client,
+        account_to_client,
+        account_admissions,
+        account_environments,
+        HashSet::new(),
+    )
+}
+
+/// 创建并启动执行 Worker 任务，并携带由运行时注册阶段产生的专用客户端能力证明。
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_execution_worker_with_control_and_capabilities(
+    config: ExecutionWorkerConfig,
+    queues: WorkerQueues,
+    execution_clients: Vec<Box<dyn ExecutionClient>>,
+    venue_to_client: HashMap<VenueId, usize>,
+    strategy_to_client: Option<std::collections::HashMap<String, usize>>,
+    account_to_client: Option<std::collections::HashMap<AccountId, usize>>,
+    account_admissions: Option<std::collections::HashMap<AccountId, AccountExecutionAdmission>>,
+    account_environments: Option<std::collections::HashMap<AccountId, AccountExecutionEnvironment>>,
+    binance_usdm_client_indices: HashSet<usize>,
+) -> (
+    tokio::task::JoinHandle<Result<(), HftError>>,
+    mpsc::UnboundedSender<ControlCommand>,
+) {
     let (tx, rx) = mpsc::unbounded_channel();
     let mut worker = ExecutionWorker::new(config.clone(), queues, execution_clients, rx);
     worker.venue_to_client = venue_to_client;
+    worker.binance_usdm_client_indices = binance_usdm_client_indices;
     if let Some(map) = strategy_to_client {
         worker.strategy_to_client = Some(map.into_iter().collect());
     }
@@ -2421,6 +2497,37 @@ pub fn spawn_execution_worker_with_control_and_router(
     tokio::task::JoinHandle<Result<(), HftError>>,
     mpsc::UnboundedSender<ControlCommand>,
 ) {
+    spawn_execution_worker_with_control_and_router_and_capabilities(
+        config,
+        queues,
+        execution_clients,
+        router,
+        venue_to_client,
+        strategy_to_client,
+        account_to_client,
+        account_admissions,
+        account_environments,
+        HashSet::new(),
+    )
+}
+
+/// 带路由器与专用 USD-M 客户端能力证明的执行 Worker。
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_execution_worker_with_control_and_router_and_capabilities(
+    config: ExecutionWorkerConfig,
+    queues: WorkerQueues,
+    execution_clients: Vec<Box<dyn ExecutionClient>>,
+    router: Box<dyn ExecutionRouter>,
+    venue_to_client: HashMap<VenueId, usize>,
+    strategy_to_client: Option<std::collections::HashMap<String, usize>>,
+    account_to_client: Option<std::collections::HashMap<AccountId, usize>>,
+    account_admissions: Option<std::collections::HashMap<AccountId, AccountExecutionAdmission>>,
+    account_environments: Option<std::collections::HashMap<AccountId, AccountExecutionEnvironment>>,
+    binance_usdm_client_indices: HashSet<usize>,
+) -> (
+    tokio::task::JoinHandle<Result<(), HftError>>,
+    mpsc::UnboundedSender<ControlCommand>,
+) {
     let (tx, rx) = mpsc::unbounded_channel();
     let mut worker = ExecutionWorker::new_with_router(
         config.clone(),
@@ -2430,6 +2537,7 @@ pub fn spawn_execution_worker_with_control_and_router(
         router,
         venue_to_client,
     );
+    worker.binance_usdm_client_indices = binance_usdm_client_indices;
     if let Some(map) = strategy_to_client {
         worker.strategy_to_client = Some(map.into_iter().collect());
     }
@@ -2802,6 +2910,7 @@ mod tests {
         disconnect_on_first_place: Option<mpsc::UnboundedSender<ExecutionEvent>>,
         modify_error: bool,
         simulated: bool,
+        usdm_capability: bool,
     }
 
     struct MockExecutionClient {
@@ -2891,6 +3000,9 @@ mod tests {
         }
 
         fn asset_inventory_capability(&self) -> AssetInventoryCapability {
+            if self.state.lock().unwrap().usdm_capability {
+                return AssetInventoryCapability::PositionSnapshotRequired;
+            }
             if self.state.lock().unwrap().spot_inventory {
                 AssetInventoryCapability::AuthoritativeAssetInventory {
                     product_type: hft_core::ProductType::Spot,
@@ -3233,6 +3345,81 @@ mod tests {
             .reconciled_open_order_ids
             .entry(account_id)
             .or_default();
+    }
+
+    fn ready_usdm_admission(account_id: AccountId, venue: VenueId) -> AccountExecutionAdmission {
+        let mut admission = ready_spot_admission(account_id, venue);
+        admission.product_type = ProductType::Perp;
+        admission
+    }
+
+    fn bind_ready_usdm_admission(
+        worker: &mut ExecutionWorker,
+        account_id: AccountId,
+        client_idx: usize,
+        venue: VenueId,
+    ) {
+        worker.venue_to_client.insert(venue, client_idx);
+        worker
+            .account_to_client
+            .insert(account_id.clone(), client_idx);
+        worker
+            .account_environments
+            .insert(account_id.clone(), AccountExecutionEnvironment::Testnet);
+        worker.account_admissions.insert(
+            account_id.clone(),
+            ready_usdm_admission(account_id.clone(), venue),
+        );
+        worker
+            .reconciled_open_order_ids
+            .entry(account_id)
+            .or_default();
+    }
+
+    async fn reject_unqualified_usdm_intent(
+        venue: VenueId,
+        mark_as_usdm: bool,
+        has_position_snapshot_capability: bool,
+    ) -> Vec<ExecutionEvent> {
+        let state = Arc::new(StdMutex::new(MockExecutionState {
+            usdm_capability: has_position_snapshot_capability,
+            ..Default::default()
+        }));
+        let client = MockExecutionClient {
+            state: Arc::clone(&state),
+            place_error: false,
+            list_error: false,
+            cancel_error: false,
+        };
+        let (mut engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let account_id = AccountId("usdm-negative-case".to_string());
+        let mut intent = create_test_intent("BTCUSDT");
+        intent.product_type = ProductType::Perp;
+        intent.target_venue = Some(venue);
+        intent.order_type = OrderType::Limit;
+        intent.time_in_force = TimeInForce::GTC;
+        engine_queues
+            .send_intent(account_id.clone(), intent)
+            .expect("queue USD-M intent");
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            vec![Box::new(client)],
+            control_rx,
+        );
+        bind_ready_usdm_admission(&mut worker, account_id, 0, venue);
+        if mark_as_usdm {
+            worker.binance_usdm_client_indices.insert(0);
+        }
+        let mut queued = worker.queues.receive_envelopes();
+        worker.process_order_intents(&mut queued).await;
+
+        assert!(state.lock().unwrap().placed.is_empty());
+        let mut events = Vec::new();
+        engine_queues.receive_events_into(&mut events);
+        events
     }
 
     #[test]
@@ -4223,6 +4410,75 @@ mod tests {
             ] if account_id == &expected
                 && reason == "simulated execution target venue does not match selected client"
         ));
+    }
+
+    #[tokio::test]
+    async fn usdm_perp_routes_to_the_explicit_futures_client_after_account_admission() {
+        let state = Arc::new(StdMutex::new(MockExecutionState {
+            usdm_capability: true,
+            ..Default::default()
+        }));
+        let client = MockExecutionClient {
+            state: Arc::clone(&state),
+            place_error: false,
+            list_error: false,
+            cancel_error: false,
+        };
+        let (mut engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let account_id = AccountId("usdm-account".to_string());
+        let mut intent = create_test_intent("BTCUSDT");
+        intent.product_type = ProductType::Perp;
+        intent.target_venue = Some(VenueId::BINANCE_FUTURES);
+        intent.order_type = OrderType::Limit;
+        intent.time_in_force = TimeInForce::GTC;
+        engine_queues
+            .send_intent(account_id.clone(), intent)
+            .expect("queue USD-M intent");
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            vec![Box::new(client)],
+            control_rx,
+        );
+        bind_ready_usdm_admission(&mut worker, account_id, 0, VenueId::BINANCE_FUTURES);
+        worker.binance_usdm_client_indices.insert(0);
+        let mut queued = worker.queues.receive_envelopes();
+
+        worker.process_order_intents(&mut queued).await;
+
+        assert_eq!(state.lock().unwrap().placed, vec![Symbol::new("BTCUSDT")]);
+    }
+
+    #[tokio::test]
+    async fn usdm_perp_rejects_a_futures_venue_without_the_dedicated_marker() {
+        let events = reject_unqualified_usdm_intent(VenueId::BINANCE_FUTURES, false, true).await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ExecutionEvent::OrderReject { reason, .. }
+                if reason == "product requires a dedicated Binance USD-M execution client"
+        )));
+    }
+
+    #[tokio::test]
+    async fn usdm_perp_rejects_a_marker_when_the_bound_venue_is_not_futures() {
+        let events = reject_unqualified_usdm_intent(VenueId::BINANCE, true, true).await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ExecutionEvent::OrderReject { reason, .. }
+                if reason == "product requires a dedicated Binance USD-M execution client"
+        )));
+    }
+
+    #[tokio::test]
+    async fn usdm_perp_rejects_a_marker_without_position_snapshot_capability() {
+        let events = reject_unqualified_usdm_intent(VenueId::BINANCE_FUTURES, true, false).await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ExecutionEvent::OrderReject { reason, .. }
+                if reason == "product requires a dedicated Binance USD-M execution client"
+        )));
     }
 
     #[tokio::test]

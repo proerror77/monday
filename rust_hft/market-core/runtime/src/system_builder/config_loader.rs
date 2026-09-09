@@ -82,6 +82,7 @@ pub(crate) fn load_config_from_str(
     // New schema (v2) using shared_config crate
     if let Ok(shared_cfg) = shared::SystemConfig::from_yaml_str(&expanded_content) {
         if shared_cfg.schema_version.as_deref() == Some("v2") {
+            reject_unsupported_shared_venue_ids(&shared_cfg)?;
             // 嘗試直接從原始 YAML 讀取 quotes_only（shared schema 可能未定義該欄位）
             let quotes_only_flag = serde_yaml::from_str::<serde_yaml::Value>(&expanded_content)
                 .ok()
@@ -100,6 +101,25 @@ pub(crate) fn load_config_from_str(
 
     // Fallback to legacy template expansion flow
     legacy_load_with_templates(&expanded_content)
+}
+
+fn reject_unsupported_shared_venue_ids(shared_cfg: &SharedSystemConfig) -> Result<(), LoaderError> {
+    let errors = shared_cfg
+        .venues
+        .iter()
+        .filter(|venue| venue.venue_type == VenueId::BINANCE_FUTURES)
+        .map(|venue| {
+            format!(
+                "venue '{}' uses BINANCE_FUTURES directly in schema v2; configure venue_type: Binance with execution_config.market: usdm",
+                venue.name
+            )
+        })
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(LoaderError::Validation(errors))
+    }
 }
 
 fn legacy_load_with_templates(content: &str) -> Result<SystemConfig, Box<dyn std::error::Error>> {
@@ -1102,6 +1122,45 @@ risk:
         );
         assert!(venue.capabilities.ws_order_placement);
         assert!(venue.capabilities.use_incremental_books);
+    }
+
+    #[test]
+    #[serial]
+    fn load_v2_binance_futures_venue_rejects_mock_downgrade() {
+        let system_yaml = r#"
+schema_version: v2
+engine:
+  queue_capacity: 1024
+  stale_us: 5000
+  top_n: 10
+
+venues:
+  - name: binance-futures
+    venue_type: BINANCE_FUTURES
+    symbol_catalog:
+      - BTCUSDT@BINANCE_FUTURES
+    capabilities:
+      supports_incremental_book: true
+      supports_private_ws: true
+      allows_post_only: true
+    execution_mode: Paper
+
+strategies: []
+
+risk:
+  risk_type: Default
+  global_position_limit: 0
+  global_notional_limit: 0
+  max_daily_trades: 0
+  max_orders_per_second: 0
+  staleness_threshold_us: 5000
+"#;
+
+        let error = load_config_from_str(system_yaml)
+            .expect_err("raw BINANCE_FUTURES v2 venue must fail before conversion");
+        let message = error.to_string();
+        assert!(message.contains("BINANCE_FUTURES"));
+        assert!(message.contains("execution_config.market: usdm"));
     }
 
     #[test]
