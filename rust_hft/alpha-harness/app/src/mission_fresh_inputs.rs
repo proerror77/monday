@@ -662,7 +662,11 @@ fn validate_selection(
         .chain(&selection.references)
         .try_fold(0_u64, |total, input| total.checked_add(input.bytes))
         .context("fresh window selection byte count overflowed")?;
-    if verified_bytes != selection.verified_bytes || verified_bytes > args.max_input_bytes {
+    if verified_bytes != selection.verified_bytes
+        || verified_bytes > args.max_input_bytes
+        || selection.verification_bytes < selection.verified_bytes
+        || selection.verification_bytes > args.max_input_bytes
+    {
         bail!("fresh window selection exceeds the input byte budget");
     }
     for (label, input) in selection.raw.iter().map(|input| ("raw", input)).chain(
@@ -1655,6 +1659,10 @@ EOF
             raw: vec![raw_input],
             references: vec![reference_input],
             verified_bytes: 2,
+            // The latest candidate may have consumed one additional reference
+            // before falling back; prepare must preserve that cumulative
+            // budget evidence while accepting the selected input bytes.
+            verification_bytes: 3,
             input_fingerprint_sha256: selection_fingerprint(
                 &[hft_collector::research_inventory::FrozenInput {
                     relative_path: "raw.jsonl.zst".into(),

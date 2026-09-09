@@ -69,7 +69,12 @@ pub struct FreshWindowSelection {
     pub selected_end_received_at_ns: u64,
     pub raw: Vec<FrozenInput>,
     pub references: Vec<FrozenInput>,
+    /// Bytes belonging to the final selected raw/reference inputs.
     pub verified_bytes: u64,
+    /// Cumulative bytes read while evaluating this bounded selection, including
+    /// candidates rejected before the final window. This never exceeds the
+    /// request budget and is distinct from the selected input bytes above.
+    pub verification_bytes: u64,
     pub input_fingerprint_sha256: String,
     pub inventory_eligible: bool,
     pub materialized_pit_admitted: bool,
@@ -828,6 +833,7 @@ pub fn select_fresh_window(request: &FreshWindowRequest) -> Result<FreshWindowSe
                 raw: frozen.raw,
                 references: frozen.references,
                 verified_bytes: frozen.verified_bytes,
+                verification_bytes: frozen.verified_bytes,
                 input_fingerprint_sha256: frozen.input_fingerprint_sha256,
                 inventory_eligible: true,
                 materialized_pit_admitted: false,
@@ -890,7 +896,12 @@ pub fn select_fresh_window(request: &FreshWindowRequest) -> Result<FreshWindowSe
                         &mut remaining_bytes,
                     )?);
                 }
-                let verified_bytes = request.max_input_bytes - remaining_bytes;
+                let verification_bytes = request.max_input_bytes - remaining_bytes;
+                let selected_bytes = raw
+                    .iter()
+                    .chain(&references)
+                    .try_fold(0_u64, |total, input| total.checked_add(input.bytes))
+                    .context("latest fresh selected input byte count overflowed")?;
                 let input_fingerprint_sha256 =
                     selection_fingerprint_from_inputs(&raw, &references)?;
                 return Ok(FreshWindowSelection {
@@ -900,7 +911,8 @@ pub fn select_fresh_window(request: &FreshWindowRequest) -> Result<FreshWindowSe
                     selected_end_received_at_ns: observed_end,
                     raw,
                     references,
-                    verified_bytes,
+                    verified_bytes: selected_bytes,
+                    verification_bytes,
                     input_fingerprint_sha256,
                     inventory_eligible: true,
                     materialized_pit_admitted: false,
@@ -939,7 +951,11 @@ pub fn freeze_inventory_from_selection(
         .chain(&selection.references)
         .try_fold(0_u64, |total, input| total.checked_add(input.bytes))
         .context("fresh window selection byte count overflowed")?;
-    if verified_bytes != selection.verified_bytes || verified_bytes > request.max_input_bytes {
+    if verified_bytes != selection.verified_bytes
+        || verified_bytes > request.max_input_bytes
+        || selection.verification_bytes < selection.verified_bytes
+        || selection.verification_bytes > request.max_input_bytes
+    {
         bail!("fresh window selection input byte budget exceeded");
     }
     if selection_fingerprint_from_inputs(&selection.raw, &selection.references)?
@@ -1651,13 +1667,22 @@ mod tests {
     fn latest_selection_falls_back_to_an_older_window_when_newer_refs_are_missing() {
         let (_directory, request) = fixture();
         let newer_start = RECEIVED_NS + 200_000_000_000;
-        extra_raw(&request, "newer", newer_start, newer_start + 3_000);
+        extra_raw(
+            &request,
+            "newer",
+            newer_start,
+            newer_start + 200_000_000_000,
+        );
+        // This batch is read while evaluating the newer raw span, but it is
+        // too early to bracket that full span. The older window must still be
+        // selected without resetting the cumulative verification budget.
+        extra_reference(&request, "BTCUSDT", 201_000_000_000);
         let selection = select_fresh_window(&FreshWindowRequest {
             raw_root: request.raw_root.clone(),
             reference_root: request.reference_root.clone(),
             mode: FreshWindowMode::Latest {
                 duration_ns: 500,
-                cutoff_received_at_ns: newer_start + 3_000,
+                cutoff_received_at_ns: newer_start + 200_000_000_000,
                 max_candidates: 8,
             },
             symbol: request.symbol.clone(),
@@ -1675,6 +1700,7 @@ mod tests {
         .unwrap();
         assert_eq!(selection.selected_end_received_at_ns, RECEIVED_NS + 1_000);
         assert_eq!(selection.raw.len(), 1);
+        assert!(selection.verification_bytes > selection.verified_bytes);
     }
 
     #[test]
