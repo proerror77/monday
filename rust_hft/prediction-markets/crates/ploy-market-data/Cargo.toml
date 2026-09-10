@@ -20,6 +20,7 @@ live = [
     "dep:futures",
     "dep:polymarket-client-sdk",
     "dep:reqwest",
+    "dep:secrecy",
     "dep:tokio-tungstenite",
 ]
 
@@ -38,6 +39,7 @@ polymarket-client-sdk = { package = "polymarket_client_sdk_v2", version = "=0.6.
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"], optional = true }
 rust_decimal.workspace = true
 rust_decimal_macros.workspace = true
+secrecy = { workspace = true, optional = true }
 serde.workspace = true
 serde_json = { workspace = true, features = ["arbitrary_precision"] }
 sha2.workspace = true

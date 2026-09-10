@@ -1073,6 +1073,9 @@ jobs:
           cargo test --locked -p ploy-research --features db \
             research_snapshot::tests::postgres_official_outcomes_use_token_primary_keys_and_version_clocks \
             --lib -- --ignored --exact
+          cargo test --locked -p ploy-market-data --features live \
+            predict_fun::tests::postgres_predict_fun_restart_restores_clock_and_persists_failure_readiness \
+            --lib -- --ignored --exact
           echo "### Rust research heavy lane" >> "$GITHUB_STEP_SUMMARY"
           echo "Elapsed seconds: ${SECONDS}" >> "$GITHUB_STEP_SUMMARY"
 
