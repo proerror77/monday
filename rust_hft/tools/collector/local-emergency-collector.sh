@@ -23,9 +23,13 @@ cd /Users/proerror/Documents/monday/rust_hft/apps/collector
 
 # 创建简化的 Dockerfile
 cat > Dockerfile.local << 'EOF'
-FROM rust:1.75-bullseye AS builder
+FROM rust:1.98-bullseye@sha256:4730e387a220a08a365c77da3096544dde214f9d796c16284d4be45438cad4a9 AS builder
+ENV RUST_VERSION=1.98.1
 WORKDIR /app
-RUN apt-get update && apt-get install -y pkg-config libssl-dev
+RUN apt-get update && apt-get install -y pkg-config libssl-dev \
+    && rustup toolchain install 1.98.1 --profile minimal --no-self-update \
+    && rustup default 1.98.1 \
+    && rustc --version | grep -E '^rustc 1\.98\.1 '
 COPY Cargo.toml Cargo.lock ./
 COPY src/ ./src/
 RUN cargo build --release --bin hft-collector

@@ -1,6 +1,6 @@
 # Multi-stage Dockerfile for hft-live app
 
-FROM rust:1.77-slim as builder
+FROM rust:1.98.1-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y pkg-config libssl-dev ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -23,4 +23,3 @@ EXPOSE 9090
 
 # Default command expects an external config mounted at /app/config/system.yaml
 CMD ["/usr/local/bin/hft-live", "--config", "/app/config/system.yaml"]
-

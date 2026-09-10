@@ -18,7 +18,7 @@ Prefer a focused dry-run configuration and keep evidence tied to the exact confi
 digest used by the test or replay.
 
 ```bash
-cargo +1.91 run -p new-ploy-runner --features full -- \
+cargo +1.98.1 run -p new-ploy-runner --features full -- \
   run --config config/strategies/02-pm5d.v4-dryrun.toml --dry-run
 ```
 

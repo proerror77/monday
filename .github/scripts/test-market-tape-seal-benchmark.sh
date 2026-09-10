@@ -29,6 +29,7 @@ grep -Fqx '        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8
 grep -Fqx '          ref: refs/heads/main' "$workflow"
 grep -Fqx '          persist-credentials: false' "$workflow"
 grep -Fqx '        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable' "$workflow"
+grep -Fqx '          toolchain: 1.98.1' "$workflow"
 grep -Fqx '          test "$(git rev-parse HEAD)" = "$EXPECTED_MAIN_SHA"' "$workflow"
 grep -Fqx '          benchmark_root="${expected_prefix}${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"' "$workflow"
 grep -Fqx '          } >> "$GITHUB_ENV"' "$workflow"

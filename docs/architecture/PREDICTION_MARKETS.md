@@ -8,7 +8,7 @@ exchanges are venues, not separate product authorities. The imported `ploy-*`
 crate and binary names remain temporary compatibility identifiers while their
 implementations move to canonical Monday modules.
 
-The nested Rust 1.91 Cargo workspace is a transitional build seam, not a product
+The nested Rust 1.98.1 Cargo workspace is a transitional build seam, not a product
 or production-authority seam. It still contains imported compatibility
 order/risk/reconciliation contracts for paper and test flows. Those contracts
 are explicit migration debt and cannot gain a concrete venue Adapter; canonical
@@ -337,7 +337,7 @@ the canonical implementation remain active.
 ## CI and maintenance
 
 - Monday's existing Rust workspace stays rooted at `rust_hft` and keeps its own toolchain and CI.
-- The transitional prediction-market workspace stays rooted at `rust_hft/prediction-markets`, uses Rust `1.91` and Node `22`, and has a dedicated root workflow at `.github/workflows/ploy-ci.yml`.
+- The transitional prediction-market workspace stays rooted at `rust_hft/prediction-markets`, uses Rust `1.98.1` and Node `22`, and has a dedicated root workflow at `.github/workflows/ploy-ci.yml`.
 - Prediction-market-only changes do not run Monday's main Rust or Docker build matrices; repository-wide security checks still scan the full diff.
 - Root workflows and active source remain scanned, and tracked-secret detection
   covers the complete repository tree. There is no nested prediction-market workflow surface.

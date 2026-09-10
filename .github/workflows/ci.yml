@@ -198,6 +198,7 @@ jobs:
         if: needs.scope.outputs.toolchain == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.98.1
           components: rustfmt, clippy
 
       - name: Install Linux build tools
@@ -477,6 +478,7 @@ jobs:
         if: needs.scope.outputs.loop == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.98.1
           components: rustfmt
 
       - name: Format Loop Engineer packages
@@ -594,6 +596,7 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.98.1
           components: rustfmt
 
       - name: Install Linux build tools

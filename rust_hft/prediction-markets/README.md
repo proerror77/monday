@@ -5,7 +5,7 @@ at `rust_hft/prediction-markets`. This module owns event-settlement research,
 replay, probability models, and operator tooling. Polymarket and other prediction
 exchanges are venue Adapters in the same Monday system, not separate products.
 
-The nested Rust workspace keeps the imported code buildable on Rust `1.91` while
+The nested Rust workspace keeps the imported code buildable on Rust `1.98.1` while
 it is migrated by capability. It is a transitional build seam, not a second
 production authority. Imported paper/runtime contracts remain migration debt;
 they may only shrink and cannot gain a concrete venue Adapter. Existing `ploy-*`
@@ -79,13 +79,13 @@ OMS, reconciliation, and approval gates.
 
 ## Local development
 
-Run Rust commands from this directory. The workspace is pinned to Rust `1.91`.
+Run Rust commands from this directory. The workspace is pinned to Rust `1.98.1`.
 
 ```bash
-cargo +1.91 metadata --locked --no-deps
-cargo +1.91 fmt --all -- --check
-cargo +1.91 test --locked -p ploy-connectivity -p ploy-daemon-host
-cargo +1.91 check --locked -p new-ploy-runner --features full
+cargo +1.98.1 metadata --locked --no-deps
+cargo +1.98.1 fmt --all -- --check
+cargo +1.98.1 test --locked -p ploy-connectivity -p ploy-daemon-host
+cargo +1.98.1 check --locked -p new-ploy-runner --features full
 ```
 
 Use package-scoped checks for ordinary development. Workspace-wide and database-backed
@@ -111,7 +111,7 @@ evidence, not zero missing rows.
 The full runner remains non-executing in Monday:
 
 ```bash
-cargo +1.91 run -p new-ploy-runner --features full -- \
+cargo +1.98.1 run -p new-ploy-runner --features full -- \
   run --config config/strategies/02-pm5d.v4-dryrun.toml --dry-run
 ```
 
@@ -127,8 +127,8 @@ npm --prefix ploy-frontend run build
 Rust sidecar checks:
 
 ```bash
-cargo +1.91 test --locked -p ploy-agent-sidecar
-cargo +1.91 clippy --locked -p ploy-agent-sidecar --all-targets --no-deps -- -D warnings
+cargo +1.98.1 test --locked -p ploy-agent-sidecar
+cargo +1.98.1 clippy --locked -p ploy-agent-sidecar --all-targets --no-deps -- -D warnings
 ```
 
 Do not start a local PostgreSQL service for routine migration validation. Database-backed

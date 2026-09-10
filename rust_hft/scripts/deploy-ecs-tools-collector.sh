@@ -29,7 +29,7 @@ upload_file() { scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i "$SSH_KE
 echo "== Building collector (cross-compile for Linux) =="
 if command -v docker &> /dev/null; then
   # Use Docker cross-compilation for Linux target
-  docker run --rm -v "$(pwd):/workspace" -w /workspace rust:1.75 bash -c "
+  docker run --rm -v "$(pwd):/workspace" -w /workspace rust:1.98.1-bookworm bash -c "
     cd tools/collector &&
     cargo build --release --target x86_64-unknown-linux-gnu
   " || {

@@ -253,6 +253,17 @@ for flag in loop collector control toolchain; do assert_flag "$full" "$flag" tru
 for flag in handoff json ondo focused; do assert_flag "$full" "$flag" false; done
 
 ci_workflow="$script_dir/../workflows/ci.yml"
+root_toolchain="$script_dir/../../rust-toolchain.toml"
+grep -Fqx 'channel = "1.98.1"' "$root_toolchain"
+for workflow in \
+  "$ci_workflow" \
+  "$script_dir/../workflows/release-rust.yml" \
+  "$script_dir/../workflows/security-enabled.yml"; do
+  stable_uses=$(grep -Fc 'dtolnay/rust-toolchain@stable' "$workflow")
+  pinned_toolchains=$(grep -Fxc '          toolchain: 1.98.1' "$workflow")
+  test "$stable_uses" -eq "$pinned_toolchains"
+done
+grep -Fqx '    container: rust:1.98.1-bookworm' "$script_dir/../workflows/ploy-ci.yml"
 # shellcheck disable=SC2016
 always_condition='    if: ${{ always() }}'
 grep -Fqx '    needs: selector' "$ci_workflow"

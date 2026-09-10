@@ -47,8 +47,9 @@ names its interface, callers, invariants, failure modes, and owner.
 
 ## Transitional build seam
 
-`rust_hft/prediction-markets` temporarily keeps its own Cargo workspace and Rust
-toolchain so the imported code remains independently verifiable during migration.
+`rust_hft/prediction-markets` temporarily keeps its own Cargo workspace and
+explicit Rust 1.98.1 toolchain so the imported code remains independently
+verifiable during migration.
 That build separation does not grant product or execution authority. Existing
 `ploy-*` package names are compatibility identifiers; new packages use functional
 Monday names, and every migrated implementation deletes its superseded copy.
