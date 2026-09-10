@@ -81,7 +81,9 @@ impl AsterdexExecutionClient {
 
     /// 獲取 resilience 統計資訊
     pub fn resilience_stats(&self) -> Option<ExecutorStats> {
-        self.resilient_executor.as_ref().map(|executor| executor.stats())
+        self.resilient_executor
+            .as_ref()
+            .map(|executor| executor.stats())
     }
 
     /// 獲取熔斷器狀態
@@ -146,9 +148,11 @@ impl AsterdexExecutionClient {
     /// 獲取 Signer 引用
     #[inline]
     fn get_signer(&self) -> HftResult<&AsterdexSigner> {
-        self.signer
-            .as_ref()
-            .ok_or_else(|| hft_core::HftError::Execution("Signer not initialized - missing credentials".to_string()))
+        self.signer.as_ref().ok_or_else(|| {
+            hft_core::HftError::Execution(
+                "Signer not initialized - missing credentials".to_string(),
+            )
+        })
     }
 }
 
@@ -279,10 +283,9 @@ impl ExecutionClient for AsterdexExecutionClient {
                 .signer
                 .clone()
                 .ok_or_else(|| hft_core::HftError::Authentication("缺少API憑證".to_string()))?;
-            let http_client = self
-                .http_client
-                .clone()
-                .ok_or_else(|| hft_core::HftError::Execution("HTTP client not initialized".to_string()))?;
+            let http_client = self.http_client.clone().ok_or_else(|| {
+                hft_core::HftError::Execution("HTTP client not initialized".to_string())
+            })?;
             let symbol = self
                 .order_symbol
                 .get(&order_id.0)
@@ -354,11 +357,11 @@ impl ExecutionClient for AsterdexExecutionClient {
         order_id: &OrderId,
         new_quantity: Option<Quantity>,
         new_price: Option<Price>,
-    ) -> HftResult<()> {
+    ) -> HftResult<OrderId> {
         if self.mode == ExecutionMode::Live {
             // Aster DEX 目前沿用 Binance 風格，採用撤單重下策略
             if new_quantity.is_none() && new_price.is_none() {
-                return Ok(());
+                return Ok(order_id.clone());
             }
             // 取消原單（使用 resilience，處理錯誤）
             let cancel_result = self.cancel_order(order_id).await;
@@ -373,10 +376,7 @@ impl ExecutionClient for AsterdexExecutionClient {
                         ExecutionAlertType::RetriesExhausted,
                         "asterdex",
                         "modify_order",
-                        format!(
-                            "修改訂單時撤單失敗 (order_id={}): {}",
-                            order_id.0, e
-                        ),
+                        format!("修改訂單時撤單失敗 (order_id={}): {}", order_id.0, e),
                     )
                     .with_error(e.to_string()),
                 );
@@ -398,7 +398,7 @@ impl ExecutionClient for AsterdexExecutionClient {
                     timestamp: hft_core::now_micros(),
                 });
             }
-            return Ok(());
+            return Ok(order_id.clone());
         }
         if let Some(ref tx) = self.event_tx {
             let _ = tx.send(ExecutionEvent::OrderModified {
@@ -408,7 +408,7 @@ impl ExecutionClient for AsterdexExecutionClient {
                 timestamp: hft_core::now_micros(),
             });
         }
-        Ok(())
+        Ok(order_id.clone())
     }
 
     async fn execution_stream(&self) -> HftResult<BoxStream<ExecutionEvent>> {

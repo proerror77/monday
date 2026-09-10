@@ -6,7 +6,7 @@ use ploy_operator_contracts::{
     DeploymentRuntimeMode, DeploymentState, DesiredState, ObservedState,
 };
 use ploy_platform::{DeploymentRecord, DeploymentRegistry};
-use ploy_trading::TradingRuntime;
+use portfolio_core::prediction::TradingRuntime;
 use std::collections::BTreeMap;
 
 pub fn apply_loaded_registry_state(
@@ -82,7 +82,7 @@ mod tests {
     use ploy_deployments::WorkerSupervisor;
     use ploy_operator_contracts::{DeploymentState, DesiredState, ObservedState};
     use ploy_platform::{DeploymentRecord, DeploymentRegistry};
-    use ploy_trading::TradingRuntime;
+    use portfolio_core::prediction::TradingRuntime;
     use rust_decimal_macros::dec;
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;

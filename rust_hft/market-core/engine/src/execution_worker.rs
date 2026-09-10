@@ -1999,7 +1999,16 @@ impl ExecutionWorker {
                             .modify_order(&order_id, new_quantity, new_price)
                             .await
                         {
-                            Ok(()) => {
+                            Ok(new_venue_order_id) if new_venue_order_id.0.trim().is_empty() => {
+                                self.accepting_intents = false;
+                                self.emergency_latched = true;
+                                self.reject_queued_intents_for_disabled_intake().await;
+                                Err(format!(
+                                    "order replacement returned an empty venue order id for {}; execution intake latched and reconciliation required",
+                                    order_id.0
+                                ))
+                            }
+                            Ok(new_venue_order_id) => {
                                 if let Some(order) = self.tracked_orders.get_mut(&order_id) {
                                     if let Some(quantity) = new_quantity {
                                         order.remaining_quantity = quantity;
@@ -2008,7 +2017,10 @@ impl ExecutionWorker {
                                         order.limit_price = Some(price);
                                     }
                                 }
-                                debug!("替換訂單成功: {} (client={})", order_id.0, client_idx);
+                                debug!(
+                                    "替換訂單成功: {} (venue_order_id={}, client={})",
+                                    order_id.0, new_venue_order_id.0, client_idx
+                                );
                                 Ok(())
                             }
                             Err(e) => {
@@ -2988,16 +3000,16 @@ mod tests {
 
         async fn modify_order(
             &mut self,
-            _order_id: &OrderId,
+            order_id: &OrderId,
             _new_quantity: Option<Quantity>,
             _new_price: Option<Price>,
-        ) -> HftResult<()> {
+        ) -> HftResult<OrderId> {
             if self.state.lock().unwrap().modify_error {
                 Err(HftError::Execution(
                     "amend reconciliation required".to_string(),
                 ))
             } else {
-                Ok(())
+                Ok(order_id.clone())
             }
         }
 

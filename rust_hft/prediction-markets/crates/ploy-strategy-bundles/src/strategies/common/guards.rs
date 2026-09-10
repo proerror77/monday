@@ -1,4 +1,4 @@
-use ploy_trading::{OrderLedger, OrderState};
+use portfolio_core::prediction::{OrderLedger, OrderState};
 
 #[must_use]
 pub fn active_order_exists(token_id: &str, orders: &OrderLedger) -> bool {
@@ -15,7 +15,7 @@ pub fn active_order_exists(token_id: &str, orders: &OrderLedger) -> bool {
 mod tests {
     use super::active_order_exists;
     use chrono::Utc;
-    use ploy_trading::{IntentPurpose, OrderLedger, TradeSide, TradingIntent};
+    use portfolio_core::prediction::{IntentPurpose, OrderState, TradeSide, TradingIntent};
     use rust_decimal_macros::dec;
 
     fn intent(token_id: &str) -> TradingIntent {
@@ -34,11 +34,23 @@ mod tests {
 
     #[test]
     fn finds_active_orders() {
-        let mut orders = OrderLedger::default();
-        orders.insert_from_intent("order-1", &intent("token-a"));
+        let intent = intent("token-a");
+        let orders = crate::canonical_test_support::order_projection(
+            intent.clone(),
+            "order-1",
+            OrderState::Acknowledged,
+            "venue-1",
+            None,
+        );
         assert!(active_order_exists("token-a", &orders));
 
-        orders.cancel("order-1");
+        let orders = crate::canonical_test_support::order_projection(
+            intent,
+            "order-1",
+            OrderState::Canceled,
+            "venue-1",
+            None,
+        );
         assert!(!active_order_exists("token-a", &orders));
     }
 }

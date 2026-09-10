@@ -5,11 +5,15 @@ edition = "2021"
 description = "以 fill/fee/funding 為唯一真相源，導出 AccountView 快照"
 
 [dependencies]
+chrono = { workspace = true }
+hft-oms-core = { package = "hft-oms-core", path = "../oms-core" }
 serde = { workspace = true, features = ["derive"] }
 hft-core = { package = "hft-core", path = "../../market-core/core" }
 ports = { package = "hft-ports", path = "../../market-core/ports" }
 snapshot = { package = "hft-snapshot", path = "../../market-core/snapshot" }
 rust_decimal = { version = "1.33", features = ["serde"] }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [features]
@@ -17,3 +21,7 @@ default = []
 
 [lib]
 name = "portfolio_core"
+
+[dev-dependencies]
+rust_decimal_macros = "1"
+serde_json.workspace = true

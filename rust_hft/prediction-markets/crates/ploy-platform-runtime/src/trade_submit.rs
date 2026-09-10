@@ -1,15 +1,14 @@
 use crate::order_state_wire;
-use ploy_connectivity::{
-    ExecutionOutcome, ExecutionRequest, LiveExecutionGateway, OrderExecutionType,
-};
+use hft_core::{OrderId, OrderType, Price, Quantity, Side, Symbol, TimeInForce, VenueId};
 use ploy_operator_contracts::{DeploymentRuntimeMode, PaperIntentResponse};
 use ploy_platform::DeploymentRecord;
-use ploy_trading::{TradingIntent, TradingRuntime};
+use portfolio_core::prediction::{TradingIntent, TradingRuntime};
+use ports::{ExecutionClient, OrderIntent};
 use std::io;
 
 fn response_for_order(
     deployment_id: String,
-    order: &ploy_trading::OrderRecord,
+    order: &portfolio_core::prediction::OrderRecord,
 ) -> PaperIntentResponse {
     PaperIntentResponse {
         deployment_id,
@@ -53,14 +52,14 @@ pub fn submit_paper_intent(
     Ok(response_for_order(deployment_id, order))
 }
 
-pub fn submit_live_intent(
+pub async fn submit_live_intent(
     runtime: &mut TradingRuntime,
-    gateway: &dyn LiveExecutionGateway,
+    client: &mut dyn ExecutionClient,
     intent: TradingIntent,
     idempotency_key: Option<&str>,
 ) -> io::Result<PaperIntentResponse> {
     let prepared = prepare_live_intent(runtime, intent, idempotency_key)?;
-    finish_live_intent(runtime, gateway, prepared)
+    finish_live_intent(runtime, client, prepared).await
 }
 
 #[derive(Debug, Clone)]
@@ -117,53 +116,84 @@ pub fn prepare_live_intent(
     Ok(PreparedLiveIntent::Pending { intent, order_id })
 }
 
-pub fn finish_live_intent(
+pub async fn finish_live_intent(
     runtime: &mut TradingRuntime,
-    gateway: &dyn LiveExecutionGateway,
+    client: &mut dyn ExecutionClient,
     prepared: PreparedLiveIntent,
 ) -> io::Result<PaperIntentResponse> {
-    let outcome = execute_live_intent(gateway, &prepared);
+    let outcome = execute_live_intent(client, &prepared).await;
     apply_live_intent_outcome(runtime, prepared, outcome)
 }
 
-pub fn execute_live_intent(
-    gateway: &dyn LiveExecutionGateway,
+pub async fn execute_live_intent(
+    client: &mut dyn ExecutionClient,
     prepared: &PreparedLiveIntent,
-) -> Result<ExecutionOutcome, ploy_connectivity::ExecutionError> {
+) -> Result<OrderId, hft_core::HftError> {
     let PreparedLiveIntent::Pending { intent, order_id } = prepared else {
-        return Err(ploy_connectivity::ExecutionError::Validation(
+        return Err(hft_core::HftError::InvalidOrder(
             "existing live intent must not be submitted again".to_string(),
         ));
     };
-    gateway.submit(&ExecutionRequest {
-        order_id: order_id.clone(),
-        token_id: intent.token_id.clone(),
-        side: intent.side,
-        quantity: intent.quantity,
-        limit_price: intent.limit_price,
-        order_type: OrderExecutionType::GTC,
-        aggressive_ticks: 0,
-    })
+    let canonical_intent = OrderIntent::prediction_market(
+        Symbol::new(intent.token_id.clone()),
+        match intent.side {
+            portfolio_core::prediction::TradeSide::Buy => Side::Buy,
+            portfolio_core::prediction::TradeSide::Sell => Side::Sell,
+        },
+        Quantity(intent.quantity),
+        if intent.limit_price.is_some() {
+            OrderType::Limit
+        } else {
+            OrderType::Market
+        },
+        intent.limit_price.map(Price),
+        TimeInForce::GTC,
+        format!("{}:{order_id}", intent.deployment_id),
+        VenueId::POLYMARKET,
+    );
+    client.place_order(canonical_intent).await
 }
 
 pub fn apply_live_intent_outcome(
     runtime: &mut TradingRuntime,
     prepared: PreparedLiveIntent,
-    outcome: Result<ExecutionOutcome, ploy_connectivity::ExecutionError>,
+    outcome: Result<OrderId, hft_core::HftError>,
 ) -> io::Result<PaperIntentResponse> {
     let (intent, order_id) = match prepared {
         PreparedLiveIntent::Existing(response) => return Ok(response),
         PreparedLiveIntent::Pending { intent, order_id } => (intent, order_id),
     };
     match outcome {
-        Ok(ExecutionOutcome::Acknowledged { venue_order_id }) => {
-            runtime.acknowledge_order(&order_id, venue_order_id);
-        }
-        Ok(ExecutionOutcome::Rejected { reason }) => {
-            runtime.reject_order(&order_id, reason);
+        Ok(venue_order_id) => {
+            runtime.acknowledge_order(&order_id, venue_order_id.0);
         }
         Err(err) => {
-            runtime.mark_order_unknown(&order_id, err.to_string());
+            let message = match &err {
+                hft_core::HftError::SubmissionNotAttempted(reason) => reason.clone(),
+                _ => err.to_string(),
+            };
+            match err {
+                hft_core::HftError::Network(_)
+                | hft_core::HftError::Timeout(_)
+                | hft_core::HftError::Io { .. } => {
+                    runtime.mark_order_unknown(&order_id, message);
+                }
+                hft_core::HftError::Config(_)
+                | hft_core::HftError::InvalidOrder(_)
+                | hft_core::HftError::SubmissionNotAttempted(_)
+                | hft_core::HftError::Risk(_)
+                | hft_core::HftError::Authentication(_)
+                | hft_core::HftError::InsufficientBalance(_)
+                | hft_core::HftError::OrderNotFound(_)
+                | hft_core::HftError::Parse(_)
+                | hft_core::HftError::Serialization(_)
+                | hft_core::HftError::Exchange(_)
+                | hft_core::HftError::Execution(_)
+                | hft_core::HftError::RateLimit(_)
+                | hft_core::HftError::Generic { .. } => {
+                    runtime.reject_order(&order_id, message);
+                }
+            }
         }
     }
     let order = runtime
@@ -178,13 +208,10 @@ mod tests {
         apply_live_intent_outcome, execute_live_intent, prepare_live_intent, submit_live_intent,
         submit_paper_intent,
     };
-    use ploy_connectivity::{
-        CancellationOutcome, CancellationRequest, ExecutionError, ExecutionOutcome,
-        ExecutionRequest, LiveExecutionGateway, ReplaceOutcome, ReplaceRequest, TrackedOrder,
-    };
+    use async_trait::async_trait;
     use ploy_operator_contracts::{DeploymentState, DesiredState, ObservedState};
     use ploy_platform::DeploymentRecord;
-    use ploy_trading::{FillRecord, IntentPurpose, TradeSide, TradingIntent, TradingRuntime};
+    use portfolio_core::prediction::{IntentPurpose, TradeSide, TradingIntent, TradingRuntime};
     use rust_decimal_macros::dec;
     use std::io;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -194,36 +221,60 @@ mod tests {
         submits: AtomicUsize,
     }
 
-    impl LiveExecutionGateway for CountingGateway {
-        fn probe(&self) -> Result<(), ExecutionError> {
+    #[async_trait]
+    impl ports::ExecutionClient for CountingGateway {
+        async fn place_order(
+            &mut self,
+            _intent: ports::OrderIntent,
+        ) -> Result<hft_core::OrderId, hft_core::HftError> {
+            self.submits.fetch_add(1, Ordering::SeqCst);
+            Ok(hft_core::OrderId("venue-1".to_string()))
+        }
+        async fn cancel_order(
+            &mut self,
+            _order_id: &hft_core::OrderId,
+        ) -> Result<(), hft_core::HftError> {
             Ok(())
         }
-
-        fn submit(&self, _request: &ExecutionRequest) -> Result<ExecutionOutcome, ExecutionError> {
-            self.submits.fetch_add(1, Ordering::SeqCst);
-            Ok(ExecutionOutcome::Acknowledged {
-                venue_order_id: "venue-1".to_string(),
-            })
+        async fn modify_order(
+            &mut self,
+            order_id: &hft_core::OrderId,
+            _new_quantity: Option<hft_core::Quantity>,
+            _new_price: Option<hft_core::Price>,
+        ) -> Result<hft_core::OrderId, hft_core::HftError> {
+            Ok(order_id.clone())
         }
-
-        fn cancel(
+        async fn execution_stream(
             &self,
-            _request: &CancellationRequest,
-        ) -> Result<CancellationOutcome, ExecutionError> {
-            Ok(CancellationOutcome::Canceled)
+        ) -> Result<ports::BoxStream<ports::ExecutionEvent>, hft_core::HftError> {
+            Err(hft_core::HftError::Config(
+                "test execution stream unavailable".into(),
+            ))
         }
-
-        fn replace(&self, _request: &ReplaceRequest) -> Result<ReplaceOutcome, ExecutionError> {
-            Ok(ReplaceOutcome::Replaced {
-                venue_order_id: "venue-2".to_string(),
-            })
-        }
-
-        fn reconcile_fills(
-            &self,
-            _tracked_orders: &[TrackedOrder],
-        ) -> Result<Vec<FillRecord>, ExecutionError> {
+        async fn list_open_orders(&self) -> Result<Vec<ports::OpenOrder>, hft_core::HftError> {
             Ok(Vec::new())
+        }
+        async fn list_recent_fills(&self) -> Result<Vec<ports::AccountFill>, hft_core::HftError> {
+            Ok(Vec::new())
+        }
+        async fn get_balance(&self) -> Result<Vec<ports::AccountBalance>, hft_core::HftError> {
+            Ok(Vec::new())
+        }
+        async fn get_positions(&self) -> Result<Vec<ports::Position>, hft_core::HftError> {
+            Ok(Vec::new())
+        }
+        async fn connect(&mut self) -> Result<(), hft_core::HftError> {
+            Ok(())
+        }
+        async fn disconnect(&mut self) -> Result<(), hft_core::HftError> {
+            Ok(())
+        }
+        async fn health(&self) -> ports::ConnectionHealth {
+            ports::ConnectionHealth {
+                connected: true,
+                latency_ms: Some(0.0),
+                last_heartbeat: 0,
+            }
         }
     }
 
@@ -232,32 +283,58 @@ mod tests {
         submits: AtomicUsize,
     }
 
-    impl LiveExecutionGateway for TransportGateway {
-        fn probe(&self) -> Result<(), ExecutionError> {
+    #[async_trait]
+    impl ports::ExecutionClient for TransportGateway {
+        async fn place_order(
+            &mut self,
+            _intent: ports::OrderIntent,
+        ) -> Result<hft_core::OrderId, hft_core::HftError> {
+            self.submits.fetch_add(1, Ordering::SeqCst);
+            Err(hft_core::HftError::Network("offline".to_string()))
+        }
+        async fn cancel_order(
+            &mut self,
+            _order_id: &hft_core::OrderId,
+        ) -> Result<(), hft_core::HftError> {
             Ok(())
         }
-
-        fn submit(&self, _request: &ExecutionRequest) -> Result<ExecutionOutcome, ExecutionError> {
-            self.submits.fetch_add(1, Ordering::SeqCst);
-            Err(ExecutionError::Transport("offline".to_string()))
+        async fn modify_order(
+            &mut self,
+            order_id: &hft_core::OrderId,
+            _new_quantity: Option<hft_core::Quantity>,
+            _new_price: Option<hft_core::Price>,
+        ) -> Result<hft_core::OrderId, hft_core::HftError> {
+            Ok(order_id.clone())
         }
-
-        fn cancel(
+        async fn execution_stream(
             &self,
-            _request: &CancellationRequest,
-        ) -> Result<CancellationOutcome, ExecutionError> {
-            Ok(CancellationOutcome::Canceled)
+        ) -> Result<ports::BoxStream<ports::ExecutionEvent>, hft_core::HftError> {
+            Err(hft_core::HftError::Network("offline".to_string()))
         }
-
-        fn replace(&self, _request: &ReplaceRequest) -> Result<ReplaceOutcome, ExecutionError> {
-            unreachable!()
-        }
-
-        fn reconcile_fills(
-            &self,
-            _tracked_orders: &[TrackedOrder],
-        ) -> Result<Vec<FillRecord>, ExecutionError> {
+        async fn list_open_orders(&self) -> Result<Vec<ports::OpenOrder>, hft_core::HftError> {
             Ok(Vec::new())
+        }
+        async fn list_recent_fills(&self) -> Result<Vec<ports::AccountFill>, hft_core::HftError> {
+            Ok(Vec::new())
+        }
+        async fn get_balance(&self) -> Result<Vec<ports::AccountBalance>, hft_core::HftError> {
+            Ok(Vec::new())
+        }
+        async fn get_positions(&self) -> Result<Vec<ports::Position>, hft_core::HftError> {
+            Ok(Vec::new())
+        }
+        async fn connect(&mut self) -> Result<(), hft_core::HftError> {
+            Ok(())
+        }
+        async fn disconnect(&mut self) -> Result<(), hft_core::HftError> {
+            Ok(())
+        }
+        async fn health(&self) -> ports::ConnectionHealth {
+            ports::ConnectionHealth {
+                connected: false,
+                latency_ms: None,
+                last_heartbeat: 0,
+            }
         }
     }
 
@@ -288,8 +365,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn paper_submit_acknowledges() {
+    #[tokio::test]
+    async fn paper_submit_acknowledges() {
         let mut runtime = TradingRuntime::default();
         let response =
             submit_paper_intent(&mut runtime, &paper_deployment(), intent(), None).expect("submit");
@@ -297,8 +374,8 @@ mod tests {
         assert!(runtime.order(&response.order_id).is_some());
     }
 
-    #[test]
-    fn paper_submit_returns_existing_result_for_idempotency_key() {
+    #[tokio::test]
+    async fn paper_submit_returns_existing_result_for_idempotency_key() {
         let mut runtime = TradingRuntime::default();
         let first = submit_paper_intent(
             &mut runtime,
@@ -317,21 +394,23 @@ mod tests {
         assert_eq!(runtime.orders().orders().count(), 1);
     }
 
-    #[test]
-    fn live_submit_does_not_resubmit_identical_idempotent_replay() {
+    #[tokio::test]
+    async fn live_submit_does_not_resubmit_identical_idempotent_replay() {
         let mut runtime = TradingRuntime::default();
-        let gateway = CountingGateway::default();
-        let first = submit_live_intent(&mut runtime, &gateway, intent(), Some("request-1"))
+        let mut gateway = CountingGateway::default();
+        let first = submit_live_intent(&mut runtime, &mut gateway, intent(), Some("request-1"))
+            .await
             .expect("first submit");
-        let second = submit_live_intent(&mut runtime, &gateway, intent(), Some("request-1"))
+        let second = submit_live_intent(&mut runtime, &mut gateway, intent(), Some("request-1"))
+            .await
             .expect("idempotent replay");
 
         assert_eq!(second, first);
         assert_eq!(gateway.submits.load(Ordering::SeqCst), 1);
     }
 
-    #[test]
-    fn idempotency_key_rejects_mismatched_payload() {
+    #[tokio::test]
+    async fn idempotency_key_rejects_mismatched_payload() {
         let mut runtime = TradingRuntime::default();
         submit_paper_intent(
             &mut runtime,
@@ -353,18 +432,24 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
-    #[test]
-    fn transport_error_stays_unknown_and_is_not_retried() {
+    #[tokio::test]
+    async fn transport_error_stays_unknown_and_is_not_retried() {
         let mut runtime = TradingRuntime::default();
-        let gateway = TransportGateway::default();
-        let first = submit_live_intent(&mut runtime, &gateway, intent(), Some("request-1"))
+        let mut gateway = TransportGateway::default();
+        let first = submit_live_intent(&mut runtime, &mut gateway, intent(), Some("request-1"))
+            .await
             .expect("unknown response");
         let snapshot = runtime.snapshot(&Default::default());
-        let mut restored = TradingRuntime::restore(snapshot);
-        let replay_gateway = CountingGateway::default();
-        let replay =
-            submit_live_intent(&mut restored, &replay_gateway, intent(), Some("request-1"))
-                .expect("durable replay");
+        let mut restored = TradingRuntime::restore(snapshot).expect("canonical restore");
+        let mut replay_gateway = CountingGateway::default();
+        let replay = submit_live_intent(
+            &mut restored,
+            &mut replay_gateway,
+            intent(),
+            Some("request-1"),
+        )
+        .await
+        .expect("durable replay");
 
         assert_eq!(first.state, "unknown");
         assert_eq!(replay.order_id, first.order_id);
@@ -372,10 +457,10 @@ mod tests {
         assert_eq!(replay_gateway.submits.load(Ordering::SeqCst), 0);
     }
 
-    #[test]
-    fn live_submit_execution_is_separate_from_pending_and_terminal_state_changes() {
+    #[tokio::test]
+    async fn live_submit_execution_is_separate_from_pending_and_terminal_state_changes() {
         let mut runtime = TradingRuntime::default();
-        let gateway = CountingGateway::default();
+        let mut gateway = CountingGateway::default();
         let prepared =
             prepare_live_intent(&mut runtime, intent(), Some("request-1")).expect("prepare");
         assert_eq!(
@@ -383,16 +468,16 @@ mod tests {
                 .order("order-intent-1")
                 .expect("pending order")
                 .state,
-            ploy_trading::OrderState::Pending
+            portfolio_core::prediction::OrderState::Pending
         );
 
-        let outcome = execute_live_intent(&gateway, &prepared);
+        let outcome = execute_live_intent(&mut gateway, &prepared).await;
         assert_eq!(
             runtime
                 .order("order-intent-1")
                 .expect("pending order")
                 .state,
-            ploy_trading::OrderState::Pending
+            portfolio_core::prediction::OrderState::Pending
         );
 
         let response = apply_live_intent_outcome(&mut runtime, prepared, outcome)

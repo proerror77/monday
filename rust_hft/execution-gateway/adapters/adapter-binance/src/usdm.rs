@@ -1514,10 +1514,10 @@ impl ExecutionClient for BinanceUsdMExecutionClient {
         order_id: &OrderId,
         new_quantity: Option<Quantity>,
         new_price: Option<Price>,
-    ) -> HftResult<()> {
+    ) -> HftResult<OrderId> {
         if uses_exchange_api(self.mode) {
             if new_quantity.is_none() && new_price.is_none() {
-                return Ok(());
+                return Ok(order_id.clone());
             }
             return Err(HftError::Config(format!(
                 "Binance USD-M live modify is disabled for order {}; use an explicit cancel-then-new intent",

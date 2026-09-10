@@ -93,6 +93,8 @@ pub use polymarket_evidence_projection::{
 };
 #[cfg(feature = "strategy-runtime")]
 pub use replay::replay_fills;
+#[cfg(feature = "strategy-runtime")]
+pub use replay::{PnlSnapshot, ResearchFill, ResearchTradeSide};
 pub use research_snapshot::{
     admit_extracted_authenticated_research_snapshot, authenticate_ready_event_cohort,
     build_research_snapshot_from_polymarket_chainlink_baseline,

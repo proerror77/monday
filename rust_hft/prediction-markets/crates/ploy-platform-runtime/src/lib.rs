@@ -1,5 +1,6 @@
 pub mod bootstrap;
 pub mod deployment_control;
+pub mod execution_client;
 pub mod health_runtime;
 pub mod proposals;
 pub mod reconcile;
@@ -11,107 +12,145 @@ pub mod worker_tick;
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use ploy_connectivity::{
-        CancellationOutcome, CancellationRequest, ExecutionError, ExecutionOutcome,
-        ExecutionRequest, LiveExecutionGateway, ReconcileBatch, ReplaceOutcome, ReplaceRequest,
-        TrackedOrder,
+    use async_trait::async_trait;
+    use hft_core::{HftError, OrderId, Price, Quantity};
+    use portfolio_core::prediction::{FillRecord, TradeSide};
+    use ports::{
+        AccountBalance, AccountFill, BoxStream, ConnectionHealth, ExecutionClient, ExecutionEvent,
+        OpenOrder, OrderIntent, Position,
     };
-    use ploy_trading::FillRecord;
 
     #[derive(Debug, Clone)]
     pub(crate) struct StaticExecutionGateway {
-        probe_result: Result<(), ExecutionError>,
-        submit_result: Result<ExecutionOutcome, ExecutionError>,
-        cancel_result: Result<CancellationOutcome, ExecutionError>,
-        replace_result: Result<ReplaceOutcome, ExecutionError>,
-        reconcile_result: Result<ReconcileBatch, ExecutionError>,
+        submit_result: Result<String, HftError>,
+        cancel_result: Result<(), HftError>,
+        replace_result: Result<OrderId, HftError>,
+        fills: Vec<AccountFill>,
+        events: Vec<ExecutionEvent>,
     }
 
     impl StaticExecutionGateway {
         pub(crate) fn acknowledged(venue_order_id: impl Into<String>) -> Self {
             let venue_order_id = venue_order_id.into();
             Self {
-                probe_result: Ok(()),
-                submit_result: Ok(ExecutionOutcome::Acknowledged {
-                    venue_order_id: venue_order_id.clone(),
-                }),
-                cancel_result: Ok(CancellationOutcome::Canceled),
-                replace_result: Ok(ReplaceOutcome::Replaced {
-                    venue_order_id: format!("{venue_order_id}-replaced"),
-                }),
-                reconcile_result: Ok(ReconcileBatch::default()),
+                submit_result: Ok(venue_order_id.clone()),
+                cancel_result: Ok(()),
+                replace_result: Ok(OrderId(venue_order_id.clone())),
+                fills: Vec::new(),
+                events: Vec::new(),
             }
         }
 
-        pub(crate) fn failed(error: ExecutionError) -> Self {
+        pub(crate) fn failed(error: HftError) -> Self {
             Self {
-                probe_result: Ok(()),
                 submit_result: Err(error.clone()),
-                cancel_result: Ok(CancellationOutcome::Canceled),
+                cancel_result: Err(error.clone()),
                 replace_result: Err(error),
-                reconcile_result: Ok(ReconcileBatch::default()),
+                fills: Vec::new(),
+                events: Vec::new(),
             }
         }
 
-        pub(crate) fn with_cancel_result(
-            mut self,
-            result: Result<CancellationOutcome, ExecutionError>,
-        ) -> Self {
-            self.cancel_result = result;
-            self
-        }
-
-        pub(crate) fn with_replace_result(
-            mut self,
-            result: Result<ReplaceOutcome, ExecutionError>,
-        ) -> Self {
+        pub(crate) fn with_replace_result(mut self, result: Result<OrderId, HftError>) -> Self {
             self.replace_result = result;
             self
         }
 
-        pub(crate) fn with_reconciled_fills(mut self, fills: Vec<FillRecord>) -> Self {
-            self.reconcile_result = Ok(ReconcileBatch::fills_only(fills));
+        pub(crate) fn with_cancel_result(mut self, result: Result<(), HftError>) -> Self {
+            self.cancel_result = result;
             self
         }
 
-        pub(crate) fn with_reconciled_updates(mut self, updates: ReconcileBatch) -> Self {
-            self.reconcile_result = Ok(updates);
+        pub(crate) fn with_reconciled_fills(mut self, fills: Vec<FillRecord>) -> Self {
+            self.fills = fills
+                .into_iter()
+                .map(|fill| AccountFill {
+                    fill_id: fill.fill_id,
+                    order_id: OrderId(fill.order_id),
+                    symbol: hft_core::Symbol::new(fill.token_id),
+                    side: match fill.side {
+                        TradeSide::Buy => hft_core::Side::Buy,
+                        TradeSide::Sell => hft_core::Side::Sell,
+                    },
+                    price: hft_core::Price(fill.price),
+                    quantity: hft_core::Quantity(fill.quantity),
+                    fee: Some(fill.fee),
+                    timestamp: fill.timestamp.timestamp_micros().max(0) as u64,
+                })
+                .collect();
+            self
+        }
+
+        pub(crate) fn with_execution_events(mut self, events: Vec<ExecutionEvent>) -> Self {
+            self.events = events;
             self
         }
     }
 
-    impl LiveExecutionGateway for StaticExecutionGateway {
-        fn probe(&self) -> Result<(), ExecutionError> {
-            self.probe_result.clone()
+    #[async_trait]
+    impl ExecutionClient for StaticExecutionGateway {
+        async fn place_order(&mut self, _intent: OrderIntent) -> Result<OrderId, HftError> {
+            self.submit_result.clone().map(OrderId)
         }
 
-        fn submit(&self, _request: &ExecutionRequest) -> Result<ExecutionOutcome, ExecutionError> {
-            self.submit_result.clone()
-        }
-
-        fn cancel(
-            &self,
-            _request: &CancellationRequest,
-        ) -> Result<CancellationOutcome, ExecutionError> {
+        async fn cancel_order(&mut self, _order_id: &OrderId) -> Result<(), HftError> {
             self.cancel_result.clone()
         }
 
-        fn replace(&self, _request: &ReplaceRequest) -> Result<ReplaceOutcome, ExecutionError> {
+        async fn modify_order(
+            &mut self,
+            _order_id: &OrderId,
+            _new_quantity: Option<Quantity>,
+            _new_price: Option<Price>,
+        ) -> Result<OrderId, HftError> {
             self.replace_result.clone()
         }
 
-        fn reconcile_fills(
-            &self,
-            _tracked_orders: &[TrackedOrder],
-        ) -> Result<Vec<FillRecord>, ExecutionError> {
-            self.reconcile_result.clone().map(|batch| batch.fills)
+        async fn execution_stream(&self) -> Result<BoxStream<ExecutionEvent>, HftError> {
+            if self.events.is_empty() {
+                return Err(HftError::Config(
+                    "test execution stream unavailable".to_string(),
+                ));
+            }
+            Ok(Box::pin(futures::stream::iter(
+                self.events.clone().into_iter().map(Ok),
+            )))
         }
 
-        fn reconcile_updates(
-            &self,
-            _tracked_orders: &[TrackedOrder],
-        ) -> Result<ReconcileBatch, ExecutionError> {
-            self.reconcile_result.clone()
+        fn execution_stream_may_complete(&self) -> bool {
+            true
+        }
+
+        async fn list_open_orders(&self) -> Result<Vec<OpenOrder>, HftError> {
+            Ok(Vec::new())
+        }
+
+        async fn list_recent_fills(&self) -> Result<Vec<AccountFill>, HftError> {
+            Ok(self.fills.clone())
+        }
+
+        async fn get_balance(&self) -> Result<Vec<AccountBalance>, HftError> {
+            Ok(Vec::new())
+        }
+
+        async fn get_positions(&self) -> Result<Vec<Position>, HftError> {
+            Ok(Vec::new())
+        }
+
+        async fn connect(&mut self) -> Result<(), HftError> {
+            Ok(())
+        }
+
+        async fn disconnect(&mut self) -> Result<(), HftError> {
+            Ok(())
+        }
+
+        async fn health(&self) -> ConnectionHealth {
+            ConnectionHealth {
+                connected: true,
+                latency_ms: Some(0.0),
+                last_heartbeat: 0,
+            }
         }
     }
 }
@@ -125,19 +164,24 @@ pub use deployment_control::{
     apply_deployment, build_deployment_record, control_deployment, enforce_exposure_limit,
     enforce_order_replacement_exposure, ensure_intent_allowed, set_deployment_max_gross_exposure,
 };
+pub use execution_client::{
+    disabled_execution_client, execution_io_error, lock_execution_client, DisabledExecutionClient,
+    SharedExecutionClient, MONDAY_EXECUTION_DISABLED,
+};
 pub use health_runtime::{
     mark_live_runtime_degraded, mark_runtime_healthy, mark_venue_healthy, next_live_reconcile_at,
     LiveHealthConfig,
 };
 pub use proposals::{ProposalExecutionPlan, ProposalStore};
-pub use reconcile::reconcile_live_fills;
+pub use reconcile::{reconcile_live_fills, reconcile_live_fills_with_stream};
 pub use runtime_support::{
-    build_order_control_response, build_trading_state_snapshot, deployment_state_wire,
-    intent_allowed_while_draining, intent_counts_toward_exposure, intent_purpose_from_contract,
-    intent_purpose_wire, io_error_from_execution_error, live_reconcile_backoff_ms,
-    next_paper_intent_id, next_proposal_id, observed_state_for_desired, order_state_from_wire,
-    order_state_wire, restore_trading_runtime, trade_side_from_wire, trade_side_wire, write_json,
-    ReconcileStatus,
+    build_order_control_response, build_persisted_trading_state_snapshot,
+    build_trading_state_snapshot, deployment_state_wire, intent_allowed_while_draining,
+    intent_counts_toward_exposure, intent_purpose_from_contract, intent_purpose_wire,
+    io_error_from_execution_error, live_reconcile_backoff_ms, next_paper_intent_id,
+    next_proposal_id, observed_state_for_desired, order_state_from_wire, order_state_wire,
+    restore_persisted_trading_runtime, restore_trading_runtime, trade_side_from_wire,
+    trade_side_wire, write_json, PersistedTradingStateSnapshot, ReconcileStatus,
 };
 pub use state_io::{load_proposal_store, load_registry_records, load_trading_runtimes};
 pub use trade_control::{cancel_order, replace_order};

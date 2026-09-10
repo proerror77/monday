@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, Utc};
-use ploy_trading::{
+use portfolio_core::prediction::{
     FillRecord, IntentPurpose, OrderLedger, PositionLedger, TradeSide, TradingIntent,
 };
 use rust_decimal::prelude::ToPrimitive;
@@ -866,7 +866,7 @@ impl StrategyLogic for SweepStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ploy_trading::{OrderLedger, PositionLedger};
+    use portfolio_core::prediction::{OrderLedger, PositionLedger};
 
     fn default_test_config() -> SweepConfig {
         SweepConfig {

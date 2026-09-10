@@ -18,13 +18,13 @@ impl StrategyLogic for NoopStrategy {
     fn on_update(
         &mut self,
         _update: &MarketUpdate,
-        _positions: &ploy_trading::PositionLedger,
-        _orders: &ploy_trading::OrderLedger,
+        _positions: &portfolio_core::prediction::PositionLedger,
+        _orders: &portfolio_core::prediction::OrderLedger,
     ) -> Vec<StrategyDecision> {
         Vec::new()
     }
 
-    fn on_fill(&mut self, _fill: &ploy_trading::FillRecord) {}
+    fn on_fill(&mut self, _fill: &portfolio_core::prediction::FillRecord) {}
 
     fn name(&self) -> &str {
         "noop"
@@ -258,7 +258,7 @@ mod tests {
     use super::{build_strategy, canonical_strategy_variant, StrategyKind};
     use crate::{FullConfig, MarketUpdate};
     use chrono::Utc;
-    use ploy_trading::{OrderLedger, PositionLedger};
+    use portfolio_core::prediction::{OrderLedger, PositionLedger};
     use rust_decimal_macros::dec;
 
     #[test]

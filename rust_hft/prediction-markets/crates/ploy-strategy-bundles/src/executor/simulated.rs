@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use ploy_market_contracts::{BookLevel, FeeAccumulator, FeeAsset, FeeSchedule, LiquidityRole};
-use ploy_trading::{FillRecord, IntentPurpose, TradeSide, TradingIntent};
+use portfolio_core::prediction::{FillRecord, IntentPurpose, TradeSide, TradingIntent};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
@@ -624,7 +624,7 @@ impl Executor for SimulatedExecutor {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use ploy_trading::IntentPurpose;
+    use portfolio_core::prediction::IntentPurpose;
 
     fn test_intent(side: TradeSide, price: Decimal, qty: Decimal) -> TradingIntent {
         TradingIntent {

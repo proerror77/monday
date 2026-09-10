@@ -9,3 +9,4 @@ description = "Bootstrap shell for the next-generation Ploy daemon"
 
 [dependencies]
 ploy-daemon-host.workspace = true
+tokio.workspace = true

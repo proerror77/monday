@@ -10,6 +10,9 @@ pub struct PnlSnapshot {
 
 impl PnlSnapshot {
     pub fn net_pnl(&self) -> Decimal {
-        self.realized_pnl + self.unrealized_pnl - self.total_fees
+        // Canonical Portfolio applies fees to realized PnL and exposes the
+        // fee total separately for disclosure. Subtracting it again here
+        // would charge the same venue fee twice.
+        self.realized_pnl + self.unrealized_pnl
     }
 }

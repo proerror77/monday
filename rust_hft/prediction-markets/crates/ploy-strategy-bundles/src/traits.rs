@@ -9,7 +9,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 pub use ploy_market_contracts::{Feed, MarketUpdate};
-use ploy_trading::{FillRecord, OrderLedger, PositionLedger, TradingIntent};
+use portfolio_core::prediction::{FillRecord, OrderLedger, PositionLedger, TradingIntent};
 use rust_decimal::Decimal;
 
 // ── Execution ────────────────────────────────────────────
@@ -150,7 +150,7 @@ pub trait StrategyLogic: Send {
     ///
     /// `reason` is the raw rejection string from the venue.
     /// Default: no-op (strategies that don't need rejection handling can ignore it).
-    fn on_reject(&mut self, _intent: &ploy_trading::TradingIntent, _reason: &str) {}
+    fn on_reject(&mut self, _intent: &portfolio_core::prediction::TradingIntent, _reason: &str) {}
 
     /// Strategy name for logging and metrics.
     fn name(&self) -> &str;
@@ -176,7 +176,7 @@ impl StrategyLogic for Box<dyn StrategyLogic> {
         (**self).on_fill(fill);
     }
 
-    fn on_reject(&mut self, intent: &ploy_trading::TradingIntent, reason: &str) {
+    fn on_reject(&mut self, intent: &portfolio_core::prediction::TradingIntent, reason: &str) {
         (**self).on_reject(intent, reason);
     }
 

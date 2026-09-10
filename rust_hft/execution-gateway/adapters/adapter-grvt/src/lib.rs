@@ -218,7 +218,7 @@ impl ExecutionClient for GrvtExecutionClient {
         _order_id: &OrderId,
         _new_quantity: Option<Quantity>,
         _new_price: Option<Price>,
-    ) -> HftResult<()> {
+    ) -> HftResult<OrderId> {
         Err(HftError::new("GRVT modify_order 尚未實作"))
     }
 

@@ -109,6 +109,14 @@ pub struct MultiAccountState {
     pub high_water_mark: Decimal,
     /// 最大回撤
     pub max_drawdown: Decimal,
+    /// Canonical order routing is persisted with account state.  Without it,
+    /// a restart can apply a real venue fill to no account (or the wrong one).
+    #[serde(default)]
+    pub order_to_account: HashMap<OrderId, AccountId>,
+    #[serde(default)]
+    pub unrouted_events: Vec<ExecutionEvent>,
+    #[serde(default)]
+    pub routing_conflicts: Vec<String>,
 }
 
 /// 多帳戶 Portfolio 管理器
@@ -123,6 +131,8 @@ pub struct MultiAccountPortfolio {
     high_water_mark: Decimal,
     /// 最大回撤
     max_drawdown: Decimal,
+    unrouted_events: Vec<ExecutionEvent>,
+    routing_conflicts: Vec<String>,
 }
 
 impl Default for MultiAccountPortfolio {
@@ -139,6 +149,8 @@ impl MultiAccountPortfolio {
             aggregated_snapshot: SnapshotContainer::new(AggregatedAccountView::default()),
             high_water_mark: Decimal::ZERO,
             max_drawdown: Decimal::ZERO,
+            unrouted_events: Vec::new(),
+            routing_conflicts: Vec::new(),
         }
     }
 
@@ -159,11 +171,22 @@ impl MultiAccountPortfolio {
         order_id: OrderId,
         symbol: Symbol,
         side: Side,
-    ) {
-        self.order_to_account
-            .insert(order_id.clone(), account_id.clone());
+    ) -> bool {
+        if let Some(existing_account) = self.order_to_account.get(&order_id) {
+            if existing_account != &account_id {
+                self.routing_conflicts.push(format!(
+                    "order {:?} already belongs to account {}, refused rebind to {}",
+                    order_id, existing_account, account_id
+                ));
+                return false;
+            }
+        } else {
+            self.order_to_account
+                .insert(order_id.clone(), account_id.clone());
+        }
         let portfolio = self.get_or_create_account(account_id);
         portfolio.register_order(order_id, symbol, side);
+        true
     }
 
     /// 處理執行事件（自動路由到對應帳戶）
@@ -183,7 +206,11 @@ impl MultiAccountPortfolio {
         if let Some(account_id) = self.order_to_account.get(order_id).cloned() {
             if let Some(portfolio) = self.accounts.get_mut(&account_id) {
                 portfolio.on_execution_event(event);
+            } else {
+                self.unrouted_events.push(event.clone());
             }
+        } else {
+            self.unrouted_events.push(event.clone());
         }
 
         // 更新聚合視圖
@@ -196,8 +223,26 @@ impl MultiAccountPortfolio {
         account_id: &AccountId,
         event: &ExecutionEvent,
     ) {
+        let order_id = match event {
+            ExecutionEvent::OrderAck { order_id, .. }
+            | ExecutionEvent::Fill { order_id, .. }
+            | ExecutionEvent::FeeCharged { order_id, .. }
+            | ExecutionEvent::OrderCanceled { order_id, .. }
+            | ExecutionEvent::OrderReject { order_id, .. }
+            | ExecutionEvent::OrderModified { order_id, .. } => Some(order_id),
+            _ => None,
+        };
+        if let Some(order_id) = order_id {
+            if self.order_to_account.get(order_id) != Some(account_id) {
+                self.unrouted_events.push(event.clone());
+                self.update_aggregated_view();
+                return;
+            }
+        }
         if let Some(portfolio) = self.accounts.get_mut(account_id) {
             portfolio.on_execution_event(event);
+        } else {
+            self.unrouted_events.push(event.clone());
         }
         self.update_aggregated_view();
     }
@@ -339,11 +384,14 @@ impl MultiAccountPortfolio {
             account_states,
             high_water_mark: self.high_water_mark,
             max_drawdown: self.max_drawdown,
+            order_to_account: self.order_to_account.clone(),
+            unrouted_events: self.unrouted_events.clone(),
+            routing_conflicts: self.routing_conflicts.clone(),
         }
     }
 
     /// 導入狀態（恢復）
-    pub fn import_state(&mut self, state: MultiAccountState) {
+    pub fn import_state(&mut self, state: MultiAccountState) -> Result<(), String> {
         info!(
             "Importing multi-account state - {} accounts, HWM: {}, DD: {}",
             state.account_states.len(),
@@ -351,13 +399,28 @@ impl MultiAccountPortfolio {
             state.max_drawdown
         );
 
+        if let Err(reason) = validate_state(&state) {
+            tracing::warn!(
+                "refused invalid multi-account state during restore: {}",
+                reason
+            );
+            return Err(reason);
+        }
+
+        let mut restored_accounts = HashMap::new();
+        for (account_id, portfolio_state) in &state.account_states {
+            let mut portfolio = crate::Portfolio::new();
+            portfolio.try_import_state(portfolio_state.clone())?;
+            restored_accounts.insert(account_id.clone(), portfolio);
+        }
+
         self.high_water_mark = state.high_water_mark;
         self.max_drawdown = state.max_drawdown;
+        self.order_to_account = state.order_to_account;
+        self.unrouted_events = state.unrouted_events;
+        self.routing_conflicts = state.routing_conflicts;
 
-        for (account_id, portfolio_state) in state.account_states {
-            let portfolio = self.get_or_create_account(account_id.clone());
-            portfolio.import_state(portfolio_state);
-        }
+        self.accounts = restored_accounts;
 
         self.update_aggregated_view();
 
@@ -365,6 +428,7 @@ impl MultiAccountPortfolio {
             "Multi-account state imported - Total equity: {}",
             self.get_aggregated_view().total_equity
         );
+        Ok(())
     }
 
     /// 獲取跨帳戶 PnL 報告
@@ -403,6 +467,56 @@ impl MultiAccountPortfolio {
             },
         }
     }
+}
+
+fn validate_state(state: &MultiAccountState) -> Result<(), String> {
+    for (account_id, account_state) in &state.account_states {
+        super::validate_state(account_state).map_err(|reason| {
+            format!(
+                "account {} has invalid portfolio checkpoint: {}",
+                account_id, reason
+            )
+        })?;
+    }
+    for (order_id, account_id) in &state.order_to_account {
+        let account = state
+            .account_states
+            .get(account_id)
+            .ok_or_else(|| format!("order {} references an unknown account", order_id.0))?;
+        if !account.order_meta.contains_key(order_id) {
+            return Err(format!(
+                "order {} routing has no matching account metadata",
+                order_id.0
+            ));
+        }
+    }
+    for (account_id, account) in &state.account_states {
+        for order_id in account.order_meta.keys() {
+            if state.order_to_account.get(order_id) != Some(account_id) {
+                return Err(format!(
+                    "account metadata for order {} has no canonical routing entry",
+                    order_id.0
+                ));
+            }
+        }
+    }
+    for account_id in state.account_states.keys() {
+        if state
+            .order_to_account
+            .values()
+            .all(|owner| owner != account_id)
+            && state
+                .account_states
+                .get(account_id)
+                .is_some_and(|account| !account.order_meta.is_empty())
+        {
+            return Err(format!(
+                "account {} has order metadata but no canonical routing entries",
+                account_id
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// 帳戶 PnL 明細
@@ -580,6 +694,7 @@ mod tests {
         let account = multi.get_or_create_account(account_id.clone());
         let mut state = account.export_state();
         state.account_view.cash_balance = Decimal::from(1000);
+        state.refresh_canonical_digest();
         account.import_state(state);
 
         multi.register_order(
@@ -602,6 +717,114 @@ mod tests {
         assert_eq!(
             multi.get_pnl_report().per_account[&account_id].equity,
             Decimal::from(1000)
+        );
+    }
+
+    #[test]
+    fn restore_preserves_order_account_routing_and_rejects_rebind() {
+        let mut multi = MultiAccountPortfolio::new();
+        let account_id = AccountId::new(VenueId::BINANCE);
+        let other_account = AccountId::new(VenueId::BITGET);
+        let symbol = Symbol::new("BTCUSDT");
+        let order_id = OrderId("ROUTED-RESTORE".into());
+        multi.register_order(
+            account_id.clone(),
+            order_id.clone(),
+            symbol.clone(),
+            Side::Buy,
+        );
+        let state = multi.export_state();
+
+        let mut restored = MultiAccountPortfolio::new();
+        let _ = restored.import_state(state);
+        restored.on_execution_event(&ExecutionEvent::Fill {
+            order_id: order_id.clone(),
+            price: Price(Decimal::from(100)),
+            quantity: Quantity(Decimal::ONE),
+            timestamp: 1,
+            fill_id: "restored-fill".into(),
+        });
+        assert_eq!(
+            restored
+                .get_account(&account_id)
+                .unwrap()
+                .reader()
+                .load()
+                .positions[&symbol]
+                .quantity
+                .0,
+            Decimal::ONE
+        );
+
+        restored.register_order(other_account.clone(), order_id, symbol, Side::Buy);
+        assert_eq!(restored.export_state().routing_conflicts.len(), 1);
+        assert!(restored.get_account(&other_account).is_none());
+    }
+
+    #[test]
+    fn explicit_account_event_cannot_cross_owner_boundary() {
+        let mut multi = MultiAccountPortfolio::new();
+        let owner = AccountId::new(VenueId::BINANCE);
+        let wrong = AccountId::new(VenueId::BITGET);
+        let order_id = OrderId("OWNER-BOUND".into());
+        let symbol = Symbol::new("BTCUSDT");
+        multi.register_order(owner.clone(), order_id.clone(), symbol.clone(), Side::Buy);
+        multi.on_execution_event_for_account(
+            &wrong,
+            &ExecutionEvent::Fill {
+                order_id,
+                price: Price(Decimal::from(100)),
+                quantity: Quantity(Decimal::ONE),
+                timestamp: 1,
+                fill_id: "cross-account".into(),
+            },
+        );
+        assert!(multi.get_account(&wrong).is_none());
+        assert!(multi
+            .get_account(&owner)
+            .unwrap()
+            .reader()
+            .load()
+            .positions
+            .is_empty());
+        assert_eq!(multi.export_state().unrouted_events.len(), 1);
+    }
+
+    #[test]
+    fn restore_replaces_accounts_atomically_and_rejects_invalid_child_checkpoint() {
+        let mut multi = MultiAccountPortfolio::new();
+        let stale = AccountId::new(VenueId::BINANCE);
+        multi.get_or_create_account(stale.clone());
+        let fresh = AccountId::new(VenueId::BITGET);
+        let state = MultiAccountPortfolio::new().export_state();
+        // An empty fresh checkpoint is valid and must remove stale accounts.
+        assert!(multi.import_state(state).is_ok());
+        assert!(multi.get_account(&stale).is_none());
+        assert!(multi.get_account(&fresh).is_none());
+
+        let mut invalid = MultiAccountPortfolio::new().export_state();
+        invalid.account_states.insert(
+            fresh.clone(),
+            crate::PortfolioState {
+                account_view: AccountView::default(),
+                total_fees: Decimal::ZERO,
+                order_meta: HashMap::from([(
+                    OrderId("unknown".into()),
+                    (Symbol::new("BTCUSDT"), Side::Buy),
+                )]),
+                market_prices: HashMap::new(),
+                processed_fill_ids: HashMap::new(),
+                processed_fee_ids: HashMap::new(),
+                recent_accounting_event_ids: Vec::new(),
+                reconciliation_exceptions: Vec::new(),
+                canonical_state_digest: None,
+            },
+        );
+        let before = multi.export_state();
+        assert!(multi.import_state(invalid).is_err());
+        assert_eq!(
+            multi.export_state().account_states.len(),
+            before.account_states.len()
         );
     }
 }

@@ -5147,6 +5147,7 @@ dependencies = [
  "hft-data-adapter-bitget",
  "hft-infra-metrics",
  "hft-oms-core",
+ "hft-portfolio-core",
  "hft-ports",
  "hft-snapshot",
  "hft-strategy-arbitrage",
@@ -5568,11 +5569,17 @@ dependencies = [
 name = "hft-portfolio-core"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "hft-core",
+ "hft-oms-core",
  "hft-ports",
  "hft-snapshot",
  "rust_decimal",
+ "rust_decimal_macros 1.40.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
  "tracing",
 ]
 

@@ -704,8 +704,7 @@ jobs:
             -p ploy-deployments \
             -p ploy-operator-contracts \
             -p ploy-platform \
-            -p ploy-platform-runtime \
-            -p ploy-trading
+            -p ploy-platform-runtime
           cargo test --locked \
             -p ploy-agent-sidecar \
             -p ploy-daemon-host \
@@ -716,8 +715,7 @@ jobs:
             -p ploy-deployments \
             -p ploy-operator-contracts \
             -p ploy-platform \
-            -p ploy-platform-runtime \
-            -p ploy-trading
+            -p ploy-platform-runtime
           cargo clippy --locked -p ploy-agent-sidecar --all-targets --no-deps -- -D warnings
           echo "### Rust control-plane/core lane" >> "$GITHUB_STEP_SUMMARY"
           echo "Elapsed seconds: ${SECONDS}" >> "$GITHUB_STEP_SUMMARY"
@@ -856,8 +854,7 @@ jobs:
             -p ploy-backtest \
             -p ploy-runner-host \
             -p ploy-strategy-runtime \
-            -p ploy-strategy-bundles \
-            -p ploy-connectivity
+            -p ploy-strategy-bundles
           cargo check --locked \
             -p new-ploy-runner \
             --features full
@@ -866,7 +863,6 @@ jobs:
             -p ploy-runner-host \
             -p ploy-strategy-runtime \
             -p ploy-strategy-bundles \
-            -p ploy-connectivity \
             --features ploy-runner-host/full,ploy-strategy-runtime/full
           if cargo tree --locked -p new-ploy-runner --features full -e features \
             | grep -q 'live-execution'; then

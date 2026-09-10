@@ -218,19 +218,19 @@ mod tests {
     #[test]
     fn normalized_runtime_evidence_exposes_order_and_fill_rows() {
         let timestamp = Utc::now();
-        let snapshot = ploy_trading::TradingRuntimeSnapshot {
-            intents: vec![ploy_trading::TradingIntent {
+        let snapshot = portfolio_core::prediction::TradingRuntimeSnapshot {
+            intents: vec![portfolio_core::prediction::TradingIntent {
                 intent_id: "intent-1".to_string(),
                 deployment_id: "pm5d-test".to_string(),
                 market_id: "event-1".to_string(),
                 token_id: "token-up".to_string(),
-                side: ploy_trading::TradeSide::Buy,
+                side: portfolio_core::prediction::TradeSide::Buy,
                 quantity: dec!(10),
                 limit_price: Some(dec!(0.42)),
-                purpose: ploy_trading::IntentPurpose::Entry,
+                purpose: portfolio_core::prediction::IntentPurpose::Entry,
                 created_at: timestamp,
             }],
-            orders: vec![ploy_trading::OrderRecord {
+            orders: vec![portfolio_core::prediction::OrderRecord {
                 order_id: "order-1".to_string(),
                 intent_id: "intent-1".to_string(),
                 deployment_id: "pm5d-test".to_string(),
@@ -241,17 +241,17 @@ mod tests {
                 venue_order_history: vec![],
                 revision: 0,
                 idempotency_key: None,
-                state: ploy_trading::OrderState::Filled,
+                state: portfolio_core::prediction::OrderState::Filled,
                 state_changed_at: Some(timestamp),
                 filled_qty: dec!(10),
                 rejection_reason: None,
                 last_error: None,
             }],
-            fills: vec![ploy_trading::FillRecord {
+            fills: vec![portfolio_core::prediction::FillRecord {
                 fill_id: "fill-1".to_string(),
                 order_id: "order-1".to_string(),
                 token_id: "token-up".to_string(),
-                side: ploy_trading::TradeSide::Buy,
+                side: portfolio_core::prediction::TradeSide::Buy,
                 quantity: dec!(10),
                 price: dec!(0.41),
                 fee: Decimal::ZERO,
@@ -282,7 +282,7 @@ mod tests {
     #[test]
     fn backtest_evidence_tracks_event_uniqueness_and_closed_drawdown() {
         let started = Utc::now();
-        let mut snapshot = ploy_trading::TradingRuntimeSnapshot::default();
+        let mut snapshot = portfolio_core::prediction::TradingRuntimeSnapshot::default();
         for (index, (event_id, exit_price)) in [
             ("event-1", dec!(0.60)),
             ("event-2", dec!(0.25)),
@@ -299,26 +299,26 @@ mod tests {
             let opened_at = started + Duration::seconds(index as i64 * 10);
             let closed_at = opened_at + Duration::seconds(5);
             snapshot.intents.extend([
-                ploy_trading::TradingIntent {
+                portfolio_core::prediction::TradingIntent {
                     intent_id: entry_intent_id.clone(),
                     deployment_id: "pm5d-test".into(),
                     market_id: event_id.into(),
                     token_id: token_id.clone(),
-                    side: ploy_trading::TradeSide::Buy,
+                    side: portfolio_core::prediction::TradeSide::Buy,
                     quantity: dec!(100),
                     limit_price: Some(dec!(0.50)),
-                    purpose: ploy_trading::IntentPurpose::Entry,
+                    purpose: portfolio_core::prediction::IntentPurpose::Entry,
                     created_at: opened_at,
                 },
-                ploy_trading::TradingIntent {
+                portfolio_core::prediction::TradingIntent {
                     intent_id: exit_intent_id.clone(),
                     deployment_id: "pm5d-test".into(),
                     market_id: event_id.into(),
                     token_id: token_id.clone(),
-                    side: ploy_trading::TradeSide::Sell,
+                    side: portfolio_core::prediction::TradeSide::Sell,
                     quantity: dec!(100),
                     limit_price: Some(exit_price),
-                    purpose: ploy_trading::IntentPurpose::Exit,
+                    purpose: portfolio_core::prediction::IntentPurpose::Exit,
                     created_at: closed_at,
                 },
             ]);
@@ -326,39 +326,41 @@ mod tests {
                 (entry_order_id.clone(), entry_intent_id.clone()),
                 (exit_order_id.clone(), exit_intent_id.clone()),
             ] {
-                snapshot.orders.push(ploy_trading::OrderRecord {
-                    order_id,
-                    intent_id,
-                    deployment_id: "pm5d-test".into(),
-                    token_id: token_id.clone(),
-                    requested_qty: dec!(100),
-                    limit_price: Some(dec!(0.50)),
-                    venue_order_id: None,
-                    venue_order_history: Vec::new(),
-                    revision: 0,
-                    idempotency_key: None,
-                    state: ploy_trading::OrderState::Filled,
-                    filled_qty: dec!(100),
-                    rejection_reason: None,
-                    last_error: None,
-                });
+                snapshot
+                    .orders
+                    .push(portfolio_core::prediction::OrderRecord {
+                        order_id,
+                        intent_id,
+                        deployment_id: "pm5d-test".into(),
+                        token_id: token_id.clone(),
+                        requested_qty: dec!(100),
+                        limit_price: Some(dec!(0.50)),
+                        venue_order_id: None,
+                        venue_order_history: Vec::new(),
+                        revision: 0,
+                        idempotency_key: None,
+                        state: portfolio_core::prediction::OrderState::Filled,
+                        filled_qty: dec!(100),
+                        rejection_reason: None,
+                        last_error: None,
+                    });
             }
             snapshot.fills.extend([
-                ploy_trading::FillRecord {
+                portfolio_core::prediction::FillRecord {
                     fill_id: format!("entry-fill-{index}"),
                     order_id: entry_order_id,
                     token_id: token_id.clone(),
-                    side: ploy_trading::TradeSide::Buy,
+                    side: portfolio_core::prediction::TradeSide::Buy,
                     quantity: dec!(100),
                     price: dec!(0.50),
                     fee: Decimal::ZERO,
                     timestamp: opened_at,
                 },
-                ploy_trading::FillRecord {
+                portfolio_core::prediction::FillRecord {
                     fill_id: format!("exit-fill-{index}"),
                     order_id: exit_order_id,
                     token_id,
-                    side: ploy_trading::TradeSide::Sell,
+                    side: portfolio_core::prediction::TradeSide::Sell,
                     quantity: dec!(100),
                     price: exit_price,
                     fee: Decimal::ZERO,
@@ -366,49 +368,55 @@ mod tests {
                 },
             ]);
         }
-        snapshot.intents.push(ploy_trading::TradingIntent {
-            intent_id: "duplicate-event-1".into(),
-            deployment_id: "pm5d-test".into(),
-            market_id: "event-1".into(),
-            token_id: "token-0".into(),
-            side: ploy_trading::TradeSide::Buy,
-            quantity: dec!(1),
-            limit_price: Some(dec!(0.50)),
-            purpose: ploy_trading::IntentPurpose::Entry,
-            created_at: started + Duration::seconds(1),
-        });
-        snapshot.intents.push(ploy_trading::TradingIntent {
-            intent_id: "orphan-exit".into(),
-            deployment_id: "pm5d-test".into(),
-            market_id: "event-without-entry".into(),
-            token_id: "orphan-token".into(),
-            side: ploy_trading::TradeSide::Sell,
-            quantity: dec!(1),
-            limit_price: Some(dec!(0.75)),
-            purpose: ploy_trading::IntentPurpose::Exit,
-            created_at: started + Duration::seconds(40),
-        });
-        snapshot.orders.push(ploy_trading::OrderRecord {
-            order_id: "orphan-exit-order".into(),
-            intent_id: "orphan-exit".into(),
-            deployment_id: "pm5d-test".into(),
-            token_id: "orphan-token".into(),
-            requested_qty: dec!(1),
-            limit_price: Some(dec!(0.75)),
-            venue_order_id: None,
-            venue_order_history: Vec::new(),
-            revision: 0,
-            idempotency_key: None,
-            state: ploy_trading::OrderState::Filled,
-            filled_qty: dec!(1),
-            rejection_reason: None,
-            last_error: None,
-        });
-        snapshot.fills.push(ploy_trading::FillRecord {
+        snapshot
+            .intents
+            .push(portfolio_core::prediction::TradingIntent {
+                intent_id: "duplicate-event-1".into(),
+                deployment_id: "pm5d-test".into(),
+                market_id: "event-1".into(),
+                token_id: "token-0".into(),
+                side: portfolio_core::prediction::TradeSide::Buy,
+                quantity: dec!(1),
+                limit_price: Some(dec!(0.50)),
+                purpose: portfolio_core::prediction::IntentPurpose::Entry,
+                created_at: started + Duration::seconds(1),
+            });
+        snapshot
+            .intents
+            .push(portfolio_core::prediction::TradingIntent {
+                intent_id: "orphan-exit".into(),
+                deployment_id: "pm5d-test".into(),
+                market_id: "event-without-entry".into(),
+                token_id: "orphan-token".into(),
+                side: portfolio_core::prediction::TradeSide::Sell,
+                quantity: dec!(1),
+                limit_price: Some(dec!(0.75)),
+                purpose: portfolio_core::prediction::IntentPurpose::Exit,
+                created_at: started + Duration::seconds(40),
+            });
+        snapshot
+            .orders
+            .push(portfolio_core::prediction::OrderRecord {
+                order_id: "orphan-exit-order".into(),
+                intent_id: "orphan-exit".into(),
+                deployment_id: "pm5d-test".into(),
+                token_id: "orphan-token".into(),
+                requested_qty: dec!(1),
+                limit_price: Some(dec!(0.75)),
+                venue_order_id: None,
+                venue_order_history: Vec::new(),
+                revision: 0,
+                idempotency_key: None,
+                state: portfolio_core::prediction::OrderState::Filled,
+                filled_qty: dec!(1),
+                rejection_reason: None,
+                last_error: None,
+            });
+        snapshot.fills.push(portfolio_core::prediction::FillRecord {
             fill_id: "orphan-exit-fill".into(),
             order_id: "orphan-exit-order".into(),
             token_id: "orphan-token".into(),
-            side: ploy_trading::TradeSide::Sell,
+            side: portfolio_core::prediction::TradeSide::Sell,
             quantity: dec!(1),
             price: dec!(0.75),
             fee: Decimal::ZERO,
@@ -761,7 +769,7 @@ fn write_backtest_evaluation_json(
     end_date: Option<&str>,
     backtest_options: &HistoricalLoadOptions,
     result: &ploy_strategy_bundles::RuntimeResult,
-    snapshot: &ploy_trading::TradingRuntimeSnapshot,
+    snapshot: &portfolio_core::prediction::TradingRuntimeSnapshot,
 ) {
     let Some(path) = path else {
         return;
@@ -805,7 +813,7 @@ fn build_backtest_evaluation_artifact(
     end_date: Option<&str>,
     backtest_options: &HistoricalLoadOptions,
     result: &ploy_strategy_bundles::RuntimeResult,
-    snapshot: &ploy_trading::TradingRuntimeSnapshot,
+    snapshot: &portfolio_core::prediction::TradingRuntimeSnapshot,
 ) -> serde_json::Value {
     let cashflow = snapshot.fill_cashflow_summary();
     let evidence_metrics = backtest_evidence_metrics(snapshot);
@@ -977,14 +985,14 @@ struct EventLifecycle {
 }
 
 fn backtest_evidence_metrics(
-    snapshot: &ploy_trading::TradingRuntimeSnapshot,
+    snapshot: &portfolio_core::prediction::TradingRuntimeSnapshot,
 ) -> BacktestEvidenceMetrics {
     let mut entry_decisions = BTreeMap::<String, usize>::new();
     let mut missing_event_id_count = 0usize;
     for intent in snapshot
         .intents
         .iter()
-        .filter(|intent| intent.purpose == ploy_trading::IntentPurpose::Entry)
+        .filter(|intent| intent.purpose == portfolio_core::prediction::IntentPurpose::Entry)
     {
         if intent.market_id.trim().is_empty() {
             missing_event_id_count += 1;
@@ -1017,16 +1025,16 @@ fn backtest_evidence_metrics(
         }
         let lifecycle = lifecycles.entry(intent.market_id.clone()).or_default();
         let signed_quantity = match fill.side {
-            ploy_trading::TradeSide::Buy => fill.quantity,
-            ploy_trading::TradeSide::Sell => -fill.quantity,
+            portfolio_core::prediction::TradeSide::Buy => fill.quantity,
+            portfolio_core::prediction::TradeSide::Sell => -fill.quantity,
         };
         *lifecycle
             .net_quantity_by_token
             .entry(fill.token_id.clone())
             .or_default() += signed_quantity;
         let signed_notional = match fill.side {
-            ploy_trading::TradeSide::Buy => -(fill.quantity * fill.price),
-            ploy_trading::TradeSide::Sell => fill.quantity * fill.price,
+            portfolio_core::prediction::TradeSide::Buy => -(fill.quantity * fill.price),
+            portfolio_core::prediction::TradeSide::Sell => fill.quantity * fill.price,
         };
         lifecycle.net_pnl += signed_notional - fill.fee;
         lifecycle.closed_at = Some(
@@ -1084,14 +1092,14 @@ fn backtest_evidence_metrics(
 }
 
 fn normalized_runtime_evidence(
-    snapshot: &ploy_trading::TradingRuntimeSnapshot,
+    snapshot: &portfolio_core::prediction::TradingRuntimeSnapshot,
 ) -> serde_json::Value {
-    let intents_by_id: BTreeMap<&str, &ploy_trading::TradingIntent> = snapshot
+    let intents_by_id: BTreeMap<&str, &portfolio_core::prediction::TradingIntent> = snapshot
         .intents
         .iter()
         .map(|intent| (intent.intent_id.as_str(), intent))
         .collect();
-    let orders_by_id: BTreeMap<&str, &ploy_trading::OrderRecord> = snapshot
+    let orders_by_id: BTreeMap<&str, &portfolio_core::prediction::OrderRecord> = snapshot
         .orders
         .iter()
         .map(|order| (order.order_id.as_str(), order))
@@ -1108,8 +1116,8 @@ fn normalized_runtime_evidence(
             .entry(fill.order_id.as_str())
             .or_default() += fill.quantity * fill.price;
         let signed_notional = match fill.side {
-            ploy_trading::TradeSide::Buy => -(fill.quantity * fill.price),
-            ploy_trading::TradeSide::Sell => fill.quantity * fill.price,
+            portfolio_core::prediction::TradeSide::Buy => -(fill.quantity * fill.price),
+            portfolio_core::prediction::TradeSide::Sell => fill.quantity * fill.price,
         };
         *fill_pnl_by_order.entry(fill.order_id.as_str()).or_default() += signed_notional - fill.fee;
     }
@@ -1253,32 +1261,32 @@ fn empty_to_none(value: &str) -> Option<&str> {
     }
 }
 
-fn trade_side_label(side: ploy_trading::TradeSide) -> &'static str {
+fn trade_side_label(side: portfolio_core::prediction::TradeSide) -> &'static str {
     match side {
-        ploy_trading::TradeSide::Buy => "BUY",
-        ploy_trading::TradeSide::Sell => "SELL",
+        portfolio_core::prediction::TradeSide::Buy => "BUY",
+        portfolio_core::prediction::TradeSide::Sell => "SELL",
     }
 }
 
-fn intent_purpose_label(purpose: ploy_trading::IntentPurpose) -> &'static str {
+fn intent_purpose_label(purpose: portfolio_core::prediction::IntentPurpose) -> &'static str {
     match purpose {
-        ploy_trading::IntentPurpose::Entry => "ENTRY",
-        ploy_trading::IntentPurpose::Exit => "EXIT",
-        ploy_trading::IntentPurpose::Reduce => "REDUCE",
-        ploy_trading::IntentPurpose::Hedge => "HEDGE",
-        ploy_trading::IntentPurpose::Cancel => "CANCEL",
+        portfolio_core::prediction::IntentPurpose::Entry => "ENTRY",
+        portfolio_core::prediction::IntentPurpose::Exit => "EXIT",
+        portfolio_core::prediction::IntentPurpose::Reduce => "REDUCE",
+        portfolio_core::prediction::IntentPurpose::Hedge => "HEDGE",
+        portfolio_core::prediction::IntentPurpose::Cancel => "CANCEL",
     }
 }
 
-fn order_state_label(state: ploy_trading::OrderState) -> &'static str {
+fn order_state_label(state: portfolio_core::prediction::OrderState) -> &'static str {
     match state {
-        ploy_trading::OrderState::Pending => "PENDING",
-        ploy_trading::OrderState::Unknown => "UNKNOWN",
-        ploy_trading::OrderState::Acknowledged => "ACKNOWLEDGED",
-        ploy_trading::OrderState::PartiallyFilled => "PARTIALLY_FILLED",
-        ploy_trading::OrderState::Filled => "FILLED",
-        ploy_trading::OrderState::Canceled => "CANCELED",
-        ploy_trading::OrderState::Rejected => "REJECTED",
+        portfolio_core::prediction::OrderState::Pending => "PENDING",
+        portfolio_core::prediction::OrderState::Unknown => "UNKNOWN",
+        portfolio_core::prediction::OrderState::Acknowledged => "ACKNOWLEDGED",
+        portfolio_core::prediction::OrderState::PartiallyFilled => "PARTIALLY_FILLED",
+        portfolio_core::prediction::OrderState::Filled => "FILLED",
+        portfolio_core::prediction::OrderState::Canceled => "CANCELED",
+        portfolio_core::prediction::OrderState::Rejected => "REJECTED",
     }
 }
 
@@ -1348,7 +1356,7 @@ fn write_timing_json(path: Option<&str>, payload: serde_json::Value) {
 
 fn print_results(
     result: &ploy_strategy_bundles::RuntimeResult,
-    snapshot: &ploy_trading::TradingRuntimeSnapshot,
+    snapshot: &portfolio_core::prediction::TradingRuntimeSnapshot,
     stake_usd: Decimal,
 ) {
     let cashflow = snapshot.fill_cashflow_summary();
@@ -1368,13 +1376,13 @@ fn print_results(
     let mut peak_positions: i64 = 0;
     for fill in fills {
         match fill.side {
-            ploy_trading::TradeSide::Buy => {
+            portfolio_core::prediction::TradeSide::Buy => {
                 open_positions += 1;
                 if open_positions > peak_positions {
                     peak_positions = open_positions;
                 }
             }
-            ploy_trading::TradeSide::Sell => {
+            portfolio_core::prediction::TradeSide::Sell => {
                 open_positions = (open_positions - 1).max(0);
             }
         }

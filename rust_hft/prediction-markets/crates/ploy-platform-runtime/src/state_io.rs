@@ -1,8 +1,9 @@
-use crate::{restore_trading_runtime, ProposalStore};
-use ploy_operator_contracts::{DeploymentRuntimeMode, TradingStateSnapshot};
+use crate::runtime_support::verify_persisted_trading_state_snapshot;
+use crate::{restore_persisted_trading_runtime, PersistedTradingStateSnapshot, ProposalStore};
+use ploy_operator_contracts::DeploymentRuntimeMode;
 use ploy_platform::DeploymentRecord;
-use ploy_trading::TradingRuntime;
-use std::collections::BTreeMap;
+use portfolio_core::prediction::TradingRuntime;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -33,19 +34,27 @@ pub fn load_trading_runtimes(
         return Ok(BTreeMap::new());
     }
 
-    let snapshots: Vec<TradingStateSnapshot> = serde_json::from_str(&raw)
+    let snapshots: Vec<PersistedTradingStateSnapshot> = serde_json::from_str(&raw)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
 
     let mut runtimes = BTreeMap::new();
+    let mut seen_deployment_ids = BTreeSet::new();
     for snapshot in snapshots {
-        let Some(expected_mode) = expected_runtime_mode(&snapshot.deployment_id) else {
+        verify_persisted_trading_state_snapshot(&snapshot)?;
+        let deployment_id = snapshot.snapshot.deployment_id.clone();
+        if !seen_deployment_ids.insert(deployment_id.clone()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("duplicate persisted trading deployment identity `{deployment_id}`"),
+            ));
+        }
+        let Some(expected_mode) = expected_runtime_mode(&snapshot.snapshot.deployment_id) else {
             continue;
         };
-        if snapshot.runtime_mode != expected_mode {
+        if snapshot.snapshot.runtime_mode != expected_mode {
             continue;
         }
-        let deployment_id = snapshot.deployment_id.clone();
-        runtimes.insert(deployment_id, restore_trading_runtime(snapshot)?);
+        runtimes.insert(deployment_id, restore_persisted_trading_runtime(snapshot)?);
     }
 
     Ok(runtimes)
@@ -72,6 +81,13 @@ pub fn load_proposal_store(path: &Path) -> io::Result<ProposalStore> {
 mod tests {
     use super::{load_proposal_store, load_registry_records, load_trading_runtimes};
     use chrono::Utc;
+    use ploy_operator_contracts::DeploymentRuntimeMode;
+    use ploy_platform::DeploymentRecord;
+    use portfolio_core::prediction::{
+        FillRecord, IntentPurpose, TradeSide, TradingIntent, TradingRuntime,
+    };
+    use rust_decimal_macros::dec;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -81,6 +97,83 @@ mod tests {
             .expect("duration")
             .as_nanos();
         std::env::temp_dir().join(format!("ploy-state-io-{label}-{unique}.json"))
+    }
+
+    fn persisted_snapshot(
+        deployment_id: &str,
+        runtime_mode: DeploymentRuntimeMode,
+    ) -> serde_json::Value {
+        let record = DeploymentRecord {
+            deployment_id: deployment_id.to_string(),
+            bundle_id: "example".to_string(),
+            runtime_mode,
+            account_id: "acct-test".to_string(),
+            max_gross_exposure: None,
+            deployment_state: ploy_operator_contracts::DeploymentState::Enabled,
+            desired_state: ploy_operator_contracts::DesiredState::Paused,
+            observed_state: ploy_operator_contracts::ObservedState::Paused,
+        };
+        let snapshot = TradingRuntime::default().snapshot(&BTreeMap::new());
+        serde_json::to_value(
+            super::super::build_persisted_trading_state_snapshot(record, snapshot)
+                .expect("canonical test snapshot"),
+        )
+        .expect("serialize canonical test snapshot")
+    }
+
+    fn persisted_snapshot_with_multiple_fills(
+        deployment_id: &str,
+        runtime_mode: DeploymentRuntimeMode,
+    ) -> serde_json::Value {
+        let record = DeploymentRecord {
+            deployment_id: deployment_id.to_string(),
+            bundle_id: "example".to_string(),
+            runtime_mode,
+            account_id: "acct-test".to_string(),
+            max_gross_exposure: None,
+            deployment_state: ploy_operator_contracts::DeploymentState::Enabled,
+            desired_state: ploy_operator_contracts::DesiredState::Running,
+            observed_state: ploy_operator_contracts::ObservedState::Running,
+        };
+        let mut runtime = TradingRuntime::default();
+        runtime
+            .submit_intent(
+                TradingIntent {
+                    intent_id: "intent-roundtrip".to_string(),
+                    deployment_id: deployment_id.to_string(),
+                    market_id: "market-roundtrip".to_string(),
+                    token_id: "token-roundtrip".to_string(),
+                    side: TradeSide::Buy,
+                    quantity: dec!(2),
+                    limit_price: Some(dec!(0.5)),
+                    purpose: IntentPurpose::Entry,
+                    created_at: Utc::now(),
+                },
+                "order-roundtrip",
+                None,
+            )
+            .expect("roundtrip intent");
+        runtime.acknowledge_order("order-roundtrip", "venue-roundtrip");
+        for (fill_id, timestamp) in [("fill-roundtrip-a", 1), ("fill-roundtrip-b", 2)] {
+            assert!(runtime.record_fill(FillRecord {
+                fill_id: fill_id.to_string(),
+                order_id: "order-roundtrip".to_string(),
+                token_id: "token-roundtrip".to_string(),
+                side: TradeSide::Buy,
+                quantity: dec!(1),
+                price: dec!(0.5),
+                fee: dec!(0.01),
+                timestamp: chrono::DateTime::from_timestamp(timestamp, 0).expect("timestamp"),
+            }));
+        }
+        serde_json::to_value(
+            super::super::build_persisted_trading_state_snapshot(
+                record,
+                runtime.snapshot(&BTreeMap::new()),
+            )
+            .expect("multi-fill canonical test snapshot"),
+        )
+        .expect("serialize multi-fill canonical test snapshot")
     }
 
     #[test]
@@ -111,38 +204,11 @@ mod tests {
         let path = temp_path("trading");
         fs::write(
             &path,
-            serde_json::json!([{
-                "deployment_id": "example.paper",
-                "runtime_mode": "paper",
-                "intents": [{
-                    "intent_id": "intent-1",
-                    "market_id": "market-1",
-                    "token_id": "token-1",
-                    "side": "buy",
-                    "quantity": "1",
-                    "limit_price": null,
-                    "purpose": "entry",
-                    "created_at": Utc::now(),
-                }],
-                "orders": [],
-                "fills": [],
-                "positions": [],
-                "pnl": {
-                    "realized_pnl": "0",
-                    "unrealized_pnl": "0",
-                    "total_fees": "0",
-                    "net_pnl": "0"
-                },
-                "risk": {
-                    "pending_intents": 0,
-                    "active_orders": 0,
-                    "open_positions": 0,
-                    "gross_exposure": "0",
-                    "reserved_order_exposure": "0",
-                    "total_gross_exposure": "0"
-                }
-            }])
-            .to_string(),
+            serde_json::to_string(&vec![persisted_snapshot(
+                "example.paper",
+                DeploymentRuntimeMode::Paper,
+            )])
+            .expect("serialize"),
         )
         .expect("write");
         let runtimes = load_trading_runtimes(&path, |id| {
@@ -178,16 +244,15 @@ mod tests {
             ),
         ] {
             let path = temp_path("trading-mode-match");
+            let snapshot_mode = match snapshot_mode {
+                "paper" => DeploymentRuntimeMode::Paper,
+                "live" => DeploymentRuntimeMode::Live,
+                _ => unreachable!(),
+            };
             fs::write(
                 &path,
-                serde_json::json!([{
-                    "deployment_id": "example.mode",
-                    "runtime_mode": snapshot_mode,
-                    "intents": [], "orders": [], "fills": [], "positions": [],
-                    "pnl": {"realized_pnl":"0","unrealized_pnl":"0","total_fees":"0","net_pnl":"0"},
-                    "risk": {"pending_intents":0,"active_orders":0,"open_positions":0,"gross_exposure":"0","reserved_order_exposure":"0","total_gross_exposure":"0"}
-                }])
-                .to_string(),
+                serde_json::to_string(&vec![persisted_snapshot("example.mode", snapshot_mode)])
+                    .expect("serialize"),
             )
             .expect("snapshot");
             let runtimes = load_trading_runtimes(&path, |_| Some(registry_mode.clone()))
@@ -195,6 +260,154 @@ mod tests {
             assert_eq!(runtimes.len(), expected);
             let _ = fs::remove_file(path);
         }
+    }
+
+    #[test]
+    fn trading_runtime_load_rejects_missing_or_tampered_envelope_digest() {
+        let mut missing_digest =
+            persisted_snapshot("example.digest-missing", DeploymentRuntimeMode::Paper);
+        missing_digest
+            .as_object_mut()
+            .expect("envelope object")
+            .remove("integrity_digest");
+        let missing_path = temp_path("trading-missing-digest");
+        fs::write(
+            &missing_path,
+            serde_json::to_string(&vec![missing_digest]).expect("serialize missing digest"),
+        )
+        .expect("write missing digest");
+        assert!(
+            load_trading_runtimes(&missing_path, |_| Some(DeploymentRuntimeMode::Paper)).is_err()
+        );
+        let _ = fs::remove_file(missing_path);
+
+        let mut tampered =
+            persisted_snapshot("example.digest-tampered", DeploymentRuntimeMode::Paper);
+        tampered["snapshot"]["deployment_id"] = serde_json::json!("unknown.owner");
+        let tampered_path = temp_path("trading-tampered-digest");
+        fs::write(
+            &tampered_path,
+            serde_json::to_string(&vec![tampered]).expect("serialize tampered digest"),
+        )
+        .expect("write tampered digest");
+        assert!(load_trading_runtimes(&tampered_path, |_| None).is_err());
+        let _ = fs::remove_file(tampered_path);
+
+        let mut tampered_mode =
+            persisted_snapshot("example.digest-mode", DeploymentRuntimeMode::Paper);
+        tampered_mode["snapshot"]["runtime_mode"] = serde_json::json!("live");
+        let mode_path = temp_path("trading-tampered-mode");
+        fs::write(
+            &mode_path,
+            serde_json::to_string(&vec![tampered_mode]).expect("serialize tampered mode"),
+        )
+        .expect("write tampered mode");
+        assert!(load_trading_runtimes(&mode_path, |_| None).is_err());
+        let _ = fs::remove_file(mode_path);
+
+        let assert_tampered_rejected = |label: &str, value: serde_json::Value| {
+            let path = temp_path(label);
+            fs::write(
+                &path,
+                serde_json::to_string(&vec![value]).expect("serialize tampered envelope"),
+            )
+            .expect("write tampered envelope");
+            assert!(
+                load_trading_runtimes(&path, |_| None).is_err(),
+                "{label} tampering must be rejected before deployment filtering"
+            );
+            let _ = fs::remove_file(path);
+        };
+
+        let mut tampered_intent = persisted_snapshot_with_multiple_fills(
+            "example.digest-intent",
+            DeploymentRuntimeMode::Paper,
+        );
+        tampered_intent["snapshot"]["intents"][0]["token_id"] = serde_json::json!("other-token");
+        assert_tampered_rejected("trading-tampered-intent", tampered_intent);
+
+        let mut tampered_fill = persisted_snapshot_with_multiple_fills(
+            "example.digest-fill",
+            DeploymentRuntimeMode::Paper,
+        );
+        tampered_fill["snapshot"]["fills"][0]["quantity"] = serde_json::json!("0.5");
+        assert_tampered_rejected("trading-tampered-fill", tampered_fill);
+
+        let mut tampered_inner_digest = persisted_snapshot_with_multiple_fills(
+            "example.digest-inner",
+            DeploymentRuntimeMode::Paper,
+        );
+        tampered_inner_digest["canonical_snapshot_digest"] = serde_json::json!("sha256:tampered");
+        assert_tampered_rejected("trading-tampered-inner-digest", tampered_inner_digest);
+
+        let mut stripped_portfolio_integrity = persisted_snapshot_with_multiple_fills(
+            "example.digest-portfolio",
+            DeploymentRuntimeMode::Paper,
+        );
+        stripped_portfolio_integrity["canonical_portfolio"]["canonical_state_digest"] =
+            serde_json::Value::Null;
+        stripped_portfolio_integrity["canonical_portfolio"]["reconciliation_exceptions"] =
+            serde_json::json!([]);
+        assert_tampered_rejected(
+            "trading-stripped-portfolio-integrity",
+            stripped_portfolio_integrity,
+        );
+
+        let mut tampered_exception = persisted_snapshot_with_multiple_fills(
+            "example.digest-exception",
+            DeploymentRuntimeMode::Paper,
+        );
+        tampered_exception["canonical_portfolio"]["reconciliation_exceptions"] =
+            serde_json::json!([{"order_id": null, "reason": "tampered", "event": null}]);
+        assert_tampered_rejected("trading-tampered-exception", tampered_exception);
+    }
+
+    #[test]
+    fn trading_runtime_load_rejects_duplicate_deployment_identity() {
+        let snapshots = vec![
+            persisted_snapshot("example.duplicate", DeploymentRuntimeMode::Paper),
+            persisted_snapshot("example.duplicate", DeploymentRuntimeMode::Paper),
+        ];
+        let path = temp_path("trading-duplicate-deployment");
+        fs::write(
+            &path,
+            serde_json::to_string(&snapshots).expect("serialize duplicates"),
+        )
+        .expect("write duplicates");
+        let error = load_trading_runtimes(&path, |_| Some(DeploymentRuntimeMode::Paper))
+            .expect_err("duplicate deployment identities must fail closed");
+        assert!(error
+            .to_string()
+            .contains("duplicate persisted trading deployment identity"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn trading_runtime_load_round_trips_serialized_multi_fill_envelope() {
+        let path = temp_path("trading-multi-fill-roundtrip");
+        fs::write(
+            &path,
+            serde_json::to_string(&vec![persisted_snapshot_with_multiple_fills(
+                "example.multi-fill",
+                DeploymentRuntimeMode::Paper,
+            )])
+            .expect("serialize multi-fill envelope"),
+        )
+        .expect("write multi-fill envelope");
+        let runtimes = load_trading_runtimes(&path, |id| {
+            (id == "example.multi-fill").then_some(DeploymentRuntimeMode::Paper)
+        })
+        .expect("multi-fill envelope remains restorable after JSON roundtrip");
+        assert_eq!(
+            runtimes
+                .get("example.multi-fill")
+                .expect("multi-fill runtime")
+                .snapshot(&BTreeMap::new())
+                .fills
+                .len(),
+            2
+        );
+        let _ = fs::remove_file(path);
     }
 
     #[test]

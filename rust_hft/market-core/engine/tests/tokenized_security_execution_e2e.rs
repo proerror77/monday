@@ -32,11 +32,11 @@ impl ExecutionClient for RecordingExecutionClient {
 
     async fn modify_order(
         &mut self,
-        _order_id: &OrderId,
+        order_id: &OrderId,
         _new_quantity: Option<Quantity>,
         _new_price: Option<Price>,
-    ) -> HftResult<()> {
-        Ok(())
+    ) -> HftResult<OrderId> {
+        Ok(order_id.clone())
     }
 
     async fn execution_stream(&self) -> HftResult<BoxStream<ExecutionEvent>> {

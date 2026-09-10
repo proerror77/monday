@@ -1,5 +1,4 @@
-use crate::replay::replay_fills;
-use ploy_trading::{FillRecord, PnlSnapshot};
+use crate::replay::{replay_fills, PnlSnapshot, ResearchFill};
 
 #[derive(Debug, Clone)]
 pub struct BacktestReport {
@@ -7,7 +6,7 @@ pub struct BacktestReport {
     pub fill_count: usize,
 }
 
-pub fn run_backtest(fills: &[FillRecord]) -> BacktestReport {
+pub fn run_backtest(fills: &[ResearchFill]) -> BacktestReport {
     BacktestReport {
         pnl: replay_fills(fills),
         fill_count: fills.len(),

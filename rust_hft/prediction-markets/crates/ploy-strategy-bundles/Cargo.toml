@@ -18,7 +18,7 @@ chrono.workspace = true
 ploy-market-contracts.workspace = true
 polymarket-tape-contract = { path = "../../../shared/polymarket-tape" }
 ploy-operator-contracts.workspace = true
-ploy-trading.workspace = true
+portfolio-core.workspace = true
 rust_decimal.workspace = true
 rust_decimal_macros.workspace = true
 serde.workspace = true

@@ -2,7 +2,7 @@
 //!
 //! [`StrategyRuntime`] is the core loop that connects a [`Feed`], a
 //! [`StrategyLogic`], and an [`Executor`] through the canonical
-//! [`ploy_trading::TradingRuntime`] lifecycle.
+//! [`portfolio_core::prediction::TradingRuntime`] lifecycle.
 //!
 //! The same `StrategyRuntime` drives backtest, dry-run, and live trading —
 //! only the trait implementations differ.
@@ -10,12 +10,14 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
-use ploy_trading::{OrderState, PnlSnapshot, RiskSnapshot, TradingIntent, TradingRuntime};
+use portfolio_core::prediction::{
+    OrderState, PnlSnapshot, RiskSnapshot, TradingIntent, TradingRuntime,
+};
 use rust_decimal::Decimal;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use ploy_trading::IntentPurpose;
+use portfolio_core::prediction::IntentPurpose;
 use rust_decimal_macros::dec;
 
 use crate::traits::{
@@ -645,7 +647,9 @@ where
         &self.trading
     }
 
-    async fn reconcile_active_fills(&mut self) -> Result<Vec<ploy_trading::FillRecord>, String> {
+    async fn reconcile_active_fills(
+        &mut self,
+    ) -> Result<Vec<portfolio_core::prediction::FillRecord>, String> {
         if self.trading.orders().active_orders() == 0 {
             return Ok(Vec::new());
         }
@@ -925,7 +929,7 @@ mod tests {
 
     use async_trait::async_trait;
     use chrono::{Duration, Utc};
-    use ploy_trading::{
+    use portfolio_core::prediction::{
         FillRecord, IntentPurpose, OrderLedger, PositionLedger, TradeSide, TradingIntent,
     };
     use rust_decimal::Decimal;
@@ -2233,7 +2237,10 @@ mod tests {
         let snapshot = runtime.trading().snapshot(&BTreeMap::new());
 
         assert_eq!(snapshot.orders.len(), 1);
-        assert_eq!(snapshot.orders[0].state, ploy_trading::OrderState::Canceled);
+        assert_eq!(
+            snapshot.orders[0].state,
+            portfolio_core::prediction::OrderState::Canceled
+        );
         assert_eq!(
             snapshot.orders[0].venue_order_id.as_deref(),
             Some("venue-order-1")
@@ -2302,7 +2309,7 @@ mod tests {
         assert_eq!(snapshot.orders.len(), 1);
         assert_eq!(
             snapshot.orders[0].state,
-            ploy_trading::OrderState::Acknowledged
+            portfolio_core::prediction::OrderState::Acknowledged
         );
         assert_eq!(snapshot.risk.active_orders, 1);
     }
@@ -2382,7 +2389,7 @@ mod tests {
             snapshot
                 .orders
                 .iter()
-                .filter(|order| order.state == ploy_trading::OrderState::Canceled)
+                .filter(|order| order.state == portfolio_core::prediction::OrderState::Canceled)
                 .count(),
             1
         );
@@ -2390,7 +2397,7 @@ mod tests {
             snapshot
                 .orders
                 .iter()
-                .filter(|order| order.state == ploy_trading::OrderState::Filled)
+                .filter(|order| order.state == portfolio_core::prediction::OrderState::Filled)
                 .count(),
             1
         );
@@ -2470,7 +2477,10 @@ mod tests {
             ["pm5d_BTCUSDT_UP_dust"]
         );
         assert_eq!(snapshot.orders.len(), 1);
-        assert_eq!(snapshot.orders[0].state, ploy_trading::OrderState::Canceled);
+        assert_eq!(
+            snapshot.orders[0].state,
+            portfolio_core::prediction::OrderState::Canceled
+        );
         assert_eq!(snapshot.fills.len(), 0);
         assert_eq!(snapshot.risk.active_orders, 0);
     }
@@ -2478,7 +2488,7 @@ mod tests {
     #[tokio::test]
     async fn restored_live_ack_order_is_managed_as_pending() {
         let now = Utc::now();
-        let mut trading = ploy_trading::TradingRuntime::default();
+        let mut trading = portfolio_core::prediction::TradingRuntime::default();
         trading
             .submit_intent(
                 TradingIntent {
@@ -2529,14 +2539,17 @@ mod tests {
         let snapshot = runtime.trading().snapshot(&BTreeMap::new());
 
         assert_eq!(snapshot.orders.len(), 1);
-        assert_eq!(snapshot.orders[0].state, ploy_trading::OrderState::Canceled);
+        assert_eq!(
+            snapshot.orders[0].state,
+            portfolio_core::prediction::OrderState::Canceled
+        );
         assert_eq!(snapshot.fills.len(), 0);
     }
 
     #[tokio::test]
     async fn restored_live_retry_order_continues_from_existing_attempt_suffix() {
         let now = Utc::now();
-        let mut trading = ploy_trading::TradingRuntime::default();
+        let mut trading = portfolio_core::prediction::TradingRuntime::default();
         trading
             .submit_intent(
                 TradingIntent {
@@ -2605,7 +2618,7 @@ mod tests {
             .orders
             .iter()
             .any(|order| order.intent_id == "pm5d_BTCUSDT_UP_retry3"
-                && order.state == ploy_trading::OrderState::Acknowledged));
+                && order.state == portfolio_core::prediction::OrderState::Acknowledged));
     }
 
     #[tokio::test]

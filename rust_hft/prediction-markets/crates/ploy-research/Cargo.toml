@@ -17,7 +17,7 @@ db = ["dep:sqlx", "dep:ploy-feed-loaders"]
 polars-export = ["dep:polars"]
 ml = ["dep:burn", "dep:burn-ndarray", "dep:burn-store", "dep:ciborium"]
 rl = ["dep:burn", "dep:burn-ndarray"]
-strategy-runtime = ["dep:ploy-strategy-bundles", "dep:ploy-trading"]
+strategy-runtime = []
 
 [dependencies]
 data = { package = "hft-data", path = "../../../data-pipelines/core" }
@@ -26,9 +26,10 @@ chrono.workspace = true
 polars = { workspace = true, optional = true }
 ploy-market-contracts.workspace = true
 ploy-market-data.workspace = true
+hft-portfolio-core = { package = "hft-portfolio-core", path = "../../../risk-control/portfolio-core" }
+hft-ports = { package = "hft-ports", path = "../../../market-core/ports" }
+hft-core = { package = "hft-core", path = "../../../market-core/core" }
 ploy-feed-loaders = { workspace = true, optional = true }
-ploy-strategy-bundles = { workspace = true, optional = true }
-ploy-trading = { workspace = true, optional = true }
 rust_decimal.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["float_roundtrip"] }

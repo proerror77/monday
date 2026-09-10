@@ -27,11 +27,12 @@ Monday's `rust_hft` runtime is the only production authority for risk, OMS,
 reconciliation, cancellation, replacement, and order execution.
 
 - Compatibility-daemon live trading is disabled in code, not only by documentation or configuration.
-- `PloyDaemon::boot` installs a gateway that rejects probe, submit, cancel, replace,
+- `PloyDaemon::boot` installs a canonical boundary that rejects probe, submit, cancel, replace,
   and fill-reconciliation operations.
-- `ploy-connectivity` contains only a fail-closed interface and deterministic test
-  fake; its private-key, CLOB SDK, account-readiness, and real order implementation
-  have been removed. Real Polymarket execution exists only in Monday's canonical Adapter.
+- `ploy-platform-runtime::canonical_execution` owns the fail-closed boundary and
+  deterministic test fake; its private-key, CLOB SDK, account-readiness, and real
+  order implementation are absent. Real Polymarket execution exists only in
+  Monday's canonical Adapter.
 - The standalone Node account-operation tools are retired. Polymarket account,
   order, cancellation, and reconciliation operations belong to `rust_hft`.
 - The standard `new-ploy-runner --features full` build does not enable the legacy
@@ -70,7 +71,8 @@ OMS, reconciliation, and approval gates.
   Rust adapters are bundled with the release
 - `apps/ployctl`: operator client
 - `apps/ploytui`: terminal operator console
-- `crates/ploy-*`: compatibility-named domain and runtime crates being migrated by capability
+- `crates/ploy-*`: compatibility-named research, strategy, and operator crates;
+  order/account truth lives in `hft-oms-core` and `hft-portfolio-core`
 - `ploy-frontend`: operator frontend
 - `contracts`: shared JSON schemas
 - `config`: retained strategy and deployment examples
@@ -83,8 +85,8 @@ Run Rust commands from this directory. The workspace is pinned to Rust `1.98.1`.
 
 ```bash
 cargo +1.98.1 metadata --locked --no-deps
-cargo +1.98.1 fmt --all -- --check
-cargo +1.98.1 test --locked -p ploy-connectivity -p ploy-daemon-host
+cargo +1.98.1 fmt -p ploy-platform-runtime -p ploy-daemon-host -- --check
+cargo +1.98.1 test --locked -p ploy-platform-runtime -p ploy-daemon-host
 cargo +1.98.1 check --locked -p new-ploy-runner --features full
 ```
 

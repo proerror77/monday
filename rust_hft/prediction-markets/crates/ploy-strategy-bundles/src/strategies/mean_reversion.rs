@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use ploy_trading::{
+use portfolio_core::prediction::{
     FillRecord, IntentPurpose, OrderLedger, PositionLedger, TradeSide, TradingIntent,
 };
 use rust_decimal::prelude::ToPrimitive;
@@ -1011,7 +1011,7 @@ impl StrategyLogic for MeanReversionStrategy {
 mod tests {
     use super::*;
     use crate::traits::MarketUpdate;
-    use ploy_trading::{OrderLedger, PositionLedger};
+    use portfolio_core::prediction::{OrderLedger, PositionLedger};
 
     fn default_config() -> DirectionalConfig {
         DirectionalConfig {
@@ -1159,7 +1159,7 @@ mod tests {
     fn quote_take_profit_emits_exit_before_settlement() {
         let mut strategy = MeanReversionStrategy::new(default_config());
         let now = Utc::now();
-        let mut positions = PositionLedger::default();
+        let positions = PositionLedger::default();
         let orders = OrderLedger::default();
 
         strategy.on_update(
@@ -1187,7 +1187,12 @@ mod tests {
             fee: Decimal::ZERO,
             timestamp: now,
         };
-        positions.apply_fill(&buy_fill);
+        let positions = crate::canonical_test_support::position_projection(
+            crate::canonical_test_support::entry_intent("up1", dec!(5)),
+            "order-1",
+            "venue-1",
+            [buy_fill.clone()],
+        );
         strategy.on_fill(&buy_fill);
 
         let decisions = strategy.on_update(
@@ -1219,7 +1224,7 @@ mod tests {
     fn early_exit_retires_event_from_reentry() {
         let mut strategy = MeanReversionStrategy::new(default_config());
         let now = Utc::now();
-        let mut positions = PositionLedger::default();
+        let positions = PositionLedger::default();
         let orders = OrderLedger::default();
 
         strategy.on_update(
@@ -1247,7 +1252,6 @@ mod tests {
             fee: Decimal::ZERO,
             timestamp: now,
         };
-        positions.apply_fill(&buy_fill);
         strategy.on_fill(&buy_fill);
 
         let sell_fill = FillRecord {
@@ -1261,6 +1265,12 @@ mod tests {
             timestamp: now + chrono::Duration::seconds(30),
         };
         strategy.on_fill(&sell_fill);
+        let positions = crate::canonical_test_support::position_projection(
+            crate::canonical_test_support::entry_intent("up1", dec!(5)),
+            "order-1",
+            "venue-1",
+            [buy_fill, sell_fill.clone()],
+        );
 
         let decisions = strategy.on_update(
             &MarketUpdate::SpotPrice {
@@ -1282,7 +1292,7 @@ mod tests {
     fn partial_exit_keeps_remaining_position_exitable() {
         let mut strategy = MeanReversionStrategy::new(default_config());
         let now = Utc::now();
-        let mut positions = PositionLedger::default();
+        let positions = PositionLedger::default();
         let orders = OrderLedger::default();
 
         strategy.on_update(
@@ -1310,7 +1320,6 @@ mod tests {
             fee: Decimal::ZERO,
             timestamp: now,
         };
-        positions.apply_fill(&buy_fill);
         strategy.on_fill(&buy_fill);
 
         let partial_exit_fill = FillRecord {
@@ -1323,7 +1332,12 @@ mod tests {
             fee: Decimal::ZERO,
             timestamp: now + chrono::Duration::seconds(30),
         };
-        positions.apply_fill(&partial_exit_fill);
+        let positions = crate::canonical_test_support::position_projection(
+            crate::canonical_test_support::entry_intent("up1", dec!(5)),
+            "order-1",
+            "venue-1",
+            [buy_fill, partial_exit_fill.clone()],
+        );
         strategy.on_fill(&partial_exit_fill);
 
         let decisions = strategy.on_update(

@@ -12,7 +12,8 @@ single bot script. The current canonical runtime path is:
 - `apps/new-ployd`: daemon and HTTP control-plane surface
 - `apps/ployctl`: operator client for system, trading, and deployment control
 - `apps/new-ploy-runner`: strategy runner using unified strategy configs
-- `crates/ploy-trading`: canonical trading lifecycle
+- `rust_hft/risk-control/oms-core` and `rust_hft/risk-control/portfolio-core`:
+  canonical order/account lifecycle and prediction projections
 - `crates/ploy-strategy-bundles`: signal-to-intent strategy logic
 - `crates/ploy-strategy-runtime`: strategy dispatch and runtime ownership
 - `crates/ploy-research`: replay, factor research, backtest, and evidence

@@ -16,18 +16,19 @@ use ploy_operator_contracts::{
     SystemStatus, TradingSnapshotEvent,
 };
 use ploy_platform_runtime::runtime_support::IntentAdmissionSource;
-use ploy_trading::{TradeSide, TradingIntent};
+use portfolio_core::prediction::{TradeSide, TradingIntent};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 use sha2::Sha256;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::thread;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -39,12 +40,16 @@ pub struct AppState {
     pub events: Arc<EventBroker>,
 }
 
+async fn lock_daemon(state: &Arc<AppState>) -> Result<MutexGuard<'_, PloyDaemon>, ()> {
+    Ok(state.daemon.lock().await)
+}
+
 const ADMIN_SESSION_COOKIE_NAME: &str = "ploy_admin_session";
 const AUDIT_LOG_TAIL_LIMIT: usize = 200;
 const MAX_HTTP_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_JSONL_TAIL_BYTES: usize = 1024 * 1024;
 type HmacSha256 = Hmac<Sha256>;
-static REQUEST_RATE_LIMITER: OnceLock<Mutex<RateLimiter>> = OnceLock::new();
+static REQUEST_RATE_LIMITER: OnceLock<StdMutex<RateLimiter>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthLevel {
@@ -198,38 +203,35 @@ fn query_param(raw_path: &str, key: &str) -> Option<String> {
     None
 }
 
-fn build_strategy_report_html(state: &Arc<AppState>, since: Option<&str>) -> (u16, String) {
-    let host_root = match state.daemon.lock() {
-        Ok(daemon) => host_root_from_runtime_root(&daemon.config.runtime_root),
-        Err(_) => return html_error(503, "daemon lock poisoned"),
+async fn build_strategy_report_html(state: &Arc<AppState>, since: Option<&str>) -> (u16, String) {
+    let host_root = {
+        let daemon = state.daemon.lock().await;
+        host_root_from_runtime_root(&daemon.config.runtime_root)
     };
 
-    match generate_strategy_report_html(&host_root, since) {
+    match generate_strategy_report_html(&host_root, since).await {
         Ok(body) => (200, body),
         Err(err) => html_error(500, &err),
     }
 }
 
-fn build_market_data_health_json(state: &Arc<AppState>) -> (u16, String) {
-    match state.daemon.lock() {
-        Ok(_) => {}
-        Err(_) => return json_error(503, "daemon_lock_poisoned", None),
-    }
+async fn build_market_data_health_json(state: &Arc<AppState>) -> (u16, String) {
+    let _daemon = state.daemon.lock().await;
 
     report_json_response(
-        generate_market_data_health_json(),
+        generate_market_data_health_json().await,
         "market_data_health_unavailable",
     )
 }
 
-fn build_dry_run_summary_json(state: &Arc<AppState>) -> (u16, String) {
-    let host_root = match state.daemon.lock() {
-        Ok(daemon) => host_root_from_runtime_root(&daemon.config.runtime_root),
-        Err(_) => return json_error(503, "daemon_lock_poisoned", None),
+async fn build_dry_run_summary_json(state: &Arc<AppState>) -> (u16, String) {
+    let host_root = {
+        let daemon = state.daemon.lock().await;
+        host_root_from_runtime_root(&daemon.config.runtime_root)
     };
 
     report_json_response(
-        generate_dry_run_summary_json(&host_root),
+        generate_dry_run_summary_json(&host_root).await,
         "dry_run_summary_unavailable",
     )
 }
@@ -348,7 +350,7 @@ pub fn handle_api_request(
 
             match PloyDaemon::boot(config) {
                 Ok(mut daemon) => {
-                    let response = daemon.submit_intent_idempotent(
+                    let response = daemon.submit_paper_intent_idempotent(
                         TradingIntent {
                             intent_id: request
                                 .idempotency_key
@@ -381,28 +383,26 @@ pub fn handle_api_request(
     }
 }
 
-pub fn spawn_server(state: Arc<AppState>) -> io::Result<thread::JoinHandle<()>> {
-    let listen_addr = state
-        .daemon
-        .lock()
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "daemon lock poisoned"))?
-        .config
-        .listen_addr
-        .clone();
-    let listener = TcpListener::bind(&listen_addr)?;
-    Ok(thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            let state = state.clone();
-            thread::spawn(move || {
-                let _ = handle_connection(stream, &state);
+pub async fn spawn_server(state: Arc<AppState>) -> io::Result<tokio::task::JoinHandle<()>> {
+    let listen_addr = state.daemon.lock().await.config.listen_addr.clone();
+    let listener = TcpListener::bind(&listen_addr).await?;
+    Ok(tokio::spawn(async move {
+        loop {
+            let Ok((stream, _peer)) = listener.accept().await else {
+                return;
+            };
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                let mut stream = stream;
+                let _ = handle_connection(&mut stream, &state).await;
             });
         }
     }))
 }
 
-fn handle_connection(mut stream: TcpStream, state: &Arc<AppState>) -> io::Result<()> {
+async fn handle_connection(stream: &mut TcpStream, state: &Arc<AppState>) -> io::Result<()> {
     loop {
-        let request = read_http_request(&mut stream)?;
+        let request = read_http_request(stream).await?;
         if request.is_empty() {
             return Ok(());
         }
@@ -420,9 +420,9 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<AppState>) -> io::Result
         let peer_addr = stream.peer_addr().ok().map(|addr| addr.to_string());
         let client_addr = Some(client_ip(peer_addr.as_deref(), &request));
         let (configured_token, operator_token, worker_token, sidecar_token, cookie_secret) =
-            match configured_auth(state) {
+            match configured_auth(state).await {
                 Ok(auth) => auth,
-                Err(response) => return write_json_response(stream, response),
+                Err(response) => return write_json_response(stream, response).await,
             };
         let auth_level = request_auth_level(
             &request,
@@ -446,7 +446,7 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<AppState>) -> io::Result
         );
         let required_access = required_access(method, path);
         if let Some(response) =
-            rate_limit_response(method, path, client_addr.as_deref(), auth_level, state)
+            rate_limit_response(method, path, client_addr.as_deref(), auth_level, state).await
         {
             audit_request(
                 state,
@@ -458,8 +458,9 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<AppState>) -> io::Result
                 response.0,
                 "rate_limited",
                 response_message(&response.1),
-            );
-            return write_json_response(stream, response);
+            )
+            .await;
+            return write_json_response(stream, response).await;
         }
         if method == "GET" && path == "/api/events/stream" {
             if !access_allowed(
@@ -487,8 +488,9 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<AppState>) -> io::Result
                     response.0,
                     "denied",
                     response_message(&response.1),
-                );
-                return write_json_response(stream, response);
+                )
+                .await;
+                return write_json_response(stream, response).await;
             }
             audit_request(
                 state,
@@ -500,8 +502,9 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<AppState>) -> io::Result
                 200,
                 "allowed",
                 None,
-            );
-            return handle_event_stream(stream, state);
+            )
+            .await;
+            return handle_event_stream(stream, state).await;
         }
         if method == "GET" && path == "/reports/strategy" {
             if !access_allowed(
@@ -529,12 +532,13 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<AppState>) -> io::Result
                     response.0,
                     "denied",
                     response_message(&response.1),
-                );
-                return write_json_response(stream, response);
+                )
+                .await;
+                return write_json_response(stream, response).await;
             }
 
             let response =
-                build_strategy_report_html(state, query_param(raw_path, "since").as_deref());
+                build_strategy_report_html(state, query_param(raw_path, "since").as_deref()).await;
             audit_request(
                 state,
                 method,
@@ -553,8 +557,9 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<AppState>) -> io::Result
                 } else {
                     Some("strategy report generation failed".to_string())
                 },
-            );
-            return write_html_response(stream, response);
+            )
+            .await;
+            return write_html_response(stream, response).await;
         }
         let body = request
             .split_once("\r\n\r\n")
@@ -570,7 +575,8 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<AppState>) -> io::Result
             worker_token.is_some(),
             sidecar_token.is_some(),
             state,
-        );
+        )
+        .await;
         let headers = response_headers(
             method,
             path,
@@ -590,9 +596,9 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<AppState>) -> io::Result
         let message = response_message(&response.1);
         if method == "POST" && path.ends_with("/intents") {
             let result = if keep_alive {
-                write_json_response_keep_alive_with_headers(stream.try_clone()?, response, &headers)
+                write_json_response_keep_alive_with_headers(stream, response, &headers).await
             } else {
-                write_json_response_with_headers(stream.try_clone()?, response, &headers)
+                write_json_response_with_headers(stream, response, &headers).await
             };
             audit_request(
                 state,
@@ -604,7 +610,8 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<AppState>) -> io::Result
                 status_code,
                 outcome,
                 message,
-            );
+            )
+            .await;
             result?;
             if keep_alive {
                 continue;
@@ -621,22 +628,26 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<AppState>) -> io::Result
             status_code,
             outcome,
             message,
-        );
+        )
+        .await;
         if keep_alive {
-            write_json_response_keep_alive_with_headers(stream.try_clone()?, response, &headers)?;
+            write_json_response_keep_alive_with_headers(stream, response, &headers).await?;
             continue;
         }
-        return write_json_response_with_headers(stream, response, &headers);
+        return write_json_response_with_headers(stream, response, &headers).await;
     }
 }
 
-fn read_http_request(stream: &mut TcpStream) -> io::Result<String> {
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+async fn read_http_request(stream: &mut TcpStream) -> io::Result<String> {
     let mut request = Vec::new();
     let mut buffer = [0_u8; 4096];
 
     loop {
-        let bytes = stream.read(&mut buffer)?;
+        let bytes = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buffer))
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "HTTP request read timed out")
+            })??;
         if bytes == 0 {
             break;
         }
@@ -691,25 +702,25 @@ fn content_length(headers: &[u8]) -> io::Result<usize> {
     Ok(0)
 }
 
-fn write_json_response(stream: TcpStream, response: (u16, String)) -> io::Result<()> {
-    write_json_response_with_headers(stream, response, &[])
+async fn write_json_response(stream: &mut TcpStream, response: (u16, String)) -> io::Result<()> {
+    write_json_response_with_headers(stream, response, &[]).await
 }
 
-fn write_html_response(stream: TcpStream, response: (u16, String)) -> io::Result<()> {
-    write_response_with_headers(stream, response, "text/html; charset=utf-8", &[])
+async fn write_html_response(stream: &mut TcpStream, response: (u16, String)) -> io::Result<()> {
+    write_response_with_headers(stream, response, "text/html; charset=utf-8", &[]).await
 }
 
-fn write_response_with_headers(
-    stream: TcpStream,
+async fn write_response_with_headers(
+    stream: &mut TcpStream,
     response: (u16, String),
     content_type: &str,
     headers: &[(String, String)],
 ) -> io::Result<()> {
-    write_response_with_headers_and_connection(stream, response, content_type, headers, false)
+    write_response_with_headers_and_connection(stream, response, content_type, headers, false).await
 }
 
-fn write_response_with_headers_and_connection(
-    mut stream: TcpStream,
+async fn write_response_with_headers_and_connection(
+    stream: &mut TcpStream,
     response: (u16, String),
     content_type: &str,
     headers: &[(String, String)],
@@ -720,8 +731,7 @@ fn write_response_with_headers_and_connection(
         .iter()
         .map(|(name, value)| format!("{name}: {value}\r\n"))
         .collect::<String>();
-    write!(
-        stream,
+    let response = format!(
         "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: {}\r\nConnection: {}\r\n{}\
          \r\n{}",
         status_code,
@@ -731,26 +741,28 @@ fn write_response_with_headers_and_connection(
         if keep_alive { "keep-alive" } else { "close" },
         extra_headers,
         body
-    )
+    );
+    stream.write_all(response.as_bytes()).await
 }
 
-fn write_json_response_with_headers(
-    stream: TcpStream,
+async fn write_json_response_with_headers(
+    stream: &mut TcpStream,
     response: (u16, String),
     headers: &[(String, String)],
 ) -> io::Result<()> {
-    write_response_with_headers(stream, response, "application/json", headers)
+    write_response_with_headers(stream, response, "application/json", headers).await
 }
 
-fn write_json_response_keep_alive_with_headers(
-    stream: TcpStream,
+async fn write_json_response_keep_alive_with_headers(
+    stream: &mut TcpStream,
     response: (u16, String),
     headers: &[(String, String)],
 ) -> io::Result<()> {
     write_response_with_headers_and_connection(stream, response, "application/json", headers, true)
+        .await
 }
 
-fn configured_auth(
+async fn configured_auth(
     state: &Arc<AppState>,
 ) -> Result<
     (
@@ -762,34 +774,30 @@ fn configured_auth(
     ),
     (u16, String),
 > {
-    state
+    let daemon = state.daemon.lock().await;
+    Ok((
+        daemon.config.admin_token.clone(),
+        daemon.config.operator_token.clone(),
+        daemon.config.worker_token.clone(),
+        daemon.config.sidecar_token.clone(),
+        daemon.config.auth_cookie_secret.clone(),
+    ))
+}
+
+fn request_rate_limiter() -> &'static StdMutex<RateLimiter> {
+    REQUEST_RATE_LIMITER.get_or_init(|| StdMutex::new(RateLimiter::default()))
+}
+
+async fn request_rate_limit_per_minute(state: &Arc<AppState>) -> Result<u32, (u16, String)> {
+    Ok(state
         .daemon
         .lock()
-        .map(|daemon| {
-            (
-                daemon.config.admin_token.clone(),
-                daemon.config.operator_token.clone(),
-                daemon.config.worker_token.clone(),
-                daemon.config.sidecar_token.clone(),
-                daemon.config.auth_cookie_secret.clone(),
-            )
-        })
-        .map_err(|_| json_error(503, "daemon_lock_poisoned", None))
+        .await
+        .config
+        .request_rate_limit_per_minute)
 }
 
-fn request_rate_limiter() -> &'static Mutex<RateLimiter> {
-    REQUEST_RATE_LIMITER.get_or_init(|| Mutex::new(RateLimiter::default()))
-}
-
-fn request_rate_limit_per_minute(state: &Arc<AppState>) -> Result<u32, (u16, String)> {
-    state
-        .daemon
-        .lock()
-        .map(|daemon| daemon.config.request_rate_limit_per_minute)
-        .map_err(|_| json_error(503, "daemon_lock_poisoned", None))
-}
-
-fn rate_limit_response(
+async fn rate_limit_response(
     method: &str,
     path: &str,
     client_addr: Option<&str>,
@@ -799,7 +807,7 @@ fn rate_limit_response(
     if path == "/health" {
         return None;
     }
-    let limit = match request_rate_limit_per_minute(state) {
+    let limit = match request_rate_limit_per_minute(state).await {
         Ok(limit) => limit,
         Err(response) => return Some(response),
     };
@@ -912,15 +920,11 @@ fn response_message(body: &str) -> Option<String> {
         .and_then(|error| error.message.or(Some(error.error)))
 }
 
-fn audit_log_path(state: &Arc<AppState>) -> Result<PathBuf, (u16, String)> {
-    state
-        .daemon
-        .lock()
-        .map(|daemon| daemon.config.audit_log_file.clone())
-        .map_err(|_| json_error(503, "daemon_lock_poisoned", None))
+async fn audit_log_path(state: &Arc<AppState>) -> Result<PathBuf, (u16, String)> {
+    Ok(state.daemon.lock().await.config.audit_log_file.clone())
 }
 
-fn audit_request(
+async fn audit_request(
     state: &Arc<AppState>,
     method: &str,
     path: &str,
@@ -935,7 +939,7 @@ fn audit_request(
         return;
     }
 
-    let Ok(audit_log_file) = audit_log_path(state) else {
+    let Ok(audit_log_file) = audit_log_path(state).await else {
         return;
     };
     let entry = AuditLogEntry {
@@ -1062,12 +1066,8 @@ fn read_recent_audit_entries(path: &PathBuf, limit: usize) -> io::Result<Vec<Aud
     Ok(entries)
 }
 
-fn agent_runs_path(state: &Arc<AppState>) -> Result<PathBuf, (u16, String)> {
-    state
-        .daemon
-        .lock()
-        .map(|daemon| daemon.config.agent_runs_file.clone())
-        .map_err(|_| json_error(503, "daemon_lock_poisoned", None))
+async fn agent_runs_path(state: &Arc<AppState>) -> Result<PathBuf, (u16, String)> {
+    Ok(state.daemon.lock().await.config.agent_runs_file.clone())
 }
 
 fn read_agent_runs(path: &PathBuf) -> io::Result<Vec<AgentRunRecord>> {
@@ -1163,25 +1163,31 @@ fn read_harness_memory(agent_runs_path: &PathBuf) -> io::Result<serde_json::Valu
     }))
 }
 
-fn queue_agent_run_request(
+async fn queue_agent_run_request(
     state: &Arc<AppState>,
     request: AgentRunCreateRequest,
 ) -> io::Result<AgentRunCreateResponse> {
     let run_id = format!("agent-{}", Uuid::new_v4());
     let created_at = Utc::now();
     let request_snapshot = request.clone();
-    let agent_runs_file = agent_runs_path(state).map_err(|response| {
+    let agent_runs_file = agent_runs_path(state).await.map_err(|response| {
         io::Error::new(
             io::ErrorKind::Other,
             response_message(&response.1).unwrap_or(response.1),
         )
     })?;
     let request_file = agent_run_requests_path(&agent_runs_file);
-    let platform_status = state
-        .daemon
-        .lock()
-        .ok()
-        .map(|daemon| daemon.control_plane.system.status().status.to_string());
+    let platform_status = Some(
+        state
+            .daemon
+            .lock()
+            .await
+            .control_plane
+            .system
+            .status()
+            .status
+            .to_string(),
+    );
 
     let queued = AgentRunRecord {
         run_id: run_id.clone(),
@@ -1236,7 +1242,7 @@ fn queue_agent_run_request(
 
 fn build_platform_diagnostics_report(
     daemon: &PloyDaemon,
-    state: &Arc<AppState>,
+    audit_log_file: &Path,
 ) -> io::Result<PlatformDiagnosticsReport> {
     let system = daemon.control_plane.system.status();
     let metrics = daemon.platform_metrics();
@@ -1244,10 +1250,8 @@ fn build_platform_diagnostics_report(
     let deployments = daemon.control_plane.deployments.summaries();
     let trading = daemon.trading_state();
     let oversight = compute_oversight_report(&system, &deployments, &trading);
-    let audit_entries = audit_log_path(state)
-        .ok()
-        .and_then(|path| read_recent_audit_entries(&path, 4).ok())
-        .unwrap_or_default();
+    let audit_entries =
+        read_recent_audit_entries(&audit_log_file.to_path_buf(), 4).unwrap_or_default();
     let event_entries = recent_snapshot_evidence(daemon, 8, None);
     let mut seen = BTreeSet::new();
     let mut findings = Vec::new();
@@ -1371,7 +1375,7 @@ fn build_platform_diagnostics_report(
 
 fn build_deployment_diagnostics_report(
     daemon: &PloyDaemon,
-    state: &Arc<AppState>,
+    audit_log_file: &Path,
     deployment_id: &str,
 ) -> io::Result<DeploymentDiagnosticsReport> {
     let system = daemon.control_plane.system.status();
@@ -1393,10 +1397,8 @@ fn build_deployment_diagnostics_report(
             )
         })?;
     let oversight = compute_oversight_report(&system, &deployments, &trading);
-    let audit_entries = audit_log_path(state)
-        .ok()
-        .and_then(|path| read_recent_audit_entries(&path, 8).ok())
-        .unwrap_or_default();
+    let audit_entries =
+        read_recent_audit_entries(&audit_log_file.to_path_buf(), 8).unwrap_or_default();
     let mut recent_evidence = vec![DiagnosticsEvidence {
         source: "current_snapshot".to_string(),
         label: "trading_state".to_string(),
@@ -1898,7 +1900,7 @@ fn intent_admission_source(auth_level: AuthLevel) -> Option<IntentAdmissionSourc
     }
 }
 
-fn handle_authenticated_runtime_request(
+async fn handle_authenticated_runtime_request(
     method: &str,
     path: &str,
     body: Option<&str>,
@@ -1938,26 +1940,22 @@ fn handle_authenticated_runtime_request(
                 return json_error(503, "admin_auth_not_configured", None);
             }
 
-            match state.daemon.lock() {
-                Ok(daemon) => match daemon
-                    .config
-                    .admin_token
-                    .as_ref()
-                    .map(ExposeSecret::expose_secret)
-                {
-                    Some(expected) if provided.as_deref() == Some(expected) => {
-                        (200, serde_json::json!({ "success": true }).to_string())
-                    }
-                    Some(_) => json_error(
-                        401,
-                        "invalid_credentials",
-                        Some(
-                            "admin token did not match configured control-plane token".to_string(),
-                        ),
-                    ),
-                    None => json_error(503, "admin_auth_not_configured", None),
-                },
-                Err(_) => json_error(503, "daemon_lock_poisoned", None),
+            let daemon = state.daemon.lock().await;
+            match daemon
+                .config
+                .admin_token
+                .as_ref()
+                .map(ExposeSecret::expose_secret)
+            {
+                Some(expected) if provided.as_deref() == Some(expected) => {
+                    (200, serde_json::json!({ "success": true }).to_string())
+                }
+                Some(_) => json_error(
+                    401,
+                    "invalid_credentials",
+                    Some("admin token did not match configured control-plane token".to_string()),
+                ),
+                None => json_error(503, "admin_auth_not_configured", None),
             }
         }
         ("POST", "/auth/logout") => (200, serde_json::json!({ "success": true }).to_string()),
@@ -1978,17 +1976,21 @@ fn handle_authenticated_runtime_request(
                 sidecar_configured,
             )
         }
-        _ => handle_runtime_request_from(
-            method,
-            path,
-            body,
-            intent_admission_source(auth_level),
-            state,
-        ),
+        _ => {
+            handle_runtime_request_from(
+                method,
+                path,
+                body,
+                intent_admission_source(auth_level),
+                state,
+            )
+            .await
+        }
     }
 }
 
-fn handle_runtime_request(
+#[cfg(test)]
+async fn handle_runtime_request(
     method: &str,
     path: &str,
     body: Option<&str>,
@@ -2001,9 +2003,10 @@ fn handle_runtime_request(
         Some(IntentAdmissionSource::AuthenticatedOperator),
         state,
     )
+    .await
 }
 
-fn handle_runtime_request_from(
+async fn handle_runtime_request_from(
     method: &str,
     path: &str,
     body: Option<&str>,
@@ -2011,7 +2014,7 @@ fn handle_runtime_request_from(
     state: &Arc<AppState>,
 ) -> (u16, String) {
     match (method, path) {
-        ("GET", "/health") | ("GET", "/api/system/status") => match state.daemon.lock() {
+        ("GET", "/health") | ("GET", "/api/system/status") => match lock_daemon(state).await {
             Ok(daemon) => (
                 200,
                 serde_json::to_string(&daemon.control_plane.system.status())
@@ -2019,7 +2022,7 @@ fn handle_runtime_request_from(
             ),
             Err(_) => json_error(503, "daemon_lock_poisoned", None),
         },
-        ("GET", "/api/system/metrics") => match state.daemon.lock() {
+        ("GET", "/api/system/metrics") => match lock_daemon(state).await {
             Ok(daemon) => (
                 200,
                 serde_json::to_string(&daemon.platform_metrics())
@@ -2027,16 +2030,16 @@ fn handle_runtime_request_from(
             ),
             Err(_) => json_error(503, "daemon_lock_poisoned", None),
         },
-        ("GET", "/api/system/alerts") => match state.daemon.lock() {
+        ("GET", "/api/system/alerts") => match lock_daemon(state).await {
             Ok(daemon) => (
                 200,
                 serde_json::to_string(&daemon.active_alerts()).unwrap_or_else(|_| "[]".to_string()),
             ),
             Err(_) => json_error(503, "daemon_lock_poisoned", None),
         },
-        ("GET", "/api/market-data/health") => build_market_data_health_json(state),
-        ("GET", "/api/reports/dry-run") => build_dry_run_summary_json(state),
-        ("GET", "/api/deployments") => match state.daemon.lock() {
+        ("GET", "/api/market-data/health") => build_market_data_health_json(state).await,
+        ("GET", "/api/reports/dry-run") => build_dry_run_summary_json(state).await,
+        ("GET", "/api/deployments") => match lock_daemon(state).await {
             Ok(daemon) => (
                 200,
                 serde_json::to_string(&daemon.control_plane.deployments.summaries())
@@ -2044,7 +2047,7 @@ fn handle_runtime_request_from(
             ),
             Err(_) => json_error(503, "daemon_lock_poisoned", None),
         },
-        ("GET", "/api/trading/state") => match state.daemon.lock() {
+        ("GET", "/api/trading/state") => match lock_daemon(state).await {
             Ok(daemon) => (
                 200,
                 serde_json::to_string(&daemon.trading_state()).unwrap_or_else(|_| "[]".to_string()),
@@ -2052,6 +2055,7 @@ fn handle_runtime_request_from(
             Err(_) => json_error(503, "daemon_lock_poisoned", None),
         },
         ("GET", "/api/audit/logs") => match audit_log_path(state)
+            .await
             .map_err(|response| response)
             .and_then(|path| {
                 read_recent_audit_entries(&path, AUDIT_LOG_TAIL_LIMIT)
@@ -2063,17 +2067,21 @@ fn handle_runtime_request_from(
             ),
             Err(response) => response,
         },
-        ("GET", "/api/system/diagnose") => match state.daemon.lock() {
-            Ok(daemon) => match build_platform_diagnostics_report(&daemon, state) {
-                Ok(report) => (
-                    200,
-                    serde_json::to_string(&report).unwrap_or_else(|_| "{}".to_string()),
-                ),
-                Err(err) => json_error(500, "diagnostics_unavailable", Some(err.to_string())),
-            },
+        ("GET", "/api/system/diagnose") => match lock_daemon(state).await {
+            Ok(daemon) => {
+                let audit_path = daemon.config.audit_log_file.clone();
+                match build_platform_diagnostics_report(&daemon, &audit_path) {
+                    Ok(report) => (
+                        200,
+                        serde_json::to_string(&report).unwrap_or_else(|_| "{}".to_string()),
+                    ),
+                    Err(err) => json_error(500, "diagnostics_unavailable", Some(err.to_string())),
+                }
+            }
             Err(_) => json_error(503, "daemon_lock_poisoned", None),
         },
         ("GET", "/api/agent/runs") => match agent_runs_path(state)
+            .await
             .map_err(|response| response)
             .and_then(|path| {
                 read_agent_runs(&path)
@@ -2086,6 +2094,7 @@ fn handle_runtime_request_from(
             Err(response) => response,
         },
         ("GET", "/api/agent/harness-memory") => match agent_runs_path(state)
+            .await
             .map_err(|response| response)
             .and_then(|path| {
                 read_harness_memory(&path).map_err(|err| {
@@ -2109,7 +2118,7 @@ fn handle_runtime_request_from(
             if let Err(reason) = validate_agent_run_create_request(&request) {
                 return json_error(400, "agent_run_limits_exceeded", Some(reason));
             }
-            match queue_agent_run_request(state, request) {
+            match queue_agent_run_request(state, request).await {
                 Ok(response) => (
                     202,
                     serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string()),
@@ -2120,6 +2129,7 @@ fn handle_runtime_request_from(
         ("GET", _) if path.starts_with("/api/agent/runs/") => {
             let run_id = path.trim_start_matches("/api/agent/runs/");
             match agent_runs_path(state)
+                .await
                 .map_err(|response| response)
                 .and_then(|path| {
                     read_agent_run(&path, run_id).map_err(|err| {
@@ -2138,7 +2148,7 @@ fn handle_runtime_request_from(
                 Err(response) => response,
             }
         }
-        ("GET", "/api/proposals") => match state.daemon.lock() {
+        ("GET", "/api/proposals") => match lock_daemon(state).await {
             Ok(daemon) => (
                 200,
                 serde_json::to_string(&daemon.proposals()).unwrap_or_else(|_| "[]".to_string()),
@@ -2147,7 +2157,7 @@ fn handle_runtime_request_from(
         },
         ("GET", _) if path.starts_with("/api/proposals/") => {
             let proposal_id = path.trim_start_matches("/api/proposals/");
-            match state.daemon.lock() {
+            match lock_daemon(state).await {
                 Ok(daemon) => match daemon
                     .proposals()
                     .into_iter()
@@ -2174,7 +2184,7 @@ fn handle_runtime_request_from(
                 Ok(request) => request,
                 Err(err) => return json_error(400, "invalid_json", Some(err.to_string())),
             };
-            match state.daemon.lock() {
+            match lock_daemon(state).await {
                 Ok(mut daemon) => match daemon.create_proposal(request).and_then(|proposal| {
                     daemon.write_runtime_snapshots()?;
                     publish_snapshot_events(&daemon, &state.events);
@@ -2197,7 +2207,7 @@ fn handle_runtime_request_from(
         }
         ("GET", _) if path.starts_with("/api/deployments/") && !path.ends_with("/control") => {
             let deployment_id = path.trim_start_matches("/api/deployments/");
-            match state.daemon.lock() {
+            match lock_daemon(state).await {
                 Ok(daemon) => match daemon.inspect_deployment(deployment_id) {
                     Some(record) => (
                         200,
@@ -2214,9 +2224,10 @@ fn handle_runtime_request_from(
         }
         ("GET", _) if path.starts_with("/api/trading/diagnose/") => {
             let deployment_id = path.trim_start_matches("/api/trading/diagnose/");
-            match state.daemon.lock() {
+            match lock_daemon(state).await {
                 Ok(daemon) => {
-                    match build_deployment_diagnostics_report(&daemon, state, deployment_id) {
+                    let audit_path = daemon.config.audit_log_file.clone();
+                    match build_deployment_diagnostics_report(&daemon, &audit_path, deployment_id) {
                         Ok(report) => (
                             200,
                             serde_json::to_string(&report).unwrap_or_else(|_| "{}".to_string()),
@@ -2251,7 +2262,7 @@ fn handle_runtime_request_from(
                     )),
                 );
             }
-            match state.daemon.lock() {
+            match lock_daemon(state).await {
                 Ok(mut daemon) => {
                     match daemon.apply_deployment(request).and_then(|record| {
                         daemon.write_runtime_snapshots()?;
@@ -2283,7 +2294,7 @@ fn handle_runtime_request_from(
                 Ok(request) => request,
                 Err(err) => return json_error(400, "invalid_json", Some(err.to_string())),
             };
-            match state.daemon.lock() {
+            match lock_daemon(state).await {
                 Ok(mut daemon) => {
                     match daemon
                         .control_deployment(deployment_id, request)
@@ -2325,15 +2336,14 @@ fn handle_runtime_request_from(
                 return json_error(404, "not_found", None);
             }
 
-            match state.daemon.lock() {
+            match lock_daemon(state).await {
                 Ok(mut daemon) => {
-                    match daemon
-                        .cancel_order(deployment_id, order_id)
-                        .and_then(|response| {
-                            daemon.write_runtime_snapshots()?;
-                            publish_snapshot_events(&daemon, &state.events);
-                            Ok(response)
-                        }) {
+                    let result = daemon.cancel_order(deployment_id, order_id).await;
+                    match result.and_then(|response| {
+                        daemon.write_runtime_snapshots()?;
+                        publish_snapshot_events(&daemon, &state.events);
+                        Ok(response)
+                    }) {
                         Ok(response) => (
                             200,
                             serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string()),
@@ -2363,15 +2373,14 @@ fn handle_runtime_request_from(
                 Err(err) => return json_error(400, "invalid_json", Some(err.to_string())),
             };
 
-            match state.daemon.lock() {
+            match lock_daemon(state).await {
                 Ok(mut daemon) => {
-                    match daemon
-                        .replace_order(deployment_id, order_id, request)
-                        .and_then(|response| {
-                            daemon.write_runtime_snapshots()?;
-                            publish_snapshot_events(&daemon, &state.events);
-                            Ok(response)
-                        }) {
+                    let result = daemon.replace_order(deployment_id, order_id, request).await;
+                    match result.and_then(|response| {
+                        daemon.write_runtime_snapshots()?;
+                        publish_snapshot_events(&daemon, &state.events);
+                        Ok(response)
+                    }) {
                         Ok(response) => (
                             200,
                             serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string()),
@@ -2408,7 +2417,7 @@ fn handle_runtime_request_from(
                 );
             };
 
-            let prepared = match state.daemon.lock() {
+            let prepared = match lock_daemon(state).await {
                 Ok(mut daemon) => daemon.prepare_intent_idempotent_from(
                     TradingIntent {
                         intent_id: request
@@ -2433,8 +2442,8 @@ fn handle_runtime_request_from(
             let response = match prepared {
                 Ok(PreparedIntentSubmission::Complete(response)) => Ok(response),
                 Ok(PreparedIntentSubmission::Live(prepared)) => {
-                    let outcome = prepared.execute();
-                    match state.daemon.lock() {
+                    let outcome = prepared.execute().await;
+                    match lock_daemon(state).await {
                         Ok(mut daemon) => daemon.finish_prepared_live_intent(prepared, outcome),
                         Err(_) => return json_error(503, "daemon_lock_poisoned", None),
                     }
@@ -2463,7 +2472,7 @@ fn handle_runtime_request_from(
                 Ok(None) => ProposalDecisionRequest::default(),
                 Err(response) => return response,
             };
-            match state.daemon.lock() {
+            match lock_daemon(state).await {
                 Ok(mut daemon) => {
                     match daemon
                         .approve_proposal(proposal_id, request)
@@ -2509,7 +2518,7 @@ fn handle_runtime_request_from(
                 Ok(None) => ProposalDecisionRequest::default(),
                 Err(response) => return response,
             };
-            match state.daemon.lock() {
+            match lock_daemon(state).await {
                 Ok(mut daemon) => {
                     match daemon
                         .reject_proposal(proposal_id, request)
@@ -2553,13 +2562,13 @@ fn trade_side_from_wire(side: &str) -> Result<TradeSide, ControlPlaneErrorRespon
     }
 }
 
-fn intent_purpose_from_wire(purpose: IntentPurpose) -> ploy_trading::IntentPurpose {
+fn intent_purpose_from_wire(purpose: IntentPurpose) -> portfolio_core::prediction::IntentPurpose {
     match purpose {
-        IntentPurpose::Entry => ploy_trading::IntentPurpose::Entry,
-        IntentPurpose::Exit => ploy_trading::IntentPurpose::Exit,
-        IntentPurpose::Reduce => ploy_trading::IntentPurpose::Reduce,
-        IntentPurpose::Hedge => ploy_trading::IntentPurpose::Hedge,
-        IntentPurpose::Cancel => ploy_trading::IntentPurpose::Cancel,
+        IntentPurpose::Entry => portfolio_core::prediction::IntentPurpose::Entry,
+        IntentPurpose::Exit => portfolio_core::prediction::IntentPurpose::Exit,
+        IntentPurpose::Reduce => portfolio_core::prediction::IntentPurpose::Reduce,
+        IntentPurpose::Hedge => portfolio_core::prediction::IntentPurpose::Hedge,
+        IntentPurpose::Cancel => portfolio_core::prediction::IntentPurpose::Cancel,
     }
 }
 
@@ -2593,36 +2602,47 @@ pub fn publish_snapshot_events(daemon: &PloyDaemon, broker: &EventBroker) {
     }
 }
 
-fn handle_event_stream(mut stream: TcpStream, state: &Arc<AppState>) -> io::Result<()> {
-    write!(
-        stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n"
-    )?;
+async fn handle_event_stream(stream: &mut TcpStream, state: &Arc<AppState>) -> io::Result<()> {
+    stream
+        .write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n",
+        )
+        .await?;
 
-    if let Ok(daemon) = state.daemon.lock() {
+    if let Ok(daemon) = lock_daemon(state).await {
         for event in snapshot_events(&daemon) {
-            write_sse_event(&mut stream, &event)?;
+            write_sse_event(stream, &event).await?;
         }
     }
 
     let receiver = state.events.subscribe();
-    loop {
-        match receiver.recv_timeout(Duration::from_secs(15)) {
-            Ok(event) => write_sse_event(&mut stream, &event)?,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                write!(stream, ": keep-alive\n\n")?;
-                stream.flush()?;
+    let (sender, mut events) = tokio::sync::mpsc::channel(16);
+    tokio::task::spawn_blocking(move || {
+        while let Ok(event) = receiver.recv() {
+            if sender.blocking_send(event).is_err() {
+                break;
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+        }
+    });
+    loop {
+        match tokio::time::timeout(Duration::from_secs(15), events.recv()).await {
+            Ok(Some(event)) => write_sse_event(stream, &event).await?,
+            Ok(None) => return Ok(()),
+            Err(_) => {
+                stream.write_all(b": keep-alive\n\n").await?;
+                stream.flush().await?;
+            }
         }
     }
 }
 
-fn write_sse_event(stream: &mut TcpStream, event: &OperatorEvent) -> io::Result<()> {
+async fn write_sse_event(stream: &mut TcpStream, event: &OperatorEvent) -> io::Result<()> {
     let body = serde_json::to_string(event)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-    write!(stream, "data: {body}\n\n")?;
-    stream.flush()
+    stream
+        .write_all(format!("data: {body}\n\n").as_bytes())
+        .await?;
+    stream.flush().await
 }
 
 #[cfg(test)]
@@ -2637,11 +2657,8 @@ mod tests {
     };
     use crate::events::EventBroker;
     use crate::test_support::StaticExecutionGateway;
+    use async_trait::async_trait;
     use chrono::{Duration, Utc};
-    use ploy_connectivity::{
-        CancellationOutcome, CancellationRequest, ExecutionError, ExecutionOutcome,
-        ExecutionRequest, LiveExecutionGateway, ReplaceOutcome, ReplaceRequest, TrackedOrder,
-    };
     use ploy_operator_contracts::AuditLogEntry;
     use ploy_operator_contracts::{OrderReplaceRequest, PaperIntentRequest};
     use ploy_platform_runtime::runtime_support::IntentAdmissionSource;
@@ -2650,18 +2667,19 @@ mod tests {
         Feed, LiveFeed, MarketUpdate, StrategyDecision, StrategyLogic, ThreeLayerProfile,
         ThreeLayerStrategy,
     };
-    use ploy_trading::{
+    use portfolio_core::prediction::{
         IntentPurpose as TradingIntentPurpose, OrderLedger, PositionLedger, TradeSide,
         TradingIntent,
     };
     use std::collections::VecDeque;
     use std::fs;
-    use std::io::{self, Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::io;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
 
     fn temp_dir(label: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -2671,11 +2689,14 @@ mod tests {
         std::env::temp_dir().join(format!("ployd-http-{label}-{unique}"))
     }
 
-    fn read_response_body(stream: &mut TcpStream) -> String {
+    async fn read_response_body(stream: &mut TcpStream) -> String {
         let mut headers = Vec::new();
         let mut byte = [0_u8; 1];
         while !headers.ends_with(b"\r\n\r\n") {
-            stream.read_exact(&mut byte).expect("read response headers");
+            stream
+                .read_exact(&mut byte)
+                .await
+                .expect("read response headers");
             headers.push(byte[0]);
         }
         let headers = String::from_utf8(headers).expect("response headers utf8");
@@ -2688,7 +2709,10 @@ mod tests {
             })
             .expect("content length header");
         let mut body = vec![0_u8; content_length];
-        stream.read_exact(&mut body).expect("read response body");
+        stream
+            .read_exact(&mut body)
+            .await
+            .expect("read response body");
         String::from_utf8(body).expect("response body utf8")
     }
 
@@ -2710,47 +2734,71 @@ mod tests {
         submits: AtomicUsize,
     }
 
-    impl LiveExecutionGateway for BenchmarkSubmitGateway {
-        fn probe(&self) -> Result<(), ExecutionError> {
-            Ok(())
-        }
-
-        fn submit(&self, _request: &ExecutionRequest) -> Result<ExecutionOutcome, ExecutionError> {
+    #[async_trait]
+    impl ports::ExecutionClient for BenchmarkSubmitGateway {
+        async fn place_order(
+            &mut self,
+            _intent: ports::OrderIntent,
+        ) -> Result<hft_core::OrderId, hft_core::HftError> {
             self.entered
                 .lock()
                 .expect("entered lock")
                 .push(Instant::now());
             let sequence = self.submits.fetch_add(1, Ordering::SeqCst);
-            Ok(ExecutionOutcome::Acknowledged {
-                venue_order_id: format!("venue-benchmark-{sequence}"),
-            })
+            Ok(hft_core::OrderId(format!("venue-benchmark-{sequence}")))
         }
-
-        fn cancel(
-            &self,
-            _request: &CancellationRequest,
-        ) -> Result<CancellationOutcome, ExecutionError> {
-            Ok(CancellationOutcome::Canceled)
+        async fn cancel_order(
+            &mut self,
+            _order_id: &hft_core::OrderId,
+        ) -> Result<(), hft_core::HftError> {
+            Ok(())
         }
-
-        fn replace(&self, _request: &ReplaceRequest) -> Result<ReplaceOutcome, ExecutionError> {
+        async fn modify_order(
+            &mut self,
+            _order_id: &hft_core::OrderId,
+            _new_quantity: Option<hft_core::Quantity>,
+            _new_price: Option<hft_core::Price>,
+        ) -> Result<hft_core::OrderId, hft_core::HftError> {
             unreachable!("replace is not used")
         }
-
-        fn reconcile_fills(
+        async fn execution_stream(
             &self,
-            _tracked_orders: &[TrackedOrder],
-        ) -> Result<Vec<ploy_trading::FillRecord>, ExecutionError> {
+        ) -> Result<ports::BoxStream<ports::ExecutionEvent>, hft_core::HftError> {
+            Err(hft_core::HftError::Config("unused".into()))
+        }
+        async fn list_open_orders(&self) -> Result<Vec<ports::OpenOrder>, hft_core::HftError> {
             Ok(Vec::new())
+        }
+        async fn list_recent_fills(&self) -> Result<Vec<ports::AccountFill>, hft_core::HftError> {
+            Ok(Vec::new())
+        }
+        async fn get_balance(&self) -> Result<Vec<ports::AccountBalance>, hft_core::HftError> {
+            Ok(Vec::new())
+        }
+        async fn get_positions(&self) -> Result<Vec<ports::Position>, hft_core::HftError> {
+            Ok(Vec::new())
+        }
+        async fn connect(&mut self) -> Result<(), hft_core::HftError> {
+            Ok(())
+        }
+        async fn disconnect(&mut self) -> Result<(), hft_core::HftError> {
+            Ok(())
+        }
+        async fn health(&self) -> ports::ConnectionHealth {
+            ports::ConnectionHealth {
+                connected: true,
+                latency_ms: Some(0.0),
+                last_heartbeat: 0,
+            }
         }
     }
 
-    impl LiveExecutionGateway for BlockingSubmitGateway {
-        fn probe(&self) -> Result<(), ExecutionError> {
-            Ok(())
-        }
-
-        fn submit(&self, _request: &ExecutionRequest) -> Result<ExecutionOutcome, ExecutionError> {
+    #[async_trait]
+    impl ports::ExecutionClient for BlockingSubmitGateway {
+        async fn place_order(
+            &mut self,
+            _intent: ports::OrderIntent,
+        ) -> Result<hft_core::OrderId, hft_core::HftError> {
             self.submits.fetch_add(1, Ordering::SeqCst);
             if let Some(entered) = self.entered.lock().expect("entered lock").take() {
                 let _ = entered.send(());
@@ -2760,38 +2808,62 @@ mod tests {
                 .expect("release lock")
                 .recv()
                 .expect("release submit");
-            Ok(ExecutionOutcome::Acknowledged {
-                venue_order_id: "venue-blocking".to_string(),
-            })
+            Ok(hft_core::OrderId("venue-blocking".to_string()))
         }
-
-        fn cancel(
-            &self,
-            _request: &CancellationRequest,
-        ) -> Result<CancellationOutcome, ExecutionError> {
-            Ok(CancellationOutcome::Canceled)
+        async fn cancel_order(
+            &mut self,
+            _order_id: &hft_core::OrderId,
+        ) -> Result<(), hft_core::HftError> {
+            Ok(())
         }
-
-        fn replace(&self, _request: &ReplaceRequest) -> Result<ReplaceOutcome, ExecutionError> {
+        async fn modify_order(
+            &mut self,
+            _order_id: &hft_core::OrderId,
+            _new_quantity: Option<hft_core::Quantity>,
+            _new_price: Option<hft_core::Price>,
+        ) -> Result<hft_core::OrderId, hft_core::HftError> {
             unreachable!("replace is not used")
         }
-
-        fn reconcile_fills(
+        async fn execution_stream(
             &self,
-            _tracked_orders: &[TrackedOrder],
-        ) -> Result<Vec<ploy_trading::FillRecord>, ExecutionError> {
+        ) -> Result<ports::BoxStream<ports::ExecutionEvent>, hft_core::HftError> {
+            Err(hft_core::HftError::Config("unused".into()))
+        }
+        async fn list_open_orders(&self) -> Result<Vec<ports::OpenOrder>, hft_core::HftError> {
             Ok(Vec::new())
+        }
+        async fn list_recent_fills(&self) -> Result<Vec<ports::AccountFill>, hft_core::HftError> {
+            Ok(Vec::new())
+        }
+        async fn get_balance(&self) -> Result<Vec<ports::AccountBalance>, hft_core::HftError> {
+            Ok(Vec::new())
+        }
+        async fn get_positions(&self) -> Result<Vec<ports::Position>, hft_core::HftError> {
+            Ok(Vec::new())
+        }
+        async fn connect(&mut self) -> Result<(), hft_core::HftError> {
+            Ok(())
+        }
+        async fn disconnect(&mut self) -> Result<(), hft_core::HftError> {
+            Ok(())
+        }
+        async fn health(&self) -> ports::ConnectionHealth {
+            ports::ConnectionHealth {
+                connected: true,
+                latency_ms: Some(0.0),
+                last_heartbeat: 0,
+            }
         }
     }
 
-    #[test]
-    fn request_reader_helpers_accept_large_content_length() {
+    #[tokio::test]
+    async fn request_reader_helpers_accept_large_content_length() {
         let headers = b"POST /api/proposals HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4096";
         assert_eq!(content_length(headers).expect("content length"), 4096);
     }
 
-    #[test]
-    fn report_json_error_preserves_control_plane_envelope() {
+    #[tokio::test]
+    async fn report_json_error_preserves_control_plane_envelope() {
         for error in [
             "market_data_health_unavailable",
             "dry_run_summary_unavailable",
@@ -2805,8 +2877,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn report_json_success_is_returned_without_rewriting() {
+    #[tokio::test]
+    async fn report_json_success_is_returned_without_rewriting() {
         let body = "{\"generated_at\":\"2026-04-29T00:00:00Z\"}".to_string();
         assert_eq!(
             report_json_response(Ok(body.clone()), "unused"),
@@ -2814,8 +2886,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn request_reader_helpers_find_header_end_after_large_headers() {
+    #[tokio::test]
+    async fn request_reader_helpers_find_header_end_after_large_headers() {
         let request = format!(
             "POST /api/proposals HTTP/1.1\r\nX-Large: {}\r\n\r\n{{}}",
             "x".repeat(3000)
@@ -2823,8 +2895,8 @@ mod tests {
         assert!(header_end_offset(request.as_bytes()).is_some());
     }
 
-    #[test]
-    fn server_handles_multiple_requests_on_one_keep_alive_connection() {
+    #[tokio::test]
+    async fn server_handles_multiple_requests_on_one_keep_alive_connection() {
         let root = temp_dir("server-keep-alive");
         let runtime_root = root.join("run/platform");
         let config = crate::config::PlatformConfig {
@@ -2841,33 +2913,41 @@ mod tests {
         )
         .expect("boot daemon");
         let state = Arc::new(AppState {
-            daemon: Arc::new(Mutex::new(daemon)),
+            daemon: Arc::new(tokio::sync::Mutex::new(daemon)),
             events: Arc::new(EventBroker::default()),
         });
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
         let addr = listener.local_addr().expect("listener addr");
         let server_state = Arc::clone(&state);
-        let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("accept");
-            handle_connection(stream, &server_state).expect("serve connection");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            handle_connection(&mut stream, &server_state)
+                .await
+                .expect("serve connection");
         });
-        let mut client = TcpStream::connect(addr).expect("connect");
+        let mut client = TcpStream::connect(addr).await.expect("connect");
 
         for _ in 0..2 {
-            write!(
-                client,
-                "GET /health HTTP/1.1\r\nHost: {addr}\r\nConnection: keep-alive\r\n\r\n"
-            )
-            .expect("write request");
-            assert!(read_response_body(&mut client).contains("\"status\""));
+            client
+                .write_all(
+                    format!(
+                        "GET /health HTTP/1.1\r\nHost: {addr}\r\nConnection: keep-alive\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write request");
+            assert!(read_response_body(&mut client).await.contains("\"status\""));
         }
         drop(client);
-        server.join().expect("server thread");
+        server.await.expect("server task");
     }
 
-    #[test]
+    #[tokio::test]
     #[ignore = "local no-live-order latency benchmark"]
-    fn live_submit_latency_benchmark() {
+    async fn live_submit_latency_benchmark() {
         const SAMPLES: usize = 1_001;
         let root = temp_dir("live-submit-latency");
         let runtime_root = root.join("run/platform");
@@ -2914,17 +2994,21 @@ mod tests {
             ploy_operator_contracts::ObservedState::Running,
         );
         let state = Arc::new(AppState {
-            daemon: Arc::new(Mutex::new(daemon)),
+            daemon: Arc::new(tokio::sync::Mutex::new(daemon)),
             events: Arc::new(EventBroker::default()),
         });
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
         let addr = listener.local_addr().expect("listener addr");
         let server_state = Arc::clone(&state);
-        let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("accept");
-            handle_connection(stream, &server_state).expect("serve benchmark connection");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            handle_connection(&mut stream, &server_state)
+                .await
+                .expect("serve benchmark connection");
         });
-        let mut client = TcpStream::connect(addr).expect("connect");
+        let mut client = TcpStream::connect(addr).await.expect("connect");
         client.set_nodelay(true).expect("nodelay");
         let base_ts = Utc::now();
         let positions = PositionLedger::default();
@@ -2987,9 +3071,6 @@ mod tests {
         );
         let (tick_tx, tick_rx) = tokio::sync::broadcast::channel(16);
         let mut tick_feed = LiveFeed::new(tick_rx);
-        let tick_runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("tick runtime");
         let mut canonical_tick_to_decision = Vec::with_capacity(SAMPLES);
         let mut canonical_tick_to_gateway = Vec::with_capacity(SAMPLES);
         let mut canonical_tick_to_response = Vec::with_capacity(SAMPLES);
@@ -3010,9 +3091,7 @@ mod tests {
             };
             let tick_started = Instant::now();
             tick_tx.send(tick).expect("broadcast canonical tick");
-            let tick = tick_runtime
-                .block_on(tick_feed.next())
-                .expect("receive canonical tick");
+            let tick = tick_feed.next().await.expect("receive canonical tick");
             let decisions = strategy.on_update(&tick, &positions, &orders);
             let decision_at = Instant::now();
             let intent = match decisions.as_slice() {
@@ -3034,14 +3113,18 @@ mod tests {
             })
             .expect("request json");
             let started = Instant::now();
-            write!(
-                client,
-                "POST /api/deployments/benchmark.live/intents HTTP/1.1\r\nHost: {addr}\r\nx-ploy-worker-token: benchmark-worker\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .expect("write request");
-            let response = read_response_body(&mut client);
+            client
+                .write_all(
+                    format!(
+                        "POST /api/deployments/benchmark.live/intents HTTP/1.1\r\nHost: {addr}\r\nx-ploy-worker-token: benchmark-worker\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write request");
+            let response = read_response_body(&mut client).await;
             let completed = Instant::now();
             assert!(response.contains("\"state\":\"acknowledged\""));
             let wire = entered.lock().expect("entered lock")[sequence];
@@ -3077,12 +3160,12 @@ mod tests {
             percentile_micros(&mut end_to_end, 999),
         );
         drop(client);
-        server.join().expect("server thread");
+        server.await.expect("server task");
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn route_request_serves_system_and_deployment_snapshots() {
+    #[tokio::test]
+    async fn route_request_serves_system_and_deployment_snapshots() {
         let runtime_root = temp_dir("routes");
         fs::create_dir_all(&runtime_root).expect("create runtime root");
         fs::write(
@@ -3125,15 +3208,15 @@ mod tests {
         assert!(deployments_body.contains("\"deployment_id\":\"example.paper\""));
     }
 
-    #[test]
-    fn rate_limiter_denies_requests_after_limit_within_window() {
+    #[tokio::test]
+    async fn rate_limiter_denies_requests_after_limit_within_window() {
         let mut limiter = RateLimiter::default();
         assert!(limiter.allow("127.0.0.1|admin|GET|/api/deployments", 1));
         assert!(!limiter.allow("127.0.0.1|admin|GET|/api/deployments", 1));
     }
 
-    #[test]
-    fn same_ip_different_ports_share_rate_limit() {
+    #[tokio::test]
+    async fn same_ip_different_ports_share_rate_limit() {
         let mut limiter = RateLimiter::default();
         let first = rate_limit_key(
             Some("127.0.0.1:41000"),
@@ -3152,8 +3235,8 @@ mod tests {
         assert!(!limiter.allow(&second, 1));
     }
 
-    #[test]
-    fn different_paths_share_rate_limit() {
+    #[tokio::test]
+    async fn different_paths_share_rate_limit() {
         let mut limiter = RateLimiter::default();
         let first = rate_limit_key(
             Some("127.0.0.1:41000"),
@@ -3172,8 +3255,8 @@ mod tests {
         assert!(!limiter.allow(&second, 1));
     }
 
-    #[test]
-    fn trusted_loopback_proxy_uses_real_client_ip() {
+    #[tokio::test]
+    async fn trusted_loopback_proxy_uses_real_client_ip() {
         let request = "GET /auth/login HTTP/1.1\r\nX-Real-IP: 203.0.113.9\r\n\r\n";
 
         assert_eq!(client_ip(Some("127.0.0.1:41000"), request), "203.0.113.9");
@@ -3183,8 +3266,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn expired_rate_limit_buckets_are_removed() {
+    #[tokio::test]
+    async fn expired_rate_limit_buckets_are_removed() {
         let mut limiter = RateLimiter::default();
         limiter.requests.insert(
             "expired|none".to_string(),
@@ -3195,8 +3278,8 @@ mod tests {
         assert!(!limiter.requests.contains_key("expired|none"));
     }
 
-    #[test]
-    fn missing_tokens_do_not_authorize_protected_routes() {
+    #[tokio::test]
+    async fn missing_tokens_do_not_authorize_protected_routes() {
         assert!(access_allowed(
             AuthLevel::None,
             super::RequiredAccess::Public,
@@ -3221,8 +3304,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn auth_session_does_not_report_protected_apis_open_without_tokens() {
+    #[tokio::test]
+    async fn auth_session_does_not_report_protected_apis_open_without_tokens() {
         let config = crate::config::PlatformConfig::default();
         let daemon = crate::runtime::PloyDaemon::boot_with_live_execution(
             &config,
@@ -3230,7 +3313,7 @@ mod tests {
         )
         .expect("boot daemon");
         let state = Arc::new(AppState {
-            daemon: Arc::new(Mutex::new(daemon)),
+            daemon: Arc::new(tokio::sync::Mutex::new(daemon)),
             events: Arc::new(EventBroker::default()),
         });
 
@@ -3244,15 +3327,16 @@ mod tests {
             false,
             false,
             &state,
-        );
+        )
+        .await;
 
         assert_eq!(code, 200);
         assert!(body.contains("\"auth_required\":true"));
         assert!(body.contains("\"authenticated\":false"));
     }
 
-    #[test]
-    fn handle_runtime_request_reads_recent_audit_entries() {
+    #[tokio::test]
+    async fn handle_runtime_request_reads_recent_audit_entries() {
         let root = temp_dir("audit-read");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -3286,18 +3370,19 @@ mod tests {
 
         let daemon = crate::runtime::PloyDaemon::boot(&config).expect("boot daemon");
         let state = Arc::new(AppState {
-            daemon: Arc::new(Mutex::new(daemon)),
+            daemon: Arc::new(tokio::sync::Mutex::new(daemon)),
             events: Arc::new(EventBroker::default()),
         });
 
-        let (status_code, body) = handle_runtime_request("GET", "/api/audit/logs", None, &state);
+        let (status_code, body) =
+            handle_runtime_request("GET", "/api/audit/logs", None, &state).await;
         assert_eq!(status_code, 200);
         assert!(body.contains("/api/deployments/example.paper/control"));
         assert!(body.contains("deployment paused"));
     }
 
-    #[test]
-    fn auth_session_reports_auth_requirement_when_admin_token_is_configured() {
+    #[tokio::test]
+    async fn auth_session_reports_auth_requirement_when_admin_token_is_configured() {
         let config = crate::config::PlatformConfig {
             admin_token: Some("secret-token".to_string().into()),
             ..crate::config::PlatformConfig::default()
@@ -3308,7 +3393,7 @@ mod tests {
         )
         .expect("boot daemon");
         let state = Arc::new(AppState {
-            daemon: Arc::new(Mutex::new(daemon)),
+            daemon: Arc::new(tokio::sync::Mutex::new(daemon)),
             events: Arc::new(EventBroker::default()),
         });
 
@@ -3322,15 +3407,16 @@ mod tests {
             false,
             false,
             &state,
-        );
+        )
+        .await;
 
         assert_eq!(code, 200);
         assert!(body.contains("\"auth_required\":true"));
         assert!(body.contains("\"authenticated\":false"));
     }
 
-    #[test]
-    fn unauthorized_requests_are_rejected_when_admin_token_is_configured() {
+    #[tokio::test]
+    async fn unauthorized_requests_are_rejected_when_admin_token_is_configured() {
         let config = crate::config::PlatformConfig {
             admin_token: Some("secret-token".to_string().into()),
             ..crate::config::PlatformConfig::default()
@@ -3341,7 +3427,7 @@ mod tests {
         )
         .expect("boot daemon");
         let state = Arc::new(AppState {
-            daemon: Arc::new(Mutex::new(daemon)),
+            daemon: Arc::new(tokio::sync::Mutex::new(daemon)),
             events: Arc::new(EventBroker::default()),
         });
 
@@ -3355,14 +3441,15 @@ mod tests {
             false,
             false,
             &state,
-        );
+        )
+        .await;
 
         assert_eq!(code, 401);
         assert!(body.contains("\"error\":\"unauthorized\""));
     }
 
-    #[test]
-    fn auth_login_accepts_matching_admin_token() {
+    #[tokio::test]
+    async fn auth_login_accepts_matching_admin_token() {
         let config = crate::config::PlatformConfig {
             admin_token: Some("secret-token".to_string().into()),
             ..crate::config::PlatformConfig::default()
@@ -3373,7 +3460,7 @@ mod tests {
         )
         .expect("boot daemon");
         let state = Arc::new(AppState {
-            daemon: Arc::new(Mutex::new(daemon)),
+            daemon: Arc::new(tokio::sync::Mutex::new(daemon)),
             events: Arc::new(EventBroker::default()),
         });
 
@@ -3387,14 +3474,15 @@ mod tests {
             false,
             false,
             &state,
-        );
+        )
+        .await;
 
         assert_eq!(code, 200);
         assert!(body.contains("\"success\":true"));
     }
 
-    #[test]
-    fn auth_login_rejects_when_admin_auth_is_not_configured() {
+    #[tokio::test]
+    async fn auth_login_rejects_when_admin_auth_is_not_configured() {
         let config = crate::config::PlatformConfig::default();
         let daemon = crate::runtime::PloyDaemon::boot_with_live_execution(
             &config,
@@ -3402,7 +3490,7 @@ mod tests {
         )
         .expect("boot daemon");
         let state = Arc::new(AppState {
-            daemon: Arc::new(Mutex::new(daemon)),
+            daemon: Arc::new(tokio::sync::Mutex::new(daemon)),
             events: Arc::new(EventBroker::default()),
         });
 
@@ -3416,15 +3504,16 @@ mod tests {
             false,
             false,
             &state,
-        );
+        )
+        .await;
 
         assert_eq!(code, 503);
         assert!(body.contains("\"error\":\"admin_auth_not_configured\""));
         assert!(response_headers("POST", "/auth/login", code, None, "cookie-secret").is_empty());
     }
 
-    #[test]
-    fn request_auth_level_accepts_admin_session_cookie() {
+    #[tokio::test]
+    async fn request_auth_level_accepts_admin_session_cookie() {
         let cookie = admin_session_cookie("secret-token", "cookie-secret");
         let request = format!(
             "GET /api/events/stream HTTP/1.1\r\nHost: 127.0.0.1:8081\r\nCookie: {cookie}; theme=dark\r\n\r\n"
@@ -3442,8 +3531,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn auth_responses_emit_session_cookie_headers() {
+    #[tokio::test]
+    async fn auth_responses_emit_session_cookie_headers() {
         let login_headers = response_headers(
             "POST",
             "/auth/login",
@@ -3471,8 +3560,8 @@ mod tests {
                 && value.contains("Max-Age=0")));
     }
 
-    #[test]
-    fn signed_session_cookie_does_not_authenticate_other_tokens() {
+    #[tokio::test]
+    async fn signed_session_cookie_does_not_authenticate_other_tokens() {
         let cookie = admin_session_cookie("secret-token", "cookie-secret");
         let request = format!("GET / HTTP/1.1\r\nCookie: {cookie}\r\n\r\n");
         assert_eq!(
@@ -3488,8 +3577,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sidecar_token_grants_read_only_access_but_not_admin_access() {
+    #[tokio::test]
+    async fn sidecar_token_grants_read_only_access_but_not_admin_access() {
         let request =
             "GET /api/deployments HTTP/1.1\r\nx-ploy-sidecar-token: sidecar-secret\r\n\r\n";
         assert_eq!(
@@ -3515,7 +3604,7 @@ mod tests {
         )
         .expect("boot daemon");
         let state = Arc::new(AppState {
-            daemon: Arc::new(Mutex::new(daemon)),
+            daemon: Arc::new(tokio::sync::Mutex::new(daemon)),
             events: Arc::new(EventBroker::default()),
         });
 
@@ -3529,7 +3618,8 @@ mod tests {
             false,
             true,
             &state,
-        );
+        )
+        .await;
         assert_eq!(read_code, 200);
 
         let (write_code, write_body) = handle_authenticated_runtime_request(
@@ -3542,13 +3632,14 @@ mod tests {
             false,
             true,
             &state,
-        );
+        )
+        .await;
         assert_eq!(write_code, 401);
         assert!(write_body.contains("\"error\":\"unauthorized\""));
     }
 
-    #[test]
-    fn operator_token_grants_write_access_but_not_admin_access() {
+    #[tokio::test]
+    async fn operator_token_grants_write_access_but_not_admin_access() {
         let request = "POST /api/deployments/example.paper/control HTTP/1.1\r\nx-ploy-operator-token: operator-secret\r\n\r\n";
         assert_eq!(
             request_auth_level(
@@ -3574,7 +3665,7 @@ mod tests {
         )
         .expect("boot daemon");
         let state = Arc::new(AppState {
-            daemon: Arc::new(Mutex::new(daemon)),
+            daemon: Arc::new(tokio::sync::Mutex::new(daemon)),
             events: Arc::new(EventBroker::default()),
         });
 
@@ -3588,7 +3679,8 @@ mod tests {
             false,
             true,
             &state,
-        );
+        )
+        .await;
         assert_eq!(write_code, 404);
         assert!(write_body.contains("deployment_not_found"));
 
@@ -3602,13 +3694,14 @@ mod tests {
             false,
             true,
             &state,
-        );
+        )
+        .await;
         assert_eq!(audit_code, 401);
         assert!(audit_body.contains("\"error\":\"unauthorized\""));
     }
 
-    #[test]
-    fn worker_token_cannot_access_operator_or_admin_endpoints() {
+    #[tokio::test]
+    async fn worker_token_cannot_access_operator_or_admin_endpoints() {
         let request = "POST /api/deployments/example.live/intents HTTP/1.1\r\nx-ploy-worker-token: worker-secret\r\n\r\n";
         let auth_level = request_auth_level(
             request,
@@ -3645,8 +3738,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn intent_json_cannot_spoof_admission_source() {
+    #[tokio::test]
+    async fn intent_json_cannot_spoof_admission_source() {
         let request: PaperIntentRequest = serde_json::from_value(serde_json::json!({
             "market_id": "market-1",
             "token_id": "token-1",
@@ -3668,8 +3761,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unauthenticated_and_sidecar_cannot_become_operator_source() {
+    #[tokio::test]
+    async fn unauthenticated_and_sidecar_cannot_become_operator_source() {
         assert_eq!(intent_admission_source(AuthLevel::None), None);
         assert_eq!(intent_admission_source(AuthLevel::Sidecar), None);
         assert_eq!(
@@ -3682,8 +3775,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn worker_only_auth_configuration_is_recognized() {
+    #[tokio::test]
+    async fn worker_only_auth_configuration_is_recognized() {
         let config = crate::config::PlatformConfig {
             worker_token: Some("worker-secret".to_string().into()),
             ..crate::config::PlatformConfig::default()
@@ -3694,7 +3787,7 @@ mod tests {
         )
         .expect("boot daemon");
         let state = Arc::new(AppState {
-            daemon: Arc::new(Mutex::new(daemon)),
+            daemon: Arc::new(tokio::sync::Mutex::new(daemon)),
             events: Arc::new(EventBroker::default()),
         });
         let body = serde_json::json!({
@@ -3717,7 +3810,8 @@ mod tests {
             true,
             false,
             &state,
-        );
+        )
+        .await;
         assert_eq!(missing_code, 401);
         assert!(missing_body.contains("worker, operator, or admin token is required"));
 
@@ -3731,13 +3825,14 @@ mod tests {
             true,
             false,
             &state,
-        );
+        )
+        .await;
         assert_eq!(worker_code, 404);
         assert!(worker_body.contains("deployment_not_found"));
     }
 
-    #[test]
-    fn handle_api_request_applies_and_controls_deployments() {
+    #[tokio::test]
+    async fn handle_api_request_applies_and_controls_deployments() {
         let root = temp_dir("apply");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -3807,8 +3902,8 @@ mod tests {
         assert!(control_response.contains("\"desired_state\":\"paused\""));
     }
 
-    #[test]
-    fn handle_api_request_submits_paper_intent() {
+    #[tokio::test]
+    async fn handle_api_request_submits_paper_intent() {
         let root = temp_dir("submit-intent");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -3860,8 +3955,8 @@ mod tests {
         assert!(submit_response.contains("\"deployment_id\":\"example.paper\""));
     }
 
-    #[test]
-    fn route_request_serves_trading_state_snapshot() {
+    #[tokio::test]
+    async fn route_request_serves_trading_state_snapshot() {
         let runtime_root = temp_dir("trading-routes");
         fs::create_dir_all(&runtime_root).expect("create runtime root");
         fs::write(
@@ -3899,8 +3994,8 @@ mod tests {
         assert!(body.contains("\"deployment_id\":\"example.paper\""));
     }
 
-    #[test]
-    fn handle_runtime_request_serves_metrics_and_alert_snapshots() {
+    #[tokio::test]
+    async fn handle_runtime_request_serves_metrics_and_alert_snapshots() {
         let root = temp_dir("metrics-alerts");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -3950,12 +4045,12 @@ mod tests {
         daemon.control_plane.system.refresh_source_health();
 
         let state = Arc::new(AppState {
-            daemon: Arc::new(Mutex::new(daemon)),
+            daemon: Arc::new(tokio::sync::Mutex::new(daemon)),
             events: Arc::new(EventBroker::default()),
         });
 
         let (metrics_code, metrics_body) =
-            handle_runtime_request("GET", "/api/system/metrics", None, &state);
+            handle_runtime_request("GET", "/api/system/metrics", None, &state).await;
         assert_eq!(metrics_code, 200);
         let metrics: ploy_operator_contracts::PlatformMetrics =
             serde_json::from_str(&metrics_body).expect("metrics json");
@@ -3963,7 +4058,7 @@ mod tests {
         assert!(metrics.stale_sources >= 1);
 
         let (alerts_code, alerts_body) =
-            handle_runtime_request("GET", "/api/system/alerts", None, &state);
+            handle_runtime_request("GET", "/api/system/alerts", None, &state).await;
         assert_eq!(alerts_code, 200);
         let alerts: Vec<ploy_operator_contracts::ActiveAlert> =
             serde_json::from_str(&alerts_body).expect("alerts json");
@@ -3975,8 +4070,8 @@ mod tests {
             .any(|alert| alert.source_id.contains("live_reconcile")));
     }
 
-    #[test]
-    fn snapshot_events_include_control_plane_and_trading_payloads() {
+    #[tokio::test]
+    async fn snapshot_events_include_control_plane_and_trading_payloads() {
         let daemon = crate::runtime::PloyDaemon::boot(&crate::config::PlatformConfig::default())
             .expect("boot daemon");
         let events = snapshot_events(&daemon);
@@ -4006,8 +4101,8 @@ mod tests {
         )));
     }
 
-    #[test]
-    fn handle_runtime_request_submits_live_intent_via_shared_daemon_state() {
+    #[tokio::test]
+    async fn handle_runtime_request_submits_live_intent_via_shared_daemon_state() {
         let root = temp_dir("runtime-live-intent");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -4050,7 +4145,7 @@ mod tests {
             ploy_operator_contracts::ObservedState::Running,
         );
         let state = Arc::new(AppState {
-            daemon: Arc::new(Mutex::new(daemon)),
+            daemon: Arc::new(tokio::sync::Mutex::new(daemon)),
             events: Arc::new(EventBroker::default()),
         });
 
@@ -4070,7 +4165,8 @@ mod tests {
             "/api/deployments/example.live/intents",
             Some(&body),
             &state,
-        );
+        )
+        .await;
         assert_eq!(submit_code, 200);
         assert!(submit_response.contains("\"state\":\"acknowledged\""));
 
@@ -4078,15 +4174,15 @@ mod tests {
             fs::read_to_string(runtime_root.join("trading-state.json")).expect("trading snapshot");
         let trading: serde_json::Value =
             serde_json::from_str(&trading_body).expect("snapshot json");
-        assert_eq!(trading[0]["deployment_id"], "example.live");
+        assert_eq!(trading[0]["snapshot"]["deployment_id"], "example.live");
         assert_eq!(
-            trading[0]["orders"][0]["venue_order_id"],
+            trading[0]["snapshot"]["orders"][0]["venue_order_id"],
             "venue-live-http-1"
         );
     }
 
-    #[test]
-    fn live_venue_submit_does_not_hold_the_daemon_mutex() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_venue_submit_does_not_hold_the_daemon_mutex() {
         let root = temp_dir("runtime-live-unlocked-submit");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -4132,7 +4228,7 @@ mod tests {
             ploy_operator_contracts::ObservedState::Running,
         );
         let state = Arc::new(AppState {
-            daemon: Arc::new(Mutex::new(daemon)),
+            daemon: Arc::new(tokio::sync::Mutex::new(daemon)),
             events: Arc::new(EventBroker::default()),
         });
         let body = serde_json::to_string(&PaperIntentRequest {
@@ -4147,13 +4243,14 @@ mod tests {
         .expect("request json");
         let retry_body = body.clone();
         let request_state = Arc::clone(&state);
-        let request = std::thread::spawn(move || {
+        let request = tokio::spawn(async move {
             handle_runtime_request(
                 "POST",
                 "/api/deployments/example.live/intents",
                 Some(&body),
                 &request_state,
             )
+            .await
         });
 
         entered_rx
@@ -4170,19 +4267,22 @@ mod tests {
                 .and_then(|runtime| runtime.order("order-request-blocking-1"))
                 .expect("pending order")
                 .state,
-            ploy_trading::OrderState::Pending
+            portfolio_core::prediction::OrderState::Pending
         );
         drop(daemon_guard);
 
         let retry_state = Arc::clone(&state);
         let (retry_tx, retry_rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = retry_tx.send(handle_runtime_request(
-                "POST",
-                "/api/deployments/example.live/intents",
-                Some(&retry_body),
-                &retry_state,
-            ));
+        let retry_task = tokio::spawn(async move {
+            let _ = retry_tx.send(
+                handle_runtime_request(
+                    "POST",
+                    "/api/deployments/example.live/intents",
+                    Some(&retry_body),
+                    &retry_state,
+                )
+                .await,
+            );
         });
         let (retry_status, retry_response) = retry_rx
             .recv_timeout(StdDuration::from_secs(2))
@@ -4190,15 +4290,16 @@ mod tests {
         assert_eq!(retry_status, 200);
         assert!(retry_response.contains("\"state\":\"pending\""));
         assert_eq!(submits.load(Ordering::SeqCst), 1);
+        retry_task.await.expect("retry task");
 
         release_tx.send(()).expect("release submit");
-        let (status, response) = request.join().expect("request thread");
+        let (status, response) = request.await.expect("request task");
         assert_eq!(status, 200);
         assert!(response.contains("\"state\":\"acknowledged\""));
     }
 
-    #[test]
-    fn handle_runtime_request_surfaces_live_gateway_transport_failure_as_503() {
+    #[tokio::test]
+    async fn handle_runtime_request_surfaces_live_gateway_transport_failure_as_503() {
         let root = temp_dir("runtime-live-intent-transport-error");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -4233,9 +4334,9 @@ mod tests {
         crate::runtime::seed_empty_live_ledgers(&config);
         let mut daemon = crate::runtime::PloyDaemon::boot_with_live_execution(
             &config,
-            Box::new(StaticExecutionGateway::failed(
-                ploy_connectivity::ExecutionError::Transport("gateway offline".to_string()),
-            )),
+            Box::new(StaticExecutionGateway::failed(hft_core::HftError::Network(
+                "gateway offline".to_string(),
+            ))),
         )
         .expect("boot daemon");
         daemon.control_plane.deployments.set_observed_state(
@@ -4243,7 +4344,7 @@ mod tests {
             ploy_operator_contracts::ObservedState::Running,
         );
         let state = Arc::new(AppState {
-            daemon: Arc::new(Mutex::new(daemon)),
+            daemon: Arc::new(tokio::sync::Mutex::new(daemon)),
             events: Arc::new(EventBroker::default()),
         });
 
@@ -4263,7 +4364,8 @@ mod tests {
             "/api/deployments/example.live/intents",
             Some(&body),
             &state,
-        );
+        )
+        .await;
         assert_eq!(submit_code, 200);
         assert!(submit_response.contains("\"state\":\"unknown\""));
         assert!(submit_response.contains("gateway offline"));
@@ -4272,12 +4374,12 @@ mod tests {
             fs::read_to_string(root.join("run/platform/trading-state.json")).expect("snapshot");
         let trading: serde_json::Value =
             serde_json::from_str(&trading_body).expect("snapshot json");
-        assert_eq!(trading[0]["orders"][0]["state"], "unknown");
-        assert_eq!(trading[0]["deployment_id"], "example.live");
+        assert_eq!(trading[0]["snapshot"]["orders"][0]["state"], "unknown");
+        assert_eq!(trading[0]["snapshot"]["deployment_id"], "example.live");
     }
 
-    #[test]
-    fn handle_runtime_request_cancels_live_order_and_persists_snapshot() {
+    #[tokio::test]
+    async fn handle_runtime_request_cancels_live_order_and_persists_snapshot() {
         let root = temp_dir("runtime-live-cancel");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -4310,7 +4412,7 @@ mod tests {
         };
 
         let gateway = StaticExecutionGateway::acknowledged("venue-live-http-cancel-1")
-            .with_cancel_result(Ok(CancellationOutcome::Canceled));
+            .with_cancel_result(Ok(()));
         crate::runtime::seed_empty_live_ledgers(&config);
         let mut daemon =
             crate::runtime::PloyDaemon::boot_with_live_execution(&config, Box::new(gateway))
@@ -4320,7 +4422,7 @@ mod tests {
             ploy_operator_contracts::ObservedState::Running,
         );
         let state = Arc::new(AppState {
-            daemon: Arc::new(Mutex::new(daemon)),
+            daemon: Arc::new(tokio::sync::Mutex::new(daemon)),
             events: Arc::new(EventBroker::default()),
         });
 
@@ -4340,7 +4442,8 @@ mod tests {
             "/api/deployments/example.live/intents",
             Some(&submit_body),
             &state,
-        );
+        )
+        .await;
         assert_eq!(submit_code, 200);
         assert!(submit_response.contains("\"order_id\":\"order-"));
 
@@ -4355,7 +4458,8 @@ mod tests {
             &format!("/api/deployments/example.live/orders/{order_id}/cancel"),
             None,
             &state,
-        );
+        )
+        .await;
         assert_eq!(cancel_code, 200);
         assert!(cancel_response.contains("\"state\":\"canceled\""));
 
@@ -4363,15 +4467,15 @@ mod tests {
             fs::read_to_string(runtime_root.join("trading-state.json")).expect("trading snapshot");
         let trading: serde_json::Value =
             serde_json::from_str(&trading_body).expect("snapshot json");
-        assert_eq!(trading[0]["orders"][0]["state"], "canceled");
+        assert_eq!(trading[0]["snapshot"]["orders"][0]["state"], "canceled");
         assert_eq!(
-            trading[0]["orders"][0]["venue_order_id"],
+            trading[0]["snapshot"]["orders"][0]["venue_order_id"],
             "venue-live-http-cancel-1"
         );
     }
 
-    #[test]
-    fn handle_runtime_request_replaces_live_order_and_persists_revision_history() {
+    #[tokio::test]
+    async fn handle_runtime_request_replaces_live_order_and_persists_revision_history() {
         let root = temp_dir("runtime-live-replace");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -4404,9 +4508,9 @@ mod tests {
         };
 
         let gateway = StaticExecutionGateway::acknowledged("venue-live-http-replace-1")
-            .with_replace_result(Ok(ReplaceOutcome::Replaced {
-                venue_order_id: "venue-live-http-replace-2".to_string(),
-            }));
+            .with_replace_result(Ok(hft_core::OrderId(
+                "venue-live-http-replace-2".to_string(),
+            )));
         crate::runtime::seed_empty_live_ledgers(&config);
         let mut daemon =
             crate::runtime::PloyDaemon::boot_with_live_execution(&config, Box::new(gateway))
@@ -4416,7 +4520,7 @@ mod tests {
             ploy_operator_contracts::ObservedState::Running,
         );
         let state = Arc::new(AppState {
-            daemon: Arc::new(Mutex::new(daemon)),
+            daemon: Arc::new(tokio::sync::Mutex::new(daemon)),
             events: Arc::new(EventBroker::default()),
         });
 
@@ -4436,7 +4540,8 @@ mod tests {
             "/api/deployments/example.live/intents",
             Some(&submit_body),
             &state,
-        );
+        )
+        .await;
         assert_eq!(submit_code, 200);
 
         let order_id = submit_response
@@ -4455,7 +4560,8 @@ mod tests {
             &format!("/api/deployments/example.live/orders/{order_id}/replace"),
             Some(&replace_body),
             &state,
-        );
+        )
+        .await;
         assert_eq!(replace_code, 200);
         assert!(replace_response.contains("\"revision\":1"));
         assert!(replace_response.contains("\"venue_order_id\":\"venue-live-http-replace-2\""));
@@ -4465,14 +4571,18 @@ mod tests {
         let trading: serde_json::Value =
             serde_json::from_str(&trading_body).expect("snapshot json");
         assert_eq!(
-            trading[0]["orders"][0]["venue_order_history"][0],
+            trading[0]["snapshot"]["orders"][0]["venue_order_id"],
+            "venue-live-http-replace-2"
+        );
+        assert_eq!(
+            trading[0]["snapshot"]["orders"][0]["venue_order_history"][0],
             "venue-live-http-replace-1"
         );
-        assert_eq!(trading[0]["orders"][0]["revision"], 1);
+        assert_eq!(trading[0]["snapshot"]["orders"][0]["revision"], 1);
     }
 
-    #[test]
-    fn handle_runtime_request_reads_trading_state_from_shared_daemon() {
+    #[tokio::test]
+    async fn handle_runtime_request_reads_trading_state_from_shared_daemon() {
         let root = temp_dir("runtime-live-read");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -4525,61 +4635,55 @@ mod tests {
                 purpose: TradingIntentPurpose::Entry,
                 created_at: chrono::Utc::now(),
             })
+            .await
             .expect("submit intent");
 
         let state = Arc::new(AppState {
-            daemon: Arc::new(Mutex::new(daemon)),
+            daemon: Arc::new(tokio::sync::Mutex::new(daemon)),
             events: Arc::new(EventBroker::default()),
         });
 
-        let (status_code, body) = handle_runtime_request("GET", "/api/trading/state", None, &state);
+        let (status_code, body) =
+            handle_runtime_request("GET", "/api/trading/state", None, &state).await;
         assert_eq!(status_code, 200);
         assert!(body.contains("\"deployment_id\":\"example.live\""));
         assert!(body.contains("\"venue_order_id\":\"venue-live-http-2\""));
     }
 
-    #[test]
-    fn handle_runtime_request_reports_structured_not_found_error() {
+    #[tokio::test]
+    async fn handle_runtime_request_reports_structured_not_found_error() {
         let daemon = crate::runtime::PloyDaemon::boot(&crate::config::PlatformConfig::default())
             .expect("boot daemon");
         let state = Arc::new(AppState {
-            daemon: Arc::new(Mutex::new(daemon)),
+            daemon: Arc::new(tokio::sync::Mutex::new(daemon)),
             events: Arc::new(EventBroker::default()),
         });
 
         let (status_code, body) =
-            handle_runtime_request("GET", "/api/deployments/missing.paper", None, &state);
+            handle_runtime_request("GET", "/api/deployments/missing.paper", None, &state).await;
         assert_eq!(status_code, 404);
         assert!(body.contains("\"error\":\"deployment_not_found\""));
         assert!(body.contains("\"message\""));
         assert!(body.contains("missing.paper"));
     }
 
-    #[test]
-    fn handle_runtime_request_reports_poisoned_lock_as_503() {
+    #[tokio::test]
+    async fn handle_runtime_request_uses_async_daemon_lock() {
         let daemon = crate::runtime::PloyDaemon::boot(&crate::config::PlatformConfig::default())
             .expect("boot daemon");
-        let poisoned = Arc::new(Mutex::new(daemon));
-        let poison_handle = poisoned.clone();
-        let _ = std::thread::spawn(move || {
-            let _guard = poison_handle.lock().expect("lock daemon");
-            panic!("poison daemon lock for test");
-        })
-        .join();
-
         let state = Arc::new(AppState {
-            daemon: poisoned,
+            daemon: Arc::new(tokio::sync::Mutex::new(daemon)),
             events: Arc::new(EventBroker::default()),
         });
 
         let (status_code, body) =
-            handle_runtime_request("GET", "/api/deployments/missing.paper", None, &state);
-        assert_eq!(status_code, 503);
-        assert!(body.contains("\"error\":\"daemon_lock_poisoned\""));
+            handle_runtime_request("GET", "/api/deployments/missing.paper", None, &state).await;
+        assert_eq!(status_code, 404);
+        assert!(body.contains("\"error\":\"deployment_not_found\""));
     }
 
-    #[test]
-    fn handle_runtime_request_reads_single_agent_run_detail() {
+    #[tokio::test]
+    async fn handle_runtime_request_reads_single_agent_run_detail() {
         let root = temp_dir("runtime-agent-run-detail");
         let runtime_root = root.join("run/platform");
         let agent_runs_file = root.join("run/sidecar/agent-runs.jsonl");
@@ -4645,19 +4749,20 @@ mod tests {
 
         let daemon = crate::runtime::PloyDaemon::boot(&config).expect("boot daemon");
         let state = Arc::new(AppState {
-            daemon: Arc::new(Mutex::new(daemon)),
+            daemon: Arc::new(tokio::sync::Mutex::new(daemon)),
             events: Arc::new(EventBroker::default()),
         });
 
         let (status_code, body) =
-            handle_runtime_request("GET", "/api/agent/runs/run-operator-detail", None, &state);
+            handle_runtime_request("GET", "/api/agent/runs/run-operator-detail", None, &state)
+                .await;
         assert_eq!(status_code, 200);
         assert!(body.contains("\"run_id\":\"run-operator-detail\""));
         assert!(body.contains("\"diagnostic_candidates\":[\"example.paper\"]"));
     }
 
-    #[test]
-    fn handle_runtime_request_reads_nullable_sidecar_agent_runs() {
+    #[tokio::test]
+    async fn handle_runtime_request_reads_nullable_sidecar_agent_runs() {
         let root = temp_dir("runtime-agent-run-nullable");
         let runtime_root = root.join("run/platform");
         let agent_runs_file = root.join("run/sidecar/agent-runs.jsonl");
@@ -4704,18 +4809,19 @@ mod tests {
 
         let daemon = crate::runtime::PloyDaemon::boot(&config).expect("boot daemon");
         let state = Arc::new(AppState {
-            daemon: Arc::new(Mutex::new(daemon)),
+            daemon: Arc::new(tokio::sync::Mutex::new(daemon)),
             events: Arc::new(EventBroker::default()),
         });
 
-        let (status_code, body) = handle_runtime_request("GET", "/api/agent/runs", None, &state);
+        let (status_code, body) =
+            handle_runtime_request("GET", "/api/agent/runs", None, &state).await;
         assert_eq!(status_code, 200);
         assert!(body.contains("\"run_id\":\"run-nullable\""));
         assert!(body.contains("\"finished_at\":null"));
     }
 
-    #[test]
-    fn handle_runtime_request_reads_harness_memory() {
+    #[tokio::test]
+    async fn handle_runtime_request_reads_harness_memory() {
         let root = temp_dir("runtime-harness-memory");
         let runtime_root = root.join("run/platform");
         let agent_runs_file = root.join("run/sidecar/agent-runs.jsonl");
@@ -4755,12 +4861,12 @@ mod tests {
 
         let daemon = crate::runtime::PloyDaemon::boot(&config).expect("boot daemon");
         let state = Arc::new(AppState {
-            daemon: Arc::new(Mutex::new(daemon)),
+            daemon: Arc::new(tokio::sync::Mutex::new(daemon)),
             events: Arc::new(EventBroker::default()),
         });
 
         let (status_code, body) =
-            handle_runtime_request("GET", "/api/agent/harness-memory", None, &state);
+            handle_runtime_request("GET", "/api/agent/harness-memory", None, &state).await;
         assert_eq!(status_code, 200);
         assert!(body.contains("use grok-evidence"));
         assert!(body.contains("\"event_count\":1"));
@@ -4768,8 +4874,8 @@ mod tests {
         assert!(!body.contains("harness-context.md"));
     }
 
-    #[test]
-    fn handle_runtime_request_queues_agent_run_request() {
+    #[tokio::test]
+    async fn handle_runtime_request_queues_agent_run_request() {
         let root = temp_dir("runtime-agent-run-queue");
         let runtime_root = root.join("run/platform");
         let agent_runs_file = root.join("run/sidecar/agent-runs.jsonl");
@@ -4793,7 +4899,7 @@ mod tests {
 
         let daemon = crate::runtime::PloyDaemon::boot(&config).expect("boot daemon");
         let state = Arc::new(AppState {
-            daemon: Arc::new(Mutex::new(daemon)),
+            daemon: Arc::new(tokio::sync::Mutex::new(daemon)),
             events: Arc::new(EventBroker::default()),
         });
 
@@ -4811,7 +4917,7 @@ mod tests {
         .to_string();
 
         let (status_code, body) =
-            handle_runtime_request("POST", "/api/agent/runs", Some(&request), &state);
+            handle_runtime_request("POST", "/api/agent/runs", Some(&request), &state).await;
         assert_eq!(status_code, 202);
         let response: ploy_operator_contracts::AgentRunCreateResponse =
             serde_json::from_str(&body).expect("queue response");
@@ -4832,7 +4938,7 @@ mod tests {
             "budget_usd":1.0, "run_packet":"packet", "run_contract":"contract"
         }).to_string();
         let (status_code, body) =
-            handle_runtime_request("POST", "/api/agent/runs", Some(&over_limit), &state);
+            handle_runtime_request("POST", "/api/agent/runs", Some(&over_limit), &state).await;
         assert_eq!(status_code, 400);
         assert!(body.contains("agent_run_limits_exceeded"));
 
@@ -4849,7 +4955,7 @@ mod tests {
             })
             .to_string();
             let (status_code, body) =
-                handle_runtime_request("POST", "/api/agent/runs", Some(&invalid), &state);
+                handle_runtime_request("POST", "/api/agent/runs", Some(&invalid), &state).await;
             assert_eq!(status_code, 400);
             assert!(body.contains("agent_run_limits_exceeded"));
         }
@@ -4861,14 +4967,14 @@ mod tests {
             r#"{"objective":"bounded","strategy_profile":"test","autonomy_mode":"research_until_blocked","target_evidence":"diagnostic","symbols":[],"max_turns":1,"budget_usd":Infinity,"run_packet":"packet","run_contract":"contract"}"#,
         ] {
             let (status_code, body) =
-                handle_runtime_request("POST", "/api/agent/runs", Some(invalid_json), &state);
+                handle_runtime_request("POST", "/api/agent/runs", Some(invalid_json), &state).await;
             assert_eq!(status_code, 400);
             assert!(body.contains("invalid_json"));
         }
     }
 
-    #[test]
-    fn append_jsonl_normalizes_a_complete_tail_without_newline() {
+    #[tokio::test]
+    async fn append_jsonl_normalizes_a_complete_tail_without_newline() {
         let root = temp_dir("jsonl-complete-tail");
         let path = root.join("events.jsonl");
         fs::create_dir_all(&root).expect("create temp root");
@@ -4883,8 +4989,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn append_jsonl_refuses_to_join_onto_a_truncated_tail() {
+    #[tokio::test]
+    async fn append_jsonl_refuses_to_join_onto_a_truncated_tail() {
         let root = temp_dir("jsonl-truncated-tail");
         let path = root.join("events.jsonl");
         fs::create_dir_all(&root).expect("create temp root");
@@ -4901,8 +5007,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn handle_runtime_request_creates_and_lists_proposals() {
+    #[tokio::test]
+    async fn handle_runtime_request_creates_and_lists_proposals() {
         let root = temp_dir("runtime-proposals-create");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -4935,7 +5041,7 @@ mod tests {
 
         let daemon = crate::runtime::PloyDaemon::boot(&config).expect("boot daemon");
         let state = Arc::new(AppState {
-            daemon: Arc::new(Mutex::new(daemon)),
+            daemon: Arc::new(tokio::sync::Mutex::new(daemon)),
             events: Arc::new(EventBroker::default()),
         });
 
@@ -4950,20 +5056,20 @@ mod tests {
         .expect("proposal create json");
 
         let (create_code, create_response) =
-            handle_runtime_request("POST", "/api/proposals", Some(&create_body), &state);
+            handle_runtime_request("POST", "/api/proposals", Some(&create_body), &state).await;
         assert_eq!(create_code, 200);
         assert!(create_response.contains("\"proposal_id\""));
         assert!(create_response.contains("\"action_kind\":\"pause_deployment\""));
 
         let (list_code, list_response) =
-            handle_runtime_request("GET", "/api/proposals", None, &state);
+            handle_runtime_request("GET", "/api/proposals", None, &state).await;
         assert_eq!(list_code, 200);
         assert!(list_response.contains("\"proposal_id\""));
         assert!(list_response.contains("\"status\":\"pending\""));
     }
 
-    #[test]
-    fn handle_runtime_request_reads_single_proposal_detail() {
+    #[tokio::test]
+    async fn handle_runtime_request_reads_single_proposal_detail() {
         let root = temp_dir("runtime-proposals-detail");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -4995,7 +5101,7 @@ mod tests {
 
         let daemon = crate::runtime::PloyDaemon::boot(&config).expect("boot daemon");
         let state = Arc::new(AppState {
-            daemon: Arc::new(Mutex::new(daemon)),
+            daemon: Arc::new(tokio::sync::Mutex::new(daemon)),
             events: Arc::new(EventBroker::default()),
         });
 
@@ -5010,7 +5116,7 @@ mod tests {
         .expect("proposal create json");
 
         let (_, create_response) =
-            handle_runtime_request("POST", "/api/proposals", Some(&create_body), &state);
+            handle_runtime_request("POST", "/api/proposals", Some(&create_body), &state).await;
         let proposal =
             serde_json::from_str::<ploy_operator_contracts::SafetyProposal>(&create_response)
                 .expect("proposal json");
@@ -5020,14 +5126,15 @@ mod tests {
             &format!("/api/proposals/{}", proposal.proposal_id),
             None,
             &state,
-        );
+        )
+        .await;
         assert_eq!(status_code, 200);
         assert!(body.contains(&proposal.proposal_id));
         assert!(body.contains("\"source_run_id\":\"run-detail-1\""));
     }
 
-    #[test]
-    fn handle_runtime_request_approves_pause_proposal_through_control_plane() {
+    #[tokio::test]
+    async fn handle_runtime_request_approves_pause_proposal_through_control_plane() {
         let root = temp_dir("runtime-proposals-approve");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -5060,7 +5167,7 @@ mod tests {
 
         let daemon = crate::runtime::PloyDaemon::boot(&config).expect("boot daemon");
         let state = Arc::new(AppState {
-            daemon: Arc::new(Mutex::new(daemon)),
+            daemon: Arc::new(tokio::sync::Mutex::new(daemon)),
             events: Arc::new(EventBroker::default()),
         });
 
@@ -5075,7 +5182,7 @@ mod tests {
         .expect("proposal create json");
 
         let (_, create_response) =
-            handle_runtime_request("POST", "/api/proposals", Some(&create_body), &state);
+            handle_runtime_request("POST", "/api/proposals", Some(&create_body), &state).await;
         let proposal_id =
             serde_json::from_str::<ploy_operator_contracts::SafetyProposal>(&create_response)
                 .expect("proposal json")
@@ -5091,12 +5198,13 @@ mod tests {
             &format!("/api/proposals/{proposal_id}/approve"),
             Some(&approve_body),
             &state,
-        );
+        )
+        .await;
         assert_eq!(approve_code, 200);
         assert!(approve_response.contains("\"status\":\"approved\""));
 
         let (deployment_code, deployment_response) =
-            handle_runtime_request("GET", "/api/deployments/example.paper", None, &state);
+            handle_runtime_request("GET", "/api/deployments/example.paper", None, &state).await;
         assert_eq!(deployment_code, 200);
         assert!(deployment_response.contains("\"desired_state\":\"paused\""));
     }

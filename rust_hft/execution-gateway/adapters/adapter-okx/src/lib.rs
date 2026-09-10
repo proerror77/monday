@@ -497,7 +497,7 @@ impl ExecutionClient for OkxExecutionClient {
         order_id: &OrderId,
         new_quantity: Option<Quantity>,
         new_price: Option<Price>,
-    ) -> HftResult<()> {
+    ) -> HftResult<OrderId> {
         if self.cfg.mode != ExecutionMode::Live {
             if let Some(ref tx) = self.event_tx {
                 let _ = tx.send(ExecutionEvent::OrderModified {
@@ -507,7 +507,7 @@ impl ExecutionClient for OkxExecutionClient {
                     timestamp: hft_core::now_micros(),
                 });
             }
-            return Ok(());
+            return Ok(order_id.clone());
         }
 
         self.ensure_http()?;
@@ -615,7 +615,7 @@ impl ExecutionClient for OkxExecutionClient {
             }
         }
 
-        result
+        result.map(|_| order_id.clone())
     }
 
     async fn execution_stream(&self) -> HftResult<BoxStream<ExecutionEvent>> {

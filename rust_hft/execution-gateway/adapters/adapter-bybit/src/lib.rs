@@ -1368,7 +1368,7 @@ impl ExecutionClient for BybitExecutionClient {
         order_id: &OrderId,
         new_quantity: Option<Quantity>,
         new_price: Option<Price>,
-    ) -> HftResult<()> {
+    ) -> HftResult<OrderId> {
         if matches!(
             self.config.mode,
             ExecutionMode::Live | ExecutionMode::Testnet
@@ -1450,7 +1450,7 @@ impl ExecutionClient for BybitExecutionClient {
                     timestamp: hft_core::now_micros(),
                 });
             }
-            return Ok(());
+            return Ok(order_id.clone());
         }
         if let Some(ref tx) = self.event_tx {
             let _ = tx.send(ExecutionEvent::OrderModified {
@@ -1460,7 +1460,7 @@ impl ExecutionClient for BybitExecutionClient {
                 timestamp: hft_core::now_micros(),
             });
         }
-        Ok(())
+        Ok(order_id.clone())
     }
 
     async fn execution_stream(&self) -> HftResult<BoxStream<ExecutionEvent>> {

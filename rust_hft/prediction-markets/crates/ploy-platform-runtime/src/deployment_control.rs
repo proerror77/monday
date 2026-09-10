@@ -3,7 +3,7 @@ use ploy_operator_contracts::{
     DesiredState, ObservedState,
 };
 use ploy_platform::{DeploymentRecord, DeploymentRegistry};
-use ploy_trading::{IntentPurpose, OrderRecord, TradingIntent};
+use portfolio_core::prediction::{IntentPurpose, OrderRecord, TradingIntent};
 use rust_decimal::Decimal;
 use std::io;
 
@@ -445,7 +445,7 @@ mod tests {
         ObservedState,
     };
     use ploy_platform::DeploymentRegistry;
-    use ploy_trading::{IntentPurpose, TradeSide, TradingIntent};
+    use portfolio_core::prediction::{IntentPurpose, TradeSide, TradingIntent};
     use rust_decimal_macros::dec;
 
     use crate::runtime_support::{IntentAdmissionSource, IntentRiskEffect};

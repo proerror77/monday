@@ -1490,7 +1490,7 @@ impl ExecutionClient for BitgetExecutionClient {
         order_id: &OrderId,
         new_quantity: Option<Quantity>,
         new_price: Option<Price>,
-    ) -> HftResult<()> {
+    ) -> HftResult<OrderId> {
         if self.config.mode == ExecutionMode::Paper {
             info!(
                 "模擬修改訂單: {} - 數量: {:?}, 價格: {:?}",
@@ -1507,7 +1507,7 @@ impl ExecutionClient for BitgetExecutionClient {
                 });
             }
 
-            return Ok(());
+            return Ok(order_id.clone());
         }
 
         if self.http_client.is_none() {
@@ -1608,7 +1608,7 @@ impl ExecutionClient for BitgetExecutionClient {
             }
         }
 
-        result
+        result.map(|_| order_id.clone())
     }
 
     async fn execution_stream(&self) -> HftResult<BoxStream<ExecutionEvent>> {

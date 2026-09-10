@@ -1,15 +1,14 @@
-use crate::{build_order_control_response, io_error_from_execution_error, order_state_wire};
-use ploy_connectivity::{
-    CancellationOutcome, CancellationRequest, LiveExecutionGateway, ReplaceOutcome, ReplaceRequest,
-};
+use crate::execution_client::execution_io_error;
+use crate::{build_order_control_response, order_state_wire};
 use ploy_operator_contracts::{DeploymentRuntimeMode, OrderControlResponse, OrderReplaceRequest};
 use ploy_platform::DeploymentRecord;
-use ploy_trading::{OrderState, TradingRuntime};
+use portfolio_core::prediction::{OrderState, TradingRuntime};
+use ports::ExecutionClient;
 use std::io;
 
 fn reject_submission_in_progress(
     deployment: &DeploymentRecord,
-    order: &ploy_trading::OrderRecord,
+    order: &portfolio_core::prediction::OrderRecord,
 ) -> io::Result<()> {
     if deployment.runtime_mode == DeploymentRuntimeMode::Live
         && order.state == OrderState::Pending
@@ -23,9 +22,9 @@ fn reject_submission_in_progress(
     Ok(())
 }
 
-pub fn cancel_order(
+pub async fn cancel_order(
     runtime: &mut TradingRuntime,
-    gateway: &dyn LiveExecutionGateway,
+    client: &mut dyn ExecutionClient,
     deployment: &DeploymentRecord,
     deployment_id: &str,
     order_id: &str,
@@ -54,20 +53,10 @@ pub fn cancel_order(
         DeploymentRuntimeMode::Paper => {}
         DeploymentRuntimeMode::Live => {
             if let Some(venue_order_id) = order.venue_order_id.clone() {
-                let cancel_result = gateway.cancel(&CancellationRequest {
-                    order_id: order_id.to_string(),
-                    venue_order_id,
-                });
-                match cancel_result {
-                    Ok(CancellationOutcome::Canceled) => {}
-                    Ok(CancellationOutcome::Rejected { reason }) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("live cancel rejected: {reason}"),
-                        ));
-                    }
-                    Err(err) => return Err(io_error_from_execution_error(err)),
-                }
+                client
+                    .cancel_order(&hft_core::OrderId(venue_order_id))
+                    .await
+                    .map_err(execution_io_error)?;
             }
         }
     }
@@ -81,9 +70,9 @@ pub fn cancel_order(
     ))
 }
 
-pub fn replace_order(
+pub async fn replace_order(
     runtime: &mut TradingRuntime,
-    gateway: &dyn LiveExecutionGateway,
+    client: &mut dyn ExecutionClient,
     deployment: &DeploymentRecord,
     deployment_id: &str,
     order_id: &str,
@@ -137,58 +126,29 @@ pub fn replace_order(
                     format!("order `{order_id}` has no live venue order to replace"),
                 )
             })?;
-            let side = runtime
-                .intent(&order.intent_id)
-                .map(|intent| intent.side)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!(
-                            "intent `{}` for order `{order_id}` was not found",
-                            order.intent_id
-                        ),
-                    )
+            let new_venue_order_id = client
+                .modify_order(
+                    &hft_core::OrderId(venue_order_id.clone()),
+                    Some(hft_core::Quantity(request.quantity)),
+                    request.limit_price.map(hft_core::Price),
+                )
+                .await
+                .map_err(|error| {
+                    let _ = runtime.record_order_error(order_id, error.to_string());
+                    execution_io_error(error)
                 })?;
-
-            match gateway.replace(&ReplaceRequest {
-                order_id: order_id.to_string(),
-                venue_order_id,
-                token_id: order.token_id.clone(),
-                side,
-                quantity: request.quantity,
-                limit_price: request.limit_price,
-            }) {
-                Ok(ReplaceOutcome::Replaced { venue_order_id }) => {
-                    let updated = runtime
-                        .replace_order(
-                            order_id,
-                            request.quantity,
-                            request.limit_price,
-                            venue_order_id,
-                        )
-                        .ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::NotFound, "order not found")
-                        })?;
-                    Ok(build_order_control_response(
-                        deployment_id.to_string(),
-                        updated,
-                    ))
-                }
-                Ok(ReplaceOutcome::Rejected { reason }) => Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("live replace rejected: {reason}"),
-                )),
-                Ok(ReplaceOutcome::PartialFailure { reason }) => {
-                    let message = format!("live replace partially failed after cancel: {reason}");
-                    let _ = runtime.cancel_order(order_id);
-                    let _ = runtime.record_order_error(order_id, message.clone());
-                    Err(io::Error::other(message))
-                }
-                Err(err) => {
-                    let _ = runtime.record_order_error(order_id, err.to_string());
-                    Err(io_error_from_execution_error(err))
-                }
-            }
+            let updated = runtime
+                .replace_order(
+                    order_id,
+                    request.quantity,
+                    request.limit_price,
+                    new_venue_order_id.0,
+                )
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "order not found"))?;
+            Ok(build_order_control_response(
+                deployment_id.to_string(),
+                updated,
+            ))
         }
         DeploymentRuntimeMode::Paper => {
             let next_revision = order.revision + 1;
@@ -213,15 +173,12 @@ pub fn replace_order(
 mod tests {
     use super::{cancel_order, replace_order};
     use crate::test_support::StaticExecutionGateway;
-    use ploy_connectivity::{
-        CancellationOutcome, CancellationRequest, ExecutionError, ExecutionOutcome,
-        ExecutionRequest, LiveExecutionGateway, ReplaceOutcome, ReplaceRequest, TrackedOrder,
-    };
+    use async_trait::async_trait;
     use ploy_operator_contracts::{
         DeploymentState, DesiredState, ObservedState, OrderReplaceRequest,
     };
     use ploy_platform::DeploymentRecord;
-    use ploy_trading::{
+    use portfolio_core::prediction::{
         FillRecord, IntentPurpose, OrderState, TradeSide, TradingIntent, TradingRuntime,
     };
     use rust_decimal::Decimal;
@@ -235,35 +192,62 @@ mod tests {
         replacements: AtomicUsize,
     }
 
-    impl LiveExecutionGateway for CountingControlGateway {
-        fn probe(&self) -> Result<(), ExecutionError> {
-            Ok(())
-        }
-
-        fn submit(&self, _request: &ExecutionRequest) -> Result<ExecutionOutcome, ExecutionError> {
+    #[async_trait]
+    impl ports::ExecutionClient for CountingControlGateway {
+        async fn place_order(
+            &mut self,
+            _intent: ports::OrderIntent,
+        ) -> Result<hft_core::OrderId, hft_core::HftError> {
             unreachable!("submit is not used by replacement tests")
         }
 
-        fn cancel(
-            &self,
-            _request: &CancellationRequest,
-        ) -> Result<CancellationOutcome, ExecutionError> {
+        async fn cancel_order(
+            &mut self,
+            _order_id: &hft_core::OrderId,
+        ) -> Result<(), hft_core::HftError> {
             self.cancellations.fetch_add(1, Ordering::SeqCst);
-            Ok(CancellationOutcome::Canceled)
+            Ok(())
         }
 
-        fn replace(&self, _request: &ReplaceRequest) -> Result<ReplaceOutcome, ExecutionError> {
+        async fn modify_order(
+            &mut self,
+            order_id: &hft_core::OrderId,
+            _new_quantity: Option<hft_core::Quantity>,
+            _new_price: Option<hft_core::Price>,
+        ) -> Result<hft_core::OrderId, hft_core::HftError> {
             self.replacements.fetch_add(1, Ordering::SeqCst);
-            Ok(ReplaceOutcome::Replaced {
-                venue_order_id: "venue-exit-r1".to_string(),
-            })
+            Ok(order_id.clone())
         }
 
-        fn reconcile_fills(
+        async fn execution_stream(
             &self,
-            _tracked_orders: &[TrackedOrder],
-        ) -> Result<Vec<FillRecord>, ExecutionError> {
-            unreachable!("reconcile is not used by replacement tests")
+        ) -> Result<ports::BoxStream<ports::ExecutionEvent>, hft_core::HftError> {
+            unreachable!("reconcile is not used")
+        }
+        async fn list_open_orders(&self) -> Result<Vec<ports::OpenOrder>, hft_core::HftError> {
+            Ok(Vec::new())
+        }
+        async fn list_recent_fills(&self) -> Result<Vec<ports::AccountFill>, hft_core::HftError> {
+            Ok(Vec::new())
+        }
+        async fn get_balance(&self) -> Result<Vec<ports::AccountBalance>, hft_core::HftError> {
+            Ok(Vec::new())
+        }
+        async fn get_positions(&self) -> Result<Vec<ports::Position>, hft_core::HftError> {
+            Ok(Vec::new())
+        }
+        async fn connect(&mut self) -> Result<(), hft_core::HftError> {
+            Ok(())
+        }
+        async fn disconnect(&mut self) -> Result<(), hft_core::HftError> {
+            Ok(())
+        }
+        async fn health(&self) -> ports::ConnectionHealth {
+            ports::ConnectionHealth {
+                connected: true,
+                latency_ms: Some(0.0),
+                last_heartbeat: 0,
+            }
         }
     }
 
@@ -303,65 +287,32 @@ mod tests {
         runtime
     }
 
-    #[test]
-    fn cancel_live_order_updates_runtime() {
+    #[tokio::test]
+    async fn cancel_live_order_updates_runtime() {
         let mut runtime = seeded_runtime();
-        let gateway = StaticExecutionGateway::acknowledged("venue-1")
-            .with_cancel_result(Ok(CancellationOutcome::Canceled));
+        let mut gateway =
+            StaticExecutionGateway::acknowledged("venue-1").with_cancel_result(Ok(()));
         let response = cancel_order(
             &mut runtime,
-            &gateway,
+            &mut gateway,
             &live_deployment(),
             "example.live",
             "order-1",
         )
+        .await
         .expect("cancel");
         assert_eq!(response.state, "canceled");
     }
 
-    #[test]
-    fn replace_rejects_invalid_quantity() {
+    #[tokio::test]
+    async fn replace_live_persists_new_venue_identity_and_history_across_restore() {
         let mut runtime = seeded_runtime();
-        runtime.record_fill(ploy_trading::FillRecord {
-            fill_id: "fill-1".to_string(),
-            order_id: "order-1".to_string(),
-            token_id: "token-1".to_string(),
-            side: TradeSide::Buy,
-            quantity: dec!(1.5),
-            price: dec!(0.45),
-            fee: dec!(0.01),
-            timestamp: chrono::Utc::now(),
-        });
-        let gateway =
-            StaticExecutionGateway::failed(ExecutionError::Transport("offline".to_string()));
-        let error = replace_order(
-            &mut runtime,
-            &gateway,
-            &live_deployment(),
-            "example.live",
-            "order-1",
-            OrderReplaceRequest {
-                quantity: dec!(1),
-                limit_price: Some(dec!(0.47)),
-            },
-            dec!(2),
-        )
-        .expect_err("invalid quantity");
-        assert_eq!(error.kind(), ErrorKind::InvalidInput);
-    }
+        let mut gateway = StaticExecutionGateway::acknowledged("venue-1")
+            .with_replace_result(Ok(hft_core::OrderId("venue-2".to_string())));
 
-    #[test]
-    fn replace_partial_failure_marks_order_canceled_with_error() {
-        let mut runtime = seeded_runtime();
-        let gateway = StaticExecutionGateway::acknowledged("venue-1").with_replace_result(Ok(
-            ReplaceOutcome::PartialFailure {
-                reason: "submit rejected".to_string(),
-            },
-        ));
-
-        let error = replace_order(
+        let response = replace_order(
             &mut runtime,
-            &gateway,
+            &mut gateway,
             &live_deployment(),
             "example.live",
             "order-1",
@@ -371,19 +322,85 @@ mod tests {
             },
             dec!(2),
         )
+        .await
+        .expect("replace persists the venue identity returned by the client");
+
+        assert_eq!(response.venue_order_id.as_deref(), Some("venue-2"));
+        assert_eq!(response.venue_order_history, vec!["venue-1"]);
+
+        let restored =
+            TradingRuntime::restore(runtime.snapshot(&std::collections::BTreeMap::new()))
+                .expect("canonical runtime restore");
+        let restored_order = restored.order("order-1").expect("restored order");
+        assert_eq!(restored_order.venue_order_id.as_deref(), Some("venue-2"));
+        assert_eq!(restored_order.venue_order_history, vec!["venue-1"]);
+    }
+
+    #[tokio::test]
+    async fn replace_rejects_invalid_quantity() {
+        let mut runtime = seeded_runtime();
+        runtime.record_fill(portfolio_core::prediction::FillRecord {
+            fill_id: "fill-1".to_string(),
+            order_id: "order-1".to_string(),
+            token_id: "token-1".to_string(),
+            side: TradeSide::Buy,
+            quantity: dec!(1.5),
+            price: dec!(0.45),
+            fee: dec!(0.01),
+            timestamp: chrono::Utc::now(),
+        });
+        let mut gateway =
+            StaticExecutionGateway::failed(hft_core::HftError::Network("offline".to_string()));
+        let error = replace_order(
+            &mut runtime,
+            &mut gateway,
+            &live_deployment(),
+            "example.live",
+            "order-1",
+            OrderReplaceRequest {
+                quantity: dec!(1),
+                limit_price: Some(dec!(0.47)),
+            },
+            dec!(2),
+        )
+        .await
+        .expect_err("invalid quantity");
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn replace_partial_failure_marks_order_canceled_with_error() {
+        let mut runtime = seeded_runtime();
+        let mut gateway = StaticExecutionGateway::failed(hft_core::HftError::Exchange(
+            "submit rejected".to_string(),
+        ));
+
+        let error = replace_order(
+            &mut runtime,
+            &mut gateway,
+            &live_deployment(),
+            "example.live",
+            "order-1",
+            OrderReplaceRequest {
+                quantity: dec!(2),
+                limit_price: Some(dec!(0.47)),
+            },
+            dec!(2),
+        )
+        .await
         .expect_err("partial failure should be surfaced");
 
-        assert_eq!(error.kind(), ErrorKind::Other);
+        assert_eq!(error.kind(), ErrorKind::ConnectionAborted);
         let order = runtime.order("order-1").expect("order");
-        assert_eq!(order.state, OrderState::Canceled);
+        assert_eq!(order.state, OrderState::Acknowledged);
         assert_eq!(
             order.last_error.as_deref(),
-            Some("live replace partially failed after cancel: submit rejected")
+            Some("交易所錯誤: submit rejected")
         );
     }
 
-    #[test]
-    fn replace_exit_cannot_exceed_remaining_reducible_position() {
+    #[tokio::test]
+    async fn replace_exit_cannot_exceed_remaining_reducible_position() {
         let mut runtime = TradingRuntime::default();
         runtime
             .submit_intent(
@@ -449,11 +466,11 @@ mod tests {
             .expect("second reduction reserves remaining position");
         runtime.acknowledge_order("order-reduce", "venue-reduce");
         let before = runtime.snapshot(&std::collections::BTreeMap::new());
-        let gateway = CountingControlGateway::default();
+        let mut gateway = CountingControlGateway::default();
 
         let error = replace_order(
             &mut runtime,
-            &gateway,
+            &mut gateway,
             &live_deployment(),
             "example.live",
             "order-exit",
@@ -463,6 +480,7 @@ mod tests {
             },
             dec!(0),
         )
+        .await
         .expect_err("replacement would flip short position");
 
         assert_eq!(error.kind(), ErrorKind::InvalidInput);
@@ -470,8 +488,8 @@ mod tests {
         assert_eq!(runtime.snapshot(&std::collections::BTreeMap::new()), before);
     }
 
-    #[test]
-    fn live_submission_in_progress_cannot_be_canceled_or_replaced() {
+    #[tokio::test]
+    async fn live_submission_in_progress_cannot_be_canceled_or_replaced() {
         let runtime = seeded_runtime();
         let snapshot = runtime.snapshot(&std::collections::BTreeMap::new());
         let mut pending = TradingRuntime::default();
@@ -479,19 +497,20 @@ mod tests {
         pending
             .submit_intent(intent, "order-1", None)
             .expect("pending order");
-        let gateway = CountingControlGateway::default();
+        let mut gateway = CountingControlGateway::default();
 
         let cancel_error = cancel_order(
             &mut pending,
-            &gateway,
+            &mut gateway,
             &live_deployment(),
             "example.live",
             "order-1",
         )
+        .await
         .expect_err("pending live submission cannot be canceled");
         let replace_error = replace_order(
             &mut pending,
-            &gateway,
+            &mut gateway,
             &live_deployment(),
             "example.live",
             "order-1",
@@ -501,6 +520,7 @@ mod tests {
             },
             Decimal::ZERO,
         )
+        .await
         .expect_err("pending live submission cannot be replaced");
 
         assert_eq!(cancel_error.kind(), ErrorKind::InvalidInput);

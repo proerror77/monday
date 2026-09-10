@@ -22,8 +22,8 @@ Start with focused checks:
 
 ```bash
 cargo +1.98.1 metadata --locked --no-deps --format-version 1
-cargo +1.98.1 fmt --all -- --check
-cargo +1.98.1 test --locked -p ploy-connectivity -p ploy-daemon-host
+cargo +1.98.1 fmt -p ploy-platform-runtime -p ploy-daemon-host -- --check
+cargo +1.98.1 test --locked -p ploy-platform-runtime -p ploy-daemon-host
 cargo +1.98.1 check --locked -p new-ploy-runner --features full
 ```
 

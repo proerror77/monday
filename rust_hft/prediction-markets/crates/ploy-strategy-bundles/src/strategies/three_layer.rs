@@ -1,7 +1,7 @@
 //! Three-layer strategy config and regime classification.
 
 use chrono::{DateTime, Utc};
-use ploy_trading::{
+use portfolio_core::prediction::{
     FillRecord, IntentPurpose, OrderLedger, OrderState, PositionLedger, TradeSide, TradingIntent,
 };
 use rust_decimal::prelude::ToPrimitive;
@@ -2812,6 +2812,7 @@ mod tests {
         EventMlFeatureStandardizer, EventMlFeatureWeight, EventMlStandardizer,
     };
     use super::*;
+    use portfolio_core::prediction::TradingRuntime;
     use rust_decimal_macros::dec;
 
     #[test]
@@ -3113,10 +3114,25 @@ mod tests {
     }
 
     fn position_with_token(token_id: &str, now: DateTime<Utc>) -> PositionLedger {
-        let mut positions = PositionLedger::default();
-        positions.apply_fill(&FillRecord {
+        let mut trading = TradingRuntime::default();
+        let intent = TradingIntent {
+            intent_id: format!("seed-{token_id}"),
+            deployment_id: "three-layer-live".into(),
+            market_id: "evt1".into(),
+            token_id: token_id.to_string(),
+            side: TradeSide::Buy,
+            quantity: dec!(10),
+            limit_price: Some(dec!(0.45)),
+            purpose: IntentPurpose::Entry,
+            created_at: now,
+        };
+        trading
+            .submit_intent(intent, format!("seed-order-{token_id}"), None)
+            .unwrap();
+        trading.acknowledge_order(&format!("seed-order-{token_id}"), "seed-venue");
+        trading.record_fill(FillRecord {
             fill_id: format!("fill-{token_id}"),
-            order_id: format!("order-{token_id}"),
+            order_id: format!("seed-order-{token_id}"),
             token_id: token_id.to_string(),
             side: TradeSide::Buy,
             quantity: dec!(10),
@@ -3124,11 +3140,36 @@ mod tests {
             fee: Decimal::ZERO,
             timestamp: now,
         });
-        positions
+        trading.positions().clone()
     }
 
     fn active_order_for_token(token_id: &str, now: DateTime<Utc>) -> OrderLedger {
-        let mut orders = OrderLedger::default();
+        let mut trading = TradingRuntime::default();
+        let seed = TradingIntent {
+            intent_id: format!("seed-{token_id}"),
+            deployment_id: "three-layer-live".into(),
+            market_id: "evt1".into(),
+            token_id: token_id.to_string(),
+            side: TradeSide::Buy,
+            quantity: dec!(10),
+            limit_price: Some(dec!(0.45)),
+            purpose: IntentPurpose::Entry,
+            created_at: now,
+        };
+        trading
+            .submit_intent(seed, format!("seed-order-{token_id}"), None)
+            .unwrap();
+        trading.acknowledge_order(&format!("seed-order-{token_id}"), "seed-venue");
+        trading.record_fill(FillRecord {
+            fill_id: format!("seed-fill-{token_id}"),
+            order_id: format!("seed-order-{token_id}"),
+            token_id: token_id.to_string(),
+            side: TradeSide::Buy,
+            quantity: dec!(10),
+            price: dec!(0.45),
+            fee: Decimal::ZERO,
+            timestamp: now,
+        });
         let intent = TradingIntent {
             intent_id: format!("intent-{token_id}"),
             deployment_id: "three-layer-live".into(),
@@ -3140,9 +3181,11 @@ mod tests {
             purpose: IntentPurpose::Exit,
             created_at: now,
         };
-        orders.insert_from_intent(format!("order-{token_id}"), &intent);
-        orders.acknowledge(&format!("order-{token_id}"), format!("venue-{token_id}"));
-        orders
+        trading
+            .submit_intent(intent, format!("order-{token_id}"), None)
+            .unwrap();
+        trading.acknowledge_order(&format!("order-{token_id}"), format!("venue-{token_id}"));
+        trading.orders().clone()
     }
 
     fn take_profit_quote(token_id: &str, ts: DateTime<Utc>) -> MarketUpdate {

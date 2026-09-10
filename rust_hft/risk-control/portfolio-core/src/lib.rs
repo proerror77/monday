@@ -4,6 +4,7 @@
 //! - 多帳戶 PnL 聚合（跨交易所）
 
 pub mod multi_account;
+pub mod prediction;
 
 pub use multi_account::{
     AccountId, AccountPnl, AggregatedAccountView, AggregatedPosition, MultiAccountPortfolio,
@@ -12,6 +13,7 @@ pub use multi_account::{
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -22,18 +24,42 @@ use tracing::{info, warn};
 
 const ACCOUNTING_EVENT_REPLAY_CAPACITY: usize = 200_000;
 
+/// An observed accounting event that was intentionally not applied because
+/// the portfolio cannot prove the event belongs to its canonical state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconciliationException {
+    pub order_id: Option<OrderId>,
+    pub reason: String,
+    pub event: Option<ExecutionEvent>,
+}
+
 /// Portfolio state that can be persisted
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortfolioState {
     pub account_view: AccountView,
+    #[serde(default)]
+    pub total_fees: Decimal,
     pub order_meta: HashMap<OrderId, (Symbol, Side)>,
     pub market_prices: HashMap<Symbol, Price>,
     /// 已處理的成交ID（去重），恢復後避免重覆累計
     #[serde(default)]
     pub processed_fill_ids: HashMap<OrderId, HashSet<String>>,
+    /// Fee identities are a separate namespace from venue fill identities.
+    #[serde(default)]
+    pub processed_fee_ids: HashMap<OrderId, HashSet<String>>,
     /// Accounting event keys ordered oldest to newest for deterministic bounded recovery.
     #[serde(default)]
     pub recent_accounting_event_ids: Vec<(OrderId, String)>,
+    #[serde(default)]
+    pub reconciliation_exceptions: Vec<ReconciliationException>,
+    #[serde(default)]
+    pub canonical_state_digest: Option<String>,
+}
+
+impl PortfolioState {
+    pub fn refresh_canonical_digest(&mut self) {
+        self.canonical_state_digest = Some(canonical_state_digest(self));
+    }
 }
 
 /// 最小 Portfolio：單帳戶，根據 fills 更新倉位/現金與 PnL
@@ -46,8 +72,11 @@ pub struct Portfolio {
     market_prices: HashMap<Symbol, Price>,
     // 已處理的成交 ID（去重）
     processed_fill_ids: HashMap<hft_core::OrderId, HashSet<String>>,
+    processed_fee_ids: HashMap<hft_core::OrderId, HashSet<String>>,
+    total_fees: Decimal,
     // Bounded chronological journal used to restore the engine replay horizon.
     recent_accounting_event_ids: VecDeque<(OrderId, String)>,
+    reconciliation_exceptions: Vec<ReconciliationException>,
 }
 
 impl Default for Portfolio {
@@ -60,7 +89,10 @@ impl Default for Portfolio {
             order_meta: HashMap::new(),
             market_prices: HashMap::new(),
             processed_fill_ids: HashMap::new(),
+            processed_fee_ids: HashMap::new(),
+            total_fees: Decimal::ZERO,
             recent_accounting_event_ids: VecDeque::new(),
+            reconciliation_exceptions: Vec::new(),
         }
     }
 }
@@ -82,7 +114,36 @@ impl Portfolio {
 
     /// 註冊下單元資訊（供 fill 時查找 symbol/side）
     pub fn register_order(&mut self, order_id: hft_core::OrderId, symbol: Symbol, side: Side) {
+        if let Some((existing_symbol, existing_side)) = self.order_meta.get(&order_id) {
+            if existing_symbol == &symbol && *existing_side == side {
+                return;
+            }
+            self.record_exception(
+                Some(order_id),
+                "conflicting portfolio order metadata registration",
+                None,
+            );
+            return;
+        }
         self.order_meta.insert(order_id, (symbol, side));
+    }
+
+    fn record_exception(
+        &mut self,
+        order_id: Option<OrderId>,
+        reason: impl Into<String>,
+        event: Option<&ExecutionEvent>,
+    ) {
+        self.reconciliation_exceptions
+            .push(ReconciliationException {
+                order_id,
+                reason: reason.into(),
+                event: event.cloned(),
+            });
+    }
+
+    pub fn reconciliation_exceptions(&self) -> &[ReconciliationException] {
+        &self.reconciliation_exceptions
     }
 
     /// 處理執行事件，僅處理 Fill/Fee/Balance 類事件
@@ -101,28 +162,49 @@ impl Portfolio {
                         quantity = %quantity.0,
                         "ignoring fill with non-positive quantity"
                     );
+                    self.record_exception(
+                        Some(order_id.clone()),
+                        "fill has non-positive quantity",
+                        Some(event),
+                    );
                     return;
                 }
-                if let Some((symbol, side)) = self.order_meta.get(order_id).cloned() {
-                    // De-duplication: skip duplicated fill_id for this order
-                    let is_new = fill_id.is_empty()
-                        || self
-                            .processed_fill_ids
-                            .entry(order_id.clone())
-                            .or_default()
-                            .insert(fill_id.clone());
-                    if is_new {
-                        if !fill_id.is_empty() {
-                            self.record_accounting_event(
-                                order_id.clone(),
-                                format!("fill:{fill_id}"),
-                            );
-                        }
-                        self.apply_fill(&symbol, side, *price, *quantity);
-                        // Fill price is the freshest executable fallback mark observed by this ledger.
-                        self.market_prices.insert(symbol.clone(), *price);
-                        self.recalculate_unrealized_pnl();
-                    }
+                if price.0 <= Decimal::ZERO {
+                    self.record_exception(
+                        Some(order_id.clone()),
+                        "fill has non-positive price",
+                        Some(event),
+                    );
+                    return;
+                }
+                if fill_id.is_empty() {
+                    self.record_exception(
+                        Some(order_id.clone()),
+                        "fill is missing the venue execution identity",
+                        Some(event),
+                    );
+                    return;
+                }
+                let Some((symbol, side)) = self.order_meta.get(order_id).cloned() else {
+                    self.record_exception(
+                        Some(order_id.clone()),
+                        "fill references an unknown portfolio order",
+                        Some(event),
+                    );
+                    return;
+                };
+                // De-duplication is scoped to the fill namespace only.
+                let is_new = self
+                    .processed_fill_ids
+                    .entry(order_id.clone())
+                    .or_default()
+                    .insert(fill_id.clone());
+                if is_new {
+                    self.record_accounting_event(order_id.clone(), format!("fill:{fill_id}"));
+                    self.apply_fill(&symbol, side, *price, *quantity);
+                    // Fill price is the freshest executable fallback mark observed by this ledger.
+                    self.market_prices.insert(symbol.clone(), *price);
+                    self.recalculate_unrealized_pnl();
                 }
             }
             ExecutionEvent::FeeCharged {
@@ -133,12 +215,25 @@ impl Portfolio {
             } => {
                 if *amount < Decimal::ZERO {
                     warn!(order_id = %order_id.0, amount = %amount, "ignoring negative fee");
+                    self.record_exception(
+                        Some(order_id.clone()),
+                        "fee amount is negative",
+                        Some(event),
+                    );
                     return;
                 }
                 if self.order_meta.contains_key(order_id) {
+                    if fill_id.is_empty() {
+                        self.record_exception(
+                            Some(order_id.clone()),
+                            "fee is missing the venue execution identity",
+                            Some(event),
+                        );
+                        return;
+                    }
                     let fee_id = format!("fee:{fill_id}");
                     let inserted = self
-                        .processed_fill_ids
+                        .processed_fee_ids
                         .entry(order_id.clone())
                         .or_default()
                         .insert(fee_id.clone());
@@ -148,10 +243,15 @@ impl Portfolio {
                         }
                         self.view.cash_balance -= *amount;
                         self.view.realized_pnl -= *amount;
+                        self.total_fees += *amount;
                         self.update_drawdown_stats();
                     }
                 } else {
-                    warn!(order_id = %order_id.0, "ignoring fee for unknown order");
+                    self.record_exception(
+                        Some(order_id.clone()),
+                        "fee references an unknown portfolio order",
+                        Some(event),
+                    );
                 }
             }
             _ => {}
@@ -288,13 +388,71 @@ impl Portfolio {
 
     /// Export portfolio state for persistence
     pub fn export_state(&self) -> PortfolioState {
-        PortfolioState {
+        let mut state = PortfolioState {
             account_view: self.view.clone(),
+            total_fees: self.total_fees,
             order_meta: self.order_meta.clone(),
             market_prices: self.market_prices.clone(),
             processed_fill_ids: self.processed_fill_ids.clone(),
+            processed_fee_ids: self.processed_fee_ids.clone(),
             recent_accounting_event_ids: self.recent_accounting_event_ids.iter().cloned().collect(),
+            reconciliation_exceptions: self.reconciliation_exceptions.clone(),
+            canonical_state_digest: None,
+        };
+        state.canonical_state_digest = Some(canonical_state_digest(&state));
+        state
+    }
+
+    /// Apply an authoritative cash readback without round-tripping a persisted
+    /// checkpoint through the caller. The next export recomputes the canonical
+    /// digest over the updated AccountView and all existing accounting state.
+    pub fn update_cash_balance(&mut self, cash_balance: Decimal) -> Result<(), String> {
+        self.view.cash_balance = cash_balance;
+        self.snapshot.store(Arc::new(self.view.clone()));
+        Ok(())
+    }
+
+    /// Publish a runtime-owned AccountView while preserving canonical OMS and
+    /// accounting state. Scope-bearing attestations and inventory are checked
+    /// before the view is swapped so a rejected readback leaves the portfolio
+    /// unchanged.
+    pub fn publish_account_readback(&mut self, account_view: AccountView) -> Result<(), String> {
+        self.validate_account_view_scope(&account_view)?;
+        self.view = account_view;
+        self.snapshot.store(Arc::new(self.view.clone()));
+        Ok(())
+    }
+
+    fn validate_account_view_scope(&self, account_view: &AccountView) -> Result<(), String> {
+        if let Some(existing) = self.view.account_id.as_ref() {
+            if account_view.account_id.as_ref() != Some(existing) {
+                return Err("account readback identity disagrees with Portfolio scope".to_string());
+            }
         }
+        for (key, attestation) in &account_view.tokenized_securities_attestations {
+            let Some(account_id) = account_view.account_id.as_ref() else {
+                return Err("tokenized securities attestation has no account scope".to_string());
+            };
+            if &attestation.account_id != account_id
+                || key.venue != attestation.venue
+                || key.product_type != attestation.product_type
+                || key.symbol != attestation.symbol
+            {
+                return Err(
+                    "tokenized securities attestation disagrees with its AccountView key"
+                        .to_string(),
+                );
+            }
+        }
+        for (asset, inventory) in &account_view.asset_inventory {
+            if asset != &inventory.asset {
+                return Err("asset inventory key disagrees with its record asset".to_string());
+            }
+            inventory
+                .validate()
+                .map_err(|error| format!("invalid asset inventory readback: {error}"))?;
+        }
+        Ok(())
     }
 
     /// Import portfolio state from persistent storage
@@ -306,10 +464,41 @@ impl Portfolio {
             state.order_meta.len()
         );
 
+        if let Err(reason) = self.try_import_state(state) {
+            self.record_exception(None, reason, None);
+            warn!("refused invalid portfolio state during restore");
+        }
+    }
+
+    pub fn try_import_state(&mut self, state: PortfolioState) -> Result<(), String> {
+        validate_state(&state)?;
+
         self.view = state.account_view;
+        self.total_fees = state.total_fees;
         self.order_meta = state.order_meta;
         self.market_prices = state.market_prices;
         self.processed_fill_ids = state.processed_fill_ids;
+        self.processed_fee_ids = state.processed_fee_ids;
+        self.reconciliation_exceptions = state.reconciliation_exceptions;
+        // Older snapshots only carried the bounded journal.  Reconstructing
+        // the fee namespace from that journal keeps replay idempotent without
+        // treating a fill id and fee id as the same key.
+        for (order_id, event_id) in &state.recent_accounting_event_ids {
+            if let Some(fee_id) = event_id.strip_prefix("fee:") {
+                self.processed_fee_ids
+                    .entry(order_id.clone())
+                    .or_default()
+                    .insert(event_id.clone());
+                if fee_id.is_empty() {
+                    self.reconciliation_exceptions
+                        .push(ReconciliationException {
+                            order_id: Some(order_id.clone()),
+                            reason: "snapshot contains an empty fee identity".to_string(),
+                            event: None,
+                        });
+                }
+            }
+        }
         self.recent_accounting_event_ids = state
             .recent_accounting_event_ids
             .into_iter()
@@ -333,14 +522,280 @@ impl Portfolio {
             self.view.realized_pnl,
             self.view.unrealized_pnl
         );
+        Ok(())
+    }
+}
+
+fn validate_state(state: &PortfolioState) -> Result<(), String> {
+    if let Some(expected) = &state.canonical_state_digest {
+        let actual = canonical_state_digest(state);
+        if expected != &actual {
+            return Err("portfolio canonical financial checkpoint digest mismatch".to_string());
+        }
+    }
+    for (symbol, position) in &state.account_view.positions {
+        if symbol != &position.symbol {
+            return Err("portfolio position key does not match position symbol".to_string());
+        }
+    }
+    for (asset, inventory) in &state.account_view.asset_inventory {
+        if asset != &inventory.asset {
+            return Err("asset inventory key does not match record asset".to_string());
+        }
+    }
+    for order_id in state.processed_fill_ids.keys() {
+        if !state.order_meta.contains_key(order_id) {
+            return Err(format!(
+                "processed fill namespace references unknown order {}",
+                order_id.0
+            ));
+        }
+    }
+    for order_id in state.processed_fee_ids.keys() {
+        if !state.order_meta.contains_key(order_id) {
+            return Err(format!(
+                "processed fee namespace references unknown order {}",
+                order_id.0
+            ));
+        }
+    }
+    for (order_id, event_id) in &state.recent_accounting_event_ids {
+        if !state.order_meta.contains_key(order_id) {
+            return Err(format!(
+                "accounting journal references unknown order {}",
+                order_id.0
+            ));
+        }
+        if event_id.is_empty() || (!event_id.starts_with("fill:") && !event_id.starts_with("fee:"))
+        {
+            return Err("accounting journal contains an untyped event identity".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn canonical_state_digest(state: &PortfolioState) -> String {
+    let mut material = String::new();
+    let view = &state.account_view;
+    append_optional_field(
+        &mut material,
+        "account-id",
+        view.account_id
+            .as_ref()
+            .map(|account_id| account_id.0.as_str()),
+    );
+    let mut attestations = view
+        .tokenized_securities_attestations
+        .iter()
+        .collect::<Vec<_>>();
+    attestations.sort_by_key(|(key, _)| {
+        (
+            key.venue.as_str(),
+            key.product_type.as_str(),
+            key.symbol.as_str().to_string(),
+        )
+    });
+    for (key, attestation) in attestations {
+        append_field(&mut material, "attestation-key-venue", key.venue.as_str());
+        append_field(
+            &mut material,
+            "attestation-key-product",
+            key.product_type.as_str(),
+        );
+        append_field(&mut material, "attestation-key-symbol", key.symbol.as_str());
+        append_field(
+            &mut material,
+            "attestation-account-id",
+            &attestation.account_id,
+        );
+        append_field(
+            &mut material,
+            "attestation-venue",
+            attestation.venue.as_str(),
+        );
+        append_field(
+            &mut material,
+            "attestation-product",
+            attestation.product_type.as_str(),
+        );
+        append_field(
+            &mut material,
+            "attestation-symbol",
+            attestation.symbol.as_str(),
+        );
+        append_field(&mut material, "attestation-source", &attestation.source_id);
+        append_field(
+            &mut material,
+            "attestation-observed-at",
+            attestation.observed_at,
+        );
+        append_optional_field(
+            &mut material,
+            "attestation-jurisdiction",
+            attestation.jurisdiction.as_deref(),
+        );
+        append_field(
+            &mut material,
+            "attestation-account-eligible",
+            attestation.account_eligible,
+        );
+        append_field(
+            &mut material,
+            "attestation-cap-crypto",
+            attestation.account_capability.can_trade_crypto_spot,
+        );
+        append_field(
+            &mut material,
+            "attestation-cap-tokenized",
+            attestation
+                .account_capability
+                .can_trade_tokenized_securities,
+        );
+        append_field(
+            &mut material,
+            "attestation-cap-equities",
+            attestation.account_capability.can_trade_brokerage_equities,
+        );
+        append_optional_field(
+            &mut material,
+            "attestation-cap-jurisdiction",
+            attestation.account_capability.jurisdiction.as_deref(),
+        );
+        append_optional_field(
+            &mut material,
+            "attestation-cap-kyc",
+            attestation.account_capability.kyc_level.as_deref(),
+        );
+        append_field(
+            &mut material,
+            "attestation-symbol-notional",
+            attestation.account_symbol_notional,
+        );
+        append_field(
+            &mut material,
+            "attestation-asset-class-notional",
+            attestation.account_asset_class_notional,
+        );
+        append_field(
+            &mut material,
+            "attestation-corporate-action",
+            attestation.corporate_action_active,
+        );
+        append_field(
+            &mut material,
+            "attestation-top-depth",
+            attestation.top_depth_usd,
+        );
+        append_field(
+            &mut material,
+            "attestation-spread-bps",
+            attestation.spread_bps,
+        );
+    }
+    let mut inventory = view.asset_inventory.iter().collect::<Vec<_>>();
+    inventory.sort_by_key(|(asset, _)| asset.as_str());
+    for (asset, record) in inventory {
+        append_field(&mut material, "inventory-key", asset);
+        append_field(&mut material, "inventory-asset", &record.asset);
+        append_field(&mut material, "inventory-available", record.available);
+        append_field(&mut material, "inventory-locked", record.locked);
+        append_field(&mut material, "inventory-total", record.total);
+        append_optional_field(
+            &mut material,
+            "inventory-usd-value",
+            record.usd_value.map(|value| value.to_string()).as_deref(),
+        );
+    }
+    material.push_str(&format!(
+        "cash={};realized={};unrealized={};fees={};hwm={};dd={};maxdd={};session={};",
+        view.cash_balance,
+        view.realized_pnl,
+        view.unrealized_pnl,
+        state.total_fees,
+        view.high_water_mark,
+        view.drawdown_pct,
+        view.max_drawdown_pct,
+        view.session_start_us
+    ));
+    let mut positions = view.positions.iter().collect::<Vec<_>>();
+    positions.sort_by_key(|(symbol, _)| symbol.as_str().to_string());
+    for (symbol, position) in positions {
+        material.push_str(&format!(
+            "pos:{}:{}:{}:{}:{};",
+            symbol.as_str(),
+            position.quantity.0,
+            position.avg_price.0,
+            position.unrealized_pnl,
+            position.realized_pnl
+        ));
+    }
+    let mut orders = state.order_meta.iter().collect::<Vec<_>>();
+    orders.sort_by_key(|(order_id, _)| order_id.0.clone());
+    for (order_id, (symbol, side)) in orders {
+        material.push_str(&format!(
+            "order:{}:{}:{:?};",
+            order_id.0,
+            symbol.as_str(),
+            side
+        ));
+    }
+    let mut marks = state.market_prices.iter().collect::<Vec<_>>();
+    marks.sort_by_key(|(symbol, _)| symbol.as_str().to_string());
+    for (symbol, price) in marks {
+        material.push_str(&format!("mark:{}:{};", symbol.as_str(), price.0));
+    }
+    append_namespaced_ids(&mut material, "fill", &state.processed_fill_ids);
+    append_namespaced_ids(&mut material, "fee", &state.processed_fee_ids);
+    for (order_id, event_id) in &state.recent_accounting_event_ids {
+        material.push_str(&format!("journal:{}:{};", order_id.0, event_id));
+    }
+    for exception in &state.reconciliation_exceptions {
+        material.push_str(&format!(
+            "exception:{:?}:{:?}:{};",
+            exception.order_id, exception.event, exception.reason
+        ));
+    }
+    format!("sha256:{:x}", Sha256::digest(material.as_bytes()))
+}
+
+fn append_field<T: std::fmt::Display>(material: &mut String, label: &str, value: T) {
+    let value = value.to_string();
+    material.push_str(&format!("{label}:{}:{value};", value.len()));
+}
+
+fn append_optional_field(material: &mut String, label: &str, value: Option<&str>) {
+    match value {
+        Some(value) => append_field(material, label, format!("some:{value}")),
+        None => append_field(material, label, "none"),
+    }
+}
+
+fn append_namespaced_ids(
+    material: &mut String,
+    namespace: &str,
+    ids: &HashMap<OrderId, HashSet<String>>,
+) {
+    let mut entries = ids
+        .iter()
+        .flat_map(|(order_id, values)| {
+            values
+                .iter()
+                .map(move |value| (order_id.0.clone(), value.clone()))
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+    for (order_id, value) in entries {
+        material.push_str(&format!("{}:{}:{};", namespace, order_id, value));
     }
 }
 
 /// 實現 PortfolioManager trait - 將現有方法適配為 trait 接口
 impl ports::PortfolioManager for Portfolio {
-    fn register_order(&mut self, order_id: hft_core::OrderId, symbol: Symbol, side: Side) {
+    fn register_order(&mut self, order_id: hft_core::OrderId, symbol: Symbol, side: Side) -> bool {
         // 直接調用現有實現
+        let before = self.reconciliation_exceptions.len();
         self.register_order(order_id, symbol, side);
+        self.reconciliation_exceptions.len() == before
     }
 
     fn on_execution_event(&mut self, event: &ExecutionEvent) {
@@ -358,15 +813,35 @@ impl ports::PortfolioManager for Portfolio {
         self.update_market_prices(prices);
     }
 
+    fn update_cash_balance(&mut self, cash_balance: Decimal) -> Result<(), String> {
+        Portfolio::update_cash_balance(self, cash_balance)
+    }
+
+    fn publish_account_readback(&mut self, account_view: AccountView) -> Result<(), String> {
+        Portfolio::publish_account_readback(self, account_view)
+    }
+
     fn export_state(&self) -> ports::PortfolioState {
         // 轉換內部 PortfolioState 為 ports::PortfolioState
         let internal_state = self.export_state();
         ports::PortfolioState {
             account_view: internal_state.account_view,
+            total_fees: internal_state.total_fees,
             order_meta: internal_state.order_meta,
             market_prices: internal_state.market_prices,
             processed_fill_ids: internal_state.processed_fill_ids,
+            processed_fee_ids: internal_state.processed_fee_ids,
             recent_accounting_event_ids: internal_state.recent_accounting_event_ids,
+            reconciliation_exceptions: internal_state
+                .reconciliation_exceptions
+                .into_iter()
+                .map(|exception| ports::ReconciliationException {
+                    order_id: exception.order_id,
+                    reason: exception.reason,
+                    event: exception.event,
+                })
+                .collect(),
+            canonical_state_digest: internal_state.canonical_state_digest,
         }
     }
 
@@ -374,19 +849,61 @@ impl ports::PortfolioManager for Portfolio {
         // 轉換 ports::PortfolioState 為內部 PortfolioState
         let internal_state = PortfolioState {
             account_view: state.account_view,
+            total_fees: state.total_fees,
             order_meta: state.order_meta,
             market_prices: state.market_prices,
             processed_fill_ids: state.processed_fill_ids,
+            processed_fee_ids: state.processed_fee_ids,
             recent_accounting_event_ids: state.recent_accounting_event_ids,
+            reconciliation_exceptions: state
+                .reconciliation_exceptions
+                .into_iter()
+                .map(|exception| ReconciliationException {
+                    order_id: exception.order_id,
+                    reason: exception.reason,
+                    event: exception.event,
+                })
+                .collect(),
+            canonical_state_digest: state.canonical_state_digest,
         };
         self.import_state(internal_state);
+    }
+
+    fn try_import_state(&mut self, state: ports::PortfolioState) -> Result<(), String> {
+        let internal_state = PortfolioState {
+            account_view: state.account_view,
+            total_fees: state.total_fees,
+            order_meta: state.order_meta,
+            market_prices: state.market_prices,
+            processed_fill_ids: state.processed_fill_ids,
+            processed_fee_ids: state.processed_fee_ids,
+            recent_accounting_event_ids: state.recent_accounting_event_ids,
+            reconciliation_exceptions: state
+                .reconciliation_exceptions
+                .into_iter()
+                .map(|exception| ReconciliationException {
+                    order_id: exception.order_id,
+                    reason: exception.reason,
+                    event: exception.event,
+                })
+                .collect(),
+            canonical_state_digest: state.canonical_state_digest,
+        };
+        Portfolio::try_import_state(self, internal_state)
+    }
+
+    fn reconciliation_exception_count(&self) -> usize {
+        self.reconciliation_exceptions.len()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hft_core::{OrderId, Price, Quantity};
+    use hft_core::{
+        AccountCapability, AccountId as CoreAccountId, InstrumentKey, OrderId, Price, ProductType,
+        Quantity, VenueId,
+    };
 
     fn fill(
         portfolio: &mut Portfolio,
@@ -580,5 +1097,321 @@ mod tests {
         assert_eq!(recovered.high_water_mark, Decimal::from(1010));
         assert_eq!(recovered.drawdown_pct, 0.0);
         assert!((recovered.max_drawdown_pct - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn fill_and_fee_with_same_venue_id_use_separate_namespaces() {
+        let mut portfolio = Portfolio::with_cash_balance(Decimal::from(1000));
+        let order_id = OrderId("NAMESPACE-1".into());
+        let symbol = Symbol::new("BTCUSDT");
+        portfolio.register_order(order_id.clone(), symbol.clone(), Side::Buy);
+        let fill = ExecutionEvent::Fill {
+            order_id: order_id.clone(),
+            price: Price(Decimal::from(100)),
+            quantity: Quantity(Decimal::ONE),
+            timestamp: 1,
+            fill_id: "same-id".into(),
+        };
+        let fee = ExecutionEvent::FeeCharged {
+            order_id,
+            amount: Decimal::from(2),
+            timestamp: 1,
+            fill_id: "same-id".into(),
+        };
+        portfolio.on_execution_event(&fill);
+        portfolio.on_execution_event(&fee);
+        portfolio.on_execution_event(&fill);
+        portfolio.on_execution_event(&fee);
+
+        let view = portfolio.reader().load();
+        assert_eq!(view.positions[&symbol].quantity.0, Decimal::ONE);
+        assert_eq!(view.cash_balance, Decimal::from(898));
+        assert_eq!(portfolio.export_state().processed_fill_ids.len(), 1);
+        assert_eq!(portfolio.export_state().processed_fee_ids.len(), 1);
+    }
+
+    #[test]
+    fn conflicting_order_metadata_is_retained_and_does_not_rebind_accounting() {
+        let mut portfolio = Portfolio::new();
+        let order_id = OrderId("META-CONFLICT".into());
+        portfolio.register_order(order_id.clone(), Symbol::new("BTCUSDT"), Side::Buy);
+        portfolio.register_order(order_id.clone(), Symbol::new("ETHUSDT"), Side::Sell);
+        portfolio.on_execution_event(&ExecutionEvent::Fill {
+            order_id,
+            price: Price(Decimal::from(100)),
+            quantity: Quantity(Decimal::ONE),
+            timestamp: 1,
+            fill_id: "metadata-fill".into(),
+        });
+        let state = portfolio.export_state();
+        assert!(state
+            .account_view
+            .positions
+            .contains_key(&Symbol::new("BTCUSDT")));
+        assert!(!state
+            .account_view
+            .positions
+            .contains_key(&Symbol::new("ETHUSDT")));
+        assert_eq!(portfolio.reconciliation_exceptions().len(), 1);
+    }
+
+    #[test]
+    fn invalid_snapshot_references_are_rejected_before_state_mutation() {
+        let mut portfolio = Portfolio::with_cash_balance(Decimal::from(500));
+        let mut state = portfolio.export_state();
+        state
+            .processed_fill_ids
+            .insert(OrderId("UNKNOWN".into()), HashSet::from(["f".into()]));
+        portfolio.import_state(state);
+        assert_eq!(portfolio.reader().load().cash_balance, Decimal::from(500));
+        assert_eq!(portfolio.reconciliation_exceptions().len(), 1);
+    }
+
+    #[test]
+    fn financial_checkpoint_digest_rejects_tampered_cash_or_pnl() {
+        let mut portfolio = Portfolio::with_cash_balance(Decimal::from(500));
+        let mut state = portfolio.export_state();
+        assert!(state.canonical_state_digest.is_some());
+        state.account_view.cash_balance = Decimal::from(999);
+        portfolio.import_state(state);
+        assert_eq!(portfolio.reader().load().cash_balance, Decimal::from(500));
+        assert_eq!(portfolio.reconciliation_exceptions().len(), 1);
+    }
+
+    #[test]
+    fn financial_checkpoint_digest_rejects_cleared_reconciliation_evidence() {
+        let mut portfolio = Portfolio::new();
+        portfolio.on_execution_event(&ExecutionEvent::FeeCharged {
+            order_id: OrderId("UNKNOWN-FEE".into()),
+            amount: Decimal::ONE,
+            timestamp: 1,
+            fill_id: "fee-1".into(),
+        });
+        let mut state = portfolio.export_state();
+        assert_eq!(state.reconciliation_exceptions.len(), 1);
+        state.reconciliation_exceptions.clear();
+        assert!(portfolio.try_import_state(state).is_err());
+    }
+
+    #[test]
+    fn canonical_digest_is_stable_across_serialization_and_hash_insertion_order() {
+        let mut portfolio = Portfolio::new();
+        let order_a = OrderId("DIGEST-A".into());
+        let order_b = OrderId("DIGEST-B".into());
+        portfolio.register_order(order_a.clone(), Symbol::new("A"), Side::Buy);
+        portfolio.register_order(order_b.clone(), Symbol::new("B"), Side::Buy);
+        for (order_id, symbol, fill_id) in [
+            (order_a.clone(), Symbol::new("A"), "a-1"),
+            (order_a.clone(), Symbol::new("A"), "a-2"),
+            (order_b.clone(), Symbol::new("B"), "b-1"),
+        ] {
+            portfolio.on_execution_event(&ExecutionEvent::Fill {
+                order_id,
+                price: Price(Decimal::ONE),
+                quantity: Quantity(Decimal::ONE),
+                timestamp: 1,
+                fill_id: fill_id.into(),
+            });
+            let _ = symbol;
+        }
+        let state = portfolio.export_state();
+        let serialized = serde_json::to_vec(&state).expect("serialize checkpoint");
+        let round_tripped: PortfolioState =
+            serde_json::from_slice(&serialized).expect("deserialize checkpoint");
+        let mut restored = Portfolio::new();
+        restored
+            .try_import_state(round_tripped)
+            .expect("serialized checkpoint restores");
+        assert_eq!(
+            restored.export_state().canonical_state_digest,
+            state.canonical_state_digest
+        );
+
+        let mut reordered = state.clone();
+        reordered.processed_fill_ids.clear();
+        let mut reversed_a = HashSet::new();
+        reversed_a.insert("a-2".to_string());
+        reversed_a.insert("a-1".to_string());
+        reordered
+            .processed_fill_ids
+            .insert(order_a.clone(), reversed_a);
+        let mut reversed_b = HashSet::new();
+        reversed_b.insert("b-1".to_string());
+        reordered.processed_fill_ids.insert(order_b, reversed_b);
+        reordered.canonical_state_digest = None;
+        reordered.refresh_canonical_digest();
+        assert_eq!(
+            reordered.canonical_state_digest, state.canonical_state_digest,
+            "HashMap/HashSet insertion order must not change the canonical digest"
+        );
+    }
+
+    #[test]
+    fn canonical_digest_binds_account_scope_attestations_and_inventory() {
+        let account_id = CoreAccountId("binance-tokenized".to_string());
+        let symbol = Symbol::new("TSLABUSDT");
+        let key = InstrumentKey::tokenized_security_spot(
+            symbol.clone(),
+            VenueId::BINANCE_TOKENIZED_SECURITIES,
+        );
+        let attestation = ports::TokenizedSecuritiesRuntimeAttestation {
+            account_id: account_id.clone(),
+            venue: VenueId::BINANCE_TOKENIZED_SECURITIES,
+            product_type: ProductType::TokenizedSecuritySpot,
+            symbol,
+            source_id: "readback-1".to_string(),
+            observed_at: 100,
+            jurisdiction: Some("US".to_string()),
+            account_eligible: true,
+            account_capability: AccountCapability {
+                can_trade_crypto_spot: true,
+                can_trade_tokenized_securities: true,
+                can_trade_brokerage_equities: false,
+                jurisdiction: Some("US".to_string()),
+                kyc_level: Some("enhanced".to_string()),
+            },
+            account_symbol_notional: Decimal::from(10),
+            account_asset_class_notional: Decimal::from(20),
+            corporate_action_active: false,
+            top_depth_usd: Decimal::from(100),
+            spread_bps: Decimal::from(2),
+        };
+        let mut portfolio = Portfolio::new();
+        let mut state = portfolio.export_state();
+        state.account_view.account_id = Some(account_id);
+        state
+            .account_view
+            .tokenized_securities_attestations
+            .insert(key, attestation);
+        state.account_view.asset_inventory.insert(
+            "USDT".to_string(),
+            ports::AssetInventoryRecord {
+                asset: "USDT".to_string(),
+                available: Decimal::from(7),
+                locked: Decimal::from(3),
+                total: Decimal::from(10),
+                usd_value: Some(Decimal::from(10)),
+            },
+        );
+        state.account_view.asset_inventory.insert(
+            "USDC".to_string(),
+            ports::AssetInventoryRecord {
+                asset: "USDC".to_string(),
+                available: Decimal::from(4),
+                locked: Decimal::from(1),
+                total: Decimal::from(5),
+                usd_value: Some(Decimal::from(5)),
+            },
+        );
+        state.refresh_canonical_digest();
+        portfolio
+            .try_import_state(state.clone())
+            .expect("complete account readback restores");
+
+        let mut tampered_account = state.clone();
+        tampered_account.account_view.account_id = Some(CoreAccountId("other".to_string()));
+        assert!(portfolio.try_import_state(tampered_account).is_err());
+
+        let mut tampered_attestation = state.clone();
+        tampered_attestation
+            .account_view
+            .tokenized_securities_attestations
+            .values_mut()
+            .next()
+            .expect("attestation")
+            .source_id = "tampered".to_string();
+        assert!(portfolio.try_import_state(tampered_attestation).is_err());
+
+        let mut tampered_inventory_asset = state.clone();
+        tampered_inventory_asset
+            .account_view
+            .asset_inventory
+            .get_mut("USDT")
+            .expect("inventory")
+            .asset = "EUR".to_string();
+        assert!(portfolio
+            .try_import_state(tampered_inventory_asset)
+            .is_err());
+
+        let mut tampered_inventory = state.clone();
+        tampered_inventory
+            .account_view
+            .asset_inventory
+            .get_mut("USDT")
+            .expect("inventory")
+            .total = Decimal::from(11);
+        assert!(portfolio.try_import_state(tampered_inventory).is_err());
+
+        let mut reordered = state.clone();
+        reordered.account_view.asset_inventory.clear();
+        for asset in ["USDC", "USDT"] {
+            let record = state.account_view.asset_inventory[asset].clone();
+            reordered
+                .account_view
+                .asset_inventory
+                .insert(asset.to_string(), record);
+        }
+        reordered.refresh_canonical_digest();
+        assert_eq!(
+            reordered.canonical_state_digest, state.canonical_state_digest,
+            "asset inventory insertion order must not change the canonical digest"
+        );
+    }
+
+    #[test]
+    fn controlled_account_updates_refresh_digest_and_restore() {
+        let mut portfolio = Portfolio::with_cash_balance(Decimal::from(100));
+        portfolio
+            .update_cash_balance(Decimal::from(250))
+            .expect("controlled cash update");
+        let mut account_view = (*portfolio.reader().load()).clone();
+        account_view.account_id = Some(CoreAccountId("account-readback".to_string()));
+        portfolio
+            .publish_account_readback(account_view)
+            .expect("controlled account readback");
+        let before_rejected_scope = portfolio.export_state();
+        let mut rejected_scope = (*portfolio.reader().load()).clone();
+        rejected_scope.account_id = Some(CoreAccountId("other-account".to_string()));
+        assert!(portfolio.publish_account_readback(rejected_scope).is_err());
+        assert_eq!(
+            portfolio.export_state().canonical_state_digest,
+            before_rejected_scope.canonical_state_digest
+        );
+        let state = portfolio.export_state();
+        assert!(state.canonical_state_digest.is_some());
+
+        let mut restored = Portfolio::new();
+        restored
+            .try_import_state(state)
+            .expect("controlled update state restores");
+        let view = restored.reader().load();
+        assert_eq!(view.cash_balance, Decimal::from(250));
+        assert_eq!(
+            view.account_id,
+            Some(CoreAccountId("account-readback".to_string()))
+        );
+    }
+
+    #[test]
+    fn non_positive_fill_price_or_fee_is_rejected_with_evidence() {
+        let mut portfolio = Portfolio::new();
+        let order_id = OrderId("BAD-PRICE".into());
+        let symbol = Symbol::new("BTCUSDT");
+        portfolio.register_order(order_id.clone(), symbol, Side::Buy);
+        portfolio.on_execution_event(&ExecutionEvent::Fill {
+            order_id: order_id.clone(),
+            price: Price(Decimal::ZERO),
+            quantity: Quantity(Decimal::ONE),
+            timestamp: 1,
+            fill_id: "zero-price".into(),
+        });
+        portfolio.on_execution_event(&ExecutionEvent::FeeCharged {
+            order_id,
+            amount: Decimal::from(-1),
+            timestamp: 1,
+            fill_id: "negative-fee".into(),
+        });
+        assert!(portfolio.reader().load().positions.is_empty());
+        assert_eq!(portfolio.reconciliation_exceptions().len(), 2);
     }
 }

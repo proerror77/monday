@@ -1,4 +1,4 @@
-use ploy_trading::{IntentPurpose, TradeSide, TradingIntent};
+use portfolio_core::prediction::{IntentPurpose, TradeSide, TradingIntent};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 

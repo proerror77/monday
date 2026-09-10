@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use ploy_trading::{
+use portfolio_core::prediction::{
     FillRecord, IntentPurpose, OrderLedger, PositionLedger, TradeSide, TradingIntent,
 };
 use rust_decimal::prelude::ToPrimitive;
@@ -848,9 +848,9 @@ impl DirectionalStrategy {
         orders.orders().any(|order| {
             matches!(
                 order.state,
-                ploy_trading::OrderState::Pending
-                    | ploy_trading::OrderState::Acknowledged
-                    | ploy_trading::OrderState::PartiallyFilled
+                portfolio_core::prediction::OrderState::Pending
+                    | portfolio_core::prediction::OrderState::Acknowledged
+                    | portfolio_core::prediction::OrderState::PartiallyFilled
             ) && (order.token_id.as_str() == &*event.up_token
                 || order.token_id.as_str() == &*event.down_token)
         })
@@ -1766,11 +1766,11 @@ impl StrategyLogic for DirectionalStrategy {
 
         // Track entry prices and realized PnL for circuit breaker.
         match fill.side {
-            ploy_trading::TradeSide::Buy => {
+            portfolio_core::prediction::TradeSide::Buy => {
                 self.entry_prices
                     .insert(Arc::from(fill.token_id.clone()), fill.price);
             }
-            ploy_trading::TradeSide::Sell => {
+            portfolio_core::prediction::TradeSide::Sell => {
                 if let Some(entry_price) = self.entry_prices.remove(fill.token_id.as_str()) {
                     let pnl = (fill.price - entry_price) * fill.quantity - fill.fee;
                     self.daily_realized_pnl += pnl;
@@ -1779,7 +1779,7 @@ impl StrategyLogic for DirectionalStrategy {
         }
     }
 
-    fn on_reject(&mut self, intent: &ploy_trading::TradingIntent, reason: &str) {
+    fn on_reject(&mut self, intent: &portfolio_core::prediction::TradingIntent, reason: &str) {
         let now = self.feed_time.unwrap_or_else(Utc::now);
 
         if reason.contains("not enough balance") {
@@ -1811,7 +1811,7 @@ impl StrategyLogic for DirectionalStrategy {
 mod tests {
     use super::*;
     use crate::traits::MarketUpdate;
-    use ploy_trading::{OrderLedger, PositionLedger};
+    use portfolio_core::prediction::{OrderLedger, OrderState, PositionLedger};
 
     fn default_config() -> DirectionalConfig {
         DirectionalConfig {
@@ -2027,10 +2027,8 @@ mod tests {
             );
         }
 
-        let mut blocking_orders = OrderLedger::default();
-        blocking_orders.insert_from_intent(
-            "order-next",
-            &TradingIntent {
+        let blocking_orders = crate::canonical_test_support::order_projection(
+            TradingIntent {
                 intent_id: "intent-next".into(),
                 deployment_id: "test".into(),
                 market_id: "next".into(),
@@ -2041,8 +2039,11 @@ mod tests {
                 purpose: IntentPurpose::Entry,
                 created_at: now,
             },
+            "order-next",
+            OrderState::Acknowledged,
+            "venue-next",
+            None,
         );
-        blocking_orders.acknowledge("order-next", "venue-next");
 
         let blocked = strat.on_update(
             &MarketUpdate::SpotPrice {
@@ -2594,10 +2595,8 @@ mod tests {
             &OrderLedger::default(),
         );
 
-        let mut orders = OrderLedger::default();
-        orders.insert_from_intent(
-            "order-1",
-            &TradingIntent {
+        let orders = crate::canonical_test_support::order_projection(
+            TradingIntent {
                 intent_id: "intent-1".into(),
                 deployment_id: "live".into(),
                 market_id: "evt1".into(),
@@ -2608,8 +2607,11 @@ mod tests {
                 purpose: IntentPurpose::Entry,
                 created_at: now,
             },
+            "order-1",
+            OrderState::Acknowledged,
+            "venue-1",
+            None,
         );
-        orders.acknowledge("order-1", "venue-1");
 
         let decisions = strat.on_update(
             &MarketUpdate::SpotPrice {
@@ -2697,10 +2699,8 @@ mod tests {
             );
         }
 
-        let mut orders = OrderLedger::default();
-        orders.insert_from_intent(
-            "order-1",
-            &TradingIntent {
+        let orders = crate::canonical_test_support::order_projection(
+            TradingIntent {
                 intent_id: "intent-1".into(),
                 deployment_id: "live".into(),
                 market_id: "evt-near".into(),
@@ -2711,8 +2711,11 @@ mod tests {
                 purpose: IntentPurpose::Entry,
                 created_at: now,
             },
+            "order-1",
+            OrderState::Acknowledged,
+            "venue-1",
+            None,
         );
-        orders.acknowledge("order-1", "venue-1");
 
         let decisions = strat.on_update(
             &MarketUpdate::SpotPrice {
@@ -2759,17 +2762,21 @@ mod tests {
             },
         );
 
-        let mut positions = PositionLedger::default();
-        positions.apply_fill(&FillRecord {
-            fill_id: "fill-1".into(),
-            order_id: "order-1".into(),
-            token_id: "up1".into(),
-            side: TradeSide::Buy,
-            quantity: dec!(5),
-            price: dec!(0.40),
-            fee: Decimal::ZERO,
-            timestamp: now,
-        });
+        let positions = crate::canonical_test_support::position_projection(
+            crate::canonical_test_support::entry_intent("up1", dec!(5)),
+            "order-1",
+            "venue-1",
+            [FillRecord {
+                fill_id: "fill-1".into(),
+                order_id: "order-1".into(),
+                token_id: "up1".into(),
+                side: TradeSide::Buy,
+                quantity: dec!(5),
+                price: dec!(0.40),
+                fee: Decimal::ZERO,
+                timestamp: now,
+            }],
+        );
 
         let decisions = strat.on_update(
             &MarketUpdate::EventExpired {
@@ -2810,17 +2817,21 @@ mod tests {
         strat.token_symbol.insert("up1".into(), "BTCUSDT".into());
         strat.token_symbol.insert("dn1".into(), "BTCUSDT".into());
 
-        let mut positions = PositionLedger::default();
-        positions.apply_fill(&FillRecord {
-            fill_id: "fill-1".into(),
-            order_id: "order-1".into(),
-            token_id: "up1".into(),
-            side: TradeSide::Buy,
-            quantity: dec!(5),
-            price: dec!(0.40),
-            fee: Decimal::ZERO,
-            timestamp: now,
-        });
+        let positions = crate::canonical_test_support::position_projection(
+            crate::canonical_test_support::entry_intent("up1", dec!(5)),
+            "order-1",
+            "venue-1",
+            [FillRecord {
+                fill_id: "fill-1".into(),
+                order_id: "order-1".into(),
+                token_id: "up1".into(),
+                side: TradeSide::Buy,
+                quantity: dec!(5),
+                price: dec!(0.40),
+                fee: Decimal::ZERO,
+                timestamp: now,
+            }],
+        );
 
         let pending = strat.on_update(
             &MarketUpdate::EventExpired {

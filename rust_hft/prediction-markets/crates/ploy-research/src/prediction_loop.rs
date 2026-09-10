@@ -1301,7 +1301,7 @@ mod tests {
         assert!(paths
             .iter()
             .all(|path| !path.contains("operator-contracts")));
-        assert!(paths.iter().all(|path| !path.contains("ploy-trading")));
+        assert!(paths.iter().all(|path| !path.contains("hft-runtime")));
         assert!(!paths.contains(&"Cargo.lock"));
         assert!(!paths.contains(&"Cargo.toml"));
         assert!(!paths.contains(&"crates/ploy-research/Cargo.toml"));

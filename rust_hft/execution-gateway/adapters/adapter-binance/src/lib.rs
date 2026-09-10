@@ -1109,10 +1109,10 @@ impl ExecutionClient for BinanceExecutionClient {
         order_id: &OrderId,
         new_quantity: Option<Quantity>,
         new_price: Option<Price>,
-    ) -> HftResult<()> {
+    ) -> HftResult<OrderId> {
         if uses_exchange_api(self.mode) {
             if new_quantity.is_none() && new_price.is_none() {
-                return Ok(());
+                return Ok(order_id.clone());
             }
             return Err(hft_core::HftError::Config(format!(
                 "Binance live modify is disabled for order {}; use an explicit cancel-then-new intent",
@@ -1127,7 +1127,7 @@ impl ExecutionClient for BinanceExecutionClient {
                 timestamp: hft_core::now_micros(),
             });
         }
-        Ok(())
+        Ok(order_id.clone())
     }
 
     async fn execution_stream(&self) -> HftResult<BoxStream<ExecutionEvent>> {

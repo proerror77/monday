@@ -161,7 +161,7 @@ fn write_strategy_evaluation(
     config_path: &str,
     deployment_id: Option<&str>,
     result: &ploy_strategy_bundles::RuntimeResult,
-    snapshot: &ploy_trading::TradingRuntimeSnapshot,
+    snapshot: &portfolio_core::prediction::TradingRuntimeSnapshot,
 ) {
     let cashflow = snapshot.fill_cashflow_summary();
     let strategy_diagnostics: BTreeMap<&str, u64> = result
@@ -240,15 +240,15 @@ fn write_strategy_evaluation(
 }
 
 fn normalized_runtime_evidence(
-    snapshot: &ploy_trading::TradingRuntimeSnapshot,
+    snapshot: &portfolio_core::prediction::TradingRuntimeSnapshot,
     fallback_deployment_id: Option<&str>,
 ) -> serde_json::Value {
-    let intents_by_id: BTreeMap<&str, &ploy_trading::TradingIntent> = snapshot
+    let intents_by_id: BTreeMap<&str, &portfolio_core::prediction::TradingIntent> = snapshot
         .intents
         .iter()
         .map(|intent| (intent.intent_id.as_str(), intent))
         .collect();
-    let orders_by_id: BTreeMap<&str, &ploy_trading::OrderRecord> = snapshot
+    let orders_by_id: BTreeMap<&str, &portfolio_core::prediction::OrderRecord> = snapshot
         .orders
         .iter()
         .map(|order| (order.order_id.as_str(), order))
@@ -265,8 +265,8 @@ fn normalized_runtime_evidence(
             .entry(fill.order_id.as_str())
             .or_default() += fill.quantity * fill.price;
         let signed_notional = match fill.side {
-            ploy_trading::TradeSide::Buy => -(fill.quantity * fill.price),
-            ploy_trading::TradeSide::Sell => fill.quantity * fill.price,
+            portfolio_core::prediction::TradeSide::Buy => -(fill.quantity * fill.price),
+            portfolio_core::prediction::TradeSide::Sell => fill.quantity * fill.price,
         };
         *fill_pnl_by_order.entry(fill.order_id.as_str()).or_default() += signed_notional - fill.fee;
     }
@@ -465,32 +465,32 @@ fn evidence_deployment_id<'a>(
     }
 }
 
-fn trade_side_label(side: ploy_trading::TradeSide) -> &'static str {
+fn trade_side_label(side: portfolio_core::prediction::TradeSide) -> &'static str {
     match side {
-        ploy_trading::TradeSide::Buy => "BUY",
-        ploy_trading::TradeSide::Sell => "SELL",
+        portfolio_core::prediction::TradeSide::Buy => "BUY",
+        portfolio_core::prediction::TradeSide::Sell => "SELL",
     }
 }
 
-fn intent_purpose_label(purpose: ploy_trading::IntentPurpose) -> &'static str {
+fn intent_purpose_label(purpose: portfolio_core::prediction::IntentPurpose) -> &'static str {
     match purpose {
-        ploy_trading::IntentPurpose::Entry => "ENTRY",
-        ploy_trading::IntentPurpose::Exit => "EXIT",
-        ploy_trading::IntentPurpose::Reduce => "REDUCE",
-        ploy_trading::IntentPurpose::Hedge => "HEDGE",
-        ploy_trading::IntentPurpose::Cancel => "CANCEL",
+        portfolio_core::prediction::IntentPurpose::Entry => "ENTRY",
+        portfolio_core::prediction::IntentPurpose::Exit => "EXIT",
+        portfolio_core::prediction::IntentPurpose::Reduce => "REDUCE",
+        portfolio_core::prediction::IntentPurpose::Hedge => "HEDGE",
+        portfolio_core::prediction::IntentPurpose::Cancel => "CANCEL",
     }
 }
 
-fn order_state_label(state: ploy_trading::OrderState) -> &'static str {
+fn order_state_label(state: portfolio_core::prediction::OrderState) -> &'static str {
     match state {
-        ploy_trading::OrderState::Pending => "PENDING",
-        ploy_trading::OrderState::Unknown => "UNKNOWN",
-        ploy_trading::OrderState::Acknowledged => "ACKNOWLEDGED",
-        ploy_trading::OrderState::PartiallyFilled => "PARTIALLY_FILLED",
-        ploy_trading::OrderState::Filled => "FILLED",
-        ploy_trading::OrderState::Canceled => "CANCELED",
-        ploy_trading::OrderState::Rejected => "REJECTED",
+        portfolio_core::prediction::OrderState::Pending => "PENDING",
+        portfolio_core::prediction::OrderState::Unknown => "UNKNOWN",
+        portfolio_core::prediction::OrderState::Acknowledged => "ACKNOWLEDGED",
+        portfolio_core::prediction::OrderState::PartiallyFilled => "PARTIALLY_FILLED",
+        portfolio_core::prediction::OrderState::Filled => "FILLED",
+        portfolio_core::prediction::OrderState::Canceled => "CANCELED",
+        portfolio_core::prediction::OrderState::Rejected => "REJECTED",
     }
 }
 
@@ -502,7 +502,7 @@ async fn run_backtest_entry(
     _runtime_config: RuntimeModeConfig,
 ) -> (
     ploy_strategy_bundles::RuntimeResult,
-    ploy_trading::TradingRuntimeSnapshot,
+    portfolio_core::prediction::TradingRuntimeSnapshot,
 ) {
     eprintln!("Backtest mode requires the `backtest-db` feature");
     std::process::exit(1);
@@ -515,7 +515,7 @@ async fn run_replay_entry(
     _runtime_config: RuntimeModeConfig,
 ) -> (
     ploy_strategy_bundles::RuntimeResult,
-    ploy_trading::TradingRuntimeSnapshot,
+    portfolio_core::prediction::TradingRuntimeSnapshot,
 ) {
     eprintln!("Replay mode requires the `replay` feature");
     std::process::exit(1);
@@ -530,7 +530,7 @@ async fn run_live_or_dry_run_entry(
     _deployment_id: String,
 ) -> (
     ploy_strategy_bundles::RuntimeResult,
-    ploy_trading::TradingRuntimeSnapshot,
+    portfolio_core::prediction::TradingRuntimeSnapshot,
 ) {
     eprintln!("Live and dry-run modes require the `live` feature");
     std::process::exit(1);

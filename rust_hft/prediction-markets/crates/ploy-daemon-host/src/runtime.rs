@@ -2,9 +2,6 @@ use crate::config::PlatformConfig;
 use crate::events::EventBroker;
 use crate::http::publish_snapshot_events;
 use chrono::{DateTime, Utc};
-use ploy_connectivity::{
-    DisabledLiveExecutionGateway, ExecutionError, ExecutionOutcome, LiveExecutionGateway,
-};
 use ploy_deployments::WorkerSupervisor;
 use ploy_operator_contracts::{
     ActiveAlert, DeploymentApplyRequest, DeploymentControlRequest, DeploymentRuntimeMode,
@@ -13,20 +10,24 @@ use ploy_operator_contracts::{
     ProposalDecisionRequest, SafetyProposal, TradingStateSnapshot,
 };
 use ploy_platform::{ControlPlane, DeploymentRecord};
+use ploy_platform_runtime::execution_client::{
+    disabled_execution_client, lock_execution_client, SharedExecutionClient,
+    MONDAY_EXECUTION_DISABLED,
+};
 use ploy_platform_runtime::runtime_support::{
     account_token_exposure_envelope, intent_risk_effect, IntentAdmissionSource,
 };
 use ploy_platform_runtime::{
     apply_deployment as apply_deployment_record,
     apply_live_intent_outcome as apply_live_runtime_intent_outcome, apply_loaded_registry_state,
-    build_trading_state_snapshot, cancel_order as cancel_runtime_order,
-    control_deployment as control_deployment_record,
+    build_persisted_trading_state_snapshot, build_trading_state_snapshot,
+    cancel_order as cancel_runtime_order, control_deployment as control_deployment_record,
     enforce_exposure_limit as enforce_intent_exposure_limit, ensure_intent_allowed,
     execute_live_intent as execute_live_runtime_intent, load_proposal_store, load_registry_records,
     load_trading_runtimes, mark_live_runtime_degraded as mark_runtime_degraded_state,
     mark_runtime_healthy as mark_runtime_healthy_state, mark_venue_healthy, order_state_wire,
     prepare_live_intent as prepare_live_runtime_intent,
-    reconcile_live_fills as reconcile_runtime_live_fills,
+    reconcile_live_fills_with_stream as reconcile_runtime_live_fills,
     refresh_source_health as refresh_platform_source_health,
     replace_order as replace_runtime_order,
     set_deployment_max_gross_exposure as set_record_max_gross_exposure,
@@ -34,7 +35,9 @@ use ploy_platform_runtime::{
     write_json, LiveHealthConfig, PreparedLiveIntent, ProposalStore, ReconcileStatus,
     WorkerTickConfig,
 };
-use ploy_trading::{TradingIntent, TradingRuntime, TradingRuntimeSnapshot};
+use portfolio_core::prediction::{TradingIntent, TradingRuntime, TradingRuntimeSnapshot};
+#[cfg(test)]
+use ports::ExecutionClient;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -42,8 +45,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::Arc;
 use std::time::Duration;
 
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -54,22 +56,37 @@ pub enum PreparedIntentSubmission {
     Live(PreparedDaemonLiveIntent),
 }
 
-#[derive(Debug)]
 pub struct PreparedDaemonLiveIntent {
     deployment_id: String,
     prepared: PreparedLiveIntent,
-    gateway: Arc<dyn LiveExecutionGateway>,
+    client: SharedExecutionClient,
+}
+
+impl std::fmt::Debug for PreparedDaemonLiveIntent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedDaemonLiveIntent")
+            .field("deployment_id", &self.deployment_id)
+            .field("prepared", &self.prepared)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PreparedDaemonLiveIntent {
-    pub fn execute(&self) -> Result<ExecutionOutcome, ExecutionError> {
-        execute_live_runtime_intent(self.gateway.as_ref(), &self.prepared)
+    pub async fn execute(&self) -> Result<hft_core::OrderId, hft_core::HftError> {
+        let mut client =
+            lock_execution_client(&self.client)
+                .await
+                .map_err(|error| hft_core::HftError::Io {
+                    message: error.to_string(),
+                })?;
+        execute_live_runtime_intent(&mut **client, &self.prepared).await
     }
 }
 
 fn response_for_runtime_order(
     deployment_id: &str,
-    order: &ploy_trading::OrderRecord,
+    order: &portfolio_core::prediction::OrderRecord,
 ) -> PaperIntentResponse {
     PaperIntentResponse {
         deployment_id: deployment_id.to_string(),
@@ -105,19 +122,20 @@ fn shutdown_requested() -> bool {
 }
 
 #[cfg(test)]
-use ploy_trading::FillRecord;
+use portfolio_core::prediction::FillRecord;
 
-#[derive(Debug)]
 pub struct PloyDaemon {
     pub config: PlatformConfig,
     pub control_plane: ControlPlane,
     pub supervisor: WorkerSupervisor,
     pub trading: BTreeMap<String, TradingRuntime>,
     proposals: ProposalStore,
-    live_execution: Arc<dyn LiveExecutionGateway>,
+    live_execution: SharedExecutionClient,
     live_reconcile_failures: u32,
     next_live_reconcile_at: Option<DateTime<Utc>>,
     last_live_reconcile_error: Option<String>,
+    execution_stream: Option<ports::BoxStream<ports::ExecutionEvent>>,
+    execution_stream_attempted: bool,
     #[cfg(test)]
     fail_trading_state_write_on_attempt: Option<usize>,
     #[cfg(test)]
@@ -132,22 +150,42 @@ pub struct PloyDaemon {
     status_write_attempts: usize,
 }
 
+impl std::fmt::Debug for PloyDaemon {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PloyDaemon")
+            .field("config", &self.config)
+            .field(
+                "trading_deployments",
+                &self.trading.keys().collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
 impl PloyDaemon {
     pub fn boot(config: &PlatformConfig) -> io::Result<Self> {
-        Self::boot_with_gateway(config, Box::new(DisabledLiveExecutionGateway))
+        Self::boot_with_gateway(config, disabled_execution_client())
     }
 
     #[cfg(test)]
     pub(crate) fn boot_with_live_execution(
         config: &PlatformConfig,
-        live_execution: Box<dyn LiveExecutionGateway>,
+        live_execution: Box<dyn ExecutionClient>,
     ) -> io::Result<Self> {
-        Self::boot_with_gateway(config, live_execution)
+        let mut daemon =
+            Self::boot_with_gateway(config, Arc::new(tokio::sync::Mutex::new(live_execution)))?;
+        daemon.mark_runtime_healthy();
+        daemon.mark_venue_healthy();
+        daemon.live_reconcile_failures = 0;
+        daemon.next_live_reconcile_at = None;
+        daemon.last_live_reconcile_error = None;
+        Ok(daemon)
     }
 
     fn boot_with_gateway(
         config: &PlatformConfig,
-        live_execution: Box<dyn LiveExecutionGateway>,
+        live_execution: SharedExecutionClient,
     ) -> io::Result<Self> {
         let mut normalized_config = config.clone();
         normalized_config.normalize_derived_paths();
@@ -162,10 +200,12 @@ impl PloyDaemon {
             supervisor: WorkerSupervisor::default(),
             trading: BTreeMap::new(),
             proposals: ProposalStore::default(),
-            live_execution: Arc::from(live_execution),
+            live_execution,
             live_reconcile_failures: 0,
             next_live_reconcile_at: None,
             last_live_reconcile_error: None,
+            execution_stream: None,
+            execution_stream_attempted: false,
             #[cfg(test)]
             fail_trading_state_write_on_attempt: None,
             #[cfg(test)]
@@ -196,11 +236,12 @@ impl PloyDaemon {
             daemon.tick();
         }
         daemon.mark_runtime_healthy();
+        #[cfg(not(test))]
         if daemon.has_live_deployments() {
-            match daemon.probe_live_venue() {
-                Ok(()) => daemon.mark_venue_healthy(),
-                Err(error) => daemon.mark_live_runtime_degraded(error),
-            }
+            daemon.mark_live_runtime_degraded(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                MONDAY_EXECUTION_DISABLED,
+            ));
         }
 
         Ok(daemon)
@@ -216,24 +257,24 @@ impl PloyDaemon {
         }
         self.control_plane.system.set_database_connected(true);
         self.tick();
-        if self.has_live_deployments() {
-            match self.probe_live_venue() {
-                Ok(()) => {
-                    self.mark_venue_healthy();
-                    match self.reconcile_live_fills() {
-                        Ok(ReconcileStatus::Applied(_) | ReconcileStatus::Noop) => {
-                            self.mark_runtime_healthy()
-                        }
-                        Ok(ReconcileStatus::BackoffActive) => {}
-                        Err(err) => self.mark_live_runtime_degraded(err),
-                    }
-                }
-                Err(err) => self.mark_live_runtime_degraded(err),
-            }
-        } else {
+        if !self.has_live_deployments() {
             self.mark_runtime_healthy();
         }
         self.refresh_source_health();
+        if self
+            .control_plane
+            .system
+            .status()
+            .status
+            .starts_with("recovering@")
+            && !self.control_plane.system.source_is_stale("live_reconcile")
+            && !self
+                .control_plane
+                .system
+                .source_is_stale("venue:polymarket")
+        {
+            self.mark_runtime_healthy();
+        }
         if self.config.circuit_breaker_enabled {
             self.evaluate_circuit_breakers();
         }
@@ -256,7 +297,7 @@ impl PloyDaemon {
             &self.config.deployment_status_file,
             &self.control_plane.deployments.summaries(),
         )?;
-        write_json(&self.config.trading_state_file, &self.trading_state())?;
+        self.persist_trading_state()?;
         write_json(&self.config.proposals_file, &self.proposals.all())?;
         Ok(())
     }
@@ -403,8 +444,21 @@ impl PloyDaemon {
         }
         match prior_runtime {
             Some(snapshot) => {
-                self.trading
-                    .insert(deployment_id.to_string(), TradingRuntime::restore(snapshot));
+                match TradingRuntime::restore(snapshot) {
+                    Ok(runtime) => {
+                        self.trading.insert(deployment_id.to_string(), runtime);
+                    }
+                    Err(error) => {
+                        self.trading.remove(deployment_id);
+                        // The canonical checkpoint is authoritative; a failed
+                        // rollback must remain visible to the caller and may
+                        // not be replaced with a default runtime.
+                        return io::Error::new(
+                            apply_error.kind(),
+                            format!("{apply_error}; canonical rollback restore failed: {error}"),
+                        );
+                    }
+                }
             }
             None => {
                 self.trading.remove(deployment_id);
@@ -685,11 +739,14 @@ impl PloyDaemon {
         Ok(())
     }
 
-    pub fn submit_intent(&mut self, intent: TradingIntent) -> io::Result<PaperIntentResponse> {
-        self.submit_intent_idempotent(intent, None)
+    pub async fn submit_intent(
+        &mut self,
+        intent: TradingIntent,
+    ) -> io::Result<PaperIntentResponse> {
+        self.submit_intent_idempotent(intent, None).await
     }
 
-    pub fn submit_intent_idempotent(
+    pub async fn submit_intent_idempotent(
         &mut self,
         intent: TradingIntent,
         idempotency_key: Option<&str>,
@@ -699,9 +756,10 @@ impl PloyDaemon {
             idempotency_key,
             IntentAdmissionSource::AuthenticatedOperator,
         )
+        .await
     }
 
-    pub fn submit_intent_idempotent_from(
+    pub async fn submit_intent_idempotent_from(
         &mut self,
         intent: TradingIntent,
         idempotency_key: Option<&str>,
@@ -710,7 +768,7 @@ impl PloyDaemon {
         match self.prepare_intent_idempotent_from(intent, idempotency_key, source)? {
             PreparedIntentSubmission::Complete(response) => Ok(response),
             PreparedIntentSubmission::Live(prepared) => {
-                let outcome = prepared.execute();
+                let outcome = prepared.execute().await;
                 self.finish_prepared_live_intent(prepared, outcome)
             }
         }
@@ -854,7 +912,7 @@ impl PloyDaemon {
         self.submit_paper_intent_idempotent(intent, None)
     }
 
-    fn submit_paper_intent_idempotent(
+    pub(crate) fn submit_paper_intent_idempotent(
         &mut self,
         intent: TradingIntent,
         idempotency_key: Option<&str>,
@@ -885,7 +943,7 @@ impl PloyDaemon {
         submit_paper_runtime_intent(runtime, deployment, intent, idempotency_key)
     }
 
-    pub fn cancel_order(
+    pub async fn cancel_order(
         &mut self,
         deployment_id: &str,
         order_id: &str,
@@ -901,14 +959,15 @@ impl PloyDaemon {
         })?;
         cancel_runtime_order(
             runtime,
-            self.live_execution.as_ref(),
+            &mut **lock_execution_client(&self.live_execution).await?,
             &deployment,
             deployment_id,
             order_id,
         )
+        .await
     }
 
-    pub fn replace_order(
+    pub async fn replace_order(
         &mut self,
         deployment_id: &str,
         order_id: &str,
@@ -926,13 +985,14 @@ impl PloyDaemon {
         })?;
         replace_runtime_order(
             runtime,
-            self.live_execution.as_ref(),
+            &mut **lock_execution_client(&self.live_execution).await?,
             &deployment,
             deployment_id,
             order_id,
             request,
             current_total_exposure,
         )
+        .await
     }
 
     fn prepare_live_intent_submission(
@@ -955,7 +1015,7 @@ impl PloyDaemon {
                 Ok(PreparedIntentSubmission::Live(PreparedDaemonLiveIntent {
                     deployment_id,
                     prepared,
-                    gateway: Arc::clone(&self.live_execution),
+                    client: Arc::clone(&self.live_execution),
                 }))
             }
         }
@@ -964,7 +1024,7 @@ impl PloyDaemon {
     pub fn finish_prepared_live_intent(
         &mut self,
         prepared: PreparedDaemonLiveIntent,
-        outcome: Result<ExecutionOutcome, ExecutionError>,
+        outcome: Result<hft_core::OrderId, hft_core::HftError>,
     ) -> io::Result<PaperIntentResponse> {
         let submission_ambiguous = outcome.is_err();
         let deployment_id = prepared.deployment_id;
@@ -1032,27 +1092,90 @@ impl PloyDaemon {
             }
         }
         fs::create_dir_all(&self.config.runtime_root)?;
-        write_json(&self.config.trading_state_file, &self.trading_state())
+        let persisted = self
+            .control_plane
+            .deployments
+            .records()
+            .into_iter()
+            .filter_map(|record| {
+                self.trading
+                    .get(&record.deployment_id)
+                    .map(|runtime| (record, runtime.snapshot(&BTreeMap::new())))
+            })
+            .map(|(record, snapshot)| build_persisted_trading_state_snapshot(record, snapshot))
+            .collect::<io::Result<Vec<_>>>()?;
+        write_json(&self.config.trading_state_file, &persisted)
     }
 
-    pub fn reconcile_live_fills(&mut self) -> io::Result<ReconcileStatus> {
+    pub async fn reconcile_live_fills(&mut self) -> io::Result<ReconcileStatus> {
         if let Some(next_attempt_at) = self.next_live_reconcile_at {
             if Utc::now() < next_attempt_at {
                 return Ok(ReconcileStatus::BackoffActive);
             }
         }
 
-        let result = reconcile_runtime_live_fills(
-            self.live_execution.as_ref(),
-            &self.control_plane.deployments.records(),
-            &mut self.trading,
-        )?;
+        if self.execution_stream.is_none() && !self.execution_stream_attempted {
+            self.execution_stream_attempted = true;
+            let client_ref = Arc::clone(&self.live_execution);
+            let stream_result = {
+                let client = lock_execution_client(&client_ref).await?;
+                client.execution_stream().await
+            };
+            match stream_result {
+                Ok(stream) => self.execution_stream = Some(stream),
+                Err(
+                    hft_core::HftError::Config(_)
+                    | hft_core::HftError::InvalidOrder(_)
+                    | hft_core::HftError::SubmissionNotAttempted(_),
+                ) => {}
+                Err(error) => {
+                    self.execution_stream_attempted = false;
+                    let error = io::Error::new(io::ErrorKind::ConnectionAborted, error.to_string());
+                    self.mark_live_runtime_degraded(io::Error::new(
+                        error.kind(),
+                        error.to_string(),
+                    ));
+                    return Err(error);
+                }
+            }
+        }
+
+        let result = {
+            let client_ref = Arc::clone(&self.live_execution);
+            let mut client = lock_execution_client(&client_ref).await?;
+            reconcile_runtime_live_fills(
+                &mut **client,
+                &mut self.execution_stream,
+                &self.control_plane.deployments.records(),
+                &mut self.trading,
+            )
+            .await
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if self.execution_stream.is_none() {
+                    self.execution_stream_attempted = false;
+                }
+                self.mark_live_runtime_degraded(io::Error::new(error.kind(), error.to_string()));
+                return Err(error);
+            }
+        };
+
+        // Attaching a canonical execution stream deliberately closes readiness until its
+        // ordered synchronization marker is applied. Drain it before probing that readiness.
+        if let Err(error) = self.probe_live_venue().await {
+            self.mark_live_runtime_degraded(io::Error::new(error.kind(), error.to_string()));
+            return Err(error);
+        }
 
         if matches!(result, ReconcileStatus::Noop) {
             self.live_reconcile_failures = 0;
             self.next_live_reconcile_at = None;
             self.last_live_reconcile_error = None;
             self.control_plane.system.note_live_reconcile_healthy();
+            self.mark_runtime_healthy();
+            self.mark_venue_healthy();
             return Ok(ReconcileStatus::Noop);
         }
 
@@ -1060,6 +1183,8 @@ impl PloyDaemon {
         self.next_live_reconcile_at = None;
         self.last_live_reconcile_error = None;
         self.control_plane.system.note_live_reconcile_healthy();
+        self.mark_runtime_healthy();
+        self.mark_venue_healthy();
 
         Ok(result)
     }
@@ -1075,10 +1200,17 @@ impl PloyDaemon {
             })
     }
 
-    fn probe_live_venue(&self) -> io::Result<()> {
-        self.live_execution
-            .probe()
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))
+    async fn probe_live_venue(&self) -> io::Result<()> {
+        let client = lock_execution_client(&self.live_execution).await?;
+        let health = client.health().await;
+        if health.connected {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                MONDAY_EXECUTION_DISABLED,
+            ))
+        }
     }
 
     fn latest_trade_time(&self) -> Option<DateTime<Utc>> {
@@ -1325,12 +1457,13 @@ pub(crate) fn seed_empty_live_ledgers(config: &PlatformConfig) {
         .into_iter()
         .filter(|record| record.runtime_mode == DeploymentRuntimeMode::Live)
         .map(|record| {
-            build_trading_state_snapshot(
+            build_persisted_trading_state_snapshot(
                 record,
                 TradingRuntime::default().snapshot(&BTreeMap::new()),
             )
         })
-        .collect::<Vec<_>>();
+        .collect::<io::Result<Vec<_>>>()
+        .expect("build canonical test snapshots");
     fs::create_dir_all(
         config
             .trading_state_file
@@ -1341,16 +1474,14 @@ pub(crate) fn seed_empty_live_ledgers(config: &PlatformConfig) {
     write_json(&config.trading_state_file, &snapshots).expect("seed canonical live ledgers");
 }
 
-pub fn run_shared_forever(
-    daemon: Arc<Mutex<PloyDaemon>>,
+pub async fn run_shared_forever(
+    daemon: Arc<tokio::sync::Mutex<PloyDaemon>>,
     events: Arc<EventBroker>,
 ) -> io::Result<()> {
     loop {
         if shutdown_requested() {
             eprintln!("ployd: shutdown signal received, writing final snapshots");
-            let mut daemon = daemon
-                .lock()
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "daemon lock poisoned"))?;
+            let mut daemon = daemon.lock().await;
             if let Err(err) = daemon.write_runtime_snapshots() {
                 eprintln!("ployd: final snapshot write failed: {err}");
             }
@@ -1358,16 +1489,19 @@ pub fn run_shared_forever(
             return Ok(());
         }
         let tick_interval_ms = {
-            let mut daemon = daemon
-                .lock()
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "daemon lock poisoned"))?;
+            let mut daemon = daemon.lock().await;
             if let Err(err) = daemon.write_runtime_snapshots() {
                 eprintln!("ployd tick degraded: {err}");
+            }
+            if daemon.has_live_deployments() {
+                if let Err(err) = daemon.reconcile_live_fills().await {
+                    eprintln!("ployd reconcile degraded: {err}");
+                }
             }
             publish_snapshot_events(&daemon, &events);
             daemon.config.tick_interval_ms
         };
-        thread::sleep(Duration::from_millis(tick_interval_ms));
+        tokio::time::sleep(Duration::from_millis(tick_interval_ms)).await;
     }
 }
 
@@ -1376,11 +1510,8 @@ mod tests {
     use super::{seed_empty_live_ledgers, PloyDaemon, ReconcileStatus};
     use crate::config::PlatformConfig;
     use crate::test_support::StaticExecutionGateway;
-    use ploy_connectivity::{
-        CancellationOutcome, CancellationRequest, ExecutionError, ExecutionOutcome,
-        ExecutionRequest, LiveExecutionGateway, ReplaceOutcome, ReplaceRequest,
-        MONDAY_LIVE_EXECUTION_DISABLED,
-    };
+    use async_trait::async_trait;
+    use chrono::Utc;
     use ploy_operator_contracts::{
         DeploymentApplyRequest, DeploymentControlRequest, DeploymentRuntimeMode, DeploymentState,
         DesiredState, ObservedState, PaperIntentResponse,
@@ -1389,18 +1520,18 @@ mod tests {
     use ploy_platform_runtime::{
         live_reconcile_backoff_ms, runtime_support::IntentAdmissionSource,
     };
-    use ploy_trading::{
-        FillRecord, IntentPurpose, OrderRecord, OrderState, PositionSnapshot, TradeSide,
-        TradingIntent, TradingRuntime, TradingRuntimeSnapshot,
+    use portfolio_core::prediction::{
+        FillRecord, IntentPurpose, OrderState, TradeSide, TradingIntent, TradingRuntime,
     };
+    use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
     use std::fs;
-    use std::io::ErrorKind;
+    use std::io::{self, ErrorKind};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier, Mutex};
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const LIVE_WALLET: &str = "0x1111111111111111111111111111111111111111";
@@ -1440,8 +1571,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn production_boot_wires_the_monday_disabled_live_gateway() {
+    #[tokio::test]
+    async fn production_boot_wires_the_monday_disabled_live_gateway() {
         let root = temp_dir("monday-disabled-live");
         let runtime_root = root.join("run/platform");
         let config = PlatformConfig {
@@ -1453,13 +1584,118 @@ mod tests {
             ..PlatformConfig::default()
         };
         let daemon = PloyDaemon::boot(&config).expect("boot with disabled live execution");
-        let expected = ExecutionError::Configuration(MONDAY_LIVE_EXECUTION_DISABLED.to_string());
-
-        assert_eq!(daemon.live_execution.probe(), Err(expected));
+        let health = {
+            let client = daemon.live_execution.lock().await;
+            client.health().await
+        };
+        assert!(!health.connected);
     }
 
-    #[test]
-    fn configured_live_resume_requires_matching_unexpired_approval_receipt() {
+    #[tokio::test]
+    async fn daemon_reattaches_ended_stream_and_applies_pending_sync_before_health_probe() {
+        let root = temp_dir("execution-stream-recovery");
+        let config = PlatformConfig {
+            registry_file: root.join("deployments.json"),
+            runtime_root: root.join("runtime"),
+            status_file: root.join("status.json"),
+            deployment_status_file: root.join("deployment-status.json"),
+            trading_state_file: root.join("trading-state.json"),
+            ..PlatformConfig::default()
+        };
+        let recovery = Arc::new(StreamRecoveryFixture::default());
+        let gateway = CountingAckGateway {
+            submits: Arc::new(AtomicUsize::new(0)),
+            stream_recovery: Some(Arc::clone(&recovery)),
+        };
+        let mut daemon = PloyDaemon::boot_with_live_execution(&config, Box::new(gateway)).unwrap();
+        let error = daemon.reconcile_live_fills().await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ConnectionAborted);
+        assert!(daemon.execution_stream.is_none());
+        assert!(!daemon.execution_stream_attempted);
+        assert_eq!(recovery.attachments.load(Ordering::SeqCst), 1);
+
+        daemon.next_live_reconcile_at = None;
+        assert!(daemon.reconcile_live_fills().await.is_err());
+        assert!(daemon.execution_stream.is_some());
+        assert!(daemon.execution_stream_attempted);
+        assert_eq!(recovery.attachments.load(Ordering::SeqCst), 2);
+        assert_eq!(recovery.acknowledged.load(Ordering::SeqCst), 0);
+
+        let mut final_result = Err(io::Error::other("synchronization not reached"));
+        for _ in 0..8 {
+            daemon.next_live_reconcile_at = None;
+            final_result = daemon.reconcile_live_fills().await;
+            if final_result.is_ok() {
+                break;
+            }
+        }
+        assert_eq!(final_result.unwrap(), ReconcileStatus::Noop);
+        assert_eq!(recovery.acknowledged.load(Ordering::SeqCst), 42);
+        assert_eq!(recovery.attachments.load(Ordering::SeqCst), 2);
+        assert_eq!(daemon.live_reconcile_failures, 0);
+        assert!(daemon.last_live_reconcile_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn daemon_keeps_rejected_canonical_accounting_degraded() {
+        let root = temp_dir("rejected-canonical-accounting");
+        let config = PlatformConfig {
+            registry_file: root.join("deployments.json"),
+            runtime_root: root.join("runtime"),
+            status_file: root.join("status.json"),
+            deployment_status_file: root.join("deployment-status.json"),
+            trading_state_file: root.join("trading-state.json"),
+            ..PlatformConfig::default()
+        };
+        let mut daemon = PloyDaemon::boot_with_live_execution(
+            &config,
+            Box::new(StaticExecutionGateway::acknowledged("venue-invalid")),
+        )
+        .unwrap();
+        daemon
+            .apply_deployment(paused_live_request("example.live", LIVE_WALLET))
+            .unwrap();
+        let runtime = daemon.trading.get_mut("example.live").unwrap();
+        runtime
+            .submit_intent(
+                TradingIntent {
+                    intent_id: "rejected-fee".to_string(),
+                    deployment_id: "example.live".to_string(),
+                    market_id: "market-1".to_string(),
+                    token_id: "yes-token".to_string(),
+                    side: TradeSide::Buy,
+                    quantity: dec!(1),
+                    limit_price: Some(dec!(0.5)),
+                    purpose: IntentPurpose::Entry,
+                    created_at: Utc::now(),
+                },
+                "order-invalid",
+                None,
+            )
+            .unwrap();
+        runtime.acknowledge_order("order-invalid", "venue-invalid");
+        assert!(!runtime.record_fill(FillRecord {
+            fill_id: "negative-fee".to_string(),
+            order_id: "order-invalid".to_string(),
+            token_id: "yes-token".to_string(),
+            side: TradeSide::Buy,
+            quantity: dec!(1),
+            price: dec!(0.5),
+            fee: dec!(-0.01),
+            timestamp: Utc::now(),
+        }));
+        for expected_failures in 1..=2 {
+            daemon.next_live_reconcile_at = None;
+            let error = daemon.reconcile_live_fills().await.unwrap_err();
+            assert!(error.to_string().contains("requires reconciliation"));
+            assert_eq!(daemon.live_reconcile_failures, expected_failures);
+            assert!(daemon.last_live_reconcile_error.is_some());
+            assert!(daemon.trading["example.live"].reconciliation_required());
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_live_resume_requires_matching_unexpired_approval_receipt() {
         let root = temp_dir("live-approval-receipt");
         let runtime_root = root.join("run/platform");
         let strategy_root = root.join("config/strategies");
@@ -1550,33 +1786,52 @@ mod tests {
     }
 
     fn order_runtime(deployment_id: &str, state: OrderState) -> TradingRuntime {
-        TradingRuntime::restore(TradingRuntimeSnapshot {
-            orders: vec![OrderRecord {
-                order_id: "order-1".to_string(),
-                intent_id: "intent-1".to_string(),
-                deployment_id: deployment_id.to_string(),
-                token_id: "token-1".to_string(),
-                requested_qty: dec!(1),
-                limit_price: Some(dec!(0.5)),
-                venue_order_id: Some("venue-1".to_string()),
-                venue_order_history: Vec::new(),
-                revision: 0,
-                state,
-                state_changed_at: Some(chrono::Utc::now()),
-                filled_qty: if state == OrderState::PartiallyFilled {
-                    dec!(0.5)
-                } else {
-                    dec!(0)
-                },
-                rejection_reason: None,
-                last_error: None,
-                idempotency_key: None,
-            }],
-            ..TradingRuntimeSnapshot::default()
-        })
+        let intent = TradingIntent {
+            intent_id: "intent-1".to_string(),
+            deployment_id: deployment_id.to_string(),
+            market_id: "market-1".to_string(),
+            token_id: "token-1".to_string(),
+            side: TradeSide::Buy,
+            quantity: dec!(1),
+            limit_price: Some(dec!(0.5)),
+            purpose: IntentPurpose::Entry,
+            created_at: Utc::now(),
+        };
+        let mut runtime = TradingRuntime::default();
+        runtime
+            .submit_intent(intent, "order-1".to_string(), None)
+            .expect("canonical test intent");
+        match state {
+            OrderState::Pending => {}
+            OrderState::Acknowledged => {
+                runtime.acknowledge_order("order-1", "venue-1");
+            }
+            OrderState::PartiallyFilled => {
+                runtime.acknowledge_order("order-1", "venue-1");
+                assert!(runtime.record_fill(FillRecord {
+                    fill_id: "fill-1".to_string(),
+                    order_id: "order-1".to_string(),
+                    token_id: "token-1".to_string(),
+                    side: TradeSide::Buy,
+                    quantity: dec!(0.5),
+                    price: dec!(0.5),
+                    fee: Decimal::ZERO,
+                    timestamp: Utc::now(),
+                }));
+            }
+            OrderState::Unknown => {
+                runtime.mark_order_unknown("order-1", "test unknown");
+            }
+            OrderState::Canceled => {
+                runtime.acknowledge_order("order-1", "venue-1");
+                runtime.cancel_order("order-1");
+            }
+            other => panic!("unsupported canonical test state: {other:?}"),
+        }
+        runtime
     }
 
-    fn create_flat_idempotent_paper_history(
+    async fn create_flat_idempotent_paper_history(
         daemon: &mut PloyDaemon,
         deployment_id: &str,
     ) -> (TradingIntent, PaperIntentResponse) {
@@ -1604,9 +1859,11 @@ mod tests {
         };
         let response = daemon
             .submit_intent_idempotent(intent.clone(), Some("mode-stable-key"))
+            .await
             .expect("submit idempotent paper intent");
         daemon
             .cancel_order(deployment_id, &response.order_id)
+            .await
             .expect("cancel to flat terminal history");
         daemon
             .control_deployment(
@@ -1633,112 +1890,233 @@ mod tests {
     #[derive(Debug, Clone)]
     struct CountingAckGateway {
         submits: Arc<AtomicUsize>,
+        stream_recovery: Option<Arc<StreamRecoveryFixture>>,
     }
 
-    impl LiveExecutionGateway for CountingAckGateway {
-        fn probe(&self) -> Result<(), ExecutionError> {
-            Ok(())
-        }
+    #[derive(Debug, Default)]
+    struct StreamRecoveryFixture {
+        attachments: AtomicUsize,
+        pending_generation: AtomicUsize,
+        acknowledged: AtomicUsize,
+    }
 
-        fn submit(&self, _request: &ExecutionRequest) -> Result<ExecutionOutcome, ExecutionError> {
+    #[async_trait]
+    impl ports::ExecutionClient for CountingAckGateway {
+        async fn place_order(
+            &mut self,
+            _intent: ports::OrderIntent,
+        ) -> Result<hft_core::OrderId, hft_core::HftError> {
             let attempt = self.submits.fetch_add(1, Ordering::SeqCst) + 1;
-            Ok(ExecutionOutcome::Acknowledged {
-                venue_order_id: format!("venue-{attempt}"),
-            })
+            Ok(hft_core::OrderId(format!("venue-{attempt}")))
         }
-
-        fn cancel(
-            &self,
-            _request: &CancellationRequest,
-        ) -> Result<CancellationOutcome, ExecutionError> {
-            Ok(CancellationOutcome::Canceled)
-        }
-
-        fn replace(&self, _request: &ReplaceRequest) -> Result<ReplaceOutcome, ExecutionError> {
-            unreachable!()
-        }
-
-        fn reconcile_fills(
-            &self,
-            _tracked_orders: &[ploy_connectivity::TrackedOrder],
-        ) -> Result<Vec<FillRecord>, ExecutionError> {
-            Ok(Vec::new())
-        }
-    }
-
-    impl LiveExecutionGateway for PendingPersistGateway {
-        fn probe(&self) -> Result<(), ExecutionError> {
+        async fn cancel_order(
+            &mut self,
+            _order_id: &hft_core::OrderId,
+        ) -> Result<(), hft_core::HftError> {
             Ok(())
         }
-
-        fn submit(&self, _request: &ExecutionRequest) -> Result<ExecutionOutcome, ExecutionError> {
-            let snapshots: serde_json::Value = serde_json::from_slice(
-                &fs::read(&self.trading_state_file).expect("pending state persisted before submit"),
-            )
-            .expect("pending state json");
-            assert_eq!(snapshots[0]["orders"][0]["state"], "pending");
-            Err(ExecutionError::Transport("response lost".to_string()))
-        }
-
-        fn cancel(
-            &self,
-            _request: &CancellationRequest,
-        ) -> Result<CancellationOutcome, ExecutionError> {
-            Ok(CancellationOutcome::Canceled)
-        }
-
-        fn replace(&self, _request: &ReplaceRequest) -> Result<ReplaceOutcome, ExecutionError> {
+        async fn modify_order(
+            &mut self,
+            _order_id: &hft_core::OrderId,
+            _new_quantity: Option<hft_core::Quantity>,
+            _new_price: Option<hft_core::Price>,
+        ) -> Result<hft_core::OrderId, hft_core::HftError> {
             unreachable!()
         }
-
-        fn reconcile_fills(
+        async fn execution_stream(
             &self,
-            _tracked_orders: &[ploy_connectivity::TrackedOrder],
-        ) -> Result<Vec<FillRecord>, ExecutionError> {
+        ) -> Result<ports::BoxStream<ports::ExecutionEvent>, hft_core::HftError> {
+            if let Some(recovery) = &self.stream_recovery {
+                use futures::StreamExt;
+                let attempt = recovery.attachments.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    return Ok(Box::pin(futures::stream::empty()));
+                }
+                recovery.pending_generation.store(42, Ordering::SeqCst);
+                let mut events = vec![ports::ExecutionEvent::ExecutionStreamBarrier {
+                    stream_id: 42,
+                    timestamp: 1,
+                }];
+                events.extend((0..128).map(|_| ports::ExecutionEvent::ConnectionStatus {
+                    connected: true,
+                    timestamp: 1,
+                }));
+                events.push(ports::ExecutionEvent::ExecutionStreamSynchronized {
+                    stream_id: 42,
+                    connected: true,
+                    timestamp: 2,
+                });
+                return Ok(Box::pin(
+                    futures::stream::iter(events.into_iter().map(Ok))
+                        .chain(futures::stream::pending()),
+                ));
+            }
+            Err(hft_core::HftError::Config("unused".into()))
+        }
+        fn acknowledge_execution_stream_applied(&self, stream_id: u64) {
+            if let Some(recovery) = &self.stream_recovery {
+                if recovery
+                    .pending_generation
+                    .compare_exchange(stream_id as usize, 0, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    recovery
+                        .acknowledged
+                        .store(stream_id as usize, Ordering::SeqCst);
+                }
+            }
+        }
+        async fn list_open_orders(&self) -> Result<Vec<ports::OpenOrder>, hft_core::HftError> {
             Ok(Vec::new())
         }
-    }
-
-    impl LiveExecutionGateway for FlakyReconcileGateway {
-        fn probe(&self) -> Result<(), ExecutionError> {
+        async fn list_recent_fills(&self) -> Result<Vec<ports::AccountFill>, hft_core::HftError> {
+            Ok(Vec::new())
+        }
+        async fn get_balance(&self) -> Result<Vec<ports::AccountBalance>, hft_core::HftError> {
+            Ok(Vec::new())
+        }
+        async fn get_positions(&self) -> Result<Vec<ports::Position>, hft_core::HftError> {
+            Ok(Vec::new())
+        }
+        async fn connect(&mut self) -> Result<(), hft_core::HftError> {
             Ok(())
         }
-
-        fn submit(&self, _request: &ExecutionRequest) -> Result<ExecutionOutcome, ExecutionError> {
-            Ok(ExecutionOutcome::Acknowledged {
-                venue_order_id: "venue-live-health-1".to_string(),
-            })
+        async fn disconnect(&mut self) -> Result<(), hft_core::HftError> {
+            Ok(())
         }
-
-        fn cancel(
-            &self,
-            _request: &CancellationRequest,
-        ) -> Result<CancellationOutcome, ExecutionError> {
-            Ok(CancellationOutcome::Canceled)
-        }
-
-        fn replace(&self, _request: &ReplaceRequest) -> Result<ReplaceOutcome, ExecutionError> {
-            Ok(ReplaceOutcome::Replaced {
-                venue_order_id: "venue-live-health-2".to_string(),
-            })
-        }
-
-        fn reconcile_fills(
-            &self,
-            _tracked_orders: &[ploy_connectivity::TrackedOrder],
-        ) -> Result<Vec<FillRecord>, ExecutionError> {
-            let mut attempts = self.attempts.lock().expect("attempts lock");
-            *attempts += 1;
-            if *attempts == 1 {
-                Err(ExecutionError::Transport("gateway offline".to_string()))
-            } else {
-                Ok(Vec::new())
+        async fn health(&self) -> ports::ConnectionHealth {
+            ports::ConnectionHealth {
+                connected: self
+                    .stream_recovery
+                    .as_ref()
+                    .is_none_or(|recovery| recovery.pending_generation.load(Ordering::SeqCst) == 0),
+                latency_ms: Some(0.0),
+                last_heartbeat: 0,
             }
         }
     }
 
-    #[test]
-    fn boot_persists_unsafe_live_account_scope_quarantine() {
+    #[async_trait]
+    impl ports::ExecutionClient for PendingPersistGateway {
+        async fn place_order(
+            &mut self,
+            _intent: ports::OrderIntent,
+        ) -> Result<hft_core::OrderId, hft_core::HftError> {
+            let snapshots: serde_json::Value = serde_json::from_slice(
+                &fs::read(&self.trading_state_file).expect("pending state persisted before submit"),
+            )
+            .expect("pending state json");
+            assert_eq!(snapshots[0]["snapshot"]["orders"][0]["state"], "pending");
+            Err(hft_core::HftError::Network("response lost".to_string()))
+        }
+        async fn cancel_order(
+            &mut self,
+            _order_id: &hft_core::OrderId,
+        ) -> Result<(), hft_core::HftError> {
+            Ok(())
+        }
+        async fn modify_order(
+            &mut self,
+            _order_id: &hft_core::OrderId,
+            _new_quantity: Option<hft_core::Quantity>,
+            _new_price: Option<hft_core::Price>,
+        ) -> Result<hft_core::OrderId, hft_core::HftError> {
+            unreachable!()
+        }
+        async fn execution_stream(
+            &self,
+        ) -> Result<ports::BoxStream<ports::ExecutionEvent>, hft_core::HftError> {
+            Err(hft_core::HftError::Config("unused".into()))
+        }
+        async fn list_open_orders(&self) -> Result<Vec<ports::OpenOrder>, hft_core::HftError> {
+            Ok(Vec::new())
+        }
+        async fn list_recent_fills(&self) -> Result<Vec<ports::AccountFill>, hft_core::HftError> {
+            Ok(Vec::new())
+        }
+        async fn get_balance(&self) -> Result<Vec<ports::AccountBalance>, hft_core::HftError> {
+            Ok(Vec::new())
+        }
+        async fn get_positions(&self) -> Result<Vec<ports::Position>, hft_core::HftError> {
+            Ok(Vec::new())
+        }
+        async fn connect(&mut self) -> Result<(), hft_core::HftError> {
+            Ok(())
+        }
+        async fn disconnect(&mut self) -> Result<(), hft_core::HftError> {
+            Ok(())
+        }
+        async fn health(&self) -> ports::ConnectionHealth {
+            ports::ConnectionHealth {
+                connected: true,
+                latency_ms: Some(0.0),
+                last_heartbeat: 0,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ports::ExecutionClient for FlakyReconcileGateway {
+        async fn place_order(
+            &mut self,
+            _intent: ports::OrderIntent,
+        ) -> Result<hft_core::OrderId, hft_core::HftError> {
+            Ok(hft_core::OrderId("venue-live-health-1".into()))
+        }
+        async fn cancel_order(
+            &mut self,
+            _order_id: &hft_core::OrderId,
+        ) -> Result<(), hft_core::HftError> {
+            Ok(())
+        }
+        async fn modify_order(
+            &mut self,
+            _order_id: &hft_core::OrderId,
+            _new_quantity: Option<hft_core::Quantity>,
+            _new_price: Option<hft_core::Price>,
+        ) -> Result<hft_core::OrderId, hft_core::HftError> {
+            Ok(_order_id.clone())
+        }
+        async fn execution_stream(
+            &self,
+        ) -> Result<ports::BoxStream<ports::ExecutionEvent>, hft_core::HftError> {
+            Err(hft_core::HftError::Config("unused".into()))
+        }
+        async fn list_open_orders(&self) -> Result<Vec<ports::OpenOrder>, hft_core::HftError> {
+            Ok(Vec::new())
+        }
+        async fn list_recent_fills(&self) -> Result<Vec<ports::AccountFill>, hft_core::HftError> {
+            let mut attempts = self.attempts.lock().expect("attempts lock");
+            *attempts += 1;
+            if *attempts == 1 {
+                Err(hft_core::HftError::Network("gateway offline".to_string()))
+            } else {
+                Ok(Vec::new())
+            }
+        }
+        async fn get_balance(&self) -> Result<Vec<ports::AccountBalance>, hft_core::HftError> {
+            Ok(Vec::new())
+        }
+        async fn get_positions(&self) -> Result<Vec<ports::Position>, hft_core::HftError> {
+            Ok(Vec::new())
+        }
+        async fn connect(&mut self) -> Result<(), hft_core::HftError> {
+            Ok(())
+        }
+        async fn disconnect(&mut self) -> Result<(), hft_core::HftError> {
+            Ok(())
+        }
+        async fn health(&self) -> ports::ConnectionHealth {
+            ports::ConnectionHealth {
+                connected: true,
+                latency_ms: Some(0.0),
+                last_heartbeat: 0,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn boot_persists_unsafe_live_account_scope_quarantine() {
         let root = temp_dir("legacy-live-cutover");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -1795,8 +2173,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn paper_snapshot_with_live_registry_is_quarantined_and_pid_is_killed() {
+    #[tokio::test]
+    async fn paper_snapshot_with_live_registry_is_quarantined_and_pid_is_killed() {
         let root = temp_dir("snapshot-mode-mismatch");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -1834,10 +2212,11 @@ mod tests {
         };
         super::write_json(
             &config.trading_state_file,
-            &[super::build_trading_state_snapshot(
+            &[super::build_persisted_trading_state_snapshot(
                 paper_record,
                 TradingRuntime::default().snapshot(&BTreeMap::new()),
-            )],
+            )
+            .expect("paper canonical snapshot")],
         )
         .expect("paper snapshot");
         let pid_file = runtime_root.join("workers/mismatch.live.pid");
@@ -1887,8 +2266,8 @@ mod tests {
         assert!(exited, "mode-mismatched legacy worker survived cutover");
     }
 
-    #[test]
-    fn new_live_apply_seeds_and_persists_empty_canonical_ledger() {
+    #[tokio::test]
+    async fn new_live_apply_seeds_and_persists_empty_canonical_ledger() {
         let root = temp_dir("new-live-canonical-ledger");
         let runtime_root = root.join("run/platform");
         let config = PlatformConfig {
@@ -1913,15 +2292,15 @@ mod tests {
             .and_then(|items| {
                 items
                     .iter()
-                    .find(|item| item["deployment_id"] == "new.live")
+                    .find(|item| item["snapshot"]["deployment_id"] == "new.live")
             })
             .expect("new live canonical ledger");
-        assert_eq!(snapshot["orders"], serde_json::json!([]));
-        assert_eq!(snapshot["positions"], serde_json::json!([]));
+        assert_eq!(snapshot["snapshot"]["orders"], serde_json::json!([]));
+        assert_eq!(snapshot["snapshot"]["positions"], serde_json::json!([]));
     }
 
-    #[test]
-    fn failed_first_live_ledger_persist_rolls_back_new_apply_without_resurrection() {
+    #[tokio::test]
+    async fn failed_first_live_ledger_persist_rolls_back_new_apply_without_resurrection() {
         let root = temp_dir("apply-ledger-failure-rollback");
         let runtime_root = root.join("run/platform");
         let config = PlatformConfig {
@@ -1948,8 +2327,8 @@ mod tests {
         assert!(daemon.supervisor.status("failed.live").is_none());
     }
 
-    #[test]
-    fn failed_registry_persist_after_ledger_write_rolls_back_and_restarts_absent() {
+    #[tokio::test]
+    async fn failed_registry_persist_after_ledger_write_rolls_back_and_restarts_absent() {
         let root = temp_dir("apply-registry-failure-rollback");
         let runtime_root = root.join("run/platform");
         let config = PlatformConfig {
@@ -1977,8 +2356,8 @@ mod tests {
         assert!(restarted.supervisor.status("failed.live").is_none());
     }
 
-    #[test]
-    fn failed_update_persist_restores_old_record_runtime_and_idempotency() {
+    #[tokio::test]
+    async fn failed_update_persist_restores_old_record_runtime_and_idempotency() {
         let root = temp_dir("apply-update-failure-rollback");
         let runtime_root = root.join("run/platform");
         let config = PlatformConfig {
@@ -2014,6 +2393,7 @@ mod tests {
         };
         let original_response = daemon
             .submit_intent_idempotent(intent.clone(), Some("stable-key"))
+            .await
             .expect("submit");
         daemon
             .control_deployment(
@@ -2060,12 +2440,13 @@ mod tests {
         );
         let replay = daemon
             .submit_intent_idempotent(intent, Some("stable-key"))
+            .await
             .expect("restored idempotency replay");
         assert_eq!(replay, original_response);
     }
 
-    #[test]
-    fn second_registry_write_failure_accepts_core_apply_and_marks_degraded() {
+    #[tokio::test]
+    async fn second_registry_write_failure_accepts_core_apply_and_marks_degraded() {
         let root = temp_dir("apply-derived-registry-failure");
         let runtime_root = root.join("run/platform");
         let config = PlatformConfig {
@@ -2108,8 +2489,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn status_snapshot_failure_accepts_core_apply_and_marks_degraded() {
+    #[tokio::test]
+    async fn status_snapshot_failure_accepts_core_apply_and_marks_degraded() {
         let root = temp_dir("apply-derived-status-failure");
         let runtime_root = root.join("run/platform");
         let config = PlatformConfig {
@@ -2140,8 +2521,8 @@ mod tests {
         assert_eq!(daemon.control_plane.deployments.records().len(), 1);
     }
 
-    #[test]
-    fn paper_to_live_core_snapshot_stays_aligned_when_derived_status_write_fails() {
+    #[tokio::test]
+    async fn paper_to_live_core_snapshot_stays_aligned_when_derived_status_write_fails() {
         let root = temp_dir("paper-live-derived-failure");
         let runtime_root = root.join("run/platform");
         let config = PlatformConfig {
@@ -2154,7 +2535,7 @@ mod tests {
         };
         let mut daemon = PloyDaemon::boot(&config).expect("boot");
         let (_intent, _response) =
-            create_flat_idempotent_paper_history(&mut daemon, "aligned.mode");
+            create_flat_idempotent_paper_history(&mut daemon, "aligned.mode").await;
         daemon.fail_status_write_on_attempt = Some(daemon.status_write_attempts + 1);
 
         let applied = daemon
@@ -2176,7 +2557,7 @@ mod tests {
             serde_json::from_slice(&fs::read(&config.trading_state_file).expect("snapshot"))
                 .expect("snapshot json");
         assert_eq!(registry[0]["runtime_mode"], "live");
-        assert_eq!(snapshots[0]["runtime_mode"], "live");
+        assert_eq!(snapshots[0]["snapshot"]["runtime_mode"], "live");
 
         let mut restarted = PloyDaemon::boot(&config).expect("restart aligned live");
         assert!(restarted.trading.contains_key("aligned.mode"));
@@ -2189,8 +2570,8 @@ mod tests {
         daemon.supervisor.stop("aligned.mode");
     }
 
-    #[test]
-    fn paper_to_live_core_ledger_failure_restores_paper_memory_and_disk() {
+    #[tokio::test]
+    async fn paper_to_live_core_ledger_failure_restores_paper_memory_and_disk() {
         let root = temp_dir("paper-live-core-failure");
         let runtime_root = root.join("run/platform");
         let config = PlatformConfig {
@@ -2202,7 +2583,7 @@ mod tests {
             ..PlatformConfig::default()
         };
         let mut daemon = PloyDaemon::boot(&config).expect("boot");
-        create_flat_idempotent_paper_history(&mut daemon, "rollback.mode");
+        create_flat_idempotent_paper_history(&mut daemon, "rollback.mode").await;
         daemon.fail_trading_state_write_on_attempt = Some(daemon.trading_state_write_attempts + 1);
 
         daemon
@@ -2230,7 +2611,7 @@ mod tests {
             serde_json::from_slice(&fs::read(&config.trading_state_file).expect("snapshot"))
                 .expect("snapshot json");
         assert_eq!(registry[0]["runtime_mode"], "paper");
-        assert_eq!(snapshots[0]["runtime_mode"], "paper");
+        assert_eq!(snapshots[0]["snapshot"]["runtime_mode"], "paper");
         let restarted = PloyDaemon::boot(&config).expect("restart paper");
         assert_eq!(
             restarted
@@ -2241,8 +2622,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn live_to_paper_persists_aligned_snapshot_and_idempotency_history() {
+    #[tokio::test]
+    async fn live_to_paper_persists_aligned_snapshot_and_idempotency_history() {
         let root = temp_dir("live-paper-history");
         let runtime_root = root.join("run/platform");
         let config = PlatformConfig {
@@ -2255,7 +2636,7 @@ mod tests {
         };
         let mut daemon = PloyDaemon::boot(&config).expect("boot");
         let (intent, original_response) =
-            create_flat_idempotent_paper_history(&mut daemon, "history.mode");
+            create_flat_idempotent_paper_history(&mut daemon, "history.mode").await;
         daemon
             .apply_deployment(DeploymentApplyRequest {
                 deployment_id: "history.mode".to_string(),
@@ -2281,23 +2662,24 @@ mod tests {
         let snapshots: serde_json::Value =
             serde_json::from_slice(&fs::read(&config.trading_state_file).expect("snapshot"))
                 .expect("snapshot json");
-        assert_eq!(snapshots[0]["runtime_mode"], "paper");
-        assert_eq!(snapshots[0]["orders"][0]["state"], "canceled");
+        assert_eq!(snapshots[0]["snapshot"]["runtime_mode"], "paper");
+        assert_eq!(snapshots[0]["snapshot"]["orders"][0]["state"], "canceled");
         assert_eq!(
-            snapshots[0]["orders"][0]["idempotency_key"],
+            snapshots[0]["snapshot"]["orders"][0]["idempotency_key"],
             "mode-stable-key"
         );
 
         let mut restarted = PloyDaemon::boot(&config).expect("restart paper");
         let replay = restarted
             .submit_intent_idempotent(intent, Some("mode-stable-key"))
+            .await
             .expect("idempotency history restored");
         assert_eq!(replay.order_id, original_response.order_id);
         assert_eq!(replay.state, "canceled");
     }
 
-    #[test]
-    fn paper_registry_without_snapshot_keeps_existing_bootstrap_behavior() {
+    #[tokio::test]
+    async fn paper_registry_without_snapshot_keeps_existing_bootstrap_behavior() {
         let root = temp_dir("paper-bootstrap-unchanged");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -2331,8 +2713,8 @@ mod tests {
         assert!(daemon.supervisor.status("legacy.paper").is_some());
     }
 
-    #[test]
-    fn mode_change_rejects_each_nonterminal_order_state_before_registry_mutation() {
+    #[tokio::test]
+    async fn mode_change_rejects_each_nonterminal_order_state_before_registry_mutation() {
         for state in [
             OrderState::Pending,
             OrderState::Acknowledged,
@@ -2375,8 +2757,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn account_move_rejects_nonzero_position_before_registry_mutation() {
+    #[tokio::test]
+    async fn account_move_rejects_nonzero_position_before_registry_mutation() {
         let root = temp_dir("account-move-position");
         let runtime_root = root.join("run/platform");
         let config = PlatformConfig {
@@ -2393,15 +2775,7 @@ mod tests {
             .expect("apply");
         daemon.trading.insert(
             "move.live".to_string(),
-            TradingRuntime::restore(TradingRuntimeSnapshot {
-                positions: vec![PositionSnapshot {
-                    token_id: "token-1".to_string(),
-                    net_qty: dec!(1),
-                    avg_entry_price: dec!(0.5),
-                    realized_pnl: dec!(0),
-                }],
-                ..TradingRuntimeSnapshot::default()
-            }),
+            order_runtime("move.live", OrderState::PartiallyFilled),
         );
 
         let error = daemon
@@ -2417,8 +2791,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn flat_ledger_with_terminal_history_allows_mode_and_account_reassignment() {
+    #[tokio::test]
+    async fn flat_ledger_with_terminal_history_allows_mode_and_account_reassignment() {
         let root = temp_dir("flat-reassignment");
         let runtime_root = root.join("run/platform");
         let config = PlatformConfig {
@@ -2446,8 +2820,8 @@ mod tests {
         assert_eq!(updated.account_id, "paper:test-new");
     }
 
-    #[test]
-    fn daemon_loads_platform_config() {
+    #[tokio::test]
+    async fn daemon_loads_platform_config() {
         let config = PlatformConfig {
             listen_addr: "127.0.0.1:9090".to_string(),
             ..PlatformConfig::default()
@@ -2458,8 +2832,8 @@ mod tests {
         assert_eq!(status.status, "running@127.0.0.1:9090");
     }
 
-    #[test]
-    fn daemon_writes_runtime_snapshots_for_operator_clients() {
+    #[tokio::test]
+    async fn daemon_writes_runtime_snapshots_for_operator_clients() {
         let root = temp_dir("snapshots");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -2509,8 +2883,8 @@ mod tests {
         assert_eq!(deployments[0].observed_state, ObservedState::Running);
     }
 
-    #[test]
-    fn daemon_records_paper_trade_into_trading_state_snapshot() {
+    #[tokio::test]
+    async fn daemon_records_paper_trade_into_trading_state_snapshot() {
         let root = temp_dir("trading-state");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -2570,11 +2944,15 @@ mod tests {
         );
         daemon.write_runtime_snapshots().expect("write snapshots");
 
-        let trading_state: Vec<ploy_operator_contracts::TradingStateSnapshot> =
+        let persisted: Vec<ploy_platform_runtime::runtime_support::PersistedTradingStateSnapshot> =
             serde_json::from_str(
                 &fs::read_to_string(&config.trading_state_file).expect("trading state file"),
             )
             .expect("trading state json");
+        let trading_state = persisted
+            .iter()
+            .map(|item| &item.snapshot)
+            .collect::<Vec<_>>();
         assert_eq!(trading_state.len(), 1);
         assert_eq!(trading_state[0].deployment_id, "example.paper");
         assert_eq!(trading_state[0].orders.len(), 1);
@@ -2583,8 +2961,8 @@ mod tests {
         assert_eq!(trading_state[0].risk.open_positions, 1);
     }
 
-    #[test]
-    fn daemon_rejects_paper_intent_when_deployment_is_not_running() {
+    #[tokio::test]
+    async fn daemon_rejects_paper_intent_when_deployment_is_not_running() {
         let root = temp_dir("paper-intent-gate");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -2632,8 +3010,8 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
-    #[test]
-    fn idempotent_replay_precedes_current_state_gate_and_rejects_payload_mismatch() {
+    #[tokio::test]
+    async fn idempotent_replay_precedes_current_state_gate_and_rejects_payload_mismatch() {
         let root = temp_dir("idempotent-state-gate");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -2675,6 +3053,7 @@ mod tests {
         let mut daemon = PloyDaemon::boot(&config).expect("boot");
         let first = daemon
             .submit_intent_idempotent(make_intent("intent-1", dec!(2)), Some("request-1"))
+            .await
             .expect("first submit");
         daemon
             .control_deployment(
@@ -2688,19 +3067,21 @@ mod tests {
 
         let replay = daemon
             .submit_intent_idempotent(make_intent("intent-2", dec!(2)), Some("request-1"))
+            .await
             .expect("replay bypasses current state gate");
         assert_eq!(replay, first);
 
         let mismatch = daemon
             .submit_intent_idempotent(make_intent("intent-3", dec!(1)), Some("request-1"))
+            .await
             .expect_err("mismatched payload must reject");
         assert!(mismatch
             .to_string()
             .contains("idempotency key payload mismatch"));
     }
 
-    #[test]
-    fn account_scoped_idempotency_survives_restart_and_cross_deployment_replay() {
+    #[tokio::test]
+    async fn account_scoped_idempotency_survives_restart_and_cross_deployment_replay() {
         let root = temp_dir("account-idempotency");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -2740,14 +3121,17 @@ mod tests {
             &config,
             Box::new(CountingAckGateway {
                 submits: submits.clone(),
+                stream_recovery: None,
             }),
         )
         .expect("boot");
         let first = daemon
             .submit_intent_idempotent(make_intent("a.live", "intent-a", dec!(1)), Some("key-1"))
+            .await
             .expect("first submit");
         let replay = daemon
             .submit_intent_idempotent(make_intent("b.live", "intent-b", dec!(1)), Some("key-1"))
+            .await
             .expect("same-account replay");
         assert_eq!(replay.order_id, first.order_id);
         assert_eq!(replay.deployment_id, "a.live");
@@ -2756,11 +3140,13 @@ mod tests {
                 make_intent("b.live", "intent-mismatch", dec!(2)),
                 Some("key-1")
             )
+            .await
             .expect_err("mismatch")
             .to_string()
             .contains("payload mismatch"));
         daemon
             .submit_intent_idempotent(make_intent("c.paper", "intent-c", dec!(1)), Some("key-1"))
+            .await
             .expect("different account may reuse key");
         assert_eq!(submits.load(Ordering::SeqCst), 1);
 
@@ -2771,6 +3157,7 @@ mod tests {
             &config,
             Box::new(CountingAckGateway {
                 submits: submits.clone(),
+                stream_recovery: None,
             }),
         )
         .expect("restore");
@@ -2779,13 +3166,14 @@ mod tests {
                 make_intent("b.live", "intent-after-restart", dec!(1)),
                 Some("key-1"),
             )
+            .await
             .expect("restored replay");
         assert_eq!(restored_replay.order_id, first.order_id);
         assert_eq!(submits.load(Ordering::SeqCst), 1);
     }
 
-    #[test]
-    fn daemon_routes_live_intent_into_acknowledged_order_snapshot() {
+    #[tokio::test]
+    async fn daemon_routes_live_intent_into_acknowledged_order_snapshot() {
         let root = temp_dir("live-intent-ack");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -2835,6 +3223,7 @@ mod tests {
                 purpose: IntentPurpose::Entry,
                 created_at: chrono::Utc::now(),
             })
+            .await
             .expect("submit live intent");
 
         assert_eq!(response.state, "acknowledged");
@@ -2850,8 +3239,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fresh_running_live_allows_risk_increase() {
+    #[tokio::test]
+    async fn fresh_running_live_allows_risk_increase() {
         let root = temp_dir("fresh-running-live-intent");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -2884,7 +3273,7 @@ mod tests {
             &config,
             Box::new(
                 StaticExecutionGateway::acknowledged("unused").with_probe_result(Err(
-                    ExecutionError::Transport("venue unreachable".to_string()),
+                    hft_core::HftError::Network("venue unreachable".to_string()),
                 )),
             ),
         )
@@ -2893,6 +3282,10 @@ mod tests {
             .control_plane
             .deployments
             .set_observed_state("example.live", ObservedState::Running);
+        blocked.mark_live_runtime_degraded(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "venue unreachable",
+        ));
         let error = blocked
             .submit_intent_idempotent_from(
                 TradingIntent {
@@ -2909,6 +3302,7 @@ mod tests {
                 None,
                 IntentAdmissionSource::Worker,
             )
+            .await
             .expect_err("unreachable venue must block live risk increase");
         assert!(error.to_string().contains("fresh venue health"));
 
@@ -2938,13 +3332,14 @@ mod tests {
                 None,
                 IntentAdmissionSource::Worker,
             )
+            .await
             .expect("fresh running live admission");
 
         assert_eq!(response.state, "acknowledged");
     }
 
-    #[test]
-    fn live_submission_persists_pending_before_side_effect_and_pauses_on_unknown() {
+    #[tokio::test]
+    async fn live_submission_persists_pending_before_side_effect_and_pauses_on_unknown() {
         let root = temp_dir("live-pending-before-submit");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -2991,6 +3386,7 @@ mod tests {
                 purpose: IntentPurpose::Entry,
                 created_at: chrono::Utc::now(),
             })
+            .await
             .expect("unknown response");
 
         assert_eq!(response.state, "unknown");
@@ -3001,8 +3397,8 @@ mod tests {
         assert_eq!(deployment.observed_state, ObservedState::Degraded);
     }
 
-    #[test]
-    fn acknowledged_submit_with_final_persistence_failure_becomes_durable_unknown() {
+    #[tokio::test]
+    async fn acknowledged_submit_with_final_persistence_failure_becomes_durable_unknown() {
         let root = temp_dir("ack-final-persist-failure");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -3023,6 +3419,7 @@ mod tests {
         let submits = Arc::new(AtomicUsize::new(0));
         let gateway = CountingAckGateway {
             submits: submits.clone(),
+            stream_recovery: None,
         };
         seed_empty_live_ledgers(&config);
         let mut daemon =
@@ -3041,6 +3438,7 @@ mod tests {
         };
         let response = daemon
             .submit_intent_idempotent(intent.clone(), Some("key-1"))
+            .await
             .expect("unknown response");
         assert_eq!(response.state, "unknown");
         assert_eq!(submits.load(Ordering::SeqCst), 1);
@@ -3053,16 +3451,17 @@ mod tests {
             &fs::read(&config.trading_state_file).expect("durable unknown snapshot"),
         )
         .expect("snapshot json");
-        assert_eq!(persisted[0]["orders"][0]["state"], "unknown");
+        assert_eq!(persisted[0]["snapshot"]["orders"][0]["state"], "unknown");
         let replay = daemon
             .submit_intent_idempotent(intent, Some("key-1"))
+            .await
             .expect("idempotent unknown replay");
         assert_eq!(replay.state, "unknown");
         assert_eq!(submits.load(Ordering::SeqCst), 1);
     }
 
-    #[test]
-    fn daemon_records_live_rejection_in_canonical_ledger() {
+    #[tokio::test]
+    async fn daemon_records_live_rejection_in_canonical_ledger() {
         let root = temp_dir("live-intent-reject");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -3112,6 +3511,7 @@ mod tests {
                 purpose: IntentPurpose::Entry,
                 created_at: chrono::Utc::now(),
             })
+            .await
             .expect("submit live intent");
 
         assert_eq!(response.state, "rejected");
@@ -3125,8 +3525,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn daemon_records_live_gateway_transport_ambiguity_as_unknown() {
+    #[tokio::test]
+    async fn daemon_records_live_gateway_transport_ambiguity_as_unknown() {
         let root = temp_dir("live-intent-transport-error");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -3161,9 +3561,9 @@ mod tests {
         seed_empty_live_ledgers(&config);
         let mut daemon = PloyDaemon::boot_with_live_execution(
             &config,
-            Box::new(StaticExecutionGateway::failed(
-                ploy_connectivity::ExecutionError::Transport("gateway offline".to_string()),
-            )),
+            Box::new(StaticExecutionGateway::failed(hft_core::HftError::Network(
+                "gateway offline".to_string(),
+            ))),
         )
         .expect("boot");
         let response = daemon
@@ -3178,6 +3578,7 @@ mod tests {
                 purpose: IntentPurpose::Entry,
                 created_at: chrono::Utc::now(),
             })
+            .await
             .expect("transport ambiguity response");
 
         assert_eq!(response.state, "unknown");
@@ -3192,8 +3593,8 @@ mod tests {
             .contains("gateway offline"));
     }
 
-    #[test]
-    fn daemon_cancels_live_order_through_gateway_and_updates_ledger() {
+    #[tokio::test]
+    async fn daemon_cancels_live_order_through_gateway_and_updates_ledger() {
         let root = temp_dir("live-order-cancel");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -3225,8 +3626,8 @@ mod tests {
             ..PlatformConfig::default()
         };
 
-        let gateway = StaticExecutionGateway::acknowledged("venue-live-cancel-1")
-            .with_cancel_result(Ok(CancellationOutcome::Canceled));
+        let gateway =
+            StaticExecutionGateway::acknowledged("venue-live-cancel-1").with_cancel_result(Ok(()));
         seed_empty_live_ledgers(&config);
         let mut daemon =
             PloyDaemon::boot_with_live_execution(&config, Box::new(gateway)).expect("boot");
@@ -3242,10 +3643,12 @@ mod tests {
                 purpose: IntentPurpose::Entry,
                 created_at: chrono::Utc::now(),
             })
+            .await
             .expect("submit live intent");
 
         let response = daemon
             .cancel_order("example.live", "order-intent-live-cancel")
+            .await
             .expect("cancel live order");
 
         assert_eq!(response.state, "canceled");
@@ -3255,8 +3658,8 @@ mod tests {
         assert_eq!(trading_state[0].risk.active_orders, 0);
     }
 
-    #[test]
-    fn daemon_replaces_live_order_through_gateway_and_preserves_logical_order() {
+    #[tokio::test]
+    async fn daemon_replaces_live_order_through_gateway_and_preserves_logical_order() {
         let root = temp_dir("live-order-replace");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -3289,9 +3692,7 @@ mod tests {
         };
 
         let gateway = StaticExecutionGateway::acknowledged("venue-live-replace-1")
-            .with_replace_result(Ok(ReplaceOutcome::Replaced {
-                venue_order_id: "venue-live-replace-2".to_string(),
-            }));
+            .with_replace_result(Ok(hft_core::OrderId("venue-live-replace-2".to_string())));
         seed_empty_live_ledgers(&config);
         let mut daemon =
             PloyDaemon::boot_with_live_execution(&config, Box::new(gateway)).expect("boot");
@@ -3307,6 +3708,7 @@ mod tests {
                 purpose: IntentPurpose::Entry,
                 created_at: chrono::Utc::now(),
             })
+            .await
             .expect("submit live intent");
 
         let response = daemon
@@ -3318,6 +3720,7 @@ mod tests {
                     limit_price: Some(dec!(0.57)),
                 },
             )
+            .await
             .expect("replace live order");
 
         assert_eq!(response.state, "acknowledged");
@@ -3350,8 +3753,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn daemon_rejects_replace_when_requested_qty_is_below_filled_qty() {
+    #[tokio::test]
+    async fn daemon_rejects_replace_when_requested_qty_is_below_filled_qty() {
         let root = temp_dir("live-order-replace-invalid");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -3414,9 +3817,13 @@ mod tests {
                 purpose: IntentPurpose::Entry,
                 created_at: chrono::Utc::now(),
             })
+            .await
             .expect("submit live intent");
         assert!(matches!(
-            daemon.reconcile_live_fills().expect("reconcile fills"),
+            daemon
+                .reconcile_live_fills()
+                .await
+                .expect("reconcile fills"),
             ReconcileStatus::Applied(1)
         ));
 
@@ -3429,6 +3836,7 @@ mod tests {
                     limit_price: Some(dec!(0.57)),
                 },
             )
+            .await
             .expect_err("replace should fail");
 
         assert_eq!(error.kind(), ErrorKind::InvalidInput);
@@ -3437,8 +3845,8 @@ mod tests {
             .contains("cannot be below filled quantity"));
     }
 
-    #[test]
-    fn concurrent_account_submissions_cannot_exceed_cap() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn concurrent_account_submissions_cannot_exceed_cap() {
         let root = temp_dir("account-exposure-limit");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -3467,8 +3875,8 @@ mod tests {
                 .expect("apply deployment");
         }
 
-        let daemon = Arc::new(Mutex::new(daemon));
-        let barrier = Arc::new(Barrier::new(3));
+        let daemon = Arc::new(tokio::sync::Mutex::new(daemon));
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
         let submissions = [
             ("acct-a.paper", "intent-account-a", "market-1", "yes-token"),
             ("acct-b.paper", "intent-account-b", "market-2", "no-token"),
@@ -3476,11 +3884,11 @@ mod tests {
         .map(|(deployment_id, intent_id, market_id, token_id)| {
             let daemon = daemon.clone();
             let barrier = barrier.clone();
-            std::thread::spawn(move || {
-                barrier.wait();
+            tokio::spawn(async move {
+                barrier.wait().await;
                 daemon
                     .lock()
-                    .expect("daemon lock")
+                    .await
                     .submit_intent(TradingIntent {
                         intent_id: intent_id.to_string(),
                         deployment_id: deployment_id.to_string(),
@@ -3492,10 +3900,15 @@ mod tests {
                         purpose: IntentPurpose::Entry,
                         created_at: chrono::Utc::now(),
                     })
+                    .await
             })
         });
-        barrier.wait();
-        let results = submissions.map(|handle| handle.join().expect("submission thread"));
+        barrier.wait().await;
+        let [first_submission, second_submission] = submissions;
+        let results = [
+            first_submission.await.expect("submission task"),
+            second_submission.await.expect("submission task"),
+        ];
 
         assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
         let error = results
@@ -3507,8 +3920,8 @@ mod tests {
         assert!(error.to_string().contains("max_gross_exposure"));
     }
 
-    #[test]
-    fn daemon_rejects_replacement_when_it_would_exceed_account_exposure_limit() {
+    #[tokio::test]
+    async fn daemon_rejects_replacement_when_it_would_exceed_account_exposure_limit() {
         let root = temp_dir("account-exposure-replace");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -3546,6 +3959,7 @@ mod tests {
                 purpose: IntentPurpose::Entry,
                 created_at: chrono::Utc::now(),
             })
+            .await
             .expect("submit intent");
 
         let error = daemon
@@ -3557,6 +3971,7 @@ mod tests {
                     limit_price: Some(dec!(0.5)),
                 },
             )
+            .await
             .expect_err("replacement should exceed exposure limit");
 
         assert_eq!(error.kind(), ErrorKind::InvalidInput);
@@ -3564,8 +3979,8 @@ mod tests {
         assert!(error.to_string().contains("next_total=2.0"));
     }
 
-    #[test]
-    fn daemon_pause_then_resume_restarts_paper_worker() {
+    #[tokio::test]
+    async fn daemon_pause_then_resume_restarts_paper_worker() {
         let root = temp_dir("pause-resume-worker");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -3635,8 +4050,8 @@ mod tests {
         assert_ne!(resumed.pid, Some(initial_pid));
     }
 
-    #[test]
-    fn daemon_rejects_archive_with_active_orders() {
+    #[tokio::test]
+    async fn daemon_rejects_archive_with_active_orders() {
         let root = temp_dir("archive-active-orders");
         let runtime_root = root.join("run/platform");
         let config = PlatformConfig {
@@ -3694,8 +4109,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn daemon_rejects_cap_reduction_below_account_exposure() {
+    #[tokio::test]
+    async fn daemon_rejects_cap_reduction_below_account_exposure() {
         let root = temp_dir("cap-below-account-exposure");
         let runtime_root = root.join("run/platform");
         let config = PlatformConfig {
@@ -3772,8 +4187,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn daemon_reconciles_live_fill_into_canonical_ledger() {
+    #[tokio::test]
+    async fn daemon_reconciles_live_fill_into_canonical_ledger() {
         let root = temp_dir("live-fill-reconcile");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -3837,9 +4252,13 @@ mod tests {
                 purpose: IntentPurpose::Entry,
                 created_at: chrono::Utc::now(),
             })
+            .await
             .expect("submit live intent");
 
-        let reconciled = daemon.reconcile_live_fills().expect("reconcile fills");
+        let reconciled = daemon
+            .reconcile_live_fills()
+            .await
+            .expect("reconcile fills");
         assert_eq!(reconciled, ReconcileStatus::Applied(1));
 
         let trading_state = daemon.trading_state();
@@ -3848,8 +4267,8 @@ mod tests {
         assert_eq!(trading_state[0].positions[0].net_qty, dec!(3));
     }
 
-    #[test]
-    fn daemon_restores_live_orders_and_reconciles_after_restart() {
+    #[tokio::test]
+    async fn daemon_restores_live_orders_and_reconciles_after_restart() {
         let root = temp_dir("live-restart-recovery");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -3899,6 +4318,7 @@ mod tests {
                 purpose: IntentPurpose::Entry,
                 created_at: chrono::Utc::now(),
             })
+            .await
             .expect("submit live intent");
         daemon.write_runtime_snapshots().expect("write snapshots");
 
@@ -3931,6 +4351,7 @@ mod tests {
 
         let recorded = restored
             .reconcile_live_fills()
+            .await
             .expect("reconcile restored fills");
         assert_eq!(recorded, ReconcileStatus::Applied(1));
 
@@ -3941,8 +4362,8 @@ mod tests {
         assert_eq!(reconciled_state[0].positions[0].net_qty, dec!(4));
     }
 
-    #[test]
-    fn daemon_reconcile_is_idempotent_for_duplicate_fill_ids() {
+    #[tokio::test]
+    async fn daemon_reconcile_is_idempotent_for_duplicate_fill_ids() {
         let root = temp_dir("live-fill-idempotent");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -4006,15 +4427,22 @@ mod tests {
                 purpose: IntentPurpose::Entry,
                 created_at: chrono::Utc::now(),
             })
+            .await
             .expect("submit live intent");
 
         assert_eq!(
-            daemon.reconcile_live_fills().expect("reconcile fills"),
+            daemon
+                .reconcile_live_fills()
+                .await
+                .expect("reconcile fills"),
             ReconcileStatus::Applied(1)
         );
         assert_eq!(
-            daemon.reconcile_live_fills().expect("reconcile fills"),
-            ReconcileStatus::Noop
+            daemon
+                .reconcile_live_fills()
+                .await
+                .expect("reconcile fills"),
+            ReconcileStatus::Applied(0)
         );
 
         let trading_state = daemon.trading_state();
@@ -4022,8 +4450,8 @@ mod tests {
         assert_eq!(trading_state[0].orders[0].filled_qty, dec!(1));
     }
 
-    #[test]
-    fn daemon_surfaces_transient_reconcile_failures_as_degraded_then_recovering() {
+    #[tokio::test]
+    async fn daemon_surfaces_transient_reconcile_failures_as_degraded_then_recovering() {
         let root = temp_dir("live-health-recovery");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -4075,8 +4503,10 @@ mod tests {
                 purpose: IntentPurpose::Entry,
                 created_at: chrono::Utc::now(),
             })
+            .await
             .expect("submit live intent");
 
+        let _ = daemon.reconcile_live_fills().await;
         daemon.write_runtime_snapshots().expect("degraded snapshot");
         assert!(daemon
             .control_plane
@@ -4093,6 +4523,7 @@ mod tests {
             ObservedState::Degraded
         );
 
+        let _ = daemon.reconcile_live_fills().await;
         daemon
             .write_runtime_snapshots()
             .expect("recovering snapshot");
@@ -4101,7 +4532,7 @@ mod tests {
             .system
             .status()
             .status
-            .starts_with("recovering@"));
+            .starts_with("running@"));
         assert_eq!(
             daemon
                 .inspect_deployment("example.live")
@@ -4119,16 +4550,16 @@ mod tests {
             .starts_with("running@"));
     }
 
-    #[test]
-    fn live_reconcile_backoff_doubles_until_maximum() {
+    #[tokio::test]
+    async fn live_reconcile_backoff_doubles_until_maximum() {
         assert_eq!(live_reconcile_backoff_ms(1, 1_000, 30_000), 1_000);
         assert_eq!(live_reconcile_backoff_ms(2, 1_000, 30_000), 2_000);
         assert_eq!(live_reconcile_backoff_ms(3, 1_000, 30_000), 4_000);
         assert_eq!(live_reconcile_backoff_ms(10, 1_000, 30_000), 30_000);
     }
 
-    #[test]
-    fn daemon_skips_live_reconcile_while_backoff_is_active() {
+    #[tokio::test]
+    async fn daemon_skips_live_reconcile_while_backoff_is_active() {
         let root = temp_dir("live-health-backoff");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -4180,20 +4611,25 @@ mod tests {
                 purpose: IntentPurpose::Entry,
                 created_at: chrono::Utc::now(),
             })
+            .await
             .expect("submit live intent");
 
+        let _ = daemon.reconcile_live_fills().await;
         daemon.write_runtime_snapshots().expect("degraded snapshot");
         let status = daemon.control_plane.system.status();
         assert_eq!(status.live_reconcile_failures, 1);
         assert!(status.next_live_reconcile_at.is_some());
         assert_eq!(
-            daemon.reconcile_live_fills().expect("backoff reconcile"),
+            daemon
+                .reconcile_live_fills()
+                .await
+                .expect("backoff reconcile"),
             ReconcileStatus::BackoffActive
         );
     }
 
-    #[test]
-    fn daemon_surfaces_live_source_failures_in_metrics_and_alerts() {
+    #[tokio::test]
+    async fn daemon_surfaces_live_source_failures_in_metrics_and_alerts() {
         let root = temp_dir("live-source-alerts");
         let runtime_root = root.join("run/platform");
         let registry_file = root.join("data/state/deployments.json");
@@ -4245,8 +4681,10 @@ mod tests {
                 purpose: IntentPurpose::Entry,
                 created_at: chrono::Utc::now(),
             })
+            .await
             .expect("submit live intent");
 
+        let _ = daemon.reconcile_live_fills().await;
         daemon.write_runtime_snapshots().expect("degraded snapshot");
 
         let metrics = daemon.platform_metrics();

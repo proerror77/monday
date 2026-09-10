@@ -2174,11 +2174,11 @@ mod tests {
 
         async fn modify_order(
             &mut self,
-            _order_id: &hft_core::OrderId,
+            order_id: &hft_core::OrderId,
             _new_quantity: Option<hft_core::Quantity>,
             _new_price: Option<hft_core::Price>,
-        ) -> HftResult<()> {
-            Ok(())
+        ) -> HftResult<hft_core::OrderId> {
+            Ok(order_id.clone())
         }
 
         async fn execution_stream(&self) -> HftResult<BoxStream<ExecutionEvent>> {
@@ -2267,7 +2267,7 @@ mod tests {
             _order_id: &hft_core::OrderId,
             _new_quantity: Option<hft_core::Quantity>,
             _new_price: Option<hft_core::Price>,
-        ) -> HftResult<()> {
+        ) -> HftResult<hft_core::OrderId> {
             Err(HftError::Execution("test client has no orders".to_string()))
         }
 

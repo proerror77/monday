@@ -490,7 +490,7 @@ impl ExecutionClient for OndoPerpsExecutionClient {
         _order_id: &OrderId,
         _new_quantity: Option<Quantity>,
         _new_price: Option<Price>,
-    ) -> HftResult<()> {
+    ) -> HftResult<OrderId> {
         Err(HftError::Execution(
             "Ondo Perps does not support order modification through this adapter".into(),
         ))

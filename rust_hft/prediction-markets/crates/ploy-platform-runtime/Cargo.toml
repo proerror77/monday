@@ -8,18 +8,26 @@ repository.workspace = true
 description = "Next-generation platform runtime ownership boundary for Ploy"
 
 [dependencies]
+async-trait = "0.1"
 chrono.workspace = true
-ploy-connectivity.workspace = true
+futures = "0.3"
+hft-core = { package = "hft-core", path = "../../../market-core/core" }
+ports = { package = "hft-ports", path = "../../../market-core/ports" }
 ploy-deployments.workspace = true
 ploy-operator-contracts.workspace = true
 ploy-platform.workspace = true
 rust_decimal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-ploy-trading.workspace = true
+sha2.workspace = true
+portfolio-core.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-ploy-connectivity = { workspace = true, features = ["test-support"] }
 rust_decimal.workspace = true
 rust_decimal_macros.workspace = true
+
+[features]
+default = []
