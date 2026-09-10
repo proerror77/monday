@@ -8,7 +8,7 @@ const POLICY_TARGET: &str = "x86_64-unknown-linux-gnu";
 const POLICY_GRAPH_SCHEMA: &str = "prediction-policy-dependencies.v5";
 const POLICY_GRAPH_FILE: &str = "prediction-policy-dependencies.linux.txt";
 const CANONICAL_POLICY_DEPENDENCY_HASH_FILE: &str = "prediction-policy-dependencies.linux.sha256";
-const POLICY_INPUTS: [(&str, &str); 11] = [
+const POLICY_INPUTS: [(&str, &str); 13] = [
     ("Cargo.lock", "Cargo.lock"),
     ("Cargo.toml", "Cargo.toml"),
     (
@@ -46,6 +46,14 @@ const POLICY_INPUTS: [(&str, &str); 11] = [
     (
         "../market-core/snapshot/Cargo.toml",
         "../market-core/snapshot/Cargo.toml",
+    ),
+    (
+        "../risk-control/oms-core/Cargo.toml",
+        "../risk-control/oms-core/Cargo.toml",
+    ),
+    (
+        "../risk-control/portfolio-core/Cargo.toml",
+        "../risk-control/portfolio-core/Cargo.toml",
     ),
 ];
 const FORBIDDEN_RUNTIME_PACKAGES: [&str; 7] = [
@@ -138,6 +146,8 @@ pub(crate) fn validate_checked_in_graph(graph: &str, workspace_dir: &Path) {
     let mut package_count = 0usize;
     let mut has_sqlx_postgres = false;
     let mut sqlx_has_postgres_feature = false;
+    let mut has_hft_oms_core = false;
+    let mut has_hft_portfolio_core = false;
     for line in lines {
         let package = line.strip_prefix("package:").unwrap_or_else(|| {
             panic!("checked-in Linux policy dependency graph has invalid line {line:?}")
@@ -168,6 +178,8 @@ pub(crate) fn validate_checked_in_graph(graph: &str, workspace_dir: &Path) {
             panic!("checked-in Linux policy dependency graph includes sqlx-sqlite");
         }
         has_sqlx_postgres |= name == "sqlx-postgres";
+        has_hft_oms_core |= name == "hft-oms-core";
+        has_hft_portfolio_core |= name == "hft-portfolio-core";
         if name == "sqlx" {
             let features = fields
                 .split_once("|features=")
@@ -179,6 +191,16 @@ pub(crate) fn validate_checked_in_graph(graph: &str, workspace_dir: &Path) {
     }
     if package_count == 0 {
         panic!("checked-in Linux policy dependency graph has no packages");
+    }
+    if !has_hft_oms_core {
+        panic!(
+            "checked-in Linux policy dependency graph is missing canonical state package hft-oms-core"
+        );
+    }
+    if !has_hft_portfolio_core {
+        panic!(
+            "checked-in Linux policy dependency graph is missing canonical state package hft-portfolio-core"
+        );
     }
     if !has_sqlx_postgres || !sqlx_has_postgres_feature {
         panic!(

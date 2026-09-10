@@ -65,8 +65,16 @@ mod tests {
             "../market-core/integration/Cargo.toml",
             "../market-core/ports/Cargo.toml",
             "../market-core/snapshot/Cargo.toml",
+            "../risk-control/oms-core/Cargo.toml",
+            "../risk-control/portfolio-core/Cargo.toml",
         ] {
             assert!(fingerprint.contains(&format!("input:{input}=sha256:")));
+        }
+        for package in ["hft-oms-core", "hft-portfolio-core"] {
+            assert!(
+                fingerprint.contains(&format!("package:{package}@")),
+                "the runtime policy fingerprint must include canonical state package {package}"
+            );
         }
         assert!(fingerprint.contains("package:sqlx-postgres@0.8.6|"));
         let sqlx = fingerprint
@@ -120,6 +128,37 @@ mod tests {
             "input Cargo.lock is stale",
         );
 
+        for input in [
+            "../risk-control/oms-core/Cargo.toml",
+            "../risk-control/portfolio-core/Cargo.toml",
+        ] {
+            let input_line = graph
+                .lines()
+                .find(|line| line.starts_with(&format!("input:{input}=")))
+                .expect("checked-in graph must pin canonical state manifests");
+            let stale_manifest_graph = graph.replacen(
+                input_line,
+                &format!(
+                    "input:{input}=sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                ),
+                1,
+            );
+            assert_graph_is_rejected(
+                &stale_manifest_graph,
+                workspace_dir,
+                &format!("input {input} is stale"),
+            );
+        }
+
+        for package in ["hft-oms-core", "hft-portfolio-core"] {
+            let missing_package_graph = graph_without_package(graph, package);
+            assert_graph_is_rejected(
+                &missing_package_graph,
+                workspace_dir,
+                &format!("missing canonical state package {package}"),
+            );
+        }
+
         for (package, expected) in [
             ("hft-runtime", "includes runtime authority hft-runtime"),
             ("sqlx-sqlite", "includes sqlx-sqlite"),
@@ -151,6 +190,15 @@ mod tests {
             .and_then(|package| package.split_once('|'))
             .expect("checked-in package must retain fields");
         graph.replacen(original, &format!("package:{package}@0.0.0|{fields}"), 1)
+    }
+
+    fn graph_without_package(graph: &str, package: &str) -> String {
+        graph
+            .lines()
+            .filter(|line| !line.starts_with(&format!("package:{package}@")))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
     }
 
     fn assert_graph_is_rejected(graph: &str, workspace_dir: &Path, expected: &str) {
