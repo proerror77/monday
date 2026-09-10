@@ -1204,6 +1204,7 @@ pub fn freeze_inventory(request: &InventoryRequest) -> Result<FrozenInventory> {
         files_with_suffix_bounded(&reference_root, ".manifest.json", request.max_scan_entries)?;
     let mut remaining_bytes = request.max_input_bytes;
     let mut raw = Vec::new();
+    let mut raw_scope: Option<(String, String)> = None;
     for path in raw_manifests {
         let (manifest, sha) = read_manifest(&raw_root, &path)?;
         if !raw_manifest_matches_market(&manifest, request.market)
@@ -1226,6 +1227,19 @@ pub fn freeze_inventory(request: &InventoryRequest) -> Result<FrozenInventory> {
             bail!("inventory raw interval is reversed");
         }
         validate_source_manifest(&manifest)?;
+        // Materialization permits multiple replay sessions, but its strict
+        // series gate requires one market/dataset/shard across the inventory.
+        let scope = (
+            required_string(&manifest, "dataset", "source manifest")?.to_string(),
+            required_string(&manifest, "shard_id", "source manifest")?.to_string(),
+        );
+        match &raw_scope {
+            Some(expected) if expected != &scope => {
+                bail!("inventory raw segments do not share one market/dataset/shard scope");
+            }
+            None => raw_scope = Some(scope),
+            _ => {}
+        }
         if raw.len() >= request.max_inputs {
             bail!("inventory input count budget exceeded");
         }
@@ -1718,6 +1732,26 @@ mod tests {
         (directory, request)
     }
 
+    fn fresh_request(request: &InventoryRequest, mode: FreshWindowMode) -> FreshWindowRequest {
+        FreshWindowRequest {
+            raw_root: request.raw_root.clone(),
+            reference_root: request.reference_root.clone(),
+            mode,
+            market: request.market,
+            symbol: request.symbol.clone(),
+            source_revision: request.source_revision.clone(),
+            image_ref: request.image_ref.clone(),
+            mission_id: request.mission_id.clone(),
+            output_prefix: request.output_prefix.clone(),
+            bucket_ms: request.bucket_ms,
+            label_horizon_buckets: request.label_horizon_buckets,
+            top_depth: request.top_depth,
+            max_scan_entries: request.max_scan_entries,
+            max_inputs: request.max_inputs,
+            max_input_bytes: request.max_input_bytes,
+        }
+    }
+
     #[test]
     fn freeze_accepts_current_usdm_trade_archive() {
         let (_directory, request) = current_usdm_trade_fixture();
@@ -1747,28 +1781,70 @@ mod tests {
                 max_candidates: 4,
             },
         ] {
-            let selection = select_fresh_window(&FreshWindowRequest {
-                raw_root: request.raw_root.clone(),
-                reference_root: request.reference_root.clone(),
-                mode,
-                market: request.market,
-                symbol: request.symbol.clone(),
-                source_revision: request.source_revision.clone(),
-                image_ref: request.image_ref.clone(),
-                mission_id: request.mission_id.clone(),
-                output_prefix: request.output_prefix.clone(),
-                bucket_ms: request.bucket_ms,
-                label_horizon_buckets: request.label_horizon_buckets,
-                top_depth: request.top_depth,
-                max_scan_entries: request.max_scan_entries,
-                max_inputs: request.max_inputs,
-                max_input_bytes: request.max_input_bytes,
-            })
-            .unwrap();
+            let selection = select_fresh_window(&fresh_request(&request, mode)).unwrap();
             assert_eq!(selection.raw.len(), 1);
             assert!(selection.inventory_eligible);
             assert!(!selection.materialized_pit_admitted);
         }
+    }
+
+    #[test]
+    fn freeze_rejects_mixed_dataset_or_shard_scope() {
+        for changed_field in ["dataset", "shard_id"] {
+            let (_directory, request) = fixture();
+            extra_raw(&request, "part-2", RECEIVED_NS + 1_000, RECEIVED_NS + 2_000);
+            let path = request.raw_root.join("part-2.jsonl.zst.manifest.json");
+            let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            if changed_field == "dataset" {
+                manifest["dataset"] = json!("usdm_perpetual_top100_lob_trade");
+                manifest["stream_types"] = json!(["depth@100ms", "aggTrade"]);
+                manifest["trade_summary_contract"] = json!(AGGREGATE_TRADE_SUMMARY_CONTRACT);
+            } else {
+                manifest["shard_id"] = json!("another-shard");
+            }
+            fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+            assert!(freeze_inventory(&request)
+                .unwrap_err()
+                .to_string()
+                .contains("market/dataset/shard scope"));
+            let explicit = fresh_request(
+                &request,
+                FreshWindowMode::Explicit {
+                    start_received_at_ns: request.start_received_at_ns,
+                    end_received_at_ns: request.end_received_at_ns,
+                },
+            );
+            assert!(select_fresh_window(&explicit)
+                .unwrap_err()
+                .to_string()
+                .contains("market/dataset/shard scope"));
+        }
+    }
+
+    #[test]
+    fn latest_selection_keeps_one_contract_across_a_dataset_transition() {
+        let (_directory, request) = fixture();
+        extra_reference(&request, "BTCUSDT", 5_000_010_000);
+        extra_raw(&request, "part-2", RECEIVED_NS + 1_000, RECEIVED_NS + 2_000);
+        let path = request.raw_root.join("part-2.jsonl.zst.manifest.json");
+        let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        manifest["dataset"] = json!("usdm_perpetual_top100_lob_trade");
+        manifest["stream_types"] = json!(["depth@100ms", "aggTrade"]);
+        manifest["trade_summary_contract"] = json!(AGGREGATE_TRADE_SUMMARY_CONTRACT);
+        fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let selection = select_fresh_window(&fresh_request(
+            &request,
+            FreshWindowMode::Latest {
+                duration_ns: 500,
+                cutoff_received_at_ns: RECEIVED_NS + 2_000,
+                max_candidates: 4,
+            },
+        ))
+        .unwrap();
+        assert_eq!(selection.raw.len(), 1);
+        assert_eq!(selection.raw[0].relative_path, "part-2.jsonl.zst");
     }
 
     #[test]
