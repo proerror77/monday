@@ -192,6 +192,7 @@ load_fresh_controller_contract() {
   local controller_state="$1"
   fresh_raw_root="$(jq -er '.fresh.raw_root' "$controller_state")"
   fresh_reference_root="$(jq -er '.fresh.reference_root' "$controller_state")"
+  fresh_market="$(jq -er '.fresh.market' "$controller_state")"
   fresh_start_received_at_ns="$(jq -r '.fresh.start_received_at_ns // empty' "$controller_state")"
   fresh_end_received_at_ns="$(jq -r '.fresh.end_received_at_ns // empty' "$controller_state")"
   fresh_symbol="$(jq -er '.fresh.symbol' "$controller_state")"
@@ -910,9 +911,11 @@ study_handoff() {
   target_inventory="$study_dir/frozen.env"
   target_materializer_work="$study_dir/materializer"
   if [[ ! -s "$target_report" ]]; then
-    "$alpha_harness" mission prepare-fresh-inputs \
+    target_prepare_args=(
+      mission prepare-fresh-inputs
       --raw-root "$fresh_raw_root" \
       --reference-root "$fresh_reference_root" \
+      --market "$fresh_market" \
       --symbol "$fresh_symbol" \
       --image-ref "$fresh_image_ref" \
       --mission-id "$study_target_mission_id" \
@@ -933,7 +936,12 @@ study_handoff() {
       --materializer-work-dir "$target_materializer_work" \
       --materializer-timeout-seconds "$fresh_materializer_timeout_seconds" \
       --max-materializer-output-bytes "$fresh_max_materializer_output_bytes" \
-      --report-out "$target_report" >"$study_dir/preparation.stdout"
+      --report-out "$target_report"
+    )
+    if [[ -n "$fresh_binary_dir" ]]; then
+      target_prepare_args+=(--binary-dir "$fresh_binary_dir")
+    fi
+    "$alpha_harness" "${target_prepare_args[@]}" >"$study_dir/preparation.stdout"
   fi
   [[ -s "$target_report" && -s "$target_campaign_inputs" ]] \
     || die "Study target materialization did not produce complete evidence"

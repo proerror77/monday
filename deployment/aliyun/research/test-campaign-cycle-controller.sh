@@ -53,6 +53,15 @@ case "$1 $2" in
     campaign_inputs="$(value_after --campaign-inputs-out "$@")"
     output_root="$(value_after --output-root "$@")"
     output_prefix="$(value_after --output-prefix "$@")"
+    market="$(value_after --market "$@")"
+    case "$market" in
+      spot|usdm) ;;
+      *) echo "unexpected fresh market: $market" >&2; exit 1 ;;
+    esac
+    printf '%s\n' "$market" >>"$FAKE_STATE/fresh-markets"
+    if [[ " $* " == *" --binary-dir "* ]]; then
+      printf 'binary:%s\n' "$(value_after --binary-dir "$@")" >>"$FAKE_STATE/fresh-binary-dirs"
+    fi
     symbol="$(value_after --symbol "$@")"
     mission_id="$(value_after --mission-id "$@")"
     request_out="$(value_after --request-out "$@")"
@@ -849,6 +858,7 @@ fresh_args=(
   --fresh-label-horizon-buckets 5
   --fresh-top-depth 5
   --fresh-materializer "$bin/signer"
+  --fresh-binary-dir "$bin"
   --fresh-max-scan-entries 100
   --fresh-max-inputs 4
   --fresh-max-input-bytes 1000000
@@ -946,6 +956,7 @@ fresh_latest_args=(
   --fresh-label-horizon-buckets 5
   --fresh-top-depth 5
   --fresh-materializer "$bin/signer"
+  --fresh-binary-dir "$bin"
   --fresh-max-scan-entries 100
   --fresh-max-inputs 4
   --fresh-max-input-bytes 1000000
@@ -984,7 +995,7 @@ fresh_control_args=(
   --fresh-inputs
   --fresh-raw-root "$fresh_case_root/control-raw"
   --fresh-reference-root "$fresh_case_root/control-reference"
-  --fresh-market usdm
+  --fresh-market spot
   --fresh-start-received-at-ns 1700000000000000000
   --fresh-end-received-at-ns 1700000060000000000
   --fresh-symbol BTCUSDT
@@ -996,6 +1007,7 @@ fresh_control_args=(
   --fresh-label-horizon-buckets 5
   --fresh-top-depth 5
   --fresh-materializer "$bin/signer"
+  --fresh-binary-dir "$bin"
   --fresh-max-scan-entries 100
   --fresh-max-inputs 4
   --fresh-max-input-bytes 1000000
@@ -1020,6 +1032,7 @@ jq -e '
   and .reason == "dispatch_control_missing"
   and .sign_finalize_dispatch_preserved == true
 ' "$fresh_control_cycle/generation-0/needs-authority.json" >/dev/null
+jq -e '.fresh.market == "spot"' "$fresh_control_cycle/controller-inputs.json" >/dev/null
 test -s "$fresh_control_cycle/generation-0/request.json"
 test -s "$fresh_control_cycle/generation-0/submission.json"
 test "$(<"$FAKE_STATE/dispatch-count")" == "$control_dispatch_before"
@@ -1036,6 +1049,9 @@ if ! FAKE_UNAME=Darwin "$controller" approve \
   exit 1
 fi
 test "$(<"$FAKE_STATE/dispatch-count")" == "$((control_dispatch_before + 1))"
+jq -e '.fresh.market == "spot"' "$fresh_control_cycle/controller-inputs.json" >/dev/null
+grep -Fqx spot "$FAKE_STATE/fresh-markets"
+grep -Fqx "binary:$bin" "$FAKE_STATE/fresh-binary-dirs"
 printf 'campaign fresh-input preparation: PASS\n'
 
 study_case_root="$root/study-handoff"
