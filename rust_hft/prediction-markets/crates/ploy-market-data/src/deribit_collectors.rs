@@ -1,415 +1,626 @@
-//! Deribit HTTP data collectors — implied volatility ticks and ATM greeks.
-//!
-//! Both collectors poll the Deribit public REST API periodically and persist
-//! normalized rows to PostgreSQL using batched INSERT ... ON CONFLICT upserts.
-//!
-//! Run via `ploy-runner`:
-//!   ploy-runner collect-deribit-iv --currencies BTC,ETH,SOL --poll-secs 30
-//!   ploy-runner collect-deribit-greeks --currencies BTC,ETH,SOL --poll-secs 30
+//! Deribit public option reference collectors.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use adapter_deribit_data::DeribitReferenceSource;
 use chrono::{DateTime, TimeZone, Utc};
+use data::deribit_reference::{DeribitGreeksObservation, DeribitIvObservation};
 use rust_decimal::Decimal;
-use serde_json::Value;
 use sqlx::PgPool;
 use tracing::{error, info, warn};
 
-// ---------------------------------------------------------------------------
-// Shared helpers
-// ---------------------------------------------------------------------------
+type CollectorResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-const DERIBIT_API_BASE: &str = "https://www.deribit.com/api/v2/public";
+#[derive(Debug, PartialEq)]
+struct StoredIvFields {
+    raw_mark_iv: Option<Decimal>,
+    stored_mark_iv: Option<Decimal>,
+    source_iv_unit: String,
+    storage_iv_unit: String,
+}
 
-type SharedRunning = Arc<AtomicBool>;
+fn stored_iv_fields(observation: &DeribitIvObservation) -> StoredIvFields {
+    StoredIvFields {
+        raw_mark_iv: observation.mark_iv_raw,
+        stored_mark_iv: observation.mark_iv,
+        source_iv_unit: observation.source_iv_unit.clone(),
+        storage_iv_unit: observation.iv_unit.clone(),
+    }
+}
 
-fn running_flag() -> SharedRunning {
+fn same_deribit_content(
+    existing_raw: &serde_json::Value,
+    existing_canonical: Option<&serde_json::Value>,
+    raw: &serde_json::Value,
+    canonical: &serde_json::Value,
+) -> bool {
+    existing_raw == raw
+        && existing_canonical.is_some_and(|existing| {
+            canonical_without_receipt(existing) == canonical_without_receipt(canonical)
+        })
+}
+
+fn canonical_without_receipt(value: &serde_json::Value) -> serde_json::Value {
+    let mut canonical = value.clone();
+    if let Some(object) = canonical.as_object_mut() {
+        object.remove("received_at_us");
+    }
+    canonical
+}
+
+fn running_flag() -> Arc<AtomicBool> {
     let flag = Arc::new(AtomicBool::new(true));
-    let f = flag.clone();
+    let clone = Arc::clone(&flag);
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
-        info!("Shutdown signal received, stopping Deribit collector...");
-        f.store(false, Ordering::SeqCst);
+        clone.store(false, Ordering::SeqCst);
     });
     flag
 }
 
 fn parse_currencies(raw: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
     raw.split(',')
-        .map(|s| s.trim().to_uppercase())
-        .filter(|s| !s.is_empty())
+        .map(|value| value.trim().to_ascii_uppercase())
+        .filter(|value| !value.is_empty() && seen.insert(value.clone()))
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// IV collector (deribit_iv_ticks)
-// ---------------------------------------------------------------------------
-
-/// Collect option book summaries from Deribit `get_book_summary_by_currency`.
-///
-/// Polls every `poll_secs` seconds for each configured currency and upserts
-/// normalized IV ticks into `deribit_iv_ticks`.
 pub async fn collect_deribit_iv(pool: PgPool, currencies_raw: &str, poll_secs: u64) {
     let currencies = parse_currencies(currencies_raw);
     let running = running_flag();
-    info!(
-        "[deribit-iv] Starting collector currencies={:?} poll_secs={}",
-        currencies, poll_secs
-    );
-
+    let source = match DeribitReferenceSource::production(Duration::from_secs(20)) {
+        Ok(source) => source,
+        Err(error) => {
+            error!("[deribit-iv] reference source configuration failed: {error}");
+            return;
+        }
+    };
+    let poll_secs = poll_secs.max(1);
     while running.load(Ordering::SeqCst) {
-        let start = Instant::now();
-
+        let started = Instant::now();
         for currency in &currencies {
             if !running.load(Ordering::SeqCst) {
                 break;
             }
-            if let Err(e) = fetch_and_store_iv(&pool, currency).await {
-                error!("[deribit-iv] currency={currency} error: {e}");
+            if let Err(error) = fetch_and_store_iv(&source, &pool, currency).await {
+                error!(%error, currency, "[deribit-iv] collection failed");
             }
         }
-
-        let elapsed = start.elapsed();
-        let sleep = if elapsed.as_secs() < poll_secs {
-            poll_secs - elapsed.as_secs()
-        } else {
-            0
-        };
-        if sleep > 0 {
-            tokio::time::sleep(Duration::from_secs(sleep)).await;
+        let elapsed = started.elapsed();
+        if elapsed < Duration::from_secs(poll_secs) {
+            tokio::time::sleep(Duration::from_secs(poll_secs) - elapsed).await;
         }
     }
-    info!("[deribit-iv] Collector stopped");
 }
 
 async fn fetch_and_store_iv(
+    source: &DeribitReferenceSource,
     pool: &PgPool,
     currency: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let url = format!("{DERIBIT_API_BASE}/get_book_summary_by_currency");
-    let client = reqwest::Client::new();
-    let resp = client
-        .get(&url)
-        .query(&[("currency", currency), ("kind", "option")])
-        .timeout(Duration::from_secs(20))
-        .send()
-        .await?;
-    let payload: Value = resp.json().await?;
-    let rows = payload["result"].as_array().ok_or("missing result array")?;
-
-    let fetched_at = Utc::now();
-
-    for item in rows {
-        let instrument_name = match item["instrument_name"].as_str() {
-            Some(n) => n.to_string(),
-            None => continue,
-        };
-
-        // Parse expiry / strike / option_type from instrument name like "BTC-29MAR24-50000-C"
-        let parts: Vec<&str> = instrument_name.split('-').collect();
-        let (expiry_ts, _strike, _option_type) = if parts.len() >= 4 {
-            (
-                parse_deribit_expiry(parts.get(1).unwrap_or(&"")),
-                parts.get(2).and_then(|s| s.parse::<Decimal>().ok()),
-                parts.get(3).map(|s| s.to_string()),
-            )
-        } else {
-            (None, None, None)
-        };
-
-        let creation_ms = item["creation_timestamp"].as_i64();
-        let creation_ts = creation_ms.map(|ms| {
-            Utc.timestamp_opt(ms / 1000, ((ms % 1000) * 1_000_000) as u32)
-                .unwrap()
-        });
-
-        let mark_iv_raw = item["mark_iv"].as_f64();
-        let bid_iv_raw = item["bid_iv"].as_f64();
-        let ask_iv_raw = item["ask_iv"].as_f64();
-
-        let normalize = |raw: Option<f64>| -> Option<Decimal> {
-            let v = raw?;
-            if v <= 0.0 {
-                return None;
-            }
-            let normalized = if v > 2.0 { v / 100.0 } else { v };
-            Decimal::try_from(normalized).ok()
-        };
-
-        let underlying_price = item["underlying_price"]
-            .as_f64()
-            .and_then(|v| Decimal::try_from(v).ok());
-        let index_price = item["index_price"]
-            .as_f64()
-            .and_then(|v| Decimal::try_from(v).ok());
-        let mark_price = item["mark_price"]
-            .as_f64()
-            .and_then(|v| Decimal::try_from(v).ok());
-        let best_bid = item["bid_price"]
-            .as_f64()
-            .and_then(|v| Decimal::try_from(v).ok());
-        let best_ask = item["ask_price"]
-            .as_f64()
-            .and_then(|v| Decimal::try_from(v).ok());
-        let open_interest = item["open_interest"]
-            .as_f64()
-            .and_then(|v| Decimal::try_from(v).ok());
-        let volume = item["volume"]
-            .as_f64()
-            .and_then(|v| Decimal::try_from(v).ok());
-
-        sqlx::query(
-            r#"
-            INSERT INTO deribit_iv_ticks (
-                currency, instrument_name, creation_ts, expiry_ts,
-                mark_iv, bid_iv, ask_iv,
-                underlying_price, index_price, mark_price,
-                best_bid_price, best_ask_price,
-                open_interest, volume,
-                payload, fetched_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16)
-            ON CONFLICT (currency, instrument_name, creation_ts, fetched_at) DO UPDATE SET
-                mark_iv = EXCLUDED.mark_iv,
-                bid_iv = EXCLUDED.bid_iv,
-                ask_iv = EXCLUDED.ask_iv,
-                underlying_price = EXCLUDED.underlying_price,
-                index_price = EXCLUDED.index_price,
-                mark_price = EXCLUDED.mark_price,
-                best_bid_price = EXCLUDED.best_bid_price,
-                best_ask_price = EXCLUDED.best_ask_price,
-                open_interest = EXCLUDED.open_interest,
-                volume = EXCLUDED.volume,
-                payload = EXCLUDED.payload
-            "#,
-        )
-        .bind(currency)
-        .bind(&instrument_name)
-        .bind(creation_ts)
-        .bind(expiry_ts)
-        .bind(normalize(mark_iv_raw))
-        .bind(normalize(bid_iv_raw))
-        .bind(normalize(ask_iv_raw))
-        .bind(underlying_price)
-        .bind(index_price)
-        .bind(mark_price)
-        .bind(best_bid)
-        .bind(best_ask)
-        .bind(open_interest)
-        .bind(volume)
-        .bind(item.to_string())
-        .bind(fetched_at)
-        .execute(pool)
-        .await?;
+) -> CollectorResult<()> {
+    let batch = source.option_iv(currency).await?;
+    for observation in &batch.observations {
+        persist_iv(pool, observation).await?;
     }
-
     info!(
-        "[deribit-iv] Fetched {} instruments for currency={}",
-        rows.len(),
-        currency
+        currency,
+        rows = batch.observations.len(),
+        received_at_us = batch.received_at_us,
+        "[deribit-iv] canonical batch persisted"
     );
     Ok(())
 }
 
-/// Parse Deribit expiry codes like "29MAR24" into UTC 08:00 timestamp.
-fn parse_deribit_expiry(code: &str) -> Option<DateTime<Utc>> {
-    if code.len() < 7 {
-        return None;
-    }
-    let day: u32 = code[0..2].parse().ok()?;
-    let mon_str = code[2..5].to_uppercase();
-    let year: i32 = code[5..].parse().ok()?;
-    let year = if year < 100 { year + 2000 } else { year };
-
-    let month = match mon_str.as_str() {
-        "JAN" => 1,
-        "FEB" => 2,
-        "MAR" => 3,
-        "APR" => 4,
-        "MAY" => 5,
-        "JUN" => 6,
-        "JUL" => 7,
-        "AUG" => 8,
-        "SEP" => 9,
-        "OCT" => 10,
-        "NOV" => 11,
-        "DEC" => 12,
-        _ => return None,
-    };
-
-    chrono::NaiveDate::from_ymd_opt(year, month, day)
-        .map(|d| d.and_hms_opt(8, 0, 0).unwrap())
-        .map(|dt| DateTime::from_naive_utc_and_offset(dt, Utc))
-}
-
-// ---------------------------------------------------------------------------
-// ATM Greeks collector (deribit_atm_greeks_ticks)
-// ---------------------------------------------------------------------------
-
-/// Collect ATM option greeks by:
-///   1. Picking the nearest ATM instrument per currency from `deribit_iv_ticks`
-///   2. Calling Deribit `get_order_book` for Greeks
-///   3. Upserting into `deribit_atm_greeks_ticks`
 pub async fn collect_deribit_greeks(pool: PgPool, currencies_raw: &str, poll_secs: u64) {
     let currencies = parse_currencies(currencies_raw);
     let running = running_flag();
-    info!(
-        "[deribit-greeks] Starting collector currencies={:?} poll_secs={}",
-        currencies, poll_secs
-    );
-
+    let source = match DeribitReferenceSource::production(Duration::from_secs(20)) {
+        Ok(source) => source,
+        Err(error) => {
+            error!("[deribit-greeks] reference source configuration failed: {error}");
+            return;
+        }
+    };
+    let poll_secs = poll_secs.max(1);
     while running.load(Ordering::SeqCst) {
-        let start = Instant::now();
-
+        let started = Instant::now();
         for currency in &currencies {
             if !running.load(Ordering::SeqCst) {
                 break;
             }
-            if let Err(e) = pick_and_fetch_greeks(&pool, currency).await {
-                error!("[deribit-greeks] currency={currency} error: {e}");
+            if let Err(error) = pick_and_fetch_greeks(&source, &pool, currency).await {
+                error!(%error, currency, "[deribit-greeks] collection failed");
             }
         }
-
-        let elapsed = start.elapsed();
-        let sleep = if elapsed.as_secs() < poll_secs {
-            poll_secs - elapsed.as_secs()
-        } else {
-            0
-        };
-        if sleep > 0 {
-            tokio::time::sleep(Duration::from_secs(sleep)).await;
+        let elapsed = started.elapsed();
+        if elapsed < Duration::from_secs(poll_secs) {
+            tokio::time::sleep(Duration::from_secs(poll_secs) - elapsed).await;
         }
     }
-    info!("[deribit-greeks] Collector stopped");
 }
 
-/// Find the ATM instrument for a currency, then fetch its order book for Greeks.
 async fn pick_and_fetch_greeks(
+    source: &DeribitReferenceSource,
     pool: &PgPool,
     currency: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Pick ATM instrument from recent deribit_iv_ticks
+) -> CollectorResult<()> {
     let instrument: Option<(String,)> = sqlx::query_as(
         r#"
         WITH candidates AS (
             SELECT instrument_name,
+                   strike,
                    underlying_price,
-                   abs(NULLIF(split_part(instrument_name, '-', 3), '')::numeric - underlying_price) AS atm_distance
+                   abs(strike - underlying_price) AS atm_distance,
+                   fetched_at,
+                   source_timestamp_ms
             FROM deribit_iv_ticks
             WHERE upper(currency) = $1
               AND fetched_at >= NOW() - INTERVAL '10 minutes'
-              AND creation_ts IS NOT NULL
+              AND fetched_at <= NOW()
+              AND iv_unit = 'decimal_fraction'
+              AND strike IS NOT NULL
+              AND source_timestamp_ms IS NOT NULL
               AND underlying_price IS NOT NULL
               AND instrument_name ~ '^[^-]+-[0-9]{1,2}[A-Z]{3}[0-9]{2}-[0-9]+(\.[0-9]+)?-[CP]$'
-            ORDER BY fetched_at DESC, creation_ts DESC
+            ORDER BY fetched_at DESC, source_timestamp_ms DESC
             LIMIT 500
         )
         SELECT instrument_name
         FROM candidates
-        ORDER BY atm_distance ASC
+        ORDER BY atm_distance ASC, fetched_at DESC, source_timestamp_ms DESC
         LIMIT 1
         "#,
     )
     .bind(currency)
     .fetch_optional(pool)
     .await?;
+    let Some((instrument_name,)) = instrument else {
+        warn!(currency, "[deribit-greeks] no typed recent IV instrument");
+        return Ok(());
+    };
+    let observation = source
+        .option_greeks(currency, &instrument_name)
+        .await?
+        .observation;
+    persist_greeks(pool, &observation).await
+}
 
-    let instrument_name = match instrument {
-        Some((n,)) => n,
-        None => {
-            warn!("[deribit-greeks] No recent instruments for {currency}, skipping");
-            return Ok(());
+async fn persist_iv(pool: &PgPool, observation: &DeribitIvObservation) -> CollectorResult<()> {
+    // `creation_ts` is the legacy source-clock column. Instrument creation
+    // metadata is a separate optional identity field and is not available in
+    // these market-data responses.
+    let creation_ts = observation
+        .source_timestamp_ms
+        .map(millis_to_utc)
+        .transpose()?;
+    let expiry_ts = millis_to_utc(observation.identity.expiry_timestamp_ms)?;
+    let canonical = serde_json::to_value(observation)?;
+    let iv = stored_iv_fields(observation);
+    debug_assert_eq!(iv.raw_mark_iv, observation.mark_iv_raw);
+    let inserted: Option<(i64,)> = sqlx::query_as(
+        r#"
+        INSERT INTO deribit_iv_ticks (
+            currency, instrument_name, creation_ts, expiry_ts,
+            mark_iv, bid_iv, ask_iv,
+            underlying_price, index_price, mark_price,
+            best_bid_price, best_ask_price, open_interest, volume,
+            payload, fetched_at, strike, option_type, source_iv_unit,
+            iv_unit, source_timestamp_ms, canonical_observation
+        ) VALUES (
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,$16,
+            $17,$18,$19,$20,$21,$22::jsonb
+        )
+        ON CONFLICT (
+            currency, instrument_name, source_timestamp_ms, fetched_at
+        ) WHERE source_timestamp_ms IS NOT NULL
+            AND source_iv_unit = 'percent_points'
+            AND iv_unit = 'decimal_fraction'
+        DO NOTHING
+        RETURNING 1::bigint
+        "#,
+    )
+    .bind(&observation.identity.currency)
+    .bind(&observation.identity.instrument_name)
+    .bind(creation_ts)
+    .bind(expiry_ts)
+    .bind(observation.mark_iv)
+    .bind(observation.bid_iv)
+    .bind(observation.ask_iv)
+    .bind(observation.underlying_price)
+    .bind(observation.index_price)
+    .bind(observation.mark_price)
+    .bind(observation.best_bid_price)
+    .bind(observation.best_ask_price)
+    .bind(observation.open_interest)
+    .bind(observation.volume)
+    .bind(&observation.raw)
+    .bind(micros_to_utc(observation.received_at_us)?)
+    .bind(observation.identity.strike)
+    .bind(&observation.identity.option_type)
+    .bind(&iv.source_iv_unit)
+    .bind(&iv.storage_iv_unit)
+    .bind(observation.source_timestamp_ms)
+    .bind(&canonical)
+    .fetch_optional(pool)
+    .await?;
+    if inserted.is_some() {
+        return Ok(());
+    }
+
+    let existing: Option<(serde_json::Value, Option<serde_json::Value>)> = sqlx::query_as(
+        r#"
+        SELECT payload, canonical_observation
+        FROM deribit_iv_ticks
+        WHERE currency = $1
+          AND instrument_name = $2
+          AND source_timestamp_ms = $3
+          AND fetched_at = $4
+        "#,
+    )
+    .bind(&observation.identity.currency)
+    .bind(&observation.identity.instrument_name)
+    .bind(observation.source_timestamp_ms)
+    .bind(micros_to_utc(observation.received_at_us)?)
+    .fetch_optional(pool)
+    .await?;
+    match existing {
+        Some((existing_raw, existing_canonical))
+            if same_deribit_content(
+                &existing_raw,
+                existing_canonical.as_ref(),
+                &observation.raw,
+                &canonical,
+            ) =>
+        {
+            Ok(())
         }
-    };
+        _ => Err(format!(
+            "Deribit IV content conflict for {}/{} at source {:?} and receive {}",
+            observation.identity.currency,
+            observation.identity.instrument_name,
+            observation.source_timestamp_ms,
+            observation.received_at_us
+        )
+        .into()),
+    }
+}
 
-    // Fetch order book via Deribit REST API
-    let url = format!("{DERIBIT_API_BASE}/get_order_book");
-    let client = reqwest::Client::new();
-    let resp = client
-        .get(&url)
-        .query(&[("instrument_name", &instrument_name)])
-        .timeout(Duration::from_secs(20))
-        .send()
-        .await?;
-    let payload: Value = resp.json().await?;
-    let result = payload["result"]
-        .as_object()
-        .ok_or("missing result object")?;
-
-    let ts_ms = result
-        .get("timestamp")
-        .and_then(|v| v.as_i64())
-        .unwrap_or_else(|| Utc::now().timestamp_millis());
-    let source_ts = Utc
-        .timestamp_opt(ts_ms / 1000, ((ts_ms % 1000) * 1_000_000) as u32)
-        .unwrap();
-
-    let greeks = result.get("greeks").and_then(|g| g.as_object());
-
-    let to_dec = |key: &str| -> Option<Decimal> {
-        result
-            .get(key)
-            .and_then(|v| v.as_f64())
-            .and_then(|f| Decimal::try_from(f).ok())
-    };
-    let greek_dec = |key: &str| -> Option<Decimal> {
-        greeks
-            .and_then(|g| g.get(key))
-            .and_then(|v| v.as_f64())
-            .and_then(|f| Decimal::try_from(f).ok())
-    };
-
-    sqlx::query(
+async fn persist_greeks(
+    pool: &PgPool,
+    observation: &DeribitGreeksObservation,
+) -> CollectorResult<()> {
+    let source_ts = millis_to_utc(observation.source_timestamp_ms)?;
+    let canonical = serde_json::to_value(observation)?;
+    let inserted: Option<(i64,)> = sqlx::query_as(
         r#"
         INSERT INTO deribit_atm_greeks_ticks (
             currency, instrument_name, source_ts, fetched_at,
             mark_iv, bid_iv, ask_iv,
             delta, gamma, vega, theta, rho,
             mark_price, underlying_price, index_price,
-            best_bid_price, best_ask_price, open_interest,
-            raw
-        ) VALUES ($1, $2, $3, NOW(), $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18::jsonb)
-        ON CONFLICT (currency, instrument_name, source_ts) DO UPDATE SET
-            fetched_at = NOW(),
-            mark_iv = EXCLUDED.mark_iv,
-            bid_iv = EXCLUDED.bid_iv,
-            ask_iv = EXCLUDED.ask_iv,
-            delta = EXCLUDED.delta,
-            gamma = EXCLUDED.gamma,
-            vega = EXCLUDED.vega,
-            theta = EXCLUDED.theta,
-            rho = EXCLUDED.rho,
-            mark_price = EXCLUDED.mark_price,
-            underlying_price = EXCLUDED.underlying_price,
-            index_price = EXCLUDED.index_price,
-            best_bid_price = EXCLUDED.best_bid_price,
-            best_ask_price = EXCLUDED.best_ask_price,
-            open_interest = EXCLUDED.open_interest,
-            raw = EXCLUDED.raw
+            best_bid_price, best_ask_price, open_interest, raw,
+            strike, option_type, source_iv_unit, iv_unit, canonical_observation
+        ) VALUES (
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
+            $19::jsonb,$20,$21,$22,$23,$24::jsonb
+        )
+        ON CONFLICT (currency, instrument_name, source_ts) DO NOTHING
+        RETURNING 1::bigint
         "#,
     )
-    .bind(currency)
-    .bind(&instrument_name)
+    .bind(&observation.identity.currency)
+    .bind(&observation.identity.instrument_name)
     .bind(source_ts)
-    .bind(to_dec("mark_iv"))
-    .bind(to_dec("bid_iv"))
-    .bind(to_dec("ask_iv"))
-    .bind(greek_dec("delta"))
-    .bind(greek_dec("gamma"))
-    .bind(greek_dec("vega"))
-    .bind(greek_dec("theta"))
-    .bind(greek_dec("rho"))
-    .bind(to_dec("mark_price"))
-    .bind(to_dec("underlying_price"))
-    .bind(to_dec("index_price"))
-    .bind(to_dec("best_bid_price"))
-    .bind(to_dec("best_ask_price"))
-    .bind(to_dec("open_interest"))
-    .bind(serde_json::to_string(result).unwrap_or_default())
-    .execute(pool)
+    .bind(micros_to_utc(observation.received_at_us)?)
+    .bind(observation.mark_iv)
+    .bind(observation.bid_iv)
+    .bind(observation.ask_iv)
+    .bind(observation.delta)
+    .bind(observation.gamma)
+    .bind(observation.vega)
+    .bind(observation.theta)
+    .bind(observation.rho)
+    .bind(observation.mark_price)
+    .bind(observation.underlying_price)
+    .bind(observation.index_price)
+    .bind(observation.best_bid_price)
+    .bind(observation.best_ask_price)
+    .bind(observation.open_interest)
+    .bind(&observation.raw)
+    .bind(observation.identity.strike)
+    .bind(&observation.identity.option_type)
+    .bind(&observation.source_iv_unit)
+    .bind(&observation.iv_unit)
+    .bind(&canonical)
+    .fetch_optional(pool)
     .await?;
+    if inserted.is_some() {
+        return Ok(());
+    }
 
-    info!("[deribit-greeks] Stored Greeks for {instrument_name}");
-    Ok(())
+    let existing: Option<(serde_json::Value, Option<serde_json::Value>)> = sqlx::query_as(
+        r#"
+        SELECT raw, canonical_observation
+        FROM deribit_atm_greeks_ticks
+        WHERE currency = $1
+          AND instrument_name = $2
+          AND source_ts = $3
+        "#,
+    )
+    .bind(&observation.identity.currency)
+    .bind(&observation.identity.instrument_name)
+    .bind(source_ts)
+    .fetch_optional(pool)
+    .await?;
+    match existing {
+        Some((existing_raw, existing_canonical))
+            if same_deribit_content(
+                &existing_raw,
+                existing_canonical.as_ref(),
+                &observation.raw,
+                &canonical,
+            ) =>
+        {
+            Ok(())
+        }
+        _ => Err(format!(
+            "Deribit Greeks content conflict for {}/{} at source {}",
+            observation.identity.currency,
+            observation.identity.instrument_name,
+            observation.source_timestamp_ms
+        )
+        .into()),
+    }
+}
+
+fn millis_to_utc(milliseconds: i64) -> CollectorResult<DateTime<Utc>> {
+    if milliseconds <= 0 {
+        return Err("Deribit timestamp must be positive".into());
+    }
+    Utc.timestamp_millis_opt(milliseconds)
+        .single()
+        .ok_or_else(|| "Deribit timestamp is out of range".into())
+}
+
+fn micros_to_utc(micros: u64) -> CollectorResult<DateTime<Utc>> {
+    if micros == 0 {
+        return Err("Deribit receive timestamp must be positive".into());
+    }
+    let seconds = i64::try_from(micros / 1_000_000)?;
+    DateTime::from_timestamp(seconds, (micros % 1_000_000) as u32 * 1_000)
+        .ok_or_else(|| "Deribit receive timestamp is out of range".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use data::deribit_reference::parse_greeks_result;
+    use data::deribit_reference::parse_iv_summary_row;
+    use serde_json::json;
+    use sqlx::postgres::PgPoolOptions;
+
+    #[test]
+    fn currencies_are_uppercase_and_deduplicated() {
+        assert_eq!(
+            parse_currencies("btc, ETH,btc,,SOL"),
+            vec!["BTC", "ETH", "SOL"]
+        );
+    }
+
+    #[test]
+    fn sink_keeps_raw_iv_unit_separate_from_decimal_storage() {
+        let observation = parse_iv_summary_row(
+            &json!({
+                "instrument_name":"BTC-6SEP24-50000-C",
+                "creation_timestamp":1_700_000_000_000_i64,
+                "mark_iv":77.72
+            }),
+            "BTC",
+            1_700_000_001_000_000,
+        )
+        .unwrap();
+        let stored = stored_iv_fields(&observation);
+        assert_eq!(
+            stored.raw_mark_iv,
+            Some(Decimal::from_str_exact("77.72").unwrap())
+        );
+        assert_eq!(
+            stored.stored_mark_iv,
+            Some(Decimal::from_str_exact("0.7772").unwrap())
+        );
+        assert_eq!(stored.source_iv_unit, "percent_points");
+        assert_eq!(stored.storage_iv_unit, "decimal_fraction");
+    }
+
+    #[test]
+    fn repeated_source_content_is_idempotent_but_changed_content_is_rejected() {
+        let raw = json!({"mark_iv":77.72});
+        let canonical = json!({
+            "mark_iv":0.7772,
+            "iv_unit":"decimal_fraction",
+            "received_at_us":1_700_000_001_000_000_u64
+        });
+        let replay = json!({
+            "mark_iv":0.7772,
+            "iv_unit":"decimal_fraction",
+            "received_at_us":1_700_000_002_000_000_u64
+        });
+        assert!(same_deribit_content(&raw, Some(&canonical), &raw, &replay));
+        assert!(!same_deribit_content(
+            &json!({"mark_iv":77.73}),
+            Some(&replay),
+            &raw,
+            &replay
+        ));
+        assert!(!same_deribit_content(&raw, None, &raw, &replay));
+    }
+
+    #[cfg(feature = "live")]
+    #[tokio::test]
+    #[ignore = "requires PLOY_TEST_DATABASE_URL and a temporary PostgreSQL fixture"]
+    async fn postgres_deribit_persistence_and_pit_contract() {
+        let database_url = std::env::var("PLOY_TEST_DATABASE_URL").expect(
+            "PLOY_TEST_DATABASE_URL is required for the ignored Deribit PostgreSQL integration test",
+        );
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&database_url)
+            .await
+            .expect("connect to PostgreSQL fixture");
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/055_deribit_reference_evidence.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("apply Deribit evidence migration");
+
+        let iv = parse_iv_summary_row(
+            &json!({
+                "instrument_name":"BTC-6SEP24-50000-C",
+                "creation_timestamp":1_700_000_000_000_i64,
+                "mark_iv":77.72,
+                "bid_price":0,
+                "open_interest":1
+            }),
+            "BTC",
+            1_700_000_001_000_000,
+        )
+        .unwrap();
+        persist_iv(&pool, &iv).await.unwrap();
+        persist_iv(&pool, &iv).await.unwrap();
+
+        let first_iv: (DateTime<Utc>, DateTime<Utc>, Decimal, i64, String, String) =
+            sqlx::query_as(
+                "SELECT fetched_at, creation_ts, mark_iv, source_timestamp_ms, iv_unit, source_iv_unit FROM deribit_iv_ticks WHERE currency = $1 AND instrument_name = $2",
+            )
+            .bind("BTC")
+            .bind("BTC-6SEP24-50000-C")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(first_iv.0.timestamp(), 1_700_000_001);
+        assert_eq!(first_iv.1.timestamp(), 1_700_000_000);
+        assert_eq!(first_iv.2, Decimal::from_str_exact("0.7772").unwrap());
+        assert_eq!(first_iv.3, 1_700_000_000_000);
+        assert_eq!(first_iv.4, "decimal_fraction");
+        assert_eq!(first_iv.5, "percent_points");
+        let iv_count: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM deribit_iv_ticks WHERE currency = $1 AND instrument_name = $2",
+        )
+        .bind("BTC")
+        .bind("BTC-6SEP24-50000-C")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(iv_count.0, 1);
+
+        let pit_bucket = Utc.timestamp_opt(1_700_000_001, 500_000_000).unwrap();
+        let pit_before = Utc.timestamp_opt(1_700_000_000, 500_000_000).unwrap();
+        let pit_sql = r#"
+            SELECT mark_iv
+            FROM deribit_iv_ticks
+            WHERE currency = $1
+              AND iv_unit = 'decimal_fraction'
+              AND fetched_at <= $2
+              AND fetched_at > $2 - interval '5 minutes'
+              AND source_timestamp_ms <= (extract(epoch FROM $2) * 1000)::bigint
+              AND source_timestamp_ms >
+                  (extract(epoch FROM ($2 - interval '5 minutes')) * 1000)::bigint
+        "#;
+        let pit_value: Option<(Decimal,)> = sqlx::query_as(pit_sql)
+            .bind("BTC")
+            .bind(pit_bucket)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            pit_value.unwrap().0,
+            Decimal::from_str_exact("0.7772").unwrap()
+        );
+        let before_value: Option<(Decimal,)> = sqlx::query_as(pit_sql)
+            .bind("BTC")
+            .bind(pit_before)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+        assert!(before_value.is_none());
+
+        let conflicting_iv = parse_iv_summary_row(
+            &json!({
+                "instrument_name":"BTC-6SEP24-50000-C",
+                "creation_timestamp":1_700_000_000_000_i64,
+                "mark_iv":77.73
+            }),
+            "BTC",
+            1_700_000_001_000_000,
+        )
+        .unwrap();
+        assert!(persist_iv(&pool, &conflicting_iv).await.is_err());
+
+        let greeks_result = json!({
+            "instrument_name":"BTC-6SEP24-50000-C",
+            "timestamp":1_700_000_002_000_i64,
+            "mark_iv":77.72,
+            "greeks":{"delta":0.5,"theta":-0.1}
+        });
+        let greeks = parse_greeks_result(
+            &greeks_result,
+            "BTC",
+            "BTC-6SEP24-50000-C",
+            1_700_000_003_000_000,
+        )
+        .unwrap();
+        persist_greeks(&pool, &greeks).await.unwrap();
+        let first_greeks: (DateTime<Utc>, Decimal, String) = sqlx::query_as(
+            "SELECT fetched_at, mark_iv, iv_unit FROM deribit_atm_greeks_ticks WHERE currency = $1 AND instrument_name = $2 AND source_ts = to_timestamp($3)::timestamptz",
+        )
+        .bind("BTC")
+        .bind("BTC-6SEP24-50000-C")
+        .bind(1_700_000_002_f64)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(first_greeks.0.timestamp(), 1_700_000_003);
+        assert_eq!(first_greeks.1, Decimal::from_str_exact("0.7772").unwrap());
+        assert_eq!(first_greeks.2, "decimal_fraction");
+
+        let mut replay = greeks.clone();
+        replay.received_at_us += 1_000_000;
+        persist_greeks(&pool, &replay).await.unwrap();
+        let replay_fetched: (DateTime<Utc>,) = sqlx::query_as(
+            "SELECT fetched_at FROM deribit_atm_greeks_ticks WHERE currency = $1 AND instrument_name = $2 AND source_ts = to_timestamp($3)::timestamptz",
+        )
+        .bind("BTC")
+        .bind("BTC-6SEP24-50000-C")
+        .bind(1_700_000_002_f64)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(replay_fetched.0, first_greeks.0);
+        let greeks_count: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM deribit_atm_greeks_ticks WHERE currency = $1 AND instrument_name = $2 AND source_ts = to_timestamp($3)::timestamptz",
+        )
+        .bind("BTC")
+        .bind("BTC-6SEP24-50000-C")
+        .bind(1_700_000_002_f64)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(greeks_count.0, 1);
+
+        let mut conflicting_result = greeks_result;
+        conflicting_result["mark_iv"] = json!(77.73);
+        let conflicting_greeks = parse_greeks_result(
+            &conflicting_result,
+            "BTC",
+            "BTC-6SEP24-50000-C",
+            1_700_000_004_000_000,
+        )
+        .unwrap();
+        assert!(persist_greeks(&pool, &conflicting_greeks).await.is_err());
+    }
 }

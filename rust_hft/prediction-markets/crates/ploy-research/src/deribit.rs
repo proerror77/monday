@@ -59,7 +59,7 @@ pub async fn load_deribit_feature_snapshots_with_timings(
     let mut snapshots: BTreeMap<(String, DateTime<Utc>), DeribitFeatureSnapshot> = BTreeMap::new();
 
     let started = Instant::now();
-    if relation_exists(pool, "strategy_data.deribit_atm_greeks_snapshots_cache").await {
+    if canonical_cache_exists(pool).await {
         let started = Instant::now();
         let cache_rows = load_deribit_cache_rows(pool, &currencies, start, end, sample_secs).await;
         let elapsed_ms = started.elapsed().as_millis();
@@ -156,14 +156,19 @@ type DeribitRow = (
     DateTime<Utc>,
 );
 
-async fn relation_exists(pool: &sqlx::PgPool, relation: &str) -> bool {
-    sqlx::query_scalar::<_, Option<String>>("SELECT to_regclass($1)::text")
-        .bind(relation)
-        .fetch_one(pool)
-        .await
-        .ok()
-        .flatten()
-        .is_some()
+async fn canonical_cache_exists(pool: &sqlx::PgPool) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT COUNT(*) = 2
+        FROM information_schema.columns
+        WHERE table_schema = 'strategy_data'
+          AND table_name = 'deribit_atm_greeks_snapshots_cache'
+          AND column_name IN ('fetched_at', 'iv_unit')
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false)
 }
 
 fn raw_iv_fallback_enabled() -> bool {
@@ -172,15 +177,7 @@ fn raw_iv_fallback_enabled() -> bool {
         .unwrap_or(false)
 }
 
-async fn load_deribit_cache_rows(
-    pool: &sqlx::PgPool,
-    currencies: &[String],
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
-    sample_secs: i32,
-) -> Vec<DeribitRow> {
-    match sqlx::query_as(
-        r#"
+const DERIBIT_CACHE_ROWS_QUERY: &str = r#"
         WITH currencies AS (
             SELECT unnest($1::text[]) AS currency
         ),
@@ -205,38 +202,18 @@ async fn load_deribit_cache_rows(
             FROM strategy_data.deribit_atm_greeks_snapshots_cache d
             WHERE d.currency = c.currency
               AND d.source_ts <= b.bucket_ts
+              AND d.fetched_at <= b.bucket_ts
               AND d.source_ts > b.bucket_ts - interval '5 minutes'
+              AND d.fetched_at > b.bucket_ts - interval '5 minutes'
+              AND d.iv_unit = 'decimal_fraction'
               AND d.mark_iv IS NOT NULL
-            ORDER BY d.source_ts DESC
+            ORDER BY d.fetched_at DESC, d.source_ts DESC
             LIMIT 1
         ) d ON true
         ORDER BY b.bucket_ts
-        "#,
-    )
-    .bind(currencies)
-    .bind(start)
-    .bind(end)
-    .bind(sample_secs)
-    .fetch_all(pool)
-    .await
-    {
-        Ok(rows) => rows,
-        Err(err) => {
-            tracing::warn!(error = %err, "deribit cache load failed");
-            Vec::new()
-        }
-    }
-}
+        "#;
 
-async fn load_deribit_atm_greeks_rows(
-    pool: &sqlx::PgPool,
-    currencies: &[String],
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
-    sample_secs: i32,
-) -> Vec<DeribitRow> {
-    match sqlx::query_as(
-        r#"
+const DERIBIT_ATM_GREEKS_ROWS_QUERY: &str = r#"
         WITH currencies AS (
             SELECT unnest($1::text[]) AS currency
         ),
@@ -261,20 +238,87 @@ async fn load_deribit_atm_greeks_rows(
             FROM deribit_atm_greeks_ticks d
             WHERE d.currency = c.currency
               AND d.source_ts <= b.bucket_ts
+              AND d.fetched_at <= b.bucket_ts
               AND d.source_ts > b.bucket_ts - interval '5 minutes'
+              AND d.fetched_at > b.bucket_ts - interval '5 minutes'
+              AND d.iv_unit = 'decimal_fraction'
               AND d.mark_iv IS NOT NULL
-            ORDER BY d.source_ts DESC, d.open_interest DESC NULLS LAST
+            ORDER BY d.fetched_at DESC, d.source_ts DESC, d.open_interest DESC NULLS LAST
             LIMIT 1
         ) d ON true
         ORDER BY b.bucket_ts
-        "#,
-    )
-    .bind(currencies)
-    .bind(start)
-    .bind(end)
-    .bind(sample_secs)
-    .fetch_all(pool)
-    .await
+        "#;
+
+const DERIBIT_RAW_IV_ROWS_QUERY: &str = r#"
+        WITH currencies AS (
+            SELECT unnest($1::text[]) AS currency
+        ),
+        buckets AS (
+            SELECT generate_series($2::timestamptz, $3::timestamptz, make_interval(secs => $4::int)) AS bucket_ts
+        )
+        SELECT
+            c.currency,
+            d.mark_iv::double precision,
+            d.bid_iv::double precision,
+            d.ask_iv::double precision,
+            d.underlying_price::double precision,
+            b.bucket_ts
+        FROM currencies c
+        CROSS JOIN buckets b
+        JOIN LATERAL (
+            SELECT mark_iv, bid_iv, ask_iv, underlying_price
+            FROM deribit_iv_ticks d
+            WHERE d.currency = c.currency
+              AND d.fetched_at <= b.bucket_ts
+              AND d.fetched_at > b.bucket_ts - interval '5 minutes'
+              AND d.source_timestamp_ms <= (extract(epoch FROM b.bucket_ts) * 1000)::bigint
+              AND d.source_timestamp_ms >
+                  (extract(epoch FROM (b.bucket_ts - interval '5 minutes')) * 1000)::bigint
+              AND d.iv_unit = 'decimal_fraction'
+              AND d.mark_iv IS NOT NULL
+            ORDER BY d.fetched_at DESC, d.creation_ts DESC, d.open_interest DESC NULLS LAST
+            LIMIT 1
+        ) d ON true
+        ORDER BY b.bucket_ts
+        "#;
+
+async fn load_deribit_cache_rows(
+    pool: &sqlx::PgPool,
+    currencies: &[String],
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    sample_secs: i32,
+) -> Vec<DeribitRow> {
+    match sqlx::query_as(DERIBIT_CACHE_ROWS_QUERY)
+        .bind(currencies)
+        .bind(start)
+        .bind(end)
+        .bind(sample_secs)
+        .fetch_all(pool)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(error = %err, "deribit cache load failed");
+            Vec::new()
+        }
+    }
+}
+
+async fn load_deribit_atm_greeks_rows(
+    pool: &sqlx::PgPool,
+    currencies: &[String],
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    sample_secs: i32,
+) -> Vec<DeribitRow> {
+    match sqlx::query_as(DERIBIT_ATM_GREEKS_ROWS_QUERY)
+        .bind(currencies)
+        .bind(start)
+        .bind(end)
+        .bind(sample_secs)
+        .fetch_all(pool)
+        .await
     {
         Ok(rows) => rows,
         Err(err) => {
@@ -298,42 +342,13 @@ async fn load_deribit_raw_iv_rows(
         Option<f64>,
         Option<f64>,
         DateTime<Utc>,
-    )> = match sqlx::query_as(
-        r#"
-        WITH currencies AS (
-            SELECT unnest($1::text[]) AS currency
-        ),
-        buckets AS (
-            SELECT generate_series($2::timestamptz, $3::timestamptz, make_interval(secs => $4::int)) AS bucket_ts
-        )
-        SELECT
-            c.currency,
-            d.mark_iv::double precision,
-            d.bid_iv::double precision,
-            d.ask_iv::double precision,
-            d.underlying_price::double precision,
-            b.bucket_ts
-        FROM currencies c
-        CROSS JOIN buckets b
-        JOIN LATERAL (
-            SELECT mark_iv, bid_iv, ask_iv, underlying_price
-            FROM deribit_iv_ticks d
-            WHERE d.currency = c.currency
-              AND d.creation_ts <= b.bucket_ts
-              AND d.creation_ts > b.bucket_ts - interval '5 minutes'
-              AND d.mark_iv IS NOT NULL
-            ORDER BY d.creation_ts DESC, d.open_interest DESC NULLS LAST
-            LIMIT 1
-        ) d ON true
-        ORDER BY b.bucket_ts
-        "#,
-    )
-    .bind(currencies)
-    .bind(start)
-    .bind(end)
-    .bind(sample_secs)
-    .fetch_all(pool)
-    .await
+    )> = match sqlx::query_as(DERIBIT_RAW_IV_ROWS_QUERY)
+        .bind(currencies)
+        .bind(start)
+        .bind(end)
+        .bind(sample_secs)
+        .fetch_all(pool)
+        .await
     {
         Ok(rows) => rows,
         Err(err) => {
@@ -440,5 +455,46 @@ fn deribit_currency_to_symbol(currency: &str) -> String {
         "ETH" => "ETHUSDT".to_string(),
         "SOL" => "SOLUSDT".to_string(),
         other => format!("{other}USDT"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pit_queries_require_receive_availability_and_typed_iv_units() {
+        for query in [
+            DERIBIT_CACHE_ROWS_QUERY,
+            DERIBIT_ATM_GREEKS_ROWS_QUERY,
+            DERIBIT_RAW_IV_ROWS_QUERY,
+        ] {
+            assert!(query.contains("d.fetched_at <= b.bucket_ts"));
+            assert!(query.contains("d.fetched_at > b.bucket_ts - interval '5 minutes'"));
+            assert!(query.contains("d.iv_unit = 'decimal_fraction'"));
+        }
+        for query in [DERIBIT_CACHE_ROWS_QUERY, DERIBIT_ATM_GREEKS_ROWS_QUERY] {
+            assert!(query.contains("d.source_ts <= b.bucket_ts"));
+            assert!(query.contains("d.source_ts > b.bucket_ts - interval '5 minutes'"));
+        }
+        assert!(!DERIBIT_RAW_IV_ROWS_QUERY.contains("d.creation_ts <= b.bucket_ts"));
+        assert!(DERIBIT_RAW_IV_ROWS_QUERY.contains("d.source_timestamp_ms <="));
+    }
+
+    #[test]
+    fn deribit_currency_mapping_stays_explicit() {
+        assert_eq!(
+            symbol_to_deribit_currency("btc-usdt"),
+            Some("BTC".to_string())
+        );
+        assert_eq!(
+            symbol_to_deribit_currency("ETHUSDT"),
+            Some("ETH".to_string())
+        );
+        assert_eq!(
+            symbol_to_deribit_currency("SOL-USD"),
+            Some("SOL".to_string())
+        );
+        assert_eq!(symbol_to_deribit_currency("DOGEUSDT"), None);
     }
 }

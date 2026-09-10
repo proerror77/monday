@@ -8,6 +8,7 @@ pub mod binance_market_tape_artifact;
 pub mod binance_reference_common;
 pub mod binance_spot_reference;
 pub mod binance_usdm_reference;
+pub mod deribit_reference;
 
 pub mod capabilities {
     #[derive(Debug, Clone, Default)]

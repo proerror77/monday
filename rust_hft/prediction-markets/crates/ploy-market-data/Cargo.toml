@@ -13,6 +13,7 @@ audit = ["dep:sqlx"]
 live = [
     "audit",
     "dep:adapter-binance-data",
+    "dep:adapter-deribit-data",
     "dep:adapter-predict-fun-data",
     "dep:data",
     "dep:adapter-polymarket-data",
@@ -26,6 +27,7 @@ live = [
 
 [dependencies]
 adapter-binance-data = { package = "hft-data-adapter-binance", path = "../../../data-pipelines/adapters/adapter-binance", optional = true }
+adapter-deribit-data = { package = "hft-data-adapter-deribit-reference", path = "../../../data-pipelines/adapters/adapter-deribit-reference", optional = true }
 adapter-predict-fun-data = { package = "hft-data-adapter-predict-fun", path = "../../../data-pipelines/adapters/adapter-predict-fun", optional = true }
 data = { package = "hft-data", path = "../../../data-pipelines/core", optional = true }
 adapter-polymarket-data = { package = "hft-data-adapter-polymarket", path = "../../../data-pipelines/adapters/adapter-polymarket", optional = true }

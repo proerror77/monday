@@ -10767,16 +10767,14 @@ fn enrich_rolling_features(
                     &rows[idx].symbol,
                     rows[idx].tick_ts - chrono::Duration::seconds(30),
                 ) {
-                    rows[idx].deribit_iv_change_30s =
-                        diff(rows[idx].deribit_mark_iv, normalized_iv(prev.mark_iv));
+                    rows[idx].deribit_iv_change_30s = diff(rows[idx].deribit_mark_iv, prev.mark_iv);
                 }
                 if let Some(prev) = latest_deribit_before(
                     &deribit_by_symbol,
                     &rows[idx].symbol,
                     rows[idx].tick_ts - chrono::Duration::seconds(60),
                 ) {
-                    rows[idx].deribit_iv_change_60s =
-                        diff(rows[idx].deribit_mark_iv, normalized_iv(prev.mark_iv));
+                    rows[idx].deribit_iv_change_60s = diff(rows[idx].deribit_mark_iv, prev.mark_iv);
                 }
             }
         }
@@ -11012,9 +11010,9 @@ fn latest_deribit_before<'a>(
 }
 
 fn apply_deribit_snapshot(row: &mut FactorObservationV2, snapshot: &DeribitFeatureSnapshot) {
-    let mark_iv = normalized_iv(snapshot.mark_iv);
-    let bid_iv = normalized_iv(snapshot.bid_iv);
-    let ask_iv = normalized_iv(snapshot.ask_iv);
+    let mark_iv = snapshot.mark_iv;
+    let bid_iv = snapshot.bid_iv;
+    let ask_iv = snapshot.ask_iv;
     row.deribit_mark_iv = mark_iv;
     row.deribit_bid_iv = bid_iv;
     row.deribit_ask_iv = ask_iv;
@@ -11050,17 +11048,6 @@ fn normalize_symbol(symbol: &str) -> String {
         "ETH" | "ETH-PERPETUAL" => "ETHUSDT".to_string(),
         "SOL" | "SOL-PERPETUAL" => "SOLUSDT".to_string(),
         other => other.to_string(),
-    }
-}
-
-fn normalized_iv(value: f64) -> f64 {
-    if !value.is_finite() {
-        return f64::NAN;
-    }
-    if value > 2.0 {
-        value / 100.0
-    } else {
-        value
     }
 }
 
@@ -11662,6 +11649,60 @@ mod tests {
             cex_consecutive_down_bars: 0.0,
             cex_breakout_volume_score: 1.2,
         }
+    }
+
+    #[test]
+    fn canonical_deribit_iv_is_not_rescaled_in_research_features() {
+        let start = Utc::now();
+        let mut first = base_obs();
+        first.tick_ts = start;
+        first.event_end_ts = Some(start + Duration::seconds(220));
+        let mut second = first.clone();
+        second.tick_ts = start + Duration::seconds(30);
+        second.event_end_ts = Some(second.tick_ts + Duration::seconds(220));
+
+        let snapshots = vec![
+            DeribitFeatureSnapshot {
+                symbol: "BTCUSDT".to_string(),
+                ts: start,
+                mark_iv: 2.5,
+                bid_iv: 2.4,
+                ask_iv: 2.6,
+                underlying_price: 100_000.0,
+                delta: f64::NAN,
+                gamma: f64::NAN,
+                vega: f64::NAN,
+                theta: f64::NAN,
+            },
+            DeribitFeatureSnapshot {
+                symbol: "BTCUSDT".to_string(),
+                ts: second.tick_ts,
+                mark_iv: 3.0,
+                bid_iv: 2.8,
+                ask_iv: 3.2,
+                underlying_price: 100_100.0,
+                delta: f64::NAN,
+                gamma: f64::NAN,
+                vega: f64::NAN,
+                theta: f64::NAN,
+            },
+        ];
+
+        let rows = build_factor_observations_v2_with_deribit(
+            &[first, second.clone()],
+            &snapshots,
+            &FactorReviewOptions::default(),
+        );
+        let current = rows
+            .iter()
+            .find(|row| row.tick_ts == second.tick_ts && row.side == ReviewSide::Up)
+            .expect("current Deribit snapshot row");
+
+        assert_eq!(current.deribit_mark_iv, 3.0);
+        assert_eq!(current.deribit_bid_iv, 2.8);
+        assert_eq!(current.deribit_ask_iv, 3.2);
+        assert!((current.deribit_iv_spread - 0.4).abs() < 1e-12);
+        assert!((current.deribit_iv_change_30s - 0.5).abs() < 1e-12);
     }
 
     fn bind_test_resolution_clocks(rows: &mut [FactorObservation]) {
