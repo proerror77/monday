@@ -1,8 +1,9 @@
 //! Governed Prediction Market research entrypoint.
 //!
-//! This binary accepts only Mission v4. It can prove pipeline compatibility or
+//! Governed runs accept only Mission v4. It can prove pipeline compatibility or
 //! run the existing authenticated, event-disjoint ResearchTrial; it has no live
-//! order path and no external proposal-provider dependency.
+//! order path and no external proposal-provider dependency. The separate
+//! --explore-trades mode emits descriptive statistics without Mission admission.
 
 use std::fs;
 #[cfg(unix)]
@@ -31,7 +32,7 @@ const MAX_PARTITION_VIEW_BYTES: usize = 16 * 1024;
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  monday-prediction-research --print-policy-snapshot-id\n  monday-prediction-research --pipeline-smoke <mission.json> <snapshot-dir> <output-dir> <admitted identity flags>\n  monday-prediction-research --research-trial <mission.json> <snapshot-dir> <output-dir> <admitted identity flags>"
+        "usage:\n  monday-prediction-research --print-policy-snapshot-id\n  monday-prediction-research --explore-trades <history-dir> <manifest-sha256>\n  monday-prediction-research --pipeline-smoke <mission.json> <snapshot-dir> <output-dir> <admitted identity flags>\n  monday-prediction-research --research-trial <mission.json> <snapshot-dir> <output-dir> <admitted identity flags>"
     );
     std::process::exit(2);
 }
@@ -409,6 +410,23 @@ fn terminate_evaluator_group(child: &mut Child) -> Option<std::process::ExitStat
 
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if let [mode, directory, manifest_sha256] = args.as_slice() {
+        if mode == "--explore-trades" {
+            let result = ploy_research::polymarket_history::explore_historical_trades(
+                Path::new(directory),
+                manifest_sha256,
+            )
+            .and_then(|report| Ok(serde_json::to_string_pretty(&report)?));
+            match result {
+                Ok(report) => println!("{report}"),
+                Err(error) => {
+                    eprintln!("ERROR: {error:#}");
+                    std::process::exit(2);
+                }
+            }
+            return;
+        }
+    }
     if args.as_slice() == ["--print-policy-snapshot-id"] {
         println!("{}", current_prediction_policy_snapshot_id());
         return;
