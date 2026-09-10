@@ -4842,6 +4842,7 @@ dependencies = [
  "chrono",
  "clap",
  "clickhouse 0.12.2",
+ "csv",
  "duckdb",
  "flate2",
  "fs4",

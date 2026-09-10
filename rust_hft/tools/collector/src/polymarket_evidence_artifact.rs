@@ -623,10 +623,10 @@ struct PolymarketEvidenceManifest<'a> {
     validated_inputs: &'a ResearchSegmentValidationReport,
 }
 
-struct ArtifactBytes<'a> {
-    data: &'a [u8],
-    manifest: &'a [u8],
-    success: &'a [u8],
+pub(crate) struct ArtifactBytes<'a> {
+    pub(crate) data: &'a [u8],
+    pub(crate) manifest: &'a [u8],
+    pub(crate) success: &'a [u8],
 }
 
 fn recording_semantics(inputs: &ResearchSegmentValidationReport) -> Result<RecordingSemantics> {
@@ -1066,7 +1066,7 @@ fn install_no_clobber(
     Ok(created)
 }
 
-fn publish_triplet(
+pub(crate) fn publish_triplet(
     data_path: &Path,
     manifest_path: &Path,
     success_path: &Path,

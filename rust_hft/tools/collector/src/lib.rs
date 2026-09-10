@@ -11,6 +11,7 @@ pub mod feature_matrix;
 pub mod lob_archiver;
 pub mod polymarket_evidence_artifact;
 pub mod polymarket_parity;
+pub mod polymarket_poly_data;
 pub mod polymarket_raw;
 pub mod polymarket_research_import;
 pub mod polymarket_research_normalize;

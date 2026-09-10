@@ -1,6 +1,9 @@
 # Polymarket historical-data integration and research handoff
 
-Status: implementation requested; this specification is not implementation or research evidence.
+Status: Rust import, independent readback and trade-only research exploration
+implemented. Real-data BTC baseline remains blocked on the inputs and evidence
+listed in [the runnable guide](../research/poly-data-history.md). This document
+and synthetic tests are not real research evidence.
 
 ## Goal
 
