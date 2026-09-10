@@ -105,21 +105,14 @@ sha256_file() {
   sha256sum "$1" | awk '{print $1}'
 }
 
+# These helpers read the pipeline's generated, pretty-printed reports. Collector
+# manifests have no whitespace contract and use the native verifier below.
 json_string_field() {
   field=$1
   file=$2
   matches=$(sed -n "s/^[[:space:]]*\"$field\": \"\\([^\"]*\\)\"[,]*/\\1/p" "$file")
   count=$(printf '%s\n' "$matches" | sed '/^$/d' | wc -l | tr -d ' ')
   [ "$count" -eq 1 ] || die "expected exactly one $field field in $file, observed $count"
-  printf '%s\n' "$matches" | sed -n '1p'
-}
-
-json_number_field() {
-  field=$1
-  file=$2
-  matches=$(sed -n "s/^[[:space:]]*\"$field\":[[:space:]]*\([0-9][0-9]*\)[,]*/\1/p" "$file")
-  count=$(printf '%s\n' "$matches" | sed '/^$/d' | wc -l | tr -d ' ')
-  [ "$count" -eq 1 ] || die "expected exactly one numeric $field field in $file, observed $count"
   printf '%s\n' "$matches" | sed -n '1p'
 }
 
@@ -568,6 +561,7 @@ require_tool sed
 require_tool sha256sum
 
 SLICER_BIN=$BINARY_DIR/binance-market-tape-slicer
+ALPHA_BIN=$BINARY_DIR/alpha-harness
 PIT_BIN=$BINARY_DIR/lob-pit-materializer
 REPLAY_BIN=$BINARY_DIR/binance-replay-parquet-materializer
 
@@ -720,6 +714,7 @@ if [ "$resume_publish" -eq 1 ]; then
   load_recovery_publish_state
 else
   mkdir -p "$SLICE_ROOT" "$STATE_ROOT"
+  [ -x "$ALPHA_BIN" ] || die "native manifest verifier is not executable: $ALPHA_BIN"
 
   if [ "$DRY_RUN" -ne 1 ] && [ "$ROLE" != "slice" ]; then
   mkdir -p "$LOCAL_MATERIALIZATION_DIR" "$LOCAL_REPLAY_DIR" "$LOCAL_RECEIPT_DIR"
@@ -755,16 +750,12 @@ verify_raw_range() {
     verified=$(verify_triplet "raw segment $i" "$RAW_ROOT" "$rel" "$sha" "$manifest_sha")
     data=$(printf '%s' "$verified" | awk -F'|' '{print $1}')
     manifest=$(printf '%s' "$verified" | awk -F'|' '{print $2}')
+    set -- --manifest "$manifest" --manifest-sha256 "$manifest_sha" --kind raw --market "$market"
     if [ -n "$window_start_received_at_ns" ]; then
-      segment_start=$(json_number_field start_received_at_ns "$manifest")
-      segment_end=$(json_number_field end_received_at_ns "$manifest")
-      [ "$segment_start" -ge "$window_start_received_at_ns" ] \
-        || die "raw segment $i begins before the selected materialization window"
-      [ "$segment_end" -le "$window_end_received_at_ns" ] \
-        || die "raw segment $i ends after the selected materialization window"
+      set -- "$@" --start-received-at-ns "$window_start_received_at_ns" --end-received-at-ns "$window_end_received_at_ns"
     fi
-    raw_market=$(json_string_field market "$manifest")
-    [ "$raw_market" = "$market" ] || die "raw segment $i market differs from frozen inventory"
+    "$ALPHA_BIN" data verify-materialization-manifest "$@" >"$STATE_ROOT/raw-segment-$i.metadata.json" \
+      || die "raw segment $i metadata verification failed"
     printf '%s\n' "$data" >"$STATE_ROOT/raw-segment-$i.path"
     printf '%s\n' "$sha" >"$STATE_ROOT/raw-segment-$i.sha256"
     printf '%s\n' "$manifest_sha" >"$STATE_ROOT/raw-segment-$i.manifest-sha256"
@@ -799,11 +790,10 @@ if [ "$ROLE" != "slice" ]; then
     [ -n "$manifest_sha" ] || die "REFERENCE_${i}_MANIFEST_SHA256 is required"
     verified=$(verify_triplet "reference batch $i" "$REFERENCE_ROOT" "$rel" "$sha" "$manifest_sha")
     data=$(printf '%s' "$verified" | awk -F'|' '{print $1}')
-    reference_venue=$(json_string_field venue "$(printf '%s' "$verified" | awk -F'|' '{print $2}')")
-    case "$market:$reference_venue" in
-      spot:binance_spot|usdm:binance_usdm) ;;
-      *) die "reference batch $i venue does not match frozen market" ;;
-    esac
+    manifest=$(printf '%s' "$verified" | awk -F'|' '{print $2}')
+    "$ALPHA_BIN" data verify-materialization-manifest \
+      --manifest "$manifest" --manifest-sha256 "$manifest_sha" --kind reference --market "$market" \
+      >"$STATE_ROOT/reference-$i.metadata.json" || die "reference batch $i metadata verification failed"
     printf '%s\n' "$data" >"$STATE_ROOT/reference-$i.path"
     printf '%s\n' "$sha" >"$STATE_ROOT/reference-$i.sha256"
     printf '%s\n' "$manifest_sha" >"$STATE_ROOT/reference-$i.manifest-sha256"

@@ -224,6 +224,92 @@ fn required_string<'a>(raw: &'a Map<String, Value>, field: &str, what: &str) -> 
 
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaterializationManifestKind {
+    Raw,
+    Reference,
+}
+
+#[derive(serde::Deserialize)]
+struct RawMaterializationMetadata {
+    market: String,
+    start_received_at_ns: Option<u64>,
+    end_received_at_ns: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+struct ReferenceMaterializationMetadata {
+    venue: String,
+}
+
+/// Check archive metadata from the exact hashed bytes, independently of JSON
+/// whitespace. Typed fields reject duplicates and non-integer nanoseconds;
+/// identically named fields inside unrelated nested objects are not root fields.
+/// Data/marker integrity and full slicer/PIT admission remain separate checks.
+pub fn verify_materialization_manifest_metadata(
+    manifest: &Path,
+    expected_manifest_sha256: &str,
+    kind: MaterializationManifestKind,
+    market: Market,
+    window: Option<(u64, u64)>,
+) -> Result<()> {
+    if let Some((start, end)) = window {
+        if start >= end || matches!(kind, MaterializationManifestKind::Reference) {
+            bail!("materialization window requires ordered raw-segment bounds");
+        }
+    }
+    let parent = manifest
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .canonicalize()?;
+    let path = parent.join(
+        manifest
+            .file_name()
+            .context("materialization manifest filename is missing")?,
+    );
+    let bytes = bounded_bytes(&parent, &path, MAX_MANIFEST_BYTES)?;
+    if hex::encode(Sha256::digest(&bytes)) != expected_manifest_sha256 {
+        bail!("materialization manifest SHA256 differs from frozen inventory");
+    }
+    match kind {
+        MaterializationManifestKind::Raw => {
+            let metadata: RawMaterializationMetadata = serde_json::from_slice(&bytes)
+                .context("parse raw materialization manifest metadata")?;
+            if metadata.market != market.as_str() {
+                bail!("raw segment market differs from frozen inventory");
+            }
+            if let Some((start, end)) = window {
+                let segment_start = metadata
+                    .start_received_at_ns
+                    .context("raw segment start_received_at_ns must be an unsigned integer")?;
+                let segment_end = metadata
+                    .end_received_at_ns
+                    .context("raw segment end_received_at_ns must be an unsigned integer")?;
+                if segment_start < start {
+                    bail!("raw segment begins before the selected materialization window");
+                }
+                if segment_end > end {
+                    bail!("raw segment ends after the selected materialization window");
+                }
+            }
+        }
+        MaterializationManifestKind::Reference => {
+            let metadata: ReferenceMaterializationMetadata = serde_json::from_slice(&bytes)
+                .context("parse reference materialization manifest metadata")?;
+            let expected = match market {
+                Market::Spot => "binance_spot",
+                Market::Usdm => "binance_usdm",
+            };
+            if metadata.venue != expected {
+                bail!("reference batch venue does not match frozen market");
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct InventoryRequest {
     pub raw_root: PathBuf,
@@ -1469,6 +1555,173 @@ mod tests {
 
     const SOURCE_MS: u64 = 1_700_000_000_000;
     const RECEIVED_NS: u64 = 1_700_000_000_500_000_000;
+
+    fn check_materialization_metadata(
+        bytes: &[u8],
+        kind: MaterializationManifestKind,
+        market: Market,
+        window: Option<(u64, u64)>,
+    ) -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("manifest.json");
+        fs::write(&path, bytes)?;
+        verify_materialization_manifest_metadata(
+            &path,
+            &hex::encode(Sha256::digest(bytes)),
+            kind,
+            market,
+            window,
+        )
+    }
+
+    #[test]
+    fn materialization_metadata_accepts_compact_and_pretty_root_fields() {
+        let raw = json!({
+            "market": "usdm", "start_received_at_ns": RECEIVED_NS,
+            "end_received_at_ns": RECEIVED_NS + 100,
+            "nested": {"market": "spot", "start_received_at_ns": 0},
+            "note": "\"market\":\"spot\" is only text",
+        });
+        for bytes in [
+            serde_json::to_vec(&raw).unwrap(),
+            serde_json::to_vec_pretty(&raw).unwrap(),
+        ] {
+            check_materialization_metadata(
+                &bytes,
+                MaterializationManifestKind::Raw,
+                Market::Usdm,
+                Some((RECEIVED_NS, RECEIVED_NS + 100)),
+            )
+            .unwrap();
+        }
+        for (market, venue) in [
+            (Market::Spot, "binance_spot"),
+            (Market::Usdm, "binance_usdm"),
+        ] {
+            let reference = json!({"venue": venue, "nested": {"venue": "unrelated"}});
+            for bytes in [
+                serde_json::to_vec(&reference).unwrap(),
+                serde_json::to_vec_pretty(&reference).unwrap(),
+            ] {
+                check_materialization_metadata(
+                    &bytes,
+                    MaterializationManifestKind::Reference,
+                    market,
+                    None,
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn materialization_metadata_preserves_exact_nanosecond_window_bounds() {
+        let bytes = serde_json::to_vec(&json!({
+            "market": "usdm", "start_received_at_ns": RECEIVED_NS,
+            "end_received_at_ns": RECEIVED_NS + 100,
+        }))
+        .unwrap();
+        for window in [
+            (RECEIVED_NS + 1, RECEIVED_NS + 100),
+            (RECEIVED_NS, RECEIVED_NS + 99),
+            (RECEIVED_NS + 100, RECEIVED_NS),
+        ] {
+            assert!(check_materialization_metadata(
+                &bytes,
+                MaterializationManifestKind::Raw,
+                Market::Usdm,
+                Some(window)
+            )
+            .is_err());
+        }
+        assert!(check_materialization_metadata(
+            &bytes,
+            MaterializationManifestKind::Raw,
+            Market::Spot,
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn materialization_metadata_rejects_ambiguous_or_non_integer_raw_fields() {
+        for bytes in [
+            r#"{"market":"usdm","market":"usdm","start_received_at_ns":1,"end_received_at_ns":2}"#,
+            r#"{"market":"usdm","start_received_at_ns":1,"start_received_at_ns":1,"end_received_at_ns":2}"#,
+            r#"{"market":"usdm","start_received_at_ns":1,"end_received_at_ns":2,"end_received_at_ns":2}"#,
+            r#"{"market":"usdm","start_received_at_ns":"1","end_received_at_ns":2}"#,
+            r#"{"market":"usdm","start_received_at_ns":1.0,"end_received_at_ns":2}"#,
+            r#"{"market":"usdm","start_received_at_ns":null,"end_received_at_ns":2}"#,
+            r#"{"market":"usdm","start_received_at_ns":-1,"end_received_at_ns":2}"#,
+            r#"{"market":"usdm","start_received_at_ns":1,"end_received_at_ns":18446744073709551616}"#,
+            r#"{"market":"usdm","nested":{"start_received_at_ns":1},"end_received_at_ns":2}"#,
+            r#"{"nested":{"market":"usdm"},"start_received_at_ns":1,"end_received_at_ns":2}"#,
+            r#"{"market":"usdm","start_received_at_ns":1,"end_received_at_ns":2} trailing"#,
+        ] {
+            assert!(
+                check_materialization_metadata(
+                    bytes.as_bytes(),
+                    MaterializationManifestKind::Raw,
+                    Market::Usdm,
+                    Some((1, 2))
+                )
+                .is_err(),
+                "accepted {bytes}"
+            );
+        }
+    }
+
+    #[test]
+    fn materialization_metadata_rejects_wrong_or_duplicate_reference_venue() {
+        for bytes in [
+            r#"{"venue":"binance_spot"}"#,
+            r#"{"venue":"binance_usdm","venue":"binance_usdm"}"#,
+            r#"{"nested":{"venue":"binance_usdm"}}"#,
+            r#"{"venue":1}"#,
+        ] {
+            assert!(check_materialization_metadata(
+                bytes.as_bytes(),
+                MaterializationManifestKind::Reference,
+                Market::Usdm,
+                None
+            )
+            .is_err());
+        }
+        assert!(check_materialization_metadata(
+            br#"{"venue":"binance_usdm"}"#,
+            MaterializationManifestKind::Reference,
+            Market::Usdm,
+            Some((1, 2))
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn materialization_metadata_binds_parsed_bytes_to_inventory_hash() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest = directory.path().join("manifest.json");
+        let original = br#"{"market":"usdm"}"#;
+        fs::write(&manifest, original).unwrap();
+        let expected = hex::encode(Sha256::digest(original));
+        verify_materialization_manifest_metadata(
+            &manifest,
+            &expected,
+            MaterializationManifestKind::Raw,
+            Market::Usdm,
+            None,
+        )
+        .unwrap();
+        fs::write(&manifest, b"{\"market\": \"usdm\"}").unwrap();
+        let error = verify_materialization_manifest_metadata(
+            &manifest,
+            &expected,
+            MaterializationManifestKind::Raw,
+            Market::Usdm,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("SHA256 differs"));
+    }
 
     fn spot_reference_batch(received_at_ns: u64) -> SpotReferenceBatch {
         let source_time_ms = received_at_ns / 1_000_000 - 1;

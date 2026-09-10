@@ -115,6 +115,7 @@ enum DataCommand {
     Acquire(AcquireDataArgs),
     ImportFeatures(ImportFeatureDataArgs),
     FreezeInventory(FreezeInventoryArgs),
+    VerifyMaterializationManifest(VerifyMaterializationManifestArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -870,6 +871,29 @@ pub struct FeedbackLogArgs {
 }
 
 #[derive(Debug, Clone, Args)]
+pub struct VerifyMaterializationManifestArgs {
+    #[arg(long)]
+    pub manifest: PathBuf,
+    /// SHA-256 from the frozen inventory, checked against the parsed bytes.
+    #[arg(long)]
+    pub manifest_sha256: String,
+    #[arg(long, value_enum)]
+    pub kind: MaterializationManifestKindArg,
+    #[arg(long)]
+    pub market: String,
+    #[arg(long, requires = "end_received_at_ns")]
+    pub start_received_at_ns: Option<u64>,
+    #[arg(long, requires = "start_received_at_ns")]
+    pub end_received_at_ns: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum MaterializationManifestKindArg {
+    Raw,
+    Reference,
+}
+
+#[derive(Debug, Clone, Args)]
 pub struct FreezeInventoryArgs {
     /// Read-only root of sealed raw collector triplets.
     #[arg(long)]
@@ -1099,6 +1123,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 tokio::task::spawn_blocking(move || data_mission::freeze_research_inventory(args))
                     .await
                     .context("inventory freezer worker failed")?
+            }
+            DataCommand::VerifyMaterializationManifest(args) => {
+                tokio::task::spawn_blocking(move || {
+                    data_mission::verify_materialization_manifest(args)
+                })
+                .await
+                .context("materialization manifest verifier worker failed")?
             }
             DataCommand::Acquire(args) => {
                 let mut store = AlphaStore::open(&args.db)?;
