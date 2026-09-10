@@ -47,7 +47,6 @@ pub struct PnlSnapshot {
 
 pub fn replay_fills(fills: &[ResearchFill]) -> PnlSnapshot {
     let mut portfolio = Portfolio::new();
-    let mut total_fees = Decimal::ZERO;
     for fill in fills {
         let order_id = OrderId(fill.order_id.clone());
         let symbol = Symbol::new(&fill.token_id);
@@ -60,7 +59,6 @@ pub fn replay_fills(fills: &[ResearchFill]) -> PnlSnapshot {
             fill_id: fill.fill_id.clone(),
         });
         if fill.fee > Decimal::ZERO {
-            total_fees += fill.fee;
             portfolio.on_execution_event(&ExecutionEvent::FeeCharged {
                 order_id,
                 amount: fill.fee,
@@ -70,6 +68,7 @@ pub fn replay_fills(fills: &[ResearchFill]) -> PnlSnapshot {
         }
     }
     let view = portfolio.reader().load();
+    let total_fees = portfolio.export_state().total_fees;
     PnlSnapshot {
         realized_pnl: view.realized_pnl,
         unrealized_pnl: view.unrealized_pnl,
@@ -112,6 +111,36 @@ mod tests {
         let pnl = replay_fills(&fills);
         assert!(pnl.realized_pnl > dec!(0));
         assert_eq!(pnl.total_fees, dec!(0.10));
+    }
+
+    #[test]
+    fn duplicate_fill_id_uses_canonical_fee_and_pnl_once() {
+        let first = ResearchFill {
+            fill_id: "same-fill".to_string(),
+            order_id: "order-1".to_string(),
+            token_id: "yes-token".to_string(),
+            side: ResearchTradeSide::Buy.into(),
+            quantity: dec!(1),
+            price: dec!(0.40),
+            fee: dec!(0.05),
+            timestamp: Utc::now(),
+        };
+
+        let pnl = replay_fills(&[first.clone(), first]);
+
+        assert_eq!(pnl.total_fees, dec!(0.05));
+        assert_eq!(pnl.realized_pnl, dec!(-0.05));
+    }
+
+    #[test]
+    fn negative_fee_is_not_counted_or_applied() {
+        let mut fill = sample_fill("negative-fee", ResearchTradeSide::Buy, dec!(1), dec!(0.40));
+        fill.fee = dec!(-0.05);
+
+        let pnl = replay_fills(&[fill]);
+
+        assert_eq!(pnl.total_fees, dec!(0));
+        assert_eq!(pnl.realized_pnl, dec!(0));
     }
 
     #[test]

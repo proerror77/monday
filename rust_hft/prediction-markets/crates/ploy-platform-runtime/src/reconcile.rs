@@ -29,6 +29,7 @@ pub async fn reconcile_live_fills_with_stream(
     deployments: &[DeploymentRecord],
     trading: &mut BTreeMap<String, TradingRuntime>,
 ) -> io::Result<ReconcileStatus> {
+    ensure_reconciliation_ready(deployments, trading)?;
     let mut order_deployments = HashMap::new();
     let mut venue_to_local = HashMap::new();
     let terminal_cutoff =
@@ -101,38 +102,83 @@ pub async fn reconcile_live_fills_with_stream(
 
     validate_local_venue_identity_collisions(&order_deployments, &venue_to_local)?;
 
-    if order_deployments.is_empty() {
-        return Ok(ReconcileStatus::Noop);
+    let mut recorded = 0;
+    let deadline = Instant::now() + std::time::Duration::from_millis(MAX_STREAM_DRAIN_MS);
+    let mut observed = 0;
+    while observed < MAX_STREAM_EVENTS_PER_RECONCILE && Instant::now() < deadline {
+        let Some(stream) = stream_slot.as_mut() else {
+            break;
+        };
+        match timeout(Duration::from_millis(1), stream.next()).await {
+            Ok(Some(Ok(event))) => {
+                observed += 1;
+                match &event {
+                    ExecutionEvent::ExecutionStreamBarrier { stream_id, .. }
+                    | ExecutionEvent::ExecutionStreamSynchronized { stream_id, .. }
+                        if *stream_id == 0 =>
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "execution stream generation must be nonzero",
+                        ));
+                    }
+                    ExecutionEvent::ExecutionStreamSynchronized { stream_id, .. } => {
+                        // The adapter rejects acknowledgements for superseded generations.
+                        // Every preceding owned event has reached the canonical ledger before
+                        // this marker, including across bounded reconciliation batches.
+                        ensure_reconciliation_ready(deployments, trading)?;
+                        client.acknowledge_execution_stream_applied(*stream_id);
+                        continue;
+                    }
+                    ExecutionEvent::ExecutionStreamBarrier { .. } => continue,
+                    ExecutionEvent::ReconciliationRequired { reason, .. } => {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, reason.clone()));
+                    }
+                    ExecutionEvent::ConnectionStatus {
+                        connected: false, ..
+                    } => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "execution stream reported a disconnected transport",
+                        ));
+                    }
+                    _ => {}
+                }
+                let Some(venue_order_id) = execution_event_order_id(&event) else {
+                    continue;
+                };
+                let Some((local_id, deployment_id)) = venue_to_local.get(&venue_order_id).cloned()
+                else {
+                    continue;
+                };
+                if let Some(runtime) = trading.get_mut(&deployment_id) {
+                    if runtime.apply_reconciliation_event(&local_id, Some(&venue_order_id), &event)
+                    {
+                        recorded += 1;
+                    }
+                    ensure_runtime_reconciliation_ready(&deployment_id, runtime)?;
+                }
+            }
+            Ok(Some(Err(error))) => {
+                *stream_slot = None;
+                return Err(execution_io_error(error));
+            }
+            Ok(None) => {
+                *stream_slot = None;
+                if !client.execution_stream_may_complete() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "live execution stream ended before recovery",
+                    ));
+                }
+                break;
+            }
+            Err(_) => break,
+        }
     }
 
-    let mut recorded = 0;
-    if let Some(stream) = stream_slot.as_mut() {
-        let deadline = Instant::now() + std::time::Duration::from_millis(MAX_STREAM_DRAIN_MS);
-        while recorded < MAX_STREAM_EVENTS_PER_RECONCILE && Instant::now() < deadline {
-            match timeout(Duration::from_millis(1), stream.next()).await {
-                Ok(Some(Ok(event))) => {
-                    let Some(venue_order_id) = execution_event_order_id(&event) else {
-                        continue;
-                    };
-                    let Some((local_id, deployment_id)) =
-                        venue_to_local.get(&venue_order_id).cloned()
-                    else {
-                        continue;
-                    };
-                    if let Some(runtime) = trading.get_mut(&deployment_id) {
-                        if runtime.apply_reconciliation_event(
-                            &local_id,
-                            Some(&venue_order_id),
-                            &event,
-                        ) {
-                            recorded += 1;
-                        }
-                    }
-                }
-                Ok(Some(Err(error))) => return Err(execution_io_error(error)),
-                Ok(None) | Err(_) => break,
-            }
-        }
+    if order_deployments.is_empty() {
+        return Ok(ReconcileStatus::Noop);
     }
 
     // REST snapshots are supplementary evidence. Events have already been
@@ -193,6 +239,7 @@ pub async fn reconcile_live_fills_with_stream(
         if runtime.record_fill(fill) {
             recorded += 1;
         }
+        ensure_runtime_reconciliation_ready(&deployment_id, runtime)?;
     }
 
     // Reconcile authoritative order observations after fills so a confirmed
@@ -212,10 +259,38 @@ pub async fn reconcile_live_fills_with_stream(
         };
         if let Some(runtime) = trading.get_mut(&deployment_id) {
             runtime.acknowledge_order(&local_id, open_order.order_id.0);
+            ensure_runtime_reconciliation_ready(&deployment_id, runtime)?;
         }
     }
 
     Ok(ReconcileStatus::Applied(recorded))
+}
+
+fn ensure_runtime_reconciliation_ready(
+    deployment_id: &str,
+    runtime: &TradingRuntime,
+) -> io::Result<()> {
+    if runtime.reconciliation_required() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("canonical ledger for deployment {deployment_id} requires reconciliation"),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_reconciliation_ready(
+    deployments: &[DeploymentRecord],
+    trading: &BTreeMap<String, TradingRuntime>,
+) -> io::Result<()> {
+    for record in deployments {
+        if record.runtime_mode == DeploymentRuntimeMode::Live {
+            if let Some(runtime) = trading.get(&record.deployment_id) {
+                ensure_runtime_reconciliation_ready(&record.deployment_id, runtime)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn execution_event_order_id(event: &ExecutionEvent) -> Option<String> {
@@ -331,6 +406,7 @@ mod tests {
     use crate::test_support::StaticExecutionGateway;
     use crate::ReconcileStatus;
     use async_trait::async_trait;
+    use futures::StreamExt;
     use hft_core::{HftError, OrderId};
     use ploy_operator_contracts::{DeploymentState, DesiredState, ObservedState};
     use ploy_platform::DeploymentRecord;
@@ -340,13 +416,15 @@ mod tests {
     use ports::{ExecutionClient, ExecutionEvent};
     use rust_decimal_macros::dec;
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, Default)]
     struct DelayedTerminalGateway {
         stream_calls: Arc<AtomicUsize>,
         rest_fail: Arc<AtomicBool>,
+        acknowledged: Arc<AtomicU64>,
+        stream_may_complete: bool,
     }
 
     #[async_trait]
@@ -364,8 +442,16 @@ mod tests {
             _order_id: &OrderId,
             _new_quantity: Option<hft_core::Quantity>,
             _new_price: Option<hft_core::Price>,
-        ) -> Result<(), HftError> {
-            Ok(())
+        ) -> Result<OrderId, HftError> {
+            Ok(_order_id.clone())
+        }
+
+        fn execution_stream_may_complete(&self) -> bool {
+            self.stream_may_complete
+        }
+
+        fn acknowledge_execution_stream_applied(&self, stream_id: u64) {
+            self.acknowledged.store(stream_id, Ordering::SeqCst);
         }
 
         async fn execution_stream(&self) -> Result<ports::BoxStream<ExecutionEvent>, HftError> {
@@ -438,8 +524,12 @@ mod tests {
             _order_id: &OrderId,
             _new_quantity: Option<hft_core::Quantity>,
             _new_price: Option<hft_core::Price>,
-        ) -> Result<(), HftError> {
-            Ok(())
+        ) -> Result<OrderId, HftError> {
+            Ok(_order_id.clone())
+        }
+
+        fn execution_stream_may_complete(&self) -> bool {
+            true
         }
 
         async fn execution_stream(&self) -> Result<ports::BoxStream<ExecutionEvent>, HftError> {
@@ -502,6 +592,160 @@ mod tests {
                 connected: true,
                 latency_ms: Some(0.0),
                 last_heartbeat: 0,
+            }
+        }
+    }
+
+    fn acknowledged_live_ledger() -> (DeploymentRecord, BTreeMap<String, TradingRuntime>) {
+        let deployment = DeploymentRecord {
+            deployment_id: "example.live".to_string(),
+            bundle_id: "example".to_string(),
+            runtime_mode: ploy_operator_contracts::DeploymentRuntimeMode::Live,
+            account_id: "acct-live".to_string(),
+            max_gross_exposure: Some(dec!(5)),
+            deployment_state: DeploymentState::Enabled,
+            desired_state: DesiredState::Running,
+            observed_state: ObservedState::Running,
+        };
+        let mut runtime = TradingRuntime::default();
+        runtime
+            .submit_intent(
+                TradingIntent {
+                    intent_id: "intent-reconcile".to_string(),
+                    deployment_id: deployment.deployment_id.clone(),
+                    market_id: "market-1".to_string(),
+                    token_id: "token-1".to_string(),
+                    side: TradeSide::Buy,
+                    quantity: dec!(1),
+                    limit_price: Some(dec!(0.5)),
+                    purpose: IntentPurpose::Entry,
+                    created_at: chrono::Utc::now(),
+                },
+                "order-reconcile",
+                None,
+            )
+            .unwrap();
+        runtime.acknowledge_order("order-reconcile", "venue-reconcile");
+        let trading = BTreeMap::from([(deployment.deployment_id.clone(), runtime)]);
+        (deployment, trading)
+    }
+
+    #[tokio::test]
+    async fn empty_ledger_consumes_sync_markers_across_bounded_batches() {
+        let mut gateway = DelayedTerminalGateway::default();
+        let mut events = vec![ExecutionEvent::ExecutionStreamBarrier {
+            stream_id: 42,
+            timestamp: 1,
+        }];
+        events.extend((1..super::MAX_STREAM_EVENTS_PER_RECONCILE).map(|_| {
+            ExecutionEvent::ConnectionStatus {
+                connected: true,
+                timestamp: 1,
+            }
+        }));
+        events.push(ExecutionEvent::ExecutionStreamSynchronized {
+            stream_id: 42,
+            connected: true,
+            timestamp: 2,
+        });
+        let mut stream: Option<ports::BoxStream<ExecutionEvent>> = Some(Box::pin(
+            futures::stream::iter(events.into_iter().map(Ok)).chain(futures::stream::pending()),
+        ));
+        let mut trading = BTreeMap::new();
+        assert_eq!(
+            reconcile_live_fills_with_stream(&mut gateway, &mut stream, &[], &mut trading)
+                .await
+                .unwrap(),
+            ReconcileStatus::Noop,
+        );
+        assert_eq!(gateway.acknowledged.load(Ordering::SeqCst), 0);
+        for _ in 0..4 {
+            reconcile_live_fills_with_stream(&mut gateway, &mut stream, &[], &mut trading)
+                .await
+                .unwrap();
+            if gateway.acknowledged.load(Ordering::SeqCst) == 42 {
+                break;
+            }
+        }
+        assert_eq!(gateway.acknowledged.load(Ordering::SeqCst), 42);
+        assert!(stream.is_some());
+    }
+
+    #[tokio::test]
+    async fn live_stream_end_clears_the_slot_and_reports_failure() {
+        let mut gateway = DelayedTerminalGateway::default();
+        let mut stream: Option<ports::BoxStream<ExecutionEvent>> =
+            Some(Box::pin(futures::stream::empty()));
+        let error =
+            reconcile_live_fills_with_stream(&mut gateway, &mut stream, &[], &mut BTreeMap::new())
+                .await
+                .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+        assert!(stream.is_none());
+    }
+
+    #[tokio::test]
+    async fn rejected_stream_event_latches_failure_before_sync_acknowledgement() {
+        let (deployment, mut trading) = acknowledged_live_ledger();
+        let mut gateway = DelayedTerminalGateway::default();
+        let events = vec![
+            ExecutionEvent::Fill {
+                order_id: OrderId("venue-reconcile".to_string()),
+                price: hft_core::Price(dec!(0.5)),
+                quantity: hft_core::Quantity(dec!(2)),
+                timestamp: chrono::Utc::now().timestamp_micros() as u64,
+                fill_id: "excess-fill".to_string(),
+            },
+            ExecutionEvent::ExecutionStreamSynchronized {
+                stream_id: 42,
+                connected: true,
+                timestamp: 2,
+            },
+        ];
+        let mut stream: Option<ports::BoxStream<ExecutionEvent>> = Some(Box::pin(
+            futures::stream::iter(events.into_iter().map(Ok)).chain(futures::stream::pending()),
+        ));
+        for _ in 0..2 {
+            let error = reconcile_live_fills_with_stream(
+                &mut gateway,
+                &mut stream,
+                std::slice::from_ref(&deployment),
+                &mut trading,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("requires reconciliation"));
+            assert!(trading[&deployment.deployment_id].reconciliation_required());
+            assert_eq!(gateway.acknowledged.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_rest_fill_is_not_reported_as_a_harmless_duplicate() {
+        for (quantity, fee) in [(dec!(2), dec!(0)), (dec!(1), dec!(-0.01))] {
+            let (deployment, mut trading) = acknowledged_live_ledger();
+            let fill = FillRecord {
+                fill_id: "invalid-rest-fill".to_string(),
+                order_id: "order-reconcile".to_string(),
+                token_id: "token-1".to_string(),
+                side: TradeSide::Buy,
+                quantity,
+                price: dec!(0.5),
+                fee,
+                timestamp: chrono::Utc::now(),
+            };
+            let mut gateway =
+                StaticExecutionGateway::acknowledged("unused").with_reconciled_fills(vec![fill]);
+            for _ in 0..2 {
+                let error = reconcile_live_fills(
+                    &mut gateway,
+                    std::slice::from_ref(&deployment),
+                    &mut trading,
+                )
+                .await
+                .unwrap_err();
+                assert!(error.to_string().contains("requires reconciliation"));
+                assert!(trading[&deployment.deployment_id].reconciliation_required());
             }
         }
     }
@@ -967,6 +1211,8 @@ mod tests {
         let mut gateway = DelayedTerminalGateway {
             stream_calls: Arc::clone(&stream_calls),
             rest_fail: Arc::clone(&rest_fail),
+            stream_may_complete: true,
+            ..Default::default()
         };
         let mut stream = Some(gateway.execution_stream().await.expect("attach stream"));
         let mut trading = BTreeMap::from([(deployment.deployment_id.clone(), runtime)]);

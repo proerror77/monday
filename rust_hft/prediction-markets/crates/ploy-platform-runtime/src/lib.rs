@@ -24,7 +24,7 @@ pub(crate) mod test_support {
     pub(crate) struct StaticExecutionGateway {
         submit_result: Result<String, HftError>,
         cancel_result: Result<(), HftError>,
-        replace_result: Result<(), HftError>,
+        replace_result: Result<OrderId, HftError>,
         fills: Vec<AccountFill>,
         events: Vec<ExecutionEvent>,
     }
@@ -33,9 +33,9 @@ pub(crate) mod test_support {
         pub(crate) fn acknowledged(venue_order_id: impl Into<String>) -> Self {
             let venue_order_id = venue_order_id.into();
             Self {
-                submit_result: Ok(venue_order_id),
+                submit_result: Ok(venue_order_id.clone()),
                 cancel_result: Ok(()),
-                replace_result: Ok(()),
+                replace_result: Ok(OrderId(venue_order_id.clone())),
                 fills: Vec::new(),
                 events: Vec::new(),
             }
@@ -49,6 +49,11 @@ pub(crate) mod test_support {
                 fills: Vec::new(),
                 events: Vec::new(),
             }
+        }
+
+        pub(crate) fn with_replace_result(mut self, result: Result<OrderId, HftError>) -> Self {
+            self.replace_result = result;
+            self
         }
 
         pub(crate) fn with_cancel_result(mut self, result: Result<(), HftError>) -> Self {
@@ -97,7 +102,7 @@ pub(crate) mod test_support {
             _order_id: &OrderId,
             _new_quantity: Option<Quantity>,
             _new_price: Option<Price>,
-        ) -> Result<(), HftError> {
+        ) -> Result<OrderId, HftError> {
             self.replace_result.clone()
         }
 
@@ -110,6 +115,10 @@ pub(crate) mod test_support {
             Ok(Box::pin(futures::stream::iter(
                 self.events.clone().into_iter().map(Ok),
             )))
+        }
+
+        fn execution_stream_may_complete(&self) -> bool {
+            true
         }
 
         async fn list_open_orders(&self) -> Result<Vec<OpenOrder>, HftError> {

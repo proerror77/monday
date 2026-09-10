@@ -403,6 +403,58 @@ impl Portfolio {
         state
     }
 
+    /// Apply an authoritative cash readback without round-tripping a persisted
+    /// checkpoint through the caller. The next export recomputes the canonical
+    /// digest over the updated AccountView and all existing accounting state.
+    pub fn update_cash_balance(&mut self, cash_balance: Decimal) -> Result<(), String> {
+        self.view.cash_balance = cash_balance;
+        self.snapshot.store(Arc::new(self.view.clone()));
+        Ok(())
+    }
+
+    /// Publish a runtime-owned AccountView while preserving canonical OMS and
+    /// accounting state. Scope-bearing attestations and inventory are checked
+    /// before the view is swapped so a rejected readback leaves the portfolio
+    /// unchanged.
+    pub fn publish_account_readback(&mut self, account_view: AccountView) -> Result<(), String> {
+        self.validate_account_view_scope(&account_view)?;
+        self.view = account_view;
+        self.snapshot.store(Arc::new(self.view.clone()));
+        Ok(())
+    }
+
+    fn validate_account_view_scope(&self, account_view: &AccountView) -> Result<(), String> {
+        if let Some(existing) = self.view.account_id.as_ref() {
+            if account_view.account_id.as_ref() != Some(existing) {
+                return Err("account readback identity disagrees with Portfolio scope".to_string());
+            }
+        }
+        for (key, attestation) in &account_view.tokenized_securities_attestations {
+            let Some(account_id) = account_view.account_id.as_ref() else {
+                return Err("tokenized securities attestation has no account scope".to_string());
+            };
+            if &attestation.account_id != account_id
+                || key.venue != attestation.venue
+                || key.product_type != attestation.product_type
+                || key.symbol != attestation.symbol
+            {
+                return Err(
+                    "tokenized securities attestation disagrees with its AccountView key"
+                        .to_string(),
+                );
+            }
+        }
+        for (asset, inventory) in &account_view.asset_inventory {
+            if asset != &inventory.asset {
+                return Err("asset inventory key disagrees with its record asset".to_string());
+            }
+            inventory
+                .validate()
+                .map_err(|error| format!("invalid asset inventory readback: {error}"))?;
+        }
+        Ok(())
+    }
+
     /// Import portfolio state from persistent storage
     pub fn import_state(&mut self, state: PortfolioState) {
         info!(
@@ -486,6 +538,11 @@ fn validate_state(state: &PortfolioState) -> Result<(), String> {
             return Err("portfolio position key does not match position symbol".to_string());
         }
     }
+    for (asset, inventory) in &state.account_view.asset_inventory {
+        if asset != &inventory.asset {
+            return Err("asset inventory key does not match record asset".to_string());
+        }
+    }
     for order_id in state.processed_fill_ids.keys() {
         if !state.order_meta.contains_key(order_id) {
             return Err(format!(
@@ -520,6 +577,135 @@ fn validate_state(state: &PortfolioState) -> Result<(), String> {
 fn canonical_state_digest(state: &PortfolioState) -> String {
     let mut material = String::new();
     let view = &state.account_view;
+    append_optional_field(
+        &mut material,
+        "account-id",
+        view.account_id
+            .as_ref()
+            .map(|account_id| account_id.0.as_str()),
+    );
+    let mut attestations = view
+        .tokenized_securities_attestations
+        .iter()
+        .collect::<Vec<_>>();
+    attestations.sort_by_key(|(key, _)| {
+        (
+            key.venue.as_str(),
+            key.product_type.as_str(),
+            key.symbol.as_str().to_string(),
+        )
+    });
+    for (key, attestation) in attestations {
+        append_field(&mut material, "attestation-key-venue", key.venue.as_str());
+        append_field(
+            &mut material,
+            "attestation-key-product",
+            key.product_type.as_str(),
+        );
+        append_field(&mut material, "attestation-key-symbol", key.symbol.as_str());
+        append_field(
+            &mut material,
+            "attestation-account-id",
+            &attestation.account_id,
+        );
+        append_field(
+            &mut material,
+            "attestation-venue",
+            attestation.venue.as_str(),
+        );
+        append_field(
+            &mut material,
+            "attestation-product",
+            attestation.product_type.as_str(),
+        );
+        append_field(
+            &mut material,
+            "attestation-symbol",
+            attestation.symbol.as_str(),
+        );
+        append_field(&mut material, "attestation-source", &attestation.source_id);
+        append_field(
+            &mut material,
+            "attestation-observed-at",
+            attestation.observed_at,
+        );
+        append_optional_field(
+            &mut material,
+            "attestation-jurisdiction",
+            attestation.jurisdiction.as_deref(),
+        );
+        append_field(
+            &mut material,
+            "attestation-account-eligible",
+            attestation.account_eligible,
+        );
+        append_field(
+            &mut material,
+            "attestation-cap-crypto",
+            attestation.account_capability.can_trade_crypto_spot,
+        );
+        append_field(
+            &mut material,
+            "attestation-cap-tokenized",
+            attestation
+                .account_capability
+                .can_trade_tokenized_securities,
+        );
+        append_field(
+            &mut material,
+            "attestation-cap-equities",
+            attestation.account_capability.can_trade_brokerage_equities,
+        );
+        append_optional_field(
+            &mut material,
+            "attestation-cap-jurisdiction",
+            attestation.account_capability.jurisdiction.as_deref(),
+        );
+        append_optional_field(
+            &mut material,
+            "attestation-cap-kyc",
+            attestation.account_capability.kyc_level.as_deref(),
+        );
+        append_field(
+            &mut material,
+            "attestation-symbol-notional",
+            attestation.account_symbol_notional,
+        );
+        append_field(
+            &mut material,
+            "attestation-asset-class-notional",
+            attestation.account_asset_class_notional,
+        );
+        append_field(
+            &mut material,
+            "attestation-corporate-action",
+            attestation.corporate_action_active,
+        );
+        append_field(
+            &mut material,
+            "attestation-top-depth",
+            attestation.top_depth_usd,
+        );
+        append_field(
+            &mut material,
+            "attestation-spread-bps",
+            attestation.spread_bps,
+        );
+    }
+    let mut inventory = view.asset_inventory.iter().collect::<Vec<_>>();
+    inventory.sort_by_key(|(asset, _)| asset.as_str());
+    for (asset, record) in inventory {
+        append_field(&mut material, "inventory-key", asset);
+        append_field(&mut material, "inventory-asset", &record.asset);
+        append_field(&mut material, "inventory-available", record.available);
+        append_field(&mut material, "inventory-locked", record.locked);
+        append_field(&mut material, "inventory-total", record.total);
+        append_optional_field(
+            &mut material,
+            "inventory-usd-value",
+            record.usd_value.map(|value| value.to_string()).as_deref(),
+        );
+    }
     material.push_str(&format!(
         "cash={};realized={};unrealized={};fees={};hwm={};dd={};maxdd={};session={};",
         view.cash_balance,
@@ -572,6 +758,18 @@ fn canonical_state_digest(state: &PortfolioState) -> String {
     format!("sha256:{:x}", Sha256::digest(material.as_bytes()))
 }
 
+fn append_field<T: std::fmt::Display>(material: &mut String, label: &str, value: T) {
+    let value = value.to_string();
+    material.push_str(&format!("{label}:{}:{value};", value.len()));
+}
+
+fn append_optional_field(material: &mut String, label: &str, value: Option<&str>) {
+    match value {
+        Some(value) => append_field(material, label, format!("some:{value}")),
+        None => append_field(material, label, "none"),
+    }
+}
+
 fn append_namespaced_ids(
     material: &mut String,
     namespace: &str,
@@ -613,6 +811,14 @@ impl ports::PortfolioManager for Portfolio {
     fn update_market_prices(&mut self, prices: &HashMap<Symbol, Price>) {
         // 直接調用現有實現
         self.update_market_prices(prices);
+    }
+
+    fn update_cash_balance(&mut self, cash_balance: Decimal) -> Result<(), String> {
+        Portfolio::update_cash_balance(self, cash_balance)
+    }
+
+    fn publish_account_readback(&mut self, account_view: AccountView) -> Result<(), String> {
+        Portfolio::publish_account_readback(self, account_view)
     }
 
     fn export_state(&self) -> ports::PortfolioState {
@@ -694,7 +900,10 @@ impl ports::PortfolioManager for Portfolio {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hft_core::{OrderId, Price, Quantity};
+    use hft_core::{
+        AccountCapability, AccountId as CoreAccountId, InstrumentKey, OrderId, Price, ProductType,
+        Quantity, VenueId,
+    };
 
     fn fill(
         portfolio: &mut Portfolio,
@@ -1034,6 +1243,152 @@ mod tests {
         assert_eq!(
             reordered.canonical_state_digest, state.canonical_state_digest,
             "HashMap/HashSet insertion order must not change the canonical digest"
+        );
+    }
+
+    #[test]
+    fn canonical_digest_binds_account_scope_attestations_and_inventory() {
+        let account_id = CoreAccountId("binance-tokenized".to_string());
+        let symbol = Symbol::new("TSLABUSDT");
+        let key = InstrumentKey::tokenized_security_spot(
+            symbol.clone(),
+            VenueId::BINANCE_TOKENIZED_SECURITIES,
+        );
+        let attestation = ports::TokenizedSecuritiesRuntimeAttestation {
+            account_id: account_id.clone(),
+            venue: VenueId::BINANCE_TOKENIZED_SECURITIES,
+            product_type: ProductType::TokenizedSecuritySpot,
+            symbol,
+            source_id: "readback-1".to_string(),
+            observed_at: 100,
+            jurisdiction: Some("US".to_string()),
+            account_eligible: true,
+            account_capability: AccountCapability {
+                can_trade_crypto_spot: true,
+                can_trade_tokenized_securities: true,
+                can_trade_brokerage_equities: false,
+                jurisdiction: Some("US".to_string()),
+                kyc_level: Some("enhanced".to_string()),
+            },
+            account_symbol_notional: Decimal::from(10),
+            account_asset_class_notional: Decimal::from(20),
+            corporate_action_active: false,
+            top_depth_usd: Decimal::from(100),
+            spread_bps: Decimal::from(2),
+        };
+        let mut portfolio = Portfolio::new();
+        let mut state = portfolio.export_state();
+        state.account_view.account_id = Some(account_id);
+        state
+            .account_view
+            .tokenized_securities_attestations
+            .insert(key, attestation);
+        state.account_view.asset_inventory.insert(
+            "USDT".to_string(),
+            ports::AssetInventoryRecord {
+                asset: "USDT".to_string(),
+                available: Decimal::from(7),
+                locked: Decimal::from(3),
+                total: Decimal::from(10),
+                usd_value: Some(Decimal::from(10)),
+            },
+        );
+        state.account_view.asset_inventory.insert(
+            "USDC".to_string(),
+            ports::AssetInventoryRecord {
+                asset: "USDC".to_string(),
+                available: Decimal::from(4),
+                locked: Decimal::from(1),
+                total: Decimal::from(5),
+                usd_value: Some(Decimal::from(5)),
+            },
+        );
+        state.refresh_canonical_digest();
+        portfolio
+            .try_import_state(state.clone())
+            .expect("complete account readback restores");
+
+        let mut tampered_account = state.clone();
+        tampered_account.account_view.account_id = Some(CoreAccountId("other".to_string()));
+        assert!(portfolio.try_import_state(tampered_account).is_err());
+
+        let mut tampered_attestation = state.clone();
+        tampered_attestation
+            .account_view
+            .tokenized_securities_attestations
+            .values_mut()
+            .next()
+            .expect("attestation")
+            .source_id = "tampered".to_string();
+        assert!(portfolio.try_import_state(tampered_attestation).is_err());
+
+        let mut tampered_inventory_asset = state.clone();
+        tampered_inventory_asset
+            .account_view
+            .asset_inventory
+            .get_mut("USDT")
+            .expect("inventory")
+            .asset = "EUR".to_string();
+        assert!(portfolio
+            .try_import_state(tampered_inventory_asset)
+            .is_err());
+
+        let mut tampered_inventory = state.clone();
+        tampered_inventory
+            .account_view
+            .asset_inventory
+            .get_mut("USDT")
+            .expect("inventory")
+            .total = Decimal::from(11);
+        assert!(portfolio.try_import_state(tampered_inventory).is_err());
+
+        let mut reordered = state.clone();
+        reordered.account_view.asset_inventory.clear();
+        for asset in ["USDC", "USDT"] {
+            let record = state.account_view.asset_inventory[asset].clone();
+            reordered
+                .account_view
+                .asset_inventory
+                .insert(asset.to_string(), record);
+        }
+        reordered.refresh_canonical_digest();
+        assert_eq!(
+            reordered.canonical_state_digest, state.canonical_state_digest,
+            "asset inventory insertion order must not change the canonical digest"
+        );
+    }
+
+    #[test]
+    fn controlled_account_updates_refresh_digest_and_restore() {
+        let mut portfolio = Portfolio::with_cash_balance(Decimal::from(100));
+        portfolio
+            .update_cash_balance(Decimal::from(250))
+            .expect("controlled cash update");
+        let mut account_view = (*portfolio.reader().load()).clone();
+        account_view.account_id = Some(CoreAccountId("account-readback".to_string()));
+        portfolio
+            .publish_account_readback(account_view)
+            .expect("controlled account readback");
+        let before_rejected_scope = portfolio.export_state();
+        let mut rejected_scope = (*portfolio.reader().load()).clone();
+        rejected_scope.account_id = Some(CoreAccountId("other-account".to_string()));
+        assert!(portfolio.publish_account_readback(rejected_scope).is_err());
+        assert_eq!(
+            portfolio.export_state().canonical_state_digest,
+            before_rejected_scope.canonical_state_digest
+        );
+        let state = portfolio.export_state();
+        assert!(state.canonical_state_digest.is_some());
+
+        let mut restored = Portfolio::new();
+        restored
+            .try_import_state(state)
+            .expect("controlled update state restores");
+        let view = restored.reader().load();
+        assert_eq!(view.cash_balance, Decimal::from(250));
+        assert_eq!(
+            view.account_id,
+            Some(CoreAccountId("account-readback".to_string()))
         );
     }
 

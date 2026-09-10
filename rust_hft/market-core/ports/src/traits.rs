@@ -132,13 +132,17 @@ pub trait ExecutionClient: Send + Sync {
     /// 撤單
     async fn cancel_order(&mut self, order_id: &OrderId) -> HftResult<()>;
 
-    /// 修改訂單
+    /// 修改訂單並返回修改後目前有效的 venue order id。
+    ///
+    /// In-place amend implementations return the existing id. Cancel/resubmit
+    /// implementations must return the newly created venue id so callers can
+    /// update canonical order identity and preserve the previous id in history.
     async fn modify_order(
         &mut self,
         order_id: &OrderId,
         new_quantity: Option<Quantity>,
         new_price: Option<Price>,
-    ) -> HftResult<()>;
+    ) -> HftResult<OrderId>;
 
     /// 執行回報流 (填充、ACK、拒絕等)
     async fn execution_stream(&self) -> HftResult<BoxStream<ExecutionEvent>>;
@@ -1155,6 +1159,19 @@ pub trait PortfolioManager: Send + Sync {
 
     /// 更新市場價格並重新計算未實現盈虧
     fn update_market_prices(&mut self, prices: &std::collections::HashMap<Symbol, Price>);
+
+    /// Controlled account-cash update for canonical portfolio implementations.
+    /// Non-canonical implementations must fail closed rather than mutate through
+    /// export/edit/import with a stale state digest.
+    fn update_cash_balance(&mut self, _cash_balance: rust_decimal::Decimal) -> Result<(), String> {
+        Err("controlled account cash updates are unsupported".to_string())
+    }
+
+    /// Publish an authoritative account readback through the portfolio's digest-aware
+    /// update path. Non-canonical implementations remain fail-closed by default.
+    fn publish_account_readback(&mut self, _account_view: AccountView) -> Result<(), String> {
+        Err("controlled account readback updates are unsupported".to_string())
+    }
 
     /// 導出 Portfolio 狀態（供恢復/持久化使用）
     fn export_state(&self) -> PortfolioState;

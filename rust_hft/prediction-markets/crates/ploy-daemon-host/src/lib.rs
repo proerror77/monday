@@ -18,7 +18,7 @@ pub(crate) mod test_support {
     pub(crate) struct StaticExecutionGateway {
         submit_result: Result<String, HftError>,
         cancel_result: Result<(), HftError>,
-        replace_result: Result<(), HftError>,
+        replace_result: Result<OrderId, HftError>,
         fills: Vec<AccountFill>,
     }
 
@@ -28,7 +28,7 @@ pub(crate) mod test_support {
             Self {
                 submit_result: Ok(venue_order_id),
                 cancel_result: Ok(()),
-                replace_result: Ok(()),
+                replace_result: Ok(OrderId("venue-replaced".to_string())),
                 fills: Vec::new(),
             }
         }
@@ -61,7 +61,7 @@ pub(crate) mod test_support {
             self
         }
 
-        pub(crate) fn with_replace_result(mut self, result: Result<(), HftError>) -> Self {
+        pub(crate) fn with_replace_result(mut self, result: Result<OrderId, HftError>) -> Self {
             self.replace_result = result;
             self
         }
@@ -100,7 +100,7 @@ pub(crate) mod test_support {
             _order_id: &OrderId,
             _new_quantity: Option<hft_core::Quantity>,
             _new_price: Option<hft_core::Price>,
-        ) -> Result<(), HftError> {
+        ) -> Result<OrderId, HftError> {
             self.replace_result.clone()
         }
         async fn execution_stream(&self) -> Result<BoxStream<ExecutionEvent>, HftError> {

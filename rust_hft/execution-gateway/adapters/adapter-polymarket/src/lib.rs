@@ -782,6 +782,11 @@ enum SubmissionSuccessEvent {
     },
 }
 
+struct SubmittedOrder {
+    logical_id: OrderId,
+    venue_id: OrderId,
+}
+
 pub struct PolymarketExecutionClient {
     config: PolymarketExecutionConfig,
     signer: PrivateKeySigner,
@@ -1150,7 +1155,7 @@ impl PolymarketExecutionClient {
         logical_id: Option<&OrderId>,
         success_event: SubmissionSuccessEvent,
         reserved_event: &mut Option<mpsc::OwnedPermit<ExecutionEventBatch>>,
-    ) -> HftResult<OrderId> {
+    ) -> HftResult<SubmittedOrder> {
         let client = self.ensure_ready().map_err(submission_not_attempted)?;
         validate_live_envelope_fresh(envelope, "before preparation")?;
         let prepared = self
@@ -1269,11 +1274,14 @@ impl PolymarketExecutionClient {
             &mut tracking,
             envelope,
             logical_id.clone(),
-            venue_id,
+            venue_id.clone(),
             created_at,
         );
         event_permit.send(vec![event]);
-        Ok(logical_id)
+        Ok(SubmittedOrder {
+            logical_id,
+            venue_id: OrderId(venue_id),
+        })
     }
 
     async fn prepare_order(
@@ -3894,6 +3902,7 @@ impl ExecutionClient for PolymarketExecutionClient {
             &mut event_permit,
         )
         .await
+        .map(|submitted| submitted.logical_id)
     }
 
     async fn cancel_order(&mut self, order_id: &OrderId) -> HftResult<()> {
@@ -3935,7 +3944,7 @@ impl ExecutionClient for PolymarketExecutionClient {
         order_id: &OrderId,
         new_quantity: Option<Quantity>,
         new_price: Option<Price>,
-    ) -> HftResult<()> {
+    ) -> HftResult<OrderId> {
         if new_quantity.is_none() && new_price.is_none() {
             return Err(HftError::InvalidOrder(
                 "Polymarket replacement requires quantity or price".to_string(),
@@ -4095,7 +4104,7 @@ impl ExecutionClient for PolymarketExecutionClient {
             )
             .await
         {
-            Ok(_) => Ok(()),
+            Ok(submitted) => Ok(submitted.venue_id),
             Err(error) => {
                 if let Some(permit) = event_permit.take() {
                     self.commit_canceled_replacement(order_id, permit, None)

@@ -2758,7 +2758,7 @@ mod tests {
             _order_id: &hft_core::OrderId,
             _new_quantity: Option<hft_core::Quantity>,
             _new_price: Option<hft_core::Price>,
-        ) -> Result<(), hft_core::HftError> {
+        ) -> Result<hft_core::OrderId, hft_core::HftError> {
             unreachable!("replace is not used")
         }
         async fn execution_stream(
@@ -2821,7 +2821,7 @@ mod tests {
             _order_id: &hft_core::OrderId,
             _new_quantity: Option<hft_core::Quantity>,
             _new_price: Option<hft_core::Price>,
-        ) -> Result<(), hft_core::HftError> {
+        ) -> Result<hft_core::OrderId, hft_core::HftError> {
             unreachable!("replace is not used")
         }
         async fn execution_stream(
@@ -4508,7 +4508,9 @@ mod tests {
         };
 
         let gateway = StaticExecutionGateway::acknowledged("venue-live-http-replace-1")
-            .with_replace_result(Ok(()));
+            .with_replace_result(Ok(hft_core::OrderId(
+                "venue-live-http-replace-2".to_string(),
+            )));
         crate::runtime::seed_empty_live_ledgers(&config);
         let mut daemon =
             crate::runtime::PloyDaemon::boot_with_live_execution(&config, Box::new(gateway))
@@ -4562,12 +4564,16 @@ mod tests {
         .await;
         assert_eq!(replace_code, 200);
         assert!(replace_response.contains("\"revision\":1"));
-        assert!(replace_response.contains("\"venue_order_id\":\"venue-live-http-replace-1\""));
+        assert!(replace_response.contains("\"venue_order_id\":\"venue-live-http-replace-2\""));
 
         let trading_body =
             fs::read_to_string(runtime_root.join("trading-state.json")).expect("trading snapshot");
         let trading: serde_json::Value =
             serde_json::from_str(&trading_body).expect("snapshot json");
+        assert_eq!(
+            trading[0]["snapshot"]["orders"][0]["venue_order_id"],
+            "venue-live-http-replace-2"
+        );
         assert_eq!(
             trading[0]["snapshot"]["orders"][0]["venue_order_history"][0],
             "venue-live-http-replace-1"

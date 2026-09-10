@@ -238,11 +238,11 @@ mod tests {
         }
         async fn modify_order(
             &mut self,
-            _order_id: &hft_core::OrderId,
+            order_id: &hft_core::OrderId,
             _new_quantity: Option<hft_core::Quantity>,
             _new_price: Option<hft_core::Price>,
-        ) -> Result<(), hft_core::HftError> {
-            Ok(())
+        ) -> Result<hft_core::OrderId, hft_core::HftError> {
+            Ok(order_id.clone())
         }
         async fn execution_stream(
             &self,
@@ -300,11 +300,11 @@ mod tests {
         }
         async fn modify_order(
             &mut self,
-            _order_id: &hft_core::OrderId,
+            order_id: &hft_core::OrderId,
             _new_quantity: Option<hft_core::Quantity>,
             _new_price: Option<hft_core::Price>,
-        ) -> Result<(), hft_core::HftError> {
-            Ok(())
+        ) -> Result<hft_core::OrderId, hft_core::HftError> {
+            Ok(order_id.clone())
         }
         async fn execution_stream(
             &self,

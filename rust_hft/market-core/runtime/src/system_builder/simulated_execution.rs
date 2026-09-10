@@ -411,7 +411,7 @@ impl ExecutionClient for SimulatedExecutionClient {
         id: &OrderId,
         quantity: Option<Quantity>,
         price: Option<Price>,
-    ) -> HftResult<()> {
+    ) -> HftResult<OrderId> {
         let mut state = self.state.lock().await;
         let pending = state
             .orders
@@ -441,7 +441,7 @@ impl ExecutionClient for SimulatedExecutionClient {
             new_price: price,
             timestamp: pending.order.updated_at,
         });
-        Ok(())
+        Ok(id.clone())
     }
 
     async fn execution_stream(&self) -> HftResult<BoxStream<ExecutionEvent>> {

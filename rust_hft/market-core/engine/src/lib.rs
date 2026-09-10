@@ -814,13 +814,34 @@ impl Engine {
 
     /// Publish an externally read-back account view through the engine's canonical snapshot.
     /// The caller must validate the account scope and evidence before invoking this writer.
-    pub(crate) fn publish_account_readback(&mut self, account_view: AccountView) {
+    pub(crate) fn publish_account_readback(&mut self, account_view: AccountView) -> HftResult<()> {
         if let Some(portfolio_manager) = &mut self.portfolio_manager {
-            let mut state = portfolio_manager.export_state();
-            state.account_view = account_view.clone();
-            portfolio_manager.import_state(state);
+            portfolio_manager
+                .publish_account_readback(account_view.clone())
+                .map_err(HftError::Execution)?;
+        } else {
+            return Err(HftError::Execution(
+                "portfolio manager unavailable for account readback".to_string(),
+            ));
         }
         self.account_snapshots.store(Arc::new(account_view));
+        Ok(())
+    }
+
+    /// Update only the authoritative cash balance through the PortfolioManager
+    /// boundary. This keeps canonical digest ownership inside Portfolio.
+    pub fn update_cash_balance(&mut self, cash_balance: Decimal) -> HftResult<()> {
+        let Some(portfolio_manager) = &mut self.portfolio_manager else {
+            return Err(HftError::Execution(
+                "portfolio manager unavailable for cash readback".to_string(),
+            ));
+        };
+        portfolio_manager
+            .update_cash_balance(cash_balance)
+            .map_err(HftError::Execution)?;
+        self.account_snapshots
+            .store(portfolio_manager.reader().load());
+        Ok(())
     }
 
     /// 獲取所有階段的延遲統計數據

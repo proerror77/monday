@@ -126,7 +126,7 @@ pub async fn replace_order(
                     format!("order `{order_id}` has no live venue order to replace"),
                 )
             })?;
-            client
+            let new_venue_order_id = client
                 .modify_order(
                     &hft_core::OrderId(venue_order_id.clone()),
                     Some(hft_core::Quantity(request.quantity)),
@@ -142,7 +142,7 @@ pub async fn replace_order(
                     order_id,
                     request.quantity,
                     request.limit_price,
-                    venue_order_id,
+                    new_venue_order_id.0,
                 )
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "order not found"))?;
             Ok(build_order_control_response(
@@ -211,12 +211,12 @@ mod tests {
 
         async fn modify_order(
             &mut self,
-            _order_id: &hft_core::OrderId,
+            order_id: &hft_core::OrderId,
             _new_quantity: Option<hft_core::Quantity>,
             _new_price: Option<hft_core::Price>,
-        ) -> Result<(), hft_core::HftError> {
+        ) -> Result<hft_core::OrderId, hft_core::HftError> {
             self.replacements.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            Ok(order_id.clone())
         }
 
         async fn execution_stream(
@@ -302,6 +302,38 @@ mod tests {
         .await
         .expect("cancel");
         assert_eq!(response.state, "canceled");
+    }
+
+    #[tokio::test]
+    async fn replace_live_persists_new_venue_identity_and_history_across_restore() {
+        let mut runtime = seeded_runtime();
+        let mut gateway = StaticExecutionGateway::acknowledged("venue-1")
+            .with_replace_result(Ok(hft_core::OrderId("venue-2".to_string())));
+
+        let response = replace_order(
+            &mut runtime,
+            &mut gateway,
+            &live_deployment(),
+            "example.live",
+            "order-1",
+            OrderReplaceRequest {
+                quantity: dec!(2),
+                limit_price: Some(dec!(0.47)),
+            },
+            dec!(2),
+        )
+        .await
+        .expect("replace persists the venue identity returned by the client");
+
+        assert_eq!(response.venue_order_id.as_deref(), Some("venue-2"));
+        assert_eq!(response.venue_order_history, vec!["venue-1"]);
+
+        let restored =
+            TradingRuntime::restore(runtime.snapshot(&std::collections::BTreeMap::new()))
+                .expect("canonical runtime restore");
+        let restored_order = restored.order("order-1").expect("restored order");
+        assert_eq!(restored_order.venue_order_id.as_deref(), Some("venue-2"));
+        assert_eq!(restored_order.venue_order_history, vec!["venue-1"]);
     }
 
     #[tokio::test]

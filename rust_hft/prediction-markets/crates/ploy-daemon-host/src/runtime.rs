@@ -1114,11 +1114,6 @@ impl PloyDaemon {
             }
         }
 
-        if let Err(error) = self.probe_live_venue().await {
-            self.mark_live_runtime_degraded(io::Error::new(error.kind(), error.to_string()));
-            return Err(error);
-        }
-
         if self.execution_stream.is_none() && !self.execution_stream_attempted {
             self.execution_stream_attempted = true;
             let client_ref = Arc::clone(&self.live_execution);
@@ -1159,13 +1154,20 @@ impl PloyDaemon {
         let result = match result {
             Ok(result) => result,
             Err(error) => {
-                self.mark_live_runtime_degraded(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    error.to_string(),
-                ));
+                if self.execution_stream.is_none() {
+                    self.execution_stream_attempted = false;
+                }
+                self.mark_live_runtime_degraded(io::Error::new(error.kind(), error.to_string()));
                 return Err(error);
             }
         };
+
+        // Attaching a canonical execution stream deliberately closes readiness until its
+        // ordered synchronization marker is applied. Drain it before probing that readiness.
+        if let Err(error) = self.probe_live_venue().await {
+            self.mark_live_runtime_degraded(io::Error::new(error.kind(), error.to_string()));
+            return Err(error);
+        }
 
         if matches!(result, ReconcileStatus::Noop) {
             self.live_reconcile_failures = 0;
@@ -1590,6 +1592,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn daemon_reattaches_ended_stream_and_applies_pending_sync_before_health_probe() {
+        let root = temp_dir("execution-stream-recovery");
+        let config = PlatformConfig {
+            registry_file: root.join("deployments.json"),
+            runtime_root: root.join("runtime"),
+            status_file: root.join("status.json"),
+            deployment_status_file: root.join("deployment-status.json"),
+            trading_state_file: root.join("trading-state.json"),
+            ..PlatformConfig::default()
+        };
+        let recovery = Arc::new(StreamRecoveryFixture::default());
+        let gateway = CountingAckGateway {
+            submits: Arc::new(AtomicUsize::new(0)),
+            stream_recovery: Some(Arc::clone(&recovery)),
+        };
+        let mut daemon = PloyDaemon::boot_with_live_execution(&config, Box::new(gateway)).unwrap();
+        let error = daemon.reconcile_live_fills().await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ConnectionAborted);
+        assert!(daemon.execution_stream.is_none());
+        assert!(!daemon.execution_stream_attempted);
+        assert_eq!(recovery.attachments.load(Ordering::SeqCst), 1);
+
+        daemon.next_live_reconcile_at = None;
+        assert!(daemon.reconcile_live_fills().await.is_err());
+        assert!(daemon.execution_stream.is_some());
+        assert!(daemon.execution_stream_attempted);
+        assert_eq!(recovery.attachments.load(Ordering::SeqCst), 2);
+        assert_eq!(recovery.acknowledged.load(Ordering::SeqCst), 0);
+
+        let mut final_result = Err(io::Error::other("synchronization not reached"));
+        for _ in 0..8 {
+            daemon.next_live_reconcile_at = None;
+            final_result = daemon.reconcile_live_fills().await;
+            if final_result.is_ok() {
+                break;
+            }
+        }
+        assert_eq!(final_result.unwrap(), ReconcileStatus::Noop);
+        assert_eq!(recovery.acknowledged.load(Ordering::SeqCst), 42);
+        assert_eq!(recovery.attachments.load(Ordering::SeqCst), 2);
+        assert_eq!(daemon.live_reconcile_failures, 0);
+        assert!(daemon.last_live_reconcile_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn daemon_keeps_rejected_canonical_accounting_degraded() {
+        let root = temp_dir("rejected-canonical-accounting");
+        let config = PlatformConfig {
+            registry_file: root.join("deployments.json"),
+            runtime_root: root.join("runtime"),
+            status_file: root.join("status.json"),
+            deployment_status_file: root.join("deployment-status.json"),
+            trading_state_file: root.join("trading-state.json"),
+            ..PlatformConfig::default()
+        };
+        let mut daemon = PloyDaemon::boot_with_live_execution(
+            &config,
+            Box::new(StaticExecutionGateway::acknowledged("venue-invalid")),
+        )
+        .unwrap();
+        daemon
+            .apply_deployment(paused_live_request("example.live", LIVE_WALLET))
+            .unwrap();
+        let runtime = daemon.trading.get_mut("example.live").unwrap();
+        runtime
+            .submit_intent(
+                TradingIntent {
+                    intent_id: "rejected-fee".to_string(),
+                    deployment_id: "example.live".to_string(),
+                    market_id: "market-1".to_string(),
+                    token_id: "yes-token".to_string(),
+                    side: TradeSide::Buy,
+                    quantity: dec!(1),
+                    limit_price: Some(dec!(0.5)),
+                    purpose: IntentPurpose::Entry,
+                    created_at: Utc::now(),
+                },
+                "order-invalid",
+                None,
+            )
+            .unwrap();
+        runtime.acknowledge_order("order-invalid", "venue-invalid");
+        assert!(!runtime.record_fill(FillRecord {
+            fill_id: "negative-fee".to_string(),
+            order_id: "order-invalid".to_string(),
+            token_id: "yes-token".to_string(),
+            side: TradeSide::Buy,
+            quantity: dec!(1),
+            price: dec!(0.5),
+            fee: dec!(-0.01),
+            timestamp: Utc::now(),
+        }));
+        for expected_failures in 1..=2 {
+            daemon.next_live_reconcile_at = None;
+            let error = daemon.reconcile_live_fills().await.unwrap_err();
+            assert!(error.to_string().contains("requires reconciliation"));
+            assert_eq!(daemon.live_reconcile_failures, expected_failures);
+            assert!(daemon.last_live_reconcile_error.is_some());
+            assert!(daemon.trading["example.live"].reconciliation_required());
+        }
+    }
+
+    #[tokio::test]
     async fn configured_live_resume_requires_matching_unexpired_approval_receipt() {
         let root = temp_dir("live-approval-receipt");
         let runtime_root = root.join("run/platform");
@@ -1785,6 +1890,14 @@ mod tests {
     #[derive(Debug, Clone)]
     struct CountingAckGateway {
         submits: Arc<AtomicUsize>,
+        stream_recovery: Option<Arc<StreamRecoveryFixture>>,
+    }
+
+    #[derive(Debug, Default)]
+    struct StreamRecoveryFixture {
+        attachments: AtomicUsize,
+        pending_generation: AtomicUsize,
+        acknowledged: AtomicUsize,
     }
 
     #[async_trait]
@@ -1807,13 +1920,51 @@ mod tests {
             _order_id: &hft_core::OrderId,
             _new_quantity: Option<hft_core::Quantity>,
             _new_price: Option<hft_core::Price>,
-        ) -> Result<(), hft_core::HftError> {
+        ) -> Result<hft_core::OrderId, hft_core::HftError> {
             unreachable!()
         }
         async fn execution_stream(
             &self,
         ) -> Result<ports::BoxStream<ports::ExecutionEvent>, hft_core::HftError> {
+            if let Some(recovery) = &self.stream_recovery {
+                use futures::StreamExt;
+                let attempt = recovery.attachments.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    return Ok(Box::pin(futures::stream::empty()));
+                }
+                recovery.pending_generation.store(42, Ordering::SeqCst);
+                let mut events = vec![ports::ExecutionEvent::ExecutionStreamBarrier {
+                    stream_id: 42,
+                    timestamp: 1,
+                }];
+                events.extend((0..128).map(|_| ports::ExecutionEvent::ConnectionStatus {
+                    connected: true,
+                    timestamp: 1,
+                }));
+                events.push(ports::ExecutionEvent::ExecutionStreamSynchronized {
+                    stream_id: 42,
+                    connected: true,
+                    timestamp: 2,
+                });
+                return Ok(Box::pin(
+                    futures::stream::iter(events.into_iter().map(Ok))
+                        .chain(futures::stream::pending()),
+                ));
+            }
             Err(hft_core::HftError::Config("unused".into()))
+        }
+        fn acknowledge_execution_stream_applied(&self, stream_id: u64) {
+            if let Some(recovery) = &self.stream_recovery {
+                if recovery
+                    .pending_generation
+                    .compare_exchange(stream_id as usize, 0, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    recovery
+                        .acknowledged
+                        .store(stream_id as usize, Ordering::SeqCst);
+                }
+            }
         }
         async fn list_open_orders(&self) -> Result<Vec<ports::OpenOrder>, hft_core::HftError> {
             Ok(Vec::new())
@@ -1835,7 +1986,10 @@ mod tests {
         }
         async fn health(&self) -> ports::ConnectionHealth {
             ports::ConnectionHealth {
-                connected: true,
+                connected: self
+                    .stream_recovery
+                    .as_ref()
+                    .is_none_or(|recovery| recovery.pending_generation.load(Ordering::SeqCst) == 0),
                 latency_ms: Some(0.0),
                 last_heartbeat: 0,
             }
@@ -1866,7 +2020,7 @@ mod tests {
             _order_id: &hft_core::OrderId,
             _new_quantity: Option<hft_core::Quantity>,
             _new_price: Option<hft_core::Price>,
-        ) -> Result<(), hft_core::HftError> {
+        ) -> Result<hft_core::OrderId, hft_core::HftError> {
             unreachable!()
         }
         async fn execution_stream(
@@ -1920,8 +2074,8 @@ mod tests {
             _order_id: &hft_core::OrderId,
             _new_quantity: Option<hft_core::Quantity>,
             _new_price: Option<hft_core::Price>,
-        ) -> Result<(), hft_core::HftError> {
-            Ok(())
+        ) -> Result<hft_core::OrderId, hft_core::HftError> {
+            Ok(_order_id.clone())
         }
         async fn execution_stream(
             &self,
@@ -2967,6 +3121,7 @@ mod tests {
             &config,
             Box::new(CountingAckGateway {
                 submits: submits.clone(),
+                stream_recovery: None,
             }),
         )
         .expect("boot");
@@ -3002,6 +3157,7 @@ mod tests {
             &config,
             Box::new(CountingAckGateway {
                 submits: submits.clone(),
+                stream_recovery: None,
             }),
         )
         .expect("restore");
@@ -3263,6 +3419,7 @@ mod tests {
         let submits = Arc::new(AtomicUsize::new(0));
         let gateway = CountingAckGateway {
             submits: submits.clone(),
+            stream_recovery: None,
         };
         seed_empty_live_ledgers(&config);
         let mut daemon =
@@ -3535,7 +3692,7 @@ mod tests {
         };
 
         let gateway = StaticExecutionGateway::acknowledged("venue-live-replace-1")
-            .with_replace_result(Ok(()));
+            .with_replace_result(Ok(hft_core::OrderId("venue-live-replace-2".to_string())));
         seed_empty_live_ledgers(&config);
         let mut daemon =
             PloyDaemon::boot_with_live_execution(&config, Box::new(gateway)).expect("boot");
@@ -3571,7 +3728,7 @@ mod tests {
         assert_eq!(response.revision, 1);
         assert_eq!(
             response.venue_order_id.as_deref(),
-            Some("venue-live-replace-1")
+            Some("venue-live-replace-2")
         );
         assert_eq!(
             response.venue_order_history,
@@ -3592,7 +3749,7 @@ mod tests {
         );
         assert_eq!(
             trading_state[0].orders[0].venue_order_id.as_deref(),
-            Some("venue-live-replace-1")
+            Some("venue-live-replace-2")
         );
     }
 

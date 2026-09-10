@@ -476,7 +476,7 @@ impl ExecutionControlHandle {
                         .as_ref()
                         .is_some_and(|report| report.complete && report.healthy)
                 {
-                    engine.publish_account_readback(candidate_account_view);
+                    engine.publish_account_readback(candidate_account_view)?;
                 }
                 let position_report =
                     reconcile_positions(&worker_snapshot, &account_view.positions);
@@ -1526,6 +1526,22 @@ mod tests {
             self.state.market_prices.extend(prices.clone());
         }
 
+        fn update_cash_balance(&mut self, cash_balance: Decimal) -> Result<(), String> {
+            self.state.account_view.cash_balance = cash_balance;
+            self.snapshot
+                .store(Arc::new(self.state.account_view.clone()));
+            Ok(())
+        }
+
+        fn publish_account_readback(
+            &mut self,
+            account_view: ports::AccountView,
+        ) -> Result<(), String> {
+            self.state.account_view = account_view.clone();
+            self.snapshot.store(Arc::new(account_view));
+            Ok(())
+        }
+
         fn export_state(&self) -> ports::PortfolioState {
             self.state.clone()
         }
@@ -1576,7 +1592,9 @@ mod tests {
 
     #[tokio::test]
     async fn emergency_releases_engine_lock_before_waiting_for_worker() {
-        let engine = Arc::new(Mutex::new(Engine::new(EngineConfig::default())));
+        let mut engine_value = Engine::new(EngineConfig::default());
+        engine_value.set_portfolio_manager(Box::new(portfolio_core::Portfolio::new()));
+        let engine = Arc::new(Mutex::new(engine_value));
         let (worker_tx, mut worker_rx) = mpsc::unbounded_channel();
         let control = ExecutionControlHandle::new(engine.clone(), Some(worker_tx), true);
         let worker_engine = engine.clone();
@@ -2228,7 +2246,9 @@ mod tests {
             ready: true,
         };
         let inventory = vec![asset("USDT", 90, 10)];
-        let engine = Arc::new(Mutex::new(Engine::new(EngineConfig::default())));
+        let mut engine_value = Engine::new(EngineConfig::default());
+        engine_value.set_portfolio_manager(Box::new(portfolio_core::Portfolio::new()));
+        let engine = Arc::new(Mutex::new(engine_value));
         let engine_readback = Arc::clone(&engine);
         let (worker_tx, mut worker_rx) = mpsc::unbounded_channel();
         let control = ExecutionControlHandle::new(engine, Some(worker_tx), true)
@@ -2316,11 +2336,14 @@ mod tests {
         existing_account
             .asset_inventory
             .insert("USDC".to_string(), asset("USDC", 4, 0));
-        let engine = Arc::new(Mutex::new(Engine::new(EngineConfig::default())));
+        let mut engine_value = Engine::new(EngineConfig::default());
+        engine_value.set_portfolio_manager(Box::new(portfolio_core::Portfolio::new()));
+        let engine = Arc::new(Mutex::new(engine_value));
         engine
             .lock()
             .await
-            .publish_account_readback(existing_account.clone());
+            .publish_account_readback(existing_account.clone())
+            .expect("publish existing account readback");
         let engine_readback = Arc::clone(&engine);
         let (worker_tx, mut worker_rx) = mpsc::unbounded_channel();
         let control = ExecutionControlHandle::new(engine, Some(worker_tx), true)

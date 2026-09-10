@@ -41,7 +41,7 @@ impl ExecutionClient for DisabledExecutionClient {
         _order_id: &OrderId,
         _new_quantity: Option<hft_core::Quantity>,
         _new_price: Option<hft_core::Price>,
-    ) -> HftResult<()> {
+    ) -> HftResult<OrderId> {
         Err(disabled_error())
     }
 

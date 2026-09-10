@@ -497,7 +497,7 @@ impl ExecutionClient for BinancePredictionExecutionClient {
         _order_id: &OrderId,
         _new_quantity: Option<Quantity>,
         _new_price: Option<hft_core::Price>,
-    ) -> HftResult<()> {
+    ) -> HftResult<OrderId> {
         Err(HftError::InvalidOrder(
             "Binance Prediction does not support in-place order modification; cancel and replace"
                 .to_string(),

@@ -123,15 +123,10 @@ async fn run_balance_sync_loop<E: ExecutionClient + 'static>(
                     current_balance, quote_balance, config.quote_asset
                 );
 
-                // 創建更新後的狀態
-                let mut updated_state = current_state;
-                updated_state.account_view.cash_balance = quote_balance;
-
-                // 導入更新後的狀態
-                if let Err(import_error) = engine.import_portfolio_state(updated_state) {
+                if let Err(import_error) = engine.update_cash_balance(quote_balance) {
                     error!(
                         error = %import_error,
-                        "refused to import balance update because accounting replay state is unsafe"
+                        "refused controlled balance update because accounting replay state is unsafe"
                     );
                 }
             }
@@ -179,12 +174,9 @@ pub async fn sync_balance_once<E: ExecutionClient>(
         balances.len()
     );
 
-    // 更新 Portfolio
-    let mut state = engine.export_portfolio_state();
-    state.account_view.cash_balance = quote_balance;
     engine
-        .import_portfolio_state(state)
-        .map_err(|error| format!("Portfolio 狀態導入失敗: {error}"))?;
+        .update_cash_balance(quote_balance)
+        .map_err(|error| format!("Portfolio 餘額受控更新失敗: {error}"))?;
 
     Ok(balances)
 }
