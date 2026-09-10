@@ -99,6 +99,19 @@ pub struct TopOfBook {
     pub timestamps: MarketDataTimestamps,
 }
 
+/// Binance aggregate-trade identity carried alongside the normalized trade.
+///
+/// A regular `@trade` event leaves this metadata absent. An `@aggTrade` event
+/// must preserve all three exchange IDs so consumers do not mistake a raw
+/// trade ID for an aggregate range.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AggregateTradeMetadata {
+    pub aggregate_trade_id: u64,
+    pub first_trade_id: u64,
+    pub last_trade_id: u64,
+    pub is_buyer_maker: bool,
+}
+
 /// 交易事件
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Trade {
@@ -114,6 +127,9 @@ pub struct Trade {
     pub source_venue: Option<VenueId>,
     #[serde(default)]
     pub timestamps: MarketDataTimestamps,
+    /// Present only when the source event is Binance `@aggTrade`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregate: Option<AggregateTradeMetadata>,
 }
 
 /// 聚合K線
@@ -203,6 +219,9 @@ pub struct TrackedMarketEvent {
     pub event: MarketEvent,
     /// 延遲追蹤器
     pub tracker: LatencyTracker,
+    /// Venue sequence predecessor when the source protocol exposes one (Binance `pu`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_sequence: Option<u64>,
 }
 
 impl TrackedMarketEvent {
@@ -210,14 +229,22 @@ impl TrackedMarketEvent {
     pub fn new(event: MarketEvent) -> Self {
         let mut tracker = LatencyTracker::new();
         tracker.capture_boundary = LatencyCaptureBoundary::AdapterPublish;
-        Self { event, tracker }
+        Self {
+            event,
+            tracker,
+            previous_sequence: None,
+        }
     }
 
     /// Track REST snapshot completion separately from userspace WS message delivery.
     pub fn from_snapshot_completion(event: MarketEvent) -> Self {
         let mut tracker = LatencyTracker::new();
         tracker.capture_boundary = LatencyCaptureBoundary::SnapshotCompletion;
-        Self { event, tracker }
+        Self {
+            event,
+            tracker,
+            previous_sequence: None,
+        }
     }
 
     /// 從指定時間創建帶追蹤的市場事件
@@ -225,6 +252,7 @@ impl TrackedMarketEvent {
         Self {
             event,
             tracker: LatencyTracker::from_time(origin_time),
+            previous_sequence: None,
         }
     }
 

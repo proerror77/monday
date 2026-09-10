@@ -26,14 +26,21 @@ use std::sync::Arc;
 use tracing::info;
 
 use ploy_market_contracts::{
-    l2_updates_from_depth_totals, market_update_sort_ts, normalize_token_id, BinanceSourceClock,
-    BinanceSourceKind, BookLevel, HistoricalLoadOptions, MarketUpdate,
+    canonical_binance_identity, l2_updates_from_depth_totals, market_update_sort_ts,
+    normalize_token_id, BinanceSourceClock, BinanceSourceKind, BookLevel, HistoricalLoadOptions,
+    MarketUpdate,
 };
 
 use serde_json::Value;
 
 /// How far before `from` to load spot prices for EWMA volatility warm-up.
 const WARMUP_MINUTES: i64 = 30;
+
+fn binance_identity_for_market_type(
+    market_type: &str,
+) -> Result<(&'static str, &'static str), sqlx::Error> {
+    canonical_binance_identity(market_type).map_err(sqlx::Error::InvalidArgument)
+}
 
 const BINANCE_PRICE_SAMPLED_QUERY: &str = r#"
         WITH buckets AS (
@@ -45,10 +52,11 @@ const BINANCE_PRICE_SAMPLED_QUERY: &str = r#"
                 make_interval(secs => $4::int)
             ) AS bucket_start
         )
-        SELECT spot.received_at, spot.trade_time, spot.symbol, spot.price
+        SELECT spot.received_at, spot.trade_time, spot.symbol, spot.price,
+               spot.market_type, spot.venue
         FROM buckets
         JOIN LATERAL (
-            SELECT received_at, trade_time, symbol, price
+            SELECT received_at, trade_time, symbol, price, market_type, venue
             FROM binance_price_ticks
             WHERE symbol = buckets.symbol
               AND trade_time >= buckets.bucket_start
@@ -56,6 +64,10 @@ const BINANCE_PRICE_SAMPLED_QUERY: &str = r#"
               AND received_at <= $3
               AND received_at >= trade_time
               AND received_at - trade_time <= make_interval(secs => $5::int)
+              AND trade_id IS NOT NULL
+              AND event_time IS NOT NULL
+              AND market_type = $6
+              AND venue = $7
             ORDER BY trade_time DESC
             LIMIT 1
         ) AS spot ON true
@@ -73,7 +85,7 @@ const BINANCE_AGG_TRADE_SAMPLED_QUERY: &str = r#"
             ) AS bucket_start
         )
         SELECT agg.received_at, buckets.bucket_start, agg.source_time,
-               agg.symbol, agg.agg_trade_id,
+               agg.symbol, agg.agg_trade_id, agg.market_type, agg.venue,
                agg.price, agg.quantity, agg.is_buyer_maker
         FROM buckets
         JOIN LATERAL (
@@ -81,6 +93,8 @@ const BINANCE_AGG_TRADE_SAMPLED_QUERY: &str = r#"
                 MAX(received_at) AS received_at,
                 MAX(trade_time) AS source_time,
                 symbol,
+                market_type,
+                venue,
                 MAX(agg_trade_id) AS agg_trade_id,
                 SUM(price * quantity) / NULLIF(SUM(quantity), 0) AS price,
                 SUM(quantity) AS quantity,
@@ -92,9 +106,14 @@ const BINANCE_AGG_TRADE_SAMPLED_QUERY: &str = r#"
               AND received_at <= $3
               AND received_at >= trade_time
               AND received_at - trade_time <= make_interval(secs => $4::int)
+              AND event_time IS NOT NULL
+              AND first_trade_id IS NOT NULL
+              AND last_trade_id IS NOT NULL
+              AND market_type = $5
+              AND venue = $6
               AND quantity > 0
               AND price > 0
-            GROUP BY symbol, is_buyer_maker
+            GROUP BY symbol, market_type, venue, is_buyer_maker
         ) AS agg ON true
         ORDER BY agg.received_at, agg.symbol, agg.is_buyer_maker
         "#;
@@ -110,20 +129,26 @@ const BINANCE_LOB_SAMPLED_QUERY: &str = r#"
             ) AS bucket_start
         )
         SELECT lob.received_at, lob.event_time, lob.symbol,
+               lob.market_type, lob.venue,
                COALESCE(lob.obi_5, 0.0) as obi,
                COALESCE(lob.spread_bps, 0)::int as spread_bps,
                COALESCE(lob.bid_volume_5, 0) as bid_volume_5,
                COALESCE(lob.ask_volume_5, 0) as ask_volume_5
         FROM buckets
         JOIN LATERAL (
-            SELECT received_at, event_time, symbol, obi_5, spread_bps, bid_volume_5, ask_volume_5
+            SELECT received_at, event_time, symbol, market_type, venue,
+                   obi_5, spread_bps, bid_volume_5, ask_volume_5
             FROM binance_lob_ticks
             WHERE symbol = buckets.symbol
+              AND event_time IS NOT NULL
+              AND depth_mode IS NOT NULL
               AND event_time >= buckets.bucket_start
               AND event_time < buckets.bucket_start + make_interval(secs => $4::int)
               AND received_at <= $3
               AND received_at >= event_time
               AND received_at - event_time <= make_interval(secs => $5::int)
+              AND market_type = $6
+              AND venue = $7
             ORDER BY event_time DESC
             LIMIT 1
         ) AS lob ON true
@@ -316,6 +341,8 @@ pub async fn load_from_database_with_options_and_source_clocks(
     to: DateTime<Utc>,
     options: &HistoricalLoadOptions,
 ) -> Result<HistoricalLoadBatch, sqlx::Error> {
+    let (binance_market_type, binance_venue) =
+        binance_identity_for_market_type(&options.binance_market_type)?;
     let mut updates: Vec<MarketUpdate> = Vec::new();
     let mut binance_source_clocks = Vec::new();
 
@@ -328,6 +355,8 @@ pub async fn load_from_database_with_options_and_source_clocks(
         to,
         options.spot_sample_secs,
         options.max_source_delay_secs,
+        binance_market_type,
+        binance_venue,
         &mut updates,
         &mut binance_source_clocks,
     )
@@ -340,6 +369,8 @@ pub async fn load_from_database_with_options_and_source_clocks(
         from,
         to,
         options.max_source_delay_secs,
+        binance_market_type,
+        binance_venue,
         &mut updates,
         &mut binance_source_clocks,
     )
@@ -389,6 +420,8 @@ pub async fn load_from_database_with_options_and_source_clocks(
             to,
             options.lob_sample_secs,
             options.max_source_delay_secs,
+            binance_market_type,
+            binance_venue,
             &mut updates,
             &mut binance_source_clocks,
         )
@@ -426,6 +459,8 @@ pub async fn load_from_database_with_options_and_source_clocks(
             clock.source_ts,
             clock.kind,
             clock.symbol.clone(),
+            clock.market_type.clone(),
+            clock.venue.clone(),
             clock.sequence_id,
         )
     });
@@ -444,26 +479,36 @@ async fn load_spot_prices(
     to: DateTime<Utc>,
     sample_secs: u32,
     max_source_delay_secs: u32,
+    binance_market_type: &str,
+    binance_venue: &str,
     updates: &mut Vec<MarketUpdate>,
     source_clocks: &mut Vec<BinanceSourceClock>,
 ) -> Result<(), sqlx::Error> {
     let sample_secs = sample_secs.max(1) as i64;
-    let rows: Vec<(DateTime<Utc>, DateTime<Utc>, String, Decimal)> =
-        sqlx::query_as(BINANCE_PRICE_SAMPLED_QUERY)
-            .bind(symbols)
-            .bind(from)
-            .bind(to)
-            .bind(sample_secs)
-            .bind(max_source_delay_secs as i32)
-            .fetch_all(pool)
-            .await?;
+    let rows: Vec<(
+        DateTime<Utc>,
+        DateTime<Utc>,
+        String,
+        Decimal,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(BINANCE_PRICE_SAMPLED_QUERY)
+        .bind(symbols)
+        .bind(from)
+        .bind(to)
+        .bind(sample_secs)
+        .bind(max_source_delay_secs as i32)
+        .bind(binance_market_type)
+        .bind(binance_venue)
+        .fetch_all(pool)
+        .await?;
 
     info!(
         count = rows.len(),
         sample_secs, "Loaded spot prices from binance_price_ticks"
     );
     let mut latest_source_time = HashMap::new();
-    for (received_at, trade_time, symbol, price) in rows {
+    for (received_at, trade_time, symbol, price, _stored_market_type, _stored_venue) in rows {
         if !accept_monotonic_source_time(&mut latest_source_time, &symbol, trade_time) {
             continue;
         }
@@ -472,6 +517,8 @@ async fn load_spot_prices(
             symbol: symbol.clone(),
             source_ts: trade_time,
             received_at,
+            venue: Some(binance_venue.to_owned()),
+            market_type: Some(binance_market_type.to_owned()),
             sequence_id: None,
         });
         updates.push(MarketUpdate::SpotPrice {
@@ -490,6 +537,8 @@ async fn load_agg_trades(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     max_source_delay_secs: u32,
+    binance_market_type: &str,
+    binance_venue: &str,
     updates: &mut Vec<MarketUpdate>,
     source_clocks: &mut Vec<BinanceSourceClock>,
 ) -> Result<(), sqlx::Error> {
@@ -503,6 +552,8 @@ async fn load_agg_trades(
         DateTime<Utc>,
         String,
         i64,
+        Option<String>,
+        Option<String>,
         Decimal,
         Decimal,
         bool,
@@ -511,6 +562,8 @@ async fn load_agg_trades(
         .bind(from)
         .bind(to)
         .bind(max_source_delay_secs as i32)
+        .bind(binance_market_type)
+        .bind(binance_venue)
         .fetch_all(pool)
         .await?;
 
@@ -518,26 +571,35 @@ async fn load_agg_trades(
         count = rows.len(),
         "Loaded agg trades from binance_agg_trade_ticks (5s side aggregates)"
     );
-    let mut latest_source_time = HashMap::new();
+    let mut latest_source_time = HashMap::<(String, bool), DateTime<Utc>>::new();
     for (
         received_at,
         bucket_start,
         source_time,
         symbol,
         agg_trade_id,
+        _stored_market_type,
+        _stored_venue,
         price,
         quantity,
         is_buyer_maker,
     ) in rows
     {
-        if !accept_monotonic_source_time(&mut latest_source_time, &symbol, bucket_start) {
+        let source_key = (symbol.clone(), is_buyer_maker);
+        if latest_source_time
+            .get(&source_key)
+            .is_some_and(|latest| bucket_start < *latest)
+        {
             continue;
         }
+        latest_source_time.insert(source_key, bucket_start);
         source_clocks.push(BinanceSourceClock {
             kind: BinanceSourceKind::AggTrade,
             symbol: symbol.clone(),
             source_ts: source_time,
             received_at,
+            venue: Some(binance_venue.to_owned()),
+            market_type: Some(binance_market_type.to_owned()),
             sequence_id: Some(agg_trade_id as u64),
         });
         updates.push(MarketUpdate::AggTrade {
@@ -946,6 +1008,8 @@ async fn load_l2_data(
     to: DateTime<Utc>,
     sample_secs: u32,
     max_source_delay_secs: u32,
+    binance_market_type: &str,
+    binance_venue: &str,
     updates: &mut Vec<MarketUpdate>,
     source_clocks: &mut Vec<BinanceSourceClock>,
 ) -> Result<(), sqlx::Error> {
@@ -954,6 +1018,8 @@ async fn load_l2_data(
         DateTime<Utc>,
         DateTime<Utc>,
         String,
+        Option<String>,
+        Option<String>,
         Decimal,
         i32,
         Decimal,
@@ -964,6 +1030,8 @@ async fn load_l2_data(
         .bind(to)
         .bind(sample_secs)
         .bind(max_source_delay_secs as i32)
+        .bind(binance_market_type)
+        .bind(binance_venue)
         .fetch_all(pool)
         .await
     {
@@ -976,7 +1044,18 @@ async fn load_l2_data(
 
     info!(count = rows.len(), "Loaded L2 data from binance_lob_ticks");
     let mut latest_source_time = HashMap::new();
-    for (received_at, event_time, symbol, obi, spread_bps, bid_volume_5, ask_volume_5) in rows {
+    for (
+        received_at,
+        event_time,
+        symbol,
+        _stored_market_type,
+        _stored_venue,
+        obi,
+        spread_bps,
+        bid_volume_5,
+        ask_volume_5,
+    ) in rows
+    {
         if !accept_monotonic_source_time(&mut latest_source_time, &symbol, event_time) {
             continue;
         }
@@ -985,6 +1064,8 @@ async fn load_l2_data(
             symbol: symbol.clone(),
             source_ts: event_time,
             received_at,
+            venue: Some(binance_venue.to_owned()),
+            market_type: Some(binance_market_type.to_owned()),
             sequence_id: None,
         });
         updates.extend(l2_updates_from_depth_totals(
@@ -1400,7 +1481,7 @@ mod tests {
             .split_whitespace()
             .collect::<String>();
 
-        assert!(query.contains("GROUPBYsymbol,is_buyer_maker"));
+        assert!(query.contains("GROUPBYsymbol,market_type,venue,is_buyer_maker"));
         assert!(query.contains("SUM(quantity)ASquantity"));
         assert!(query.contains("SUM(price*quantity)/NULLIF(SUM(quantity),0)ASprice"));
         assert!(query.contains("MAX(received_at)ASreceived_at"));
@@ -1444,6 +1525,34 @@ mod tests {
                 "received_at-{source_ts}<=make_interval(secs=>{delay_parameter}::int)"
             )));
         }
+    }
+
+    #[test]
+    fn binance_replay_admits_only_identity_bound_clocked_rows() {
+        let price = BINANCE_PRICE_SAMPLED_QUERY
+            .split_whitespace()
+            .collect::<String>();
+        assert!(price.contains("trade_idISNOTNULL"));
+        assert!(price.contains("event_timeISNOTNULL"));
+        assert!(price.contains("market_type=$6"));
+        assert!(price.contains("venue=$7"));
+
+        let aggregate = BINANCE_AGG_TRADE_SAMPLED_QUERY
+            .split_whitespace()
+            .collect::<String>();
+        assert!(aggregate.contains("event_timeISNOTNULL"));
+        assert!(aggregate.contains("first_trade_idISNOTNULL"));
+        assert!(aggregate.contains("last_trade_idISNOTNULL"));
+        assert!(aggregate.contains("market_type=$5"));
+        assert!(aggregate.contains("venue=$6"));
+
+        let lob = BINANCE_LOB_SAMPLED_QUERY
+            .split_whitespace()
+            .collect::<String>();
+        assert!(lob.contains("event_timeISNOTNULL"));
+        assert!(lob.contains("depth_modeISNOTNULL"));
+        assert!(lob.contains("market_type=$6"));
+        assert!(lob.contains("venue=$7"));
     }
 
     #[test]

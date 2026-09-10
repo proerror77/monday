@@ -9,7 +9,7 @@
 use super::ring_buffer::{spsc_ring_buffer, SpscConsumer, SpscProducer};
 use hdrhistogram::Histogram;
 use hft_core::{now_micros, HftError, LatencyStage, LatencyTracker, Symbol};
-use ports::{MarketEvent, TrackedMarketEvent};
+use ports::{MarketEvent, TrackedMarketEvent, TradeStreamMode};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -309,7 +309,11 @@ impl EventIngester {
         tracker.record_stage(LatencyStage::Ingestion);
 
         // 創建帶追蹤的事件（零拷貝：移動事件所有權）
-        let tracked_event = TrackedMarketEvent { event, tracker };
+        let tracked_event = TrackedMarketEvent {
+            event,
+            tracker,
+            previous_sequence: None,
+        };
 
         // 嘗試發送，應用背壓策略
         match self.producer.send(tracked_event) {
@@ -401,8 +405,12 @@ impl EventIngester {
         tracker.capture_boundary = hft_core::LatencyCaptureBoundary::AdapterPublish;
         tracker.record_stage_with_offset(LatencyStage::WsReceive, 0);
         tracker.record_stage_with_offset(LatencyStage::Parsing, 0);
-        self.ingest_tracked_lossless(TrackedMarketEvent { event, tracker })
-            .await
+        self.ingest_tracked_lossless(TrackedMarketEvent {
+            event,
+            tracker,
+            previous_sequence: None,
+        })
+        .await
     }
 
     /// Lossless ingestion for adapters that already measured frame receive and parse boundaries.
@@ -537,6 +545,7 @@ pub struct EventConsumer {
     /// 引擎唤醒通知器（可选）
     engine_notify: Option<Arc<Notify>>,
     queue_space_notify: Arc<Notify>,
+    trade_stream_mode: TradeStreamMode,
 }
 
 #[derive(Debug)]
@@ -567,7 +576,17 @@ impl EventConsumer {
             flip_metrics: FlipMetrics::default(),
             engine_notify: None,
             queue_space_notify,
+            trade_stream_mode: TradeStreamMode::Raw,
         }
+    }
+
+    pub fn set_trade_stream_mode(&mut self, mode: TradeStreamMode) {
+        self.trade_stream_mode = mode;
+    }
+
+    #[must_use]
+    pub fn trade_stream_mode(&self) -> TradeStreamMode {
+        self.trade_stream_mode
     }
 
     /// 设置引擎唤醒通知器
@@ -982,6 +1001,7 @@ mod tests {
                 provider_identity: None,
             }),
             tracker,
+            previous_sequence: None,
         };
 
         ingester.ingest_tracked_lossless(tracked).await.unwrap();

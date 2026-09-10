@@ -317,6 +317,7 @@ fn trade_data_ref_to_trade(data: &BitgetTradeDataRef<'_>, fallback_inst: &str) -
         trade_id: data.trade_id.unwrap_or("").to_string(),
         source_venue: Some(VenueId::BITGET),
         timestamps: Default::default(),
+        aggregate: None,
     })
 }
 
@@ -568,6 +569,7 @@ impl BitgetMarketStream {
             trade_id: data.trade_id.clone(),
             source_venue: Some(VenueId::BITGET),
             timestamps: Default::default(),
+            aggregate: None,
         })
     }
 
@@ -1321,6 +1323,7 @@ impl BitgetMessageHandler {
                 trade_id,
                 source_venue: Some(VenueId::BITGET),
                 timestamps: Default::default(),
+                aggregate: None,
             };
             self.try_send_event(MarketEvent::Trade(trade));
         }
@@ -1432,6 +1435,7 @@ impl BitgetMessageHandler {
             trade_id: data.trade_id.clone(),
             source_venue: Some(VenueId::BITGET),
             timestamps: Default::default(),
+            aggregate: None,
         })
     }
 }

@@ -20,8 +20,27 @@ pub struct ConnectionHealth {
 }
 
 /// 市場數據流接口 (公有行情)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TradeStreamMode {
+    /// Raw `@trade` prints are the authoritative OHLCV source.
+    #[default]
+    Raw,
+    /// Aggregate `@aggTrade` prints are the authoritative OHLCV source.
+    Aggregate,
+    /// Both channels are subscribed; raw prints remain authoritative.
+    Both,
+    /// No trade channel is subscribed.
+    None,
+}
+
 #[async_trait]
 pub trait MarketStream: Send + Sync {
+    /// Declare which trade channel the stream actually subscribes to so the
+    /// downstream bar consumer can select one authoritative OHLCV source.
+    fn trade_stream_mode(&self) -> TradeStreamMode {
+        TradeStreamMode::Raw
+    }
+
     /// 訂閱指定品種，返回統一事件流
     async fn subscribe(&self, symbols: Vec<Symbol>) -> HftResult<BoxStream<MarketEvent>>;
 

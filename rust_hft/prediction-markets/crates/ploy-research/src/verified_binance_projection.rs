@@ -221,6 +221,8 @@ fn project_trades(
                 symbol: symbol.to_owned(),
                 source_ts: datetime_from_ms(trade.trade_time_ms)?,
                 received_at,
+                venue: Some("binance".to_string()),
+                market_type: Some("spot".to_string()),
                 sequence_id: None,
             },
         ));
@@ -246,6 +248,8 @@ fn project_trades(
                 symbol: symbol.to_owned(),
                 source_ts: datetime_from_ms(bucket.source_time_ms)?,
                 received_at,
+                venue: Some("binance".to_string()),
+                market_type: Some("spot".to_string()),
                 sequence_id: Some(bucket.aggregate_trade_id),
             },
         ));

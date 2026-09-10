@@ -85,6 +85,7 @@ impl MockMarketDataGenerator {
             quantity: Quantity::from_f64(0.1).unwrap(),
             side,
             trade_id: format!("T{}", self.sequence),
+            aggregate: None,
         }
     }
 }

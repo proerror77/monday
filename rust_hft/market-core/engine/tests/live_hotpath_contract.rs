@@ -345,6 +345,7 @@ async fn receive_latency_cohort_excludes_non_receive_boundaries() {
                 timestamps: Default::default(),
             }),
             tracker,
+            previous_sequence: None,
         })
         .await
         .expect("userspace WebSocket message accepted");
@@ -1146,6 +1147,7 @@ fn trade_event_runs_strategy_without_waiting_for_a_book_snapshot() {
             trade_id: "trade-1".to_string(),
             source_venue: Some(VenueId::BINANCE),
             timestamps: Default::default(),
+            aggregate: None,
         }))
         .expect("trade accepted");
     let tick = engine.tick().expect("trade tick");

@@ -5,16 +5,18 @@
 use async_trait::async_trait;
 use bytes::BytesMut;
 use futures::StreamExt;
-use hft_core::{
-    now_micros, HftError, HftResult, InstrumentSpec, LatencyStage, LatencyTracker,
-    LocalReceiveTimestamp, ProductType, Symbol,
+pub use hft_core::{
+    now_micros, ExchangeEventTimestamp, ExchangeTradeTimestamp, HftError, HftResult,
+    InstrumentSpec, LatencyStage, LatencyTracker, LocalReceiveTimestamp, MarketDataTimestamps,
+    Price, ProductType, Quantity, Side, Symbol, VenueId,
 };
 use integration::WsMessageMetrics;
-use ports::events::MarketSnapshot;
-use ports::{
-    BookUpdate, BoxStream, ConnectionHealth, MarketEvent, MarketStream, TrackedMarketEvent,
+pub use ports::{
+    AggregateTradeMetadata, BookLevel, BookUpdate, BoxStream, ConnectionHealth, MarketEvent,
+    MarketSnapshot, MarketStream, TrackedMarketEvent, Trade,
 };
-use std::collections::{HashMap, HashSet, VecDeque};
+use rust_decimal::Decimal;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
@@ -27,13 +29,75 @@ mod websocket;
 
 // Re-export for benchmarks and external use
 pub use converter::MessageConverter;
-pub use message_types::{BookTickerEvent, DepthSnapshot};
+pub use message_types::{AggregateTradeEvent, BookTickerEvent, DepthSnapshot};
 pub use rest::BinanceRestClient;
 pub use websocket::BinanceWebSocket;
 
 const DEFAULT_EVENT_QUEUE_CAPACITY: usize = 4096;
 const DEFAULT_SYNC_BUFFER_CAPACITY: usize = 16_384;
 const REST_SNAPSHOT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Public Binance market family used by collectors and instrument gates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinanceMarketKind {
+    Spot,
+    UsdM,
+}
+
+/// Explicit trade-channel selection for one Binance market subscription.
+///
+/// Raw and aggregate prints represent overlapping fills. The default is raw
+/// only so a generic `MarketStream` cannot silently double-count OHLCV. A
+/// consumer that truly needs both channels must opt in and distinguish them
+/// through `Trade::aggregate`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BinanceTradeStreams {
+    None,
+    #[default]
+    Raw,
+    Aggregate,
+    Both,
+}
+
+impl BinanceMarketKind {
+    #[must_use]
+    pub const fn market_type(self) -> &'static str {
+        match self {
+            Self::Spot => "spot",
+            Self::UsdM => "usd_m",
+        }
+    }
+
+    #[must_use]
+    pub const fn venue(self) -> hft_core::VenueId {
+        match self {
+            Self::Spot => hft_core::VenueId::BINANCE,
+            Self::UsdM => hft_core::VenueId::BINANCE_FUTURES,
+        }
+    }
+
+    #[must_use]
+    pub fn stream(self) -> BinanceMarketStream {
+        match self {
+            Self::Spot => BinanceMarketStream::new(),
+            Self::UsdM => BinanceMarketStream::new().with_usdm(),
+        }
+    }
+}
+
+impl std::str::FromStr for BinanceMarketKind {
+    type Err = HftError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "spot" => Ok(Self::Spot),
+            "usd_m" | "usdm" | "futures" | "perp" => Ok(Self::UsdM),
+            other => Err(HftError::Config(format!(
+                "unsupported Binance market type {other}; use spot or usd_m"
+            ))),
+        }
+    }
+}
 
 #[derive(Debug)]
 struct QueuedMarketEvent {
@@ -52,6 +116,7 @@ impl ParsedTrackedMarketEvent {
         TrackedMarketEvent {
             event: self.event,
             tracker: self.tracker,
+            previous_sequence: self.previous_update_id,
         }
     }
 }
@@ -223,6 +288,177 @@ impl DepthSequenceTracker {
     }
 }
 
+/// Canonical cumulative Binance book projection.
+///
+/// The adapter owns snapshot/delta state so collectors do not reimplement a
+/// second parser or book merge. A disconnect or rejected sequence clears the
+/// projection; callers must wait for the next snapshot before persisting it.
+#[derive(Debug, Clone, Default)]
+pub struct BinanceBook {
+    symbol: Option<Symbol>,
+    bids: BTreeMap<Decimal, Decimal>,
+    asks: BTreeMap<Decimal, Decimal>,
+    sequence: u64,
+    ready: bool,
+}
+
+impl BinanceBook {
+    #[must_use]
+    pub const fn is_ready(&self) -> bool {
+        self.ready
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn apply_levels(
+        levels: &[ports::BookLevel],
+        target: &mut BTreeMap<Decimal, Decimal>,
+    ) -> HftResult<()> {
+        for level in levels {
+            if level.price.0 <= Decimal::ZERO || level.quantity.0 < Decimal::ZERO {
+                return Err(HftError::Parse(format!(
+                    "Binance book level is invalid price={} quantity={}",
+                    level.price, level.quantity
+                )));
+            }
+            if level.quantity.0.is_zero() {
+                target.remove(&level.price.0);
+            } else {
+                target.insert(level.price.0, level.quantity.0);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_not_crossed(
+        bids: &BTreeMap<Decimal, Decimal>,
+        asks: &BTreeMap<Decimal, Decimal>,
+    ) -> HftResult<()> {
+        if let Some((best_bid, best_ask)) = bids
+            .last_key_value()
+            .zip(asks.first_key_value())
+            .map(|((bid, _), (ask, _))| (*bid, *ask))
+        {
+            if best_bid >= best_ask {
+                return Err(HftError::Parse(format!(
+                    "Binance book is crossed bid={best_bid} ask={best_ask}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn snapshot(
+        &self,
+        timestamp: u64,
+        sequence: u64,
+        source_venue: Option<hft_core::VenueId>,
+        timestamps: hft_core::MarketDataTimestamps,
+    ) -> MarketSnapshot {
+        MarketSnapshot {
+            symbol: self.symbol.clone().expect("ready Binance book has symbol"),
+            timestamp,
+            bids: self
+                .bids
+                .iter()
+                .rev()
+                .map(|(price, quantity)| ports::BookLevel {
+                    price: Price(*price),
+                    quantity: Quantity(*quantity),
+                })
+                .collect(),
+            asks: self
+                .asks
+                .iter()
+                .map(|(price, quantity)| ports::BookLevel {
+                    price: Price(*price),
+                    quantity: Quantity(*quantity),
+                })
+                .collect(),
+            sequence,
+            source_venue,
+            timestamps,
+            provider_identity: None,
+        }
+    }
+
+    /// Apply one canonical snapshot or sequence-checked delta.
+    pub fn apply(&mut self, event: &MarketEvent) -> HftResult<Option<MarketSnapshot>> {
+        match event {
+            MarketEvent::Snapshot(snapshot) => {
+                let mut bids = BTreeMap::new();
+                let mut asks = BTreeMap::new();
+                Self::apply_levels(&snapshot.bids, &mut bids)?;
+                Self::apply_levels(&snapshot.asks, &mut asks)?;
+                Self::validate_not_crossed(&bids, &asks)?;
+                self.symbol = Some(snapshot.symbol.clone());
+                self.bids = bids;
+                self.asks = asks;
+                self.sequence = snapshot.sequence;
+                self.ready = true;
+                Ok(Some(self.snapshot(
+                    snapshot.timestamp,
+                    snapshot.sequence,
+                    snapshot.source_venue,
+                    snapshot.timestamps,
+                )))
+            }
+            MarketEvent::Update(update) => {
+                if !self.ready {
+                    return Err(HftError::Network(format!(
+                        "Binance book delta arrived before snapshot for {}",
+                        update.symbol
+                    )));
+                }
+                if self.symbol.as_ref() != Some(&update.symbol) {
+                    return Err(HftError::Network(format!(
+                        "Binance book symbol changed from {} to {}",
+                        self.symbol.as_ref().expect("ready Binance book has symbol"),
+                        update.symbol
+                    )));
+                }
+                if update.sequence <= self.sequence {
+                    return Err(HftError::Network(format!(
+                        "Binance book sequence regressed from {} to {}",
+                        self.sequence, update.sequence
+                    )));
+                }
+                let expected = self.sequence.saturating_add(1);
+                if update
+                    .first_sequence
+                    .is_some_and(|first_sequence| first_sequence > expected)
+                {
+                    return Err(HftError::Network(format!(
+                        "Binance book sequence gap for {}: expected {}, received {:?}-{}",
+                        update.symbol, expected, update.first_sequence, update.sequence
+                    )));
+                }
+                let mut bids = self.bids.clone();
+                let mut asks = self.asks.clone();
+                Self::apply_levels(&update.bids, &mut bids)?;
+                Self::apply_levels(&update.asks, &mut asks)?;
+                Self::validate_not_crossed(&bids, &asks)?;
+                self.bids = bids;
+                self.asks = asks;
+                self.sequence = update.sequence;
+                Ok(Some(self.snapshot(
+                    update.timestamp,
+                    update.sequence,
+                    update.source_venue,
+                    update.timestamps,
+                )))
+            }
+            MarketEvent::Disconnect { .. } => {
+                self.clear();
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
 pub mod capabilities {
     #[derive(Debug, Clone)]
     pub struct BinanceCapabilities {
@@ -251,6 +487,10 @@ pub struct BinanceMarketStream {
     ws_base_url: String,
     usdm: bool,
     source_venue: hft_core::VenueId,
+    trade_streams: BinanceTradeStreams,
+    depth_levels: Option<usize>,
+    depth_enabled: bool,
+    book_ticker_enabled: bool,
 }
 
 impl Default for BinanceMarketStream {
@@ -269,6 +509,10 @@ impl BinanceMarketStream {
             ws_base_url: websocket::WS_BASE_URL.to_string(),
             usdm: false,
             source_venue: hft_core::VenueId::BINANCE,
+            trade_streams: BinanceTradeStreams::default(),
+            depth_levels: None,
+            depth_enabled: true,
+            book_ticker_enabled: true,
         }
     }
 
@@ -281,6 +525,10 @@ impl BinanceMarketStream {
             ws_base_url: websocket::WS_BASE_URL.to_string(),
             usdm: false,
             source_venue: hft_core::VenueId::BINANCE,
+            trade_streams: BinanceTradeStreams::default(),
+            depth_levels: None,
+            depth_enabled: true,
+            book_ticker_enabled: true,
         }
     }
 
@@ -306,6 +554,37 @@ impl BinanceMarketStream {
         self.usdm = true;
         self.source_venue = hft_core::VenueId::BINANCE_FUTURES;
         self
+    }
+
+    /// Select raw, aggregate, both, or no trade channels for this subscription.
+    #[must_use]
+    pub const fn with_trade_streams(mut self, trade_streams: BinanceTradeStreams) -> Self {
+        self.trade_streams = trade_streams;
+        self
+    }
+
+    /// Enable or disable depth subscriptions for specialized collectors.
+    #[must_use]
+    pub const fn with_depth_stream(mut self, enabled: bool) -> Self {
+        self.depth_enabled = enabled;
+        self
+    }
+
+    /// Enable or disable per-symbol book-ticker subscriptions.
+    #[must_use]
+    pub const fn with_book_ticker(mut self, enabled: bool) -> Self {
+        self.book_ticker_enabled = enabled;
+        self
+    }
+
+    pub fn with_depth_levels(mut self, depth_levels: usize) -> HftResult<Self> {
+        if !matches!(depth_levels, 5 | 10 | 20) {
+            return Err(HftError::Config(format!(
+                "unsupported Binance partial depth {depth_levels}; use 5, 10, or 20"
+            )));
+        }
+        self.depth_levels = Some(depth_levels);
+        Ok(self)
     }
 
     /// Select the explicit venue identity for Spot-family streams such as B-Stock.
@@ -454,12 +733,13 @@ impl BinanceMarketStream {
             let depth = rest_client.get_depth(symbol, Some(snapshot_depth)).await?;
             let timestamp = now_micros();
 
-            let snapshot = MessageConverter::convert_depth_snapshot(
+            let mut snapshot = MessageConverter::convert_depth_snapshot(
                 symbol.clone(),
                 depth,
                 timestamp,
                 source_venue,
             )?;
+            snapshot.timestamps.local_receive = Some(LocalReceiveTimestamp::new(timestamp));
 
             snapshots.push((snapshot, timestamp));
         }
@@ -566,6 +846,15 @@ impl BinanceMarketStream {
 
 #[async_trait]
 impl MarketStream for BinanceMarketStream {
+    fn trade_stream_mode(&self) -> ports::TradeStreamMode {
+        match self.trade_streams {
+            BinanceTradeStreams::None => ports::TradeStreamMode::None,
+            BinanceTradeStreams::Raw => ports::TradeStreamMode::Raw,
+            BinanceTradeStreams::Aggregate => ports::TradeStreamMode::Aggregate,
+            BinanceTradeStreams::Both => ports::TradeStreamMode::Both,
+        }
+    }
+
     async fn subscribe(&self, symbols: Vec<Symbol>) -> HftResult<BoxStream<MarketEvent>> {
         let stream = self.subscribe_tracked(symbols).await?;
         Ok(Box::pin(
@@ -583,11 +872,14 @@ impl MarketStream for BinanceMarketStream {
 
         info!("訂閱 Binance 市場數據，品種: {:?}", symbols);
 
-        let uses_ws_snapshot_depth = Self::uses_ws_snapshot_depth();
+        let uses_ws_snapshot_depth = self.depth_enabled && Self::uses_ws_snapshot_depth();
         if uses_ws_snapshot_depth {
             websocket::validate_depth_frequency(self.usdm)?;
         }
-        if !uses_ws_snapshot_depth && (!self.caps.snapshot_crc || !self.caps.rest_fallback) {
+        if self.depth_enabled
+            && !uses_ws_snapshot_depth
+            && (!self.caps.snapshot_crc || !self.caps.rest_fallback)
+        {
             return Err(HftError::Config(
                 "Binance diff-depth requires the REST snapshot bridge; use partial20 for a WebSocket-only feed"
                     .to_string(),
@@ -602,11 +894,15 @@ impl MarketStream for BinanceMarketStream {
         // Default mode is a WebSocket-only partial-depth snapshot stream. Full diff-depth mode is
         // opt-in and uses one rate-budgeted REST snapshot while explicitly buffering WS events.
         let mut ws_client = BinanceWebSocket::with_base_url(self.ws_base_url.clone());
+        ws_client = ws_client.with_trade_streams(self.trade_streams);
+        ws_client = ws_client.with_depth_levels(self.depth_levels);
+        ws_client = ws_client.with_depth_stream(self.depth_enabled);
+        ws_client = ws_client.with_book_ticker(self.book_ticker_enabled);
         if self.usdm {
             ws_client = ws_client.with_usdm();
         }
         let rest_client = self.rest_client.clone();
-        let snapshot_enabled = !uses_ws_snapshot_depth;
+        let snapshot_enabled = self.depth_enabled && !uses_ws_snapshot_depth;
         let snapshot_depth = Self::snapshot_depth(self.usdm);
         let usdm = self.usdm;
         let source_venue = self.source_venue();
@@ -682,6 +978,7 @@ impl MarketStream for BinanceMarketStream {
                                         TrackedMarketEvent {
                                             event: MarketEvent::Snapshot(snapshot),
                                             tracker,
+                                            previous_sequence: None,
                                         },
                                     ) {
                                         Ok(()) => {}
@@ -942,6 +1239,43 @@ mod tests {
     }
 
     #[test]
+    fn market_kind_selects_explicit_venue_identity() {
+        assert_eq!(BinanceMarketKind::Spot.market_type(), "spot");
+        assert_eq!(BinanceMarketKind::Spot.venue(), hft_core::VenueId::BINANCE);
+        assert_eq!(
+            "usd_m".parse::<BinanceMarketKind>().unwrap(),
+            BinanceMarketKind::UsdM
+        );
+        assert_eq!(
+            BinanceMarketKind::UsdM.venue(),
+            hft_core::VenueId::BINANCE_FUTURES
+        );
+        assert!("prediction".parse::<BinanceMarketKind>().is_err());
+    }
+
+    #[test]
+    fn trade_subscription_mode_is_exposed_to_the_bar_consumer() {
+        assert_eq!(
+            BinanceMarketStream::new()
+                .with_trade_streams(BinanceTradeStreams::Aggregate)
+                .trade_stream_mode(),
+            ports::TradeStreamMode::Aggregate
+        );
+        assert_eq!(
+            BinanceMarketStream::new()
+                .with_trade_streams(BinanceTradeStreams::Both)
+                .trade_stream_mode(),
+            ports::TradeStreamMode::Both
+        );
+    }
+
+    #[test]
+    fn explicit_depth_level_configuration_rejects_unsupported_values() {
+        assert!(BinanceMarketStream::new().with_depth_levels(5).is_ok());
+        assert!(BinanceMarketStream::new().with_depth_levels(50).is_err());
+    }
+
+    #[test]
     fn test_binance_capabilities_default() {
         let caps = BinanceCapabilities::default();
         assert!(caps.snapshot_crc);
@@ -1032,6 +1366,112 @@ mod tests {
         let result = stream.subscribe(vec![]).await;
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn canonical_book_applies_snapshot_delta_and_disconnect_gate() {
+        let symbol = Symbol::new("BTCUSDT");
+        let mut book = BinanceBook::default();
+        let snapshot = MarketEvent::Snapshot(MarketSnapshot {
+            symbol: symbol.clone(),
+            timestamp: 1_000,
+            bids: vec![BookLevel::new(100.0, 2.0).unwrap()],
+            asks: vec![BookLevel::new(101.0, 3.0).unwrap()],
+            sequence: 10,
+            source_venue: Some(hft_core::VenueId::BINANCE),
+            timestamps: Default::default(),
+            provider_identity: None,
+        });
+        let projected = book.apply(&snapshot).unwrap().unwrap();
+        assert!(book.is_ready());
+        assert_eq!(projected.bids.len(), 1);
+
+        let delta = MarketEvent::Update(BookUpdate {
+            symbol: symbol.clone(),
+            timestamp: 2_000,
+            bids: vec![BookLevel {
+                price: Price::from_f64(100.0).unwrap(),
+                quantity: Quantity::zero(),
+            }],
+            asks: vec![BookLevel::new(102.0, 1.0).unwrap()],
+            first_sequence: Some(11),
+            sequence: 11,
+            is_snapshot: false,
+            source_venue: Some(hft_core::VenueId::BINANCE),
+            timestamps: Default::default(),
+        });
+        let projected = book.apply(&delta).unwrap().unwrap();
+        assert!(projected.bids.is_empty());
+        assert_eq!(projected.asks[0].price, Price::from_f64(101.0).unwrap());
+        assert_eq!(projected.asks[1].price, Price::from_f64(102.0).unwrap());
+
+        let crossed = MarketEvent::Update(BookUpdate {
+            symbol,
+            timestamp: 3_000,
+            bids: vec![BookLevel::new(103.0, 1.0).unwrap()],
+            asks: Vec::new(),
+            first_sequence: Some(12),
+            sequence: 12,
+            is_snapshot: false,
+            source_venue: Some(hft_core::VenueId::BINANCE),
+            timestamps: Default::default(),
+        });
+        assert!(book.apply(&crossed).is_err());
+        assert!(book.is_ready());
+        book.apply(&MarketEvent::Disconnect {
+            reason: "sequence gap".to_string(),
+            source_venue: Some(hft_core::VenueId::BINANCE),
+            symbol: None,
+            connection_started_at: None,
+        })
+        .unwrap();
+        assert!(!book.is_ready());
+        assert!(book.apply(&delta).is_err());
+    }
+
+    #[test]
+    fn canonical_book_rejects_a_sequence_gap_without_mutating_state() {
+        let symbol = Symbol::new("BTCUSDT");
+        let mut book = BinanceBook::default();
+        let snapshot = MarketEvent::Snapshot(MarketSnapshot {
+            symbol: symbol.clone(),
+            timestamp: 1_000,
+            bids: vec![BookLevel::new(100.0, 2.0).unwrap()],
+            asks: vec![BookLevel::new(101.0, 3.0).unwrap()],
+            sequence: 10,
+            source_venue: Some(hft_core::VenueId::BINANCE),
+            timestamps: Default::default(),
+            provider_identity: None,
+        });
+        book.apply(&snapshot).unwrap();
+
+        let gap = MarketEvent::Update(BookUpdate {
+            symbol,
+            timestamp: 2_000,
+            bids: vec![BookLevel::new(99.0, 4.0).unwrap()],
+            asks: Vec::new(),
+            first_sequence: Some(12),
+            sequence: 12,
+            is_snapshot: false,
+            source_venue: Some(hft_core::VenueId::BINANCE),
+            timestamps: Default::default(),
+        });
+        assert!(book.apply(&gap).is_err());
+        let retained = book
+            .apply(&MarketEvent::Update(BookUpdate {
+                symbol: Symbol::new("BTCUSDT"),
+                timestamp: 2_001,
+                bids: Vec::new(),
+                asks: Vec::new(),
+                first_sequence: Some(11),
+                sequence: 11,
+                is_snapshot: false,
+                source_venue: Some(hft_core::VenueId::BINANCE),
+                timestamps: Default::default(),
+            }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.bids[0].price, Price::from_f64(100.0).unwrap());
     }
 
     #[tokio::test]
@@ -1423,6 +1863,7 @@ mod tests {
         );
         assert!(depth.event.timestamps().unwrap().exchange_trade.is_none());
         assert!(depth.event.timestamps().unwrap().local_receive.is_some());
+        assert_eq!(depth.into_tracked().previous_sequence, Some(99));
 
         let partial_depth = parse(
             br#"{"stream":"btcusdt@depth20@100ms","data":{"lastUpdateId":101,"bids":[["45000.00","0.1"]],"asks":[["45100.00","0.2"]]}}"#,

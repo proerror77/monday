@@ -344,6 +344,7 @@ fn convert_message_with_fast_bbo(
                     trade_id: trade.i,
                     source_venue: Some(VenueId::BYBIT),
                     timestamps: Default::default(),
+                    aggregate: None,
                 }))
             })
             .collect()
@@ -542,6 +543,7 @@ impl MarketStream for BybitMarketStream {
                                                         event: TrackedMarketEvent {
                                                             event,
                                                             tracker,
+                                                            previous_sequence: None,
                                                         },
                                                     };
                                                     match tx.try_send(queued) {
@@ -1003,6 +1005,7 @@ mod tests {
             trade_id: "old".to_string(),
             source_venue: Some(VenueId::BYBIT),
             timestamps: Default::default(),
+            aggregate: None,
         });
         data_tx
             .try_send(QueuedMarketEvent {
@@ -1026,6 +1029,7 @@ mod tests {
             trade_id: "fresh".to_string(),
             source_venue: Some(VenueId::BYBIT),
             timestamps: Default::default(),
+            aggregate: None,
         });
         data_tx
             .try_send(QueuedMarketEvent {

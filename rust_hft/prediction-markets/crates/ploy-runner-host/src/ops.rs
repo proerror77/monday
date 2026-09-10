@@ -1,5 +1,5 @@
 use ploy_market_data::binance_collectors::{
-    collect_binance_aggtrade, collect_binance_lob, collect_binance_price,
+    collect_binance_aggtrade, collect_binance_lob, collect_binance_price, BinanceMarketKind,
 };
 use ploy_market_data::cex_collectors::collect_cex_public;
 use ploy_market_data::collector::{CollectorConfig, QuoteCollector};
@@ -84,17 +84,20 @@ pub fn print_usage() {
     eprintln!();
     eprintln!("Options for 'collect-binance-lob':");
     eprintln!("  --symbols <list>  Comma-separated symbols (default: BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,HYPEUSDT,BNBUSDT)");
+    eprintln!("  --market-type <spot|usd_m>  Binance market family (default: spot)");
     eprintln!("  --depth <n>       Depth levels (default: 20)");
     eprintln!("  --batch-size <n>  DB commit batch size (default: 25)");
     eprintln!("  --db-url <url>    Database URL (or DATABASE_URL/PLOY_DATABASE__URL)");
     eprintln!();
     eprintln!("Options for 'collect-binance-price':");
     eprintln!("  --symbols <list>  Comma-separated symbols (default: BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,HYPEUSDT,BNBUSDT)");
+    eprintln!("  --market-type <spot|usd_m>  Binance market family (default: spot)");
     eprintln!("  --batch-size <n>  DB commit batch size (default: 25)");
     eprintln!("  --db-url <url>    Database URL (or DATABASE_URL/PLOY_DATABASE__URL)");
     eprintln!();
     eprintln!("Options for 'collect-binance-aggtrade':");
     eprintln!("  --symbols <list>  Comma-separated symbols (default: BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,HYPEUSDT,BNBUSDT)");
+    eprintln!("  --market-type <spot|usd_m>  Binance market family (default: spot)");
     eprintln!("  --batch-size <n>  DB commit batch size (default: 50)");
     eprintln!("  --db-url <url>    Database URL (or DATABASE_URL/PLOY_DATABASE__URL)");
     eprintln!();
@@ -371,6 +374,20 @@ fn parse_symbols(symbols: &str) -> Vec<String> {
         .collect()
 }
 
+fn binance_market_kind(args: &[String]) -> BinanceMarketKind {
+    let Some(value) = arg_value(args, "--market-type") else {
+        return BinanceMarketKind::Spot;
+    };
+    match value.parse() {
+        Ok(kind) => kind,
+        Err(error) => {
+            eprintln!("{error}");
+            print_usage();
+            std::process::exit(1);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Binance collectors
 // ---------------------------------------------------------------------------
@@ -393,6 +410,7 @@ pub async fn run_collect_binance_lob(args: &[String]) {
     let batch = arg_value(args, "--batch-size")
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(25);
+    let market_kind = binance_market_kind(args);
 
     let pool = match PgPoolOptions::new()
         .max_connections(3)
@@ -405,7 +423,7 @@ pub async fn run_collect_binance_lob(args: &[String]) {
             std::process::exit(1);
         }
     };
-    collect_binance_lob(pool, symbols, depth, batch).await;
+    collect_binance_lob(pool, symbols, depth, batch, market_kind).await;
 }
 
 pub async fn run_collect_binance_price(args: &[String]) {
@@ -423,6 +441,7 @@ pub async fn run_collect_binance_price(args: &[String]) {
     let batch = arg_value(args, "--batch-size")
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(25);
+    let market_kind = binance_market_kind(args);
 
     let pool = match PgPoolOptions::new()
         .max_connections(3)
@@ -435,7 +454,7 @@ pub async fn run_collect_binance_price(args: &[String]) {
             std::process::exit(1);
         }
     };
-    collect_binance_price(pool, symbols, batch).await;
+    collect_binance_price(pool, symbols, batch, market_kind).await;
 }
 
 pub async fn run_collect_binance_aggtrade(args: &[String]) {
@@ -453,6 +472,7 @@ pub async fn run_collect_binance_aggtrade(args: &[String]) {
     let batch = arg_value(args, "--batch-size")
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(50);
+    let market_kind = binance_market_kind(args);
 
     let pool = match PgPoolOptions::new()
         .max_connections(3)
@@ -465,7 +485,7 @@ pub async fn run_collect_binance_aggtrade(args: &[String]) {
             std::process::exit(1);
         }
     };
-    collect_binance_aggtrade(pool, symbols, batch).await;
+    collect_binance_aggtrade(pool, symbols, batch, market_kind).await;
 }
 
 // ---------------------------------------------------------------------------

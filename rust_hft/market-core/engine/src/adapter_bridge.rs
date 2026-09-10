@@ -63,14 +63,16 @@ impl AdapterBridge {
         S: MarketStream + Send + 'static,
     {
         info!("橋接市場數據流，交易對: {:?}", symbols);
+        let trade_stream_mode = stream.trade_stream_mode();
 
         // 創建 SPSC 攝取器
-        let (mut ingester, consumer) = EventIngester::new(self.config.ingestion.clone());
+        let (mut ingester, mut consumer) = EventIngester::new(self.config.ingestion.clone());
 
         // 若有引擎 Notify，掛載到 ingester 以實現真正事件驅動
         if let Some(n) = &self.engine_notify {
             ingester.set_engine_notify(n.clone());
         }
+        consumer.set_trade_stream_mode(trade_stream_mode);
 
         // 訂閱數據流
         let event_stream =
@@ -95,16 +97,18 @@ impl AdapterBridge {
     where
         S: MarketStream + Send + 'static,
     {
+        let trade_stream_mode = stream.trade_stream_mode();
         let symbols: Vec<Symbol> = instruments
             .iter()
             .map(|instrument| instrument.symbol.clone())
             .collect();
         info!("橋接市場數據流，商品: {:?}", instruments);
 
-        let (mut ingester, consumer) = EventIngester::new(self.config.ingestion.clone());
+        let (mut ingester, mut consumer) = EventIngester::new(self.config.ingestion.clone());
         if let Some(n) = &self.engine_notify {
             ingester.set_engine_notify(n.clone());
         }
+        consumer.set_trade_stream_mode(trade_stream_mode);
 
         let event_stream = stream
             .subscribe_tracked_instruments(instruments)
