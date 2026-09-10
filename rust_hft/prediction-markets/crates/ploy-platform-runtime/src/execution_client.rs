@@ -109,6 +109,65 @@ pub fn execution_io_error(error: HftError) -> std::io::Error {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use hft_core::{OrderType, Price, Quantity, Side, Symbol, TimeInForce, VenueId};
+    use ports::{OrderIntentEnvelope, OrderIntentLifecycle};
+    use rust_decimal::Decimal;
+
+    fn assert_disabled<T>(result: HftResult<T>) {
+        match result {
+            Err(HftError::Config(message)) if message == MONDAY_EXECUTION_DISABLED => {}
+            Err(error) => panic!("expected the disabled execution error, got {error}"),
+            Ok(_) => panic!("disabled execution unexpectedly succeeded"),
+        }
+    }
+
+    #[tokio::test]
+    async fn production_client_rejects_orders_and_authoritative_account_reads() {
+        let shared = disabled_execution_client();
+        let mut client = lock_execution_client(&shared).await.unwrap();
+        let intent = OrderIntent::prediction_market(
+            Symbol::new("test-yes-token"),
+            Side::Buy,
+            Quantity(Decimal::ONE),
+            OrderType::Limit,
+            Some(Price(Decimal::new(5, 1))),
+            TimeInForce::GTC,
+            "disabled-client-regression".to_string(),
+            VenueId::POLYMARKET,
+        );
+        let now = hft_core::now_micros();
+        let envelope = OrderIntentEnvelope::new(
+            intent.clone(),
+            OrderIntentLifecycle::new(now, now + 60_000_000),
+        );
+        envelope.validate_cex_pre_execution(now, None).unwrap();
+        let order_id = OrderId("existing-order".to_string());
+
+        assert_disabled(client.connect().await);
+        assert_disabled(client.place_order(intent.clone()).await);
+        assert_disabled(client.place_order_with_spec(intent, None).await);
+        assert_disabled(client.place_order_envelope(&envelope).await);
+        let attempt = client.place_order_envelope_traced(&envelope).await;
+        assert_disabled(attempt.outcome);
+        assert!(attempt.userspace_write_started_mono_us.is_none());
+        assert!(attempt.userspace_write_returned_mono_us.is_none());
+        assert!(attempt.response_received_mono_us.is_none());
+        assert_disabled(client.cancel_order(&order_id).await);
+        assert_disabled(client.modify_order(&order_id, None, None).await);
+        assert_disabled(client.execution_stream().await);
+        assert_disabled(client.list_open_orders().await);
+        assert_disabled(client.get_balance().await);
+        assert_disabled(client.get_positions().await);
+        assert_disabled(client.list_recent_fills().await);
+        assert!(!client.health().await.connected);
+        assert!(!client.is_simulated_execution());
+        assert!(!client.execution_stream_may_complete());
+        assert!(!client.supports_position_snapshot());
+        assert!(!client.supports_recent_fills_snapshot());
+        client.disconnect().await.unwrap();
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn execution_client_lock_is_async() {
         let started = std::time::Instant::now();

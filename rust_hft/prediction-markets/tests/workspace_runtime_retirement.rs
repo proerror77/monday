@@ -971,139 +971,7 @@ fn gateway_guard_propagates_cfg_test_through_every_item_container() {
 }
 
 #[test]
-fn compiler_seal_rejects_cross_file_external_and_attribute_macro_gateway_impls() {
-    let fixture = TemporaryDirectory::new("compiler-seal-fixture");
-    let macro_provider = fixture.path().join("gateway-macros");
-    let application = fixture.path().join("application");
-    fs::create_dir_all(macro_provider.join("src")).expect("create macro provider source");
-    fs::create_dir_all(application.join("src")).expect("create fixture application source");
-
-    fs::write(
-        fixture.path().join("Cargo.toml"),
-        r#"
-            [workspace]
-            members = ["gateway-macros", "application"]
-            resolver = "2"
-
-            [patch.crates-io]
-            rust_decimal = { git = "https://github.com/proerror77/monday-rust-decimal-security-694", rev = "4f7bc6f02d7920b6416988914ae86d25f6670b22" }
-        "#,
-    )
-    .expect("write fixture workspace manifest");
-    fs::write(
-        macro_provider.join("Cargo.toml"),
-        r#"
-            [package]
-            name = "gateway-macros"
-            version = "0.0.0"
-            edition = "2021"
-
-            [lib]
-            proc-macro = true
-        "#,
-    )
-    .expect("write macro provider manifest");
-    fs::write(
-        macro_provider.join("src/lib.rs"),
-        r#"
-            use proc_macro::TokenStream;
-
-            #[proc_macro]
-            pub fn install_external_gateway(_input: TokenStream) -> TokenStream {
-                "impl ploy_platform_runtime::execution_client::ExecutionClient for ExternalMacroClient {}"
-                    .parse()
-                    .expect("valid external macro expansion")
-            }
-
-            #[proc_macro_attribute]
-            pub fn install_attribute_gateway(
-                _attribute: TokenStream,
-                item: TokenStream,
-            ) -> TokenStream {
-                format!(
-                    "{item} impl ploy_platform_runtime::execution_client::ExecutionClient for AttributeMacroClient {{}}"
-                )
-                .parse()
-                .expect("valid attribute macro expansion")
-            }
-        "#,
-    )
-    .expect("write macro provider source");
-
-    let connectivity = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("crates/ploy-platform-runtime")
-        .canonicalize()
-        .expect("canonical connectivity path");
-    fs::write(
-        application.join("Cargo.toml"),
-        format!(
-            r#"
-                [package]
-                name = "gateway-seal-fixture"
-                version = "0.0.0"
-                edition = "2021"
-
-                [dependencies]
-                gateway-macros = {{ path = "../gateway-macros" }}
-                ploy-platform-runtime = {{ path = "{}", default-features = false }}
-            "#,
-            connectivity.display()
-        ),
-    )
-    .expect("write fixture application manifest");
-    fs::write(
-        application.join("src/lib.rs"),
-        r#"
-            use gateway_macros::{install_attribute_gateway, install_external_gateway};
-
-            mod aliased;
-            mod aliases;
-
-            #[derive(Debug)]
-            struct ExternalMacroClient;
-            install_external_gateway!();
-
-            #[install_attribute_gateway]
-            #[derive(Debug)]
-            struct AttributeMacroClient;
-        "#,
-    )
-    .expect("write fixture application source");
-    fs::write(
-        application.join("src/aliases.rs"),
-        "pub use ploy_platform_runtime::execution_client::ExecutionClient as VenueGateway;",
-    )
-    .expect("write compiler-seal alias fixture");
-    fs::write(
-        application.join("src/aliased.rs"),
-        r#"
-            use crate::aliases::VenueGateway as ExecGateway;
-
-            #[derive(Debug)]
-            pub struct CrossFileAliasedClient;
-
-            impl ExecGateway for CrossFileAliasedClient {}
-        "#,
-    )
-    .expect("write compiler-seal aliased implementation fixture");
-
-    let output = Command::new(env!("CARGO"))
-        .args(["check", "--offline", "-p", "gateway-seal-fixture"])
-        .current_dir(fixture.path())
-        .env("CARGO_TARGET_DIR", fixture.path().join("target"))
-        .output()
-        .expect("run compiler-seal fixture");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(!output.status.success(), "macro gateway fixture compiled");
-    assert!(
-        stderr.contains("missing:") || stderr.contains("ExecutionClient"),
-        "{stderr}"
-    );
-}
-
-#[test]
-fn gateway_test_support_feature_is_dev_only_and_registry_pinned() {
+fn canonical_execution_has_no_legacy_test_support_feature() {
     fn collect_registry_entries(root: &Path, workspace_root: &Path, entries: &mut Vec<String>) {
         for entry in fs::read_dir(root).expect("read manifest registry directory") {
             let path = entry.expect("manifest registry entry").path();
@@ -1144,13 +1012,9 @@ fn gateway_test_support_feature_is_dev_only_and_registry_pinned() {
     collect_registry_entries(workspace_root, workspace_root, &mut entries);
     entries.sort();
 
-    assert_eq!(
-        entries,
-        vec![
-            "crates/ploy-daemon-host/Cargo.toml|[dependencies]|ploy-platform-runtime = { workspace = true, features = [\"test-support\"] }",
-            "crates/ploy-platform-runtime/Cargo.toml|[features]|test-support = []",
-        ],
-        "the compiler seal may be relaxed only for the two pinned unit-test crates and never by a production dependency"
+    assert!(
+        entries.is_empty(),
+        "canonical execution fakes use cfg(test), without a production-enabling test-support feature: {entries:?}"
     );
 }
 
@@ -1308,7 +1172,7 @@ fn gateway_defining_crate_has_a_pinned_production_macro_surface() {
             ("derive:Debug".to_string(), 1),
             ("derive:Default".to_string(), 1),
         ]),
-        "new production attributes or derive macros in the seal-defining crate require explicit security review"
+        "new production attributes or derive macros in the execution-client seam require explicit security review"
     );
     assert!(
         visitor.macros.is_empty(),

@@ -31,4 +31,3 @@ rust_decimal_macros.workspace = true
 
 [features]
 default = []
-test-support = []
