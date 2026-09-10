@@ -542,28 +542,18 @@ mod tests {
     use ploy_market_contracts::{HistoricalLoadOptions, MarketUpdate};
     use rust_decimal::prelude::ToPrimitive;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
     struct ParquetFixture {
         root: PathBuf,
-    }
-
-    impl Drop for ParquetFixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
-        }
+        _temp: tempfile::TempDir,
     }
 
     fn fixture_root() -> ParquetFixture {
-        let id = NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "ploy-strategy-bundles-parquet-{}-{id}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        ParquetFixture { root }
+        let temp = tempfile::tempdir().unwrap();
+        ParquetFixture {
+            root: temp.path().to_path_buf(),
+            _temp: temp,
+        }
     }
 
     fn write_mixed_market_file(root: &Path, market_type: &str) {
