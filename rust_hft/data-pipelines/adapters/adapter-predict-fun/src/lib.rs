@@ -18,7 +18,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
@@ -432,6 +431,10 @@ struct AcceptanceTracker {
     markets: HashMap<i64, MarketAcceptance>,
     pending_invalidations: Vec<PredictFunBookProjection>,
     generation: u64,
+    stream_enabled: bool,
+    stream_selected_markets: HashSet<i64>,
+    stream_ready_markets: HashSet<i64>,
+    stream_last_receive_us: u64,
 }
 
 impl AcceptanceTracker {
@@ -518,13 +521,42 @@ impl AcceptanceTracker {
         std::mem::take(&mut self.pending_invalidations)
     }
 
-    fn all_ready(&self, market_ids: &HashSet<i64>) -> bool {
-        !market_ids.is_empty()
-            && market_ids.iter().all(|market_id| {
-                self.markets
-                    .get(market_id)
-                    .is_some_and(|state| state.active && !state.invalidated)
-            })
+    fn begin_stream_generation(&mut self) -> u64 {
+        self.generation = self.generation.saturating_add(1);
+        self.stream_enabled = false;
+        self.stream_selected_markets.clear();
+        self.stream_ready_markets.clear();
+        self.stream_last_receive_us = 0;
+        self.generation
+    }
+
+    fn activate_stream_generation(
+        &mut self,
+        generation: u64,
+        selected_markets: HashSet<i64>,
+    ) -> bool {
+        if self.generation != generation {
+            return false;
+        }
+        self.stream_enabled = true;
+        self.stream_selected_markets = selected_markets;
+        self.stream_ready_markets.clear();
+        self.stream_last_receive_us = 0;
+        true
+    }
+
+    fn stream_generation_active(&self, generation: u64) -> bool {
+        self.generation == generation && self.stream_enabled
+    }
+
+    fn stream_health(&self) -> (bool, u64) {
+        let connected = self.stream_enabled
+            && !self.stream_selected_markets.is_empty()
+            && self
+                .stream_selected_markets
+                .iter()
+                .all(|market_id| self.stream_ready_markets.contains(market_id));
+        (connected, self.stream_last_receive_us)
     }
 }
 
@@ -767,8 +799,32 @@ impl PredictFunClient {
         let mut acceptance = self.acceptance.lock().map_err(|_| {
             PredictFunError::Client("Predict.fun acceptance state poisoned".to_owned())
         })?;
-        acceptance.generation = acceptance.generation.saturating_add(1);
-        Ok(acceptance.generation)
+        Ok(acceptance.begin_stream_generation())
+    }
+
+    fn activate_stream_generation(
+        &self,
+        generation: u64,
+        selected_markets: HashSet<i64>,
+    ) -> PredictFunResult<bool> {
+        let mut acceptance = self.acceptance.lock().map_err(|_| {
+            PredictFunError::Client("Predict.fun acceptance state poisoned".to_owned())
+        })?;
+        Ok(acceptance.activate_stream_generation(generation, selected_markets))
+    }
+
+    fn stream_generation_active(&self, generation: u64) -> PredictFunResult<bool> {
+        let acceptance = self.acceptance.lock().map_err(|_| {
+            PredictFunError::Client("Predict.fun acceptance state poisoned".to_owned())
+        })?;
+        Ok(acceptance.stream_generation_active(generation))
+    }
+
+    fn stream_health(&self) -> PredictFunResult<(bool, u64)> {
+        let acceptance = self.acceptance.lock().map_err(|_| {
+            PredictFunError::Client("Predict.fun acceptance state poisoned".to_owned())
+        })?;
+        Ok(acceptance.stream_health())
     }
 
     fn accept_orderbook_for_generation(
@@ -781,10 +837,19 @@ impl PredictFunClient {
         let mut acceptance = self.acceptance.lock().map_err(|_| {
             PredictFunError::Client("Predict.fun acceptance state poisoned".to_owned())
         })?;
-        if acceptance.generation != generation {
+        if !acceptance.stream_generation_active(generation) {
             return Ok(None);
         }
-        acceptance.accept(projection).map(Some)
+        let projection = acceptance.accept(projection)?;
+        acceptance.stream_last_receive_us = projection.received_at_us;
+        if projection.ready {
+            acceptance.stream_ready_markets.insert(projection.market_id);
+        } else {
+            acceptance
+                .stream_ready_markets
+                .remove(&projection.market_id);
+        }
+        Ok(Some(projection))
     }
 
     pub fn invalidate_market(
@@ -809,10 +874,12 @@ impl PredictFunClient {
         let mut acceptance = self.acceptance.lock().map_err(|_| {
             PredictFunError::Client("Predict.fun acceptance state poisoned".to_owned())
         })?;
-        if acceptance.generation != generation {
+        if !acceptance.stream_generation_active(generation) {
             return Ok(None);
         }
-        acceptance.invalidate(market_id, reason).map(Some)
+        let projection = acceptance.invalidate(market_id, reason)?;
+        acceptance.stream_ready_markets.remove(&market_id);
+        Ok(Some(projection))
     }
 
     pub fn seed_acceptance_clock(
@@ -844,13 +911,6 @@ impl PredictFunClient {
             .lock()
             .map(|mut acceptance| acceptance.drain_invalidations())
             .unwrap_or_default()
-    }
-
-    fn all_markets_ready(&self, market_ids: &HashSet<i64>) -> bool {
-        self.acceptance
-            .lock()
-            .map(|acceptance| acceptance.all_ready(market_ids))
-            .unwrap_or(false)
     }
 }
 
@@ -1001,20 +1061,10 @@ pub fn project_orderbook(
     })
 }
 
-#[derive(Debug, Default)]
-struct StreamState {
-    connected: AtomicBool,
-    enabled: AtomicBool,
-    generation: AtomicU64,
-    last_receive_us: AtomicU64,
-    selected_markets: Mutex<HashSet<i64>>,
-}
-
 pub struct PredictFunMarketStream {
     client: PredictFunClient,
     bindings: Vec<PredictFunMarketBinding>,
     poll_interval: Duration,
-    state: Arc<StreamState>,
 }
 
 impl PredictFunMarketStream {
@@ -1048,7 +1098,6 @@ impl PredictFunMarketStream {
             client,
             bindings,
             poll_interval,
-            state: Arc::new(StreamState::default()),
         })
     }
 
@@ -1102,14 +1151,7 @@ impl MarketStream for PredictFunMarketStream {
                 "Predict.fun requires at least one configured outcome token".to_owned(),
             ));
         }
-        let state = Arc::clone(&self.state);
         let generation = self.client.begin_stream_generation().map_err(hft_error)?;
-        state.generation.store(generation, Ordering::Release);
-        state.enabled.store(false, Ordering::Release);
-        state.connected.store(false, Ordering::Release);
-        if let Ok(mut selected_markets) = state.selected_markets.lock() {
-            selected_markets.clear();
-        }
         self.validate_against_catalog().await?;
         let selected = symbols
             .into_iter()
@@ -1138,12 +1180,13 @@ impl MarketStream for PredictFunMarketStream {
                 .1
                 .push((symbol, outcome));
         }
-        if let Ok(mut selected_markets) = state.selected_markets.lock() {
-            selected_markets.clear();
-            selected_markets.extend(grouped.keys().copied());
+        if !self
+            .client
+            .activate_stream_generation(generation, grouped.keys().copied().collect())
+            .map_err(hft_error)?
+        {
+            return Err(hft_error(PredictFunError::SupersededGeneration));
         }
-        state.enabled.store(true, Ordering::Release);
-        state.connected.store(false, Ordering::Release);
         let client = self.client.clone();
         let poll_interval = self.poll_interval;
         let (tx, mut rx) = mpsc::channel(1_024);
@@ -1152,12 +1195,11 @@ impl MarketStream for PredictFunMarketStream {
             ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
             let mut sequences: HashMap<(i64, PredictFunOutcomeSide), u64> = HashMap::new();
             let mut invalidated = HashSet::new();
-            let mut ready_markets = HashSet::new();
-            while state.enabled.load(Ordering::Acquire)
-                && state.generation.load(Ordering::Acquire) == generation
-                && !tx.is_closed()
-            {
+            while client.stream_generation_active(generation).unwrap_or(false) && !tx.is_closed() {
                 ticker.tick().await;
+                if !client.stream_generation_active(generation).unwrap_or(false) {
+                    return;
+                }
                 for (market_id, (binding, outcomes)) in &grouped {
                     let result = client.orderbook(*market_id).await.and_then(|received| {
                         client
@@ -1170,15 +1212,11 @@ impl MarketStream for PredictFunMarketStream {
                                 projection.ok_or(PredictFunError::SupersededGeneration)
                             })
                     });
-                    if state.generation.load(Ordering::Acquire) != generation {
+                    if !client.stream_generation_active(generation).unwrap_or(false) {
                         return;
                     }
                     match result {
                         Ok(projection) if projection.ready => {
-                            state
-                                .last_receive_us
-                                .store(projection.received_at_us, Ordering::Release);
-                            ready_markets.insert(*market_id);
                             invalidated.remove(market_id);
                             for (symbol, outcome) in outcomes {
                                 let key = (*market_id, *outcome);
@@ -1194,7 +1232,6 @@ impl MarketStream for PredictFunMarketStream {
                             }
                         }
                         Ok(projection) => {
-                            ready_markets.remove(market_id);
                             if invalidated.insert(*market_id) {
                                 for (symbol, _) in outcomes {
                                     if tx
@@ -1218,7 +1255,6 @@ impl MarketStream for PredictFunMarketStream {
                             }
                         }
                         Err(error) => {
-                            ready_markets.remove(market_id);
                             let reason = error.to_string();
                             match client.invalidate_market_for_generation(
                                 generation,
@@ -1247,12 +1283,9 @@ impl MarketStream for PredictFunMarketStream {
                         }
                     }
                 }
-                if state.generation.load(Ordering::Acquire) != generation {
+                if !client.stream_generation_active(generation).unwrap_or(false) {
                     return;
                 }
-                state
-                    .connected
-                    .store(ready_markets.len() == grouped.len(), Ordering::Release);
             }
         });
         Ok(Box::pin(futures::stream::poll_fn(move |cx| {
@@ -1261,33 +1294,20 @@ impl MarketStream for PredictFunMarketStream {
     }
 
     async fn health(&self) -> ConnectionHealth {
-        let selected_markets = self
-            .state
-            .selected_markets
-            .lock()
-            .map(|market_ids| market_ids.clone())
-            .unwrap_or_default();
+        let (connected, last_heartbeat) = self.client.stream_health().unwrap_or((false, 0));
         ConnectionHealth {
-            connected: self.state.connected.load(Ordering::Acquire)
-                && self.client.all_markets_ready(&selected_markets),
+            connected,
             latency_ms: None,
-            last_heartbeat: self.state.last_receive_us.load(Ordering::Acquire),
+            last_heartbeat,
         }
     }
 
     async fn connect(&mut self) -> HftResult<()> {
-        self.state.enabled.store(true, Ordering::Release);
         Ok(())
     }
 
     async fn disconnect(&mut self) -> HftResult<()> {
-        let generation = self.client.begin_stream_generation().map_err(hft_error)?;
-        self.state.generation.store(generation, Ordering::Release);
-        self.state.enabled.store(false, Ordering::Release);
-        self.state.connected.store(false, Ordering::Release);
-        if let Ok(mut selected_markets) = self.state.selected_markets.lock() {
-            selected_markets.clear();
-        }
+        self.client.begin_stream_generation().map_err(hft_error)?;
         Ok(())
     }
 }
