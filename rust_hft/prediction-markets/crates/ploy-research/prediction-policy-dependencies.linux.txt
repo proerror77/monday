@@ -1,9 +1,9 @@
 prediction-policy-dependencies.v5
 target=x86_64-unknown-linux-gnu
 profile=default,db
-input:Cargo.lock=sha256:80f17ebd7e16598de65fae661079320081eddce8a200f90ea99a42fec32a4469
-input:Cargo.toml=sha256:104f7b7a41e62d573b42da227e6fae379c2cfbe70bccf4b65b921a9c1281048f
-input:crates/ploy-research/Cargo.toml=sha256:cfc1572e1364f0e9712a81b2d7d5e6e786541b080862ee6729199ca4524b5541
+input:Cargo.lock=sha256:40434a27341e7f0dcd9ce3d217669bbabf3089f95af5a4d4b9a51e0b1664e7bd
+input:Cargo.toml=sha256:a844f776f78a7087501979a1fcd0ca4f90f1e21073fdedc1a04e2bd5d97dc25d
+input:crates/ploy-research/Cargo.toml=sha256:3d3cc6e52da9335b915c79d776fa335f21c88cda447daffc097cc9755d6c9291
 input:crates/ploy-feed-loaders/Cargo.toml=sha256:abf8f1b8adec93b1ad84a66294cb58eb65f9cbca33c701cc81c7635eb9b35e2c
 input:crates/ploy-market-contracts/Cargo.toml=sha256:e086ddc8f162ff0abcabe832b1b61549f0daf7e98a78ab96f5512c596c3dc7f0
 input:crates/ploy-market-data/Cargo.toml=sha256:e6938c0663c42a96546dae42ddfb1751f66bb92ec78f3bd82d4958885429a6e5
@@ -64,6 +64,7 @@ package:hex@0.4.3|source=registry+https://github.com/rust-lang/crates.io-index|c
 package:hft-core@0.1.0|source=path|checksum=none|features=default
 package:hft-data@0.1.0|source=path|checksum=none|features=default
 package:hft-integration@0.1.0|source=path|checksum=none|features=default
+package:hft-portfolio-core@0.1.0|source=path|checksum=none|features=default
 package:hft-ports@0.1.0|source=path|checksum=none|features=default
 package:hft-search-kernel@0.1.0|source=path|checksum=none|features=
 package:hft-snapshot@0.1.0|source=path|checksum=none|features=

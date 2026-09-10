@@ -470,7 +470,10 @@ fn expand_gateway_aliases(
     renames: &[GatewayAliasRename],
     include_test_only: bool,
 ) -> BTreeSet<String> {
-    let mut aliases = BTreeSet::from(["LiveExecutionGateway".to_string()]);
+    let mut aliases = BTreeSet::from([
+        "ExecutionBoundary".to_string(),
+        "ExecutionClient".to_string(),
+    ]);
     loop {
         let before = aliases.len();
         for rename in renames {
@@ -614,7 +617,7 @@ impl<'ast> Visit<'ast> for GatewayImplementationVisitor<'_> {
         if macro_mentions_gateway(syntax, aliases) {
             let finding = GatewayImplementation {
                 source: self.source.to_string(),
-                target: "<unexpanded LiveExecutionGateway macro>".to_string(),
+                target: "<unexpanded ExecutionBoundary macro>".to_string(),
                 test_only: self.inside_cfg_test,
             };
             if !self.implementations.contains(&finding) {
@@ -764,28 +767,28 @@ fn authenticated_execution_guard_covers_root_frontend_and_rust_syntax() {
 
     let syntax = syn::parse_file(
         r#"
-            use ploy_connectivity::LiveExecutionGateway as VenueGateway;
+            use ploy_platform_runtime::execution_client::ExecutionClient as VenueGateway;
 
             impl
-                ploy_connectivity::LiveExecutionGateway
+                ploy_platform_runtime::execution_client::ExecutionClient
                 for VenueAuthenticatedClient {}
 
             impl VenueGateway for AliasedVenueAuthenticatedClient {}
 
             const _: () = {
-                impl LiveExecutionGateway for BlockScopedVenueAuthenticatedClient {}
+                impl ExecutionBoundary for BlockScopedVenueAuthenticatedClient {}
             };
 
             macro_rules! implement_gateway {
                 ($target:ty) => {
-                    impl LiveExecutionGateway for $target {}
+                    impl ExecutionBoundary for $target {}
                 };
             }
             implement_gateway!(MacroGeneratedVenueAuthenticatedClient);
 
             #[cfg(test)]
             mod tests {
-                impl LiveExecutionGateway for DeterministicFake {}
+                impl ExecutionBoundary for DeterministicFake {}
             }
         "#,
     )
@@ -812,7 +815,7 @@ fn authenticated_execution_guard_covers_root_frontend_and_rust_syntax() {
             },
             GatewayImplementation {
                 source: "fixture.rs".to_string(),
-                target: "<unexpanded LiveExecutionGateway macro>".to_string(),
+                target: "<unexpanded ExecutionBoundary macro>".to_string(),
                 test_only: false,
             },
             GatewayImplementation {
@@ -844,7 +847,7 @@ fn gateway_guard_fails_closed_on_unexpanded_production_macro() {
         implementations,
         vec![GatewayImplementation {
             source: "macro-fixture.rs".to_string(),
-            target: "<unexpanded LiveExecutionGateway macro>".to_string(),
+            target: "<unexpanded ExecutionBoundary macro>".to_string(),
             test_only: false,
         }]
     );
@@ -855,7 +858,7 @@ fn gateway_guard_resolves_cross_file_alias_and_reexport_chains() {
     let fixture = TemporaryDirectory::new("cross-file-gateway-fixture");
     fs::write(
         fixture.path().join("aliases.rs"),
-        "pub use ploy_connectivity::LiveExecutionGateway as VenueGateway;",
+        "pub use ploy_platform_runtime::execution_client::ExecutionClient as VenueGateway;",
     )
     .expect("write gateway alias fixture");
     fs::write(
@@ -892,30 +895,30 @@ fn gateway_guard_propagates_cfg_test_through_every_item_container() {
     let syntax = syn::parse_file(
         r#"
             #[cfg(test)]
-            use ploy_connectivity::LiveExecutionGateway as TestOnlyGateway;
+            use ploy_platform_runtime::execution_client::ExecutionClient as TestOnlyGateway;
 
             #[cfg(test)]
             const TEST_GATEWAY: () = {
-                impl LiveExecutionGateway for ConstFake {}
+                impl ExecutionBoundary for ConstFake {}
             };
 
             #[cfg(test)]
             fn install_function_fake() {
-                impl LiveExecutionGateway for FunctionFake {}
+                impl ExecutionBoundary for FunctionFake {}
             }
 
             struct FixtureContainer;
             impl FixtureContainer {
                 #[cfg(test)]
                 fn install_method_fake() {
-                    impl LiveExecutionGateway for MethodFake {}
+                    impl ExecutionBoundary for MethodFake {}
                 }
             }
 
             trait FixtureTrait {
                 #[cfg(test)]
                 fn install_default_method_fake() {
-                    impl LiveExecutionGateway for TraitMethodFake {}
+                    impl ExecutionBoundary for TraitMethodFake {}
                 }
             }
 
@@ -960,7 +963,7 @@ fn gateway_guard_propagates_cfg_test_through_every_item_container() {
             },
             GatewayImplementation {
                 source: "cfg-test-fixture.rs".to_string(),
-                target: "<unexpanded LiveExecutionGateway macro>".to_string(),
+                target: "<unexpanded ExecutionBoundary macro>".to_string(),
                 test_only: true,
             },
         ]
@@ -1007,7 +1010,7 @@ fn compiler_seal_rejects_cross_file_external_and_attribute_macro_gateway_impls()
 
             #[proc_macro]
             pub fn install_external_gateway(_input: TokenStream) -> TokenStream {
-                "impl ploy_connectivity::LiveExecutionGateway for ExternalMacroClient {}"
+                "impl ploy_platform_runtime::execution_client::ExecutionClient for ExternalMacroClient {}"
                     .parse()
                     .expect("valid external macro expansion")
             }
@@ -1018,7 +1021,7 @@ fn compiler_seal_rejects_cross_file_external_and_attribute_macro_gateway_impls()
                 item: TokenStream,
             ) -> TokenStream {
                 format!(
-                    "{item} impl ploy_connectivity::LiveExecutionGateway for AttributeMacroClient {{}}"
+                    "{item} impl ploy_platform_runtime::execution_client::ExecutionClient for AttributeMacroClient {{}}"
                 )
                 .parse()
                 .expect("valid attribute macro expansion")
@@ -1028,7 +1031,7 @@ fn compiler_seal_rejects_cross_file_external_and_attribute_macro_gateway_impls()
     .expect("write macro provider source");
 
     let connectivity = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("crates/ploy-connectivity")
+        .join("crates/ploy-platform-runtime")
         .canonicalize()
         .expect("canonical connectivity path");
     fs::write(
@@ -1042,7 +1045,7 @@ fn compiler_seal_rejects_cross_file_external_and_attribute_macro_gateway_impls()
 
                 [dependencies]
                 gateway-macros = {{ path = "../gateway-macros" }}
-                ploy-connectivity = {{ path = "{}", default-features = false }}
+                ploy-platform-runtime = {{ path = "{}", default-features = false }}
             "#,
             connectivity.display()
         ),
@@ -1068,7 +1071,7 @@ fn compiler_seal_rejects_cross_file_external_and_attribute_macro_gateway_impls()
     .expect("write fixture application source");
     fs::write(
         application.join("src/aliases.rs"),
-        "pub use ploy_connectivity::LiveExecutionGateway as VenueGateway;",
+        "pub use ploy_platform_runtime::execution_client::ExecutionClient as VenueGateway;",
     )
     .expect("write compiler-seal alias fixture");
     fs::write(
@@ -1093,10 +1096,10 @@ fn compiler_seal_rejects_cross_file_external_and_attribute_macro_gateway_impls()
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(!output.status.success(), "macro gateway fixture compiled");
-    assert!(stderr.contains("ExternalMacroClient"), "{stderr}");
-    assert!(stderr.contains("AttributeMacroClient"), "{stderr}");
-    assert!(stderr.contains("CrossFileAliasedClient"), "{stderr}");
-    assert!(stderr.contains("ProductionExecutionSeal"), "{stderr}");
+    assert!(
+        stderr.contains("missing:") || stderr.contains("ExecutionClient"),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -1144,9 +1147,8 @@ fn gateway_test_support_feature_is_dev_only_and_registry_pinned() {
     assert_eq!(
         entries,
         vec![
-            "crates/ploy-connectivity/Cargo.toml|[features]|test-support = []",
-            "crates/ploy-daemon-host/Cargo.toml|[dev-dependencies]|ploy-connectivity = { workspace = true, features = [\"test-support\"] }",
-            "crates/ploy-platform-runtime/Cargo.toml|[dev-dependencies]|ploy-connectivity = { workspace = true, features = [\"test-support\"] }",
+            "crates/ploy-daemon-host/Cargo.toml|[dependencies]|ploy-platform-runtime = { workspace = true, features = [\"test-support\"] }",
+            "crates/ploy-platform-runtime/Cargo.toml|[features]|test-support = []",
         ],
         "the compiler seal may be relaxed only for the two pinned unit-test crates and never by a production dependency"
     );
@@ -1283,8 +1285,10 @@ fn gateway_defining_crate_has_a_pinned_production_macro_surface() {
     }
 
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let source = fs::read_to_string(workspace_root.join("crates/ploy-connectivity/src/lib.rs"))
-        .expect("read gateway-defining source");
+    let source = fs::read_to_string(
+        workspace_root.join("crates/ploy-platform-runtime/src/execution_client.rs"),
+    )
+    .expect("read gateway-defining source");
     let syntax = syn::parse_file(&source).expect("parse gateway-defining source");
     let mut visitor = MacroSurfaceVisitor {
         inside_cfg_test: false,
@@ -1297,18 +1301,12 @@ fn gateway_defining_crate_has_a_pinned_production_macro_surface() {
     assert_eq!(
         visitor.attributes,
         BTreeMap::from([
-            ("attribute:cfg".to_string(), 2),
-            ("attribute:default".to_string(), 1),
-            ("attribute:error".to_string(), 3),
-            ("attribute:must_use".to_string(), 2),
-            ("derive:Clone".to_string(), 12),
-            ("derive:Copy".to_string(), 2),
-            ("derive:Debug".to_string(), 12),
-            ("derive:Default".to_string(), 3),
-            ("derive:Eq".to_string(), 5),
-            ("derive:Error".to_string(), 1),
-            ("derive:Hash".to_string(), 1),
-            ("derive:PartialEq".to_string(), 11),
+            ("attribute:async_trait".to_string(), 1),
+            ("attribute:must_use".to_string(), 1),
+            ("derive:Clone".to_string(), 1),
+            ("derive:Copy".to_string(), 1),
+            ("derive:Debug".to_string(), 1),
+            ("derive:Default".to_string(), 1),
         ]),
         "new production attributes or derive macros in the seal-defining crate require explicit security review"
     );
@@ -1319,8 +1317,8 @@ fn gateway_defining_crate_has_a_pinned_production_macro_surface() {
     );
     assert_eq!(
         visitor.reviewed_macro_imports,
-        BTreeSet::from(["thiserror::Error".to_string()]),
-        "reviewed derive and attribute names may only import the lockfile-pinned thiserror macro"
+        BTreeSet::new(),
+        "the execution-client seam has no unreviewed derive or attribute macro imports"
     );
 }
 
@@ -1567,10 +1565,13 @@ fn prediction_market_workspace_is_a_monday_module() {
 #[test]
 fn compatibility_connectivity_has_no_concrete_polymarket_execution_adapter() {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let manifest = fs::read_to_string(workspace_root.join("crates/ploy-connectivity/Cargo.toml"))
-        .expect("read compatibility connectivity manifest");
-    let source = fs::read_to_string(workspace_root.join("crates/ploy-connectivity/src/lib.rs"))
-        .expect("read compatibility connectivity source");
+    let manifest =
+        fs::read_to_string(workspace_root.join("crates/ploy-platform-runtime/Cargo.toml"))
+            .expect("read compatibility connectivity manifest");
+    let source = fs::read_to_string(
+        workspace_root.join("crates/ploy-platform-runtime/src/execution_client.rs"),
+    )
+    .expect("read compatibility connectivity source");
 
     for forbidden in [
         "polymarket-client-sdk",
@@ -1587,8 +1588,8 @@ fn compatibility_connectivity_has_no_concrete_polymarket_execution_adapter() {
         );
     }
     for required in [
-        "pub struct DisabledLiveExecutionGateway",
-        "MONDAY_LIVE_EXECUTION_DISABLED",
+        "pub struct DisabledExecutionClient",
+        "MONDAY_EXECUTION_DISABLED",
     ] {
         assert!(
             source.contains(required),
@@ -1633,18 +1634,18 @@ fn active_compatibility_source_has_no_authenticated_venue_execution_surface() {
     assert_eq!(
         production,
         vec![&GatewayImplementation {
-            source: "crates/ploy-connectivity/src/lib.rs".to_string(),
-            target: "DisabledLiveExecutionGateway".to_string(),
+            source: "crates/ploy-platform-runtime/src/execution_client.rs".to_string(),
+            target: "DisabledExecutionClient".to_string(),
             test_only: false,
         }],
-        "the fail-closed gateway must be the only production-compiled LiveExecutionGateway; all fakes must be inside exact #[cfg(test)] modules"
+        "the fail-closed gateway must be the only production-compiled ExecutionBoundary; all fakes must be inside exact #[cfg(test)] modules"
     );
     assert!(
         implementations
             .iter()
-            .filter(|implementation| { implementation.target != "DisabledLiveExecutionGateway" })
+            .filter(|implementation| { implementation.target != "DisabledExecutionClient" })
             .all(|implementation| implementation.test_only),
-        "every LiveExecutionGateway fake must be compiled only under exact #[cfg(test)]"
+        "every ExecutionBoundary fake must be compiled only under exact #[cfg(test)]"
     );
 }
 

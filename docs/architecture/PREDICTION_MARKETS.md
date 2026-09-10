@@ -327,7 +327,7 @@ workspace.
 | 0. Establish ownership | Complete | Source lives at `rust_hft/prediction-markets`; `products/ploy` is absent; CI enforces the layout |
 | 1. Remove credentialed compatibility Adapters | Complete | Compatibility code contains no private-key handling, authenticated client construction, or concrete Polymarket gateway; production boot remains fail closed |
 | 2. Split venue data Adapters | Planned | Polymarket, Predict.fun, Binance, and Deribit collectors implement canonical `data-pipelines` interfaces; superseded compatibility copies are deleted |
-| 3. Promote shared runtime contracts | Planned | Reusable instruments, fees, typed intents, risk, OMS, monitoring, execution contracts, and reconciliation depend on canonical Monday interfaces rather than `ploy-*` compatibility types |
+| 3. Promote shared runtime contracts | Complete for order/account state and research replay | Prediction research and runtime state use `hft-ports`, `hft-oms-core`, and `hft-portfolio-core`; old `ploy-trading` and `ploy-connectivity` packages are removed, and the remaining disabled execution boundary is owned by `ploy-platform-runtime` |
 | 4. Retire the compatibility workspace | Planned | Entrypoints and operator UI compose Monday modules, package names are functional, and the nested Cargo workspace can be removed |
 
 Each later phase must add contract tests at the receiving seam before moving an
@@ -342,14 +342,15 @@ the canonical implementation remain active.
 - Root workflows and active source remain scanned, and tracked-secret detection
   covers the complete repository tree. There is no nested prediction-market workflow surface.
 - The active compatibility entrypoints are `new-ployd`, `ploy-agent-sidecar`, `new-ploy-runner`, `ployctl`, and `ploytui`. The root `ploy` crate is a compatibility shim; new entrypoints use functional Monday names.
-- `PloyDaemon::boot` installs `DisabledLiveExecutionGateway`; production code
+- `PloyDaemon::boot` installs `DisabledCanonicalExecutionBoundary`; production code
   cannot inject a concrete venue Adapter. The former private Polymarket gateway
   and its SDK/private-key dependencies have been removed from the compatibility
   module, and the standard runner `full` feature does not enable its legacy
   control-plane live executor.
-- The compatibility `LiveExecutionGateway` contract and paper/runtime state are
-  not canonical Monday interfaces. They remain migration debt until Phase 3 and
-  cannot be implemented by a credentialed venue client in this module.
+- Prediction runtime state is owned by canonical OMS and Portfolio checkpoints.
+  The platform runtime's `ExecutionBoundary` is a fail-closed disabled boundary
+  for legacy paper/control flows; it cannot be implemented by a credentialed
+  venue client in this module.
 - The standalone Node account-operation packages are retired. Polymarket account,
   order, cancellation, and reconciliation operations remain in canonical Monday modules; the prediction-market module
   does not retain a second execution path.

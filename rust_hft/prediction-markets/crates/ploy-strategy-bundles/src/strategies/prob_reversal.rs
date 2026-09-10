@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, Utc};
-use ploy_trading::{
+use portfolio_core::prediction::{
     FillRecord, IntentPurpose, OrderLedger, PositionLedger, TradeSide, TradingIntent,
 };
 use rust_decimal::prelude::ToPrimitive;
@@ -613,7 +613,7 @@ impl StrategyLogic for ProbReversalStrategy {
 mod tests {
     use super::*;
     use chrono::Duration;
-    use ploy_trading::{OrderLedger, PositionLedger};
+    use portfolio_core::prediction::{OrderLedger, PositionLedger};
     use rust_decimal_macros::dec;
     #[test]
     fn strategy_name() {
@@ -787,7 +787,7 @@ mod tests {
             ..ProbReversalConfig::default()
         };
         let mut strategy = ProbReversalStrategy::new(config);
-        let mut positions = PositionLedger::default();
+        let positions = PositionLedger::default();
         let orders = OrderLedger::default();
         let now = Utc::now();
 
@@ -817,7 +817,13 @@ mod tests {
             fee: Decimal::ZERO,
             timestamp: now,
         };
-        positions.apply_fill(&fill);
+        let positions = crate::canonical_test_support::position_projection(
+            crate::canonical_test_support::entry_intent("up3", dec!(10)),
+            "o1",
+            "venue-o1",
+            [fill.clone()],
+        );
+        assert_eq!(positions.net_qty("up3"), dec!(10));
         strategy.on_fill(&fill);
 
         // Quote at 0.90 — above take_profit_prob.

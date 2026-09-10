@@ -15,7 +15,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use async_trait::async_trait;
-use ploy_trading::TradingIntent;
+use portfolio_core::prediction::TradingIntent;
 
 use crate::traits::{ExecutionReport, Executor};
 

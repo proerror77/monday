@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use ploy_trading::{
+use portfolio_core::prediction::{
     FillRecord, IntentPurpose, OrderLedger, PositionLedger, TradeSide, TradingIntent,
 };
 use rust_decimal::prelude::ToPrimitive;
@@ -363,9 +363,9 @@ impl BayesianDirectionalStrategy {
         orders.orders().any(|order| {
             matches!(
                 order.state,
-                ploy_trading::OrderState::Pending
-                    | ploy_trading::OrderState::Acknowledged
-                    | ploy_trading::OrderState::PartiallyFilled
+                portfolio_core::prediction::OrderState::Pending
+                    | portfolio_core::prediction::OrderState::Acknowledged
+                    | portfolio_core::prediction::OrderState::PartiallyFilled
             ) && (order.token_id.as_str() == &*event.up_token
                 || order.token_id.as_str() == &*event.down_token)
         })
@@ -1068,11 +1068,11 @@ impl StrategyLogic for BayesianDirectionalStrategy {
         }
 
         match fill.side {
-            ploy_trading::TradeSide::Buy => {
+            portfolio_core::prediction::TradeSide::Buy => {
                 self.entry_prices
                     .insert(Arc::from(fill.token_id.as_str()), fill.price);
             }
-            ploy_trading::TradeSide::Sell => {
+            portfolio_core::prediction::TradeSide::Sell => {
                 if let Some(entry_price) = self.entry_prices.remove(fill.token_id.as_str()) {
                     let pnl = (fill.price - entry_price) * fill.quantity - fill.fee;
                     self.daily_realized_pnl += pnl;
@@ -1081,7 +1081,7 @@ impl StrategyLogic for BayesianDirectionalStrategy {
         }
     }
 
-    fn on_reject(&mut self, intent: &ploy_trading::TradingIntent, reason: &str) {
+    fn on_reject(&mut self, intent: &portfolio_core::prediction::TradingIntent, reason: &str) {
         let now = self.feed_time.unwrap_or_else(Utc::now);
 
         if reason.contains("not enough balance") {
@@ -1109,7 +1109,7 @@ impl StrategyLogic for BayesianDirectionalStrategy {
 mod tests {
     use super::*;
     use crate::traits::MarketUpdate;
-    use ploy_trading::{OrderLedger, PositionLedger};
+    use portfolio_core::prediction::{OrderLedger, PositionLedger};
 
     fn default_config() -> BayesianDirectionalConfig {
         BayesianDirectionalConfig {

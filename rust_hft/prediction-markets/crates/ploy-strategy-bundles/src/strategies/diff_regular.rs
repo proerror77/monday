@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, Utc};
-use ploy_trading::{
+use portfolio_core::prediction::{
     FillRecord, IntentPurpose, OrderLedger, PositionLedger, TradeSide, TradingIntent,
 };
 use rust_decimal::prelude::ToPrimitive;
@@ -818,7 +818,7 @@ impl StrategyLogic for DiffRegularStrategy {
 mod tests {
     use super::*;
     use chrono::Duration;
-    use ploy_trading::{OrderLedger, PositionLedger};
+    use portfolio_core::prediction::{OrderLedger, PositionLedger};
     use rust_decimal_macros::dec;
 
     #[test]
@@ -998,7 +998,7 @@ mod tests {
             ..DiffRegularConfig::default()
         };
         let mut strategy = DiffRegularStrategy::new(config);
-        let mut positions = PositionLedger::default();
+        let positions = PositionLedger::default();
         let orders = OrderLedger::default();
         let now = Utc::now();
 
@@ -1028,7 +1028,12 @@ mod tests {
             fee: Decimal::ZERO,
             timestamp: now,
         };
-        positions.apply_fill(&buy_fill);
+        let positions = crate::canonical_test_support::position_projection(
+            crate::canonical_test_support::entry_intent("up3", dec!(5)),
+            "order-1",
+            "venue-order-1",
+            [buy_fill.clone()],
+        );
         strategy.on_fill(&buy_fill);
 
         let no_quote_decisions = strategy.on_update(

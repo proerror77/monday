@@ -8,7 +8,7 @@ use ports::{
     OrderReconciliationReport, OrderRecord, OrderStatus,
 };
 use rust_decimal::Decimal;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -759,10 +759,14 @@ impl ExecutionControlHandle {
         account_view.high_water_mark = account_view.equity();
         engine.import_portfolio_state(ports::PortfolioState {
             account_view,
+            total_fees: Decimal::ZERO,
             order_meta: current.order_meta,
             market_prices: current.market_prices,
             processed_fill_ids: baseline_processed_fill_ids,
+            processed_fee_ids: HashMap::new(),
             recent_accounting_event_ids: baseline_recent_accounting_event_ids,
+            reconciliation_exceptions: Vec::new(),
+            canonical_state_digest: None,
         })?;
         Ok(true)
     }
@@ -1492,10 +1496,14 @@ mod tests {
             Self {
                 state: ports::PortfolioState {
                     account_view: account_view.clone(),
+                    total_fees: Decimal::ZERO,
                     order_meta: HashMap::new(),
                     market_prices: HashMap::new(),
                     processed_fill_ids: HashMap::new(),
+                    processed_fee_ids: HashMap::new(),
                     recent_accounting_event_ids: Vec::new(),
+                    reconciliation_exceptions: Vec::new(),
+                    canonical_state_digest: None,
                 },
                 snapshot: snapshot::SnapshotContainer::new(account_view),
             }
@@ -1503,8 +1511,9 @@ mod tests {
     }
 
     impl PortfolioManager for TestPortfolio {
-        fn register_order(&mut self, order_id: OrderId, symbol: Symbol, side: Side) {
+        fn register_order(&mut self, order_id: OrderId, symbol: Symbol, side: Side) -> bool {
             self.state.order_meta.insert(order_id, (symbol, side));
+            true
         }
 
         fn on_execution_event(&mut self, _event: &ExecutionEvent) {}
@@ -1528,7 +1537,9 @@ mod tests {
     }
 
     impl OrderManager for ReconcileOrderManager {
-        fn register_order(&mut self, _params: RegisterOrderParams) {}
+        fn register_order(&mut self, _params: RegisterOrderParams) -> bool {
+            true
+        }
 
         fn on_execution_event(&mut self, _event: &ExecutionEvent) -> Option<OrderUpdate> {
             None
@@ -1650,6 +1661,7 @@ mod tests {
                 status: OrderStatus::Acknowledged,
                 venue: Some(VenueId::MOCK),
                 strategy_id: Some("test".to_string()),
+                processed_fill_ids: std::collections::HashSet::new(),
             },
         }));
         let engine = Arc::new(Mutex::new(engine));
@@ -1700,6 +1712,7 @@ mod tests {
                 status: OrderStatus::Acknowledged,
                 venue: Some(VenueId::BINANCE),
                 strategy_id: Some("test".to_string()),
+                processed_fill_ids: std::collections::HashSet::new(),
             },
         }));
         engine
@@ -1794,6 +1807,7 @@ mod tests {
                 status: OrderStatus::Acknowledged,
                 venue: Some(VenueId::BINANCE),
                 strategy_id: Some("alpha".to_string()),
+                processed_fill_ids: std::collections::HashSet::new(),
             },
         )]));
         assert_eq!(
@@ -2962,6 +2976,7 @@ mod tests {
                 status: OrderStatus::Acknowledged,
                 venue: Some(VenueId::POLYMARKET),
                 strategy_id: Some("test".to_string()),
+                processed_fill_ids: std::collections::HashSet::new(),
             },
         }));
         let engine = Arc::new(Mutex::new(engine));
@@ -3016,6 +3031,7 @@ mod tests {
                 status: OrderStatus::PartiallyFilled,
                 venue: Some(VenueId::POLYMARKET),
                 strategy_id: Some("test".to_string()),
+                processed_fill_ids: std::collections::HashSet::new(),
             },
         }));
         let (worker_tx, mut worker_rx) = mpsc::unbounded_channel();
@@ -3057,6 +3073,7 @@ mod tests {
                 status: OrderStatus::Acknowledged,
                 venue: Some(VenueId::POLYMARKET),
                 strategy_id: Some("test".to_string()),
+                processed_fill_ids: std::collections::HashSet::new(),
             },
         }));
         let (worker_tx, mut worker_rx) = mpsc::unbounded_channel();

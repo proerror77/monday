@@ -4320,6 +4320,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "hft-oms-core"
+version = "0.1.0"
+dependencies = [
+ "hft-core",
+ "hft-ports",
+ "rust_decimal",
+ "serde",
+ "tracing",
+]
+
+[[package]]
+name = "hft-portfolio-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hft-core",
+ "hft-oms-core",
+ "hft-ports",
+ "hft-snapshot",
+ "rust_decimal",
+ "serde",
+ "sha2",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "hft-ports"
 version = "0.1.0"
 dependencies = [
@@ -5318,6 +5345,7 @@ name = "new-ployd"
 version = "0.1.0"
 dependencies = [
  "ploy-daemon-host",
+ "tokio",
 ]
 
 [[package]]
@@ -5825,16 +5853,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ploy-connectivity"
-version = "0.1.0"
-dependencies = [
- "ploy-trading",
- "rust_decimal",
- "rust_decimal_macros",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "ploy-control-client"
 version = "0.1.0"
 dependencies = [
@@ -5848,16 +5866,18 @@ dependencies = [
 name = "ploy-daemon-host"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
+ "hft-core",
+ "hft-portfolio-core",
+ "hft-ports",
  "hmac",
- "ploy-connectivity",
  "ploy-deployments",
  "ploy-market-contracts",
  "ploy-operator-contracts",
  "ploy-platform",
  "ploy-platform-runtime",
  "ploy-strategy-bundles",
- "ploy-trading",
  "rand 0.8.7",
  "rust_decimal",
  "rust_decimal_macros",
@@ -5962,16 +5982,21 @@ dependencies = [
 name = "ploy-platform-runtime"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
- "ploy-connectivity",
+ "futures",
+ "hft-core",
+ "hft-portfolio-core",
+ "hft-ports",
  "ploy-deployments",
  "ploy-operator-contracts",
  "ploy-platform",
- "ploy-trading",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",
  "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
  "uuid",
 ]
 
@@ -5994,7 +6019,10 @@ dependencies = [
  "chrono",
  "ciborium",
  "fs2",
+ "hft-core",
  "hft-data",
+ "hft-portfolio-core",
+ "hft-ports",
  "hft-search-kernel",
  "libc",
  "optimizer",
@@ -6002,8 +6030,6 @@ dependencies = [
  "ploy-market-contracts",
  "ploy-market-data",
  "ploy-operator-contracts",
- "ploy-strategy-bundles",
- "ploy-trading",
  "polars",
  "rand 0.8.7",
  "rust_decimal",
@@ -6038,10 +6064,10 @@ dependencies = [
  "async-trait",
  "chrono",
  "duckdb",
+ "hft-portfolio-core",
  "ploy-feed-loaders",
  "ploy-market-contracts",
  "ploy-operator-contracts",
- "ploy-trading",
  "polymarket-tape-contract",
  "rust_decimal",
  "rust_decimal_macros",
@@ -6063,30 +6089,18 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "hft-portfolio-core",
  "ploy-control-client",
  "ploy-feed-loaders",
  "ploy-market-data",
  "ploy-operator-contracts",
  "ploy-platform-runtime",
  "ploy-strategy-bundles",
- "ploy-trading",
  "rust_decimal",
  "serde_json",
  "sqlx",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "ploy-trading"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "rust_decimal",
- "rust_decimal_macros",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
 ]
 
 [[package]]

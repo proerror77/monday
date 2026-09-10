@@ -81,7 +81,11 @@ mod tests {
         for forbidden in [
             "ploy-operator-contracts",
             "ploy-strategy-bundles",
-            "ploy-trading",
+            "ploy-platform-runtime",
+            "hft-runtime",
+            "hft-engine",
+            "hft-execution",
+            "hft-execution-adapter-polymarket",
         ] {
             assert!(!fingerprint.contains(&format!("package:{forbidden}@")));
         }
@@ -117,7 +121,7 @@ mod tests {
         );
 
         for (package, expected) in [
-            ("ploy-trading", "includes runtime authority ploy-trading"),
+            ("hft-runtime", "includes runtime authority hft-runtime"),
             ("sqlx-sqlite", "includes sqlx-sqlite"),
             (
                 "core-foundation-sys",

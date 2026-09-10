@@ -968,8 +968,26 @@ pub struct RegisterOrderParams {
     pub strategy_id: Option<String>,
 }
 
+/// An observed accounting event which the canonical portfolio deliberately
+/// refused to apply.  It is persisted so a caller can halt and reconcile the
+/// authoritative venue event instead of silently dropping it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ReconciliationException {
+    pub order_id: Option<OrderId>,
+    pub reason: String,
+    pub event: Option<ExecutionEvent>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NotionalFillContract {
+    pub requested_notional: rust_decimal::Decimal,
+    pub limit_price: Price,
+    pub filled_notional: rust_decimal::Decimal,
+    pub reduce_only: bool,
+}
+
 /// 訂單記錄
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OrderRecord {
     pub order_id: OrderId,
     pub client_order_id: Option<String>,
@@ -982,6 +1000,17 @@ pub struct OrderRecord {
     pub status: OrderStatus,
     pub venue: Option<hft_core::VenueId>,
     pub strategy_id: Option<String>,
+    #[serde(default)]
+    pub processed_fill_ids: std::collections::HashSet<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OmsCheckpoint {
+    pub orders: std::collections::HashMap<OrderId, OrderRecord>,
+    #[serde(default)]
+    pub notional_contracts: std::collections::HashMap<OrderId, NotionalFillContract>,
+    #[serde(default)]
+    pub reconciliation_exceptions: Vec<ReconciliationException>,
 }
 
 /// Local OMS versus authoritative exchange open-order reconciliation.
@@ -1022,7 +1051,7 @@ pub struct QuantityMismatch {
 /// 訂單管理器 trait - 提供訂單生命週期管理能力
 pub trait OrderManager: Send + Sync {
     /// 註冊新訂單
-    fn register_order(&mut self, params: RegisterOrderParams);
+    fn register_order(&mut self, params: RegisterOrderParams) -> bool;
 
     /// 處理執行事件，返回訂單狀態更新
     fn on_execution_event(&mut self, event: &ExecutionEvent) -> Option<OrderUpdate>;
@@ -1033,6 +1062,25 @@ pub trait OrderManager: Send + Sync {
     /// 導入 OMS 狀態（供恢復/持久化使用）
     fn import_state(&mut self, state: std::collections::HashMap<OrderId, OrderRecord>);
 
+    /// Concrete canonical implementations preserve deduplication, notional
+    /// contracts, and reconciliation evidence through this checkpoint seam.
+    fn export_checkpoint(&self) -> OmsCheckpoint {
+        OmsCheckpoint {
+            orders: self.export_state(),
+            notional_contracts: std::collections::HashMap::new(),
+            reconciliation_exceptions: Vec::new(),
+        }
+    }
+
+    fn reconciliation_exception_count(&self) -> usize {
+        0
+    }
+
+    fn import_checkpoint(&mut self, checkpoint: OmsCheckpoint) -> Result<(), String> {
+        self.import_state(checkpoint.orders);
+        Ok(())
+    }
+
     /// 取得指定策略的未結訂單
     fn open_order_pairs_by_strategy(&self, strategy_id: &str) -> Vec<(OrderId, Symbol)>;
 
@@ -1041,22 +1089,37 @@ pub trait OrderManager: Send + Sync {
 }
 
 /// Portfolio 狀態（供持久化使用）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PortfolioState {
     pub account_view: AccountView,
+    /// Canonical venue fees applied to the account.  Kept separate from fill
+    /// projections so a fee report arriving after a duplicate fill is not
+    /// silently lost.
+    #[serde(default)]
+    pub total_fees: rust_decimal::Decimal,
     pub order_meta: std::collections::HashMap<OrderId, (Symbol, Side)>,
     pub market_prices: std::collections::HashMap<Symbol, Price>,
     /// 已處理的成交ID（去重），恢復後避免重覆累計
     pub processed_fill_ids: std::collections::HashMap<OrderId, std::collections::HashSet<String>>,
+    /// Fee identities use a separate namespace from fill identities.
+    #[serde(default)]
+    pub processed_fee_ids: std::collections::HashMap<OrderId, std::collections::HashSet<String>>,
     /// Engine accounting replay horizon, ordered oldest to newest. Hash-based portfolio fill sets
     /// cannot reconstruct recency once the bounded engine deduper reaches capacity.
     pub recent_accounting_event_ids: Vec<(OrderId, String)>,
+    #[serde(default)]
+    pub reconciliation_exceptions: Vec<ReconciliationException>,
+    /// Digest of the canonical account/metadata/dedup checkpoint.  A present
+    /// digest must match before restore; absent is accepted only for older
+    /// snapshots and remains visible to the caller as legacy state.
+    #[serde(default)]
+    pub canonical_state_digest: Option<String>,
 }
 
 /// Portfolio 管理器 trait - 提供帳戶會計能力
 pub trait PortfolioManager: Send + Sync {
     /// 註冊訂單元資訊（供 fill 時查找 symbol/side）
-    fn register_order(&mut self, order_id: OrderId, symbol: Symbol, side: Side);
+    fn register_order(&mut self, order_id: OrderId, symbol: Symbol, side: Side) -> bool;
 
     /// 處理執行事件
     fn on_execution_event(&mut self, event: &ExecutionEvent);
@@ -1072,6 +1135,15 @@ pub trait PortfolioManager: Send + Sync {
 
     /// 導入 Portfolio 狀態（供恢復/持久化使用）
     fn import_state(&mut self, state: PortfolioState);
+
+    fn try_import_state(&mut self, state: PortfolioState) -> Result<(), String> {
+        self.import_state(state);
+        Ok(())
+    }
+
+    fn reconciliation_exception_count(&self) -> usize {
+        0
+    }
 }
 
 #[cfg(test)]

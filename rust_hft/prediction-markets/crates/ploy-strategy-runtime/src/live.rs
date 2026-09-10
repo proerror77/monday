@@ -11,7 +11,7 @@ use ploy_strategy_bundles::{
     Feed, FullConfig, LiveFeed, RecordingFeed, RuntimeMode, StrategyLogic,
 };
 #[cfg(feature = "live-execution")]
-use ploy_trading::TradingRuntime;
+use portfolio_core::prediction::TradingRuntime;
 use sqlx::postgres::PgPoolOptions;
 use std::env;
 use std::sync::Arc;
@@ -28,7 +28,7 @@ mod execution {
     use ploy_control_client::ControlPlaneClient;
     use ploy_operator_contracts::{IntentPurpose, PaperIntentRequest};
     use ploy_strategy_bundles::{ExecutionPolicy, ExecutionReport};
-    use ploy_trading::{FillRecord, TradeSide, TradingIntent};
+    use portfolio_core::prediction::{FillRecord, TradeSide, TradingIntent};
     use rust_decimal::Decimal;
     use std::collections::{BTreeMap, BTreeSet};
     use tracing::{debug, error};
@@ -71,11 +71,11 @@ mod execution {
                 quantity: intent.quantity,
                 limit_price: intent.limit_price,
                 purpose: match intent.purpose {
-                    ploy_trading::IntentPurpose::Entry => IntentPurpose::Entry,
-                    ploy_trading::IntentPurpose::Exit => IntentPurpose::Exit,
-                    ploy_trading::IntentPurpose::Reduce => IntentPurpose::Reduce,
-                    ploy_trading::IntentPurpose::Hedge => IntentPurpose::Hedge,
-                    ploy_trading::IntentPurpose::Cancel => IntentPurpose::Cancel,
+                    portfolio_core::prediction::IntentPurpose::Entry => IntentPurpose::Entry,
+                    portfolio_core::prediction::IntentPurpose::Exit => IntentPurpose::Exit,
+                    portfolio_core::prediction::IntentPurpose::Reduce => IntentPurpose::Reduce,
+                    portfolio_core::prediction::IntentPurpose::Hedge => IntentPurpose::Hedge,
+                    portfolio_core::prediction::IntentPurpose::Cancel => IntentPurpose::Cancel,
                 },
             }
         }
@@ -270,7 +270,7 @@ mod execution {
 
         async fn reconcile_fills(
             &mut self,
-            _orders: &ploy_trading::OrderLedger,
+            _orders: &portfolio_core::prediction::OrderLedger,
         ) -> Result<Vec<FillRecord>, String> {
             let client = self.client.clone();
             let deployment_id = self.deployment_id.clone();
@@ -313,7 +313,7 @@ mod execution {
         use chrono::Utc;
         use ploy_operator_contracts::{DeploymentRuntimeMode, FillSnapshot, TradingStateSnapshot};
         use ploy_strategy_bundles::Executor;
-        use ploy_trading::IntentPurpose;
+        use portfolio_core::prediction::IntentPurpose;
         use std::fs;
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -460,7 +460,7 @@ mod execution {
             let mut client = ControlPlaneClient::from_runtime_root(root);
             client.control_plane_addr = "127.0.0.1:9".to_string();
             let mut executor = LiveExecutor::new(client, ExecutionPolicy::default(), "deployment");
-            let orders = ploy_trading::OrderLedger::default();
+            let orders = portfolio_core::prediction::OrderLedger::default();
 
             assert_eq!(executor.reconcile_fills(&orders).await.unwrap().len(), 1);
             assert!(executor.reconcile_fills(&orders).await.unwrap().is_empty());
@@ -509,7 +509,7 @@ pub(crate) async fn run_live_or_dry_run_entry(
     deployment_id: String,
 ) -> (
     ploy_strategy_bundles::RuntimeResult,
-    ploy_trading::TradingRuntimeSnapshot,
+    portfolio_core::prediction::TradingRuntimeSnapshot,
 ) {
     run_live_or_dry_run(config, symbols, strategy, runtime_config, deployment_id).await
 }
@@ -538,7 +538,7 @@ async fn run_live_or_dry_run(
     deployment_id: String,
 ) -> (
     ploy_strategy_bundles::RuntimeResult,
-    ploy_trading::TradingRuntimeSnapshot,
+    portfolio_core::prediction::TradingRuntimeSnapshot,
 ) {
     let db_url = env::var("DATABASE_URL").ok();
     let db_pool: Option<sqlx::PgPool> = match db_url.as_deref() {
@@ -744,7 +744,7 @@ async fn drain_market_update_recorder(
     runtime_config: &RuntimeModeConfig,
 ) -> (
     ploy_strategy_bundles::RuntimeResult,
-    ploy_trading::TradingRuntimeSnapshot,
+    portfolio_core::prediction::TradingRuntimeSnapshot,
 ) {
     let start = std::time::Instant::now();
     let mut updates_processed = 0_u64;
@@ -781,8 +781,8 @@ async fn drain_market_update_recorder(
         fills_recorded: 0,
         non_settlement_fills_observed: 0,
         full_depth_fills_observed: 0,
-        pnl: ploy_trading::PnlSnapshot::default(),
-        risk: ploy_trading::RiskSnapshot::default(),
+        pnl: portfolio_core::prediction::PnlSnapshot::default(),
+        risk: portfolio_core::prediction::RiskSnapshot::default(),
         elapsed_secs: start.elapsed().as_secs_f64(),
         strategy_diagnostics: Vec::new(),
     };
@@ -792,7 +792,10 @@ async fn drain_market_update_recorder(
         depth_quotes = result.depth_quote_updates_observed,
         "Pure market recorder stopped",
     );
-    (result, ploy_trading::TradingRuntimeSnapshot::default())
+    (
+        result,
+        portfolio_core::prediction::TradingRuntimeSnapshot::default(),
+    )
 }
 
 #[cfg(test)]

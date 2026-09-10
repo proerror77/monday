@@ -13,7 +13,7 @@ pub(crate) async fn run_replay_entry(
     runtime_config: RuntimeModeConfig,
 ) -> (
     ploy_strategy_bundles::RuntimeResult,
-    ploy_trading::TradingRuntimeSnapshot,
+    portfolio_core::prediction::TradingRuntimeSnapshot,
 ) {
     run_replay(config, strategy, runtime_config).await
 }
@@ -24,7 +24,7 @@ async fn run_replay(
     runtime_config: RuntimeModeConfig,
 ) -> (
     ploy_strategy_bundles::RuntimeResult,
-    ploy_trading::TradingRuntimeSnapshot,
+    portfolio_core::prediction::TradingRuntimeSnapshot,
 ) {
     let replay_path = config.replay_market_updates_path().unwrap_or_else(|| {
         eprintln!("Replay mode requires [runtime].replay_market_updates_from in the config");

@@ -1,13 +1,15 @@
-use ploy_connectivity::ExecutionError;
+use crate::execution_client::execution_io_error;
 use ploy_operator_contracts::{
     DeploymentState, DesiredState, FillSnapshot, IntentPurpose, ObservedState,
     OrderControlResponse, OrderSnapshot, PnlSnapshotResponse, PositionSnapshotResponse,
     RiskSnapshotResponse, TradingIntentSnapshot, TradingStateSnapshot,
 };
 use ploy_platform::DeploymentRecord;
-use ploy_trading::{OrderState, TradeSide, TradingIntent, TradingRuntime, TradingRuntimeSnapshot};
+use portfolio_core::prediction::{
+    OrderState, TradeSide, TradingIntent, TradingRuntime, TradingRuntimeSnapshot,
+};
 use rust_decimal::Decimal;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
@@ -34,6 +36,39 @@ pub enum IntentAdmissionSource {
     Worker,
     AuthenticatedOperator,
     Emergency,
+}
+
+/// Durable state envelope. The operator snapshot remains a read-only API view;
+/// canonical OMS and portfolio checkpoints travel beside it for fail-closed
+/// restore instead of being reconstructed from legacy projections.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedTradingStateSnapshot {
+    pub snapshot: TradingStateSnapshot,
+    pub canonical_oms: ports::OmsCheckpoint,
+    pub canonical_portfolio: ports::PortfolioState,
+}
+
+pub fn build_persisted_trading_state_snapshot(
+    record: DeploymentRecord,
+    snapshot: TradingRuntimeSnapshot,
+) -> io::Result<PersistedTradingStateSnapshot> {
+    let canonical_oms = snapshot.canonical_oms.clone().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trading runtime snapshot is missing canonical OMS checkpoint",
+        )
+    })?;
+    let canonical_portfolio = snapshot.canonical_portfolio.clone().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trading runtime snapshot is missing canonical portfolio checkpoint",
+        )
+    })?;
+    Ok(PersistedTradingStateSnapshot {
+        snapshot: build_trading_state_snapshot(record, snapshot),
+        canonical_oms,
+        canonical_portfolio,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -135,6 +170,17 @@ pub fn build_trading_state_snapshot(
 }
 
 pub fn restore_trading_runtime(snapshot: TradingStateSnapshot) -> io::Result<TradingRuntime> {
+    let _ = snapshot;
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "legacy operator trading snapshot has no canonical OMS/portfolio checkpoint",
+    ))
+}
+
+pub fn restore_persisted_trading_runtime(
+    persisted: PersistedTradingStateSnapshot,
+) -> io::Result<TradingRuntime> {
+    let snapshot = persisted.snapshot;
     let deployment_id = snapshot.deployment_id.clone();
     let persisted_positions = snapshot.positions.clone();
     let intents = snapshot
@@ -158,7 +204,7 @@ pub fn restore_trading_runtime(snapshot: TradingStateSnapshot) -> io::Result<Tra
         .orders
         .into_iter()
         .map(|order| {
-            Ok(ploy_trading::OrderRecord {
+            Ok(portfolio_core::prediction::OrderRecord {
                 order_id: order.order_id,
                 intent_id: order.intent_id,
                 deployment_id: deployment_id.clone(),
@@ -181,7 +227,7 @@ pub fn restore_trading_runtime(snapshot: TradingStateSnapshot) -> io::Result<Tra
         .fills
         .into_iter()
         .map(|fill| {
-            Ok(ploy_trading::FillRecord {
+            Ok(portfolio_core::prediction::FillRecord {
                 fill_id: fill.fill_id,
                 order_id: fill.order_id,
                 token_id: fill.token_id,
@@ -200,7 +246,10 @@ pub fn restore_trading_runtime(snapshot: TradingStateSnapshot) -> io::Result<Tra
         positions: Vec::new(),
         pnl: Default::default(),
         risk: Default::default(),
-    });
+        canonical_oms: Some(persisted.canonical_oms),
+        canonical_portfolio: Some(persisted.canonical_portfolio),
+    })
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if !persisted_positions.is_empty() {
         let rebuilt = runtime.snapshot(&Default::default()).positions;
         let matches = persisted_positions.len() == rebuilt.len()
@@ -224,7 +273,7 @@ pub fn restore_trading_runtime(snapshot: TradingStateSnapshot) -> io::Result<Tra
 
 pub fn build_order_control_response(
     deployment_id: String,
-    order: &ploy_trading::OrderRecord,
+    order: &portfolio_core::prediction::OrderRecord,
 ) -> OrderControlResponse {
     OrderControlResponse {
         deployment_id,
@@ -287,23 +336,25 @@ pub fn order_state_from_wire(state: &str) -> io::Result<OrderState> {
     }
 }
 
-pub fn intent_purpose_wire(purpose: ploy_trading::IntentPurpose) -> IntentPurpose {
+pub fn intent_purpose_wire(purpose: portfolio_core::prediction::IntentPurpose) -> IntentPurpose {
     match purpose {
-        ploy_trading::IntentPurpose::Entry => IntentPurpose::Entry,
-        ploy_trading::IntentPurpose::Exit => IntentPurpose::Exit,
-        ploy_trading::IntentPurpose::Reduce => IntentPurpose::Reduce,
-        ploy_trading::IntentPurpose::Hedge => IntentPurpose::Hedge,
-        ploy_trading::IntentPurpose::Cancel => IntentPurpose::Cancel,
+        portfolio_core::prediction::IntentPurpose::Entry => IntentPurpose::Entry,
+        portfolio_core::prediction::IntentPurpose::Exit => IntentPurpose::Exit,
+        portfolio_core::prediction::IntentPurpose::Reduce => IntentPurpose::Reduce,
+        portfolio_core::prediction::IntentPurpose::Hedge => IntentPurpose::Hedge,
+        portfolio_core::prediction::IntentPurpose::Cancel => IntentPurpose::Cancel,
     }
 }
 
-pub fn intent_purpose_from_contract(purpose: IntentPurpose) -> ploy_trading::IntentPurpose {
+pub fn intent_purpose_from_contract(
+    purpose: IntentPurpose,
+) -> portfolio_core::prediction::IntentPurpose {
     match purpose {
-        IntentPurpose::Entry => ploy_trading::IntentPurpose::Entry,
-        IntentPurpose::Exit => ploy_trading::IntentPurpose::Exit,
-        IntentPurpose::Reduce => ploy_trading::IntentPurpose::Reduce,
-        IntentPurpose::Hedge => ploy_trading::IntentPurpose::Hedge,
-        IntentPurpose::Cancel => ploy_trading::IntentPurpose::Cancel,
+        IntentPurpose::Entry => portfolio_core::prediction::IntentPurpose::Entry,
+        IntentPurpose::Exit => portfolio_core::prediction::IntentPurpose::Exit,
+        IntentPurpose::Reduce => portfolio_core::prediction::IntentPurpose::Reduce,
+        IntentPurpose::Hedge => portfolio_core::prediction::IntentPurpose::Hedge,
+        IntentPurpose::Cancel => portfolio_core::prediction::IntentPurpose::Cancel,
     }
 }
 
@@ -316,19 +367,20 @@ pub fn deployment_state_wire(state: DeploymentState) -> &'static str {
     }
 }
 
-pub fn intent_counts_toward_exposure(purpose: ploy_trading::IntentPurpose) -> bool {
+pub fn intent_counts_toward_exposure(purpose: portfolio_core::prediction::IntentPurpose) -> bool {
     matches!(
         purpose,
-        ploy_trading::IntentPurpose::Entry | ploy_trading::IntentPurpose::Hedge
+        portfolio_core::prediction::IntentPurpose::Entry
+            | portfolio_core::prediction::IntentPurpose::Hedge
     )
 }
 
-pub fn intent_allowed_while_draining(purpose: ploy_trading::IntentPurpose) -> bool {
+pub fn intent_allowed_while_draining(purpose: portfolio_core::prediction::IntentPurpose) -> bool {
     matches!(
         purpose,
-        ploy_trading::IntentPurpose::Exit
-            | ploy_trading::IntentPurpose::Reduce
-            | ploy_trading::IntentPurpose::Cancel
+        portfolio_core::prediction::IntentPurpose::Exit
+            | portfolio_core::prediction::IntentPurpose::Reduce
+            | portfolio_core::prediction::IntentPurpose::Cancel
     )
 }
 
@@ -387,12 +439,11 @@ pub fn intent_risk_effect(
     exposure: TokenExposureEnvelope,
 ) -> IntentRiskEffect {
     match intent.purpose {
-        ploy_trading::IntentPurpose::Entry => IntentRiskEffect::Increase,
-        ploy_trading::IntentPurpose::Reduce | ploy_trading::IntentPurpose::Exit => {
-            IntentRiskEffect::Reduce
-        }
-        ploy_trading::IntentPurpose::Cancel => IntentRiskEffect::Control,
-        ploy_trading::IntentPurpose::Hedge => {
+        portfolio_core::prediction::IntentPurpose::Entry => IntentRiskEffect::Increase,
+        portfolio_core::prediction::IntentPurpose::Reduce
+        | portfolio_core::prediction::IntentPurpose::Exit => IntentRiskEffect::Reduce,
+        portfolio_core::prediction::IntentPurpose::Cancel => IntentRiskEffect::Control,
+        portfolio_core::prediction::IntentPurpose::Hedge => {
             let current_worst = exposure
                 .worst_case_min_qty
                 .abs()
@@ -427,16 +478,8 @@ pub fn live_reconcile_backoff_ms(failures: u32, base_ms: u64, max_ms: u64) -> u6
     scaled.min(max_ms.max(base_ms))
 }
 
-pub fn io_error_from_execution_error(err: ExecutionError) -> io::Error {
-    match err {
-        ExecutionError::Validation(message) => io::Error::new(io::ErrorKind::InvalidInput, message),
-        ExecutionError::Configuration(message) => {
-            io::Error::new(io::ErrorKind::InvalidData, message)
-        }
-        ExecutionError::Transport(message) => {
-            io::Error::new(io::ErrorKind::ConnectionAborted, message)
-        }
-    }
+pub fn io_error_from_execution_error(err: hft_core::HftError) -> io::Error {
+    execution_io_error(err)
 }
 
 pub fn next_paper_intent_id(deployment_id: &str) -> String {
@@ -472,9 +515,9 @@ mod tests {
         TradingStateSnapshot,
     };
     use ploy_platform::DeploymentRecord;
-    use ploy_trading::{
-        IntentPurpose as TradingIntentPurpose, OrderRecord, OrderState, PositionSnapshot,
-        TradeSide, TradingIntent, TradingRuntime, TradingRuntimeSnapshot,
+    use portfolio_core::prediction::{
+        FillRecord, IntentPurpose as TradingIntentPurpose, OrderRecord, OrderState, TradeSide,
+        TradingIntent, TradingRuntime,
     };
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
@@ -530,95 +573,58 @@ mod tests {
             purpose: TradingIntentPurpose::Hedge,
             created_at: chrono::Utc::now(),
         };
-        let order = |deployment_id: &str,
-                     order_id: &str,
-                     intent_id: &str,
-                     requested_qty,
-                     filled_qty,
-                     state| OrderRecord {
-            order_id: order_id.to_string(),
-            intent_id: intent_id.to_string(),
-            deployment_id: deployment_id.to_string(),
-            token_id: "token-1".to_string(),
-            requested_qty,
-            limit_price: Some(dec!(0.5)),
-            venue_order_id: Some(format!("venue-{order_id}")),
-            venue_order_history: Vec::new(),
-            revision: 0,
-            state,
-            state_changed_at: Some(chrono::Utc::now()),
-            filled_qty,
-            rejection_reason: None,
-            last_error: None,
-            idempotency_key: None,
-        };
         let deployments = vec![
             deployment("a.live", " 0xAbC ", DeploymentState::Enabled),
             deployment("b.live", "0xabc", DeploymentState::Enabled),
             deployment("archived.live", "0xabc", DeploymentState::Archived),
         ];
         let mut trading = BTreeMap::new();
-        trading.insert(
-            "a.live".to_string(),
-            TradingRuntime::restore(TradingRuntimeSnapshot {
-                intents: vec![intent("a.live", "sell-ack", TradeSide::Sell, dec!(4))],
-                orders: vec![order(
-                    "a.live",
-                    "sell-ack-order",
-                    "sell-ack",
-                    dec!(4),
-                    dec!(1),
-                    OrderState::Acknowledged,
-                )],
-                positions: vec![PositionSnapshot {
-                    token_id: "token-1".to_string(),
-                    net_qty: dec!(5),
-                    avg_entry_price: dec!(0.5),
-                    realized_pnl: Decimal::ZERO,
-                }],
-                ..TradingRuntimeSnapshot::default()
-            }),
-        );
-        trading.insert(
-            "b.live".to_string(),
-            TradingRuntime::restore(TradingRuntimeSnapshot {
-                intents: vec![
-                    intent("b.live", "sell-unknown", TradeSide::Sell, dec!(8)),
-                    intent("b.live", "buy-ack", TradeSide::Buy, dec!(2)),
-                ],
-                orders: vec![
-                    order(
-                        "b.live",
-                        "sell-unknown-order",
-                        "sell-unknown",
-                        dec!(8),
-                        Decimal::ZERO,
-                        OrderState::Unknown,
-                    ),
-                    order(
-                        "b.live",
-                        "buy-ack-order",
-                        "buy-ack",
-                        dec!(2),
-                        Decimal::ZERO,
-                        OrderState::Acknowledged,
-                    ),
-                ],
-                ..TradingRuntimeSnapshot::default()
-            }),
-        );
-        trading.insert(
-            "archived.live".to_string(),
-            TradingRuntime::restore(TradingRuntimeSnapshot {
-                positions: vec![PositionSnapshot {
-                    token_id: "token-1".to_string(),
-                    net_qty: dec!(100),
-                    avg_entry_price: dec!(0.5),
-                    realized_pnl: Decimal::ZERO,
-                }],
-                ..TradingRuntimeSnapshot::default()
-            }),
-        );
+        let mut a_runtime = TradingRuntime::default();
+        let seed_a = intent("a.live", "seed-a", TradeSide::Buy, dec!(6));
+        a_runtime
+            .submit_intent(seed_a, "seed-a-order", None)
+            .unwrap();
+        a_runtime.acknowledge_order("seed-a-order", "venue-seed-a");
+        a_runtime.record_fill(FillRecord {
+            fill_id: "seed-a-fill".to_string(),
+            order_id: "seed-a-order".to_string(),
+            token_id: "token-1".to_string(),
+            side: TradeSide::Buy,
+            quantity: dec!(6),
+            price: dec!(0.5),
+            fee: Decimal::ZERO,
+            timestamp: chrono::Utc::now(),
+        });
+        let sell_a = intent("a.live", "sell-ack", TradeSide::Sell, dec!(4));
+        a_runtime
+            .submit_intent(sell_a, "sell-ack-order", None)
+            .unwrap();
+        a_runtime.acknowledge_order("sell-ack-order", "venue-sell-a");
+        a_runtime.record_fill(FillRecord {
+            fill_id: "sell-a-fill".to_string(),
+            order_id: "sell-ack-order".to_string(),
+            token_id: "token-1".to_string(),
+            side: TradeSide::Sell,
+            quantity: dec!(1),
+            price: dec!(0.5),
+            fee: Decimal::ZERO,
+            timestamp: chrono::Utc::now(),
+        });
+        trading.insert("a.live".to_string(), a_runtime);
+
+        let mut b_runtime = TradingRuntime::default();
+        let sell_b = intent("b.live", "sell-unknown", TradeSide::Sell, dec!(8));
+        b_runtime
+            .submit_intent(sell_b, "sell-unknown-order", None)
+            .unwrap();
+        b_runtime.mark_order_unknown("sell-unknown-order", "transport lost");
+        let buy_b = intent("b.live", "buy-ack", TradeSide::Buy, dec!(2));
+        b_runtime
+            .submit_intent(buy_b, "buy-ack-order", None)
+            .unwrap();
+        b_runtime.acknowledge_order("buy-ack-order", "venue-buy-b");
+        trading.insert("b.live".to_string(), b_runtime);
+        trading.insert("archived.live".to_string(), TradingRuntime::default());
 
         let exposure = account_token_exposure_envelope(&deployments, &trading, "0xABC", "token-1");
         assert_eq!(exposure.settled_net_qty, dec!(5));
@@ -683,9 +689,9 @@ mod tests {
     }
 
     #[test]
-    fn restore_reconstructs_positions_from_filled_orders() {
+    fn restore_rejects_legacy_filled_projection_without_canonical_checkpoint() {
         let now = chrono::Utc::now();
-        let runtime = restore_trading_runtime(TradingStateSnapshot {
+        let error = restore_trading_runtime(TradingStateSnapshot {
             deployment_id: "dep-1".to_string(),
             runtime_mode: ploy_operator_contracts::DeploymentRuntimeMode::Live,
             intents: vec![TradingIntentSnapshot {
@@ -727,12 +733,7 @@ mod tests {
             positions: Vec::new(),
             ..TradingStateSnapshot::default()
         })
-        .expect("restore filled runtime");
-
-        let restored = runtime.snapshot(&Default::default());
-        assert_eq!(restored.positions[0].net_qty, dec!(4));
-        assert_eq!(restored.fills.len(), 1);
-        assert_eq!(restored.orders[0].state, OrderState::Filled);
-        assert_eq!(restored.orders[0].state_changed_at, Some(now));
+        .expect_err("legacy projection cannot restore without canonical checkpoint");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 }

@@ -1,7 +1,7 @@
-use crate::{restore_trading_runtime, ProposalStore};
-use ploy_operator_contracts::{DeploymentRuntimeMode, TradingStateSnapshot};
+use crate::{restore_persisted_trading_runtime, PersistedTradingStateSnapshot, ProposalStore};
+use ploy_operator_contracts::DeploymentRuntimeMode;
 use ploy_platform::DeploymentRecord;
-use ploy_trading::TradingRuntime;
+use portfolio_core::prediction::TradingRuntime;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
@@ -33,19 +33,19 @@ pub fn load_trading_runtimes(
         return Ok(BTreeMap::new());
     }
 
-    let snapshots: Vec<TradingStateSnapshot> = serde_json::from_str(&raw)
+    let snapshots: Vec<PersistedTradingStateSnapshot> = serde_json::from_str(&raw)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
 
     let mut runtimes = BTreeMap::new();
     for snapshot in snapshots {
-        let Some(expected_mode) = expected_runtime_mode(&snapshot.deployment_id) else {
+        let Some(expected_mode) = expected_runtime_mode(&snapshot.snapshot.deployment_id) else {
             continue;
         };
-        if snapshot.runtime_mode != expected_mode {
+        if snapshot.snapshot.runtime_mode != expected_mode {
             continue;
         }
-        let deployment_id = snapshot.deployment_id.clone();
-        runtimes.insert(deployment_id, restore_trading_runtime(snapshot)?);
+        let deployment_id = snapshot.snapshot.deployment_id.clone();
+        runtimes.insert(deployment_id, restore_persisted_trading_runtime(snapshot)?);
     }
 
     Ok(runtimes)
@@ -72,6 +72,10 @@ pub fn load_proposal_store(path: &Path) -> io::Result<ProposalStore> {
 mod tests {
     use super::{load_proposal_store, load_registry_records, load_trading_runtimes};
     use chrono::Utc;
+    use ploy_operator_contracts::DeploymentRuntimeMode;
+    use ploy_platform::DeploymentRecord;
+    use portfolio_core::prediction::TradingRuntime;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -81,6 +85,28 @@ mod tests {
             .expect("duration")
             .as_nanos();
         std::env::temp_dir().join(format!("ploy-state-io-{label}-{unique}.json"))
+    }
+
+    fn persisted_snapshot(
+        deployment_id: &str,
+        runtime_mode: DeploymentRuntimeMode,
+    ) -> serde_json::Value {
+        let record = DeploymentRecord {
+            deployment_id: deployment_id.to_string(),
+            bundle_id: "example".to_string(),
+            runtime_mode,
+            account_id: "acct-test".to_string(),
+            max_gross_exposure: None,
+            deployment_state: ploy_operator_contracts::DeploymentState::Enabled,
+            desired_state: ploy_operator_contracts::DesiredState::Paused,
+            observed_state: ploy_operator_contracts::ObservedState::Paused,
+        };
+        let snapshot = TradingRuntime::default().snapshot(&BTreeMap::new());
+        serde_json::to_value(
+            super::super::build_persisted_trading_state_snapshot(record, snapshot)
+                .expect("canonical test snapshot"),
+        )
+        .expect("serialize canonical test snapshot")
     }
 
     #[test]
@@ -111,38 +137,11 @@ mod tests {
         let path = temp_path("trading");
         fs::write(
             &path,
-            serde_json::json!([{
-                "deployment_id": "example.paper",
-                "runtime_mode": "paper",
-                "intents": [{
-                    "intent_id": "intent-1",
-                    "market_id": "market-1",
-                    "token_id": "token-1",
-                    "side": "buy",
-                    "quantity": "1",
-                    "limit_price": null,
-                    "purpose": "entry",
-                    "created_at": Utc::now(),
-                }],
-                "orders": [],
-                "fills": [],
-                "positions": [],
-                "pnl": {
-                    "realized_pnl": "0",
-                    "unrealized_pnl": "0",
-                    "total_fees": "0",
-                    "net_pnl": "0"
-                },
-                "risk": {
-                    "pending_intents": 0,
-                    "active_orders": 0,
-                    "open_positions": 0,
-                    "gross_exposure": "0",
-                    "reserved_order_exposure": "0",
-                    "total_gross_exposure": "0"
-                }
-            }])
-            .to_string(),
+            serde_json::to_string(&vec![persisted_snapshot(
+                "example.paper",
+                DeploymentRuntimeMode::Paper,
+            )])
+            .expect("serialize"),
         )
         .expect("write");
         let runtimes = load_trading_runtimes(&path, |id| {
@@ -178,16 +177,15 @@ mod tests {
             ),
         ] {
             let path = temp_path("trading-mode-match");
+            let snapshot_mode = match snapshot_mode {
+                "paper" => DeploymentRuntimeMode::Paper,
+                "live" => DeploymentRuntimeMode::Live,
+                _ => unreachable!(),
+            };
             fs::write(
                 &path,
-                serde_json::json!([{
-                    "deployment_id": "example.mode",
-                    "runtime_mode": snapshot_mode,
-                    "intents": [], "orders": [], "fills": [], "positions": [],
-                    "pnl": {"realized_pnl":"0","unrealized_pnl":"0","total_fees":"0","net_pnl":"0"},
-                    "risk": {"pending_intents":0,"active_orders":0,"open_positions":0,"gross_exposure":"0","reserved_order_exposure":"0","total_gross_exposure":"0"}
-                }])
-                .to_string(),
+                serde_json::to_string(&vec![persisted_snapshot("example.mode", snapshot_mode)])
+                    .expect("serialize"),
             )
             .expect("snapshot");
             let runtimes = load_trading_runtimes(&path, |_| Some(registry_mode.clone()))

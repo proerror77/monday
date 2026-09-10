@@ -9,7 +9,6 @@ members = [
     "apps/ployctl",
     "apps/ploytui",
     "crates/ploy-control-client",
-    "crates/ploy-connectivity",
     "crates/ploy-daemon-host",
     "crates/ploy-deployments",
     "crates/ploy-feed-loaders",
@@ -22,7 +21,6 @@ members = [
     "crates/ploy-runner-host",
     "crates/ploy-strategy-runtime",
     "crates/ploy-strategy-bundles",
-    "crates/ploy-trading",
 ]
 default-members = [
     ".",
@@ -38,7 +36,6 @@ default-members = [
     "crates/ploy-platform",
     "crates/ploy-platform-runtime",
     "crates/ploy-runner-host",
-    "crates/ploy-trading",
 ]
 resolver = "2"
 
@@ -54,12 +51,12 @@ chrono = { version = "0.4", features = ["serde"] }
 libc = "0.2"
 hmac = "0.12"
 ploy-control-client = { path = "crates/ploy-control-client" }
-ploy-connectivity = { path = "crates/ploy-connectivity" }
 ploy-deployments = { path = "crates/ploy-deployments" }
 ploy-daemon-host = { path = "crates/ploy-daemon-host" }
 ploy-feed-loaders = { path = "crates/ploy-feed-loaders" }
 ploy-market-contracts = { path = "crates/ploy-market-contracts" }
 ploy-market-data = { path = "crates/ploy-market-data" }
+portfolio-core = { package = "hft-portfolio-core", path = "../risk-control/portfolio-core" }
 ploy-operator-contracts = { path = "crates/ploy-operator-contracts" }
 ploy-platform = { path = "crates/ploy-platform" }
 ploy-platform-runtime = { path = "crates/ploy-platform-runtime" }
@@ -67,7 +64,6 @@ ploy-research = { path = "crates/ploy-research" }
 ploy-runner-host = { path = "crates/ploy-runner-host" }
 ploy-strategy-runtime = { path = "crates/ploy-strategy-runtime" }
 ploy-strategy-bundles = { path = "crates/ploy-strategy-bundles" }
-ploy-trading = { path = "crates/ploy-trading" }
 rand = "0.8"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
 rust_decimal = { version = "1", features = ["serde", "serde-with-str"] }

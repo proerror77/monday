@@ -4,6 +4,7 @@
 //! - 多帳戶 PnL 聚合（跨交易所）
 
 pub mod multi_account;
+pub mod prediction;
 
 pub use multi_account::{
     AccountId, AccountPnl, AggregatedAccountView, AggregatedPosition, MultiAccountPortfolio,
@@ -12,6 +13,7 @@ pub use multi_account::{
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -22,18 +24,42 @@ use tracing::{info, warn};
 
 const ACCOUNTING_EVENT_REPLAY_CAPACITY: usize = 200_000;
 
+/// An observed accounting event that was intentionally not applied because
+/// the portfolio cannot prove the event belongs to its canonical state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconciliationException {
+    pub order_id: Option<OrderId>,
+    pub reason: String,
+    pub event: Option<ExecutionEvent>,
+}
+
 /// Portfolio state that can be persisted
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortfolioState {
     pub account_view: AccountView,
+    #[serde(default)]
+    pub total_fees: Decimal,
     pub order_meta: HashMap<OrderId, (Symbol, Side)>,
     pub market_prices: HashMap<Symbol, Price>,
     /// 已處理的成交ID（去重），恢復後避免重覆累計
     #[serde(default)]
     pub processed_fill_ids: HashMap<OrderId, HashSet<String>>,
+    /// Fee identities are a separate namespace from venue fill identities.
+    #[serde(default)]
+    pub processed_fee_ids: HashMap<OrderId, HashSet<String>>,
     /// Accounting event keys ordered oldest to newest for deterministic bounded recovery.
     #[serde(default)]
     pub recent_accounting_event_ids: Vec<(OrderId, String)>,
+    #[serde(default)]
+    pub reconciliation_exceptions: Vec<ReconciliationException>,
+    #[serde(default)]
+    pub canonical_state_digest: Option<String>,
+}
+
+impl PortfolioState {
+    pub fn refresh_canonical_digest(&mut self) {
+        self.canonical_state_digest = Some(canonical_state_digest(self));
+    }
 }
 
 /// 最小 Portfolio：單帳戶，根據 fills 更新倉位/現金與 PnL
@@ -46,8 +72,11 @@ pub struct Portfolio {
     market_prices: HashMap<Symbol, Price>,
     // 已處理的成交 ID（去重）
     processed_fill_ids: HashMap<hft_core::OrderId, HashSet<String>>,
+    processed_fee_ids: HashMap<hft_core::OrderId, HashSet<String>>,
+    total_fees: Decimal,
     // Bounded chronological journal used to restore the engine replay horizon.
     recent_accounting_event_ids: VecDeque<(OrderId, String)>,
+    reconciliation_exceptions: Vec<ReconciliationException>,
 }
 
 impl Default for Portfolio {
@@ -60,7 +89,10 @@ impl Default for Portfolio {
             order_meta: HashMap::new(),
             market_prices: HashMap::new(),
             processed_fill_ids: HashMap::new(),
+            processed_fee_ids: HashMap::new(),
+            total_fees: Decimal::ZERO,
             recent_accounting_event_ids: VecDeque::new(),
+            reconciliation_exceptions: Vec::new(),
         }
     }
 }
@@ -82,7 +114,36 @@ impl Portfolio {
 
     /// 註冊下單元資訊（供 fill 時查找 symbol/side）
     pub fn register_order(&mut self, order_id: hft_core::OrderId, symbol: Symbol, side: Side) {
+        if let Some((existing_symbol, existing_side)) = self.order_meta.get(&order_id) {
+            if existing_symbol == &symbol && *existing_side == side {
+                return;
+            }
+            self.record_exception(
+                Some(order_id),
+                "conflicting portfolio order metadata registration",
+                None,
+            );
+            return;
+        }
         self.order_meta.insert(order_id, (symbol, side));
+    }
+
+    fn record_exception(
+        &mut self,
+        order_id: Option<OrderId>,
+        reason: impl Into<String>,
+        event: Option<&ExecutionEvent>,
+    ) {
+        self.reconciliation_exceptions
+            .push(ReconciliationException {
+                order_id,
+                reason: reason.into(),
+                event: event.cloned(),
+            });
+    }
+
+    pub fn reconciliation_exceptions(&self) -> &[ReconciliationException] {
+        &self.reconciliation_exceptions
     }
 
     /// 處理執行事件，僅處理 Fill/Fee/Balance 類事件
@@ -101,28 +162,49 @@ impl Portfolio {
                         quantity = %quantity.0,
                         "ignoring fill with non-positive quantity"
                     );
+                    self.record_exception(
+                        Some(order_id.clone()),
+                        "fill has non-positive quantity",
+                        Some(event),
+                    );
                     return;
                 }
-                if let Some((symbol, side)) = self.order_meta.get(order_id).cloned() {
-                    // De-duplication: skip duplicated fill_id for this order
-                    let is_new = fill_id.is_empty()
-                        || self
-                            .processed_fill_ids
-                            .entry(order_id.clone())
-                            .or_default()
-                            .insert(fill_id.clone());
-                    if is_new {
-                        if !fill_id.is_empty() {
-                            self.record_accounting_event(
-                                order_id.clone(),
-                                format!("fill:{fill_id}"),
-                            );
-                        }
-                        self.apply_fill(&symbol, side, *price, *quantity);
-                        // Fill price is the freshest executable fallback mark observed by this ledger.
-                        self.market_prices.insert(symbol.clone(), *price);
-                        self.recalculate_unrealized_pnl();
-                    }
+                if price.0 <= Decimal::ZERO {
+                    self.record_exception(
+                        Some(order_id.clone()),
+                        "fill has non-positive price",
+                        Some(event),
+                    );
+                    return;
+                }
+                if fill_id.is_empty() {
+                    self.record_exception(
+                        Some(order_id.clone()),
+                        "fill is missing the venue execution identity",
+                        Some(event),
+                    );
+                    return;
+                }
+                let Some((symbol, side)) = self.order_meta.get(order_id).cloned() else {
+                    self.record_exception(
+                        Some(order_id.clone()),
+                        "fill references an unknown portfolio order",
+                        Some(event),
+                    );
+                    return;
+                };
+                // De-duplication is scoped to the fill namespace only.
+                let is_new = self
+                    .processed_fill_ids
+                    .entry(order_id.clone())
+                    .or_default()
+                    .insert(fill_id.clone());
+                if is_new {
+                    self.record_accounting_event(order_id.clone(), format!("fill:{fill_id}"));
+                    self.apply_fill(&symbol, side, *price, *quantity);
+                    // Fill price is the freshest executable fallback mark observed by this ledger.
+                    self.market_prices.insert(symbol.clone(), *price);
+                    self.recalculate_unrealized_pnl();
                 }
             }
             ExecutionEvent::FeeCharged {
@@ -133,12 +215,25 @@ impl Portfolio {
             } => {
                 if *amount < Decimal::ZERO {
                     warn!(order_id = %order_id.0, amount = %amount, "ignoring negative fee");
+                    self.record_exception(
+                        Some(order_id.clone()),
+                        "fee amount is negative",
+                        Some(event),
+                    );
                     return;
                 }
                 if self.order_meta.contains_key(order_id) {
+                    if fill_id.is_empty() {
+                        self.record_exception(
+                            Some(order_id.clone()),
+                            "fee is missing the venue execution identity",
+                            Some(event),
+                        );
+                        return;
+                    }
                     let fee_id = format!("fee:{fill_id}");
                     let inserted = self
-                        .processed_fill_ids
+                        .processed_fee_ids
                         .entry(order_id.clone())
                         .or_default()
                         .insert(fee_id.clone());
@@ -148,10 +243,15 @@ impl Portfolio {
                         }
                         self.view.cash_balance -= *amount;
                         self.view.realized_pnl -= *amount;
+                        self.total_fees += *amount;
                         self.update_drawdown_stats();
                     }
                 } else {
-                    warn!(order_id = %order_id.0, "ignoring fee for unknown order");
+                    self.record_exception(
+                        Some(order_id.clone()),
+                        "fee references an unknown portfolio order",
+                        Some(event),
+                    );
                 }
             }
             _ => {}
@@ -288,13 +388,19 @@ impl Portfolio {
 
     /// Export portfolio state for persistence
     pub fn export_state(&self) -> PortfolioState {
-        PortfolioState {
+        let mut state = PortfolioState {
             account_view: self.view.clone(),
+            total_fees: self.total_fees,
             order_meta: self.order_meta.clone(),
             market_prices: self.market_prices.clone(),
             processed_fill_ids: self.processed_fill_ids.clone(),
+            processed_fee_ids: self.processed_fee_ids.clone(),
             recent_accounting_event_ids: self.recent_accounting_event_ids.iter().cloned().collect(),
-        }
+            reconciliation_exceptions: self.reconciliation_exceptions.clone(),
+            canonical_state_digest: None,
+        };
+        state.canonical_state_digest = Some(canonical_state_digest(&state));
+        state
     }
 
     /// Import portfolio state from persistent storage
@@ -306,10 +412,41 @@ impl Portfolio {
             state.order_meta.len()
         );
 
+        if let Err(reason) = self.try_import_state(state) {
+            self.record_exception(None, reason, None);
+            warn!("refused invalid portfolio state during restore");
+        }
+    }
+
+    pub fn try_import_state(&mut self, state: PortfolioState) -> Result<(), String> {
+        validate_state(&state)?;
+
         self.view = state.account_view;
+        self.total_fees = state.total_fees;
         self.order_meta = state.order_meta;
         self.market_prices = state.market_prices;
         self.processed_fill_ids = state.processed_fill_ids;
+        self.processed_fee_ids = state.processed_fee_ids;
+        self.reconciliation_exceptions = state.reconciliation_exceptions;
+        // Older snapshots only carried the bounded journal.  Reconstructing
+        // the fee namespace from that journal keeps replay idempotent without
+        // treating a fill id and fee id as the same key.
+        for (order_id, event_id) in &state.recent_accounting_event_ids {
+            if let Some(fee_id) = event_id.strip_prefix("fee:") {
+                self.processed_fee_ids
+                    .entry(order_id.clone())
+                    .or_default()
+                    .insert(event_id.clone());
+                if fee_id.is_empty() {
+                    self.reconciliation_exceptions
+                        .push(ReconciliationException {
+                            order_id: Some(order_id.clone()),
+                            reason: "snapshot contains an empty fee identity".to_string(),
+                            event: None,
+                        });
+                }
+            }
+        }
         self.recent_accounting_event_ids = state
             .recent_accounting_event_ids
             .into_iter()
@@ -333,14 +470,128 @@ impl Portfolio {
             self.view.realized_pnl,
             self.view.unrealized_pnl
         );
+        Ok(())
+    }
+}
+
+fn validate_state(state: &PortfolioState) -> Result<(), String> {
+    if let Some(expected) = &state.canonical_state_digest {
+        let actual = canonical_state_digest(state);
+        if expected != &actual {
+            return Err("portfolio canonical financial checkpoint digest mismatch".to_string());
+        }
+    }
+    for (symbol, position) in &state.account_view.positions {
+        if symbol != &position.symbol {
+            return Err("portfolio position key does not match position symbol".to_string());
+        }
+    }
+    for order_id in state.processed_fill_ids.keys() {
+        if !state.order_meta.contains_key(order_id) {
+            return Err(format!(
+                "processed fill namespace references unknown order {}",
+                order_id.0
+            ));
+        }
+    }
+    for order_id in state.processed_fee_ids.keys() {
+        if !state.order_meta.contains_key(order_id) {
+            return Err(format!(
+                "processed fee namespace references unknown order {}",
+                order_id.0
+            ));
+        }
+    }
+    for (order_id, event_id) in &state.recent_accounting_event_ids {
+        if !state.order_meta.contains_key(order_id) {
+            return Err(format!(
+                "accounting journal references unknown order {}",
+                order_id.0
+            ));
+        }
+        if event_id.is_empty() || (!event_id.starts_with("fill:") && !event_id.starts_with("fee:"))
+        {
+            return Err("accounting journal contains an untyped event identity".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn canonical_state_digest(state: &PortfolioState) -> String {
+    let mut material = String::new();
+    let view = &state.account_view;
+    material.push_str(&format!(
+        "cash={};realized={};unrealized={};fees={};hwm={};dd={};maxdd={};session={};",
+        view.cash_balance,
+        view.realized_pnl,
+        view.unrealized_pnl,
+        state.total_fees,
+        view.high_water_mark,
+        view.drawdown_pct,
+        view.max_drawdown_pct,
+        view.session_start_us
+    ));
+    let mut positions = view.positions.iter().collect::<Vec<_>>();
+    positions.sort_by_key(|(symbol, _)| symbol.as_str().to_string());
+    for (symbol, position) in positions {
+        material.push_str(&format!(
+            "pos:{}:{}:{}:{}:{};",
+            symbol.as_str(),
+            position.quantity.0,
+            position.avg_price.0,
+            position.unrealized_pnl,
+            position.realized_pnl
+        ));
+    }
+    let mut orders = state.order_meta.iter().collect::<Vec<_>>();
+    orders.sort_by_key(|(order_id, _)| order_id.0.clone());
+    for (order_id, (symbol, side)) in orders {
+        material.push_str(&format!(
+            "order:{}:{}:{:?};",
+            order_id.0,
+            symbol.as_str(),
+            side
+        ));
+    }
+    let mut marks = state.market_prices.iter().collect::<Vec<_>>();
+    marks.sort_by_key(|(symbol, _)| symbol.as_str().to_string());
+    for (symbol, price) in marks {
+        material.push_str(&format!("mark:{}:{};", symbol.as_str(), price.0));
+    }
+    append_namespaced_ids(&mut material, "fill", &state.processed_fill_ids);
+    append_namespaced_ids(&mut material, "fee", &state.processed_fee_ids);
+    for (order_id, event_id) in &state.recent_accounting_event_ids {
+        material.push_str(&format!("journal:{}:{};", order_id.0, event_id));
+    }
+    format!("sha256:{:x}", Sha256::digest(material.as_bytes()))
+}
+
+fn append_namespaced_ids(
+    material: &mut String,
+    namespace: &str,
+    ids: &HashMap<OrderId, HashSet<String>>,
+) {
+    let mut entries = ids
+        .iter()
+        .flat_map(|(order_id, values)| {
+            values
+                .iter()
+                .map(move |value| (order_id.0.clone(), value.clone()))
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+    for (order_id, value) in entries {
+        material.push_str(&format!("{}:{}:{};", namespace, order_id, value));
     }
 }
 
 /// 實現 PortfolioManager trait - 將現有方法適配為 trait 接口
 impl ports::PortfolioManager for Portfolio {
-    fn register_order(&mut self, order_id: hft_core::OrderId, symbol: Symbol, side: Side) {
+    fn register_order(&mut self, order_id: hft_core::OrderId, symbol: Symbol, side: Side) -> bool {
         // 直接調用現有實現
+        let before = self.reconciliation_exceptions.len();
         self.register_order(order_id, symbol, side);
+        self.reconciliation_exceptions.len() == before
     }
 
     fn on_execution_event(&mut self, event: &ExecutionEvent) {
@@ -363,10 +614,22 @@ impl ports::PortfolioManager for Portfolio {
         let internal_state = self.export_state();
         ports::PortfolioState {
             account_view: internal_state.account_view,
+            total_fees: internal_state.total_fees,
             order_meta: internal_state.order_meta,
             market_prices: internal_state.market_prices,
             processed_fill_ids: internal_state.processed_fill_ids,
+            processed_fee_ids: internal_state.processed_fee_ids,
             recent_accounting_event_ids: internal_state.recent_accounting_event_ids,
+            reconciliation_exceptions: internal_state
+                .reconciliation_exceptions
+                .into_iter()
+                .map(|exception| ports::ReconciliationException {
+                    order_id: exception.order_id,
+                    reason: exception.reason,
+                    event: exception.event,
+                })
+                .collect(),
+            canonical_state_digest: internal_state.canonical_state_digest,
         }
     }
 
@@ -374,12 +637,51 @@ impl ports::PortfolioManager for Portfolio {
         // 轉換 ports::PortfolioState 為內部 PortfolioState
         let internal_state = PortfolioState {
             account_view: state.account_view,
+            total_fees: state.total_fees,
             order_meta: state.order_meta,
             market_prices: state.market_prices,
             processed_fill_ids: state.processed_fill_ids,
+            processed_fee_ids: state.processed_fee_ids,
             recent_accounting_event_ids: state.recent_accounting_event_ids,
+            reconciliation_exceptions: state
+                .reconciliation_exceptions
+                .into_iter()
+                .map(|exception| ReconciliationException {
+                    order_id: exception.order_id,
+                    reason: exception.reason,
+                    event: exception.event,
+                })
+                .collect(),
+            canonical_state_digest: state.canonical_state_digest,
         };
         self.import_state(internal_state);
+    }
+
+    fn try_import_state(&mut self, state: ports::PortfolioState) -> Result<(), String> {
+        let internal_state = PortfolioState {
+            account_view: state.account_view,
+            total_fees: state.total_fees,
+            order_meta: state.order_meta,
+            market_prices: state.market_prices,
+            processed_fill_ids: state.processed_fill_ids,
+            processed_fee_ids: state.processed_fee_ids,
+            recent_accounting_event_ids: state.recent_accounting_event_ids,
+            reconciliation_exceptions: state
+                .reconciliation_exceptions
+                .into_iter()
+                .map(|exception| ReconciliationException {
+                    order_id: exception.order_id,
+                    reason: exception.reason,
+                    event: exception.event,
+                })
+                .collect(),
+            canonical_state_digest: state.canonical_state_digest,
+        };
+        Portfolio::try_import_state(self, internal_state)
+    }
+
+    fn reconciliation_exception_count(&self) -> usize {
+        self.reconciliation_exceptions.len()
     }
 }
 
@@ -580,5 +882,107 @@ mod tests {
         assert_eq!(recovered.high_water_mark, Decimal::from(1010));
         assert_eq!(recovered.drawdown_pct, 0.0);
         assert!((recovered.max_drawdown_pct - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn fill_and_fee_with_same_venue_id_use_separate_namespaces() {
+        let mut portfolio = Portfolio::with_cash_balance(Decimal::from(1000));
+        let order_id = OrderId("NAMESPACE-1".into());
+        let symbol = Symbol::new("BTCUSDT");
+        portfolio.register_order(order_id.clone(), symbol.clone(), Side::Buy);
+        let fill = ExecutionEvent::Fill {
+            order_id: order_id.clone(),
+            price: Price(Decimal::from(100)),
+            quantity: Quantity(Decimal::ONE),
+            timestamp: 1,
+            fill_id: "same-id".into(),
+        };
+        let fee = ExecutionEvent::FeeCharged {
+            order_id,
+            amount: Decimal::from(2),
+            timestamp: 1,
+            fill_id: "same-id".into(),
+        };
+        portfolio.on_execution_event(&fill);
+        portfolio.on_execution_event(&fee);
+        portfolio.on_execution_event(&fill);
+        portfolio.on_execution_event(&fee);
+
+        let view = portfolio.reader().load();
+        assert_eq!(view.positions[&symbol].quantity.0, Decimal::ONE);
+        assert_eq!(view.cash_balance, Decimal::from(898));
+        assert_eq!(portfolio.export_state().processed_fill_ids.len(), 1);
+        assert_eq!(portfolio.export_state().processed_fee_ids.len(), 1);
+    }
+
+    #[test]
+    fn conflicting_order_metadata_is_retained_and_does_not_rebind_accounting() {
+        let mut portfolio = Portfolio::new();
+        let order_id = OrderId("META-CONFLICT".into());
+        portfolio.register_order(order_id.clone(), Symbol::new("BTCUSDT"), Side::Buy);
+        portfolio.register_order(order_id.clone(), Symbol::new("ETHUSDT"), Side::Sell);
+        portfolio.on_execution_event(&ExecutionEvent::Fill {
+            order_id,
+            price: Price(Decimal::from(100)),
+            quantity: Quantity(Decimal::ONE),
+            timestamp: 1,
+            fill_id: "metadata-fill".into(),
+        });
+        let state = portfolio.export_state();
+        assert!(state
+            .account_view
+            .positions
+            .contains_key(&Symbol::new("BTCUSDT")));
+        assert!(!state
+            .account_view
+            .positions
+            .contains_key(&Symbol::new("ETHUSDT")));
+        assert_eq!(portfolio.reconciliation_exceptions().len(), 1);
+    }
+
+    #[test]
+    fn invalid_snapshot_references_are_rejected_before_state_mutation() {
+        let mut portfolio = Portfolio::with_cash_balance(Decimal::from(500));
+        let mut state = portfolio.export_state();
+        state
+            .processed_fill_ids
+            .insert(OrderId("UNKNOWN".into()), HashSet::from(["f".into()]));
+        portfolio.import_state(state);
+        assert_eq!(portfolio.reader().load().cash_balance, Decimal::from(500));
+        assert_eq!(portfolio.reconciliation_exceptions().len(), 1);
+    }
+
+    #[test]
+    fn financial_checkpoint_digest_rejects_tampered_cash_or_pnl() {
+        let mut portfolio = Portfolio::with_cash_balance(Decimal::from(500));
+        let mut state = portfolio.export_state();
+        assert!(state.canonical_state_digest.is_some());
+        state.account_view.cash_balance = Decimal::from(999);
+        portfolio.import_state(state);
+        assert_eq!(portfolio.reader().load().cash_balance, Decimal::from(500));
+        assert_eq!(portfolio.reconciliation_exceptions().len(), 1);
+    }
+
+    #[test]
+    fn non_positive_fill_price_or_fee_is_rejected_with_evidence() {
+        let mut portfolio = Portfolio::new();
+        let order_id = OrderId("BAD-PRICE".into());
+        let symbol = Symbol::new("BTCUSDT");
+        portfolio.register_order(order_id.clone(), symbol, Side::Buy);
+        portfolio.on_execution_event(&ExecutionEvent::Fill {
+            order_id: order_id.clone(),
+            price: Price(Decimal::ZERO),
+            quantity: Quantity(Decimal::ONE),
+            timestamp: 1,
+            fill_id: "zero-price".into(),
+        });
+        portfolio.on_execution_event(&ExecutionEvent::FeeCharged {
+            order_id,
+            amount: Decimal::from(-1),
+            timestamp: 1,
+            fill_id: "negative-fee".into(),
+        });
+        assert!(portfolio.reader().load().positions.is_empty());
+        assert_eq!(portfolio.reconciliation_exceptions().len(), 2);
     }
 }

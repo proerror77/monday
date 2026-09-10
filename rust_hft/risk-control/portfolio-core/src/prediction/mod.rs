@@ -15,9 +15,3 @@ pub use risk::{snapshot_from_state, RiskSnapshot};
 pub use runtime::{
     TradeCashflowSummary, TradingRuntime, TradingRuntimeError, TradingRuntimeSnapshot,
 };
-
-pub const CRATE_MARKER: &str = "ploy-trading";
-
-pub fn crate_marker() -> &'static str {
-    CRATE_MARKER
-}

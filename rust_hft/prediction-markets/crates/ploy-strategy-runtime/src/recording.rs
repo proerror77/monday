@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use ploy_strategy_bundles::{ExecutionReport, NullRecorder, Recorder, RuntimeMode, SignalRecord};
-use ploy_trading::{FillRecord, TradeSide, TradingIntent};
+use portfolio_core::prediction::{FillRecord, TradeSide, TradingIntent};
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 use serde_json::json;

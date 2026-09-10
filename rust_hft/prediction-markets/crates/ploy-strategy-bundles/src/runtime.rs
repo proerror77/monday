@@ -1,7 +1,7 @@
 use crate::bundle::StrategyBundle;
 use crate::signals::MarketSignal;
 use chrono::Utc;
-use ploy_trading::TradingIntent;
+use portfolio_core::prediction::TradingIntent;
 
 pub fn emit_intents(
     deployment_id: &str,

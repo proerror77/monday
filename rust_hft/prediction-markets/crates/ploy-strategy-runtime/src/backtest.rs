@@ -17,7 +17,7 @@ pub(crate) async fn run_backtest_entry(
     runtime_config: RuntimeModeConfig,
 ) -> (
     ploy_strategy_bundles::RuntimeResult,
-    ploy_trading::TradingRuntimeSnapshot,
+    portfolio_core::prediction::TradingRuntimeSnapshot,
 ) {
     run_backtest(config, symbols, strategy, runtime_config).await
 }
@@ -29,7 +29,7 @@ async fn run_backtest(
     runtime_config: RuntimeModeConfig,
 ) -> (
     ploy_strategy_bundles::RuntimeResult,
-    ploy_trading::TradingRuntimeSnapshot,
+    portfolio_core::prediction::TradingRuntimeSnapshot,
 ) {
     let db_url = match env::var("DATABASE_URL") {
         Ok(url) if !url.trim().is_empty() => url,

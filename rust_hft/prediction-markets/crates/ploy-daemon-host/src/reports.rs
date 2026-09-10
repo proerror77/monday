@@ -13,10 +13,8 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
-use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::runtime::Builder;
 use tokio::time::timeout;
 
 const DEFAULT_DATABASE_URL: &str = "postgresql://postgres:postgres@localhost:5432/ploy";
@@ -547,40 +545,36 @@ const HEALTH_SOURCES: [HealthSource; 11] = [
     },
 ];
 
-pub fn generate_market_data_health_json() -> Result<String, String> {
+pub async fn generate_market_data_health_json() -> Result<String, String> {
     let database_url = database_url();
-    let payload = run_async(async move {
-        let pool = connect(&database_url).await?;
-        market_data_health_payload(&pool).await
-    })?;
+    let pool = connect(&database_url).await?;
+    let payload = market_data_health_payload(&pool).await?;
     serde_json::to_string(&payload).map_err(|err| format!("serialize market data health: {err}"))
 }
 
-pub fn generate_dry_run_summary_json(host_root: &Path) -> Result<String, String> {
-    let report = generate_dry_run_report(host_root, None, true)?;
+pub async fn generate_dry_run_summary_json(host_root: &Path) -> Result<String, String> {
+    let report = generate_dry_run_report(host_root, None, true).await?;
     serde_json::to_string(&report).map_err(|err| format!("serialize dry-run summary: {err}"))
 }
 
-pub fn generate_strategy_report_html(
+pub async fn generate_strategy_report_html(
     host_root: &Path,
     since: Option<&str>,
 ) -> Result<String, String> {
     let since = parse_since(since)?;
-    let report = generate_dry_run_report(host_root, since, false)?;
+    let report = generate_dry_run_report(host_root, since, false).await?;
     Ok(render_strategy_report_html(&report, since))
 }
 
-fn generate_dry_run_report(
+async fn generate_dry_run_report(
     host_root: &Path,
     since: Option<NaiveDate>,
     include_runtime_evidence: bool,
 ) -> Result<DryRunPerformanceReport, String> {
     let database_url = database_url();
     let root = host_root.to_path_buf();
-    let data = run_async(async move {
-        let pool = connect(&database_url).await?;
-        load_report_data(&pool, &root, since, include_runtime_evidence).await
-    })?;
+    let pool = connect(&database_url).await?;
+    let data = load_report_data(&pool, &root, since, include_runtime_evidence).await?;
     Ok(build_performance_report(data))
 }
 
@@ -597,14 +591,6 @@ fn parse_since(value: Option<&str>) -> Result<Option<NaiveDate>, String> {
                 .map_err(|_| "since must use YYYY-MM-DD".to_string())
         })
         .transpose()
-}
-
-fn run_async<T>(future: impl Future<Output = Result<T, String>>) -> Result<T, String> {
-    let runtime = Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|err| format!("create report runtime: {err}"))?;
-    runtime.block_on(future)
 }
 
 async fn connect(database_url: &str) -> Result<PgPool, String> {

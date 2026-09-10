@@ -313,6 +313,9 @@ pub struct CancellableOrderRef {
 /// 訂單狀態
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum OrderStatus {
+    /// The local state cannot be reconciled with an authoritative venue
+    /// report. Unknown is fail-closed and must not be treated as filled.
+    Unknown,
     /// 新訂單，等待確認
     New,
     /// 已確認，等待成交（OMS 層使用）

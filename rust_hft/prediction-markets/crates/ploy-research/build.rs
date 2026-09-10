@@ -48,10 +48,14 @@ const POLICY_INPUTS: [(&str, &str); 11] = [
         "../market-core/snapshot/Cargo.toml",
     ),
 ];
-const FORBIDDEN_RUNTIME_PACKAGES: [&str; 3] = [
+const FORBIDDEN_RUNTIME_PACKAGES: [&str; 7] = [
     "ploy-operator-contracts",
     "ploy-strategy-bundles",
-    "ploy-trading",
+    "ploy-platform-runtime",
+    "hft-runtime",
+    "hft-engine",
+    "hft-execution",
+    "hft-execution-adapter-polymarket",
 ];
 const EXCLUDED_HOST_OR_PROC_MACRO_PACKAGES: [&str; 3] =
     ["core-foundation-sys", "security-framework", "sqlx-macros"];

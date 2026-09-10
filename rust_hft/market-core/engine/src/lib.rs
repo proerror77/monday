@@ -26,6 +26,7 @@ use ports::{
     AccountView, BoxStream, ExecutionClient, ExecutionEvent, OrderManager, PortfolioManager,
     Strategy, VenueSpec,
 };
+use rust_decimal::Decimal;
 use rustc_hash::FxHashMap;
 use snapshot::SnapshotContainer;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -123,6 +124,10 @@ impl AccountingEventDeduper {
         }
         self.fifo.push_back(key.clone());
         self.ids.insert(key)
+    }
+
+    fn contains(&self, key: &(hft_core::OrderId, String)) -> bool {
+        self.ids.contains(key)
     }
 
     fn from_portfolio_state(state: &ports::PortfolioState, capacity: usize) -> HftResult<Self> {
@@ -295,6 +300,9 @@ pub struct Engine {
     /// batch after cancellation, so suppress duplicates before OMS, portfolio, risk, metrics, and
     /// broadcasts rather than relying on only some downstream consumers to deduplicate.
     applied_accounting_event_ids: AccountingEventDeduper,
+    /// Fail-closed latch set when a real execution event cannot be applied
+    /// atomically. It is cleared only after independent reconciliation readback.
+    reconciliation_halt: bool,
     /// 最近處理的市場事件時間戳（用於端到端延遲計算）
     recent_market_event_timestamp: Option<u64>,
     /// 延遲監控器 - 統一收集所有階段延遲
@@ -387,6 +395,7 @@ impl Engine {
             applied_accounting_event_ids: AccountingEventDeduper::with_capacity(
                 ACCOUNTING_EVENT_DEDUP_CAPACITY,
             ),
+            reconciliation_halt: false,
             recent_market_event_timestamp: None,
             latency_monitor,
             broadcasters,
@@ -600,6 +609,17 @@ impl Engine {
             .unwrap_or_default()
     }
 
+    pub fn export_oms_checkpoint(&self) -> ports::OmsCheckpoint {
+        self.order_manager
+            .as_ref()
+            .map(|om| om.export_checkpoint())
+            .unwrap_or_else(|| ports::OmsCheckpoint {
+                orders: HashMap::new(),
+                notional_contracts: HashMap::new(),
+                reconciliation_exceptions: Vec::new(),
+            })
+    }
+
     /// Compare the OMS source of truth with an authoritative exchange snapshot.
     pub fn reconcile_open_orders(
         &self,
@@ -701,6 +721,25 @@ impl Engine {
         }
     }
 
+    pub fn import_oms_checkpoint(&mut self, checkpoint: ports::OmsCheckpoint) -> HftResult<()> {
+        self.order_account_map.clear();
+        self.order_account_map
+            .extend(checkpoint.orders.iter().filter_map(|(order_id, record)| {
+                record
+                    .account_id
+                    .as_ref()
+                    .map(|account_id| (order_id.clone(), account_id.clone()))
+            }));
+        if !checkpoint.reconciliation_exceptions.is_empty() {
+            self.reconciliation_halt = true;
+        }
+        if let Some(om) = &mut self.order_manager {
+            om.import_checkpoint(checkpoint)
+                .map_err(HftError::Execution)?;
+        }
+        Ok(())
+    }
+
     /// 導出 Portfolio 狀態（供恢復/持久化使用）
     pub fn export_portfolio_state(&self) -> ports::PortfolioState {
         let mut state = self
@@ -709,17 +748,27 @@ impl Engine {
             .map(|pm| pm.export_state())
             .unwrap_or_else(|| ports::PortfolioState {
                 account_view: AccountView::default(),
+                total_fees: Decimal::ZERO,
                 order_meta: HashMap::new(),
                 market_prices: HashMap::new(),
                 processed_fill_ids: HashMap::new(),
+                processed_fee_ids: HashMap::new(),
                 recent_accounting_event_ids: Vec::new(),
+                reconciliation_exceptions: Vec::new(),
+                canonical_state_digest: None,
             });
-        state.recent_accounting_event_ids = self
-            .applied_accounting_event_ids
-            .fifo
-            .iter()
-            .cloned()
-            .collect();
+        // Canonical Portfolio owns the accounting journal and digest.  A
+        // legacy manager without a digest still receives the engine horizon
+        // for migration, but a canonical checkpoint must not be rewritten by
+        // this outer engine layer.
+        if state.canonical_state_digest.is_none() {
+            state.recent_accounting_event_ids = self
+                .applied_accounting_event_ids
+                .fifo
+                .iter()
+                .cloned()
+                .collect();
+        }
         state
     }
 
@@ -728,11 +777,39 @@ impl Engine {
         let restored_deduper =
             AccountingEventDeduper::from_portfolio_state(&state, ACCOUNTING_EVENT_DEDUP_CAPACITY)?;
         self.applied_accounting_event_ids = restored_deduper;
+        if !state.reconciliation_exceptions.is_empty() {
+            self.reconciliation_halt = true;
+        }
         if let Some(pm) = &mut self.portfolio_manager {
-            pm.import_state(state);
+            pm.try_import_state(state).map_err(HftError::Execution)?;
             self.account_snapshots.store(pm.reader().load());
         }
         Ok(())
+    }
+
+    /// Clear the fail-closed execution latch only after the caller supplies
+    /// independently read-back, exception-free OMS and Portfolio checkpoints.
+    pub fn clear_reconciliation_halt(
+        &mut self,
+        oms: ports::OmsCheckpoint,
+        portfolio: ports::PortfolioState,
+    ) -> HftResult<()> {
+        if !oms.reconciliation_exceptions.is_empty()
+            || !portfolio.reconciliation_exceptions.is_empty()
+        {
+            return Err(HftError::Execution(
+                "cannot clear reconciliation halt with unresolved checkpoint exceptions"
+                    .to_string(),
+            ));
+        }
+        self.import_oms_checkpoint(oms)?;
+        self.import_portfolio_state(portfolio)?;
+        self.reconciliation_halt = false;
+        Ok(())
+    }
+
+    pub fn reconciliation_halted(&self) -> bool {
+        self.reconciliation_halt
     }
 
     /// Publish an externally read-back account view through the engine's canonical snapshot.
@@ -1491,6 +1568,12 @@ impl Engine {
 
     /// 處理單個執行事件
     fn handle_execution_event(&mut self, event: &ExecutionEvent) -> Result<(), HftError> {
+        if self.reconciliation_halt && matches!(event, ExecutionEvent::OrderNew { .. }) {
+            return Err(HftError::Execution(
+                "canonical execution state is halted pending independent reconciliation; new orders are blocked"
+                    .to_string(),
+            ));
+        }
         debug!("處理執行事件: {:?}", event);
         let accounting_key = match event {
             ExecutionEvent::Fill {
@@ -1501,7 +1584,10 @@ impl Engine {
             } if !fill_id.is_empty() => Some((order_id.clone(), format!("fee:{fill_id}"))),
             _ => None,
         };
-        if accounting_key.is_some_and(|key| !self.applied_accounting_event_ids.insert(key)) {
+        if accounting_key
+            .as_ref()
+            .is_some_and(|key| self.applied_accounting_event_ids.contains(key))
+        {
             debug!("忽略重放的成交/費用會計事件: {:?}", event);
             return Ok(());
         }
@@ -1539,8 +1625,10 @@ impl Engine {
                 }
             };
             // 註冊到 OMS 與 Portfolio（供後續 Fill 計算倉位/PnL）
+            let oms_registration_checkpoint =
+                self.order_manager.as_ref().map(|om| om.export_checkpoint());
             if let Some(om) = &mut self.order_manager {
-                om.register_order(ports::RegisterOrderParams {
+                let accepted = om.register_order(ports::RegisterOrderParams {
                     order_id: order_id.clone(),
                     client_order_id: client_order_id.clone(),
                     account_id: Some(account_id.clone()),
@@ -1550,10 +1638,27 @@ impl Engine {
                     venue: *venue,
                     strategy_id: Some(strategy_id.clone()),
                 });
+                if !accepted {
+                    return Err(HftError::Execution(format!(
+                        "canonical OMS refused OrderNew registration for {}",
+                        order_id.0
+                    )));
+                }
             }
             self.order_account_map.insert(order_id.clone(), account_id);
             if let Some(pm) = &mut self.portfolio_manager {
-                pm.register_order(order_id.clone(), symbol.clone(), *side);
+                if !pm.register_order(order_id.clone(), symbol.clone(), *side) {
+                    if let (Some(om), Some(checkpoint)) =
+                        (&mut self.order_manager, oms_registration_checkpoint)
+                    {
+                        let _ = om.import_checkpoint(checkpoint);
+                    }
+                    self.order_account_map.remove(order_id);
+                    return Err(HftError::Execution(format!(
+                        "canonical Portfolio refused OrderNew registration for {}",
+                        order_id.0
+                    )));
+                }
             }
             self.stats.orders_submitted = self.stats.orders_submitted.saturating_add(1);
             #[cfg(feature = "metrics")]
@@ -1568,22 +1673,97 @@ impl Engine {
             );
         }
 
-        // 廣播執行事件（最佳努力） only after OrderNew identity validation.
-        let _ = self.broadcasters.exec_event_tx.send(event.clone());
+        let accounting_event = matches!(
+            event,
+            ExecutionEvent::Fill { .. } | ExecutionEvent::FeeCharged { .. }
+        );
+        let oms_checkpoint = self
+            .order_manager
+            .as_ref()
+            .filter(|_| accounting_event)
+            .map(|om| om.export_checkpoint());
+        let oms_exception_count = self
+            .order_manager
+            .as_ref()
+            .map(|om| om.reconciliation_exception_count())
+            .unwrap_or_default();
+        let portfolio_checkpoint = self
+            .portfolio_manager
+            .as_ref()
+            .filter(|_| accounting_event)
+            .map(|pm| pm.export_state());
+        let portfolio_exception_count = portfolio_checkpoint
+            .as_ref()
+            .map(|state| state.reconciliation_exceptions.len())
+            .unwrap_or_default();
 
         // 1. 更新 OMS 狀態機
         let order_update = self
             .order_manager
             .as_mut()
             .and_then(|om| om.on_execution_event(event));
+        if accounting_event
+            && self
+                .order_manager
+                .as_ref()
+                .is_some_and(|om| om.reconciliation_exception_count() > oms_exception_count)
+        {
+            if let (Some(om), Some(mut checkpoint)) =
+                (&mut self.order_manager, oms_checkpoint.clone())
+            {
+                let mut evidence = om.export_checkpoint().reconciliation_exceptions;
+                checkpoint.reconciliation_exceptions.append(&mut evidence);
+                if let Err(reason) = om.import_checkpoint(checkpoint) {
+                    error!("canonical OMS rollback failed: {}", reason);
+                }
+            }
+            self.reconciliation_halt = true;
+            return Err(HftError::Execution(
+                "canonical OMS retained an execution event for reconciliation; portfolio was not updated"
+                    .to_string(),
+            ));
+        }
+        // 2. 更新 Portfolio 會計
+        if let Some(pm) = &mut self.portfolio_manager {
+            pm.on_execution_event(event);
+            if accounting_event
+                && pm.export_state().reconciliation_exceptions.len() > portfolio_exception_count
+            {
+                if let (Some(om), Some(mut checkpoint)) = (&mut self.order_manager, oms_checkpoint)
+                {
+                    let mut evidence = om.export_checkpoint().reconciliation_exceptions;
+                    checkpoint.reconciliation_exceptions.append(&mut evidence);
+                    if let Err(reason) = om.import_checkpoint(checkpoint) {
+                        error!("canonical OMS rollback failed: {}", reason);
+                    }
+                }
+                if let Some(mut checkpoint) = portfolio_checkpoint {
+                    let mut evidence = pm.export_state().reconciliation_exceptions;
+                    checkpoint.reconciliation_exceptions.append(&mut evidence);
+                    // The evidence append changes the trusted checkpoint
+                    // material; the canonical Portfolio recomputes its digest
+                    // on the next export after this verified restore.
+                    checkpoint.canonical_state_digest = None;
+                    if let Err(reason) = pm.try_import_state(checkpoint) {
+                        error!("canonical Portfolio rollback failed: {}", reason);
+                    }
+                }
+                self.reconciliation_halt = true;
+                return Err(HftError::Execution(
+                    "canonical portfolio retained an execution event for reconciliation; OMS was rolled back"
+                        .to_string(),
+                ));
+            }
+        }
+
+        // Downstream lifecycle effects become visible only after Portfolio
+        // acceptance. This keeps a rejected/rolled-back fill from emitting a
+        // false completion, metric, or broadcast.
         if let Some(order_update) = order_update {
             debug!("訂單狀態更新: {:?}", order_update);
-
-            // 檢查是否需要生成 OrderCompleted 事件（當訂單從非Filled變為Filled）
             if order_update.status == ports::OrderStatus::Filled
                 && order_update.previous_status != ports::OrderStatus::Filled
             {
-                // 創建 OrderCompleted 事件
                 let completed_event = ExecutionEvent::OrderCompleted {
                     order_id: order_update.order_id.clone(),
                     final_price: order_update.avg_price.unwrap_or(hft_core::Price::zero()),
@@ -1593,18 +1773,14 @@ impl Engine {
                         .unwrap_or_default()
                         .as_micros() as u64,
                 };
-
                 info!(
                     "生成 OrderCompleted 事件: order_id={}, final_price={:?}, total_filled={}",
                     order_update.order_id.0, order_update.avg_price, order_update.cum_qty.0
                 );
-
-                // 遞歸調用處理 OrderCompleted 事件（但 OMS 會忽略它避免循環）
                 self.handle_execution_event(&completed_event)?;
             }
         }
 
-        // 2. 細分統計
         match event {
             ExecutionEvent::OrderAck {
                 order_id,
@@ -1634,8 +1810,6 @@ impl Engine {
                         infra_metrics::MetricsRegistry::global().record_order_fill_latency(lat);
                     }
                 }
-
-                // 記錄端到端DoD延遲指標（從市場事件到執行完成）
                 if let Some(market_ts) = self.recent_market_event_timestamp {
                     let end_to_end_latency = timestamp.saturating_sub(market_ts) as f64;
                     #[cfg(feature = "metrics")]
@@ -1658,9 +1832,13 @@ impl Engine {
             _ => {}
         }
 
-        // 3. 更新 Portfolio 會計
-        if let Some(pm) = &mut self.portfolio_manager {
-            pm.on_execution_event(event);
+        let _ = self.broadcasters.exec_event_tx.send(event.clone());
+
+        // Commit the event deduplication key only after OMS and Portfolio have
+        // both accepted the event. A retained reconciliation event can then
+        // be retried after the authoritative state is repaired.
+        if let Some(key) = accounting_key {
+            self.applied_accounting_event_ids.insert(key);
         }
 
         // 4. 通知風控管理器
@@ -2173,6 +2351,12 @@ impl Engine {
     }
 
     fn ensure_accepting_new_intents(&self) -> Result<(), HftError> {
+        if self.reconciliation_halt {
+            return Err(HftError::Risk(
+                "canonical execution state is halted pending independent reconciliation"
+                    .to_string(),
+            ));
+        }
         match self.stats.trading_mode {
             TradingMode::Normal | TradingMode::Degraded => Ok(()),
             TradingMode::Paused | TradingMode::Emergency => Err(HftError::Risk(format!(
@@ -2963,7 +3147,8 @@ mod tests {
             _order_id: hft_core::OrderId,
             _symbol: Symbol,
             _side: hft_core::Side,
-        ) {
+        ) -> bool {
+            true
         }
 
         fn on_execution_event(&mut self, _event: &ports::ExecutionEvent) {}
@@ -2979,10 +3164,14 @@ mod tests {
         fn export_state(&self) -> ports::PortfolioState {
             ports::PortfolioState {
                 account_view: AccountView::default(),
+                total_fees: Decimal::ZERO,
                 order_meta: HashMap::new(),
                 market_prices: HashMap::new(),
                 processed_fill_ids: HashMap::new(),
+                processed_fee_ids: HashMap::new(),
                 recent_accounting_event_ids: Vec::new(),
+                reconciliation_exceptions: Vec::new(),
+                canonical_state_digest: None,
             }
         }
 
@@ -3532,6 +3721,69 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_overfill_is_atomic_across_canonical_oms_and_portfolio() {
+        let mut engine = Engine::new(EngineConfig::default());
+        engine.set_order_manager(Box::new(oms_core::OmsCore::new()));
+        engine.set_portfolio_manager(Box::new(portfolio_core::Portfolio::new()));
+        let order_id = hft_core::OrderId("atomic-overfill".to_string());
+        let account_id = hft_core::AccountId("canonical-account".to_string());
+        engine
+            .handle_execution_event(&ExecutionEvent::OrderNew {
+                order_id: order_id.clone(),
+                client_order_id: Some("atomic-client".to_string()),
+                account_id: Some(account_id),
+                symbol: Symbol::new("TOKEN-UP"),
+                side: hft_core::Side::Buy,
+                quantity: Quantity::from_f64(1.0).unwrap(),
+                requested_price: Some(Price::from_f64(0.50).unwrap()),
+                arrival_price: None,
+                timestamp: 1,
+                venue: Some(VenueId::POLYMARKET),
+                strategy_id: "prediction".to_string(),
+            })
+            .expect("order registration");
+
+        let error = engine
+            .handle_execution_event(&ExecutionEvent::Fill {
+                order_id: order_id.clone(),
+                price: Price::from_f64(0.50).unwrap(),
+                quantity: Quantity::from_f64(2.0).unwrap(),
+                timestamp: 2,
+                fill_id: "confirmed-overfill".to_string(),
+            })
+            .expect_err("overfill must halt for reconciliation");
+        assert!(error.to_string().contains("reconciliation"));
+        let oms = engine.export_oms_state();
+        assert_eq!(oms[&order_id].cum_qty, Quantity::zero());
+        let account = engine.account_reader().load();
+        assert!(account.positions.is_empty());
+        assert!(engine.reconciliation_halted());
+        assert_eq!(
+            engine
+                .export_oms_checkpoint()
+                .reconciliation_exceptions
+                .len(),
+            1
+        );
+        let blocked = engine
+            .handle_execution_event(&ExecutionEvent::OrderNew {
+                order_id,
+                client_order_id: Some("retry-after-halt".to_string()),
+                account_id: Some(hft_core::AccountId("canonical-account".to_string())),
+                symbol: Symbol::new("TOKEN-UP"),
+                side: hft_core::Side::Buy,
+                quantity: Quantity::from_f64(0.5).unwrap(),
+                requested_price: Some(Price::from_f64(0.50).unwrap()),
+                arrival_price: None,
+                timestamp: 3,
+                venue: Some(VenueId::POLYMARKET),
+                strategy_id: "prediction".to_string(),
+            })
+            .expect_err("halt must block retry before independent reconciliation");
+        assert!(blocked.to_string().contains("halted"));
+    }
+
+    #[test]
     fn strategy_account_mapping_falls_back_to_base_strategy_id() {
         let mut engine = Engine::new(EngineConfig::default());
         let account_id = hft_core::AccountId("base-account".to_string());
@@ -3566,6 +3818,7 @@ mod tests {
         let order_id = hft_core::OrderId("logical-1".to_string());
         let state = ports::PortfolioState {
             account_view: ports::AccountView::default(),
+            total_fees: Decimal::ZERO,
             order_meta: HashMap::new(),
             market_prices: HashMap::new(),
             processed_fill_ids: HashMap::from([(
@@ -3576,10 +3829,13 @@ mod tests {
                     "recent-2".to_string(),
                 ]),
             )]),
+            processed_fee_ids: HashMap::new(),
             recent_accounting_event_ids: vec![
                 (order_id.clone(), "fill:recent-1".to_string()),
                 (order_id.clone(), "fill:recent-2".to_string()),
             ],
+            reconciliation_exceptions: Vec::new(),
+            canonical_state_digest: None,
         };
 
         let mut restored =
@@ -3594,13 +3850,17 @@ mod tests {
     fn accounting_event_deduper_rejects_oversized_unordered_legacy_state() {
         let state = ports::PortfolioState {
             account_view: ports::AccountView::default(),
+            total_fees: Decimal::ZERO,
             order_meta: HashMap::new(),
             market_prices: HashMap::new(),
             processed_fill_ids: HashMap::from([(
                 hft_core::OrderId("logical-1".to_string()),
                 HashSet::from(["one".to_string(), "two".to_string(), "three".to_string()]),
             )]),
+            processed_fee_ids: HashMap::new(),
             recent_accounting_event_ids: Vec::new(),
+            reconciliation_exceptions: Vec::new(),
+            canonical_state_digest: None,
         };
 
         let error = match AccountingEventDeduper::from_portfolio_state(&state, 2) {

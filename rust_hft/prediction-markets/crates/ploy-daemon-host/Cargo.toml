@@ -8,14 +8,16 @@ repository.workspace = true
 description = "Daemon host crate for the Ploy control-plane runtime"
 
 [dependencies]
+async-trait = "0.1"
 chrono.workspace = true
+hft-core = { package = "hft-core", path = "../../../market-core/core" }
+ports = { package = "hft-ports", path = "../../../market-core/ports" }
 hmac.workspace = true
-ploy-connectivity.workspace = true
 ploy-deployments.workspace = true
 ploy-operator-contracts.workspace = true
 ploy-platform.workspace = true
-ploy-platform-runtime.workspace = true
-ploy-trading.workspace = true
+ploy-platform-runtime = { workspace = true, features = ["test-support"] }
+portfolio-core.workspace = true
 rand.workspace = true
 rust_decimal.workspace = true
 secrecy.workspace = true
@@ -28,7 +30,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 chrono.workspace = true
-ploy-connectivity = { workspace = true, features = ["test-support"] }
 ploy-market-contracts.workspace = true
 ploy-strategy-bundles.workspace = true
 rust_decimal.workspace = true
