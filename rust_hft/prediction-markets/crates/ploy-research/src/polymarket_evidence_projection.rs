@@ -154,8 +154,8 @@ pub fn project_verified_polymarket_evidence(
     for book in sampled_books.into_values() {
         let mut bids = book.bid_levels.clone().unwrap_or_default();
         let mut asks = book.ask_levels.clone().unwrap_or_default();
-        bids.sort_by(|left, right| right.price.cmp(&left.price));
-        asks.sort_by(|left, right| left.price.cmp(&right.price));
+        bids.sort_by_key(|level| std::cmp::Reverse(level.price));
+        asks.sort_by_key(|level| level.price);
         updates.push(MarketUpdate::Quote {
             token_id: Arc::from(book.token_id.as_str()),
             bid: book.bid,
