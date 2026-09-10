@@ -5,7 +5,7 @@ use ploy_operator_contracts::DeploymentRuntimeMode;
 use ploy_platform::DeploymentRecord;
 use portfolio_core::prediction::{FillRecord, TradeSide, TradingRuntime};
 use ports::{ExecutionClient, ExecutionEvent};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::time::Instant;
 use tokio::time::{timeout, Duration};
@@ -31,7 +31,6 @@ pub async fn reconcile_live_fills_with_stream(
 ) -> io::Result<ReconcileStatus> {
     let mut order_deployments = HashMap::new();
     let mut venue_to_local = HashMap::new();
-    let mut ambiguous_venue_ids = HashSet::new();
     let terminal_cutoff =
         chrono::Utc::now() - chrono::Duration::hours(TERMINAL_RECONCILE_RETENTION_HOURS);
 
@@ -68,29 +67,29 @@ pub async fn reconcile_live_fills_with_stream(
             let Some(_venue_order_id) = order.venue_order_id.clone() else {
                 continue;
             };
-            order_deployments.insert(order.order_id.clone(), record.deployment_id.clone());
+            if let Some(existing_deployment_id) = order_deployments
+                .insert(order.order_id.clone(), record.deployment_id.clone())
+                .filter(|existing| existing != &record.deployment_id)
+            {
+                return Err(reconciliation_identity_error(
+                    "local order",
+                    &order.order_id,
+                    &existing_deployment_id,
+                    &record.deployment_id,
+                ));
+            }
             let local = order.order_id.clone();
             let deployment_id = record.deployment_id.clone();
             if let Some(venue_order_id) = order.venue_order_id {
-                bind_venue_identity(
-                    &mut venue_to_local,
-                    &mut ambiguous_venue_ids,
-                    venue_order_id,
-                    local.clone(),
-                    deployment_id.clone(),
-                );
+                bind_venue_identity(&mut venue_to_local, venue_order_id, local.clone(), deployment_id.clone())?;
             }
             for venue_order_id in order.venue_order_history {
-                bind_venue_identity(
-                    &mut venue_to_local,
-                    &mut ambiguous_venue_ids,
-                    venue_order_id,
-                    local.clone(),
-                    deployment_id.clone(),
-                );
+                bind_venue_identity(&mut venue_to_local, venue_order_id, local.clone(), deployment_id.clone())?;
             }
         }
     }
+
+    validate_local_venue_identity_collisions(&order_deployments, &venue_to_local)?;
 
     if order_deployments.is_empty() {
         return Ok(ReconcileStatus::Noop);
@@ -138,14 +137,11 @@ pub async fn reconcile_live_fills_with_stream(
         .map_err(execution_io_error)?;
 
     for account_fill in account_fills {
-        let local_id = if order_deployments.contains_key(&account_fill.order_id.0) {
-            account_fill.order_id.0.clone()
-        } else if let Some((local_id, _)) = venue_to_local.get(&account_fill.order_id.0) {
-            local_id.clone()
-        } else {
-            continue;
-        };
-        let Some(deployment_id) = order_deployments.get(&local_id) else {
+        let Some((local_id, deployment_id)) = resolve_account_fill_identity(
+            &account_fill.order_id.0,
+            &order_deployments,
+            &venue_to_local,
+        )? else {
             continue;
         };
         let event = ExecutionEvent::Fill {
@@ -165,7 +161,7 @@ pub async fn reconcile_live_fills_with_stream(
         else {
             unreachable!("canonical fill conversion must remain a fill event");
         };
-        let Some(runtime) = trading.get_mut(deployment_id) else {
+        let Some(runtime) = trading.get_mut(&deployment_id) else {
             continue;
         };
         let fill = FillRecord {
@@ -228,23 +224,87 @@ fn execution_event_order_id(event: &ExecutionEvent) -> Option<String> {
 
 fn bind_venue_identity(
     venue_to_local: &mut HashMap<String, (String, String)>,
-    ambiguous_venue_ids: &mut HashSet<String>,
     venue_order_id: String,
     local_order_id: String,
     deployment_id: String,
-) {
-    if venue_order_id.is_empty() || ambiguous_venue_ids.contains(&venue_order_id) {
-        return;
+) -> io::Result<()> {
+    if venue_order_id.is_empty() {
+        return Ok(());
     }
     let candidate = (local_order_id, deployment_id);
     if let Some(existing) = venue_to_local.get(&venue_order_id) {
         if existing != &candidate {
-            venue_to_local.remove(&venue_order_id);
-            ambiguous_venue_ids.insert(venue_order_id);
+            return Err(reconciliation_identity_error(
+                "venue order",
+                &venue_order_id,
+                &existing.1,
+                &candidate.1,
+            ));
         }
-        return;
+        return Ok(());
     }
     venue_to_local.insert(venue_order_id, candidate);
+    Ok(())
+}
+
+fn validate_local_venue_identity_collisions(
+    order_deployments: &HashMap<String, String>,
+    venue_to_local: &HashMap<String, (String, String)>,
+) -> io::Result<()> {
+    for (local_order_id, local_deployment_id) in order_deployments {
+        let Some((mapped_local_order_id, venue_deployment_id)) = venue_to_local.get(local_order_id)
+        else {
+            continue;
+        };
+        if mapped_local_order_id != local_order_id || venue_deployment_id != local_deployment_id {
+            return Err(reconciliation_identity_error(
+                "local/venue order",
+                local_order_id,
+                local_deployment_id,
+                venue_deployment_id,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_account_fill_identity(
+    order_id: &str,
+    order_deployments: &HashMap<String, String>,
+    venue_to_local: &HashMap<String, (String, String)>,
+) -> io::Result<Option<(String, String)>> {
+    match (order_deployments.get(order_id), venue_to_local.get(order_id)) {
+        (None, None) => Ok(None),
+        (Some(deployment_id), None) => Ok(Some((order_id.to_string(), deployment_id.clone()))),
+        (None, Some((local_order_id, deployment_id))) => {
+            Ok(Some((local_order_id.clone(), deployment_id.clone())))
+        }
+        (Some(local_deployment_id), Some((mapped_local_order_id, venue_deployment_id))) => {
+            if mapped_local_order_id != order_id || local_deployment_id != venue_deployment_id {
+                return Err(reconciliation_identity_error(
+                    "local/venue order",
+                    order_id,
+                    local_deployment_id,
+                    venue_deployment_id,
+                ));
+            }
+            Ok(Some((mapped_local_order_id.clone(), venue_deployment_id.clone())))
+        }
+    }
+}
+
+fn reconciliation_identity_error(
+    identity_kind: &str,
+    identity: &str,
+    existing_deployment_id: &str,
+    conflicting_deployment_id: &str,
+) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "reconciliation {identity_kind} identity collision for `{identity}` between deployments `{existing_deployment_id}` and `{conflicting_deployment_id}`"
+        ),
+    )
 }
 
 #[cfg(test)]
@@ -933,6 +993,107 @@ mod tests {
                 .orders[0]
                 .state,
             OrderState::Canceled
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_deployment_local_venue_identity_collision_fails_before_reconciliation_mutation() {
+        let deployment_a = DeploymentRecord {
+            deployment_id: "example.live-a".to_string(),
+            bundle_id: "example".to_string(),
+            runtime_mode: ploy_operator_contracts::DeploymentRuntimeMode::Live,
+            account_id: "acct-a".to_string(),
+            max_gross_exposure: Some(dec!(5)),
+            deployment_state: DeploymentState::Enabled,
+            desired_state: DesiredState::Running,
+            observed_state: ObservedState::Running,
+        };
+        let deployment_b = DeploymentRecord {
+            deployment_id: "example.live-b".to_string(),
+            bundle_id: "example".to_string(),
+            runtime_mode: ploy_operator_contracts::DeploymentRuntimeMode::Live,
+            account_id: "acct-b".to_string(),
+            max_gross_exposure: Some(dec!(5)),
+            deployment_state: DeploymentState::Enabled,
+            desired_state: DesiredState::Running,
+            observed_state: ObservedState::Running,
+        };
+        let mut runtime_a = TradingRuntime::default();
+        runtime_a
+            .submit_intent(
+                TradingIntent {
+                    intent_id: "intent-a".to_string(),
+                    deployment_id: deployment_a.deployment_id.clone(),
+                    market_id: "market-a".to_string(),
+                    token_id: "token-a".to_string(),
+                    side: TradeSide::Buy,
+                    quantity: dec!(1),
+                    limit_price: Some(dec!(0.4)),
+                    purpose: IntentPurpose::Entry,
+                    created_at: chrono::Utc::now(),
+                },
+                "shared-venue-order",
+                None,
+            )
+            .expect("valid deployment A intent");
+        runtime_a.acknowledge_order("shared-venue-order", "venue-a");
+        let mut runtime_b = TradingRuntime::default();
+        runtime_b
+            .submit_intent(
+                TradingIntent {
+                    intent_id: "intent-b".to_string(),
+                    deployment_id: deployment_b.deployment_id.clone(),
+                    market_id: "market-b".to_string(),
+                    token_id: "token-b".to_string(),
+                    side: TradeSide::Buy,
+                    quantity: dec!(1),
+                    limit_price: Some(dec!(0.4)),
+                    purpose: IntentPurpose::Entry,
+                    created_at: chrono::Utc::now(),
+                },
+                "order-b",
+                None,
+            )
+            .expect("valid deployment B intent");
+        runtime_b.acknowledge_order("order-b", "shared-venue-order");
+        let mut trading = BTreeMap::from([
+            (deployment_a.deployment_id.clone(), runtime_a),
+            (deployment_b.deployment_id.clone(), runtime_b),
+        ]);
+        let before_a = trading
+            .get("example.live-a")
+            .expect("deployment A runtime")
+            .snapshot(&BTreeMap::new());
+        let before_b = trading
+            .get("example.live-b")
+            .expect("deployment B runtime")
+            .snapshot(&BTreeMap::new());
+
+        let mut gateway = StaticExecutionGateway::acknowledged("unused");
+        let error = reconcile_live_fills(
+            &mut gateway,
+            &[deployment_a, deployment_b],
+            &mut trading,
+        )
+        .await
+        .expect_err("ambiguous venue identity must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("shared-venue-order"));
+        assert_eq!(
+            trading
+                .get("example.live-a")
+                .expect("deployment A runtime")
+                .snapshot(&BTreeMap::new())
+                .fills,
+            before_a.fills
+        );
+        assert_eq!(
+            trading
+                .get("example.live-b")
+                .expect("deployment B runtime")
+                .snapshot(&BTreeMap::new())
+                .fills,
+            before_b.fills
         );
     }
 }

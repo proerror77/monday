@@ -6,10 +6,12 @@ use ploy_operator_contracts::{
 };
 use ploy_platform::DeploymentRecord;
 use portfolio_core::prediction::{
-    OrderState, TradeSide, TradingIntent, TradingRuntime, TradingRuntimeSnapshot,
+    OrderState, PositionSnapshot, PnlSnapshot, RiskSnapshot, TradeSide, TradingIntent,
+    TradingRuntime, TradingRuntimeSnapshot,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
@@ -46,6 +48,8 @@ pub struct PersistedTradingStateSnapshot {
     pub snapshot: TradingStateSnapshot,
     pub canonical_oms: ports::OmsCheckpoint,
     pub canonical_portfolio: ports::PortfolioState,
+    pub canonical_snapshot_digest: String,
+    pub integrity_digest: String,
 }
 
 pub fn build_persisted_trading_state_snapshot(
@@ -64,11 +68,159 @@ pub fn build_persisted_trading_state_snapshot(
             "trading runtime snapshot is missing canonical portfolio checkpoint",
         )
     })?;
+    let canonical_snapshot_digest = snapshot.canonical_snapshot_digest.clone().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trading runtime snapshot is missing canonical integrity digest",
+        )
+    })?;
+    if canonical_snapshot_digest != snapshot.integrity_digest() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trading runtime snapshot integrity digest mismatch",
+        ));
+    }
+    let snapshot = build_trading_state_snapshot(record, snapshot);
+    let integrity_digest = persisted_integrity_digest(
+        &snapshot,
+        &canonical_oms,
+        &canonical_portfolio,
+        &canonical_snapshot_digest,
+    )?;
     Ok(PersistedTradingStateSnapshot {
-        snapshot: build_trading_state_snapshot(record, snapshot),
+        snapshot,
         canonical_oms,
         canonical_portfolio,
+        canonical_snapshot_digest,
+        integrity_digest,
     })
+}
+
+/// Verify the durable envelope before any deployment or runtime-mode filtering.
+/// The digest covers every persisted projection and both canonical checkpoints,
+/// including fields whose own checkpoint digest may be optional for legacy data.
+pub(crate) fn verify_persisted_trading_state_snapshot(
+    persisted: &PersistedTradingStateSnapshot,
+) -> io::Result<()> {
+    let expected = persisted_integrity_digest(
+        &persisted.snapshot,
+        &persisted.canonical_oms,
+        &persisted.canonical_portfolio,
+        &persisted.canonical_snapshot_digest,
+    )?;
+    if persisted.integrity_digest != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "persisted trading state envelope integrity digest mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn persisted_integrity_digest(
+    snapshot: &TradingStateSnapshot,
+    canonical_oms: &ports::OmsCheckpoint,
+    canonical_portfolio: &ports::PortfolioState,
+    canonical_snapshot_digest: &str,
+) -> io::Result<String> {
+    let value = serde_json::json!({
+        "snapshot": snapshot,
+        "canonical_oms": canonical_oms,
+        "canonical_portfolio": canonical_portfolio,
+        "canonical_snapshot_digest": canonical_snapshot_digest,
+    });
+    let mut material = Vec::new();
+    write_canonical_json(&value, &mut material)?;
+    Ok(format!("sha256:{:x}", Sha256::digest(material)))
+}
+
+fn write_canonical_json(value: &serde_json::Value, output: &mut Vec<u8>) -> io::Result<()> {
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            output.extend(serde_json::to_vec(value).map_err(invalid_json_error)?);
+        }
+        serde_json::Value::String(_) => {
+            output.extend(serde_json::to_vec(value).map_err(invalid_json_error)?);
+        }
+        serde_json::Value::Array(values) => {
+            output.push(b'[');
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    output.push(b',');
+                }
+                write_canonical_json(value, output)?;
+            }
+            output.push(b']');
+        }
+        serde_json::Value::Object(values) => {
+            let mut entries = values.iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(right.0));
+            output.push(b'{');
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if index != 0 {
+                    output.push(b',');
+                }
+                output.extend(serde_json::to_vec(key).map_err(invalid_json_error)?);
+                output.push(b':');
+                if matches!(key.as_str(), "processed_fill_ids" | "processed_fee_ids") {
+                    write_canonical_json_sorted_array(value, output)?;
+                } else {
+                    write_canonical_json(value, output)?;
+                }
+            }
+            output.push(b'}');
+        }
+    }
+    Ok(())
+}
+
+fn write_canonical_json_sorted_array(
+    value: &serde_json::Value,
+    output: &mut Vec<u8>,
+) -> io::Result<()> {
+    match value {
+        serde_json::Value::Array(values) => {
+            let mut encoded = values
+                .iter()
+                .map(canonical_json_bytes)
+                .collect::<io::Result<Vec<_>>>()?;
+            encoded.sort();
+            output.push(b'[');
+            for (index, value) in encoded.into_iter().enumerate() {
+                if index != 0 {
+                    output.push(b',');
+                }
+                output.extend(value);
+            }
+            output.push(b']');
+        }
+        serde_json::Value::Object(values) => {
+            let mut entries = values.iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(right.0));
+            output.push(b'{');
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if index != 0 {
+                    output.push(b',');
+                }
+                output.extend(serde_json::to_vec(key).map_err(invalid_json_error)?);
+                output.push(b':');
+                write_canonical_json_sorted_array(value, output)?;
+            }
+            output.push(b'}');
+        }
+        _ => write_canonical_json(value, output)?,
+    }
+    Ok(())
+}
+
+fn canonical_json_bytes(value: &serde_json::Value) -> io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    write_canonical_json(value, &mut output)?;
+    Ok(output)
+}
+
+fn invalid_json_error(error: serde_json::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -180,6 +332,7 @@ pub fn restore_trading_runtime(snapshot: TradingStateSnapshot) -> io::Result<Tra
 pub fn restore_persisted_trading_runtime(
     persisted: PersistedTradingStateSnapshot,
 ) -> io::Result<TradingRuntime> {
+    verify_persisted_trading_state_snapshot(&persisted)?;
     let snapshot = persisted.snapshot;
     let deployment_id = snapshot.deployment_id.clone();
     let persisted_positions = snapshot.positions.clone();
@@ -239,18 +392,37 @@ pub fn restore_persisted_trading_runtime(
             })
         })
         .collect::<io::Result<Vec<_>>>()?;
-    let mut snapshot = TradingRuntimeSnapshot {
+    let snapshot = TradingRuntimeSnapshot {
         intents,
         orders,
         fills,
-        positions: Vec::new(),
-        pnl: Default::default(),
-        risk: Default::default(),
+        positions: snapshot
+            .positions
+            .into_iter()
+            .map(|position| PositionSnapshot {
+                token_id: position.token_id,
+                net_qty: position.net_qty,
+                avg_entry_price: position.avg_entry_price,
+                realized_pnl: position.realized_pnl,
+            })
+            .collect(),
+        pnl: PnlSnapshot {
+            realized_pnl: snapshot.pnl.realized_pnl,
+            unrealized_pnl: snapshot.pnl.unrealized_pnl,
+            total_fees: snapshot.pnl.total_fees,
+        },
+        risk: RiskSnapshot {
+            pending_intents: snapshot.risk.pending_intents,
+            active_orders: snapshot.risk.active_orders,
+            open_positions: snapshot.risk.open_positions,
+            gross_exposure: snapshot.risk.gross_exposure,
+            reserved_order_exposure: snapshot.risk.reserved_order_exposure,
+            total_gross_exposure: snapshot.risk.total_gross_exposure,
+        },
         canonical_oms: Some(persisted.canonical_oms),
         canonical_portfolio: Some(persisted.canonical_portfolio),
-        canonical_snapshot_digest: None,
+        canonical_snapshot_digest: Some(persisted.canonical_snapshot_digest),
     };
-    snapshot.canonical_snapshot_digest = Some(snapshot.integrity_digest());
     let runtime = TradingRuntime::restore(snapshot)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if !persisted_positions.is_empty() {

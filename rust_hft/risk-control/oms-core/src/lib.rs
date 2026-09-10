@@ -654,7 +654,16 @@ impl OmsCore {
             order.limit_price = next_price;
         }
         order.revision = order.revision.saturating_add(1);
-        order.state_changed_at = Some(timestamp);
+        if !matches!(
+            previous_status,
+            OrderStatus::Filled
+                | OrderStatus::Canceled
+                | OrderStatus::Rejected
+                | OrderStatus::Expired
+                | OrderStatus::Replaced
+        ) {
+            order.state_changed_at = Some(timestamp);
+        }
         let derived_status = if order.cum_qty.0 >= order.qty.0 {
             OrderStatus::Filled
         } else if order.cum_qty.0 > rust_decimal::Decimal::ZERO {
@@ -2033,6 +2042,76 @@ mod tests {
             );
         }
         assert_eq!(oms.get(&order_id).unwrap().status, OrderStatus::Filled);
+    }
+
+    #[test]
+    fn terminal_order_modified_preserves_terminal_state_clock() {
+        for (label, terminal_event, expected_status) in [
+            (
+                "filled",
+                ExecutionEvent::Fill {
+                    order_id: OrderId("TERMINAL-MODIFIED-FILLED".into()),
+                    price: Price::from_f64(100.0).unwrap(),
+                    quantity: Quantity::from_f64(1.0).unwrap(),
+                    timestamp: 10,
+                    fill_id: "terminal-modified-fill".into(),
+                },
+                OrderStatus::Filled,
+            ),
+            (
+                "canceled",
+                ExecutionEvent::OrderCanceled {
+                    order_id: OrderId("TERMINAL-MODIFIED-CANCELED".into()),
+                    timestamp: 10,
+                },
+                OrderStatus::Canceled,
+            ),
+            (
+                "rejected",
+                ExecutionEvent::OrderReject {
+                    order_id: OrderId("TERMINAL-MODIFIED-REJECTED".into()),
+                    reason: "venue rejected".into(),
+                    timestamp: 10,
+                },
+                OrderStatus::Rejected,
+            ),
+        ] {
+            let mut oms = OmsCore::new();
+            let order_id = match &terminal_event {
+                ExecutionEvent::Fill { order_id, .. }
+                | ExecutionEvent::OrderCanceled { order_id, .. }
+                | ExecutionEvent::OrderReject { order_id, .. } => order_id.clone(),
+                _ => unreachable!("test only covers terminal events"),
+            };
+            assert!(oms.register_order(RegisterOrderParams {
+                order_id: order_id.clone(),
+                client_order_id: None,
+                account_id: None,
+                symbol: Symbol::new("BTCUSDT"),
+                side: Side::Buy,
+                qty: Quantity::from_f64(1.0).unwrap(),
+                venue: None,
+                strategy_id: None,
+            }));
+            assert_eq!(oms.on_execution_event(&terminal_event).unwrap().status, expected_status);
+            let terminal_changed_at = oms.get(&order_id).unwrap().state_changed_at;
+            assert_eq!(terminal_changed_at, Some(10), "{label} terminal timestamp");
+
+            let modified = oms
+                .on_execution_event(&ExecutionEvent::OrderModified {
+                    order_id: order_id.clone(),
+                    new_quantity: Some(Quantity::from_f64(1.0).unwrap()),
+                    new_price: Some(Price::from_f64(99.0).unwrap()),
+                    timestamp: 20,
+                })
+                .expect("terminal modification remains observable");
+            assert_eq!(modified.status, expected_status, "{label} status");
+            assert_eq!(
+                oms.get(&order_id).unwrap().state_changed_at,
+                terminal_changed_at,
+                "{label} late modification must not extend retention"
+            );
+        }
     }
 
     #[test]
