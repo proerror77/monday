@@ -85,7 +85,7 @@ Run Rust commands from this directory. The workspace is pinned to Rust `1.98.1`.
 
 ```bash
 cargo +1.98.1 metadata --locked --no-deps
-cargo +1.98.1 fmt --all -- --check
+cargo +1.98.1 fmt -p ploy-platform-runtime -p ploy-daemon-host -- --check
 cargo +1.98.1 test --locked -p ploy-platform-runtime -p ploy-daemon-host
 cargo +1.98.1 check --locked -p new-ploy-runner --features full
 ```
