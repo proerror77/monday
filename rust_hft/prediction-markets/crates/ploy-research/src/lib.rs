@@ -17,6 +17,7 @@ pub mod factors_v2;
 pub mod model;
 pub mod orderbook;
 pub mod polymarket_evidence_projection;
+pub mod polymarket_history;
 pub mod prediction_loop;
 mod prediction_loop_fs;
 pub mod prediction_mcts;
