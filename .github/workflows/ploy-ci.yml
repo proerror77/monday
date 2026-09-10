@@ -938,6 +938,7 @@ jobs:
           set -euo pipefail
           SECONDS=0
           cargo check --locked -p ploy-market-data --features live --lib
+          cargo test --locked -p ploy-market-data --features live --lib
           echo "### Rust market-data ops lane" >> "$GITHUB_STEP_SUMMARY"
           echo "Elapsed seconds: ${SECONDS}" >> "$GITHUB_STEP_SUMMARY"
 

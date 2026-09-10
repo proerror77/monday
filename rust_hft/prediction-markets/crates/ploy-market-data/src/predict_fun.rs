@@ -52,14 +52,8 @@ impl PredictFunConfig {
             .ok()
             .filter(|value| !value.trim().is_empty());
         let api_key = api_key.map(SecretString::from);
-        validate_api_access(
-            &base_url,
-            api_key
-                .as_ref()
-                .map(ExposeSecret::expose_secret)
-                .map(String::as_str),
-        )
-        .map_err(map_config_error)?;
+        validate_api_access(&base_url, api_key.as_ref().map(ExposeSecret::expose_secret))
+            .map_err(map_config_error)?;
         Ok(Self {
             base_url,
             api_key,
@@ -171,10 +165,12 @@ async fn restore_acceptance_state(
     pool: &PgPool,
 ) -> Result<(), PredictFunError> {
     let rows = sqlx::query_as::<_, (i64, Option<i64>)>(
-        "SELECT market_id, MAX(exchange_timestamp_ms)\
-         FROM predict_fun_orderbook_ticks\
-         WHERE exchange_timestamp_ms IS NOT NULL\
-         GROUP BY market_id",
+        r#"
+        SELECT market_id, MAX(exchange_timestamp_ms)
+        FROM predict_fun_orderbook_ticks
+        WHERE exchange_timestamp_ms IS NOT NULL
+        GROUP BY market_id
+        "#,
     )
     .fetch_all(pool)
     .await?;

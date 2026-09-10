@@ -86,6 +86,8 @@ pub enum PredictFunError {
     InvalidBinding(String),
     #[error("Predict.fun order book is not ready: {0}")]
     NotReady(String),
+    #[error("Predict.fun stream generation was superseded")]
+    SupersededGeneration,
 }
 
 pub type PredictFunResult<T> = Result<T, PredictFunError>;
@@ -429,6 +431,7 @@ struct MarketAcceptance {
 struct AcceptanceTracker {
     markets: HashMap<i64, MarketAcceptance>,
     pending_invalidations: Vec<PredictFunBookProjection>,
+    generation: u64,
 }
 
 impl AcceptanceTracker {
@@ -551,13 +554,7 @@ fn failure_projection(
 
 impl PredictFunClient {
     pub fn new(base_url: String, api_key: Option<SecretString>) -> PredictFunResult<Self> {
-        validate_api_access(
-            &base_url,
-            api_key
-                .as_ref()
-                .map(ExposeSecret::expose_secret)
-                .map(String::as_str),
-        )?;
+        validate_api_access(&base_url, api_key.as_ref().map(ExposeSecret::expose_secret))?;
         let origin = Url::parse(base_url.trim_end_matches('/'))
             .map_err(|error| PredictFunError::Client(error.to_string()))?;
         Self::build(origin, api_key)
@@ -766,6 +763,30 @@ impl PredictFunClient {
             .accept(projection)
     }
 
+    fn begin_stream_generation(&self) -> PredictFunResult<u64> {
+        let mut acceptance = self.acceptance.lock().map_err(|_| {
+            PredictFunError::Client("Predict.fun acceptance state poisoned".to_owned())
+        })?;
+        acceptance.generation = acceptance.generation.saturating_add(1);
+        Ok(acceptance.generation)
+    }
+
+    fn accept_orderbook_for_generation(
+        &self,
+        generation: u64,
+        received: &ReceivedOrderBook,
+        decimal_precision: u32,
+    ) -> PredictFunResult<Option<PredictFunBookProjection>> {
+        let projection = project_orderbook(received, decimal_precision)?;
+        let mut acceptance = self.acceptance.lock().map_err(|_| {
+            PredictFunError::Client("Predict.fun acceptance state poisoned".to_owned())
+        })?;
+        if acceptance.generation != generation {
+            return Ok(None);
+        }
+        acceptance.accept(projection).map(Some)
+    }
+
     pub fn invalidate_market(
         &self,
         market_id: i64,
@@ -777,6 +798,21 @@ impl PredictFunClient {
                 PredictFunError::Client("Predict.fun acceptance state poisoned".to_owned())
             })?
             .invalidate(market_id, reason.into())
+    }
+
+    fn invalidate_market_for_generation(
+        &self,
+        generation: u64,
+        market_id: i64,
+        reason: String,
+    ) -> PredictFunResult<Option<PredictFunBookProjection>> {
+        let mut acceptance = self.acceptance.lock().map_err(|_| {
+            PredictFunError::Client("Predict.fun acceptance state poisoned".to_owned())
+        })?;
+        if acceptance.generation != generation {
+            return Ok(None);
+        }
+        acceptance.invalidate(market_id, reason).map(Some)
     }
 
     pub fn seed_acceptance_clock(
@@ -1066,6 +1102,14 @@ impl MarketStream for PredictFunMarketStream {
                 "Predict.fun requires at least one configured outcome token".to_owned(),
             ));
         }
+        let state = Arc::clone(&self.state);
+        let generation = self.client.begin_stream_generation().map_err(hft_error)?;
+        state.generation.store(generation, Ordering::Release);
+        state.enabled.store(false, Ordering::Release);
+        state.connected.store(false, Ordering::Release);
+        if let Ok(mut selected_markets) = state.selected_markets.lock() {
+            selected_markets.clear();
+        }
         self.validate_against_catalog().await?;
         let selected = symbols
             .into_iter()
@@ -1094,14 +1138,12 @@ impl MarketStream for PredictFunMarketStream {
                 .1
                 .push((symbol, outcome));
         }
-        let state = Arc::clone(&self.state);
         if let Ok(mut selected_markets) = state.selected_markets.lock() {
             selected_markets.clear();
             selected_markets.extend(grouped.keys().copied());
         }
         state.enabled.store(true, Ordering::Release);
         state.connected.store(false, Ordering::Release);
-        let generation = state.generation.fetch_add(1, Ordering::AcqRel) + 1;
         let client = self.client.clone();
         let poll_interval = self.poll_interval;
         let (tx, mut rx) = mpsc::channel(1_024);
@@ -1118,7 +1160,15 @@ impl MarketStream for PredictFunMarketStream {
                 ticker.tick().await;
                 for (market_id, (binding, outcomes)) in &grouped {
                     let result = client.orderbook(*market_id).await.and_then(|received| {
-                        client.accept_orderbook(&received, binding.decimal_precision)
+                        client
+                            .accept_orderbook_for_generation(
+                                generation,
+                                &received,
+                                binding.decimal_precision,
+                            )
+                            .and_then(|projection| {
+                                projection.ok_or(PredictFunError::SupersededGeneration)
+                            })
                     });
                     if state.generation.load(Ordering::Acquire) != generation {
                         return;
@@ -1170,7 +1220,14 @@ impl MarketStream for PredictFunMarketStream {
                         Err(error) => {
                             ready_markets.remove(market_id);
                             let reason = error.to_string();
-                            let _ = client.invalidate_market(*market_id, reason.clone());
+                            match client.invalidate_market_for_generation(
+                                generation,
+                                *market_id,
+                                reason.clone(),
+                            ) {
+                                Ok(Some(_)) => {}
+                                Ok(None) | Err(_) => return,
+                            }
                             if invalidated.insert(*market_id) {
                                 for (symbol, _) in outcomes {
                                     if tx
@@ -1224,6 +1281,8 @@ impl MarketStream for PredictFunMarketStream {
     }
 
     async fn disconnect(&mut self) -> HftResult<()> {
+        let generation = self.client.begin_stream_generation().map_err(hft_error)?;
+        self.state.generation.store(generation, Ordering::Release);
         self.state.enabled.store(false, Ordering::Release);
         self.state.connected.store(false, Ordering::Release);
         if let Ok(mut selected_markets) = self.state.selected_markets.lock() {
@@ -1244,6 +1303,8 @@ mod tests {
     use serde_json::json;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
     use std::thread;
     use tokio::time::{timeout, Duration as TokioDuration};
 
@@ -1807,6 +1868,84 @@ mod tests {
         }
         assert!(saw_snapshot);
         assert!(!stream_adapter.health().await.connected);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn superseded_delayed_response_cannot_mutate_current_generation() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let catalog = market_value(7, None);
+        let old_book = valid_book(7, json!([["0.60", "1"]]), json!([["0.40", "1"]]), 100);
+        let current_book = valid_book(7, json!([["0.61", "1"]]), json!([["0.39", "1"]]), 50);
+        let orderbook_count = StdArc::new(AtomicUsize::new(0));
+        let (old_started_tx, mut old_started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_old_tx, release_old_rx) = std::sync::mpsc::channel();
+        let release_old_rx = StdArc::new(StdMutex::new(release_old_rx));
+        let server = thread::spawn(move || {
+            let mut workers = Vec::new();
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 1_024];
+                let count = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..count]).into_owned();
+                let orderbook_count = StdArc::clone(&orderbook_count);
+                let old_started_tx = old_started_tx.clone();
+                let release_old_rx = StdArc::clone(&release_old_rx);
+                let catalog = catalog.clone();
+                let old_book = old_book.clone();
+                let current_book = current_book.clone();
+                workers.push(thread::spawn(move || {
+                    let body = if request.contains("/v1/markets/") {
+                        if orderbook_count.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                            old_started_tx.send(()).unwrap();
+                            release_old_rx.lock().unwrap().recv().unwrap();
+                            old_book
+                        } else {
+                            current_book
+                        }
+                    } else {
+                        catalog
+                    };
+                    stream.write_all(&response_bytes(&body, "200 OK")).unwrap();
+                }));
+            }
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        });
+
+        let client = PredictFunClient::for_test(&format!("http://{address}"));
+        let binding = PredictFunMarketBinding::new(
+            7,
+            Symbol::new("yes-token-7"),
+            Symbol::new("no-token-7"),
+            3,
+        )
+        .unwrap();
+        let stream_adapter =
+            PredictFunMarketStream::new(client, vec![binding], Duration::from_millis(1)).unwrap();
+        let _old_events = stream_adapter
+            .subscribe(vec![Symbol::new("yes-token-7")])
+            .await
+            .unwrap();
+        timeout(TokioDuration::from_secs(1), old_started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut current_events = stream_adapter
+            .subscribe(vec![Symbol::new("yes-token-7")])
+            .await
+            .unwrap();
+        release_old_tx.send(()).unwrap();
+        let current_event = timeout(TokioDuration::from_secs(1), current_events.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(current_event, MarketEvent::Snapshot(_)));
+        assert!(stream_adapter.health().await.connected);
         server.join().unwrap();
     }
 
