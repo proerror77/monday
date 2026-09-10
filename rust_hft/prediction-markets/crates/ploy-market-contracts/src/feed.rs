@@ -84,6 +84,20 @@ impl HistoricalLoadOptions {
     }
 }
 
+/// Return the canonical venue identity required for one Binance market family.
+/// Legacy symbol-only rows intentionally have no mapping and must be rejected.
+pub fn canonical_binance_identity(
+    market_type: &str,
+) -> Result<(&'static str, &'static str), String> {
+    match market_type.trim().to_ascii_lowercase().as_str() {
+        "spot" => Ok(("spot", "binance")),
+        "usd_m" => Ok(("usd_m", "binance_futures")),
+        other => Err(format!(
+            "unsupported Binance market type {other}; use spot or usd_m"
+        )),
+    }
+}
+
 /// Data feed source: historical replay, recording replay, or live stream.
 #[async_trait]
 pub trait Feed: Send {

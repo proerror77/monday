@@ -489,6 +489,8 @@ pub struct BinanceMarketStream {
     source_venue: hft_core::VenueId,
     trade_streams: BinanceTradeStreams,
     depth_levels: Option<usize>,
+    depth_enabled: bool,
+    book_ticker_enabled: bool,
 }
 
 impl Default for BinanceMarketStream {
@@ -509,6 +511,8 @@ impl BinanceMarketStream {
             source_venue: hft_core::VenueId::BINANCE,
             trade_streams: BinanceTradeStreams::default(),
             depth_levels: None,
+            depth_enabled: true,
+            book_ticker_enabled: true,
         }
     }
 
@@ -523,6 +527,8 @@ impl BinanceMarketStream {
             source_venue: hft_core::VenueId::BINANCE,
             trade_streams: BinanceTradeStreams::default(),
             depth_levels: None,
+            depth_enabled: true,
+            book_ticker_enabled: true,
         }
     }
 
@@ -554,6 +560,20 @@ impl BinanceMarketStream {
     #[must_use]
     pub const fn with_trade_streams(mut self, trade_streams: BinanceTradeStreams) -> Self {
         self.trade_streams = trade_streams;
+        self
+    }
+
+    /// Enable or disable depth subscriptions for specialized collectors.
+    #[must_use]
+    pub const fn with_depth_stream(mut self, enabled: bool) -> Self {
+        self.depth_enabled = enabled;
+        self
+    }
+
+    /// Enable or disable per-symbol book-ticker subscriptions.
+    #[must_use]
+    pub const fn with_book_ticker(mut self, enabled: bool) -> Self {
+        self.book_ticker_enabled = enabled;
         self
     }
 
@@ -826,6 +846,15 @@ impl BinanceMarketStream {
 
 #[async_trait]
 impl MarketStream for BinanceMarketStream {
+    fn trade_stream_mode(&self) -> ports::TradeStreamMode {
+        match self.trade_streams {
+            BinanceTradeStreams::None => ports::TradeStreamMode::None,
+            BinanceTradeStreams::Raw => ports::TradeStreamMode::Raw,
+            BinanceTradeStreams::Aggregate => ports::TradeStreamMode::Aggregate,
+            BinanceTradeStreams::Both => ports::TradeStreamMode::Both,
+        }
+    }
+
     async fn subscribe(&self, symbols: Vec<Symbol>) -> HftResult<BoxStream<MarketEvent>> {
         let stream = self.subscribe_tracked(symbols).await?;
         Ok(Box::pin(
@@ -843,11 +872,14 @@ impl MarketStream for BinanceMarketStream {
 
         info!("訂閱 Binance 市場數據，品種: {:?}", symbols);
 
-        let uses_ws_snapshot_depth = Self::uses_ws_snapshot_depth();
+        let uses_ws_snapshot_depth = self.depth_enabled && Self::uses_ws_snapshot_depth();
         if uses_ws_snapshot_depth {
             websocket::validate_depth_frequency(self.usdm)?;
         }
-        if !uses_ws_snapshot_depth && (!self.caps.snapshot_crc || !self.caps.rest_fallback) {
+        if self.depth_enabled
+            && !uses_ws_snapshot_depth
+            && (!self.caps.snapshot_crc || !self.caps.rest_fallback)
+        {
             return Err(HftError::Config(
                 "Binance diff-depth requires the REST snapshot bridge; use partial20 for a WebSocket-only feed"
                     .to_string(),
@@ -864,11 +896,13 @@ impl MarketStream for BinanceMarketStream {
         let mut ws_client = BinanceWebSocket::with_base_url(self.ws_base_url.clone());
         ws_client = ws_client.with_trade_streams(self.trade_streams);
         ws_client = ws_client.with_depth_levels(self.depth_levels);
+        ws_client = ws_client.with_depth_stream(self.depth_enabled);
+        ws_client = ws_client.with_book_ticker(self.book_ticker_enabled);
         if self.usdm {
             ws_client = ws_client.with_usdm();
         }
         let rest_client = self.rest_client.clone();
-        let snapshot_enabled = !uses_ws_snapshot_depth;
+        let snapshot_enabled = self.depth_enabled && !uses_ws_snapshot_depth;
         let snapshot_depth = Self::snapshot_depth(self.usdm);
         let usdm = self.usdm;
         let source_venue = self.source_venue();
@@ -1217,6 +1251,22 @@ mod tests {
             hft_core::VenueId::BINANCE_FUTURES
         );
         assert!("prediction".parse::<BinanceMarketKind>().is_err());
+    }
+
+    #[test]
+    fn trade_subscription_mode_is_exposed_to_the_bar_consumer() {
+        assert_eq!(
+            BinanceMarketStream::new()
+                .with_trade_streams(BinanceTradeStreams::Aggregate)
+                .trade_stream_mode(),
+            ports::TradeStreamMode::Aggregate
+        );
+        assert_eq!(
+            BinanceMarketStream::new()
+                .with_trade_streams(BinanceTradeStreams::Both)
+                .trade_stream_mode(),
+            ports::TradeStreamMode::Both
+        );
     }
 
     #[test]

@@ -16,11 +16,10 @@ use rust_decimal::Decimal;
 use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Clone, Copy)]
 enum CollectionSurface {
@@ -30,23 +29,12 @@ enum CollectionSurface {
 }
 
 type CollectorResult<T> = Result<T, String>;
-type SharedRunning = Arc<AtomicBool>;
 
 fn parse_symbols(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(|symbol| symbol.trim().to_ascii_uppercase())
         .filter(|symbol| !symbol.is_empty())
         .collect()
-}
-
-fn running_flag() -> SharedRunning {
-    let running = Arc::new(AtomicBool::new(true));
-    let signal = Arc::clone(&running);
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        signal.store(false, Ordering::Release);
-    });
-    running
 }
 
 fn utc_from_micros(micros: u64) -> CollectorResult<DateTime<Utc>> {
@@ -361,7 +349,11 @@ async fn run_database_collector(
         CollectionSurface::AggregateTrade => BinanceTradeStreams::Aggregate,
         CollectionSurface::Lob => BinanceTradeStreams::None,
     };
-    let adapter = kind.stream().with_trade_streams(trade_streams);
+    let adapter = kind
+        .stream()
+        .with_trade_streams(trade_streams)
+        .with_depth_stream(matches!(surface, CollectionSurface::Lob))
+        .with_book_ticker(false);
     let adapter = if matches!(surface, CollectionSurface::Lob) {
         adapter
             .with_depth_levels(depth_levels)
@@ -420,22 +412,35 @@ async fn run_until_reconnect(
     depth_levels: usize,
     batch_size: usize,
 ) {
-    let running = running_flag();
-    while running.load(Ordering::Acquire) {
-        if let Err(error) = run_database_collector(
+    loop {
+        let collection = run_database_collector(
             pool.clone(),
             symbols,
             kind,
             surface,
             depth_levels,
             batch_size,
-        )
-        .await
-        {
-            error!(%error, market_type = kind.market_type(), "Canonical Binance collector stopped; reconnecting");
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        } else {
-            break;
+        );
+        tokio::pin!(collection);
+        tokio::select! {
+            result = &mut collection => {
+                if let Err(error) = result {
+                    error!(%error, market_type = kind.market_type(), "Canonical Binance collector stopped; reconnecting");
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                        _ = tokio::signal::ctrl_c() => {
+                            info!(market_type = kind.market_type(), "Canonical Binance collector stopped by Ctrl-C");
+                            break;
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!(market_type = kind.market_type(), "Canonical Binance collector stopped by Ctrl-C");
+                break;
+            }
         }
     }
 }

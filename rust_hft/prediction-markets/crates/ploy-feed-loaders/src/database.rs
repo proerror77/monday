@@ -26,8 +26,9 @@ use std::sync::Arc;
 use tracing::info;
 
 use ploy_market_contracts::{
-    l2_updates_from_depth_totals, market_update_sort_ts, normalize_token_id, BinanceSourceClock,
-    BinanceSourceKind, BookLevel, HistoricalLoadOptions, MarketUpdate,
+    canonical_binance_identity, l2_updates_from_depth_totals, market_update_sort_ts,
+    normalize_token_id, BinanceSourceClock, BinanceSourceKind, BookLevel, HistoricalLoadOptions,
+    MarketUpdate,
 };
 
 use serde_json::Value;
@@ -38,13 +39,7 @@ const WARMUP_MINUTES: i64 = 30;
 fn binance_identity_for_market_type(
     market_type: &str,
 ) -> Result<(&'static str, &'static str), sqlx::Error> {
-    match market_type.trim().to_ascii_lowercase().as_str() {
-        "spot" => Ok(("spot", "binance")),
-        "usd_m" => Ok(("usd_m", "binance_futures")),
-        other => Err(sqlx::Error::InvalidArgument(format!(
-            "unsupported Binance market type {other}; use spot or usd_m"
-        ))),
-    }
+    canonical_binance_identity(market_type).map_err(sqlx::Error::InvalidArgument)
 }
 
 const BINANCE_PRICE_SAMPLED_QUERY: &str = r#"

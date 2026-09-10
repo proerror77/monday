@@ -307,6 +307,8 @@ impl CanonicalDepthBook {
 }
 
 /// K線建構器 - O(1) 累計
+pub use ports::TradeStreamMode as TradeBarMode;
+
 #[derive(Debug, Clone)]
 pub struct BarBuilder {
     pub symbol: Symbol,
@@ -367,6 +369,18 @@ impl BarBuilder {
         // 累計成交量
         self.volume = Quantity(self.volume.0 + trade.quantity.0);
         self.trade_count += 1;
+    }
+
+    fn add_trade_for_mode(&mut self, trade: &Trade, mode: TradeBarMode) -> bool {
+        let include = match mode {
+            TradeBarMode::Raw | TradeBarMode::Both => trade.aggregate.is_none(),
+            TradeBarMode::Aggregate => trade.aggregate.is_some(),
+            TradeBarMode::None => false,
+        };
+        if include {
+            self.add_trade(trade);
+        }
+        include
     }
 
     pub fn is_complete(&self, current_time: Timestamp) -> bool {
@@ -561,6 +575,7 @@ pub struct AggregationEngine {
     pub changed_symbols: FxHashSet<Symbol>,
     /// 快照版本号，用于追踪变化
     pub snapshot_version: u64,
+    trade_bar_mode: TradeBarMode,
 }
 
 impl Default for AggregationEngine {
@@ -582,6 +597,7 @@ impl AggregationEngine {
             stale_threshold_us: 3000, // 預設 3ms
             changed_symbols: FxHashSet::with_capacity_and_hasher(64, Default::default()),
             snapshot_version: 0,
+            trade_bar_mode: TradeBarMode::Raw,
         }
     }
 
@@ -597,7 +613,19 @@ impl AggregationEngine {
             stale_threshold_us,
             changed_symbols: FxHashSet::with_capacity_and_hasher(64, Default::default()),
             snapshot_version: 0,
+            trade_bar_mode: TradeBarMode::Raw,
         }
+    }
+
+    /// Configure which trade channel contributes to OHLCV bars.
+    #[must_use]
+    pub fn with_trade_bar_mode(mut self, mode: TradeBarMode) -> Self {
+        self.trade_bar_mode = mode;
+        self
+    }
+
+    pub fn set_trade_bar_mode(&mut self, mode: TradeBarMode) {
+        self.trade_bar_mode = mode;
     }
 
     /// 處理市場事件並生成輸出事件（不含延遲追蹤）
@@ -867,13 +895,11 @@ impl AggregationEngine {
                         BarBuilder::new(trade.symbol.clone(), interval_ms, interval_start)
                     });
 
-                    // Binance raw `@trade` and aggregate `@aggTrade` may be
-                    // subscribed together for separate consumers. Aggregate
-                    // prints carry the same fills and must not double-count
-                    // the shared OHLCV builder.
-                    if trade.aggregate.is_none() {
-                        builder.add_trade(&trade);
-                    }
+                    // Raw `@trade` and aggregate `@aggTrade` overlap when both
+                    // channels are selected. The adapter bridge carries the
+                    // explicit subscription mode; Both uses raw as the sole
+                    // OHLCV source while Aggregate admits aggregate-only bars.
+                    builder.add_trade_for_mode(&trade, self.trade_bar_mode);
 
                     if builder.is_complete(trade.timestamp) {
                         if let Some(bar) = builder.build() {
@@ -1091,14 +1117,15 @@ pub struct MarketView {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::AggregationEngine;
+    use super::{AggregationEngine, TradeBarMode};
     use hft_core::{MarketDataTimestamps, Price, Quantity, Side, Symbol, VenueId};
     use ports::{AggregateTradeMetadata, MarketEvent, Trade};
 
     #[test]
     fn aggregate_trade_does_not_double_count_raw_trade_in_bars() {
-        let mut engine = AggregationEngine::new();
+        let mut engine = AggregationEngine::new().with_trade_bar_mode(TradeBarMode::Both);
         let raw = Trade {
             symbol: Symbol::new("BTCUSDT"),
             timestamp: 1_000_000,
@@ -1135,6 +1162,108 @@ mod tests {
             .get(&(Symbol::new("BTCUSDT"), 60_000))
             .expect("raw trade initializes the bar");
         assert_eq!(builder.volume, Quantity::from_f64(2.0).unwrap());
+        assert_eq!(builder.trade_count, 1);
+    }
+
+    #[test]
+    fn raw_only_trade_subscription_skips_aggregate_prints() {
+        let mut engine = AggregationEngine::new().with_trade_bar_mode(TradeBarMode::Raw);
+        let aggregate = Trade {
+            symbol: Symbol::new("BTCUSDT"),
+            timestamp: 1_000_000,
+            price: Price::from_f64(100.0).unwrap(),
+            quantity: Quantity::from_f64(2.0).unwrap(),
+            side: Side::Buy,
+            trade_id: "20".to_string(),
+            source_venue: Some(VenueId::BINANCE),
+            timestamps: MarketDataTimestamps::default(),
+            aggregate: Some(AggregateTradeMetadata {
+                aggregate_trade_id: 20,
+                first_trade_id: 10,
+                last_trade_id: 11,
+                is_buyer_maker: false,
+            }),
+        };
+        let mut output = Vec::new();
+        engine.process_market_event_into(MarketEvent::Trade(aggregate), &mut output);
+
+        let builder = engine
+            .bar_builders
+            .get(&(Symbol::new("BTCUSDT"), 60_000))
+            .expect("trade timestamp initializes the bar window");
+        assert_eq!(builder.trade_count, 0);
+        assert!(builder.build().is_none());
+    }
+
+    #[test]
+    fn aggregate_only_trade_subscription_builds_bars() {
+        let mut engine = AggregationEngine::new().with_trade_bar_mode(TradeBarMode::Aggregate);
+        let aggregate = Trade {
+            symbol: Symbol::new("BTCUSDT"),
+            timestamp: 1_000_000,
+            price: Price::from_f64(100.0).unwrap(),
+            quantity: Quantity::from_f64(2.0).unwrap(),
+            side: Side::Buy,
+            trade_id: "20".to_string(),
+            source_venue: Some(VenueId::BINANCE),
+            timestamps: MarketDataTimestamps::default(),
+            aggregate: Some(AggregateTradeMetadata {
+                aggregate_trade_id: 20,
+                first_trade_id: 10,
+                last_trade_id: 11,
+                is_buyer_maker: false,
+            }),
+        };
+        let mut output = Vec::new();
+        engine.process_market_event_into(MarketEvent::Trade(aggregate), &mut output);
+
+        let builder = engine
+            .bar_builders
+            .get(&(Symbol::new("BTCUSDT"), 60_000))
+            .expect("aggregate trade initializes the bar");
+        assert_eq!(builder.volume, Quantity::from_f64(2.0).unwrap());
+        assert_eq!(builder.trade_count, 1);
+    }
+
+    #[test]
+    fn both_trade_channels_use_raw_source_when_aggregate_arrives_first() {
+        let mut engine = AggregationEngine::new().with_trade_bar_mode(TradeBarMode::Both);
+        let aggregate = Trade {
+            symbol: Symbol::new("BTCUSDT"),
+            timestamp: 1_000_000,
+            price: Price::from_f64(100.0).unwrap(),
+            quantity: Quantity::from_f64(2.0).unwrap(),
+            side: Side::Buy,
+            trade_id: "20".to_string(),
+            source_venue: Some(VenueId::BINANCE),
+            timestamps: MarketDataTimestamps::default(),
+            aggregate: Some(AggregateTradeMetadata {
+                aggregate_trade_id: 20,
+                first_trade_id: 10,
+                last_trade_id: 11,
+                is_buyer_maker: false,
+            }),
+        };
+        let raw = Trade {
+            symbol: aggregate.symbol.clone(),
+            timestamp: aggregate.timestamp,
+            price: aggregate.price,
+            quantity: Quantity::from_f64(1.0).unwrap(),
+            side: aggregate.side,
+            trade_id: "10".to_string(),
+            source_venue: aggregate.source_venue,
+            timestamps: aggregate.timestamps,
+            aggregate: None,
+        };
+        let mut output = Vec::new();
+        engine.process_market_event_into(MarketEvent::Trade(aggregate), &mut output);
+        engine.process_market_event_into(MarketEvent::Trade(raw), &mut output);
+
+        let builder = engine
+            .bar_builders
+            .get(&(Symbol::new("BTCUSDT"), 60_000))
+            .expect("aggregate trade initializes the bar");
+        assert_eq!(builder.volume, Quantity::from_f64(1.0).unwrap());
         assert_eq!(builder.trade_count, 1);
     }
 }

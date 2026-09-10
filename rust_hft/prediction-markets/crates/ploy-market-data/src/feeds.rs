@@ -10,7 +10,7 @@ use std::time::Duration as StdDuration;
 use adapter_polymarket_data::{
     MarketEvent, MarketSnapshot, MarketStream, PolymarketBook, PolymarketMarketStream, Symbol,
 };
-use chrono::{DateTime, Duration, Timelike, Utc};
+use chrono::{DateTime, Duration, Utc};
 use futures::StreamExt;
 use ploy_market_contracts::{
     l2_updates_from_depth_totals, normalize_token_id, BookLevel, MarketUpdate,
@@ -62,20 +62,14 @@ fn pm_tradeable_price(price: Decimal) -> bool {
 /// Spawn a task that subscribes to Binance spot prices via RTDS WebSocket
 /// and publishes `MarketUpdate::SpotPrice` events in real-time.
 ///
-/// When `pool` is provided, each tick is also persisted to `binance_price_ticks`
-/// (at full tick resolution) so that historical backtests can replay
-/// the same spot-price stream.
 pub fn spawn_spot_feed(
     tx: Arc<broadcast::Sender<MarketUpdate>>,
     reference_prices: ReferencePriceRegistry,
     symbols: Vec<String>,
-    pool: Option<PgPool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut logged_spot_symbols = HashSet::new();
         let symbols_upper: Vec<String> = symbols.iter().map(|s| s.to_uppercase()).collect();
-        // Track last-persisted second per symbol to deduplicate high-frequency ticks.
-        let mut last_persisted: HashMap<String, DateTime<Utc>> = HashMap::new();
 
         info!(
             symbols = ?symbols_upper,
@@ -156,24 +150,6 @@ pub fn spawn_spot_feed(
                                     receivers,
                                     "RTDS spot prices forwarded"
                                 );
-                            }
-
-                            // Persist to DB at most once per second per symbol.
-                            if let Some(ref db) = pool {
-                                // Truncate to second by zeroing sub-second component.
-                                let ts_sec = ts.with_nanosecond(0).unwrap_or(ts);
-                                let last = last_persisted.get(&symbol_upper).copied();
-                                if last.map_or(true, |l| ts_sec > l) {
-                                    last_persisted.insert(symbol_upper.clone(), ts_sec);
-                                    persist_spot_price(
-                                        db,
-                                        &symbol_upper,
-                                        crypto_price.value,
-                                        ts,
-                                        received_at,
-                                    )
-                                    .await;
-                                }
                             }
                         }
                         Err(_) => {
@@ -1580,35 +1556,6 @@ async fn run_pyth_reference_worker(
         }
     }
     warn!(symbol = %subscribe_symbol, "RTDS equity_prices stream ended");
-}
-
-/// Persist a spot price tick to `binance_price_ticks` for backtest replay.
-/// Called at most once per second per symbol (throttled in spawn_spot_feed).
-async fn persist_spot_price(
-    pool: &PgPool,
-    symbol: &str,
-    price: Decimal,
-    trade_time: DateTime<Utc>,
-    received_at: DateTime<Utc>,
-) {
-    let result = sqlx::query(
-        r#"
-        INSERT INTO binance_price_ticks
-            (symbol, price, trade_time, received_at)
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT DO NOTHING
-        "#,
-    )
-    .bind(symbol)
-    .bind(price)
-    .bind(trade_time)
-    .bind(received_at)
-    .execute(pool)
-    .await;
-
-    if let Err(e) = result {
-        debug!(symbol, error = %e, "Failed to persist spot price tick");
-    }
 }
 
 async fn persist_chainlink_price(

@@ -1182,6 +1182,8 @@ impl Engine {
                 .config
                 .max_events_per_cycle
                 .saturating_sub(total_events);
+            self.aggregation_engine
+                .set_trade_bar_mode(consumer.trade_stream_mode());
             let consumer_should_flip = consumer.consume_events_up_to(remaining, |event| {
                 consumer_events += 1;
                 total_events += 1;
@@ -2584,10 +2586,69 @@ pub struct EngineStatistics {
 mod tests {
     #![allow(unused_imports)]
     use super::*;
-    use hft_core::{Price, Quantity, Symbol, VenueId};
+    use hft_core::{now_micros, MarketDataTimestamps, Price, Quantity, Side, Symbol, VenueId};
     use ports::{
-        AggregatedBar, MarketEvent, OrderIntent, OrderIntentEnvelope, OrderIntentLifecycle,
+        AggregateTradeMetadata, AggregatedBar, MarketEvent, OrderIntent, OrderIntentEnvelope,
+        OrderIntentLifecycle, Trade, TradeStreamMode,
     };
+
+    #[test]
+    fn consumers_keep_independent_trade_bar_modes() {
+        let timestamp = now_micros();
+        let aggregate = Trade {
+            symbol: Symbol::new("BTCUSDT"),
+            timestamp,
+            price: Price::from_f64(100.0).unwrap(),
+            quantity: Quantity::from_f64(2.0).unwrap(),
+            side: Side::Buy,
+            trade_id: "20".to_string(),
+            source_venue: Some(VenueId::BINANCE),
+            timestamps: MarketDataTimestamps::default(),
+            aggregate: Some(AggregateTradeMetadata {
+                aggregate_trade_id: 20,
+                first_trade_id: 10,
+                last_trade_id: 11,
+                is_buyer_maker: false,
+            }),
+        };
+        let raw = Trade {
+            symbol: aggregate.symbol.clone(),
+            timestamp,
+            price: aggregate.price,
+            quantity: Quantity::from_f64(1.0).unwrap(),
+            side: aggregate.side,
+            trade_id: "10".to_string(),
+            source_venue: aggregate.source_venue,
+            timestamps: aggregate.timestamps,
+            aggregate: None,
+        };
+        let mut engine = Engine::new(EngineConfig::default());
+        let ingestion_config = IngestionConfig {
+            stale_threshold_us: u64::MAX,
+            ..Default::default()
+        };
+        let (mut aggregate_ingester, mut aggregate_consumer) =
+            dataflow::EventIngester::new(ingestion_config.clone());
+        aggregate_consumer.set_trade_stream_mode(TradeStreamMode::Aggregate);
+        aggregate_ingester
+            .ingest(MarketEvent::Trade(aggregate))
+            .unwrap();
+        let (mut raw_ingester, mut raw_consumer) = dataflow::EventIngester::new(ingestion_config);
+        raw_consumer.set_trade_stream_mode(TradeStreamMode::Raw);
+        raw_ingester.ingest(MarketEvent::Trade(raw)).unwrap();
+        engine.register_event_consumer(aggregate_consumer);
+        engine.register_event_consumer(raw_consumer);
+
+        engine.tick().unwrap();
+
+        let builder = engine
+            .aggregation_engine
+            .bar_builders
+            .get(&(Symbol::new("BTCUSDT"), 60_000))
+            .expect("trade consumers initialize the bar");
+        assert_eq!(builder.volume, Quantity::from_f64(3.0).unwrap());
+        assert_eq!(builder.trade_count, 2);
+    }
 
     #[cfg(feature = "metrics")]
     #[test]

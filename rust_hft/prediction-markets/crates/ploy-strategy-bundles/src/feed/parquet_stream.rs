@@ -35,6 +35,7 @@ use thiserror::Error;
 
 use super::options::HistoricalLoadOptions;
 use crate::traits::{Feed, MarketUpdate};
+use ploy_market_contracts::canonical_binance_identity;
 
 /// Bounded channel capacity — limits how far ahead the background thread runs.
 const CHANNEL_CAPACITY: usize = 1000;
@@ -48,6 +49,13 @@ pub enum StreamingParquetFeedError {
 enum FeedMessage {
     Update(MarketUpdate),
     Error(StreamingParquetFeedError),
+}
+
+#[derive(Debug, Clone)]
+struct ParquetWorkerOptions {
+    lob_sample_secs: u32,
+    require_official_settlement: bool,
+    binance_market_type: String,
 }
 
 /// Streaming Parquet feed backed by a DuckDB background thread.
@@ -80,20 +88,15 @@ impl StreamingParquetFeed {
 
         let data_dir = data_dir.to_string();
         let symbols = symbols.to_vec();
-        let lob_sample_secs = options.lob_sample_secs;
-        let require_official_settlement = options.require_official_settlement;
+        let worker_options = ParquetWorkerOptions {
+            lob_sample_secs: options.lob_sample_secs,
+            require_official_settlement: options.require_official_settlement,
+            binance_market_type: options.binance_market_type.clone(),
+        };
 
         let worker = thread::spawn(move || {
             let error_tx = tx.clone();
-            if let Err(e) = run_background(
-                &data_dir,
-                &symbols,
-                from,
-                to,
-                lob_sample_secs,
-                require_official_settlement,
-                tx,
-            ) {
+            if let Err(e) = run_background(&data_dir, &symbols, from, to, &worker_options, tx) {
                 let error = StreamingParquetFeedError::Background(e.to_string());
                 tracing::error!(error = %error, "StreamingParquetFeed background thread error");
                 let _ = error_tx.send(FeedMessage::Error(error));
@@ -153,8 +156,7 @@ fn run_background(
     symbols: &[String],
     from: DateTime<Utc>,
     to: DateTime<Utc>,
-    lob_sample_secs: u32,
-    require_official_settlement: bool,
+    options: &ParquetWorkerOptions,
     tx: SyncSender<FeedMessage>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use chrono::Duration;
@@ -168,6 +170,9 @@ fn run_background(
         return Ok(());
     }
 
+    let (binance_market_type, binance_venue) =
+        canonical_binance_identity(&options.binance_market_type).map_err(std::io::Error::other)?;
+
     let memory_limit =
         std::env::var("PLOY_DUCKDB_MEMORY_LIMIT").unwrap_or_else(|_| "6GB".to_string());
     let temp_dir =
@@ -175,7 +180,7 @@ fn run_background(
     std::fs::create_dir_all(&temp_dir).ok();
     let conn = Connection::open_in_memory()?;
     conn.execute_batch(&format!(
-        "SET memory_limit='{}'; SET temp_directory='{}';",
+        "LOAD parquet; SET memory_limit='{}'; SET temp_directory='{}';",
         memory_limit.replace('\'', "''"),
         temp_dir.replace('\'', "''")
     ))?;
@@ -185,12 +190,12 @@ fn run_background(
     let from_str = from.to_rfc3339();
     let to_str = to.to_rfc3339();
     let spot_from_str = spot_from.to_rfc3339();
-    let _bucket_us = (lob_sample_secs.max(1) as i64) * 1_000_000;
+    let _bucket_us = (options.lob_sample_secs.max(1) as i64) * 1_000_000;
 
     // File globs
-    let spot_glob = format!("{data_dir}/binance_price_ticks/*.parquet");
-    let agg_glob = format!("{data_dir}/binance_agg_trade_ticks/*.parquet");
-    let lob_glob = format!("{data_dir}/binance_lob_ticks/*.parquet");
+    let spot_glob = format!("{data_dir}/binance_price_ticks/{binance_market_type}/*.parquet");
+    let agg_glob = format!("{data_dir}/binance_agg_trade_ticks/{binance_market_type}/*.parquet");
+    let lob_glob = format!("{data_dir}/binance_lob_ticks/{binance_market_type}/*.parquet");
     let quote_glob = format!("{data_dir}/clob_quote_ticks/*.parquet");
     let orderbook_dir = format!("{data_dir}/orderbook_snapshots");
     let orderbook_glob = format!("{orderbook_dir}/**/*.parquet");
@@ -205,7 +210,7 @@ fn run_background(
         symbols,
         &from_str,
         &to_str,
-        require_official_settlement,
+        options.require_official_settlement,
     )?;
     info!(count = events.len(), "StreamingParquetFeed: loaded events");
     let token_filter = event_token_filter_sql(&events);
@@ -215,7 +220,11 @@ fn run_background(
     let mut parts: Vec<String> = Vec::new();
 
     // Spot prices (with 30min warmup)
-    if Path::new(&format!("{data_dir}/binance_price_ticks")).exists() {
+    if Path::new(&format!(
+        "{data_dir}/binance_price_ticks/{binance_market_type}"
+    ))
+    .exists()
+    {
         parts.push(format!(
             "SELECT epoch_us(trade_time)::BIGINT AS ts_us, \
                     {SPOT_SOURCE_RANK} AS source_rank, \
@@ -226,6 +235,10 @@ fn run_background(
              FROM read_parquet('{spot_glob}') \
              WHERE trade_time >= TIMESTAMPTZ '{spot_from_str}' \
                AND trade_time <= TIMESTAMPTZ '{to_str}' \
+               AND trade_id IS NOT NULL \
+               AND event_time IS NOT NULL \
+               AND market_type = '{binance_market_type}' \
+               AND venue = '{binance_venue}' \
                {sym_filter}"
         ));
     }
@@ -233,7 +246,11 @@ fn run_background(
     // Agg trades — full tick-by-tick, no downsampling.
     // Real collection rate: 0.6-4.4 r/s per symbol. Each trade carries direction
     // (is_buyer_maker) used for signed_trade_imbalance in the Confirmation layer.
-    if Path::new(&format!("{data_dir}/binance_agg_trade_ticks")).exists() {
+    if Path::new(&format!(
+        "{data_dir}/binance_agg_trade_ticks/{binance_market_type}"
+    ))
+    .exists()
+    {
         parts.push(format!(
             "SELECT epoch_us(trade_time)::BIGINT AS ts_us, \
                     {AGG_SOURCE_RANK} AS source_rank, \
@@ -245,15 +262,26 @@ fn run_background(
              FROM read_parquet('{agg_glob}') \
              WHERE trade_time >= TIMESTAMPTZ '{from_str}' \
                AND trade_time <= TIMESTAMPTZ '{to_str}' \
+               AND event_time IS NOT NULL \
+               AND first_trade_id IS NOT NULL \
+               AND last_trade_id IS NOT NULL \
+               AND market_type = '{binance_market_type}' \
+               AND venue = '{binance_venue}' \
+               AND price > 0 \
+               AND quantity > 0 \
                {sym_filter}"
         ));
     }
 
     // LOB — full tick-by-tick, no downsampling. Memory is O(channel buffer) regardless.
-    // Downsampling causes temporal misalignment: a 30s bucket at T=0 is used when
+    // Downsampling causes temporal misalignment: a 30s interval at T=0 is used when
     // evaluating quotes at T=15s, which is incorrect. Each LOB tick is processed
     // in timestamp order, matching live trading behavior exactly.
-    if Path::new(&format!("{data_dir}/binance_lob_ticks")).exists() {
+    if Path::new(&format!(
+        "{data_dir}/binance_lob_ticks/{binance_market_type}"
+    ))
+    .exists()
+    {
         parts.push(format!(
             "SELECT epoch_us(event_time)::BIGINT AS ts_us, \
                     {LOB_SOURCE_RANK} AS source_rank, \
@@ -267,11 +295,15 @@ fn run_background(
              FROM read_parquet('{lob_glob}') \
              WHERE event_time >= TIMESTAMPTZ '{from_str}' \
                AND event_time <= TIMESTAMPTZ '{to_str}' \
+               AND event_time IS NOT NULL \
+               AND depth_mode IS NOT NULL \
+               AND market_type = '{binance_market_type}' \
+               AND venue = '{binance_venue}' \
                {sym_filter}"
         ));
     }
 
-    // Prefer the full-fidelity CLOB archive. If it is present, missing rows for
+    // PM quotes: prefer the full-fidelity CLOB archive. If it is present, missing rows for
     // the requested window fail closed instead of silently mixing top-book data.
     if Path::new(&orderbook_dir).exists() {
         parts.push(format!(
@@ -875,8 +907,10 @@ fn resolve_up_won_from_settlements(
             .copied(),
     ) {
         (Some(up), Some(down)) if up != down => Some(up > down),
-        (Some(up), _) => Some(up > Decimal::new(5, 1)),
-        (_, Some(down)) => Some(down < Decimal::new(5, 1)),
+        (Some(up), _) if up == Decimal::ZERO || up == Decimal::ONE => Some(up == Decimal::ONE),
+        (_, Some(down)) if down == Decimal::ZERO || down == Decimal::ONE => {
+            Some(down == Decimal::ZERO)
+        }
         _ => None,
     }
 }

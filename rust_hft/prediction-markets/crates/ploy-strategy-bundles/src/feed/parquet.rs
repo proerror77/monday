@@ -7,15 +7,15 @@
 //!
 //! ```text
 //! <data_dir>/
-//!   binance_price_ticks/YYYY-MM-DD.parquet
-//!   binance_lob_ticks/YYYY-MM-DD.parquet
-//!   binance_agg_trade_ticks/YYYY-MM-DD.parquet
+//!   binance_price_ticks/{spot|usd_m}/YYYY-MM-DD.parquet
+//!   binance_lob_ticks/{spot|usd_m}/YYYY-MM-DD.parquet
+//!   binance_agg_trade_ticks/{spot|usd_m}/YYYY-MM-DD.parquet
 //!   clob_quote_ticks/YYYY-MM-DD.parquet
 //!   pm_market_metadata/YYYY-MM-DD.parquet
 //! ```
 
 use chrono::{DateTime, Duration, Utc};
-use ploy_market_contracts::market_update_sort_ts;
+use ploy_market_contracts::{canonical_binance_identity, market_update_sort_ts};
 use rust_decimal::Decimal;
 use std::path::Path;
 use std::sync::Arc;
@@ -39,6 +39,8 @@ pub fn load_from_parquet(
     to: DateTime<Utc>,
     options: &HistoricalLoadOptions,
 ) -> Result<Vec<MarketUpdate>, Box<dyn std::error::Error>> {
+    canonical_binance_identity(&options.binance_market_type)
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
     if !Path::new(data_dir).exists() {
         return Ok(Vec::new());
     }
@@ -71,13 +73,25 @@ fn load_with_duckdb(
 
     let mut updates: Vec<MarketUpdate> = Vec::new();
     let spot_from = from - Duration::minutes(WARMUP_MINUTES);
+    canonical_binance_identity(&options.binance_market_type)
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
 
     // Non-LOB tables: load all at once (small files)
     {
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch("SET memory_limit='4GB'; SET temp_directory='/tmp/duckdb_spill';")?;
-        load_spot_prices(&conn, data_dir, symbols, spot_from, to, &mut updates)?;
-        load_agg_trades(&conn, data_dir, symbols, from, to, &mut updates)?;
+        conn.execute_batch(
+            "LOAD parquet; SET memory_limit='4GB'; SET temp_directory='/tmp/duckdb_spill';",
+        )?;
+        load_spot_prices(
+            &conn,
+            data_dir,
+            symbols,
+            spot_from,
+            to,
+            options,
+            &mut updates,
+        )?;
+        load_agg_trades(&conn, data_dir, symbols, from, to, options, &mut updates)?;
         load_events(&conn, data_dir, symbols, from, to, &mut updates)?;
         load_pm_quotes(&conn, data_dir, from, to, &mut updates)?;
     }
@@ -94,14 +108,16 @@ fn load_with_duckdb(
             .unwrap()
             .and_utc();
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch("SET memory_limit='4GB'; SET temp_directory='/tmp/duckdb_spill';")?;
+        conn.execute_batch(
+            "LOAD parquet; SET memory_limit='4GB'; SET temp_directory='/tmp/duckdb_spill';",
+        )?;
         load_l2_data(
             &conn,
             data_dir,
             symbols,
             day_start,
             day_end,
-            options.lob_sample_secs,
+            options,
             &mut updates,
         )?;
         day = day.succ_opt().unwrap_or(day);
@@ -148,9 +164,13 @@ fn load_spot_prices(
     symbols: &[String],
     from: DateTime<Utc>,
     to: DateTime<Utc>,
+    options: &HistoricalLoadOptions,
     updates: &mut Vec<MarketUpdate>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let dir = format!("{data_dir}/binance_price_ticks");
+    let (binance_market_type, binance_venue) =
+        canonical_binance_identity(&options.binance_market_type)
+            .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+    let dir = format!("{data_dir}/binance_price_ticks/{binance_market_type}");
     if !Path::new(&dir).exists() {
         return Ok(());
     }
@@ -164,6 +184,10 @@ fn load_spot_prices(
          FROM read_parquet('{glob}') \
          WHERE trade_time >= TIMESTAMPTZ '{from_str}' \
            AND trade_time <= TIMESTAMPTZ '{to_str}' \
+           AND trade_id IS NOT NULL \
+           AND event_time IS NOT NULL \
+           AND market_type = '{binance_market_type}' \
+           AND venue = '{binance_venue}' \
            {sym_filter} \
          ORDER BY trade_time"
     );
@@ -200,9 +224,13 @@ fn load_agg_trades(
     symbols: &[String],
     from: DateTime<Utc>,
     to: DateTime<Utc>,
+    options: &HistoricalLoadOptions,
     updates: &mut Vec<MarketUpdate>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let dir = format!("{data_dir}/binance_agg_trade_ticks");
+    let (binance_market_type, binance_venue) =
+        canonical_binance_identity(&options.binance_market_type)
+            .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+    let dir = format!("{data_dir}/binance_agg_trade_ticks/{binance_market_type}");
     if !Path::new(&dir).exists() {
         return Ok(());
     }
@@ -219,6 +247,13 @@ fn load_agg_trades(
          FROM read_parquet('{glob}') \
          WHERE trade_time >= TIMESTAMPTZ '{from_str}' \
            AND trade_time <= TIMESTAMPTZ '{to_str}' \
+           AND event_time IS NOT NULL \
+           AND first_trade_id IS NOT NULL \
+           AND last_trade_id IS NOT NULL \
+           AND market_type = '{binance_market_type}' \
+           AND venue = '{binance_venue}' \
+           AND price > 0 \
+           AND quantity > 0 \
            {sym_filter} \
          ORDER BY symbol, epoch_ms(trade_time)::BIGINT / 5000, trade_time"
     );
@@ -262,10 +297,14 @@ fn load_l2_data(
     symbols: &[String],
     from: DateTime<Utc>,
     to: DateTime<Utc>,
-    sample_secs: u32,
+    options: &HistoricalLoadOptions,
     updates: &mut Vec<MarketUpdate>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let dir = format!("{data_dir}/binance_lob_ticks");
+    let sample_secs = options.lob_sample_secs;
+    let (binance_market_type, binance_venue) =
+        canonical_binance_identity(&options.binance_market_type)
+            .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+    let dir = format!("{data_dir}/binance_lob_ticks/{binance_market_type}");
     if !Path::new(&dir).exists() {
         return Ok(());
     }
@@ -285,6 +324,10 @@ fn load_l2_data(
          FROM read_parquet('{glob}') \
          WHERE event_time >= TIMESTAMPTZ '{from_str}' \
            AND event_time <= TIMESTAMPTZ '{to_str}' \
+           AND event_time IS NOT NULL \
+           AND depth_mode IS NOT NULL \
+           AND market_type = '{binance_market_type}' \
+           AND venue = '{binance_venue}' \
            {sym_filter} \
          ORDER BY symbol, epoch_ms(event_time)::BIGINT / {bucket_ms}, event_time DESC"
     );
@@ -489,4 +532,217 @@ fn load_events(
     }
     info!(count, "Loaded events from Parquet pm_market_metadata");
     Ok(())
+}
+
+#[cfg(all(test, feature = "parquet-feed"))]
+mod tests {
+    use super::*;
+    use crate::feed::parquet_stream::StreamingParquetFeed;
+    use chrono::{DateTime, TimeZone, Utc};
+    use ploy_market_contracts::{HistoricalLoadOptions, MarketUpdate};
+    use rust_decimal::prelude::ToPrimitive;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct ParquetFixture {
+        root: PathBuf,
+    }
+
+    impl Drop for ParquetFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn fixture_root() -> ParquetFixture {
+        let id = NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "ploy-strategy-bundles-parquet-{}-{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        ParquetFixture { root }
+    }
+
+    fn write_mixed_market_file(root: &Path, market_type: &str) {
+        let price_dir = root.join("binance_price_ticks").join(market_type);
+        let agg_dir = root.join("binance_agg_trade_ticks").join(market_type);
+        let lob_dir = root.join("binance_lob_ticks").join(market_type);
+        std::fs::create_dir_all(&price_dir).unwrap();
+        std::fs::create_dir_all(&agg_dir).unwrap();
+        std::fs::create_dir_all(&lob_dir).unwrap();
+
+        let price_path = price_dir.join("2026-07-01.parquet");
+        let agg_path = agg_dir.join("2026-07-01.parquet");
+        let lob_path = lob_dir.join("2026-07-01.parquet");
+        let price_path = price_path.display().to_string();
+        let agg_path = agg_path.display().to_string();
+        let lob_path = lob_path.display().to_string();
+        let connection = duckdb::Connection::open_in_memory().unwrap();
+        connection.execute_batch("LOAD parquet;").unwrap();
+        connection
+            .execute_batch(&format!(
+                r#"
+                CREATE TABLE prices (
+                    symbol VARCHAR, price DOUBLE, quantity DOUBLE,
+                    trade_time TIMESTAMPTZ, received_at TIMESTAMPTZ,
+                    trade_id BIGINT, event_time TIMESTAMPTZ,
+                    market_type VARCHAR, venue VARCHAR
+                );
+                INSERT INTO prices VALUES
+                    ('BTCUSDT', 101.0, 1.0, TIMESTAMPTZ '2026-07-01 00:00:01+00', TIMESTAMPTZ '2026-07-01 00:00:01.100+00', 11, TIMESTAMPTZ '2026-07-01 00:00:01+00', 'spot', 'binance'),
+                    ('BTCUSDT', 202.0, 2.0, TIMESTAMPTZ '2026-07-01 00:00:02+00', TIMESTAMPTZ '2026-07-01 00:00:02.100+00', 22, TIMESTAMPTZ '2026-07-01 00:00:02+00', 'usd_m', 'binance_futures'),
+                    ('BTCUSDT', 999.0, 9.0, TIMESTAMPTZ '2026-07-01 00:00:03+00', TIMESTAMPTZ '2026-07-01 00:00:03.100+00', NULL, NULL, NULL, NULL);
+                COPY prices TO '{price_path}' (FORMAT PARQUET);
+
+                CREATE TABLE aggregates (
+                    symbol VARCHAR, agg_trade_id BIGINT, first_trade_id BIGINT,
+                    last_trade_id BIGINT, price DOUBLE, quantity DOUBLE,
+                    trade_time TIMESTAMPTZ, event_time TIMESTAMPTZ,
+                    is_buyer_maker BOOLEAN, market_type VARCHAR, venue VARCHAR
+                );
+                INSERT INTO aggregates VALUES
+                    ('BTCUSDT', 31, 31, 31, 103.0, 1.0, TIMESTAMPTZ '2026-07-01 00:00:04+00', TIMESTAMPTZ '2026-07-01 00:00:04+00', false, 'spot', 'binance'),
+                    ('BTCUSDT', 32, 32, 32, 204.0, 2.0, TIMESTAMPTZ '2026-07-01 00:00:05+00', TIMESTAMPTZ '2026-07-01 00:00:05+00', true, 'usd_m', 'binance_futures'),
+                    ('BTCUSDT', 99, NULL, NULL, 999.0, 9.0, TIMESTAMPTZ '2026-07-01 00:00:06+00', NULL, false, NULL, NULL);
+                COPY aggregates TO '{agg_path}' (FORMAT PARQUET);
+
+                CREATE TABLE books (
+                    symbol VARCHAR, event_time TIMESTAMPTZ, received_at TIMESTAMPTZ,
+                    obi_5 DOUBLE, spread_bps INTEGER, bid_volume_5 DOUBLE,
+                    ask_volume_5 DOUBLE, depth_mode VARCHAR,
+                    market_type VARCHAR, venue VARCHAR
+                );
+                INSERT INTO books VALUES
+                    ('BTCUSDT', TIMESTAMPTZ '2026-07-01 00:00:07+00', TIMESTAMPTZ '2026-07-01 00:00:07.100+00', 0.1, 4, 3.0, 2.0, 'partial', 'spot', 'binance'),
+                    ('BTCUSDT', TIMESTAMPTZ '2026-07-01 00:00:08+00', TIMESTAMPTZ '2026-07-01 00:00:08.100+00', 0.2, 5, 4.0, 3.0, 'partial', 'usd_m', 'binance_futures'),
+                    ('BTCUSDT', NULL, TIMESTAMPTZ '2026-07-01 00:00:09.100+00', 0.9, 9, 9.0, 9.0, NULL, NULL, NULL);
+                COPY books TO '{lob_path}' (FORMAT PARQUET);
+                "#
+            ))
+            .unwrap();
+    }
+
+    fn options(market_type: &str) -> HistoricalLoadOptions {
+        HistoricalLoadOptions {
+            binance_market_type: market_type.to_string(),
+            ..HistoricalLoadOptions::default()
+        }
+    }
+
+    fn window() -> (DateTime<Utc>, DateTime<Utc>) {
+        (
+            Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 7, 1, 0, 1, 0).unwrap(),
+        )
+    }
+
+    fn assert_market_rows(updates: &[MarketUpdate], market_type: &str) {
+        let expected_price = if market_type == "spot" { 101.0 } else { 202.0 };
+        let expected_agg = if market_type == "spot" { 103.0 } else { 204.0 };
+        let expected_obi = if market_type == "spot" { 0.1 } else { 0.2 };
+        let prices = updates
+            .iter()
+            .filter_map(|update| match update {
+                MarketUpdate::SpotPrice { price, .. } => Some(price.to_f64().unwrap()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let aggregates = updates
+            .iter()
+            .filter_map(|update| match update {
+                MarketUpdate::AggTrade { price, .. } => Some(price.to_f64().unwrap()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let lob = updates
+            .iter()
+            .filter_map(|update| match update {
+                MarketUpdate::L2 { obi, .. } => Some(*obi),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(prices, vec![expected_price]);
+        assert_eq!(aggregates, vec![expected_agg]);
+        assert_eq!(lob, vec![expected_obi]);
+        assert_eq!(updates.len(), 4, "one L2 row emits L2 and L2Depth");
+    }
+
+    #[test]
+    fn batch_and_streaming_loaders_select_one_canonical_market_from_mixed_files() {
+        let fixture = fixture_root();
+        write_mixed_market_file(&fixture.root, "spot");
+        write_mixed_market_file(&fixture.root, "usd_m");
+        let (from, to) = window();
+
+        for market_type in ["spot", "usd_m"] {
+            let opts = options(market_type);
+            let batch = load_from_parquet(
+                fixture.root.to_str().unwrap(),
+                &["BTCUSDT".to_string()],
+                from,
+                to,
+                &opts,
+            )
+            .unwrap();
+            assert_market_rows(&batch, market_type);
+
+            let mut stream = StreamingParquetFeed::new(
+                fixture.root.to_str().unwrap(),
+                &["BTCUSDT".to_string()],
+                from,
+                to,
+                &opts,
+            );
+            let mut streamed = Vec::new();
+            while let Some(update) = stream.next_result().unwrap() {
+                streamed.push(update);
+            }
+            assert_market_rows(&streamed, market_type);
+        }
+    }
+
+    #[test]
+    fn parquet_loaders_reject_old_schema_without_canonical_identity_columns() {
+        let fixture = fixture_root();
+        let dir = fixture.root.join("binance_price_ticks").join("spot");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("2026-07-01.parquet");
+        let path = path.display().to_string();
+        let connection = duckdb::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(&format!(
+                r#"
+                CREATE TABLE old_prices (
+                    symbol VARCHAR, price DOUBLE, trade_time TIMESTAMPTZ,
+                    received_at TIMESTAMPTZ
+                );
+                INSERT INTO old_prices VALUES
+                    ('BTCUSDT', 101.0, TIMESTAMPTZ '2026-07-01 00:00:01+00', TIMESTAMPTZ '2026-07-01 00:00:01.100+00');
+                COPY old_prices TO '{path}' (FORMAT PARQUET);
+                "#
+            ))
+            .unwrap();
+        let (from, to) = window();
+        let opts = options("spot");
+        assert!(load_from_parquet(
+            fixture.root.to_str().unwrap(),
+            &["BTCUSDT".to_string()],
+            from,
+            to,
+            &opts,
+        )
+        .is_err());
+
+        let mut stream = StreamingParquetFeed::new(
+            fixture.root.to_str().unwrap(),
+            &["BTCUSDT".to_string()],
+            from,
+            to,
+            &opts,
+        );
+        assert!(stream.next_result().is_err());
+    }
 }

@@ -805,17 +805,17 @@ struct TimeSeriesSpec {
 const TIME_SERIES_SPECS: [TimeSeriesSpec; 4] = [
     TimeSeriesSpec {
         surface: BINANCE_PRICE_SURFACE,
-        raw_source_sql: "SELECT trade_time AS source_time, received_at FROM binance_price_ticks WHERE upper(symbol) = $1",
+        raw_source_sql: "SELECT trade_time AS source_time, received_at FROM binance_price_ticks WHERE upper(symbol) = $1 AND trade_id IS NOT NULL AND event_time IS NOT NULL AND market_type = 'spot' AND venue = 'binance'",
         reference_symbol: false,
     },
     TimeSeriesSpec {
         surface: BINANCE_AGG_TRADE_SURFACE,
-        raw_source_sql: "SELECT trade_time AS source_time, received_at FROM binance_agg_trade_ticks WHERE upper(symbol) = $1",
+        raw_source_sql: "SELECT trade_time AS source_time, received_at FROM binance_agg_trade_ticks WHERE upper(symbol) = $1 AND event_time IS NOT NULL AND first_trade_id IS NOT NULL AND last_trade_id IS NOT NULL AND market_type = 'spot' AND venue = 'binance' AND price > 0 AND quantity > 0",
         reference_symbol: false,
     },
     TimeSeriesSpec {
         surface: BINANCE_LOB_SURFACE,
-        raw_source_sql: "SELECT event_time AS source_time, received_at FROM binance_lob_ticks WHERE upper(symbol) = $1",
+        raw_source_sql: "SELECT event_time AS source_time, received_at FROM binance_lob_ticks WHERE upper(symbol) = $1 AND event_time IS NOT NULL AND depth_mode IS NOT NULL AND market_type = 'spot' AND venue = 'binance'",
         reference_symbol: false,
     },
     TimeSeriesSpec {
@@ -1716,6 +1716,19 @@ mod tests {
                     "audit query contains forbidden mutation: {forbidden}"
                 );
             }
+        }
+    }
+
+    #[cfg(feature = "audit")]
+    #[test]
+    fn binance_audit_queries_require_canonical_spot_identity() {
+        for spec in super::TIME_SERIES_SPECS
+            .iter()
+            .filter(|spec| spec.surface.starts_with("binance_"))
+        {
+            let sql = spec.raw_source_sql.to_ascii_lowercase();
+            assert!(sql.contains("market_type = 'spot'"));
+            assert!(sql.contains("venue = 'binance'"));
         }
     }
 }

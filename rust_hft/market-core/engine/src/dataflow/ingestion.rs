@@ -9,7 +9,7 @@
 use super::ring_buffer::{spsc_ring_buffer, SpscConsumer, SpscProducer};
 use hdrhistogram::Histogram;
 use hft_core::{now_micros, HftError, LatencyStage, LatencyTracker, Symbol};
-use ports::{MarketEvent, TrackedMarketEvent};
+use ports::{MarketEvent, TrackedMarketEvent, TradeStreamMode};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -545,6 +545,7 @@ pub struct EventConsumer {
     /// 引擎唤醒通知器（可选）
     engine_notify: Option<Arc<Notify>>,
     queue_space_notify: Arc<Notify>,
+    trade_stream_mode: TradeStreamMode,
 }
 
 #[derive(Debug)]
@@ -575,7 +576,17 @@ impl EventConsumer {
             flip_metrics: FlipMetrics::default(),
             engine_notify: None,
             queue_space_notify,
+            trade_stream_mode: TradeStreamMode::Raw,
         }
+    }
+
+    pub fn set_trade_stream_mode(&mut self, mode: TradeStreamMode) {
+        self.trade_stream_mode = mode;
+    }
+
+    #[must_use]
+    pub fn trade_stream_mode(&self) -> TradeStreamMode {
+        self.trade_stream_mode
     }
 
     /// 设置引擎唤醒通知器

@@ -66,6 +66,8 @@ pub struct BinanceWebSocket {
     usdm: bool,
     trade_streams: BinanceTradeStreams,
     depth_levels: Option<usize>,
+    depth_enabled: bool,
+    book_ticker_enabled: bool,
 }
 
 impl Default for BinanceWebSocket {
@@ -94,6 +96,8 @@ impl BinanceWebSocket {
             usdm: false,
             trade_streams: BinanceTradeStreams::default(),
             depth_levels: None,
+            depth_enabled: true,
+            book_ticker_enabled: true,
         }
     }
 
@@ -110,6 +114,20 @@ impl BinanceWebSocket {
 
     pub fn with_depth_levels(mut self, depth_levels: Option<usize>) -> Self {
         self.depth_levels = depth_levels;
+        self
+    }
+
+    /// Enable or disable depth subscriptions for specialized collectors.
+    #[must_use]
+    pub const fn with_depth_stream(mut self, enabled: bool) -> Self {
+        self.depth_enabled = enabled;
+        self
+    }
+
+    /// Enable or disable per-symbol book-ticker subscriptions.
+    #[must_use]
+    pub const fn with_book_ticker(mut self, enabled: bool) -> Self {
+        self.book_ticker_enabled = enabled;
         self
     }
 
@@ -152,7 +170,7 @@ impl BinanceWebSocket {
         // 允許通過環境變數控制深度模式
         // BINANCE_USE_LIMITED=true -> 使用 depth{levels}@{freq}
         // 否則使用 diff depth（symbol@depth）
-        let use_limited = uses_partial_depth_stream();
+        let use_limited = self.depth_enabled && uses_partial_depth_stream();
         let levels: usize = self.depth_levels.unwrap_or_else(|| {
             std::env::var("COLLECTOR_DEPTH_LEVELS")
                 .ok()
@@ -165,7 +183,7 @@ impl BinanceWebSocket {
                 .filter(|levels| matches!(*levels, 5 | 10 | 20))
                 .unwrap_or(20)
         });
-        if !matches!(levels, 5 | 10 | 20) {
+        if self.depth_enabled && !matches!(levels, 5 | 10 | 20) {
             return Err(HftError::Config(format!(
                 "unsupported Binance partial depth {levels}; use 5, 10, or 20"
             )));
@@ -206,10 +224,12 @@ impl BinanceWebSocket {
             let symbol_lower = symbol.to_string().to_lowercase();
 
             // 訂單簿增量更新 (100ms 推送)
-            if use_limited {
-                streams.push(format!("{}@depth{}@{}", symbol_lower, levels, freq));
-            } else {
-                streams.push(format!("{}@depth@100ms", symbol_lower));
+            if self.depth_enabled {
+                if use_limited {
+                    streams.push(format!("{}@depth{}@{}", symbol_lower, levels, freq));
+                } else {
+                    streams.push(format!("{}@depth@100ms", symbol_lower));
+                }
             }
 
             match self.trade_streams {
@@ -232,13 +252,13 @@ impl BinanceWebSocket {
             }
 
             // per-symbol bookTicker（可選）
-            if sub_book_ticker && !all_book_ticker {
+            if self.book_ticker_enabled && sub_book_ticker && !all_book_ticker {
                 streams.push(format!("{}@bookTicker", symbol_lower));
             }
         }
 
         // 全市場最優買賣（可選）：!bookTicker（獨立連線在 adapter 中處理）
-        if all_book_ticker {
+        if self.book_ticker_enabled && all_book_ticker {
             streams.push("!bookTicker".to_string());
         }
 
@@ -319,6 +339,16 @@ mod tests {
         let streams = ws.build_stream_names(&[Symbol::new("BTCUSDT")]).unwrap();
         assert!(streams.contains(&"btcusdt@depth5@100ms".to_string()));
         assert!(!streams.contains(&"btcusdt@depth20@100ms".to_string()));
+    }
+
+    #[test]
+    fn specialized_subscription_can_disable_depth_and_quotes() {
+        let ws = BinanceWebSocket::new()
+            .with_trade_streams(BinanceTradeStreams::Raw)
+            .with_depth_stream(false)
+            .with_book_ticker(false);
+        let streams = ws.build_stream_names(&[Symbol::new("BTCUSDT")]).unwrap();
+        assert_eq!(streams, vec!["btcusdt@trade".to_string()]);
     }
 
     #[test]

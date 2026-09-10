@@ -13,7 +13,9 @@ pub use events::{
     MarketUpdate,
 };
 pub use family::PredictionFamily;
-pub use feed::{BinanceSourceClock, BinanceSourceKind, Feed, HistoricalLoadOptions};
+pub use feed::{
+    canonical_binance_identity, BinanceSourceClock, BinanceSourceKind, Feed, HistoricalLoadOptions,
+};
 pub use fees::{
     polymarket_crypto_taker_fee_cost, polymarket_crypto_taker_fee_per_share, FeeAccumulator,
     FeeAsset, FeeCharge, FeeFormula, FeeRounding, FeeSchedule, FeeSettlement, LiquidityRole,
