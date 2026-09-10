@@ -5,6 +5,8 @@
 - 開發與 CI 檢查：編譯要快，盡量復用快取。
 - Release 發布：二進制要小、吞吐要高、產物資訊要可追溯。
 
+The repository-root `rust-toolchain.toml` pins active commands to Rust 1.98.1.
+
 ## 開發路徑
 
 dev profile 保持 Cargo 增量編譯，並禁用 LTO。不要在 `.cargo/config.toml` 里用 `CARGO_INCREMENTAL=1` 硬設環境變量；`sccache` 會拒絕這種組合。增量策略交給 Cargo profile 即可。

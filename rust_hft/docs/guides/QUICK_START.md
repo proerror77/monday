@@ -22,7 +22,8 @@ SSD: 100GB+ 可用空間
 ```bash
 # Rust 工具鏈 (必需)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-rustup update stable
+rustup toolchain install 1.98.1
+rustup default 1.98.1
 
 # 可選依賴
 sudo apt install build-essential pkg-config libssl-dev  # Linux
@@ -286,7 +287,8 @@ open http://localhost:9090    # Prometheus
 ### Q: 編譯失敗怎麼辦？
 ```bash
 # 更新Rust版本
-rustup update stable
+rustup toolchain install 1.98.1
+rustup default 1.98.1
 
 # 清理重建
 cargo clean && cargo build --release

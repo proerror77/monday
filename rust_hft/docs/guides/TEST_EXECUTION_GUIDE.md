@@ -190,25 +190,27 @@ critcmp main pr
 
 ```bash
 # 安装工具
-cargo install cargo-fuzz
-rustup default nightly
+cargo +nightly install cargo-fuzz
+# cargo-fuzz requires nightly; keep it isolated from the repository's stable
+# Rust 1.98.1 build and invoke it explicitly.
+rustup toolchain install nightly
 
 # 创建 fuzz target
-cargo fuzz add ring_buffer_fuzz
+cargo +nightly fuzz add ring_buffer_fuzz
 ```
 
 ### 运行 Fuzzing
 
 ```bash
 # 短时间测试 (1h)
-cargo fuzz run ring_buffer_fuzz -- -max_total_time=3600
+cargo +nightly fuzz run ring_buffer_fuzz -- -max_total_time=3600
 
 # 长时间测试 (24h, 多核)
-cargo fuzz run ring_buffer_fuzz -- \
+cargo +nightly fuzz run ring_buffer_fuzz -- \
   -max_total_time=86400 -workers=16
 
 # 从崩溃输入调试
-cargo fuzz run ring_buffer_fuzz \
+cargo +nightly fuzz run ring_buffer_fuzz \
   fuzz/artifacts/ring_buffer_fuzz/crash-xxx
 ```
 

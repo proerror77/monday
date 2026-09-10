@@ -104,7 +104,7 @@ cargo run -p hft-collector -- \
 
 ### 系統要求
 - **操作系統**: Linux/macOS
-- **Rust**: 1.70+
+- **Rust**: 1.98.1+
 - **ClickHouse**: 22.3+ (可選，數據持久化)
 - **內存**: 建議 2GB+
 - **磁盤**: 建議 100GB+ (取決於收集時長)

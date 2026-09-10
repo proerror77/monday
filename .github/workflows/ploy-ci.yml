@@ -208,7 +208,7 @@ jobs:
     needs: image-smoke-scope
     if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/research-image-binaries,') }}
     runs-on: ubuntu-latest
-    container: rust:1.98-bookworm
+    container: rust:1.98.1-bookworm
     timeout-minutes: 45
     defaults:
       run:

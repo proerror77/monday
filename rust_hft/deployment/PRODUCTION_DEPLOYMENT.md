@@ -29,7 +29,7 @@ docker build \
   .
 ```
 
-The builder uses Rust 1.98, `--release --locked`, and the production `clickhouse,redis,grpc,polymarket` feature graph. BuildKit caches Cargo registry and target artifacts, but the final binary is copied out of the cache before the runtime stage. The runtime image runs as the unprivileged `hft` user and contains only the binary, CA certificates, health-check client, and required runtime libraries.
+The builder uses Rust 1.98.1, `--release --locked`, and the production `clickhouse,redis,grpc,polymarket` feature graph. BuildKit caches Cargo registry and target artifacts, but the final binary is copied out of the cache before the runtime stage. The runtime image runs as the unprivileged `hft` user and contains only the binary, CA certificates, health-check client, and required runtime libraries.
 
 ## Required External Inputs
 

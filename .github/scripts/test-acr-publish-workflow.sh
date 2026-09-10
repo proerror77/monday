@@ -13,6 +13,12 @@ controller_job="$script_dir/../../deployment/aliyun/research/k8s/campaign-cycle-
 source_test_dockerfile="$script_dir/../../rust_hft/deployment/docker/Dockerfile.source-test"
 source_test_entrypoint="$script_dir/../../rust_hft/deployment/docker/source-test-entrypoint.sh"
 source_test_job="$script_dir/../../deployment/aliyun/research/k8s/source-test-job.example.yaml"
+root_toolchain="$script_dir/../../rust-toolchain.toml"
+binance_lob_dockerfile="$script_dir/../../rust_hft/deployment/docker/Dockerfile.binance-lob-archiver"
+market_data_dockerfile="$script_dir/../../rust_hft/deployment/docker/Dockerfile.market-data"
+sentinel_dockerfile="$script_dir/../../rust_hft/deployment/docker/Dockerfile.sentinel"
+hft_live_dockerfile="$script_dir/../../rust_hft/ops/hft-live.Dockerfile"
+emergency_collector="$script_dir/../../rust_hft/tools/collector/local-emergency-collector.sh"
 verifier="$script_dir/verify-research-runner-binaries.sh"
 tmp_dir=$(mktemp -d)
 source_test_tmp_dir=$(mktemp -d)
@@ -81,7 +87,15 @@ fi
 grep -Fqx '  research-runner-binaries:' "$workflow"
 grep -Fqx "    if: needs.selector.outputs.research_mode == 'rebuild'" "$workflow"
 grep -Fqx "    if: always() && needs.selector.result == 'success' && needs.selector.outputs.publish_target != 'none' && needs.selector.outputs.publish_target != 'research-source-test'" "$workflow"
-grep -Fqx '    container: rust:1.98-bookworm' "$workflow"
+grep -Fqx '    container: rust:1.98.1-bookworm' "$workflow"
+grep -Fqx 'channel = "1.98.1"' "$root_toolchain"
+grep -Fqx 'FROM rust:1.98.1-bookworm AS builder' "$market_data_dockerfile"
+grep -Fqx 'FROM rust:1.98.1-bookworm AS builder' "$sentinel_dockerfile"
+grep -Fqx 'FROM rust:1.98.1-slim-bookworm AS builder' "$hft_live_dockerfile"
+grep -Fqx 'FROM rust:1.98-bullseye AS builder' "$binance_lob_dockerfile"
+grep -Fqx 'RUN rustup toolchain install 1.98.1 --profile minimal \' "$binance_lob_dockerfile"
+grep -Fqx 'FROM rust:1.98-bullseye AS builder' "$emergency_collector"
+grep -Fqx '    && rustup toolchain install 1.98.1 --profile minimal \' "$emergency_collector"
 grep -Fqx 'FROM debian:bookworm-slim AS runtime-base' "$dockerfile"
 grep -Fqx 'ARG ALIYUN_CLI_VERSION=3.4.6' "$controller_dockerfile"
 grep -Fqx 'ARG KUBECTL_VERSION=v1.35.3' "$controller_dockerfile"
@@ -171,7 +185,7 @@ if grep -Fq 'research-source-test:${{ needs.selector.outputs.source_sha }}' <<<"
   exit 1
 fi
 
-grep -Fqx 'FROM rust:1.98-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 AS source-test' "$source_test_dockerfile"
+grep -Fqx 'FROM rust:1.98.1-bookworm@sha256:9a73a5088750b4c95158ab26629c854c3d6fc4b173cb7bc8079ad252d8ed7bfa AS source-test' "$source_test_dockerfile"
 grep -Fq 'groupadd --gid 1000 research' "$source_test_dockerfile"
 grep -Fqx '    && useradd --create-home --uid 1000 --gid 1000 research' "$source_test_dockerfile"
 grep -Fqx 'COPY --chown=research:research source/rust_hft/ /work/' "$source_test_dockerfile"
