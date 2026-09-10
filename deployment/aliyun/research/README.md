@@ -327,6 +327,13 @@ writing output. The repo-local contract check is:
 deployment/aliyun/research/test-cex-materialization-entrypoint.sh
 ```
 
+Collector manifests may use compact or pretty-printed JSON. The entrypoint uses
+the runner's `alpha-harness data verify-materialization-manifest` command to
+check the exact manifest SHA, root market/venue and optional receive-time bounds.
+Nanoseconds remain unsigned integers; duplicate gate fields, wrong types,
+checksum drift and out-of-window raw segments fail before slicing. This metadata
+check does not replace the data/marker checks or native slicer and PIT admission.
+
 Current repository state caveat: the mounted inventory still needs explicit
 reference triplets whenever the pinned `research-runner` image's
 `lob-pit-materializer` still expects the read-only historical v1/current data v3

@@ -1153,6 +1153,36 @@ pub(crate) fn freeze_research_inventory_request(
     hft_collector::research_inventory::freeze_inventory(&request)
 }
 
+pub fn verify_materialization_manifest(
+    args: crate::cli::VerifyMaterializationManifestArgs,
+) -> anyhow::Result<()> {
+    use hft_collector::research_inventory::{
+        verify_materialization_manifest_metadata, MaterializationManifestKind,
+    };
+    let kind = match args.kind {
+        crate::cli::MaterializationManifestKindArg::Raw => MaterializationManifestKind::Raw,
+        crate::cli::MaterializationManifestKindArg::Reference => {
+            MaterializationManifestKind::Reference
+        }
+    };
+    let window = match (args.start_received_at_ns, args.end_received_at_ns) {
+        (Some(start), Some(end)) => Some((start, end)),
+        (None, None) => None,
+        _ => bail!("materialization manifest requires both window bounds together"),
+    };
+    verify_materialization_manifest_metadata(
+        &args.manifest,
+        &args.manifest_sha256,
+        kind,
+        args.market.parse::<Market>().map_err(anyhow::Error::msg)?,
+        window,
+    )?;
+    crate::cli::print_json(&serde_json::json!({
+        "status": "verified", "kind": kind, "manifest_sha256": args.manifest_sha256,
+        "requires_pit_admission": true,
+    }))
+}
+
 /// Prepare immutable input selection for the existing materialization entrypoint.
 pub fn freeze_research_inventory(args: crate::cli::FreezeInventoryArgs) -> anyhow::Result<()> {
     let inventory = freeze_research_inventory_request(&args)?;

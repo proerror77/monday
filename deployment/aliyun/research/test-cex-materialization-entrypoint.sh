@@ -64,12 +64,8 @@ raw2_rel=venue=binance/market=usdm/dataset=usdm_all/shard=all/date=2026-08-18/ho
 ref1_rel=venue=binance_usdm/dataset=reference/date=2026-08-18/hour=01/batch=001/reference.ndjson
 ref2_rel=venue=binance_usdm/dataset=reference/date=2026-08-18/hour=02/batch=002/reference.ndjson
 
-raw_manifest='{
-  "market": "usdm"
-}'
-reference_manifest='{
-  "venue": "binance_usdm"
-}'
+raw_manifest='{"market":"usdm","start_received_at_ns":1789005600004729437,"end_received_at_ns":1789005900000187690,"nested":{"market":"spot","start_received_at_ns":1}}'
+reference_manifest='{"venue":"binance_usdm","nested":{"venue":"binance_spot"}}'
 raw1=$(write_triplet "$RAW_ROOT/$raw1_rel" raw-segment-1 "$raw_manifest")
 raw2=$(write_triplet "$RAW_ROOT/$raw2_rel" raw-segment-2 "$raw_manifest")
 ref1=$(write_triplet "$REF_ROOT/$ref1_rel" ref-segment-1 "$reference_manifest")
@@ -86,6 +82,8 @@ BUCKET_MS=1000
 LABEL_HORIZON_BUCKETS=5
 TOP_DEPTH=5
 OUTPUT_PREFIX=test-run-1
+WINDOW_START_RECEIVED_AT_NS=1789005600000000000
+WINDOW_END_RECEIVED_AT_NS=1789006200000000000
 RAW_SEGMENT_COUNT=2
 RAW_SEGMENT_1=$raw1_rel
 RAW_SEGMENT_1_SHA256=$(printf '%s' "$raw1" | awk -F'|' '{print $1}')
@@ -209,15 +207,73 @@ cat <<JSON
 JSON
 EOF
 
-chmod +x "$BIN_DIR/binance-market-tape-slicer" "$BIN_DIR/lob-pit-materializer" "$BIN_DIR/binance-replay-parquet-materializer"
+# JSON decoding, exact integer bounds, duplicate fields and venue checks are
+# exercised by the collector's native metadata tests. This double checks the
+# shell/native contract and lets this orchestration test run without a build.
+cat >"$BIN_DIR/alpha-harness" <<'EOF'
+#!/bin/sh
+set -eu
+[ "$1" = data ] && [ "$2" = verify-materialization-manifest ] || exit 64
+shift 2
+manifest= manifest_sha= kind= market= start= end=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --manifest) manifest=$2 ;;
+    --manifest-sha256) manifest_sha=$2 ;;
+    --kind) kind=$2 ;;
+    --market) market=$2 ;;
+    --start-received-at-ns) start=$2 ;;
+    --end-received-at-ns) end=$2 ;;
+    *) exit 64 ;;
+  esac
+  shift 2
+done
+[ -f "$manifest" ] && [ -n "$manifest_sha" ] && [ "$market" = usdm ] || exit 64
+[ "$(sha256sum "$manifest" | awk '{print $1}')" = "$manifest_sha" ] || exit 65
+case "$kind" in
+  raw)
+    if [ -n "$start$end" ]; then
+      [ -n "$start" ] && [ -n "$end" ] || exit 64
+    fi
+    ;;
+  reference) [ -z "$start$end" ] || exit 64 ;;
+  *) exit 64 ;;
+esac
+printf '%s|%s|%s|%s|%s|%s\n' "$kind" "$market" "$start" "$end" "$manifest" "$manifest_sha" >>"${MONDAY_TEST_VERIFY_CALLS:?}"
+[ "${MONDAY_TEST_VERIFY_FAILURE:-}" != "$kind" ] || exit 65
+printf '{"status":"verified"}\n'
+EOF
+MONDAY_TEST_VERIFY_CALLS=$ROOT/manifest-verifier-calls.log
+export MONDAY_TEST_VERIFY_CALLS
+chmod +x "$BIN_DIR/alpha-harness" "$BIN_DIR/binance-market-tape-slicer" "$BIN_DIR/lob-pit-materializer" "$BIN_DIR/binance-replay-parquet-materializer"
 
-sh "$ENTRYPOINT" \
+if ! sh "$ENTRYPOINT" \
   --inventory "$ROOT/inventory.env" \
   --raw-root "$RAW_ROOT" \
   --reference-root "$REF_ROOT" \
   --output-root "$OUT_ROOT" \
   --work-dir "$WORK_ROOT" \
-  --binary-dir "$BIN_DIR" >/dev/null 2>"$ROOT/run.log"
+  --binary-dir "$BIN_DIR" >/dev/null 2>"$ROOT/run.log"; then
+  cat "$ROOT/run.log" >&2
+  exit 1
+fi
+
+[ "$(wc -l <"$MONDAY_TEST_VERIFY_CALLS" | tr -d ' ')" -eq 4 ]
+grep -Fx "raw|usdm|1789005600000000000|1789006200000000000|$RAW_ROOT/$raw1_rel.manifest.json|$(printf '%s' "$raw1" | awk -F'|' '{print $2}')" "$MONDAY_TEST_VERIFY_CALLS" >/dev/null
+grep -Fx "reference|usdm|||$REF_ROOT/$ref1_rel.manifest.json|$(printf '%s' "$ref1" | awk -F'|' '{print $2}')" "$MONDAY_TEST_VERIFY_CALLS" >/dev/null
+for rejected_kind in raw reference; do
+  rejected_root=$ROOT/reject-$rejected_kind
+  mkdir -p "$rejected_root/output" "$rejected_root/work"
+  if MONDAY_TEST_VERIFY_FAILURE=$rejected_kind sh "$ENTRYPOINT" \
+    --inventory "$ROOT/inventory.env" --raw-root "$RAW_ROOT" --reference-root "$REF_ROOT" \
+    --output-root "$rejected_root/output" --work-dir "$rejected_root/work" \
+    --binary-dir "$BIN_DIR" --dry-run >"$rejected_root/stdout" 2>"$rejected_root/log"; then
+    printf 'expected native %s metadata rejection to stop materialization\n' "$rejected_kind" >&2
+    exit 1
+  fi
+  grep -Fq 'metadata verification failed' "$rejected_root/log"
+  [ -z "$(find "$rejected_root/output" -type f -print)" ]
+done
 
 grep -Fq "progress_event raw_verification \"\$seen\" \"\$verify_total\" 10" "$ENTRYPOINT"
 grep -Fq "progress_event reference_verification \"\$i\" \"\$reference_count\" 50" "$ENTRYPOINT"
