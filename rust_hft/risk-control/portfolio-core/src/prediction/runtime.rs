@@ -1931,15 +1931,12 @@ mod tests {
             )
             .is_none());
         assert!(runtime.reconciliation_required());
-        assert!(
-            runtime
-                .snapshot(&BTreeMap::new())
-                .canonical_oms
-                .unwrap()
-                .reconciliation_exceptions
-                .len()
-                > 0
-        );
+        assert!(!runtime
+            .snapshot(&BTreeMap::new())
+            .canonical_oms
+            .unwrap()
+            .reconciliation_exceptions
+            .is_empty());
     }
 
     #[test]
