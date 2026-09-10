@@ -7,16 +7,16 @@ use crate::{
     },
 };
 use alpha_domain::{
-    canonical_json_hash, CexBaselinePolicyV1, CexEqualAbsoluteWeightPolicyV1,
-    CexEventReplayPolicyV1, CexGpPolicyV1, CexResearchContentRefV1, CexResearchDeltaConfigV1,
-    CexResearchEvidenceKindV1, CexResearchEvidenceRefV1, CexResearchFalsificationTestV1,
-    CexResearchHoldoutStateV1, CexResearchHoldoutV1, CexResearchHypothesisTargetV1,
-    CexResearchHypothesisV1, CexResearchInputBindingsV1, CexResearchInstrumentV1,
-    CexResearchMarketV1, CexResearchMissionArtifactV1, CexResearchMissionSpecV1,
-    CexResearchOperationalMetadataV1, CexResearchPolicyBindingsV1, CexResearchSearchPlanV1,
-    CexResearchVenueV1, EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1,
-    EvaluationWalkForwardV1, SearchBudget, CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD,
-    CEX_RESEARCH_MISSION_SCHEMA_V1,
+    campaign_horizon::CampaignLabelHorizonV1, canonical_json_hash, CexBaselinePolicyV1,
+    CexEqualAbsoluteWeightPolicyV1, CexEventReplayPolicyV1, CexGpPolicyV1, CexResearchContentRefV1,
+    CexResearchDeltaConfigV1, CexResearchEvidenceKindV1, CexResearchEvidenceRefV1,
+    CexResearchFalsificationTestV1, CexResearchHoldoutStateV1, CexResearchHoldoutV1,
+    CexResearchHypothesisTargetV1, CexResearchHypothesisV1, CexResearchInputBindingsV1,
+    CexResearchInstrumentV1, CexResearchMarketV1, CexResearchMissionArtifactV1,
+    CexResearchMissionSpecV1, CexResearchOperationalMetadataV1, CexResearchPolicyBindingsV1,
+    CexResearchSearchPlanV1, CexResearchVenueV1, EvaluationCostsV1, EvaluationLabelSpecV1,
+    EvaluationProtocolV1, EvaluationWalkForwardV1, SearchBudget,
+    CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD, CEX_RESEARCH_MISSION_SCHEMA_V1,
 };
 use alpha_engine::baselines::CexSupervisedDecisionPolicyV2;
 use anyhow::{bail, Context};
@@ -413,6 +413,8 @@ pub(crate) struct CexCampaignResearchPlanV1 {
     pub(crate) hypothesis: String,
     pub(crate) focus_field: String,
     pub(crate) feature_fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) label_horizon: Option<CampaignLabelHorizonV1>,
     pub(crate) search_policy_revision: CexCampaignSearchPolicyRevisionV1,
     pub(crate) attempted_search_policy_revision_ids: Vec<String>,
     pub(crate) allowed_search_policy_revisions: Vec<CexCampaignSearchPolicyRevisionV1>,
@@ -510,6 +512,7 @@ impl CexCampaignResearchPlanV1 {
                 .to_string(),
             focus_field: "book_imbalance_top5".to_string(),
             feature_fields: FEATURE_FIELDS.into_iter().map(str::to_string).collect(),
+            label_horizon: None,
             attempted_search_policy_revision_ids: vec![search_policy_revision.revision_id.clone()],
             allowed_search_policy_revisions: CexCampaignSearchPolicyRevisionV1::bounded_allowlist(),
             parent_evidence_signature: None,
@@ -523,6 +526,9 @@ impl CexCampaignResearchPlanV1 {
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         if self.schema_version != RESEARCH_PLAN_SCHEMA_V2 {
             bail!("CEX Campaign research plan schema_version must be {RESEARCH_PLAN_SCHEMA_V2}");
+        }
+        if let Some(horizon) = &self.label_horizon {
+            horizon.validate().map_err(anyhow::Error::msg)?;
         }
         self.search_policy_revision.validate()?;
         let attempted = self
@@ -794,7 +800,12 @@ pub(crate) fn render_cex_bundle(
         feature,
         feature_artifacts.path(),
     )?;
-    ensure_materialization_scope(&materialization, &feature_manifest, &feature_sha256)?;
+    ensure_materialization_scope(
+        &materialization,
+        &feature_manifest,
+        &feature_sha256,
+        research_plan.label_horizon.as_ref(),
+    )?;
     data_mission::validate_cex_replay_features(&materialization.snapshot, &feature_manifest)?;
     let validation = approved_validation(&materialization)?;
     validate_materialization(&materialization, &feature_sha256, &validation)?;
@@ -837,7 +848,10 @@ pub(crate) fn render_cex_bundle(
     );
     let input_lineage_id = format!("{stable_version}-input-{}", &materialization_sha256[..16]);
     let holdout_id = format!("cex-holdout-{}", &sealed_holdout_cohort_sha256[..48]);
-    let evaluation_protocol = approved_evaluation_protocol(&materialization)?;
+    let evaluation_protocol = approved_evaluation_protocol_for_horizon(
+        &materialization,
+        research_plan.label_horizon.as_ref(),
+    )?;
     let search = CexResearchSearchPlanV1 {
         seed,
         budget: SearchBudget {
@@ -1097,16 +1111,46 @@ pub(crate) fn approved_validation(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn approved_evaluation_protocol(
     materialization: &crate::mission_runner::Materialization,
 ) -> anyhow::Result<EvaluationProtocolV1> {
+    approved_evaluation_protocol_for_horizon(materialization, None)
+}
+
+pub(crate) fn approved_evaluation_protocol_for_horizon(
+    materialization: &crate::mission_runner::Materialization,
+    expected_horizon: Option<&CampaignLabelHorizonV1>,
+) -> anyhow::Result<EvaluationProtocolV1> {
+    let (labels, purge_rows, embargo_rows) = if let Some(horizon) = expected_horizon {
+        horizon.validate().map_err(anyhow::Error::msg)?;
+        if horizon.labels.horizon_buckets != materialization.label_horizon_buckets
+            || horizon.labels.observation_frequency_millis != materialization.bucket_ms
+        {
+            bail!("typed Campaign label horizon does not match materialization");
+        }
+        (
+            horizon.labels.clone(),
+            horizon.purge_rows,
+            horizon.embargo_rows,
+        )
+    } else {
+        (
+            EvaluationLabelSpecV1 {
+                horizon_buckets: materialization.label_horizon_buckets,
+                observation_frequency_millis: materialization.bucket_ms,
+            },
+            PURGE_ROWS,
+            EMBARGO_ROWS,
+        )
+    };
     EvaluationProtocolV1::new(
         EvaluationWalkForwardV1 {
             initial_train_rows: INITIAL_TRAIN_ROWS,
             validation_rows: VALIDATION_ROWS,
             fold_count: FOLD_COUNT,
-            purge_rows: PURGE_ROWS,
-            embargo_rows: EMBARGO_ROWS,
+            purge_rows,
+            embargo_rows,
             sealed_holdout_rows: HOLDOUT_ROWS,
         },
         EvaluationCostsV1 {
@@ -1120,28 +1164,48 @@ pub(crate) fn approved_evaluation_protocol(
             capacity_depth_levels: 5,
             max_book_depth_fraction: 0.05,
         },
-        EvaluationLabelSpecV1 {
-            horizon_buckets: materialization.label_horizon_buckets,
-            observation_frequency_millis: materialization.bucket_ms,
-        },
+        labels,
     )
     .and_then(|protocol| protocol.with_independent_selection(SELECTION_ROWS))
     .map_err(anyhow::Error::new)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn validate_render_materialization_scope(
     materialization: &crate::mission_runner::Materialization,
+) -> anyhow::Result<()> {
+    validate_render_materialization_scope_for_horizon(materialization, None)?;
+    Ok(())
+}
+
+pub(crate) fn validate_render_materialization_scope_for_horizon(
+    materialization: &crate::mission_runner::Materialization,
+    expected_horizon: Option<&CampaignLabelHorizonV1>,
 ) -> anyhow::Result<()> {
     if !matches!(materialization.market.as_str(), "spot" | "usdm")
         || materialization.symbol != "BTCUSDT"
         || materialization.bucket_ms != 1_000
-        || materialization.label_horizon_buckets != 5
         || materialization.top_depth != 5
     {
         bail!("only the approved Binance Spot or USD-M BTCUSDT 1s/h5/top5 materialization can render this Mission");
     }
-    if materialization.rows < MIN_ROWS {
-        bail!("approved Mission render requires at least {MIN_ROWS} point-in-time rows");
+    if let Some(horizon) = expected_horizon {
+        horizon.validate().map_err(anyhow::Error::msg)?;
+        if horizon.labels.horizon_buckets != materialization.label_horizon_buckets
+            || horizon.labels.observation_frequency_millis != materialization.bucket_ms
+        {
+            bail!("typed Campaign label horizon does not match materialization");
+        }
+    } else if materialization.label_horizon_buckets != 5 {
+        bail!("only the approved Binance Spot or USD-M BTCUSDT 1s/h5/top5 materialization can render this Mission");
+    }
+    let minimum_rows = expected_horizon
+        .map(minimum_rows_for_horizon)
+        .transpose()?
+        .unwrap_or(MIN_ROWS);
+    if materialization.rows < minimum_rows {
+        bail!("approved Mission render requires at least {minimum_rows} point-in-time rows");
     }
     Ok(())
 }
@@ -1156,14 +1220,33 @@ fn rendered_research_market(
     }
 }
 
+fn minimum_rows_for_horizon(horizon: &CampaignLabelHorizonV1) -> anyhow::Result<usize> {
+    let fold_rows = VALIDATION_ROWS
+        .checked_add(horizon.embargo_rows)
+        .and_then(|rows| FOLD_COUNT.checked_mul(rows))
+        .context("typed Campaign horizon row budget overflowed")?;
+    INITIAL_TRAIN_ROWS
+        .checked_add(fold_rows)
+        .and_then(|rows| rows.checked_add(horizon.purge_rows))
+        .and_then(|rows| rows.checked_add(SELECTION_ROWS))
+        .and_then(|rows| rows.checked_add(horizon.purge_rows.checked_mul(2)?))
+        .and_then(|rows| rows.checked_add(HOLDOUT_ROWS))
+        .context("typed Campaign horizon row budget overflowed")
+}
+
 fn ensure_materialization_scope(
     materialization: &crate::mission_runner::Materialization,
     manifest: &FeatureDatasetManifest,
     feature_sha256: &str,
+    expected_horizon: Option<&CampaignLabelHorizonV1>,
 ) -> anyhow::Result<()> {
-    validate_render_materialization_scope(materialization)?;
-    if manifest.rows < MIN_ROWS {
-        bail!("approved Mission render requires at least {MIN_ROWS} point-in-time rows");
+    validate_render_materialization_scope_for_horizon(materialization, expected_horizon)?;
+    let minimum_rows = expected_horizon
+        .map(minimum_rows_for_horizon)
+        .transpose()?
+        .unwrap_or(MIN_ROWS);
+    if manifest.rows < minimum_rows {
+        bail!("approved Mission render requires at least {minimum_rows} point-in-time rows");
     }
     if materialization.rows != manifest.rows {
         bail!("materialization evidence row count does not match the feature artifact");
@@ -1335,6 +1418,7 @@ pub(crate) mod tests {
                 .to_string(),
             focus_field: canonical.focus_field,
             feature_fields: canonical.feature_fields,
+            label_horizon: None,
             search_policy_revision,
             attempted_search_policy_revision_ids: vec![
                 canonical.search_policy_revision.revision_id.clone(),
@@ -1530,6 +1614,7 @@ pub(crate) mod tests {
             hypothesis: "The subset remains evaluable under the same costs".to_string(),
             focus_field: canonical.focus_field.clone(),
             feature_fields: subset.feature_fields.clone(),
+            label_horizon: None,
             search_policy_revision: revision.clone(),
             attempted_search_policy_revision_ids: vec![
                 canonical.search_policy_revision.revision_id.clone(),

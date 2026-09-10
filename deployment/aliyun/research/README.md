@@ -621,6 +621,44 @@ trusted keys, approval, ledger, resources, and receipt access; an older root
 cannot be reused for the new window. This path remains pre-holdout and does
 not create final-evaluation or holdout authority.
 
+An authenticated Study can hand off a settled no-candidate parent to another
+predeclared family with the same controller. Add the target Study member,
+typed horizon, explicit receive-time window, target output prefix, and a
+separate target dispatch control to the controller start request:
+
+```bash
+deployment/aliyun/research/scripts/campaign-cycle-controller.sh start \
+  --fresh-inputs ... \
+  --study-id REPLACE_STUDY_ID \
+  --study-target-family-id REPLACE_TARGET_FAMILY_ID \
+  --study-target-horizon /campaign-root/study/target-horizon.json \
+  --study-target-start-received-at-ns REPLACE_START_NS \
+  --study-target-end-received-at-ns REPLACE_END_NS \
+  --study-target-mission-id REPLACE_TARGET_MISSION_ID \
+  --study-target-output-root /campaign-root/inputs \
+  --study-target-output-prefix REPLACE_TARGET_PREFIX \
+  --study-target-bucket-ms 1000 --study-target-top-depth 5 \
+  --study-target-control /campaign-root/study/target-dispatch-control.json \
+  ...
+```
+
+After the parent ledger settlement, the controller materializes the target
+window and reads back its campaign-inputs receipt, feature, and materialization.
+The proposal binds the receipt hash, mission/output prefix, source segment
+start/end, typed horizon, purge/embargo protocol, and predeclared member
+execution. A missing member, target control, or exact binding produces a
+durable `needs_authority` checkpoint. A ready proposal is embedded in the next
+frozen request, and the ordinary freeze -> finalize -> dispatch path remains
+the only execution seam. The target dispatch control must name both
+`campaign_inputs_path` and `materialization_path`; Admission independently
+rechecks those files and the parent family/Study settlement receipts before
+reserving the target family.
+
+If the authority changes while the input paths remain unchanged, resume with
+`approve` or `ack-readback --study-retry-authority`. The controller archives
+the previous proposal report before retrying; ordinary resumes keep the cached
+report and do not repeat the authority decision.
+
 The printed ACK Job runs `ack-readback` from
 `/campaign-root/cycles/REPLACE_CYCLE_ID`. Its campaign-root PVC must use block storage for the active DuckDB ledger and
 cycle checkpoints. OSS holds immutable published evidence; the OSS CSI example

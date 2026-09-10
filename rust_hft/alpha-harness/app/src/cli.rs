@@ -83,6 +83,7 @@ enum MissionCommand {
     CampaignExecute(CampaignExecuteArgs),
     CampaignFreeze(CampaignFreezeArgs),
     CampaignLearn(CampaignLearnArgs),
+    CampaignStudyPropose(CampaignStudyProposeArgs),
     CampaignFinalize(CampaignFinalizeArgs),
     CampaignId(CampaignIdArgs),
     PrepareFreshInputs(Box<PrepareFreshInputsArgs>),
@@ -263,6 +264,9 @@ pub struct CampaignFreezeArgs {
     pub seeds: Vec<u64>,
     #[arg(long)]
     pub research_plan: Option<PathBuf>,
+    /// Optional authenticated next-family proposal. Freeze binds it into the signed request.
+    #[arg(long)]
+    pub study_proposal: Option<PathBuf>,
     #[arg(long)]
     pub output: PathBuf,
 }
@@ -277,6 +281,58 @@ pub struct CampaignLearnArgs {
     pub result_sha256: String,
     #[arg(long)]
     pub output: PathBuf,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CampaignStudyProposeArgs {
+    /// Finalized parent submission whose ledger settlement must be read back.
+    #[arg(long)]
+    pub parent_submission: PathBuf,
+    /// Independently read-back terminal Campaign result.
+    #[arg(long)]
+    pub parent_result: PathBuf,
+    /// The durable report returned by `mission dispatch settle`.
+    #[arg(long)]
+    pub parent_settlement: PathBuf,
+    /// Existing dispatch control containing the authenticated parent ledger.
+    #[arg(long)]
+    pub parent_control: PathBuf,
+    #[arg(long)]
+    pub study_id: String,
+    /// Existing Study member to select. Missing or unlisted members yield needs_authority.
+    #[arg(long)]
+    pub target_family_id: Option<String>,
+    /// Typed label-horizon JSON whose hash must match the selected Study member.
+    #[arg(long)]
+    pub target_horizon: Option<PathBuf>,
+    /// Materialized campaign-inputs receipt for the selected target family.
+    #[arg(long)]
+    pub target_campaign_inputs: Option<PathBuf>,
+    /// Local input root containing the receipt's feature/materialization objects.
+    #[arg(long)]
+    pub target_input_root: Option<PathBuf>,
+    #[arg(long, default_value_t = 7)]
+    pub target_seed: u64,
+    #[arg(long)]
+    pub target_start_received_at_ns: Option<u64>,
+    #[arg(long)]
+    pub target_end_received_at_ns: Option<u64>,
+    #[arg(long)]
+    pub target_mission_id: Option<String>,
+    #[arg(long)]
+    pub target_output_prefix: Option<String>,
+    #[arg(long)]
+    pub target_bucket_ms: Option<u64>,
+    #[arg(long, default_value_t = 5)]
+    pub target_top_depth: usize,
+    #[arg(long, default_value = "monday-research")]
+    pub parent_namespace: String,
+    /// Create-once next-family proposal evidence.
+    #[arg(long)]
+    pub output: PathBuf,
+    /// Create-once target research plan consumed by the canonical freeze seam.
+    #[arg(long)]
+    pub research_plan_output: PathBuf,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -990,6 +1046,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 tokio::task::spawn_blocking(move || mission_campaign::learn(args))
                     .await
                     .context("campaign learning worker failed")?
+            }
+            MissionCommand::CampaignStudyPropose(args) => {
+                tokio::task::spawn_blocking(move || mission_campaign::propose_next_family(args))
+                    .await
+                    .context("next-family Campaign proposal worker failed")?
             }
             MissionCommand::CampaignFinalize(args) => mission_campaign::finalize(args),
             MissionCommand::CampaignId(args) => mission_campaign::print_expected_id(args),

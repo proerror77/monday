@@ -37,14 +37,21 @@ Usage: campaign-cycle-controller.sh [start] \
   [--control CONTROL_JSON] [--signer EXECUTABLE] \
   --work-dir DIR --seed N --seed N \
   [--context NAME] [--namespace NAME] [--max-follow-ups 3] \
-  [--job-timeout 7h]
+  [--job-timeout 7h] \
+  [--study-id ID --study-target-family-id ID --study-target-horizon FILE \
+   --study-target-start-received-at-ns N --study-target-end-received-at-ns N \
+   --study-target-mission-id ID --study-target-output-root DIR \
+   --study-target-output-prefix PREFIX --study-target-bucket-ms N \
+   [--study-target-top-depth N]]
 
        campaign-cycle-controller.sh approve \
   --work-dir DIR --signer EXECUTABLE [--control CONTROL_JSON] \
+  [--study-target-control FILE] [--study-retry-authority] \
   [--alpha-harness EXECUTABLE] [--aliyun EXECUTABLE] [--kubectl EXECUTABLE]
 
        campaign-cycle-controller.sh ack-readback \
   --work-dir DIR --campaign-pod-name NAME \
+  [--study-target-control FILE] [--study-retry-authority] \
   [--alpha-harness EXECUTABLE] [--aliyun EXECUTABLE] [--kubectl EXECUTABLE]
 
        campaign-cycle-controller.sh status --work-dir DIR
@@ -92,14 +99,18 @@ validate_controller_state() {
     and all(.seeds[]; type == "number")
     and ((.input_mode // "receipt") == "receipt"
       or ((.input_mode == "fresh") and (.fresh | type == "object" and (.market | type == "string"))))
+    and ((.study // null) == null or ((.study | type == "object")
+      and ((.study.handoff_consumed // false) | type == "boolean")))
   ' "$controller_state" >/dev/null || die "controller state is invalid: $controller_state"
 }
 
 sha256_file() {
-  if command -v shasum >/dev/null; then
+  if command -v sha256sum >/dev/null; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null; then
     shasum -a 256 "$1" | awk '{print $1}'
   else
-    sha256sum "$1" | awk '{print $1}'
+    die "no portable SHA256 implementation is available"
   fi
 }
 
@@ -149,6 +160,72 @@ build_fresh_controller_contract() {
       materializer_work_dir:$materializer_work_dir,
       preparation_report:$preparation_report
     }')
+}
+
+build_study_controller_contract() {
+  study_state_json=$(jq -n \
+    --arg study_id "$study_id" \
+    --arg target_family_id "$study_target_family_id" \
+    --arg target_horizon "$study_target_horizon" \
+    --arg target_start_received_at_ns "$study_target_start_received_at_ns" \
+    --arg target_end_received_at_ns "$study_target_end_received_at_ns" \
+    --arg target_mission_id "$study_target_mission_id" \
+    --arg target_output_root "$study_target_output_root" \
+    --arg target_output_prefix "$study_target_output_prefix" \
+    --arg target_bucket_ms "$study_target_bucket_ms" \
+    --arg target_top_depth "$study_target_top_depth" \
+    --arg target_control "$study_target_control" \
+    --argjson handoff_consumed "$study_handoff_consumed" \
+    --arg proposal_out "$study_proposal_out" \
+    --arg plan_out "$study_plan_out" \
+    '{study_id:$study_id,target_family_id:$target_family_id,target_horizon:$target_horizon,
+      target_start_received_at_ns:$target_start_received_at_ns,
+      target_end_received_at_ns:$target_end_received_at_ns,target_mission_id:$target_mission_id,
+      target_output_root:$target_output_root,target_output_prefix:$target_output_prefix,
+      target_bucket_ms:$target_bucket_ms,target_top_depth:$target_top_depth,
+      target_control:$target_control,
+      handoff_consumed:$handoff_consumed,
+      proposal_out:$proposal_out,plan_out:$plan_out}')
+}
+
+load_fresh_controller_contract() {
+  local controller_state="$1"
+  fresh_raw_root="$(jq -er '.fresh.raw_root' "$controller_state")"
+  fresh_reference_root="$(jq -er '.fresh.reference_root' "$controller_state")"
+  fresh_market="$(jq -er '.fresh.market' "$controller_state")"
+  fresh_start_received_at_ns="$(jq -r '.fresh.start_received_at_ns // empty' "$controller_state")"
+  fresh_end_received_at_ns="$(jq -r '.fresh.end_received_at_ns // empty' "$controller_state")"
+  fresh_symbol="$(jq -er '.fresh.symbol' "$controller_state")"
+  fresh_image_ref="$(jq -er '.fresh.image_ref' "$controller_state")"
+  fresh_mission_id="$(jq -er '.fresh.mission_id' "$controller_state")"
+  fresh_output_root="$(jq -er '.fresh.output_root' "$controller_state")"
+  fresh_output_prefix="$(jq -er '.fresh.output_prefix' "$controller_state")"
+  fresh_bucket_ms="$(jq -er '.fresh.bucket_ms' "$controller_state")"
+  fresh_label_horizon_buckets="$(jq -er '.fresh.label_horizon_buckets' "$controller_state")"
+  fresh_top_depth="$(jq -er '.fresh.top_depth' "$controller_state")"
+  fresh_duration_ns="$(jq -r '.fresh.duration_ns // empty' "$controller_state")"
+  fresh_cutoff_received_at_ns="$(jq -r '.fresh.cutoff_received_at_ns // empty' "$controller_state")"
+  fresh_max_candidates="$(jq -r '.fresh.max_candidates // empty' "$controller_state")"
+  fresh_materializer="$(jq -er '.fresh.materializer' "$controller_state")"
+  fresh_binary_dir="$(jq -r '.fresh.binary_dir // empty' "$controller_state")"
+  fresh_max_scan_entries="$(jq -er '.fresh.max_scan_entries' "$controller_state")"
+  fresh_max_inputs="$(jq -er '.fresh.max_inputs' "$controller_state")"
+  fresh_max_input_bytes="$(jq -er '.fresh.max_input_bytes' "$controller_state")"
+  fresh_materializer_timeout_seconds="$(jq -er '.fresh.materializer_timeout_seconds' "$controller_state")"
+  fresh_max_materializer_output_bytes="$(jq -er '.fresh.max_materializer_output_bytes' "$controller_state")"
+  fresh_inventory_out="$(jq -er '.fresh.inventory_out' "$controller_state")"
+  fresh_request_out="$(jq -er '.fresh.request_out' "$controller_state")"
+  fresh_materializer_work_dir="$(jq -er '.fresh.materializer_work_dir' "$controller_state")"
+  fresh_report_out="$(jq -er '.fresh.preparation_report' "$controller_state")"
+}
+
+mark_study_handoff_consumed() {
+  local controller_state="$work_dir/controller-inputs.json"
+  local state_tmp="$controller_state.partial.$$"
+  [[ -s "$controller_state" ]] || die "controller state is missing before Study handoff commit"
+  jq '.study.handoff_consumed = true' "$controller_state" >"$state_tmp"
+  mv -f -- "$state_tmp" "$controller_state"
+  study_handoff_consumed=true
 }
 
 validate_fresh_controller_owner() {
@@ -223,7 +300,7 @@ validate_learning_checkpoint() {
 validate_generation_completion() {
   local dir="$1" expected_generation="$2"
   local checkpoint="$dir/generation-complete"
-  local report_sha expected_request expected_result learning_sha="" learned_outcome="" learn_report_sha=""
+  local report_sha expected_request expected_result learning_sha="" learned_outcome="" learn_report_sha="" study_handoff_sha=""
   local campaign_root max_follow_ups
   [[ -s "$checkpoint" && -s "$dir/generation-report.json" \
     && -s "$dir/finalize-report.json" && -s "$dir/campaign-result.json" ]] || return 1
@@ -242,21 +319,28 @@ validate_generation_completion() {
       cmp -s "$dir/next-research-plan.json" "$dir/next-research-plan-readback.json" || return 1
     fi
   fi
+  if [[ -e "$dir/study-handoff.json" ]]; then
+    study_handoff_sha="$(sha256_file "$dir/study-handoff.json")" || return 1
+  fi
   jq -e --slurpfile report "$dir/generation-report.json" \
     --argjson generation "$expected_generation" --arg report_sha "$report_sha" \
     --arg request "$expected_request" --arg result "$expected_result" \
     --arg learning "$learning_sha" --arg learned_outcome "$learned_outcome" \
     --arg learn_report_sha "$learn_report_sha" --arg campaign_root "$campaign_root" \
+    --arg study_handoff "$study_handoff_sha" \
     --argjson max_follow_ups "$max_follow_ups" '
     .schema_version == "monday.campaign_generation_completion.v1"
     and .generation == $generation and $report[0].generation == $generation
     and .generation_report_sha256 == $report_sha
     and .learning_checkpoint_sha256 == $learning
+    and (.study_handoff_sha256 // "") == $study_handoff
     and $report[0].request_sha256 == $request
     and $report[0].campaign_result_sha256 == $result
     and (.campaign_pod_name | type == "string" and length > 0)
     and (if .outcome == "follow_up" then
       $learned_outcome == "follow_up" and .cycle_result == null
+    elif .outcome == "study_handoff" then
+      $study_handoff != "" and .cycle_result == null
     elif .outcome == "complete" then
       if $learned_outcome == "no_improvement" then
         .cycle_result == ($report[0] + {
@@ -314,6 +398,8 @@ cycle_status() {
       checkpoint_status="complete"
       next_stage=""
       termination_reason="$(jq -er '.cycle_result.termination_reason' "$generation_dir/generation-complete")"
+    elif [[ "$(jq -er '.outcome' "$generation_dir/generation-complete")" == study_handoff ]]; then
+      next_stage="next_generation"
     else
       next_stage="next_generation"
     fi
@@ -417,6 +503,23 @@ fresh_inventory_out=""
 fresh_request_out=""
 fresh_materializer_work_dir=""
 fresh_report_out=""
+study_id=""
+study_target_family_id=""
+study_target_horizon=""
+study_target_start_received_at_ns=""
+study_target_end_received_at_ns=""
+study_target_mission_id=""
+study_target_output_root=""
+study_target_output_prefix=""
+study_target_bucket_ms=""
+study_target_top_depth="5"
+study_target_control=""
+study_target_control_cli=""
+study_retry_authority=false
+study_handoff_consumed=false
+study_proposal_out=""
+study_plan_out=""
+study_proposal_path=""
 
 case "${1:-}" in
   start|approve|ack-readback|status)
@@ -486,6 +589,20 @@ while (($#)); do
     --namespace) [[ "$mode" == "start" ]] || die "$mode loads --namespace from controller state"; namespace="$2"; shift 2 ;;
     --max-follow-ups) [[ "$mode" == "start" ]] || die "$mode loads --max-follow-ups from controller state"; max_follow_ups="$2"; shift 2 ;;
     --job-timeout) [[ "$mode" == "start" ]] || die "$mode loads --job-timeout from controller state"; job_timeout="$2"; shift 2 ;;
+    --study-id) [[ "$mode" == "start" ]] || die "$mode loads --study-id from controller state"; study_id="$2"; shift 2 ;;
+    --study-target-family-id) [[ "$mode" == "start" ]] || die "$mode loads --study-target-family-id from controller state"; study_target_family_id="$2"; shift 2 ;;
+    --study-target-horizon) [[ "$mode" == "start" ]] || die "$mode loads --study-target-horizon from controller state"; study_target_horizon="$2"; shift 2 ;;
+    --study-target-start-received-at-ns) [[ "$mode" == "start" ]] || die "$mode loads study target window from controller state"; study_target_start_received_at_ns="$2"; shift 2 ;;
+    --study-target-end-received-at-ns) [[ "$mode" == "start" ]] || die "$mode loads study target window from controller state"; study_target_end_received_at_ns="$2"; shift 2 ;;
+    --study-target-mission-id) [[ "$mode" == "start" ]] || die "$mode loads --study-target-mission-id from controller state"; study_target_mission_id="$2"; shift 2 ;;
+    --study-target-output-root) [[ "$mode" == "start" ]] || die "$mode loads --study-target-output-root from controller state"; study_target_output_root="$2"; shift 2 ;;
+    --study-target-output-prefix) [[ "$mode" == "start" ]] || die "$mode loads --study-target-output-prefix from controller state"; study_target_output_prefix="$2"; shift 2 ;;
+    --study-target-bucket-ms) [[ "$mode" == "start" ]] || die "$mode loads --study-target-bucket-ms from controller state"; study_target_bucket_ms="$2"; shift 2 ;;
+    --study-target-top-depth) [[ "$mode" == "start" ]] || die "$mode loads --study-target-top-depth from controller state"; study_target_top_depth="$2"; shift 2 ;;
+    --study-target-control) [[ "$mode" == "start" || "$mode" == "approve" || "$mode" == "ack-readback" ]] || die "$mode loads --study-target-control from controller state"; study_target_control="$2"; study_target_control_cli="$2"; shift 2 ;;
+    --study-retry-authority) [[ "$mode" == "approve" || "$mode" == "ack-readback" ]] || die "--study-retry-authority requires approve or ack-readback"; study_retry_authority=true; shift ;;
+    --study-proposal-out) [[ "$mode" == "start" ]] || die "$mode loads --study-proposal-out from controller state"; study_proposal_out="$2"; shift 2 ;;
+    --study-plan-out) [[ "$mode" == "start" ]] || die "$mode loads --study-plan-out from controller state"; study_plan_out="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -508,6 +625,23 @@ if [[ "$mode" == "approve" || "$mode" == "ack-readback" ]]; then
   job_timeout="$(jq -er '.job_timeout' "$state")"
   if [[ "$(jq -r '.input_mode // "receipt"' "$state")" == "fresh" ]]; then
     fresh_mode=true
+    load_fresh_controller_contract "$state"
+  fi
+  if [[ "$(jq -r '.study // null' "$state")" != null ]]; then
+    study_id="$(jq -er '.study.study_id' "$state")"
+    study_target_family_id="$(jq -er '.study.target_family_id' "$state")"
+    study_target_horizon="$(jq -er '.study.target_horizon' "$state")"
+    study_target_start_received_at_ns="$(jq -er '.study.target_start_received_at_ns' "$state")"
+    study_target_end_received_at_ns="$(jq -er '.study.target_end_received_at_ns' "$state")"
+    study_target_mission_id="$(jq -er '.study.target_mission_id' "$state")"
+    study_target_output_root="$(jq -er '.study.target_output_root' "$state")"
+    study_target_output_prefix="$(jq -er '.study.target_output_prefix' "$state")"
+    study_target_bucket_ms="$(jq -er '.study.target_bucket_ms' "$state")"
+    study_target_top_depth="$(jq -er '.study.target_top_depth' "$state")"
+    study_target_control="$(jq -er '.study.target_control' "$state")"
+    [[ -z "$study_target_control_cli" ]] || study_target_control="$study_target_control_cli"
+    study_proposal_out="$(jq -er '.study.proposal_out' "$state")"
+    study_plan_out="$(jq -er '.study.plan_out' "$state")"
   fi
   if [[ -z "$control" ]]; then
     control="$(jq -r '.control // empty' "$state")"
@@ -629,17 +763,21 @@ on_controller_error() {
 trap 'on_controller_error "$?" "$LINENO"' ERR
 
 commit_generation_completion() {
-  local outcome="$1" cycle_result="${2:-null}" learning_sha=""
+  local outcome="$1" cycle_result="${2:-null}" learning_sha="" study_handoff_sha=""
   if [[ -e "$generation_dir/learning-checkpoint.json" ]]; then
     learning_sha="$(sha256_file "$generation_dir/learning-checkpoint.json")"
+  fi
+  if [[ -e "$generation_dir/study-handoff.json" ]]; then
+    study_handoff_sha="$(sha256_file "$generation_dir/study-handoff.json")"
   fi
   jq -n --argjson generation "$generation" --arg outcome "$outcome" \
     --arg pod "$campaign_pod_name" --argjson cycle_result "$cycle_result" \
     --arg report "$(sha256_file "$generation_dir/generation-report.json")" \
-    --arg learning "$learning_sha" '{
+    --arg learning "$learning_sha" --arg study_handoff "$study_handoff_sha" '{
       schema_version:"monday.campaign_generation_completion.v1",
       generation:$generation,outcome:$outcome,campaign_pod_name:$pod,
       generation_report_sha256:$report,learning_checkpoint_sha256:$learning,
+      study_handoff_sha256:$study_handoff,
       cycle_result:$cycle_result
     }' >"$generation_dir/generation-complete.partial"
   mv -f -- "$generation_dir/generation-complete.partial" "$generation_dir/generation-complete"
@@ -702,6 +840,246 @@ oss_publish_readback() {
     --endpoint oss-ap-northeast-1-internal.aliyuncs.com >&2
   cmp -s "$source" "$partial" || die "published learn artifact readback SHA256 mismatch"
   mv -f -- "$partial" "$readback"
+}
+
+study_handoff() {
+  local generation_dir="$1" dispatch_control="$2"
+  local handoff="$generation_dir/study-handoff.json"
+  local study_dir="$generation_dir/study"
+  local target_horizon_buckets target_bucket_ms
+  local target_input_root target_campaign_inputs target_report target_request
+  local target_inventory target_materializer_work target_output_root
+  local proposal="$study_dir/proposal.json" proposal_report="$study_dir/proposal-report.json"
+  local proposal_report_partial="$proposal_report.partial"
+  local plan="$study_dir/research-plan.json" preparation="$study_dir/preparation.json"
+  local proposal_status proposal_reason proposal_fingerprint existing_fingerprint target_control_sha
+  local report_sha archive_path
+  if [[ -s "$handoff" ]]; then
+    jq -e '.schema_version == "monday.campaign_study_handoff.v1"
+      and (.campaign_inputs | type == "string")
+      and (.input_root | type == "string")
+      and (.research_plan | type == "string")
+      and (.proposal | type == "string")
+      and (.target_control | type == "string")
+      and (.target_control_sha256 | type == "string")
+      and (.campaign_inputs_sha256 | type == "string")
+      and (.proposal_sha256 | type == "string")
+      and (.research_plan_sha256 | type == "string")
+      and (.preparation_sha256 | type == "string")' "$handoff" >/dev/null \
+      || die "saved Study handoff is invalid"
+    campaign_inputs="$(jq -er '.campaign_inputs' "$handoff")"
+    input_root="$(jq -er '.input_root' "$handoff")"
+    research_plan="$(jq -er '.research_plan' "$handoff")"
+    study_proposal_path="$(jq -er '.proposal' "$handoff")"
+    study_target_control="$(jq -er '.target_control' "$handoff")"
+    control="$study_target_control"
+    handoff_campaign_inputs_sha256="$(jq -er '.campaign_inputs_sha256' "$handoff")"
+    campaign_inputs_sha256="$handoff_campaign_inputs_sha256"
+    [[ -s "$campaign_inputs" && "$(sha256_file "$campaign_inputs")" == "$handoff_campaign_inputs_sha256" ]] \
+      || die "saved Study handoff campaign inputs changed"
+    [[ -s "$study_proposal_path" \
+      && "$(sha256_file "$study_proposal_path")" == "$(jq -er '.proposal_sha256' "$handoff")" ]] \
+      || die "saved Study handoff proposal changed"
+    [[ -s "$research_plan" \
+      && "$(sha256_file "$research_plan")" == "$(jq -er '.research_plan_sha256' "$handoff")" ]] \
+      || die "saved Study handoff research plan changed"
+    [[ -s "$(jq -er '.preparation' "$handoff")" \
+      && "$(sha256_file "$(jq -er '.preparation' "$handoff")")" == "$(jq -er '.preparation_sha256' "$handoff")" ]] \
+      || die "saved Study handoff preparation changed"
+    [[ -s "$study_target_control" ]] \
+      || die "saved Study handoff target control is missing"
+    [[ "$(sha256_file "$study_target_control")" == "$(jq -er '.target_control_sha256' "$handoff")" ]] \
+      || die "saved Study handoff target control changed"
+    return 0
+  fi
+  [[ -n "$study_id" ]] || die "Study handoff requires --study-id"
+  [[ "$fresh_mode" == true ]] || die "Study handoff requires fresh input materialization settings"
+  [[ -n "$dispatch_control" && -f "$dispatch_control" ]] \
+    || die "Study handoff requires the authenticated parent dispatch control"
+  [[ -s "$study_target_horizon" ]] || die "Study target horizon file is missing"
+  mkdir -p "$study_dir"
+  target_horizon_buckets="$(jq -er '.labels.horizon_buckets' "$study_target_horizon")"
+  target_bucket_ms="$(jq -er '.labels.observation_frequency_millis' "$study_target_horizon")"
+  [[ "$target_bucket_ms" == "$study_target_bucket_ms" ]] \
+    || die "Study target bucket differs from the typed horizon"
+  target_output_root="$(cd "$study_target_output_root" && pwd -P)" \
+    || die "Study target output root does not exist"
+  target_input_root="$target_output_root/$study_target_output_prefix"
+  target_campaign_inputs="$target_input_root/receipts/campaign-inputs.json"
+  target_report="$preparation"
+  target_request="$study_dir/fresh-request.json"
+  target_inventory="$study_dir/frozen.env"
+  target_materializer_work="$study_dir/materializer"
+  if [[ ! -s "$target_report" ]]; then
+    target_prepare_args=(
+      mission prepare-fresh-inputs
+      --raw-root "$fresh_raw_root" \
+      --reference-root "$fresh_reference_root" \
+      --market "$fresh_market" \
+      --symbol "$fresh_symbol" \
+      --image-ref "$fresh_image_ref" \
+      --mission-id "$study_target_mission_id" \
+      --start-received-at-ns "$study_target_start_received_at_ns" \
+      --end-received-at-ns "$study_target_end_received_at_ns" \
+      --output-prefix "$study_target_output_prefix" \
+      --bucket-ms "$study_target_bucket_ms" \
+      --label-horizon-buckets "$target_horizon_buckets" \
+      --top-depth "$study_target_top_depth" \
+      --max-scan-entries "$fresh_max_scan_entries" \
+      --max-inputs "$fresh_max_inputs" \
+      --max-input-bytes "$fresh_max_input_bytes" \
+      --inventory-out "$target_inventory" \
+      --request-out "$target_request" \
+      --campaign-inputs-out "$target_campaign_inputs" \
+      --output-root "$target_output_root" \
+      --materializer "$fresh_materializer" \
+      --materializer-work-dir "$target_materializer_work" \
+      --materializer-timeout-seconds "$fresh_materializer_timeout_seconds" \
+      --max-materializer-output-bytes "$fresh_max_materializer_output_bytes" \
+      --report-out "$target_report"
+    )
+    if [[ -n "$fresh_binary_dir" ]]; then
+      target_prepare_args+=(--binary-dir "$fresh_binary_dir")
+    fi
+    "$alpha_harness" "${target_prepare_args[@]}" >"$study_dir/preparation.stdout"
+  fi
+  [[ -s "$target_report" && -s "$target_campaign_inputs" ]] \
+    || die "Study target materialization did not produce complete evidence"
+  jq -e \
+    --arg mission_id "$study_target_mission_id" \
+    --arg output_prefix "$study_target_output_prefix" \
+    --arg target_root "$target_input_root" \
+    '.schema_version == "monday.cex_fresh_inputs_preparation.v1"
+     and .status == "ready" and .mission_id == $mission_id
+     and .output_prefix == $output_prefix and .input_root == $target_root
+     and .campaign_inputs_path == $target_root + "/receipts/campaign-inputs.json"' \
+    "$target_report" >/dev/null || die "Study target preparation identity is incomplete"
+  target_control_sha="missing"
+  [[ -n "$study_target_control" && -s "$study_target_control" ]] \
+    && target_control_sha="$(sha256_file "$study_target_control")"
+  printf '%s\0' \
+    "$(sha256_file "$generation_dir/campaign-result.json")" \
+    "$(sha256_file "$generation_dir/settlement-report.json")" \
+    "$(sha256_file "$study_target_horizon")" \
+    "$target_control_sha" \
+    "$(sha256_file "$target_campaign_inputs")" >"$study_dir/proposal-fingerprint-input.partial"
+  proposal_fingerprint="$(sha256_file "$study_dir/proposal-fingerprint-input.partial")"
+  rm -f -- "$study_dir/proposal-fingerprint-input.partial"
+  if [[ -s "$proposal_report" ]] \
+    && [[ "$(jq -r '.status // empty' "$proposal_report" 2>/dev/null || true)" == "needs_authority" ]]; then
+    existing_fingerprint=""
+    [[ -s "$study_dir/proposal-fingerprint" ]] \
+      && existing_fingerprint="$(<"$study_dir/proposal-fingerprint")"
+    if [[ "$existing_fingerprint" != "$proposal_fingerprint" || "$study_retry_authority" == true ]]; then
+      report_sha="$(sha256_file "$proposal_report")"
+      archive_path="$study_dir/proposal-report.needs-authority.$existing_fingerprint.$report_sha.json"
+      if [[ -e "$archive_path" ]]; then
+        cmp -s "$proposal_report" "$archive_path" \
+          || die "existing Study needs-authority archive differs: $archive_path"
+      else
+        cp -- "$proposal_report" "$archive_path"
+      fi
+      rm -f -- "$proposal_report" "$proposal" "$study_dir/proposal.report.json"
+      study_retry_authority=false
+    fi
+  fi
+  if [[ ! -s "$proposal_report" ]]; then
+    rm -f -- "$proposal_report_partial"
+    "$alpha_harness" mission campaign-study-propose \
+      --parent-submission "$generation_dir/submission.json" \
+      --parent-result "$generation_dir/campaign-result.json" \
+      --parent-settlement "$generation_dir/settlement-report.json" \
+      --parent-control "$dispatch_control" \
+      --parent-namespace "$namespace" \
+      --study-id "$study_id" \
+      --target-family-id "$study_target_family_id" \
+      --target-horizon "$study_target_horizon" \
+      --target-campaign-inputs "$target_campaign_inputs" \
+      --target-input-root "$target_input_root" \
+      --target-start-received-at-ns "$study_target_start_received_at_ns" \
+      --target-end-received-at-ns "$study_target_end_received_at_ns" \
+      --target-mission-id "$study_target_mission_id" \
+      --target-output-prefix "$study_target_output_prefix" \
+      --target-bucket-ms "$study_target_bucket_ms" \
+      --target-top-depth "$study_target_top_depth" \
+      --output "$proposal" \
+      --research-plan-output "$plan" >"$proposal_report_partial"
+    mv -f -- "$proposal_report_partial" "$proposal_report"
+    printf '%s\n' "$proposal_fingerprint" >"$study_dir/proposal-fingerprint"
+  fi
+  proposal_status="$(jq -er '.status' "$proposal_report")"
+  if [[ "$proposal_status" == "needs_authority" ]]; then
+    proposal_reason="$(jq -r '.reason // "unknown"' "$proposal_report")"
+    jq -n \
+      --arg reason "$proposal_reason" \
+      --arg parent "$generation_dir/settlement-report.json" \
+      --arg proposal_report "$proposal_report" \
+      --arg preparation "$target_report" \
+      '{
+        schema_version:"monday.campaign_cycle_needs_authority.v1",
+        status:"needs_authority",reason:("study_" + $reason),
+        parent_settlement:$parent,study_proposal_report:$proposal_report,
+        target_preparation:$preparation,preparation_preserved:true,resume_ready:true
+      }' >"$generation_dir/needs-authority.json"
+    log_event needs_authority "generation=$current_generation" \
+      "stage=study_handoff" "reason=$proposal_reason" \
+      "artifact=$generation_dir/needs-authority.json"
+    jq . "$generation_dir/needs-authority.json"
+    exit 0
+  fi
+  [[ "$proposal_status" == "ready" && -s "$proposal" && -s "$plan" ]] \
+    || die "Study proposal did not produce a ready immutable handoff"
+  if [[ -z "$study_target_control" || ! -s "$study_target_control" ]]; then
+    jq -n \
+      --arg parent "$generation_dir/settlement-report.json" \
+      --arg proposal_report "$proposal_report" \
+      --arg preparation "$target_report" \
+      '{
+        schema_version:"monday.campaign_cycle_needs_authority.v1",
+        status:"needs_authority",reason:"study_target_dispatch_control_missing",
+        parent_settlement:$parent,study_proposal_report:$proposal_report,
+        target_preparation:$preparation,preparation_preserved:true,resume_ready:true
+      }' >"$generation_dir/needs-authority.json"
+    log_event needs_authority "generation=$current_generation" \
+      "stage=study_handoff" "reason=study_target_dispatch_control_missing" \
+      "artifact=$generation_dir/needs-authority.json"
+    jq . "$generation_dir/needs-authority.json"
+    exit 0
+  fi
+  jq -e '.campaign_inputs_path != null and .materialization_path != null' \
+    "$study_target_control" >/dev/null \
+    || die "Study target dispatch control must bind campaign inputs and materialization paths"
+  campaign_inputs="$target_campaign_inputs"
+  input_root="$target_input_root"
+  research_plan="$plan"
+  study_proposal_path="$proposal"
+  control="$study_target_control"
+  campaign_inputs_sha256="$(sha256_file "$campaign_inputs")"
+  jq -n \
+    --arg campaign_inputs "$campaign_inputs" \
+    --arg campaign_inputs_sha256 "$campaign_inputs_sha256" \
+    --arg input_root "$input_root" \
+    --arg research_plan "$research_plan" \
+    --arg proposal "$proposal" \
+    --arg proposal_report "$proposal_report" \
+    --arg preparation "$target_report" \
+    --arg target_control "$study_target_control" \
+    --arg target_control_sha256 "$(sha256_file "$study_target_control")" \
+    --arg proposal_sha256 "$(sha256_file "$proposal")" \
+    --arg research_plan_sha256 "$(sha256_file "$plan")" \
+    --arg preparation_sha256 "$(sha256_file "$target_report")" \
+    '{
+      schema_version:"monday.campaign_study_handoff.v1",
+      campaign_inputs:$campaign_inputs,campaign_inputs_sha256:$campaign_inputs_sha256,
+      input_root:$input_root,research_plan:$research_plan,proposal:$proposal,
+      proposal_report:$proposal_report,preparation:$preparation,
+      target_control:$target_control,
+      target_control_sha256:$target_control_sha256,
+      proposal_sha256:$proposal_sha256,
+      research_plan_sha256:$research_plan_sha256,
+      preparation_sha256:$preparation_sha256
+    }' >"$handoff.partial"
+  mv -f -- "$handoff.partial" "$handoff"
 }
 
 verify_kubernetes_provenance() {
@@ -819,6 +1197,7 @@ else
   seeds_json="$(printf '%s\n' "${seeds[@]}" | jq -R 'tonumber' | jq -s '.')"
   state_tmp="$state.partial.$$"
   fresh_state_json=null
+  study_state_json=null
   input_mode=receipt
   if [[ "$fresh_mode" == true ]]; then
     input_mode=fresh
@@ -827,6 +1206,17 @@ else
     else
       fresh_state_json="$(jq -c '.fresh' "$state")"
     fi
+  fi
+  if [[ -n "$study_id" ]]; then
+    [[ -n "$study_target_family_id" && -n "$study_target_horizon" \
+      && -n "$study_target_start_received_at_ns" && -n "$study_target_end_received_at_ns" \
+      && -n "$study_target_mission_id" && -n "$study_target_output_root" \
+      && -n "$study_target_output_prefix" && -n "$study_target_bucket_ms" ]] \
+      || die "all Study target window and materialization arguments are required"
+    [[ -s "$study_target_horizon" ]] || die "Study target horizon file is missing: $study_target_horizon"
+    [[ -n "$study_proposal_out" ]] || study_proposal_out="$work_dir/study-proposal.json"
+    [[ -n "$study_plan_out" ]] || study_plan_out="$work_dir/study-plan.json"
+    build_study_controller_contract
   fi
   jq -n \
     --arg campaign_inputs "$campaign_inputs" \
@@ -840,19 +1230,29 @@ else
     --arg control "$control" \
     --arg input_mode "$input_mode" \
     --argjson fresh "$fresh_state_json" \
+    --argjson study "$study_state_json" \
     --argjson max_follow_ups "$max_follow_ups" \
     --arg job_timeout "$job_timeout" \
     --argjson seeds "$seeds_json" \
     '{campaign_inputs:$campaign_inputs,campaign_inputs_sha256:$campaign_inputs_sha256,input_root:$input_root,source_revision:$source_revision,image:$image,campaign_root:$campaign_root,context:$context,namespace:$namespace,max_follow_ups:$max_follow_ups,job_timeout:$job_timeout,seeds:$seeds}
      + (if $input_mode == "fresh" then {input_mode:"fresh",fresh:$fresh,control:(if $control == "" then null else $control end)}
-        elif $control == "" then {} else {control:$control} end)' \
+        elif $control == "" then {} else {control:$control} end)
+     + (if $study == null then {} else {study:$study} end)' \
     >"$state_tmp"
   if [[ -e "$state" ]]; then
     # Preserve historical checkpoints; only the retired token budget is irrelevant.
-    jq -e -s 'length == 2 and ((.[0] | del(.control)) == (.[1] | del(.max_tokens,.control)))' \
+    jq -e -s '
+      def comparable:
+        del(.control,.max_tokens,.study.target_control,.study.handoff_consumed);
+      length == 2 and ((.[0] | comparable) == (.[1] | comparable))
+    ' \
       "$state_tmp" "$state" >/dev/null \
       || die "existing work directory belongs to different controller inputs"
-    rm -f -- "$state_tmp"
+    if [[ -n "$study_target_control_cli" ]]; then
+      mv -f -- "$state_tmp" "$state"
+    else
+      rm -f -- "$state_tmp"
+    fi
   else
     mv -- "$state_tmp" "$state"
   fi
@@ -942,6 +1342,16 @@ while ((generation <= max_follow_ups)); do
       jq . "$work_dir/cycle-result.json"
       exit 0
     fi
+    if [[ "$(jq -er '.outcome' "$generation_dir/generation-complete")" == study_handoff ]]; then
+      dispatch_control="${dispatch_control:-$control}"
+      if [[ -z "$dispatch_control" ]]; then
+        dispatch_control="$(printenv MONDAY_CAMPAIGN_CONTROL 2>/dev/null || true)"
+      fi
+      study_handoff "$generation_dir" "$dispatch_control"
+      mark_study_handoff_consumed
+      generation=$((generation + 1))
+      continue
+    fi
     research_plan="$generation_dir/next-research-plan.json"
     [[ -s "$research_plan" ]] || die "completed generation is missing its follow-up plan"
     if [[ "$mode" == ack-readback \
@@ -975,6 +1385,9 @@ while ((generation <= max_follow_ups)); do
     freeze_args+=(--seed "$seed")
   done
   [[ -z "$research_plan" ]] || freeze_args+=(--research-plan "$research_plan")
+  if [[ -n "$study_proposal_path" && -s "$study_proposal_path" ]]; then
+    freeze_args+=(--study-proposal "$study_proposal_path")
+  fi
   if [[ ! -e "$generation_dir/frozen" ]]; then
     controller_stage="freeze"
     log_event stage_started "generation=$generation" "stage=freeze"
@@ -1067,8 +1480,8 @@ while ((generation <= max_follow_ups)); do
       exit 0
     fi
     dispatch_control_args=()
-    if [[ -n "$control" ]]; then
-      dispatch_control_args=(--control "$control")
+    if [[ -n "$dispatch_control" ]]; then
+      dispatch_control_args=(--control "$dispatch_control")
     fi
     "$alpha_harness" mission dispatch submit \
       "${dispatch_control_args[@]}" \
@@ -1332,6 +1745,32 @@ while ((generation <= max_follow_ups)); do
       "campaign_result_sha256=$result_sha256"
     jq . "$work_dir/cycle-result.json"
     exit 0
+  fi
+
+  if [[ -n "$study_id" && "$study_handoff_consumed" != true ]]; then
+    controller_stage="study_handoff"
+    log_event stage_started \
+      "generation=$generation" "stage=study_handoff" \
+      "parent_campaign_id=$campaign_id" "parent_result_sha256=$result_sha256"
+    dispatch_control="${dispatch_control:-$control}"
+    if [[ -z "$dispatch_control" ]]; then
+      dispatch_control="$(printenv MONDAY_CAMPAIGN_CONTROL 2>/dev/null || true)"
+    fi
+    study_handoff "$generation_dir" "$dispatch_control"
+    commit_generation_completion study_handoff
+    mark_study_handoff_consumed
+    rm -f -- "$request" "$submission"
+    if [[ "$mode" == ack-readback ]]; then
+      controller_stage="approval_handoff"
+      log_event stage_completed \
+        "generation=$generation" "stage=approval_handoff" \
+        "next_generation=$((generation + 1))" \
+        "study_proposal=$(sha256_file "$study_proposal_path")"
+      cycle_status "$work_dir"
+      exit 0
+    fi
+    generation=$((generation + 1))
+    continue
   fi
 
   research_plan="$generation_dir/next-research-plan.json"

@@ -13,6 +13,14 @@ use crate::{
         validate_cluster_target, validate_dns_label,
     },
 };
+use alpha_domain::{
+    campaign_control::{verify_campaign_root_grant, SignedCampaignRootGrantV1},
+    campaign_horizon::CampaignNextFamilyParentV1,
+};
+use alpha_store::campaign_ledger::{
+    CampaignLedgerEventV1, CampaignStudyLedgerEventV1, CampaignStudySnapshotV1,
+};
+use alpha_store::AlphaStore;
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -22,7 +30,24 @@ use std::path::Path;
 const MAX_SUBMISSION_BYTES: u64 = 1024 * 1024;
 const ACTIVE_DEADLINE_SECONDS: u64 = 21_608;
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug)]
+pub(crate) struct AuthenticatedCampaignParent {
+    pub(crate) parent: CampaignNextFamilyParentV1,
+    pub(crate) study_grant: alpha_domain::campaign_study::SignedCampaignStudyGrantV1,
+    pub(crate) request: CampaignRequest,
+}
+
+#[derive(Debug, Deserialize)]
+struct SettlementReadback {
+    status: String,
+    operation_id: String,
+    request_sha256: String,
+    campaign_result_sha256: String,
+    job_uid: Option<String>,
+    pod_uid: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct MissionDispatchSubmission {
     attempt_id: String,
@@ -133,6 +158,147 @@ pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
         report.clone(),
     );
     print_json(&report)
+}
+
+/// Read back the parent terminal through the authenticated dispatch ledger.
+/// Caller-provided hashes are only cross-checks; the family and Study receipts
+/// are the source of truth for a next-family proposal.
+pub(crate) fn read_authenticated_campaign_parent(
+    control_path: &Path,
+    submission_path: &Path,
+    result_path: &Path,
+    settlement_path: &Path,
+    study_id: &str,
+    namespace: &str,
+) -> anyhow::Result<AuthenticatedCampaignParent> {
+    let control = admission::read_control(control_path)?;
+    let submission = load_submission(submission_path)?;
+    let validated = validate_submission(submission)?;
+    let manifest = render_manifest(&validated, namespace)?;
+    let inspection = admission::inspect_binding(
+        &validated,
+        &manifest,
+        &control.materialization_path,
+        &control.controller_image,
+        control.attempt_ordinal,
+    )?;
+    let signed: SignedCampaignRootGrantV1 = admission::read_json(&control.signed_root_grant_path)?;
+    // The parent is historical evidence.  Authenticate its signature at a
+    // point inside the grant's own validity window, while the ledger record
+    // below supplies the actual settled identity.  Current-time admission is
+    // reserved for the target dispatch path.
+    verify_campaign_root_grant(
+        &signed,
+        &admission::read_trusted_keys(&control.trusted_keys_path)?,
+        signed.grant.expires_at - chrono::TimeDelta::seconds(1),
+    )?;
+    let store = AlphaStore::open(&control.ledger_path)?;
+    let reservation = inspection
+        .historical_reservation_for(&signed.content_sha256, &signed.grant.family.family_id);
+    let operation_id = reservation.operation_id()?;
+    let record = store.campaign_dispatch_record(&reservation.family_id, &operation_id)?;
+    if record.root.signed_grant() != &signed || record.reservation != reservation {
+        bail!("parent dispatch ledger differs from the finalized submission");
+    }
+    let settlement = record
+        .settlement
+        .clone()
+        .context("parent dispatch has no durable settlement")?;
+    let terminal_job_uid = record
+        .claim
+        .job_uid
+        .clone()
+        .context("parent dispatch has no durable Job UID")?;
+    let terminal_pod_uid = record
+        .terminal_pod_uid
+        .clone()
+        .context("parent dispatch has no independently read-back terminal Pod UID")?;
+    let result_sha256 = hex::encode(Sha256::digest(admission::read_bounded(
+        result_path,
+        MAX_SUBMISSION_BYTES,
+    )?));
+    if result_sha256 != settlement.evidence_sha256 {
+        bail!("parent terminal result differs from the settled ledger evidence");
+    }
+    let readback: SettlementReadback = admission::read_json(settlement_path)?;
+    if readback.status != "settled"
+        || readback.operation_id != operation_id
+        || readback.request_sha256 != reservation.request_sha256
+        || readback.campaign_result_sha256 != result_sha256
+        || readback.job_uid.as_deref() != Some(terminal_job_uid.as_str())
+        || readback.pod_uid.as_deref() != Some(terminal_pod_uid.as_str())
+    {
+        bail!("parent settlement readback differs from the authenticated ledger");
+    }
+    let family_receipt_sha256 = store
+        .campaign_family_receipts(&reservation.family_id)?
+        .into_iter()
+        .find_map(|receipt| match &receipt.receipt.event {
+            CampaignLedgerEventV1::DispatchSettled { evidence }
+                if evidence.settlement == settlement =>
+            {
+                Some(receipt.content_sha256)
+            }
+            CampaignLedgerEventV1::AttemptSettled {
+                settlement: observed,
+            } if observed == &settlement => Some(receipt.content_sha256),
+            _ => None,
+        })
+        .context("parent settlement is missing from the authenticated family ledger")?;
+    let study_snapshot: CampaignStudySnapshotV1 = store.campaign_study_snapshot(study_id)?;
+    let study_grant = store
+        .campaign_study_grant(study_id)?
+        .context("parent family has no authenticated Study grant")?;
+    let member = study_grant
+        .grant
+        .members
+        .iter()
+        .find(|member| {
+            member.family_id == reservation.family_id
+                && member.root_grant_sha256 == reservation.root_grant_sha256
+        })
+        .context("parent family is not a finite member of the authenticated Study")?;
+    let study_receipt_sha256 = study_snapshot
+        .receipts
+        .iter()
+        .find_map(|receipt| match &receipt.receipt.event {
+            CampaignStudyLedgerEventV1::AttemptSettled {
+                family_id,
+                settlement: observed,
+                family_receipt_sha256: linked_family_receipt_sha256,
+            } if family_id == &reservation.family_id
+                && observed == &settlement
+                && linked_family_receipt_sha256 == &family_receipt_sha256 =>
+            {
+                Some(receipt.content_sha256.clone())
+            }
+            _ => None,
+        })
+        .context("parent settlement is missing from the authenticated Study ledger")?;
+    if member.execution != reservation.execution {
+        bail!("parent root execution input differs from its finite Study member");
+    }
+    let parent = CampaignNextFamilyParentV1 {
+        campaign_id: reservation.campaign_id,
+        family_id: reservation.family_id,
+        root_grant_sha256: reservation.root_grant_sha256,
+        request_sha256: reservation.request_sha256,
+        campaign_inputs_sha256: validated.submission.request.campaign_inputs_sha256.clone(),
+        campaign_result_sha256: result_sha256,
+        family_settlement_receipt_sha256: family_receipt_sha256,
+        study_settlement_receipt_sha256: study_receipt_sha256.clone(),
+        study_snapshot_sha256: admission::study_prefix_identity(
+            &study_snapshot,
+            &study_receipt_sha256,
+        )?,
+        terminal_job_uid,
+        terminal_pod_uid,
+    };
+    Ok(AuthenticatedCampaignParent {
+        parent,
+        study_grant,
+        request: validated.submission.request,
+    })
 }
 
 pub(super) trait DispatchAdmission {
@@ -1583,7 +1749,9 @@ mod tests {
 
     impl AdmissionFixture {
         fn new() -> Self {
+            use crate::mission_render::CexCampaignSearchPolicyRevisionV1;
             use alpha_domain::campaign_control::*;
+            use alpha_domain::campaign_horizon::CampaignLabelHorizonV1;
             use alpha_domain::campaign_study::*;
             use alpha_store::{AlphaStore, ApprovalRecord};
             use chrono::{TimeDelta, Utc};
@@ -1594,6 +1762,85 @@ mod tests {
             submission.request = crate::mission_campaign::request_for_materialization_for_tests(
                 &inputs.materialization_path,
             );
+            let old_campaign_id = submission.request.campaign_id.clone();
+            let materialization_metadata: Value =
+                serde_json::from_slice(&std::fs::read(&inputs.materialization_path).unwrap())
+                    .unwrap();
+            let campaign_inputs_path = inputs._root.path().join("campaign-inputs.json");
+            std::fs::write(
+                &campaign_inputs_path,
+                serde_json::to_vec(&json!({
+                    "mission_id": materialization_metadata["mission_id"],
+                    "output_prefix": "target",
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            submission.request.campaign_inputs_sha256 =
+                crate::mission_runner::sha256_file(&campaign_inputs_path).unwrap();
+            submission.request.research_plan.label_horizon =
+                Some(alpha_domain::campaign_horizon::CampaignLabelHorizonV1::canonical());
+            submission.request.campaign_id =
+                crate::mission_campaign::expected_campaign_id(&submission.request).unwrap();
+            for round in &mut submission.request.rounds {
+                round.mission_put_url = round
+                    .mission_put_url
+                    .replace(&old_campaign_id, &submission.request.campaign_id);
+                round.mission_readback_url = round
+                    .mission_readback_url
+                    .replace(&old_campaign_id, &submission.request.campaign_id);
+                round.result_put_url = round
+                    .result_put_url
+                    .replace(&old_campaign_id, &submission.request.campaign_id);
+                round.result_readback_url = round
+                    .result_readback_url
+                    .replace(&old_campaign_id, &submission.request.campaign_id);
+            }
+            submission.request.campaign_result_put_url = submission
+                .request
+                .campaign_result_put_url
+                .replace(&old_campaign_id, &submission.request.campaign_id);
+            submission.request.campaign_result_readback_url = submission
+                .request
+                .campaign_result_readback_url
+                .replace(&old_campaign_id, &submission.request.campaign_id);
+            let data_fingerprint = crate::mission_campaign::campaign_data_fingerprint_sha256(
+                &submission.request.campaign_inputs_sha256,
+                &submission.request.producer_source_revision,
+                &submission.request.feature_sha256,
+                &submission.request.materialization_sha256,
+                &submission.request.replay_artifact_sha256,
+                &submission.request.replay_manifest_sha256,
+            )
+            .unwrap();
+            for round in &mut submission.request.rounds {
+                round.identity.data_fingerprint_sha256 = data_fingerprint.clone();
+            }
+            let previous_campaign_id = submission.request.campaign_id.clone();
+            submission.request.campaign_id =
+                crate::mission_campaign::expected_campaign_id(&submission.request).unwrap();
+            for round in &mut submission.request.rounds {
+                round.mission_put_url = round
+                    .mission_put_url
+                    .replace(&previous_campaign_id, &submission.request.campaign_id);
+                round.mission_readback_url = round
+                    .mission_readback_url
+                    .replace(&previous_campaign_id, &submission.request.campaign_id);
+                round.result_put_url = round
+                    .result_put_url
+                    .replace(&previous_campaign_id, &submission.request.campaign_id);
+                round.result_readback_url = round
+                    .result_readback_url
+                    .replace(&previous_campaign_id, &submission.request.campaign_id);
+            }
+            submission.request.campaign_result_put_url = submission
+                .request
+                .campaign_result_put_url
+                .replace(&previous_campaign_id, &submission.request.campaign_id);
+            submission.request.campaign_result_readback_url = submission
+                .request
+                .campaign_result_readback_url
+                .replace(&previous_campaign_id, &submission.request.campaign_id);
             let validated = validate_submission(submission).unwrap();
             let manifest = render_manifest(&validated, "monday-research").unwrap();
             let controller_image = format!("registry/controller@sha256:{}", "e".repeat(64));
@@ -1619,10 +1866,10 @@ mod tests {
                 },
                 execution_scope: CampaignExecutionScope::PreHoldout,
                 execution: serde_json::from_value(inspection["execution"].clone()).unwrap(),
-                allowed_policy_revision_ids: BTreeSet::from([inspection["policy_revision_id"]
-                    .as_str()
-                    .unwrap()
-                    .into()]),
+                allowed_policy_revision_ids: BTreeSet::from([
+                    inspection["policy_revision_id"].as_str().unwrap().into(),
+                    format!("cex-search-policy-{}", "f".repeat(64)),
+                ]),
                 max_follow_ups: 1,
                 budget: CampaignRootBudgetV1 {
                     max_trials: 1000,
@@ -1635,6 +1882,33 @@ mod tests {
             };
             let signing_key = SigningKey::from_bytes(&[19; 32]);
             let signed = sign_campaign_root_grant(grant, "operator".into(), &signing_key).unwrap();
+            let mut target_allowed_policy_revision_ids =
+                signed.grant.allowed_policy_revision_ids.clone();
+            target_allowed_policy_revision_ids.extend(
+                CexCampaignSearchPolicyRevisionV1::bounded_allowlist()
+                    .into_iter()
+                    .map(|revision| revision.revision_id),
+            );
+            let target_grant = CampaignRootGrantV1 {
+                schema_version: ROOT_GRANT_SCHEMA.into(),
+                root_id: "dispatch-target-root".into(),
+                family: CampaignFamilyPolicyV1 {
+                    family_id: "dispatch-target".into(),
+                    definition_sha256: "c".repeat(64),
+                    max_trials: 1000,
+                },
+                execution_scope: signed.grant.execution_scope.clone(),
+                execution: signed.grant.execution.clone(),
+                allowed_policy_revision_ids: target_allowed_policy_revision_ids,
+                max_follow_ups: 1,
+                budget: signed.grant.budget.clone(),
+                valid_from: signed.grant.valid_from,
+                expires_at: signed.grant.expires_at,
+            };
+            let target_key = SigningKey::from_bytes(&[29; 32]);
+            let signed_target =
+                sign_campaign_root_grant(target_grant, "target-operator".into(), &target_key)
+                    .unwrap();
             let root = inputs._root.path();
             std::fs::write(
                 root.join("grant.json"),
@@ -1642,10 +1916,16 @@ mod tests {
             )
             .unwrap();
             std::fs::write(
+                root.join("target-grant.json"),
+                serde_json::to_vec(&signed_target).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
                 root.join("keys.json"),
-                serde_json::to_vec(
-                    &json!({ "operator": hex::encode(signing_key.verifying_key().as_bytes()) }),
-                )
+                serde_json::to_vec(&json!({
+                    "operator": hex::encode(signing_key.verifying_key().as_bytes()),
+                    "target-operator": hex::encode(target_key.verifying_key().as_bytes()),
+                }))
                 .unwrap(),
             )
             .unwrap();
@@ -1673,22 +1953,64 @@ mod tests {
             store
                 .register_campaign_root(&verified_root, &approval.approval_id, now)
                 .unwrap();
+            let target_approval = ApprovalRecord {
+                approval_id: "dispatch-target-approval".into(),
+                approval_class: "campaign_root".into(),
+                subject_id: signed_target.grant.root_id.clone(),
+                payload: json!({
+                    "grant_sha256": signed_target.content_sha256,
+                    "family_id": signed_target.grant.family.family_id,
+                }),
+                signer_id: Some("target-operator".into()),
+                valid_from: Some(signed_target.grant.valid_from),
+                expires_at: Some(signed_target.grant.expires_at),
+                revoked_at: None,
+                revoked_by: None,
+                revocation_reason: None,
+                created_at: signed_target.grant.valid_from,
+            };
+            store.record_approval(&target_approval).unwrap();
+            let verified_target = verify_campaign_root_grant(
+                &signed_target,
+                &BTreeMap::from([("target-operator".into(), target_key.verifying_key())]),
+                now,
+            )
+            .unwrap();
+            store
+                .register_campaign_root(&verified_target, &target_approval.approval_id, now)
+                .unwrap();
             let study_id = "dispatch-study-budget".to_string();
+            let target_horizon_sha256 = CampaignLabelHorizonV1::canonical().content_hash().unwrap();
             let study_grant = CampaignStudyGrantV1 {
                 schema_version: STUDY_GRANT_SCHEMA.into(),
                 study_id: study_id.clone(),
-                members: vec![CampaignStudyMemberV1 {
-                    family_id: signed.grant.family.family_id.clone(),
-                    root_grant_sha256: signed.content_sha256.clone(),
-                    family_definition_sha256: signed.grant.family.definition_sha256.clone(),
-                    family_max_trials: signed.grant.family.max_trials,
-                    execution_scope: signed.grant.execution_scope.clone(),
-                    execution: signed.grant.execution.clone(),
-                    label_horizon_sha256: "b".repeat(64),
-                }],
+                members: vec![
+                    CampaignStudyMemberV1 {
+                        family_id: signed.grant.family.family_id.clone(),
+                        root_grant_sha256: signed.content_sha256.clone(),
+                        family_definition_sha256: signed.grant.family.definition_sha256.clone(),
+                        family_max_trials: signed.grant.family.max_trials,
+                        execution_scope: signed.grant.execution_scope.clone(),
+                        execution: signed.grant.execution.clone(),
+                        label_horizon_sha256: target_horizon_sha256.clone(),
+                    },
+                    CampaignStudyMemberV1 {
+                        family_id: signed_target.grant.family.family_id.clone(),
+                        root_grant_sha256: signed_target.content_sha256.clone(),
+                        family_definition_sha256: signed_target
+                            .grant
+                            .family
+                            .definition_sha256
+                            .clone(),
+                        family_max_trials: signed_target.grant.family.max_trials,
+                        execution_scope: signed_target.grant.execution_scope.clone(),
+                        execution: signed_target.grant.execution.clone(),
+                        label_horizon_sha256: target_horizon_sha256,
+                    },
+                ],
                 budget: CampaignStudyBudgetV1 {
                     max_trials: 1000,
-                    max_job_attempts: 2,
+                    max_job_attempts: 3,
                     max_job_seconds: 100_000,
                     max_llm_tokens: 0,
                 },
@@ -1739,6 +2061,11 @@ mod tests {
             for sequence in 1..=12 {
                 let key = format!(
                     "research/campaign-ledger/study-id=dispatch-study-budget/sequence={sequence:020}/receipt.json"
+                );
+                let url = format!("{origin}/{key}?signature=fixture-only");
+                access.insert(key, json!({"put_url": url, "readback_url": url}));
+                let key = format!(
+                    "research/campaign-ledger/family-id=dispatch-target/sequence={sequence:020}/receipt.json"
                 );
                 let url = format!("{origin}/{key}?signature=fixture-only");
                 access.insert(key, json!({"put_url": url, "readback_url": url}));
@@ -2226,6 +2553,668 @@ mod tests {
         drop(gate);
         assert_eq!(fixture.usage().consumed_trials, 20);
         assert_eq!(fixture.usage().job_attempts, 1);
+    }
+
+    #[test]
+    fn study_admission_accepts_distinct_target_and_rejects_tampered_parent_evidence() {
+        use alpha_domain::campaign_control::{
+            CampaignAttemptOutcomeV1, CampaignAttemptSettlementV1,
+        };
+        use alpha_domain::campaign_horizon::{
+            CampaignLabelHorizonV1, CampaignNextFamilyInputWindowV1, CampaignNextFamilyParentV1,
+            CampaignNextFamilyProposalV1, CAMPAIGN_NEXT_FAMILY_PROPOSAL_SCHEMA_V1,
+        };
+        use alpha_store::campaign_ledger::CampaignDispatchSettlementV1;
+
+        let fixture = AdmissionFixture::new();
+        let mut gate = fixture.open();
+        gate.prepare().unwrap();
+        gate.publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
+        gate.claim().unwrap();
+        gate.publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
+        gate.bind_job("job-uid-1").unwrap();
+        gate.publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
+        let attempt = gate.reservation.clone();
+        drop(gate);
+        let mut gate = admission::Admission::open_for_settlement(
+            &fixture.control,
+            &fixture.validated,
+            &fixture.manifest,
+            "research-context",
+            "monday-research",
+        )
+        .unwrap();
+        gate.settle(&CampaignDispatchSettlementV1 {
+            job_uid: "job-uid-1".into(),
+            pod_uid: "pod-uid-1".into(),
+            settlement: CampaignAttemptSettlementV1 {
+                operation_id: attempt.operation_id().unwrap(),
+                reservation_sha256: attempt.content_hash().unwrap(),
+                evidence_sha256: "b".repeat(64),
+                outcome: CampaignAttemptOutcomeV1::NoCandidate,
+                consumed_trials: Some(20),
+            },
+        })
+        .unwrap();
+        gate.publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
+        drop(gate);
+
+        let control = admission::read_control(&fixture.control).unwrap();
+        let signed_root: alpha_domain::campaign_control::SignedCampaignRootGrantV1 =
+            admission::read_json(&control.signed_root_grant_path).unwrap();
+        let store = alpha_store::AlphaStore::open(&control.ledger_path).unwrap();
+        let family_receipt = store
+            .campaign_family_receipts(&attempt.family_id)
+            .unwrap()
+            .into_iter()
+            .find(|receipt| {
+                matches!(
+                    &receipt.receipt.event,
+                    alpha_store::campaign_ledger::CampaignLedgerEventV1::DispatchSettled {
+                        evidence
+                    } if evidence.settlement == store
+                        .campaign_dispatch_record(&attempt.family_id, &attempt.operation_id().unwrap())
+                        .unwrap()
+                        .settlement
+                        .clone()
+                        .unwrap()
+                )
+            })
+            .unwrap();
+        let study_snapshot = store
+            .campaign_study_snapshot("dispatch-study-budget")
+            .unwrap();
+        let study_receipt = study_snapshot
+            .receipts
+            .iter()
+            .find(|receipt| {
+                matches!(
+                    &receipt.receipt.event,
+                    alpha_store::campaign_ledger::CampaignStudyLedgerEventV1::AttemptSettled {
+                        family_id, settlement, ..
+                    } if family_id == &attempt.family_id && settlement.operation_id == attempt.operation_id().unwrap()
+                )
+            })
+            .unwrap();
+        let signed_study = store
+            .campaign_study_grant("dispatch-study-budget")
+            .unwrap()
+            .unwrap();
+        let horizon = CampaignLabelHorizonV1::canonical();
+        let parent = CampaignNextFamilyParentV1 {
+            campaign_id: attempt.campaign_id.clone(),
+            family_id: attempt.family_id.clone(),
+            root_grant_sha256: signed_root.content_sha256.clone(),
+            request_sha256: attempt.request_sha256.clone(),
+            campaign_inputs_sha256: attempt.execution.campaign_inputs_sha256.clone(),
+            campaign_result_sha256: "b".repeat(64),
+            family_settlement_receipt_sha256: family_receipt.content_sha256.clone(),
+            study_settlement_receipt_sha256: study_receipt.content_sha256.clone(),
+            study_snapshot_sha256: admission::study_prefix_identity(
+                &study_snapshot,
+                &study_receipt.content_sha256,
+            )
+            .unwrap(),
+            terminal_job_uid: "job-uid-1".into(),
+            terminal_pod_uid: "pod-uid-1".into(),
+        };
+        let proposal = CampaignNextFamilyProposalV1 {
+            schema_version: CAMPAIGN_NEXT_FAMILY_PROPOSAL_SCHEMA_V1.into(),
+            study_id: "dispatch-study-budget".into(),
+            study_grant_sha256: signed_study.content_sha256.clone(),
+            parent,
+            target_family_id: "target-family".into(),
+            target_root_grant_sha256: "c".repeat(64),
+            target_member_sha256: "d".repeat(64),
+            target_execution: attempt.execution.clone(),
+            target_horizon_sha256: horizon.content_hash().unwrap(),
+            target_horizon: horizon,
+            target_window: CampaignNextFamilyInputWindowV1 {
+                mission_id: "target-mission".into(),
+                output_prefix: "target".into(),
+                start_received_at_ns: 1,
+                end_received_at_ns: 2,
+                bucket_ms: 1_000,
+                top_depth: 5,
+            },
+            target_research_plan_sha256: "e".repeat(64),
+        };
+        assert_ne!(proposal.parent.family_id, proposal.target_family_id);
+        admission::validate_parent_settlement_binding(&store, &signed_study, &proposal).unwrap();
+        let parent_record = store
+            .campaign_dispatch_record(&attempt.family_id, &attempt.operation_id().unwrap())
+            .unwrap();
+        drop(store);
+        let mut advanced_store = alpha_store::AlphaStore::open(&control.ledger_path).unwrap();
+        let mut target_attempt = attempt.clone();
+        target_attempt.campaign_id = "target-campaign".into();
+        target_attempt.generation = 1;
+        target_attempt.parent_result_sha256 = Some("b".repeat(64));
+        target_attempt.attempt_ordinal = 0;
+        target_attempt.request_sha256 = "c".repeat(64);
+        target_attempt.policy_revision_id = format!("cex-search-policy-{}", "f".repeat(64));
+        advanced_store
+            .reserve_campaign_attempt(&parent_record.root, &target_attempt, chrono::Utc::now())
+            .unwrap();
+        admission::validate_parent_settlement_binding(&advanced_store, &signed_study, &proposal)
+            .unwrap();
+        let mut substituted_root = proposal.clone();
+        substituted_root.parent.root_grant_sha256 = "a".repeat(64);
+        assert!(admission::validate_parent_settlement_binding(
+            &advanced_store,
+            &signed_study,
+            &substituted_root,
+        )
+        .is_err());
+        let mut tampered = proposal.clone();
+        tampered.parent.campaign_result_sha256 = "c".repeat(64);
+        assert!(admission::validate_parent_settlement_binding(
+            &advanced_store,
+            &signed_study,
+            &tampered,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn historical_parent_root_auth_accepts_expired_grants_but_rejects_signature_tamper() {
+        use alpha_domain::campaign_control::{
+            sign_campaign_root_grant, verify_campaign_root_grant, CampaignExecutionScope,
+            CampaignFamilyPolicyV1, CampaignRootBudgetV1, CampaignRootGrantV1, ROOT_GRANT_SCHEMA,
+        };
+        use chrono::{Duration, Utc};
+        use ed25519_dalek::SigningKey;
+        use std::collections::BTreeSet;
+
+        let now = Utc::now();
+        let key = SigningKey::from_bytes(&[61; 32]);
+        let grant = CampaignRootGrantV1 {
+            schema_version: ROOT_GRANT_SCHEMA.into(),
+            root_id: "expired-parent-root".into(),
+            family: CampaignFamilyPolicyV1 {
+                family_id: "expired-parent-family".into(),
+                definition_sha256: "a".repeat(64),
+                max_trials: 100,
+            },
+            execution_scope: CampaignExecutionScope::PreHoldout,
+            execution: alpha_domain::campaign_control::CampaignExecutionBindingV1 {
+                campaign_inputs_sha256: "b".repeat(64),
+                evaluation_protocol_sha256: "c".repeat(64),
+                evaluation_views: alpha_domain::campaign_control::CampaignEvaluationViewsV1 {
+                    search_view_sha256: "d".repeat(64),
+                    selection_view_sha256: "e".repeat(64),
+                    selection_feedback:
+                        alpha_domain::campaign_control::CampaignSelectionFeedbackV1::IndependentSelectionWithheld,
+                },
+                source_revision: "f".repeat(40),
+                runner_image: format!("registry/runner@sha256:{}", "1".repeat(64)),
+                controller_image: format!("registry/controller@sha256:{}", "2".repeat(64)),
+                job_cpu_millis: 1,
+                job_memory_mib: 1,
+            },
+            allowed_policy_revision_ids: BTreeSet::from([format!(
+                "cex-search-policy-{}",
+                "3".repeat(64)
+            )]),
+            max_follow_ups: 1,
+            budget: CampaignRootBudgetV1 {
+                max_trials: 100,
+                max_job_attempts: 1,
+                max_job_seconds: 1,
+                max_llm_tokens: 0,
+            },
+            valid_from: now - Duration::hours(2),
+            expires_at: now - Duration::hours(1),
+        };
+        let signed = sign_campaign_root_grant(grant, "expired-operator".into(), &key).unwrap();
+        let trusted =
+            std::collections::BTreeMap::from([("expired-operator".into(), key.verifying_key())]);
+        assert!(verify_campaign_root_grant(
+            &signed,
+            &trusted,
+            signed.grant.expires_at - Duration::seconds(1),
+        )
+        .is_ok());
+        let mut tampered = signed.clone();
+        tampered.signature_hex = "00".into();
+        assert!(verify_campaign_root_grant(
+            &tampered,
+            &trusted,
+            tampered.grant.expires_at - Duration::seconds(1),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn target_admission_accepts_distinct_study_member_and_rejects_parent_root_substitution() {
+        use crate::mission_render::{
+            CexCampaignFailureClassV1, CexCampaignLearningDirectiveV1, CexCampaignPositionPolicyV1,
+            CexCampaignResearchDeltaV1, CexCampaignResearchEvidenceSignatureV2,
+            CexCampaignResearchParentV1, CexCampaignSearchPolicyRevisionV1,
+        };
+        use alpha_domain::campaign_control::{
+            CampaignAttemptOutcomeV1, CampaignAttemptSettlementV1,
+        };
+        use alpha_domain::campaign_horizon::{
+            CampaignLabelHorizonV1, CampaignNextFamilyInputWindowV1, CampaignNextFamilyParentV1,
+            CampaignNextFamilyProposalV1, CAMPAIGN_NEXT_FAMILY_PROPOSAL_SCHEMA_V1,
+        };
+        use alpha_store::campaign_ledger::CampaignDispatchSettlementV1;
+
+        let fixture = AdmissionFixture::new();
+        let mut parent_gate = fixture.open();
+        parent_gate.prepare().unwrap();
+        parent_gate
+            .publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
+        parent_gate.claim().unwrap();
+        parent_gate
+            .publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
+        parent_gate.bind_job("parent-job").unwrap();
+        parent_gate
+            .publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
+        let parent_attempt = parent_gate.reservation.clone();
+        drop(parent_gate);
+        let mut parent_settlement = admission::Admission::open_for_settlement(
+            &fixture.control,
+            &fixture.validated,
+            &fixture.manifest,
+            "research-context",
+            "monday-research",
+        )
+        .unwrap();
+        parent_settlement
+            .settle(&CampaignDispatchSettlementV1 {
+                job_uid: "parent-job".into(),
+                pod_uid: "parent-pod".into(),
+                settlement: CampaignAttemptSettlementV1 {
+                    operation_id: parent_attempt.operation_id().unwrap(),
+                    reservation_sha256: parent_attempt.content_hash().unwrap(),
+                    evidence_sha256: "b".repeat(64),
+                    outcome: CampaignAttemptOutcomeV1::NoCandidate,
+                    consumed_trials: Some(20),
+                },
+            })
+            .unwrap();
+        parent_settlement
+            .publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
+        drop(parent_settlement);
+
+        let control = admission::read_control(&fixture.control).unwrap();
+        let store = alpha_store::AlphaStore::open(&control.ledger_path).unwrap();
+        let signed_root: alpha_domain::campaign_control::SignedCampaignRootGrantV1 =
+            admission::read_json(&control.signed_root_grant_path).unwrap();
+        let signed_study = store
+            .campaign_study_grant("dispatch-study-budget")
+            .unwrap()
+            .unwrap();
+        let target_member = signed_study
+            .grant
+            .members
+            .iter()
+            .find(|member| member.family_id == "dispatch-target")
+            .unwrap();
+        let parent_family_receipt = store
+            .campaign_family_receipts(&parent_attempt.family_id)
+            .unwrap()
+            .into_iter()
+            .find(|receipt| {
+                matches!(
+                    &receipt.receipt.event,
+                    alpha_store::campaign_ledger::CampaignLedgerEventV1::DispatchSettled {
+                        evidence
+                    } if evidence.settlement.evidence_sha256 == "b".repeat(64)
+                )
+            })
+            .unwrap();
+        let snapshot = store
+            .campaign_study_snapshot("dispatch-study-budget")
+            .unwrap();
+        let study_settlement = snapshot
+            .receipts
+            .iter()
+            .find(|receipt| {
+                matches!(
+                    &receipt.receipt.event,
+                    alpha_store::campaign_ledger::CampaignStudyLedgerEventV1::AttemptSettled {
+                        family_id, ..
+                    } if family_id == &parent_attempt.family_id
+                )
+            })
+            .unwrap();
+        let parent = CampaignNextFamilyParentV1 {
+            campaign_id: parent_attempt.campaign_id.clone(),
+            family_id: parent_attempt.family_id.clone(),
+            root_grant_sha256: signed_root.content_sha256.clone(),
+            request_sha256: parent_attempt.request_sha256.clone(),
+            campaign_inputs_sha256: parent_attempt.execution.campaign_inputs_sha256.clone(),
+            campaign_result_sha256: "b".repeat(64),
+            family_settlement_receipt_sha256: parent_family_receipt.content_sha256.clone(),
+            study_settlement_receipt_sha256: study_settlement.content_sha256.clone(),
+            study_snapshot_sha256: admission::study_prefix_identity(
+                &snapshot,
+                &study_settlement.content_sha256,
+            )
+            .unwrap(),
+            terminal_job_uid: "parent-job".into(),
+            terminal_pod_uid: "parent-pod".into(),
+        };
+        let materialization: Value =
+            serde_json::from_slice(&std::fs::read(&fixture.inputs.materialization_path).unwrap())
+                .unwrap();
+        let segments = materialization["source_segments"].as_array().unwrap();
+        let target_window = CampaignNextFamilyInputWindowV1 {
+            mission_id: materialization["mission_id"].as_str().unwrap().into(),
+            output_prefix: "target".into(),
+            start_received_at_ns: segments
+                .iter()
+                .filter_map(|segment| segment["start_received_at_ns"].as_u64())
+                .min()
+                .unwrap(),
+            end_received_at_ns: segments
+                .iter()
+                .filter_map(|segment| segment["end_received_at_ns"].as_u64())
+                .max()
+                .unwrap(),
+            bucket_ms: materialization["bucket_ms"].as_u64().unwrap(),
+            top_depth: materialization["top_depth"].as_u64().unwrap() as usize,
+        };
+        let canonical_plan = fixture.validated.submission.request.research_plan.clone();
+        let research_parent = CexCampaignResearchParentV1 {
+            campaign_id: parent.campaign_id.clone(),
+            request_sha256: parent.request_sha256.clone(),
+            campaign_result_sha256: parent.campaign_result_sha256.clone(),
+        };
+        let target_revision = CexCampaignSearchPolicyRevisionV1::new_typed(
+            Some(canonical_plan.search_policy_revision.revision_id.clone()),
+            CexCampaignPositionPolicyV1::PredictionIdentity,
+            CexCampaignResearchDeltaV1::canonical(),
+        )
+        .unwrap();
+        let directive = CexCampaignLearningDirectiveV1::new(
+            &research_parent,
+            CexCampaignFailureClassV1::NoTradesAfterCosts,
+            canonical_plan.search_policy_revision.revision_id.clone(),
+            target_revision.revision_id.clone(),
+        )
+        .unwrap();
+        let mut plan = canonical_plan.clone();
+        plan.generation = 1;
+        plan.search_policy_revision = target_revision;
+        plan.attempted_search_policy_revision_ids = vec![
+            canonical_plan.search_policy_revision.revision_id.clone(),
+            directive.search_policy_revision_id.clone(),
+        ];
+        plan.parent_evidence_signature = Some(
+            CexCampaignResearchEvidenceSignatureV2::new(
+                parent.campaign_inputs_sha256.clone(),
+                canonical_plan.search_policy_revision.revision_id.clone(),
+                "1".repeat(64),
+                "2".repeat(64),
+                "3".repeat(64),
+            )
+            .unwrap(),
+        );
+        plan.parent = Some(research_parent);
+        plan.learning_directive = Some(directive);
+        plan.label_horizon = Some(CampaignLabelHorizonV1::canonical());
+        plan.validate().unwrap();
+        let horizon = plan.label_horizon.clone().unwrap();
+        let proposal = CampaignNextFamilyProposalV1 {
+            schema_version: CAMPAIGN_NEXT_FAMILY_PROPOSAL_SCHEMA_V1.into(),
+            study_id: "dispatch-study-budget".into(),
+            study_grant_sha256: signed_study.content_sha256.clone(),
+            parent,
+            target_family_id: target_member.family_id.clone(),
+            target_root_grant_sha256: target_member.root_grant_sha256.clone(),
+            target_member_sha256: target_member.content_hash().unwrap(),
+            target_execution: target_member.execution.clone(),
+            target_horizon_sha256: horizon.content_hash().unwrap(),
+            target_horizon: horizon,
+            target_window: target_window.clone(),
+            target_research_plan_sha256: plan.content_hash().unwrap(),
+        };
+        proposal.validate().unwrap();
+        let mut target_submission = fixture.validated.submission.clone();
+        target_submission.request.research_plan = plan.clone();
+        target_submission.request.study_proposal = Some(proposal.clone());
+        let previous_target_campaign_id = target_submission.request.campaign_id.clone();
+        target_submission.request.campaign_id =
+            crate::mission_campaign::expected_campaign_id(&target_submission.request).unwrap();
+        for round in &mut target_submission.request.rounds {
+            round.mission_put_url = round.mission_put_url.replace(
+                &previous_target_campaign_id,
+                &target_submission.request.campaign_id,
+            );
+            round.mission_readback_url = round.mission_readback_url.replace(
+                &previous_target_campaign_id,
+                &target_submission.request.campaign_id,
+            );
+            round.result_put_url = round.result_put_url.replace(
+                &previous_target_campaign_id,
+                &target_submission.request.campaign_id,
+            );
+            round.result_readback_url = round.result_readback_url.replace(
+                &previous_target_campaign_id,
+                &target_submission.request.campaign_id,
+            );
+        }
+        target_submission.request.campaign_result_put_url =
+            target_submission.request.campaign_result_put_url.replace(
+                &previous_target_campaign_id,
+                &target_submission.request.campaign_id,
+            );
+        target_submission.request.campaign_result_readback_url = target_submission
+            .request
+            .campaign_result_readback_url
+            .replace(
+                &previous_target_campaign_id,
+                &target_submission.request.campaign_id,
+            );
+        let target_validated = validate_submission(target_submission).unwrap();
+        let target_manifest = render_manifest(&target_validated, "monday-research").unwrap();
+        let mut target_control: Value =
+            serde_json::from_slice(&std::fs::read(&fixture.control).unwrap()).unwrap();
+        target_control["signed_root_grant_path"] = json!("target-grant.json");
+        target_control["approval_id"] = json!("dispatch-target-approval");
+        target_control["campaign_inputs_path"] = json!("campaign-inputs.json");
+        let target_control_path = fixture.inputs._root.path().join("target-control.json");
+        std::fs::write(
+            &target_control_path,
+            serde_json::to_vec(&target_control).unwrap(),
+        )
+        .unwrap();
+
+        let target_parent_validated =
+            validate_submission(fixture.validated.submission.clone()).unwrap();
+        let target_parent_manifest =
+            render_manifest(&target_parent_validated, "monday-research").unwrap();
+        let mut target_parent_gate = admission::Admission::open(
+            &target_control_path,
+            &target_parent_validated,
+            &target_parent_manifest,
+            "research-context",
+            "monday-research",
+        )
+        .unwrap();
+        target_parent_gate.prepare().unwrap();
+        target_parent_gate
+            .publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
+        target_parent_gate.claim().unwrap();
+        target_parent_gate
+            .publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
+        target_parent_gate.bind_job("target-parent-job").unwrap();
+        target_parent_gate
+            .publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
+        drop(target_parent_gate);
+        let mut target_parent_settlement = admission::Admission::open_for_settlement(
+            &target_control_path,
+            &target_parent_validated,
+            &target_parent_manifest,
+            "research-context",
+            "monday-research",
+        )
+        .unwrap();
+        target_parent_settlement
+            .settle(&CampaignDispatchSettlementV1 {
+                job_uid: "target-parent-job".into(),
+                pod_uid: "target-parent-pod".into(),
+                settlement: CampaignAttemptSettlementV1 {
+                    operation_id: target_parent_settlement.reservation.operation_id().unwrap(),
+                    reservation_sha256: target_parent_settlement
+                        .reservation
+                        .content_hash()
+                        .unwrap(),
+                    evidence_sha256: "b".repeat(64),
+                    outcome: CampaignAttemptOutcomeV1::NoCandidate,
+                    consumed_trials: Some(20),
+                },
+            })
+            .unwrap();
+        target_parent_settlement
+            .publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
+        drop(target_parent_settlement);
+
+        let previous_target_campaign_id = fixture.validated.submission.request.campaign_id;
+        let target_campaign_id = target_validated.submission.request.campaign_id.clone();
+        for access in target_control["receipt_access"]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+        {
+            for field in ["put_url", "readback_url"] {
+                if let Some(url) = access[field].as_str() {
+                    access[field] =
+                        json!(url.replace(&previous_target_campaign_id, &target_campaign_id));
+                }
+            }
+        }
+        std::fs::write(
+            &target_control_path,
+            serde_json::to_vec(&target_control).unwrap(),
+        )
+        .unwrap();
+
+        let mut out_of_bounds_submission = target_validated.submission.clone();
+        out_of_bounds_submission
+            .request
+            .study_proposal
+            .as_mut()
+            .unwrap()
+            .target_window
+            .end_received_at_ns = target_window.end_received_at_ns.saturating_sub(1);
+        out_of_bounds_submission.request.campaign_id =
+            crate::mission_campaign::expected_campaign_id(&out_of_bounds_submission.request)
+                .unwrap();
+        let out_of_bounds_validated = validate_submission(out_of_bounds_submission).unwrap();
+        let out_of_bounds_manifest =
+            render_manifest(&out_of_bounds_validated, "monday-research").unwrap();
+        assert!(admission::Admission::open(
+            &target_control_path,
+            &out_of_bounds_validated,
+            &out_of_bounds_manifest,
+            "research-context",
+            "monday-research",
+        )
+        .is_err());
+
+        let mut target_gate = admission::Admission::open(
+            &target_control_path,
+            &target_validated,
+            &target_manifest,
+            "research-context",
+            "monday-research",
+        )
+        .unwrap();
+        target_gate.prepare().unwrap();
+        target_gate
+            .publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
+        target_gate.claim().unwrap();
+        target_gate
+            .publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
+        target_gate.bind_job("target-job").unwrap();
+        target_gate
+            .publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
+        drop(target_gate);
+        let mut target_settlement = admission::Admission::open_for_settlement(
+            &target_control_path,
+            &target_validated,
+            &target_manifest,
+            "research-context",
+            "monday-research",
+        )
+        .unwrap();
+        target_settlement
+            .settle(&CampaignDispatchSettlementV1 {
+                job_uid: "target-job".into(),
+                pod_uid: "target-pod".into(),
+                settlement: CampaignAttemptSettlementV1 {
+                    operation_id: target_settlement.reservation.operation_id().unwrap(),
+                    reservation_sha256: target_settlement.reservation.content_hash().unwrap(),
+                    evidence_sha256: "c".repeat(64),
+                    outcome: CampaignAttemptOutcomeV1::NoCandidate,
+                    consumed_trials: Some(20),
+                },
+            })
+            .unwrap();
+        target_settlement
+            .publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
+        drop(target_settlement);
+
+        let tampered_control_path = fixture
+            .inputs
+            ._root
+            .path()
+            .join("tampered-target-control.json");
+        let mut tampered_control = target_control.clone();
+        tampered_control["campaign_inputs_path"] = json!("tampered-inputs.json");
+        std::fs::write(
+            &tampered_control_path,
+            serde_json::to_vec(&tampered_control).unwrap(),
+        )
+        .unwrap();
+        assert!(admission::Admission::open(
+            &tampered_control_path,
+            &target_validated,
+            &target_manifest,
+            "research-context",
+            "monday-research",
+        )
+        .is_err());
+
+        let mut tampered_submission = target_validated.submission.clone();
+        tampered_submission
+            .request
+            .study_proposal
+            .as_mut()
+            .unwrap()
+            .parent
+            .root_grant_sha256 = target_member.root_grant_sha256.clone();
+        let tampered_validated = validate_submission(tampered_submission).unwrap();
+        let tampered_manifest = render_manifest(&tampered_validated, "monday-research").unwrap();
+        assert!(admission::Admission::open(
+            &target_control_path,
+            &tampered_validated,
+            &tampered_manifest,
+            "research-context",
+            "monday-research",
+        )
+        .is_err());
     }
 
     #[test]
