@@ -23,6 +23,7 @@ use std::{
 };
 
 const USDM_LOB_DATASET: &str = "usdm_perpetual_top100_lob";
+const USDM_LOB_TRADE_DATASET: &str = "usdm_perpetual_top100_lob_trade";
 const SPOT_LOB_DATASET: &str = "spot_all";
 const USDM_LOB_DEPTH_ONLY_STREAM_TYPES: [&str; 1] = ["depth@100ms"];
 const USDM_LOB_HISTORICAL_STREAM_TYPES: [&str; 2] = ["depth@100ms", "bookTicker"];
@@ -453,13 +454,14 @@ fn raw_contract_key(manifest: &Map<String, Value>) -> Result<String> {
 }
 
 fn raw_manifest_matches_market(manifest: &Map<String, Value>, market: Market) -> bool {
+    let dataset = manifest.get("dataset").and_then(Value::as_str);
+    let dataset_matches = match market {
+        Market::Spot => dataset == Some(SPOT_LOB_DATASET),
+        Market::Usdm => matches!(dataset, Some(USDM_LOB_DATASET | USDM_LOB_TRADE_DATASET)),
+    };
     manifest.get("venue").and_then(Value::as_str) == Some("binance")
         && manifest.get("market").and_then(Value::as_str) == Some(market.as_str())
-        && manifest.get("dataset").and_then(Value::as_str)
-            == Some(match market {
-                Market::Spot => SPOT_LOB_DATASET,
-                Market::Usdm => USDM_LOB_DATASET,
-            })
+        && dataset_matches
 }
 
 fn reference_manifest_matches_market(manifest: &Map<String, Value>, market: Market) -> bool {
@@ -1701,6 +1703,117 @@ mod tests {
             serde_json::to_vec(&manifest).unwrap(),
         )
         .unwrap();
+    }
+
+    fn current_usdm_trade_fixture() -> (tempfile::TempDir, InventoryRequest) {
+        let (directory, request) = fixture();
+        let path = request.raw_root.join("part-1.jsonl.zst.manifest.json");
+        let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        // Match the production collector's current dataset and stream contract.
+        manifest["dataset"] = json!("usdm_perpetual_top100_lob_trade");
+        manifest["stream_types"] = json!(["depth@100ms", "aggTrade"]);
+        manifest["trade_summary_contract"] = json!(AGGREGATE_TRADE_SUMMARY_CONTRACT);
+        manifest["trade_representation"] = json!("aggregate_trade_only");
+        fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        (directory, request)
+    }
+
+    #[test]
+    fn freeze_accepts_current_usdm_trade_archive() {
+        let (_directory, request) = current_usdm_trade_fixture();
+        let frozen = freeze_inventory(&request).unwrap();
+
+        assert_eq!(frozen.raw.len(), 1);
+        assert_eq!(frozen.references.len(), 1);
+        assert!(frozen.requires_pit_admission);
+        assert_eq!(
+            frozen.inventory_sha256,
+            hex::encode(Sha256::digest(frozen.inventory_env.as_bytes()))
+        );
+    }
+
+    #[test]
+    fn fresh_selection_accepts_current_usdm_trade_archive() {
+        let (_directory, request) = current_usdm_trade_fixture();
+        extra_reference(&request, "BTCUSDT", 5_000_010_000);
+        for mode in [
+            FreshWindowMode::Explicit {
+                start_received_at_ns: request.start_received_at_ns,
+                end_received_at_ns: request.end_received_at_ns,
+            },
+            FreshWindowMode::Latest {
+                duration_ns: 500,
+                cutoff_received_at_ns: RECEIVED_NS + 1_000,
+                max_candidates: 4,
+            },
+        ] {
+            let selection = select_fresh_window(&FreshWindowRequest {
+                raw_root: request.raw_root.clone(),
+                reference_root: request.reference_root.clone(),
+                mode,
+                market: request.market,
+                symbol: request.symbol.clone(),
+                source_revision: request.source_revision.clone(),
+                image_ref: request.image_ref.clone(),
+                mission_id: request.mission_id.clone(),
+                output_prefix: request.output_prefix.clone(),
+                bucket_ms: request.bucket_ms,
+                label_horizon_buckets: request.label_horizon_buckets,
+                top_depth: request.top_depth,
+                max_scan_entries: request.max_scan_entries,
+                max_inputs: request.max_inputs,
+                max_input_bytes: request.max_input_bytes,
+            })
+            .unwrap();
+            assert_eq!(selection.raw.len(), 1);
+            assert!(selection.inventory_eligible);
+            assert!(!selection.materialized_pit_admitted);
+        }
+    }
+
+    #[test]
+    fn current_usdm_trade_archive_keeps_trade_and_integrity_checks() {
+        let (_directory, request) = current_usdm_trade_fixture();
+        let path = request.raw_root.join("part-1.jsonl.zst.manifest.json");
+        let original: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(!manifest_is_usdm_lob_only(original.as_object().unwrap()));
+
+        let mut missing_trade_contract = original.clone();
+        missing_trade_contract
+            .as_object_mut()
+            .unwrap()
+            .remove("trade_summary_contract");
+        fs::write(&path, serde_json::to_vec(&missing_trade_contract).unwrap()).unwrap();
+        assert!(freeze_inventory(&request)
+            .unwrap_err()
+            .to_string()
+            .contains("aggregate-trade summary contract"));
+
+        let mut incomplete = original.clone();
+        incomplete["all_stream_coverage_verified"] = json!(false);
+        fs::write(&path, serde_json::to_vec(&incomplete).unwrap()).unwrap();
+        assert!(freeze_inventory(&request)
+            .unwrap_err()
+            .to_string()
+            .contains("fully replayable"));
+
+        for dataset in ["usdm_perpetual_top100_lob_trade_rust_shadow", "unrelated"] {
+            let mut excluded = original.clone();
+            excluded["dataset"] = json!(dataset);
+            fs::write(&path, serde_json::to_vec(&excluded).unwrap()).unwrap();
+            assert!(freeze_inventory(&request)
+                .unwrap_err()
+                .to_string()
+                .contains("no eligible sealed Binance usdm segments"));
+        }
+
+        fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        fs::write(
+            request.raw_root.join("part-1.jsonl.zst._SUCCESS"),
+            "wrong\n",
+        )
+        .unwrap();
+        assert!(freeze_inventory(&request).is_err());
     }
 
     #[test]
