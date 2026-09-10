@@ -239,7 +239,7 @@ pub fn restore_persisted_trading_runtime(
             })
         })
         .collect::<io::Result<Vec<_>>>()?;
-    let runtime = TradingRuntime::restore(TradingRuntimeSnapshot {
+    let mut snapshot = TradingRuntimeSnapshot {
         intents,
         orders,
         fills,
@@ -248,8 +248,11 @@ pub fn restore_persisted_trading_runtime(
         risk: Default::default(),
         canonical_oms: Some(persisted.canonical_oms),
         canonical_portfolio: Some(persisted.canonical_portfolio),
-    })
-    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        canonical_snapshot_digest: None,
+    };
+    snapshot.canonical_snapshot_digest = Some(snapshot.integrity_digest());
+    let runtime = TradingRuntime::restore(snapshot)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if !persisted_positions.is_empty() {
         let rebuilt = runtime.snapshot(&Default::default()).positions;
         let matches = persisted_positions.len() == rebuilt.len()

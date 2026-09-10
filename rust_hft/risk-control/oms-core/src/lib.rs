@@ -326,8 +326,8 @@ impl OmsCore {
                     let previous_status = ord.status;
                     if matches!(ord.status, OrderStatus::New | OrderStatus::Unknown) {
                         ord.status = OrderStatus::Acknowledged;
+                        ord.state_changed_at = Some(*timestamp);
                     }
-                    ord.state_changed_at = Some(*timestamp);
                     return Some(OrderUpdate {
                         order_id: order_id.clone(),
                         status: ord.status,
@@ -507,9 +507,9 @@ impl OmsCore {
                             | OrderStatus::Replaced
                     ) {
                         ord.status = OrderStatus::Rejected;
+                        ord.state_changed_at = Some(*timestamp);
                     }
                     ord.rejection_reason = Some(reason.clone());
-                    ord.state_changed_at = Some(*timestamp);
                     return Some(OrderUpdate {
                         order_id: order_id.clone(),
                         status: ord.status,
@@ -534,8 +534,8 @@ impl OmsCore {
                             | OrderStatus::Replaced
                     ) {
                         ord.status = OrderStatus::Canceled;
+                        ord.state_changed_at = Some(*timestamp);
                     }
-                    ord.state_changed_at = Some(*timestamp);
                     return Some(OrderUpdate {
                         order_id: order_id.clone(),
                         status: ord.status,
@@ -1980,6 +1980,7 @@ mod tests {
             fill_id: "terminal-fill".into(),
         };
         oms.on_execution_event(&fill).unwrap();
+        let terminal_changed_at = oms.get(&order_id).unwrap().state_changed_at;
         for event in [
             ExecutionEvent::OrderAck {
                 order_id: order_id.clone(),
@@ -1998,6 +1999,10 @@ mod tests {
             assert_eq!(
                 oms.on_execution_event(&event).unwrap().status,
                 OrderStatus::Filled
+            );
+            assert_eq!(
+                oms.get(&order_id).unwrap().state_changed_at,
+                terminal_changed_at
             );
         }
         assert_eq!(oms.get(&order_id).unwrap().status, OrderStatus::Filled);
