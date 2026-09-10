@@ -41,6 +41,7 @@ Classification:
 | `data-pipelines/adapters/adapter-lighter/src/lib.rs` | adapter stream channel | must-fix before live MD path | Same adapter output risk; classify before any live use. |
 | `data-pipelines/adapters/adapter-asterdex/src/lib.rs` | adapter stream channel | must-fix before live MD path | Same adapter output risk; classify before any live use. |
 | `data-pipelines/adapters/adapter-grvt/src/lib.rs` | adapter stream channel wrapped as stream | must-fix before live MD path | Same adapter output risk; bounded stream conversion needed before production use. |
+| `data-pipelines/adapters/adapter-predict-fun/src/lib.rs` | delayed-response regression test synchronization | test/demo | The `#[cfg(test)]` server sends one unit notification when its first orderbook request starts. Production market-event output uses a bounded channel with backpressure. |
 | `data-pipelines/adapters/adapter-replay/src/lib.rs` | replay adapter channel | test/demo | Replay is offline and not a live latency authority path. Keep deterministic and avoid using as live queue. |
 
 ## Current Safe Boundary

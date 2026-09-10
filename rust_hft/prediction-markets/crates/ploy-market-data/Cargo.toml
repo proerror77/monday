@@ -13,6 +13,7 @@ audit = ["dep:sqlx"]
 live = [
     "audit",
     "dep:adapter-binance-data",
+    "dep:adapter-predict-fun-data",
     "dep:data",
     "dep:adapter-polymarket-data",
     "dep:crc32fast",
@@ -25,6 +26,7 @@ live = [
 
 [dependencies]
 adapter-binance-data = { package = "hft-data-adapter-binance", path = "../../../data-pipelines/adapters/adapter-binance", optional = true }
+adapter-predict-fun-data = { package = "hft-data-adapter-predict-fun", path = "../../../data-pipelines/adapters/adapter-predict-fun", optional = true }
 data = { package = "hft-data", path = "../../../data-pipelines/core", optional = true }
 adapter-polymarket-data = { package = "hft-data-adapter-polymarket", path = "../../../data-pipelines/adapters/adapter-polymarket", optional = true }
 anyhow = "1"
@@ -35,9 +37,9 @@ libc.workspace = true
 ploy-market-contracts.workspace = true
 polymarket-client-sdk = { package = "polymarket_client_sdk_v2", version = "=0.6.0", features = ["clob", "data", "gamma", "rtds", "tracing", "ws", "heartbeats"], optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"], optional = true }
-secrecy = { workspace = true, optional = true }
 rust_decimal.workspace = true
 rust_decimal_macros.workspace = true
+secrecy = { version = "0.10", features = ["serde"], optional = true }
 serde.workspace = true
 serde_json = { workspace = true, features = ["arbitrary_precision"] }
 sha2.workspace = true

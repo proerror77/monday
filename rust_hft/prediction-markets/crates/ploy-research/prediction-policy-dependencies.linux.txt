@@ -1,12 +1,12 @@
 prediction-policy-dependencies.v5
 target=x86_64-unknown-linux-gnu
 profile=default,db
-input:Cargo.lock=sha256:9170fb482e91302a7bc81a05027438a6dc6c6e00359a20aa0588bc5821a088f4
+input:Cargo.lock=sha256:0ee232024396bd3b7aa596d422ffa30d96a58c68ceaafb64c1489f0df734ec55
 input:Cargo.toml=sha256:104f7b7a41e62d573b42da227e6fae379c2cfbe70bccf4b65b921a9c1281048f
 input:crates/ploy-research/Cargo.toml=sha256:cfc1572e1364f0e9712a81b2d7d5e6e786541b080862ee6729199ca4524b5541
 input:crates/ploy-feed-loaders/Cargo.toml=sha256:abf8f1b8adec93b1ad84a66294cb58eb65f9cbca33c701cc81c7635eb9b35e2c
 input:crates/ploy-market-contracts/Cargo.toml=sha256:e086ddc8f162ff0abcabe832b1b61549f0daf7e98a78ab96f5512c596c3dc7f0
-input:crates/ploy-market-data/Cargo.toml=sha256:e77a1686807b86a82fa3c41c8196561b0f5aee89a4306f9ad7c890e73453da4f
+input:crates/ploy-market-data/Cargo.toml=sha256:0febdff22c4a6198bc012ee4e8c6bda0c3279b8547ffde7d05420e684088a0ca
 input:../data-pipelines/core/Cargo.toml=sha256:4d4bb79a5456edf8f1922303ee98191401d08a360f60858681c12be2e0795b27
 input:../market-core/core/Cargo.toml=sha256:1871023d225485d0585cf929928690f83d0b5dc1f52eb6e5e578948843872769
 input:../market-core/integration/Cargo.toml=sha256:f54494420bc70e3e7465267411a9f055165061f68dbb00bb31391565a1ab0142

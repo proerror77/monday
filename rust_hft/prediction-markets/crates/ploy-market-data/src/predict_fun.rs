@@ -1,23 +1,25 @@
-//! Predict.fun REST market-discovery and order-book collector.
-//!
-//! Predict's API is currently beta. Mainnet requires an API key; the official
-//! testnet permits keyless access. This module intentionally contains no order
-//! submission or wallet operations.
+//! Predict.fun collector sink.
+//
+// HTTP, pagination, response validation, full-depth projection, and stream
+// invalidation live in adapter-predict-fun. This module owns only scheduling
+// and append-only database persistence for the existing collector command.
 
-use std::str::FromStr;
 use std::time::Duration;
 
-use reqwest::Client;
-use rust_decimal::Decimal;
+use adapter_predict_fun_data::{
+    validate_api_access, PredictFunBookProjection, PredictFunClient,
+    PredictFunError as AdapterError, PredictFunLevel, ReceivedMarket,
+};
+use chrono::{DateTime, Utc};
 use secrecy::{ExposeSecret, SecretString};
-use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sqlx::PgPool;
 use thiserror::Error;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
-pub const MAINNET_API: &str = "https://api.predict.fun";
-pub const TESTNET_API: &str = "https://api-testnet.predict.fun";
+pub const MAINNET_API: &str = adapter_predict_fun_data::MAINNET_API;
+pub const TESTNET_API: &str = adapter_predict_fun_data::TESTNET_API;
 
 #[derive(Debug, Error)]
 pub enum PredictFunError {
@@ -25,15 +27,15 @@ pub enum PredictFunError {
     MissingMainnetApiKey,
     #[error("unsupported Predict.fun API origin: {0}")]
     UnsupportedApiOrigin(String),
-    #[error("Predict.fun API request failed: {0}")]
-    Http(#[from] reqwest::Error),
-    #[error("Predict.fun API returned success=false for {0}")]
-    Api(String),
+    #[error(transparent)]
+    Adapter(#[from] AdapterError),
     #[error("Predict.fun persistence failed: {0}")]
     Database(#[from] sqlx::Error),
+    #[error("Predict.fun time conversion failed: {0}")]
+    Time(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PredictFunConfig {
     pub base_url: String,
     pub api_key: Option<SecretString>,
@@ -45,233 +47,34 @@ pub struct PredictFunConfig {
 impl PredictFunConfig {
     pub fn from_env(once: bool) -> Result<Self, PredictFunError> {
         let base_url =
-            std::env::var("PREDICT_FUN_API_URL").unwrap_or_else(|_| MAINNET_API.to_string());
+            std::env::var("PREDICT_FUN_API_URL").unwrap_or_else(|_| MAINNET_API.to_owned());
         let api_key = std::env::var("PREDICT_FUN_API_KEY")
             .ok()
-            .filter(|value| !value.trim().is_empty())
-            .map(SecretString::from);
-        validate_api_access(
-            &base_url,
-            api_key
-                .as_ref()
-                .map(ExposeSecret::expose_secret)
-                .map(String::as_str),
-        )?;
+            .filter(|value| !value.trim().is_empty());
+        let api_key = api_key.map(SecretString::from);
+        validate_api_access(&base_url, api_key.as_ref().map(ExposeSecret::expose_secret))
+            .map_err(map_config_error)?;
         Ok(Self {
             base_url,
             api_key,
             refresh_interval_secs: env_positive_u64("PLOY_PREDICT_FUN_REFRESH_SECS", 30),
-            // Predict documents a 240 requests/minute default limit. Keep book
-            // polling below that ceiling and leave room for catalog pages.
             per_market_delay_ms: env_positive_u64("PLOY_PREDICT_FUN_MARKET_DELAY_MS", 300),
             once,
         })
     }
 }
 
-pub fn validate_api_access(base_url: &str, api_key: Option<&str>) -> Result<(), PredictFunError> {
-    let parsed = reqwest::Url::parse(base_url)
-        .map_err(|_| PredictFunError::UnsupportedApiOrigin(base_url.to_string()))?;
-    let is_origin_only = parsed.scheme() == "https"
-        && parsed.port_or_known_default() == Some(443)
-        && matches!(parsed.path(), "" | "/")
-        && parsed.query().is_none()
-        && parsed.fragment().is_none()
-        && parsed.username().is_empty()
-        && parsed.password().is_none();
-    if !is_origin_only {
-        return Err(PredictFunError::UnsupportedApiOrigin(base_url.to_string()));
-    }
-    match parsed.host_str() {
-        Some("api.predict.fun") if api_key.is_none_or(|key| key.trim().is_empty()) => {
-            Err(PredictFunError::MissingMainnetApiKey)
-        }
-        Some("api.predict.fun" | "api-testnet.predict.fun") => Ok(()),
-        _ => Err(PredictFunError::UnsupportedApiOrigin(base_url.to_string())),
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PredictMarket {
-    pub id: i64,
-    pub title: String,
-    pub question: String,
-    #[serde(default)]
-    pub description: Option<String>,
-    pub condition_id: String,
-    pub decimal_precision: u32,
-    pub trading_status: String,
-    pub status: String,
-    pub is_visible: bool,
-    pub is_neg_risk: bool,
-    #[serde(default)]
-    pub is_yield_bearing: bool,
-    pub fee_rate_bps: i32,
-    #[serde(default)]
-    pub outcomes: Vec<PredictOutcome>,
-    #[serde(default)]
-    pub resolution: Option<serde_json::Value>,
-}
-
-impl PredictMarket {
-    fn is_collectible(&self) -> bool {
-        self.is_visible && self.trading_status.eq_ignore_ascii_case("OPEN")
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PredictOutcome {
-    pub name: String,
-    pub index_set: i64,
-    pub on_chain_id: String,
-    #[serde(default)]
-    pub status: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MarketsResponse {
-    pub success: bool,
-    #[serde(default)]
-    pub cursor: Option<String>,
-    pub data: Vec<PredictMarket>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OrderBookResponse {
-    pub success: bool,
-    pub data: OrderBook,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OrderBook {
-    pub market_id: i64,
-    pub update_timestamp_ms: i64,
-    #[serde(default)]
-    pub asks: Vec<[serde_json::Value; 2]>,
-    #[serde(default)]
-    pub bids: Vec<[serde_json::Value; 2]>,
-    #[serde(default)]
-    pub last_order_settled: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ComplementedBook {
-    pub yes_bid: Option<Decimal>,
-    pub yes_bid_size: Option<Decimal>,
-    pub yes_ask: Option<Decimal>,
-    pub yes_ask_size: Option<Decimal>,
-    pub no_bid: Option<Decimal>,
-    pub no_bid_size: Option<Decimal>,
-    pub no_ask: Option<Decimal>,
-    pub no_ask_size: Option<Decimal>,
-}
-
-pub fn complement_book(book: &OrderBook, precision: u32) -> ComplementedBook {
-    let yes_bid = book.bids.first().and_then(|level| decimal(&level[0]));
-    let yes_bid_size = book.bids.first().and_then(|level| decimal(&level[1]));
-    let yes_ask = book.asks.first().and_then(|level| decimal(&level[0]));
-    let yes_ask_size = book.asks.first().and_then(|level| decimal(&level[1]));
-
-    ComplementedBook {
-        yes_bid,
-        yes_bid_size,
-        yes_ask,
-        yes_ask_size,
-        no_bid: yes_ask.map(|price| (Decimal::ONE - price).round_dp(precision)),
-        no_bid_size: yes_ask_size,
-        no_ask: yes_bid.map(|price| (Decimal::ONE - price).round_dp(precision)),
-        no_ask_size: yes_bid_size,
-    }
-}
-
-fn decimal(value: &serde_json::Value) -> Option<Decimal> {
-    match value {
-        serde_json::Value::Number(number) => Decimal::from_str(number.as_str()).ok(),
-        serde_json::Value::String(number) => Decimal::from_str(number).ok(),
-        _ => None,
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct PredictFunClient {
-    client: Client,
-    base_url: String,
-    api_key: Option<SecretString>,
-}
-
-impl PredictFunClient {
-    pub fn new(base_url: String, api_key: Option<SecretString>) -> Result<Self, PredictFunError> {
-        validate_api_access(
-            &base_url,
-            api_key
-                .as_ref()
-                .map(ExposeSecret::expose_secret)
-                .map(String::as_str),
-        )?;
-        Ok(Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(20))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()?,
-            base_url: base_url.trim_end_matches('/').to_string(),
-            api_key,
-        })
-    }
-
-    fn get(&self, path: &str) -> reqwest::RequestBuilder {
-        let request = self.client.get(format!("{}{path}", self.base_url));
-        match &self.api_key {
-            Some(key) => request.header("x-api-key", key.expose_secret()),
-            None => request,
-        }
-    }
-
-    pub async fn markets(&self) -> Result<Vec<PredictMarket>, PredictFunError> {
-        let mut all = Vec::new();
-        let mut cursor: Option<String> = None;
-        loop {
-            let mut request = self.get("/v1/markets").query(&[("first", "100")]);
-            if let Some(after) = cursor.as_deref() {
-                request = request.query(&[("after", after)]);
-            }
-            let response: MarketsResponse =
-                request.send().await?.error_for_status()?.json().await?;
-            if !response.success {
-                return Err(PredictFunError::Api("GET /v1/markets".to_string()));
-            }
-            all.extend(response.data);
-            match response.cursor.filter(|next| Some(next) != cursor.as_ref()) {
-                Some(next) => cursor = Some(next),
-                None => break,
-            }
-        }
-        Ok(all)
-    }
-
-    pub async fn orderbook(&self, market_id: i64) -> Result<OrderBook, PredictFunError> {
-        let response: OrderBookResponse = self
-            .get(&format!("/v1/markets/{market_id}/orderbook"))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        if !response.success {
-            return Err(PredictFunError::Api(format!(
-                "GET /v1/markets/{market_id}/orderbook"
-            )));
-        }
-        Ok(response.data)
+fn map_config_error(error: AdapterError) -> PredictFunError {
+    match error {
+        AdapterError::MissingApiKey => PredictFunError::MissingMainnetApiKey,
+        AdapterError::UnsupportedOrigin(origin) => PredictFunError::UnsupportedApiOrigin(origin),
+        other => PredictFunError::Adapter(other),
     }
 }
 
 pub async fn run_collector(config: PredictFunConfig, pool: PgPool) -> Result<(), PredictFunError> {
     let client = PredictFunClient::new(config.base_url.clone(), config.api_key.clone())?;
+    restore_acceptance_state(&client, &pool).await?;
     loop {
         if let Err(error) = collect_once(&client, &config, &pool).await {
             if config.once {
@@ -291,30 +94,54 @@ async fn collect_once(
     config: &PredictFunConfig,
     pool: &PgPool,
 ) -> Result<(), PredictFunError> {
-    let markets = client.markets().await?;
+    let markets = match client.markets().await {
+        Ok(markets) => markets,
+        Err(error) => {
+            persist_invalidations(pool, client.drain_invalidations()).await?;
+            return Err(error.into());
+        }
+    };
+    persist_invalidations(pool, client.drain_invalidations()).await?;
     let mut books = 0usize;
     let mut attempted_books = 0usize;
-    for market in &markets {
-        persist_market(pool, market).await?;
-        if !market.is_collectible() {
+    for received_market in &markets {
+        persist_market(pool, received_market).await?;
+        if !received_market.market.is_collectible() {
             continue;
         }
+        let binding = match received_market.market.binary_binding() {
+            Ok(binding) => binding,
+            Err(error) => {
+                warn!(market_id = received_market.market.id, %error, "Predict.fun market has no valid YES/NO binding");
+                let projection =
+                    client.invalidate_market(received_market.market.id, error.to_string())?;
+                persist_book(pool, &projection).await?;
+                continue;
+            }
+        };
         attempted_books += 1;
-        match client.orderbook(market.id).await {
-            Ok(book) => {
-                persist_book(pool, market, &book).await?;
+        match client
+            .orderbook(binding.market_id())
+            .await
+            .and_then(|received| client.accept_orderbook(&received, binding.decimal_precision()))
+        {
+            Ok(projection) => {
+                persist_book(pool, &projection).await?;
                 books += 1;
             }
             Err(error) => {
-                warn!(market_id = market.id, %error, "Predict.fun orderbook fetch failed")
+                warn!(market_id = binding.market_id(), %error, "Predict.fun orderbook fetch failed");
+                let projection =
+                    client.invalidate_market(binding.market_id(), error.to_string())?;
+                persist_book(pool, &projection).await?;
             }
         }
         sleep(Duration::from_millis(config.per_market_delay_ms)).await;
     }
     if attempted_books > 0 && books == 0 {
-        return Err(PredictFunError::Api(
-            "all collectible market orderbook requests failed".to_string(),
-        ));
+        return Err(PredictFunError::Adapter(AdapterError::Api {
+            path: "/v1/markets/{id}/orderbook".to_owned(),
+        }));
     }
     info!(
         markets = markets.len(),
@@ -323,16 +150,54 @@ async fn collect_once(
     Ok(())
 }
 
-async fn persist_market(pool: &PgPool, market: &PredictMarket) -> Result<(), sqlx::Error> {
-    let outcomes = serde_json::to_value(&market.outcomes).unwrap_or(serde_json::Value::Null);
+async fn persist_invalidations(
+    pool: &PgPool,
+    projections: Vec<PredictFunBookProjection>,
+) -> Result<(), PredictFunError> {
+    for projection in projections {
+        persist_book(pool, &projection).await?;
+    }
+    Ok(())
+}
+
+async fn restore_acceptance_state(
+    client: &PredictFunClient,
+    pool: &PgPool,
+) -> Result<(), PredictFunError> {
+    let rows = sqlx::query_as::<_, (i64, Option<i64>)>(
+        r#"
+        SELECT market_id, MAX(exchange_timestamp_ms)
+        FROM predict_fun_orderbook_ticks
+        WHERE exchange_timestamp_ms IS NOT NULL
+        GROUP BY market_id
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    for (market_id, timestamp_ms) in rows {
+        let Some(timestamp_ms) = timestamp_ms else {
+            continue;
+        };
+        let timestamp_ms = u64::try_from(timestamp_ms).map_err(|_| {
+            PredictFunError::Time("stored exchange timestamp is negative".to_owned())
+        })?;
+        client.seed_acceptance_clock(market_id, timestamp_ms)?;
+    }
+    Ok(())
+}
+
+async fn persist_market(pool: &PgPool, received: &ReceivedMarket) -> Result<(), PredictFunError> {
+    let observed_at = timestamp_to_utc(received.received_at_us)?;
+    let outcomes = serde_json::to_value(&received.market.outcomes)
+        .map_err(|error| PredictFunError::Time(error.to_string()))?;
     sqlx::query(
         r#"
         INSERT INTO predict_fun_markets (
             market_id, condition_id, title, question, description,
             decimal_precision, trading_status, status, is_visible, is_neg_risk,
-            is_yield_bearing, fee_rate_bps, outcomes, resolution, observed_at
+            is_yield_bearing, fee_rate_bps, outcomes, resolution, raw, observed_at
         ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW()
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16
         )
         ON CONFLICT (market_id) DO UPDATE SET
             condition_id = EXCLUDED.condition_id,
@@ -348,23 +213,26 @@ async fn persist_market(pool: &PgPool, market: &PredictMarket) -> Result<(), sql
             fee_rate_bps = EXCLUDED.fee_rate_bps,
             outcomes = EXCLUDED.outcomes,
             resolution = EXCLUDED.resolution,
-            observed_at = NOW()
+            raw = EXCLUDED.raw,
+            observed_at = EXCLUDED.observed_at
         "#,
     )
-    .bind(market.id)
-    .bind(&market.condition_id)
-    .bind(&market.title)
-    .bind(&market.question)
-    .bind(&market.description)
-    .bind(i32::try_from(market.decimal_precision).unwrap_or(i32::MAX))
-    .bind(&market.trading_status)
-    .bind(&market.status)
-    .bind(market.is_visible)
-    .bind(market.is_neg_risk)
-    .bind(market.is_yield_bearing)
-    .bind(market.fee_rate_bps)
+    .bind(received.market.id)
+    .bind(&received.market.condition_id)
+    .bind(&received.market.title)
+    .bind(&received.market.question)
+    .bind(&received.market.description)
+    .bind(i32::try_from(received.market.decimal_precision).unwrap_or(i32::MAX))
+    .bind(&received.market.trading_status)
+    .bind(&received.market.status)
+    .bind(received.market.is_visible)
+    .bind(received.market.is_neg_risk)
+    .bind(received.market.is_yield_bearing)
+    .bind(received.market.fee_rate_bps)
     .bind(outcomes)
-    .bind(&market.resolution)
+    .bind(&received.market.resolution)
+    .bind(&received.raw)
+    .bind(observed_at)
     .execute(pool)
     .await?;
     Ok(())
@@ -372,33 +240,102 @@ async fn persist_market(pool: &PgPool, market: &PredictMarket) -> Result<(), sql
 
 async fn persist_book(
     pool: &PgPool,
-    market: &PredictMarket,
-    book: &OrderBook,
-) -> Result<(), sqlx::Error> {
-    let normalized = complement_book(book, market.decimal_precision);
+    projection: &PredictFunBookProjection,
+) -> Result<(), PredictFunError> {
+    let plan = book_persistence_plan(projection)?;
+    let (yes_bid, yes_bid_size) = top_level(&projection.yes_bids);
+    let (yes_ask, yes_ask_size) = top_level_ask(&projection.yes_asks);
+    let (no_bid, no_bid_size) = top_level(&projection.no_bids);
+    let (no_ask, no_ask_size) = top_level_ask(&projection.no_asks);
     sqlx::query(
         r#"
         INSERT INTO predict_fun_orderbook_ticks (
             market_id, exchange_timestamp_ms,
             best_yes_bid, best_yes_bid_size, best_yes_ask, best_yes_ask_size,
             best_no_bid, best_no_bid_size, best_no_ask, best_no_ask_size,
-            received_at
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
+            received_at, ready, readiness_reason, yes_bids, yes_asks, no_bids, no_asks, raw
+        ) VALUES (
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18
+        )
         "#,
     )
-    .bind(book.market_id)
-    .bind(book.update_timestamp_ms)
-    .bind(normalized.yes_bid)
-    .bind(normalized.yes_bid_size)
-    .bind(normalized.yes_ask)
-    .bind(normalized.yes_ask_size)
-    .bind(normalized.no_bid)
-    .bind(normalized.no_bid_size)
-    .bind(normalized.no_ask)
-    .bind(normalized.no_ask_size)
+    .bind(plan.market_id)
+    .bind(plan.exchange_timestamp_ms)
+    .bind(yes_bid)
+    .bind(yes_bid_size)
+    .bind(yes_ask)
+    .bind(yes_ask_size)
+    .bind(no_bid)
+    .bind(no_bid_size)
+    .bind(no_ask)
+    .bind(no_ask_size)
+    .bind(plan.received_at)
+    .bind(plan.ready)
+    .bind(&plan.readiness_reason)
+    .bind(serde_json::to_value(&projection.yes_bids).unwrap_or(Value::Null))
+    .bind(serde_json::to_value(&projection.yes_asks).unwrap_or(Value::Null))
+    .bind(serde_json::to_value(&projection.no_bids).unwrap_or(Value::Null))
+    .bind(serde_json::to_value(&projection.no_asks).unwrap_or(Value::Null))
+    .bind(&projection.raw)
     .execute(pool)
     .await?;
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct BookPersistencePlan {
+    market_id: i64,
+    exchange_timestamp_ms: Option<i64>,
+    received_at: DateTime<Utc>,
+    ready: bool,
+    readiness_reason: Option<String>,
+}
+
+fn book_persistence_plan(
+    projection: &PredictFunBookProjection,
+) -> Result<BookPersistencePlan, PredictFunError> {
+    let exchange_timestamp_ms = projection
+        .exchange_timestamp_ms
+        .map(|timestamp| {
+            i64::try_from(timestamp).map_err(|_| {
+                PredictFunError::Time("exchange timestamp exceeds PostgreSQL BIGINT".to_owned())
+            })
+        })
+        .transpose()?;
+    Ok(BookPersistencePlan {
+        market_id: projection.market_id,
+        exchange_timestamp_ms,
+        received_at: timestamp_to_utc(projection.received_at_us)?,
+        ready: projection.ready,
+        readiness_reason: projection.readiness_reason.clone(),
+    })
+}
+
+fn top_level(
+    levels: &[PredictFunLevel],
+) -> (Option<rust_decimal::Decimal>, Option<rust_decimal::Decimal>) {
+    levels
+        .first()
+        .map(|level| (Some(level.price), Some(level.size)))
+        .unwrap_or((None, None))
+}
+
+fn top_level_ask(
+    levels: &[PredictFunLevel],
+) -> (Option<rust_decimal::Decimal>, Option<rust_decimal::Decimal>) {
+    top_level(levels)
+}
+
+fn timestamp_to_utc(micros: u64) -> Result<DateTime<Utc>, PredictFunError> {
+    if micros == 0 {
+        return Err(PredictFunError::Time(
+            "receive timestamp is zero".to_owned(),
+        ));
+    }
+    let seconds = i64::try_from(micros / 1_000_000)
+        .map_err(|_| PredictFunError::Time("receive timestamp exceeds i64".to_owned()))?;
+    DateTime::from_timestamp(seconds, (micros % 1_000_000) as u32 * 1_000)
+        .ok_or_else(|| PredictFunError::Time("receive timestamp is invalid".to_owned()))
 }
 
 fn env_positive_u64(name: &str, default: u64) -> u64 {
@@ -411,76 +348,181 @@ fn env_positive_u64(name: &str, default: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{complement_book, validate_api_access, MarketsResponse, OrderBookResponse};
-    use rust_decimal_macros::dec;
+    use super::*;
+    use adapter_predict_fun_data::PredictFunBookProjection;
+    use serde_json::json;
 
     #[test]
-    fn parses_official_market_payload() {
-        let response: MarketsResponse = serde_json::from_str(
-            r#"{
-              "success": true,
-              "cursor": "NDc2",
-              "data": [{
-                "id": 476,
-                "title": "<$2,500",
-                "question": "Will Gold close under $2,500?",
-                "description": "Resolution rules",
-                "conditionId": "0xf5cb",
-                "decimalPrecision": 2,
-                "tradingStatus": "OPEN",
-                "status": "REGISTERED",
-                "isVisible": true,
-                "isNegRisk": true,
-                "isYieldBearing": true,
-                "feeRateBps": 200,
-                "outcomes": [
-                  {"name":"Yes","indexSet":1,"onChainId":"11","status":null},
-                  {"name":"No","indexSet":2,"onChainId":"22","status":null}
-                ],
-                "resolution": null
-              }]
-            }"#,
+    fn mainnet_requires_api_key_but_testnet_does_not() {
+        assert!(adapter_predict_fun_data::validate_api_access(TESTNET_API, None).is_ok());
+        assert!(adapter_predict_fun_data::validate_api_access(MAINNET_API, None).is_err());
+    }
+
+    #[test]
+    fn market_binding_preserves_exact_outcome_tokens() {
+        let market = adapter_predict_fun_data::PredictFunMarket {
+            id: 1,
+            title: "t".to_owned(),
+            question: "q".to_owned(),
+            description: None,
+            condition_id: "c".to_owned(),
+            decimal_precision: 3,
+            trading_status: "OPEN".to_owned(),
+            status: "REGISTERED".to_owned(),
+            is_visible: true,
+            is_neg_risk: false,
+            is_yield_bearing: false,
+            fee_rate_bps: 0,
+            outcomes: vec![
+                adapter_predict_fun_data::PredictFunOutcome {
+                    name: "Yes".to_owned(),
+                    index_set: 1,
+                    on_chain_id: "yes-token-without-truncation".to_owned(),
+                    status: None,
+                },
+                adapter_predict_fun_data::PredictFunOutcome {
+                    name: "No".to_owned(),
+                    index_set: 2,
+                    on_chain_id: "no-token-without-truncation".to_owned(),
+                    status: None,
+                },
+            ],
+            resolution: None,
+        };
+        let binding = market.binary_binding().unwrap();
+        assert_eq!(binding.yes_token().as_str(), "yes-token-without-truncation");
+        assert_eq!(binding.no_token().as_str(), "no-token-without-truncation");
+        assert_eq!(market.decimal_precision, 3);
+    }
+
+    #[test]
+    fn failed_book_persistence_plan_keeps_unknown_exchange_time_and_reason() {
+        let projection = PredictFunBookProjection {
+            market_id: 77,
+            exchange_timestamp_ms: None,
+            received_at_us: 1_700_000_000_500_000,
+            ready: false,
+            readiness_reason: Some("HTTP 503".to_owned()),
+            yes_bids: Vec::<PredictFunLevel>::new(),
+            yes_asks: Vec::new(),
+            no_bids: Vec::new(),
+            no_asks: Vec::new(),
+            raw: json!({"error": "HTTP 503"}),
+        };
+        let plan = book_persistence_plan(&projection).expect("failure persistence plan");
+        assert_eq!(plan.market_id, 77);
+        assert_eq!(plan.exchange_timestamp_ms, None);
+        assert!(!plan.ready);
+        assert_eq!(plan.readiness_reason.as_deref(), Some("HTTP 503"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the migrated PostgreSQL service in rust-research-heavy"]
+    async fn postgres_predict_fun_restart_restores_clock_and_persists_failure_readiness() {
+        let database_url = std::env::var("PLOY_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .expect("research-heavy PostgreSQL URL");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .expect("connect research-heavy PostgreSQL");
+        let market_id = 9_876_543_i64;
+        sqlx::query("DELETE FROM predict_fun_orderbook_ticks WHERE market_id = $1")
+            .bind(market_id)
+            .execute(&pool)
+            .await
+            .expect("clear test ticks");
+        sqlx::query("DELETE FROM predict_fun_markets WHERE market_id = $1")
+            .bind(market_id)
+            .execute(&pool)
+            .await
+            .expect("clear test market");
+        sqlx::query(
+            "INSERT INTO predict_fun_markets (market_id, condition_id, title, question, decimal_precision, trading_status, status, is_visible, is_neg_risk, is_yield_bearing, fee_rate_bps, outcomes) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
         )
-        .unwrap();
-        assert!(response.success);
-        assert_eq!(response.cursor.as_deref(), Some("NDc2"));
-        assert_eq!(response.data[0].id, 476);
-        assert_eq!(response.data[0].outcomes[1].on_chain_id, "22");
-    }
-
-    #[test]
-    fn parses_book_and_derives_no_side_at_market_precision() {
-        let response: OrderBookResponse = serde_json::from_str(
-            r#"{
-              "success": true,
-              "data": {
-                "marketId": 476,
-                "updateTimestampMs": 1727910141000,
-                "asks": [[0.492, 30192.26]],
-                "bids": [[0.491, 303518.1]],
-                "lastOrderSettled": null
-              }
-            }"#,
+        .bind(market_id)
+        .bind("condition-restart")
+        .bind("restart")
+        .bind("restart")
+        .bind(3_i32)
+        .bind("OPEN")
+        .bind("REGISTERED")
+        .bind(true)
+        .bind(false)
+        .bind(false)
+        .bind(0_i32)
+        .bind(json!([]))
+        .execute(&pool)
+        .await
+        .expect("insert test market");
+        sqlx::query(
+            "INSERT INTO predict_fun_orderbook_ticks (market_id, exchange_timestamp_ms, received_at, ready) VALUES ($1,$2,NOW(),TRUE)",
         )
-        .unwrap();
-        assert!(response.success);
-        let book = complement_book(&response.data, 3);
-        assert_eq!(book.yes_bid, Some(dec!(0.491)));
-        assert_eq!(book.yes_ask, Some(dec!(0.492)));
-        assert_eq!(book.no_bid, Some(dec!(0.508)));
-        assert_eq!(book.no_ask, Some(dec!(0.509)));
-        assert_eq!(book.no_bid_size, Some(dec!(30192.26)));
-        assert_eq!(book.no_ask_size, Some(dec!(303518.1)));
-    }
+        .bind(market_id)
+        .bind(100_i64)
+        .execute(&pool)
+        .await
+        .expect("insert historical ready tick");
+        sqlx::query(
+            "INSERT INTO predict_fun_orderbook_ticks (market_id, exchange_timestamp_ms, received_at, ready, readiness_reason) VALUES ($1,$2,NOW(),FALSE,$3)",
+        )
+        .bind(market_id)
+        .bind(200_i64)
+        .bind("empty bid or ask side")
+        .execute(&pool)
+        .await
+        .expect("insert historical non-ready observation");
 
-    #[test]
-    fn mainnet_requires_api_key_but_official_testnet_does_not() {
-        assert!(validate_api_access(MAINNET_API, None).is_err());
-        assert!(validate_api_access("https://api.predict.fun/", Some("key")).is_ok());
-        assert!(validate_api_access("https://api.predict.fun:443", None).is_err());
-        assert!(validate_api_access(TESTNET_API, None).is_ok());
-        assert!(validate_api_access("https://example.com", Some("key")).is_err());
+        let client = adapter_predict_fun_data::PredictFunClient::new(TESTNET_API.to_owned(), None)
+            .expect("testnet client");
+        restore_acceptance_state(&client, &pool)
+            .await
+            .expect("restore acceptance high-water");
+        let raw = json!({
+            "success": true,
+            "data": {
+                "marketId": market_id,
+                "updateTimestampMs": 150,
+                "asks": [["0.60", "1"]],
+                "bids": [["0.40", "1"]]
+            }
+        });
+        let received = adapter_predict_fun_data::ReceivedOrderBook {
+            requested_market_id: market_id,
+            book: serde_json::from_value(raw["data"].clone()).expect("test book"),
+            received_at_us: 1_700_000_000_500_000,
+            raw,
+        };
+        assert!(matches!(
+            client.accept_orderbook(&received, 3),
+            Err(AdapterError::ExchangeClockRegressed { .. })
+        ));
+        let failure = client
+            .invalidate_market(market_id, "clock regression")
+            .expect("failure projection");
+        persist_book(&pool, &failure)
+            .await
+            .expect("persist failure evidence");
+        let row: (Option<i64>, bool, Option<String>) = sqlx::query_as(
+            "SELECT exchange_timestamp_ms, ready, readiness_reason FROM predict_fun_orderbook_ticks WHERE market_id = $1 ORDER BY id DESC LIMIT 1",
+        )
+        .bind(market_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read failure evidence");
+        assert_eq!(row.0, None);
+        assert!(!row.1);
+        assert_eq!(row.2.as_deref(), Some("clock regression"));
+        sqlx::query("DELETE FROM predict_fun_orderbook_ticks WHERE market_id = $1")
+            .bind(market_id)
+            .execute(&pool)
+            .await
+            .expect("remove test ticks");
+        sqlx::query("DELETE FROM predict_fun_markets WHERE market_id = $1")
+            .bind(market_id)
+            .execute(&pool)
+            .await
+            .expect("remove test market");
     }
-
-    use super::{MAINNET_API, TESTNET_API};
 }
