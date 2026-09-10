@@ -145,6 +145,11 @@ pub struct NotionalFillContract {
     pub limit_price: Price,
     pub filled_notional: rust_decimal::Decimal,
     pub reduce_only: bool,
+    pub approved_quantity: Quantity,
+    pub approved_limit_price: Price,
+    pub approved_filled_quantity: Quantity,
+    #[serde(default)]
+    pub approved_filled_notional: rust_decimal::Decimal,
 }
 
 impl OmsCore {
@@ -219,6 +224,10 @@ impl OmsCore {
                 limit_price,
                 filled_notional: rust_decimal::Decimal::ZERO,
                 reduce_only,
+                approved_quantity: order_qty,
+                approved_limit_price: limit_price,
+                approved_filled_quantity: Quantity::zero(),
+                approved_filled_notional: rust_decimal::Decimal::ZERO,
             },
         );
         true
@@ -633,6 +642,10 @@ impl OmsCore {
             if let Some(contract) = self.notional_contracts.get_mut(order_id) {
                 contract.limit_price = limit_price;
                 contract.requested_notional = requested_notional;
+                contract.approved_quantity = next_qty;
+                contract.approved_limit_price = limit_price;
+                contract.approved_filled_quantity = cum_qty;
+                contract.approved_filled_notional = contract.filled_notional;
             }
         }
         let order = self.orders.get_mut(order_id).expect("order checked above");
@@ -726,6 +739,14 @@ impl OmsCore {
             );
             return false;
         }
+        if self.notional_contracts.contains_key(order_id) {
+            self.record_exception(
+                Some(order_id.clone()),
+                "notional order price must change through a canonical replace",
+                None,
+            );
+            return false;
+        }
         let Some(order) = self.orders.get_mut(order_id) else {
             self.record_exception(
                 Some(order_id.clone()),
@@ -735,11 +756,6 @@ impl OmsCore {
             return false;
         };
         order.limit_price = Some(price);
-        if let Some(contract) = self.notional_contracts.get_mut(order_id) {
-            contract.limit_price = price;
-            contract.requested_notional = contract.filled_notional
-                + (order.qty.0 - order.cum_qty.0).max(rust_decimal::Decimal::ZERO) * price.0;
-        }
         true
     }
 
@@ -890,21 +906,24 @@ impl OmsCore {
                 self.record_exception(Some(order_id.clone()), reason.clone(), None);
                 return Err(reason);
             };
+            let expected_notional = contract.approved_filled_notional
+                + (contract.approved_quantity.0 - contract.approved_filled_quantity.0)
+                    .max(rust_decimal::Decimal::ZERO)
+                    * contract.approved_limit_price.0;
             if order.side != Side::Buy
                 || contract.reduce_only
                 || contract.requested_notional <= rust_decimal::Decimal::ZERO
                 || contract.filled_notional < rust_decimal::Decimal::ZERO
                 || contract.filled_notional > contract.requested_notional
+                || contract.approved_quantity.0 <= rust_decimal::Decimal::ZERO
+                || contract.approved_filled_quantity.0 < rust_decimal::Decimal::ZERO
+                || contract.approved_filled_quantity.0 > contract.approved_quantity.0
+                || contract.approved_filled_notional < rust_decimal::Decimal::ZERO
+                || contract.approved_filled_notional > contract.requested_notional
                 || contract.limit_price.0 <= rust_decimal::Decimal::ZERO
+                || contract.approved_limit_price.0 <= rust_decimal::Decimal::ZERO
                 || order.limit_price != Some(contract.limit_price)
-                || if order.cum_qty.0 > order.qty.0 {
-                    contract.requested_notional != order.qty.0 * contract.limit_price.0
-                } else {
-                    contract.requested_notional
-                        != contract.filled_notional
-                            + (order.qty.0 - order.cum_qty.0).max(rust_decimal::Decimal::ZERO)
-                                * contract.limit_price.0
-                }
+                || contract.requested_notional != expected_notional
             {
                 let reason = format!(
                     "OMS checkpoint has invalid notional contract for {:?}",
@@ -1280,6 +1299,10 @@ impl ports::OrderManager for OmsCore {
                             limit_price: contract.limit_price,
                             filled_notional: contract.filled_notional,
                             reduce_only: contract.reduce_only,
+                            approved_quantity: contract.approved_quantity,
+                            approved_limit_price: contract.approved_limit_price,
+                            approved_filled_quantity: contract.approved_filled_quantity,
+                            approved_filled_notional: contract.approved_filled_notional,
                         },
                     )
                 })
@@ -1354,6 +1377,10 @@ impl ports::OrderManager for OmsCore {
                             limit_price: contract.limit_price,
                             filled_notional: contract.filled_notional,
                             reduce_only: contract.reduce_only,
+                            approved_quantity: contract.approved_quantity,
+                            approved_limit_price: contract.approved_limit_price,
+                            approved_filled_quantity: contract.approved_filled_quantity,
+                            approved_filled_notional: contract.approved_filled_notional,
                         },
                     )
                 })
@@ -2603,6 +2630,11 @@ mod tests {
                 fill_id: "partial-1".into(),
             })
             .is_some());
+        let pre_replace_checkpoint = oms.export_checkpoint();
+        let mut pre_replace_restored = OmsCore::new();
+        pre_replace_restored
+            .import_checkpoint(pre_replace_checkpoint)
+            .expect("partial fill before replace remains restorable");
         oms.on_execution_event(&ExecutionEvent::OrderModified {
             order_id: order_id.clone(),
             new_quantity: Some(Quantity::from_f64(7.0).unwrap()),
@@ -2665,5 +2697,65 @@ mod tests {
             .requested_notional = rust_decimal::Decimal::from(100);
         let mut restored = OmsCore::new();
         assert!(restored.import_checkpoint(checkpoint).is_err());
+    }
+
+    #[test]
+    fn improved_partial_fill_before_replace_keeps_fixed_budget_restorable() {
+        let mut oms = OmsCore::new();
+        let order_id = OrderId("REPLACE-IMPROVED-PARTIAL".into());
+        oms.register_order(RegisterOrderParams {
+            order_id: order_id.clone(),
+            client_order_id: None,
+            account_id: None,
+            symbol: Symbol::new("TOKEN"),
+            side: Side::Buy,
+            qty: Quantity::from_f64(10.0).unwrap(),
+            venue: None,
+            strategy_id: None,
+        });
+        assert!(oms.set_limit_price(&order_id, Price::from_f64(0.5).unwrap()));
+        assert!(oms.register_notional_fill_contract(
+            &order_id,
+            Price::from_f64(0.5).unwrap(),
+            false
+        ));
+        assert!(oms
+            .on_execution_event(&ExecutionEvent::Fill {
+                order_id: order_id.clone(),
+                price: Price::from_f64(0.4).unwrap(),
+                quantity: Quantity::from_f64(2.0).unwrap(),
+                timestamp: 1,
+                fill_id: "improved-before-replace".into(),
+            })
+            .is_some());
+        let mut restored_before_replace = OmsCore::new();
+        restored_before_replace
+            .import_checkpoint(oms.export_checkpoint())
+            .expect("improved partial fill remains restorable");
+        oms.on_execution_event(&ExecutionEvent::OrderModified {
+            order_id: order_id.clone(),
+            new_quantity: Some(Quantity::from_f64(7.0).unwrap()),
+            new_price: Some(Price::from_f64(0.4).unwrap()),
+            timestamp: 2,
+        })
+        .expect("replace after improved partial fill");
+        let contract = oms.export_checkpoint().notional_contracts[&order_id].clone();
+        assert_eq!(
+            contract.requested_notional,
+            rust_decimal::Decimal::new(28, 1)
+        );
+        assert!(oms
+            .on_execution_event(&ExecutionEvent::Fill {
+                order_id: order_id.clone(),
+                price: Price::from_f64(0.4).unwrap(),
+                quantity: Quantity::from_f64(2.0).unwrap(),
+                timestamp: 3,
+                fill_id: "improved-after-replace".into(),
+            })
+            .is_some());
+        let mut restored_after_replace = OmsCore::new();
+        restored_after_replace
+            .import_checkpoint(oms.export_checkpoint())
+            .expect("improved partial replace checkpoint remains restorable");
     }
 }

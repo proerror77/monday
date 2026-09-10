@@ -190,7 +190,32 @@ impl TradingRuntimeSnapshot {
             let mut canonical_orders = oms.orders.iter().collect::<Vec<_>>();
             canonical_orders.sort_by_key(|(order_id, _)| order_id.0.clone());
             for (order_id, order) in canonical_orders {
-                material.push_str(&format!("oms-order:{}:{:?};", order_id.0, order));
+                material.push_str(&format!(
+                    "oms-order:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?};",
+                    order_id.0,
+                    order.order_id.0,
+                    order.client_order_id,
+                    order.symbol.as_str(),
+                    order.side,
+                    order.qty.0,
+                    order.limit_price,
+                    order.cum_qty.0,
+                    order.avg_price,
+                    order.status,
+                    order.venue,
+                    order.strategy_id,
+                    order.revision,
+                    order.venue_order_id,
+                    order.venue_order_history,
+                    order.rejection_reason,
+                    order.last_error,
+                    order.state_changed_at,
+                ));
+                let mut processed_fill_ids = order.processed_fill_ids.iter().collect::<Vec<_>>();
+                processed_fill_ids.sort();
+                for fill_id in processed_fill_ids {
+                    material.push_str(&format!("oms-fill-id:{}:{};", order_id.0, fill_id));
+                }
             }
             let mut contracts = oms.notional_contracts.iter().collect::<Vec<_>>();
             contracts.sort_by_key(|(order_id, _)| order_id.0.clone());
@@ -1829,7 +1854,7 @@ mod tests {
                     market_id: "market".into(),
                     token_id: "token".into(),
                     side: TradeSide::Buy,
-                    quantity: dec!(1),
+                    quantity: dec!(2),
                     limit_price: Some(dec!(0.5)),
                     purpose: IntentPurpose::Entry,
                     created_at: Utc::now(),
@@ -1848,17 +1873,31 @@ mod tests {
             fee: Decimal::ZERO,
             timestamp: Utc::now(),
         }));
+        assert!(source.record_fill(FillRecord {
+            fill_id: "integrity-fill-2".into(),
+            order_id: "integrity-order".into(),
+            token_id: "token".into(),
+            side: TradeSide::Buy,
+            quantity: dec!(1),
+            price: dec!(0.5),
+            fee: Decimal::ZERO,
+            timestamp: Utc::now(),
+        }));
         let snapshot = source.snapshot(&BTreeMap::new());
+        let encoded = serde_json::to_vec(&snapshot).expect("serialize runtime snapshot");
+        let round_tripped: TradingRuntimeSnapshot =
+            serde_json::from_slice(&encoded).expect("deserialize runtime snapshot");
+        assert!(TradingRuntime::restore(round_tripped.clone()).is_ok());
 
-        let mut missing_digest = snapshot.clone();
+        let mut missing_digest = round_tripped.clone();
         missing_digest.canonical_snapshot_digest = None;
         assert!(TradingRuntime::restore(missing_digest).is_err());
 
-        let mut tampered_fill = snapshot.clone();
+        let mut tampered_fill = round_tripped.clone();
         tampered_fill.fills[0].quantity = dec!(0.5);
         assert!(TradingRuntime::restore(tampered_fill).is_err());
 
-        let mut tampered_intent = snapshot;
+        let mut tampered_intent = round_tripped;
         tampered_intent.intents[0].token_id = "other-token".into();
         assert!(TradingRuntime::restore(tampered_intent).is_err());
     }

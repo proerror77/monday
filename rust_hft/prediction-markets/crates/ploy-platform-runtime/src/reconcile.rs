@@ -5,7 +5,7 @@ use ploy_operator_contracts::DeploymentRuntimeMode;
 use ploy_platform::DeploymentRecord;
 use portfolio_core::prediction::{FillRecord, TradeSide, TradingRuntime};
 use ports::{ExecutionClient, ExecutionEvent};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::time::Instant;
 use tokio::time::{timeout, Duration};
@@ -31,6 +31,7 @@ pub async fn reconcile_live_fills_with_stream(
 ) -> io::Result<ReconcileStatus> {
     let mut order_deployments = HashMap::new();
     let mut venue_to_local = HashMap::new();
+    let mut ambiguous_venue_ids = HashSet::new();
     let terminal_cutoff =
         chrono::Utc::now() - chrono::Duration::hours(TERMINAL_RECONCILE_RETENTION_HOURS);
 
@@ -57,6 +58,8 @@ pub async fn reconcile_live_fills_with_stream(
                     ) || (matches!(
                         order.state,
                         portfolio_core::prediction::OrderState::Canceled
+                            | portfolio_core::prediction::OrderState::Filled
+                            | portfolio_core::prediction::OrderState::Rejected
                     ) && order
                         .state_changed_at
                         .is_some_and(|changed_at| changed_at >= terminal_cutoff)))
@@ -66,10 +69,26 @@ pub async fn reconcile_live_fills_with_stream(
                 continue;
             };
             order_deployments.insert(order.order_id.clone(), record.deployment_id.clone());
-            venue_to_local.insert(
-                order.venue_order_id.clone().unwrap_or_default(),
-                (order.order_id, record.deployment_id.clone()),
-            );
+            let local = order.order_id.clone();
+            let deployment_id = record.deployment_id.clone();
+            if let Some(venue_order_id) = order.venue_order_id {
+                bind_venue_identity(
+                    &mut venue_to_local,
+                    &mut ambiguous_venue_ids,
+                    venue_order_id,
+                    local.clone(),
+                    deployment_id.clone(),
+                );
+            }
+            for venue_order_id in order.venue_order_history {
+                bind_venue_identity(
+                    &mut venue_to_local,
+                    &mut ambiguous_venue_ids,
+                    venue_order_id,
+                    local.clone(),
+                    deployment_id.clone(),
+                );
+            }
         }
     }
 
@@ -87,12 +106,7 @@ pub async fn reconcile_live_fills_with_stream(
                         continue;
                     };
                     let Some((local_id, deployment_id)) =
-                        venue_to_local.get(&venue_order_id).cloned().or_else(|| {
-                            order_deployments
-                                .get(&venue_order_id)
-                                .cloned()
-                                .map(|deployment_id| (venue_order_id.clone(), deployment_id))
-                        })
+                        venue_to_local.get(&venue_order_id).cloned()
                     else {
                         continue;
                     };
@@ -212,6 +226,27 @@ fn execution_event_order_id(event: &ExecutionEvent) -> Option<String> {
     }
 }
 
+fn bind_venue_identity(
+    venue_to_local: &mut HashMap<String, (String, String)>,
+    ambiguous_venue_ids: &mut HashSet<String>,
+    venue_order_id: String,
+    local_order_id: String,
+    deployment_id: String,
+) {
+    if venue_order_id.is_empty() || ambiguous_venue_ids.contains(&venue_order_id) {
+        return;
+    }
+    let candidate = (local_order_id, deployment_id);
+    if let Some(existing) = venue_to_local.get(&venue_order_id) {
+        if existing != &candidate {
+            venue_to_local.remove(&venue_order_id);
+            ambiguous_venue_ids.insert(venue_order_id);
+        }
+        return;
+    }
+    venue_to_local.insert(venue_order_id, candidate);
+}
+
 #[cfg(test)]
 mod tests {
     use super::reconcile_live_fills;
@@ -277,6 +312,96 @@ mod tests {
 
         async fn list_recent_fills(&self) -> Result<Vec<ports::AccountFill>, HftError> {
             Ok(Vec::new())
+        }
+
+        async fn get_balance(&self) -> Result<Vec<ports::AccountBalance>, HftError> {
+            Ok(Vec::new())
+        }
+
+        async fn get_positions(&self) -> Result<Vec<ports::Position>, HftError> {
+            Ok(Vec::new())
+        }
+
+        async fn connect(&mut self) -> Result<(), HftError> {
+            Ok(())
+        }
+
+        async fn disconnect(&mut self) -> Result<(), HftError> {
+            Ok(())
+        }
+
+        async fn health(&self) -> ports::ConnectionHealth {
+            ports::ConnectionHealth {
+                connected: true,
+                latency_ms: Some(0.0),
+                last_heartbeat: 0,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct LateFeeGateway {
+        old_venue_order_id: String,
+        stream_started: Arc<AtomicBool>,
+        rest_fail: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ports::ExecutionClient for LateFeeGateway {
+        async fn place_order(&mut self, _intent: ports::OrderIntent) -> Result<OrderId, HftError> {
+            Err(HftError::Config("unused".to_string()))
+        }
+
+        async fn cancel_order(&mut self, _order_id: &OrderId) -> Result<(), HftError> {
+            Ok(())
+        }
+
+        async fn modify_order(
+            &mut self,
+            _order_id: &OrderId,
+            _new_quantity: Option<hft_core::Quantity>,
+            _new_price: Option<hft_core::Price>,
+        ) -> Result<(), HftError> {
+            Ok(())
+        }
+
+        async fn execution_stream(&self) -> Result<ports::BoxStream<ExecutionEvent>, HftError> {
+            if self.stream_started.swap(true, Ordering::SeqCst) {
+                return Err(HftError::Config("stream already attached".to_string()));
+            }
+            let order_id = self.old_venue_order_id.clone();
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                let _ = tx.send(Ok(ExecutionEvent::Fill {
+                    order_id: OrderId(order_id.clone()),
+                    price: hft_core::Price(dec!(0.5)),
+                    quantity: hft_core::Quantity(dec!(1)),
+                    timestamp: chrono::Utc::now().timestamp_micros().max(0) as u64,
+                    fill_id: "late-old-fill".to_string(),
+                }));
+                tokio::time::sleep(std::time::Duration::from_millis(8)).await;
+                let _ = tx.send(Ok(ExecutionEvent::FeeCharged {
+                    order_id: OrderId(order_id),
+                    amount: dec!(0.01),
+                    timestamp: chrono::Utc::now().timestamp_micros().max(0) as u64,
+                    fill_id: "late-old-fill".to_string(),
+                }));
+            });
+            Ok(Box::pin(futures::stream::unfold(rx, |mut rx| async {
+                rx.recv().await.map(|event| (event, rx))
+            })))
+        }
+
+        async fn list_open_orders(&self) -> Result<Vec<ports::OpenOrder>, HftError> {
+            Ok(Vec::new())
+        }
+
+        async fn list_recent_fills(&self) -> Result<Vec<ports::AccountFill>, HftError> {
+            if self.rest_fail.swap(false, Ordering::SeqCst) {
+                Err(HftError::Network("REST snapshot unavailable".to_string()))
+            } else {
+                Ok(Vec::new())
+            }
         }
 
         async fn get_balance(&self) -> Result<Vec<ports::AccountBalance>, HftError> {
@@ -573,6 +698,100 @@ mod tests {
             .snapshot(&BTreeMap::new());
         assert_eq!(snapshot.fills.len(), 1);
         assert_eq!(snapshot.orders[0].filled_qty, dec!(1));
+    }
+
+    #[tokio::test]
+    async fn filled_order_keeps_bounded_route_for_late_fee_and_old_venue_identity() {
+        let deployment = DeploymentRecord {
+            deployment_id: "example.live".to_string(),
+            bundle_id: "example".to_string(),
+            runtime_mode: ploy_operator_contracts::DeploymentRuntimeMode::Live,
+            account_id: "acct-live".to_string(),
+            max_gross_exposure: Some(dec!(5)),
+            deployment_state: DeploymentState::Enabled,
+            desired_state: DesiredState::Running,
+            observed_state: ObservedState::Running,
+        };
+        let mut runtime = TradingRuntime::default();
+        runtime
+            .submit_intent(
+                TradingIntent {
+                    intent_id: "intent-late-fee".to_string(),
+                    deployment_id: deployment.deployment_id.clone(),
+                    market_id: "market-1".to_string(),
+                    token_id: "token-1".to_string(),
+                    side: TradeSide::Buy,
+                    quantity: dec!(1),
+                    limit_price: Some(dec!(0.5)),
+                    purpose: IntentPurpose::Entry,
+                    created_at: chrono::Utc::now(),
+                },
+                "order-late-fee",
+                None,
+            )
+            .expect("valid intent");
+        runtime.acknowledge_order("order-late-fee", "venue-old");
+        runtime
+            .replace_order("order-late-fee", dec!(1), Some(dec!(0.5)), "venue-new")
+            .expect("replace order");
+        let mut gateway = LateFeeGateway {
+            old_venue_order_id: "venue-old".to_string(),
+            stream_started: Arc::new(AtomicBool::new(false)),
+            rest_fail: Arc::new(AtomicBool::new(true)),
+        };
+        let mut stream = Some(gateway.execution_stream().await.expect("attach stream"));
+        let mut trading = BTreeMap::from([(deployment.deployment_id.clone(), runtime)]);
+
+        let first = reconcile_live_fills_with_stream(
+            &mut gateway,
+            &mut stream,
+            &[deployment.clone()],
+            &mut trading,
+        )
+        .await;
+        assert!(first.is_err(), "first REST failure must remain visible");
+        assert_eq!(
+            trading
+                .get("example.live")
+                .unwrap()
+                .snapshot(&BTreeMap::new())
+                .fills
+                .len(),
+            1
+        );
+        assert_eq!(
+            trading
+                .get("example.live")
+                .unwrap()
+                .order("order-late-fee")
+                .unwrap()
+                .state,
+            OrderState::Filled
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let second = reconcile_live_fills_with_stream(
+            &mut gateway,
+            &mut stream,
+            &[deployment],
+            &mut trading,
+        )
+        .await
+        .expect("late fee reconciliation");
+        assert_eq!(second, ReconcileStatus::Applied(1));
+        let snapshot = trading
+            .get("example.live")
+            .unwrap()
+            .snapshot(&BTreeMap::new());
+        assert_eq!(snapshot.pnl.total_fees, dec!(0.01));
+        assert_eq!(
+            snapshot
+                .canonical_portfolio
+                .unwrap()
+                .processed_fee_ids
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

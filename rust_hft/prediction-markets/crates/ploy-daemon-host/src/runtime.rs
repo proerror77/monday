@@ -4285,7 +4285,7 @@ mod tests {
                 .reconcile_live_fills()
                 .await
                 .expect("reconcile fills"),
-            ReconcileStatus::Noop
+            ReconcileStatus::Applied(0)
         );
 
         let trading_state = daemon.trading_state();

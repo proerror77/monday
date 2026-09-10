@@ -984,6 +984,11 @@ pub struct NotionalFillContract {
     pub limit_price: Price,
     pub filled_notional: rust_decimal::Decimal,
     pub reduce_only: bool,
+    pub approved_quantity: Quantity,
+    pub approved_limit_price: Price,
+    pub approved_filled_quantity: Quantity,
+    #[serde(default)]
+    pub approved_filled_notional: rust_decimal::Decimal,
 }
 
 /// 訂單記錄
