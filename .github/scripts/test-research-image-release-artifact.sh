@@ -256,9 +256,33 @@ admission_checkout = jobs.fetch('release-admission').fetch('steps').find { |step
 raise 'admission executes event-selected code before trust validation' unless admission_checkout.fetch('with').fetch('ref') == 'refs/heads/main'
 build = jobs.fetch('build-and-push')
 raise 'build does not require admission' unless build.fetch('if').include?("outputs.admitted == 'true'")
+admission_outputs = jobs.fetch('release-admission').fetch('outputs')
+raise 'admission does not publish the source SHA short form' unless admission_outputs.fetch('source_sha_short').include?('steps.admission.outputs.source_sha_short')
+admission = jobs.fetch('release-admission').fetch('steps').find { |step| step['id'] == 'admission' }
+admission_run = admission.fetch('run')
+raise 'admission does not validate a full source SHA' unless admission_run.include?('$SOURCE_SHA" =~ ^[[:xdigit:]]{40}$')
+raise 'admission does not derive the source SHA short form' unless admission_run.include?('${SOURCE_SHA:0:7}')
 checkout = build.fetch('steps').find { |step| step['name'] == 'Checkout admitted source' }
 raise 'build source is not bound' unless checkout.fetch('with').fetch('ref').include?('outputs.source_sha')
 metadata = build.fetch('steps').find { |step| step['id'] == 'meta' }
-raise 'OCI revision is not bound' unless metadata.fetch('with').fetch('labels').include?('outputs.source_sha')
+raise 'metadata must use workflow context for detached checkouts' unless metadata.fetch('with').fetch('context') == 'workflow'
+tags = metadata.fetch('with').fetch('tags')
+raise 'SHA tag is not bound to the admitted source SHA' unless tags.include?('type=raw,value=sha-${{ needs.release-admission.outputs.source_sha_short }}')
+raise 'metadata still infers a SHA from the workflow context' if tags.include?('type=sha') || tags.include?('github.sha')
+labels = metadata.fetch('with').fetch('labels')
+raise 'OCI revision is not bound' unless labels.include?('outputs.source_sha')
+
+# A workflow_run's github.sha can differ from its admitted head SHA. Render the
+# metadata expressions with distinct values to prove both publication identities
+# stay bound to the admitted source rather than the workflow context.
+source_sha = '1' * 40
+workflow_sha = '2' * 40
+source_sha_short = source_sha[0, 7]
+raise 'test fixture did not separate source and workflow SHAs' if source_sha_short == workflow_sha[0, 7]
+rendered_tags = tags.gsub('${{ needs.release-admission.outputs.source_sha_short }}', source_sha_short)
+rendered_labels = labels.gsub('${{ needs.release-admission.outputs.source_sha }}', source_sha)
+raise 'rendered SHA tag does not use the source SHA' unless rendered_tags.include?("type=raw,value=sha-#{source_sha_short}")
+raise 'rendered revision label does not use the full source SHA' unless rendered_labels.include?("org.opencontainers.image.revision=#{source_sha}")
+raise 'rendered metadata uses the workflow SHA' if rendered_tags.include?(workflow_sha) || rendered_labels.include?(workflow_sha)
 RUBY
 printf 'shared release admission tests passed\n'
