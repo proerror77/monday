@@ -119,6 +119,10 @@ pub struct CampaignNextFamilyParentV1 {
     pub family_id: String,
     pub root_grant_sha256: String,
     pub request_sha256: String,
+    /// The authenticated parent Campaign input receipt.  A Study handoff may
+    /// intentionally select a different target receipt, so this remains
+    /// separate from the target member's execution binding.
+    pub campaign_inputs_sha256: String,
     pub campaign_result_sha256: String,
     pub family_settlement_receipt_sha256: String,
     pub study_settlement_receipt_sha256: String,
@@ -154,6 +158,7 @@ impl CampaignNextFamilyProposalV1 {
             || !valid_identifier(&self.parent.family_id)
             || !valid_digest(&self.parent.root_grant_sha256)
             || !valid_digest(&self.parent.request_sha256)
+            || !valid_digest(&self.parent.campaign_inputs_sha256)
             || !valid_digest(&self.parent.campaign_result_sha256)
             || !valid_digest(&self.parent.family_settlement_receipt_sha256)
             || !valid_digest(&self.parent.study_settlement_receipt_sha256)
@@ -233,6 +238,7 @@ mod tests {
                 family_id: "family-parent".into(),
                 root_grant_sha256: "8".repeat(64),
                 request_sha256: "9".repeat(64),
+                campaign_inputs_sha256: "1".repeat(64),
                 campaign_result_sha256: "a".repeat(64),
                 family_settlement_receipt_sha256: "b".repeat(64),
                 study_settlement_receipt_sha256: "c".repeat(64),

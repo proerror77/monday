@@ -894,8 +894,8 @@ fn validate_next_family_materialization(
         .filter_map(|segment| segment["end_received_at_ns"].as_u64())
         .max()
         .context("target materialization has no source end")?;
-    if start != target_window.start_received_at_ns || end != target_window.end_received_at_ns {
-        bail!("target materialization source window differs from the selected Study window");
+    if start < target_window.start_received_at_ns || end > target_window.end_received_at_ns {
+        bail!("target materialization source window is outside the selected Study window");
     }
     let declared_trials = declared_total_trials_for_rounds(plan, 2)?;
     let rendered = render_cex_bundle(
@@ -2667,6 +2667,23 @@ fn validate_study_proposal_for_plan(
     if plan.label_horizon.as_ref() != Some(&proposal.target_horizon) {
         bail!("next-family proposal horizon differs from the frozen research plan");
     }
+    let parent = plan
+        .parent
+        .as_ref()
+        .context("next-family proposal requires a parent-bound research plan")?;
+    if proposal.parent.campaign_id != parent.campaign_id
+        || proposal.parent.request_sha256 != parent.request_sha256
+        || proposal.parent.campaign_result_sha256 != parent.campaign_result_sha256
+    {
+        bail!("next-family proposal parent identity differs from the research plan");
+    }
+    let evidence = plan
+        .parent_evidence_signature
+        .as_ref()
+        .context("next-family proposal requires parent evidence")?;
+    if evidence.campaign_inputs_sha256 != proposal.parent.campaign_inputs_sha256 {
+        bail!("next-family proposal parent input identity differs from parent evidence");
+    }
     Ok(())
 }
 
@@ -3283,6 +3300,7 @@ pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> 
         .parent_evidence_signature
         .as_ref()
         .is_some_and(|parent| parent.campaign_inputs_sha256 != request.campaign_inputs_sha256)
+        && request.study_proposal.is_none()
     {
         bail!("CEX Campaign follow-up parent evidence does not match Campaign inputs");
     }
@@ -4152,7 +4170,10 @@ mod tests {
         let output = root.path().join("next-plan.json");
         write_research_plan_create_once(&output, &plan).unwrap();
         assert_eq!(load_research_plan(&output).unwrap(), plan);
-        assert!(write_research_plan_create_once(&output, &plan).is_err());
+        assert!(write_research_plan_create_once(&output, &plan).is_ok());
+        let mut changed_plan = plan.clone();
+        changed_plan.objective.push_str(" with drift");
+        assert!(write_research_plan_create_once(&output, &changed_plan).is_err());
 
         let request_path = root.path().join("request.json");
         let result_path = root.path().join("result.json");
@@ -4169,6 +4190,138 @@ mod tests {
         assert!(load_research_plan(&args.output).unwrap().llm.is_none());
         learn(args.clone()).unwrap();
         assert_eq!(std::fs::read(&args.output).unwrap(), first);
+    }
+
+    #[test]
+    fn study_proposal_binds_authenticated_parent_input_separately_from_target_input() {
+        use alpha_domain::campaign_control::{
+            CampaignEvaluationViewsV1, CampaignExecutionBindingV1, CampaignSelectionFeedbackV1,
+        };
+
+        let loaded = loaded_request_for_learning();
+        let result = negative_campaign_result(&loaded);
+        let result_sha256 = "9".repeat(64);
+        let failure_class = classify_campaign_failure(&result).unwrap();
+        let (revision, directive) =
+            next_campaign_policy_revision(&loaded, &result_sha256, failure_class).unwrap();
+        let mut plan = follow_up_plan(
+            &loaded,
+            &result_sha256,
+            directive,
+            revision,
+            campaign_research_evidence_signature(&loaded.request, &result).unwrap(),
+        )
+        .unwrap();
+        let horizon = CampaignLabelHorizonV1::canonical();
+        plan.label_horizon = Some(horizon.clone());
+        plan.validate().unwrap();
+
+        let parent = CampaignNextFamilyParentV1 {
+            campaign_id: loaded.request.campaign_id.clone(),
+            family_id: "parent-family".into(),
+            root_grant_sha256: "1".repeat(64),
+            request_sha256: loaded.sha256.clone(),
+            campaign_inputs_sha256: loaded.request.campaign_inputs_sha256.clone(),
+            campaign_result_sha256: result_sha256.clone(),
+            family_settlement_receipt_sha256: "2".repeat(64),
+            study_settlement_receipt_sha256: "3".repeat(64),
+            study_snapshot_sha256: "4".repeat(64),
+            terminal_job_uid: "parent-job".into(),
+            terminal_pod_uid: "parent-pod".into(),
+        };
+        let target_inputs_sha256 = "e".repeat(64);
+        let target_execution = CampaignExecutionBindingV1 {
+            campaign_inputs_sha256: target_inputs_sha256.clone(),
+            evaluation_protocol_sha256: "5".repeat(64),
+            evaluation_views: CampaignEvaluationViewsV1 {
+                search_view_sha256: "6".repeat(64),
+                selection_view_sha256: "7".repeat(64),
+                selection_feedback: CampaignSelectionFeedbackV1::IndependentSelectionWithheld,
+            },
+            source_revision: loaded.request.build_source_revision.clone(),
+            runner_image: format!("registry/runner@sha256:{}", "8".repeat(64)),
+            controller_image: format!("registry/controller@sha256:{}", "9".repeat(64)),
+            job_cpu_millis: 1,
+            job_memory_mib: 1,
+        };
+        let proposal_for = |parent: CampaignNextFamilyParentV1| CampaignNextFamilyProposalV1 {
+            schema_version: alpha_domain::campaign_horizon::CAMPAIGN_NEXT_FAMILY_PROPOSAL_SCHEMA_V1
+                .into(),
+            study_id: "study-cross-input".into(),
+            study_grant_sha256: "a".repeat(64),
+            parent,
+            target_family_id: "target-family".into(),
+            target_root_grant_sha256: "b".repeat(64),
+            target_member_sha256: "c".repeat(64),
+            target_execution: target_execution.clone(),
+            target_horizon: horizon.clone(),
+            target_horizon_sha256: horizon.content_hash().unwrap(),
+            target_window: CampaignNextFamilyInputWindowV1 {
+                mission_id: "target-mission".into(),
+                output_prefix: "target".into(),
+                start_received_at_ns: 1,
+                end_received_at_ns: 2,
+                bucket_ms: 1_000,
+                top_depth: 5,
+            },
+            target_research_plan_sha256: plan.content_hash().unwrap(),
+        };
+        let campaign_root = loaded
+            .request
+            .campaign_result_put_url
+            .split_once("/campaign-id=")
+            .unwrap()
+            .0;
+        let build_target_request =
+            |proposal: Option<&CampaignNextFamilyProposalV1>,
+             target_inputs: &str,
+             target_plan: &CexCampaignResearchPlanV1| {
+                build_request_from_parts(
+                    &loaded.request.feature_url,
+                    &loaded.request.feature_sha256,
+                    &loaded.request.materialization_url,
+                    &loaded.request.materialization_sha256,
+                    &loaded.request.replay_artifact_url,
+                    &loaded.request.replay_artifact_sha256,
+                    &loaded.request.replay_manifest_url,
+                    &loaded.request.replay_manifest_sha256,
+                    target_inputs,
+                    &loaded.request.producer_source_revision,
+                    &loaded.request.producer_image_identity,
+                    target_plan,
+                    &loaded.request.build_source_revision,
+                    &loaded.request.image_identity,
+                    campaign_root,
+                    &loaded.request.holdout_id,
+                    &[11, 17],
+                    proposal,
+                )
+            };
+
+        let proposal = proposal_for(parent.clone());
+        let target_request = build_target_request(Some(&proposal), &target_inputs_sha256, &plan);
+        assert!(
+            target_request.is_ok(),
+            "cross-input Study handoff should validate"
+        );
+
+        let mut wrong_parent = parent.clone();
+        wrong_parent.campaign_id = "cex-campaign-wrong-parent".into();
+        let wrong_parent_proposal = proposal_for(wrong_parent);
+        assert!(
+            build_target_request(Some(&wrong_parent_proposal), &target_inputs_sha256, &plan)
+                .is_err()
+        );
+
+        let mut wrong_input = parent.clone();
+        wrong_input.campaign_inputs_sha256 = "d".repeat(64);
+        let wrong_input_proposal = proposal_for(wrong_input);
+        assert!(
+            build_target_request(Some(&wrong_input_proposal), &target_inputs_sha256, &plan)
+                .is_err()
+        );
+
+        assert!(build_target_request(None, &target_inputs_sha256, &plan).is_err());
     }
 
     #[test]

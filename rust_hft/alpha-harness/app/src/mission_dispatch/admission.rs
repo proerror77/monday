@@ -616,10 +616,10 @@ fn validate_study_target_window(
         .filter_map(|segment| segment["end_received_at_ns"].as_u64())
         .max()
         .context("next-family materialization end is missing")?;
-    if start != proposal.target_window.start_received_at_ns
-        || end != proposal.target_window.end_received_at_ns
+    if start < proposal.target_window.start_received_at_ns
+        || end > proposal.target_window.end_received_at_ns
     {
-        bail!("next-family proposal target window differs from source segments");
+        bail!("next-family proposal target window does not contain source segments");
     }
     Ok(())
 }
@@ -660,6 +660,7 @@ pub(super) fn validate_parent_settlement_binding(
         || record.reservation.campaign_id != parent.campaign_id
         || record.reservation.root_grant_sha256 != parent.root_grant_sha256
         || record.reservation.request_sha256 != parent.request_sha256
+        || record.reservation.execution.campaign_inputs_sha256 != parent.campaign_inputs_sha256
         || record.settlement.as_ref() != Some(&evidence.settlement)
         || record.claim.job_uid.as_deref() != Some(parent.terminal_job_uid.as_str())
         || record.terminal_pod_uid.as_deref() != Some(parent.terminal_pod_uid.as_str())

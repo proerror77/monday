@@ -99,15 +99,18 @@ validate_controller_state() {
     and all(.seeds[]; type == "number")
     and ((.input_mode // "receipt") == "receipt"
       or ((.input_mode == "fresh") and (.fresh | type == "object" and (.market | type == "string"))))
-    and ((.study // null) == null or (.study | type == "object"))
+    and ((.study // null) == null or ((.study | type == "object")
+      and ((.study.handoff_consumed // false) | type == "boolean")))
   ' "$controller_state" >/dev/null || die "controller state is invalid: $controller_state"
 }
 
 sha256_file() {
-  if command -v shasum >/dev/null; then
+  if command -v sha256sum >/dev/null; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null; then
     shasum -a 256 "$1" | awk '{print $1}'
   else
-    sha256sum "$1" | awk '{print $1}'
+    die "no portable SHA256 implementation is available"
   fi
 }
 
@@ -172,6 +175,7 @@ build_study_controller_contract() {
     --arg target_bucket_ms "$study_target_bucket_ms" \
     --arg target_top_depth "$study_target_top_depth" \
     --arg target_control "$study_target_control" \
+    --argjson handoff_consumed "$study_handoff_consumed" \
     --arg proposal_out "$study_proposal_out" \
     --arg plan_out "$study_plan_out" \
     '{study_id:$study_id,target_family_id:$target_family_id,target_horizon:$target_horizon,
@@ -180,7 +184,47 @@ build_study_controller_contract() {
       target_output_root:$target_output_root,target_output_prefix:$target_output_prefix,
       target_bucket_ms:$target_bucket_ms,target_top_depth:$target_top_depth,
       target_control:$target_control,
+      handoff_consumed:$handoff_consumed,
       proposal_out:$proposal_out,plan_out:$plan_out}')
+}
+
+load_fresh_controller_contract() {
+  local controller_state="$1"
+  fresh_raw_root="$(jq -er '.fresh.raw_root' "$controller_state")"
+  fresh_reference_root="$(jq -er '.fresh.reference_root' "$controller_state")"
+  fresh_start_received_at_ns="$(jq -r '.fresh.start_received_at_ns // empty' "$controller_state")"
+  fresh_end_received_at_ns="$(jq -r '.fresh.end_received_at_ns // empty' "$controller_state")"
+  fresh_symbol="$(jq -er '.fresh.symbol' "$controller_state")"
+  fresh_image_ref="$(jq -er '.fresh.image_ref' "$controller_state")"
+  fresh_mission_id="$(jq -er '.fresh.mission_id' "$controller_state")"
+  fresh_output_root="$(jq -er '.fresh.output_root' "$controller_state")"
+  fresh_output_prefix="$(jq -er '.fresh.output_prefix' "$controller_state")"
+  fresh_bucket_ms="$(jq -er '.fresh.bucket_ms' "$controller_state")"
+  fresh_label_horizon_buckets="$(jq -er '.fresh.label_horizon_buckets' "$controller_state")"
+  fresh_top_depth="$(jq -er '.fresh.top_depth' "$controller_state")"
+  fresh_duration_ns="$(jq -r '.fresh.duration_ns // empty' "$controller_state")"
+  fresh_cutoff_received_at_ns="$(jq -r '.fresh.cutoff_received_at_ns // empty' "$controller_state")"
+  fresh_max_candidates="$(jq -r '.fresh.max_candidates // empty' "$controller_state")"
+  fresh_materializer="$(jq -er '.fresh.materializer' "$controller_state")"
+  fresh_binary_dir="$(jq -r '.fresh.binary_dir // empty' "$controller_state")"
+  fresh_max_scan_entries="$(jq -er '.fresh.max_scan_entries' "$controller_state")"
+  fresh_max_inputs="$(jq -er '.fresh.max_inputs' "$controller_state")"
+  fresh_max_input_bytes="$(jq -er '.fresh.max_input_bytes' "$controller_state")"
+  fresh_materializer_timeout_seconds="$(jq -er '.fresh.materializer_timeout_seconds' "$controller_state")"
+  fresh_max_materializer_output_bytes="$(jq -er '.fresh.max_materializer_output_bytes' "$controller_state")"
+  fresh_inventory_out="$(jq -er '.fresh.inventory_out' "$controller_state")"
+  fresh_request_out="$(jq -er '.fresh.request_out' "$controller_state")"
+  fresh_materializer_work_dir="$(jq -er '.fresh.materializer_work_dir' "$controller_state")"
+  fresh_report_out="$(jq -er '.fresh.preparation_report' "$controller_state")"
+}
+
+mark_study_handoff_consumed() {
+  local controller_state="$work_dir/controller-inputs.json"
+  local state_tmp="$controller_state.partial.$$"
+  [[ -s "$controller_state" ]] || die "controller state is missing before Study handoff commit"
+  jq '.study.handoff_consumed = true' "$controller_state" >"$state_tmp"
+  mv -f -- "$state_tmp" "$controller_state"
+  study_handoff_consumed=true
 }
 
 validate_fresh_controller_owner() {
@@ -471,6 +515,7 @@ study_target_top_depth="5"
 study_target_control=""
 study_target_control_cli=""
 study_retry_authority=false
+study_handoff_consumed=false
 study_proposal_out=""
 study_plan_out=""
 study_proposal_path=""
@@ -579,6 +624,7 @@ if [[ "$mode" == "approve" || "$mode" == "ack-readback" ]]; then
   job_timeout="$(jq -er '.job_timeout' "$state")"
   if [[ "$(jq -r '.input_mode // "receipt"' "$state")" == "fresh" ]]; then
     fresh_mode=true
+    load_fresh_controller_contract "$state"
   fi
   if [[ "$(jq -r '.study // null' "$state")" != null ]]; then
     study_id="$(jq -er '.study.study_id' "$state")"
@@ -803,6 +849,7 @@ study_handoff() {
   local target_input_root target_campaign_inputs target_report target_request
   local target_inventory target_materializer_work target_output_root
   local proposal="$study_dir/proposal.json" proposal_report="$study_dir/proposal-report.json"
+  local proposal_report_partial="$proposal_report.partial"
   local plan="$study_dir/research-plan.json" preparation="$study_dir/preparation.json"
   local proposal_status proposal_reason proposal_fingerprint existing_fingerprint target_control_sha
   local report_sha archive_path
@@ -902,12 +949,14 @@ study_handoff() {
   target_control_sha="missing"
   [[ -n "$study_target_control" && -s "$study_target_control" ]] \
     && target_control_sha="$(sha256_file "$study_target_control")"
-  proposal_fingerprint="$(printf '%s\0' \
+  printf '%s\0' \
     "$(sha256_file "$generation_dir/campaign-result.json")" \
     "$(sha256_file "$generation_dir/settlement-report.json")" \
     "$(sha256_file "$study_target_horizon")" \
     "$target_control_sha" \
-    "$(sha256_file "$target_campaign_inputs")" | shasum -a 256 | awk '{print $1}')"
+    "$(sha256_file "$target_campaign_inputs")" >"$study_dir/proposal-fingerprint-input.partial"
+  proposal_fingerprint="$(sha256_file "$study_dir/proposal-fingerprint-input.partial")"
+  rm -f -- "$study_dir/proposal-fingerprint-input.partial"
   if [[ -s "$proposal_report" ]] \
     && [[ "$(jq -r '.status // empty' "$proposal_report" 2>/dev/null || true)" == "needs_authority" ]]; then
     existing_fingerprint=""
@@ -927,6 +976,7 @@ study_handoff() {
     fi
   fi
   if [[ ! -s "$proposal_report" ]]; then
+    rm -f -- "$proposal_report_partial"
     "$alpha_harness" mission campaign-study-propose \
       --parent-submission "$generation_dir/submission.json" \
       --parent-result "$generation_dir/campaign-result.json" \
@@ -945,7 +995,8 @@ study_handoff() {
       --target-bucket-ms "$study_target_bucket_ms" \
       --target-top-depth "$study_target_top_depth" \
       --output "$proposal" \
-      --research-plan-output "$plan" >"$proposal_report"
+      --research-plan-output "$plan" >"$proposal_report_partial"
+    mv -f -- "$proposal_report_partial" "$proposal_report"
     printf '%s\n' "$proposal_fingerprint" >"$study_dir/proposal-fingerprint"
   fi
   proposal_status="$(jq -er '.status' "$proposal_report")"
@@ -1182,7 +1233,11 @@ else
     >"$state_tmp"
   if [[ -e "$state" ]]; then
     # Preserve historical checkpoints; only the retired token budget is irrelevant.
-    jq -e -s 'length == 2 and ((.[0] | del(.control,.study.target_control)) == (.[1] | del(.max_tokens,.control,.study.target_control)))' \
+    jq -e -s '
+      def comparable:
+        del(.control,.max_tokens,.study.target_control,.study.handoff_consumed);
+      length == 2 and ((.[0] | comparable) == (.[1] | comparable))
+    ' \
       "$state_tmp" "$state" >/dev/null \
       || die "existing work directory belongs to different controller inputs"
     if [[ -n "$study_target_control_cli" ]]; then
@@ -1280,7 +1335,12 @@ while ((generation <= max_follow_ups)); do
       exit 0
     fi
     if [[ "$(jq -er '.outcome' "$generation_dir/generation-complete")" == study_handoff ]]; then
-      study_handoff "$generation_dir" "$control"
+      dispatch_control="${dispatch_control:-$control}"
+      if [[ -z "$dispatch_control" ]]; then
+        dispatch_control="$(printenv MONDAY_CAMPAIGN_CONTROL 2>/dev/null || true)"
+      fi
+      study_handoff "$generation_dir" "$dispatch_control"
+      mark_study_handoff_consumed
       generation=$((generation + 1))
       continue
     fi
@@ -1412,8 +1472,8 @@ while ((generation <= max_follow_ups)); do
       exit 0
     fi
     dispatch_control_args=()
-    if [[ -n "$control" ]]; then
-      dispatch_control_args=(--control "$control")
+    if [[ -n "$dispatch_control" ]]; then
+      dispatch_control_args=(--control "$dispatch_control")
     fi
     "$alpha_harness" mission dispatch submit \
       "${dispatch_control_args[@]}" \
@@ -1679,14 +1739,18 @@ while ((generation <= max_follow_ups)); do
     exit 0
   fi
 
-  if [[ -n "$study_id" ]]; then
+  if [[ -n "$study_id" && "$study_handoff_consumed" != true ]]; then
     controller_stage="study_handoff"
     log_event stage_started \
       "generation=$generation" "stage=study_handoff" \
       "parent_campaign_id=$campaign_id" "parent_result_sha256=$result_sha256"
     dispatch_control="${dispatch_control:-$control}"
+    if [[ -z "$dispatch_control" ]]; then
+      dispatch_control="$(printenv MONDAY_CAMPAIGN_CONTROL 2>/dev/null || true)"
+    fi
     study_handoff "$generation_dir" "$dispatch_control"
     commit_generation_completion study_handoff
+    mark_study_handoff_consumed
     rm -f -- "$request" "$submission"
     if [[ "$mode" == ack-readback ]]; then
       controller_stage="approval_handoff"

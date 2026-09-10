@@ -520,6 +520,11 @@ jobs:
             test -x /usr/local/bin/aliyun
             test -x /usr/local/bin/kubectl
             test -x /usr/local/bin/alpha-harness
+            test -x /usr/local/bin/binance-market-tape-slicer
+            test -x /usr/local/bin/lob-pit-materializer
+            test -x /usr/local/bin/binance-replay-parquet-materializer
+            test -x /usr/local/bin/cex-materialization-entrypoint.sh
+            bash -n /usr/local/bin/cex-materialization-entrypoint.sh
             test -x /opt/monday/deployment/aliyun/research/scripts/campaign-cycle-controller.sh
             test -r /opt/monday/deployment/aliyun/research/k8s/campaign-cycle-controller-job.example.yaml
           '

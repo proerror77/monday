@@ -172,6 +172,15 @@ case "$1 $2" in
   "mission campaign-study-propose")
     output="$(value_after --output "$@")"
     plan_output="$(value_after --research-plan-output "$@")"
+    increment "$FAKE_STATE/study-propose-count"
+    if [[ "${FAKE_FAIL_STUDY_PROPOSE_ONCE:-0}" == 1 \
+      && ! -e "$FAKE_STATE/study-propose-failed-once" ]] \
+      || [[ -e "$FAKE_STATE/fail-study-propose-once" ]]; then
+      : >"$FAKE_STATE/study-propose-failed-once"
+      rm -f -- "$FAKE_STATE/fail-study-propose-once"
+      printf '{"status":"'
+      exit 75
+    fi
     if [[ "${FAKE_STUDY_PROPOSAL_STATUS:-ready}" == needs_authority ]]; then
       jq -n --arg reason "${FAKE_STUDY_PROPOSAL_REASON:-target_family_is_not_a_predeclared_study_member}" \
         '{schema_version:"monday.campaign_study_proposal_report.v1",status:"needs_authority",reason:$reason}'
@@ -342,7 +351,9 @@ if [[ "$source_object" == *"/campaign-result.json"* ]]; then
   fi
   request_sha256="$(<"$FAKE_STATE/request-sha256")"
   termination="campaign_no_candidate"
-  [[ "$generation" != 1 ]] || termination="campaign_finalized"
+  if [[ "$generation" == 1 && "${FAKE_STUDY_TARGET_NO_CANDIDATE:-0}" != 1 ]]; then
+    termination="campaign_finalized"
+  fi
   mission_r1_sha="$(sha_text "mission-g$generation-r1")"
   mission_r2_sha="$(sha_text "mission-g$generation-r2")"
   bundle_r1_sha="$(sha_text "bundle-g$generation-r1")"
@@ -385,10 +396,10 @@ if [[ "$source_object" == *"/campaign-result.json"* ]]; then
         {round_id:"r1",seed:7,identity:$request[0].rounds[0].identity,mission_sha256:$mission_r1_sha,request_sha256:$request_sha256,result_bundle_sha256:$bundle_r1_sha,result_readback_bundle_sha256:$bundle_r1_sha,consumed_trials:1},
         {round_id:"r2",seed:11,identity:$request[0].rounds[1].identity,mission_sha256:$mission_r2_sha,request_sha256:$request_sha256,result_bundle_sha256:$bundle_r2_sha,result_readback_bundle_sha256:$bundle_r2_sha,consumed_trials:1}
       ],
-      selected_round_id:(if $generation == 1 then "r1" else null end),
-      selected_candidate_id:(if $generation == 1 then "candidate-1" else null end),
-      selected_candidate_content_hash:(if $generation == 1 then ("f" * 64) else null end),
-      finalization:(if $generation == 1 then {verified:true} else null end)
+      selected_round_id:(if $termination == "campaign_finalized" then "r1" else null end),
+      selected_candidate_id:(if $termination == "campaign_finalized" then "candidate-1" else null end),
+      selected_candidate_content_hash:(if $termination == "campaign_finalized" then ("f" * 64) else null end),
+      finalization:(if $termination == "campaign_finalized" then {verified:true} else null end)
     }' >"$destination"
 elif [[ "$source_object" == *"/mission.json"* ]]; then
   round_id="r1"
@@ -1043,8 +1054,8 @@ for ((study_index = 0; study_index < ${#study_args[@]}; study_index++)); do
     study_args[study_index + 1]="$study_cycle"
   fi
 done
+study_args+=(--max-follow-ups 2)
 study_args+=(
-  --control "$bin/control"
   --study-id study-test
   --study-target-family-id target-family
   --study-target-horizon "$study_horizon"
@@ -1057,17 +1068,27 @@ study_args+=(
   --study-target-top-depth 5
   --study-target-control "$study_target_control"
 )
-FAKE_STUDY_PROPOSAL_STATUS=needs_authority FAKE_STUDY_PROPOSAL_REASON=first_gap "$controller" "${study_args[@]}" \
+MONDAY_CAMPAIGN_CONTROL="$bin/control" "$controller" "${study_args[@]}" \
   >"$root/study-start.stdout" 2>"$root/study-start.stderr"
 study_ack_args=(
   ack-readback --alpha-harness "$bin/alpha-harness" --aliyun "$bin/aliyun" --kubectl "$bin/kubectl"
   --campaign-pod-name pod-g0 --work-dir "$study_cycle"
 )
-if ! FAKE_STUDY_PROPOSAL_STATUS=needs_authority "$controller" "${study_ack_args[@]}" \
+: >"$FAKE_STATE/fail-study-propose-once"
+if MONDAY_CAMPAIGN_CONTROL="$bin/control" FAKE_STUDY_PROPOSAL_STATUS=needs_authority \
+  "$controller" "${study_ack_args[@]}" \
+  >"$root/study-interrupted.stdout" 2>"$root/study-interrupted.stderr"; then
+  echo "interrupted Study proposal unexpectedly completed" >&2
+  exit 1
+fi
+test -s "$study_cycle/generation-0/study/proposal-report.json.partial"
+test ! -e "$study_cycle/generation-0/study/proposal-report.json"
+if ! MONDAY_CAMPAIGN_CONTROL="$bin/control" FAKE_STUDY_PROPOSAL_STATUS=needs_authority "$controller" "${study_ack_args[@]}" \
   >"$root/study-needs.stdout" 2>"$root/study-needs.stderr"; then
   cat "$root/study-needs.stderr" >&2
   exit 1
 fi
+test ! -e "$study_cycle/generation-0/study/proposal-report.json.partial"
 jq -e '.status == "needs_authority" and (.reason | startswith("study_"))' \
   "$study_cycle/generation-0/needs-authority.json" >/dev/null
 test ! -e "$study_cycle/generation-0/generation-complete"
@@ -1075,14 +1096,14 @@ test ! -e "$study_cycle/generation-0/generation-complete"
 # Explicit authority resume retries the cached report even with unchanged
 # input/control paths and preserves the prior report evidence.
 study_resume_ack_args=("${study_ack_args[@]}" --study-retry-authority)
-if ! FAKE_STUDY_PROPOSAL_STATUS=needs_authority FAKE_STUDY_PROPOSAL_REASON=second_gap "$controller" "${study_resume_ack_args[@]}" \
+if ! MONDAY_CAMPAIGN_CONTROL="$bin/control" FAKE_STUDY_PROPOSAL_STATUS=needs_authority FAKE_STUDY_PROPOSAL_REASON=second_gap "$controller" "${study_resume_ack_args[@]}" \
   >"$root/study-resumed.stdout" 2>"$root/study-resumed.stderr"; then
   cat "$root/study-resumed.stderr" >&2
   exit 1
 fi
 archive_count="$(find "$study_cycle/generation-0/study" -name 'proposal-report.needs-authority.*.json' | wc -l | tr -d ' ')"
 test "$archive_count" -eq 1
-if ! FAKE_STUDY_PROPOSAL_STATUS=ready "$controller" "${study_resume_ack_args[@]}" \
+if ! MONDAY_CAMPAIGN_CONTROL="$bin/control" FAKE_STUDY_PROPOSAL_STATUS=ready "$controller" "${study_resume_ack_args[@]}" \
   >"$root/study-authorized.stdout" 2>"$root/study-authorized.stderr"; then
   cat "$root/study-authorized.stderr" >&2
   exit 1
@@ -1096,20 +1117,37 @@ jq -e '.outcome == "study_handoff" and .study_handoff_sha256 != ""' \
   "$study_cycle/generation-0/generation-complete" >/dev/null
 journal_count="$(find "$study_cycle/generation-0/study" -name 'proposal-report.needs-authority.*.json' | wc -l | tr -d ' ')"
 test "$journal_count" -eq 2
+study_propose_before_restart="$(<"$FAKE_STATE/study-propose-count")"
+MONDAY_CAMPAIGN_CONTROL="$bin/control" FAKE_STUDY_PROPOSAL_STATUS=ready \
+  "$controller" "${study_args[@]}" \
+  >"$root/study-restart.stdout" 2>"$root/study-restart.stderr"
+test "$(<"$FAKE_STATE/study-propose-count")" == "$study_propose_before_restart"
 study_approve_args=("${approve_args[@]}")
 for ((study_index = 0; study_index < ${#study_approve_args[@]}; study_index++)); do
   if [[ "${study_approve_args[study_index]}" == --work-dir ]]; then
     study_approve_args[study_index + 1]="$study_cycle"
   fi
 done
-"$controller" "${study_approve_args[@]}" \
+MONDAY_CAMPAIGN_CONTROL="$bin/control" "$controller" "${study_approve_args[@]}" \
   >"$root/study-approve.stdout" 2>"$root/study-approve.stderr"
 test -s "$study_cycle/generation-1/request.json"
 study_ack_g1_args=(
   ack-readback --alpha-harness "$bin/alpha-harness" --aliyun "$bin/aliyun" --kubectl "$bin/kubectl"
   --campaign-pod-name pod-g1 --work-dir "$study_cycle"
 )
-"$controller" "${study_ack_g1_args[@]}" >"$root/study-ack-g1.stdout" 2>"$root/study-ack-g1.stderr"
-test -s "$study_cycle/cycle-result.json"
+study_propose_before_g1="$(<"$FAKE_STATE/study-propose-count")"
+if ! MONDAY_CAMPAIGN_CONTROL="$bin/control" FAKE_STUDY_TARGET_NO_CANDIDATE=1 FAKE_LEARN_OUTCOME=no_improvement \
+  "$controller" "${study_ack_g1_args[@]}" \
+  >"$root/study-ack-g1.stdout" 2>"$root/study-ack-g1.stderr"; then
+  cat "$root/study-ack-g1.stderr" >&2
+  exit 1
+fi
+jq -e '.termination_reason == "no_improvement"' "$study_cycle/cycle-result.json" >/dev/null
+# One ACK process reuses the verified generation-0 Study handoff, reads the
+# generation-1 target, observes no_candidate, then falls back to learning.
+grep -Fq 'event=generation_checkpoint_reused generation=0' "$root/study-ack-g1.stderr"
+grep -Fq 'event=generation_started generation=1' "$root/study-ack-g1.stderr"
+grep -Fq 'event=stage_started generation=1 stage=campaign_learning' "$root/study-ack-g1.stderr"
+test "$(<"$FAKE_STATE/study-propose-count")" == "$study_propose_before_g1"
 printf 'campaign Study handoff recovery: PASS\n'
 echo "campaign cycle controller test: PASS"
