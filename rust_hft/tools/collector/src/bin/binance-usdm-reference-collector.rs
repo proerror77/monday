@@ -326,7 +326,9 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use hft_collector::binance_usdm_reference_collector::TimedJson;
+    use hft_collector::binance_usdm_reference_collector::{
+        BinanceReferenceError, ReferenceResult, TimedJson,
+    };
     use serde_json::{json, Value};
     use std::cell::Cell;
     use tempfile::tempdir;
@@ -344,16 +346,19 @@ mod tests {
         fn source_origin(&self) -> &str {
             OFFICIAL_USDM_SOURCE_ORIGIN
         }
-        async fn server_time(&self) -> Result<TimedJson> {
+        async fn server_time(&self) -> ReferenceResult<TimedJson> {
             if self.fail {
-                bail!("injected Binance API failure");
+                return Err(BinanceReferenceError::Request {
+                    endpoint: "/fapi/v1/time".to_owned(),
+                    message: "injected Binance API failure".to_owned(),
+                });
             }
             Ok(timed(
                 json!({"serverTime": SOURCE_MS}),
                 self.server_received_at_ns,
             ))
         }
-        async fn exchange_info(&self) -> Result<TimedJson> {
+        async fn exchange_info(&self) -> ReferenceResult<TimedJson> {
             Ok(timed(
                 json!({"symbols":[{
                     "symbol":"BTCUSDT","pair":"BTCUSDT","contractType":"PERPETUAL",
@@ -368,7 +373,7 @@ mod tests {
                 RECEIVED_NS - 50,
             ))
         }
-        async fn premium_index(&self) -> Result<TimedJson> {
+        async fn premium_index(&self) -> ReferenceResult<TimedJson> {
             Ok(timed(
                 json!([{
                     "symbol":"BTCUSDT","markPrice":"101","indexPrice":"100",
@@ -378,7 +383,10 @@ mod tests {
                 RECEIVED_NS,
             ))
         }
-        async fn open_interest(&self, _symbol: &str) -> Result<TimedJson> {
+        async fn basis(&self, _pair: &str, _period: &str) -> ReferenceResult<TimedJson> {
+            Ok(timed(json!([]), RECEIVED_NS))
+        }
+        async fn open_interest(&self, _symbol: &str) -> ReferenceResult<TimedJson> {
             Ok(timed(
                 json!({
                     "symbol":"BTCUSDT","openInterest":"12.3","time":SOURCE_MS

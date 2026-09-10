@@ -1,172 +1,17 @@
+pub use adapter_binance_data::reference::{
+    BinanceReferenceError, HttpReferenceSource, ReferenceResult, ReferenceSource, TimedJson,
+    OFFICIAL_USDM_SOURCE_ORIGIN,
+};
 use anyhow::{bail, Context, Result};
-use async_trait::async_trait;
 use data::binance_usdm_reference::{
     active_perpetual_contracts, mark_index_funding_observations, open_interest_observation,
     CompleteReferenceBatch, ReferenceClockValidator, ReferenceKind, ReferenceMarket,
-    EXCHANGE_INFO_ENDPOINT, OPEN_INTEREST_ENDPOINT, PREMIUM_INDEX_ENDPOINT, SERVER_TIME_ENDPOINT,
 };
 use futures::{stream, StreamExt, TryStreamExt};
 use serde_json::Value;
 use std::collections::BTreeSet;
-use std::fmt;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tracing::warn;
-
-pub const OFFICIAL_USDM_SOURCE_ORIGIN: &str = "https://fapi.binance.com";
-pub const OFFICIAL_SPOT_SOURCE_ORIGIN: &str = "https://api.binance.com";
-
-#[derive(Debug, Clone)]
-pub struct TimedJson {
-    pub value: Value,
-    pub received_at_ns: u64,
-}
-
-#[derive(Debug)]
-struct RateLimited {
-    endpoint: String,
-    retry_after_seconds: u64,
-}
-
-impl fmt::Display for RateLimited {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "Binance reference endpoint {} returned HTTP 429 Too Many Requests",
-            self.endpoint
-        )
-    }
-}
-
-impl std::error::Error for RateLimited {}
-
-#[async_trait]
-pub trait ReferenceSource: Sync {
-    fn source_origin(&self) -> &str;
-    async fn server_time(&self) -> Result<TimedJson>;
-    async fn exchange_info(&self) -> Result<TimedJson>;
-    async fn premium_index(&self) -> Result<TimedJson>;
-    async fn open_interest(&self, symbol: &str) -> Result<TimedJson>;
-}
-
-#[derive(Debug, Clone)]
-pub struct HttpReferenceSource {
-    client: reqwest::Client,
-    source_origin: String,
-}
-
-impl HttpReferenceSource {
-    pub fn new(source_origin: &str, timeout: Duration) -> Result<Self> {
-        let origin = source_origin.trim_end_matches('/');
-        let expected_host = match origin {
-            OFFICIAL_USDM_SOURCE_ORIGIN => "fapi.binance.com",
-            OFFICIAL_SPOT_SOURCE_ORIGIN => "api.binance.com",
-            _ => bail!("Binance reference source must be an official Binance origin"),
-        };
-        if origin != source_origin && source_origin != format!("{origin}/") {
-            bail!("Binance reference source must not include a path");
-        }
-        let parsed = reqwest::Url::parse(source_origin).context("invalid Binance REST origin")?;
-        if parsed.scheme() != "https"
-            || parsed.host_str() != Some(expected_host)
-            || parsed.port().is_some()
-            || !parsed.username().is_empty()
-            || parsed.password().is_some()
-            || parsed.path() != "/"
-            || parsed.query().is_some()
-            || parsed.fragment().is_some()
-        {
-            bail!("Binance reference source must not include credentials, port, path, or query");
-        }
-        Ok(Self {
-            client: reqwest::Client::builder()
-                .timeout(timeout)
-                .build()
-                .context("build Binance reference HTTP client")?,
-            source_origin: origin.to_owned(),
-        })
-    }
-
-    async fn get(&self, endpoint: &str, symbol: Option<&str>) -> Result<TimedJson> {
-        self.get_url(
-            &format!("{}{endpoint}", self.source_origin),
-            endpoint,
-            symbol,
-        )
-        .await
-    }
-
-    pub async fn get_public(&self, endpoint: &str) -> Result<TimedJson> {
-        self.get(endpoint, None).await
-    }
-
-    pub fn source_origin(&self) -> &str {
-        &self.source_origin
-    }
-
-    async fn get_url(&self, url: &str, endpoint: &str, symbol: Option<&str>) -> Result<TimedJson> {
-        let mut request = self.client.get(url);
-        if let Some(symbol) = symbol {
-            request = request.query(&[("symbol", symbol)]);
-        }
-        let response = request
-            .send()
-            .await
-            .context("Binance reference request failed")?;
-        let status = response.status();
-        let retry_after_seconds = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(30)
-            .min(60);
-        let bytes = response
-            .bytes()
-            .await
-            .context("Binance reference response body failed")?;
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(RateLimited {
-                endpoint: endpoint.to_owned(),
-                retry_after_seconds,
-            }
-            .into());
-        }
-        let received_at_ns = now_ns()?;
-        if !status.is_success() {
-            bail!("Binance reference endpoint {endpoint} returned HTTP {status}");
-        }
-        let value = serde_json::from_slice(&bytes).with_context(|| {
-            format!("Binance reference endpoint {endpoint} returned invalid JSON")
-        })?;
-        Ok(TimedJson {
-            value,
-            received_at_ns,
-        })
-    }
-}
-
-#[async_trait]
-impl ReferenceSource for HttpReferenceSource {
-    fn source_origin(&self) -> &str {
-        &self.source_origin
-    }
-
-    async fn server_time(&self) -> Result<TimedJson> {
-        self.get(SERVER_TIME_ENDPOINT, None).await
-    }
-
-    async fn exchange_info(&self) -> Result<TimedJson> {
-        self.get(EXCHANGE_INFO_ENDPOINT, None).await
-    }
-
-    async fn premium_index(&self) -> Result<TimedJson> {
-        self.get(PREMIUM_INDEX_ENDPOINT, None).await
-    }
-
-    async fn open_interest(&self, symbol: &str) -> Result<TimedJson> {
-        self.get(OPEN_INTEREST_ENDPOINT, Some(symbol)).await
-    }
-}
 
 #[derive(Debug)]
 pub struct CollectedReferenceBatch {
@@ -197,15 +42,19 @@ pub async fn collect_complete_reference_batch(
     }
     match collect_complete_reference_batch_once(source, oi_concurrency, clocks).await {
         Err(error) => {
-            let Some(rate_limit) = error.downcast_ref::<RateLimited>() else {
+            let Some(BinanceReferenceError::RateLimited {
+                endpoint,
+                retry_after_seconds,
+            }) = error.downcast_ref::<BinanceReferenceError>()
+            else {
                 return Err(error);
             };
             warn!(
-                endpoint = rate_limit.endpoint,
-                retry_after_seconds = rate_limit.retry_after_seconds,
+                endpoint,
+                retry_after_seconds,
                 "Binance rate limited; restarting the complete reference batch once"
             );
-            tokio::time::sleep(Duration::from_secs(rate_limit.retry_after_seconds)).await;
+            tokio::time::sleep(Duration::from_secs(*retry_after_seconds)).await;
             collect_complete_reference_batch_once(source, oi_concurrency, clocks).await
         }
         result => result,
@@ -282,24 +131,15 @@ async fn collect_complete_reference_batch_once(
     })
 }
 
-fn now_ns() -> Result<u64> {
-    Ok(u64::try_from(
-        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
-    )?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::Result;
     use async_trait::async_trait;
+    use data::binance_usdm_reference::{OPEN_INTEREST_ENDPOINT, PREMIUM_INDEX_ENDPOINT};
     use rust_decimal::Decimal;
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::thread;
 
     const SOURCE_MS: u64 = 1_700_000_000_000;
     const RECEIVED_NS: u64 = 1_700_000_000_500_000_000;
@@ -340,11 +180,11 @@ mod tests {
             self.origin
         }
 
-        async fn server_time(&self) -> Result<TimedJson> {
+        async fn server_time(&self) -> ReferenceResult<TimedJson> {
             Ok(Self::timed(json!({"serverTime": SOURCE_MS}), RECEIVED_NS))
         }
 
-        async fn exchange_info(&self) -> Result<TimedJson> {
+        async fn exchange_info(&self) -> ReferenceResult<TimedJson> {
             Ok(Self::timed(
                 json!({"symbols":[
                     {"symbol":"BTCUSDT","pair":"BTCUSDT","contractType":"PERPETUAL","deliveryDate":4133404800000_u64,"onboardDate":1598252400000_u64,"status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","marginAsset":"USDT","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.10"},{"filterType":"LOT_SIZE","stepSize":"0.001"},{"filterType":"MIN_NOTIONAL","notional":"5"}]},
@@ -354,7 +194,7 @@ mod tests {
             ))
         }
 
-        async fn premium_index(&self) -> Result<TimedJson> {
+        async fn premium_index(&self) -> ReferenceResult<TimedJson> {
             Ok(Self::timed(
                 json!([
                     {"symbol":"BTCUSDT","markPrice":"101.0","indexPrice":"100.0","lastFundingRate":"0.0001","interestRate":"0.0001","nextFundingTime":SOURCE_MS + 28_800_000,"time":SOURCE_MS},
@@ -364,12 +204,17 @@ mod tests {
             ))
         }
 
-        async fn open_interest(&self, symbol: &str) -> Result<TimedJson> {
-            let value = self
-                .open_interest
-                .get(symbol)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("missing fake OI for {symbol}"))?;
+        async fn basis(&self, _pair: &str, _period: &str) -> ReferenceResult<TimedJson> {
+            Ok(Self::timed(json!([]), RECEIVED_NS + 25))
+        }
+
+        async fn open_interest(&self, symbol: &str) -> ReferenceResult<TimedJson> {
+            let value = self.open_interest.get(symbol).cloned().ok_or_else(|| {
+                BinanceReferenceError::Request {
+                    endpoint: OPEN_INTEREST_ENDPOINT.to_owned(),
+                    message: format!("missing fake OI for {symbol}"),
+                }
+            })?;
             Ok(Self::timed(value, RECEIVED_NS + 30))
         }
     }
@@ -385,27 +230,30 @@ mod tests {
             self.inner.source_origin()
         }
 
-        async fn server_time(&self) -> Result<TimedJson> {
+        async fn server_time(&self) -> ReferenceResult<TimedJson> {
             self.server_time_calls.fetch_add(1, Ordering::SeqCst);
             self.inner.server_time().await
         }
 
-        async fn exchange_info(&self) -> Result<TimedJson> {
+        async fn exchange_info(&self) -> ReferenceResult<TimedJson> {
             self.inner.exchange_info().await
         }
 
-        async fn premium_index(&self) -> Result<TimedJson> {
+        async fn premium_index(&self) -> ReferenceResult<TimedJson> {
             if self.server_time_calls.load(Ordering::SeqCst) == 1 {
-                return Err(RateLimited {
+                return Err(BinanceReferenceError::RateLimited {
                     endpoint: PREMIUM_INDEX_ENDPOINT.to_owned(),
                     retry_after_seconds: 0,
-                }
-                .into());
+                });
             }
             self.inner.premium_index().await
         }
 
-        async fn open_interest(&self, symbol: &str) -> Result<TimedJson> {
+        async fn basis(&self, pair: &str, period: &str) -> ReferenceResult<TimedJson> {
+            self.inner.basis(pair, period).await
+        }
+
+        async fn open_interest(&self, symbol: &str) -> ReferenceResult<TimedJson> {
             self.inner.open_interest(symbol).await
         }
     }
@@ -470,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn http_source_pins_the_exact_official_origin() {
+    fn shared_http_source_pins_the_exact_official_origin() {
         for origin in [
             "http://fapi.binance.com",
             "https://example.com",
@@ -481,45 +329,6 @@ mod tests {
             assert!(HttpReferenceSource::new(origin, Duration::from_secs(1)).is_err());
         }
         HttpReferenceSource::new(OFFICIAL_USDM_SOURCE_ORIGIN, Duration::from_secs(1)).unwrap();
-    }
-
-    #[tokio::test]
-    async fn http_source_preserves_bounded_retry_after_on_rate_limit() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buffer = [0_u8; 1024];
-            let _ = stream.read(&mut buffer);
-            stream
-                .write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                .unwrap();
-        });
-        let source = HttpReferenceSource {
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(1))
-                .build()
-                .unwrap(),
-            source_origin: OFFICIAL_USDM_SOURCE_ORIGIN.to_owned(),
-        };
-
-        let error = source
-            .get_url(
-                &format!("http://{address}/time"),
-                SERVER_TIME_ENDPOINT,
-                None,
-            )
-            .await
-            .unwrap_err();
-
-        assert_eq!(
-            error
-                .downcast_ref::<RateLimited>()
-                .unwrap()
-                .retry_after_seconds,
-            0
-        );
-        server.join().unwrap();
     }
 
     #[tokio::test]

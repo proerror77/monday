@@ -153,6 +153,40 @@ impl BinanceWebSocket {
         Ok(())
     }
 
+    /// Connect only to the USD-M force-order reference streams. Liquidation
+    /// notifications are typed reference observations and are intentionally
+    /// kept outside the generic MarketEvent trade/depth stream.
+    pub async fn connect_and_subscribe_force_orders(
+        &mut self,
+        symbols: Vec<Symbol>,
+    ) -> HftResult<()> {
+        if !self.usdm {
+            return Err(HftError::Config(
+                "Binance force-order streams require the USD-M endpoint".to_string(),
+            ));
+        }
+        if symbols.is_empty() {
+            return Err(HftError::Config(
+                "Binance force-order symbols cannot be empty".to_string(),
+            ));
+        }
+        self.symbols = symbols.clone();
+        let streams = Self::force_order_stream_names(&symbols);
+        let url = self.build_connection_url(&streams);
+        self.client.cfg.url = url;
+        self.client.connect().await.map_err(|error| {
+            HftError::Network(format!("Binance force-order connection failed: {error}"))
+        })?;
+        Ok(())
+    }
+
+    fn force_order_stream_names(symbols: &[Symbol]) -> Vec<String> {
+        symbols
+            .iter()
+            .map(|symbol| format!("{}@forceOrder", symbol.as_str().to_ascii_lowercase()))
+            .collect()
+    }
+
     fn build_connection_url(&self, streams: &[String]) -> String {
         if streams.is_empty() {
             return self.ws_base_url.clone();
@@ -331,6 +365,24 @@ mod tests {
         let none = BinanceWebSocket::new().with_trade_streams(BinanceTradeStreams::None);
         let streams = none.build_stream_names(&[Symbol::new("BTCUSDT")]).unwrap();
         assert!(!streams.iter().any(|stream| stream.contains("trade")));
+    }
+
+    #[tokio::test]
+    async fn force_order_subscription_is_usdm_only_and_symbol_bounded() {
+        let symbols = vec![Symbol::new("BTCUSDT"), Symbol::new("ETHUSDT")];
+        assert_eq!(
+            BinanceWebSocket::force_order_stream_names(&symbols),
+            vec!["btcusdt@forceOrder", "ethusdt@forceOrder"]
+        );
+        assert!(BinanceWebSocket::new()
+            .connect_and_subscribe_force_orders(symbols.clone())
+            .await
+            .is_err());
+        assert!(BinanceWebSocket::new()
+            .with_usdm()
+            .connect_and_subscribe_force_orders(Vec::new())
+            .await
+            .is_err());
     }
 
     #[test]

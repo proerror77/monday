@@ -38,6 +38,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 engine = { package = "hft-engine", path = "../../market-core/engine" }
 data = { package = "hft-data", path = "../../data-pipelines/core" }
+adapter-binance-data = { package = "hft-data-adapter-binance", path = "../../data-pipelines/adapters/adapter-binance" }
 hft-research-manifest = { path = "../../research-core/manifest" }
 hft-core = { path = "../../market-core/core" }
 integration = { package = "hft-integration", path = "../../market-core/integration" }
