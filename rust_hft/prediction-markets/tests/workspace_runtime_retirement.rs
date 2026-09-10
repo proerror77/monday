@@ -1560,6 +1560,23 @@ fn prediction_market_workspace_is_a_monday_module() {
             "Monday must own the Polymarket adapter seam: {adapter}"
         );
     }
+    for retired in ["ploy-trading", "ploy-connectivity"] {
+        assert!(
+            !workspace_root.join("crates").join(retired).exists(),
+            "the canonical state migration must retire package {retired}"
+        );
+        for ci_surface in [
+            ".github/workflows/ploy-ci.yml",
+            ".github/scripts/select-rust-ci-scope.sh",
+        ] {
+            let source = fs::read_to_string(monday_root.join(ci_surface))
+                .expect("read prediction CI package selection");
+            assert!(
+                !source.split_whitespace().any(|token| token == retired),
+                "{ci_surface} still selects removed package {retired}"
+            );
+        }
+    }
 }
 
 #[test]

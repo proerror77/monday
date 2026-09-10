@@ -2093,7 +2093,10 @@ mod tests {
                 venue: None,
                 strategy_id: None,
             }));
-            assert_eq!(oms.on_execution_event(&terminal_event).unwrap().status, expected_status);
+            assert_eq!(
+                oms.on_execution_event(&terminal_event).unwrap().status,
+                expected_status
+            );
             let terminal_changed_at = oms.get(&order_id).unwrap().state_changed_at;
             assert_eq!(terminal_changed_at, Some(10), "{label} terminal timestamp");
 

@@ -586,11 +586,11 @@ if [[ $prediction_package_affected == true ]]; then
 fi
 select_job_if_affected ploy/rust-control-plane ploy-agent-sidecar ploy-daemon-host new-ployd \
   ployctl ploy-control-client ploytui ploy-deployments ploy-operator-contracts ploy-platform \
-  ploy-platform-runtime ploy-trading
+  ploy-platform-runtime
 select_job_if_affected ploy/rust-runner-lean ploy-strategy-bundles ploy-market-data \
   ploy-strategy-runtime ploy-replay
 select_job_if_affected ploy/rust-runner-full new-ploy-runner ploy-backtest ploy-runner-host \
-  ploy-strategy-runtime ploy-strategy-bundles ploy-connectivity
+  ploy-strategy-runtime ploy-strategy-bundles
 select_job_if_affected ploy/rust-market-data ploy-market-data
 select_job_if_affected ploy/rust-research-heavy ploy-feed-loaders ploy-research ploy-market-data ploy-agent-sidecar
 select_job_if_affected ploy/frontend ploy-operator-contracts

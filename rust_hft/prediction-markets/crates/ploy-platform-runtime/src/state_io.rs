@@ -264,7 +264,8 @@ mod tests {
 
     #[test]
     fn trading_runtime_load_rejects_missing_or_tampered_envelope_digest() {
-        let mut missing_digest = persisted_snapshot("example.digest-missing", DeploymentRuntimeMode::Paper);
+        let mut missing_digest =
+            persisted_snapshot("example.digest-missing", DeploymentRuntimeMode::Paper);
         missing_digest
             .as_object_mut()
             .expect("envelope object")
@@ -275,10 +276,13 @@ mod tests {
             serde_json::to_string(&vec![missing_digest]).expect("serialize missing digest"),
         )
         .expect("write missing digest");
-        assert!(load_trading_runtimes(&missing_path, |_| Some(DeploymentRuntimeMode::Paper)).is_err());
+        assert!(
+            load_trading_runtimes(&missing_path, |_| Some(DeploymentRuntimeMode::Paper)).is_err()
+        );
         let _ = fs::remove_file(missing_path);
 
-        let mut tampered = persisted_snapshot("example.digest-tampered", DeploymentRuntimeMode::Paper);
+        let mut tampered =
+            persisted_snapshot("example.digest-tampered", DeploymentRuntimeMode::Paper);
         tampered["snapshot"]["deployment_id"] = serde_json::json!("unknown.owner");
         let tampered_path = temp_path("trading-tampered-digest");
         fs::write(
@@ -289,7 +293,8 @@ mod tests {
         assert!(load_trading_runtimes(&tampered_path, |_| None).is_err());
         let _ = fs::remove_file(tampered_path);
 
-        let mut tampered_mode = persisted_snapshot("example.digest-mode", DeploymentRuntimeMode::Paper);
+        let mut tampered_mode =
+            persisted_snapshot("example.digest-mode", DeploymentRuntimeMode::Paper);
         tampered_mode["snapshot"]["runtime_mode"] = serde_json::json!("live");
         let mode_path = temp_path("trading-tampered-mode");
         fs::write(
@@ -335,6 +340,19 @@ mod tests {
         tampered_inner_digest["canonical_snapshot_digest"] = serde_json::json!("sha256:tampered");
         assert_tampered_rejected("trading-tampered-inner-digest", tampered_inner_digest);
 
+        let mut stripped_portfolio_integrity = persisted_snapshot_with_multiple_fills(
+            "example.digest-portfolio",
+            DeploymentRuntimeMode::Paper,
+        );
+        stripped_portfolio_integrity["canonical_portfolio"]["canonical_state_digest"] =
+            serde_json::Value::Null;
+        stripped_portfolio_integrity["canonical_portfolio"]["reconciliation_exceptions"] =
+            serde_json::json!([]);
+        assert_tampered_rejected(
+            "trading-stripped-portfolio-integrity",
+            stripped_portfolio_integrity,
+        );
+
         let mut tampered_exception = persisted_snapshot_with_multiple_fills(
             "example.digest-exception",
             DeploymentRuntimeMode::Paper,
@@ -351,11 +369,16 @@ mod tests {
             persisted_snapshot("example.duplicate", DeploymentRuntimeMode::Paper),
         ];
         let path = temp_path("trading-duplicate-deployment");
-        fs::write(&path, serde_json::to_string(&snapshots).expect("serialize duplicates"))
-            .expect("write duplicates");
+        fs::write(
+            &path,
+            serde_json::to_string(&snapshots).expect("serialize duplicates"),
+        )
+        .expect("write duplicates");
         let error = load_trading_runtimes(&path, |_| Some(DeploymentRuntimeMode::Paper))
             .expect_err("duplicate deployment identities must fail closed");
-        assert!(error.to_string().contains("duplicate persisted trading deployment identity"));
+        assert!(error
+            .to_string()
+            .contains("duplicate persisted trading deployment identity"));
         let _ = fs::remove_file(path);
     }
 

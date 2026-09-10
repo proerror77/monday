@@ -6,7 +6,7 @@ use ploy_operator_contracts::{
 };
 use ploy_platform::DeploymentRecord;
 use portfolio_core::prediction::{
-    OrderState, PositionSnapshot, PnlSnapshot, RiskSnapshot, TradeSide, TradingIntent,
+    OrderState, PnlSnapshot, PositionSnapshot, RiskSnapshot, TradeSide, TradingIntent,
     TradingRuntime, TradingRuntimeSnapshot,
 };
 use rust_decimal::Decimal;
@@ -68,12 +68,13 @@ pub fn build_persisted_trading_state_snapshot(
             "trading runtime snapshot is missing canonical portfolio checkpoint",
         )
     })?;
-    let canonical_snapshot_digest = snapshot.canonical_snapshot_digest.clone().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "trading runtime snapshot is missing canonical integrity digest",
-        )
-    })?;
+    let canonical_snapshot_digest =
+        snapshot.canonical_snapshot_digest.clone().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "trading runtime snapshot is missing canonical integrity digest",
+            )
+        })?;
     if canonical_snapshot_digest != snapshot.integrity_digest() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

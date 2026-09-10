@@ -81,10 +81,20 @@ pub async fn reconcile_live_fills_with_stream(
             let local = order.order_id.clone();
             let deployment_id = record.deployment_id.clone();
             if let Some(venue_order_id) = order.venue_order_id {
-                bind_venue_identity(&mut venue_to_local, venue_order_id, local.clone(), deployment_id.clone())?;
+                bind_venue_identity(
+                    &mut venue_to_local,
+                    venue_order_id,
+                    local.clone(),
+                    deployment_id.clone(),
+                )?;
             }
             for venue_order_id in order.venue_order_history {
-                bind_venue_identity(&mut venue_to_local, venue_order_id, local.clone(), deployment_id.clone())?;
+                bind_venue_identity(
+                    &mut venue_to_local,
+                    venue_order_id,
+                    local.clone(),
+                    deployment_id.clone(),
+                )?;
             }
         }
     }
@@ -141,7 +151,8 @@ pub async fn reconcile_live_fills_with_stream(
             &account_fill.order_id.0,
             &order_deployments,
             &venue_to_local,
-        )? else {
+        )?
+        else {
             continue;
         };
         let event = ExecutionEvent::Fill {
@@ -273,7 +284,10 @@ fn resolve_account_fill_identity(
     order_deployments: &HashMap<String, String>,
     venue_to_local: &HashMap<String, (String, String)>,
 ) -> io::Result<Option<(String, String)>> {
-    match (order_deployments.get(order_id), venue_to_local.get(order_id)) {
+    match (
+        order_deployments.get(order_id),
+        venue_to_local.get(order_id),
+    ) {
         (None, None) => Ok(None),
         (Some(deployment_id), None) => Ok(Some((order_id.to_string(), deployment_id.clone()))),
         (None, Some((local_order_id, deployment_id))) => {
@@ -288,7 +302,10 @@ fn resolve_account_fill_identity(
                     venue_deployment_id,
                 ));
             }
-            Ok(Some((mapped_local_order_id.clone(), venue_deployment_id.clone())))
+            Ok(Some((
+                mapped_local_order_id.clone(),
+                venue_deployment_id.clone(),
+            )))
         }
     }
 }
@@ -997,7 +1014,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cross_deployment_local_venue_identity_collision_fails_before_reconciliation_mutation() {
+    async fn cross_deployment_local_venue_identity_collision_fails_before_reconciliation_mutation()
+    {
         let deployment_a = DeploymentRecord {
             deployment_id: "example.live-a".to_string(),
             bundle_id: "example".to_string(),
@@ -1070,13 +1088,9 @@ mod tests {
             .snapshot(&BTreeMap::new());
 
         let mut gateway = StaticExecutionGateway::acknowledged("unused");
-        let error = reconcile_live_fills(
-            &mut gateway,
-            &[deployment_a, deployment_b],
-            &mut trading,
-        )
-        .await
-        .expect_err("ambiguous venue identity must fail closed");
+        let error = reconcile_live_fills(&mut gateway, &[deployment_a, deployment_b], &mut trading)
+            .await
+            .expect_err("ambiguous venue identity must fail closed");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("shared-venue-order"));
         assert_eq!(
