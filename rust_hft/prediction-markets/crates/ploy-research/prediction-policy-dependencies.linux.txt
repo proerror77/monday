@@ -13,7 +13,7 @@ input:../market-core/integration/Cargo.toml=sha256:f54494420bc70e3e7465267411a9f
 input:../market-core/ports/Cargo.toml=sha256:5c60ccfd504fa8c50989d8c310392c1cdb7e6fc5f0b29c8053850dc8bd2d3adb
 input:../market-core/snapshot/Cargo.toml=sha256:05034b38335e1641ec9c5de9d5b9570738fc552d299ff82295141aff9819b56c
 input:../risk-control/oms-core/Cargo.toml=sha256:9d6e87a64ce5fc12bcf01d815a33360339884b4a2de2ea0a8a4630e948927d54
-input:../risk-control/portfolio-core/Cargo.toml=sha256:4753a7501a2f28af906152e33fae9fe62cb5010d4b4f0d489fc4ec74f392bdaa
+input:../risk-control/portfolio-core/Cargo.toml=sha256:b342256b00d1dd297d1252e842525c359b71e89c5cc92324ee556b625e8c5eca
 package:allocator-api2@0.2.21|source=registry+https://github.com/rust-lang/crates.io-index|checksum=683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923|features=alloc
 package:anyhow@1.0.103|source=registry+https://github.com/rust-lang/crates.io-index|checksum=2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3|features=default,std
 package:arc-swap@1.9.2|source=registry+https://github.com/rust-lang/crates.io-index|checksum=c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b|features=

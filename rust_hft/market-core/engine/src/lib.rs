@@ -1602,6 +1602,7 @@ impl Engine {
             venue,
             strategy_id,
             account_id: event_account_id,
+            requested_price,
             ..
         } = event
         {
@@ -1643,6 +1644,14 @@ impl Engine {
                         "canonical OMS refused OrderNew registration for {}",
                         order_id.0
                     )));
+                }
+                if let Some(limit_price) = requested_price {
+                    if !om.set_limit_price(order_id, *limit_price) {
+                        return Err(HftError::Execution(format!(
+                            "canonical OMS refused OrderNew limit price for {}",
+                            order_id.0
+                        )));
+                    }
                 }
             }
             self.order_account_map.insert(order_id.clone(), account_id);

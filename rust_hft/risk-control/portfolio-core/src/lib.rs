@@ -563,6 +563,12 @@ fn canonical_state_digest(state: &PortfolioState) -> String {
     for (order_id, event_id) in &state.recent_accounting_event_ids {
         material.push_str(&format!("journal:{}:{};", order_id.0, event_id));
     }
+    for exception in &state.reconciliation_exceptions {
+        material.push_str(&format!(
+            "exception:{:?}:{:?}:{};",
+            exception.order_id, exception.event, exception.reason
+        ));
+    }
     format!("sha256:{:x}", Sha256::digest(material.as_bytes()))
 }
 
@@ -961,6 +967,74 @@ mod tests {
         portfolio.import_state(state);
         assert_eq!(portfolio.reader().load().cash_balance, Decimal::from(500));
         assert_eq!(portfolio.reconciliation_exceptions().len(), 1);
+    }
+
+    #[test]
+    fn financial_checkpoint_digest_rejects_cleared_reconciliation_evidence() {
+        let mut portfolio = Portfolio::new();
+        portfolio.on_execution_event(&ExecutionEvent::FeeCharged {
+            order_id: OrderId("UNKNOWN-FEE".into()),
+            amount: Decimal::ONE,
+            timestamp: 1,
+            fill_id: "fee-1".into(),
+        });
+        let mut state = portfolio.export_state();
+        assert_eq!(state.reconciliation_exceptions.len(), 1);
+        state.reconciliation_exceptions.clear();
+        assert!(portfolio.try_import_state(state).is_err());
+    }
+
+    #[test]
+    fn canonical_digest_is_stable_across_serialization_and_hash_insertion_order() {
+        let mut portfolio = Portfolio::new();
+        let order_a = OrderId("DIGEST-A".into());
+        let order_b = OrderId("DIGEST-B".into());
+        portfolio.register_order(order_a.clone(), Symbol::new("A"), Side::Buy);
+        portfolio.register_order(order_b.clone(), Symbol::new("B"), Side::Buy);
+        for (order_id, symbol, fill_id) in [
+            (order_a.clone(), Symbol::new("A"), "a-1"),
+            (order_a.clone(), Symbol::new("A"), "a-2"),
+            (order_b.clone(), Symbol::new("B"), "b-1"),
+        ] {
+            portfolio.on_execution_event(&ExecutionEvent::Fill {
+                order_id,
+                price: Price(Decimal::ONE),
+                quantity: Quantity(Decimal::ONE),
+                timestamp: 1,
+                fill_id: fill_id.into(),
+            });
+            let _ = symbol;
+        }
+        let state = portfolio.export_state();
+        let serialized = serde_json::to_vec(&state).expect("serialize checkpoint");
+        let round_tripped: PortfolioState =
+            serde_json::from_slice(&serialized).expect("deserialize checkpoint");
+        let mut restored = Portfolio::new();
+        restored
+            .try_import_state(round_tripped)
+            .expect("serialized checkpoint restores");
+        assert_eq!(
+            restored.export_state().canonical_state_digest,
+            state.canonical_state_digest
+        );
+
+        let mut reordered = state.clone();
+        reordered.processed_fill_ids.clear();
+        let mut reversed_a = HashSet::new();
+        reversed_a.insert("a-2".to_string());
+        reversed_a.insert("a-1".to_string());
+        reordered
+            .processed_fill_ids
+            .insert(order_a.clone(), reversed_a);
+        let mut reversed_b = HashSet::new();
+        reversed_b.insert("b-1".to_string());
+        reordered.processed_fill_ids.insert(order_b, reversed_b);
+        reordered.canonical_state_digest = None;
+        reordered.refresh_canonical_digest();
+        assert_eq!(
+            reordered.canonical_state_digest, state.canonical_state_digest,
+            "HashMap/HashSet insertion order must not change the canonical digest"
+        );
     }
 
     #[test]

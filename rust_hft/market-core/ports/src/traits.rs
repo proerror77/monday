@@ -995,11 +995,25 @@ pub struct OrderRecord {
     pub symbol: Symbol,
     pub side: Side,
     pub qty: Quantity,
+    #[serde(default)]
+    pub limit_price: Option<Price>,
     pub cum_qty: Quantity,
     pub avg_price: Option<Price>,
     pub status: OrderStatus,
     pub venue: Option<hft_core::VenueId>,
     pub strategy_id: Option<String>,
+    #[serde(default)]
+    pub revision: u32,
+    #[serde(default)]
+    pub venue_order_id: Option<String>,
+    #[serde(default)]
+    pub venue_order_history: Vec<String>,
+    #[serde(default)]
+    pub rejection_reason: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub state_changed_at: Option<Timestamp>,
     #[serde(default)]
     pub processed_fill_ids: std::collections::HashSet<String>,
 }
@@ -1052,6 +1066,13 @@ pub struct QuantityMismatch {
 pub trait OrderManager: Send + Sync {
     /// 註冊新訂單
     fn register_order(&mut self, params: RegisterOrderParams) -> bool;
+
+    /// Bind the canonical current limit after registration when the order
+    /// event carries an optional executable price.
+    fn set_limit_price(&mut self, order_id: &OrderId, price: Price) -> bool {
+        let _ = (order_id, price);
+        false
+    }
 
     /// 處理執行事件，返回訂單狀態更新
     fn on_execution_event(&mut self, event: &ExecutionEvent) -> Option<OrderUpdate>;

@@ -5577,6 +5577,7 @@ dependencies = [
  "rust_decimal",
  "rust_decimal_macros 1.40.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
+ "serde_json",
  "sha2",
  "thiserror 2.0.18",
  "tracing",

@@ -48,12 +48,7 @@ impl OrderLedger {
     pub fn restore(records: Vec<OrderRecord>) -> Self {
         let orders = records
             .into_iter()
-            .map(|mut record| {
-                if record.state_changed_at.is_none() {
-                    record.state_changed_at = Some(Utc::now());
-                }
-                (record.order_id.clone(), record)
-            })
+            .map(|record| (record.order_id.clone(), record))
             .collect();
         Self { orders }
     }
@@ -83,5 +78,33 @@ impl OrderLedger {
 
     pub fn orders(&self) -> impl Iterator<Item = &OrderRecord> {
         self.orders.values()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OrderLedger, OrderRecord, OrderState};
+    use rust_decimal::Decimal;
+
+    #[test]
+    fn restore_preserves_unknown_state_change_time_without_fabricating_now() {
+        let ledger = OrderLedger::restore(vec![OrderRecord {
+            order_id: "unknown-time".into(),
+            intent_id: "intent".into(),
+            deployment_id: "deployment".into(),
+            token_id: "token".into(),
+            requested_qty: Decimal::ONE,
+            limit_price: None,
+            venue_order_id: None,
+            venue_order_history: Vec::new(),
+            revision: 0,
+            state: OrderState::Canceled,
+            state_changed_at: None,
+            filled_qty: Decimal::ZERO,
+            rejection_reason: None,
+            last_error: None,
+            idempotency_key: None,
+        }]);
+        assert_eq!(ledger.order("unknown-time").unwrap().state_changed_at, None);
     }
 }

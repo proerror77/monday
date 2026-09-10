@@ -123,11 +123,6 @@ pub struct TradingRuntime {
     intents: Vec<TradingIntent>,
     intent_by_id: BTreeMap<String, usize>,
     order_by_idempotency_key: BTreeMap<String, (String, TradingIntent)>,
-    venue_order_ids: BTreeMap<String, String>,
-    order_errors: BTreeMap<String, (Option<String>, Option<String>)>,
-    order_revisions: BTreeMap<String, u32>,
-    order_history: BTreeMap<String, Vec<String>>,
-    order_limit_prices: BTreeMap<String, Option<Decimal>>,
     orders: OrderLedger,
     fills: FillLedger,
     positions: PositionLedger,
@@ -185,6 +180,50 @@ impl TradingRuntime {
                 ));
             }
         }
+        for projected in &snapshot.orders {
+            let Some(canonical) = oms_checkpoint
+                .orders
+                .get(&CanonicalOrderId(projected.order_id.clone()))
+            else {
+                return Err(TradingRuntimeError::InvalidCanonicalCheckpoint(
+                    "projection order is absent from OMS checkpoint".to_string(),
+                ));
+            };
+            let canonical_state = match canonical.status {
+                ports::OrderStatus::Unknown => OrderState::Unknown,
+                ports::OrderStatus::New => OrderState::Pending,
+                ports::OrderStatus::Acknowledged | ports::OrderStatus::Accepted => {
+                    OrderState::Acknowledged
+                }
+                ports::OrderStatus::PartiallyFilled => OrderState::PartiallyFilled,
+                ports::OrderStatus::Filled => OrderState::Filled,
+                ports::OrderStatus::Canceled
+                | ports::OrderStatus::Expired
+                | ports::OrderStatus::Replaced => OrderState::Canceled,
+                ports::OrderStatus::Rejected => OrderState::Rejected,
+            };
+            let canonical_changed_at = canonical.state_changed_at.and_then(|timestamp| {
+                i64::try_from(timestamp)
+                    .ok()
+                    .and_then(DateTime::from_timestamp_micros)
+            });
+            if projected.requested_qty != canonical.qty.0
+                || projected.limit_price != canonical.limit_price.map(|price| price.0)
+                || projected.venue_order_id != canonical.venue_order_id
+                || projected.venue_order_history != canonical.venue_order_history
+                || projected.revision != canonical.revision
+                || projected.filled_qty != canonical.cum_qty.0
+                || projected.state != canonical_state
+                || projected.state_changed_at != canonical_changed_at
+                || projected.rejection_reason != canonical.rejection_reason
+                || projected.last_error != canonical.last_error
+                || projected.idempotency_key != canonical.client_order_id
+            {
+                return Err(TradingRuntimeError::InvalidCanonicalCheckpoint(
+                    "projection order metadata disagrees with OMS checkpoint".to_string(),
+                ));
+            }
+        }
         let mut canonical_oms = OmsCore::new();
         CanonicalOrderManager::import_checkpoint(&mut canonical_oms, oms_checkpoint)
             .map_err(TradingRuntimeError::InvalidCanonicalCheckpoint)?;
@@ -212,51 +251,10 @@ impl TradingRuntime {
                 Some((key, (order.order_id.clone(), intent)))
             })
             .collect();
-        let venue_order_ids = snapshot
-            .orders
-            .iter()
-            .filter_map(|order| {
-                order
-                    .venue_order_id
-                    .clone()
-                    .map(|venue_id| (order.order_id.clone(), venue_id))
-            })
-            .collect();
-        let order_errors = snapshot
-            .orders
-            .iter()
-            .map(|order| {
-                (
-                    order.order_id.clone(),
-                    (order.rejection_reason.clone(), order.last_error.clone()),
-                )
-            })
-            .collect();
-        let order_revisions = snapshot
-            .orders
-            .iter()
-            .map(|order| (order.order_id.clone(), order.revision))
-            .collect();
-        let order_history = snapshot
-            .orders
-            .iter()
-            .map(|order| (order.order_id.clone(), order.venue_order_history.clone()))
-            .collect();
-        let order_limit_prices = snapshot
-            .orders
-            .iter()
-            .map(|order| (order.order_id.clone(), order.limit_price))
-            .collect();
-
         let mut runtime = Self {
             intents: snapshot.intents,
             intent_by_id,
             order_by_idempotency_key,
-            venue_order_ids,
-            order_errors,
-            order_revisions,
-            order_history,
-            order_limit_prices,
             orders: OrderLedger::restore(snapshot.orders),
             fills: FillLedger::restore(snapshot.fills),
             positions: PositionLedger::default(),
@@ -276,73 +274,14 @@ impl TradingRuntime {
     /// Rebuild the strategy-facing views from the canonical OMS/Portfolio
     /// checkpoints. These views contain no transition or accounting logic.
     fn sync_projections(&mut self) {
-        let prior_orders = self.orders.orders().cloned().collect::<Vec<_>>();
-        let prior_by_id = prior_orders
-            .into_iter()
-            .map(|order| (order.order_id.clone(), order))
-            .collect::<BTreeMap<_, _>>();
         let canonical = CanonicalOrderManager::export_checkpoint(&self.canonical_oms);
         let mut projected_orders = Vec::new();
         for record in canonical.orders.values() {
-            let intent = self
+            let Some(intent) = self
                 .intents
                 .iter()
-                .find(|intent| record.strategy_id.as_deref() == Some(intent.intent_id.as_str()));
-            let prior = prior_by_id.get(&record.order_id.0);
-            let error_metadata = self
-                .order_errors
-                .get(&record.order_id.0)
-                .cloned()
-                .unwrap_or_else(|| {
-                    (
-                        prior.and_then(|order| order.rejection_reason.clone()),
-                        prior.and_then(|order| order.last_error.clone()),
-                    )
-                });
-            let (
-                intent_id,
-                deployment_id,
-                token_id,
-                limit_price,
-                revision,
-                venue_order_id,
-                history,
-                idem,
-            ) = if let Some(prior) = prior {
-                (
-                    prior.intent_id.clone(),
-                    prior.deployment_id.clone(),
-                    prior.token_id.clone(),
-                    self.order_limit_prices
-                        .get(&record.order_id.0)
-                        .copied()
-                        .unwrap_or(prior.limit_price),
-                    self.order_revisions
-                        .get(&record.order_id.0)
-                        .copied()
-                        .unwrap_or(prior.revision),
-                    self.venue_order_ids
-                        .get(&record.order_id.0)
-                        .cloned()
-                        .or_else(|| prior.venue_order_id.clone()),
-                    self.order_history
-                        .get(&record.order_id.0)
-                        .cloned()
-                        .unwrap_or_else(|| prior.venue_order_history.clone()),
-                    prior.idempotency_key.clone(),
-                )
-            } else if let Some(intent) = intent {
-                (
-                    intent.intent_id.clone(),
-                    intent.deployment_id.clone(),
-                    intent.token_id.clone(),
-                    intent.limit_price,
-                    0,
-                    None,
-                    Vec::new(),
-                    None,
-                )
-            } else {
+                .find(|intent| record.strategy_id.as_deref() == Some(intent.intent_id.as_str()))
+            else {
                 continue;
             };
             let state = match record.status {
@@ -358,20 +297,24 @@ impl TradingRuntime {
             };
             projected_orders.push(OrderRecord {
                 order_id: record.order_id.0.clone(),
-                intent_id,
-                deployment_id,
-                token_id,
+                intent_id: intent.intent_id.clone(),
+                deployment_id: intent.deployment_id.clone(),
+                token_id: intent.token_id.clone(),
                 requested_qty: record.qty.0,
-                limit_price,
-                venue_order_id,
-                venue_order_history: history,
-                revision,
+                limit_price: record.limit_price.map(|price| price.0),
+                venue_order_id: record.venue_order_id.clone(),
+                venue_order_history: record.venue_order_history.clone(),
+                revision: record.revision,
                 state,
-                state_changed_at: prior.and_then(|order| order.state_changed_at),
+                state_changed_at: record.state_changed_at.and_then(|timestamp| {
+                    i64::try_from(timestamp)
+                        .ok()
+                        .and_then(DateTime::from_timestamp_micros)
+                }),
                 filled_qty: record.cum_qty.0,
-                rejection_reason: error_metadata.0,
-                last_error: error_metadata.1,
-                idempotency_key: idem.or_else(|| record.client_order_id.clone()),
+                rejection_reason: record.rejection_reason.clone(),
+                last_error: record.last_error.clone(),
+                idempotency_key: record.client_order_id.clone(),
             });
         }
         self.orders = OrderLedger::restore(projected_orders);
@@ -489,11 +432,6 @@ impl TradingRuntime {
                 "canonical OMS/Portfolio refused order registration",
             ));
         }
-        self.order_errors.insert(order_id.clone(), (None, None));
-        self.order_revisions.insert(order_id.clone(), 0);
-        self.order_history.insert(order_id.clone(), Vec::new());
-        self.order_limit_prices
-            .insert(order_id.clone(), projection.limit_price);
         if let Some(key) = idempotency_key {
             self.order_by_idempotency_key
                 .insert(key.to_string(), (order_id.clone(), intent.clone()));
@@ -619,10 +557,15 @@ impl TradingRuntime {
         self.canonical_oms
             .on_execution_event(&ExecutionEvent::OrderAck {
                 order_id: CanonicalOrderId(order_id.to_string()),
-                timestamp: 0,
+                timestamp: now_timestamp(),
             })?;
-        self.venue_order_ids
-            .insert(order_id.to_string(), venue_order_id.into());
+        if !self.canonical_oms.set_venue_order_id(
+            &CanonicalOrderId(order_id.to_string()),
+            venue_order_id.into(),
+        ) {
+            self.reconciliation_required = true;
+            return None;
+        }
         self.sync_projections();
         self.orders.order(order_id)
     }
@@ -634,27 +577,19 @@ impl TradingRuntime {
         limit_price: Option<Decimal>,
         venue_order_id: impl Into<String>,
     ) -> Option<&super::orders::OrderRecord> {
-        self.canonical_oms
-            .on_execution_event(&ExecutionEvent::OrderModified {
-                order_id: CanonicalOrderId(order_id.to_string()),
-                new_quantity: Some(CanonicalQuantity(requested_qty)),
-                new_price: limit_price.map(CanonicalPrice),
-                timestamp: 0,
-            })?;
-        if let Some(previous) = self.venue_order_ids.get(order_id).cloned() {
-            self.order_history
-                .entry(order_id.to_string())
-                .or_default()
-                .push(previous);
+        self.canonical_oms.apply_order_modification(
+            &CanonicalOrderId(order_id.to_string()),
+            Some(CanonicalQuantity(requested_qty)),
+            limit_price.map(CanonicalPrice),
+            now_timestamp(),
+        )?;
+        if !self.canonical_oms.replace_venue_order_id(
+            &CanonicalOrderId(order_id.to_string()),
+            venue_order_id.into(),
+        ) {
+            self.reconciliation_required = true;
+            return None;
         }
-        self.order_limit_prices
-            .insert(order_id.to_string(), limit_price);
-        *self
-            .order_revisions
-            .entry(order_id.to_string())
-            .or_default() += 1;
-        self.venue_order_ids
-            .insert(order_id.to_string(), venue_order_id.into());
         self.sync_projections();
         self.orders.order(order_id)
     }
@@ -669,10 +604,10 @@ impl TradingRuntime {
             .on_execution_event(&ExecutionEvent::OrderReject {
                 order_id: CanonicalOrderId(order_id.to_string()),
                 reason: reason.clone(),
-                timestamp: 0,
+                timestamp: now_timestamp(),
             })?;
-        self.order_errors
-            .insert(order_id.to_string(), (Some(reason), None));
+        self.canonical_oms
+            .set_rejection_reason(&CanonicalOrderId(order_id.to_string()), reason);
         self.sync_projections();
         self.orders.order(order_id)
     }
@@ -682,7 +617,8 @@ impl TradingRuntime {
         order_id: &str,
         error: impl Into<String>,
     ) -> Option<&super::orders::OrderRecord> {
-        self.order_errors.entry(order_id.to_string()).or_default().1 = Some(error.into());
+        self.canonical_oms
+            .set_last_error(&CanonicalOrderId(order_id.to_string()), error.into());
         self.sync_projections();
         self.orders.order(order_id)
     }
@@ -692,7 +628,9 @@ impl TradingRuntime {
         order_id: &str,
         error: impl Into<String>,
     ) -> Option<&super::orders::OrderRecord> {
-        self.order_errors.entry(order_id.to_string()).or_default().1 = Some(error.into());
+        let error = error.into();
+        self.canonical_oms
+            .set_last_error(&CanonicalOrderId(order_id.to_string()), error);
         self.canonical_oms.update_status(
             &CanonicalOrderId(order_id.to_string()),
             CanonicalOmsStatus::Unknown,
@@ -705,7 +643,7 @@ impl TradingRuntime {
         self.canonical_oms
             .on_execution_event(&ExecutionEvent::OrderCanceled {
                 order_id: CanonicalOrderId(order_id.to_string()),
-                timestamp: 0,
+                timestamp: now_timestamp(),
             })?;
         self.sync_projections();
         self.orders.order(order_id)
@@ -738,7 +676,7 @@ impl TradingRuntime {
                 .canonical_oms
                 .on_execution_event(&ExecutionEvent::OrderCanceled {
                     order_id: CanonicalOrderId(order_id.clone()),
-                    timestamp: 0,
+                    timestamp: now_timestamp(),
                 });
         }
         self.sync_projections();
@@ -772,6 +710,7 @@ impl TradingRuntime {
                         fill_id: fill.fill_id.clone(),
                     },
                 );
+                self.refresh_reconciliation_latch();
                 self.sync_projections();
             }
             return false;
@@ -949,10 +888,11 @@ impl TradingRuntime {
                 let after =
                     CanonicalPortfolioManager::export_state(&*self.canonical_portfolio.borrow());
                 let changed = before.processed_fee_ids != after.processed_fee_ids;
-                if changed {
+                self.refresh_reconciliation_latch();
+                if changed || self.reconciliation_required {
                     self.sync_projections();
                 }
-                changed
+                changed && !self.reconciliation_required
             }
             _ => false,
         }
@@ -960,6 +900,18 @@ impl TradingRuntime {
 
     pub fn reconciliation_required(&self) -> bool {
         self.reconciliation_required
+    }
+
+    fn refresh_reconciliation_latch(&mut self) {
+        if !CanonicalOrderManager::export_checkpoint(&self.canonical_oms)
+            .reconciliation_exceptions
+            .is_empty()
+            || !CanonicalPortfolioManager::export_state(&*self.canonical_portfolio.borrow())
+                .reconciliation_exceptions
+                .is_empty()
+        {
+            self.reconciliation_required = true;
+        }
     }
 
     pub fn last_fill_time(&self) -> Option<DateTime<Utc>> {
@@ -1033,6 +985,10 @@ impl TradingRuntime {
     }
 }
 
+fn now_timestamp() -> u64 {
+    Utc::now().timestamp_micros().max(0) as u64
+}
+
 fn canonical_side(side: TradeSide) -> CanonicalSide {
     match side {
         TradeSide::Buy => CanonicalSide::Buy,
@@ -1060,6 +1016,11 @@ fn canonical_register(
         strategy_id: Some(intent.intent_id.clone()),
     }) {
         return false;
+    }
+    if let Some(limit_price) = order.limit_price {
+        if !oms.set_limit_price(&order_id, CanonicalPrice(limit_price)) {
+            return false;
+        }
     }
     if !CanonicalPortfolioManager::register_order(portfolio, order_id.clone(), symbol, side) {
         return false;
@@ -1369,6 +1330,140 @@ mod tests {
             restored_snapshot.fill_cashflow_summary().net_pnl(),
             dec!(-0.53)
         );
+    }
+
+    #[test]
+    fn duplicate_fill_fee_for_unknown_order_latches_and_blocks_new_intents() {
+        let mut runtime = TradingRuntime::default();
+        runtime
+            .submit_intent(
+                TradingIntent {
+                    intent_id: "fee-intent".into(),
+                    deployment_id: "dep".into(),
+                    market_id: "market".into(),
+                    token_id: "token".into(),
+                    side: TradeSide::Buy,
+                    quantity: dec!(1),
+                    limit_price: Some(dec!(0.5)),
+                    purpose: IntentPurpose::Entry,
+                    created_at: Utc::now(),
+                },
+                "fee-order",
+                None,
+            )
+            .unwrap();
+        assert!(runtime.record_fill(FillRecord {
+            fill_id: "duplicate-fee".into(),
+            order_id: "fee-order".into(),
+            token_id: "token".into(),
+            side: TradeSide::Buy,
+            quantity: dec!(1),
+            price: dec!(0.5),
+            fee: Decimal::ZERO,
+            timestamp: Utc::now(),
+        }));
+        assert!(!runtime.record_fill(FillRecord {
+            fill_id: "duplicate-fee".into(),
+            order_id: "missing-order".into(),
+            token_id: "token".into(),
+            side: TradeSide::Buy,
+            quantity: dec!(1),
+            price: dec!(0.5),
+            fee: dec!(0.01),
+            timestamp: Utc::now(),
+        }));
+        assert!(runtime.reconciliation_required());
+        let error = runtime
+            .submit_intent(
+                TradingIntent {
+                    intent_id: "blocked-intent".into(),
+                    deployment_id: "dep".into(),
+                    market_id: "market".into(),
+                    token_id: "token".into(),
+                    side: TradeSide::Buy,
+                    quantity: dec!(1),
+                    limit_price: Some(dec!(0.5)),
+                    purpose: IntentPurpose::Entry,
+                    created_at: Utc::now(),
+                },
+                "blocked-order",
+                None,
+            )
+            .expect_err("reconciliation evidence must block admission");
+        assert!(error.to_string().contains("reconciliation"));
+    }
+
+    #[test]
+    fn clearing_reconciliation_exceptions_cannot_restore_runtime() {
+        let mut runtime = TradingRuntime::default();
+        runtime
+            .submit_intent(
+                TradingIntent {
+                    intent_id: "restore-intent".into(),
+                    deployment_id: "dep".into(),
+                    market_id: "market".into(),
+                    token_id: "token".into(),
+                    side: TradeSide::Buy,
+                    quantity: dec!(1),
+                    limit_price: Some(dec!(0.5)),
+                    purpose: IntentPurpose::Entry,
+                    created_at: Utc::now(),
+                },
+                "restore-order",
+                None,
+            )
+            .unwrap();
+        assert!(!runtime.apply_reconciliation_event(
+            "missing-order",
+            None,
+            &ExecutionEvent::FeeCharged {
+                order_id: hft_core::OrderId("restore-order".into()),
+                amount: dec!(0.01),
+                timestamp: 1,
+                fill_id: "fee-without-fill".into(),
+            }
+        ));
+        let mut snapshot = runtime.snapshot(&BTreeMap::new());
+        snapshot
+            .canonical_portfolio
+            .as_mut()
+            .unwrap()
+            .reconciliation_exceptions
+            .clear();
+        assert!(TradingRuntime::restore(snapshot).is_err());
+    }
+
+    #[test]
+    fn restore_rejects_canonical_oms_metadata_tampering() {
+        let mut runtime = TradingRuntime::default();
+        runtime
+            .submit_intent(
+                TradingIntent {
+                    intent_id: "metadata-intent".into(),
+                    deployment_id: "dep".into(),
+                    market_id: "market".into(),
+                    token_id: "token".into(),
+                    side: TradeSide::Buy,
+                    quantity: dec!(1),
+                    limit_price: Some(dec!(0.5)),
+                    purpose: IntentPurpose::Entry,
+                    created_at: Utc::now(),
+                },
+                "metadata-order",
+                None,
+            )
+            .unwrap();
+        runtime.acknowledge_order("metadata-order", "venue-1");
+        let mut snapshot = runtime.snapshot(&BTreeMap::new());
+        snapshot
+            .canonical_oms
+            .as_mut()
+            .unwrap()
+            .orders
+            .get_mut(&hft_core::OrderId("metadata-order".into()))
+            .unwrap()
+            .revision = 99;
+        assert!(TradingRuntime::restore(snapshot).is_err());
     }
 
     #[test]

@@ -24,3 +24,4 @@ name = "portfolio_core"
 
 [dev-dependencies]
 rust_decimal_macros = "1"
+serde_json.workspace = true

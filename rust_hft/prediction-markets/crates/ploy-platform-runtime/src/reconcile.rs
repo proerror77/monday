@@ -59,7 +59,7 @@ pub async fn reconcile_live_fills_with_stream(
                         portfolio_core::prediction::OrderState::Canceled
                     ) && order
                         .state_changed_at
-                        .is_none_or(|changed_at| changed_at >= terminal_cutoff)))
+                        .is_some_and(|changed_at| changed_at >= terminal_cutoff)))
             })
         {
             let Some(_venue_order_id) = order.venue_order_id.clone() else {
