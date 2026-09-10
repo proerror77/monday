@@ -21,6 +21,7 @@ use crate::{
     },
     event::EventEnvelope,
 };
+use hft_research_manifest::CexSpotInstrumentRulesV1;
 
 const CANONICAL_PARQUET_SCHEMA: &str =
     "timestamp_us:int64,sequence:int64,event:utf8,payload_json:utf8";
@@ -126,6 +127,7 @@ impl BacktestConfig {
         let manifest: BacktestDataManifest =
             serde_json::from_slice(&manifest_bytes).context("无法解析回测数据 manifest")?;
         manifest.validate()?;
+        validate_market_identity(&self.data.market, &manifest.market)?;
         self.validate_modalities()?;
 
         let artifact_path = resolve_path(&self.data.path);
@@ -189,6 +191,7 @@ impl BacktestConfig {
             self.data.start_ts,
             self.data.end_ts,
         )?;
+        validate_market_identity(&self.data.market, &verified.evidence.market)?;
         self.validate_execution_model()?;
         Ok(VerifiedBacktestData {
             bytes: verified.bytes,
@@ -215,6 +218,11 @@ impl BacktestConfig {
     }
 
     fn validate_execution_model(&self) -> anyhow::Result<()> {
+        let market = self
+            .data
+            .market
+            .parse::<Market>()
+            .map_err(anyhow::Error::msg)?;
         if !self.execution.max_slippage_ticks.is_finite()
             || self.execution.max_slippage_ticks < 0.0
             || !self.risk.slippage_limit_ticks.is_finite()
@@ -227,6 +235,21 @@ impl BacktestConfig {
         }
         if !self.execution.fee_bps.is_finite() || self.execution.fee_bps < 0.0 {
             bail!("execution.fee_bps must be finite and non-negative");
+        }
+        if !self.execution.initial_cash.is_finite()
+            || self.execution.initial_cash < 0.0
+            || !self.execution.initial_inventory.is_finite()
+            || self.execution.initial_inventory < 0.0
+        {
+            bail!("Spot initial cash and inventory must be finite and non-negative");
+        }
+        if market == Market::Spot
+            && self.execution.initial_inventory > self.risk.inventory_limit + 1e-9
+        {
+            bail!("Spot initial inventory exceeds the configured inventory limit");
+        }
+        if market == Market::Spot && self.execution.initial_inventory > 0.0 {
+            bail!("Spot initial inventory requires an explicit cost basis and is unsupported");
         }
         if !self.execution.max_fill_ratio.is_finite()
             || !(0.0..=1.0).contains(&self.execution.max_fill_ratio)
@@ -278,6 +301,8 @@ pub struct CanonicalReplayEvidence {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DataConfig {
     pub path: String,
+    #[serde(default = "default_market")]
+    pub market: String,
     #[serde(default = "default_format")]
     pub format: String,
     #[serde(default = "default_tick_size")]
@@ -477,6 +502,23 @@ impl BacktestDataManifest {
         }
         Ok(())
     }
+}
+
+fn default_market() -> String {
+    "usdm".to_string()
+}
+
+fn validate_market_identity(configured: &str, manifest: &str) -> anyhow::Result<()> {
+    let configured = configured.parse::<Market>().map_err(anyhow::Error::msg)?;
+    let manifest = manifest.parse::<Market>().map_err(anyhow::Error::msg)?;
+    if configured != manifest {
+        bail!(
+            "backtest market {} does not match replay artifact market {}",
+            configured.as_str(),
+            manifest.as_str()
+        );
+    }
+    Ok(())
 }
 
 fn validate_source_segments(
@@ -913,13 +955,52 @@ pub fn verify_and_replay_canonical_target_positions_with_trace(
     decisions: &[TargetPositionDecision],
     config: &TargetPositionReplayConfig,
 ) -> anyhow::Result<(CanonicalReplayEvidence, TargetPositionReplayOutput)> {
+    verify_and_replay_canonical_target_positions_with_trace_and_spot_rules(
+        artifact_path,
+        manifest_path,
+        expected_artifact_sha256,
+        expected_manifest_sha256,
+        start_ts,
+        end_ts,
+        decisions,
+        config,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn verify_and_replay_canonical_target_positions_with_trace_and_spot_rules(
+    artifact_path: &Path,
+    manifest_path: &Path,
+    expected_artifact_sha256: &str,
+    expected_manifest_sha256: &str,
+    start_ts: Option<i64>,
+    end_ts: Option<i64>,
+    decisions: &[TargetPositionDecision],
+    config: &TargetPositionReplayConfig,
+    spot_instrument_rules: Option<&CexSpotInstrumentRulesV1>,
+) -> anyhow::Result<(CanonicalReplayEvidence, TargetPositionReplayOutput)> {
     let (manifest, manifest_sha256, artifact_sha256) = verify_canonical_manifest_and_artifact(
         artifact_path,
         manifest_path,
         Some(expected_artifact_sha256),
         expected_manifest_sha256,
     )?;
-    let mut replay = TargetPositionReplay::new(decisions, config)?;
+    validate_market_identity(&config.market, &manifest.market)?;
+    if let Some(rules) = spot_instrument_rules {
+        rules
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        if rules.symbol != manifest.symbol {
+            anyhow::bail!(
+                "full Spot instrument rules symbol {} does not match canonical replay symbol {}",
+                rules.symbol,
+                manifest.symbol
+            );
+        }
+    }
+    let mut replay =
+        TargetPositionReplay::new_with_spot_rules(decisions, config, spot_instrument_rules)?;
     let replay_rows =
         visit_canonical_parquet(artifact_path, &manifest, start_ts, end_ts, |event| {
             replay.observe(&event)
@@ -1255,6 +1336,18 @@ mod tests {
     }
 
     #[test]
+    fn spot_initial_inventory_requires_an_explicit_cost_basis() {
+        let mut config =
+            BacktestConfig::from_file(resolve_path("config/backtest/default.yaml")).unwrap();
+        config.data.market = "spot".to_string();
+        config.execution.initial_inventory = 0.01;
+        config.risk.inventory_limit = 1.0;
+
+        let error = config.validate_execution_model().unwrap_err();
+        assert!(error.to_string().contains("explicit cost basis"));
+    }
+
+    #[test]
     fn collector_identity_is_bound_to_backtest_manifest() {
         let manifest = fixture_manifest();
         let segment = &manifest.source_segments[0];
@@ -1467,7 +1560,7 @@ mod tests {
         fs::write(&manifest, &manifest_bytes).unwrap();
         let manifest_sha = hex::encode(Sha256::digest(&manifest_bytes));
         let yaml = format!(
-            "data:\n  path: {}\n  format: ndjson\n  manifest_path: {}\n  manifest_sha256: {}\n  require_sequence: true\nstrategy:\n  volume_factor: 0\n  cvd_threshold: 0\nexecution: {{}}\nrisk: {{}}\noutput: {{}}\n",
+            "data:\n  path: {}\n  market: spot\n  format: ndjson\n  manifest_path: {}\n  manifest_sha256: {}\n  require_sequence: true\nstrategy:\n  volume_factor: 0\n  cvd_threshold: 0\nexecution: {{}}\nrisk: {{}}\noutput: {{}}\n",
             artifact.display(),
             manifest.display(),
             manifest_sha,
@@ -1589,6 +1682,13 @@ pub struct ExecutionConfig {
     pub hold_secs: Option<f64>,
     #[serde(default)]
     pub fee_bps: f64,
+    /// Explicit quote cash available to a Spot simulation. Zero means no
+    /// funds are invented for a caller that did not configure capital.
+    #[serde(default)]
+    pub initial_cash: f64,
+    /// Explicit base-asset inventory available to a Spot simulation.
+    #[serde(default)]
+    pub initial_inventory: f64,
     #[serde(default = "default_max_fill_ratio")]
     pub max_fill_ratio: f64,
 }
@@ -1603,6 +1703,8 @@ impl Default for ExecutionConfig {
             take_profit_ticks: default_slippage_ticks(),
             hold_secs: Some(900.0),
             fee_bps: 0.0,
+            initial_cash: 0.0,
+            initial_inventory: 0.0,
             max_fill_ratio: default_max_fill_ratio(),
         }
     }

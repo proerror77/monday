@@ -445,6 +445,12 @@ pub struct CexSupervisedDecisionPolicyV2 {
     pub round_trip_cost_multiplier: f64,
     pub sizing_rule: CexSupervisedSizingRuleV1,
     pub max_abs_position: f64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub long_only: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl CexSupervisedDecisionPolicyV2 {
@@ -454,6 +460,7 @@ impl CexSupervisedDecisionPolicyV2 {
             round_trip_cost_multiplier: 2.0,
             sizing_rule: CexSupervisedSizingRuleV1::ExcessExpectedReturnOverRoundTripCost,
             max_abs_position: 1.0,
+            long_only: false,
         }
     }
 
@@ -463,6 +470,7 @@ impl CexSupervisedDecisionPolicyV2 {
             round_trip_cost_multiplier: 0.0,
             sizing_rule: CexSupervisedSizingRuleV1::PredictionIdentity,
             max_abs_position: 1.0,
+            long_only: false,
         }
     }
 
@@ -472,7 +480,13 @@ impl CexSupervisedDecisionPolicyV2 {
             round_trip_cost_multiplier: 2.0,
             sizing_rule: CexSupervisedSizingRuleV1::HystereticExcessExpectedReturnOverRoundTripCost,
             max_abs_position: 1.0,
+            long_only: false,
         }
+    }
+
+    pub fn with_long_only(mut self, long_only: bool) -> Self {
+        self.long_only = long_only;
+        self
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -522,6 +536,7 @@ impl CexSupervisedDecisionPolicyV2 {
         if !prediction.is_finite()
             || !previous_position.is_finite()
             || previous_position.abs() > self.max_abs_position
+            || (self.long_only && previous_position < -f64::EPSILON)
             || !costs.one_way_cost_bps.is_finite()
             || !costs.funding_bps.is_finite()
             || costs.funding_bps < 0.0
@@ -529,7 +544,12 @@ impl CexSupervisedDecisionPolicyV2 {
             return Err("invalid supervised decision input".into());
         }
         if self.sizing_rule == CexSupervisedSizingRuleV1::PredictionIdentity {
-            return Ok(prediction.clamp(-self.max_abs_position, self.max_abs_position));
+            let position = prediction.clamp(-self.max_abs_position, self.max_abs_position);
+            return Ok(if self.long_only {
+                position.max(0.0)
+            } else {
+                position
+            });
         }
         let edge = |multiplier: f64| -> Result<f64, String> {
             let value =
@@ -549,16 +569,21 @@ impl CexSupervisedDecisionPolicyV2 {
                 * ((absolute - minimum_edge) / (absolute + minimum_edge).max(f64::EPSILON))
                     .clamp(0.0, self.max_abs_position)
         };
-        if self.sizing_rule
+        let position = if self.sizing_rule
             == CexSupervisedSizingRuleV1::HystereticExcessExpectedReturnOverRoundTripCost
             && previous_position.abs() > f64::EPSILON
             && prediction.signum() == previous_position.signum()
             && absolute > edge(self.round_trip_cost_multiplier / 2.0)?
         {
-            Ok(previous_position)
+            previous_position
         } else {
-            Ok(proposed)
-        }
+            proposed
+        };
+        Ok(if self.long_only {
+            position.max(0.0)
+        } else {
+            position
+        })
     }
 }
 
@@ -634,6 +659,16 @@ mod tests {
         let identity = CexSupervisedDecisionPolicyV2::prediction_identity_v2();
         assert_eq!(identity.target_position(2.0, 0.0, costs).unwrap(), 1.0);
         assert_eq!(identity.target_position(-0.25, 0.0, costs).unwrap(), -0.25);
+        let spot_identity = identity.clone().with_long_only(true);
+        assert_eq!(
+            spot_identity.target_position(-0.25, 0.0, costs).unwrap(),
+            0.0
+        );
+        assert!(spot_identity.target_position(0.25, -0.1, costs).is_err());
+        assert_eq!(
+            spot_identity.target_position(0.25, 0.0, costs).unwrap(),
+            0.25
+        );
         let json = r#"{"schema_version":"cex-supervised-decision-policy-v2","round_trip_cost_multiplier":0.0,"sizing_rule":"prediction_identity","max_abs_position":1.0}"#;
         assert_eq!(serde_json::to_string(&identity).unwrap(), json);
         assert_eq!(

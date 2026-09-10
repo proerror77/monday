@@ -3,6 +3,7 @@ use alpha_engine::evaluation::ResearchRow;
 use alpha_store::{AlphaStore, RegistryRevision};
 use anyhow::{bail, Context};
 use chrono::{DateTime, Utc};
+use hft_collector::research_inventory::Market;
 use hft_collector::{
     acquire_dataset, import_feature_dataset, lob_archiver::source_revision, read_feature_rows,
     DataAcquisitionMission, DataModality, DatasetManifest, FeatureDatasetManifest, OhlcvTraceRow,
@@ -1136,6 +1137,7 @@ pub(crate) fn freeze_research_inventory_request(
         reference_root: args.reference_root.clone(),
         start_received_at_ns: args.start_received_at_ns,
         end_received_at_ns: args.end_received_at_ns,
+        market: args.market.parse::<Market>().map_err(anyhow::Error::msg)?,
         symbol: args.symbol.clone(),
         source_revision: crate::cli::BUILD_SOURCE_REVISION.to_string(),
         image_ref: args.image_ref.clone(),
@@ -1665,6 +1667,7 @@ mod tests {
                 valid_through: rows.last().unwrap().label_available_time,
                 evidence: instrument_rules_evidence.clone(),
             },
+            spot_instrument_rules: None,
             series: vec![hft_research_manifest::CexReplaySeriesV1 {
                 series_id: 1,
                 first_event_time: rows.first().unwrap().event_time,

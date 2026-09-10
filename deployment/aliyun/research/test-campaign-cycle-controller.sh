@@ -813,6 +813,7 @@ fresh_args=(
   --fresh-inputs
   --fresh-raw-root "$fresh_case_root/raw"
   --fresh-reference-root "$fresh_case_root/reference"
+  --fresh-market usdm
   --fresh-start-received-at-ns 1700000000000000000
   --fresh-end-received-at-ns 1700000060000000000
   --fresh-symbol BTCUSDT
@@ -908,6 +909,7 @@ fresh_latest_args=(
   --fresh-inputs
   --fresh-raw-root "$fresh_latest_case_root/raw"
   --fresh-reference-root "$fresh_latest_case_root/reference"
+  --fresh-market usdm
   --fresh-duration-ns 5000
   --fresh-cutoff-received-at-ns 1700000060000000000
   --fresh-max-candidates 8
@@ -958,6 +960,7 @@ fresh_control_args=(
   --fresh-inputs
   --fresh-raw-root "$fresh_case_root/control-raw"
   --fresh-reference-root "$fresh_case_root/control-reference"
+  --fresh-market usdm
   --fresh-start-received-at-ns 1700000000000000000
   --fresh-end-received-at-ns 1700000060000000000
   --fresh-symbol BTCUSDT

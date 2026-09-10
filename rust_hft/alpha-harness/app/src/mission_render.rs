@@ -90,10 +90,22 @@ pub(crate) enum CexCampaignPositionPolicyV1 {
 
 impl CexCampaignPositionPolicyV1 {
     pub(crate) fn decision_policy(self) -> CexSupervisedDecisionPolicyV2 {
-        match self {
+        self.decision_policy_for_market(CexResearchMarketV1::Usdm)
+    }
+
+    pub(crate) fn decision_policy_for_market(
+        self,
+        market: CexResearchMarketV1,
+    ) -> CexSupervisedDecisionPolicyV2 {
+        let policy = match self {
             Self::CostAware => CexSupervisedDecisionPolicyV2::controlled_v2(),
             Self::PredictionIdentity => CexSupervisedDecisionPolicyV2::prediction_identity_v2(),
             Self::HystereticCostAware => CexSupervisedDecisionPolicyV2::hysteretic_cost_aware_v2(),
+        };
+        if market == CexResearchMarketV1::Spot {
+            policy.with_long_only(true)
+        } else {
+            policy
         }
     }
 }
@@ -775,6 +787,7 @@ pub(crate) fn render_cex_bundle(
         &std::fs::read(materialization_path)
             .with_context(|| format!("read {}", materialization_path.display()))?,
     )?;
+    let research_market = rendered_research_market(&materialization)?;
     let feature_artifacts = tempfile::tempdir().context("create feature validation directory")?;
     let feature_manifest = import_feature_manifest(
         &materialization.mission_id,
@@ -871,7 +884,7 @@ pub(crate) fn render_cex_bundle(
     let supervised_decision_policy = research_plan
         .search_policy_revision
         .position_policy
-        .decision_policy();
+        .decision_policy_for_market(research_market.clone());
     let weight_policy = CexEqualAbsoluteWeightPolicyV1::controlled_v1(WEIGHT_POLICY_ID)?;
     let replay_policy = CexEventReplayPolicyV1::controlled_v2(
         REPLAY_POLICY_ID,
@@ -894,8 +907,8 @@ pub(crate) fn render_cex_bundle(
             data_mission_id: materialization.mission_id.clone(),
             instrument: CexResearchInstrumentV1 {
                 venue: CexResearchVenueV1::Binance,
-                market: CexResearchMarketV1::Usdm,
-                symbol: "BTCUSDT".to_string(),
+                market: research_market,
+                symbol: materialization.symbol.clone(),
                 horizon: EvaluationLabelSpecV1 {
                     horizon_buckets: materialization.label_horizon_buckets,
                     observation_frequency_millis: materialization.bucket_ms,
@@ -1119,18 +1132,28 @@ pub(crate) fn approved_evaluation_protocol(
 pub(crate) fn validate_render_materialization_scope(
     materialization: &crate::mission_runner::Materialization,
 ) -> anyhow::Result<()> {
-    if materialization.market != "usdm"
+    if !matches!(materialization.market.as_str(), "spot" | "usdm")
         || materialization.symbol != "BTCUSDT"
         || materialization.bucket_ms != 1_000
         || materialization.label_horizon_buckets != 5
         || materialization.top_depth != 5
     {
-        bail!("only the approved Binance USD-M BTCUSDT 1s/h5/top5 materialization can render this Mission");
+        bail!("only the approved Binance Spot or USD-M BTCUSDT 1s/h5/top5 materialization can render this Mission");
     }
     if materialization.rows < MIN_ROWS {
         bail!("approved Mission render requires at least {MIN_ROWS} point-in-time rows");
     }
     Ok(())
+}
+
+fn rendered_research_market(
+    materialization: &crate::mission_runner::Materialization,
+) -> anyhow::Result<CexResearchMarketV1> {
+    match materialization.market.as_str() {
+        "spot" => Ok(CexResearchMarketV1::Spot),
+        "usdm" => Ok(CexResearchMarketV1::Usdm),
+        other => bail!("unsupported CEX materialization market: {other}"),
+    }
 }
 
 fn ensure_materialization_scope(
@@ -1197,6 +1220,14 @@ pub(crate) mod tests {
         .unwrap();
         let mission = rendered.mission;
         assert_eq!(MIN_ROWS, 25_245);
+        assert_eq!(mission.spec.instrument.market, CexResearchMarketV1::Usdm);
+        assert_eq!(
+            mission.spec.policies.supervised_decision.content_sha256,
+            CexCampaignPositionPolicyV1::CostAware
+                .decision_policy()
+                .content_hash()
+                .unwrap()
+        );
         let partitions = mission
             .spec
             .evaluation_protocol
@@ -1626,6 +1657,37 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn spot_renderer_binds_typed_spot_market() {
+        let fixture = Fixture::spot(MIN_ROWS);
+        let rendered = render_cex_bundle(
+            &fixture.feature_path,
+            &fixture.materialization_path,
+            &CexCampaignResearchPlanV1::canonical(),
+            7,
+            default_trials(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            rendered.mission.spec.instrument.market,
+            CexResearchMarketV1::Spot
+        );
+        assert_eq!(rendered.mission.spec.instrument.symbol, "BTCUSDT");
+        let spot_policy = CexCampaignPositionPolicyV1::CostAware
+            .decision_policy_for_market(CexResearchMarketV1::Spot);
+        assert!(spot_policy.long_only);
+        assert_eq!(
+            rendered
+                .mission
+                .spec
+                .policies
+                .supervised_decision
+                .content_sha256,
+            spot_policy.content_hash().unwrap()
+        );
+    }
+
+    #[test]
     fn render_cex_rejects_feature_source_drift_without_leaving_output() {
         let fixture = Fixture::with_feature_source(MIN_ROWS, "d".repeat(64));
         let error = render_cex_bundle(
@@ -1893,6 +1955,10 @@ pub(crate) mod tests {
             Self::with_optional_feature_source(rows, None)
         }
 
+        pub(crate) fn spot(rows: usize) -> Self {
+            Self::with_market(rows, None, "spot")
+        }
+
         fn with_feature_source(rows: usize, feature_source_revision: String) -> Self {
             Self::with_optional_feature_source(rows, Some(feature_source_revision))
         }
@@ -1901,6 +1967,10 @@ pub(crate) mod tests {
             rows: usize,
             feature_source_revision: Option<String>,
         ) -> Self {
+            Self::with_market(rows, feature_source_revision, "usdm")
+        }
+
+        fn with_market(rows: usize, feature_source_revision: Option<String>, market: &str) -> Self {
             let root = tempfile::tempdir().unwrap();
             let feature_path = root.path().join("features.jsonl");
             let materialization_path = root.path().join("materialization.json");
@@ -1910,7 +1980,7 @@ pub(crate) mod tests {
             let feature_source_revision = feature_source_revision
                 .as_deref()
                 .unwrap_or(&source_revision);
-            let rows = feature_rows(rows, feature_source_revision);
+            let rows = feature_rows(rows, feature_source_revision, market);
             write_feature_rows(&feature_path, &rows);
             let bytes = std::fs::read(&feature_path).unwrap();
             let feature_sha256 = hex::encode(Sha256::digest(&bytes));
@@ -1934,7 +2004,7 @@ pub(crate) mod tests {
             let snapshot = hft_research_manifest::CexReplaySnapshotV5 {
                 schema_version: hft_research_manifest::CEX_REPLAY_SNAPSHOT_SCHEMA_V5.to_string(),
                 venue: "binance".to_string(),
-                instrument_type: "usdm".to_string(),
+                instrument_type: market.to_string(),
                 symbol: "BTCUSDT".to_string(),
                 replay_clock: hft_research_manifest::CEX_REPLAY_CLOCK_RECEIVED_AT_NS.to_string(),
                 required_modalities: BTreeSet::from([
@@ -1964,6 +2034,7 @@ pub(crate) mod tests {
                     valid_through: last_event_time + ChronoDuration::seconds(5),
                     evidence: instrument_rules_evidence.clone(),
                 },
+                spot_instrument_rules: (market == "spot").then(spot_instrument_rules),
                 series: vec![hft_research_manifest::CexReplaySeriesV1 {
                     series_id: 1,
                     first_event_time,
@@ -1983,7 +2054,7 @@ pub(crate) mod tests {
                 "schema_version": hft_research_manifest::BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V7,
                 "mission_id": "data-mission-1",
                 "symbol": "BTCUSDT",
-                "market": "usdm",
+                "market": market,
                 "bucket_ms": 1000,
                 "label_horizon_buckets": 5,
                 "top_depth": 5,
@@ -2020,7 +2091,11 @@ pub(crate) mod tests {
         }
     }
 
-    fn feature_rows(count: usize, source_revision: &str) -> Vec<PointInTimeFeatureRow> {
+    fn feature_rows(
+        count: usize,
+        source_revision: &str,
+        market: &str,
+    ) -> Vec<PointInTimeFeatureRow> {
         let ingestion_time = Utc::now();
         let start = ingestion_time - ChronoDuration::seconds(count as i64 + 10);
         (0..count)
@@ -2032,7 +2107,7 @@ pub(crate) mod tests {
                 ingestion_time,
                 symbol: "BTCUSDT".to_string(),
                 source_revisions: BTreeMap::from([(
-                    "binance-usdm-lob".to_string(),
+                    format!("binance-{market}-lob"),
                     source_revision.to_string(),
                 )]),
                 modalities: BTreeSet::from([DataModality::Lob, DataModality::TradeTick]),
@@ -2054,6 +2129,49 @@ pub(crate) mod tests {
                 label: 0.0001,
             })
             .collect()
+    }
+
+    fn spot_instrument_rules() -> hft_research_manifest::CexSpotInstrumentRulesV1 {
+        hft_research_manifest::CexSpotInstrumentRulesV1 {
+            schema: "binance.spot_reference.v1".to_string(),
+            venue: "binance".to_string(),
+            market: "spot".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            base_asset: "BTC".to_string(),
+            quote_asset: "USDT".to_string(),
+            status: "TRADING".to_string(),
+            is_spot_trading_allowed: true,
+            base_asset_precision: 8,
+            quote_asset_precision: 8,
+            price_filter: hft_research_manifest::CexSpotPriceFilterV1 {
+                min_price: "0".to_string(),
+                max_price: "0".to_string(),
+                tick_size: "0.1".to_string(),
+            },
+            lot_size_filter: hft_research_manifest::CexSpotQuantityFilterV1 {
+                min_quantity: "0.001".to_string(),
+                max_quantity: "100".to_string(),
+                step_size: "0.001".to_string(),
+            },
+            market_lot_size_filter: Some(hft_research_manifest::CexSpotQuantityFilterV1 {
+                min_quantity: "0.001".to_string(),
+                max_quantity: "100".to_string(),
+                step_size: "0.001".to_string(),
+            }),
+            notional_filter: hft_research_manifest::CexSpotNotionalFilterV1 {
+                filter_type: "MIN_NOTIONAL".to_string(),
+                min_notional: "5".to_string(),
+                max_notional: None,
+                apply_min_to_market: false,
+                apply_max_to_market: None,
+                avg_price_mins: 5,
+            },
+            source_time_ms: 1,
+            source_clock_received_at_ns: 1_000_000,
+            received_at_ns: 1_000_000,
+            source_endpoint: "/api/v3/exchangeInfo".to_string(),
+            source_clock_endpoint: "/api/v3/time".to_string(),
+        }
     }
 
     fn indexed_cex_triplet(index: usize) -> hft_research_manifest::CexArtifactTripletV2 {

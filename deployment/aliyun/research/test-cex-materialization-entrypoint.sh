@@ -64,10 +64,16 @@ raw2_rel=venue=binance/market=usdm/dataset=usdm_all/shard=all/date=2026-08-18/ho
 ref1_rel=venue=binance_usdm/dataset=reference/date=2026-08-18/hour=01/batch=001/reference.ndjson
 ref2_rel=venue=binance_usdm/dataset=reference/date=2026-08-18/hour=02/batch=002/reference.ndjson
 
-raw1=$(write_triplet "$RAW_ROOT/$raw1_rel" raw-segment-1 raw-manifest-1)
-raw2=$(write_triplet "$RAW_ROOT/$raw2_rel" raw-segment-2 raw-manifest-2)
-ref1=$(write_triplet "$REF_ROOT/$ref1_rel" ref-segment-1 ref-manifest-1)
-ref2=$(write_triplet "$REF_ROOT/$ref2_rel" ref-segment-2 ref-manifest-2)
+raw_manifest='{
+  "market": "usdm"
+}'
+reference_manifest='{
+  "venue": "binance_usdm"
+}'
+raw1=$(write_triplet "$RAW_ROOT/$raw1_rel" raw-segment-1 "$raw_manifest")
+raw2=$(write_triplet "$RAW_ROOT/$raw2_rel" raw-segment-2 "$raw_manifest")
+ref1=$(write_triplet "$REF_ROOT/$ref1_rel" ref-segment-1 "$reference_manifest")
+ref2=$(write_triplet "$REF_ROOT/$ref2_rel" ref-segment-2 "$reference_manifest")
 
 cat >"$ROOT/inventory.env" <<EOF
 RUN_ID=test-run-1
@@ -391,9 +397,9 @@ RAW4=$SHARD_ROOT/raw
 OUT4=$SHARD_ROOT/output
 REF4=$SHARD_ROOT/reference
 mkdir -p "$RAW4" "$OUT4" "$REF4"
-raw3=$(write_triplet "$RAW4/venue=binance/market=usdm/dataset=usdm_all/shard=all/date=2026-08-18/hour=03/part-3.jsonl.zst" raw-segment-3 raw-manifest-3)
-raw4=$(write_triplet "$RAW4/venue=binance/market=usdm/dataset=usdm_all/shard=all/date=2026-08-18/hour=04/part-4.jsonl.zst" raw-segment-4 raw-manifest-4)
-ref3=$(write_triplet "$REF4/venue=binance/market=usdm/dataset=reference/batch-001/reference.ndjson" ref-segment-1 ref-manifest-1)
+raw3=$(write_triplet "$RAW4/venue=binance/market=usdm/dataset=usdm_all/shard=all/date=2026-08-18/hour=03/part-3.jsonl.zst" raw-segment-3 "$raw_manifest")
+raw4=$(write_triplet "$RAW4/venue=binance/market=usdm/dataset=usdm_all/shard=all/date=2026-08-18/hour=04/part-4.jsonl.zst" raw-segment-4 "$raw_manifest")
+ref3=$(write_triplet "$REF4/venue=binance/market=usdm/dataset=reference/batch-001/reference.ndjson" ref-segment-1 "$reference_manifest")
 
 cat >"$SHARD_ROOT/inventory.env" <<EOF
 RUN_ID=test-run-shards

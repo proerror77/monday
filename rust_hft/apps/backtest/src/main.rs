@@ -69,7 +69,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     info!("載入事件：{}", cfg.data.path);
-    let mut engine = BacktestEngine::new(cfg.clone());
+    let mut engine = BacktestEngine::new(cfg.clone())?;
     let result = engine.run()?;
     info!(
         "回測完成：交易筆數={}，總損益={:.4}",
@@ -380,6 +380,8 @@ mod tests {
                 max_drawdown: 0.0,
                 max_position: 0.0,
                 open_position_qty: 0.0,
+                ending_cash: 0.0,
+                ending_inventory: 0.0,
                 net_sharpe: 0.0,
             },
             input_evidence: Some(BacktestInputEvidence {

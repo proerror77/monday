@@ -12,7 +12,7 @@ use crate::{
 use anyhow::{bail, Context};
 use hft_collector::research_inventory::{
     freeze_inventory_from_selection, select_fresh_window, FreshWindowMode, FreshWindowRequest,
-    FreshWindowSelection, FRESH_WINDOW_SELECTION_SCHEMA,
+    FreshWindowSelection, Market, FRESH_WINDOW_SELECTION_SCHEMA,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -47,6 +47,7 @@ struct PreparationRequest {
     raw_root: PathBuf,
     reference_root: PathBuf,
     selection: FreshWindowMode,
+    market: String,
     symbol: String,
     image_ref: String,
     mission_id: String,
@@ -119,6 +120,7 @@ struct PreparationReport {
     status: String,
     source_revision: String,
     image_ref: String,
+    market: String,
     symbol: String,
     mission_id: String,
     selection: FreshWindowMode,
@@ -353,6 +355,7 @@ pub fn prepare(args: PrepareFreshInputsArgs) -> anyhow::Result<()> {
 }
 
 fn validate_args(args: &PrepareFreshInputsArgs) -> anyhow::Result<()> {
+    parse_market(&args.market)?;
     let has_explicit = args.start_received_at_ns.is_some() || args.end_received_at_ns.is_some();
     let has_latest = args.duration_ns.is_some()
         || args.cutoff_received_at_ns.is_some()
@@ -407,6 +410,14 @@ fn validate_args(args: &PrepareFreshInputsArgs) -> anyhow::Result<()> {
     validate_relative_prefix(&args.output_prefix)?;
     crate::mission_dispatch::image_digest(&args.image_ref)?;
     Ok(())
+}
+
+fn parse_market(value: &str) -> anyhow::Result<Market> {
+    let market = value.parse::<Market>().map_err(anyhow::Error::msg)?;
+    if value != market.as_str() {
+        bail!("fresh input market must be canonical lowercase: {value}");
+    }
+    Ok(market)
 }
 
 fn validate_relative_prefix(value: &str) -> anyhow::Result<()> {
@@ -566,6 +577,7 @@ fn build_preparation_request(
         raw_root: raw_root.to_path_buf(),
         reference_root: reference_root.to_path_buf(),
         selection,
+        market: args.market.clone(),
         symbol: args.symbol.clone(),
         image_ref: args.image_ref.clone(),
         mission_id: args.mission_id.clone(),
@@ -604,6 +616,7 @@ fn fresh_window_request(
         raw_root: raw_root.to_path_buf(),
         reference_root: reference_root.to_path_buf(),
         mode: mode.clone(),
+        market: parse_market(&args.market).expect("validated fresh input market"),
         symbol: args.symbol.clone(),
         source_revision: BUILD_SOURCE_REVISION.to_string(),
         image_ref: args.image_ref.clone(),
@@ -627,6 +640,7 @@ fn inventory_from_selection(
         reference_root: args.reference_root.clone(),
         start_received_at_ns: selection.selected_start_received_at_ns,
         end_received_at_ns: selection.selected_end_received_at_ns,
+        market: parse_market(&args.market)?,
         symbol: args.symbol.clone(),
         source_revision: BUILD_SOURCE_REVISION.to_string(),
         image_ref: args.image_ref.clone(),
@@ -659,8 +673,11 @@ fn validate_selection(
     request: &PreparationRequest,
     args: &PrepareFreshInputsArgs,
 ) -> anyhow::Result<()> {
+    let market = parse_market(&args.market)?;
     if selection.schema_version != FRESH_WINDOW_SELECTION_SCHEMA
         || selection.mode != request.selection
+        || selection.market != market
+        || request.market != args.market
         || !selection.inventory_eligible
         || selection.materialized_pit_admitted
         || selection.selected_start_received_at_ns >= selection.selected_end_received_at_ns
@@ -821,11 +838,12 @@ fn validate_existing_inventory(args: &PrepareFreshInputsArgs, path: &Path) -> an
 
 fn validate_inventory_env(args: &PrepareFreshInputsArgs, env: &str) -> anyhow::Result<()> {
     let values = parse_inventory_values(env)?;
+    parse_market(&args.market)?;
     for (key, expected) in [
         ("SOURCE_REVISION", BUILD_SOURCE_REVISION.to_string()),
         ("IMAGE_REF", args.image_ref.clone()),
         ("MISSION_ID", args.mission_id.clone()),
-        ("MARKET", "usdm".to_string()),
+        ("MARKET", args.market.clone()),
         ("SYMBOL", args.symbol.clone()),
         ("BUCKET_MS", args.bucket_ms.to_string()),
         (
@@ -1301,7 +1319,7 @@ fn validate_campaign_receipt(
     if receipt.source_revision != BUILD_SOURCE_REVISION
         || receipt.image_ref != args.image_ref
         || receipt.mission_id != args.mission_id
-        || receipt.market != "usdm"
+        || receipt.market != args.market
         || receipt.symbol != args.symbol
         || receipt.output_prefix != args.output_prefix
         || receipt.readback_scope != "same-mounted-ossfs-prefix"
@@ -1465,6 +1483,7 @@ fn preparation_report(
         status: "ready".to_string(),
         source_revision: BUILD_SOURCE_REVISION.to_string(),
         image_ref: args.image_ref.clone(),
+        market: args.market.clone(),
         symbol: args.symbol.clone(),
         mission_id: args.mission_id.clone(),
         selection: selection.mode.clone(),
@@ -1545,6 +1564,7 @@ mod tests {
             duration_ns: None,
             cutoff_received_at_ns: None,
             max_candidates: None,
+            market: "usdm".into(),
             symbol: "BTCUSDT".into(),
             image_ref: format!("registry/research@sha256:{}", "a".repeat(64)),
             mission_id: "fresh-window".into(),
@@ -1705,6 +1725,7 @@ EOF
             duration_ns: None,
             cutoff_received_at_ns: None,
             max_candidates: None,
+            market: "usdm".into(),
             symbol: "BTCUSDT".into(),
             image_ref,
             mission_id: "fresh-window".into(),
@@ -1749,6 +1770,7 @@ EOF
                 start_received_at_ns: 1,
                 end_received_at_ns: 2,
             },
+            market: Market::Usdm,
             selected_start_received_at_ns: 1,
             selected_end_received_at_ns: 2,
             raw: vec![raw_input],

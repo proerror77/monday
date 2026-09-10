@@ -37,8 +37,8 @@ use anyhow::{bail, Context};
 use chrono::Utc;
 use hft_backtest::{
     config::{
-        verify_and_replay_canonical_target_positions_with_trace, CanonicalReplayEvidence,
-        CanonicalSourceSegmentEvidence,
+        verify_and_replay_canonical_target_positions_with_trace_and_spot_rules,
+        CanonicalReplayEvidence, CanonicalSourceSegmentEvidence,
     },
     engine::{
         TargetPositionDecision, TargetPositionReplayConfig, TargetPositionReplayMetrics,
@@ -229,11 +229,15 @@ fn bound_supervised_decision_policy(
     if !binding.id.starts_with("cex-search-policy-") {
         bail!("CEX supervised decision policy has an invalid revision identity");
     }
+    let long_only = mission.spec.instrument.market.as_str() == "spot";
     for policy in [
         CexSupervisedDecisionPolicyV2::controlled_v2(),
         CexSupervisedDecisionPolicyV2::prediction_identity_v2(),
         CexSupervisedDecisionPolicyV2::hysteretic_cost_aware_v2(),
-    ] {
+    ]
+    .into_iter()
+    .map(|policy| policy.with_long_only(long_only))
+    {
         if policy.content_hash().map_err(anyhow::Error::msg)? == binding.content_sha256 {
             return Ok(policy);
         }
@@ -658,6 +662,7 @@ impl CexEventReplayReceiptV1 {
                 .and_then(|value| value.as_object_mut())
             {
                 config.remove("order_latency_us");
+                config.remove("market");
             }
             if let Some(metrics) = value
                 .get_mut("metrics")
@@ -702,6 +707,7 @@ fn replay_config_content_hash(
     let mut value = serde_json::to_value(config)?;
     if let Some(object) = value.as_object_mut() {
         object.remove("order_latency_us");
+        object.remove("market");
     }
     Ok(canonical_json_hash(&value)?)
 }
@@ -2849,10 +2855,12 @@ fn run_cex_target_position_replay(
         bail!("CEX replay materialization identity drifted");
     }
     candidate.reference.validate()?;
-    if observations.len() != candidate.positions.len()
-        || feature_decision_clocks.len() != candidate.positions.len()
+    let candidate_positions =
+        validate_market_compatible_target_positions(&materialization.market, candidate.positions)?;
+    if observations.len() != candidate_positions.len()
+        || feature_decision_clocks.len() != candidate_positions.len()
         || candidate.research_decision_count == 0
-        || candidate.research_decision_count > candidate.positions.len()
+        || candidate.research_decision_count > candidate_positions.len()
     {
         bail!("CEX replay feature clock does not match the selected strategy rows");
     }
@@ -2868,7 +2876,7 @@ fn run_cex_target_position_replay(
         bail!("CEX replay feature clock drifted across PIT series boundaries");
     }
     let (decisions, _non_forced_decision_count) =
-        canonical_target_position_decisions(feature_decision_clocks, candidate.positions)?;
+        canonical_target_position_decisions(feature_decision_clocks, candidate_positions)?;
     let first_decision_time = decisions
         .first()
         .context("CEX event replay has no pre-holdout decisions")?
@@ -2894,6 +2902,7 @@ fn run_cex_target_position_replay(
         .max(candidate.capacity_depth_levels)
         .max(policy.required_depth_levels);
     let replay_config = TargetPositionReplayConfig {
+        market: materialization.market.clone(),
         max_depth_levels,
         max_decision_delay_us,
         order_latency_us,
@@ -2929,16 +2938,18 @@ fn run_cex_target_position_replay(
             },
         }),
     );
-    let (replay_evidence, replay_output) = verify_and_replay_canonical_target_positions_with_trace(
-        replay_artifact_path,
-        replay_manifest_path,
-        replay_artifact_sha256,
-        &replay_manifest_sha256,
-        None,
-        Some(replay_end_time),
-        &decisions,
-        &replay_config,
-    )?;
+    let (replay_evidence, replay_output) =
+        verify_and_replay_canonical_target_positions_with_trace_and_spot_rules(
+            replay_artifact_path,
+            replay_manifest_path,
+            replay_artifact_sha256,
+            &replay_manifest_sha256,
+            None,
+            Some(replay_end_time),
+            &decisions,
+            &replay_config,
+            materialization.snapshot.spot_instrument_rules.as_ref(),
+        )?;
     let trace_artifact_path = replay_trace_artifact_path(receipt_name);
     write_trace_atomic(
         &results_dir.join(&trace_artifact_path),
@@ -3079,6 +3090,24 @@ fn run_cex_target_position_replay(
         }),
     );
     Ok(receipt)
+}
+
+fn validate_market_compatible_target_positions(
+    market: &str,
+    positions: Vec<f64>,
+) -> anyhow::Result<Vec<f64>> {
+    positions
+        .into_iter()
+        .map(|position| {
+            if !position.is_finite() || position.abs() > 1.0 {
+                bail!("CEX replay target position is outside the bounded range");
+            }
+            if market == "spot" && position < -f64::EPSILON {
+                bail!("Spot replay received a short target from its frozen decision policy");
+            }
+            Ok(position)
+        })
+        .collect()
 }
 
 fn canonical_target_position_decisions(
@@ -4800,6 +4829,7 @@ pub(crate) mod tests {
             &tape,
             &decisions,
             &TargetPositionReplayConfig {
+                market: "usdm".to_string(),
                 max_depth_levels: 1,
                 max_decision_delay_us: 1,
                 order_latency_us: 0,
@@ -4832,6 +4862,7 @@ pub(crate) mod tests {
     #[test]
     fn historical_v1_replay_receipt_keeps_its_old_nested_hash_semantics() {
         let replay_config = TargetPositionReplayConfig {
+            market: "usdm".to_string(),
             max_depth_levels: 1,
             max_decision_delay_us: 1_000,
             order_latency_us: 0,
@@ -4964,11 +4995,13 @@ pub(crate) mod tests {
         ] {
             object.remove(field);
         }
-        object
+        if let Some(config) = object
             .get_mut("replay_config")
             .and_then(serde_json::Value::as_object_mut)
-            .unwrap()
-            .remove("order_latency_us");
+        {
+            config.remove("order_latency_us");
+            config.remove("market");
+        }
         let metrics = object
             .get_mut("metrics")
             .and_then(serde_json::Value::as_object_mut)
@@ -8698,6 +8731,7 @@ message binance_replay {
                 valid_through: last_event_time + ChronoDuration::seconds(5),
                 evidence: instrument_rules_evidence.clone(),
             },
+            spot_instrument_rules: None,
             series: vec![hft_research_manifest::CexReplaySeriesV1 {
                 series_id: 1,
                 first_event_time,
@@ -9233,6 +9267,21 @@ message binance_replay {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn spot_replay_targets_are_long_flat_while_usdm_preserves_shorts() {
+        assert!(
+            validate_market_compatible_target_positions("spot", vec![-0.75, 0.25, 0.0]).is_err()
+        );
+        let spot =
+            validate_market_compatible_target_positions("spot", vec![0.0, 0.25, 0.0]).unwrap();
+        assert_eq!(spot, vec![0.0, 0.25, 0.0]);
+
+        let usdm =
+            validate_market_compatible_target_positions("usdm", vec![-0.75, 0.25, 0.0]).unwrap();
+        assert_eq!(usdm, vec![-0.75, 0.25, 0.0]);
+        assert!(validate_market_compatible_target_positions("spot", vec![f64::NAN]).is_err());
     }
 
     #[test]

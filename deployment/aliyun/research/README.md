@@ -31,7 +31,7 @@ The storage authority remains split deliberately:
   must never open the same DuckDB file for writes.
 
 The first Agentic Alpha path uses the Rust `lob-pit-materializer` binary to
-validate the raw segment, replay Binance's USD-M sequence contract, and emit
+validate the raw segment, replay the selected Binance Spot or USD-M sequence contract, and emit
 one-second point-in-time rows. It rejects missing `_SUCCESS` markers,
 SHA-256 mismatch, sequence gaps, unseeded diffs, and closing checkpoints that
 do not match the replayed full book. Feature rows and the materialization report
@@ -800,7 +800,7 @@ must come from the matching release receipt; discovery does not certify that
 image or start a Job. Archive roots may be read-only mirrors or mounted archive
 views. The command neither downloads source payloads nor changes the collectors.
 
-The freezer selects whole, sealed USD-M segments contained in the requested
+The freezer selects whole, sealed Spot or USD-M segments contained in the requested
 window and containing the exact symbol. It reuses the slicer's manifest eligibility
 rules and hashes each selected data/manifest/`_SUCCESS` triplet. Published reference
 batches covering the symbol are verified with the existing reference verifier;

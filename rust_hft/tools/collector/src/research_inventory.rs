@@ -7,6 +7,7 @@ use crate::{
     lob_archiver::files_with_suffix_bounded,
 };
 use anyhow::{bail, Context, Result};
+pub use data::binance_lob_replay::Market;
 use data::binance_market_tape::{
     market_tape_schema, AGGREGATE_TRADE_SUMMARY_CONTRACT, MARKET_TAPE_SCHEMA_V2,
 };
@@ -22,6 +23,7 @@ use std::{
 };
 
 const USDM_LOB_DATASET: &str = "usdm_perpetual_top100_lob";
+const SPOT_LOB_DATASET: &str = "spot_all";
 const USDM_LOB_DEPTH_ONLY_STREAM_TYPES: [&str; 1] = ["depth@100ms"];
 const USDM_LOB_HISTORICAL_STREAM_TYPES: [&str; 2] = ["depth@100ms", "bookTicker"];
 pub const FRESH_WINDOW_SELECTION_SCHEMA: &str = "monday.cex_fresh_window_selection.v1";
@@ -47,6 +49,7 @@ pub struct FreshWindowRequest {
     pub raw_root: PathBuf,
     pub reference_root: PathBuf,
     pub mode: FreshWindowMode,
+    pub market: Market,
     pub symbol: String,
     pub source_revision: String,
     pub image_ref: String,
@@ -65,6 +68,7 @@ pub struct FreshWindowRequest {
 pub struct FreshWindowSelection {
     pub schema_version: String,
     pub mode: FreshWindowMode,
+    pub market: Market,
     pub selected_start_received_at_ns: u64,
     pub selected_end_received_at_ns: u64,
     pub raw: Vec<FrozenInput>,
@@ -225,6 +229,7 @@ pub struct InventoryRequest {
     pub reference_root: PathBuf,
     pub start_received_at_ns: u64,
     pub end_received_at_ns: u64,
+    pub market: Market,
     pub symbol: String,
     pub source_revision: String,
     pub image_ref: String,
@@ -253,6 +258,7 @@ pub struct FrozenInventory {
     pub schema_version: &'static str,
     pub inventory_sha256: String,
     pub input_fingerprint_sha256: String,
+    pub market: Market,
     pub raw: Vec<FrozenInput>,
     pub references: Vec<FrozenInput>,
     pub verified_bytes: u64,
@@ -412,6 +418,13 @@ struct ReferenceWindowCandidate {
     observed_at_ns: u64,
 }
 
+#[derive(Debug, Clone)]
+struct VerifiedReferenceInput {
+    input: FrozenInput,
+    coverage_start_received_at_ns: u64,
+    coverage_end_received_at_ns: u64,
+}
+
 fn raw_contract_key(manifest: &Map<String, Value>) -> Result<String> {
     let schema = required_string(manifest, "schema", "source manifest")?;
     let dataset = required_string(manifest, "dataset", "source manifest")?;
@@ -437,6 +450,25 @@ fn raw_contract_key(manifest: &Map<String, Value>) -> Result<String> {
         symbols,
         stream_types,
     ))?)
+}
+
+fn raw_manifest_matches_market(manifest: &Map<String, Value>, market: Market) -> bool {
+    manifest.get("venue").and_then(Value::as_str) == Some("binance")
+        && manifest.get("market").and_then(Value::as_str) == Some(market.as_str())
+        && manifest.get("dataset").and_then(Value::as_str)
+            == Some(match market {
+                Market::Spot => SPOT_LOB_DATASET,
+                Market::Usdm => USDM_LOB_DATASET,
+            })
+}
+
+fn reference_manifest_matches_market(manifest: &Map<String, Value>, market: Market) -> bool {
+    manifest.get("dataset").and_then(Value::as_str) == Some("reference")
+        && manifest.get("venue").and_then(Value::as_str)
+            == Some(match market {
+                Market::Spot => "binance_spot",
+                Market::Usdm => "binance_usdm",
+            })
 }
 
 fn validate_fresh_window_request(request: &FreshWindowRequest) -> Result<u64> {
@@ -527,8 +559,7 @@ fn scan_raw_window_candidates(
     let mut candidates = Vec::new();
     for path in manifests {
         let (manifest, manifest_sha256) = read_manifest(&request.raw_root, &path)?;
-        if manifest.get("market").and_then(Value::as_str) != Some("usdm")
-            || manifest.get("venue").and_then(Value::as_str) != Some("binance")
+        if !raw_manifest_matches_market(&manifest, request.market)
             || !manifest
                 .get("schema")
                 .and_then(Value::as_str)
@@ -745,9 +776,7 @@ fn scan_reference_window_candidates(
     let mut candidates = Vec::new();
     for path in manifests {
         let (manifest, manifest_sha256) = read_manifest(&request.reference_root, &path)?;
-        if manifest.get("venue").and_then(Value::as_str) != Some("binance_usdm")
-            || manifest.get("dataset").and_then(Value::as_str) != Some("reference")
-        {
+        if !reference_manifest_matches_market(&manifest, request.market) {
             continue;
         }
         let observed = uint(&manifest, "observed_at_ns")?;
@@ -777,8 +806,8 @@ fn verify_reference_window_candidate(
     request: &FreshWindowRequest,
     candidate: &ReferenceWindowCandidate,
     remaining_bytes: &mut u64,
-    cache: &mut BTreeMap<PathBuf, Option<FrozenInput>>,
-) -> Result<Option<FrozenInput>> {
+    cache: &mut BTreeMap<PathBuf, Option<VerifiedReferenceInput>>,
+) -> Result<Option<VerifiedReferenceInput>> {
     if let Some(cached) = cache.get(&candidate.path) {
         return Ok(cached.clone());
     }
@@ -803,16 +832,44 @@ fn verify_reference_window_candidate(
         data_sha256: input.content_sha256.clone(),
         manifest_sha256: input.manifest_sha256.clone(),
     };
-    let batch = verify_reference_artifact_read_only_current_batch(
-        &artifact,
-        &input.content_sha256,
-        &input.manifest_sha256,
-    )?;
-    let selected = batch
+    let coverage = match request.market {
+        Market::Usdm => verify_reference_artifact_read_only_current_batch(
+            &artifact,
+            &input.content_sha256,
+            &input.manifest_sha256,
+        )?
         .contracts()
         .iter()
         .any(|contract| contract.symbol == request.symbol)
-        .then_some(input);
+        .then_some((input.start_received_at_ns, input.end_received_at_ns)),
+        Market::Spot => {
+            let spot_artifact =
+                crate::binance_spot_reference_artifact::PublishedSpotReferenceArtifact {
+                    data_path,
+                    manifest_path: candidate.path.clone(),
+                    success_path: artifact.success_path,
+                    data_sha256: input.content_sha256.clone(),
+                    manifest_sha256: input.manifest_sha256.clone(),
+                };
+            let batch = crate::binance_spot_reference_artifact::verify_spot_reference_artifact(
+                &spot_artifact,
+                &input.content_sha256,
+                &input.manifest_sha256,
+            )?;
+            batch
+                .rules()
+                .iter()
+                .find(|rule| rule.symbol == request.symbol)
+                .map(|rule| (rule.received_at_ns, rule.received_at_ns))
+        }
+    };
+    let selected = coverage.map(
+        |(coverage_start_received_at_ns, coverage_end_received_at_ns)| VerifiedReferenceInput {
+            input,
+            coverage_start_received_at_ns,
+            coverage_end_received_at_ns,
+        },
+    );
     cache.insert(candidate.path.clone(), selected.clone());
     Ok(selected)
 }
@@ -823,7 +880,7 @@ fn references_for_window(
     window_end: u64,
     candidates: &[ReferenceWindowCandidate],
     remaining_bytes: &mut u64,
-    cache: &mut BTreeMap<PathBuf, Option<FrozenInput>>,
+    cache: &mut BTreeMap<PathBuf, Option<VerifiedReferenceInput>>,
 ) -> Result<Option<Vec<FrozenInput>>> {
     let horizon_ns = request
         .bucket_ms
@@ -848,19 +905,32 @@ fn references_for_window(
         }
     }
     references.sort_by(|left, right| {
-        (left.start_received_at_ns, &left.relative_path)
-            .cmp(&(right.start_received_at_ns, &right.relative_path))
+        (
+            left.coverage_start_received_at_ns,
+            &left.input.relative_path,
+        )
+            .cmp(&(
+                right.coverage_start_received_at_ns,
+                &right.input.relative_path,
+            ))
     });
     if references.is_empty() {
         return Ok(None);
     }
-    let earliest = references.first().unwrap().start_received_at_ns;
-    let latest = references.last().unwrap().end_received_at_ns;
-    let gap = hft_research_manifest::CEX_DERIVATIVES_MAX_GAP_NS;
-    if earliest > window_start.saturating_add(gap) || latest < window_end.saturating_sub(gap) {
+    let earliest = references.first().unwrap().coverage_start_received_at_ns;
+    let latest = references.last().unwrap().coverage_end_received_at_ns;
+    let required_through = window_end
+        .checked_add(horizon_ns)
+        .context("fresh reference required coverage overflows")?;
+    if earliest > window_start || latest < required_through {
         return Ok(None);
     }
-    Ok(Some(references))
+    Ok(Some(
+        references
+            .into_iter()
+            .map(|reference| reference.input)
+            .collect(),
+    ))
 }
 
 pub fn select_fresh_window(request: &FreshWindowRequest) -> Result<FreshWindowSelection> {
@@ -875,6 +945,7 @@ pub fn select_fresh_window(request: &FreshWindowRequest) -> Result<FreshWindowSe
                 reference_root: request.reference_root.clone(),
                 start_received_at_ns,
                 end_received_at_ns,
+                market: request.market,
                 symbol: request.symbol.clone(),
                 source_revision: request.source_revision.clone(),
                 image_ref: request.image_ref.clone(),
@@ -890,6 +961,7 @@ pub fn select_fresh_window(request: &FreshWindowRequest) -> Result<FreshWindowSe
             Ok(FreshWindowSelection {
                 schema_version: FRESH_WINDOW_SELECTION_SCHEMA.to_string(),
                 mode: request.mode.clone(),
+                market: request.market,
                 selected_start_received_at_ns: start_received_at_ns,
                 selected_end_received_at_ns: end_received_at_ns,
                 raw: frozen.raw,
@@ -982,6 +1054,7 @@ pub fn select_fresh_window(request: &FreshWindowRequest) -> Result<FreshWindowSe
                 return Ok(FreshWindowSelection {
                     schema_version: FRESH_WINDOW_SELECTION_SCHEMA.to_string(),
                     mode: request.mode.clone(),
+                    market: request.market,
                     selected_start_received_at_ns: observed_start,
                     selected_end_received_at_ns: observed_end,
                     raw,
@@ -1005,6 +1078,7 @@ pub fn freeze_inventory_from_selection(
     if selection.schema_version != FRESH_WINDOW_SELECTION_SCHEMA
         || !selection.inventory_eligible
         || selection.materialized_pit_admitted
+        || selection.market != request.market
         || selection.raw.is_empty()
         || selection.references.is_empty()
         || request.start_received_at_ns != selection.selected_start_received_at_ns
@@ -1130,8 +1204,7 @@ pub fn freeze_inventory(request: &InventoryRequest) -> Result<FrozenInventory> {
     let mut raw = Vec::new();
     for path in raw_manifests {
         let (manifest, sha) = read_manifest(&raw_root, &path)?;
-        if manifest.get("market").and_then(Value::as_str) != Some("usdm")
-            || manifest.get("venue").and_then(Value::as_str) != Some("binance")
+        if !raw_manifest_matches_market(&manifest, request.market)
             || !manifest
                 .get("schema")
                 .and_then(Value::as_str)
@@ -1169,7 +1242,10 @@ pub fn freeze_inventory(request: &InventoryRequest) -> Result<FrozenInventory> {
             .cmp(&(right.start_received_at_ns, &right.relative_path))
     });
     if raw.is_empty() {
-        bail!("no eligible sealed USD-M segments in the requested window");
+        bail!(
+            "no eligible sealed Binance {} segments in the requested window",
+            request.market.as_str()
+        );
     }
     let first = raw
         .iter()
@@ -1195,9 +1271,7 @@ pub fn freeze_inventory(request: &InventoryRequest) -> Result<FrozenInventory> {
     let mut references = Vec::new();
     for path in reference_manifests {
         let (manifest, sha) = read_manifest(&reference_root, &path)?;
-        if manifest.get("venue").and_then(Value::as_str) != Some("binance_usdm")
-            || manifest.get("dataset").and_then(Value::as_str) != Some("reference")
-        {
+        if !reference_manifest_matches_market(&manifest, request.market) {
             continue;
         }
         let observed = uint(&manifest, "observed_at_ns")?;
@@ -1216,26 +1290,51 @@ pub fn freeze_inventory(request: &InventoryRequest) -> Result<FrozenInventory> {
             &mut remaining_bytes,
         )?;
         let data_path = reference_root.join(&input.relative_path);
-        let artifact = PublishedReferenceArtifact {
-            data_path: data_path.clone(),
-            manifest_path: path,
-            success_path: data_path.with_file_name(format!(
-                "{}._SUCCESS",
-                data_path.file_name().unwrap().to_str().unwrap()
-            )),
-            data_sha256: input.content_sha256.clone(),
-            manifest_sha256: input.manifest_sha256.clone(),
+        let data_name = data_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("reference data name is not UTF-8")?
+            .to_string();
+        let has_symbol = match request.market {
+            Market::Usdm => {
+                let artifact = PublishedReferenceArtifact {
+                    data_path: data_path.clone(),
+                    manifest_path: path,
+                    success_path: data_path.with_file_name(format!("{data_name}._SUCCESS")),
+                    data_sha256: input.content_sha256.clone(),
+                    manifest_sha256: input.manifest_sha256.clone(),
+                };
+                verify_reference_artifact_read_only_current_batch(
+                    &artifact,
+                    &input.content_sha256,
+                    &input.manifest_sha256,
+                )?
+                .contracts()
+                .iter()
+                .any(|contract| contract.symbol == request.symbol)
+            }
+            Market::Spot => {
+                let artifact =
+                    crate::binance_spot_reference_artifact::PublishedSpotReferenceArtifact {
+                        data_path,
+                        manifest_path: path,
+                        success_path: reference_root
+                            .join(&input.relative_path)
+                            .with_file_name(format!("{data_name}._SUCCESS")),
+                        data_sha256: input.content_sha256.clone(),
+                        manifest_sha256: input.manifest_sha256.clone(),
+                    };
+                crate::binance_spot_reference_artifact::verify_spot_reference_artifact(
+                    &artifact,
+                    &input.content_sha256,
+                    &input.manifest_sha256,
+                )?
+                .rules()
+                .iter()
+                .any(|rule| rule.symbol == request.symbol)
+            }
         };
-        let batch = verify_reference_artifact_read_only_current_batch(
-            &artifact,
-            &input.content_sha256,
-            &input.manifest_sha256,
-        )?;
-        if !batch
-            .contracts()
-            .iter()
-            .any(|contract| contract.symbol == request.symbol)
-        {
+        if !has_symbol {
             continue;
         }
         if raw.len() + references.len() >= request.max_inputs {
@@ -1248,7 +1347,10 @@ pub fn freeze_inventory(request: &InventoryRequest) -> Result<FrozenInventory> {
             .cmp(&(right.start_received_at_ns, &right.relative_path))
     });
     if references.is_empty() {
-        bail!("no eligible reference seed for the selected USD-M input");
+        bail!(
+            "no eligible reference seed for the selected Binance {} input",
+            request.market.as_str()
+        );
     }
     let fingerprint = selection_fingerprint_from_inputs(&raw, &references)?;
     build_frozen_inventory(
@@ -1299,7 +1401,7 @@ fn build_frozen_inventory(
     if raw.is_empty() || references.is_empty() {
         bail!("frozen inventory requires raw and reference inputs");
     }
-    let mut env = format!("SOURCE_REVISION={}\nIMAGE_REF={}\nMISSION_ID={}\nMARKET=usdm\nSYMBOL={}\nBUCKET_MS={}\nLABEL_HORIZON_BUCKETS={}\nTOP_DEPTH={}\nOUTPUT_PREFIX={}\nWINDOW_START_RECEIVED_AT_NS={}\nWINDOW_END_RECEIVED_AT_NS={}\nRAW_SEGMENT_COUNT={}\n", request.source_revision, request.image_ref, request.mission_id, request.symbol, request.bucket_ms, request.label_horizon_buckets, request.top_depth, request.output_prefix, request.start_received_at_ns, request.end_received_at_ns, raw.len());
+    let mut env = format!("SOURCE_REVISION={}\nIMAGE_REF={}\nMISSION_ID={}\nMARKET={}\nSYMBOL={}\nBUCKET_MS={}\nLABEL_HORIZON_BUCKETS={}\nTOP_DEPTH={}\nOUTPUT_PREFIX={}\nWINDOW_START_RECEIVED_AT_NS={}\nWINDOW_END_RECEIVED_AT_NS={}\nRAW_SEGMENT_COUNT={}\n", request.source_revision, request.image_ref, request.mission_id, request.market.as_str(), request.symbol, request.bucket_ms, request.label_horizon_buckets, request.top_depth, request.output_prefix, request.start_received_at_ns, request.end_received_at_ns, raw.len());
     for (prefix, inputs) in [("RAW_SEGMENT", &raw), ("REFERENCE", &references)] {
         if prefix == "REFERENCE" {
             env.push_str(&format!("REFERENCE_COUNT={}\n", inputs.len()));
@@ -1315,6 +1417,7 @@ fn build_frozen_inventory(
         schema_version: "monday.research_frozen_inventory.v1",
         inventory_sha256: hex::encode(Sha256::digest(env.as_bytes())),
         input_fingerprint_sha256: fingerprint,
+        market: request.market,
         raw,
         references,
         verified_bytes,
@@ -1326,10 +1429,20 @@ fn build_frozen_inventory(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::binance_spot_reference_artifact::{
+        publish_spot_reference, SpotReferenceArtifactConfig,
+    };
+    use crate::binance_spot_reference_collector::OFFICIAL_SPOT_SOURCE_ORIGIN;
     use crate::binance_usdm_reference_artifact::{
         publish_reference_batch, ReferenceArtifactConfig,
     };
     use crate::binance_usdm_reference_collector::OFFICIAL_USDM_SOURCE_ORIGIN;
+    use data::binance_spot_reference::{
+        SpotInstrumentRules, SpotNotionalFilter, SpotPriceFilter, SpotQuantityFilter,
+        SpotReferenceBatch, EXCHANGE_INFO_ENDPOINT as SPOT_EXCHANGE_INFO_ENDPOINT,
+        REFERENCE_SCHEMA as SPOT_REFERENCE_SCHEMA,
+        SERVER_TIME_ENDPOINT as SPOT_SERVER_TIME_ENDPOINT,
+    };
     use data::binance_usdm_reference::{
         ActivePerpetualContract, CompleteReferenceBatch, MarkIndexFundingObservation,
         OpenInterestObservation, EXCHANGE_INFO_ENDPOINT, OPEN_INTEREST_ENDPOINT,
@@ -1340,6 +1453,51 @@ mod tests {
 
     const SOURCE_MS: u64 = 1_700_000_000_000;
     const RECEIVED_NS: u64 = 1_700_000_000_500_000_000;
+
+    fn spot_reference_batch(received_at_ns: u64) -> SpotReferenceBatch {
+        let source_time_ms = received_at_ns / 1_000_000 - 1;
+        SpotReferenceBatch::new(vec![SpotInstrumentRules {
+            schema: SPOT_REFERENCE_SCHEMA.into(),
+            venue: "binance".into(),
+            market: "spot".into(),
+            symbol: "BTCUSDT".into(),
+            base_asset: "BTC".into(),
+            quote_asset: "USDT".into(),
+            status: "TRADING".into(),
+            is_spot_trading_allowed: true,
+            base_asset_precision: 8,
+            quote_asset_precision: 8,
+            price_filter: SpotPriceFilter {
+                min_price: Decimal::ZERO,
+                max_price: Decimal::ZERO,
+                tick_size: Decimal::ZERO,
+            },
+            lot_size_filter: SpotQuantityFilter {
+                min_quantity: Decimal::new(1, 3),
+                max_quantity: Decimal::from(100),
+                step_size: Decimal::new(1, 3),
+            },
+            market_lot_size_filter: Some(SpotQuantityFilter {
+                min_quantity: Decimal::ZERO,
+                max_quantity: Decimal::ZERO,
+                step_size: Decimal::ZERO,
+            }),
+            notional_filter: SpotNotionalFilter {
+                filter_type: "MIN_NOTIONAL".into(),
+                min_notional: Decimal::from(5),
+                max_notional: None,
+                apply_min_to_market: false,
+                apply_max_to_market: None,
+                avg_price_mins: 5,
+            },
+            source_time_ms,
+            source_clock_received_at_ns: received_at_ns - 100_000,
+            received_at_ns,
+            source_endpoint: SPOT_EXCHANGE_INFO_ENDPOINT.into(),
+            source_clock_endpoint: SPOT_SERVER_TIME_ENDPOINT.into(),
+        }])
+        .unwrap()
+    }
 
     fn fixture() -> (tempfile::TempDir, InventoryRequest) {
         let directory = tempfile::tempdir().unwrap();
@@ -1428,6 +1586,7 @@ mod tests {
                 reference_root,
                 start_received_at_ns: RECEIVED_NS,
                 end_received_at_ns: RECEIVED_NS + 2000,
+                market: Market::Usdm,
                 symbol: "BTCUSDT".into(),
                 source_revision: "a".repeat(40),
                 image_ref: format!("registry/runner@sha256:{}", "b".repeat(64)),
@@ -1444,6 +1603,15 @@ mod tests {
     }
 
     fn extra_reference(request: &InventoryRequest, symbol: &str, offset_ns: u64) {
+        extra_reference_with_offsets(request, symbol, offset_ns, offset_ns);
+    }
+
+    fn extra_reference_with_offsets(
+        request: &InventoryRequest,
+        symbol: &str,
+        rule_offset_ns: u64,
+        observed_offset_ns: u64,
+    ) {
         let path = files_with_suffix_bounded(&request.reference_root, ".manifest.json", 100)
             .unwrap()
             .remove(0);
@@ -1468,26 +1636,26 @@ mod tests {
         for row in &mut contracts {
             row.symbol = symbol.into();
             row.pair = symbol.into();
-            row.source_time_ms += offset_ns / 1_000_000;
-            row.source_clock_received_at_ns += offset_ns;
-            row.received_at_ns += offset_ns;
+            row.source_time_ms += rule_offset_ns / 1_000_000;
+            row.source_clock_received_at_ns += rule_offset_ns;
+            row.received_at_ns += rule_offset_ns;
         }
         for row in &mut marks {
             row.symbol = symbol.into();
-            row.source_time_ms += offset_ns / 1_000_000;
-            row.received_at_ns += offset_ns;
-            row.next_funding_time_ms += offset_ns / 1_000_000;
+            row.source_time_ms += rule_offset_ns / 1_000_000;
+            row.received_at_ns += rule_offset_ns;
+            row.next_funding_time_ms += rule_offset_ns / 1_000_000;
         }
         for row in &mut interest {
             row.symbol = symbol.into();
-            row.source_time_ms += offset_ns / 1_000_000;
-            row.received_at_ns += offset_ns;
+            row.source_time_ms += rule_offset_ns / 1_000_000;
+            row.received_at_ns += rule_offset_ns;
         }
         let batch = CompleteReferenceBatch::new(contracts, marks, interest).unwrap();
         publish_reference_batch(
             &ReferenceArtifactConfig {
                 output_root: request.reference_root.clone(),
-                observed_at_ns: RECEIVED_NS + 100 + offset_ns,
+                observed_at_ns: RECEIVED_NS + 100 + observed_offset_ns,
                 max_staleness_ms: 1000,
             },
             OFFICIAL_USDM_SOURCE_ORIGIN,
@@ -1636,8 +1804,114 @@ mod tests {
     }
 
     #[test]
+    fn spot_market_never_falls_back_to_usdm_inputs() {
+        let (_directory, mut request) = fixture();
+        request.market = Market::Spot;
+
+        let error = freeze_inventory(&request).unwrap_err().to_string();
+
+        assert!(error.contains("Binance spot"));
+    }
+
+    #[test]
+    fn fresh_spot_reference_boundary_uses_verified_rule_receive_clock() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let reference_root = root.join("reference");
+        fs::create_dir_all(&reference_root).unwrap();
+        let references = [
+            (RECEIVED_NS - 1_000_000_000, RECEIVED_NS + 1_000_000_000),
+            (RECEIVED_NS + 7_000_000_000, RECEIVED_NS + 8_000_000_000),
+        ];
+        for (rule_received_at_ns, observed_at_ns) in references {
+            publish_spot_reference(
+                &SpotReferenceArtifactConfig {
+                    output_root: reference_root.clone(),
+                    observed_at_ns,
+                    max_staleness_ms: 3_000,
+                },
+                OFFICIAL_SPOT_SOURCE_ORIGIN,
+                rule_received_at_ns - 100_000,
+                rule_received_at_ns,
+                &spot_reference_batch(rule_received_at_ns),
+            )
+            .unwrap();
+        }
+
+        let request = FreshWindowRequest {
+            raw_root: root.join("raw"),
+            reference_root: reference_root.clone(),
+            mode: FreshWindowMode::Explicit {
+                start_received_at_ns: RECEIVED_NS,
+                end_received_at_ns: RECEIVED_NS + 2_000_000_000,
+            },
+            market: Market::Spot,
+            symbol: "BTCUSDT".into(),
+            source_revision: "a".repeat(40),
+            image_ref: format!("registry/runner@sha256:{}", "b".repeat(64)),
+            mission_id: "data-test".into(),
+            output_prefix: "runs/test".into(),
+            bucket_ms: 1_000,
+            label_horizon_buckets: 5,
+            top_depth: 5,
+            max_scan_entries: 100,
+            max_inputs: 10,
+            max_input_bytes: 1_000_000,
+        };
+        let candidates = scan_reference_window_candidates(&request).unwrap();
+        assert_eq!(candidates.len(), 2);
+        let mut remaining_bytes = request.max_input_bytes;
+        let mut cache = BTreeMap::new();
+        let references = references_for_window(
+            &request,
+            RECEIVED_NS,
+            RECEIVED_NS + 2_000_000_000,
+            &candidates,
+            &mut remaining_bytes,
+            &mut cache,
+        )
+        .unwrap()
+        .expect("the verified rule receive clock covers the label horizon");
+
+        assert_eq!(references.len(), 2);
+        assert_eq!(
+            references[0].start_received_at_ns,
+            RECEIVED_NS + 1_000_000_000
+        );
+        assert_eq!(
+            references[0].end_received_at_ns,
+            RECEIVED_NS + 1_000_000_000
+        );
+        assert_eq!(
+            references[1].start_received_at_ns,
+            RECEIVED_NS + 8_000_000_000
+        );
+        assert_eq!(
+            references[1].end_received_at_ns,
+            RECEIVED_NS + 8_000_000_000
+        );
+
+        let mut remaining_bytes = request.max_input_bytes;
+        let mut cache = BTreeMap::new();
+        let rejected = references_for_window(
+            &request,
+            RECEIVED_NS,
+            RECEIVED_NS + 3_000_000_000,
+            &candidates,
+            &mut remaining_bytes,
+            &mut cache,
+        )
+        .unwrap();
+        assert!(
+            rejected.is_none(),
+            "a manifest observed clock at required_through cannot replace a late rule receive clock"
+        );
+    }
+
+    #[test]
     fn latest_selection_uses_metadata_time_and_skips_unsealed_tail() {
         let (_directory, request) = fixture();
+        extra_reference(&request, "BTCUSDT", 5_000_010_000);
         extra_raw(
             &request,
             "z-part-2",
@@ -1660,6 +1934,7 @@ mod tests {
                 cutoff_received_at_ns: RECEIVED_NS + 3_000,
                 max_candidates: 4,
             },
+            market: request.market,
             symbol: request.symbol.clone(),
             source_revision: request.source_revision.clone(),
             image_ref: request.image_ref.clone(),
@@ -1682,6 +1957,7 @@ mod tests {
     #[test]
     fn latest_selection_allows_one_sealed_segment_to_cover_the_window() {
         let (_directory, request) = fixture();
+        extra_reference(&request, "BTCUSDT", 5_000_010_000);
         let selection = select_fresh_window(&FreshWindowRequest {
             raw_root: request.raw_root.clone(),
             reference_root: request.reference_root.clone(),
@@ -1690,6 +1966,7 @@ mod tests {
                 cutoff_received_at_ns: RECEIVED_NS + 1_000,
                 max_candidates: 4,
             },
+            market: request.market,
             symbol: request.symbol.clone(),
             source_revision: request.source_revision.clone(),
             image_ref: request.image_ref.clone(),
@@ -1711,6 +1988,7 @@ mod tests {
     #[test]
     fn latest_selection_uses_manifest_span_without_fabricating_event_continuity() {
         let (_directory, request) = fixture();
+        extra_reference(&request, "BTCUSDT", 5_000_010_000);
         extra_raw(&request, "gapped", RECEIVED_NS + 2_000, RECEIVED_NS + 3_000);
         let selection = select_fresh_window(&FreshWindowRequest {
             raw_root: request.raw_root.clone(),
@@ -1720,6 +1998,7 @@ mod tests {
                 cutoff_received_at_ns: RECEIVED_NS + 3_000,
                 max_candidates: 4,
             },
+            market: request.market,
             symbol: request.symbol.clone(),
             source_revision: request.source_revision.clone(),
             image_ref: request.image_ref.clone(),
@@ -1741,6 +2020,7 @@ mod tests {
     #[test]
     fn latest_selection_falls_back_to_an_older_window_when_newer_refs_are_missing() {
         let (_directory, request) = fixture();
+        extra_reference(&request, "BTCUSDT", 5_000_010_000);
         let newer_start = RECEIVED_NS + 200_000_000_000;
         extra_raw(
             &request,
@@ -1760,6 +2040,7 @@ mod tests {
                 cutoff_received_at_ns: newer_start + 200_000_000_000,
                 max_candidates: 8,
             },
+            market: request.market,
             symbol: request.symbol.clone(),
             source_revision: request.source_revision.clone(),
             image_ref: request.image_ref.clone(),
@@ -1789,6 +2070,7 @@ mod tests {
                 cutoff_received_at_ns: RECEIVED_NS + 2_000,
                 max_candidates: 4,
             },
+            market: request.market,
             symbol: request.symbol.clone(),
             source_revision: request.source_revision.clone(),
             image_ref: request.image_ref.clone(),

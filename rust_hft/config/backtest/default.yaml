@@ -1,5 +1,6 @@
 data:
   path: data/backtest/sample.ndjson
+  market: spot
   format: ndjson
   tick_size: 0.5
   lot_size: 0.01
