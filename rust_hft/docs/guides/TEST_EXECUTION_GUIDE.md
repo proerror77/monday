@@ -189,11 +189,10 @@ critcmp main pr
 ### 初次设置
 
 ```bash
-# 安装工具
-cargo +nightly install cargo-fuzz
 # cargo-fuzz requires nightly; keep it isolated from the repository's stable
 # Rust 1.98.1 build and invoke it explicitly.
 rustup toolchain install nightly
+cargo +nightly install cargo-fuzz
 
 # 创建 fuzz target
 cargo +nightly fuzz add ring_buffer_fuzz
