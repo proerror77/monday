@@ -2135,9 +2135,9 @@ mod tests {
             0,
         )
         .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("noncanonical prediction horizons require a matching typed Campaign label horizon"));
+        assert!(error.to_string().contains(
+            "noncanonical prediction horizons require a matching typed Campaign label horizon"
+        ));
     }
 
     #[test]
