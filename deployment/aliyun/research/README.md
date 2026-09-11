@@ -830,7 +830,11 @@ describe the CEX method; each Mission binds its exact instrument and horizon.
 
 The default label horizon remains five seconds. A 10- or 30-second comparison
 must provide a typed `label_horizon` in its research plan, matching freshly
-materialized labels and the declared purge/embargo boundaries. A comparison
+materialized labels and the declared purge/embargo boundaries. Pass a
+generation-zero plan to the controller with `start --initial-research-plan`.
+The controller retains its exact bytes under the cycle root and binds their
+SHA256 in the controller inputs; retries and ACK readback reject drift without
+requiring access to the original operator path. A comparison
 needs a finite, explicitly budgeted set of Campaigns; adding a symbol or horizon
 does not extend a prior Root Grant. Keep prediction quality separate from
 position-return evaluation and event replay. The existing signed evaluation
