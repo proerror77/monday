@@ -817,6 +817,16 @@ settlement derive the same deadline from the immutable signed budget. A Job
 must still fit the grant's remaining validity and all family/Study budgets;
 the dispatcher does not shorten it based on the current clock or extend expiry.
 
+Terminal feedback retains finite nonnegative drawdowns above one for failed
+evaluations and replays: fixed-notional additive losses can exceed the initial
+unit. Such feedback remains failed; passing feedback retains the original bound,
+and evaluation risk thresholds do not change. Settlement can use a newer reader
+build to reconcile the original execution. It reconstructs the original source,
+images, manifest and reservation and requires an exact registered dispatch,
+Job/Pod provenance and result bytes. New admission still requires the dispatcher
+build to match the execution source; historical settlement cannot reserve or
+submit a Job.
+
 ```bash
 alpha-harness mission dispatch inspect \
   --submission /private/path/campaign-submission.json \
