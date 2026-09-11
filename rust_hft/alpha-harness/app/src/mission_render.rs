@@ -26,7 +26,7 @@ use hft_research_manifest::CexReplayDatasetManifestV5;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, path::Path};
 
-const STABLE_VERSION: &str = "binance-btcusdt-usdm-1s-h5-top5-factor-plan-v5";
+const STABLE_VERSION: &str = "binance-cex-1s-top5-factor-plan-v5";
 const STABLE_HYPOTHESIS_ID: &str = "l2-microstructure-factor-plan-v5";
 const RESEARCH_PLAN_SCHEMA_V2: &str = "cex-campaign-research-plan-v2";
 const SEARCH_POLICY_REVISION_SCHEMA_V1: &str = "cex-campaign-search-policy-revision-v1";
@@ -51,14 +51,14 @@ const MIN_ROWS: usize = INITIAL_TRAIN_ROWS
     + 2 * PURGE_ROWS
     + HOLDOUT_ROWS;
 const MAX_EXPANSIONS: u64 = 256;
-const GP_POLICY_ID: &str = "binance-btcusdt-usdm-1s-h5-top5-factor-plan-v5-gp-policy";
-const BASELINE_POLICY_ID: &str = "binance-btcusdt-usdm-1s-h5-top5-baseline-policy";
-const WEIGHT_POLICY_ID: &str = "binance-btcusdt-usdm-1s-h5-top5-weight-policy";
-const REPLAY_POLICY_ID: &str = "binance-btcusdt-usdm-1s-h5-top5-replay-policy";
-const SCREENING_POLICY_ID: &str = "binance-btcusdt-usdm-1s-h5-top5-screening-policy";
-const SUBSET_POLICY_ID: &str = "binance-btcusdt-usdm-1s-h5-top5-subset-policy";
-const EVALUATION_POLICY_ID: &str = "binance-btcusdt-usdm-1s-h5-top5-evaluation-policy";
-const HOLDOUT_POLICY_ID: &str = "binance-btcusdt-usdm-1s-h5-top5-holdout-policy";
+const GP_POLICY_ID: &str = "binance-cex-1s-top5-factor-plan-v5-gp-policy";
+const BASELINE_POLICY_ID: &str = "binance-cex-1s-top5-baseline-policy";
+const WEIGHT_POLICY_ID: &str = "binance-cex-1s-top5-weight-policy";
+const REPLAY_POLICY_ID: &str = "binance-cex-1s-top5-replay-policy";
+const SCREENING_POLICY_ID: &str = "binance-cex-1s-top5-screening-policy";
+const SUBSET_POLICY_ID: &str = "binance-cex-1s-top5-subset-policy";
+const EVALUATION_POLICY_ID: &str = "binance-cex-1s-top5-evaluation-policy";
+const HOLDOUT_POLICY_ID: &str = "binance-cex-1s-top5-holdout-policy";
 const FEATURE_FIELDS: [&str; 9] = [
     CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD,
     "ask_depth_top5",
@@ -506,9 +506,9 @@ impl CexCampaignResearchPlanV1 {
         Self {
             schema_version: RESEARCH_PLAN_SCHEMA_V2.to_string(),
             generation: 0,
-            objective: "Generate and screen continuous L2 and aggregate-trade microstructure factors, including aggressive trade-flow imbalance, inverse spread, cross-depth pressure consensus, top-five depth concentration, and VWAP-center displacement, then evaluate Ridge and shallow CART with purged walk-forward OOS predictions on Binance USD-M BTCUSDT 1s/h5/top5 under governed dynamic-v4 GP"
+            objective: "Generate and screen continuous L2 and aggregate-trade microstructure factors, including aggressive trade-flow imbalance, inverse spread, cross-depth pressure consensus, top-five depth concentration, and VWAP-center displacement, then evaluate Ridge and shallow CART with purged walk-forward OOS predictions on the bound Binance instrument and prediction horizon under governed dynamic-v4 GP"
                 .to_string(),
-            hypothesis: "Aggressive trade-flow imbalance, L1 pressure, top-five depth balance, inverse spread, cross-depth pressure consensus, near-touch depth concentration, linearly weighted top-five pressure, and top-five VWAP-center displacement predict the next five one-second BTCUSDT mid-price returns"
+            hypothesis: "Aggressive trade-flow imbalance, L1 pressure, top-five depth balance, inverse spread, cross-depth pressure consensus, near-touch depth concentration, linearly weighted top-five pressure, and top-five VWAP-center displacement predict forward mid-price returns over the bound instrument horizon"
                 .to_string(),
             focus_field: "book_imbalance_top5".to_string(),
             feature_fields: FEATURE_FIELDS.into_iter().map(str::to_string).collect(),
@@ -1183,12 +1183,9 @@ pub(crate) fn validate_render_materialization_scope_for_horizon(
     materialization: &crate::mission_runner::Materialization,
     expected_horizon: Option<&CampaignLabelHorizonV1>,
 ) -> anyhow::Result<()> {
-    if !matches!(materialization.market.as_str(), "spot" | "usdm")
-        || materialization.symbol != "BTCUSDT"
-        || materialization.bucket_ms != 1_000
-        || materialization.top_depth != 5
-    {
-        bail!("only the approved Binance Spot or USD-M BTCUSDT 1s/h5/top5 materialization can render this Mission");
+    validate_render_instrument_scope(&materialization.market, &materialization.symbol)?;
+    if materialization.bucket_ms != 1_000 || materialization.top_depth != 5 {
+        bail!("approved Binance research requires 1s/top5 materialization");
     }
     if let Some(horizon) = expected_horizon {
         horizon.validate().map_err(anyhow::Error::msg)?;
@@ -1198,7 +1195,7 @@ pub(crate) fn validate_render_materialization_scope_for_horizon(
             bail!("typed Campaign label horizon does not match materialization");
         }
     } else if materialization.label_horizon_buckets != 5 {
-        bail!("only the approved Binance Spot or USD-M BTCUSDT 1s/h5/top5 materialization can render this Mission");
+        bail!("noncanonical prediction horizons require a matching typed Campaign label horizon");
     }
     let minimum_rows = expected_horizon
         .map(minimum_rows_for_horizon)
@@ -1206,6 +1203,16 @@ pub(crate) fn validate_render_materialization_scope_for_horizon(
         .unwrap_or(MIN_ROWS);
     if materialization.rows < minimum_rows {
         bail!("approved Mission render requires at least {minimum_rows} point-in-time rows");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_render_instrument_scope(market: &str, symbol: &str) -> anyhow::Result<()> {
+    if !matches!(
+        (market, symbol),
+        ("usdm", "BTCUSDT" | "SOLUSDT" | "BNBUSDT") | ("spot", "BTCUSDT")
+    ) {
+        bail!("approved Binance research instruments are USD-M BTCUSDT/SOLUSDT/BNBUSDT or Spot BTCUSDT");
     }
     Ok(())
 }
@@ -1773,6 +1780,76 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn renderer_binds_each_study_symbol_and_horizon() {
+        let mut holdouts = BTreeSet::new();
+        for symbol in ["BTCUSDT", "SOLUSDT", "BNBUSDT"] {
+            for seconds in [5, 10, 30] {
+                let horizon =
+                    CampaignLabelHorizonV1::new(seconds, 1_000, seconds * 2, seconds).unwrap();
+                let fixture = Fixture::with_scope(
+                    minimum_rows_for_horizon(&horizon).unwrap(),
+                    None,
+                    "usdm",
+                    symbol,
+                    seconds,
+                );
+                let mut plan = CexCampaignResearchPlanV1::canonical();
+                plan.label_horizon = Some(horizon.clone());
+                let rendered = render_cex_bundle(
+                    &fixture.feature_path,
+                    &fixture.materialization_path,
+                    &plan,
+                    7,
+                    default_trials(),
+                )
+                .unwrap();
+                let spec = rendered.mission.spec;
+                assert_eq!(spec.instrument.symbol, symbol);
+                assert_eq!(spec.instrument.horizon, horizon.labels);
+                assert_eq!(
+                    spec.evaluation_protocol.walk_forward.purge_rows,
+                    seconds * 2
+                );
+                assert_eq!(
+                    spec.evaluation_protocol.costs.position_notional_usd,
+                    1_000.0
+                );
+                assert_eq!(spec.evaluation_protocol.costs.fee_bps, 2.0);
+                assert!(!spec.objective.contains("BTCUSDT"));
+                assert!(!spec.hypotheses[0].statement.contains("BTCUSDT"));
+                assert!(!spec.policies.gp.id.contains("btcusdt"));
+                assert!(holdouts.insert(spec.holdout.holdout_id));
+                let mut mismatched = plan.clone();
+                mismatched.label_horizon = Some(
+                    CampaignLabelHorizonV1::new(seconds + 1, 1_000, (seconds + 1) * 2, seconds)
+                        .unwrap(),
+                );
+                assert!(render_cex_bundle(
+                    &fixture.feature_path,
+                    &fixture.materialization_path,
+                    &mismatched,
+                    7,
+                    default_trials(),
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("horizon does not match"));
+            }
+        }
+        for (market, symbol) in [
+            ("usdm", "ETHUSDT"),
+            ("spot", "SOLUSDT"),
+            ("usdm", "solusdt"),
+        ] {
+            let fixture = Fixture::with_scope(MIN_ROWS, None, market, symbol, 5);
+            let materialization =
+                decode_materialization(&std::fs::read(&fixture.materialization_path).unwrap())
+                    .unwrap();
+            assert!(validate_render_materialization_scope(&materialization).is_err());
+        }
+    }
+
+    #[test]
     fn render_cex_rejects_feature_source_drift_without_leaving_output() {
         let fixture = Fixture::with_feature_source(MIN_ROWS, "d".repeat(64));
         let error = render_cex_bundle(
@@ -2056,6 +2133,16 @@ pub(crate) mod tests {
         }
 
         fn with_market(rows: usize, feature_source_revision: Option<String>, market: &str) -> Self {
+            Self::with_scope(rows, feature_source_revision, market, "BTCUSDT", 5)
+        }
+
+        fn with_scope(
+            rows: usize,
+            feature_source_revision: Option<String>,
+            market: &str,
+            symbol: &str,
+            horizon: usize,
+        ) -> Self {
             let root = tempfile::tempdir().unwrap();
             let feature_path = root.path().join("features.jsonl");
             let materialization_path = root.path().join("materialization.json");
@@ -2065,7 +2152,7 @@ pub(crate) mod tests {
             let feature_source_revision = feature_source_revision
                 .as_deref()
                 .unwrap_or(&source_revision);
-            let rows = feature_rows(rows, feature_source_revision, market);
+            let rows = feature_rows(rows, feature_source_revision, market, symbol, horizon);
             write_feature_rows(&feature_path, &rows);
             let bytes = std::fs::read(&feature_path).unwrap();
             let feature_sha256 = hex::encode(Sha256::digest(&bytes));
@@ -2090,7 +2177,7 @@ pub(crate) mod tests {
                 schema_version: hft_research_manifest::CEX_REPLAY_SNAPSHOT_SCHEMA_V5.to_string(),
                 venue: "binance".to_string(),
                 instrument_type: market.to_string(),
-                symbol: "BTCUSDT".to_string(),
+                symbol: symbol.to_string(),
                 replay_clock: hft_research_manifest::CEX_REPLAY_CLOCK_RECEIVED_AT_NS.to_string(),
                 required_modalities: BTreeSet::from([
                     hft_research_manifest::CEX_MODALITY_LOB.to_string(),
@@ -2109,14 +2196,14 @@ pub(crate) mod tests {
                 feature_availability_policy: hft_research_manifest::CEX_FEATURE_AVAILABILITY_POLICY
                     .to_string(),
                 bucket_ms: 1_000,
-                label_horizon_buckets: 5,
+                label_horizon_buckets: horizon,
                 top_depth: 5,
                 instrument_rules: hft_research_manifest::CexInstrumentRulesV2 {
                     tick_size: "0.1".to_string(),
                     step_size: "0.001".to_string(),
                     min_notional: "5".to_string(),
                     available_at: first_event_time - ChronoDuration::seconds(1),
-                    valid_through: last_event_time + ChronoDuration::seconds(5),
+                    valid_through: last_event_time + ChronoDuration::seconds(horizon as i64),
                     evidence: instrument_rules_evidence.clone(),
                 },
                 spot_instrument_rules: (market == "spot").then(spot_instrument_rules),
@@ -2127,7 +2214,8 @@ pub(crate) mod tests {
                     instrument_rules_coverage: hft_research_manifest::CexPitSeriesEvidenceV2 {
                         evidence: instrument_rules_evidence,
                         first_available_at: first_event_time - ChronoDuration::seconds(1),
-                        last_available_at: last_event_time + ChronoDuration::seconds(5),
+                        last_available_at: last_event_time
+                            + ChronoDuration::seconds(horizon as i64),
                         observations: reference_observations as u64,
                         max_gap_ns: hft_research_manifest::CEX_DERIVATIVES_MAX_GAP_NS,
                     },
@@ -2138,10 +2226,10 @@ pub(crate) mod tests {
                 "dataset_kind": "lob_point_in_time_materialization",
                 "schema_version": hft_research_manifest::BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V7,
                 "mission_id": "data-mission-1",
-                "symbol": "BTCUSDT",
+                "symbol": symbol,
                 "market": market,
                 "bucket_ms": 1000,
-                "label_horizon_buckets": 5,
+                "label_horizon_buckets": horizon,
                 "top_depth": 5,
                 "source_revision": source_revision,
                 "source_segments": [{
@@ -2180,17 +2268,19 @@ pub(crate) mod tests {
         count: usize,
         source_revision: &str,
         market: &str,
+        symbol: &str,
+        horizon: usize,
     ) -> Vec<PointInTimeFeatureRow> {
         let ingestion_time = Utc::now();
-        let start = ingestion_time - ChronoDuration::seconds(count as i64 + 10);
+        let start = ingestion_time - ChronoDuration::seconds((count + horizon + 5) as i64);
         (0..count)
             .map(|index| PointInTimeFeatureRow {
                 series_id: 1,
                 event_time: start + ChronoDuration::seconds(index as i64),
                 feature_available_time: start + ChronoDuration::seconds(index as i64),
-                label_available_time: start + ChronoDuration::seconds(index as i64 + 5),
+                label_available_time: start + ChronoDuration::seconds((index + horizon) as i64),
                 ingestion_time,
-                symbol: "BTCUSDT".to_string(),
+                symbol: symbol.to_string(),
                 source_revisions: BTreeMap::from([(
                     format!("binance-{market}-lob"),
                     source_revision.to_string(),

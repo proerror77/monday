@@ -822,6 +822,25 @@ configuration from the paired image-release receipt; inspection checks its pin
 and the dispatcher's compiled source revision, not a live controller Pod imageID.
 That Pod/image/volume identity still needs deployment readback before cloud use.
 
+The formal USD-M Campaign input scope admits `BTCUSDT`, `SOLUSDT`, and
+`BNBUSDT`. The receipt's market and symbol must match its content-verified
+materialization; the feature, snapshot and replay bindings still apply. The
+separate Spot Mission renderer remains limited to `BTCUSDT`. Shared policy IDs
+describe the CEX method; each Mission binds its exact instrument and horizon.
+
+The default label horizon remains five seconds. A 10- or 30-second comparison
+must provide a typed `label_horizon` in its research plan, matching freshly
+materialized labels and the declared purge/embargo boundaries. Pass a
+generation-zero plan to the controller with `start --initial-research-plan`.
+The controller retains its exact bytes under the cycle root and binds their
+SHA256 in the controller inputs; retries and ACK readback reject drift without
+requiring access to the original operator path. A comparison
+needs a finite, explicitly budgeted set of Campaigns; adding a symbol or horizon
+does not extend a prior Root Grant. Keep prediction quality separate from
+position-return evaluation and event replay. The existing signed evaluation
+protocol supplies the research notional and costs, and each decision updates
+the target position rather than implicitly creating another full-size trade.
+
 #### Discover and freeze existing collector inputs
 
 `alpha-harness data freeze-inventory` prepares the existing materialization

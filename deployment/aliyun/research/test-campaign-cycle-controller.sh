@@ -108,7 +108,11 @@ case "$1 $2" in
   "mission campaign-freeze")
     output="$(value_after --output "$@")"
     generation=0
-    [[ " $* " != *" --research-plan "* ]] || generation=1
+    if [[ " $* " == *" --research-plan "* ]]; then
+      plan="$(value_after --research-plan "$@")"
+      generation="$(jq -er '.generation' "$plan")"
+      cp "$plan" "$FAKE_STATE/frozen-plan-g$generation.json"
+    fi
     campaign_id="campaign-g$generation"
     object_root="https://bucket.oss-ap-northeast-1-internal.aliyuncs.com/research/g$generation"
     jq -n \
@@ -195,7 +199,7 @@ case "$1 $2" in
         '{schema_version:"monday.campaign_study_proposal_report.v1",status:"needs_authority",reason:$reason}'
     else
       printf '{"study_proposal":true}\n' >"$output"
-      printf '{"schema_version":"cex-campaign-research-plan-v2"}\n' >"$plan_output"
+      printf '{"schema_version":"cex-campaign-research-plan-v2","generation":1}\n' >"$plan_output"
       jq -n --arg proposal "$output" --arg plan "$plan_output" \
         '{schema_version:"monday.campaign_study_proposal_report.v1",status:"ready",proposal_path:$proposal,research_plan_path:$plan}'
     fi
@@ -237,7 +241,7 @@ case "$1 $2" in
     if [[ -e "$output" ]]; then
       reused_existing=true
     else
-      printf '{"schema_version":"cex-campaign-research-plan-v2"}\n' >"$output"
+      printf '{"schema_version":"cex-campaign-research-plan-v2","generation":1}\n' >"$output"
       increment "$FAKE_STATE/plan-count"
     fi
     if [[ "${FAKE_FAIL_AFTER_PLAN:-0}" == 1 && ! -e "$FAKE_STATE/plan-failed-once" ]]; then
@@ -1166,4 +1170,60 @@ grep -Fq 'event=generation_started generation=1' "$root/study-ack-g1.stderr"
 grep -Fq 'event=stage_started generation=1 stage=campaign_learning' "$root/study-ack-g1.stderr"
 test "$(<"$FAKE_STATE/study-propose-count")" == "$study_propose_before_g1"
 printf 'campaign Study handoff recovery: PASS\n'
+
+# An explicit initial horizon plan must survive an ACK handoff without its
+# original operator path, and changing the retained bytes must fail closed.
+export FAKE_STATE="$root/initial-plan-state"
+mkdir "$FAKE_STATE"
+initial_cycle="$root/initial-plan-cycle"
+initial_source="$root/initial-plan.json"
+printf '{"generation":0,"label_horizon":{"labels":[10]}}\n' >"$initial_source"
+initial_args=("${controller_args[@]}")
+for ((index = 0; index < ${#initial_args[@]}; index++)); do
+  if [[ "${initial_args[index]}" == --work-dir ]]; then
+    initial_args[index + 1]="$initial_cycle"
+  elif [[ "${initial_args[index]}" == --max-follow-ups ]]; then
+    initial_args[index + 1]=0
+  fi
+done
+initial_args+=(--initial-research-plan "$initial_source")
+if ! (cd "$start_dir" && FAKE_UNAME=Darwin "$controller" "${initial_args[@]}") \
+  >"$root/initial-plan.stdout" 2>"$root/initial-plan.stderr"; then
+  cat "$root/initial-plan.stderr" >&2
+  exit 1
+fi
+cmp -s "$initial_source" "$FAKE_STATE/frozen-plan-g0.json"
+cmp -s "$initial_source" "$initial_cycle/initial-research-plan.json"
+test "$(jq -r '.initial_research_plan_sha256' "$initial_cycle/controller-inputs.json")" \
+  = "$(shasum -a 256 "$initial_source" | awk '{print $1}')"
+mv "$initial_source" "$initial_source.offline"
+initial_ack=(ack-readback --alpha-harness "$bin/alpha-harness" --aliyun "$bin/aliyun"
+  --kubectl "$bin/kubectl" --campaign-pod-name pod-g0 --work-dir "$initial_cycle")
+# The first fake OSS response intentionally fails; retry uses the same input.
+"$controller" "${initial_ack[@]}" >"$root/initial-ack-first.out" 2>"$root/initial-ack-first.err" || true
+"$controller" "${initial_ack[@]}" >"$root/initial-ack.out" 2>"$root/initial-ack.err"
+test -s "$initial_cycle/cycle-result.json"
+test "$(<"$FAKE_STATE/dispatch-count")" == 1
+printf '\n' >>"$initial_cycle/initial-research-plan.json"
+if "$controller" "${initial_ack[@]}" >"$root/initial-drift.out" 2>"$root/initial-drift.err"; then
+  echo "controller accepted changed initial research plan" >&2
+  exit 1
+fi
+grep -Fq 'initial research plan SHA256 differs' "$root/initial-drift.err"
+test "$(<"$FAKE_STATE/dispatch-count")" == 1
+printf '{"generation":1}\n' >"$initial_source"
+for ((index = 0; index < ${#initial_args[@]}; index++)); do
+  if [[ "${initial_args[index]}" == --work-dir ]]; then
+    initial_args[index + 1]="$root/invalid-initial-plan-cycle"
+  fi
+done
+if (cd "$start_dir" && FAKE_UNAME=Darwin "$controller" "${initial_args[@]}") \
+  >"$root/initial-generation.out" 2>"$root/initial-generation.err"; then
+  echo "controller accepted a follow-up plan as initial authority" >&2
+  exit 1
+fi
+grep -Fq 'initial research plan must have generation zero' "$root/initial-generation.err"
+test ! -e "$root/invalid-initial-plan-cycle"
+test "$(<"$FAKE_STATE/dispatch-count")" == 1
+printf 'initial Campaign plan and recovery binding: PASS\n'
 echo "campaign cycle controller test: PASS"

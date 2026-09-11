@@ -36,6 +36,7 @@ Usage: campaign-cycle-controller.sh [start] \
   --image IMAGE@sha256:DIGEST --campaign-root HTTPS_URL \
   [--control CONTROL_JSON] [--signer EXECUTABLE] \
   --work-dir DIR --seed N --seed N \
+  [--initial-research-plan FILE] \
   [--context NAME] [--namespace NAME] [--max-follow-ups 3] \
   [--job-timeout 7h] \
   [--study-id ID --study-target-family-id ID --study-target-horizon FILE \
@@ -97,6 +98,9 @@ validate_controller_state() {
     and (.job_timeout | type == "string")
     and (.seeds | type == "array" and length >= 2)
     and all(.seeds[]; type == "number")
+    and (if has("initial_research_plan_sha256") then
+      (.initial_research_plan_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+      else true end)
     and ((.input_mode // "receipt") == "receipt"
       or ((.input_mode == "fresh") and (.fresh | type == "object" and (.market | type == "string"))))
     and ((.study // null) == null or ((.study | type == "object")
@@ -111,6 +115,44 @@ sha256_file() {
     shasum -a 256 "$1" | awk '{print $1}'
   else
     die "no portable SHA256 implementation is available"
+  fi
+}
+
+# Retain the initial plan under the durable cycle root. ACK readback may run
+# on another host, after the original operator file is no longer available.
+validate_initial_research_plan() {
+  local retained="$work_dir/initial-research-plan.json"
+  local controller_state="$work_dir/controller-inputs.json" expected=""
+  if [[ -e "$controller_state" ]]; then
+    validate_controller_state "$controller_state"
+    expected="$(jq -r '.initial_research_plan_sha256 // empty' "$controller_state")"
+    if [[ -n "$expected" ]]; then
+      [[ ! -L "$retained" && -f "$retained" ]] || die "retained initial research plan is missing"
+      [[ "$(sha256_file "$retained")" == "$expected" ]] || die "initial research plan SHA256 differs"
+    fi
+  fi
+  if [[ -n "$initial_research_plan" ]]; then
+    [[ ! -L "$initial_research_plan" && -f "$initial_research_plan" ]] \
+      || die "initial research plan must be a regular file"
+    [[ "$(wc -c <"$initial_research_plan")" -le 1048576 ]] \
+      || die "initial research plan exceeds 1048576 bytes"
+    jq -e 'type == "object" and .generation == 0' "$initial_research_plan" >/dev/null \
+      || die "initial research plan must have generation zero"
+    initial_research_plan_sha256="$(sha256_file "$initial_research_plan")"
+    if [[ -e "$controller_state" ]]; then
+      [[ "$initial_research_plan_sha256" == "$expected" ]] \
+        || die "initial research plan SHA256 differs from controller inputs"
+    fi
+    if [[ -e "$retained" || -L "$retained" ]]; then
+      [[ ! -L "$retained" && -f "$retained" ]] || die "retained initial research plan is not a regular file"
+      [[ "$(sha256_file "$retained")" == "$initial_research_plan_sha256" ]] \
+        || die "initial research plan SHA256 differs from retained bytes"
+    fi
+  elif [[ -n "$expected" ]]; then
+    initial_research_plan="$retained"
+    initial_research_plan_sha256="$expected"
+  elif [[ -e "$retained" || -L "$retained" ]]; then
+    die "unbound retained initial research plan requires its original input"
   fi
 }
 
@@ -469,6 +511,8 @@ input_root=""
 source_revision=""
 image=""
 campaign_root=""
+initial_research_plan=""
+initial_research_plan_sha256=""
 signer=""
 control=""
 campaign_pod_name=""
@@ -580,6 +624,7 @@ while (($#)); do
     --source-revision) [[ "$mode" == "start" ]] || die "$mode loads --source-revision from controller state"; source_revision="$2"; shift 2 ;;
     --image) [[ "$mode" == "start" ]] || die "$mode loads --image from controller state"; image="$2"; shift 2 ;;
     --campaign-root) [[ "$mode" == "start" ]] || die "$mode loads --campaign-root from controller state"; campaign_root="$2"; shift 2 ;;
+    --initial-research-plan) [[ "$mode" == "start" ]] || die "$mode loads --initial-research-plan from controller state"; initial_research_plan="$2"; shift 2 ;;
     --signer) signer="$2"; shift 2 ;;
     --control) control="$2"; shift 2 ;;
     --campaign-pod-name) [[ "$mode" == "ack-readback" ]] || die "--campaign-pod-name is ACK-only"; campaign_pod_name="$2"; shift 2 ;;
@@ -736,6 +781,7 @@ fi
 # Fresh preparation can publish to an external output prefix. Verify an
 # existing controller state before creating the work directory, logging a
 # preparation stage, or invoking that materializer.
+validate_initial_research_plan
 validate_fresh_controller_owner
 
 umask 077
@@ -761,6 +807,19 @@ on_controller_error() {
   die "command failed at line $2 with exit $1"
 }
 trap 'on_controller_error "$?" "$LINENO"' ERR
+
+if [[ -n "$initial_research_plan" ]]; then
+  retained_initial_plan="$work_dir/initial-research-plan.json"
+  if [[ ! -e "$retained_initial_plan" ]]; then
+    state_tmp="$retained_initial_plan.partial.$$"
+    cp -- "$initial_research_plan" "$state_tmp"
+    [[ "$(sha256_file "$state_tmp")" == "$initial_research_plan_sha256" ]] \
+      || die "initial research plan changed during retention"
+    mv -- "$state_tmp" "$retained_initial_plan"
+    state_tmp=""
+  fi
+  initial_research_plan="$retained_initial_plan"
+fi
 
 commit_generation_completion() {
   local outcome="$1" cycle_result="${2:-null}" learning_sha="" study_handoff_sha=""
@@ -1228,6 +1287,7 @@ else
     --arg context "$context" \
     --arg namespace "$namespace" \
     --arg control "$control" \
+    --arg initial_plan_sha256 "$initial_research_plan_sha256" \
     --arg input_mode "$input_mode" \
     --argjson fresh "$fresh_state_json" \
     --argjson study "$study_state_json" \
@@ -1237,7 +1297,8 @@ else
     '{campaign_inputs:$campaign_inputs,campaign_inputs_sha256:$campaign_inputs_sha256,input_root:$input_root,source_revision:$source_revision,image:$image,campaign_root:$campaign_root,context:$context,namespace:$namespace,max_follow_ups:$max_follow_ups,job_timeout:$job_timeout,seeds:$seeds}
      + (if $input_mode == "fresh" then {input_mode:"fresh",fresh:$fresh,control:(if $control == "" then null else $control end)}
         elif $control == "" then {} else {control:$control} end)
-     + (if $study == null then {} else {study:$study} end)' \
+     + (if $study == null then {} else {study:$study} end)
+     + (if $initial_plan_sha256 == "" then {} else {initial_research_plan_sha256:$initial_plan_sha256} end)' \
     >"$state_tmp"
   if [[ -e "$state" ]]; then
     # Preserve historical checkpoints; only the retired token budget is irrelevant.
@@ -1316,7 +1377,7 @@ if [[ -s "$work_dir/cycle-result.json" ]]; then
   exit 0
 fi
 
-research_plan=""
+research_plan="$initial_research_plan"
 generation=0
 while ((generation <= max_follow_ups)); do
   current_generation="$generation"

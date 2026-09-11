@@ -2135,9 +2135,9 @@ mod tests {
             0,
         )
         .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("approved Binance Spot or USD-M BTCUSDT"));
+        assert!(error.to_string().contains(
+            "noncanonical prediction horizons require a matching typed Campaign label horizon"
+        ));
     }
 
     #[test]

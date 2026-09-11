@@ -6,10 +6,11 @@ use crate::{
     },
     data_mission, mission_dispatch,
     mission_render::{
-        allowed_research_feature_fields, render_cex_bundle, CexCampaignFailureClassV1,
-        CexCampaignLearningDirectiveV1, CexCampaignPositionPolicyV1, CexCampaignResearchDeltaV1,
-        CexCampaignResearchEvidenceSignatureV2, CexCampaignResearchParentV1,
-        CexCampaignResearchPlanV1, CexCampaignSearchPolicyRevisionV1, MAX_RESEARCH_PLAN_GENERATION,
+        allowed_research_feature_fields, render_cex_bundle, validate_render_instrument_scope,
+        CexCampaignFailureClassV1, CexCampaignLearningDirectiveV1, CexCampaignPositionPolicyV1,
+        CexCampaignResearchDeltaV1, CexCampaignResearchEvidenceSignatureV2,
+        CexCampaignResearchParentV1, CexCampaignResearchPlanV1, CexCampaignSearchPolicyRevisionV1,
+        MAX_RESEARCH_PLAN_GENERATION,
     },
     mission_runner::{
         decode_materialization, execute_report, fetch_to_file, finalize_existing_search_round,
@@ -17,7 +18,7 @@ use crate::{
         research_event, valid_git_revision, validate_cex_holdout_id,
         validate_supervised_candidate_binding, validate_supervised_replay_binding,
         CexEventReplayReceiptV1, CexSupervisedModelSelectionV1, ExecutionBinding,
-        CEX_SUPERVISED_MODEL_NAMES, MAX_RESULT_BUNDLE_BYTES,
+        CEX_SUPERVISED_MODEL_NAMES, MAX_MATERIALIZATION_BYTES, MAX_RESULT_BUNDLE_BYTES,
     },
     prediction_dispatch::{
         canonical_tokyo_oss_internal_object, cex_campaign_round_root,
@@ -1714,6 +1715,13 @@ fn validated_campaign_inputs(
         &materialization_path,
         &receipt.materialization.sha256,
     )?;
+    if materialization_path.metadata()?.len() > MAX_MATERIALIZATION_BYTES {
+        bail!("campaign materialization exceeds {MAX_MATERIALIZATION_BYTES} bytes");
+    }
+    let materialization = decode_materialization(&std::fs::read(&materialization_path)?)?;
+    if materialization.market != receipt.market || materialization.symbol != receipt.symbol {
+        bail!("campaign inputs receipt instrument does not match its materialization");
+    }
     let replay_artifact_sha256 = verify_local_receipt_item(
         "campaign replay artifact",
         &replay_artifact_path,
@@ -1846,9 +1854,7 @@ fn validate_campaign_inputs_receipt(receipt: &CampaignInputsReceipt) -> anyhow::
     if receipt.market != "usdm" {
         bail!("campaign inputs receipt market must be usdm");
     }
-    if receipt.symbol != "BTCUSDT" {
-        bail!("campaign inputs receipt symbol must be BTCUSDT");
-    }
+    validate_render_instrument_scope(&receipt.market, &receipt.symbol)?;
     if receipt.readback_scope != "same-mounted-ossfs-prefix" {
         bail!("campaign inputs receipt readback_scope must be same-mounted-ossfs-prefix");
     }
@@ -5222,6 +5228,36 @@ mod tests {
             frozen.signing_plan,
             signing_plan(&frozen.canonical_request).unwrap()
         );
+
+        for symbol in ["BTCUSDT", "SOLUSDT", "BNBUSDT"] {
+            let mut admitted = receipt.clone();
+            admitted.symbol = symbol.to_string();
+            validate_campaign_inputs_receipt(&admitted).unwrap();
+        }
+        let mut unsupported = receipt.clone();
+        unsupported.symbol = "ETHUSDT".to_string();
+        assert!(validate_campaign_inputs_receipt(&unsupported).is_err());
+
+        let mut wrong_symbol = receipt.clone();
+        wrong_symbol.symbol = "SOLUSDT".to_string();
+        data_mission::write_json_atomic(&receipt_path, &wrong_symbol).unwrap();
+        let mismatch = freeze_request(&CampaignFreezeArgs {
+            final_evaluation_control: None,
+            campaign_inputs: receipt_path.clone(),
+            input_root: input_root.clone(),
+            source_revision: BUILD_SOURCE_REVISION.to_string(),
+            image: executor_image_ref.clone(),
+            campaign_root: format!("{TEST_ROOT}/campaigns"),
+            seeds: vec![7, 11],
+            research_plan: None,
+            study_proposal: None,
+            output: root.path().join("wrong-symbol-freeze.json"),
+        })
+        .unwrap_err();
+        assert!(mismatch
+            .to_string()
+            .contains("receipt instrument does not match"));
+        data_mission::write_json_atomic(&receipt_path, &receipt).unwrap();
 
         let mut invalid_producer = receipt.clone();
         invalid_producer.source_revision = "not-a-git-sha".to_string();
