@@ -1788,6 +1788,20 @@ mod tests {
             valid_for: chrono::TimeDelta,
             now: chrono::DateTime<chrono::Utc>,
         ) -> Self {
+            Self::with_execution_source(
+                max_job_seconds,
+                valid_for,
+                now,
+                crate::cli::BUILD_SOURCE_REVISION,
+            )
+        }
+
+        fn with_execution_source(
+            max_job_seconds: u64,
+            valid_for: chrono::TimeDelta,
+            now: chrono::DateTime<chrono::Utc>,
+            source_revision: &str,
+        ) -> Self {
             use crate::mission_render::CexCampaignSearchPolicyRevisionV1;
             use alpha_domain::campaign_control::*;
             use alpha_domain::campaign_horizon::CampaignLabelHorizonV1;
@@ -1801,6 +1815,10 @@ mod tests {
             submission.request = crate::mission_campaign::request_for_materialization_for_tests(
                 &inputs.materialization_path,
             );
+            submission.request.build_source_revision = source_revision.into();
+            for round in &mut submission.request.rounds {
+                round.identity.build_source_revision = source_revision.into();
+            }
             let old_campaign_id = submission.request.campaign_id.clone();
             let materialization_metadata: Value =
                 serde_json::from_slice(&std::fs::read(&inputs.materialization_path).unwrap())
@@ -1884,7 +1902,7 @@ mod tests {
             let manifest = render_manifest(&validated, "monday-research").unwrap();
             let controller_image = format!("registry/controller@sha256:{}", "e".repeat(64));
             let inspection = serde_json::to_value(
-                admission::inspect_binding(
+                admission::reconstruct_binding(
                     &validated,
                     &manifest,
                     &inputs.materialization_path,
@@ -2726,6 +2744,169 @@ mod tests {
         drop(gate);
         assert_eq!(fixture.usage().consumed_trials, 20);
         assert_eq!(fixture.usage().job_attempts, 1);
+    }
+
+    #[test]
+    fn historical_settlement_preserves_registered_execution_across_reader_upgrade() {
+        use alpha_domain::campaign_control::{
+            CampaignAttemptOutcomeV1, CampaignAttemptSettlementV1,
+        };
+        use alpha_store::campaign_ledger::{
+            CampaignDispatchSettlementV1, CampaignDispatchTargetV1,
+        };
+        use ed25519_dalek::SigningKey;
+        use std::collections::BTreeMap;
+
+        let now = chrono::Utc::now();
+        let source = "1".repeat(40);
+        assert_ne!(source, crate::cli::BUILD_SOURCE_REVISION);
+        let fixture =
+            AdmissionFixture::with_execution_source(600, chrono::TimeDelta::hours(1), now, &source);
+        let control = admission::read_control(&fixture.control).unwrap();
+        assert!(admission::inspect_binding(
+            &fixture.validated,
+            &fixture.manifest,
+            &control.materialization_path,
+            &control.controller_image,
+            0
+        )
+        .is_err());
+        assert!(admission::Admission::open(
+            &fixture.control,
+            &fixture.validated,
+            &fixture.manifest,
+            "research-context",
+            "monday-research"
+        )
+        .is_err());
+        assert!(
+            admission::Admission::open_for_settlement(
+                &fixture.control,
+                &fixture.validated,
+                &fixture.manifest,
+                "research-context",
+                "monday-research"
+            )
+            .is_err(),
+            "unclaimed historical input must not become settlement authority"
+        );
+
+        let signed: SignedCampaignRootGrantV1 =
+            admission::read_json(&control.signed_root_grant_path).unwrap();
+        let verified = verify_campaign_root_grant(
+            &signed,
+            &BTreeMap::from([(
+                "operator".into(),
+                SigningKey::from_bytes(&[19; 32]).verifying_key(),
+            )]),
+            now,
+        )
+        .unwrap();
+        let inspection = admission::reconstruct_binding(
+            &fixture.validated,
+            &fixture.manifest,
+            &control.materialization_path,
+            &control.controller_image,
+            0,
+        )
+        .unwrap();
+        let reservation = inspection.reservation(&verified);
+        let target = CampaignDispatchTargetV1 {
+            context: "research-context".into(),
+            namespace: "monday-research".into(),
+            job_name: fixture.validated.job_name.clone(),
+            manifest_sha256: alpha_domain::canonical_json_hash(&fixture.manifest).unwrap(),
+        };
+        let origin = reqwest::Url::parse(
+            &fixture
+                .validated
+                .submission
+                .request
+                .campaign_result_readback_url,
+        )
+        .unwrap()
+        .origin()
+        .ascii_serialization();
+        let publish = |store: &mut AlphaStore| {
+            admission::publish_family_receipts_with(
+                store,
+                "dispatch-study",
+                &origin,
+                &control.receipt_access,
+                |_, bytes| Ok(bytes.to_vec()),
+            )
+            .unwrap();
+            admission::publish_study_receipts_with(
+                store,
+                "dispatch-study-budget",
+                &origin,
+                &control.receipt_access,
+                |_, bytes| Ok(bytes.to_vec()),
+            )
+            .unwrap();
+        };
+        // Build the immutable record as the original dispatcher would, using
+        // the authenticated native store rather than the upgraded reader.
+        let mut store = AlphaStore::open(&control.ledger_path).unwrap();
+        store
+            .reserve_campaign_attempt(&verified, &reservation, now)
+            .unwrap();
+        publish(&mut store);
+        store
+            .claim_campaign_dispatch(&verified, &reservation, &target, now)
+            .unwrap();
+        publish(&mut store);
+        store
+            .bind_campaign_dispatch_job(&verified, &reservation, &target, "historical-job", now)
+            .unwrap();
+        publish(&mut store);
+        drop(store);
+        let before = fixture.usage();
+        let mut gate = admission::Admission::open_for_settlement(
+            &fixture.control,
+            &fixture.validated,
+            &fixture.manifest,
+            "research-context",
+            "monday-research",
+        )
+        .unwrap();
+        assert_eq!(gate.reservation.execution.source_revision, source);
+        assert_eq!(gate.reservation, reservation);
+        assert!(gate.prepare().is_err());
+        assert!(gate.claim().is_err());
+        assert!(gate.bind_job("another-job").is_err());
+        gate.settle(&CampaignDispatchSettlementV1 {
+            job_uid: "historical-job".into(),
+            pod_uid: "historical-pod".into(),
+            settlement: CampaignAttemptSettlementV1 {
+                operation_id: reservation.operation_id().unwrap(),
+                reservation_sha256: reservation.content_hash().unwrap(),
+                evidence_sha256: "b".repeat(64),
+                outcome: CampaignAttemptOutcomeV1::NoCandidate,
+                consumed_trials: Some(20),
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            gate.record().unwrap().terminal_pod_uid.as_deref(),
+            Some("historical-pod")
+        );
+        drop(gate);
+        let after = fixture.usage();
+        assert_eq!(after.job_attempts, before.job_attempts);
+        assert_eq!(after.reserved_job_seconds, before.reserved_job_seconds);
+        assert_eq!(after.consumed_trials, 20);
+        let mut changed = fixture.manifest.clone();
+        changed["items"][1]["spec"]["template"]["spec"]["containers"][0]["resources"]["limits"]
+            ["memory"] = json!("24Gi");
+        assert!(admission::Admission::open_for_settlement(
+            &fixture.control,
+            &fixture.validated,
+            &changed,
+            "research-context",
+            "monday-research"
+        )
+        .is_err());
     }
 
     #[test]

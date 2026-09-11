@@ -123,10 +123,29 @@ pub(super) fn inspect_binding(
     controller_image: &str,
     attempt_ordinal: u32,
 ) -> anyhow::Result<DispatchInspection> {
-    let request = &validated.submission.request;
-    if request.build_source_revision != BUILD_SOURCE_REVISION {
+    if validated.submission.request.build_source_revision != BUILD_SOURCE_REVISION {
         bail!("Campaign dispatcher source revision differs from the execution request");
     }
+    reconstruct_binding(
+        validated,
+        manifest,
+        materialization_path,
+        controller_image,
+        attempt_ordinal,
+    )
+}
+
+/// Reconstruct immutable execution evidence independently of the reader build.
+/// Settlement must subsequently match an already registered dispatch record;
+/// this function alone is never authority to reserve or submit another Job.
+pub(super) fn reconstruct_binding(
+    validated: &ValidatedSubmission,
+    manifest: &Value,
+    materialization_path: &Path,
+    controller_image: &str,
+    attempt_ordinal: u32,
+) -> anyhow::Result<DispatchInspection> {
+    let request = &validated.submission.request;
     image_digest(controller_image)?;
     let bytes = read_bounded(materialization_path, MAX_MATERIALIZATION_BYTES)?;
     if hex::encode(Sha256::digest(&bytes)) != request.materialization_sha256 {
@@ -308,7 +327,11 @@ impl Admission {
     ) -> anyhow::Result<Self> {
         let control = read_control(path)?;
         let signed: SignedCampaignRootGrantV1 = read_json(&control.signed_root_grant_path)?;
-        let inspection = inspect_binding(
+        let inspect = match purpose {
+            Purpose::Dispatch => inspect_binding,
+            Purpose::Settlement => reconstruct_binding,
+        };
+        let inspection = inspect(
             validated,
             manifest,
             &control.materialization_path,

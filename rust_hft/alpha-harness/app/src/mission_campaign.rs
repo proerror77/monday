@@ -3211,8 +3211,7 @@ fn valid_campaign_evaluation_feedback(feedback: &CampaignEvaluationFeedbackV1) -
             .time_series_rank_ic
             .is_none_or(|value| value.is_finite() && (-1.0..=1.0).contains(&value))
         && feedback.cumulative_net_return.is_finite()
-        && feedback.max_drawdown.is_finite()
-        && (0.0..=1.0).contains(&feedback.max_drawdown)
+        && valid_feedback_drawdown(feedback.max_drawdown, feedback.passed)
         && feedback.net_sharpe.is_finite()
         && feedback.total_turnover.is_finite()
         && feedback.total_turnover >= 0.0
@@ -3229,9 +3228,15 @@ fn valid_campaign_replay_feedback(feedback: &CampaignReplayFeedbackV1) -> bool {
         && feedback.total_turnover >= 0.0
         && feedback.mean_net_return.is_finite()
         && feedback.cumulative_net_return.is_finite()
-        && feedback.max_drawdown.is_finite()
-        && (0.0..=1.0).contains(&feedback.max_drawdown)
+        && valid_feedback_drawdown(feedback.max_drawdown, feedback.passed)
         && feedback.net_sharpe.is_finite()
+}
+
+fn valid_feedback_drawdown(drawdown: f64, passed: bool) -> bool {
+    // Fixed-notional additive losses can exceed the initial unit. Preserve
+    // those failed outcomes for accounting without admitting a passing result
+    // outside the existing bound or changing any evaluation risk threshold.
+    drawdown.is_finite() && drawdown >= 0.0 && (!passed || drawdown <= 1.0)
 }
 
 pub(crate) fn serialize_request(request: &CampaignRequest) -> anyhow::Result<Vec<u8>> {
@@ -4756,8 +4761,49 @@ mod tests {
         };
 
         validate_campaign_round_feedback(&feedback, 1).unwrap();
+        // Fixed-notional additive accounting can lose more than the initial
+        // unit. SOL5 produced this rejected trading evaluation in a real run.
+        feedback.factors[0]
+            .evaluation
+            .as_mut()
+            .unwrap()
+            .max_drawdown = 1.048_747_746_845_106;
+        validate_campaign_round_feedback(&feedback, 1).unwrap();
+        assert!(!feedback.factors[0].evaluation.as_ref().unwrap().passed);
+        let mut invalid = feedback.clone();
+        invalid.factors[0].evaluation.as_mut().unwrap().passed = true;
+        assert!(validate_campaign_round_feedback(&invalid, 1).is_err());
+        for drawdown in [-0.01, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut invalid = feedback.clone();
+            invalid.factors[0].evaluation.as_mut().unwrap().max_drawdown = drawdown;
+            assert!(validate_campaign_round_feedback(&invalid, 1).is_err());
+        }
         feedback.accepted_factors = 0;
         assert!(validate_campaign_round_feedback(&feedback, 1).is_err());
+    }
+
+    #[test]
+    fn campaign_feedback_preserves_rejected_additive_drawdown_in_replay() {
+        let mut replay = CampaignReplayFeedbackV1 {
+            passed: false,
+            failures: vec!["maximum drawdown exceeded".into()],
+            position_changes: 5_267,
+            total_turnover: 10_526.0,
+            mean_net_return: -0.000_3,
+            cumulative_net_return: -3.129_691_227_555_395_6,
+            max_drawdown: 1.048_747_746_845_106,
+            net_sharpe: -0.9,
+        };
+        assert!(valid_campaign_replay_feedback(&replay));
+        replay.passed = true;
+        replay.failures.clear();
+        assert!(!valid_campaign_replay_feedback(&replay));
+        replay.passed = false;
+        replay.failures.push("maximum drawdown exceeded".into());
+        for drawdown in [-0.01, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            replay.max_drawdown = drawdown;
+            assert!(!valid_campaign_replay_feedback(&replay));
+        }
     }
 
     #[test]
