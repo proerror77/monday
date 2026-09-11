@@ -1,8 +1,8 @@
 //! Independent terminal readback and accounting for the same dispatched Job.
 
 use super::{
-    admission::Admission, load_submission, render_manifest, validate_job_readback,
-    validate_submission,
+    admission::{self, Admission},
+    load_submission, render_controlled_manifest, validate_job_readback, validate_submission,
 };
 use crate::{
     cli::{print_json, MissionDispatchSubmitArgs},
@@ -19,11 +19,15 @@ use std::time::Duration;
 pub(super) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
     validate_cluster_target(&args.context, &args.namespace)?;
     let validated = validate_submission(load_submission(&args.submission)?)?;
-    let manifest = render_manifest(&validated, &args.namespace)?;
     let control = args
         .control
         .or_else(|| std::env::var_os("MONDAY_CAMPAIGN_CONTROL").map(Into::into))
         .context("Campaign settlement requires --control or MONDAY_CAMPAIGN_CONTROL")?;
+    let manifest = render_controlled_manifest(
+        &validated,
+        &args.namespace,
+        &admission::read_control(&control)?,
+    )?;
     let mut admission = Admission::open_for_settlement(
         &control,
         &validated,

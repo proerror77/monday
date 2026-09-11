@@ -87,7 +87,14 @@ pub fn inspect(args: MissionDispatchInspectArgs) -> anyhow::Result<()> {
         return final_admission::inspect(args);
     }
     let validated = validate_submission(load_submission(&args.submission)?)?;
-    let manifest = render_manifest(&validated, "monday-research")?;
+    let manifest = match args.control.as_deref() {
+        Some(path) => render_controlled_manifest(
+            &validated,
+            "monday-research",
+            &admission::read_control(path)?,
+        )?,
+        None => render_manifest(&validated, "monday-research")?,
+    };
     print_json(&admission::inspect_binding(
         &validated,
         &manifest,
@@ -116,12 +123,16 @@ pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
     let campaign_id = validated.submission.request.campaign_id.clone();
     let request_sha256 = validated.request_sha256.clone();
     let request_json = validated.request_json.clone();
-    let manifest = render_manifest(&validated, &args.namespace)?;
     let control = args
         .control
         .clone()
         .or_else(|| std::env::var_os("MONDAY_CAMPAIGN_CONTROL").map(Into::into))
         .context("Campaign dispatch requires --control or MONDAY_CAMPAIGN_CONTROL")?;
+    let manifest = render_controlled_manifest(
+        &validated,
+        &args.namespace,
+        &admission::read_control(&control)?,
+    )?;
     let mut admission = admission::Admission::open(
         &control,
         &validated,
@@ -174,7 +185,7 @@ pub(crate) fn read_authenticated_campaign_parent(
     let control = admission::read_control(control_path)?;
     let submission = load_submission(submission_path)?;
     let validated = validate_submission(submission)?;
-    let manifest = render_manifest(&validated, namespace)?;
+    let manifest = render_controlled_manifest(&validated, namespace, &control)?;
     let inspection = admission::inspect_binding(
         &validated,
         &manifest,
@@ -997,6 +1008,22 @@ struct DispatchManifestInput<'a> {
 }
 
 fn render_manifest(validated: &ValidatedSubmission, namespace: &str) -> anyhow::Result<Value> {
+    render_manifest_with_deadline(validated, namespace, ACTIVE_DEADLINE_SECONDS)
+}
+
+fn render_controlled_manifest(
+    validated: &ValidatedSubmission,
+    namespace: &str,
+    control: &admission::DispatchControl,
+) -> anyhow::Result<Value> {
+    render_manifest_with_deadline(validated, namespace, admission::root_job_deadline(control)?)
+}
+
+fn render_manifest_with_deadline(
+    validated: &ValidatedSubmission,
+    namespace: &str,
+    active_deadline_seconds: u64,
+) -> anyhow::Result<Value> {
     render_campaign_manifest(
         DispatchManifestInput {
             attempt_id: &validated.submission.attempt_id,
@@ -1009,7 +1036,7 @@ fn render_manifest(validated: &ValidatedSubmission, namespace: &str) -> anyhow::
             request_json: &validated.request_json,
             submission_identity_sha256: &validated.submission_identity_sha256,
             trusted_keys_json: None,
-            active_deadline_seconds: ACTIVE_DEADLINE_SECONDS,
+            active_deadline_seconds,
             args: vec![
                 "mission".into(),
                 "campaign-execute".into(),
@@ -1749,12 +1776,24 @@ mod tests {
 
     impl AdmissionFixture {
         fn new() -> Self {
+            Self::with_job_budget(100_000, chrono::TimeDelta::hours(24))
+        }
+
+        fn with_job_budget(max_job_seconds: u64, valid_for: chrono::TimeDelta) -> Self {
+            Self::with_job_budget_at(max_job_seconds, valid_for, chrono::Utc::now())
+        }
+
+        fn with_job_budget_at(
+            max_job_seconds: u64,
+            valid_for: chrono::TimeDelta,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> Self {
             use crate::mission_render::CexCampaignSearchPolicyRevisionV1;
             use alpha_domain::campaign_control::*;
             use alpha_domain::campaign_horizon::CampaignLabelHorizonV1;
             use alpha_domain::campaign_study::*;
             use alpha_store::{AlphaStore, ApprovalRecord};
-            use chrono::{TimeDelta, Utc};
+            use chrono::TimeDelta;
             use ed25519_dalek::SigningKey;
             use std::collections::{BTreeMap, BTreeSet};
             let inputs = crate::mission_render::tests::Fixture::canonical();
@@ -1855,7 +1894,6 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-            let now = Utc::now();
             let grant = CampaignRootGrantV1 {
                 schema_version: ROOT_GRANT_SCHEMA.into(),
                 root_id: "dispatch-root".into(),
@@ -1874,11 +1912,11 @@ mod tests {
                 budget: CampaignRootBudgetV1 {
                     max_trials: 1000,
                     max_job_attempts: 2,
-                    max_job_seconds: 100_000,
+                    max_job_seconds,
                     max_llm_tokens: 0,
                 },
                 valid_from: now - TimeDelta::minutes(1),
-                expires_at: now + TimeDelta::hours(24),
+                expires_at: now + valid_for,
             };
             let signing_key = SigningKey::from_bytes(&[19; 32]);
             let signed = sign_campaign_root_grant(grant, "operator".into(), &signing_key).unwrap();
@@ -2078,6 +2116,12 @@ mod tests {
                 "approval_id": "dispatch-approval", "controller_image": controller_image,
                 "attempt_ordinal": 0, "receipt_access": access,
             })).unwrap()).unwrap();
+            let manifest = render_controlled_manifest(
+                &validated,
+                "monday-research",
+                &admission::read_control(&control).unwrap(),
+            )
+            .unwrap();
             Self {
                 inputs,
                 control,
@@ -2306,6 +2350,128 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_root_deadline_fits_short_authority_and_reserves_actual_job_seconds() {
+        let fixture = AdmissionFixture::with_job_budget(600, chrono::TimeDelta::hours(1));
+        let mut gate = fixture.open();
+        assert_eq!(
+            fixture.manifest["items"][1]["spec"]["activeDeadlineSeconds"],
+            600
+        );
+        assert_eq!(gate.reservation.reserved_job_seconds, 600);
+        gate.prepare().unwrap();
+        drop(gate);
+        assert_eq!(fixture.usage().reserved_job_seconds, 600);
+        assert_eq!(fixture.usage().job_attempts, 1);
+    }
+
+    #[test]
+    fn dispatch_root_deadline_is_stable_and_does_not_extend_an_expired_grant() {
+        use chrono::{TimeDelta, Utc};
+
+        let fixture = AdmissionFixture::with_job_budget_at(
+            600,
+            TimeDelta::hours(1),
+            Utc::now() - TimeDelta::hours(2),
+        );
+        let control = admission::read_control(&fixture.control).unwrap();
+        let historical =
+            render_controlled_manifest(&fixture.validated, "monday-research", &control).unwrap();
+        assert_eq!(historical, fixture.manifest);
+        assert!(admission::Admission::open(
+            &fixture.control,
+            &fixture.validated,
+            &historical,
+            "research-context",
+            "monday-research",
+        )
+        .is_err());
+        assert_eq!(fixture.usage().job_attempts, 0);
+    }
+
+    #[test]
+    fn dispatch_root_deadline_preserves_first_dispatch_registration() {
+        use alpha_domain::campaign_control::{sign_campaign_root_grant, SignedCampaignRootGrantV1};
+        use alpha_store::ApprovalRecord;
+        use ed25519_dalek::SigningKey;
+
+        let fixture = AdmissionFixture::with_job_budget(600, chrono::TimeDelta::hours(1));
+        let mut control = admission::read_control(&fixture.control).unwrap();
+        let existing: SignedCampaignRootGrantV1 =
+            admission::read_json(&control.signed_root_grant_path).unwrap();
+        let mut grant = existing.grant;
+        grant.root_id = "unregistered-root".into();
+        grant.family.family_id = "unregistered-family".into();
+        let signed =
+            sign_campaign_root_grant(grant, "operator".into(), &SigningKey::from_bytes(&[19; 32]))
+                .unwrap();
+        control.approval_id = "unregistered-approval".into();
+        let approval = ApprovalRecord {
+            approval_id: control.approval_id.clone(),
+            approval_class: "campaign_root".into(),
+            subject_id: signed.grant.root_id.clone(),
+            payload: json!({"grant_sha256":signed.content_sha256, "family_id":signed.grant.family.family_id}),
+            signer_id: Some("operator".into()),
+            valid_from: Some(signed.grant.valid_from),
+            expires_at: Some(signed.grant.expires_at),
+            revoked_at: None,
+            revoked_by: None,
+            revocation_reason: None,
+            created_at: signed.grant.valid_from,
+        };
+        let mut store = AlphaStore::open(&control.ledger_path).unwrap();
+        store.record_approval(&approval).unwrap();
+        assert!(store
+            .campaign_family_receipts("unregistered-family")
+            .unwrap()
+            .is_empty());
+        drop(store);
+        std::fs::write(
+            &control.signed_root_grant_path,
+            serde_json::to_vec(&signed).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&fixture.control, serde_json::to_vec(&control).unwrap()).unwrap();
+        let manifest =
+            render_controlled_manifest(&fixture.validated, "monday-research", &control).unwrap();
+        assert_eq!(manifest["items"][1]["spec"]["activeDeadlineSeconds"], 600);
+        let mut gate = admission::Admission::open(
+            &fixture.control,
+            &fixture.validated,
+            &manifest,
+            "research-context",
+            "monday-research",
+        )
+        .unwrap();
+        gate.prepare().unwrap();
+        drop(gate);
+        let store = AlphaStore::open_read_only(&control.ledger_path).unwrap();
+        assert_eq!(
+            store
+                .campaign_family_usage("unregistered-family")
+                .unwrap()
+                .reserved_job_seconds,
+            600
+        );
+    }
+
+    #[test]
+    fn dispatch_root_deadline_rejects_unsigned_budget_changes() {
+        let fixture = AdmissionFixture::new();
+        let control = admission::read_control(&fixture.control).unwrap();
+        let mut signed: Value = admission::read_json(&control.signed_root_grant_path).unwrap();
+        signed["grant"]["budget"]["max_job_seconds"] = json!(600);
+        std::fs::write(
+            &control.signed_root_grant_path,
+            serde_json::to_vec(&signed).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            render_controlled_manifest(&fixture.validated, "monday-research", &control).is_err()
+        );
+        assert_eq!(fixture.usage().job_attempts, 0);
+    }
+
+    #[test]
     fn dispatch_reserves_real_request_once_and_requires_independent_receipt_bytes_before_actions() {
         let fixture = AdmissionFixture::new();
         let mut gate = fixture.open();
@@ -2490,7 +2656,7 @@ mod tests {
             CampaignAttemptOutcomeV1, CampaignAttemptSettlementV1,
         };
         use alpha_store::campaign_ledger::CampaignDispatchSettlementV1;
-        let fixture = AdmissionFixture::new();
+        let fixture = AdmissionFixture::with_job_budget(600, chrono::TimeDelta::hours(1));
         let mut gate = fixture.open();
         gate.prepare().unwrap();
         gate.publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
@@ -2504,6 +2670,13 @@ mod tests {
         let attempt = gate.reservation.clone();
         drop(gate);
         std::fs::remove_file(fixture.inputs._root.path().join("keys.json")).unwrap();
+        let historical = render_controlled_manifest(
+            &fixture.validated,
+            "monday-research",
+            &admission::read_control(&fixture.control).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(historical, fixture.manifest);
         assert!(admission::Admission::open(
             &fixture.control,
             &fixture.validated,
