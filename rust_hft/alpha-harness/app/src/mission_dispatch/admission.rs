@@ -898,7 +898,11 @@ pub(super) fn root_job_deadline(control: &DispatchControl) -> anyhow::Result<u64
             }
         }
     }
-    bail!("Campaign control root differs from authenticated ledger")
+    // The first dispatch may register a newly approved root. Authenticate
+    // that prospective authority with current trust; prepare() still checks
+    // its approval, family/Study binding and all cumulative charges.
+    let verified = verify(&signed, &control.trusted_keys_path)?;
+    Ok(super::ACTIVE_DEADLINE_SECONDS.min(verified.grant().budget.max_job_seconds))
 }
 
 pub(super) fn read_control(path: &Path) -> anyhow::Result<DispatchControl> {

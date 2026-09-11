@@ -2389,6 +2389,72 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_root_deadline_preserves_first_dispatch_registration() {
+        use alpha_domain::campaign_control::{sign_campaign_root_grant, SignedCampaignRootGrantV1};
+        use alpha_store::ApprovalRecord;
+        use ed25519_dalek::SigningKey;
+
+        let fixture = AdmissionFixture::with_job_budget(600, chrono::TimeDelta::hours(1));
+        let mut control = admission::read_control(&fixture.control).unwrap();
+        let existing: SignedCampaignRootGrantV1 =
+            admission::read_json(&control.signed_root_grant_path).unwrap();
+        let mut grant = existing.grant;
+        grant.root_id = "unregistered-root".into();
+        grant.family.family_id = "unregistered-family".into();
+        let signed =
+            sign_campaign_root_grant(grant, "operator".into(), &SigningKey::from_bytes(&[19; 32]))
+                .unwrap();
+        control.approval_id = "unregistered-approval".into();
+        let approval = ApprovalRecord {
+            approval_id: control.approval_id.clone(),
+            approval_class: "campaign_root".into(),
+            subject_id: signed.grant.root_id.clone(),
+            payload: json!({"grant_sha256":signed.content_sha256, "family_id":signed.grant.family.family_id}),
+            signer_id: Some("operator".into()),
+            valid_from: Some(signed.grant.valid_from),
+            expires_at: Some(signed.grant.expires_at),
+            revoked_at: None,
+            revoked_by: None,
+            revocation_reason: None,
+            created_at: signed.grant.valid_from,
+        };
+        let mut store = AlphaStore::open(&control.ledger_path).unwrap();
+        store.record_approval(&approval).unwrap();
+        assert!(store
+            .campaign_family_receipts("unregistered-family")
+            .unwrap()
+            .is_empty());
+        drop(store);
+        std::fs::write(
+            &control.signed_root_grant_path,
+            serde_json::to_vec(&signed).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&fixture.control, serde_json::to_vec(&control).unwrap()).unwrap();
+        let manifest =
+            render_controlled_manifest(&fixture.validated, "monday-research", &control).unwrap();
+        assert_eq!(manifest["items"][1]["spec"]["activeDeadlineSeconds"], 600);
+        let mut gate = admission::Admission::open(
+            &fixture.control,
+            &fixture.validated,
+            &manifest,
+            "research-context",
+            "monday-research",
+        )
+        .unwrap();
+        gate.prepare().unwrap();
+        drop(gate);
+        let store = AlphaStore::open_read_only(&control.ledger_path).unwrap();
+        assert_eq!(
+            store
+                .campaign_family_usage("unregistered-family")
+                .unwrap()
+                .reserved_job_seconds,
+            600
+        );
+    }
+
+    #[test]
     fn dispatch_root_deadline_rejects_unsigned_budget_changes() {
         let fixture = AdmissionFixture::new();
         let control = admission::read_control(&fixture.control).unwrap();
