@@ -808,6 +808,15 @@ Use `mission dispatch inspect` to derive the execution binding and charges from
 the finalized request, the SHA-verified materialization metadata, and the actual
 Job template. Inspection does not approve a root, reserve budget, or start a Job:
 
+Before root issuance, inspection shows the default 21,608-second Job ceiling.
+With an issued root, pass `--control` to inspect the actual bounded template:
+each research Job uses the smaller of that ceiling and the signed root's
+`budget.max_job_seconds`. This is still a cumulative family budget, not a fresh
+allowance per attempt. Submission, retry, historical parent readback and
+settlement derive the same deadline from the immutable signed budget. A Job
+must still fit the grant's remaining validity and all family/Study budgets;
+the dispatcher does not shorten it based on the current clock or extend expiry.
+
 ```bash
 alpha-harness mission dispatch inspect \
   --submission /private/path/campaign-submission.json \

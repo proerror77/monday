@@ -878,6 +878,29 @@ pub(super) fn publish_and_readback(
     Ok(observed)
 }
 
+/// The signed cumulative time budget also bounds any individual Job. Its
+/// immutable value keeps retry, historical readback and settlement manifests
+/// identical; current expiry and remaining cumulative capacity are still
+/// enforced at admission. Rendering historical evidence is not new authority.
+pub(super) fn root_job_deadline(control: &DispatchControl) -> anyhow::Result<u64> {
+    let signed: SignedCampaignRootGrantV1 = read_json(&control.signed_root_grant_path)?;
+    let store = AlphaStore::open_read_only(&control.ledger_path)?;
+    let receipts = store.campaign_family_receipts(&signed.grant.family.family_id)?;
+    for receipt in receipts {
+        if let CampaignLedgerEventV1::RootRegistered {
+            signed: registered, ..
+        } = receipt.receipt.event
+        {
+            if registered.as_ref() == &signed {
+                return Ok(
+                    super::ACTIVE_DEADLINE_SECONDS.min(registered.grant.budget.max_job_seconds)
+                );
+            }
+        }
+    }
+    bail!("Campaign control root differs from authenticated ledger")
+}
+
 pub(super) fn read_control(path: &Path) -> anyhow::Result<DispatchControl> {
     // Trust paths remain logical so projected-key rotation is visible. Immutable
     // input/ledger paths are physical and all relative paths are control-relative.
