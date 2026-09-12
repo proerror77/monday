@@ -180,8 +180,8 @@ the `monitor-collector-host` workflow issue and blocks `ok:true`.
 | 8. `/data` mount | `/data` is not a mount point — otherwise healthy-looking spool paths may write to the root filesystem |
 | 9. Recovery queue | malformed receipts, failed or stale jobs, or ready/running ages over the lane bound |
 | 10. Production LOB archivers | `binance-lob-archiver-production@spot/usdm` not active, not enabled, or last systemd `Result` other than `success` |
-| 11. LOB `health.json` | missing, a symlink, unparseable, or `updated_at_ns` older than 300s |
-| 12. LOB sequence gaps | `sequence_gaps > 0`, or `sequence_gap_total` increased since the previous poll |
+| 11. LOB `health.json` | missing, a symlink, unparseable, `updated_at_ns` older than 300s, or `updated_at_ns` missing/non-numeric |
+| 12. LOB sequence gaps | `sequence_gaps > 0`, or `sequence_gap_total` increased since the previous poll. The five-minute host timer latches an increase (`MONDAY_COLLECTOR_HEALTH_LATCH_SEQUENCE_GAPS=1`) so the 15-minute GitHub `monitor-collector-host` poll still observes the breach; that alerting poll then consumes the new baseline |
 
 The raw-ops Gate template has no `[Install]` section, so `static` is the
 healthy installed state only when no Gate instance is active, the control lock
@@ -213,7 +213,9 @@ slow `ExecStartPre` to roll out of the rate-limit window and loop indefinitely.
 Test/override environment for fixtures and containers:
 `MONDAY_COLLECTOR_SPOOL_ROOT` (default `/data/monday/spool`) and
 `MONDAY_COLLECTOR_STATE_DIR` (default `/var/lib/monday-collector-health`).
-`test-monday-collector-health.sh` is the self-contained contract test.
+`MONDAY_COLLECTOR_HEALTH_LATCH_SEQUENCE_GAPS=1` keeps a sequence-gap increase
+latched for the local timer; the GitHub Cloud Assistant command leaves it
+unset. `test-monday-collector-health.sh` is the self-contained contract test.
 
 ### Install and timer deploy
 

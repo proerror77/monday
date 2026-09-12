@@ -54,11 +54,13 @@
 #      StartLimitBurst death otherwise looks healthy while upload-status.json
 #      still holds a recent last_success_at.
 #  10. LOB health.json must be a regular file, parse, and stay younger than
-#      HEALTH_SILENCE_SECONDS. Missing, symlink, unparseable, or stale health
-#      is a liveness failure, not a soft signal.
+#      HEALTH_SILENCE_SECONDS. Missing, symlink, unparseable, stale, or
+#      malformed updated_at_ns is a liveness failure, not a soft signal.
 #  11. LOB sequence_gaps > 0 or a sequence_gap_total increase is a replay-gap
-#      breach. Session changes and counter regressions rebaseline instead of
-#      fabricating a delta.
+#      breach. The five-minute host timer latches an increase until the
+#      GitHub alerting poll observes it; the local timer must not consume
+#      the counter. Session changes and counter regressions rebaseline
+#      instead of fabricating a delta.
 # The raw-ops Gate template has no [Install] section, so systemd reports it as
 # static. Static is healthy only when no Gate instance, running lock, or
 # residual EnvironmentFile remains on the host. State-persistence failures
@@ -85,6 +87,11 @@
 #   MONDAY_COLLECTOR_SPOOL_ROOT  spool root (default /data/monday/spool)
 #   MONDAY_COLLECTOR_STATE_DIR   state directory (default
 #                                /var/lib/monday-collector-health)
+#   MONDAY_COLLECTOR_HEALTH_LATCH_SEQUENCE_GAPS=1  keep a sequence_gap_total
+#                                increase latched (do not persist the new
+#                                total). The local systemd timer sets this so
+#                                the 15-minute GitHub poll still observes the
+#                                breach. Unset on the Cloud Assistant command.
 #   MONDAY_COLLECTOR_HEALTH_TEST_MODE=1 and
 #   MONDAY_COLLECTOR_HEALTH_TEST_ROOT  are reserved for the contract test
 #                                      fixture under /tmp. Test mode may also
@@ -207,6 +214,15 @@ for arg in "$@"; do
   esac
 done
 
+# The local monday-collector-health.timer must not consume a sequence-gap
+# increase. The GitHub monitor-collector-host workflow invokes this script
+# through Cloud Assistant without this env, observes the latched delta, and
+# then persists the new baseline.
+SEQUENCE_GAP_LATCH=0
+case "${MONDAY_COLLECTOR_HEALTH_LATCH_SEQUENCE_GAPS:-}" in
+  1|true|yes) SEQUENCE_GAP_LATCH=1 ;;
+esac
+
 if ! command -v jq >/dev/null 2>&1; then
   logger -t "$TAG" -p daemon.err -- 'jq is required but not installed' 2>/dev/null || true
   printf 'ok:false\nbreach: jq is required but not installed\n' >&2
@@ -267,13 +283,19 @@ read_prior() {
   fi
 }
 
+write_sequence_prior() {
+  # $1 session, $2 total — persist into the replacement state file.
+  if [ "$DRY_RUN" -eq 0 ]; then
+    state_lines="$state_lines sequence_gap_session|$label=$1 sequence_gap_total|$label=$2"
+  fi
+}
+
 preserve_sequence_prior() {
   # Invalid or missing health observations must never erase the last valid
   # session/counter baseline when write_state atomically replaces the file.
-  if [ "$DRY_RUN" -eq 0 ] && [ -n "${prior_session:-}" ] \
-    && [ -n "${prior_total:-}" ]; then
+  if [ -n "${prior_session:-}" ] && [ -n "${prior_total:-}" ]; then
     sequence_gap_previous_total_json=$prior_total
-    state_lines="$state_lines sequence_gap_session|$label=$prior_session sequence_gap_total|$label=$prior_total"
+    write_sequence_prior "$prior_session" "$prior_total"
   fi
 }
 
@@ -650,12 +672,13 @@ check_raw_ops_gate() {
 }
 
 check_binance_health() {
-  # health.json at /data/monday/spool/binance-lob/<market>/: freshness and the
-  # collector's typed, session-scoped sequence-gap counter are soft signals
-  # (warnings). The hard LOB gates run on upload-status.json and the pending
-  # segment backlog. sequence_gap_total is cumulative only within session_id;
-  # a new session or a counter regression establishes a new baseline instead
-  # of fabricating a delta. Malformed counters retain the last valid baseline.
+  # health.json at /data/monday/spool/binance-lob/<market>/: missing, stale,
+  # unparseable, or malformed updated_at_ns is a liveness breach. sequence_gaps
+  # > 0 or a sequence_gap_total increase is a replay-gap breach.
+  # sequence_gap_total is cumulative only within session_id; a new session or
+  # a counter regression establishes a new baseline instead of fabricating a
+  # delta. Malformed counters retain the last valid baseline. A latched
+  # increase keeps that prior baseline until the GitHub alerting poll.
   label=$1
   spool_dir=$2
   health_file="$spool_dir/health.json"
@@ -743,7 +766,7 @@ check_binance_health() {
     fi
 
     if [ "$updated_ns_valid" -eq 0 ]; then
-      record_warning "$label: health.json updated_at_ns malformed"
+      record_breach "$label: health.json updated_at_ns malformed"
       sequence_gap_baseline=malformed
       preserve_sequence_prior
     elif [ "$session_valid" -eq 1 ] && [ "$total_valid" -eq 1 ]; then
@@ -772,7 +795,13 @@ check_binance_health() {
         fi
       fi
       if [ "$DRY_RUN" -eq 0 ]; then
-        state_lines="$state_lines sequence_gap_session|$label=$session_id sequence_gap_total|$label=$sequence_gap_total"
+        if [ "$sequence_gap_baseline" = increased ] && [ "$SEQUENCE_GAP_LATCH" -eq 1 ]; then
+          # Keep the pre-increase baseline so a later GitHub poll still sees
+          # the delta. Session/regression/stable observations still persist.
+          write_sequence_prior "$prior_session" "$prior_total"
+        else
+          write_sequence_prior "$session_id" "$sequence_gap_total"
+        fi
       fi
     else
       record_warning "$label: health.json sequence counter malformed (session_id/sequence_gap_total)"

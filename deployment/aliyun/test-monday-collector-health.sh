@@ -16,8 +16,9 @@
 #   7. /data must be mounted
 #   8. recovery receipts valid, ready/running ages bounded, no failed/stale jobs
 #   9. production LOB archivers active, enabled, Result=success
-#  10. LOB health.json missing/symlink/unparseable/stale
-#  11. LOB sequence_gaps > 0 or sequence_gap_total increase
+#  10. LOB health.json missing/symlink/unparseable/stale/malformed timestamp
+#  11. LOB sequence_gaps > 0 or sequence_gap_total increase; local timer
+#      latches the increase until the GitHub alerting poll consumes it
 # plus the raw-ops Gate containment contract (static template with no active
 # instance, running lock, or residual environment) and state-persistence
 # failures. Non-LOB units, timers, restarts, disk warning band, and
@@ -126,6 +127,7 @@ reset_env() {
   STUB_LOCK_APPEAR=0
   STUB_HFT_GID=$(id -g)
   unset MONDAY_COLLECTOR_STATE_DIR
+  unset MONDAY_COLLECTOR_HEALTH_LATCH_SEQUENCE_GAPS
 }
 
 reset_state() {
@@ -927,7 +929,8 @@ expect "restart delta: warning message" "$(grep_out '^warning: .*restart rate hi
 # 15. health.json missing/stale and sequence gaps are breaches. Session
 #     changes and counter regressions still rebaseline instead of fabricating
 #     a delta. The counter is cumulative within one session and compared
-#     against the prior poll from the existing state file.
+#     against the prior poll from the existing state file. The local timer
+#     latches an increase until a non-latch (GitHub) poll consumes it.
 # ---------------------------------------------------------------------------
 reset_env
 reset_state
@@ -974,6 +977,28 @@ run_health --json
 expect "health gap stable: exit 0" "$(rc_is 0; echo $?)"
 expect "health gap stable: no repeated warning" "$(grep_not_out 'sequence_gap_total increased'; echo $?)"
 expect "health gap stable: zero delta" "$(json_query '.checks.health["binance-lob-archiver-production@usdm"].sequence_gap_delta == 0 and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_baseline == "stable"'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+write_health usdm 45 0 false synced session-usdm 2
+run_health
+write_health usdm 45 0 false synced session-usdm 5
+MONDAY_COLLECTOR_HEALTH_LATCH_SEQUENCE_GAPS=1 run_health --json
+expect "health gap latch: first timer still breaches" "$(rc_is 1; echo $?)"
+expect "health gap latch: first timer delta" "$(json_query '.checks.health["binance-lob-archiver-production@usdm"].sequence_gap_delta == 3 and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_baseline == "increased"'; echo $?)"
+expect "health gap latch: first timer keeps prior total" "$(grep -q '^sequence_gap_total|binance-lob-archiver-production@usdm=2$' "$state_dir/state.json"; echo $?)"
+MONDAY_COLLECTOR_HEALTH_LATCH_SEQUENCE_GAPS=1 run_health --json
+expect "health gap latch: second timer still breaches" "$(rc_is 1; echo $?)"
+expect "health gap latch: second timer still reports increase" "$(grep_out 'sequence_gap_total increased 2 -> 5 (delta=3)'; echo $?)"
+expect "health gap latch: second timer still keeps prior total" "$(grep -q '^sequence_gap_total|binance-lob-archiver-production@usdm=2$' "$state_dir/state.json"; echo $?)"
+run_health --json
+expect "health gap latch: github poll still breaches" "$(rc_is 1; echo $?)"
+expect "health gap latch: github poll consumes new total" "$(grep -q '^sequence_gap_total|binance-lob-archiver-production@usdm=5$' "$state_dir/state.json"; echo $?)"
+run_health --json
+expect "health gap latch: after github poll is stable" "$(rc_is 0; echo $?)"
+expect "health gap latch: after github poll zero delta" "$(json_query '.checks.health["binance-lob-archiver-production@usdm"].sequence_gap_delta == 0 and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_baseline == "stable"'; echo $?)"
 
 write_health usdm 45 0 false synced session-usdm-next 1
 run_health --json
@@ -1041,7 +1066,8 @@ write_health spot 45 0 false synced preserved-session 5
 jq '.updated_at_ns = {invalid: true}' "$spool_root/binance-lob/spot/health.json" > "$spool_root/binance-lob/spot/health.json.tmp" \
   && mv "$spool_root/binance-lob/spot/health.json.tmp" "$spool_root/binance-lob/spot/health.json"
 run_health --json
-expect "health invalid timestamp: exit 0" "$(rc_is 0; echo $?)"
+expect "health invalid timestamp: exit 1" "$(rc_is 1; echo $?)"
+expect "health invalid timestamp: breach message" "$(grep_out '^breach: .*updated_at_ns malformed'; echo $?)"
 expect "health invalid timestamp: prior retained" "$(json_query '.checks.health["binance-lob-archiver-production@spot"].sequence_gap_observed == false and .checks.health["binance-lob-archiver-production@spot"].sequence_gap_baseline == "malformed" and .checks.health["binance-lob-archiver-production@spot"].sequence_gap_previous_total == 4'; echo $?)"
 
 reset_env
