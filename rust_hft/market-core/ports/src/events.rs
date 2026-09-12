@@ -670,6 +670,15 @@ impl OrderIntentEnvelope {
         latest_book_seq: Option<u64>,
     ) -> Result<(), OrderIntentRejectReason> {
         self.validate_pre_execution(now, latest_book_seq)?;
+        if self.lifecycle.max_slippage_bps.is_none() {
+            return Err(OrderIntentRejectReason::MissingMaxSlippage);
+        }
+        if self.lifecycle.max_order_notional.is_none() {
+            return Err(OrderIntentRejectReason::MissingMaxOrderNotional);
+        }
+        if self.lifecycle.max_order_quantity.is_none() {
+            return Err(OrderIntentRejectReason::MissingMaxOrderQuantity);
+        }
         self.validate_slippage_reference(now, self.price_reference.as_ref())
     }
 
@@ -792,6 +801,7 @@ pub enum OrderIntentRejectReason {
     InvalidMaxSlippage {
         max_slippage_bps: i32,
     },
+    MissingMaxSlippage,
     MissingSlippageReference,
     SourceBookUnavailable,
     SlippageReferenceMismatch,
@@ -824,6 +834,7 @@ pub enum OrderIntentRejectReason {
     InvalidMaxOrderNotional {
         max_order_notional: rust_decimal::Decimal,
     },
+    MissingMaxOrderNotional,
     OrderNotionalUnpriceable {
         max_order_notional: rust_decimal::Decimal,
     },
@@ -834,6 +845,7 @@ pub enum OrderIntentRejectReason {
     InvalidMaxOrderQuantity {
         max_order_quantity: rust_decimal::Decimal,
     },
+    MissingMaxOrderQuantity,
     MaxOrderQuantityExceeded {
         order_quantity: rust_decimal::Decimal,
         max_order_quantity: rust_decimal::Decimal,
@@ -1166,6 +1178,8 @@ mod tests {
     fn signed_slippage_ceiling_rejects_missing_reference_before_execution() {
         let mut lifecycle = lifecycle(1_000, 2_000);
         lifecycle.max_slippage_bps = Some(25);
+        lifecycle.max_order_notional = Some(rust_decimal::Decimal::from(10_000));
+        lifecycle.max_order_quantity = Some(rust_decimal::Decimal::from(10));
         let envelope = OrderIntentEnvelope::new(
             OrderIntent::crypto_spot(
                 Symbol::new("BTCUSDT"),
@@ -1186,9 +1200,73 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cex_envelope_does_not_treat_missing_size_or_slippage_as_allow() {
+        let mut lifecycle = lifecycle(1_000, 2_000);
+        let envelope = OrderIntentEnvelope::new(
+            OrderIntent::crypto_spot(
+                Symbol::new("BTCUSDT"),
+                Side::Buy,
+                Quantity(rust_decimal::Decimal::ONE),
+                OrderType::Limit,
+                Some(Price(rust_decimal::Decimal::from(100))),
+                TimeInForce::IOC,
+                "unbounded".to_string(),
+                Some(VenueId::BINANCE_SPOT),
+            ),
+            lifecycle,
+        );
+        assert_eq!(
+            envelope.validate_cex_pre_execution(1_100, None),
+            Err(OrderIntentRejectReason::MissingMaxSlippage)
+        );
+
+        lifecycle.max_slippage_bps = Some(25);
+        lifecycle.max_order_quantity = Some(rust_decimal::Decimal::from(10));
+        let quantity_only = OrderIntentEnvelope::new(
+            OrderIntent::crypto_spot(
+                Symbol::new("BTCUSDT"),
+                Side::Buy,
+                Quantity(rust_decimal::Decimal::ONE),
+                OrderType::Limit,
+                Some(Price(rust_decimal::Decimal::from(100))),
+                TimeInForce::IOC,
+                "quantity-only".to_string(),
+                Some(VenueId::BINANCE_SPOT),
+            ),
+            lifecycle,
+        );
+        assert_eq!(
+            quantity_only.validate_cex_pre_execution(1_100, None),
+            Err(OrderIntentRejectReason::MissingMaxOrderNotional)
+        );
+
+        lifecycle.max_order_notional = Some(rust_decimal::Decimal::from(10_000));
+        lifecycle.max_order_quantity = None;
+        let notional_only = OrderIntentEnvelope::new(
+            OrderIntent::crypto_spot(
+                Symbol::new("BTCUSDT"),
+                Side::Buy,
+                Quantity(rust_decimal::Decimal::ONE),
+                OrderType::Limit,
+                Some(Price(rust_decimal::Decimal::from(100))),
+                TimeInForce::IOC,
+                "notional-only".to_string(),
+                Some(VenueId::BINANCE_SPOT),
+            ),
+            lifecycle,
+        );
+        assert_eq!(
+            notional_only.validate_cex_pre_execution(1_100, None),
+            Err(OrderIntentRejectReason::MissingMaxOrderQuantity)
+        );
+    }
+
     fn slippage_envelope(side: Side, price: rust_decimal::Decimal) -> OrderIntentEnvelope {
         let mut lifecycle = lifecycle(1_000, 2_000);
         lifecycle.max_slippage_bps = Some(25);
+        lifecycle.max_order_notional = Some(rust_decimal::Decimal::from(10_000));
+        lifecycle.max_order_quantity = Some(rust_decimal::Decimal::from(10));
         let mut envelope = OrderIntentEnvelope::new(
             OrderIntent::crypto_spot(
                 Symbol::new("BTCUSDT"),

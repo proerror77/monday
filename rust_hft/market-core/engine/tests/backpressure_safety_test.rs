@@ -2,9 +2,13 @@
 
 use engine::dataflow::{BackpressurePolicy, IngestionConfig};
 use engine::{create_execution_queues, ExecutionQueueConfig, LifecycleIntentSubmitError};
-use hft_core::{AccountId, OrderType, Quantity, Side, Symbol, TimeInForce};
+use hft_core::{
+    AccountId, LocalReceiveTimestamp, OrderType, Price, Quantity, Side, Symbol, TimeInForce,
+    VenueId,
+};
 use ports::{
-    ExecutionEvent, OrderIntent, OrderIntentEnvelope, OrderIntentLifecycle, OrderIntentRejectReason,
+    ExecutionEvent, ExecutionPriceReference, OrderIntent, OrderIntentEnvelope,
+    OrderIntentLifecycle, OrderIntentRejectReason,
 };
 
 fn test_intent() -> OrderIntent {
@@ -63,6 +67,8 @@ fn queued_price_protection_reloads_market_identity_and_freshness() {
     intent.target_venue = Some(VenueId::MOCK);
     let mut life = OrderIntentLifecycle::new(1_000, 2_000);
     life.max_slippage_bps = Some(25);
+    life.max_order_notional = Some(rust_decimal::Decimal::from(10_000));
+    life.max_order_quantity = Some(rust_decimal::Decimal::from(10));
     let mut envelope = OrderIntentEnvelope::new(intent, life);
     envelope.price_reference = snapshots.load().execution_price_reference(&envelope.intent);
     sender.send_lifecycle_intent(envelope, 1_100).unwrap();
@@ -288,9 +294,24 @@ fn test_current_lifecycle_intent_enters_execution_queue() {
         batch_size: 8,
     };
     let (mut engine_queues, mut worker_queues) = create_execution_queues(config);
+    let mut intent = test_intent();
+    intent.order_type = OrderType::Limit;
+    intent.price = Some(Price::from_f64(100.0).unwrap());
+    intent.target_venue = Some(VenueId::MOCK);
     let mut lifecycle = OrderIntentLifecycle::new(1_000, 1_100);
     lifecycle.max_latency_us = Some(99);
-    let envelope = OrderIntentEnvelope::new(test_intent(), lifecycle);
+    lifecycle.max_slippage_bps = Some(25);
+    lifecycle.max_order_notional = Some(rust_decimal::Decimal::from(10_000));
+    lifecycle.max_order_quantity = Some(rust_decimal::Decimal::from(10));
+    let mut envelope = OrderIntentEnvelope::new(intent, lifecycle);
+    envelope.price_reference = Some(ExecutionPriceReference {
+        venue: VenueId::MOCK,
+        symbol: Symbol::new("BTCUSDT"),
+        side: Side::Buy,
+        price: Price::from_f64(100.0).unwrap(),
+        book_sequence: 1,
+        received_at: LocalReceiveTimestamp::new(1_000),
+    });
 
     assert!(engine_queues.send_lifecycle_intent(envelope, 1_099).is_ok());
 
