@@ -12,6 +12,7 @@ use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
 // 引入生成的 proto 代碼
+#[allow(clippy::result_large_err)]
 pub mod proto {
     tonic::include_proto!("hft.control");
 }
