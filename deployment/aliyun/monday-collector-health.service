@@ -5,6 +5,9 @@ Description=Run the Monday collector-host health check (read-only)
 
 [Service]
 Type=oneshot
+# Latch sequence-gap increases so the 15-minute GitHub Cloud Assistant poll
+# still observes the breach. The alerting command must not set this.
+Environment=MONDAY_COLLECTOR_HEALTH_LATCH_SEQUENCE_GAPS=1
 ExecStart=/opt/monday/bin/monday-collector-health.sh --json
 NoNewPrivileges=true
 PrivateTmp=true

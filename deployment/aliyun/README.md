@@ -165,7 +165,7 @@ tape files or `upload-status.json`. It emits one JSON snapshot (or a human
 to journald tag `monday-collector-health`. Run with `--json` for machine output
 and `--dry-run` to avoid reading or writing the persistent delta state.
 
-The monitor has seven hard gates. Each is a breach: it fails closed into
+The monitor has twelve hard gates. Each is a breach: it fails closed into
 the `monitor-collector-host` workflow issue and blocks `ok:true`.
 
 | Hard gate | Breach condition |
@@ -174,9 +174,14 @@ the `monitor-collector-host` workflow issue and blocks `ok:true`.
 | 2. Upload freshness | `last_success_at` missing/unparseable, or older than the lane bound (LOB 7200s, fee 600s, usdm-reference 1200s, polymarket 7200s, bybit 5400s; each just above the lane's upload cadence — the polymarket lanes rotate tapes hourly, so the 5-minute upload timer is not a heartbeat). On the polymarket lanes the oldest pending rotated tape older than 1800s breaches earlier: an upload stall with a live backlog must alert within 30 minutes |
 | 3. Pending backlog | pending count over the lane limit, or oldest pending artifact older than the lane age bound, using each collector's own pending definition (LOB `*.manifest.json`, fee/usdm-reference `lake/raw/**/batch=*`, polymarket rotated `market-updates.*.ndjson` tapes, bybit marked `.ndjson` without `.uploaded.json`) |
 | 4. Upload failures | `last_error_at`/`last_error` present, or a `failure_count` increase since the previous poll (prior counts live under `/var/lib/monday-collector-health`) |
-| 5. `/data` disk | free <= 15% (used >= 85%) via `df -Pk /data` — the 2026-08-17/18 incidents reached 100% twice, so the critical watermark pages a human instead of only warning |
+| 5. `/data` disk | free <= 15% (used >= 85%) via `df -Pk /data`, or `df` unavailable — an unobservable disk is the same class of incident this monitor was created to catch |
 | 6. Polymarket upload timers | `polymarket-market-tape-upload.timer` or `polymarket-reference-upload.timer` not active (waiting) while its collector service (`polymarket-market-tape.service` / `polymarket-reference-collector.service`) is active — a stopped timer with a running collector silently strands rotated tapes until the disk fills |
 | 7. Polymarket upload watchdog | `polymarket-market-tape-upload-watchdog.timer` is neither `waiting` nor briefly `running`, or a waiting timer has no finite monotonic next elapse — systemd can otherwise report an enabled, active but elapsed timer that will never run again |
+| 8. `/data` mount | `/data` is not a mount point — otherwise healthy-looking spool paths may write to the root filesystem |
+| 9. Recovery queue | malformed receipts, failed or stale jobs, or ready/running ages over the lane bound |
+| 10. Production LOB archivers | `binance-lob-archiver-production@spot/usdm` not active, not enabled, or last systemd `Result` other than `success` |
+| 11. LOB `health.json` | missing, a symlink, unparseable, `updated_at_ns` older than 300s, or `updated_at_ns` missing/non-numeric |
+| 12. LOB sequence gaps | `sequence_gaps > 0`, or `sequence_gap_total` increased since the previous poll. The five-minute host timer latches an increase (`MONDAY_COLLECTOR_HEALTH_LATCH_SEQUENCE_GAPS=1`) so the 15-minute GitHub `monitor-collector-host` poll still observes the breach; that alerting poll then consumes the new baseline |
 
 The raw-ops Gate template has no `[Install]` section, so `static` is the
 healthy installed state only when no Gate instance is active, the control lock
@@ -189,18 +194,18 @@ Every other check is a warning — reported in the JSON `warnings` array and as
 
 | Warning | Condition |
 | --- | --- |
-| `/data` disk | free <= 25% (warn) via `df -Pk /data`; free <= 15% is hard gate 5 above |
-| Governed services | `binance-lob-archiver-production@spot/usdm`, `binance-usdm-reference-collector`, `bybit-options-archiver` active AND enabled AND `Result==success`, plus a restart-rate delta > 1 since the last poll |
+| `/data` disk | free <= 25% (warn) via `df -Pk /data`; free <= 15% or `df` unavailable is hard gate 5 above |
+| Other governed services | `binance-usdm-reference-collector`, `bybit-options-archiver` active AND enabled AND `Result==success`, plus a restart-rate delta > 1 since the last poll on any persistent unit |
 | Upload lane units | upload/fee timers active AND enabled; their oneshot services' last `Result==success` |
-| `health.json` | missing/unparseable, wall-clock age of `updated_at_ns` > 300s, or `sequence_gaps` > 0 (spot + usdm spools) |
+| LOB sequence rebaseline | `health.json` session id changed or `sequence_gap_total` regressed; the next valid poll still detects a later increase |
 | Delay-gate trips | > 0 journald `source-to-receive delay exceeds the governed limit` lines per Binance unit in the last 15 minutes |
 | Fee snapshot failures | > 0 `Failed with result` journald lines per fee snapshot unit in the last 10 minutes |
-| `/data` mount | `mountpoint -q /data` fails (the monitor must DETECT a missing mount, not gate on it) |
 
 The persistent-service check deliberately does not warn on `NRestarts > 0`:
 both Binance archivers restart every six hours by design
 (`RuntimeMaxSec=21600`). Crash loops are detected through `Result != success`
-or an `NRestarts` delta greater than one between consecutive five-minute polls.
+(a hard gate for production LOB archivers) or an `NRestarts` delta greater
+than one between consecutive five-minute polls.
 Production startup is bounded at 120 seconds. Five failed starts inside the
 two-hour `StartLimitIntervalSec` stop automatic retries instead of allowing a
 slow `ExecStartPre` to roll out of the rate-limit window and loop indefinitely.
@@ -208,7 +213,9 @@ slow `ExecStartPre` to roll out of the rate-limit window and loop indefinitely.
 Test/override environment for fixtures and containers:
 `MONDAY_COLLECTOR_SPOOL_ROOT` (default `/data/monday/spool`) and
 `MONDAY_COLLECTOR_STATE_DIR` (default `/var/lib/monday-collector-health`).
-`test-monday-collector-health.sh` is the self-contained contract test.
+`MONDAY_COLLECTOR_HEALTH_LATCH_SEQUENCE_GAPS=1` keeps a sequence-gap increase
+latched for the local timer; the GitHub Cloud Assistant command leaves it
+unset. `test-monday-collector-health.sh` is the self-contained contract test.
 
 ### Install and timer deploy
 
