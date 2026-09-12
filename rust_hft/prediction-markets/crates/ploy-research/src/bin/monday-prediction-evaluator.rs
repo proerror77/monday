@@ -735,7 +735,7 @@ fn run_pipeline_smoke(args: &[String]) -> Result<(), String> {
     }
     validate_prediction_snapshot_contract_id(
         &args.snapshot_contract_id,
-        snapshot.manifest.snapshot_contract_hash.as_deref(),
+        Some(snapshot.snapshot_contract_hash()),
     )?;
     validate_expected_prediction_policy(Some(&args.search_policy_snapshot_id), None)?;
     let path = write_pipeline_smoke_report(
@@ -1831,7 +1831,7 @@ async fn main() {
     });
     let snapshot_provenance: String;
     let snapshot_hash: String;
-    let snapshot_contract_hash: Option<String>;
+    let snapshot_contract_hash: String;
     let snapshot_data_audit_status: Option<String>;
     let snapshot_source_kind: String;
     let settlement_component_profile: SettlementProbabilityComponentProfile;
@@ -1888,12 +1888,12 @@ async fn main() {
             },
         )
         .expect("snapshot does not cover requested walk-forward inputs");
-        snapshot_hash = snapshot.manifest.snapshot_hash.clone().unwrap_or_default();
-        snapshot_contract_hash = snapshot.manifest.snapshot_contract_hash.clone();
+        snapshot_hash = snapshot.snapshot_hash().to_string();
+        snapshot_contract_hash = snapshot.snapshot_contract_hash().to_string();
         eprintln!(
             "snapshot: schema={} hash={} generated_at={} observations={} deribit={} pm_books={} load_ms={}",
             snapshot.manifest.schema_version,
-            if snapshot_hash.is_empty() { "<missing>" } else { &snapshot_hash },
+            snapshot_hash,
             snapshot.manifest.generated_at,
             snapshot.observations.len(),
             snapshot.deribit_snapshots.len(),
@@ -1905,8 +1905,8 @@ async fn main() {
         snapshot_provenance = format!(
             "# Snapshot\nsnapshot_schema={}\nsnapshot_hash={}\nsnapshot_contract_hash={}\nsnapshot_generated_at={}\nsnapshot_optimizer_data_dir={}\nsnapshot_data_requirements={}\nsnapshot_data_audit_status={}\nsnapshot_data_audit_report={}\nsnapshot_include_deribit={}\n",
             snapshot.manifest.schema_version,
-            if snapshot_hash.is_empty() { "<missing>" } else { &snapshot_hash },
-            snapshot_contract_hash.as_deref().unwrap_or("<missing>"),
+            snapshot_hash,
+            snapshot_contract_hash,
             snapshot.manifest.generated_at,
             snapshot
                 .manifest
@@ -1970,7 +1970,7 @@ async fn main() {
     if report_output_dir.is_some() {
         require_report_identity(
             &snapshot_hash,
-            snapshot_contract_hash.as_deref(),
+            Some(snapshot_contract_hash.as_str()),
             mission_id.as_deref(),
             expected_prediction_policy.as_deref(),
         )
@@ -1986,7 +1986,7 @@ async fn main() {
             .expect("validated prediction snapshot id");
         validate_prediction_snapshot_contract_id(
             prior_snapshot_id,
-            snapshot_contract_hash.as_deref(),
+            Some(snapshot_contract_hash.as_str()),
         )
         .unwrap_or_else(|reason| panic!("{reason}"));
         let prior_symbol = prediction_underlying_symbol(&prior.symbols[0]);
@@ -2132,7 +2132,7 @@ async fn main() {
                     .expect("--reprice-pilot-10s validated report output"),
             ),
             &snapshot_hash,
-            snapshot_contract_hash.as_deref(),
+            Some(snapshot_contract_hash.as_str()),
             mission_id.as_deref(),
             expected_prediction_policy.as_deref(),
             &start,
@@ -2301,7 +2301,7 @@ async fn main() {
         write_report_artifacts(
             Path::new(report_output_dir),
             &snapshot_hash,
-            snapshot_contract_hash.as_deref(),
+            Some(snapshot_contract_hash.as_str()),
             mission_id.as_deref(),
             expected_prediction_policy.as_deref(),
             &start,
