@@ -74,7 +74,7 @@ impl FrozenFactorModelV1 {
         {
             return Err("invalid frozen model instrument".into());
         }
-        if let CexBaselineModelV1::BurnMlpPortable { symbol, venue, .. } = &self.model {
+        if let CexBaselineModelV1::BurnMlpPortableV2 { symbol, venue, .. } = &self.model {
             if symbol != &self.symbol || venue != &format!("{}-{}", self.venue, self.market) {
                 return Err("frozen MLP instrument differs from training".into());
             }

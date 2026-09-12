@@ -2971,7 +2971,7 @@ pub fn factor_ast_source_features(ast: &FactorAst) -> Vec<String> {
 pub const CEX_BASELINE_POLICY_SCHEMA_V1: &str = "cex-baseline-policy-v1";
 pub const CEX_BASELINE_POLICY_SCHEMA_V2: &str = "cex-baseline-policy-v2";
 pub const CEX_BASELINE_POLICY_SCHEMA_V3: &str = "cex-baseline-policy-v3";
-pub const CEX_BASELINE_ARTIFACT_SCHEMA_V1: &str = "cex-baseline-artifact-v1";
+pub const CEX_BASELINE_ARTIFACT_SCHEMA_V2: &str = "cex-baseline-artifact-v2";
 pub const CEX_BASELINE_GATE_SCHEMA_V1: &str = "cex-baseline-gate-v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3211,7 +3211,7 @@ impl CexBaselineArtifactV1 {
         evaluation: CandidateEvaluation,
     ) -> Result<Self, DomainError> {
         let mut artifact = Self {
-            schema_version: CEX_BASELINE_ARTIFACT_SCHEMA_V1.to_string(),
+            schema_version: CEX_BASELINE_ARTIFACT_SCHEMA_V2.to_string(),
             artifact_id: String::new(),
             mission_id,
             factor_bank_revision_id,
@@ -3231,7 +3231,7 @@ impl CexBaselineArtifactV1 {
     }
 
     pub fn validate(&self) -> Result<(), DomainError> {
-        if self.schema_version != CEX_BASELINE_ARTIFACT_SCHEMA_V1
+        if self.schema_version != CEX_BASELINE_ARTIFACT_SCHEMA_V2
             || self.artifact_id != self.expected_artifact_id()?
             || self.mission_id.trim().is_empty()
             || self.factor_bank_revision_id.trim().is_empty()
@@ -3295,14 +3295,14 @@ impl CexBaselineArtifactV1 {
                     || model_validate(&fold.model, self.factor_ids.len(), &self.baseline_policy)
                         .is_err()
                     || match (&self.baseline_policy.mlp_training, &fold.model) {
-                        (Some(profile), CexBaselineModelV1::BurnMlpPortable { seed, .. }) => {
+                        (Some(profile), CexBaselineModelV1::BurnMlpPortableV2 { seed, .. }) => {
                             profile.initialization.fold_seeds.get(index) != Some(seed)
                         }
                         _ => false,
                     }
                     || match (&fold.model, &fold.mlp_observation) {
                         (
-                            CexBaselineModelV1::BurnMlpPortable { learning, .. },
+                            CexBaselineModelV1::BurnMlpPortableV2 { learning, .. },
                             Some(observation),
                         ) => {
                             observation.validation_prediction.validate().is_err()
@@ -3311,7 +3311,7 @@ impl CexBaselineArtifactV1 {
                                 || observation.validation_prediction.training_target_mean
                                     != learning.training_prediction.training_target_mean
                         }
-                        (CexBaselineModelV1::BurnMlpPortable { .. }, None) => true,
+                        (CexBaselineModelV1::BurnMlpPortableV2 { .. }, None) => true,
                         (_, Some(_)) => true,
                         (_, None) => false,
                     }
@@ -3503,21 +3503,7 @@ fn model_validate(
             Ok(())
         }
         CexBaselineModelV1::ShallowCart { root } => validate_cart_node(root, arity, policy, 0),
-        CexBaselineModelV1::BurnMlp {
-            request_semantic_sha256,
-            semantic_model_sha256,
-            config_sha256,
-            trainer_version,
-            symbol,
-            venue,
-            row_count,
-            hidden_dim,
-            epochs,
-            learning_rate,
-            min_rows,
-            ..
-        }
-        | CexBaselineModelV1::BurnMlpPortable {
+        CexBaselineModelV1::BurnMlpPortableV2 {
             request_semantic_sha256,
             semantic_model_sha256,
             config_sha256,
@@ -3546,7 +3532,7 @@ fn model_validate(
             && *row_count >= *min_rows
             && arity > 0 =>
         {
-            if let CexBaselineModelV1::BurnMlpPortable {
+            if let CexBaselineModelV1::BurnMlpPortableV2 {
                 parameters,
                 learning,
                 ..
@@ -8364,6 +8350,12 @@ mod tests {
         for fold in &mut cart.folds { fold.model = CexBaselineModelV1::ShallowCart { root: CexBaselineCartNodeV1::Leaf { value: 0.1, sample_count: 5 } }; }
         cart.artifact_id = cart.expected_artifact_id().unwrap();
         let _gate = CexBaselineGateV1::new(&ridge, &cart).unwrap();
+
+        let mut old_version = ridge.clone();
+        old_version.schema_version = "cex-baseline-artifact-v1".into();
+        old_version.artifact_id = old_version.expected_artifact_id().unwrap();
+        let decoded: CexBaselineArtifactV1 = serde_json::from_slice(&serde_json::to_vec(&old_version).unwrap()).unwrap();
+        assert!(decoded.validate().is_err(), "audit decoding must not admit the old version as current evidence");
 
         let mut non_finite = ridge.clone();
         if let CexBaselineModelV1::Ridge { coefficients, .. } = &mut non_finite.folds[0].model {

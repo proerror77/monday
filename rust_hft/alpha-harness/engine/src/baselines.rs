@@ -198,12 +198,12 @@ pub fn verify_cex_baseline_artifact(
                 }
                 predict_fold_cart(&tree, &features, &validation)?
             }
-            CexBaselineModelV1::BurnMlp { .. } => {
+            CexBaselineModelV1::BurnMlp { .. } | CexBaselineModelV1::BurnMlpPortable { .. } => {
                 return Err(
                     "historical Burn MLP diagnostics do not contain executable parameters".into(),
                 );
             }
-            CexBaselineModelV1::BurnMlpPortable { symbol, venue, .. } => {
+            CexBaselineModelV1::BurnMlpPortableV2 { symbol, venue, .. } => {
                 let refit = fit_burn_fold(CexBurnFoldFit {
                     rows: context.rows(),
                     features: &features,
@@ -989,7 +989,7 @@ fn fit_burn_fold(fit: CexBurnFoldFit<'_>) -> Result<CexBurnFoldOutput, String> {
         )?,
     };
     Ok(CexBurnFoldOutput {
-        model: CexBaselineModelV1::BurnMlpPortable {
+        model: CexBaselineModelV1::BurnMlpPortableV2 {
             parameters,
             request_semantic_sha256: diagnostics.request_semantic_sha256.as_str().to_string(),
             semantic_model_sha256: diagnostics.semantic_model_sha256.as_str().to_string(),
@@ -1588,7 +1588,7 @@ mod tests {
         assert_eq!(left_predictions.len(), 3);
         let reloaded: CexBaselineModelV1 =
             serde_json::from_slice(&serde_json::to_vec(&left_model).unwrap()).unwrap();
-        let CexBaselineModelV1::BurnMlpPortable {
+        let CexBaselineModelV1::BurnMlpPortableV2 {
             parameters,
             semantic_model_sha256,
             ..
@@ -1622,7 +1622,7 @@ mod tests {
         let mutated_model = fit(&mutated).unwrap().model;
         assert_eq!(left_model, mutated_model);
 
-        let CexBaselineModelV1::BurnMlpPortable { seed, learning, .. } = &left_model else {
+        let CexBaselineModelV1::BurnMlpPortableV2 { seed, learning, .. } = &left_model else {
             unreachable!()
         };
         for mode in [
@@ -1657,7 +1657,7 @@ mod tests {
                     })
                 };
                 let treatment = paired_fit(&rows, &profile).unwrap();
-                let CexBaselineModelV1::BurnMlpPortable {
+                let CexBaselineModelV1::BurnMlpPortableV2 {
                     learning: observed,
                     epochs,
                     ..
@@ -1701,7 +1701,7 @@ mod tests {
             .contains("not available before validation"));
         assert!(matches!(
             left_model,
-            CexBaselineModelV1::BurnMlpPortable { row_count: 12, .. }
+            CexBaselineModelV1::BurnMlpPortableV2 { row_count: 12, .. }
         ));
 
         let mut multi_step_rows = rows.clone();
@@ -1742,7 +1742,7 @@ mod tests {
         assert_eq!(predictions.len(), 3);
         assert!(matches!(
             multi_model,
-            CexBaselineModelV1::BurnMlpPortable { row_count: 8, .. }
+            CexBaselineModelV1::BurnMlpPortableV2 { row_count: 8, .. }
         ));
         // These labels fall inside Burn's extra embargo and must not be fitted.
         for row in &mut multi_step_rows[8..12] {

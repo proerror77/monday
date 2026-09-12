@@ -66,6 +66,26 @@ impl CexMlpTrainingPlanV1 {
         }
         for init in self.initializations.values() {
             init.validate()?;
+            if Some(init.fold_seeds.len())
+                != self
+                    .initializations
+                    .values()
+                    .next()
+                    .map(|first| first.fold_seeds.len())
+            {
+                return Err("CEX MLP round seeds must declare the same fold count".into());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_requested_seeds(&self, seeds: &[u64]) -> Result<(), String> {
+        self.validate()?;
+        if seeds.is_empty() {
+            return Err("CEX MLP Campaign requires declared round seeds".into());
+        }
+        for seed in seeds {
+            self.resolve(*seed)?;
         }
         Ok(())
     }

@@ -535,6 +535,9 @@ impl CexCampaignResearchPlanV1 {
         }
         if let Some(plan) = &self.mlp_training {
             plan.validate().map_err(anyhow::Error::msg)?;
+            if self.generation != 0 || self.parent.is_some() || self.learning_directive.is_some() {
+                bail!("paired MLP diagnostics require a new root plan with matched factors and initialization");
+            }
         }
         self.search_policy_revision.validate()?;
         let attempted = self

@@ -1083,6 +1083,9 @@ fn follow_up_plan(
     search_policy_revision: CexCampaignSearchPolicyRevisionV1,
     parent_evidence_signature: CexCampaignResearchEvidenceSignatureV2,
 ) -> anyhow::Result<CexCampaignResearchPlanV1> {
+    if loaded.request.research_plan.mlp_training.is_some() {
+        bail!("paired MLP diagnostics require a new root plan with matched factors and initialization; automatic follow-up is not supported");
+    }
     let delta_scope = search_policy_revision
         .research_delta
         .as_ref()
@@ -1143,7 +1146,7 @@ fn follow_up_plan(
         focus_field: loaded.request.research_plan.focus_field.clone(),
         feature_fields,
         label_horizon: loaded.request.research_plan.label_horizon.clone(),
-        mlp_training: loaded.request.research_plan.mlp_training.clone(),
+        mlp_training: None,
         search_policy_revision,
         attempted_search_policy_revision_ids,
         allowed_search_policy_revisions: loaded
@@ -1786,6 +1789,10 @@ fn freeze_request(args: &CampaignFreezeArgs) -> anyhow::Result<(CampaignRequest,
         .map(load_research_plan)
         .transpose()?
         .unwrap_or_else(CexCampaignResearchPlanV1::canonical);
+    if let Some(plan) = &research_plan.mlp_training {
+        plan.validate_requested_seeds(&args.seeds)
+            .map_err(anyhow::Error::msg)?;
+    }
     let study_proposal = args
         .study_proposal
         .as_deref()
@@ -3297,6 +3304,16 @@ pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> 
         bail!("campaign request schema_version must be {CAMPAIGN_REQUEST_SCHEMA_V5}");
     }
     request.research_plan.validate()?;
+    if let Some(plan) = &request.research_plan.mlp_training {
+        plan.validate_requested_seeds(
+            &request
+                .rounds
+                .iter()
+                .map(|round| round.seed)
+                .collect::<Vec<_>>(),
+        )
+        .map_err(anyhow::Error::msg)?;
+    }
     validate_study_proposal_for_plan(request.study_proposal.as_ref(), &request.research_plan)?;
     if let Some(proposal) = &request.study_proposal {
         if proposal.target_execution.campaign_inputs_sha256 != request.campaign_inputs_sha256 {
@@ -3481,6 +3498,10 @@ fn build_request_from_parts(
     study_proposal: Option<&CampaignNextFamilyProposalV1>,
 ) -> anyhow::Result<CampaignRequest> {
     research_plan.validate()?;
+    if let Some(plan) = &research_plan.mlp_training {
+        plan.validate_requested_seeds(seeds)
+            .map_err(anyhow::Error::msg)?;
+    }
     let data_fingerprint_sha256 = campaign_data_fingerprint_sha256(
         campaign_inputs_sha256,
         producer_source_revision,
@@ -4125,6 +4146,28 @@ mod tests {
         }
     }
 
+    fn paired_mlp_plan_for_tests() -> alpha_domain::CexMlpTrainingPlanV1 {
+        use alpha_domain::mlp_training::CexMlpInitializationV1;
+        alpha_domain::CexMlpTrainingPlanV1 {
+            schema_version: "cex-mlp-training-plan-v1".into(),
+            updates: 64,
+            target_scale: hft_research_manifest::mlp_training::MlpTargetScaleV1::TrainStandardized,
+            initializations: [(7, vec![71, 72, 73]), (11, vec![111, 112, 113])]
+                .into_iter()
+                .map(|(seed, fold_seeds)| {
+                    (
+                        seed,
+                        CexMlpInitializationV1 {
+                            fold_seeds,
+                            expected_factor_ids: vec!["cex-factor-1".into()],
+                            expected_factor_columns_sha256: "a".repeat(64),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn negative_campaign_creates_one_parent_bound_follow_up_plan() {
         let loaded = loaded_request_for_learning();
@@ -4154,6 +4197,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.generation, 1);
+        let mut profiled = LoadedRequest {
+            request: loaded.request.clone(),
+            sha256: loaded.sha256.clone(),
+        };
+        profiled.request.research_plan.mlp_training = Some(paired_mlp_plan_for_tests());
+        assert!(follow_up_plan(
+            &profiled,
+            &result_sha256,
+            learning_directive.clone(),
+            search_policy_revision.clone(),
+            plan.parent_evidence_signature.as_ref().unwrap().clone()
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("new root plan"));
+        let mut forged_child = plan.clone();
+        forged_child.mlp_training = profiled.request.research_plan.mlp_training;
+        assert!(forged_child
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("new root plan"));
         assert_eq!(plan.parent.as_ref().unwrap().request_sha256, loaded.sha256);
         assert_eq!(
             plan.max_candidates().unwrap(),
@@ -5287,6 +5352,56 @@ mod tests {
             signing_plan(&frozen.canonical_request).unwrap()
         );
 
+        for missing_later_seed in [true, false] {
+            let mut plan = CexCampaignResearchPlanV1::canonical();
+            let mut training = paired_mlp_plan_for_tests();
+            if missing_later_seed {
+                training.initializations.remove(&11);
+            } else {
+                training
+                    .initializations
+                    .get_mut(&11)
+                    .unwrap()
+                    .fold_seeds
+                    .pop();
+            }
+            plan.mlp_training = Some(training);
+            let plan_path = root
+                .path()
+                .join(format!("invalid-mlp-{missing_later_seed}.json"));
+            std::fs::write(&plan_path, serde_json::to_vec(&plan).unwrap()).unwrap();
+            let invalid_output = root
+                .path()
+                .join(format!("invalid-freeze-{missing_later_seed}.json"));
+            let error = freeze(CampaignFreezeArgs {
+                final_evaluation_control: None,
+                campaign_inputs: receipt_path.clone(),
+                input_root: input_root.clone(),
+                source_revision: BUILD_SOURCE_REVISION.to_string(),
+                image: executor_image_ref.clone(),
+                campaign_root: format!("{TEST_ROOT}/campaigns"),
+                seeds: vec![7, 11],
+                research_plan: Some(plan_path),
+                study_proposal: None,
+                output: invalid_output.clone(),
+            })
+            .unwrap_err()
+            .to_string();
+            let expected = if missing_later_seed {
+                "Campaign seed"
+            } else {
+                "fold count"
+            };
+            assert!(
+                error.contains(expected),
+                "unexpected freeze rejection: {error}"
+            );
+            assert!(
+                !invalid_output.exists(),
+                "invalid later rounds must not freeze an immutable request"
+            );
+        }
+
         for symbol in ["BTCUSDT", "SOLUSDT", "BNBUSDT"] {
             let mut admitted = receipt.clone();
             admitted.symbol = symbol.to_string();
@@ -5902,7 +6017,7 @@ mod tests {
                     .unwrap();
             let mut fold_seeds = Vec::new();
             for fold in &baseline.folds {
-                let CexBaselineModelV1::BurnMlpPortable {
+                let CexBaselineModelV1::BurnMlpPortableV2 {
                     seed: actual,
                     learning,
                     ..
@@ -5987,7 +6102,7 @@ mod tests {
                 alpha_domain::CEX_BASELINE_POLICY_SCHEMA_V3
             );
             let mut wrong_seed = baseline.clone();
-            let CexBaselineModelV1::BurnMlpPortable { seed, .. } = &mut wrong_seed.folds[0].model
+            let CexBaselineModelV1::BurnMlpPortableV2 { seed, .. } = &mut wrong_seed.folds[0].model
             else {
                 unreachable!()
             };
@@ -6002,7 +6117,7 @@ mod tests {
                 "rebinding an artifact cannot change its declared paired seed"
             );
             for fold in baseline.folds {
-                let CexBaselineModelV1::BurnMlpPortable {
+                let CexBaselineModelV1::BurnMlpPortableV2 {
                     epochs, learning, ..
                 } = fold.model
                 else {

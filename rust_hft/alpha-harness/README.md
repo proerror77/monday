@@ -399,6 +399,14 @@ The inverse transform is folded into the fitted output layer before saving or
 exporting parameters. Training, loaded Burnpack, portable scalar inference and
 the shared frozen-model consumer therefore all return original return units.
 Model bundle manifests and sealed generic training requests use schema version 2.
+CEX baseline artifacts use `cex-baseline-artifact-v2` for the expanded fitted-model
+and validation evidence, with the versioned `burn_mlp_portable_v2` model variant.
+The old `burn_mlp_portable` variant remains decodable for audit inspection without
+invented learning fields; it is not executable or admissible as current evidence.
+Every requested round seed is checked before freezing, and all seed entries must
+use the same fold schedule. Paired diagnostics use a root plan: a changed factor
+search requires newly frozen matched inputs and initialization instead of an
+automatic follow-up that inherits the parent's factor bindings.
 
 Each `results/burn-mlp-baseline.json` fold retains:
 
