@@ -34,8 +34,11 @@ controller. The separate ACK settlement process reuses its verified result
 cache and publishes a lightweight native metrics/MLP report. No workstation bulk
 download is needed for settlement, reporting or child advancement. See the
 [cloud evidence flow](../../deployment/aliyun/research/README.md#data-flow-review-and-host-lifetime).
-Sealed holdout opens only through an independent `--final-evaluation` grant,
-not from `--pre-holdout` campaign-execute or diagnostic `mission execute`.
+GP v1-v3 formula round winners also stop pre-holdout. Sealed holdout opens only
+through an independent `--final-evaluation` grant, which independently freezes
+and evaluates supervised model winners and formula winners.
+`--pre-holdout` campaign-execute and diagnostic `mission execute` never open
+holdout.
 Low-level Mission and LoopRun commands
 remain diagnostics and implementation surfaces; they are not alternate evidence
 paths around this contract.
