@@ -17,7 +17,7 @@ use alpha_domain::{
 use alpha_engine::{
     evaluation::prepare_dataset,
     formula_evaluator::{FormulaEvaluator, WALK_FORWARD_EVALUATOR_VERSION},
-    CandidateEvaluation, EngineProposal,
+    CandidateEvaluation,
 };
 use alpha_onnx_evaluator::OnnxEvaluator;
 use alpha_store::{
@@ -499,50 +499,7 @@ pub(crate) fn execute_evaluate(args: EvaluateArgs) -> anyhow::Result<RegistryRev
         return Ok(existing);
     }
 
-    let rows = manifest.load_rows(&requested_protocol.costs)?;
-    let dataset = prepare_dataset(rows, &requested_protocol)?;
-    let proposal = EngineProposal {
-        candidate_id: candidate.candidate_id.clone(),
-        hypothesis: iteration.hypothesis.clone(),
-        artifact: candidate.artifact.clone(),
-        expansions: 0,
-        tokens: 0,
-        elapsed_ms: 0,
-    };
-    let evaluation = match &candidate.artifact {
-        CandidateArtifact::Formula(_) => FormulaEvaluator::for_mission(&lineage.mission)
-            .map_err(anyhow::Error::msg)?
-            .evaluate_sealed(&proposal, &dataset)
-            .map_err(anyhow::Error::msg)?,
-        CandidateArtifact::OnnxModel(model) => {
-            let root = args
-                .model_root
-                .as_deref()
-                .context("--model-root is required for ONNX sealed evaluation")?;
-            let model_path = verified_model_path(model, root)?;
-            OnnxEvaluator::for_mission(&lineage.mission)
-                .map_err(anyhow::Error::msg)?
-                .evaluate_sealed(model, &model_path, &dataset)
-                .map_err(anyhow::Error::msg)?
-        }
-        _ => bail!("candidate artifact has no governed sealed evaluator"),
-    };
-    let revision = RegistryRevision {
-        revision_id,
-        registry_kind: "sealed_evaluation".to_string(),
-        asset_id: args.candidate_id,
-        parent_revision_id: None,
-        payload: serde_json::json!({
-            "mission_id": args.mission_id,
-            "candidate_content_hash": candidate.content_hash,
-            "dataset_manifest_id": manifest.manifest_id(),
-            "evaluation_protocol_hash": requested_protocol_hash,
-            "evaluation": evaluation,
-        }),
-        created_at: Utc::now(),
-    };
-    store.put_registry_revision(&revision)?;
-    Ok(revision)
+    bail!("public evaluate cannot read sealed holdout without the global create-once claim")
 }
 
 fn sealed_evaluator_version(artifact: &CandidateArtifact) -> anyhow::Result<&'static str> {
