@@ -3939,6 +3939,7 @@ pub(crate) fn recover_execution_report_from_published_result(
     validate_model_metric_readback(
         &mut archive,
         expected_mission_id,
+        &control_mission,
         supervised_selection.as_ref(),
         &metric_candidate_refs,
     )?;
@@ -4359,6 +4360,7 @@ fn validate_recovered_finalization(
 fn validate_model_metric_readback(
     archive: &mut zip::ZipArchive<File>,
     expected_mission_id: &str,
+    mission: &CexResearchMissionArtifactV1,
     selection: Option<&CexSupervisedModelSelectionV1>,
     candidates: &std::collections::BTreeMap<&str, CexResearchContentRefV1>,
 ) -> anyhow::Result<()> {
@@ -4372,9 +4374,9 @@ fn validate_model_metric_readback(
         &format!("results/{}", crate::mission_metrics::METRICS_CSV),
         crate::mission_metrics::MAX_METRICS_BYTES,
     )?;
-    if report_bytes.is_none() && csv_bytes.is_none() {
-        // Older completed artifacts and empty-factor rounds have no derived
-        // comparison. Their original native evidence requirements still apply.
+    if selection.is_none() && report_bytes.is_none() && csv_bytes.is_none() {
+        // No supervised models were selected or evaluated (for example an
+        // empty Factor Bank); do not invent a comparison for this round.
         return Ok(());
     }
     let selection = selection.context("published model metrics lack model selection evidence")?;
@@ -4387,6 +4389,20 @@ fn validate_model_metric_readback(
     {
         bail!("published model metric cohort is incomplete or mismatched");
     }
+    let dataset = load_metric_verification_dataset(archive, mission)?;
+    let context = dataset.engine_context();
+    let cohort = &report.groups[0].cohort;
+    if cohort.evaluation_protocol != *context.protocol()
+        || cohort.research_dataset.content_sha256 != canonical_json_hash(&context.rows())?
+        || cohort.walk_forward_partition.content_sha256
+            != canonical_json_hash(&serde_json::json!({
+                "research_dataset": &cohort.research_dataset,
+                "folds": context.folds(),
+            }))?
+    {
+        bail!("published model metric cohort differs from the admitted feature data");
+    }
+    let baseline_policy = bound_baseline_policy(mission)?;
     let mut inputs = Vec::new();
     for name in CEX_SUPERVISED_MODEL_NAMES {
         let bytes = read_bundle_bytes(
@@ -4404,6 +4420,12 @@ fn validate_model_metric_readback(
         {
             bail!("published model metric backtest candidate differs from native evidence");
         }
+        alpha_engine::model_metrics::verify_model_ledger_from_dataset(
+            &evaluation,
+            &context,
+            &baseline_policy.evaluator_config,
+        )
+        .map_err(anyhow::Error::msg)?;
         inputs.push(
             alpha_engine::model_metrics::summarize_model_evaluation(
                 &evaluation,
@@ -4421,6 +4443,55 @@ fn validate_model_metric_readback(
         bail!("published model metrics differ from their original backtest evidence");
     }
     Ok(())
+}
+
+fn load_metric_verification_dataset(
+    archive: &mut zip::ZipArchive<File>,
+    mission: &CexResearchMissionArtifactV1,
+) -> anyhow::Result<alpha_engine::evaluation::PreparedDataset> {
+    let mut features: hft_collector::FeatureDatasetManifest = read_bundle_json(
+        archive,
+        "results/feature-manifest.json",
+        MAX_MATERIALIZATION_BYTES,
+    )?
+    .context("published model metrics lack the admitted feature manifest")?;
+    let feature_sha = &mission.spec.inputs.feature.content_sha256;
+    if features.artifact_sha256 != *feature_sha
+        || features.manifest_id != mission.spec.inputs.feature.id
+        || features.symbol != mission.spec.instrument.symbol
+        || features.label_spec.horizon_buckets != mission.spec.instrument.horizon.horizon_buckets
+        || features.label_spec.observation_frequency_millis
+            != mission.spec.instrument.horizon.observation_frequency_millis
+    {
+        bail!("model metric feature manifest does not bind the admitted Mission input");
+    }
+    let bytes = read_bundle_bytes(
+        archive,
+        &format!("artifacts/{feature_sha}.jsonl"),
+        MAX_FEATURE_BYTES,
+    )?;
+    if format!("{:x}", Sha256::digest(&bytes)) != *feature_sha {
+        bail!("model metric feature bytes differ from the admitted Mission input SHA256");
+    }
+    // Ignore the archive's filesystem path. The content-addressed copy stays
+    // in an owned temporary directory and is removed after the rows are read.
+    let temporary = tempfile::Builder::new()
+        .prefix("monday-metric-input-")
+        .tempdir()?;
+    features.artifact_path = temporary.path().join(format!("{feature_sha}.jsonl"));
+    std::fs::write(&features.artifact_path, &bytes)?;
+    drop(bytes);
+    let costs = &mission.spec.evaluation_protocol.costs;
+    let rows = data_mission::load_feature_research_rows(
+        &features,
+        costs.fee_bps,
+        costs.funding_bps,
+        costs.latency_bps,
+        false,
+    )?;
+    // Only the search engine context is exposed to verification. There is no
+    // holdout-open operation, model fitting, store import, or new trial here.
+    prepare_dataset(rows, &mission.spec.evaluation_protocol).map_err(anyhow::Error::msg)
 }
 
 fn read_optional_bundle_bytes(

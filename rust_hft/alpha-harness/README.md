@@ -354,10 +354,15 @@ the JSON keeps the original identities.
 The command verifies internal evaluation consistency and records source-file
 hashes. It does not authenticate a Study ledger, create settlement evidence,
 train, open holdout, or submit a research Job. Canonical Campaign readback
-additionally recomputes any published comparison from the original backtests and
-validated candidates, and checks the CSV. Historical bundles and empty-factor
-rounds can lack this descriptive sidecar; their existing native proof requirements
-remain unchanged.
+requires both comparison files whenever supervised selection exists. It verifies
+the feature bytes against the input SHA256 inside the already admitted Mission,
+reconstructs the same pre-holdout dataset and partition, and recomputes positions
+and ledger accounting from those immutable prices, clocks and costs. This is
+deterministic verification, not model fitting or a new parameter trial. Both
+comparison files must then match the verified model backtests and CSV rendering.
+Empty-factor rounds without supervised selection do not invent a comparison.
+Historical backtests remain readable by the separate reporting command; missing
+comparison evidence cannot satisfy current Campaign readback.
 
 These reports describe position evaluation under its cost approximation.
 Event-replay capabilities must be read from the separate replay receipt: V4

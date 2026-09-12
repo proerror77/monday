@@ -219,6 +219,46 @@ pub fn model_artifact_stem(kind: CexBaselineModelKindV1) -> &'static str {
     }
 }
 
+/// Verify a completed evaluation against an independently admitted data view.
+/// This reruns deterministic position accounting, never a model fitter.
+pub fn verify_model_ledger_from_dataset(
+    evaluation: &CexSupervisedModelEvaluationV2,
+    context: &crate::evaluation::EngineContext<'_>,
+    evaluator_config: &alpha_domain::FormulaEvaluatorConfig,
+) -> Result<(), String> {
+    evaluation.validate()?;
+    if evaluation.candidate.evaluation.evaluation_protocol.as_ref() != Some(context.protocol())
+        || evaluation.predictions.len() != context.rows().len()
+        || evaluation.candidate.evaluation.evaluator_config
+            != serde_json::to_value(evaluator_config).map_err(|error| error.to_string())?
+    {
+        return Err("model ledger does not bind the admitted evaluation context".into());
+    }
+    let positions = crate::baselines::supervised_target_positions(
+        context,
+        &evaluation.predictions,
+        &evaluation.candidate.decision_policy,
+    )?;
+    if positions != evaluation.target_positions {
+        return Err(
+            "model target positions differ from the admitted data and decision policy".into(),
+        );
+    }
+    let expected = crate::formula_evaluator::FormulaEvaluator::new(evaluator_config.clone())?
+        .evaluate_predictions_and_positions(
+            context.rows(),
+            &evaluation.predictions,
+            &positions,
+            context.folds().iter().map(|fold| fold.validation.clone()),
+            alpha_domain::CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION,
+            context.protocol(),
+        )?;
+    if expected != evaluation.report {
+        return Err("model ledger differs from the admitted feature data".into());
+    }
+    Ok(())
+}
+
 pub fn summarize_model_evaluation(
     evaluation: &CexSupervisedModelEvaluationV2,
     backtest_sha256: &str,
