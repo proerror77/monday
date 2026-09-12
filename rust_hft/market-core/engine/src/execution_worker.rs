@@ -4547,6 +4547,7 @@ mod tests {
         intent.order_type = OrderType::Limit;
         let mut life = ports::OrderIntentLifecycle::new(now, now + 1_000_000);
         life.max_slippage_bps = Some(25);
+        life.max_order_notional = Some(rust_decimal::Decimal::from(10_000));
         let mut envelope = OrderIntentEnvelope::new(intent, life);
         envelope.price_reference = snapshots.load().execution_price_reference(&envelope.intent);
         assert!(envelope.validate_pre_execution(now, None).is_ok());
