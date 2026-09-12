@@ -3450,7 +3450,6 @@ mod tests {
         seed_empty_live_ledgers(&config);
         let mut daemon =
             PloyDaemon::boot_with_live_execution(&config, Box::new(gateway.clone())).expect("boot");
-        daemon.fail_trading_state_write_on_attempt = Some(2);
         let intent = TradingIntent {
             intent_id: "intent-1".to_string(),
             deployment_id: "example.live".to_string(),
