@@ -1396,6 +1396,7 @@ mod tests {
         let mut client = BinanceExecutionClient::new(make_test_config(ExecutionMode::Paper));
         let lifecycle = ports::OrderIntentLifecycle {
             max_slippage_bps: Some(25),
+            max_order_notional: Some(rust_decimal::Decimal::from(10_000)),
             ..Default::default()
         };
         let envelope = OrderIntentEnvelope::new(
