@@ -1465,6 +1465,15 @@ mod tests {
             format!("{error:#}").contains("global create-once claim"),
             "unexpected error: {error:#}"
         );
+        let store = AlphaStore::open_read_only(&db).unwrap();
+        assert!(
+            matches!(
+                store.get_registry_revision(&format!("mission-evaluation-protocol:{mission_id}")),
+                Err(StoreError::NotFound)
+            ),
+            "failed public evaluate must not bind an evaluation protocol"
+        );
+        drop(store);
         let _ = std::fs::remove_file(db);
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -1776,6 +1785,20 @@ mod tests {
             .content_hash;
         {
             let mut store = AlphaStore::open(&db).unwrap();
+            store
+                .bind_mission_evaluation_protocol(
+                    mission_id,
+                    true,
+                    &dataset_args
+                        .validation
+                        .evaluation_protocol(&alpha_domain::EvaluationLabelSpecV1 {
+                            horizon_buckets: 1,
+                            observation_frequency_millis: 60_000,
+                        })
+                        .unwrap(),
+                    Utc::now(),
+                )
+                .unwrap();
             store
                 .put_registry_revision(&RegistryRevision {
                     revision_id: governance::sealed_evaluation_revision_id(

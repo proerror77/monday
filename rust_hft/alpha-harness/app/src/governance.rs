@@ -395,7 +395,7 @@ pub fn evaluate(args: EvaluateArgs) -> anyhow::Result<()> {
 }
 
 pub(crate) fn execute_evaluate(args: EvaluateArgs) -> anyhow::Result<RegistryRevision> {
-    let mut store = AlphaStore::open(&args.db)?;
+    let store = AlphaStore::open_read_only(&args.db)?;
     let lineage = store.mission_lineage(&args.mission_id)?;
     let manifest =
         data_mission::read_registered_research_dataset(&store, &args.dataset.dataset_manifest)?;
@@ -415,12 +415,6 @@ pub(crate) fn execute_evaluate(args: EvaluateArgs) -> anyhow::Result<RegistryRev
     {
         bail!("only the selected canonical walk-forward candidate can access holdout");
     }
-    store.bind_mission_evaluation_protocol(
-        &lineage.mission.mission_id,
-        !lineage.iterations.is_empty(),
-        &requested_protocol,
-        Utc::now(),
-    )?;
     let candidate = lineage
         .candidates
         .iter()
@@ -448,6 +442,10 @@ pub(crate) fn execute_evaluate(args: EvaluateArgs) -> anyhow::Result<RegistryRev
     };
 
     if let Some(existing) = existing {
+        store.require_mission_evaluation_protocol(
+            &lineage.mission.mission_id,
+            &requested_protocol,
+        )?;
         let existing_evaluation: CandidateEvaluation = serde_json::from_value(
             existing
                 .payload

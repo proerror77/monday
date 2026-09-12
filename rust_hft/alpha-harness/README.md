@@ -29,9 +29,11 @@ Job/Pod downloads the shared inputs once, admits the request, renders and
 executes each round search-only, performs create-once Mission/result readback
 per round, and selects the deterministic pre-holdout winner. A governed GP v4
 Campaign stops there; a negative result can feed the bounded external LLM
-controller. Sealed holdout opens only through an independent
-`--final-evaluation` grant, not from `--pre-holdout` campaign-execute or
-diagnostic `mission execute`.
+controller. GP v1-v3 formula round winners also stop pre-holdout. Sealed
+holdout opens only through an independent `--final-evaluation` grant, which
+independently freezes and evaluates supervised model winners and formula
+winners. `--pre-holdout` campaign-execute and diagnostic `mission execute`
+never open holdout.
 Low-level Mission and LoopRun commands
 remain diagnostics and implementation surfaces; they are not alternate evidence
 paths around this contract.

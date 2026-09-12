@@ -1,7 +1,7 @@
 use crate::{
     evaluation::{
-        contiguous_series_ranges, evaluate_sealed_holdout, EngineContext, PreparedDataset,
-        ResearchRow,
+        contiguous_series_ranges, evaluate_sealed_holdout, independent_selection_rows,
+        EngineContext, PreparedDataset, ResearchRow,
     },
     CandidateEvaluation, CandidateEvaluator, EngineProposal, EvaluationMetrics,
     FoldEvaluationMetrics, FoldPredictiveMetrics, PredictiveMetrics,
@@ -310,6 +310,58 @@ impl FormulaEvaluator {
             rows,
             predictions,
             target_positions,
+            ranges,
+            evaluator_version,
+            protocol,
+        )
+    }
+
+    /// Evaluates reserved independent-selection rows when the protocol reserved
+    /// them; otherwise re-evaluates walk-forward on the same admitted dataset.
+    pub fn evaluate_independent_selection(
+        &self,
+        proposal: &EngineProposal,
+        dataset: &PreparedDataset,
+    ) -> Result<PositionEvaluationReport, String> {
+        match independent_selection_rows(dataset) {
+            Ok(rows) => {
+                self.evaluate_formula_rows(
+                    proposal,
+                    rows,
+                    std::iter::once(0..rows.len()),
+                    alpha_domain::frozen_model::INDEPENDENT_SELECTION_EVALUATOR_VERSION,
+                    dataset.protocol(),
+                )
+            }
+            Err(reason) if reason.contains("independent selection was not reserved") => {
+                let context = dataset.engine_context();
+                self.evaluate_formula_rows(
+                    proposal,
+                    context.rows(),
+                    context.folds().iter().map(|fold| fold.validation.clone()),
+                    WALK_FORWARD_EVALUATOR_VERSION,
+                    context.protocol(),
+                )
+            }
+            Err(reason) => Err(reason),
+        }
+    }
+
+    fn evaluate_formula_rows<'a>(
+        &self,
+        proposal: &EngineProposal,
+        rows: &'a [ResearchRow],
+        ranges: impl IntoIterator<Item = std::ops::Range<usize>>,
+        evaluator_version: &str,
+        protocol: &EvaluationProtocolV1,
+    ) -> Result<PositionEvaluationReport, String> {
+        let ast = formula(proposal, self.governed_gp_policy.as_ref())?;
+        let signals = evaluate_ast(ast, rows)?;
+        let target_positions = signals.iter().copied().map(signal_position).collect::<Vec<_>>();
+        self.evaluate_prediction_position_ranges(
+            rows,
+            &signals,
+            &target_positions,
             ranges,
             evaluator_version,
             protocol,

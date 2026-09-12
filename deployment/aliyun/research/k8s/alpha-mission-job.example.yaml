@@ -59,6 +59,7 @@ spec:
           args:
             - mission
             - campaign-execute
+            - --pre-holdout
             - --work-dir
             - /work
             - --campaign-id

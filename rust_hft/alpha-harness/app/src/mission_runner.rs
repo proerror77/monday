@@ -905,7 +905,9 @@ pub(crate) fn execute_report(
     {
         bail!("CEX Research Mission hypotheses do not share one frozen baseline target");
     }
-    if !binding.is_search_only() {
+    if matches!(binding, ExecutionBinding::Direct) {
+        // Direct execute is search-only and cannot open holdout, but it is not
+        // the Campaign research field set. Reject fields with no live semantics.
         mission::validate_live_feature_fields(&control_mission.spec.feature_fields)?;
     }
     let gp_policy = bound_gp_policy(&control_mission)?;
@@ -2018,24 +2020,20 @@ pub(crate) fn promote_sealed_candidate(
     Ok(result)
 }
 
-pub(crate) fn finalize_existing_search_round(
-    round_execute_dir: &Path,
+/// Freeze a GP v1-v3 formula search round and open sealed holdout. Used by the
+/// signed `--final-evaluation` worker; Direct execute and `--pre-holdout`
+/// Campaign rounds never call this.
+pub(crate) fn finalize_formula_search_round(
+    round_results: &Path,
     finalization_dir: &Path,
+    client: &Client,
     holdout_claim_put_url: &str,
     holdout_claim_readback_url: &str,
     control_mission: &CexResearchMissionArtifactV1,
+    store: &mut AlphaStore,
+    dataset: &alpha_engine::evaluation::PreparedDataset,
 ) -> anyhow::Result<CexFinalizationReportV1> {
-    let client = Client::builder()
-        .timeout(Duration::from_secs(120))
-        .redirect(Policy::none())
-        .build()?;
-    ensure_holdout_claim_absent(&client, holdout_claim_readback_url)?;
-    let round_results = round_execute_dir.join("results");
     std::fs::create_dir_all(finalization_dir)?;
-    let mut store = AlphaStore::open(round_results.join("alpha.duckdb"))?;
-    if store.has_cex_sealed_holdout_claim(&control_mission.spec.holdout.holdout_id)? {
-        bail!("sealed holdout is already claimed; finalize requires a fresh unopened holdout");
-    }
     let mission_id = control_mission.semantic_id()?;
     let lineage = store.mission_lineage(&mission_id)?;
     let factor_bank: CexFactorBankRevisionV2 =
@@ -2068,12 +2066,6 @@ pub(crate) fn finalize_existing_search_round(
         serde_json::from_slice(&std::fs::read(round_results.join("replay-policy.json"))?)?;
     let materialization =
         decode_materialization(&std::fs::read(round_results.join("materialization.json"))?)?;
-    let dataset_manifest = data_mission::read_registered_research_dataset(
-        &store,
-        &round_results.join("cex-replay-dataset-manifest.json"),
-    )?;
-    let rows = dataset_manifest.load_rows(&control_mission.spec.evaluation_protocol.costs)?;
-    let dataset = prepare_dataset(rows, &control_mission.spec.evaluation_protocol)?;
     let baselines = alpha_engine::baselines::CexBaselineRun {
         ridge: Some(ridge),
         cart: Some(cart),
@@ -2081,9 +2073,9 @@ pub(crate) fn finalize_existing_search_round(
         gate,
     };
     finalize_cex_candidate(
-        &mut store,
+        store,
         finalization_dir,
-        &client,
+        client,
         holdout_claim_put_url,
         holdout_claim_readback_url,
         &mission_id,
@@ -2095,13 +2087,50 @@ pub(crate) fn finalize_existing_search_round(
         &subset_checkpoint.checkpoint,
         &subset_result,
         &replay,
-        &round_results,
-        &dataset,
+        round_results,
+        dataset,
         &gp_policy,
         &baseline_policy,
         &weight_policy,
         &replay_policy,
         &materialization.snapshot.instrument_rules,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn finalize_existing_search_round(
+    round_execute_dir: &Path,
+    finalization_dir: &Path,
+    holdout_claim_put_url: &str,
+    holdout_claim_readback_url: &str,
+    control_mission: &CexResearchMissionArtifactV1,
+) -> anyhow::Result<CexFinalizationReportV1> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(120))
+        .redirect(Policy::none())
+        .build()?;
+    ensure_holdout_claim_absent(&client, holdout_claim_readback_url)?;
+    let round_results = round_execute_dir.join("results");
+    std::fs::create_dir_all(finalization_dir)?;
+    let mut store = AlphaStore::open(round_results.join("alpha.duckdb"))?;
+    if store.has_cex_sealed_holdout_claim(&control_mission.spec.holdout.holdout_id)? {
+        bail!("sealed holdout is already claimed; finalize requires a fresh unopened holdout");
+    }
+    let dataset_manifest = data_mission::read_registered_research_dataset(
+        &store,
+        &round_results.join("cex-replay-dataset-manifest.json"),
+    )?;
+    let rows = dataset_manifest.load_rows(&control_mission.spec.evaluation_protocol.costs)?;
+    let dataset = prepare_dataset(rows, &control_mission.spec.evaluation_protocol)?;
+    finalize_formula_search_round(
+        &round_results,
+        finalization_dir,
+        &client,
+        holdout_claim_put_url,
+        holdout_claim_readback_url,
+        control_mission,
+        &mut store,
+        &dataset,
     )
 }
 
