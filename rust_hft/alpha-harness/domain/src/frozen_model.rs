@@ -9,9 +9,15 @@ pub const FROZEN_FORMULA_SELECTION_PREFIX: &str = "cex-frozen-formula-";
 pub const FROZEN_MODEL_SELECTION_PREFIX: &str = "cex-frozen-model-";
 
 fn valid_frozen_selection_id(id: &str) -> bool {
-    [FROZEN_MODEL_SELECTION_PREFIX, FROZEN_FORMULA_SELECTION_PREFIX]
-        .into_iter()
-        .any(|prefix| id.strip_prefix(prefix).is_some_and(crate::valid_content_sha256))
+    [
+        FROZEN_MODEL_SELECTION_PREFIX,
+        FROZEN_FORMULA_SELECTION_PREFIX,
+    ]
+    .into_iter()
+    .any(|prefix| {
+        id.strip_prefix(prefix)
+            .is_some_and(crate::valid_content_sha256)
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

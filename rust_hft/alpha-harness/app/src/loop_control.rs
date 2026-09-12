@@ -1433,7 +1433,19 @@ mod tests {
             dataset: args.mission.dataset,
         })
         .unwrap_err();
-        assert!(format!("{error:#}").contains("legacy or malformed"));
+        assert!(
+            format!("{error:#}").contains("legacy or malformed"),
+            "unexpected error: {error:#}"
+        );
+        let store = AlphaStore::open_read_only(&db).unwrap();
+        assert!(
+            matches!(
+                store.get_registry_revision(&format!("mission-evaluation-protocol:{mission_id}")),
+                Err(StoreError::NotFound)
+            ),
+            "rejecting a legacy sealed record must not bind an evaluation protocol"
+        );
+        drop(store);
         let _ = std::fs::remove_file(db);
         let _ = std::fs::remove_dir_all(directory);
     }

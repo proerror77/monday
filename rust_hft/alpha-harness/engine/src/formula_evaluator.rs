@@ -324,15 +324,13 @@ impl FormulaEvaluator {
         dataset: &PreparedDataset,
     ) -> Result<PositionEvaluationReport, String> {
         match independent_selection_rows(dataset) {
-            Ok(rows) => {
-                self.evaluate_formula_rows(
-                    proposal,
-                    rows,
-                    std::iter::once(0..rows.len()),
-                    alpha_domain::frozen_model::INDEPENDENT_SELECTION_EVALUATOR_VERSION,
-                    dataset.protocol(),
-                )
-            }
+            Ok(rows) => self.evaluate_formula_rows(
+                proposal,
+                rows,
+                std::iter::once(0..rows.len()),
+                alpha_domain::frozen_model::INDEPENDENT_SELECTION_EVALUATOR_VERSION,
+                dataset.protocol(),
+            ),
             Err(reason) if reason.contains("independent selection was not reserved") => {
                 let context = dataset.engine_context();
                 self.evaluate_formula_rows(
@@ -357,7 +355,11 @@ impl FormulaEvaluator {
     ) -> Result<PositionEvaluationReport, String> {
         let ast = formula(proposal, self.governed_gp_policy.as_ref())?;
         let signals = evaluate_ast(ast, rows)?;
-        let target_positions = signals.iter().copied().map(signal_position).collect::<Vec<_>>();
+        let target_positions = signals
+            .iter()
+            .copied()
+            .map(signal_position)
+            .collect::<Vec<_>>();
         self.evaluate_prediction_position_ranges(
             rows,
             &signals,
