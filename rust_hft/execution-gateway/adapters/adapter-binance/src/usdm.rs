@@ -1798,6 +1798,7 @@ mod tests {
                 created_ts: now,
                 max_slippage_bps: Some(25),
                 max_order_notional: Some(Decimal::from(1_000_000)),
+                max_order_quantity: Some(Decimal::from(10)),
                 max_latency_us: Some(60_000_000),
                 ..Default::default()
             },
@@ -2338,6 +2339,7 @@ mod tests {
         let lifecycle = OrderIntentLifecycle {
             max_slippage_bps: Some(25),
             max_order_notional: Some(Decimal::from(10_000)),
+            max_order_quantity: Some(Decimal::from(10)),
             ..Default::default()
         };
         let envelope = OrderIntentEnvelope::new(perp_intent(), lifecycle)

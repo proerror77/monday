@@ -68,6 +68,7 @@ fn queued_price_protection_reloads_market_identity_and_freshness() {
     let mut life = OrderIntentLifecycle::new(1_000, 2_000);
     life.max_slippage_bps = Some(25);
     life.max_order_notional = Some(rust_decimal::Decimal::from(10_000));
+    life.max_order_quantity = Some(rust_decimal::Decimal::from(10));
     let mut envelope = OrderIntentEnvelope::new(intent, life);
     envelope.price_reference = snapshots.load().execution_price_reference(&envelope.intent);
     sender.send_lifecycle_intent(envelope, 1_100).unwrap();
@@ -301,6 +302,7 @@ fn test_current_lifecycle_intent_enters_execution_queue() {
     lifecycle.max_latency_us = Some(99);
     lifecycle.max_slippage_bps = Some(25);
     lifecycle.max_order_notional = Some(rust_decimal::Decimal::from(10_000));
+    lifecycle.max_order_quantity = Some(rust_decimal::Decimal::from(10));
     let mut envelope = OrderIntentEnvelope::new(intent, lifecycle);
     envelope.price_reference = Some(ExecutionPriceReference {
         venue: VenueId::MOCK,
