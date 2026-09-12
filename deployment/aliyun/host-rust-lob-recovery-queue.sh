@@ -1368,7 +1368,12 @@ drain_market() {
     if finalize_passed_running "$running_dir"; then
       exit 0
     fi
-    fail "unfinished running recovery job requires manual intervention: $running_dir"
+    CURRENT_RUNNING_DIR=$running_dir
+    CURRENT_STEP=unfinished-running
+    mark_failed "$running_dir" "$CURRENT_STEP" \
+      "unfinished running recovery job requires manual resume: $running_dir"
+    CURRENT_RUNNING_DIR=
+    exit 1
   fi
   ready_dir=$(oldest_ready_dir)
   [[ -n $ready_dir ]] || exit 0
