@@ -8,7 +8,8 @@ AssertPathIsMountPoint=/data
 [Service]
 Type=oneshot
 ExecStart=/opt/monday/bin/monday-rust-lob-recovery-queue drain %i
-TimeoutStartSec=0
+TimeoutStartSec=7200
+TimeoutStopSec=120
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7

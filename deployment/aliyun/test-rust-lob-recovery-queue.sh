@@ -14,6 +14,12 @@ fi
 grep -Fq "active V2 controller is required" "$RECOVERY"
 grep -Fq 'monday.rust_lob_controller_release.v2' "$RECOVERY"
 grep -Fq 'monday.rust_lob_controller_release.v2' "$RECOVERY"
+grep -Fxq 'TimeoutStartSec=7200' "$SCRIPT_DIR/binance-lob-archiver-recovery@.service"
+grep -Fxq 'TimeoutStopSec=120' "$SCRIPT_DIR/binance-lob-archiver-recovery@.service"
+if grep -Fxq 'TimeoutStartSec=0' "$SCRIPT_DIR/binance-lob-archiver-recovery@.service"; then
+  printf 'recovery oneshot still has unbounded TimeoutStartSec\n' >&2
+  exit 1
+fi
 projection_contract='"$ACTIVE_CONTROLLER/deployment/binance-lob-archiver-production-$MARKET.env"'
 resolved_contract='secure_regular_file "$installed_env" 0'
 obsolete_contract='secure_regular_file "$ENV_FILE" 0'
@@ -542,4 +548,21 @@ expect_rejected missing-remote-object fixture_drain
 unset FIXTURE_OSS_FAIL
 [[ $(jq -r .result "$attempt/result.json") == failed ]]
 [[ $(sha256sum "$EVIDENCE_ROOT/$RESUME_JOB_ID/result.json" | awk '{print $1}') == "$fixture_old_result_sha" ]]
+
+# An unfinished *.running job with the active identity is marked failed, not
+# left as a successful drain. Resume still requires exact identities.
+fixture_job 109 running
+rm -f "$fixture/payload.calls"
+saved_active=$fixture_active_c
+fixture_active_c=$fixture_old_c
+expect_rejected unfinished-running fixture_drain
+fixture_active_c=$saved_active
+[[ -d $QUEUE_MARKET_ROOT/$RESUME_JOB_ID.failed ]]
+[[ ! -e $QUEUE_MARKET_ROOT/$RESUME_JOB_ID.running ]]
+[[ $(jq -r '.result == "failed" and .step == "unfinished-running"' \
+  "$EVIDENCE_ROOT/$RESUME_JOB_ID/result.json") == true ]]
+if grep -Fq -- '--upload-only' "$fixture/payload.calls" 2>/dev/null; then
+  printf 'unfinished running drain started payload work\n' >&2
+  exit 1
+fi
 printf 'Explicit recovery adoption, historical readback, mixed drain and interruption behavior passed\n'
