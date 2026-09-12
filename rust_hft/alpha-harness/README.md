@@ -370,6 +370,57 @@ supports partial fills against displayed liquidity but does not model queue
 position, market impact, or true capacity. A model metric report does not
 establish that replay ran or passed.
 
+## Bounded MLP training diagnostics
+
+An optional `mlp_training` object in the existing Campaign research-plan file
+declares a `cex-mlp-training-plan-v1` experiment. Supply that complete research plan
+through the existing `campaign-freeze --research-plan` input. The plan contains:
+
+| Field | Meaning and bounds |
+| --- | --- |
+| `updates` | Exactly 8, 64 or 256 full-batch Adam updates; this is separate from native trial accounting. |
+| `target_scale` | `raw_return` or `train_standardized`. |
+| `initializations` | Map from each Campaign round seed to its declared fold seeds and ordered `expected_factor_ids`. |
+| `fold_seeds` | Actual u64 initialization seeds, one for every chronological fold. |
+| `expected_factor_ids` | Exact sorted Factor Bank columns; a mismatch stops fitting rather than changing the experimental input. |
+| `expected_factor_columns_sha256` | Hash of sorted `(factor_id, orientation)` pairs, binding the direction of every input column as well as its formula. |
+
+The renderer resolves the round's profile into the Mission and a v3 baseline
+policy. Requests, Mission identities and baseline policy hashes bind the full
+profile. Model treatments do not change the factor-search plan identity. Missing
+round seeds, missing v3 profiles, undeclared update counts and changed factor
+ordering fail validation. The ordinary recipe without an explicit profile
+continues to use eight updates with raw-return targets. Network width, learning
+rate and input-factor processing are fixed for this experiment.
+
+`train_standardized` fits a mean and population standard deviation using only
+admitted training rows. Constant training targets are rejected for this mode.
+The inverse transform is folded into the fitted output layer before saving or
+exporting parameters. Training, loaded Burnpack, portable scalar inference and
+the shared frozen-model consumer therefore all return original return units.
+Model bundle manifests and sealed generic training requests use schema version 2.
+
+Each `results/burn-mlp-baseline.json` fold retains:
+
+- `model.learning`: requested/completed updates, actual initialization parameter
+  digest, target transform, finite-gradient/parameter maxima and training losses.
+- `loss_history`: the initial loss followed by one value per completed update,
+  in optimization target units. Standardized-target losses are distinguished
+  from raw-return MSE and MAE.
+- Raw-return training errors against zero and training-mean predictions, their
+  relative MSE when the denominator exists, and prediction/target magnitude
+  summaries. A zero baseline error makes its ratio unavailable.
+- `mlp_observation.validation_prediction`: the same raw-return diagnostics on
+  the final validation predictions, using the training-fitted mean benchmark.
+  Validation labels do not select intermediate checkpoints or fit the transform.
+
+`mlp_fold_fit_completed` research events record the actual seed, update counts
+and fitting duration. Their `purpose` separates primary training from
+deterministic verification refits. Durations remain execution observations;
+they do not make fitted-model content identities depend on wall-clock timing.
+Original study artifacts remain immutable. These diagnostics add no order
+authority and do not establish economic or independent validation success.
+
 ## Evaluation and Learning
 
 ```bash

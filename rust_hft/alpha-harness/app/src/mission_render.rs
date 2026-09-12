@@ -415,6 +415,8 @@ pub(crate) struct CexCampaignResearchPlanV1 {
     pub(crate) feature_fields: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) label_horizon: Option<CampaignLabelHorizonV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mlp_training: Option<alpha_domain::CexMlpTrainingPlanV1>,
     pub(crate) search_policy_revision: CexCampaignSearchPolicyRevisionV1,
     pub(crate) attempted_search_policy_revision_ids: Vec<String>,
     pub(crate) allowed_search_policy_revisions: Vec<CexCampaignSearchPolicyRevisionV1>,
@@ -513,6 +515,7 @@ impl CexCampaignResearchPlanV1 {
             focus_field: "book_imbalance_top5".to_string(),
             feature_fields: FEATURE_FIELDS.into_iter().map(str::to_string).collect(),
             label_horizon: None,
+            mlp_training: None,
             attempted_search_policy_revision_ids: vec![search_policy_revision.revision_id.clone()],
             allowed_search_policy_revisions: CexCampaignSearchPolicyRevisionV1::bounded_allowlist(),
             parent_evidence_signature: None,
@@ -529,6 +532,9 @@ impl CexCampaignResearchPlanV1 {
         }
         if let Some(horizon) = &self.label_horizon {
             horizon.validate().map_err(anyhow::Error::msg)?;
+        }
+        if let Some(plan) = &self.mlp_training {
+            plan.validate().map_err(anyhow::Error::msg)?;
         }
         self.search_policy_revision.validate()?;
         let attempted = self
@@ -826,18 +832,22 @@ pub(crate) fn render_cex_bundle(
         "source_revision": materialization.source_revision,
     }))?;
     let sealed_holdout_cohort_sha256 = sealed_holdout_cohort_sha256(&materialization)?;
-    let research_plan_sha256 = research_plan.content_hash()?;
-    let stable_version = if research_plan == &CexCampaignResearchPlanV1::canonical() {
+    // MLP treatments must not change the factor-search lineage. The complete
+    // plan, resolved baseline policy and Mission still bind the treatment.
+    let mut factor_search_plan = research_plan.clone();
+    factor_search_plan.mlp_training = None;
+    let research_plan_sha256 = factor_search_plan.content_hash()?;
+    let stable_version = if factor_search_plan == CexCampaignResearchPlanV1::canonical() {
         STABLE_VERSION.to_string()
     } else {
         format!("{STABLE_VERSION}-plan-{}", &research_plan_sha256[..16])
     };
-    let gp_policy_id = if research_plan == &CexCampaignResearchPlanV1::canonical() {
+    let gp_policy_id = if factor_search_plan == CexCampaignResearchPlanV1::canonical() {
         GP_POLICY_ID.to_string()
     } else {
         format!("{GP_POLICY_ID}-{}", &research_plan_sha256[..16])
     };
-    let hypothesis_id = if research_plan == &CexCampaignResearchPlanV1::canonical() {
+    let hypothesis_id = if factor_search_plan == CexCampaignResearchPlanV1::canonical() {
         STABLE_HYPOTHESIS_ID.to_string()
     } else {
         format!("l2-microstructure-followup-{}", &research_plan_sha256[..16])
@@ -852,6 +862,17 @@ pub(crate) fn render_cex_bundle(
         &materialization,
         research_plan.label_horizon.as_ref(),
     )?;
+    let mlp_training = research_plan
+        .mlp_training
+        .as_ref()
+        .map(|plan| plan.resolve(seed))
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
+    if mlp_training.as_ref().is_some_and(|profile| {
+        profile.initialization.fold_seeds.len() != evaluation_protocol.walk_forward.fold_count
+    }) {
+        bail!("MLP paired initialization count differs from the rendered fold schedule");
+    }
     let search = CexResearchSearchPlanV1 {
         seed,
         budget: SearchBudget {
@@ -894,7 +915,8 @@ pub(crate) fn render_cex_bundle(
             )
         })
         .transpose()?
-        .unwrap_or(CexBaselinePolicyV1::controlled_v1(BASELINE_POLICY_ID)?);
+        .unwrap_or(CexBaselinePolicyV1::controlled_v1(BASELINE_POLICY_ID)?)
+        .with_mlp_training(mlp_training.clone())?;
     let supervised_decision_policy = research_plan
         .search_policy_revision
         .position_policy
@@ -1050,6 +1072,7 @@ pub(crate) fn render_cex_bundle(
                 .search_policy_revision
                 .research_delta
                 .clone(),
+            mlp_training,
             search,
             evaluation_protocol,
             holdout: CexResearchHoldoutV1 {
@@ -1298,6 +1321,121 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn mlp_training_profiles_bind_missions_without_changing_factor_search() {
+        use alpha_domain::mlp_training::{CexMlpInitializationV1, CexMlpTrainingPlanV1};
+        use hft_research_manifest::mlp_training::MlpTargetScaleV1;
+        let fixture = Fixture::new(MIN_ROWS);
+        let control_plan = CexCampaignResearchPlanV1::canonical();
+        let control = render_cex_bundle(
+            &fixture.feature_path,
+            &fixture.materialization_path,
+            &control_plan,
+            7,
+            default_trials(),
+        )
+        .unwrap();
+        let folds = control
+            .mission
+            .spec
+            .evaluation_protocol
+            .walk_forward
+            .fold_count;
+        let initialization = CexMlpInitializationV1 {
+            fold_seeds: (0..folds).map(|i| 100 + i as u64).collect(),
+            expected_factor_ids: vec!["frozen-factor-1".into()],
+            expected_factor_columns_sha256: "a".repeat(64),
+        };
+        let mut plan = control_plan.clone();
+        plan.mlp_training = Some(CexMlpTrainingPlanV1 {
+            schema_version: "cex-mlp-training-plan-v1".into(),
+            updates: 64,
+            target_scale: MlpTargetScaleV1::TrainStandardized,
+            initializations: BTreeMap::from([(7, initialization)]),
+        });
+        let rendered = render_cex_bundle(
+            &fixture.feature_path,
+            &fixture.materialization_path,
+            &plan,
+            7,
+            default_trials(),
+        )
+        .unwrap();
+        assert_ne!(
+            control_plan.content_hash().unwrap(),
+            plan.content_hash().unwrap()
+        );
+        assert_ne!(control.mission_id, rendered.mission_id);
+        assert_ne!(
+            control.mission.spec.policies.baseline,
+            rendered.mission.spec.policies.baseline
+        );
+        assert_eq!(
+            control.mission.spec.policies.gp,
+            rendered.mission.spec.policies.gp
+        );
+        assert_eq!(
+            control.mission.spec.search_lineage_id,
+            rendered.mission.spec.search_lineage_id
+        );
+        assert_eq!(control.mission.spec.search, rendered.mission.spec.search);
+        assert_eq!(control.mission.spec.inputs, rendered.mission.spec.inputs);
+        assert_eq!(
+            plan.max_candidates().unwrap(),
+            control_plan.max_candidates().unwrap()
+        );
+        assert_eq!(
+            rendered.mission.spec.mlp_training,
+            Some(plan.mlp_training.as_ref().unwrap().resolve(7).unwrap())
+        );
+        let mut request = crate::mission_campaign::valid_request_for_tests();
+        request.research_plan = plan.clone();
+        crate::mission_campaign::validate_terminal_mission_revision_binding(
+            &rendered.mission,
+            &request,
+        )
+        .unwrap();
+        let mut stripped = rendered.mission.clone();
+        stripped.spec.mlp_training = None;
+        assert!(
+            crate::mission_campaign::validate_terminal_mission_revision_binding(
+                &stripped, &request
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("MLP profile")
+        );
+        let mut forged = rendered.mission.clone();
+        forged.spec.mlp_training.as_mut().unwrap().updates = 8;
+        let rebound = CexBaselinePolicyV1::controlled_v1(forged.spec.policies.baseline.id.clone())
+            .unwrap()
+            .with_mlp_training(forged.spec.mlp_training.clone())
+            .unwrap();
+        forged.spec.policies.baseline.content_sha256 = rebound.content_hash().unwrap();
+        forged.validate().unwrap();
+        assert!(
+            crate::mission_campaign::validate_terminal_mission_revision_binding(&forged, &request)
+                .unwrap_err()
+                .to_string()
+                .contains("MLP profile")
+        );
+        assert!(render_cex_bundle(
+            &fixture.feature_path,
+            &fixture.materialization_path,
+            &plan,
+            11,
+            default_trials()
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("Campaign seed"));
+        plan.mlp_training.as_mut().unwrap().updates = 512;
+        assert!(plan.validate().is_err());
+        let mut policy = rebound;
+        policy.mlp_training = None;
+        assert!(policy.validate().is_err());
+    }
+
+    #[test]
     fn cloud_renderer_builds_an_l2_factor_plan_v5_mission() {
         let fixture = Fixture::new(MIN_ROWS);
         let rendered = render_cex_bundle(
@@ -1426,6 +1564,7 @@ pub(crate) mod tests {
             focus_field: canonical.focus_field,
             feature_fields: canonical.feature_fields,
             label_horizon: None,
+            mlp_training: None,
             search_policy_revision,
             attempted_search_policy_revision_ids: vec![
                 canonical.search_policy_revision.revision_id.clone(),
@@ -1622,6 +1761,7 @@ pub(crate) mod tests {
             focus_field: canonical.focus_field.clone(),
             feature_fields: subset.feature_fields.clone(),
             label_horizon: None,
+            mlp_training: None,
             search_policy_revision: revision.clone(),
             attempted_search_policy_revision_ids: vec![
                 canonical.search_policy_revision.revision_id.clone(),

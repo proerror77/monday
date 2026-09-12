@@ -6,7 +6,9 @@ pub mod campaign_horizon;
 pub mod campaign_study;
 mod evaluation_partition;
 pub mod frozen_model;
+pub mod mlp_training;
 pub use evaluation_partition::{EvaluationRowPartitionsV1, EvaluationSelectionV1};
+pub use mlp_training::{CexMlpFoldObservationV1, CexMlpTrainingPlanV1, CexMlpTrainingProfileV1};
 pub mod runtime_latency_evidence;
 
 use chrono::{DateTime, Utc};
@@ -863,6 +865,8 @@ pub struct CexResearchMissionSpecV1 {
     pub feature_fields: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub research_delta: Option<CexResearchDeltaConfigV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mlp_training: Option<CexMlpTrainingProfileV1>,
     pub search: CexResearchSearchPlanV1,
     pub evaluation_protocol: EvaluationProtocolV1,
     pub holdout: CexResearchHoldoutV1,
@@ -940,7 +944,9 @@ impl CexResearchMissionSpecV1 {
                 delta.cart_max_depth,
                 delta.cart_min_leaf,
             )?;
-            baseline.validate_binding(&self.policies.baseline)?;
+            baseline
+                .with_mlp_training(self.mlp_training.clone())?
+                .validate_binding(&self.policies.baseline)?;
             Some(gp)
         } else {
             None
@@ -972,6 +978,30 @@ impl CexResearchMissionSpecV1 {
             ));
         }
         self.evaluation_protocol.validate()?;
+        if let Some(profile) = &self.mlp_training {
+            profile
+                .validate()
+                .map_err(|_| DomainError::InvalidCexBaseline("MLP training profile is invalid"))?;
+            if profile.initialization.fold_seeds.len()
+                != self.evaluation_protocol.walk_forward.fold_count
+            {
+                return Err(DomainError::InvalidCexBaseline(
+                    "MLP paired seed count differs from the fold schedule",
+                ));
+            }
+            if parameterized_delta.is_none() {
+                CexGpPolicyV1::controlled_dynamic_v4(
+                    self.policies.gp.id.clone(),
+                    self.feature_fields.clone(),
+                    self.search.seed,
+                    &self.search.budget,
+                )?
+                .validate_binding(&self.policies.gp)?;
+                CexBaselinePolicyV1::controlled_v1(self.policies.baseline.id.clone())?
+                    .with_mlp_training(Some(profile.clone()))?
+                    .validate_binding(&self.policies.baseline)?;
+            }
+        }
         if self
             .subset_checkpoint_upper_bound_bytes()
             .is_none_or(|bytes| bytes > MAX_CEX_FACTOR_BANK_MCTS_CHECKPOINT_BYTES)
@@ -2940,6 +2970,7 @@ pub fn factor_ast_source_features(ast: &FactorAst) -> Vec<String> {
 
 pub const CEX_BASELINE_POLICY_SCHEMA_V1: &str = "cex-baseline-policy-v1";
 pub const CEX_BASELINE_POLICY_SCHEMA_V2: &str = "cex-baseline-policy-v2";
+pub const CEX_BASELINE_POLICY_SCHEMA_V3: &str = "cex-baseline-policy-v3";
 pub const CEX_BASELINE_ARTIFACT_SCHEMA_V1: &str = "cex-baseline-artifact-v1";
 pub const CEX_BASELINE_GATE_SCHEMA_V1: &str = "cex-baseline-gate-v1";
 
@@ -2959,6 +2990,8 @@ pub struct CexBaselinePolicyV1 {
     pub cart_min_leaf: usize,
     pub cart_tie_break: CexBaselineTieBreakV1,
     pub evaluator_config: FormulaEvaluatorConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mlp_training: Option<CexMlpTrainingProfileV1>,
 }
 
 impl CexBaselinePolicyV1 {
@@ -2971,6 +3004,7 @@ impl CexBaselinePolicyV1 {
             cart_min_leaf: 5,
             cart_tie_break: CexBaselineTieBreakV1::LossThenFeatureThenThreshold,
             evaluator_config: FormulaEvaluatorConfig::for_trials(2)?,
+            mlp_training: None,
         };
         policy.validate()?;
         Ok(policy)
@@ -2990,17 +3024,41 @@ impl CexBaselinePolicyV1 {
             cart_min_leaf,
             cart_tie_break: CexBaselineTieBreakV1::LossThenFeatureThenThreshold,
             evaluator_config: FormulaEvaluatorConfig::for_trials(2)?,
+            mlp_training: None,
         };
         policy.validate()?;
         Ok(policy)
     }
 
+    pub fn with_mlp_training(
+        mut self,
+        profile: Option<CexMlpTrainingProfileV1>,
+    ) -> Result<Self, DomainError> {
+        if let Some(profile) = profile {
+            profile
+                .validate()
+                .map_err(|_| DomainError::InvalidCexBaseline("MLP training profile is invalid"))?;
+            self.schema_version = CEX_BASELINE_POLICY_SCHEMA_V3.into();
+            self.mlp_training = Some(profile);
+        }
+        self.validate()?;
+        Ok(self)
+    }
+
     pub fn validate(&self) -> Result<(), DomainError> {
         let canonical = self.schema_version == CEX_BASELINE_POLICY_SCHEMA_V1
+            && self.mlp_training.is_none()
             && self.ridge_l2.to_bits() == 1.0e-6_f64.to_bits()
             && self.cart_max_depth == 3
             && self.cart_min_leaf == 5;
-        let parameterized = self.schema_version == CEX_BASELINE_POLICY_SCHEMA_V2
+        let profile_shape = (self.schema_version == CEX_BASELINE_POLICY_SCHEMA_V2
+            && self.mlp_training.is_none())
+            || (self.schema_version == CEX_BASELINE_POLICY_SCHEMA_V3
+                && self
+                    .mlp_training
+                    .as_ref()
+                    .is_some_and(|profile| profile.validate().is_ok()));
+        let parameterized = profile_shape
             && self.ridge_l2.is_finite()
             && (1.0e-8..=1.0e-2).contains(&self.ridge_l2)
             && (1..=8).contains(&self.cart_max_depth)
@@ -3070,6 +3128,8 @@ pub struct CexBaselineFoldV1 {
     pub embargo_range: CexBaselineRangeV1,
     pub predictions: Vec<f64>,
     pub model: CexBaselineModelV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mlp_observation: Option<CexMlpFoldObservationV1>,
 }
 
 impl CexBaselineFoldV1 {
@@ -3094,6 +3154,7 @@ impl CexBaselineFoldV1 {
             embargo_range,
             predictions,
             model,
+            mlp_observation: None,
         };
         let hash = fold_ranges_hash(&fold)?;
         fold.fold_id = CexResearchContentRefV1 {
@@ -3187,6 +3248,15 @@ impl CexBaselineArtifactV1 {
         self.walk_forward_partition.validate()?;
         self.evaluation_policy.validate()?;
         self.baseline_policy.validate()?;
+        if let Some(profile) = &self.baseline_policy.mlp_training {
+            profile
+                .validate_inputs(self.folds.len(), &self.factor_ids)
+                .map_err(|_| {
+                    DomainError::InvalidCexBaseline(
+                        "paired MLP inputs differ from the frozen profile",
+                    )
+                })?;
+        }
         self.evaluation.validate()?;
         let (evaluation_protocol, _) = self.evaluation.protocol_binding()?;
         validate_baseline_fold_schedule(&self.folds, &evaluation_protocol.walk_forward)?;
@@ -3224,6 +3294,27 @@ impl CexBaselineArtifactV1 {
                     || fold.model.kind() != self.model_kind
                     || model_validate(&fold.model, self.factor_ids.len(), &self.baseline_policy)
                         .is_err()
+                    || match (&self.baseline_policy.mlp_training, &fold.model) {
+                        (Some(profile), CexBaselineModelV1::BurnMlpPortable { seed, .. }) => {
+                            profile.initialization.fold_seeds.get(index) != Some(seed)
+                        }
+                        _ => false,
+                    }
+                    || match (&fold.model, &fold.mlp_observation) {
+                        (
+                            CexBaselineModelV1::BurnMlpPortable { learning, .. },
+                            Some(observation),
+                        ) => {
+                            observation.validation_prediction.validate().is_err()
+                                || observation.validation_prediction.row_count
+                                    != fold.predictions.len()
+                                || observation.validation_prediction.training_target_mean
+                                    != learning.training_prediction.training_target_mean
+                        }
+                        (CexBaselineModelV1::BurnMlpPortable { .. }, None) => true,
+                        (_, Some(_)) => true,
+                        (_, None) => false,
+                    }
             })
         {
             return Err(DomainError::InvalidCexBaseline(
@@ -3262,6 +3353,13 @@ impl CexBaselineArtifactV1 {
         factor_bank.validate()?;
         self.validate()?;
         let expected_factor_ids = expected_factor_ids(factor_bank);
+        if let Some(profile) = &policy.mlp_training {
+            profile.validate_factor_bank(factor_bank).map_err(|_| {
+                DomainError::InvalidCexBaseline(
+                    "paired MLP factor columns or orientations differ from the admitted profile",
+                )
+            })?;
+        }
         if self.mission_id != mission.semantic_id()?
             || self.factor_bank_revision_id != factor_bank.revision_id
             || self.factor_ids != expected_factor_ids
@@ -3448,7 +3546,33 @@ fn model_validate(
             && *row_count >= *min_rows
             && arity > 0 =>
         {
-            if let CexBaselineModelV1::BurnMlpPortable { parameters, .. } = model {
+            if let CexBaselineModelV1::BurnMlpPortable {
+                parameters,
+                learning,
+                ..
+            } = model
+            {
+                model.validate_inference(arity).map_err(|_| {
+                    DomainError::InvalidCexBaseline("MLP learning evidence is invalid")
+                })?;
+                let expected_updates = policy
+                    .mlp_training
+                    .as_ref()
+                    .map_or(8, |profile| profile.updates);
+                let expected_scale = policy.mlp_training.as_ref().map_or(
+                    hft_research_manifest::mlp_training::MlpTargetScaleV1::RawReturn,
+                    |profile| profile.target_scale,
+                );
+                if *hidden_dim != 8
+                    || *epochs != expected_updates
+                    || *learning_rate != 1e-3
+                    || *min_rows != 8
+                    || learning.target_transform.mode != expected_scale
+                {
+                    return Err(DomainError::InvalidCexBaseline(
+                        "MLP model differs from the bound training recipe",
+                    ));
+                }
                 parameters.validate().map_err(|_| {
                     DomainError::InvalidCexBaseline("portable MLP parameters are invalid")
                 })?;
@@ -5941,6 +6065,7 @@ mod tests {
                 }],
                 feature_fields: vec!["book_imbalance".to_string(), "spread_bps".to_string()],
                 research_delta: None,
+                mlp_training: None,
                 search,
                 evaluation_protocol,
                 holdout: CexResearchHoldoutV1 {

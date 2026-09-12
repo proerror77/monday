@@ -1143,6 +1143,7 @@ fn follow_up_plan(
         focus_field: loaded.request.research_plan.focus_field.clone(),
         feature_fields,
         label_horizon: loaded.request.research_plan.label_horizon.clone(),
+        mlp_training: loaded.request.research_plan.mlp_training.clone(),
         search_policy_revision,
         attempted_search_policy_revision_ids,
         allowed_search_policy_revisions: loaded
@@ -2737,6 +2738,16 @@ pub(crate) fn validate_terminal_mission_revision_binding(
     mission: &alpha_domain::CexResearchMissionArtifactV1,
     request: &CampaignRequest,
 ) -> anyhow::Result<()> {
+    let expected_mlp = request
+        .research_plan
+        .mlp_training
+        .as_ref()
+        .map(|plan| plan.resolve(mission.spec.search.seed))
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
+    if mission.spec.mlp_training != expected_mlp {
+        bail!("terminal Mission MLP profile differs from the admitted paired training plan");
+    }
     let expected = &request.research_plan.search_policy_revision;
     match (
         expected.research_delta.as_ref(),
@@ -2797,6 +2808,7 @@ fn validate_existing_follow_up_plan(
         || &plan.search_policy_revision != expected_revision
         || plan.allowed_search_policy_revisions
             != loaded.request.research_plan.allowed_search_policy_revisions
+        || plan.mlp_training != loaded.request.research_plan.mlp_training
         || plan
             .attempted_search_policy_revision_ids
             .strip_suffix(std::slice::from_ref(&expected_revision.revision_id))
@@ -5857,6 +5869,164 @@ mod tests {
             &client,
             alpha_store::campaign_ledger::CampaignFinalOutcomeV1::PromotionReady,
         );
+    }
+
+    #[test]
+    fn execute_retains_paired_mlp_training_diagnostics() {
+        let control = campaign_e2e_fixture("campaign-e2e-ml-profile-control", false, false, true);
+        execute(control.args.clone()).unwrap();
+        assert_paired_training_roundtrip(&control);
+    }
+
+    fn assert_paired_training_roundtrip(control: &CampaignE2eFixture) {
+        use alpha_domain::mlp_training::{CexMlpInitializationV1, CexMlpTrainingPlanV1};
+        use alpha_domain::{CexBaselineArtifactV1, CexBaselineModelV1};
+        use hft_research_manifest::mlp_training::MlpTargetScaleV1;
+        let mut initializations = std::collections::BTreeMap::new();
+        let mut control_initial = std::collections::BTreeMap::new();
+        let control_request = load_request(&control.args.request).unwrap();
+        for (round, seed) in [("r1", 7), ("r2", 11)] {
+            let request = control_request
+                .request
+                .rounds
+                .iter()
+                .find(|entry| entry.round_id == round)
+                .unwrap();
+            let bytes = std::fs::read(&request.result_readback_url).unwrap();
+            let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+            let baseline: CexBaselineArtifactV1 =
+                serde_json::from_reader(archive.by_name("results/burn-mlp-baseline.json").unwrap())
+                    .unwrap();
+            let bank: alpha_domain::CexFactorBankRevisionV2 =
+                serde_json::from_reader(archive.by_name("results/factor-bank.json").unwrap())
+                    .unwrap();
+            let mut fold_seeds = Vec::new();
+            for fold in &baseline.folds {
+                let CexBaselineModelV1::BurnMlpPortable {
+                    seed: actual,
+                    learning,
+                    ..
+                } = &fold.model
+                else {
+                    unreachable!()
+                };
+                fold_seeds.push(*actual);
+                control_initial.insert(
+                    (round.to_string(), fold.fold_index),
+                    learning.initial_parameters_sha256.clone(),
+                );
+            }
+            initializations.insert(
+                seed,
+                CexMlpInitializationV1 {
+                    fold_seeds,
+                    expected_factor_ids: baseline.factor_ids,
+                    expected_factor_columns_sha256:
+                        alpha_domain::mlp_training::factor_columns_sha256(&bank.entries).unwrap(),
+                },
+            );
+        }
+        let mut fixture =
+            campaign_e2e_fixture("campaign-e2e-ml-training-profile", false, false, true);
+        let mut request: CampaignRequest =
+            serde_json::from_slice(&std::fs::read(&fixture.args.request).unwrap()).unwrap();
+        request.research_plan.mlp_training = Some(CexMlpTrainingPlanV1 {
+            schema_version: "cex-mlp-training-plan-v1".into(),
+            updates: 64,
+            target_scale: MlpTargetScaleV1::TrainStandardized,
+            initializations,
+        });
+        std::fs::write(&fixture.args.request, serde_json::to_vec(&request).unwrap()).unwrap();
+        fixture.args.request_sha256 =
+            crate::mission_runner::sha256_file(&fixture.args.request).unwrap();
+        execute(fixture.args.clone()).unwrap();
+        let loaded = load_request(&fixture.args.request).unwrap();
+        let materialization = crate::mission_runner::decode_materialization(
+            &std::fs::read(&fixture._render_fixture.materialization_path).unwrap(),
+        )
+        .unwrap();
+        let protocol = crate::mission_render::approved_evaluation_protocol(&materialization)
+            .unwrap()
+            .content_hash()
+            .unwrap();
+        let client = Client::builder().redirect(Policy::none()).build().unwrap();
+        readback_pre_holdout_terminal(&client, &loaded.request, &loaded.sha256, &protocol).unwrap();
+        assert!(!fixture.global_claim_path.exists());
+        for round in ["r1", "r2"] {
+            let request = loaded
+                .request
+                .rounds
+                .iter()
+                .find(|entry| entry.round_id == round)
+                .unwrap();
+            let bytes = std::fs::read(&request.result_readback_url).unwrap();
+            let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+            let baseline: CexBaselineArtifactV1 =
+                serde_json::from_reader(archive.by_name("results/burn-mlp-baseline.json").unwrap())
+                    .unwrap();
+            let bank: alpha_domain::CexFactorBankRevisionV2 =
+                serde_json::from_reader(archive.by_name("results/factor-bank.json").unwrap())
+                    .unwrap();
+            let profile = baseline.baseline_policy.mlp_training.as_ref().unwrap();
+            profile.validate_factor_bank(&bank).unwrap();
+            let mut changed = bank;
+            changed.entries[0].orientation = match changed.entries[0].orientation {
+                alpha_domain::CexFactorOrientationV1::Positive => {
+                    alpha_domain::CexFactorOrientationV1::Negative
+                }
+                alpha_domain::CexFactorOrientationV1::Negative => {
+                    alpha_domain::CexFactorOrientationV1::Positive
+                }
+            };
+            assert!(profile
+                .validate_factor_bank(&changed)
+                .unwrap_err()
+                .contains("orientations"));
+            assert_eq!(
+                baseline.baseline_policy.schema_version,
+                alpha_domain::CEX_BASELINE_POLICY_SCHEMA_V3
+            );
+            let mut wrong_seed = baseline.clone();
+            let CexBaselineModelV1::BurnMlpPortable { seed, .. } = &mut wrong_seed.folds[0].model
+            else {
+                unreachable!()
+            };
+            *seed = seed.wrapping_add(1);
+            wrong_seed.artifact_id.clear();
+            wrong_seed.artifact_id = format!(
+                "cex-baseline-artifact-{}",
+                alpha_domain::canonical_json_hash(&wrong_seed).unwrap()
+            );
+            assert!(
+                wrong_seed.validate().is_err(),
+                "rebinding an artifact cannot change its declared paired seed"
+            );
+            for fold in baseline.folds {
+                let CexBaselineModelV1::BurnMlpPortable {
+                    epochs, learning, ..
+                } = fold.model
+                else {
+                    unreachable!()
+                };
+                assert_eq!(epochs, 64);
+                assert_eq!(learning.updates_completed, 64);
+                assert_eq!(
+                    learning.target_transform.mode,
+                    MlpTargetScaleV1::TrainStandardized
+                );
+                assert_eq!(
+                    learning.initial_parameters_sha256,
+                    control_initial[&(round.to_string(), fold.fold_index)]
+                );
+                assert_eq!(
+                    fold.mlp_observation
+                        .unwrap()
+                        .validation_prediction
+                        .row_count,
+                    fold.predictions.len()
+                );
+            }
+        }
     }
 
     fn regenerate_metric_entries(entries: &mut std::collections::BTreeMap<String, Vec<u8>>) {

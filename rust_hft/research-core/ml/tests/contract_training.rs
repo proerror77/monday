@@ -39,6 +39,7 @@ fn training_config() -> ContractTrainingConfig {
         learning_rate: 0.01,
         min_rows: 8,
         seed: 42,
+        target_scale: hft_research_ml::MlpTargetScaleV1::RawReturn,
     }
 }
 
@@ -206,6 +207,138 @@ fn fit_diagnostics_have_no_promotion_capability() {
     assert_eq!(diagnostics["authority"], "fit_diagnostics_only");
     assert!(diagnostics.get("promotion_eligible").is_none());
     assert!(diagnostics.get("evaluation_scope").is_none());
+}
+
+#[test]
+fn standardized_targets_keep_raw_return_inference_and_learning_evidence() {
+    let rows = training_rows();
+    let rows_artifact = serde_json::to_vec(&rows).unwrap();
+    let (request_bytes, _, _) = sealed_request(&rows_artifact);
+    let mut request: serde_json::Value = serde_json::from_slice(&request_bytes).unwrap();
+    request["config"]["target_scale"] = serde_json::json!("train_standardized");
+    request["config"]["epochs"] = serde_json::json!(128);
+    let bytes = serde_json::to_vec(&request).unwrap();
+    let sealed = SealedTrainingRequest::from_bytes(&bytes, &Sha256Digest::of_bytes(&bytes))
+        .expect("a sealed request can declare training-only target standardization");
+    let trained = train_contract_model(&rows_artifact, &sealed).unwrap();
+    let zero_mse = rows
+        .iter()
+        .map(|row| f64::from(row.forward_return).powi(2))
+        .sum::<f64>()
+        / rows.len() as f64;
+    assert!(trained.diagnostics().mse < zero_mse * 0.25);
+    let portable = trained.export_parameters().unwrap();
+    let output = tempfile::tempdir().unwrap();
+    let saved = trained.save_bundle(output.path()).unwrap();
+    let loaded = load_contract_model_bundle(&saved.manifest_path, &saved.manifest_sha256).unwrap();
+    for row in &rows {
+        let prediction = trained.predict(&row.features).unwrap();
+        assert!(prediction.abs() < 0.002);
+        assert_eq!(
+            prediction.to_bits(),
+            loaded.predict(&row.features).unwrap().to_bits()
+        );
+        assert!((prediction - portable.predict(&row.features).unwrap()).abs() < 1e-8);
+    }
+    let diagnostics = serde_json::to_value(trained.diagnostics()).unwrap();
+    assert_eq!(diagnostics["learning"]["updates_completed"], 128);
+    assert_eq!(
+        diagnostics["learning"]["loss_history"]
+            .as_array()
+            .unwrap()
+            .len(),
+        129
+    );
+    assert_eq!(
+        diagnostics["learning"]["target_transform"]["mode"],
+        "train_standardized"
+    );
+}
+
+#[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn raw_control_keeps_pre_transform_parameters_and_predictions() {
+    let rows = serde_json::to_vec(&training_rows()).unwrap();
+    let (_, _, sealed) = sealed_request(&rows);
+    let trained = train_contract_model(&rows, &sealed).unwrap();
+    // Same-host before/after checkpoint. Training kernels are not required to
+    // produce identical parameter bits across different CPU architectures.
+    // Captured from this fixture at 6fdd7b29 before adding target transforms.
+    assert_eq!(
+        trained.diagnostics().semantic_model_sha256.as_str(),
+        "3a2d9c6f828a1fd063ffedf519dcf5d38e637340550ca47d325e8a99801630c8"
+    );
+    for (x, expected) in [
+        (-1.0, 1053007888_u32),
+        (0.0, 1038960036),
+        (0.25, 1028255236),
+        (1.0, 3189373560),
+        (10.0, 3191709404),
+    ] {
+        assert_eq!(trained.predict(&[x]).unwrap().to_bits(), expected);
+    }
+}
+
+#[test]
+fn training_treatments_share_initialization_but_bind_distinct_requests() {
+    let rows = serde_json::to_vec(&training_rows()).unwrap();
+    let (bytes, _, _) = sealed_request(&rows);
+    let base: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let mut initial = None;
+    let mut identities = std::collections::BTreeSet::new();
+    for mode in ["raw_return", "train_standardized"] {
+        for updates in [8, 64] {
+            let mut value = base.clone();
+            value["config"]["target_scale"] = serde_json::json!(mode);
+            value["config"]["epochs"] = serde_json::json!(updates);
+            let bytes = serde_json::to_vec(&value).unwrap();
+            let sealed =
+                SealedTrainingRequest::from_bytes(&bytes, &Sha256Digest::of_bytes(&bytes)).unwrap();
+            let trained = train_contract_model(&rows, &sealed).unwrap();
+            let diagnostics = trained.diagnostics();
+            let init = &diagnostics.learning.initial_parameters_sha256;
+            assert_eq!(initial.get_or_insert_with(|| init.clone()), init);
+            assert!(identities.insert(diagnostics.request_semantic_sha256.as_str().to_string()));
+            assert_eq!(diagnostics.learning.loss_history.len(), updates + 1);
+            assert_eq!(diagnostics.learning.updates_completed, updates);
+            assert!(trained.training_elapsed_millis().is_some());
+        }
+    }
+}
+
+#[test]
+fn degenerate_targets_and_nonfinite_optimization_are_explicit() {
+    let mut rows = training_rows();
+    for row in &mut rows {
+        row.forward_return = 0.0;
+    }
+    let bytes = serde_json::to_vec(&rows).unwrap();
+    let (request, _, raw) = sealed_request(&bytes);
+    let trained = train_contract_model(&bytes, &raw).unwrap();
+    assert!(trained
+        .diagnostics()
+        .learning
+        .training_prediction
+        .mse_over_zero_prediction
+        .is_none());
+    let mut value: serde_json::Value = serde_json::from_slice(&request).unwrap();
+    value["config"]["target_scale"] = serde_json::json!("train_standardized");
+    let request = serde_json::to_vec(&value).unwrap();
+    let sealed =
+        SealedTrainingRequest::from_bytes(&request, &Sha256Digest::of_bytes(&request)).unwrap();
+    assert!(train_contract_model(&bytes, &sealed)
+        .unwrap_err()
+        .to_string()
+        .contains("degenerate training variance"));
+    for (index, row) in rows.iter_mut().enumerate() {
+        row.features[0] = if index % 2 == 0 { 1e30 } else { -1e30 };
+    }
+    let bytes = serde_json::to_vec(&rows).unwrap();
+    let (_, _, sealed) = sealed_request(&bytes);
+    assert!(train_contract_model(&bytes, &sealed)
+        .unwrap_err()
+        .to_string()
+        .contains("non-finite"));
 }
 
 #[test]
