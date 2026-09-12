@@ -243,9 +243,12 @@ fn validate_instrument_catalog(
 }
 
 fn require_supported_cex_execution(costs: &EvaluationCostsV1) -> Result<(), String> {
-    // Paper uses canonical opposite-side depth for crossing orders.
-    // ponytail: non-zero funding needs a point-in-time runtime funding feed; admit it only after
-    // that feed can debit every research bucket deterministically.
+    // Canonical opposite-side depth is not a supported CEX Paper/Shadow execution
+    // contract. Non-zero funding still needs a point-in-time runtime funding feed
+    // that can debit every research bucket deterministically.
+    if costs.cross_spread {
+        return Err("CEX Paper/Shadow does not support cross-spread execution".to_string());
+    }
     if costs.funding_bps != 0.0 {
         return Err("CEX Paper/Shadow does not support non-zero funding costs".to_string());
     }
