@@ -1,4 +1,4 @@
-use anyhow::Context;
+use anyhow::{bail, Context};
 pub use data::binance_lob_replay::{
     source_revision, Market, ReplaySequenceEvent, ReplaySequenceValidator,
 };
@@ -1317,7 +1317,7 @@ pub fn write_health(
     queue: QueueHealth,
     states: &HashMap<String, OrderBookState>,
 ) -> anyhow::Result<()> {
-    let upload = read_upload_status(spool_dir);
+    let upload = read_upload_status(spool_dir)?;
     let disk_free_gb = disk_free_gb(spool_dir);
     let disk_warning_threshold_gb = std::env::var("MIN_FREE_GB")
         .ok()
@@ -1409,11 +1409,18 @@ pub struct UploadStatus {
     pub last_uploaded_triplet: Option<Value>,
 }
 
-pub fn read_upload_status(spool_dir: &Path) -> UploadStatus {
-    File::open(spool_dir.join("upload-status.json"))
-        .ok()
-        .and_then(|file| serde_json::from_reader(file).ok())
-        .unwrap_or_default()
+pub fn read_upload_status(spool_dir: &Path) -> anyhow::Result<UploadStatus> {
+    let path = spool_dir.join("upload-status.json");
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(UploadStatus::default()),
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            serde_json::from_slice(&fs::read(&path)?).with_context(|| {
+                format!("upload status {} is not valid JSON", path.display())
+            })
+        }
+        Ok(_) => bail!("upload status must be a regular non-symlink file"),
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub fn write_upload_status(spool_dir: &Path, status: &UploadStatus) -> anyhow::Result<()> {
@@ -1959,6 +1966,45 @@ mod tests {
         assert_eq!(health["all_symbols_bridged"], false);
         assert_eq!(health["all_stream_coverage_verified"], false);
         assert_eq!(health["full_stream_coverage_verified"], false);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_upload_status_does_not_default_failure_count() {
+        let root = std::env::temp_dir().join(format!(
+            "monday-upload-status-corrupt-{}",
+            now_ns().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let status = root.join("upload-status.json");
+        let payload = br#"{"failure_count":4, not json"#;
+        fs::write(&status, payload).unwrap();
+        let error = read_upload_status(&root).unwrap_err();
+        assert!(
+            error.to_string().contains("not valid JSON"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(fs::read(&status).unwrap(), payload);
+        let health_error = write_health(
+            &root,
+            Market::Spot,
+            "spot_all",
+            "session-1",
+            "synced",
+            0,
+            0,
+            0,
+            QueueHealth {
+                capacity: 1,
+                remaining_capacity: 1,
+                saturated: false,
+            },
+            &HashMap::new(),
+        )
+        .unwrap_err();
+        assert!(health_error.to_string().contains("not valid JSON"));
+        assert_eq!(fs::read(&status).unwrap(), payload);
+        assert!(!root.join("health.json").exists());
         fs::remove_dir_all(root).unwrap();
     }
 

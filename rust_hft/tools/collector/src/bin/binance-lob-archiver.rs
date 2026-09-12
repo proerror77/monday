@@ -4946,7 +4946,7 @@ async fn upload_only(config: &UploadConfig) -> anyhow::Result<()> {
 }
 
 async fn upload_pending_with_status(config: &UploadConfig) -> anyhow::Result<usize> {
-    let mut status = read_upload_status(&config.spool_dir);
+    let mut status = read_upload_status(&config.spool_dir)?;
     let result = upload_pending(config).await;
     match &result {
         Ok(outcome) => apply_upload_outcome(&mut status, outcome),
