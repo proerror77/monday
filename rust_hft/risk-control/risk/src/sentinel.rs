@@ -223,6 +223,10 @@ impl Sentinel {
     pub fn check(&mut self, stats: &SystemStats) -> SentinelAction {
         self.total_checks += 1;
 
+        if self.state == SentinelState::Emergency {
+            return SentinelAction::Continue;
+        }
+
         // 檢查延遲
         let latency_action = self.check_latency(stats);
 
@@ -355,6 +359,9 @@ impl Sentinel {
 
     /// 更新內部狀態
     fn update_state(&mut self, action: SentinelAction) {
+        if self.state == SentinelState::Emergency {
+            return;
+        }
         self.state = match action {
             SentinelAction::Continue | SentinelAction::Warn => {
                 if self.state == SentinelState::Recovering {
@@ -399,6 +406,10 @@ impl Sentinel {
 
     /// 執行恢復
     fn recover(&mut self) {
+        if self.state == SentinelState::Emergency {
+            warn!("Emergency is sticky; restart is required");
+            return;
+        }
         info!("Sentinel recovering to normal state");
         self.state = SentinelState::Normal;
         self.degraded_since = None;
@@ -408,6 +419,10 @@ impl Sentinel {
 
     /// 強制停止
     pub fn force_stop(&mut self) {
+        if self.state == SentinelState::Emergency {
+            warn!("Emergency is sticky; restart is required");
+            return;
+        }
         warn!("Sentinel force stop triggered");
         self.state = SentinelState::Stopped;
         self.total_stops += 1;
@@ -415,6 +430,10 @@ impl Sentinel {
 
     /// 強制恢復（需要人工確認）
     pub fn force_recover(&mut self) {
+        if self.state == SentinelState::Emergency {
+            warn!("Emergency is sticky; restart is required");
+            return;
+        }
         info!("Sentinel force recover (manual override)");
         self.recover();
     }
@@ -508,6 +527,46 @@ mod tests {
 
         let action = sentinel.check(&stats);
         assert_eq!(action, SentinelAction::EmergencyExit);
+        assert_eq!(sentinel.state(), SentinelState::Emergency);
+    }
+
+    #[test]
+    fn emergency_state_cannot_be_downgraded_to_degraded() {
+        let config = SentinelConfig {
+            consecutive_anomaly_threshold: 1,
+            recovery_cooldown_secs: 0,
+            ..Default::default()
+        };
+        let mut sentinel = Sentinel::new(config);
+        assert_eq!(
+            sentinel.check(&SystemStats {
+                latency_p99_us: 5_000,
+                drawdown_pct: 8.0,
+                ..Default::default()
+            }),
+            SentinelAction::EmergencyExit
+        );
+        assert_eq!(sentinel.state(), SentinelState::Emergency);
+
+        let action = sentinel.check(&SystemStats {
+            latency_p99_us: 5_000,
+            drawdown_pct: 3.5,
+            ..Default::default()
+        });
+        assert_ne!(action, SentinelAction::Degrade);
+        assert_eq!(sentinel.state(), SentinelState::Emergency);
+
+        sentinel.force_recover();
+        sentinel.force_stop();
+        assert_eq!(sentinel.state(), SentinelState::Emergency);
+        assert_eq!(
+            sentinel.check(&SystemStats {
+                latency_p99_us: 1_000,
+                drawdown_pct: 0.1,
+                ..Default::default()
+            }),
+            SentinelAction::Continue
+        );
         assert_eq!(sentinel.state(), SentinelState::Emergency);
     }
 
