@@ -51,11 +51,13 @@ pub(crate) mod test_support {
             }
         }
 
+        #[allow(dead_code)]
         pub(crate) fn with_replace_result(mut self, result: Result<OrderId, HftError>) -> Self {
             self.replace_result = result;
             self
         }
 
+        #[allow(dead_code)]
         pub(crate) fn with_cancel_result(mut self, result: Result<(), HftError>) -> Self {
             self.cancel_result = result;
             self
