@@ -36,7 +36,10 @@ A production Gate failure blocks cutover only. It never blocks or downgrades Cod
 - Audit actions are read-only; never mutate merely to improve the reported state.
 - If implementation is already active, answer a brief progress question from current task evidence and continue the implementation without invoking this audit.
 - Do not carry this audit workflow into a later implementation turn.
-- Stop and report `blocked` if the audited branch, PR head, or in-scope working-tree contents move during the audit.
+- Bind the report to one source identity. If the target moves during the audit,
+  refresh the affected evidence for the new identity; reuse evidence whose inputs
+  are unchanged. If a consistent current view cannot be established, report that
+  limitation as `unknown` rather than combining evidence from different heads.
 - Report authentication, network, or permission gaps as `unknown`; do not reuse stale screenshots or old green runs.
 
 ## Output

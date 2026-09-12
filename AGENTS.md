@@ -31,30 +31,16 @@
   precedence over repository and skill guidance. Apply skills only to the
   requested task; their workflows do not grant additional authority.
 
-## Working rules
+## Working context
 
-- Follow the user's goal and scope autonomously under the standing authorization.
-  Preserve unrelated changes. Ask only when a material scope choice is unresolved,
-  an action exceeds that authorization, or a required external authority is absent;
-  continue independent work while awaiting the answer.
-- Use conversation context to resolve routine choices and state material
-  assumptions. Treat follow-up questions as steering the active task; answer and
-  continue unless the user changes the goal. After interruption, resume from
-  completed work and pending operations rather than restarting.
-- If a concrete blocker requires user input, first complete independent
-  preparation and present one reviewable decision. Cite any blocking instruction
-  and explain why existing authorization does not cover it; distinguish the
-  written requirement from your interpretation.
-- Solve the problem directly. Use a skill, issue, specification, branch, or
-  worktree only when it reduces uncertainty, coordinates durable work, or
-  isolates concurrent writes; never create one merely to satisfy a workflow.
-- For a defect, reproduce the cause with an observable check, fix the shared
-  cause, and verify the repaired behavior using the focused validation rules.
-- Deliver the complete authorized outcome with correct behavior, coherent
-  architecture, and long-term maintainability. Choose the implementation on
-  those merits, not line count or diff size. Cross-module fixes, refactors, and
-  contract migrations are appropriate when the outcome requires them; preserve
-  unrelated user changes and explain material tradeoffs.
+- Resolve routine choices from the task and current evidence. Ask only when a
+  material scope choice or required authority remains unresolved; continue
+  independent work. Preserve unrelated changes and resume from existing task
+  evidence after interruption.
+- For architecture or module ownership changes, read `rust_hft/ARCHITECTURE.md`
+  and `docs/architecture/REPOSITORY_LAYOUT.md`, then the relevant implementation.
+  For tracked work, use `docs/agents/issue-tracker.md` and
+  `docs/agents/triage-labels.md`; use `docs/agents/domain.md` for domain docs.
 - Backward compatibility is not a goal. Remove obsolete paths instead of adding
   shims or fallbacks; preserve applied migrations and audit history as read-only
   records.
@@ -145,26 +131,21 @@
   concrete task scenarios. Add tests for behavior or credible regressions, not
   assertions that mirror implementation or wording.
 
-## Progress and retry limits
+## Progress and completion
 
-- Keep a compact task checkpoint: required outcome, current stage, input/source
-  identity, completed checks, pending operation IDs, and the next unresolved step.
-  Reuse passing evidence while its relevant inputs are unchanged. A repeat check
-  needs a changed input, an observed failure, a specific risk, or a required CI gate.
-- For asynchronous work, prefer the service's wait primitive or returned cursor;
-  otherwise use bounded backoff. Wait for the required terminal state or deadline
-  using the same operation ID. A queued or running job is not a failed attempt.
-- After three identical failures with unchanged inputs, stop that retry path,
-  identify its cause or missing prerequisite, and continue independent work.
-  Resume only when the cause or a relevant input changes. A new task, issue,
-  worktree, or attempt name does not reset an unchanged failure.
-- Once the required outcome and readback pass, finish. Avoid another review,
-  cleanup, planning, or validation cycle without a newly identified requirement.
+- For multi-session or asynchronous work, retain the outcome, source identity,
+  completed checks, pending operation IDs, and next unresolved step. Reuse passing
+  evidence while its inputs remain unchanged; repeat for changed inputs, a
+  specific regression risk, an observed failure, or a required CI gate.
+- Follow asynchronous work by its operation ID and service wait primitive or
+  bounded backoff. A queued or running job is not a failed attempt. After three
+  identical failures with unchanged inputs, stop that retry path until its cause
+  changes; a new task or attempt name does not reset the failure count.
+- Finish once the requested outcome and readback pass. Report exact identities,
+  checks, results, and material limitations, separating verified facts from
+  inference and unknowns.
 
 ## Communication
 
 - Lead with the result in concise Chinese unless the user requests another
   language. Use plain paragraphs; use lists or tables when they aid comparison.
-- Report what changed, the checks and results, and material limitations. Separate
-  verified facts from inference and unknowns; avoid boilerplate summaries and
-  repeating unchanged progress.

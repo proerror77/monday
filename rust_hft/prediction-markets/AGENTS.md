@@ -18,8 +18,9 @@ product or execution authority.
 - Do not create new `ploy-*` crates, a `products/ploy` tree, or another venue execution path. Put new capabilities in the canonical Monday module named in `docs/architecture/PREDICTION_MARKETS.md`.
 - When work is tracked in an issue or PR, use its current GitHub metadata;
   `tasks/todo.md` is a historical migration checklist, not an authority. Follow
-  the root delivery scope: complexity alone does not require creating an issue,
-  publishing a PR, or waiting for CI during a local fix.
+  the root delivery scope. When the user explicitly requests local-only work,
+  stop after local validation and review; otherwise the root implementation
+  default includes PR/CI and merge. Complexity alone does not require an issue.
 - Use `apply_patch` for manual edits, preserve unrelated changes, and verify affected behavior and contracts. Run the PLOY CI lane when requested or required by the delivery contract.
 - Do not run a local PostgreSQL instance. Database-backed validation belongs in GitHub Actions.
 
