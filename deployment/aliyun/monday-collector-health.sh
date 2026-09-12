@@ -38,10 +38,9 @@
 #   4. failure_count must not grow between polls and last_error must be empty,
 #      uniformly across all upload lanes.
 #   5. /data disk watermarks: free at or below DISK_WARN_PERCENT is a warning;
-#      free at or below DISK_CRIT_PERCENT (used >= 85%) is a breach. The
-#      2026-08-17/18
-#      incidents reached 100% twice, so the critical watermark pages a human
-#      instead of only warning.
+#      free at or below DISK_CRIT_PERCENT (used >= 85%) is a breach. df
+#      failure is also a breach: an unobservable disk is the same class of
+#      incident this monitor was created to catch.
 #   6. polymarket-market-tape-upload.timer and polymarket-reference-upload.timer
 #      must be active (waiting) whenever their collector service is active; a
 #      stopped timer with a running collector silently strands rotated tapes
@@ -51,16 +50,25 @@
 #   8. Recovery jobs need valid receipts, bounded ready/running ages, and no
 #      failed or stale entries. A stale job remains undelivered regardless of
 #      when the controller moved it out of the runnable queue.
+#   9. Production LOB archivers must be active, enabled, and Result=success.
+#      StartLimitBurst death otherwise looks healthy while upload-status.json
+#      still holds a recent last_success_at.
+#  10. LOB health.json must be a regular file, parse, and stay younger than
+#      HEALTH_SILENCE_SECONDS. Missing, symlink, unparseable, or stale health
+#      is a liveness failure, not a soft signal.
+#  11. LOB sequence_gaps > 0 or a sequence_gap_total increase is a replay-gap
+#      breach. Session changes and counter regressions rebaseline instead of
+#      fabricating a delta.
 # The raw-ops Gate template has no [Install] section, so systemd reports it as
 # static. Static is healthy only when no Gate instance, running lock, or
 # residual EnvironmentFile remains on the host. State-persistence failures
 # also stay breaches because gate 4 delta detection depends on the persisted
 # state.
 #
-# Everything else is a WARNING: unit/timer active+enabled state, systemd
-# Result, restart-rate deltas, and health.json freshness/sequence counters.
-# Warnings are reported in the JSON warnings array (and as warning: lines in
-# text mode) but never block ok:true.
+# Everything else is a WARNING: non-LOB unit/timer active+enabled state,
+# systemd Result, restart-rate deltas, and health.json session/regression
+# rebaselines. Warnings are reported in the JSON warnings array (and as
+# warning: lines in text mode) but never block ok:true.
 #
 # The script is READ-ONLY: it never starts, stops, enables, or disables a unit
 # and never modifies tape files or upload-status.json. It emits one JSON
@@ -132,10 +140,11 @@ POLY_PENDING_MAX_AGE=86400
 BYBIT_PENDING_MAX=48
 BYBIT_PENDING_MAX_AGE=7200
 
-# Governed units. Persistent services are observed for active + enabled +
-# Result=success and restart-rate deltas (all warnings). Upload lanes are
-# driven by timers whose oneshot services' last Result is observed (warning);
-# their delivery is hard-gated through upload-status.json instead.
+# Governed units. Production LOB archivers are hard-gated on active + enabled +
+# Result=success (gate 9); their restart-rate deltas stay warnings. Other
+# persistent services remain warnings. Upload lanes are driven by timers whose
+# oneshot services' last Result is observed (warning); their delivery is
+# hard-gated through upload-status.json instead.
 ARCHIVER_SPOT=binance-lob-archiver-production@spot.service
 ARCHIVER_USDM=binance-lob-archiver-production@usdm.service
 RECOVERY_SPOT_TIMER=binance-lob-archiver-recovery@spot.timer
@@ -366,7 +375,7 @@ check_disk() {
     disk_free_gb=0
     disk_critical=1
     disk_warning=1
-    record_warning "disk: cannot determine /data free space (df unavailable)"
+    record_breach "disk: cannot determine /data free space (df unavailable)"
   else
     disk_free_percent=$((disk_avail_kib * 100 / disk_total_kib))
     disk_free_gb=$((disk_avail_kib / 1048576))
@@ -387,17 +396,25 @@ check_disk() {
 
 check_service() {
   # Persistent service: active AND enabled AND Result=success AND restart-rate
-  # delta. All soft signals: the hard delivery gates run on upload-status.json.
+  # delta. required=1 (production LOB archivers) fails closed on death;
+  # restart-rate and other persistent units stay warnings.
   unit=$1
   label=$2
+  required=${3:-0}
   active=$(unit_is_active "$unit")
   enabled=$(unit_is_enabled "$unit")
   result=$(unit_result "$unit")
   nrestarts=$(unit_nrestarts "$unit")
   case "$nrestarts" in (*[!0-9]*|'') nrestarts=0;; esac
-  [ "$active" = "active" ] || record_warning "$label: not active (is-active='$active')"
-  [ "$enabled" = "enabled" ] || record_warning "$label: not enabled (is-enabled='$enabled')"
-  [ "$result" = "success" ] || record_warning "$label: last systemd Result='$result'"
+  if [ "$required" -eq 1 ]; then
+    [ "$active" = "active" ] || record_breach "$label: not active (is-active='$active')"
+    [ "$enabled" = "enabled" ] || record_breach "$label: not enabled (is-enabled='$enabled')"
+    [ "$result" = "success" ] || record_breach "$label: last systemd Result='$result'"
+  else
+    [ "$active" = "active" ] || record_warning "$label: not active (is-active='$active')"
+    [ "$enabled" = "enabled" ] || record_warning "$label: not enabled (is-enabled='$enabled')"
+    [ "$result" = "success" ] || record_warning "$label: last systemd Result='$result'"
+  fi
   prior=$(read_prior "nrestarts|$unit")
   if [ "$DRY_RUN" -eq 0 ] && [ -n "$prior" ]; then
     case "$prior" in (*[!0-9]*|'') prior="" ;; esac
@@ -662,12 +679,12 @@ check_binance_health() {
     esac
   fi
   if [ ! -f "$health_file" ] || [ -L "$health_file" ]; then
-    record_warning "$label: health.json missing or a symbolic link ($health_file)"
+    record_breach "$label: health.json missing or a symbolic link ($health_file)"
     sequence_gap_baseline=missing
     preserve_sequence_prior
     age=999999
   elif ! updated_ns=$(jq -r '.updated_at_ns // 0' "$health_file" 2>/dev/null); then
-    record_warning "$label: health.json unparseable ($health_file)"
+    record_breach "$label: health.json unparseable ($health_file)"
     sequence_gap_baseline=malformed
     preserve_sequence_prior
     age=999999
@@ -677,17 +694,21 @@ check_binance_health() {
     hstatus=$(jq -r '.status // "unknown"' "$health_file" 2>/dev/null || printf 'unknown')
     case "$gaps" in (*[!0-9]*|'') gaps=0 ;; esac
     if [ "$gaps" -gt 0 ]; then
-      record_warning "$label: sequence_gaps=$gaps"
+      record_breach "$label: sequence_gaps=$gaps"
     fi
     updated_ns_valid=1
     case "$updated_ns" in
       (*[!0-9]*|'') updated_ns=0; updated_ns_valid=0 ;;
     esac
-    updated_sec=$((updated_ns / 1000000000))
-    age=$((NOW_SEC - updated_sec))
-    [ "$age" -lt 0 ] && age=0
-    if [ "$age" -gt "$HEALTH_SILENCE_SECONDS" ]; then
-      record_warning "$label: health.json stale (age ${age}s > ${HEALTH_SILENCE_SECONDS}s)"
+    if [ "$updated_ns_valid" -eq 1 ]; then
+      updated_sec=$((updated_ns / 1000000000))
+      age=$((NOW_SEC - updated_sec))
+      [ "$age" -lt 0 ] && age=0
+      if [ "$age" -gt "$HEALTH_SILENCE_SECONDS" ]; then
+        record_breach "$label: health.json stale (age ${age}s > ${HEALTH_SILENCE_SECONDS}s)"
+      fi
+    else
+      age=999999
     fi
 
     # A session id is deliberately constrained to the collector's opaque,
@@ -741,7 +762,7 @@ check_binance_health() {
           sequence_gap_delta=$((sequence_gap_total - prior_total))
           sequence_gap_delta_json=$sequence_gap_delta
           sequence_gap_baseline=increased
-          record_warning "$label: sequence_gap_total increased $prior_total -> $sequence_gap_total (delta=$sequence_gap_delta)"
+          record_breach "$label: sequence_gap_total increased $prior_total -> $sequence_gap_total (delta=$sequence_gap_delta)"
         elif [ "$sequence_gap_total" -lt "$prior_total" ]; then
           sequence_gap_baseline=regressed
           record_warning "$label: sequence_gap_total regressed $prior_total -> $sequence_gap_total; baseline reset"
@@ -1312,8 +1333,8 @@ CHECKED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 check_mount
 check_disk
 
-check_service "$ARCHIVER_SPOT" "binance-lob-archiver-production@spot"
-check_service "$ARCHIVER_USDM" "binance-lob-archiver-production@usdm"
+check_service "$ARCHIVER_SPOT" "binance-lob-archiver-production@spot" 1
+check_service "$ARCHIVER_USDM" "binance-lob-archiver-production@usdm" 1
 check_timer "$RECOVERY_SPOT_TIMER" "binance-lob-archiver-recovery@spot.timer" "$ARCHIVER_SPOT"
 check_timer "$RECOVERY_USDM_TIMER" "binance-lob-archiver-recovery@usdm.timer" "$ARCHIVER_USDM"
 check_service "$REFERENCE_COLLECTOR" "binance-usdm-reference-collector"
