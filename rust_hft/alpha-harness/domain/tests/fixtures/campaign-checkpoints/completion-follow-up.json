@@ -1,0 +1,9 @@
+{
+  "schema_version": "monday.campaign_generation_completion.v1",
+  "generation": 0,
+  "outcome": "follow_up",
+  "campaign_pod_name": "pod-g0",
+  "generation_report_sha256": "1845e7a4096c9d18108191416a98df129e7368f7ba0c5735c3a0b095abe486a0",
+  "learning_checkpoint_sha256": "ac0a49bac8024fa5e3df4af44844171c84bcaa93f6b6d7c58689d69ce3fe2bac",
+  "cycle_result": null
+}
