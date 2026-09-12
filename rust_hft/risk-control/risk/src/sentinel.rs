@@ -50,6 +50,10 @@ pub struct SentinelConfig {
     // === 連續異常計數 ===
     /// 連續異常次數觸發動作
     pub consecutive_anomaly_threshold: u32,
+
+    /// Extra EmergencyExit cancel attempts after the first latch.
+    /// Engine Emergency rejects new intents but does not cancel open venue orders.
+    pub emergency_cancel_retries: u32,
 }
 
 impl Default for SentinelConfig {
@@ -76,6 +80,9 @@ impl Default for SentinelConfig {
 
             // 連續異常
             consecutive_anomaly_threshold: 3,
+
+            // First EmergencyExit plus this many follow-up cancel attempts.
+            emergency_cancel_retries: 5,
         }
     }
 }
@@ -170,6 +177,7 @@ pub struct Sentinel {
     // 恢復追蹤
     last_violation_time: Option<Instant>,
     degraded_since: Option<Instant>,
+    emergency_cancel_retries_remaining: u32,
 
     // 統計
     total_checks: u64,
@@ -189,6 +197,7 @@ impl Sentinel {
             last_data_gap_count: 0,
             last_violation_time: None,
             degraded_since: None,
+            emergency_cancel_retries_remaining: 0,
             total_checks: 0,
             total_warnings: 0,
             total_degrades: 0,
@@ -224,7 +233,7 @@ impl Sentinel {
         self.total_checks += 1;
 
         if self.state == SentinelState::Emergency {
-            return SentinelAction::Continue;
+            return self.emergency_cancel_retry_action();
         }
 
         // 檢查延遲
@@ -377,8 +386,24 @@ impl Sentinel {
                 SentinelState::Degraded
             }
             SentinelAction::Stop => SentinelState::Stopped,
-            SentinelAction::EmergencyExit => SentinelState::Emergency,
+            SentinelAction::EmergencyExit => {
+                self.emergency_cancel_retries_remaining = self.config.emergency_cancel_retries;
+                SentinelState::Emergency
+            }
         };
+    }
+
+    fn emergency_cancel_retry_action(&mut self) -> SentinelAction {
+        if self.emergency_cancel_retries_remaining == 0 {
+            return SentinelAction::Continue;
+        }
+        self.emergency_cancel_retries_remaining -= 1;
+        SentinelAction::EmergencyExit
+    }
+
+    /// Stop further EmergencyExit cancel retries. Emergency state stays latched.
+    pub fn mark_emergency_cancel_complete(&mut self) {
+        self.emergency_cancel_retries_remaining = 0;
     }
 
     /// 檢查是否應該恢復
@@ -535,6 +560,7 @@ mod tests {
         let config = SentinelConfig {
             consecutive_anomaly_threshold: 1,
             recovery_cooldown_secs: 0,
+            emergency_cancel_retries: 1,
             ..Default::default()
         };
         let mut sentinel = Sentinel::new(config);
@@ -548,12 +574,12 @@ mod tests {
         );
         assert_eq!(sentinel.state(), SentinelState::Emergency);
 
-        let action = sentinel.check(&SystemStats {
+        let retry = sentinel.check(&SystemStats {
             latency_p99_us: 5_000,
             drawdown_pct: 3.5,
             ..Default::default()
         });
-        assert_ne!(action, SentinelAction::Degrade);
+        assert_eq!(retry, SentinelAction::EmergencyExit);
         assert_eq!(sentinel.state(), SentinelState::Emergency);
 
         sentinel.force_recover();
@@ -563,6 +589,57 @@ mod tests {
             sentinel.check(&SystemStats {
                 latency_p99_us: 1_000,
                 drawdown_pct: 0.1,
+                ..Default::default()
+            }),
+            SentinelAction::Continue
+        );
+        assert_eq!(sentinel.state(), SentinelState::Emergency);
+    }
+
+    #[test]
+    fn emergency_keeps_bounded_cancel_retries_without_degrading() {
+        let config = SentinelConfig {
+            emergency_cancel_retries: 2,
+            ..Default::default()
+        };
+        let mut sentinel = Sentinel::new(config);
+        assert_eq!(
+            sentinel.check(&SystemStats {
+                drawdown_pct: 8.0,
+                ..Default::default()
+            }),
+            SentinelAction::EmergencyExit
+        );
+
+        let degrade_band = SystemStats {
+            latency_p99_us: 5_000,
+            drawdown_pct: 3.5,
+            ..Default::default()
+        };
+        assert_eq!(sentinel.check(&degrade_band), SentinelAction::EmergencyExit);
+        assert_eq!(sentinel.check(&degrade_band), SentinelAction::EmergencyExit);
+        assert_eq!(sentinel.check(&degrade_band), SentinelAction::Continue);
+        assert_eq!(sentinel.check(&degrade_band), SentinelAction::Continue);
+        assert_eq!(sentinel.state(), SentinelState::Emergency);
+    }
+
+    #[test]
+    fn complete_emergency_cancel_stops_further_retries() {
+        let mut sentinel = Sentinel::new(SentinelConfig {
+            emergency_cancel_retries: 5,
+            ..Default::default()
+        });
+        assert_eq!(
+            sentinel.check(&SystemStats {
+                drawdown_pct: 8.0,
+                ..Default::default()
+            }),
+            SentinelAction::EmergencyExit
+        );
+        sentinel.mark_emergency_cancel_complete();
+        assert_eq!(
+            sentinel.check(&SystemStats {
+                drawdown_pct: 3.5,
                 ..Default::default()
             }),
             SentinelAction::Continue

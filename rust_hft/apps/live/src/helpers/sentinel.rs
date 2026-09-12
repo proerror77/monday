@@ -161,7 +161,8 @@ async fn run_sentinel_loop(
                 error!("緊急平倉觸發: drawdown={:.2}%", stats.drawdown_pct);
                 match control.emergency_stop(true).await {
                     Ok(report) if report.is_complete() => {
-                        error!(submitted = report.submitted.len(), "緊急撤單已提交")
+                        error!(submitted = report.submitted.len(), "緊急撤單已提交");
+                        sentinel.mark_emergency_cancel_complete();
                     }
                     Ok(report) => {
                         error!(
