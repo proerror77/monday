@@ -13,12 +13,12 @@ use crate::{
         MAX_RESEARCH_PLAN_GENERATION,
     },
     mission_runner::{
-        decode_materialization, execute_report, fetch_to_file, finalize_existing_search_round,
-        normalized_sha256, publish_immutable_file, recover_execution_report_from_published_result,
-        research_event, valid_git_revision, validate_cex_holdout_id,
-        validate_supervised_candidate_binding, validate_supervised_replay_binding,
-        CexEventReplayReceiptV1, CexSupervisedModelSelectionV1, ExecutionBinding,
-        CEX_SUPERVISED_MODEL_NAMES, MAX_MATERIALIZATION_BYTES, MAX_RESULT_BUNDLE_BYTES,
+        decode_materialization, execute_report, fetch_to_file, normalized_sha256,
+        publish_immutable_file, recover_execution_report_from_published_result, research_event,
+        valid_git_revision, validate_cex_holdout_id, validate_supervised_candidate_binding,
+        validate_supervised_replay_binding, CexEventReplayReceiptV1, CexSupervisedModelSelectionV1,
+        ExecutionBinding, CEX_SUPERVISED_MODEL_NAMES, MAX_MATERIALIZATION_BYTES,
+        MAX_RESULT_BUNDLE_BYTES,
     },
     prediction_dispatch::{
         canonical_tokyo_oss_internal_object, cex_campaign_round_root,
@@ -442,6 +442,11 @@ struct LoadedRequest {
 pub fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
     if args.final_evaluation {
         return final_evaluation::execute(args);
+    }
+    if !args.pre_holdout {
+        bail!(
+            "campaign-execute cannot open sealed holdout; pass --pre-holdout, or --final-evaluation with an independent grant"
+        );
     }
     let loaded = load_request(&args.request)?;
     if loaded.sha256 != normalized_sha256("campaign request", &args.request_sha256)? {
@@ -1243,6 +1248,11 @@ pub(crate) fn validate_request_for_execute(request: &CampaignRequest) -> anyhow:
 }
 
 fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> anyhow::Result<()> {
+    if !args.pre_holdout {
+        bail!(
+            "campaign-execute cannot open sealed holdout; pass --pre-holdout, or --final-evaluation with an independent grant"
+        );
+    }
     let shared_input_dir = args.work_dir.join("shared-inputs");
     let mission_dir = args.work_dir.join("mission");
     let local_request_path = args.work_dir.join("campaign-request.json");
@@ -1341,8 +1351,6 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
 
     let mut ledgers = Vec::with_capacity(loaded.request.rounds.len());
     let mut selected_round = None;
-    let mut selected_mission = None;
-    let mut selected_execute_dir = None;
     for (round_index, round) in loaded.request.rounds.iter().enumerate() {
         research_event(
             "alpha-harness",
@@ -1482,8 +1490,6 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
                 }),
             );
             selected_round = Some(ledger.clone());
-            selected_mission = Some(rendered.mission);
-            selected_execute_dir = Some(execute_dir.clone());
         }
         ledgers.push(ledger);
     }
@@ -1506,64 +1512,7 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
                 .and_then(|round| round.selected_candidate_id.as_deref()),
         }),
     );
-    let finalization = match (&selected_round, &selected_mission, &selected_execute_dir) {
-        (Some(selected_round), Some(selected_mission), Some(selected_execute_dir))
-            if !args.pre_holdout && selected_round.supervised_candidate_id.is_none() =>
-        {
-            let finalization_dir = mission_dir.join("finalization");
-            let report = finalize_existing_search_round(
-                selected_execute_dir,
-                &finalization_dir,
-                &loaded.request.holdout_claim_put_url,
-                &loaded.request.holdout_claim_readback_url,
-                selected_mission,
-            )?;
-            let final_precommit = read_json_value(&finalization_dir.join("final-precommit.json"))?;
-            let sealed_holdout_claim =
-                read_json_value(&finalization_dir.join("sealed-holdout-claim.json"))?;
-            let sealed_holdout_receipt =
-                read_json_value(&finalization_dir.join("sealed-holdout-receipt.json"))?;
-            let strategy_bundle_path = finalization_dir.join("strategy-bundle.json");
-            let promotion_record_path = finalization_dir.join("promotion-record.json");
-            Some(CampaignFinalizationV1 {
-                round_id: selected_round.round_id.clone(),
-                precommit_id: report.precommit_id.clone(),
-                sealed_receipt_id: report.sealed_receipt_id.clone(),
-                sealed_passed: report.sealed_passed,
-                strategy_bundle_id: report.strategy_bundle_id.clone(),
-                promotion_id: report.promotion_id.clone(),
-                final_precommit,
-                sealed_holdout_claim,
-                sealed_holdout_receipt,
-                strategy_bundle: strategy_bundle_path
-                    .try_exists()?
-                    .then(|| read_json_value(&strategy_bundle_path))
-                    .transpose()?,
-                promotion_record: promotion_record_path
-                    .try_exists()?
-                    .then(|| read_json_value(&promotion_record_path))
-                    .transpose()?,
-                final_precommit_sha256: crate::mission_runner::sha256_file(
-                    &finalization_dir.join("final-precommit.json"),
-                )?,
-                sealed_holdout_claim_sha256: crate::mission_runner::sha256_file(
-                    &finalization_dir.join("sealed-holdout-claim.json"),
-                )?,
-                sealed_holdout_receipt_sha256: crate::mission_runner::sha256_file(
-                    &finalization_dir.join("sealed-holdout-receipt.json"),
-                )?,
-                strategy_bundle_sha256: strategy_bundle_path
-                    .try_exists()?
-                    .then(|| crate::mission_runner::sha256_file(&strategy_bundle_path))
-                    .transpose()?,
-                promotion_record_sha256: promotion_record_path
-                    .try_exists()?
-                    .then(|| crate::mission_runner::sha256_file(&promotion_record_path))
-                    .transpose()?,
-            })
-        }
-        _ => None,
-    };
+    let finalization = None;
 
     let result = CampaignResultV1 {
         schema_version: CAMPAIGN_RESULT_SCHEMA_V8.to_string(),
@@ -1588,9 +1537,7 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
         declared_total_trials: loaded.request.declared_total_trials,
         consumed_trials,
         stop_rule: STOP_RULE_V2.to_string(),
-        termination_reason: if finalization.is_some() {
-            "campaign_finalized".to_string()
-        } else if selected_round.is_some() {
+        termination_reason: if selected_round.is_some() {
             "campaign_selected_pre_holdout".to_string()
         } else {
             "campaign_no_candidate".to_string()
@@ -2571,10 +2518,6 @@ fn compare_round_selection(
                 .cmp(&left.selected_candidate_content_hash)
         })
         .then_with(|| right.round_id.cmp(&left.round_id))
-}
-
-fn read_json_value(path: &Path) -> anyhow::Result<serde_json::Value> {
-    serde_json::from_slice(&std::fs::read(path)?).map_err(anyhow::Error::new)
 }
 
 fn load_freeze_plan(path: &Path) -> anyhow::Result<FrozenCampaignPlan> {
@@ -5553,6 +5496,27 @@ mod tests {
         assert!(error
             .to_string()
             .contains("published campaign result already exists with different bytes"));
+    }
+
+    #[test]
+    fn campaign_execute_without_pre_holdout_refuses_to_open_holdout() {
+        let error = execute(CampaignExecuteArgs {
+            final_evaluation: false,
+            final_trusted_keys: None,
+            pre_holdout: false,
+            work_dir: PathBuf::from("/tmp/monday-campaign-execute-holdout-bypass"),
+            campaign_id: "cex-campaign-1234567890abcdef1234567890abcdef".into(),
+            image_identity: "a".repeat(64),
+            request: PathBuf::from("/tmp/missing-campaign-request.json"),
+            request_sha256: "b".repeat(64),
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("campaign-execute cannot open sealed holdout"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]

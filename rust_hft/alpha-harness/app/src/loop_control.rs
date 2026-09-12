@@ -1439,6 +1439,37 @@ mod tests {
     }
 
     #[test]
+    fn public_evaluate_cannot_read_sealed_holdout_without_a_global_claim() {
+        let db = temp_db_path("alpha-evaluate-no-claim");
+        let mission_id = "mission-loop";
+        let candidate_id = "candidate-1";
+        let (directory, manifest_path, manifest) = governed_dataset_fixture(mission_id);
+        create_completed_mission_with_engine_and_dataset(
+            &db,
+            mission_id,
+            candidate_id,
+            EngineKind::ManualSeed,
+            Some(&manifest),
+        );
+        let mut args = loop_args(db.clone(), mission_id, LoopTargetChoice::HoldoutPassed);
+        args.mission.dataset.dataset_manifest = manifest_path;
+        let error = governance::evaluate(EvaluateArgs {
+            db: db.clone(),
+            mission_id: mission_id.to_string(),
+            candidate_id: candidate_id.to_string(),
+            model_root: None,
+            dataset: args.mission.dataset,
+        })
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("global create-once claim"),
+            "unexpected error: {error:#}"
+        );
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn offline_rl_candidate_remains_lab_only_with_sealed_evidence_present() {
         let db = temp_db_path("alpha-loop-offline-rl-lab");
         let mission_id = "mission-loop";
@@ -1675,6 +1706,7 @@ mod tests {
             payload: serde_json::to_value(walk_forward_evaluation).unwrap(),
             created_at: now,
         };
+        let walk_forward_protocol_hash = evaluation.evaluation_protocol_hash.clone();
         {
             let mut store = AlphaStore::open(&db).unwrap();
             store
@@ -1707,14 +1739,63 @@ mod tests {
                 .unwrap();
         }
 
-        governance::evaluate(EvaluateArgs {
+        let error = governance::evaluate(EvaluateArgs {
             db: db.clone(),
             mission_id: mission_id.to_string(),
             candidate_id: candidate_id.to_string(),
             model_root: None,
             dataset: dataset_args.clone(),
         })
-        .unwrap();
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("global create-once claim"),
+            "unexpected error: {error:#}"
+        );
+        let sealed_evaluation = FormulaEvaluator::for_mission(&research_mission)
+            .unwrap()
+            .evaluate_sealed(
+                &EngineProposal {
+                    candidate_id: candidate_id.to_string(),
+                    hypothesis: "positive momentum persists".to_string(),
+                    artifact: candidate.clone(),
+                    expansions: 0,
+                    tokens: 0,
+                    elapsed_ms: 0,
+                },
+                &prepared,
+            )
+            .unwrap();
+        let candidate_hash = AlphaStore::open(&db)
+            .unwrap()
+            .mission_lineage(mission_id)
+            .unwrap()
+            .candidates
+            .into_iter()
+            .find(|stored| stored.candidate_id == candidate_id)
+            .unwrap()
+            .content_hash;
+        {
+            let mut store = AlphaStore::open(&db).unwrap();
+            store
+                .put_registry_revision(&RegistryRevision {
+                    revision_id: governance::sealed_evaluation_revision_id(
+                        candidate_id,
+                        SEALED_HOLDOUT_EVALUATOR_VERSION,
+                    ),
+                    registry_kind: "sealed_evaluation".to_string(),
+                    asset_id: candidate_id.to_string(),
+                    parent_revision_id: None,
+                    payload: serde_json::json!({
+                        "mission_id": mission_id,
+                        "candidate_content_hash": candidate_hash,
+                        "dataset_manifest_id": research_mission.dataset_manifest_id.as_str(),
+                        "evaluation_protocol_hash": walk_forward_protocol_hash,
+                        "evaluation": sealed_evaluation,
+                    }),
+                    created_at: Utc::now(),
+                })
+                .unwrap();
+        }
         governance::evaluate(EvaluateArgs {
             db: db.clone(),
             mission_id: mission_id.to_string(),

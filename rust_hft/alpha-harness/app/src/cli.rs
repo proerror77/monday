@@ -261,8 +261,9 @@ pub struct CampaignExecuteArgs {
     pub final_evaluation: bool,
     #[arg(long, requires = "final_evaluation")]
     pub final_trusted_keys: Option<PathBuf>,
-    /// Stop before opening sealed holdout, including for non-ML candidates.
-    #[arg(long)]
+    /// Stop before opening sealed holdout, including for the formula lane.
+    /// Required unless `--final-evaluation` supplies an independent grant.
+    #[arg(long, required_unless_present = "final_evaluation")]
     pub pre_holdout: bool,
     #[arg(long)]
     pub work_dir: PathBuf,
@@ -1518,7 +1519,8 @@ mod tests {
     #[test]
     fn parses_mission_campaign_execute() {
         let args = "alpha-harness mission campaign-execute --work-dir work --campaign-id cex-campaign-1234567890abcdef1234567890abcdef --image-identity aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --request campaign.json --request-sha256 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        assert!(Cli::try_parse_from(args.split_whitespace()).is_ok());
+        assert!(Cli::try_parse_from(args.split_whitespace()).is_err());
+        assert!(Cli::try_parse_from(format!("{args} --pre-holdout").split_whitespace()).is_ok());
         for suffix in [
             " --final-evaluation",
             " --final-trusted-keys keys.json",

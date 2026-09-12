@@ -17,7 +17,7 @@ Rust CLI and libraries for the governed CEX Campaign and prediction research pla
 | Legacy Factor-Bank subset MCTS | Preserved for governed GP v1-v3 | Content-bound checkpoint, add/remove/swap trace, and passing equal-absolute-weight selection or an explicit no-selection result; sealed holdout remains closed |
 | Legacy four-stage combination walk-forward | Preserved for governed GP v1-v3 | A passing subset emits a content-addressed, research-only Signal/Sizing/Risk/Execution artifact with same-protocol Ridge/CART evidence; no selection emits no strategy |
 | Event-level L2 replay receipt | Implemented | Canonical event replay emits a content-bound receipt, net-return/Sharpe gates, and explicit queue/partial-fill/impact/capacity disclosures |
-| Final precommit and sealed holdout | Preserved for the legacy formula lane only | The ML v4 lane stops pre-holdout and carries no deployment or order authority |
+| Final precommit and sealed holdout | Independent `--final-evaluation` grant only | Root `--pre-holdout` Jobs, formula-lane `campaign-execute`, and diagnostic `mission execute` never open holdout |
 | Signed Paper/Shadow intake | Implemented | Signed four-stage CEX bundles reach the fail-closed Paper/Shadow boundary; this grants no LiveSmall authority |
 | Exact-main CEX run and readback | Pending [#606](https://github.com/proerror77/monday/issues/606) | A fresh credential-free USD-M Mission still needs cloud Runtime and independent result readback |
 | Prediction Mission v4 | Implemented for `pipeline_smoke` and deterministic `research_trial` | Authenticated partition readmission plus task-isolated settlement, UP-execution, and DOWN-execution result receipts; no external proposal provider |
@@ -29,7 +29,9 @@ Job/Pod downloads the shared inputs once, admits the request, renders and
 executes each round search-only, performs create-once Mission/result readback
 per round, and selects the deterministic pre-holdout winner. A governed GP v4
 Campaign stops there; a negative result can feed the bounded external LLM
-controller, while the legacy formula lane alone retains sealed finalization.
+controller. Sealed holdout opens only through an independent
+`--final-evaluation` grant, not from `--pre-holdout` campaign-execute or
+diagnostic `mission execute`.
 Low-level Mission and LoopRun commands
 remain diagnostics and implementation surfaces; they are not alternate evidence
 paths around this contract.
@@ -146,8 +148,8 @@ search only, and can produce at most one passing pre-holdout result. The
 Campaign selects one deterministic pre-holdout winner from the passing rounds.
 The v4 ML lane stops there. If no round passes, the Campaign ends negative and
 no claim is made; its typed factor/model/replay failures can seed a bounded
-follow-up. Only the legacy formula lane retains one finalization against the
-global holdout claim.
+follow-up. Formula-lane `campaign-execute` also stops pre-holdout unless the
+Job is the independent `--final-evaluation` grant.
 
 Typed Campaign follow-ups carry a finite, root-declared allowlist of complete
 research deltas. A delta may select a subset of the admitted feature fields,
@@ -227,7 +229,8 @@ For an LLM mission, `objective` and `hypothesis_scope` are the governed research
 inspection. They are hidden from CLI help and are not runnable CEX completion
 paths. The Campaign seam owns v4 supervised-model selection and replay, legacy
 Factor-Bank subset MCTS/checkpoint resume, round accounting, and winner
-selection. Only the legacy formula lane owns sealed-holdout finalization.
+selection. Sealed-holdout finalization is not a diagnostic or `--pre-holdout`
+completion path.
 Missing evaluation, holdout, Paper, Shadow, or human evidence still fails or
 pauses closed; invoking a diagnostic command never supplies that evidence.
 
@@ -387,7 +390,7 @@ cargo run -p alpha-harness -- mission learn \
   --repeated-failure-threshold 3
 ```
 
-Only a canonical Formula v3 walk-forward Keep candidate can access the sealed holdout. Candidate generators receive label-free proposal metadata; only the evaluator can read labels. Before position mapping, the evaluator persists per-fold time-series IC, RankIC, ICIR, RankICIR, and positive-IC ratio. After mapping, it persists rows, trades, post-cost edge, drawdown, per-observation net Sharpe, raw score, and adjusted score. The versioned evaluation protocol binds the split, costs, label horizon, observation frequency, fold-IC population-deviation ICIR, and unannualized per-observation population-deviation Sharpe definitions. Sharpe remains unannualized by explicit protocol definition. Label horizon and observation frequency come from the registered, content-validated dataset; their CLI flags are required assertions, not alternate sources of truth. The first run freezes the protocol for the mission and each new checkpoint records its hash, so resume fails before an engine transition if the protocol drifts. Legacy feature manifests without label facts fail closed.
+Only a canonical Formula v3 walk-forward Keep candidate can access the sealed holdout. Public `evaluate` cannot read sealed holdout rows; it only returns existing sealed evidence and otherwise fails closed until the global create-once claim. Opening holdout requires `campaign-execute --final-evaluation`. Candidate generators receive label-free proposal metadata; only the evaluator can read labels. Before position mapping, the evaluator persists per-fold time-series IC, RankIC, ICIR, RankICIR, and positive-IC ratio. After mapping, it persists rows, trades, post-cost edge, drawdown, per-observation net Sharpe, raw score, and adjusted score. The versioned evaluation protocol binds the split, costs, label horizon, observation frequency, fold-IC population-deviation ICIR, and unannualized per-observation population-deviation Sharpe definitions. Sharpe remains unannualized by explicit protocol definition. Label horizon and observation frequency come from the registered, content-validated dataset; their CLI flags are required assertions, not alternate sources of truth. The first run freezes the protocol for the mission and each new checkpoint records its hash, so resume fails before an engine transition if the protocol drifts. Legacy feature manifests without label facts fail closed.
 
 Mission `validator_spec` may override `min_time_series_ic`, `min_time_series_rank_ic`, `min_time_series_icir`, `min_time_series_rank_icir`, and `min_positive_ic_ratio`. It may also pre-register a larger multiple-testing family through `multiple_testing_trials`, but cannot declare fewer trials than its candidate budget. The evaluation protocol, config, and metric hashes are bound into versioned sealed evidence, promotion, and bundle hashes. Old evidence remains readable but cannot be promoted without a valid protocol binding. Repeated failures generate one idempotent follow-up mission and learning directive. Add `--llm-critic` for a bounded real failure explanation.
 
