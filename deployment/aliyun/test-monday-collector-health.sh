@@ -1067,7 +1067,7 @@ jq '.updated_at_ns = {invalid: true}' "$spool_root/binance-lob/spot/health.json"
   && mv "$spool_root/binance-lob/spot/health.json.tmp" "$spool_root/binance-lob/spot/health.json"
 run_health --json
 expect "health invalid timestamp: exit 1" "$(rc_is 1; echo $?)"
-expect "health invalid timestamp: breach message" "$(grep_out '^breach: .*updated_at_ns malformed'; echo $?)"
+expect "health invalid timestamp: breach message" "$(json_query '.breaches | any(contains("updated_at_ns malformed"))'; echo $?)"
 expect "health invalid timestamp: prior retained" "$(json_query '.checks.health["binance-lob-archiver-production@spot"].sequence_gap_observed == false and .checks.health["binance-lob-archiver-production@spot"].sequence_gap_baseline == "malformed" and .checks.health["binance-lob-archiver-production@spot"].sequence_gap_previous_total == 4'; echo $?)"
 
 reset_env
