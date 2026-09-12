@@ -2380,31 +2380,32 @@ pub fn load_research_snapshot(snapshot_dir: impl AsRef<Path>) -> Result<Research
             RESEARCH_SNAPSHOT_SCHEMA_VERSION
         );
     }
-    let artifact_bytes = load_snapshot_artifact_bytes_with(
-        &manifest,
-        manifest.snapshot_contract_hash.is_some(),
-        |artifact| read_bounded_snapshot_artifact(&snapshot_dir.join(artifact), artifact),
-    )?;
-    if let Some(recorded_contract_hash) = manifest.snapshot_contract_hash.as_deref() {
-        let contract_hex = recorded_contract_hash
-            .strip_prefix("sha256:")
-            .filter(|hex| {
-                hex.len() == 64
-                    && hex
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            })
-            .context("research snapshot contract hash must use sha256:<64hex>")?;
-        debug_assert_eq!(contract_hex.len(), 64);
-        let computed_contract_hash = compute_snapshot_contract_hash(&manifest, &artifact_bytes)
-            .context("verify research snapshot evaluator contract hash")?;
-        if recorded_contract_hash != computed_contract_hash {
-            anyhow::bail!(
-                "research snapshot evaluator contract hash mismatch: manifest={} computed={}",
-                recorded_contract_hash,
-                computed_contract_hash
-            );
-        }
+    let recorded_contract_hash = manifest
+        .snapshot_contract_hash
+        .as_deref()
+        .filter(|hash| !hash.is_empty())
+        .context("research snapshot manifest is missing snapshot_contract_hash")?;
+    let artifact_bytes = load_snapshot_artifact_bytes_with(&manifest, true, |artifact| {
+        read_bounded_snapshot_artifact(&snapshot_dir.join(artifact), artifact)
+    })?;
+    let contract_hex = recorded_contract_hash
+        .strip_prefix("sha256:")
+        .filter(|hex| {
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .context("research snapshot contract hash must use sha256:<64hex>")?;
+    debug_assert_eq!(contract_hex.len(), 64);
+    let computed_contract_hash = compute_snapshot_contract_hash(&manifest, &artifact_bytes)
+        .context("verify research snapshot evaluator contract hash")?;
+    if recorded_contract_hash != computed_contract_hash {
+        anyhow::bail!(
+            "research snapshot evaluator contract hash mismatch: manifest={} computed={}",
+            recorded_contract_hash,
+            computed_contract_hash
+        );
     }
     let recorded_hash = manifest
         .snapshot_hash
@@ -4974,6 +4975,17 @@ mod tests {
             .expect("manifest object")
             .remove("snapshot_contract_hash");
         write_json(root.join("manifest.json"), &legacy_manifest).expect("write legacy manifest");
+        let missing_contract_hash = load_research_snapshot(&root)
+            .expect_err("legacy snapshot without contract hash must fail closed");
+        assert!(
+            missing_contract_hash
+                .to_string()
+                .contains("missing snapshot_contract_hash"),
+            "{missing_contract_hash:#}"
+        );
+
+        write_json(root.join("manifest.json"), &loaded.manifest)
+            .expect("restore strong snapshot manifest");
 
         #[cfg(feature = "polars-export")]
         {
@@ -4987,11 +4999,6 @@ mod tests {
             );
             let parquet_bytes = fs::read(&parquet_path).expect("read parquet before deletion");
             fs::remove_file(&parquet_path).expect("remove optional legacy parquet");
-            load_research_snapshot(&root)
-                .expect("legacy snapshot must not depend on an unverified parquet artifact");
-
-            write_json(root.join("manifest.json"), &loaded.manifest)
-                .expect("restore strong snapshot manifest");
             let missing_parquet = load_research_snapshot(&root)
                 .expect_err("strong snapshot must require its declared parquet artifact");
             assert!(missing_parquet
@@ -4999,9 +5006,6 @@ mod tests {
                 .contains("read snapshot artifact"));
             fs::write(&parquet_path, parquet_bytes).expect("restore parquet artifact");
         }
-
-        #[cfg(not(feature = "polars-export"))]
-        load_research_snapshot(&root).expect("legacy snapshot without contract hash must load");
 
         let mut semantic_tamper = loaded.manifest.clone();
         semantic_tamper.max_quote_age_secs += 1;
