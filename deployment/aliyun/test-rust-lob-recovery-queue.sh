@@ -16,8 +16,13 @@ grep -Fq 'monday.rust_lob_controller_release.v2' "$RECOVERY"
 grep -Fq 'monday.rust_lob_controller_release.v2' "$RECOVERY"
 grep -Fq 'needs_recovery_isolation' "$RECOVERY"
 grep -Fq 'has_undrained_complete_segments' "$RECOVERY"
+grep -Fq 'has_cleanup_marker_only_leftover' "$RECOVERY"
 if grep -Fq 'if ! has_incomplete_parts "$CANONICAL_SPOOL"' "$RECOVERY"; then
   printf 'recovery isolate still skips complete undrained segments\n' >&2
+  exit 1
+fi
+if awk '/^has_undrained_complete_segments\(\)/,/^}/' "$RECOVERY" | grep -Fq -- "-name '*.uploaded-cleanup"; then
+  printf 'undrained-complete still treats cleanup markers as segments\n' >&2
   exit 1
 fi
 projection_contract='"$ACTIVE_CONTROLLER/deployment/binance-lob-archiver-production-$MARKET.env"'
@@ -579,6 +584,16 @@ if has_undrained_complete_segments "$part_spool"; then
   printf 'incomplete part was classified as a complete segment\n' >&2
   exit 1
 fi
+cleanup_spool="$fixture/cleanup-isolate-spool"
+mkdir -p "$cleanup_spool"
+printf '%s\n' '{"schema":"monday.binance_lob.uploaded_cleanup.v1","data":"part-1.jsonl.zst","manifest":"part-1.jsonl.zst.manifest.json","success":"part-1.jsonl.zst._SUCCESS"}' \
+  >"$cleanup_spool/part-1.jsonl.zst.manifest.json.uploaded-cleanup.json"
+has_uploaded_cleanup_markers "$cleanup_spool"
+has_cleanup_marker_only_leftover "$cleanup_spool"
+if has_undrained_complete_segments "$cleanup_spool" || needs_recovery_isolation "$cleanup_spool"; then
+  printf 'cleanup-marker-only spool was treated as recovery work\n' >&2
+  exit 1
+fi
 
 rm -f "$fixture/payload.calls" "$fixture/uploaded-files"
 fixture_job 108 ready
@@ -596,6 +611,29 @@ if grep -Fq -- '--recover-parts-only' "$fixture/payload.calls"; then
 fi
 grep -Fq 'part-complete.jsonl.zst' "$fixture/uploaded-files"
 
+rm -f "$fixture/payload.calls" "$fixture/uploaded-files"
+fixture_job 109 ready
+printf '%s\n' '{"schema":"monday.binance_lob.uploaded_cleanup.v1","data":"part-cleanup.jsonl.zst","manifest":"part-cleanup.jsonl.zst.manifest.json","success":"part-cleanup.jsonl.zst._SUCCESS"}' \
+  >"$fixture_job_dir/part-cleanup.jsonl.zst.manifest.json.uploaded-cleanup.json"
+fixture_resume >/dev/null
+attempt=$(fixture_attempt)
+expect_rejected leftover-cleanup-markers fixture_drain
+grep -Fq 'leftover uploaded-cleanup markers' "$fixture/rejected.log"
+[[ -d $QUEUE_MARKET_ROOT/$RESUME_JOB_ID.failed ]]
+[[ -f $QUEUE_MARKET_ROOT/$RESUME_JOB_ID.failed/part-cleanup.jsonl.zst.manifest.json.uploaded-cleanup.json ]]
+[[ $(jq -r .result "$attempt/result.json") == failed ]]
+if [[ -e $fixture/payload.calls ]] && grep -Fq -- '--upload-only' "$fixture/payload.calls"; then
+  printf 'cleanup-marker-only drain entered fresh-upload verify\n' >&2
+  exit 1
+fi
+if [[ -e $fixture/payload.calls ]] && grep -Fq -- '--recover-parts-only' "$fixture/payload.calls"; then
+  printf 'cleanup-marker-only drain invoked recover-parts\n' >&2
+  exit 1
+fi
+fixture_drain >/dev/null
+[[ -d $QUEUE_MARKET_ROOT/$RESUME_JOB_ID.failed ]]
+[[ ! -d $QUEUE_MARKET_ROOT/$RESUME_JOB_ID.ready ]]
+
 saved_canonical=$CANONICAL_SPOOL
 isolate_spool="$fixture/host/data/monday/spool/binance-lob/spot"
 rm -rf -- "$isolate_spool"
@@ -607,6 +645,7 @@ ready_before=$(find "$QUEUE_MARKET_ROOT" -mindepth 1 -maxdepth 1 -type d -name '
 fixture_isolate() {
   (
     CURRENT_ACTION=isolate
+    # shellcheck disable=SC2317,SC2329 # Nested stub used by run_isolate in this subshell.
     install() {
       local mode=0750 dest src
       while (($#)); do
@@ -639,6 +678,18 @@ fi
 ready_after=$(find "$QUEUE_MARKET_ROOT" -mindepth 1 -maxdepth 1 -type d -name '*.ready' -print | wc -l)
 [[ $ready_before == "$ready_after" ]] \
   || { printf 'empty spool isolate queued a job\n' >&2; exit 1; }
+
+printf '%s\n' '{"schema":"monday.binance_lob.uploaded_cleanup.v1","data":"part-cleanup.jsonl.zst","manifest":"part-cleanup.jsonl.zst.manifest.json","success":"part-cleanup.jsonl.zst._SUCCESS"}' \
+  >"$isolate_spool/part-cleanup.jsonl.zst.manifest.json.uploaded-cleanup.json"
+if ! fixture_isolate >/dev/null; then
+  printf 'cleanup-marker-only isolate failed\n' >&2
+  exit 1
+fi
+ready_after_cleanup=$(find "$QUEUE_MARKET_ROOT" -mindepth 1 -maxdepth 1 -type d -name '*.ready' -print | wc -l)
+[[ $ready_before == "$ready_after_cleanup" ]] \
+  || { printf 'cleanup-marker-only isolate queued a job\n' >&2; exit 1; }
+[[ -f $isolate_spool/part-cleanup.jsonl.zst.manifest.json.uploaded-cleanup.json ]]
+rm -f -- "$isolate_spool/part-cleanup.jsonl.zst.manifest.json.uploaded-cleanup.json"
 
 printf 'sealed\n' >"$isolate_spool/part-pending.jsonl.zst"
 printf '{}\n' >"$isolate_spool/part-pending.jsonl.zst.manifest.json"
