@@ -4219,7 +4219,7 @@ mod tests {
             create_execution_queues(ExecutionQueueConfig::default());
         engine.set_execution_queues(engine_queues);
         engine
-            .set_intent_execution_limits(Some(25), None, None)
+            .set_intent_execution_limits(Some(25), Some(rust_decimal::Decimal::from(10_000)), None)
             .unwrap();
         let now = now_micros();
         let mut envelope =
@@ -4242,7 +4242,7 @@ mod tests {
             create_execution_queues(ExecutionQueueConfig::default());
         engine.set_execution_queues(engine_queues);
         engine
-            .set_intent_execution_limits(Some(25), None, None)
+            .set_intent_execution_limits(Some(25), Some(rust_decimal::Decimal::from(10_000)), None)
             .unwrap();
         let intent = ports::OrderIntent::prediction_market(
             Symbol::new("prediction-token"),
