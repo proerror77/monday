@@ -2977,20 +2977,6 @@ pub(crate) fn read_status(path: &Path) -> Result<Map<String, Value>> {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Map::new()),
         Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
-            Ok(serde_json::from_slice::<Value>(&fs::read(path)?)
-                .ok()
-                .and_then(|value| value.as_object().cloned())
-                .unwrap_or_default())
-        }
-        Ok(_) => bail!("upload status must be a regular non-symlink file"),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn read_polymarket_status(path: &Path) -> Result<Map<String, Value>> {
-    match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Map::new()),
-        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
             let value: Value = serde_json::from_slice(&fs::read(path)?)
                 .with_context(|| format!("upload status {} is not valid JSON", path.display()))?;
             let status = value
@@ -3003,6 +2989,10 @@ fn read_polymarket_status(path: &Path) -> Result<Map<String, Value>> {
         Ok(_) => bail!("upload status must be a regular non-symlink file"),
         Err(error) => Err(error.into()),
     }
+}
+
+fn read_polymarket_status(path: &Path) -> Result<Map<String, Value>> {
+    read_status(path)
 }
 
 fn upload_status_failure_count(status: &Map<String, Value>) -> Result<u64> {
@@ -6882,6 +6872,10 @@ mod tests {
             .unwrap_err();
 
             assert_eq!(called.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                fs::read(root.path().join("upload-status.json")).unwrap(),
+                payload
+            );
             assert!(
                 error.to_string().contains(expected),
                 "expected {expected}, got {error:#}"
