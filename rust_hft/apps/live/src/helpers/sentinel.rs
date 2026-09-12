@@ -145,7 +145,7 @@ async fn run_sentinel_loop(
                     stats.latency_p99_us, stats.drawdown_pct
                 );
                 let mut engine = engine_arc.lock().await;
-                engine.enter_degrade_mode();
+                apply_degrade_mode(&mut engine);
             }
             SentinelAction::Stop => {
                 // 停止交易
@@ -161,7 +161,8 @@ async fn run_sentinel_loop(
                 error!("緊急平倉觸發: drawdown={:.2}%", stats.drawdown_pct);
                 match control.emergency_stop(true).await {
                     Ok(report) if report.is_complete() => {
-                        error!(submitted = report.submitted.len(), "緊急撤單已提交")
+                        error!(submitted = report.submitted.len(), "緊急撤單已提交");
+                        sentinel.mark_emergency_cancel_complete();
                     }
                     Ok(report) => {
                         error!(
@@ -180,6 +181,14 @@ async fn run_sentinel_loop(
     }
 }
 
+fn apply_degrade_mode(engine: &mut engine::Engine) {
+    if engine.trading_mode() == engine::TradingMode::Emergency {
+        warn!("緊急模式已鎖定，忽略降頻請求");
+        return;
+    }
+    engine.enter_degrade_mode();
+}
+
 /// 獲取 Sentinel 當前狀態（用於外部查詢）
 /// (保留供未來 gRPC 控制接口使用)
 #[allow(dead_code)]
@@ -191,5 +200,30 @@ pub struct SentinelHandle {
 impl SentinelHandle {
     pub fn new(handle: JoinHandle<()>) -> Self {
         Self { _handle: handle }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_degrade_mode;
+    use engine::{Engine, EngineConfig, TradingMode};
+
+    #[test]
+    fn sentinel_degrade_cannot_leave_emergency() {
+        let mut engine = Engine::new(EngineConfig::default());
+        engine.emergency_exit();
+
+        apply_degrade_mode(&mut engine);
+
+        assert_eq!(engine.trading_mode(), TradingMode::Emergency);
+    }
+
+    #[test]
+    fn sentinel_degrade_still_enters_degraded_from_normal() {
+        let mut engine = Engine::new(EngineConfig::default());
+
+        apply_degrade_mode(&mut engine);
+
+        assert_eq!(engine.trading_mode(), TradingMode::Degraded);
     }
 }
