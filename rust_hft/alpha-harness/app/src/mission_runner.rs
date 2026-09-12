@@ -332,7 +332,11 @@ pub(crate) enum ExecutionBinding {
 
 impl ExecutionBinding {
     fn is_search_only(&self) -> bool {
-        matches!(self, Self::Campaign { .. })
+        // Direct `mission execute` is a diagnostic surface. Campaign rounds are
+        // search-only. Sealed holdout opens only through `--final-evaluation`.
+        match self {
+            Self::Direct | Self::Campaign { .. } => true,
+        }
     }
 }
 
@@ -901,7 +905,9 @@ pub(crate) fn execute_report(
     {
         bail!("CEX Research Mission hypotheses do not share one frozen baseline target");
     }
-    if !binding.is_search_only() {
+    if matches!(binding, ExecutionBinding::Direct) {
+        // Direct execute is search-only and cannot open holdout, but it is not
+        // the Campaign research field set. Reject fields with no live semantics.
         mission::validate_live_feature_fields(&control_mission.spec.feature_fields)?;
     }
     let gp_policy = bound_gp_policy(&control_mission)?;
@@ -1473,36 +1479,10 @@ pub(crate) fn execute_report(
             created_at: Utc::now(),
         })?;
     }
-    let finalization = match (&subset_run, &replay_report) {
-        (Some((strategy, subset_checkpoint, subset_result)), Some(replay))
-            if replay.gate.passed && !binding.is_search_only() =>
-        {
-            Some(finalize_cex_candidate(
-                &mut store,
-                &results_dir,
-                &client,
-                &args.holdout_claim_put_url,
-                &args.holdout_claim_readback_url,
-                &mission_id,
-                &control_mission,
-                &lineage,
-                &factor_bank,
-                &baseline_run,
-                strategy,
-                subset_checkpoint,
-                subset_result,
-                replay,
-                &results_dir,
-                &baseline_dataset,
-                &gp_policy,
-                &baseline_policy,
-                &weight_policy,
-                &replay_policy,
-                &materialization.snapshot.instrument_rules,
-            )?)
-        }
-        _ => None,
-    };
+    // Direct execute and Campaign rounds stop before sealed holdout. The
+    // formula-lane finalizer remains a library seam for `--final-evaluation`
+    // tests; it is not a `mission execute` completion path.
+    let finalization = None::<CexFinalizationReportV1>;
     let lineage = store.mission_lineage(&mission_id)?;
     let candidate_count = lineage.candidates.len();
     let evaluation_count = lineage.evaluations.len();
@@ -2040,24 +2020,21 @@ pub(crate) fn promote_sealed_candidate(
     Ok(result)
 }
 
-pub(crate) fn finalize_existing_search_round(
-    round_execute_dir: &Path,
+/// Freeze a GP v1-v3 formula search round and open sealed holdout. Used by the
+/// signed `--final-evaluation` worker; Direct execute and `--pre-holdout`
+/// Campaign rounds never call this.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finalize_formula_search_round(
+    round_results: &Path,
     finalization_dir: &Path,
+    client: &Client,
     holdout_claim_put_url: &str,
     holdout_claim_readback_url: &str,
     control_mission: &CexResearchMissionArtifactV1,
+    store: &mut AlphaStore,
+    dataset: &alpha_engine::evaluation::PreparedDataset,
 ) -> anyhow::Result<CexFinalizationReportV1> {
-    let client = Client::builder()
-        .timeout(Duration::from_secs(120))
-        .redirect(Policy::none())
-        .build()?;
-    ensure_holdout_claim_absent(&client, holdout_claim_readback_url)?;
-    let round_results = round_execute_dir.join("results");
     std::fs::create_dir_all(finalization_dir)?;
-    let mut store = AlphaStore::open(round_results.join("alpha.duckdb"))?;
-    if store.has_cex_sealed_holdout_claim(&control_mission.spec.holdout.holdout_id)? {
-        bail!("sealed holdout is already claimed; finalize requires a fresh unopened holdout");
-    }
     let mission_id = control_mission.semantic_id()?;
     let lineage = store.mission_lineage(&mission_id)?;
     let factor_bank: CexFactorBankRevisionV2 =
@@ -2090,12 +2067,6 @@ pub(crate) fn finalize_existing_search_round(
         serde_json::from_slice(&std::fs::read(round_results.join("replay-policy.json"))?)?;
     let materialization =
         decode_materialization(&std::fs::read(round_results.join("materialization.json"))?)?;
-    let dataset_manifest = data_mission::read_registered_research_dataset(
-        &store,
-        &round_results.join("cex-replay-dataset-manifest.json"),
-    )?;
-    let rows = dataset_manifest.load_rows(&control_mission.spec.evaluation_protocol.costs)?;
-    let dataset = prepare_dataset(rows, &control_mission.spec.evaluation_protocol)?;
     let baselines = alpha_engine::baselines::CexBaselineRun {
         ridge: Some(ridge),
         cart: Some(cart),
@@ -2103,9 +2074,9 @@ pub(crate) fn finalize_existing_search_round(
         gate,
     };
     finalize_cex_candidate(
-        &mut store,
+        store,
         finalization_dir,
-        &client,
+        client,
         holdout_claim_put_url,
         holdout_claim_readback_url,
         &mission_id,
@@ -2117,13 +2088,50 @@ pub(crate) fn finalize_existing_search_round(
         &subset_checkpoint.checkpoint,
         &subset_result,
         &replay,
-        &round_results,
-        &dataset,
+        round_results,
+        dataset,
         &gp_policy,
         &baseline_policy,
         &weight_policy,
         &replay_policy,
         &materialization.snapshot.instrument_rules,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn finalize_existing_search_round(
+    round_execute_dir: &Path,
+    finalization_dir: &Path,
+    holdout_claim_put_url: &str,
+    holdout_claim_readback_url: &str,
+    control_mission: &CexResearchMissionArtifactV1,
+) -> anyhow::Result<CexFinalizationReportV1> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(120))
+        .redirect(Policy::none())
+        .build()?;
+    ensure_holdout_claim_absent(&client, holdout_claim_readback_url)?;
+    let round_results = round_execute_dir.join("results");
+    std::fs::create_dir_all(finalization_dir)?;
+    let mut store = AlphaStore::open(round_results.join("alpha.duckdb"))?;
+    if store.has_cex_sealed_holdout_claim(&control_mission.spec.holdout.holdout_id)? {
+        bail!("sealed holdout is already claimed; finalize requires a fresh unopened holdout");
+    }
+    let dataset_manifest = data_mission::read_registered_research_dataset(
+        &store,
+        &round_results.join("cex-replay-dataset-manifest.json"),
+    )?;
+    let rows = dataset_manifest.load_rows(&control_mission.spec.evaluation_protocol.costs)?;
+    let dataset = prepare_dataset(rows, &control_mission.spec.evaluation_protocol)?;
+    finalize_formula_search_round(
+        &round_results,
+        finalization_dir,
+        &client,
+        holdout_claim_put_url,
+        holdout_claim_readback_url,
+        control_mission,
+        &mut store,
+        &dataset,
     )
 }
 
@@ -5969,12 +5977,22 @@ pub(crate) mod tests {
                 };
             });
 
-            let error = execute(fixture.args.clone()).unwrap_err();
+            execute(fixture.args.clone()).unwrap();
+            let results = fixture.args.work_dir.join("results");
+            assert!(results.join("factor-bank.json").exists());
+            assert!(!results.join("final-precommit.json").exists());
+            assert!(!Path::new(&fixture.args.holdout_claim_put_url).exists());
+            let error = finalize_existing_search_round(
+                &fixture.args.work_dir,
+                &results,
+                &fixture.args.holdout_claim_put_url,
+                &fixture.args.holdout_claim_readback_url,
+                &fixture.mission,
+            )
+            .unwrap_err();
 
             assert!(format!("{error:#}")
                 .contains("promotable CEX candidates require fee_bps >= 2 and rebate_bps == 0"));
-            let results = fixture.args.work_dir.join("results");
-            assert!(results.join("factor-bank.json").exists());
             assert!(!results.join("final-precommit.json").exists());
             assert!(!results.join("promotion-record.json").exists());
             assert!(!Path::new(&fixture.args.holdout_claim_put_url).exists());
@@ -6024,6 +6042,23 @@ pub(crate) mod tests {
         assert!(results.join("mission-admission.json").exists());
         assert!(!results.join("sealed-evaluations.jsonl").exists());
         assert!(!results.join("mcts-research-receipt.json").exists());
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn direct_execute_does_not_open_sealed_holdout_or_promote() {
+        let fixture = finalizing_fixture("direct-search-only-holdout");
+        execute(fixture.args.clone()).unwrap();
+
+        let results = fixture.args.work_dir.join("results");
+        assert!(results.join("cex-event-replay-receipt.json").exists());
+        assert!(!results.join("final-precommit.json").exists());
+        assert!(!results.join("sealed-holdout-claim.json").exists());
+        assert!(!results.join("sealed-holdout-receipt.json").exists());
+        assert!(!results.join("finalization-report.json").exists());
+        assert!(!results.join("strategy-bundle.json").exists());
+        assert!(!results.join("promotion-record.json").exists());
+        assert!(!Path::new(&fixture.args.holdout_claim_put_url).exists());
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
@@ -6180,6 +6215,16 @@ pub(crate) mod tests {
         execute(fixture.args.clone()).unwrap();
 
         let results = fixture.args.work_dir.join("results");
+        assert!(!results.join("final-precommit.json").exists());
+        assert!(!Path::new(&fixture.args.holdout_claim_put_url).exists());
+        finalize_existing_search_round(
+            &fixture.args.work_dir,
+            &results,
+            &fixture.args.holdout_claim_put_url,
+            &fixture.args.holdout_claim_readback_url,
+            &fixture.mission,
+        )
+        .unwrap();
         let ridge: serde_json::Value =
             serde_json::from_slice(&std::fs::read(results.join("ridge-baseline.json")).unwrap())
                 .unwrap();
@@ -6743,18 +6788,24 @@ pub(crate) mod tests {
         });
         std::fs::write(&fixture.args.holdout_claim_put_url, b"already-claimed").unwrap();
 
-        let error = execute(fixture.args.clone()).unwrap_err();
+        execute(fixture.args.clone()).unwrap();
+        let results = fixture.args.work_dir.join("results");
+        assert!(results.join("factor-bank.json").exists());
+        assert!(!results.join("sealed-holdout-receipt.json").exists());
+        let error = finalize_existing_search_round(
+            &fixture.args.work_dir,
+            &results,
+            &fixture.args.holdout_claim_put_url,
+            &fixture.args.holdout_claim_readback_url,
+            &fixture.mission,
+        )
+        .unwrap_err();
 
         assert!(
             format!("{error:#}").contains("Mission is terminal and inconclusive"),
             "unexpected error: {error:#}"
         );
-        assert!(!fixture.args.work_dir.exists());
-        assert!(!fixture
-            .args
-            .work_dir
-            .join("results/sealed-holdout-receipt.json")
-            .exists());
+        assert!(!results.join("sealed-holdout-receipt.json").exists());
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
@@ -6770,13 +6821,22 @@ pub(crate) mod tests {
         assert_eq!(fixture.args.holdout_claim_put_url, shared_claim);
         std::fs::write(&shared_claim, b"already-claimed").unwrap();
 
-        let error = execute(fixture.args.clone()).unwrap_err();
+        execute(fixture.args.clone()).unwrap();
+        let results = fixture.args.work_dir.join("results");
+        assert!(!results.join("sealed-holdout-receipt.json").exists());
+        let error = finalize_existing_search_round(
+            &fixture.args.work_dir,
+            &results,
+            &fixture.args.holdout_claim_put_url,
+            &fixture.args.holdout_claim_readback_url,
+            &fixture.mission,
+        )
+        .unwrap_err();
 
         assert!(
             format!("{error:#}").contains("Mission is terminal and inconclusive"),
             "unexpected error: {error:#}"
         );
-        assert!(!fixture.args.work_dir.exists());
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
@@ -6800,6 +6860,15 @@ pub(crate) mod tests {
         execute(fixture.args.clone()).unwrap();
 
         let results = fixture.args.work_dir.join("results");
+        assert!(!results.join("final-precommit.json").exists());
+        finalize_existing_search_round(
+            &fixture.args.work_dir,
+            &results,
+            &fixture.args.holdout_claim_put_url,
+            &fixture.args.holdout_claim_readback_url,
+            &fixture.mission,
+        )
+        .unwrap();
         let strategy: CexCombinationResearchArtifactV1 = serde_json::from_slice(
             &std::fs::read(results.join("combination-walk-forward.json")).unwrap(),
         )
@@ -7143,13 +7212,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_ne!(sha256_file(&resume_path).unwrap(), resume_content_sha256);
-        fixture.args.work_dir = fixture.root.join("work-resumed");
-        bind_result_attempt(&mut fixture, "resumed");
-        fixture.args.resume_url = Some(resume_path.to_string_lossy().into_owned());
-        fixture.args.resume_sha256 = Some(resume_content_sha256);
-        let error = execute(fixture.args.clone()).unwrap_err();
-        assert!(format!("{error:#}").contains("Mission is terminal and inconclusive"));
-        assert!(!fixture.args.work_dir.exists());
+        assert!(!Path::new(&fixture.args.holdout_claim_put_url).exists());
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
@@ -8304,6 +8367,7 @@ pub(crate) mod tests {
     fn recovered_finalization_rejects_optimistic_costs() {
         let mut fixture = finalizing_fixture("recover-finalization-cost-gate");
         execute_report(fixture.args.clone(), ExecutionBinding::Direct).unwrap();
+        publish_finalization_into_result_bundle(&fixture);
         let mut archive = ZipArchive::new(File::open(&fixture.result_path).unwrap()).unwrap();
         let report: CexFinalizationReportV1 =
             read_bundle_json(&mut archive, "results/finalization-report.json", 128 * 1024)
@@ -8581,6 +8645,35 @@ pub(crate) mod tests {
             };
         });
         fixture
+    }
+
+    fn publish_finalization_into_result_bundle(fixture: &Fixture) {
+        let results = fixture.args.work_dir.join("results");
+        finalize_existing_search_round(
+            &fixture.args.work_dir,
+            &results,
+            &fixture.args.holdout_claim_put_url,
+            &fixture.args.holdout_claim_readback_url,
+            &fixture.mission,
+        )
+        .unwrap();
+        for name in [
+            "finalization-report.json",
+            "final-precommit.json",
+            "sealed-holdout-claim.json",
+            "sealed-holdout-receipt.json",
+            "strategy-bundle.json",
+            "promotion-record.json",
+        ] {
+            let path = results.join(name);
+            if path.exists() {
+                rewrite_bundle_entry_bytes(
+                    &fixture.result_path,
+                    &format!("results/{name}"),
+                    std::fs::read(path).unwrap(),
+                );
+            }
+        }
     }
 
     fn rewrite_bundle_entry_bytes(bundle_path: &Path, entry_name: &str, replacement: Vec<u8>) {

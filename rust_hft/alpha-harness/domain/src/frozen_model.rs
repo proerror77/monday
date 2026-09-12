@@ -5,6 +5,14 @@ use serde::{Deserialize, Serialize};
 
 pub const FROZEN_SUPERVISED_CANDIDATE_SCHEMA: &str = "monday.frozen_supervised_candidate.v1";
 pub const INDEPENDENT_SELECTION_EVALUATOR_VERSION: &str = "cex-independent-selection-v1";
+pub const FROZEN_FORMULA_SELECTION_PREFIX: &str = "cex-frozen-formula-";
+pub const FROZEN_MODEL_SELECTION_PREFIX: &str = "cex-frozen-model-";
+
+fn valid_frozen_selection_id(id: &str) -> bool {
+    [FROZEN_MODEL_SELECTION_PREFIX, FROZEN_FORMULA_SELECTION_PREFIX]
+        .into_iter()
+        .any(|prefix| id.strip_prefix(prefix).is_some_and(crate::valid_content_sha256))
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -230,15 +238,16 @@ impl ModelSelectionReportV1 {
             ) {
                 (Some(candidate), Some(evaluation), None) => {
                     candidate.validate().map_err(|e| e.to_string())?;
-                    if !candidate
-                        .id
-                        .strip_prefix("cex-frozen-model-")
-                        .is_some_and(crate::valid_content_sha256)
-                    {
-                        return Err("invalid frozen model artifact path identity".into());
+                    if !valid_frozen_selection_id(&candidate.id) {
+                        return Err("invalid frozen selection artifact path identity".into());
                     }
                     evaluation.validate().map_err(|e| e.to_string())?;
-                    if evaluation.evaluator_version != INDEPENDENT_SELECTION_EVALUATOR_VERSION
+                    let formula_walk_forward = candidate
+                        .id
+                        .starts_with(FROZEN_FORMULA_SELECTION_PREFIX)
+                        && evaluation.evaluator_version == crate::WALK_FORWARD_EVALUATOR_VERSION;
+                    if (!formula_walk_forward
+                        && evaluation.evaluator_version != INDEPENDENT_SELECTION_EVALUATOR_VERSION)
                         || evaluation.protocol_binding().map_err(|e| e.to_string())?.1
                             != definition.execution.evaluation_protocol_sha256
                     {
@@ -476,4 +485,26 @@ pub fn final_evaluator_config(
     config.multiple_testing_trials = config.multiple_testing_trials.max(max_candidates as usize);
     config.validate()?;
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frozen_selection_ids_accept_formula_and_model_prefixes() {
+        let hash = "a".repeat(64);
+        assert!(valid_frozen_selection_id(&format!(
+            "{FROZEN_FORMULA_SELECTION_PREFIX}{hash}"
+        )));
+        assert!(valid_frozen_selection_id(&format!(
+            "{FROZEN_MODEL_SELECTION_PREFIX}{hash}"
+        )));
+        assert!(!valid_frozen_selection_id(&format!(
+            "cex-frozen-other-{hash}"
+        )));
+        assert!(!valid_frozen_selection_id(&format!(
+            "{FROZEN_FORMULA_SELECTION_PREFIX}not-a-hash"
+        )));
+    }
 }

@@ -314,17 +314,21 @@ pub(crate) fn is_final_freeze(path: &Path) -> anyhow::Result<bool> {
 
 use alpha_domain::frozen_model::{
     FrozenModelStrategyV1, FrozenSupervisedCandidateV1, ModelFinalPrecommitV1,
-    ModelSelectionEntryV1, ModelSelectionReportV1,
+    ModelSelectionEntryV1, ModelSelectionReportV1, FROZEN_FORMULA_SELECTION_PREFIX,
 };
 use alpha_domain::{
-    CandidateArtifact, CexBaselineArtifactV1, CexBaselineModelKindV1, CexResearchContentRefV1,
-    CexSealedHoldoutClaimV1, EngineKind, IterationVerdict, ResearchIteration,
+    CandidateArtifact, CexBaselineArtifactV1, CexBaselineModelKindV1, CexFinalPrecommitV1,
+    CexResearchContentRefV1, CexSealedHoldoutClaimV1, EngineKind, IterationVerdict,
+    ResearchIteration,
 };
 use alpha_engine::{
+    engines::CexCombinationResearchArtifactV1,
     evaluation::prepare_dataset,
     final_models::{
         evaluate_frozen_holdout, evaluate_frozen_selection, freeze_supervised_candidate,
     },
+    formula_evaluator::FormulaEvaluator,
+    EngineProposal,
 };
 use alpha_store::{
     campaign_ledger::CampaignFinalOutcomeV1, AlphaStore, EvaluationRecord, RegistryRevision,
@@ -355,7 +359,32 @@ pub(crate) struct FinalResult {
     pub elapsed_to_result_seconds: u64,
 }
 
-struct FrozenSource {
+#[derive(Debug)]
+enum WinnerLane {
+    Supervised,
+    Formula,
+}
+
+fn winner_lane(
+    supervised_replay_gate_passed: Option<bool>,
+    replay_gate_passed: Option<bool>,
+) -> anyhow::Result<Option<WinnerLane>> {
+    match (supervised_replay_gate_passed, replay_gate_passed) {
+        (Some(true), Some(true)) => {
+            bail!("round mixed supervised and formula replay evidence")
+        }
+        (Some(true), _) => Ok(Some(WinnerLane::Supervised)),
+        (_, Some(true)) => Ok(Some(WinnerLane::Formula)),
+        _ => Ok(None),
+    }
+}
+
+enum ClosedFamily {
+    Supervised(Vec<SupervisedWinner>),
+    Formula(Vec<FormulaWinner>),
+}
+
+struct SupervisedWinner {
     operation: String,
     result_sha256: String,
     results_dir: PathBuf,
@@ -364,6 +393,52 @@ struct FrozenSource {
     candidate: CexSupervisedModelCandidateV2,
     bank: CexFactorBankRevisionV2,
     baseline: CexBaselineArtifactV1,
+}
+
+struct FormulaWinner {
+    operation: String,
+    result_sha256: String,
+    results_dir: PathBuf,
+    mission: alpha_domain::CexResearchMissionArtifactV1,
+    research_mission: alpha_domain::ResearchMission,
+    strategy: CexCombinationResearchArtifactV1,
+    factor_bank: CexFactorBankRevisionV2,
+}
+
+impl ClosedFamily {
+    fn first_mission(&self) -> &alpha_domain::CexResearchMissionArtifactV1 {
+        match self {
+            Self::Supervised(sources) => &sources[0].mission,
+            Self::Formula(sources) => &sources[0].mission,
+        }
+    }
+
+    fn source_identities(&self) -> anyhow::Result<BTreeSet<(String, String, String, String)>> {
+        match self {
+            Self::Supervised(sources) => sources
+                .iter()
+                .map(|source| {
+                    Ok((
+                        source.operation.clone(),
+                        source.result_sha256.clone(),
+                        source.candidate.artifact_id.clone(),
+                        canonical_json_hash(&source.candidate)?,
+                    ))
+                })
+                .collect(),
+            Self::Formula(sources) => sources
+                .iter()
+                .map(|source| {
+                    Ok((
+                        source.operation.clone(),
+                        source.result_sha256.clone(),
+                        source.strategy.artifact_id.clone(),
+                        canonical_json_hash(&source.strategy)?,
+                    ))
+                })
+                .collect(),
+        }
+    }
 }
 
 fn content_ref<T: Serialize>(id: &str, value: &T) -> anyhow::Result<CexResearchContentRefV1> {
@@ -396,8 +471,9 @@ fn collect_sources(
     client: &Client,
     request: &FinalRequest,
     work: &Path,
-) -> anyhow::Result<Vec<FrozenSource>> {
-    let mut candidates = Vec::new();
+) -> anyhow::Result<ClosedFamily> {
+    let mut supervised = Vec::new();
+    let mut formula = Vec::new();
     let mut total_bundle_bytes = 0u64;
     for (source_index, (operation, original)) in request.sources.iter().enumerate() {
         let root = work.join(format!("source-{source_index}"));
@@ -427,62 +503,98 @@ fn collect_sources(
             // The immutable remote digest is recorded above; keep the verified
             // extracted source, not an extra compressed copy on the Job disk.
             std::fs::remove_file(zip)?;
-            if ledger.supervised_replay_gate_passed != Some(true) {
+            let Some(lane) = winner_lane(
+                ledger.supervised_replay_gate_passed,
+                ledger.replay_gate_passed,
+            )?
+            else {
                 continue;
-            }
-            if candidates.len() >= request.grant.grant.max_candidates as usize {
+            };
+            if supervised.len() + formula.len() >= request.grant.grant.max_candidates as usize {
                 bail!("complete final shortlist exceeds signed candidate budget");
             }
             let results_dir = round_dir.join("extracted/results");
             let mission: alpha_domain::CexResearchMissionArtifactV1 =
                 serde_json::from_slice(&std::fs::read(round_dir.join("mission.json"))?)?;
-            let selection: CexSupervisedModelSelectionV1 = serde_json::from_slice(&std::fs::read(
-                results_dir.join("supervised-model-selection.json"),
-            )?)?;
-            let mut selected = None;
-            for name in ["ridge", "cart", "burn_mlp"] {
-                let candidate: CexSupervisedModelCandidateV2 = serde_json::from_slice(
-                    &std::fs::read(results_dir.join(format!("{name}-supervised-candidate.json")))?,
-                )?;
-                if content_ref(&candidate.artifact_id, &candidate)? == selection.selected_candidate
-                {
-                    selected = Some(candidate);
-                }
-            }
-            let candidate = selected.context("final source selected model is missing")?;
-            if !candidate.evaluation.passed
-                || Some(&candidate.artifact_id) != ledger.supervised_candidate_id.as_ref()
-            {
-                bail!("final shortlist differs from passing source evidence");
-            }
-            let bank: CexFactorBankRevisionV2 =
-                serde_json::from_slice(&std::fs::read(results_dir.join("factor-bank.json"))?)?;
-            let baseline_name = match candidate.model_kind {
-                CexBaselineModelKindV1::Ridge => "ridge-baseline.json",
-                CexBaselineModelKindV1::ShallowCart => "cart-baseline.json",
-                CexBaselineModelKindV1::BurnMlp => "burn-mlp-baseline.json",
-            };
-            let baseline: CexBaselineArtifactV1 =
-                serde_json::from_slice(&std::fs::read(results_dir.join(baseline_name))?)?;
-            validate_supervised_candidate_binding(&candidate, &mission, &bank, &baseline)?;
             let research_mission = AlphaStore::open_read_only(results_dir.join("alpha.duckdb"))?
                 .get_mission(&mission.semantic_id()?)?;
-            candidates.push(FrozenSource {
-                operation: operation.clone(),
-                result_sha256: result_sha256.clone(),
-                results_dir,
-                mission,
-                research_mission,
-                candidate,
-                bank,
-                baseline,
-            });
+            match lane {
+                WinnerLane::Supervised => {
+                    let selection: CexSupervisedModelSelectionV1 = serde_json::from_slice(
+                        &std::fs::read(results_dir.join("supervised-model-selection.json"))?,
+                    )?;
+                    let mut selected = None;
+                    for name in ["ridge", "cart", "burn_mlp"] {
+                        let candidate: CexSupervisedModelCandidateV2 =
+                            serde_json::from_slice(&std::fs::read(
+                                results_dir.join(format!("{name}-supervised-candidate.json")),
+                            )?)?;
+                        if content_ref(&candidate.artifact_id, &candidate)?
+                            == selection.selected_candidate
+                        {
+                            selected = Some(candidate);
+                        }
+                    }
+                    let candidate = selected.context("final source selected model is missing")?;
+                    if !candidate.evaluation.passed
+                        || Some(&candidate.artifact_id) != ledger.supervised_candidate_id.as_ref()
+                    {
+                        bail!("final shortlist differs from passing source evidence");
+                    }
+                    let bank: CexFactorBankRevisionV2 = serde_json::from_slice(&std::fs::read(
+                        results_dir.join("factor-bank.json"),
+                    )?)?;
+                    let baseline_name = match candidate.model_kind {
+                        CexBaselineModelKindV1::Ridge => "ridge-baseline.json",
+                        CexBaselineModelKindV1::ShallowCart => "cart-baseline.json",
+                        CexBaselineModelKindV1::BurnMlp => "burn-mlp-baseline.json",
+                    };
+                    let baseline: CexBaselineArtifactV1 =
+                        serde_json::from_slice(&std::fs::read(results_dir.join(baseline_name))?)?;
+                    validate_supervised_candidate_binding(&candidate, &mission, &bank, &baseline)?;
+                    supervised.push(SupervisedWinner {
+                        operation: operation.clone(),
+                        result_sha256: result_sha256.clone(),
+                        results_dir,
+                        mission,
+                        research_mission,
+                        candidate,
+                        bank,
+                        baseline,
+                    });
+                }
+                WinnerLane::Formula => {
+                    if ledger.supervised_candidate_id.is_some() {
+                        bail!("formula shortlist mixed with supervised evidence");
+                    }
+                    let strategy: CexCombinationResearchArtifactV1 = serde_json::from_slice(
+                        &std::fs::read(results_dir.join("combination-walk-forward.json"))?,
+                    )?;
+                    let factor_bank: CexFactorBankRevisionV2 = serde_json::from_slice(
+                        &std::fs::read(results_dir.join("factor-bank.json"))?,
+                    )?;
+                    if Some(&strategy.artifact_id) != ledger.selected_candidate_id.as_ref() {
+                        bail!("final formula shortlist differs from passing source evidence");
+                    }
+                    formula.push(FormulaWinner {
+                        operation: operation.clone(),
+                        result_sha256: result_sha256.clone(),
+                        results_dir,
+                        mission,
+                        research_mission,
+                        strategy,
+                        factor_bank,
+                    });
+                }
+            }
         }
     }
-    if candidates.is_empty() {
-        bail!("closed family has no supervised replay-qualified round winners");
+    match (supervised.is_empty(), formula.is_empty()) {
+        (false, false) => bail!("closed family mixed supervised and formula winners"),
+        (false, true) => Ok(ClosedFamily::Supervised(supervised)),
+        (true, false) => Ok(ClosedFamily::Formula(formula)),
+        (true, true) => bail!("closed family has no replay-qualified round winners"),
     }
-    Ok(candidates)
 }
 
 pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
@@ -571,10 +683,10 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
     )?;
     let materialization =
         crate::mission_runner::decode_materialization(&std::fs::read(&materialization_path)?)?;
-    let sources = collect_sources(&client, &request, &work)?;
-    let mission = &sources[0].mission;
+    let family = collect_sources(&client, &request, &work)?;
+    let mission = family.first_mission().clone();
     crate::mission_runner::validate_mission_materialization_binding(
-        mission,
+        &mission,
         &materialization,
         &first.materialization_sha256,
         &first.feature_sha256,
@@ -595,7 +707,7 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
         &materialization.snapshot,
     )?;
     crate::mission_runner::validate_mission_dataset_binding(
-        mission,
+        &mission,
         &feature_manifest,
         &dataset_manifest,
     )?;
@@ -607,6 +719,140 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
         &mission.spec.evaluation_protocol,
     )?;
     let clocks = data_mission::feature_decision_clocks(&feature_manifest)?;
+    let (selection, evaluated, outcome, precommit_ref, sealed_ref, bundle_ref, promotion_ref) =
+        match family {
+            ClosedFamily::Supervised(sources) => finalize_supervised_family(
+                &grant,
+                &sources,
+                &dataset,
+                &clocks,
+                &results,
+                &materialization,
+                first,
+                &replay_path,
+                &replay_manifest_path,
+                &client,
+                &request,
+            )?,
+            ClosedFamily::Formula(sources) => {
+                finalize_formula_family(&grant, &sources, &dataset, &results, &client, &request)?
+            }
+        };
+    let bundle_path = work.join("final-result.zip");
+    crate::mission_runner::create_bundle(&work, &bundle_path, [&results])?;
+    let bundle_bytes = std::fs::metadata(&bundle_path)?.len();
+    if bundle_bytes > MAX_RESULT_BUNDLE_BYTES {
+        bail!("final result bundle exceeds publication limit");
+    }
+    let bundle_sha256 = crate::mission_runner::sha256_file(&bundle_path)?;
+    let result = FinalResult {
+        schema_version: "monday.campaign_final_result.v1".into(),
+        campaign_id: request.campaign_id.clone(),
+        family_id: grant.grant().family_id.clone(),
+        request_sha256: args.request_sha256,
+        final_grant_sha256: grant.content_sha256().into(),
+        build_source_revision: BUILD_SOURCE_REVISION.into(),
+        image_identity: args.image_identity,
+        outcome,
+        candidates_considered: u32::try_from(selection.entries.len())?,
+        candidates_evaluated: evaluated,
+        selection_report: content_ref(&selection.artifact_id, &selection)?,
+        selected_candidate: selection.selected_candidate.clone(),
+        precommit: precommit_ref,
+        sealed_receipt: sealed_ref,
+        strategy_bundle: bundle_ref,
+        promotion: promotion_ref,
+        bundle_sha256,
+        bundle_bytes,
+        elapsed_to_result_seconds: started.elapsed().as_secs(),
+    };
+    result.validate_identity(&request, &result.request_sha256)?;
+    let result_path = work.join("final-result.json");
+    data_mission::write_json_atomic(&result_path, &result)?;
+    publish_immutable_file(
+        &client,
+        &request.bundle_put_url,
+        &bundle_path,
+        "application/zip",
+    )?;
+    fetch_verified(
+        &client,
+        "final bundle readback",
+        &request.bundle_readback_url,
+        &work.join("final-result-readback.zip"),
+        &result.bundle_sha256,
+        MAX_RESULT_BUNDLE_BYTES,
+    )?;
+    publish_immutable_file(
+        &client,
+        &request.result_put_url,
+        &result_path,
+        "application/json",
+    )?;
+    let result_hash = crate::mission_runner::sha256_file(&result_path)?;
+    fetch_verified(
+        &client,
+        "final result readback",
+        &request.result_readback_url,
+        &work.join("final-result-readback.json"),
+        &result_hash,
+        MAX_CAMPAIGN_RESULT_BYTES,
+    )?;
+    print_json(
+        &serde_json::json!({"campaign_id":request.campaign_id,"family_id":grant.grant().family_id,"outcome":result.outcome,
+        "result_sha256":result_hash,"bundle_sha256":result.bundle_sha256,"candidates_considered":result.candidates_considered,
+        "candidates_evaluated":result.candidates_evaluated,"holdout_opened":result.precommit.is_some(),"promotion":result.promotion}),
+    )
+}
+
+type FamilyOutcome = (
+    ModelSelectionReportV1,
+    u32,
+    CampaignFinalOutcomeV1,
+    Option<CexResearchContentRefV1>,
+    Option<CexResearchContentRefV1>,
+    Option<CexResearchContentRefV1>,
+    Option<CexResearchContentRefV1>,
+);
+
+fn copy_source_store(source_results: &Path, results: &Path) -> anyhow::Result<()> {
+    for name in [
+        "alpha.duckdb",
+        "alpha.duckdb.integrity-key",
+        "alpha.duckdb.wal",
+    ] {
+        let original = source_results.join(name);
+        if original.try_exists()? {
+            std::fs::copy(original, results.join(name))?;
+        }
+    }
+    Ok(())
+}
+
+fn formula_frozen_ref(
+    strategy: &CexCombinationResearchArtifactV1,
+) -> anyhow::Result<CexResearchContentRefV1> {
+    let hash = canonical_json_hash(strategy)?;
+    content_ref(
+        &format!("{FROZEN_FORMULA_SELECTION_PREFIX}{hash}"),
+        strategy,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_supervised_family(
+    grant: &alpha_domain::campaign_finalization::VerifiedCampaignFinalEvaluationGrant,
+    sources: &[SupervisedWinner],
+    dataset: &alpha_engine::evaluation::PreparedDataset,
+    clocks: &[crate::data_mission::FeatureDecisionClock],
+    results: &Path,
+    materialization: &crate::mission_runner::Materialization,
+    first: &CampaignRequest,
+    replay_path: &Path,
+    replay_manifest_path: &Path,
+    client: &Client,
+    request: &FinalRequest,
+) -> anyhow::Result<FamilyOutcome> {
     let mut entries = Vec::new();
     let mut fitted = BTreeMap::new();
     let mut evaluated = 0u32;
@@ -625,7 +871,7 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
             grant.grant().max_candidates,
         )
         .and_then(|frozen| {
-            evaluate_frozen_selection(&frozen, &dataset).map(|report| (frozen, report))
+            evaluate_frozen_selection(&frozen, dataset).map(|report| (frozen, report))
         });
         match attempt {
             Ok((frozen, report)) => {
@@ -664,7 +910,7 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
             }),
         }
     }
-    let selection = ModelSelectionReportV1::new(&grant, entries).map_err(anyhow::Error::msg)?;
+    let selection = ModelSelectionReportV1::new(grant, entries).map_err(anyhow::Error::msg)?;
     data_mission::write_json_atomic(&results.join("independent-selection.json"), &selection)?;
     let mut outcome = CampaignFinalOutcomeV1::NoSelectionCandidate;
     let mut precommit_ref = None;
@@ -681,17 +927,17 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
             &std::fs::read(source.results_dir.join("replay-policy.json"))?,
         )?;
         let replay = crate::mission_runner::run_frozen_model_event_replay(
-            &results,
+            results,
             &source.mission,
-            &materialization,
+            materialization,
             &first.materialization_sha256,
-            &clocks,
+            clocks,
             frozen,
             evaluation,
             &replay_policy,
-            &replay_path,
+            replay_path,
             &first.replay_artifact_sha256,
-            &replay_manifest_path,
+            replay_manifest_path,
             &first.replay_manifest_sha256,
         )?;
         outcome = CampaignFinalOutcomeV1::ReplayRejected;
@@ -701,21 +947,12 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
                 let original = AlphaStore::open_read_only(source.results_dir.join("alpha.duckdb"))?;
                 original.get_mission(&source.mission.semantic_id()?)?;
             }
-            for name in [
-                "alpha.duckdb",
-                "alpha.duckdb.integrity-key",
-                "alpha.duckdb.wal",
-            ] {
-                let original = source.results_dir.join(name);
-                if original.try_exists()? {
-                    std::fs::copy(original, results.join(name))?;
-                }
-            }
+            copy_source_store(&source.results_dir, results)?;
             let mut store = AlphaStore::open(results.join("alpha.duckdb"))?;
             let lineage = store.mission_lineage(&source.mission.semantic_id()?)?;
             let now = Utc::now();
             let (authority_ref, selection_ref) =
-                store.put_model_final_authority(&grant, &selection, now)?;
+                store.put_model_final_authority(grant, &selection, now)?;
             data_mission::write_json_atomic(
                 &results.join("final-authority.json"),
                 &store.get_registry_revision(&authority_ref.id)?,
@@ -813,13 +1050,13 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
             grant.validate_active_at(Utc::now())?;
             let sealed = crate::mission_runner::open_cex_holdout(
                 &mut store,
-                &results,
-                &client,
+                results,
+                client,
                 &claim,
                 &request.holdout_claim_put_url,
                 &request.holdout_claim_readback_url,
                 || {
-                    evaluate_frozen_holdout(frozen, &dataset)
+                    evaluate_frozen_holdout(frozen, dataset)
                         .map(|report| report.evaluation)
                         .map_err(anyhow::Error::msg)
                 },
@@ -827,7 +1064,7 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
             data_mission::write_json_atomic(&results.join("sealed-holdout-receipt.json"), &sealed)?;
             let (bundle_id, promotion_id) = crate::mission_runner::promote_sealed_candidate(
                 &mut store,
-                &results,
+                results,
                 &lineage.mission,
                 &candidate,
                 &candidate_id,
@@ -847,71 +1084,145 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
             }
         }
     }
-    let bundle_path = work.join("final-result.zip");
-    crate::mission_runner::create_bundle(&work, &bundle_path, [&results])?;
-    let bundle_bytes = std::fs::metadata(&bundle_path)?.len();
-    if bundle_bytes > MAX_RESULT_BUNDLE_BYTES {
-        bail!("final result bundle exceeds publication limit");
-    }
-    let bundle_sha256 = crate::mission_runner::sha256_file(&bundle_path)?;
-    let result = FinalResult {
-        schema_version: "monday.campaign_final_result.v1".into(),
-        campaign_id: request.campaign_id.clone(),
-        family_id: grant.grant().family_id.clone(),
-        request_sha256: args.request_sha256,
-        final_grant_sha256: grant.content_sha256().into(),
-        build_source_revision: BUILD_SOURCE_REVISION.into(),
-        image_identity: args.image_identity,
+    Ok((
+        selection,
+        evaluated,
         outcome,
-        candidates_considered: u32::try_from(selection.entries.len())?,
-        candidates_evaluated: evaluated,
-        selection_report: content_ref(&selection.artifact_id, &selection)?,
-        selected_candidate: selection.selected_candidate.clone(),
-        precommit: precommit_ref,
-        sealed_receipt: sealed_ref,
-        strategy_bundle: bundle_ref,
-        promotion: promotion_ref,
-        bundle_sha256,
-        bundle_bytes,
-        elapsed_to_result_seconds: started.elapsed().as_secs(),
-    };
-    result.validate_identity(&request, &result.request_sha256)?;
-    let result_path = work.join("final-result.json");
-    data_mission::write_json_atomic(&result_path, &result)?;
-    publish_immutable_file(
-        &client,
-        &request.bundle_put_url,
-        &bundle_path,
-        "application/zip",
-    )?;
-    fetch_verified(
-        &client,
-        "final bundle readback",
-        &request.bundle_readback_url,
-        &work.join("final-result-readback.zip"),
-        &result.bundle_sha256,
-        MAX_RESULT_BUNDLE_BYTES,
-    )?;
-    publish_immutable_file(
-        &client,
-        &request.result_put_url,
-        &result_path,
-        "application/json",
-    )?;
-    let result_hash = crate::mission_runner::sha256_file(&result_path)?;
-    fetch_verified(
-        &client,
-        "final result readback",
-        &request.result_readback_url,
-        &work.join("final-result-readback.json"),
-        &result_hash,
-        MAX_CAMPAIGN_RESULT_BYTES,
-    )?;
-    print_json(
-        &serde_json::json!({"campaign_id":request.campaign_id,"family_id":grant.grant().family_id,"outcome":result.outcome,
-        "result_sha256":result_hash,"bundle_sha256":result.bundle_sha256,"candidates_considered":result.candidates_considered,
-        "candidates_evaluated":result.candidates_evaluated,"holdout_opened":result.precommit.is_some(),"promotion":result.promotion}),
-    )
+        precommit_ref,
+        sealed_ref,
+        bundle_ref,
+        promotion_ref,
+    ))
+}
+
+fn finalize_formula_family(
+    grant: &alpha_domain::campaign_finalization::VerifiedCampaignFinalEvaluationGrant,
+    sources: &[FormulaWinner],
+    dataset: &alpha_engine::evaluation::PreparedDataset,
+    results: &Path,
+    client: &Client,
+    request: &FinalRequest,
+) -> anyhow::Result<FamilyOutcome> {
+    let mut entries = Vec::new();
+    let mut fitted = BTreeMap::new();
+    let mut evaluated = 0u32;
+    for (index, source) in sources.iter().enumerate() {
+        grant.validate_active_at(Utc::now())?;
+        let source_ref = content_ref(&source.strategy.artifact_id, &source.strategy)?;
+        let frozen_ref = formula_frozen_ref(&source.strategy)?;
+        let attempt = source
+            .strategy
+            .executable_formula(&source.factor_bank)
+            .and_then(|ast| {
+                FormulaEvaluator::for_mission(&source.research_mission).and_then(|evaluator| {
+                    evaluator.evaluate_independent_selection(
+                        &EngineProposal {
+                            candidate_id: source.strategy.artifact_id.clone(),
+                            hypothesis: format!(
+                                "independent formula selection of {}",
+                                source.strategy.artifact_id
+                            ),
+                            artifact: CandidateArtifact::Formula(ast),
+                            expansions: 0,
+                            tokens: 0,
+                            elapsed_ms: 0,
+                        },
+                        dataset,
+                    )
+                })
+            });
+        match attempt {
+            Ok(report) => {
+                evaluated += 1;
+                data_mission::write_json_atomic(
+                    &results.join(format!("{}-model.json", frozen_ref.id)),
+                    &source.strategy,
+                )?;
+                data_mission::write_json_atomic(
+                    &results.join(format!("{}-selection.json", frozen_ref.id)),
+                    &report,
+                )?;
+                entries.push(ModelSelectionEntryV1 {
+                    source_operation_id: source.operation.clone(),
+                    source_result_sha256: source.result_sha256.clone(),
+                    source_candidate: source_ref,
+                    frozen_candidate: Some(frozen_ref.clone()),
+                    evaluation: Some(report.evaluation.clone()),
+                    rejection_reason: None,
+                });
+                if fitted.insert(frozen_ref.id.clone(), index).is_some() {
+                    bail!("duplicate frozen formula identity");
+                }
+            }
+            Err(reason) => entries.push(ModelSelectionEntryV1 {
+                source_operation_id: source.operation.clone(),
+                source_result_sha256: source.result_sha256.clone(),
+                source_candidate: source_ref,
+                frozen_candidate: None,
+                evaluation: None,
+                rejection_reason: Some(reason),
+            }),
+        }
+    }
+    let selection = ModelSelectionReportV1::new(grant, entries).map_err(anyhow::Error::msg)?;
+    data_mission::write_json_atomic(&results.join("independent-selection.json"), &selection)?;
+    let mut outcome = CampaignFinalOutcomeV1::NoSelectionCandidate;
+    let mut precommit_ref = None;
+    let mut sealed_ref = None;
+    let mut bundle_ref = None;
+    let mut promotion_ref = None;
+    if let Some(selected) = &selection.selected_candidate {
+        let index = fitted
+            .get(&selected.id)
+            .context("selected formula is missing")?;
+        let source = &sources[*index];
+        grant.validate_active_at(Utc::now())?;
+        {
+            let original = AlphaStore::open_read_only(source.results_dir.join("alpha.duckdb"))?;
+            original.get_mission(&source.mission.semantic_id()?)?;
+        }
+        copy_source_store(&source.results_dir, results)?;
+        let mut store = AlphaStore::open(results.join("alpha.duckdb"))?;
+        let report = crate::mission_runner::finalize_formula_search_round(
+            &source.results_dir,
+            results,
+            client,
+            &request.holdout_claim_put_url,
+            &request.holdout_claim_readback_url,
+            &source.mission,
+            &mut store,
+            dataset,
+        )?;
+        let replay_src = source.results_dir.join("cex-event-replay-receipt.json");
+        if replay_src.try_exists()? {
+            std::fs::copy(&replay_src, results.join("cex-event-replay-receipt.json"))?;
+        }
+        let precommit: CexFinalPrecommitV1 =
+            serde_json::from_slice(&std::fs::read(results.join("final-precommit.json"))?)?;
+        let sealed: RegistryRevision =
+            serde_json::from_slice(&std::fs::read(results.join("sealed-holdout-receipt.json"))?)?;
+        precommit_ref = Some(content_ref(&precommit.precommit_id, &precommit)?);
+        sealed_ref = Some(content_ref(&sealed.revision_id, &sealed)?);
+        outcome = CampaignFinalOutcomeV1::HoldoutRejected;
+        if let (Some(bundle_id), Some(promotion_id)) =
+            (report.strategy_bundle_id, report.promotion_id)
+        {
+            let bundle = store.get_strategy_bundle(&bundle_id)?;
+            let promotion = store.get_promotion(&promotion_id)?;
+            bundle_ref = Some(content_ref(&bundle_id, &bundle)?);
+            promotion_ref = Some(content_ref(&promotion_id, &promotion.record)?);
+            outcome = CampaignFinalOutcomeV1::PromotionReady;
+        }
+    }
+    Ok((
+        selection,
+        evaluated,
+        outcome,
+        precommit_ref,
+        sealed_ref,
+        bundle_ref,
+        promotion_ref,
+    ))
 }
 
 impl FinalResult {
@@ -1036,17 +1347,7 @@ pub(crate) fn readback_terminal(
     let source_root = root.path().join("sources");
     std::fs::create_dir(&source_root)?;
     let sources = collect_sources(client, request, &source_root)?;
-    let expected: BTreeSet<_> = sources
-        .iter()
-        .map(|source| {
-            Ok((
-                source.operation.clone(),
-                source.result_sha256.clone(),
-                source.candidate.artifact_id.clone(),
-                canonical_json_hash(&source.candidate)?,
-            ))
-        })
-        .collect::<anyhow::Result<_>>()?;
+    let expected = sources.source_identities()?;
     let observed: BTreeSet<_> = selection
         .entries
         .iter()
@@ -1062,113 +1363,212 @@ pub(crate) fn readback_terminal(
     if expected != observed {
         bail!("final selection omitted or added a replay-qualified source winner");
     }
-    for entry in &selection.entries {
-        if let Some(reference) = &entry.frozen_candidate {
-            let source = sources
-                .iter()
-                .find(|source| {
-                    source.operation == entry.source_operation_id
-                        && source.candidate.artifact_id == entry.source_candidate.id
-                })
-                .context("final source missing")?;
-            let frozen: FrozenSupervisedCandidateV1 = serde_json::from_slice(&std::fs::read(
-                results.join(format!("{}-model.json", reference.id)),
-            )?)?;
-            frozen
-                .validate_against_protocol(&source.mission.spec.evaluation_protocol)
-                .map_err(anyhow::Error::msg)?;
-            frozen
-                .validate_fitted_origin(&source.baseline, &source.bank)
-                .map_err(anyhow::Error::msg)?;
-            if content_ref(&frozen.artifact_id, &frozen)? != *reference
-                || frozen.source_candidate != entry.source_candidate
-                || frozen.program.decision_policy != source.candidate.decision_policy
-                || frozen.evaluator_config
-                    != alpha_domain::frozen_model::final_evaluator_config(
-                        &source.research_mission,
-                        grant.grant().max_candidates,
-                    )?
-            {
-                bail!("final frozen model source changed");
+    match &sources {
+        ClosedFamily::Supervised(sources) => {
+            for entry in &selection.entries {
+                if let Some(reference) = &entry.frozen_candidate {
+                    let source = sources
+                        .iter()
+                        .find(|source| {
+                            source.operation == entry.source_operation_id
+                                && source.candidate.artifact_id == entry.source_candidate.id
+                        })
+                        .context("final source missing")?;
+                    let frozen: FrozenSupervisedCandidateV1 = serde_json::from_slice(
+                        &std::fs::read(results.join(format!("{}-model.json", reference.id)))?,
+                    )?;
+                    frozen
+                        .validate_against_protocol(&source.mission.spec.evaluation_protocol)
+                        .map_err(anyhow::Error::msg)?;
+                    frozen
+                        .validate_fitted_origin(&source.baseline, &source.bank)
+                        .map_err(anyhow::Error::msg)?;
+                    if content_ref(&frozen.artifact_id, &frozen)? != *reference
+                        || frozen.source_candidate != entry.source_candidate
+                        || frozen.program.decision_policy != source.candidate.decision_policy
+                        || frozen.evaluator_config
+                            != alpha_domain::frozen_model::final_evaluator_config(
+                                &source.research_mission,
+                                grant.grant().max_candidates,
+                            )?
+                    {
+                        bail!("final frozen model source changed");
+                    }
+                    let report: alpha_engine::formula_evaluator::PositionEvaluationReport =
+                        serde_json::from_slice(&std::fs::read(
+                            results.join(format!("{}-selection.json", reference.id)),
+                        )?)?;
+                    if Some(&report.evaluation) != entry.evaluation.as_ref()
+                        || report.ledger.len() != report.evaluation.metrics.row_count
+                    {
+                        bail!("final selection ledger differs from evaluation");
+                    }
+                }
             }
-            let report: alpha_engine::formula_evaluator::PositionEvaluationReport =
-                serde_json::from_slice(&std::fs::read(
-                    results.join(format!("{}-selection.json", reference.id)),
+            if let Some(selected) = &result.selected_candidate {
+                let replay: CexEventReplayReceiptV1 = serde_json::from_slice(&std::fs::read(
+                    results.join("frozen-model-event-replay-receipt.json"),
                 )?)?;
-            if Some(&report.evaluation) != entry.evaluation.as_ref()
-                || report.ledger.len() != report.evaluation.metrics.row_count
-            {
-                bail!("final selection ledger differs from evaluation");
+                replay.validate()?;
+                if replay.strategy != *selected
+                    || replay.gate.passed
+                        == (result.outcome == CampaignFinalOutcomeV1::ReplayRejected)
+                {
+                    bail!("frozen replay candidate or gate differs from result");
+                }
+            }
+            if let Some(precommit_reference) = &result.precommit {
+                let store = AlphaStore::open_read_only(results.join("alpha.duckdb"))?;
+                let evidence = store.read_model_finalization_evidence(&precommit_reference.id)?;
+                let file_precommit: ModelFinalPrecommitV1 =
+                    serde_json::from_slice(&std::fs::read(results.join("final-precommit.json"))?)?;
+                if evidence.precommit != file_precommit
+                    || evidence.precommit.content_reference()? != *precommit_reference
+                    || evidence.precommit.frozen_candidate
+                        != *result.selected_candidate.as_ref().unwrap()
+                    || evidence.precommit.family_id != result.family_id
+                    || evidence.precommit.selection_report != result.selection_report
+                    || Some(content_ref(&evidence.sealed.revision_id, &evidence.sealed)?)
+                        != result.sealed_receipt
+                {
+                    bail!("model finalization database and published files differ");
+                }
+                readback_holdout_and_promotion(
+                    client,
+                    request,
+                    root.path(),
+                    &results,
+                    &result,
+                    &store,
+                    &evidence.claim,
+                    &evidence.sealed,
+                    &evidence.precommit.final_candidate.id,
+                )?;
             }
         }
-    }
-    if let Some(selected) = &result.selected_candidate {
-        let replay: CexEventReplayReceiptV1 = serde_json::from_slice(&std::fs::read(
-            results.join("frozen-model-event-replay-receipt.json"),
-        )?)?;
-        replay.validate()?;
-        if replay.strategy != *selected
-            || replay.gate.passed == (result.outcome == CampaignFinalOutcomeV1::ReplayRejected)
-        {
-            bail!("frozen replay candidate or gate differs from result");
-        }
-    }
-    if let Some(precommit_reference) = &result.precommit {
-        let store = AlphaStore::open_read_only(results.join("alpha.duckdb"))?;
-        let evidence = store.read_model_finalization_evidence(&precommit_reference.id)?;
-        let file_precommit: ModelFinalPrecommitV1 =
-            serde_json::from_slice(&std::fs::read(results.join("final-precommit.json"))?)?;
-        if evidence.precommit != file_precommit
-            || evidence.precommit.content_reference()? != *precommit_reference
-            || evidence.precommit.frozen_candidate != *result.selected_candidate.as_ref().unwrap()
-            || evidence.precommit.family_id != result.family_id
-            || evidence.precommit.selection_report != result.selection_report
-            || Some(content_ref(&evidence.sealed.revision_id, &evidence.sealed)?)
-                != result.sealed_receipt
-        {
-            bail!("model finalization database and published files differ");
-        }
-        let global = root.path().join("global-claim.json");
-        fetch_verified(
-            client,
-            "global holdout claim",
-            &request.holdout_claim_readback_url,
-            &global,
-            &crate::mission_runner::sha256_file(&results.join("sealed-holdout-claim.json"))?,
-            64 * 1024,
-        )
-        .map_err(terminal_readback_error)?;
-        let claim: CexSealedHoldoutClaimV1 = serde_json::from_slice(&std::fs::read(global)?)?;
-        if claim != evidence.claim {
-            bail!("global holdout claim differs from finalization evidence");
-        }
-        let sealed: CandidateEvaluation =
-            serde_json::from_value(evidence.sealed.payload["evaluation"].clone())?;
-        if sealed.passed != (result.outcome == CampaignFinalOutcomeV1::PromotionReady) {
-            bail!("sealed verdict differs from final outcome");
-        }
-        if let (Some(bundle_ref), Some(promotion_ref)) =
-            (&result.strategy_bundle, &result.promotion)
-        {
-            let bundle = store.get_strategy_bundle(&bundle_ref.id)?;
-            let promotion = store.get_promotion(&promotion_ref.id)?;
-            if content_ref(&bundle.bundle_id, &bundle)? != *bundle_ref
-                || content_ref(&promotion.record.promotion_id, &promotion.record)? != *promotion_ref
-                || promotion.record.bundle_hash != bundle.bundle_hash
-                || promotion.record.candidate_id != evidence.precommit.final_candidate.id
-            {
-                bail!("final promotion identities differ");
+        ClosedFamily::Formula(sources) => {
+            for entry in &selection.entries {
+                if let Some(reference) = &entry.frozen_candidate {
+                    let source = sources
+                        .iter()
+                        .find(|source| {
+                            source.operation == entry.source_operation_id
+                                && source.strategy.artifact_id == entry.source_candidate.id
+                        })
+                        .context("final source missing")?;
+                    let strategy: CexCombinationResearchArtifactV1 = serde_json::from_slice(
+                        &std::fs::read(results.join(format!("{}-model.json", reference.id)))?,
+                    )?;
+                    if formula_frozen_ref(&strategy)? != *reference
+                        || content_ref(&strategy.artifact_id, &strategy)? != entry.source_candidate
+                        || strategy.artifact_id != source.strategy.artifact_id
+                    {
+                        bail!("final frozen formula source changed");
+                    }
+                    let report: alpha_engine::formula_evaluator::PositionEvaluationReport =
+                        serde_json::from_slice(&std::fs::read(
+                            results.join(format!("{}-selection.json", reference.id)),
+                        )?)?;
+                    if Some(&report.evaluation) != entry.evaluation.as_ref()
+                        || report.ledger.len() != report.evaluation.metrics.row_count
+                    {
+                        bail!("final selection ledger differs from evaluation");
+                    }
+                }
             }
-            let bundle_file: alpha_domain::StrategyBundle =
-                serde_json::from_slice(&std::fs::read(results.join("strategy-bundle.json"))?)?;
-            let promotion_file: alpha_domain::PromotionRecord =
-                serde_json::from_slice(&std::fs::read(results.join("promotion-record.json"))?)?;
-            if bundle != bundle_file || promotion.record != promotion_file {
-                bail!("final promotion files differ from authenticated database");
+            if result.selected_candidate.is_some() {
+                let replay: CexEventReplayReceiptV1 = serde_json::from_slice(&std::fs::read(
+                    results.join("cex-event-replay-receipt.json"),
+                )?)?;
+                replay.validate()?;
+                if !replay.gate.passed || result.outcome == CampaignFinalOutcomeV1::ReplayRejected {
+                    bail!("formula replay candidate or gate differs from result");
+                }
+            }
+            if let Some(precommit_reference) = &result.precommit {
+                let store = AlphaStore::open_read_only(results.join("alpha.duckdb"))?;
+                let file_precommit: CexFinalPrecommitV1 =
+                    serde_json::from_slice(&std::fs::read(results.join("final-precommit.json"))?)?;
+                let stored = store.get_registry_revision(&file_precommit.precommit_id)?;
+                let stored_precommit: CexFinalPrecommitV1 = serde_json::from_value(stored.payload)?;
+                let sealed: RegistryRevision = serde_json::from_slice(&std::fs::read(
+                    results.join("sealed-holdout-receipt.json"),
+                )?)?;
+                if stored_precommit != file_precommit
+                    || content_ref(&file_precommit.precommit_id, &file_precommit)?
+                        != *precommit_reference
+                    || Some(content_ref(&sealed.revision_id, &sealed)?) != result.sealed_receipt
+                {
+                    bail!("formula finalization database and published files differ");
+                }
+                let claim = CexSealedHoldoutClaimV1::from_precommit(&file_precommit)?;
+                readback_holdout_and_promotion(
+                    client,
+                    request,
+                    root.path(),
+                    &results,
+                    &result,
+                    &store,
+                    &claim,
+                    &sealed,
+                    &file_precommit.final_candidate.id,
+                )?;
             }
         }
     }
     Ok((result, result_sha256))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn readback_holdout_and_promotion(
+    client: &Client,
+    request: &FinalRequest,
+    root: &Path,
+    results: &Path,
+    result: &FinalResult,
+    store: &AlphaStore,
+    claim: &CexSealedHoldoutClaimV1,
+    sealed_revision: &RegistryRevision,
+    final_candidate_id: &str,
+) -> anyhow::Result<()> {
+    let global = root.join("global-claim.json");
+    fetch_verified(
+        client,
+        "global holdout claim",
+        &request.holdout_claim_readback_url,
+        &global,
+        &crate::mission_runner::sha256_file(&results.join("sealed-holdout-claim.json"))?,
+        64 * 1024,
+    )
+    .map_err(terminal_readback_error)?;
+    let published: CexSealedHoldoutClaimV1 = serde_json::from_slice(&std::fs::read(global)?)?;
+    if published != *claim {
+        bail!("global holdout claim differs from finalization evidence");
+    }
+    let sealed: CandidateEvaluation =
+        serde_json::from_value(sealed_revision.payload["evaluation"].clone())?;
+    if sealed.passed != (result.outcome == CampaignFinalOutcomeV1::PromotionReady) {
+        bail!("sealed verdict differs from final outcome");
+    }
+    if let (Some(bundle_ref), Some(promotion_ref)) = (&result.strategy_bundle, &result.promotion) {
+        let bundle = store.get_strategy_bundle(&bundle_ref.id)?;
+        let promotion = store.get_promotion(&promotion_ref.id)?;
+        if content_ref(&bundle.bundle_id, &bundle)? != *bundle_ref
+            || content_ref(&promotion.record.promotion_id, &promotion.record)? != *promotion_ref
+            || promotion.record.bundle_hash != bundle.bundle_hash
+            || promotion.record.candidate_id != final_candidate_id
+        {
+            bail!("final promotion identities differ");
+        }
+        let bundle_file: alpha_domain::StrategyBundle =
+            serde_json::from_slice(&std::fs::read(results.join("strategy-bundle.json"))?)?;
+        let promotion_file: alpha_domain::PromotionRecord =
+            serde_json::from_slice(&std::fs::read(results.join("promotion-record.json"))?)?;
+        if bundle != bundle_file || promotion.record != promotion_file {
+            bail!("final promotion files differ from authenticated database");
+        }
+    }
+    Ok(())
 }
 
 fn canonical_final_object(label: &str, value: &str) -> anyhow::Result<String> {
@@ -1229,6 +1629,24 @@ mod tests {
         };
         FinalRequest::new(sign_campaign_final_evaluation_grant(grant,"test-key".into(),&key).unwrap(), BTreeMap::from([(operation,source)]),
             "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/final-tests".into()).unwrap()
+    }
+
+    #[test]
+    fn winner_lane_admits_formula_and_supervised_replay_and_rejects_mixed_evidence() {
+        assert!(matches!(
+            winner_lane(Some(true), None).unwrap(),
+            Some(WinnerLane::Supervised)
+        ));
+        assert!(matches!(
+            winner_lane(None, Some(true)).unwrap(),
+            Some(WinnerLane::Formula)
+        ));
+        assert!(winner_lane(Some(false), Some(false)).unwrap().is_none());
+        assert!(winner_lane(None, None).unwrap().is_none());
+        assert!(winner_lane(Some(true), Some(true))
+            .unwrap_err()
+            .to_string()
+            .contains("mixed supervised and formula"));
     }
 
     #[test]
