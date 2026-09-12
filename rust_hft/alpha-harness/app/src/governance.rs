@@ -442,10 +442,6 @@ pub(crate) fn execute_evaluate(args: EvaluateArgs) -> anyhow::Result<RegistryRev
     };
 
     if let Some(existing) = existing {
-        store.require_mission_evaluation_protocol(
-            &lineage.mission.mission_id,
-            &requested_protocol,
-        )?;
         let existing_evaluation: CandidateEvaluation = serde_json::from_value(
             existing
                 .payload
@@ -494,6 +490,10 @@ pub(crate) fn execute_evaluate(args: EvaluateArgs) -> anyhow::Result<RegistryRev
         {
             bail!("existing sealed evaluation is not canonical evidence for this protocol");
         }
+        store.require_mission_evaluation_protocol(
+            &lineage.mission.mission_id,
+            &requested_protocol,
+        )?;
         return Ok(existing);
     }
 
