@@ -209,6 +209,7 @@ fn bound_baseline_policy(
     } else {
         CexBaselinePolicyV1::controlled_v1(binding.id.clone())?
     };
+    let policy = policy.with_mlp_training(mission.spec.mlp_training.clone())?;
     policy
         .validate_binding(binding)
         .map_err(anyhow::Error::msg)?;
@@ -9133,6 +9134,7 @@ message binance_replay {
                 }],
                 feature_fields,
                 research_delta: None,
+                mlp_training: None,
                 search,
                 evaluation_protocol,
                 holdout: CexResearchHoldoutV1 {

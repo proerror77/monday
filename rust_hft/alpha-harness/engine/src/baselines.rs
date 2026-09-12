@@ -5,14 +5,15 @@ use crate::{
 use alpha_domain::{
     canonical_json_hash, CexBaselineArtifactV1, CexBaselineCartNodeV1, CexBaselineFoldV1,
     CexBaselineGateV1, CexBaselineModelKindV1, CexBaselineModelV1, CexBaselinePolicyV1,
-    CexBaselineRangeV1, CexFactorBankRevisionV2, CexFactorOrientationV1, CexResearchContentRefV1,
-    CexResearchHypothesisTargetV1, EvaluationLabelSpecV1,
-    CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION,
+    CexBaselineRangeV1, CexFactorBankRevisionV2, CexFactorOrientationV1, CexMlpFoldObservationV1,
+    CexMlpTrainingProfileV1, CexResearchContentRefV1, CexResearchHypothesisTargetV1,
+    EvaluationLabelSpecV1, CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION,
 };
 use hft_research_ml::{
     train_contract_model, ContractDatasetBinding, ContractTrainingConfig, ContractTrainingRow,
-    FeatureName, PositiveDurationMs, PurgedWalkForwardSplit, SealedTrainingRequest, Sha256Digest,
-    SplitId, SplitRole, Symbol, TimestampMs, TrainingRequest, Venue,
+    FeatureName, MlpPredictionDiagnosticsV1, MlpTargetScaleV1, PositiveDurationMs,
+    PurgedWalkForwardSplit, SealedTrainingRequest, Sha256Digest, SplitId, SplitRole, Symbol,
+    TimestampMs, TrainingRequest, Venue,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -38,6 +39,7 @@ pub struct CexBurnFitIdentity<'a> {
     pub venue: &'a str,
 }
 
+#[derive(Clone, Copy)]
 struct CexBurnFoldFit<'a> {
     rows: &'a [ResearchRow],
     features: &'a [Vec<f64>],
@@ -49,6 +51,15 @@ struct CexBurnFoldFit<'a> {
     horizon: &'a EvaluationLabelSpecV1,
     evaluation_policy_sha256: &'a str,
     dataset_sha256: &'a str,
+    profile: Option<&'a CexMlpTrainingProfileV1>,
+    purpose: &'static str,
+}
+
+#[derive(Debug)]
+struct CexBurnFoldOutput {
+    model: CexBaselineModelV1,
+    predictions: Vec<f64>,
+    observation: CexMlpFoldObservationV1,
 }
 
 pub use hft_research_manifest::model::{
@@ -101,6 +112,9 @@ pub fn verify_cex_baseline_artifact(
     factor_bank
         .validate()
         .map_err(|error| format!("factor bank validation failed: {error}"))?;
+    if let Some(profile) = &artifact.baseline_policy.mlp_training {
+        profile.validate_factor_bank(factor_bank)?;
+    }
     if artifact.factor_bank_revision_id != factor_bank.revision_id
         || artifact.research_dataset != factor_bank.research_dataset
         || artifact.evaluation_policy != factor_bank.evaluation_policy
@@ -190,7 +204,7 @@ pub fn verify_cex_baseline_artifact(
                 );
             }
             CexBaselineModelV1::BurnMlpPortable { symbol, venue, .. } => {
-                let (refit_model, predictions) = fit_burn_fold(CexBurnFoldFit {
+                let refit = fit_burn_fold(CexBurnFoldFit {
                     rows: context.rows(),
                     features: &features,
                     fold: context_fold,
@@ -201,14 +215,22 @@ pub fn verify_cex_baseline_artifact(
                     horizon: &artifact.target.horizon,
                     evaluation_policy_sha256: &artifact.evaluation_policy.content_sha256,
                     dataset_sha256: &factor_bank.research_dataset.content_sha256,
+                    profile: artifact.baseline_policy.mlp_training.as_ref(),
+                    purpose: "verification",
                 })?;
-                if refit_model != fold.model {
+                if refit.model != fold.model
+                    || fold
+                        .mlp_observation
+                        .as_ref()
+                        .map(|value| &value.validation_prediction)
+                        != Some(&refit.observation.validation_prediction)
+                {
                     return Err(format!(
                         "baseline fold {} Burn MLP model drifted",
                         fold_index + 1
                     ));
                 }
-                predictions
+                refit.predictions
             }
         };
         if !predictions_equal(&predictions, &fold.predictions) {
@@ -261,6 +283,19 @@ pub fn evaluate_cex_baselines(
         return Err("baseline evaluation policy does not match the Factor Bank".to_string());
     }
     validate_context_identity(context, factor_bank, evaluation_policy, &target)?;
+    if let Some(profile) = &policy.mlp_training {
+        profile.validate_factor_bank(factor_bank)?;
+        let mut ids: Vec<_> = factor_bank
+            .entries
+            .iter()
+            .map(|entry| entry.factor_id.clone())
+            .collect();
+        ids.sort();
+        profile.validate_inputs(context.folds().len(), &ids)?;
+        if burn.is_none() {
+            return Err("a bound MLP training profile requires the supervised MLP lane".into());
+        }
+    }
     if factor_bank.entries.is_empty() {
         let gate = CexBaselineGateV1::empty_factor_bank(mission_id, policy, factor_bank)
             .map_err(|error| format!("empty Factor Bank gate failed: {error}"))?;
@@ -616,11 +651,14 @@ fn fit_artifact(
     features: &[Vec<f64>],
     kind: BaselineKind<'_>,
 ) -> Result<CexBaselineArtifactV1, String> {
+    if let Some(profile) = &policy.mlp_training {
+        profile.validate_inputs(context.folds().len(), &factor_ids)?;
+    }
     let evaluator = FormulaEvaluator::new(policy.evaluator_config.clone())?;
     let mut folds = Vec::with_capacity(context.folds().len());
     let mut signals = vec![0.0; context.rows().len()];
     for (fold_index, fold) in context.folds().iter().enumerate() {
-        let (model, predictions) = match kind {
+        let (model, predictions, mlp_observation) = match kind {
             BaselineKind::Ridge => {
                 let labels = labels(context.rows());
                 let fit = fit_ridge(features, &labels, fold.train.clone(), policy.ridge_l2)?;
@@ -633,6 +671,7 @@ fn fit_artifact(
                         coefficients: fit.coefficients,
                     },
                     predictions,
+                    None,
                 )
             }
             BaselineKind::ShallowCart => {
@@ -646,36 +685,45 @@ fn fit_artifact(
                     &factor_ids,
                 )?;
                 let predictions = predict_fold_cart(&tree, features, &fold.validation)?;
-                (CexBaselineModelV1::ShallowCart { root: tree }, predictions)
+                (
+                    CexBaselineModelV1::ShallowCart { root: tree },
+                    predictions,
+                    None,
+                )
             }
-            BaselineKind::BurnMlp { identity } => fit_burn_fold(CexBurnFoldFit {
-                rows: context.rows(),
-                features,
-                fold,
-                fold_index: fold_index + 1,
-                mission_id,
-                identity,
-                factor_ids: &factor_ids,
-                horizon: &target.horizon,
-                evaluation_policy_sha256: &evaluation_policy.content_sha256,
-                dataset_sha256: &factor_bank.research_dataset.content_sha256,
-            })?,
+            BaselineKind::BurnMlp { identity } => {
+                let result = fit_burn_fold(CexBurnFoldFit {
+                    rows: context.rows(),
+                    features,
+                    fold,
+                    fold_index: fold_index + 1,
+                    mission_id,
+                    identity,
+                    factor_ids: &factor_ids,
+                    horizon: &target.horizon,
+                    evaluation_policy_sha256: &evaluation_policy.content_sha256,
+                    dataset_sha256: &factor_bank.research_dataset.content_sha256,
+                    profile: policy.mlp_training.as_ref(),
+                    purpose: "training",
+                })?;
+                (result.model, result.predictions, Some(result.observation))
+            }
         };
         for (index, prediction) in fold.validation.clone().zip(&predictions) {
             signals[index] = *prediction;
         }
-        folds.push(
-            CexBaselineFoldV1::new(
-                fold_index + 1,
-                range(&fold.train),
-                range(&fold.purge),
-                range(&fold.validation),
-                range(&fold.embargo),
-                predictions,
-                model,
-            )
-            .map_err(|error| format!("baseline fold validation failed: {error}"))?,
-        );
+        let mut recorded_fold = CexBaselineFoldV1::new(
+            fold_index + 1,
+            range(&fold.train),
+            range(&fold.purge),
+            range(&fold.validation),
+            range(&fold.embargo),
+            predictions,
+            model,
+        )
+        .map_err(|error| format!("baseline fold validation failed: {error}"))?;
+        recorded_fold.mlp_observation = mlp_observation;
+        folds.push(recorded_fold);
     }
     let evaluation = evaluator.evaluate_signals(
         context.rows(),
@@ -707,7 +755,7 @@ fn fit_artifact(
     Ok(artifact)
 }
 
-fn fit_burn_fold(fit: CexBurnFoldFit<'_>) -> Result<(CexBaselineModelV1, Vec<f64>), String> {
+fn fit_burn_fold(fit: CexBurnFoldFit<'_>) -> Result<CexBurnFoldOutput, String> {
     let CexBurnFoldFit {
         rows,
         features,
@@ -719,6 +767,8 @@ fn fit_burn_fold(fit: CexBurnFoldFit<'_>) -> Result<(CexBaselineModelV1, Vec<f64
         horizon,
         evaluation_policy_sha256,
         dataset_sha256,
+        profile,
+        purpose,
     } = fit;
     if fold.train.end > rows.len()
         || fold.validation.end > rows.len()
@@ -817,14 +867,26 @@ fn fit_burn_fold(fit: CexBurnFoldFit<'_>) -> Result<(CexBaselineModelV1, Vec<f64
         .map_err(|error| format!("Burn MLP horizon is invalid: {error}"))?,
     )
     .map_err(|error| format!("Burn MLP dataset binding failed: {error}"))?;
-    let seed = burn_fold_seed(mission_id, fold_index, factor_ids);
+    if let Some(profile) = profile {
+        profile.validate()?;
+        if profile.initialization.expected_factor_ids != factor_ids {
+            return Err("Burn MLP factor order differs from the paired training profile".into());
+        }
+    }
+    let seed = match profile {
+        Some(profile) => profile.seed_for_fold(fold_index)?,
+        None => burn_fold_seed(mission_id, fold_index, factor_ids),
+    };
+    let epochs = profile.map_or(CEX_BURN_EPOCHS, |profile| profile.updates);
+    let target_scale = profile.map_or(MlpTargetScaleV1::RawReturn, |profile| profile.target_scale);
     let config = ContractTrainingConfig {
         input_dim: factor_ids.len(),
         hidden_dim: CEX_BURN_HIDDEN_DIM,
-        epochs: CEX_BURN_EPOCHS,
+        epochs,
         learning_rate: CEX_BURN_LEARNING_RATE,
         min_rows: CEX_BURN_MIN_ROWS,
         seed,
+        target_scale,
     };
     let rows_artifact = serde_json::to_vec(&training_rows)
         .map_err(|error| format!("Burn MLP training rows failed to serialize: {error}"))?;
@@ -858,6 +920,22 @@ fn fit_burn_fold(fit: CexBurnFoldFit<'_>) -> Result<(CexBaselineModelV1, Vec<f64
         .map_err(|error| format!("Burn MLP training request failed to seal: {error}"))?;
     let trained = train_contract_model(&rows_artifact, &sealed)
         .map_err(|error| format!("Burn MLP training failed: {error}"))?;
+    crate::research_event(
+        "alpha-engine-mlp",
+        "mlp_fold_fit_completed",
+        json!({
+            "mission_id": mission_id, "fold_index": fold_index, "purpose": purpose,
+            "symbol": identity.symbol, "venue": identity.venue, "seed": seed,
+            "updates_requested": epochs, "updates_completed": trained.diagnostics().learning.updates_completed,
+            "target_scale": target_scale, "row_count": trained.diagnostics().row_count,
+            "training_elapsed_millis": trained.training_elapsed_millis(),
+            "initial_parameters_sha256": trained.diagnostics().learning.initial_parameters_sha256,
+            "semantic_model_sha256": trained.diagnostics().semantic_model_sha256,
+            "request_semantic_sha256": trained.diagnostics().request_semantic_sha256,
+            "training_mse": trained.diagnostics().mse,
+            "mse_over_zero_prediction": trained.diagnostics().learning.training_prediction.mse_over_zero_prediction,
+        }),
+    );
     let parameters = trained
         .export_parameters()
         .map_err(|error| format!("Burn MLP parameters failed to export: {error}"))?;
@@ -880,7 +958,8 @@ fn fit_burn_fold(fit: CexBurnFoldFit<'_>) -> Result<(CexBaselineModelV1, Vec<f64
             .predict(&feature_row)
             .map_err(|error| format!("Burn MLP validation row {index} failed: {error}"))?;
         let prediction = parameters.predict(&feature_row)?;
-        let tolerance = 1e-5_f32 * backend_prediction.abs().max(1.0);
+        let output_scale = trained.diagnostics().learning.target_transform.scale as f32;
+        let tolerance = (1e-6_f32 * output_scale + 1e-6 * backend_prediction.abs()).max(1e-10);
         if (prediction - backend_prediction).abs() > tolerance {
             return Err(format!(
                 "Burn MLP portable inference differs at validation row {index}"
@@ -894,8 +973,23 @@ fn fit_burn_fold(fit: CexBurnFoldFit<'_>) -> Result<(CexBaselineModelV1, Vec<f64
         predictions.push(normalize_zero(f64::from(prediction)));
     }
     let diagnostics = trained.diagnostics();
-    Ok((
-        CexBaselineModelV1::BurnMlpPortable {
+    let targets: Vec<_> = fold
+        .validation
+        .clone()
+        .map(|index| rows[index].label)
+        .collect();
+    let observation = CexMlpFoldObservationV1 {
+        validation_prediction: MlpPredictionDiagnosticsV1::new(
+            &predictions,
+            &targets,
+            diagnostics
+                .learning
+                .training_prediction
+                .training_target_mean,
+        )?,
+    };
+    Ok(CexBurnFoldOutput {
+        model: CexBaselineModelV1::BurnMlpPortable {
             parameters,
             request_semantic_sha256: diagnostics.request_semantic_sha256.as_str().to_string(),
             semantic_model_sha256: diagnostics.semantic_model_sha256.as_str().to_string(),
@@ -906,12 +1000,14 @@ fn fit_burn_fold(fit: CexBurnFoldFit<'_>) -> Result<(CexBaselineModelV1, Vec<f64
             row_count: diagnostics.row_count,
             seed,
             hidden_dim: CEX_BURN_HIDDEN_DIM,
-            epochs: CEX_BURN_EPOCHS,
+            epochs,
             learning_rate: CEX_BURN_LEARNING_RATE,
             min_rows: CEX_BURN_MIN_ROWS,
+            learning: Box::new(diagnostics.learning.clone()),
         },
         predictions,
-    ))
+        observation,
+    })
 }
 
 fn timestamp_ms(time: chrono::DateTime<chrono::Utc>) -> Result<i64, String> {
@@ -1473,10 +1569,20 @@ mod tests {
                 horizon: &horizon,
                 evaluation_policy_sha256: &evaluation_sha,
                 dataset_sha256: &dataset_sha,
+                profile: None,
+                purpose: "test",
             })
         };
-        let (left_model, left_predictions) = fit(&rows).unwrap();
-        let (right_model, right_predictions) = fit(&rows).unwrap();
+        let CexBurnFoldOutput {
+            model: left_model,
+            predictions: left_predictions,
+            ..
+        } = fit(&rows).unwrap();
+        let CexBurnFoldOutput {
+            model: right_model,
+            predictions: right_predictions,
+            ..
+        } = fit(&rows).unwrap();
         assert_eq!(left_model, right_model);
         assert_eq!(left_predictions, right_predictions);
         assert_eq!(left_predictions.len(), 3);
@@ -1513,8 +1619,73 @@ mod tests {
         for row in &mut mutated[13..16] {
             row.label = 9.9;
         }
-        let (mutated_model, _) = fit(&mutated).unwrap();
+        let mutated_model = fit(&mutated).unwrap().model;
         assert_eq!(left_model, mutated_model);
+
+        let CexBaselineModelV1::BurnMlpPortable { seed, learning, .. } = &left_model else {
+            unreachable!()
+        };
+        for mode in [
+            MlpTargetScaleV1::RawReturn,
+            MlpTargetScaleV1::TrainStandardized,
+        ] {
+            for updates in [8, 64] {
+                let profile = CexMlpTrainingProfileV1 {
+                    schema_version: "cex-mlp-training-profile-v1".into(),
+                    updates,
+                    target_scale: mode,
+                    initialization: alpha_domain::mlp_training::CexMlpInitializationV1 {
+                        fold_seeds: vec![*seed],
+                        expected_factor_ids: factor_ids.to_vec(),
+                        expected_factor_columns_sha256: "a".repeat(64),
+                    },
+                };
+                let paired_fit = |input: &[ResearchRow], profile: &CexMlpTrainingProfileV1| {
+                    fit_burn_fold(CexBurnFoldFit {
+                        rows: input,
+                        features: &features,
+                        fold: &fold,
+                        fold_index: 1,
+                        mission_id: "different-mission-for-paired-treatment",
+                        identity,
+                        factor_ids: &factor_ids,
+                        horizon: &horizon,
+                        evaluation_policy_sha256: &evaluation_sha,
+                        dataset_sha256: &dataset_sha,
+                        profile: Some(profile),
+                        purpose: "test",
+                    })
+                };
+                let treatment = paired_fit(&rows, &profile).unwrap();
+                let CexBaselineModelV1::BurnMlpPortable {
+                    learning: observed,
+                    epochs,
+                    ..
+                } = &treatment.model
+                else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    observed.initial_parameters_sha256,
+                    learning.initial_parameters_sha256
+                );
+                assert_eq!(*epochs, updates);
+                assert_eq!(observed.updates_completed, updates);
+                assert_eq!(observed.target_transform.mode, mode);
+                let changed_validation = paired_fit(&mutated, &profile).unwrap();
+                assert_eq!(treatment.model, changed_validation.model);
+                assert_eq!(treatment.predictions, changed_validation.predictions);
+                assert_ne!(
+                    treatment.observation.validation_prediction.mse,
+                    changed_validation.observation.validation_prediction.mse
+                );
+                let mut bad = profile.clone();
+                bad.initialization.expected_factor_ids[0] = "different-factor".into();
+                assert!(paired_fit(&rows, &bad)
+                    .unwrap_err()
+                    .contains("factor order"));
+            }
+        }
 
         // Actual validation time and actual label maturity must drive the split.
         // Neither may be replaced by a convenient synthetic horizon offset.
@@ -1559,9 +1730,15 @@ mod tests {
                 horizon: &multi_step_horizon,
                 evaluation_policy_sha256: &evaluation_sha,
                 dataset_sha256: &dataset_sha,
+                profile: None,
+                purpose: "test",
             })
         };
-        let (multi_model, predictions) = fit_multi_step(&multi_step_rows).unwrap();
+        let CexBurnFoldOutput {
+            model: multi_model,
+            predictions,
+            ..
+        } = fit_multi_step(&multi_step_rows).unwrap();
         assert_eq!(predictions.len(), 3);
         assert!(matches!(
             multi_model,
@@ -1571,6 +1748,6 @@ mod tests {
         for row in &mut multi_step_rows[8..12] {
             row.label = 9.9;
         }
-        assert_eq!(fit_multi_step(&multi_step_rows).unwrap().0, multi_model);
+        assert_eq!(fit_multi_step(&multi_step_rows).unwrap().model, multi_model);
     }
 }

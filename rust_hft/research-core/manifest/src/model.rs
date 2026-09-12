@@ -1,5 +1,6 @@
 //! Frozen inference parameters shared by training, evaluation and runtime.
 //! The tensor digest is identical to the trainer's existing semantic digest.
+use crate::mlp_training::MlpLearningDiagnosticsV1;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -168,6 +169,7 @@ pub enum CexBaselineModelV1 {
         learning_rate: f64,
         min_rows: usize,
         parameters: PortableMlpV1,
+        learning: Box<MlpLearningDiagnosticsV1>,
     },
 }
 
@@ -224,6 +226,7 @@ impl CexBaselineModelV1 {
                 learning_rate,
                 min_rows,
                 parameters,
+                learning,
                 ..
             } => {
                 validate_burn_training_metadata(
@@ -241,9 +244,12 @@ impl CexBaselineModelV1 {
                     features,
                 )?;
                 parameters.validate()?;
+                learning.validate()?;
                 if parameters.input_dim != features
                     || parameters.hidden_dim != *hidden_dim
                     || parameters.semantic_sha256()? != *semantic_model_sha256
+                    || learning.updates_requested != *epochs
+                    || learning.training_prediction.row_count != *row_count
                 {
                     return Err("portable MLP training identity or dimensions differ".into());
                 }
@@ -736,6 +742,25 @@ mod tests {
             learning_rate: 1e-3,
             min_rows: 8,
             parameters,
+            learning: Box::new(crate::mlp_training::MlpLearningDiagnosticsV1 {
+                schema_version: "mlp-learning-diagnostics-v1".into(),
+                updates_requested: 1,
+                updates_completed: 1,
+                initial_parameters_sha256: "c".repeat(64),
+                target_transform: crate::mlp_training::MlpTargetTransformV1 {
+                    mode: crate::mlp_training::MlpTargetScaleV1::RawReturn,
+                    mean: 0.0,
+                    scale: 1.0,
+                },
+                loss_history: vec![0.0, 0.0],
+                max_gradient_abs: 0.0,
+                max_parameter_abs: 1.0,
+                training_prediction: crate::mlp_training::MlpPredictionDiagnosticsV1::new(
+                    &[0.0; 8], &[0.0; 8], 0.0,
+                )
+                .unwrap(),
+                exit_reason: "fixed_update_budget_completed".into(),
+            }),
         }
     }
 
