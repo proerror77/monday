@@ -2023,6 +2023,7 @@ pub(crate) fn promote_sealed_candidate(
 /// Freeze a GP v1-v3 formula search round and open sealed holdout. Used by the
 /// signed `--final-evaluation` worker; Direct execute and `--pre-holdout`
 /// Campaign rounds never call this.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn finalize_formula_search_round(
     round_results: &Path,
     finalization_dir: &Path,

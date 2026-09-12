@@ -486,3 +486,25 @@ pub fn final_evaluator_config(
     config.validate()?;
     Ok(config)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frozen_selection_ids_accept_formula_and_model_prefixes() {
+        let hash = "a".repeat(64);
+        assert!(valid_frozen_selection_id(&format!(
+            "{FROZEN_FORMULA_SELECTION_PREFIX}{hash}"
+        )));
+        assert!(valid_frozen_selection_id(&format!(
+            "{FROZEN_MODEL_SELECTION_PREFIX}{hash}"
+        )));
+        assert!(!valid_frozen_selection_id(&format!(
+            "cex-frozen-other-{hash}"
+        )));
+        assert!(!valid_frozen_selection_id(&format!(
+            "{FROZEN_FORMULA_SELECTION_PREFIX}not-a-hash"
+        )));
+    }
+}

@@ -1519,6 +1519,7 @@ pub(crate) fn readback_terminal(
     Ok((result, result_sha256))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn readback_holdout_and_promotion(
     client: &Client,
     request: &FinalRequest,

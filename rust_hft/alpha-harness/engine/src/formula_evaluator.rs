@@ -347,10 +347,10 @@ impl FormulaEvaluator {
         }
     }
 
-    fn evaluate_formula_rows<'a>(
+    fn evaluate_formula_rows(
         &self,
         proposal: &EngineProposal,
-        rows: &'a [ResearchRow],
+        rows: &[ResearchRow],
         ranges: impl IntoIterator<Item = std::ops::Range<usize>>,
         evaluator_version: &str,
         protocol: &EvaluationProtocolV1,
@@ -2045,5 +2045,30 @@ mod tests {
         assert!(evaluator
             .evaluate(&proposal, &dataset(0.0).engine_context())
             .is_err());
+    }
+
+    #[test]
+    fn independent_selection_falls_back_to_walk_forward_when_unreserved() {
+        let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
+        let proposal = proposal(FactorAst::Terminal(FactorTerminal::Field(
+            "book_imbalance".to_string(),
+        )));
+        let unreserved = evaluator
+            .evaluate_independent_selection(&proposal, &dataset(0.0))
+            .unwrap();
+        assert_eq!(
+            unreserved.evaluation.evaluator_version,
+            WALK_FORWARD_EVALUATOR_VERSION
+        );
+
+        let reserved_protocol = protocol(0.0, 3).with_independent_selection(30).unwrap();
+        let reserved_dataset = prepare_dataset(rows(0.0), &reserved_protocol).unwrap();
+        let reserved = evaluator
+            .evaluate_independent_selection(&proposal, &reserved_dataset)
+            .unwrap();
+        assert_eq!(
+            reserved.evaluation.evaluator_version,
+            alpha_domain::frozen_model::INDEPENDENT_SELECTION_EVALUATOR_VERSION
+        );
     }
 }
