@@ -298,6 +298,78 @@ have no order, submit, cancel, replace, reconciliation, OMS, or venue-key input.
 All production execution remains in Monday `risk-control`,
 `execution-gateway`, and `apps/live`.
 
+## Supervised model comparison reports
+
+Each completed supervised-model round writes `supervised-model-metrics.json`
+and `supervised-model-metrics.csv` beside its original model backtests. The
+comparison preserves every evaluated model, its candidate and model references,
+the backtest file SHA256, native metric definitions, and the original selection.
+It does not change model ranking, economic gates, trial accounting, or authority.
+
+The JSON retains all native folds, including IC, Rank IC, Fold ICIR, Rank ICIR,
+zero-trade outcomes, costs, turnover, and the maximum of the native fold
+drawdowns. Native net Sharpe remains the mean of the fold-level, per-observation
+population-deviation ratios without annualization. Its raw zero value is retained
+for a no-trade model, with a separate unavailable interpretation. Prediction
+amplitudes are reported in basis points; target and rebalance amounts use the
+frozen reference notional when one is declared.
+
+Calendar-day statistics are separate derived fields. A complete UTC day requires
+one ledger observation at every declared cadence in `[00:00, next 00:00)`.
+This is evaluator-ledger coverage, not proof of market-data completeness or
+independent samples. Daily IC is available only when an existing predictive fold
+is exactly that complete day; correlations cannot be reconstructed by averaging
+partial-fold correlations. Daily ICIR and Sharpe use sample deviation and at least
+two complete days. Daily Sortino uses a zero downside target. Daily excess-return
+and downside calculations explicitly use zero research risk-free/target returns
+and remain unannualized. These fixed-notional research ratios are not account
+CAGR or executed trading results.
+
+Daily information ratio uses paired complete-day returns relative to the declared
+benchmark inside the same Mission, protocol, and ledger scope. Missing benchmarks,
+self-comparisons, unmatched coverage, insufficient days, and degenerate denominators
+have explicit unavailable reasons. A cash benchmark can make IR and Sharpe
+redundant; neither duplicate ratios nor zero trading establish economic success.
+
+Completed evidence can also be summarized without training or opening a store:
+
+```bash
+alpha-harness mission model-metrics \
+  --backtest results/ridge-supervised-backtest.json \
+    results/cart-supervised-backtest.json \
+    results/burn_mlp-supervised-backtest.json \
+  --selection results/supervised-model-selection.json \
+  --benchmark ridge \
+  --output reports/model-metrics.json
+```
+
+The CSV defaults to the JSON output path with a `.csv` extension. Multiple
+Missions may be supplied; each remains a separate comparison cohort. Omitting
+selection evidence leaves selection unknown instead of choosing a model.
+Identical output bytes may be reused; different existing files are never
+overwritten. Sources are read one at a time with byte/count limits. Text cells
+that could be interpreted as spreadsheet formulas are protected in the CSV;
+the JSON keeps the original identities.
+
+The command verifies internal evaluation consistency and records source-file
+hashes. It does not authenticate a Study ledger, create settlement evidence,
+train, open holdout, or submit a research Job. Canonical Campaign readback
+requires both comparison files whenever supervised selection exists. It verifies
+the feature bytes against the input SHA256 inside the already admitted Mission,
+reconstructs the same pre-holdout dataset and partition, and recomputes positions
+and ledger accounting from those immutable prices, clocks and costs. This is
+deterministic verification, not model fitting or a new parameter trial. Both
+comparison files must then match the verified model backtests and CSV rendering.
+Empty-factor rounds without supervised selection do not invent a comparison.
+Historical backtests remain readable by the separate reporting command; missing
+comparison evidence cannot satisfy current Campaign readback.
+
+These reports describe position evaluation under its cost approximation.
+Event-replay capabilities must be read from the separate replay receipt: V4
+supports partial fills against displayed liquidity but does not model queue
+position, market impact, or true capacity. A model metric report does not
+establish that replay ran or passed.
+
 ## Evaluation and Learning
 
 ```bash

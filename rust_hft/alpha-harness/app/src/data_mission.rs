@@ -891,7 +891,7 @@ pub fn load_research_rows(
     Ok(rows)
 }
 
-fn load_feature_research_rows(
+pub(crate) fn load_feature_research_rows(
     manifest: &FeatureDatasetManifest,
     fee_bps: f64,
     funding_bps: f64,

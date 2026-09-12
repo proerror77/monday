@@ -385,7 +385,7 @@ pub fn evaluate_cex_supervised_model(
     Ok(evaluation)
 }
 
-fn supervised_target_positions(
+pub(crate) fn supervised_target_positions(
     context: &EngineContext<'_>,
     predictions: &[f64],
     policy: &CexSupervisedDecisionPolicyV2,

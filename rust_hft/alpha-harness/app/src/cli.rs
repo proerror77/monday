@@ -1,6 +1,6 @@
 use crate::{
     data_mission, governance, loop_control, mission, mission_campaign, mission_dispatch,
-    mission_fresh_inputs, mission_runner, prediction_dispatch, prediction_runner,
+    mission_fresh_inputs, mission_metrics, mission_runner, prediction_dispatch, prediction_runner,
     prediction_snapshot,
 };
 use alpha_domain::{
@@ -86,6 +86,8 @@ enum MissionCommand {
     CampaignStudyPropose(CampaignStudyProposeArgs),
     CampaignFinalize(CampaignFinalizeArgs),
     CampaignId(CampaignIdArgs),
+    /// Summarize completed model evidence without training or submitting research.
+    ModelMetrics(ModelMetricsArgs),
     PrepareFreshInputs(Box<PrepareFreshInputsArgs>),
     Dispatch {
         #[command(subcommand)]
@@ -143,6 +145,33 @@ enum MissionDispatchCommand {
     Settle(MissionDispatchSubmitArgs),
     ControllerHandoff(CampaignControllerHandoffArgs),
     PrepareController(CampaignControllerPrepareArgs),
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ModelMetricsBenchmark {
+    Ridge,
+    Cart,
+    BurnMlp,
+    None,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ModelMetricsArgs {
+    /// Completed supervised backtest JSON files; may span multiple Missions.
+    #[arg(long, required = true, num_args = 1..)]
+    pub backtest: Vec<PathBuf>,
+    /// Optional original model selection JSON files; no selection is inferred.
+    #[arg(long, num_args = 1..)]
+    pub selection: Vec<PathBuf>,
+    /// Benchmark is matched only inside an identical Mission evaluation cohort.
+    #[arg(long, value_enum, default_value = "ridge")]
+    pub benchmark: ModelMetricsBenchmark,
+    /// New JSON report path. An existing identical report may be reused.
+    #[arg(long)]
+    pub output: PathBuf,
+    /// Defaults to the JSON output path with a .csv extension.
+    #[arg(long)]
+    pub csv_output: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1078,6 +1107,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             MissionCommand::CampaignFinalize(args) => mission_campaign::finalize(args),
             MissionCommand::CampaignId(args) => mission_campaign::print_expected_id(args),
+            MissionCommand::ModelMetrics(args) => {
+                tokio::task::spawn_blocking(move || mission_metrics::run(args))
+                    .await
+                    .context("model metrics reporting worker failed")?
+            }
             MissionCommand::PrepareFreshInputs(args) => {
                 tokio::task::spawn_blocking(move || mission_fresh_inputs::prepare(*args))
                     .await
@@ -1223,6 +1257,36 @@ pub fn print_json(value: &impl serde::Serialize) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_metrics_cli_accepts_multiple_backtests_and_explicit_selection() {
+        let cli = Cli::try_parse_from([
+            "alpha-harness",
+            "mission",
+            "model-metrics",
+            "--backtest",
+            "ridge.json",
+            "cart.json",
+            "--selection",
+            "selection.json",
+            "--benchmark",
+            "ridge",
+            "--output",
+            "metrics.json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Mission {
+                command: MissionCommand::ModelMetrics(args),
+            } => {
+                assert_eq!(args.backtest.len(), 2);
+                assert_eq!(args.selection, [PathBuf::from("selection.json")]);
+                assert_eq!(args.output, PathBuf::from("metrics.json"));
+                assert!(matches!(args.benchmark, ModelMetricsBenchmark::Ridge));
+            }
+            _ => panic!("expected read-only model metrics command"),
+        }
+    }
     use clap::CommandFactory;
     use std::ffi::{OsStr, OsString};
 
