@@ -243,6 +243,7 @@ impl EngineQueues {
                         self.stats.intent_order_notional_count += 1;
                     }
                     OrderIntentRejectReason::InvalidMaxOrderQuantity { .. }
+                    | OrderIntentRejectReason::MissingMaxOrderQuantity
                     | OrderIntentRejectReason::MaxOrderQuantityExceeded { .. } => {
                         self.stats.intent_order_quantity_count += 1;
                     }

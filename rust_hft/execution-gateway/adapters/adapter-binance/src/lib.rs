@@ -1397,6 +1397,7 @@ mod tests {
         let lifecycle = ports::OrderIntentLifecycle {
             max_slippage_bps: Some(25),
             max_order_notional: Some(rust_decimal::Decimal::from(10_000)),
+            max_order_quantity: Some(rust_decimal::Decimal::from(10)),
             ..Default::default()
         };
         let envelope = OrderIntentEnvelope::new(
