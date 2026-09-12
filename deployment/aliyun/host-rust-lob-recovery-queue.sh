@@ -233,16 +233,36 @@ has_incomplete_parts() {
   \) -print -quit) ]]
 }
 
+has_uploaded_cleanup_markers() {
+  local spool=$1
+  [[ -d $spool && ! -L $spool ]] || return 1
+  [[ -n $(find "$spool" -type f \( \
+    -name '*.uploaded-cleanup.json' -o \
+    -name '*.uploaded-cleanup.json.tmp' \
+  \) -print -quit) ]]
+}
+
 has_undrained_complete_segments() {
+  # Manifest/data/success only. Leftover uploaded-cleanup markers are the
+  # production archiver's post-upload residue, not undrained segments.
+  # Isolating them would send drain through --upload-only, which deletes the
+  # marker without refreshing last_success_at, then fails triplet verify and
+  # leaves the job unresumable.
   local spool=$1
   [[ -d $spool && ! -L $spool ]] || return 1
   [[ -n $(find "$spool" -type f \( \
     -name '*.manifest.json' -o \
     -name '*.jsonl.zst' -o \
-    -name '*._SUCCESS' -o \
-    -name '*.uploaded-cleanup.json' -o \
-    -name '*.uploaded-cleanup.json.tmp' \
+    -name '*._SUCCESS' \
   \) -print -quit) ]]
+}
+
+has_cleanup_marker_only_leftover() {
+  local spool=$1
+  has_uploaded_cleanup_markers "$spool" || return 1
+  has_incomplete_parts "$spool" && return 1
+  has_undrained_complete_segments "$spool" && return 1
+  return 0
 }
 
 needs_recovery_isolation() {
@@ -1301,6 +1321,9 @@ run_drain_job() {
       RECOVERY_BACKUP_DIR="$backup_dir" \
       "$release_binary" --recover-parts-only \
       || fail 'detached recovery of incomplete parts failed'
+  fi
+  if has_cleanup_marker_only_leftover "$running_dir"; then
+    fail 'detached spool has leftover uploaded-cleanup markers without local segment artifacts; refusing fresh-upload verify so the marker remains inspectable'
   fi
   # The uploader commits its own readback before removing local segments.  An
   # interrupted controller may therefore have only metadata left.  Re-running
