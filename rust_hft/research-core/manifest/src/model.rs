@@ -1,5 +1,6 @@
 //! Frozen inference parameters shared by training, evaluation and runtime.
 //! The tensor digest is identical to the trainer's existing semantic digest.
+use crate::mlp_training::MlpLearningDiagnosticsV1;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -153,7 +154,8 @@ pub enum CexBaselineModelV1 {
         learning_rate: f64,
         min_rows: usize,
     },
-    /// Executable fitted parameters bound to the original training tensor digest.
+    /// Historical portable parameters remain decodable for audit inspection.
+    /// They cannot acquire the new learning contract or execute through it.
     BurnMlpPortable {
         request_semantic_sha256: String,
         semantic_model_sha256: String,
@@ -169,6 +171,23 @@ pub enum CexBaselineModelV1 {
         min_rows: usize,
         parameters: PortableMlpV1,
     },
+    /// Executable raw-return parameters with the bound learning diagnostics.
+    BurnMlpPortableV2 {
+        request_semantic_sha256: String,
+        semantic_model_sha256: String,
+        config_sha256: String,
+        trainer_version: String,
+        symbol: String,
+        venue: String,
+        row_count: usize,
+        seed: u64,
+        hidden_dim: usize,
+        epochs: usize,
+        learning_rate: f64,
+        min_rows: usize,
+        parameters: PortableMlpV1,
+        learning: Box<MlpLearningDiagnosticsV1>,
+    },
 }
 
 impl CexBaselineModelV1 {
@@ -176,7 +195,9 @@ impl CexBaselineModelV1 {
         match self {
             Self::Ridge { .. } => CexBaselineModelKindV1::Ridge,
             Self::ShallowCart { .. } => CexBaselineModelKindV1::ShallowCart,
-            Self::BurnMlp { .. } | Self::BurnMlpPortable { .. } => CexBaselineModelKindV1::BurnMlp,
+            Self::BurnMlp { .. }
+            | Self::BurnMlpPortable { .. }
+            | Self::BurnMlpPortableV2 { .. } => CexBaselineModelKindV1::BurnMlp,
         }
     }
 }
@@ -211,7 +232,7 @@ impl CexBaselineModelV1 {
                 coefficients,
             } => validate_ridge(*intercept, means, scales, coefficients, features),
             Self::ShallowCart { root } => root.validate_inference(features),
-            Self::BurnMlpPortable {
+            Self::BurnMlpPortableV2 {
                 request_semantic_sha256,
                 semantic_model_sha256,
                 config_sha256,
@@ -224,6 +245,7 @@ impl CexBaselineModelV1 {
                 learning_rate,
                 min_rows,
                 parameters,
+                learning,
                 ..
             } => {
                 validate_burn_training_metadata(
@@ -241,15 +263,20 @@ impl CexBaselineModelV1 {
                     features,
                 )?;
                 parameters.validate()?;
+                learning.validate()?;
                 if parameters.input_dim != features
                     || parameters.hidden_dim != *hidden_dim
                     || parameters.semantic_sha256()? != *semantic_model_sha256
+                    || learning.updates_requested != *epochs
+                    || learning.training_prediction.row_count != *row_count
                 {
                     return Err("portable MLP training identity or dimensions differ".into());
                 }
                 Ok(())
             }
-            Self::BurnMlp { .. } => Err("historical Burn diagnostics are not executable".into()),
+            Self::BurnMlp { .. } | Self::BurnMlpPortable { .. } => {
+                Err("historical Burn records are audit-only".into())
+            }
         }
     }
 
@@ -266,12 +293,14 @@ impl CexBaselineModelV1 {
                 coefficients,
             } => predict_standardized_ridge(*intercept, means, scales, coefficients, features),
             Self::ShallowCart { root } => root.predict(features),
-            Self::BurnMlpPortable { parameters, .. } => {
+            Self::BurnMlpPortableV2 { parameters, .. } => {
                 let features: Vec<f32> = features.iter().map(|value| *value as f32).collect();
                 let prediction = f64::from(parameters.predict(&features)?);
                 Ok(if prediction == 0.0 { 0.0 } else { prediction })
             }
-            Self::BurnMlp { .. } => Err("historical Burn diagnostics are not executable".into()),
+            Self::BurnMlp { .. } | Self::BurnMlpPortable { .. } => {
+                Err("historical Burn records are audit-only".into())
+            }
         }
     }
 }
@@ -722,7 +751,7 @@ mod tests {
             output_bias: 0.0,
         };
         let semantic_model_sha256 = parameters.semantic_sha256().unwrap();
-        CexBaselineModelV1::BurnMlpPortable {
+        CexBaselineModelV1::BurnMlpPortableV2 {
             request_semantic_sha256: "a".repeat(64),
             semantic_model_sha256,
             config_sha256: "b".repeat(64),
@@ -736,6 +765,25 @@ mod tests {
             learning_rate: 1e-3,
             min_rows: 8,
             parameters,
+            learning: Box::new(crate::mlp_training::MlpLearningDiagnosticsV1 {
+                schema_version: "mlp-learning-diagnostics-v1".into(),
+                updates_requested: 1,
+                updates_completed: 1,
+                initial_parameters_sha256: "c".repeat(64),
+                target_transform: crate::mlp_training::MlpTargetTransformV1 {
+                    mode: crate::mlp_training::MlpTargetScaleV1::RawReturn,
+                    mean: 0.0,
+                    scale: 1.0,
+                },
+                loss_history: vec![0.0, 0.0],
+                max_gradient_abs: 0.0,
+                max_parameter_abs: 1.0,
+                training_prediction: crate::mlp_training::MlpPredictionDiagnosticsV1::new(
+                    &[0.0; 8], &[0.0; 8], 0.0,
+                )
+                .unwrap(),
+                exit_reason: "fixed_update_budget_completed".into(),
+            }),
         }
     }
 
@@ -750,7 +798,7 @@ mod tests {
             assert!(model.validate_inference(1).is_err());
         };
         assert_invalid(valid.clone(), |model| {
-            let CexBaselineModelV1::BurnMlpPortable {
+            let CexBaselineModelV1::BurnMlpPortableV2 {
                 request_semantic_sha256,
                 ..
             } = model
@@ -760,7 +808,7 @@ mod tests {
             *request_semantic_sha256 = "invalid".into();
         });
         assert_invalid(valid.clone(), |model| {
-            let CexBaselineModelV1::BurnMlpPortable {
+            let CexBaselineModelV1::BurnMlpPortableV2 {
                 semantic_model_sha256,
                 ..
             } = model
@@ -770,13 +818,13 @@ mod tests {
             *semantic_model_sha256 = "invalid".into();
         });
         assert_invalid(valid.clone(), |model| {
-            let CexBaselineModelV1::BurnMlpPortable { config_sha256, .. } = model else {
+            let CexBaselineModelV1::BurnMlpPortableV2 { config_sha256, .. } = model else {
                 unreachable!()
             };
             *config_sha256 = "invalid".into();
         });
         assert_invalid(valid.clone(), |model| {
-            let CexBaselineModelV1::BurnMlpPortable {
+            let CexBaselineModelV1::BurnMlpPortableV2 {
                 trainer_version, ..
             } = model
             else {
@@ -785,46 +833,66 @@ mod tests {
             *trainer_version = " ".into();
         });
         assert_invalid(valid.clone(), |model| {
-            let CexBaselineModelV1::BurnMlpPortable { symbol, .. } = model else {
+            let CexBaselineModelV1::BurnMlpPortableV2 { symbol, .. } = model else {
                 unreachable!()
             };
             *symbol = " BTCUSDT".into();
         });
         assert_invalid(valid.clone(), |model| {
-            let CexBaselineModelV1::BurnMlpPortable { venue, .. } = model else {
+            let CexBaselineModelV1::BurnMlpPortableV2 { venue, .. } = model else {
                 unreachable!()
             };
             *venue = "binance-usdm ".into();
         });
         assert_invalid(valid.clone(), |model| {
-            let CexBaselineModelV1::BurnMlpPortable { row_count, .. } = model else {
+            let CexBaselineModelV1::BurnMlpPortableV2 { row_count, .. } = model else {
                 unreachable!()
             };
             *row_count = 7;
         });
         assert_invalid(valid.clone(), |model| {
-            let CexBaselineModelV1::BurnMlpPortable { hidden_dim, .. } = model else {
+            let CexBaselineModelV1::BurnMlpPortableV2 { hidden_dim, .. } = model else {
                 unreachable!()
             };
             *hidden_dim = 0;
         });
         assert_invalid(valid.clone(), |model| {
-            let CexBaselineModelV1::BurnMlpPortable { epochs, .. } = model else {
+            let CexBaselineModelV1::BurnMlpPortableV2 { epochs, .. } = model else {
                 unreachable!()
             };
             *epochs = 0;
         });
         assert_invalid(valid.clone(), |model| {
-            let CexBaselineModelV1::BurnMlpPortable { learning_rate, .. } = model else {
+            let CexBaselineModelV1::BurnMlpPortableV2 { learning_rate, .. } = model else {
                 unreachable!()
             };
             *learning_rate = 0.0;
         });
         assert_invalid(valid, |model| {
-            let CexBaselineModelV1::BurnMlpPortable { min_rows, .. } = model else {
+            let CexBaselineModelV1::BurnMlpPortableV2 { min_rows, .. } = model else {
                 unreachable!()
             };
             *min_rows = 0;
         });
+    }
+
+    #[test]
+    fn legacy_portable_mlp_is_decodable_without_inventing_learning_evidence() {
+        let mut legacy = serde_json::to_value(portable_baseline_for_validation()).unwrap();
+        legacy["model_kind"] = serde_json::json!("burn_mlp_portable");
+        legacy.as_object_mut().unwrap().remove("learning");
+        let decoded: CexBaselineModelV1 = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(matches!(
+            decoded,
+            CexBaselineModelV1::BurnMlpPortable { .. }
+        ));
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), legacy);
+        assert!(decoded
+            .validate_inference(1)
+            .unwrap_err()
+            .contains("audit-only"));
+        assert!(decoded.predict(&[0.5]).is_err());
+        legacy["model_kind"] = serde_json::json!("burn_mlp_portable_v2");
+        assert!(serde_json::from_value::<CexBaselineModelV1>(legacy).is_err());
     }
 }

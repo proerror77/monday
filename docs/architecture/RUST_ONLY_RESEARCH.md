@@ -39,7 +39,8 @@ split, seed, training configuration, metrics, model checksum, framework version,
 and research-only scope. Loaders verify the manifest and checksum before reading
 weights. Existing bundles are never overwritten.
 
-Campaign Burn baselines retain a `burn_mlp_portable` model in every fitted fold.
+Campaign Burn baselines retain a `burn_mlp_portable_v2` model in every fitted fold,
+including bound training diagnostics in `cex-baseline-artifact-v2` evidence.
 Its versioned `PortableMlpV1` payload contains both layer weights and biases in
 row-major tensor order, bounded to one million parameters. The exported tensor
 digest must equal the trainer's existing semantic model digest. Deserialization,
@@ -47,13 +48,15 @@ shape validation, finite-value checks and the training-identity binding precede
 inference.
 
 New fold predictions use the portable scalar f32 evaluator. The Campaign fitter
-compares these predictions with the fitted Burn backend at a relative tolerance of 1e-5
-and an absolute floor of 1e-5; reloading the portable payload reproduces the
-recorded predictions exactly. This makes evaluator arithmetic part of the frozen
-model, while the original Burnpack training bundle remains separately available.
-Historical `burn_mlp` records containing only diagnostics remain readable audit
-evidence and are rejected by current execution/refit verification. Parameter
-export provides no holdout, promotion, deployment or order authority.
+compares them with the fitted Burn backend using the raw-return tolerance
+`max(1e-10, 1e-6 * training_target_scale + 1e-6 * abs(backend_prediction))`, where
+the target scale is 1 for raw targets or the training-only population standard
+deviation for standardized targets. The inverse transform is folded into output
+parameters before export. Reloading the portable payload reproduces recorded
+scalar predictions exactly. The generic trainer also supports immutable
+Burnpack bundles. Historical `burn_mlp` and `burn_mlp_portable` records remain
+decodable audit evidence and are rejected by current execution/refit verification.
+Parameter export provides no holdout, promotion, deployment or order authority.
 
 Canonical CEX Campaigns now bind `evaluation-protocol-v2`: three search folds,
 a separate 3,600-row selection window and a 3,600-row sealed holdout. Both

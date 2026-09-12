@@ -7,7 +7,7 @@
 use burn::{
     backend::{Autodiff, NdArray},
     config::Config,
-    module::{AutodiffModule, Module},
+    module::{AutodiffModule, Module, Param},
     nn::{
         loss::{MseLoss, Reduction},
         Linear, LinearConfig,
@@ -17,6 +17,9 @@ use burn::{
 };
 use burn_ndarray::NdArrayDevice;
 use burn_store::{BurnpackStore, ModuleSnapshot};
+pub use hft_research_manifest::mlp_training::{
+    MlpLearningDiagnosticsV1, MlpPredictionDiagnosticsV1, MlpTargetScaleV1, MlpTargetTransformV1,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -210,6 +213,7 @@ pub struct ContractTrainingConfig {
     pub learning_rate: f64,
     pub min_rows: usize,
     pub seed: u64,
+    pub target_scale: MlpTargetScaleV1,
 }
 
 impl Default for ContractTrainingConfig {
@@ -221,6 +225,7 @@ impl Default for ContractTrainingConfig {
             learning_rate: 1e-3,
             min_rows: 32,
             seed: 7,
+            target_scale: MlpTargetScaleV1::RawReturn,
         }
     }
 }
@@ -402,7 +407,7 @@ impl TrainingRequest {
         config: ContractTrainingConfig,
     ) -> Result<Self, ContractTrainingError> {
         let request = Self {
-            schema_version: 1,
+            schema_version: 2,
             rows_artifact_sha256,
             dataset,
             split,
@@ -433,7 +438,7 @@ impl TrainingRequest {
     }
 
     fn validate(&self) -> Result<(), ContractTrainingError> {
-        if self.schema_version != 1 {
+        if self.schema_version != 2 {
             return Err(ContractTrainingError::UnsupportedSchemaVersion {
                 artifact: "training request",
                 found: self.schema_version,
@@ -550,6 +555,7 @@ pub struct FitDiagnostics {
     pub request_artifact_sha256: Sha256Digest,
     pub request_semantic_sha256: Sha256Digest,
     pub semantic_model_sha256: Sha256Digest,
+    pub learning: MlpLearningDiagnosticsV1,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -697,6 +703,11 @@ fn update_semantic_tensor_digest<const D: usize>(
         .map_err(|error| ContractTrainingError::Artifact(format!("{error:?}")))?;
     hasher.update((values.len() as u64).to_le_bytes());
     for value in values {
+        if !value.is_finite() {
+            return Err(ContractTrainingError::Artifact(
+                "model parameter is non-finite".into(),
+            ));
+        }
         hasher.update(value.to_bits().to_le_bytes());
     }
     Ok(())
@@ -718,6 +729,118 @@ fn semantic_model_sha256(
     })?;
     update_semantic_tensor_digest(&mut hasher, "output.bias", output_bias.val())?;
     Ok(Sha256Digest(hex::encode(hasher.finalize())))
+}
+
+fn tensor_abs_max<const D: usize>(
+    tensor: Tensor<CpuBackend, D>,
+) -> Result<f64, ContractTrainingError> {
+    let values = tensor
+        .into_data()
+        .into_vec::<f32>()
+        .map_err(|error| ContractTrainingError::Artifact(format!("{error:?}")))?;
+    values.into_iter().try_fold(0.0_f64, |max, value| {
+        if value.is_finite() {
+            Ok(max.max(f64::from(value.abs())))
+        } else {
+            Err(ContractTrainingError::Artifact(
+                "MLP parameter or gradient is non-finite".into(),
+            ))
+        }
+    })
+}
+
+fn parameter_abs_max(model: &ReturnRegressor<CpuBackend>) -> Result<f64, ContractTrainingError> {
+    let hidden_bias = model
+        .hidden
+        .bias
+        .as_ref()
+        .ok_or_else(|| ContractTrainingError::Artifact("hidden bias missing".into()))?;
+    let output_bias = model
+        .output
+        .bias
+        .as_ref()
+        .ok_or_else(|| ContractTrainingError::Artifact("output bias missing".into()))?;
+    Ok(tensor_abs_max(model.hidden.weight.val())?
+        .max(tensor_abs_max(hidden_bias.val())?)
+        .max(tensor_abs_max(model.output.weight.val())?)
+        .max(tensor_abs_max(output_bias.val())?))
+}
+
+fn gradient_abs_max(
+    gradients: &GradientsParams,
+    model: &ReturnRegressor<CpuAutodiffBackend>,
+) -> Result<f64, ContractTrainingError> {
+    let missing = || ContractTrainingError::Artifact("MLP parameter gradient missing".into());
+    let hidden_bias = model.hidden.bias.as_ref().ok_or_else(missing)?;
+    let output_bias = model.output.bias.as_ref().ok_or_else(missing)?;
+    Ok(tensor_abs_max(
+        gradients
+            .get::<CpuBackend, 2>(model.hidden.weight.id)
+            .ok_or_else(missing)?,
+    )?
+    .max(tensor_abs_max(
+        gradients
+            .get::<CpuBackend, 1>(hidden_bias.id)
+            .ok_or_else(missing)?,
+    )?)
+    .max(tensor_abs_max(
+        gradients
+            .get::<CpuBackend, 2>(model.output.weight.id)
+            .ok_or_else(missing)?,
+    )?)
+    .max(tensor_abs_max(
+        gradients
+            .get::<CpuBackend, 1>(output_bias.id)
+            .ok_or_else(missing)?,
+    )?))
+}
+
+/// Fold the inverse transform into the output layer, so every persisted and
+/// portable model predicts raw returns without a second inference path.
+fn fold_target_inverse(
+    mut model: ReturnRegressor<CpuBackend>,
+    transform: &MlpTargetTransformV1,
+) -> Result<ReturnRegressor<CpuBackend>, ContractTrainingError> {
+    transform
+        .validate()
+        .map_err(ContractTrainingError::Artifact)?;
+    if transform.mode == MlpTargetScaleV1::RawReturn {
+        return Ok(model);
+    }
+    let weight = model.output.weight.val();
+    let shape = weight.shape().dims;
+    let weights = weight
+        .into_data()
+        .into_vec::<f32>()
+        .map_err(|error| ContractTrainingError::Artifact(format!("{error:?}")))?
+        .into_iter()
+        .map(|value| (f64::from(value) * transform.scale) as f32)
+        .collect::<Vec<_>>();
+    let bias = model
+        .output
+        .bias
+        .as_ref()
+        .ok_or_else(|| ContractTrainingError::Artifact("output bias missing".into()))?
+        .val()
+        .into_data()
+        .into_vec::<f32>()
+        .map_err(|error| ContractTrainingError::Artifact(format!("{error:?}")))?
+        .into_iter()
+        .map(|value| (f64::from(value) * transform.scale + transform.mean) as f32)
+        .collect::<Vec<_>>();
+    if weights.iter().chain(&bias).any(|value| !value.is_finite()) {
+        return Err(ContractTrainingError::Artifact(
+            "inverse target transform overflows model parameters".into(),
+        ));
+    }
+    let device = NdArrayDevice::Cpu;
+    model.output.weight =
+        Param::from_tensor(Tensor::from_data(TensorData::new(weights, shape), &device));
+    model.output.bias = Some(Param::from_tensor(Tensor::from_data(
+        TensorData::new(bias, [1]),
+        &device,
+    )));
+    Ok(model)
 }
 
 fn staging_path(output_dir: &Path, stem: &str, extension: &str) -> PathBuf {
@@ -794,6 +917,7 @@ pub struct TrainedContractModel {
     model: ReturnRegressor<CpuBackend>,
     request: TrainingRequest,
     diagnostics: FitDiagnostics,
+    training_elapsed_millis: Option<u64>,
 }
 
 impl TrainedContractModel {
@@ -803,6 +927,11 @@ impl TrainedContractModel {
 
     pub fn diagnostics(&self) -> &FitDiagnostics {
         &self.diagnostics
+    }
+
+    /// None for a loaded model: loading did not perform a new fit.
+    pub fn training_elapsed_millis(&self) -> Option<u64> {
+        self.training_elapsed_millis
     }
 
     pub fn predict(&self, features: &[f32]) -> Result<f32, ContractTrainingError> {
@@ -915,7 +1044,7 @@ impl TrainedContractModel {
         let model_path = output_dir.join(&model_file);
         publish_staged_file(&model_staging_path, &model_path, &model_sha256)?;
         let manifest = ContractModelBundleManifest {
-            schema_version: 1,
+            schema_version: 2,
             model_file,
             model_file_sha256: model_sha256,
             semantic_model_sha256: self.diagnostics.semantic_model_sha256.clone(),
@@ -996,6 +1125,7 @@ pub fn load_contract_model_bundle(
         model,
         request: manifest.request,
         diagnostics: manifest.diagnostics,
+        training_elapsed_millis: None,
     })
 }
 
@@ -1029,6 +1159,7 @@ fn train_parsed_contract_model(
 
     let device = NdArrayDevice::Cpu;
     let _backend_guard = lock_ndarray_backend()?;
+    let started = std::time::Instant::now();
     CpuAutodiffBackend::seed(&device, config.seed);
     let mut model = ReturnRegressorConfig::new(config.input_dim, config.hidden_dim)
         .init_model::<CpuAutodiffBackend>(&device);
@@ -1036,15 +1167,26 @@ fn train_parsed_contract_model(
     let _ = model.hidden.bias.as_ref().map(|bias| bias.val());
     let _ = model.output.weight.val();
     let _ = model.output.bias.as_ref().map(|bias| bias.val());
+    let initial_parameters_sha256 = semantic_model_sha256(&model.clone().valid())?;
+    let mut max_parameter_abs = parameter_abs_max(&model.clone().valid())?;
+    let mut max_gradient_abs = 0.0_f64;
+    let mut loss_history = Vec::new();
     let mut optimizer = AdamConfig::new().init();
     let features = rows
         .iter()
         .flat_map(|row| row.features.iter().copied())
         .collect::<Vec<_>>();
-    let targets = rows
+    let raw_targets = rows
         .iter()
         .map(|row| row.forward_return)
         .collect::<Vec<_>>();
+    let target_transform = MlpTargetTransformV1::fit(config.target_scale, &raw_targets)
+        .map_err(ContractTrainingError::Artifact)?;
+    let targets = raw_targets
+        .iter()
+        .map(|target| target_transform.transform(*target))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(ContractTrainingError::Artifact)?;
 
     for _ in 0..config.epochs {
         let feature_tensor = Tensor::<CpuAutodiffBackend, 2>::from_data(
@@ -1060,39 +1202,90 @@ fn train_parsed_contract_model(
             target_tensor,
             Reduction::Mean,
         );
+        let loss_value = loss
+            .clone()
+            .into_data()
+            .into_vec::<f32>()
+            .map_err(|error| ContractTrainingError::Artifact(format!("{error:?}")))?[0];
+        if !loss_value.is_finite() || loss_value < 0.0 {
+            return Err(ContractTrainingError::Artifact(
+                "MLP optimization loss is non-finite".into(),
+            ));
+        }
+        loss_history.push(f64::from(loss_value));
         let gradients = GradientsParams::from_grads(loss.backward(), &model);
+        max_gradient_abs = max_gradient_abs.max(gradient_abs_max(&gradients, &model)?);
         model = optimizer.step(config.learning_rate, model, gradients);
+        max_parameter_abs = max_parameter_abs.max(parameter_abs_max(&model.clone().valid())?);
     }
 
-    let model = model.valid();
-    let predictions = model
+    let normalized_model = model.valid();
+    let normalized_predictions = normalized_model
         .forward(Tensor::<CpuBackend, 2>::from_data(
-            TensorData::new(features, [rows.len(), config.input_dim]),
+            TensorData::new(features.clone(), [rows.len(), config.input_dim]),
             &device,
         ))
         .into_data()
         .into_vec::<f32>()
         .map_err(|error| ContractTrainingError::Artifact(format!("{error:?}")))?;
-    let mse = predictions
-        .iter()
-        .zip(&targets)
-        .map(|(prediction, target)| f64::from((prediction - target).powi(2)))
-        .sum::<f64>()
-        / rows.len() as f64;
+    loss_history.push(
+        normalized_predictions
+            .iter()
+            .zip(&targets)
+            .map(|(prediction, target)| (f64::from(*prediction) - f64::from(*target)).powi(2))
+            .sum::<f64>()
+            / rows.len() as f64,
+    );
+    let model = fold_target_inverse(normalized_model, &target_transform)?;
+    max_parameter_abs = max_parameter_abs.max(parameter_abs_max(&model)?);
+    let predictions = if config.target_scale == MlpTargetScaleV1::RawReturn {
+        normalized_predictions
+    } else {
+        model
+            .forward(Tensor::<CpuBackend, 2>::from_data(
+                TensorData::new(features, [rows.len(), config.input_dim]),
+                &device,
+            ))
+            .into_data()
+            .into_vec::<f32>()
+            .map_err(|error| ContractTrainingError::Artifact(format!("{error:?}")))?
+    };
+    let raw_targets: Vec<_> = raw_targets.into_iter().map(f64::from).collect();
+    let raw_predictions: Vec<_> = predictions.iter().copied().map(f64::from).collect();
+    let training_target_mean = raw_targets.iter().sum::<f64>() / rows.len() as f64;
+    let training_prediction =
+        MlpPredictionDiagnosticsV1::new(&raw_predictions, &raw_targets, training_target_mean)
+            .map_err(ContractTrainingError::Artifact)?;
+    let mse = training_prediction.mse;
     let directional_accuracy = predictions
         .iter()
-        .zip(&targets)
-        .filter(|(prediction, target)| prediction.signum() == target.signum())
+        .zip(&raw_targets)
+        .filter(|(prediction, target)| f64::from(prediction.signum()) == target.signum())
         .count() as f64
         / rows.len() as f64;
 
     let semantic_model_sha256 = semantic_model_sha256(&model)?;
     let request_semantic_sha256 = request.semantic_sha256()?;
+    let learning = MlpLearningDiagnosticsV1 {
+        schema_version: "mlp-learning-diagnostics-v1".into(),
+        updates_requested: config.epochs,
+        updates_completed: config.epochs,
+        initial_parameters_sha256: initial_parameters_sha256.as_str().into(),
+        target_transform,
+        loss_history,
+        max_gradient_abs,
+        max_parameter_abs,
+        training_prediction,
+        exit_reason: "fixed_update_budget_completed".into(),
+    };
+    learning
+        .validate()
+        .map_err(ContractTrainingError::Artifact)?;
     Ok(TrainedContractModel {
         model,
         request: request.clone(),
         diagnostics: FitDiagnostics {
-            schema_version: 1,
+            schema_version: 2,
             backend: TrainingBackend::BurnNdarrayAutodiff,
             algorithm: TrainingAlgorithm::BurnMlpAdamMseV1,
             artifact_format: ModelArtifactFormat::BurnpackV1,
@@ -1107,7 +1300,13 @@ fn train_parsed_contract_model(
             request_artifact_sha256: sealed_request.artifact_sha256.clone(),
             request_semantic_sha256,
             semantic_model_sha256,
+            learning,
         },
+        training_elapsed_millis: Some(
+            started.elapsed().as_millis().try_into().map_err(|_| {
+                ContractTrainingError::Artifact("training duration overflow".into())
+            })?,
+        ),
     })
 }
 
@@ -1120,7 +1319,7 @@ fn sha256_json_digest(value: &impl Serialize) -> Result<Sha256Digest, ContractTr
 fn validate_bundle_manifest(
     manifest: &ContractModelBundleManifest,
 ) -> Result<(), ContractTrainingError> {
-    if manifest.schema_version != 1 {
+    if manifest.schema_version != 2 {
         return Err(ContractTrainingError::UnsupportedSchemaVersion {
             artifact: "model bundle manifest",
             found: manifest.schema_version,
@@ -1137,7 +1336,11 @@ fn validate_bundle_manifest(
     let request_semantic_sha256 = manifest.request.semantic_sha256()?;
     let config_sha256 = sha256_json_digest(manifest.request.config())?;
     let diagnostics = &manifest.diagnostics;
-    if diagnostics.schema_version != 1
+    diagnostics
+        .learning
+        .validate()
+        .map_err(ContractTrainingError::InternalConsistency)?;
+    if diagnostics.schema_version != 2
         || diagnostics.backend != TrainingBackend::BurnNdarrayAutodiff
         || diagnostics.algorithm != TrainingAlgorithm::BurnMlpAdamMseV1
         || diagnostics.artifact_format != ModelArtifactFormat::BurnpackV1
@@ -1154,6 +1357,10 @@ fn validate_bundle_manifest(
         || diagnostics.request_semantic_sha256 != request_semantic_sha256
         || manifest.request_semantic_sha256 != request_semantic_sha256
         || diagnostics.semantic_model_sha256 != manifest.semantic_model_sha256
+        || diagnostics.learning.updates_requested != manifest.request.config.epochs
+        || diagnostics.learning.target_transform.mode != manifest.request.config.target_scale
+        || diagnostics.learning.training_prediction.row_count != diagnostics.row_count
+        || diagnostics.learning.training_prediction.mse != diagnostics.mse
     {
         return Err(ContractTrainingError::InternalConsistency(
             "manifest fields are not bound to the sealed request and diagnostics".to_string(),

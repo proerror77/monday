@@ -34,12 +34,16 @@ use thiserror::Error;
 
 #[cfg(feature = "kernel")]
 fn kernel_research_event(event: &str, details: serde_json::Value) {
+    research_event("alpha-engine-kernel", event, details);
+}
+
+pub(crate) fn research_event(component: &str, event: &str, details: serde_json::Value) {
     eprintln!(
         "{}",
         serde_json::json!({
             "schema_version": "monday.research_event.v1",
-            "timestamp": Utc::now().to_rfc3339(),
-            "component": "alpha-engine-kernel",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "component": component,
             "event": event,
             "details": details,
         })

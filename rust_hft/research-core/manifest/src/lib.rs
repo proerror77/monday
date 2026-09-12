@@ -1,5 +1,6 @@
 //! Manifest contracts for reproducible research, evaluation, promotion, and live rollout.
 
+pub mod mlp_training;
 pub mod model;
 
 use chrono::{DateTime, Utc};
