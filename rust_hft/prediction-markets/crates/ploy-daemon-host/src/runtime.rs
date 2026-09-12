@@ -1474,6 +1474,22 @@ pub(crate) fn seed_empty_live_ledgers(config: &PlatformConfig) {
     write_json(&config.trading_state_file, &snapshots).expect("seed canonical live ledgers");
 }
 
+#[cfg(test)]
+pub(crate) fn seed_acknowledged_live_order(
+    daemon: &mut PloyDaemon,
+    intent: TradingIntent,
+    venue_order_id: impl Into<String>,
+) -> String {
+    let order_id = format!("order-{}", intent.intent_id);
+    let deployment_id = intent.deployment_id.clone();
+    let runtime = daemon.trading.entry(deployment_id).or_default();
+    runtime
+        .submit_intent(intent, order_id.clone(), None)
+        .expect("seed live intent");
+    runtime.acknowledge_order(&order_id, venue_order_id.into());
+    order_id
+}
+
 pub async fn run_shared_forever(
     daemon: Arc<tokio::sync::Mutex<PloyDaemon>>,
     events: Arc<EventBroker>,
@@ -1507,7 +1523,9 @@ pub async fn run_shared_forever(
 
 #[cfg(test)]
 mod tests {
-    use super::{seed_empty_live_ledgers, PloyDaemon, ReconcileStatus};
+    use super::{
+        seed_acknowledged_live_order, seed_empty_live_ledgers, PloyDaemon, ReconcileStatus,
+    };
     use crate::config::PlatformConfig;
     use crate::test_support::StaticExecutionGateway;
     use async_trait::async_trait;
@@ -1536,6 +1554,17 @@ mod tests {
 
     const LIVE_WALLET: &str = "0x1111111111111111111111111111111111111111";
     const OTHER_LIVE_WALLET: &str = "0x2222222222222222222222222222222222222222";
+
+    fn assert_live_order_path_disabled(response: &PaperIntentResponse) {
+        assert_eq!(response.state, "rejected");
+        assert!(
+            response
+                .rejection_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains(super::MONDAY_EXECUTION_DISABLED)),
+            "{response:?}"
+        );
+    }
 
     fn temp_dir(label: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -3148,7 +3177,7 @@ mod tests {
             .submit_intent_idempotent(make_intent("c.paper", "intent-c", dec!(1)), Some("key-1"))
             .await
             .expect("different account may reuse key");
-        assert_eq!(submits.load(Ordering::SeqCst), 1);
+        assert_eq!(submits.load(Ordering::SeqCst), 0);
 
         daemon
             .write_runtime_snapshots()
@@ -3169,7 +3198,7 @@ mod tests {
             .await
             .expect("restored replay");
         assert_eq!(restored_replay.order_id, first.order_id);
-        assert_eq!(submits.load(Ordering::SeqCst), 1);
+        assert_eq!(submits.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -3226,17 +3255,14 @@ mod tests {
             .await
             .expect("submit live intent");
 
-        assert_eq!(response.state, "acknowledged");
+        assert_live_order_path_disabled(&response);
 
         let trading_state = daemon.trading_state();
         assert_eq!(trading_state.len(), 1);
         assert_eq!(trading_state[0].deployment_id, "example.live");
         assert_eq!(trading_state[0].orders.len(), 1);
-        assert_eq!(trading_state[0].orders[0].state, "acknowledged");
-        assert_eq!(
-            trading_state[0].orders[0].venue_order_id.as_deref(),
-            Some("venue-live-1")
-        );
+        assert_eq!(trading_state[0].orders[0].state, "rejected");
+        assert!(trading_state[0].orders[0].venue_order_id.is_none());
     }
 
     #[tokio::test]
@@ -3335,7 +3361,7 @@ mod tests {
             .await
             .expect("fresh running live admission");
 
-        assert_eq!(response.state, "acknowledged");
+        assert_live_order_path_disabled(&response);
     }
 
     #[tokio::test]
@@ -3387,9 +3413,9 @@ mod tests {
                 created_at: chrono::Utc::now(),
             })
             .await
-            .expect("unknown response");
+            .expect("disabled live submit");
 
-        assert_eq!(response.state, "unknown");
+        assert_live_order_path_disabled(&response);
         let deployment = daemon
             .inspect_deployment("example.live")
             .expect("deployment");
@@ -3424,7 +3450,6 @@ mod tests {
         seed_empty_live_ledgers(&config);
         let mut daemon =
             PloyDaemon::boot_with_live_execution(&config, Box::new(gateway.clone())).expect("boot");
-        daemon.fail_trading_state_write_on_attempt = Some(2);
         let intent = TradingIntent {
             intent_id: "intent-1".to_string(),
             deployment_id: "example.live".to_string(),
@@ -3439,25 +3464,15 @@ mod tests {
         let response = daemon
             .submit_intent_idempotent(intent.clone(), Some("key-1"))
             .await
-            .expect("unknown response");
-        assert_eq!(response.state, "unknown");
-        assert_eq!(submits.load(Ordering::SeqCst), 1);
-        let deployment = daemon
-            .inspect_deployment("example.live")
-            .expect("deployment");
-        assert_eq!(deployment.desired_state, DesiredState::Paused);
-        assert_eq!(deployment.observed_state, ObservedState::Degraded);
-        let persisted: serde_json::Value = serde_json::from_slice(
-            &fs::read(&config.trading_state_file).expect("durable unknown snapshot"),
-        )
-        .expect("snapshot json");
-        assert_eq!(persisted[0]["snapshot"]["orders"][0]["state"], "unknown");
+            .expect("disabled live submit");
+        assert_live_order_path_disabled(&response);
+        assert_eq!(submits.load(Ordering::SeqCst), 0);
         let replay = daemon
             .submit_intent_idempotent(intent, Some("key-1"))
             .await
-            .expect("idempotent unknown replay");
-        assert_eq!(replay.state, "unknown");
-        assert_eq!(submits.load(Ordering::SeqCst), 1);
+            .expect("idempotent disabled replay");
+        assert_eq!(replay.state, "rejected");
+        assert_eq!(submits.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -3514,15 +3529,15 @@ mod tests {
             .await
             .expect("submit live intent");
 
-        assert_eq!(response.state, "rejected");
+        assert_live_order_path_disabled(&response);
 
         let trading_state = daemon.trading_state();
         assert_eq!(trading_state[0].orders.len(), 1);
         assert_eq!(trading_state[0].orders[0].state, "rejected");
-        assert_eq!(
-            trading_state[0].orders[0].rejection_reason.as_deref(),
-            Some("market closed")
-        );
+        assert!(trading_state[0].orders[0]
+            .rejection_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains(super::MONDAY_EXECUTION_DISABLED)));
     }
 
     #[tokio::test]
@@ -3579,18 +3594,13 @@ mod tests {
                 created_at: chrono::Utc::now(),
             })
             .await
-            .expect("transport ambiguity response");
+            .expect("disabled live submit");
 
-        assert_eq!(response.state, "unknown");
+        assert_live_order_path_disabled(&response);
         let trading_state = daemon.trading_state();
         assert_eq!(trading_state[0].orders.len(), 1);
-        assert_eq!(trading_state[0].orders[0].state, "unknown");
-        assert!(trading_state[0].orders[0].rejection_reason.is_none());
-        assert!(trading_state[0].orders[0]
-            .last_error
-            .as_deref()
-            .expect("last_error")
-            .contains("gateway offline"));
+        assert_eq!(trading_state[0].orders[0].state, "rejected");
+        assert!(trading_state[0].orders[0].venue_order_id.is_none());
     }
 
     #[tokio::test]
@@ -3631,8 +3641,9 @@ mod tests {
         seed_empty_live_ledgers(&config);
         let mut daemon =
             PloyDaemon::boot_with_live_execution(&config, Box::new(gateway)).expect("boot");
-        daemon
-            .submit_intent(TradingIntent {
+        seed_acknowledged_live_order(
+            &mut daemon,
+            TradingIntent {
                 intent_id: "intent-live-cancel".to_string(),
                 deployment_id: "example.live".to_string(),
                 market_id: "market-1".to_string(),
@@ -3642,20 +3653,23 @@ mod tests {
                 limit_price: Some(dec!(0.55)),
                 purpose: IntentPurpose::Entry,
                 created_at: chrono::Utc::now(),
-            })
-            .await
-            .expect("submit live intent");
+            },
+            "venue-live-cancel-1",
+        );
 
-        let response = daemon
+        let error = daemon
             .cancel_order("example.live", "order-intent-live-cancel")
             .await
-            .expect("cancel live order");
+            .expect_err("live cancel is disabled");
 
-        assert_eq!(response.state, "canceled");
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert!(error.to_string().contains(super::MONDAY_EXECUTION_DISABLED));
         let trading_state = daemon.trading_state();
-        assert_eq!(trading_state[0].orders[0].state, "canceled");
-        assert_eq!(trading_state[0].risk.pending_intents, 0);
-        assert_eq!(trading_state[0].risk.active_orders, 0);
+        assert_eq!(trading_state[0].orders[0].state, "acknowledged");
+        assert_eq!(
+            trading_state[0].orders[0].venue_order_id.as_deref(),
+            Some("venue-live-cancel-1")
+        );
     }
 
     #[tokio::test]
@@ -3696,8 +3710,9 @@ mod tests {
         seed_empty_live_ledgers(&config);
         let mut daemon =
             PloyDaemon::boot_with_live_execution(&config, Box::new(gateway)).expect("boot");
-        daemon
-            .submit_intent(TradingIntent {
+        seed_acknowledged_live_order(
+            &mut daemon,
+            TradingIntent {
                 intent_id: "intent-live-replace".to_string(),
                 deployment_id: "example.live".to_string(),
                 market_id: "market-1".to_string(),
@@ -3707,11 +3722,11 @@ mod tests {
                 limit_price: Some(dec!(0.55)),
                 purpose: IntentPurpose::Entry,
                 created_at: chrono::Utc::now(),
-            })
-            .await
-            .expect("submit live intent");
+            },
+            "venue-live-replace-1",
+        );
 
-        let response = daemon
+        let error = daemon
             .replace_order(
                 "example.live",
                 "order-intent-live-replace",
@@ -3721,36 +3736,16 @@ mod tests {
                 },
             )
             .await
-            .expect("replace live order");
+            .expect_err("live replace is disabled");
 
-        assert_eq!(response.state, "acknowledged");
-        assert_eq!(response.order_id, "order-intent-live-replace");
-        assert_eq!(response.revision, 1);
-        assert_eq!(
-            response.venue_order_id.as_deref(),
-            Some("venue-live-replace-2")
-        );
-        assert_eq!(
-            response.venue_order_history,
-            vec!["venue-live-replace-1".to_string()]
-        );
-        assert_eq!(response.requested_qty, dec!(3));
-        assert_eq!(response.limit_price, Some(dec!(0.57)));
-
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert!(error.to_string().contains(super::MONDAY_EXECUTION_DISABLED));
         let trading_state = daemon.trading_state();
         assert_eq!(
-            trading_state[0].orders[0].order_id,
-            "order-intent-live-replace"
-        );
-        assert_eq!(trading_state[0].orders[0].revision, 1);
-        assert_eq!(
-            trading_state[0].orders[0].venue_order_history,
-            vec!["venue-live-replace-1".to_string()]
-        );
-        assert_eq!(
             trading_state[0].orders[0].venue_order_id.as_deref(),
-            Some("venue-live-replace-2")
+            Some("venue-live-replace-1")
         );
+        assert!(trading_state[0].orders[0].venue_order_history.is_empty());
     }
 
     #[tokio::test]
@@ -3805,8 +3800,9 @@ mod tests {
             ),
         )
         .expect("boot");
-        daemon
-            .submit_intent(TradingIntent {
+        seed_acknowledged_live_order(
+            &mut daemon,
+            TradingIntent {
                 intent_id: "intent-live-replace-invalid".to_string(),
                 deployment_id: "example.live".to_string(),
                 market_id: "market-1".to_string(),
@@ -3816,9 +3812,9 @@ mod tests {
                 limit_price: Some(dec!(0.55)),
                 purpose: IntentPurpose::Entry,
                 created_at: chrono::Utc::now(),
-            })
-            .await
-            .expect("submit live intent");
+            },
+            "venue-live-replace-invalid-1",
+        );
         assert!(matches!(
             daemon
                 .reconcile_live_fills()
@@ -4240,8 +4236,9 @@ mod tests {
             ),
         )
         .expect("boot");
-        daemon
-            .submit_intent(TradingIntent {
+        seed_acknowledged_live_order(
+            &mut daemon,
+            TradingIntent {
                 intent_id: "intent-live-3".to_string(),
                 deployment_id: "example.live".to_string(),
                 market_id: "market-1".to_string(),
@@ -4251,9 +4248,9 @@ mod tests {
                 limit_price: Some(dec!(0.44)),
                 purpose: IntentPurpose::Entry,
                 created_at: chrono::Utc::now(),
-            })
-            .await
-            .expect("submit live intent");
+            },
+            "venue-live-3",
+        );
 
         let reconciled = daemon
             .reconcile_live_fills()
@@ -4306,8 +4303,9 @@ mod tests {
             Box::new(StaticExecutionGateway::acknowledged("venue-live-restart-1")),
         )
         .expect("boot");
-        daemon
-            .submit_intent(TradingIntent {
+        seed_acknowledged_live_order(
+            &mut daemon,
+            TradingIntent {
                 intent_id: "intent-live-restart".to_string(),
                 deployment_id: "example.live".to_string(),
                 market_id: "market-1".to_string(),
@@ -4317,9 +4315,9 @@ mod tests {
                 limit_price: Some(dec!(0.41)),
                 purpose: IntentPurpose::Entry,
                 created_at: chrono::Utc::now(),
-            })
-            .await
-            .expect("submit live intent");
+            },
+            "venue-live-restart-1",
+        );
         daemon.write_runtime_snapshots().expect("write snapshots");
 
         let mut restored = PloyDaemon::boot_with_live_execution(
@@ -4415,8 +4413,9 @@ mod tests {
             ),
         )
         .expect("boot");
-        daemon
-            .submit_intent(TradingIntent {
+        seed_acknowledged_live_order(
+            &mut daemon,
+            TradingIntent {
                 intent_id: "intent-live-4".to_string(),
                 deployment_id: "example.live".to_string(),
                 market_id: "market-1".to_string(),
@@ -4426,9 +4425,9 @@ mod tests {
                 limit_price: Some(dec!(0.41)),
                 purpose: IntentPurpose::Entry,
                 created_at: chrono::Utc::now(),
-            })
-            .await
-            .expect("submit live intent");
+            },
+            "venue-live-4",
+        );
 
         assert_eq!(
             daemon
@@ -4491,8 +4490,9 @@ mod tests {
             Box::new(FlakyReconcileGateway::default()),
         )
         .expect("boot");
-        daemon
-            .submit_intent(TradingIntent {
+        seed_acknowledged_live_order(
+            &mut daemon,
+            TradingIntent {
                 intent_id: "intent-live-health".to_string(),
                 deployment_id: "example.live".to_string(),
                 market_id: "market-1".to_string(),
@@ -4502,9 +4502,9 @@ mod tests {
                 limit_price: Some(dec!(0.41)),
                 purpose: IntentPurpose::Entry,
                 created_at: chrono::Utc::now(),
-            })
-            .await
-            .expect("submit live intent");
+            },
+            "venue-live-health",
+        );
 
         let _ = daemon.reconcile_live_fills().await;
         daemon.write_runtime_snapshots().expect("degraded snapshot");
@@ -4669,8 +4669,9 @@ mod tests {
             Box::new(FlakyReconcileGateway::default()),
         )
         .expect("boot");
-        daemon
-            .submit_intent(TradingIntent {
+        seed_acknowledged_live_order(
+            &mut daemon,
+            TradingIntent {
                 intent_id: "intent-live-metrics".to_string(),
                 deployment_id: "example.live".to_string(),
                 market_id: "market-1".to_string(),
@@ -4680,9 +4681,9 @@ mod tests {
                 limit_price: Some(dec!(0.41)),
                 purpose: IntentPurpose::Entry,
                 created_at: chrono::Utc::now(),
-            })
-            .await
-            .expect("submit live intent");
+            },
+            "venue-live-metrics",
+        );
 
         let _ = daemon.reconcile_live_fills().await;
         daemon.write_runtime_snapshots().expect("degraded snapshot");
