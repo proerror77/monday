@@ -37,8 +37,9 @@
   material scope choice or required authority remains unresolved; continue
   independent work. Preserve unrelated changes and resume from existing task
   evidence after interruption.
-- For architecture or module ownership changes, read `rust_hft/ARCHITECTURE.md`
-  and `docs/architecture/REPOSITORY_LAYOUT.md`, then the relevant implementation.
+- For architecture or module ownership changes, read `README.md`,
+  `rust_hft/ARCHITECTURE.md`, and `docs/architecture/REPOSITORY_LAYOUT.md`, then the
+  relevant implementation.
   For tracked work, use `docs/agents/issue-tracker.md` and
   `docs/agents/triage-labels.md`; use `docs/agents/domain.md` for domain docs.
 - Backward compatibility is not a goal. Remove obsolete paths instead of adding
