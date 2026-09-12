@@ -2374,6 +2374,7 @@ fn run_cex_supervised_model_research(
         evaluate_cex_supervised_model(context, factor_bank, burn, decision_policy)
             .map_err(|error| anyhow::anyhow!("Burn MLP supervised evaluation failed: {error}"))
     })?;
+    let mut metric_inputs = Vec::new();
     for (name, evaluation) in [("ridge", &ridge), ("cart", &cart), ("burn_mlp", &burn)] {
         evaluation.validate().map_err(anyhow::Error::msg)?;
         store.put_registry_revision(&RegistryRevision {
@@ -2392,6 +2393,13 @@ fn run_cex_supervised_model_research(
             &results_dir.join(format!("{name}-supervised-candidate.json")),
             &evaluation.candidate,
         )?;
+        metric_inputs.push(
+            alpha_engine::model_metrics::summarize_model_evaluation(
+                evaluation,
+                &sha256_file(&results_dir.join(format!("{name}-supervised-backtest.json")))?,
+            )
+            .map_err(anyhow::Error::msg)?,
+        );
         research_event(
             "alpha-harness",
             "supervised_model_completed",
@@ -2424,6 +2432,16 @@ fn run_cex_supervised_model_research(
         order_submission_authority: false,
     };
     selection.validate()?;
+    let metric_report = crate::mission_metrics::build_report(
+        metric_inputs,
+        std::slice::from_ref(&selection),
+        Some(CexBaselineModelKindV1::Ridge),
+    )?;
+    crate::mission_metrics::persist_report(
+        &metric_report,
+        &results_dir.join(crate::mission_metrics::METRICS_JSON),
+        &results_dir.join(crate::mission_metrics::METRICS_CSV),
+    )?;
     data_mission::write_json_atomic(
         &results_dir.join("supervised-model-selection.json"),
         &selection,
@@ -3835,6 +3853,7 @@ pub(crate) fn recover_execution_report_from_published_result(
     if !supervised_ml && (supervised_selection.is_some() || supervised_replay_receipt.is_some()) {
         bail!("published legacy result contains supervised ML artifacts");
     }
+    let mut metric_candidate_refs = std::collections::BTreeMap::new();
     if let Some(selection) = &supervised_selection {
         selection.validate()?;
         if selection.mission_id != expected_mission_id {
@@ -3890,9 +3909,12 @@ pub(crate) fn recover_execution_report_from_published_result(
                 &factor_bank,
                 baseline,
             )?;
-            if content_reference(&candidate.artifact_id, &candidate)?
-                == selection.selected_candidate
-            {
+            let candidate_reference = content_reference(&candidate.artifact_id, &candidate)?;
+            metric_candidate_refs.insert(
+                alpha_engine::model_metrics::model_artifact_stem(candidate.model_kind),
+                candidate_reference.clone(),
+            );
+            if candidate_reference == selection.selected_candidate {
                 selected_candidate = Some(candidate);
             }
         }
@@ -3914,6 +3936,12 @@ pub(crate) fn recover_execution_report_from_published_result(
     } else if supervised_replay_receipt.is_some() {
         bail!("published supervised replay has no model selection evidence");
     }
+    validate_model_metric_readback(
+        &mut archive,
+        expected_mission_id,
+        supervised_selection.as_ref(),
+        &metric_candidate_refs,
+    )?;
 
     let finalization: Option<CexFinalizationReportV1> =
         read_bundle_json(&mut archive, "results/finalization-report.json", 128 * 1024)?;
@@ -4326,6 +4354,84 @@ fn validate_recovered_finalization(
         bail!("published result bundle failed sealed holdout cannot carry deployable lineage");
     }
     Ok(())
+}
+
+fn validate_model_metric_readback(
+    archive: &mut zip::ZipArchive<File>,
+    expected_mission_id: &str,
+    selection: Option<&CexSupervisedModelSelectionV1>,
+    candidates: &std::collections::BTreeMap<&str, CexResearchContentRefV1>,
+) -> anyhow::Result<()> {
+    let report_bytes = read_optional_bundle_bytes(
+        archive,
+        &format!("results/{}", crate::mission_metrics::METRICS_JSON),
+        crate::mission_metrics::MAX_METRICS_BYTES,
+    )?;
+    let csv_bytes = read_optional_bundle_bytes(
+        archive,
+        &format!("results/{}", crate::mission_metrics::METRICS_CSV),
+        crate::mission_metrics::MAX_METRICS_BYTES,
+    )?;
+    if report_bytes.is_none() && csv_bytes.is_none() {
+        // Older completed artifacts and empty-factor rounds have no derived
+        // comparison. Their original native evidence requirements still apply.
+        return Ok(());
+    }
+    let selection = selection.context("published model metrics lack model selection evidence")?;
+    let report: alpha_engine::model_metrics::CexModelMetricsReportV1 =
+        serde_json::from_slice(&report_bytes.context("published model metrics JSON is missing")?)?;
+    let csv = csv_bytes.context("published model metrics CSV is missing")?;
+    if candidates.len() != CEX_SUPERVISED_MODEL_NAMES.len()
+        || report.groups.len() != 1
+        || report.groups[0].cohort.mission_id != expected_mission_id
+    {
+        bail!("published model metric cohort is incomplete or mismatched");
+    }
+    let mut inputs = Vec::new();
+    for name in CEX_SUPERVISED_MODEL_NAMES {
+        let bytes = read_bundle_bytes(
+            archive,
+            &format!("results/{name}-supervised-backtest.json"),
+            crate::mission_metrics::MAX_BACKTEST_BYTES,
+        )
+        .context("published model metrics lack an original model backtest")?;
+        let evaluation: CexSupervisedModelEvaluationV2 = serde_json::from_slice(&bytes)?;
+        if candidates.get(name)
+            != Some(&content_reference(
+                &evaluation.candidate.artifact_id,
+                &evaluation.candidate,
+            )?)
+        {
+            bail!("published model metric backtest candidate differs from native evidence");
+        }
+        inputs.push(
+            alpha_engine::model_metrics::summarize_model_evaluation(
+                &evaluation,
+                &format!("{:x}", Sha256::digest(&bytes)),
+            )
+            .map_err(anyhow::Error::msg)?,
+        );
+    }
+    let expected = crate::mission_metrics::build_report(
+        inputs,
+        std::slice::from_ref(selection),
+        Some(CexBaselineModelKindV1::Ridge),
+    )?;
+    if report != expected || csv != expected.to_csv().as_bytes() {
+        bail!("published model metrics differ from their original backtest evidence");
+    }
+    Ok(())
+}
+
+fn read_optional_bundle_bytes(
+    archive: &mut zip::ZipArchive<File>,
+    name: &str,
+    max_bytes: u64,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    if !archive.file_names().any(|entry| entry == name) {
+        return Ok(None);
+    }
+    read_bundle_bytes(archive, name, max_bytes).map(Some)
 }
 
 fn read_bundle_json<T: for<'de> Deserialize<'de>>(

@@ -8,6 +8,7 @@ pub mod formula_evaluator;
 #[cfg(feature = "kernel")]
 pub mod learning;
 pub mod llm;
+pub mod model_metrics;
 
 #[cfg(feature = "kernel")]
 use alpha_domain::{

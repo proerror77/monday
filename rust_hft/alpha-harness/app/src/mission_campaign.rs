@@ -5701,10 +5701,123 @@ mod tests {
             let results = fixture
                 .work_dir
                 .join(format!("mission/{round}/execute/results"));
+            assert!(
+                results.join("supervised-model-metrics.json").exists(),
+                "each supervised round must publish a unified comparison report"
+            );
+            assert!(results.join("supervised-model-metrics.csv").exists());
+            let metrics: alpha_engine::model_metrics::CexModelMetricsReportV1 =
+                serde_json::from_slice(
+                    &std::fs::read(results.join("supervised-model-metrics.json")).unwrap(),
+                )
+                .unwrap();
+            assert_eq!(metrics.model_count(), 3);
+            assert_eq!(metrics.groups.len(), 1);
+            assert_eq!(
+                std::fs::read(results.join("supervised-model-metrics.csv")).unwrap(),
+                metrics.to_csv().as_bytes(),
+            );
+            let original_ridge: alpha_engine::baselines::CexSupervisedModelEvaluationV2 =
+                serde_json::from_slice(
+                    &std::fs::read(results.join("ridge-supervised-backtest.json")).unwrap(),
+                )
+                .unwrap();
+            let ridge_metrics = metrics.groups[0]
+                .models
+                .iter()
+                .find(|model| model.model_kind == alpha_domain::CexBaselineModelKindV1::Ridge)
+                .unwrap();
+            assert_eq!(
+                ridge_metrics.native,
+                original_ridge.report.evaluation.metrics
+            );
+            assert_eq!(
+                metrics.groups[0].cohort.evaluation_protocol.metrics,
+                original_ridge
+                    .candidate
+                    .evaluation
+                    .evaluation_protocol
+                    .as_ref()
+                    .unwrap()
+                    .metrics,
+            );
+            assert_eq!(ridge_metrics.complete_utc_days, 0);
+            assert!(ridge_metrics.daily_net_sharpe.value().is_none());
+            let mut changed_ledger = original_ridge.clone();
+            changed_ledger.report.ledger[0].net_return += 0.001;
+            let error = alpha_engine::model_metrics::summarize_model_evaluation(
+                &changed_ledger,
+                &"f".repeat(64),
+            )
+            .err()
+            .expect("a derived report must reject inconsistent source accounting");
+            assert!(error.contains("ledger accounting"));
             assert!(!results.join("factor-subset-mcts-result.json").exists());
             assert!(!results.join("cex-event-replay-receipt.json").exists());
             assert!(!results.join("finalization-report.json").exists());
         }
+
+        // Rehashing both a forged comparison and the outer ZIP must not make
+        // its metrics authoritative over the original model evaluations.
+        let bundle_path = Path::new(&loaded.request.rounds[0].result_readback_url);
+        let result_path = Path::new(&loaded.request.campaign_result_readback_url);
+        let original_bundle = std::fs::read(bundle_path).unwrap();
+        let original_result = std::fs::read(result_path).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&original_bundle)).unwrap();
+        let mut entries = Vec::new();
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            entries.push((entry.name().to_string(), bytes));
+        }
+        let metric_entry = entries
+            .iter()
+            .find(|(name, _)| name == "results/supervised-model-metrics.json")
+            .unwrap();
+        let mut forged: alpha_engine::model_metrics::CexModelMetricsReportV1 =
+            serde_json::from_slice(&metric_entry.1).unwrap();
+        forged.groups[0].models[0]
+            .native
+            .predictive
+            .time_series_icir = Some(999.0);
+        forged.report_id.clear();
+        forged.report_id = format!(
+            "cex-model-metrics-{}",
+            canonical_json_hash(&forged).unwrap()
+        );
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, bytes) in entries {
+            writer
+                .start_file(&name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            let replacement = match name.as_str() {
+                "results/supervised-model-metrics.json" => {
+                    serde_json::to_vec_pretty(&forged).unwrap()
+                }
+                "results/supervised-model-metrics.csv" => forged.to_csv().into_bytes(),
+                _ => bytes,
+            };
+            writer.write_all(&replacement).unwrap();
+        }
+        std::fs::write(bundle_path, writer.finish().unwrap().into_inner()).unwrap();
+        let changed_hash = crate::mission_runner::sha256_file(bundle_path).unwrap();
+        let mut changed: serde_json::Value = serde_json::from_slice(&original_result).unwrap();
+        changed["rounds"][0]["result_bundle_sha256"] = serde_json::json!(changed_hash);
+        changed["rounds"][0]["result_readback_bundle_sha256"] = serde_json::json!(changed_hash);
+        std::fs::write(result_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+        let rejection =
+            readback_pre_holdout_terminal(&client, &loaded.request, &loaded.sha256, &protocol)
+                .err()
+                .map(|error| format!("{error:#}"));
+        std::fs::write(bundle_path, original_bundle).unwrap();
+        std::fs::write(result_path, original_result).unwrap();
+        let rejection = rejection
+            .expect("self-consistent metric sidecars cannot replace original model metrics");
+        assert!(
+            rejection.contains("published model metrics differ"),
+            "unexpected rejection: {rejection}"
+        );
 
         assert_final_worker_outcome(
             &fixture,
