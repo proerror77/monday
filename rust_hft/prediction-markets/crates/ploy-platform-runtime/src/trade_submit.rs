@@ -1,9 +1,10 @@
+use crate::execution_client::MONDAY_EXECUTION_DISABLED;
 use crate::order_state_wire;
-use hft_core::{OrderId, OrderType, Price, Quantity, Side, Symbol, TimeInForce, VenueId};
+use hft_core::OrderId;
 use ploy_operator_contracts::{DeploymentRuntimeMode, PaperIntentResponse};
 use ploy_platform::DeploymentRecord;
 use portfolio_core::prediction::{TradingIntent, TradingRuntime};
-use ports::{ExecutionClient, OrderIntent};
+use ports::ExecutionClient;
 use std::io;
 
 fn response_for_order(
@@ -126,32 +127,17 @@ pub async fn finish_live_intent(
 }
 
 pub async fn execute_live_intent(
-    client: &mut dyn ExecutionClient,
+    _client: &mut dyn ExecutionClient,
     prepared: &PreparedLiveIntent,
 ) -> Result<OrderId, hft_core::HftError> {
-    let PreparedLiveIntent::Pending { intent, order_id } = prepared else {
+    let PreparedLiveIntent::Pending { .. } = prepared else {
         return Err(hft_core::HftError::InvalidOrder(
             "existing live intent must not be submitted again".to_string(),
         ));
     };
-    let canonical_intent = OrderIntent::prediction_market(
-        Symbol::new(intent.token_id.clone()),
-        match intent.side {
-            portfolio_core::prediction::TradeSide::Buy => Side::Buy,
-            portfolio_core::prediction::TradeSide::Sell => Side::Sell,
-        },
-        Quantity(intent.quantity),
-        if intent.limit_price.is_some() {
-            OrderType::Limit
-        } else {
-            OrderType::Market
-        },
-        intent.limit_price.map(Price),
-        TimeInForce::GTC,
-        format!("{}:{order_id}", intent.deployment_id),
-        VenueId::POLYMARKET,
-    );
-    client.place_order(canonical_intent).await
+    Err(hft_core::HftError::Config(
+        MONDAY_EXECUTION_DISABLED.to_string(),
+    ))
 }
 
 pub fn apply_live_intent_outcome(
@@ -208,6 +194,7 @@ mod tests {
         apply_live_intent_outcome, execute_live_intent, prepare_live_intent, submit_live_intent,
         submit_paper_intent,
     };
+    use crate::execution_client::MONDAY_EXECUTION_DISABLED;
     use async_trait::async_trait;
     use ploy_operator_contracts::{DeploymentState, DesiredState, ObservedState};
     use ploy_platform::DeploymentRecord;
@@ -395,18 +382,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_submit_does_not_resubmit_identical_idempotent_replay() {
+    async fn live_submit_never_calls_place_order_even_with_a_swapped_client() {
         let mut runtime = TradingRuntime::default();
         let mut gateway = CountingGateway::default();
         let first = submit_live_intent(&mut runtime, &mut gateway, intent(), Some("request-1"))
             .await
-            .expect("first submit");
+            .expect("disabled live submit still records a terminal local reject");
         let second = submit_live_intent(&mut runtime, &mut gateway, intent(), Some("request-1"))
             .await
-            .expect("idempotent replay");
+            .expect("idempotent replay of the disabled reject");
 
+        assert_eq!(first.state, "rejected");
+        assert!(first
+            .rejection_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains(MONDAY_EXECUTION_DISABLED)));
         assert_eq!(second, first);
-        assert_eq!(gateway.submits.load(Ordering::SeqCst), 1);
+        assert_eq!(gateway.submits.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -433,12 +425,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transport_error_stays_unknown_and_is_not_retried() {
+    async fn disabled_live_submit_is_not_retried_as_a_transport_unknown() {
         let mut runtime = TradingRuntime::default();
         let mut gateway = TransportGateway::default();
         let first = submit_live_intent(&mut runtime, &mut gateway, intent(), Some("request-1"))
             .await
-            .expect("unknown response");
+            .expect("disabled live submit");
         let snapshot = runtime.snapshot(&Default::default());
         let mut restored = TradingRuntime::restore(snapshot).expect("canonical restore");
         let mut replay_gateway = CountingGateway::default();
@@ -451,9 +443,9 @@ mod tests {
         .await
         .expect("durable replay");
 
-        assert_eq!(first.state, "unknown");
+        assert_eq!(first.state, "rejected");
         assert_eq!(replay.order_id, first.order_id);
-        assert_eq!(gateway.submits.load(Ordering::SeqCst), 1);
+        assert_eq!(gateway.submits.load(Ordering::SeqCst), 0);
         assert_eq!(replay_gateway.submits.load(Ordering::SeqCst), 0);
     }
 
@@ -472,6 +464,10 @@ mod tests {
         );
 
         let outcome = execute_live_intent(&mut gateway, &prepared).await;
+        assert!(matches!(
+            &outcome,
+            Err(hft_core::HftError::Config(message)) if message == MONDAY_EXECUTION_DISABLED
+        ));
         assert_eq!(
             runtime
                 .order("order-intent-1")
@@ -482,7 +478,7 @@ mod tests {
 
         let response = apply_live_intent_outcome(&mut runtime, prepared, outcome)
             .expect("apply submission outcome");
-        assert_eq!(response.state, "acknowledged");
-        assert_eq!(gateway.submits.load(Ordering::SeqCst), 1);
+        assert_eq!(response.state, "rejected");
+        assert_eq!(gateway.submits.load(Ordering::SeqCst), 0);
     }
 }

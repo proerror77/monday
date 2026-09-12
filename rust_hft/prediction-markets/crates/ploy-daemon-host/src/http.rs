@@ -2656,11 +2656,13 @@ mod tests {
         ADMIN_SESSION_COOKIE_NAME,
     };
     use crate::events::EventBroker;
+    use crate::runtime::seed_acknowledged_live_order;
     use crate::test_support::StaticExecutionGateway;
     use async_trait::async_trait;
     use chrono::{Duration, Utc};
     use ploy_operator_contracts::AuditLogEntry;
     use ploy_operator_contracts::{OrderReplaceRequest, PaperIntentRequest};
+    use ploy_platform_runtime::execution_client::MONDAY_EXECUTION_DISABLED;
     use ploy_platform_runtime::runtime_support::IntentAdmissionSource;
     use ploy_strategy_bundles::strategies::three_layer::ThreeLayerConfig;
     use ploy_strategy_bundles::{
@@ -4168,17 +4170,16 @@ mod tests {
         )
         .await;
         assert_eq!(submit_code, 200);
-        assert!(submit_response.contains("\"state\":\"acknowledged\""));
+        assert!(submit_response.contains("\"state\":\"rejected\""));
+        assert!(submit_response.contains(MONDAY_EXECUTION_DISABLED));
 
         let trading_body =
             fs::read_to_string(runtime_root.join("trading-state.json")).expect("trading snapshot");
         let trading: serde_json::Value =
             serde_json::from_str(&trading_body).expect("snapshot json");
         assert_eq!(trading[0]["snapshot"]["deployment_id"], "example.live");
-        assert_eq!(
-            trading[0]["snapshot"]["orders"][0]["venue_order_id"],
-            "venue-live-http-1"
-        );
+        assert_eq!(trading[0]["snapshot"]["orders"][0]["state"], "rejected");
+        assert!(trading[0]["snapshot"]["orders"][0]["venue_order_id"].is_null());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4241,61 +4242,36 @@ mod tests {
             purpose: ploy_operator_contracts::IntentPurpose::Entry,
         })
         .expect("request json");
-        let retry_body = body.clone();
-        let request_state = Arc::clone(&state);
-        let request = tokio::spawn(async move {
-            handle_runtime_request(
-                "POST",
-                "/api/deployments/example.live/intents",
-                Some(&body),
-                &request_state,
-            )
-            .await
-        });
-
-        entered_rx
-            .recv_timeout(StdDuration::from_secs(2))
-            .expect("venue submit entered");
+        let (status, response) = handle_runtime_request(
+            "POST",
+            "/api/deployments/example.live/intents",
+            Some(&body),
+            &state,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(response.contains("\"state\":\"rejected\""));
+        assert!(response.contains(MONDAY_EXECUTION_DISABLED));
+        assert_eq!(submits.load(Ordering::SeqCst), 0);
+        assert!(
+            entered_rx.try_recv().is_err(),
+            "disabled live submit must not enter the venue client"
+        );
+        let _release_tx = release_tx;
         let daemon_guard = state
             .daemon
             .try_lock()
-            .expect("daemon mutex must be available during venue submit");
+            .expect("daemon mutex must be available because venue submit is never entered");
+        let order = daemon_guard
+            .trading
+            .get("example.live")
+            .and_then(|runtime| runtime.order("order-request-blocking-1"))
+            .expect("rejected order");
         assert_eq!(
-            daemon_guard
-                .trading
-                .get("example.live")
-                .and_then(|runtime| runtime.order("order-request-blocking-1"))
-                .expect("pending order")
-                .state,
-            portfolio_core::prediction::OrderState::Pending
+            order.state,
+            portfolio_core::prediction::OrderState::Rejected
         );
         drop(daemon_guard);
-
-        let retry_state = Arc::clone(&state);
-        let (retry_tx, retry_rx) = mpsc::channel();
-        let retry_task = tokio::spawn(async move {
-            let _ = retry_tx.send(
-                handle_runtime_request(
-                    "POST",
-                    "/api/deployments/example.live/intents",
-                    Some(&retry_body),
-                    &retry_state,
-                )
-                .await,
-            );
-        });
-        let (retry_status, retry_response) = retry_rx
-            .recv_timeout(StdDuration::from_secs(2))
-            .expect("idempotent retry must not wait for venue");
-        assert_eq!(retry_status, 200);
-        assert!(retry_response.contains("\"state\":\"pending\""));
-        assert_eq!(submits.load(Ordering::SeqCst), 1);
-        retry_task.await.expect("retry task");
-
-        release_tx.send(()).expect("release submit");
-        let (status, response) = request.await.expect("request task");
-        assert_eq!(status, 200);
-        assert!(response.contains("\"state\":\"acknowledged\""));
     }
 
     #[tokio::test]
@@ -4367,14 +4343,15 @@ mod tests {
         )
         .await;
         assert_eq!(submit_code, 200);
-        assert!(submit_response.contains("\"state\":\"unknown\""));
-        assert!(submit_response.contains("gateway offline"));
+        assert!(submit_response.contains("\"state\":\"rejected\""));
+        assert!(submit_response.contains(MONDAY_EXECUTION_DISABLED));
+        assert!(!submit_response.contains("gateway offline"));
 
         let trading_body =
             fs::read_to_string(root.join("run/platform/trading-state.json")).expect("snapshot");
         let trading: serde_json::Value =
             serde_json::from_str(&trading_body).expect("snapshot json");
-        assert_eq!(trading[0]["snapshot"]["orders"][0]["state"], "unknown");
+        assert_eq!(trading[0]["snapshot"]["orders"][0]["state"], "rejected");
         assert_eq!(trading[0]["snapshot"]["deployment_id"], "example.live");
     }
 
@@ -4421,37 +4398,25 @@ mod tests {
             "example.live",
             ploy_operator_contracts::ObservedState::Running,
         );
+        let order_id = seed_acknowledged_live_order(
+            &mut daemon,
+            TradingIntent {
+                intent_id: "intent-live-http-cancel".to_string(),
+                deployment_id: "example.live".to_string(),
+                market_id: "market-1".to_string(),
+                token_id: "token-1".to_string(),
+                side: TradeSide::Buy,
+                quantity: rust_decimal::Decimal::ONE,
+                limit_price: Some(rust_decimal::Decimal::new(5, 1)),
+                purpose: TradingIntentPurpose::Entry,
+                created_at: chrono::Utc::now(),
+            },
+            "venue-live-http-cancel-1",
+        );
         let state = Arc::new(AppState {
             daemon: Arc::new(tokio::sync::Mutex::new(daemon)),
             events: Arc::new(EventBroker::default()),
         });
-
-        let submit_body = serde_json::to_string(&PaperIntentRequest {
-            idempotency_key: None,
-            market_id: "market-1".to_string(),
-            token_id: "token-1".to_string(),
-            side: "buy".to_string(),
-            quantity: rust_decimal::Decimal::ONE,
-            limit_price: Some(rust_decimal::Decimal::new(5, 1)),
-            purpose: ploy_operator_contracts::IntentPurpose::Entry,
-        })
-        .expect("request json");
-
-        let (submit_code, submit_response) = handle_runtime_request(
-            "POST",
-            "/api/deployments/example.live/intents",
-            Some(&submit_body),
-            &state,
-        )
-        .await;
-        assert_eq!(submit_code, 200);
-        assert!(submit_response.contains("\"order_id\":\"order-"));
-
-        let order_id = submit_response
-            .split("\"order_id\":\"")
-            .nth(1)
-            .and_then(|suffix| suffix.split('"').next())
-            .expect("order id");
 
         let (cancel_code, cancel_response) = handle_runtime_request(
             "POST",
@@ -4460,17 +4425,23 @@ mod tests {
             &state,
         )
         .await;
-        assert_eq!(cancel_code, 200);
-        assert!(cancel_response.contains("\"state\":\"canceled\""));
+        assert_eq!(cancel_code, 400);
+        assert!(cancel_response.contains("\"error\":\"invalid_request\""));
+        assert!(cancel_response.contains(MONDAY_EXECUTION_DISABLED));
 
-        let trading_body =
-            fs::read_to_string(runtime_root.join("trading-state.json")).expect("trading snapshot");
-        let trading: serde_json::Value =
-            serde_json::from_str(&trading_body).expect("snapshot json");
-        assert_eq!(trading[0]["snapshot"]["orders"][0]["state"], "canceled");
+        let daemon = state.daemon.lock().await;
+        let order = daemon
+            .trading
+            .get("example.live")
+            .and_then(|runtime| runtime.order(&order_id))
+            .expect("seeded order");
         assert_eq!(
-            trading[0]["snapshot"]["orders"][0]["venue_order_id"],
-            "venue-live-http-cancel-1"
+            order.state,
+            portfolio_core::prediction::OrderState::Acknowledged
+        );
+        assert_eq!(
+            order.venue_order_id.as_deref(),
+            Some("venue-live-http-cancel-1")
         );
     }
 
@@ -4519,36 +4490,25 @@ mod tests {
             "example.live",
             ploy_operator_contracts::ObservedState::Running,
         );
+        let order_id = seed_acknowledged_live_order(
+            &mut daemon,
+            TradingIntent {
+                intent_id: "intent-live-http-replace".to_string(),
+                deployment_id: "example.live".to_string(),
+                market_id: "market-1".to_string(),
+                token_id: "token-1".to_string(),
+                side: TradeSide::Buy,
+                quantity: rust_decimal::Decimal::ONE,
+                limit_price: Some(rust_decimal::Decimal::new(55, 2)),
+                purpose: TradingIntentPurpose::Entry,
+                created_at: chrono::Utc::now(),
+            },
+            "venue-live-http-replace-1",
+        );
         let state = Arc::new(AppState {
             daemon: Arc::new(tokio::sync::Mutex::new(daemon)),
             events: Arc::new(EventBroker::default()),
         });
-
-        let submit_body = serde_json::to_string(&PaperIntentRequest {
-            idempotency_key: None,
-            market_id: "market-1".to_string(),
-            token_id: "token-1".to_string(),
-            side: "buy".to_string(),
-            quantity: rust_decimal::Decimal::ONE,
-            limit_price: Some(rust_decimal::Decimal::new(55, 2)),
-            purpose: ploy_operator_contracts::IntentPurpose::Entry,
-        })
-        .expect("request json");
-
-        let (submit_code, submit_response) = handle_runtime_request(
-            "POST",
-            "/api/deployments/example.live/intents",
-            Some(&submit_body),
-            &state,
-        )
-        .await;
-        assert_eq!(submit_code, 200);
-
-        let order_id = submit_response
-            .split("\"order_id\":\"")
-            .nth(1)
-            .and_then(|suffix| suffix.split('"').next())
-            .expect("order id");
 
         let replace_body = serde_json::to_string(&OrderReplaceRequest {
             quantity: rust_decimal::Decimal::new(250, 2),
@@ -4562,23 +4522,25 @@ mod tests {
             &state,
         )
         .await;
-        assert_eq!(replace_code, 200);
-        assert!(replace_response.contains("\"revision\":1"));
-        assert!(replace_response.contains("\"venue_order_id\":\"venue-live-http-replace-2\""));
+        assert_eq!(replace_code, 400);
+        assert!(replace_response.contains("\"error\":\"invalid_request\""));
+        assert!(replace_response.contains(MONDAY_EXECUTION_DISABLED));
 
-        let trading_body =
-            fs::read_to_string(runtime_root.join("trading-state.json")).expect("trading snapshot");
-        let trading: serde_json::Value =
-            serde_json::from_str(&trading_body).expect("snapshot json");
+        let daemon = state.daemon.lock().await;
+        let order = daemon
+            .trading
+            .get("example.live")
+            .and_then(|runtime| runtime.order(&order_id))
+            .expect("seeded order");
         assert_eq!(
-            trading[0]["snapshot"]["orders"][0]["venue_order_id"],
-            "venue-live-http-replace-2"
+            order.state,
+            portfolio_core::prediction::OrderState::Acknowledged
         );
         assert_eq!(
-            trading[0]["snapshot"]["orders"][0]["venue_order_history"][0],
-            "venue-live-http-replace-1"
+            order.venue_order_id.as_deref(),
+            Some("venue-live-http-replace-1")
         );
-        assert_eq!(trading[0]["snapshot"]["orders"][0]["revision"], 1);
+        assert_eq!(order.revision, 0);
     }
 
     #[tokio::test]
@@ -4623,8 +4585,9 @@ mod tests {
             "example.live",
             ploy_operator_contracts::ObservedState::Running,
         );
-        daemon
-            .submit_intent(TradingIntent {
+        seed_acknowledged_live_order(
+            &mut daemon,
+            TradingIntent {
                 intent_id: "intent-live-http-2".to_string(),
                 deployment_id: "example.live".to_string(),
                 market_id: "market-1".to_string(),
@@ -4634,9 +4597,9 @@ mod tests {
                 limit_price: Some(rust_decimal::Decimal::new(5, 1)),
                 purpose: TradingIntentPurpose::Entry,
                 created_at: chrono::Utc::now(),
-            })
-            .await
-            .expect("submit intent");
+            },
+            "venue-live-http-2",
+        );
 
         let state = Arc::new(AppState {
             daemon: Arc::new(tokio::sync::Mutex::new(daemon)),
