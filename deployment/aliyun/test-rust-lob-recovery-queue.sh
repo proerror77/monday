@@ -14,6 +14,12 @@ fi
 grep -Fq "active V2 controller is required" "$RECOVERY"
 grep -Fq 'monday.rust_lob_controller_release.v2' "$RECOVERY"
 grep -Fq 'monday.rust_lob_controller_release.v2' "$RECOVERY"
+grep -Fq 'needs_recovery_isolation' "$RECOVERY"
+grep -Fq 'has_undrained_complete_segments' "$RECOVERY"
+if grep -Fq 'if ! has_incomplete_parts "$CANONICAL_SPOOL"' "$RECOVERY"; then
+  printf 'recovery isolate still skips complete undrained segments\n' >&2
+  exit 1
+fi
 projection_contract='"$ACTIVE_CONTROLLER/deployment/binance-lob-archiver-production-$MARKET.env"'
 resolved_contract='secure_regular_file "$installed_env" 0'
 obsolete_contract='secure_regular_file "$ENV_FILE" 0'
@@ -542,4 +548,108 @@ expect_rejected missing-remote-object fixture_drain
 unset FIXTURE_OSS_FAIL
 [[ $(jq -r .result "$attempt/result.json") == failed ]]
 [[ $(sha256sum "$EVIDENCE_ROOT/$RESUME_JOB_ID/result.json" | awk '{print $1}') == "$fixture_old_result_sha" ]]
-printf 'Explicit recovery adoption, historical readback, mixed drain and interruption behavior passed\n'
+
+# Isolate/drain must cover rotated complete undrained segments, not only
+# incomplete parts.  Drain of a complete-only spool uses --upload-only.
+empty_spool="$fixture/empty-isolate-spool"
+complete_spool="$fixture/complete-isolate-spool"
+part_spool="$fixture/part-isolate-spool"
+mkdir -p "$empty_spool" "$complete_spool" "$part_spool"
+printf '{}\n' >"$empty_spool/upload-status.json"
+printf '{}\n' >"$empty_spool/health.json"
+: >"$empty_spool/.binance-lob-archiver.lock"
+if has_incomplete_parts "$empty_spool" || has_undrained_complete_segments "$empty_spool" \
+  || needs_recovery_isolation "$empty_spool"; then
+  printf 'empty spool was treated as recovery work\n' >&2
+  exit 1
+fi
+printf 'sealed\n' >"$complete_spool/part-1.jsonl.zst"
+printf '{}\n' >"$complete_spool/part-1.jsonl.zst.manifest.json"
+printf 'ok\n' >"$complete_spool/part-1.jsonl.zst._SUCCESS"
+has_undrained_complete_segments "$complete_spool"
+needs_recovery_isolation "$complete_spool"
+if has_incomplete_parts "$complete_spool"; then
+  printf 'complete segment was classified as an incomplete part\n' >&2
+  exit 1
+fi
+printf 'raw\n' >"$part_spool/part-2.jsonl.part"
+has_incomplete_parts "$part_spool"
+needs_recovery_isolation "$part_spool"
+if has_undrained_complete_segments "$part_spool"; then
+  printf 'incomplete part was classified as a complete segment\n' >&2
+  exit 1
+fi
+
+rm -f "$fixture/payload.calls" "$fixture/uploaded-files"
+fixture_job 108 ready
+printf 'already sealed\n' >"$fixture_job_dir/part-complete.jsonl.zst"
+printf '{}\n' >"$fixture_job_dir/part-complete.jsonl.zst.manifest.json"
+printf 'success\n' >"$fixture_job_dir/part-complete.jsonl.zst._SUCCESS"
+fixture_resume >/dev/null
+attempt=$(fixture_attempt)
+fixture_drain >/dev/null
+[[ -d $attempt/spool.done && $(jq -r .result "$attempt/result.json") == passed ]]
+grep -Fq -- '--upload-only' "$fixture/payload.calls"
+if grep -Fq -- '--recover-parts-only' "$fixture/payload.calls"; then
+  printf 'complete-only drain invoked recover-parts\n' >&2
+  exit 1
+fi
+grep -Fq 'part-complete.jsonl.zst' "$fixture/uploaded-files"
+
+saved_canonical=$CANONICAL_SPOOL
+isolate_spool="$fixture/host/data/monday/spool/binance-lob/spot"
+rm -rf -- "$isolate_spool"
+mkdir -p "$isolate_spool"
+printf '{}\n' >"$isolate_spool/upload-status.json"
+: >"$isolate_spool/.binance-lob-archiver.lock"
+chmod 0640 "$isolate_spool/.binance-lob-archiver.lock" "$isolate_spool/upload-status.json"
+ready_before=$(find "$QUEUE_MARKET_ROOT" -mindepth 1 -maxdepth 1 -type d -name '*.ready' -print | wc -l)
+fixture_isolate() {
+  (
+    CURRENT_ACTION=isolate
+    install() {
+      local mode=0750 dest src
+      while (($#)); do
+        case "$1" in
+          -d) shift ;;
+          -m) mode=$2; shift 2 ;;
+          -o|-g) shift 2 ;;
+          --) shift; break ;;
+          *) break ;;
+        esac
+      done
+      dest=${*: -1}
+      if (($# <= 1)); then
+        mkdir -p "$dest"
+        chmod "$mode" "$dest" 2>/dev/null || true
+      else
+        src=${*: -2:1}
+        cp -- "$src" "$dest"
+        chmod "$mode" "$dest" 2>/dev/null || true
+      fi
+    }
+    queue_lock
+    run_isolate
+  )
+}
+if ! fixture_isolate >/dev/null; then
+  printf 'empty canonical spool isolate failed\n' >&2
+  exit 1
+fi
+ready_after=$(find "$QUEUE_MARKET_ROOT" -mindepth 1 -maxdepth 1 -type d -name '*.ready' -print | wc -l)
+[[ $ready_before == "$ready_after" ]] \
+  || { printf 'empty spool isolate queued a job\n' >&2; exit 1; }
+
+printf 'sealed\n' >"$isolate_spool/part-pending.jsonl.zst"
+printf '{}\n' >"$isolate_spool/part-pending.jsonl.zst.manifest.json"
+printf 'ok\n' >"$isolate_spool/part-pending.jsonl.zst._SUCCESS"
+fixture_isolate >/dev/null
+ready_dir=$(find "$QUEUE_MARKET_ROOT" -mindepth 1 -maxdepth 1 -type d -name '*.ready' -print \
+  | while IFS= read -r dir; do
+      [[ -f $dir/part-pending.jsonl.zst ]] && printf '%s\n' "$dir"
+    done | sed -n '1p')
+[[ -n $ready_dir ]] || { printf 'complete undrained isolate did not queue a job\n' >&2; exit 1; }
+[[ -f $ready_dir/part-pending.jsonl.zst && -f $ready_dir/part-pending.jsonl.zst.manifest.json ]]
+[[ -f $isolate_spool/upload-status.json && ! -e $isolate_spool/part-pending.jsonl.zst ]]
+CANONICAL_SPOOL=$saved_canonical
+printf 'Explicit recovery adoption, historical readback, mixed drain and complete-segment isolation passed\n'
