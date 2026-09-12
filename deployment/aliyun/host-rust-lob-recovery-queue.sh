@@ -233,6 +233,23 @@ has_incomplete_parts() {
   \) -print -quit) ]]
 }
 
+has_undrained_complete_segments() {
+  local spool=$1
+  [[ -d $spool && ! -L $spool ]] || return 1
+  [[ -n $(find "$spool" -type f \( \
+    -name '*.manifest.json' -o \
+    -name '*.jsonl.zst' -o \
+    -name '*._SUCCESS' -o \
+    -name '*.uploaded-cleanup.json' -o \
+    -name '*.uploaded-cleanup.json.tmp' \
+  \) -print -quit) ]]
+}
+
+needs_recovery_isolation() {
+  local spool=$1
+  has_incomplete_parts "$spool" || has_undrained_complete_segments "$spool"
+}
+
 segment_artifacts() {
   local spool=$1
   [[ -d $spool && ! -L $spool ]] || return 0
@@ -649,8 +666,8 @@ isolate_market() {
     fail "canonical spool is missing; refusing recovery fallback: $CANONICAL_SPOOL"
   fi
   secure_directory "$CANONICAL_SPOOL" "$hft_uid" "$hft_gid"
-  isolation_phase_begin incomplete-scan
-  if ! has_incomplete_parts "$CANONICAL_SPOOL"; then
+  isolation_phase_begin recovery-scan
+  if ! needs_recovery_isolation "$CANONICAL_SPOOL"; then
     isolation_phase_done
     exit 0
   fi
