@@ -17,9 +17,9 @@ metadata:
     app.kubernetes.io/part-of: monday
 spec:
   backoffLimit: 0
-  # Bound by the signed root Job budget and remaining task window. Prefer the
-  # native dispatch controller-handoff renderer for the executable manifest.
-  activeDeadlineSeconds: REPLACE_CONTROLLER_DEADLINE_SECONDS
+  # Conservative schema-valid placeholder, not a runnable time allowance. Use
+  # the native handoff renderer for seconds bounded by the original deadline.
+  activeDeadlineSeconds: 1
   ttlSecondsAfterFinished: 86400
   template:
     metadata:
