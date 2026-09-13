@@ -40,6 +40,7 @@ fn training_config() -> ContractTrainingConfig {
         min_rows: 8,
         seed: 42,
         target_scale: hft_research_ml::MlpTargetScaleV1::RawReturn,
+        optimization: None,
     }
 }
 
@@ -476,4 +477,137 @@ fn training_request_rejects_non_training_roles_and_short_embargoes() {
     assert!(embargo_error
         .to_string()
         .contains("at least the prediction horizon"));
+}
+
+fn controlled_request(rows: &[u8], updates: usize, rate: f64) -> SealedTrainingRequest {
+    let (bytes, _, _) = sealed_request(rows);
+    let mut request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    request["config"]["target_scale"] = serde_json::json!("train_standardized");
+    request["config"]["epochs"] = serde_json::json!(updates);
+    request["config"]["learning_rate"] = serde_json::json!(rate);
+    request["config"]["optimization"] =
+        serde_json::to_value(hft_research_ml::MlpOptimizationControlsV1::default()).unwrap();
+    let bytes = serde_json::to_vec(&request).unwrap();
+    SealedTrainingRequest::from_bytes(&bytes, &Sha256Digest::of_bytes(&bytes)).unwrap()
+}
+
+#[test]
+fn guarded_long_training_keeps_original_return_parity_and_rejects_diagnostic_tampering() {
+    let rows = training_rows();
+    let bytes = serde_json::to_vec(&rows).unwrap();
+    let sealed = controlled_request(&bytes, 2048, 0.001);
+    let trained = train_contract_model(&bytes, &sealed).unwrap();
+    let learning = &trained.diagnostics().learning;
+    let stability = learning.stability.as_ref().unwrap();
+    assert_eq!(learning.updates_completed, 2048);
+    assert_eq!(learning.loss_history.len(), 2049);
+    assert_eq!(stability.raw_gradient_l2_history.len(), 2048);
+    assert!(stability
+        .applied_gradient_l2_history
+        .iter()
+        .all(|v| *v <= 1.0 + hft_research_ml::MLP_GRADIENT_CLIP_RELATIVE_TOLERANCE));
+    learning
+        .validate_optimization(sealed.request().config().optimization.as_ref())
+        .unwrap();
+    let portable = trained.export_parameters().unwrap();
+    let output = tempfile::tempdir().unwrap();
+    let saved = trained.save_bundle(output.path()).unwrap();
+    let loaded = load_contract_model_bundle(&saved.manifest_path, &saved.manifest_sha256).unwrap();
+    for row in &rows {
+        let prediction = trained.predict(&row.features).unwrap();
+        assert!(prediction.abs() < 0.002);
+        assert_eq!(
+            prediction.to_bits(),
+            loaded.predict(&row.features).unwrap().to_bits()
+        );
+        assert!((prediction - portable.predict(&row.features).unwrap()).abs() < 1e-8);
+    }
+    let mut tampered = saved.manifest.clone();
+    tampered
+        .diagnostics
+        .learning
+        .stability
+        .as_mut()
+        .unwrap()
+        .controls
+        .max_raw_gradient_l2 = 200.0;
+    let (path, sha) = write_content_addressed_manifest(output.path(), &tampered);
+    assert!(load_contract_model_bundle(path, &sha)
+        .unwrap_err()
+        .to_string()
+        .contains("sealed configuration"));
+    let mut tampered = saved.manifest.clone();
+    tampered
+        .diagnostics
+        .learning
+        .stability
+        .as_mut()
+        .unwrap()
+        .applied_gradient_l2_history[0] = 2.0;
+    let (path, sha) = write_content_addressed_manifest(output.path(), &tampered);
+    assert!(load_contract_model_bundle(path, &sha)
+        .unwrap_err()
+        .to_string()
+        .contains("frozen controls"));
+    let mut tampered = saved.manifest;
+    tampered.diagnostics.learning.stability = None;
+    let (path, sha) = write_content_addressed_manifest(output.path(), &tampered);
+    assert!(load_contract_model_bundle(path, &sha)
+        .unwrap_err()
+        .to_string()
+        .contains("sealed configuration"));
+}
+
+#[test]
+fn guarded_training_retains_exact_shorter_budget_prefix_without_early_stopping() {
+    let rows = serde_json::to_vec(&training_rows()).unwrap();
+    let short = train_contract_model(&rows, &controlled_request(&rows, 64, 0.001)).unwrap();
+    let long = train_contract_model(&rows, &controlled_request(&rows, 128, 0.001)).unwrap();
+    let short = &short.diagnostics().learning;
+    let long = &long.diagnostics().learning;
+    assert_eq!(
+        short.initial_parameters_sha256,
+        long.initial_parameters_sha256
+    );
+    assert_eq!(short.loss_history, long.loss_history[..65]);
+    assert_eq!(
+        short.stability.as_ref().unwrap().raw_gradient_l2_history,
+        long.stability.as_ref().unwrap().raw_gradient_l2_history[..64]
+    );
+    assert_eq!(
+        short
+            .stability
+            .as_ref()
+            .unwrap()
+            .applied_gradient_l2_history,
+        long.stability.as_ref().unwrap().applied_gradient_l2_history[..64]
+    );
+    assert_eq!(
+        long.stability.as_ref().unwrap().convergence.status,
+        hft_research_ml::MlpConvergenceStatusV1::BudgetExhaustedNotConverged
+    );
+    assert_eq!(long.exit_reason, "fixed_update_budget_completed");
+    assert_eq!(long.updates_completed, 128);
+}
+
+#[test]
+fn guarded_training_rejects_loss_growth_on_the_final_update() {
+    let rows = serde_json::to_vec(&training_rows()).unwrap();
+    let error = train_contract_model(&rows, &controlled_request(&rows, 1, 100.0)).unwrap_err();
+    assert!(error.to_string().contains("growth limit"), "{error}");
+    assert!(error.to_string().contains("completed_updates=1"), "{error}");
+}
+
+#[test]
+fn absent_optimization_controls_preserve_historical_serialization() {
+    let rows = serde_json::to_vec(&training_rows()).unwrap();
+    let (_, _, sealed) = sealed_request(&rows);
+    let value = serde_json::to_value(sealed.request()).unwrap();
+    assert!(value["config"].get("optimization").is_none());
+    let trained = train_contract_model(&rows, &sealed).unwrap();
+    assert!(
+        serde_json::to_value(trained.diagnostics()).unwrap()["learning"]
+            .get("stability")
+            .is_none()
+    );
 }

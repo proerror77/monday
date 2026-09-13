@@ -4317,6 +4317,7 @@ mod tests {
             schema_version: "cex-mlp-training-plan-v1".into(),
             updates: 64,
             target_scale: hft_research_manifest::mlp_training::MlpTargetScaleV1::TrainStandardized,
+            optimization: None,
             initializations: [(7, vec![71, 72, 73]), (11, vec![111, 112, 113])]
                 .into_iter()
                 .map(|(seed, fold_seeds)| {
@@ -6216,6 +6217,7 @@ mod tests {
             schema_version: "cex-mlp-training-plan-v1".into(),
             updates: 64,
             target_scale: MlpTargetScaleV1::TrainStandardized,
+            optimization: None,
             initializations,
         });
         std::fs::write(&fixture.args.request, serde_json::to_vec(&request).unwrap()).unwrap();

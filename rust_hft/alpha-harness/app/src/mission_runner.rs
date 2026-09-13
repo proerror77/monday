@@ -87,6 +87,8 @@ pub(crate) const MAX_MATERIALIZATION_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_REPLAY_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_REPLAY_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const MAX_RESULT_BUNDLE_BYTES: u64 = 1024 * 1024 * 1024;
+// Long, bounded MLP loss/gradient histories accompany predictions in this artifact.
+pub(crate) const MAX_MLP_BASELINE_BYTES: u64 = 64 * 1024 * 1024;
 const MCTS_CHECKPOINT_ARTIFACT_SCHEMA_VERSION: &str =
     "cex-factor-bank-subset-mcts-checkpoint-artifact-v1";
 const CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V1: &str = "cex-event-replay-receipt-v1";
@@ -3924,7 +3926,7 @@ fn decode_verified_execution_report(
         let burn_baseline: CexBaselineArtifactV1 = read_bundle_json(
             &mut archive,
             "results/burn-mlp-baseline.json",
-            4 * 1024 * 1024,
+            MAX_MLP_BASELINE_BYTES,
         )?
         .context("published supervised selection has no Burn MLP baseline")?;
         ridge_baseline.validate_binding(&control_mission, &baseline_policy, &factor_bank)?;

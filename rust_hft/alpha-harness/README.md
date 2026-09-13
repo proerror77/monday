@@ -382,8 +382,9 @@ through the existing `campaign-freeze --research-plan` input. The plan contains:
 
 | Field | Meaning and bounds |
 | --- | --- |
-| `updates` | Exactly 8, 64 or 256 full-batch Adam updates; this is separate from native trial accounting. |
-| `target_scale` | `raw_return` or `train_standardized`. |
+| `updates` | Short diagnostics retain 8/64/256. Explicit guarded profiles admit 2048/4096/8192/16384 fixed full-batch updates. Optimizer steps are separate from native trial accounting. |
+| `target_scale` | Short diagnostics allow `raw_return` or `train_standardized`; guarded long profiles require `train_standardized`. |
+| `optimization` | Required for long profiles: admitted `learning_rate` (0.0003/0.001/0.003) and frozen gradient/convergence `controls`. |
 | `initializations` | Map from each Campaign round seed to its declared fold seeds and ordered `expected_factor_ids`. |
 | `fold_seeds` | Actual u64 initialization seeds, one for every chronological fold. |
 | `expected_factor_ids` | Exact sorted Factor Bank columns; a mismatch stops fitting rather than changing the experimental input. |
@@ -393,9 +394,51 @@ The renderer resolves the round's profile into the Mission and a v3 baseline
 policy. Requests, Mission identities and baseline policy hashes bind the full
 profile. Model treatments do not change the factor-search plan identity. Missing
 round seeds, missing v3 profiles, undeclared update counts and changed factor
-ordering fail validation. The ordinary recipe without an explicit profile
-continues to use eight updates with raw-return targets. Network width, learning
-rate and input-factor processing are fixed for this experiment.
+ordering fail validation. The recipe without an explicit profile remains the
+short eight-update raw-return diagnostic; it does not meet the long-training
+convergence contract. The network is one hidden layer of width eight, not eight
+layers. Input-factor processing is unchanged; guarded profiles bind their rate
+and controls into the plan, resolved profile, sealed request and artifact.
+Absent optimization/stability fields retain the historical serialized identity.
+
+A guarded optimization block for the six-group convergence study is:
+
+```json
+{
+  "learning_rate": 0.001,
+  "controls": {
+    "global_gradient_clip_l2": 1.0,
+    "max_raw_gradient_l2": 100.0,
+    "max_loss_growth_ratio": 10.0,
+    "convergence": {
+      "minimum_updates": 2048,
+      "window_updates": 256,
+      "comparisons": 3,
+      "max_relative_window_change": 0.001,
+      "max_relative_tail_range": 0.005
+    }
+  }
+}
+```
+
+The trainer executes every frozen update. It computes a stable f64 global L2
+norm across all four parameter tensors, rejects nonfinite/excessive raw gradients,
+uniformly clips to the declared norm, checks the applied norm before Adam, and
+checks parameters and losses after updates including the final update. Loss may
+not exceed the frozen multiple of initial loss. Norm tolerance is explicitly
+bounded for f32 rounding; clipping counts are reported rather than treated as
+failures. A gradient bound does not itself prove a bound on Adam parameter steps.
+
+Convergence is a reproducible **training-loss plateau**, not global optimality or
+strategy validity. Three comparisons use four consecutive 256-update windows
+from the final 1024 post-update losses, excluding the initial loss. Each adjacent
+mean change is `abs(next-previous)/max(previous,1e-12)`; the tail range is
+`(max-min)/max(tail_mean,1e-12)` over those same1024 losses. All thresholds and the
+minimum update count must pass. Otherwise status is
+`budget_exhausted_not_converged`; completing the budget alone is insufficient.
+Training-mean/zero baselines remain separately reported so an uninformative flat
+solution is not confused with predictive or economic success. No validation
+labels determine the optimizer or this convergence result.
 
 `train_standardized` fits a mean and population standard deviation using only
 admitted training rows. Constant training targets are rejected for this mode.
@@ -416,6 +459,9 @@ Each `results/burn-mlp-baseline.json` fold retains:
 
 - `model.learning`: requested/completed updates, actual initialization parameter
   digest, target transform, finite-gradient/parameter maxima and training losses.
+- Optional `model.learning.stability`: frozen controls, complete raw/applied
+  gradient histories, clipping count and recomputable convergence diagnostics.
+  Missing or altered stability evidence is rejected for a guarded profile.
 - `loss_history`: the initial loss followed by one value per completed update,
   in optimization target units. Standardized-target losses are distinguished
   from raw-return MSE and MAE.
@@ -426,10 +472,19 @@ Each `results/burn-mlp-baseline.json` fold retains:
   the final validation predictions, using the training-fitted mean benchmark.
   Validation labels do not select intermediate checkpoints or fit the transform.
 
-`mlp_fold_fit_completed` research events record the actual seed, update counts
-and fitting duration. Their `purpose` separates primary training from
+`mlp_fold_fit_started/completed/failed` events bind request, fold, seed, rate,
+update budget and outcome. Guarded fits also emit `mlp_training_progress` every
+256 updates and at the end, with aggregate loss and gradient norms. Errors carry
+step/loss/guard context; no raw rows, labels or weights are logged. Completed
+fold events record fitting duration and the operational convergence result. Their `purpose` separates primary training from
 deterministic verification refits. Durations remain execution observations;
 they do not make fitted-model content identities depend on wall-clock timing.
+Long baseline histories have one shared64MiB read bound in native bundle
+validation and ACK report extraction. Detailed reports stay in ACK/OSS; their
+small receipts determine whether workstation transfer is within the4MiB ceiling.
+For a two-seed/three-fold group, report all six primary fold statuses; only6/6
+passing folds satisfy a group convergence claim. A4096/8192 pair with identical
+rate, data and initialization must share the first4097 loss values exactly.
 Original study artifacts remain immutable. These diagnostics add no order
 authority and do not establish economic or independent validation success.
 
