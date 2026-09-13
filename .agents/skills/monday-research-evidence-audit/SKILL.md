@@ -9,6 +9,12 @@ Audit existing evidence only. Do not collect data, run evaluation, publish resul
 This Skill reports an existing research result; it is not a workflow prerequisite
 for modifying research or collector code.
 
+For CEX cloud audits, follow the
+[ACK-only evidence and recovery boundary](../../../deployment/aliyun/research/README.md#data-flow-review-and-host-lifetime).
+Use existing cloud read-only access and retained evidence. This audit does not
+launch verification Jobs or restore state; if that is needed to inspect missing
+content, report the observability gap and the required recovery work separately.
+
 ## Workflow
 
 1. Name one research contract, venue/instrument, time window, canonical execution seam, and expected terminal artifact. The CEX cloud path is `mission campaign-freeze` -> `mission campaign-finalize` -> `mission dispatch submit` -> `mission campaign-execute`; Prediction uses `prediction execute`. Direct `mission execute`, low-level `mission run`, and legacy `loop run` are diagnostics, not alternate completion seams.

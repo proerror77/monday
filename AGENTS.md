@@ -95,15 +95,9 @@
   result is requested, verify its terminal result and output, not just submission.
 - Remote build or validation tasks must use `monday-remote-build`; never place a
   workspace, toolchain, Cargo cache, or target directory on an `ack-system` node.
-- Keep CEX raw input preparation, freeze, training, bulk artifact verification,
-  settlement and metric computation in ACK/OSS. Reuse the authenticated ACK
-  result cache; a workstation may sign/inspect control metadata and format
-  bounded reports, but must not gate cloud progress on bulk downloads or a local
-  verifier. Keep the active ledger on its single-writer cloud volume. Follow
-  `deployment/aliyun/research/README.md` for cloud reporting and recovery.
-- Bound research/controller lifetime in cloud Jobs and retain the original task
-  deadline on resume. Do not rely solely on a desktop PID or sticky node-retention
-  annotation for cleanup; verify release of task-owned resources independently.
+- For CEX cloud research, follow the
+  [ACK-only evidence and recovery boundary](deployment/aliyun/research/README.md#data-flow-review-and-host-lifetime)
+  during preparation, verification, reporting, recovery, and resource cleanup.
 
 ## Scope and ownership
 
