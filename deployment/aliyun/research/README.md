@@ -1444,14 +1444,37 @@ Memory observation does not change costs or admission thresholds.
 
 ### Data-flow review and host lifetime
 
+For CEX cloud research, keep raw input preparation, freeze, training, full input
+and artifact verification, native metric computation, and settlement in ACK.
+Keep raw data, model/result bundles, the active ledger, and state archives in
+ACK/OSS; restore and verify archives in ACK. Code and software build artifacts
+may be handled locally. Workstation research access is limited to control and
+signing metadata, bounded logs, and report receipts/summaries within their
+declared byte limits. Signed root keys remain in the established signing
+boundary; the active ledger stays on its single-writer cloud volume.
+
+Independent readback means checking the actual cloud object against its bound
+identity, not downloading the full dataset, model bundle, ledger, or archive to
+a workstation. Use existing authenticated ACK caches for subsequent verification
+and reporting. Fetch a report's small receipt first; oversized details stay in
+ACK. Do not make cloud progress depend on a local bulk download or verifier.
+A read-only evidence audit may inspect existing cloud evidence, but does not
+create verification Jobs, restore archives, or mutate a run; missing access is
+an observability gap, not authority to start recovery.
+
+When resuming the same run, authenticate and reuse its original Study/root
+grants, ledger, immutable result cache, and completed checkpoints. Retain the
+original deadline and attempt/trial budgets, including failed or pending
+charges; do not reset them or retrain an already settled attempt. Recover only
+the incomplete stage and preserve the prior evidence. A different name or a new
+coordinator does not make a new research attempt permissible.
+
 The [2026-09-13 review](../../../docs/reports/2026-09-13-cex-cloud-evidence-flow-review.md)
-records removed transfers and intentional independent checks. A retained ACK
-cache is keyed to the immutable Campaign result, not to a successful local
-process. Do not add Python wrappers that fetch bulk artifacts to a workstation
-for metrics, ledger verification or subsequent dispatch. Workstation charts may
-format details only when the report receipt fits the workstation byte ceiling;
-otherwise show the small receipt and keep full analysis in ACK. Signed root keys may remain in the established
-signing boundary; an active ledger remains on its single-writer cloud volume.
+records removed transfers and intentional independent checks. Host placement
+alone does not establish that duplicate work is gone: the current preparation
+and controller-start paths can freeze the same input again. Report such
+remaining repetition; do not claim that these rules implement native frozen
+checkpoint reuse.
 
 Controller Jobs must have finite deadlines/TTL within the task resource window.
 A local PID or a sticky node-retention annotation is not an acceptable sole
