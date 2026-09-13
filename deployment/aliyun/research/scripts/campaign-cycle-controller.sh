@@ -452,6 +452,9 @@ cycle_status() {
     if [[ ! -s "$generation_dir/settlement-report.json" ]] \
       || ! jq -e '.status == "settled"' "$generation_dir/settlement-report.json" >/dev/null 2>&1; then
       next_stage="ledger_settlement"
+    elif [[ ! -s "$generation_dir/model-report-readback.json" ]] \
+      || ! cmp -s "$generation_dir/model-report.json" "$generation_dir/model-report-readback.json"; then
+      next_stage="model_report_publication"
     elif [[ "$termination_reason" == "campaign_no_candidate" ]]; then
       next_stage="campaign_learning"
     else
@@ -652,6 +655,9 @@ while (($#)); do
     *) die "unknown argument: $1" ;;
   esac
 done
+
+[[ "$(uname -s)" == "Linux" ]] \
+  || die "Campaign $mode requires the ACK research host; use workstation status or metadata signing only"
 
 if [[ "$mode" == "approve" || "$mode" == "ack-readback" ]]; then
   [[ -n "$work_dir" ]] || die "--work-dir is required"
@@ -880,15 +886,15 @@ oss_publish_readback() {
   local canonical_url="${object_url%%\?*}"
   local host_and_key host key bucket partial
   [[ "$(uname -s)" != "Darwin" ]] \
-    || die "OSS learn publication is forbidden on Darwin; run the ACK controller Job"
-  [[ -s "$source" ]] || die "OSS learn publication source is missing: $source"
-  [[ "$canonical_url" == https://*/* ]] || die "OSS learn URL is not canonical HTTPS"
+    || die "OSS artifact publication is forbidden on Darwin; run the ACK controller Job"
+  [[ -s "$source" ]] || die "OSS artifact publication source is missing: $source"
+  [[ "$canonical_url" == https://*/* ]] || die "OSS artifact URL is not canonical HTTPS"
   host_and_key="${canonical_url#https://}"
   host="${host_and_key%%/*}"
   key="${host_and_key#*/}"
   bucket="${host%%.*}"
   [[ -n "$key" && "$host" == "$bucket.oss-ap-northeast-1-internal.aliyuncs.com" ]] \
-    || die "OSS learn URL is outside Tokyo internal OSS"
+    || die "OSS artifact URL is outside Tokyo internal OSS"
   if ! "$aliyun_cli" ossutil cp "$source" "oss://$bucket/$key" \
     --endpoint oss-ap-northeast-1-internal.aliyuncs.com --forbid-overwrite >&2; then
     log_event immutable_publish_reused "object=$canonical_url"
@@ -897,7 +903,7 @@ oss_publish_readback() {
   rm -f -- "$partial"
   "$aliyun_cli" ossutil cp "oss://$bucket/$key" "$partial" \
     --endpoint oss-ap-northeast-1-internal.aliyuncs.com >&2
-  cmp -s "$source" "$partial" || die "published learn artifact readback SHA256 mismatch"
+  cmp -s "$source" "$partial" || die "published artifact readback SHA256 mismatch"
   mv -f -- "$partial" "$readback"
 }
 
@@ -1744,13 +1750,35 @@ while ((generation <= max_follow_ups)); do
   "$alpha_harness" mission dispatch settle \
     --submission "$submission" \
     --context "$context" \
-    --namespace "$namespace" >"$generation_dir/settlement-report.json.partial"
+    --namespace "$namespace" \
+    --readback-cache "$generation_dir" \
+    --model-report "$generation_dir/model-report.json" >"$generation_dir/settlement-report.json.partial"
   jq -e --arg request "$request_sha256" --arg result "$result_sha256" \
     '.status == "settled" and .request_sha256 == $request and .campaign_result_sha256 == $result' \
     "$generation_dir/settlement-report.json.partial" >/dev/null \
     || die "Campaign settlement report differs from the independently read-back result"
   mv -f -- "$generation_dir/settlement-report.json.partial" "$generation_dir/settlement-report.json"
   log_event stage_completed "generation=$generation" "stage=ledger_settlement" "campaign_id=$campaign_id"
+
+  # Publish only the bounded native summary. A publication retry uses the same
+  # settled cache and immutable report; it must not dispatch or download again.
+  controller_stage="model_report_publication"
+  model_report="$generation_dir/model-report.json"
+  model_report_sha256="$(sha256_file "$model_report")"
+  model_report_bytes="$(wc -c <"$model_report" | tr -d ' ')"
+  jq -e --arg path "$model_report" --arg sha "$model_report_sha256" \
+    --arg result "$result_sha256" --argjson bytes "$model_report_bytes" \
+    '.model_report | .path == $path and .sha256 == $sha and .bytes == $bytes
+      and .bytes > 0 and .bytes <= 4194304 and .campaign_result_sha256 == $result
+      and .training_performed == false and .metrics_recomputed == false' \
+    "$generation_dir/settlement-report.json" >/dev/null \
+    || die "native Campaign model report identity or lightweight bound is invalid"
+  model_report_url="$(jq -er '.campaign_result_readback_url' "$request")"
+  model_report_url="${model_report_url%%\?*}"
+  model_report_url="${model_report_url%/*}/model-report.json"
+  oss_publish_readback "$model_report" "$model_report_url" "$generation_dir/model-report-readback.json"
+  log_event stage_completed "generation=$generation" "stage=model_report_publication" \
+    "model_report_sha256=$model_report_sha256" "model_report_bytes=$model_report_bytes"
 
   termination_reason="$(jq -er '.termination_reason' "$result")"
   observed_image_id="$(jq -er '.items[0].status.containerStatuses[] | select(.name == "alpha-campaign") | .imageID' "$pod_status")"
@@ -1777,8 +1805,11 @@ while ((generation <= max_follow_ups)); do
     --arg observed_image_id "$observed_image_id" \
     --arg learning_directive_sha256 "$learning_directive_sha256" \
     --arg search_policy_revision_id "$search_policy_revision_id" \
+    --arg model_report_url "$model_report_url" \
+    --arg model_report_sha256 "$model_report_sha256" \
+    --argjson model_report_bytes "$model_report_bytes" \
     --argjson round_readback_count "$request_round_count" \
-    '{generation:$generation,campaign_id:$campaign_id,request_sha256:$request_sha256,job_name:$job_name,campaign_result_sha256:$result_sha256,termination_reason:$termination_reason,observed_image_id:$observed_image_id,learning_directive_sha256:$learning_directive_sha256,search_policy_revision_id:$search_policy_revision_id,round_readback_count:$round_readback_count}' \
+    '{generation:$generation,campaign_id:$campaign_id,request_sha256:$request_sha256,job_name:$job_name,campaign_result_sha256:$result_sha256,termination_reason:$termination_reason,observed_image_id:$observed_image_id,learning_directive_sha256:$learning_directive_sha256,search_policy_revision_id:$search_policy_revision_id,round_readback_count:$round_readback_count,model_report:{url:$model_report_url,sha256:$model_report_sha256,bytes:$model_report_bytes}}' \
     >"$generation_dir/generation-report.json"
 
   if [[ "$termination_reason" != "campaign_no_candidate" ]]; then

@@ -3,8 +3,8 @@ set -euo pipefail
 
 root="$(mktemp -d)"
 root="$(cd "$root" && pwd -P)"
-mac_work_dir="$(mktemp -d /tmp/monday-cex-e2e.XXXXXX)"
-trap 'rm -rf -- "$root" "$mac_work_dir"' EXIT
+submit_work_dir="$(mktemp -d /tmp/monday-cex-e2e.XXXXXX)"
+trap 'rm -rf -- "$root" "$submit_work_dir"' EXIT
 bin="$root/bin"
 start_dir="$root/start"
 export FAKE_STATE="$root/state"
@@ -114,7 +114,10 @@ case "$1 $2" in
       cp "$plan" "$FAKE_STATE/frozen-plan-g$generation.json"
     fi
     campaign_id="campaign-g$generation"
-    object_root="https://bucket.oss-ap-northeast-1-internal.aliyuncs.com/research/g$generation"
+    # Separate independent fixture Campaigns, as real content-addressed roots do.
+    cycle_dir="${output%/*/*}"
+    cycle_hash="$(printf '%s' "$cycle_dir" | sha_file /dev/stdin)"
+    object_root="$(value_after --campaign-root "$@")/${cycle_hash:0:16}/g$generation"
     jq -n \
       --arg campaign_id "$campaign_id" \
       --arg object_root "$object_root" \
@@ -216,9 +219,15 @@ case "$1 $2" in
         : >"$FAKE_STATE/settled-$job_name"
         increment "$FAKE_STATE/settlement-count"
       fi
-      result_sha256="$(sha_file "${submission%/*}/campaign-result.json")"
+      cache="$(value_after --readback-cache "$@")"
+      report="$(value_after --model-report "$@")"
+      [[ "$cache" == "${submission%/*}" && "$report" == "$cache/model-report.json" ]]
+      [[ -s "$cache/round-readback/round-0-results.zip" ]]
+      result_sha256="$(sha_file "$cache/campaign-result.json")"
+      jq -n --arg result "$result_sha256" '{schema_version:"cex-campaign-evidence-report-v1",campaign_result_sha256:$result,training_performed:false,metrics_recomputed:false}' >"$report"
       jq -n --arg request "$(jq -r '.request_sha256' "$submission")" --arg result "$result_sha256" \
-        '{status:"settled",request_sha256:$request,campaign_result_sha256:$result}'
+        --arg report "$report" --arg sha "$(sha_file "$report")" --argjson bytes "$(wc -c <"$report" | tr -d ' ')" \
+        '{status:"settled",request_sha256:$request,campaign_result_sha256:$result,model_report:{path:$report,sha256:$sha,bytes:$bytes,campaign_result_sha256:$result,training_performed:false,metrics_recomputed:false}}'
       exit 0
     fi
     [[ "$3" == submit ]]
@@ -342,6 +351,15 @@ if [[ "$source_object" != oss://* ]]; then
     : >"$FAKE_STATE/put-response-lost"
     exit 75
   fi
+  exit 0
+fi
+if [[ "$source_object" == */model-report.json ]]; then
+  if [[ "${FAKE_FAIL_MODEL_REPORT_READBACK_ONCE:-0}" == 1 && ! -e "$FAKE_STATE/model-report-readback-failed" ]]; then
+    : >"$FAKE_STATE/model-report-readback-failed"
+    exit 75
+  fi
+  object_key="$(sha_text "$source_object")"
+  cp "$FAKE_STATE/oss-objects/$object_key" "$destination"
   exit 0
 fi
 if [[ "$source_object" == *"/learning/"* ]]; then
@@ -484,7 +502,7 @@ controller_args=(
   --image "registry.example/research@sha256:$image_digest"
   --campaign-root https://bucket.oss-ap-northeast-1-internal.aliyuncs.com/research/campaigns
   --signer "$bin/signer"
-  --work-dir "$mac_work_dir"
+  --work-dir "$submit_work_dir"
   --seed 7 --seed 11
   --max-follow-ups 1
 )
@@ -507,31 +525,45 @@ approve_args=(
   --work-dir "$root/campaign-root/cycle"
 )
 
-if ! (cd "$start_dir" && FAKE_UNAME=Darwin "$controller" "${controller_args[@]}") \
+# All data-bearing modes fail before reading state, invoking a signer or writing.
+for host in Darwin Windows_NT; do
+  for host_mode in start approve ack-readback; do
+    if FAKE_UNAME="$host" "$controller" "$host_mode" --work-dir "$submit_work_dir" >"$root/host.out" 2>"$root/host.err"; then
+      echo "workstation unexpectedly accepted $host_mode" >&2
+      exit 1
+    fi
+    grep -Fq 'requires the ACK research host' "$root/host.err"
+    test ! -e "$submit_work_dir/controller-inputs.json"
+    test ! -e "$FAKE_STATE/signer-count"
+    test ! -e "$FAKE_STATE/dispatch-count"
+  done
+done
+
+if ! (cd "$start_dir" && FAKE_UNAME=Linux "$controller" "${controller_args[@]}") \
   >"$root/start.stdout" 2>"$root/start.stderr"; then
   cat "$root/start.stderr" >&2
   exit 1
 fi
-test "$(jq -r '.campaign_inputs' "$mac_work_dir/controller-inputs.json")" \
+test "$(jq -r '.campaign_inputs' "$submit_work_dir/controller-inputs.json")" \
   = "$start_dir/campaign-inputs.json"
-test "$(jq -r '.input_root' "$mac_work_dir/controller-inputs.json")" = "$start_dir/input"
-test "$(jq 'has("max_tokens")' "$mac_work_dir/controller-inputs.json")" = false
-test -s "$mac_work_dir/generation-0/request.json"
+test "$(jq -r '.input_root' "$submit_work_dir/controller-inputs.json")" = "$start_dir/input"
+test "$(jq 'has("max_tokens")' "$submit_work_dir/controller-inputs.json")" = false
+test -s "$submit_work_dir/generation-0/request.json"
 test "$(<"$FAKE_STATE/signer-count")" == 1
 test "$(<"$FAKE_STATE/dispatch-count")" == 1
 grep -Fq 'kind: Job' "$root/start.stdout"
-request_sha256="$(jq -r '.request_sha256' "$mac_work_dir/generation-0/finalize-report.json")"
+request_sha256="$(jq -r '.request_sha256' "$submit_work_dir/generation-0/finalize-report.json")"
 grep -Fq "name: campaign-cycle-${request_sha256:0:16}" "$root/start.stdout"
 grep -Fq 'research.monday/campaign-id: campaign-g0' "$root/start.stdout"
 grep -Fq 'campaign-cycle-controller@sha256:REPLACE_WITH_IMMUTABLE_DIGEST' "$root/start.stdout"
-grep -Fq "/campaign-root/cycles/${mac_work_dir##*/}" "$root/start.stdout"
+grep -Fq "/campaign-root/cycles/${submit_work_dir##*/}" "$root/start.stdout"
 if grep -Fq 'REPLACE_RESEARCH_LEARNING_SECRET' "$root/start.stdout"; then
   echo "controller handoff still requires LLM credentials" >&2
   exit 1
 fi
 grep -Fq 'event=stage_completed generation=0 stage=ack_handoff' "$root/start.stderr"
 test ! -e "$FAKE_STATE/ossutil-calls"
-test -z "$(find "$mac_work_dir" -name '*results.zip' -print -quit)"
+test -z "$(find "$submit_work_dir" -name '*results.zip' -print -quit)"
 jq -e '
   .schema_version == "monday.campaign_cycle_status.v1"
   and .checkpoint_status == "incomplete"
@@ -539,7 +571,7 @@ jq -e '
   and .next_stage == "kubernetes_runtime_readback"
   and .campaign_id == "campaign-g0"
   and .job_name == "job-g0"
-' < <("$controller" status --work-dir "$mac_work_dir") >/dev/null
+' < <("$controller" status --work-dir "$submit_work_dir") >/dev/null
 
 darwin_ack_args=(
   ack-readback
@@ -547,20 +579,19 @@ darwin_ack_args=(
   --aliyun "$bin/aliyun"
   --kubectl "$bin/kubectl"
   --campaign-pod-name pod-g0
-  --work-dir "$mac_work_dir"
+  --work-dir "$submit_work_dir"
 )
 if FAKE_UNAME=Darwin "$controller" "${darwin_ack_args[@]}" \
   >"$root/darwin.stdout" 2>"$root/darwin.stderr"; then
   echo "Darwin ACK readback unexpectedly succeeded" >&2
   exit 1
 fi
-grep -Fq 'stage=oss_result_readback' "$root/darwin.stderr"
-grep -Fq 'OSS result readback is forbidden on Darwin' "$root/darwin.stderr"
+grep -Fq 'requires the ACK research host' "$root/darwin.stderr"
 test ! -e "$FAKE_STATE/ossutil-calls"
-test -z "$(find "$mac_work_dir" -name '*results.zip' -print -quit)"
+test -z "$(find "$submit_work_dir" -name '*results.zip' -print -quit)"
 
 mkdir -p "$root/campaign-root"
-cp -R "$mac_work_dir" "$root/campaign-root/cycle"
+cp -R "$submit_work_dir" "$root/campaign-root/cycle"
 # Existing checkpoints retain the obsolete token budget as audit history.
 legacy_state="$root/campaign-root/cycle/controller-inputs.json"
 jq '. + {max_tokens:300}' "$legacy_state" >"$root/legacy-controller-inputs.json"
@@ -574,11 +605,31 @@ if "$controller" "${ack_g0_args[@]}" >"$root/first.stdout" 2>"$root/first.stderr
 fi
 grep -Fq 'schema_version=monday.research_event.v1 component=campaign-cycle-controller event=cycle_failed generation=0 stage=oss_result_readback' "$root/first.stderr"
 
+# A report GET failure happens after settlement. Resume only its publication.
+if FAKE_FAIL_MODEL_REPORT_READBACK_ONCE=1 "$controller" "${ack_g0_args[@]}" >"$root/report-fail.out" 2>"$root/report-fail.err"; then
+  echo "report publication failure was ignored" >&2
+  exit 1
+fi
+grep -Fq 'stage=model_report_publication' "$root/report-fail.err" || { cat "$root/report-fail.err" >&2; exit 1; }
+test -s "$root/campaign-root/cycle/generation-0/submission.json"
+test ! -e "$FAKE_STATE/learn-count"
+report_before="$(shasum -a 256 "$root/campaign-root/cycle/generation-0/model-report.json" | awk '{print $1}')"
+bulk_gets_before="$(grep -Ec 'ossutil cp oss://.*(mission.json|results.zip)' "$FAKE_STATE/ossutil-calls")"
+FAKE_UNAME=Darwin "$controller" status --work-dir "$root/campaign-root/cycle" >"$root/report-status.json"
+jq -e '.next_stage == "model_report_publication"' "$root/report-status.json" >/dev/null
+
 if ! "$controller" "${ack_g0_args[@]}" >"$root/learn.stdout" 2>"$root/learn.stderr"; then
   cat "$root/learn.stderr" >&2
   exit 1
 fi
 grep -Fq 'event=stage_completed generation=0 stage=approval_handoff next_generation=1' "$root/learn.stderr"
+test "$(shasum -a 256 "$root/campaign-root/cycle/generation-0/model-report.json" | awk '{print $1}')" == "$report_before"
+test "$(grep -Ec 'ossutil cp oss://.*(mission.json|results.zip)' "$FAKE_STATE/ossutil-calls")" == "$bulk_gets_before"
+test "$(<"$FAKE_STATE/dispatch-count")" == 1
+test "$(<"$FAKE_STATE/settlement-count")" == 1
+cmp -s "$root/campaign-root/cycle/generation-0/model-report.json" "$root/campaign-root/cycle/generation-0/model-report-readback.json"
+jq -e '.model_report.bytes > 0 and (.model_report.sha256 | length) == 64 and (.model_report.url | endswith("/model-report.json"))' "$root/campaign-root/cycle/generation-0/generation-report.json" >/dev/null
+
 test -s "$root/campaign-root/cycle/generation-0/next-research-plan.json"
 test -s "$root/campaign-root/cycle/generation-0/learn-report-readback.json"
 test -s "$root/campaign-root/cycle/generation-0/next-research-plan-readback.json"
@@ -589,7 +640,7 @@ mv "$root/input.offline" "$start_dir/input"
 oss_calls_before_approve="$(wc -l <"$FAKE_STATE/ossutil-calls" | tr -d ' ')"
 # Removing the token budget must not weaken the immutable input binding.
 printf 'changed input' >"$start_dir/campaign-inputs.json"
-if FAKE_UNAME=Darwin "$controller" "${approve_args[@]}" \
+if FAKE_UNAME=Linux "$controller" "${approve_args[@]}" \
   >"$root/drift.stdout" 2>"$root/drift.stderr"; then
   echo "controller accepted changed inputs in a legacy checkpoint" >&2
   exit 1
@@ -597,7 +648,7 @@ fi
 grep -Fq 'existing work directory belongs to different controller inputs' "$root/drift.stderr"
 test "$(<"$FAKE_STATE/dispatch-count")" == 1
 : >"$start_dir/campaign-inputs.json"
-if ! FAKE_UNAME=Darwin "$controller" "${approve_args[@]}" \
+if ! FAKE_UNAME=Linux "$controller" "${approve_args[@]}" \
   >"$root/approve.stdout" 2>"$root/approve.stderr"; then
   cat "$root/approve.stderr" >&2
   exit 1
@@ -665,7 +716,7 @@ for generation in 0 1; do
     test ! -e "$root/campaign-root/cycle/generation-$generation/$sensitive"
   done
 done
-test -z "$(find "$mac_work_dir" -name '*results.zip' -print -quit)"
+test -z "$(find "$submit_work_dir" -name '*results.zip' -print -quit)"
 
 no_improvement_mac="$root/no-improvement-mac"
 no_improvement_ack="$root/campaign-root/no-improvement"
@@ -673,7 +724,7 @@ no_improvement_args=("${controller_args[@]}")
 no_improvement_args[16]=https://bucket.oss-ap-northeast-1-internal.aliyuncs.com/research/no-improvement-campaigns
 no_improvement_args[20]="$no_improvement_mac"
 no_improvement_args[26]=3
-if ! (cd "$start_dir" && FAKE_UNAME=Darwin "$controller" "${no_improvement_args[@]}") \
+if ! (cd "$start_dir" && FAKE_UNAME=Linux "$controller" "${no_improvement_args[@]}") \
   >"$root/no-improvement-start.stdout" 2>"$root/no-improvement-start.stderr"; then
   cat "$root/no-improvement-start.stderr" >&2
   exit 1
@@ -746,10 +797,15 @@ recovery_case() (
       printf '\n' >>"$request_dir/learn-report.json"
       expected_error='saved Campaign learning checkpoint is invalid'
     else
-      local objects=("$fake_state/oss-objects/"*)
-      test "${#objects[@]}" == 1
-      printf '\n' >>"${objects[0]}"
-      expected_error='published learn artifact readback SHA256 mismatch'
+      local object matches=0
+      for object in "$fake_state/oss-objects/"*; do
+        if cmp -s "$object" "$request_dir/learn-report.json"; then
+          printf '\n' >>"$object"
+          matches=$((matches + 1))
+        fi
+      done
+      test "$matches" == 1
+      expected_error='published artifact readback SHA256 mismatch'
     fi
     if FAKE_STATE="$fake_state" "$controller" "${readback_args[@]}" >"$case_root/rejected.out" 2>"$case_root/rejected.err"; then
       echo "controller accepted corrupted learning evidence: $label" >&2
@@ -876,7 +932,7 @@ fresh_args=(
   --max-follow-ups 1
 )
 fresh_dispatch_before="$(<"$FAKE_STATE/dispatch-count")"
-if ! FAKE_UNAME=Darwin "$controller" "${fresh_args[@]}" \
+if ! FAKE_UNAME=Linux "$controller" "${fresh_args[@]}" \
   >"$root/fresh-needs-authority.stdout" 2>"$root/fresh-needs-authority.stderr"; then
   cat "$root/fresh-needs-authority.stderr" >&2
   exit 1
@@ -892,7 +948,7 @@ test ! -e "$fresh_cycle/generation-0"
 grep -Fq 'event=needs_authority stage=fresh_inputs reason=signer_missing' \
   "$root/fresh-needs-authority.stderr"
 
-if ! FAKE_UNAME=Darwin "$controller" "${fresh_args[@]}" \
+if ! FAKE_UNAME=Linux "$controller" "${fresh_args[@]}" \
   >"$root/fresh-restart.stdout" 2>"$root/fresh-restart.stderr"; then
   cat "$root/fresh-restart.stderr" >&2
   exit 1
@@ -911,7 +967,7 @@ for ((mismatch_index = 0; mismatch_index < ${#mismatched_fresh_args[@]}; mismatc
   fi
 done
 fresh_prepare_before_mismatch="$(<"$FAKE_STATE/fresh-preparation-count")"
-if FAKE_UNAME=Darwin "$controller" "${mismatched_fresh_args[@]}" \
+if FAKE_UNAME=Linux "$controller" "${mismatched_fresh_args[@]}" \
   >"$root/fresh-mismatch.stdout" 2>"$root/fresh-mismatch.stderr"; then
   cat "$root/fresh-mismatch.stderr" >&2
   exit 1
@@ -920,7 +976,7 @@ test "$(<"$FAKE_STATE/fresh-preparation-count")" == "$fresh_prepare_before_misma
 test ! -e "$fresh_output/campaign-inputs/changed-window"
 grep -Fq 'different fresh controller inputs' "$root/fresh-mismatch.stderr"
 
-if ! FAKE_UNAME=Darwin "$controller" approve \
+if ! FAKE_UNAME=Linux "$controller" approve \
   --alpha-harness "$bin/alpha-harness" \
   --aliyun "$bin/aliyun" \
   --kubectl "$bin/kubectl" \
@@ -974,7 +1030,7 @@ fresh_latest_args=(
   --max-follow-ups 1
 )
 latest_dispatch_before="$(<"$FAKE_STATE/dispatch-count")"
-if ! FAKE_UNAME=Darwin "$controller" "${fresh_latest_args[@]}" \
+if ! FAKE_UNAME=Linux "$controller" "${fresh_latest_args[@]}" \
   >"$root/fresh-latest-needs-authority.stdout" 2>"$root/fresh-latest-needs-authority.stderr"; then
   cat "$root/fresh-latest-needs-authority.stderr" >&2
   exit 1
@@ -1026,7 +1082,7 @@ fresh_control_args=(
   --max-follow-ups 1
 )
 control_dispatch_before="$(<"$FAKE_STATE/dispatch-count")"
-if ! FAKE_UNAME=Darwin "$controller" "${fresh_control_args[@]}" \
+if ! FAKE_UNAME=Linux "$controller" "${fresh_control_args[@]}" \
   >"$root/fresh-control-needs-authority.stdout" 2>"$root/fresh-control-needs-authority.stderr"; then
   cat "$root/fresh-control-needs-authority.stderr" >&2
   exit 1
@@ -1041,7 +1097,7 @@ test -s "$fresh_control_cycle/generation-0/request.json"
 test -s "$fresh_control_cycle/generation-0/submission.json"
 test "$(<"$FAKE_STATE/dispatch-count")" == "$control_dispatch_before"
 
-if ! FAKE_UNAME=Darwin "$controller" approve \
+if ! FAKE_UNAME=Linux "$controller" approve \
   --alpha-harness "$bin/alpha-harness" \
   --aliyun "$bin/aliyun" \
   --kubectl "$bin/kubectl" \
@@ -1187,7 +1243,7 @@ for ((index = 0; index < ${#initial_args[@]}; index++)); do
   fi
 done
 initial_args+=(--initial-research-plan "$initial_source")
-if ! (cd "$start_dir" && FAKE_UNAME=Darwin "$controller" "${initial_args[@]}") \
+if ! (cd "$start_dir" && FAKE_UNAME=Linux "$controller" "${initial_args[@]}") \
   >"$root/initial-plan.stdout" 2>"$root/initial-plan.stderr"; then
   cat "$root/initial-plan.stderr" >&2
   exit 1
@@ -1217,7 +1273,7 @@ for ((index = 0; index < ${#initial_args[@]}; index++)); do
     initial_args[index + 1]="$root/invalid-initial-plan-cycle"
   fi
 done
-if (cd "$start_dir" && FAKE_UNAME=Darwin "$controller" "${initial_args[@]}") \
+if (cd "$start_dir" && FAKE_UNAME=Linux "$controller" "${initial_args[@]}") \
   >"$root/initial-generation.out" 2>"$root/initial-generation.err"; then
   echo "controller accepted a follow-up plan as initial authority" >&2
   exit 1

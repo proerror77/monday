@@ -127,6 +127,10 @@ pub(super) fn render_value(
     if signed.grant.execution != inspection.execution {
         bail!("controller handoff differs from the root execution binding");
     }
+    let controller_deadline_seconds = signed.grant.budget.max_job_seconds.min(28_800);
+    if controller_deadline_seconds == 0 {
+        bail!("controller handoff requires a positive signed Job time budget");
+    }
     let trusted_keys = read_authority(&control.trusted_keys_path)?;
     let _: std::collections::BTreeMap<String, String> = serde_json::from_str(&trusted_keys)?;
     control.ledger_path = mount_path(&root, &control.ledger_path)?;
@@ -163,7 +167,7 @@ pub(super) fn render_value(
          "subjects":[{"kind":"ServiceAccount","name":args.service_account,"namespace":args.namespace}],
          "roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"Role","name":role}},
         {"apiVersion":"batch/v1","kind":"Job","metadata":metadata(&name),"spec":{
-            "backoffLimit":0,"activeDeadlineSeconds":28_800,"ttlSecondsAfterFinished":86_400,
+            "backoffLimit":0,"activeDeadlineSeconds":controller_deadline_seconds,"ttlSecondsAfterFinished":86_400,
             "template":{"metadata":{"labels":labels},"spec":{
                 "restartPolicy":"Never","serviceAccountName":args.service_account,"automountServiceAccountToken":true,
                 "imagePullSecrets":[{"name":"monday-acr"}],"nodeSelector":{"kubernetes.io/arch":"amd64","workload":"backtest"},

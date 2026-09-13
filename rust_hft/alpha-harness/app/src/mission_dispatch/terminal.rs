@@ -6,7 +6,7 @@ use super::{
 };
 use crate::{
     cli::{print_json, MissionDispatchSubmitArgs},
-    mission_campaign::readback_pre_holdout_terminal,
+    mission_campaign::{readback_pre_holdout_terminal_cached, report_settled_campaign_cache},
     prediction_dispatch::{kubectl_binary, kubectl_json, validate_cluster_target},
 };
 use alpha_domain::campaign_control::CampaignAttemptSettlementV1;
@@ -17,6 +17,14 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 pub(super) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
+    let cache = args
+        .readback_cache
+        .as_deref()
+        .context("Campaign settlement requires --readback-cache from the ACK controller")?;
+    let report_output = args
+        .model_report
+        .clone()
+        .unwrap_or_else(|| cache.join("model-report.json"));
     validate_cluster_target(&args.context, &args.namespace)?;
     let validated = validate_submission(load_submission(&args.submission)?)?;
     let control = args
@@ -54,11 +62,12 @@ pub(super) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
             .timeout(Duration::from_secs(120))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
-        let (outcome, consumed_trials, evidence_sha256) = readback_pre_holdout_terminal(
+        let (outcome, consumed_trials, evidence_sha256) = readback_pre_holdout_terminal_cached(
             &client,
             &validated.submission.request,
             &validated.request_sha256,
             &admission.reservation.execution.evaluation_protocol_sha256,
+            cache,
         )?;
         let evidence = CampaignDispatchSettlementV1 {
             job_uid,
@@ -80,6 +89,13 @@ pub(super) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
     let settlement = record
         .settlement
         .context("dispatch settlement was not persisted")?;
+    let model_report = report_settled_campaign_cache(
+        &validated.submission.request,
+        &validated.request_sha256,
+        &settlement.evidence_sha256,
+        cache,
+        &report_output,
+    )?;
     // If publication previously lost its response, reuse the durable event's
     // exact bytes. Do not require a TTL-deleted Job to be present a second time.
     admission.publish_receipts()?;
@@ -91,6 +107,7 @@ pub(super) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
         "pod_uid": record.terminal_pod_uid,
         "campaign_result_sha256": settlement.evidence_sha256,
         "outcome": settlement.outcome, "consumed_trials": settlement.consumed_trials,
+        "model_report": model_report,
     });
     crate::mission_runner::research_event(
         "alpha-harness",

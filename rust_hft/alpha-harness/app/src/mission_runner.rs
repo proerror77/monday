@@ -3786,6 +3786,55 @@ pub(crate) fn recover_execution_report_from_published_result(
     else {
         return Ok(None);
     };
+    decode_verified_execution_report(
+        readback_destination,
+        bundle_bytes,
+        bundle_sha256,
+        expected_mission_id,
+        expected_mission_sha256,
+        binding,
+    )
+    .map(Some)
+}
+
+/// Decode the same bound evidence from the ACK controller's immutable readback
+/// cache. A missing or mismatched cache is an error, never a second download.
+pub(crate) fn recover_execution_report_from_cached_result(
+    path: &Path,
+    expected_bundle_sha256: &str,
+    expected_mission_id: &str,
+    expected_mission_sha256: &str,
+    binding: &ExecutionBinding,
+) -> anyhow::Result<ExecutionReport> {
+    let metadata = std::fs::symlink_metadata(path).context("inspect cached result bundle")?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > MAX_RESULT_BUNDLE_BYTES
+    {
+        bail!("cached result bundle must be a bounded regular file");
+    }
+    let digest = sha256_file(path)?;
+    if digest != normalized_sha256("cached result bundle", expected_bundle_sha256)? {
+        bail!("cached result bundle SHA256 differs from the authenticated Campaign result");
+    }
+    decode_verified_execution_report(
+        path,
+        metadata.len(),
+        digest,
+        expected_mission_id,
+        expected_mission_sha256,
+        binding,
+    )
+}
+
+fn decode_verified_execution_report(
+    readback_destination: &Path,
+    bundle_bytes: u64,
+    bundle_sha256: String,
+    expected_mission_id: &str,
+    expected_mission_sha256: &str,
+    binding: &ExecutionBinding,
+) -> anyhow::Result<ExecutionReport> {
     let mut archive = ZipArchive::new(File::open(readback_destination)?)
         .context("open published result bundle")?;
     let admission: MissionAdmissionEvidenceV1 =
@@ -3970,7 +4019,7 @@ pub(crate) fn recover_execution_report_from_published_result(
         None
     };
 
-    Ok(Some(ExecutionReport {
+    Ok(ExecutionReport {
         mission_id: expected_mission_id.to_string(),
         mission_sha256: normalized_sha256("Mission", expected_mission_sha256)?,
         campaign_id: admission.campaign_id,
@@ -4010,7 +4059,7 @@ pub(crate) fn recover_execution_report_from_published_result(
         promotion_id: finalization
             .as_ref()
             .and_then(|report| report.promotion_id.clone()),
-    }))
+    })
 }
 
 fn fetch_optional_to_file(

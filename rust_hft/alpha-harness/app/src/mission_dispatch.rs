@@ -106,12 +106,20 @@ pub fn inspect(args: MissionDispatchInspectArgs) -> anyhow::Result<()> {
 
 pub fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
     if final_admission::is_final_submission(&args.submission)? {
+        if args.readback_cache.is_some() || args.model_report.is_some() {
+            anyhow::bail!(
+                "pre-holdout readback cache options do not apply to final evaluation settlement"
+            );
+        }
         return final_admission::settle(args);
     }
     terminal::settle(args)
 }
 
 pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
+    if args.readback_cache.is_some() || args.model_report.is_some() {
+        anyhow::bail!("readback cache and model report options are settlement-only");
+    }
     if final_admission::is_final_submission(&args.submission)? {
         return final_admission::submit(args);
     }
@@ -2281,6 +2289,16 @@ mod tests {
             "/trusted-keys/root-public-keys.json"
         );
         let job = items.iter().find(|x| x["kind"] == "Job").unwrap();
+        let signed_root: Value =
+            serde_json::from_str(secret["stringData"]["root-grant.json"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(
+            job["spec"]["activeDeadlineSeconds"],
+            signed_root["grant"]["budget"]["max_job_seconds"]
+                .as_u64()
+                .unwrap()
+                .min(28_800)
+        );
         assert!(
             secret["stringData"].get("root-public-keys.json").is_none(),
             "trusted keys must not be frozen into per-attempt authority"

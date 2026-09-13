@@ -239,6 +239,13 @@ pub struct MissionDispatchSubmitArgs {
     pub context: String,
     #[arg(long)]
     pub namespace: String,
+    /// ACK generation directory containing its already downloaded round-readback cache.
+    /// Required for pre-holdout settlement; not accepted by submission.
+    #[arg(long)]
+    pub readback_cache: Option<PathBuf>,
+    /// Lightweight report derived in ACK from the authenticated settled cache.
+    #[arg(long, requires = "readback_cache")]
+    pub model_report: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1090,11 +1097,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     .context("mission execution worker failed")?
             }
             MissionCommand::CampaignExecute(args) => {
+                require_cloud_data_host(std::env::consts::OS)?;
                 tokio::task::spawn_blocking(move || mission_campaign::execute(args))
                     .await
                     .context("campaign execution worker failed")?
             }
-            MissionCommand::CampaignFreeze(args) => mission_campaign::freeze(args),
+            MissionCommand::CampaignFreeze(args) => {
+                require_cloud_data_host(std::env::consts::OS)?;
+                mission_campaign::freeze(args)
+            }
             MissionCommand::CampaignLearn(args) => {
                 tokio::task::spawn_blocking(move || mission_campaign::learn(args))
                     .await
@@ -1108,17 +1119,20 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             MissionCommand::CampaignFinalize(args) => mission_campaign::finalize(args),
             MissionCommand::CampaignId(args) => mission_campaign::print_expected_id(args),
             MissionCommand::ModelMetrics(args) => {
+                require_cloud_data_host(std::env::consts::OS)?;
                 tokio::task::spawn_blocking(move || mission_metrics::run(args))
                     .await
                     .context("model metrics reporting worker failed")?
             }
             MissionCommand::PrepareFreshInputs(args) => {
+                require_cloud_data_host(std::env::consts::OS)?;
                 tokio::task::spawn_blocking(move || mission_fresh_inputs::prepare(*args))
                     .await
                     .context("fresh Campaign input preparation worker failed")?
             }
             MissionCommand::Dispatch { command } => match command {
                 MissionDispatchCommand::Submit(args) => {
+                    require_cloud_data_host(std::env::consts::OS)?;
                     tokio::task::spawn_blocking(move || mission_dispatch::submit(args))
                         .await
                         .context("Campaign dispatch worker failed")?
@@ -1134,6 +1148,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     mission_dispatch::controller::prepare(args)
                 }
                 MissionDispatchCommand::Settle(args) => {
+                    require_cloud_data_host(std::env::consts::OS)?;
                     tokio::task::spawn_blocking(move || mission_dispatch::settle(args))
                         .await
                         .context("Campaign settlement worker failed")?
@@ -1254,9 +1269,27 @@ pub fn print_json(value: &impl serde::Serialize) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn require_cloud_data_host(os: &str) -> anyhow::Result<()> {
+    if os != "linux" {
+        anyhow::bail!("bulk CEX research, artifact verification and ledger execution belong in the ACK research Job; the workstation may sign control metadata and read lightweight reports");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_research_commands_reject_workstation_hosts() {
+        for host in ["macos", "windows"] {
+            assert!(require_cloud_data_host(host)
+                .unwrap_err()
+                .to_string()
+                .contains("ACK research Job"));
+        }
+        assert!(require_cloud_data_host("linux").is_ok());
+    }
 
     #[test]
     fn model_metrics_cli_accepts_multiple_backtests_and_explicit_selection() {

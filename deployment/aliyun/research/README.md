@@ -428,8 +428,10 @@ The image contains eight stable entrypoints:
 
 `k8s/alpha-mission-job.example.yaml` is only the generated Pod-shape reference.
 The production CEX path does not render a Mission or scan feature rows on the
-workstation. The workstation only freezes, signs, and submits identities. The
-cloud ACK Pod downloads the shared inputs once, then performs the complete
+workstation. Input preparation, freeze, dispatch and evidence processing run
+on the ACK research host with the campaign-root volume. The workstation may
+inspect/sign control metadata and fetch bounded reports. The cloud ACK worker
+downloads the shared inputs once per Campaign, then performs the complete
 sequence:
 
 ```text
@@ -518,15 +520,17 @@ still the only path that creates the next suspended execution Job.
 historical `max_tokens` field unchanged; resumption ignores only this retired
 field and still rejects changes to every other input, including the input hash.
 
-`scripts/campaign-cycle-controller.sh` separates the local control plane from
-ACK data-plane readback. A workstation may run only `start`, `status`, or
-`approve`. `start` freezes, signs, finalizes, and dispatches one approved
-generation, then prints `k8s/campaign-cycle-controller-job.example.yaml` to
-stdout for review. It does not wait for the Campaign Job, enter
-`oss_result_readback`, run `campaign-learn`, or copy any `results.zip` object.
-`approve` performs the same bounded preparation for one learned child
-generation and prints a fresh ACK Job handoff. Applying either printed Job is a
-separate operator action; the controller does not apply it.
+`scripts/campaign-cycle-controller.sh start`, `approve` and `ack-readback`
+run on the ACK research host. `start` and `approve` read immutable input files
+during freeze, so they are data-bearing operations. The workstation may inspect
+`status` or sign a frozen metadata plan; it does not copy raw inputs, result
+bundles, or an active ledger to advance a generation. `start` freezes, signs,
+finalizes and dispatches one authorized generation; `approve` does the same for
+one authorized child. Both print a controller Job reference without applying it.
+For a runnable, authority-bound handoff use `mission dispatch controller-handoff`
+on the existing cloud volume. Its deadline is capped by the signed root Job
+budget and eight hours. The example template requires an explicit deadline;
+it is not a substitute for native authority validation.
 
 The ACR publication workflow publishes `campaign-cycle-controller` alongside
 `research-runner` from the same authenticated research binary artifact. Pin the
@@ -683,21 +687,26 @@ the next research plan beneath the Campaign root in OSS, then reads each back
 through `oss-ap-northeast-1-internal.aliyuncs.com` and checks SHA-256. The
 downloaded evidence, the active ledger and learn artifacts remain on the
 campaign-root block volume; immutable copies are published to OSS.
-The Pod's research-only RAM identity must be limited to GET on that Campaign
-prefix and create-only PUT on its `learning/` prefix; do not mount exchange or
-trading credentials. These artifacts are never copied to Mac `/tmp`.
+The Pod's research-only RAM identity needs GET on the Campaign prefix and
+create-only PUT on its `learning/` prefix and exact `model-report.json` object.
+An exact-object signed transport map must include PUT/GET for that report;
+missing access fails publication without a local download fallback. Do not mount
+exchange or trading credentials. Bulk artifacts remain on ACK/OSS.
 
-Darwin is fail-closed inside `oss_readback`: any attempt to run the ACK
-readback mode on macOS exits non-zero before creating a partial destination or
-any `round-*-results.zip`. `start`, `status`, and `approve` therefore remain
-local control-plane operations only. The ACK Job uses the namespace-scoped
+All three data-bearing controller modes reject non-Linux hosts before state
+reads, signing, dispatch or file writes. Native Campaign freeze/execute,
+fresh-input preparation, model-metrics and dispatch submit/settle have the same
+accidental-workstation guard. Linux alone is not ACK attestation: retain the
+namespace, Job/Pod UID, source/image, volume and signed-authority checks. The
+workstation `status` mode and metadata signing remain available. The ACK Job uses the namespace-scoped
 ServiceAccount and Role in
 `k8s/campaign-cycle-controller-rbac.example.yaml`: exact Job read/watch, exact
 Job-owned Pod read, and Pod list for the native unique-owner check.
 It has no create/patch authority, cluster-wide authority, exchange credential,
 order, risk-limit, or runtime-resume access. After a negative generation, the
-ACK Job stops at `approval_handoff`; a workstation may inspect `status` and
-explicitly approve the next bounded generation.
+ACK Job stops at `approval_handoff`; the operator may inspect its small status
+and authorize the next bounded generation. Execute that authorized `approve`
+on the cloud host against the same volume, without copying the ledger or inputs.
 
 ### Recovery checkpoints
 
@@ -1051,14 +1060,19 @@ After a successful terminal Job, settle the same submission:
 alpha-harness mission dispatch settle \
   --submission /private/path/campaign-submission.json \
   --control /private/path/campaign-control.json \
+  --readback-cache /campaign-root/cycles/CYCLE/generation-0 \
+  --model-report /campaign-root/cycles/CYCLE/generation-0/model-report.json \
   --context monday-research-apne1 \
   --namespace monday-research
 ```
 
 Settlement independently reads the exact Job and its single successful Pod,
-checks the bound UID, request and image, then reads the Campaign result and each
-round's Mission/result bundle. It reconstructs factor/model/replay evidence and
-trial counts using the existing readers. Summary counts alone, a failed Job,
+checks the bound UID, request and image, then freshly reads the small Campaign
+result. It verifies the ACK cache against that result's hashes and reuses each
+`round-readback/round-N-mission.json` and `round-N-results.zip`; a missing,
+symlinked, oversized or mismatched cache fails instead of downloading again.
+It reconstructs factor/model/replay evidence and trial counts using the existing
+readers. Hash reuse does not skip semantic validation. Summary counts alone, a failed Job,
 missing artifacts, a mismatched winner, or sealed-holdout artifacts cannot settle
 a successful pre-holdout result. Failed/unknown attempts remain fully charged
 pending separate infrastructure reconciliation.
@@ -1071,8 +1085,25 @@ fails after the local commit, retry reuses those exact committed bytes without
 requiring a TTL-deleted Job to appear again. A child cannot be released until its
 parent terminal receipt and its own reservation have been independently read back.
 
+Settlement also writes `cex-campaign-evidence-report-v1`: at most 4 MiB of
+native model metrics and MLP fold learning/prediction diagnostics, with request,
+Campaign-result, execution-source, reader-source and per-round bundle identities.
+It copies verified native summaries without model fitting, position-accounting
+replay, raw input reads or console-log parsing. Older artifacts without these
+summaries have explicit absent metrics/empty diagnostics. The report does not
+create a new research result or grant.
+
+The shell publishes this report create-once next to `campaign-result.json`,
+compares an independent GET, then records its URL/SHA256/bytes in the generation
+summary. Completion and child advancement require this cloud publication; a
+workstation report download is never a dependency. A report-publication failure
+resumes the same settlement and immutable cache without another Job, raw-data
+transfer or model fit. `status` identifies `model_report_publication` while this
+readback is pending. The authenticated durable settlement hash allows recovery
+even after the execution Job has expired from Kubernetes.
+
 The shell controller settles before learning and retains the private submission
-until generation completion so an interrupted settlement can resume. It no longer
+until generation completion so an interrupted settlement or report can resume. It no longer
 deletes Secrets by name during provenance checks. Completed Jobs retain their
 existing TTL and UID-based Secret owner reference for Kubernetes garbage
 collection; ambiguous/suspended attempts remain for owner reconciliation. New
@@ -1398,3 +1429,21 @@ trading results. Real-data re-evaluation and independent out-of-sample evidence
 are still required before profitability claims. See the
 [accounting contract](../../../rust_hft/alpha-harness/README.md#prediction-clocks-and-return-accounting).
 Memory observation does not change costs or admission thresholds.
+
+### Data-flow review and host lifetime
+
+The [2026-09-13 review](../../../docs/reports/2026-09-13-cex-cloud-evidence-flow-review.md)
+records removed transfers and intentional independent checks. A retained ACK
+cache is keyed to the immutable Campaign result, not to a successful local
+process. Do not add Python wrappers that fetch bulk artifacts to a workstation
+for metrics, ledger verification or subsequent dispatch. Workstation charts may
+format the bounded report only. Signed root keys may remain in the established
+signing boundary; an active ledger remains on its single-writer cloud volume.
+
+Controller Jobs must have finite deadlines/TTL within the task resource window.
+A local PID or a sticky node-retention annotation is not an acceptable sole
+lifetime controller. Reserve cleanup time, preserve the original deadline on
+resume, and release only owned resources by UID. Check cloud terminal evidence
+and capacity release independently; desktop interruption must not create a new
+attempt or extend a lease. Job TTL cleans Jobs, not arbitrary PVCs, RAM policy,
+or node annotations; these resources still need the task's scoped cleanup.
