@@ -2,7 +2,7 @@ name: Publish ACR Images
 
 on:
   workflow_run:
-    workflows: ["Prediction Markets CI"]
+    workflows: ["Monorepo CI", "Prediction Markets CI", "Security & Quality (ENABLED)"]
     types: [completed]
     branches: [main]
   workflow_dispatch:
@@ -64,85 +64,37 @@ jobs:
     steps:
       - name: Checkout source selector
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: refs/heads/main
 
-      - name: Read authenticated source job results
+      - name: Read authenticated automatic release source
         id: source-jobs
         if: github.event_name == 'workflow_run'
         env:
           GH_TOKEN: ${{ github.token }}
-          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
-          jobs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID/jobs" \
-            --jq '.jobs[] | [.name, .conclusion] | @tsv')
-          job_conclusion() {
-            local name=$1 matches
-            matches=$(awk -F '\t' -v name="$name" '$1 == name {print $2}' <<<"$jobs")
-            [[ -n "$matches" && "$matches" != *$'\n'* ]]
-            printf '%s\n' "$matches"
-          }
-          echo "binaries_conclusion=$(job_conclusion 'Research image binaries')" >> "$GITHUB_OUTPUT"
-          echo "smoke_conclusion=$(job_conclusion 'Research image smoke')" >> "$GITHUB_OUTPUT"
+          .github/scripts/read-acr-publish-source.sh "$SOURCE_SHA" "$GITHUB_RUN_ID"
 
       - name: Read authenticated release admission
         id: admission
+        if: github.event_name == 'workflow_dispatch'
         env:
-          BINARIES_CONCLUSION: ${{ steps.source-jobs.outputs.binaries_conclusion }}
           CURRENT_SHA: ${{ github.sha }}
-          EVENT_NAME: ${{ github.event_name }}
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           PUBLISH_TARGET: ${{ inputs.target }}
-          SMOKE_CONCLUSION: ${{ steps.source-jobs.outputs.smoke_conclusion }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if [[ "$EVENT_NAME" == workflow_run ]]; then
-            admission_sha=$HEAD_SHA
-          else
-            admission_sha=$CURRENT_SHA
-          fi
-
-          requires_checks=false
-          if [[ "$EVENT_NAME" == workflow_dispatch && "$PUBLISH_TARGET" != research-source-test ]]; then
-            requires_checks=true
-          elif [[ "$EVENT_NAME" == workflow_run && "$BINARIES_CONCLUSION/$SMOKE_CONCLUSION" == success/success ]]; then
-            requires_checks=true
-          fi
-
-          main_sha=
-          monorepo_conclusion=missing
-          prediction_conclusion=missing
-          security_conclusion=missing
-          deadline=$((SECONDS + 900))
-          while :; do
-            main_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
-            [[ "$requires_checks" == true && "$admission_sha" == "$main_sha" ]] || break
-
+          main_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
+          echo "main_sha=$main_sha" >> "$GITHUB_OUTPUT"
+          if [[ "$PUBLISH_TARGET" != research-source-test && "$CURRENT_SHA" == "$main_sha" ]]; then
             checks_json="$RUNNER_TEMP/acr-required-checks.json"
-            evidence="$RUNNER_TEMP/acr-required-checks.env"
             gh api --paginate --slurp \
-              "repos/$GITHUB_REPOSITORY/commits/$admission_sha/check-runs?filter=latest&per_page=100" > "$checks_json"
+              "repos/$GITHUB_REPOSITORY/commits/$CURRENT_SHA/check-runs?filter=latest&per_page=100" > "$checks_json"
+            evidence="$RUNNER_TEMP/acr-required-checks.env"
             .github/scripts/read-release-required-checks.sh "$checks_json" "$evidence"
-            monorepo_conclusion=$(sed -n 's/^monorepo_conclusion=//p' "$evidence")
-            prediction_conclusion=$(sed -n 's/^prediction_conclusion=//p' "$evidence")
-            security_conclusion=$(sed -n 's/^security_conclusion=//p' "$evidence")
-            [[ "$monorepo_conclusion/$prediction_conclusion/$security_conclusion" == success/success/success ]] && break
-            [[ "$EVENT_NAME" == workflow_run && $SECONDS -lt $deadline ]] || break
-
-            waitable=true
-            for state in "$monorepo_conclusion" "$prediction_conclusion" "$security_conclusion"; do
-              case "$state" in
-                success|missing|queued|in_progress|waiting|pending|requested) ;;
-                *) waitable=false ;;
-              esac
-            done
-            [[ "$waitable" == true ]] || break
-            sleep 30
-          done
-          printf '%s\n' \
-            "main_sha=$main_sha" \
-            "monorepo_conclusion=$monorepo_conclusion" \
-            "prediction_conclusion=$prediction_conclusion" \
-            "security_conclusion=$security_conclusion" >> "$GITHUB_OUTPUT"
+            cat "$evidence" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Select authenticated publish source
         id: source
@@ -154,7 +106,8 @@ jobs:
           SOURCE_EVENT: ${{ github.event.workflow_run.event }}
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
-          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          SOURCE_RUN_ID: ${{ steps.source-jobs.outputs.artifact_run_id }}
+          AUTOMATION_STATE: ${{ steps.source-jobs.outputs.automation_state }}
           PUBLISH_TARGET: ${{ inputs.target }}
           REBUILD_RESEARCH_RUNNER: ${{ inputs.rebuild_research_runner }}
           SOURCE_TEST_SOURCE_SHA: ${{ inputs.source_test_source_sha }}
@@ -162,10 +115,10 @@ jobs:
           CURRENT_SHA: ${{ github.sha }}
           CURRENT_RUN_ID: ${{ github.run_id }}
           CURRENT_REF: ${{ github.ref }}
-          MAIN_SHA: ${{ steps.admission.outputs.main_sha }}
-          MONOREPO_CONCLUSION: ${{ steps.admission.outputs.monorepo_conclusion }}
-          PREDICTION_CONCLUSION: ${{ steps.admission.outputs.prediction_conclusion }}
-          SECURITY_CONCLUSION: ${{ steps.admission.outputs.security_conclusion }}
+          MAIN_SHA: ${{ steps.source-jobs.outputs.main_sha || steps.admission.outputs.main_sha }}
+          MONOREPO_CONCLUSION: ${{ steps.source-jobs.outputs.monorepo_conclusion || steps.admission.outputs.monorepo_conclusion }}
+          PREDICTION_CONCLUSION: ${{ steps.source-jobs.outputs.prediction_conclusion || steps.admission.outputs.prediction_conclusion }}
+          SECURITY_CONCLUSION: ${{ steps.source-jobs.outputs.security_conclusion || steps.admission.outputs.security_conclusion }}
         run: |
           .github/scripts/select-acr-publish-source.sh \
             --event "$EVENT_NAME" \
@@ -174,6 +127,7 @@ jobs:
             --head-branch "$HEAD_BRANCH" \
             --head-sha "$HEAD_SHA" \
             --run-id "$SOURCE_RUN_ID" \
+            --automation-state "$AUTOMATION_STATE" \
             --binaries-conclusion "$BINARIES_CONCLUSION" \
             --smoke-conclusion "$SMOKE_CONCLUSION" \
             --target "$PUBLISH_TARGET" \
@@ -376,10 +330,12 @@ jobs:
       - name: Revalidate current main before publication
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_CHECK_TIMEOUT_SECONDS: "0"
           SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
         run: |
           current_main=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
           test "$SOURCE_REVISION" = "$current_main"
+          .github/scripts/wait-release-required-checks.sh "$SOURCE_REVISION" current-main
 
       - name: Build and push
         id: build
@@ -881,6 +837,20 @@ jobs:
           docker logout "$ACR_REGISTRY" >/dev/null 2>&1 || true
           docker_config_root=${DOCKER_CONFIG:-$HOME/.docker}
           rm -f -- "$docker_config_root/config.json"
+
+  research-release-complete:
+    name: Research release complete (${{ needs.selector.outputs.source_sha }})
+    needs: [selector, publish]
+    if: always() && needs.selector.result == 'success' && needs.publish.result == 'success' && (needs.selector.outputs.publish_target == 'research-runner' || needs.selector.outputs.publish_target == 'all')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record verified paired publication
+        env:
+          SOURCE_SHA: ${{ needs.selector.outputs.source_sha }}
+          ARTIFACT_RUN_ID: ${{ needs.selector.outputs.artifact_run_id }}
+        run: |
+          test "$SOURCE_SHA" = "$GITHUB_SHA"
+          printf 'Verified runner and controller: source=%s artifact_run=%s\n' "$SOURCE_SHA" "$ARTIFACT_RUN_ID"
 
   publish-source-test:
     needs: selector

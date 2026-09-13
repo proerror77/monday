@@ -39,7 +39,7 @@ grep -Fqx '            [{repository:"research-runner",context:"rust_hft",file:"r
 grep -Fqx '             {repository:"campaign-cycle-controller",context:".",file:"deployment/aliyun/research/Dockerfile.campaign-cycle-controller",target:"prebuilt",research_artifact:true},' "$workflow"
 grep -Fqx '                or ($target == "research-runner" and .repository == "campaign-cycle-controller")' "$workflow"
 grep -Fqx '  workflow_run:' "$workflow"
-grep -Fqx '    workflows: ["Prediction Markets CI"]' "$workflow"
+grep -Fqx '    workflows: ["Monorepo CI", "Prediction Markets CI", "Security & Quality (ENABLED)"]' "$workflow"
 grep -Fqx '    branches: [main]' "$workflow"
 grep -Fqx '        description: Image target (research-runner also publishes its paired Campaign controller)' "$workflow"
 grep -Fqx '          - polymarket-raw-ops' "$workflow"
@@ -55,21 +55,27 @@ if grep -Eq '^    paths(-ignore)?:' <<<"$ci_push_block$ploy_push_block"; then
 fi
 grep -Fqx '      rebuild_research_runner:' "$workflow"
 grep -Fqx '      source_test_source_sha:' "$workflow"
-grep -Fqx '          jobs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID/jobs" \' "$workflow"
 grep -Fqx '          BINARIES_CONCLUSION: ${{ steps.source-jobs.outputs.binaries_conclusion }}' "$workflow"
 grep -Fqx '          SMOKE_CONCLUSION: ${{ steps.source-jobs.outputs.smoke_conclusion }}' "$workflow"
 grep -Fqx '      - name: Read authenticated release admission' "$workflow"
-grep -Fqx '            main_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '\''.object.sha'\'')' "$workflow"
+grep -Fqx '          .github/scripts/read-acr-publish-source.sh "$SOURCE_SHA" "$GITHUB_RUN_ID"' "$workflow"
+grep -Fqx '          SOURCE_RUN_ID: ${{ steps.source-jobs.outputs.artifact_run_id }}' "$workflow"
+grep -Fqx '            --automation-state "$AUTOMATION_STATE" \' "$workflow"
+grep -Fqx '    name: Research release complete (${{ needs.selector.outputs.source_sha }})' "$workflow"
+grep -Fqx '    needs: [selector, publish]' "$workflow"
+grep -Fqx "    if: always() && needs.selector.result == 'success' && needs.publish.result == 'success' && (needs.selector.outputs.publish_target == 'research-runner' || needs.selector.outputs.publish_target == 'all')" "$workflow"
+grep -Fqx '          test "$SOURCE_SHA" = "$GITHUB_SHA"' "$workflow"
+if grep -Fq 'SECONDS + 900' "$workflow"; then
+  echo 'automatic ACR admission still waits instead of deferring' >&2
+  exit 1
+fi
 grep -Fqx '            gh api --paginate --slurp \' "$workflow"
-grep -Fqx '              "repos/$GITHUB_REPOSITORY/commits/$admission_sha/check-runs?filter=latest&per_page=100" > "$checks_json"' "$workflow"
-grep -Fqx '            .github/scripts/read-release-required-checks.sh "$checks_json" "$evidence"' "$workflow"
-grep -Fqx '          deadline=$((SECONDS + 900))' "$workflow"
 grep -Fqx '          .github/scripts/select-acr-publish-source.sh \' "$workflow"
 grep -Fqx '          CURRENT_REF: ${{ github.ref }}' "$workflow"
-grep -Fqx '          MAIN_SHA: ${{ steps.admission.outputs.main_sha }}' "$workflow"
-grep -Fqx '          MONOREPO_CONCLUSION: ${{ steps.admission.outputs.monorepo_conclusion }}' "$workflow"
-grep -Fqx '          PREDICTION_CONCLUSION: ${{ steps.admission.outputs.prediction_conclusion }}' "$workflow"
-grep -Fqx '          SECURITY_CONCLUSION: ${{ steps.admission.outputs.security_conclusion }}' "$workflow"
+grep -Fqx '          MAIN_SHA: ${{ steps.source-jobs.outputs.main_sha || steps.admission.outputs.main_sha }}' "$workflow"
+grep -Fqx '          MONOREPO_CONCLUSION: ${{ steps.source-jobs.outputs.monorepo_conclusion || steps.admission.outputs.monorepo_conclusion }}' "$workflow"
+grep -Fqx '          PREDICTION_CONCLUSION: ${{ steps.source-jobs.outputs.prediction_conclusion || steps.admission.outputs.prediction_conclusion }}' "$workflow"
+grep -Fqx '          SECURITY_CONCLUSION: ${{ steps.source-jobs.outputs.security_conclusion || steps.admission.outputs.security_conclusion }}' "$workflow"
 grep -Fqx '            --current-ref "$CURRENT_REF" \' "$workflow"
 grep -Fqx '            --main-sha "$MAIN_SHA" \' "$workflow"
 grep -Fqx '            --monorepo-conclusion "$MONOREPO_CONCLUSION" \' "$workflow"
@@ -78,6 +84,8 @@ grep -Fqx '            --security-conclusion "$SECURITY_CONCLUSION"' "$workflow"
 grep -Fqx '      - name: Revalidate current main before publication' "$workflow"
 grep -Fqx '          current_main=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '\''.object.sha'\'')' "$workflow"
 grep -Fqx '          test "$SOURCE_REVISION" = "$current_main"' "$workflow"
+grep -Fqx '          .github/scripts/wait-release-required-checks.sh "$SOURCE_REVISION" current-main' "$workflow"
+grep -Fqx '          RELEASE_CHECK_TIMEOUT_SECONDS: "0"' "$workflow"
 test "$(grep -n '^      - name: Revalidate current main before publication$' "$workflow" | cut -d: -f1)" \
   -lt "$(grep -n '^      - name: Build and push$' "$workflow" | cut -d: -f1)"
 if grep -Fq '${{' <<<"$source_command_block"; then
@@ -333,5 +341,6 @@ if "$verifier" "$tmp_dir"; then
 fi
 
 "$script_dir/test-research-image-release-artifact.sh"
+"$script_dir/test-acr-publish-source-readback.sh"
 
 printf 'ACR research-runner prebuilt contract tests passed\n'

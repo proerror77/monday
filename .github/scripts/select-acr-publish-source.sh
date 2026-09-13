@@ -2,6 +2,7 @@
 set -euo pipefail
 
 event=
+automation_state=ready
 conclusion=
 source_event=
 head_branch=
@@ -26,6 +27,7 @@ output=${GITHUB_OUTPUT:-/dev/stdout}
 while (($#)); do
   case "$1" in
     --event) event=$2; shift 2 ;;
+    --automation-state) automation_state=${2:-ready}; shift 2 ;;
     --conclusion) conclusion=$2; shift 2 ;;
     --source-event) source_event=$2; shift 2 ;;
     --head-branch) head_branch=$2; shift 2 ;;
@@ -88,16 +90,26 @@ case "$event" in
       exit 1
     }
     source_sha=$head_sha
-    case "$binaries_conclusion/$smoke_conclusion" in
-      success/success)
-        require_green_main "$source_sha"
-        publish_target=research-runner
-        research_mode=artifact
+    case "$automation_state" in
+      ready) ;;
+      deferred|stale|out_of_scope|already_published)
+        publish_target=none
+        research_mode=none
         ;;
-      skipped/skipped) publish_target=none; research_mode=none ;;
-      *) printf 'incomplete research image validation: binaries=%s smoke=%s\n' \
-           "$binaries_conclusion" "$smoke_conclusion" >&2; exit 1 ;;
+      *) echo 'invalid automated ACR admission state' >&2; exit 1 ;;
     esac
+    if [[ $automation_state == ready ]]; then
+      case "$binaries_conclusion/$smoke_conclusion" in
+        success/success)
+          require_green_main "$source_sha"
+          publish_target=research-runner
+          research_mode=artifact
+          ;;
+        skipped/skipped) publish_target=none; research_mode=none ;;
+        *) printf 'incomplete research image validation: binaries=%s smoke=%s\n' \
+             "$binaries_conclusion" "$smoke_conclusion" >&2; exit 1 ;;
+      esac
+    fi
     artifact_run_id=$run_id
     ;;
   workflow_dispatch)
