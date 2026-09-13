@@ -1,5 +1,8 @@
 //! Frozen inference parameters shared by training, evaluation and runtime.
 //! The tensor digest is identical to the trainer's existing semantic digest.
+mod numerical;
+pub use numerical::{MlpPredictionParityDiagnostics, MlpPredictionParityError};
+
 use crate::mlp_training::MlpLearningDiagnosticsV1;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

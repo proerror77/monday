@@ -989,11 +989,24 @@ fn fit_burn_fold(fit: CexBurnFoldFit<'_>) -> Result<CexBurnFoldOutput, String> {
             .predict(&feature_row)
             .map_err(|error| format!("Burn MLP validation row {index} failed: {error}"))?;
         let prediction = parameters.predict(&feature_row)?;
-        let output_scale = trained.diagnostics().learning.target_transform.scale as f32;
-        let tolerance = (1e-6_f32 * output_scale + 1e-6 * backend_prediction.abs()).max(1e-10);
-        if (prediction - backend_prediction).abs() > tolerance {
+        if let Err(error) =
+            parameters.verify_prediction_pair(&feature_row, backend_prediction, prediction)
+        {
+            crate::research_event(
+                "alpha-engine-mlp",
+                "mlp_portable_parity_failed",
+                json!({
+                    "mission_id":mission_id,"fold_index":fold_index,"purpose":purpose,
+                    "seed":seed,"learning_rate":learning_rate,"validation_row":index,
+                    "request_semantic_sha256":trained.diagnostics().request_semantic_sha256,
+                    "semantic_model_sha256":trained.diagnostics().semantic_model_sha256,
+                    "target_scale":trained.diagnostics().learning.target_transform.scale,
+                    "backend_prediction":backend_prediction,"portable_prediction":prediction,
+                    "numerical_diagnostics":&error.diagnostics,"cause":error.to_string(),
+                }),
+            );
             return Err(format!(
-                "Burn MLP portable inference differs at validation row {index}"
+                "Burn MLP portable inference rejected at validation row {index}: {error}"
             ));
         }
         if !prediction.is_finite() {

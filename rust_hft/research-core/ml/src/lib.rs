@@ -1806,3 +1806,117 @@ mod gradient_control_tests {
         assert_eq!((raw, applied), (0.0, 0.0));
     }
 }
+
+#[cfg(test)]
+mod prediction_parity_tests {
+    use super::*;
+    use hft_research_manifest::model::{PortableMlpV1, PORTABLE_MLP_SCHEMA_V1};
+
+    fn random(state: &mut u64) -> f32 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((*state >> 40) as f32 / 16777216.0) * 2.0 - 1.0
+    }
+
+    fn tensor<const D: usize>(values: Vec<f32>, dims: [usize; D]) -> Tensor<CpuBackend, D> {
+        Tensor::from_data(TensorData::new(values, dims), &NdArrayDevice::Cpu)
+    }
+
+    #[test]
+    fn certified_parity_accepts_real_burn_roundoff_without_changing_post_inverse_tensors() {
+        let _guard = lock_ndarray_backend().unwrap();
+        let scale = 0.0001_f32;
+        let mut state = 17_u64;
+        let mut fixture = None;
+        // Reproducible independent finite coefficients, not market data or a fit.
+        for _ in 0..=82 {
+            let hidden_weight = (0..112)
+                .map(|_| 2.0 * random(&mut state))
+                .collect::<Vec<_>>();
+            let hidden_bias = (0..8).map(|_| random(&mut state)).collect::<Vec<_>>();
+            let output_weight = (0..8).map(|_| random(&mut state)).collect::<Vec<_>>();
+            let features = (0..14)
+                .map(|i| random(&mut state) * [0.1, 1.0, 10.0][i % 3])
+                .collect::<Vec<_>>();
+            let output_bias = random(&mut state);
+            fixture = Some((
+                hidden_weight,
+                hidden_bias,
+                output_weight,
+                features,
+                output_bias,
+            ));
+        }
+        let (hidden_weight, hidden_bias, output_weight, features, output_bias) = fixture.unwrap();
+        for mean in [0.0, 0.00000725] {
+            let normalized = ReturnRegressor {
+                hidden: Linear {
+                    weight: Param::from_tensor(tensor(hidden_weight.clone(), [14, 8])),
+                    bias: Some(Param::from_tensor(tensor(hidden_bias.clone(), [8]))),
+                },
+                output: Linear {
+                    weight: Param::from_tensor(tensor(output_weight.clone(), [8, 1])),
+                    bias: Some(Param::from_tensor(tensor(vec![output_bias], [1]))),
+                },
+            };
+            let transform = MlpTargetTransformV1 {
+                mode: MlpTargetScaleV1::TrainStandardized,
+                mean,
+                scale: f64::from(scale),
+            };
+            let raw = fold_target_inverse(normalized, &transform).unwrap();
+            let parameters = PortableMlpV1 {
+                schema_version: PORTABLE_MLP_SCHEMA_V1.into(),
+                input_dim: 14,
+                hidden_dim: 8,
+                hidden_weight: hidden_weight.clone(),
+                hidden_bias: hidden_bias.clone(),
+                output_weight: output_weight
+                    .iter()
+                    .map(|v| (f64::from(*v) * transform.scale) as f32)
+                    .collect(),
+                output_bias: (f64::from(output_bias) * transform.scale + mean) as f32,
+            };
+            // Both paths use this same quantized post-inverse tensor snapshot;
+            // no claim equates a later inverse with folding before inference.
+            let digest = parameters.semantic_sha256().unwrap();
+            assert_eq!(digest, semantic_model_sha256(&raw).unwrap().as_str());
+            let backend = raw
+                .forward(tensor(features.clone(), [1, 14]))
+                .into_data()
+                .into_vec::<f32>()
+                .unwrap()[0];
+            let portable = parameters.predict(&features).unwrap();
+            let original_bits = portable.to_bits();
+            parameters
+                .verify_prediction_pair(&features, backend, portable)
+                .unwrap();
+            if mean == 0.0 {
+                // This pair was observed with the actual Burn/portable kernels
+                // on arm64. The oracle check is platform-independent; also check
+                // this host's actual Burn result above, including Linux CI.
+                let observed_burn = f32::from_bits(0x3713f588);
+                let observed_portable = f32::from_bits(0x3713f4e8);
+                let old_tolerance = (1e-6 * scale + 1e-6 * observed_burn.abs()).max(1e-10);
+                assert!((observed_burn - observed_portable).abs() > old_tolerance);
+                parameters
+                    .verify_prediction_pair(&features, observed_burn, observed_portable)
+                    .unwrap();
+                for wrong in [backend + 0.0001, backend * 10_000.0] {
+                    assert!(parameters
+                        .verify_prediction_pair(&features, wrong, portable)
+                        .is_err());
+                    assert!(parameters
+                        .verify_prediction_pair(&features, wrong, wrong)
+                        .is_err());
+                }
+            }
+            assert_eq!(parameters.semantic_sha256().unwrap(), digest);
+            assert_eq!(
+                parameters.predict(&features).unwrap().to_bits(),
+                original_bits
+            );
+        }
+    }
+}
