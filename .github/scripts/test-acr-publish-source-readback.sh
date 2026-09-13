@@ -20,7 +20,7 @@ case "$endpoint" in
   */workflows/ploy-ci.yml/runs\?*) cat "$FAKE_ACR_STATE/prediction" ;;
   */runs/100/attempts/2/jobs\?*) cat "$FAKE_ACR_STATE/jobs" ;;
   */workflows/acr-publish.yml/runs\?*) cat "$FAKE_ACR_STATE/publishers" ;;
-  */runs/80/attempts/3/jobs\?*) cat "$FAKE_ACR_STATE/prior-jobs" ;;
+  */runs/80/attempts/3/jobs\?*|*/runs/300/attempts/3/jobs\?*) cat "$FAKE_ACR_STATE/prior-jobs" ;;
   */runs/100/artifacts\?*) cat "$FAKE_ACR_STATE/artifacts" ;;
   *) printf 'unexpected endpoint %s\n' "$endpoint" >&2; exit 1 ;;
 esac
@@ -130,6 +130,16 @@ if grep -Fq /artifacts "$work/calls"; then
   echo 'completed publication needlessly revisited binary artifacts' >&2
   exit 1
 fi
+# Rerunning an older publisher must still recognize a newer completed run.
+edit_fixture publishers '.[0].workflow_runs[0].id=300'
+edit_fixture prior-jobs '.[0].jobs[0].run_id=300'
+rm "$work/out"
+read_state already_published
+# The current run is never its own prior completion evidence.
+edit_fixture publishers '.[0].workflow_runs[0].id=200'
+edit_fixture prior-jobs '.[0].jobs[0].run_id=200'
+rm "$work/out"
+read_state ready
 for mismatch in skipped-marker other-source previous-attempt wrong-run untrusted-workflow foreign-repository partial-pair; do
   cp "$work/publisher-base" "$work/publishers"
   cp "$work/marker-base" "$work/prior-jobs"
