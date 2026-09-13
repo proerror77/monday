@@ -1,5 +1,7 @@
 //! Read-only reporting of completed model evaluations.
 
+pub(crate) mod campaign;
+
 use crate::{
     cli::{ModelMetricsArgs, ModelMetricsBenchmark},
     data_mission,

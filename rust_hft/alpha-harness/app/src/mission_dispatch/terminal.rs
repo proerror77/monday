@@ -6,7 +6,7 @@ use super::{
 };
 use crate::{
     cli::{print_json, MissionDispatchSubmitArgs},
-    mission_campaign::readback_pre_holdout_terminal,
+    mission_campaign::{readback_pre_holdout_terminal_cached, report_settled_campaign_cache},
     prediction_dispatch::{kubectl_binary, kubectl_json, validate_cluster_target},
 };
 use alpha_domain::campaign_control::CampaignAttemptSettlementV1;
@@ -17,6 +17,14 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 pub(super) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
+    let cache = args
+        .readback_cache
+        .as_deref()
+        .context("Campaign settlement requires --readback-cache from the ACK controller")?;
+    let report_output = args
+        .model_report
+        .clone()
+        .unwrap_or_else(|| cache.join("model-report.json"));
     validate_cluster_target(&args.context, &args.namespace)?;
     let validated = validate_submission(load_submission(&args.submission)?)?;
     let control = args
@@ -36,7 +44,7 @@ pub(super) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
         &args.namespace,
     )?;
     let record = admission.record()?;
-    if record.settlement.is_none() {
+    let model_report = if record.settlement.is_none() {
         let bound_uid = record
             .claim
             .job_uid
@@ -54,11 +62,12 @@ pub(super) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
             .timeout(Duration::from_secs(120))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
-        let (outcome, consumed_trials, evidence_sha256) = readback_pre_holdout_terminal(
+        let (outcome, consumed_trials, evidence_sha256) = readback_pre_holdout_terminal_cached(
             &client,
             &validated.submission.request,
             &validated.request_sha256,
             &admission.reservation.execution.evaluation_protocol_sha256,
+            cache,
         )?;
         let evidence = CampaignDispatchSettlementV1 {
             job_uid,
@@ -71,8 +80,33 @@ pub(super) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
                 consumed_trials: Some(consumed_trials),
             },
         };
-        admission.settle(&evidence)?;
-    }
+        // Complete report construction before the durable settlement. A report
+        // I/O failure must never create a settled-but-unreportable operation.
+        report_before_settlement(&mut admission, &evidence, || {
+            report_settled_campaign_cache(
+                &validated.submission.request,
+                &validated.request_sha256,
+                &evidence.settlement.evidence_sha256,
+                cache,
+                &report_output,
+            )
+        })?
+    } else {
+        if record.terminal_pod_uid.is_none() {
+            bail!("existing settlement lacks independent dispatch terminal provenance");
+        }
+        report_settled_campaign_cache(
+            &validated.submission.request,
+            &validated.request_sha256,
+            &record
+                .settlement
+                .as_ref()
+                .context("existing settlement")?
+                .evidence_sha256,
+            cache,
+            &report_output,
+        )?
+    };
     let record = admission.record()?;
     if record.terminal_pod_uid.is_none() {
         bail!("existing settlement lacks independent dispatch terminal provenance");
@@ -91,6 +125,7 @@ pub(super) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
         "pod_uid": record.terminal_pod_uid,
         "campaign_result_sha256": settlement.evidence_sha256,
         "outcome": settlement.outcome, "consumed_trials": settlement.consumed_trials,
+        "model_report": model_report,
     });
     crate::mission_runner::research_event(
         "alpha-harness",
@@ -98,6 +133,16 @@ pub(super) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
         report.clone(),
     );
     print_json(&report)
+}
+
+pub(super) fn report_before_settlement(
+    admission: &mut Admission,
+    evidence: &CampaignDispatchSettlementV1,
+    report: impl FnOnce() -> anyhow::Result<Value>,
+) -> anyhow::Result<Value> {
+    let report = report()?;
+    admission.settle(evidence)?;
+    Ok(report)
 }
 
 pub(super) struct TerminalJobReadback {

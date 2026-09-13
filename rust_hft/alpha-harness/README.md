@@ -23,13 +23,17 @@ Rust CLI and libraries for the governed CEX Campaign and prediction research pla
 | Prediction Mission v4 | Implemented for `pipeline_smoke` and deterministic `research_trial` | Authenticated partition readmission plus task-isolated settlement, UP-execution, and DOWN-execution result receipts; no external proposal provider |
 
 `mission dispatch submit` is the CEX operator acceptance seam. It submits one
-immutable Campaign request and does not read feature rows or run search locally.
-The workstation only freezes, signs, and submits identities. One cloud ACK
-Job/Pod downloads the shared inputs once, admits the request, renders and
+immutable Campaign request from the ACK research host. Freeze and input
+preparation read data on the same cloud volume. Workstations inspect/sign
+metadata and read bounded reports. One cloud ACK Job/Pod downloads the shared
+inputs once per Campaign, admits the request, renders and
 executes each round search-only, performs create-once Mission/result readback
 per round, and selects the deterministic pre-holdout winner. A governed GP v4
-Campaign stops there; a negative result can feed the bounded external LLM
-controller, while the legacy formula lane alone retains sealed finalization.
+Campaign stops there; a negative result can feed the bounded native learning
+controller. The separate ACK settlement process reuses its verified result
+cache and publishes a lightweight native metrics/MLP report. No workstation bulk
+download is needed for settlement, reporting or child advancement. See the
+[cloud evidence flow](../../deployment/aliyun/research/README.md#data-flow-review-and-host-lifetime).
 Low-level Mission and LoopRun commands
 remain diagnostics and implementation surfaces; they are not alternate evidence
 paths around this contract.

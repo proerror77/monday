@@ -14,11 +14,12 @@ use crate::{
     },
     mission_runner::{
         decode_materialization, execute_report, fetch_to_file, finalize_existing_search_round,
-        normalized_sha256, publish_immutable_file, recover_execution_report_from_published_result,
-        research_event, valid_git_revision, validate_cex_holdout_id,
-        validate_supervised_candidate_binding, validate_supervised_replay_binding,
-        CexEventReplayReceiptV1, CexSupervisedModelSelectionV1, ExecutionBinding,
-        CEX_SUPERVISED_MODEL_NAMES, MAX_MATERIALIZATION_BYTES, MAX_RESULT_BUNDLE_BYTES,
+        normalized_sha256, publish_immutable_file, recover_execution_report_from_cached_result,
+        recover_execution_report_from_published_result, research_event, valid_git_revision,
+        validate_cex_holdout_id, validate_supervised_candidate_binding,
+        validate_supervised_replay_binding, CexEventReplayReceiptV1, CexSupervisedModelSelectionV1,
+        ExecutionBinding, CEX_SUPERVISED_MODEL_NAMES, MAX_MATERIALIZATION_BYTES,
+        MAX_RESULT_BUNDLE_BYTES,
     },
     prediction_dispatch::{
         canonical_tokyo_oss_internal_object, cex_campaign_round_root,
@@ -2844,6 +2845,7 @@ fn validate_existing_follow_up_plan(
 
 /// Reconstructs every round from independently read-back immutable artifacts.
 /// This validates evidence only: it does not train, replay, open holdout or promote.
+#[cfg(test)]
 pub(crate) fn readback_pre_holdout_terminal(
     client: &Client,
     request: &CampaignRequest,
@@ -2875,6 +2877,74 @@ pub(crate) fn readback_pre_holdout_terminal_into(
     u64,
     String,
 )> {
+    readback_pre_holdout_terminal_impl(
+        client,
+        request,
+        request_sha256,
+        evaluation_protocol_sha256,
+        root,
+        None,
+    )
+}
+
+pub(crate) fn readback_pre_holdout_terminal_cached(
+    client: &Client,
+    request: &CampaignRequest,
+    request_sha256: &str,
+    evaluation_protocol_sha256: &str,
+    cache: &Path,
+) -> anyhow::Result<(
+    alpha_domain::campaign_control::CampaignAttemptOutcomeV1,
+    u64,
+    String,
+)> {
+    validate_terminal_cache(cache)?;
+    let temporary = tempfile::tempdir()?;
+    readback_pre_holdout_terminal_impl(
+        client,
+        request,
+        request_sha256,
+        evaluation_protocol_sha256,
+        temporary.path(),
+        Some(cache),
+    )
+}
+
+fn validate_terminal_cache(cache: &Path) -> anyhow::Result<()> {
+    for path in [cache.to_path_buf(), cache.join("round-readback")] {
+        let metadata = std::fs::symlink_metadata(&path).context("inspect ACK terminal cache")?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            bail!("ACK terminal cache must use regular directories");
+        }
+    }
+    Ok(())
+}
+
+fn verify_cached_terminal_file(path: &Path, digest: &str, limit: u64) -> anyhow::Result<()> {
+    let metadata = std::fs::symlink_metadata(path).context("inspect cached terminal artifact")?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > limit {
+        bail!("cached terminal artifact is not a bounded regular file");
+    }
+    if crate::mission_runner::sha256_file(path)?
+        != normalized_sha256("cached terminal artifact", digest)?
+    {
+        bail!("cached terminal artifact differs from the authenticated Campaign result");
+    }
+    Ok(())
+}
+
+fn readback_pre_holdout_terminal_impl(
+    client: &Client,
+    request: &CampaignRequest,
+    request_sha256: &str,
+    evaluation_protocol_sha256: &str,
+    root: &Path,
+    cache: Option<&Path>,
+) -> anyhow::Result<(
+    alpha_domain::campaign_control::CampaignAttemptOutcomeV1,
+    u64,
+    String,
+)> {
     use alpha_domain::campaign_control::CampaignAttemptOutcomeV1;
     let result_path = root.join("campaign-result.json");
     let (_, result_sha256) = fetch_to_file(
@@ -2890,6 +2960,13 @@ pub(crate) fn readback_pre_holdout_terminal_into(
         sha256: request_sha256.into(),
     };
     validate_campaign_result_identity(&loaded, &result, &result_sha256)?;
+    if let Some(cache) = cache {
+        verify_cached_terminal_file(
+            &cache.join("campaign-result.json"),
+            &result_sha256,
+            MAX_CAMPAIGN_RESULT_BYTES,
+        )?;
+    }
     if result.finalization.is_some() || result.rounds.len() != request.rounds.len() {
         bail!("dispatch settlement requires complete pre-holdout rounds");
     }
@@ -2904,16 +2981,25 @@ pub(crate) fn readback_pre_holdout_terminal_into(
         }
         let dir = root.join(format!("round-{index}"));
         std::fs::create_dir_all(&dir)?;
-        let mission_path = dir.join("mission.json");
-        fetch_verified(
-            client,
-            "terminal Mission",
-            &round.mission_readback_url,
-            &mission_path,
-            &expected.mission_sha256,
-            MAX_REQUEST_BYTES,
-        )
-        .map_err(terminal_readback_error)?;
+        let mission_path = if let Some(cache) = cache {
+            let path = cache
+                .join("round-readback")
+                .join(format!("round-{index}-mission.json"));
+            verify_cached_terminal_file(&path, &expected.mission_sha256, MAX_REQUEST_BYTES)?;
+            path
+        } else {
+            let path = dir.join("mission.json");
+            fetch_verified(
+                client,
+                "terminal Mission",
+                &round.mission_readback_url,
+                &path,
+                &expected.mission_sha256,
+                MAX_REQUEST_BYTES,
+            )
+            .map_err(terminal_readback_error)?;
+            path
+        };
         let mission: alpha_domain::CexResearchMissionArtifactV1 =
             serde_json::from_slice(&std::fs::read(&mission_path)?)?;
         mission.validate()?;
@@ -2930,22 +3016,39 @@ pub(crate) fn readback_pre_holdout_terminal_into(
         {
             bail!("terminal Mission does not bind the reserved data, policy, trials and evaluation protocol");
         }
-        let bundle_path = dir.join("result.zip");
+        let bundle_path = cache.map_or_else(
+            || dir.join("result.zip"),
+            |cache| {
+                cache
+                    .join("round-readback")
+                    .join(format!("round-{index}-results.zip"))
+            },
+        );
         let binding = ExecutionBinding::Campaign {
             campaign_id: request.campaign_id.clone(),
             round_id: round.round_id.clone(),
             request_sha256: request_sha256.into(),
         };
-        let report = recover_execution_report_from_published_result(
-            client,
-            &round.result_readback_url,
-            &bundle_path,
-            &expected.mission_id,
-            &expected.mission_sha256,
-            &binding,
-        )
-        .map_err(terminal_readback_error)?
-        .context("terminal round bundle is absent")?;
+        let report = if cache.is_some() {
+            recover_execution_report_from_cached_result(
+                &bundle_path,
+                &expected.result_bundle_sha256,
+                &expected.mission_id,
+                &expected.mission_sha256,
+                &binding,
+            )?
+        } else {
+            recover_execution_report_from_published_result(
+                client,
+                &round.result_readback_url,
+                &bundle_path,
+                &expected.mission_id,
+                &expected.mission_sha256,
+                &binding,
+            )
+            .map_err(terminal_readback_error)?
+            .context("terminal round bundle is absent")?
+        };
         if report.bundle_sha256 != expected.result_bundle_sha256
             || report.bundle_sha256 != expected.result_readback_bundle_sha256
         {
@@ -3005,6 +3108,68 @@ pub(crate) fn readback_pre_holdout_terminal_into(
         CampaignAttemptOutcomeV1::NoCandidate
     };
     Ok((outcome, u64::try_from(consumed)?, result_sha256))
+}
+
+/// The hash comes from fresh authenticated terminal readback or the durable
+/// settlement, never an untrusted report. Build metadata without refitting or rerunning
+/// position accounting, including after a report-only publication interruption.
+pub(crate) fn report_settled_campaign_cache(
+    request: &CampaignRequest,
+    request_sha256: &str,
+    settled_result_sha256: &str,
+    cache: &Path,
+    output: &Path,
+) -> anyhow::Result<serde_json::Value> {
+    validate_terminal_cache(cache)?;
+    let result_path = cache.join("campaign-result.json");
+    verify_cached_terminal_file(
+        &result_path,
+        settled_result_sha256,
+        MAX_CAMPAIGN_RESULT_BYTES,
+    )?;
+    let result = load_campaign_result(&result_path)?;
+    let loaded = LoadedRequest {
+        request: request.clone(),
+        sha256: request_sha256.into(),
+    };
+    validate_campaign_result_identity(&loaded, &result, settled_result_sha256)?;
+    if result.rounds.len() != request.rounds.len() || result.finalization.is_some() {
+        bail!("Campaign report requires the complete settled pre-holdout rounds");
+    }
+    let mut rounds = Vec::with_capacity(result.rounds.len());
+    for (index, (planned, round)) in request.rounds.iter().zip(&result.rounds).enumerate() {
+        if planned.round_id != round.round_id
+            || planned.seed != round.seed
+            || planned.identity != round.identity
+        {
+            bail!("Campaign report round identity differs from the settled request");
+        }
+        let bundle = cache
+            .join("round-readback")
+            .join(format!("round-{index}-results.zip"));
+        verify_cached_terminal_file(
+            &bundle,
+            &round.result_bundle_sha256,
+            MAX_RESULT_BUNDLE_BYTES,
+        )?;
+        rounds.push(crate::mission_metrics::campaign::collect_verified_archive(
+            &bundle,
+            &round.round_id,
+            round.seed,
+            &round.mission_id,
+            &round.result_bundle_sha256,
+        )?);
+    }
+    crate::mission_metrics::campaign::CampaignEvidenceReport::new(
+        request.campaign_id.clone(),
+        request_sha256.into(),
+        settled_result_sha256.into(),
+        request.build_source_revision.clone(),
+        result.termination_reason,
+        result.consumed_trials,
+        rounds,
+    )?
+    .persist(output)
 }
 
 fn terminal_readback_error(error: anyhow::Error) -> anyhow::Error {
@@ -5977,6 +6142,8 @@ mod tests {
             "model metric feature bytes differ from the admitted Mission input SHA256",
         );
 
+        assert_cached_terminal_reporting(&fixture, &loaded, &protocol, &client, &hash);
+
         assert_final_worker_outcome(
             &fixture,
             loaded,
@@ -6141,6 +6308,177 @@ mod tests {
                     fold.predictions.len()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn terminal_cache_requires_bounded_regular_files() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        assert!(validate_terminal_cache(&cache).is_err());
+        std::fs::create_dir_all(cache.join("round-readback")).unwrap();
+        validate_terminal_cache(&cache).unwrap();
+        let artifact = cache.join("artifact");
+        std::fs::write(&artifact, b"bound evidence").unwrap();
+        let digest = crate::mission_runner::sha256_file(&artifact).unwrap();
+        verify_cached_terminal_file(&artifact, &digest, 14).unwrap();
+        assert!(verify_cached_terminal_file(&artifact, &digest, 13).is_err());
+        std::fs::write(&artifact, b"other evidence").unwrap();
+        assert!(verify_cached_terminal_file(&artifact, &digest, 14).is_err());
+        #[cfg(unix)]
+        {
+            let linked = cache.join("linked");
+            std::os::unix::fs::symlink(&artifact, &linked).unwrap();
+            let actual = crate::mission_runner::sha256_file(&artifact).unwrap();
+            assert!(verify_cached_terminal_file(&linked, &actual, 14).is_err());
+            let linked_cache = root.path().join("linked-cache");
+            std::os::unix::fs::symlink(&cache, &linked_cache).unwrap();
+            assert!(validate_terminal_cache(&linked_cache).is_err());
+        }
+    }
+
+    fn assert_cached_terminal_reporting(
+        fixture: &CampaignE2eFixture,
+        loaded: &LoadedRequest,
+        protocol: &str,
+        client: &Client,
+        result_sha256: &str,
+    ) {
+        let cache = fixture.work_dir.join("ack-cache");
+        std::fs::create_dir_all(cache.join("round-readback")).unwrap();
+        std::fs::copy(
+            &loaded.request.campaign_result_readback_url,
+            cache.join("campaign-result.json"),
+        )
+        .unwrap();
+        let mut originals = Vec::new();
+        for (index, round) in loaded.request.rounds.iter().enumerate() {
+            for (url, suffix) in [
+                (&round.mission_readback_url, "mission.json"),
+                (&round.result_readback_url, "results.zip"),
+            ] {
+                let destination = cache
+                    .join("round-readback")
+                    .join(format!("round-{index}-{suffix}"));
+                std::fs::copy(url, destination).unwrap();
+                let original = PathBuf::from(url);
+                let backup = original.with_extension(format!("cache-test-{index}-{suffix}"));
+                std::fs::rename(&original, &backup).unwrap();
+                originals.push((original, backup));
+            }
+        }
+        // The published large objects are unavailable. The bound ACK cache must
+        // be sufficient; accidental duplicate network/file fetches fail here.
+        let (_, _, observed) = readback_pre_holdout_terminal_cached(
+            client,
+            &loaded.request,
+            &loaded.sha256,
+            protocol,
+            &cache,
+        )
+        .unwrap();
+        assert_eq!(observed, result_sha256);
+        let output = cache.join("model-report.json");
+        let report = report_settled_campaign_cache(
+            &loaded.request,
+            &loaded.sha256,
+            result_sha256,
+            &cache,
+            &output,
+        )
+        .unwrap();
+        assert!(report["bytes"].as_u64().unwrap() < 4 * 1024 * 1024);
+        let summary: crate::mission_metrics::campaign::CampaignEvidenceReport =
+            serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        assert_eq!(summary.rounds.len(), 2);
+        assert_eq!(
+            summary
+                .rounds
+                .iter()
+                .map(|r| r.model_metrics.as_ref().unwrap().model_count())
+                .sum::<usize>(),
+            6
+        );
+        assert_eq!(
+            summary
+                .rounds
+                .iter()
+                .map(|r| r.mlp_folds.len())
+                .sum::<usize>(),
+            6
+        );
+        assert!(
+            !summary.training_performed
+                && !summary.metrics_recomputed
+                && !summary.raw_data_required_by_report_consumer
+        );
+        // A larger valid-shaped summary stays complete in ACK/OSS. Its receipt
+        // blocks an automatic workstation download instead of stranding settlement.
+        let mut aggregate = summary.clone();
+        while serde_json::to_vec_pretty(&aggregate).unwrap().len()
+            <= crate::mission_metrics::campaign::MAX_WORKSTATION_REPORT_BYTES
+        {
+            aggregate.rounds.extend(aggregate.rounds.clone());
+        }
+        for (index, round) in aggregate.rounds.iter_mut().enumerate() {
+            round.round_id = format!("report-size-fixture-{index}");
+            round.seed = index as u64;
+        }
+        let aggregate = crate::mission_metrics::campaign::CampaignEvidenceReport::new(
+            aggregate.campaign_id,
+            aggregate.request_sha256,
+            aggregate.campaign_result_sha256,
+            aggregate.execution_source_revision,
+            aggregate.termination_reason,
+            aggregate.consumed_trials,
+            aggregate.rounds,
+        )
+        .unwrap();
+        let large_output = cache.join("large-cloud-report.json");
+        let large_receipt = aggregate.persist(&large_output).unwrap();
+        assert_eq!(large_receipt["fits_workstation_byte_limit"], false);
+        assert!(large_receipt["bytes"].as_u64().unwrap() > 4 * 1024 * 1024);
+        let preserved: crate::mission_metrics::campaign::CampaignEvidenceReport =
+            serde_json::from_slice(&std::fs::read(&large_output).unwrap()).unwrap();
+        assert_eq!(preserved.rounds.len(), aggregate.rounds.len());
+        assert_eq!(aggregate.persist(&large_output).unwrap(), large_receipt);
+        let first_bytes = std::fs::read(&output).unwrap();
+        assert_eq!(
+            report_settled_campaign_cache(
+                &loaded.request,
+                &loaded.sha256,
+                result_sha256,
+                &cache,
+                &output
+            )
+            .unwrap(),
+            report
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), first_bytes);
+        assert!(report_settled_campaign_cache(
+            &loaded.request,
+            &loaded.sha256,
+            &"f".repeat(64),
+            &cache,
+            &output
+        )
+        .is_err());
+        let corrupt = cache.join("round-readback/round-0-results.zip");
+        let bytes = std::fs::read(&corrupt).unwrap();
+        std::fs::write(&corrupt, b"corrupt cache").unwrap();
+        assert!(readback_pre_holdout_terminal_cached(
+            client,
+            &loaded.request,
+            &loaded.sha256,
+            protocol,
+            &cache
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("SHA256"));
+        std::fs::write(&corrupt, bytes).unwrap();
+        for (original, backup) in originals {
+            std::fs::rename(backup, original).unwrap();
         }
     }
 

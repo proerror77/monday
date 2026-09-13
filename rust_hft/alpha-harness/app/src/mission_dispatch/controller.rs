@@ -11,6 +11,7 @@ use crate::{
 };
 use alpha_domain::campaign_control::SignedCampaignRootGrantV1;
 use anyhow::{bail, Context};
+use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -22,10 +23,47 @@ const MOUNT: &str = "/campaign-root";
 const AUTHORITY: &str = "/authority";
 const KUBECONFIG: &str = "/tmp/monday-campaign-kubeconfig.json";
 const MAX_AUTHORITY_BYTES: u64 = 700_000;
+const DEADLINE_ENV: &str = "MONDAY_CAMPAIGN_DEADLINE_AT";
+
+fn controller_timing(
+    task_deadline: DateTime<Utc>,
+    grant_expiry: DateTime<Utc>,
+    job_seconds: u64,
+    now: DateTime<Utc>,
+) -> anyhow::Result<(DateTime<Utc>, u64)> {
+    let deadline = task_deadline.min(grant_expiry);
+    let remaining = deadline.signed_duration_since(now).num_seconds();
+    if remaining <= 0 || job_seconds == 0 {
+        bail!("controller has no time remaining before its original task or grant deadline");
+    }
+    Ok((deadline, job_seconds.min(28_800).min(remaining as u64)))
+}
+
+fn check_saved_deadline(work_dir: &Path, deadline: DateTime<Utc>) -> anyhow::Result<()> {
+    let path = work_dir.join("controller-deadline.json");
+    if path.try_exists()? {
+        let saved: Value = serde_json::from_str(&read_authority(&path)?)?;
+        if saved
+            != json!({"schema_version":"campaign-controller-deadline-v1", "deadline_at":deadline})
+        {
+            bail!("controller must retain the original recorded task deadline");
+        }
+    }
+    Ok(())
+}
 
 pub(crate) fn render(args: CampaignControllerHandoffArgs) -> anyhow::Result<()> {
     let validated = validate_submission(load_submission(&args.submission)?)?;
     let manifest = render_value(&args, &validated)?;
+    let deadline_path = args.work_dir.join("controller-deadline.json");
+    if !deadline_path.try_exists()? {
+        write_new_private_json(
+            &deadline_path,
+            &json!({
+                "schema_version":"campaign-controller-deadline-v1", "deadline_at":args.deadline_at
+            }),
+        )?;
+    }
     let manifest_sha256 = write_new_private_json(&args.output, &manifest)?;
     print_json(&json!({
         "status":"rendered", "campaign_id":validated.submission.request.campaign_id,
@@ -77,6 +115,7 @@ pub(super) fn render_value(
         bail!("existing controller volume and work directories are required");
     }
     let work_dir = mount_path(&root, &args.work_dir)?;
+    check_saved_deadline(&args.work_dir, args.deadline_at)?;
     let state: Value = serde_json::from_str(&read_authority(
         &args.work_dir.join("controller-inputs.json"),
     )?)?;
@@ -127,6 +166,13 @@ pub(super) fn render_value(
     if signed.grant.execution != inspection.execution {
         bail!("controller handoff differs from the root execution binding");
     }
+    let (absolute_deadline, controller_deadline_seconds) = controller_timing(
+        args.deadline_at,
+        signed.grant.expires_at,
+        signed.grant.budget.max_job_seconds,
+        Utc::now(),
+    )?;
+    let deadline_env = json!({"name":DEADLINE_ENV,"value":absolute_deadline.to_rfc3339()});
     let trusted_keys = read_authority(&control.trusted_keys_path)?;
     let _: std::collections::BTreeMap<String, String> = serde_json::from_str(&trusted_keys)?;
     control.ledger_path = mount_path(&root, &control.ledger_path)?;
@@ -163,13 +209,14 @@ pub(super) fn render_value(
          "subjects":[{"kind":"ServiceAccount","name":args.service_account,"namespace":args.namespace}],
          "roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"Role","name":role}},
         {"apiVersion":"batch/v1","kind":"Job","metadata":metadata(&name),"spec":{
-            "backoffLimit":0,"activeDeadlineSeconds":28_800,"ttlSecondsAfterFinished":86_400,
+            "backoffLimit":0,"activeDeadlineSeconds":controller_deadline_seconds,"ttlSecondsAfterFinished":86_400,
             "template":{"metadata":{"labels":labels},"spec":{
                 "restartPolicy":"Never","serviceAccountName":args.service_account,"automountServiceAccountToken":true,
                 "imagePullSecrets":[{"name":"monday-acr"}],"nodeSelector":{"kubernetes.io/arch":"amd64","workload":"backtest"},
                 "securityContext":{"runAsNonRoot":true,"runAsUser":1000,"runAsGroup":1000,"fsGroup":1000,
                                    "fsGroupChangePolicy":"OnRootMismatch","seccompProfile":{"type":"RuntimeDefault"}},
                 "initContainers":[{"name":"prepare-controller","image":control.controller_image,
+                    "env":[deadline_env.clone()],
                     "command":["/usr/local/bin/alpha-harness","mission","dispatch","prepare-controller",
                                "--control","/authority/control.json","--context",args.context,"--namespace",args.namespace,
                                "--kubeconfig-out",KUBECONFIG],"volumeMounts":mounts,"securityContext":security,
@@ -177,7 +224,7 @@ pub(super) fn render_value(
                 "containers":[{"name":"campaign-cycle-controller","image":control.controller_image,"imagePullPolicy":"IfNotPresent",
                     "args":["ack-readback","--work-dir",work_dir,"--campaign-pod-name",args.campaign_pod,
                             "--alpha-harness","/usr/local/bin/alpha-harness","--aliyun","aliyun","--kubectl","kubectl"],
-                    "env":[{"name":"MONDAY_CAMPAIGN_CONTROL","value":"/authority/control.json"},{"name":"KUBECONFIG","value":KUBECONFIG}],
+                    "env":[{"name":"MONDAY_CAMPAIGN_CONTROL","value":"/authority/control.json"},{"name":"KUBECONFIG","value":KUBECONFIG},deadline_env],
                     "volumeMounts":mounts,"securityContext":security,
                     "resources":{"requests":{"cpu":"500m","memory":"1Gi"},"limits":{"cpu":"2","memory":"4Gi"}}}],
                 "volumes":[{"name":"campaign-root","persistentVolumeClaim":{"claimName":args.pvc}},
@@ -238,6 +285,14 @@ pub(crate) fn prepare(args: CampaignControllerPrepareArgs) -> anyhow::Result<()>
     if !control.ledger_path.starts_with(MOUNT) || args.kubeconfig_out != Path::new(KUBECONFIG) {
         bail!("controller preparation requires its declared volume and temporary kubeconfig");
     }
+    let deadline: DateTime<Utc> = std::env::var(DEADLINE_ENV)
+        .context("controller preparation requires its original deadline")?
+        .parse()?;
+    let signed: SignedCampaignRootGrantV1 =
+        serde_json::from_str(&read_authority(&control.signed_root_grant_path)?)?;
+    if deadline > signed.grant.expires_at || deadline <= Utc::now() {
+        bail!("controller preparation is outside its original task or grant deadline");
+    }
     #[cfg(unix)]
     restrict_integrity_key(&control.ledger_path, 1000)?;
     #[cfg(not(unix))]
@@ -252,4 +307,48 @@ pub(crate) fn prepare(args: CampaignControllerPrepareArgs) -> anyhow::Result<()>
         "current-context":args.context});
     write_new_private_json(&args.kubeconfig_out, &config)?;
     print_json(&json!({"status":"prepared","private_key_mode":"0600","token_materialized":false}))
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use chrono::TimeDelta;
+
+    #[test]
+    fn controller_deadline_uses_remaining_absolute_window() {
+        let now = Utc::now();
+        let task = now + TimeDelta::minutes(5);
+        let expiry = now + TimeDelta::hours(1);
+        assert_eq!(
+            controller_timing(task, expiry, 28_800, now).unwrap(),
+            (task, 300)
+        );
+        assert_eq!(
+            controller_timing(task, expiry, 28_800, now + TimeDelta::minutes(4)).unwrap(),
+            (task, 60)
+        );
+        assert_eq!(
+            controller_timing(expiry, task, 28_800, now).unwrap(),
+            (task, 300)
+        );
+        assert_eq!(controller_timing(task, expiry, 10, now).unwrap().1, 10);
+        assert!(controller_timing(task, expiry, 28_800, task).is_err());
+        assert!(controller_timing(expiry, now - TimeDelta::seconds(1), 28_800, now).is_err());
+        assert!(controller_timing(task, expiry, 0, now).is_err());
+    }
+
+    #[test]
+    fn controller_deadline_record_rejects_extension_on_resume() {
+        let root = tempfile::tempdir().unwrap();
+        let deadline = Utc::now() + TimeDelta::minutes(5);
+        write_new_private_json(
+            &root.path().join("controller-deadline.json"),
+            &json!({
+                "schema_version":"campaign-controller-deadline-v1", "deadline_at":deadline,
+            }),
+        )
+        .unwrap();
+        check_saved_deadline(root.path(), deadline).unwrap();
+        assert!(check_saved_deadline(root.path(), deadline + TimeDelta::seconds(1)).is_err());
+    }
 }
