@@ -3549,9 +3549,24 @@ fn model_validate(
                     hft_research_manifest::mlp_training::MlpTargetScaleV1::RawReturn,
                     |profile| profile.target_scale,
                 );
+                let expected_learning_rate = policy
+                    .mlp_training
+                    .as_ref()
+                    .map_or(1e-3, |profile| profile.learning_rate());
+                let expected_optimization = policy
+                    .mlp_training
+                    .as_ref()
+                    .and_then(|profile| profile.optimization_controls());
+                learning
+                    .validate_optimization(expected_optimization)
+                    .map_err(|_| {
+                        DomainError::InvalidCexBaseline(
+                            "MLP stability evidence differs from the bound recipe",
+                        )
+                    })?;
                 if *hidden_dim != 8
                     || *epochs != expected_updates
-                    || *learning_rate != 1e-3
+                    || *learning_rate != expected_learning_rate
                     || *min_rows != 8
                     || learning.target_transform.mode != expected_scale
                 {

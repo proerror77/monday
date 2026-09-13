@@ -879,14 +879,19 @@ fn fit_burn_fold(fit: CexBurnFoldFit<'_>) -> Result<CexBurnFoldOutput, String> {
     };
     let epochs = profile.map_or(CEX_BURN_EPOCHS, |profile| profile.updates);
     let target_scale = profile.map_or(MlpTargetScaleV1::RawReturn, |profile| profile.target_scale);
+    let learning_rate = profile.map_or(CEX_BURN_LEARNING_RATE, |profile| profile.learning_rate());
+    let optimization = profile
+        .and_then(|profile| profile.optimization_controls())
+        .cloned();
     let config = ContractTrainingConfig {
         input_dim: factor_ids.len(),
         hidden_dim: CEX_BURN_HIDDEN_DIM,
         epochs,
-        learning_rate: CEX_BURN_LEARNING_RATE,
+        learning_rate,
         min_rows: CEX_BURN_MIN_ROWS,
         seed,
         target_scale,
+        optimization,
     };
     let rows_artifact = serde_json::to_vec(&training_rows)
         .map_err(|error| format!("Burn MLP training rows failed to serialize: {error}"))?;
@@ -918,8 +923,29 @@ fn fit_burn_fold(fit: CexBurnFoldFit<'_>) -> Result<CexBurnFoldOutput, String> {
     let request_digest = Sha256Digest::of_bytes(&request_bytes);
     let sealed = SealedTrainingRequest::from_bytes(&request_bytes, &request_digest)
         .map_err(|error| format!("Burn MLP training request failed to seal: {error}"))?;
-    let trained = train_contract_model(&rows_artifact, &sealed)
-        .map_err(|error| format!("Burn MLP training failed: {error}"))?;
+    let request_semantic_sha256 = request
+        .semantic_sha256()
+        .map_err(|error| format!("Burn MLP semantic request failed: {error}"))?;
+    crate::research_event(
+        "alpha-engine-mlp",
+        "mlp_fold_fit_started",
+        json!({
+            "mission_id":mission_id,"fold_index":fold_index,"purpose":purpose,
+            "symbol":identity.symbol,"venue":identity.venue,"seed":seed,
+            "updates_requested":epochs,"learning_rate":learning_rate,"target_scale":target_scale,
+            "request_semantic_sha256":request_semantic_sha256.as_str(),
+        }),
+    );
+    let trained = train_contract_model(&rows_artifact, &sealed).map_err(|error| {
+        crate::research_event(
+            "alpha-engine-mlp", "mlp_fold_fit_failed",
+            json!({"mission_id":mission_id,"fold_index":fold_index,"purpose":purpose,
+                "symbol":identity.symbol,"venue":identity.venue,"seed":seed,
+                "updates_requested":epochs,"learning_rate":learning_rate,"target_scale":target_scale,
+                "cause":error.to_string()}),
+        );
+        format!("Burn MLP training failed: fold={fold_index}, seed={seed}, learning_rate={learning_rate}, purpose={purpose}: {error}")
+    })?;
     crate::research_event(
         "alpha-engine-mlp",
         "mlp_fold_fit_completed",
@@ -927,7 +953,12 @@ fn fit_burn_fold(fit: CexBurnFoldFit<'_>) -> Result<CexBurnFoldOutput, String> {
             "mission_id": mission_id, "fold_index": fold_index, "purpose": purpose,
             "symbol": identity.symbol, "venue": identity.venue, "seed": seed,
             "updates_requested": epochs, "updates_completed": trained.diagnostics().learning.updates_completed,
-            "target_scale": target_scale, "row_count": trained.diagnostics().row_count,
+            "target_scale": target_scale, "learning_rate":learning_rate,
+            "row_count": trained.diagnostics().row_count,
+            "convergence": trained.diagnostics().learning.stability.as_ref().map(|s| &s.convergence),
+            "clipped_updates": trained.diagnostics().learning.stability.as_ref().map(|s| s.clipped_updates),
+            "max_raw_gradient_l2": trained.diagnostics().learning.stability.as_ref().map(|s| s.raw_gradient_l2_history.iter().copied().fold(0.0_f64,f64::max)),
+            "max_applied_gradient_l2": trained.diagnostics().learning.stability.as_ref().map(|s| s.applied_gradient_l2_history.iter().copied().fold(0.0_f64,f64::max)),
             "training_elapsed_millis": trained.training_elapsed_millis(),
             "initial_parameters_sha256": trained.diagnostics().learning.initial_parameters_sha256,
             "semantic_model_sha256": trained.diagnostics().semantic_model_sha256,
@@ -1001,7 +1032,7 @@ fn fit_burn_fold(fit: CexBurnFoldFit<'_>) -> Result<CexBurnFoldOutput, String> {
             seed,
             hidden_dim: CEX_BURN_HIDDEN_DIM,
             epochs,
-            learning_rate: CEX_BURN_LEARNING_RATE,
+            learning_rate,
             min_rows: CEX_BURN_MIN_ROWS,
             learning: Box::new(diagnostics.learning.clone()),
         },
@@ -1625,15 +1656,27 @@ mod tests {
         let CexBaselineModelV1::BurnMlpPortableV2 { seed, learning, .. } = &left_model else {
             unreachable!()
         };
+        let mut shorter_guarded: Option<
+            hft_research_manifest::mlp_training::MlpLearningDiagnosticsV1,
+        > = None;
         for mode in [
             MlpTargetScaleV1::RawReturn,
             MlpTargetScaleV1::TrainStandardized,
         ] {
-            for updates in [8, 64] {
+            let budgets = if mode == MlpTargetScaleV1::TrainStandardized {
+                vec![8, 64, 4096, 8192]
+            } else {
+                vec![8, 64]
+            };
+            for updates in budgets {
                 let profile = CexMlpTrainingProfileV1 {
                     schema_version: "cex-mlp-training-profile-v1".into(),
                     updates,
                     target_scale: mode,
+                    optimization: (updates > 256).then(|| alpha_domain::mlp_training::CexMlpOptimizationV1 {
+                        learning_rate:0.0003,
+                        controls:hft_research_manifest::mlp_training::MlpOptimizationControlsV1::default(),
+                    }),
                     initialization: alpha_domain::mlp_training::CexMlpInitializationV1 {
                         fold_seeds: vec![*seed],
                         expected_factor_ids: factor_ids.to_vec(),
@@ -1672,6 +1715,41 @@ mod tests {
                 assert_eq!(*epochs, updates);
                 assert_eq!(observed.updates_completed, updates);
                 assert_eq!(observed.target_transform.mode, mode);
+                treatment
+                    .model
+                    .validate_inference(factor_ids.len())
+                    .unwrap();
+                observed
+                    .validate_optimization(profile.optimization_controls())
+                    .unwrap();
+                if updates == 4096 {
+                    shorter_guarded = Some((**observed).clone());
+                } else if updates == 8192 {
+                    let shorter = shorter_guarded.as_ref().unwrap();
+                    assert_eq!(&observed.loss_history[..4097], shorter.loss_history);
+                    assert_eq!(
+                        &observed.stability.as_ref().unwrap().raw_gradient_l2_history[..4096],
+                        shorter.stability.as_ref().unwrap().raw_gradient_l2_history
+                    );
+                    assert_eq!(
+                        &observed
+                            .stability
+                            .as_ref()
+                            .unwrap()
+                            .applied_gradient_l2_history[..4096],
+                        shorter
+                            .stability
+                            .as_ref()
+                            .unwrap()
+                            .applied_gradient_l2_history
+                    );
+                    // Full histories remain serializable without truncation; native
+                    // round readers admit the expanded, bounded MLP evidence.
+                    assert!(
+                        serde_json::to_vec_pretty(&treatment.model).unwrap().len()
+                            < 64 * 1024 * 1024
+                    );
+                }
                 let changed_validation = paired_fit(&mutated, &profile).unwrap();
                 assert_eq!(treatment.model, changed_validation.model);
                 assert_eq!(treatment.predictions, changed_validation.predictions);

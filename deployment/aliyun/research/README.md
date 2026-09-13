@@ -1460,3 +1460,30 @@ resume, and release only owned resources by UID. Check cloud terminal evidence
 and capacity release independently; desktop interruption must not create a new
 attempt or extend a lease. Job TTL cleans Jobs, not arbitrary PVCs, RAM policy,
 or node annotations; these resources still need the task's scoped cleanup.
+
+### Long MLP convergence studies
+
+Freeze the [guarded MLP recipe](../../../rust_hft/alpha-harness/README.md#bounded-mlp-training-diagnostics)
+before starting new resources. Six `(learning_rate, updates)` groups use
+`[0.0003,0.001,0.003] × [4096,8192]`, standardized training targets and seeds7/11.
+Their36primary folds plus72deterministic verification fits are108actual fits;
+optimizer steps are not separate search trials. Keep native trial previews,
+root/Study budgets, deadline and cleanup reserve unchanged unless a new bounded
+contract is established. Node/resource time starts once, after source/image
+readiness; no node waits for CI or a software build.
+
+Admit existing input bytes and freeze in ACK. Register the new Study and every
+member on one cloud ledger before reserving a worker. Do not reopen the old
+Study or run retired workstation helpers. Per-step guards reject unstable
+training; fixed budgets still run in full, and per-fold plateau status is read
+from native immutable diagnostics. Check the4097-point4096/8192prefix in ACK.
+No average may turn one failed/unconverged fold into an accepted group, and
+convergence never overrides economic or holdout gates.
+
+Watch actual durations: current artifact validation refits each primary fold
+twice inside the worker, while terminal settlement itself does not fit models.
+Long model histories also increase repeated frozen-model validation cost if
+replay becomes eligible. Verify actual Job/cgroup timing rather than assuming
+an iteration-count extrapolation proves resource sufficiency. Keep detailed
+curves, model archives, native ledger inspection and final state archives in
+ACK/OSS; return only bounded report receipts/details to the workstation.

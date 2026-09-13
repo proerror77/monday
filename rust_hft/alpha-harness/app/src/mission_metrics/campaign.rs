@@ -135,7 +135,7 @@ pub(crate) fn collect_verified_archive(
     if let Some(bytes) = optional_entry(
         &mut archive,
         "results/burn-mlp-baseline.json",
-        64 * 1024 * 1024,
+        crate::mission_runner::MAX_MLP_BASELINE_BYTES,
     )? {
         let baseline: CexBaselineArtifactV1 = serde_json::from_slice(&bytes)?;
         if baseline.mission_id != mission_id {

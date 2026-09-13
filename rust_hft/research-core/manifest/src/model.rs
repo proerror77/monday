@@ -777,6 +777,7 @@ mod tests {
                 },
                 loss_history: vec![0.0, 0.0],
                 max_gradient_abs: 0.0,
+                stability: None,
                 max_parameter_abs: 1.0,
                 training_prediction: crate::mlp_training::MlpPredictionDiagnosticsV1::new(
                     &[0.0; 8], &[0.0; 8], 0.0,

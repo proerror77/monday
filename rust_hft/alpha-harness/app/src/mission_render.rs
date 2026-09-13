@@ -1353,6 +1353,7 @@ pub(crate) mod tests {
             schema_version: "cex-mlp-training-plan-v1".into(),
             updates: 64,
             target_scale: MlpTargetScaleV1::TrainStandardized,
+            optimization: None,
             initializations: BTreeMap::from([(7, initialization)]),
         });
         let rendered = render_cex_bundle(
@@ -1390,6 +1391,48 @@ pub(crate) mod tests {
             rendered.mission.spec.mlp_training,
             Some(plan.mlp_training.as_ref().unwrap().resolve(7).unwrap())
         );
+        // Longer guarded recipes change only the bound baseline/Mission identity.
+        for rate in [0.0003, 0.001, 0.003] {
+            for updates in [4096, 8192] {
+                let mut long = plan.clone();
+                let training = long.mlp_training.as_mut().unwrap();
+                training.updates = updates;
+                training.optimization = Some(alpha_domain::mlp_training::CexMlpOptimizationV1 {
+                    learning_rate: rate,
+                    controls:
+                        hft_research_manifest::mlp_training::MlpOptimizationControlsV1::default(),
+                });
+                let guarded = render_cex_bundle(
+                    &fixture.feature_path,
+                    &fixture.materialization_path,
+                    &long,
+                    7,
+                    default_trials(),
+                )
+                .unwrap();
+                assert_ne!(guarded.mission_id, rendered.mission_id);
+                assert_eq!(guarded.mission.spec.search, rendered.mission.spec.search);
+                assert_eq!(
+                    guarded.mission.spec.search_lineage_id,
+                    rendered.mission.spec.search_lineage_id
+                );
+                assert_eq!(guarded.mission.spec.inputs, rendered.mission.spec.inputs);
+                assert_eq!(
+                    guarded
+                        .mission
+                        .spec
+                        .mlp_training
+                        .as_ref()
+                        .unwrap()
+                        .learning_rate(),
+                    rate
+                );
+                assert_eq!(
+                    long.max_candidates().unwrap(),
+                    plan.max_candidates().unwrap()
+                );
+            }
+        }
         let mut request = crate::mission_campaign::valid_request_for_tests();
         request.research_plan = plan.clone();
         crate::mission_campaign::validate_terminal_mission_revision_binding(

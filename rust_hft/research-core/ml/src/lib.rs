@@ -18,7 +18,10 @@ use burn::{
 use burn_ndarray::NdArrayDevice;
 use burn_store::{BurnpackStore, ModuleSnapshot};
 pub use hft_research_manifest::mlp_training::{
-    MlpLearningDiagnosticsV1, MlpPredictionDiagnosticsV1, MlpTargetScaleV1, MlpTargetTransformV1,
+    MlpConvergenceDiagnosticsV1, MlpConvergencePolicyV1, MlpConvergenceStatusV1,
+    MlpLearningDiagnosticsV1, MlpOptimizationControlsV1, MlpPredictionDiagnosticsV1,
+    MlpStabilityDiagnosticsV1, MlpTargetScaleV1, MlpTargetTransformV1, MAX_MLP_TRAINING_UPDATES,
+    MLP_GRADIENT_CLIP_RELATIVE_TOLERANCE,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -214,6 +217,8 @@ pub struct ContractTrainingConfig {
     pub min_rows: usize,
     pub seed: u64,
     pub target_scale: MlpTargetScaleV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optimization: Option<MlpOptimizationControlsV1>,
 }
 
 impl Default for ContractTrainingConfig {
@@ -226,6 +231,7 @@ impl Default for ContractTrainingConfig {
             min_rows: 32,
             seed: 7,
             target_scale: MlpTargetScaleV1::RawReturn,
+            optimization: None,
         }
     }
 }
@@ -601,7 +607,7 @@ pub enum ContractTrainingError {
     UnsupportedSchemaVersion { artifact: &'static str, found: u32 },
     #[error("input_dim and hidden_dim must be positive")]
     InvalidDimensions,
-    #[error("epochs and min_rows must be positive")]
+    #[error("epochs must be between 1 and 16384 and min_rows must be positive")]
     InvalidTrainingBudget,
     #[error("learning_rate must be finite and positive")]
     InvalidLearningRate,
@@ -793,6 +799,138 @@ fn gradient_abs_max(
             .get::<CpuBackend, 1>(output_bias.id)
             .ok_or_else(missing)?,
     )?))
+}
+
+fn accumulate_tensor_l2<const D: usize>(
+    tensor: Tensor<CpuBackend, D>,
+    norm: &mut f64,
+) -> Result<(), ContractTrainingError> {
+    for value in tensor
+        .into_data()
+        .into_vec::<f32>()
+        .map_err(|error| ContractTrainingError::Artifact(format!("{error:?}")))?
+    {
+        if !value.is_finite() {
+            return Err(ContractTrainingError::Artifact(
+                "MLP gradient is non-finite".into(),
+            ));
+        }
+        // f64 hypot avoids the overflow in f32 sum-of-squares norm implementations.
+        *norm = norm.hypot(f64::from(value));
+    }
+    Ok(())
+}
+
+fn global_gradient_l2(
+    gradients: &GradientsParams,
+    model: &ReturnRegressor<CpuAutodiffBackend>,
+) -> Result<f64, ContractTrainingError> {
+    let missing = || ContractTrainingError::Artifact("MLP parameter gradient missing".into());
+    if gradients.len() != 4 {
+        return Err(ContractTrainingError::Artifact(
+            "MLP must supply exactly four parameter gradients".into(),
+        ));
+    }
+    let mut norm = 0.0_f64;
+    accumulate_tensor_l2(
+        gradients
+            .get::<CpuBackend, 2>(model.hidden.weight.id)
+            .ok_or_else(missing)?,
+        &mut norm,
+    )?;
+    accumulate_tensor_l2(
+        gradients
+            .get::<CpuBackend, 1>(model.hidden.bias.as_ref().ok_or_else(missing)?.id)
+            .ok_or_else(missing)?,
+        &mut norm,
+    )?;
+    accumulate_tensor_l2(
+        gradients
+            .get::<CpuBackend, 2>(model.output.weight.id)
+            .ok_or_else(missing)?,
+        &mut norm,
+    )?;
+    accumulate_tensor_l2(
+        gradients
+            .get::<CpuBackend, 1>(model.output.bias.as_ref().ok_or_else(missing)?.id)
+            .ok_or_else(missing)?,
+        &mut norm,
+    )?;
+    Ok(norm)
+}
+
+fn controlled_gradients(
+    mut gradients: GradientsParams,
+    model: &ReturnRegressor<CpuAutodiffBackend>,
+    controls: &MlpOptimizationControlsV1,
+) -> Result<(GradientsParams, f64, f64), ContractTrainingError> {
+    let raw = global_gradient_l2(&gradients, model)?;
+    if raw > controls.max_raw_gradient_l2 {
+        return Err(ContractTrainingError::Artifact(format!(
+            "MLP raw global gradient L2 {raw} exceeded frozen ceiling {}; applied_gradient_l2=not_performed",
+            controls.max_raw_gradient_l2
+        )));
+    }
+    if raw > controls.global_gradient_clip_l2 {
+        let scale = (controls.global_gradient_clip_l2 / raw) as f32;
+        let missing = || ContractTrainingError::Artifact("MLP parameter gradient missing".into());
+        // One shared scalar covers all parameters, not a separate norm per tensor.
+        let hidden_weight = gradients
+            .remove::<CpuBackend, 2>(model.hidden.weight.id)
+            .ok_or_else(missing)?;
+        let hidden_bias_id = model.hidden.bias.as_ref().ok_or_else(missing)?.id;
+        let hidden_bias = gradients
+            .remove::<CpuBackend, 1>(hidden_bias_id)
+            .ok_or_else(missing)?;
+        let output_weight = gradients
+            .remove::<CpuBackend, 2>(model.output.weight.id)
+            .ok_or_else(missing)?;
+        let output_bias_id = model.output.bias.as_ref().ok_or_else(missing)?.id;
+        let output_bias = gradients
+            .remove::<CpuBackend, 1>(output_bias_id)
+            .ok_or_else(missing)?;
+        gradients.register(model.hidden.weight.id, hidden_weight * scale);
+        gradients.register(hidden_bias_id, hidden_bias * scale);
+        gradients.register(model.output.weight.id, output_weight * scale);
+        gradients.register(output_bias_id, output_bias * scale);
+    }
+    let applied = global_gradient_l2(&gradients, model)?;
+    let expected = raw.min(controls.global_gradient_clip_l2);
+    if (applied - expected).abs() > expected * MLP_GRADIENT_CLIP_RELATIVE_TOLERANCE {
+        return Err(ContractTrainingError::Artifact(format!(
+            "MLP applied global gradient L2 failed its clipping bound: raw={raw}, applied={applied}, expected={expected}"
+        )));
+    }
+    Ok((gradients, raw, applied))
+}
+
+fn training_progress_event(
+    request_sha256: &Sha256Digest,
+    requested: usize,
+    completed: usize,
+    training_loss: f64,
+    raw_gradient_l2: f64,
+    applied_gradient_l2: f64,
+) {
+    // Observability only: a closed log sink must not alter training or its identity.
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "{}",
+        serde_json::json!({
+            "schema_version": "monday.research_event.v1",
+            "component": "hft-research-ml",
+            "event": "mlp_training_progress",
+            "details": {
+                "request_semantic_sha256": request_sha256.as_str(),
+                "updates_requested": requested,
+                "updates_completed": completed,
+                "training_loss_after_update": training_loss,
+                "raw_gradient_l2": raw_gradient_l2,
+                "applied_gradient_l2": applied_gradient_l2,
+                "gradient_update": completed,
+            },
+        })
+    );
 }
 
 /// Fold the inverse transform into the output layer, so every persisted and
@@ -1153,6 +1291,7 @@ fn train_parsed_contract_model(
 ) -> Result<TrainedContractModel, ContractTrainingError> {
     let request = &sealed_request.request;
     let config = &request.config;
+    let request_semantic_sha256 = request.semantic_sha256()?;
     let dataset = &request.dataset;
     let training_cutoff_ms = request.split.training_cutoff_ms;
     validate_dataset_binding(dataset, config)?;
@@ -1171,6 +1310,8 @@ fn train_parsed_contract_model(
     let mut max_parameter_abs = parameter_abs_max(&model.clone().valid())?;
     let mut max_gradient_abs = 0.0_f64;
     let mut loss_history = Vec::new();
+    let mut raw_gradient_l2_history = Vec::new();
+    let mut applied_gradient_l2_history = Vec::new();
     let mut optimizer = AdamConfig::new().init();
     let features = rows
         .iter()
@@ -1188,7 +1329,7 @@ fn train_parsed_contract_model(
         .collect::<Result<Vec<_>, _>>()
         .map_err(ContractTrainingError::Artifact)?;
 
-    for _ in 0..config.epochs {
+    for update in 0..config.epochs {
         let feature_tensor = Tensor::<CpuAutodiffBackend, 2>::from_data(
             TensorData::new(features.clone(), [rows.len(), config.input_dim]),
             &device,
@@ -1208,15 +1349,64 @@ fn train_parsed_contract_model(
             .into_vec::<f32>()
             .map_err(|error| ContractTrainingError::Artifact(format!("{error:?}")))?[0];
         if !loss_value.is_finite() || loss_value < 0.0 {
-            return Err(ContractTrainingError::Artifact(
-                "MLP optimization loss is non-finite".into(),
-            ));
+            return Err(ContractTrainingError::Artifact(format!(
+                "MLP optimization loss is non-finite at completed update {update}: loss={loss_value}; latest_gradient_update={update}, latest_raw_gradient_l2={:?}, latest_applied_gradient_l2={:?}",
+                raw_gradient_l2_history.last(), applied_gradient_l2_history.last(),
+            )));
         }
         loss_history.push(f64::from(loss_value));
+        if let Some(controls) = &config.optimization {
+            controls
+                .validate_loss(loss_history[0], f64::from(loss_value))
+                .map_err(|cause| {
+                    ContractTrainingError::Artifact(format!(
+                        "{cause}; completed_updates={update}, initial_loss={}, loss={loss_value}; latest_gradient_update={update}, latest_raw_gradient_l2={:?}, latest_applied_gradient_l2={:?}",
+                        loss_history[0], raw_gradient_l2_history.last(), applied_gradient_l2_history.last(),
+                    ))
+                })?;
+            // At the next forward pass the loss is the verified post-update
+            // loss for exactly `update` completed Adam steps.
+            if update > 0 && update % 256 == 0 {
+                training_progress_event(
+                    &request_semantic_sha256,
+                    config.epochs,
+                    update,
+                    f64::from(loss_value),
+                    raw_gradient_l2_history[update - 1],
+                    applied_gradient_l2_history[update - 1],
+                );
+            }
+        }
         let gradients = GradientsParams::from_grads(loss.backward(), &model);
-        max_gradient_abs = max_gradient_abs.max(gradient_abs_max(&gradients, &model)?);
+        max_gradient_abs =
+            max_gradient_abs.max(gradient_abs_max(&gradients, &model).map_err(|cause| {
+                ContractTrainingError::Artifact(format!(
+                    "{cause}; pending_update={}, loss={loss_value}",
+                    update + 1
+                ))
+            })?);
+        let gradients = if let Some(controls) = &config.optimization {
+            let (gradients, raw, applied) = controlled_gradients(gradients, &model, controls)
+                .map_err(|cause| {
+                    ContractTrainingError::Artifact(format!(
+                        "{cause}; pending_update={}, loss={loss_value}",
+                        update + 1
+                    ))
+                })?;
+            raw_gradient_l2_history.push(raw);
+            applied_gradient_l2_history.push(applied);
+            gradients
+        } else {
+            gradients
+        };
         model = optimizer.step(config.learning_rate, model, gradients);
-        max_parameter_abs = max_parameter_abs.max(parameter_abs_max(&model.clone().valid())?);
+        max_parameter_abs =
+            max_parameter_abs.max(parameter_abs_max(&model.clone().valid()).map_err(|cause| {
+                ContractTrainingError::Artifact(format!(
+                    "{cause}; completed_updates={}, pre_update_loss={loss_value}; latest_gradient_update={}, latest_raw_gradient_l2={:?}, latest_applied_gradient_l2={:?}",
+                    update + 1, update + 1, raw_gradient_l2_history.last(), applied_gradient_l2_history.last(),
+                ))
+            })?);
     }
 
     let normalized_model = model.valid();
@@ -1228,14 +1418,55 @@ fn train_parsed_contract_model(
         .into_data()
         .into_vec::<f32>()
         .map_err(|error| ContractTrainingError::Artifact(format!("{error:?}")))?;
-    loss_history.push(
+    let final_loss = if config.optimization.is_some() {
+        // Match the training kernel exactly so a longer fixed budget retains
+        // the shorter run's complete loss prefix, including its final update.
+        let loss = MseLoss::new().forward(
+            Tensor::<CpuBackend, 2>::from_data(
+                TensorData::new(normalized_predictions.clone(), [rows.len(), 1]),
+                &device,
+            ),
+            Tensor::<CpuBackend, 2>::from_data(
+                TensorData::new(targets.clone(), [rows.len(), 1]),
+                &device,
+            ),
+            Reduction::Mean,
+        );
+        f64::from(
+            loss.into_data()
+                .into_vec::<f32>()
+                .map_err(|error| ContractTrainingError::Artifact(format!("{error:?}")))?[0],
+        )
+    } else {
         normalized_predictions
             .iter()
             .zip(&targets)
             .map(|(prediction, target)| (f64::from(*prediction) - f64::from(*target)).powi(2))
             .sum::<f64>()
-            / rows.len() as f64,
-    );
+            / rows.len() as f64
+    };
+    loss_history.push(final_loss);
+    if let Some(controls) = &config.optimization {
+        controls
+            .validate_loss(loss_history[0], *loss_history.last().unwrap())
+            .map_err(|cause| {
+                ContractTrainingError::Artifact(format!(
+                    "{cause}; completed_updates={}, initial_loss={}, loss={}; latest_gradient_update={}, latest_raw_gradient_l2={:?}, latest_applied_gradient_l2={:?}",
+                    config.epochs,
+                    loss_history[0],
+                    loss_history.last().unwrap(), config.epochs,
+                    raw_gradient_l2_history.last(), applied_gradient_l2_history.last(),
+                ))
+            })?;
+        training_progress_event(
+            &request_semantic_sha256,
+            config.epochs,
+            config.epochs,
+            final_loss,
+            raw_gradient_l2_history[config.epochs - 1],
+            applied_gradient_l2_history[config.epochs - 1],
+        );
+    }
     let model = fold_target_inverse(normalized_model, &target_transform)?;
     max_parameter_abs = max_parameter_abs.max(parameter_abs_max(&model)?);
     let predictions = if config.target_scale == MlpTargetScaleV1::RawReturn {
@@ -1265,7 +1496,26 @@ fn train_parsed_contract_model(
         / rows.len() as f64;
 
     let semantic_model_sha256 = semantic_model_sha256(&model)?;
-    let request_semantic_sha256 = request.semantic_sha256()?;
+    let stability = config
+        .optimization
+        .as_ref()
+        .map(|controls| {
+            Ok::<_, ContractTrainingError>(MlpStabilityDiagnosticsV1 {
+                controls: controls.clone(),
+                clipped_updates: raw_gradient_l2_history
+                    .iter()
+                    .filter(|v| **v > controls.global_gradient_clip_l2)
+                    .count(),
+                raw_gradient_l2_history,
+                applied_gradient_l2_history,
+                convergence: MlpConvergenceDiagnosticsV1::from_loss_history(
+                    &controls.convergence,
+                    &loss_history,
+                )
+                .map_err(ContractTrainingError::Artifact)?,
+            })
+        })
+        .transpose()?;
     let learning = MlpLearningDiagnosticsV1 {
         schema_version: "mlp-learning-diagnostics-v1".into(),
         updates_requested: config.epochs,
@@ -1277,9 +1527,10 @@ fn train_parsed_contract_model(
         max_parameter_abs,
         training_prediction,
         exit_reason: "fixed_update_budget_completed".into(),
+        stability,
     };
     learning
-        .validate()
+        .validate_optimization(config.optimization.as_ref())
         .map_err(ContractTrainingError::Artifact)?;
     Ok(TrainedContractModel {
         model,
@@ -1338,7 +1589,7 @@ fn validate_bundle_manifest(
     let diagnostics = &manifest.diagnostics;
     diagnostics
         .learning
-        .validate()
+        .validate_optimization(manifest.request.config.optimization.as_ref())
         .map_err(ContractTrainingError::InternalConsistency)?;
     if diagnostics.schema_version != 2
         || diagnostics.backend != TrainingBackend::BurnNdarrayAutodiff
@@ -1401,11 +1652,16 @@ fn validate_config(config: &ContractTrainingConfig) -> Result<(), ContractTraini
     if config.input_dim == 0 || config.hidden_dim == 0 {
         return Err(ContractTrainingError::InvalidDimensions);
     }
-    if config.epochs == 0 || config.min_rows == 0 {
+    if config.epochs == 0 || config.epochs > MAX_MLP_TRAINING_UPDATES || config.min_rows == 0 {
         return Err(ContractTrainingError::InvalidTrainingBudget);
     }
     if !config.learning_rate.is_finite() || config.learning_rate <= 0.0 {
         return Err(ContractTrainingError::InvalidLearningRate);
+    }
+    if let Some(controls) = &config.optimization {
+        controls
+            .validate_for_updates(config.epochs)
+            .map_err(ContractTrainingError::Artifact)?;
     }
     Ok(())
 }
@@ -1477,4 +1733,76 @@ fn validate_dataset_binding(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod gradient_control_tests {
+    use super::*;
+
+    fn gradients(model: &ReturnRegressor<CpuAutodiffBackend>, values: [f32; 4]) -> GradientsParams {
+        let device = NdArrayDevice::Cpu;
+        let mut gradients = GradientsParams::new();
+        gradients.register(
+            model.hidden.weight.id,
+            Tensor::<CpuBackend, 2>::from_data(TensorData::new(vec![values[0]], [1, 1]), &device),
+        );
+        gradients.register(
+            model.hidden.bias.as_ref().unwrap().id,
+            Tensor::<CpuBackend, 1>::from_data(TensorData::new(vec![values[1]], [1]), &device),
+        );
+        gradients.register(
+            model.output.weight.id,
+            Tensor::<CpuBackend, 2>::from_data(TensorData::new(vec![values[2]], [1, 1]), &device),
+        );
+        gradients.register(
+            model.output.bias.as_ref().unwrap().id,
+            Tensor::<CpuBackend, 1>::from_data(TensorData::new(vec![values[3]], [1]), &device),
+        );
+        gradients
+    }
+
+    #[test]
+    fn clipping_uses_one_global_norm_and_rejects_huge_or_nonfinite_gradients() {
+        let _lock = lock_ndarray_backend().unwrap();
+        let model =
+            ReturnRegressorConfig::new(1, 1).init_model::<CpuAutodiffBackend>(&NdArrayDevice::Cpu);
+        let controls = MlpOptimizationControlsV1::default();
+        let (clipped, raw, applied) =
+            controlled_gradients(gradients(&model, [3.0, 4.0, 0.0, 0.0]), &model, &controls)
+                .unwrap();
+        assert_eq!(raw, 5.0);
+        assert!((applied - 1.0).abs() <= MLP_GRADIENT_CLIP_RELATIVE_TOLERANCE);
+        let hidden = clipped
+            .get::<CpuBackend, 2>(model.hidden.weight.id)
+            .unwrap()
+            .into_data()
+            .into_vec::<f32>()
+            .unwrap();
+        let bias = clipped
+            .get::<CpuBackend, 1>(model.hidden.bias.as_ref().unwrap().id)
+            .unwrap()
+            .into_data()
+            .into_vec::<f32>()
+            .unwrap();
+        assert!((hidden[0] - 0.6).abs() < 1e-6 && (bias[0] - 0.8).abs() < 1e-6);
+        let huge = gradients(&model, [f32::MAX; 4]);
+        assert!(global_gradient_l2(&huge, &model).unwrap().is_finite());
+        assert!(controlled_gradients(huge, &model, &controls)
+            .unwrap_err()
+            .to_string()
+            .contains("frozen ceiling"));
+        for invalid in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            assert!(controlled_gradients(
+                gradients(&model, [invalid, 0.0, 0.0, 0.0]),
+                &model,
+                &controls
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("non-finite"));
+        }
+        let (_, raw, applied) =
+            controlled_gradients(gradients(&model, [0.0; 4]), &model, &controls).unwrap();
+        assert_eq!((raw, applied), (0.0, 0.0));
+    }
 }
