@@ -528,8 +528,12 @@ bundles, or an active ledger to advance a generation. `start` freezes, signs,
 finalizes and dispatches one authorized generation; `approve` does the same for
 one authorized child. Both print a controller Job reference without applying it.
 For a runnable, authority-bound handoff use `mission dispatch controller-handoff`
-on the existing cloud volume. Its deadline is capped by the signed root Job
-budget and eight hours. The example template requires an explicit deadline;
+on the existing cloud volume. Supply the original absolute `--deadline-at`,
+which is recorded create-once in `controller-deadline.json` and cannot be
+extended on resume. Its relative deadline is capped by the remaining task/grant
+window, signed root Job budget and eight hours. Init rejects expired windows;
+the ACK entrypoint enforces the same absolute deadline with GNU timeout even
+when the manifest is applied late. The example template requires both deadlines;
 it is not a substitute for native authority validation.
 
 The ACR publication workflow publishes `campaign-cycle-controller` alongside
@@ -934,6 +938,7 @@ alpha-harness mission dispatch controller-handoff \
   --trusted-keys-configmap approved-campaign-public-keys \
   --campaign-pod EXACT_WORKER_POD \
   --context monday-research-apne1 --namespace monday-research \
+  --deadline-at REPLACE_ORIGINAL_TASK_DEADLINE_RFC3339 \
   --output /private/controller-handoff.json
 ```
 
@@ -1085,10 +1090,17 @@ fails after the local commit, retry reuses those exact committed bytes without
 requiring a TTL-deleted Job to appear again. A child cannot be released until its
 parent terminal receipt and its own reservation have been independently read back.
 
-Settlement also writes `cex-campaign-evidence-report-v1`: at most 4 MiB of
-native model metrics and MLP fold learning/prediction diagnostics, with request,
+Before committing settlement, the native reader constructs
+`cex-campaign-evidence-report-v1` from bounded per-round inputs: full native
+model metrics and MLP fold learning/prediction diagnostics, with request,
 Campaign-result, execution-source, reader-source and per-round bundle identities.
-It copies verified native summaries without model fitting, position-accounting
+The aggregate remains in ACK/OSS and can grow with the authorized round count;
+it is not capped at a single input's 4 MiB ceiling. Its small receipt includes
+`bytes`, `workstation_byte_limit` (4 MiB) and `fits_workstation_byte_limit`.
+Workstation consumers retrieve that receipt first and leave oversized details
+in the cloud; never download an oversized report automatically or substitute a
+result ZIP. Report I/O failure occurs before the ledger commit. It copies
+verified native summaries without model fitting, position-accounting
 replay, raw input reads or console-log parsing. Older artifacts without these
 summaries have explicit absent metrics/empty diagnostics. The report does not
 create a new research result or grant.
@@ -1437,7 +1449,8 @@ records removed transfers and intentional independent checks. A retained ACK
 cache is keyed to the immutable Campaign result, not to a successful local
 process. Do not add Python wrappers that fetch bulk artifacts to a workstation
 for metrics, ledger verification or subsequent dispatch. Workstation charts may
-format the bounded report only. Signed root keys may remain in the established
+format details only when the report receipt fits the workstation byte ceiling;
+otherwise show the small receipt and keep full analysis in ACK. Signed root keys may remain in the established
 signing boundary; an active ledger remains on its single-writer cloud volume.
 
 Controller Jobs must have finite deadlines/TTL within the task resource window.

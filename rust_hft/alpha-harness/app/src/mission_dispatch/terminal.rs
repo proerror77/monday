@@ -44,7 +44,7 @@ pub(super) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
         &args.namespace,
     )?;
     let record = admission.record()?;
-    if record.settlement.is_none() {
+    let model_report = if record.settlement.is_none() {
         let bound_uid = record
             .claim
             .job_uid
@@ -80,8 +80,33 @@ pub(super) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
                 consumed_trials: Some(consumed_trials),
             },
         };
-        admission.settle(&evidence)?;
-    }
+        // Complete report construction before the durable settlement. A report
+        // I/O failure must never create a settled-but-unreportable operation.
+        report_before_settlement(&mut admission, &evidence, || {
+            report_settled_campaign_cache(
+                &validated.submission.request,
+                &validated.request_sha256,
+                &evidence.settlement.evidence_sha256,
+                cache,
+                &report_output,
+            )
+        })?
+    } else {
+        if record.terminal_pod_uid.is_none() {
+            bail!("existing settlement lacks independent dispatch terminal provenance");
+        }
+        report_settled_campaign_cache(
+            &validated.submission.request,
+            &validated.request_sha256,
+            &record
+                .settlement
+                .as_ref()
+                .context("existing settlement")?
+                .evidence_sha256,
+            cache,
+            &report_output,
+        )?
+    };
     let record = admission.record()?;
     if record.terminal_pod_uid.is_none() {
         bail!("existing settlement lacks independent dispatch terminal provenance");
@@ -89,13 +114,6 @@ pub(super) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
     let settlement = record
         .settlement
         .context("dispatch settlement was not persisted")?;
-    let model_report = report_settled_campaign_cache(
-        &validated.submission.request,
-        &validated.request_sha256,
-        &settlement.evidence_sha256,
-        cache,
-        &report_output,
-    )?;
     // If publication previously lost its response, reuse the durable event's
     // exact bytes. Do not require a TTL-deleted Job to be present a second time.
     admission.publish_receipts()?;
@@ -115,6 +133,16 @@ pub(super) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
         report.clone(),
     );
     print_json(&report)
+}
+
+pub(super) fn report_before_settlement(
+    admission: &mut Admission,
+    evidence: &CampaignDispatchSettlementV1,
+    report: impl FnOnce() -> anyhow::Result<Value>,
+) -> anyhow::Result<Value> {
+    let report = report()?;
+    admission.settle(evidence)?;
+    Ok(report)
 }
 
 pub(super) struct TerminalJobReadback {

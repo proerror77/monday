@@ -2254,6 +2254,7 @@ mod tests {
             campaign_pod: "worker-pod".into(),
             context: "monday-research-apne1".into(),
             namespace: "monday-research".into(),
+            deadline_at: chrono::Utc::now() + chrono::TimeDelta::hours(12),
             output: root.join("handoff.json"),
         };
         std::fs::write(
@@ -2292,12 +2293,21 @@ mod tests {
         let signed_root: Value =
             serde_json::from_str(secret["stringData"]["root-grant.json"].as_str().unwrap())
                 .unwrap();
+        assert!(job["spec"]["activeDeadlineSeconds"].as_u64().unwrap() > 0);
+        assert!(
+            job["spec"]["activeDeadlineSeconds"].as_u64().unwrap()
+                <= signed_root["grant"]["budget"]["max_job_seconds"]
+                    .as_u64()
+                    .unwrap()
+                    .min(28_800)
+        );
+        let saved: Value = serde_json::from_slice(
+            &std::fs::read(args.work_dir.join("controller-deadline.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
-            job["spec"]["activeDeadlineSeconds"],
-            signed_root["grant"]["budget"]["max_job_seconds"]
-                .as_u64()
-                .unwrap()
-                .min(28_800)
+            saved["deadline_at"],
+            serde_json::to_value(args.deadline_at).unwrap()
         );
         assert!(
             secret["stringData"].get("root-public-keys.json").is_none(),
@@ -2729,7 +2739,7 @@ mod tests {
             "monday-research",
         )
         .unwrap();
-        gate.settle(&CampaignDispatchSettlementV1 {
+        let evidence = CampaignDispatchSettlementV1 {
             job_uid: "job-uid-1".into(),
             pod_uid: "pod-uid-1".into(),
             settlement: CampaignAttemptSettlementV1 {
@@ -2739,8 +2749,16 @@ mod tests {
                 outcome: CampaignAttemptOutcomeV1::NoCandidate,
                 consumed_trials: Some(20),
             },
-        })
-        .unwrap();
+        };
+        assert!(
+            terminal::report_before_settlement(&mut gate, &evidence, || {
+                anyhow::bail!("report disk full")
+            })
+            .is_err()
+        );
+        assert!(gate.record().unwrap().settlement.is_none());
+        terminal::report_before_settlement(&mut gate, &evidence, || Ok(json!({"report":"ready"})))
+            .unwrap();
         assert!(gate
             .publish_receipts_with(|_, _| anyhow::bail!("lost PUT response"))
             .is_err());

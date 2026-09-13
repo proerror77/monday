@@ -211,6 +211,9 @@ pub struct CampaignControllerHandoffArgs {
     pub context: String,
     #[arg(long)]
     pub namespace: String,
+    /// Original absolute task deadline; re-rendering cannot extend this value.
+    #[arg(long)]
+    pub deadline_at: chrono::DateTime<chrono::Utc>,
     /// A new private JSON file; signed access URLs are never printed to stdout.
     #[arg(long)]
     pub output: PathBuf,

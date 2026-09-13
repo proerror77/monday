@@ -1,4 +1,4 @@
-//! Lightweight evidence produced from the already verified ACK round artifacts.
+//! Cloud evidence and lightweight receipts from already verified ACK artifacts.
 //! No model fitting, ledger reconstruction, raw-data download or log parsing lives here.
 
 use super::{existing_output_matches, persist_immutable_bytes, MAX_METRICS_BYTES, METRICS_JSON};
@@ -15,7 +15,7 @@ use std::{fs::File, io::Read, path::Path};
 use zip::ZipArchive;
 
 const SCHEMA: &str = "cex-campaign-evidence-report-v1";
-const MAX_REPORT_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_WORKSTATION_REPORT_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -91,9 +91,9 @@ impl CampaignEvidenceReport {
 
     pub(crate) fn persist(&self, output: &Path) -> anyhow::Result<serde_json::Value> {
         let bytes = serde_json::to_vec_pretty(self)?;
-        if bytes.len() > MAX_REPORT_BYTES {
-            bail!("Campaign evidence report exceeds its lightweight byte bound");
-        }
+        // This aggregate stays in ACK/OSS and may legitimately exceed one
+        // round's input bound. Only its small receipt is returned by default;
+        // consumers must enforce the separate workstation transfer ceiling.
         if !existing_output_matches(output, &bytes)? {
             persist_immutable_bytes(output, &bytes)?;
         }
@@ -102,6 +102,8 @@ impl CampaignEvidenceReport {
             "sha256": format!("{:x}", Sha256::digest(&bytes)), "bytes": bytes.len(),
             "campaign_result_sha256": self.campaign_result_sha256,
             "training_performed": false, "metrics_recomputed": false,
+            "workstation_byte_limit": MAX_WORKSTATION_REPORT_BYTES,
+            "fits_workstation_byte_limit": bytes.len() <= MAX_WORKSTATION_REPORT_BYTES,
         }))
     }
 }

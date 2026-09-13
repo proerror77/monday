@@ -227,7 +227,7 @@ case "$1 $2" in
       jq -n --arg result "$result_sha256" '{schema_version:"cex-campaign-evidence-report-v1",campaign_result_sha256:$result,training_performed:false,metrics_recomputed:false}' >"$report"
       jq -n --arg request "$(jq -r '.request_sha256' "$submission")" --arg result "$result_sha256" \
         --arg report "$report" --arg sha "$(sha_file "$report")" --argjson bytes "$(wc -c <"$report" | tr -d ' ')" \
-        '{status:"settled",request_sha256:$request,campaign_result_sha256:$result,model_report:{path:$report,sha256:$sha,bytes:$bytes,campaign_result_sha256:$result,training_performed:false,metrics_recomputed:false}}'
+        '{status:"settled",request_sha256:$request,campaign_result_sha256:$result,model_report:{path:$report,sha256:$sha,bytes:$bytes,campaign_result_sha256:$result,training_performed:false,metrics_recomputed:false,workstation_byte_limit:4194304,fits_workstation_byte_limit:($bytes <= 4194304)}}'
       exit 0
     fi
     [[ "$3" == submit ]]
@@ -524,6 +524,34 @@ approve_args=(
   --signer "$bin/signer"
   --work-dir "$root/campaign-root/cycle"
 )
+
+# Check the in-Pod deadline wrapper without sleeping or relying on the test host's date implementation.
+export FAKE_REAL_DATE
+FAKE_REAL_DATE="$(command -v date)"
+cat >"$bin/date" <<'EOF'
+#!/usr/bin/env bash
+if [[ -n "${FAKE_DEADLINE_EPOCH:-}" ]]; then
+  if [[ " $* " == *" -d "* ]]; then printf '%s\n' "$FAKE_DEADLINE_EPOCH"; else printf '1000\n'; fi
+else
+  exec "$FAKE_REAL_DATE" "$@"
+fi
+EOF
+cat >"$bin/timeout" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >"$FAKE_STATE/deadline-timeout-args"
+exit 77
+EOF
+chmod +x "$bin/date" "$bin/timeout"
+if MONDAY_CAMPAIGN_DEADLINE_AT=original-deadline FAKE_DEADLINE_EPOCH=1000 "$controller" ack-readback --work-dir "$submit_work_dir" >"$root/expired.out" 2>"$root/expired.err"; then
+  echo "expired controller unexpectedly started" >&2; exit 1
+fi
+grep -Fq 'original absolute deadline has expired' "$root/expired.err"
+test ! -e "$FAKE_STATE/deadline-timeout-args"
+if MONDAY_CAMPAIGN_DEADLINE_AT=original-deadline FAKE_DEADLINE_EPOCH=1060 "$controller" ack-readback --work-dir "$submit_work_dir" >"$root/deadline.out" 2>"$root/deadline.err"; then
+  echo "deadline wrapper unexpectedly completed" >&2; exit 1
+fi
+grep -Fq -- "--signal=KILL 59s $controller ack-readback --work-dir $submit_work_dir" "$FAKE_STATE/deadline-timeout-args"
+test ! -e "$submit_work_dir/controller-inputs.json"
 
 # All data-bearing modes fail before reading state, invoking a signer or writing.
 for host in Darwin Windows_NT; do

@@ -3110,8 +3110,8 @@ fn readback_pre_holdout_terminal_impl(
     Ok((outcome, u64::try_from(consumed)?, result_sha256))
 }
 
-/// The hash comes from the authenticated durable settlement, not from a caller's
-/// untrusted report. Rebuild presentation metadata without refitting or rerunning
+/// The hash comes from fresh authenticated terminal readback or the durable
+/// settlement, never an untrusted report. Build metadata without refitting or rerunning
 /// position accounting, including after a report-only publication interruption.
 pub(crate) fn report_settled_campaign_cache(
     request: &CampaignRequest,
@@ -6412,6 +6412,36 @@ mod tests {
                 && !summary.metrics_recomputed
                 && !summary.raw_data_required_by_report_consumer
         );
+        // A larger valid-shaped summary stays complete in ACK/OSS. Its receipt
+        // blocks an automatic workstation download instead of stranding settlement.
+        let mut aggregate = summary.clone();
+        while serde_json::to_vec_pretty(&aggregate).unwrap().len()
+            <= crate::mission_metrics::campaign::MAX_WORKSTATION_REPORT_BYTES
+        {
+            aggregate.rounds.extend(aggregate.rounds.clone());
+        }
+        for (index, round) in aggregate.rounds.iter_mut().enumerate() {
+            round.round_id = format!("report-size-fixture-{index}");
+            round.seed = index as u64;
+        }
+        let aggregate = crate::mission_metrics::campaign::CampaignEvidenceReport::new(
+            aggregate.campaign_id,
+            aggregate.request_sha256,
+            aggregate.campaign_result_sha256,
+            aggregate.execution_source_revision,
+            aggregate.termination_reason,
+            aggregate.consumed_trials,
+            aggregate.rounds,
+        )
+        .unwrap();
+        let large_output = cache.join("large-cloud-report.json");
+        let large_receipt = aggregate.persist(&large_output).unwrap();
+        assert_eq!(large_receipt["fits_workstation_byte_limit"], false);
+        assert!(large_receipt["bytes"].as_u64().unwrap() > 4 * 1024 * 1024);
+        let preserved: crate::mission_metrics::campaign::CampaignEvidenceReport =
+            serde_json::from_slice(&std::fs::read(&large_output).unwrap()).unwrap();
+        assert_eq!(preserved.rounds.len(), aggregate.rounds.len());
+        assert_eq!(aggregate.persist(&large_output).unwrap(), large_receipt);
         let first_bytes = std::fs::read(&output).unwrap();
         assert_eq!(
             report_settled_campaign_cache(

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+original_args=("$@")
 
 controller_stage="preflight"
 current_generation="unknown"
@@ -658,6 +659,19 @@ done
 
 [[ "$(uname -s)" == "Linux" ]] \
   || die "Campaign $mode requires the ACK research host; use workstation status or metadata signing only"
+
+# The native handoff supplies the absolute deadline to both containers. Recompute
+# remaining time at startup, so queue delay or late application cannot renew it.
+if [[ -n "${MONDAY_CAMPAIGN_DEADLINE_AT:-}" \
+  && "${MONDAY_CAMPAIGN_DEADLINE_GUARDED:-}" != "$MONDAY_CAMPAIGN_DEADLINE_AT" ]]; then
+  deadline_epoch="$(date -u -d "$MONDAY_CAMPAIGN_DEADLINE_AT" +%s)" \
+    || die "controller absolute deadline is invalid"
+  remaining_seconds=$((deadline_epoch - $(date -u +%s) - 1))
+  ((remaining_seconds > 0)) || die "controller original absolute deadline has expired"
+  command -v timeout >/dev/null || die "controller absolute deadline requires GNU timeout"
+  export MONDAY_CAMPAIGN_DEADLINE_GUARDED="$MONDAY_CAMPAIGN_DEADLINE_AT"
+  exec timeout --signal=KILL "${remaining_seconds}s" "$0" "${original_args[@]}"
+fi
 
 if [[ "$mode" == "approve" || "$mode" == "ack-readback" ]]; then
   [[ -n "$work_dir" ]] || die "--work-dir is required"
@@ -1760,7 +1774,8 @@ while ((generation <= max_follow_ups)); do
   mv -f -- "$generation_dir/settlement-report.json.partial" "$generation_dir/settlement-report.json"
   log_event stage_completed "generation=$generation" "stage=ledger_settlement" "campaign_id=$campaign_id"
 
-  # Publish only the bounded native summary. A publication retry uses the same
+  # Publish native details within ACK/OSS; only the bounded receipt is required
+  # by a workstation. A publication retry uses the same
   # settled cache and immutable report; it must not dispatch or download again.
   controller_stage="model_report_publication"
   model_report="$generation_dir/model-report.json"
@@ -1769,10 +1784,12 @@ while ((generation <= max_follow_ups)); do
   jq -e --arg path "$model_report" --arg sha "$model_report_sha256" \
     --arg result "$result_sha256" --argjson bytes "$model_report_bytes" \
     '.model_report | .path == $path and .sha256 == $sha and .bytes == $bytes
-      and .bytes > 0 and .bytes <= 4194304 and .campaign_result_sha256 == $result
+      and .bytes > 0 and .campaign_result_sha256 == $result
+      and .workstation_byte_limit == 4194304
+      and .fits_workstation_byte_limit == ($bytes <= 4194304)
       and .training_performed == false and .metrics_recomputed == false' \
     "$generation_dir/settlement-report.json" >/dev/null \
-    || die "native Campaign model report identity or lightweight bound is invalid"
+    || die "native Campaign model report identity or transfer receipt is invalid"
   model_report_url="$(jq -er '.campaign_result_readback_url' "$request")"
   model_report_url="${model_report_url%%\?*}"
   model_report_url="${model_report_url%/*}/model-report.json"
@@ -1809,7 +1826,7 @@ while ((generation <= max_follow_ups)); do
     --arg model_report_sha256 "$model_report_sha256" \
     --argjson model_report_bytes "$model_report_bytes" \
     --argjson round_readback_count "$request_round_count" \
-    '{generation:$generation,campaign_id:$campaign_id,request_sha256:$request_sha256,job_name:$job_name,campaign_result_sha256:$result_sha256,termination_reason:$termination_reason,observed_image_id:$observed_image_id,learning_directive_sha256:$learning_directive_sha256,search_policy_revision_id:$search_policy_revision_id,round_readback_count:$round_readback_count,model_report:{url:$model_report_url,sha256:$model_report_sha256,bytes:$model_report_bytes}}' \
+    '{generation:$generation,campaign_id:$campaign_id,request_sha256:$request_sha256,job_name:$job_name,campaign_result_sha256:$result_sha256,termination_reason:$termination_reason,observed_image_id:$observed_image_id,learning_directive_sha256:$learning_directive_sha256,search_policy_revision_id:$search_policy_revision_id,round_readback_count:$round_readback_count,model_report:{url:$model_report_url,sha256:$model_report_sha256,bytes:$model_report_bytes,workstation_byte_limit:4194304,fits_workstation_byte_limit:($model_report_bytes <= 4194304)}}' \
     >"$generation_dir/generation-report.json"
 
   if [[ "$termination_reason" != "campaign_no_candidate" ]]; then
