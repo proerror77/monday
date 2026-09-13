@@ -1820,7 +1820,7 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "--label-horizon-buckets", "5", "--top-depth", "5", "--max-input-bytes", "1000000",
             "--output", "frozen.env",
         ]).is_ok());
-        assert!(Cli::try_parse_from([
+        let handoff_args = [
             "alpha-harness",
             "mission",
             "dispatch",
@@ -1847,8 +1847,14 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "monday-research",
             "--output",
             "private-handoff.json",
-        ])
-        .is_ok());
+        ];
+        assert!(Cli::try_parse_from(handoff_args)
+            .unwrap_err()
+            .to_string()
+            .contains("--deadline-at"));
+        let mut bounded_handoff = handoff_args.to_vec();
+        bounded_handoff.extend(["--deadline-at", "2030-01-01T00:00:00Z"]);
+        assert!(Cli::try_parse_from(bounded_handoff).is_ok());
         assert!(Cli::try_parse_from([
             "alpha-harness",
             "mission",
