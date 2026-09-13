@@ -49,6 +49,20 @@ grep -Fqx '  checks: read' "$workflow"
 grep -Fqx 'concurrency:' "$workflow"
 grep -Fqx '  group: acr-publish-${{ github.ref }}' "$workflow"
 grep -Fqx '  cancel-in-progress: false' "$workflow"
+# Native queue:max retains the pending current-source wakeup when a stale CI
+# completion, ignored CI event, or non-research manual request arrives later.
+ruby -ryaml - "$workflow" <<'RUBY'
+concurrency = YAML.safe_load(File.read(ARGV.fetch(0))).fetch('concurrency')
+abort 'ACR publishers must share their existing mutex' unless concurrency.fetch('group') == 'acr-publish-${{ github.ref }}'
+abort 'ACR wakeups require retained pending runs' unless concurrency.fetch('queue') == 'max'
+abort 'running publishers must survive new wakeups' unless concurrency.fetch('cancel-in-progress') == false
+pending = [:current_source_required_ci]
+pending << :stale_source_completion << :ignored_scheduled_ci << :manual_hft << :manual_source_test
+abort 'a later event replaced the current-source wakeup' unless pending.shift == :current_source_required_ci
+abort 'manual requests lost their shared ordering' unless pending == [:stale_source_completion, :ignored_scheduled_ci, :manual_hft, :manual_source_test]
+# GitHub's native bound is 100 pending runs, not an unbounded queue guarantee.
+abort 'test scenario exceeded the documented queue bound' unless pending.length < 100
+RUBY
 if grep -Eq '^    paths(-ignore)?:' <<<"$ci_push_block$ploy_push_block"; then
   printf 'required CI workflow can skip a main SHA by path\n' >&2
   exit 1

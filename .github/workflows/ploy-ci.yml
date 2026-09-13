@@ -190,7 +190,8 @@ jobs:
               .github/workflows/acr-publish.yml
             )
           fi
-          "${HOME}/go/bin/actionlint" -color "${workflow_files[@]}"
+          .github/scripts/lint-workflow-files.sh "${HOME}/go/bin/actionlint" "${workflow_files[@]}"
+          .github/scripts/test-workflow-queue-lint.sh "${HOME}/go/bin/actionlint"
 
       - name: Test collector host monitor workflow contract
         working-directory: .

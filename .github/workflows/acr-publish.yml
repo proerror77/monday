@@ -46,7 +46,10 @@ permissions:
   contents: read
 
 concurrency:
+  # Retain queued CI wakeups and manual requests while preserving the shared
+  # image publication mutex. A later stale/no-op event must not replace them.
   group: acr-publish-${{ github.ref }}
+  queue: max
   cancel-in-progress: false
 
 jobs:

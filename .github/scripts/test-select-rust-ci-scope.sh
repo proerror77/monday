@@ -369,7 +369,8 @@ grep -Fq "contains(needs.image-smoke-scope.outputs.jobs, ',ploy/rust-research-he
 grep -Fqx "            mapfile -d '' workflow_files < <(" "$ploy_workflow"
 grep -Fq -- '--diff-filter=ACMR -z' "$ploy_workflow"
 grep -Fqx '          if ((${#workflow_files[@]} == 0)); then' "$ploy_workflow"
-grep -Fqx '          "${HOME}/go/bin/actionlint" -color "${workflow_files[@]}"' "$ploy_workflow"
+grep -Fqx '          .github/scripts/lint-workflow-files.sh "${HOME}/go/bin/actionlint" "${workflow_files[@]}"' "$ploy_workflow"
+grep -Fqx '          .github/scripts/test-workflow-queue-lint.sh "${HOME}/go/bin/actionlint"' "$ploy_workflow"
 # Exercise the actual CI validator with valid and invalid metadata.
 sed -n "/^          ruby -ryaml <<'RUBY'$/,/^          RUBY$/p" "$ploy_workflow" \
   | sed 's/^          //' >"$tmp_dir/validate-skills.sh"
