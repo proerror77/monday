@@ -1359,6 +1359,9 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
         }),
     );
 
+    // Independent worker admission happens once; all seeds render from that
+    // same verified snapshot instead of reimporting bulk features per round.
+    let render_inputs = PreparedCexInputs::load(&feature_path, &materialization_path)?;
     let mut ledgers = Vec::with_capacity(loaded.request.rounds.len());
     let mut selected_round = None;
     let mut selected_mission = None;
@@ -1377,9 +1380,8 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
                 "research_plan": &loaded.request.research_plan,
             }),
         );
-        let rendered = render_cex_bundle(
-            &feature_path,
-            &materialization_path,
+        let rendered = render_prepared_cex_bundle(
+            &render_inputs,
             &loaded.request.research_plan,
             round.seed,
             loaded.request.declared_total_trials,
