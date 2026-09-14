@@ -245,6 +245,7 @@ pub fn verify_model_ledger_from_dataset(
         );
     }
     let expected = crate::formula_evaluator::FormulaEvaluator::new(evaluator_config.clone())?
+        .with_decision_policy(&evaluation.candidate.decision_policy)?
         .evaluate_predictions_and_positions(
             context.rows(),
             &evaluation.predictions,
@@ -694,9 +695,21 @@ fn position_metrics(
         }
         let current = point.target_position;
         let delta = (current - previous).abs();
-        total_turnover += delta;
+        let turnover =
+            if report.return_accounting == ReturnAccountingBasis::HeldQuantityWithQuotedEntryExit {
+                point
+                    .quoted_turnover_fraction
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                    .ok_or("held model ledger lacks quoted traded notional")?
+            } else {
+                delta
+            };
+        if delta == 0.0 && turnover != 0.0 {
+            return Err("held model resized during its horizon".into());
+        }
+        total_turnover += turnover;
         peak_target = peak_target.max(current.abs());
-        peak_rebalance = peak_rebalance.max(delta);
+        peak_rebalance = peak_rebalance.max(turnover);
         if delta > f64::EPSILON {
             if previous.abs() <= f64::EPSILON {
                 actions.entries += 1;
@@ -950,6 +963,8 @@ mod tests {
 
     fn point(index: usize, date: u32, hour: u32, fold: usize, net: f64) -> PositionEvaluationPoint {
         PositionEvaluationPoint {
+            quoted_turnover_fraction: None,
+            entry_target: None,
             row_index: index,
             series_id: 1,
             available_time: Utc.with_ymd_and_hms(2026, 9, date, hour, 0, 0).unwrap(),

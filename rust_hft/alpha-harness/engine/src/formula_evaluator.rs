@@ -19,15 +19,24 @@ use hft_factor_dsl::{
 };
 
 const BPS: f64 = 10_000.0;
+mod holding_ledger;
 
 pub struct FormulaEvaluator {
     config: FormulaEvaluatorConfig,
     governed_gp_policy: Option<CexGpPolicyV1>,
+    entry_policy: Option<hft_research_manifest::model::CexSupervisedDecisionPolicyV2>,
+    holding: Option<hft_research_manifest::model::HorizonHoldingPolicyV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PositionEvaluationPoint {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quoted_turnover_fraction: Option<f64>,
+    /// Cost-aware opening signal before holding, with predeclared tail entries
+    /// disabled. Event replay can reconsider it after a zero-fill IOC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_target: Option<f64>,
     pub row_index: usize,
     pub series_id: u64,
     pub available_time: chrono::DateTime<chrono::Utc>,
@@ -57,6 +66,7 @@ struct PredictiveGateResult {
 }
 
 struct PositionReturnPoint {
+    quoted_turnover_fraction: Option<f64>,
     row_index: usize,
     series_id: u64,
     available_time: chrono::DateTime<chrono::Utc>,
@@ -150,6 +160,7 @@ impl PredictiveGateResult {
                 }
                 let net_return = gross_return - transaction_cost_value - funding_cost;
                 PositionReturnPoint {
+                    quoted_turnover_fraction: None,
                     row_index: index,
                     series_id: row.series_id,
                     available_time: row.available_time,
@@ -192,6 +203,8 @@ impl FormulaEvaluator {
         Ok(Self {
             config,
             governed_gp_policy: None,
+            entry_policy: None,
+            holding: None,
         })
     }
 
@@ -314,6 +327,16 @@ impl FormulaEvaluator {
             evaluator_version,
             protocol,
         )
+    }
+
+    pub fn with_decision_policy(
+        mut self,
+        policy: &hft_research_manifest::model::CexSupervisedDecisionPolicyV2,
+    ) -> Result<Self, String> {
+        policy.validate()?;
+        self.entry_policy = policy.holding.as_ref().map(|_| policy.clone());
+        self.holding = policy.holding.clone();
+        Ok(self)
     }
 
     pub fn evaluate_sealed(
@@ -440,6 +463,17 @@ impl FormulaEvaluator {
         } else if protocol.labels.horizon_buckets != 1 {
             return Err("multi-step prediction labels cannot be used as one-step trading returns; price marks are required".into());
         }
+        if let Some(holding) = &self.holding {
+            let expected = u64::try_from(protocol.labels.horizon_buckets)
+                .ok()
+                .and_then(|h| h.checked_mul(protocol.labels.observation_frequency_millis));
+            if expected != Some(holding.horizon_millis)
+                || mark_field != Some("mid_price")
+                || !protocol.costs.cross_spread
+            {
+                return Err("held-position accounting requires matching horizon labels and observed taker quotes".into());
+            }
+        }
 
         let ranges = ranges.into_iter().collect::<Vec<_>>();
         if ranges.is_empty() {
@@ -486,21 +520,57 @@ impl FormulaEvaluator {
         let mut ledger = Vec::new();
         let mut equity = 1.0_f64;
         for (fold_index, range) in ranges.into_iter().enumerate() {
-            let (points, trade_count, total_turnover, max_book_depth_fraction) = predictive_stage
-                .target_positions_to_net_returns(
-                    rows,
-                    target_positions,
-                    range,
-                    &protocol.costs,
-                    mark_field,
-                );
+            let end_clock = rows[range.end - 1].available_time.timestamp_micros();
+            let (points, trade_count, total_turnover, max_book_depth_fraction) =
+                if let Some(holding) = &self.holding {
+                    holding_ledger::evaluate(
+                        rows,
+                        target_positions,
+                        range,
+                        &protocol.costs,
+                        holding,
+                    )?
+                } else {
+                    predictive_stage.target_positions_to_net_returns(
+                        rows,
+                        target_positions,
+                        range,
+                        &protocol.costs,
+                        mark_field,
+                    )
+                };
             let returns = points
                 .iter()
                 .map(|point| point.net_return)
                 .collect::<Vec<_>>();
             for point in points {
                 equity += point.net_return;
+                let entry_target = self
+                    .entry_policy
+                    .as_ref()
+                    .map(|policy| {
+                        let horizon = policy.holding.as_ref().unwrap().duration_micros()?;
+                        if point
+                            .available_time
+                            .timestamp_micros()
+                            .checked_add(i64::try_from(horizon).map_err(|e| e.to_string())?)
+                            .is_none_or(|due| due > end_clock)
+                        {
+                            return Ok::<f64, String>(0.0);
+                        }
+                        policy.target_position(
+                            predictions[point.row_index],
+                            0.0,
+                            crate::baselines::decision_costs(
+                                &rows[point.row_index],
+                                &protocol.costs,
+                            )?,
+                        )
+                    })
+                    .transpose()?;
                 ledger.push(PositionEvaluationPoint {
+                    quoted_turnover_fraction: point.quoted_turnover_fraction,
+                    entry_target,
                     row_index: point.row_index,
                     series_id: point.series_id,
                     available_time: point.available_time,
@@ -624,10 +694,14 @@ impl FormulaEvaluator {
             .map_err(|reason| format!("evaluation evidence is inconsistent: {reason}"))?;
         Ok(PositionEvaluationReport {
             evaluation,
-            return_accounting: match mark_field {
-                Some("mid_price") => ReturnAccountingBasis::ObservedMidPrice,
-                Some("close") => ReturnAccountingBasis::ObservedClosePrice,
-                _ => ReturnAccountingBasis::OneStepLabel,
+            return_accounting: if self.holding.is_some() {
+                ReturnAccountingBasis::HeldQuantityWithQuotedEntryExit
+            } else {
+                match mark_field {
+                    Some("mid_price") => ReturnAccountingBasis::ObservedMidPrice,
+                    Some("close") => ReturnAccountingBasis::ObservedClosePrice,
+                    _ => ReturnAccountingBasis::OneStepLabel,
+                }
             },
             ledger,
         })

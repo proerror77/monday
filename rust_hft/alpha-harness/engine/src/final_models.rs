@@ -252,7 +252,18 @@ fn evaluate_frozen_rows(
         positions[index] = target;
         previous = target;
     }
+    if let Some(holding) = &candidate.program.decision_policy.holding {
+        positions = crate::baselines::horizon_target_positions(
+            rows,
+            &predictions,
+            &candidate.program.decision_policy,
+            protocol,
+            std::iter::once(0..rows.len()),
+            holding,
+        )?;
+    }
     let report = FormulaEvaluator::new(candidate.evaluator_config.clone())?
+        .with_decision_policy(&candidate.program.decision_policy)?
         .evaluate_predictions_and_positions(
             rows,
             &predictions,
@@ -261,7 +272,12 @@ fn evaluate_frozen_rows(
             version,
             protocol,
         )?;
-    if report.return_accounting != ReturnAccountingBasis::ObservedMidPrice {
+    let expected_basis = if candidate.program.decision_policy.holding.is_some() {
+        ReturnAccountingBasis::HeldQuantityWithQuotedEntryExit
+    } else {
+        ReturnAccountingBasis::ObservedMidPrice
+    };
+    if report.return_accounting != expected_basis {
         return Err("frozen CEX model evaluation requires observed mid-price accounting".into());
     }
     report.evaluation.validate_reason()?;

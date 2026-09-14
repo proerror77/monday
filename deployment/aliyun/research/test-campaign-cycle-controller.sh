@@ -250,9 +250,9 @@ case "$1 $2" in
     [[ " $* " != *" --max-tokens "* ]]
     output="$(value_after --output "$@")"
     increment "$FAKE_STATE/learn-count"
-    if [[ "${FAKE_LEARN_OUTCOME:-}" == "no_improvement" ]]; then
+    if [[ "${FAKE_LEARN_OUTCOME:-}" == "no_improvement" || "${FAKE_LEARN_OUTCOME:-}" == "fixed_comparison_complete" ]]; then
       rm -f -- "$output"
-      jq -n '{failure_class:"overtrade_capacity",outcome:"no_improvement",evidence_signature:{schema_version:"cex-campaign-research-evidence-signature-v1",feature_fields_sha256:("7" * 64),factor_signatures_sha256:("8" * 64)}}'
+      jq -n --arg outcome "$FAKE_LEARN_OUTCOME" '{failure_class:"overtrade_capacity",outcome:$outcome,evidence_signature:{schema_version:"cex-campaign-research-evidence-signature-v1",feature_fields_sha256:("7" * 64),factor_signatures_sha256:("8" * 64)}}'
       exit 0
     fi
     reused_existing=false
@@ -868,7 +868,7 @@ recovery_case() (
     test -s "$request_dir/generation-complete"
     if [[ "$outcome" != follow_up ]]; then
       test ! -e "$case_work/cycle-result.json"
-      local expected_termination=no_improvement
+      local expected_termination="$outcome"
       [[ "$outcome" != bounded ]] || expected_termination=campaign_no_candidate
       jq -e --arg termination "$expected_termination" '.checkpoint_status == "complete" and .termination_reason == $termination' \
         < <(FAKE_STATE="$fake_state" "$controller" status --work-dir "$case_work") >/dev/null
@@ -892,8 +892,8 @@ recovery_case() (
     test "$(<"$fake_state/plan-count")" == 1
     cmp "$request_dir/next-research-plan.json" "$request_dir/next-research-plan-readback.json"
     jq -e '.next_stage == "next_generation"' < <(FAKE_STATE="$fake_state" "$controller" status --work-dir "$case_work") >/dev/null
-  elif [[ "$outcome" == no_improvement ]]; then
-    jq -e '.termination_reason == "no_improvement"' "$case_work/cycle-result.json" >/dev/null
+  elif [[ "$outcome" == no_improvement || "$outcome" == fixed_comparison_complete ]]; then
+    jq -e --arg outcome "$outcome" '.termination_reason == $outcome' "$case_work/cycle-result.json" >/dev/null
   else
     jq -e '.termination_reason == "campaign_no_candidate" and .bounded_loop_exhausted == true' "$case_work/cycle-result.json" >/dev/null
     test ! -e "$fake_state/learn-count"
@@ -918,6 +918,7 @@ for scenario in \
   'follow-up-commit FAKE_CRASH_AFTER_COMPLETION_COMMIT' \
   'terminal-commit FAKE_CRASH_AFTER_COMPLETION_COMMIT no_improvement' \
   'cycle-summary FAKE_FAIL_CYCLE_SUMMARY no_improvement' \
+  'fixed-comparison-commit FAKE_CRASH_AFTER_COMPLETION_COMMIT fixed_comparison_complete' \
   'bounded-commit FAKE_CRASH_AFTER_COMPLETION_COMMIT bounded' \
   'changed-local-report TAMPER_LEARN_REPORT' \
   'changed-remote-report TAMPER_REMOTE_REPORT' \

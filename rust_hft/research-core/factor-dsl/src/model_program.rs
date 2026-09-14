@@ -6,6 +6,9 @@ use crate::{
 use hft_research_manifest::model::{
     CexBaselineModelV1, CexDecisionCostsV1, CexSupervisedDecisionPolicyV2, PreparedCexBaselineModel,
 };
+pub use hft_research_manifest::model::{
+    HorizonHoldingPolicyV1, HorizonPositionAction, HorizonPositionState,
+};
 use serde::{Deserialize, Serialize};
 
 pub const FROZEN_FACTOR_MODEL_SCHEMA_V1: &str = "monday.frozen_factor_model.v1";
@@ -96,6 +99,16 @@ impl FrozenFactorModelV1 {
             }
         }
         self.decision_policy.validate()?;
+        if let Some(holding) = &self.decision_policy.holding {
+            let expected = u64::try_from(self.label_horizon_buckets)
+                .ok()
+                .and_then(|h| h.checked_mul(self.observation_frequency_millis));
+            if expected != Some(holding.horizon_millis) || !self.cross_spread {
+                return Err(
+                    "frozen holding period must match its return label and taker execution".into(),
+                );
+            }
+        }
         if !self.base_costs.one_way_cost_bps.is_finite()
             || !self.base_costs.funding_bps.is_finite()
             || self.base_costs.funding_bps < 0.0

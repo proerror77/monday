@@ -2,7 +2,9 @@ use hft_core::{
     top5_book_features, OrderType, Price, Quantity, Side, Symbol, TimeInForce, Top5BookFeatures,
     TOP5_DEPTH,
 };
-use hft_factor_dsl::model_program::{FrozenFactorModelV1, PreparedFrozenFactorModel};
+use hft_factor_dsl::model_program::{
+    FrozenFactorModelV1, HorizonPositionAction, HorizonPositionState, PreparedFrozenFactorModel,
+};
 use hft_factor_dsl::{
     evaluate_live_formula_series, validate_live_formula, FactorAst, FactorDslError, FactorOperator,
     FactorTerminal, LiveEventDomain, LiveFormulaCapabilityError,
@@ -81,6 +83,9 @@ pub enum FormulaStrategyError {
 
 #[derive(Debug)]
 pub struct FormulaStrategy {
+    horizon_pending_entry: Option<(u64, Option<hft_core::OrderId>, bool)>,
+    horizon_state: HorizonPositionState,
+    horizon_exit_pending: bool,
     config: FormulaStrategyConfig,
     prepared_model: Option<PreparedFrozenFactorModel>,
     domain: EventDomain,
@@ -179,6 +184,9 @@ impl FormulaStrategy {
             return Err(FormulaStrategyError::StatefulFormulaRequiresTargetPosition);
         }
         Ok(Self {
+            horizon_pending_entry: None,
+            horizon_state: HorizonPositionState::default(),
+            horizon_exit_pending: false,
             config,
             prepared_model,
             domain,
@@ -801,36 +809,101 @@ impl Strategy for FormulaStrategy {
         while self.history.len() > self.history_rows {
             self.history.pop_front();
         }
-        let signal = match &self.config.program {
-            FormulaProgram::Formula(ast) => {
-                evaluate_ast_history(ast, &self.field_names, &self.history)
+        let holding = match &self.config.program {
+            FormulaProgram::FrozenModel(model) => model.decision_policy.holding.clone(),
+            _ => None,
+        };
+        let current_quantity = account
+            .positions
+            .get(&self.config.symbol)
+            .map(|p| p.quantity.0)
+            .unwrap_or(Decimal::ZERO);
+        let mut forced_exit = false;
+        if let Some(policy) = &holding {
+            if self.horizon_state.is_holding() {
+                match self.horizon_state.advance(policy, timestamp, false, None) {
+                    Ok(HorizonPositionAction::Hold(_)) => return Vec::new(),
+                    Ok(HorizonPositionAction::Exit { .. }) => {
+                        self.horizon_exit_pending = current_quantity != Decimal::ZERO;
+                        forced_exit = true;
+                    }
+                    _ => return Vec::new(),
+                }
+            } else if self.horizon_exit_pending {
+                if current_quantity != Decimal::ZERO {
+                    forced_exit = true;
+                } else {
+                    self.horizon_exit_pending = false;
+                }
+            } else if current_quantity != Decimal::ZERO {
+                // A new actor cannot adopt another position without its entry
+                // clock. External execution remains a separate runtime contract.
+                return Vec::new();
             }
-            FormulaProgram::FrozenModel(model) => self
-                .prepared_model
-                .as_ref()
-                .and_then(|prepared| {
-                    prepared
-                        .predict_from_history(self.history.len(), |row, field| {
-                            let column = self.field_names.iter().position(|name| name == field)?;
-                            self.history.get(row)?.get(column).copied()
-                        })
-                        .ok()
-                })
-                .and_then(|prediction| {
-                    let bid = decision.best_bid.to_f64()?;
-                    let ask = decision.best_ask.to_f64()?;
-                    let spread_bps = (ask - bid) / ((ask + bid) * 0.5) * 10_000.0;
-                    model
-                        .target_position(prediction, self.last_signal.unwrap_or(0.0), spread_bps)
-                        .ok()
-                }),
+            if !forced_exit {
+                self.signal_initialized = false;
+                self.target_position = None;
+                self.last_signal = None;
+            }
+        }
+        let signal = if forced_exit {
+            Some(0.0)
+        } else {
+            match &self.config.program {
+                FormulaProgram::Formula(ast) => {
+                    evaluate_ast_history(ast, &self.field_names, &self.history)
+                }
+                FormulaProgram::FrozenModel(model) => self
+                    .prepared_model
+                    .as_ref()
+                    .and_then(|prepared| {
+                        prepared
+                            .predict_from_history(self.history.len(), |row, field| {
+                                let column =
+                                    self.field_names.iter().position(|name| name == field)?;
+                                self.history.get(row)?.get(column).copied()
+                            })
+                            .ok()
+                    })
+                    .and_then(|prediction| {
+                        let bid = decision.best_bid.to_f64()?;
+                        let ask = decision.best_ask.to_f64()?;
+                        let spread_bps = (ask - bid) / ((ask + bid) * 0.5) * 10_000.0;
+                        model
+                            .target_position(
+                                prediction,
+                                self.last_signal.unwrap_or(0.0),
+                                spread_bps,
+                            )
+                            .ok()
+                    }),
+            }
         };
         let Some(signal) = signal else {
             return Vec::new();
         };
+        let mut entered = false;
+        let signal = if let Some(policy) = &holding {
+            if forced_exit {
+                0.0
+            } else {
+                match self
+                    .horizon_state
+                    .advance(policy, timestamp, true, Some(signal))
+                {
+                    Ok(action) => {
+                        entered = matches!(action, HorizonPositionAction::Enter(_));
+                        action.target()
+                    }
+                    Err(_) => return Vec::new(),
+                }
+            }
+        } else {
+            signal
+        };
         let buy_price = self.target_price(Side::Buy, decision.best_bid, decision.best_ask);
         let sell_price = self.target_price(Side::Sell, decision.best_bid, decision.best_ask);
-        self.emit_signal(
+        let intents = self.emit_signal(
             signal,
             decision.venue,
             account,
@@ -839,14 +912,82 @@ impl Strategy for FormulaStrategy {
                 Side::Sell => sell_price,
             },
             Some(decision.bucket),
-        )
+        );
+        if entered {
+            if intents.is_empty() {
+                let _ = self.horizon_state.reject_entry(timestamp);
+            } else {
+                self.horizon_pending_entry = Some((timestamp, None, false));
+            }
+        }
+        intents
     }
 
     fn on_execution_event(
         &mut self,
-        _event: &ExecutionEvent,
-        _account: &AccountView,
+        event: &ExecutionEvent,
+        account: &AccountView,
     ) -> Vec<OrderIntent> {
+        let Some((opened, order, filled)) = &mut self.horizon_pending_entry else {
+            return Vec::new();
+        };
+        match event {
+            ExecutionEvent::OrderNew {
+                order_id,
+                symbol,
+                strategy_id,
+                ..
+            } if order.is_none()
+                && symbol == &self.config.symbol
+                && strategy_id == &self.config.name =>
+            {
+                *order = Some(order_id.clone());
+            }
+            ExecutionEvent::Fill {
+                order_id, quantity, ..
+            } if order.as_ref() == Some(order_id) && quantity.0 > Decimal::ZERO => {
+                *filled = true;
+            }
+            ExecutionEvent::OrderCanceled { order_id, .. }
+            | ExecutionEvent::OrderReject { order_id, .. }
+                if order.as_ref() == Some(order_id) =>
+            {
+                if !*filled
+                    && account
+                        .positions
+                        .get(&self.config.symbol)
+                        .is_none_or(|p| p.quantity.0 == Decimal::ZERO)
+                {
+                    let _ = self.horizon_state.reject_entry(*opened);
+                    self.pending_target = None;
+                    self.target_position = None;
+                    self.signal_initialized = false;
+                    self.last_signal = None;
+                }
+                self.horizon_pending_entry = None;
+            }
+            ExecutionEvent::OrderCompleted {
+                order_id,
+                total_filled,
+                ..
+            } if order.as_ref() == Some(order_id) => {
+                if !*filled
+                    && total_filled.0 == Decimal::ZERO
+                    && account
+                        .positions
+                        .get(&self.config.symbol)
+                        .is_none_or(|p| p.quantity.0 == Decimal::ZERO)
+                {
+                    let _ = self.horizon_state.reject_entry(*opened);
+                    self.pending_target = None;
+                    self.target_position = None;
+                    self.signal_initialized = false;
+                    self.last_signal = None;
+                }
+                self.horizon_pending_entry = None;
+            }
+            _ => {}
+        }
         Vec::new()
     }
 
@@ -1307,6 +1448,138 @@ mod tests {
             cross_spread: false,
         }));
         target
+    }
+
+    #[test]
+    fn frozen_horizon_canceled_entry_waits_for_its_own_receipt_then_retries() {
+        let mut config = frozen_model_config("usdm");
+        config.cross_spread = Some(true);
+        let FormulaProgram::FrozenModel(model) = &mut config.program else {
+            unreachable!()
+        };
+        model.cross_spread = true;
+        model.decision_policy =
+            hft_research_manifest::model::CexSupervisedDecisionPolicyV2::hold_to_horizon_v3(5000)
+                .unwrap();
+        let mut strategy = FormulaStrategy::new(config).unwrap();
+        let account = AccountView::default();
+        let first = target_intents(
+            &mut strategy,
+            &snapshot_at(3, 1, 1_000_000),
+            &account,
+            1_000_000,
+        );
+        assert_eq!(first.len(), 1);
+        strategy.on_execution_event(
+            &ExecutionEvent::OrderCanceled {
+                order_id: hft_core::OrderId("foreign".into()),
+                timestamp: 1_500_000,
+            },
+            &account,
+        );
+        assert!(target_intents(
+            &mut strategy,
+            &snapshot_at(3, 1, 2_000_000),
+            &account,
+            2_000_000
+        )
+        .is_empty());
+        let id = hft_core::OrderId("owned".into());
+        strategy.on_execution_event(
+            &ExecutionEvent::OrderNew {
+                order_id: id.clone(),
+                client_order_id: None,
+                account_id: None,
+                symbol: first[0].symbol.clone(),
+                side: first[0].side,
+                quantity: first[0].quantity,
+                requested_price: first[0].price,
+                arrival_price: first[0].price,
+                timestamp: 1_000_000,
+                venue: first[0].target_venue,
+                strategy_id: first[0].strategy_id.clone(),
+            },
+            &account,
+        );
+        strategy.on_execution_event(
+            &ExecutionEvent::OrderCanceled {
+                order_id: id,
+                timestamp: 2_500_000,
+            },
+            &account,
+        );
+        assert_eq!(
+            target_intents(
+                &mut strategy,
+                &snapshot_at(3, 1, 3_000_000),
+                &account,
+                3_000_000
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn frozen_horizon_model_ignores_new_signals_and_exits_the_same_quantity() {
+        for horizon in [5, 10, 30] {
+            let mut config = frozen_model_config("usdm");
+            config.cross_spread = Some(true);
+            let FormulaProgram::FrozenModel(model) = &mut config.program else {
+                unreachable!()
+            };
+            model.cross_spread = true;
+            model.label_horizon_buckets = horizon;
+            model.decision_policy =
+                hft_research_manifest::model::CexSupervisedDecisionPolicyV2::hold_to_horizon_v3(
+                    horizon as u64 * 1000,
+                )
+                .unwrap();
+            let mut strategy = FormulaStrategy::new(config).unwrap();
+            let mut account = AccountView::default();
+            let entry = target_intents(
+                &mut strategy,
+                &snapshot_at(3, 1, 1_000_000),
+                &account,
+                1_000_000,
+            );
+            assert_eq!(entry.len(), 1);
+            account.positions.insert(
+                Symbol::from("BTCUSDT"),
+                ports::Position {
+                    symbol: Symbol::from("BTCUSDT"),
+                    quantity: entry[0].quantity,
+                    avg_price: Price(Decimal::from(101)),
+                    unrealized_pnl: Decimal::ZERO,
+                    realized_pnl: Decimal::ZERO,
+                },
+            );
+            for second in 2..=horizon {
+                let mut event = snapshot_at(1, 30, second as u64 * 1_000_000);
+                let MarketEvent::Snapshot(book) = &mut event else {
+                    unreachable!()
+                };
+                book.bids[0].price = Price(Decimal::from(110));
+                book.asks[0].price = Price(Decimal::from(112));
+                assert!(
+                    target_intents(&mut strategy, &event, &account, second as u64 * 1_000_000)
+                        .is_empty()
+                );
+            }
+            let due = (horizon as u64 + 1) * 1_000_000;
+            let exit = target_intents(&mut strategy, &snapshot_at(3, 1, due), &account, due);
+            assert_eq!(exit.len(), 1);
+            assert_eq!(exit[0].side, Side::Sell);
+            assert_eq!(exit[0].quantity, entry[0].quantity);
+            account.positions.clear();
+            let next = target_intents(
+                &mut strategy,
+                &snapshot_at(3, 1, due + 1_000_000),
+                &account,
+                due + 1_000_000,
+            );
+            assert_eq!(next.len(), 1);
+        }
     }
 
     #[test]

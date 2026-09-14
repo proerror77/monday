@@ -1,6 +1,8 @@
 //! Frozen inference parameters shared by training, evaluation and runtime.
 //! The tensor digest is identical to the trainer's existing semantic digest.
+mod holding;
 mod numerical;
+pub use holding::{HorizonHoldingPolicyV1, HorizonPositionAction, HorizonPositionState};
 pub use numerical::{MlpPredictionParityDiagnostics, MlpPredictionParityError};
 mod prepared;
 pub use prepared::PreparedCexBaselineModel;
@@ -494,6 +496,7 @@ impl CexBaselineCartNodeV1 {
 }
 
 const CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V2: &str = "cex-supervised-decision-policy-v2";
+const CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V3: &str = "cex-supervised-decision-policy-v3";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -506,6 +509,8 @@ pub enum CexSupervisedSizingRuleV1 {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CexSupervisedDecisionPolicyV2 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holding: Option<HorizonHoldingPolicyV1>,
     pub schema_version: String,
     pub round_trip_cost_multiplier: f64,
     pub sizing_rule: CexSupervisedSizingRuleV1,
@@ -521,6 +526,7 @@ fn is_false(value: &bool) -> bool {
 impl CexSupervisedDecisionPolicyV2 {
     pub fn controlled_v2() -> Self {
         Self {
+            holding: None,
             schema_version: CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V2.to_string(),
             round_trip_cost_multiplier: 2.0,
             sizing_rule: CexSupervisedSizingRuleV1::ExcessExpectedReturnOverRoundTripCost,
@@ -531,6 +537,7 @@ impl CexSupervisedDecisionPolicyV2 {
 
     pub fn prediction_identity_v2() -> Self {
         Self {
+            holding: None,
             schema_version: CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V2.to_string(),
             round_trip_cost_multiplier: 0.0,
             sizing_rule: CexSupervisedSizingRuleV1::PredictionIdentity,
@@ -541,6 +548,7 @@ impl CexSupervisedDecisionPolicyV2 {
 
     pub fn hysteretic_cost_aware_v2() -> Self {
         Self {
+            holding: None,
             schema_version: CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V2.to_string(),
             round_trip_cost_multiplier: 2.0,
             sizing_rule: CexSupervisedSizingRuleV1::HystereticExcessExpectedReturnOverRoundTripCost,
@@ -554,6 +562,14 @@ impl CexSupervisedDecisionPolicyV2 {
         self
     }
 
+    pub fn hold_to_horizon_v3(horizon_millis: u64) -> Result<Self, String> {
+        let mut policy = Self::controlled_v2();
+        policy.schema_version = CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V3.into();
+        policy.holding = Some(HorizonHoldingPolicyV1 { horizon_millis });
+        policy.validate()?;
+        Ok(policy)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         let admitted = match self.sizing_rule {
             CexSupervisedSizingRuleV1::ExcessExpectedReturnOverRoundTripCost
@@ -564,10 +580,15 @@ impl CexSupervisedDecisionPolicyV2 {
                 self.round_trip_cost_multiplier.to_bits() == 0.0_f64.to_bits()
             }
         };
-        if self.schema_version != CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V2
-            || !admitted
-            || self.max_abs_position.to_bits() != 1.0_f64.to_bits()
-        {
+        let schema_matches = if let Some(holding) = &self.holding {
+            holding.duration_micros()?;
+            self.schema_version == CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V3
+                && self.sizing_rule
+                    == CexSupervisedSizingRuleV1::ExcessExpectedReturnOverRoundTripCost
+        } else {
+            self.schema_version == CEX_SUPERVISED_DECISION_POLICY_SCHEMA_V2
+        };
+        if !schema_matches || !admitted || self.max_abs_position.to_bits() != 1.0_f64.to_bits() {
             return Err("CEX supervised decision policy drifted".to_string());
         }
         Ok(())

@@ -433,7 +433,12 @@ impl CexSupervisedModelCandidateV2 {
         self.evaluation
             .validate()
             .map_err(|error| error.to_string())?;
-        if self.return_accounting != crate::ReturnAccountingBasis::ObservedMidPrice
+        let expected_accounting = if self.decision_policy.holding.is_some() {
+            crate::ReturnAccountingBasis::HeldQuantityWithQuotedEntryExit
+        } else {
+            crate::ReturnAccountingBasis::ObservedMidPrice
+        };
+        if self.return_accounting != expected_accounting
             || self.schema_version != CEX_SUPERVISED_CANDIDATE_SCHEMA_V2
             || self.artifact_id != self.expected_artifact_id()?
             || self.mission_id.trim().is_empty()
