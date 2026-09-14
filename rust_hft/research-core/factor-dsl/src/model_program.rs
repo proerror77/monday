@@ -4,7 +4,7 @@ use crate::{
     LiveEventDomain, LiveFormulaCapability, MAX_LIVE_EVALUATION_STEPS,
 };
 use hft_research_manifest::model::{
-    CexBaselineModelV1, CexDecisionCostsV1, CexSupervisedDecisionPolicyV2,
+    CexBaselineModelV1, CexDecisionCostsV1, CexSupervisedDecisionPolicyV2, PreparedCexBaselineModel,
 };
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +39,22 @@ pub struct FrozenFactorModelV1 {
 
 impl FrozenFactorModelV1 {
     pub fn validate(&self) -> Result<LiveFormulaCapability, String> {
+        let capability = self.validate_program()?;
+        self.model.validate_inference(self.factors.len())?;
+        Ok(capability)
+    }
+
+    /// Admit the immutable model and factor ordering once for a prediction batch.
+    pub fn prepare(&self) -> Result<PreparedFrozenFactorModel, String> {
+        let capability = self.validate_program()?;
+        Ok(PreparedFrozenFactorModel {
+            predictor: self.model.prepare_inference(self.factors.len())?,
+            factors: self.factors.clone(),
+            history_rows: capability.history_rows,
+        })
+    }
+
+    fn validate_program(&self) -> Result<LiveFormulaCapability, String> {
         if self.schema_version != FROZEN_FACTOR_MODEL_SCHEMA_V1
             || self.factors.is_empty()
             || self.factors.len() > MAX_FROZEN_FACTORS
@@ -79,7 +95,6 @@ impl FrozenFactorModelV1 {
                 return Err("frozen MLP instrument differs from training".into());
             }
         }
-        self.model.validate_inference(self.factors.len())?;
         self.decision_policy.validate()?;
         if !self.base_costs.one_way_cost_bps.is_finite()
             || !self.base_costs.funding_bps.is_finite()
@@ -119,22 +134,7 @@ impl FrozenFactorModelV1 {
         row_count: usize,
         field_value: impl Fn(usize, &str) -> Option<f64>,
     ) -> Result<f64, String> {
-        let capability = self.validate()?;
-        let offset = row_count
-            .checked_sub(capability.history_rows)
-            .ok_or("frozen factor model requires more history")?;
-        let mut features = Vec::with_capacity(self.factors.len());
-        for factor in &self.factors {
-            let values =
-                evaluate_live_formula_series(&factor.ast, capability.history_rows, |row, field| {
-                    field_value(offset + row, field)
-                })
-                .map_err(|error| error.to_string())?;
-            let value = *values.last().ok_or("missing frozen factor value")?;
-            let value = if factor.negative { -value } else { value };
-            features.push(if value == 0.0 { 0.0 } else { value });
-        }
-        self.model.predict(&features)
+        self.prepare()?.predict_from_history(row_count, field_value)
     }
 
     pub fn target_position(
@@ -161,6 +161,42 @@ impl FrozenFactorModelV1 {
         } else {
             target
         })
+    }
+}
+
+/// Validated inference-only snapshot; not a serializable substitute for evidence.
+#[derive(Debug, Clone)]
+pub struct PreparedFrozenFactorModel {
+    predictor: PreparedCexBaselineModel,
+    factors: Vec<FrozenModelFactorV1>,
+    history_rows: usize,
+}
+
+impl PreparedFrozenFactorModel {
+    pub fn history_rows(&self) -> usize {
+        self.history_rows
+    }
+
+    pub fn predict_from_history(
+        &self,
+        row_count: usize,
+        field_value: impl Fn(usize, &str) -> Option<f64>,
+    ) -> Result<f64, String> {
+        let offset = row_count
+            .checked_sub(self.history_rows)
+            .ok_or("frozen factor model requires more history")?;
+        let mut features = Vec::with_capacity(self.factors.len());
+        for factor in &self.factors {
+            let values =
+                evaluate_live_formula_series(&factor.ast, self.history_rows, |row, field| {
+                    field_value(offset + row, field)
+                })
+                .map_err(|error| error.to_string())?;
+            let value = *values.last().ok_or("missing frozen factor value")?;
+            let value = if factor.negative { -value } else { value };
+            features.push(if value == 0.0 { 0.0 } else { value });
+        }
+        self.predictor.predict(&features)
     }
 }
 
@@ -201,6 +237,36 @@ mod tests {
             },
             cross_spread: true,
         }
+    }
+
+    #[test]
+    fn prepared_frozen_model_reuses_immutable_factors_and_checks_each_history() {
+        let mut model = fixture();
+        let prepared = model.prepare().unwrap();
+        assert_eq!(prepared.history_rows(), 2);
+        for end in 2..100 {
+            let read = |row: usize, field: &str| (field == "book_imbalance").then_some(row as f64);
+            assert_eq!(
+                prepared.predict_from_history(end, read).unwrap().to_bits(),
+                model.predict_from_history(end, read).unwrap().to_bits(),
+            );
+        }
+        model.factors[0].negative = false;
+        if let CexBaselineModelV1::Ridge { coefficients, .. } = &mut model.model {
+            coefficients[0] = f64::NAN;
+        }
+        assert!(model.prepare().is_err());
+        assert_eq!(
+            prepared
+                .predict_from_history(2, |row, _| Some(row as f64))
+                .unwrap(),
+            -0.25
+        );
+        assert!(prepared.predict_from_history(1, |_, _| Some(0.0)).is_err());
+        assert!(prepared.predict_from_history(2, |_, _| None).is_err());
+        assert!(prepared
+            .predict_from_history(2, |_, _| Some(f64::NAN))
+            .is_err());
     }
 
     #[test]

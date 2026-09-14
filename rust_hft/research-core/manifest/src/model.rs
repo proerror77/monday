@@ -2,6 +2,8 @@
 //! The tensor digest is identical to the trainer's existing semantic digest.
 mod numerical;
 pub use numerical::{MlpPredictionParityDiagnostics, MlpPredictionParityError};
+mod prepared;
+pub use prepared::PreparedCexBaselineModel;
 
 use crate::mlp_training::MlpLearningDiagnosticsV1;
 use serde::{Deserialize, Serialize};
@@ -99,6 +101,10 @@ impl PortableMlpV1 {
     /// arithmetic semantics, rather than depending on a backend's GEMM kernel.
     pub fn predict(&self, features: &[f32]) -> Result<f32, String> {
         self.validate()?;
+        self.predict_validated(features)
+    }
+
+    fn predict_validated(&self, features: &[f32]) -> Result<f32, String> {
         if features.len() != self.input_dim || features.iter().any(|value| !value.is_finite()) {
             return Err("portable MLP feature shape or values are invalid".into());
         }
@@ -224,6 +230,8 @@ pub enum CexBaselineCartNodeV1 {
 /// remain decodable but cannot be used as an executable model.
 impl CexBaselineModelV1 {
     pub fn validate_inference(&self, features: usize) -> Result<(), String> {
+        #[cfg(test)]
+        MODEL_ADMISSIONS.with(|count| count.set(count.get() + 1));
         if features == 0 || features > MAX_PARAMETERS {
             return Err("model input dimension is invalid".into());
         }
@@ -306,6 +314,17 @@ impl CexBaselineModelV1 {
             }
         }
     }
+
+    /// Validate once and copy only immutable inference parameters. The returned
+    /// object contains no learning histories and cannot be deserialized or edited.
+    pub fn prepare_inference(&self, features: usize) -> Result<PreparedCexBaselineModel, String> {
+        PreparedCexBaselineModel::new(self, features)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static MODEL_ADMISSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -379,6 +398,16 @@ pub fn predict_standardized_ridge(
     features: &[f64],
 ) -> Result<f64, String> {
     validate_ridge(intercept, means, scales, coefficients, features.len())?;
+    predict_validated_ridge(intercept, means, scales, coefficients, features)
+}
+
+fn predict_validated_ridge(
+    intercept: f64,
+    means: &[f64],
+    scales: &[f64],
+    coefficients: &[f64],
+    features: &[f64],
+) -> Result<f64, String> {
     if features.iter().any(|v| !v.is_finite()) {
         return Err("invalid Ridge prediction inputs".into());
     }
@@ -436,6 +465,10 @@ impl CexBaselineCartNodeV1 {
 
     pub fn predict(&self, features: &[f64]) -> Result<f64, String> {
         self.validate_inference(features.len())?;
+        self.predict_validated(features)
+    }
+
+    fn predict_validated(&self, features: &[f64]) -> Result<f64, String> {
         if features.iter().any(|value| !value.is_finite()) {
             return Err("invalid CART prediction inputs".into());
         }
@@ -789,6 +822,80 @@ mod tests {
                 exit_reason: "fixed_update_budget_completed".into(),
             }),
         }
+    }
+
+    #[test]
+    fn prepared_models_admit_once_and_keep_snapshot_and_row_checks() {
+        let mut mlp = portable_baseline_for_validation();
+        if let CexBaselineModelV1::BurnMlpPortableV2 {
+            epochs, learning, ..
+        } = &mut mlp
+        {
+            *epochs = 8192;
+            learning.updates_requested = 8192;
+            learning.updates_completed = 8192;
+            learning.loss_history = vec![0.0; 8193];
+        }
+        let models = [
+            mlp.clone(),
+            CexBaselineModelV1::Ridge {
+                intercept: 0.125,
+                means: vec![0.25],
+                scales: vec![2.0],
+                coefficients: vec![-0.5],
+            },
+            CexBaselineModelV1::ShallowCart {
+                root: CexBaselineCartNodeV1::Split {
+                    feature_index: 0,
+                    threshold: 0.0,
+                    left: Box::new(CexBaselineCartNodeV1::Leaf {
+                        value: -0.25,
+                        sample_count: 4,
+                    }),
+                    right: Box::new(CexBaselineCartNodeV1::Leaf {
+                        value: 0.5,
+                        sample_count: 4,
+                    }),
+                },
+            },
+        ];
+        let rows = [-3.0, 0.0, 0.125, 2.0];
+        for model in models {
+            let expected: Vec<_> = rows
+                .iter()
+                .map(|x| model.predict(&[*x]).unwrap().to_bits())
+                .collect();
+            MODEL_ADMISSIONS.with(|n| n.set(0));
+            let prepared = model.prepare_inference(1).unwrap();
+            for _ in 0..100 {
+                for (row, expected) in rows.iter().zip(&expected) {
+                    assert_eq!(prepared.predict(&[*row]).unwrap().to_bits(), *expected);
+                }
+            }
+            for row in [vec![], vec![0.0, 1.0], vec![f64::NAN], vec![f64::INFINITY]] {
+                assert!(prepared.predict(&row).is_err());
+            }
+            MODEL_ADMISSIONS.with(|n| assert_eq!(n.get(), 1));
+        }
+        let prepared = mlp.prepare_inference(1).unwrap();
+        assert!(prepared.predict(&[f64::MAX]).is_err());
+        if let CexBaselineModelV1::BurnMlpPortableV2 {
+            learning,
+            parameters,
+            ..
+        } = &mut mlp
+        {
+            learning.loss_history[4096] = f64::NAN;
+            parameters.hidden_weight[0] = 9.0;
+        }
+        // A prepared snapshot cannot be changed through the source artifact.
+        assert_eq!(prepared.predict(&[0.5]).unwrap(), 0.5);
+        assert!(mlp.prepare_inference(1).is_err());
+        let mut changed = portable_baseline_for_validation();
+        if let CexBaselineModelV1::BurnMlpPortableV2 { parameters, .. } = &mut changed {
+            parameters.hidden_weight[0] = 2.0;
+        }
+        assert!(changed.prepare_inference(1).is_err());
     }
 
     #[test]
