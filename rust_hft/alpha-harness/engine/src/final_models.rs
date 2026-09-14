@@ -127,7 +127,8 @@ pub fn freeze_supervised_candidate(
         base_costs: alpha_domain::frozen_model::frozen_decision_costs(protocol),
         cross_spread: costs.cross_spread,
     };
-    let history_rows = program.validate()?.history_rows;
+    let prepared = program.prepare()?;
+    let history_rows = prepared.history_rows();
     for (index, expected_prediction) in expected.validation.clone().zip(&fold.predictions) {
         let start = index
             .checked_add(1)
@@ -137,7 +138,7 @@ pub fn freeze_supervised_candidate(
         if rows.iter().any(|row| row.series_id != rows[0].series_id) {
             return Err("frozen model validation history crosses a series boundary".into());
         }
-        let actual = program.predict_from_history(rows.len(), |row, field| {
+        let actual = prepared.predict_from_history(rows.len(), |row, field| {
             rows[row].features.get(field).copied()
         })?;
         if actual.to_bits() != expected_prediction.to_bits() {
@@ -201,7 +202,8 @@ fn evaluate_frozen_rows(
     version: &str,
 ) -> Result<PositionEvaluationReport, String> {
     candidate.validate_against_protocol(protocol)?;
-    let history_rows = candidate.program.validate()?.history_rows;
+    let prepared = candidate.program.prepare()?;
+    let history_rows = prepared.history_rows();
     let mut predictions = vec![0.0; rows.len()];
     let mut positions = vec![0.0; rows.len()];
     let mut start = 0;
@@ -225,11 +227,9 @@ fn evaluate_frozen_rows(
             continue;
         }
         let history = &rows[start..=index];
-        let prediction = candidate
-            .program
-            .predict_from_history(history.len(), |row, field| {
-                history[row].features.get(field).copied()
-            })?;
+        let prediction = prepared.predict_from_history(history.len(), |row, field| {
+            history[row].features.get(field).copied()
+        })?;
         predictions[index] = prediction;
         let spread = if candidate.program.cross_spread {
             *row.features

@@ -2,7 +2,7 @@ use hft_core::{
     top5_book_features, OrderType, Price, Quantity, Side, Symbol, TimeInForce, Top5BookFeatures,
     TOP5_DEPTH,
 };
-use hft_factor_dsl::model_program::FrozenFactorModelV1;
+use hft_factor_dsl::model_program::{FrozenFactorModelV1, PreparedFrozenFactorModel};
 use hft_factor_dsl::{
     evaluate_live_formula_series, validate_live_formula, FactorAst, FactorDslError, FactorOperator,
     FactorTerminal, LiveEventDomain, LiveFormulaCapabilityError,
@@ -82,6 +82,7 @@ pub enum FormulaStrategyError {
 #[derive(Debug)]
 pub struct FormulaStrategy {
     config: FormulaStrategyConfig,
+    prepared_model: Option<PreparedFrozenFactorModel>,
     domain: EventDomain,
     signal_state: SignalState,
     signal_initialized: bool,
@@ -140,14 +141,15 @@ impl FormulaStrategy {
                         .is_none_or(|quantity| quantity.0 > Decimal::ZERO) => {}
             _ => return Err(FormulaStrategyError::InvalidExecutionContract),
         }
+        let mut prepared_model = None;
         let (domain, history_rows, field_names) = match &config.program {
             FormulaProgram::Formula(ast) => {
                 let (domain, rows) = validate_live_ast(ast)?;
                 (domain, rows, formula_fields(ast))
             }
             FormulaProgram::FrozenModel(model) => {
-                let capability = model
-                    .validate()
+                let prepared = model
+                    .prepare()
                     .map_err(FormulaStrategyError::InvalidModelProgram)?;
                 let model_venue = frozen_model_target_venue(model)
                     .ok_or(FormulaStrategyError::InvalidExecutionContract)?;
@@ -168,7 +170,9 @@ impl FormulaStrategy {
                     .collect::<BTreeSet<_>>()
                     .into_iter()
                     .collect();
-                (EventDomain::Snapshot, capability.history_rows, fields)
+                let history_rows = prepared.history_rows();
+                prepared_model = Some(prepared);
+                (EventDomain::Snapshot, history_rows, fields)
             }
         };
         if history_rows > 1 && !config.target_position {
@@ -176,6 +180,7 @@ impl FormulaStrategy {
         }
         Ok(Self {
             config,
+            prepared_model,
             domain,
             signal_state: SignalState::Neutral,
             signal_initialized: false,
@@ -800,12 +805,17 @@ impl Strategy for FormulaStrategy {
             FormulaProgram::Formula(ast) => {
                 evaluate_ast_history(ast, &self.field_names, &self.history)
             }
-            FormulaProgram::FrozenModel(model) => model
-                .predict_from_history(self.history.len(), |row, field| {
-                    let column = self.field_names.iter().position(|name| name == field)?;
-                    self.history.get(row)?.get(column).copied()
+            FormulaProgram::FrozenModel(model) => self
+                .prepared_model
+                .as_ref()
+                .and_then(|prepared| {
+                    prepared
+                        .predict_from_history(self.history.len(), |row, field| {
+                            let column = self.field_names.iter().position(|name| name == field)?;
+                            self.history.get(row)?.get(column).copied()
+                        })
+                        .ok()
                 })
-                .ok()
                 .and_then(|prediction| {
                     let bid = decision.best_bid.to_f64()?;
                     let ask = decision.best_ask.to_f64()?;
