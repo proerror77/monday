@@ -15,7 +15,12 @@ Each arm permits at most one position in the instrument. New opening signals
 are ignored while holding. Entry quantity remains fixed; changing prices or
 predictions cannot create rebalancing orders. At expiry, close first; another
 entry is allowed at a later decision tick, after the previous position is flat.
-Unfilled entry intents do not prove a position or a completed trade. An
+Unfilled entry intents do not prove a position or a completed trade. Native
+replay retains each pre-holding opening signal, with entry disabled near the
+known window end. A zero-fill IOC clears the tentative episode; a later signal
+uses its own clock and expiry. FormulaStrategy clears a rejected entry only
+after a terminal execution receipt bound to its own acknowledged order.
+An
 unresolved exit prevents a new entry. No overlap or same-tick close/reopen
 netting may hide costs.
 
@@ -24,6 +29,10 @@ window. The first implementation rejects an observation gap or a series
 boundary inside an evaluation range; it never uses knowledge of a later gap
 to avoid an earlier entry. Unavailable exit quotes, delayed
 or incomplete fills and safety exits must be retained as explicit exceptions.
+Holding summaries retain incomplete exit orders and delayed exit decisions;
+either blocks replay promotion even if cleanup eventually flattens inventory.
+A completed cleanup cannot open another position on that same tick. The next
+eligible tick may use a fresh opening signal.
 They cannot be presented as clean horizon-complete trades. Safety boundaries
 remain active; an exception must not fabricate a fill or profitability result.
 
@@ -78,3 +87,6 @@ reuse; keep bulk data, models, verification and readback in ACK/OSS. Retain
 signed controls and cumulative accounting. The prior six-group budget is
 exhausted and cannot be reset; genuine available authority must cover the new
 run. A code merge, precheck or submission does not prove a terminal experiment.
+
+A completed fixed holding comparison returns `fixed_comparison_complete` from
+learning. It cannot automatically change the entry policy or create H2/H3.

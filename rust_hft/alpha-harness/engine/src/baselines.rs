@@ -457,7 +457,7 @@ fn evaluate_verified_supervised_model(
     }
     let target_positions = supervised_target_positions(context, &predictions, decision_policy)?;
     let evaluator = FormulaEvaluator::new(artifact.baseline_policy.evaluator_config.clone())?
-        .with_holding_policy(decision_policy.holding.as_ref())?;
+        .with_decision_policy(decision_policy)?;
     let report = evaluator.evaluate_predictions_and_positions(
         context.rows(),
         &predictions,
@@ -643,7 +643,7 @@ pub(crate) fn horizon_target_positions(
     Ok(positions)
 }
 
-fn decision_costs(
+pub(crate) fn decision_costs(
     row: &ResearchRow,
     costs: &alpha_domain::EvaluationCostsV1,
 ) -> Result<CexDecisionCostsV1, String> {

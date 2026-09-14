@@ -263,7 +263,7 @@ fn evaluate_frozen_rows(
         )?;
     }
     let report = FormulaEvaluator::new(candidate.evaluator_config.clone())?
-        .with_holding_policy(candidate.program.decision_policy.holding.as_ref())?
+        .with_decision_policy(&candidate.program.decision_policy)?
         .evaluate_predictions_and_positions(
             rows,
             &predictions,

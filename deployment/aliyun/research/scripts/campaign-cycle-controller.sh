@@ -362,7 +362,7 @@ validate_learning_checkpoint() {
       [[ -s "$dir/next-research-plan.json" ]] || return 1
       plan_sha="$(sha256_file "$dir/next-research-plan.json")" || return 1
       ;;
-    no_improvement) [[ ! -e "$dir/next-research-plan.json" ]] || return 1 ;;
+    no_improvement|fixed_comparison_complete) [[ ! -e "$dir/next-research-plan.json" ]] || return 1 ;;
     *) return 1 ;;
   esac
   jq -e --arg request "$expected_request" --arg result "$expected_result" \
@@ -419,9 +419,9 @@ validate_generation_completion() {
     elif .outcome == "study_handoff" then
       $study_handoff != "" and .cycle_result == null
     elif .outcome == "complete" then
-      if $learned_outcome == "no_improvement" then
+      if $learned_outcome == "no_improvement" or $learned_outcome == "fixed_comparison_complete" then
         .cycle_result == ($report[0] + {
-          termination_reason:"no_improvement",learning_outcome:"no_improvement",
+          termination_reason:$learned_outcome,learning_outcome:$learned_outcome,
           learn_report_url:($campaign_root + "/campaign-id=" + $report[0].campaign_id + "/learning/generation=" + ($generation | tostring) + "/learn-report.json"),
           learn_report_sha256:$learn_report_sha
         })
@@ -2000,7 +2000,7 @@ while ((generation <= max_follow_ups)); do
     oss_publish_readback \
       "$research_plan" "$research_plan_url" \
       "$generation_dir/next-research-plan-readback.json"
-  elif [[ "$learning_outcome" != "no_improvement" ]]; then
+  elif [[ "$learning_outcome" != "no_improvement" && "$learning_outcome" != "fixed_comparison_complete" ]]; then
     die "Campaign learning returned an unsupported outcome: $learning_outcome"
   fi
   log_event stage_completed \
@@ -2010,10 +2010,10 @@ while ((generation <= max_follow_ups)); do
     "failure_class=$(jq -er '.failure_class' "$generation_dir/learn-report.json")" \
     "outcome=$learning_outcome" \
     "learn_report_sha256=$(sha256_file "$generation_dir/learn-report.json")"
-  if [[ "$learning_outcome" == "no_improvement" ]]; then
-    commit_generation_completion complete "$(jq --arg learn_report_url "$learn_report_url" \
+  if [[ "$learning_outcome" == "no_improvement" || "$learning_outcome" == "fixed_comparison_complete" ]]; then
+    commit_generation_completion complete "$(jq --arg outcome "$learning_outcome" --arg learn_report_url "$learn_report_url" \
       --arg learn_report_sha256 "$(sha256_file "$generation_dir/learn-report.json")" \
-      '. + {termination_reason:"no_improvement",learning_outcome:"no_improvement",learn_report_url:$learn_report_url,learn_report_sha256:$learn_report_sha256}' \
+      '. + {termination_reason:$outcome,learning_outcome:$outcome,learn_report_url:$learn_report_url,learn_report_sha256:$learn_report_sha256}' \
       "$generation_dir/generation-report.json")"
     publish_cycle_checkpoint "$generation_dir"
     rm -f -- "$request" "$submission"
@@ -2021,7 +2021,7 @@ while ((generation <= max_follow_ups)); do
     log_event cycle_completed \
       "generation=$generation" \
       "campaign_id=$campaign_id" \
-      "termination_reason=no_improvement" \
+      "termination_reason=$learning_outcome" \
       "campaign_result_sha256=$result_sha256"
     jq . "$work_dir/cycle-result.json"
     exit 0

@@ -435,6 +435,7 @@ struct CampaignStudyProposalReport {
 enum CampaignLearnOutcomeV1 {
     FollowUp,
     NoImprovement,
+    FixedComparisonComplete,
 }
 
 #[derive(Debug)]
@@ -540,13 +541,19 @@ pub fn learn(args: CampaignLearnArgs) -> anyhow::Result<()> {
     validate_negative_campaign_result(&loaded, &result, &result_sha256)?;
     let failure_class = classify_campaign_failure(&result)?;
     let evidence_signature = campaign_research_evidence_signature(&loaded.request, &result)?;
-    if campaign_has_no_improvement(&loaded.request, &evidence_signature) {
+    if loaded.request.research_plan.holding.is_some()
+        || campaign_has_no_improvement(&loaded.request, &evidence_signature)
+    {
         let report = CampaignLearnReport {
             parent_campaign_id: loaded.request.campaign_id.clone(),
             parent_request_sha256: loaded.sha256.clone(),
             parent_campaign_result_sha256: result_sha256,
             failure_class,
-            outcome: CampaignLearnOutcomeV1::NoImprovement,
+            outcome: if loaded.request.research_plan.holding.is_some() {
+                CampaignLearnOutcomeV1::FixedComparisonComplete
+            } else {
+                CampaignLearnOutcomeV1::NoImprovement
+            },
             evidence_signature,
             learning_directive_sha256: None,
             search_policy_revision_id: None,
@@ -1022,6 +1029,9 @@ fn next_campaign_policy_revision(
     CexCampaignSearchPolicyRevisionV1,
     CexCampaignLearningDirectiveV1,
 )> {
+    if loaded.request.research_plan.holding.is_some() {
+        bail!("fixed holding comparison has no automatic follow-up; retain all arm results");
+    }
     let preferred_position_policy = match failure_class {
         CexCampaignFailureClassV1::NoTradesAfterCosts => {
             CexCampaignPositionPolicyV1::PredictionIdentity
@@ -4441,6 +4451,27 @@ mod tests {
                     )
                 })
                 .collect(),
+        }
+    }
+
+    #[test]
+    fn fixed_holding_comparison_never_changes_the_entry_policy_on_failure() {
+        let mut loaded = loaded_request_for_learning();
+        loaded.request.research_plan.holding =
+            Some(hft_research_manifest::model::HorizonHoldingPolicyV1 {
+                horizon_millis: 5000,
+            });
+        for failure in [
+            CexCampaignFailureClassV1::NoTradesAfterCosts,
+            CexCampaignFailureClassV1::OvertradeCapacity,
+            CexCampaignFailureClassV1::PositiveIcNegativeNet,
+        ] {
+            assert!(
+                next_campaign_policy_revision(&loaded, &"c".repeat(64), failure)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("no automatic follow-up")
+            );
         }
     }
 

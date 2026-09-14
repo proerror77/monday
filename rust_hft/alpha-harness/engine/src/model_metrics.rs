@@ -245,7 +245,7 @@ pub fn verify_model_ledger_from_dataset(
         );
     }
     let expected = crate::formula_evaluator::FormulaEvaluator::new(evaluator_config.clone())?
-        .with_holding_policy(evaluation.candidate.decision_policy.holding.as_ref())?
+        .with_decision_policy(&evaluation.candidate.decision_policy)?
         .evaluate_predictions_and_positions(
             context.rows(),
             &evaluation.predictions,
@@ -951,6 +951,7 @@ mod tests {
 
     fn point(index: usize, date: u32, hour: u32, fold: usize, net: f64) -> PositionEvaluationPoint {
         PositionEvaluationPoint {
+            entry_target: None,
             row_index: index,
             series_id: 1,
             available_time: Utc.with_ymd_and_hms(2026, 9, date, hour, 0, 0).unwrap(),

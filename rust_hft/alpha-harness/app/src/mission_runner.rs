@@ -633,6 +633,15 @@ impl CexEventReplayReceiptV1 {
         {
             bail!("replay holding summary does not bind its declared policy");
         }
+        if self.gate.passed
+            && self
+                .metrics
+                .holding
+                .as_ref()
+                .is_some_and(|h| h.incomplete_exit_orders > 0 || h.delayed_exit_decisions > 0)
+        {
+            bail!("exceptional holding evidence cannot pass the replay gate");
+        }
         if current_schema && !self.replay_config.cross_spread {
             bail!(
                 "current CEX event replay requires cross_spread=true; passive or mid-queue execution is unsupported"
@@ -2642,7 +2651,32 @@ fn run_factor_bank_subset_search(
     }
 }
 
+fn holding_opening_signals(
+    report: &alpha_engine::formula_evaluator::PositionEvaluationReport,
+    held: bool,
+) -> anyhow::Result<Option<std::collections::BTreeMap<i64, f64>>> {
+    if !held {
+        return Ok(None);
+    }
+    let mut signals = std::collections::BTreeMap::new();
+    for point in &report.ledger {
+        let value = point
+            .entry_target
+            .context("held model ledger lacks an opening signal")?;
+        if !value.is_finite()
+            || value.abs() > 1.0
+            || signals
+                .insert(point.available_time.timestamp_micros(), value)
+                .is_some()
+        {
+            bail!("held opening signal or clock is invalid");
+        }
+    }
+    Ok(Some(signals))
+}
+
 struct CexReplayCandidateInput {
+    openings: Option<std::collections::BTreeMap<i64, f64>>,
     holding: Option<hft_research_manifest::model::HorizonHoldingPolicyV1>,
     reference: CexResearchContentRefV1,
     positions: Vec<f64>,
@@ -2692,6 +2726,7 @@ fn run_cex_event_replay(
             .collect::<Vec<_>>(),
         feature_decision_clocks,
         CexReplayCandidateInput {
+            openings: None,
             holding: None,
             reference: content_reference(&strategy.artifact_id, strategy)?,
             positions,
@@ -2752,6 +2787,10 @@ fn run_cex_supervised_event_replay(
             .collect::<Vec<_>>(),
         feature_decision_clocks,
         CexReplayCandidateInput {
+            openings: holding_opening_signals(
+                &evaluation.report,
+                evaluation.candidate.decision_policy.holding.is_some(),
+            )?,
             holding: evaluation.candidate.decision_policy.holding.clone(),
             reference: content_reference(&evaluation.candidate.artifact_id, &evaluation.candidate)?,
             positions: evaluation.target_positions.clone(),
@@ -2830,6 +2869,10 @@ pub(crate) fn run_frozen_model_event_replay(
         &observations,
         &clocks,
         CexReplayCandidateInput {
+            openings: holding_opening_signals(
+                report,
+                frozen.program.decision_policy.holding.is_some(),
+            )?,
             holding: frozen.program.decision_policy.holding.clone(),
             reference: content_reference(&frozen.artifact_id, frozen)?,
             positions: report
@@ -2946,8 +2989,14 @@ fn run_cex_target_position_replay(
     {
         bail!("CEX replay feature clock drifted across PIT series boundaries");
     }
-    let (decisions, _non_forced_decision_count) =
+    let (mut decisions, _non_forced_decision_count) =
         canonical_target_position_decisions(feature_decision_clocks, candidate_positions)?;
+    if let Some(openings) = &candidate.openings {
+        for decision in &mut decisions {
+            decision.entry_target =
+                Some(openings.get(&decision.timestamp_us).copied().unwrap_or(0.0));
+        }
+    }
     let first_decision_time = decisions
         .first()
         .context("CEX event replay has no pre-holdout decisions")?
@@ -3053,6 +3102,13 @@ fn run_cex_target_position_replay(
         true_capacity: false,
     };
     let mut failures = Vec::new();
+    if metrics
+        .holding
+        .as_ref()
+        .is_some_and(|h| h.incomplete_exit_orders > 0 || h.delayed_exit_decisions > 0)
+    {
+        failures.push("holding episode has an incomplete or delayed exit decision".into());
+    }
     if metrics.snapshot_events + metrics.l2_update_events < policy.min_book_events {
         failures.push("book event count is below the frozen replay minimum".to_string());
     }
@@ -3205,6 +3261,7 @@ fn canonical_target_position_decisions(
             bail!("CEX replay decisions are not strictly ordered");
         }
         decisions.push(TargetPositionDecision {
+            entry_target: None,
             timestamp_us: feature_time_us,
             target_position,
         });
@@ -3221,6 +3278,7 @@ fn canonical_target_position_decisions(
                 bail!("CEX replay series close decisions are not strictly ordered");
             }
             decisions.push(TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: close_time_us,
                 target_position: 0.0,
             });
@@ -5121,6 +5179,7 @@ pub(crate) mod tests {
             .ledger
             .iter()
             .map(|point| TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: point.available_time.timestamp_micros(),
                 target_position: point.target_position,
             })
@@ -8367,6 +8426,25 @@ pub(crate) mod tests {
             &std::fs::read(results_dir.join("cex-event-replay-receipt.json")).unwrap(),
         )
         .unwrap();
+        for (incomplete, delayed) in [(1, 0), (0, 1)] {
+            let mut exceptional = current.clone();
+            exceptional.replay_config.holding =
+                Some(hft_research_manifest::model::HorizonHoldingPolicyV1 {
+                    horizon_millis: 5000,
+                });
+            exceptional.metrics.holding = Some(hft_backtest::engine::HorizonExecutionSummaryV1 {
+                planned_signal_horizon_micros: 5_000_000,
+                incomplete_exit_orders: incomplete,
+                delayed_exit_decisions: delayed,
+                ..Default::default()
+            });
+            exceptional.gate.passed = true;
+            assert!(exceptional
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("exceptional holding evidence"));
+        }
         let historical = historical_v3_replay_receipt(&current);
         std::fs::write(
             results_dir.join("cex-event-replay-receipt.json"),

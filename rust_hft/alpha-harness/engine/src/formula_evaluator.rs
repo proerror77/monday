@@ -24,12 +24,17 @@ mod holding_ledger;
 pub struct FormulaEvaluator {
     config: FormulaEvaluatorConfig,
     governed_gp_policy: Option<CexGpPolicyV1>,
+    entry_policy: Option<hft_research_manifest::model::CexSupervisedDecisionPolicyV2>,
     holding: Option<hft_research_manifest::model::HorizonHoldingPolicyV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PositionEvaluationPoint {
+    /// Cost-aware opening signal before holding, with predeclared tail entries
+    /// disabled. Event replay can reconsider it after a zero-fill IOC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_target: Option<f64>,
     pub row_index: usize,
     pub series_id: u64,
     pub available_time: chrono::DateTime<chrono::Utc>,
@@ -194,6 +199,7 @@ impl FormulaEvaluator {
         Ok(Self {
             config,
             governed_gp_policy: None,
+            entry_policy: None,
             holding: None,
         })
     }
@@ -317,6 +323,15 @@ impl FormulaEvaluator {
             evaluator_version,
             protocol,
         )
+    }
+
+    pub fn with_decision_policy(
+        mut self,
+        policy: &hft_research_manifest::model::CexSupervisedDecisionPolicyV2,
+    ) -> Result<Self, String> {
+        policy.validate()?;
+        self.entry_policy = policy.holding.as_ref().map(|_| policy.clone());
+        self.with_holding_policy(policy.holding.as_ref())
     }
 
     pub fn with_holding_policy(
@@ -511,6 +526,7 @@ impl FormulaEvaluator {
         let mut ledger = Vec::new();
         let mut equity = 1.0_f64;
         for (fold_index, range) in ranges.into_iter().enumerate() {
+            let end_clock = rows[range.end - 1].available_time.timestamp_micros();
             let (points, trade_count, total_turnover, max_book_depth_fraction) =
                 if let Some(holding) = &self.holding {
                     holding_ledger::evaluate(
@@ -535,7 +551,31 @@ impl FormulaEvaluator {
                 .collect::<Vec<_>>();
             for point in points {
                 equity += point.net_return;
+                let entry_target = self
+                    .entry_policy
+                    .as_ref()
+                    .map(|policy| {
+                        let horizon = policy.holding.as_ref().unwrap().duration_micros()?;
+                        if point
+                            .available_time
+                            .timestamp_micros()
+                            .checked_add(i64::try_from(horizon).map_err(|e| e.to_string())?)
+                            .is_none_or(|due| due > end_clock)
+                        {
+                            return Ok::<f64, String>(0.0);
+                        }
+                        policy.target_position(
+                            predictions[point.row_index],
+                            0.0,
+                            crate::baselines::decision_costs(
+                                &rows[point.row_index],
+                                &protocol.costs,
+                            )?,
+                        )
+                    })
+                    .transpose()?;
                 ledger.push(PositionEvaluationPoint {
+                    entry_target,
                     row_index: point.row_index,
                     series_id: point.series_id,
                     available_time: point.available_time,

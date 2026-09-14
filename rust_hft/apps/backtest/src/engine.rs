@@ -40,6 +40,8 @@ pub const TARGET_POSITION_REPLAY_TRACE_SCHEMA_VERSION: &str = "hft-target-positi
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TargetPositionDecision {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_target: Option<f64>,
     pub timestamp_us: i64,
     pub target_position: f64,
 }
@@ -479,6 +481,10 @@ impl<'a> TargetPositionReplay<'a> {
         let funding_cost = self.inventory.abs() * mid * self.config.funding_bps / BPS;
         self.cash -= funding_cost;
         self.total_funding_cost += funding_cost;
+        if self.horizon_cleanup_only && self.inventory.abs() <= f64::EPSILON {
+            // The prior tick completed cleanup. A fresh signal may enter now.
+            self.horizon_cleanup_only = false;
+        }
         let horizon_action = if let Some(holding) = &self.config.holding {
             if self.horizon_cleanup_only {
                 None
@@ -488,8 +494,12 @@ impl<'a> TargetPositionReplay<'a> {
                         .advance(
                             holding,
                             u64::try_from(decision.timestamp_us)?,
-                            true,
-                            Some(decision.target_position),
+                            u64::try_from(decision.timestamp_us)?
+                                .checked_add(holding.duration_micros().map_err(anyhow::Error::msg)?)
+                                .is_some_and(|due| {
+                                    due <= self.decisions.last().unwrap().timestamp_us as u64
+                                }),
+                            decision.entry_target,
                         )
                         .map_err(anyhow::Error::msg)?,
                 )
@@ -507,11 +517,11 @@ impl<'a> TargetPositionReplay<'a> {
                             anyhow::bail!("horizon entry overlaps existing inventory");
                         }
                         let price = if target > 0.0 {
-                            self.displayed_budget.best_ask()
+                            self.book.best_ask()
                         } else {
-                            self.displayed_budget.best_bid()
+                            self.book.best_bid()
                         }
-                        .and_then(|level| level.0.to_f64())
+                        .map(|level| level.0)
                         .context("horizon entry has no executable quote")?;
                         target * self.config.position_notional_usd / price
                     }
@@ -682,6 +692,13 @@ impl<'a> TargetPositionReplay<'a> {
             }
         }
 
+        if matches!(horizon_action, Some(HorizonPositionAction::Enter(_)))
+            && filled_quantity <= f64::EPSILON
+        {
+            self.horizon_state
+                .reject_entry(u64::try_from(decision.timestamp_us)?)
+                .map_err(anyhow::Error::msg)?;
+        }
         let equity_after = self.cash + self.inventory * mid;
         self.max_abs_inventory_ratio = self
             .max_abs_inventory_ratio
@@ -715,7 +732,11 @@ impl<'a> TargetPositionReplay<'a> {
             order_timestamp_us: decision.timestamp_us,
             arrival_timestamp_us: arrival_ts_us,
             time_in_force: "IOC".to_string(),
-            target_position: decision.target_position,
+            target_position: if self.config.holding.is_some() {
+                horizon_action.map_or(0.0, HorizonPositionAction::target)
+            } else {
+                decision.target_position
+            },
             side,
             order_type: side.map(|_| OrderType::Market),
             requested_quantity,
@@ -920,6 +941,12 @@ fn validate_target_replay_inputs(
         );
     }
     if let Some(holding) = &config.holding {
+        if decisions.iter().any(|d| {
+            d.entry_target
+                .is_none_or(|v| !v.is_finite() || v.abs() > 1.0)
+        }) {
+            anyhow::bail!("held replay requires bounded opening signals at every decision");
+        }
         let duration = holding.duration_micros().map_err(anyhow::Error::msg)?;
         let last = u64::try_from(
             decisions
@@ -931,6 +958,13 @@ fn validate_target_replay_inputs(
         for decision in decisions {
             let now = u64::try_from(decision.timestamp_us)?;
             let can_enter = now.checked_add(duration).is_some_and(|due| due <= last);
+            if !can_enter
+                && decision
+                    .entry_target
+                    .is_some_and(|v| v.abs() > f64::EPSILON)
+            {
+                anyhow::bail!("opening signal exceeds the predeclared holding window");
+            }
             let action = state
                 .advance(holding, now, can_enter, Some(decision.target_position))
                 .map_err(anyhow::Error::msg)?;
@@ -2732,6 +2766,7 @@ mod tests {
                         "event": if t == 0 { "snapshot" } else { "l2_update" }, "bids": bids, "asks": asks }).to_string());
                     tape.push('\n');
                     decisions.push(TargetPositionDecision {
+                        entry_target: Some(if t == 0 { target } else { 0.0 }),
                         timestamp_us: ((t + 1) * 1_000_000) as i64,
                         target_position: if t == seconds { 0.0 } else { target },
                     });
@@ -2790,10 +2825,14 @@ mod tests {
             "{\"timestamp\":3000000,\"sequence\":3,\"event\":\"l2_update\",\"bids\":[[99,10]],\"asks\":[[101,10]]}\n",
             "{\"timestamp\":4000000,\"sequence\":4,\"event\":\"l2_update\",\"bids\":[[99,10]],\"asks\":[[101,10]]}\n",
         );
-        let decisions: Vec<_> = [0.5, 0.0, -0.5, 0.0]
+        let tape = format!("{}{}{}", tape,
+            "{\"timestamp\":5000000,\"sequence\":5,\"event\":\"l2_update\",\"bids\":[[99,10]],\"asks\":[[101,10]]}\n",
+            "{\"timestamp\":6000000,\"sequence\":6,\"event\":\"l2_update\",\"bids\":[[99,10]],\"asks\":[[101,10]]}\n");
+        let decisions: Vec<_> = [0.5, 0.0, -0.5, 0.0, -0.5, 0.0]
             .into_iter()
             .enumerate()
             .map(|(t, target_position)| TargetPositionDecision {
+                entry_target: Some(target_position),
                 timestamp_us: (t as i64 + 1) * 1_000_000,
                 target_position,
             })
@@ -2805,7 +2844,65 @@ mod tests {
         assert!(output.metrics.max_residual_quantity > 0.0);
         assert_eq!(trace[2].inventory_after, 0.0);
         assert!(trace[3].side.is_none());
-        assert_eq!(output.metrics.order_count, 3); // entry, partial exit, cleanup only
+        assert_eq!(output.metrics.order_count, 5);
+        assert!(trace[4].inventory_after < 0.0);
+        assert_eq!(trace[5].inventory_after, 0.0); // entry, partial exit, cleanup only
+    }
+
+    #[test]
+    fn horizon_replay_retries_a_zero_fill_with_the_new_signal_clock() {
+        let mut config = holding_replay_config(5);
+        config.market = "spot".into();
+        config.order_latency_us = 0;
+        let mut tape = String::new();
+        let decisions: Vec<_> = (0..7)
+            .map(|i| {
+                tape.push_str(
+                    &serde_json::json!({"timestamp":(i+1)*1_000_000,"sequence":i+1,
+                "event":if i==0 {"snapshot"} else {"l2_update"},"bids":[[99,10]],"asks":[[101,10]]})
+                    .to_string(),
+                );
+                tape.push('\n');
+                TargetPositionDecision {
+                    timestamp_us: (i + 1) * 1_000_000,
+                    target_position: if i < 5 { 0.005 } else { 0.0 },
+                    entry_target: Some(if i == 0 {
+                        0.005
+                    } else if i == 1 {
+                        0.5
+                    } else {
+                        0.0
+                    }),
+                }
+            })
+            .collect();
+        let mut rules = spot_replay_rules();
+        rules.lot_size_filter.min_quantity = "0.1".into();
+        rules.market_lot_size_filter.as_mut().unwrap().min_quantity = "0.1".into();
+        let output = replay_target_positions_with_trace_and_spot_rules(
+            tape.as_bytes(),
+            &decisions,
+            &config,
+            Some(&rules),
+        )
+        .unwrap();
+        let trace = tape_trace_events(&output.trace_bytes);
+        assert_eq!(trace[0].filled_quantity, 0.0);
+        assert!(trace[1].filled_quantity > 0.0);
+        assert!(
+            trace[5].side.is_none(),
+            "the rejected first signal cannot set the new exit deadline"
+        );
+        assert!(trace[6].filled_quantity > 0.0);
+        assert_eq!(
+            output
+                .metrics
+                .holding
+                .as_ref()
+                .unwrap()
+                .max_actual_holding_micros,
+            Some(5_000_000)
+        );
     }
 
     #[test]
@@ -2817,14 +2914,17 @@ mod tests {
         );
         let decisions = vec![
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 1_000_000,
                 target_position: 1.0,
             },
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 2_000_000,
                 target_position: -1.0,
             },
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 3_000_000,
                 target_position: 0.0,
             },
@@ -2881,10 +2981,12 @@ mod tests {
         );
         let decisions = vec![
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 1_000_000,
                 target_position: 0.5,
             },
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 2_000_000,
                 target_position: 0.0,
             },
@@ -2930,14 +3032,17 @@ mod tests {
         );
         let decisions = [
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 1_000_000,
                 target_position: 1.0,
             },
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 2_000_000,
                 target_position: 0.5,
             },
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 3_000_000,
                 target_position: 0.0,
             },
@@ -2993,10 +3098,12 @@ mod tests {
         );
         let decisions = [
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 1_500_000,
                 target_position: 0.5,
             },
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 2_500_000,
                 target_position: 0.0,
             },
@@ -3131,10 +3238,12 @@ mod tests {
         );
         let decisions = [
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 1_000_000,
                 target_position: 0.3,
             },
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 2_000_000,
                 target_position: 0.0,
             },
@@ -3187,10 +3296,12 @@ mod tests {
         );
         let decisions = [
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 1_500_000,
                 target_position: 0.5,
             },
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 2_500_000,
                 target_position: 0.0,
             },
@@ -3249,10 +3360,12 @@ mod tests {
         );
         let decisions = [
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 1_000_000,
                 target_position: 1.0,
             },
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 3_000_000,
                 target_position: 0.0,
             },
@@ -3303,10 +3416,12 @@ mod tests {
         );
         let decisions = [
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 4_900_000,
                 target_position: 1.0,
             },
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 6_500_000,
                 target_position: 0.0,
             },
@@ -3350,6 +3465,7 @@ mod tests {
             "{\"timestamp\":5000000,\"sequence\":2,\"event\":\"trade\",\"side\":\"buy\",\"price\":101,\"quantity\":1}\n",
         );
         let decisions = [TargetPositionDecision {
+            entry_target: None,
             timestamp_us: 4_900_000,
             target_position: 1.0,
         }];
@@ -3386,10 +3502,12 @@ mod tests {
         );
         let decisions = [
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 1_000_000,
                 target_position: 1.0,
             },
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 2_000_000,
                 target_position: 0.0,
             },
@@ -3441,14 +3559,17 @@ mod tests {
         );
         let decisions = [
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 1_000_000,
                 target_position: 1.0,
             },
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 2_000_000,
                 target_position: -1.0,
             },
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 3_000_000,
                 target_position: 0.0,
             },
@@ -3491,14 +3612,17 @@ mod tests {
         );
         let decisions = [
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 1_000_000,
                 target_position: 0.5,
             },
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 2_000_000,
                 target_position: 1.0,
             },
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 3_000_000,
                 target_position: 0.0,
             },
@@ -3549,6 +3673,7 @@ mod tests {
             trade_tape_declared: false,
         };
         let decisions = [TargetPositionDecision {
+            entry_target: None,
             timestamp_us: 1,
             target_position: 0.0,
         }];
@@ -3579,6 +3704,7 @@ mod tests {
             trade_tape_declared: false,
         };
         let decisions = [TargetPositionDecision {
+            entry_target: None,
             timestamp_us: 1,
             target_position: 0.0,
         }];
@@ -3610,14 +3736,17 @@ mod tests {
         );
         let decisions = [
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 1_000_000,
                 target_position: 1.0,
             },
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 2_000_000,
                 target_position: 1.0,
             },
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 3_000_000,
                 target_position: 0.0,
             },
@@ -3654,6 +3783,7 @@ mod tests {
             "{\"timestamp\":2000000,\"sequence\":2,\"event\":\"snapshot\",\"bids\":[[89,10]],\"asks\":[[91,10]]}\n",
         );
         let decisions = [TargetPositionDecision {
+            entry_target: None,
             timestamp_us: 1_000_000,
             target_position: 1.0,
         }];
@@ -3687,14 +3817,17 @@ mod tests {
         );
         let decisions = [
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 1_000_000,
                 target_position: 1.0,
             },
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 2_000_000,
                 target_position: 0.0,
             },
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 5_000_000,
                 target_position: 0.0,
             },
@@ -3732,18 +3865,22 @@ mod tests {
         );
         let decisions = [
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 1_000_000,
                 target_position: 1.0,
             },
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 2_000_000,
                 target_position: 0.0,
             },
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 10_000_000,
                 target_position: 1.0,
             },
             TargetPositionDecision {
+                entry_target: None,
                 timestamp_us: 11_000_000,
                 target_position: 0.0,
             },
@@ -3777,6 +3914,7 @@ mod tests {
             "{\"timestamp\":2000000,\"sequence\":2,\"event\":\"l2_update\",\"bids\":[[99,0],[109,10]],\"asks\":[[101,0],[111,10]]}\n",
         );
         let decisions = [TargetPositionDecision {
+            entry_target: None,
             timestamp_us: 1_000_000,
             target_position: 1.0,
         }];

@@ -83,10 +83,12 @@ fn cli_replays_local_canonical_parquet_without_raw_sources_and_records_evidence(
     let manifest_sha = sha256(&manifest_bytes);
     let decisions = vec![
         TargetPositionDecision {
+            entry_target: None,
             timestamp_us: 100,
             target_position: 0.0,
         },
         TargetPositionDecision {
+            entry_target: None,
             timestamp_us: 200,
             target_position: 0.0,
         },

@@ -83,6 +83,7 @@ pub enum FormulaStrategyError {
 
 #[derive(Debug)]
 pub struct FormulaStrategy {
+    horizon_pending_entry: Option<(u64, Option<hft_core::OrderId>, bool)>,
     horizon_state: HorizonPositionState,
     horizon_exit_pending: bool,
     config: FormulaStrategyConfig,
@@ -183,6 +184,7 @@ impl FormulaStrategy {
             return Err(FormulaStrategyError::StatefulFormulaRequiresTargetPosition);
         }
         Ok(Self {
+            horizon_pending_entry: None,
             horizon_state: HorizonPositionState::default(),
             horizon_exit_pending: false,
             config,
@@ -911,17 +913,81 @@ impl Strategy for FormulaStrategy {
             },
             Some(decision.bucket),
         );
-        if entered && intents.is_empty() {
-            let _ = self.horizon_state.reject_entry(timestamp);
+        if entered {
+            if intents.is_empty() {
+                let _ = self.horizon_state.reject_entry(timestamp);
+            } else {
+                self.horizon_pending_entry = Some((timestamp, None, false));
+            }
         }
         intents
     }
 
     fn on_execution_event(
         &mut self,
-        _event: &ExecutionEvent,
-        _account: &AccountView,
+        event: &ExecutionEvent,
+        account: &AccountView,
     ) -> Vec<OrderIntent> {
+        let Some((opened, order, filled)) = &mut self.horizon_pending_entry else {
+            return Vec::new();
+        };
+        match event {
+            ExecutionEvent::OrderNew {
+                order_id,
+                symbol,
+                strategy_id,
+                ..
+            } if order.is_none()
+                && symbol == &self.config.symbol
+                && strategy_id == &self.config.name =>
+            {
+                *order = Some(order_id.clone());
+            }
+            ExecutionEvent::Fill {
+                order_id, quantity, ..
+            } if order.as_ref() == Some(order_id) && quantity.0 > Decimal::ZERO => {
+                *filled = true;
+            }
+            ExecutionEvent::OrderCanceled { order_id, .. }
+            | ExecutionEvent::OrderReject { order_id, .. }
+                if order.as_ref() == Some(order_id) =>
+            {
+                if !*filled
+                    && account
+                        .positions
+                        .get(&self.config.symbol)
+                        .is_none_or(|p| p.quantity.0 == Decimal::ZERO)
+                {
+                    let _ = self.horizon_state.reject_entry(*opened);
+                    self.pending_target = None;
+                    self.target_position = None;
+                    self.signal_initialized = false;
+                    self.last_signal = None;
+                }
+                self.horizon_pending_entry = None;
+            }
+            ExecutionEvent::OrderCompleted {
+                order_id,
+                total_filled,
+                ..
+            } if order.as_ref() == Some(order_id) => {
+                if !*filled
+                    && total_filled.0 == Decimal::ZERO
+                    && account
+                        .positions
+                        .get(&self.config.symbol)
+                        .is_none_or(|p| p.quantity.0 == Decimal::ZERO)
+                {
+                    let _ = self.horizon_state.reject_entry(*opened);
+                    self.pending_target = None;
+                    self.target_position = None;
+                    self.signal_initialized = false;
+                    self.last_signal = None;
+                }
+                self.horizon_pending_entry = None;
+            }
+            _ => {}
+        }
         Vec::new()
     }
 
@@ -1382,6 +1448,76 @@ mod tests {
             cross_spread: false,
         }));
         target
+    }
+
+    #[test]
+    fn frozen_horizon_canceled_entry_waits_for_its_own_receipt_then_retries() {
+        let mut config = frozen_model_config("usdm");
+        config.cross_spread = Some(true);
+        let FormulaProgram::FrozenModel(model) = &mut config.program else {
+            unreachable!()
+        };
+        model.cross_spread = true;
+        model.decision_policy =
+            hft_research_manifest::model::CexSupervisedDecisionPolicyV2::hold_to_horizon_v3(5000)
+                .unwrap();
+        let mut strategy = FormulaStrategy::new(config).unwrap();
+        let account = AccountView::default();
+        let first = target_intents(
+            &mut strategy,
+            &snapshot_at(3, 1, 1_000_000),
+            &account,
+            1_000_000,
+        );
+        assert_eq!(first.len(), 1);
+        strategy.on_execution_event(
+            &ExecutionEvent::OrderCanceled {
+                order_id: hft_core::OrderId("foreign".into()),
+                timestamp: 1_500_000,
+            },
+            &account,
+        );
+        assert!(target_intents(
+            &mut strategy,
+            &snapshot_at(3, 1, 2_000_000),
+            &account,
+            2_000_000
+        )
+        .is_empty());
+        let id = hft_core::OrderId("owned".into());
+        strategy.on_execution_event(
+            &ExecutionEvent::OrderNew {
+                order_id: id.clone(),
+                client_order_id: None,
+                account_id: None,
+                symbol: first[0].symbol.clone(),
+                side: first[0].side,
+                quantity: first[0].quantity,
+                requested_price: first[0].price,
+                arrival_price: first[0].price,
+                timestamp: 1_000_000,
+                venue: first[0].target_venue,
+                strategy_id: first[0].strategy_id.clone(),
+            },
+            &account,
+        );
+        strategy.on_execution_event(
+            &ExecutionEvent::OrderCanceled {
+                order_id: id,
+                timestamp: 2_500_000,
+            },
+            &account,
+        );
+        assert_eq!(
+            target_intents(
+                &mut strategy,
+                &snapshot_at(3, 1, 3_000_000),
+                &account,
+                3_000_000
+            )
+            .len(),
+            1
+        );
     }
 
     #[test]
