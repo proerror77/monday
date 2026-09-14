@@ -559,7 +559,7 @@ fn guarded_long_training_keeps_original_return_parity_and_rejects_diagnostic_tam
 }
 
 #[test]
-fn guarded_training_retains_exact_shorter_budget_prefix_without_early_stopping() {
+fn guarded_training_retains_exact_prefix_before_minimum_updates() {
     let rows = serde_json::to_vec(&training_rows()).unwrap();
     let short = train_contract_model(&rows, &controlled_request(&rows, 64, 0.001)).unwrap();
     let long = train_contract_model(&rows, &controlled_request(&rows, 128, 0.001)).unwrap();
@@ -586,8 +586,69 @@ fn guarded_training_retains_exact_shorter_budget_prefix_without_early_stopping()
         long.stability.as_ref().unwrap().convergence.status,
         hft_research_ml::MlpConvergenceStatusV1::BudgetExhaustedNotConverged
     );
-    assert_eq!(long.exit_reason, "fixed_update_budget_completed");
+    assert_eq!(long.exit_reason, "update_budget_exhausted_not_converged");
     assert_eq!(long.updates_completed, 128);
+}
+
+#[test]
+fn convergence_stops_at_first_eligible_training_checkpoint_and_survives_save_load() {
+    let rows = training_rows();
+    let bytes = serde_json::to_vec(&rows).unwrap();
+    let original = controlled_request(&bytes, 64, 1e-12);
+    let mut value = serde_json::to_value(original.request()).unwrap();
+    // Negligible optimizer steps give this software fixture a stable loss.
+    // The configured minimum, rather than a validation metric, must stop it.
+    value["config"]["optimization"]["convergence"]["minimum_updates"] = 8.into();
+    value["config"]["optimization"]["convergence"]["window_updates"] = 2.into();
+    let seal = |value: &serde_json::Value| {
+        let bytes = serde_json::to_vec(value).unwrap();
+        SealedTrainingRequest::from_bytes(&bytes, &Sha256Digest::of_bytes(&bytes)).unwrap()
+    };
+    let trained = train_contract_model(&bytes, &seal(&value)).unwrap();
+    let learning = &trained.diagnostics().learning;
+    assert_eq!(learning.updates_requested, 64);
+    assert_eq!(learning.updates_completed, 8);
+    assert_eq!(learning.loss_history.len(), 9);
+    assert_eq!(learning.exit_reason, "training_converged");
+    let output = tempfile::tempdir().unwrap();
+    let saved = trained.save_bundle(output.path()).unwrap();
+    let loaded = load_contract_model_bundle(&saved.manifest_path, &saved.manifest_sha256).unwrap();
+    for row in &rows {
+        assert_eq!(
+            trained.predict(&row.features).unwrap().to_bits(),
+            loaded.predict(&row.features).unwrap().to_bits()
+        );
+    }
+    let mut edited = learning.clone();
+    edited.exit_reason = "fixed_update_budget_completed".into();
+    assert!(edited.validate().is_err());
+    let mut edited = learning.clone();
+    edited
+        .stability
+        .as_mut()
+        .unwrap()
+        .controls
+        .convergence
+        .minimum_updates = 16;
+    assert!(edited.validate().is_err());
+    value["config"]["optimization"]
+        .as_object_mut()
+        .unwrap()
+        .remove("stop_on_convergence");
+    let historical = train_contract_model(&bytes, &seal(&value)).unwrap();
+    assert_eq!(historical.diagnostics().learning.updates_completed, 64);
+    assert_eq!(
+        historical.diagnostics().learning.exit_reason,
+        "fixed_update_budget_completed"
+    );
+    assert_eq!(
+        learning.initial_parameters_sha256,
+        historical.diagnostics().learning.initial_parameters_sha256
+    );
+    assert_eq!(
+        learning.loss_history,
+        historical.diagnostics().learning.loss_history[..9]
+    );
 }
 
 #[test]

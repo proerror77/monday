@@ -33,6 +33,77 @@ pub struct CexBaselineRun {
     pub gate: CexBaselineGateV1,
 }
 
+/// Immutable baselines tied to the exact borrowed input context. Construction
+/// performs one independent refit; downstream consumption cannot mutate the
+/// models, substitute rows or deserialize a fabricated verification token.
+pub struct VerifiedCexBaselineRun<'a, 'data> {
+    run: CexBaselineRun,
+    context: &'a EngineContext<'data>,
+}
+
+impl std::ops::Deref for VerifiedCexBaselineRun<'_, '_> {
+    type Target = CexBaselineRun;
+    fn deref(&self) -> &Self::Target {
+        &self.run
+    }
+}
+
+impl VerifiedCexBaselineRun<'_, '_> {
+    pub fn evaluate_supervised_model(
+        &self,
+        kind: CexBaselineModelKindV1,
+        policy: &CexSupervisedDecisionPolicyV2,
+    ) -> Result<CexSupervisedModelEvaluationV2, String> {
+        let artifact = match kind {
+            CexBaselineModelKindV1::Ridge => &self.run.ridge,
+            CexBaselineModelKindV1::ShallowCart => &self.run.cart,
+            CexBaselineModelKindV1::BurnMlp => &self.run.burn,
+        }
+        .as_ref()
+        .ok_or_else(|| "verified baseline model is missing".to_string())?;
+        evaluate_verified_supervised_model(self.context, artifact, policy)
+    }
+}
+
+pub fn prepare_cex_baselines<'a, 'data>(
+    context: &'a EngineContext<'data>,
+    factor_bank: &CexFactorBankRevisionV2,
+    policy: &CexBaselinePolicyV1,
+    mission_id: &str,
+    target: CexResearchHypothesisTargetV1,
+    evaluation_policy: &CexResearchContentRefV1,
+    burn: Option<CexBurnFitIdentity<'_>>,
+) -> Result<VerifiedCexBaselineRun<'a, 'data>, String> {
+    Ok(VerifiedCexBaselineRun {
+        run: evaluate_cex_baselines(
+            context,
+            factor_bank,
+            policy,
+            mission_id,
+            target,
+            evaluation_policy,
+            burn,
+        )?,
+        context,
+    })
+}
+
+/// Statistical evaluation is retained even for an exhausted training budget,
+/// but a model that declared convergence as a stop requirement cannot advance.
+pub fn baseline_training_admitted(artifact: &CexBaselineArtifactV1) -> bool {
+    artifact.folds.iter().all(|fold| match &fold.model {
+        CexBaselineModelV1::BurnMlpPortableV2 { learning, .. } => {
+            learning.stability.as_ref().is_none_or(|stability| {
+                !stability.controls.stop_on_convergence
+                    || stability.convergence.status
+                        == hft_research_ml::MlpConvergenceStatusV1::Converged
+            })
+        }
+        CexBaselineModelV1::Ridge { .. } | CexBaselineModelV1::ShallowCart { .. } => true,
+        _ => false,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CexBurnFitIdentity<'a> {
     pub symbol: &'a str,
@@ -362,6 +433,14 @@ pub fn evaluate_cex_supervised_model(
     decision_policy: &CexSupervisedDecisionPolicyV2,
 ) -> Result<CexSupervisedModelEvaluationV2, String> {
     verify_cex_baseline_artifact(context, factor_bank, artifact)?;
+    evaluate_verified_supervised_model(context, artifact, decision_policy)
+}
+
+fn evaluate_verified_supervised_model(
+    context: &EngineContext<'_>,
+    artifact: &CexBaselineArtifactV1,
+    decision_policy: &CexSupervisedDecisionPolicyV2,
+) -> Result<CexSupervisedModelEvaluationV2, String> {
     decision_policy.validate()?;
     let mut predictions = vec![0.0; context.rows().len()];
     let mut assigned = vec![false; context.rows().len()];
@@ -953,6 +1032,7 @@ fn fit_burn_fold(fit: CexBurnFoldFit<'_>) -> Result<CexBurnFoldOutput, String> {
             "mission_id": mission_id, "fold_index": fold_index, "purpose": purpose,
             "symbol": identity.symbol, "venue": identity.venue, "seed": seed,
             "updates_requested": epochs, "updates_completed": trained.diagnostics().learning.updates_completed,
+            "exit_reason": trained.diagnostics().learning.exit_reason,
             "target_scale": target_scale, "learning_rate":learning_rate,
             "row_count": trained.diagnostics().row_count,
             "convergence": trained.diagnostics().learning.stability.as_ref().map(|s| &s.convergence),

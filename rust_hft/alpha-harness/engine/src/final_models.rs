@@ -46,6 +46,9 @@ pub fn freeze_supervised_candidate(
 ) -> Result<FrozenSupervisedCandidateV1, String> {
     bank.validate().map_err(|e| e.to_string())?;
     baseline.validate().map_err(|e| e.to_string())?;
+    if !crate::baselines::baseline_training_admitted(baseline) {
+        return Err("model did not satisfy its declared training convergence requirement".into());
+    }
     candidate.validate()?;
     let protocol = context.protocol();
     let protocol_hash = protocol.content_hash().map_err(|e| e.to_string())?;

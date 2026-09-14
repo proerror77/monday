@@ -58,6 +58,13 @@ pub struct MlpOptimizationControlsV1 {
     pub max_raw_gradient_l2: f64,
     pub max_loss_growth_ratio: f64,
     pub convergence: MlpConvergencePolicyV1,
+    /// Frozen in the training request. Absent on historical fixed-budget runs.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stop_on_convergence: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl Default for MlpOptimizationControlsV1 {
@@ -67,11 +74,29 @@ impl Default for MlpOptimizationControlsV1 {
             max_raw_gradient_l2: 100.0,
             max_loss_growth_ratio: 10.0,
             convergence: MlpConvergencePolicyV1::default(),
+            stop_on_convergence: true,
         }
     }
 }
 
 impl MlpOptimizationControlsV1 {
+    /// Only completed training updates participate. No validation labels or
+    /// evaluation metric can select the stopping point.
+    pub fn should_stop(&self, losses: &[f64]) -> Result<bool, String> {
+        self.validate()?;
+        let updates = losses.len().saturating_sub(1);
+        if !self.stop_on_convergence
+            || updates < self.convergence.minimum_updates
+            || !updates.is_multiple_of(self.convergence.window_updates)
+        {
+            return Ok(false);
+        }
+        Ok(
+            MlpConvergenceDiagnosticsV1::from_loss_history(&self.convergence, losses)?.status
+                == MlpConvergenceStatusV1::Converged,
+        )
+    }
+
     pub fn validate_for_updates(&self, updates: usize) -> Result<(), String> {
         self.validate()?;
         if updates == 0 || updates > MAX_MLP_TRAINING_UPDATES {
@@ -507,13 +532,12 @@ impl MlpLearningDiagnosticsV1 {
         &self,
         expected: Option<&MlpOptimizationControlsV1>,
     ) -> Result<(), String> {
-        self.validate()?;
         if self.stability.as_ref().map(|value| &value.controls) != expected {
             return Err(
                 "MLP optimization diagnostics are detached from the sealed configuration".into(),
             );
         }
-        Ok(())
+        self.validate()
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -535,7 +559,8 @@ impl MlpLearningDiagnosticsV1 {
         if self.schema_version != "mlp-learning-diagnostics-v1"
             || self.updates_requested == 0
             || self.updates_requested > MAX_MLP_TRAINING_UPDATES
-            || self.updates_completed != self.updates_requested
+            || self.updates_completed == 0
+            || self.updates_completed > self.updates_requested
             || self.updates_completed.checked_add(1) != Some(self.loss_history.len())
             || !crate::valid_sha256(&self.initial_parameters_sha256)
             || self.loss_history.iter().any(|v| !v.is_finite() || *v < 0.0)
@@ -543,7 +568,6 @@ impl MlpLearningDiagnosticsV1 {
             || self.max_gradient_abs < 0.0
             || !self.max_parameter_abs.is_finite()
             || self.max_parameter_abs < 0.0
-            || self.exit_reason != "fixed_update_budget_completed"
         {
             return Err(
                 "MLP update counts, loss curve or numerical diagnostics are invalid".into(),
@@ -551,6 +575,37 @@ impl MlpLearningDiagnosticsV1 {
         }
         if let Some(stability) = &self.stability {
             stability.validate(&self.loss_history, self.updates_completed)?;
+            if stability.controls.stop_on_convergence {
+                let converged = stability.convergence.status == MlpConvergenceStatusV1::Converged;
+                let expected_reason = if converged {
+                    "training_converged"
+                } else {
+                    "update_budget_exhausted_not_converged"
+                };
+                if self.exit_reason != expected_reason
+                    || (self.updates_completed < self.updates_requested
+                        && !stability.controls.should_stop(&self.loss_history)?)
+                {
+                    return Err("MLP stopping reason is detached from its training evidence".into());
+                }
+                // Retained evidence must end at the first eligible stable
+                // checkpoint, rather than merely claim convergence afterward.
+                let window = stability.controls.convergence.window_updates;
+                for updates in (window..self.updates_completed).step_by(window) {
+                    if stability
+                        .controls
+                        .should_stop(&self.loss_history[..=updates])?
+                    {
+                        return Err("MLP continued after its frozen convergence stop".into());
+                    }
+                }
+                return Ok(());
+            }
+        }
+        if self.updates_completed != self.updates_requested
+            || self.exit_reason != "fixed_update_budget_completed"
+        {
+            return Err("fixed-budget MLP training evidence is incomplete".into());
         }
         Ok(())
     }
