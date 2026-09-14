@@ -245,6 +245,7 @@ pub fn verify_model_ledger_from_dataset(
         );
     }
     let expected = crate::formula_evaluator::FormulaEvaluator::new(evaluator_config.clone())?
+        .with_holding_policy(evaluation.candidate.decision_policy.holding.as_ref())?
         .evaluate_predictions_and_positions(
             context.rows(),
             &evaluation.predictions,

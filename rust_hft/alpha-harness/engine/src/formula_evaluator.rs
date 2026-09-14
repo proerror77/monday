@@ -19,10 +19,12 @@ use hft_factor_dsl::{
 };
 
 const BPS: f64 = 10_000.0;
+mod holding_ledger;
 
 pub struct FormulaEvaluator {
     config: FormulaEvaluatorConfig,
     governed_gp_policy: Option<CexGpPolicyV1>,
+    holding: Option<hft_research_manifest::model::HorizonHoldingPolicyV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -192,6 +194,7 @@ impl FormulaEvaluator {
         Ok(Self {
             config,
             governed_gp_policy: None,
+            holding: None,
         })
     }
 
@@ -314,6 +317,17 @@ impl FormulaEvaluator {
             evaluator_version,
             protocol,
         )
+    }
+
+    pub fn with_holding_policy(
+        mut self,
+        holding: Option<&hft_research_manifest::model::HorizonHoldingPolicyV1>,
+    ) -> Result<Self, String> {
+        if let Some(policy) = holding {
+            policy.duration_micros()?;
+        }
+        self.holding = holding.cloned();
+        Ok(self)
     }
 
     pub fn evaluate_sealed(
@@ -440,6 +454,17 @@ impl FormulaEvaluator {
         } else if protocol.labels.horizon_buckets != 1 {
             return Err("multi-step prediction labels cannot be used as one-step trading returns; price marks are required".into());
         }
+        if let Some(holding) = &self.holding {
+            let expected = u64::try_from(protocol.labels.horizon_buckets)
+                .ok()
+                .and_then(|h| h.checked_mul(protocol.labels.observation_frequency_millis));
+            if expected != Some(holding.horizon_millis)
+                || mark_field != Some("mid_price")
+                || !protocol.costs.cross_spread
+            {
+                return Err("held-position accounting requires matching horizon labels and observed taker quotes".into());
+            }
+        }
 
         let ranges = ranges.into_iter().collect::<Vec<_>>();
         if ranges.is_empty() {
@@ -486,14 +511,24 @@ impl FormulaEvaluator {
         let mut ledger = Vec::new();
         let mut equity = 1.0_f64;
         for (fold_index, range) in ranges.into_iter().enumerate() {
-            let (points, trade_count, total_turnover, max_book_depth_fraction) = predictive_stage
-                .target_positions_to_net_returns(
-                    rows,
-                    target_positions,
-                    range,
-                    &protocol.costs,
-                    mark_field,
-                );
+            let (points, trade_count, total_turnover, max_book_depth_fraction) =
+                if let Some(holding) = &self.holding {
+                    holding_ledger::evaluate(
+                        rows,
+                        target_positions,
+                        range,
+                        &protocol.costs,
+                        holding,
+                    )?
+                } else {
+                    predictive_stage.target_positions_to_net_returns(
+                        rows,
+                        target_positions,
+                        range,
+                        &protocol.costs,
+                        mark_field,
+                    )
+                };
             let returns = points
                 .iter()
                 .map(|point| point.net_return)
@@ -624,10 +659,14 @@ impl FormulaEvaluator {
             .map_err(|reason| format!("evaluation evidence is inconsistent: {reason}"))?;
         Ok(PositionEvaluationReport {
             evaluation,
-            return_accounting: match mark_field {
-                Some("mid_price") => ReturnAccountingBasis::ObservedMidPrice,
-                Some("close") => ReturnAccountingBasis::ObservedClosePrice,
-                _ => ReturnAccountingBasis::OneStepLabel,
+            return_accounting: if self.holding.is_some() {
+                ReturnAccountingBasis::HeldQuantityWithQuotedEntryExit
+            } else {
+                match mark_field {
+                    Some("mid_price") => ReturnAccountingBasis::ObservedMidPrice,
+                    Some("close") => ReturnAccountingBasis::ObservedClosePrice,
+                    _ => ReturnAccountingBasis::OneStepLabel,
+                }
             },
             ledger,
         })

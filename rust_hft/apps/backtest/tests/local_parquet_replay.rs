@@ -92,6 +92,7 @@ fn cli_replays_local_canonical_parquet_without_raw_sources_and_records_evidence(
         },
     ];
     let spot_config = TargetPositionReplayConfig {
+        holding: None,
         market: "spot".to_string(),
         max_depth_levels: 1,
         max_decision_delay_us: 1_000,

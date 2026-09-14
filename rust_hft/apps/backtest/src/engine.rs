@@ -1,3 +1,6 @@
+mod holding;
+pub use holding::{HorizonExecutionAccumulator, HorizonExecutionSummaryV1};
+
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{BufReader, Cursor};
 use std::mem;
@@ -20,6 +23,9 @@ use crate::config::{
     BacktestConfig, BacktestInputEvidence, ExecutionConfig, RiskConfig, StrategyConfig,
 };
 use crate::event::{EventEnvelope, EventPayload, EventStream, Level, TradeSide};
+use hft_research_manifest::model::{
+    HorizonHoldingPolicyV1, HorizonPositionAction, HorizonPositionState,
+};
 use hft_research_manifest::CexSpotInstrumentRulesV1;
 
 const MICROS_IN_SECOND: f64 = 1_000_000.0;
@@ -41,6 +47,8 @@ pub struct TargetPositionDecision {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TargetPositionReplayConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holding: Option<HorizonHoldingPolicyV1>,
     /// Market identity is part of replay semantics; Spot cannot borrow base
     /// inventory or use derivatives funding.
     #[serde(default = "default_replay_market")]
@@ -72,6 +80,8 @@ fn default_replay_market() -> String {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TargetPositionReplayMetrics {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holding: Option<HorizonExecutionSummaryV1>,
     pub event_count: usize,
     pub snapshot_events: usize,
     pub l2_update_events: usize,
@@ -228,6 +238,9 @@ pub fn replay_target_positions_with_trace_and_spot_rules(
 }
 
 pub(crate) struct TargetPositionReplay<'a> {
+    horizon_execution: Option<HorizonExecutionAccumulator>,
+    horizon_state: HorizonPositionState,
+    horizon_cleanup_only: bool,
     decisions: &'a [TargetPositionDecision],
     config: &'a TargetPositionReplayConfig,
     spot_instrument_rules: Option<&'a CexSpotInstrumentRulesV1>,
@@ -287,6 +300,13 @@ impl<'a> TargetPositionReplay<'a> {
     ) -> Result<Self> {
         validate_target_replay_inputs(decisions, config, spot_instrument_rules)?;
         Ok(Self {
+            horizon_execution: config
+                .holding
+                .as_ref()
+                .map(HorizonExecutionAccumulator::new)
+                .transpose()?,
+            horizon_state: HorizonPositionState::default(),
+            horizon_cleanup_only: false,
             decisions,
             config,
             spot_instrument_rules,
@@ -459,7 +479,49 @@ impl<'a> TargetPositionReplay<'a> {
         let funding_cost = self.inventory.abs() * mid * self.config.funding_bps / BPS;
         self.cash -= funding_cost;
         self.total_funding_cost += funding_cost;
-        let target_inventory = decision.target_position * self.config.position_notional_usd / mid;
+        let horizon_action = if let Some(holding) = &self.config.holding {
+            if self.horizon_cleanup_only {
+                None
+            } else {
+                Some(
+                    self.horizon_state
+                        .advance(
+                            holding,
+                            u64::try_from(decision.timestamp_us)?,
+                            true,
+                            Some(decision.target_position),
+                        )
+                        .map_err(anyhow::Error::msg)?,
+                )
+            }
+        } else {
+            None
+        };
+        let target_inventory = if self.config.holding.is_some() {
+            if self.horizon_cleanup_only {
+                0.0
+            } else {
+                match horizon_action.context("holding decision is missing")? {
+                    HorizonPositionAction::Enter(target) => {
+                        if self.inventory.abs() > f64::EPSILON {
+                            anyhow::bail!("horizon entry overlaps existing inventory");
+                        }
+                        let price = if target > 0.0 {
+                            self.displayed_budget.best_ask()
+                        } else {
+                            self.displayed_budget.best_bid()
+                        }
+                        .and_then(|level| level.0.to_f64())
+                        .context("horizon entry has no executable quote")?;
+                        target * self.config.position_notional_usd / price
+                    }
+                    HorizonPositionAction::Hold(_) => self.inventory,
+                    HorizonPositionAction::Flat | HorizonPositionAction::Exit { .. } => 0.0,
+                }
+            }
+        } else {
+            decision.target_position * self.config.position_notional_usd / mid
+        };
         if self.config.market == "spot" && target_inventory < -f64::EPSILON {
             anyhow::bail!("Spot target-position replay cannot create a short inventory");
         }
@@ -637,6 +699,14 @@ impl<'a> TargetPositionReplay<'a> {
             residual_quantity
         };
         self.max_residual_quantity = self.max_residual_quantity.max(residual_quantity);
+        if matches!(horizon_action, Some(HorizonPositionAction::Exit { .. }))
+            && self.inventory.abs() > f64::EPSILON
+        {
+            // Keep the failed exit as negative execution evidence. Subsequent
+            // actions may only reduce the remaining position, never overlap it
+            // with another requested episode.
+            self.horizon_cleanup_only = true;
+        }
         let vwap = (filled_quantity > f64::EPSILON).then_some(fill_notional / filled_quantity);
         let trace_event = TargetPositionReplayTraceEvent {
             schema_version: TARGET_POSITION_REPLAY_TRACE_SCHEMA_VERSION.to_string(),
@@ -662,6 +732,9 @@ impl<'a> TargetPositionReplay<'a> {
             status,
             fills: fills_for_trace,
         };
+        if let Some(execution) = &mut self.horizon_execution {
+            execution.observe(&trace_event)?;
+        }
         serde_json::to_writer(&mut self.trace, &trace_event)?;
         self.trace.push(b'\n');
         Ok(())
@@ -728,6 +801,10 @@ impl<'a> TargetPositionReplay<'a> {
         }
         let trace_sha256 = hex::encode(Sha256::digest(&self.trace));
         let metrics = TargetPositionReplayMetrics {
+            holding: self
+                .horizon_execution
+                .map(HorizonExecutionAccumulator::finish)
+                .transpose()?,
             event_count: self.event_count,
             snapshot_events: self.snapshot_events,
             l2_update_events: self.l2_update_events,
@@ -841,6 +918,33 @@ fn validate_target_replay_inputs(
         anyhow::bail!(
             "target-position replay requires cross_spread=true; passive or mid-queue execution is unsupported"
         );
+    }
+    if let Some(holding) = &config.holding {
+        let duration = holding.duration_micros().map_err(anyhow::Error::msg)?;
+        let last = u64::try_from(
+            decisions
+                .last()
+                .context("missing horizon decisions")?
+                .timestamp_us,
+        )?;
+        let mut state = HorizonPositionState::default();
+        for decision in decisions {
+            let now = u64::try_from(decision.timestamp_us)?;
+            let can_enter = now.checked_add(duration).is_some_and(|due| due <= last);
+            let action = state
+                .advance(holding, now, can_enter, Some(decision.target_position))
+                .map_err(anyhow::Error::msg)?;
+            if action.target().to_bits() != decision.target_position.to_bits()
+                || matches!(action, HorizonPositionAction::Exit { late: true, .. })
+            {
+                anyhow::bail!(
+                    "target decisions violate the declared non-overlapping holding horizon"
+                );
+            }
+        }
+        if state.is_holding() {
+            anyhow::bail!("target decisions leave an incomplete holding horizon");
+        }
     }
     Ok(())
 }
@@ -2580,6 +2684,130 @@ mod tests {
         }
     }
 
+    fn holding_replay_config(seconds: u64) -> TargetPositionReplayConfig {
+        TargetPositionReplayConfig {
+            holding: Some(HorizonHoldingPolicyV1 {
+                horizon_millis: seconds * 1000,
+            }),
+            market: "usdm".into(),
+            max_depth_levels: 1,
+            max_decision_delay_us: 1_000_000,
+            order_latency_us: 100_000,
+            position_notional_usd: 100.0,
+            fee_bps: 2.0,
+            rebate_bps: 0.0,
+            funding_bps: 0.0,
+            latency_bps: 0.0,
+            additional_slippage_bps: 0.0,
+            cross_spread: true,
+            capacity_depth_levels: 0,
+            trade_tape_declared: false,
+        }
+    }
+
+    #[test]
+    fn horizon_replay_holds_entry_quantity_and_uses_both_arrival_quotes() {
+        for seconds in [5, 10, 30] {
+            for target in [0.5, -0.4] {
+                let mut tape = String::new();
+                let mut decisions = Vec::new();
+                let mut previous_mid = 100.0;
+                for t in 0..=seconds {
+                    let mid = 100.0 + t as f64;
+                    // Exit has an extra observed-book delay: distinguish the
+                    // signal horizon from actual fill-to-fill holding time.
+                    let arrival =
+                        (t + 1) * 1_000_000 + if t == seconds { 200_000 } else { 100_000 };
+                    let bids = if t == 0 {
+                        vec![(mid - 1.0, 10.0)]
+                    } else {
+                        vec![(previous_mid - 1.0, 0.0), (mid - 1.0, 10.0)]
+                    };
+                    let asks = if t == 0 {
+                        vec![(mid + 1.0, 10.0)]
+                    } else {
+                        vec![(previous_mid + 1.0, 0.0), (mid + 1.0, 10.0)]
+                    };
+                    tape.push_str(&serde_json::json!({ "timestamp": arrival, "sequence": t+1,
+                        "event": if t == 0 { "snapshot" } else { "l2_update" }, "bids": bids, "asks": asks }).to_string());
+                    tape.push('\n');
+                    decisions.push(TargetPositionDecision {
+                        timestamp_us: ((t + 1) * 1_000_000) as i64,
+                        target_position: if t == seconds { 0.0 } else { target },
+                    });
+                    previous_mid = mid;
+                }
+                let config = holding_replay_config(seconds);
+                let output =
+                    replay_target_positions_with_trace(tape.as_bytes(), &decisions, &config)
+                        .unwrap();
+                let trace = tape_trace_events(&output.trace_bytes);
+                let entry = &trace[0];
+                let exit = trace.last().unwrap();
+                assert_eq!(output.metrics.order_count, 2);
+                let summary = output.metrics.holding.as_ref().unwrap();
+                assert_eq!(summary.closed_episodes, 1);
+                assert_eq!(
+                    summary.max_actual_holding_micros,
+                    Some(seconds * 1_000_000 + 100_000)
+                );
+                assert_eq!(output.metrics.final_inventory, 0.0);
+                assert!(trace[1..seconds as usize]
+                    .iter()
+                    .all(|e| e.side.is_none() && e.fills.is_empty()));
+                assert!((entry.filled_quantity - exit.filled_quantity).abs() < 1e-12);
+                assert_eq!(
+                    exit.decision_timestamp_us - entry.decision_timestamp_us,
+                    seconds as i64 * 1_000_000
+                );
+                assert_eq!(
+                    exit.arrival_timestamp_us - entry.arrival_timestamp_us,
+                    seconds as i64 * 1_000_000 + 100_000
+                );
+                let cash_profit = target.signum()
+                    * entry.filled_quantity
+                    * (exit.vwap.unwrap() - entry.vwap.unwrap())
+                    - entry.fees
+                    - exit.fees;
+                assert!(
+                    (output.metrics.final_cash - config.position_notional_usd - cash_profit).abs()
+                        < 1e-10
+                );
+                let mut invalid = decisions.clone();
+                invalid[1].target_position = -target;
+                assert!(replay_target_positions(tape.as_bytes(), &invalid, &config).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn horizon_replay_incomplete_exit_prevents_overlapping_entry() {
+        let mut config = holding_replay_config(1);
+        config.order_latency_us = 0;
+        let tape = concat!(
+            "{\"timestamp\":1000000,\"sequence\":1,\"event\":\"snapshot\",\"bids\":[[99,10]],\"asks\":[[101,10]]}\n",
+            "{\"timestamp\":2000000,\"sequence\":2,\"event\":\"l2_update\",\"bids\":[[99,0.1]],\"asks\":[[101,10]]}\n",
+            "{\"timestamp\":3000000,\"sequence\":3,\"event\":\"l2_update\",\"bids\":[[99,10]],\"asks\":[[101,10]]}\n",
+            "{\"timestamp\":4000000,\"sequence\":4,\"event\":\"l2_update\",\"bids\":[[99,10]],\"asks\":[[101,10]]}\n",
+        );
+        let decisions: Vec<_> = [0.5, 0.0, -0.5, 0.0]
+            .into_iter()
+            .enumerate()
+            .map(|(t, target_position)| TargetPositionDecision {
+                timestamp_us: (t as i64 + 1) * 1_000_000,
+                target_position,
+            })
+            .collect();
+        let output =
+            replay_target_positions_with_trace(tape.as_bytes(), &decisions, &config).unwrap();
+        let trace = tape_trace_events(&output.trace_bytes);
+        assert_eq!(output.metrics.partial_order_count, 1);
+        assert!(output.metrics.max_residual_quantity > 0.0);
+        assert_eq!(trace[2].inventory_after, 0.0);
+        assert!(trace[3].side.is_none());
+        assert_eq!(output.metrics.order_count, 3); // entry, partial exit, cleanup only
+    }
+
     #[test]
     fn target_position_replay_is_deterministic_and_snapshot_gated() {
         let tape = concat!(
@@ -2602,6 +2830,7 @@ mod tests {
             },
         ];
         let config = TargetPositionReplayConfig {
+            holding: None,
             market: "usdm".to_string(),
             max_depth_levels: 1,
             max_decision_delay_us: 1_000_000,
@@ -2661,6 +2890,7 @@ mod tests {
             },
         ];
         let config = TargetPositionReplayConfig {
+            holding: None,
             market: "spot".to_string(),
             max_depth_levels: 3,
             max_decision_delay_us: 1_000_000,
@@ -2713,6 +2943,7 @@ mod tests {
             },
         ];
         let config = TargetPositionReplayConfig {
+            holding: None,
             market: "spot".to_string(),
             max_depth_levels: 1,
             max_decision_delay_us: 1_000_000,
@@ -2771,6 +3002,7 @@ mod tests {
             },
         ];
         let config = TargetPositionReplayConfig {
+            holding: None,
             market: "spot".to_string(),
             max_depth_levels: 1,
             max_decision_delay_us: 1_000_000,
@@ -2908,6 +3140,7 @@ mod tests {
             },
         ];
         let config = TargetPositionReplayConfig {
+            holding: None,
             market: "spot".to_string(),
             max_depth_levels: 1,
             max_decision_delay_us: 1_000_000,
@@ -2963,6 +3196,7 @@ mod tests {
             },
         ];
         let config = TargetPositionReplayConfig {
+            holding: None,
             market: "spot".to_string(),
             max_depth_levels: 1,
             max_decision_delay_us: 1_000_000,
@@ -3024,6 +3258,7 @@ mod tests {
             },
         ];
         let mut config = TargetPositionReplayConfig {
+            holding: None,
             market: "usdm".to_string(),
             max_depth_levels: 1,
             max_decision_delay_us: 2_000_000,
@@ -3077,6 +3312,7 @@ mod tests {
             },
         ];
         let config = TargetPositionReplayConfig {
+            holding: None,
             market: "usdm".to_string(),
             max_depth_levels: 1,
             max_decision_delay_us: 2_000_000,
@@ -3118,6 +3354,7 @@ mod tests {
             target_position: 1.0,
         }];
         let config = TargetPositionReplayConfig {
+            holding: None,
             market: "usdm".to_string(),
             max_depth_levels: 1,
             max_decision_delay_us: 1_000_000,
@@ -3158,6 +3395,7 @@ mod tests {
             },
         ];
         let config = TargetPositionReplayConfig {
+            holding: None,
             market: "usdm".to_string(),
             max_depth_levels: 1,
             max_decision_delay_us: 1_000_000,
@@ -3216,6 +3454,7 @@ mod tests {
             },
         ];
         let config = TargetPositionReplayConfig {
+            holding: None,
             market: "usdm".to_string(),
             max_depth_levels: 1,
             max_decision_delay_us: 1_000_000,
@@ -3265,6 +3504,7 @@ mod tests {
             },
         ];
         let config = TargetPositionReplayConfig {
+            holding: None,
             market: "usdm".to_string(),
             max_depth_levels: 1,
             max_decision_delay_us: 1_000_000,
@@ -3293,6 +3533,7 @@ mod tests {
     #[test]
     fn target_position_replay_requires_positive_notional() {
         let config = TargetPositionReplayConfig {
+            holding: None,
             market: "usdm".to_string(),
             max_depth_levels: 1,
             max_decision_delay_us: 1,
@@ -3322,6 +3563,7 @@ mod tests {
     #[test]
     fn target_position_replay_rejects_unsupported_non_crossing_execution() {
         let config = TargetPositionReplayConfig {
+            holding: None,
             market: "usdm".to_string(),
             max_depth_levels: 1,
             max_decision_delay_us: 1,
@@ -3381,6 +3623,7 @@ mod tests {
             },
         ];
         let config = TargetPositionReplayConfig {
+            holding: None,
             market: "usdm".to_string(),
             max_depth_levels: 1,
             max_decision_delay_us: 1,
@@ -3415,6 +3658,7 @@ mod tests {
             target_position: 1.0,
         }];
         let config = TargetPositionReplayConfig {
+            holding: None,
             market: "usdm".to_string(),
             max_depth_levels: 1,
             max_decision_delay_us: 1_000_000,
@@ -3456,6 +3700,7 @@ mod tests {
             },
         ];
         let config = TargetPositionReplayConfig {
+            holding: None,
             market: "usdm".to_string(),
             max_depth_levels: 1,
             max_decision_delay_us: 10_000_000,
@@ -3504,6 +3749,7 @@ mod tests {
             },
         ];
         let config = TargetPositionReplayConfig {
+            holding: None,
             market: "usdm".to_string(),
             max_depth_levels: 1,
             max_decision_delay_us: 1_000_000,
@@ -3535,6 +3781,7 @@ mod tests {
             target_position: 1.0,
         }];
         let config = TargetPositionReplayConfig {
+            holding: None,
             market: "usdm".to_string(),
             max_depth_levels: 1,
             max_decision_delay_us: 1_000_000,

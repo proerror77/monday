@@ -1151,6 +1151,7 @@ fn follow_up_plan(
         bail!("declared follow-up feature subset removed the focus field");
     }
     let plan = CexCampaignResearchPlanV1 {
+        holding: loaded.request.research_plan.holding.clone(),
         comparison_family_trials: loaded.request.research_plan.comparison_family_trials,
         schema_version: "cex-campaign-research-plan-v2".to_string(),
         generation: loaded.request.research_plan.generation + 1,
@@ -2883,9 +2884,9 @@ pub(crate) fn validate_terminal_mission_revision_binding(
         }
         _ => bail!("terminal Mission research delta differs from the approved revision"),
     }
-    let expected_decision_hash = expected
-        .position_policy
-        .decision_policy_for_market(mission.spec.instrument.market.clone())
+    let expected_decision_hash = request
+        .research_plan
+        .decision_policy_for_market(mission.spec.instrument.market.clone())?
         .content_hash()
         .map_err(anyhow::Error::msg)?;
     if mission.spec.policies.supervised_decision.id != expected.revision_id
@@ -2918,6 +2919,7 @@ fn validate_existing_follow_up_plan(
         || &plan.search_policy_revision != expected_revision
         || plan.allowed_search_policy_revisions
             != loaded.request.research_plan.allowed_search_policy_revisions
+        || plan.holding != loaded.request.research_plan.holding
         || plan.mlp_training != loaded.request.research_plan.mlp_training
         || plan
             .attempted_search_policy_revision_ids

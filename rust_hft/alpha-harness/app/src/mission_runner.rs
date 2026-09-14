@@ -226,7 +226,7 @@ fn is_supervised_gp_policy(policy: &CexGpPolicyV1) -> bool {
     )
 }
 
-fn bound_supervised_decision_policy(
+pub(crate) fn bound_supervised_decision_policy(
     mission: &CexResearchMissionArtifactV1,
 ) -> anyhow::Result<CexSupervisedDecisionPolicyV2> {
     let binding = &mission.spec.policies.supervised_decision;
@@ -238,6 +238,18 @@ fn bound_supervised_decision_policy(
         CexSupervisedDecisionPolicyV2::controlled_v2(),
         CexSupervisedDecisionPolicyV2::prediction_identity_v2(),
         CexSupervisedDecisionPolicyV2::hysteretic_cost_aware_v2(),
+        CexSupervisedDecisionPolicyV2::hold_to_horizon_v3(
+            u64::try_from(mission.spec.evaluation_protocol.labels.horizon_buckets)?
+                .checked_mul(
+                    mission
+                        .spec
+                        .evaluation_protocol
+                        .labels
+                        .observation_frequency_millis,
+                )
+                .context("holding duration overflow")?,
+        )
+        .map_err(anyhow::Error::msg)?,
     ]
     .into_iter()
     .map(|policy| policy.with_long_only(long_only))
@@ -503,6 +515,16 @@ pub(crate) struct CexEventReplayReceiptV1 {
 }
 
 impl CexEventReplayReceiptV1 {
+    pub(crate) fn validate_holding_policy(
+        &self,
+        expected: Option<&hft_research_manifest::model::HorizonHoldingPolicyV1>,
+    ) -> anyhow::Result<()> {
+        if self.replay_config.holding.as_ref() != expected {
+            bail!("replay holding contract differs from its frozen candidate");
+        }
+        Ok(())
+    }
+
     fn finalize(mut self) -> anyhow::Result<Self> {
         self.capabilities_sha256 = canonical_json_hash(&self.capabilities)?;
         self.receipt_id = self.expected_receipt_id()?;
@@ -596,6 +618,21 @@ impl CexEventReplayReceiptV1 {
                 && self.trace_artifact_path.is_empty()
                 && self.accounting_trace_event_count == 0
         };
+        if self
+            .replay_config
+            .holding
+            .as_ref()
+            .map(|p| p.duration_micros())
+            .transpose()
+            .map_err(anyhow::Error::msg)?
+            != self
+                .metrics
+                .holding
+                .as_ref()
+                .map(|s| s.planned_signal_horizon_micros)
+        {
+            bail!("replay holding summary does not bind its declared policy");
+        }
         if current_schema && !self.replay_config.cross_spread {
             bail!(
                 "current CEX event replay requires cross_spread=true; passive or mid-queue execution is unsupported"
@@ -2606,6 +2643,7 @@ fn run_factor_bank_subset_search(
 }
 
 struct CexReplayCandidateInput {
+    holding: Option<hft_research_manifest::model::HorizonHoldingPolicyV1>,
     reference: CexResearchContentRefV1,
     positions: Vec<f64>,
     costs: EvaluationCostsV1,
@@ -2654,6 +2692,7 @@ fn run_cex_event_replay(
             .collect::<Vec<_>>(),
         feature_decision_clocks,
         CexReplayCandidateInput {
+            holding: None,
             reference: content_reference(&strategy.artifact_id, strategy)?,
             positions,
             costs: strategy.execution.costs.clone(),
@@ -2713,6 +2752,7 @@ fn run_cex_supervised_event_replay(
             .collect::<Vec<_>>(),
         feature_decision_clocks,
         CexReplayCandidateInput {
+            holding: evaluation.candidate.decision_policy.holding.clone(),
             reference: content_reference(&evaluation.candidate.artifact_id, &evaluation.candidate)?,
             positions: evaluation.target_positions.clone(),
             max_abs_position: evaluation.candidate.decision_policy.max_abs_position,
@@ -2790,6 +2830,7 @@ pub(crate) fn run_frozen_model_event_replay(
         &observations,
         &clocks,
         CexReplayCandidateInput {
+            holding: frozen.program.decision_policy.holding.clone(),
             reference: content_reference(&frozen.artifact_id, frozen)?,
             positions: report
                 .ledger
@@ -2932,6 +2973,7 @@ fn run_cex_target_position_replay(
         .max(candidate.capacity_depth_levels)
         .max(policy.required_depth_levels);
     let replay_config = TargetPositionReplayConfig {
+        holding: candidate.holding.clone(),
         market: materialization.market.clone(),
         max_depth_levels,
         max_decision_delay_us,
@@ -4166,6 +4208,7 @@ fn validate_replay_strategy_binding(
     strategy.validate().map_err(anyhow::Error::msg)?;
     if replay.mission_id != mission_id
         || strategy.mission_id != mission_id
+        || replay.replay_config.holding.is_some()
         || replay.strategy != content_reference(&strategy.artifact_id, strategy)?
         || replay.dataset != mission.spec.inputs.dataset
         || replay.materialization != mission.spec.inputs.materialization
@@ -4195,6 +4238,7 @@ pub(crate) fn validate_supervised_replay_binding(
     if selection.mission_id != mission_id
         || candidate.mission_id != mission_id
         || selection.selected_candidate != content_reference(&candidate.artifact_id, candidate)?
+        || replay.replay_config.holding != candidate.decision_policy.holding
         || replay.strategy != selection.selected_candidate
         || replay.mission_id != mission_id
         || replay.dataset != mission.spec.inputs.dataset
@@ -4679,6 +4723,12 @@ fn validate_replay_trace_bytes(
     {
         bail!("CEX replay trace hash or accounting identity does not match its receipt");
     }
+    let mut holding_execution = receipt
+        .replay_config
+        .holding
+        .as_ref()
+        .map(hft_backtest::engine::HorizonExecutionAccumulator::new)
+        .transpose()?;
     let mut count = 0_usize;
     let mut last = None;
     let mut expected_cash = receipt.replay_config.position_notional_usd;
@@ -4782,7 +4832,16 @@ fn validate_replay_trace_bytes(
         count = count
             .checked_add(1)
             .context("CEX replay trace event count overflow")?;
+        if let Some(execution) = &mut holding_execution {
+            execution.observe(&event)?;
+        }
         last = Some(event);
+    }
+    let holding_summary = holding_execution
+        .map(hft_backtest::engine::HorizonExecutionAccumulator::finish)
+        .transpose()?;
+    if holding_summary != receipt.metrics.holding {
+        bail!("CEX actual holding evidence differs from the independent trace readback");
     }
     let last = last.context("CEX replay trace is empty")?;
     let initial_cash = receipt.replay_config.position_notional_usd;
@@ -5070,6 +5129,7 @@ pub(crate) mod tests {
             &tape,
             &decisions,
             &TargetPositionReplayConfig {
+                holding: None,
                 market: "usdm".to_string(),
                 max_depth_levels: 1,
                 max_decision_delay_us: 1,
@@ -5103,6 +5163,7 @@ pub(crate) mod tests {
     #[test]
     fn historical_v1_replay_receipt_keeps_its_old_nested_hash_semantics() {
         let replay_config = TargetPositionReplayConfig {
+            holding: None,
             market: "usdm".to_string(),
             max_depth_levels: 1,
             max_decision_delay_us: 1_000,
@@ -5118,6 +5179,7 @@ pub(crate) mod tests {
             trade_tape_declared: false,
         };
         let metrics = TargetPositionReplayMetrics {
+            holding: None,
             event_count: 2,
             snapshot_events: 1,
             l2_update_events: 1,
@@ -6344,6 +6406,20 @@ pub(crate) mod tests {
                 symbol: "BTCUSDT",
                 venue: "binance-usdm",
             }),
+        )
+        .unwrap();
+        let held_decision = CexSupervisedDecisionPolicyV2::hold_to_horizon_v3(5000).unwrap();
+        let held = verified
+            .evaluate_supervised_model(CexBaselineModelKindV1::Ridge, &held_decision)
+            .unwrap();
+        assert_eq!(
+            held.report.return_accounting,
+            alpha_domain::ReturnAccountingBasis::HeldQuantityWithQuotedEntryExit
+        );
+        alpha_engine::model_metrics::verify_model_ledger_from_dataset(
+            &held,
+            &context,
+            &policy.evaluator_config,
         )
         .unwrap();
         let decision = CexSupervisedDecisionPolicyV2::controlled_v2();

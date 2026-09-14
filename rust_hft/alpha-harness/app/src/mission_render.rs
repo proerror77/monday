@@ -410,6 +410,8 @@ impl CexCampaignLearningDirectiveV1 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CexCampaignResearchPlanV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) holding: Option<hft_research_manifest::model::HorizonHoldingPolicyV1>,
     /// Statistical correction across the declared comparison family; separate
     /// from the trials reserved by this individual Campaign.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -510,6 +512,21 @@ pub(crate) struct CexCampaignLlmProvenanceV1 {
 }
 
 impl CexCampaignResearchPlanV1 {
+    pub(crate) fn decision_policy_for_market(
+        &self,
+        market: CexResearchMarketV1,
+    ) -> anyhow::Result<CexSupervisedDecisionPolicyV2> {
+        Ok(if let Some(holding) = &self.holding {
+            CexSupervisedDecisionPolicyV2::hold_to_horizon_v3(holding.horizon_millis)
+                .map_err(anyhow::Error::msg)?
+                .with_long_only(market == CexResearchMarketV1::Spot)
+        } else {
+            self.search_policy_revision
+                .position_policy
+                .decision_policy_for_market(market)
+        })
+    }
+
     pub(crate) fn effective_multiple_testing_trials(
         &self,
         declared_trials: usize,
@@ -524,6 +541,7 @@ impl CexCampaignResearchPlanV1 {
     pub(crate) fn canonical() -> Self {
         let search_policy_revision = CexCampaignSearchPolicyRevisionV1::canonical();
         Self {
+            holding: None,
             comparison_family_trials: None,
             schema_version: RESEARCH_PLAN_SCHEMA_V2.to_string(),
             generation: 0,
@@ -551,6 +569,13 @@ impl CexCampaignResearchPlanV1 {
         }
         if let Some(horizon) = &self.label_horizon {
             horizon.validate().map_err(anyhow::Error::msg)?;
+        }
+        if let Some(holding) = &self.holding {
+            holding.duration_micros().map_err(anyhow::Error::msg)?;
+            if self.search_policy_revision.position_policy != CexCampaignPositionPolicyV1::CostAware
+            {
+                bail!("holding requires the unchanged cost-aware entry policy");
+            }
         }
         if let Some(plan) = &self.mlp_training {
             plan.validate().map_err(anyhow::Error::msg)?;
@@ -1048,10 +1073,18 @@ pub(crate) fn render_prepared_cex_bundle(
     } else {
         baseline_policy
     };
-    let supervised_decision_policy = research_plan
-        .search_policy_revision
-        .position_policy
-        .decision_policy_for_market(research_market.clone());
+    if let Some(holding) = &research_plan.holding {
+        if holding.horizon_millis
+            != materialization
+                .bucket_ms
+                .checked_mul(u64::try_from(materialization.label_horizon_buckets)?)
+                .context("label horizon overflow")?
+        {
+            bail!("holding horizon must equal the bound prediction horizon");
+        }
+    }
+    let supervised_decision_policy =
+        research_plan.decision_policy_for_market(research_market.clone())?;
     let weight_policy = CexEqualAbsoluteWeightPolicyV1::controlled_v1(WEIGHT_POLICY_ID)?;
     let replay_policy = CexEventReplayPolicyV1::controlled_v2(
         REPLAY_POLICY_ID,
@@ -1771,6 +1804,71 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn holding_policy_binds_rendered_and_terminal_mission_without_changing_costs() {
+        let fixture = Fixture::canonical();
+        let plain = CexCampaignResearchPlanV1::canonical();
+        let original = render_cex_bundle(
+            &fixture.feature_path,
+            &fixture.materialization_path,
+            &plain,
+            7,
+            default_trials(),
+        )
+        .unwrap();
+        let mut plan = plain.clone();
+        plan.holding = Some(hft_research_manifest::model::HorizonHoldingPolicyV1 {
+            horizon_millis: 5000,
+        });
+        let held = render_cex_bundle(
+            &fixture.feature_path,
+            &fixture.materialization_path,
+            &plan,
+            7,
+            default_trials(),
+        )
+        .unwrap();
+        assert_eq!(
+            original.mission.spec.evaluation_protocol,
+            held.mission.spec.evaluation_protocol
+        );
+        assert_ne!(
+            original.mission.spec.policies.supervised_decision,
+            held.mission.spec.policies.supervised_decision
+        );
+        assert_eq!(
+            crate::mission_runner::bound_supervised_decision_policy(&held.mission)
+                .unwrap()
+                .holding,
+            plan.holding
+        );
+        let mut request = crate::mission_campaign::valid_request_for_tests();
+        request.research_plan = plan.clone();
+        crate::mission_campaign::validate_terminal_mission_revision_binding(
+            &held.mission,
+            &request,
+        )
+        .unwrap();
+        assert!(
+            crate::mission_campaign::validate_terminal_mission_revision_binding(
+                &original.mission,
+                &request
+            )
+            .is_err()
+        );
+        plan.holding.as_mut().unwrap().horizon_millis = 30000;
+        assert!(render_cex_bundle(
+            &fixture.feature_path,
+            &fixture.materialization_path,
+            &plan,
+            7,
+            default_trials()
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("holding horizon"));
+    }
+
+    #[test]
     fn follow_up_plan_binds_one_registered_position_policy_revision() {
         let fixture = Fixture::new(MIN_ROWS);
         let canonical = CexCampaignResearchPlanV1::canonical();
@@ -1793,6 +1891,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let plan = CexCampaignResearchPlanV1 {
+            holding: None,
             comparison_family_trials: None,
             schema_version: RESEARCH_PLAN_SCHEMA_V2.to_string(),
             generation: 1,
@@ -1992,6 +2091,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let plan = CexCampaignResearchPlanV1 {
+            holding: None,
             comparison_family_trials: None,
             schema_version: RESEARCH_PLAN_SCHEMA_V2.to_string(),
             generation: 1,

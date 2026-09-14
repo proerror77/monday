@@ -1062,6 +1062,7 @@ pub(crate) fn readback_terminal(
     if expected != observed {
         bail!("final selection omitted or added a replay-qualified source winner");
     }
+    let mut selected_holding = None;
     for entry in &selection.entries {
         if let Some(reference) = &entry.frozen_candidate {
             let source = sources
@@ -1074,6 +1075,9 @@ pub(crate) fn readback_terminal(
             let frozen: FrozenSupervisedCandidateV1 = serde_json::from_slice(&std::fs::read(
                 results.join(format!("{}-model.json", reference.id)),
             )?)?;
+            if result.selected_candidate.as_ref() == Some(reference) {
+                selected_holding = frozen.program.decision_policy.holding.clone();
+            }
             frozen
                 .validate_against_protocol(&source.mission.spec.evaluation_protocol)
                 .map_err(anyhow::Error::msg)?;
@@ -1107,6 +1111,7 @@ pub(crate) fn readback_terminal(
             results.join("frozen-model-event-replay-receipt.json"),
         )?)?;
         replay.validate()?;
+        replay.validate_holding_policy(selected_holding.as_ref())?;
         if replay.strategy != *selected
             || replay.gate.passed == (result.outcome == CampaignFinalOutcomeV1::ReplayRejected)
         {

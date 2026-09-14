@@ -456,7 +456,8 @@ fn evaluate_verified_supervised_model(
         }
     }
     let target_positions = supervised_target_positions(context, &predictions, decision_policy)?;
-    let evaluator = FormulaEvaluator::new(artifact.baseline_policy.evaluator_config.clone())?;
+    let evaluator = FormulaEvaluator::new(artifact.baseline_policy.evaluator_config.clone())?
+        .with_holding_policy(decision_policy.holding.as_ref())?;
     let report = evaluator.evaluate_predictions_and_positions(
         context.rows(),
         &predictions,
@@ -508,6 +509,16 @@ pub(crate) fn supervised_target_positions(
     if predictions.len() != context.rows().len() {
         return Err("supervised prediction length does not match dataset".to_string());
     }
+    if let Some(holding) = &policy.holding {
+        return horizon_target_positions(
+            context.rows(),
+            predictions,
+            policy,
+            context.protocol(),
+            context.folds().iter().map(|fold| fold.validation.clone()),
+            holding,
+        );
+    }
     let mut positions = vec![0.0; predictions.len()];
     for fold in context.folds() {
         let mut previous_position = 0.0;
@@ -549,6 +560,84 @@ pub(crate) fn supervised_target_positions(
                 };
             positions[index] = position;
             previous_position = position;
+        }
+    }
+    Ok(positions)
+}
+
+pub(crate) fn horizon_target_positions(
+    rows: &[ResearchRow],
+    predictions: &[f64],
+    policy: &CexSupervisedDecisionPolicyV2,
+    protocol: &alpha_domain::EvaluationProtocolV1,
+    ranges: impl IntoIterator<Item = std::ops::Range<usize>>,
+    holding: &hft_research_manifest::model::HorizonHoldingPolicyV1,
+) -> Result<Vec<f64>, String> {
+    use hft_research_manifest::model::{HorizonPositionAction, HorizonPositionState};
+    let duration = holding.duration_micros()?;
+    let labels = &protocol.labels;
+    let label_millis = u64::try_from(labels.horizon_buckets)
+        .ok()
+        .and_then(|h| h.checked_mul(labels.observation_frequency_millis));
+    if label_millis != Some(holding.horizon_millis) || !protocol.costs.cross_spread {
+        return Err(
+            "horizon holding must match the prediction label and existing taker costs".into(),
+        );
+    }
+    if predictions.len() != rows.len() || predictions.iter().any(|v| !v.is_finite()) {
+        return Err("supervised model prediction is not finite".into());
+    }
+    let clock = |row: &ResearchRow| {
+        u64::try_from(row.available_time.timestamp_micros())
+            .map_err(|_| "invalid holding decision time".to_string())
+    };
+    let mut positions = vec![0.0; predictions.len()];
+    for range in ranges {
+        if range.start >= range.end || range.end > rows.len() {
+            return Err("invalid holding evaluation range".into());
+        }
+        // A gap is a data-quality failure, not a future-known early stop. Only
+        // the predeclared evaluation end may prohibit a new entry.
+        if rows[range.clone()].windows(2).any(|pair| {
+            pair[0].series_id != pair[1].series_id
+                || pair[1]
+                    .available_time
+                    .signed_duration_since(pair[0].available_time)
+                    .num_milliseconds()
+                    != labels.observation_frequency_millis as i64
+        }) {
+            return Err("holding evaluation requires one continuous instrument calendar".into());
+        }
+        {
+            let last = clock(&rows[range.end - 1])?;
+            let mut state = HorizonPositionState::default();
+            for index in range {
+                let row = &rows[index];
+                let now = clock(row)?;
+                // The evaluation calendar is fixed in advance. Never open an
+                // episode that would require an early close at its known end.
+                let can_enter = now.checked_add(duration).is_some_and(|due| due <= last);
+                let proposed = if can_enter && !state.is_holding() {
+                    Some(cost_aware_target_position(
+                        predictions[index],
+                        row,
+                        &protocol.costs,
+                        policy,
+                    )?)
+                } else {
+                    None
+                };
+                let action = state.advance(holding, now, can_enter, proposed)?;
+                if matches!(action, HorizonPositionAction::Exit { late: true, .. }) {
+                    return Err(
+                        "observations cannot close the position at its declared horizon".into(),
+                    );
+                }
+                positions[index] = action.target();
+            }
+            if state.is_holding() {
+                return Err("evaluation ended with an incomplete horizon position".into());
+            }
         }
     }
     Ok(positions)
@@ -1486,6 +1575,82 @@ fn normalize_zero(value: f64) -> f64 {
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    #[test]
+    fn horizon_targets_keep_entry_gate_and_ignore_signals_until_expiry() {
+        for seconds in [5, 10, 30] {
+            let policy = CexSupervisedDecisionPolicyV2::hold_to_horizon_v3(seconds * 1000).unwrap();
+            let rows: Vec<_> = (0..=seconds + 2)
+                .map(|i| ResearchRow {
+                    series_id: 1,
+                    available_time: chrono::DateTime::from_timestamp(i as i64, 0).unwrap(),
+                    label_available_time: chrono::DateTime::from_timestamp((i + seconds) as i64, 0)
+                        .unwrap(),
+                    signal: 0.0,
+                    label: 0.0,
+                    fee_bps: 2.0,
+                    funding_bps: 0.0,
+                    pit_funding: true,
+                    latency_bps: 0.0,
+                    features: std::collections::BTreeMap::from([
+                        ("spread_bps".into(), 2.0),
+                        ("mid_price".into(), 100.0),
+                    ]),
+                })
+                .collect();
+            let protocol = alpha_domain::EvaluationProtocolV1::new(
+                alpha_domain::EvaluationWalkForwardV1 {
+                    initial_train_rows: 60,
+                    validation_rows: 60,
+                    fold_count: 2,
+                    purge_rows: seconds as usize,
+                    embargo_rows: seconds as usize,
+                    sealed_holdout_rows: 60,
+                },
+                alpha_domain::EvaluationCostsV1 {
+                    fee_bps: 2.0,
+                    rebate_bps: 0.0,
+                    funding_bps: 0.0,
+                    latency_bps: 0.0,
+                    slippage_bps: 0.0,
+                    cross_spread: true,
+                    position_notional_usd: 0.0,
+                    capacity_depth_levels: 0,
+                    max_book_depth_fraction: 0.0,
+                },
+                EvaluationLabelSpecV1 {
+                    horizon_buckets: seconds as usize,
+                    observation_frequency_millis: 1000,
+                },
+            )
+            .unwrap();
+            let mut predictions = vec![-0.002; rows.len()];
+            predictions[0] = 0.002;
+            let evaluate = |rows: &[ResearchRow], predictions: &[f64]| {
+                horizon_target_positions(
+                    rows,
+                    predictions,
+                    &policy,
+                    &protocol,
+                    std::iter::once(0..rows.len()),
+                    policy.holding.as_ref().unwrap(),
+                )
+            };
+            let positions = evaluate(&rows, &predictions).unwrap();
+            assert!(positions[0] > 0.0);
+            assert!(positions[..seconds as usize]
+                .iter()
+                .all(|p| *p == positions[0]));
+            assert!(positions[seconds as usize..].iter().all(|p| *p == 0.0));
+            assert!(evaluate(&rows, &vec![0.0001; rows.len()])
+                .unwrap()
+                .iter()
+                .all(|p| *p == 0.0));
+            let mut gap = rows.clone();
+            gap[1].series_id = 2;
+            assert!(evaluate(&gap, &predictions).is_err());
+        }
+    }
 
     #[test]
     fn ridge_is_deterministic_and_constant_columns_are_safe() {
