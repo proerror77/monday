@@ -306,6 +306,9 @@ pub struct CampaignExecuteArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct CampaignWorkflowArgs {
+    /// Existing trusted ACK ledger, selected independently of the plan's artifacts.
+    #[arg(long)]
+    pub ledger: PathBuf,
     #[arg(long)]
     pub plan: PathBuf,
     #[arg(long)]

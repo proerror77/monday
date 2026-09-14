@@ -318,12 +318,81 @@ fn restore_inputs(
 }
 
 pub fn prepare(args: CampaignPrepareArgs) -> anyhow::Result<()> {
-    print_json(&prepare_report(args, None)?)
+    print_json(&prepare_report(
+        args,
+        None,
+        PreparationPurpose::ArtifactsOnly,
+    )?)
+}
+
+pub(super) enum PreparationPurpose {
+    ArtifactsOnly,
+    ExecuteWorkflow { comparison_trials: usize },
+}
+
+fn validate_workflow_training(plans: &[CexCampaignResearchPlanV1]) -> anyhow::Result<()> {
+    for plan in plans {
+        if !plan.supervised_model_scope.is_default() {
+            plan.validate()?;
+            continue;
+        }
+        let training = plan.mlp_training.as_ref().context("canonical supervised workflow requires an explicit MLP training plan; diagnostic defaults cannot execute")?;
+        let optimization = training
+            .optimization
+            .as_ref()
+            .context("workflow requires frozen gradient, loss and convergence controls")?;
+        let convergence = &optimization.controls.convergence;
+        let tail = convergence
+            .comparisons
+            .checked_add(1)
+            .and_then(|windows| convergence.window_updates.checked_mul(windows))
+            .context("workflow convergence window overflowed")?;
+        if !optimization.controls.stop_on_convergence
+            || training.updates < convergence.minimum_updates
+            || training.updates < tail
+        {
+            bail!("workflow requires convergence stopping and enough update budget for its minimum and tail windows");
+        }
+    }
+    Ok(())
+}
+
+/// Plan all input groups before admitting bulk data. The workflow uses the
+/// sum for statistical correction while native grants charge each member only.
+pub(super) fn workflow_plan_bound(
+    reference: &FileRef,
+    base: &Path,
+) -> anyhow::Result<(usize, usize, Vec<String>)> {
+    let value = verified_bytes(reference, base, MAX_REQUEST_BYTES)?;
+    let plan: PreparationPlan = serde_json::from_slice(&value)?;
+    let members = member_plans(&plan)?;
+    validate_workflow_training(&members)?;
+    if normalized_source_revision("preparation source", &plan.source_revision)?
+        != BUILD_SOURCE_REVISION
+    {
+        bail!("workflow preparation source differs from the executable");
+    }
+    mission_dispatch::image_digest(&plan.image)?;
+    canonical_tokyo_oss_internal_object("campaign root", &plan.campaign_root)?;
+    let mut sum = 0usize;
+    let mut bound = 0usize;
+    for member in members {
+        sum = sum
+            .checked_add(declared_total_trials_for_rounds(&member, plan.seeds.len())?)
+            .context("workflow trial sum overflow")?;
+        bound = bound.max(member.comparison_family_trials.unwrap_or(0));
+    }
+    Ok((
+        sum,
+        bound,
+        plan.members.into_iter().map(|member| member.id).collect(),
+    ))
 }
 
 pub(super) fn prepare_report(
     args: CampaignPrepareArgs,
     expected_sha: Option<&str>,
+    purpose: PreparationPurpose,
 ) -> anyhow::Result<serde_json::Value> {
     // Bulk data preparation is colocated with ACK inputs. Software tests use
     // local synthetic fixtures and do not establish cloud runtime evidence.
@@ -346,7 +415,22 @@ pub(super) fn prepare_report(
         }
     }
     let mut plan: PreparationPlan = serde_json::from_slice(&plan_bytes)?;
-    let plans = member_plans(&plan)?;
+    let mut plans = member_plans(&plan)?;
+    if let PreparationPurpose::ExecuteWorkflow { comparison_trials } = purpose {
+        validate_workflow_training(&plans)?;
+        for member in &mut plans {
+            member.comparison_family_trials = Some(
+                member
+                    .comparison_family_trials
+                    .unwrap_or(0)
+                    .max(comparison_trials),
+            );
+            member.effective_multiple_testing_trials(declared_total_trials_for_rounds(
+                member,
+                plan.seeds.len(),
+            )?)?;
+        }
+    }
     if normalized_source_revision("preparation source", &plan.source_revision)?
         != BUILD_SOURCE_REVISION
     {
@@ -555,6 +639,33 @@ mod tests {
             }],
         }
     }
+    #[test]
+    fn executable_workflow_rejects_diagnostic_defaults_and_inadequate_training_budgets() {
+        let mut research = CexCampaignResearchPlanV1::canonical();
+        assert!(validate_workflow_training(&[research.clone()]).is_err());
+        let mut training = super::super::tests::paired_mlp_plan_for_tests();
+        training.updates = 4096;
+        training.optimization = Some(alpha_domain::mlp_training::CexMlpOptimizationV1 {
+            learning_rate: 0.0003,
+            controls: hft_research_manifest::mlp_training::MlpOptimizationControlsV1::default(),
+        });
+        research.mlp_training = Some(training);
+        validate_workflow_training(&[research.clone()]).unwrap();
+        research.mlp_training.as_mut().unwrap().updates = 8;
+        assert!(validate_workflow_training(&[research.clone()]).is_err());
+        research.mlp_training.as_mut().unwrap().updates = 4096;
+        research
+            .mlp_training
+            .as_mut()
+            .unwrap()
+            .optimization
+            .as_mut()
+            .unwrap()
+            .controls
+            .stop_on_convergence = false;
+        assert!(validate_workflow_training(&[research]).is_err());
+    }
+
     #[test]
     fn preparation_authentication_rejects_self_consistent_edits_and_other_ledgers() {
         let ledger = alpha_store::AlphaStore::open_in_memory().unwrap();

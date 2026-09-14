@@ -4493,7 +4493,7 @@ mod tests {
         }
     }
 
-    fn paired_mlp_plan_for_tests() -> alpha_domain::CexMlpTrainingPlanV1 {
+    pub(super) fn paired_mlp_plan_for_tests() -> alpha_domain::CexMlpTrainingPlanV1 {
         use alpha_domain::mlp_training::CexMlpInitializationV1;
         alpha_domain::CexMlpTrainingPlanV1 {
             schema_version: "cex-mlp-training-plan-v1".into(),

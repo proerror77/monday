@@ -27,7 +27,7 @@ struct Member {
 #[serde(deny_unknown_fields)]
 struct Plan {
     schema_version: String,
-    preparation_plan: FileRef,
+    preparation_plans: Vec<FileRef>,
     /// Absolute and retained with the plan. Recovery cannot renew it.
     deadline_at: DateTime<Utc>,
     context: String,
@@ -126,7 +126,12 @@ pub fn run(args: CampaignWorkflowArgs) -> anyhow::Result<()> {
     let bytes = read(&path)?;
     let plan: Plan = serde_json::from_slice(&bytes)?;
     let mut ids = BTreeSet::new();
-    if plan.schema_version != SCHEMA || plan.members.is_empty() || plan.members.len() > 32 {
+    if plan.schema_version != SCHEMA
+        || plan.members.is_empty()
+        || plan.members.len() > 32
+        || plan.preparation_plans.is_empty()
+        || plan.preparation_plans.len() > 32
+    {
         bail!("invalid workflow schema or bounded member count");
     }
     crate::prediction_dispatch::validate_cluster_target(&plan.context, &plan.namespace)?;
@@ -156,46 +161,83 @@ pub fn run(args: CampaignWorkflowArgs) -> anyhow::Result<()> {
     if !controller.is_file() || controller.is_symlink() {
         bail!("the bundled canonical Campaign controller is unavailable");
     }
-    let prepared = preparation::prepare_report(
-        CampaignPrepareArgs {
-            plan: base.join(&plan.preparation_plan.path),
-            output_root: root.join("preparations"),
-        },
-        Some(&plan.preparation_plan.sha256),
-    )?;
-    let index_ref = FileRef {
-        path: PathBuf::from(
-            prepared["preparation"]
-                .as_str()
-                .context("preparation output path")?,
-        ),
-        sha256: prepared["sha256"]
-            .as_str()
-            .context("preparation output SHA256")?
-            .into(),
-    };
-    let index: PreparationIndex = serde_json::from_slice(&preparation::verified_bytes(
-        &index_ref,
-        &root,
-        16 * 1024 * 1024,
-    )?)?;
-    let index_root = index_ref
-        .path
-        .parent()
-        .context("preparation index parent")?;
-    if index.members.iter().map(|m| &m.id).collect::<BTreeSet<_>>() != ids {
-        bail!("workflow members differ from the prepared matrix");
+    let mut total_trials = 0usize;
+    let mut comparison_bound = 0usize;
+    let mut prepared_ids = BTreeSet::new();
+    for reference in &plan.preparation_plans {
+        let (trials, bound, members) = preparation::workflow_plan_bound(reference, base)?;
+        total_trials = total_trials
+            .checked_add(trials)
+            .context("workflow comparison budget overflow")?;
+        comparison_bound = comparison_bound.max(bound);
+        for member in members {
+            if !prepared_ids.insert(member) {
+                bail!("duplicate workflow member across input groups");
+            }
+        }
     }
+    if prepared_ids.iter().collect::<BTreeSet<_>>() != ids {
+        bail!("workflow members differ from its input groups");
+    }
+    comparison_bound = comparison_bound.max(total_trials);
+    let mut groups = Vec::new();
+    for reference in &plan.preparation_plans {
+        let prepared = preparation::prepare_report(
+            CampaignPrepareArgs {
+                ledger: args.ledger.clone(),
+                plan: base.join(&reference.path),
+                output_root: root.join("preparations"),
+            },
+            Some(&reference.sha256),
+            preparation::PreparationPurpose::ExecuteWorkflow {
+                comparison_trials: comparison_bound,
+            },
+        )?;
+        let index_ref = FileRef {
+            path: PathBuf::from(
+                prepared["preparation"]
+                    .as_str()
+                    .context("preparation path")?,
+            ),
+            sha256: prepared["sha256"]
+                .as_str()
+                .context("preparation hash")?
+                .into(),
+        };
+        let index: PreparationIndex = serde_json::from_slice(&preparation::verified_bytes(
+            &index_ref,
+            &root,
+            16 * 1024 * 1024,
+        )?)?;
+        groups.push((
+            index,
+            index_ref
+                .path
+                .parent()
+                .context("preparation parent")?
+                .to_owned(),
+        ));
+    }
+    let group_refs = groups
+        .iter()
+        .map(|(index, path)| (index, path.as_path()))
+        .collect::<Vec<_>>();
     let result = execute(
         &plan,
         base,
         &root,
         &lock,
-        &index,
-        index_root,
+        &group_refs,
         &hex::encode(Sha256::digest(bytes)),
     )?;
-    print_json(&result)
+    print_json(&result)?;
+    if result["state"] != "complete" {
+        bail!(
+            "Campaign workflow requires attention; retained status: {}",
+            root.join("workflow-status.json").display()
+        );
+    }
+    Ok(())
 }
 
 fn execute(
@@ -203,14 +245,28 @@ fn execute(
     base: &Path,
     root: &Path,
     lock: &File,
-    index: &PreparationIndex,
-    index_root: &Path,
+    groups: &[(&PreparationIndex, &Path)],
     plan_sha: &str,
 ) -> anyhow::Result<serde_json::Value> {
     let controller = controller_path(base);
+    let mut ids = BTreeSet::new();
+    for (index, _) in groups {
+        for member in &index.members {
+            if !ids.insert(member.id.as_str()) {
+                bail!("duplicate prepared member across input groups");
+            }
+        }
+    }
+    if ids != plan.members.iter().map(|m| m.id.as_str()).collect() {
+        bail!("prepared input groups do not match workflow members");
+    }
     let mut outcomes = Vec::new();
     let mut state = "complete";
     for member in &plan.members {
+        let (index, index_root) = groups
+            .iter()
+            .find(|(index, _)| index.members.iter().any(|m| m.id == member.id))
+            .context("prepared workflow input group missing")?;
         let prepared = index
             .members
             .iter()
@@ -275,6 +331,8 @@ fn execute(
                     .arg(index_root.join(&prepared.freeze.path))
                     .arg("--prepared-freeze-sha256")
                     .arg(&prepared.freeze.sha256)
+                    .arg("--preparation-ledger")
+                    .arg(&index.ledger)
                     .arg("--signer")
                     .arg(base.join(&member.signer.path))
                     .arg("--context")
@@ -366,7 +424,9 @@ if [[ "$mode" == status ]]; then
   elif [[ -e "$dir/generation-0/generation-complete" ]]; then
     state=complete
   else state=incomplete; fi
-  jq -c --arg state "$state" --arg id "$id" '. + {checkpoint_status:$state,generation:0,campaign_id:$id}' "$base/status-header.json"
+  header="$base/status-header.json"
+  if [[ -f "$base/status-header-$id.json" ]]; then header="$base/status-header-$id.json"; fi
+  jq -c --arg state "$state" --arg id "$id" '. + {checkpoint_status:$state,generation:0,campaign_id:$id}' "$header"
   exit 0
 fi
 printf '%s %s\n' "$mode" "$arguments" >>"$base/calls-$id"
@@ -397,7 +457,7 @@ touch "$dir/generation-0/generation-complete"
             let ids = ["first", "second"];
             let plan = Plan {
                 schema_version: SCHEMA.into(),
-                preparation_plan: reference(&control),
+                preparation_plans: vec![reference(&control)],
                 deadline_at: Utc::now() + chrono::TimeDelta::minutes(5),
                 context: "context".into(),
                 namespace: "monday-research".into(),
@@ -411,6 +471,7 @@ touch "$dir/generation-0/generation-complete"
                     .collect(),
             };
             let index = PreparationIndex {
+                ledger: control.clone(),
                 schema_version: "monday.cex_campaign_preparation.v1".into(),
                 plan_sha256: "a".repeat(64),
                 source_revision: BUILD_SOURCE_REVISION.into(),
@@ -447,8 +508,7 @@ touch "$dir/generation-0/generation-complete"
                 self.root.path(),
                 self.root.path(),
                 &self.lock,
-                &self.index,
-                self.root.path(),
+                &[(&self.index, self.root.path())],
                 &"b".repeat(64),
             )
             .unwrap()
@@ -459,6 +519,71 @@ touch "$dir/generation-0/generation-complete"
                 .lines()
                 .count()
         }
+    }
+
+    #[test]
+    fn workflow_runs_distinct_input_groups_without_restarting_completed_members() {
+        let fixture = Fixture::new();
+        let mut first: PreparationIndex =
+            serde_json::from_value(serde_json::to_value(&fixture.index).unwrap()).unwrap();
+        let mut second: PreparationIndex =
+            serde_json::from_value(serde_json::to_value(&fixture.index).unwrap()).unwrap();
+        first.members.truncate(1);
+        second.members.remove(0);
+        second.campaign_inputs.sha256 = "f".repeat(64);
+        std::fs::write(fixture.root.path().join("status-header-second.json"),serde_json::to_vec(&json!({
+            "source_revision":&second.source_revision,"image":&second.image,"campaign_inputs_sha256":&second.campaign_inputs.sha256
+        })).unwrap()).unwrap();
+        let groups = [
+            (&first, fixture.root.path()),
+            (&second, fixture.root.path()),
+        ];
+        let result = execute(
+            &fixture.plan,
+            fixture.root.path(),
+            fixture.root.path(),
+            &fixture.lock,
+            &groups,
+            &"b".repeat(64),
+        )
+        .unwrap();
+        assert_eq!(result["state"], "complete");
+        let again = execute(
+            &fixture.plan,
+            fixture.root.path(),
+            fixture.root.path(),
+            &fixture.lock,
+            &groups,
+            &"b".repeat(64),
+        )
+        .unwrap();
+        assert!(again["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["reused"] == true));
+        for id in ["first", "second"] {
+            assert_eq!(
+                std::fs::read_to_string(fixture.root.path().join(format!("calls-{id}")))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+        }
+        let duplicate = [
+            (&first, fixture.root.path()),
+            (&fixture.index, fixture.root.path()),
+        ];
+        assert!(execute(
+            &fixture.plan,
+            fixture.root.path(),
+            fixture.root.path(),
+            &fixture.lock,
+            &duplicate,
+            &"b".repeat(64)
+        )
+        .is_err());
     }
 
     #[test]
@@ -492,8 +617,7 @@ touch "$dir/generation-0/generation-complete"
             fixture.root.path(),
             fixture.root.path(),
             &fixture.lock,
-            &fixture.index,
-            fixture.root.path(),
+            &[(&fixture.index, fixture.root.path())],
             &"b".repeat(64)
         )
         .is_err());
@@ -551,8 +675,7 @@ touch "$dir/generation-0/generation-complete"
             fixture.root.path(),
             fixture.root.path(),
             &fixture.lock,
-            &fixture.index,
-            fixture.root.path(),
+            &[(&fixture.index, fixture.root.path())],
             &"b".repeat(64)
         )
         .is_err());

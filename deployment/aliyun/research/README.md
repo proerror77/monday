@@ -1510,3 +1510,7 @@ replay becomes eligible. Verify actual Job/cgroup timing rather than assuming
 an iteration-count extrapolation proves resource sufficiency. Keep detailed
 curves, model archives, native ledger inspection and final state archives in
 ACK/OSS; return only bounded report receipts/details to the workstation.
+
+The native [Campaign workflow](../../../docs/research/CAMPAIGN_WORKFLOW.md)
+coordinates prepared input groups, guarded training, terminal readback and
+recovery from a frozen configuration in ACK.
