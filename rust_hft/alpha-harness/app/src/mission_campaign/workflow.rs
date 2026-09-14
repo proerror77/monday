@@ -376,7 +376,7 @@ fn execute_inner(
                 .arg("--control")
                 .arg(base.join(&member.control.path))
                 .arg("--alpha-harness")
-                .arg(std::env::current_exe()?);
+                .arg("/usr/local/bin/alpha-harness");
             // Inherit the locked open file description into the controller so
             // parent interruption cannot admit a second live coordinator.
             let status = command

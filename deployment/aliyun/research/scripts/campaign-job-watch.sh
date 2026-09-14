@@ -97,7 +97,11 @@ wait_for_campaign_terminal() {
       return 65
     fi
     if [[ "$failed" == true ]]; then
-      read_campaign_pods >"$pod_status.partial" && mv -- "$pod_status.partial" "$pod_status" || true
+      if read_campaign_pods >"$pod_status.partial"; then
+        mv -- "$pod_status.partial" "$pod_status" || return 75
+      else
+        rm -f -- "$pod_status.partial"
+      fi
       jq -n --arg request "$request_sha256" --arg identity "$(sha256_file "$identity")" \
         --arg job "$(sha256_file "$job_status")" --arg uid "$bound_job_uid" \
         '{schema_version:"monday.campaign_terminal_failure.v1",reason:"job_failed",request_sha256:$request,job_uid:$uid,dispatch_identity_sha256:$identity,job_status_sha256:$job,accounting_changed:false}' \
