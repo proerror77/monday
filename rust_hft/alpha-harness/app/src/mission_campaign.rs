@@ -1,5 +1,6 @@
 pub(crate) mod final_evaluation;
 pub(crate) mod preparation;
+pub(crate) mod workflow;
 use crate::{
     cli::{
         print_json, CampaignExecuteArgs, CampaignFinalizeArgs, CampaignFreezeArgs, CampaignIdArgs,

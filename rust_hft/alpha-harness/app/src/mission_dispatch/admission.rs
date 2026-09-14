@@ -297,6 +297,7 @@ impl Admission {
             context,
             namespace,
             Purpose::Dispatch,
+            false,
         )
     }
 
@@ -314,6 +315,25 @@ impl Admission {
             context,
             namespace,
             Purpose::Settlement,
+            false,
+        )
+    }
+
+    pub(super) fn open_for_readback(
+        path: &Path,
+        validated: &ValidatedSubmission,
+        manifest: &Value,
+        context: &str,
+        namespace: &str,
+    ) -> anyhow::Result<Self> {
+        Self::load(
+            path,
+            validated,
+            manifest,
+            context,
+            namespace,
+            Purpose::Settlement,
+            true,
         )
     }
 
@@ -324,6 +344,7 @@ impl Admission {
         context: &str,
         namespace: &str,
         purpose: Purpose,
+        read_only: bool,
     ) -> anyhow::Result<Self> {
         let control = read_control(path)?;
         let signed: SignedCampaignRootGrantV1 = read_json(&control.signed_root_grant_path)?;
@@ -340,7 +361,11 @@ impl Admission {
         )?;
         // Opening the existing database read/write retains DuckDB's process
         // exclusion. Never create an empty replacement database.
-        let store = AlphaStore::open(&control.ledger_path)?;
+        let store = if read_only {
+            AlphaStore::open_read_only(&control.ledger_path)?
+        } else {
+            AlphaStore::open(&control.ledger_path)?
+        };
         let verified = match purpose {
             Purpose::Dispatch => verify(&signed, &control.trusted_keys_path)?,
             Purpose::Settlement => {

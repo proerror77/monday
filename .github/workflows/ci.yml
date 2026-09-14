@@ -124,9 +124,11 @@ jobs:
         if: steps.scope.outputs.control == 'true'
         run: |
           bash -n deployment/aliyun/research/scripts/campaign-cycle-controller.sh \
+            deployment/aliyun/research/scripts/campaign-job-watch.sh \
             deployment/aliyun/research/test-campaign-cycle-controller.sh
-          shellcheck -e SC2154 \
+          shellcheck -x -e SC2154 \
             deployment/aliyun/research/scripts/campaign-cycle-controller.sh \
+            deployment/aliyun/research/scripts/campaign-job-watch.sh \
             deployment/aliyun/research/test-campaign-cycle-controller.sh
           deployment/aliyun/research/test-campaign-cycle-controller.sh
 

@@ -318,6 +318,13 @@ fn restore_inputs(
 }
 
 pub fn prepare(args: CampaignPrepareArgs) -> anyhow::Result<()> {
+    print_json(&prepare_report(args, None)?)
+}
+
+pub(super) fn prepare_report(
+    args: CampaignPrepareArgs,
+    expected_sha: Option<&str>,
+) -> anyhow::Result<serde_json::Value> {
     // Bulk data preparation is colocated with ACK inputs. Software tests use
     // local synthetic fixtures and do not establish cloud runtime evidence.
     #[cfg(not(test))]
@@ -330,7 +337,15 @@ pub fn prepare(args: CampaignPrepareArgs) -> anyhow::Result<()> {
     let ledger_path = std::fs::canonicalize(&args.ledger)?;
     let ledger = alpha_store::AlphaStore::open_read_only(&ledger_path)?;
     let base = plan_path.parent().unwrap();
-    let mut plan: PreparationPlan = serde_json::from_slice(&bytes(&plan_path, MAX_REQUEST_BYTES)?)?;
+    let plan_bytes = bytes(&plan_path, MAX_REQUEST_BYTES)?;
+    if let Some(expected) = expected_sha {
+        if hex::encode(Sha256::digest(&plan_bytes))
+            != normalized_sha256("workflow preparation plan", expected)?
+        {
+            bail!("workflow preparation plan SHA256 mismatch");
+        }
+    }
+    let mut plan: PreparationPlan = serde_json::from_slice(&plan_bytes)?;
     let plans = member_plans(&plan)?;
     if normalized_source_revision("preparation source", &plan.source_revision)?
         != BUILD_SOURCE_REVISION
@@ -424,8 +439,8 @@ pub fn prepare(args: CampaignPrepareArgs) -> anyhow::Result<()> {
                 bail!("retained preparation member report differs from its request");
             }
         }
-        return print_json(
-            &serde_json::json!({"status":"ready","preparation":index_path,"sha256":hex::encode(Sha256::digest(bytes(&index_path,MAX_METADATA_BYTES)?)),"reused":true,"bulk_input_reads":0}),
+        return Ok(
+            serde_json::json!({"status":"ready","preparation":index_path,"sha256":hex::encode(Sha256::digest(bytes(&index_path,MAX_METADATA_BYTES)?)),"reused":true,"bulk_input_reads":0}),
         );
     }
     let ready_path = output.join("input-ready.json");
@@ -509,8 +524,8 @@ pub fn prepare(args: CampaignPrepareArgs) -> anyhow::Result<()> {
         members,
     };
     let reference = publish(&output, Path::new("preparation.json"), &index)?;
-    print_json(
-        &serde_json::json!({"status":"ready","preparation":index_path,"sha256":reference.sha256,
+    Ok(
+        serde_json::json!({"status":"ready","preparation":index_path,"sha256":reference.sha256,
         "reused":false,"input_validation_reused":reused_inputs,"members":index.members.len()}),
     )
 }

@@ -218,6 +218,12 @@ case "$1 $2" in
     ;;
   "mission dispatch")
     submission="$(value_after --submission "$@")"
+    if [[ "$3" == status ]]; then
+      jq '{schema_version:"monday.campaign_dispatch_status.v1",request_sha256,job_name,
+        operation_id:("op-" + .request_sha256),job_uid:("uid-" + .job_name),authority_deadline_epoch:4102444800,
+        accounting_changed:false}' "$submission"
+      exit 0
+    fi
     if [[ "$3" == settle ]]; then
       if [[ "${FAKE_FAIL_SETTLEMENT_ONCE:-0}" == 1 && ! -e "$FAKE_STATE/settlement-failed-once" ]]; then
         : >"$FAKE_STATE/settlement-failed-once"
@@ -304,14 +310,17 @@ case " $* " in
     exit 0
     ;;
   *" get job/"*)
-    jq -n --arg job_name "$job_name" --arg request_sha256 "$request_sha256" '{
-      metadata:{name:$job_name,annotations:{"research.monday/request-sha256":$request_sha256}},
-      status:{conditions:[{type:"Complete",status:"True"}]}
+    printf '%s\n' "$*" >>"$FAKE_STATE/job-reads"
+    jq -n --arg job_name "$job_name" --arg request_sha256 "$request_sha256" \
+      --arg state "${FAKE_JOB_STATE:-complete}" --arg uid "${FAKE_JOB_UID:-uid-$job_name}" '{
+      metadata:{name:$job_name,uid:$uid,annotations:{"research.monday/request-sha256":$request_sha256}},
+      status:{conditions:(if $state == "failed" then [{type:"Failed",status:"True",reason:"BackoffLimitExceeded"}]
+        elif $state == "running" then [] else [{type:"Complete",status:"True"}] end)}
     }'
     ;;
-  *" get pod/"*)
-    jq -n --arg request_sha256 "$request_sha256" --arg job_name "$job_name" '{
-      metadata:{annotations:{"research.monday/request-sha256":$request_sha256},ownerReferences:[{kind:"Job",name:$job_name}]},
+  *" get pod/"*|*" get pods "*)
+    document=$(jq -n --arg request_sha256 "$request_sha256" --arg job_name "$job_name" '{
+      metadata:{name:($job_name|sub("job-";"pod-")),uid:("pod-uid-" + $job_name),annotations:{"research.monday/request-sha256":$request_sha256},ownerReferences:[{kind:"Job",name:$job_name,uid:("uid-" + $job_name)}]},
       status:{
         phase:"Succeeded",
         containerStatuses:[{
@@ -320,7 +329,8 @@ case " $* " in
           state:{terminated:{exitCode:0}}
         }]
       }
-    }'
+    }')
+    if [[ " $* " == *" get pods "* ]]; then jq '{items:[.]}' <<<"$document"; else printf '%s\n' "$document"; fi
     ;;
   *" delete secret "*)
     printf '%s\n' "$job_name-inputs" >>"$FAKE_STATE/deleted-secrets"
@@ -741,7 +751,8 @@ jq -e '
 test "$(<"$FAKE_STATE/signer-count")" == 2
 test "$(<"$FAKE_STATE/dispatch-count")" == 2
 test ! -e "$FAKE_STATE/deleted-secrets"
-test "$(grep -c -- '--timeout=7h' "$FAKE_STATE/job-waits")" == 2
+test ! -e "$FAKE_STATE/job-waits"
+test "$(wc -l < "$FAKE_STATE/job-reads" | tr -d ' ')" == 2
 for generation in 0 1; do
   test -e "$root/campaign-root/cycle/generation-$generation/provenance-readback-complete"
   test -e "$root/campaign-root/cycle/generation-$generation/result-readback-complete"
@@ -1356,4 +1367,55 @@ fi
 grep -Fq 'retained prepared freeze is invalid' "$root/prepared-drift.err"
 [[ $(cat "$FAKE_STATE/dispatch-count") == 1 ]]
 printf 'prepared freeze reuse and resume: PASS\n'
+mv "$root/prepared-offline-input" "$start_dir/input"
+
+runtime_case() (
+  local scenario="$1" case_root="$root/runtime-$1" case_work fake_state before
+  case_work="$case_root/cycle"
+  fake_state="$case_root/state"
+  mkdir -p "$fake_state"
+  : >"$fake_state/result-failed-once"
+  local args=("${controller_args[@]}")
+  for ((i=0; i<${#args[@]}; i++)); do
+    if [[ "${args[i]}" == --work-dir ]]; then args[i + 1]="$case_work";
+    elif [[ "${args[i]}" == --max-follow-ups ]]; then args[i + 1]=0; fi
+  done
+  args+=(--run-to-terminal --job-timeout 1s)
+  local state=complete uid="uid-job-g0"
+  case "$scenario" in failed) state=failed;; timeout) state=running;; identity) uid=foreign-job-uid;; esac
+  local code=0
+  (cd "$start_dir" && FAKE_STATE="$fake_state" FAKE_JOB_STATE="$state" FAKE_JOB_UID="$uid" "$controller" "${args[@]}") >"$case_root/first.out" 2>"$case_root/first.err" || code=$?
+  if [[ "$scenario" == complete ]]; then
+    [[ "$code" == 0 ]] || { cat "$case_root/first.err" >&2; exit 1; }
+    [[ -s "$case_work/cycle-result.json" ]]
+  else
+    [[ "$code" != 0 && -s "$case_work/generation-0/request.json" && -s "$case_work/generation-0/submission.json" ]]
+    [[ ! -e "$fake_state/settlement-count" ]]
+    if [[ "$scenario" == failed ]]; then
+      jq -e '.reason == "job_failed" and .accounting_changed == false' "$case_work/generation-0/terminal-failure" >/dev/null
+      "$controller" status --work-dir "$case_work" | jq -e '.checkpoint_status == "terminal_failure" and .termination_reason == "job_failed"' >/dev/null
+      if (cd "$start_dir" && FAKE_STATE="$fake_state" "$controller" "${args[@]}") >"$case_root/repeat.out" 2>"$case_root/repeat.err"; then exit 1; fi
+      [[ $(cat "$fake_state/dispatch-count") == 1 ]]
+      : >"$case_work/generation-0/terminal-failure"
+      if "$controller" status --work-dir "$case_work" >"$case_root/corrupt.out" 2>&1; then exit 1; fi
+      printf 'Campaign runtime %s: PASS\n' "$scenario"
+      exit 0
+    elif [[ "$scenario" == timeout ]]; then
+      before=$(jq -r .deadline_epoch "$case_work/generation-0/job-watch.json")
+      jq -e '.reason == "deadline_exhausted"' "$case_work/generation-0/wait-state.json" >/dev/null
+      if (cd "$start_dir" && FAKE_STATE="$fake_state" FAKE_JOB_STATE=running "$controller" "${args[@]}") >"$case_root/repeat.out" 2>"$case_root/repeat.err"; then exit 1; fi
+      [[ $(jq -r .deadline_epoch "$case_work/generation-0/job-watch.json") == "$before" ]]
+      [[ ! -e "$case_work/generation-0/terminal-failure" ]]
+    else
+      jq -e '.reason == "job_identity_mismatch"' "$case_work/generation-0/wait-state.json" >/dev/null
+      [[ ! -e "$case_work/generation-0/terminal-failure" ]]
+    fi
+  fi
+  (cd "$start_dir" && FAKE_STATE="$fake_state" "$controller" "${args[@]}") >"$case_root/recovery.out" 2>"$case_root/recovery.err" || { cat "$case_root/recovery.err" >&2; exit 1; }
+  [[ -s "$case_work/cycle-result.json" ]]
+  [[ $(cat "$fake_state/full-freeze-count") == 1 && $(cat "$fake_state/signer-count") == 1 && $(cat "$fake_state/dispatch-count") == 1 ]]
+  [[ ! -e "$fake_state/job-waits" ]]
+  printf 'Campaign runtime %s: PASS\n' "$scenario"
+)
+for scenario in complete failed timeout identity; do runtime_case "$scenario"; done
 echo "campaign cycle controller test: PASS"
