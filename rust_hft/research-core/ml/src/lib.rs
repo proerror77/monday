@@ -1312,6 +1312,7 @@ fn train_parsed_contract_model(
     let mut loss_history = Vec::new();
     let mut raw_gradient_l2_history = Vec::new();
     let mut applied_gradient_l2_history = Vec::new();
+    let mut completed_updates = 0;
     let mut optimizer = AdamConfig::new().init();
     let features = rows
         .iter()
@@ -1376,6 +1377,15 @@ fn train_parsed_contract_model(
                     applied_gradient_l2_history[update - 1],
                 );
             }
+            if controls
+                .should_stop(&loss_history)
+                .map_err(ContractTrainingError::Artifact)?
+            {
+                // The final forward pass below records this post-update loss
+                // once, using the same kernel as fixed-budget training.
+                loss_history.pop();
+                break;
+            }
         }
         let gradients = GradientsParams::from_grads(loss.backward(), &model);
         max_gradient_abs =
@@ -1400,6 +1410,7 @@ fn train_parsed_contract_model(
             gradients
         };
         model = optimizer.step(config.learning_rate, model, gradients);
+        completed_updates = update + 1;
         max_parameter_abs =
             max_parameter_abs.max(parameter_abs_max(&model.clone().valid()).map_err(|cause| {
                 ContractTrainingError::Artifact(format!(
@@ -1452,19 +1463,19 @@ fn train_parsed_contract_model(
             .map_err(|cause| {
                 ContractTrainingError::Artifact(format!(
                     "{cause}; completed_updates={}, initial_loss={}, loss={}; latest_gradient_update={}, latest_raw_gradient_l2={:?}, latest_applied_gradient_l2={:?}",
-                    config.epochs,
+                    completed_updates,
                     loss_history[0],
-                    loss_history.last().unwrap(), config.epochs,
+                    loss_history.last().unwrap(), completed_updates,
                     raw_gradient_l2_history.last(), applied_gradient_l2_history.last(),
                 ))
             })?;
         training_progress_event(
             &request_semantic_sha256,
             config.epochs,
-            config.epochs,
+            completed_updates,
             final_loss,
-            raw_gradient_l2_history[config.epochs - 1],
-            applied_gradient_l2_history[config.epochs - 1],
+            raw_gradient_l2_history[completed_updates - 1],
+            applied_gradient_l2_history[completed_updates - 1],
         );
     }
     let model = fold_target_inverse(normalized_model, &target_transform)?;
@@ -1508,25 +1519,32 @@ fn train_parsed_contract_model(
                     .count(),
                 raw_gradient_l2_history,
                 applied_gradient_l2_history,
-                convergence: MlpConvergenceDiagnosticsV1::from_loss_history(
-                    &controls.convergence,
-                    &loss_history,
-                )
-                .map_err(ContractTrainingError::Artifact)?,
+                convergence: controls
+                    .convergence_diagnostics(&loss_history)
+                    .map_err(ContractTrainingError::Artifact)?,
             })
         })
         .transpose()?;
+    let exit_reason = match &stability {
+        Some(value) if value.controls.stop_on_convergence => match value.convergence.status {
+            MlpConvergenceStatusV1::Converged => "training_converged",
+            MlpConvergenceStatusV1::BudgetExhaustedNotConverged => {
+                "update_budget_exhausted_not_converged"
+            }
+        },
+        _ => "fixed_update_budget_completed",
+    };
     let learning = MlpLearningDiagnosticsV1 {
         schema_version: "mlp-learning-diagnostics-v1".into(),
         updates_requested: config.epochs,
-        updates_completed: config.epochs,
+        updates_completed: completed_updates,
         initial_parameters_sha256: initial_parameters_sha256.as_str().into(),
         target_transform,
         loss_history,
         max_gradient_abs,
         max_parameter_abs,
         training_prediction,
-        exit_reason: "fixed_update_budget_completed".into(),
+        exit_reason: exit_reason.into(),
         stability,
     };
     learning

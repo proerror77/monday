@@ -20,9 +20,8 @@ use alpha_domain::{
 };
 use alpha_engine::{
     baselines::{
-        evaluate_cex_baselines, evaluate_cex_supervised_model, CexBurnFitIdentity,
-        CexSupervisedDecisionPolicyV2, CexSupervisedModelCandidateV2,
-        CexSupervisedModelEvaluationV2,
+        prepare_cex_baselines, CexBurnFitIdentity, CexSupervisedDecisionPolicyV2,
+        CexSupervisedModelCandidateV2, CexSupervisedModelEvaluationV2, VerifiedCexBaselineRun,
     },
     engines::{
         CexCombinationResearchArtifactV1, CexFactorBankMcts, CexFactorBankMctsCheckpointV1,
@@ -390,7 +389,7 @@ impl CexSupervisedModelSelectionV1 {
         self.selected_candidate.validate()?;
         if self.schema_version != CEX_SUPERVISED_MODEL_SELECTION_SCHEMA_VERSION
             || self.mission_id.trim().is_empty()
-            || self.criterion != "passed_then_adjusted_score_desc_ridge_cart_burn_tie_break"
+            || !matches!(self.criterion.as_str(), "passed_then_adjusted_score_desc_ridge_cart_burn_tie_break" | "training_admitted_then_passed_then_adjusted_score_desc_ridge_cart_burn_tie_break")
             || self.deployment_authority
             || self.order_submission_authority
         {
@@ -1316,7 +1315,7 @@ pub(crate) fn execute_report(
         symbol: control_mission.spec.instrument.symbol.as_str(),
         venue: burn_venue.as_str(),
     });
-    let baseline_run = evaluate_cex_baselines(
+    let baseline_run = prepare_cex_baselines(
         &baseline_context,
         &factor_bank,
         &baseline_policy,
@@ -2329,7 +2328,7 @@ fn run_cex_supervised_model_research(
     mission: &CexResearchMissionArtifactV1,
     factor_bank: &CexFactorBankRevisionV2,
     context: &EngineContext<'_>,
-    baselines: &alpha_engine::baselines::CexBaselineRun,
+    baselines: &VerifiedCexBaselineRun<'_, '_>,
     decision_policy: &CexSupervisedDecisionPolicyV2,
 ) -> anyhow::Result<Option<CexSupervisedModelEvaluationV2>> {
     let (Some(ridge), Some(cart), Some(burn)) =
@@ -2366,15 +2365,18 @@ fn run_cex_supervised_model_research(
     });
     persist_supervised_model_attempts(results_dir, &attempts)?;
     let ridge = run_supervised_model_attempt(results_dir, &mut attempts, "ridge", || {
-        evaluate_cex_supervised_model(context, factor_bank, ridge, decision_policy)
+        baselines
+            .evaluate_supervised_model(ridge.model_kind, decision_policy)
             .map_err(|error| anyhow::anyhow!("ridge supervised evaluation failed: {error}"))
     })?;
     let cart = run_supervised_model_attempt(results_dir, &mut attempts, "cart", || {
-        evaluate_cex_supervised_model(context, factor_bank, cart, decision_policy)
+        baselines
+            .evaluate_supervised_model(cart.model_kind, decision_policy)
             .map_err(|error| anyhow::anyhow!("shallow CART supervised evaluation failed: {error}"))
     })?;
     let burn = run_supervised_model_attempt(results_dir, &mut attempts, "burn_mlp", || {
-        evaluate_cex_supervised_model(context, factor_bank, burn, decision_policy)
+        baselines
+            .evaluate_supervised_model(burn.model_kind, decision_policy)
             .map_err(|error| anyhow::anyhow!("Burn MLP supervised evaluation failed: {error}"))
     })?;
     let mut metric_inputs = Vec::new();
@@ -2421,11 +2423,15 @@ fn run_cex_supervised_model_research(
             }),
         );
     }
-    let selected = select_supervised_model(ridge, cart, burn);
+    let burn_training_admitted =
+        alpha_engine::baselines::baseline_training_admitted(baselines.burn.as_ref().unwrap());
+    let selected = select_supervised_model(ridge, cart, burn, burn_training_admitted);
     let selection = CexSupervisedModelSelectionV1 {
         schema_version: CEX_SUPERVISED_MODEL_SELECTION_SCHEMA_VERSION.to_string(),
         mission_id: selected.candidate.mission_id.clone(),
-        criterion: "passed_then_adjusted_score_desc_ridge_cart_burn_tie_break".to_string(),
+        criterion:
+            "training_admitted_then_passed_then_adjusted_score_desc_ridge_cart_burn_tie_break"
+                .to_string(),
         selected_candidate: content_reference(
             &selected.candidate.artifact_id,
             &selected.candidate,
@@ -2470,12 +2476,13 @@ fn select_supervised_model(
     ridge: CexSupervisedModelEvaluationV2,
     cart: CexSupervisedModelEvaluationV2,
     burn: CexSupervisedModelEvaluationV2,
+    burn_training_admitted: bool,
 ) -> CexSupervisedModelEvaluationV2 {
     let mut selected = ridge;
     if supervised_model_ranks_ahead(&cart, &selected) {
         selected = cart;
     }
-    if supervised_model_ranks_ahead(&burn, &selected) {
+    if burn_training_admitted && supervised_model_ranks_ahead(&burn, &selected) {
         selected = burn;
     }
     selected
@@ -3967,6 +3974,9 @@ fn decode_verified_execution_report(
                 candidate_reference.clone(),
             );
             if candidate_reference == selection.selected_candidate {
+                if !alpha_engine::baselines::baseline_training_admitted(baseline) {
+                    bail!("published selected model did not satisfy its declared training convergence requirement");
+                }
                 selected_candidate = Some(candidate);
             }
         }
@@ -6318,6 +6328,92 @@ pub(crate) mod tests {
         let factor_bank_typed: CexFactorBankRevisionV2 =
             serde_json::from_slice(&std::fs::read(results.join("factor-bank.json")).unwrap())
                 .unwrap();
+        // The prepared run owns admitted, immutable artifacts and borrows the
+        // exact context. Repeated supervised consumption must preserve evidence
+        // without performing another independent training pass.
+        let verified = prepare_cex_baselines(
+            &context,
+            &factor_bank_typed,
+            &policy,
+            &fixture.mission.semantic_id().unwrap(),
+            fixture.mission.spec.hypotheses[0].target.clone(),
+            &fixture.mission.spec.policies.evaluation,
+            Some(CexBurnFitIdentity {
+                symbol: "BTCUSDT",
+                venue: "binance-usdm",
+            }),
+        )
+        .unwrap();
+        let decision = CexSupervisedDecisionPolicyV2::controlled_v2();
+        for kind in [
+            CexBaselineModelKindV1::Ridge,
+            CexBaselineModelKindV1::ShallowCart,
+            CexBaselineModelKindV1::BurnMlp,
+        ] {
+            let first = verified.evaluate_supervised_model(kind, &decision).unwrap();
+            assert_eq!(
+                first,
+                verified.evaluate_supervised_model(kind, &decision).unwrap()
+            );
+            first.validate().unwrap();
+        }
+        let ridge_evaluation = verified
+            .evaluate_supervised_model(CexBaselineModelKindV1::Ridge, &decision)
+            .unwrap();
+        let cart_evaluation = verified
+            .evaluate_supervised_model(CexBaselineModelKindV1::ShallowCart, &decision)
+            .unwrap();
+        let mut burn_evaluation = verified
+            .evaluate_supervised_model(CexBaselineModelKindV1::BurnMlp, &decision)
+            .unwrap();
+        // Exercise ranking separately: even an attractive statistical score
+        // cannot override a failed, independently checked training requirement.
+        burn_evaluation.candidate.evaluation.passed = true;
+        burn_evaluation.candidate.evaluation.score = ridge_evaluation
+            .candidate
+            .evaluation
+            .score
+            .max(cart_evaluation.candidate.evaluation.score)
+            + 1.0;
+        assert_eq!(
+            select_supervised_model(
+                ridge_evaluation.clone(),
+                cart_evaluation.clone(),
+                burn_evaluation.clone(),
+                true
+            )
+            .candidate
+            .model_kind,
+            CexBaselineModelKindV1::BurnMlp
+        );
+        assert_ne!(
+            select_supervised_model(ridge_evaluation, cart_evaluation, burn_evaluation, false)
+                .candidate
+                .model_kind,
+            CexBaselineModelKindV1::BurnMlp
+        );
+        let original = verified.ridge.as_ref().unwrap();
+        assert_eq!(
+            verified
+                .evaluate_supervised_model(CexBaselineModelKindV1::Ridge, &decision)
+                .unwrap(),
+            alpha_engine::baselines::evaluate_cex_supervised_model(
+                &context,
+                &factor_bank_typed,
+                original,
+                &decision
+            )
+            .unwrap()
+        );
+        let mut tampered = original.clone();
+        tampered.folds[0].predictions[0] += 0.1;
+        assert!(alpha_engine::baselines::evaluate_cex_supervised_model(
+            &context,
+            &factor_bank_typed,
+            &tampered,
+            &decision
+        )
+        .is_err());
         let ridge_typed: CexBaselineArtifactV1 = serde_json::from_value(ridge.clone()).unwrap();
         let cart_typed: CexBaselineArtifactV1 = serde_json::from_value(cart.clone()).unwrap();
         let gate_typed: CexBaselineGateV1 = serde_json::from_value(gate.clone()).unwrap();
@@ -7864,7 +7960,7 @@ pub(crate) mod tests {
             .load_rows(&fixture.mission.spec.evaluation_protocol.costs)
             .unwrap();
         let dataset = prepare_dataset(rows, &fixture.mission.spec.evaluation_protocol).unwrap();
-        let failed_baselines = evaluate_cex_baselines(
+        let failed_baselines = alpha_engine::baselines::evaluate_cex_baselines(
             &dataset.engine_context(),
             &factor_bank,
             &baseline_policy,
