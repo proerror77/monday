@@ -1043,6 +1043,11 @@ pub(crate) fn render_prepared_cex_bundle(
         .transpose()?
         .unwrap_or(CexBaselinePolicyV1::controlled_v1(BASELINE_POLICY_ID)?)
         .with_mlp_training(mlp_training.clone())?;
+    let baseline_policy = if research_plan.comparison_family_trials.is_some() {
+        baseline_policy.with_comparison_trials(multiple_testing_trials)?
+    } else {
+        baseline_policy
+    };
     let supervised_decision_policy = research_plan
         .search_policy_revision
         .position_policy
@@ -1474,6 +1479,31 @@ pub(crate) mod tests {
         assert_eq!(
             compared.mission.spec.search.multiple_testing_trials,
             default_trials() * 3
+        );
+        let scoring = crate::mission_runner::bound_baseline_policy(&compared.mission).unwrap();
+        assert_eq!(
+            scoring.evaluator_config.multiple_testing_trials,
+            default_trials() * 3
+        );
+        let mut request = crate::mission_campaign::valid_request_for_tests();
+        request.research_plan = invalid.clone();
+        crate::mission_campaign::validate_terminal_mission_revision_binding(
+            &compared.mission,
+            &request,
+        )
+        .unwrap();
+        let mut undercounted = compared.mission.clone();
+        undercounted.spec.policies.baseline.content_sha256 =
+            CexBaselinePolicyV1::controlled_v1(BASELINE_POLICY_ID)
+                .unwrap()
+                .content_hash()
+                .unwrap();
+        assert!(
+            crate::mission_campaign::validate_terminal_mission_revision_binding(
+                &undercounted,
+                &request
+            )
+            .is_err()
         );
         invalid.comparison_family_trials = Some(default_trials() - 1);
         assert!(render_prepared_cex_bundle(&inputs, &invalid, 7, default_trials()).is_err());

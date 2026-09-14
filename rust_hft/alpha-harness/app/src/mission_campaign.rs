@@ -2847,6 +2847,17 @@ pub(crate) fn validate_terminal_mission_revision_binding(
     if mission.spec.mlp_training != expected_mlp {
         bail!("terminal Mission MLP profile differs from the admitted paired training plan");
     }
+    if request.research_plan.comparison_family_trials.is_some() {
+        let expected_trials = request
+            .research_plan
+            .effective_multiple_testing_trials(request.declared_total_trials)?;
+        let policy = crate::mission_runner::bound_baseline_policy(mission)?;
+        if policy.evaluator_config.multiple_testing_trials != expected_trials
+            || policy.schema_version != alpha_domain::CEX_BASELINE_POLICY_SCHEMA_V4
+        {
+            bail!("terminal supervised score omitted the registered comparison family");
+        }
+    }
     let expected = &request.research_plan.search_policy_revision;
     match (
         expected.research_delta.as_ref(),
