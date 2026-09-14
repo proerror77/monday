@@ -331,17 +331,7 @@ impl FormulaEvaluator {
     ) -> Result<Self, String> {
         policy.validate()?;
         self.entry_policy = policy.holding.as_ref().map(|_| policy.clone());
-        self.with_holding_policy(policy.holding.as_ref())
-    }
-
-    pub fn with_holding_policy(
-        mut self,
-        holding: Option<&hft_research_manifest::model::HorizonHoldingPolicyV1>,
-    ) -> Result<Self, String> {
-        if let Some(policy) = holding {
-            policy.duration_micros()?;
-        }
-        self.holding = holding.cloned();
+        self.holding = policy.holding.clone();
         Ok(self)
     }
 

@@ -1,7 +1,8 @@
 # H1 holding and evidence contract
 
-Implementation and validation are in progress under #1182. No H1 run may start
-until this contract is implemented, tested, reviewed and merged.
+The holding implementation and focused regression checks are tracked by #1182
+and PR #1183. H1 starts only after reviewed code and current-source CI are
+merged, with its workflow and signed budget prerequisites satisfied.
 
 ## Clock and position
 
@@ -90,3 +91,6 @@ run. A code merge, precheck or submission does not prove a terminal experiment.
 
 A completed fixed holding comparison returns `fixed_comparison_complete` from
 learning. It cannot automatically change the entry policy or create H2/H3.
+
+Fill prices, quantity and holding-time evidence here come from event replay.
+Live runtime activation follows its separately enforced execution contract.
