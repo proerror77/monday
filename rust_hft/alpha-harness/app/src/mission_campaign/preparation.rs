@@ -640,6 +640,39 @@ mod tests {
         }
     }
     #[test]
+    fn ridge_workflow_plans_its_budget_without_requiring_mlp_or_reading_bulk_inputs() {
+        let root = tempfile::tempdir().unwrap();
+        let mut plan = plan();
+        plan.base_research_plan.supervised_model_scope =
+            alpha_domain::CexSupervisedModelScopeV1::RidgeOnly;
+        plan.base_research_plan.holding =
+            Some(hft_research_manifest::model::HorizonHoldingPolicyV1 {
+                horizon_millis: 5000,
+            });
+        plan.base_research_plan.comparison_family_trials = Some(138);
+        let bytes = serde_json::to_vec(&plan).unwrap();
+        let path = root.path().join("plan.json");
+        std::fs::write(&path, &bytes).unwrap();
+        let reference = FileRef {
+            path: path.clone(),
+            sha256: hex::encode(Sha256::digest(&bytes)),
+        };
+        let (trials, bound, ids) = workflow_plan_bound(&reference, root.path()).unwrap();
+        assert_eq!(
+            trials,
+            declared_total_trials_for_rounds(&plan.base_research_plan, 2).unwrap()
+        );
+        assert_eq!(bound, 138);
+        assert_eq!(ids, vec!["first"]);
+        assert!(!root.path().join("missing.json").exists());
+        let changed = FileRef {
+            path,
+            sha256: "a".repeat(64),
+        };
+        assert!(workflow_plan_bound(&changed, root.path()).is_err());
+    }
+
+    #[test]
     fn executable_workflow_rejects_diagnostic_defaults_and_inadequate_training_budgets() {
         let mut research = CexCampaignResearchPlanV1::canonical();
         assert!(validate_workflow_training(&[research.clone()]).is_err());

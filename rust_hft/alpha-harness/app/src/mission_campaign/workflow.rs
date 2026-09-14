@@ -248,6 +248,31 @@ fn execute(
     groups: &[(&PreparationIndex, &Path)],
     plan_sha: &str,
 ) -> anyhow::Result<serde_json::Value> {
+    match execute_inner(plan, base, root, lock, groups, plan_sha) {
+        Ok(report) => Ok(report),
+        Err(error) => {
+            data_mission::write_json_atomic(
+                &root.join("workflow-status.json"),
+                &json!({
+                    "schema_version":"monday.cex_campaign_workflow_report.v1", "plan_sha256":plan_sha,
+                    "state":"needs_attention", "failure":error.to_string(),
+                    "deadline_at":plan.deadline_at, "declared_members":plan.members.len(),
+                    "accounting_source":"authenticated_campaign_ledger", "native_cycle_state":root.join("cycles")
+                }),
+            )?;
+            Err(error)
+        }
+    }
+}
+
+fn execute_inner(
+    plan: &Plan,
+    base: &Path,
+    root: &Path,
+    lock: &File,
+    groups: &[(&PreparationIndex, &Path)],
+    plan_sha: &str,
+) -> anyhow::Result<serde_json::Value> {
     let controller = controller_path(base);
     let mut ids = BTreeSet::new();
     for (index, _) in groups {
@@ -622,6 +647,11 @@ touch "$dir/generation-0/generation-complete"
         )
         .is_err());
         assert_eq!((fixture.calls("first"), fixture.calls("second")), (1, 1));
+        let status: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture.root.path().join("workflow-status.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status["state"], "needs_attention");
     }
 
     #[test]
