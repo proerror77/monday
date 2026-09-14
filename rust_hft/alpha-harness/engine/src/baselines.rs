@@ -338,6 +338,9 @@ pub fn evaluate_cex_baselines(
     evaluation_policy: &CexResearchContentRefV1,
     burn: Option<CexBurnFitIdentity<'_>>,
 ) -> Result<CexBaselineRun, String> {
+    if policy.model_scope == alpha_domain::CexSupervisedModelScopeV1::RidgeOnly && burn.is_some() {
+        return Err("Ridge-only evaluation received an MLP training identity".into());
+    }
     if mission_id.trim().is_empty() {
         return Err("baseline mission identity is empty".to_string());
     }
@@ -390,6 +393,15 @@ pub fn evaluate_cex_baselines(
         &feature_rows,
         BaselineKind::Ridge,
     )?;
+    if policy.model_scope == alpha_domain::CexSupervisedModelScopeV1::RidgeOnly {
+        let gate = CexBaselineGateV1::ridge_only(&ridge).map_err(|e| e.to_string())?;
+        return Ok(CexBaselineRun {
+            ridge: Some(ridge),
+            cart: None,
+            burn: None,
+            gate,
+        });
+    }
     let cart = fit_artifact(
         context,
         policy,

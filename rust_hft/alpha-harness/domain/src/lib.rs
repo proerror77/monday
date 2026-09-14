@@ -851,9 +851,30 @@ impl CexResearchDeltaConfigV1 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CexSupervisedModelScopeV1 {
+    #[default]
+    RidgeCartMlp,
+    RidgeOnly,
+}
+impl CexSupervisedModelScopeV1 {
+    pub fn is_default(&self) -> bool {
+        *self == Self::RidgeCartMlp
+    }
+    pub fn names(self) -> &'static [&'static str] {
+        match self {
+            Self::RidgeCartMlp => &["ridge", "cart", "burn_mlp"],
+            Self::RidgeOnly => &["ridge"],
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CexResearchMissionSpecV1 {
+    #[serde(default, skip_serializing_if = "CexSupervisedModelScopeV1::is_default")]
+    pub supervised_model_scope: CexSupervisedModelScopeV1,
     pub objective: String,
     pub search_lineage_id: String,
     pub data_mission_id: String,
@@ -917,6 +938,13 @@ impl CexResearchMissionSpecV1 {
                 "mission scope is incomplete",
             ));
         }
+        if self.supervised_model_scope == CexSupervisedModelScopeV1::RidgeOnly
+            && self.mlp_training.is_some()
+        {
+            return Err(DomainError::InvalidCexBaseline(
+                "Ridge-only Mission cannot bind MLP training",
+            ));
+        }
         self.inputs.validate()?;
         self.policies.validate()?;
         CexEqualAbsoluteWeightPolicyV1::controlled_v1(self.policies.weight.id.clone())?
@@ -946,6 +974,7 @@ impl CexResearchMissionSpecV1 {
             )?;
             baseline
                 .with_mlp_training(self.mlp_training.clone())?
+                .with_model_scope(self.supervised_model_scope)?
                 .resolve_trial_binding(
                     &self.policies.baseline,
                     self.search.multiple_testing_trials,
@@ -1002,6 +1031,7 @@ impl CexResearchMissionSpecV1 {
                 .validate_binding(&self.policies.gp)?;
                 CexBaselinePolicyV1::controlled_v1(self.policies.baseline.id.clone())?
                     .with_mlp_training(Some(profile.clone()))?
+                    .with_model_scope(self.supervised_model_scope)?
                     .resolve_trial_binding(
                         &self.policies.baseline,
                         self.search.multiple_testing_trials,
@@ -2979,6 +3009,8 @@ pub const CEX_BASELINE_POLICY_SCHEMA_V1: &str = "cex-baseline-policy-v1";
 pub const CEX_BASELINE_POLICY_SCHEMA_V2: &str = "cex-baseline-policy-v2";
 pub const CEX_BASELINE_POLICY_SCHEMA_V3: &str = "cex-baseline-policy-v3";
 pub const CEX_BASELINE_POLICY_SCHEMA_V4: &str = "cex-baseline-policy-v4";
+pub const CEX_BASELINE_POLICY_SCHEMA_V5: &str = "cex-baseline-policy-v5";
+pub const CEX_BASELINE_GATE_SCHEMA_V2: &str = "cex-baseline-gate-v2";
 pub const CEX_BASELINE_ARTIFACT_SCHEMA_V2: &str = "cex-baseline-artifact-v2";
 pub const CEX_BASELINE_GATE_SCHEMA_V1: &str = "cex-baseline-gate-v1";
 
@@ -2991,6 +3023,8 @@ pub enum CexBaselineTieBreakV1 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CexBaselinePolicyV1 {
+    #[serde(default, skip_serializing_if = "CexSupervisedModelScopeV1::is_default")]
+    pub model_scope: CexSupervisedModelScopeV1,
     pub schema_version: String,
     pub policy_id: String,
     pub ridge_l2: f64,
@@ -3005,6 +3039,7 @@ pub struct CexBaselinePolicyV1 {
 impl CexBaselinePolicyV1 {
     pub fn controlled_v1(policy_id: impl Into<String>) -> Result<Self, DomainError> {
         let policy = Self {
+            model_scope: CexSupervisedModelScopeV1::default(),
             schema_version: CEX_BASELINE_POLICY_SCHEMA_V1.to_string(),
             policy_id: policy_id.into(),
             ridge_l2: 1.0e-6,
@@ -3025,6 +3060,7 @@ impl CexBaselinePolicyV1 {
         cart_min_leaf: usize,
     ) -> Result<Self, DomainError> {
         let policy = Self {
+            model_scope: CexSupervisedModelScopeV1::default(),
             schema_version: CEX_BASELINE_POLICY_SCHEMA_V2.to_string(),
             policy_id: policy_id.into(),
             ridge_l2,
@@ -3053,6 +3089,18 @@ impl CexBaselinePolicyV1 {
         Ok(self)
     }
 
+    pub fn with_model_scope(
+        mut self,
+        scope: CexSupervisedModelScopeV1,
+    ) -> Result<Self, DomainError> {
+        self.model_scope = scope;
+        if scope == CexSupervisedModelScopeV1::RidgeOnly {
+            self.schema_version = CEX_BASELINE_POLICY_SCHEMA_V5.into();
+        }
+        self.validate()?;
+        Ok(self)
+    }
+
     /// Bind the actual supervised score correction to the preregistered family.
     pub fn with_comparison_trials(mut self, trials: usize) -> Result<Self, DomainError> {
         if trials < 2 {
@@ -3060,7 +3108,12 @@ impl CexBaselinePolicyV1 {
                 "comparison trial bound is too small",
             ));
         }
-        self.schema_version = CEX_BASELINE_POLICY_SCHEMA_V4.into();
+        self.schema_version = if self.model_scope == CexSupervisedModelScopeV1::RidgeOnly {
+            CEX_BASELINE_POLICY_SCHEMA_V5
+        } else {
+            CEX_BASELINE_POLICY_SCHEMA_V4
+        }
+        .into();
         self.evaluator_config = FormulaEvaluatorConfig::for_trials(trials)?;
         self.validate()?;
         Ok(self)
@@ -3073,8 +3126,10 @@ impl CexBaselinePolicyV1 {
         binding: &CexResearchContentRefV1,
         trials: usize,
     ) -> Result<Self, DomainError> {
-        if self.schema_version != CEX_BASELINE_POLICY_SCHEMA_V4
-            && self.validate_binding(binding).is_ok()
+        if !matches!(
+            self.schema_version.as_str(),
+            CEX_BASELINE_POLICY_SCHEMA_V4 | CEX_BASELINE_POLICY_SCHEMA_V5
+        ) && self.validate_binding(binding).is_ok()
         {
             return Ok(self);
         }
@@ -3096,8 +3151,10 @@ impl CexBaselinePolicyV1 {
                     .mlp_training
                     .as_ref()
                     .is_some_and(|profile| profile.validate().is_ok()));
-        let family_shape = self.schema_version == CEX_BASELINE_POLICY_SCHEMA_V4
-            && self.evaluator_config.multiple_testing_trials >= 2
+        let family_shape = matches!(
+            self.schema_version.as_str(),
+            CEX_BASELINE_POLICY_SCHEMA_V4 | CEX_BASELINE_POLICY_SCHEMA_V5
+        ) && self.evaluator_config.multiple_testing_trials >= 2
             && self
                 .mlp_training
                 .as_ref()
@@ -3107,7 +3164,11 @@ impl CexBaselinePolicyV1 {
             && (1.0e-8..=1.0e-2).contains(&self.ridge_l2)
             && (1..=8).contains(&self.cart_max_depth)
             && (1..=128).contains(&self.cart_min_leaf);
-        if !(canonical || parameterized)
+        if (self.model_scope == CexSupervisedModelScopeV1::RidgeOnly)
+            != (self.schema_version == CEX_BASELINE_POLICY_SCHEMA_V5)
+            || (self.model_scope == CexSupervisedModelScopeV1::RidgeOnly
+                && self.mlp_training.is_some())
+            || !(canonical || parameterized)
             || self.policy_id.trim().is_empty()
             || self.cart_tie_break != CexBaselineTieBreakV1::LossThenFeatureThenThreshold
             || self.evaluator_config
@@ -3280,6 +3341,13 @@ impl CexBaselineArtifactV1 {
     }
 
     pub fn validate(&self) -> Result<(), DomainError> {
+        if self.baseline_policy.model_scope == CexSupervisedModelScopeV1::RidgeOnly
+            && self.model_kind != CexBaselineModelKindV1::Ridge
+        {
+            return Err(DomainError::InvalidCexBaseline(
+                "unrequested model in Ridge-only artifact",
+            ));
+        }
         if self.schema_version != CEX_BASELINE_ARTIFACT_SCHEMA_V2
             || self.artifact_id != self.expected_artifact_id()?
             || self.mission_id.trim().is_empty()
@@ -3699,7 +3767,8 @@ impl CexBaselineGateV1 {
     ) -> Result<Self, DomainError> {
         ridge.validate()?;
         cart.validate()?;
-        if ridge.model_kind != CexBaselineModelKindV1::Ridge
+        if ridge.baseline_policy.model_scope != CexSupervisedModelScopeV1::RidgeCartMlp
+            || ridge.model_kind != CexBaselineModelKindV1::Ridge
             || cart.model_kind != CexBaselineModelKindV1::ShallowCart
             || ridge.mission_id != cart.mission_id
             || ridge.factor_bank_revision_id != cart.factor_bank_revision_id
@@ -3737,6 +3806,36 @@ impl CexBaselineGateV1 {
         Ok(gate)
     }
 
+    pub fn ridge_only(ridge: &CexBaselineArtifactV1) -> Result<Self, DomainError> {
+        ridge.validate()?;
+        if ridge.model_kind != CexBaselineModelKindV1::Ridge
+            || ridge.baseline_policy.model_scope != CexSupervisedModelScopeV1::RidgeOnly
+        {
+            return Err(DomainError::InvalidCexBaseline(
+                "Ridge-only gate has another model scope",
+            ));
+        }
+        let mut gate = Self {
+            schema_version: CEX_BASELINE_GATE_SCHEMA_V2.into(),
+            gate_id: String::new(),
+            mission_id: ridge.mission_id.clone(),
+            policy_id: ridge.baseline_policy.policy_id.clone(),
+            policy_hash: ridge.baseline_policy.content_hash()?,
+            factor_bank_revision_id: ridge.factor_bank_revision_id.clone(),
+            ridge_artifact_id: Some(ridge.artifact_id.clone()),
+            cart_artifact_id: None,
+            passed: ridge.evaluation.passed,
+            failure_codes: if ridge.evaluation.passed {
+                vec![]
+            } else {
+                vec![CexBaselineFailureCodeV1::InsufficientEvidence]
+            },
+        };
+        gate.gate_id = gate.expected_gate_id()?;
+        gate.validate()?;
+        Ok(gate)
+    }
+
     pub fn empty_factor_bank(
         mission_id: impl Into<String>,
         policy: &CexBaselinePolicyV1,
@@ -3765,8 +3864,10 @@ impl CexBaselineGateV1 {
     }
 
     pub fn validate(&self) -> Result<(), DomainError> {
-        if self.schema_version != CEX_BASELINE_GATE_SCHEMA_V1
-            || self.gate_id != self.expected_gate_id()?
+        if !matches!(
+            self.schema_version.as_str(),
+            CEX_BASELINE_GATE_SCHEMA_V1 | CEX_BASELINE_GATE_SCHEMA_V2
+        ) || self.gate_id != self.expected_gate_id()?
             || self.mission_id.trim().is_empty()
             || self.policy_id.trim().is_empty()
             || !valid_content_sha256(&self.policy_hash)
@@ -3784,6 +3885,15 @@ impl CexBaselineGateV1 {
             self.failure_codes.as_slice(),
         ) {
             (None, None, false, [CexBaselineFailureCodeV1::EmptyFactorBank]) => Ok(()),
+            (Some(ridge), None, passed, codes)
+                if self.schema_version == CEX_BASELINE_GATE_SCHEMA_V2
+                    && valid_baseline_artifact_id(ridge)
+                    && ((passed && codes.is_empty())
+                        || (!passed
+                            && codes == [CexBaselineFailureCodeV1::InsufficientEvidence])) =>
+            {
+                Ok(())
+            }
             (Some(ridge), Some(cart), true, [])
                 if valid_baseline_artifact_id(ridge)
                     && valid_baseline_artifact_id(cart)
@@ -3839,6 +3949,20 @@ impl CexBaselineGateV1 {
                 if Self::empty_factor_bank(mission_id, policy, factor_bank)? != *self {
                     return Err(DomainError::InvalidCexBaseline(
                         "empty baseline gate binding drifted",
+                    ));
+                }
+                Ok(())
+            }
+            (Some(ridge), None, Some(id), None)
+                if ridge.artifact_id == *id
+                    && policy.model_scope == CexSupervisedModelScopeV1::RidgeOnly =>
+            {
+                ridge.validate_binding(mission, policy, factor_bank)?;
+                if ridge.factor_ids != expected_factor_ids(factor_bank)
+                    || Self::ridge_only(ridge)? != *self
+                {
+                    return Err(DomainError::InvalidCexBaseline(
+                        "Ridge-only gate binding drifted",
                     ));
                 }
                 Ok(())
@@ -6046,6 +6170,7 @@ mod tests {
         CexResearchMissionArtifactV1 {
             schema_version: CEX_RESEARCH_MISSION_SCHEMA_V1.to_string(),
             spec: CexResearchMissionSpecV1 {
+                supervised_model_scope: CexSupervisedModelScopeV1::default(),
                 objective: "Test one falsifiable LOB hypothesis".to_string(),
                 search_lineage_id: "search-lineage-1".to_string(),
                 data_mission_id: "data-mission-1".to_string(),

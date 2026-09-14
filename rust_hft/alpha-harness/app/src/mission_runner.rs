@@ -212,6 +212,7 @@ pub(crate) fn bound_baseline_policy(
     };
     let policy = policy
         .with_mlp_training(mission.spec.mlp_training.clone())?
+        .with_model_scope(mission.spec.supervised_model_scope)?
         .resolve_trial_binding(binding, mission.spec.search.multiple_testing_trials)?;
     policy
         .validate_binding(binding)
@@ -1216,6 +1217,29 @@ pub(crate) fn execute_report(
     data_mission::write_json_atomic(&results_dir.join("mission.json"), &research_mission)?;
     store.create_mission(&research_mission)?;
     data_mission::write_json_atomic(&results_dir.join("mission-create.json"), &research_mission)?;
+    let baseline_dataset_manifest =
+        data_mission::read_registered_research_dataset(&store, &dataset_manifest_path)?;
+    let baseline_rows = baseline_dataset_manifest.load_rows(&evaluation_protocol.costs)?;
+    let feature_decision_clocks = data_mission::feature_decision_clocks(&feature_manifest)?;
+    if feature_decision_clocks.len() != baseline_rows.len() {
+        bail!("CEX feature availability clock does not match the admitted dataset");
+    }
+    let baseline_dataset = prepare_dataset(baseline_rows, &evaluation_protocol)?;
+    let baseline_context = baseline_dataset.engine_context();
+    if !control_mission.spec.supervised_model_scope.is_default() {
+        let precheck = alpha_engine::label_precheck::label_space_precheck(
+            &baseline_context,
+            &supervised_decision_policy,
+        )
+        .map_err(anyhow::Error::msg)?;
+        data_mission::write_json_atomic(&results_dir.join("label-space-precheck.json"), &precheck)?;
+        research_event(
+            "alpha-harness",
+            "label_space_precheck_completed",
+            serde_json::to_value(&precheck)?,
+        );
+    }
+
     drop(store);
 
     let dataset = DatasetArgs {
@@ -1329,15 +1353,6 @@ pub(crate) fn execute_report(
         created_at: Utc::now(),
     })?;
     data_mission::write_json_atomic(&results_dir.join("factor-bank.json"), &factor_bank)?;
-    let baseline_dataset_manifest =
-        data_mission::read_registered_research_dataset(&store, &dataset_manifest_path)?;
-    let baseline_rows = baseline_dataset_manifest.load_rows(&evaluation_protocol.costs)?;
-    let feature_decision_clocks = data_mission::feature_decision_clocks(&feature_manifest)?;
-    if feature_decision_clocks.len() != baseline_rows.len() {
-        bail!("CEX feature availability clock does not match the admitted dataset");
-    }
-    let baseline_dataset = prepare_dataset(baseline_rows, &evaluation_protocol)?;
-    let baseline_context = baseline_dataset.engine_context();
     research_event(
         "alpha-harness",
         "baseline_training_started",
@@ -1348,7 +1363,7 @@ pub(crate) fn execute_report(
             "rows": baseline_context.rows().len(),
             "walk_forward_folds": baseline_context.folds().len(),
             "models": if supervised_ml {
-                serde_json::json!(["ridge", "shallow_cart", "burn_mlp"])
+                serde_json::json!(control_mission.spec.supervised_model_scope.names())
             } else {
                 serde_json::json!(["ridge", "shallow_cart"])
             },
@@ -1359,10 +1374,11 @@ pub(crate) fn execute_report(
         control_mission.spec.instrument.venue.as_str(),
         control_mission.spec.instrument.market.as_str()
     );
-    let burn_identity = supervised_ml.then_some(CexBurnFitIdentity {
-        symbol: control_mission.spec.instrument.symbol.as_str(),
-        venue: burn_venue.as_str(),
-    });
+    let burn_identity = (supervised_ml && control_mission.spec.supervised_model_scope.is_default())
+        .then_some(CexBurnFitIdentity {
+            symbol: control_mission.spec.instrument.symbol.as_str(),
+            venue: burn_venue.as_str(),
+        });
     let baseline_run = prepare_cex_baselines(
         &baseline_context,
         &factor_bank,
@@ -1378,6 +1394,9 @@ pub(crate) fn execute_report(
         ("shallow_cart", baseline_run.cart.as_ref()),
         ("burn_mlp", baseline_run.burn.as_ref()),
     ] {
+        if artifact.is_none() {
+            continue;
+        }
         research_event(
             "alpha-harness",
             "baseline_model_completed",
@@ -2313,59 +2332,43 @@ fn persist_baseline_evidence(
 
     let ridge = ridge
         .as_ref()
-        .context("non-empty Factor Bank baseline is missing Ridge artifact")?;
-    let cart = cart
-        .as_ref()
-        .context("non-empty Factor Bank baseline is missing CART artifact")?;
-    ridge.validate_binding(control_mission, baseline_policy, factor_bank)?;
-    cart.validate_binding(control_mission, baseline_policy, factor_bank)?;
+        .context("non-empty Factor Bank is missing Ridge")?;
     gate.validate_binding(
         control_mission,
         baseline_policy,
         factor_bank,
         Some(ridge),
-        Some(cart),
+        cart.as_ref(),
     )?;
-    for (artifact_id, registry_kind, payload) in [
-        (
-            ridge.artifact_id.clone(),
-            CEX_BASELINE_RIDGE_REGISTRY_KIND,
-            serde_json::to_value(ridge)?,
-        ),
-        (
-            cart.artifact_id.clone(),
-            CEX_BASELINE_CART_REGISTRY_KIND,
-            serde_json::to_value(cart)?,
-        ),
-        (
-            gate.gate_id.clone(),
-            CEX_BASELINE_GATE_REGISTRY_KIND,
-            serde_json::to_value(gate)?,
-        ),
+    for (artifact, name, kind) in [
+        (Some(ridge), "ridge", CEX_BASELINE_RIDGE_REGISTRY_KIND),
+        (cart.as_ref(), "cart", CEX_BASELINE_CART_REGISTRY_KIND),
+        (burn.as_ref(), "burn-mlp", CEX_BASELINE_BURN_REGISTRY_KIND),
     ] {
-        store.put_registry_revision(&RegistryRevision {
-            revision_id: artifact_id,
-            registry_kind: registry_kind.to_string(),
-            asset_id: asset_id.clone(),
-            parent_revision_id: Some(factor_bank.revision_id.clone()),
-            payload,
-            created_at: Utc::now(),
-        })?;
+        if let Some(artifact) = artifact {
+            artifact.validate_binding(control_mission, baseline_policy, factor_bank)?;
+            store.put_registry_revision(&RegistryRevision {
+                revision_id: artifact.artifact_id.clone(),
+                registry_kind: kind.into(),
+                asset_id: asset_id.clone(),
+                parent_revision_id: Some(factor_bank.revision_id.clone()),
+                payload: serde_json::to_value(artifact)?,
+                created_at: Utc::now(),
+            })?;
+            data_mission::write_json_atomic(
+                &results_dir.join(format!("{name}-baseline.json")),
+                artifact,
+            )?;
+        }
     }
-    data_mission::write_json_atomic(&results_dir.join("ridge-baseline.json"), ridge)?;
-    data_mission::write_json_atomic(&results_dir.join("cart-baseline.json"), cart)?;
-    if let Some(burn) = burn {
-        burn.validate_binding(control_mission, baseline_policy, factor_bank)?;
-        store.put_registry_revision(&RegistryRevision {
-            revision_id: burn.artifact_id.clone(),
-            registry_kind: CEX_BASELINE_BURN_REGISTRY_KIND.to_string(),
-            asset_id: asset_id.clone(),
-            parent_revision_id: Some(factor_bank.revision_id.clone()),
-            payload: serde_json::to_value(burn)?,
-            created_at: Utc::now(),
-        })?;
-        data_mission::write_json_atomic(&results_dir.join("burn-mlp-baseline.json"), burn)?;
-    }
+    store.put_registry_revision(&RegistryRevision {
+        revision_id: gate.gate_id.clone(),
+        registry_kind: CEX_BASELINE_GATE_REGISTRY_KIND.into(),
+        asset_id,
+        parent_revision_id: Some(factor_bank.revision_id.clone()),
+        payload: serde_json::to_value(gate)?,
+        created_at: Utc::now(),
+    })?;
     data_mission::write_json_atomic(&results_dir.join("baseline-gate.json"), gate)?;
     Ok(())
 }
@@ -2379,56 +2382,49 @@ fn run_cex_supervised_model_research(
     baselines: &VerifiedCexBaselineRun<'_, '_>,
     decision_policy: &CexSupervisedDecisionPolicyV2,
 ) -> anyhow::Result<Option<CexSupervisedModelEvaluationV2>> {
-    let (Some(ridge), Some(cart), Some(burn)) =
-        (&baselines.ridge, &baselines.cart, &baselines.burn)
-    else {
-        if factor_bank.entries.is_empty() {
-            research_event(
-                "alpha-harness",
-                "supervised_training_skipped",
-                serde_json::json!({
-                    "mission_id": mission.semantic_id()?,
-                    "reason": "empty_factor_bank",
-                }),
-            );
-            return Ok(None);
-        }
-        bail!("non-empty Factor Bank is missing supervised Ridge, CART, or Burn MLP models");
-    };
     research_event(
         "alpha-harness",
-        "supervised_training_started",
+        "supervised_evaluation_started",
         serde_json::json!({
-            "mission_id": mission.semantic_id()?,
-            "factor_bank_revision_id": &factor_bank.revision_id,
-            "factor_count": factor_bank.entries.len(),
-            "models": ["ridge", "shallow_cart", "burn_mlp"],
-            "rows": context.rows().len(),
-            "walk_forward_folds": context.folds().len(),
+            "models": mission.spec.supervised_model_scope.names(), "rows":context.rows().len(),
+            "folds":context.folds().len(), "mission_id":mission.semantic_id()?
         }),
     );
-    let mut attempts = CEX_SUPERVISED_MODEL_NAMES.map(|model| CexSupervisedModelAttemptV1 {
-        model: model.to_string(),
-        outcome: "admitted".to_string(),
-    });
+    if factor_bank.entries.is_empty() {
+        return Ok(None);
+    }
+    let models: Vec<_> = [
+        ("ridge", baselines.ridge.as_ref()),
+        ("cart", baselines.cart.as_ref()),
+        ("burn_mlp", baselines.burn.as_ref()),
+    ]
+    .into_iter()
+    .filter_map(|(name, artifact)| artifact.map(|artifact| (name, artifact)))
+    .collect();
+    if models.iter().map(|(name, _)| *name).collect::<Vec<_>>()
+        != mission.spec.supervised_model_scope.names()
+    {
+        bail!("supervised model artifacts differ from the declared model scope");
+    }
+    let mut attempts: Vec<_> = models
+        .iter()
+        .map(|(name, _)| CexSupervisedModelAttemptV1 {
+            model: (*name).into(),
+            outcome: "admitted".into(),
+        })
+        .collect();
     persist_supervised_model_attempts(results_dir, &attempts)?;
-    let ridge = run_supervised_model_attempt(results_dir, &mut attempts, "ridge", || {
-        baselines
-            .evaluate_supervised_model(ridge.model_kind, decision_policy)
-            .map_err(|error| anyhow::anyhow!("ridge supervised evaluation failed: {error}"))
-    })?;
-    let cart = run_supervised_model_attempt(results_dir, &mut attempts, "cart", || {
-        baselines
-            .evaluate_supervised_model(cart.model_kind, decision_policy)
-            .map_err(|error| anyhow::anyhow!("shallow CART supervised evaluation failed: {error}"))
-    })?;
-    let burn = run_supervised_model_attempt(results_dir, &mut attempts, "burn_mlp", || {
-        baselines
-            .evaluate_supervised_model(burn.model_kind, decision_policy)
-            .map_err(|error| anyhow::anyhow!("Burn MLP supervised evaluation failed: {error}"))
-    })?;
+    let mut evaluations = Vec::new();
+    for (name, artifact) in &models {
+        let evaluation = run_supervised_model_attempt(results_dir, &mut attempts, name, || {
+            baselines
+                .evaluate_supervised_model(artifact.model_kind, decision_policy)
+                .map_err(anyhow::Error::msg)
+        })?;
+        evaluations.push((*name, evaluation));
+    }
     let mut metric_inputs = Vec::new();
-    for (name, evaluation) in [("ridge", &ridge), ("cart", &cart), ("burn_mlp", &burn)] {
+    for (name, evaluation) in &evaluations {
         evaluation.validate().map_err(anyhow::Error::msg)?;
         store.put_registry_revision(&RegistryRevision {
             revision_id: evaluation.candidate.artifact_id.clone(),
@@ -2471,9 +2467,22 @@ fn run_cex_supervised_model_research(
             }),
         );
     }
-    let burn_training_admitted =
-        alpha_engine::baselines::baseline_training_admitted(baselines.burn.as_ref().unwrap());
-    let selected = select_supervised_model(ridge, cart, burn, burn_training_admitted);
+    let selected = evaluations
+        .into_iter()
+        .filter(|(name, _)| {
+            models.iter().any(|(model, artifact)| {
+                model == name && alpha_engine::baselines::baseline_training_admitted(artifact)
+            })
+        })
+        .map(|(_, evaluation)| evaluation)
+        .reduce(|selected, candidate| {
+            if supervised_model_ranks_ahead(&candidate, &selected) {
+                candidate
+            } else {
+                selected
+            }
+        })
+        .context("no trained model satisfies its declared numerical requirements")?;
     let selection = CexSupervisedModelSelectionV1 {
         schema_version: CEX_SUPERVISED_MODEL_SELECTION_SCHEMA_VERSION.to_string(),
         mission_id: selected.candidate.mission_id.clone(),
@@ -2520,6 +2529,7 @@ fn run_cex_supervised_model_research(
     Ok(Some(selected))
 }
 
+#[cfg(test)]
 fn select_supervised_model(
     ridge: CexSupervisedModelEvaluationV2,
     cart: CexSupervisedModelEvaluationV2,
@@ -4026,49 +4036,41 @@ fn decode_verified_execution_report(
         let baseline_policy: CexBaselinePolicyV1 =
             read_bundle_json(&mut archive, "results/baseline-policy.json", 256 * 1024)?
                 .context("published supervised selection has no baseline policy")?;
-        let ridge_baseline: CexBaselineArtifactV1 =
-            read_bundle_json(&mut archive, "results/ridge-baseline.json", 4 * 1024 * 1024)?
-                .context("published supervised selection has no Ridge baseline")?;
-        let cart_baseline: CexBaselineArtifactV1 =
-            read_bundle_json(&mut archive, "results/cart-baseline.json", 4 * 1024 * 1024)?
-                .context("published supervised selection has no CART baseline")?;
-        let burn_baseline: CexBaselineArtifactV1 = read_bundle_json(
-            &mut archive,
-            "results/burn-mlp-baseline.json",
-            MAX_MLP_BASELINE_BYTES,
-        )?
-        .context("published supervised selection has no Burn MLP baseline")?;
-        ridge_baseline.validate_binding(&control_mission, &baseline_policy, &factor_bank)?;
-        cart_baseline.validate_binding(&control_mission, &baseline_policy, &factor_bank)?;
-        burn_baseline.validate_binding(&control_mission, &baseline_policy, &factor_bank)?;
-        let ridge_candidate: Option<CexSupervisedModelCandidateV2> = read_bundle_json(
-            &mut archive,
-            "results/ridge-supervised-candidate.json",
-            4 * 1024 * 1024,
-        )?;
-        let cart_candidate: Option<CexSupervisedModelCandidateV2> = read_bundle_json(
-            &mut archive,
-            "results/cart-supervised-candidate.json",
-            4 * 1024 * 1024,
-        )?;
-        let burn_candidate: Option<CexSupervisedModelCandidateV2> = read_bundle_json(
-            &mut archive,
-            "results/burn_mlp-supervised-candidate.json",
-            4 * 1024 * 1024,
-        )?;
         let mut selected_candidate = None;
-        for (candidate, baseline) in [
-            (ridge_candidate, &ridge_baseline),
-            (cart_candidate, &cart_baseline),
-            (burn_candidate, &burn_baseline),
-        ] {
-            let candidate = candidate
-                .context("published supervised selection is missing a model candidate artifact")?;
+        for name in CEX_SUPERVISED_MODEL_NAMES {
+            let baseline_name = if name == "burn_mlp" { "burn-mlp" } else { name };
+            let baseline: Option<CexBaselineArtifactV1> = read_bundle_json(
+                &mut archive,
+                &format!("results/{baseline_name}-baseline.json"),
+                MAX_MLP_BASELINE_BYTES,
+            )?;
+            let candidate: Option<CexSupervisedModelCandidateV2> = read_bundle_json(
+                &mut archive,
+                &format!("results/{name}-supervised-candidate.json"),
+                4 * 1024 * 1024,
+            )?;
+            if !control_mission
+                .spec
+                .supervised_model_scope
+                .names()
+                .contains(&name)
+            {
+                let unexpected_backtest = archive
+                    .file_names()
+                    .any(|path| path == format!("results/{name}-supervised-backtest.json"));
+                if baseline.is_some() || candidate.is_some() || unexpected_backtest {
+                    bail!("published result contains a model outside its declared scope");
+                }
+                continue;
+            }
+            let baseline = baseline.context("published requested model baseline is missing")?;
+            let candidate = candidate.context("published requested model candidate is missing")?;
+            baseline.validate_binding(&control_mission, &baseline_policy, &factor_bank)?;
             validate_supervised_candidate_binding(
                 &candidate,
                 &control_mission,
                 &factor_bank,
-                baseline,
+                &baseline,
             )?;
             let candidate_reference = content_reference(&candidate.artifact_id, &candidate)?;
             metric_candidate_refs.insert(
@@ -4076,7 +4078,7 @@ fn decode_verified_execution_report(
                 candidate_reference.clone(),
             );
             if candidate_reference == selection.selected_candidate {
-                if !alpha_engine::baselines::baseline_training_admitted(baseline) {
+                if !alpha_engine::baselines::baseline_training_admitted(&baseline) {
                     bail!("published selected model did not satisfy its declared training convergence requirement");
                 }
                 selected_candidate = Some(candidate);
@@ -4540,6 +4542,28 @@ fn validate_model_metric_readback(
         &format!("results/{}", crate::mission_metrics::METRICS_CSV),
         crate::mission_metrics::MAX_METRICS_BYTES,
     )?;
+    let verification_dataset =
+        if !mission.spec.supervised_model_scope.is_default() || selection.is_some() {
+            Some(load_metric_verification_dataset(archive, mission)?)
+        } else {
+            None
+        };
+    if !mission.spec.supervised_model_scope.is_default() {
+        let dataset = verification_dataset
+            .as_ref()
+            .context("precheck readback dataset missing")?;
+        let expected = alpha_engine::label_precheck::label_space_precheck(
+            &dataset.engine_context(),
+            &bound_supervised_decision_policy(mission)?,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let actual: alpha_engine::label_precheck::LabelSpacePrecheckV1 =
+            read_bundle_json(archive, "results/label-space-precheck.json", 64 * 1024)?
+                .context("Ridge-only result is missing its descriptive precheck")?;
+        if actual != expected {
+            bail!("label precheck differs from the allowed development/validation view");
+        }
+    }
     if selection.is_none() && report_bytes.is_none() && csv_bytes.is_none() {
         // No supervised models were selected or evaluated (for example an
         // empty Factor Bank); do not invent a comparison for this round.
@@ -4549,13 +4573,13 @@ fn validate_model_metric_readback(
     let report: alpha_engine::model_metrics::CexModelMetricsReportV1 =
         serde_json::from_slice(&report_bytes.context("published model metrics JSON is missing")?)?;
     let csv = csv_bytes.context("published model metrics CSV is missing")?;
-    if candidates.len() != CEX_SUPERVISED_MODEL_NAMES.len()
+    if candidates.len() != mission.spec.supervised_model_scope.names().len()
         || report.groups.len() != 1
         || report.groups[0].cohort.mission_id != expected_mission_id
     {
         bail!("published model metric cohort is incomplete or mismatched");
     }
-    let dataset = load_metric_verification_dataset(archive, mission)?;
+    let dataset = verification_dataset.context("model metric verification dataset missing")?;
     let context = dataset.engine_context();
     let cohort = &report.groups[0].cohort;
     if cohort.evaluation_protocol != *context.protocol()
@@ -4570,7 +4594,7 @@ fn validate_model_metric_readback(
     }
     let baseline_policy = bound_baseline_policy(mission)?;
     let mut inputs = Vec::new();
-    for name in CEX_SUPERVISED_MODEL_NAMES {
+    for &name in mission.spec.supervised_model_scope.names() {
         let bytes = read_bundle_bytes(
             archive,
             &format!("results/{name}-supervised-backtest.json"),
@@ -6467,6 +6491,50 @@ pub(crate) mod tests {
             }),
         )
         .unwrap();
+        let ridge_policy = policy
+            .clone()
+            .with_model_scope(alpha_domain::CexSupervisedModelScopeV1::RidgeOnly)
+            .unwrap()
+            .with_comparison_trials(138)
+            .unwrap();
+        let ridge_only = prepare_cex_baselines(
+            &context,
+            &factor_bank_typed,
+            &ridge_policy,
+            &fixture.mission.semantic_id().unwrap(),
+            fixture.mission.spec.hypotheses[0].target.clone(),
+            &fixture.mission.spec.policies.evaluation,
+            None,
+        )
+        .unwrap();
+        assert!(ridge_only.cart.is_none() && ridge_only.burn.is_none());
+        assert!(ridge_only.ridge.is_some());
+        assert_eq!(
+            ridge_only.gate.schema_version,
+            alpha_domain::CEX_BASELINE_GATE_SCHEMA_V2
+        );
+        ridge_only.gate.validate().unwrap();
+        let scoped = ridge_only
+            .evaluate_supervised_model(
+                CexBaselineModelKindV1::Ridge,
+                &CexSupervisedDecisionPolicyV2::hold_to_horizon_v3(5000).unwrap(),
+            )
+            .unwrap();
+        alpha_engine::model_metrics::verify_model_ledger_from_dataset(
+            &scoped,
+            &context,
+            &ridge_policy.evaluator_config,
+        )
+        .unwrap();
+        assert_eq!(
+            scoped
+                .candidate
+                .evaluation
+                .formula_config()
+                .unwrap()
+                .multiple_testing_trials,
+            138
+        );
         let held_decision = CexSupervisedDecisionPolicyV2::hold_to_horizon_v3(5000).unwrap();
         let held = verified
             .evaluate_supervised_model(CexBaselineModelKindV1::Ridge, &held_decision)
@@ -9345,6 +9413,7 @@ message binance_replay {
         let mut mission = CexResearchMissionArtifactV1 {
             schema_version: CEX_RESEARCH_MISSION_SCHEMA_V1.to_string(),
             spec: CexResearchMissionSpecV1 {
+                supervised_model_scope: alpha_domain::CexSupervisedModelScopeV1::default(),
                 objective: "test objective".to_string(),
                 search_lineage_id: "search-lineage-1".to_string(),
                 data_mission_id: "data-1".to_string(),

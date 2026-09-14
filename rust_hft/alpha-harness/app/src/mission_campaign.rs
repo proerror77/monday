@@ -67,7 +67,11 @@ fn declared_total_trials_for_rounds(
     round_count: usize,
 ) -> anyhow::Result<usize> {
     let gp_trials = research_plan.max_candidates()?;
-    let per_round = if research_plan
+    let per_round = if !research_plan.supervised_model_scope.is_default() {
+        gp_trials
+            .checked_add(research_plan.supervised_model_scope.names().len())
+            .context("Campaign scoped model trial overflow")?
+    } else if research_plan
         .search_policy_revision
         .research_delta
         .is_some()
@@ -1161,6 +1165,7 @@ fn follow_up_plan(
         bail!("declared follow-up feature subset removed the focus field");
     }
     let plan = CexCampaignResearchPlanV1 {
+        supervised_model_scope: loaded.request.research_plan.supervised_model_scope,
         holding: loaded.request.research_plan.holding.clone(),
         comparison_family_trials: loaded.request.research_plan.comparison_family_trials,
         schema_version: "cex-campaign-research-plan-v2".to_string(),
@@ -2155,8 +2160,8 @@ fn extract_bundle_with_file_limit(
 
 struct SupervisedRoundEvidence {
     ridge: CexSupervisedModelCandidateV2,
-    cart: CexSupervisedModelCandidateV2,
-    burn: CexSupervisedModelCandidateV2,
+    cart: Option<CexSupervisedModelCandidateV2>,
+    burn: Option<CexSupervisedModelCandidateV2>,
     selected: CexSupervisedModelCandidateV2,
     replay: Option<CexEventReplayReceiptV1>,
 }
@@ -2182,21 +2187,24 @@ fn load_supervised_round_evidence(
         }
         return Ok(None);
     }
-    let ridge_baseline = ridge_baseline.context("supervised ML is missing its Ridge baseline")?;
-    let cart_baseline = cart_baseline.context("supervised ML is missing its CART baseline")?;
-    let burn_baseline = burn_baseline.context("supervised ML is missing its Burn MLP baseline")?;
-    let ridge: CexSupervisedModelCandidateV2 = serde_json::from_slice(&std::fs::read(
-        results.join("ridge-supervised-candidate.json"),
-    )?)?;
-    let cart: CexSupervisedModelCandidateV2 = serde_json::from_slice(&std::fs::read(
-        results.join("cart-supervised-candidate.json"),
-    )?)?;
-    let burn: CexSupervisedModelCandidateV2 = serde_json::from_slice(&std::fs::read(
-        results.join("burn_mlp-supervised-candidate.json"),
-    )?)?;
-    validate_supervised_candidate_binding(&ridge, mission, factor_bank, ridge_baseline)?;
-    validate_supervised_candidate_binding(&cart, mission, factor_bank, cart_baseline)?;
-    validate_supervised_candidate_binding(&burn, mission, factor_bank, burn_baseline)?;
+    let read_candidate = |name: &str,
+                          baseline: Option<&alpha_domain::CexBaselineArtifactV1>|
+     -> anyhow::Result<Option<CexSupervisedModelCandidateV2>> {
+        let path = results.join(format!("{name}-supervised-candidate.json"));
+        if !mission.spec.supervised_model_scope.names().contains(&name) {
+            if baseline.is_some() || path.exists() {
+                bail!("result contains an unrequested supervised model");
+            }
+            return Ok(None);
+        }
+        let baseline = baseline.context("requested supervised model baseline is missing")?;
+        let candidate = serde_json::from_slice(&std::fs::read(path)?)?;
+        validate_supervised_candidate_binding(&candidate, mission, factor_bank, baseline)?;
+        Ok(Some(candidate))
+    };
+    let ridge = read_candidate("ridge", ridge_baseline)?.context("Ridge candidate missing")?;
+    let cart = read_candidate("cart", cart_baseline)?;
+    let burn = read_candidate("burn_mlp", burn_baseline)?;
     let selection: CexSupervisedModelSelectionV1 = serde_json::from_slice(&std::fs::read(
         results.join("supervised-model-selection.json"),
     )?)?;
@@ -2204,8 +2212,9 @@ fn load_supervised_round_evidence(
     if selection.mission_id != mission.semantic_id()? {
         bail!("supervised selection does not match its Campaign Mission");
     }
-    let selected = [&ridge, &cart, &burn]
+    let selected = [Some(&ridge), cart.as_ref(), burn.as_ref()]
         .into_iter()
+        .flatten()
         .find(|candidate| {
             candidate.artifact_id == selection.selected_candidate.id
                 && canonical_json_hash(*candidate)
@@ -2266,23 +2275,28 @@ fn collect_round_ledger(
         serde_json::from_slice(&std::fs::read(results.join("control-plane-mission.json"))?)?;
     let baseline_policy: alpha_domain::CexBaselinePolicyV1 =
         serde_json::from_slice(&std::fs::read(results.join("baseline-policy.json"))?)?;
-    let (ridge, cart) = if factor_bank.entries.is_empty() {
-        (None, None)
+    let ridge = if factor_bank.entries.is_empty() {
+        None
     } else {
-        (
-            Some(
-                serde_json::from_slice::<alpha_domain::CexBaselineArtifactV1>(&std::fs::read(
-                    results.join("ridge-baseline.json"),
-                )?)?,
-            ),
-            Some(
-                serde_json::from_slice::<alpha_domain::CexBaselineArtifactV1>(&std::fs::read(
-                    results.join("cart-baseline.json"),
-                )?)?,
-            ),
+        Some(
+            serde_json::from_slice::<alpha_domain::CexBaselineArtifactV1>(&std::fs::read(
+                results.join("ridge-baseline.json"),
+            )?)?,
+        )
+    };
+    let cart = if factor_bank.entries.is_empty()
+        || !control_mission.spec.supervised_model_scope.is_default()
+    {
+        None
+    } else {
+        Some(
+            serde_json::from_slice::<alpha_domain::CexBaselineArtifactV1>(&std::fs::read(
+                results.join("cart-baseline.json"),
+            )?)?,
         )
     };
     let burn = if factor_bank.entries.is_empty()
+        || !control_mission.spec.supervised_model_scope.is_default()
         || !matches!(
             factor_bank.gp_policy.schema_version.as_str(),
             alpha_domain::CEX_GP_POLICY_SCHEMA_V4 | alpha_domain::CEX_GP_POLICY_SCHEMA_V5
@@ -2330,7 +2344,10 @@ fn collect_round_ledger(
         }
         None
     };
-    let model_attempts = persisted_supervised_model_attempt_count(&results)?;
+    let model_attempts = persisted_supervised_model_attempt_count(
+        &results,
+        control_mission.spec.supervised_model_scope.names(),
+    )?;
     if supervised_ml
         && !factor_bank.entries.is_empty()
         && model_attempts.is_none_or(|attempts| attempts == 0)
@@ -2372,10 +2389,12 @@ fn collect_round_ledger(
             .map(|evidence| campaign_evaluation_feedback(&evidence.ridge.evaluation)),
         supervised_cart: supervised
             .as_ref()
-            .map(|evidence| campaign_evaluation_feedback(&evidence.cart.evaluation)),
+            .and_then(|evidence| evidence.cart.as_ref())
+            .map(|candidate| campaign_evaluation_feedback(&candidate.evaluation)),
         supervised_burn: supervised
             .as_ref()
-            .map(|evidence| campaign_evaluation_feedback(&evidence.burn.evaluation)),
+            .and_then(|evidence| evidence.burn.as_ref())
+            .map(|candidate| campaign_evaluation_feedback(&candidate.evaluation)),
         supervised_selected: supervised
             .as_ref()
             .map(|evidence| campaign_evaluation_feedback(&evidence.selected.evaluation)),
@@ -2605,7 +2624,10 @@ struct SupervisedModelAttemptEntryV1 {
     outcome: String,
 }
 
-fn persisted_supervised_model_attempt_count(results: &Path) -> anyhow::Result<Option<usize>> {
+fn persisted_supervised_model_attempt_count(
+    results: &Path,
+    model_names: &[&str],
+) -> anyhow::Result<Option<usize>> {
     let attempts_path = results.join("supervised-model-attempts.json");
     if attempts_path.try_exists()? {
         let ledger: SupervisedModelAttemptLedgerV1 =
@@ -2613,7 +2635,7 @@ fn persisted_supervised_model_attempt_count(results: &Path) -> anyhow::Result<Op
         if ledger.schema_version != "cex-supervised-model-attempts-v1" {
             bail!("supervised model attempt ledger schema is invalid");
         }
-        let expected_models = CEX_SUPERVISED_MODEL_NAMES
+        let expected_models = model_names
             .iter()
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
@@ -2858,13 +2880,22 @@ pub(crate) fn validate_terminal_mission_revision_binding(
     if mission.spec.mlp_training != expected_mlp {
         bail!("terminal Mission MLP profile differs from the admitted paired training plan");
     }
-    if request.research_plan.comparison_family_trials.is_some() {
+    if mission.spec.supervised_model_scope != request.research_plan.supervised_model_scope {
+        bail!("terminal Mission changed the approved model scope");
+    }
+    if request.research_plan.comparison_family_trials.is_some()
+        || !request.research_plan.supervised_model_scope.is_default()
+    {
         let expected_trials = request
             .research_plan
             .effective_multiple_testing_trials(request.declared_total_trials)?;
         let policy = crate::mission_runner::bound_baseline_policy(mission)?;
         if policy.evaluator_config.multiple_testing_trials != expected_trials
-            || policy.schema_version != alpha_domain::CEX_BASELINE_POLICY_SCHEMA_V4
+            || !matches!(
+                policy.schema_version.as_str(),
+                alpha_domain::CEX_BASELINE_POLICY_SCHEMA_V4
+                    | alpha_domain::CEX_BASELINE_POLICY_SCHEMA_V5
+            )
         {
             bail!("terminal supervised score omitted the registered comparison family");
         }
@@ -2929,6 +2960,7 @@ fn validate_existing_follow_up_plan(
         || &plan.search_policy_revision != expected_revision
         || plan.allowed_search_policy_revisions
             != loaded.request.research_plan.allowed_search_policy_revisions
+        || plan.supervised_model_scope != loaded.request.research_plan.supervised_model_scope
         || plan.holding != loaded.request.research_plan.holding
         || plan.mlp_training != loaded.request.research_plan.mlp_training
         || plan
@@ -3392,6 +3424,7 @@ fn validate_negative_campaign_result(
         validate_campaign_round_feedback(
             &round.feedback,
             loaded.request.research_plan.max_candidates()?,
+            loaded.request.research_plan.supervised_model_scope,
         )?;
     }
     Ok(())
@@ -3400,6 +3433,7 @@ fn validate_negative_campaign_result(
 fn validate_campaign_round_feedback(
     feedback: &CampaignRoundFeedbackV1,
     max_factors: usize,
+    scope: alpha_domain::CexSupervisedModelScopeV1,
 ) -> anyhow::Result<()> {
     let allowed_fields = allowed_research_feature_fields();
     if feedback.factor_attempts != feedback.factors.len()
@@ -3432,7 +3466,18 @@ fn validate_campaign_round_feedback(
                 && !feedback.baseline_gate_passed
                 && feedback.baseline_failure_codes == [CexBaselineFailureCodeV1::EmptyFactorBank]
         }
-        (Some(ridge), Some(cart)) => {
+        (Some(ridge), None) if !scope.is_default() => {
+            feedback.accepted_factors > 0
+                && valid_campaign_evaluation_feedback(ridge)
+                && feedback.baseline_gate_passed == ridge.passed
+                && if ridge.passed {
+                    feedback.baseline_failure_codes.is_empty()
+                } else {
+                    feedback.baseline_failure_codes
+                        == [CexBaselineFailureCodeV1::InsufficientEvidence]
+                }
+        }
+        (Some(ridge), Some(cart)) if scope.is_default() => {
             feedback.accepted_factors > 0
                 && valid_campaign_evaluation_feedback(ridge)
                 && valid_campaign_evaluation_feedback(cart)
@@ -3455,9 +3500,25 @@ fn validate_campaign_round_feedback(
         &feedback.supervised_selected_candidate_id,
     ) {
         (None, None, None, None, None) => {
-            feedback.supervised_replay.is_none() && feedback.burn.is_none()
+            feedback.supervised_replay.is_none()
+                && feedback.burn.is_none()
+                && (scope.is_default() || feedback.accepted_factors == 0)
         }
-        (Some(ridge), Some(cart), Some(burn), Some(selected), Some(candidate_id)) => {
+        (Some(ridge), None, None, Some(selected), Some(candidate_id)) if !scope.is_default() => {
+            feedback.accepted_factors > 0
+                && !candidate_id.trim().is_empty()
+                && valid_campaign_evaluation_feedback(ridge)
+                && ridge == selected
+                && feedback.burn.is_none()
+                && feedback.model_attempts == Some(1)
+                && feedback
+                    .supervised_replay
+                    .as_ref()
+                    .is_none_or(valid_campaign_replay_feedback)
+        }
+        (Some(ridge), Some(cart), Some(burn), Some(selected), Some(candidate_id))
+            if scope.is_default() =>
+        {
             feedback.accepted_factors > 0
                 && !candidate_id.trim().is_empty()
                 && valid_campaign_evaluation_feedback(ridge)
@@ -5144,7 +5205,12 @@ mod tests {
             ..CampaignRoundFeedbackV1::default()
         };
 
-        validate_campaign_round_feedback(&feedback, 1).unwrap();
+        validate_campaign_round_feedback(
+            &feedback,
+            1,
+            alpha_domain::CexSupervisedModelScopeV1::default(),
+        )
+        .unwrap();
         // Fixed-notional additive accounting can lose more than the initial
         // unit. SOL5 produced this rejected trading evaluation in a real run.
         feedback.factors[0]
@@ -5152,18 +5218,38 @@ mod tests {
             .as_mut()
             .unwrap()
             .max_drawdown = 1.048_747_746_845_106;
-        validate_campaign_round_feedback(&feedback, 1).unwrap();
+        validate_campaign_round_feedback(
+            &feedback,
+            1,
+            alpha_domain::CexSupervisedModelScopeV1::default(),
+        )
+        .unwrap();
         assert!(!feedback.factors[0].evaluation.as_ref().unwrap().passed);
         let mut invalid = feedback.clone();
         invalid.factors[0].evaluation.as_mut().unwrap().passed = true;
-        assert!(validate_campaign_round_feedback(&invalid, 1).is_err());
+        assert!(validate_campaign_round_feedback(
+            &invalid,
+            1,
+            alpha_domain::CexSupervisedModelScopeV1::default()
+        )
+        .is_err());
         for drawdown in [-0.01, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let mut invalid = feedback.clone();
             invalid.factors[0].evaluation.as_mut().unwrap().max_drawdown = drawdown;
-            assert!(validate_campaign_round_feedback(&invalid, 1).is_err());
+            assert!(validate_campaign_round_feedback(
+                &invalid,
+                1,
+                alpha_domain::CexSupervisedModelScopeV1::default()
+            )
+            .is_err());
         }
         feedback.accepted_factors = 0;
-        assert!(validate_campaign_round_feedback(&feedback, 1).is_err());
+        assert!(validate_campaign_round_feedback(
+            &feedback,
+            1,
+            alpha_domain::CexSupervisedModelScopeV1::default()
+        )
+        .is_err());
     }
 
     #[test]
@@ -5208,7 +5294,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            persisted_supervised_model_attempt_count(root.path()).unwrap(),
+            persisted_supervised_model_attempt_count(root.path(), &CEX_SUPERVISED_MODEL_NAMES)
+                .unwrap(),
             Some(3)
         );
     }
@@ -5218,7 +5305,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("ridge-supervised-candidate.json"), b"{}").unwrap();
         assert_eq!(
-            persisted_supervised_model_attempt_count(root.path()).unwrap(),
+            persisted_supervised_model_attempt_count(root.path(), &CEX_SUPERVISED_MODEL_NAMES)
+                .unwrap(),
             None
         );
     }
@@ -5235,7 +5323,10 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        assert!(persisted_supervised_model_attempt_count(root.path()).is_err());
+        assert!(
+            persisted_supervised_model_attempt_count(root.path(), &CEX_SUPERVISED_MODEL_NAMES)
+                .is_err()
+        );
 
         let root = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -5251,7 +5342,10 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        assert!(persisted_supervised_model_attempt_count(root.path()).is_err());
+        assert!(
+            persisted_supervised_model_attempt_count(root.path(), &CEX_SUPERVISED_MODEL_NAMES)
+                .is_err()
+        );
     }
 
     #[test]
@@ -6265,6 +6359,139 @@ mod tests {
         assert!(result["selected_round_id"].is_null());
         assert!(result["finalization"].is_null());
         assert!(!fixture.global_claim_path.exists());
+    }
+
+    #[test]
+    fn execute_ridge_only_holding_retains_precheck_and_one_model_through_readback() {
+        assert_ridge_holding_campaign(
+            campaign_e2e_fixture("ridge-only-holding", false, false, true),
+            false,
+        );
+    }
+
+    #[test]
+    fn execute_ridge_only_holding_zero_trades_is_a_completed_negative() {
+        assert_ridge_holding_campaign(
+            campaign_e2e_fixture_with_price_step(
+                "ridge-only-zero-trades",
+                false,
+                false,
+                true,
+                false,
+                0.00001,
+            ),
+            true,
+        );
+    }
+
+    fn assert_ridge_holding_campaign(mut fixture: CampaignE2eFixture, negative: bool) {
+        let mut request: CampaignRequest =
+            serde_json::from_slice(&std::fs::read(&fixture.args.request).unwrap()).unwrap();
+        request.research_plan.supervised_model_scope =
+            alpha_domain::CexSupervisedModelScopeV1::RidgeOnly;
+        request.research_plan.holding =
+            Some(hft_research_manifest::model::HorizonHoldingPolicyV1 {
+                horizon_millis: 5000,
+            });
+        request.declared_total_trials =
+            declared_total_trials_for_rounds(&request.research_plan, request.rounds.len()).unwrap();
+        request.research_plan.comparison_family_trials = Some(request.declared_total_trials * 3);
+        std::fs::write(&fixture.args.request, serde_json::to_vec(&request).unwrap()).unwrap();
+        fixture.args.request_sha256 =
+            crate::mission_runner::sha256_file(&fixture.args.request).unwrap();
+        execute(fixture.args.clone()).unwrap();
+        let loaded = load_request(&fixture.args.request).unwrap();
+        let materialization = crate::mission_runner::decode_materialization(
+            &std::fs::read(&fixture._render_fixture.materialization_path).unwrap(),
+        )
+        .unwrap();
+        let protocol = crate::mission_render::approved_evaluation_protocol(&materialization)
+            .unwrap()
+            .content_hash()
+            .unwrap();
+        let client = Client::builder().redirect(Policy::none()).build().unwrap();
+        let (_, trials, _) =
+            readback_pre_holdout_terminal(&client, &loaded.request, &loaded.sha256, &protocol)
+                .unwrap();
+        assert!(trials <= u64::try_from(request.declared_total_trials).unwrap());
+        assert!(!fixture.global_claim_path.exists());
+        if negative {
+            let result: CampaignResultV1 =
+                load_campaign_result(&fixture.work_dir.join("campaign-result.json")).unwrap();
+            validate_negative_campaign_result(
+                &loaded,
+                &result,
+                &crate::mission_runner::sha256_file(&fixture.work_dir.join("campaign-result.json"))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(result.rounds.iter().all(|r| r.feedback.accepted_factors > 0
+                && r.feedback.supervised_ridge.as_ref().unwrap().trade_count == 0));
+            assert!(next_campaign_policy_revision(
+                &loaded,
+                &crate::mission_runner::sha256_file(&fixture.work_dir.join("campaign-result.json"))
+                    .unwrap(),
+                classify_campaign_failure(&result).unwrap()
+            )
+            .is_err());
+        } else {
+            for model in ["cart", "burn_mlp"] {
+                assert_metric_bundle_rejected(
+                    &loaded,
+                    &protocol,
+                    &client,
+                    |entries| {
+                        entries.insert(
+                            format!("results/{model}-supervised-backtest.json"),
+                            b"{}".to_vec(),
+                        );
+                    },
+                    "outside its declared scope",
+                );
+            }
+        }
+        for round in &loaded.request.rounds {
+            let file = std::fs::File::open(&round.result_readback_url).unwrap();
+            let mut archive = zip::ZipArchive::new(file).unwrap();
+            assert!(archive.by_name("results/ridge-baseline.json").is_ok());
+            assert!(archive.by_name("results/cart-baseline.json").is_err());
+            assert!(archive.by_name("results/burn-mlp-baseline.json").is_err());
+            let attempts: serde_json::Value = serde_json::from_reader(
+                archive
+                    .by_name("results/supervised-model-attempts.json")
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(attempts["attempts"].as_array().unwrap().len(), 1);
+            let precheck: alpha_engine::label_precheck::LabelSpacePrecheckV1 =
+                serde_json::from_reader(
+                    archive
+                        .by_name("results/label-space-precheck.json")
+                        .unwrap(),
+                )
+                .unwrap();
+            assert!(!precheck.cancels_experiment);
+            let model: alpha_engine::baselines::CexSupervisedModelEvaluationV2 =
+                serde_json::from_reader(
+                    archive
+                        .by_name("results/ridge-supervised-backtest.json")
+                        .unwrap(),
+                )
+                .unwrap();
+            assert_eq!(
+                model.report.return_accounting,
+                alpha_domain::ReturnAccountingBasis::HeldQuantityWithQuotedEntryExit
+            );
+            assert_eq!(
+                model
+                    .candidate
+                    .evaluation
+                    .formula_config()
+                    .unwrap()
+                    .multiple_testing_trials,
+                request.declared_total_trials * 3
+            );
+        }
     }
 
     #[test]
@@ -7628,6 +7855,24 @@ mod tests {
         replay_tracks_features: bool,
         rejected_holdout: bool,
     ) -> CampaignE2eFixture {
+        campaign_e2e_fixture_with_price_step(
+            name,
+            zero_labels,
+            preexisting_claim,
+            replay_tracks_features,
+            rejected_holdout,
+            0.0005,
+        )
+    }
+
+    fn campaign_e2e_fixture_with_price_step(
+        name: &str,
+        zero_labels: bool,
+        preexisting_claim: bool,
+        replay_tracks_features: bool,
+        rejected_holdout: bool,
+        price_step: f64,
+    ) -> CampaignE2eFixture {
         let render_fixture = mission_render::tests::Fixture::canonical();
         let mut rows = mission_render::tests::read_feature_rows(&render_fixture.feature_path);
         if zero_labels {
@@ -7659,7 +7904,7 @@ mod tests {
                     .insert("weighted_book_imbalance_top5".to_string(), direction);
                 if replay_tracks_features {
                     row.features.insert("mid_price".to_string(), mid_price);
-                    mid_price *= 1.0 + direction * 0.0005;
+                    mid_price *= 1.0 + direction * price_step;
                 } else {
                     row.label = direction * 0.001;
                 }
