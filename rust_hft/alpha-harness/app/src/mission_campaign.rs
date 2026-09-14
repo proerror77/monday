@@ -1,4 +1,5 @@
 pub(crate) mod final_evaluation;
+pub(crate) mod preparation;
 use crate::{
     cli::{
         print_json, CampaignExecuteArgs, CampaignFinalizeArgs, CampaignFreezeArgs, CampaignIdArgs,
@@ -6,10 +7,11 @@ use crate::{
     },
     data_mission, mission_dispatch,
     mission_render::{
-        allowed_research_feature_fields, render_cex_bundle, validate_render_instrument_scope,
-        CexCampaignFailureClassV1, CexCampaignLearningDirectiveV1, CexCampaignPositionPolicyV1,
-        CexCampaignResearchDeltaV1, CexCampaignResearchEvidenceSignatureV2,
-        CexCampaignResearchParentV1, CexCampaignResearchPlanV1, CexCampaignSearchPolicyRevisionV1,
+        allowed_research_feature_fields, render_cex_bundle, render_prepared_cex_bundle,
+        validate_render_instrument_scope, CexCampaignFailureClassV1,
+        CexCampaignLearningDirectiveV1, CexCampaignPositionPolicyV1, CexCampaignResearchDeltaV1,
+        CexCampaignResearchEvidenceSignatureV2, CexCampaignResearchParentV1,
+        CexCampaignResearchPlanV1, CexCampaignSearchPolicyRevisionV1, PreparedCexInputs,
         MAX_RESEARCH_PLAN_GENERATION,
     },
     mission_runner::{
@@ -18,8 +20,7 @@ use crate::{
         recover_execution_report_from_published_result, research_event, valid_git_revision,
         validate_cex_holdout_id, validate_supervised_candidate_binding,
         validate_supervised_replay_binding, CexEventReplayReceiptV1, CexSupervisedModelSelectionV1,
-        ExecutionBinding, CEX_SUPERVISED_MODEL_NAMES, MAX_MATERIALIZATION_BYTES,
-        MAX_RESULT_BUNDLE_BYTES,
+        ExecutionBinding, CEX_SUPERVISED_MODEL_NAMES, MAX_RESULT_BUNDLE_BYTES,
     },
     prediction_dispatch::{
         canonical_tokyo_oss_internal_object, cex_campaign_round_root,
@@ -482,6 +483,11 @@ pub fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
 }
 
 pub fn freeze(args: CampaignFreezeArgs) -> anyhow::Result<()> {
+    if args.reuse.is_some() != args.reuse_sha256.is_some()
+        || (args.final_evaluation_control.is_some() && args.reuse.is_some())
+    {
+        bail!("prepared Campaign reuse requires its digest and cannot replace final evaluation admission");
+    }
     if args.final_evaluation_control.is_some() {
         return final_evaluation::freeze(args);
     }
@@ -497,6 +503,7 @@ pub fn freeze(args: CampaignFreezeArgs) -> anyhow::Result<()> {
         "alpha-harness",
         "campaign_freeze_completed",
         serde_json::json!({
+            "prepared_input_reused": args.reuse.is_some(),
             "campaign_id": &request.campaign_id,
             "campaign_inputs_sha256": &plan.campaign_inputs_sha256,
             "research_plan": &request.research_plan,
@@ -1670,8 +1677,7 @@ struct ValidatedCampaignInputSet {
     campaign_root: String,
     image_identity: String,
     producer_image_identity: String,
-    feature_path: PathBuf,
-    materialization_path: PathBuf,
+    render_inputs: PreparedCexInputs,
     feature_url: String,
     materialization_url: String,
     replay_artifact_url: String,
@@ -1713,30 +1719,32 @@ fn validated_campaign_inputs(
     let materialization_path = args.input_root.join(&receipt.materialization.relative_path);
     let replay_artifact_path = args.input_root.join(&receipt.replay_artifact.relative_path);
     let replay_manifest_path = args.input_root.join(&receipt.replay_manifest.relative_path);
-    let feature_sha256 =
-        verify_local_receipt_item("campaign feature", &feature_path, &receipt.feature.sha256)?;
-    let materialization_sha256 = verify_local_receipt_item(
-        "campaign materialization",
-        &materialization_path,
-        &receipt.materialization.sha256,
-    )?;
-    if materialization_path.metadata()?.len() > MAX_MATERIALIZATION_BYTES {
-        bail!("campaign materialization exceeds {MAX_MATERIALIZATION_BYTES} bytes");
+    let render_inputs = PreparedCexInputs::load(&feature_path, &materialization_path)?;
+    let feature_sha256 = render_inputs.feature_sha256().to_string();
+    let materialization_sha256 = render_inputs.materialization_sha256().to_string();
+    for (label, actual, expected) in [
+        ("campaign feature", &feature_sha256, &receipt.feature.sha256),
+        (
+            "campaign materialization",
+            &materialization_sha256,
+            &receipt.materialization.sha256,
+        ),
+    ] {
+        if *actual != normalized_sha256(label, expected)? {
+            bail!("{label} local file SHA256 does not match the receipt");
+        }
     }
-    let materialization = decode_materialization(&std::fs::read(&materialization_path)?)?;
-    if materialization.market != receipt.market || materialization.symbol != receipt.symbol {
+    if render_inputs.materialization().market != receipt.market
+        || render_inputs.materialization().symbol != receipt.symbol
+    {
         bail!("campaign inputs receipt instrument does not match its materialization");
     }
-    let replay_artifact_sha256 = verify_local_receipt_item(
-        "campaign replay artifact",
-        &replay_artifact_path,
-        &receipt.replay_artifact.sha256,
-    )?;
-    let replay_manifest_sha256 = verify_local_receipt_item(
-        "campaign replay manifest",
-        &replay_manifest_path,
-        &receipt.replay_manifest.sha256,
-    )?;
+    let replay_artifact_sha256 =
+        normalized_sha256("campaign replay artifact", &receipt.replay_artifact.sha256)?;
+    let replay_manifest_sha256 =
+        normalized_sha256("campaign replay manifest", &receipt.replay_manifest.sha256)?;
+    // The canonical verifier already hashes both files before checking replay
+    // structure. Do not hash them once more in this caller.
     verify_canonical_replay_artifact_streaming(
         &replay_artifact_path,
         &replay_manifest_path,
@@ -1752,8 +1760,7 @@ fn validated_campaign_inputs(
         campaign_root,
         image_identity,
         producer_image_identity,
-        feature_path,
-        materialization_path,
+        render_inputs,
         feature_url,
         materialization_url,
         replay_artifact_url,
@@ -1766,24 +1773,6 @@ fn validated_campaign_inputs(
 }
 
 fn freeze_request(args: &CampaignFreezeArgs) -> anyhow::Result<(CampaignRequest, String)> {
-    let ValidatedCampaignInputSet {
-        receipt,
-        campaign_inputs_sha256,
-        build_source_revision,
-        campaign_root,
-        image_identity,
-        producer_image_identity,
-        feature_path,
-        materialization_path,
-        feature_url,
-        materialization_url,
-        replay_artifact_url,
-        replay_manifest_url,
-        feature_sha256,
-        materialization_sha256,
-        replay_artifact_sha256,
-        replay_manifest_sha256,
-    } = validated_campaign_inputs(args)?;
     let research_plan = args
         .research_plan
         .as_deref()
@@ -1800,41 +1789,118 @@ fn freeze_request(args: &CampaignFreezeArgs) -> anyhow::Result<(CampaignRequest,
         .map(load_study_proposal)
         .transpose()?;
     validate_study_proposal_for_plan(study_proposal.as_ref(), &research_plan)?;
-    let declared_total_trials = declared_total_trials_for_rounds(&research_plan, args.seeds.len())?;
-    let probe_seed = *args
-        .seeds
+    if args.reuse.is_some() || args.reuse_sha256.is_some() {
+        return reuse_frozen_request(args, &research_plan, study_proposal.as_ref());
+    }
+    let inputs = validated_campaign_inputs(args)?;
+    freeze_prepared_request(
+        &inputs,
+        &research_plan,
+        &args.seeds,
+        study_proposal.as_ref(),
+    )
+}
+
+fn freeze_prepared_request(
+    inputs: &ValidatedCampaignInputSet,
+    research_plan: &CexCampaignResearchPlanV1,
+    seeds: &[u64],
+    study_proposal: Option<&CampaignNextFamilyProposalV1>,
+) -> anyhow::Result<(CampaignRequest, String)> {
+    research_plan.validate()?;
+    if let Some(plan) = &research_plan.mlp_training {
+        plan.validate_requested_seeds(seeds)
+            .map_err(anyhow::Error::msg)?;
+    }
+    validate_study_proposal_for_plan(study_proposal, research_plan)?;
+    let declared_total_trials = declared_total_trials_for_rounds(research_plan, seeds.len())?;
+    let probe_seed = *seeds
         .first()
         .context("campaign freeze requires at least one seed")?;
-    let rendered = render_cex_bundle(
-        &feature_path,
-        &materialization_path,
-        &research_plan,
+    let rendered = render_prepared_cex_bundle(
+        &inputs.render_inputs,
+        research_plan,
         probe_seed,
         declared_total_trials,
     )?;
     Ok((
         build_request_from_parts(
-            &feature_url,
-            &feature_sha256,
-            &materialization_url,
-            &materialization_sha256,
-            &replay_artifact_url,
-            &replay_artifact_sha256,
-            &replay_manifest_url,
-            &replay_manifest_sha256,
-            &campaign_inputs_sha256,
-            &receipt.source_revision,
-            &producer_image_identity,
-            &research_plan,
-            &build_source_revision,
-            &image_identity,
-            &campaign_root,
+            &inputs.feature_url,
+            &inputs.feature_sha256,
+            &inputs.materialization_url,
+            &inputs.materialization_sha256,
+            &inputs.replay_artifact_url,
+            &inputs.replay_artifact_sha256,
+            &inputs.replay_manifest_url,
+            &inputs.replay_manifest_sha256,
+            &inputs.campaign_inputs_sha256,
+            &inputs.receipt.source_revision,
+            &inputs.producer_image_identity,
+            research_plan,
+            &inputs.build_source_revision,
+            &inputs.image_identity,
+            &inputs.campaign_root,
             &rendered.mission.spec.holdout.holdout_id,
-            &args.seeds,
-            study_proposal.as_ref(),
+            seeds,
+            study_proposal,
         )?,
-        campaign_inputs_sha256,
+        inputs.campaign_inputs_sha256.clone(),
     ))
+}
+
+fn reuse_frozen_request(
+    args: &CampaignFreezeArgs,
+    research_plan: &CexCampaignResearchPlanV1,
+    study_proposal: Option<&CampaignNextFamilyProposalV1>,
+) -> anyhow::Result<(CampaignRequest, String)> {
+    let path = args
+        .reuse
+        .as_deref()
+        .context("prepared freeze path is required")?;
+    let expected_sha = normalized_sha256(
+        "prepared freeze",
+        args.reuse_sha256
+            .as_deref()
+            .context("prepared freeze SHA256 is required")?,
+    )?;
+    let (frozen, actual_sha) = load_freeze_plan_with_sha(path)?;
+    if actual_sha != expected_sha {
+        bail!("prepared freeze SHA256 mismatch");
+    }
+    let (receipt, receipt_sha) = load_campaign_inputs_receipt(&args.campaign_inputs)?;
+    validate_campaign_inputs_receipt(&receipt)?;
+    let source = normalized_source_revision("campaign source revision", &args.source_revision)?;
+    if source != BUILD_SOURCE_REVISION {
+        bail!("campaign source revision does not match this build");
+    }
+    let expected = build_request_from_parts(
+        &receipt.feature.object_url,
+        &receipt.feature.sha256,
+        &receipt.materialization.object_url,
+        &receipt.materialization.sha256,
+        &receipt.replay_artifact.object_url,
+        &receipt.replay_artifact.sha256,
+        &receipt.replay_manifest.object_url,
+        &receipt.replay_manifest.sha256,
+        &receipt_sha,
+        &receipt.source_revision,
+        &mission_dispatch::image_digest(&receipt.image_ref)?,
+        research_plan,
+        &source,
+        &mission_dispatch::image_digest(&args.image)?,
+        &args.campaign_root,
+        &frozen.canonical_request.holdout_id,
+        &args.seeds,
+        study_proposal,
+    )?;
+    if frozen.campaign_inputs_sha256 != receipt_sha
+        || frozen.canonical_request != expected
+        || frozen.signing_plan != signing_plan(&expected)?
+    {
+        bail!("prepared freeze differs from requested input, source, image, plan, seeds or output identity");
+    }
+    validate_request(&expected)?;
+    Ok((expected, receipt_sha))
 }
 
 fn load_campaign_inputs_receipt(path: &Path) -> anyhow::Result<(CampaignInputsReceipt, String)> {
@@ -2587,19 +2653,24 @@ fn read_json_value(path: &Path) -> anyhow::Result<serde_json::Value> {
 }
 
 fn load_freeze_plan(path: &Path) -> anyhow::Result<FrozenCampaignPlan> {
-    let mut file = File::open(path)
+    Ok(load_freeze_plan_with_sha(path)?.0)
+}
+
+fn load_freeze_plan_with_sha(path: &Path) -> anyhow::Result<(FrozenCampaignPlan, String)> {
+    let file = File::open(path)
         .with_context(|| format!("open campaign freeze plan {}", path.display()))?;
-    if file.metadata()?.len() > MAX_REQUEST_BYTES {
+    let mut bytes = Vec::new();
+    file.take(MAX_REQUEST_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_REQUEST_BYTES {
         bail!("campaign freeze plan exceeds {MAX_REQUEST_BYTES} bytes");
     }
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut file, &mut bytes)?;
+    let sha = hex::encode(Sha256::digest(&bytes));
     let plan: FrozenCampaignPlan = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse campaign freeze plan {}", path.display()))?;
     if plan.schema_version != CAMPAIGN_FREEZE_SCHEMA_V1 {
         bail!("campaign freeze plan schema_version must be {CAMPAIGN_FREEZE_SCHEMA_V1}");
     }
-    Ok(plan)
+    Ok((plan, sha))
 }
 
 pub fn print_expected_id(args: CampaignIdArgs) -> anyhow::Result<()> {
@@ -5475,6 +5546,8 @@ mod tests {
         let output = root.path().join("freeze.json");
 
         freeze(CampaignFreezeArgs {
+            reuse: None,
+            reuse_sha256: None,
             final_evaluation_control: None,
             campaign_inputs: receipt_path.clone(),
             input_root: input_root.clone(),
@@ -5518,6 +5591,153 @@ mod tests {
             signing_plan(&frozen.canonical_request).unwrap()
         );
 
+        let mut reuse = CampaignFreezeArgs {
+            reuse: Some(output.clone()),
+            reuse_sha256: Some(crate::mission_runner::sha256_file(&output).unwrap()),
+            final_evaluation_control: None,
+            campaign_inputs: receipt_path.clone(),
+            input_root: input_root.clone(),
+            source_revision: BUILD_SOURCE_REVISION.to_string(),
+            image: executor_image_ref.clone(),
+            campaign_root: format!("{TEST_ROOT}/campaigns"),
+            seeds: vec![7, 11],
+            research_plan: None,
+            study_proposal: None,
+            output: root.path().join("reused-freeze.json"),
+        };
+        let offline_inputs = root.path().join("offline-inputs");
+        std::fs::rename(&input_root, &offline_inputs).unwrap();
+        freeze(reuse.clone()).unwrap();
+        assert_eq!(
+            std::fs::read(&output).unwrap(),
+            std::fs::read(&reuse.output).unwrap()
+        );
+        for mutation in 0..6 {
+            let mut wrong = reuse.clone();
+            match mutation {
+                0 => wrong.reuse_sha256 = Some("0".repeat(64)),
+                1 => wrong.reuse_sha256 = None,
+                2 => wrong.source_revision = "b".repeat(40),
+                3 => wrong.image = format!("registry/research@sha256:{}", "3".repeat(64)),
+                4 => wrong.seeds = vec![7, 12],
+                _ => wrong.campaign_root = format!("{TEST_ROOT}/other-campaigns"),
+            }
+            assert!(
+                freeze_request(&wrong).is_err(),
+                "reuse accepted changed binding {mutation}"
+            );
+        }
+        let mut changed_plan = CexCampaignResearchPlanV1::canonical();
+        changed_plan.hypothesis.push_str(" Revised hypothesis.");
+        let changed_plan_path = root.path().join("changed-plan.json");
+        data_mission::write_json_atomic(&changed_plan_path, &changed_plan).unwrap();
+        reuse.research_plan = Some(changed_plan_path);
+        assert!(freeze_request(&reuse).is_err());
+        let mut changed_receipt = receipt.clone();
+        changed_receipt.feature.sha256 = "9".repeat(64);
+        data_mission::write_json_atomic(&receipt_path, &changed_receipt).unwrap();
+        reuse.research_plan = None;
+        assert!(freeze_request(&reuse).is_err());
+        data_mission::write_json_atomic(&receipt_path, &receipt).unwrap();
+        std::fs::rename(&offline_inputs, &input_root).unwrap();
+
+        // Exercise the fixed matrix preparation entrypoint with shared input
+        // validation, completed-index reuse, and a changed parameter matrix.
+        let mut base_plan = CexCampaignResearchPlanV1::canonical();
+        let mut training = paired_mlp_plan_for_tests();
+        training.updates = 4096;
+        training.optimization = Some(alpha_domain::mlp_training::CexMlpOptimizationV1 {
+            learning_rate: 0.0003,
+            controls: hft_research_manifest::mlp_training::MlpOptimizationControlsV1::default(),
+        });
+        base_plan.mlp_training = Some(training);
+        let matrix_path = root.path().join("matrix.json");
+        let matrix_root = root.path().join("matrix-output");
+        let mut matrix = serde_json::json!({
+            "schema_version":"monday.cex_campaign_preparation_plan.v1",
+            "source_revision":BUILD_SOURCE_REVISION,"image":executor_image_ref,
+            "campaign_root":format!("{TEST_ROOT}/campaigns"),
+            "campaign_inputs":{"path":receipt_path,"sha256":receipt_sha256},
+            "input_root":input_root,"seeds":[7,11],"base_research_plan":base_plan,
+            "members":[{"id":"short","mlp":{"updates":4096,"learning_rate":0.0003}},
+                       {"id":"long","mlp":{"updates":8192,"learning_rate":0.0003}}]
+        });
+        data_mission::write_json_atomic(&matrix_path, &matrix).unwrap();
+        let prepare_matrix = || {
+            preparation::prepare(crate::cli::CampaignPrepareArgs {
+                plan: matrix_path.clone(),
+                output_root: matrix_root.clone(),
+            })
+        };
+        prepare_matrix().unwrap();
+        let prepared_root = std::fs::read_dir(&matrix_root)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let index_path = prepared_root.join("preparation.json");
+        let first_index = std::fs::read(&index_path).unwrap();
+        let index: serde_json::Value = serde_json::from_slice(&first_index).unwrap();
+        assert_eq!(index["members"].as_array().unwrap().len(), 2);
+        assert_ne!(
+            index["members"][0]["campaign_id"],
+            index["members"][1]["campaign_id"]
+        );
+        assert_eq!(index["seeds"], serde_json::json!(["7", "11"]));
+        let mut from_matrix = reuse.clone();
+        from_matrix.reuse =
+            Some(prepared_root.join(index["members"][0]["freeze"]["path"].as_str().unwrap()));
+        from_matrix.reuse_sha256 = Some(
+            index["members"][0]["freeze"]["sha256"]
+                .as_str()
+                .unwrap()
+                .into(),
+        );
+        from_matrix.research_plan = Some(
+            prepared_root.join(
+                index["members"][0]["research_plan"]["path"]
+                    .as_str()
+                    .unwrap(),
+            ),
+        );
+        from_matrix.output = root.path().join("native-from-matrix.json");
+        freeze(from_matrix.clone()).unwrap();
+        assert_eq!(
+            std::fs::read(from_matrix.reuse.unwrap()).unwrap(),
+            std::fs::read(from_matrix.output).unwrap()
+        );
+        std::fs::rename(&input_root, &offline_inputs).unwrap();
+        prepare_matrix().unwrap();
+        assert_eq!(std::fs::read(&index_path).unwrap(), first_index);
+        // Inputs were committed, but the final index was not: resume without
+        // touching the now-unavailable bulk input or replacing existing members.
+        std::fs::remove_file(&index_path).unwrap();
+        prepare_matrix().unwrap();
+        assert_eq!(std::fs::read(&index_path).unwrap(), first_index);
+        matrix["prepared_inputs"] = serde_json::json!({
+            "path":prepared_root.join(index["prepared_inputs"]["path"].as_str().unwrap()),
+            "sha256":index["prepared_inputs"]["sha256"],
+        });
+        matrix["members"][0]["mlp"]["updates"] = 8192.into();
+        matrix["members"][1]["mlp"]["updates"] = 16384.into();
+        data_mission::write_json_atomic(&matrix_path, &matrix).unwrap();
+        prepare_matrix().unwrap();
+        assert_eq!(std::fs::read(&index_path).unwrap(), first_index);
+        let second_root = std::fs::read_dir(&matrix_root)
+            .unwrap()
+            .map(|p| p.unwrap().path())
+            .find(|p| *p != prepared_root)
+            .unwrap();
+        let second_index: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(second_root.join("preparation.json")).unwrap())
+                .unwrap();
+        let cached_inputs =
+            second_root.join(second_index["prepared_inputs"]["path"].as_str().unwrap());
+        std::fs::write(&cached_inputs, b"{}\n").unwrap();
+        assert!(prepare_matrix().is_err());
+        std::fs::rename(&offline_inputs, &input_root).unwrap();
+
         for missing_later_seed in [true, false] {
             let mut plan = CexCampaignResearchPlanV1::canonical();
             let mut training = paired_mlp_plan_for_tests();
@@ -5540,6 +5760,8 @@ mod tests {
                 .path()
                 .join(format!("invalid-freeze-{missing_later_seed}.json"));
             let error = freeze(CampaignFreezeArgs {
+                reuse: None,
+                reuse_sha256: None,
                 final_evaluation_control: None,
                 campaign_inputs: receipt_path.clone(),
                 input_root: input_root.clone(),
@@ -5581,6 +5803,8 @@ mod tests {
         wrong_symbol.symbol = "SOLUSDT".to_string();
         data_mission::write_json_atomic(&receipt_path, &wrong_symbol).unwrap();
         let mismatch = freeze_request(&CampaignFreezeArgs {
+            reuse: None,
+            reuse_sha256: None,
             final_evaluation_control: None,
             campaign_inputs: receipt_path.clone(),
             input_root: input_root.clone(),
@@ -5606,6 +5830,8 @@ mod tests {
             .contains("source_revision must be an exact git revision"));
 
         let invalid_executor = freeze_request(&CampaignFreezeArgs {
+            reuse: None,
+            reuse_sha256: None,
             final_evaluation_control: None,
             campaign_inputs: receipt_path.clone(),
             input_root: input_root.clone(),
@@ -5632,6 +5858,8 @@ mod tests {
             crate::mission_runner::sha256_file(&replay_manifest_path).unwrap();
         data_mission::write_json_atomic(&receipt_path, &invalid_replay_receipt).unwrap();
         let invalid_replay = freeze_request(&CampaignFreezeArgs {
+            reuse: None,
+            reuse_sha256: None,
             final_evaluation_control: None,
             campaign_inputs: receipt_path.clone(),
             input_root: input_root.clone(),
@@ -5649,6 +5877,8 @@ mod tests {
             .any(|cause| cause.to_string().contains("artifact")));
 
         let invalid_source = freeze_request(&CampaignFreezeArgs {
+            reuse: None,
+            reuse_sha256: None,
             final_evaluation_control: None,
             campaign_inputs: receipt_path.clone(),
             input_root: input_root.clone(),

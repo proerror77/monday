@@ -82,6 +82,8 @@ enum MissionCommand {
     Execute(Box<ExecuteMissionArgs>),
     CampaignExecute(CampaignExecuteArgs),
     CampaignFreeze(CampaignFreezeArgs),
+    /// Prepare a bounded research matrix once, without signing or dispatching jobs.
+    CampaignPrepare(CampaignPrepareArgs),
     CampaignLearn(CampaignLearnArgs),
     CampaignStudyPropose(CampaignStudyProposeArgs),
     CampaignFinalize(CampaignFinalizeArgs),
@@ -287,7 +289,24 @@ pub struct CampaignExecuteArgs {
 }
 
 #[derive(Debug, Clone, Args)]
+pub struct CampaignPrepareArgs {
+    #[arg(long)]
+    pub plan: PathBuf,
+    #[arg(long)]
+    pub output_root: PathBuf,
+}
+
+#[derive(Debug, Clone, Args)]
 pub struct CampaignFreezeArgs {
+    /// Reuse a previously produced native freeze, verified against an explicit digest.
+    #[arg(
+        long,
+        requires = "reuse_sha256",
+        conflicts_with = "final_evaluation_control"
+    )]
+    pub reuse: Option<PathBuf>,
+    #[arg(long, requires = "reuse")]
+    pub reuse_sha256: Option<String>,
     #[arg(long, conflicts_with_all = ["seeds", "research_plan"])]
     pub final_evaluation_control: Option<PathBuf>,
     #[arg(long)]
@@ -1109,6 +1128,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 require_cloud_data_host(std::env::consts::OS)?;
                 mission_campaign::freeze(args)
             }
+            MissionCommand::CampaignPrepare(args) => mission_campaign::preparation::prepare(args),
             MissionCommand::CampaignLearn(args) => {
                 tokio::task::spawn_blocking(move || mission_campaign::learn(args))
                     .await
