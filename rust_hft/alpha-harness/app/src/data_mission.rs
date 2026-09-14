@@ -119,6 +119,21 @@ pub(crate) fn validate_cex_replay_features(
     snapshot: &CexReplaySnapshotV5,
     features: &FeatureDatasetManifest,
 ) -> anyhow::Result<()> {
+    let rows = read_feature_rows(features).map_err(anyhow::Error::msg)?;
+    validate_cex_replay_feature_rows(snapshot, features, &rows)
+}
+
+pub(crate) fn validate_imported_cex_replay_features(
+    snapshot: &CexReplaySnapshotV5,
+    imported: &hft_collector::ImportedFeatureDataset,
+) -> anyhow::Result<()> {
+    validate_cex_replay_feature_rows(snapshot, imported.manifest(), imported.rows())
+}
+
+pub(crate) fn validate_cex_replay_feature_metadata(
+    snapshot: &CexReplaySnapshotV5,
+    features: &FeatureDatasetManifest,
+) -> anyhow::Result<()> {
     snapshot.validate()?;
     if features.symbol != snapshot.symbol
         || features.artifact_sha256 != snapshot.feature_artifact_sha256
@@ -174,7 +189,15 @@ pub(crate) fn validate_cex_replay_features(
     if features.series_count != snapshot.series.len() {
         bail!("feature series count does not match the CEX replay snapshot");
     }
-    let rows = read_feature_rows(features).map_err(anyhow::Error::msg)?;
+    Ok(())
+}
+
+fn validate_cex_replay_feature_rows(
+    snapshot: &CexReplaySnapshotV5,
+    features: &FeatureDatasetManifest,
+    rows: &[hft_collector::PointInTimeFeatureRow],
+) -> anyhow::Result<()> {
+    validate_cex_replay_feature_metadata(snapshot, features)?;
     let label_horizon = u64::try_from(snapshot.label_horizon_buckets)
         .ok()
         .and_then(|horizon| snapshot.bucket_ms.checked_mul(horizon))

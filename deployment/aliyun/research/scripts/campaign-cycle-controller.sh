@@ -38,6 +38,7 @@ Usage: campaign-cycle-controller.sh [start] \
   [--control CONTROL_JSON] [--signer EXECUTABLE] \
   --work-dir DIR --seed N --seed N \
   [--initial-research-plan FILE] \
+  [--prepared-freeze FILE --prepared-freeze-sha256 SHA256 --preparation-ledger FILE] \
   [--context NAME] [--namespace NAME] [--max-follow-ups 3] \
   [--job-timeout 7h] \
   [--study-id ID --study-target-family-id ID --study-target-horizon FILE \
@@ -102,6 +103,8 @@ validate_controller_state() {
     and (if has("initial_research_plan_sha256") then
       (.initial_research_plan_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
       else true end)
+    and (if has("prepared_freeze_sha256") then (.prepared_freeze_sha256 | type == "string" and test("^[a-f0-9]{64}$")) else true end)
+    and (if has("prepared_freeze_sha256") then (.preparation_ledger | type == "string" and length > 0) else true end)
     and ((.input_mode // "receipt") == "receipt"
       or ((.input_mode == "fresh") and (.fresh | type == "object" and (.market | type == "string"))))
     and ((.study // null) == null or ((.study | type == "object")
@@ -154,6 +157,37 @@ validate_initial_research_plan() {
     initial_research_plan_sha256="$expected"
   elif [[ -e "$retained" || -L "$retained" ]]; then
     die "unbound retained initial research plan requires its original input"
+  fi
+}
+
+validate_prepared_freeze() {
+  local retained="$work_dir/prepared-freeze.json" expected="" state="$work_dir/controller-inputs.json"
+  if [[ -e "$state" ]]; then
+    validate_controller_state "$state"
+    expected=$(jq -r '.prepared_freeze_sha256 // empty' "$state")
+  fi
+  if [[ -n "$prepared_freeze" || -n "$prepared_freeze_sha256" ]]; then
+    [[ -n "$preparation_ledger" && -f "$preparation_ledger" ]] || die "prepared reuse requires its independently selected trusted ledger"
+    [[ "$max_follow_ups" == 0 ]] || die "a prepared comparison has no automatic follow-up trials"
+    [[ -n "$prepared_freeze" && "$prepared_freeze_sha256" =~ ^[a-f0-9]{64}$ ]] \
+      || die "prepared freeze requires a file and exact SHA256"
+    [[ "$fresh_mode" != true ]] || die "prepared freeze cannot replace fresh input preparation"
+    [[ ! -L "$prepared_freeze" && -f "$prepared_freeze" ]] || die "prepared freeze must be a regular file"
+    [[ $(wc -c < "$prepared_freeze") -le 1048576 ]] || die "prepared freeze exceeds 1048576 bytes"
+    if [[ $(sha256_file "$prepared_freeze") != "$prepared_freeze_sha256" ]]; then
+      [[ "$prepared_freeze" != "$retained" ]] || die "retained prepared freeze is invalid"
+      die "prepared freeze SHA256 mismatch"
+    fi
+    [[ ! -e "$state" || "$expected" == "$prepared_freeze_sha256" ]] || die "prepared freeze differs from controller inputs"
+  elif [[ -n "$expected" ]]; then
+    prepared_freeze="$retained"
+    prepared_freeze_sha256="$expected"
+  fi
+  if [[ -n "$prepared_freeze_sha256" && ( -e "$retained" || -L "$retained" ) ]]; then
+    [[ ! -L "$retained" && -f "$retained" && $(sha256_file "$retained") == "$prepared_freeze_sha256" ]] \
+      || die "retained prepared freeze is invalid"
+  elif [[ -n "$expected" ]]; then
+    die "retained prepared freeze is missing"
   fi
 }
 
@@ -523,6 +557,9 @@ campaign_pod_name=""
 work_dir=""
 seeds=()
 mode="start"
+prepared_freeze=""
+prepared_freeze_sha256=""
+preparation_ledger=""
 fresh_mode=false
 fresh_raw_root=""
 fresh_reference_root=""
@@ -628,6 +665,9 @@ while (($#)); do
     --source-revision) [[ "$mode" == "start" ]] || die "$mode loads --source-revision from controller state"; source_revision="$2"; shift 2 ;;
     --image) [[ "$mode" == "start" ]] || die "$mode loads --image from controller state"; image="$2"; shift 2 ;;
     --campaign-root) [[ "$mode" == "start" ]] || die "$mode loads --campaign-root from controller state"; campaign_root="$2"; shift 2 ;;
+    --prepared-freeze) [[ "$mode" == "start" ]] || die "$mode loads prepared freeze from controller state"; prepared_freeze="$2"; shift 2 ;;
+    --prepared-freeze-sha256) [[ "$mode" == "start" ]] || die "$mode loads prepared freeze from controller state"; prepared_freeze_sha256="$2"; shift 2 ;;
+    --preparation-ledger) [[ "$mode" == "start" ]] || die "$mode loads preparation ledger from controller state"; preparation_ledger="$2"; shift 2 ;;
     --initial-research-plan) [[ "$mode" == "start" ]] || die "$mode loads --initial-research-plan from controller state"; initial_research_plan="$2"; shift 2 ;;
     --signer) signer="$2"; shift 2 ;;
     --control) control="$2"; shift 2 ;;
@@ -679,6 +719,9 @@ if [[ "$mode" == "approve" || "$mode" == "ack-readback" ]]; then
   state="$work_dir/controller-inputs.json"
   [[ -s "$state" ]] || die "controller state is missing: $state"
   validate_controller_state "$state"
+  prepared_freeze_sha256=$(jq -r '.prepared_freeze_sha256 // empty' "$state")
+  preparation_ledger=$(jq -r '.preparation_ledger // empty' "$state")
+  [[ -z "$prepared_freeze_sha256" ]] || prepared_freeze="$work_dir/prepared-freeze.json"
   campaign_inputs="$(jq -er '.campaign_inputs' "$state")"
   input_root="$(jq -er '.input_root' "$state")"
   source_revision="$(jq -er '.source_revision' "$state")"
@@ -784,7 +827,13 @@ if [[ "$mode" != "ack-readback" ]]; then
       || die "campaign inputs directory does not exist: $(dirname "$campaign_inputs")"
     campaign_inputs="$campaign_inputs_dir/$(basename "$campaign_inputs")"
     [[ -f "$campaign_inputs" ]] || die "campaign inputs file does not exist: $campaign_inputs"
-    input_root="$(cd "$input_root" && pwd -P)" || die "input root does not exist: $input_root"
+    if [[ -z "$prepared_freeze" && -z "${prepared_freeze_sha256:-}" ]]; then
+      input_root="$(cd "$input_root" && pwd -P)" || die "input root does not exist: $input_root"
+    elif [[ "$input_root" != /* ]]; then
+      # Prepared execution binds object identities; its old bulk-input directory
+      # is not needed for metadata validation or worker-side verified downloads.
+      input_root="$(pwd -P)/$input_root"
+    fi
   fi
   if [[ -n "$signer" ]]; then
     [[ -x "$signer" ]] || die "signer is not executable: $signer"
@@ -802,6 +851,10 @@ fi
 # existing controller state before creating the work directory, logging a
 # preparation stage, or invoking that materializer.
 validate_initial_research_plan
+if [[ -n "$preparation_ledger" ]]; then
+  preparation_ledger="$(cd "$(dirname "$preparation_ledger")" && pwd -P)/$(basename "$preparation_ledger")"
+fi
+validate_prepared_freeze
 validate_fresh_controller_owner
 
 umask 077
@@ -827,6 +880,18 @@ on_controller_error() {
   die "command failed at line $2 with exit $1"
 }
 trap 'on_controller_error "$?" "$LINENO"' ERR
+
+if [[ -n "$prepared_freeze" && "$prepared_freeze" != "$work_dir/prepared-freeze.json" ]]; then
+  if [[ ! -e "$work_dir/prepared-freeze.json" ]]; then
+    state_tmp=$(mktemp "$work_dir/.prepared-freeze.XXXXXX")
+    cp -- "$prepared_freeze" "$state_tmp"
+    [[ $(sha256_file "$state_tmp") == "$prepared_freeze_sha256" ]] || die "prepared freeze changed while retaining it"
+    chmod 600 "$state_tmp"
+    mv -- "$state_tmp" "$work_dir/prepared-freeze.json"
+    state_tmp=""
+  fi
+  prepared_freeze="$work_dir/prepared-freeze.json"
+fi
 
 if [[ -n "$initial_research_plan" ]]; then
   retained_initial_plan="$work_dir/initial-research-plan.json"
@@ -1308,6 +1373,8 @@ else
     --arg namespace "$namespace" \
     --arg control "$control" \
     --arg initial_plan_sha256 "$initial_research_plan_sha256" \
+    --arg prepared_freeze_sha256 "$prepared_freeze_sha256" \
+    --arg preparation_ledger "$preparation_ledger" \
     --arg input_mode "$input_mode" \
     --argjson fresh "$fresh_state_json" \
     --argjson study "$study_state_json" \
@@ -1318,7 +1385,8 @@ else
      + (if $input_mode == "fresh" then {input_mode:"fresh",fresh:$fresh,control:(if $control == "" then null else $control end)}
         elif $control == "" then {} else {control:$control} end)
      + (if $study == null then {} else {study:$study} end)
-     + (if $initial_plan_sha256 == "" then {} else {initial_research_plan_sha256:$initial_plan_sha256} end)' \
+     + (if $initial_plan_sha256 == "" then {} else {initial_research_plan_sha256:$initial_plan_sha256} end)
+     + (if $prepared_freeze_sha256 == "" then {} else {prepared_freeze_sha256:$prepared_freeze_sha256,preparation_ledger:$preparation_ledger} end)' \
     >"$state_tmp"
   if [[ -e "$state" ]]; then
     # Preserve historical checkpoints; only the retired token budget is irrelevant.
@@ -1468,6 +1536,9 @@ while ((generation <= max_follow_ups)); do
   [[ -z "$research_plan" ]] || freeze_args+=(--research-plan "$research_plan")
   if [[ -n "$study_proposal_path" && -s "$study_proposal_path" ]]; then
     freeze_args+=(--study-proposal "$study_proposal_path")
+  fi
+  if [[ "$generation" == 0 && -n "$prepared_freeze" ]]; then
+    freeze_args+=(--reuse "$prepared_freeze" --reuse-sha256 "$prepared_freeze_sha256" --preparation-ledger "$preparation_ledger")
   fi
   if [[ ! -e "$generation_dir/frozen" ]]; then
     controller_stage="freeze"

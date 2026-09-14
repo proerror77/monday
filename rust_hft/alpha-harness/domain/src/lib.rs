@@ -946,7 +946,10 @@ impl CexResearchMissionSpecV1 {
             )?;
             baseline
                 .with_mlp_training(self.mlp_training.clone())?
-                .validate_binding(&self.policies.baseline)?;
+                .resolve_trial_binding(
+                    &self.policies.baseline,
+                    self.search.multiple_testing_trials,
+                )?;
             Some(gp)
         } else {
             None
@@ -999,7 +1002,10 @@ impl CexResearchMissionSpecV1 {
                 .validate_binding(&self.policies.gp)?;
                 CexBaselinePolicyV1::controlled_v1(self.policies.baseline.id.clone())?
                     .with_mlp_training(Some(profile.clone()))?
-                    .validate_binding(&self.policies.baseline)?;
+                    .resolve_trial_binding(
+                        &self.policies.baseline,
+                        self.search.multiple_testing_trials,
+                    )?;
             }
         }
         if self
@@ -2971,6 +2977,7 @@ pub fn factor_ast_source_features(ast: &FactorAst) -> Vec<String> {
 pub const CEX_BASELINE_POLICY_SCHEMA_V1: &str = "cex-baseline-policy-v1";
 pub const CEX_BASELINE_POLICY_SCHEMA_V2: &str = "cex-baseline-policy-v2";
 pub const CEX_BASELINE_POLICY_SCHEMA_V3: &str = "cex-baseline-policy-v3";
+pub const CEX_BASELINE_POLICY_SCHEMA_V4: &str = "cex-baseline-policy-v4";
 pub const CEX_BASELINE_ARTIFACT_SCHEMA_V2: &str = "cex-baseline-artifact-v2";
 pub const CEX_BASELINE_GATE_SCHEMA_V1: &str = "cex-baseline-gate-v1";
 
@@ -3045,6 +3052,36 @@ impl CexBaselinePolicyV1 {
         Ok(self)
     }
 
+    /// Bind the actual supervised score correction to the preregistered family.
+    pub fn with_comparison_trials(mut self, trials: usize) -> Result<Self, DomainError> {
+        if trials < 2 {
+            return Err(DomainError::InvalidCexBaseline(
+                "comparison trial bound is too small",
+            ));
+        }
+        self.schema_version = CEX_BASELINE_POLICY_SCHEMA_V4.into();
+        self.evaluator_config = FormulaEvaluatorConfig::for_trials(trials)?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Historical fixed-two artifacts retain their original hash. A newly
+    /// bound family policy must exactly match the Mission's registered bound.
+    pub fn resolve_trial_binding(
+        self,
+        binding: &CexResearchContentRefV1,
+        trials: usize,
+    ) -> Result<Self, DomainError> {
+        if self.schema_version != CEX_BASELINE_POLICY_SCHEMA_V4
+            && self.validate_binding(binding).is_ok()
+        {
+            return Ok(self);
+        }
+        let policy = self.with_comparison_trials(trials)?;
+        policy.validate_binding(binding)?;
+        Ok(policy)
+    }
+
     pub fn validate(&self) -> Result<(), DomainError> {
         let canonical = self.schema_version == CEX_BASELINE_POLICY_SCHEMA_V1
             && self.mlp_training.is_none()
@@ -3058,7 +3095,13 @@ impl CexBaselinePolicyV1 {
                     .mlp_training
                     .as_ref()
                     .is_some_and(|profile| profile.validate().is_ok()));
-        let parameterized = profile_shape
+        let family_shape = self.schema_version == CEX_BASELINE_POLICY_SCHEMA_V4
+            && self.evaluator_config.multiple_testing_trials >= 2
+            && self
+                .mlp_training
+                .as_ref()
+                .is_none_or(|profile| profile.validate().is_ok());
+        let parameterized = (profile_shape || family_shape)
             && self.ridge_l2.is_finite()
             && (1.0e-8..=1.0e-2).contains(&self.ridge_l2)
             && (1..=8).contains(&self.cart_max_depth)
@@ -3066,7 +3109,12 @@ impl CexBaselinePolicyV1 {
         if !(canonical || parameterized)
             || self.policy_id.trim().is_empty()
             || self.cart_tie_break != CexBaselineTieBreakV1::LossThenFeatureThenThreshold
-            || self.evaluator_config != FormulaEvaluatorConfig::for_trials(2)?
+            || self.evaluator_config
+                != FormulaEvaluatorConfig::for_trials(if family_shape {
+                    self.evaluator_config.multiple_testing_trials
+                } else {
+                    2
+                })?
         {
             return Err(DomainError::InvalidCexBaseline("baseline policy drifted"));
         }

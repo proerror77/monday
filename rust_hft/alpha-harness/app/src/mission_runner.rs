@@ -196,7 +196,7 @@ fn bound_gp_policy(mission: &CexResearchMissionArtifactV1) -> anyhow::Result<Cex
     Ok(continuous_templates)
 }
 
-fn bound_baseline_policy(
+pub(crate) fn bound_baseline_policy(
     mission: &CexResearchMissionArtifactV1,
 ) -> anyhow::Result<CexBaselinePolicyV1> {
     let binding = &mission.spec.policies.baseline;
@@ -210,7 +210,9 @@ fn bound_baseline_policy(
     } else {
         CexBaselinePolicyV1::controlled_v1(binding.id.clone())?
     };
-    let policy = policy.with_mlp_training(mission.spec.mlp_training.clone())?;
+    let policy = policy
+        .with_mlp_training(mission.spec.mlp_training.clone())?
+        .resolve_trial_binding(binding, mission.spec.search.multiple_testing_trials)?;
     policy
         .validate_binding(binding)
         .map_err(anyhow::Error::msg)?;

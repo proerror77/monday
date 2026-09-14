@@ -51,6 +51,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     && install -D -m 0755 /work/target/prediction-markets/release/monday-prediction-snapshot /out/bin/monday-prediction-snapshot
 
 FROM debian:bookworm-slim AS runtime-base
+ENV MONDAY_EXECUTION_HOST=ack
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \

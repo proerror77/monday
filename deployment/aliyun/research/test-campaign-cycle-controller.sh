@@ -107,6 +107,15 @@ case "$1 $2" in
     ;;
   "mission campaign-freeze")
     output="$(value_after --output "$@")"
+    if [[ " $* " == *" --reuse "* ]]; then
+      previous=$(value_after --reuse "$@")
+      [[ $(sha_file "$previous") == $(value_after --reuse-sha256 "$@") ]]
+      increment "$FAKE_STATE/reused-freeze-count"
+      cp "$previous" "$output"
+      jq '{campaign_id:.canonical_request.campaign_id}' "$output"
+      exit 0
+    fi
+    increment "$FAKE_STATE/full-freeze-count"
     generation=0
     if [[ " $* " == *" --research-plan "* ]]; then
       plan="$(value_after --research-plan "$@")"
@@ -1310,4 +1319,40 @@ grep -Fq 'initial research plan must have generation zero' "$root/initial-genera
 test ! -e "$root/invalid-initial-plan-cycle"
 test "$(<"$FAKE_STATE/dispatch-count")" == 1
 printf 'initial Campaign plan and recovery binding: PASS\n'
+# Prepared artifacts are consumed by the native freeze reuse branch and retained
+# for recovery. No initial research-plan file is required for canonical plans.
+export FAKE_STATE="$root/prepared-state"
+mkdir "$FAKE_STATE"
+prepared_cycle="$root/prepared-cycle"
+prepared_source="$root/prepared-source.json"
+cp "$submit_work_dir/generation-0/freeze.json" "$prepared_source"
+prepared_sha=$(shasum -a 256 "$prepared_source" | awk '{print $1}')
+prepared_args=("${controller_args[@]}")
+for ((index = 0; index < ${#prepared_args[@]}; index++)); do
+  if [[ "${prepared_args[index]}" == --work-dir ]]; then
+    prepared_args[index + 1]="$prepared_cycle"
+  elif [[ "${prepared_args[index]}" == --max-follow-ups ]]; then
+    prepared_args[index + 1]=0
+  fi
+done
+touch "$start_dir/preparation-ledger"
+prepared_args+=(--prepared-freeze "$prepared_source" --prepared-freeze-sha256 "$prepared_sha" --preparation-ledger "$start_dir/preparation-ledger")
+mv "$start_dir/input" "$root/prepared-offline-input"
+(cd "$start_dir" && "$controller" "${prepared_args[@]}") >"$root/prepared.out" 2>"$root/prepared.err" || { cat "$root/prepared.err" >&2; exit 1; }
+[[ ! -e "$FAKE_STATE/full-freeze-count" ]]
+[[ $(cat "$FAKE_STATE/reused-freeze-count") == 1 ]]
+[[ $(cat "$FAKE_STATE/dispatch-count") == 1 ]]
+cmp "$prepared_source" "$prepared_cycle/prepared-freeze.json"
+[[ $(jq -r .prepared_freeze_sha256 "$prepared_cycle/controller-inputs.json") == "$prepared_sha" ]]
+mv "$prepared_source" "$prepared_source.offline"
+prepared_resume=(approve --work-dir "$prepared_cycle" --signer "$bin/signer" --alpha-harness "$bin/alpha-harness" --aliyun "$bin/aliyun" --kubectl "$bin/kubectl")
+"$controller" "${prepared_resume[@]}" >"$root/prepared-resume.out" 2>"$root/prepared-resume.err"
+[[ $(cat "$FAKE_STATE/reused-freeze-count") == 1 && $(cat "$FAKE_STATE/dispatch-count") == 1 ]]
+printf '\n' >>"$prepared_cycle/prepared-freeze.json"
+if "$controller" "${prepared_resume[@]}" >"$root/prepared-drift.out" 2>"$root/prepared-drift.err"; then
+  echo "controller accepted changed retained prepared input" >&2; exit 1
+fi
+grep -Fq 'retained prepared freeze is invalid' "$root/prepared-drift.err"
+[[ $(cat "$FAKE_STATE/dispatch-count") == 1 ]]
+printf 'prepared freeze reuse and resume: PASS\n'
 echo "campaign cycle controller test: PASS"

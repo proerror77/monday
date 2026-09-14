@@ -2,8 +2,8 @@ use crate::{
     cli::ValidationArgs,
     data_mission,
     mission_runner::{
-        decode_materialization, normalized_sha256, sha256_file, validate_materialization,
-        MAX_FEATURE_BYTES, MAX_MATERIALIZATION_BYTES,
+        decode_materialization, normalized_sha256, validate_materialization, MAX_FEATURE_BYTES,
+        MAX_MATERIALIZATION_BYTES,
     },
 };
 use alpha_domain::{
@@ -20,11 +20,14 @@ use alpha_domain::{
 };
 use alpha_engine::baselines::CexSupervisedDecisionPolicyV2;
 use anyhow::{bail, Context};
-use hft_collector::{import_feature_dataset, FeatureDatasetManifest};
+#[cfg(test)]
+use hft_collector::import_feature_dataset;
+use hft_collector::FeatureDatasetManifest;
 use hft_factor_dsl::FactorOperator;
 use hft_research_manifest::CexReplayDatasetManifestV5;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, path::Path};
+use sha2::{Digest, Sha256};
+use std::{collections::BTreeSet, io::Read, path::Path};
 
 const STABLE_VERSION: &str = "binance-cex-1s-top5-factor-plan-v5";
 const STABLE_HYPOTHESIS_ID: &str = "l2-microstructure-factor-plan-v5";
@@ -407,6 +410,10 @@ impl CexCampaignLearningDirectiveV1 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CexCampaignResearchPlanV1 {
+    /// Statistical correction across the declared comparison family; separate
+    /// from the trials reserved by this individual Campaign.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) comparison_family_trials: Option<usize>,
     pub(crate) schema_version: String,
     pub(crate) generation: u8,
     pub(crate) objective: String,
@@ -503,9 +510,21 @@ pub(crate) struct CexCampaignLlmProvenanceV1 {
 }
 
 impl CexCampaignResearchPlanV1 {
+    pub(crate) fn effective_multiple_testing_trials(
+        &self,
+        declared_trials: usize,
+    ) -> anyhow::Result<usize> {
+        let trials = self.comparison_family_trials.unwrap_or(declared_trials);
+        if trials < declared_trials || trials == 0 {
+            bail!("comparison family trial bound is below the Campaign trial declaration");
+        }
+        Ok(trials)
+    }
+
     pub(crate) fn canonical() -> Self {
         let search_policy_revision = CexCampaignSearchPolicyRevisionV1::canonical();
         Self {
+            comparison_family_trials: None,
             schema_version: RESEARCH_PLAN_SCHEMA_V2.to_string(),
             generation: 0,
             objective: "Generate and screen continuous L2 and aggregate-trade microstructure factors, including aggressive trade-flow imbalance, inverse spread, cross-depth pressure consensus, top-five depth concentration, and VWAP-center displacement, then evaluate Ridge and shallow CART with purged walk-forward OOS predictions on the bound Binance instrument and prediction horizon under governed dynamic-v4 GP"
@@ -759,6 +778,107 @@ pub(crate) struct RenderedCexMission {
     pub(crate) mission_id: String,
 }
 
+/// One verified input snapshot, shared by all treatments rendered in this
+/// process. Only the loader can construct it; rendering never reopens inputs.
+pub(crate) struct PreparedCexInputs {
+    materialization: crate::mission_runner::Materialization,
+    feature_manifest: FeatureDatasetManifest,
+    feature_sha256: String,
+    materialization_sha256: String,
+    materialization_bytes: Vec<u8>,
+    _feature_artifacts: Option<tempfile::TempDir>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PreparedCexInputMetadata {
+    materialization_json: String,
+    feature_manifest: FeatureDatasetManifest,
+}
+
+impl PreparedCexInputs {
+    pub(crate) fn metadata(&self) -> anyhow::Result<PreparedCexInputMetadata> {
+        Ok(PreparedCexInputMetadata {
+            materialization_json: String::from_utf8(self.materialization_bytes.clone())?,
+            feature_manifest: self.feature_manifest.clone(),
+        })
+    }
+
+    /// The preparation controller must first authenticate the enclosing receipt
+    /// against its independently retained digest and source/input bindings.
+    pub(crate) fn restore_metadata(
+        metadata: PreparedCexInputMetadata,
+        feature_sha256: &str,
+        materialization_sha256: &str,
+    ) -> anyhow::Result<Self> {
+        let bytes = metadata.materialization_json.into_bytes();
+        if bytes.len() as u64 > MAX_MATERIALIZATION_BYTES
+            || hex::encode(Sha256::digest(&bytes)) != materialization_sha256
+            || metadata.feature_manifest.artifact_sha256 != feature_sha256
+            || metadata.feature_manifest.manifest_id != format!("dataset-{feature_sha256}")
+        {
+            bail!("prepared input metadata differs from its admitted content identities");
+        }
+        let materialization = decode_materialization(&bytes)?;
+        data_mission::validate_cex_replay_feature_metadata(
+            &materialization.snapshot,
+            &metadata.feature_manifest,
+        )?;
+        Ok(Self {
+            materialization,
+            feature_manifest: metadata.feature_manifest,
+            feature_sha256: feature_sha256.into(),
+            materialization_sha256: materialization_sha256.into(),
+            materialization_bytes: bytes,
+            _feature_artifacts: None,
+        })
+    }
+
+    pub(crate) fn materialization(&self) -> &crate::mission_runner::Materialization {
+        &self.materialization
+    }
+    pub(crate) fn feature_sha256(&self) -> &str {
+        &self.feature_sha256
+    }
+    pub(crate) fn materialization_sha256(&self) -> &str {
+        &self.materialization_sha256
+    }
+    pub(crate) fn load(feature: &Path, materialization_path: &Path) -> anyhow::Result<Self> {
+        validate_input_sizes(feature, materialization_path)?;
+        let mut bytes = Vec::new();
+        std::fs::File::open(materialization_path)?
+            .take(MAX_MATERIALIZATION_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_MATERIALIZATION_BYTES {
+            bail!("source exceeds the allowed size");
+        }
+        let materialization_sha256 = hex::encode(Sha256::digest(&bytes));
+        let materialization = decode_materialization(&bytes)?;
+        let feature_artifacts =
+            tempfile::tempdir().context("create feature validation directory")?;
+        // The importer hashes the exact bytes it parses. Reuse that hash rather
+        // than performing another full read before or after the import.
+        let imported = hft_collector::import_feature_dataset_for_reuse(
+            materialization.mission_id.clone(),
+            feature,
+            feature_artifacts.path(),
+            MAX_FEATURE_BYTES,
+        )
+        .map_err(anyhow::Error::msg)?;
+        data_mission::validate_imported_cex_replay_features(&materialization.snapshot, &imported)?;
+        let feature_manifest = imported.into_manifest();
+        let feature_sha256 = feature_manifest.artifact_sha256.clone();
+        Ok(Self {
+            materialization,
+            feature_manifest,
+            feature_sha256,
+            materialization_sha256,
+            materialization_bytes: bytes,
+            _feature_artifacts: Some(feature_artifacts),
+        })
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RenderedHoldoutPolicyV1 {
@@ -795,37 +915,40 @@ pub(crate) fn render_cex_bundle(
     multiple_testing_trials: usize,
 ) -> anyhow::Result<RenderedCexMission> {
     research_plan.validate()?;
-    validate_input_sizes(feature, materialization_path)?;
-    let feature_sha256 = sha256_file(feature)?;
-    let materialization_sha256 = sha256_file(materialization_path)?;
-    let materialization = decode_materialization(
-        &std::fs::read(materialization_path)
-            .with_context(|| format!("read {}", materialization_path.display()))?,
-    )?;
-    let research_market = rendered_research_market(&materialization)?;
-    let feature_artifacts = tempfile::tempdir().context("create feature validation directory")?;
-    let feature_manifest = import_feature_manifest(
-        &materialization.mission_id,
-        feature,
-        feature_artifacts.path(),
-    )?;
+    let inputs = PreparedCexInputs::load(feature, materialization_path)?;
+    render_prepared_cex_bundle(&inputs, research_plan, seed, multiple_testing_trials)
+}
+
+pub(crate) fn render_prepared_cex_bundle(
+    inputs: &PreparedCexInputs,
+    research_plan: &CexCampaignResearchPlanV1,
+    seed: u64,
+    multiple_testing_trials: usize,
+) -> anyhow::Result<RenderedCexMission> {
+    research_plan.validate()?;
+    let multiple_testing_trials =
+        research_plan.effective_multiple_testing_trials(multiple_testing_trials)?;
+    let materialization = &inputs.materialization;
+    let feature_manifest = &inputs.feature_manifest;
+    let feature_sha256 = &inputs.feature_sha256;
+    let materialization_sha256 = &inputs.materialization_sha256;
+    let research_market = rendered_research_market(materialization)?;
     ensure_materialization_scope(
-        &materialization,
-        &feature_manifest,
-        &feature_sha256,
+        materialization,
+        feature_manifest,
+        feature_sha256,
         research_plan.label_horizon.as_ref(),
     )?;
-    data_mission::validate_cex_replay_features(&materialization.snapshot, &feature_manifest)?;
-    let validation = approved_validation(&materialization)?;
-    validate_materialization(&materialization, &feature_sha256, &validation)?;
+    let validation = approved_validation(materialization)?;
+    validate_materialization(materialization, feature_sha256, &validation)?;
     let dataset = CexReplayDatasetManifestV5::new(
         feature_manifest.manifest_id.clone(),
         materialization.snapshot.clone(),
     )
     .context("construct CEX replay dataset manifest")?;
     let dataset_sha256 = canonical_json_hash(&dataset)?;
-    let feature_sha256 = normalized_sha256("feature", &feature_sha256)?;
-    let materialization_sha256 = normalized_sha256("materialization", &materialization_sha256)?;
+    let feature_sha256 = normalized_sha256("feature", feature_sha256)?;
+    let materialization_sha256 = normalized_sha256("materialization", materialization_sha256)?;
     let snapshot_sha256 = materialization.snapshot.sha256();
     let frozen_input_sha256 = canonical_json_hash(&serde_json::json!({
         "stable_version": STABLE_VERSION,
@@ -834,7 +957,7 @@ pub(crate) fn render_cex_bundle(
         "snapshot_sha256": snapshot_sha256,
         "source_revision": materialization.source_revision,
     }))?;
-    let sealed_holdout_cohort_sha256 = sealed_holdout_cohort_sha256(&materialization)?;
+    let sealed_holdout_cohort_sha256 = sealed_holdout_cohort_sha256(materialization)?;
     // MLP treatments must not change the factor-search lineage. The complete
     // plan, resolved baseline policy and Mission still bind the treatment.
     let mut factor_search_plan = research_plan.clone();
@@ -862,7 +985,7 @@ pub(crate) fn render_cex_bundle(
     let input_lineage_id = format!("{stable_version}-input-{}", &materialization_sha256[..16]);
     let holdout_id = format!("cex-holdout-{}", &sealed_holdout_cohort_sha256[..48]);
     let evaluation_protocol = approved_evaluation_protocol_for_horizon(
-        &materialization,
+        materialization,
         research_plan.label_horizon.as_ref(),
     )?;
     let mlp_training = research_plan
@@ -920,6 +1043,11 @@ pub(crate) fn render_cex_bundle(
         .transpose()?
         .unwrap_or(CexBaselinePolicyV1::controlled_v1(BASELINE_POLICY_ID)?)
         .with_mlp_training(mlp_training.clone())?;
+    let baseline_policy = if research_plan.comparison_family_trials.is_some() {
+        baseline_policy.with_comparison_trials(multiple_testing_trials)?
+    } else {
+        baseline_policy
+    };
     let supervised_decision_policy = research_plan
         .search_policy_revision
         .position_policy
@@ -1102,6 +1230,7 @@ fn validate_input_sizes(feature: &Path, materialization: &Path) -> anyhow::Resul
     Ok(())
 }
 
+#[cfg(test)]
 fn import_feature_manifest(
     mission_id: &str,
     input: &Path,
@@ -1321,6 +1450,68 @@ pub(crate) mod tests {
             .max_candidates()
             .unwrap()
             * 2
+    }
+
+    #[test]
+    fn prepared_inputs_render_multiple_treatments_without_reading_files_again() {
+        let fixture = Fixture::new(MIN_ROWS);
+        let inputs =
+            PreparedCexInputs::load(&fixture.feature_path, &fixture.materialization_path).unwrap();
+        let plan = CexCampaignResearchPlanV1::canonical();
+        let first = render_prepared_cex_bundle(&inputs, &plan, 7, default_trials()).unwrap();
+        // Remove both source files and the importer's local copy. The admitted
+        // snapshot must suffice; no filesystem cache marker is being trusted.
+        std::fs::remove_file(&fixture.feature_path).unwrap();
+        std::fs::remove_file(&fixture.materialization_path).unwrap();
+        std::fs::remove_file(&inputs.feature_manifest.artifact_path).unwrap();
+        for seed in [7, 11, 17] {
+            let rendered =
+                render_prepared_cex_bundle(&inputs, &plan, seed, default_trials()).unwrap();
+            if seed == 7 {
+                assert_eq!(rendered.mission_id, first.mission_id);
+            } else {
+                assert_ne!(rendered.mission_id, first.mission_id);
+            }
+        }
+        let mut invalid = plan;
+        invalid.comparison_family_trials = Some(default_trials() * 3);
+        let compared = render_prepared_cex_bundle(&inputs, &invalid, 7, default_trials()).unwrap();
+        assert_eq!(
+            compared.mission.spec.search.multiple_testing_trials,
+            default_trials() * 3
+        );
+        let scoring = crate::mission_runner::bound_baseline_policy(&compared.mission).unwrap();
+        assert_eq!(
+            scoring.evaluator_config.multiple_testing_trials,
+            default_trials() * 3
+        );
+        let mut request = crate::mission_campaign::valid_request_for_tests();
+        request.research_plan = invalid.clone();
+        crate::mission_campaign::validate_terminal_mission_revision_binding(
+            &compared.mission,
+            &request,
+        )
+        .unwrap();
+        let mut undercounted = compared.mission.clone();
+        undercounted.spec.policies.baseline.content_sha256 =
+            CexBaselinePolicyV1::controlled_v1(BASELINE_POLICY_ID)
+                .unwrap()
+                .content_hash()
+                .unwrap();
+        assert!(
+            crate::mission_campaign::validate_terminal_mission_revision_binding(
+                &undercounted,
+                &request
+            )
+            .is_err()
+        );
+        invalid.comparison_family_trials = Some(default_trials() - 1);
+        assert!(render_prepared_cex_bundle(&inputs, &invalid, 7, default_trials()).is_err());
+        invalid.feature_fields.clear();
+        assert!(render_prepared_cex_bundle(&inputs, &invalid, 7, default_trials()).is_err());
+        assert!(
+            PreparedCexInputs::load(&fixture.feature_path, &fixture.materialization_path).is_err()
+        );
     }
 
     #[test]
@@ -1602,6 +1793,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let plan = CexCampaignResearchPlanV1 {
+            comparison_family_trials: None,
             schema_version: RESEARCH_PLAN_SCHEMA_V2.to_string(),
             generation: 1,
             objective: "Test one bounded follow-up".to_string(),
@@ -1800,6 +1992,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let plan = CexCampaignResearchPlanV1 {
+            comparison_family_trials: None,
             schema_version: RESEARCH_PLAN_SCHEMA_V2.to_string(),
             generation: 1,
             objective: "Test a declared feature subset".to_string(),

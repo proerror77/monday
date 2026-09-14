@@ -1970,12 +1970,7 @@ fn backup_recovery_inputs_owned(
     std::fs::set_permissions(backup_dir, std::fs::Permissions::from_mode(0o550))?;
     backup_directories.sort();
     backup_directories.dedup();
-    backup_directories.sort_by(|left, right| {
-        right
-            .components()
-            .count()
-            .cmp(&left.components().count())
-    });
+    backup_directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
     for directory in backup_directories {
         std::fs::File::open(directory)?.sync_all()?;
     }

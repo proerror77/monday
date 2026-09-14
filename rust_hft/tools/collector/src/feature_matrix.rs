@@ -119,17 +119,55 @@ struct TraceFacts {
     time_bounds: FeatureDatasetTimeBounds,
 }
 
+/// An immutable import snapshot; the manifest and rows describe the exact same
+/// bytes. Reuse this during preparation instead of reading and parsing the
+/// just-imported artifact again. This is not deserializable admission evidence.
+pub struct ImportedFeatureDataset {
+    manifest: FeatureDatasetManifest,
+    rows: Vec<PointInTimeFeatureRow>,
+}
+
+impl ImportedFeatureDataset {
+    pub fn manifest(&self) -> &FeatureDatasetManifest {
+        &self.manifest
+    }
+    pub fn rows(&self) -> &[PointInTimeFeatureRow] {
+        &self.rows
+    }
+    pub fn into_manifest(self) -> FeatureDatasetManifest {
+        self.manifest
+    }
+}
+
 pub fn import_feature_dataset(
     mission_id: impl Into<String>,
     input: &Path,
     artifact_dir: &Path,
 ) -> Result<FeatureDatasetManifest, String> {
+    import_feature_dataset_for_reuse(mission_id, input, artifact_dir, u64::MAX)
+        .map(ImportedFeatureDataset::into_manifest)
+}
+
+pub fn import_feature_dataset_for_reuse(
+    mission_id: impl Into<String>,
+    input: &Path,
+    artifact_dir: &Path,
+    max_bytes: u64,
+) -> Result<ImportedFeatureDataset, String> {
     let mission_id = mission_id.into();
     if mission_id.trim().is_empty() || artifact_dir.as_os_str().is_empty() {
         return Err("feature data mission and artifact directory are required".to_string());
     }
-    let input_bytes =
-        std::fs::read(input).map_err(|error| format!("failed to read feature matrix: {error}"))?;
+    use std::io::Read;
+    let mut input_bytes = Vec::new();
+    std::fs::File::open(input)
+        .map_err(|error| format!("failed to read feature matrix: {error}"))?
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut input_bytes)
+        .map_err(|error| format!("failed to read feature matrix: {error}"))?;
+    if input_bytes.len() as u64 > max_bytes {
+        return Err("feature matrix exceeds the admitted byte limit".into());
+    }
     let rows = parse_feature_rows(&input_bytes, SeriesFieldRequirement::Required)?;
     let created_at = Utc::now();
     let facts = validate_rows(&rows, created_at)?;
@@ -145,7 +183,7 @@ pub fn import_feature_dataset(
     std::fs::rename(&temporary, &artifact_path)
         .map_err(|error| format!("failed to publish feature artifact: {error}"))?;
 
-    Ok(FeatureDatasetManifest {
+    let manifest = FeatureDatasetManifest {
         dataset_kind: "point_in_time_feature_matrix".to_string(),
         manifest_id: format!("dataset-{hash}"),
         mission_id,
@@ -161,7 +199,8 @@ pub fn import_feature_dataset(
         artifact_path,
         artifact_sha256: hash,
         created_at,
-    })
+    };
+    Ok(ImportedFeatureDataset { manifest, rows })
 }
 
 pub fn read_feature_rows(
@@ -412,6 +451,27 @@ mod tests {
         }
         std::fs::write(&path, bytes).unwrap();
         path
+    }
+
+    #[test]
+    fn reusable_import_binds_rows_and_bytes_and_enforces_the_read_limit() {
+        let source = rows();
+        let input = write_input(&source);
+        let output = input.with_extension("artifacts");
+        let size = std::fs::metadata(&input).unwrap().len();
+        let rejected = import_feature_dataset_for_reuse("data-reuse", &input, &output, size - 1);
+        assert!(rejected.err().unwrap().contains("byte limit"));
+        assert!(!output.exists());
+        let imported =
+            import_feature_dataset_for_reuse("data-reuse", &input, &output, size).unwrap();
+        assert_eq!(imported.rows(), source);
+        assert_eq!(
+            imported.rows(),
+            read_feature_rows(imported.manifest()).unwrap()
+        );
+        std::fs::remove_file(&input).unwrap();
+        std::fs::remove_dir_all(&output).unwrap();
+        assert_eq!(imported.rows(), source);
     }
 
     #[test]

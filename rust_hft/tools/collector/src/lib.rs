@@ -21,8 +21,8 @@ pub mod research_memory;
 pub mod source_catalog;
 
 pub use feature_matrix::{
-    import_feature_dataset, read_feature_rows, DataModality, FeatureDatasetManifest,
-    FeatureLabelSpec, PointInTimeFeatureRow,
+    import_feature_dataset, import_feature_dataset_for_reuse, read_feature_rows, DataModality,
+    FeatureDatasetManifest, FeatureLabelSpec, ImportedFeatureDataset, PointInTimeFeatureRow,
 };
 pub use source_catalog::{
     acquire_dataset, source_catalog, CandleInterval, DataAcquisitionMission, DatasetManifest,
