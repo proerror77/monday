@@ -1,0 +1,8 @@
+{
+  "schema_version": "monday.campaign_learning_checkpoint.v1",
+  "request_sha256": "64a93f349cb914717fa5b4ca953566e26b577ffebde7e91f620d6a954a903239",
+  "campaign_result_sha256": "b1bfa9587a4cd134264772189fb0eab5ec8cf916c8fd4a0348011968d7db684e",
+  "learn_report_sha256": "65f2b5fdba2b6f45b41198f4f70d493f3b77359bfcc8ddbeea201d66f12e4370",
+  "research_plan_file_sha256": "44b261c45e84c495f93cf7c2f03ec33d17e200e302807b508069dddb0d984d87",
+  "outcome": "follow_up"
+}
