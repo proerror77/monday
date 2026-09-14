@@ -410,6 +410,11 @@ impl CexCampaignLearningDirectiveV1 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CexCampaignResearchPlanV1 {
+    #[serde(
+        default,
+        skip_serializing_if = "alpha_domain::CexSupervisedModelScopeV1::is_default"
+    )]
+    pub(crate) supervised_model_scope: alpha_domain::CexSupervisedModelScopeV1,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) holding: Option<hft_research_manifest::model::HorizonHoldingPolicyV1>,
     /// Statistical correction across the declared comparison family; separate
@@ -541,6 +546,7 @@ impl CexCampaignResearchPlanV1 {
     pub(crate) fn canonical() -> Self {
         let search_policy_revision = CexCampaignSearchPolicyRevisionV1::canonical();
         Self {
+            supervised_model_scope: alpha_domain::CexSupervisedModelScopeV1::default(),
             holding: None,
             comparison_family_trials: None,
             schema_version: RESEARCH_PLAN_SCHEMA_V2.to_string(),
@@ -576,6 +582,11 @@ impl CexCampaignResearchPlanV1 {
             {
                 bail!("holding requires the unchanged cost-aware entry policy");
             }
+        }
+        if self.supervised_model_scope == alpha_domain::CexSupervisedModelScopeV1::RidgeOnly
+            && (self.mlp_training.is_some() || self.holding.is_none())
+        {
+            bail!("Ridge-only H1 requires horizon holding and cannot include MLP training");
         }
         if let Some(plan) = &self.mlp_training {
             plan.validate().map_err(anyhow::Error::msg)?;
@@ -1067,8 +1078,11 @@ pub(crate) fn render_prepared_cex_bundle(
         })
         .transpose()?
         .unwrap_or(CexBaselinePolicyV1::controlled_v1(BASELINE_POLICY_ID)?)
-        .with_mlp_training(mlp_training.clone())?;
-    let baseline_policy = if research_plan.comparison_family_trials.is_some() {
+        .with_mlp_training(mlp_training.clone())?
+        .with_model_scope(research_plan.supervised_model_scope)?;
+    let baseline_policy = if research_plan.comparison_family_trials.is_some()
+        || !research_plan.supervised_model_scope.is_default()
+    {
         baseline_policy.with_comparison_trials(multiple_testing_trials)?
     } else {
         baseline_policy
@@ -1102,6 +1116,7 @@ pub(crate) fn render_prepared_cex_bundle(
     let mission = CexResearchMissionArtifactV1 {
         schema_version: CEX_RESEARCH_MISSION_SCHEMA_V1.to_string(),
         spec: CexResearchMissionSpecV1 {
+            supervised_model_scope: research_plan.supervised_model_scope,
             objective: research_plan.objective.clone(),
             search_lineage_id,
             data_mission_id: materialization.mission_id.clone(),
@@ -1841,6 +1856,41 @@ pub(crate) mod tests {
                 .holding,
             plan.holding
         );
+        plan.supervised_model_scope = alpha_domain::CexSupervisedModelScopeV1::RidgeOnly;
+        plan.comparison_family_trials = Some(default_trials() * 3);
+        let ridge = render_cex_bundle(
+            &fixture.feature_path,
+            &fixture.materialization_path,
+            &plan,
+            7,
+            default_trials(),
+        )
+        .unwrap();
+        let policy = crate::mission_runner::bound_baseline_policy(&ridge.mission).unwrap();
+        assert_eq!(
+            policy.model_scope,
+            alpha_domain::CexSupervisedModelScopeV1::RidgeOnly
+        );
+        assert_eq!(
+            policy.evaluator_config.multiple_testing_trials,
+            default_trials() * 3
+        );
+        let mut ridge_request = crate::mission_campaign::valid_request_for_tests();
+        ridge_request.research_plan = plan.clone();
+        crate::mission_campaign::validate_terminal_mission_revision_binding(
+            &ridge.mission,
+            &ridge_request,
+        )
+        .unwrap();
+        assert!(
+            crate::mission_campaign::validate_terminal_mission_revision_binding(
+                &held.mission,
+                &ridge_request
+            )
+            .is_err()
+        );
+        plan.supervised_model_scope = alpha_domain::CexSupervisedModelScopeV1::default();
+        plan.comparison_family_trials = None;
         let mut request = crate::mission_campaign::valid_request_for_tests();
         request.research_plan = plan.clone();
         crate::mission_campaign::validate_terminal_mission_revision_binding(
@@ -1891,6 +1941,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let plan = CexCampaignResearchPlanV1 {
+            supervised_model_scope: alpha_domain::CexSupervisedModelScopeV1::default(),
             holding: None,
             comparison_family_trials: None,
             schema_version: RESEARCH_PLAN_SCHEMA_V2.to_string(),
@@ -2091,6 +2142,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let plan = CexCampaignResearchPlanV1 {
+            supervised_model_scope: alpha_domain::CexSupervisedModelScopeV1::default(),
             holding: None,
             comparison_family_trials: None,
             schema_version: RESEARCH_PLAN_SCHEMA_V2.to_string(),

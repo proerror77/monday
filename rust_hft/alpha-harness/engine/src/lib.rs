@@ -1,5 +1,7 @@
 //! Persistent, budgeted AutoResearch mission kernel.
 
+pub mod label_precheck;
+
 pub mod baselines;
 pub mod engines;
 pub mod evaluation;
