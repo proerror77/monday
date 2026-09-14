@@ -631,6 +631,21 @@ fn convergence_stops_at_first_eligible_training_checkpoint_and_survives_save_loa
         .convergence
         .minimum_updates = 16;
     assert!(edited.validate().is_err());
+    let mut non_boundary = value.clone();
+    non_boundary["config"]["epochs"] = 9.into();
+    non_boundary["config"]["optimization"]["convergence"]["minimum_updates"] = 9.into();
+    let exhausted = train_contract_model(&bytes, &seal(&non_boundary)).unwrap();
+    let exhausted = &exhausted.diagnostics().learning;
+    assert_eq!(exhausted.updates_completed, 9);
+    assert_eq!(
+        exhausted.exit_reason,
+        "update_budget_exhausted_not_converged"
+    );
+    assert_eq!(
+        exhausted.stability.as_ref().unwrap().convergence.status,
+        hft_research_ml::MlpConvergenceStatusV1::BudgetExhaustedNotConverged
+    );
+    exhausted.validate().unwrap();
     value["config"]["optimization"]
         .as_object_mut()
         .unwrap()

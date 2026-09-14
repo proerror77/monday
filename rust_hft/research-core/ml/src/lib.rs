@@ -1519,11 +1519,9 @@ fn train_parsed_contract_model(
                     .count(),
                 raw_gradient_l2_history,
                 applied_gradient_l2_history,
-                convergence: MlpConvergenceDiagnosticsV1::from_loss_history(
-                    &controls.convergence,
-                    &loss_history,
-                )
-                .map_err(ContractTrainingError::Artifact)?,
+                convergence: controls
+                    .convergence_diagnostics(&loss_history)
+                    .map_err(ContractTrainingError::Artifact)?,
             })
         })
         .transpose()?;

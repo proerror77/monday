@@ -80,6 +80,20 @@ impl Default for MlpOptimizationControlsV1 {
 }
 
 impl MlpOptimizationControlsV1 {
+    pub fn convergence_diagnostics(
+        &self,
+        losses: &[f64],
+    ) -> Result<MlpConvergenceDiagnosticsV1, String> {
+        let mut diagnostics =
+            MlpConvergenceDiagnosticsV1::from_loss_history(&self.convergence, losses)?;
+        if self.stop_on_convergence
+            && !(losses.len() - 1).is_multiple_of(self.convergence.window_updates)
+        {
+            diagnostics.status = MlpConvergenceStatusV1::BudgetExhaustedNotConverged;
+        }
+        Ok(diagnostics)
+    }
+
     /// Only completed training updates participate. No validation labels or
     /// evaluation metric can select the stopping point.
     pub fn should_stop(&self, losses: &[f64]) -> Result<bool, String> {
@@ -277,10 +291,7 @@ impl MlpStabilityDiagnosticsV1 {
                 .count()
             || !self
                 .convergence
-                .agrees(&MlpConvergenceDiagnosticsV1::from_loss_history(
-                    &self.controls.convergence,
-                    losses,
-                )?)
+                .agrees(&self.controls.convergence_diagnostics(losses)?)
         {
             return Err("MLP clipping or convergence evidence is not reproducible".into());
         }
@@ -583,6 +594,7 @@ impl MlpLearningDiagnosticsV1 {
                     "update_budget_exhausted_not_converged"
                 };
                 if self.exit_reason != expected_reason
+                    || (converged && !stability.controls.should_stop(&self.loss_history)?)
                     || (self.updates_completed < self.updates_requested
                         && !stability.controls.should_stop(&self.loss_history)?)
                 {
