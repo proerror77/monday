@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+# shellcheck source=deployment/aliyun/research/scripts/campaign-job-watch.sh
+source "$(dirname "$0")/campaign-job-watch.sh"
 original_args=("$@")
 
 controller_stage="preflight"
@@ -39,6 +41,7 @@ Usage: campaign-cycle-controller.sh [start] \
   --work-dir DIR --seed N --seed N \
   [--initial-research-plan FILE] \
   [--prepared-freeze FILE --prepared-freeze-sha256 SHA256 --preparation-ledger FILE] \
+  [--run-to-terminal] \
   [--context NAME] [--namespace NAME] [--max-follow-ups 3] \
   [--job-timeout 7h] \
   [--study-id ID --study-target-family-id ID --study-target-horizon FILE \
@@ -53,7 +56,7 @@ Usage: campaign-cycle-controller.sh [start] \
   [--alpha-harness EXECUTABLE] [--aliyun EXECUTABLE] [--kubectl EXECUTABLE]
 
        campaign-cycle-controller.sh ack-readback \
-  --work-dir DIR --campaign-pod-name NAME \
+  --work-dir DIR (--campaign-pod-name NAME | --discover-campaign-pod) \
   [--study-target-control FILE] [--study-retry-authority] \
   [--alpha-harness EXECUTABLE] [--aliyun EXECUTABLE] [--kubectl EXECUTABLE]
 
@@ -99,7 +102,8 @@ validate_controller_state() {
     and (.max_follow_ups | type == "number")
     and (.job_timeout | type == "string")
     and (.seeds | type == "array" and length >= 2)
-    and all(.seeds[]; type == "number")
+    and all(.seeds[]; (type == "string" and test("^(0|[1-9][0-9]{0,19})$"))
+      or (type == "number" and . >= 0 and . <= 9007199254740991 and floor == .))
     and (if has("initial_research_plan_sha256") then
       (.initial_research_plan_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
       else true end)
@@ -192,7 +196,7 @@ validate_prepared_freeze() {
 }
 
 build_fresh_controller_contract() {
-  seeds_json=$(printf '%s\n' "${seeds[@]}" | jq -R 'tonumber' | jq -s '.')
+  seeds_json=$(printf '%s\n' "${seeds[@]}" | jq -R . | jq -s '.')
   fresh_state_json=$(jq -n \
     --arg raw_root "$fresh_raw_root" \
     --arg reference_root "$fresh_reference_root" \
@@ -335,7 +339,7 @@ validate_fresh_controller_owner() {
        and .namespace == $namespace
        and .max_follow_ups == $max_follow_ups
        and .job_timeout == $job_timeout
-       and .seeds == $seeds
+       and (.seeds | map(tostring)) == $seeds
        and .fresh == $fresh' \
       "$state" >/dev/null \
       || die "existing work directory belongs to different fresh controller inputs"
@@ -466,8 +470,10 @@ cycle_status() {
   fi
 
   if [[ -e "$generation_dir/terminal-failure" ]]; then
+    validate_terminal_failure "$generation_dir" || die "saved terminal failure evidence is invalid or unsupported"
     checkpoint_status="terminal_failure"
     next_stage=""
+    termination_reason="$(jq -er '.reason' "$generation_dir/terminal-failure")"
   elif [[ -e "$generation_dir/generation-complete" ]]; then
     validate_generation_completion "$generation_dir" "$generation" \
       || die "saved Campaign completion checkpoint is invalid or unsupported"
@@ -554,9 +560,11 @@ initial_research_plan_sha256=""
 signer=""
 control=""
 campaign_pod_name=""
+discover_campaign_pod=false
 work_dir=""
 seeds=()
 mode="start"
+run_to_terminal=false
 prepared_freeze=""
 prepared_freeze_sha256=""
 preparation_ledger=""
@@ -666,6 +674,8 @@ while (($#)); do
     --image) [[ "$mode" == "start" ]] || die "$mode loads --image from controller state"; image="$2"; shift 2 ;;
     --campaign-root) [[ "$mode" == "start" ]] || die "$mode loads --campaign-root from controller state"; campaign_root="$2"; shift 2 ;;
     --prepared-freeze) [[ "$mode" == "start" ]] || die "$mode loads prepared freeze from controller state"; prepared_freeze="$2"; shift 2 ;;
+    --run-to-terminal) [[ "$mode" == "start" || "$mode" == "approve" ]] || die "$mode cannot dispatch a workflow"; run_to_terminal=true; shift ;;
+    --discover-campaign-pod) [[ "$mode" == "ack-readback" ]] || die "Pod discovery is a readback operation"; discover_campaign_pod=true; shift ;;
     --prepared-freeze-sha256) [[ "$mode" == "start" ]] || die "$mode loads prepared freeze from controller state"; prepared_freeze_sha256="$2"; shift 2 ;;
     --preparation-ledger) [[ "$mode" == "start" ]] || die "$mode loads preparation ledger from controller state"; preparation_ledger="$2"; shift 2 ;;
     --initial-research-plan) [[ "$mode" == "start" ]] || die "$mode loads --initial-research-plan from controller state"; initial_research_plan="$2"; shift 2 ;;
@@ -815,8 +825,12 @@ if [[ "$mode" != "ack-readback" ]]; then
     die "--signer is required"
   fi
 else
-  [[ "$campaign_pod_name" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]] \
-    || die "--campaign-pod-name must be an exact Kubernetes Pod name"
+  if [[ "$discover_campaign_pod" == true ]]; then
+    [[ -z "$campaign_pod_name" ]] || die "select an exact Pod or authenticated discovery"
+  else
+    [[ "$campaign_pod_name" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]] \
+      || die "--campaign-pod-name must be an exact Kubernetes Pod name"
+  fi
 fi
 ((${#seeds[@]} >= 2)) || die "at least two --seed values are required"
 [[ "$max_follow_ups" =~ ^[0-3]$ ]] || die "--max-follow-ups must be between 0 and 3"
@@ -867,7 +881,7 @@ cleanup_sensitive_files() {
   for generation_dir in "$work_dir"/generation-*; do
     [[ -d "$generation_dir" ]] || continue
     rm -f -- "$generation_dir/signed-request.json"
-    if [[ -e "$generation_dir/terminal-failure" || ! -e "$generation_dir/finalized" ]] \
+    if [[ ! -e "$generation_dir/finalized" ]] \
       || validate_generation_completion "$generation_dir" "${generation_dir##*/generation-}"; then
       rm -f -- "$generation_dir/request.json" "$generation_dir/submission.json"
     fi
@@ -1232,15 +1246,18 @@ verify_kubernetes_provenance() {
   local expected_job="$3"
   local expected_request="$4"
   local expected_image="sha256:$5"
-  jq -e --arg job "$expected_job" --arg request "$expected_request" '
+  local expected_uid
+  expected_uid=$(jq -er '.job_uid' "${job_status%/*}/dispatch-identity.json") || return 1
+  jq -e --arg job "$expected_job" --arg request "$expected_request" --arg uid "$expected_uid" '
     .metadata.name == $job
+    and .metadata.uid == $uid
     and .metadata.annotations["research.monday/request-sha256"] == $request
     and (.status.conditions // [] | any(.type == "Complete" and .status == "True"))
   ' "$job_status" >/dev/null || return 1
-  jq -e --arg job "$expected_job" --arg request "$expected_request" --arg image "$expected_image" '
+  jq -e --arg job "$expected_job" --arg request "$expected_request" --arg image "$expected_image" --arg uid "$expected_uid" '
     (.items | length) == 1
     and .items[0].metadata.annotations["research.monday/request-sha256"] == $request
-    and (.items[0].metadata.ownerReferences | any(.kind == "Job" and .name == $job))
+    and (.items[0].metadata.ownerReferences | any(.kind == "Job" and .name == $job and .uid == $uid))
     and .items[0].status.phase == "Succeeded"
     and ([.items[0].status.containerStatuses[]? | select(.name == "alpha-campaign")] | length) == 1
     and ([.items[0].status.containerStatuses[]? | select(.name == "alpha-campaign")][0]
@@ -1338,7 +1355,7 @@ if [[ "$mode" == "ack-readback" ]]; then
   campaign_inputs_sha256="$(jq -er '.campaign_inputs_sha256' "$state")"
 else
   campaign_inputs_sha256="$(sha256_file "$campaign_inputs")"
-  seeds_json="$(printf '%s\n' "${seeds[@]}" | jq -R 'tonumber' | jq -s '.')"
+  seeds_json="$(printf '%s\n' "${seeds[@]}" | jq -R . | jq -s '.')"
   state_tmp="$state.partial.$$"
   fresh_state_json=null
   study_state_json=null
@@ -1392,7 +1409,7 @@ else
     # Preserve historical checkpoints; only the retired token budget is irrelevant.
     jq -e -s '
       def comparable:
-        del(.control,.max_tokens,.study.target_control,.study.handoff_consumed);
+        del(.control,.max_tokens,.study.target_control,.study.handoff_consumed) | .seeds |= map(tostring);
       length == 2 and ((.[0] | comparable) == (.[1] | comparable))
     ' \
       "$state_tmp" "$state" >/dev/null \
@@ -1648,7 +1665,7 @@ while ((generation <= max_follow_ups)); do
   fi
   [[ -s "$dispatch_report" ]] || die "Campaign dispatch checkpoint is incomplete"
 
-  if [[ "$mode" != "ack-readback" ]]; then
+  if [[ "$mode" != "ack-readback" && "$run_to_terminal" != true ]]; then
     controller_stage="ack_handoff"
     log_event stage_completed \
       "generation=$generation" \
@@ -1661,6 +1678,7 @@ while ((generation <= max_follow_ups)); do
 
   job_status="$generation_dir/job-status.json"
   pod_status="$generation_dir/pod-status.json"
+  if [[ "$run_to_terminal" == true ]]; then campaign_pod_name=""; fi
   if [[ ! -e "$generation_dir/provenance-readback-complete" ]]; then
     controller_stage="kubernetes_runtime_readback"
     log_event stage_started \
@@ -1668,38 +1686,21 @@ while ((generation <= max_follow_ups)); do
       "stage=kubernetes_runtime_readback" \
       "job_name=$job_name" \
       "timeout=$job_timeout"
-    wait_completed=true
-    if ! "$kubectl_cli" "${kubectl_readback_args[@]}" wait \
-      --for=condition=complete "job/$job_name" --timeout="$job_timeout" >&2; then
-      wait_completed=false
-    fi
-    "$kubectl_cli" "${kubectl_readback_args[@]}" get \
-      "job/$job_name" -o json >"$job_status" \
-      || die "Campaign Job status readback failed: $job_name"
-    job_complete="$(jq -r '(.status.conditions // [] | any(.type == "Complete" and .status == "True"))' "$job_status")"
-    job_failed="$(jq -r '(.status.conditions // [] | any(.type == "Failed" and .status == "True"))' "$job_status")"
-    if [[ "$job_failed" == true ]]; then
-      "$kubectl_cli" "${kubectl_readback_args[@]}" get \
-        "pod/$campaign_pod_name" -o json | jq '{items:[.]}' >"$pod_status" || true
-      : >"$generation_dir/terminal-failure"
-      rm -f -- "$request" "$submission"
-      die "Campaign Job failed: $job_name"
-    fi
-    [[ "$job_complete" == true ]] \
-      || { [[ "$wait_completed" == true ]] && die "Campaign Job completion condition is missing: $job_name"; die "Campaign Job wait ended before terminal status: $job_name"; }
+    watch_exit=0
+    wait_for_campaign_terminal || watch_exit=$?
+    ((watch_exit == 0)) || die "Campaign runtime readback stopped (code=$watch_exit); progress, identity and charges retained"
     pod_readback_ok=true
-    if ! "$kubectl_cli" "${kubectl_readback_args[@]}" get \
-      "pod/$campaign_pod_name" -o json | jq '{items:[.]}' >"$pod_status"; then
+    if ! read_campaign_pods >"$pod_status"; then
       pod_readback_ok=false
     fi
     [[ "$pod_readback_ok" == true ]] || die "Campaign Pod status readback failed: $job_name"
     image_identity="$(jq -er '.image_identity' "$request")"
     if ! verify_kubernetes_provenance \
       "$job_status" "$pod_status" "$job_name" "$request_sha256" "$image_identity"; then
-      : >"$generation_dir/terminal-failure"
-      rm -f -- "$request" "$submission"
+      watch_state pod_identity_mismatch
       die "Campaign Pod or image provenance does not match the submitted request"
     fi
+    campaign_pod_name=$(jq -er '.items[0].metadata.name' "$pod_status")
     : >"$generation_dir/provenance-readback-complete"
     log_event stage_completed \
       "generation=$generation" \
@@ -1717,6 +1718,7 @@ while ((generation <= max_follow_ups)); do
   verify_kubernetes_provenance \
     "$job_status" "$pod_status" "$job_name" "$request_sha256" "$image_identity" \
     || die "saved Campaign Pod provenance is invalid"
+  campaign_pod_name=$(jq -er '.items[0].metadata.name' "$pod_status")
 
   round_readback_dir="$generation_dir/round-readback"
   mkdir -p "$round_readback_dir"

@@ -104,6 +104,45 @@ pub fn inspect(args: MissionDispatchInspectArgs) -> anyhow::Result<()> {
     )?)
 }
 
+pub fn status(args: crate::cli::MissionDispatchStatusArgs) -> anyhow::Result<()> {
+    print_json(&status_report(&args)?)
+}
+
+fn status_report(args: &crate::cli::MissionDispatchStatusArgs) -> anyhow::Result<Value> {
+    validate_cluster_target(&args.context, &args.namespace)?;
+    if final_admission::is_final_submission(&args.submission)? {
+        bail!("Campaign workflow status is limited to pre-holdout dispatch");
+    }
+    let validated = validate_submission(load_submission(&args.submission)?)?;
+    let manifest = render_controlled_manifest(
+        &validated,
+        &args.namespace,
+        &admission::read_control(&args.control)?,
+    )?;
+    // Historical authenticated admission remains readable after expiry or
+    // revocation. This path never prepares, claims, submits or settles an attempt.
+    let admission = admission::Admission::open_for_readback(
+        &args.control,
+        &validated,
+        &manifest,
+        &args.context,
+        &args.namespace,
+    )?;
+    let record = admission.record()?;
+    Ok(json!({
+        "schema_version":"monday.campaign_dispatch_status.v1",
+        "operation_id":record.reservation.operation_id()?,
+        "request_sha256":validated.request_sha256,
+        "campaign_id":validated.submission.request.campaign_id,
+        "job_name":record.claim.target.job_name,
+        "job_uid":record.claim.job_uid,
+        "authority_deadline_epoch":record.root.grant().expires_at.timestamp(),
+        "reserved_trials":record.reservation.declared_trials,
+        "settlement":record.settlement,
+        "accounting_changed":false,
+    }))
+}
+
 pub fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
     if final_admission::is_final_submission(&args.submission)? {
         if args.readback_cache.is_some() || args.model_report.is_some() {
@@ -2515,6 +2554,49 @@ mod tests {
             render_controlled_manifest(&fixture.validated, "monday-research", &control).is_err()
         );
         assert_eq!(fixture.usage().job_attempts, 0);
+    }
+
+    #[test]
+    fn dispatch_status_reads_original_uid_and_charge_without_new_authority_or_spending() {
+        let fixture = AdmissionFixture::new();
+        let mut gate = fixture.open();
+        gate.prepare().unwrap();
+        gate.publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
+        gate.claim().unwrap();
+        gate.publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
+        gate.bind_job("original-job-uid").unwrap();
+        let expected = gate.record().unwrap();
+        drop(gate);
+        let submission = fixture.inputs._root.path().join("status-submission.json");
+        std::fs::write(
+            &submission,
+            serde_json::to_vec(&fixture.validated.submission).unwrap(),
+        )
+        .unwrap();
+        let args = crate::cli::MissionDispatchStatusArgs {
+            control: fixture.control.clone(),
+            submission,
+            context: "research-context".into(),
+            namespace: "monday-research".into(),
+        };
+        std::fs::remove_file(fixture.inputs._root.path().join("keys.json")).unwrap();
+        let first = status_report(&args).unwrap();
+        assert_eq!(first["job_uid"], "original-job-uid");
+        assert_eq!(
+            first["operation_id"],
+            expected.reservation.operation_id().unwrap()
+        );
+        assert_eq!(
+            first["reserved_trials"],
+            expected.reservation.declared_trials
+        );
+        assert_eq!(first["accounting_changed"], false);
+        assert_eq!(first, status_report(&args).unwrap());
+        let mut changed = args;
+        changed.namespace = "other-namespace".into();
+        assert!(status_report(&changed).is_err());
     }
 
     #[test]

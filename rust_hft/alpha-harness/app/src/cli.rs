@@ -84,6 +84,8 @@ enum MissionCommand {
     CampaignFreeze(CampaignFreezeArgs),
     /// Prepare a bounded research matrix once, without signing or dispatching jobs.
     CampaignPrepare(CampaignPrepareArgs),
+    /// Run or resume a declared ACK workflow through terminal Campaign readback.
+    CampaignWorkflow(CampaignWorkflowArgs),
     CampaignLearn(CampaignLearnArgs),
     CampaignStudyPropose(CampaignStudyProposeArgs),
     CampaignFinalize(CampaignFinalizeArgs),
@@ -143,6 +145,8 @@ enum PredictionDispatchCommand {
 enum MissionDispatchCommand {
     CloseFamily(CampaignCloseFamilyArgs),
     Inspect(MissionDispatchInspectArgs),
+    /// Read authenticated historical dispatch identity without submitting or settling.
+    Status(MissionDispatchStatusArgs),
     Submit(MissionDispatchSubmitArgs),
     Settle(MissionDispatchSubmitArgs),
     ControllerHandoff(CampaignControllerHandoffArgs),
@@ -254,6 +258,18 @@ pub struct MissionDispatchSubmitArgs {
 }
 
 #[derive(Debug, Clone, Args)]
+pub struct MissionDispatchStatusArgs {
+    #[arg(long)]
+    pub control: PathBuf,
+    #[arg(long)]
+    pub submission: PathBuf,
+    #[arg(long)]
+    pub context: String,
+    #[arg(long)]
+    pub namespace: String,
+}
+
+#[derive(Debug, Clone, Args)]
 pub struct MissionDispatchInspectArgs {
     #[arg(long)]
     pub control: Option<PathBuf>,
@@ -286,6 +302,17 @@ pub struct CampaignExecuteArgs {
     pub request: PathBuf,
     #[arg(long)]
     pub request_sha256: String,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CampaignWorkflowArgs {
+    /// Existing trusted ACK ledger, selected independently of the plan's artifacts.
+    #[arg(long)]
+    pub ledger: PathBuf,
+    #[arg(long)]
+    pub plan: PathBuf,
+    #[arg(long)]
+    pub work_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1135,6 +1162,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 mission_campaign::freeze(args)
             }
             MissionCommand::CampaignPrepare(args) => mission_campaign::preparation::prepare(args),
+            MissionCommand::CampaignWorkflow(args) => mission_campaign::workflow::run(args),
             MissionCommand::CampaignLearn(args) => {
                 tokio::task::spawn_blocking(move || mission_campaign::learn(args))
                     .await
@@ -1167,6 +1195,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                         .context("Campaign dispatch worker failed")?
                 }
                 MissionDispatchCommand::Inspect(args) => mission_dispatch::inspect(args),
+                MissionDispatchCommand::Status(args) => mission_dispatch::status(args),
                 MissionDispatchCommand::CloseFamily(args) => {
                     mission_dispatch::final_authority::close_family(args)
                 }
