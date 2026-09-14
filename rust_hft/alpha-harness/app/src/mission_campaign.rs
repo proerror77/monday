@@ -6308,6 +6308,83 @@ mod tests {
     }
 
     #[test]
+    fn execute_ridge_only_holding_retains_precheck_and_one_model_through_readback() {
+        let mut fixture = campaign_e2e_fixture("ridge-only-holding", false, false, true);
+        let mut request: CampaignRequest =
+            serde_json::from_slice(&std::fs::read(&fixture.args.request).unwrap()).unwrap();
+        request.research_plan.supervised_model_scope =
+            alpha_domain::CexSupervisedModelScopeV1::RidgeOnly;
+        request.research_plan.holding =
+            Some(hft_research_manifest::model::HorizonHoldingPolicyV1 {
+                horizon_millis: 5000,
+            });
+        request.declared_total_trials =
+            declared_total_trials_for_rounds(&request.research_plan, request.rounds.len()).unwrap();
+        request.research_plan.comparison_family_trials = Some(request.declared_total_trials * 3);
+        std::fs::write(&fixture.args.request, serde_json::to_vec(&request).unwrap()).unwrap();
+        fixture.args.request_sha256 =
+            crate::mission_runner::sha256_file(&fixture.args.request).unwrap();
+        execute(fixture.args.clone()).unwrap();
+        let loaded = load_request(&fixture.args.request).unwrap();
+        let materialization = crate::mission_runner::decode_materialization(
+            &std::fs::read(&fixture._render_fixture.materialization_path).unwrap(),
+        )
+        .unwrap();
+        let protocol = crate::mission_render::approved_evaluation_protocol(&materialization)
+            .unwrap()
+            .content_hash()
+            .unwrap();
+        let client = Client::builder().redirect(Policy::none()).build().unwrap();
+        let (_, trials, _) =
+            readback_pre_holdout_terminal(&client, &loaded.request, &loaded.sha256, &protocol)
+                .unwrap();
+        assert!(trials <= u64::try_from(request.declared_total_trials).unwrap());
+        assert!(!fixture.global_claim_path.exists());
+        for round in &loaded.request.rounds {
+            let file = std::fs::File::open(&round.result_readback_url).unwrap();
+            let mut archive = zip::ZipArchive::new(file).unwrap();
+            assert!(archive.by_name("results/ridge-baseline.json").is_ok());
+            assert!(archive.by_name("results/cart-baseline.json").is_err());
+            assert!(archive.by_name("results/burn-mlp-baseline.json").is_err());
+            let attempts: serde_json::Value = serde_json::from_reader(
+                archive
+                    .by_name("results/supervised-model-attempts.json")
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(attempts["attempts"].as_array().unwrap().len(), 1);
+            let precheck: alpha_engine::label_precheck::LabelSpacePrecheckV1 =
+                serde_json::from_reader(
+                    archive
+                        .by_name("results/label-space-precheck.json")
+                        .unwrap(),
+                )
+                .unwrap();
+            assert!(!precheck.cancels_experiment);
+            let model: alpha_engine::baselines::CexSupervisedModelEvaluationV2 =
+                serde_json::from_reader(
+                    archive
+                        .by_name("results/ridge-supervised-backtest.json")
+                        .unwrap(),
+                )
+                .unwrap();
+            assert_eq!(
+                model.report.return_accounting,
+                alpha_domain::ReturnAccountingBasis::HeldQuantityWithQuotedEntryExit
+            );
+            assert_eq!(
+                model
+                    .candidate
+                    .evaluation
+                    .formula_config()
+                    .unwrap()
+                    .multiple_testing_trials,
+                request.declared_total_trials * 3
+            );
+        }
+    }
+
+    #[test]
     fn execute_keeps_profitable_ml_replay_without_legacy_finalization() {
         let fixture = campaign_e2e_fixture("campaign-e2e-ml-positive", false, false, true);
         execute(fixture.args.clone()).unwrap();
