@@ -104,10 +104,13 @@ These interfaces provide reusable preparation and native startup. They do not
 by themselves claim that a multi-member executor or a real cloud experiment has
 completed. Runtime adoption still requires its own bounded run and readback.
 
-Preparation is not research admission or permission to run. In particular, the
-planned H1 comparison must first pass its declared label-amplitude screen on a
-verified unseen calendar, before producing any freeze. Its Ridge model, 30-second
-`forward_mid_return`, existing factors and cost gate remain fixed. A failed
-pre-fit screen is retained negative evidence and must not trigger more models,
-automatic cost-policy changes or same-window trials. This preparation interface
-alone does not implement that screen or start H1.
+Preparation is not execution authorization. The next H1 comparison requires a
+verified unused calendar, predeclared development/validation/sealed-test views,
+and a reviewed hold-to-horizon contract before dispatch. Label prechecks inspect
+only authorized development/validation data and report quantiles plus the count
+and fraction of returns above one round-trip cost. P95 is not a falsification
+test or proof of model predictability. The user chose to evaluate all three
+5/10/30-second Ridge arms; the precheck does not cancel an arm. Existing factors
+and the cost gate remain fixed. Preserve every negative arm and distinguish it
+from shared infrastructure, identity or numerical failures. This preparation
+interface alone does not implement those H1 evaluation prerequisites.
