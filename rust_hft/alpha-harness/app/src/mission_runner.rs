@@ -6481,6 +6481,7 @@ pub(crate) mod tests {
             &policy.evaluator_config,
         )
         .unwrap();
+        alpha_engine::model_metrics::summarize_model_evaluation(&held, &"a".repeat(64)).unwrap();
         let decision = CexSupervisedDecisionPolicyV2::controlled_v2();
         for kind in [
             CexBaselineModelKindV1::Ridge,

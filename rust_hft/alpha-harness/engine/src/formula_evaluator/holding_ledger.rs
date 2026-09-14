@@ -86,9 +86,10 @@ pub(super) fn evaluate(
             };
             let delta = next_quantity - quantity;
             let mut cost = 0.0;
+            let mut traded_notional = 0.0;
             if delta != 0.0 {
                 let execution_price = mid + delta.signum() * half_spread;
-                let traded_notional = delta.abs() * execution_price;
+                traded_notional = delta.abs() * execution_price;
                 trade_count += 1;
                 turnover += traded_notional;
                 cost = transaction_cost(
@@ -106,6 +107,7 @@ pub(super) fn evaluate(
                 return Err("non-finite horizon position ledger".into());
             }
             points.push(PositionReturnPoint {
+                quoted_turnover_fraction: Some(traded_notional),
                 row_index: index,
                 series_id: row.series_id,
                 available_time: row.available_time,

@@ -31,6 +31,8 @@ pub struct FormulaEvaluator {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PositionEvaluationPoint {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quoted_turnover_fraction: Option<f64>,
     /// Cost-aware opening signal before holding, with predeclared tail entries
     /// disabled. Event replay can reconsider it after a zero-fill IOC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -64,6 +66,7 @@ struct PredictiveGateResult {
 }
 
 struct PositionReturnPoint {
+    quoted_turnover_fraction: Option<f64>,
     row_index: usize,
     series_id: u64,
     available_time: chrono::DateTime<chrono::Utc>,
@@ -157,6 +160,7 @@ impl PredictiveGateResult {
                 }
                 let net_return = gross_return - transaction_cost_value - funding_cost;
                 PositionReturnPoint {
+                    quoted_turnover_fraction: None,
                     row_index: index,
                     series_id: row.series_id,
                     available_time: row.available_time,
@@ -565,6 +569,7 @@ impl FormulaEvaluator {
                     })
                     .transpose()?;
                 ledger.push(PositionEvaluationPoint {
+                    quoted_turnover_fraction: point.quoted_turnover_fraction,
                     entry_target,
                     row_index: point.row_index,
                     series_id: point.series_id,
