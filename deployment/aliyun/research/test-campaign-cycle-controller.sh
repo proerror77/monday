@@ -1335,7 +1335,8 @@ for ((index = 0; index < ${#prepared_args[@]}; index++)); do
     prepared_args[index + 1]=0
   fi
 done
-prepared_args+=(--prepared-freeze "$prepared_source" --prepared-freeze-sha256 "$prepared_sha")
+touch "$start_dir/preparation-ledger"
+prepared_args+=(--prepared-freeze "$prepared_source" --prepared-freeze-sha256 "$prepared_sha" --preparation-ledger "$start_dir/preparation-ledger")
 mv "$start_dir/input" "$root/prepared-offline-input"
 (cd "$start_dir" && "$controller" "${prepared_args[@]}") >"$root/prepared.out" 2>"$root/prepared.err" || { cat "$root/prepared.err" >&2; exit 1; }
 [[ ! -e "$FAKE_STATE/full-freeze-count" ]]

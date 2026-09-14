@@ -140,6 +140,8 @@ pub(crate) struct CampaignRoundIdentityV1 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FrozenCampaignPlan {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preparation_authentication_tag: Option<String>,
     schema_version: String,
     campaign_inputs_sha256: String,
     canonical_request: CampaignRequest,
@@ -492,12 +494,17 @@ pub fn freeze(args: CampaignFreezeArgs) -> anyhow::Result<()> {
         return final_evaluation::freeze(args);
     }
     let (request, campaign_inputs_sha256) = freeze_request(&args)?;
-    let plan = FrozenCampaignPlan {
+    let mut plan = FrozenCampaignPlan {
+        preparation_authentication_tag: None,
         schema_version: CAMPAIGN_FREEZE_SCHEMA_V1.to_string(),
         campaign_inputs_sha256,
         signing_plan: signing_plan(&request)?,
         canonical_request: request.clone(),
     };
+    if let Some(path) = &args.preparation_ledger {
+        let ledger = alpha_store::AlphaStore::open_read_only(path)?;
+        plan.preparation_authentication_tag = Some(preparation::authenticate(&ledger, &plan)?);
+    }
     data_mission::write_json_atomic(&args.output, &plan)?;
     research_event(
         "alpha-harness",
@@ -1144,6 +1151,7 @@ fn follow_up_plan(
         bail!("declared follow-up feature subset removed the focus field");
     }
     let plan = CexCampaignResearchPlanV1 {
+        comparison_family_trials: loaded.request.research_plan.comparison_family_trials,
         schema_version: "cex-campaign-research-plan-v2".to_string(),
         generation: loaded.request.research_plan.generation + 1,
         objective: format!(
@@ -1867,6 +1875,16 @@ fn reuse_frozen_request(
     if actual_sha != expected_sha {
         bail!("prepared freeze SHA256 mismatch");
     }
+    let ledger = alpha_store::AlphaStore::open_read_only(
+        args.preparation_ledger
+            .as_deref()
+            .context("prepared freeze requires an independently selected trusted ledger")?,
+    )?;
+    preparation::verify_authentication(
+        &ledger,
+        &frozen,
+        frozen.preparation_authentication_tag.as_deref(),
+    )?;
     let (receipt, receipt_sha) = load_campaign_inputs_receipt(&args.campaign_inputs)?;
     validate_campaign_inputs_receipt(&receipt)?;
     let source = normalized_source_revision("campaign source revision", &args.source_revision)?;
@@ -3081,7 +3099,10 @@ fn readback_pre_holdout_terminal_impl(
             || mission.spec.evaluation_protocol.content_hash()? != evaluation_protocol_sha256
             || mission.spec.feature_fields != request.research_plan.feature_fields
             || mission.spec.search.seed != round.seed
-            || mission.spec.search.multiple_testing_trials != request.declared_total_trials
+            || mission.spec.search.multiple_testing_trials
+                != request
+                    .research_plan
+                    .effective_multiple_testing_trials(request.declared_total_trials)?
             || mission.spec.holdout.holdout_id != request.holdout_id
             || mission.spec.holdout.state != alpha_domain::CexResearchHoldoutStateV1::Unopened
         {
@@ -3640,6 +3661,9 @@ pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> 
     }
     let minimum_total_trials =
         declared_total_trials_for_rounds(&request.research_plan, request.rounds.len())?;
+    request
+        .research_plan
+        .effective_multiple_testing_trials(request.declared_total_trials)?;
     if request.declared_total_trials < minimum_total_trials {
         bail!("campaign declared_total_trials is below the minimum multi-round trial family");
     }
@@ -5359,6 +5383,7 @@ mod tests {
         let submission_out = root.path().join("submission.json");
         let canonical_request = canonicalize_request_transport(&valid_request()).unwrap();
         let frozen = FrozenCampaignPlan {
+            preparation_authentication_tag: None,
             schema_version: CAMPAIGN_FREEZE_SCHEMA_V1.to_string(),
             campaign_inputs_sha256: "a".repeat(64),
             signing_plan: signing_plan(&canonical_request).unwrap(),
@@ -5544,8 +5569,11 @@ mod tests {
         };
         data_mission::write_json_atomic(&receipt_path, &receipt).unwrap();
         let output = root.path().join("freeze.json");
+        let preparation_ledger = root.path().join("preparation.duckdb");
+        drop(alpha_store::AlphaStore::open(&preparation_ledger).unwrap());
 
         freeze(CampaignFreezeArgs {
+            preparation_ledger: Some(preparation_ledger.clone()),
             reuse: None,
             reuse_sha256: None,
             final_evaluation_control: None,
@@ -5592,6 +5620,7 @@ mod tests {
         );
 
         let mut reuse = CampaignFreezeArgs {
+            preparation_ledger: Some(preparation_ledger.clone()),
             reuse: Some(output.clone()),
             reuse_sha256: Some(crate::mission_runner::sha256_file(&output).unwrap()),
             final_evaluation_control: None,
@@ -5665,6 +5694,7 @@ mod tests {
         data_mission::write_json_atomic(&matrix_path, &matrix).unwrap();
         let prepare_matrix = || {
             preparation::prepare(crate::cli::CampaignPrepareArgs {
+                ledger: preparation_ledger.clone(),
                 plan: matrix_path.clone(),
                 output_root: matrix_root.clone(),
             })
@@ -5685,6 +5715,25 @@ mod tests {
             index["members"][1]["campaign_id"]
         );
         assert_eq!(index["seeds"], serde_json::json!(["7", "11"]));
+        let aggregate_trials = index["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|member| member["declared_trials"].as_u64().unwrap())
+            .sum::<u64>();
+        for member in index["members"].as_array().unwrap() {
+            let frozen =
+                load_freeze_plan(&prepared_root.join(member["freeze"]["path"].as_str().unwrap()))
+                    .unwrap();
+            assert_eq!(
+                frozen
+                    .canonical_request
+                    .research_plan
+                    .comparison_family_trials,
+                Some(aggregate_trials as usize)
+            );
+            assert!(frozen.canonical_request.declared_total_trials < aggregate_trials as usize);
+        }
         let mut from_matrix = reuse.clone();
         from_matrix.reuse =
             Some(prepared_root.join(index["members"][0]["freeze"]["path"].as_str().unwrap()));
@@ -5760,6 +5809,7 @@ mod tests {
                 .path()
                 .join(format!("invalid-freeze-{missing_later_seed}.json"));
             let error = freeze(CampaignFreezeArgs {
+                preparation_ledger: None,
                 reuse: None,
                 reuse_sha256: None,
                 final_evaluation_control: None,
@@ -5803,6 +5853,7 @@ mod tests {
         wrong_symbol.symbol = "SOLUSDT".to_string();
         data_mission::write_json_atomic(&receipt_path, &wrong_symbol).unwrap();
         let mismatch = freeze_request(&CampaignFreezeArgs {
+            preparation_ledger: None,
             reuse: None,
             reuse_sha256: None,
             final_evaluation_control: None,
@@ -5830,6 +5881,7 @@ mod tests {
             .contains("source_revision must be an exact git revision"));
 
         let invalid_executor = freeze_request(&CampaignFreezeArgs {
+            preparation_ledger: None,
             reuse: None,
             reuse_sha256: None,
             final_evaluation_control: None,
@@ -5858,6 +5910,7 @@ mod tests {
             crate::mission_runner::sha256_file(&replay_manifest_path).unwrap();
         data_mission::write_json_atomic(&receipt_path, &invalid_replay_receipt).unwrap();
         let invalid_replay = freeze_request(&CampaignFreezeArgs {
+            preparation_ledger: None,
             reuse: None,
             reuse_sha256: None,
             final_evaluation_control: None,
@@ -5877,6 +5930,7 @@ mod tests {
             .any(|cause| cause.to_string().contains("artifact")));
 
         let invalid_source = freeze_request(&CampaignFreezeArgs {
+            preparation_ledger: None,
             reuse: None,
             reuse_sha256: None,
             final_evaluation_control: None,
@@ -5919,6 +5973,7 @@ mod tests {
         let mut signing_plan = signing_plan(&canonical_request).unwrap();
         signing_plan.actions[0].method = "PUT".to_string();
         let frozen = FrozenCampaignPlan {
+            preparation_authentication_tag: None,
             schema_version: CAMPAIGN_FREEZE_SCHEMA_V1.to_string(),
             campaign_inputs_sha256: "a".repeat(64),
             signing_plan,

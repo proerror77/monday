@@ -26,6 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && kubectl version --client=true
 
 FROM debian:bookworm-slim AS prebuilt
+ENV MONDAY_EXECUTION_HOST=ack
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \

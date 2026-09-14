@@ -535,6 +535,32 @@ pub struct AlphaStore {
 }
 
 impl AlphaStore {
+    /// Authenticate the hash of a preparation result with the existing store's
+    /// integrity key. Callers must admit inputs before requesting this witness;
+    /// this does not create a grant, charge or mutable ledger record.
+    pub fn attest_research_preparation(&self, payload_sha256: &str) -> Result<String, StoreError> {
+        authentication_tag(
+            &self.integrity_key,
+            "cex_research_preparation_v1",
+            payload_sha256,
+            payload_sha256,
+        )
+    }
+
+    pub fn verify_research_preparation(
+        &self,
+        payload_sha256: &str,
+        tag: &str,
+    ) -> Result<(), StoreError> {
+        verify_authentication_tag(
+            &self.integrity_key,
+            "cex_research_preparation_v1",
+            payload_sha256,
+            payload_sha256,
+            tag,
+        )
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
         if let Some(parent) = path

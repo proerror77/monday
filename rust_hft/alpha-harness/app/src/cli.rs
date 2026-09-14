@@ -290,6 +290,9 @@ pub struct CampaignExecuteArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct CampaignPrepareArgs {
+    /// Existing trusted ACK ledger whose integrity key authenticates preparation.
+    #[arg(long)]
+    pub ledger: PathBuf,
     #[arg(long)]
     pub plan: PathBuf,
     #[arg(long)]
@@ -298,10 +301,13 @@ pub struct CampaignPrepareArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct CampaignFreezeArgs {
+    /// Trusted ledger selected independently of a caller-supplied cache artifact.
+    #[arg(long)]
+    pub preparation_ledger: Option<PathBuf>,
     /// Reuse a previously produced native freeze, verified against an explicit digest.
     #[arg(
         long,
-        requires = "reuse_sha256",
+        requires_all = ["reuse_sha256", "preparation_ledger"],
         conflicts_with = "final_evaluation_control"
     )]
     pub reuse: Option<PathBuf>,

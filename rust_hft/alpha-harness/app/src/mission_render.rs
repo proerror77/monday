@@ -410,6 +410,10 @@ impl CexCampaignLearningDirectiveV1 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CexCampaignResearchPlanV1 {
+    /// Statistical correction across the declared comparison family; separate
+    /// from the trials reserved by this individual Campaign.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) comparison_family_trials: Option<usize>,
     pub(crate) schema_version: String,
     pub(crate) generation: u8,
     pub(crate) objective: String,
@@ -506,9 +510,21 @@ pub(crate) struct CexCampaignLlmProvenanceV1 {
 }
 
 impl CexCampaignResearchPlanV1 {
+    pub(crate) fn effective_multiple_testing_trials(
+        &self,
+        declared_trials: usize,
+    ) -> anyhow::Result<usize> {
+        let trials = self.comparison_family_trials.unwrap_or(declared_trials);
+        if trials < declared_trials || trials == 0 {
+            bail!("comparison family trial bound is below the Campaign trial declaration");
+        }
+        Ok(trials)
+    }
+
     pub(crate) fn canonical() -> Self {
         let search_policy_revision = CexCampaignSearchPolicyRevisionV1::canonical();
         Self {
+            comparison_family_trials: None,
             schema_version: RESEARCH_PLAN_SCHEMA_V2.to_string(),
             generation: 0,
             objective: "Generate and screen continuous L2 and aggregate-trade microstructure factors, including aggressive trade-flow imbalance, inverse spread, cross-depth pressure consensus, top-five depth concentration, and VWAP-center displacement, then evaluate Ridge and shallow CART with purged walk-forward OOS predictions on the bound Binance instrument and prediction horizon under governed dynamic-v4 GP"
@@ -910,6 +926,8 @@ pub(crate) fn render_prepared_cex_bundle(
     multiple_testing_trials: usize,
 ) -> anyhow::Result<RenderedCexMission> {
     research_plan.validate()?;
+    let multiple_testing_trials =
+        research_plan.effective_multiple_testing_trials(multiple_testing_trials)?;
     let materialization = &inputs.materialization;
     let feature_manifest = &inputs.feature_manifest;
     let feature_sha256 = &inputs.feature_sha256;
@@ -1451,6 +1469,14 @@ pub(crate) mod tests {
             }
         }
         let mut invalid = plan;
+        invalid.comparison_family_trials = Some(default_trials() * 3);
+        let compared = render_prepared_cex_bundle(&inputs, &invalid, 7, default_trials()).unwrap();
+        assert_eq!(
+            compared.mission.spec.search.multiple_testing_trials,
+            default_trials() * 3
+        );
+        invalid.comparison_family_trials = Some(default_trials() - 1);
+        assert!(render_prepared_cex_bundle(&inputs, &invalid, 7, default_trials()).is_err());
         invalid.feature_fields.clear();
         assert!(render_prepared_cex_bundle(&inputs, &invalid, 7, default_trials()).is_err());
         assert!(
@@ -1737,6 +1763,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let plan = CexCampaignResearchPlanV1 {
+            comparison_family_trials: None,
             schema_version: RESEARCH_PLAN_SCHEMA_V2.to_string(),
             generation: 1,
             objective: "Test one bounded follow-up".to_string(),
@@ -1935,6 +1962,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let plan = CexCampaignResearchPlanV1 {
+            comparison_family_trials: None,
             schema_version: RESEARCH_PLAN_SCHEMA_V2.to_string(),
             generation: 1,
             objective: "Test a declared feature subset".to_string(),

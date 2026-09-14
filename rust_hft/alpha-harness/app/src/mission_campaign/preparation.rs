@@ -9,7 +9,7 @@ const PLAN_SCHEMA: &str = "monday.cex_campaign_preparation_plan.v1";
 const INDEX_SCHEMA: &str = "monday.cex_campaign_preparation.v1";
 const INPUT_SCHEMA: &str = "monday.cex_prepared_inputs.v1";
 const MAX_MEMBERS: usize = 32;
-const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_METADATA_BYTES: u64 = 8 * crate::mission_runner::MAX_MATERIALIZATION_BYTES + 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -56,12 +56,40 @@ struct PreparationPlan {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SharedInputs {
+    preparation_authentication_tag: Option<String>,
     schema_version: String,
     source_revision: String,
     image_identity: String,
     campaign_inputs_sha256: String,
     /// Only a metadata summary. Its digest must be pinned by the caller before reuse.
     render_metadata: PreparedCexInputMetadata,
+}
+
+fn authentication_payload<T: Serialize>(value: &T) -> anyhow::Result<String> {
+    let mut value = serde_json::to_value(value)?;
+    value
+        .as_object_mut()
+        .context("preparation attestation object")?
+        .remove("preparation_authentication_tag");
+    Ok(canonical_json_hash(&value)?)
+}
+
+pub(super) fn authenticate<T: Serialize>(
+    ledger: &alpha_store::AlphaStore,
+    value: &T,
+) -> anyhow::Result<String> {
+    Ok(ledger.attest_research_preparation(&authentication_payload(value)?)?)
+}
+
+pub(super) fn verify_authentication<T: Serialize>(
+    ledger: &alpha_store::AlphaStore,
+    value: &T,
+    tag: Option<&str>,
+) -> anyhow::Result<()> {
+    let tag = tag.context("prepared evidence lacks a trusted preparation attestation")?;
+    ledger
+        .verify_research_preparation(&authentication_payload(value)?, tag)
+        .context("preparation attestation does not match the trusted ledger")
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -77,6 +105,7 @@ pub(crate) struct PreparedMember {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PreparationIndex {
+    pub ledger: PathBuf,
     pub schema_version: String,
     pub plan_sha256: String,
     pub source_revision: String,
@@ -164,7 +193,8 @@ fn member_plans(plan: &PreparationPlan) -> anyhow::Result<Vec<CexCampaignResearc
     plan.base_research_plan.validate()?;
     let mut ids = BTreeSet::new();
     let mut identities = BTreeSet::new();
-    plan.members
+    let mut members: Vec<CexCampaignResearchPlanV1> = plan
+        .members
         .iter()
         .map(|member| {
             validate_dns_label("preparation member", &member.id)?;
@@ -188,7 +218,9 @@ fn member_plans(plan: &PreparationPlan) -> anyhow::Result<Vec<CexCampaignResearc
                     .learning_rate = treatment.learning_rate;
             }
             selected.validate()?;
-            if !identities.insert(canonical_json_hash(&selected)?) {
+            let mut treatment_identity = selected.clone();
+            treatment_identity.comparison_family_trials = None;
+            if !identities.insert(canonical_json_hash(&treatment_identity)?) {
                 bail!("duplicate preparation member configuration");
             }
             if selected.generation != 0 {
@@ -198,13 +230,34 @@ fn member_plans(plan: &PreparationPlan) -> anyhow::Result<Vec<CexCampaignResearc
                 mlp.validate_requested_seeds(&plan.seeds)
                     .map_err(anyhow::Error::msg)?;
             }
+            selected.effective_multiple_testing_trials(declared_total_trials_for_rounds(
+                &selected,
+                plan.seeds.len(),
+            )?)?;
             Ok(selected)
         })
-        .collect()
+        .collect::<anyhow::Result<_>>()?;
+    if members.len() > 1 {
+        let total = members.iter().try_fold(0usize, |sum, member| {
+            sum.checked_add(declared_total_trials_for_rounds(member, plan.seeds.len())?)
+                .context("comparison family trial bound overflowed")
+        })?;
+        let bound = members
+            .iter()
+            .filter_map(|member| member.comparison_family_trials)
+            .max()
+            .unwrap_or(0)
+            .max(total);
+        for member in &mut members {
+            member.comparison_family_trials = Some(bound);
+        }
+    }
+    Ok(members)
 }
 
 fn freeze_args(plan: &PreparationPlan, receipt: &Path) -> CampaignFreezeArgs {
     CampaignFreezeArgs {
+        preparation_ledger: None,
         reuse: None,
         reuse_sha256: None,
         final_evaluation_control: None,
@@ -224,7 +277,13 @@ fn restore_inputs(
     plan: &PreparationPlan,
     receipt: CampaignInputsReceipt,
     shared: SharedInputs,
+    ledger: &alpha_store::AlphaStore,
 ) -> anyhow::Result<ValidatedCampaignInputSet> {
+    verify_authentication(
+        ledger,
+        &shared,
+        shared.preparation_authentication_tag.as_deref(),
+    )?;
     let image_identity = mission_dispatch::image_digest(&plan.image)?;
     if shared.schema_version != INPUT_SCHEMA
         || shared.source_revision != plan.source_revision
@@ -268,6 +327,8 @@ pub fn prepare(args: CampaignPrepareArgs) -> anyhow::Result<()> {
         bail!("Campaign matrix preparation belongs in ACK; export only bounded control metadata");
     }
     let plan_path = std::fs::canonicalize(&args.plan)?;
+    let ledger_path = std::fs::canonicalize(&args.ledger)?;
+    let ledger = alpha_store::AlphaStore::open_read_only(&ledger_path)?;
     let base = plan_path.parent().unwrap();
     let mut plan: PreparationPlan = serde_json::from_slice(&bytes(&plan_path, MAX_REQUEST_BYTES)?)?;
     let plans = member_plans(&plan)?;
@@ -305,10 +366,12 @@ pub fn prepare(args: CampaignPrepareArgs) -> anyhow::Result<()> {
     let local_receipt = publish_bytes(&output, Path::new("campaign-inputs.json"), &receipt_bytes)?;
     plan.input_root = base.join(&plan.input_root);
     let mut args_for_freeze = freeze_args(&plan, &output.join(&local_receipt.path));
+    args_for_freeze.preparation_ledger = Some(ledger_path.clone());
     if index_path.exists() {
         let index: PreparationIndex =
             serde_json::from_slice(&bytes(&index_path, MAX_METADATA_BYTES)?)?;
         if index.schema_version != INDEX_SCHEMA
+            || index.ledger != ledger_path
             || index.plan_sha256 != key
             || index.members.len() != plan.members.len()
         {
@@ -335,7 +398,7 @@ pub fn prepare(args: CampaignPrepareArgs) -> anyhow::Result<()> {
             &output,
             MAX_METADATA_BYTES,
         )?)?;
-        restore_inputs(&plan, receipt, shared)?;
+        restore_inputs(&plan, receipt, shared, &ledger)?;
         for ((expected, research), member) in plan.members.iter().zip(&plans).zip(&index.members) {
             if member.id != expected.id
                 || member.freeze.path != Path::new("members").join(&member.id).join("freeze.json")
@@ -374,21 +437,27 @@ pub fn prepare(args: CampaignPrepareArgs) -> anyhow::Result<()> {
         }
         let shared: SharedInputs =
             serde_json::from_slice(&verified_bytes(&reference, &output, MAX_METADATA_BYTES)?)?;
-        (restore_inputs(&plan, receipt, shared)?, reference, true)
+        (
+            restore_inputs(&plan, receipt, shared, &ledger)?,
+            reference,
+            true,
+        )
     } else {
         let (inputs, data, reused) = if let Some(previous) = &plan.prepared_inputs {
             let data = verified_bytes(previous, base, MAX_METADATA_BYTES)?;
             let shared: SharedInputs = serde_json::from_slice(&data)?;
-            (restore_inputs(&plan, receipt, shared)?, data, true)
+            (restore_inputs(&plan, receipt, shared, &ledger)?, data, true)
         } else {
             let inputs = validated_campaign_inputs(&args_for_freeze)?;
-            let shared = SharedInputs {
+            let mut shared = SharedInputs {
+                preparation_authentication_tag: None,
                 schema_version: INPUT_SCHEMA.into(),
                 source_revision: plan.source_revision.clone(),
                 image_identity: inputs.image_identity.clone(),
                 campaign_inputs_sha256: inputs.campaign_inputs_sha256.clone(),
                 render_metadata: inputs.render_inputs.metadata()?,
             };
+            shared.preparation_authentication_tag = Some(authenticate(&ledger, &shared)?);
             let mut data = serde_json::to_vec_pretty(&shared)?;
             data.push(b'\n');
             (inputs, data, false)
@@ -409,12 +478,14 @@ pub fn prepare(args: CampaignPrepareArgs) -> anyhow::Result<()> {
     for (member, research) in plan.members.iter().zip(&plans) {
         let (request, campaign_inputs_sha256) =
             freeze_prepared_request(&inputs, research, &plan.seeds, None)?;
-        let frozen = FrozenCampaignPlan {
+        let mut frozen = FrozenCampaignPlan {
+            preparation_authentication_tag: None,
             schema_version: CAMPAIGN_FREEZE_SCHEMA_V1.into(),
             campaign_inputs_sha256,
             signing_plan: signing_plan(&request)?,
             canonical_request: request.clone(),
         };
+        frozen.preparation_authentication_tag = Some(authenticate(&ledger, &frozen)?);
         let directory = Path::new("members").join(&member.id);
         members.push(PreparedMember {
             id: member.id.clone(),
@@ -425,6 +496,7 @@ pub fn prepare(args: CampaignPrepareArgs) -> anyhow::Result<()> {
         });
     }
     let index = PreparationIndex {
+        ledger: ledger_path,
         schema_version: INDEX_SCHEMA.into(),
         plan_sha256: key,
         source_revision: plan.source_revision,
@@ -468,6 +540,32 @@ mod tests {
             }],
         }
     }
+    #[test]
+    fn preparation_authentication_rejects_self_consistent_edits_and_other_ledgers() {
+        let ledger = alpha_store::AlphaStore::open_in_memory().unwrap();
+        let other = alpha_store::AlphaStore::open_in_memory().unwrap();
+        let mut payload =
+            serde_json::json!({"holdout_id":"original","preparation_authentication_tag":null});
+        let tag = authenticate(&ledger, &payload).unwrap();
+        payload["preparation_authentication_tag"] = tag.clone().into();
+        verify_authentication(&ledger, &payload, Some(&tag)).unwrap();
+        assert!(verify_authentication(&other, &payload, Some(&tag)).is_err());
+        payload["holdout_id"] = "caller-edited-cohort".into();
+        assert!(verify_authentication(&ledger, &payload, Some(&tag)).is_err());
+        assert!(verify_authentication(&ledger, &payload, None).is_err());
+    }
+
+    #[test]
+    fn metadata_envelope_supports_json_expansion_at_the_materialization_limit() {
+        let materialization =
+            "\"".repeat(crate::mission_runner::MAX_MATERIALIZATION_BYTES as usize);
+        let encoded =
+            serde_json::to_vec(&serde_json::json!({"materialization_json":materialization}))
+                .unwrap();
+        assert!(encoded.len() as u64 > crate::mission_runner::MAX_MATERIALIZATION_BYTES);
+        assert!(encoded.len() as u64 <= MAX_METADATA_BYTES);
+    }
+
     #[test]
     fn matrix_validation_rejects_duplicates_paths_and_unsupported_recipes() {
         let mut value = plan();

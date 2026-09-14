@@ -1,7 +1,7 @@
 # Reusable Campaign preparation
 
-`alpha-harness mission campaign-prepare --plan PLAN.json --output-root DIR`
-prepares a bounded matrix in ACK. It performs no signing, ledger reservation,
+`alpha-harness mission campaign-prepare --plan PLAN.json --ledger ACK_LEDGER --output-root DIR`
+prepares a bounded matrix in ACK. It performs no execution signing, ledger reservation,
 Job creation or training. The existing Campaign freeze/finalize/dispatch/execute
 boundary still owns execution. Parameter-only research changes use the same
 published source/image; they do not require changing the controller program.
@@ -27,6 +27,13 @@ contracts, duplicate configurations or invalid plans reject before input
 preparation. This does not add model families or select a training policy for
 the researcher.
 
+For multiple members, preparation sets a shared `comparison_family_trials` bound
+equal to at least the sum of all members' declared trials. Rendering and terminal
+readback carry this bound into statistical multiple-testing correction. Each
+Campaign's `declared_total_trials` and ledger reservation still count only its
+own work. Prepared comparisons use zero automatic follow-ups; another comparison
+requires an explicit plan with its own correct family bound.
+
 The preparer validates the exact feature bytes once, retains their parsed rows
 for replay/availability checks, and releases them after constructing an immutable
 metadata snapshot. Materialization is hashed and decoded from one read. The
@@ -50,10 +57,21 @@ that stage again.
 
 For a changed parameter matrix, set `prepared_inputs` to the previous index's
 input receipt and its independently retained SHA. Reuse checks the receipt hash,
-source, image, original input receipt and metadata identities. The old preparation
+an authentication tag made with the independently selected ACK ledger's existing
+integrity key, source, image, original input receipt and metadata identities. The old preparation
 is preserved; new member requests are rendered without reopening raw features or
 replay files. This receipt is a trusted preparation output, not an arbitrary
-self-authored cache marker. Worker-side independent input admission is retained.
+self-authored cache marker: changing JSON and recomputing its SHA cannot recreate
+the authentication tag. The same authentication binds native prepared freezes,
+including the holdout/cohort identity derived during original data admission.
+The ledger is opened read-only for authentication; no grants or charges are
+created. Keep its existing private integrity key in ACK. Worker-side independent
+input admission is retained.
+
+The runner and controller images set `MONDAY_EXECUTION_HOST=ack`. A bare ACK
+entrypoint must set that marker explicitly; a workstation is not an execution
+host. The larger escaped-materialization envelope remains bounded cloud metadata,
+not a report to export to the workstation.
 
 ## Starting from prepared artifacts
 
@@ -65,6 +83,8 @@ and control arguments:
 --initial-research-plan <member research-plan.json>
 --prepared-freeze <member freeze.json>
 --prepared-freeze-sha256 <the index's exact freeze SHA256>
+--preparation-ledger <the same trusted ACK ledger>
+--max-follow-ups 0
 ```
 
 The controller retains the prepared freeze under its durable work directory and
