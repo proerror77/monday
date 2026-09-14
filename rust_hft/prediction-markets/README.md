@@ -35,8 +35,9 @@ reconciliation, cancellation, replacement, and order execution.
   Monday's canonical Adapter.
 - The standalone Node account-operation tools are retired. Polymarket account,
   order, cancellation, and reconciliation operations belong to `rust_hft`.
-- The standard `new-ploy-runner --features full` build does not enable the legacy
-  `live-execution` feature.
+- The leftover `live-execution` feature is a no-op tombstone. `RuntimeMode::Live`
+  always exits fail-closed; compatibility live OMS submit/cancel/replace never
+  call a venue client. Monday runtime remains the only production execution path.
 - The only prediction-market CI authority is the root `.github/workflows/ploy-ci.yml` workflow.
 - `scripts/install-platform-service.sh` is a fail-closed compatibility tombstone;
   it cannot install or enable the former standalone service.
