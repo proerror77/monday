@@ -3424,6 +3424,7 @@ fn validate_negative_campaign_result(
         validate_campaign_round_feedback(
             &round.feedback,
             loaded.request.research_plan.max_candidates()?,
+            loaded.request.research_plan.supervised_model_scope,
         )?;
     }
     Ok(())
@@ -3432,6 +3433,7 @@ fn validate_negative_campaign_result(
 fn validate_campaign_round_feedback(
     feedback: &CampaignRoundFeedbackV1,
     max_factors: usize,
+    scope: alpha_domain::CexSupervisedModelScopeV1,
 ) -> anyhow::Result<()> {
     let allowed_fields = allowed_research_feature_fields();
     if feedback.factor_attempts != feedback.factors.len()
@@ -3464,7 +3466,18 @@ fn validate_campaign_round_feedback(
                 && !feedback.baseline_gate_passed
                 && feedback.baseline_failure_codes == [CexBaselineFailureCodeV1::EmptyFactorBank]
         }
-        (Some(ridge), Some(cart)) => {
+        (Some(ridge), None) if !scope.is_default() => {
+            feedback.accepted_factors > 0
+                && valid_campaign_evaluation_feedback(ridge)
+                && feedback.baseline_gate_passed == ridge.passed
+                && if ridge.passed {
+                    feedback.baseline_failure_codes.is_empty()
+                } else {
+                    feedback.baseline_failure_codes
+                        == [CexBaselineFailureCodeV1::InsufficientEvidence]
+                }
+        }
+        (Some(ridge), Some(cart)) if scope.is_default() => {
             feedback.accepted_factors > 0
                 && valid_campaign_evaluation_feedback(ridge)
                 && valid_campaign_evaluation_feedback(cart)
@@ -3487,9 +3500,25 @@ fn validate_campaign_round_feedback(
         &feedback.supervised_selected_candidate_id,
     ) {
         (None, None, None, None, None) => {
-            feedback.supervised_replay.is_none() && feedback.burn.is_none()
+            feedback.supervised_replay.is_none()
+                && feedback.burn.is_none()
+                && (scope.is_default() || feedback.accepted_factors == 0)
         }
-        (Some(ridge), Some(cart), Some(burn), Some(selected), Some(candidate_id)) => {
+        (Some(ridge), None, None, Some(selected), Some(candidate_id)) if !scope.is_default() => {
+            feedback.accepted_factors > 0
+                && !candidate_id.trim().is_empty()
+                && valid_campaign_evaluation_feedback(ridge)
+                && ridge == selected
+                && feedback.burn.is_none()
+                && feedback.model_attempts == Some(1)
+                && feedback
+                    .supervised_replay
+                    .as_ref()
+                    .is_none_or(valid_campaign_replay_feedback)
+        }
+        (Some(ridge), Some(cart), Some(burn), Some(selected), Some(candidate_id))
+            if scope.is_default() =>
+        {
             feedback.accepted_factors > 0
                 && !candidate_id.trim().is_empty()
                 && valid_campaign_evaluation_feedback(ridge)
@@ -5176,7 +5205,12 @@ mod tests {
             ..CampaignRoundFeedbackV1::default()
         };
 
-        validate_campaign_round_feedback(&feedback, 1).unwrap();
+        validate_campaign_round_feedback(
+            &feedback,
+            1,
+            alpha_domain::CexSupervisedModelScopeV1::default(),
+        )
+        .unwrap();
         // Fixed-notional additive accounting can lose more than the initial
         // unit. SOL5 produced this rejected trading evaluation in a real run.
         feedback.factors[0]
@@ -5184,18 +5218,38 @@ mod tests {
             .as_mut()
             .unwrap()
             .max_drawdown = 1.048_747_746_845_106;
-        validate_campaign_round_feedback(&feedback, 1).unwrap();
+        validate_campaign_round_feedback(
+            &feedback,
+            1,
+            alpha_domain::CexSupervisedModelScopeV1::default(),
+        )
+        .unwrap();
         assert!(!feedback.factors[0].evaluation.as_ref().unwrap().passed);
         let mut invalid = feedback.clone();
         invalid.factors[0].evaluation.as_mut().unwrap().passed = true;
-        assert!(validate_campaign_round_feedback(&invalid, 1).is_err());
+        assert!(validate_campaign_round_feedback(
+            &invalid,
+            1,
+            alpha_domain::CexSupervisedModelScopeV1::default()
+        )
+        .is_err());
         for drawdown in [-0.01, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let mut invalid = feedback.clone();
             invalid.factors[0].evaluation.as_mut().unwrap().max_drawdown = drawdown;
-            assert!(validate_campaign_round_feedback(&invalid, 1).is_err());
+            assert!(validate_campaign_round_feedback(
+                &invalid,
+                1,
+                alpha_domain::CexSupervisedModelScopeV1::default()
+            )
+            .is_err());
         }
         feedback.accepted_factors = 0;
-        assert!(validate_campaign_round_feedback(&feedback, 1).is_err());
+        assert!(validate_campaign_round_feedback(
+            &feedback,
+            1,
+            alpha_domain::CexSupervisedModelScopeV1::default()
+        )
+        .is_err());
     }
 
     #[test]
@@ -6309,7 +6363,28 @@ mod tests {
 
     #[test]
     fn execute_ridge_only_holding_retains_precheck_and_one_model_through_readback() {
-        let mut fixture = campaign_e2e_fixture("ridge-only-holding", false, false, true);
+        assert_ridge_holding_campaign(
+            campaign_e2e_fixture("ridge-only-holding", false, false, true),
+            false,
+        );
+    }
+
+    #[test]
+    fn execute_ridge_only_holding_zero_trades_is_a_completed_negative() {
+        assert_ridge_holding_campaign(
+            campaign_e2e_fixture_with_price_step(
+                "ridge-only-zero-trades",
+                false,
+                false,
+                true,
+                false,
+                0.00001,
+            ),
+            true,
+        );
+    }
+
+    fn assert_ridge_holding_campaign(mut fixture: CampaignE2eFixture, negative: bool) {
         let mut request: CampaignRequest =
             serde_json::from_slice(&std::fs::read(&fixture.args.request).unwrap()).unwrap();
         request.research_plan.supervised_model_scope =
@@ -6340,6 +6415,41 @@ mod tests {
                 .unwrap();
         assert!(trials <= u64::try_from(request.declared_total_trials).unwrap());
         assert!(!fixture.global_claim_path.exists());
+        if negative {
+            let result: CampaignResultV1 =
+                load_campaign_result(&fixture.work_dir.join("campaign-result.json")).unwrap();
+            validate_negative_campaign_result(
+                &loaded,
+                &result,
+                &crate::mission_runner::sha256_file(&fixture.work_dir.join("campaign-result.json"))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(result.rounds.iter().all(|r| r.feedback.accepted_factors > 0
+                && r.feedback.supervised_ridge.as_ref().unwrap().trade_count == 0));
+            assert!(next_campaign_policy_revision(
+                &loaded,
+                &crate::mission_runner::sha256_file(&fixture.work_dir.join("campaign-result.json"))
+                    .unwrap(),
+                classify_campaign_failure(&result).unwrap()
+            )
+            .is_err());
+        } else {
+            for model in ["cart", "burn_mlp"] {
+                assert_metric_bundle_rejected(
+                    &loaded,
+                    &protocol,
+                    &client,
+                    |entries| {
+                        entries.insert(
+                            format!("results/{model}-supervised-backtest.json"),
+                            b"{}".to_vec(),
+                        );
+                    },
+                    "outside its declared scope",
+                );
+            }
+        }
         for round in &loaded.request.rounds {
             let file = std::fs::File::open(&round.result_readback_url).unwrap();
             let mut archive = zip::ZipArchive::new(file).unwrap();
@@ -7745,6 +7855,24 @@ mod tests {
         replay_tracks_features: bool,
         rejected_holdout: bool,
     ) -> CampaignE2eFixture {
+        campaign_e2e_fixture_with_price_step(
+            name,
+            zero_labels,
+            preexisting_claim,
+            replay_tracks_features,
+            rejected_holdout,
+            0.0005,
+        )
+    }
+
+    fn campaign_e2e_fixture_with_price_step(
+        name: &str,
+        zero_labels: bool,
+        preexisting_claim: bool,
+        replay_tracks_features: bool,
+        rejected_holdout: bool,
+        price_step: f64,
+    ) -> CampaignE2eFixture {
         let render_fixture = mission_render::tests::Fixture::canonical();
         let mut rows = mission_render::tests::read_feature_rows(&render_fixture.feature_path);
         if zero_labels {
@@ -7776,7 +7904,7 @@ mod tests {
                     .insert("weighted_book_imbalance_top5".to_string(), direction);
                 if replay_tracks_features {
                     row.features.insert("mid_price".to_string(), mid_price);
-                    mid_price *= 1.0 + direction * 0.0005;
+                    mid_price *= 1.0 + direction * price_step;
                 } else {
                     row.label = direction * 0.001;
                 }

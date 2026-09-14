@@ -4055,7 +4055,10 @@ fn decode_verified_execution_report(
                 .names()
                 .contains(&name)
             {
-                if baseline.is_some() || candidate.is_some() {
+                let unexpected_backtest = archive
+                    .file_names()
+                    .any(|path| path == format!("results/{name}-supervised-backtest.json"));
+                if baseline.is_some() || candidate.is_some() || unexpected_backtest {
                     bail!("published result contains a model outside its declared scope");
                 }
                 continue;
