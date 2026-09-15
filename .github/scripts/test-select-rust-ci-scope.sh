@@ -102,7 +102,7 @@ assert_security_jobs() {
 }
 
 job_cases=(
-  'collector|pull_request|collector.txt|ci/rust,ci/polymarket-evidence-compiler-image'
+  'collector|pull_request|collector.txt|ci/rust,ci/polymarket-evidence-compiler-image,ci/deployment-artifacts'
   'pinned-aliyun|pull_request|pinned-aliyun.txt|ci/market-recorder-contract,ploy/integration-regressions,ci/rust,ploy/safety-scans'
   'pinned-aliyun-push|push|pinned-aliyun.txt|ci/market-recorder-contract,ploy/integration-regressions,ci/rust,ploy/safety-scans'
   'future-aliyun-pin|pull_request|future-aliyun-pin.txt|ploy/safety-scans'
@@ -127,7 +127,7 @@ job_cases=(
   'skill-push|push|skill.txt|ploy/workflow-lint'
   'skill-ui|pull_request|skill-ui.txt|ploy/commit-hygiene,ploy/workflow-lint'
   'agent-instructions|pull_request|agent-instructions.txt|ploy/commit-hygiene'
-  'agent-instructions-with-code|pull_request|agent-instructions-with-code.txt|ploy/commit-hygiene,ci/rust,ci/polymarket-evidence-compiler-image'
+  'agent-instructions-with-code|pull_request|agent-instructions-with-code.txt|ploy/commit-hygiene,ci/rust,ci/polymarket-evidence-compiler-image,ci/deployment-artifacts'
   'preflight-only|pull_request|preflight-only.txt|ploy/commit-hygiene'
   'unknown-workflow|pull_request|unknown-workflow.txt|ci/rust-shell-scripts,ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/workflow-lint,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
   'unknown-root|pull_request|unknown-root.txt|ci/rust-shell-scripts,ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
@@ -135,7 +135,7 @@ job_cases=(
   'rust-docs|pull_request|rust-docs.txt|'
   'package-readme|pull_request|package-readme.txt|'
   'rust-shell-script|pull_request|rust-shell-script.txt|ci/rust-shell-scripts'
-  'rust-deploy-collector|pull_request|rust-deploy-collector.txt|ci/rust-shell-scripts,ci/rust,ci/polymarket-evidence-compiler-image,ploy/safety-scans'
+  'rust-deploy-collector|pull_request|rust-deploy-collector.txt|ci/rust-shell-scripts,ci/rust,ci/polymarket-evidence-compiler-image,ploy/safety-scans,ci/deployment-artifacts'
   'docs|pull_request|docs.txt|'
   'unknown-prediction|pull_request|unknown-prediction.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
   'mixed-prediction|pull_request|mixed-prediction.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans,ploy/rust-format,ploy/rust-research-heavy'
@@ -145,7 +145,7 @@ job_cases=(
   'trading-dockerfile-push|push|trading-dockerfile.txt|ci/deployment-artifacts'
   'research-deployment-push|push|research-deployment.txt|ci/deployment-artifacts,ploy/research-image-binaries,ploy/research-image-smoke'
   'acr-workflow-push|push|acr-workflow.txt|ploy/workflow-lint,ploy/research-image-binaries,ploy/research-image-smoke'
-  'full|push|collector.txt|ci/rust,ci/polymarket-evidence-compiler-image,ploy/research-image-binaries,ploy/research-image-smoke'
+  'full|push|collector.txt|ci/rust,ci/polymarket-evidence-compiler-image,ploy/research-image-binaries,ploy/research-image-smoke,ci/deployment-artifacts'
 )
 for job_case in "${job_cases[@]}"; do
   IFS='|' read -r name event fixture expected expected_owning <<<"$job_case"
@@ -184,7 +184,7 @@ printf '%s\n' \
   rust_hft/tools/collector/src/polymarket/reference.rs \
   rust_hft/tools/future-rust-tool/src/lib.rs >"$tmp_dir/known-and-future.txt"
 known_and_future=$(run_case known-and-future pull_request known-and-future.txt)
-assert_jobs "$known_and_future" 'ci/rust,ci/polymarket-evidence-compiler-image'
+assert_jobs "$known_and_future" 'ci/rust,ci/polymarket-evidence-compiler-image,ci/deployment-artifacts'
 assert_owning_packages "$known_and_future" 'future-rust-tool'
 
 printf '%s\n' rust_hft/apps/live/src/lib.rs rust_hft/apps/paper/src/main.rs \
@@ -474,9 +474,17 @@ printf '%s' '{"selector":{"result":"success"},"rust":{"result":"success"}}' | \
   bash "$gate" --expected-jobs ',ci/rust,'
 printf '%s' '{"selector":{"result":"success"},"scope":{"result":"success"}}' | \
   bash "$gate" --job-prefix ci --expected-jobs ',ploy/workflow-lint,'
-release_expected=',ci/rust,ci/polymarket-evidence-compiler-image,ploy/rust-research-heavy,'
-release_needs='{"selector":{"result":"success"},"scope":{"result":"success"},"rust":{"result":"success"},"polymarket_evidence_compiler_image":{"result":"success"}}'
+release_expected=',ci/rust,ci/polymarket-evidence-compiler-image,ploy/rust-research-heavy,ci/deployment-artifacts,'
+release_needs='{"selector":{"result":"success"},"scope":{"result":"success"},"rust":{"result":"success"},"polymarket_evidence_compiler_image":{"result":"success"},"deployment_artifacts":{"result":"success"}}'
 printf '%s' "$release_needs" | bash "$gate" --job-prefix ci --expected-jobs "$release_expected"
+for image_state in missing skipped failure; do
+  bad_image_needs=$(jq -cn --argjson needs "$release_needs" --arg state "$image_state" \
+    '$needs | if $state == "missing" then del(.deployment_artifacts) else .deployment_artifacts.result=$state end')
+  if printf '%s' "$bad_image_needs" | bash "$gate" --job-prefix ci --expected-jobs "$release_expected" >/dev/null 2>&1; then
+    printf 'Monorepo gate accepted a %s production image check\n' "$image_state" >&2
+    exit 1
+  fi
+done
 unrelated_needs='{"image-smoke-selector":{"result":"success"},"image-smoke-scope":{"result":"success"},"rust-research-heavy":{"result":"failure"}}'
 if printf '%s' "$unrelated_needs" | \
   bash "$gate" --job-prefix ploy --expected-jobs "$release_expected" >/dev/null 2>&1; then

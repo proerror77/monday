@@ -2,6 +2,7 @@
 
 FROM rust:1.98-bullseye@sha256:4730e387a220a08a365c77da3096544dde214f9d796c16284d4be45438cad4a9 AS builder
 
+ARG TARGETARCH
 ENV RUST_VERSION=1.98.1
 RUN rustup toolchain install 1.98.1 --profile minimal --no-self-update \
     && rustup default 1.98.1 \
@@ -11,15 +12,16 @@ WORKDIR /work
 ARG SOURCE_REVISION
 RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list \
     && apt-get update && apt-get install -y --no-install-recommends \
-    clang \
     cmake \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 COPY . .
+# Proc-macro artifacts depend on the builder libc, toolchain and architecture.
+# Keep compiled targets separate from other images while sharing source downloads.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,target=/work/target,sharing=locked \
+    --mount=type=cache,id=monday-binance-lob-bullseye-rust-${RUST_VERSION}-${TARGETARCH},target=/work/target,sharing=locked \
     printf '%s\n' "$SOURCE_REVISION" | grep -Eq '^[0-9a-f]{40}$' \
     && MONDAY_SOURCE_REVISION="$SOURCE_REVISION" cargo --config 'build.rustc-wrapper=""' build \
     --release \

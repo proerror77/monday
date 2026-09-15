@@ -167,6 +167,8 @@ select_all() {
 
 emit() {
   local value
+  # Every path that selects collector verification must exercise its production image.
+  if [[ $collector == true ]]; then select_job ci/deployment-artifacts; fi
   select_security_scope
   for value in "$loop" "$handoff" "$json" "$ondo" "$collector" "$control" "$focused" "$toolchain"; do
     [[ $value == true || $value == false ]] || { printf 'invalid boolean selector output: %s\n' "$value" >&2; exit 1; }
