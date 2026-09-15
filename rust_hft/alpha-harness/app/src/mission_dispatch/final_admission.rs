@@ -297,6 +297,7 @@ impl FinalAdmission {
         let container = &manifest["items"][1]["spec"]["template"]["spec"]["containers"][0];
         if grant.grant().execution.job_cpu_millis != 3500
             || grant.grant().execution.job_memory_mib != 12 * 1024
+            || !grant.grant().execution.accelerator.is_cpu()
             || container["image"] != grant.grant().execution.runner_image
         {
             bail!("final Job resources differ from closed-family binding");
@@ -626,6 +627,7 @@ mod tests {
                 controller_image: format!("registry/controller@sha256:{}", "f".repeat(64)),
                 job_cpu_millis: 3500,
                 job_memory_mib: 12 * 1024,
+                accelerator: alpha_domain::research_accelerator::ResearchAcceleratorV1::Cpu,
             },
             selected_results: BTreeMap::from([(operation.clone(), "f".repeat(64))]),
             max_candidates: 4,

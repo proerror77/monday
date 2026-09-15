@@ -118,6 +118,13 @@ pub struct CampaignExecutionBindingV1 {
     pub controller_image: String,
     pub job_cpu_millis: u32,
     pub job_memory_mib: u32,
+    /// Omitted on the wire for CPU grants. `cuda_gpu` is rejected until the
+    /// compiled trainer backend is CUDA.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::research_accelerator::ResearchAcceleratorV1::is_cpu"
+    )]
+    pub accelerator: crate::research_accelerator::ResearchAcceleratorV1,
 }
 
 impl CampaignExecutionBindingV1 {
@@ -131,6 +138,8 @@ impl CampaignExecutionBindingV1 {
         if self.job_cpu_millis == 0 || self.job_memory_mib == 0 {
             return Err(CampaignControlError::Invalid("Job resources"));
         }
+        crate::research_accelerator::admit_research_accelerator(self.accelerator)
+            .map_err(|_| CampaignControlError::Invalid("research accelerator"))?;
         Ok(())
     }
 }
@@ -505,6 +514,7 @@ mod tests {
                 controller_image: format!("registry/controller@sha256:{}", "5".repeat(64)),
                 job_cpu_millis: 3500,
                 job_memory_mib: 12288,
+                accelerator: crate::research_accelerator::ResearchAcceleratorV1::Cpu,
             },
             allowed_policy_revision_ids: BTreeSet::from([format!(
                 "cex-search-policy-{}",
@@ -602,7 +612,7 @@ mod tests {
     #[test]
     fn attempts_cannot_change_family_policy_generation_or_grant() {
         let (grant, now) = verified();
-        for change in 0..12 {
+        for change in 0..13 {
             let mut a = attempt(&grant);
             match change {
                 0 => a.family_id = "other-family".into(),
@@ -622,7 +632,11 @@ mod tests {
                         format!("registry/other@sha256:{}", "5".repeat(64))
                 }
                 10 => a.execution.job_cpu_millis += 1,
-                _ => a.execution.job_memory_mib += 1,
+                11 => a.execution.job_memory_mib += 1,
+                _ => {
+                    a.execution.accelerator =
+                        crate::research_accelerator::ResearchAcceleratorV1::CudaGpu
+                }
             }
             assert!(
                 grant.validate_attempt_scope(&a, now).is_err(),
@@ -642,6 +656,19 @@ mod tests {
         changed.attempt_ordinal += 1;
         assert_ne!(a.operation_id().unwrap(), changed.operation_id().unwrap());
         assert_eq!(a.family_id, changed.family_id);
+    }
+
+    #[test]
+    fn cpu_accelerator_is_default_and_gpu_grants_are_rejected() {
+        let (grant, _, _) = fixture();
+        let value = serde_json::to_value(&grant.execution).unwrap();
+        assert!(value.get("accelerator").is_none());
+        let restored: CampaignExecutionBindingV1 = serde_json::from_value(value).unwrap();
+        assert!(restored.accelerator.is_cpu());
+        assert_eq!(restored, grant.execution);
+        let mut gpu = grant.clone();
+        gpu.execution.accelerator = crate::research_accelerator::ResearchAcceleratorV1::CudaGpu;
+        assert!(gpu.validate().is_err());
     }
 
     #[test]

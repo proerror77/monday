@@ -16,6 +16,7 @@ use crate::{
 use alpha_domain::{
     campaign_control::{verify_campaign_root_grant, SignedCampaignRootGrantV1},
     campaign_horizon::CampaignNextFamilyParentV1,
+    research_accelerator::{cpu_research_container_resources, cpu_research_node_selector},
 };
 use alpha_store::campaign_ledger::{
     CampaignLedgerEventV1, CampaignStudyLedgerEventV1, CampaignStudySnapshotV1,
@@ -1169,7 +1170,7 @@ fn render_campaign_manifest(
                             "restartPolicy": "Never",
                             "automountServiceAccountToken": false,
                             "imagePullSecrets": [{ "name": "monday-acr" }],
-                            "nodeSelector": { "kubernetes.io/arch": "amd64", "workload": "backtest" },
+                            "nodeSelector": cpu_research_node_selector(),
                             "securityContext": {
                                 "runAsNonRoot": true,
                                 "runAsUser": 1000,
@@ -1183,10 +1184,7 @@ fn render_campaign_manifest(
                                 "imagePullPolicy": "IfNotPresent",
                                 "command": ["/usr/local/bin/alpha-harness"],
                                 "args": input.args,
-                                "resources": {
-                                    "requests": { "cpu": "3500m", "memory": "8Gi" },
-                                    "limits": { "cpu": "3500m", "memory": "12Gi" }
-                                },
+                                "resources": cpu_research_container_resources(),
                                 "securityContext": {
                                     "allowPrivilegeEscalation": false,
                                     "capabilities": { "drop": ["ALL"] },
@@ -1279,6 +1277,17 @@ mod tests {
             job["spec"]["template"]["spec"]["containers"][0]["args"][1],
             "campaign-execute"
         );
+        let pod = &job["spec"]["template"]["spec"];
+        assert_eq!(pod["nodeSelector"], cpu_research_node_selector());
+        assert!(pod["nodeSelector"]
+            .get("research.monday/accelerator")
+            .is_none());
+        assert!(pod["containers"][0]["resources"]["limits"]
+            .get("nvidia.com/gpu")
+            .is_none());
+        assert!(pod["containers"][0]["resources"]["requests"]
+            .get("nvidia.com/gpu")
+            .is_none());
     }
 
     #[test]
@@ -2610,6 +2619,7 @@ mod tests {
         );
         assert_eq!(gate.reservation.execution.job_memory_mib, 12 * 1024);
         assert_eq!(gate.reservation.execution.job_cpu_millis, 3500);
+        assert!(gate.reservation.execution.accelerator.is_cpu());
         assert_eq!(
             gate.reservation.reserved_job_seconds,
             ACTIVE_DEADLINE_SECONDS
@@ -2697,6 +2707,21 @@ mod tests {
         let mut changed = fixture.manifest.clone();
         changed["items"][1]["spec"]["template"]["spec"]["containers"][0]["resources"]["limits"]
             ["memory"] = json!("24Gi");
+        assert!(admission::Admission::open(
+            &fixture.control,
+            &fixture.validated,
+            &changed,
+            "research-context",
+            "monday-research"
+        )
+        .is_err());
+        let mut changed = fixture.manifest.clone();
+        changed["items"][1]["spec"]["template"]["spec"]["containers"][0]["resources"]["limits"]
+            ["nvidia.com/gpu"] = json!("1");
+        changed["items"][1]["spec"]["template"]["spec"]["containers"][0]["resources"]["requests"]
+            ["nvidia.com/gpu"] = json!("1");
+        changed["items"][1]["spec"]["template"]["spec"]["nodeSelector"]
+            ["research.monday/accelerator"] = json!("cuda-gpu");
         assert!(admission::Admission::open(
             &fixture.control,
             &fixture.validated,
@@ -3227,6 +3252,7 @@ mod tests {
                 controller_image: format!("registry/controller@sha256:{}", "2".repeat(64)),
                 job_cpu_millis: 1,
                 job_memory_mib: 1,
+                accelerator: alpha_domain::research_accelerator::ResearchAcceleratorV1::Cpu,
             },
             allowed_policy_revision_ids: BTreeSet::from([format!(
                 "cex-search-policy-{}",

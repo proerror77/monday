@@ -7,6 +7,7 @@ pub mod campaign_study;
 mod evaluation_partition;
 pub mod frozen_model;
 pub mod mlp_training;
+pub mod research_accelerator;
 pub use evaluation_partition::{EvaluationRowPartitionsV1, EvaluationSelectionV1};
 pub use mlp_training::{CexMlpFoldObservationV1, CexMlpTrainingPlanV1, CexMlpTrainingProfileV1};
 pub mod runtime_latency_evidence;

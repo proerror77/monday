@@ -94,4 +94,6 @@ Role or create another credential source. Keep active authority-ledger/WAL files
 on the established stable block volume; the preparer opens its separately selected
 attestation ledger through the read-only API. The signed control remains responsible
 for execution accounting. Render resources and the Job deadline from the actual
-approved study budget; the template is not a runnable default grant.
+approved study budget; the template is not a runnable default grant. ACK
+workers follow the [CPU-default accelerator contract](ACK_RESEARCH_ACCELERATOR.md);
+do not attach `nvidia.com/gpu` to make Ridge or ndarray MLP faster.

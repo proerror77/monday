@@ -2093,6 +2093,7 @@ mod tests {
                 controller_image: format!("registry/controller@sha256:{}", repeat_hex('f')),
                 job_cpu_millis: 1,
                 job_memory_mib: 1,
+                accelerator: alpha_domain::research_accelerator::ResearchAcceleratorV1::Cpu,
             },
             allowed_policy_revision_ids: BTreeSet::from([format!(
                 "cex-search-policy-{}",

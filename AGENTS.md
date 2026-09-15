@@ -98,6 +98,13 @@
 - For CEX cloud research, follow the
   [ACK-only evidence and recovery boundary](deployment/aliyun/research/README.md#data-flow-review-and-host-lifetime)
   during preparation, verification, reporting, recovery, and resource cleanup.
+- ACK CEX compute is a typed accelerator, not an agent guess. Default and current
+  trainer resolve to CPU Spot `workload=backtest`. Do not provision GPU node
+  pools or put `nvidia.com/gpu` on Jobs to make training faster. GPU is admitted
+  only when `ResearchAcceleratorV1::CudaGpu` binds a CUDA trainer, CUDA runner
+  image, GPU node selector, and `nvidia.com/gpu` together; the current ndarray
+  backend rejects that grant. See
+  [ACK research accelerator](docs/research/ACK_RESEARCH_ACCELERATOR.md).
 
 ## Scope and ownership
 
