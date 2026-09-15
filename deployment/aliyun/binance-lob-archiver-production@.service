@@ -19,7 +19,9 @@ ExecStartPre=+/opt/monday/bin/monday-rust-lob-recovery-queue isolate %i
 ExecStart=/opt/monday/bin/binance-lob-archiver
 Restart=always
 RestartSec=5
-RuntimeMaxSec=21600
+# Continuous capture must survive research windows longer than six hours.
+# Crash recovery, startup rate limits and resource protections remain bounded.
+RuntimeMaxSec=infinity
 KillMode=mixed
 TimeoutStartSec=120
 TimeoutStopSec=600

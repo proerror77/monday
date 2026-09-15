@@ -151,7 +151,7 @@ and (.before | type == "object"
   and (.production_assets | valid_production_asset_map($production_asset_keys; $root.source_mode)))
 and (.production_assets | valid_production_asset_map($production_asset_keys; $root.source_mode))
 and (.production_runtime | type == "object"
-  and .schema == "monday.rust_lob_production_runtime.v2"
+  and .schema == "monday.rust_lob_production_runtime.v3"
   and (.slice | valid_lob_slice)
   and .slice_memory_high == "3072M"
   and .slice_memory_max == "3584M"
@@ -164,7 +164,7 @@ and (.production_runtime | type == "object"
   and .group == "hftcollector"
   and .restart == "always"
   and .restart_sec == 5
-  and .runtime_max_sec == 21600
+  and .runtime_max_sec == "infinity"
   and .kill_mode == "mixed"
   and .timeout_start_sec == 120
   and .timeout_stop_sec == 600
@@ -221,7 +221,9 @@ and (.production_runtime | type == "object"
     and ((.usdm.symbols | split(",") | unique) | length == 100)))
 and (.production_process | type == "object"
   and (keys | sort) == ["spot", "usdm"]
-  and all(.[]; (keys | sort) == ["active", "process_exe_sha256"]
+  and all(.[]; (keys | sort) == ["active", "main_pid", "n_restarts", "process_exe_sha256"]
+    and (.main_pid | type == "number" and floor == . and . >= 1)
+    and (.n_restarts | type == "number" and floor == . and . >= 0)
     and .active == true
     and (.process_exe_sha256 | type == "string" and test("^[a-f0-9]{64}$"))))
 and (.production_memory | . as $pm

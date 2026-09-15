@@ -468,6 +468,17 @@ expect "healthy: state records failure_count" "$(grep -q '^failure_count|polymar
 expect "healthy: state records sequence session" "$(grep -q '^sequence_gap_session|binance-lob-archiver-production@spot=fixture-spot$' "$state_dir/state.json"; echo $?)"
 expect "healthy: state records sequence total" "$(grep -q '^sequence_gap_total|binance-lob-archiver-production@spot=0$' "$state_dir/state.json"; echo $?)"
 
+# Archive coverage is distinct from process health and research admission.
+run_health --json
+expect "healthy: archive unknown without evidence" "$(json_query '.checks.health["binance-lob-archiver-production@usdm"].archive_coverage.status == "not_observed"'; echo $?)"
+jq '.archive_coverage = {schema:"monday.archive_coverage.v1",evidence:"verified_upload_manifests",
+  segments:97,longest_candidate_duration_ns:28800000000000,eight_hour_candidate_available:true,
+  native_tape_verification:"pending",calendar_admission:"pending",spans:[],breaks:[]}' \
+  "$spool_root/binance-lob/usdm/health.json" > "$test_root/coverage.json"
+cp "$test_root/coverage.json" "$spool_root/binance-lob/usdm/health.json"
+run_health --json
+expect "archive candidate does not imply native or calendar admission" "$(json_query '.checks.health["binance-lob-archiver-production@usdm"].archive_coverage | .eight_hour_candidate_available == true and .native_tape_verification == "pending" and .calendar_admission == "pending"'; echo $?)"
+
 # ---------------------------------------------------------------------------
 # 2. Gate 1: missing upload-status.json on a mandated lane is a breach
 #    (replaces the old 'LOB missing status is healthy' expectation)
@@ -897,7 +908,7 @@ healthy_scenario
 healthy_fixtures
 run_health
 expect "restart delta: baseline healthy" "$(rc_is 0; echo $?)"
-rewrite_scenario 's|^binance-lob-archiver-production@spot.service	active	enabled	success	4|binance-lob-archiver-production@spot.service	active	enabled	success	7|'
+rewrite_scenario 's|^binance-lob-archiver-production@spot.service	active	enabled	success	4|binance-lob-archiver-production@spot.service	active	enabled	success	5|'
 run_health
 expect "restart delta: exit 0" "$(rc_is 0; echo $?)"
 expect "restart delta: warning message" "$(grep_out '^warning: .*restart rate high'; echo $?)"

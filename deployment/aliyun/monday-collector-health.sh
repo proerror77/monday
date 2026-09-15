@@ -403,7 +403,11 @@ check_service() {
     case "$prior" in (*[!0-9]*|'') prior="" ;; esac
     if [ -n "$prior" ]; then
       delta=$((nrestarts - prior))
-      if [ "$delta" -gt "$RESTART_MAX_DELTA" ]; then
+      restart_limit=$RESTART_MAX_DELTA
+      case "$unit" in
+        binance-lob-archiver-production@spot.service|binance-lob-archiver-production@usdm.service) restart_limit=0 ;;
+      esac
+      if [ "$delta" -gt "$restart_limit" ]; then
         record_warning "$label: restart rate high (NRestarts $prior -> $nrestarts)"
       fi
     fi
@@ -652,6 +656,7 @@ check_binance_health() {
   sequence_gap_baseline=missing
   hwarn=false
   hstatus=unknown
+  archive_coverage='{"status":"not_observed","native_tape_verification":"pending","calendar_admission":"pending"}'
   prior_session=''
   prior_total=''
   if [ "$DRY_RUN" -eq 0 ]; then
@@ -672,6 +677,12 @@ check_binance_health() {
     preserve_sequence_prior
     age=999999
   else
+    archive_coverage=$(jq -c '
+      if .archive_coverage.schema == "monday.archive_coverage.v1" then
+        .archive_coverage | {schema,evidence,segments,longest_candidate_duration_ns,
+          eight_hour_candidate_available,native_tape_verification,calendar_admission,spans,breaks}
+      else {status:"not_observed",native_tape_verification:"pending",calendar_admission:"pending"} end' \
+      "$health_file")
     gaps=$(jq -r '.sequence_gaps // 0' "$health_file" 2>/dev/null || printf '0')
     hwarn=$(jq -r '.disk_warning // false' "$health_file" 2>/dev/null || printf 'false')
     hstatus=$(jq -r '.status // "unknown"' "$health_file" 2>/dev/null || printf 'unknown')
@@ -768,13 +779,14 @@ check_binance_health() {
     --argjson session "$sequence_gap_session_json" \
     --arg baseline "$sequence_gap_baseline" \
     --argjson observed "$sequence_gap_observed" \
+    --argjson archive "$archive_coverage" \
     --arg hw "$hwarn" --arg s "$hstatus" \
     '{age_seconds: $age, sequence_gaps: $gaps,
       sequence_gap_total: $total, sequence_gap_delta: $delta,
       sequence_gap_previous_total: $previous, session_id: $session,
       sequence_gap_observed: ($observed == 1),
       sequence_gap_baseline: $baseline,
-      disk_warning: ($hw == "true"), status: $s}')
+      archive_coverage: $archive, disk_warning: ($hw == "true"), status: $s}')
   health_json=$(jq -n --argjson base "$health_json" --arg k "$label" --argjson v "$hobj" \
     '$base + {($k): $v}')
 }

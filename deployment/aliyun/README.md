@@ -190,17 +190,21 @@ Every other check is a warning — reported in the JSON `warnings` array and as
 | Warning | Condition |
 | --- | --- |
 | `/data` disk | free <= 25% (warn) via `df -Pk /data`; free <= 15% is hard gate 5 above |
-| Governed services | `binance-lob-archiver-production@spot/usdm`, `binance-usdm-reference-collector`, `bybit-options-archiver` active AND enabled AND `Result==success`, plus a restart-rate delta > 1 since the last poll |
+| Governed services | `binance-lob-archiver-production@spot/usdm`, `binance-usdm-reference-collector`, `bybit-options-archiver` active AND enabled AND `Result==success`, plus any positive Binance LOB restart delta (other services: > 1) since the last poll |
 | Upload lane units | upload/fee timers active AND enabled; their oneshot services' last `Result==success` |
 | `health.json` | missing/unparseable, wall-clock age of `updated_at_ns` > 300s, or `sequence_gaps` > 0 (spot + usdm spools) |
 | Delay-gate trips | > 0 journald `source-to-receive delay exceeds the governed limit` lines per Binance unit in the last 15 minutes |
 | Fee snapshot failures | > 0 `Failed with result` journald lines per fee snapshot unit in the last 10 minutes |
 | `/data` mount | `mountpoint -q /data` fails (the monitor must DETECT a missing mount, not gate on it) |
 
-The persistent-service check deliberately does not warn on `NRestarts > 0`:
-both Binance archivers restart every six hours by design
-(`RuntimeMaxSec=21600`). Crash loops are detected through `Result != success`
-or an `NRestarts` delta greater than one between consecutive five-minute polls.
+Production Binance LOB capture has no scheduled lifetime limit
+(`RuntimeMaxSec=infinity`): a six-hour restart would necessarily interrupt
+every eight-hour research window. Shadow/Gate jobs retain finite deadlines.
+The persistent-service check uses restart deltas rather than lifetime counts;
+crash loops are detected through `Result != success` or any positive `NRestarts` delta
+for either Binance LOB production instance between consecutive five-minute polls. Process health does
+not prove archive continuity. A new snapshot after reconnect does not restore
+unrecorded depth events.
 Production startup is bounded at 120 seconds. Five failed starts inside the
 two-hour `StartLimitIntervalSec` stop automatic retries instead of allowing a
 slow `ExecStartPre` to roll out of the rate-limit window and loop indefinitely.
@@ -250,6 +254,47 @@ systemctl status monday-collector-health.service --no-pager -n 5
 
 The service must NOT add `ConditionPathIsMountPoint=/data`: the whole point of
 the mount check is to detect and alert when `/data` is missing.
+
+### Continuous Binance research windows
+
+The collector's `health.json.archive_coverage` and host monitor report the
+recording spans of the most recent 512 successfully read-back uploads. They
+retain capture-session IDs and object/manifest hashes in
+`upload-status.json.archive_segments`. A recording gap (including a one-nanosecond
+seam gap), overlap, session/symbol change or unsafe segment breaks the span;
+hour and date directory boundaries do not. Restarted or damaged status starts
+with unknown/empty evidence; it never fabricates the missing past. The original
+OSS objects remain the complete history.
+
+`eight_hour_candidate_available` is manifest coverage only. Its
+`native_tape_verification` and `calendar_admission` stay `pending`. Neither
+process health, hour presence nor upload success constitutes research admission.
+
+For independent readback, download the immutable triplets to a task-owned
+validation location and freeze an index with external SHA-256 anchors:
+
+```json
+{"schema":"monday.archive_continuity_index.v1","start_ns":1789430400000000000,"end_ns":1789459200000000000,"segments":[{"data_path":"/work/task/part-....jsonl.zst","object":"oss://bucket/lake/raw/.../part-....jsonl.zst","data_sha256":"<64 hex>","manifest_sha256":"<64 hex>"}]}
+```
+
+List all required segments in recording order, including the segment that
+covers each window endpoint. Run `binance-lob-archiver --audit-archive-index
+/work/task/index.json` and preserve stdout plus the exit code. This uses the
+native sequence, trade, checkpoint, manifest and `_SUCCESS` checks across the
+entire window, loading one decoded segment at a time. A failed chain emits a
+negative report and exits nonzero. `eight_hour_tape_available` requires a
+verified window of at least eight hours; native materialization and per-second
+calendar admission are still required separately. Manifest or index parse/hash
+errors fail before a report is emitted.
+
+Dynamic `SYMBOLS=ALL` catalog refresh runs independently of event consumption;
+only a real scope change rolls the capture generation. That boundary is explicit
+and is never joined into a continuous research span.
+
+Removing the six-hour systemd deadline does not provide seamless WebSocket
+handover. A disconnected depth shard invalidates affected books and requests
+new snapshots; unsafe intervals remain excluded. Deliberate disconnects and
+connection expiry beyond 24 hours need their own overlap/handover verification.
 
 ### Data completeness check
 
@@ -679,8 +724,11 @@ session tasks. This prevents bounded final segment compression (up to
 space emits a warning but does not pause collection. Successfully uploaded segments are deleted
 from the local spool immediately. Pending segments are retained when OSS upload
 fails so the collector never creates a silent data hole merely to reclaim space.
-The shared pending-diff budget still bounds initialization bursts. Services restart
-every six hours to refresh the active-symbol catalog.
+The shared pending-diff budget still bounds initialization bursts. The collector refreshes
+the dynamic active-symbol catalog in the background every six hours. A changed
+`SYMBOLS=ALL` catalog starts a new capture generation after preserving the old
+tail as unsafe; unchanged catalogs keep their existing recording. The fixed
+USD-M top100 scope has no scheduled generation or process restart.
 
 The snapshot bridge timeout is 120 seconds after the last initial snapshot request
 finishes. This gives the full-market queue time to apply the tail of Spot and USD-M

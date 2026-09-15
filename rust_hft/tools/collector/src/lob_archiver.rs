@@ -1379,6 +1379,7 @@ pub fn write_health(
             "disk_free_gb": disk_free_gb,
             "disk_warning": disk_free_gb.is_some_and(|free| free < disk_warning_threshold_gb),
             "disk_warning_threshold_gb": disk_warning_threshold_gb,
+            "archive_coverage": crate::archive_continuity::coverage_report(&upload.archive_segments),
             "upload_warning": upload.last_error_at.is_some(),
             "upload_failure_count": upload.failure_count,
             "last_upload_success_at": upload.last_success_at,
@@ -1407,6 +1408,7 @@ pub struct UploadStatus {
     pub failed_batches: Vec<Value>,
     pub last_uploaded_object: Option<String>,
     pub last_uploaded_triplet: Option<Value>,
+    pub archive_segments: Vec<crate::archive_continuity::ArchiveSegment>,
 }
 
 pub fn read_upload_status(spool_dir: &Path) -> UploadStatus {
