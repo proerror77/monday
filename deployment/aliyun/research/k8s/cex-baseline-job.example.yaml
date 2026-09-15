@@ -92,6 +92,7 @@ spec:
             - --output-dir
             - /work/results
           resources:
+            # CPU research accelerator only. Do not add nvidia.com/gpu.
             requests:
               cpu: "3500m"
               memory: 8Gi

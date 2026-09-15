@@ -1066,6 +1066,7 @@ mod tests {
                 controller_image: format!("registry/controller@sha256:{}", "5".repeat(64)),
                 job_cpu_millis: 3500,
                 job_memory_mib: 12288,
+                accelerator: alpha_domain::research_accelerator::ResearchAcceleratorV1::Cpu,
             },
             allowed_policy_revision_ids: BTreeSet::from([format!(
                 "cex-search-policy-{}",

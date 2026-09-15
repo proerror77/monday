@@ -4700,6 +4700,7 @@ mod tests {
             controller_image: format!("registry/controller@sha256:{}", "9".repeat(64)),
             job_cpu_millis: 1,
             job_memory_mib: 1,
+            accelerator: alpha_domain::research_accelerator::ResearchAcceleratorV1::Cpu,
         };
         let proposal_for = |parent: CampaignNextFamilyParentV1| CampaignNextFamilyProposalV1 {
             schema_version: alpha_domain::campaign_horizon::CAMPAIGN_NEXT_FAMILY_PROPOSAL_SCHEMA_V1
