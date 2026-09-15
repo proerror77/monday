@@ -72,6 +72,8 @@ gate_publish_dir_line=$(grep -nF "mv -- \"\$evidence_dir\" \"\$final_evidence_di
 # Effective instance configuration must agree with the production contract.
 # This models an old pinned instance alias overriding a newly updated template.
 (
+  # The sourced lifetime verifier invokes this stub indirectly.
+  # shellcheck disable=SC2317,SC2329
   systemctl() {
     case "$1 $2 $3 $4" in
       'show binance-lob-archiver-production@spot.service --property=RuntimeMaxUSec --value') printf 'infinity\n' ;;
