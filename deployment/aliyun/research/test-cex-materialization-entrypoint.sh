@@ -8,7 +8,7 @@ SLICE_JOB=$SCRIPT_DIR/k8s/cex-materialization-slice-job.example.yaml
 REDUCE_JOB=$SCRIPT_DIR/k8s/cex-materialization-reduce-job.example.yaml
 
 [ "$(grep -c ' /reference/lake/raw$' "$JOB_TEMPLATE")" -eq 2 ]
-! grep -q ' /lake/reference$' "$JOB_TEMPLATE"
+if grep -q ' /lake/reference$' "$JOB_TEMPLATE"; then exit 1; fi
 grep -q '^  activeDeadlineSeconds: 7200$' "$JOB_TEMPLATE"
 grep -q '^  completionMode: NonIndexed$' "$JOB_TEMPLATE"
 grep -q '^  completions: 1$' "$JOB_TEMPLATE"
@@ -20,15 +20,15 @@ grep -q '^  completions: 8$' "$SLICE_JOB"
 grep -q '^  parallelism: 1$' "$SLICE_JOB"
 grep -q '^  backoffLimit: 0$' "$SLICE_JOB"
 grep -q 'command: \["/bin/sh"\]' "$SLICE_JOB"
-! grep -E '^[[:space:]]+- \$\(JOB_COMPLETION_INDEX\)$' "$SLICE_JOB"
-! grep -q 'exec /contract/' "$SLICE_JOB"
+if grep -E '^[[:space:]]+- \$\(JOB_COMPLETION_INDEX\)$' "$SLICE_JOB"; then exit 1; fi
+if grep -q 'exec /contract/' "$SLICE_JOB"; then exit 1; fi
 grep -F 'fieldPath: metadata.annotations['"'"'batch.kubernetes.io/job-completion-index'"'"']' "$SLICE_JOB" >/dev/null
 grep -q '^  completionMode: NonIndexed$' "$REDUCE_JOB"
 grep -q '^  completions: 1$' "$REDUCE_JOB"
 grep -q '^  parallelism: 1$' "$REDUCE_JOB"
 grep -q '^  backoffLimit: 0$' "$REDUCE_JOB"
 grep -q '^  activeDeadlineSeconds: 7200$' "$REDUCE_JOB"
-! grep -qiE 'argo|kubeflow' "$SLICE_JOB" "$REDUCE_JOB" "$JOB_TEMPLATE"
+if grep -qiE 'argo|kubeflow' "$SLICE_JOB" "$REDUCE_JOB" "$JOB_TEMPLATE"; then exit 1; fi
 
 for tool in awk find sed sha256sum mktemp chmod grep; do
   command -v "$tool" >/dev/null 2>&1 || {
@@ -140,14 +140,19 @@ cat >"$BIN_DIR/lob-pit-materializer" <<'EOF'
 #!/bin/sh
 set -eu
 artifact_dir=
+window_start=
+window_end=
 while [ $# -gt 0 ]; do
   case "$1" in
     --artifact-dir) artifact_dir=$2; shift 2 ;;
+    --output-start-received-at-ns) window_start=$2; shift 2 ;;
+    --output-end-received-at-ns) window_end=$2; shift 2 ;;
     *) shift ;;
   esac
 done
 [ -n "$artifact_dir" ] || exit 2
 mkdir -p "$artifact_dir"
+printf '%s|%s\n' "$window_start" "$window_end" >"$artifact_dir/window-args.txt"
 feature=$artifact_dir/feature-test.jsonl
 report=$artifact_dir/materialization-test.materialization.json
 printf 'feature-row\n' >"$feature"
@@ -259,6 +264,7 @@ if ! sh "$ENTRYPOINT" \
 fi
 
 [ "$(wc -l <"$MONDAY_TEST_VERIFY_CALLS" | tr -d ' ')" -eq 4 ]
+grep -Fx '1789005600000000000|1789006200000000000' "$WORK_ROOT/staged-output/artifacts/materialization/window-args.txt" >/dev/null
 grep -Fx "raw|usdm|1789005600000000000|1789006200000000000|$RAW_ROOT/$raw1_rel.manifest.json|$(printf '%s' "$raw1" | awk -F'|' '{print $2}')" "$MONDAY_TEST_VERIFY_CALLS" >/dev/null
 grep -Fx "reference|usdm|||$REF_ROOT/$ref1_rel.manifest.json|$(printf '%s' "$ref1" | awk -F'|' '{print $2}')" "$MONDAY_TEST_VERIFY_CALLS" >/dev/null
 for rejected_kind in raw reference; do

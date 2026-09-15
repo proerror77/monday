@@ -585,6 +585,29 @@ impl CexCampaignResearchPlanV1 {
                 .label_horizon
                 .as_ref()
                 .context("calendar H1 requires its explicit label horizon")?;
+            if self.comparison_family_trials != Some(138) {
+                bail!("calendar H1 requires the complete 138-trial comparison family");
+            }
+            if self.feature_fields != allowed_research_feature_fields()
+                || self.search_policy_revision.research_delta.is_some()
+                || self.focus_field != "book_imbalance_top5"
+            {
+                bail!(
+                    "calendar H1 requires the unchanged snapshot feature family and GP templates"
+                );
+            }
+            if horizon.labels.observation_frequency_millis != 1_000
+                || !matches!(
+                    (
+                        horizon.labels.horizon_buckets,
+                        horizon.purge_rows,
+                        horizon.embargo_rows
+                    ),
+                    (5, 10, 5) | (10, 20, 10) | (30, 60, 30)
+                )
+            {
+                bail!("calendar H1 requires a registered 5/10/30-second horizon and purge/embargo tuple");
+            }
             if self.holding.as_ref().is_none_or(|holding| {
                 Some(holding.horizon_millis)
                     != horizon
@@ -933,13 +956,11 @@ impl PreparedCexInputs {
             .iter()
             .map(|row| row.available_time)
             .collect::<Vec<_>>();
-        let protocol =
-            calendar
-                .resolve(&clocks)?
-                .bind(approved_evaluation_protocol_for_horizon(
-                    &self.materialization,
-                    plan.label_horizon.as_ref(),
-                )?)?;
+        let base = approved_evaluation_protocol_for_horizon(
+            &self.materialization,
+            plan.label_horizon.as_ref(),
+        )?;
+        let protocol = calendar.resolve(&clocks, &base.labels)?.bind(base)?;
         let policy =
             plan.decision_policy_for_market(rendered_research_market(&self.materialization)?)?;
         let report = alpha_engine::label_precheck::development_label_space_precheck(
@@ -1686,7 +1707,8 @@ pub(crate) mod tests {
     #[test]
     fn calendar_precheck_binds_actual_clocks_and_reuses_verified_snapshot() {
         for horizon in [5, 10, 30] {
-            let fixture = Fixture::with_scope(28_770, None, "usdm", "BTCUSDT", horizon);
+            let count = 28_800 - horizon;
+            let fixture = Fixture::with_scope(count, None, "usdm", "BTCUSDT", horizon);
             let mut inputs =
                 PreparedCexInputs::load(&fixture.feature_path, &fixture.materialization_path, true)
                     .unwrap();
@@ -1705,6 +1727,18 @@ pub(crate) mod tests {
                 validation_end: start + ChronoDuration::hours(6),
                 end: start + ChronoDuration::hours(8),
             });
+            for bound in [None, Some(46), Some(137), Some(139)] {
+                let mut invalid = plan.clone();
+                invalid.comparison_family_trials = bound;
+                assert!(invalid.validate().is_err());
+            }
+            for (h, purge, embargo) in [(60, 120, 60), (5, 5, 5), (10, 20, 5), (30, 60, 31)] {
+                let mut invalid = plan.clone();
+                invalid.label_horizon =
+                    Some(CampaignLabelHorizonV1::new(h, 1000, purge, embargo).unwrap());
+                invalid.holding.as_mut().unwrap().horizon_millis = h as u64 * 1000;
+                assert!(invalid.validate().is_err());
+            }
             assert!(render_prepared_cex_bundle(&inputs, &plan, 7, 138)
                 .unwrap_err()
                 .to_string()
@@ -1755,7 +1789,7 @@ pub(crate) mod tests {
             plan.development_precheck = Some(receipt);
             let rendered = render_prepared_cex_bundle(&inputs, &plan, 7, 138).unwrap();
             let protocol = &rendered.mission.spec.evaluation_protocol;
-            let parts = protocol.row_partitions(28_770).unwrap();
+            let parts = protocol.row_partitions(count).unwrap();
             assert_eq!(parts.selection.as_ref().unwrap().start, 14_400);
             assert_eq!(parts.sealed_holdout.start, 21_600);
             let round_trip = ValidationArgs::from_protocol(protocol)

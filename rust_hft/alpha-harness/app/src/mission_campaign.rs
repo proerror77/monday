@@ -1848,6 +1848,9 @@ fn freeze_prepared_request(
     study_proposal: Option<&CampaignNextFamilyProposalV1>,
 ) -> anyhow::Result<(CampaignRequest, String)> {
     research_plan.validate()?;
+    if research_plan.calendar.is_some() && seeds != [7, 11] {
+        bail!("calendar H1 requires exactly seeds 7 and 11");
+    }
     if let Some(plan) = &research_plan.mlp_training {
         plan.validate_requested_seeds(seeds)
             .map_err(anyhow::Error::msg)?;
@@ -3736,6 +3739,15 @@ pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> 
     }
     request.research_plan.validate()?;
     if request.research_plan.calendar.is_some() {
+        if request
+            .rounds
+            .iter()
+            .map(|round| round.seed)
+            .collect::<Vec<_>>()
+            != [7, 11]
+        {
+            bail!("calendar H1 requires exactly seeds 7 and 11");
+        }
         let precheck = request
             .research_plan
             .development_precheck
@@ -6507,7 +6519,7 @@ mod tests {
             true,
             false,
             if negative { 0.00001 } else { 0.0005 },
-            mission_render::tests::Fixture::new(28_770),
+            mission_render::tests::Fixture::new(28_795),
         );
         let rows = mission_render::tests::read_feature_rows(&fixture._render_fixture.feature_path);
         let start = rows[0].feature_available_time;

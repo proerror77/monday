@@ -68,6 +68,17 @@ are September 11 at 02:00, 06:00, 08:00, and 10:00 respectively. Intervals are
 half-open and use feature decision availability. Native admission resolves the
 row boundaries from actual clocks, preserving warm-up and label-tail exclusions;
 the worker resolves them again. A row count cannot substitute for this calendar.
+Admission allows at most two initial buckets (bucket alignment plus the previous
+book sample) and `h + 1` trailing buckets for label maturity/end alignment. It
+rejects any larger endpoint truncation. The H1 plan requires the exact registered
+5/10/30-second purge/embargo tuples, seeds 7/11, unchanged snapshot GP templates,
+and the complete 138-trial comparison-family correction.
+
+Freeze verifies complete raw blobs that overlap the requested receive window,
+including boundary blobs. The PIT materializer then emits only window-contained
+decisions whose labels mature before the window end, retaining full source hashes.
+It must not discard a five-minute boundary blob because its final receive timestamp
+is a millisecond beyond the nominal window, or quietly accept the resulting gap.
 
 Three expanding search folds remain entirely inside development. Their equal
 validation lengths are derived from the available development rows, preserving

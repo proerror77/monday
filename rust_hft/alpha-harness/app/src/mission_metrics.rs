@@ -158,7 +158,7 @@ fn read_regular_file(path: &Path, limit: u64) -> anyhow::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn existing_output_matches(path: &Path, bytes: &[u8]) -> anyhow::Result<bool> {
+pub(crate) fn existing_output_matches(path: &Path, bytes: &[u8]) -> anyhow::Result<bool> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -177,7 +177,7 @@ fn existing_output_matches(path: &Path, bytes: &[u8]) -> anyhow::Result<bool> {
     Ok(true)
 }
 
-fn persist_immutable_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn persist_immutable_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let mut file = data_mission::temporary_output_file(path, ".monday-model-metrics-")?;
     file.write_all(bytes)?;
     file.as_file().sync_all()?;

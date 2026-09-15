@@ -978,6 +978,9 @@ set -- "$PIT_BIN" \
   --label-horizon-buckets "$label_horizon_buckets" \
   --top-depth "$top_depth" \
   --artifact-dir "$LOCAL_MATERIALIZATION_DIR"
+if [ -n "$window_start_received_at_ns" ]; then
+  set -- "$@" --output-start-received-at-ns "$window_start_received_at_ns" --output-end-received-at-ns "$window_end_received_at_ns"
+fi
 i=1
 while [ "$i" -le "$raw_segment_count" ]; do
   set -- "$@" \

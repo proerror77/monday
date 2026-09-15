@@ -241,7 +241,7 @@ pub fn prepare_dataset(
             .iter()
             .map(|row| row.available_time)
             .collect::<Vec<_>>();
-        if binding.calendar.resolve(&clocks).as_ref() != Ok(binding) {
+        if binding.calendar.resolve(&clocks, &protocol.labels).as_ref() != Ok(binding) {
             return Err(EvaluationError::ProtocolMismatch);
         }
     }

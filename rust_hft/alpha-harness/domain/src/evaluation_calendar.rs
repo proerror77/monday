@@ -1,6 +1,7 @@
 //! UTC calendar admission. Resolve boundaries from decision clocks, never labels.
 use crate::{
-    DomainError, EvaluationProtocolV1, EvaluationSelectionV1, EVALUATION_PROTOCOL_VERSION_V3,
+    DomainError, EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationSelectionV1,
+    EVALUATION_PROTOCOL_VERSION_V3,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -37,11 +38,40 @@ impl EvaluationCalendarV1 {
     pub fn resolve(
         &self,
         clocks: &[DateTime<Utc>],
+        labels: &EvaluationLabelSpecV1,
     ) -> Result<EvaluationCalendarBindingV1, DomainError> {
         self.validate()?;
+        // The materializer samples on bucket boundaries and begins at sample 1
+        // to compute changes from the previous book: at most two initial buckets.
+        // Its forward label removes h trailing buckets, plus the end boundary.
+        // These are fixed algorithmic exclusions, not tolerances learned from data.
+        let millis = i64::try_from(labels.observation_frequency_millis)
+            .ok()
+            .filter(|millis| *millis > 0)
+            .ok_or(DomainError::InvalidEvaluationProtocol)?;
+        let warmup = millis
+            .checked_mul(2)
+            .and_then(chrono::TimeDelta::try_milliseconds)
+            .ok_or(DomainError::InvalidEvaluationProtocol)?;
+        let tail = i64::try_from(labels.horizon_buckets)
+            .ok()
+            .and_then(|h| h.checked_add(1))
+            .and_then(|buckets| buckets.checked_mul(millis))
+            .and_then(chrono::TimeDelta::try_milliseconds)
+            .ok_or(DomainError::InvalidEvaluationProtocol)?;
+        let latest_start = self
+            .start
+            .checked_add_signed(warmup)
+            .ok_or(DomainError::InvalidEvaluationProtocol)?;
+        let earliest_end = self
+            .end
+            .checked_sub_signed(tail)
+            .ok_or(DomainError::InvalidEvaluationProtocol)?;
         if clocks.is_empty()
             || clocks[0] < self.start
+            || clocks[0] > latest_start
             || clocks[clocks.len() - 1] >= self.end
+            || clocks[clocks.len() - 1] < earliest_end
             || clocks.windows(2).any(|pair| pair[0] >= pair[1])
         {
             return Err(DomainError::InvalidEvaluationProtocol);
@@ -144,13 +174,10 @@ mod tests {
         };
         // Real materialization can lose warm-up and label-tail rows. Boundaries
         // must still follow UTC, not an assumed offset from the first row.
-        let clocks = (31..28_770)
-            .map(|i| start + TimeDelta::seconds(i))
-            .collect::<Vec<_>>();
-        let binding = calendar.resolve(&clocks).unwrap();
-        assert_eq!(binding.develop_end_row, 14_369);
-        assert_eq!(binding.validation_end_row, 21_569);
         for horizon in [5, 10, 30] {
+            let clocks = (2..(28_800 - horizon as i64))
+                .map(|i| start + TimeDelta::seconds(i))
+                .collect::<Vec<_>>();
             let protocol = EvaluationProtocolV1::new(
                 EvaluationWalkForwardV1 {
                     initial_train_rows: 7_200,
@@ -177,6 +204,19 @@ mod tests {
                 },
             )
             .unwrap();
+            let binding = calendar.resolve(&clocks, &protocol.labels).unwrap();
+            assert_eq!(binding.develop_end_row, 14_398);
+            assert_eq!(binding.validation_end_row, 21_598);
+            assert!(calendar
+                .resolve(&clocks[3_600..clocks.len() - 3_600], &protocol.labels)
+                .is_err());
+            assert!(calendar.resolve(&clocks[1..], &protocol.labels).is_err());
+            assert!(calendar
+                .resolve(&clocks[..clocks.len() - 1], &protocol.labels)
+                .is_err());
+            let mut drifted = clocks.clone();
+            drifted[14_398] -= TimeDelta::seconds(1);
+            assert!(calendar.resolve(&drifted, &protocol.labels).is_err());
             let bound = binding.bind(protocol).unwrap();
             let parts = bound.row_partitions(clocks.len()).unwrap();
             assert!(clocks[parts.search.end - 1] < calendar.develop_end);
@@ -187,9 +227,5 @@ mod tests {
             assert_eq!(clocks[parts.sealed_holdout.start], calendar.validation_end);
             assert!(bound.row_partitions(clocks.len() + 1).is_err());
         }
-        let mut drifted = clocks.clone();
-        drifted[14_369] -= TimeDelta::seconds(1);
-        assert!(calendar.resolve(&drifted).is_err());
-        assert!(calendar.resolve(&clocks[..20_000]).is_err());
     }
 }

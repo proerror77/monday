@@ -896,8 +896,10 @@ must come from the matching release receipt; discovery does not certify that
 image or start a Job. Archive roots may be read-only mirrors or mounted archive
 views. The command neither downloads source payloads nor changes the collectors.
 
-The freezer selects whole, sealed Spot or USD-M segments contained in the requested
-window and containing the exact symbol. It reuses the slicer's manifest eligibility
+The freezer selects whole, sealed Spot or USD-M segments overlapping the requested
+window and containing the exact symbol. Complete boundary blobs retain their hashes
+and replay context; the native PIT materializer clips output decision times and
+label maturity to the declared half-open window. It reuses the slicer's manifest eligibility
 rules and hashes each selected data/manifest/`_SUCCESS` triplet. Published reference
 batches covering the symbol are verified with the existing reference verifier;
 the selection includes a potential seed up to the existing 90-second derivative
