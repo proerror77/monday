@@ -339,11 +339,18 @@ struct UploadStatus {
     last_error: Option<String>,
 }
 
-fn read_upload_status(spool: &Path) -> UploadStatus {
-    File::open(spool.join("upload-status.json"))
-        .ok()
-        .and_then(|file| serde_json::from_reader(file).ok())
-        .unwrap_or_default()
+fn read_upload_status(spool: &Path) -> Result<UploadStatus> {
+    let path = spool.join("upload-status.json");
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(UploadStatus::default()),
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            serde_json::from_slice(&fs::read(&path)?).with_context(|| {
+                format!("upload status {} is not valid JSON", path.display())
+            })
+        }
+        Ok(_) => bail!("upload status must be a regular non-symlink file"),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn write_upload_status(spool: &Path, status: &UploadStatus) -> Result<()> {
@@ -656,7 +663,7 @@ async fn upload_pending(config: Config) -> Result<usize> {
     if recovered > 0 {
         info!(segments = recovered, "recovered interrupted raw segment cleanups");
     }
-    let mut status = read_upload_status(&config.spool_dir);
+    let mut status = read_upload_status(&config.spool_dir)?;
     let mut uploaded = 0;
     let mut failures = 0;
     for entry in fs::read_dir(&config.spool_dir)? {
@@ -1001,7 +1008,7 @@ fn write_health(
 ) -> Result<()> {
     let (disk_free_gb, spool_usage_bytes, disk_warning, spool_warning) =
         spool_disk_state(config);
-    let upload = read_upload_status(&config.spool_dir);
+    let upload = read_upload_status(&config.spool_dir)?;
     let upload_warning = upload.failure_count > 0;
     write_json_atomic(
         &config.spool_dir.join("health.json"),
@@ -1251,5 +1258,19 @@ mod tests {
             request.headers().get("app_id").unwrap(),
             &format!("{DEFAULT_USER_AGENT_PREFIX}/{BUILD_SOURCE_REVISION}")
         );
+    }
+
+    #[test]
+    fn corrupt_upload_status_does_not_reset_failure_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = dir.path().join("upload-status.json");
+        let payload = br#"{"failure_count":3, not json"#;
+        fs::write(&status, payload).unwrap();
+        let error = read_upload_status(dir.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("not valid JSON"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(fs::read(&status).unwrap(), payload);
     }
 }
