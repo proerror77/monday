@@ -1225,6 +1225,7 @@ mod tests {
                 controller_image: format!("registry/controller@sha256:{}", "f".repeat(64)),
                 job_cpu_millis: 3500,
                 job_memory_mib: 12288,
+                accelerator: alpha_domain::research_accelerator::ResearchAcceleratorV1::Cpu,
             },
             selected_results: BTreeMap::from([(operation.clone(), "f".repeat(64))]),
             max_candidates: 4,

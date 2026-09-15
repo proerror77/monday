@@ -72,7 +72,9 @@ Recommended first production shape:
 - Autoscaled Spot worker pool, `ecs.u1-c1m4.xlarge` (4 vCPU / 16 GiB), with a
   40 GiB PL0 system disk and 100 GiB PL1 work disk. The pool is labeled
   `workload=backtest`, scales from zero to four nodes, and returns to zero after
-  jobs finish.
+  jobs finish. This is the admitted CPU research accelerator. Do not add GPU
+  nodes or `nvidia.com/gpu` to speed training; see
+  [ACK research accelerator](../../../docs/research/ACK_RESEARCH_ACCELERATOR.md).
 - One backtest Pod per worker; each Pod processes a batch of parameters.
 - A prebuilt runner image from `rust_hft/deployment/docker/Dockerfile.research`.
 - A separate ACK controller image from
@@ -134,7 +136,8 @@ not fully price.
    create a separate read/write application account afterward.
 3. Create an ACK Standard cluster, the small system node pool, and the Spot
    research node pool. Label research nodes `workload=backtest`. Do not place
-   the trading runtime or its credentials in this cluster.
+   the trading runtime or its credentials in this cluster. Do not create a GPU
+   pool unless a merged Campaign grant binds `accelerator: cuda_gpu`.
 4. Publish the research image once per source revision. Parameter changes reuse
    the same immutable image and do not compile Rust again.
 5. Apply the namespace, create the ClickHouse connection Secret, create the

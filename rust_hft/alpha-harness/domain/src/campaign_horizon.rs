@@ -224,6 +224,7 @@ mod tests {
             controller_image: format!("registry/controller@sha256:{}", "6".repeat(64)),
             job_cpu_millis: 1,
             job_memory_mib: 1,
+            accelerator: crate::research_accelerator::ResearchAcceleratorV1::Cpu,
         }
     }
 

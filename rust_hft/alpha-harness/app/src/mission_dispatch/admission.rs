@@ -18,6 +18,7 @@ use alpha_domain::{
         VerifiedCampaignRootGrant, ATTEMPT_SCHEMA,
     },
     canonical_json_hash,
+    research_accelerator::bind_pod_spec_accelerator,
 };
 use alpha_store::{
     campaign_ledger::{
@@ -235,6 +236,8 @@ pub(super) fn reconstruct_binding(
         job_memory_mib: memory_gib
             .checked_mul(1024)
             .context("Job memory overflow")?,
+        accelerator: bind_pod_spec_accelerator(&job["spec"]["template"]["spec"])
+            .map_err(anyhow::Error::msg)?,
     };
     execution.validate()?;
     if let Some(proposal) = request.study_proposal.as_ref() {
