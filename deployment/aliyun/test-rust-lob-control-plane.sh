@@ -69,6 +69,25 @@ gate_publish_dir_line=$(grep -nF "mv -- \"\$evidence_dir\" \"\$final_evidence_di
   exit 1
 }
 
+# Effective instance configuration must agree with the production contract.
+# This models an old pinned instance alias overriding a newly updated template.
+(
+  systemctl() {
+    case "$1 $2 $3 $4" in
+      'show binance-lob-archiver-production@spot.service --property=RuntimeMaxUSec --value') printf 'infinity\n' ;;
+      'show binance-lob-archiver-production@usdm.service --property=RuntimeMaxUSec --value') printf '%s\n' "$fixture_lifetime" ;;
+      *) return 1 ;;
+    esac
+  }
+  fixture_lifetime=infinity
+  monday_rust_lob_verify_systemd_production_lifetime
+  fixture_lifetime=6h
+  if monday_rust_lob_verify_systemd_production_lifetime; then
+    printf 'effective lifetime check accepted a stale six-hour instance alias\n' >&2
+    exit 1
+  fi
+)
+
 # Recovery authority must cross a durability barrier before active=C1, and
 # Gate-bearing success evidence must be durable before that authority is
 # removed.  Readback alone proves bytes, not power-loss ordering.
@@ -1783,6 +1802,36 @@ for asset in \
   cp -p -- "$ROOT/opt/monday/releases/binance-lob-controller/$c0/deployment/$asset" \
     "$production_verify_dir/$asset"
 done
+# Include the slice and prove the untouched fixture passes before negative
+# assertions; otherwise all mutations could fail only because an asset is absent.
+cp -p -- "$SCRIPT_DIR/$production_slice_asset" "$production_verify_dir/$production_slice_asset"
+production_runtime=$(monday_verify_production_runtime_assets "$ROOT" "$production_verify_dir" "$p0_sha")
+jq -e '.schema == "monday.rust_lob_production_runtime.v3"
+  and .runtime_max_sec == "infinity" and .restart == "always"
+  and .memory_high == "2048M" and .memory_max == "2560M"' <<<"$production_runtime" >/dev/null
+for invalid_lifetime in 21600 43200 0; do
+  chmod u+w "$production_verify_dir/binance-lob-archiver-production@.service"
+  sed -i.bak "s/^RuntimeMaxSec=.*/RuntimeMaxSec=$invalid_lifetime/" \
+    "$production_verify_dir/binance-lob-archiver-production@.service"
+  rm -f "$production_verify_dir/binance-lob-archiver-production@.service.bak"
+  if monday_verify_production_runtime_assets "$ROOT" "$production_verify_dir" "$p0_sha" >/dev/null; then
+    printf 'production accepted unreviewed lifetime %s\n' "$invalid_lifetime" >&2
+    exit 1
+  fi
+  cp -p -- "$SCRIPT_DIR/binance-lob-archiver-production@.service" \
+    "$production_verify_dir/binance-lob-archiver-production@.service"
+done
+# Both independently implemented Gate validators reject the former lifetime,
+# even if the rest of the otherwise valid signed evidence is untouched.
+jq '.production_runtime.runtime_max_sec = 21600' "$gate" >"$tampered"
+if monday_validate_v2_gate "$tampered" direct "$c0" "$(monday_sha256_file "$tampered")" >/dev/null 2>&1; then
+  printf 'Gate validator accepted the former six-hour production lifetime\n' >&2
+  exit 1
+fi
+if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$tampered" >/dev/null 2>&1; then
+  printf 'Gate policy accepted the former six-hour production lifetime\n' >&2
+  exit 1
+fi
 sed -i.bak 's/^User=hftcollector$/User=untrusted/' \
   "$production_verify_dir/binance-lob-archiver-production@.service"
 rm -f -- "$production_verify_dir/binance-lob-archiver-production@.service.bak"

@@ -51,6 +51,9 @@ const USDM_TOP100_LOB_TRADE_SHADOW_DATASET: &str =
 #[derive(Debug, Parser)]
 #[command(name = "binance-lob-archiver", version = BUILD_SOURCE_REVISION)]
 struct Args {
+    #[arg(long, conflicts_with_all = ["self_test", "upload_only", "recover_parts_only", "verify_segment"])]
+    audit_archive_index: Option<PathBuf>,
+
     #[arg(long)]
     self_test: bool,
 
@@ -1245,6 +1248,15 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let args = Args::parse();
+    if let Some(path) = &args.audit_archive_index {
+        let report = hft_collector::archive_continuity::audit_archive_index(path)?;
+        println!("{}", serde_json::to_string(&report)?);
+        anyhow::ensure!(
+            report["native_tape_verification"] == "passed",
+            "archive continuity verification failed"
+        );
+        return Ok(());
+    }
     if args.self_test {
         return self_test();
     }
@@ -4958,6 +4970,9 @@ async fn upload_pending_with_status(config: &UploadConfig) -> anyhow::Result<usi
 
 fn apply_upload_outcome(status: &mut UploadStatus, outcome: &LobUploadOutcome) {
     let now = chrono::Utc::now().to_rfc3339();
+    hft_collector::archive_continuity::merge_recent_segments(
+        &mut status.archive_segments, &outcome.archive_segments,
+    );
     status.updated_at = Some(now.clone());
     status.discovery_failed = false;
     status.uploaded_batches = outcome.uploaded as u64;
@@ -5036,6 +5051,9 @@ where
                     outcome.retried += 1;
                 } else {
                     outcome.uploaded += 1;
+                }
+                if let Some(archive) = &segment.archive {
+                    outcome.archive_segments.push(archive.clone());
                 }
                 outcome.last_uploaded = Some(segment);
             }
@@ -5281,6 +5299,7 @@ fn sync_parent_directory(path: &Path) -> anyhow::Result<()> {
 
 #[derive(Debug)]
 struct UploadedSegment {
+    archive: Option<hft_collector::archive_continuity::ArchiveSegment>,
     retried: bool,
     object: String,
     object_prefix: String,
@@ -5291,6 +5310,7 @@ struct UploadedSegment {
 
 #[derive(Debug, Default)]
 struct LobUploadOutcome {
+    archive_segments: Vec<hft_collector::archive_continuity::ArchiveSegment>,
     uploaded: usize,
     retried: usize,
     pending_batches: u64,
@@ -5483,13 +5503,15 @@ where
         let marker = write_uploaded_cleanup_marker(&data, manifest, &success)?;
         cleanup_uploaded_marker(&marker)?;
     }
+    let object = format!("oss://{}/{prefix}/{}", config.oss_bucket, local_file_name(&data)?);
     Ok(UploadedSegment {
+        archive: hft_collector::archive_continuity::ArchiveSegment::from_manifest(
+            &metadata,
+            object.clone(),
+            manifest_sha256.clone(),
+        ).ok(),
         retried,
-        object: format!(
-            "oss://{}/{prefix}/{}",
-            config.oss_bucket,
-            local_file_name(&data)?
-        ),
+        object,
         object_prefix: prefix,
         data_sha256: digest,
         manifest_sha256,
@@ -6928,10 +6950,12 @@ mod tests {
     fn upload_status_records_the_upload_receipt() {
         let dirs = UploadTestDir::new();
         let outcome = LobUploadOutcome {
+            archive_segments: Vec::new(),
             uploaded: 1,
             retried: 0,
             pending_batches: 2,
             last_uploaded: Some(UploadedSegment {
+                archive: None,
                 retried: false,
                 object: "oss://test-bucket/lake/raw/part-1.jsonl.zst".into(),
                 object_prefix: "lake/raw".into(),
@@ -6981,6 +7005,7 @@ mod tests {
             ..UploadStatus::default()
         };
         let outcome = LobUploadOutcome {
+            archive_segments: Vec::new(),
             uploaded: 0,
             retried: 0,
             pending_batches: 1,

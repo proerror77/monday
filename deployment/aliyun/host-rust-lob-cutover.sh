@@ -173,6 +173,7 @@ if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
               fi
             fi
             printf '%s\n' "$fixture_pid" ;;
+          RuntimeMaxUSec) printf '%s\n' "${MONDAY_CUTOVER_FIXTURE_RUNTIME_MAX:-infinity}" ;;
           NRestarts) printf '%s\n' "${MONDAY_CUTOVER_FIXTURE_RESTARTS:-0}" ;;
           *) printf '\n' ;;
         esac
@@ -808,6 +809,8 @@ if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
     || die 'could not unmask V2 production lanes'
   systemctl enable binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service \
     || die 'could not enable V2 production lanes before start'
+  monday_rust_lob_verify_systemd_production_lifetime \
+    || die 'loaded production lifetime differs from the continuous capture contract'
   systemctl start binance-lob-archiver-production@spot.service \
     || die 'Spot did not start after pair commit'
   systemctl start binance-lob-archiver-production@usdm.service \

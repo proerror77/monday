@@ -720,7 +720,7 @@ monday_unit_normalized() {
         'Service|ExecStart|/opt/monday/bin/binance-lob-archiver'
         'Service|Restart|always'
         'Service|RestartSec|5'
-        'Service|RuntimeMaxSec|21600'
+        'Service|RuntimeMaxSec|infinity'
         'Service|KillMode|mixed'
         'Service|TimeoutStartSec|120'
         'Service|TimeoutStopSec|600'
@@ -1057,7 +1057,7 @@ monday_verify_production_runtime_assets() {
   monday_unit_exact_line "$service" ExecStart /opt/monday/bin/binance-lob-archiver || return 1
   monday_unit_exact_line "$service" Restart always || return 1
   monday_unit_exact_line "$service" RestartSec 5 || return 1
-  monday_unit_exact_line "$service" RuntimeMaxSec 21600 || return 1
+  monday_unit_exact_line "$service" RuntimeMaxSec infinity || return 1
   monday_unit_exact_line "$service" KillMode mixed || return 1
   monday_unit_exact_line "$service" TimeoutStartSec 120 || return 1
   monday_unit_exact_line "$service" TimeoutStopSec 600 || return 1
@@ -1135,7 +1135,7 @@ monday_verify_production_runtime_assets() {
     --arg spot_sha "$spot_sha" --arg usdm_sha "$usdm_sha" \
     --argjson markets "$markets_json" \
     --arg service_semantics_sha "$service_semantics_sha" --arg upload_semantics_sha "$upload_semantics_sha" \
-    '{schema:"monday.rust_lob_production_runtime.v2",slice:"system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice",slice_memory_high:"3072M",slice_memory_max:"3584M",slice_sha256:$slice_sha,slice_semantics_sha256:$slice_semantics_sha,exec_start:"/opt/monday/bin/binance-lob-archiver",environment_file:"/etc/monday/binance-lob-archiver-production-%i.env",user:"hftcollector",group:"hftcollector",restart:"always",restart_sec:5,runtime_max_sec:21600,kill_mode:"mixed",timeout_start_sec:120,timeout_stop_sec:600,type:"simple",cpu_quota:"80%",memory_high:"2048M",memory_max:"2560M",sandbox:{no_new_privileges:true,private_tmp:true,protect_system:"strict",protect_home:true,protect_kernel_tunables:true,protect_kernel_modules:true,protect_control_groups:true,lock_personality:true,restrict_suidsgid:true,state_directory:"hft-collector",read_write_paths:["/data/monday/spool/binance-lob","/data/monday/spool/binance-lob-recovery"]},upload:{type:"oneshot",exec_start:"/opt/monday/bin/binance-lob-archiver --upload-only",environment_file:"/etc/monday/binance-lob-archiver-production-%i.env",cpu_quota:"80%",memory_high:"384M",memory_max:"512M",timeout_start_sec:0},unit_sha256:{collector:$service_sha,upload:$upload_sha,slice:$slice_sha},unit_semantics_sha256:{collector:$service_semantics_sha,upload:$upload_semantics_sha,slice:$slice_semantics_sha},env_sha256:{spot:$spot_sha,usdm:$usdm_sha},markets:$markets}') || return 1
+    '{schema:"monday.rust_lob_production_runtime.v3",slice:"system-binance\\x2dlob\\x2darchiver\\x2dproduction.slice",slice_memory_high:"3072M",slice_memory_max:"3584M",slice_sha256:$slice_sha,slice_semantics_sha256:$slice_semantics_sha,exec_start:"/opt/monday/bin/binance-lob-archiver",environment_file:"/etc/monday/binance-lob-archiver-production-%i.env",user:"hftcollector",group:"hftcollector",restart:"always",restart_sec:5,runtime_max_sec:"infinity",kill_mode:"mixed",timeout_start_sec:120,timeout_stop_sec:600,type:"simple",cpu_quota:"80%",memory_high:"2048M",memory_max:"2560M",sandbox:{no_new_privileges:true,private_tmp:true,protect_system:"strict",protect_home:true,protect_kernel_tunables:true,protect_kernel_modules:true,protect_control_groups:true,lock_personality:true,restrict_suidsgid:true,state_directory:"hft-collector",read_write_paths:["/data/monday/spool/binance-lob","/data/monday/spool/binance-lob-recovery"]},upload:{type:"oneshot",exec_start:"/opt/monday/bin/binance-lob-archiver --upload-only",environment_file:"/etc/monday/binance-lob-archiver-production-%i.env",cpu_quota:"80%",memory_high:"384M",memory_max:"512M",timeout_start_sec:0},unit_sha256:{collector:$service_sha,upload:$upload_sha,slice:$slice_sha},unit_semantics_sha256:{collector:$service_semantics_sha,upload:$upload_semantics_sha,slice:$slice_semantics_sha},env_sha256:{spot:$spot_sha,usdm:$usdm_sha},markets:$markets}') || return 1
   printf '%s\n' "$production_json"
 }
 
@@ -1317,8 +1317,8 @@ monday_validate_lob_production_snapshot() {
 }
 
 # Emit the stable production contract for comparison between the Gate start and
-# every later resource-monitor sample.  The six-hour lifecycle restart may
-# change PID/NRestarts; each full snapshot still proves cgroup membership,
+# every later resource-monitor sample. A baseline restart may change
+# PID/NRestarts; each full snapshot still proves cgroup membership,
 # active state, executable digest, limits, and OOM counters independently.
 monday_lob_production_snapshot_identity() {
   [[ $# -eq 1 ]] || return 2
@@ -1343,6 +1343,18 @@ monday_lob_production_snapshot_identity() {
 # Verify only the signed production slice configuration.  Cutover/Restore
 # call this after daemon-reload and before starting either lane; child
 # membership is checked separately once both lanes are active.
+# Read effective values after systemd has resolved concrete instance aliases and
+# drop-ins. Template bytes alone cannot prove the lifetime of a loaded service.
+monday_rust_lob_verify_systemd_production_lifetime() {
+  [[ $# -eq 0 ]] || return 2
+  local market lifetime
+  for market in spot usdm; do
+    lifetime=$(systemctl show "binance-lob-archiver-production@${market}.service" \
+      --property=RuntimeMaxUSec --value) || return 1
+    [[ $lifetime == infinity ]] || return 1
+  done
+}
+
 monday_rust_lob_verify_systemd_production_slice_configured() {
   [[ $# -eq 1 ]] || return 2
   local slice='system-binance\x2dlob\x2darchiver\x2dproduction.slice'
@@ -1602,7 +1614,7 @@ monday_validate_v2_gate() {
       and (.before.production_assets | valid_production_asset_map($production_asset_keys; $root.source_mode))
       and (.production_assets | valid_production_asset_map($production_asset_keys; $root.source_mode))
       and (.production_runtime | type == "object"
-        and .schema == "monday.rust_lob_production_runtime.v2"
+        and .schema == "monday.rust_lob_production_runtime.v3"
         and (.slice | valid_lob_slice)
         and .slice_memory_high == "3072M"
         and .slice_memory_max == "3584M"
@@ -1615,7 +1627,7 @@ monday_validate_v2_gate() {
         and .group == "hftcollector"
         and .restart == "always"
         and .restart_sec == 5
-        and .runtime_max_sec == 21600
+        and .runtime_max_sec == "infinity"
         and .kill_mode == "mixed"
         and .timeout_start_sec == 120
         and .timeout_stop_sec == 600

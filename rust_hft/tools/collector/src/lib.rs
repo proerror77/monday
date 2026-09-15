@@ -1,5 +1,6 @@
 #![allow(unexpected_cfgs)]
 
+pub mod archive_continuity;
 pub mod binance_fee_artifact;
 pub mod binance_fee_upload;
 pub mod binance_spot_reference_artifact;

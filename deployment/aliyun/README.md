@@ -197,10 +197,14 @@ Every other check is a warning — reported in the JSON `warnings` array and as
 | Fee snapshot failures | > 0 `Failed with result` journald lines per fee snapshot unit in the last 10 minutes |
 | `/data` mount | `mountpoint -q /data` fails (the monitor must DETECT a missing mount, not gate on it) |
 
-The persistent-service check deliberately does not warn on `NRestarts > 0`:
-both Binance archivers restart every six hours by design
-(`RuntimeMaxSec=21600`). Crash loops are detected through `Result != success`
-or an `NRestarts` delta greater than one between consecutive five-minute polls.
+Production Binance LOB capture has no scheduled lifetime limit
+(`RuntimeMaxSec=infinity`): a six-hour restart would necessarily interrupt
+every eight-hour research window. Shadow/Gate jobs retain finite deadlines.
+The persistent-service check uses restart deltas rather than lifetime counts;
+crash loops are detected through `Result != success` or an `NRestarts` delta
+greater than one between consecutive five-minute polls. Process health does
+not prove archive continuity. A new snapshot after reconnect does not restore
+unrecorded depth events.
 Production startup is bounded at 120 seconds. Five failed starts inside the
 two-hour `StartLimitIntervalSec` stop automatic retries instead of allowing a
 slow `ExecStartPre` to roll out of the rate-limit window and loop indefinitely.
@@ -250,6 +254,43 @@ systemctl status monday-collector-health.service --no-pager -n 5
 
 The service must NOT add `ConditionPathIsMountPoint=/data`: the whole point of
 the mount check is to detect and alert when `/data` is missing.
+
+### Continuous Binance research windows
+
+The collector's `health.json.archive_coverage` and host monitor report the
+recording spans of the most recent 512 successfully read-back uploads. They
+retain capture-session IDs and object/manifest hashes in
+`upload-status.json.archive_segments`. A recording gap (including a one-nanosecond
+seam gap), overlap, session/symbol change or unsafe segment breaks the span;
+hour and date directory boundaries do not. Restarted or damaged status starts
+with unknown/empty evidence; it never fabricates the missing past. The original
+OSS objects remain the complete history.
+
+`eight_hour_candidate_available` is manifest coverage only. Its
+`native_tape_verification` and `calendar_admission` stay `pending`. Neither
+process health, hour presence nor upload success constitutes research admission.
+
+For independent readback, download the immutable triplets to a task-owned
+validation location and freeze an index with external SHA-256 anchors:
+
+```json
+{"schema":"monday.archive_continuity_index.v1","start_ns":1789430400000000000,"end_ns":1789459200000000000,"segments":[{"data_path":"/work/task/part-....jsonl.zst","object":"oss://bucket/lake/raw/.../part-....jsonl.zst","data_sha256":"<64 hex>","manifest_sha256":"<64 hex>"}]}
+```
+
+List all required segments in recording order, including the segment that
+covers each window endpoint. Run `binance-lob-archiver --audit-archive-index
+/work/task/index.json` and preserve stdout plus the exit code. This uses the
+native sequence, trade, checkpoint, manifest and `_SUCCESS` checks across the
+entire window, loading one decoded segment at a time. A failed chain emits a
+negative report and exits nonzero. `eight_hour_tape_available` requires a
+verified window of at least eight hours; native materialization and per-second
+calendar admission are still required separately. Manifest or index parse/hash
+errors fail before a report is emitted.
+
+Removing the six-hour systemd deadline does not provide seamless WebSocket
+handover. A disconnected depth shard invalidates affected books and requests
+new snapshots; unsafe intervals remain excluded. Deliberate disconnects and
+connection expiry beyond 24 hours need their own overlap/handover verification.
 
 ### Data completeness check
 

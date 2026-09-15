@@ -580,6 +580,20 @@ fn segment_series_scope(segment: &SealedBinanceMarketTapeTriplet) -> Result<Segm
     })
 }
 
+/// Verify an ordered, continuous archive while holding only one decoded segment.
+/// The iterator must supply externally anchored triplets in recording order.
+/// All original row, book, trade and manifest checks remain active across seams.
+pub fn verify_binance_market_tape_archive(
+    sealed: impl IntoIterator<Item = Result<SealedBinanceMarketTapeTriplet>>,
+) -> Result<Vec<BinanceMarketTapeSegmentIdentity>> {
+    let mut sealed = sealed.into_iter();
+    let first = sealed.next().context("market-tape segment set is empty")??;
+    let require_trades = !manifest_is_usdm_lob_only(&first.manifest);
+    verify_ordered_market_tape(
+        std::iter::once(Ok(first)).chain(sealed), require_trades, true, false, true,
+    ).map(|verified| verified.segments)
+}
+
 fn verify_binance_market_tape_with_requirements_and_surfaces(
     mut sealed: Vec<SealedBinanceMarketTapeTriplet>,
     require_trade_summaries: bool,
@@ -598,10 +612,25 @@ fn verify_binance_market_tape_with_requirements_and_surfaces(
             .cmp(&right.manifest.start_received_at_ns)
             .then_with(|| left.manifest.file.cmp(&right.manifest.file))
     });
-    let market = Market::from_str(&sealed[0].manifest.market).map_err(anyhow::Error::msg)?;
-    let dataset = sealed[0].manifest.dataset.clone();
-    let shard_id = sealed[0].manifest.shard_id.clone();
-    let symbols = sealed[0]
+    verify_ordered_market_tape(
+        sealed.into_iter().map(Ok), require_trade_summaries,
+        require_lob_continuity, collect_surfaces, false,
+    )
+}
+
+fn verify_ordered_market_tape(
+    sealed: impl IntoIterator<Item = Result<SealedBinanceMarketTapeTriplet>>,
+    require_trade_summaries: bool,
+    require_lob_continuity: bool,
+    collect_surfaces: bool,
+    require_adjacent_boundaries: bool,
+) -> Result<VerifiedBinanceMarketTape> {
+    let mut sealed = sealed.into_iter();
+    let first = sealed.next().context("market-tape segment set is empty")??;
+    let market = Market::from_str(&first.manifest.market).map_err(anyhow::Error::msg)?;
+    let dataset = first.manifest.dataset.clone();
+    let shard_id = first.manifest.shard_id.clone();
+    let symbols = first
         .manifest
         .symbols
         .iter()
@@ -619,7 +648,7 @@ fn verify_binance_market_tape_with_requirements_and_surfaces(
             ))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
-    let mut identities = Vec::with_capacity(sealed.len());
+    let mut identities = Vec::new();
     let mut aggregate_trades = Vec::new();
     let mut lob_observations = Vec::new();
     let mut replayed_events: BTreeMap<String, Vec<ReplayedBinanceBookEvent>> = if collect_surfaces {
@@ -639,13 +668,14 @@ fn verify_binance_market_tape_with_requirements_and_surfaces(
     let mut raw_trade_receive_clocks = depth_receive_clocks.clone();
     let mut book_ticker_receive_clocks = depth_receive_clocks.clone();
     let mut force_order_receive_clocks = depth_receive_clocks.clone();
-    let stream_contract = sealed[0].manifest.stream_types.as_ref().map(|types| {
+    let stream_contract = first.manifest.stream_types.as_ref().map(|types| {
         types.iter().cloned().collect::<BTreeSet<_>>()
     });
     let mut highest_received_at_ns = None;
     let mut previous_segment_end_received_at_ns = None;
 
-    for segment in sealed {
+    for segment in std::iter::once(Ok(first)).chain(sealed) {
+        let segment = segment?;
         let segment_stream_contract = segment.manifest.stream_types.as_ref().map(|types| {
             types.iter().cloned().collect::<BTreeSet<_>>()
         });
@@ -679,7 +709,14 @@ fn verify_binance_market_tape_with_requirements_and_surfaces(
         {
             bail!("market-tape receive time moved backwards across segments");
         }
+        if require_adjacent_boundaries && previous_segment_end_received_at_ns
+            .is_some_and(|last| segment.manifest.start_received_at_ns != last)
+        {
+            bail!("market-tape archive has a gap between recording boundaries");
+        }
         previous_segment_end_received_at_ns = Some(segment.manifest.end_received_at_ns);
+        let mut recorded_start = u64::MAX;
+        let mut recorded_end = 0;
         let mut counts = BTreeMap::<String, u64>::new();
         let mut trade_summaries = AggregateTradeSummaryBuilder::default();
         let mut lob_continuity = LobContinuitySummaryBuilder::new(symbols.iter().cloned())?;
@@ -696,6 +733,8 @@ fn verify_binance_market_tape_with_requirements_and_surfaces(
                 .ok_or_else(|| anyhow!("market-tape row must be an object"))?;
             let (event_type, row_session_id, received_at_ns) =
                 validate_row(raw, &segment.manifest)?;
+            recorded_start = recorded_start.min(received_at_ns);
+            recorded_end = recorded_end.max(received_at_ns);
             lob_continuity.observe(raw)?;
             if event_type == "session_start"
                 && highest_received_at_ns.is_some_and(|last| received_at_ns < last)
@@ -1078,6 +1117,10 @@ fn verify_binance_market_tape_with_requirements_and_surfaces(
                 }
                 _ => bail!("incomplete market-tape event {event_type}"),
             }
+        }
+        if require_adjacent_boundaries && (recorded_start != segment.manifest.start_received_at_ns
+            || recorded_end != segment.manifest.end_received_at_ns) {
+            bail!("archive manifest boundaries do not match recorded rows");
         }
         if audited_stale_raw_trade_symbols
             != segment
@@ -2844,6 +2887,70 @@ mod tests {
                 ReplayedBinanceBookEvent::Checkpoint { .. },
             ]
         ));
+    }
+
+    #[test]
+    fn archive_verifier_preserves_row_checks_and_rejects_missing_recording_time() {
+        for gap_ns in [0, 1, 7_000_000_000] {
+            let root = tempdir();
+            let rows = with_stream_coverage(valid_rows(), &["BTCUSDT"]);
+            let (first, _) = write_triplet(root.path(), &rows);
+            let _ = add_trade_summaries(&first, one_trade_summary("2"));
+            let first_anchor = add_lob_continuity(&first, &rows, &["BTCUSDT"]);
+            let seam = START_NS + 400_000_000 + gap_ns;
+            let mut opening = checkpoint_row(seam, 101);
+            opening["reason"] = json!("segment_open");
+            let second_rows = with_stream_coverage(vec![opening,
+                depth_row(seam + 100_000_000, 102, 101),
+                trade_row(seam + 150_000_000, 11),
+                checkpoint_row(seam + 200_000_000, 102)], &["BTCUSDT"]);
+            let (second, _) = write_triplet(root.path(), &second_rows);
+            let mut trade_summary = AggregateTradeSummaryBuilder::default();
+            trade_summary.observe(&AggregateTrade::from_archived_event(
+                trade_row(seam + 150_000_000, 11).as_object().unwrap(), seam + 150_000_000,
+            ).unwrap()).unwrap();
+            let _ = add_trade_summaries(&second, serde_json::to_value(trade_summary.finish().unwrap()).unwrap());
+            let second_anchor = add_lob_continuity(&second, &second_rows, &["BTCUSDT"]);
+            let result = verify_binance_market_tape_archive([
+                seal_binance_market_tape_triplet(&first, &first_anchor),
+                seal_binance_market_tape_triplet(&second, &second_anchor),
+            ]);
+            if gap_ns == 0 {
+                assert_eq!(result.unwrap().len(), 2);
+            } else {
+                assert!(result.unwrap_err().to_string().contains("gap between recording boundaries"));
+            }
+        }
+    }
+
+    #[test]
+    fn archive_verifier_rejects_manifest_padding() {
+        let root = tempdir();
+        let rows = with_stream_coverage(valid_rows(), &["BTCUSDT"]);
+        let (triplet, _) = write_triplet(root.path(), &rows);
+        let _ = add_trade_summaries(&triplet, one_trade_summary("2"));
+        let _ = add_lob_continuity(&triplet, &rows, &["BTCUSDT"]);
+        let anchor = rewrite_manifest(&triplet, |manifest| {
+            manifest["end_received_at_ns"] = json!(START_NS + 8 * 3600 * 1_000_000_000);
+        });
+        let result = verify_binance_market_tape_archive([
+            seal_binance_market_tape_triplet(&triplet, &anchor),
+        ]);
+        assert!(result.unwrap_err().to_string().contains("boundaries do not match recorded rows"));
+    }
+
+    #[test]
+    fn archive_verifier_propagates_later_read_failure() {
+        let root = tempdir();
+        let rows = with_stream_coverage(valid_rows(), &["BTCUSDT"]);
+        let (triplet, _) = write_triplet(root.path(), &rows);
+        let _ = add_trade_summaries(&triplet, one_trade_summary("2"));
+        let anchor = add_lob_continuity(&triplet, &rows, &["BTCUSDT"]);
+        let result = verify_binance_market_tape_archive([
+            seal_binance_market_tape_triplet(&triplet, &anchor),
+            Err(anyhow!("object missing")),
+        ]);
+        assert!(result.unwrap_err().to_string().contains("object missing"));
     }
 
     #[test]

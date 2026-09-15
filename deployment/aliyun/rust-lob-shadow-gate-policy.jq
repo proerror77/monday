@@ -151,7 +151,7 @@ and (.before | type == "object"
   and (.production_assets | valid_production_asset_map($production_asset_keys; $root.source_mode)))
 and (.production_assets | valid_production_asset_map($production_asset_keys; $root.source_mode))
 and (.production_runtime | type == "object"
-  and .schema == "monday.rust_lob_production_runtime.v2"
+  and .schema == "monday.rust_lob_production_runtime.v3"
   and (.slice | valid_lob_slice)
   and .slice_memory_high == "3072M"
   and .slice_memory_max == "3584M"
@@ -164,7 +164,7 @@ and (.production_runtime | type == "object"
   and .group == "hftcollector"
   and .restart == "always"
   and .restart_sec == 5
-  and .runtime_max_sec == 21600
+  and .runtime_max_sec == "infinity"
   and .kill_mode == "mixed"
   and .timeout_start_sec == 120
   and .timeout_stop_sec == 600
