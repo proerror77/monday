@@ -291,6 +291,8 @@ struct CampaignRoundFeedbackV1 {
     supervised_selected_candidate_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     supervised_replay: Option<CampaignReplayFeedbackV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    calendar_validation: Option<CampaignEvaluationFeedbackV1>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -458,6 +460,9 @@ pub fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
         bail!("campaign request SHA256 mismatch");
     }
     validate_request_for_execute(&loaded.request)?;
+    if loaded.request.research_plan.calendar.is_some() && !args.pre_holdout {
+        bail!("fixed calendar H1 must stop at pre-holdout");
+    }
     if loaded.request.campaign_id != args.campaign_id {
         bail!("campaign request does not match the requested Campaign ID");
     }
@@ -1166,6 +1171,8 @@ fn follow_up_plan(
         bail!("declared follow-up feature subset removed the focus field");
     }
     let plan = CexCampaignResearchPlanV1 {
+        calendar: None,
+        development_precheck: None,
         supervised_model_scope: loaded.request.research_plan.supervised_model_scope,
         holding: loaded.request.research_plan.holding.clone(),
         comparison_family_trials: loaded.request.research_plan.comparison_family_trials,
@@ -1378,7 +1385,11 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
 
     // Independent worker admission happens once; all seeds render from that
     // same verified snapshot instead of reimporting bulk features per round.
-    let render_inputs = PreparedCexInputs::load(&feature_path, &materialization_path)?;
+    let render_inputs = PreparedCexInputs::load(
+        &feature_path,
+        &materialization_path,
+        loaded.request.research_plan.calendar.is_some(),
+    )?;
     let mut ledgers = Vec::with_capacity(loaded.request.rounds.len());
     let mut selected_round = None;
     let mut selected_mission = None;
@@ -1717,6 +1728,7 @@ struct ValidatedCampaignInputSet {
 
 fn validated_campaign_inputs(
     args: &CampaignFreezeArgs,
+    retain_calendar_rows: bool,
 ) -> anyhow::Result<ValidatedCampaignInputSet> {
     let (receipt, campaign_inputs_sha256) = load_campaign_inputs_receipt(&args.campaign_inputs)?;
     validate_campaign_inputs_receipt(&receipt)?;
@@ -1746,7 +1758,8 @@ fn validated_campaign_inputs(
     let materialization_path = args.input_root.join(&receipt.materialization.relative_path);
     let replay_artifact_path = args.input_root.join(&receipt.replay_artifact.relative_path);
     let replay_manifest_path = args.input_root.join(&receipt.replay_manifest.relative_path);
-    let render_inputs = PreparedCexInputs::load(&feature_path, &materialization_path)?;
+    let render_inputs =
+        PreparedCexInputs::load(&feature_path, &materialization_path, retain_calendar_rows)?;
     let feature_sha256 = render_inputs.feature_sha256().to_string();
     let materialization_sha256 = render_inputs.materialization_sha256().to_string();
     for (label, actual, expected) in [
@@ -1819,7 +1832,7 @@ fn freeze_request(args: &CampaignFreezeArgs) -> anyhow::Result<(CampaignRequest,
     if args.reuse.is_some() || args.reuse_sha256.is_some() {
         return reuse_frozen_request(args, &research_plan, study_proposal.as_ref());
     }
-    let inputs = validated_campaign_inputs(args)?;
+    let inputs = validated_campaign_inputs(args, research_plan.calendar.is_some())?;
     freeze_prepared_request(
         &inputs,
         &research_plan,
@@ -2165,6 +2178,8 @@ struct SupervisedRoundEvidence {
     burn: Option<CexSupervisedModelCandidateV2>,
     selected: CexSupervisedModelCandidateV2,
     replay: Option<CexEventReplayReceiptV1>,
+    calendar_validation: Option<alpha_engine::final_models::CalendarValidationReportV1>,
+    calendar_replay: Option<CexEventReplayReceiptV1>,
 }
 
 fn load_supervised_round_evidence(
@@ -2253,12 +2268,48 @@ fn load_supervised_round_evidence(
     {
         bail!("supervised replay report drifted from its receipt");
     }
+    let calendar_validation = if let Some(calendar) = &mission.spec.evaluation_protocol.calendar {
+        let validation: alpha_engine::final_models::CalendarValidationReportV1 =
+            serde_json::from_slice(&std::fs::read(results.join("calendar-validation.json"))?)?;
+        validation.report.evaluation.validate()?;
+        if &validation.calendar != calendar
+            || validation.promotion_authority
+            || validation.source_candidate.id != ridge.artifact_id
+            || validation.source_candidate.content_sha256 != canonical_json_hash(&ridge)?
+            || validation.report.evaluation.protocol_binding()?.1
+                != mission.spec.evaluation_protocol.content_hash()?
+            || validation.report.evaluation.evaluator_version
+                != alpha_domain::frozen_model::INDEPENDENT_SELECTION_EVALUATOR_VERSION
+        {
+            bail!("calendar validation is not bound to this Ridge and calendar");
+        }
+        Some(validation)
+    } else {
+        None
+    };
+    let calendar_replay = if let Some(validation) = &calendar_validation {
+        let path = results.join("calendar-validation-event-replay-receipt.json");
+        if crate::mission_runner::calendar_replay_required(validation) {
+            let replay = serde_json::from_slice(&std::fs::read(path)?)?;
+            crate::mission_runner::validate_calendar_replay_binding(&replay, validation, mission)?;
+            Some(replay)
+        } else {
+            if path.exists() {
+                bail!("zero-position calendar validation has unexpected replay");
+            }
+            None
+        }
+    } else {
+        None
+    };
     Ok(Some(SupervisedRoundEvidence {
         ridge,
         cart,
         burn,
         selected,
         replay,
+        calendar_validation,
+        calendar_replay,
     }))
 }
 
@@ -2406,6 +2457,10 @@ fn collect_round_ledger(
             .as_ref()
             .and_then(|evidence| evidence.replay.as_ref())
             .map(campaign_replay_feedback),
+        calendar_validation: supervised
+            .as_ref()
+            .and_then(|evidence| evidence.calendar_validation.as_ref())
+            .map(|validation| campaign_evaluation_feedback(&validation.report.evaluation)),
     };
     let strategy_path = results.join("combination-walk-forward.json");
     let subset_result = load_round_subset_result(&results)?;
@@ -2447,7 +2502,29 @@ fn collect_round_ledger(
         let evidence = supervised
             .as_ref()
             .context("supervised ML round is missing model selection evidence")?;
-        if !evidence.selected.evaluation.passed {
+        if evidence
+            .calendar_validation
+            .as_ref()
+            .is_some_and(|validation| !validation.report.evaluation.passed)
+        {
+            (
+                "calendar_validation_gate_failed".to_string(),
+                None,
+                None,
+                None,
+            )
+        } else if evidence
+            .calendar_replay
+            .as_ref()
+            .is_some_and(|replay| !replay.gate.passed)
+        {
+            (
+                "calendar_validation_replay_gate_failed".to_string(),
+                None,
+                None,
+                None,
+            )
+        } else if !evidence.selected.evaluation.passed {
             ("no_passing_supervised_model".to_string(), None, None, None)
         } else {
             let replay = evidence
@@ -2871,6 +2948,16 @@ pub(crate) fn validate_terminal_mission_revision_binding(
     mission: &alpha_domain::CexResearchMissionArtifactV1,
     request: &CampaignRequest,
 ) -> anyhow::Result<()> {
+    if let Some(precheck) = &request.research_plan.development_precheck {
+        if mission.spec.evaluation_protocol != precheck.protocol
+            || precheck.feature_sha256 != request.feature_sha256
+            || precheck.materialization_sha256 != request.materialization_sha256
+        {
+            bail!("terminal Mission calendar or precheck differs from the admitted request");
+        }
+    } else if mission.spec.evaluation_protocol.calendar.is_some() {
+        bail!("terminal Mission added an unrequested calendar");
+    }
     let expected_mlp = request
         .research_plan
         .mlp_training
@@ -3648,6 +3735,19 @@ pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> 
         bail!("campaign request schema_version must be {CAMPAIGN_REQUEST_SCHEMA_V5}");
     }
     request.research_plan.validate()?;
+    if request.research_plan.calendar.is_some() {
+        let precheck = request
+            .research_plan
+            .development_precheck
+            .as_ref()
+            .context("calendar request requires its published development precheck")?;
+        if precheck.feature_sha256 != request.feature_sha256
+            || precheck.materialization_sha256 != request.materialization_sha256
+            || precheck.source_revision != request.build_source_revision
+        {
+            bail!("calendar precheck differs from the requested input and source identities");
+        }
+    }
     if let Some(plan) = &request.research_plan.mlp_training {
         plan.validate_requested_seeds(
             &request
@@ -6385,6 +6485,176 @@ mod tests {
         );
     }
 
+    #[test]
+    fn calendar_h1_preserves_negative_validation_and_independent_bundle_readback() {
+        assert_calendar_h1_readback(true);
+    }
+
+    #[test]
+    fn calendar_h1_replays_nonzero_validation_without_opening_sealed() {
+        assert_calendar_h1_readback(false);
+    }
+
+    fn assert_calendar_h1_readback(negative: bool) {
+        let mut fixture = campaign_e2e_fixture_with_input(
+            if negative {
+                "h1-calendar-negative"
+            } else {
+                "h1-calendar-positive"
+            },
+            false,
+            false,
+            true,
+            false,
+            if negative { 0.00001 } else { 0.0005 },
+            mission_render::tests::Fixture::new(28_770),
+        );
+        let rows = mission_render::tests::read_feature_rows(&fixture._render_fixture.feature_path);
+        let start = rows[0].feature_available_time;
+        let mut request: CampaignRequest =
+            serde_json::from_slice(&std::fs::read(&fixture.args.request).unwrap()).unwrap();
+        let plan = &mut request.research_plan;
+        plan.supervised_model_scope = alpha_domain::CexSupervisedModelScopeV1::RidgeOnly;
+        plan.holding = Some(hft_research_manifest::model::HorizonHoldingPolicyV1 {
+            horizon_millis: 5000,
+        });
+        plan.label_horizon =
+            Some(alpha_domain::campaign_horizon::CampaignLabelHorizonV1::canonical());
+        plan.comparison_family_trials = Some(138);
+        plan.calendar = Some(alpha_domain::EvaluationCalendarV1 {
+            start,
+            develop_end: start + chrono::TimeDelta::hours(4),
+            validation_end: start + chrono::TimeDelta::hours(6),
+            end: start + chrono::TimeDelta::hours(8),
+        });
+        let inputs = PreparedCexInputs::load(
+            &fixture._render_fixture.feature_path,
+            &fixture._render_fixture.materialization_path,
+            true,
+        )
+        .unwrap();
+        plan.development_precheck = Some(inputs.development_precheck(plan).unwrap());
+        let protocol = plan.development_precheck.as_ref().unwrap().protocol.clone();
+        request.holdout_id = render_prepared_cex_bundle(&inputs, plan, 7, 46)
+            .unwrap()
+            .mission
+            .spec
+            .holdout
+            .holdout_id;
+        request.declared_total_trials = declared_total_trials_for_rounds(plan, 2).unwrap();
+        assert_eq!(request.declared_total_trials, 46);
+        std::fs::write(&fixture.args.request, serde_json::to_vec(&request).unwrap()).unwrap();
+        fixture.args.request_sha256 =
+            crate::mission_runner::sha256_file(&fixture.args.request).unwrap();
+        execute(fixture.args.clone()).unwrap();
+        let loaded = load_request(&fixture.args.request).unwrap();
+        let client = Client::builder().redirect(Policy::none()).build().unwrap();
+        let (_, trials, _) = readback_pre_holdout_terminal(
+            &client,
+            &loaded.request,
+            &loaded.sha256,
+            &protocol.content_hash().unwrap(),
+        )
+        .unwrap();
+        assert!(trials <= 46);
+        let result = load_campaign_result(&fixture.work_dir.join("campaign-result.json")).unwrap();
+        if negative {
+            assert_eq!(result.termination_reason, "campaign_no_candidate");
+        }
+        assert!(!fixture.global_claim_path.exists());
+        for round in &result.rounds {
+            assert!(round.feedback.calendar_validation.is_some());
+            let path = fixture.work_dir.join(format!(
+                "mission/{}/execute/results/calendar-validation.json",
+                round.round_id
+            ));
+            let report: alpha_engine::final_models::CalendarValidationReportV1 =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            assert!(!report.promotion_authority);
+            if negative {
+                assert!(!report.report.evaluation.passed);
+            }
+            assert!(report.last_training_time < report.calendar.calendar.develop_end);
+            assert!(report.report.ledger.iter().all(|row| row.available_time
+                >= report.calendar.calendar.develop_end
+                && row.available_time < report.calendar.calendar.validation_end));
+            let planned = loaded
+                .request
+                .rounds
+                .iter()
+                .find(|planned| planned.round_id == round.round_id)
+                .unwrap();
+            let lightweight = crate::mission_metrics::campaign::collect_verified_archive(
+                Path::new(&planned.result_readback_url),
+                &round.round_id,
+                round.seed,
+                &round.mission_id,
+                &round.result_bundle_sha256,
+            )
+            .unwrap();
+            assert_eq!(
+                lightweight.calendar_validation.as_ref(),
+                Some(&report.summary().unwrap())
+            );
+            assert_eq!(
+                lightweight.label_space_precheck.as_ref().unwrap().scope,
+                "calendar_development_only_overlapping_labels"
+            );
+            assert_eq!(lightweight.calendar_replay.is_some(), !negative);
+            if negative {
+                assert!(report
+                    .report
+                    .ledger
+                    .iter()
+                    .all(|row| row.target_position == 0.0));
+            } else {
+                assert!(report
+                    .report
+                    .ledger
+                    .iter()
+                    .any(|row| row.target_position != 0.0));
+                let replay_path = fixture.work_dir.join(format!(
+                    "mission/{}/execute/results/calendar-validation-event-replay-receipt.json",
+                    round.round_id
+                ));
+                let replay: CexEventReplayReceiptV1 =
+                    serde_json::from_slice(&std::fs::read(replay_path).unwrap()).unwrap();
+                let holding = replay.metrics.holding.as_ref().unwrap();
+                assert!(holding.closed_episodes > 0);
+                assert_eq!(holding.incomplete_exit_orders, 0);
+                assert_eq!(holding.delayed_exit_decisions, 0);
+            }
+        }
+        if negative {
+            assert_metric_bundle_rejected(
+                &loaded,
+                &protocol.content_hash().unwrap(),
+                &client,
+                |entries| {
+                    let mut report: serde_json::Value =
+                        serde_json::from_slice(&entries["results/calendar-validation.json"])
+                            .unwrap();
+                    report["report"]["ledger"][0]["prediction"] = serde_json::json!(9999.0);
+                    entries.insert(
+                        "results/calendar-validation.json".into(),
+                        serde_json::to_vec(&report).unwrap(),
+                    );
+                },
+                "calendar validation differs from independently evaluated fitted weights",
+            );
+        } else {
+            assert_metric_bundle_rejected(
+                &loaded,
+                &protocol.content_hash().unwrap(),
+                &client,
+                |entries| {
+                    entries.remove("results/calendar-validation-event-replay-receipt.json");
+                },
+                "nonzero calendar validation is missing observed event replay",
+            );
+        }
+    }
+
     fn assert_ridge_holding_campaign(mut fixture: CampaignE2eFixture, negative: bool) {
         let mut request: CampaignRequest =
             serde_json::from_slice(&std::fs::read(&fixture.args.request).unwrap()).unwrap();
@@ -7760,6 +8030,7 @@ mod tests {
                     consumed_trials: consumed_per_round,
                     termination_reason: "no_passing_supervised_model".to_string(),
                     feedback: CampaignRoundFeedbackV1 {
+                        calendar_validation: None,
                         factor_attempts,
                         model_attempts: Some(3),
                         accepted_factors: 1,
@@ -7875,6 +8146,26 @@ mod tests {
         price_step: f64,
     ) -> CampaignE2eFixture {
         let render_fixture = mission_render::tests::Fixture::canonical();
+        campaign_e2e_fixture_with_input(
+            name,
+            zero_labels,
+            preexisting_claim,
+            replay_tracks_features,
+            rejected_holdout,
+            price_step,
+            render_fixture,
+        )
+    }
+
+    fn campaign_e2e_fixture_with_input(
+        name: &str,
+        zero_labels: bool,
+        preexisting_claim: bool,
+        replay_tracks_features: bool,
+        rejected_holdout: bool,
+        price_step: f64,
+        render_fixture: mission_render::tests::Fixture,
+    ) -> CampaignE2eFixture {
         let mut rows = mission_render::tests::read_feature_rows(&render_fixture.feature_path);
         if zero_labels {
             for row in &mut rows {

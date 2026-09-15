@@ -5,7 +5,7 @@ use super::{image_digest, ValidatedSubmission};
 use crate::{
     cli::BUILD_SOURCE_REVISION,
     mission_render::{
-        approved_evaluation_protocol_for_horizon, approved_validation,
+        approved_evaluation_protocol_for_plan, approved_validation,
         validate_render_materialization_scope_for_horizon,
     },
     mission_runner::{decode_materialization, validate_materialization, MAX_MATERIALIZATION_BYTES},
@@ -155,16 +155,18 @@ pub(super) fn reconstruct_binding(
     validate_render_materialization_scope_for_horizon(
         &materialization,
         request.research_plan.label_horizon.as_ref(),
+        request
+            .research_plan
+            .development_precheck
+            .as_ref()
+            .and_then(|receipt| receipt.protocol.calendar.as_ref()),
     )?;
     validate_materialization(
         &materialization,
         &request.feature_sha256,
         &approved_validation(&materialization)?,
     )?;
-    let protocol = approved_evaluation_protocol_for_horizon(
-        &materialization,
-        request.research_plan.label_horizon.as_ref(),
-    )?;
+    let protocol = approved_evaluation_protocol_for_plan(&materialization, &request.research_plan)?;
     let protocol_sha256 = protocol.content_hash()?;
     // The same partition function is used by PreparedDataset readers. Bind the
     // complete protocol, exact data identity and source, not just two view labels.
@@ -186,7 +188,17 @@ pub(super) fn reconstruct_binding(
         }))
     };
     let search_view_sha256 = view_hash("search_and_learning", &partitions.search)?;
-    let selection_view_sha256 = view_hash("independent_selection_withheld", selection)?;
+    let selection_feedback = if protocol.calendar.is_some() {
+        CampaignSelectionFeedbackV1::FixedCalendarValidationPreHoldout
+    } else {
+        CampaignSelectionFeedbackV1::IndependentSelectionWithheld
+    };
+    let selection_purpose = if protocol.calendar.is_some() {
+        "fixed_calendar_validation_pre_holdout"
+    } else {
+        "independent_selection_withheld"
+    };
+    let selection_view_sha256 = view_hash(selection_purpose, selection)?;
     let job = &manifest["items"][1];
     let container = &job["spec"]["template"]["spec"]["containers"][0];
     if !container["args"]
@@ -211,7 +223,7 @@ pub(super) fn reconstruct_binding(
         evaluation_views: CampaignEvaluationViewsV1 {
             search_view_sha256,
             selection_view_sha256,
-            selection_feedback: CampaignSelectionFeedbackV1::IndependentSelectionWithheld,
+            selection_feedback,
         },
         source_revision: request.build_source_revision.clone(),
         runner_image: container["image"]

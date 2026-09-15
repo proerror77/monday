@@ -410,6 +410,10 @@ impl CexCampaignLearningDirectiveV1 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CexCampaignResearchPlanV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) calendar: Option<alpha_domain::EvaluationCalendarV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) development_precheck: Option<crate::mission_calendar::DevelopmentPrecheckReceiptV1>,
     #[serde(
         default,
         skip_serializing_if = "alpha_domain::CexSupervisedModelScopeV1::is_default"
@@ -546,6 +550,8 @@ impl CexCampaignResearchPlanV1 {
     pub(crate) fn canonical() -> Self {
         let search_policy_revision = CexCampaignSearchPolicyRevisionV1::canonical();
         Self {
+            calendar: None,
+            development_precheck: None,
             supervised_model_scope: alpha_domain::CexSupervisedModelScopeV1::default(),
             holding: None,
             comparison_family_trials: None,
@@ -572,6 +578,36 @@ impl CexCampaignResearchPlanV1 {
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         if self.schema_version != RESEARCH_PLAN_SCHEMA_V2 {
             bail!("CEX Campaign research plan schema_version must be {RESEARCH_PLAN_SCHEMA_V2}");
+        }
+        if let Some(calendar) = &self.calendar {
+            calendar.validate()?;
+            let horizon = self
+                .label_horizon
+                .as_ref()
+                .context("calendar H1 requires its explicit label horizon")?;
+            if self.holding.as_ref().is_none_or(|holding| {
+                Some(holding.horizon_millis)
+                    != horizon
+                        .labels
+                        .observation_frequency_millis
+                        .checked_mul(horizon.labels.horizon_buckets as u64)
+            }) {
+                bail!("calendar holding horizon differs from its label horizon");
+            }
+            if self.supervised_model_scope != alpha_domain::CexSupervisedModelScopeV1::RidgeOnly
+                || self.generation != 0
+                || self.parent.is_some()
+                || self.learning_directive.is_some()
+            {
+                bail!("calendar H1 requires a fresh fixed Ridge-only comparison");
+            }
+            if let Some(precheck) = &self.development_precheck {
+                if &precheck.binding()?.calendar != calendar {
+                    bail!("precheck calendar differs from the research plan");
+                }
+            }
+        } else if self.development_precheck.is_some() {
+            bail!("development precheck requires its declared calendar");
         }
         if let Some(horizon) = &self.label_horizon {
             horizon.validate().map_err(anyhow::Error::msg)?;
@@ -822,6 +858,9 @@ pub(crate) struct PreparedCexInputs {
     feature_sha256: String,
     materialization_sha256: String,
     materialization_bytes: Vec<u8>,
+    feature_rows: Option<Vec<alpha_engine::evaluation::ResearchRow>>,
+    verified_prechecks:
+        std::cell::RefCell<Vec<crate::mission_calendar::DevelopmentPrecheckReceiptV1>>,
     _feature_artifacts: Option<tempfile::TempDir>,
 }
 
@@ -830,6 +869,8 @@ pub(crate) struct PreparedCexInputs {
 pub(crate) struct PreparedCexInputMetadata {
     materialization_json: String,
     feature_manifest: FeatureDatasetManifest,
+    #[serde(default)]
+    verified_prechecks: Vec<crate::mission_calendar::DevelopmentPrecheckReceiptV1>,
 }
 
 impl PreparedCexInputs {
@@ -837,6 +878,7 @@ impl PreparedCexInputs {
         Ok(PreparedCexInputMetadata {
             materialization_json: String::from_utf8(self.materialization_bytes.clone())?,
             feature_manifest: self.feature_manifest.clone(),
+            verified_prechecks: self.verified_prechecks.borrow().clone(),
         })
     }
 
@@ -866,6 +908,8 @@ impl PreparedCexInputs {
             feature_sha256: feature_sha256.into(),
             materialization_sha256: materialization_sha256.into(),
             materialization_bytes: bytes,
+            feature_rows: None,
+            verified_prechecks: std::cell::RefCell::new(metadata.verified_prechecks),
             _feature_artifacts: None,
         })
     }
@@ -873,13 +917,87 @@ impl PreparedCexInputs {
     pub(crate) fn materialization(&self) -> &crate::mission_runner::Materialization {
         &self.materialization
     }
+    pub(crate) fn development_precheck(
+        &self,
+        plan: &CexCampaignResearchPlanV1,
+    ) -> anyhow::Result<crate::mission_calendar::DevelopmentPrecheckReceiptV1> {
+        let calendar = plan
+            .calendar
+            .as_ref()
+            .context("precheck requires a declared UTC calendar")?;
+        let rows = self
+            .feature_rows
+            .as_ref()
+            .context("precheck requires admitted feature rows")?;
+        let clocks = rows
+            .iter()
+            .map(|row| row.available_time)
+            .collect::<Vec<_>>();
+        let protocol =
+            calendar
+                .resolve(&clocks)?
+                .bind(approved_evaluation_protocol_for_horizon(
+                    &self.materialization,
+                    plan.label_horizon.as_ref(),
+                )?)?;
+        let policy =
+            plan.decision_policy_for_market(rendered_research_market(&self.materialization)?)?;
+        let report = alpha_engine::label_precheck::development_label_space_precheck(
+            rows, &protocol, &policy,
+        )
+        .map_err(anyhow::Error::msg)?;
+        Ok(crate::mission_calendar::DevelopmentPrecheckReceiptV1 {
+            schema_version: "monday.development_precheck.v1".into(),
+            source_revision: crate::cli::BUILD_SOURCE_REVISION.into(),
+            feature_sha256: self.feature_sha256.clone(),
+            materialization_sha256: self.materialization_sha256.clone(),
+            protocol,
+            decision_policy_sha256: policy.content_hash().map_err(anyhow::Error::msg)?,
+            report,
+        })
+    }
+
+    pub(crate) fn verify_development_precheck(
+        &self,
+        plan: &CexCampaignResearchPlanV1,
+    ) -> anyhow::Result<()> {
+        if plan.calendar.is_none() {
+            return Ok(());
+        }
+        let expected = plan
+            .development_precheck
+            .as_ref()
+            .context("calendar Campaign requires a published development precheck before freeze")?;
+        if expected.feature_sha256 != self.feature_sha256
+            || expected.materialization_sha256 != self.materialization_sha256
+        {
+            bail!("development precheck input identity mismatch");
+        }
+        if self.feature_rows.is_some() {
+            let actual = self.development_precheck(plan)?;
+            if &actual != expected {
+                bail!("development precheck differs from the admitted data and calendar");
+            }
+            let mut verified = self.verified_prechecks.borrow_mut();
+            if !verified.contains(expected) {
+                verified.push(actual);
+            }
+        } else if !self.verified_prechecks.borrow().contains(expected) {
+            bail!("trusted preparation snapshot lacks this development precheck");
+        }
+        Ok(())
+    }
     pub(crate) fn feature_sha256(&self) -> &str {
         &self.feature_sha256
     }
     pub(crate) fn materialization_sha256(&self) -> &str {
         &self.materialization_sha256
     }
-    pub(crate) fn load(feature: &Path, materialization_path: &Path) -> anyhow::Result<Self> {
+    pub(crate) fn load(
+        feature: &Path,
+        materialization_path: &Path,
+        retain_calendar_rows: bool,
+    ) -> anyhow::Result<Self> {
         validate_input_sizes(feature, materialization_path)?;
         let mut bytes = Vec::new();
         std::fs::File::open(materialization_path)?
@@ -902,6 +1020,24 @@ impl PreparedCexInputs {
         )
         .map_err(anyhow::Error::msg)?;
         data_mission::validate_imported_cex_replay_features(&materialization.snapshot, &imported)?;
+        let feature_rows = retain_calendar_rows.then(|| {
+            imported
+                .rows()
+                .iter()
+                .map(|row| alpha_engine::evaluation::ResearchRow {
+                    series_id: row.series_id,
+                    available_time: row.feature_available_time,
+                    label_available_time: row.label_available_time,
+                    signal: 0.0,
+                    features: row.features.clone(),
+                    label: row.label,
+                    fee_bps: 2.0,
+                    funding_bps: 0.0,
+                    pit_funding: false,
+                    latency_bps: 0.5,
+                })
+                .collect()
+        });
         let feature_manifest = imported.into_manifest();
         let feature_sha256 = feature_manifest.artifact_sha256.clone();
         Ok(Self {
@@ -910,6 +1046,8 @@ impl PreparedCexInputs {
             feature_sha256,
             materialization_sha256,
             materialization_bytes: bytes,
+            feature_rows,
+            verified_prechecks: std::cell::RefCell::new(Vec::new()),
             _feature_artifacts: Some(feature_artifacts),
         })
     }
@@ -951,7 +1089,11 @@ pub(crate) fn render_cex_bundle(
     multiple_testing_trials: usize,
 ) -> anyhow::Result<RenderedCexMission> {
     research_plan.validate()?;
-    let inputs = PreparedCexInputs::load(feature, materialization_path)?;
+    let inputs = PreparedCexInputs::load(
+        feature,
+        materialization_path,
+        research_plan.calendar.is_some(),
+    )?;
     render_prepared_cex_bundle(&inputs, research_plan, seed, multiple_testing_trials)
 }
 
@@ -962,6 +1104,7 @@ pub(crate) fn render_prepared_cex_bundle(
     multiple_testing_trials: usize,
 ) -> anyhow::Result<RenderedCexMission> {
     research_plan.validate()?;
+    inputs.verify_development_precheck(research_plan)?;
     let multiple_testing_trials =
         research_plan.effective_multiple_testing_trials(multiple_testing_trials)?;
     let materialization = &inputs.materialization;
@@ -974,6 +1117,10 @@ pub(crate) fn render_prepared_cex_bundle(
         feature_manifest,
         feature_sha256,
         research_plan.label_horizon.as_ref(),
+        research_plan
+            .development_precheck
+            .as_ref()
+            .and_then(|receipt| receipt.protocol.calendar.as_ref()),
     )?;
     let validation = approved_validation(materialization)?;
     validate_materialization(materialization, feature_sha256, &validation)?;
@@ -993,7 +1140,13 @@ pub(crate) fn render_prepared_cex_bundle(
         "snapshot_sha256": snapshot_sha256,
         "source_revision": materialization.source_revision,
     }))?;
-    let sealed_holdout_cohort_sha256 = sealed_holdout_cohort_sha256(materialization)?;
+    let sealed_holdout_cohort_sha256 = if let Some(calendar) = &research_plan.calendar {
+        canonical_json_hash(
+            &serde_json::json!({"input_cohort":sealed_holdout_cohort_sha256(materialization)?, "calendar":calendar}),
+        )?
+    } else {
+        sealed_holdout_cohort_sha256(materialization)?
+    };
     // MLP treatments must not change the factor-search lineage. The complete
     // plan, resolved baseline policy and Mission still bind the treatment.
     let mut factor_search_plan = research_plan.clone();
@@ -1020,10 +1173,8 @@ pub(crate) fn render_prepared_cex_bundle(
     );
     let input_lineage_id = format!("{stable_version}-input-{}", &materialization_sha256[..16]);
     let holdout_id = format!("cex-holdout-{}", &sealed_holdout_cohort_sha256[..48]);
-    let evaluation_protocol = approved_evaluation_protocol_for_horizon(
-        materialization,
-        research_plan.label_horizon.as_ref(),
-    )?;
+    let evaluation_protocol =
+        approved_evaluation_protocol_for_plan(materialization, research_plan)?;
     let mlp_training = research_plan
         .mlp_training
         .as_ref()
@@ -1300,6 +1451,7 @@ pub(crate) fn approved_validation(
         embargo_rows: EMBARGO_ROWS,
         sealed_holdout_rows: HOLDOUT_ROWS,
         independent_selection_rows: Some(SELECTION_ROWS),
+        calendar_binding_json: None,
         fee_bps: 2.0,
         rebate_bps: 0.0,
         funding_bps: 0.0,
@@ -1373,18 +1525,48 @@ pub(crate) fn approved_evaluation_protocol_for_horizon(
     .map_err(anyhow::Error::new)
 }
 
+pub(crate) fn approved_evaluation_protocol_for_plan(
+    materialization: &crate::mission_runner::Materialization,
+    plan: &CexCampaignResearchPlanV1,
+) -> anyhow::Result<EvaluationProtocolV1> {
+    let protocol =
+        approved_evaluation_protocol_for_horizon(materialization, plan.label_horizon.as_ref())?;
+    let Some(calendar) = &plan.calendar else {
+        return Ok(protocol);
+    };
+    let receipt = plan
+        .development_precheck
+        .as_ref()
+        .context("calendar Campaign requires its pre-freeze development report")?;
+    let binding = receipt.binding()?;
+    let expected = binding.bind(protocol)?;
+    if &binding.calendar != calendar
+        || binding.total_rows != materialization.rows
+        || expected != receipt.protocol
+        || receipt.decision_policy_sha256
+            != plan
+                .decision_policy_for_market(rendered_research_market(materialization)?)?
+                .content_hash()
+                .map_err(anyhow::Error::msg)?
+    {
+        bail!("calendar protocol differs from the prechecked data, costs or holding policy");
+    }
+    Ok(expected)
+}
+
 #[cfg(test)]
 #[allow(dead_code)]
 pub(crate) fn validate_render_materialization_scope(
     materialization: &crate::mission_runner::Materialization,
 ) -> anyhow::Result<()> {
-    validate_render_materialization_scope_for_horizon(materialization, None)?;
+    validate_render_materialization_scope_for_horizon(materialization, None, None)?;
     Ok(())
 }
 
 pub(crate) fn validate_render_materialization_scope_for_horizon(
     materialization: &crate::mission_runner::Materialization,
     expected_horizon: Option<&CampaignLabelHorizonV1>,
+    calendar: Option<&alpha_domain::EvaluationCalendarBindingV1>,
 ) -> anyhow::Result<()> {
     validate_render_instrument_scope(&materialization.market, &materialization.symbol)?;
     if materialization.bucket_ms != 1_000 || materialization.top_depth != 5 {
@@ -1400,9 +1582,9 @@ pub(crate) fn validate_render_materialization_scope_for_horizon(
     } else if materialization.label_horizon_buckets != 5 {
         bail!("noncanonical prediction horizons require a matching typed Campaign label horizon");
     }
-    let minimum_rows = expected_horizon
-        .map(minimum_rows_for_horizon)
-        .transpose()?
+    let minimum_rows = calendar
+        .map(|binding| binding.total_rows)
+        .or(expected_horizon.map(minimum_rows_for_horizon).transpose()?)
         .unwrap_or(MIN_ROWS);
     if materialization.rows < minimum_rows {
         bail!("approved Mission render requires at least {minimum_rows} point-in-time rows");
@@ -1449,11 +1631,12 @@ fn ensure_materialization_scope(
     manifest: &FeatureDatasetManifest,
     feature_sha256: &str,
     expected_horizon: Option<&CampaignLabelHorizonV1>,
+    calendar: Option<&alpha_domain::EvaluationCalendarBindingV1>,
 ) -> anyhow::Result<()> {
-    validate_render_materialization_scope_for_horizon(materialization, expected_horizon)?;
-    let minimum_rows = expected_horizon
-        .map(minimum_rows_for_horizon)
-        .transpose()?
+    validate_render_materialization_scope_for_horizon(materialization, expected_horizon, calendar)?;
+    let minimum_rows = calendar
+        .map(|binding| binding.total_rows)
+        .or(expected_horizon.map(minimum_rows_for_horizon).transpose()?)
         .unwrap_or(MIN_ROWS);
     if manifest.rows < minimum_rows {
         bail!("approved Mission render requires at least {minimum_rows} point-in-time rows");
@@ -1501,10 +1684,114 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn calendar_precheck_binds_actual_clocks_and_reuses_verified_snapshot() {
+        for horizon in [5, 10, 30] {
+            let fixture = Fixture::with_scope(28_770, None, "usdm", "BTCUSDT", horizon);
+            let mut inputs =
+                PreparedCexInputs::load(&fixture.feature_path, &fixture.materialization_path, true)
+                    .unwrap();
+            let start = inputs.feature_rows.as_ref().unwrap()[0].available_time;
+            let mut plan = CexCampaignResearchPlanV1::canonical();
+            plan.supervised_model_scope = alpha_domain::CexSupervisedModelScopeV1::RidgeOnly;
+            plan.holding = Some(hft_research_manifest::model::HorizonHoldingPolicyV1 {
+                horizon_millis: horizon as u64 * 1000,
+            });
+            plan.label_horizon =
+                Some(CampaignLabelHorizonV1::new(horizon, 1000, 2 * horizon, horizon).unwrap());
+            plan.comparison_family_trials = Some(138);
+            plan.calendar = Some(alpha_domain::EvaluationCalendarV1 {
+                start,
+                develop_end: start + ChronoDuration::hours(4),
+                validation_end: start + ChronoDuration::hours(6),
+                end: start + ChronoDuration::hours(8),
+            });
+            assert!(render_prepared_cex_bundle(&inputs, &plan, 7, 138)
+                .unwrap_err()
+                .to_string()
+                .contains("precheck"));
+            let receipt = inputs.development_precheck(&plan).unwrap();
+            assert_eq!(receipt.report.observations, 14_400 - horizon);
+            assert_eq!(receipt.report.excluded_unmatured_labels, horizon);
+            assert_eq!(receipt.report.median_spread_bps, Some(1.2));
+            assert_eq!(receipt.report.entry_cost_median_bps, Some(6.2));
+            assert_eq!(receipt.report.observations_above_cost, 0);
+            assert!(!receipt.report.cancels_experiment);
+            let original = alpha_engine::evaluation::prepare_dataset(
+                inputs.feature_rows.as_ref().unwrap().clone(),
+                &receipt.protocol,
+            )
+            .unwrap();
+            // Only withheld values change. Neither precheck nor search context
+            // can depend on them, even though integrity admission checks all bytes.
+            for row in inputs
+                .feature_rows
+                .as_mut()
+                .unwrap()
+                .iter_mut()
+                .skip(14_400)
+            {
+                row.label = 9_999.0;
+            }
+            assert_eq!(inputs.development_precheck(&plan).unwrap(), receipt);
+            let poisoned = alpha_engine::evaluation::prepare_dataset(
+                inputs.feature_rows.as_ref().unwrap().clone(),
+                &receipt.protocol,
+            )
+            .unwrap();
+            assert_eq!(
+                original.engine_context().rows(),
+                poisoned.engine_context().rows()
+            );
+            assert_eq!(
+                alpha_engine::label_precheck::dataset_label_space_precheck(
+                    &poisoned,
+                    &plan
+                        .decision_policy_for_market(CexResearchMarketV1::Usdm)
+                        .unwrap()
+                )
+                .unwrap(),
+                receipt.report
+            );
+            plan.development_precheck = Some(receipt);
+            let rendered = render_prepared_cex_bundle(&inputs, &plan, 7, 138).unwrap();
+            let protocol = &rendered.mission.spec.evaluation_protocol;
+            let parts = protocol.row_partitions(28_770).unwrap();
+            assert_eq!(parts.selection.as_ref().unwrap().start, 14_400);
+            assert_eq!(parts.sealed_holdout.start, 21_600);
+            let round_trip = ValidationArgs::from_protocol(protocol)
+                .evaluation_protocol(&protocol.labels)
+                .unwrap();
+            assert_eq!(&round_trip, protocol);
+            let metadata = inputs.metadata().unwrap();
+            std::fs::remove_file(&fixture.feature_path).unwrap();
+            std::fs::remove_file(&fixture.materialization_path).unwrap();
+            let restored = PreparedCexInputs::restore_metadata(
+                metadata,
+                inputs.feature_sha256(),
+                inputs.materialization_sha256(),
+            )
+            .unwrap();
+            assert_eq!(
+                render_prepared_cex_bundle(&restored, &plan, 7, 138)
+                    .unwrap()
+                    .mission,
+                rendered.mission
+            );
+            plan.development_precheck
+                .as_mut()
+                .unwrap()
+                .report
+                .absolute_p95_bps = Some(9_999.0);
+            assert!(render_prepared_cex_bundle(&restored, &plan, 7, 138).is_err());
+        }
+    }
+
+    #[test]
     fn prepared_inputs_render_multiple_treatments_without_reading_files_again() {
         let fixture = Fixture::new(MIN_ROWS);
         let inputs =
-            PreparedCexInputs::load(&fixture.feature_path, &fixture.materialization_path).unwrap();
+            PreparedCexInputs::load(&fixture.feature_path, &fixture.materialization_path, false)
+                .unwrap();
         let plan = CexCampaignResearchPlanV1::canonical();
         let first = render_prepared_cex_bundle(&inputs, &plan, 7, default_trials()).unwrap();
         // Remove both source files and the importer's local copy. The admitted
@@ -1557,9 +1844,12 @@ pub(crate) mod tests {
         assert!(render_prepared_cex_bundle(&inputs, &invalid, 7, default_trials()).is_err());
         invalid.feature_fields.clear();
         assert!(render_prepared_cex_bundle(&inputs, &invalid, 7, default_trials()).is_err());
-        assert!(
-            PreparedCexInputs::load(&fixture.feature_path, &fixture.materialization_path).is_err()
-        );
+        assert!(PreparedCexInputs::load(
+            &fixture.feature_path,
+            &fixture.materialization_path,
+            false
+        )
+        .is_err());
     }
 
     #[test]
@@ -1941,6 +2231,8 @@ pub(crate) mod tests {
         )
         .unwrap();
         let plan = CexCampaignResearchPlanV1 {
+            calendar: None,
+            development_precheck: None,
             supervised_model_scope: alpha_domain::CexSupervisedModelScopeV1::default(),
             holding: None,
             comparison_family_trials: None,
@@ -2142,6 +2434,8 @@ pub(crate) mod tests {
         )
         .unwrap();
         let plan = CexCampaignResearchPlanV1 {
+            calendar: None,
+            development_precheck: None,
             supervised_model_scope: alpha_domain::CexSupervisedModelScopeV1::default(),
             holding: None,
             comparison_family_trials: None,

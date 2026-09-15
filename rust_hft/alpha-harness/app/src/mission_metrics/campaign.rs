@@ -35,6 +35,12 @@ pub(crate) struct RoundEvidenceReport {
     pub result_bundle_sha256: String,
     pub model_metrics: Option<CexModelMetricsReportV1>,
     pub mlp_folds: Vec<MlpFoldReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_space_precheck: Option<alpha_engine::label_precheck::LabelSpacePrecheckV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar_validation: Option<alpha_engine::final_models::CalendarValidationSummaryV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar_replay: Option<crate::mission_runner::CexEventReplayReceiptV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -155,6 +161,28 @@ pub(crate) fn collect_verified_archive(
             }
         }
     }
+    let label_space_precheck =
+        optional_entry(&mut archive, "results/label-space-precheck.json", 64 * 1024)?
+            .map(|bytes| serde_json::from_slice(&bytes))
+            .transpose()?;
+    let calendar_validation = optional_entry(
+        &mut archive,
+        "results/calendar-validation.json",
+        super::MAX_BACKTEST_BYTES,
+    )?
+    .map(|bytes| -> anyhow::Result<_> {
+        let report: alpha_engine::final_models::CalendarValidationReportV1 =
+            serde_json::from_slice(&bytes)?;
+        report.summary().map_err(anyhow::Error::msg)
+    })
+    .transpose()?;
+    let calendar_replay = optional_entry(
+        &mut archive,
+        "results/calendar-validation-event-replay-receipt.json",
+        512 * 1024,
+    )?
+    .map(|bytes| serde_json::from_slice(&bytes))
+    .transpose()?;
     Ok(RoundEvidenceReport {
         round_id: round_id.into(),
         seed,
@@ -162,6 +190,9 @@ pub(crate) fn collect_verified_archive(
         result_bundle_sha256: bundle_sha256.into(),
         model_metrics,
         mlp_folds,
+        label_space_precheck,
+        calendar_validation,
+        calendar_replay,
     })
 }
 

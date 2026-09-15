@@ -4,9 +4,11 @@ pub mod campaign_control;
 pub mod campaign_finalization;
 pub mod campaign_horizon;
 pub mod campaign_study;
+mod evaluation_calendar;
 mod evaluation_partition;
 pub mod frozen_model;
 pub mod mlp_training;
+pub use evaluation_calendar::{EvaluationCalendarBindingV1, EvaluationCalendarV1};
 pub use evaluation_partition::{EvaluationRowPartitionsV1, EvaluationSelectionV1};
 pub use mlp_training::{CexMlpFoldObservationV1, CexMlpTrainingPlanV1, CexMlpTrainingProfileV1};
 pub mod runtime_latency_evidence;
@@ -34,6 +36,7 @@ pub const ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION: &str = "onnx-sealed-holdout-v4"
 pub const LOB_ONNX_PREPROCESSING_VERSION: &str = "lob-relative-price-log-size-v1";
 pub const EVALUATION_PROTOCOL_VERSION_V1: &str = "evaluation-protocol-v1";
 pub const EVALUATION_PROTOCOL_VERSION_V2: &str = "evaluation-protocol-v2";
+pub const EVALUATION_PROTOCOL_VERSION_V3: &str = "evaluation-protocol-v3-calendar";
 pub const CEX_MCTS_RESEARCH_RECEIPT_VERSION_V1: &str = "cex-mcts-research-receipt-v1";
 pub const CEX_RESEARCH_MISSION_SCHEMA_V1: &str = "cex-research-mission-v1";
 pub const CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD: &str =
@@ -195,6 +198,8 @@ pub struct EvaluationProtocolV1 {
     /// V1 audit payloads omit this field; V2 reserves an independent selection window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<EvaluationSelectionV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar: Option<EvaluationCalendarBindingV1>,
 }
 
 impl EvaluationProtocolV1 {
@@ -210,6 +215,7 @@ impl EvaluationProtocolV1 {
             labels,
             metrics: EvaluationMetricDefinitionsV1::default(),
             selection: None,
+            calendar: None,
         };
         protocol.validate()?;
         Ok(protocol)
@@ -235,9 +241,16 @@ impl EvaluationProtocolV1 {
             && self.costs.max_book_depth_fraction > 0.0
             && self.costs.max_book_depth_fraction <= 1.0;
         let version_valid = match (&*self.version, &self.selection) {
-            (EVALUATION_PROTOCOL_VERSION_V1, None) => true,
-            (EVALUATION_PROTOCOL_VERSION_V2, Some(selection)) => {
+            (EVALUATION_PROTOCOL_VERSION_V1, None) => self.calendar.is_none(),
+            (EVALUATION_PROTOCOL_VERSION_V2 | EVALUATION_PROTOCOL_VERSION_V3, Some(selection)) => {
                 selection.rows > 0
+                    && match &self.calendar {
+                        Some(calendar) => {
+                            self.version == EVALUATION_PROTOCOL_VERSION_V3
+                                && calendar.validate_protocol(self)
+                        }
+                        None => self.version == EVALUATION_PROTOCOL_VERSION_V2,
+                    }
                     && schedule_end
                         .and_then(|end| end.checked_add(selection.rows))
                         .and_then(|end| {

@@ -547,7 +547,13 @@ pub(super) fn prepare_report(
             let shared: SharedInputs = serde_json::from_slice(&data)?;
             (restore_inputs(&plan, receipt, shared, &ledger)?, data, true)
         } else {
-            let inputs = validated_campaign_inputs(&args_for_freeze)?;
+            let inputs = validated_campaign_inputs(
+                &args_for_freeze,
+                plans.iter().any(|plan| plan.calendar.is_some()),
+            )?;
+            for research in &plans {
+                inputs.render_inputs.verify_development_precheck(research)?;
+            }
             let mut shared = SharedInputs {
                 preparation_authentication_tag: None,
                 schema_version: INPUT_SCHEMA.into(),
