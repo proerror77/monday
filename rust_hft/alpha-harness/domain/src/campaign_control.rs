@@ -64,6 +64,10 @@ pub enum CampaignSelectionFeedbackV1 {
     /// A separate window is reserved and inaccessible to search/proposal readers.
     /// This does not assert that final selection has been evaluated or authorized.
     IndependentSelectionWithheld,
+    /// A fresh fixed calendar authorizes reporting validation after fitting,
+    /// within pre-holdout. Search never sees these rows; no later final selection
+    /// may claim this already-reported view was still withheld.
+    FixedCalendarValidationPreHoldout,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,7 +89,10 @@ impl CampaignEvaluationViewsV1 {
                     "v1 selection must declare the shared walk-forward view",
                 ))
             }
-            CampaignSelectionFeedbackV1::IndependentSelectionWithheld if shared => {
+            CampaignSelectionFeedbackV1::IndependentSelectionWithheld
+            | CampaignSelectionFeedbackV1::FixedCalendarValidationPreHoldout
+                if shared =>
+            {
                 return Err(CampaignControlError::Invalid(
                     "independent selection must bind a separate view",
                 ))
@@ -102,6 +109,9 @@ impl CampaignEvaluationViewsV1 {
             }
             CampaignSelectionFeedbackV1::IndependentSelectionWithheld => {
                 "independent_selection_withheld"
+            }
+            CampaignSelectionFeedbackV1::FixedCalendarValidationPreHoldout => {
+                "fixed_calendar_validation_pre_holdout"
             }
         }
     }
@@ -673,6 +683,26 @@ mod tests {
         let mut changed = grant.grant().clone();
         changed.budget.max_trials = changed.family.max_trials + 1;
         assert!(changed.validate().is_err());
+    }
+
+    #[test]
+    fn fixed_calendar_validation_exposure_requires_new_signed_authority() {
+        let (mut grant, key, now) = fixture();
+        grant.execution.evaluation_views.selection_view_sha256 = "c".repeat(64);
+        grant.execution.evaluation_views.selection_feedback =
+            CampaignSelectionFeedbackV1::IndependentSelectionWithheld;
+        let keys = BTreeMap::from([("operator".into(), key.verifying_key())]);
+        let mut signed = sign_campaign_root_grant(grant, "operator".into(), &key).unwrap();
+        signed.grant.execution.evaluation_views.selection_feedback =
+            CampaignSelectionFeedbackV1::FixedCalendarValidationPreHoldout;
+        signed.content_sha256 = signed.grant.content_hash().unwrap();
+        assert!(verify_campaign_root_grant(&signed, &keys, now).is_err());
+        let signed = sign_campaign_root_grant(signed.grant, "operator".into(), &key).unwrap();
+        let verified = verify_campaign_root_grant(&signed, &keys, now).unwrap();
+        assert_eq!(
+            verified.grant().execution.evaluation_views.evidence_label(),
+            "fixed_calendar_validation_pre_holdout"
+        );
     }
 
     #[test]

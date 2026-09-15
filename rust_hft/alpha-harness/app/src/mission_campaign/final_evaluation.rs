@@ -251,7 +251,7 @@ pub(crate) fn freeze(args: CampaignFreezeArgs) -> anyhow::Result<()> {
         .context("missing final evaluation control")?;
     let (control, grant) = mission_dispatch::final_admission::read_active_control(path)?;
     let sources = mission_dispatch::final_admission::verified_source_requests(&control, &grant)?;
-    let input = validated_campaign_inputs(&args)?;
+    let input = validated_campaign_inputs(&args, false)?;
     let first = sources
         .values()
         .next()

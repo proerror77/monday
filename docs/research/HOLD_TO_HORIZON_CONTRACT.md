@@ -52,15 +52,59 @@ separately when order-arrival latency changes execution prices.
 
 ## Data and three-arm comparison
 
-Before any label inspection, commit the development, validation, independent
-selection and sealed-test views. Label prechecks use only the authorized
-development/validation view, including label-maturity boundaries. Test data
+Before any label inspection, commit the development, independent validation
+and sealed-test views. H1 label prechecks use only development, including
+label-maturity boundaries. Test data
 cannot select the horizon, factors, transformations or rules. This follows the
 [data leakage guidance](https://scikit-learn.org/stable/common_pitfalls.html#data-leakage).
 
 Verify data coverage and prior research usage for `2026-09-11 02:00-10:00 UTC`.
 An apparently new calendar is not automatically an unseen test. Do not reuse
 the already inspected `2026-09-10` eight-hour window for this H1 comparison.
+
+Declare `calendar` on each Ridge research plan before inspection: `start`,
+`develop_end`, `validation_end`, and `end` are UTC timestamps. For this H1 they
+are September 11 at 02:00, 06:00, 08:00, and 10:00 respectively. Intervals are
+half-open and use feature decision availability. Native admission resolves the
+row boundaries from actual clocks, preserving warm-up and label-tail exclusions;
+the worker resolves them again. A row count cannot substitute for this calendar.
+Admission allows at most two initial buckets (bucket alignment plus the previous
+book sample) and `h + 1` trailing buckets for label maturity/end alignment. It
+rejects any larger endpoint truncation. The retained calendar must also have every
+interior observation bucket; a gap fails calendar admission before any fitting.
+The H1 plan requires the exact registered
+5/10/30-second purge/embargo tuples, seeds 7/11, unchanged snapshot GP templates,
+and the complete 138-trial comparison-family correction.
+
+Freeze verifies complete raw blobs that overlap the requested receive window,
+including boundary blobs. The PIT materializer then emits only window-contained
+decisions whose labels mature before the window end, retaining full source hashes.
+It must not discard a five-minute boundary blob because its final receive timestamp
+is a millisecond beyond the nominal window, or quietly accept the resulting gap.
+
+Three expanding search folds remain entirely inside development. Their equal
+validation lengths are derived from the available development rows, preserving
+the declared horizon-specific purge/embargo. The final already-fitted Ridge fold
+is evaluated on the separate 06:00–08:00 validation view, with its training cutoff
+recorded. This does not refit on validation, add a model trial, or inspect sealed
+labels. Retain this report even when the development economic gate failed.
+
+Before `campaign-prepare` or `campaign-freeze`, run the ACK-native
+`mission campaign-precheck --feature FEATURES --materialization MATERIALIZATION
+--research-plan PLAN --output REPORT --research-plan-out CHECKED_PLAN`.
+It reports only development labels mature strictly before `develop_end`, with
+absolute-return quantiles, count/fraction above each row's unchanged round-trip
+cost, median spread, and median/min/max entry threshold. It emits an immutable
+report and a plan binding the report's source/input/calendar/cost identities.
+Preparation recomputes the report once during input admission; an authenticated
+preparation snapshot can reuse that verified report without reopening inputs.
+
+The new root grant must explicitly bind `fixed_calendar_validation_pre_holdout`
+view exposure. A prior grant reserving an unreported independent-selection view
+cannot authorize this report. Reporting validation does not grant final evaluation;
+the sealed 08:00–10:00 view stays closed. Calendar negatives cannot produce a
+selected pre-holdout candidate. The result bundle retains `calendar-validation.json`
+and independent readback reevaluates it from the same fitted weights and inputs.
 
 Report absolute cumulative-return quantiles for 5/10/30 seconds, the unchanged
 round-trip cost comparison, and counts/fractions of opportunities above cost.

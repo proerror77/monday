@@ -287,11 +287,8 @@ pub fn verify_materialization_manifest_metadata(
                 let segment_end = metadata
                     .end_received_at_ns
                     .context("raw segment end_received_at_ns must be an unsigned integer")?;
-                if segment_start < start {
-                    bail!("raw segment begins before the selected materialization window");
-                }
-                if segment_end > end {
-                    bail!("raw segment ends after the selected materialization window");
+                if segment_start > segment_end || segment_start >= end || segment_end < start {
+                    bail!("raw segment does not overlap the selected materialization window");
                 }
             }
         }
@@ -1215,10 +1212,10 @@ pub fn freeze_inventory_from_selection(
         }
     }
     if selection.raw.iter().any(|input| {
-        input.start_received_at_ns < request.start_received_at_ns
-            || input.end_received_at_ns > request.end_received_at_ns
+        input.start_received_at_ns >= request.end_received_at_ns
+            || input.end_received_at_ns < request.start_received_at_ns
     }) {
-        bail!("fresh window selection raw input exceeds its selected window");
+        bail!("fresh window selection raw input does not overlap its selected window");
     }
     build_frozen_inventory(
         request,
@@ -1306,11 +1303,15 @@ pub fn freeze_inventory(request: &InventoryRequest) -> Result<FrozenInventory> {
         }
         let start = uint(&manifest, "start_received_at_ns")?;
         let end = uint(&manifest, "end_received_at_ns")?;
-        if start < request.start_received_at_ns || end > request.end_received_at_ns {
-            continue;
-        }
         if start > end {
             bail!("inventory raw interval is reversed");
+        }
+        // Keep boundary blobs whole for hash/sequence verification. The native
+        // materializer clips output decisions and label maturity to WINDOW_*.
+        // Discarding a five-minute blob for a millisecond end overrun truncates
+        // the requested experiment even though those in-window bytes exist.
+        if start >= request.end_received_at_ns || end < request.start_received_at_ns {
+            continue;
         }
         validate_source_manifest(&manifest)?;
         // Materialization permits multiple replay sessions, but its strict
@@ -1624,7 +1625,19 @@ mod tests {
         for window in [
             (RECEIVED_NS + 1, RECEIVED_NS + 100),
             (RECEIVED_NS, RECEIVED_NS + 99),
+        ] {
+            assert!(check_materialization_metadata(
+                &bytes,
+                MaterializationManifestKind::Raw,
+                Market::Usdm,
+                Some(window)
+            )
+            .is_ok());
+        }
+        for window in [
             (RECEIVED_NS + 100, RECEIVED_NS),
+            (RECEIVED_NS + 101, RECEIVED_NS + 200),
+            (RECEIVED_NS - 100, RECEIVED_NS),
         ] {
             assert!(check_materialization_metadata(
                 &bytes,
@@ -2213,6 +2226,51 @@ mod tests {
             changed.image_ref = image.clone();
             assert!(freeze_inventory(&changed).is_err(), "{image}");
         }
+    }
+
+    #[test]
+    fn freeze_keeps_overlapping_boundary_blob_for_native_output_clipping() {
+        let (_directory, request) = fixture();
+        extra_raw(
+            &request,
+            "boundary",
+            request.end_received_at_ns - 100,
+            request.end_received_at_ns + 1,
+        );
+        extra_raw(
+            &request,
+            "after-window",
+            request.end_received_at_ns,
+            request.end_received_at_ns + 100,
+        );
+        let frozen = freeze_inventory(&request).unwrap();
+        assert_eq!(frozen.raw.len(), 2);
+        assert!(frozen
+            .raw
+            .iter()
+            .any(|input| input.relative_path == "boundary.jsonl.zst"));
+        assert!(frozen
+            .raw
+            .iter()
+            .all(|input| input.relative_path != "after-window.jsonl.zst"));
+        assert!(frozen.inventory_env.contains(&format!(
+            "WINDOW_END_RECEIVED_AT_NS={}\n",
+            request.end_received_at_ns
+        )));
+        let selection = select_fresh_window(&fresh_request(
+            &request,
+            FreshWindowMode::Explicit {
+                start_received_at_ns: request.start_received_at_ns,
+                end_received_at_ns: request.end_received_at_ns,
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            freeze_inventory_from_selection(&request, &selection)
+                .unwrap()
+                .inventory_sha256,
+            frozen.inventory_sha256
+        );
     }
 
     #[test]

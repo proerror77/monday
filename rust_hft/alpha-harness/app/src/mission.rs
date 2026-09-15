@@ -641,6 +641,7 @@ mod tests {
                             embargo_rows: 0,
                             sealed_holdout_rows: 30,
                             independent_selection_rows: None,
+                            calendar_binding_json: None,
                             fee_bps: 1.0,
                             rebate_bps: 0.0,
                             funding_bps: 0.0,

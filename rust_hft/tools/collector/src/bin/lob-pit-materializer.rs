@@ -77,6 +77,11 @@ struct Args {
     label_horizon_buckets: usize,
     #[arg(long, default_value_t = 5)]
     top_depth: usize,
+    /// Decision and label-maturity window; input blobs retain complete provenance.
+    #[arg(long, requires = "output_end_received_at_ns")]
+    output_start_received_at_ns: Option<u64>,
+    #[arg(long, requires = "output_start_received_at_ns")]
+    output_end_received_at_ns: Option<u64>,
     #[arg(long, required = true)]
     segment: Vec<PathBuf>,
     #[arg(long, required = true)]
@@ -137,6 +142,10 @@ struct MaterializationReport {
     bucket_ms: u64,
     label_horizon_buckets: usize,
     top_depth: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_start_received_at_ns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_end_received_at_ns: Option<u64>,
     source_revision: String,
     source_segments: Vec<SourceSegmentEvidence>,
     series_count: usize,
@@ -349,6 +358,7 @@ fn main() -> Result<()> {
 }
 
 fn materialize(args: &Args) -> Result<PublishedMaterialization> {
+    output_window(args)?;
     let mission_id = args.mission_id.trim();
     let symbol = args.symbol.trim().to_uppercase();
     if mission_id.is_empty() || symbol.is_empty() {
@@ -581,9 +591,11 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         bucket_ms: args.bucket_ms,
         label_horizon_buckets: args.label_horizon_buckets,
         top_depth: args.top_depth,
+        output_start_received_at_ns: args.output_start_received_at_ns,
+        output_end_received_at_ns: args.output_end_received_at_ns,
         source_revision: revision,
         source_segments,
-        series_count: usize::try_from(replay.series_id).context("series count overflow")?,
+        series_count: snapshot.series.len(),
         rows: rows.len(),
         first_event_time,
         last_event_time,
@@ -1338,6 +1350,17 @@ fn sample_book(
     })
 }
 
+fn output_window(args: &Args) -> Result<Option<(u64, u64)>> {
+    match (
+        args.output_start_received_at_ns,
+        args.output_end_received_at_ns,
+    ) {
+        (None, None) => Ok(None),
+        (Some(start), Some(end)) if start < end => Ok(Some((start, end))),
+        _ => bail!("output window requires both ordered receive-time bounds"),
+    }
+}
+
 fn materialize_rows(
     samples: &[BookSample],
     aggregate_trades: &[AggregateTrade],
@@ -1347,6 +1370,7 @@ fn materialize_rows(
     symbol: &str,
     ingestion_time: DateTime<Utc>,
 ) -> Result<Vec<PointInTimeFeatureRow>> {
+    let window = output_window(args)?;
     let mut rows = Vec::new();
     let aggregate_trades = aggregate_trades
         .iter()
@@ -1366,6 +1390,11 @@ fn materialize_rows(
         let previous = &samples[index - 1];
         let current = &samples[index];
         let future = &samples[index + args.label_horizon_buckets];
+        if window.is_some_and(|(start, end)| {
+            current.time_ns < start || current.time_ns >= end || future.time_ns >= end
+        }) {
+            continue;
+        }
         if previous.series_id != current.series_id || current.series_id != future.series_id {
             continue;
         }
@@ -1489,6 +1518,17 @@ fn materialize_rows(
     }
     if rows.len() < 3 {
         bail!("materialization produced fewer than three PIT rows");
+    }
+    // Cropping may remove an entire initial session. Preserve every remaining
+    // series boundary while giving the new immutable dataset contiguous IDs.
+    let mut previous = None;
+    let mut series_id = 0;
+    for row in &mut rows {
+        if previous != Some(row.series_id) {
+            previous = Some(row.series_id);
+            series_id += 1;
+        }
+        row.series_id = series_id;
     }
     Ok(rows)
 }
@@ -2121,6 +2161,7 @@ mod tests {
             Args {
                 mission_id: "data-btc-usdm-1".to_string(), symbol: "BTCUSDT".to_string(),
                 market: self.market, bucket_ms: 1_000, label_horizon_buckets: 2, top_depth: 5,
+                output_start_received_at_ns: None, output_end_received_at_ns: None,
                 segment: vec![self.data.clone()],
                 segment_content_sha256: vec![self.content_sha256.clone()], segment_manifest_sha256: vec![self.manifest_sha256.clone()],
                 artifact_dir: self.directory.join("artifacts"),
@@ -2263,6 +2304,46 @@ mod tests {
         incomplete.bids.remove(&Decimal::from(95));
         incomplete.bids.remove(&Decimal::from(96));
         assert!(sample_book(&incomplete, 1, event_ns(1_000), 5).is_err());
+    }
+
+    #[test]
+    fn output_window_clips_boundary_blob_and_label_maturity() {
+        let fixture = Fixture::new(Market::Usdm, &valid_rows("usdm"));
+        let mut args = fixture.args();
+        args.bucket_ms = 100;
+        args.output_start_received_at_ns = Some(event_ns(1_500));
+        args.output_end_received_at_ns = Some(event_ns(5_500));
+        let published = materialize(&args).unwrap();
+        let bytes = std::fs::read(&published.report.artifact_path).unwrap();
+        let rows: Vec<PointInTimeFeatureRow> = std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            rows.first().unwrap().event_time,
+            datetime_ns(event_ns(1_500)).unwrap()
+        );
+        assert_eq!(
+            rows.last().unwrap().event_time,
+            datetime_ns(event_ns(5_200)).unwrap()
+        );
+        assert!(rows.iter().all(
+            |row| row.event_time >= datetime_ns(event_ns(1_500)).unwrap()
+                && row.label_available_time < datetime_ns(event_ns(5_500)).unwrap()
+        ));
+        assert_eq!(
+            published.report.output_start_received_at_ns,
+            args.output_start_received_at_ns
+        );
+        assert_eq!(
+            published.report.output_end_received_at_ns,
+            args.output_end_received_at_ns
+        );
+        assert!(published.report.source_segments[0].start_received_at_ns < event_ns(1_500));
+        assert!(published.report.source_segments[0].end_received_at_ns > event_ns(5_500));
+        args.output_end_received_at_ns = None;
+        assert!(materialize(&args).is_err());
     }
 
     #[test]

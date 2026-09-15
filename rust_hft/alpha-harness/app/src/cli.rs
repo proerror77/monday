@@ -82,6 +82,8 @@ enum MissionCommand {
     Execute(Box<ExecuteMissionArgs>),
     CampaignExecute(CampaignExecuteArgs),
     CampaignFreeze(CampaignFreezeArgs),
+    /// Emit a development-only label report and bound plan before any freeze or fit.
+    CampaignPrecheck(CampaignPrecheckArgs),
     /// Prepare a bounded research matrix once, without signing or dispatching jobs.
     CampaignPrepare(CampaignPrepareArgs),
     /// Run or resume a declared ACK workflow through terminal Campaign readback.
@@ -324,6 +326,20 @@ pub struct CampaignPrepareArgs {
     pub plan: PathBuf,
     #[arg(long)]
     pub output_root: PathBuf,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CampaignPrecheckArgs {
+    #[arg(long)]
+    pub feature: PathBuf,
+    #[arg(long)]
+    pub materialization: PathBuf,
+    #[arg(long)]
+    pub research_plan: PathBuf,
+    #[arg(long)]
+    pub output: PathBuf,
+    #[arg(long)]
+    pub research_plan_out: PathBuf,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -707,6 +723,8 @@ pub struct ValidationArgs {
     /// Reserve a separate selection window, withheld from search and learning.
     #[arg(long)]
     pub independent_selection_rows: Option<usize>,
+    #[arg(long, hide = true)]
+    pub calendar_binding_json: Option<String>,
     #[arg(long, default_value_t = 2.0)]
     pub fee_bps: f64,
     #[arg(long, default_value_t = 0.0)]
@@ -746,6 +764,10 @@ impl ValidationArgs {
             embargo_rows: protocol.walk_forward.embargo_rows,
             sealed_holdout_rows: protocol.walk_forward.sealed_holdout_rows,
             independent_selection_rows: protocol.selection.as_ref().map(|selection| selection.rows),
+            calendar_binding_json: protocol
+                .calendar
+                .as_ref()
+                .map(|binding| serde_json::to_string(binding).expect("calendar is serializable")),
             fee_bps: protocol.costs.fee_bps,
             rebate_bps: protocol.costs.rebate_bps,
             funding_bps: protocol.costs.funding_bps,
@@ -791,10 +813,19 @@ impl ValidationArgs {
             },
             labels.clone(),
         )?;
-        match self.independent_selection_rows {
+        let mut protocol = match self.independent_selection_rows {
             Some(rows) => protocol.with_independent_selection(rows),
             None => Ok(protocol),
+        }?;
+        if let Some(binding) = &self.calendar_binding_json {
+            protocol.calendar = Some(
+                serde_json::from_str(binding)
+                    .map_err(|_| alpha_domain::DomainError::InvalidEvaluationProtocol)?,
+            );
+            protocol.version = alpha_domain::EVALUATION_PROTOCOL_VERSION_V3.into();
+            protocol.validate()?;
         }
+        Ok(protocol)
     }
 }
 
@@ -1162,6 +1193,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 mission_campaign::freeze(args)
             }
             MissionCommand::CampaignPrepare(args) => mission_campaign::preparation::prepare(args),
+            MissionCommand::CampaignPrecheck(args) => crate::mission_calendar::precheck(args),
             MissionCommand::CampaignWorkflow(args) => mission_campaign::workflow::run(args),
             MissionCommand::CampaignLearn(args) => {
                 tokio::task::spawn_blocking(move || mission_campaign::learn(args))
@@ -1327,7 +1359,7 @@ pub fn print_json(value: &impl serde::Serialize) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn require_cloud_data_host(os: &str) -> anyhow::Result<()> {
+pub(crate) fn require_cloud_data_host(os: &str) -> anyhow::Result<()> {
     if os != "linux" {
         anyhow::bail!("bulk CEX research, artifact verification and ledger execution belong in the ACK research Job; the workstation may sign control metadata and read lightweight reports");
     }
@@ -1812,6 +1844,7 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             embargo_rows: 1,
             sealed_holdout_rows: 64,
             independent_selection_rows: None,
+            calendar_binding_json: None,
             fee_bps: 1.0,
             rebate_bps: 0.25,
             funding_bps: 0.0,

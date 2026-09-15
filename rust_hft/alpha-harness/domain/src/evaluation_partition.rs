@@ -29,6 +29,13 @@ impl EvaluationProtocolV1 {
     pub fn row_partitions(&self, rows: usize) -> Result<EvaluationRowPartitionsV1, DomainError> {
         self.validate()?;
         let invalid = DomainError::InvalidEvaluationProtocol;
+        if self
+            .calendar
+            .as_ref()
+            .is_some_and(|calendar| calendar.total_rows != rows)
+        {
+            return Err(invalid);
+        }
         let holdout_start = rows
             .checked_sub(self.walk_forward.sealed_holdout_rows)
             .ok_or(invalid.clone())?;

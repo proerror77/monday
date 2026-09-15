@@ -184,6 +184,23 @@ impl PreparedDataset {
     pub fn protocol(&self) -> &EvaluationProtocolV1 {
         &self.protocol
     }
+
+    /// Calendar diagnostics can see development labels only, including mature
+    /// development-tail rows excluded from fitting by the stricter purge.
+    pub fn development_rows(&self) -> Option<&[ResearchRow]> {
+        self.protocol
+            .calendar
+            .as_ref()
+            .map(|calendar| &self.rows[..calendar.develop_end_row])
+    }
+
+    pub fn calendar_validation_rows(&self) -> Option<&[ResearchRow]> {
+        self.protocol.calendar.as_ref()?;
+        self.partitions
+            .selection
+            .as_ref()
+            .map(|range| &self.rows[range.clone()])
+    }
 }
 
 pub(crate) fn validate_row_clocks(
@@ -219,6 +236,15 @@ pub fn prepare_dataset(
     protocol
         .validate()
         .map_err(EvaluationError::InvalidConfiguration)?;
+    if let Some(binding) = &protocol.calendar {
+        let clocks = rows
+            .iter()
+            .map(|row| row.available_time)
+            .collect::<Vec<_>>();
+        if binding.calendar.resolve(&clocks, &protocol.labels).as_ref() != Ok(binding) {
+            return Err(EvaluationError::ProtocolMismatch);
+        }
+    }
     let config = &protocol.walk_forward;
     if rows.iter().any(|row| {
         [

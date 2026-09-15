@@ -45,6 +45,14 @@ one comparison-family trial bound across the groups. Each worker reserves only
 its own declared trials; factor and model scores use the shared statistical
 bound. Repeating or recovering a group retains that exact bound.
 
+For a fixed UTC H1 comparison, each research plan also carries the declared
+`calendar` and the native `development_precheck` receipt. Run
+`mission campaign-precheck` before preparation and use its checked research plan.
+The calendar resolves development, independent fitted-model validation and sealed
+rows from the original feature clocks. Preparation, signed view admission and
+worker/result readback bind those same boundaries; see the
+[H1 calendar contract](HOLD_TO_HORIZON_CONTRACT.md).
+
 ## Execution and recovery
 
 The coordinator calls the bundled canonical controller with prepared evidence:
@@ -65,8 +73,8 @@ can be read back, without new signing or dispatch.
 A normal research negative, including zero trades after costs, remains a
 completed member and does not cancel another member. H1's label precheck reports
 quantiles and the count/fraction of overlapping labels above cost using only
-the predeclared development/validation view. It never cancels an arm. Independent
-selection and sealed-test labels are excluded. Holding exceptions cannot pass
+the predeclared development view. It never cancels an arm. The later independent
+validation and sealed-test labels are excluded. Holding exceptions cannot pass
 the replay promotion gate. Fixed holding comparisons end without automatic
 changes to the entry policy or H2/H3 trials.
 

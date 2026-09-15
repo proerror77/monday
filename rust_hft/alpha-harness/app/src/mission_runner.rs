@@ -565,6 +565,9 @@ impl CexEventReplayReceiptV1 {
             ) | (
                 CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V4,
                 "independent_selection_frozen_model"
+            ) | (
+                CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V4,
+                "calendar_validation_fitted_model"
             )
         );
         let current_schema = self.schema_version == CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V4;
@@ -1227,8 +1230,8 @@ pub(crate) fn execute_report(
     let baseline_dataset = prepare_dataset(baseline_rows, &evaluation_protocol)?;
     let baseline_context = baseline_dataset.engine_context();
     if !control_mission.spec.supervised_model_scope.is_default() {
-        let precheck = alpha_engine::label_precheck::label_space_precheck(
-            &baseline_context,
+        let precheck = alpha_engine::label_precheck::dataset_label_space_precheck(
+            &baseline_dataset,
             &supervised_decision_policy,
         )
         .map_err(anyhow::Error::msg)?;
@@ -1441,6 +1444,49 @@ pub(crate) fn execute_report(
         })
         .transpose()?
         .flatten();
+    if evaluation_protocol.calendar.is_some() {
+        if let (Some(model), Some(ridge)) = (&supervised_model, &baseline_run.ridge) {
+            let validation = alpha_engine::final_models::evaluate_calendar_validation(
+                &baseline_dataset,
+                &factor_bank,
+                ridge,
+                &model.candidate,
+                control_mission.spec.instrument.venue.as_str(),
+                control_mission.spec.instrument.market.as_str(),
+                &control_mission.spec.instrument.symbol,
+                &research_mission,
+            )
+            .map_err(anyhow::Error::msg)?;
+            if calendar_replay_required(&validation) {
+                run_calendar_validation_replay(
+                    &results_dir,
+                    &control_mission,
+                    &materialization,
+                    &materialization_sha256,
+                    &feature_decision_clocks,
+                    &validation,
+                    &replay_policy,
+                    &replay_artifact_path,
+                    &replay_artifact_sha256,
+                    &replay_manifest_path,
+                    &args.replay_manifest_sha256,
+                )?;
+            }
+            data_mission::write_json_atomic(
+                &results_dir.join("calendar-validation.json"),
+                &validation,
+            )?;
+            research_event(
+                "alpha-harness",
+                "calendar_validation_completed",
+                serde_json::json!({
+                    "source_model":validation.source_model, "calendar":validation.calendar,
+                    "last_training_time":validation.last_training_time,
+                    "evaluation":evaluation_log_summary(&validation.report.evaluation), "promotion_authority":false,
+                }),
+            );
+        }
+    }
     let supervised_replay_report = supervised_model
         .as_ref()
         .filter(|evaluation| evaluation.candidate.evaluation.passed)
@@ -2907,6 +2953,177 @@ pub(crate) fn run_frozen_model_event_replay(
         replay_manifest_path,
         replay_manifest_sha256,
     )
+}
+
+pub(crate) fn calendar_replay_required(
+    validation: &alpha_engine::final_models::CalendarValidationReportV1,
+) -> bool {
+    validation.report.ledger.iter().any(|point| {
+        point.target_position.abs() > f64::EPSILON
+            || point
+                .entry_target
+                .is_some_and(|position| position.abs() > f64::EPSILON)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_calendar_validation_replay(
+    results: &Path,
+    mission: &CexResearchMissionArtifactV1,
+    materialization: &Materialization,
+    materialization_sha256: &str,
+    all_clocks: &[data_mission::FeatureDecisionClock],
+    validation: &alpha_engine::final_models::CalendarValidationReportV1,
+    policy: &CexEventReplayPolicyV1,
+    tape: &Path,
+    tape_sha256: &str,
+    manifest: &Path,
+    manifest_sha256: &str,
+) -> anyhow::Result<CexEventReplayReceiptV1> {
+    let protocol = &mission.spec.evaluation_protocol;
+    let partitions = protocol.row_partitions(all_clocks.len())?;
+    let clocks = frozen_selection_replay_clocks(
+        all_clocks,
+        partitions
+            .selection
+            .context("calendar validation requires a separate view")?,
+        partitions.sealed_holdout.start,
+        protocol.labels.observation_frequency_millis,
+        policy.max_decision_delay_millis,
+    )?;
+    let decision = bound_supervised_decision_policy(mission)?;
+    let evaluator = validation.report.evaluation.formula_config()?;
+    let observations = validation
+        .report
+        .ledger
+        .iter()
+        .map(|row| (row.series_id, row.available_time))
+        .collect::<Vec<_>>();
+    let reference = content_reference(
+        &format!("calendar-validation-{}", canonical_json_hash(validation)?),
+        validation,
+    )?;
+    run_cex_target_position_replay(
+        results,
+        "calendar-validation-event-replay-receipt.json",
+        &mission.semantic_id()?,
+        mission,
+        materialization,
+        materialization_sha256,
+        &observations,
+        &clocks,
+        CexReplayCandidateInput {
+            openings: holding_opening_signals(&validation.report, true)?,
+            holding: decision.holding,
+            reference,
+            positions: validation
+                .report
+                .ledger
+                .iter()
+                .map(|row| row.target_position)
+                .collect(),
+            max_abs_position: decision.max_abs_position,
+            max_drawdown: evaluator.max_drawdown,
+            position_notional_usd: protocol.costs.position_notional_usd,
+            capacity_depth_levels: protocol.costs.capacity_depth_levels,
+            max_book_depth_fraction: protocol.costs.max_book_depth_fraction,
+            decision_scope: "calendar_validation_fitted_model",
+            research_decision_count: validation.report.ledger.len(),
+            minimum_mean_net_return: Some(evaluator.min_fold_mean_return),
+            minimum_net_sharpe: Some(evaluator.min_aggregate_score),
+            costs: protocol.costs.clone(),
+        },
+        policy,
+        tape,
+        tape_sha256,
+        manifest,
+        manifest_sha256,
+    )
+}
+
+pub(crate) fn validate_calendar_replay_binding(
+    replay: &CexEventReplayReceiptV1,
+    validation: &alpha_engine::final_models::CalendarValidationReportV1,
+    mission: &CexResearchMissionArtifactV1,
+) -> anyhow::Result<()> {
+    validate_current_replay_receipt(replay, mission)?;
+    let policy = bound_supervised_decision_policy(mission)?;
+    let reference = content_reference(
+        &format!("calendar-validation-{}", canonical_json_hash(validation)?),
+        validation,
+    )?;
+    let evaluator = validation.report.evaluation.formula_config()?;
+    if replay.decision_scope != "calendar_validation_fitted_model"
+        || replay.strategy != reference
+        || replay.mission_id != mission.semantic_id()?
+        || replay.dataset != mission.spec.inputs.dataset
+        || replay.materialization != mission.spec.inputs.materialization
+        || replay.source != mission.spec.inputs.source
+        || replay.replay_config.holding != policy.holding
+        || mission.spec.evaluation_protocol.calendar.as_ref() != Some(&validation.calendar)
+        || validation
+            .report
+            .ledger
+            .first()
+            .is_none_or(|row| row.available_time < validation.calendar.calendar.develop_end)
+        || validation
+            .report
+            .ledger
+            .last()
+            .is_none_or(|row| row.available_time >= validation.calendar.calendar.validation_end)
+        || (replay.gate.passed
+            && (replay.metrics.mean_net_return <= evaluator.min_fold_mean_return
+                || replay.metrics.net_sharpe < evaluator.min_aggregate_score))
+    {
+        bail!("calendar replay differs from its fitted validation report or UTC window");
+    }
+    Ok(())
+}
+
+fn validate_calendar_replay_decisions(
+    replay: &CexEventReplayReceiptV1,
+    validation: &alpha_engine::final_models::CalendarValidationReportV1,
+    dataset: &alpha_engine::evaluation::PreparedDataset,
+) -> anyhow::Result<()> {
+    let rows = dataset
+        .calendar_validation_rows()
+        .context("calendar replay has no admitted validation rows")?;
+    let frequency = i64::try_from(dataset.protocol().labels.observation_frequency_millis)?;
+    let end = rows
+        .last()
+        .context("empty calendar validation")?
+        .available_time
+        .checked_add_signed(chrono::TimeDelta::milliseconds(frequency))
+        .context("calendar replay tail overflow")?;
+    if end >= validation.calendar.calendar.validation_end {
+        bail!("calendar replay tail reaches sealed");
+    }
+    let clocks = rows
+        .iter()
+        .map(|row| data_mission::FeatureDecisionClock {
+            series_id: row.series_id,
+            feature_available_time: row.available_time,
+            series_close_time: row.label_available_time.min(end),
+        })
+        .collect::<Vec<_>>();
+    let (mut decisions, _) = canonical_target_position_decisions(
+        &clocks,
+        validation
+            .report
+            .ledger
+            .iter()
+            .map(|row| row.target_position)
+            .collect(),
+    )?;
+    let openings = holding_opening_signals(&validation.report, true)?
+        .context("calendar replay requires holding openings")?;
+    for decision in &mut decisions {
+        decision.entry_target = Some(openings.get(&decision.timestamp_us).copied().unwrap_or(0.0));
+    }
+    if replay.decision_sha256 != canonical_json_hash(&decisions)? {
+        bail!("calendar replay decisions differ from independently evaluated fitted weights");
+    }
+    Ok(())
 }
 
 fn frozen_selection_replay_clocks(
@@ -4532,6 +4749,18 @@ fn validate_model_metric_readback(
     selection: Option<&CexSupervisedModelSelectionV1>,
     candidates: &std::collections::BTreeMap<&str, CexResearchContentRefV1>,
 ) -> anyhow::Result<()> {
+    let calendar_artifacts_present = archive.file_names().any(|name| {
+        matches!(
+            name,
+            "results/calendar-validation.json"
+                | "results/calendar-validation-event-replay-receipt.json"
+        )
+    });
+    if calendar_artifacts_present
+        && (mission.spec.evaluation_protocol.calendar.is_none() || selection.is_none())
+    {
+        bail!("calendar validation artifacts lack an admitted calendar and fitted model");
+    }
     let report_bytes = read_optional_bundle_bytes(
         archive,
         &format!("results/{}", crate::mission_metrics::METRICS_JSON),
@@ -4552,8 +4781,8 @@ fn validate_model_metric_readback(
         let dataset = verification_dataset
             .as_ref()
             .context("precheck readback dataset missing")?;
-        let expected = alpha_engine::label_precheck::label_space_precheck(
-            &dataset.engine_context(),
+        let expected = alpha_engine::label_precheck::dataset_label_space_precheck(
+            dataset,
             &bound_supervised_decision_policy(mission)?,
         )
         .map_err(anyhow::Error::msg)?;
@@ -4616,6 +4845,57 @@ fn validate_model_metric_readback(
             &baseline_policy.evaluator_config,
         )
         .map_err(anyhow::Error::msg)?;
+        if name == "ridge" && mission.spec.evaluation_protocol.calendar.is_some() {
+            let bank: CexFactorBankRevisionV2 = read_bundle_json(
+                archive,
+                "results/factor-bank.json",
+                MAX_MATERIALIZATION_BYTES,
+            )?
+            .context("calendar validation lacks Factor Bank")?;
+            let baseline: CexBaselineArtifactV1 = read_bundle_json(
+                archive,
+                "results/ridge-baseline.json",
+                MAX_MATERIALIZATION_BYTES,
+            )?
+            .context("calendar validation lacks fitted Ridge")?;
+            let research: ResearchMission =
+                read_bundle_json(archive, "results/mission.json", MAX_MATERIALIZATION_BYTES)?
+                    .context("calendar validation lacks source Mission")?;
+            let expected = alpha_engine::final_models::evaluate_calendar_validation(
+                &dataset,
+                &bank,
+                &baseline,
+                &evaluation.candidate,
+                mission.spec.instrument.venue.as_str(),
+                mission.spec.instrument.market.as_str(),
+                &mission.spec.instrument.symbol,
+                &research,
+            )
+            .map_err(anyhow::Error::msg)?;
+            let actual: alpha_engine::final_models::CalendarValidationReportV1 = read_bundle_json(
+                archive,
+                "results/calendar-validation.json",
+                crate::mission_metrics::MAX_BACKTEST_BYTES,
+            )?
+            .context("calendar validation result missing")?;
+            if actual != expected {
+                bail!("calendar validation differs from independently evaluated fitted weights");
+            }
+            let replay: Option<CexEventReplayReceiptV1> = read_bundle_json(
+                archive,
+                "results/calendar-validation-event-replay-receipt.json",
+                512 * 1024,
+            )?;
+            if calendar_replay_required(&expected) {
+                let replay = replay
+                    .context("nonzero calendar validation is missing observed event replay")?;
+                validate_calendar_replay_binding(&replay, &expected, mission)?;
+                validate_calendar_replay_decisions(&replay, &expected, &dataset)?;
+                validate_replay_trace_readback(archive, &replay)?;
+            } else if replay.is_some() {
+                bail!("zero-position calendar validation has unexpected event replay");
+            }
+        }
         inputs.push(
             alpha_engine::model_metrics::summarize_model_evaluation(
                 &evaluation,
@@ -9354,6 +9634,7 @@ message binance_replay {
             embargo_rows: 1,
             sealed_holdout_rows: 30,
             independent_selection_rows: None,
+            calendar_binding_json: None,
             fee_bps: 2.0,
             rebate_bps: 0.0,
             funding_bps: 0.0,

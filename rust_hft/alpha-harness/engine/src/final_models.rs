@@ -44,6 +44,151 @@ pub fn freeze_supervised_candidate(
     mission: &alpha_domain::ResearchMission,
     max_final_candidates: u32,
 ) -> Result<FrozenSupervisedCandidateV1, String> {
+    if !candidate.evaluation.passed {
+        return Err("frozen model requires passing search evidence".into());
+    }
+    fitted_candidate(
+        context,
+        bank,
+        baseline,
+        candidate,
+        venue,
+        market,
+        symbol,
+        mission,
+        max_final_candidates,
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CalendarValidationReportV1 {
+    pub schema_version: String,
+    pub calendar: alpha_domain::EvaluationCalendarBindingV1,
+    pub source_model: CexResearchContentRefV1,
+    pub source_candidate: CexResearchContentRefV1,
+    pub source_fold: CexResearchContentRefV1,
+    pub last_training_time: chrono::DateTime<chrono::Utc>,
+    pub max_absolute_prediction_bps: f64,
+    pub median_spread_bps: Option<f64>,
+    pub median_entry_cost_bps: Option<f64>,
+    pub report: PositionEvaluationReport,
+    pub promotion_authority: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CalendarValidationSummaryV1 {
+    pub calendar: alpha_domain::EvaluationCalendarBindingV1,
+    pub source_model: CexResearchContentRefV1,
+    pub source_candidate: CexResearchContentRefV1,
+    pub last_training_time: chrono::DateTime<chrono::Utc>,
+    pub max_absolute_prediction_bps: f64,
+    pub median_spread_bps: Option<f64>,
+    pub median_entry_cost_bps: Option<f64>,
+    pub evaluation: alpha_domain::CandidateEvaluation,
+    pub report_content_sha256: String,
+}
+
+impl CalendarValidationReportV1 {
+    pub fn summary(&self) -> Result<CalendarValidationSummaryV1, String> {
+        Ok(CalendarValidationSummaryV1 {
+            calendar: self.calendar.clone(),
+            source_model: self.source_model.clone(),
+            source_candidate: self.source_candidate.clone(),
+            last_training_time: self.last_training_time,
+            max_absolute_prediction_bps: self.max_absolute_prediction_bps,
+            median_spread_bps: self.median_spread_bps,
+            median_entry_cost_bps: self.median_entry_cost_bps,
+            evaluation: self.report.evaluation.clone(),
+            report_content_sha256: canonical_json_hash(self).map_err(|e| e.to_string())?,
+        })
+    }
+}
+
+/// Report the held-out validation result even when development economics fail.
+/// No refit, final precommit, holdout claim or deployable candidate is returned.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_calendar_validation(
+    dataset: &PreparedDataset,
+    bank: &CexFactorBankRevisionV2,
+    baseline: &CexBaselineArtifactV1,
+    candidate: &CexSupervisedModelCandidateV2,
+    venue: &str,
+    market: &str,
+    symbol: &str,
+    mission: &alpha_domain::ResearchMission,
+) -> Result<CalendarValidationReportV1, String> {
+    let calendar = dataset
+        .protocol()
+        .calendar
+        .clone()
+        .ok_or("calendar validation requires a bound calendar")?;
+    if baseline.model_kind != alpha_domain::CexBaselineModelKindV1::Ridge {
+        return Err("calendar H1 evaluates Ridge only".into());
+    }
+    let context = dataset.engine_context();
+    let fitted = fitted_candidate(
+        &context, bank, baseline, candidate, venue, market, symbol, mission, 1,
+    )?;
+    let last_training_row = context
+        .folds()
+        .last()
+        .ok_or("missing fitted fold")?
+        .train
+        .end
+        .checked_sub(1)
+        .ok_or("empty training fold")?;
+    let report = evaluate_frozen_selection(&fitted, dataset)?;
+    let rows = independent_selection_rows(dataset)?;
+    let mut costs = rows
+        .iter()
+        .map(|row| {
+            let cost = crate::baselines::decision_costs(row, &dataset.protocol().costs)?;
+            Ok(
+                (candidate.decision_policy.round_trip_cost_multiplier * cost.one_way_cost_bps
+                    + cost.funding_bps)
+                    .max(0.0),
+            )
+        })
+        .collect::<Result<Vec<f64>, String>>()?;
+    costs.sort_by(f64::total_cmp);
+    let mut spreads = rows
+        .iter()
+        .filter_map(|row| row.features.get("spread_bps").copied())
+        .collect::<Vec<_>>();
+    spreads.sort_by(f64::total_cmp);
+    Ok(CalendarValidationReportV1 {
+        schema_version: "monday.calendar_validation.v1".into(),
+        calendar,
+        source_model: fitted.source_model.clone(),
+        source_candidate: fitted.source_candidate.clone(),
+        source_fold: fitted.source_fold.clone(),
+        last_training_time: context.rows()[last_training_row].available_time,
+        max_absolute_prediction_bps: report
+            .ledger
+            .iter()
+            .map(|row| row.prediction.abs() * 10_000.0)
+            .fold(0.0, f64::max),
+        median_spread_bps: crate::label_precheck::median(&spreads),
+        median_entry_cost_bps: crate::label_precheck::median(&costs),
+        report,
+        promotion_authority: false,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fitted_candidate(
+    context: &EngineContext<'_>,
+    bank: &CexFactorBankRevisionV2,
+    baseline: &CexBaselineArtifactV1,
+    candidate: &CexSupervisedModelCandidateV2,
+    venue: &str,
+    market: &str,
+    symbol: &str,
+    mission: &alpha_domain::ResearchMission,
+    max_final_candidates: u32,
+) -> Result<FrozenSupervisedCandidateV1, String> {
     bank.validate().map_err(|e| e.to_string())?;
     baseline.validate().map_err(|e| e.to_string())?;
     if !crate::baselines::baseline_training_admitted(baseline) {
@@ -73,7 +218,6 @@ pub fn freeze_supervised_candidate(
             .formula_config()
             .map_err(|e| e.to_string())?
             != baseline.baseline_policy.evaluator_config
-        || !candidate.evaluation.passed
     {
         return Err("frozen model source, policy or search evidence mismatch".into());
     }
