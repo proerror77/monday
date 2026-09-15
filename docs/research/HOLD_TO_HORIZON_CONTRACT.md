@@ -70,7 +70,9 @@ row boundaries from actual clocks, preserving warm-up and label-tail exclusions;
 the worker resolves them again. A row count cannot substitute for this calendar.
 Admission allows at most two initial buckets (bucket alignment plus the previous
 book sample) and `h + 1` trailing buckets for label maturity/end alignment. It
-rejects any larger endpoint truncation. The H1 plan requires the exact registered
+rejects any larger endpoint truncation. The retained calendar must also have every
+interior observation bucket; a gap fails calendar admission before any fitting.
+The H1 plan requires the exact registered
 5/10/30-second purge/embargo tuples, seeds 7/11, unchanged snapshot GP templates,
 and the complete 138-trial comparison-family correction.
 

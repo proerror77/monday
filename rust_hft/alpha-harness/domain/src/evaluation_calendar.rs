@@ -72,7 +72,9 @@ impl EvaluationCalendarV1 {
             || clocks[0] > latest_start
             || clocks[clocks.len() - 1] >= self.end
             || clocks[clocks.len() - 1] < earliest_end
-            || clocks.windows(2).any(|pair| pair[0] >= pair[1])
+            || clocks.windows(2).any(|pair| {
+                pair[1].signed_duration_since(pair[0]) != chrono::TimeDelta::milliseconds(millis)
+            })
         {
             return Err(DomainError::InvalidEvaluationProtocol);
         }
@@ -217,6 +219,9 @@ mod tests {
             let mut drifted = clocks.clone();
             drifted[14_398] -= TimeDelta::seconds(1);
             assert!(calendar.resolve(&drifted, &protocol.labels).is_err());
+            let mut missing_bucket = clocks.clone();
+            missing_bucket.remove(7_200);
+            assert!(calendar.resolve(&missing_bucket, &protocol.labels).is_err());
             let bound = binding.bind(protocol).unwrap();
             let parts = bound.row_partitions(clocks.len()).unwrap();
             assert!(clocks[parts.search.end - 1] < calendar.develop_end);
