@@ -221,7 +221,9 @@ and (.production_runtime | type == "object"
     and ((.usdm.symbols | split(",") | unique) | length == 100)))
 and (.production_process | type == "object"
   and (keys | sort) == ["spot", "usdm"]
-  and all(.[]; (keys | sort) == ["active", "process_exe_sha256"]
+  and all(.[]; (keys | sort) == ["active", "main_pid", "n_restarts", "process_exe_sha256"]
+    and (.main_pid | type == "number" and floor == . and . >= 1)
+    and (.n_restarts | type == "number" and floor == . and . >= 0)
     and .active == true
     and (.process_exe_sha256 | type == "string" and test("^[a-f0-9]{64}$"))))
 and (.production_memory | . as $pm

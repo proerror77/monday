@@ -1317,8 +1317,8 @@ monday_validate_lob_production_snapshot() {
 }
 
 # Emit the stable production contract for comparison between the Gate start and
-# every later resource-monitor sample. A baseline restart may change
-# PID/NRestarts; each full snapshot still proves cgroup membership,
+# every later resource-monitor sample. A PID/restart change interrupts capture
+# and invalidates the Gate; each full snapshot also proves cgroup membership,
 # active state, executable digest, limits, and OOM counters independently.
 monday_lob_production_snapshot_identity() {
   [[ $# -eq 1 ]] || return 2
@@ -1330,7 +1330,7 @@ monday_lob_production_snapshot_identity() {
       systemd_production_slice_memory_high_bytes,systemd_production_slice_memory_max_bytes,
       target_production_slice_memory_high_bytes,target_production_slice_memory_max_bytes,
       children: (.children | with_entries(.value |= {
-        market,slice,control_group,process_exe_sha256,active,
+        market,slice,control_group,main_pid,n_restarts,process_exe_sha256,active,
         systemd_memory_max_bytes,memory_max_bytes
       }))}'
   if [[ -f $source && ! -L $source ]]; then
@@ -1684,7 +1684,9 @@ monday_validate_v2_gate() {
           and ((.usdm.symbols | split(",") | unique) | length == 100)))
       and (.production_process | type == "object"
         and (keys | sort) == ["spot", "usdm"]
-        and all(.[]; (keys | sort) == ["active", "process_exe_sha256"]
+        and all(.[]; (keys | sort) == ["active", "main_pid", "n_restarts", "process_exe_sha256"]
+          and (.main_pid | type == "number" and floor == . and . >= 1)
+          and (.n_restarts | type == "number" and floor == . and . >= 0)
           and .active == true
           and (.process_exe_sha256 | type == "string" and test("^[a-f0-9]{64}$"))))
       and (.production_memory | . as $pm

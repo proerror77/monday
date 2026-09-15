@@ -467,8 +467,8 @@ for mutation in extra-child non-direct wrong-limit identity; do
   if [[ $mutation == identity ]]; then
     monday_validate_lob_production_snapshot "$mutated_snapshot"
     mutated_identity=$(monday_lob_production_snapshot_identity "$mutated_snapshot")
-    [[ $mutated_identity == "$production_identity" ]] || {
-      printf 'production snapshot identity changed after PID/restart-only drift\n' >&2
+    [[ $mutated_identity != "$production_identity" ]] || {
+      printf 'production snapshot identity ignored PID/restart drift\n' >&2
       exit 1
     }
   elif monday_validate_lob_production_snapshot "$mutated_snapshot"; then
@@ -2778,7 +2778,7 @@ ln -s "$ROOT/opt/monday/releases/binance-lob-controller/active/deployment/binanc
 
 # Restore uses the same two-stage systemd proof as Cutover: signed aggregate
 # configuration before unmask, then exact child membership after both starts.
-for restore_failure in config membership; do
+for restore_failure in config membership lifetime; do
   rm -f -- "$ROOT/data/monday/evidence/restores/$c2/restore.json" \
     "$ROOT/data/monday/evidence/restores/$c2/restore.json.sha256" \
     "$ROOT/run/restore-fixture.calls"
@@ -2786,6 +2786,8 @@ for restore_failure in config membership; do
     MONDAY_RESTORE_FIXTURE_PID="$restore_fixture_pid" MONDAY_ROOT="$ROOT")
   if [[ $restore_failure == config ]]; then
     restore_env+=(MONDAY_RESTORE_FIXTURE_BAD_CONFIG=1)
+  elif [[ $restore_failure == lifetime ]]; then
+    restore_env+=(MONDAY_RESTORE_FIXTURE_RUNTIME_MAX=6h)
   else
     restore_env+=(MONDAY_RESTORE_FIXTURE_BAD_MEMBERSHIP=1)
   fi
@@ -2800,6 +2802,12 @@ for restore_failure in config membership; do
     printf 'restore crossed the production start boundary before slice configuration validation\n' >&2
     exit 1
   }
+  if [[ $restore_failure == lifetime ]]; then
+    if grep -Eq '^start binance-lob-archiver-production@(spot|usdm)\.service$' "$ROOT/run/restore-fixture.calls"; then
+      printf 'restore started a collector with a stale six-hour lifetime\n' >&2
+      exit 1
+    fi
+  fi
   if [[ $restore_failure == membership ]]; then
     [[ $(grep -Ec '^start binance-lob-archiver-production@(spot|usdm)\.service$' \
       "$ROOT/run/restore-fixture.calls") -eq 2 ]] || {

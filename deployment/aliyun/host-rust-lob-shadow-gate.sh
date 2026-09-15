@@ -847,10 +847,10 @@ refresh_production_snapshot() {
     parent_memory_current_bytes,parent_memory_peak_bytes,parent_memory_anon_bytes,parent_memory_file_bytes,parent_memory_stat,
     child_memory_max_sum_bytes,parent_memory_events}
     | .parent_memory_stat.anon=$anon | .parent_memory_stat.file=$file' <<<"$production_snapshot_json")
-  # The Gate's stable production contract permits the six-hour lifecycle
-  # restart, so PID/NRestarts remain audit fields.  Every full snapshot still
-  # proves active child membership and the exact executable digest.
-  production_process_json=$(jq -c '(.children | with_entries(.value |= {process_exe_sha256,active}))' <<<"$production_snapshot_json")
+  # Every production restart interrupts the archive, including a timed restart
+  # of a pre-migration baseline. Keep process identity in both comparison and
+  # the final receipt; a changed PID/restart counter invalidates this Gate.
+  production_process_json=$(jq -c '(.children | with_entries(.value |= {main_pid,n_restarts,process_exe_sha256,active}))' <<<"$production_snapshot_json")
   if [[ -z ${production_snapshot_identity_json:-} ]]; then
     production_snapshot_identity_json=$first_identity
   fi

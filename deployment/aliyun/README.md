@@ -190,7 +190,7 @@ Every other check is a warning — reported in the JSON `warnings` array and as
 | Warning | Condition |
 | --- | --- |
 | `/data` disk | free <= 25% (warn) via `df -Pk /data`; free <= 15% is hard gate 5 above |
-| Governed services | `binance-lob-archiver-production@spot/usdm`, `binance-usdm-reference-collector`, `bybit-options-archiver` active AND enabled AND `Result==success`, plus a restart-rate delta > 1 since the last poll |
+| Governed services | `binance-lob-archiver-production@spot/usdm`, `binance-usdm-reference-collector`, `bybit-options-archiver` active AND enabled AND `Result==success`, plus any positive Binance LOB restart delta (other services: > 1) since the last poll |
 | Upload lane units | upload/fee timers active AND enabled; their oneshot services' last `Result==success` |
 | `health.json` | missing/unparseable, wall-clock age of `updated_at_ns` > 300s, or `sequence_gaps` > 0 (spot + usdm spools) |
 | Delay-gate trips | > 0 journald `source-to-receive delay exceeds the governed limit` lines per Binance unit in the last 15 minutes |
@@ -201,8 +201,8 @@ Production Binance LOB capture has no scheduled lifetime limit
 (`RuntimeMaxSec=infinity`): a six-hour restart would necessarily interrupt
 every eight-hour research window. Shadow/Gate jobs retain finite deadlines.
 The persistent-service check uses restart deltas rather than lifetime counts;
-crash loops are detected through `Result != success` or an `NRestarts` delta
-greater than one between consecutive five-minute polls. Process health does
+crash loops are detected through `Result != success` or any positive `NRestarts` delta
+for either Binance LOB production instance between consecutive five-minute polls. Process health does
 not prove archive continuity. A new snapshot after reconnect does not restore
 unrecorded depth events.
 Production startup is bounded at 120 seconds. Five failed starts inside the
@@ -286,6 +286,10 @@ negative report and exits nonzero. `eight_hour_tape_available` requires a
 verified window of at least eight hours; native materialization and per-second
 calendar admission are still required separately. Manifest or index parse/hash
 errors fail before a report is emitted.
+
+Dynamic `SYMBOLS=ALL` catalog refresh runs independently of event consumption;
+only a real scope change rolls the capture generation. That boundary is explicit
+and is never joined into a continuous research span.
 
 Removing the six-hour systemd deadline does not provide seamless WebSocket
 handover. A disconnected depth shard invalidates affected books and requests
@@ -720,8 +724,11 @@ session tasks. This prevents bounded final segment compression (up to
 space emits a warning but does not pause collection. Successfully uploaded segments are deleted
 from the local spool immediately. Pending segments are retained when OSS upload
 fails so the collector never creates a silent data hole merely to reclaim space.
-The shared pending-diff budget still bounds initialization bursts. Services restart
-every six hours to refresh the active-symbol catalog.
+The shared pending-diff budget still bounds initialization bursts. The collector refreshes
+the dynamic active-symbol catalog in the background every six hours. A changed
+`SYMBOLS=ALL` catalog starts a new capture generation after preserving the old
+tail as unsafe; unchanged catalogs keep their existing recording. The fixed
+USD-M top100 scope has no scheduled generation or process restart.
 
 The snapshot bridge timeout is 120 seconds after the last initial snapshot request
 finishes. This gives the full-market queue time to apply the tail of Spot and USD-M

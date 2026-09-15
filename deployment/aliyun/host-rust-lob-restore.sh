@@ -138,6 +138,7 @@ if [[ $TEST_ONLY == true && ${MONDAY_RESTORE_FIXTURE_SYSTEMD:-0} == 1 ]]; then
           SubState) [[ ${fixture_unit_state[$unit]:-inactive} == active ]] && printf 'running\n' || printf 'dead\n' ;;
           UnitFileState) printf '%s\n' "${fixture_unit_file_state[$unit]:-disabled}" ;;
           MainPID) printf '%s\n' "${MONDAY_RESTORE_FIXTURE_PID:-${fixture_pid_from_receipt:-$$}}" ;;
+          RuntimeMaxUSec) printf '%s\n' "${MONDAY_RESTORE_FIXTURE_RUNTIME_MAX:-infinity}" ;;
           NRestarts) printf '0\n' ;;
           *) printf '\n' ;;
         esac
@@ -890,6 +891,8 @@ if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
     || die 'permanent production slice verification failed before restore'
   systemctl unmask --runtime binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service \
     || die 'could not unmask V2 production lanes'
+  monday_rust_lob_verify_systemd_production_lifetime \
+    || die 'loaded production lifetime differs from the continuous capture contract during restore'
   systemctl start binance-lob-archiver-production@spot.service \
     || die 'Spot failed to start during restore'
   systemctl start binance-lob-archiver-production@usdm.service \

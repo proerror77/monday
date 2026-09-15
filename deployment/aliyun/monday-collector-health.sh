@@ -403,7 +403,11 @@ check_service() {
     case "$prior" in (*[!0-9]*|'') prior="" ;; esac
     if [ -n "$prior" ]; then
       delta=$((nrestarts - prior))
-      if [ "$delta" -gt "$RESTART_MAX_DELTA" ]; then
+      restart_limit=$RESTART_MAX_DELTA
+      case "$unit" in
+        binance-lob-archiver-production@spot.service|binance-lob-archiver-production@usdm.service) restart_limit=0 ;;
+      esac
+      if [ "$delta" -gt "$restart_limit" ]; then
         record_warning "$label: restart rate high (NRestarts $prior -> $nrestarts)"
       fi
     fi

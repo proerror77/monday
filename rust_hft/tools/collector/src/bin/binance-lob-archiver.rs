@@ -99,6 +99,7 @@ struct Args {
 
 #[derive(Debug, Clone)]
 struct Config {
+    dynamic_symbols: bool,
     market: Market,
     dataset: String,
     shard_id: String,
@@ -407,6 +408,7 @@ impl Config {
         let dataset = env_string("DATASET", &format!("{}_all", market.as_str()));
         validate_dataset_contract(market, &dataset, &catalog.symbols)?;
         Ok(Self {
+            dynamic_symbols: setting.eq_ignore_ascii_case("ALL"),
             market,
             dataset,
             shard_id: env_string("SHARD_ID", "all"),
@@ -449,6 +451,23 @@ impl Config {
     /// its recorded five stream families.
     fn stream_types(&self) -> Vec<String> {
         stream_types_for_dataset(self.market, &self.dataset)
+    }
+
+    fn catalog_changed(&self, catalog: &SymbolCatalog) -> bool {
+        self.dynamic_symbols && (self.active_symbols().into_iter().collect::<BTreeSet<_>>()
+            != catalog.symbols.iter().cloned().collect::<BTreeSet<_>>()
+            || self.security_token_symbols.iter().collect::<BTreeSet<_>>()
+                != catalog.security_token_symbols.iter().collect::<BTreeSet<_>>())
+    }
+
+    fn with_catalog(&self, catalog: SymbolCatalog) -> anyhow::Result<Self> {
+        anyhow::ensure!(!catalog.symbols.is_empty(), "refreshed catalog is empty");
+        validate_dataset_contract(self.market, &self.dataset, &catalog.symbols)?;
+        let mut updated = self.clone();
+        updated.symbols = catalog.symbols;
+        updated.security_token_symbols = catalog.security_token_symbols;
+        updated.excluded_symbols = Arc::new(RwLock::new(catalog.excluded_symbols.into_iter().collect()));
+        Ok(updated)
     }
 
     fn segment_config(&self) -> SegmentConfig {
@@ -1274,18 +1293,27 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&spool_dir)?;
     let _spool_lock = SpoolLock::acquire(&spool_dir)?;
     ensure_startup_spool_ready(&spool_dir)?;
-    let config = Arc::new(Config::from_env().await?);
+    let mut config = Arc::new(Config::from_env().await?);
     let producer_diagnostics = Arc::new(ProducerDiagnostics::default());
     let watchdog = ProcessWatchdog::start(config.process_watchdog_timeout, producer_diagnostics)?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let upload_task = tokio::spawn(upload_loop(config.clone(), shutdown_rx.clone()));
     let shutdown_signal = tokio::spawn(wait_for_signal(shutdown_tx.clone(), watchdog.clone()));
 
+    let (catalog_tx, mut catalog_rx) = watch::channel(None);
+    let catalog_task = if config.dynamic_symbols {
+        Some(tokio::spawn(refresh_catalog_loop(config.clone(), catalog_tx, shutdown_rx.clone())))
+    } else { None };
+
     let mut backoff = 1_u64;
     while !*shutdown_rx.borrow() {
-        match run_session(config.clone(), shutdown_rx.clone(), watchdog.clone()).await {
-            Ok(()) if *shutdown_rx.borrow() => break,
-            Ok(()) => backoff = 1,
+        match run_session(config.clone(), shutdown_rx.clone(), watchdog.clone(), &mut catalog_rx).await {
+            Ok(_) if *shutdown_rx.borrow() => break,
+            Ok(Some(catalog)) => {
+                config = Arc::new(config.with_catalog(catalog)?);
+                backoff = 1;
+            }
+            Ok(None) => backoff = 1,
             Err(error) => {
                 error!(error = %error, backoff, "session failed; reconnecting");
                 tokio::time::sleep(Duration::from_secs(backoff)).await;
@@ -1297,7 +1325,39 @@ async fn main() -> anyhow::Result<()> {
     watchdog.stop();
     upload_task.await?;
     shutdown_signal.abort();
+    if let Some(task) = catalog_task { task.abort(); }
     Ok(())
+}
+
+// Refresh dynamic catalogs in the background: REST latency must never block
+// the event consumer. Fixed symbol contracts, including production USD-M's
+// top100, have no scheduled capture interruption. Only a changed ALL catalog
+// starts a new, explicitly separate capture generation.
+async fn refresh_catalog_loop(
+    config: Arc<Config>,
+    updates: watch::Sender<Option<SymbolCatalog>>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(6 * 3600));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            _ = interval.tick() => {}
+        }
+        let refreshed = tokio::select! {
+            _ = shutdown.changed() => break,
+            result = discover_symbols(config.market, &config.rest_base) => result,
+        };
+        match refreshed.and_then(|catalog| {
+            config.with_catalog(catalog.clone())?;
+            Ok(catalog)
+        }) {
+            Ok(catalog) => { if updates.send(Some(catalog)).is_err() { break; } }
+            Err(error) => warn!(error = %error, "catalog refresh failed; current capture continues"),
+        }
+    }
 }
 
 fn incomplete_segment_artifacts(spool_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
@@ -2106,7 +2166,8 @@ async fn run_session(
     config: Arc<Config>,
     mut shutdown: watch::Receiver<bool>,
     watchdog: ProcessWatchdog,
-) -> anyhow::Result<()> {
+    catalog_updates: &mut watch::Receiver<Option<SymbolCatalog>>,
+) -> anyhow::Result<Option<SymbolCatalog>> {
     let session_id = format!("{:x}-{}", now_ns()?, std::process::id());
     let mut process_state = ProcessState::new(false);
     let active_symbols = config.active_symbols();
@@ -2221,6 +2282,7 @@ async fn run_session(
     let mut sync_deadline = None;
     let mut snapshot_completions = 0_usize;
     let mut pending_segment_finalizer = None;
+    let mut next_catalog = None;
 
     loop {
         let mut pending_action = ProcessAction::None;
@@ -2233,6 +2295,20 @@ async fn run_session(
                     // final segment compression begin.
                     watchdog.disarm();
                     break;
+                }
+            }
+            changed = catalog_updates.changed(), if config.dynamic_symbols => {
+                if changed.is_err() {
+                    failure = Some(anyhow::anyhow!("catalog refresh worker stopped"));
+                    break;
+                }
+                if let Some(catalog) = catalog_updates.borrow_and_update().clone() {
+                    if config.catalog_changed(&catalog) {
+                        info!(old_symbols = active_symbols.len(), new_symbols = catalog.symbols.len(),
+                            "catalog changed; closing capture generation before adopting new scope");
+                        next_catalog = Some(catalog);
+                        break;
+                    }
                 }
             }
             joined = tasks.join_next(), if !tasks.is_empty() => {
@@ -2476,7 +2552,7 @@ async fn run_session(
     while let Ok(event) = receiver.try_recv() {
         archive_only(&mut segment, &session_id, config.market, event)?;
     }
-    if failure.is_some() {
+    if failure.is_some() || next_catalog.is_some() {
         segment.mark_replay_unsafe();
     }
     let _ = close_segment(
@@ -2506,7 +2582,7 @@ async fn run_session(
     if let Some(error) = failure {
         Err(error)
     } else {
-        Ok(())
+        Ok(next_catalog)
     }
 }
 
@@ -7045,6 +7121,7 @@ mod tests {
 
     fn test_config(rest_base: String) -> Config {
         Config {
+            dynamic_symbols: false,
             market: Market::Spot,
             dataset: "spot_all".into(),
             shard_id: "all".into(),
@@ -7072,6 +7149,25 @@ mod tests {
             zstd_timeout: Duration::from_secs(30),
             oss_copy_timeout: Duration::from_secs(30),
         }
+    }
+
+    #[test]
+    fn dynamic_catalog_generation_preserves_fixed_scopes_and_recovers_relisted_symbols() {
+        let mut config = test_config("http://unused".into());
+        let catalog = SymbolCatalog {symbols: vec!["BTCUSDT".into(),"ETHUSDT".into()],
+            security_token_symbols: vec![], excluded_symbols: vec![]};
+        assert!(!config.catalog_changed(&catalog)); // fixed contracts never roll on a catalog tick
+        config.dynamic_symbols = true;
+        assert!(config.catalog_changed(&catalog));
+        let updated = config.with_catalog(catalog.clone()).unwrap();
+        assert!(!updated.catalog_changed(&catalog));
+        assert_eq!(config.symbols, ["BTCUSDT"]); // old generation remains immutable
+        updated.excluded_symbols.write().unwrap().insert("ETHUSDT".into());
+        assert!(updated.catalog_changed(&catalog));
+        assert!(!config.is_excluded("ETHUSDT"));
+        let refreshed = updated.with_catalog(catalog).unwrap();
+        assert!(!refreshed.is_excluded("ETHUSDT"));
+        assert!(refreshed.with_catalog(SymbolCatalog {symbols:vec![],security_token_symbols:vec![],excluded_symbols:vec![]}).is_err());
     }
 
     #[test]
@@ -11127,6 +11223,15 @@ mod tests {
         .unwrap();
         assert!(states["BTCUSDT"].synced);
         assert_eq!(states["BTCUSDT"].last_update_id(), Some(151));
+        states.get_mut("BTCUSDT").unwrap().apply_diff(&DepthDiff {
+            symbol:"BTCUSDT".into(),first_update_id:152,final_update_id:152,
+            previous_update_id:None,bids:vec![],asks:vec![],
+        }, &mut budget).unwrap();
+        archive_first_btc_aggregate_trade(&config,&mut segment,&mut states,&mut budget,&mut process_state);
+        assert!(!segment.is_replay_safe());
+        let next = begin_segment_rotation(&mut segment,&config,&states,"session-1","scheduled",&process_state).unwrap();
+        assert!(!segment.is_replay_safe(), "the disconnected interval must remain unsafe");
+        assert!(next.is_replay_safe(), "a fully resynchronized boundary must recover the next interval");
     }
 
     #[tokio::test]
@@ -11542,6 +11647,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn changed_catalog_closes_only_the_current_generation_without_process_shutdown() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = test_config("http://[::1".into());
+        config.dynamic_symbols = true;
+        config.symbols = vec!["BAD\nSYMBOL".into()]; // invalid producer URLs avoid external sockets
+        config.spool_dir = root.path().to_owned();
+        let catalog = SymbolCatalog { symbols:vec!["BTCUSDT".into()],security_token_symbols:vec![],excluded_symbols:vec![] };
+        let (catalog_tx, mut catalog_rx) = watch::channel(None);
+        catalog_tx.send(Some(catalog.clone())).unwrap();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let watchdog = armed_watchdog();
+        let result = tokio::time::timeout(Duration::from_secs(5),
+            run_session(Arc::new(config),shutdown_rx.clone(),watchdog.clone(),&mut catalog_rx))
+            .await.unwrap().unwrap();
+        assert_eq!(result,Some(catalog));
+        assert!(!*shutdown_rx.borrow());
+        assert_eq!(watchdog.state(),ProcessWatchdogState::Armed);
+        let manifests=files_with_suffix(root.path(),".manifest.json").unwrap();
+        assert_eq!(manifests.len(),1);
+        let manifest:Value=serde_json::from_reader(std::fs::File::open(&manifests[0]).unwrap()).unwrap();
+        assert_eq!(manifest["has_replay_safe_checkpoint"],false);
+    }
+
+    #[tokio::test]
     async fn run_session_task_failure_keeps_watchdog_armed_for_reconnect() {
         let watchdog = armed_watchdog();
         let spool_dir = env::temp_dir().join(format!(
@@ -11560,8 +11689,9 @@ mod tests {
 
         for attempt in 1..=2 {
             let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+            let (_catalog_tx, mut catalog_rx) = watch::channel(None);
             let error = tokio::time::timeout(Duration::from_secs(5), async {
-                run_session(config.clone(), shutdown_rx, watchdog.clone()).await
+                run_session(config.clone(), shutdown_rx, watchdog.clone(), &mut catalog_rx).await
             })
             .await
             .unwrap_or_else(|_| panic!("session attempt {attempt} did not fail promptly"))

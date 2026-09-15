@@ -908,7 +908,7 @@ healthy_scenario
 healthy_fixtures
 run_health
 expect "restart delta: baseline healthy" "$(rc_is 0; echo $?)"
-rewrite_scenario 's|^binance-lob-archiver-production@spot.service	active	enabled	success	4|binance-lob-archiver-production@spot.service	active	enabled	success	7|'
+rewrite_scenario 's|^binance-lob-archiver-production@spot.service	active	enabled	success	4|binance-lob-archiver-production@spot.service	active	enabled	success	5|'
 run_health
 expect "restart delta: exit 0" "$(rc_is 0; echo $?)"
 expect "restart delta: warning message" "$(grep_out '^warning: .*restart rate high'; echo $?)"
