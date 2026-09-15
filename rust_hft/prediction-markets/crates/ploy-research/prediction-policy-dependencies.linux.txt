@@ -1,7 +1,7 @@
 prediction-policy-dependencies.v5
 target=x86_64-unknown-linux-gnu
 profile=default,db
-input:Cargo.lock=sha256:6a49e29dc755be4ab1d3656c8b89ddcd9b567eebda754eb074367397f3e5a268
+input:Cargo.lock=sha256:83b1d9fece83e2b42d0d3d148325f967f31f3b8444027cabe1da74514a404559
 input:Cargo.toml=sha256:a844f776f78a7087501979a1fcd0ca4f90f1e21073fdedc1a04e2bd5d97dc25d
 input:crates/ploy-research/Cargo.toml=sha256:3d3cc6e52da9335b915c79d776fa335f21c88cda447daffc097cc9755d6c9291
 input:crates/ploy-feed-loaders/Cargo.toml=sha256:abf8f1b8adec93b1ad84a66294cb58eb65f9cbca33c701cc81c7635eb9b35e2c
@@ -125,8 +125,8 @@ package:reqwest@0.12.28|source=registry+https://github.com/rust-lang/crates.io-i
 package:ring@0.17.14|source=registry+https://github.com/rust-lang/crates.io-index|checksum=a4689e6c2294d81e88dc6261c768b63bc4fcdb852be6d1352498b114f61383b7|features=alloc,default,dev_urandom_fallback
 package:rust_decimal@1.42.1|source=git+https://github.com/proerror77/monday-rust-decimal-security-694?rev=4f7bc6f02d7920b6416988914ae86d25f6670b22#4f7bc6f02d7920b6416988914ae86d25f6670b22|checksum=none|features=default,maths,serde,serde-with-str,std
 package:rustls-pki-types@1.15.0|source=registry+https://github.com/rust-lang/crates.io-index|checksum=764899a24af3980067ee14bc143654f297b22eaebfe3c7b6b211920a5a59b046|features=alloc,default,std
-package:rustls-webpki@0.103.13|source=registry+https://github.com/rust-lang/crates.io-index|checksum=61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e|features=alloc,ring,std
-package:rustls@0.23.42|source=registry+https://github.com/rust-lang/crates.io-index|checksum=3c54fcab019b409d04215d3a17cb438fd7fbf192ee61461f20f4fe18704bc138|features=ring,std,tls12
+package:rustls-webpki@0.103.15|source=registry+https://github.com/rust-lang/crates.io-index|checksum=f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2|features=alloc,ring,std
+package:rustls@0.23.45|source=registry+https://github.com/rust-lang/crates.io-index|checksum=0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634|features=ring,std,tls12
 package:ryu@1.0.23|source=registry+https://github.com/rust-lang/crates.io-index|checksum=9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f|features=
 package:scopeguard@1.2.0|source=registry+https://github.com/rust-lang/crates.io-index|checksum=94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49|features=
 package:serde@1.0.228|source=registry+https://github.com/rust-lang/crates.io-index|checksum=9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e|features=alloc,default,derive,rc,serde_derive,std
