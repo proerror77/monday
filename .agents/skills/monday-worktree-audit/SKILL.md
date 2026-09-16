@@ -1,6 +1,6 @@
 ---
 name: monday-worktree-audit
-description: Audit Monday worktree inventory, cleanup candidates, or ownership conflicts without mutation. Ordinary use of a known worktree is outside this audit.
+description: Audit Monday worktree inventory, cleanup candidates, or ownership conflicts without mutation. Ordinary use of a known worktree is outside this audit. After a Cursor-Codex handoff, use this to confirm two writers do not share a worktree or PR.
 ---
 
 # Monday Worktree Audit

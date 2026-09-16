@@ -42,6 +42,9 @@
   relevant implementation.
   For tracked work, use `docs/agents/issue-tracker.md` and
   `docs/agents/triage-labels.md`; use `docs/agents/domain.md` for domain docs.
+  For Cursor Cloud vs Codex research handoff, use
+  [cursor-codex-handoff](docs/agents/cursor-codex-handoff.md). Monk routes the
+  packet; do not add an agent chat bus.
 - Backward compatibility is not a goal. Remove obsolete paths instead of adding
   shims or fallbacks; preserve applied migrations and audit history as read-only
   records.
