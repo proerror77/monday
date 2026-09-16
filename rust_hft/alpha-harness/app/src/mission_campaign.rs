@@ -6508,6 +6508,19 @@ mod tests {
     }
 
     fn assert_calendar_h1_readback(negative: bool) {
+        let render_fixture = mission_render::tests::Fixture::new(28_795);
+        let mut rows = mission_render::tests::read_feature_rows(&render_fixture.feature_path);
+        for (index, row) in rows.iter_mut().enumerate() {
+            row.features.insert(
+                alpha_domain::CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD.into(),
+                if (index / 100).is_multiple_of(2) {
+                    1.0
+                } else {
+                    -1.0
+                },
+            );
+        }
+        mission_render::tests::rewrite_feature_rows(&render_fixture.feature_path, &rows);
         let mut fixture = campaign_e2e_fixture_with_input(
             if negative {
                 "h1-calendar-negative"
@@ -6519,7 +6532,7 @@ mod tests {
             true,
             false,
             if negative { 0.00001 } else { 0.0005 },
-            mission_render::tests::Fixture::new(28_795),
+            render_fixture,
         );
         let rows = mission_render::tests::read_feature_rows(&fixture._render_fixture.feature_path);
         let start = rows[0].feature_available_time;
@@ -6576,6 +6589,19 @@ mod tests {
         assert!(!fixture.global_claim_path.exists());
         for round in &result.rounds {
             assert!(round.feedback.calendar_validation.is_some());
+            let bank_path = fixture.work_dir.join(format!(
+                "mission/{}/execute/results/factor-bank.json",
+                round.round_id
+            ));
+            let bank: CexFactorBankRevisionV2 =
+                serde_json::from_slice(&std::fs::read(bank_path).unwrap()).unwrap();
+            assert!(
+                bank.entries
+                    .iter()
+                    .any(|entry| entry.source_features.iter().any(|field| field
+                        == alpha_domain::CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD)),
+                "calendar validation must exercise a fitted research-only factor"
+            );
             let path = fixture.work_dir.join(format!(
                 "mission/{}/execute/results/calendar-validation.json",
                 round.round_id

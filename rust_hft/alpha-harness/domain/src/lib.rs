@@ -2390,6 +2390,18 @@ impl CexGpPolicyV1 {
         Ok(())
     }
 
+    /// Bounded history for an admitted snapshot research factor; no live capability.
+    pub fn candidate_history_rows(&self, ast: &FactorAst) -> Result<usize, DomainError> {
+        self.validate_candidate(ast)?;
+        let capability = validate_cex_research_formula(ast)?;
+        if capability.event_domain != hft_factor_dsl::LiveEventDomain::Snapshot {
+            return Err(DomainError::InvalidCexGpCandidate(
+                "fitted CEX research models require snapshot-domain factors",
+            ));
+        }
+        Ok(capability.history_rows)
+    }
+
     pub fn validate_candidate(&self, ast: &FactorAst) -> Result<(), DomainError> {
         self.validate()?;
         ast.validate()
