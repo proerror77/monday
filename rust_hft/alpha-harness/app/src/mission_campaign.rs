@@ -6596,9 +6596,10 @@ mod tests {
             let bank: CexFactorBankRevisionV2 =
                 serde_json::from_slice(&std::fs::read(bank_path).unwrap()).unwrap();
             assert!(
-                bank.entries.iter().any(|entry| entry.source_features.iter().any(|field|
-                    field == alpha_domain::CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD
-                )),
+                bank.entries
+                    .iter()
+                    .any(|entry| entry.source_features.iter().any(|field| field
+                        == alpha_domain::CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD)),
                 "calendar validation must exercise a fitted research-only factor"
             );
             let path = fixture.work_dir.join(format!(
