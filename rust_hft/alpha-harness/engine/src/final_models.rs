@@ -7,7 +7,9 @@ use crate::{
         evaluate_sealed_holdout, independent_selection_rows, EngineContext, PreparedDataset,
         ResearchRow,
     },
-    formula_evaluator::{FormulaEvaluator, PositionEvaluationReport, ReturnAccountingBasis},
+    formula_evaluator::{
+        evaluate_ast, FormulaEvaluator, PositionEvaluationReport, ReturnAccountingBasis,
+    },
 };
 use alpha_domain::{
     canonical_json_hash,
@@ -128,9 +130,28 @@ pub fn evaluate_calendar_validation(
         return Err("calendar H1 evaluates Ridge only".into());
     }
     let context = dataset.engine_context();
-    let fitted = fitted_candidate(
-        &context, bank, baseline, candidate, venue, market, symbol, mission, 1,
-    )?;
+    if venue.is_empty()
+        || venue.len() > 32
+        || !venue
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-_".contains(&b))
+        || !matches!(market, "spot" | "usdm")
+        || symbol.is_empty()
+        || symbol.len() > 64
+        || !symbol
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b"-_".contains(&b))
+    {
+        return Err("invalid calendar research instrument".into());
+    }
+    let fitted = fitted_inputs(&context, bank, baseline, candidate, mission)?;
+    let development_predictions = research_predictions(context.rows(), &fitted, &bank.gp_policy)?;
+    let expected = context.folds().last().ok_or("missing fitted fold")?;
+    for (index, prediction) in expected.validation.clone().zip(&fitted.fold.predictions) {
+        if development_predictions[index].to_bits() != prediction.to_bits() {
+            return Err("research model prediction differs from fitted fold evidence".into());
+        }
+    }
     let last_training_row = context
         .folds()
         .last()
@@ -139,8 +160,37 @@ pub fn evaluate_calendar_validation(
         .end
         .checked_sub(1)
         .ok_or("empty training fold")?;
-    let report = evaluate_frozen_selection(&fitted, dataset)?;
     let rows = independent_selection_rows(dataset)?;
+    let predictions = research_predictions(rows, &fitted, &bank.gp_policy)?;
+    let holding = candidate
+        .decision_policy
+        .holding
+        .as_ref()
+        .ok_or("calendar H1 requires horizon holding")?;
+    let positions = crate::baselines::horizon_target_positions(
+        rows,
+        &predictions,
+        &candidate.decision_policy,
+        dataset.protocol(),
+        std::iter::once(0..rows.len()),
+        holding,
+    )?;
+    let evaluator_config = alpha_domain::frozen_model::final_evaluator_config(mission, 1)
+        .map_err(|error| error.to_string())?;
+    let report = FormulaEvaluator::new(evaluator_config)?
+        .with_decision_policy(&candidate.decision_policy)?
+        .evaluate_predictions_and_positions(
+            rows,
+            &predictions,
+            &positions,
+            std::iter::once(0..rows.len()),
+            INDEPENDENT_SELECTION_EVALUATOR_VERSION,
+            dataset.protocol(),
+        )?;
+    if report.return_accounting != ReturnAccountingBasis::HeldQuantityWithQuotedEntryExit {
+        return Err("calendar H1 requires held-quantity entry/exit accounting".into());
+    }
+    report.evaluation.validate_reason()?;
     let mut costs = rows
         .iter()
         .map(|row| {
@@ -161,9 +211,9 @@ pub fn evaluate_calendar_validation(
     Ok(CalendarValidationReportV1 {
         schema_version: "monday.calendar_validation.v1".into(),
         calendar,
-        source_model: fitted.source_model.clone(),
-        source_candidate: fitted.source_candidate.clone(),
-        source_fold: fitted.source_fold.clone(),
+        source_model: candidate.model_artifact.clone(),
+        source_candidate: reference(&candidate.artifact_id, candidate)?,
+        source_fold: fitted.fold.fold_id.clone(),
         last_training_time: context.rows()[last_training_row].available_time,
         max_absolute_prediction_bps: report
             .ledger
@@ -177,18 +227,21 @@ pub fn evaluate_calendar_validation(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn fitted_candidate(
+/// Source checks shared by research validation and live freezing. This private
+/// value is neither a deployable candidate nor an admission token.
+struct FittedInputs<'a> {
+    fold: &'a alpha_domain::CexBaselineFoldV1,
+    factors: Vec<FrozenModelFactorV1>,
+    protocol_hash: String,
+}
+
+fn fitted_inputs<'a>(
     context: &EngineContext<'_>,
     bank: &CexFactorBankRevisionV2,
-    baseline: &CexBaselineArtifactV1,
+    baseline: &'a CexBaselineArtifactV1,
     candidate: &CexSupervisedModelCandidateV2,
-    venue: &str,
-    market: &str,
-    symbol: &str,
     mission: &alpha_domain::ResearchMission,
-    max_final_candidates: u32,
-) -> Result<FrozenSupervisedCandidateV1, String> {
+) -> Result<FittedInputs<'a>, String> {
     bank.validate().map_err(|e| e.to_string())?;
     baseline.validate().map_err(|e| e.to_string())?;
     if !crate::baselines::baseline_training_admitted(baseline) {
@@ -213,6 +266,12 @@ fn fitted_candidate(
         || baseline.target.horizon != protocol.labels
         || canonical_json_hash(&context.rows()).map_err(|e| e.to_string())?
             != bank.research_dataset.content_sha256
+        || bank.walk_forward_partition.content_sha256
+            != canonical_json_hash(&serde_json::json!({
+                "research_dataset": &bank.research_dataset,
+                "folds": context.folds(),
+            }))
+            .map_err(|e| e.to_string())?
         || candidate
             .evaluation
             .formula_config()
@@ -230,6 +289,11 @@ fn fitted_candidate(
         || fold.train_range.end != expected.train.end
         || fold.validation_range.start != expected.validation.start
         || fold.validation_range.end != expected.validation.end
+        || fold.purge_range.start != expected.purge.start
+        || fold.purge_range.end != expected.purge.end
+        || fold.embargo_range.start != expected.embargo.start
+        || fold.embargo_range.end != expected.embargo.end
+        || fold.predictions.len() != expected.validation.len()
         || fold.embargo_range.end > context.rows().len()
     {
         return Err("frozen model fold differs from the signed search schedule".into());
@@ -258,6 +322,94 @@ fn fitted_candidate(
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
+    Ok(FittedInputs {
+        fold,
+        factors,
+        protocol_hash,
+    })
+}
+
+/// Predict with the fitted weights and the same research factor interpreter
+/// used by training. The frozen GP policy bounds fields, operators and history.
+fn research_predictions(
+    rows: &[ResearchRow],
+    fitted: &FittedInputs<'_>,
+    policy: &alpha_domain::CexGpPolicyV1,
+) -> Result<Vec<f64>, String> {
+    if fitted.factors.len() > hft_factor_dsl::model_program::MAX_FROZEN_FACTORS {
+        return Err("research model exceeds the fitted factor limit".into());
+    }
+    let model = fitted.fold.model.prepare_inference(fitted.factors.len())?;
+    let history_rows = fitted
+        .factors
+        .iter()
+        .map(|factor| {
+            policy
+                .candidate_history_rows(&factor.ast)
+                .map_err(|e| e.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .ok_or("research model has no factors")?;
+    let columns = fitted
+        .factors
+        .iter()
+        .map(|factor| {
+            let mut values = evaluate_ast(&factor.ast, rows)?;
+            for value in &mut values {
+                if !value.is_finite() {
+                    return Err("research model factor is not finite".into());
+                }
+                if factor.negative {
+                    *value = -*value;
+                }
+                if *value == 0.0 {
+                    *value = 0.0;
+                }
+            }
+            Ok(values)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut predictions = Vec::with_capacity(rows.len());
+    let mut series_start = 0;
+    for (index, row) in rows.iter().enumerate() {
+        if index == 0 || rows[index - 1].series_id != row.series_id {
+            series_start = index;
+        }
+        if index + 1 - series_start < history_rows {
+            predictions.push(0.0);
+            continue;
+        }
+        let features = columns
+            .iter()
+            .map(|column| column[index])
+            .collect::<Vec<_>>();
+        predictions.push(model.predict(&features)?);
+    }
+    Ok(predictions)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fitted_candidate(
+    context: &EngineContext<'_>,
+    bank: &CexFactorBankRevisionV2,
+    baseline: &CexBaselineArtifactV1,
+    candidate: &CexSupervisedModelCandidateV2,
+    venue: &str,
+    market: &str,
+    symbol: &str,
+    mission: &alpha_domain::ResearchMission,
+    max_final_candidates: u32,
+) -> Result<FrozenSupervisedCandidateV1, String> {
+    let fitted = fitted_inputs(context, bank, baseline, candidate, mission)?;
+    let FittedInputs {
+        fold,
+        factors,
+        protocol_hash,
+    } = fitted;
+    let protocol = context.protocol();
+    let expected = context.folds().last().ok_or("search has no fold")?;
     let costs = &protocol.costs;
     let program = FrozenFactorModelV1 {
         schema_version: FROZEN_FACTOR_MODEL_SCHEMA_V1.into(),
@@ -427,3 +579,7 @@ fn evaluate_frozen_rows(
     report.evaluation.validate_reason()?;
     Ok(report)
 }
+
+#[cfg(test)]
+#[path = "final_models_tests.rs"]
+mod tests;
