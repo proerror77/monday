@@ -1681,6 +1681,72 @@ mod tests {
     }
 
     #[test]
+    fn ridge_preserves_feature_units_and_target_units_with_train_only_statistics() {
+        let features: Vec<_> = (0..8)
+            .map(|i| vec![i as f64, (i % 2) as f64, 2.0])
+            .collect();
+        let labels: Vec<_> = features
+            .iter()
+            .map(|x| 0.0001 + x[0] * 0.0002 - x[1] * 0.00003)
+            .collect();
+        let transformed: Vec<_> = features
+            .iter()
+            .map(|x| vec![x[0] * 1e6 + 50.0, x[1] * 0.001 - 10.0, -7.0])
+            .collect();
+        let fitted = fit_ridge(&features, &labels, 0..6, 1e-6).unwrap();
+        let scaled_features = fit_ridge(&transformed, &labels, 0..6, 1e-6).unwrap();
+        let bps_labels: Vec<_> = labels.iter().map(|y| y * 10_000.0).collect();
+        let scaled_target = fit_ridge(&features, &bps_labels, 0..6, 1e-6).unwrap();
+        assert!((fitted.means[0] - 2.5).abs() < 1e-12);
+        let mut changed = features.clone();
+        changed[7] = vec![1e9, 1e9, 1e9];
+        let mut changed_labels = labels.clone();
+        changed_labels[7] = 1e9;
+        assert_eq!(
+            fitted,
+            fit_ridge(&changed, &changed_labels, 0..6, 1e-6).unwrap()
+        );
+        for i in 0..8 {
+            let expected = predict_ridge(&fitted, &features[i]).unwrap();
+            assert!(
+                (expected - predict_ridge(&scaled_features, &transformed[i]).unwrap()).abs()
+                    < 1e-12
+            );
+            assert!(
+                (expected - predict_ridge(&scaled_target, &features[i]).unwrap() / 10_000.0).abs()
+                    < 1e-12
+            );
+            assert!((expected - labels[i]).abs() < 1e-9);
+        }
+        let portable = CexBaselineModelV1::Ridge {
+            intercept: fitted.intercept,
+            means: fitted.means,
+            scales: fitted.scales,
+            coefficients: fitted.coefficients,
+        };
+        let loaded: CexBaselineModelV1 =
+            serde_json::from_slice(&serde_json::to_vec(&portable).unwrap()).unwrap();
+        assert_eq!(
+            portable.predict(&features[7]).unwrap().to_bits(),
+            loaded.predict(&features[7]).unwrap().to_bits()
+        );
+        let policy = CexSupervisedDecisionPolicyV2::hold_to_horizon_v3(5000).unwrap();
+        assert!(
+            policy
+                .target_position(
+                    loaded.predict(&features[7]).unwrap(),
+                    0.0,
+                    CexDecisionCostsV1 {
+                        one_way_cost_bps: 2.5,
+                        funding_bps: 0.0
+                    }
+                )
+                .unwrap()
+                > 0.0
+        );
+    }
+
+    #[test]
     fn cart_uses_stable_threshold_routing_and_tie_breaking() {
         let features = vec![
             vec![0.0, 0.0],

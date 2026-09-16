@@ -6638,6 +6638,28 @@ mod tests {
                 lightweight.label_space_precheck.as_ref().unwrap().scope,
                 "calendar_development_only_overlapping_labels"
             );
+            let diagnostics = lightweight
+                .calendar_prediction_diagnostics
+                .as_ref()
+                .unwrap();
+            assert!(!diagnostics.training_performed && !diagnostics.promotion_authority);
+            assert_eq!(
+                diagnostics.source_validation_sha256,
+                report.summary().unwrap().report_content_sha256
+            );
+            assert_eq!(
+                diagnostics.counts.evaluated_rows,
+                report.report.ledger.len()
+            );
+            assert_eq!(
+                diagnostics.counts.horizon_eligible_rows + diagnostics.counts.tail_rows,
+                diagnostics.counts.evaluated_rows
+            );
+            if negative {
+                assert_eq!(diagnostics.counts.eligible_nonzero_entry_signals, 0);
+            } else {
+                assert!(diagnostics.counts.eligible_nonzero_entry_signals > 0);
+            }
             assert_eq!(lightweight.calendar_replay.is_some(), !negative);
             if negative {
                 assert!(report
@@ -6664,6 +6686,33 @@ mod tests {
             }
         }
         if negative {
+            assert_metric_bundle_rejected(
+                &loaded,
+                &protocol.content_hash().unwrap(),
+                &client,
+                |entries| {
+                    let mut diagnostics: serde_json::Value = serde_json::from_slice(
+                        &entries["results/calendar-prediction-diagnostics.json"],
+                    )
+                    .unwrap();
+                    diagnostics["counts"]["eligible_predictions_above_cost"] =
+                        serde_json::json!(999);
+                    entries.insert(
+                        "results/calendar-prediction-diagnostics.json".into(),
+                        serde_json::to_vec(&diagnostics).unwrap(),
+                    );
+                },
+                "calendar prediction diagnostics differ from independently evaluated rows",
+            );
+            assert_metric_bundle_rejected(
+                &loaded,
+                &protocol.content_hash().unwrap(),
+                &client,
+                |entries| {
+                    entries.remove("results/calendar-prediction-diagnostics.json");
+                },
+                "calendar prediction diagnostics missing",
+            );
             assert_metric_bundle_rejected(
                 &loaded,
                 &protocol.content_hash().unwrap(),

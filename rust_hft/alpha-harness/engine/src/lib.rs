@@ -11,6 +11,7 @@ pub mod formula_evaluator;
 pub mod learning;
 pub mod llm;
 pub mod model_metrics;
+pub mod prediction_diagnostics;
 
 #[cfg(feature = "kernel")]
 use alpha_domain::{

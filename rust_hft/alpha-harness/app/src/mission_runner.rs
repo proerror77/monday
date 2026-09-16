@@ -1457,6 +1457,17 @@ pub(crate) fn execute_report(
                 &research_mission,
             )
             .map_err(anyhow::Error::msg)?;
+            let diagnostics =
+                alpha_engine::prediction_diagnostics::calendar_prediction_diagnostics(
+                    &baseline_dataset,
+                    &validation,
+                    &model.candidate.decision_policy,
+                )
+                .map_err(anyhow::Error::msg)?;
+            data_mission::write_json_atomic(
+                &results_dir.join(alpha_engine::prediction_diagnostics::CALENDAR_DIAGNOSTICS_FILE),
+                &diagnostics,
+            )?;
             if calendar_replay_required(&validation) {
                 run_calendar_validation_replay(
                     &results_dir,
@@ -4753,6 +4764,7 @@ fn validate_model_metric_readback(
         matches!(
             name,
             "results/calendar-validation.json"
+                | "results/calendar-prediction-diagnostics.json"
                 | "results/calendar-validation-event-replay-receipt.json"
         )
     });
@@ -4880,6 +4892,23 @@ fn validate_model_metric_readback(
             .context("calendar validation result missing")?;
             if actual != expected {
                 bail!("calendar validation differs from independently evaluated fitted weights");
+            }
+            let diagnostics: alpha_engine::prediction_diagnostics::CalendarPredictionDiagnosticsV1 =
+                read_bundle_json(
+                    archive,
+                    "results/calendar-prediction-diagnostics.json",
+                    64 * 1024,
+                )?
+                .context("calendar prediction diagnostics missing")?;
+            let expected_diagnostics =
+                alpha_engine::prediction_diagnostics::calendar_prediction_diagnostics(
+                    &dataset,
+                    &expected,
+                    &evaluation.candidate.decision_policy,
+                )
+                .map_err(anyhow::Error::msg)?;
+            if diagnostics != expected_diagnostics {
+                bail!("calendar prediction diagnostics differ from independently evaluated rows");
             }
             let replay: Option<CexEventReplayReceiptV1> = read_bundle_json(
                 archive,

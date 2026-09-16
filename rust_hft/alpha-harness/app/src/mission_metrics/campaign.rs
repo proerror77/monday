@@ -40,6 +40,9 @@ pub(crate) struct RoundEvidenceReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calendar_validation: Option<alpha_engine::final_models::CalendarValidationSummaryV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar_prediction_diagnostics:
+        Option<alpha_engine::prediction_diagnostics::CalendarPredictionDiagnosticsV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calendar_replay: Option<crate::mission_runner::CexEventReplayReceiptV1>,
 }
 
@@ -176,6 +179,13 @@ pub(crate) fn collect_verified_archive(
         report.summary().map_err(anyhow::Error::msg)
     })
     .transpose()?;
+    let calendar_prediction_diagnostics = optional_entry(
+        &mut archive,
+        "results/calendar-prediction-diagnostics.json",
+        64 * 1024,
+    )?
+    .map(|bytes| serde_json::from_slice(&bytes))
+    .transpose()?;
     let calendar_replay = optional_entry(
         &mut archive,
         "results/calendar-validation-event-replay-receipt.json",
@@ -192,6 +202,7 @@ pub(crate) fn collect_verified_archive(
         mlp_folds,
         label_space_precheck,
         calendar_validation,
+        calendar_prediction_diagnostics,
         calendar_replay,
     })
 }
