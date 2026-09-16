@@ -1,5 +1,6 @@
 //! Trust-boundary contracts for bounded Loop Engineer research and runtime deployment.
 
+pub mod campaign_checkpoint;
 pub mod campaign_control;
 pub mod campaign_finalization;
 pub mod campaign_horizon;
