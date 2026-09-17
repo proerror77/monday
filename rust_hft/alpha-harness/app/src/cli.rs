@@ -72,6 +72,27 @@ enum Command {
         #[command(subcommand)]
         command: ApprovalCommand,
     },
+    /// Diagnostic research-only surfaces that cannot dispatch jobs or train models.
+    Research {
+        #[command(subcommand)]
+        command: ResearchCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ResearchCommand {
+    /// Read-only second-level orderflow import/audit. Never trains or dispatches.
+    SecOrderflowAudit(SecOrderflowAuditArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct SecOrderflowAuditArgs {
+    #[arg(long)]
+    config: PathBuf,
+    /// Explicit input root. Omitted or missing paths report research_eligible=false.
+    /// This flag never defaults to a Mac collector path.
+    #[arg(long)]
+    input_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1350,6 +1371,16 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             ApprovalCommand::Record(args) => governance::record_approval(args),
             ApprovalCommand::Revoke(args) => governance::revoke_approval(args),
         },
+        Command::Research { command } => match command {
+            ResearchCommand::SecOrderflowAudit(args) => {
+                let report =
+                    crate::sec_orderflow::audit(crate::sec_orderflow::SecOrderflowAuditRequest {
+                        config: args.config,
+                        input_root: args.input_root,
+                    })?;
+                print_json(&report)
+            }
+        },
     }
 }
 
@@ -2227,6 +2258,26 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
     fn exposes_no_order_or_trade_command() {
         assert!(Cli::try_parse_from(["alpha-harness", "order"]).is_err());
         assert!(Cli::try_parse_from(["alpha-harness", "trade"]).is_err());
+    }
+
+    #[test]
+    fn parses_diagnostic_sec_orderflow_audit_without_input_root() {
+        let cli = Cli::try_parse_from([
+            "alpha-harness",
+            "research",
+            "sec-orderflow-audit",
+            "--config",
+            "sec-orderflow.json",
+        ])
+        .unwrap();
+        let Command::Research {
+            command: ResearchCommand::SecOrderflowAudit(args),
+        } = cli.command
+        else {
+            panic!("expected research sec-orderflow-audit");
+        };
+        assert_eq!(args.config, PathBuf::from("sec-orderflow.json"));
+        assert!(args.input_root.is_none());
     }
 
     #[test]
