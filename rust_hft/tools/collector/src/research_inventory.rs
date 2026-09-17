@@ -59,6 +59,8 @@ pub struct FreshWindowRequest {
     pub bucket_ms: u64,
     pub label_horizon_buckets: u64,
     pub top_depth: usize,
+    /// `h1` snapshot family or `h2` lagged Cont OFI. Frozen inventories never default.
+    pub feature_family: String,
     pub max_scan_entries: usize,
     pub max_inputs: usize,
     pub max_input_bytes: u64,
@@ -322,6 +324,8 @@ pub struct InventoryRequest {
     pub bucket_ms: u64,
     pub label_horizon_buckets: u64,
     pub top_depth: usize,
+    /// `h1` snapshot family or `h2` lagged Cont OFI. Frozen inventories never default.
+    pub feature_family: String,
     pub max_scan_entries: usize,
     pub max_inputs: usize,
     pub max_input_bytes: u64,
@@ -356,6 +360,14 @@ fn safe_value(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"_./:@=+-".contains(&byte))
+}
+
+fn canonical_feature_family(value: &str) -> Result<&'static str> {
+    match value {
+        "h1" => Ok("h1"),
+        "h2" => Ok("h2"),
+        _ => bail!("inventory feature family must be h1 or h2"),
+    }
 }
 
 fn uint(manifest: &Map<String, Value>, field: &str) -> Result<u64> {
@@ -1039,6 +1051,7 @@ pub fn select_fresh_window(request: &FreshWindowRequest) -> Result<FreshWindowSe
                 bucket_ms: request.bucket_ms,
                 label_horizon_buckets: request.label_horizon_buckets,
                 top_depth: request.top_depth,
+                feature_family: request.feature_family.clone(),
                 max_scan_entries: request.max_scan_entries,
                 max_inputs: request.max_inputs,
                 max_input_bytes: request.max_input_bytes,
@@ -1232,6 +1245,7 @@ pub fn freeze_inventory(request: &InventoryRequest) -> Result<FrozenInventory> {
             .timestamp_nanos_opt()
             .context("inventory wall clock is out of range")?,
     )?;
+    canonical_feature_family(&request.feature_family)?;
     if request.end_received_at_ns > now
         || request.output_prefix.contains("..")
         || request.output_prefix == "research/cex-materialization"
@@ -1504,7 +1518,8 @@ fn build_frozen_inventory(
     if raw.is_empty() || references.is_empty() {
         bail!("frozen inventory requires raw and reference inputs");
     }
-    let mut env = format!("SOURCE_REVISION={}\nIMAGE_REF={}\nMISSION_ID={}\nMARKET={}\nSYMBOL={}\nBUCKET_MS={}\nLABEL_HORIZON_BUCKETS={}\nTOP_DEPTH={}\nOUTPUT_PREFIX={}\nWINDOW_START_RECEIVED_AT_NS={}\nWINDOW_END_RECEIVED_AT_NS={}\nRAW_SEGMENT_COUNT={}\n", request.source_revision, request.image_ref, request.mission_id, request.market.as_str(), request.symbol, request.bucket_ms, request.label_horizon_buckets, request.top_depth, request.output_prefix, request.start_received_at_ns, request.end_received_at_ns, raw.len());
+    let feature_family = canonical_feature_family(&request.feature_family)?;
+    let mut env = format!("SOURCE_REVISION={}\nIMAGE_REF={}\nMISSION_ID={}\nMARKET={}\nSYMBOL={}\nBUCKET_MS={}\nLABEL_HORIZON_BUCKETS={}\nTOP_DEPTH={}\nFEATURE_FAMILY={}\nOUTPUT_PREFIX={}\nWINDOW_START_RECEIVED_AT_NS={}\nWINDOW_END_RECEIVED_AT_NS={}\nRAW_SEGMENT_COUNT={}\n", request.source_revision, request.image_ref, request.mission_id, request.market.as_str(), request.symbol, request.bucket_ms, request.label_horizon_buckets, request.top_depth, feature_family, request.output_prefix, request.start_received_at_ns, request.end_received_at_ns, raw.len());
     for (prefix, inputs) in [("RAW_SEGMENT", &raw), ("REFERENCE", &references)] {
         if prefix == "REFERENCE" {
             env.push_str(&format!("REFERENCE_COUNT={}\n", inputs.len()));
@@ -1877,6 +1892,7 @@ mod tests {
                 bucket_ms: 1000,
                 label_horizon_buckets: 5,
                 top_depth: 5,
+                feature_family: "h1".into(),
                 max_scan_entries: 100,
                 max_inputs: 10,
                 max_input_bytes: 1_000_000,
@@ -2012,6 +2028,7 @@ mod tests {
             bucket_ms: request.bucket_ms,
             label_horizon_buckets: request.label_horizon_buckets,
             top_depth: request.top_depth,
+            feature_family: request.feature_family.clone(),
             max_scan_entries: request.max_scan_entries,
             max_inputs: request.max_inputs,
             max_input_bytes: request.max_input_bytes,
@@ -2304,6 +2321,28 @@ mod tests {
     }
 
     #[test]
+    fn freeze_binds_selected_feature_family_and_rejects_unknown_family() {
+        let (_directory, mut request) = fixture();
+        let h1 = freeze_inventory(&request).unwrap();
+        assert!(h1.inventory_env.contains("FEATURE_FAMILY=h1\n"));
+
+        request.feature_family = "h2".into();
+        let h2 = freeze_inventory(&request).unwrap();
+        assert!(h2.inventory_env.contains("FEATURE_FAMILY=h2\n"));
+        assert_eq!(h2.input_fingerprint_sha256, h1.input_fingerprint_sha256);
+        assert_ne!(h2.inventory_sha256, h1.inventory_sha256);
+
+        request.feature_family = "h1h2".into();
+        let error = freeze_inventory(&request).unwrap_err().to_string();
+        assert!(error.contains("feature family"), "{error}");
+        request.feature_family.clear();
+        assert!(freeze_inventory(&request)
+            .unwrap_err()
+            .to_string()
+            .contains("feature family"));
+    }
+
+    #[test]
     fn spot_market_never_falls_back_to_usdm_inputs() {
         let (_directory, mut request) = fixture();
         request.market = Market::Spot;
@@ -2354,6 +2393,7 @@ mod tests {
             bucket_ms: 1_000,
             label_horizon_buckets: 5,
             top_depth: 5,
+            feature_family: "h1".into(),
             max_scan_entries: 100,
             max_inputs: 10,
             max_input_bytes: 1_000_000,
@@ -2443,6 +2483,7 @@ mod tests {
             bucket_ms: request.bucket_ms,
             label_horizon_buckets: request.label_horizon_buckets,
             top_depth: request.top_depth,
+            feature_family: request.feature_family.clone(),
             max_scan_entries: request.max_scan_entries,
             max_inputs: request.max_inputs,
             max_input_bytes: request.max_input_bytes,
@@ -2475,6 +2516,7 @@ mod tests {
             bucket_ms: request.bucket_ms,
             label_horizon_buckets: request.label_horizon_buckets,
             top_depth: request.top_depth,
+            feature_family: request.feature_family.clone(),
             max_scan_entries: request.max_scan_entries,
             max_inputs: request.max_inputs,
             max_input_bytes: request.max_input_bytes,
@@ -2507,6 +2549,7 @@ mod tests {
             bucket_ms: request.bucket_ms,
             label_horizon_buckets: request.label_horizon_buckets,
             top_depth: request.top_depth,
+            feature_family: request.feature_family.clone(),
             max_scan_entries: request.max_scan_entries,
             max_inputs: request.max_inputs,
             max_input_bytes: request.max_input_bytes,
@@ -2549,6 +2592,7 @@ mod tests {
             bucket_ms: request.bucket_ms,
             label_horizon_buckets: request.label_horizon_buckets,
             top_depth: request.top_depth,
+            feature_family: request.feature_family.clone(),
             max_scan_entries: request.max_scan_entries,
             max_inputs: request.max_inputs,
             max_input_bytes: request.max_input_bytes,
@@ -2579,6 +2623,7 @@ mod tests {
             bucket_ms: request.bucket_ms,
             label_horizon_buckets: request.label_horizon_buckets,
             top_depth: request.top_depth,
+            feature_family: request.feature_family.clone(),
             max_scan_entries: request.max_scan_entries,
             max_inputs: request.max_inputs,
             max_input_bytes,

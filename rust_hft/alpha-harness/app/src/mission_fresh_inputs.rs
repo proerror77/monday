@@ -56,6 +56,7 @@ struct PreparationRequest {
     bucket_ms: u64,
     label_horizon_buckets: u64,
     top_depth: usize,
+    feature_family: String,
     max_scan_entries: usize,
     max_inputs: usize,
     max_input_bytes: u64,
@@ -401,6 +402,10 @@ fn validate_args(args: &PrepareFreshInputsArgs) -> anyhow::Result<()> {
     {
         bail!("fresh input symbol must be canonical uppercase ASCII");
     }
+    match args.feature_family.as_str() {
+        "h1" | "h2" => {}
+        _ => bail!("fresh input feature-family must be h1 or h2"),
+    }
     if args.materializer.as_os_str().is_empty()
         || args.inventory_out.as_os_str().is_empty()
         || args.campaign_inputs_out.as_os_str().is_empty()
@@ -586,6 +591,7 @@ fn build_preparation_request(
         bucket_ms: args.bucket_ms,
         label_horizon_buckets: args.label_horizon_buckets,
         top_depth: args.top_depth,
+        feature_family: args.feature_family.clone(),
         max_scan_entries: args.max_scan_entries,
         max_inputs: args.max_inputs,
         max_input_bytes: args.max_input_bytes,
@@ -625,6 +631,7 @@ fn fresh_window_request(
         bucket_ms: args.bucket_ms,
         label_horizon_buckets: args.label_horizon_buckets,
         top_depth: args.top_depth,
+        feature_family: args.feature_family.clone(),
         max_scan_entries: args.max_scan_entries,
         max_inputs: args.max_inputs,
         max_input_bytes: args.max_input_bytes,
@@ -649,6 +656,7 @@ fn inventory_from_selection(
         bucket_ms: args.bucket_ms,
         label_horizon_buckets: args.label_horizon_buckets,
         top_depth: args.top_depth,
+        feature_family: args.feature_family.clone(),
         max_scan_entries: args.max_scan_entries,
         max_inputs: args.max_inputs,
         max_input_bytes: args.max_input_bytes,
@@ -851,6 +859,7 @@ fn validate_inventory_env(args: &PrepareFreshInputsArgs, env: &str) -> anyhow::R
             args.label_horizon_buckets.to_string(),
         ),
         ("TOP_DEPTH", args.top_depth.to_string()),
+        ("FEATURE_FAMILY", args.feature_family.clone()),
         ("OUTPUT_PREFIX", args.output_prefix.clone()),
     ] {
         if values.get(key).copied() != Some(expected.as_str()) {
@@ -1572,6 +1581,7 @@ mod tests {
             bucket_ms: 1_000,
             label_horizon_buckets: 5,
             top_depth: 5,
+            feature_family: "h1".into(),
             max_scan_entries: 100,
             max_inputs: 10,
             max_input_bytes: 1_000_000,
@@ -1733,6 +1743,7 @@ EOF
             bucket_ms: 1_000,
             label_horizon_buckets: 5,
             top_depth: 5,
+            feature_family: "h1".into(),
             max_scan_entries: 100,
             max_inputs: 4,
             max_input_bytes: 1_000_000,

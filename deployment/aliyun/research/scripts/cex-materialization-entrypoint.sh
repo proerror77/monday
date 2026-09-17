@@ -567,7 +567,7 @@ REPLAY_BIN=$BINARY_DIR/binance-replay-parquet-materializer
 
 inventory_load
 
-for key in RUN_ID SOURCE_REVISION IMAGE_REF MISSION_ID MARKET SYMBOL BUCKET_MS LABEL_HORIZON_BUCKETS TOP_DEPTH OUTPUT_PREFIX RAW_SEGMENT_COUNT; do
+for key in RUN_ID SOURCE_REVISION IMAGE_REF MISSION_ID MARKET SYMBOL BUCKET_MS LABEL_HORIZON_BUCKETS TOP_DEPTH FEATURE_FAMILY OUTPUT_PREFIX RAW_SEGMENT_COUNT; do
   require_inventory_var "$key"
 done
 
@@ -580,6 +580,7 @@ symbol=$(inventory_get SYMBOL)
 bucket_ms=$(inventory_get BUCKET_MS)
 label_horizon_buckets=$(inventory_get LABEL_HORIZON_BUCKETS)
 top_depth=$(inventory_get TOP_DEPTH)
+feature_family=$(inventory_get FEATURE_FAMILY)
 output_prefix=$(inventory_get OUTPUT_PREFIX)
 window_start_received_at_ns=$(inventory_get WINDOW_START_RECEIVED_AT_NS)
 window_end_received_at_ns=$(inventory_get WINDOW_END_RECEIVED_AT_NS)
@@ -633,6 +634,13 @@ fi
 case "$bucket_ms$label_horizon_buckets$top_depth" in
   *[!0-9]*)
     die "BUCKET_MS, LABEL_HORIZON_BUCKETS, and TOP_DEPTH must be numeric"
+    ;;
+esac
+case "$feature_family" in
+  h1|h2)
+    ;;
+  *)
+    die "FEATURE_FAMILY must be h1 or h2"
     ;;
 esac
 canonical_relpath "$output_prefix" || die "OUTPUT_PREFIX must be a safe relative path"
@@ -977,6 +985,7 @@ set -- "$PIT_BIN" \
   --bucket-ms "$bucket_ms" \
   --label-horizon-buckets "$label_horizon_buckets" \
   --top-depth "$top_depth" \
+  --feature-family "$feature_family" \
   --artifact-dir "$LOCAL_MATERIALIZATION_DIR"
 if [ -n "$window_start_received_at_ns" ]; then
   set -- "$@" --output-start-received-at-ns "$window_start_received_at_ns" --output-end-received-at-ns "$window_end_received_at_ns"
