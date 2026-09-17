@@ -506,6 +506,9 @@ pub struct PrepareFreshInputsArgs {
     pub label_horizon_buckets: u64,
     #[arg(long)]
     pub top_depth: usize,
+    /// H1 snapshot family or H2 lagged Cont OFI. Required; inventories never default.
+    #[arg(long, value_parser = ["h1", "h2"])]
+    pub feature_family: String,
     #[arg(long, default_value_t = 100_000)]
     pub max_scan_entries: usize,
     /// Maximum number of frozen raw and reference inputs.
@@ -1045,6 +1048,9 @@ pub struct FreezeInventoryArgs {
     pub label_horizon_buckets: u64,
     #[arg(long)]
     pub top_depth: usize,
+    /// H1 snapshot family or H2 lagged Cont OFI. Required; inventories never default.
+    #[arg(long, value_parser = ["h1", "h2"])]
+    pub feature_family: String,
     #[arg(long, default_value_t = 100_000)]
     pub max_scan_entries: usize,
     #[arg(long, default_value_t = 8192)]
@@ -1725,6 +1731,8 @@ mod tests {
             "5",
             "--top-depth",
             "5",
+            "--feature-family",
+            "h1",
             "--max-inputs",
             "64",
             "--max-input-bytes",
@@ -1746,6 +1754,69 @@ mod tests {
     }
 
     #[test]
+    fn freeze_and_fresh_inputs_require_explicit_feature_family() {
+        let freeze = [
+            "alpha-harness", "data", "freeze-inventory",
+            "--raw-root", "/archive/raw", "--reference-root", "/archive/reference",
+            "--market", "usdm",
+            "--start-received-at-ns", "1700000000000000000", "--end-received-at-ns", "1700000060000000000",
+            "--symbol", "BTCUSDT", "--image-ref", "registry/runner@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--mission-id", "data-test", "--output-prefix", "runs/test", "--bucket-ms", "1000",
+            "--label-horizon-buckets", "5", "--top-depth", "5", "--max-input-bytes", "1000000",
+            "--output", "frozen.env",
+        ];
+        assert!(Cli::try_parse_from(freeze).is_err());
+        assert!(Cli::try_parse_from(freeze.into_iter().chain(["--feature-family", "h2"])).is_ok());
+
+        let fresh = [
+            "alpha-harness",
+            "mission",
+            "prepare-fresh-inputs",
+            "--raw-root",
+            "/archive/raw",
+            "--reference-root",
+            "/archive/reference",
+            "--market",
+            "usdm",
+            "--start-received-at-ns",
+            "1700000000000000000",
+            "--end-received-at-ns",
+            "1700000060000000000",
+            "--symbol",
+            "BTCUSDT",
+            "--image-ref",
+            "registry/research@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--mission-id",
+            "fresh-window",
+            "--output-prefix",
+            "campaigns/fresh-window",
+            "--bucket-ms",
+            "1000",
+            "--label-horizon-buckets",
+            "5",
+            "--top-depth",
+            "5",
+            "--max-inputs",
+            "64",
+            "--max-input-bytes",
+            "1000000",
+            "--inventory-out",
+            "/work/frozen.env",
+            "--request-out",
+            "/output/.fresh-inputs/campaigns/fresh-window/request.json",
+            "--campaign-inputs-out",
+            "/output/campaigns/fresh-window/receipts/campaign-inputs.json",
+            "--output-root",
+            "/output",
+            "--materializer",
+            "/usr/local/bin/cex-materialization-entrypoint.sh",
+            "--materializer-work-dir",
+            "/work/materializer",
+        ];
+        assert!(Cli::try_parse_from(fresh).is_err());
+    }
+
+    #[test]
     fn parses_latest_bounded_fresh_input_preparation() {
         let args = "alpha-harness mission prepare-fresh-inputs \
             --raw-root /archive/raw \
@@ -1761,6 +1832,7 @@ mod tests {
             --bucket-ms 1000 \
             --label-horizon-buckets 5 \
             --top-depth 5 \
+            --feature-family h1 \
             --max-inputs 64 \
             --max-input-bytes 1000000 \
             --inventory-out /work/frozen.env \
@@ -1905,7 +1977,7 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "--start-received-at-ns", "1700000000000000000", "--end-received-at-ns", "1700000060000000000",
             "--symbol", "BTCUSDT", "--image-ref", "registry/runner@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "--mission-id", "data-test", "--output-prefix", "runs/test", "--bucket-ms", "1000",
-            "--label-horizon-buckets", "5", "--top-depth", "5", "--max-input-bytes", "1000000",
+            "--label-horizon-buckets", "5", "--top-depth", "5", "--feature-family", "h1", "--max-input-bytes", "1000000",
             "--output", "frozen.env",
         ]).is_ok());
         let handoff_args = [

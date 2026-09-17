@@ -121,6 +121,15 @@ for bullseye_builder in "$binance_lob_dockerfile" "$emergency_collector"; do
   grep -Fqx '    && rustup default 1.98.1 \' "$bullseye_builder"
   grep -Fqx "    && rustc --version | grep -E '^rustc 1\\.98\\.1 '" "$bullseye_builder"
 done
+# SOURCE_REVISION must not cache-bust the collector cmake/pkg-config apt layer.
+# Live bullseye-security 404s libarchive13 3.4.3-2+deb11u5; pin that suite to snapshot.
+grep -Fq 'apt-get -o Acquire::Check-Valid-Until=false install -y --no-install-recommends cmake pkg-config' "$binance_lob_dockerfile"
+grep -Fq 'https://snapshot.debian.org/archive/debian-security/20260901T000000Z/' "$binance_lob_dockerfile"
+awk '
+  /apt-get -o Acquire::Check-Valid-Until=false install -y --no-install-recommends cmake pkg-config/ && !apt { apt = NR }
+  /^ARG SOURCE_REVISION$/ { arg = NR }
+  END { if (!(apt && arg && arg > apt)) exit 1 }
+' "$binance_lob_dockerfile"
 grep -Fqx 'FROM debian:bookworm-slim AS runtime-base' "$dockerfile"
 grep -Fqx 'ARG ALIYUN_CLI_VERSION=3.4.6' "$controller_dockerfile"
 grep -Fqx 'ARG KUBECTL_VERSION=v1.35.3' "$controller_dockerfile"

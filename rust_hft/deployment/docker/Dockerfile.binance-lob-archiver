@@ -9,14 +9,16 @@ RUN rustup toolchain install 1.98.1 --profile minimal --no-self-update \
     && rustc --version | grep -E '^rustc 1\.98\.1 '
 
 WORKDIR /work
-ARG SOURCE_REVISION
+# Live bullseye-security Packages still list libarchive13 3.4.3-2+deb11u5 after
+# the pool object 404s. Pin that suite to a snapshot that still serves it.
 RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list \
-    && apt-get update && apt-get install -y --no-install-recommends \
-    cmake \
-    pkg-config \
+    && sed -i 's|https://deb.debian.org/debian-security|https://snapshot.debian.org/archive/debian-security/20260901T000000Z/|g' /etc/apt/sources.list \
+    && apt-get -o Acquire::Check-Valid-Until=false update \
+    && apt-get -o Acquire::Check-Valid-Until=false install -y --no-install-recommends cmake pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 COPY . .
+ARG SOURCE_REVISION
 # Proc-macro artifacts depend on the builder libc, toolchain and architecture.
 # Keep compiled targets separate from other images while sharing source downloads.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
