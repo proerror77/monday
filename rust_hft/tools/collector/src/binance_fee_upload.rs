@@ -538,4 +538,27 @@ mod tests {
         assert_eq!(recovered["failure_count"], 1);
         assert!(recovered["last_error"].is_null());
     }
+
+    #[test]
+    fn corrupt_upload_status_does_not_reset_failure_count() {
+        let root = tempfile::tempdir().unwrap();
+        let status_path = root.path().join("upload-status.json");
+        let payload = br#"{"failure_count":9, not json"#;
+        fs::write(&status_path, payload).unwrap();
+        let config = ReferenceUploadConfig {
+            output_root: root.path().to_path_buf(),
+            bucket: "bucket".to_string(),
+            endpoint: "endpoint".to_string(),
+            region: "region".to_string(),
+            profile: "profile".to_string(),
+            oss_timeout: Duration::from_secs(1),
+        };
+
+        let error = upload_pending_with(&config, |_, _| unreachable!()).unwrap_err();
+        assert!(
+            error.to_string().contains("not valid JSON"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(fs::read(&status_path).unwrap(), payload);
+    }
 }
