@@ -2396,8 +2396,23 @@ impl Engine {
         }
     }
 
+    fn refuse_emergency_downgrade(&self, requested: TradingMode) -> bool {
+        if self.stats.trading_mode == TradingMode::Emergency && requested != TradingMode::Emergency
+        {
+            warn!(
+                "Sentinel: 緊急模式已鎖定，忽略變更為 {:?} 的請求",
+                requested
+            );
+            return true;
+        }
+        false
+    }
+
     /// 設置交易模式（由 Sentinel 調用）
     pub fn set_trading_mode(&mut self, mode: TradingMode) {
+        if self.refuse_emergency_downgrade(mode) {
+            return;
+        }
         if self.stats.trading_mode != mode {
             info!("交易模式變更: {:?} -> {:?}", self.stats.trading_mode, mode);
             self.stats.trading_mode = mode;
@@ -2406,8 +2421,7 @@ impl Engine {
 
     /// 暫停交易（不生成新訂單）
     pub fn pause_trading(&mut self) {
-        if self.stats.trading_mode == TradingMode::Emergency {
-            warn!("Sentinel: 緊急模式已鎖定，忽略降級為暫停的請求");
+        if self.refuse_emergency_downgrade(TradingMode::Paused) {
             return;
         }
         warn!("Sentinel: 暫停交易");
@@ -2416,12 +2430,18 @@ impl Engine {
 
     /// 恢復正常交易
     pub fn resume_trading(&mut self) {
+        if self.refuse_emergency_downgrade(TradingMode::Normal) {
+            return;
+        }
         info!("Sentinel: 恢復正常交易");
         self.stats.trading_mode = TradingMode::Normal;
     }
 
     /// 進入降頻模式
     pub fn enter_degrade_mode(&mut self) {
+        if self.refuse_emergency_downgrade(TradingMode::Degraded) {
+            return;
+        }
         warn!("Sentinel: 進入降頻模式");
         self.stats.trading_mode = TradingMode::Degraded;
     }
@@ -4114,5 +4134,25 @@ mod tests {
         engine.pause_trading();
 
         assert_eq!(engine.trading_mode(), TradingMode::Emergency);
+    }
+
+    #[test]
+    fn emergency_mode_cannot_be_downgraded_to_degraded() {
+        let mut engine = Engine::new(EngineConfig::default());
+        let (engine_queues, _worker_queues) =
+            create_execution_queues(ExecutionQueueConfig::default());
+        engine.set_execution_queues(engine_queues);
+        engine.emergency_exit();
+
+        engine.enter_degrade_mode();
+        engine.resume_trading();
+        engine.set_trading_mode(TradingMode::Degraded);
+        engine.set_trading_mode(TradingMode::Normal);
+
+        assert_eq!(engine.trading_mode(), TradingMode::Emergency);
+        assert!(matches!(
+            engine.submit_order_intent(test_intent()),
+            Err(HftError::Risk(_))
+        ));
     }
 }

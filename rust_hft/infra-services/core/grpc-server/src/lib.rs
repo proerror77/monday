@@ -12,6 +12,7 @@ use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
 // 引入生成的 proto 代碼
+#[allow(clippy::result_large_err)]
 pub mod proto {
     tonic::include_proto!("hft.control");
 }
@@ -130,6 +131,11 @@ impl HftControl for HftControlService {
         info!("收到進入降頻模式請求");
 
         let mut engine = self.engine.lock().await;
+        if engine.trading_mode() == engine::TradingMode::Emergency {
+            return Err(Status::failed_precondition(
+                "Emergency mode is sticky; restart is required",
+            ));
+        }
         engine.enter_degrade_mode();
 
         Ok(Response::new(Ack {
@@ -524,6 +530,26 @@ mod tests {
             engine::TradingMode::Emergency
         );
         worker.await.expect("worker task");
+    }
+
+    #[tokio::test]
+    async fn enter_degrade_mode_cannot_leave_emergency() {
+        let mut engine = Engine::new(engine::EngineConfig::default());
+        engine.emergency_exit();
+        let engine = Arc::new(Mutex::new(engine));
+        let control = ExecutionControlHandle::new(engine.clone(), None, false);
+        let service = HftControlService::with_execution_control(control);
+
+        let error = service
+            .enter_degrade_mode(Request::new(Empty {}))
+            .await
+            .expect_err("Emergency must stay sticky");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("sticky"));
+        assert_eq!(
+            engine.lock().await.trading_mode(),
+            engine::TradingMode::Emergency
+        );
     }
 
     #[tokio::test]
