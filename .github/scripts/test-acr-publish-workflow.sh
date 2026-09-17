@@ -122,11 +122,11 @@ for bullseye_builder in "$binance_lob_dockerfile" "$emergency_collector"; do
   grep -Fqx "    && rustc --version | grep -E '^rustc 1\\.98\\.1 '" "$bullseye_builder"
 done
 # SOURCE_REVISION must not cache-bust the collector cmake/pkg-config apt layer.
-# A stale bullseye-security index can 404 mid-install; retry once with a fresh update.
-grep -Fq 'apt-get install -y --no-install-recommends cmake pkg-config' "$binance_lob_dockerfile"
-grep -Fq '|| (apt-get update && apt-get install -y --no-install-recommends cmake pkg-config)' "$binance_lob_dockerfile"
+# Live bullseye-security 404s libarchive13 3.4.3-2+deb11u5; pin that suite to snapshot.
+grep -Fq 'apt-get -o Acquire::Check-Valid-Until=false install -y --no-install-recommends cmake pkg-config' "$binance_lob_dockerfile"
+grep -Fq 'https://snapshot.debian.org/archive/debian-security/20260901T000000Z/' "$binance_lob_dockerfile"
 awk '
-  /apt-get install -y --no-install-recommends cmake pkg-config/ && !apt { apt = NR }
+  /apt-get -o Acquire::Check-Valid-Until=false install -y --no-install-recommends cmake pkg-config/ && !apt { apt = NR }
   /^ARG SOURCE_REVISION$/ { arg = NR }
   END { if (!(apt && arg && arg > apt)) exit 1 }
 ' "$binance_lob_dockerfile"
