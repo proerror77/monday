@@ -552,6 +552,18 @@ mod tests {
     }
 
     #[test]
+    fn live_feature_fields_reject_lagged_cont_ofi() {
+        let error = validate_live_feature_fields(&[
+            alpha_domain::CEX_RESEARCH_CONT_OFI_LAG60S_FIELD.to_string(),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("cont_ofi_lag60s is not live executable"));
+    }
+
+    #[test]
     fn mcts_shared_fan_in_requires_an_immutable_baseline_gate() {
         let store = AlphaStore::open_in_memory().unwrap();
         let mission = ResearchMission {

@@ -16,7 +16,8 @@ use alpha_domain::{
     CexResearchMissionSpecV1, CexResearchOperationalMetadataV1, CexResearchPolicyBindingsV1,
     CexResearchSearchPlanV1, CexResearchVenueV1, EvaluationCostsV1, EvaluationLabelSpecV1,
     EvaluationProtocolV1, EvaluationWalkForwardV1, SearchBudget,
-    CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD, CEX_RESEARCH_MISSION_SCHEMA_V1,
+    CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD, CEX_RESEARCH_CONT_OFI_LAG60S_FIELD,
+    CEX_RESEARCH_MISSION_SCHEMA_V1,
 };
 use alpha_engine::baselines::CexSupervisedDecisionPolicyV2;
 use anyhow::{bail, Context};
@@ -68,6 +69,17 @@ const FEATURE_FIELDS: [&str; 9] = [
     "bid_depth_top5",
     "book_imbalance",
     "book_imbalance_top5",
+    "near_depth_concentration_skew_top5",
+    "spread_bps",
+    "vwap_center_deviation_top5_bps",
+    "weighted_book_imbalance_top5",
+];
+const H2_FEATURE_FIELDS: [&str; 9] = [
+    "ask_depth_top5",
+    "bid_depth_top5",
+    "book_imbalance",
+    "book_imbalance_top5",
+    CEX_RESEARCH_CONT_OFI_LAG60S_FIELD,
     "near_depth_concentration_skew_top5",
     "spread_bps",
     "vwap_center_deviation_top5_bps",
@@ -562,7 +574,7 @@ impl CexCampaignResearchPlanV1 {
             hypothesis: "Aggressive trade-flow imbalance, L1 pressure, top-five depth balance, inverse spread, cross-depth pressure consensus, near-touch depth concentration, linearly weighted top-five pressure, and top-five VWAP-center displacement predict forward mid-price returns over the bound instrument horizon"
                 .to_string(),
             focus_field: "book_imbalance_top5".to_string(),
-            feature_fields: FEATURE_FIELDS.into_iter().map(str::to_string).collect(),
+            feature_fields: snapshot_feature_fields(),
             label_horizon: None,
             mlp_training: None,
             attempted_search_policy_revision_ids: vec![search_policy_revision.revision_id.clone()],
@@ -573,6 +585,17 @@ impl CexCampaignResearchPlanV1 {
             learning_directive: None,
             llm: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn h2() -> Self {
+        let mut plan = Self::canonical();
+        plan.objective = "Generate and screen continuous L2 microstructure factors, including lagged sixty-second Cont best-quote order-flow imbalance, inverse spread, cross-depth pressure consensus, top-five depth concentration, and VWAP-center displacement, then evaluate Ridge and shallow CART with purged walk-forward OOS predictions on the bound Binance instrument and prediction horizon under governed dynamic-v4 GP"
+            .to_string();
+        plan.hypothesis = "Lagged sixty-second Cont best-quote order-flow imbalance, L1 pressure, top-five depth balance, inverse spread, cross-depth pressure consensus, near-touch depth concentration, linearly weighted top-five pressure, and top-five VWAP-center displacement predict forward mid-price returns over the bound instrument horizon"
+            .to_string();
+        plan.feature_fields = lagged_cont_ofi_feature_fields();
+        plan
     }
 
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
@@ -588,12 +611,12 @@ impl CexCampaignResearchPlanV1 {
             if self.comparison_family_trials != Some(138) {
                 bail!("calendar H1 requires the complete 138-trial comparison family");
             }
-            if self.feature_fields != allowed_research_feature_fields()
+            if !calendar_admits_feature_family(&self.feature_fields)
                 || self.search_policy_revision.research_delta.is_some()
                 || self.focus_field != "book_imbalance_top5"
             {
                 bail!(
-                    "calendar H1 requires the unchanged snapshot feature family and GP templates"
+                    "calendar validation requires the H1 snapshot family or the H2 lagged Cont OFI replacement family, with unchanged GP templates"
                 );
             }
             if horizon.labels.observation_frequency_millis != 1_000
@@ -719,7 +742,7 @@ impl CexCampaignResearchPlanV1 {
                 bail!("CEX Campaign research plan {label} is invalid");
             }
         }
-        let allowed = FEATURE_FIELDS
+        let allowed = allowed_research_feature_fields()
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>();
         if self.feature_fields.is_empty()
@@ -863,8 +886,24 @@ impl CexCampaignResearchPlanV1 {
     }
 }
 
-pub(crate) fn allowed_research_feature_fields() -> Vec<String> {
+fn snapshot_feature_fields() -> Vec<String> {
     FEATURE_FIELDS.into_iter().map(str::to_string).collect()
+}
+
+fn lagged_cont_ofi_feature_fields() -> Vec<String> {
+    H2_FEATURE_FIELDS.into_iter().map(str::to_string).collect()
+}
+
+fn calendar_admits_feature_family(fields: &[String]) -> bool {
+    fields == snapshot_feature_fields() || fields == lagged_cont_ofi_feature_fields()
+}
+
+pub(crate) fn allowed_research_feature_fields() -> Vec<String> {
+    let mut fields = snapshot_feature_fields();
+    fields.extend(lagged_cont_ofi_feature_fields());
+    fields.sort();
+    fields.dedup();
+    fields
 }
 
 #[derive(Debug)]
@@ -1142,6 +1181,7 @@ pub(crate) fn render_prepared_cex_bundle(
             .development_precheck
             .as_ref()
             .and_then(|receipt| receipt.protocol.calendar.as_ref()),
+        &research_plan.feature_fields,
     )?;
     let validation = approved_validation(materialization)?;
     validate_materialization(materialization, feature_sha256, &validation)?;
@@ -1653,6 +1693,7 @@ fn ensure_materialization_scope(
     feature_sha256: &str,
     expected_horizon: Option<&CampaignLabelHorizonV1>,
     calendar: Option<&alpha_domain::EvaluationCalendarBindingV1>,
+    required_feature_fields: &[String],
 ) -> anyhow::Result<()> {
     validate_render_materialization_scope_for_horizon(materialization, expected_horizon, calendar)?;
     let minimum_rows = calendar
@@ -1678,7 +1719,11 @@ fn ensure_materialization_scope(
     {
         bail!("feature manifest does not bind the supplied feature artifact");
     }
-    for field in FEATURE_FIELDS.into_iter().chain(["mid_price"]) {
+    for field in required_feature_fields
+        .iter()
+        .map(String::as_str)
+        .chain(["mid_price"])
+    {
         if !manifest.feature_names.iter().any(|name| name == field) {
             bail!("approved Mission render requires feature field {field}");
         }
@@ -1818,6 +1863,181 @@ pub(crate) mod tests {
                 .absolute_p95_bps = Some(9_999.0);
             assert!(render_prepared_cex_bundle(&restored, &plan, 7, 138).is_err());
         }
+    }
+
+    fn calendar_ready_plan(mut plan: CexCampaignResearchPlanV1) -> CexCampaignResearchPlanV1 {
+        let start = chrono::DateTime::<Utc>::from_timestamp(1_789_552_800, 0).unwrap();
+        plan.supervised_model_scope = alpha_domain::CexSupervisedModelScopeV1::RidgeOnly;
+        plan.holding = Some(hft_research_manifest::model::HorizonHoldingPolicyV1 {
+            horizon_millis: 5_000,
+        });
+        plan.label_horizon = Some(CampaignLabelHorizonV1::new(5, 1000, 10, 5).unwrap());
+        plan.comparison_family_trials = Some(138);
+        plan.calendar = Some(alpha_domain::EvaluationCalendarV1 {
+            start,
+            develop_end: start + ChronoDuration::hours(4),
+            validation_end: start + ChronoDuration::hours(6),
+            end: start + ChronoDuration::hours(8),
+        });
+        plan
+    }
+
+    fn bind_rewritten_features(fixture: &Fixture, rows: &[PointInTimeFeatureRow]) {
+        rewrite_feature_rows(&fixture.feature_path, rows);
+        let feature_sha256 = hex::encode(Sha256::digest(
+            std::fs::read(&fixture.feature_path).unwrap(),
+        ));
+        let mut materialization: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&fixture.materialization_path).unwrap()).unwrap();
+        materialization["artifact_sha256"] = serde_json::json!(feature_sha256.clone());
+        materialization["snapshot"]["feature_artifact_sha256"] = serde_json::json!(feature_sha256);
+        let snapshot: hft_research_manifest::CexReplaySnapshotV5 =
+            serde_json::from_value(materialization["snapshot"].clone()).unwrap();
+        materialization["snapshot_sha256"] = serde_json::json!(snapshot.sha256());
+        std::fs::write(
+            &fixture.materialization_path,
+            serde_json::to_vec_pretty(&materialization).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn calendar_h1_still_rejects_drifted_snapshot_family() {
+        let plan = calendar_ready_plan(CexCampaignResearchPlanV1::canonical());
+        plan.validate().unwrap();
+        assert_eq!(plan.max_candidates().unwrap(), 22);
+
+        let mut dropped = plan.clone();
+        dropped.feature_fields.retain(|field| field != "spread_bps");
+        assert!(dropped.validate().is_err());
+
+        let mut tenth = plan.clone();
+        tenth
+            .feature_fields
+            .push(CEX_RESEARCH_CONT_OFI_LAG60S_FIELD.to_string());
+        tenth.feature_fields.sort();
+        assert_eq!(tenth.feature_fields.len(), 10);
+        assert!(tenth.validate().is_err());
+
+        let mut ofi_top5 = plan;
+        ofi_top5.feature_fields = ofi_top5
+            .feature_fields
+            .into_iter()
+            .map(|field| {
+                if field == "spread_bps" {
+                    "ofi_top5".to_string()
+                } else {
+                    field
+                }
+            })
+            .collect();
+        ofi_top5.feature_fields.sort();
+        assert!(ofi_top5.validate().is_err());
+    }
+
+    #[test]
+    fn calendar_h2_accepts_lagged_cont_ofi_replacement_family() {
+        let plan = calendar_ready_plan(CexCampaignResearchPlanV1::h2());
+        plan.validate().unwrap();
+        assert_eq!(plan.feature_fields, lagged_cont_ofi_feature_fields());
+        assert_eq!(plan.max_candidates().unwrap(), 22);
+        assert!(!plan
+            .feature_fields
+            .iter()
+            .any(|field| field == CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD));
+        assert!(!plan.feature_fields.iter().any(|field| field == "ofi_top5"));
+
+        let mut mixed = plan.clone();
+        mixed.feature_fields = allowed_research_feature_fields();
+        assert_eq!(mixed.feature_fields.len(), 10);
+        assert!(mixed.validate().is_err());
+
+        let mut ofi_top5 = plan.clone();
+        ofi_top5.feature_fields = ofi_top5
+            .feature_fields
+            .into_iter()
+            .map(|field| {
+                if field == CEX_RESEARCH_CONT_OFI_LAG60S_FIELD {
+                    "ofi_top5".to_string()
+                } else {
+                    field
+                }
+            })
+            .collect();
+        ofi_top5.feature_fields.sort();
+        assert!(ofi_top5.validate().is_err());
+
+        let mut windows = plan;
+        windows.search_policy_revision.research_delta = Some(CexResearchDeltaConfigV1 {
+            feature_fields: lagged_cont_ofi_feature_fields(),
+            operators: vec![
+                FactorOperator::Add,
+                FactorOperator::Delta,
+                FactorOperator::Mul,
+                FactorOperator::Sub,
+                FactorOperator::ZScore,
+            ],
+            windows: vec![5, 20],
+            ridge_l2: 1.0e-6,
+            cart_max_depth: 3,
+            cart_min_leaf: 5,
+        });
+        assert!(windows.validate().is_err());
+    }
+
+    #[test]
+    fn h2_render_requires_lagged_cont_ofi_and_keeps_twenty_two_gp_templates() {
+        let fixture = Fixture::new(MIN_ROWS);
+        let plan = CexCampaignResearchPlanV1::h2();
+        let missing = render_cex_bundle(
+            &fixture.feature_path,
+            &fixture.materialization_path,
+            &plan,
+            7,
+            plan.max_candidates().unwrap() * 2,
+        )
+        .unwrap_err();
+        assert!(missing
+            .to_string()
+            .contains("approved Mission render requires feature field cont_ofi_lag60s"));
+
+        let mut rows = read_feature_rows(&fixture.feature_path);
+        for row in &mut rows {
+            row.features
+                .insert(CEX_RESEARCH_CONT_OFI_LAG60S_FIELD.to_string(), 1.5);
+        }
+        bind_rewritten_features(&fixture, &rows);
+        let rendered = render_cex_bundle(
+            &fixture.feature_path,
+            &fixture.materialization_path,
+            &plan,
+            7,
+            plan.max_candidates().unwrap() * 2,
+        )
+        .unwrap();
+        assert_eq!(
+            rendered.mission.spec.feature_fields,
+            lagged_cont_ofi_feature_fields()
+        );
+        assert_eq!(rendered.mission.spec.search.budget.max_candidates, 22);
+        let expected_gp = CexGpPolicyV1::controlled_dynamic_v4(
+            rendered.mission.spec.policies.gp.id.clone(),
+            rendered.mission.spec.feature_fields.clone(),
+            rendered.mission.spec.search.seed,
+            &rendered.mission.spec.search.budget,
+        )
+        .unwrap();
+        expected_gp
+            .validate_binding(&rendered.mission.spec.policies.gp)
+            .unwrap();
+        assert!(expected_gp
+            .admitted_fields
+            .iter()
+            .any(|field| field == CEX_RESEARCH_CONT_OFI_LAG60S_FIELD));
+        assert!(!expected_gp
+            .admitted_fields
+            .iter()
+            .any(|field| { field == CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD }));
     }
 
     #[test]

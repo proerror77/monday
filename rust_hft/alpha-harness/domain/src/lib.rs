@@ -42,6 +42,7 @@ pub const CEX_MCTS_RESEARCH_RECEIPT_VERSION_V1: &str = "cex-mcts-research-receip
 pub const CEX_RESEARCH_MISSION_SCHEMA_V1: &str = "cex-research-mission-v1";
 pub const CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD: &str =
     "aggregate_trade_flow_imbalance";
+pub const CEX_RESEARCH_CONT_OFI_LAG60S_FIELD: &str = "cont_ofi_lag60s";
 pub const CEX_GP_POLICY_SCHEMA_V1: &str = "cex-gp-policy-v1";
 pub const CEX_GP_POLICY_SCHEMA_V2: &str = "cex-gp-policy-v2";
 pub const CEX_GP_POLICY_SCHEMA_V3: &str = "cex-gp-policy-v3";
@@ -1993,7 +1994,8 @@ fn validate_cex_research_formula(ast: &FactorAst) -> Result<LiveFormulaCapabilit
     fn live_capability_surrogate(ast: &FactorAst) -> FactorAst {
         match ast {
             FactorAst::Terminal(FactorTerminal::Field(field))
-                if field == CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD =>
+                if field == CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD
+                    || field == CEX_RESEARCH_CONT_OFI_LAG60S_FIELD =>
             {
                 FactorAst::Terminal(FactorTerminal::Field("book_imbalance".to_string()))
             }
@@ -7305,6 +7307,29 @@ mod tests {
         )
         .unwrap();
         policy.validate_candidate(&field).unwrap();
+    }
+
+    #[test]
+    fn governed_gp_accepts_lagged_cont_ofi_without_granting_live_capability() {
+        let field = FactorAst::Terminal(FactorTerminal::Field(
+            CEX_RESEARCH_CONT_OFI_LAG60S_FIELD.to_string(),
+        ));
+        assert!(validate_live_formula(&field).is_err());
+
+        let policy = CexGpPolicyV1::controlled_v1(
+            "research-cont-ofi-policy",
+            vec![CEX_RESEARCH_CONT_OFI_LAG60S_FIELD.to_string()],
+            7,
+            &SearchBudget {
+                max_candidates: 2,
+                max_expansions: 16,
+                max_tokens: 0,
+                max_seconds: 0,
+            },
+        )
+        .unwrap();
+        policy.validate_candidate(&field).unwrap();
+        assert_eq!(policy.candidate_history_rows(&field).unwrap(), 1);
     }
 
     #[test]
