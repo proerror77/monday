@@ -111,10 +111,34 @@ struct SourceSegmentEvidence {
     events: u64,
 }
 
+const CONT_OFI_LAG_NS: u64 = 60 * 1_000_000_000;
+const CONT_OFI_LAG60S_FIELD: &str = "cont_ofi_lag60s";
+
 #[derive(Debug, Clone, PartialEq)]
 struct BookState {
     bids: BTreeMap<Decimal, Decimal>,
     asks: BTreeMap<Decimal, Decimal>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BestQuote {
+    bid_px: Decimal,
+    bid_qty: Decimal,
+    ask_px: Decimal,
+    ask_qty: Decimal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContOfiEvent {
+    time_ns: u64,
+    series_id: u64,
+    contribution: Decimal,
+}
+
+#[derive(Debug, Default, Clone)]
+struct ContOfiTape {
+    series_started_at_ns: BTreeMap<u64, u64>,
+    events: Vec<ContOfiEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -197,6 +221,8 @@ struct Replay {
     samples: Vec<BookSample>,
     next_bucket_ns: Option<u64>,
     series_id: u64,
+    best_quote: Option<BestQuote>,
+    cont_ofi: ContOfiTape,
 }
 
 impl Replay {
@@ -208,6 +234,8 @@ impl Replay {
             samples: Vec::new(),
             next_bucket_ns: None,
             series_id: 0,
+            best_quote: None,
+            cont_ofi: ContOfiTape::default(),
         }
     }
 
@@ -218,6 +246,26 @@ impl Replay {
             .checked_add(1)
             .context("series id overflow")?;
         self.next_bucket_ns = Some(ceil_bucket(received_at_ns, self.bucket_ns)?);
+        self.best_quote = Some(best_quote(
+            self.state.as_ref().expect("series start has replay state"),
+        )?);
+        self.cont_ofi
+            .series_started_at_ns
+            .insert(self.series_id, received_at_ns);
+        Ok(())
+    }
+
+    fn record_diff_ofi(&mut self, received_at_ns: u64) -> Result<()> {
+        let current = best_quote(self.state.as_ref().context("diff has no replay state")?)?;
+        let previous = self
+            .best_quote
+            .replace(current)
+            .context("diff has no previous best quote")?;
+        self.cont_ofi.events.push(ContOfiEvent {
+            time_ns: received_at_ns,
+            series_id: self.series_id,
+            contribution: cont_best_quote_event(&previous, &current),
+        });
         Ok(())
     }
 
@@ -302,6 +350,7 @@ impl Replay {
                         let state = self.state.as_mut().context("diff has no replay state")?;
                         apply_levels(&mut state.bids, bids, "bid")?;
                         apply_levels(&mut state.asks, asks, "ask")?;
+                        self.record_diff_ofi(received_at_ns)?;
                     }
                     ReplayedBinanceBookEvent::Checkpoint { .. } => {}
                 }
@@ -479,6 +528,7 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         &replay.samples,
         &aggregate_trades,
         has_aggregate_trades,
+        &replay.cont_ofi,
         args,
         &source_revisions,
         &symbol,
@@ -1350,6 +1400,59 @@ fn sample_book(
     })
 }
 
+fn best_quote(state: &BookState) -> Result<BestQuote> {
+    let (bid_px, bid_qty) = state
+        .bids
+        .iter()
+        .next_back()
+        .context("order book has no bids")?;
+    let (ask_px, ask_qty) = state.asks.iter().next().context("order book has no asks")?;
+    if bid_px >= ask_px {
+        bail!("replayed order book is crossed");
+    }
+    Ok(BestQuote {
+        bid_px: *bid_px,
+        bid_qty: *bid_qty,
+        ask_px: *ask_px,
+        ask_qty: *ask_qty,
+    })
+}
+
+fn cont_best_quote_event(previous: &BestQuote, current: &BestQuote) -> Decimal {
+    let mut contribution = Decimal::ZERO;
+    if current.bid_px >= previous.bid_px {
+        contribution += current.bid_qty;
+    }
+    if current.bid_px <= previous.bid_px {
+        contribution -= previous.bid_qty;
+    }
+    if current.ask_px <= previous.ask_px {
+        contribution -= current.ask_qty;
+    }
+    if current.ask_px >= previous.ask_px {
+        contribution += previous.ask_qty;
+    }
+    contribution
+}
+
+fn lagged_cont_ofi(tape: &ContOfiTape, series_id: u64, time_ns: u64) -> Option<Decimal> {
+    let series_started_at_ns = tape.series_started_at_ns.get(&series_id).copied()?;
+    let lag_start_ns = time_ns.checked_sub(CONT_OFI_LAG_NS)?;
+    if series_started_at_ns > lag_start_ns {
+        return None;
+    }
+    Some(
+        tape.events
+            .iter()
+            .filter(|event| {
+                event.series_id == series_id
+                    && event.time_ns >= lag_start_ns
+                    && event.time_ns < time_ns
+            })
+            .fold(Decimal::ZERO, |total, event| total + event.contribution),
+    )
+}
+
 fn output_window(args: &Args) -> Result<Option<(u64, u64)>> {
     match (
         args.output_start_received_at_ns,
@@ -1365,13 +1468,14 @@ fn materialize_rows(
     samples: &[BookSample],
     aggregate_trades: &[AggregateTrade],
     has_aggregate_trades: bool,
+    cont_ofi: &ContOfiTape,
     args: &Args,
     source_revisions: &BTreeMap<String, String>,
     symbol: &str,
     ingestion_time: DateTime<Utc>,
 ) -> Result<Vec<PointInTimeFeatureRow>> {
     let window = output_window(args)?;
-    let mut rows = Vec::new();
+    let mut pending = Vec::new();
     let aggregate_trades = aggregate_trades
         .iter()
         .filter(|trade| trade.symbol == symbol)
@@ -1383,7 +1487,7 @@ fn materialize_rows(
                 json!({
                     "processed_samples": index,
                     "total_samples": samples.len(),
-                    "materialized_rows": rows.len(),
+                    "materialized_rows": pending.len(),
                 }),
             );
         }
@@ -1503,18 +1607,39 @@ fn materialize_rows(
         if !label.is_finite() || features.values().any(|value| !value.is_finite()) {
             bail!("materialized feature or label is not finite");
         }
-        rows.push(PointInTimeFeatureRow {
-            series_id: current.series_id,
-            event_time,
-            feature_available_time: event_time,
-            label_available_time: future_time,
-            ingestion_time,
-            symbol: symbol.to_string(),
-            source_revisions: source_revisions.clone(),
-            modalities,
-            features,
-            label,
-        });
+        pending.push((
+            PointInTimeFeatureRow {
+                series_id: current.series_id,
+                event_time,
+                feature_available_time: event_time,
+                label_available_time: future_time,
+                ingestion_time,
+                symbol: symbol.to_string(),
+                source_revisions: source_revisions.clone(),
+                modalities,
+                features,
+                label,
+            },
+            lagged_cont_ofi(cont_ofi, current.series_id, current.time_ns)
+                .map(decimal_f64)
+                .transpose()?,
+        ));
+    }
+    let emit_cont_ofi = pending.iter().any(|(_, lag)| lag.is_some());
+    let mut rows = Vec::with_capacity(pending.len());
+    for (mut row, lag) in pending {
+        if emit_cont_ofi {
+            let Some(value) = lag else {
+                // Incomplete [t-60s, t) history is not a zero; drop the row.
+                continue;
+            };
+            if !value.is_finite() {
+                bail!("materialized feature or label is not finite");
+            }
+            row.features
+                .insert(CONT_OFI_LAG60S_FIELD.to_string(), value);
+        }
+        rows.push(row);
     }
     if rows.len() < 3 {
         bail!("materialization produced fewer than three PIT rows");
@@ -2727,6 +2852,7 @@ mod tests {
         assert_eq!(rows[0].features["aggregate_trade_base_volume"], 2.0);
         assert_eq!(rows[0].features["aggregate_trade_quote_volume"], 201.0);
         assert_eq!(rows[0].features["aggregate_trade_flow_imbalance"], 1.0);
+        assert!(!rows[0].features.contains_key("cont_ofi_lag60s"));
         assert!(rows[0]
             .features
             .contains_key("weighted_book_imbalance_top5"));
@@ -2748,5 +2874,178 @@ mod tests {
         );
         assert!((rows[0].features["mid_price"] - 101.0).abs() < 1e-12);
         assert!((rows[0].label - (101.25 / 101.0 - 1.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn cont_best_quote_event_follows_cont_kukanov_stoikov() {
+        let rest = BestQuote {
+            bid_px: Decimal::from(100),
+            bid_qty: Decimal::from(10),
+            ask_px: Decimal::from(101),
+            ask_qty: Decimal::from(8),
+        };
+        assert_eq!(cont_best_quote_event(&rest, &rest), Decimal::ZERO);
+        assert_eq!(
+            cont_best_quote_event(
+                &rest,
+                &BestQuote {
+                    bid_qty: Decimal::from(11),
+                    ..rest
+                }
+            ),
+            Decimal::ONE
+        );
+        assert_eq!(
+            cont_best_quote_event(
+                &rest,
+                &BestQuote {
+                    bid_px: Decimal::from(100) + Decimal::new(1, 1),
+                    bid_qty: Decimal::from(3),
+                    ..rest
+                }
+            ),
+            Decimal::from(3)
+        );
+    }
+
+    fn lagged_cont_ofi_rows() -> Vec<Value> {
+        let mut rows = vec![
+            json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(0),"type":"session_start","session_id":"session-1","market":"usdm","symbols":1,"websocket_shards":2,"websocket_streams":2}),
+            json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(1),"type":"stream_coverage","session_id":"session-1","shards":[["btcusdt@aggTrade"],["btcusdt@depth@100ms"]]}),
+            json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(100),"type":"snapshot","session_id":"session-1","symbol":"BTCUSDT","request_started_at_ns":event_ns(50),"snapshot":{"lastUpdateId":100,"bids":[["100","10"],["99","5"],["98","4"],["97","3"],["96","2"]],"asks":[["102","4"],["103","6"],["104","5"],["105","4"],["106","3"]]}}),
+            trade(700, 10),
+        ];
+        let mut last_id = 100_u64;
+        let mut bid_qty = 10_u64;
+        for second in 1..=75 {
+            last_id += 1;
+            bid_qty += if second == 70 { 100 } else { 1 };
+            rows.push(diff(
+                second * 1_000,
+                last_id,
+                last_id,
+                last_id - 1,
+                json!([["100", bid_qty.to_string()]]),
+                json!([]),
+            ));
+        }
+        rows.push(json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(75_500),"type":"checkpoint","session_id":"session-1","symbol":"BTCUSDT","last_update_id":last_id,"synced":true,"bridged":true,"continuity_complete":true,"stream_coverage_verified":true,"bids":[["100", bid_qty.to_string()],["99","5"],["98","4"],["97","3"],["96","2"]],"asks":[["102","4"],["103","6"],["104","5"],["105","4"],["106","3"]],"reason":"test","replay_safe":true}));
+        rows
+    }
+
+    #[test]
+    fn lagged_cont_ofi_sums_prior_sixty_seconds_of_best_quote_events() {
+        let tape = lagged_cont_ofi_rows();
+        let mut fixture = Fixture::new(Market::Usdm, &tape);
+        let reference_root = fixture.directory.join("reference");
+        for milliseconds in [20_000_u64, 40_000, 60_000, 76_000] {
+            fixture.references.push(publish_reference_at_ns(
+                &reference_root,
+                event_ns(milliseconds),
+                event_ns(milliseconds + 3_000),
+                4,
+                123_470,
+            ));
+        }
+        let mut args = fixture.args();
+        args.label_horizon_buckets = 2;
+        args.output_start_received_at_ns = Some(event_ns(61_000));
+        args.output_end_received_at_ns = Some(event_ns(76_000));
+        let published = materialize(&args).unwrap();
+        let rows = BufReader::new(File::open(&published.report.artifact_path).unwrap())
+            .lines()
+            .map(|line| serde_json::from_str::<PointInTimeFeatureRow>(&line.unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        let at_70s = rows
+            .iter()
+            .find(|row| row.event_time == datetime_ns(event_ns(70_000)).unwrap())
+            .expect("70s decision row");
+        let at_71s = rows
+            .iter()
+            .find(|row| row.event_time == datetime_ns(event_ns(71_000)).unwrap())
+            .expect("71s decision row");
+        assert_eq!(at_70s.features[CONT_OFI_LAG60S_FIELD], 60.0);
+        assert_eq!(at_71s.features[CONT_OFI_LAG60S_FIELD], 159.0);
+        assert_ne!(
+            at_70s.features[CONT_OFI_LAG60S_FIELD],
+            at_70s.features["ofi_top5"]
+        );
+        assert!(at_70s.features.contains_key("book_imbalance"));
+        assert!(at_70s.features.contains_key("weighted_book_imbalance_top5"));
+    }
+
+    #[test]
+    fn lagged_cont_ofi_does_not_impute_zeros_or_include_contemporaneous_flow() {
+        let t = CONT_OFI_LAG_NS;
+        let mut tape = ContOfiTape::default();
+        tape.series_started_at_ns.insert(1, 1);
+        tape.events.push(ContOfiEvent {
+            time_ns: t - 1,
+            series_id: 1,
+            contribution: Decimal::from(4),
+        });
+        assert_eq!(lagged_cont_ofi(&tape, 1, t), None);
+
+        tape.series_started_at_ns.insert(1, 0);
+        tape.events = vec![
+            ContOfiEvent {
+                time_ns: 0,
+                series_id: 1,
+                contribution: Decimal::from(1),
+            },
+            ContOfiEvent {
+                time_ns: t - 1,
+                series_id: 1,
+                contribution: Decimal::from(2),
+            },
+            ContOfiEvent {
+                time_ns: t,
+                series_id: 1,
+                contribution: Decimal::from(100),
+            },
+            ContOfiEvent {
+                time_ns: t + 5_000_000_000,
+                series_id: 1,
+                contribution: Decimal::from(200),
+            },
+        ];
+        assert_eq!(lagged_cont_ofi(&tape, 1, t), Some(Decimal::from(3)));
+    }
+
+    #[test]
+    fn lagged_cont_ofi_drops_rows_without_sixty_second_history() {
+        let tape = lagged_cont_ofi_rows();
+        let mut fixture = Fixture::new(Market::Usdm, &tape);
+        let reference_root = fixture.directory.join("reference");
+        for milliseconds in [20_000_u64, 40_000, 60_000, 76_000] {
+            fixture.references.push(publish_reference_at_ns(
+                &reference_root,
+                event_ns(milliseconds),
+                event_ns(milliseconds + 3_000),
+                4,
+                123_470,
+            ));
+        }
+        let mut args = fixture.args();
+        args.label_horizon_buckets = 2;
+        args.output_start_received_at_ns = Some(event_ns(30_000));
+        args.output_end_received_at_ns = Some(event_ns(76_000));
+        let published = materialize(&args).unwrap();
+        let rows = BufReader::new(File::open(&published.report.artifact_path).unwrap())
+            .lines()
+            .map(|line| serde_json::from_str::<PointInTimeFeatureRow>(&line.unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|row| {
+            row.features.contains_key(CONT_OFI_LAG60S_FIELD)
+                && row.event_time >= datetime_ns(event_ns(61_000)).unwrap()
+        }));
+        assert!(rows
+            .iter()
+            .any(|row| { row.event_time == datetime_ns(event_ns(70_000)).unwrap() }));
+        assert!(rows.iter().all(|row| {
+            row.event_time != datetime_ns(event_ns(30_000)).unwrap()
+                && row.event_time != datetime_ns(event_ns(40_000)).unwrap()
+        }));
     }
 }
