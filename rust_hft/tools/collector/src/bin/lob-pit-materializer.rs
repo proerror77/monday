@@ -525,10 +525,9 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         }),
     );
     let rows = materialize_rows(
-        &replay.samples,
+        &replay,
         &aggregate_trades,
         has_aggregate_trades,
-        &replay.cont_ofi,
         args,
         &source_revisions,
         &symbol,
@@ -1465,15 +1464,16 @@ fn output_window(args: &Args) -> Result<Option<(u64, u64)>> {
 }
 
 fn materialize_rows(
-    samples: &[BookSample],
+    replay: &Replay,
     aggregate_trades: &[AggregateTrade],
     has_aggregate_trades: bool,
-    cont_ofi: &ContOfiTape,
     args: &Args,
     source_revisions: &BTreeMap<String, String>,
     symbol: &str,
     ingestion_time: DateTime<Utc>,
 ) -> Result<Vec<PointInTimeFeatureRow>> {
+    let samples = &replay.samples;
+    let cont_ofi = &replay.cont_ofi;
     let window = output_window(args)?;
     let mut pending = Vec::new();
     let aggregate_trades = aggregate_trades

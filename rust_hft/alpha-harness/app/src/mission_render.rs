@@ -587,6 +587,7 @@ impl CexCampaignResearchPlanV1 {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn h2() -> Self {
         let mut plan = Self::canonical();
         plan.objective = "Generate and screen continuous L2 microstructure factors, including lagged sixty-second Cont best-quote order-flow imbalance, inverse spread, cross-depth pressure consensus, top-five depth concentration, and VWAP-center displacement, then evaluate Ridge and shallow CART with purged walk-forward OOS predictions on the bound Binance instrument and prediction horizon under governed dynamic-v4 GP"
