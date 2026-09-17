@@ -1,4 +1,4 @@
-use crate::execution_client::execution_io_error;
+use crate::execution_client::{execution_io_error, MONDAY_EXECUTION_DISABLED};
 use crate::{build_order_control_response, order_state_wire};
 use ploy_operator_contracts::{DeploymentRuntimeMode, OrderControlResponse, OrderReplaceRequest};
 use ploy_platform::DeploymentRecord;
@@ -52,12 +52,10 @@ pub async fn cancel_order(
     match deployment.runtime_mode {
         DeploymentRuntimeMode::Paper => {}
         DeploymentRuntimeMode::Live => {
-            if let Some(venue_order_id) = order.venue_order_id.clone() {
-                client
-                    .cancel_order(&hft_core::OrderId(venue_order_id))
-                    .await
-                    .map_err(execution_io_error)?;
-            }
+            let _ = client;
+            return Err(execution_io_error(hft_core::HftError::Config(
+                MONDAY_EXECUTION_DISABLED.to_string(),
+            )));
         }
     }
 
@@ -120,35 +118,10 @@ pub async fn replace_order(
 
     match deployment.runtime_mode {
         DeploymentRuntimeMode::Live => {
-            let venue_order_id = order.venue_order_id.clone().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("order `{order_id}` has no live venue order to replace"),
-                )
-            })?;
-            let new_venue_order_id = client
-                .modify_order(
-                    &hft_core::OrderId(venue_order_id.clone()),
-                    Some(hft_core::Quantity(request.quantity)),
-                    request.limit_price.map(hft_core::Price),
-                )
-                .await
-                .map_err(|error| {
-                    let _ = runtime.record_order_error(order_id, error.to_string());
-                    execution_io_error(error)
-                })?;
-            let updated = runtime
-                .replace_order(
-                    order_id,
-                    request.quantity,
-                    request.limit_price,
-                    new_venue_order_id.0,
-                )
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "order not found"))?;
-            Ok(build_order_control_response(
-                deployment_id.to_string(),
-                updated,
-            ))
+            let _ = client;
+            Err(execution_io_error(hft_core::HftError::Config(
+                MONDAY_EXECUTION_DISABLED.to_string(),
+            )))
         }
         DeploymentRuntimeMode::Paper => {
             let next_revision = order.revision + 1;
@@ -172,6 +145,7 @@ pub async fn replace_order(
 #[cfg(test)]
 mod tests {
     use super::{cancel_order, replace_order};
+    use crate::execution_client::MONDAY_EXECUTION_DISABLED;
     use crate::test_support::StaticExecutionGateway;
     use async_trait::async_trait;
     use ploy_operator_contracts::{
@@ -288,11 +262,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_live_order_updates_runtime() {
+    async fn cancel_live_order_is_fail_closed() {
         let mut runtime = seeded_runtime();
-        let mut gateway =
-            StaticExecutionGateway::acknowledged("venue-1").with_cancel_result(Ok(()));
-        let response = cancel_order(
+        let mut gateway = CountingControlGateway::default();
+        let error = cancel_order(
             &mut runtime,
             &mut gateway,
             &live_deployment(),
@@ -300,17 +273,22 @@ mod tests {
             "order-1",
         )
         .await
-        .expect("cancel");
-        assert_eq!(response.state, "canceled");
+        .expect_err("live cancel is disabled");
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert!(error.to_string().contains(MONDAY_EXECUTION_DISABLED));
+        assert_eq!(gateway.cancellations.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            runtime.order("order-1").expect("order").state,
+            OrderState::Acknowledged
+        );
     }
 
     #[tokio::test]
-    async fn replace_live_persists_new_venue_identity_and_history_across_restore() {
+    async fn replace_live_order_is_fail_closed() {
         let mut runtime = seeded_runtime();
-        let mut gateway = StaticExecutionGateway::acknowledged("venue-1")
-            .with_replace_result(Ok(hft_core::OrderId("venue-2".to_string())));
+        let mut gateway = CountingControlGateway::default();
 
-        let response = replace_order(
+        let error = replace_order(
             &mut runtime,
             &mut gateway,
             &live_deployment(),
@@ -323,17 +301,14 @@ mod tests {
             dec!(2),
         )
         .await
-        .expect("replace persists the venue identity returned by the client");
+        .expect_err("live replace is disabled");
 
-        assert_eq!(response.venue_order_id.as_deref(), Some("venue-2"));
-        assert_eq!(response.venue_order_history, vec!["venue-1"]);
-
-        let restored =
-            TradingRuntime::restore(runtime.snapshot(&std::collections::BTreeMap::new()))
-                .expect("canonical runtime restore");
-        let restored_order = restored.order("order-1").expect("restored order");
-        assert_eq!(restored_order.venue_order_id.as_deref(), Some("venue-2"));
-        assert_eq!(restored_order.venue_order_history, vec!["venue-1"]);
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert!(error.to_string().contains(MONDAY_EXECUTION_DISABLED));
+        assert_eq!(gateway.replacements.load(Ordering::SeqCst), 0);
+        let order = runtime.order("order-1").expect("order");
+        assert_eq!(order.venue_order_id.as_deref(), Some("venue-1"));
+        assert!(order.venue_order_history.is_empty());
     }
 
     #[tokio::test]
@@ -369,11 +344,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replace_partial_failure_marks_order_canceled_with_error() {
+    async fn replace_live_does_not_record_venue_errors_when_disabled() {
         let mut runtime = seeded_runtime();
-        let mut gateway = StaticExecutionGateway::failed(hft_core::HftError::Exchange(
-            "submit rejected".to_string(),
-        ));
+        let mut gateway = CountingControlGateway::default();
 
         let error = replace_order(
             &mut runtime,
@@ -388,15 +361,14 @@ mod tests {
             dec!(2),
         )
         .await
-        .expect_err("partial failure should be surfaced");
+        .expect_err("live replace is disabled");
 
-        assert_eq!(error.kind(), ErrorKind::ConnectionAborted);
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert!(error.to_string().contains(MONDAY_EXECUTION_DISABLED));
+        assert_eq!(gateway.replacements.load(Ordering::SeqCst), 0);
         let order = runtime.order("order-1").expect("order");
         assert_eq!(order.state, OrderState::Acknowledged);
-        assert_eq!(
-            order.last_error.as_deref(),
-            Some("交易所錯誤: submit rejected")
-        );
+        assert!(order.last_error.is_none());
     }
 
     #[tokio::test]
