@@ -890,7 +890,7 @@ alpha-harness data freeze-inventory \
   --end-received-at-ns 1788825600000000000 \
   --symbol BTCUSDT --image-ref "$APPROVED_RESEARCH_IMAGE" \
   --mission-id data-btcusdt-study --output-prefix study/materialization \
-  --bucket-ms 1000 --label-horizon-buckets 5 --top-depth 5 \
+  --bucket-ms 1000 --label-horizon-buckets 5 --top-depth 5 --feature-family h1 \
   --max-input-bytes 20000000000 --output /private/frozen.env
 ```
 
