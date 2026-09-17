@@ -2,6 +2,7 @@
 
 pub mod mlp_training;
 pub mod model;
+pub mod sec_orderflow;
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
