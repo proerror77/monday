@@ -16,8 +16,8 @@ use crate::{
         MAX_RESEARCH_PLAN_GENERATION,
     },
     mission_runner::{
-        decode_materialization, execute_report, fetch_to_file, finalize_existing_search_round,
-        normalized_sha256, publish_immutable_file, recover_execution_report_from_cached_result,
+        decode_materialization, execute_report, fetch_to_file, normalized_sha256,
+        publish_immutable_file, recover_execution_report_from_cached_result,
         recover_execution_report_from_published_result, research_event, valid_git_revision,
         validate_cex_holdout_id, validate_supervised_candidate_binding,
         validate_supervised_replay_binding, CexEventReplayReceiptV1, CexSupervisedModelSelectionV1,
