@@ -59,6 +59,12 @@ impl Market {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum FeatureFamily {
+    H1,
+    H2,
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "lob-pit-materializer",
@@ -82,6 +88,10 @@ struct Args {
     output_start_received_at_ns: Option<u64>,
     #[arg(long, requires = "output_start_received_at_ns")]
     output_end_received_at_ns: Option<u64>,
+    /// H1 keeps the snapshot family. H2 emits lagged 60s Cont OFI and requires
+    /// a verified 60-second pre-window on every output row.
+    #[arg(long, value_enum, default_value = "h1")]
+    feature_family: FeatureFamily,
     #[arg(long, required = true)]
     segment: Vec<PathBuf>,
     #[arg(long, required = true)]
@@ -139,6 +149,56 @@ struct ContOfiEvent {
 struct ContOfiTape {
     series_started_at_ns: BTreeMap<u64, u64>,
     events: Vec<ContOfiEvent>,
+}
+
+#[derive(Debug, Clone)]
+struct ContOfiSeriesIndex {
+    times: Vec<u64>,
+    prefix: Vec<Decimal>,
+}
+
+#[derive(Debug, Clone)]
+struct ContOfiIndex {
+    series_started_at_ns: BTreeMap<u64, u64>,
+    series: BTreeMap<u64, ContOfiSeriesIndex>,
+}
+
+impl ContOfiIndex {
+    fn from_tape(tape: &ContOfiTape) -> Result<Self> {
+        let mut series = BTreeMap::<u64, ContOfiSeriesIndex>::new();
+        for event in &tape.events {
+            let index = series
+                .entry(event.series_id)
+                .or_insert_with(|| ContOfiSeriesIndex {
+                    times: Vec::new(),
+                    prefix: vec![Decimal::ZERO],
+                });
+            if index.times.last().is_some_and(|&last| event.time_ns < last) {
+                bail!("Cont OFI events are not ordered");
+            }
+            index.times.push(event.time_ns);
+            let total = *index.prefix.last().expect("prefix starts at zero") + event.contribution;
+            index.prefix.push(total);
+        }
+        Ok(Self {
+            series_started_at_ns: tape.series_started_at_ns.clone(),
+            series,
+        })
+    }
+
+    fn lagged(&self, series_id: u64, time_ns: u64) -> Option<Decimal> {
+        let series_started_at_ns = self.series_started_at_ns.get(&series_id).copied()?;
+        let lag_start_ns = time_ns.checked_sub(CONT_OFI_LAG_NS)?;
+        if series_started_at_ns > lag_start_ns {
+            return None;
+        }
+        let Some(index) = self.series.get(&series_id) else {
+            return Some(Decimal::ZERO);
+        };
+        let left = index.times.partition_point(|&time| time < lag_start_ns);
+        let right = index.times.partition_point(|&time| time < time_ns);
+        Some(index.prefix[right] - index.prefix[left])
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1434,22 +1494,11 @@ fn cont_best_quote_event(previous: &BestQuote, current: &BestQuote) -> Decimal {
     contribution
 }
 
+#[cfg(test)]
 fn lagged_cont_ofi(tape: &ContOfiTape, series_id: u64, time_ns: u64) -> Option<Decimal> {
-    let series_started_at_ns = tape.series_started_at_ns.get(&series_id).copied()?;
-    let lag_start_ns = time_ns.checked_sub(CONT_OFI_LAG_NS)?;
-    if series_started_at_ns > lag_start_ns {
-        return None;
-    }
-    Some(
-        tape.events
-            .iter()
-            .filter(|event| {
-                event.series_id == series_id
-                    && event.time_ns >= lag_start_ns
-                    && event.time_ns < time_ns
-            })
-            .fold(Decimal::ZERO, |total, event| total + event.contribution),
-    )
+    ContOfiIndex::from_tape(tape)
+        .expect("Cont OFI tape is ordered")
+        .lagged(series_id, time_ns)
 }
 
 fn output_window(args: &Args) -> Result<Option<(u64, u64)>> {
@@ -1473,9 +1522,12 @@ fn materialize_rows(
     ingestion_time: DateTime<Utc>,
 ) -> Result<Vec<PointInTimeFeatureRow>> {
     let samples = &replay.samples;
-    let cont_ofi = &replay.cont_ofi;
+    let cont_ofi_index = match args.feature_family {
+        FeatureFamily::H1 => None,
+        FeatureFamily::H2 => Some(ContOfiIndex::from_tape(&replay.cont_ofi)?),
+    };
     let window = output_window(args)?;
-    let mut pending = Vec::new();
+    let mut rows = Vec::new();
     let aggregate_trades = aggregate_trades
         .iter()
         .filter(|trade| trade.symbol == symbol)
@@ -1487,7 +1539,7 @@ fn materialize_rows(
                 json!({
                     "processed_samples": index,
                     "total_samples": samples.len(),
-                    "materialized_rows": pending.len(),
+                    "materialized_rows": rows.len(),
                 }),
             );
         }
@@ -1604,42 +1656,33 @@ fn materialize_rows(
         } else {
             BTreeSet::from([DataModality::Lob])
         };
-        if !label.is_finite() || features.values().any(|value| !value.is_finite()) {
-            bail!("materialized feature or label is not finite");
-        }
-        pending.push((
-            PointInTimeFeatureRow {
-                series_id: current.series_id,
-                event_time,
-                feature_available_time: event_time,
-                label_available_time: future_time,
-                ingestion_time,
-                symbol: symbol.to_string(),
-                source_revisions: source_revisions.clone(),
-                modalities,
-                features,
-                label,
-            },
-            lagged_cont_ofi(cont_ofi, current.series_id, current.time_ns)
-                .map(decimal_f64)
-                .transpose()?,
-        ));
-    }
-    let emit_cont_ofi = pending.iter().any(|(_, lag)| lag.is_some());
-    let mut rows = Vec::with_capacity(pending.len());
-    for (mut row, lag) in pending {
-        if emit_cont_ofi {
-            let Some(value) = lag else {
-                // Incomplete [t-60s, t) history is not a zero; drop the row.
-                continue;
-            };
+        if let Some(index) = cont_ofi_index.as_ref() {
+            let value = index
+                .lagged(current.series_id, current.time_ns)
+                .context(
+                    "H2 lagged Cont OFI requires a verified 60-second pre-window before each output row",
+                )?;
+            let value = decimal_f64(value)?;
             if !value.is_finite() {
                 bail!("materialized feature or label is not finite");
             }
-            row.features
-                .insert(CONT_OFI_LAG60S_FIELD.to_string(), value);
+            features.insert(CONT_OFI_LAG60S_FIELD.to_string(), value);
         }
-        rows.push(row);
+        if !label.is_finite() || features.values().any(|value| !value.is_finite()) {
+            bail!("materialized feature or label is not finite");
+        }
+        rows.push(PointInTimeFeatureRow {
+            series_id: current.series_id,
+            event_time,
+            feature_available_time: event_time,
+            label_available_time: future_time,
+            ingestion_time,
+            symbol: symbol.to_string(),
+            source_revisions: source_revisions.clone(),
+            modalities,
+            features,
+            label,
+        });
     }
     if rows.len() < 3 {
         bail!("materialization produced fewer than three PIT rows");
@@ -2287,6 +2330,7 @@ mod tests {
                 mission_id: "data-btc-usdm-1".to_string(), symbol: "BTCUSDT".to_string(),
                 market: self.market, bucket_ms: 1_000, label_horizon_buckets: 2, top_depth: 5,
                 output_start_received_at_ns: None, output_end_received_at_ns: None,
+                feature_family: FeatureFamily::H1,
                 segment: vec![self.data.clone()],
                 segment_content_sha256: vec![self.content_sha256.clone()], segment_manifest_sha256: vec![self.manifest_sha256.clone()],
                 artifact_dir: self.directory.join("artifacts"),
@@ -2948,6 +2992,7 @@ mod tests {
             ));
         }
         let mut args = fixture.args();
+        args.feature_family = FeatureFamily::H2;
         args.label_horizon_buckets = 2;
         args.output_start_received_at_ns = Some(event_ns(61_000));
         args.output_end_received_at_ns = Some(event_ns(76_000));
@@ -2956,6 +3001,10 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<PointInTimeFeatureRow>(&line.unwrap()).unwrap())
             .collect::<Vec<_>>();
+        assert_eq!(rows[0].event_time, datetime_ns(event_ns(61_000)).unwrap());
+        assert!(rows
+            .iter()
+            .all(|row| row.features.contains_key(CONT_OFI_LAG60S_FIELD)));
         let at_70s = rows
             .iter()
             .find(|row| row.event_time == datetime_ns(event_ns(70_000)).unwrap())
@@ -2972,6 +3021,62 @@ mod tests {
         );
         assert!(at_70s.features.contains_key("book_imbalance"));
         assert!(at_70s.features.contains_key("weighted_book_imbalance_top5"));
+    }
+
+    fn naive_lagged_cont_ofi(tape: &ContOfiTape, series_id: u64, time_ns: u64) -> Option<Decimal> {
+        let series_started_at_ns = tape.series_started_at_ns.get(&series_id).copied()?;
+        let lag_start_ns = time_ns.checked_sub(CONT_OFI_LAG_NS)?;
+        if series_started_at_ns > lag_start_ns {
+            return None;
+        }
+        Some(
+            tape.events
+                .iter()
+                .filter(|event| {
+                    event.series_id == series_id
+                        && event.time_ns >= lag_start_ns
+                        && event.time_ns < time_ns
+                })
+                .fold(Decimal::ZERO, |total, event| total + event.contribution),
+        )
+    }
+
+    #[test]
+    fn lagged_cont_ofi_prefix_sums_match_naive_windows_without_rescanning() {
+        let mut tape = ContOfiTape::default();
+        tape.series_started_at_ns.insert(1, 0);
+        tape.series_started_at_ns.insert(2, 0);
+        for index in 0..1_200 {
+            let time_ns = index * 100_000_000;
+            tape.events.push(ContOfiEvent {
+                time_ns,
+                series_id: 1,
+                contribution: Decimal::from((index % 5) + 1),
+            });
+            tape.events.push(ContOfiEvent {
+                time_ns,
+                series_id: 2,
+                contribution: Decimal::from((index % 3) + 7),
+            });
+        }
+        let index = ContOfiIndex::from_tape(&tape).unwrap();
+        assert_eq!(index.series.get(&1).unwrap().times.len(), 1_200);
+        assert_eq!(
+            index.series.get(&1).unwrap().prefix.len(),
+            1_201,
+            "prefix sums are built once per series, not per query"
+        );
+        for second in 60..=120 {
+            let time_ns = second * 1_000_000_000;
+            assert_eq!(
+                index.lagged(1, time_ns),
+                naive_lagged_cont_ofi(&tape, 1, time_ns)
+            );
+            assert_eq!(
+                index.lagged(2, time_ns),
+                naive_lagged_cont_ofi(&tape, 2, time_ns)
+            );
+        }
     }
 
     #[test]
@@ -3013,7 +3118,7 @@ mod tests {
     }
 
     #[test]
-    fn lagged_cont_ofi_drops_rows_without_sixty_second_history() {
+    fn h1_keeps_calendar_rows_when_ofi_history_is_missing() {
         let tape = lagged_cont_ofi_rows();
         let mut fixture = Fixture::new(Market::Usdm, &tape);
         let reference_root = fixture.directory.join("reference");
@@ -3035,17 +3140,37 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<PointInTimeFeatureRow>(&line.unwrap()).unwrap())
             .collect::<Vec<_>>();
-        assert!(!rows.is_empty());
-        assert!(rows.iter().all(|row| {
-            row.features.contains_key(CONT_OFI_LAG60S_FIELD)
-                && row.event_time >= datetime_ns(event_ns(61_000)).unwrap()
-        }));
         assert!(rows
             .iter()
-            .any(|row| { row.event_time == datetime_ns(event_ns(70_000)).unwrap() }));
-        assert!(rows.iter().all(|row| {
-            row.event_time != datetime_ns(event_ns(30_000)).unwrap()
-                && row.event_time != datetime_ns(event_ns(40_000)).unwrap()
-        }));
+            .any(|row| row.event_time == datetime_ns(event_ns(30_000)).unwrap()));
+        assert!(rows
+            .iter()
+            .any(|row| row.event_time == datetime_ns(event_ns(40_000)).unwrap()));
+        assert!(rows
+            .iter()
+            .all(|row| !row.features.contains_key(CONT_OFI_LAG60S_FIELD)));
+    }
+
+    #[test]
+    fn h2_requires_verified_sixty_second_prewindow() {
+        let tape = lagged_cont_ofi_rows();
+        let mut fixture = Fixture::new(Market::Usdm, &tape);
+        let reference_root = fixture.directory.join("reference");
+        for milliseconds in [20_000_u64, 40_000, 60_000, 76_000] {
+            fixture.references.push(publish_reference_at_ns(
+                &reference_root,
+                event_ns(milliseconds),
+                event_ns(milliseconds + 3_000),
+                4,
+                123_470,
+            ));
+        }
+        let mut args = fixture.args();
+        args.feature_family = FeatureFamily::H2;
+        args.label_horizon_buckets = 2;
+        args.output_start_received_at_ns = Some(event_ns(30_000));
+        args.output_end_received_at_ns = Some(event_ns(76_000));
+        let error = materialize(&args).unwrap_err().to_string();
+        assert!(error.contains("verified 60-second pre-window"));
     }
 }
