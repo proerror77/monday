@@ -1973,22 +1973,19 @@ mod tests {
 
     #[test]
     fn corrupt_upload_status_does_not_default_failure_count() {
-        let root = std::env::temp_dir().join(format!(
-            "monday-upload-status-corrupt-{}",
-            now_ns().unwrap()
-        ));
-        fs::create_dir_all(&root).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
         let status = root.join("upload-status.json");
         let payload = br#"{"failure_count":4, not json"#;
         fs::write(&status, payload).unwrap();
-        let error = read_upload_status(&root).unwrap_err();
+        let error = read_upload_status(root).unwrap_err();
         assert!(
             error.to_string().contains("not valid JSON"),
             "unexpected error: {error:#}"
         );
         assert_eq!(fs::read(&status).unwrap(), payload);
         let health_error = write_health(
-            &root,
+            root,
             Market::Spot,
             "spot_all",
             "session-1",
@@ -2007,7 +2004,6 @@ mod tests {
         assert!(health_error.to_string().contains("not valid JSON"));
         assert_eq!(fs::read(&status).unwrap(), payload);
         assert!(!root.join("health.json").exists());
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
