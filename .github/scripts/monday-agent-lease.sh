@@ -139,7 +139,7 @@ canonical_packet_hash() {
 new_lease_id() {
   local stamp rand
   stamp=$(date -u +"%Y%m%dT%H%M%SZ")
-  rand=$(openssl rand -hex 4 2>/dev/null || python3 -c 'import secrets; print(secrets.token_hex(4))')
+  rand=$(openssl rand -hex 4) || fail missing_openssl
   printf '%s-%s\n' "$stamp" "$rand"
 }
 
