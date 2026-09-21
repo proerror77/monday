@@ -321,7 +321,8 @@ for path in "${paths[@]}"; do
       select_job ploy/workflow-lint
       continue
       ;;
-    .github/scripts/agent-worktree-preflight.sh|.github/scripts/test-agent-worktree-preflight.sh)
+    .github/scripts/agent-worktree-preflight.sh|.github/scripts/test-agent-worktree-preflight.sh|\
+    .github/scripts/monday-agent|.github/scripts/monday-agent-lease.sh)
       [[ $event == pull_request ]] && select_job ploy/commit-hygiene
       continue
       ;;
