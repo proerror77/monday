@@ -105,7 +105,10 @@ ownership. Record the ownership tuple in the worktree-private
 The operator CLI `.github/scripts/agent-worktree-preflight.sh` (`list` / `apply` / `release`)
 is the machine interface for that tuple: `apply --packet-file` occupies a
 mutually exclusive lease, `list` reports cleanup safety, and `release` removes
-only cleanup-safe worktrees. It does not spawn Cursor, Codex, or Grok.
+only cleanup-safe worktrees. A squash-merged PR (`(#N)` on the integration tip,
+or `gh` merged head) counts as recovered unique commits. Unleased leftover
+worktrees can be released by path when cleanup-safe. It does not spawn Cursor,
+Codex, or Grok.
 
 If two open PRs or worktrees overlap, stop the later writer and ask Monk to
 choose. Use `.agents/skills/monday-worktree-audit` to inventory conflicts; do

@@ -371,6 +371,38 @@ head_in_tip() {
   git merge-base --is-ancestor "$(git -C "$path" rev-parse HEAD)" "$tip"
 }
 
+squash_merged_pr() {
+  local pr=$1
+  [[ $pr == none || -z $pr ]] && return 1
+  [[ $pr =~ ^[0-9]+$ ]] || return 1
+  local tip
+  tip=$(integration_tip)
+  git log --format=%s --grep="(#${pr})" -n 1 "$tip" | grep -Fq "(#${pr})"
+}
+
+merged_pr_for_branch() {
+  local branch=$1
+  [[ -n $branch ]] || return 1
+  command -v gh >/dev/null 2>&1 || return 1
+  local n
+  n=$(gh pr list --head "$branch" --state merged --limit 1 --json number --jq '.[0].number // empty' 2>/dev/null || true)
+  [[ -n $n ]] || return 1
+  printf '%s\n' "$n"
+}
+
+unique_commits_recovered() {
+  local path=$1 pr=$2 branch=$3
+  head_in_tip "$path" && return 0
+  if [[ $pr != none && -n $pr ]] && squash_merged_pr "$pr"; then
+    return 0
+  fi
+  local found
+  if found=$(merged_pr_for_branch "$branch") && squash_merged_pr "$found"; then
+    return 0
+  fi
+  return 1
+}
+
 find_lease_file() {
   local key=$1
   local store f id wt
@@ -389,49 +421,81 @@ find_lease_file() {
 }
 
 cmd_release() {
-  local key= discard=0
+  local key= discard=0 pr_override=none
   while (($#)); do
     case "$1" in
       --discard-unique) discard=1; shift ;;
+      --pr) pr_override=$2; shift 2 ;;
       --*) fail unknown_release_argument ;;
       *) key=$1; shift ;;
     esac
   done
   [[ -n $key ]] || fail missing_lease_id
   lease_lock_acquire
-  local store_file
-  store_file=$(find_lease_file "$key") || fail_apply lease_not_found
-  local status wt
-  status=$(yaml_scalar status "$store_file")
-  [[ $status == active ]] || fail_apply lease_not_active
-  wt=$(yaml_scalar worktree "$store_file")
+  local store_file= wt= leased=0
+  if store_file=$(find_lease_file "$key"); then
+    leased=1
+    local status
+    status=$(yaml_scalar status "$store_file")
+    [[ $status == active ]] || fail_apply lease_not_active
+    wt=$(yaml_scalar worktree "$store_file")
+  else
+    [[ -d $key ]] || fail_apply lease_not_found
+    wt=$(cd "$key" && pwd -P)
+    [[ $wt != "$(git_primary)" ]] || fail_apply primary_checkout
+  fi
   [[ -d $wt ]] || fail_apply worktree_missing
 
   if [[ -n $(git -C "$wt" status --porcelain) ]]; then
     fail_apply dirty_worktree
   fi
-  local ahead=0
+  local ahead=0 branch pr
   ahead=$(unpushed_count "$wt")
-  if ((ahead > 0)) && ! head_in_tip "$wt"; then
+  if ((leased)); then
+    branch=$(yaml_scalar branch "$store_file")
+    pr=$(yaml_scalar pr "$store_file")
+  else
+    branch=$(git -C "$wt" branch --show-current || true)
+    pr=$pr_override
+  fi
+  if [[ $pr_override != none ]]; then
+    pr=$pr_override
+  fi
+  if ((ahead > 0)) && ! unique_commits_recovered "$wt" "$pr" "$branch"; then
     if ((discard != 1)); then
       fail_apply unique_unpushed
     fi
   fi
 
-  LEASE_ID=$(yaml_scalar lease_id "$store_file")
+  if ((leased)); then
+    LEASE_ID=$(yaml_scalar lease_id "$store_file")
+    LEASE_CONTRACT=$(yaml_scalar contract "$store_file")
+    LEASE_OWNER=$(yaml_scalar owner "$store_file")
+    LEASE_SEAT=$(yaml_scalar seat "$store_file")
+    LEASE_BASE=$(yaml_scalar base_sha "$store_file")
+    LEASE_ALLOWED=$(yaml_scalar allowed_files "$store_file")
+    LEASE_DEPENDENCY=$(yaml_scalar dependency "$store_file")
+    LEASE_PACKET_SHA=$(yaml_scalar packet_sha256 "$store_file")
+    LEASE_DEADLINE=$(yaml_scalar deadline "$store_file")
+    LEASE_GATES=$(yaml_scalar trading_gates "$store_file")
+  else
+    LEASE_ID=$(new_lease_id)
+    LEASE_CONTRACT="unleased cleanup"
+    LEASE_OWNER=human
+    LEASE_SEAT=human
+    LEASE_BASE=$(git -C "$wt" rev-parse HEAD)
+    LEASE_ALLOWED=none
+    LEASE_DEPENDENCY=none
+    LEASE_PACKET_SHA=none
+    LEASE_DEADLINE=none
+    LEASE_GATES=fail-closed
+    store_file="$(lease_store)/${LEASE_ID}.yml"
+    mkdir -p "$(lease_store)"
+  fi
   LEASE_STATUS=released
-  LEASE_CONTRACT=$(yaml_scalar contract "$store_file")
-  LEASE_OWNER=$(yaml_scalar owner "$store_file")
-  LEASE_SEAT=$(yaml_scalar seat "$store_file")
   LEASE_WORKTREE=$wt
-  LEASE_BRANCH=$(yaml_scalar branch "$store_file")
-  LEASE_BASE=$(yaml_scalar base_sha "$store_file")
-  LEASE_ALLOWED=$(yaml_scalar allowed_files "$store_file")
-  LEASE_DEPENDENCY=$(yaml_scalar dependency "$store_file")
-  LEASE_PACKET_SHA=$(yaml_scalar packet_sha256 "$store_file")
-  LEASE_PR=$(yaml_scalar pr "$store_file")
-  LEASE_DEADLINE=$(yaml_scalar deadline "$store_file")
-  LEASE_GATES=$(yaml_scalar trading_gates "$store_file")
+  LEASE_BRANCH=${branch:-none}
+  LEASE_PR=${pr:-none}
   LEASE_RECOVERY_SHA=$(integration_tip)
 
   git worktree remove "$wt"
@@ -442,7 +506,7 @@ cmd_release() {
 }
 
 cleanup_class() {
-  local path=$1 state=$2 lease_status=$3 ahead=$4
+  local path=$1 state=$2 lease_status=$3 ahead=$4 pr=$5 branch=$6
   local primary
   primary=$(git_primary)
   if [[ $path == "$primary" ]]; then
@@ -458,8 +522,8 @@ cleanup_class() {
     return
   fi
   if ((ahead > 0)); then
-    if head_in_tip "$path"; then
-      printf 'cleanup-safe\thead contained in integration tip\n'
+    if unique_commits_recovered "$path" "$pr" "$branch"; then
+      printf 'cleanup-safe\tsquash-merged or contained in integration tip\n'
     else
       printf 'keep\tunique unpushed commits\n'
     fi
@@ -496,12 +560,18 @@ cmd_list() {
         fi
       done
     fi
+    if [[ $pr == none && -n $branch ]]; then
+      local found
+      if found=$(merged_pr_for_branch "$branch"); then
+        pr=$found
+      fi
+    fi
     local ahead=0
     if [[ -d $path ]]; then
       ahead=$(unpushed_count "$path")
     fi
     local safety reason
-    IFS=$'\t' read -r safety reason < <(cleanup_class "$path" "$state" "$lease_status" "$ahead")
+    IFS=$'\t' read -r safety reason < <(cleanup_class "$path" "$state" "$lease_status" "$ahead" "$pr" "$branch")
     printf 'worktree=%s\tbranch=%s\thead=%s\tcheckout=%s\tstate=%s\tlease_id=%s\tlease_status=%s\towner=%s\tpr=%s\tunpushed=%s\tcleanup_safety=%s\treason=%s\n' \
       "$path" "$branch" "$head" "$checkout" "$state" "$lease_id" "$lease_status" "$owner" "$pr" "$ahead" "$safety" "$reason"
     path='' branch='' head='' prunable=''
