@@ -122,8 +122,6 @@ grep -F "worktree=$wt_clean" <<<"$list_out" && {
   printf 'released worktree still listed: %s\n' "$wt_clean" >&2
   exit 1
 }
-wrapper=$(cd "$(dirname "$gate")" && pwd)/monday-agent
-[[ -x $wrapper ]]
-"$wrapper" help | grep -q list
+"$gate" help | grep -q list
 
 printf 'agent worktree preflight tests passed\n'

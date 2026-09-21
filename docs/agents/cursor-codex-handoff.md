@@ -102,7 +102,7 @@ One active contract has one writer. One worktree and one PR have one writer.
 A second agent on the same files is read-only unless Monk reassigns exclusive
 ownership. Record the ownership tuple in the worktree-private
 `git rev-parse --git-path agent-worktree.yml` path used by managed preflight.
-The operator CLI `.github/scripts/monday-agent` (`list` / `apply` / `release`)
+The operator CLI `.github/scripts/agent-worktree-preflight.sh` (`list` / `apply` / `release`)
 is the machine interface for that tuple: `apply --packet-file` occupies a
 mutually exclusive lease, `list` reports cleanup safety, and `release` removes
 only cleanup-safe worktrees. It does not spawn Cursor, Codex, or Grok.

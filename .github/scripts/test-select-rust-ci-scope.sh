@@ -44,9 +44,7 @@ printf '%s\n' rust_hft/scripts/clickhouse/run_bitget_dedup.sh >"$tmp_dir/rust-sh
 printf '%s\n' rust_hft/scripts/deploy-ecs-tools-collector.sh >"$tmp_dir/rust-deploy-collector.txt"
 printf '%s\n' \
   .github/scripts/agent-worktree-preflight.sh \
-  .github/scripts/test-agent-worktree-preflight.sh \
-  .github/scripts/monday-agent \
-  .github/scripts/monday-agent-lease.sh >"$tmp_dir/preflight-only.txt"
+  .github/scripts/test-agent-worktree-preflight.sh >"$tmp_dir/preflight-only.txt"
 
 assert_flag() {
   local output=$1 flag=$2 expected=$3
