@@ -45,6 +45,7 @@ grep -Eq "worktree=$fixture/detached.*checkout=detached.*state=registered-clean"
 
 write_packet() {
   local dest=$1 writer=$2 branch=$3 files=$4
+  local pr=${5:-none}
   cat >"$dest" <<EOF
 from: Cursor
 to: Cursor
@@ -59,7 +60,7 @@ writer: $writer
 allowed_files:
   - $files
 deadline: 2026-09-22T00:00:00Z
-pr: none
+pr: $pr
 EOF
 }
 
@@ -123,5 +124,27 @@ grep -F "worktree=$wt_clean" <<<"$list_out" && {
   exit 1
 }
 "$gate" help | grep -q list
+
+write_packet "$fixture/packet-squash.yml" grok cursor/test-squash docs/f.md 42
+apply_squash=$(cd "$fixture" && "$gate" apply --packet-file "$fixture/packet-squash.yml")
+grep -qx 'verdict=ok' <<<"$apply_squash"
+lease_squash=$(sed -n 's/^lease_id=//p' <<<"$apply_squash")
+wt_squash=$(sed -n 's/^worktree=//p' <<<"$apply_squash")
+git -C "$wt_squash" config user.email test@example.invalid
+git -C "$wt_squash" config user.name test
+git -C "$wt_squash" commit -q --allow-empty -m unique-squash
+squash_block=$(cd "$fixture" && "$gate" release "$lease_squash" 2>&1 || true)
+grep -q 'reason=unique_unpushed' <<<"$squash_block"
+git -C "$fixture" commit -q --allow-empty -m 'feat: squash stand-in (#42)'
+release_squash=$(cd "$fixture" && "$gate" release "$lease_squash")
+grep -qx 'verdict=ok' <<<"$release_squash"
+[[ ! -d $wt_squash ]]
+
+orphan="$fixture/.worktrees/cursor/orphan"
+mkdir -p "$(dirname "$orphan")"
+git -C "$fixture" worktree add -q -b cursor/orphan "$orphan" HEAD
+release_orphan=$(cd "$fixture" && "$gate" release "$orphan")
+grep -qx 'verdict=ok' <<<"$release_orphan"
+[[ ! -d $orphan ]]
 
 printf 'agent worktree preflight tests passed\n'
