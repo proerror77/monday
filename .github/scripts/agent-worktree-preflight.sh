@@ -61,9 +61,21 @@ report() {
 
 # Strict ownership validation is opt-in for a managed writer. Ordinary local
 # editing uses the task's ownership assessment, not a mandatory worktree gate.
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=monday-agent-lease.sh
+source "$script_dir/monday-agent-lease.sh"
+
+usage() {
+  echo "usage: $0 check-managed|report|list|get|apply|release"
+}
+
 case "${1:-help}" in
   check-managed) check_managed ;;
   report) report ;;
-  help|--help|-h) echo "usage: $0 check-managed|report (managed writer validation or read-only inventory)" ;;
-  *) echo "usage: $0 check-managed|report" >&2; exit 2 ;;
+  list) shift; cmd_list "$@" ;;
+  get) shift; cmd_get "$@" ;;
+  apply) shift; cmd_apply "$@" ;;
+  release) shift; cmd_release "$@" ;;
+  help|--help|-h) usage ;;
+  *) usage >&2; exit 2 ;;
 esac
