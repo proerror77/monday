@@ -1140,10 +1140,12 @@ assert_resource_bounds_enforceable() {
   ( ulimit -t $((cpu * 3600)) ) || fail cpu_bound_unenforceable
 }
 
+# GNU ps -g selects a session, not a process group. An empty session match
+# would skip the RSS cap, so match the recorded pgid from a full snapshot.
 run_bounded_command() {
   local cpu=$1 memory=$2 command=$3
   local max_kb=$((memory * 1024))
-  local child pgid rss members pid self exceeded=0 spins=0
+  local child pgid snapshot pid grp rss state total alive exceeded=0 spins=0
   set -m
   (
     ulimit -t $((cpu * 3600)) || exit 126
@@ -1152,18 +1154,22 @@ run_bounded_command() {
   ) &
   child=$!
   pgid=$(ps -o pgid= -p "$child" 2>/dev/null | tr -d ' ' || true)
-  [[ -n $pgid ]] || pgid=$child
+  [[ $pgid =~ ^[0-9]+$ ]] || pgid=$child
   while :; do
-    members=$(ps -o pid= -g "$pgid" 2>/dev/null || true)
-    if [[ -z ${members//[[:space:]]/} ]]; then
+    snapshot=$(ps -ax -o pid=,pgid=,rss=,state=) || return 125
+    total=0
+    alive=0
+    while read -r pid grp rss state; do
+      [[ $grp == "$pgid" ]] || continue
+      [[ $state == Z* ]] && continue
+      [[ $rss =~ ^[0-9]+$ ]] || continue
+      total=$((total + rss))
+      alive=1
+    done <<<"$snapshot"
+    if ((alive == 0)) && ! kill -0 "$child" 2>/dev/null; then
       break
     fi
-    rss=0
-    for pid in $members; do
-      self=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || true)
-      [[ $self =~ ^[0-9]+$ ]] && rss=$((rss + self))
-    done
-    if (( rss > max_kb )); then
+    if ((alive == 1 && total > max_kb)); then
       kill -KILL -"$pgid" 2>/dev/null || kill_tree "$child"
       exceeded=1
       break
@@ -1270,6 +1276,10 @@ cmd_task_invoke() {
   if ((exit_status == 137)); then
     printf 'failed\n' >"$dir/phase"
     fail memory_exceeded
+  fi
+  if ((exit_status == 125)); then
+    printf 'failed\n' >"$dir/phase"
+    fail memory_bound_unenforceable
   fi
   if ((exit_status == 126)); then
     printf 'failed\n' >"$dir/phase"

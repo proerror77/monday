@@ -484,11 +484,14 @@ workspace_repo_name: fixture
 workspace_repo_path: $repo_src
 workspace_tool_name: skill
 workspace_tool_endpoint: file:///fixture-skill
-command: perl -e 'my \$x = "x" x (80 * 1024 * 1024); sleep 2'
+command: bash -c 'x=$(printf "%48000000s" ""); sleep 1'
 EOF
 "$gate" task-declare --file "$fixture/mem-task.yml" >/dev/null
 mem_out=$("$gate" task-invoke mem-agent 2>&1 || true)
-grep -qx 'reason=memory_exceeded' <<<"$mem_out"
+grep -qx 'reason=memory_exceeded' <<<"$mem_out" || {
+  printf 'memory assertion failed:\n%s\n' "$mem_out" >&2
+  exit 1
+}
 ! grep -qx 'verdict=ok' <<<"$mem_out"
 
 cat >"$fixture/net-task.yml" <<EOF
@@ -511,7 +514,10 @@ set +e
 net_out=$("$gate" task-invoke net-agent 2>&1)
 net_status=$?
 set -e
-grep -qx 'reason=host_not_allowed' <<<"$net_out"
+grep -qx 'reason=host_not_allowed' <<<"$net_out" || {
+  printf 'egress assertion failed status=%s:\n%s\n' "$net_status" "$net_out" >&2
+  exit 1
+}
 ! grep -qx 'verdict=ok' <<<"$net_out"
 ! grep -q '200' <<<"$net_out"
 [[ $net_status != 77 ]]
@@ -554,7 +560,10 @@ command: sh -c '(sleep 0.3; curl -sS -o /dev/null https://example.com) &'
 EOF
 "$gate" task-declare --file "$fixture/bg-task.yml" >/dev/null
 bg_out=$("$gate" task-invoke bg-agent 2>&1 || true)
-grep -qx 'reason=host_not_allowed' <<<"$bg_out"
+grep -qx 'reason=host_not_allowed' <<<"$bg_out" || {
+  printf 'background egress assertion failed:\n%s\n' "$bg_out" >&2
+  exit 1
+}
 ! grep -qx 'verdict=ok' <<<"$bg_out"
 
 if ! command -v aria2c >/dev/null 2>&1; then
