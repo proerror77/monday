@@ -91,10 +91,9 @@ yaml_scalar() {
   line=${line#*:}
   line=${line#"${line%%[![:space:]]*}"}
   line=${line%"${line##*[![:space:]]}"}
-  line=${line#\"}
-  line=${line%\"}
-  line=${line#\'}
-  line=${line%\'}
+  if [[ $line == \"*\" || $line == \'*\' ]]; then
+    line=${line:1:${#line}-2}
+  fi
   printf '%s\n' "$line"
 }
 
@@ -893,8 +892,247 @@ EOF
 }
 
 
+task_store() {
+  printf '%s/agent-tasks\n' "$(git_common)"
+}
+
+task_dir() {
+  printf '%s/%s\n' "$(task_store)" "$1"
+}
+
+contract_has_active_writer() {
+  local contract=$1 f other
+  while IFS= read -r f; do
+    [[ -n $f ]] || continue
+    other=$(yaml_scalar contract "$f" || true)
+    [[ $other == "$contract" ]] && return 0
+  done < <(active_lease_files)
+  return 1
+}
+
+host_allowed() {
+  local file=$1 host=$2 item
+  local hosts
+  hosts=$(yaml_scalar allow_hosts "$file")
+  IFS=',' read -r -a items <<<"$hosts"
+  for item in "${items[@]}"; do
+    item=${item#"${item%%[![:space:]]*}"}
+    item=${item%"${item##*[![:space:]]}"}
+    [[ $item == "$host" ]] && return 0
+  done
+  return 1
+}
+
+materialize_task_workspace() {
+  local dir=$1
+  local ws=$dir/workspace
+  if [[ -d $dir/checkpoint ]]; then
+    rm -rf "$ws"
+    mkdir -p "$ws"
+    cp -a "$dir/checkpoint/." "$ws/"
+  else
+    mkdir -p "$ws"
+  fi
+  local repo_name repo_path tool_name tool_endpoint
+  repo_name=$(yaml_scalar workspace_repo_name "$dir/task.yml")
+  repo_path=$(yaml_scalar workspace_repo_path "$dir/task.yml")
+  tool_name=$(yaml_scalar workspace_tool_name "$dir/task.yml")
+  tool_endpoint=$(yaml_scalar workspace_tool_endpoint "$dir/task.yml")
+  mkdir -p "$ws/repos/$repo_name" "$ws/tools"
+  if [[ -d $repo_path ]]; then
+    cp -a "$repo_path/." "$ws/repos/$repo_name/"
+  fi
+  printf '%s\n' "$tool_endpoint" >"$ws/tools/$tool_name"
+  local cpu memory
+  cpu=$(yaml_scalar cpu "$dir/task.yml")
+  memory=$(yaml_scalar memory_mb "$dir/task.yml")
+  printf 'cpu=%s\nmemory_mb=%s\n' "$cpu" "$memory" >"$ws/.bounds"
+  printf 'ready\n' >"$ws/.ready"
+}
+
+checkpoint_task_workspace() {
+  local dir=$1
+  [[ -d $dir/workspace ]] || return 0
+  rm -rf "$dir/checkpoint"
+  mkdir -p "$dir/checkpoint"
+  cp -a "$dir/workspace/." "$dir/checkpoint/"
+}
+
+cmd_task_declare() {
+  local file=
+  while (($#)); do
+    case "$1" in
+      --file) file=$2; shift 2 ;;
+      *) fail unknown_task_argument ;;
+    esac
+  done
+  [[ -n $file && -f $file ]] || fail missing_task_file
+  local agent_id contract cpu memory hosts provider secret_file command
+  local repo_name repo_path tool_name tool_endpoint
+  agent_id=$(yaml_scalar agent_id "$file") || fail missing_agent_id
+  contract=$(yaml_scalar contract "$file") || fail missing_contract
+  cpu=$(yaml_scalar cpu "$file") || fail missing_cpu
+  memory=$(yaml_scalar memory_mb "$file") || fail missing_memory_mb
+  hosts=$(yaml_scalar allow_hosts "$file") || fail missing_allow_hosts
+  provider=$(yaml_scalar model_provider "$file") || fail missing_model_provider
+  command=$(yaml_scalar command "$file") || fail missing_command
+  repo_name=$(yaml_scalar workspace_repo_name "$file") || fail missing_workspace_repo_name
+  repo_path=$(yaml_scalar workspace_repo_path "$file") || fail missing_workspace_repo_path
+  tool_name=$(yaml_scalar workspace_tool_name "$file") || fail missing_workspace_tool_name
+  tool_endpoint=$(yaml_scalar workspace_tool_endpoint "$file") || fail missing_workspace_tool_endpoint
+  secret_file=$(yaml_scalar model_secret_file "$file" || true)
+  [[ $cpu =~ ^[0-9]+$ && $memory =~ ^[0-9]+$ ]] || fail invalid_resource_bounds
+  [[ -n $hosts ]] || fail missing_allow_hosts
+  if [[ -n $secret_file && -f $secret_file ]]; then
+    local secret
+    secret=$(cat "$secret_file")
+    [[ $command != *"$secret"* ]] || fail secret_in_command
+    [[ $(cat "$file") != *"$secret"* ]] || fail secret_in_task
+  fi
+  local dir
+  dir=$(task_dir "$agent_id")
+  [[ ! -e $dir ]] || fail agent_exists
+  mkdir -p "$dir"
+  cat >"$dir/task.yml" <<EOF
+schema: monday.agent_task.v1
+agent_id: $agent_id
+contract: $contract
+cpu: $cpu
+memory_mb: $memory
+allow_hosts: $hosts
+model_provider: $provider
+model_secret_ref: model.secret
+workspace_repo_name: $repo_name
+workspace_repo_path: $repo_path
+workspace_tool_name: $tool_name
+workspace_tool_endpoint: $tool_endpoint
+command: $command
+EOF
+  if [[ -n $secret_file && -f $secret_file ]]; then
+    cp "$secret_file" "$dir/model.secret"
+    chmod 600 "$dir/model.secret"
+  else
+    : >"$dir/model.secret"
+  fi
+  printf 'pending\n' >"$dir/phase"
+  printf 'verdict=ok\nagent_id=%s\nphase=pending\n' "$agent_id"
+}
+
+cmd_task_status() {
+  local agent_id=${1:-}
+  [[ -n $agent_id ]] || fail missing_agent_id
+  local dir phase
+  dir=$(task_dir "$agent_id")
+  [[ -f $dir/phase ]] || fail agent_not_found
+  phase=$(cat "$dir/phase")
+  printf 'verdict=ok\nagent_id=%s\nphase=%s\ncpu=%s\nmemory_mb=%s\n' \
+    "$agent_id" "$phase" \
+    "$(yaml_scalar cpu "$dir/task.yml")" \
+    "$(yaml_scalar memory_mb "$dir/task.yml")"
+}
+
+cmd_task_suspend() {
+  local agent_id=${1:-}
+  [[ -n $agent_id ]] || fail missing_agent_id
+  local dir phase
+  dir=$(task_dir "$agent_id")
+  [[ -f $dir/phase ]] || fail agent_not_found
+  phase=$(cat "$dir/phase")
+  case $phase in
+    pending | running | suspended) ;;
+    *) fail agent_not_suspendable ;;
+  esac
+  checkpoint_task_workspace "$dir"
+  printf 'suspended\n' >"$dir/phase"
+  printf 'verdict=ok\nagent_id=%s\nphase=suspended\n' "$agent_id"
+}
+
+cmd_task_egress() {
+  local agent_id=${1:-} host=${2:-}
+  [[ -n $agent_id && -n $host ]] || fail missing_egress_target
+  local dir
+  dir=$(task_dir "$agent_id")
+  [[ -f $dir/task.yml ]] || fail agent_not_found
+  if host_allowed "$dir/task.yml" "$host"; then
+    printf 'verdict=ok\nagent_id=%s\nhost=%s\n' "$agent_id" "$host"
+  else
+    fail host_not_allowed
+  fi
+}
+
+cmd_task_invoke() {
+  local agent_id=${1:-}
+  [[ -n $agent_id ]] || fail missing_agent_id
+  local dir phase contract
+  dir=$(task_dir "$agent_id")
+  [[ -f $dir/phase && -f $dir/task.yml ]] || fail agent_not_found
+  phase=$(cat "$dir/phase")
+  case $phase in
+    pending | suspended) ;;
+    running) fail agent_already_running ;;
+    failed) fail agent_failed ;;
+    *) fail agent_not_invocable ;;
+  esac
+  contract=$(yaml_scalar contract "$dir/task.yml")
+  if contract_has_active_writer "$contract"; then
+    fail writer_already_active
+  fi
+  printf 'running\n' >"$dir/phase"
+  materialize_task_workspace "$dir"
+  local ws command cpu memory
+  ws=$dir/workspace
+  command=$(yaml_scalar command "$dir/task.yml")
+  cpu=$(yaml_scalar cpu "$dir/task.yml")
+  memory=$(yaml_scalar memory_mb "$dir/task.yml")
+  [[ -d $ws/repos/$(yaml_scalar workspace_repo_name "$dir/task.yml") ]] || {
+    printf 'failed\n' >"$dir/phase"
+    fail workspace_not_materialized
+  }
+  [[ -s $ws/tools/$(yaml_scalar workspace_tool_name "$dir/task.yml") ]] || {
+    printf 'failed\n' >"$dir/phase"
+    fail workspace_not_materialized
+  }
+  [[ -s $ws/.bounds ]] || {
+    printf 'failed\n' >"$dir/phase"
+    fail bounds_not_declared
+  }
+  printf 'command=%s\ncpu=%s\nmemory_mb=%s\n' "$command" "$cpu" "$memory" >>"$dir/command.log"
+  local exit_status=0
+  set +e
+  (
+    cd "$ws"
+    export MONDAY_AGENT_ID=$agent_id
+    export MONDAY_AGENT_WORKSPACE=$ws
+    export MONDAY_AGENT_CPU=$cpu
+    export MONDAY_AGENT_MEMORY_MB=$memory
+    ulimit -v $((memory * 1024)) 2>/dev/null || true
+    eval "$command"
+  ) >>"$dir/invocation.log" 2>>"$dir/invocation.err"
+  exit_status=$?
+  set -e
+  if [[ -f $dir/model.secret ]]; then
+    local secret
+    secret=$(cat "$dir/model.secret")
+    if [[ -n $secret ]]; then
+      if grep -F -q -- "$secret" "$dir/task.yml" "$dir/command.log" "$dir/invocation.log" "$dir/invocation.err" 2>/dev/null; then
+        printf 'failed\n' >"$dir/phase"
+        fail secret_leaked
+      fi
+    fi
+  fi
+  if ((exit_status != 0)); then
+    printf 'failed\n' >"$dir/phase"
+    printf 'verdict=blocked\nreason=command_failed\nagent_id=%s\nphase=failed\n' "$agent_id" >&2
+    return "$exit_status"
+  fi
+  checkpoint_task_workspace "$dir"
+  printf 'suspended\n' >"$dir/phase"
+  printf 'verdict=ok\nagent_id=%s\nphase=suspended\ncpu=%s\nmemory_mb=%s\nworkspace=%s\n' \
+    "$agent_id" "$cpu" "$memory" "$ws"
+}
+
 usage() {
-  echo "usage: $0 check-managed|report|list|get|apply|release|spawn|sweep"
+  echo "usage: $0 check-managed|report|list|get|apply|release|spawn|sweep|task-declare|task-invoke|task-suspend|task-status|task-egress"
 }
 
 case "${1:-help}" in
@@ -906,6 +1144,11 @@ case "${1:-help}" in
   release) shift; cmd_release "$@" ;;
   spawn) shift; cmd_spawn "$@" ;;
   sweep) shift; cmd_sweep "$@" ;;
+  task-declare) shift; cmd_task_declare "$@" ;;
+  task-invoke) shift; cmd_task_invoke "$@" ;;
+  task-suspend) shift; cmd_task_suspend "$@" ;;
+  task-status) shift; cmd_task_status "$@" ;;
+  task-egress) shift; cmd_task_egress "$@" ;;
   help|--help|-h) usage ;;
   *) usage >&2; exit 2 ;;
 esac

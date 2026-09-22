@@ -113,7 +113,13 @@ dry-run does not start a process or change the execution count. It requires an
 active unexpired lease, verifies the admitted packet and current worktree/
 branch/base, and refuses `grok`/`human` seats or trading gates other than `none`
 or `fail-closed`. It does not call Cursor Cloud or Codex HTTP APIs, and it does
-not schedule ACK Jobs.
+not schedule ACK Jobs. `task-declare`, `task-invoke`, `task-suspend`,
+`task-status`, and `task-egress` are the on-demand actor path: the
+workspace is materialized before the command, suspend checkpoints that
+workspace, and a later invoke of the same agent id restores it. Egress
+is an allowlist. Model secrets stay in `model.secret`, not in the task
+body, command, or logs. An active lease on the same contract refuses
+the invoke. This path does not submit orders or change risk limits.
 
 ### Machine packet and execution evidence
 
