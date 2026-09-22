@@ -123,7 +123,39 @@ grep -F "worktree=$wt_clean" <<<"$list_out" && {
   printf 'released worktree still listed: %s\n' "$wt_clean" >&2
   exit 1
 }
-"$gate" help | grep -q list
+"$gate" help | grep -q spawn
+
+write_packet "$fixture/packet-spawn.yml" cursor-cloud cursor/test-spawn docs/spawn.md
+sed -i.bak 's|deadline: 2026-09-22T00:00:00Z|deadline: 2099-01-01T00:00:00Z|' "$fixture/packet-spawn.yml"
+apply_spawn=$(cd "$fixture" && "$gate" apply --packet-file "$fixture/packet-spawn.yml")
+grep -qx 'verdict=ok' <<<"$apply_spawn"
+lease_spawn=$(sed -n 's/^lease_id=//p' <<<"$apply_spawn")
+spawn_out=$(cd "$fixture" && "$gate" spawn "$lease_spawn")
+grep -qx 'verdict=ok' <<<"$spawn_out"
+grep -qx 'mode=dry-run' <<<"$spawn_out"
+grep -q 'cursor-agent --print --mode plan' <<<"$spawn_out"
+grep -qx 'spawn_count: 1' <<<"$(cd "$fixture" && "$gate" get "$lease_spawn")"
+
+write_packet "$fixture/packet-expired.yml" codex cursor/test-expired docs/expired.md
+sed -i.bak 's|deadline: 2026-09-22T00:00:00Z|deadline: 2000-01-01T00:00:00Z|' "$fixture/packet-expired.yml"
+apply_expired=$(cd "$fixture" && "$gate" apply --packet-file "$fixture/packet-expired.yml")
+lease_expired=$(sed -n 's/^lease_id=//p' <<<"$apply_expired")
+wt_expired=$(sed -n 's/^worktree=//p' <<<"$apply_expired")
+expired_spawn=$(cd "$fixture" && "$gate" spawn "$lease_expired" 2>&1 || true)
+grep -q 'reason=lease_expired' <<<"$expired_spawn"
+sweep_out=$(cd "$fixture" && "$gate" sweep)
+grep -qx 'verdict=ok' <<<"$sweep_out"
+grep -qx 'expired=1' <<<"$sweep_out"
+[[ -d $wt_expired ]]
+grep -qx 'status: expired' <<<"$(cd "$fixture" && "$gate" get "$lease_expired")"
+
+write_packet "$fixture/packet-live.yml" cursor-cloud cursor/test-live docs/live.md
+sed -i.bak -e 's|deadline: 2026-09-22T00:00:00Z|deadline: 2099-01-01T00:00:00Z|' \
+  -e 's|trading_gates: none|trading_gates: live|' "$fixture/packet-live.yml"
+apply_live=$(cd "$fixture" && "$gate" apply --packet-file "$fixture/packet-live.yml")
+lease_live=$(sed -n 's/^lease_id=//p' <<<"$apply_live")
+live_spawn=$(cd "$fixture" && "$gate" spawn "$lease_live" 2>&1 || true)
+grep -q 'reason=trading_gates_blocked' <<<"$live_spawn"
 
 write_packet "$fixture/packet-squash.yml" grok cursor/test-squash docs/f.md 42
 apply_squash=$(cd "$fixture" && "$gate" apply --packet-file "$fixture/packet-squash.yml")
