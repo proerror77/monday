@@ -1,5 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
+
+cleanup() {
+  local exit_status=$?
+  trap - EXIT
+  lease_lock_release
+  [[ -z ${PENDING_PACKET:-} ]] || rm -f -- "$PENDING_PACKET"
+  # An interrupted wait is not evidence that the worker stopped. Keep the
+  # marker, including when the controller exits before writing its start receipt.
+  if [[ -n ${RUN_DIR:-} && ${RUN_FINISHED:-0} != 1 ]]; then
+    printf 'execution_id: %s\ncontroller_exit_code: %s\nprocess_status: unresolved\ntask_status: unverified\n' \
+      "$RUN_ID" "$exit_status" >"$RUN_DIR/controller-exit.yml"
+  fi
+  exit "$exit_status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 fail() {
   printf 'verdict=blocked\nreason=%s\n' "$1"
@@ -63,7 +81,7 @@ report() {
 # editing uses the task's ownership assessment, not a mandatory worktree gate.
 
 # Lease helpers for monday-agent. Sourced by agent-worktree-preflight.sh.
-# Lab-only: mutates worktree registration and ownership records. Never spawns agents.
+# Lab-only: manages worktree ownership and explicit local CLI executions.
 
 yaml_scalar() {
   local key=$1 file=$2
@@ -118,7 +136,7 @@ git_primary() {
 }
 
 git_common() {
-  git rev-parse --git-common-dir
+  git rev-parse --path-format=absolute --git-common-dir
 }
 
 integration_tip() {
@@ -141,9 +159,9 @@ paths_overlap() {
   case $b in
     "$a"/*) return 0 ;;
   esac
-  # shellcheck disable=SC2254
+  # shellcheck disable=SC2053
   [[ $a == $b ]] && return 0
-  # shellcheck disable=SC2254
+  # shellcheck disable=SC2053
   [[ $b == $a ]] && return 0
   return 1
 }
@@ -181,8 +199,42 @@ active_lease_files() {
   local f
   for f in "$store"/*.yml; do
     [[ -f $f ]] || continue
-    [[ $(yaml_scalar status "$f" || true) == active ]] && printf '%s\n' "$f"
+    if [[ $(yaml_scalar status "$f" || true) == active ]] || lease_running "$f"; then
+      printf '%s\n' "$f"
+    fi
   done
+  # Running ownership must survive a missing or damaged mutable lease record.
+  for f in "$store"/*.running; do
+    [[ ! -e $f && ! -L $f ]] || printf '%s\n' "$f"
+  done
+}
+
+validate_execution_markers() {
+  local file key
+  for file in "$(lease_store)"/*.running; do
+    [[ -e $file || -L $file ]] || continue
+    [[ -f $file && ! -L $file ]] || return 1
+    for key in execution_id lease_id worktree owner branch allowed_files pr; do
+      [[ -n $(yaml_scalar "$key" "$file" || true) ]] || return 1
+    done
+  done
+}
+
+lease_running() {
+  local file=$1 id
+  id=$(yaml_scalar lease_id "$file") || return 1
+  [[ -e $(lease_store)/${id}.running || -L $(lease_store)/${id}.running ]]
+}
+
+worktree_running() {
+  local worktree=$1 file
+  # Unknown marker scope cannot be treated as evidence that a path is free.
+  validate_execution_markers || return 0
+  for file in "$(lease_store)"/*.running; do
+    [[ -f $file ]] || continue
+    [[ $(yaml_scalar worktree "$file") != "$worktree" ]] || return 0
+  done
+  return 1
 }
 
 fail_apply() {
@@ -207,10 +259,11 @@ new_lease_id() {
 }
 
 write_lease_record() {
-  local dest=$1
+  local dest=$1 temporary
   mkdir -p "$(dirname "$dest")"
-  cat >"$dest" <<EOF
-schema: monday.agent_lease.v1
+  temporary=$(mktemp "${dest}.tmp.XXXXXX")
+  cat >"$temporary" <<EOF
+schema: ${LEASE_SCHEMA:-monday.agent_lease.v2}
 lease_id: $LEASE_ID
 status: $LEASE_STATUS
 contract: $LEASE_CONTRACT
@@ -222,22 +275,25 @@ base_sha: $LEASE_BASE
 allowed_files: $LEASE_ALLOWED
 dependency: ${LEASE_DEPENDENCY:-none}
 packet_sha256: $LEASE_PACKET_SHA
+packet_file: ${LEASE_PACKET_FILE:-none}
 pr: $LEASE_PR
 deadline: $LEASE_DEADLINE
 trading_gates: $LEASE_GATES
 spawn_count: ${LEASE_SPAWN_COUNT:-0}
+last_execution_id: ${LEASE_LAST_RUN:-none}
 EOF
   if [[ $LEASE_STATUS == released ]]; then
-    cat >>"$dest" <<EOF
+    cat >>"$temporary" <<EOF
 released_at: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 recovery_sha: $LEASE_RECOVERY_SHA
 recovery_pr: $LEASE_PR
 EOF
   fi
+  mv -f -- "$temporary" "$dest"
 }
 
 cmd_apply() {
-  local packet= worktree_override=
+  local packet='' worktree_override=''
   while (($#)); do
     case "$1" in
       --packet-file) packet=$2; shift 2 ;;
@@ -246,22 +302,21 @@ cmd_apply() {
     esac
   done
   [[ -n $packet && -f $packet ]] || fail missing_packet_file
-  packet=$(cd "$(dirname "$packet")" && pwd -P)/$(basename "$packet")
+  mkdir -p "$(lease_store)"
+  PENDING_PACKET=$(mktemp "$(lease_store)/.packet.XXXXXX")
+  cp -- "$packet" "$PENDING_PACKET"
+  packet=$PENDING_PACKET
 
-  local from to routed goal evidence constraints done_criteria gates branch writer deadline pr
-  from=$(yaml_scalar from "$packet") || fail missing_from
-  to=$(yaml_scalar to "$packet") || fail missing_to
-  routed=$(yaml_scalar routed_by "$packet") || fail missing_routed_by
+  local key goal gates branch writer deadline pr
+  for key in from to routed_by evidence_paths constraints done_criteria; do
+    yaml_scalar "$key" "$packet" >/dev/null || fail "missing_$key"
+  done
   goal=$(yaml_scalar goal "$packet") || fail missing_goal
-  evidence=$(yaml_scalar evidence_paths "$packet") || fail missing_evidence_paths
-  constraints=$(yaml_scalar constraints "$packet") || fail missing_constraints
-  done_criteria=$(yaml_scalar done_criteria "$packet") || fail missing_done_criteria
   gates=$(yaml_scalar trading_gates "$packet") || fail missing_trading_gates
   branch=$(yaml_scalar branch "$packet") || fail missing_branch
   writer=$(yaml_scalar writer "$packet") || fail missing_writer
   deadline=$(yaml_scalar deadline "$packet") || fail missing_deadline
   pr=$(yaml_scalar pr "$packet") || fail missing_pr
-  : "$from" "$to" "$routed" "$evidence" "$constraints" "$done_criteria"
 
   local allowed line
   allowed=
@@ -298,6 +353,8 @@ cmd_apply() {
 
   lease_lock_acquire
   mkdir -p "$(lease_store)"
+  validate_execution_markers || fail_apply execution_marker_invalid
+  if worktree_running "$wt"; then fail_apply execution_unresolved; fi
 
   local f other_owner other_branch other_pr other_files item other
   while IFS= read -r f; do
@@ -308,6 +365,7 @@ cmd_apply() {
     other_files=$(yaml_scalar allowed_files "$f")
     [[ $other_owner != "$writer" ]] || fail_apply writer_already_active
     [[ $other_branch != "$branch" ]] || fail_apply branch_already_leased
+    [[ $(yaml_scalar worktree "$f") != "$wt" ]] || fail_apply worktree_already_leased
     if [[ $pr != none && $other_pr == "$pr" ]]; then
       fail_apply pr_already_leased
     fi
@@ -332,8 +390,12 @@ cmd_apply() {
   fi
   wt=$(cd "$wt" && pwd -P)
   [[ $wt != "$primary" ]] || fail_apply primary_checkout
+  [[ $(git -C "$wt" rev-parse --show-toplevel) == "$wt" ]] || fail_apply worktree_mismatch
+  [[ $(git -C "$wt" rev-parse --path-format=absolute --git-common-dir) == "$(git_common)" ]] || fail_apply repository_mismatch
+  [[ $(git -C "$wt" branch --show-current) == "$branch" ]] || fail_apply branch_mismatch
 
   LEASE_ID=$(new_lease_id)
+  LEASE_SCHEMA=monday.agent_lease.v2
   LEASE_STATUS=active
   LEASE_CONTRACT=$goal
   LEASE_OWNER=$writer
@@ -344,6 +406,9 @@ cmd_apply() {
   LEASE_ALLOWED=$allowed
   LEASE_DEPENDENCY=none
   LEASE_PACKET_SHA=$(canonical_packet_hash "$packet")
+  LEASE_PACKET_FILE="$(lease_store)/${LEASE_ID}.packet"
+  mv -- "$packet" "$LEASE_PACKET_FILE"
+  PENDING_PACKET=$LEASE_PACKET_FILE
   LEASE_PR=$pr
   LEASE_DEADLINE=$deadline
   LEASE_GATES=$gates
@@ -353,6 +418,7 @@ cmd_apply() {
   store_file="$(lease_store)/${LEASE_ID}.yml"
   write_lease_record "$record"
   write_lease_record "$store_file"
+  PENDING_PACKET=
   lease_lock_release
   printf 'verdict=ok\nlease_id=%s\nworktree=%s\nbranch=%s\npacket_sha256=%s\n' \
     "$LEASE_ID" "$wt" "$branch" "$LEASE_PACKET_SHA"
@@ -406,23 +472,32 @@ unique_commits_recovered() {
 
 find_lease_file() {
   local key=$1
-  local store f id wt
+  local store f id wt found='' occupied=0
   store=$(lease_store)
   [[ -d $store ]] || return 1
   for f in "$store"/*.yml; do
     [[ -f $f ]] || continue
     id=$(yaml_scalar lease_id "$f" || true)
     wt=$(yaml_scalar worktree "$f" || true)
-    if [[ $id == "$key" || $wt == "$key" ]]; then
+    if [[ $id == "$key" ]]; then
       printf '%s\n' "$f"
       return 0
     fi
+    if [[ $wt == "$key" ]]; then
+      if [[ $(yaml_scalar status "$f" || true) == active ]] || lease_running "$f"; then
+        found=$f
+        occupied=1
+      elif ((occupied == 0)); then
+        found=$f
+      fi
+    fi
   done
-  return 1
+  [[ -n $found ]] || return 1
+  printf '%s\n' "$found"
 }
 
 cmd_release() {
-  local key= discard=0 pr_override=none
+  local key='' discard=0 pr_override=none
   while (($#)); do
     case "$1" in
       --discard-unique) discard=1; shift ;;
@@ -433,12 +508,12 @@ cmd_release() {
   done
   [[ -n $key ]] || fail missing_lease_id
   lease_lock_acquire
-  local store_file= wt= leased=0
+  local store_file='' wt='' leased=0
   if store_file=$(find_lease_file "$key"); then
     leased=1
     local status
     status=$(yaml_scalar status "$store_file")
-    [[ $status == active ]] || fail_apply lease_not_active
+    [[ $status == active || $status == expired ]] || fail_apply lease_not_active
     wt=$(yaml_scalar worktree "$store_file")
   else
     [[ -d $key ]] || fail_apply lease_not_found
@@ -446,6 +521,7 @@ cmd_release() {
     [[ $wt != "$(git_primary)" ]] || fail_apply primary_checkout
   fi
   [[ -d $wt ]] || fail_apply worktree_missing
+  if worktree_running "$wt"; then fail_apply execution_unresolved; fi
 
   if [[ -n $(git -C "$wt" status --porcelain) ]]; then
     fail_apply dirty_worktree
@@ -469,16 +545,7 @@ cmd_release() {
   fi
 
   if ((leased)); then
-    LEASE_ID=$(yaml_scalar lease_id "$store_file")
-    LEASE_CONTRACT=$(yaml_scalar contract "$store_file")
-    LEASE_OWNER=$(yaml_scalar owner "$store_file")
-    LEASE_SEAT=$(yaml_scalar seat "$store_file")
-    LEASE_BASE=$(yaml_scalar base_sha "$store_file")
-    LEASE_ALLOWED=$(yaml_scalar allowed_files "$store_file")
-    LEASE_DEPENDENCY=$(yaml_scalar dependency "$store_file")
-    LEASE_PACKET_SHA=$(yaml_scalar packet_sha256 "$store_file")
-    LEASE_DEADLINE=$(yaml_scalar deadline "$store_file")
-    LEASE_GATES=$(yaml_scalar trading_gates "$store_file")
+    load_lease_file "$store_file"
   else
     LEASE_ID=$(new_lease_id)
     LEASE_CONTRACT="unleased cleanup"
@@ -518,6 +585,10 @@ cleanup_class() {
     printf 'keep\tdirty worktree\n'
     return
   fi
+  if worktree_running "$path"; then
+    printf 'keep\tunresolved execution\n'
+    return
+  fi
   if [[ $lease_status == active ]]; then
     printf 'keep\tactive lease\n'
     return
@@ -546,20 +617,12 @@ cmd_list() {
     else state=registered-clean; fi
     if [[ -n $branch ]]; then checkout=branch; else checkout=detached; fi
     local lease_id=none lease_status=none owner=none pr=none
-    local store f wt_rec
-    store=$(lease_store)
-    if [[ -d $store ]]; then
-      for f in "$store"/*.yml; do
-        [[ -f $f ]] || continue
-        wt_rec=$(yaml_scalar worktree "$f" || true)
-        if [[ $wt_rec == "$path" ]]; then
-          lease_id=$(yaml_scalar lease_id "$f")
-          lease_status=$(yaml_scalar status "$f")
-          owner=$(yaml_scalar owner "$f")
-          pr=$(yaml_scalar pr "$f")
-          break
-        fi
-      done
+    local f
+    if f=$(find_lease_file "$path"); then
+      lease_id=$(yaml_scalar lease_id "$f")
+      lease_status=$(yaml_scalar status "$f")
+      owner=$(yaml_scalar owner "$f")
+      pr=$(yaml_scalar pr "$f")
     fi
     if [[ $pr == none && -n $branch ]]; then
       local found
@@ -611,6 +674,7 @@ deadline_passed() {
 load_lease_file() {
   local f=$1
   LEASE_ID=$(yaml_scalar lease_id "$f")
+  LEASE_SCHEMA=$(yaml_scalar schema "$f")
   LEASE_STATUS=$(yaml_scalar status "$f")
   LEASE_CONTRACT=$(yaml_scalar contract "$f")
   LEASE_OWNER=$(yaml_scalar owner "$f")
@@ -621,11 +685,13 @@ load_lease_file() {
   LEASE_ALLOWED=$(yaml_scalar allowed_files "$f")
   LEASE_DEPENDENCY=$(yaml_scalar dependency "$f")
   LEASE_PACKET_SHA=$(yaml_scalar packet_sha256 "$f")
+  LEASE_PACKET_FILE=$(yaml_scalar packet_file "$f" 2>/dev/null || true)
   LEASE_PR=$(yaml_scalar pr "$f")
   LEASE_DEADLINE=$(yaml_scalar deadline "$f")
   LEASE_GATES=$(yaml_scalar trading_gates "$f")
   LEASE_SPAWN_COUNT=$(yaml_scalar spawn_count "$f" 2>/dev/null || true)
   LEASE_SPAWN_COUNT=${LEASE_SPAWN_COUNT:-0}
+  LEASE_LAST_RUN=$(yaml_scalar last_execution_id "$f" 2>/dev/null || true)
   if [[ $LEASE_STATUS == released ]]; then
     LEASE_RECOVERY_SHA=$(yaml_scalar recovery_sha "$f" 2>/dev/null || true)
   fi
@@ -646,6 +712,7 @@ cmd_sweep() {
   local expired=0 f
   while IFS= read -r f; do
     [[ -n $f ]] || continue
+    [[ $(yaml_scalar status "$f") == active ]] || continue
     local deadline
     deadline=$(yaml_scalar deadline "$f" || true)
     if deadline_passed "$deadline"; then
@@ -659,8 +726,33 @@ cmd_sweep() {
   printf 'verdict=ok\nexpired=%s\n' "$expired"
 }
 
+validate_spawn_context() {
+  [[ $LEASE_SCHEMA == monday.agent_lease.v2 ]] || fail_apply packet_snapshot_missing
+  [[ $LEASE_PACKET_FILE == "$(lease_store)/${LEASE_ID}.packet" ]] || fail_apply packet_path_mismatch
+  [[ -f $LEASE_PACKET_FILE && ! -L $LEASE_PACKET_FILE ]] || fail_apply packet_snapshot_missing
+  [[ $(canonical_packet_hash "$LEASE_PACKET_FILE") == "$LEASE_PACKET_SHA" ]] || fail_apply packet_hash_mismatch
+  local packet=$LEASE_PACKET_FILE allowed
+  allowed=$(yaml_list allowed_files "$packet" | paste -sd ',' -)
+  if [[ $(yaml_scalar goal "$packet") != "$LEASE_CONTRACT" ||
+        $(yaml_scalar writer "$packet") != "$LEASE_SEAT" ||
+        $LEASE_OWNER != "$LEASE_SEAT" ||
+        $(yaml_scalar branch "$packet") != "$LEASE_BRANCH" ||
+        $(yaml_scalar trading_gates "$packet") != "$LEASE_GATES" ||
+        $(yaml_scalar deadline "$packet") != "$LEASE_DEADLINE" ||
+        $(yaml_scalar pr "$packet") != "$LEASE_PR" ||
+        $allowed != "$LEASE_ALLOWED" ]]; then
+    fail_apply packet_binding_mismatch
+  fi
+  [[ -d $LEASE_WORKTREE ]] || fail_apply worktree_missing
+  [[ $(git -C "$LEASE_WORKTREE" rev-parse --show-toplevel) == "$LEASE_WORKTREE" ]] || fail_apply worktree_mismatch
+  [[ $(git -C "$LEASE_WORKTREE" rev-parse --path-format=absolute --git-common-dir) == "$(git_common)" ]] || fail_apply repository_mismatch
+  git worktree list --porcelain | grep -Fx "worktree $LEASE_WORKTREE" >/dev/null || fail_apply unregistered_worktree
+  [[ $(git -C "$LEASE_WORKTREE" branch --show-current) == "$LEASE_BRANCH" ]] || fail_apply branch_mismatch
+  git -C "$LEASE_WORKTREE" merge-base --is-ancestor "$LEASE_BASE" HEAD || fail_apply base_mismatch
+}
+
 cmd_spawn() {
-  local key= execute=0
+  local key='' execute=0
   while (($#)); do
     case "$1" in
       --execute) execute=1; shift ;;
@@ -673,6 +765,7 @@ cmd_spawn() {
   local store_file
   store_file=$(find_lease_file "$key") || fail_apply lease_not_found
   load_lease_file "$store_file"
+  if worktree_running "$LEASE_WORKTREE"; then fail_apply execution_unresolved; fi
   [[ $LEASE_STATUS == active ]] || fail_apply lease_not_active
   if deadline_passed "$LEASE_DEADLINE"; then
     fail_apply lease_expired
@@ -681,17 +774,17 @@ cmd_spawn() {
     fail-closed | none) ;;
     *) fail_apply trading_gates_blocked ;;
   esac
-  [[ -d $LEASE_WORKTREE ]] || fail_apply worktree_missing
+  validate_spawn_context
   local spawn_bin
   local -a spawn_args
   case $LEASE_SEAT in
     cursor-cloud)
       spawn_bin=cursor-agent
-      spawn_args=(--print --mode plan "$LEASE_CONTRACT")
+      spawn_args=(--print --mode plan)
       ;;
     codex)
       spawn_bin=codex
-      spawn_args=(exec "$LEASE_CONTRACT")
+      spawn_args=(exec)
       ;;
     grok) fail_apply grok_seat ;;
     human) fail_apply human_seat ;;
@@ -702,19 +795,101 @@ cmd_spawn() {
     command -v "$spawn_bin" >/dev/null 2>&1 || fail_apply seat_cli_missing
     mode=execute
   fi
-  LEASE_SPAWN_COUNT=$((LEASE_SPAWN_COUNT + 1))
-  persist_lease "$store_file"
-  lease_lock_release
   printf 'verdict=ok\nmode=%s\nseat=%s\nworktree=%s\ncommand=' "$mode" "$LEASE_SEAT" "$LEASE_WORKTREE"
   printf '%q' "$spawn_bin"
   local arg
   for arg in "${spawn_args[@]}"; do
     printf ' %q' "$arg"
   done
-  printf '\n'
-  if ((execute)); then
-    (cd "$LEASE_WORKTREE" && "$spawn_bin" "${spawn_args[@]}")
+  printf ' <verified-packet>\npacket_file=%s\npacket_sha256=%s\n' "$LEASE_PACKET_FILE" "$LEASE_PACKET_SHA"
+  if ((execute == 0)); then
+    lease_lock_release
+    return
   fi
+
+  local prompt source_head worker_pid exit_status marker start_sha terminal_sha prompt_sha
+  # Preserve the packet's trailing newlines and hash the actual CLI argument.
+  prompt=$(cat "$LEASE_PACKET_FILE" && printf '.') || fail_apply packet_snapshot_missing
+  prompt=${prompt%.}
+  if command -v sha256sum >/dev/null 2>&1; then
+    prompt_sha=$(printf '%s' "$prompt" | sha256sum | awk '{print $1}')
+  else
+    prompt_sha=$(printf '%s' "$prompt" | shasum -a 256 | awk '{print $1}')
+  fi
+  [[ $prompt_sha == "$LEASE_PACKET_SHA" ]] || fail_apply packet_hash_mismatch
+  source_head=$(git -C "$LEASE_WORKTREE" rev-parse HEAD)
+  RUN_ID=$(new_lease_id)
+  RUN_DIR="$(lease_store)/${LEASE_ID}.runs/$RUN_ID"
+  mkdir -p "$RUN_DIR"
+  marker="$(lease_store)/${LEASE_ID}.running"
+  (set -o noclobber; cat >"$marker" <<EOF
+execution_id: $RUN_ID
+lease_id: $LEASE_ID
+status: running
+worktree: $LEASE_WORKTREE
+owner: $LEASE_OWNER
+branch: $LEASE_BRANCH
+allowed_files: $LEASE_ALLOWED
+pr: $LEASE_PR
+EOF
+  ) || fail_apply execution_unresolved
+  LEASE_LAST_RUN=$RUN_ID
+  LEASE_SPAWN_COUNT=$((LEASE_SPAWN_COUNT + 1))
+  persist_lease "$store_file"
+  (cd "$LEASE_WORKTREE" && exec "$spawn_bin" "${spawn_args[@]}" -- "$prompt") \
+    </dev/null >"$RUN_DIR/stdout.log" 2>"$RUN_DIR/stderr.log" &
+  worker_pid=$!
+  cat >"$RUN_DIR/start.yml.partial" <<EOF
+schema: monday.agent_execution_start.v1
+execution_id: $RUN_ID
+lease_id: $LEASE_ID
+packet_sha256: $LEASE_PACKET_SHA
+base_sha: $LEASE_BASE
+source_head: $source_head
+branch: $LEASE_BRANCH
+worktree: $LEASE_WORKTREE
+seat: $LEASE_SEAT
+pr: $LEASE_PR
+controller_pid: $$
+worker_pid: $worker_pid
+started_at: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+stdout: $RUN_DIR/stdout.log
+stderr: $RUN_DIR/stderr.log
+task_status: unverified
+EOF
+  mv -- "$RUN_DIR/start.yml.partial" "$RUN_DIR/start.yml"
+  start_sha=$(canonical_packet_hash "$RUN_DIR/start.yml")
+  lease_lock_release
+  printf 'execution_id=%s\nstart_receipt=%s\n' "$RUN_ID" "$RUN_DIR/start.yml"
+  if wait "$worker_pid"; then exit_status=0; else exit_status=$?; fi
+  local source_after stdout_sha stderr_sha
+  source_after=$(git -C "$LEASE_WORKTREE" rev-parse HEAD)
+  stdout_sha=$(canonical_packet_hash "$RUN_DIR/stdout.log")
+  stderr_sha=$(canonical_packet_hash "$RUN_DIR/stderr.log")
+  cat >"$RUN_DIR/terminal.yml.partial" <<EOF
+schema: monday.agent_execution_terminal.v1
+execution_id: $RUN_ID
+lease_id: $LEASE_ID
+start_sha256: $start_sha
+packet_sha256: $LEASE_PACKET_SHA
+source_head_after: $source_after
+process_status: exited
+exit_code: $exit_status
+finished_at: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+stdout_sha256: $stdout_sha
+stderr_sha256: $stderr_sha
+task_status: unverified
+EOF
+  mv -- "$RUN_DIR/terminal.yml.partial" "$RUN_DIR/terminal.yml"
+  terminal_sha=$(canonical_packet_hash "$RUN_DIR/terminal.yml")
+  lease_lock_acquire
+  [[ $(yaml_scalar execution_id "$marker") == "$RUN_ID" ]] || fail_apply execution_marker_mismatch
+  rm -- "$marker"
+  RUN_FINISHED=1
+  lease_lock_release
+  printf 'process_status=exited\nexit_code=%s\ntask_status=unverified\nterminal_receipt=%s\nterminal_sha256=%s\n' \
+    "$exit_status" "$RUN_DIR/terminal.yml" "$terminal_sha"
+  return "$exit_status"
 }
 
 

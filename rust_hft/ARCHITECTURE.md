@@ -1,11 +1,11 @@
-# Rust Loop Engineer Architecture
+# Monday Rust Architecture
 
 ## Trust Domains
 
 ```mermaid
 flowchart TB
     subgraph Research["Cold research and control plane"]
-        LR["LoopRun goal and stage ledger"]
+        LR["CEX Campaign / prediction LoopRun contracts"]
         DM["Governed Data Missions"]
         AE["Search, evaluation, failure learning"]
         AS["DuckDB lineage and policy memory"]
@@ -15,7 +15,7 @@ flowchart TB
 
     subgraph Governance["Promotion and deployment authority"]
         PR["Immutable promotion"]
-        SB["Content-addressed Formula bundle"]
+        SB["Content-addressed strategy bundle"]
         DE["Signed DeploymentEnvelope"]
         PR --> SB --> DE
     end
@@ -42,7 +42,7 @@ flowchart TB
 
 ## Durable Packages
 
-- `alpha-harness/domain`: mission, LoopRun, candidate, evaluation, learning, approval, bundle, and signed deployment contracts.
+- `alpha-harness/domain`: Campaign/family, mission, LoopRun, candidate, evaluation, learning, approval, bundle, and signed deployment contracts.
 - `alpha-harness/store`: DuckDB migrations and append-only control-plane repositories.
 - `research-core/search-kernel`: domain-neutral deterministic UCT selection,
   topology and reward statistics. It owns no candidate grammar, evaluator,
@@ -106,9 +106,28 @@ identifiers only; new core capabilities must be placed in the canonical Monday
 module that owns them. See `../docs/architecture/PREDICTION_MARKETS.md` and
 `../docs/architecture/REPOSITORY_LAYOUT.md`.
 
-## Bounded Loop
+## CEX Campaign Execution
 
-A `LoopRun` advances only through persisted evidence:
+The production CEX entrypoint is `mission campaign-freeze` →
+`mission campaign-finalize` → `mission dispatch submit` → generated
+`mission campaign-execute`. Immutable input/source/image identities and signed
+trial/resource limits bind the admitted work. Round results, Campaign winner or
+negative outcome, terminal settlement, and independent readback provide the
+completion evidence. The [reusable coordinator](../docs/research/CAMPAIGN_WORKFLOW.md)
+uses the same seam and resumes recorded stages without resetting a budget or
+Job identity.
+
+Each supervised search Campaign stops pre-holdout. The separate
+[closed-family final evaluation](../deployment/aliyun/research/README.md#final-evaluation-of-a-closed-family)
+requires family closure and its own grant. It freezes fitted winners, evaluates
+independent selection and replay, and consumes at most one global holdout claim.
+Its native implementation checks do not prove a cloud run or runtime cutover;
+promotion and runtime intake require their own evidence.
+
+## Legacy LoopRun Contract
+
+The retained continuous-contract `LoopRun` implementation advances only through
+persisted evidence:
 
 1. `Researching`
 2. `WalkForwardKept`
@@ -121,7 +140,10 @@ The declared target stage, not candidate count, determines success. Awaiting evi
 
 Repeated failures may create one idempotent follow-up mission. A learning directive can alter only a future lab search policy after deterministic validation. It cannot alter a runtime hard cap or authorize capital.
 
-This is a durable goal/evidence loop. Cron, Kubernetes Jobs, or event consumers may invoke it, but scheduling is not itself evidence and does not bypass any stage.
+These legacy stages are diagnostic implementation surfaces, not alternate CEX
+production entrypoints. Prediction-market `prediction execute` retains its
+separate bounded probability-blend LoopRun and event-disjoint evaluator; it has
+no order authority. Scheduling either lane is not completion evidence.
 
 ## Data And Time
 
@@ -138,7 +160,7 @@ Streaming connector availability is a runtime capability, not proof that the sam
 - Trading evidence then persists per-fold and aggregate rows, trades, post-cost return, drawdown, per-observation net Sharpe, raw score, adjusted score, config, and failure reasons.
 - Mission policy pre-registers the multiple-testing family; the evaluator applies a Gaussian expected-maximum haircut without claiming full DSR or PBO.
 - Domain and store layers recompute evidence, evaluator config/metrics hashes, candidate binding, and bundle hash before promotion.
-- Only a canonical Formula v3 candidate with predictive and trading gates can be promoted by the current producer.
+- Legacy Formula promotion requires a canonical Formula v3 candidate with predictive and trading gates. Native supervised promotion evidence belongs to the separately granted closed-family final-evaluation path above; pre-holdout scores do not supply it.
 - Offline RL remains lab-only and is blocked from holdout and promotion.
 - ONNX remains runtime schema compatibility only until point-in-time training lineage and a governed model evaluator are implemented.
 

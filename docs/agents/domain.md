@@ -1,7 +1,20 @@
 # Domain Docs
 
-Monday currently uses a single-context domain-doc layout.
+Start with the [task map](scenarios.md) and read the owning domain contract for
+the requested behavior. Project authority stays in [AGENTS.md](../../AGENTS.md).
 
-Before domain-sensitive work, read the root `CONTEXT.md` if present and any relevant ADRs under `docs/adr/`. If those files do not exist, proceed without treating their absence as a blocker.
+Current architecture and ADRs live in:
 
-Use vocabulary defined by the available domain docs. If a proposed change conflicts with an ADR, surface the conflict rather than silently overriding it.
+- [Rust architecture](../../rust_hft/ARCHITECTURE.md) and
+  [repository ownership](../architecture/REPOSITORY_LAYOUT.md).
+- [System-boundary ADR](../architecture/ADR-0001-monday-v2-system-boundaries.md)
+  for Research, Governance, Runtime and market-family ownership.
+- [Release-identity ADR](../architecture/ADR-0002-rust-lob-release-identities.md)
+  for collector source, artifact and deployed identity.
+- [Research contracts](../research/) for Campaign workflows, evaluation,
+  holding/accounting and training; use only the files relevant to the task.
+
+Use the vocabulary and invariants in those contracts and their implementation.
+Surface a proposed conflict with an applicable ADR. Dated plans and reports
+provide historical reasoning or run evidence, not current interface authority.
+There is no required root `CONTEXT.md` or `docs/adr/` context tree.
