@@ -374,4 +374,80 @@ touch "$AGENT_WAIT_FILE"
 kill -TERM "$interrupted_worker" 2>/dev/null || true
 [[ -e "$fixture/.git/agent-leases/$interrupted_id.running" ]]
 
+repo_src="$fixture/declared-repo"
+mkdir -p "$repo_src"
+printf 'repo-file\n' >"$repo_src/README"
+secret_file="$fixture/model.secret"
+printf 'super-secret-token\n' >"$secret_file"
+cat >"$fixture/agent-task.yml" <<EOF
+schema: monday.agent_task.v1
+agent_id: fixture-agent
+contract: fixture-contract
+cpu: 1
+memory_mb: 256
+allow_hosts: github.com,example.com
+model_provider: fixture-provider
+model_secret_file: $secret_file
+workspace_repo_name: fixture
+workspace_repo_path: $repo_src
+workspace_tool_name: skill
+workspace_tool_endpoint: file:///fixture-skill
+command: sh -c 'test -d "\$MONDAY_AGENT_WORKSPACE/repos/fixture" && test -s "\$MONDAY_AGENT_WORKSPACE/repos/fixture/README" && test -s "\$MONDAY_AGENT_WORKSPACE/tools/skill" && test -s "\$MONDAY_AGENT_WORKSPACE/.bounds" || exit 3; if [ ! -f "\$MONDAY_AGENT_WORKSPACE/marker" ]; then echo first > "\$MONDAY_AGENT_WORKSPACE/marker"; fi; echo run >> "\$MONDAY_AGENT_WORKSPACE/runs"'
+EOF
+pending=$("$gate" task-declare --file "$fixture/agent-task.yml")
+grep -qx 'verdict=ok' <<<"$pending"
+grep -qx 'phase=pending' <<<"$pending"
+task_state="$fixture/.git/agent-tasks/fixture-agent"
+grep -qx 'cpu: 1' "$task_state/task.yml"
+grep -qx 'memory_mb: 256' "$task_state/task.yml"
+! grep -q 'super-secret-token' "$task_state/task.yml"
+invoke1=$("$gate" task-invoke fixture-agent)
+grep -qx 'verdict=ok' <<<"$invoke1"
+grep -qx 'agent_id=fixture-agent' <<<"$invoke1"
+grep -qx 'phase=suspended' <<<"$invoke1"
+grep -qx 'cpu=1' <<<"$invoke1"
+grep -qx 'memory_mb=256' <<<"$invoke1"
+grep -qx 'first' "$task_state/workspace/marker"
+grep -qx 'cpu=1' "$task_state/workspace/.bounds"
+grep -qx 'memory_mb=256' "$task_state/workspace/.bounds"
+! grep -q 'super-secret-token' "$task_state/command.log" "$task_state/invocation.log" "$task_state/invocation.err" "$task_state/task.yml"
+allowed_host=$("$gate" task-egress fixture-agent github.com)
+grep -qx 'verdict=ok' <<<"$allowed_host"
+denied_host=$("$gate" task-egress fixture-agent evil.example 2>&1 || true)
+grep -qx 'reason=host_not_allowed' <<<"$denied_host"
+suspend_out=$("$gate" task-suspend fixture-agent)
+grep -qx 'phase=suspended' <<<"$suspend_out"
+status_out=$("$gate" task-status fixture-agent)
+grep -qx 'phase=suspended' <<<"$status_out"
+grep -qx 'agent_id=fixture-agent' <<<"$status_out"
+invoke2=$("$gate" task-invoke fixture-agent)
+grep -qx 'agent_id=fixture-agent' <<<"$invoke2"
+grep -qx 'phase=suspended' <<<"$invoke2"
+grep -qx 'first' "$task_state/checkpoint/marker"
+runs=$(wc -l <"$task_state/workspace/runs" | tr -d ' ')
+[[ $runs == 2 ]]
+mkdir -p "$fixture/.git/agent-leases"
+cat >"$fixture/.git/agent-leases/occupied.yml" <<EOF
+status: active
+contract: occupied-contract
+EOF
+cat >"$fixture/occupied-task.yml" <<EOF
+schema: monday.agent_task.v1
+agent_id: occupied-agent
+contract: occupied-contract
+cpu: 1
+memory_mb: 128
+allow_hosts: github.com
+model_provider: fixture-provider
+model_secret_file: $secret_file
+workspace_repo_name: fixture
+workspace_repo_path: $repo_src
+workspace_tool_name: skill
+workspace_tool_endpoint: file:///fixture-skill
+command: true
+EOF
+"$gate" task-declare --file "$fixture/occupied-task.yml" >/dev/null
+occupied_invoke=$("$gate" task-invoke occupied-agent 2>&1 || true)
+grep -qx 'reason=writer_already_active' <<<"$occupied_invoke"
+
 printf 'agent worktree preflight tests passed\n'
