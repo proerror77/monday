@@ -31,6 +31,7 @@ toolchain=false
 jobs=
 security_jobs=
 research_image_relevant=false
+architecture=false
 owning_packages=
 clippy_loop=false
 clippy_handoff=false
@@ -123,6 +124,7 @@ select_all_rust_ci_jobs() {
 }
 
 select_all_ploy_jobs() {
+  architecture=true
   research_image_relevant=true
   [[ $event == pull_request ]] && select_job ploy/commit-hygiene
   select_job ploy/research-image-binaries
@@ -167,6 +169,7 @@ select_all() {
 
 emit() {
   local value
+  [[ $architecture == true ]] && select_job ploy/architecture-contracts
   # Every path that selects collector verification must exercise its production image.
   if [[ $collector == true ]]; then select_job ci/deployment-artifacts; fi
   select_security_scope
@@ -222,6 +225,15 @@ fi
 
 needs_metadata=false
 for path in "${paths[@]}"; do
+  # workspace_runtime_retirement reads files directly, beyond Cargo's dependency
+  # graph. Include the whole prediction tree (also its operational docs), retired
+  # roots, canonical adapter manifests, and the external collector contracts.
+  case "$path" in
+    rust_hft/prediction-markets/*|products/ploy|products/ploy/*|\
+    rust_hft/data-pipelines/adapters/adapter-polymarket/Cargo.toml|\
+    rust_hft/execution-gateway/adapters/adapter-polymarket/Cargo.toml|\
+    deployment/aliyun/polymarket*) architecture=true ;;
+  esac
   case "$path" in
     AGENTS.md|*/AGENTS.md|CLAUDE.md|*/CLAUDE.md)
       [[ $event == pull_request ]] && select_job ploy/commit-hygiene

@@ -678,6 +678,22 @@ jobs:
       - name: Test Binance MD fast lane
         run: cargo test -p hft-engine --locked binance_md
 
+      - name: Enforce quote-to-worker latency budgets
+        run: |
+          set -euo pipefail
+          cargo test -p hft-engine --bench hotpath_latency_p99 --release --locked -- --nocapture \
+            | tee "$RUNNER_TEMP/engine-latency.log"
+
+      - name: Record engine latency metrics
+        if: ${{ always() }}
+        run: |
+          if [[ -f "$RUNNER_TEMP/engine-latency.log" ]]; then
+            {
+              printf '### Local quote-to-worker latency\n\nSource: %s\n\n' "$GITHUB_SHA"
+              grep '^quote_to_worker_queue ' "$RUNNER_TEMP/engine-latency.log" || true
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: sccache stats
         if: always()
         run: ${SCCACHE_PATH:-sccache} --show-stats || true
