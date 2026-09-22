@@ -7,6 +7,7 @@ use hft_collector::polymarket_evidence_artifact::{
 use hft_collector::polymarket_parity::{
     verify_shadow_parity, ShadowParityConfig, DEFAULT_TRADE_MATURITY_LAG_SECONDS,
 };
+use hft_collector::polymarket_poly_data::{import_poly_data, PolyDataImportConfig};
 use hft_collector::polymarket_raw::{
     finalize_reference_tape, run_reference, ReferenceConfig, DEFAULT_MAX_CONCURRENT_TRADE_POLLS,
     DEFAULT_MAX_MARKETS_PER_LANE, DEFAULT_MAX_TRADE_POLLS_PER_CYCLE,
@@ -42,6 +43,18 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Import a bounded, hash-pinned poly_data export as trade-only history.
+    ImportPolyData {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Independently verify trade-only history against its recorded manifest hash.
+    ValidatePolyData {
+        #[arg(long)]
+        directory: PathBuf,
+        #[arg(long)]
+        manifest_sha256: String,
+    },
     /// Collect public market metadata, trades, and settlement evidence.
     CollectReference {
         #[arg(long, default_value = "/data/monday/spool/polymarket-reference")]
@@ -223,6 +236,26 @@ async fn main() -> Result<()> {
 
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Command::ImportPolyData { config } => {
+            let metadata = fs::metadata(&config)?;
+            if !metadata.is_file() || metadata.len() > 64 * 1024 {
+                bail!("poly_data import config must be a bounded regular JSON file");
+            }
+            let config: PolyDataImportConfig = serde_json::from_slice(&fs::read(config)?)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&import_poly_data(&config)?)?
+            );
+            Ok(())
+        }
+        Command::ValidatePolyData {
+            directory,
+            manifest_sha256,
+        } => {
+            let verified = data::polymarket_history::verify_history(&directory, &manifest_sha256)?;
+            println!("{}", serde_json::to_string_pretty(verified.manifest())?);
+            Ok(())
+        }
         Command::CollectReference {
             spool_dir,
             symbols,
@@ -331,8 +364,8 @@ async fn run(cli: Cli) -> Result<()> {
             allow_empty_legacy,
             trade_maturity_lag_seconds,
         } => {
-            let trade_maturity_lag_seconds = trade_maturity_lag_seconds
-                .unwrap_or(DEFAULT_TRADE_MATURITY_LAG_SECONDS);
+            let trade_maturity_lag_seconds =
+                trade_maturity_lag_seconds.unwrap_or(DEFAULT_TRADE_MATURITY_LAG_SECONDS);
             let config = ShadowParityConfig {
                 legacy_spool,
                 rust_spool,
