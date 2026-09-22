@@ -9,8 +9,10 @@ use engine::dataflow::IngestionConfig;
 use engine::{create_execution_queues, Engine, EngineConfig, ExecutionQueueConfig};
 use hft_core::{OrderType, Price, Quantity, Side, Symbol, TimeInForce, VenueId};
 use ports::{
-    AccountView, BookLevel, ExecutionEvent, MarketEvent, MarketSnapshot, OrderIntent, Strategy,
+    AccountView, BookLevel, ExecutionEvent, ExecutionPriceProtection, MarketEvent, MarketSnapshot,
+    OrderIntent, Strategy,
 };
+use std::collections::HashMap;
 use std::time::Instant;
 
 struct BenchmarkStrategy;
@@ -27,8 +29,8 @@ impl Strategy for BenchmarkStrategy {
             compliance_context: hft_core::ComplianceContext::default(),
             side: Side::Buy,
             quantity: Quantity::from_f64(0.001).unwrap(),
-            order_type: OrderType::Market,
-            price: None,
+            order_type: OrderType::Limit,
+            price: Some(Price::from_f64(50_001.0).unwrap()),
             time_in_force: TimeInForce::IOC,
             strategy_id: "latency_bench".to_string(),
             target_venue: Some(VenueId::BINANCE),
@@ -68,6 +70,18 @@ fn quote_to_worker_queue_p99_stays_below_budget() {
         ..Default::default()
     });
     engine.register_strategy(BenchmarkStrategy);
+    engine
+        .set_intent_execution_limits(
+            Some(100),
+            Some(rust_decimal::Decimal::from(1_000_000)),
+            Some(rust_decimal::Decimal::from(10)),
+        )
+        .expect("bench declares execution ceilings");
+    // The latency sample is local queue admission, not canonical-book slippage proof.
+    engine.set_execution_price_protection(HashMap::from([(
+        VenueId::BINANCE,
+        ExecutionPriceProtection::VenueQuote,
+    )]));
     let ingester = engine.create_event_ingester_pair();
     let (engine_queues, mut worker_queues) =
         create_execution_queues(ExecutionQueueConfig::default());
