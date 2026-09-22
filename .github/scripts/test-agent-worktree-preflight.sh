@@ -450,4 +450,66 @@ EOF
 occupied_invoke=$("$gate" task-invoke occupied-agent 2>&1 || true)
 grep -qx 'reason=writer_already_active' <<<"$occupied_invoke"
 
+cat >"$fixture/edit-task.yml" <<EOF
+schema: monday.agent_task.v1
+agent_id: edit-agent
+contract: edit-contract
+cpu: 1
+memory_mb: 256
+allow_hosts: github.com
+model_provider: fixture-provider
+model_secret_file: $secret_file
+workspace_repo_name: fixture
+workspace_repo_path: $repo_src
+workspace_tool_name: skill
+workspace_tool_endpoint: file:///fixture-skill
+command: sh -c 'if [ ! -f "\$MONDAY_AGENT_WORKSPACE/marker" ]; then printf edited-by-agent > "\$MONDAY_AGENT_WORKSPACE/repos/fixture/README"; echo first > "\$MONDAY_AGENT_WORKSPACE/marker"; fi; echo run >> "\$MONDAY_AGENT_WORKSPACE/runs"'
+EOF
+"$gate" task-declare --file "$fixture/edit-task.yml" >/dev/null
+"$gate" task-invoke edit-agent >/dev/null
+"$gate" task-suspend edit-agent >/dev/null
+"$gate" task-invoke edit-agent >/dev/null
+grep -qx 'edited-by-agent' "$fixture/.git/agent-tasks/edit-agent/workspace/repos/fixture/README"
+
+cat >"$fixture/mem-task.yml" <<EOF
+schema: monday.agent_task.v1
+agent_id: mem-agent
+contract: mem-contract
+cpu: 1
+memory_mb: 32
+allow_hosts: github.com
+model_provider: fixture-provider
+model_secret_file: $secret_file
+workspace_repo_name: fixture
+workspace_repo_path: $repo_src
+workspace_tool_name: skill
+workspace_tool_endpoint: file:///fixture-skill
+command: perl -e 'my \$x = "x" x (80 * 1024 * 1024); sleep 2'
+EOF
+"$gate" task-declare --file "$fixture/mem-task.yml" >/dev/null
+mem_out=$("$gate" task-invoke mem-agent 2>&1 || true)
+grep -qx 'reason=memory_exceeded' <<<"$mem_out"
+! grep -qx 'verdict=ok' <<<"$mem_out"
+
+cat >"$fixture/net-task.yml" <<EOF
+schema: monday.agent_task.v1
+agent_id: net-agent
+contract: net-contract
+cpu: 1
+memory_mb: 256
+allow_hosts: github.com
+model_provider: fixture-provider
+model_secret_file: $secret_file
+workspace_repo_name: fixture
+workspace_repo_path: $repo_src
+workspace_tool_name: skill
+workspace_tool_endpoint: file:///fixture-skill
+command: curl -sS -o /dev/null -w '%{http_code}' https://example.com
+EOF
+"$gate" task-declare --file "$fixture/net-task.yml" >/dev/null
+net_out=$("$gate" task-invoke net-agent 2>&1 || true)
+grep -qx 'reason=command_failed' <<<"$net_out"
+! grep -qx 'verdict=ok' <<<"$net_out"
+grep -q host_not_allowed "$fixture/.git/agent-tasks/net-agent/invocation.err"
+
 printf 'agent worktree preflight tests passed\n'

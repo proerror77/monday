@@ -939,8 +939,13 @@ materialize_task_workspace() {
   tool_name=$(yaml_scalar workspace_tool_name "$dir/task.yml")
   tool_endpoint=$(yaml_scalar workspace_tool_endpoint "$dir/task.yml")
   mkdir -p "$ws/repos/$repo_name" "$ws/tools"
-  if [[ -d $repo_path ]]; then
-    cp -a "$repo_path/." "$ws/repos/$repo_name/"
+  # A restored checkpoint already holds the agent's repo edits. Recopying the
+  # declared source would wipe that state on the next invoke.
+  if [[ ! -d $dir/checkpoint || ! -e $ws/repos/$repo_name ]]; then
+    if [[ -d $repo_path ]]; then
+      mkdir -p "$ws/repos/$repo_name"
+      cp -a "$repo_path/." "$ws/repos/$repo_name/"
+    fi
   fi
   printf '%s\n' "$tool_endpoint" >"$ws/tools/$tool_name"
   local cpu memory
@@ -1047,6 +1052,119 @@ cmd_task_suspend() {
   printf 'verdict=ok\nagent_id=%s\nphase=suspended\n' "$agent_id"
 }
 
+install_egress_wrappers() {
+  local dir=$1
+  local bindir=$dir/bin
+  mkdir -p "$bindir"
+  local hosts_file=$dir/allow_hosts
+  : >"$hosts_file"
+  local hosts item
+  hosts=$(yaml_scalar allow_hosts "$dir/task.yml")
+  IFS=',' read -r -a items <<<"$hosts"
+  for item in "${items[@]}"; do
+    item=${item#"${item%%[![:space:]]*}"}
+    item=${item%"${item##*[![:space:]]}"}
+    [[ -n $item ]] && printf '%s\n' "$item" >>"$hosts_file"
+  done
+  local tool real
+  for tool in curl wget nc ncat; do
+    real=$(command -v "$tool" 2>/dev/null || true)
+    [[ -n $real && $real != "$bindir/$tool" ]] || real=
+    cat >"$bindir/$tool" <<EOF
+#!/bin/bash
+host=
+for arg in "\$@"; do
+  case "\$arg" in
+    http://*|https://*)
+      host=\${arg#*://}
+      host=\${host%%/*}
+      host=\${host%%:*}
+      host=\${host%%\\?*}
+      ;;
+  esac
+done
+if [[ -z \$host ]]; then
+  echo host_not_allowed >&2
+  exit 77
+fi
+ok=0
+while IFS= read -r item || [[ -n \$item ]]; do
+  [[ \$item == "\$host" ]] && ok=1
+done < "\$MONDAY_AGENT_ALLOW_FILE"
+if [[ \$ok != 1 ]]; then
+  echo host_not_allowed >&2
+  exit 77
+fi
+real='$real'
+if [[ -z \$real ]]; then
+  echo host_not_allowed >&2
+  exit 77
+fi
+exec "\$real" "\$@"
+EOF
+    chmod +x "$bindir/$tool"
+  done
+}
+
+rss_tree_kb() {
+  local pid=$1
+  local self kids kid sum
+  self=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+  sum=${self:-0}
+  [[ $sum =~ ^[0-9]+$ ]] || sum=0
+  kids=$(pgrep -P "$pid" 2>/dev/null || true)
+  for kid in $kids; do
+    sum=$((sum + $(rss_tree_kb "$kid")))
+  done
+  printf '%s\n' "$sum"
+}
+
+kill_tree() {
+  local pid=$1
+  local kids kid
+  kids=$(pgrep -P "$pid" 2>/dev/null || true)
+  for kid in $kids; do
+    kill_tree "$kid"
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+}
+
+assert_resource_bounds_enforceable() {
+  local cpu=$1 memory=$2
+  ps -o rss= -p $$ >/dev/null 2>&1 || fail memory_bound_unenforceable
+  [[ $cpu =~ ^[1-9][0-9]*$ ]] || fail cpu_bound_unenforceable
+  [[ $memory =~ ^[1-9][0-9]*$ ]] || fail memory_bound_unenforceable
+  ( ulimit -t $((cpu * 3600)) ) || fail cpu_bound_unenforceable
+}
+
+run_bounded_command() {
+  local cpu=$1 memory=$2 command=$3
+  local max_kb=$((memory * 1024))
+  local child rss exceeded=0
+  set -m
+  (
+    ulimit -t $((cpu * 3600)) || exit 126
+    eval "$command"
+  ) &
+  child=$!
+  while kill -0 "$child" 2>/dev/null; do
+    rss=$(rss_tree_kb "$child")
+    if (( rss > max_kb )); then
+      kill_tree "$child"
+      exceeded=1
+      break
+    fi
+    sleep 0.05
+  done
+  if ((exceeded)); then
+    wait "$child" 2>/dev/null || true
+    return 137
+  fi
+  local exit_status=0
+  wait "$child" || exit_status=$?
+  return "$exit_status"
+}
+
 cmd_task_egress() {
   local agent_id=${1:-} host=${2:-}
   [[ -n $agent_id && -n $host ]] || fail missing_egress_target
@@ -1096,6 +1214,8 @@ cmd_task_invoke() {
     printf 'failed\n' >"$dir/phase"
     fail bounds_not_declared
   }
+  assert_resource_bounds_enforceable "$cpu" "$memory"
+  install_egress_wrappers "$dir"
   printf 'command=%s\ncpu=%s\nmemory_mb=%s\n' "$command" "$cpu" "$memory" >>"$dir/command.log"
   local exit_status=0
   set +e
@@ -1105,8 +1225,9 @@ cmd_task_invoke() {
     export MONDAY_AGENT_WORKSPACE=$ws
     export MONDAY_AGENT_CPU=$cpu
     export MONDAY_AGENT_MEMORY_MB=$memory
-    ulimit -v $((memory * 1024)) 2>/dev/null || true
-    eval "$command"
+    export MONDAY_AGENT_ALLOW_FILE=$dir/allow_hosts
+    export PATH="$dir/bin:$PATH"
+    run_bounded_command "$cpu" "$memory" "$command"
   ) >>"$dir/invocation.log" 2>>"$dir/invocation.err"
   exit_status=$?
   set -e
@@ -1119,6 +1240,14 @@ cmd_task_invoke() {
         fail secret_leaked
       fi
     fi
+  fi
+  if ((exit_status == 137)); then
+    printf 'failed\n' >"$dir/phase"
+    fail memory_exceeded
+  fi
+  if ((exit_status == 126)); then
+    printf 'failed\n' >"$dir/phase"
+    fail cpu_bound_unenforceable
   fi
   if ((exit_status != 0)); then
     printf 'failed\n' >"$dir/phase"
