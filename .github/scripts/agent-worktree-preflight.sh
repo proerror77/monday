@@ -225,6 +225,7 @@ packet_sha256: $LEASE_PACKET_SHA
 pr: $LEASE_PR
 deadline: $LEASE_DEADLINE
 trading_gates: $LEASE_GATES
+spawn_count: ${LEASE_SPAWN_COUNT:-0}
 EOF
   if [[ $LEASE_STATUS == released ]]; then
     cat >>"$dest" <<EOF
@@ -599,9 +600,126 @@ cmd_get() {
   cmd_list | grep -F "worktree=$key" || fail lease_not_found
 }
 
+deadline_passed() {
+  local deadline=$1
+  [[ -n $deadline && $deadline != none ]] || return 1
+  local now
+  now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  [[ $deadline < $now ]]
+}
+
+load_lease_file() {
+  local f=$1
+  LEASE_ID=$(yaml_scalar lease_id "$f")
+  LEASE_STATUS=$(yaml_scalar status "$f")
+  LEASE_CONTRACT=$(yaml_scalar contract "$f")
+  LEASE_OWNER=$(yaml_scalar owner "$f")
+  LEASE_SEAT=$(yaml_scalar seat "$f")
+  LEASE_WORKTREE=$(yaml_scalar worktree "$f")
+  LEASE_BRANCH=$(yaml_scalar branch "$f")
+  LEASE_BASE=$(yaml_scalar base_sha "$f")
+  LEASE_ALLOWED=$(yaml_scalar allowed_files "$f")
+  LEASE_DEPENDENCY=$(yaml_scalar dependency "$f")
+  LEASE_PACKET_SHA=$(yaml_scalar packet_sha256 "$f")
+  LEASE_PR=$(yaml_scalar pr "$f")
+  LEASE_DEADLINE=$(yaml_scalar deadline "$f")
+  LEASE_GATES=$(yaml_scalar trading_gates "$f")
+  LEASE_SPAWN_COUNT=$(yaml_scalar spawn_count "$f" 2>/dev/null || true)
+  LEASE_SPAWN_COUNT=${LEASE_SPAWN_COUNT:-0}
+  if [[ $LEASE_STATUS == released ]]; then
+    LEASE_RECOVERY_SHA=$(yaml_scalar recovery_sha "$f" 2>/dev/null || true)
+  fi
+}
+
+persist_lease() {
+  local store_file=$1
+  write_lease_record "$store_file"
+  if [[ -d $LEASE_WORKTREE ]]; then
+    local record
+    record=$(git -C "$LEASE_WORKTREE" rev-parse --git-path agent-worktree.yml)
+    write_lease_record "$record"
+  fi
+}
+
+cmd_sweep() {
+  lease_lock_acquire
+  local expired=0 f
+  while IFS= read -r f; do
+    [[ -n $f ]] || continue
+    local deadline
+    deadline=$(yaml_scalar deadline "$f" || true)
+    if deadline_passed "$deadline"; then
+      load_lease_file "$f"
+      LEASE_STATUS=expired
+      persist_lease "$f"
+      expired=$((expired + 1))
+    fi
+  done < <(active_lease_files)
+  lease_lock_release
+  printf 'verdict=ok\nexpired=%s\n' "$expired"
+}
+
+cmd_spawn() {
+  local key= execute=0
+  while (($#)); do
+    case "$1" in
+      --execute) execute=1; shift ;;
+      --*) fail unknown_spawn_argument ;;
+      *) key=$1; shift ;;
+    esac
+  done
+  [[ -n $key ]] || fail missing_lease_id
+  lease_lock_acquire
+  local store_file
+  store_file=$(find_lease_file "$key") || fail_apply lease_not_found
+  load_lease_file "$store_file"
+  [[ $LEASE_STATUS == active ]] || fail_apply lease_not_active
+  if deadline_passed "$LEASE_DEADLINE"; then
+    fail_apply lease_expired
+  fi
+  case $LEASE_GATES in
+    fail-closed | none) ;;
+    *) fail_apply trading_gates_blocked ;;
+  esac
+  [[ -d $LEASE_WORKTREE ]] || fail_apply worktree_missing
+  local spawn_bin
+  local -a spawn_args
+  case $LEASE_SEAT in
+    cursor-cloud)
+      spawn_bin=cursor-agent
+      spawn_args=(--print --mode plan "$LEASE_CONTRACT")
+      ;;
+    codex)
+      spawn_bin=codex
+      spawn_args=(exec "$LEASE_CONTRACT")
+      ;;
+    grok) fail_apply grok_seat ;;
+    human) fail_apply human_seat ;;
+    *) fail_apply unknown_seat ;;
+  esac
+  local mode=dry-run
+  if ((execute)); then
+    command -v "$spawn_bin" >/dev/null 2>&1 || fail_apply seat_cli_missing
+    mode=execute
+  fi
+  LEASE_SPAWN_COUNT=$((LEASE_SPAWN_COUNT + 1))
+  persist_lease "$store_file"
+  lease_lock_release
+  printf 'verdict=ok\nmode=%s\nseat=%s\nworktree=%s\ncommand=' "$mode" "$LEASE_SEAT" "$LEASE_WORKTREE"
+  printf '%q' "$spawn_bin"
+  local arg
+  for arg in "${spawn_args[@]}"; do
+    printf ' %q' "$arg"
+  done
+  printf '\n'
+  if ((execute)); then
+    (cd "$LEASE_WORKTREE" && "$spawn_bin" "${spawn_args[@]}")
+  fi
+}
+
 
 usage() {
-  echo "usage: $0 check-managed|report|list|get|apply|release"
+  echo "usage: $0 check-managed|report|list|get|apply|release|spawn|sweep"
 }
 
 case "${1:-help}" in
@@ -611,6 +729,8 @@ case "${1:-help}" in
   get) shift; cmd_get "$@" ;;
   apply) shift; cmd_apply "$@" ;;
   release) shift; cmd_release "$@" ;;
+  spawn) shift; cmd_spawn "$@" ;;
+  sweep) shift; cmd_sweep "$@" ;;
   help|--help|-h) usage ;;
   *) usage >&2; exit 2 ;;
 esac

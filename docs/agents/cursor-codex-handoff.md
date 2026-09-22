@@ -102,13 +102,17 @@ One active contract has one writer. One worktree and one PR have one writer.
 A second agent on the same files is read-only unless Monk reassigns exclusive
 ownership. Record the ownership tuple in the worktree-private
 `git rev-parse --git-path agent-worktree.yml` path used by managed preflight.
-The operator CLI `.github/scripts/agent-worktree-preflight.sh` (`list` / `apply` / `release`)
-is the machine interface for that tuple: `apply --packet-file` occupies a
-mutually exclusive lease, `list` reports cleanup safety, and `release` removes
-only cleanup-safe worktrees. A squash-merged PR (`(#N)` on the integration tip,
-or `gh` merged head) counts as recovered unique commits. Unleased leftover
-worktrees can be released by path when cleanup-safe. It does not spawn Cursor,
-Codex, or Grok.
+The operator CLI `.github/scripts/agent-worktree-preflight.sh`
+(`list` / `apply` / `release` / `spawn` / `sweep`) is the machine interface
+for that tuple. `apply --packet-file` occupies a mutually exclusive lease,
+`list` reports cleanup safety, and `release` removes only cleanup-safe
+worktrees. A squash-merged PR (`(#N)` on the integration tip, or `gh` merged
+head) counts as recovered unique commits. Unleased leftover worktrees can be
+released by path when cleanup-safe. `spawn` is dry-run unless `--execute`;
+it requires an active unexpired lease and refuses `grok`/`human` seats and
+any trading gate other than `none` or `fail-closed`. `sweep` marks overdue
+leases expired and does not delete worktrees. It does not call Cursor Cloud
+or Codex HTTP APIs, and it does not schedule ACK Jobs.
 
 If two open PRs or worktrees overlap, stop the later writer and ask Monk to
 choose. Use `.agents/skills/monday-worktree-audit` to inventory conflicts; do
