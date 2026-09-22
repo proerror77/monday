@@ -6,19 +6,33 @@ Rust-first, multi-venue system for governed market-data acquisition, immutable r
 
 This repository is locally production-gated for governed research plus signed **Paper** and **Shadow** activation. It is not approved for real-money autonomous trading. `LiveSmall` runtime activation remains fail-closed until real-venue reconciliation, reduce-only exit, order-size, and slippage acceptance tests are complete.
 
-## Loop Engineer Contract
+## Research Entry Contract
 
-The implemented loop is goal-based and evidence-driven:
+CEX cloud research uses `mission campaign-freeze` → `mission campaign-finalize`
+→ `mission dispatch submit` → the generated `mission campaign-execute` Job.
+The Campaign binds immutable inputs, source/image identities, admitted plans,
+and a finite trial budget. Each round produces a pre-holdout result; the
+Campaign selects one deterministic winner or records a negative outcome.
+Settlement and independent artifact readback complete that research attempt.
+The [Campaign workflow](docs/research/CAMPAIGN_WORKFLOW.md) coordinates bounded
+comparisons and recovery through this same entrypoint.
 
-1. A `LoopRun` declares a target stage, bounded mission budget, and explicit completion policy.
-2. Continuous-contract Formula `LoopRun` execution uses MCTS or Bayesian engines with exact engine-state checkpoints. GP, offline RL, and free-form LLM formula search remain standalone Lab missions. Monday's prediction-market module runs bounded deterministic probability-blend MCTS under the event-disjoint Rust evaluator; it has no proposal-provider, promotion, or execution authority outside that research lane.
-3. The versioned evaluator applies point-in-time data, purged walk-forward folds, costs, drawdown limits, minimum evidence, and a pre-registered multiple-testing haircut.
-4. Failures remain queryable and may create one bounded follow-up mission with a validator-gated learning directive.
-5. Promotion binds candidate, dataset, evaluator config/metrics, sealed result, approval, and bundle hashes.
-6. `hft-live` verifies the signed envelope and loads that exact bundle for Paper or Shadow.
-7. Runtime attribution is signed by a runtime-only key, verified before ingestion, appended to the same lineage, and may influence only a future lab search policy.
+A supervised Campaign does not open the sealed holdout. The separate
+[closed-family final evaluation](deployment/aliyun/research/README.md#final-evaluation-of-a-closed-family)
+requires its own grant, independent selection/replay and a single-use holdout
+claim. Its native worker and ledger/dispatch checks do not establish a real
+cloud final-evaluation run or runtime cutover. Promotion and signed runtime
+intake remain separate evidence and authority boundaries.
 
-The repository provides the durable goal loop and CLI. Time-based or event-based invocation is an external scheduler responsibility. LLMs never receive order, credential, wallet, risk-increase, resume, or artifact-loading authority.
+Legacy CEX Mission/`LoopRun` commands remain diagnostic implementation surfaces,
+not alternate production completion paths. Prediction-market research uses
+`prediction execute` and its bounded probability-blend `LoopRun` with an
+event-disjoint evaluator; it grants no order authority. See the
+[Alpha Harness entrypoints](rust_hft/alpha-harness/README.md) for each lane.
+
+The repository provides durable research coordinators and CLIs. External event
+routing is a separate responsibility. LLMs never receive order, credential,
+wallet, risk-increase, resume, or artifact-loading authority.
 
 ## Capability Truth
 
@@ -27,11 +41,12 @@ The repository provides the durable goal loop and CLI. Time-based or event-based
 | Binance closed-candle OHLCV v2 Data Missions | `governed` | Content-addressed trace, immutable DuckDB registry, point-in-time and quality checks |
 | Binance W3W Prediction order adapter | `implemented, activation disabled` | Official SDK wallet verification, quote/place/cancel, balance, and open-order reconciliation; fill/settlement promotion still requires a dedicated acceptance gate |
 | Tick/LOB and multi-venue streaming connectors | `runtime-only` | Connector availability is not a governed research-dataset claim |
-| Formula search with GP, MCTS, and Bayesian optimization | `governed` | Eligible for evaluator v3 and Formula-only promotion |
+| CEX Campaign factor/model search | `governed-research` | Continuous GP and native Ridge/CART/Burn MLP; per-round selection and replay stop pre-holdout, with immutable results and charged trial limits |
+| Legacy Formula search with GP, MCTS, and Bayesian optimization | `diagnostic / legacy` | Retained evaluator and Formula promotion contracts do not replace the CEX Campaign entrypoint |
 | Offline Q-learning | `lab-only` | Search-policy experiment; blocked from holdout, promotion, allocation, and runtime authority |
 | OpenAI-compatible hypothesis/failure critic | `lab-only` | Optional `ALPHA_LLM_*` calls; outputs remain evidence/proposals |
 | Prediction-market probability-blend LoopRun | `governed-research` | BTC/SOL five-minute event lane only; Rust schema, budget, event-disjoint evaluator, and content-addressed ledger; no order authority |
-| Purged walk-forward and one-time sealed holdout v3 | `governed` | Typed predictive/trading metrics and config hashes are recomputed before promotion |
+| Purged walk-forward and sealed evaluation | `governed` | Legacy Formula and separate supervised closed-family contracts; search results alone cannot open holdout or authorize runtime |
 | Native Rust contract-model training | `governed-lab` | Burn 0.20.1, point-in-time rows, immutable dataset binding, deterministic seed, Burnpack artifact; never self-promotes |
 | ONNX loading | `runtime-compatibility` | Read-only compatibility for already governed artifacts; native training uses Burnpack |
 | Signed Formula Paper/Shadow handoff | `implemented` | Ed25519 verification, runtime-owned approval evidence, policy binding, durable nonce and audit records |
@@ -43,21 +58,19 @@ The repository provides the durable goal loop and CLI. Time-based or event-based
 
 ## Architecture
 
+The CEX research path crosses these separate evidence and authority boundaries:
+
 ```mermaid
 flowchart LR
-    G["Bounded LoopRun goal"] --> D["Governed Data Mission"]
-    D --> C["Content-addressed dataset"]
-    C --> S["MCTS / Bayesian LoopRun"]
-    C --> Q["Standalone GP / RL / LLM Lab missions"]
-    S --> E["Evaluator v3"]
-    E -->|"fail + evidence"| L["Learning directive / follow-up mission"]
-    L --> S
-    E -->|"walk-forward + sealed pass"| P["Promotion + Formula bundle"]
-    P --> H["Signed deployment envelope"]
-    H --> R["Rust runtime verifier"]
-    R --> X["Paper / Shadow"]
-    X --> A["Scoped runtime attribution"]
-    A --> L
+    D["Governed immutable inputs"] --> C["CEX Campaign freeze / finalize / dispatch"]
+    C --> S["Bounded rounds: search / validation / replay"]
+    S --> E["Pre-holdout result / settlement / independent readback"]
+    E -->|"negative + admitted follow-up"| L["Typed learning plan within root budget"]
+    L --> C
+    E -->|"closed family + separate final grant"| F["Independent selection / replay / one sealed holdout"]
+    F -->|"qualifying evidence"| P["Governance: promotion / signed bundle"]
+    P -->|"separate activation contract"| R["Rust runtime verifier"]
+    R --> X["Paper / Shadow; LiveSmall disabled"]
 ```
 
 The research plane exposes no order or trade command and has no execution-adapter dependency. Runtime hard limits always clamp proposed limits; unknown account or reconciliation state halts live execution.
@@ -90,13 +103,14 @@ Ordinary changes should use package-scoped checks. Run a release graph, containe
 
 ## Entry Points
 
+- [Task and symptom navigation](docs/agents/scenarios.md)
 - [Canonical architecture](rust_hft/ARCHITECTURE.md)
 - [Monday V2 system-boundary ADR](docs/architecture/ADR-0001-monday-v2-system-boundaries.md)
 - [Monday V2 architecture migration plan](docs/superpowers/plans/2026-08-21-monday-v2-architecture-migration.md)
 - [Alpha Harness CLI](rust_hft/alpha-harness/README.md)
 - [Production deployment](rust_hft/deployment/PRODUCTION_DEPLOYMENT.md)
-- [Current approved design](docs/superpowers/specs/2026-07-11-loop-engineer-production-hardening-design.md)
-- [Current implementation plan](docs/superpowers/plans/2026-07-11-loop-engineer-production-hardening.md)
+- [Historical Loop Engineer design](docs/superpowers/specs/2026-07-11-loop-engineer-production-hardening-design.md)
+- [Historical Loop Engineer implementation plan](docs/superpowers/plans/2026-07-11-loop-engineer-production-hardening.md)
 - [Design document status](docs/superpowers/README.md)
 - [Repository layout](docs/architecture/REPOSITORY_LAYOUT.md)
 - [Prediction-market integration](docs/architecture/PREDICTION_MARKETS.md)
