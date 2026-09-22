@@ -507,9 +507,76 @@ workspace_tool_endpoint: file:///fixture-skill
 command: curl -sS -o /dev/null -w '%{http_code}' https://example.com
 EOF
 "$gate" task-declare --file "$fixture/net-task.yml" >/dev/null
-net_out=$("$gate" task-invoke net-agent 2>&1 || true)
-grep -qx 'reason=command_failed' <<<"$net_out"
+set +e
+net_out=$("$gate" task-invoke net-agent 2>&1)
+net_status=$?
+set -e
+grep -qx 'reason=host_not_allowed' <<<"$net_out"
 ! grep -qx 'verdict=ok' <<<"$net_out"
-grep -q host_not_allowed "$fixture/.git/agent-tasks/net-agent/invocation.err"
+! grep -q '200' <<<"$net_out"
+[[ $net_status != 77 ]]
+grep -qx 'example.com' "$fixture/.git/agent-tasks/net-agent/egress-refused"
+
+cat >"$fixture/leak-task.yml" <<EOF
+schema: monday.agent_task.v1
+agent_id: leak-agent
+contract: leak-contract
+cpu: 1
+memory_mb: 256
+allow_hosts: github.com
+model_provider: fixture-provider
+model_secret_file: $secret_file
+workspace_repo_name: fixture
+workspace_repo_path: $repo_src
+workspace_tool_name: skill
+workspace_tool_endpoint: file:///fixture-skill
+command: sh -c 'cat "\${MONDAY_AGENT_WORKSPACE%/workspace}/model.secret"; curl -sS https://example.com'
+EOF
+"$gate" task-declare --file "$fixture/leak-task.yml" >/dev/null
+leak_out=$("$gate" task-invoke leak-agent 2>&1 || true)
+grep -qx 'reason=secret_leaked' <<<"$leak_out"
+! grep -qx 'reason=host_not_allowed' <<<"$leak_out"
+
+cat >"$fixture/bg-task.yml" <<EOF
+schema: monday.agent_task.v1
+agent_id: bg-agent
+contract: bg-contract
+cpu: 1
+memory_mb: 256
+allow_hosts: github.com
+model_provider: fixture-provider
+model_secret_file: $secret_file
+workspace_repo_name: fixture
+workspace_repo_path: $repo_src
+workspace_tool_name: skill
+workspace_tool_endpoint: file:///fixture-skill
+command: sh -c '(sleep 0.3; curl -sS -o /dev/null https://example.com) &'
+EOF
+"$gate" task-declare --file "$fixture/bg-task.yml" >/dev/null
+bg_out=$("$gate" task-invoke bg-agent 2>&1 || true)
+grep -qx 'reason=host_not_allowed' <<<"$bg_out"
+! grep -qx 'verdict=ok' <<<"$bg_out"
+
+if ! command -v aria2c >/dev/null 2>&1; then
+  cat >"$fixture/missing-tool.yml" <<EOF
+schema: monday.agent_task.v1
+agent_id: missing-tool-agent
+contract: missing-tool-contract
+cpu: 1
+memory_mb: 256
+allow_hosts: github.com
+model_provider: fixture-provider
+model_secret_file: $secret_file
+workspace_repo_name: fixture
+workspace_repo_path: $repo_src
+workspace_tool_name: skill
+workspace_tool_endpoint: file:///fixture-skill
+command: sh -c 'aria2c https://github.com/resource || true'
+EOF
+  "$gate" task-declare --file "$fixture/missing-tool.yml" >/dev/null
+  missing_out=$("$gate" task-invoke missing-tool-agent)
+  grep -qx 'verdict=ok' <<<"$missing_out"
+  [[ ! -s $fixture/.git/agent-tasks/missing-tool-agent/egress-refused ]]
+fi
 
 printf 'agent worktree preflight tests passed\n'
