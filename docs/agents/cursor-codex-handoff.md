@@ -109,10 +109,64 @@ for that tuple. `apply --packet-file` occupies a mutually exclusive lease,
 worktrees. A squash-merged PR (`(#N)` on the integration tip, or `gh` merged
 head) counts as recovered unique commits. Unleased leftover worktrees can be
 released by path when cleanup-safe. `spawn` is dry-run unless `--execute`;
-it requires an active unexpired lease and refuses `grok`/`human` seats and
-any trading gate other than `none` or `fail-closed`. `sweep` marks overdue
-leases expired and does not delete worktrees. It does not call Cursor Cloud
-or Codex HTTP APIs, and it does not schedule ACK Jobs.
+dry-run does not start a process or change the execution count. It requires an
+active unexpired lease, verifies the admitted packet and current worktree/
+branch/base, and refuses `grok`/`human` seats or trading gates other than `none`
+or `fail-closed`. It does not call Cursor Cloud or Codex HTTP APIs, and it does
+not schedule ACK Jobs.
+
+### Machine packet and execution evidence
+
+`apply --packet-file` accepts the snake-case packet below. Lease metadata is
+single-line; additional notes and multiline evidence/constraints stay in the
+complete packet forwarded to the worker. Use references to evidence rather
+than credentials or bulk inputs.
+
+```yaml
+from: human
+to: codex
+routed_by: Monk
+goal: Fix the named behavior and open a PR
+evidence_paths: issue URL, source SHA, reproduction receipt path
+constraints: No deployment; preserve unrelated changes and trading gates
+done_criteria: PR URL, exact head and relevant check results
+trading_gates: fail-closed
+branch: codex/named-fix
+writer: codex
+allowed_files:
+  - path/to/owning/module
+deadline: 2099-01-01T00:00:00Z
+pr: none
+```
+
+Replace the example deadline and scope with the task's actual bounds. `apply`
+reads, parses and hashes one private packet snapshot. Later edits to the
+original file cannot change an admitted task. Spawn rejects a missing or
+altered snapshot, or metadata that differs from it; historical leases without
+a snapshot cannot be silently reconstructed into executable leases.
+
+The local Cursor invocation remains `cursor-agent --print --mode plan`;
+the Codex invocation remains `codex exec`. Both receive the complete verified
+packet, including evidence, constraints and done criteria. The lease coordinates
+ownership; `allowed_files` is not an operating-system write sandbox.
+
+An executed spawn writes private, per-execution start and terminal receipts
+under the repository's Git common directory, alongside stdout/stderr logs.
+Receipts bind the lease, packet hash, source heads, branch, controller/worker
+PIDs, timestamps and actual process exit code. The terminal receipt binds the
+start receipt and log hashes. Even exit code zero reports `task_status:
+unverified`; PR identity, checks and the requested outcome need their own
+readback. Dry-run prints metadata references, not the packet text.
+
+While execution is unresolved, a marker blocks another spawn, overlapping
+leases and release by either lease ID or worktree path. `sweep` marks overdue
+leases expired but retains that occupation and reports the worktree as `keep`.
+A confirmed process exit writes the terminal receipt before clearing the
+marker. Interruption of the controller retains an unresolved record: a missing
+controller PID, expired deadline or clean checkout does not prove the worker
+stopped. Inspect the recorded worker and retained evidence before manually
+recovering an interrupted execution; this helper does not kill processes or
+automatically resume them.
 
 If two open PRs or worktrees overlap, stop the later writer and ask Monk to
 choose. Use `.agents/skills/monday-worktree-audit` to inventory conflicts; do
