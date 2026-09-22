@@ -1,0 +1,23 @@
+{
+  "schema_version": "monday.campaign_generation_completion.v1",
+  "generation": 0,
+  "outcome": "complete",
+  "campaign_pod_name": "pod-g0",
+  "generation_report_sha256": "1845e7a4096c9d18108191416a98df129e7368f7ba0c5735c3a0b095abe486a0",
+  "learning_checkpoint_sha256": "20f32e38901ddeb17dc6a8b3a60415453c46ef043a0fd71ef54035ff0e3511a1",
+  "cycle_result": {
+    "generation": 0,
+    "campaign_id": "campaign-g0",
+    "request_sha256": "64a93f349cb914717fa5b4ca953566e26b577ffebde7e91f620d6a954a903239",
+    "job_name": "job-g0",
+    "campaign_result_sha256": "b1bfa9587a4cd134264772189fb0eab5ec8cf916c8fd4a0348011968d7db684e",
+    "termination_reason": "no_improvement",
+    "observed_image_id": "registry.example/research@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "learning_directive_sha256": "none",
+    "search_policy_revision_id": "cex-search-policy-0000000000000000000000000000000000000000000000000000000000000000",
+    "round_readback_count": 2,
+    "learning_outcome": "no_improvement",
+    "learn_report_url": "https://bucket.oss-ap-northeast-1-internal.aliyuncs.com/research/no-improvement-campaigns/campaign-id=campaign-g0/learning/generation=0/learn-report.json",
+    "learn_report_sha256": "e2ad6d5aa1d11e02868d3f6f0d0c49c2642b57bfb848cb4f4cb50ab7fc29716d"
+  }
+}
