@@ -10,7 +10,10 @@ RUN rustup toolchain install 1.98.1 --profile minimal --no-self-update \
 
 WORKDIR /work
 ARG SOURCE_REVISION
+# Keep the digest-pinned bullseye builder libc. cmake only needs bullseye
+# main; bullseye-security currently 404s retired libarchive13 updates.
 RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list \
+    && sed -i '/debian-security/d' /etc/apt/sources.list \
     && apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     pkg-config \
