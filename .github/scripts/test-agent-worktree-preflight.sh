@@ -149,7 +149,7 @@ grep -qx 'expired=1' <<<"$sweep_out"
 [[ -d $wt_expired ]]
 grep -qx 'status: expired' <<<"$(cd "$fixture" && "$gate" get "$lease_expired")"
 
-write_packet "$fixture/packet-live.yml" cursor-cloud cursor/test-live docs/live.md
+write_packet "$fixture/packet-live.yml" human cursor/test-live docs/live.md
 sed -i.bak -e 's|deadline: 2026-09-22T00:00:00Z|deadline: 2099-01-01T00:00:00Z|' \
   -e 's|trading_gates: none|trading_gates: live|' "$fixture/packet-live.yml"
 apply_live=$(cd "$fixture" && "$gate" apply --packet-file "$fixture/packet-live.yml")
