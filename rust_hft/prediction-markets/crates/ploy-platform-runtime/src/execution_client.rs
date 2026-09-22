@@ -110,8 +110,10 @@ pub fn execution_io_error(error: HftError) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hft_core::{OrderType, Price, Quantity, Side, Symbol, TimeInForce, VenueId};
-    use ports::{OrderIntentEnvelope, OrderIntentLifecycle};
+    use hft_core::{
+        LocalReceiveTimestamp, OrderType, Price, Quantity, Side, Symbol, TimeInForce, VenueId,
+    };
+    use ports::{ExecutionPriceReference, OrderIntentEnvelope, OrderIntentLifecycle};
     use rust_decimal::Decimal;
 
     fn assert_disabled<T>(result: HftResult<T>) {
@@ -126,21 +128,34 @@ mod tests {
     async fn production_client_rejects_orders_and_authoritative_account_reads() {
         let shared = disabled_execution_client();
         let mut client = lock_execution_client(&shared).await.unwrap();
+        let symbol = Symbol::new("test-yes-token");
+        let limit = Price(Decimal::new(5, 1));
         let intent = OrderIntent::prediction_market(
-            Symbol::new("test-yes-token"),
+            symbol.clone(),
             Side::Buy,
             Quantity(Decimal::ONE),
             OrderType::Limit,
-            Some(Price(Decimal::new(5, 1))),
+            Some(limit),
             TimeInForce::GTC,
             "disabled-client-regression".to_string(),
             VenueId::POLYMARKET,
         );
         let now = hft_core::now_micros();
-        let envelope = OrderIntentEnvelope::new(
-            intent.clone(),
-            OrderIntentLifecycle::new(now, now + 60_000_000),
-        );
+        let mut lifecycle = OrderIntentLifecycle::new(now, now + 60_000_000);
+        // Ceilings stay mandatory. This fixture is bounded so the assertion
+        // measures the disabled client, not a missing-limit rejection.
+        lifecycle.max_slippage_bps = Some(25);
+        lifecycle.max_order_notional = Some(Decimal::ONE);
+        lifecycle.max_order_quantity = Some(Decimal::ONE);
+        let mut envelope = OrderIntentEnvelope::new(intent.clone(), lifecycle);
+        envelope.price_reference = Some(ExecutionPriceReference {
+            venue: VenueId::POLYMARKET,
+            symbol,
+            side: Side::Buy,
+            price: limit,
+            book_sequence: 1,
+            received_at: LocalReceiveTimestamp::new(now),
+        });
         envelope.validate_cex_pre_execution(now, None).unwrap();
         let order_id = OrderId("existing-order".to_string());
 
