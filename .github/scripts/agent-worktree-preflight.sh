@@ -1067,7 +1067,7 @@ install_egress_wrappers() {
     [[ -n $item ]] && printf '%s\n' "$item" >>"$hosts_file"
   done
   local tool real
-  for tool in curl wget nc ncat; do
+  for tool in curl wget nc ncat aria2c; do
     real=$(command -v "$tool" 2>/dev/null || true)
     [[ -n $real && $real != "$bindir/$tool" ]] || real=
     cat >"$bindir/$tool" <<EOF
@@ -1083,22 +1083,25 @@ for arg in "\$@"; do
       ;;
   esac
 done
-if [[ -z \$host ]]; then
+refuse() {
+  printf '%s\n' "\$1" > "\$MONDAY_AGENT_EGRESS_REFUSED"
   echo host_not_allowed >&2
-  exit 77
+  exit 76
+}
+if [[ -z \$host ]]; then
+  refuse missing-host
 fi
 ok=0
 while IFS= read -r item || [[ -n \$item ]]; do
   [[ \$item == "\$host" ]] && ok=1
 done < "\$MONDAY_AGENT_ALLOW_FILE"
 if [[ \$ok != 1 ]]; then
-  echo host_not_allowed >&2
-  exit 77
+  refuse "\$host"
 fi
 real='$real'
 if [[ -z \$real ]]; then
-  echo host_not_allowed >&2
-  exit 77
+  echo command_not_found >&2
+  exit 127
 fi
 exec "\$real" "\$@"
 EOF
@@ -1137,22 +1140,45 @@ assert_resource_bounds_enforceable() {
   ( ulimit -t $((cpu * 3600)) ) || fail cpu_bound_unenforceable
 }
 
+# GNU ps -g selects a session, not a process group. An empty session match
+# would skip the RSS cap, so match the recorded pgid from a full snapshot.
 run_bounded_command() {
   local cpu=$1 memory=$2 command=$3
   local max_kb=$((memory * 1024))
-  local child rss exceeded=0
+  local child pgid snapshot pid grp rss state total alive exceeded=0 spins=0
   set -m
   (
     ulimit -t $((cpu * 3600)) || exit 126
     eval "$command"
+    wait
   ) &
   child=$!
-  while kill -0 "$child" 2>/dev/null; do
-    rss=$(rss_tree_kb "$child")
-    if (( rss > max_kb )); then
-      kill_tree "$child"
+  pgid=$(ps -o pgid= -p "$child" 2>/dev/null | tr -d ' ' || true)
+  [[ $pgid =~ ^[0-9]+$ ]] || pgid=$child
+  while :; do
+    snapshot=$(ps -ax -o pid=,pgid=,rss=,state=) || return 125
+    total=0
+    alive=0
+    while read -r pid grp rss state; do
+      [[ $grp == "$pgid" ]] || continue
+      [[ $state == Z* ]] && continue
+      [[ $rss =~ ^[0-9]+$ ]] || continue
+      total=$((total + rss))
+      alive=1
+    done <<<"$snapshot"
+    if ((alive == 0)) && ! kill -0 "$child" 2>/dev/null; then
+      break
+    fi
+    if ((alive == 1 && total > max_kb)); then
+      kill -KILL -"$pgid" 2>/dev/null || kill_tree "$child"
       exceeded=1
       break
+    fi
+    spins=$((spins + 1))
+    if ((spins > 400)); then
+      kill -KILL -"$pgid" 2>/dev/null || kill_tree "$child"
+      wait "$child" 2>/dev/null || true
+      return 124
     fi
     sleep 0.05
   done
@@ -1217,6 +1243,7 @@ cmd_task_invoke() {
   assert_resource_bounds_enforceable "$cpu" "$memory"
   install_egress_wrappers "$dir"
   printf 'command=%s\ncpu=%s\nmemory_mb=%s\n' "$command" "$cpu" "$memory" >>"$dir/command.log"
+  rm -f "$dir/egress-refused"
   local exit_status=0
   set +e
   (
@@ -1226,6 +1253,7 @@ cmd_task_invoke() {
     export MONDAY_AGENT_CPU=$cpu
     export MONDAY_AGENT_MEMORY_MB=$memory
     export MONDAY_AGENT_ALLOW_FILE=$dir/allow_hosts
+    export MONDAY_AGENT_EGRESS_REFUSED=$dir/egress-refused
     export PATH="$dir/bin:$PATH"
     run_bounded_command "$cpu" "$memory" "$command"
   ) >>"$dir/invocation.log" 2>>"$dir/invocation.err"
@@ -1241,9 +1269,17 @@ cmd_task_invoke() {
       fi
     fi
   fi
+  if [[ -s $dir/egress-refused ]]; then
+    printf 'failed\n' >"$dir/phase"
+    fail host_not_allowed
+  fi
   if ((exit_status == 137)); then
     printf 'failed\n' >"$dir/phase"
     fail memory_exceeded
+  fi
+  if ((exit_status == 125)); then
+    printf 'failed\n' >"$dir/phase"
+    fail memory_bound_unenforceable
   fi
   if ((exit_status == 126)); then
     printf 'failed\n' >"$dir/phase"
