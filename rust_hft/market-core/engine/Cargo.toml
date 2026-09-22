@@ -89,6 +89,10 @@ name = "engine_hotpath"
 harness = false
 
 [[bench]]
+name = "hotpath_latency_p99"
+harness = true
+
+[[bench]]
 name = "binance_md_hotpath"
 harness = false
 

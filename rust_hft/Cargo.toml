@@ -216,11 +216,6 @@ redis = ["dep:redis"]
 metrics = ["dep:metrics-exporter-prometheus"]
 
 [[bench]]
-name = "hotpath_latency_p99"
-path = "benches/hotpath_latency_p99.rs"
-harness = true
-
-[[bench]]
 name = "strategy_dispatch"
 path = "benches/strategy_dispatch.rs"
 harness = false

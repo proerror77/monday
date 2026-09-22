@@ -1,5 +1,8 @@
 {
   "packages": [
+    { "name": "hft-core", "manifest_path": "rust_hft/market-core/core/Cargo.toml", "dependencies": [] },
+    { "name": "hft-ports", "manifest_path": "rust_hft/market-core/ports/Cargo.toml", "dependencies": [{ "name": "hft-core", "path": "../core" }] },
+    { "name": "hft-engine", "manifest_path": "rust_hft/market-core/engine/Cargo.toml", "dependencies": [{ "name": "hft-ports", "path": "../ports" }] },
     { "name": "hft-collector", "manifest_path": "rust_hft/tools/collector/Cargo.toml", "dependencies": [] },
     {
       "name": "alpha-harness",

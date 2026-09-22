@@ -2,6 +2,8 @@
 //!
 //! Measures one local market event through aggregation, strategy, lifecycle validation, and the
 //! execution SPSC queue. Network and exchange push cadence are intentionally excluded.
+//!
+//! Run with: cargo test -p hft-engine --bench hotpath_latency_p99 --release -- --nocapture
 
 use engine::dataflow::IngestionConfig;
 use engine::{create_execution_queues, Engine, EngineConfig, ExecutionQueueConfig};
@@ -112,7 +114,9 @@ fn quote_to_worker_queue_p99_stays_below_budget() {
     let p50 = percentile(&samples, 0.50);
     let p99 = percentile(&samples, 0.99);
     let p999 = percentile(&samples, 0.999);
-    println!("quote_to_worker_queue p50={p50}ns p99={p99}ns p999={p999}ns");
+    println!(
+        "quote_to_worker_queue samples={SAMPLES} warmup={WARMUP} p50_ns={p50} p99_ns={p99} p999_ns={p999} p99_budget_ns={P99_BUDGET_NS} p999_budget_ns={P999_BUDGET_NS}"
+    );
     assert!(
         p99 <= P99_BUDGET_NS,
         "quote-to-worker p99 {p99}ns exceeds {P99_BUDGET_NS}ns"

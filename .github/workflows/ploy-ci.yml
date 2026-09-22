@@ -73,7 +73,7 @@ jobs:
              [[ "$SELECTED_JOBS" =~ ^,[a-z0-9/-]*(,[a-z0-9/-]+)*,$ ]]; then
             printf 'jobs=%s\n' "$SELECTED_JOBS"
           else
-            printf '%s\n' 'jobs=,ploy/commit-hygiene,ploy/workflow-lint,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,'
+            printf '%s\n' 'jobs=,ploy/commit-hygiene,ploy/workflow-lint,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts,'
           fi >> "$GITHUB_OUTPUT"
 
   commit-hygiene:
@@ -1160,6 +1160,31 @@ jobs:
           echo "### Frontend lane" >> "$GITHUB_STEP_SUMMARY"
           echo "TypeScript is limited to the operator UI; the agent sidecar runs in the Rust control-plane lane." >> "$GITHUB_STEP_SUMMARY"
 
+  architecture-contracts:
+    name: Prediction architecture contracts
+    needs: image-smoke-scope
+    if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/architecture-contracts,') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.98.1
+
+      - name: Cache architecture test dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: rust_hft/prediction-markets
+          shared-key: prediction-architecture-1.98.1
+          save-if: ${{ github.event_name != 'pull_request' }}
+
+      - name: Check the complete architecture scan domain
+        run: cargo test --locked -p ploy --test workspace_runtime_retirement
+
   integration-regressions:
     name: Rust integration regressions
     needs: image-smoke-scope
@@ -1240,7 +1265,6 @@ jobs:
           set -euo pipefail
           SECONDS=0
           cargo test --locked -p ploy --test platform_smoke
-          cargo test --locked -p ploy --test workspace_runtime_retirement
           echo "### Rust integration regressions lane" >> "$GITHUB_STEP_SUMMARY"
           echo "Elapsed seconds: ${SECONDS}" >> "$GITHUB_STEP_SUMMARY"
 
@@ -1274,6 +1298,7 @@ jobs:
       - rust-research-heavy
       - frontend
       - integration-regressions
+      - architecture-contracts
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
