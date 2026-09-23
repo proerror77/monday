@@ -49,10 +49,107 @@ pub struct TaskBindingV1 {
     pub contract_id: Id,
     pub workspace_id: Id,
     pub writer_id: Id,
+    pub ownership: OwnershipScopeV1,
     /// Hash of the immutable admitted packet, not its credentials or contents.
     pub spec_sha256: Digest,
     pub source_revision: String,
     pub image_sha256: Digest,
+}
+
+/// Literal repository-relative paths only. Glob syntax is deliberately refused.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WriteScopeV1 {
+    Repository,
+    File(String),
+    Subtree(String),
+}
+
+impl WriteScopeV1 {
+    fn validate(&self) -> Result<(), Error> {
+        match self {
+            Self::Repository => Ok(()),
+            Self::File(path) | Self::Subtree(path) if normalized_relative(path) => Ok(()),
+            _ => Err(Error::InvalidSpec),
+        }
+    }
+
+    fn overlaps(&self, other: &Self) -> bool {
+        fn contains(parent: &str, child: &str) -> bool {
+            child == parent
+                || child
+                    .strip_prefix(parent)
+                    .is_some_and(|tail| tail.starts_with('/'))
+        }
+        match (self, other) {
+            (Self::Repository, _) | (_, Self::Repository) => true,
+            (Self::File(a) | Self::Subtree(a), Self::File(b) | Self::Subtree(b)) => {
+                contains(a, b) || contains(b, a)
+            }
+        }
+    }
+}
+
+fn normalized_relative(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_./".contains(&b))
+        && value
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnershipScopeV1 {
+    /// Caller-authenticated identity of the shared Git repository, not a checkout.
+    pub repository_id: Id,
+    /// Host/volume/sandbox filesystem identity; separate actors can use /workspace.
+    pub filesystem_namespace: Id,
+    /// Caller-canonicalized absolute POSIX path. This model performs no filesystem IO.
+    pub canonical_worktree: String,
+    pub branch: String,
+    /// Repository-scoped pull request number.
+    pub pull_request: Option<u64>,
+    pub allowed_files: BTreeSet<WriteScopeV1>,
+}
+
+impl OwnershipScopeV1 {
+    fn validate(&self) -> Result<(), Error> {
+        if !self
+            .canonical_worktree
+            .strip_prefix('/')
+            .is_some_and(normalized_relative)
+            || !normalized_relative(&self.branch)
+            || self.branch.contains("..")
+            || self.branch.ends_with('.')
+            || self
+                .branch
+                .split('/')
+                .any(|part| part.starts_with('.') || part.ends_with(".lock"))
+            || self.pull_request == Some(0)
+            || self.allowed_files.is_empty()
+        {
+            return Err(Error::InvalidSpec);
+        }
+        for scope in &self.allowed_files {
+            scope.validate()?;
+        }
+        Ok(())
+    }
+
+    fn conflicts(&self, other: &Self) -> bool {
+        (self.filesystem_namespace == other.filesystem_namespace
+            && self.canonical_worktree == other.canonical_worktree)
+            || (self.repository_id == other.repository_id
+                && (self.branch == other.branch
+                    || self
+                        .pull_request
+                        .is_some_and(|pr| Some(pr) == other.pull_request)
+                    || self
+                        .allowed_files
+                        .iter()
+                        .any(|a| other.allowed_files.iter().any(|b| a.overlaps(b)))))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -66,18 +163,36 @@ impl Usage {
     fn within(self, ceiling: Self) -> bool {
         self.model_tokens <= ceiling.model_tokens && self.cpu_millis <= ceiling.cpu_millis
     }
+}
 
-    fn checked_add(self, other: Self) -> Result<Self, Error> {
-        Ok(Self {
-            model_tokens: self
-                .model_tokens
-                .checked_add(other.model_tokens)
-                .ok_or(Error::BudgetExceeded)?,
-            cpu_millis: self
-                .cpu_millis
-                .checked_add(other.cpu_millis)
-                .ok_or(Error::BudgetExceeded)?,
-        })
+/// Exact cumulative observation: at most u32 invocations each report u64 usage,
+/// so even an authenticated overrun cannot overflow these u128 counters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AccumulatedUsageV1 {
+    pub model_tokens: u128,
+    pub cpu_millis: u128,
+}
+
+impl From<Usage> for AccumulatedUsageV1 {
+    fn from(value: Usage) -> Self {
+        Self {
+            model_tokens: value.model_tokens.into(),
+            cpu_millis: value.cpu_millis.into(),
+        }
+    }
+}
+
+impl AccumulatedUsageV1 {
+    fn add(self, value: Usage) -> Self {
+        Self {
+            model_tokens: self.model_tokens + u128::from(value.model_tokens),
+            cpu_millis: self.cpu_millis + u128::from(value.cpu_millis),
+        }
+    }
+
+    fn within(self, budget: Usage) -> bool {
+        self.model_tokens <= u128::from(budget.model_tokens)
+            && self.cpu_millis <= u128::from(budget.cpu_millis)
     }
 }
 
@@ -97,6 +212,7 @@ pub struct TaskSpecV1 {
 
 impl TaskSpecV1 {
     fn validate(&self) -> Result<(), Error> {
+        self.binding.ownership.validate()?;
         if self.deadline == 0
             || self.max_invocations == 0
             || self.cpu_millicores == 0
@@ -145,6 +261,24 @@ pub enum Phase {
     Paused,
     Exited,
     Verified,
+    /// Independently confirmed to have never started; no automatic retry.
+    NotSubmitted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotSubmittedReason {
+    RejectedBeforeExecution,
+    AuthoritativelyAbsent,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotSubmittedReceiptV1 {
+    /// Includes the original task, operation, start time, reservation and lineage.
+    pub invocation: InvocationV1,
+    pub observed_at: u64,
+    pub reason: NotSubmittedReason,
+    /// Independently verified proof of no execution and no consumed allowance.
+    pub evidence_sha256: Digest,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -238,9 +372,19 @@ pub enum OperationDecision {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AccountingV1 {
-    pub consumed: Usage,
+    pub consumed: AccumulatedUsageV1,
     pub reserved: Usage,
     pub invocations: u32,
+    /// Sticky failure: confirmed usage exceeded a reservation or the global cap.
+    pub overrun: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UsageSettlementV1 {
+    /// Usage is recorded; reservation remains held until external effects resolve.
+    AwaitingExternalReconciliation,
+    WithinReservation,
+    Overrun,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -286,6 +430,7 @@ pub struct TaskControlV1 {
     provider_id: Option<Id>,
     used_operation_ids: BTreeSet<Id>,
     usage_receipt: Option<UsageReceiptV1>,
+    not_submitted: Option<NotSubmittedReceiptV1>,
     checkpoint: Option<CheckpointReceiptV1>,
     terminal: Option<TerminalReceiptV1>,
     readback: Option<OutcomeReadbackV1>,
@@ -301,14 +446,16 @@ impl TaskControlV1 {
             phase: Phase::Pending,
             revoked: false,
             accounting: AccountingV1 {
-                consumed: Usage::default(),
+                consumed: AccumulatedUsageV1::default(),
                 reserved: Usage::default(),
                 invocations: 0,
+                overrun: false,
             },
             invocation: None,
             provider_id: None,
             used_operation_ids: BTreeSet::new(),
             usage_receipt: None,
+            not_submitted: None,
             checkpoint: None,
             terminal: None,
             readback: None,
@@ -334,6 +481,12 @@ impl TaskControlV1 {
     pub fn terminal(&self) -> Option<&TerminalReceiptV1> {
         self.terminal.as_ref()
     }
+    pub fn usage_receipt(&self) -> Option<&UsageReceiptV1> {
+        self.usage_receipt.as_ref()
+    }
+    pub fn not_submitted(&self) -> Option<&NotSubmittedReceiptV1> {
+        self.not_submitted.as_ref()
+    }
     pub fn outcome(&self) -> Option<VerifiedOutcome> {
         self.readback.as_ref().map(|r| r.outcome)
     }
@@ -346,6 +499,9 @@ impl TaskControlV1 {
     }
 
     fn effect_allowed(&self, now: u64) -> Result<(), Error> {
+        if self.accounting.overrun {
+            return Err(Error::BudgetExceeded);
+        }
         if self.revoked {
             return Err(Error::Revoked);
         }
@@ -376,6 +532,16 @@ impl TaskControlV1 {
             return Err(Error::ExternalOperationUnresolved);
         }
         Ok(())
+    }
+
+    fn usage_settlement(&self) -> UsageSettlementV1 {
+        if self.no_unknown_operations().is_err() {
+            UsageSettlementV1::AwaitingExternalReconciliation
+        } else if self.accounting.overrun {
+            UsageSettlementV1::Overrun
+        } else {
+            UsageSettlementV1::WithinReservation
+        }
     }
 
     pub fn revoke(&mut self, expected: u64) -> Result<(), Error> {
@@ -437,7 +603,7 @@ impl TaskControlV1 {
             || !self
                 .accounting
                 .consumed
-                .checked_add(reservation)?
+                .add(reservation)
                 .within(self.spec.budget)
         {
             return Err(Error::BudgetExceeded);
@@ -483,6 +649,34 @@ impl TaskControlV1 {
         }
         self.provider_id = Some(execution.provider_id);
         self.phase = Phase::Running;
+        self.revision += 1;
+        Ok(())
+    }
+
+    /// Record authenticated non-submission as a terminal failure. An unavailable
+    /// lookup, missing PID, or expired timeout is not evidence for this transition.
+    /// Only this never-executed invocation's reservation is released; no retry or
+    /// fresh allowance is granted by the receipt.
+    pub fn observe_not_submitted(
+        &mut self,
+        expected: u64,
+        receipt: NotSubmittedReceiptV1,
+        now: u64,
+    ) -> Result<(), Error> {
+        self.expect_revision(expected)?;
+        if self.invocation.as_ref() != Some(&receipt.invocation) {
+            return Err(Error::IdentityMismatch);
+        }
+        if self.not_submitted.as_ref() == Some(&receipt) {
+            return Ok(());
+        }
+        if self.phase != Phase::Submitting {
+            return Err(Error::InvalidPhase);
+        }
+        self.observation_time(receipt.observed_at, now)?;
+        self.accounting.reserved = Usage::default();
+        self.not_submitted = Some(receipt);
+        self.phase = Phase::NotSubmitted;
         self.revision += 1;
         Ok(())
     }
@@ -554,27 +748,32 @@ impl TaskControlV1 {
         Ok(())
     }
 
-    /// The reservation remains charged until authenticated usage is known and
-    /// all external effects are resolved. A checkpoint cannot refund it.
-    pub fn settle_usage(&mut self, expected: u64, receipt: UsageReceiptV1) -> Result<(), Error> {
+    /// Record authenticated usage even while external effects remain unknown.
+    /// Release the reservation only once both facts are known. A checkpoint
+    /// cannot refund it; the same usage receipt never charges twice.
+    pub fn settle_usage(
+        &mut self,
+        expected: u64,
+        receipt: UsageReceiptV1,
+    ) -> Result<UsageSettlementV1, Error> {
         self.expect_revision(expected)?;
         self.execution_matches(&receipt.execution)?;
         if self.usage_receipt.as_ref() == Some(&receipt) {
-            return Ok(());
+            return Ok(self.usage_settlement());
         }
         if !matches!(self.phase, Phase::Paused | Phase::Exited) || self.usage_receipt.is_some() {
             return Err(Error::InvalidPhase);
         }
-        self.no_unknown_operations()?;
-        if !receipt.actual.within(self.accounting.reserved) {
-            return Err(Error::BudgetExceeded);
-        }
-        let consumed = self.accounting.consumed.checked_add(receipt.actual)?;
+        let consumed = self.accounting.consumed.add(receipt.actual);
+        self.accounting.overrun |=
+            !receipt.actual.within(self.accounting.reserved) || !consumed.within(self.spec.budget);
         self.accounting.consumed = consumed;
-        self.accounting.reserved = Usage::default();
+        if self.no_unknown_operations().is_ok() {
+            self.accounting.reserved = Usage::default();
+        }
         self.usage_receipt = Some(receipt);
         self.revision += 1;
-        Ok(())
+        Ok(self.usage_settlement())
     }
 
     pub fn record_external(
@@ -637,6 +836,9 @@ impl TaskControlV1 {
             };
         }
         retained.resolution = Some(resolution);
+        if self.usage_receipt.is_some() && self.no_unknown_operations().is_ok() {
+            self.accounting.reserved = Usage::default();
+        }
         self.revision += 1;
         Ok(())
     }
@@ -652,6 +854,9 @@ impl TaskControlV1 {
         }
         if self.phase != Phase::Exited {
             return Err(Error::InvalidPhase);
+        }
+        if self.accounting.overrun {
+            return Err(Error::BudgetExceeded);
         }
         if self.terminal.as_ref() != Some(&readback.terminal)
             || readback.observed_output_sha256 != readback.terminal.output_sha256
@@ -682,6 +887,7 @@ pub struct OwnershipClaimsV1 {
 
 impl OwnershipClaimsV1 {
     pub fn claim(&mut self, binding: TaskBindingV1) -> Result<(), Error> {
+        binding.ownership.validate()?;
         if let Some(existing) = self.claims.get(&binding.task_id) {
             return if existing == &binding {
                 Ok(())
@@ -689,11 +895,13 @@ impl OwnershipClaimsV1 {
                 Err(Error::OwnershipConflict)
             };
         }
-        if self
-            .claims
-            .values()
-            .any(|v| v.workspace_id == binding.workspace_id || v.contract_id == binding.contract_id)
-        {
+        if self.claims.values().any(|v| {
+            v.workspace_id == binding.workspace_id
+                || v.contract_id == binding.contract_id
+                || (v.ownership.repository_id == binding.ownership.repository_id
+                    && v.writer_id == binding.writer_id)
+                || v.ownership.conflicts(&binding.ownership)
+        }) {
             return Err(Error::OwnershipConflict);
         }
         self.claims.insert(binding.task_id.clone(), binding);
