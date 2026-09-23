@@ -7,6 +7,9 @@ cleanup() {
   trap - EXIT
   lease_lock_release
   [[ -z ${PENDING_PACKET:-} ]] || rm -f -- "$PENDING_PACKET"
+  if [[ -n ${EGRESS_PROXY_PID:-} ]]; then
+    kill "$EGRESS_PROXY_PID" 2>/dev/null || true
+  fi
   # An interrupted wait is not evidence that the worker stopped. Keep the
   # marker, including when the controller exits before writing its start receipt.
   if [[ -n ${RUN_DIR:-} && ${RUN_FINISHED:-0} != 1 ]]; then
@@ -1072,32 +1075,30 @@ install_egress_wrappers() {
     [[ -n $real && $real != "$bindir/$tool" ]] || real=
     cat >"$bindir/$tool" <<EOF
 #!/bin/bash
-host=
-for arg in "\$@"; do
-  case "\$arg" in
-    http://*|https://*)
-      host=\${arg#*://}
-      host=\${host%%/*}
-      host=\${host%%:*}
-      host=\${host%%\\?*}
-      ;;
-  esac
-done
 refuse() {
   printf '%s\n' "\$1" > "\$MONDAY_AGENT_EGRESS_REFUSED"
   echo host_not_allowed >&2
   exit 76
 }
-if [[ -z \$host ]]; then
-  refuse missing-host
-fi
-ok=0
-while IFS= read -r item || [[ -n \$item ]]; do
-  [[ \$item == "\$host" ]] && ok=1
-done < "\$MONDAY_AGENT_ALLOW_FILE"
-if [[ \$ok != 1 ]]; then
-  refuse "\$host"
-fi
+saw=0
+for arg in "\$@"; do
+  case "\$arg" in
+    http://*|https://*)
+      saw=1
+      host=\${arg#*://}
+      host=\${host%%/*}
+      host=\${host%%\\?*}
+      host=\${host##*@}
+      host=\${host%%:*}
+      ok=0
+      while IFS= read -r item || [[ -n \$item ]]; do
+        [[ \$item == "\$host" ]] && ok=1
+      done < "\$MONDAY_AGENT_ALLOW_FILE"
+      [[ \$ok == 1 ]] || refuse "\$host"
+      ;;
+  esac
+done
+[[ \$saw == 1 ]] || refuse missing-host
 real='$real'
 if [[ -z \$real ]]; then
   echo command_not_found >&2
@@ -1140,23 +1141,361 @@ assert_resource_bounds_enforceable() {
   ( ulimit -t $((cpu * 3600)) ) || fail cpu_bound_unenforceable
 }
 
-# GNU ps -g selects a session, not a process group. An empty session match
-# would skip the RSS cap, so match the recorded pgid from a full snapshot.
+command_disallowed_host() {
+  local command=$1 file=$2 rest token host next
+  rest=$command
+  while [[ $rest =~ https?://([^[:space:]\'\"/?#]+) ]]; do
+    token=${BASH_REMATCH[1]}
+    host=${token##*@}
+    host=${host%%:*}
+    if ! grep -qx -F -- "$host" "$file"; then
+      printf '%s\n' "$host"
+      return 0
+    fi
+    next=${rest#*"${BASH_REMATCH[0]}"}
+    [[ $next == "$rest" ]] && break
+    rest=$next
+  done
+  rest=$command
+  while [[ $rest =~ [\'\"]([A-Za-z0-9.-]+\.[A-Za-z]{2,})[\'\"] ]]; do
+    host=${BASH_REMATCH[1]}
+    if ! grep -qx -F -- "$host" "$file"; then
+      printf '%s\n' "$host"
+      return 0
+    fi
+    next=${rest#*"${BASH_REMATCH[0]}"}
+    [[ $next == "$rest" ]] && break
+    rest=$next
+  done
+  return 1
+}
+
+prepare_task_enforcement() {
+  local dir=$1
+  local cc lib
+  cc=$(command -v cc 2>/dev/null || command -v gcc 2>/dev/null || true)
+  [[ -n $cc ]] || return 1
+  lib=$dir/lib
+  mkdir -p "$lib"
+  cat >"$lib/measure.c" <<'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+  if (argc < 2) return 125;
+  pid_t pid = fork();
+  if (pid < 0) return 125;
+  if (pid == 0) {
+    execvp(argv[1], argv + 1);
+    _exit(127);
+  }
+  int status = 0;
+  struct rusage ru;
+  if (wait4(pid, &status, 0, &ru) < 0) return 125;
+  const char *path = getenv("MONDAY_PEAK_RSS");
+  if (!path) return 125;
+  FILE *f = fopen(path, "w");
+  if (!f) return 125;
+#ifdef __APPLE__
+  fprintf(f, "bytes %ld\n", ru.ru_maxrss);
+#else
+  fprintf(f, "kb %ld\n", ru.ru_maxrss);
+#endif
+  fclose(f);
+  if (WIFEXITED(status)) return WEXITSTATUS(status);
+  if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+  return 1;
+}
+EOF
+  cat >"$lib/hook.c" <<'EOF'
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <dlfcn.h>
+#include <errno.h>
+#include <netdb.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+static int (*real_getaddrinfo)(const char *, const char *, const struct addrinfo *, struct addrinfo **) = 0;
+static int loading = 0;
+static void bind_real(void) {
+  if (!real_getaddrinfo) real_getaddrinfo = dlsym(RTLD_NEXT, "getaddrinfo");
+}
+static int name_allowed(const char *host) {
+  if (!host || !host[0]) return 1;
+  if (strcmp(host, "localhost") == 0 || strcmp(host, "127.0.0.1") == 0 || strcmp(host, "::1") == 0) return 1;
+  const char *path = getenv("MONDAY_AGENT_ALLOW_FILE");
+  if (!path) return 0;
+  FILE *f = fopen(path, "r");
+  if (!f) return 0;
+  char line[256];
+  int ok = 0;
+  while (fgets(line, sizeof line, f)) {
+    line[strcspn(line, "\r\n")] = 0;
+    if (strcmp(line, host) == 0) ok = 1;
+  }
+  fclose(f);
+  return ok;
+}
+static void refuse(const char *host) {
+  const char *path = getenv("MONDAY_AGENT_EGRESS_REFUSED");
+  if (!path || !host) return;
+  FILE *f = fopen(path, "w");
+  if (!f) return;
+  fputs(host, f);
+  fputc('\n', f);
+  fclose(f);
+}
+static int my_getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res) {
+  bind_real();
+  if (!real_getaddrinfo) return EAI_FAIL;
+  if (loading) return real_getaddrinfo(node, service, hints, res);
+  if (node && !name_allowed(node)) {
+    refuse(node);
+    return EAI_NONAME;
+  }
+  return real_getaddrinfo(node, service, hints, res);
+}
+#ifdef __APPLE__
+#define DYLD_INTERPOSE(_repl, _orig) \
+  __attribute__((used)) static struct { const void *repl; const void *orig; } \
+  _interpose_##_orig __attribute__((section("__DATA,__interpose"))) = { \
+    (const void *)(unsigned long)&_repl, (const void *)(unsigned long)&_orig };
+DYLD_INTERPOSE(my_getaddrinfo, getaddrinfo)
+#else
+int getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res) {
+  return my_getaddrinfo(node, service, hints, res);
+}
+#endif
+EOF
+  "$cc" -o "$lib/measure" "$lib/measure.c" || return 1
+  if [[ $(uname -s) == Darwin ]]; then
+    "$cc" -dynamiclib -o "$lib/hook.dylib" "$lib/hook.c" || return 1
+    export MONDAY_INTERPOSE=$lib/hook.dylib
+    unset MONDAY_PRELOAD
+  else
+    "$cc" -shared -fPIC -o "$lib/hook.so" "$lib/hook.c" -ldl || return 1
+    export MONDAY_PRELOAD=$lib/hook.so
+    unset MONDAY_INTERPOSE
+  fi
+  cat >"$lib/run-task.sh" <<'EOF'
+#!/bin/bash
+if [[ -n ${MONDAY_INTERPOSE:-} ]]; then
+  export DYLD_INSERT_LIBRARIES="$MONDAY_INTERPOSE"
+fi
+if [[ -n ${MONDAY_PRELOAD:-} ]]; then
+  export LD_PRELOAD="$MONDAY_PRELOAD${LD_PRELOAD:+:$LD_PRELOAD}"
+fi
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY WS_PROXY WSS_PROXY
+if [[ -n ${MONDAY_PROXY_PORT:-} ]]; then
+  proxy="http://127.0.0.1:${MONDAY_PROXY_PORT}"
+  export http_proxy="$proxy" https_proxy="$proxy" HTTP_PROXY="$proxy" HTTPS_PROXY="$proxy" ALL_PROXY="$proxy" all_proxy="$proxy"
+fi
+eval "$MONDAY_COMMAND"
+EOF
+  chmod +x "$lib/run-task.sh" "$lib/measure"
+  export MONDAY_MEASURE=$lib/measure
+  export MONDAY_RUNNER=$lib/run-task.sh
+  export MONDAY_PEAK_RSS=$dir/peak-rss
+  unset MONDAY_SANDBOX_PROFILE MONDAY_PROXY_PORT
+  if ! command -v sandbox-exec >/dev/null 2>&1; then
+    return 0
+  fi
+  cat >"$lib/proxy.c" <<'EOF'
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <signal.h>
+#include <sys/select.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+static int allowed(const char *host) {
+  const char *path = getenv("MONDAY_AGENT_ALLOW_FILE");
+  if (!path || !host || !host[0]) return 0;
+  FILE *f = fopen(path, "r");
+  if (!f) return 0;
+  char line[256];
+  int ok = 0;
+  while (fgets(line, sizeof line, f)) {
+    line[strcspn(line, "\r\n")] = 0;
+    if (strcmp(line, host) == 0) ok = 1;
+  }
+  fclose(f);
+  return ok;
+}
+static void refuse(const char *host) {
+  const char *path = getenv("MONDAY_AGENT_EGRESS_REFUSED");
+  if (!path) return;
+  FILE *f = fopen(path, "w");
+  if (!f) return;
+  fputs(host && host[0] ? host : "blocked", f);
+  fputc('\n', f);
+  fclose(f);
+}
+static void splice(int a, int b) {
+  char buf[65536];
+  for (;;) {
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(a, &fds);
+    FD_SET(b, &fds);
+    int m = a > b ? a : b;
+    if (select(m + 1, &fds, 0, 0, 0) < 0) break;
+    int from = FD_ISSET(a, &fds) ? a : b;
+    int to = from == a ? b : a;
+    ssize_t n = read(from, buf, sizeof buf);
+    if (n <= 0) break;
+    ssize_t off = 0;
+    while (off < n) {
+      ssize_t w = write(to, buf + off, (size_t)(n - off));
+      if (w <= 0) return;
+      off += w;
+    }
+  }
+}
+int main(void) {
+  signal(SIGCHLD, SIG_IGN);
+  signal(SIGPIPE, SIG_IGN);
+  int s = socket(AF_INET, SOCK_STREAM, 0);
+  if (s < 0) return 1;
+  int one = 1;
+  setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof addr);
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (bind(s, (struct sockaddr *)&addr, sizeof addr) != 0) return 1;
+  socklen_t len = sizeof addr;
+  if (getsockname(s, (struct sockaddr *)&addr, &len) != 0) return 1;
+  if (listen(s, 16) != 0) return 1;
+  printf("%d\n", ntohs(addr.sin_port));
+  fflush(stdout);
+  for (;;) {
+    int c = accept(s, 0, 0);
+    if (c < 0) continue;
+    if (fork() != 0) { close(c); continue; }
+    close(s);
+    char req[8192];
+    size_t n = 0;
+    req[0] = 0;
+    while (n + 1 < sizeof req) {
+      ssize_t r = read(c, req + n, sizeof req - 1 - n);
+      if (r <= 0) break;
+      n += (size_t)r;
+      req[n] = 0;
+      if (strstr(req, "\r\n\r\n")) break;
+    }
+    char host[256];
+    host[0] = 0;
+    int port = 443;
+    if (!strncmp(req, "CONNECT ", 8)) {
+      const char *p = req + 8;
+      const char *sp = strchr(p, ' ');
+      if (sp && (size_t)(sp - p) < sizeof host) {
+        memcpy(host, p, (size_t)(sp - p));
+        host[sp - p] = 0;
+        char *colon = strrchr(host, ':');
+        if (colon) { *colon = 0; port = atoi(colon + 1); }
+      }
+    }
+    if (!allowed(host)) {
+      refuse(host);
+      const char *msg = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
+      (void)write(c, msg, strlen(msg));
+      _exit(0);
+    }
+    char portstr[16];
+    snprintf(portstr, sizeof portstr, "%d", port);
+    struct addrinfo hints, *res = 0;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_socktype = SOCK_STREAM;
+    int up = -1;
+    if (getaddrinfo(host, portstr, &hints, &res) == 0) {
+      for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        up = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (up < 0) continue;
+        if (connect(up, ai->ai_addr, ai->ai_addrlen) == 0) break;
+        close(up);
+        up = -1;
+      }
+      freeaddrinfo(res);
+    }
+    if (up < 0) {
+      const char *msg = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+      (void)write(c, msg, strlen(msg));
+      _exit(0);
+    }
+    const char *ok = "HTTP/1.1 200 Connection Established\r\n\r\n";
+    (void)write(c, ok, strlen(ok));
+    splice(c, up);
+    _exit(0);
+  }
+}
+EOF
+  "$cc" -o "$lib/proxy" "$lib/proxy.c" || return 1
+  if [[ -n ${EGRESS_PROXY_PID:-} ]]; then
+    kill "$EGRESS_PROXY_PID" 2>/dev/null || true
+  fi
+  # The previous invoke leaves a port file. A background redirect truncates it
+  # after the shell has already continued, so delete it before waiting.
+  rm -f "$lib/proxy.port"
+  "$lib/proxy" >"$lib/proxy.port" &
+  EGRESS_PROXY_PID=$!
+  local spins=0 port=
+  while [[ $spins -lt 50 ]]; do
+    if ! kill -0 "$EGRESS_PROXY_PID" 2>/dev/null; then
+      return 1
+    fi
+    if [[ -s $lib/proxy.port ]]; then
+      port=$(tr -d '[:space:]' <"$lib/proxy.port" || true)
+      if [[ $port =~ ^[0-9]+$ ]]; then
+        break
+      fi
+    fi
+    sleep 0.05
+    spins=$((spins + 1))
+  done
+  [[ ${port:-} =~ ^[0-9]+$ ]] || return 1
+  cat >"$lib/sandbox.sb" <<EOF
+(version 1)
+(allow default)
+(deny network-outbound)
+(allow network-outbound (remote tcp "localhost:${port}"))
+(allow network-outbound (remote udp "localhost:${port}"))
+EOF
+  export MONDAY_PROXY_PORT=$port
+  export MONDAY_SANDBOX_PROFILE=$lib/sandbox.sb
+}
+
+# GNU ps -g selects a session, not a process group. Peak RSS comes from wait4
+# so a fast allocation is still capped after it exits. There is no wall-clock
+# kill: cpu is CPU time, and an in-budget sleep must be allowed to finish.
 run_bounded_command() {
   local cpu=$1 memory=$2 command=$3
   local max_kb=$((memory * 1024))
-  local child pgid snapshot pid grp rss state total alive exceeded=0 spins=0
+  local child pgid snapshot pid grp rss state total alive exceeded=0
+  [[ -n ${MONDAY_MEASURE:-} && -x ${MONDAY_MEASURE} && -n ${MONDAY_RUNNER:-} ]] || return 125
+  export MONDAY_COMMAND=$command
+  rm -f "${MONDAY_PEAK_RSS:-}"
   set -m
   (
     ulimit -t $((cpu * 3600)) || exit 126
-    eval "$command"
-    wait
+    if [[ -n ${MONDAY_SANDBOX_PROFILE:-} ]]; then
+      exec sandbox-exec -f "$MONDAY_SANDBOX_PROFILE" "$MONDAY_MEASURE" /bin/bash "$MONDAY_RUNNER"
+    fi
+    exec "$MONDAY_MEASURE" /bin/bash "$MONDAY_RUNNER"
   ) &
   child=$!
   pgid=$(ps -o pgid= -p "$child" 2>/dev/null | tr -d ' ' || true)
   [[ $pgid =~ ^[0-9]+$ ]] || pgid=$child
   while :; do
-    snapshot=$(ps -ax -o pid=,pgid=,rss=,state=) || return 125
+    # ps can exit non-zero when a process disappears mid-scan. That is not
+    # proof the cap is unenforceable; the wait4 peak file still accounts.
+    snapshot=$(ps -ax -o pid=,pgid=,rss=,state= 2>/dev/null || true)
     total=0
     alive=0
     while read -r pid grp rss state; do
@@ -1174,13 +1513,7 @@ run_bounded_command() {
       exceeded=1
       break
     fi
-    spins=$((spins + 1))
-    if ((spins > 400)); then
-      kill -KILL -"$pgid" 2>/dev/null || kill_tree "$child"
-      wait "$child" 2>/dev/null || true
-      return 124
-    fi
-    sleep 0.05
+    sleep 0.2
   done
   if ((exceeded)); then
     wait "$child" 2>/dev/null || true
@@ -1188,6 +1521,26 @@ run_bounded_command() {
   fi
   local exit_status=0
   wait "$child" || exit_status=$?
+  if ((exit_status == 137)); then
+    return 137
+  fi
+  if ((exit_status == 126)); then
+    return 126
+  fi
+  [[ -n ${MONDAY_PEAK_RSS:-} && -s $MONDAY_PEAK_RSS ]] || return 125
+  local kind value
+  read -r kind value <"$MONDAY_PEAK_RSS" || return 125
+  if [[ $kind == bytes && $value =~ ^[0-9]+$ ]]; then
+    if (( value > max_kb * 1024 )); then
+      return 137
+    fi
+  elif [[ $kind == kb && $value =~ ^[0-9]+$ ]]; then
+    if (( value > max_kb )); then
+      return 137
+    fi
+  else
+    return 125
+  fi
   return "$exit_status"
 }
 
@@ -1242,6 +1595,10 @@ cmd_task_invoke() {
   }
   assert_resource_bounds_enforceable "$cpu" "$memory"
   install_egress_wrappers "$dir"
+  prepare_task_enforcement "$dir" || {
+    printf 'failed\n' >"$dir/phase"
+    fail egress_unenforceable
+  }
   printf 'command=%s\ncpu=%s\nmemory_mb=%s\n' "$command" "$cpu" "$memory" >>"$dir/command.log"
   rm -f "$dir/egress-refused"
   local exit_status=0
@@ -1267,6 +1624,13 @@ cmd_task_invoke() {
         printf 'failed\n' >"$dir/phase"
         fail secret_leaked
       fi
+    fi
+  fi
+  if [[ ! -s $dir/egress-refused && -f $dir/invocation.err ]] && grep -E -q 'nodename nor servname|Could not resolve host|Operation not permitted|CONNECT tunnel failed|Network is unreachable' "$dir/invocation.err"; then
+    local blocked_host
+    blocked_host=$(command_disallowed_host "$command" "$dir/allow_hosts" || true)
+    if [[ -n $blocked_host ]]; then
+      printf '%s\n' "$blocked_host" >"$dir/egress-refused"
     fi
   fi
   if [[ -s $dir/egress-refused ]]; then
