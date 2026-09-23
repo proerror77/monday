@@ -11,6 +11,9 @@ Current architecture and ADRs live in:
   for Research, Governance, Runtime and market-family ownership.
 - [Release-identity ADR](../architecture/ADR-0002-rust-lob-release-identities.md)
   for collector source, artifact and deployed identity.
+- [AX agent execution ADR](../architecture/ADR-0003-ax-agent-execution.md)
+  for the target agent platform, staged adoption and preserved Campaign authority;
+  use the [AX workflow](ax-workflow.md) for research and implementation handoffs.
 - [Research contracts](../research/) for Campaign workflows, evaluation,
   holding/accounting and training; use only the files relevant to the task.
 
