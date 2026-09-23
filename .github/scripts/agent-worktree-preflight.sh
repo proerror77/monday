@@ -361,10 +361,10 @@ cmd_apply() {
   local f other_owner other_branch other_pr other_files item other
   while IFS= read -r f; do
     [[ -n $f ]] || continue
-    other_owner=$(yaml_scalar owner "$f")
-    other_branch=$(yaml_scalar branch "$f")
-    other_pr=$(yaml_scalar pr "$f")
-    other_files=$(yaml_scalar allowed_files "$f")
+    other_owner=$(yaml_scalar owner "$f" || true)
+    other_branch=$(yaml_scalar branch "$f" || true)
+    other_pr=$(yaml_scalar pr "$f" || true)
+    other_files=$(yaml_scalar allowed_files "$f" || true)
     [[ $other_owner != "$writer" ]] || fail_apply writer_already_active
     [[ $other_branch != "$branch" ]] || fail_apply branch_already_leased
     [[ $(yaml_scalar worktree "$f") != "$wt" ]] || fail_apply worktree_already_leased
@@ -381,6 +381,9 @@ cmd_apply() {
       done
     done
   done < <(active_lease_files)
+  if task_contract_busy "$goal"; then
+    fail_apply writer_already_active
+  fi
 
   if [[ ! -d $wt ]]; then
     mkdir -p "$(dirname "$wt")"
@@ -913,6 +916,88 @@ contract_has_active_writer() {
   return 1
 }
 
+# Running and suspending tasks occupy the same contract as an active lease.
+# except is the task directory allowed to pass its own admission check.
+task_contract_busy() {
+  local contract=$1 except=${2:-} dir phase other
+  local store
+  store=$(task_store)
+  [[ -d $store ]] || return 1
+  for dir in "$store"/*; do
+    [[ -d $dir && -f $dir/task.yml && -f $dir/phase ]] || continue
+    [[ -z $except || $dir != "$except" ]] || continue
+    phase=$(tr -d '[:space:]' <"$dir/phase")
+    case $phase in
+      running | suspending) ;;
+      *) continue ;;
+    esac
+    other=$(yaml_scalar contract "$dir/task.yml" || true)
+    [[ $other == "$contract" ]] && return 0
+  done
+  return 1
+}
+
+worker_alive() {
+  local dir=$1 pid
+  [[ -f $dir/worker.pid ]] || return 1
+  pid=$(tr -d '[:space:]' <"$dir/worker.pid")
+  [[ $pid =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+stop_worker() {
+  local pid=$1 pgid self_pgid i
+  [[ $pid =~ ^[0-9]+$ && $pid != "$$" && $pid != 0 ]] || return 1
+  self_pgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ' || true)
+  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+  if [[ $pgid =~ ^[0-9]+$ && $pgid != 0 && $pgid != "$self_pgid" ]]; then
+    kill -TERM "-$pgid" 2>/dev/null || kill_tree "$pid"
+  else
+    kill -TERM "$pid" 2>/dev/null || true
+  fi
+  i=0
+  while kill -0 "$pid" 2>/dev/null && ((i < 40)); do
+    sleep 0.05
+    i=$((i + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    if [[ $pgid =~ ^[0-9]+$ && $pgid != 0 && $pgid != "$self_pgid" ]]; then
+      kill -KILL "-$pgid" 2>/dev/null || kill_tree "$pid"
+    else
+      kill_tree "$pid"
+    fi
+  fi
+  i=0
+  while kill -0 "$pid" 2>/dev/null && ((i < 20)); do
+    sleep 0.05
+    i=$((i + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    return 1
+  fi
+  return 0
+}
+
+# Returns 0 when this invoke still owns the phase and the write landed.
+# Returns 1 when pause already took the task. The lock is released either way.
+commit_task_phase() {
+  local dir=$1 next=$2 current
+  lease_lock_acquire
+  current=$(tr -d '[:space:]' <"$dir/phase")
+  case $current in
+    suspending | suspended)
+      lease_lock_release
+      return 1
+      ;;
+  esac
+  if [[ $next == suspended ]]; then
+    checkpoint_task_workspace "$dir"
+  fi
+  printf '%s\n' "$next" >"$dir/phase"
+  lease_lock_release
+  return 0
+}
+
 host_allowed() {
   local file=$1 host=$2 item
   local hosts
@@ -1042,16 +1127,53 @@ cmd_task_status() {
 cmd_task_suspend() {
   local agent_id=${1:-}
   [[ -n $agent_id ]] || fail missing_agent_id
-  local dir phase
+  local dir phase pid
   dir=$(task_dir "$agent_id")
   [[ -f $dir/phase ]] || fail agent_not_found
-  phase=$(cat "$dir/phase")
+  lease_lock_acquire
+  phase=$(tr -d '[:space:]' <"$dir/phase")
   case $phase in
-    pending | running | suspended) ;;
-    *) fail agent_not_suspendable ;;
+    running)
+      printf 'suspending\n' >"$dir/phase"
+      pid=
+      if [[ -f $dir/worker.pid ]]; then
+        pid=$(tr -d '[:space:]' <"$dir/worker.pid")
+      fi
+      lease_lock_release
+      if [[ ! $pid =~ ^[0-9]+$ ]]; then
+        lease_lock_acquire
+        printf 'running\n' >"$dir/phase"
+        lease_lock_release
+        fail pause_unconfirmed
+      fi
+      if kill -0 "$pid" 2>/dev/null; then
+        if ! stop_worker "$pid"; then
+          lease_lock_acquire
+          printf 'running\n' >"$dir/phase"
+          lease_lock_release
+          fail pause_unconfirmed
+        fi
+      fi
+      lease_lock_acquire
+      checkpoint_task_workspace "$dir"
+      printf 'suspended\n' >"$dir/phase"
+      lease_lock_release
+      printf 'verdict=ok\nagent_id=%s\nphase=suspended\n' "$agent_id"
+      return
+      ;;
+    suspending)
+      lease_lock_release
+      fail pause_unconfirmed
+      ;;
+    pending | suspended) ;;
+    *)
+      lease_lock_release
+      fail agent_not_suspendable
+      ;;
   esac
   checkpoint_task_workspace "$dir"
   printf 'suspended\n' >"$dir/phase"
+  lease_lock_release
   printf 'verdict=ok\nagent_id=%s\nphase=suspended\n' "$agent_id"
 }
 
@@ -1490,6 +1612,9 @@ run_bounded_command() {
     exec "$MONDAY_MEASURE" /bin/bash "$MONDAY_RUNNER"
   ) &
   child=$!
+  if [[ -n ${MONDAY_WORKER_PID_FILE:-} ]]; then
+    printf '%s\n' "$child" >"$MONDAY_WORKER_PID_FILE"
+  fi
   pgid=$(ps -o pgid= -p "$child" 2>/dev/null | tr -d ' ' || true)
   [[ $pgid =~ ^[0-9]+$ ]] || pgid=$child
   while :; do
@@ -1563,18 +1688,7 @@ cmd_task_invoke() {
   local dir phase contract
   dir=$(task_dir "$agent_id")
   [[ -f $dir/phase && -f $dir/task.yml ]] || fail agent_not_found
-  phase=$(cat "$dir/phase")
-  case $phase in
-    pending | suspended) ;;
-    running) fail agent_already_running ;;
-    failed) fail agent_failed ;;
-    *) fail agent_not_invocable ;;
-  esac
   contract=$(yaml_scalar contract "$dir/task.yml")
-  if contract_has_active_writer "$contract"; then
-    fail writer_already_active
-  fi
-  printf 'running\n' >"$dir/phase"
   materialize_task_workspace "$dir"
   local ws command cpu memory
   ws=$dir/workspace
@@ -1599,6 +1713,35 @@ cmd_task_invoke() {
     printf 'failed\n' >"$dir/phase"
     fail egress_unenforceable
   }
+  lease_lock_acquire
+  phase=$(tr -d '[:space:]' <"$dir/phase")
+  case $phase in
+    pending | suspended) ;;
+    running | suspending)
+      if worker_alive "$dir"; then
+        lease_lock_release
+        fail agent_already_running
+      fi
+      lease_lock_release
+      fail execution_unresolved
+      ;;
+    failed)
+      lease_lock_release
+      fail agent_failed
+      ;;
+    *)
+      lease_lock_release
+      fail agent_not_invocable
+      ;;
+  esac
+  if contract_has_active_writer "$contract" || task_contract_busy "$contract" "$dir"; then
+    lease_lock_release
+    fail writer_already_active
+  fi
+  printf '%s-%s\n' "$(date -u +"%Y%m%dT%H%M%SZ")" "$$" >"$dir/invocation.id"
+  rm -f "$dir/worker.pid"
+  printf 'running\n' >"$dir/phase"
+  lease_lock_release
   printf 'command=%s\ncpu=%s\nmemory_mb=%s\n' "$command" "$cpu" "$memory" >>"$dir/command.log"
   rm -f "$dir/egress-refused"
   local exit_status=0
@@ -1612,6 +1755,7 @@ cmd_task_invoke() {
     export MONDAY_AGENT_ALLOW_FILE=$dir/allow_hosts
     export MONDAY_AGENT_EGRESS_REFUSED=$dir/egress-refused
     export PATH="$dir/bin:$PATH"
+    export MONDAY_WORKER_PID_FILE=$dir/worker.pid
     run_bounded_command "$cpu" "$memory" "$command"
   ) >>"$dir/invocation.log" 2>>"$dir/invocation.err"
   exit_status=$?
@@ -1621,7 +1765,10 @@ cmd_task_invoke() {
     secret=$(cat "$dir/model.secret")
     if [[ -n $secret ]]; then
       if grep -F -q -- "$secret" "$dir/task.yml" "$dir/command.log" "$dir/invocation.log" "$dir/invocation.err" 2>/dev/null; then
-        printf 'failed\n' >"$dir/phase"
+        commit_task_phase "$dir" failed || {
+          printf 'verdict=ok\nagent_id=%s\nphase=%s\n' "$agent_id" "$(tr -d '[:space:]' <"$dir/phase")"
+          return 0
+        }
         fail secret_leaked
       fi
     fi
@@ -1634,28 +1781,45 @@ cmd_task_invoke() {
     fi
   fi
   if [[ -s $dir/egress-refused ]]; then
-    printf 'failed\n' >"$dir/phase"
+    commit_task_phase "$dir" failed || {
+      printf 'verdict=ok\nagent_id=%s\nphase=%s\n' "$agent_id" "$(tr -d '[:space:]' <"$dir/phase")"
+      return 0
+    }
     fail host_not_allowed
   fi
   if ((exit_status == 137)); then
-    printf 'failed\n' >"$dir/phase"
+    commit_task_phase "$dir" failed || {
+      printf 'verdict=ok\nagent_id=%s\nphase=%s\n' "$agent_id" "$(tr -d '[:space:]' <"$dir/phase")"
+      return 0
+    }
     fail memory_exceeded
   fi
   if ((exit_status == 125)); then
-    printf 'failed\n' >"$dir/phase"
+    commit_task_phase "$dir" failed || {
+      printf 'verdict=ok\nagent_id=%s\nphase=%s\n' "$agent_id" "$(tr -d '[:space:]' <"$dir/phase")"
+      return 0
+    }
     fail memory_bound_unenforceable
   fi
   if ((exit_status == 126)); then
-    printf 'failed\n' >"$dir/phase"
+    commit_task_phase "$dir" failed || {
+      printf 'verdict=ok\nagent_id=%s\nphase=%s\n' "$agent_id" "$(tr -d '[:space:]' <"$dir/phase")"
+      return 0
+    }
     fail cpu_bound_unenforceable
   fi
   if ((exit_status != 0)); then
-    printf 'failed\n' >"$dir/phase"
+    commit_task_phase "$dir" failed || {
+      printf 'verdict=ok\nagent_id=%s\nphase=%s\n' "$agent_id" "$(tr -d '[:space:]' <"$dir/phase")"
+      return 0
+    }
     printf 'verdict=blocked\nreason=command_failed\nagent_id=%s\nphase=failed\n' "$agent_id" >&2
     return "$exit_status"
   fi
-  checkpoint_task_workspace "$dir"
-  printf 'suspended\n' >"$dir/phase"
+  commit_task_phase "$dir" suspended || {
+    printf 'verdict=ok\nagent_id=%s\nphase=%s\n' "$agent_id" "$(tr -d '[:space:]' <"$dir/phase")"
+    return 0
+  }
   printf 'verdict=ok\nagent_id=%s\nphase=suspended\ncpu=%s\nmemory_mb=%s\nworkspace=%s\n' \
     "$agent_id" "$cpu" "$memory" "$ws"
 }
