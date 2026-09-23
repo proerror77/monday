@@ -113,13 +113,23 @@ dry-run does not start a process or change the execution count. It requires an
 active unexpired lease, verifies the admitted packet and current worktree/
 branch/base, and refuses `grok`/`human` seats or trading gates other than `none`
 or `fail-closed`. It does not call Cursor Cloud or Codex HTTP APIs, and it does
-not schedule ACK Jobs. `task-declare`, `task-invoke`, `task-suspend`,
-`task-status`, and `task-egress` are the on-demand actor path: the
-workspace is materialized before the command, suspend checkpoints that
-workspace, and a later invoke of the same agent id restores it. Egress
-is an allowlist. Model secrets stay in `model.secret`, not in the task
-body, command, or logs. An active lease on the same contract refuses
-the invoke. This path does not submit orders or change risk limits.
+not schedule ACK Jobs.
+
+`task-declare`, `task-invoke`, `task-suspend`, `task-status`, and `task-egress`
+are the current local task prototype, not a deployed AX controller. Invoke
+materializes workspace files and executes a command. Its checkpoint restores
+files before re-executing the command; it does not restore process memory or an
+LLM session. At the AX research baseline, `task-suspend` copies files and changes
+phase without stopping the worker, and task admission does not atomically
+exclude other tasks. Do not use that phase as proof of quiescence or safe
+ownership release. Egress wrappers and RSS checks are not a portable sandbox.
+Model secrets belong outside task text, commands, logs and checkpoints. Checking
+for a leak after execution is not proof of secret containment.
+
+Use the [AX workflow](ax-workflow.md) and
+[adoption ADR](../architecture/ADR-0003-ax-agent-execution.md) for the replacement
+contract and evidence required to retire this prototype. Keep engineering task
+execution separate from Campaign admission and trading authority.
 
 ### Machine packet and execution evidence
 
