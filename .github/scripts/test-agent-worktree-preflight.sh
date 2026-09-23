@@ -484,7 +484,7 @@ workspace_repo_name: fixture
 workspace_repo_path: $repo_src
 workspace_tool_name: skill
 workspace_tool_endpoint: file:///fixture-skill
-command: bash -c 'x=$(printf "%48000000s" ""); sleep 1'
+command: bash -c 'x=\$(printf "%80000000s" ""); printf "%s" \${#x}'
 EOF
 "$gate" task-declare --file "$fixture/mem-task.yml" >/dev/null
 mem_out=$("$gate" task-invoke mem-agent 2>&1 || true)
@@ -493,6 +493,30 @@ grep -qx 'reason=memory_exceeded' <<<"$mem_out" || {
   exit 1
 }
 ! grep -qx 'verdict=ok' <<<"$mem_out"
+
+cat >"$fixture/sleep-task.yml" <<EOF
+schema: monday.agent_task.v1
+agent_id: sleep-agent
+contract: sleep-contract
+cpu: 1
+memory_mb: 256
+allow_hosts: github.com
+model_provider: fixture-provider
+model_secret_file: $secret_file
+workspace_repo_name: fixture
+workspace_repo_path: $repo_src
+workspace_tool_name: skill
+workspace_tool_endpoint: file:///fixture-skill
+command: sleep 40
+EOF
+"$gate" task-declare --file "$fixture/sleep-task.yml" >/dev/null
+sleep_out=$("$gate" task-invoke sleep-agent)
+grep -qx 'verdict=ok' <<<"$sleep_out" || {
+  printf 'in-budget sleep failed:\n%s\n' "$sleep_out" >&2
+  exit 1
+}
+grep -qx 'phase=suspended' <<<"$sleep_out"
+grep -qx 'suspended' "$fixture/.git/agent-tasks/sleep-agent/phase"
 
 cat >"$fixture/net-task.yml" <<EOF
 schema: monday.agent_task.v1
@@ -522,6 +546,60 @@ grep -qx 'reason=host_not_allowed' <<<"$net_out" || {
 ! grep -q '200' <<<"$net_out"
 [[ $net_status != 77 ]]
 grep -qx 'example.com' "$fixture/.git/agent-tasks/net-agent/egress-refused"
+! grep -q '200' "$fixture/.git/agent-tasks/net-agent/invocation.log" "$fixture/.git/agent-tasks/net-agent/invocation.err"
+
+if [[ -x /usr/bin/curl ]]; then
+  cat >"$fixture/abs-curl.yml" <<EOF
+schema: monday.agent_task.v1
+agent_id: abs-curl-agent
+contract: abs-curl-contract
+cpu: 1
+memory_mb: 256
+allow_hosts: github.com
+model_provider: fixture-provider
+model_secret_file: $secret_file
+workspace_repo_name: fixture
+workspace_repo_path: $repo_src
+workspace_tool_name: skill
+workspace_tool_endpoint: file:///fixture-skill
+command: /usr/bin/curl -sS -o /dev/null -w '%{http_code}' --max-time 15 https://example.com
+EOF
+  "$gate" task-declare --file "$fixture/abs-curl.yml" >/dev/null
+  set +e
+  abs_out=$("$gate" task-invoke abs-curl-agent 2>&1)
+  abs_status=$?
+  set -e
+  grep -qx 'reason=host_not_allowed' <<<"$abs_out" || {
+    printf 'absolute curl was not refused status=%s:\n%s\n' "$abs_status" "$abs_out" >&2
+    printf 'log:\n%s\n' "$(cat "$fixture/.git/agent-tasks/abs-curl-agent/invocation.log" "$fixture/.git/agent-tasks/abs-curl-agent/invocation.err" 2>/dev/null)" >&2
+    exit 1
+  }
+  [[ $abs_status != 77 ]]
+  ! grep -q '200' "$fixture/.git/agent-tasks/abs-curl-agent/invocation.log" "$fixture/.git/agent-tasks/abs-curl-agent/invocation.err"
+fi
+
+cat >"$fixture/two-url.yml" <<EOF
+schema: monday.agent_task.v1
+agent_id: two-url-agent
+contract: two-url-contract
+cpu: 1
+memory_mb: 256
+allow_hosts: github.com
+model_provider: fixture-provider
+model_secret_file: $secret_file
+workspace_repo_name: fixture
+workspace_repo_path: $repo_src
+workspace_tool_name: skill
+workspace_tool_endpoint: file:///fixture-skill
+command: curl -sS -o /dev/null -w '%{url_effective} %{http_code}\\n' --max-time 15 https://example.com https://github.com
+EOF
+"$gate" task-declare --file "$fixture/two-url.yml" >/dev/null
+two_out=$("$gate" task-invoke two-url-agent 2>&1 || true)
+grep -qx 'reason=host_not_allowed' <<<"$two_out" || {
+  printf 'multi-url curl was not refused:\n%s\n' "$two_out" >&2
+  exit 1
+}
+! grep -q 'example.com/ 200' "$fixture/.git/agent-tasks/two-url-agent/invocation.log" "$fixture/.git/agent-tasks/two-url-agent/invocation.err"
 
 cat >"$fixture/leak-task.yml" <<EOF
 schema: monday.agent_task.v1
