@@ -87,6 +87,7 @@ members = [
     "alpha-harness/app",
 
     # Applications
+    "apps/agent-control",
     "apps/live",
     "apps/all-in-one",
     "apps/binance-md",
