@@ -666,4 +666,119 @@ EOF
   [[ ! -s $fixture/.git/agent-tasks/missing-tool-agent/egress-refused ]]
 fi
 
+cat >"$fixture/shared-task.yml" <<EOF
+schema: monday.agent_task.v1
+agent_id: shared-agent
+contract: shared-contract
+cpu: 1
+memory_mb: 256
+allow_hosts: github.com
+model_provider: fixture-provider
+model_secret_file: $secret_file
+workspace_repo_name: fixture
+workspace_repo_path: $repo_src
+workspace_tool_name: skill
+workspace_tool_endpoint: file:///fixture-skill
+command: sh -c 'echo start >> "\$MONDAY_AGENT_WORKSPACE/starts"; sleep 15'
+EOF
+"$gate" task-declare --file "$fixture/shared-task.yml" >/dev/null
+"$gate" task-invoke shared-agent >"$fixture/shared.out" 2>&1 &
+shared_pid=$!
+shared_dir="$fixture/.git/agent-tasks/shared-agent"
+for ((i=0; i<200; i++)); do
+  [[ -s $shared_dir/worker.pid && -s $shared_dir/workspace/starts ]] && break
+  sleep 0.05
+done
+[[ -s $shared_dir/worker.pid && -s $shared_dir/workspace/starts ]]
+[[ $(wc -l <"$shared_dir/workspace/starts" | tr -d ' ') == 1 ]]
+same_out=$("$gate" task-invoke shared-agent 2>&1 || true)
+grep -qx 'reason=agent_already_running' <<<"$same_out" || {
+  printf 'second invoke was not refused:\n%s\n' "$same_out" >&2
+  exit 1
+}
+cat >"$fixture/shared-other.yml" <<EOF
+schema: monday.agent_task.v1
+agent_id: shared-other
+contract: shared-contract
+cpu: 1
+memory_mb: 256
+allow_hosts: github.com
+model_provider: fixture-provider
+model_secret_file: $secret_file
+workspace_repo_name: fixture
+workspace_repo_path: $repo_src
+workspace_tool_name: skill
+workspace_tool_endpoint: file:///fixture-skill
+command: echo other
+EOF
+"$gate" task-declare --file "$fixture/shared-other.yml" >/dev/null
+other_out=$("$gate" task-invoke shared-other 2>&1 || true)
+grep -qx 'reason=writer_already_active' <<<"$other_out" || {
+  printf 'same-contract task was not refused:\n%s\n' "$other_out" >&2
+  exit 1
+}
+write_packet "$fixture/shared-lease.yml" grok cursor/shared-lease docs/shared.md
+sed -i.bak 's|goal: test lease cursor/shared-lease|goal: shared-contract|' "$fixture/shared-lease.yml"
+lease_block=$("$gate" apply --packet-file "$fixture/shared-lease.yml" 2>&1 || true)
+grep -qx 'reason=writer_already_active' <<<"$lease_block" || {
+  printf 'running task did not block lease:\n%s\n' "$lease_block" >&2
+  exit 1
+}
+shared_worker=$(tr -d '[:space:]' <"$shared_dir/worker.pid")
+"$gate" task-suspend shared-agent >"$fixture/shared-suspend.out"
+grep -qx 'phase=suspended' <<<"$(cat "$fixture/shared-suspend.out")"
+[[ $(tr -d '[:space:]' <"$shared_dir/phase") == suspended ]]
+if kill -0 "$shared_worker" 2>/dev/null; then
+  printf 'pause left worker %s running\n' "$shared_worker" >&2
+  exit 1
+fi
+[[ $(wc -l <"$shared_dir/workspace/starts" | tr -d ' ') == 1 ]]
+wait "$shared_pid" || true
+
+cat >"$fixture/crash-task.yml" <<EOF
+schema: monday.agent_task.v1
+agent_id: crash-agent
+contract: crash-contract
+cpu: 1
+memory_mb: 256
+allow_hosts: github.com
+model_provider: fixture-provider
+model_secret_file: $secret_file
+workspace_repo_name: fixture
+workspace_repo_path: $repo_src
+workspace_tool_name: skill
+workspace_tool_endpoint: file:///fixture-skill
+command: sh -c 'echo start >> "\$MONDAY_AGENT_WORKSPACE/starts"; sleep 15'
+EOF
+"$gate" task-declare --file "$fixture/crash-task.yml" >/dev/null
+"$gate" task-invoke crash-agent >"$fixture/crash.out" 2>&1 &
+crash_pid=$!
+crash_dir="$fixture/.git/agent-tasks/crash-agent"
+for ((i=0; i<200; i++)); do
+  [[ -s $crash_dir/worker.pid && -s $crash_dir/workspace/starts ]] && break
+  sleep 0.05
+done
+[[ -s $crash_dir/worker.pid && -s $crash_dir/workspace/starts ]]
+crash_worker=$(tr -d '[:space:]' <"$crash_dir/worker.pid")
+crash_pgid=$(ps -o pgid= -p "$crash_worker" 2>/dev/null | tr -d ' ' || true)
+kill -KILL "$crash_pid" 2>/dev/null || true
+if [[ $crash_pgid =~ ^[0-9]+$ && $crash_pgid != 0 ]]; then
+  kill -KILL "-$crash_pgid" 2>/dev/null || true
+fi
+kill -KILL "$crash_worker" 2>/dev/null || true
+for ((i=0; i<40; i++)); do
+  if ! kill -0 "$crash_pid" 2>/dev/null && ! kill -0 "$crash_worker" 2>/dev/null; then
+    break
+  fi
+  sleep 0.05
+done
+retry_out=$("$gate" task-invoke crash-agent 2>&1 || true)
+grep -qx 'reason=execution_unresolved' <<<"$retry_out" || {
+  printf 'crashed invoke was repeated:\n%s\n' "$retry_out" >&2
+  exit 1
+}
+[[ $(wc -l <"$crash_dir/workspace/starts" | tr -d ' ') == 1 ]]
+[[ $(tr -d '[:space:]' <"$crash_dir/phase") == running ]]
+wait "$crash_pid" 2>/dev/null || true
+
 printf 'agent worktree preflight tests passed\n'
