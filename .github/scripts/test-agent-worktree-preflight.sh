@@ -777,8 +777,14 @@ grep -qx 'reason=execution_unresolved' <<<"$retry_out" || {
   printf 'crashed invoke was repeated:\n%s\n' "$retry_out" >&2
   exit 1
 }
-[[ $(wc -l <"$crash_dir/workspace/starts" | tr -d ' ') == 1 ]]
-[[ $(tr -d '[:space:]' <"$crash_dir/phase") == running ]]
+[[ $(wc -l <"$crash_dir/workspace/starts" | tr -d ' ') == 1 ]] || {
+  printf 'crash starts not 1\n' >&2
+  exit 1
+}
+[[ $(tr -d '[:space:]' <"$crash_dir/phase") == running ]] || {
+  printf 'crash phase is %s\n' "$(cat "$crash_dir/phase" 2>/dev/null || true)" >&2
+  exit 1
+}
 wait "$crash_pid" 2>/dev/null || true
 
 write_slice() {
@@ -814,8 +820,14 @@ schema: monday.agent_task_batch.v1
 batch_id: split-1
 tasks: $fixture/slice-a.yml,$fixture/slice-b.yml
 EOF
-batch_out=$("$gate" task-batch run --file "$fixture/batch-split.yml")
-grep -qx 'batch_id=split-1' <<<"$batch_out"
+batch_out=$("$gate" task-batch run --file "$fixture/batch-split.yml") || {
+  printf 'split batch failed:\n%s\n' "$batch_out" >&2
+  exit 1
+}
+grep -qx 'batch_id=split-1' <<<"$batch_out" || {
+  printf 'split batch output:\n%s\n' "$batch_out" >&2
+  exit 1
+}
 for agent in slice-a slice-b; do
   receipt="$fixture/.git/agent-tasks/$agent/receipt"
   grep -qx 'verdict=ok' "$receipt"
@@ -832,6 +844,50 @@ grep -qx 'consumed=2' "$fixture/.git/agent-tasks/slice-a/receipt"
 shown=$("$gate" task-batch show --batch split-1)
 grep -qx 'agent_id=slice-a' <<<"$shown"
 grep -qx 'agent_id=slice-b' <<<"$shown"
+
+write_slice "$fixture/durable-fast.yml" durable-fast contract-durable-fast docs/durable-fast.md 2 2199-01-01T00:00:00Z none none \
+  'echo fast > "$MONDAY_AGENT_WORKSPACE/marker"'
+write_slice "$fixture/durable-slow.yml" durable-slow contract-durable-slow docs/durable-slow.md 2 2199-01-01T00:00:00Z none none \
+  'echo start >> "$MONDAY_AGENT_WORKSPACE/starts"; sleep 20'
+cat >"$fixture/batch-durable.yml" <<EOF
+schema: monday.agent_task_batch.v1
+batch_id: durable-1
+tasks: $fixture/durable-fast.yml,$fixture/durable-slow.yml
+EOF
+"$gate" task-batch run --file "$fixture/batch-durable.yml" >"$fixture/durable-run.out" 2>&1 &
+durable_pid=$!
+durable_slow="$fixture/.git/agent-tasks/durable-slow"
+durable_fast="$fixture/.git/agent-tasks/durable-fast"
+for ((i=0; i<600; i++)); do
+  [[ -s $durable_fast/receipt && -s $durable_slow/worker.pid && -s $durable_slow/workspace/starts ]] && break
+  sleep 0.05
+done
+if [[ ! -s $durable_fast/receipt || ! -s $durable_slow/workspace/starts ]]; then
+  printf 'durable batch did not reach a recoverable point\n' >&2
+  printf 'fast receipt:\n' >&2
+  cat "$durable_fast/receipt" >&2 2>/dev/null || true
+  printf 'slow phase:\n' >&2
+  cat "$durable_slow/phase" >&2 2>/dev/null || true
+  printf 'batch agents:\n' >&2
+  cat "$fixture/.git/agent-task-batches/durable-1/agents" >&2 2>/dev/null || true
+  printf 'run output:\n' >&2
+  cat "$fixture/durable-run.out" >&2 2>/dev/null || true
+  exit 1
+fi
+kill -KILL "$durable_pid" 2>/dev/null || true
+wait "$durable_pid" 2>/dev/null || true
+rm -f "$fixture/.git/agent-task-batches/durable-1/receipt"
+recovered=$("$gate" task-batch show --batch durable-1)
+grep -qx 'verdict=open' <<<"$recovered"
+grep -qx 'reason=still_running' <<<"$recovered"
+grep -qx 'agent_id=durable-fast' <<<"$recovered"
+grep -qx 'consumed=1' "$durable_fast/receipt"
+[[ $(wc -l <"$durable_slow/workspace/starts" | tr -d ' ') == 1 ]]
+"$gate" task-batch run --file "$fixture/batch-durable.yml" >"$fixture/durable-rerun.out"
+[[ $(wc -l <"$durable_slow/workspace/starts" | tr -d ' ') == 1 ]]
+grep -qx 'consumed=1' "$durable_fast/receipt"
+[[ $(tr -d '[:space:]' <"$durable_slow/phase") == running ]]
+"$gate" task-suspend durable-slow >/dev/null
 
 write_slice "$fixture/slice-hold.yml" slice-hold contract-hold docs/hold 2 2199-01-01T00:00:00Z none none \
   'echo start >> "$MONDAY_AGENT_WORKSPACE/starts"; sleep 15'
