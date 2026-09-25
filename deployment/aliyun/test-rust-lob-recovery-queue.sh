@@ -94,7 +94,7 @@ SYNC
 (
   ISOLATION_MARKER="$fixture/isolation.json"
   MARKET=spot
-  # shellcheck disable=SC2329 # Called indirectly by drain_market if the guard regresses.
+  # shellcheck disable=SC2317,SC2329 # Called indirectly by drain_market if the guard regresses.
   drain_lock() { printf 'drain reached an unfinished isolation\n' >&2; exit 1; }
   printf '{}\n' >"$ISOLATION_MARKER"
   drain_market
