@@ -920,6 +920,16 @@ done
 [[ $pending -eq 2 ]]
 kill -KILL "$cap_pid" 2>/dev/null || true
 wait "$cap_pid" 2>/dev/null || true
+"$gate" task-batch run --file "$fixture/batch-cap.yml" >"$fixture/cap-rerun.out" 2>&1 &
+cap_rerun=$!
+sleep 1
+rerun_started=0
+for n in 1 2 3; do
+  [[ -s $fixture/.git/agent-tasks/cap-$n/workspace/starts ]] && rerun_started=$((rerun_started + 1))
+done
+[[ $rerun_started -eq 1 ]]
+kill -KILL "$cap_rerun" 2>/dev/null || true
+wait "$cap_rerun" 2>/dev/null || true
 for n in 1 2 3; do
   if [[ -s $fixture/.git/agent-tasks/cap-$n/worker.pid ]]; then
     cap_worker=$(tr -d '[:space:]' <"$fixture/.git/agent-tasks/cap-$n/worker.pid")
@@ -928,6 +938,34 @@ for n in 1 2 3; do
     fi
   fi
 done
+
+write_slice "$fixture/refill-slow.yml" refill-slow contract-refill-slow docs/refill-slow.md 1 2199-01-01T00:00:00Z none none \
+  'echo start >> "$MONDAY_AGENT_WORKSPACE/starts"; sleep 20'
+write_slice "$fixture/refill-fast.yml" refill-fast contract-refill-fast docs/refill-fast.md 1 2199-01-01T00:00:00Z none none \
+  'echo fast > "$MONDAY_AGENT_WORKSPACE/marker"'
+write_slice "$fixture/refill-next.yml" refill-next contract-refill-next docs/refill-next.md 1 2199-01-01T00:00:00Z none none \
+  'echo start >> "$MONDAY_AGENT_WORKSPACE/starts"'
+cat >"$fixture/batch-refill.yml" <<EOF
+schema: monday.agent_task_batch.v1
+batch_id: refill-1
+concurrency: 2
+tasks: $fixture/refill-slow.yml,$fixture/refill-fast.yml,$fixture/refill-next.yml
+EOF
+"$gate" task-batch run --file "$fixture/batch-refill.yml" >"$fixture/refill-run.out" 2>&1 &
+refill_pid=$!
+for ((i=0; i<400; i++)); do
+  slow_phase=
+  if [[ -f $fixture/.git/agent-tasks/refill-slow/phase ]]; then
+    slow_phase=$(tr -d '[:space:]' <"$fixture/.git/agent-tasks/refill-slow/phase")
+  fi
+  [[ -s $fixture/.git/agent-tasks/refill-next/workspace/starts && $slow_phase == running ]] && break
+  sleep 0.05
+done
+[[ -s $fixture/.git/agent-tasks/refill-next/workspace/starts ]]
+[[ $(tr -d '[:space:]' <"$fixture/.git/agent-tasks/refill-slow/phase") == running ]]
+kill -KILL "$refill_pid" 2>/dev/null || true
+wait "$refill_pid" 2>/dev/null || true
+"$gate" task-suspend refill-slow >/dev/null || true
 
 write_slice "$fixture/slice-hold.yml" slice-hold contract-hold docs/hold 2 2199-01-01T00:00:00Z none none \
   'echo start >> "$MONDAY_AGENT_WORKSPACE/starts"; sleep 15'
