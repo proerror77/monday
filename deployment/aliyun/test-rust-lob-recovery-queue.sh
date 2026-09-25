@@ -49,6 +49,61 @@ fixture=$(readlink -f -- "$(mktemp -d)")
 trap 'rm -rf -- "$fixture"' EXIT
 # shellcheck disable=SC1090,SC1091
 . "$RECOVERY"
+# Model Ubuntu's two installed implementations: an unqualified uutils sync
+# must never receive a durability operation; GNU receives exactly the paths.
+(
+  mkdir -p "$fixture/sync-bin"
+  cat >"$fixture/sync-bin/gnusync" <<'SYNC'
+#!/bin/sh
+if [ "$1" = --version ]; then
+  printf 'sync (GNU coreutils) 9.7\n'
+else
+  printf '%s\n' "$@" >"$SYNC_CALLS"
+fi
+SYNC
+  cat >"$fixture/sync-bin/sync" <<'SYNC'
+#!/bin/sh
+if [ "$1" = --version ]; then
+  printf 'sync (uutils coreutils) 0.8.0\n'
+else
+  : >"$SYNC_GLOBAL_CALLED"
+fi
+SYNC
+  chmod +x "$fixture/sync-bin/gnusync" "$fixture/sync-bin/sync"
+  export SYNC_CALLS="$fixture/sync.calls" SYNC_GLOBAL_CALLED="$fixture/global-sync"
+  # shellcheck disable=SC2123 # Deliberately exclude the host tools for this fixture.
+  PATH="$fixture/sync-bin"
+  recovery_sync_path '/spool with spaces/job.json' /spool
+  [[ ! -e $SYNC_GLOBAL_CALLED ]]
+  PATH_SAVE=$PATH
+  PATH=/usr/bin:/bin
+  printf '%s\n' -- '/spool with spaces/job.json' /spool >"$fixture/expected-sync.calls"
+  cmp "$SYNC_CALLS" "$fixture/expected-sync.calls"
+  rm "$fixture/sync-bin/gnusync"
+  PATH=$PATH_SAVE
+  if recovery_sync_path /spool; then
+    printf 'recovery accepted global uutils sync semantics\n' >&2; exit 1
+  fi
+  [[ ! -e $SYNC_GLOBAL_CALLED ]]
+  if recovery_sync_path; then
+    printf 'recovery accepted a pathless flush\n' >&2; exit 1
+  fi
+)
+# A drain must leave an interrupted isolation untouched, even after its writer
+# has exited and released the queue lock. No recovery subprocess may start.
+(
+  ISOLATION_MARKER="$fixture/isolation.json"
+  MARKET=spot
+  # shellcheck disable=SC2317,SC2329 # Called indirectly by drain_market if the guard regresses.
+  drain_lock() { printf 'drain reached an unfinished isolation\n' >&2; exit 1; }
+  printf '{}\n' >"$ISOLATION_MARKER"
+  drain_market
+  rm "$ISOLATION_MARKER"
+  ln -s "$fixture/missing-marker-target" "$ISOLATION_MARKER"
+  drain_market
+  rm "$ISOLATION_MARKER"
+)
+printf 'Path-scoped durability and unfinished-isolation drain exclusion passed\n'
 JOB_ID='fixture-spot'
 MARKET=spot
 JOB_RELEASE_SHA256=$(printf '%064d' 1)
