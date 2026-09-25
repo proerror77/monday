@@ -23,6 +23,9 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 fail() {
+  if [[ -n ${TASK_RECEIPT_DIR:-} && -f ${TASK_RECEIPT_DIR}/task.yml ]]; then
+    write_task_receipt "$TASK_RECEIPT_DIR" blocked "$1"
+  fi
   printf 'verdict=blocked\nreason=%s\n' "$1"
   exit 1
 }
@@ -383,6 +386,10 @@ cmd_apply() {
   done < <(active_lease_files)
   if task_contract_busy "$goal"; then
     fail_apply writer_already_active
+  fi
+  local task_block
+  if task_block=$(running_task_conflict "" "$goal" "$branch" "$pr" "$allowed"); then
+    fail_apply "$task_block"
   fi
 
   if [[ ! -d $wt ]]; then
@@ -937,6 +944,123 @@ task_contract_busy() {
   return 1
 }
 
+comma_overlaps() {
+  local left=$1 right=$2 item other
+  [[ -n $left && -n $right ]] || return 1
+  local IFS=,
+  local -a left_arr right_arr
+  read -r -a left_arr <<<"$left"
+  read -r -a right_arr <<<"$right"
+  for item in "${left_arr[@]}"; do
+    item=${item#"${item%%[![:space:]]*}"}
+    item=${item%"${item##*[![:space:]]}"}
+    [[ -n $item ]] || continue
+    for other in "${right_arr[@]}"; do
+      other=${other#"${other%%[![:space:]]*}"}
+      other=${other%"${other##*[![:space:]]}"}
+      [[ -n $other ]] || continue
+      if paths_overlap "$item" "$other"; then
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+scope_conflict_reason() {
+  local self_contract=$1 self_branch=$2 self_pr=$3 self_files=$4
+  local other_contract=$5 other_branch=$6 other_pr=$7 other_files=$8
+  [[ -z $self_branch ]] && self_branch=none
+  [[ -z $other_branch ]] && other_branch=none
+  [[ -z $self_pr ]] && self_pr=none
+  [[ -z $other_pr ]] && other_pr=none
+  if [[ $self_contract == "$other_contract" ]]; then
+    printf 'writer_already_active\n'
+    return 0
+  fi
+  if [[ $self_branch != none && $self_branch == "$other_branch" ]]; then
+    printf 'branch_already_active\n'
+    return 0
+  fi
+  if [[ $self_pr != none && $self_pr == "$other_pr" ]]; then
+    printf 'pr_already_active\n'
+    return 0
+  fi
+  if comma_overlaps "$self_files" "$other_files"; then
+    printf 'allowed_files_overlap\n'
+    return 0
+  fi
+  return 1
+}
+
+# except_dir skips the task being admitted. contract/branch/pr/files describe
+# the candidate, which may be a task or a lease packet.
+running_task_conflict() {
+  local except_dir=$1 contract=$2 branch=$3 pr=$4 files=$5
+  local store dir phase other_contract other_branch other_pr other_files reason
+  store=$(task_store)
+  [[ -d $store ]] || return 1
+  for dir in "$store"/*; do
+    [[ -d $dir && -f $dir/task.yml && -f $dir/phase ]] || continue
+    [[ -z $except_dir || $dir != "$except_dir" ]] || continue
+    phase=$(tr -d '[:space:]' <"$dir/phase")
+    case $phase in
+      running | suspending) ;;
+      *) continue ;;
+    esac
+    other_contract=$(yaml_scalar contract "$dir/task.yml" || true)
+    other_branch=$(yaml_scalar branch "$dir/task.yml" || true)
+    other_pr=$(yaml_scalar pr "$dir/task.yml" || true)
+    other_files=$(yaml_scalar allowed_files "$dir/task.yml" || true)
+    if reason=$(scope_conflict_reason "$contract" "$branch" "$pr" "$files" \
+      "$other_contract" "$other_branch" "$other_pr" "$other_files"); then
+      printf '%s\n' "$reason"
+      return 0
+    fi
+  done
+  return 1
+}
+
+task_consumed() {
+  local dir=$1
+  if [[ -f $dir/consumed ]]; then
+    tr -d '[:space:]' <"$dir/consumed"
+  else
+    printf '0\n'
+  fi
+}
+
+charge_task() {
+  local dir=$1 budget consumed
+  budget=$(yaml_scalar budget "$dir/task.yml" || true)
+  [[ $budget =~ ^[0-9]+$ ]] || return 0
+  consumed=$(task_consumed "$dir")
+  printf '%s\n' "$((consumed + 1))" >"$dir/consumed"
+}
+
+write_task_receipt() {
+  local dir=$1 verdict=$2 reason=${3:-}
+  [[ -f $dir/task.yml ]] || return 0
+  local agent contract deadline budget consumed phase invocation branch pr files
+  agent=$(yaml_scalar agent_id "$dir/task.yml" || true)
+  contract=$(yaml_scalar contract "$dir/task.yml" || true)
+  deadline=$(yaml_scalar deadline "$dir/task.yml" || true)
+  budget=$(yaml_scalar budget "$dir/task.yml" || true)
+  branch=$(yaml_scalar branch "$dir/task.yml" || true)
+  pr=$(yaml_scalar pr "$dir/task.yml" || true)
+  files=$(yaml_scalar allowed_files "$dir/task.yml" || true)
+  consumed=$(task_consumed "$dir")
+  phase=$(tr -d '[:space:]' <"$dir/phase" || true)
+  invocation=$( [[ -f $dir/invocation.id ]] && tr -d '[:space:]' <"$dir/invocation.id" || true )
+  {
+    printf 'verdict=%s\n' "$verdict"
+    [[ -n $reason ]] && printf 'reason=%s\n' "$reason"
+    printf 'agent_id=%s\ncontract=%s\ndeadline=%s\nbudget=%s\nconsumed=%s\nbranch=%s\npr=%s\nallowed_files=%s\ninvocation=%s\nphase=%s\n' \
+      "$agent" "$contract" "${deadline:-none}" "${budget:-none}" "$consumed" \
+      "${branch:-none}" "${pr:-none}" "$files" "$invocation" "$phase"
+  } >"$dir/receipt"
+}
+
 worker_alive() {
   local dir=$1 pid
   [[ -f $dir/worker.pid ]] || return 1
@@ -1074,7 +1198,19 @@ cmd_task_declare() {
   tool_name=$(yaml_scalar workspace_tool_name "$file") || fail missing_workspace_tool_name
   tool_endpoint=$(yaml_scalar workspace_tool_endpoint "$file") || fail missing_workspace_tool_endpoint
   secret_file=$(yaml_scalar model_secret_file "$file" || true)
+  local deadline budget branch pr files
+  deadline=$(yaml_scalar deadline "$file" || true)
+  budget=$(yaml_scalar budget "$file" || true)
+  branch=$(yaml_scalar branch "$file" || true)
+  pr=$(yaml_scalar pr "$file" || true)
+  files=$(yaml_list allowed_files "$file" | paste -sd ',' - || true)
+  [[ -n $deadline ]] || deadline=none
+  [[ -n $budget ]] || budget=none
+  [[ -n $branch ]] || branch=none
+  [[ -n $pr ]] || pr=none
   [[ $cpu =~ ^[0-9]+$ && $memory =~ ^[0-9]+$ ]] || fail invalid_resource_bounds
+  [[ $budget == none || $budget =~ ^[0-9]+$ ]] || fail invalid_budget
+  [[ $pr == none || $pr =~ ^[0-9]+$ ]] || fail invalid_pr
   [[ -n $hosts ]] || fail missing_allow_hosts
   if [[ -n $secret_file && -f $secret_file ]]; then
     local secret
@@ -1099,6 +1235,11 @@ workspace_repo_name: $repo_name
 workspace_repo_path: $repo_path
 workspace_tool_name: $tool_name
 workspace_tool_endpoint: $tool_endpoint
+deadline: $deadline
+budget: $budget
+branch: $branch
+pr: $pr
+allowed_files: $files
 command: $command
 EOF
   if [[ -n $secret_file && -f $secret_file ]]; then
@@ -1108,6 +1249,7 @@ EOF
     : >"$dir/model.secret"
   fi
   printf 'pending\n' >"$dir/phase"
+  printf '0\n' >"$dir/consumed"
   printf 'verdict=ok\nagent_id=%s\nphase=pending\n' "$agent_id"
 }
 
@@ -1118,10 +1260,13 @@ cmd_task_status() {
   dir=$(task_dir "$agent_id")
   [[ -f $dir/phase ]] || fail agent_not_found
   phase=$(cat "$dir/phase")
-  printf 'verdict=ok\nagent_id=%s\nphase=%s\ncpu=%s\nmemory_mb=%s\n' \
+  printf 'verdict=ok\nagent_id=%s\nphase=%s\ncpu=%s\nmemory_mb=%s\ndeadline=%s\nbudget=%s\nconsumed=%s\n' \
     "$agent_id" "$phase" \
     "$(yaml_scalar cpu "$dir/task.yml")" \
-    "$(yaml_scalar memory_mb "$dir/task.yml")"
+    "$(yaml_scalar memory_mb "$dir/task.yml")" \
+    "$(yaml_scalar deadline "$dir/task.yml" || echo none)" \
+    "$(yaml_scalar budget "$dir/task.yml" || echo none)" \
+    "$(task_consumed "$dir")"
 }
 
 cmd_task_suspend() {
@@ -1688,6 +1833,7 @@ cmd_task_invoke() {
   local dir phase contract
   dir=$(task_dir "$agent_id")
   [[ -f $dir/phase && -f $dir/task.yml ]] || fail agent_not_found
+  TASK_RECEIPT_DIR=$dir
   contract=$(yaml_scalar contract "$dir/task.yml")
   materialize_task_workspace "$dir"
   local ws command cpu memory
@@ -1734,13 +1880,41 @@ cmd_task_invoke() {
       fail agent_not_invocable
       ;;
   esac
-  if contract_has_active_writer "$contract" || task_contract_busy "$contract" "$dir"; then
+  local task_deadline task_budget task_branch task_pr task_files admission
+  task_deadline=$(yaml_scalar deadline "$dir/task.yml" || echo none)
+  task_budget=$(yaml_scalar budget "$dir/task.yml" || echo none)
+  task_branch=$(yaml_scalar branch "$dir/task.yml" || echo none)
+  task_pr=$(yaml_scalar pr "$dir/task.yml" || echo none)
+  task_files=$(yaml_scalar allowed_files "$dir/task.yml" || true)
+  if deadline_passed "$task_deadline"; then
     lease_lock_release
-    fail writer_already_active
+    fail deadline_passed
   fi
+  if [[ $task_budget =~ ^[0-9]+$ ]] && (( $(task_consumed "$dir") >= task_budget )); then
+    lease_lock_release
+    fail budget_exhausted
+  fi
+  if admission=$(running_task_conflict "$dir" "$contract" "$task_branch" "$task_pr" "$task_files"); then
+    lease_lock_release
+    fail "$admission"
+  fi
+  local lease_file lease_contract lease_branch lease_pr lease_files lease_reason
+  while IFS= read -r lease_file; do
+    [[ -n $lease_file ]] || continue
+    lease_contract=$(yaml_scalar contract "$lease_file" || true)
+    lease_branch=$(yaml_scalar branch "$lease_file" || true)
+    lease_pr=$(yaml_scalar pr "$lease_file" || true)
+    lease_files=$(yaml_scalar allowed_files "$lease_file" || true)
+    if lease_reason=$(scope_conflict_reason "$contract" "$task_branch" "$task_pr" "$task_files" \
+      "$lease_contract" "$lease_branch" "$lease_pr" "$lease_files"); then
+      lease_lock_release
+      fail "$lease_reason"
+    fi
+  done < <(active_lease_files)
   printf '%s-%s\n' "$(date -u +"%Y%m%dT%H%M%SZ")" "$$" >"$dir/invocation.id"
   rm -f "$dir/worker.pid"
   printf 'running\n' >"$dir/phase"
+  charge_task "$dir"
   lease_lock_release
   printf 'command=%s\ncpu=%s\nmemory_mb=%s\n' "$command" "$cpu" "$memory" >>"$dir/command.log"
   rm -f "$dir/egress-refused"
@@ -1817,15 +1991,109 @@ cmd_task_invoke() {
     return "$exit_status"
   fi
   commit_task_phase "$dir" suspended || {
+    write_task_receipt "$dir" ok
     printf 'verdict=ok\nagent_id=%s\nphase=%s\n' "$agent_id" "$(tr -d '[:space:]' <"$dir/phase")"
     return 0
   }
+  write_task_receipt "$dir" ok
   printf 'verdict=ok\nagent_id=%s\nphase=suspended\ncpu=%s\nmemory_mb=%s\nworkspace=%s\n' \
     "$agent_id" "$cpu" "$memory" "$ws"
 }
 
+cmd_task_batch() {
+  local action=${1:-}
+  [[ -n $action ]] || fail unknown_task_argument
+  shift
+  case "$action" in
+    run) task_batch_run "$@" ;;
+    show) task_batch_show "$@" ;;
+    *) fail unknown_task_argument ;;
+  esac
+}
+
+task_batch_dir() {
+  printf '%s/agent-task-batches/%s\n' "$(git_common)" "$1"
+}
+
+task_batch_run() {
+  local file=
+  while (($#)); do
+    case "$1" in
+      --file) file=$2; shift 2 ;;
+      *) fail unknown_task_argument ;;
+    esac
+  done
+  [[ -n $file && -f $file ]] || fail missing_task_file
+  local batch_id
+  batch_id=$(yaml_scalar batch_id "$file") || fail missing_batch_id
+  [[ $batch_id =~ ^[A-Za-z0-9._-]+$ ]] || fail invalid_batch_id
+  local -a task_files=()
+  local task_file
+  while IFS= read -r task_file; do
+    [[ -n $task_file ]] || continue
+    task_files+=("$task_file")
+  done < <(yaml_list tasks "$file")
+  [[ ${#task_files[@]} -gt 0 ]] || fail missing_batch_tasks
+  local batch_dir agent_id
+  batch_dir=$(task_batch_dir "$batch_id")
+  mkdir -p "$batch_dir"
+  : >"$batch_dir/agents"
+  for task_file in "${task_files[@]}"; do
+    [[ -f $task_file ]] || fail missing_task_file
+    agent_id=$(yaml_scalar agent_id "$task_file") || fail missing_agent_id
+    "$0" task-declare --file "$task_file" >"$batch_dir/$agent_id.declare"
+    printf '%s\n' "$agent_id" >>"$batch_dir/agents"
+  done
+  local -a pids=()
+  while IFS= read -r agent_id; do
+    [[ -n $agent_id ]] || continue
+    "$0" task-invoke "$agent_id" >"$batch_dir/$agent_id.invoke" 2>&1 &
+    pids+=("$!")
+  done <"$batch_dir/agents"
+  local pid
+  for pid in "${pids[@]}"; do
+    wait "$pid" || true
+  done
+  task_batch_write "$batch_id"
+}
+
+task_batch_show() {
+  local batch_id=
+  while (($#)); do
+    case "$1" in
+      --batch) batch_id=$2; shift 2 ;;
+      *) fail unknown_task_argument ;;
+    esac
+  done
+  [[ -n $batch_id ]] || fail missing_batch_id
+  local batch_dir
+  batch_dir=$(task_batch_dir "$batch_id")
+  [[ -f $batch_dir/receipt ]] || fail batch_not_found
+  cat "$batch_dir/receipt"
+}
+
+task_batch_write() {
+  local batch_id=$1 agent_id dir
+  local batch_dir
+  batch_dir=$(task_batch_dir "$batch_id")
+  {
+    printf 'verdict=ok\nbatch_id=%s\n' "$batch_id"
+    while IFS= read -r agent_id; do
+      [[ -n $agent_id ]] || continue
+      dir=$(task_dir "$agent_id")
+      printf 'slice_begin\n'
+      if [[ -f $dir/receipt ]]; then
+        cat "$dir/receipt"
+      else
+        printf 'verdict=blocked\nagent_id=%s\nreason=missing_receipt\n' "$agent_id"
+      fi
+      printf 'slice_end\n'
+    done <"$batch_dir/agents"
+  } | tee "$batch_dir/receipt"
+}
+
 usage() {
-  echo "usage: $0 check-managed|report|list|get|apply|release|spawn|sweep|task-declare|task-invoke|task-suspend|task-status|task-egress"
+  echo "usage: $0 check-managed|report|list|get|apply|release|spawn|sweep|task-declare|task-invoke|task-suspend|task-status|task-egress|task-batch"
 }
 
 case "${1:-help}" in
@@ -1842,6 +2110,7 @@ case "${1:-help}" in
   task-suspend) shift; cmd_task_suspend "$@" ;;
   task-status) shift; cmd_task_status "$@" ;;
   task-egress) shift; cmd_task_egress "$@" ;;
+  task-batch) shift; cmd_task_batch "$@" ;;
   help|--help|-h) usage ;;
   *) usage >&2; exit 2 ;;
 esac
