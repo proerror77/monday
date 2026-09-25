@@ -32,6 +32,10 @@ Kubernetes namespace/RBAC settings.
 
 ## Decision
 
+Historical record, not a current instruction. On 2026-09-25 Monday stopped
+this migration. Parallel agent slices use `task-batch`. The paragraph below
+is the 2026-09-23 evaluation decision and does not authorize more AX work.
+
 Adopt AX as the candidate execution platform for agent workloads through a
 bounded lab evaluation. Keep Monday's domain control planes and put a narrow
 Rust task adapter / runner between admitted work and AX. Reuse upstream runtime
