@@ -2015,6 +2015,39 @@ task_batch_dir() {
   printf '%s/agent-task-batches/%s\n' "$(git_common)" "$1"
 }
 
+task_slice_started() {
+  local dir=$1 phase
+  [[ -f $dir/phase ]] || return 1
+  phase=$(tr -d '[:space:]' <"$dir/phase")
+  [[ $phase != pending ]]
+}
+
+task_slice_body() {
+  local agent=$1 dir phase
+  dir=$(task_dir "$agent")
+  if [[ -f $dir/receipt ]]; then
+    cat "$dir/receipt"
+    return 0
+  fi
+  phase=pending
+  [[ -f $dir/phase ]] && phase=$(tr -d '[:space:]' <"$dir/phase")
+  case $phase in
+    running | suspending)
+      if worker_alive "$dir"; then
+        printf 'verdict=open\nreason=still_running\nagent_id=%s\nphase=%s\n' "$agent" "$phase"
+      else
+        printf 'verdict=blocked\nreason=execution_unresolved\nagent_id=%s\nphase=%s\n' "$agent" "$phase"
+      fi
+      ;;
+    pending)
+      printf 'verdict=open\nreason=not_started\nagent_id=%s\nphase=pending\n' "$agent"
+      ;;
+    *)
+      printf 'verdict=blocked\nreason=missing_receipt\nagent_id=%s\nphase=%s\n' "$agent" "$phase"
+      ;;
+  esac
+}
+
 task_batch_run() {
   local file=
   while (($#)); do
@@ -2034,26 +2067,37 @@ task_batch_run() {
     task_files+=("$task_file")
   done < <(yaml_list tasks "$file")
   [[ ${#task_files[@]} -gt 0 ]] || fail missing_batch_tasks
-  local batch_dir agent_id
+  local batch_dir agent_id dir
   batch_dir=$(task_batch_dir "$batch_id")
   mkdir -p "$batch_dir"
-  : >"$batch_dir/agents"
-  for task_file in "${task_files[@]}"; do
-    [[ -f $task_file ]] || fail missing_task_file
-    agent_id=$(yaml_scalar agent_id "$task_file") || fail missing_agent_id
-    "$0" task-declare --file "$task_file" >"$batch_dir/$agent_id.declare"
-    printf '%s\n' "$agent_id" >>"$batch_dir/agents"
-  done
+  if [[ ! -s $batch_dir/agents ]]; then
+    for task_file in "${task_files[@]}"; do
+      [[ -f $task_file ]] || fail missing_task_file
+      agent_id=$(yaml_scalar agent_id "$task_file") || fail missing_agent_id
+      dir=$(task_dir "$agent_id")
+      if [[ ! -f $dir/task.yml ]]; then
+        "$0" task-declare --file "$task_file" >"$batch_dir/$agent_id.declare"
+      fi
+      printf '%s\n' "$agent_id" >>"$batch_dir/agents"
+    done
+  fi
+  task_batch_write "$batch_id" >/dev/null
   local -a pids=()
   while IFS= read -r agent_id; do
     [[ -n $agent_id ]] || continue
+    dir=$(task_dir "$agent_id")
+    if task_slice_started "$dir"; then
+      continue
+    fi
     "$0" task-invoke "$agent_id" >"$batch_dir/$agent_id.invoke" 2>&1 &
     pids+=("$!")
   done <"$batch_dir/agents"
   local pid
-  for pid in "${pids[@]}"; do
-    wait "$pid" || true
-  done
+  if ((${#pids[@]} > 0)); then
+    for pid in "${pids[@]}"; do
+      wait "$pid" || true
+    done
+  fi
   task_batch_write "$batch_id"
 }
 
@@ -2068,28 +2112,41 @@ task_batch_show() {
   [[ -n $batch_id ]] || fail missing_batch_id
   local batch_dir
   batch_dir=$(task_batch_dir "$batch_id")
-  [[ -f $batch_dir/receipt ]] || fail batch_not_found
-  cat "$batch_dir/receipt"
+  [[ -s $batch_dir/agents ]] || fail batch_not_found
+  task_batch_write "$batch_id"
 }
 
 task_batch_write() {
-  local batch_id=$1 agent_id dir
-  local batch_dir
+  local batch_id=$1 agent_id slice verdict=ok saw_open=0 saw_blocked=0
+  local batch_dir tmp
   batch_dir=$(task_batch_dir "$batch_id")
-  {
-    printf 'verdict=ok\nbatch_id=%s\n' "$batch_id"
-    while IFS= read -r agent_id; do
-      [[ -n $agent_id ]] || continue
-      dir=$(task_dir "$agent_id")
+  tmp=$(mktemp "$batch_dir/receipt.XXXXXX")
+  while IFS= read -r agent_id; do
+    [[ -n $agent_id ]] || continue
+    {
       printf 'slice_begin\n'
-      if [[ -f $dir/receipt ]]; then
-        cat "$dir/receipt"
-      else
-        printf 'verdict=blocked\nagent_id=%s\nreason=missing_receipt\n' "$agent_id"
-      fi
+      task_slice_body "$agent_id"
       printf 'slice_end\n'
-    done <"$batch_dir/agents"
-  } | tee "$batch_dir/receipt"
+    } >>"$tmp"
+  done <"$batch_dir/agents"
+  while IFS= read -r slice; do
+    case $slice in
+      verdict=open) saw_open=1 ;;
+      verdict=ok) ;;
+      verdict=*) saw_blocked=1 ;;
+    esac
+  done <"$tmp"
+  if ((saw_open)); then
+    verdict=open
+  elif ((saw_blocked)); then
+    verdict=blocked
+  fi
+  {
+    printf 'verdict=%s\nbatch_id=%s\n' "$verdict" "$batch_id"
+    cat "$tmp"
+  } >"$batch_dir/receipt"
+  rm -f "$tmp"
+  cat "$batch_dir/receipt"
 }
 
 usage() {
