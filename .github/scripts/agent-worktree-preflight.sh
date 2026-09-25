@@ -2067,6 +2067,10 @@ task_batch_run() {
     task_files+=("$task_file")
   done < <(yaml_list tasks "$file")
   [[ ${#task_files[@]} -gt 0 ]] || fail missing_batch_tasks
+  local concurrency
+  concurrency=$(yaml_scalar concurrency "$file" || true)
+  [[ -n $concurrency ]] || concurrency=2
+  [[ $concurrency =~ ^[1-9][0-9]*$ ]] || fail invalid_concurrency
   local batch_dir agent_id dir
   batch_dir=$(task_batch_dir "$batch_id")
   mkdir -p "$batch_dir"
@@ -2082,23 +2086,90 @@ task_batch_run() {
     done
   fi
   task_batch_write "$batch_id" >/dev/null
-  local -a pids=()
+  local -a pending=()
   while IFS= read -r agent_id; do
     [[ -n $agent_id ]] || continue
     dir=$(task_dir "$agent_id")
     if task_slice_started "$dir"; then
       continue
     fi
-    "$0" task-invoke "$agent_id" >"$batch_dir/$agent_id.invoke" 2>&1 &
-    pids+=("$!")
+    pending+=("$agent_id")
   done <"$batch_dir/agents"
-  local pid
-  if ((${#pids[@]} > 0)); then
-    for pid in "${pids[@]}"; do
-      wait "$pid" || true
+  local -a pids=()
+  local -a launched=()
+  local next=0 occupied
+  while ((next < ${#pending[@]})) || ((${#pids[@]} > 0)); do
+    occupied=$(batch_slots_used "$batch_dir" "${launched[@]}")
+    while ((occupied < concurrency && next < ${#pending[@]})); do
+      agent_id=${pending[$next]}
+      next=$((next + 1))
+      "$0" task-invoke "$agent_id" >"$batch_dir/$agent_id.invoke" 2>&1 &
+      pids+=("$!")
+      launched+=("$agent_id")
+      occupied=$((occupied + 1))
     done
-  fi
+    if ((${#pids[@]} == 0)); then
+      if ((next < ${#pending[@]})); then
+        sleep 0.05
+        continue
+      fi
+      break
+    fi
+    batch_reap_one pids
+  done
   task_batch_write "$batch_id"
+}
+
+# Slots already taken by slices this process did not launch, plus this
+# process's still-running invokes.
+batch_slots_used() {
+  local batch_dir=$1
+  shift
+  local -a launched=("$@")
+  local agent dir phase ours used=${#pids[@]}
+  while IFS= read -r agent; do
+    [[ -n $agent ]] || continue
+    ours=0
+    if ((${#launched[@]} > 0)); then
+      local name
+      for name in "${launched[@]}"; do
+        [[ $name == "$agent" ]] && ours=1
+      done
+    fi
+    [[ $ours == 1 ]] && continue
+    dir=$(task_dir "$agent")
+    phase=pending
+    [[ -f $dir/phase ]] && phase=$(tr -d '[:space:]' <"$dir/phase")
+    case $phase in
+      running | suspending)
+        if worker_alive "$dir"; then
+          used=$((used + 1))
+        fi
+        ;;
+    esac
+  done <"$batch_dir/agents"
+  printf '%s\n' "$used"
+}
+
+batch_reap_one() {
+  local -n _pids=$1
+  local i
+  while true; do
+    for i in "${!_pids[@]}"; do
+      if ! kill -0 "${_pids[$i]}" 2>/dev/null; then
+        wait "${_pids[$i]}" || true
+        if ((${#_pids[@]} == 1)); then
+          _pids=()
+        elif ((i == 0)); then
+          _pids=("${_pids[@]:1}")
+        else
+          _pids=("${_pids[@]:0:i}" "${_pids[@]:i+1}")
+        fi
+        return 0
+      fi
+    done
+    sleep 0.05
+  done
 }
 
 task_batch_show() {
