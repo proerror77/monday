@@ -115,21 +115,19 @@ branch/base, and refuses `grok`/`human` seats or trading gates other than `none`
 or `fail-closed`. It does not call Cursor Cloud or Codex HTTP APIs, and it does
 not schedule ACK Jobs.
 
-`task-declare`, `task-invoke`, `task-suspend`, `task-status`, and `task-egress`
-are the current local task prototype, not a deployed AX controller. Invoke
-materializes workspace files and executes a command. Its checkpoint restores
-files before re-executing the command; it does not restore process memory or an
-LLM session. At the AX research baseline, `task-suspend` copies files and changes
-phase without stopping the worker, and task admission does not atomically
-exclude other tasks. Do not use that phase as proof of quiescence or safe
-ownership release. Egress wrappers and RSS checks are not a portable sandbox.
-Model secrets belong outside task text, commands, logs and checkpoints. Checking
-for a leak after execution is not proof of secret containment.
+`task-declare`, `task-invoke`, `task-suspend`, `task-status`, `task-egress`,
+and `task-batch` are the current local task path. Invoke materializes workspace
+files and executes a command. Suspend stops the recorded worker and then
+checkpoints files. Admission refuses an overlapping contract, branch, pull
+request, or file range. A checkpoint restores files; it does not restore
+process memory or an LLM session. Egress wrappers and RSS checks are not a
+portable sandbox. Model secrets belong outside task text, commands, logs and
+checkpoints.
 
-Use the [AX workflow](ax-workflow.md) and
-[adoption ADR](../architecture/ADR-0003-ax-agent-execution.md) for the replacement
-contract and evidence required to retire this prototype. Keep engineering task
-execution separate from Campaign admission and trading authority.
+AX adoption stopped on 2026-09-25. The [ADR](../architecture/ADR-0003-ax-agent-execution.md)
+and [plan](../plans/2026-09-23-ax-adoption.md) are historical and are not a
+contract for replacing this helper. Keep engineering task execution separate
+from Campaign admission and trading authority.
 
 ### Machine packet and execution evidence
 

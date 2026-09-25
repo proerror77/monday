@@ -1,7 +1,8 @@
 # ADR-0003: AX execution for Monday agents
 
-- **Status:** Target direction accepted for staged evaluation; platform adoption
-  and runtime acceptance remain unproven.
+- **Status:** Closed on 2026-09-25 without adoption. Monday keeps task
+  admission and parallel slices on `task-batch`. AX is not an execution
+  backend. The staged evaluation below is historical.
 - **Date:** 2026-09-23.
 - **Scope:** Engineering and research-assistance agent execution. Existing
   Research, Governance and deterministic Runtime authority stays with Monday.
@@ -30,6 +31,10 @@ therefore verify AX identity, authorization and durability independently of
 Kubernetes namespace/RBAC settings.
 
 ## Decision
+
+Historical record, not a current instruction. On 2026-09-25 Monday stopped
+this migration. Parallel agent slices use `task-batch`. The paragraph below
+is the 2026-09-23 evaluation decision and does not authorize more AX work.
 
 Adopt AX as the candidate execution platform for agent workloads through a
 bounded lab evaluation. Keep Monday's domain control planes and put a narrow

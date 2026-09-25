@@ -12,8 +12,8 @@ Current architecture and ADRs live in:
 - [Release-identity ADR](../architecture/ADR-0002-rust-lob-release-identities.md)
   for collector source, artifact and deployed identity.
 - [AX agent execution ADR](../architecture/ADR-0003-ax-agent-execution.md)
-  for the target agent platform, staged adoption and preserved Campaign authority;
-  use the [AX workflow](ax-workflow.md) for research and implementation handoffs.
+  records the 2026-09-25 decision not to adopt AX. Parallel slices use
+  `task-batch`. The [workflow](ax-workflow.md) remains the research handoff.
 - [Research contracts](../research/) for Campaign workflows, evaluation,
   holding/accounting and training; use only the files relevant to the task.
 
