@@ -1,5 +1,8 @@
 # Agent research and delivery toward AX
 
+AX adoption stopped on 2026-09-25. Use this workflow for research handoff and
+for Monday's own task slices. Do not treat it as an instruction to install AX.
+
 This workflow applies when planning or migrating Monday's agent execution layer.
 It also improves today's research-to-implementation handoff without requiring an
 AX installation. [AGENTS.md](../../AGENTS.md) remains the authority source;

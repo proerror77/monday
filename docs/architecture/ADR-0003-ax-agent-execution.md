@@ -1,7 +1,8 @@
 # ADR-0003: AX execution for Monday agents
 
-- **Status:** Target direction accepted for staged evaluation; platform adoption
-  and runtime acceptance remain unproven.
+- **Status:** Closed on 2026-09-25 without adoption. Monday keeps task
+  admission and parallel slices on `task-batch`. AX is not an execution
+  backend. The staged evaluation below is historical.
 - **Date:** 2026-09-23.
 - **Scope:** Engineering and research-assistance agent execution. Existing
   Research, Governance and deterministic Runtime authority stays with Monday.

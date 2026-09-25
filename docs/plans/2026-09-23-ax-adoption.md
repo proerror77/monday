@@ -1,5 +1,9 @@
 # Monday AX adoption: bounded migration slices
 
+Stopped on 2026-09-25. Monday will not adopt AX. Parallel agent and CLI work
+uses `task-batch` on the existing lease/task admission path. The local kind
+cluster `monday-ax-lab` was deleted. Do not deploy AX or Substrate onto ACK.
+
 - Date: 2026-09-23.
 - Baseline: `16a8bd252b7a7d8bda15e7ec2222ee874f1dcb0b`.
 - Direction: [ADR-0003](../architecture/ADR-0003-ax-agent-execution.md).
