@@ -458,6 +458,22 @@ drain_lock() {
   flock -n 7
 }
 
+# uutils 0.8.0 implements `sync PATH` as global sync(2), so an isolation
+# transaction can exhaust ExecStartPre's deadline waiting for unrelated I/O.
+# Ubuntu ships GNU sync as gnusync alongside uutils. Require its path-scoped
+# fsync semantics; never fall back to a filesystem-wide or global flush.
+recovery_sync_path() {
+  local program version
+  (( $# > 0 )) || return 1
+  program=$(command -v gnusync || command -v sync) || return 1
+  version=$("$program" --version) || return 1
+  [[ $version == 'sync (GNU coreutils)'* ]] || {
+    printf 'recovery durability requires GNU sync (gnusync or sync)\n' >&2
+    return 1
+  }
+  "$program" -- "$@"
+}
+
 write_job_receipt() {
   local job_id=$1 queue_unit=$2 tmp env_copy env_tmp
   CURRENT_ISOLATION_JOB_ID=$job_id
@@ -466,8 +482,7 @@ write_job_receipt() {
   env_tmp="$env_copy.tmp.$$"
   install -m 0640 -o root -g root -- "$RELEASE_ENV_FILE" "$env_tmp"
   mv -Tf "$env_tmp" "$env_copy"
-  # A path operand uses fsync(2); -f uses syncfs(2) and can stall on all of /data.
-  sync "$env_copy"
+  recovery_sync_path "$env_copy"
   tmp="$CANONICAL_SPOOL/job.json.tmp.$$"
   jq -n \
     --arg schema monday.rust_lob_recovery_queue.v1 \
@@ -493,10 +508,10 @@ write_job_receipt() {
       release_env:$release_env,recovery_unit:$recovery_unit}' >"$tmp"
   chmod 0640 "$tmp"
   mv -Tf "$tmp" "$CANONICAL_SPOOL/job.json"
-  sync "$CANONICAL_SPOOL/job.json"
+  recovery_sync_path "$CANONICAL_SPOOL/job.json"
   isolation_phase_done
   isolation_phase_begin receipt-dir
-  sync "$CANONICAL_SPOOL"
+  recovery_sync_path "$CANONICAL_SPOOL"
   isolation_phase_done
 }
 
@@ -530,10 +545,10 @@ write_isolation_marker() {
   chmod 0640 "$tmp"
   mv -Tf "$tmp" "$ISOLATION_MARKER"
   secure_regular_file "$ISOLATION_MARKER" 0
-  sync "$ISOLATION_MARKER"
+  recovery_sync_path "$ISOLATION_MARKER"
   isolation_phase_done
   isolation_phase_begin marker-dir
-  sync "$QUEUE_MARKET_ROOT"
+  recovery_sync_path "$QUEUE_MARKET_ROOT"
   isolation_phase_done
 }
 
@@ -619,10 +634,10 @@ complete_isolation_transaction() {
     mv -T -- "$CANONICAL_SPOOL" "$ISOLATION_READY_DIR"
     isolation_phase_done
     isolation_phase_begin canonical-parent
-    sync "$CANONICAL_ROOT"
+    recovery_sync_path "$CANONICAL_ROOT"
     isolation_phase_done
     isolation_phase_begin queue-parent
-    sync "$QUEUE_MARKET_ROOT"
+    recovery_sync_path "$QUEUE_MARKET_ROOT"
     isolation_phase_done
     isolation_phase_begin canonical-recreate
     install -d -m 0750 -o "$hft_uid" -g "$hft_gid" -- "$CANONICAL_SPOOL"
@@ -631,18 +646,18 @@ complete_isolation_transaction() {
   if [[ -f $prior_upload_status && ! -L $prior_upload_status ]]; then
     install -m 0640 -o "$hft_uid" -g "$hft_gid" -- \
       "$prior_upload_status" "$CANONICAL_SPOOL/upload-status.json"
-    sync "$CANONICAL_SPOOL/upload-status.json"
+    recovery_sync_path "$CANONICAL_SPOOL/upload-status.json"
   fi
-  sync "$CANONICAL_SPOOL"
+  recovery_sync_path "$CANONICAL_SPOOL"
   isolation_phase_done
   isolation_phase_begin canonical-parent
-  sync "$CANONICAL_ROOT"
+  recovery_sync_path "$CANONICAL_ROOT"
   isolation_phase_done
   isolation_phase_begin marker-remove
   rm -f -- "$ISOLATION_MARKER"
   isolation_phase_done
   isolation_phase_begin queue-parent
-  sync "$QUEUE_MARKET_ROOT"
+  recovery_sync_path "$QUEUE_MARKET_ROOT"
   isolation_phase_done
   isolation_phase_begin handoff
   if (( spool_lock_held )); then
@@ -771,10 +786,10 @@ write_result() {
     fail 'could not serialize recovery result'
   fi
   chmod 0440 "$tmp" || fail 'could not protect recovery result'
-  sync "$tmp" || fail 'could not persist recovery result'
+  recovery_sync_path "$tmp" || fail 'could not persist recovery result'
   ln -- "$tmp" "$path" || fail "refusing to replace recovery result: $path"
   rm -f -- "$tmp" || fail 'could not remove committed recovery result temporary'
-  sync "${path%/*}" || fail 'could not persist recovery result directory'
+  recovery_sync_path "${path%/*}" || fail 'could not persist recovery result directory'
 }
 
 load_job() {
@@ -1095,12 +1110,12 @@ resume_market() {
       >"$RESUME_STAGING_DIR/adoption.json" || fail 'could not serialize recovery adoption'
     chmod 0440 "$RESUME_STAGING_DIR"/* || fail 'could not protect recovery adoption evidence'
     for candidate in "$RESUME_STAGING_DIR"/*; do
-      sync "$candidate" || fail 'could not persist recovery adoption evidence'
+      recovery_sync_path "$candidate" || fail 'could not persist recovery adoption evidence'
     done
-    sync "$RESUME_STAGING_DIR" || fail 'could not persist recovery adoption staging directory'
+    recovery_sync_path "$RESUME_STAGING_DIR" || fail 'could not persist recovery adoption staging directory'
     mv -T -- "$RESUME_STAGING_DIR" "$attempt" || fail 'could not commit recovery adoption directory'
     RESUME_STAGING_DIR=
-    sync "$evidence_root/attempts" || fail 'could not persist recovery adoption directory'
+    recovery_sync_path "$evidence_root/attempts" || fail 'could not persist recovery adoption directory'
   fi
   secure_regular_file "$attempt/adoption.json" 0
   secure_regular_file "$attempt/request.json" 0
@@ -1116,12 +1131,12 @@ resume_market() {
       request_sha256:$request_sha,adoption_sha256:$adoption_sha}' >"$tmp" \
     || fail 'could not serialize recovery adoption pointer'
   chmod 0440 "$tmp" || fail 'could not protect recovery adoption pointer'
-  sync "$tmp" || fail 'could not persist recovery adoption pointer'
+  recovery_sync_path "$tmp" || fail 'could not persist recovery adoption pointer'
   if [[ -e $pointer ]] && cmp -s -- "$tmp" "$pointer"; then
     rm -f -- "$tmp" || fail 'could not remove identical adoption pointer temporary'
   else
     mv -Tf -- "$tmp" "$pointer" || fail 'could not commit recovery adoption pointer'
-    sync "$evidence_root" || fail 'could not persist recovery adoption pointer directory'
+    recovery_sync_path "$evidence_root" || fail 'could not persist recovery adoption pointer directory'
   fi
   load_adoption "$queue_dir" || fail 'committed recovery adoption failed readback'
   result="$attempt/result.json"
@@ -1147,7 +1162,7 @@ resume_market() {
     candidate="$QUEUE_MARKET_ROOT/$JOB_ID.ready"
     [[ ! -e $candidate && ! -L $candidate ]] || fail 'resume ready destination already exists'
     mv -T -- "$queue_dir" "$candidate" || fail 'could not requeue explicitly adopted recovery job'
-    sync "$QUEUE_MARKET_ROOT" || fail 'could not persist resumed recovery queue'
+    recovery_sync_path "$QUEUE_MARKET_ROOT" || fail 'could not persist resumed recovery queue'
   fi
   flock -u 8 || fail 'could not release resumed spool lock'
   exec 8>&-
@@ -1173,10 +1188,10 @@ start_execution() {
         executing_controller_sha256:$controller,started_at:$started}' >"$tmp" \
       || fail 'could not serialize recovery start'
     chmod 0440 "$tmp" || fail 'could not protect recovery start'
-    sync "$tmp" || fail 'could not persist recovery start'
+    recovery_sync_path "$tmp" || fail 'could not persist recovery start'
     ln -- "$tmp" "$path" || fail 'recovery start already exists'
     rm -f -- "$tmp" || fail 'could not remove committed recovery start temporary'
-    sync "$JOB_EXECUTION_ROOT" || fail 'could not persist recovery start directory'
+    recovery_sync_path "$JOB_EXECUTION_ROOT" || fail 'could not persist recovery start directory'
   fi
   secure_regular_file "$path" 0
   jq -e --arg job "$JOB_ID" --arg job_sha "$JOB_RECEIPT_SHA256" \
@@ -1235,8 +1250,8 @@ mark_stale() {
   write_result "$result_path" stale "$step" "$message"
   [[ ! -e $stale_dir && ! -L $stale_dir ]] || fail "refusing to reuse stale recovery path: $stale_dir"
   mv -T -- "$running_dir" "$stale_dir" || fail 'could not commit stale recovery queue state'
-  sync "$QUEUE_MARKET_ROOT" || fail 'could not persist stale recovery queue state'
-  sync "$evidence_root" || fail 'could not persist stale recovery evidence'
+  recovery_sync_path "$QUEUE_MARKET_ROOT" || fail 'could not persist stale recovery queue state'
+  recovery_sync_path "$evidence_root" || fail 'could not persist stale recovery evidence'
 }
 
 finalize_passed_running() {
@@ -1261,8 +1276,8 @@ finalize_passed_running() {
   [[ ! -e $evidence_root/spool.done && ! -L $evidence_root/spool.done ]] \
     || fail "refusing to reuse evidence spool path: $evidence_root/spool.done"
   mv -T -- "$running_dir" "$evidence_root/spool.done" || fail 'could not archive passed recovery spool'
-  sync "$QUEUE_MARKET_ROOT" || fail 'could not persist archived recovery queue state'
-  sync "$evidence_root" || fail 'could not persist archived recovery evidence'
+  recovery_sync_path "$QUEUE_MARKET_ROOT" || fail 'could not persist archived recovery queue state'
+  recovery_sync_path "$evidence_root" || fail 'could not persist archived recovery evidence'
 }
 
 check_upload_readback() {
@@ -1343,8 +1358,8 @@ run_drain_job() {
   [[ ! -e $evidence_root/spool.done && ! -L $evidence_root/spool.done ]] \
     || fail "refusing to reuse evidence spool path: $evidence_root/spool.done"
   mv -T -- "$running_dir" "$evidence_root/spool.done" || fail 'could not archive passed recovery spool'
-  sync "$QUEUE_MARKET_ROOT" || fail 'could not persist archived recovery queue state'
-  sync "$evidence_root" || fail 'could not persist archived recovery evidence'
+  recovery_sync_path "$QUEUE_MARKET_ROOT" || fail 'could not persist archived recovery queue state'
+  recovery_sync_path "$evidence_root" || fail 'could not persist archived recovery evidence'
 }
 
 mark_failed() {
@@ -1366,7 +1381,7 @@ mark_failed() {
   if [[ $running_dir != "$failed_dir" ]]; then
     [[ ! -e $failed_dir && ! -L $failed_dir ]] || fail 'failed recovery destination already exists'
     mv -T -- "$running_dir" "$failed_dir" || fail 'could not commit failed recovery queue state'
-    sync "$QUEUE_MARKET_ROOT" || fail 'could not persist failed recovery queue state'
+    recovery_sync_path "$QUEUE_MARKET_ROOT" || fail 'could not persist failed recovery queue state'
   fi
 }
 
@@ -1387,6 +1402,12 @@ on_signal() {
 drain_market() {
   local ready_dir running_dir hft_gid drain_status
   local -a running=()
+  # The queue lock serializes this check with isolation. A ready directory
+  # is not consumable until its isolation marker has been durably removed.
+  if [[ -e $ISOLATION_MARKER || -L $ISOLATION_MARKER ]]; then
+    printf 'isolation transaction is unfinished; deferred %s drain\n' "$MARKET"
+    return 0
+  fi
   if ! drain_lock; then
     printf 'another market recovery is active; deferred %s drain\n' "$MARKET"
     exit 0
@@ -1420,7 +1441,7 @@ drain_market() {
   load_job "$ready_dir"
   running_dir="${ready_dir%.ready}.running"
   mv -T -- "$ready_dir" "$running_dir" || fail 'could not start queued recovery job'
-  sync "$QUEUE_MARKET_ROOT" || fail 'could not persist running recovery queue state'
+  recovery_sync_path "$QUEUE_MARKET_ROOT" || fail 'could not persist running recovery queue state'
   CURRENT_RUNNING_DIR=$running_dir
   CURRENT_STEP=recover-upload
   set +e
