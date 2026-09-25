@@ -1021,27 +1021,62 @@ running_task_conflict() {
   return 1
 }
 
-task_consumed() {
-  local dir=$1
-  if [[ -f $dir/consumed ]]; then
-    tr -d '[:space:]' <"$dir/consumed"
+task_counter() {
+  local dir=$1 name=$2
+  if [[ -f $dir/$name ]]; then
+    tr -d '[:space:]' <"$dir/$name"
   else
     printf '0\n'
   fi
 }
 
-charge_task() {
-  local dir=$1 budget consumed
+task_consumed() {
+  task_counter "$1" consumed
+}
+
+task_reserved() {
+  task_counter "$1" reserved
+}
+
+reserve_task() {
+  local dir=$1 budget reserved consumed phase
   budget=$(yaml_scalar budget "$dir/task.yml" || true)
   [[ $budget =~ ^[0-9]+$ ]] || return 0
+  reserved=$(task_reserved "$dir")
   consumed=$(task_consumed "$dir")
-  printf '%s\n' "$((consumed + 1))" >"$dir/consumed"
+  phase=$(tr -d '[:space:]' <"$dir/phase")
+  if [[ $phase == suspended && $reserved -gt 0 ]]; then
+    return 0
+  fi
+  if ((consumed + reserved >= budget)); then
+    return 1
+  fi
+  printf '%s\n' "$((reserved + 1))" >"$dir/reserved"
+}
+
+settle_task() {
+  local dir=$1 budget reserved
+  budget=$(yaml_scalar budget "$dir/task.yml" || true)
+  [[ $budget =~ ^[0-9]+$ ]] || return 0
+  reserved=$(task_reserved "$dir")
+  if ((reserved > 0)); then
+    printf '%s\n' "$((reserved - 1))" >"$dir/reserved"
+    printf '%s\n' "$(($(task_consumed "$dir") + 1))" >"$dir/consumed"
+  fi
+}
+
+release_reservation() {
+  local dir=$1 reserved
+  reserved=$(task_reserved "$dir")
+  if ((reserved > 0)); then
+    printf '%s\n' "$((reserved - 1))" >"$dir/reserved"
+  fi
 }
 
 write_task_receipt() {
   local dir=$1 verdict=$2 reason=${3:-}
   [[ -f $dir/task.yml ]] || return 0
-  local agent contract deadline budget consumed phase invocation branch pr files
+  local agent contract deadline budget consumed reserved phase invocation branch pr files
   agent=$(yaml_scalar agent_id "$dir/task.yml" || true)
   contract=$(yaml_scalar contract "$dir/task.yml" || true)
   deadline=$(yaml_scalar deadline "$dir/task.yml" || true)
@@ -1050,13 +1085,14 @@ write_task_receipt() {
   pr=$(yaml_scalar pr "$dir/task.yml" || true)
   files=$(yaml_scalar allowed_files "$dir/task.yml" || true)
   consumed=$(task_consumed "$dir")
+  reserved=$(task_reserved "$dir")
   phase=$(tr -d '[:space:]' <"$dir/phase" || true)
   invocation=$( [[ -f $dir/invocation.id ]] && tr -d '[:space:]' <"$dir/invocation.id" || true )
   {
     printf 'verdict=%s\n' "$verdict"
     [[ -n $reason ]] && printf 'reason=%s\n' "$reason"
-    printf 'agent_id=%s\ncontract=%s\ndeadline=%s\nbudget=%s\nconsumed=%s\nbranch=%s\npr=%s\nallowed_files=%s\ninvocation=%s\nphase=%s\n' \
-      "$agent" "$contract" "${deadline:-none}" "${budget:-none}" "$consumed" \
+    printf 'agent_id=%s\ncontract=%s\ndeadline=%s\nbudget=%s\nconsumed=%s\nreserved=%s\nbranch=%s\npr=%s\nallowed_files=%s\ninvocation=%s\nphase=%s\n' \
+      "$agent" "$contract" "${deadline:-none}" "${budget:-none}" "$consumed" "$reserved" \
       "${branch:-none}" "${pr:-none}" "$files" "$invocation" "$phase"
   } >"$dir/receipt"
 }
@@ -1250,6 +1286,7 @@ EOF
   fi
   printf 'pending\n' >"$dir/phase"
   printf '0\n' >"$dir/consumed"
+  printf '0\n' >"$dir/reserved"
   printf 'verdict=ok\nagent_id=%s\nphase=pending\n' "$agent_id"
 }
 
@@ -1260,13 +1297,14 @@ cmd_task_status() {
   dir=$(task_dir "$agent_id")
   [[ -f $dir/phase ]] || fail agent_not_found
   phase=$(cat "$dir/phase")
-  printf 'verdict=ok\nagent_id=%s\nphase=%s\ncpu=%s\nmemory_mb=%s\ndeadline=%s\nbudget=%s\nconsumed=%s\n' \
+  printf 'verdict=ok\nagent_id=%s\nphase=%s\ncpu=%s\nmemory_mb=%s\ndeadline=%s\nbudget=%s\nconsumed=%s\nreserved=%s\n' \
     "$agent_id" "$phase" \
     "$(yaml_scalar cpu "$dir/task.yml")" \
     "$(yaml_scalar memory_mb "$dir/task.yml")" \
     "$(yaml_scalar deadline "$dir/task.yml" || echo none)" \
     "$(yaml_scalar budget "$dir/task.yml" || echo none)" \
-    "$(task_consumed "$dir")"
+    "$(task_consumed "$dir")" \
+    "$(task_reserved "$dir")"
 }
 
 cmd_task_suspend() {
@@ -1890,7 +1928,9 @@ cmd_task_invoke() {
     lease_lock_release
     fail deadline_passed
   fi
-  if [[ $task_budget =~ ^[0-9]+$ ]] && (( $(task_consumed "$dir") >= task_budget )); then
+  if [[ $task_budget =~ ^[0-9]+$ && $phase == suspended && $(task_reserved "$dir") -gt 0 ]]; then
+    :
+  elif [[ $task_budget =~ ^[0-9]+$ ]] && (( $(task_consumed "$dir") + $(task_reserved "$dir") >= task_budget )); then
     lease_lock_release
     fail budget_exhausted
   fi
@@ -1913,8 +1953,12 @@ cmd_task_invoke() {
   done < <(active_lease_files)
   printf '%s-%s\n' "$(date -u +"%Y%m%dT%H%M%SZ")" "$$" >"$dir/invocation.id"
   rm -f "$dir/worker.pid"
+  if [[ $task_budget =~ ^[0-9]+$ && $phase == suspended && $(task_reserved "$dir") -gt 0 ]]; then
+    :
+  elif [[ $task_budget =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$(($(task_reserved "$dir") + 1))" >"$dir/reserved"
+  fi
   printf 'running\n' >"$dir/phase"
-  charge_task "$dir"
   lease_lock_release
   printf 'command=%s\ncpu=%s\nmemory_mb=%s\n' "$command" "$cpu" "$memory" >>"$dir/command.log"
   rm -f "$dir/egress-refused"
@@ -1943,6 +1987,7 @@ cmd_task_invoke() {
           printf 'verdict=ok\nagent_id=%s\nphase=%s\n' "$agent_id" "$(tr -d '[:space:]' <"$dir/phase")"
           return 0
         }
+        release_reservation "$dir"
         fail secret_leaked
       fi
     fi
@@ -1959,6 +2004,7 @@ cmd_task_invoke() {
       printf 'verdict=ok\nagent_id=%s\nphase=%s\n' "$agent_id" "$(tr -d '[:space:]' <"$dir/phase")"
       return 0
     }
+    release_reservation "$dir"
     fail host_not_allowed
   fi
   if ((exit_status == 137)); then
@@ -1966,6 +2012,7 @@ cmd_task_invoke() {
       printf 'verdict=ok\nagent_id=%s\nphase=%s\n' "$agent_id" "$(tr -d '[:space:]' <"$dir/phase")"
       return 0
     }
+    release_reservation "$dir"
     fail memory_exceeded
   fi
   if ((exit_status == 125)); then
@@ -1973,6 +2020,7 @@ cmd_task_invoke() {
       printf 'verdict=ok\nagent_id=%s\nphase=%s\n' "$agent_id" "$(tr -d '[:space:]' <"$dir/phase")"
       return 0
     }
+    release_reservation "$dir"
     fail memory_bound_unenforceable
   fi
   if ((exit_status == 126)); then
@@ -1980,6 +2028,7 @@ cmd_task_invoke() {
       printf 'verdict=ok\nagent_id=%s\nphase=%s\n' "$agent_id" "$(tr -d '[:space:]' <"$dir/phase")"
       return 0
     }
+    release_reservation "$dir"
     fail cpu_bound_unenforceable
   fi
   if ((exit_status != 0)); then
@@ -1987,6 +2036,8 @@ cmd_task_invoke() {
       printf 'verdict=ok\nagent_id=%s\nphase=%s\n' "$agent_id" "$(tr -d '[:space:]' <"$dir/phase")"
       return 0
     }
+    release_reservation "$dir"
+    write_task_receipt "$dir" blocked command_failed
     printf 'verdict=blocked\nreason=command_failed\nagent_id=%s\nphase=failed\n' "$agent_id" >&2
     return "$exit_status"
   fi
@@ -1995,6 +2046,7 @@ cmd_task_invoke() {
     printf 'verdict=ok\nagent_id=%s\nphase=%s\n' "$agent_id" "$(tr -d '[:space:]' <"$dir/phase")"
     return 0
   }
+  settle_task "$dir"
   write_task_receipt "$dir" ok
   printf 'verdict=ok\nagent_id=%s\nphase=suspended\ncpu=%s\nmemory_mb=%s\nworkspace=%s\n' \
     "$agent_id" "$cpu" "$memory" "$ws"

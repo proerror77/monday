@@ -833,6 +833,7 @@ for agent in slice-a slice-b; do
   grep -qx 'verdict=ok' "$receipt"
   grep -qx 'phase=suspended' "$receipt"
   grep -qx 'consumed=1' "$receipt"
+  grep -qx 'reserved=0' "$receipt"
   grep -qx "agent_id=$agent" "$receipt"
   [[ -s $fixture/.git/agent-tasks/$agent/workspace/marker ]]
 done
@@ -1039,7 +1040,8 @@ done
 die_retry=$("$gate" task-invoke slice-die 2>&1 || true)
 grep -qx 'reason=execution_unresolved' <<<"$die_retry"
 [[ $(wc -l <"$die_dir/workspace/starts" | tr -d ' ') == 1 ]]
-grep -qx 'consumed=1' "$die_dir/receipt"
+grep -qx 'consumed=0' "$die_dir/receipt"
+grep -qx 'reserved=1' "$die_dir/receipt"
 wait "$die_pid" 2>/dev/null || true
 
 printf 'agent worktree preflight tests passed\n'
