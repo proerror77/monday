@@ -2067,6 +2067,10 @@ task_batch_run() {
     task_files+=("$task_file")
   done < <(yaml_list tasks "$file")
   [[ ${#task_files[@]} -gt 0 ]] || fail missing_batch_tasks
+  local concurrency
+  concurrency=$(yaml_scalar concurrency "$file" || true)
+  [[ -n $concurrency ]] || concurrency=2
+  [[ $concurrency =~ ^[1-9][0-9]*$ ]] || fail invalid_concurrency
   local batch_dir agent_id dir
   batch_dir=$(task_batch_dir "$batch_id")
   mkdir -p "$batch_dir"
@@ -2082,22 +2086,34 @@ task_batch_run() {
     done
   fi
   task_batch_write "$batch_id" >/dev/null
-  local -a pids=()
+  local -a pending=()
   while IFS= read -r agent_id; do
     [[ -n $agent_id ]] || continue
     dir=$(task_dir "$agent_id")
     if task_slice_started "$dir"; then
       continue
     fi
-    "$0" task-invoke "$agent_id" >"$batch_dir/$agent_id.invoke" 2>&1 &
-    pids+=("$!")
+    pending+=("$agent_id")
   done <"$batch_dir/agents"
-  local pid
-  if ((${#pids[@]} > 0)); then
-    for pid in "${pids[@]}"; do
-      wait "$pid" || true
+  local -a pids=()
+  local next=0
+  while ((next < ${#pending[@]})) || ((${#pids[@]} > 0)); do
+    while ((${#pids[@]} < concurrency && next < ${#pending[@]})); do
+      agent_id=${pending[$next]}
+      next=$((next + 1))
+      "$0" task-invoke "$agent_id" >"$batch_dir/$agent_id.invoke" 2>&1 &
+      pids+=("$!")
     done
-  fi
+    if ((${#pids[@]} == 0)); then
+      break
+    fi
+    wait "${pids[0]}" || true
+    if ((${#pids[@]} > 1)); then
+      pids=("${pids[@]:1}")
+    else
+      pids=()
+    fi
+  done
   task_batch_write "$batch_id"
 }
 
