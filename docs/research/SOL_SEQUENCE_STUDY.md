@@ -12,7 +12,7 @@ no Transformer/pretraining/RL/maker or live activation in this study.
 
 `hft-research-manifest::sequence` binds ordered channels, observation clocks,
 source identity, immutable bounded shards and half-open views. `hft-research-ml`
-provides a bounded sequence reader and native CPU TCN trainer. These are library
+provides a bounded sequence reader and native CPU TCN/flattened-MLP trainers. These are library
 capabilities, not a completed Campaign or an executable trading candidate.
 
 Each JSONL frame retains a dataset-wide series identity, observation and maximum
@@ -30,6 +30,8 @@ Dataset shards exposed to a worker must belong to that worker's authorized view:
 the reader checks complete shard bytes and cannot serve as a secrecy barrier for
 a sealed shard mounted in the same input dataset.
 
+The MLP flattens the exact same normalized context used by the TCN; it does not
+receive a smaller information set. Both use the same mini-batch and scaling path.
 The TCN has five causal kernel-3 layers with dilations 1/2/4/8/16, a maximum
 63-row receptive field, and a three-return output. Its hidden width, channel
 ablation, batch size, seed, update budget, input identity and view are bound in the

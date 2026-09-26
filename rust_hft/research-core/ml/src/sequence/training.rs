@@ -1,4 +1,5 @@
-//! Small causal TCN fitting on bounded batches. This module has no execution authority.
+//! Small TCN and flattened MLP fitting on identical bounded causal batches.
+//! This module has no execution authority.
 use super::{SequenceExample, SequenceReader, MAX_SEQUENCE_BATCH};
 use crate::{lock_ndarray_backend, CpuAutodiffBackend, CpuBackend};
 use burn::{
@@ -17,9 +18,17 @@ use hft_research_manifest::sequence::{valid_sha256, SequenceInputSpecV1, Sequenc
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SequenceNeuralKindV1 {
+    Mlp,
+    Tcn,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SequenceTrainingRequestV1 {
+    pub model_kind: SequenceNeuralKindV1,
     pub dataset_sha256: String,
     pub input: SequenceInputSpecV1,
     pub view: SequenceViewV1,
@@ -38,7 +47,7 @@ impl SequenceTrainingRequestV1 {
         self.input.validate()?;
         self.view.validate()?;
         if !valid_sha256(&self.dataset_sha256)
-            || self.input.context_rows > 63
+            || (self.model_kind == SequenceNeuralKindV1::Tcn && self.input.context_rows > 63)
             || self.channels.is_empty()
             || self
                 .channels
@@ -63,6 +72,50 @@ impl SequenceTrainingRequestV1 {
 struct CausalTcn<B: Backend> {
     convolutions: Vec<Conv1d<B>>,
     output: Linear<B>,
+}
+
+#[derive(Module, Debug)]
+struct FlattenedMlp<B: Backend> {
+    hidden: Linear<B>,
+    output: Linear<B>,
+}
+
+#[derive(Module, Debug)]
+enum SequenceNetwork<B: Backend> {
+    Tcn(CausalTcn<B>),
+    Mlp(FlattenedMlp<B>),
+}
+
+impl<B: Backend> SequenceNetwork<B> {
+    fn new(request: &SequenceTrainingRequestV1, device: &B::Device) -> Self {
+        match request.model_kind {
+            SequenceNeuralKindV1::Tcn => Self::Tcn(CausalTcn::new(
+                request.channels.len(),
+                request.hidden_channels,
+                device,
+            )),
+            SequenceNeuralKindV1::Mlp => Self::Mlp(FlattenedMlp {
+                hidden: LinearConfig::new(
+                    request.channels.len() * request.input.context_rows,
+                    request.hidden_channels,
+                )
+                .init(device),
+                output: LinearConfig::new(request.hidden_channels, 3).init(device),
+            }),
+        }
+    }
+
+    fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 2> {
+        match self {
+            Self::Tcn(model) => model.forward(x),
+            Self::Mlp(model) => {
+                let [batch, channels, context] = x.dims();
+                model.output.forward(relu(
+                    model.hidden.forward(x.reshape([batch, channels * context])),
+                ))
+            }
+        }
+    }
 }
 
 impl<B: Backend> CausalTcn<B> {
@@ -229,7 +282,7 @@ impl ModuleVisitor<CpuAutodiffBackend> for GradientVisitor<'_> {
 }
 
 fn control_gradients(
-    model: &CausalTcn<CpuAutodiffBackend>,
+    model: &SequenceNetwork<CpuAutodiffBackend>,
     gradients: &mut GradientsParams,
 ) -> Result<f64, String> {
     let mut visitor = GradientVisitor {
@@ -314,7 +367,7 @@ fn sample_batch(
 }
 
 pub struct TrainedSequenceModel {
-    model: CausalTcn<CpuBackend>,
+    model: SequenceNetwork<CpuBackend>,
     request: SequenceTrainingRequestV1,
     scaling: SequenceScalingV1,
     diagnostics: SequenceTrainingDiagnosticsV1,
@@ -330,7 +383,7 @@ struct SequenceBundleV1 {
     diagnostics: SequenceTrainingDiagnosticsV1,
 }
 
-pub fn train_tcn(
+pub fn train_sequence_model(
     reader: &mut SequenceReader,
     request: SequenceTrainingRequestV1,
 ) -> Result<TrainedSequenceModel, String> {
@@ -348,11 +401,7 @@ pub fn train_tcn(
     let _guard = lock_ndarray_backend().map_err(|e| e.to_string())?;
     let device = NdArrayDevice::Cpu;
     CpuAutodiffBackend::seed(&device, request.seed);
-    let mut model = CausalTcn::<CpuAutodiffBackend>::new(
-        request.channels.len(),
-        request.hidden_channels,
-        &device,
-    );
+    let mut model = SequenceNetwork::<CpuAutodiffBackend>::new(&request, &device);
     let mut optimizer = AdamConfig::new().init();
     let mut diagnostics = SequenceTrainingDiagnosticsV1 {
         completed_updates: 0,
@@ -525,7 +574,7 @@ impl TrainedSequenceModel {
     pub fn bundle(&self) -> Result<(Vec<u8>, Vec<u8>), String> {
         let weights = self.weights()?;
         let manifest = SequenceBundleV1 {
-            schema_version: "monday.sequence_tcn_bundle.v1".into(),
+            schema_version: "monday.sequence_neural_bundle.v1".into(),
             weights_sha256: format!("{:x}", Sha256::digest(&weights)),
             request: self.request.clone(),
             scaling: self.scaling.clone(),
@@ -550,7 +599,7 @@ impl TrainedSequenceModel {
         }
         let bundle: SequenceBundleV1 =
             serde_json::from_slice(manifest).map_err(|e| e.to_string())?;
-        if bundle.schema_version != "monday.sequence_tcn_bundle.v1" {
+        if bundle.schema_version != "monday.sequence_neural_bundle.v1" {
             return Err("unsupported sequence model bundle".into());
         }
         Self::restore(
@@ -607,11 +656,7 @@ impl TrainedSequenceModel {
             return Err("sequence weights, normalization or training receipt is invalid".into());
         }
         let _guard = lock_ndarray_backend().map_err(|e| e.to_string())?;
-        let mut model = CausalTcn::<CpuBackend>::new(
-            request.channels.len(),
-            request.hidden_channels,
-            &NdArrayDevice::Cpu,
-        );
+        let mut model = SequenceNetwork::<CpuBackend>::new(&request, &NdArrayDevice::Cpu);
         let mut store =
             BurnpackStore::from_bytes(Some(burn::tensor::Bytes::from_bytes_vec(weights)));
         let applied = model.load_from(&mut store).map_err(|e| e.to_string())?;

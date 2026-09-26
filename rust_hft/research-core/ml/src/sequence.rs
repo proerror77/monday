@@ -390,11 +390,15 @@ mod tests {
 
     #[test]
     fn sequence_tcn_trains_reproducibly_and_roundtrips_raw_returns() {
-        use training::{train_tcn, SequenceTrainingRequestV1, TrainedSequenceModel};
+        use training::{
+            train_sequence_model, SequenceNeuralKindV1, SequenceTrainingRequestV1,
+            TrainedSequenceModel,
+        };
         let dir = tempfile::tempdir().unwrap();
         let rows = frames();
         let mut data = reader(dir.path(), &rows, 60000);
         let request = SequenceTrainingRequestV1 {
+            model_kind: SequenceNeuralKindV1::Tcn,
             dataset_sha256: data.dataset.digest().unwrap(),
             input: data.dataset.input.clone(),
             view: data.view,
@@ -406,7 +410,7 @@ mod tests {
             seed: 7,
             min_examples: 8,
         };
-        let trained = train_tcn(&mut data, request.clone()).unwrap();
+        let trained = train_sequence_model(&mut data, request.clone()).unwrap();
         let losses = &trained.diagnostics().batch_losses;
         assert!(
             losses[48..].iter().sum::<f64>() < losses[..16].iter().sum::<f64>(),
@@ -439,8 +443,39 @@ mod tests {
         let mut second = reader(dir.path(), &changed_rows, 60000);
         let mut second_request = request;
         second_request.dataset_sha256 = second.dataset.digest().unwrap();
-        let repeated = train_tcn(&mut second, second_request).unwrap();
+        let repeated = train_sequence_model(&mut second, second_request).unwrap();
         assert_eq!(trained.scaling(), repeated.scaling());
         assert_eq!(predicted, repeated.predict(&sample).unwrap());
+    }
+
+    #[test]
+    fn sequence_mlp_uses_the_same_bound_inputs_and_short_budget_covers_recent_rows() {
+        use training::{
+            train_sequence_model, SequenceNeuralKindV1, SequenceTrainingRequestV1,
+            TrainedSequenceModel,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut data = reader(dir.path(), &frames(), 60000);
+        let request = SequenceTrainingRequestV1 {
+            model_kind: SequenceNeuralKindV1::Mlp,
+            dataset_sha256: data.dataset.digest().unwrap(),
+            input: data.dataset.input.clone(),
+            view: data.view,
+            channels: vec![0],
+            hidden_channels: 4,
+            batch_size: 4,
+            updates: 1,
+            learning_rate: 0.003,
+            seed: 7,
+            min_examples: 8,
+        };
+        let model = train_sequence_model(&mut data, request).unwrap();
+        assert_eq!(model.diagnostics().examples_seen, 4);
+        assert_eq!(model.diagnostics().last_training_decision_ms, 29000);
+        let expected = model.predict(&[1.0, 2.0, 3.0]).unwrap();
+        let (manifest, weights) = model.bundle().unwrap();
+        let digest = format!("{:x}", Sha256::digest(&manifest));
+        let restored = TrainedSequenceModel::restore_bundle(&manifest, &digest, weights).unwrap();
+        assert_eq!(expected, restored.predict(&[1.0, 2.0, 3.0]).unwrap());
     }
 }
