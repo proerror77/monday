@@ -67,7 +67,10 @@ impl SequenceEnsemble {
                 first.identity.model_kind,
                 member.identity.seed,
             )?;
-            if member.identity != expected || member.training_examples != first.training_examples {
+            if member.identity != expected
+                || member.training_examples != first.training_examples
+                || member.scaling() != first.scaling()
+            {
                 return Err(
                     "SOL ensemble members have different inputs or training coverage".into(),
                 );
@@ -78,6 +81,29 @@ impl SequenceEnsemble {
 
     pub fn members(&self) -> &[SequenceFit] {
         &self.members
+    }
+
+    /// Bind entry costs and tail eligibility to this fitted ensemble's study.
+    pub fn decision_policy(
+        &self,
+        plan: &SolSequenceStudyV1,
+    ) -> Result<SequenceDecisionPolicy, String> {
+        let first = self.members.first().ok_or("empty SOL ensemble")?;
+        if first.identity.study_sha256 != plan.content_hash()? {
+            return Err("SOL entry policy differs from fitted study".into());
+        }
+        let fold = plan
+            .folds
+            .iter()
+            .find(|fold| {
+                fold.fold_id == first.identity.fold_id
+                    && fold.training_window_days == first.identity.training_window_days
+            })
+            .ok_or("missing fitted fold")?;
+        Ok(SequenceDecisionPolicy {
+            costs: plan.costs.clone(),
+            view: fold.validation,
+        })
     }
 
     pub fn predict(&self, inputs: &[f32]) -> Result<[f64; 3], String> {
@@ -286,6 +312,12 @@ fn neural_request(
 }
 
 impl SequenceFit {
+    fn scaling(&self) -> Option<&hft_research_ml::sequence::training::SequenceScalingV1> {
+        match &self.model {
+            FittedModel::Ridge(_) => None,
+            FittedModel::Neural(model) => Some(model.scaling()),
+        }
+    }
     pub fn fitted_content_sha256(&self) -> Result<String, String> {
         let parameters = match &self.model {
             FittedModel::Ridge(models) => {
@@ -456,7 +488,24 @@ pub struct SequenceEntryDecisionV1 {
     pub round_trip_gate_bps: f64,
 }
 
-pub fn sequence_entry_decision(
+pub struct SequenceDecisionPolicy {
+    costs: alpha_domain::EvaluationCostsV1,
+    view: hft_research_manifest::sequence::SequenceViewV1,
+}
+
+impl SequenceDecisionPolicy {
+    pub fn entry_decision(
+        &self,
+        prediction: &SequencePredictionV1,
+    ) -> Result<SequenceEntryDecisionV1, String> {
+        if prediction.observed_at_ms < self.view.decision_start_ms {
+            return Err("SOL entry precedes its fitted validation view".into());
+        }
+        sequence_entry_decision(prediction, &self.costs, self.view.end_ms)
+    }
+}
+
+fn sequence_entry_decision(
     prediction: &SequencePredictionV1,
     costs: &alpha_domain::EvaluationCostsV1,
     declared_end_ms: i64,
