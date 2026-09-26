@@ -4,6 +4,8 @@
 //! adapters. A row is usable only when its forward-return label was available by
 //! the declared training cutoff, which keeps model fitting point-in-time.
 
+pub mod sequence;
+
 use burn::{
     backend::{Autodiff, NdArray},
     config::Config,
