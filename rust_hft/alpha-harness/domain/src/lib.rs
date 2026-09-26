@@ -11,6 +11,7 @@ pub mod frozen_model;
 pub mod mlp_training;
 pub mod research_accelerator;
 pub mod sec_orderflow;
+pub mod sequence_study;
 pub use evaluation_calendar::{EvaluationCalendarBindingV1, EvaluationCalendarV1};
 pub use evaluation_partition::{EvaluationRowPartitionsV1, EvaluationSelectionV1};
 pub use mlp_training::{CexMlpFoldObservationV1, CexMlpTrainingPlanV1, CexMlpTrainingProfileV1};
@@ -150,6 +151,32 @@ pub struct EvaluationCostsV1 {
 }
 
 impl EvaluationCostsV1 {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        let capacity_disabled = self.position_notional_usd == 0.0
+            && self.capacity_depth_levels == 0
+            && self.max_book_depth_fraction == 0.0;
+        let capacity_enabled = self.position_notional_usd.is_finite()
+            && self.position_notional_usd > 0.0
+            && self.capacity_depth_levels > 0
+            && self.max_book_depth_fraction.is_finite()
+            && self.max_book_depth_fraction > 0.0
+            && self.max_book_depth_fraction <= 1.0;
+        if [
+            self.fee_bps,
+            self.rebate_bps,
+            self.funding_bps,
+            self.latency_bps,
+            self.slippage_bps,
+        ]
+        .iter()
+        .any(|value| !value.is_finite() || *value < 0.0)
+            || !(capacity_disabled || capacity_enabled)
+        {
+            return Err(DomainError::InvalidEvaluationProtocol);
+        }
+        Ok(())
+    }
+
     pub fn capacity_enabled(&self) -> bool {
         self.position_notional_usd > 0.0
     }
@@ -235,15 +262,7 @@ impl EvaluationProtocolV1 {
             .and_then(|rows| rows.checked_add(self.walk_forward.initial_train_rows))
             .and_then(|rows| rows.checked_add(self.walk_forward.purge_rows))
             .and_then(|rows| rows.checked_add(self.walk_forward.sealed_holdout_rows));
-        let capacity_disabled = self.costs.position_notional_usd == 0.0
-            && self.costs.capacity_depth_levels == 0
-            && self.costs.max_book_depth_fraction == 0.0;
-        let capacity_enabled = self.costs.position_notional_usd.is_finite()
-            && self.costs.position_notional_usd > 0.0
-            && self.costs.capacity_depth_levels > 0
-            && self.costs.max_book_depth_fraction.is_finite()
-            && self.costs.max_book_depth_fraction > 0.0
-            && self.costs.max_book_depth_fraction <= 1.0;
+        self.costs.validate()?;
         let version_valid = match (&*self.version, &self.selection) {
             (EVALUATION_PROTOCOL_VERSION_V1, None) => self.calendar.is_none(),
             (EVALUATION_PROTOCOL_VERSION_V2 | EVALUATION_PROTOCOL_VERSION_V3, Some(selection)) => {
@@ -276,16 +295,6 @@ impl EvaluationProtocolV1 {
             || self.labels.observation_frequency_millis == 0
             || self.walk_forward.purge_rows < self.labels.horizon_buckets
             || schedule_end.is_none()
-            || [
-                self.costs.fee_bps,
-                self.costs.rebate_bps,
-                self.costs.funding_bps,
-                self.costs.latency_bps,
-                self.costs.slippage_bps,
-            ]
-            .iter()
-            .any(|value| !value.is_finite() || *value < 0.0)
-            || !(capacity_disabled || capacity_enabled)
             || self.metrics != EvaluationMetricDefinitionsV1::default()
         {
             return Err(DomainError::InvalidEvaluationProtocol);

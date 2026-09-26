@@ -25,6 +25,29 @@ pub struct SequenceInputSpecV1 {
 }
 
 impl SequenceInputSpecV1 {
+    pub fn sol_lob() -> Self {
+        let mut ordered_channels = vec!["mid_return_1".to_string()];
+        for side in ["bid", "ask"] {
+            for level in 1..=5 {
+                ordered_channels.push(format!("{side}_{level}_distance_bps"));
+                ordered_channels.push(format!("{side}_{level}_log_quantity"));
+            }
+        }
+        ordered_channels.extend(
+            [
+                "aggregate_trade_log_base_volume",
+                "aggregate_trade_signed_base_asinh",
+                "aggregate_trade_log_count",
+            ]
+            .map(str::to_string),
+        );
+        Self {
+            ordered_channels,
+            context_rows: 60,
+            bucket_ms: 1000,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.ordered_channels.is_empty()
             || self.ordered_channels.len() > MAX_SEQUENCE_CHANNELS
@@ -62,6 +85,8 @@ pub struct SequenceFrameV1 {
     pub series_id: u64,
     pub observed_at_ms: i64,
     pub feature_max_available_at_ms: i64,
+    /// Decision-time metadata for the cost gate; never part of learned inputs.
+    pub spread_bps: f64,
     pub channels: Vec<f32>,
     /// Fractional simple mid returns in the fixed 5/10/30 second order.
     pub forward_returns: [f32; 3],
@@ -74,6 +99,8 @@ impl SequenceFrameV1 {
         if self.observed_at_ms < 0
             || self.feature_max_available_at_ms < 0
             || self.feature_max_available_at_ms > self.observed_at_ms
+            || !self.spread_bps.is_finite()
+            || self.spread_bps < 0.0
             || self.observed_at_ms % spec.bucket_ms as i64 != 0
             || self.channels.len() != spec.ordered_channels.len()
             || self
@@ -178,6 +205,8 @@ pub struct SequenceViewV1 {
     pub history_start_ms: i64,
     pub decision_start_ms: i64,
     pub end_ms: i64,
+    /// A frozen training-anchor grid; validation normally retains every second.
+    pub decision_stride_ms: i64,
 }
 
 impl SequenceViewV1 {
@@ -185,6 +214,9 @@ impl SequenceViewV1 {
         if self.history_start_ms < 0
             || self.decision_start_ms < self.history_start_ms
             || self.end_ms <= self.decision_start_ms
+            || self.decision_stride_ms <= 0
+            || self.decision_stride_ms > 86_400_000
+            || self.decision_stride_ms % 1000 != 0
             || [self.history_start_ms, self.decision_start_ms, self.end_ms]
                 .iter()
                 .any(|t| t % 1000 != 0)
@@ -222,6 +254,7 @@ mod tests {
             series_id: 1,
             observed_at_ms: 1000,
             feature_max_available_at_ms: 1000,
+            spread_bps: 1.0,
             channels: vec![1.0],
             forward_returns: [0.0; 3],
             label_available_at_ms: [6000, 11000, 31000],

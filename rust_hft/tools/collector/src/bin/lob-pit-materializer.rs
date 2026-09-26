@@ -1443,26 +1443,7 @@ fn sample_book(
 }
 
 fn sequence_input_spec() -> SequenceInputSpecV1 {
-    let mut ordered_channels = vec!["mid_return_1".to_string()];
-    for side in ["bid", "ask"] {
-        for level in 1..=5 {
-            ordered_channels.push(format!("{side}_{level}_distance_bps"));
-            ordered_channels.push(format!("{side}_{level}_log_quantity"));
-        }
-    }
-    ordered_channels.extend(
-        [
-            "aggregate_trade_log_base_volume",
-            "aggregate_trade_signed_base_asinh",
-            "aggregate_trade_log_count",
-        ]
-        .map(str::to_string),
-    );
-    SequenceInputSpecV1 {
-        ordered_channels,
-        context_rows: 60,
-        bucket_ms: 1000,
-    }
+    SequenceInputSpecV1::sol_lob()
 }
 
 fn sequence_frame(replay: &Replay, row: &PointInTimeFeatureRow) -> Result<SequenceFrameV1> {
@@ -1537,6 +1518,7 @@ fn sequence_frame(replay: &Replay, row: &PointInTimeFeatureRow) -> Result<Sequen
             .context("sequence recovery identity is missing")?,
         observed_at_ms: row.event_time.timestamp_millis(),
         feature_max_available_at_ms: row.feature_available_time.timestamp_millis(),
+        spread_bps: field("spread_bps")?,
         channels,
         forward_returns,
         label_available_at_ms,
