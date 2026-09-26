@@ -1478,7 +1478,9 @@ fn sequence_frame(replay: &Replay, row: &PointInTimeFeatureRow) -> Result<Sequen
         .samples
         .get(index)
         .context("sequence decision has no book sample")?;
-    if current.time_ns != clock || current.series_id != row.series_id {
+    // PIT rows renumber surviving series after cropping. The receive clock is
+    // the stable join to the original replay; normalized IDs are not replay IDs.
+    if current.time_ns != clock {
         bail!("sequence decision differs from its admitted PIT sample");
     }
     let levels = current
@@ -1531,7 +1533,7 @@ fn sequence_frame(replay: &Replay, row: &PointInTimeFeatureRow) -> Result<Sequen
         series_id: *replay
             .cont_ofi
             .series_started_at_ns
-            .get(&row.series_id)
+            .get(&current.series_id)
             .context("sequence recovery identity is missing")?,
         observed_at_ms: row.event_time.timestamp_millis(),
         feature_max_available_at_ms: row.feature_available_time.timestamp_millis(),
@@ -2611,6 +2613,30 @@ mod tests {
         }
         replay.samples[middle + 30].series_id += 1;
         assert!(sequence_frame(&replay, &rows[0]).is_err());
+
+        // Cropping removes the first capture series and PIT renumbers the
+        // surviving series to 1. Its recovery identity still belongs to replay 2.
+        replay.start_series(state(200), event_ns(200_000)).unwrap();
+        for second in 200..=400 {
+            replay.state = Some(state(second));
+            replay.emit_at(event_ns(second as u64 * 1000)).unwrap();
+        }
+        args.output_start_received_at_ns = Some(event_ns(210_000));
+        args.output_end_received_at_ns = Some(event_ns(400_000));
+        let cropped = materialize_rows(
+            &replay,
+            &[],
+            true,
+            &args,
+            &BTreeMap::new(),
+            "SOLUSDT",
+            datetime_ns(event_ns(400_000)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cropped[0].series_id, 1);
+        let frame = sequence_frame(&replay, &cropped[0]).unwrap();
+        assert_eq!(frame.series_id, event_ns(200_000));
+        assert_eq!(frame.forward_returns[2], cropped[0].label as f32);
     }
 
     #[test]
