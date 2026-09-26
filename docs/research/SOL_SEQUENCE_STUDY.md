@@ -108,3 +108,18 @@ cover feature availability, label maturity, gap/session resets, immutable shard
 identities, future-prefix invariance, actual delayed-context convolution, finite
 raw-return learning, deterministic refitting and tamper-resistant weight/scaling
 roundtrips. Controlled fixtures establish software behavior, never market alpha.
+
+The sequence dataset `source_manifest_sha256` names its PIT snapshot (or the
+admitted multi-source PIT index). A fold's `replay_manifest_sha256` names the
+validation matching Parquet manifest. These are distinct artifact types and
+cannot be compared for equality; training also uses an earlier time interval.
+The comparison library pins the exact sequence dataset and fold hashes. The
+Campaign admission layer must verify the original PIT receipts and compare
+validation source segments against the matching replay before granting any
+research/economic outcome. Library fit success alone does not make this claim.
+
+An ensemble also requires identical train-only scaling across both neural seeds.
+Its entry policy is constructed from the fitted study identity, so callers
+cannot substitute cheaper fees or a later exit boundary while preserving that
+identity. Each declared training view must permit at least 64 mature anchors;
+validation and sealed views must each permit a mature decision.

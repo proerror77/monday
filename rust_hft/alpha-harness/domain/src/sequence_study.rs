@@ -7,6 +7,15 @@ use std::collections::BTreeSet;
 pub const SOL_SEQUENCE_STUDY_SCHEMA: &str = "monday.sol_sequence_study.v1";
 const DAY_MS: i64 = 86_400_000;
 
+fn mature_anchors(view: SequenceViewV1) -> i64 {
+    let span = view.end_ms - view.decision_start_ms - 30_000;
+    if span <= 0 {
+        0
+    } else {
+        (span - 1) / view.decision_stride_ms + 1
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SequenceStudyModelV1 {
@@ -94,6 +103,7 @@ impl SolSequenceStudyV1 {
             || !valid_sha256(&self.sealed_dataset_sha256)
             || self.primary_horizon_ms != 30_000
             || self.sealed_view.decision_start_ms - self.sealed_view.history_start_ms < 59_000
+            || mature_anchors(self.sealed_view) == 0
             || self.max_primary_fits != 30
             || self.max_verification_fits != 30
             || !(1..=16_384).contains(&self.neural_updates)
@@ -135,6 +145,8 @@ impl SolSequenceStudyV1 {
                 || fold.train.end_ms >= fold.validation.history_start_ms
                 || fold.validation.end_ms >= self.sealed_view.history_start_ms
                 || fold.validation.decision_stride_ms != 1000
+                || mature_anchors(fold.train) < 64
+                || mature_anchors(fold.validation) == 0
                 || self.sealed_view.decision_stride_ms != 1000
                 || (fold.train.end_ms - fold.train.decision_start_ms - 1)
                     / fold.train.decision_stride_ms
@@ -308,6 +320,25 @@ mod tests {
         assert!(changed.validate().is_err());
         let mut changed = study;
         changed.costs.fee_bps = f64::NAN;
+        assert!(changed.validate().is_err());
+    }
+
+    #[test]
+    fn sequence_study_rejects_views_without_mature_anchors() {
+        let study = plan();
+        let mut changed = study.clone();
+        changed.folds[0].train.decision_start_ms = changed.folds[0].train.end_ms - 30_000;
+        assert!(changed.validate().is_err());
+        changed = study.clone();
+        changed.folds[0].train.decision_stride_ms = 86_400_000;
+        assert!(changed.validate().is_err());
+        changed = study.clone();
+        for fold in &mut changed.folds {
+            fold.validation.decision_start_ms = fold.validation.end_ms - 30_000;
+        }
+        assert!(changed.validate().is_err());
+        changed = study;
+        changed.sealed_view.decision_start_ms = changed.sealed_view.end_ms - 30_000;
         assert!(changed.validate().is_err());
     }
 }
