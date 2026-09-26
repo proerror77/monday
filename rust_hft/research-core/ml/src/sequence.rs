@@ -15,6 +15,7 @@ pub const MAX_SEQUENCE_BATCH: usize = 256;
 #[derive(Debug, Clone, PartialEq)]
 pub struct SequenceExample {
     pub observed_at_ms: i64,
+    pub spread_bps: f64,
     /// Time-major [context, channels], oldest first. Includes no target values.
     pub inputs: Vec<f32>,
     pub targets: [f32; 3],
@@ -106,6 +107,18 @@ impl SequenceReader {
         &self.dataset.input
     }
 
+    pub fn dataset_digest(&self) -> Result<String, String> {
+        self.dataset.digest()
+    }
+
+    pub fn view(&self) -> SequenceViewV1 {
+        self.view
+    }
+
+    pub fn is_at_start(&self) -> bool {
+        self.shard_index == 0 && self.shard.is_none() && self.history.is_empty() && !self.finished
+    }
+
     pub fn rewind(&mut self) -> Result<(), String> {
         if !self.finished {
             return Err("cannot rewind an incompletely verified sequence pass".into());
@@ -157,6 +170,9 @@ impl SequenceReader {
             let last = self.history.back().expect("pushed frame");
             if self.history.len() != self.dataset.input.context_rows
                 || last.observed_at_ms < self.view.decision_start_ms
+                || (last.observed_at_ms - self.view.decision_start_ms)
+                    % self.view.decision_stride_ms
+                    != 0
                 || last
                     .label_available_at_ms
                     .iter()
@@ -166,6 +182,7 @@ impl SequenceReader {
             }
             batch.push(SequenceExample {
                 observed_at_ms: last.observed_at_ms,
+                spread_bps: last.spread_bps,
                 inputs: self
                     .history
                     .iter()
@@ -257,6 +274,7 @@ mod tests {
                 series_id: 0,
                 observed_at_ms: i * 1000,
                 feature_max_available_at_ms: i * 1000,
+                spread_bps: 1.0,
                 channels: vec![i as f32],
                 forward_returns: [i as f32 / 10_000.0; 3],
                 label_available_at_ms: [i * 1000 + 5000, i * 1000 + 10000, i * 1000 + 30000],
@@ -303,6 +321,7 @@ mod tests {
                 history_start_ms: 0,
                 decision_start_ms: 0,
                 end_ms,
+                decision_stride_ms: 1000,
             },
         )
         .unwrap()
@@ -357,6 +376,22 @@ mod tests {
     }
 
     #[test]
+    fn sequence_anchor_stride_keeps_full_context_and_rejects_zero_stride() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut input = reader(dir.path(), &frames(), 60000);
+        input.view.decision_stride_ms = 7000;
+        let samples = input.next_batch(256).unwrap();
+        assert_eq!(
+            samples.iter().map(|s| s.observed_at_ms).collect::<Vec<_>>(),
+            [7000, 14000, 21000, 28000]
+        );
+        assert_eq!(samples[0].inputs, [5.0, 6.0, 7.0]);
+        let mut view = input.view;
+        view.decision_stride_ms = 0;
+        assert!(view.validate().is_err());
+    }
+
+    #[test]
     fn sequence_rejects_wrong_identity_duplicates_and_changed_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let rows = frames();
@@ -382,7 +417,8 @@ mod tests {
             SequenceViewV1 {
                 history_start_ms: 0,
                 decision_start_ms: 0,
-                end_ms: 100000
+                end_ms: 100000,
+                decision_stride_ms: 1000
             }
         )
         .is_err());
@@ -426,6 +462,10 @@ mod tests {
         let restored =
             TrainedSequenceModel::restore_bundle(&manifest, &digest, weights.clone()).unwrap();
         assert_eq!(predicted, restored.predict(&sample).unwrap());
+        assert_eq!(
+            trained.parameter_digest().unwrap(),
+            restored.parameter_digest().unwrap()
+        );
         let mut changed_manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
         changed_manifest["scaling"]["target_means"][0] = serde_json::json!(1.0);
         assert!(TrainedSequenceModel::restore_bundle(
@@ -446,6 +486,10 @@ mod tests {
         let repeated = train_sequence_model(&mut second, second_request).unwrap();
         assert_eq!(trained.scaling(), repeated.scaling());
         assert_eq!(predicted, repeated.predict(&sample).unwrap());
+        assert_eq!(
+            trained.parameter_digest().unwrap(),
+            repeated.parameter_digest().unwrap()
+        );
     }
 
     #[test]
