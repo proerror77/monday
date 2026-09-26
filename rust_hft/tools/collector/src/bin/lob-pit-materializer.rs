@@ -19,6 +19,10 @@ use hft_collector::binance_usdm_reference_artifact::{
 };
 use hft_collector::{DataModality, PointInTimeFeatureRow};
 use hft_core::{top5_book_features, TOP5_DEPTH};
+use hft_research_manifest::sequence::{
+    SequenceDatasetV1, SequenceFrameV1, SequenceInputSpecV1, SequenceShardV1,
+    SEQUENCE_DATASET_SCHEMA, SEQUENCE_HORIZONS_MS,
+};
 use hft_research_manifest::{
     CexArtifactTripletV2, CexInstrumentRulesV2, CexPitSeriesEvidenceV2, CexReplaySegmentIdentity,
     CexReplaySeriesV1, CexReplaySnapshotV5, CexSpotInstrumentRulesV1, CexSpotNotionalFilterV1,
@@ -77,6 +81,9 @@ struct Args {
     label_horizon_buckets: usize,
     #[arg(long, default_value_t = 5)]
     top_depth: usize,
+    /// Export a separate SOL 60-row sequence dataset from the same verified replay.
+    #[arg(long)]
+    sequence_output: bool,
     /// Decision and label-maturity window; input blobs retain complete provenance.
     #[arg(long, requires = "output_end_received_at_ns")]
     output_start_received_at_ns: Option<u64>,
@@ -154,6 +161,7 @@ struct BookSample {
     near_depth_concentration_skew_top5: Option<f64>,
     vwap_center_deviation_top5_bps: Option<f64>,
     book_imbalance: f64,
+    levels: Option<Box<[[f64; 2]; 10]>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -184,6 +192,10 @@ struct MaterializationReport {
     spot_instrument_rules: Option<SpotInstrumentRules>,
     snapshot: CexReplaySnapshotV5,
     snapshot_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sequence_manifest_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sequence_manifest_sha256: Option<String>,
     created_at: DateTime<Utc>,
 }
 
@@ -223,6 +235,7 @@ struct Replay {
     series_id: u64,
     best_quote: Option<BestQuote>,
     cont_ofi: ContOfiTape,
+    capture_levels: bool,
 }
 
 impl Replay {
@@ -236,6 +249,7 @@ impl Replay {
             series_id: 0,
             best_quote: None,
             cont_ofi: ContOfiTape::default(),
+            capture_levels: false,
         }
     }
 
@@ -291,12 +305,21 @@ impl Replay {
                 return Ok(());
             }
             let state = self.state.as_ref().context("bucket has no replay state")?;
-            self.samples.push(sample_book(
-                state,
-                self.series_id,
-                next_bucket_ns,
-                self.depth,
-            )?);
+            let mut sample = sample_book(state, self.series_id, next_bucket_ns, self.depth)?;
+            if self.capture_levels {
+                let levels = state
+                    .bids
+                    .iter()
+                    .rev()
+                    .take(5)
+                    .chain(state.asks.iter().take(5))
+                    .map(|(price, quantity)| Ok([decimal_f64(*price)?, decimal_f64(*quantity)?]))
+                    .collect::<Result<Vec<_>>>()?;
+                sample.levels = Some(Box::new(levels.try_into().map_err(|_| {
+                    anyhow::anyhow!("sequence sample requires five levels on both sides")
+                })?));
+            }
+            self.samples.push(sample);
             self.next_bucket_ns = Some(
                 next_bucket_ns
                     .checked_add(self.bucket_ns)
@@ -416,6 +439,15 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
     if args.bucket_ms == 0 || args.label_horizon_buckets == 0 || args.top_depth == 0 {
         bail!("bucket, label horizon, and top depth must be positive");
     }
+    if args.sequence_output
+        && (symbol != "SOLUSDT"
+            || !matches!(args.market, Market::Usdm)
+            || args.bucket_ms != 1000
+            || args.top_depth != 5
+            || args.label_horizon_buckets != 30)
+    {
+        bail!("sequence output requires SOLUSDT USD-M, 1s/top5 and a 30-second primary label");
+    }
     log_event(
         "segment_verification_started",
         json!({"segment_count": args.segment.len()}),
@@ -444,6 +476,7 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         .checked_mul(1_000_000)
         .context("bucket size overflow")?;
     let mut replay = Replay::new(bucket_ns, args.top_depth);
+    replay.capture_levels = args.sequence_output;
     let mut aggregate_trades = Vec::new();
     let mut has_aggregate_trades = None;
     log_event(
@@ -493,6 +526,9 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         );
     }
     let has_aggregate_trades = has_aggregate_trades.unwrap_or(false);
+    if args.sequence_output && !has_aggregate_trades {
+        bail!("sequence output requires verified aggregate-trade coverage");
+    }
     log_event(
         "lob_replay_completed",
         json!({
@@ -630,6 +666,10 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         json!({"artifact_sha256": &artifact_sha256}),
     );
     let snapshot_sha256 = snapshot.sha256();
+    let sequence = args
+        .sequence_output
+        .then(|| publish_sequence_dataset(&replay, &rows, &snapshot_sha256, &args.artifact_dir))
+        .transpose()?;
 
     let report = MaterializationReport {
         dataset_kind: "lob_point_in_time_materialization".to_string(),
@@ -653,6 +693,8 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         spot_instrument_rules,
         snapshot,
         snapshot_sha256,
+        sequence_manifest_path: sequence.as_ref().map(|(path, _)| path.clone()),
+        sequence_manifest_sha256: sequence.map(|(_, hash)| hash),
         created_at,
     };
     let report_bytes = serde_json::to_vec_pretty(&report)?;
@@ -1396,7 +1438,161 @@ fn sample_book(
             let ask_size = decimal_f64(**best_ask_quantity)?;
             (bid_size - ask_size) / (bid_size + ask_size)
         },
+        levels: None,
     })
+}
+
+fn sequence_input_spec() -> SequenceInputSpecV1 {
+    let mut ordered_channels = vec!["mid_return_1".to_string()];
+    for side in ["bid", "ask"] {
+        for level in 1..=5 {
+            ordered_channels.push(format!("{side}_{level}_distance_bps"));
+            ordered_channels.push(format!("{side}_{level}_log_quantity"));
+        }
+    }
+    ordered_channels.extend(
+        [
+            "aggregate_trade_log_base_volume",
+            "aggregate_trade_signed_base_asinh",
+            "aggregate_trade_log_count",
+        ]
+        .map(str::to_string),
+    );
+    SequenceInputSpecV1 {
+        ordered_channels,
+        context_rows: 60,
+        bucket_ms: 1000,
+    }
+}
+
+fn sequence_frame(replay: &Replay, row: &PointInTimeFeatureRow) -> Result<SequenceFrameV1> {
+    let clock = u64::try_from(
+        row.event_time
+            .timestamp_nanos_opt()
+            .context("sequence clock overflow")?,
+    )?;
+    let index = replay
+        .samples
+        .partition_point(|sample| sample.time_ns < clock);
+    let current = replay
+        .samples
+        .get(index)
+        .context("sequence decision has no book sample")?;
+    if current.time_ns != clock || current.series_id != row.series_id {
+        bail!("sequence decision differs from its admitted PIT sample");
+    }
+    let levels = current
+        .levels
+        .as_ref()
+        .context("sequence levels were not captured")?;
+    let field = |name: &str| {
+        row.features
+            .get(name)
+            .copied()
+            .with_context(|| format!("sequence source field {name} is missing"))
+    };
+    let mut channels = vec![field("mid_return_1")? as f32];
+    for [price, quantity] in levels.iter() {
+        channels.push(((price / current.mid_price - 1.0) * 10_000.0) as f32);
+        channels.push(quantity.ln_1p() as f32);
+    }
+    let base = field("aggregate_trade_base_volume")?;
+    let count = field("aggregate_trade_count")?;
+    if base < 0.0 || count < 0.0 {
+        bail!("sequence trade quantity or count is negative");
+    }
+    channels.extend([
+        base.ln_1p() as f32,
+        (base * field("aggregate_trade_flow_imbalance")?).asinh() as f32,
+        count.ln_1p() as f32,
+    ]);
+    let mut forward_returns = [0.0; 3];
+    let mut label_available_at_ms = [0; 3];
+    for (target, horizon) in SEQUENCE_HORIZONS_MS.iter().enumerate() {
+        let future = replay
+            .samples
+            .get(index + (*horizon / 1000) as usize)
+            .context("sequence label endpoint is missing")?;
+        if future.series_id != current.series_id
+            || future.time_ns
+                != clock
+                    .checked_add(*horizon as u64 * 1_000_000)
+                    .context("sequence endpoint overflow")?
+        {
+            bail!("sequence label crosses a gap or recovery series");
+        }
+        forward_returns[target] = (future.mid_price / current.mid_price - 1.0) as f32;
+        label_available_at_ms[target] = i64::try_from(future.time_ns / 1_000_000)?;
+    }
+    if forward_returns[2] != row.label as f32 {
+        bail!("sequence 30-second target differs from the original PIT label");
+    }
+    let frame = SequenceFrameV1 {
+        series_id: *replay
+            .cont_ofi
+            .series_started_at_ns
+            .get(&row.series_id)
+            .context("sequence recovery identity is missing")?,
+        observed_at_ms: row.event_time.timestamp_millis(),
+        feature_max_available_at_ms: row.feature_available_time.timestamp_millis(),
+        channels,
+        forward_returns,
+        label_available_at_ms,
+    };
+    frame
+        .validate(&sequence_input_spec())
+        .map_err(anyhow::Error::msg)?;
+    Ok(frame)
+}
+
+fn publish_sequence_dataset(
+    replay: &Replay,
+    rows: &[PointInTimeFeatureRow],
+    source_sha256: &str,
+    output: &Path,
+) -> Result<(PathBuf, String)> {
+    let mut shards = Vec::new();
+    // Bounded hourly-size shards; overlapping model windows are constructed by
+    // the reader and never copied into the stored dataset.
+    for chunk in rows.chunks(3600) {
+        let mut bytes = Vec::new();
+        for row in chunk {
+            serde_json::to_writer(&mut bytes, &sequence_frame(replay, row)?)?;
+            bytes.push(b'\n');
+        }
+        let sha256 = hex::encode(Sha256::digest(&bytes));
+        let file = format!("{sha256}.sequence.jsonl");
+        publish_immutable(&output.join(&file), &bytes)?;
+        shards.push(SequenceShardV1 {
+            file,
+            sha256,
+            bytes: bytes.len() as u64,
+            rows: chunk.len() as u64,
+            first_observed_at_ms: chunk
+                .first()
+                .context("empty sequence shard")?
+                .event_time
+                .timestamp_millis(),
+            last_observed_at_ms: chunk
+                .last()
+                .context("empty sequence shard")?
+                .event_time
+                .timestamp_millis(),
+        });
+    }
+    let dataset = SequenceDatasetV1 {
+        schema_version: SEQUENCE_DATASET_SCHEMA.into(),
+        venue: "binance-usdm".into(),
+        symbol: "SOLUSDT".into(),
+        source_manifest_sha256: source_sha256.into(),
+        input: sequence_input_spec(),
+        shards,
+    };
+    dataset.validate().map_err(anyhow::Error::msg)?;
+    let hash = dataset.digest().map_err(anyhow::Error::msg)?;
+    let path = output.join(format!("{hash}.sequence.json"));
+    publish_immutable(&path, &serde_json::to_vec(&dataset)?)?;
+    Ok((path, hash))
 }
 
 fn best_quote(state: &BookState) -> Result<BestQuote> {
@@ -2286,7 +2482,7 @@ mod tests {
             Args {
                 mission_id: "data-btc-usdm-1".to_string(), symbol: "BTCUSDT".to_string(),
                 market: self.market, bucket_ms: 1_000, label_horizon_buckets: 2, top_depth: 5,
-                output_start_received_at_ns: None, output_end_received_at_ns: None,
+                output_start_received_at_ns: None, output_end_received_at_ns: None, sequence_output: false,
                 segment: vec![self.data.clone()],
                 segment_content_sha256: vec![self.content_sha256.clone()], segment_manifest_sha256: vec![self.manifest_sha256.clone()],
                 artifact_dir: self.directory.join("artifacts"),
@@ -2322,6 +2518,99 @@ mod tests {
         let error = materialize(&args).unwrap_err().to_string();
 
         assert!(error.contains("equal nonzero lengths"));
+    }
+
+    #[test]
+    fn sequence_output_rejects_an_unregistered_instrument_before_input_access() {
+        let fixture = Fixture::new(Market::Usdm, &valid_rows("usdm"));
+        let mut args = fixture.args();
+        args.sequence_output = true;
+        assert!(materialize(&args)
+            .unwrap_err()
+            .to_string()
+            .contains("SOLUSDT"));
+    }
+
+    #[test]
+    fn sequence_export_binds_raw_levels_and_all_three_pit_targets() {
+        let fixture = Fixture::new(Market::Usdm, &valid_rows("usdm"));
+        let mut args = fixture.args();
+        args.symbol = "SOLUSDT".into();
+        args.label_horizon_buckets = 30;
+        args.sequence_output = true;
+        let state = |second: i64| BookState {
+            bids: (0..5)
+                .map(|level| {
+                    (
+                        Decimal::from(100 - level) + Decimal::new(second, 2),
+                        Decimal::from(level + 1),
+                    )
+                })
+                .collect(),
+            asks: (0..5)
+                .map(|level| {
+                    (
+                        Decimal::from(102 + level) + Decimal::new(second, 2),
+                        Decimal::from(level + 6),
+                    )
+                })
+                .collect(),
+        };
+        let mut replay = Replay::new(1_000_000_000, 5);
+        replay.capture_levels = true;
+        replay.start_series(state(0), START_NS).unwrap();
+        for second in 0..=180 {
+            replay.state = Some(state(second));
+            replay.emit_at(event_ns(second as u64 * 1000)).unwrap();
+        }
+        let rows = materialize_rows(
+            &replay,
+            &[],
+            true,
+            &args,
+            &BTreeMap::new(),
+            "SOLUSDT",
+            datetime_ns(event_ns(180000)).unwrap(),
+        )
+        .unwrap();
+        let frame = sequence_frame(&replay, &rows[0]).unwrap();
+        assert_eq!(frame.channels.len(), 24);
+        let middle = replay
+            .samples
+            .iter()
+            .position(|sample| sample.time_ns / 1_000_000 == frame.observed_at_ms as u64)
+            .unwrap();
+        assert_eq!(frame.forward_returns[2], rows[0].label as f32);
+        for (i, horizon) in [5, 10, 30].into_iter().enumerate() {
+            let expected = (replay.samples[middle + horizon].mid_price
+                / replay.samples[middle].mid_price
+                - 1.0) as f32;
+            assert_eq!(frame.forward_returns[i], expected);
+        }
+        assert_eq!(frame.channels[2], 1.0_f64.ln_1p() as f32);
+        assert_eq!(frame.channels[12], 6.0_f64.ln_1p() as f32);
+        // A later book affects the target, never the current input channels.
+        let original_future = replay.samples[middle + 5].mid_price;
+        replay.samples[middle + 5].mid_price *= 1.01;
+        let changed = sequence_frame(&replay, &rows[0]).unwrap();
+        assert_eq!(frame.channels, changed.channels);
+        assert_ne!(frame.forward_returns[0], changed.forward_returns[0]);
+        replay.samples[middle + 5].mid_price = original_future;
+        let (path, hash) =
+            publish_sequence_dataset(&replay, &rows, &"b".repeat(64), &args.artifact_dir).unwrap();
+        let manifest: SequenceDatasetV1 =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(manifest.digest().unwrap(), hash);
+        assert_eq!(
+            manifest.shards.iter().map(|shard| shard.rows).sum::<u64>(),
+            rows.len() as u64
+        );
+        for shard in &manifest.shards {
+            let bytes = std::fs::read(args.artifact_dir.join(&shard.file)).unwrap();
+            assert_eq!(hex::encode(Sha256::digest(bytes)), shard.sha256);
+        }
+        replay.samples[middle + 30].series_id += 1;
+        assert!(sequence_frame(&replay, &rows[0]).is_err());
     }
 
     #[test]
