@@ -492,6 +492,60 @@ pub fn train_sequence_model(
 }
 
 impl TrainedSequenceModel {
+    /// Refits compare fitted values rather than container metadata or Param IDs.
+    pub fn parameter_digest(&self) -> Result<String, String> {
+        let _guard = lock_ndarray_backend().map_err(|e| e.to_string())?;
+        struct Visitor {
+            digest: Sha256,
+            index: u64,
+            error: Option<String>,
+        }
+        impl ModuleVisitor<CpuBackend> for Visitor {
+            fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<CpuBackend, D>>) {
+                let tensor = param.val();
+                self.digest.update(self.index.to_le_bytes());
+                self.digest.update((D as u64).to_le_bytes());
+                for dimension in tensor.dims() {
+                    self.digest.update((dimension as u64).to_le_bytes());
+                }
+                match tensor.into_data().into_vec::<f32>() {
+                    Ok(values) => {
+                        for value in values {
+                            if !value.is_finite() {
+                                self.error = Some("non-finite sequence parameter".into());
+                            }
+                            self.digest.update(value.to_bits().to_le_bytes());
+                        }
+                    }
+                    Err(error) => self.error = Some(error.to_string()),
+                }
+                self.index += 1;
+            }
+        }
+        let mut visitor = Visitor {
+            digest: Sha256::new(),
+            index: 0,
+            error: None,
+        };
+        visitor
+            .digest
+            .update(b"monday.sequence-neural-parameters.v1");
+        visitor.digest.update(
+            serde_json::to_vec(&(
+                self.request.model_kind,
+                self.request.channels.len(),
+                self.request.hidden_channels,
+                self.request.input.context_rows,
+            ))
+            .map_err(|e| e.to_string())?,
+        );
+        self.model.visit(&mut visitor);
+        if let Some(error) = visitor.error {
+            return Err(error);
+        }
+        Ok(format!("{:x}", visitor.digest.finalize()))
+    }
+
     pub fn request(&self) -> &SequenceTrainingRequestV1 {
         &self.request
     }
@@ -528,6 +582,7 @@ impl TrainedSequenceModel {
         let _guard = lock_ndarray_backend().map_err(|e| e.to_string())?;
         let example = SequenceExample {
             observed_at_ms: 0,
+            spread_bps: 0.0,
             inputs: inputs.to_vec(),
             targets: [0.0; 3],
         };
