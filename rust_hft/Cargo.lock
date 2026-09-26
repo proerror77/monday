@@ -4779,13 +4779,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
-name = "hft-agent-control"
-version = "0.1.0"
-dependencies = [
- "sha2",
-]
-
-[[package]]
 name = "hft-all-in-one"
 version = "0.1.0"
 dependencies = [

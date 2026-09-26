@@ -3,6 +3,10 @@
 Stopped on 2026-09-25. Monday will not adopt AX. Parallel agent and CLI work
 uses `task-batch` on the existing lease/task admission path. The local kind
 cluster `monday-ax-lab` was deleted. Do not deploy AX or Substrate onto ACK.
+The unused library `hft-agent-control` at `rust_hft/apps/agent-control` was
+removed. Live admission remains `task-batch` in
+`.github/scripts/agent-worktree-preflight.sh`. The slice text below is the
+2026-09-23 plan, not a remaining instruction.
 
 - Date: 2026-09-23.
 - Baseline: `16a8bd252b7a7d8bda15e7ec2222ee874f1dcb0b`.

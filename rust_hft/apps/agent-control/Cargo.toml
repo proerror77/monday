@@ -1,9 +1,0 @@
-[package]
-name = "hft-agent-control"
-version = "0.1.0"
-edition = "2021"
-publish = false
-description = "Pure engineering-agent admission, recovery and evidence contracts"
-
-[dependencies]
-sha2 = { workspace = true }
