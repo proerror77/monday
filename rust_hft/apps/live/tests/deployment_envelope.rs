@@ -368,8 +368,7 @@ fn signed_frozen_model_bundle_loads_native_parameters_and_preserves_limits() {
             .clone(),
     )
     .unwrap();
-    let mut protocol = protocol.with_independent_selection(30).unwrap();
-    protocol.costs.cross_spread = true;
+    let protocol = protocol.with_independent_selection(30).unwrap();
     let source_ref = serde_json::json!({"id": "test-source", "content_sha256": "a".repeat(64)});
     let frozen: FrozenSupervisedCandidateV1 = serde_json::from_value(serde_json::json!({
         "schema_version": FROZEN_SUPERVISED_CANDIDATE_SCHEMA, "artifact_id": "",
@@ -446,7 +445,7 @@ fn signed_frozen_model_bundle_loads_native_parameters_and_preserves_limits() {
     assert_eq!(program.factors.len(), 1);
     assert_eq!(*max_order_notional, rust_decimal::Decimal::from(500));
     assert_eq!(execution_contract.venue, hft_core::VenueId::BINANCE_FUTURES);
-    assert!(execution_contract.cross_spread);
+    assert!(!execution_contract.cross_spread);
     assert!(config.venues[0].simulate_execution);
     assert_eq!(
         config.engine.intent_max_order_notional,

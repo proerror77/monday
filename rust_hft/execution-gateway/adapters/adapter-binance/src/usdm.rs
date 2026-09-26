@@ -1790,6 +1790,30 @@ mod tests {
         }
     }
 
+    fn cex_bounded_envelope(intent: ports::OrderIntent) -> OrderIntentEnvelope {
+        let now = hft_core::now_micros();
+        let mut envelope = OrderIntentEnvelope::new(
+            intent.clone(),
+            OrderIntentLifecycle {
+                created_ts: now,
+                max_slippage_bps: Some(25),
+                max_order_notional: Some(Decimal::from(1_000_000)),
+                max_order_quantity: Some(Decimal::from(10)),
+                max_latency_us: Some(60_000_000),
+                ..Default::default()
+            },
+        );
+        envelope.price_reference = Some(ports::ExecutionPriceReference {
+            venue: intent.target_venue.expect("usd-m test intent has a venue"),
+            symbol: intent.symbol.clone(),
+            side: intent.side,
+            price: intent.price.expect("usd-m test intent has a price"),
+            book_sequence: 1,
+            received_at: hft_core::LocalReceiveTimestamp::new(now),
+        });
+        envelope
+    }
+
     fn valid_order() -> BinanceUsdMOrder {
         BinanceUsdMOrder {
             symbol: "BTCUSDT".to_string(),
@@ -1900,12 +1924,8 @@ mod tests {
             BinanceCredentials::new("test-key".to_string(), "test-secret".to_string());
         cfg.rest_base_url = base_url;
         let mut client = BinanceUsdMExecutionClient::new(cfg);
-        let lifecycle = OrderIntentLifecycle {
-            reduce_only: true,
-            ..Default::default()
-        };
-        let envelope =
-            OrderIntentEnvelope::new(perp_intent(), lifecycle).with_client_order_id("client-usdm");
+        let mut envelope = cex_bounded_envelope(perp_intent()).with_client_order_id("client-usdm");
+        envelope.lifecycle.reduce_only = true;
 
         let order_id = client.place_order_envelope(&envelope).await.unwrap();
         assert_eq!(
@@ -2102,8 +2122,7 @@ mod tests {
             BinanceCredentials::new("test-key".to_string(), "test-secret".to_string());
         cfg.rest_base_url = base_url;
         let mut client = BinanceUsdMExecutionClient::new(cfg);
-        let envelope = OrderIntentEnvelope::new(perp_intent(), OrderIntentLifecycle::default())
-            .with_client_order_id("client-usdm");
+        let envelope = cex_bounded_envelope(perp_intent()).with_client_order_id("client-usdm");
 
         let error = client.place_order_envelope(&envelope).await.unwrap_err();
         assert!(
@@ -2124,8 +2143,7 @@ mod tests {
             BinanceCredentials::new("test-key".to_string(), "test-secret".to_string());
         cfg.rest_base_url = base_url;
         let mut client = BinanceUsdMExecutionClient::new(cfg);
-        let envelope = OrderIntentEnvelope::new(perp_intent(), OrderIntentLifecycle::default())
-            .with_client_order_id("client-usdm");
+        let envelope = cex_bounded_envelope(perp_intent()).with_client_order_id("client-usdm");
 
         let error = client.place_order_envelope(&envelope).await.unwrap_err();
         assert!(matches!(error, HftError::Network(message) if message.contains("outcome unknown")));
@@ -2320,6 +2338,8 @@ mod tests {
     async fn usd_m_both_envelope_entrypoints_apply_cex_gate_before_submission() {
         let lifecycle = OrderIntentLifecycle {
             max_slippage_bps: Some(25),
+            max_order_notional: Some(Decimal::from(10_000)),
+            max_order_quantity: Some(Decimal::from(10)),
             ..Default::default()
         };
         let envelope = OrderIntentEnvelope::new(perp_intent(), lifecycle)

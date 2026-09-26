@@ -237,15 +237,18 @@ impl EngineQueues {
                         self.stats.intent_max_latency_count += 1;
                     }
                     OrderIntentRejectReason::InvalidMaxOrderNotional { .. }
+                    | OrderIntentRejectReason::MissingMaxOrderNotional
                     | OrderIntentRejectReason::OrderNotionalUnpriceable { .. }
                     | OrderIntentRejectReason::MaxOrderNotionalExceeded { .. } => {
                         self.stats.intent_order_notional_count += 1;
                     }
                     OrderIntentRejectReason::InvalidMaxOrderQuantity { .. }
+                    | OrderIntentRejectReason::MissingMaxOrderQuantity
                     | OrderIntentRejectReason::MaxOrderQuantityExceeded { .. } => {
                         self.stats.intent_order_quantity_count += 1;
                     }
                     OrderIntentRejectReason::InvalidMaxSlippage { .. }
+                    | OrderIntentRejectReason::MissingMaxSlippage
                     | OrderIntentRejectReason::MissingSlippageReference
                     | OrderIntentRejectReason::SlippageReferenceMismatch
                     | OrderIntentRejectReason::MissingSlippageReferenceLifetime

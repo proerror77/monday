@@ -2421,20 +2421,37 @@ mod tests {
     #[tokio::test]
     async fn order_envelope_preserves_the_venue_link_id() {
         let mut client = BybitExecutionClient::new(make_test_config(ExecutionMode::Paper)).unwrap();
-        let envelope = OrderIntentEnvelope::new(
-            OrderIntent::crypto_spot(
-                Symbol::new("BTCUSDT"),
-                Side::Buy,
-                Quantity::from_f64(0.001).unwrap(),
-                OrderType::Limit,
-                Some(Price::from_f64(50_000.0).unwrap()),
-                TimeInForce::GTC,
-                "test_strategy".to_string(),
-                None,
-            ),
-            OrderIntentLifecycle::default(),
+        let intent = OrderIntent::crypto_spot(
+            Symbol::new("BTCUSDT"),
+            Side::Buy,
+            Quantity::from_f64(0.001).unwrap(),
+            OrderType::Limit,
+            Some(Price::from_f64(50_000.0).unwrap()),
+            TimeInForce::GTC,
+            "test_strategy".to_string(),
+            Some(hft_core::VenueId::BYBIT),
+        );
+        let now = hft_core::now_micros();
+        let mut envelope = OrderIntentEnvelope::new(
+            intent.clone(),
+            OrderIntentLifecycle {
+                created_ts: now,
+                max_slippage_bps: Some(25),
+                max_order_notional: Some(Decimal::from(1_000_000)),
+                max_order_quantity: Some(Decimal::from(10)),
+                max_latency_us: Some(60_000_000),
+                ..Default::default()
+            },
         )
         .with_client_order_id("bybit-link-42");
+        envelope.price_reference = Some(ports::ExecutionPriceReference {
+            venue: hft_core::VenueId::BYBIT,
+            symbol: intent.symbol.clone(),
+            side: intent.side,
+            price: intent.price.unwrap(),
+            book_sequence: 1,
+            received_at: hft_core::LocalReceiveTimestamp::new(now),
+        });
 
         assert_eq!(
             client.place_order_envelope(&envelope).await.unwrap(),
@@ -2447,6 +2464,8 @@ mod tests {
         let mut client = BybitExecutionClient::new(make_test_config(ExecutionMode::Paper)).unwrap();
         let lifecycle = OrderIntentLifecycle {
             max_slippage_bps: Some(25),
+            max_order_notional: Some(Decimal::from(10_000)),
+            max_order_quantity: Some(Decimal::from(10)),
             ..Default::default()
         };
         let envelope = OrderIntentEnvelope::new(
