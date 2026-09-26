@@ -81,6 +81,7 @@ SYMBOL=BTCUSDT
 BUCKET_MS=1000
 LABEL_HORIZON_BUCKETS=5
 TOP_DEPTH=5
+FEATURE_FAMILY=h1
 OUTPUT_PREFIX=test-run-1
 WINDOW_START_RECEIVED_AT_NS=1789005600000000000
 WINDOW_END_RECEIVED_AT_NS=1789006200000000000
@@ -142,17 +143,27 @@ set -eu
 artifact_dir=
 window_start=
 window_end=
+feature_family=
 while [ $# -gt 0 ]; do
   case "$1" in
     --artifact-dir) artifact_dir=$2; shift 2 ;;
     --output-start-received-at-ns) window_start=$2; shift 2 ;;
     --output-end-received-at-ns) window_end=$2; shift 2 ;;
+    --feature-family) feature_family=$2; shift 2 ;;
     *) shift ;;
   esac
 done
 [ -n "$artifact_dir" ] || exit 2
+# H2 calendars omit cont_ofi_lag60s under the materializer's silent H1 default.
+# Fail closed when H2 is requested but --feature-family h2 is missing.
+requested=${MONDAY_TEST_REQUESTED_FEATURE_FAMILY-}
+if [ "$requested" = h2 ] && [ "$feature_family" != h2 ]; then
+  printf 'H2 family requested but --feature-family h2 is missing\n' >&2
+  exit 1
+fi
 mkdir -p "$artifact_dir"
 printf '%s|%s\n' "$window_start" "$window_end" >"$artifact_dir/window-args.txt"
+printf '%s\n' "$feature_family" >"$artifact_dir/feature-family.txt"
 feature=$artifact_dir/feature-test.jsonl
 report=$artifact_dir/materialization-test.materialization.json
 printf 'feature-row\n' >"$feature"
@@ -252,6 +263,18 @@ MONDAY_TEST_VERIFY_CALLS=$ROOT/manifest-verifier-calls.log
 export MONDAY_TEST_VERIFY_CALLS
 chmod +x "$BIN_DIR/alpha-harness" "$BIN_DIR/binance-market-tape-slicer" "$BIN_DIR/lob-pit-materializer" "$BIN_DIR/binance-replay-parquet-materializer"
 
+grep -Fq -- '--feature-family "$feature_family"' "$ENTRYPOINT"
+
+if MONDAY_TEST_REQUESTED_FEATURE_FAMILY=h2 "$BIN_DIR/lob-pit-materializer" \
+  --artifact-dir "$ROOT/stub-h2-missing"; then
+  printf 'expected H2 without --feature-family to fail closed\n' >&2
+  exit 1
+fi
+MONDAY_TEST_REQUESTED_FEATURE_FAMILY=h2 "$BIN_DIR/lob-pit-materializer" \
+  --artifact-dir "$ROOT/stub-h2-ok" \
+  --feature-family h2 >/dev/null
+grep -Fx h2 "$ROOT/stub-h2-ok/feature-family.txt" >/dev/null
+
 if ! sh "$ENTRYPOINT" \
   --inventory "$ROOT/inventory.env" \
   --raw-root "$RAW_ROOT" \
@@ -265,6 +288,7 @@ fi
 
 [ "$(wc -l <"$MONDAY_TEST_VERIFY_CALLS" | tr -d ' ')" -eq 4 ]
 grep -Fx '1789005600000000000|1789006200000000000' "$WORK_ROOT/staged-output/artifacts/materialization/window-args.txt" >/dev/null
+grep -Fx h1 "$WORK_ROOT/staged-output/artifacts/materialization/feature-family.txt" >/dev/null
 grep -Fx "raw|usdm|1789005600000000000|1789006200000000000|$RAW_ROOT/$raw1_rel.manifest.json|$(printf '%s' "$raw1" | awk -F'|' '{print $2}')" "$MONDAY_TEST_VERIFY_CALLS" >/dev/null
 grep -Fx "reference|usdm|||$REF_ROOT/$ref1_rel.manifest.json|$(printf '%s' "$ref1" | awk -F'|' '{print $2}')" "$MONDAY_TEST_VERIFY_CALLS" >/dev/null
 for rejected_kind in raw reference; do
@@ -280,6 +304,52 @@ for rejected_kind in raw reference; do
   grep -Fq 'metadata verification failed' "$rejected_root/log"
   [ -z "$(find "$rejected_root/output" -type f -print)" ]
 done
+
+missing_family=$ROOT/missing-feature-family
+mkdir -p "$missing_family/output" "$missing_family/work"
+grep -v '^FEATURE_FAMILY=' "$ROOT/inventory.env" \
+  | sed -e 's/RUN_ID=test-run-1/RUN_ID=test-run-missing-family/' \
+    -e 's/OUTPUT_PREFIX=test-run-1/OUTPUT_PREFIX=test-run-missing-family/' \
+  >"$missing_family/inventory.env"
+if sh "$ENTRYPOINT" \
+  --inventory "$missing_family/inventory.env" --raw-root "$RAW_ROOT" --reference-root "$REF_ROOT" \
+  --output-root "$missing_family/output" --work-dir "$missing_family/work" \
+  --binary-dir "$BIN_DIR" --dry-run >"$missing_family/stdout" 2>"$missing_family/log"; then
+  printf 'expected missing FEATURE_FAMILY to fail closed\n' >&2
+  exit 1
+fi
+grep -Fq 'inventory variable is required: FEATURE_FAMILY' "$missing_family/log"
+[ -z "$(find "$missing_family/output" -type f -print)" ]
+
+invalid_family=$ROOT/invalid-feature-family
+mkdir -p "$invalid_family/output" "$invalid_family/work"
+sed -e 's/RUN_ID=test-run-1/RUN_ID=test-run-invalid-family/' \
+  -e 's/OUTPUT_PREFIX=test-run-1/OUTPUT_PREFIX=test-run-invalid-family/' \
+  -e 's/FEATURE_FAMILY=h1/FEATURE_FAMILY=h3/' \
+  "$ROOT/inventory.env" >"$invalid_family/inventory.env"
+if sh "$ENTRYPOINT" \
+  --inventory "$invalid_family/inventory.env" --raw-root "$RAW_ROOT" --reference-root "$REF_ROOT" \
+  --output-root "$invalid_family/output" --work-dir "$invalid_family/work" \
+  --binary-dir "$BIN_DIR" --dry-run >"$invalid_family/stdout" 2>"$invalid_family/log"; then
+  printf 'expected invalid FEATURE_FAMILY to fail closed\n' >&2
+  exit 1
+fi
+grep -Fq 'FEATURE_FAMILY must be h1 or h2' "$invalid_family/log"
+
+h2_root=$ROOT/h2-family
+mkdir -p "$h2_root/output" "$h2_root/work"
+sed -e 's/RUN_ID=test-run-1/RUN_ID=test-run-h2/' \
+  -e 's/OUTPUT_PREFIX=test-run-1/OUTPUT_PREFIX=test-run-h2/' \
+  -e 's/FEATURE_FAMILY=h1/FEATURE_FAMILY=h2/' \
+  "$ROOT/inventory.env" >"$h2_root/inventory.env"
+if ! MONDAY_TEST_REQUESTED_FEATURE_FAMILY=h2 sh "$ENTRYPOINT" \
+  --inventory "$h2_root/inventory.env" --raw-root "$RAW_ROOT" --reference-root "$REF_ROOT" \
+  --output-root "$h2_root/output" --work-dir "$h2_root/work" \
+  --binary-dir "$BIN_DIR" >/dev/null 2>"$h2_root/log"; then
+  cat "$h2_root/log" >&2
+  exit 1
+fi
+grep -Fx h2 "$h2_root/work/staged-output/artifacts/materialization/feature-family.txt" >/dev/null
 
 grep -Fq "progress_event raw_verification \"\$seen\" \"\$verify_total\" 10" "$ENTRYPOINT"
 grep -Fq "progress_event reference_verification \"\$i\" \"\$reference_count\" 50" "$ENTRYPOINT"
@@ -473,6 +543,7 @@ SYMBOL=BTCUSDT
 BUCKET_MS=1000
 LABEL_HORIZON_BUCKETS=5
 TOP_DEPTH=5
+FEATURE_FAMILY=h1
 OUTPUT_PREFIX=test-run-shards
 RAW_SEGMENT_COUNT=4
 RAW_SEGMENT_1=venue=binance/market=usdm/dataset=usdm_all/shard=all/date=2026-08-18/hour=01/part-1.jsonl.zst

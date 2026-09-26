@@ -9,7 +9,6 @@ RUN rustup toolchain install 1.98.1 --profile minimal --no-self-update \
     && rustc --version | grep -E '^rustc 1\.98\.1 '
 
 WORKDIR /work
-ARG SOURCE_REVISION
 # Keep the digest-pinned bullseye builder libc. cmake only needs bullseye
 # main; bullseye-security currently 404s retired libarchive13 updates.
 RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list \
@@ -20,6 +19,7 @@ RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.l
     && rm -rf /var/lib/apt/lists/*
 
 COPY . .
+ARG SOURCE_REVISION
 # Proc-macro artifacts depend on the builder libc, toolchain and architecture.
 # Keep compiled targets separate from other images while sharing source downloads.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \

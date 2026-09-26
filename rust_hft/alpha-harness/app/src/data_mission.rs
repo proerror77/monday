@@ -1169,6 +1169,7 @@ pub(crate) fn freeze_research_inventory_request(
         bucket_ms: args.bucket_ms,
         label_horizon_buckets: args.label_horizon_buckets,
         top_depth: args.top_depth,
+        feature_family: args.feature_family.clone(),
         max_scan_entries: args.max_scan_entries,
         max_inputs: args.max_inputs,
         max_input_bytes: args.max_input_bytes,
