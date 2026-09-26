@@ -2,7 +2,9 @@
 
 - **Status:** Closed on 2026-09-25 without adoption. Monday keeps task
   admission and parallel slices on `task-batch`. AX is not an execution
-  backend. The staged evaluation below is historical.
+  backend. The staged evaluation below is historical. The library named in
+  step 2, `hft-agent-control`, was removed. Live admission remains
+  `task-batch` in `.github/scripts/agent-worktree-preflight.sh`.
 - **Date:** 2026-09-23.
 - **Scope:** Engineering and research-assistance agent execution. Existing
   Research, Governance and deterministic Runtime authority stays with Monday.
