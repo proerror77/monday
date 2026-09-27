@@ -34,6 +34,15 @@ const MATERIALIZATION_RECEIPT_SCHEMA: &str = "monday.cex_materialization_receipt
 const PREPARATION_SCHEMA: &str = "monday.cex_fresh_inputs_preparation.v1";
 const PREPARATION_REQUEST_SCHEMA: &str = "monday.cex_fresh_inputs_request.v1";
 const MAX_PREPARATION_BYTES: u64 = 1024 * 1024;
+const MAX_MARKET_METADATA_BYTES: u64 = 16 * 1024 * 1024;
+
+fn metadata_limit(args: &PrepareFreshInputsArgs) -> u64 {
+    if args.market_encoder_output {
+        MAX_MARKET_METADATA_BYTES
+    } else {
+        MAX_PREPARATION_BYTES
+    }
+}
 const MAX_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
 const MAX_INPUTS: usize = 8192;
 const MAX_SCAN_ENTRIES: usize = 100_000;
@@ -64,6 +73,12 @@ struct PreparationRequest {
     materializer_work_dir: PathBuf,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     sequence_output: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    market_encoder_output: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    market_feature_start_received_at_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    market_feature_end_received_at_ns: Option<u64>,
     materializer_timeout_seconds: u64,
     max_materializer_output_bytes: u64,
     inventory_path: PathBuf,
@@ -239,7 +254,7 @@ pub fn prepare(args: PrepareFreshInputsArgs) -> anyhow::Result<()> {
             let (selection, selection_sha256) =
                 read_selection(&expected_selection, &request, &args)?;
             let inventory = inventory_from_selection(&args, &selection)?;
-            verify_inventory_matches(&args.inventory_out, &inventory)?;
+            verify_inventory_matches(&args.inventory_out, &inventory, metadata_limit(&args))?;
             let verified = verify_materialized_outputs(&args, &run_root, &args.inventory_out)?;
             let fingerprint =
                 input_fingerprint(&args, &request_sha256, &verified.inventory_sha256)?;
@@ -311,7 +326,7 @@ pub fn prepare(args: PrepareFreshInputsArgs) -> anyhow::Result<()> {
     let inventory = inventory_from_selection(&args, &selection)?;
     if args.inventory_out.try_exists()? {
         validate_existing_inventory(&args, &args.inventory_out)?;
-        verify_inventory_matches(&args.inventory_out, &inventory)?;
+        verify_inventory_matches(&args.inventory_out, &inventory, metadata_limit(&args))?;
     } else {
         write_bytes_create_once(
             &args.inventory_out,
@@ -356,9 +371,40 @@ pub fn prepare(args: PrepareFreshInputsArgs) -> anyhow::Result<()> {
     })
 }
 
+fn validate_market_window(args: &PrepareFreshInputsArgs) -> anyhow::Result<()> {
+    if args.market_encoder_output {
+        let (start, end) = args
+            .start_received_at_ns
+            .zip(args.end_received_at_ns)
+            .context("market encoder preparation requires an explicit admitted time window")?;
+        let feature_start = args.market_feature_start_received_at_ns.unwrap_or(start);
+        if feature_start < start
+            || feature_start - start > 60_000_000_000
+            || !feature_start.is_multiple_of(1_000_000_000)
+            || feature_start >= end
+            || !start.is_multiple_of(1_000_000_000)
+            || !end.is_multiple_of(1_000_000_000)
+            || args
+                .market_feature_end_received_at_ns
+                .is_some_and(|feature_end| {
+                    feature_end <= feature_start
+                        || feature_end > end
+                        || !feature_end.is_multiple_of(1_000_000_000)
+                })
+        {
+            bail!("market feature partition escapes whole-second admitted clocks");
+        }
+    } else if args.market_feature_end_received_at_ns.is_some()
+        || args.market_feature_start_received_at_ns.is_some()
+    {
+        bail!("market feature partition requires market encoder output");
+    }
+    Ok(())
+}
+
 fn validate_args(args: &PrepareFreshInputsArgs) -> anyhow::Result<()> {
     parse_market(&args.market)?;
-    if args.sequence_output
+    if (args.sequence_output || args.market_encoder_output)
         && (args.symbol != "SOLUSDT"
             || args.market != "usdm"
             || args.bucket_ms != 1000
@@ -367,6 +413,7 @@ fn validate_args(args: &PrepareFreshInputsArgs) -> anyhow::Result<()> {
     {
         bail!("sequence preparation requires SOLUSDT USD-M 1s/top5/30s");
     }
+    validate_market_window(args)?;
     let has_explicit = args.start_received_at_ns.is_some() || args.end_received_at_ns.is_some();
     let has_latest = args.duration_ns.is_some()
         || args.cutoff_received_at_ns.is_some()
@@ -527,6 +574,7 @@ fn resolve_selection_mode(
     args: &PrepareFreshInputsArgs,
     existing: Option<&PreparationRequest>,
 ) -> anyhow::Result<FreshWindowMode> {
+    validate_market_window(args)?;
     let has_explicit = args.start_received_at_ns.is_some() || args.end_received_at_ns.is_some();
     let has_latest = args.duration_ns.is_some()
         || args.cutoff_received_at_ns.is_some()
@@ -604,6 +652,9 @@ fn build_preparation_request(
         binary_dir,
         materializer_work_dir: args.materializer_work_dir.canonicalize()?,
         sequence_output: args.sequence_output,
+        market_encoder_output: args.market_encoder_output,
+        market_feature_start_received_at_ns: args.market_feature_start_received_at_ns,
+        market_feature_end_received_at_ns: args.market_feature_end_received_at_ns,
         materializer_timeout_seconds: args.materializer_timeout_seconds,
         max_materializer_output_bytes: args.max_materializer_output_bytes,
         inventory_path: normalize_for_compare(&args.inventory_out)?,
@@ -673,7 +724,7 @@ fn read_selection(
     request: &PreparationRequest,
     args: &PrepareFreshInputsArgs,
 ) -> anyhow::Result<(FreshWindowSelection, String)> {
-    let bytes = read_file_bounded(path, MAX_PREPARATION_BYTES, "fresh window selection")?;
+    let bytes = read_file_bounded(path, metadata_limit(args), "fresh window selection")?;
     let selection: FreshWindowSelection = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse fresh window selection {}", path.display()))?;
     validate_selection(&selection, request, args)?;
@@ -811,8 +862,9 @@ fn write_selection_create_once(
 fn verify_inventory_matches(
     path: &Path,
     expected: &hft_collector::research_inventory::FrozenInventory,
+    max_bytes: u64,
 ) -> anyhow::Result<()> {
-    let bytes = read_file_bounded(path, MAX_PREPARATION_BYTES, "frozen inventory")?;
+    let bytes = read_file_bounded(path, max_bytes, "frozen inventory")?;
     if bytes != expected.inventory_env.as_bytes() {
         bail!("frozen inventory differs from the create-once window selection");
     }
@@ -843,7 +895,7 @@ fn ensure_preparation_request(
 }
 
 fn validate_existing_inventory(args: &PrepareFreshInputsArgs, path: &Path) -> anyhow::Result<()> {
-    let bytes = read_file_bounded(path, MAX_PREPARATION_BYTES, "frozen inventory")?;
+    let bytes = read_file_bounded(path, metadata_limit(args), "frozen inventory")?;
     let env = String::from_utf8(bytes)?;
     validate_inventory_env(args, &env)
 }
@@ -903,7 +955,7 @@ fn input_fingerprint(
     }
     let env = String::from_utf8(read_file_bounded(
         &args.inventory_out,
-        MAX_PREPARATION_BYTES,
+        metadata_limit(args),
         "frozen inventory",
     )?)?;
     let values = parse_inventory_values(&env)?;
@@ -1024,6 +1076,19 @@ fn run_materializer(args: &PrepareFreshInputsArgs, inventory: &Path) -> anyhow::
         .arg("all");
     if args.sequence_output {
         command.arg("--sequence-output");
+    }
+    if args.market_encoder_output {
+        command.arg("--market-encoder-output");
+        if let Some(start) = args.market_feature_start_received_at_ns {
+            command
+                .arg("--market-feature-start-received-at-ns")
+                .arg(start.to_string());
+        }
+        if let Some(end) = args.market_feature_end_received_at_ns {
+            command
+                .arg("--market-feature-end-received-at-ns")
+                .arg(end.to_string());
+        }
     }
     if let Some(binary_dir) = &args.binary_dir {
         command.arg("--binary-dir").arg(binary_dir);
@@ -1245,6 +1310,7 @@ fn verify_materialized_outputs(
         MAX_INPUT_BYTES,
     )?;
     verify_sequence_output(args, run_root, &receipt.materialization)?;
+    verify_market_encoder_output(args, run_root, &receipt.materialization)?;
     Ok(VerifiedOutputs {
         receipt_sha256,
         materialization_receipt_sha256,
@@ -1340,6 +1406,117 @@ fn verify_sequence_output(
         decision_stride_ms: 1000,
     };
     let mut reader = hft_research_ml::sequence::SequenceReader::open(parent, dataset, hash, view)
+        .map_err(anyhow::Error::msg)?;
+    reader.finish_pass().map_err(anyhow::Error::msg)
+}
+
+fn verify_market_encoder_output(
+    args: &PrepareFreshInputsArgs,
+    root: &Path,
+    materialization: &CampaignInputItem,
+) -> anyhow::Result<()> {
+    use hft_research_manifest::{
+        market_encoder::{MarketDataReadRequestV1, MarketFeatureDatasetV1, MarketTargetDatasetV1},
+        sequence::{valid_sha256, SequenceInputSpecV1, SequenceViewV1},
+    };
+    use hft_research_ml::market_encoder::data::{MarketFeatureReader, MarketTaskReader};
+    let path = root.join(&materialization.relative_path);
+    ensure_regular_file(&path, "market materialization report")?;
+    if file_contains_pattern(&path, br#""market_encoder""#)? != args.market_encoder_output {
+        bail!("market encoder output differs from frozen preparation mode");
+    }
+    if !args.market_encoder_output {
+        return Ok(());
+    }
+    let report_bytes = read_file_bounded(&path, MAX_MARKET_METADATA_BYTES, "market PIT report")?;
+    let report: serde_json::Value = serde_json::from_slice(&report_bytes)?;
+    let exported = &report["market_encoder"];
+    if exported["schema_version"] != "monday.market_encoder_export.v1"
+        || exported["feature_start_received_at_ns"]
+            != serde_json::to_value(args.market_feature_start_received_at_ns)?
+        || exported["feature_end_received_at_ns"]
+            != serde_json::to_value(args.market_feature_end_received_at_ns)?
+    {
+        bail!("market encoder export changed its partition contract");
+    }
+    let parent = path.parent().context("market report parent")?;
+    let artifact = |name: &str, suffix: &str| -> anyhow::Result<(PathBuf, String)> {
+        let hash = exported[name]["sha256"]
+            .as_str()
+            .context("missing market manifest digest")?;
+        if !valid_sha256(hash) {
+            bail!("invalid market manifest digest");
+        }
+        let filename = format!("{hash}.{suffix}.json");
+        if exported[name]["file"] != filename {
+            bail!("market manifest path changed");
+        }
+        let path = parent.join(filename);
+        ensure_regular_file(&path, "market manifest")?;
+        if sha256_file(&path)? != hash {
+            bail!("market manifest hash differs");
+        }
+        Ok((path, hash.into()))
+    };
+    let (feature_path, feature_hash) = artifact("features", "market-features")?;
+    let (target_path, target_hash) = artifact("targets", "market-targets")?;
+    let (source_path, source_hash) = artifact("feature_sources", "market-feature-sources")?;
+    let features: MarketFeatureDatasetV1 = read_json_bounded(&feature_path)?;
+    let targets: MarketTargetDatasetV1 = read_json_bounded(&target_path)?;
+    features.validate().map_err(anyhow::Error::msg)?;
+    targets.validate().map_err(anyhow::Error::msg)?;
+    crate::mission_runner::decode_materialization(&report_bytes)?;
+    crate::mission_campaign::market_encoder::inputs::verify_feature_sources(
+        &report,
+        &read_file_bounded(
+            &source_path,
+            MAX_MARKET_METADATA_BYTES,
+            "market feature sources",
+        )?,
+        &source_hash,
+        &features,
+    )?;
+    if features.input != SequenceInputSpecV1::sol_lob()
+        || features.digest().map_err(anyhow::Error::msg)? != feature_hash
+        || features.source_manifest_sha256 != source_hash
+        || targets.feature_dataset_sha256 != feature_hash
+    {
+        bail!("market features or targets differ from verified PIT provenance");
+    }
+    let (start, end) = args
+        .start_received_at_ns
+        .zip(args.end_received_at_ns)
+        .context("market export has no admitted window")?;
+    let feature_start = args.market_feature_start_received_at_ns.unwrap_or(start);
+    let feature_end = args.market_feature_end_received_at_ns.unwrap_or(end);
+    for shard in &features.shards {
+        if shard.first_observed_at_ms as u128 * 1_000_000 < feature_start as u128
+            || shard.last_observed_at_ms as u128 * 1_000_000 >= feature_end as u128
+        {
+            bail!("market feature shard escaped its partition");
+        }
+    }
+    let first = features.shards[0].first_observed_at_ms;
+    let end_ms = i64::try_from(end / 1_000_000).context("market view clock overflow")?;
+    let request = MarketDataReadRequestV1 {
+        feature_dataset_sha256: feature_hash,
+        qualified_anchors_sha256: None,
+        input: features.input.clone(),
+        view: SequenceViewV1 {
+            history_start_ms: first,
+            decision_start_ms: first
+                .checked_add(59000)
+                .context("market context clock overflow")?,
+            end_ms,
+            decision_stride_ms: 1000,
+        },
+        anchor_end_ms: i64::try_from(feature_end / 1_000_000)
+            .context("market partition overflow")?
+            .min(end_ms - 30000),
+    };
+    let reader =
+        MarketFeatureReader::open(parent, features, &request).map_err(anyhow::Error::msg)?;
+    let mut reader = MarketTaskReader::open(reader, parent, targets, &target_hash)
         .map_err(anyhow::Error::msg)?;
     reader.finish_pass().map_err(anyhow::Error::msg)
 }
@@ -1687,10 +1864,86 @@ mod tests {
             materializer_work_dir: PathBuf::from("materializer-work"),
             binary_dir: None,
             sequence_output: false,
+            market_encoder_output: false,
+            market_feature_start_received_at_ns: None,
+            market_feature_end_received_at_ns: None,
             materializer_timeout_seconds: 10,
             max_materializer_output_bytes: 1024,
             report_out: None,
         }
+    }
+
+    #[test]
+    fn market_preparation_binds_explicit_window_and_label_only_lookahead() {
+        let mut request = args();
+        request.market_encoder_output = true;
+        request.symbol = "SOLUSDT".into();
+        request.label_horizon_buckets = 30;
+        request.start_received_at_ns = Some(0);
+        request.end_received_at_ns = Some(120_000_000_000);
+        request.market_feature_end_received_at_ns = Some(90_000_000_000);
+        validate_args(&request).unwrap();
+        request.market_feature_start_received_at_ns = Some(30_000_000_000);
+        validate_args(&request).unwrap();
+        resolve_selection_mode(&request, None).unwrap();
+        request.market_feature_start_received_at_ns = Some(61_000_000_000);
+        assert!(validate_args(&request).is_err());
+        assert!(resolve_selection_mode(&request, None).is_err());
+        request.market_feature_start_received_at_ns = Some(30_000_000_001);
+        assert!(validate_args(&request).is_err());
+        request.market_feature_start_received_at_ns = Some(30_000_000_000);
+        request.market_feature_end_received_at_ns = Some(121_000_000_000);
+        assert!(validate_args(&request).is_err());
+        request.market_feature_end_received_at_ns = Some(90_000_000_001);
+        assert!(validate_args(&request).is_err());
+        request.market_feature_end_received_at_ns = Some(90_000_000_000);
+        request.market_encoder_output = false;
+        assert!(validate_args(&request).is_err());
+        request.market_encoder_output = true;
+        request.start_received_at_ns = None;
+        assert!(validate_args(&request).is_err());
+    }
+
+    #[test]
+    fn market_export_verifier_preserves_legacy_reports_and_rejects_mode_drift() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("materialization.json");
+        std::fs::write(&path, b"legacy non-JSON materialization report").unwrap();
+        let item = CampaignInputItem {
+            relative_path: "materialization.json".into(),
+            sha256: "a".repeat(64),
+            object_url: "https://example.invalid/materialization.json".into(),
+        };
+        let mut request = args();
+        verify_market_encoder_output(&request, root.path(), &item).unwrap();
+        request.market_encoder_output = true;
+        assert!(verify_market_encoder_output(&request, root.path(), &item).is_err());
+        request.market_encoder_output = false;
+        std::fs::write(&path, br#"{"market_encoder":{}}"#).unwrap();
+        assert!(verify_market_encoder_output(&request, root.path(), &item).is_err());
+    }
+
+    #[test]
+    fn market_metadata_limit_accepts_daily_evidence_but_keeps_a_hard_bound() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("materialization.json");
+        let report = serde_json::json!({"market_encoder": {"schema_version": "monday.market_encoder_export.v1"},
+            "padding": "x".repeat(MAX_PREPARATION_BYTES as usize)});
+        std::fs::write(&path, serde_json::to_vec(&report).unwrap()).unwrap();
+        assert!(read_json_bounded::<serde_json::Value>(&path).is_err());
+        let item = CampaignInputItem {
+            relative_path: "materialization.json".into(),
+            sha256: "a".repeat(64),
+            object_url: "https://example.invalid/report".into(),
+        };
+        let mut request = args();
+        request.market_encoder_output = true;
+        let error = verify_market_encoder_output(&request, root.path(), &item).unwrap_err();
+        // The larger document passed bounded decoding but still cannot bypass
+        // the actual manifest admission checks.
+        assert!(error.to_string().contains("missing market manifest digest"));
+        std::fs::write(&path, vec![b'x'; MAX_MARKET_METADATA_BYTES as usize + 1]).unwrap();
+        assert!(read_file_bounded(&path, metadata_limit(&request), "market evidence").is_err());
     }
 
     #[test]
@@ -1849,6 +2102,9 @@ EOF
             materializer_work_dir: work_dir.clone(),
             binary_dir: None,
             sequence_output: false,
+            market_encoder_output: false,
+            market_feature_start_received_at_ns: None,
+            market_feature_end_received_at_ns: None,
             materializer_timeout_seconds: 10,
             max_materializer_output_bytes: 16 * 1024,
             report_out: None,

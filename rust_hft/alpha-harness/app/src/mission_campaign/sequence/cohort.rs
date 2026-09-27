@@ -34,11 +34,112 @@ pub(crate) fn prepare(args: PrepareSequenceCohortArgs) -> anyhow::Result<()> {
     // Identity is cheap. Do not stage or copy payloads for a request that
     // cannot be admitted.
     validate_cohort_identity(&spec)?;
+    let training_receipts = spec.training_receipts.len();
+    let inputs = publish_cohort(
+        &args,
+        |inputs: &SequenceCampaignInputs, root| inputs.verify_mount(root),
+        |staged| {
+            let mut train_plans = Vec::new();
+            for receipt in &spec.training_receipts {
+                train_plans.push(plan_source(
+                    &spec,
+                    &args.input_root,
+                    receipt,
+                    staged,
+                    false,
+                )?);
+            }
+            let validation_plan = plan_source(
+                &spec,
+                &args.input_root,
+                &spec.validation_receipt,
+                staged,
+                true,
+            )?;
+            let train_bytes =
+                fold_shard_bytes(train_plans.iter().flat_map(|plan| &plan.dataset.shards))?;
+            let train_rows =
+                fold_shard_rows(train_plans.iter().flat_map(|plan| &plan.dataset.shards))?;
+            let validation_bytes = fold_shard_bytes(validation_plan.dataset.shards.iter())?;
+            let validation_rows = fold_shard_rows(validation_plan.dataset.shards.iter())?;
+            // Reject the combined payload before any shard or replay body is copied.
+            payload_budget(
+                train_bytes,
+                train_rows,
+                validation_bytes,
+                validation_rows,
+                validation_plan.replay_bytes,
+            )?;
+            for plan in train_plans.iter().chain(std::iter::once(&validation_plan)) {
+                for copy in &plan.copies {
+                    copy_verified(&copy.from, &copy.to, &copy.hash, copy.max_bytes)?;
+                }
+            }
+            let train = assemble_dataset(
+                staged,
+                train_plans.iter().map(|plan| plan.source.clone()).collect(),
+                train_plans
+                    .into_iter()
+                    .flat_map(|plan| plan.dataset.shards)
+                    .collect(),
+            )?;
+            let validation = assemble_dataset(
+                staged,
+                vec![validation_plan.source],
+                validation_plan.dataset.shards,
+            )?;
+            let inputs = SequenceCampaignInputs {
+                schema_version: INPUTS_SCHEMA.into(),
+                producer_source_revision: spec.producer_source_revision,
+                producer_image: spec.producer_image,
+                pvc_name: spec.pvc_name,
+                pvc_uid: spec.pvc_uid,
+                sub_path: spec.sub_path,
+                fold_id: spec.fold_id,
+                training_window_days: spec.training_window_days,
+                train,
+                validation,
+                replay_artifact: validation_plan
+                    .replay_artifact
+                    .context("missing validation replay")?,
+                replay_manifest: validation_plan
+                    .replay_manifest
+                    .context("missing validation replay manifest")?,
+            };
+            Ok(inputs)
+        },
+    )?;
+    print_prepared(&inputs, &args.inputs_out, training_receipts)
+}
+
+/// One create-once publication controller for native research cohorts. A
+/// durable pending receipt makes the final rename recoverable without recopying.
+pub(crate) fn publish_cohort<T>(
+    args: &PrepareSequenceCohortArgs,
+    verify: impl Fn(&T, &Path) -> anyhow::Result<()>,
+    build: impl FnOnce(&Path) -> anyhow::Result<T>,
+) -> anyhow::Result<T>
+where
+    T: Serialize + serde::de::DeserializeOwned + PartialEq,
+{
     let parent = args.output_root.parent().context("cohort output parent")?;
     fs::create_dir_all(parent)?;
     let parent = parent.canonicalize()?;
     let name = args.output_root.file_name().context("cohort output name")?;
     let output = parent.join(name);
+    data_mission::ensure_output_path_is_not_symlink(&output, "cohort output")?;
+    let mut lock_name = name.to_owned();
+    lock_name.push(".cohort.lock");
+    let lock_path = parent.join(lock_name);
+    data_mission::ensure_output_path_is_not_symlink(&lock_path, "cohort publication lock")?;
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    lock.try_lock()
+        .context("this cohort has an active publication controller")?;
     let inputs_parent = args.inputs_out.parent().context("cohort receipt parent")?;
     fs::create_dir_all(inputs_parent)?;
     let inputs_out = inputs_parent
@@ -48,20 +149,22 @@ pub(crate) fn prepare(args: PrepareSequenceCohortArgs) -> anyhow::Result<()> {
         bail!("cohort receipt must be outside the worker view");
     }
     let pending = pending_receipt(&inputs_out)?;
-    if !output.exists() && pending.is_file() {
-        fs::remove_file(&pending)?;
-    }
+    data_mission::ensure_output_path_is_not_symlink(&inputs_out, "cohort receipt")?;
+    data_mission::ensure_output_path_is_not_symlink(&pending, "cohort pending receipt")?;
     if output.is_dir() && pending.is_file() && !inputs_out.exists() {
-        let inputs = finish_published_receipt(&output, &inputs_out, &pending)?;
-        return print_prepared(&inputs, &inputs_out, spec.training_receipts.len());
+        return finish_published_receipt(&output, &inputs_out, &pending, &verify);
     }
     if output.is_dir() && inputs_out.is_file() {
-        let inputs: SequenceCampaignInputs = read_json(&inputs_out)?;
-        inputs.verify_mount(&output)?;
+        let inputs: T = read_json(&inputs_out)?;
+        verify(&inputs, &output)?;
         if pending.exists() {
+            let previous: T = read_json(&pending)?;
+            if previous != inputs {
+                bail!("cohort pending receipt conflicts with the published receipt");
+            }
             fs::remove_file(&pending)?;
         }
-        return print_prepared(&inputs, &inputs_out, spec.training_receipts.len());
+        return Ok(inputs);
     }
     if output.exists() || inputs_out.exists() {
         bail!(
@@ -71,78 +174,37 @@ pub(crate) fn prepare(args: PrepareSequenceCohortArgs) -> anyhow::Result<()> {
     let temporary = tempfile::tempdir_in(&parent)?;
     let staged = temporary.path().join("view");
     fs::create_dir(&staged)?;
-    let mut train_plans = Vec::new();
-    for receipt in &spec.training_receipts {
-        train_plans.push(plan_source(
-            &spec,
-            &args.input_root,
-            receipt,
-            &staged,
-            false,
-        )?);
-    }
-    let validation_plan = plan_source(
-        &spec,
-        &args.input_root,
-        &spec.validation_receipt,
-        &staged,
-        true,
-    )?;
-    let train_bytes = fold_shard_bytes(train_plans.iter().flat_map(|plan| &plan.dataset.shards))?;
-    let train_rows = fold_shard_rows(train_plans.iter().flat_map(|plan| &plan.dataset.shards))?;
-    let validation_bytes = fold_shard_bytes(validation_plan.dataset.shards.iter())?;
-    let validation_rows = fold_shard_rows(validation_plan.dataset.shards.iter())?;
-    // Reject the combined payload before any shard or replay body is copied.
-    payload_budget(
-        train_bytes,
-        train_rows,
-        validation_bytes,
-        validation_rows,
-        validation_plan.replay_bytes,
-    )?;
-    for plan in train_plans.iter().chain(std::iter::once(&validation_plan)) {
-        for copy in &plan.copies {
-            copy_verified(&copy.from, &copy.to, &copy.hash, copy.max_bytes)?;
-        }
-    }
-    let train = assemble_dataset(
-        &staged,
-        train_plans.iter().map(|plan| plan.source.clone()).collect(),
-        train_plans
-            .into_iter()
-            .flat_map(|plan| plan.dataset.shards)
-            .collect(),
-    )?;
-    let validation = assemble_dataset(
-        &staged,
-        vec![validation_plan.source],
-        validation_plan.dataset.shards,
-    )?;
-    let inputs = SequenceCampaignInputs {
-        schema_version: INPUTS_SCHEMA.into(),
-        producer_source_revision: spec.producer_source_revision,
-        producer_image: spec.producer_image,
-        pvc_name: spec.pvc_name,
-        pvc_uid: spec.pvc_uid,
-        sub_path: spec.sub_path,
-        fold_id: spec.fold_id,
-        training_window_days: spec.training_window_days,
-        train,
-        validation,
-        replay_artifact: validation_plan
-            .replay_artifact
-            .context("missing validation replay")?,
-        replay_manifest: validation_plan
-            .replay_manifest
-            .context("missing validation replay manifest")?,
-    };
-    inputs.verify_mount(&staged)?;
-    // The pending receipt is durable before the view is published. A crash
-    // after the rename can finish this receipt without copying again.
-    data_mission::write_json_atomic(&pending, &inputs)?;
+    let inputs = build(&staged)?;
+    verify(&inputs, &staged)?;
+    retain_receipt(&pending, &inputs)?;
     fs::rename(&staged, &output)?;
-    let inputs = finish_published_receipt(&output, &inputs_out, &pending)?;
-    print_prepared(&inputs, &inputs_out, spec.training_receipts.len())
+    File::open(&parent)?.sync_all()?;
+    finish_published_receipt(&output, &inputs_out, &pending, &verify)
+}
+
+/// Create-once durable receipts: an interrupted earlier publication may be
+/// resumed only if it names exactly the reconstructed immutable cohort.
+fn retain_receipt<T>(path: &Path, value: &T) -> anyhow::Result<()>
+where
+    T: Serialize + serde::de::DeserializeOwned + PartialEq,
+{
+    data_mission::ensure_output_path_is_not_symlink(path, "cohort immutable receipt")?;
+    if path.exists() {
+        let existing: T = read_json(path)?;
+        if existing != *value {
+            bail!("cohort immutable receipt conflicts with this request");
+        }
+        return Ok(());
+    }
+    let parent = path.parent().context("cohort receipt parent")?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    serde_json::to_writer_pretty(&mut temporary, value)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist_noclobber(path)
+        .map_err(|error| error.error)?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 fn pending_receipt(inputs_out: &Path) -> anyhow::Result<PathBuf> {
@@ -180,21 +242,24 @@ fn validate_cohort_identity(spec: &CohortRequest) -> anyhow::Result<()> {
     crate::prediction_dispatch::validate_dns_label("sequence input PVC", &spec.pvc_name)
 }
 
-fn finish_published_receipt(
+fn finish_published_receipt<T>(
     output: &Path,
     inputs_out: &Path,
     pending: &Path,
-) -> anyhow::Result<SequenceCampaignInputs> {
-    let inputs: SequenceCampaignInputs = read_json(pending)?;
-    inputs.validate()?;
-    inputs.verify_mount(output)?;
+    verify: &impl Fn(&T, &Path) -> anyhow::Result<()>,
+) -> anyhow::Result<T>
+where
+    T: Serialize + serde::de::DeserializeOwned + PartialEq,
+{
+    let inputs: T = read_json(pending)?;
+    verify(&inputs, output)?;
     if inputs_out.is_file() {
-        let existing: SequenceCampaignInputs = read_json(inputs_out)?;
+        let existing: T = read_json(inputs_out)?;
         if existing != inputs {
             bail!("sequence cohort receipt differs from the published view");
         }
     } else {
-        data_mission::write_json_atomic(inputs_out, &inputs)?;
+        retain_receipt(inputs_out, &inputs)?;
     }
     if pending.exists() {
         fs::remove_file(pending)?;
@@ -216,16 +281,16 @@ fn print_prepared(
     )
 }
 
-const MAX_DATASET_SHARD_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-const MAX_DATASET_ROWS: u64 = 14 * 86_400;
-const MAX_REPLAY_PARQUET_BYTES: u64 = 16 * 1024 * 1024 * 1024;
-const MAX_REPLAY_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_DATASET_SHARD_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+pub(crate) const MAX_DATASET_ROWS: u64 = 14 * 86_400;
+pub(crate) const MAX_REPLAY_PARQUET_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+pub(crate) const MAX_REPLAY_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
-struct PlannedCopy {
-    from: std::path::PathBuf,
-    to: std::path::PathBuf,
-    hash: String,
-    max_bytes: u64,
+pub(crate) struct PlannedCopy {
+    pub(crate) from: std::path::PathBuf,
+    pub(crate) to: std::path::PathBuf,
+    pub(crate) hash: String,
+    pub(crate) max_bytes: u64,
 }
 
 struct PlannedSource {
@@ -237,14 +302,14 @@ struct PlannedSource {
     replay_bytes: u64,
 }
 
-fn dataset_budget(bytes: u64, rows: u64) -> anyhow::Result<()> {
+pub(crate) fn dataset_budget(bytes: u64, rows: u64) -> anyhow::Result<()> {
     if bytes > MAX_DATASET_SHARD_BYTES || rows > MAX_DATASET_ROWS {
         bail!("sequence cohort exceeds its 14-day row or byte limit");
     }
     Ok(())
 }
 
-fn payload_budget(
+pub(crate) fn payload_budget(
     train_bytes: u64,
     train_rows: u64,
     validation_bytes: u64,
@@ -266,7 +331,7 @@ fn payload_budget(
     Ok(())
 }
 
-fn fold_shard_bytes<'a>(
+pub(crate) fn fold_shard_bytes<'a>(
     mut shards: impl Iterator<Item = &'a hft_research_manifest::sequence::SequenceShardV1>,
 ) -> anyhow::Result<u64> {
     shards
@@ -274,7 +339,7 @@ fn fold_shard_bytes<'a>(
         .context("sequence shard bytes overflow")
 }
 
-fn fold_shard_rows<'a>(
+pub(crate) fn fold_shard_rows<'a>(
     mut shards: impl Iterator<Item = &'a hft_research_manifest::sequence::SequenceShardV1>,
 ) -> anyhow::Result<u64> {
     shards
@@ -282,7 +347,7 @@ fn fold_shard_rows<'a>(
         .context("sequence shard rows overflow")
 }
 
-fn bounded_file_len(path: &Path, max: u64) -> anyhow::Result<u64> {
+pub(crate) fn bounded_file_len(path: &Path, max: u64) -> anyhow::Result<u64> {
     let length = File::open(path)?.metadata()?.len();
     if length == 0 || length > max {
         bail!("cohort source exceeds byte bound");
@@ -406,7 +471,7 @@ fn plan_source(
     })
 }
 
-fn item(value: &serde_json::Value, name: &str) -> anyhow::Result<Artifact> {
+pub(crate) fn item(value: &serde_json::Value, name: &str) -> anyhow::Result<Artifact> {
     let result = Artifact {
         file: value[name]["relative_path"]
             .as_str()
@@ -421,7 +486,7 @@ fn item(value: &serde_json::Value, name: &str) -> anyhow::Result<Artifact> {
     Ok(result)
 }
 
-fn put_metadata(root: &Path, bytes: &[u8], suffix: &str) -> anyhow::Result<Artifact> {
+pub(crate) fn put_metadata(root: &Path, bytes: &[u8], suffix: &str) -> anyhow::Result<Artifact> {
     let hash = format!("{:x}", Sha256::digest(bytes));
     let artifact = Artifact {
         file: format!("{hash}.{suffix}"),
@@ -429,7 +494,11 @@ fn put_metadata(root: &Path, bytes: &[u8], suffix: &str) -> anyhow::Result<Artif
     };
     let path = root.join(&artifact.file);
     if path.try_exists()? {
-        if crate::mission_runner::sha256_file(&path)? != artifact.sha256 {
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file()
+            || metadata.len() != bytes.len() as u64
+            || crate::mission_runner::sha256_file(&path)? != artifact.sha256
+        {
             bail!("existing cohort metadata changed");
         }
     } else {
@@ -443,13 +512,26 @@ fn put_metadata(root: &Path, bytes: &[u8], suffix: &str) -> anyhow::Result<Artif
     Ok(artifact)
 }
 
-fn copy_verified(source: &Path, destination: &Path, hash: &str, max: u64) -> anyhow::Result<()> {
+pub(crate) fn copy_verified(
+    source: &Path,
+    destination: &Path,
+    hash: &str,
+    max: u64,
+) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(source)?;
+    if !metadata.file_type().is_file() || metadata.len() > max {
+        bail!("cohort source is not a regular bounded file");
+    }
     let input = File::open(source)?;
     if input.metadata()?.len() > max {
         bail!("cohort source exceeds byte bound");
     }
     if destination.try_exists()? {
-        if destination.is_symlink() || crate::mission_runner::sha256_file(destination)? != hash {
+        let metadata = fs::symlink_metadata(destination)?;
+        if !metadata.file_type().is_file()
+            || metadata.len() > max
+            || crate::mission_runner::sha256_file(destination)? != hash
+        {
             bail!("cohort artifact conflict");
         }
         return Ok(());
@@ -627,5 +709,76 @@ mod tests {
         );
         assert_eq!(fs::read(output.join("keep")).unwrap(), b"published");
         assert!(pending.is_file());
+    }
+    #[test]
+    fn sequence_cohort_publication_resumes_pending_receipt_and_rejects_drift() {
+        let root = tempfile::tempdir().unwrap();
+        let args = PrepareSequenceCohortArgs {
+            request: root.path().join("request"),
+            input_root: root.path().join("unused"),
+            output_root: root.path().join("view"),
+            inputs_out: root.path().join("inputs.json"),
+        };
+        let verify = |value: &u32, output: &Path| -> anyhow::Result<()> {
+            if *value != 7 || std::fs::read(output.join("rows"))? != b"immutable" {
+                bail!("changed cohort request or rows");
+            }
+            Ok(())
+        };
+        let first = publish_cohort(&args, verify, |output| {
+            std::fs::write(output.join("rows"), b"immutable")?;
+            Ok(7_u32)
+        })
+        .unwrap();
+        assert_eq!(first, 7);
+        let pending = pending_receipt(&args.inputs_out).unwrap();
+        std::fs::rename(&args.inputs_out, &pending).unwrap();
+        let restored = publish_cohort(&args, verify, |_| -> anyhow::Result<u32> {
+            panic!("must not recopy an already published view")
+        })
+        .unwrap();
+        assert_eq!(restored, 7);
+        assert!(args.inputs_out.is_file());
+        assert!(!pending.exists());
+        retain_receipt(&pending, &8_u32).unwrap();
+        assert!(publish_cohort(&args, verify, |_| Ok(7_u32)).is_err());
+        assert_eq!(
+            std::fs::read(args.output_root.join("rows")).unwrap(),
+            b"immutable"
+        );
+    }
+
+    #[test]
+    fn sequence_cohort_unpublished_pending_receipt_cannot_be_rebound() {
+        let root = tempfile::tempdir().unwrap();
+        let args = PrepareSequenceCohortArgs {
+            request: root.path().join("request"),
+            input_root: root.path().join("unused"),
+            output_root: root.path().join("view"),
+            inputs_out: root.path().join("inputs.json"),
+        };
+        let pending = pending_receipt(&args.inputs_out).unwrap();
+        retain_receipt(&pending, &7_u32).unwrap();
+        assert!(publish_cohort(&args, |_: &u32, _| Ok(()), |_| Ok(8_u32)).is_err());
+        assert!(!args.output_root.exists());
+        assert_eq!(read_json::<u32>(&pending).unwrap(), 7);
+        assert_eq!(
+            publish_cohort(&args, |_: &u32, _| Ok(()), |_| Ok(7_u32)).unwrap(),
+            7
+        );
+    }
+
+    #[test]
+    fn sequence_cohort_metadata_and_copies_reject_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = b"immutable";
+        let hash = format!("{:x}", Sha256::digest(bytes));
+        let original = root.path().join("original");
+        fs::write(&original, bytes).unwrap();
+        let alias = root.path().join(format!("{hash}.json"));
+        std::os::unix::fs::symlink(&original, &alias).unwrap();
+        assert!(put_metadata(root.path(), bytes, "json").is_err());
+        assert!(copy_verified(&alias, &root.path().join("copied"), &hash, 100).is_err());
+        assert!(copy_verified(&original, &alias, &hash, 100).is_err());
     }
 }

@@ -14,8 +14,8 @@ pub use final_dispatch::{
 mod state;
 
 pub use dispatch::{
-    CampaignDispatchClaimV1, CampaignDispatchRecord, CampaignDispatchSettlementV1,
-    CampaignDispatchTargetV1,
+    CampaignDispatchCancellationV1, CampaignDispatchClaimV1, CampaignDispatchRecord,
+    CampaignDispatchSettlementV1, CampaignDispatchTargetV1,
 };
 pub use study::{
     AuthenticatedCampaignStudyReceiptV1, CampaignStudyLedgerEventV1, CampaignStudyLedgerReceiptV1,
@@ -81,6 +81,9 @@ pub enum CampaignLedgerEventV1 {
     DispatchSettled {
         evidence: CampaignDispatchSettlementV1,
     },
+    DispatchCancelled {
+        evidence: CampaignDispatchCancellationV1,
+    },
     ApprovalRevoked {
         revocation: ApprovalRevocationV1,
     },
@@ -118,6 +121,9 @@ impl CampaignLedgerEventV1 {
                 format!("campaign-dispatch:{operation_id}")
             }
             Self::DispatchJobBound { operation_id, .. } => format!("campaign-job:{operation_id}"),
+            Self::DispatchCancelled { evidence } => {
+                format!("campaign-cancellation:{}", evidence.operation_id)
+            }
             Self::AttemptSettled { settlement } => {
                 format!("campaign-settlement:{}", settlement.operation_id)
             }
@@ -2174,6 +2180,7 @@ mod tests {
                 CampaignLedgerEventV1::DispatchJobBound { .. } => "dispatch_job_bound",
                 CampaignLedgerEventV1::AttemptSettled { .. } => "attempt_settled",
                 CampaignLedgerEventV1::DispatchSettled { .. } => "dispatch_settled",
+                CampaignLedgerEventV1::DispatchCancelled { .. } => "dispatch_cancelled",
                 CampaignLedgerEventV1::ApprovalRevoked { .. } => "approval_revoked",
                 CampaignLedgerEventV1::FinalDispatchClaimed { .. } => "final_dispatch_claimed",
                 CampaignLedgerEventV1::FinalDispatchJobBound { .. } => "final_dispatch_job_bound",

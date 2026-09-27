@@ -323,6 +323,7 @@ impl FittedMarketStage {
             Fitted::Encoder(p) => {
                 serde_json::json!({"parameters":p.diagnostics().final_encoder_values_sha256,
                     "reconstruction_parameters":p.reconstruction_parameter_digest().ok_or("pretraining stage omitted its reconstruction head")?,
+                    "reconstruction_diagnostics":p.reconstruction_diagnostics_digest()?.ok_or("pretraining stage omitted its bounded reconstruction diagnostics")?,
                     "scaling":p.scaling(),"request":p.request()})
             }
             Fitted::Task(m) => {

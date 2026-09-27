@@ -522,3 +522,190 @@ fn market_qualified_anchors_ignore_label_values_and_survive_missing_label_file()
     fit.qualified_anchors_sha256 = Some(hash);
     assert!(reader(root.path(), &features, &fit).next_batch(1).is_err());
 }
+
+fn sol_diagnostic_fixture(root: &Path) -> (MarketFeatureDatasetV1, MarketFitRequestV1) {
+    let (mut features, mut targets, mut fit) = fixture(root);
+    let mut rows = std::fs::read_to_string(root.join("features.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<MarketFeatureFrameV1>(line).unwrap())
+        .collect::<Vec<_>>();
+    for row in &mut rows {
+        row.channels = (0..24)
+            .map(|c| row.channels[c % 2] * (1.0 + c as f32 / 100.0))
+            .collect();
+    }
+    features.input = SequenceInputSpecV1::sol_lob();
+    features.shards = vec![shard(root, "features.jsonl", &rows, 0, 149000)];
+    targets.feature_dataset_sha256 = features.digest().unwrap();
+    fit.feature_dataset_sha256 = features.digest().unwrap();
+    fit.spec.input = features.input.clone();
+    fit.spec.hidden_channels = 4;
+    fit.batch_size = 64;
+    fit.updates = 1;
+    let anchors = derive_market_training_anchors(
+        &mut reader(root, &features, &fit),
+        root,
+        targets.clone(),
+        &targets.digest().unwrap(),
+    )
+    .unwrap();
+    let hash = anchors.digest().unwrap();
+    std::fs::write(
+        root.join(format!("{hash}.market-anchors.json")),
+        serde_json::to_vec(&anchors).unwrap(),
+    )
+    .unwrap();
+    fit.qualified_anchors_sha256 = Some(hash);
+    // The entire P fit and its final diagnostic must survive absent label bytes.
+    std::fs::remove_file(root.join("targets.jsonl")).unwrap();
+    (features, fit)
+}
+
+#[test]
+fn market_reconstruction_diagnostic_roundtrip_is_bounded_label_free_and_auxiliary() {
+    let root = tempfile::tempdir().unwrap();
+    let (features, fit) = sol_diagnostic_fixture(root.path());
+    let parent =
+        pretrain_market_encoder(&mut reader(root.path(), &features, &fit), fit.clone()).unwrap();
+    assert_eq!(parent.diagnostics().updates, 1);
+    assert_eq!(parent.diagnostics().example_visits, 64);
+    let (audit, head) = parent.reconstruction_bundle().unwrap().unwrap();
+    let meta: artifacts::ReconstructionAuditManifest = serde_json::from_slice(&audit).unwrap();
+    let report = meta.diagnostics.as_ref().unwrap();
+    assert_eq!(report.sampled_ordinals, (0..64).collect::<Vec<_>>());
+    assert_eq!(report.cpu_forward_examples, 64);
+    assert_eq!(report.cpu_forward_batches, 1);
+    assert_eq!(report.cpu_output_scalars, 64 * 60 * 24);
+    assert_eq!(report.additional_optimizer_updates, 0);
+    assert_eq!(
+        report.groups.iter().map(|g| g.channels).collect::<Vec<_>>(),
+        [11, 10, 3]
+    );
+    assert!(meta.diagnostic_elapsed_micros.is_some());
+    report.validate(&fit, parent.scaling()).unwrap();
+    let (encoder, weights) = parent.bundle().unwrap();
+    let encoder_json: serde_json::Value = serde_json::from_slice(&encoder).unwrap();
+    assert!(encoder_json.get("reconstruction").is_none());
+    assert!(encoder_json.get("diagnostic_elapsed_micros").is_none());
+    let mut restored =
+        MarketEncoderCheckpoint::restore(&encoder, &bytes_digest(&encoder), weights).unwrap();
+    assert!(restored
+        .reconstruction_diagnostics_digest()
+        .unwrap()
+        .is_none());
+    restored
+        .attach_reconstruction_audit(&audit, &bytes_digest(&audit), head.clone())
+        .unwrap();
+    assert_eq!(
+        parent.reconstruction_diagnostics_digest(),
+        restored.reconstruction_diagnostics_digest()
+    );
+    assert_eq!(parent.identity(), restored.identity());
+    let mut changed = meta.clone();
+    changed.diagnostic_elapsed_micros = Some(meta.diagnostic_elapsed_micros.unwrap() + 1);
+    let changed = serde_json::to_vec(&changed).unwrap();
+    restored
+        .attach_reconstruction_audit(&changed, &bytes_digest(&changed), head.clone())
+        .unwrap();
+    assert_eq!(
+        parent.reconstruction_diagnostics_digest(),
+        restored.reconstruction_diagnostics_digest()
+    );
+    for tamper in ["sample", "count", "metric"] {
+        let mut changed = meta.clone();
+        let report = changed.diagnostics.as_mut().unwrap();
+        match tamper {
+            "sample" => report.sampled_ordinals[1] = 0,
+            "count" => report.groups[0].masked_scalar_count += 1,
+            _ => report.groups[0].model_mse = -1.0,
+        }
+        let changed = serde_json::to_vec(&changed).unwrap();
+        assert!(restored
+            .attach_reconstruction_audit(&changed, &bytes_digest(&changed), head.clone())
+            .is_err());
+    }
+    let mut changed = meta;
+    changed.diagnostics.as_mut().unwrap().groups[0].model_mse += 0.5;
+    let changed = serde_json::to_vec(&changed).unwrap();
+    assert!(restored
+        .attach_reconstruction_audit(&changed, &bytes_digest(&audit), head)
+        .is_err());
+}
+
+#[test]
+fn market_reconstruction_diagnostic_uses_registry_groups_and_holds_across_masked_runs() {
+    let spec = SequenceInputSpecV1::sol_lob();
+    let groups = artifacts::reconstruction_channel_groups(&spec).unwrap();
+    assert_eq!(groups[0], vec![0, 1, 3, 5, 7, 9, 11, 13, 15, 17, 19]);
+    assert_eq!(groups[1], vec![2, 4, 6, 8, 10, 12, 14, 16, 18, 20]);
+    assert_eq!(groups[2], vec![21, 22, 23]);
+    let mut bad = spec;
+    bad.ordered_channels.swap(0, 1);
+    assert!(artifacts::reconstruction_channel_groups(&bad).is_none());
+    let scaling = MarketFeatureScalingV1 {
+        means: (0..24).map(|i| i as f64).collect(),
+        scales: vec![2.0; 24],
+        unique_frames: 60,
+        examples: 2,
+    };
+    let mut item = UnlabeledSequenceExample {
+        series_id: 1,
+        observed_at_ms: 59000,
+        inputs: vec![0.0; 60 * 24],
+    };
+    let mut prediction = vec![0.0; 60 * 24];
+    let mut mask = [false; 60];
+    mask[6..24].fill(true);
+    for (group, channels) in groups.iter().enumerate() {
+        let step = (group + 1) as f32;
+        for time in 0..60 {
+            for &channel in channels {
+                item.inputs[time * 24 + channel] = 2.0 * time as f32 * step + channel as f32;
+                prediction[time * 24 + channel] = if mask[time] {
+                    time as f32 * step + step
+                } else {
+                    99999.0
+                };
+            }
+        }
+    }
+    let mut sums: [training::ReconstructionMse; 3] = Default::default();
+    training::observe_reconstruction(&item, &mask, &prediction, &scaling, &groups, &mut sums)
+        .unwrap();
+    for (i, (sum, channels)) in sums.iter().zip(&groups).enumerate() {
+        let report = sum
+            .finish(["price", "depth", "trade"][i], channels.len())
+            .unwrap();
+        let squared = ((i + 1) * (i + 1)) as f64;
+        assert_eq!(report.masked_scalar_count, 18 * channels.len() as u64);
+        assert!((report.model_mse - squared).abs() < 1e-12);
+        assert!(
+            (report.last_visible_mse
+                - (1..=18)
+                    .map(|distance| (distance * distance) as f64)
+                    .sum::<f64>()
+                    / 18.0
+                    * squared)
+                .abs()
+                < 1e-10
+        );
+    }
+    assert!(training::observe_reconstruction(
+        &item,
+        &mask,
+        &prediction[..1439],
+        &scaling,
+        &groups,
+        &mut sums
+    )
+    .is_err());
+    let selected = artifacts::diagnostic_ordinals(10_000);
+    assert_eq!(selected.len(), 256);
+    assert_eq!(selected[0], 0);
+    assert_eq!(selected[255], 9999);
+    assert!(selected
+        .windows(2)
+        .all(|pair| (39..=40).contains(&(pair[1] - pair[0]))));
+    assert_eq!(artifacts::diagnostic_ordinals(3), vec![0, 1, 2]);
+}

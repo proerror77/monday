@@ -176,6 +176,13 @@ enum MissionDispatchCommand {
     Settle(MissionDispatchSubmitArgs),
     ControllerHandoff(CampaignControllerHandoffArgs),
     PrepareController(CampaignControllerPrepareArgs),
+    InitStageAuthority(InitStageAuthorityArgs),
+    DescribeStudy(DescribeStudyArgs),
+    SignRoot(mission_dispatch::study_authority::RootSignArgs),
+    SignStudy(mission_dispatch::study_authority::StudySignArgs),
+    RegisterStudy(mission_dispatch::study_authority::StudyRegisterArgs),
+    InspectStudy(mission_dispatch::study_authority::StudyInspectArgs),
+    StageController(CampaignStageControllerArgs),
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -260,6 +267,48 @@ pub struct CampaignControllerPrepareArgs {
     pub namespace: String,
     #[arg(long)]
     pub kubeconfig_out: PathBuf,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DescribeStudyArgs {
+    #[arg(long)]
+    pub submission: PathBuf,
+    #[arg(long)]
+    pub controller_image: String,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct InitStageAuthorityArgs {
+    #[arg(long)]
+    pub private_key: PathBuf,
+    #[arg(long)]
+    pub public_out: PathBuf,
+    #[arg(long)]
+    pub work_pvc_name: String,
+    #[arg(long)]
+    pub work_pvc_uid: String,
+}
+#[derive(Debug, Clone, Args)]
+pub struct CampaignStageControllerArgs {
+    #[arg(long)]
+    pub submission: PathBuf,
+    #[arg(long)]
+    pub control: PathBuf,
+    /// ACK mount of the root of the task-owned work PVC (never given to the worker).
+    #[arg(long)]
+    pub pvc_root: PathBuf,
+    #[arg(long)]
+    pub private_key: PathBuf,
+    #[arg(long)]
+    pub context: String,
+    #[arg(long)]
+    pub namespace: String,
+    /// Create only the attempt-owned durable directory before canonical submit.
+    #[arg(long)]
+    pub prepare_only: bool,
+    /// Perform one bounded controller iteration; otherwise wait until terminal/deadline.
+    #[arg(long)]
+    pub once: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -370,6 +419,9 @@ pub struct CampaignPrecheckArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct CampaignFreezeArgs {
+    /// Public controller stage authority and task-owned work PVC; required for market studies.
+    #[arg(long)]
+    pub stage_authority: Option<PathBuf>,
     /// Trusted ledger selected independently of a caller-supplied cache artifact.
     #[arg(long)]
     pub preparation_ledger: Option<PathBuf>,
@@ -577,6 +629,15 @@ pub struct PrepareFreshInputsArgs {
     /// Export verified SOL 1s/top5/30s sequence inputs along with PIT artifacts.
     #[arg(long)]
     pub sequence_output: bool,
+    /// Export separate label-free market features and 30-second targets.
+    #[arg(long)]
+    pub market_encoder_output: bool,
+    /// Feature start after at most 60 seconds of admitted raw/PIT warmup.
+    #[arg(long, requires = "market_encoder_output")]
+    pub market_feature_start_received_at_ns: Option<u64>,
+    /// Exclusive feature-partition end inside the explicit admitted label window.
+    #[arg(long, requires = "market_encoder_output")]
+    pub market_feature_end_received_at_ns: Option<u64>,
     /// Upper bound for the materializer process lifetime.
     #[arg(long, default_value_t = 7_200)]
     pub materializer_timeout_seconds: u64,
@@ -1265,12 +1326,55 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             MissionCommand::PrepareSequenceCohort(args) => {
                 require_cloud_data_host(std::env::consts::OS)?;
                 tokio::task::spawn_blocking(move || {
-                    mission_campaign::sequence::cohort::prepare(args)
+                    let request: serde_json::Value =
+                        mission_campaign::sequence::read_json(&args.request)?;
+                    if request["schema_version"] == "monday.sol_market_encoder_cohort_request.v1" {
+                        mission_campaign::market_encoder::cohort::prepare(args)
+                    } else {
+                        mission_campaign::sequence::cohort::prepare(args)
+                    }
                 })
                 .await
                 .context("sequence cohort preparation worker failed")?
             }
             MissionCommand::Dispatch { command } => match command {
+                MissionDispatchCommand::DescribeStudy(args) => {
+                    mission_dispatch::sequence_admission::describe(args)
+                }
+                MissionDispatchCommand::SignRoot(args) => {
+                    mission_dispatch::study_authority::sign_root(args)
+                }
+                MissionDispatchCommand::SignStudy(args) => {
+                    mission_dispatch::study_authority::sign_study(args)
+                }
+                MissionDispatchCommand::RegisterStudy(args) => {
+                    require_cloud_data_host(std::env::consts::OS)?;
+                    tokio::task::spawn_blocking(move || {
+                        mission_dispatch::study_authority::register(args)
+                    })
+                    .await
+                    .context("Campaign Study registration failed")?
+                }
+                MissionDispatchCommand::InspectStudy(args) => {
+                    require_cloud_data_host(std::env::consts::OS)?;
+                    tokio::task::spawn_blocking(move || {
+                        mission_dispatch::study_authority::inspect(args)
+                    })
+                    .await
+                    .context("Campaign Study readback failed")?
+                }
+                MissionDispatchCommand::InitStageAuthority(args) => {
+                    require_cloud_data_host(std::env::consts::OS)?;
+                    mission_dispatch::stage_controller::init_authority(args)
+                }
+                MissionDispatchCommand::StageController(args) => {
+                    require_cloud_data_host(std::env::consts::OS)?;
+                    tokio::task::spawn_blocking(move || {
+                        mission_dispatch::stage_controller::run(args)
+                    })
+                    .await
+                    .context("Campaign stage controller failed")?
+                }
                 MissionDispatchCommand::Submit(args) => {
                     require_cloud_data_host(std::env::consts::OS)?;
                     tokio::task::spawn_blocking(move || mission_dispatch::submit(args))

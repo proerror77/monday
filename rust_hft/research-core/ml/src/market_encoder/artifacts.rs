@@ -27,6 +27,131 @@ pub(super) struct ReconstructionAuditManifest {
     pub mask_policy: String,
     pub weights_sha256: String,
     pub parameter_values_sha256: String,
+    pub diagnostics: Option<ReconstructionDiagnostics>,
+    /// Observed wall time for the extra scan and CPU forward passes; not CPU-seconds
+    /// and deliberately excluded from independent numerical-fit comparison.
+    pub diagnostic_elapsed_micros: Option<u64>,
+}
+
+pub(super) const RECONSTRUCTION_AUDIT_SCHEMA: &str = "monday.market_reconstruction_audit.v2";
+pub(super) const DIAGNOSTIC_SAMPLE_LIMIT: usize = 256;
+pub(super) const DIAGNOSTIC_SAMPLING: &str = "uniform-eligible-rank-endpoints-max256-v1";
+pub(super) const DIAGNOSTIC_GROUPING: &str = "sol-lob-24-price11-depth10-trade3-v1";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ReconstructionGroupMse {
+    pub group: String,
+    pub channels: u64,
+    pub masked_scalar_count: u64,
+    pub model_mse: f64,
+    pub last_visible_mse: f64,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ReconstructionDiagnostics {
+    pub schema_version: String,
+    pub sampling_policy: String,
+    pub grouping_policy: String,
+    pub metric_space: String,
+    pub mask_epoch: u64,
+    pub eligible_training_anchors: u64,
+    pub scanned_training_anchors: u64,
+    pub sampled_ordinals: Vec<u64>,
+    pub sampled_anchor_keys_sha256: String,
+    pub additional_feature_passes: u64,
+    pub forward_batch_size: usize,
+    pub cpu_forward_batches: u64,
+    pub cpu_forward_examples: u64,
+    pub cpu_forward_frames: u64,
+    pub cpu_output_scalars: u64,
+    pub additional_optimizer_updates: u64,
+    pub groups: Vec<ReconstructionGroupMse>,
+}
+/// Only the verified registry is classified. Generic ML fixtures with other
+/// channels never acquire misleading SOL price/depth/trade labels.
+pub(super) fn reconstruction_channel_groups(
+    input: &hft_research_manifest::sequence::SequenceInputSpecV1,
+) -> Option<[Vec<usize>; 3]> {
+    if *input != hft_research_manifest::sequence::SequenceInputSpecV1::sol_lob() {
+        return None;
+    }
+    let mut groups: [Vec<usize>; 3] = Default::default();
+    for (i, name) in input.ordered_channels.iter().enumerate() {
+        let group = if name == "mid_return_1" || name.ends_with("_distance_bps") {
+            0
+        } else if name.ends_with("_log_quantity") {
+            1
+        } else if name.starts_with("aggregate_trade_") {
+            2
+        } else {
+            return None;
+        };
+        groups[group].push(i);
+    }
+    (groups.iter().map(Vec::len).collect::<Vec<_>>() == [11, 10, 3]).then_some(groups)
+}
+pub(super) fn diagnostic_ordinals(examples: u64) -> Vec<u64> {
+    let count = examples.min(DIAGNOSTIC_SAMPLE_LIMIT as u64);
+    if count < 2 {
+        return (0..count).collect();
+    }
+    (0..count)
+        .map(|i| i * (examples - 1) / (count - 1))
+        .collect()
+}
+impl ReconstructionDiagnostics {
+    pub(super) fn validate(
+        &self,
+        request: &MarketFitRequestV1,
+        scaling: &MarketFeatureScalingV1,
+    ) -> Result<(), String> {
+        let groups = reconstruction_channel_groups(&request.spec.input)
+            .ok_or("reconstruction diagnostic registry changed")?;
+        let expected = diagnostic_ordinals(scaling.examples);
+        let count = expected.len() as u64;
+        if self.schema_version != "monday.market_reconstruction_diagnostics.v1"
+            || self.sampling_policy != DIAGNOSTIC_SAMPLING
+            || self.grouping_policy != DIAGNOSTIC_GROUPING
+            || self.metric_space != "train-channel-standardized-f32"
+            || self.mask_epoch != 0
+            || self.eligible_training_anchors != scaling.examples
+            || self.scanned_training_anchors != scaling.examples
+            || self.sampled_ordinals != expected
+            || !hft_research_manifest::sequence::valid_sha256(&self.sampled_anchor_keys_sha256)
+            || self.additional_feature_passes != 1
+            || self.forward_batch_size != request.batch_size
+            || self.cpu_forward_batches != count.div_ceil(request.batch_size as u64)
+            || self.cpu_forward_examples != count
+            || self.cpu_forward_frames != count * 60
+            || self.cpu_output_scalars != count * 60 * 24
+            || self.additional_optimizer_updates != 0
+            || self.groups.len() != 3
+        {
+            return Err(
+                "reconstruction diagnostics changed their sampling, training view or compute bound"
+                    .into(),
+            );
+        }
+        for ((metric, indices), name) in self
+            .groups
+            .iter()
+            .zip(groups)
+            .zip(["price", "depth", "trade"])
+        {
+            if metric.group != name
+                || metric.channels != indices.len() as u64
+                || metric.masked_scalar_count != count * 18 * indices.len() as u64
+                || !metric.model_mse.is_finite()
+                || metric.model_mse < 0.0
+                || !metric.last_visible_mse.is_finite()
+                || metric.last_visible_mse < 0.0
+            {
+                return Err("reconstruction diagnostic group count or MSE is invalid".into());
+            }
+        }
+        Ok(())
+    }
 }
 pub(super) struct ReconstructionAudit {
     pub metadata: ReconstructionAuditManifest,
@@ -83,6 +208,15 @@ impl MarketEncoderCheckpoint {
             .as_ref()
             .map(|audit| audit.metadata.parameter_values_sha256.as_str())
     }
+    /// The bounded, deterministic diagnostic evidence compared by independent P fits.
+    /// The auxiliary wall clock is not a model value or a selection criterion.
+    pub fn reconstruction_diagnostics_digest(&self) -> Result<Option<String>, String> {
+        self.reconstruction
+            .as_ref()
+            .and_then(|a| a.metadata.diagnostics.as_ref())
+            .map(digest)
+            .transpose()
+    }
     pub fn attach_reconstruction_audit(
         &mut self,
         metadata: &[u8],
@@ -97,12 +231,21 @@ impl MarketEncoderCheckpoint {
         }
         let audit: ReconstructionAuditManifest =
             serde_json::from_slice(metadata).map_err(|e| e.to_string())?;
-        if audit.schema_version != "monday.market_reconstruction_audit.v1"
+        if audit.schema_version != RECONSTRUCTION_AUDIT_SCHEMA
             || audit.encoder_checkpoint_sha256 != self.identity()?
             || audit.mask_policy != MASK_POLICY
             || audit.weights_sha256 != bytes_digest(&weights)
         {
             return Err("reconstruction audit belongs to another encoder or objective".into());
+        }
+        let is_sol = reconstruction_channel_groups(&self.manifest.request.spec.input).is_some();
+        if audit.diagnostics.is_some() != is_sol
+            || audit.diagnostic_elapsed_micros.is_some() != is_sol
+        {
+            return Err("reconstruction audit omitted or mislabeled its SOL diagnostics".into());
+        }
+        if let Some(report) = &audit.diagnostics {
+            report.validate(&self.manifest.request, &self.manifest.scaling)?;
         }
         let _guard = lock_ndarray_backend().map_err(|e| e.to_string())?;
         let mut head = LinearConfig::new(

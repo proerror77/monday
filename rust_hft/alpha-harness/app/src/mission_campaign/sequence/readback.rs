@@ -5,7 +5,12 @@ use alpha_engine::sequence_study::{SequenceEnsemble, SequenceFit, SOL_SEQUENCE_P
 use std::collections::{BTreeMap, BTreeSet};
 use worker::FoldResult;
 
-fn cached_download(client: &Client, url: &str, path: &Path, limit: u64) -> anyhow::Result<()> {
+pub(crate) fn cached_download(
+    client: &Client,
+    url: &str,
+    path: &Path,
+    limit: u64,
+) -> anyhow::Result<()> {
     if path.try_exists()? {
         if !path.is_file() || path.metadata()?.len() > limit {
             bail!("invalid sequence cache file");
@@ -122,10 +127,18 @@ fn validate_result(
 }
 
 fn verify_artifact_set(bundle: &Path, extracted: &Path, result: &FoldResult) -> anyhow::Result<()> {
-    let expected = result
-        .artifacts
+    verify_artifact_inventory(bundle, extracted, "sequence-results", &result.artifacts)
+}
+
+pub(crate) fn verify_artifact_inventory(
+    bundle: &Path,
+    extracted: &Path,
+    directory: &str,
+    artifacts: &BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    let expected = artifacts
         .keys()
-        .map(|name| format!("sequence-results/{name}"))
+        .map(|name| format!("{directory}/{name}"))
         .chain(std::iter::once("result.json".into()))
         .collect::<BTreeSet<_>>();
     let mut archive = zip::ZipArchive::new(File::open(bundle)?)?;
@@ -139,10 +152,8 @@ fn verify_artifact_set(bundle: &Path, extracted: &Path, result: &FoldResult) -> 
     if actual != expected {
         bail!("sequence archive inventory differs from result");
     }
-    for (name, hash) in &result.artifacts {
-        if crate::mission_runner::sha256_file(&extracted.join("sequence-results").join(name))?
-            != *hash
-        {
+    for (name, hash) in artifacts {
+        if crate::mission_runner::sha256_file(&extracted.join(directory).join(name))? != *hash {
             bail!("sequence result artifact bytes changed");
         }
     }

@@ -1,4 +1,5 @@
 pub(crate) mod final_evaluation;
+pub(crate) mod market_encoder;
 pub(crate) mod preparation;
 pub(crate) mod sequence;
 pub(crate) mod workflow;
@@ -456,6 +457,9 @@ pub fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
     if args.final_evaluation {
         return final_evaluation::execute(args);
     }
+    if market_encoder::is_market_encoder_request(&args.request)? {
+        return market_encoder::execute(args);
+    }
     if sequence::is_sequence_request(&args.request)? {
         return sequence::execute(args);
     }
@@ -500,6 +504,12 @@ pub fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
 }
 
 pub fn freeze(args: CampaignFreezeArgs) -> anyhow::Result<()> {
+    if market_encoder::is_market_encoder_plan(args.research_plan.as_deref())? {
+        return market_encoder::freeze(args);
+    }
+    if args.stage_authority.is_some() {
+        bail!("stage authority requires the typed market encoder plan");
+    }
     if args.reuse.is_none()
         && args.final_evaluation_control.is_none()
         && sequence::is_sequence_plan(args.research_plan.as_deref())?
@@ -1245,6 +1255,9 @@ fn campaign_learn_report(
 }
 
 pub fn finalize(args: CampaignFinalizeArgs) -> anyhow::Result<()> {
+    if market_encoder::is_market_encoder_freeze(&args.freeze)? {
+        return market_encoder::finalize(args);
+    }
     if sequence::is_sequence_freeze(&args.freeze)? {
         return sequence::finalize(args);
     }
@@ -5840,6 +5853,7 @@ mod tests {
         drop(alpha_store::AlphaStore::open(&preparation_ledger).unwrap());
 
         freeze(CampaignFreezeArgs {
+            stage_authority: None,
             preparation_ledger: Some(preparation_ledger.clone()),
             reuse: None,
             reuse_sha256: None,
@@ -5887,6 +5901,7 @@ mod tests {
         );
 
         let mut reuse = CampaignFreezeArgs {
+            stage_authority: None,
             preparation_ledger: Some(preparation_ledger.clone()),
             reuse: Some(output.clone()),
             reuse_sha256: Some(crate::mission_runner::sha256_file(&output).unwrap()),
@@ -6076,6 +6091,7 @@ mod tests {
                 .path()
                 .join(format!("invalid-freeze-{missing_later_seed}.json"));
             let error = freeze(CampaignFreezeArgs {
+                stage_authority: None,
                 preparation_ledger: None,
                 reuse: None,
                 reuse_sha256: None,
@@ -6120,6 +6136,7 @@ mod tests {
         wrong_symbol.symbol = "SOLUSDT".to_string();
         data_mission::write_json_atomic(&receipt_path, &wrong_symbol).unwrap();
         let mismatch = freeze_request(&CampaignFreezeArgs {
+            stage_authority: None,
             preparation_ledger: None,
             reuse: None,
             reuse_sha256: None,
@@ -6148,6 +6165,7 @@ mod tests {
             .contains("source_revision must be an exact git revision"));
 
         let invalid_executor = freeze_request(&CampaignFreezeArgs {
+            stage_authority: None,
             preparation_ledger: None,
             reuse: None,
             reuse_sha256: None,
@@ -6177,6 +6195,7 @@ mod tests {
             crate::mission_runner::sha256_file(&replay_manifest_path).unwrap();
         data_mission::write_json_atomic(&receipt_path, &invalid_replay_receipt).unwrap();
         let invalid_replay = freeze_request(&CampaignFreezeArgs {
+            stage_authority: None,
             preparation_ledger: None,
             reuse: None,
             reuse_sha256: None,
@@ -6197,6 +6216,7 @@ mod tests {
             .any(|cause| cause.to_string().contains("artifact")));
 
         let invalid_source = freeze_request(&CampaignFreezeArgs {
+            stage_authority: None,
             preparation_ledger: None,
             reuse: None,
             reuse_sha256: None,

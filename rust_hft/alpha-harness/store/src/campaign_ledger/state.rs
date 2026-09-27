@@ -16,6 +16,7 @@ pub(super) struct Attempt {
     pub settlement: Option<CampaignAttemptSettlementV1>,
     pub dispatch: Option<CampaignDispatchClaimV1>,
     pub terminal_pod_uid: Option<String>,
+    pub cancellation: Option<CampaignDispatchCancellationV1>,
 }
 
 pub(super) struct FinalClosure {
@@ -284,6 +285,7 @@ impl State {
                         settlement: None,
                         dispatch: None,
                         terminal_pod_uid: None,
+                        cancellation: None,
                     },
                 );
             }
@@ -340,11 +342,41 @@ impl State {
                 dispatch.job_uid = Some(job_uid.clone());
                 dispatch.sequence = receipt.sequence;
             }
+            CampaignLedgerEventV1::DispatchCancelled { evidence } => {
+                let attempt = self
+                    .attempts
+                    .get_mut(&evidence.operation_id)
+                    .ok_or_else(|| err("cancellation has no reserved attempt"))?;
+                evidence.validate(&attempt.reservation)?;
+                let claim = attempt
+                    .dispatch
+                    .as_ref()
+                    .ok_or_else(|| err("cancellation has no claim"))?;
+                if attempt.cancellation.is_some()
+                    || attempt.settlement.is_some()
+                    || claim.job_uid.as_deref() != Some(evidence.job_uid.as_str())
+                {
+                    return Err(err("cancellation has changed or completed its claimed Job"));
+                }
+                attempt.cancellation = Some(evidence.clone());
+            }
             CampaignLedgerEventV1::DispatchSettled { evidence } => {
                 let attempt = self
                     .attempts
                     .get_mut(&evidence.settlement.operation_id)
                     .ok_or_else(|| err("dispatch settlement has no reservation"))?;
+                if let Some(cancel) = &attempt.cancellation {
+                    if evidence.job_uid != cancel.job_uid
+                        || evidence.pod_uid != cancel.pod_uid
+                        || evidence.settlement.outcome != CampaignAttemptOutcomeV1::Failed
+                        || evidence.settlement.consumed_trials
+                            != Some(attempt.reservation.declared_trials)
+                    {
+                        return Err(err(
+                            "cancelled Job requires exact failed provenance and full charge",
+                        ));
+                    }
+                }
                 evidence
                     .settlement
                     .validate_against(&attempt.reservation)
@@ -357,11 +389,13 @@ impl State {
                     .ok_or_else(|| err("dispatch settlement has no claim"))?;
                 if dispatch.job_uid.as_deref() != Some(evidence.job_uid.as_str())
                     || attempt.settlement.is_some()
-                    || !matches!(
+                    || !(matches!(
                         evidence.settlement.outcome,
                         CampaignAttemptOutcomeV1::NoCandidate
                             | CampaignAttemptOutcomeV1::SelectedPreHoldout
-                    )
+                    ) || (evidence.settlement.outcome == CampaignAttemptOutcomeV1::Failed
+                        && evidence.settlement.consumed_trials
+                            == Some(attempt.reservation.declared_trials)))
                 {
                     return Err(err("dispatch terminal identity or outcome is invalid"));
                 }
@@ -373,6 +407,11 @@ impl State {
                     .attempts
                     .get_mut(&settlement.operation_id)
                     .ok_or_else(|| err("settlement has no reservation"))?;
+                if attempt.cancellation.is_some() {
+                    return Err(err(
+                        "cancelled dispatch requires independent native failed settlement",
+                    ));
+                }
                 settlement
                     .validate_against(&attempt.reservation)
                     .map_err(err)?;

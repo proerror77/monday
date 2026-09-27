@@ -2,7 +2,7 @@
 pub(crate) mod cohort;
 pub(crate) mod inputs;
 pub(crate) mod readback;
-mod worker;
+pub(crate) mod worker;
 use super::*;
 use alpha_domain::sequence_study::{SolSequenceStudyV1, SOL_SEQUENCE_STUDY_SCHEMA};
 use inputs::SequenceCampaignInputs;

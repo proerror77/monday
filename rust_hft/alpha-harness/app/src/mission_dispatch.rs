@@ -3,6 +3,8 @@ pub(crate) mod controller;
 pub(crate) mod final_admission;
 pub(crate) mod final_authority;
 pub(crate) mod sequence_admission;
+pub(crate) mod stage_controller;
+pub(crate) mod study_authority;
 mod terminal;
 
 use crate::{
@@ -85,7 +87,7 @@ enum SubmissionObjectState {
 }
 
 pub fn inspect(args: MissionDispatchInspectArgs) -> anyhow::Result<()> {
-    if sequence_admission::is_sequence_submission(&args.submission)? {
+    if sequence_admission::is_study_submission(&args.submission)? {
         return sequence_admission::inspect(args);
     }
     if final_admission::is_final_submission(&args.submission)? {
@@ -115,7 +117,7 @@ pub fn status(args: crate::cli::MissionDispatchStatusArgs) -> anyhow::Result<()>
 
 fn status_report(args: &crate::cli::MissionDispatchStatusArgs) -> anyhow::Result<Value> {
     validate_cluster_target(&args.context, &args.namespace)?;
-    if sequence_admission::is_sequence_submission(&args.submission)? {
+    if sequence_admission::is_study_submission(&args.submission)? {
         return sequence_admission::status_report(args);
     }
     if final_admission::is_final_submission(&args.submission)? {
@@ -152,7 +154,7 @@ fn status_report(args: &crate::cli::MissionDispatchStatusArgs) -> anyhow::Result
 }
 
 pub fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
-    if sequence_admission::is_sequence_submission(&args.submission)? {
+    if sequence_admission::is_study_submission(&args.submission)? {
         return sequence_admission::settle(args);
     }
     if final_admission::is_final_submission(&args.submission)? {
@@ -170,7 +172,7 @@ pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
     if args.readback_cache.is_some() || args.model_report.is_some() {
         anyhow::bail!("readback cache and model report options are settlement-only");
     }
-    if sequence_admission::is_sequence_submission(&args.submission)? {
+    if sequence_admission::is_study_submission(&args.submission)? {
         return sequence_admission::submit(args);
     }
     if final_admission::is_final_submission(&args.submission)? {
@@ -869,6 +871,7 @@ fn job_execution_projection(job: &Value) -> Value {
                     "nodeName": pod["nodeName"].as_str().unwrap_or(""),
                     "imagePullSecrets": pod["imagePullSecrets"].clone(),
                     "nodeSelector": pod["nodeSelector"].clone(),
+                    "affinity": if container["env"].as_array().is_some_and(|items|items.iter().any(|item|item["name"]=="MONDAY_CAMPAIGN_POD_UID")) {pod["affinity"].clone()} else {Value::Null},
                     "securityContext": pod["securityContext"].clone(),
                     "initContainers": pod["initContainers"].clone(),
                     "containerCount": containers.map_or(0, Vec::len),

@@ -4,6 +4,7 @@ pub mod campaign_checkpoint;
 pub mod campaign_control;
 pub mod campaign_finalization;
 pub mod campaign_horizon;
+pub mod campaign_stage;
 pub mod campaign_study;
 mod evaluation_calendar;
 mod evaluation_partition;

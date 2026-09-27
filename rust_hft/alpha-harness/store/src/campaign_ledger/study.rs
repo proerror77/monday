@@ -1009,6 +1009,70 @@ pub(super) fn check_member_reservation(
     Ok(())
 }
 
+/// Running-stage checks retain the original charged attempt instead of adding
+/// its full duration to the current clock on every stage boundary.
+pub(super) fn check_running_member(
+    conn: &Connection,
+    key: &[u8; 32],
+    verified: &VerifiedCampaignRootGrant,
+    reservation: &CampaignAttemptReservationV1,
+    at: DateTime<Utc>,
+) -> Result<DateTime<Utc>, StoreError> {
+    let (study_id, root_hash, binding) = read_member_projection(conn, key, &reservation.family_id)?
+        .ok_or_else(|| err("running attempt lacks a Study"))?;
+    if root_hash != verified.content_sha256()
+        || !binding.matches_root(verified.grant(), verified.content_sha256())
+        || reservation.root_grant_sha256 != root_hash
+        || reservation.execution != binding.execution
+    {
+        return Err(err("running attempt changed its Study member"));
+    }
+    let (state, history) = study_load(conn, key, &study_id)?;
+    let state = state.ok_or_else(|| err("missing running Study"))?;
+    let grant = state.grant()?;
+    grant.validate_active_at(at).map_err(err)?;
+    let approval = read_effective_approval(
+        conn,
+        key,
+        &state
+            .approval
+            .as_ref()
+            .ok_or_else(|| err("missing Study approval"))?
+            .approval_id,
+    )?;
+    let operation = reservation.operation_id().map_err(err)?;
+    let attempt = state
+        .attempts
+        .get(&operation)
+        .ok_or_else(|| err("missing Study attempt"))?;
+    if !approval.is_active_at(at)
+        || state.revoked_at.is_some_and(|when| at >= when)
+        || attempt.reservation != *reservation
+        || attempt.settlement.is_some()
+    {
+        return Err(err("running Study is inactive or attempt changed"));
+    }
+    let sequence = history
+        .iter()
+        .find_map(|r| match &r.receipt.event {
+            CampaignStudyLedgerEventV1::AttemptReserved {
+                reservation: observed,
+                ..
+            } if observed == reservation => Some(r.receipt.sequence),
+            _ => None,
+        })
+        .ok_or_else(|| err("missing running Study reservation receipt"))?;
+    require_published_study_receipts(conn, key, &study_id, &history, sequence)?;
+    let mut deadline = grant.grant().expires_at;
+    for when in [state.revoked_at, approval.revoked_at, approval.expires_at]
+        .into_iter()
+        .flatten()
+    {
+        deadline = deadline.min(when);
+    }
+    Ok(deadline)
+}
+
 fn study_prepare_reservation(
     conn: &Connection,
     key: &[u8; 32],

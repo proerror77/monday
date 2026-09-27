@@ -15,7 +15,7 @@ use std::{
 
 pub const INPUTS_SCHEMA: &str = "monday.sol_sequence_inputs.v1";
 
-fn require_exact_files(
+pub(crate) fn require_exact_files(
     root: &Path,
     admitted: &std::collections::BTreeSet<PathBuf>,
 ) -> anyhow::Result<()> {
@@ -75,8 +75,18 @@ impl Artifact {
     }
     pub fn path(&self, root: &Path) -> anyhow::Result<PathBuf> {
         self.validate()?;
+        if !std::fs::symlink_metadata(root)?.file_type().is_dir() {
+            bail!("sequence artifact root is not a regular directory");
+        }
         let root = root.canonicalize()?;
-        let path = root.join(&self.file).canonicalize()?;
+        let mut path = root.clone();
+        for part in Path::new(&self.file).components() {
+            path.push(part);
+            if std::fs::symlink_metadata(&path)?.file_type().is_symlink() {
+                bail!("sequence artifact contains a symlink");
+            }
+        }
+        let path = path.canonicalize()?;
         if !path.starts_with(&root) || !path.is_file() {
             bail!("sequence artifact escapes its admitted input root");
         }
@@ -188,76 +198,15 @@ impl SequenceCampaignInputs {
         root: &Path,
         view: hft_research_manifest::sequence::SequenceViewV1,
     ) -> anyhow::Result<()> {
-        let evidence = hft_backtest::config::verify_canonical_replay_artifact_streaming(
-            &self.replay_artifact.path(root)?,
-            &self.replay_manifest.path(root)?,
-            Some(&self.replay_artifact.sha256),
-            &self.replay_manifest.sha256,
-            None,
-            Some(
-                view.end_ms
-                    .checked_mul(1000)
-                    .context("replay end overflow")?,
-            ),
-        )?;
         let index: SequenceSourceIndex =
             serde_json::from_slice(&self.validation.sources.read(root, 4 * 1024 * 1024)?)?;
-        let mut expected = std::collections::BTreeMap::new();
-        for source in index.sources {
-            let report: serde_json::Value =
-                serde_json::from_slice(&source.materialization.read(root, 16 * 1024 * 1024)?)?;
-            if report["source_revision"] != evidence.source_revision {
-                bail!("sequence replay source revision differs from its PIT sources");
-            }
-            for source in report["source_segments"]
-                .as_array()
-                .context("missing PIT sources")?
-            {
-                let mut source = source.clone();
-                let path = source["path"].as_str().context("missing PIT source path")?;
-                let file = Path::new(path)
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .context("invalid PIT source name")?
-                    .to_owned();
-                let object = source.as_object_mut().context("invalid PIT source")?;
-                object.remove("path");
-                object.insert("file".into(), file.into());
-                // Compare the complete canonical replay provenance fields.
-                let source: hft_backtest::config::CanonicalSourceSegmentEvidence =
-                    serde_json::from_value(source)?;
-                if expected
-                    .insert(source.sha256.clone(), source.clone())
-                    .is_some_and(|old| old != source)
-                {
-                    bail!("conflicting sequence replay source provenance");
-                }
-            }
-        }
-        let actual = evidence
-            .source_segments
-            .iter()
-            .map(|s| (s.sha256.clone(), s.clone()))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        if evidence.symbol != "SOLUSDT"
-            || evidence.market != "usdm"
-            || evidence.dataset != "binance_usdm_lob"
-            || evidence.modalities != ["lob"]
-            || actual.len() != evidence.source_segments.len()
-            || actual != expected
-            || evidence.first_event_time_us
-                > view
-                    .decision_start_ms
-                    .checked_mul(1000)
-                    .context("replay start overflow")?
-            || evidence.last_event_time_us
-                < (view.end_ms - 1000)
-                    .checked_mul(1000)
-                    .context("replay end overflow")?
-        {
-            bail!("sequence replay differs from validation PIT sources or clock coverage");
-        }
-        Ok(())
+        verify_source_replay(
+            root,
+            &self.replay_artifact,
+            &self.replay_manifest,
+            view,
+            index.sources.iter().map(|source| &source.materialization),
+        )
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -388,6 +337,86 @@ impl SequenceCampaignInputs {
         // Shard bytes are checked by SequenceReader against this admitted identity.
         Ok(dataset)
     }
+}
+
+/// Verify the complete original canonical replay provenance shared by both
+/// sequence and market-encoder cohorts. PIT snapshot hashes are not replay hashes.
+pub(crate) fn verify_source_replay<'a>(
+    root: &Path,
+    replay_artifact: &Artifact,
+    replay_manifest: &Artifact,
+    view: SequenceViewV1,
+    materializations: impl IntoIterator<Item = &'a Artifact>,
+) -> anyhow::Result<()> {
+    view.validate().map_err(anyhow::Error::msg)?;
+    let evidence = hft_backtest::config::verify_canonical_replay_artifact_streaming(
+        &replay_artifact.path(root)?,
+        &replay_manifest.path(root)?,
+        Some(&replay_artifact.sha256),
+        &replay_manifest.sha256,
+        None,
+        Some(
+            view.end_ms
+                .checked_mul(1000)
+                .context("replay end overflow")?,
+        ),
+    )?;
+    let mut expected = std::collections::BTreeMap::new();
+    for source in materializations {
+        let report: serde_json::Value =
+            serde_json::from_slice(&source.read(root, 16 * 1024 * 1024)?)?;
+        if report["source_revision"] != evidence.source_revision {
+            bail!("sequence replay source revision differs from its PIT sources");
+        }
+        for source in report["source_segments"]
+            .as_array()
+            .context("missing PIT sources")?
+        {
+            let mut source = source.clone();
+            let path = source["path"].as_str().context("missing PIT source path")?;
+            let file = Path::new(path)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .context("invalid PIT source name")?
+                .to_owned();
+            let object = source.as_object_mut().context("invalid PIT source")?;
+            object.remove("path");
+            object.insert("file".into(), file.into());
+            // Compare the complete canonical replay provenance fields.
+            let source: hft_backtest::config::CanonicalSourceSegmentEvidence =
+                serde_json::from_value(source)?;
+            if expected
+                .insert(source.sha256.clone(), source.clone())
+                .is_some_and(|old| old != source)
+            {
+                bail!("conflicting sequence replay source provenance");
+            }
+        }
+    }
+    let actual = evidence
+        .source_segments
+        .iter()
+        .map(|s| (s.sha256.clone(), s.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    if evidence.symbol != "SOLUSDT"
+        || evidence.market != "usdm"
+        || evidence.dataset != "binance_usdm_lob"
+        || evidence.modalities != ["lob"]
+        || actual.len() != evidence.source_segments.len()
+        || actual != expected
+        || evidence.first_event_time_us
+            > view
+                .decision_start_ms
+                .checked_mul(1000)
+                .context("replay start overflow")?
+        || evidence.last_event_time_us
+            < (view.end_ms - 1000)
+                .checked_mul(1000)
+                .context("replay end overflow")?
+    {
+        bail!("sequence replay differs from validation PIT sources or clock coverage");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
